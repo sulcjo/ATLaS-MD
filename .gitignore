@@ -1,0 +1,16 @@
+__pycache__/
+.pytest_cache/
+.remember/
+.codex/
+.agents/
+
+*.swp
+*.swo
+*.kate-swp
+
+chignolin_genpept_seeds/
+chignolin_2d_newpackage/
+ABCold_monolith/
+
+*.txt
+*.md

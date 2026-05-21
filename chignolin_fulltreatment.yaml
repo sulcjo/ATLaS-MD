@@ -1,0 +1,108 @@
+schema_version: '1.0'
+description: "Chignolin (GYDPETGTWG) 2D contacts x rama-map HMR-GaMD/REUS."
+
+sequence:
+  seq: GYDPETGTWG
+
+genpept:
+  seq: GYDPETGTWG
+  out: chignolin_genpept_seeds
+  clean: true
+  n: 70000
+  n_candidate_seeds: 400
+  n_final_seeds: 150
+  jobs: 8
+  min_jobs: 1
+  min_chunk_size: 1
+  two_stage: true
+  implicit_only: true
+  no_explicit: true
+  implicit_max_iterations: 100
+  adaptive_min_chunk_iterations: 50
+  adaptive_min_energy_tol: 0.5
+  adaptive_min_force_tol: 1000.0
+  adaptive_min_stall_rounds: 1
+  basin_hop: true
+  bh_parent_seeds: 20
+  bh_steps: 3
+  bh_md_steps: 100
+  bh_timestep: 0.0035
+  bh_hmr_mass: 3.014
+  bh_initial_min_iterations: 50
+  bh_min_iterations: 50
+  platform: OpenCL
+  device_index: '0'
+  cpu_threads: 1
+  diversity_bank_preset: chignolin
+  preselection_bin_quota: 4
+  tiered_implicit_min: true
+  tier_refine_seeds: 150
+  tier_refine_iterations: 100
+  adaptive_min_force_check_every: 0
+  assume_same_implicit_topology: true
+
+cvs:
+  cv1: contacts
+  cv2: rama-map
+
+contact_cv:
+  contact_scheme: residue-balanced
+  contact_atom_selection: backbone-heavy
+  contact_min_sequence_separation: 3
+  contact_adaptive_max: 0.97
+  contact_autocalibrate_windows: false
+
+secondary_cv:
+  secondary_cv_adaptive_min_k_kcal: 20.0
+  secondary_cv_adaptive_max_k_kcal: 100.0
+  secondary_cv_k_mode: adaptive
+  secondary_cv_adaptive_overlap_sigma: 20.0
+  secondary_cv_adaptive_k_scale: 2.0
+
+starting_structures:
+  seed_conformers_dir: chignolin_genpept_seeds
+  us_2d_start_secondary_ramp_stages: 5
+  us_2d_start_secondary_k_pull_scale: 5.0
+  us_pull_steps_per_window: 100000
+  us_pull_timestep_fs: 2.0
+  us_pull_k_kcal_a2: 25
+
+windows:
+  window_mode: adaptive-feedback
+  adaptive_window_aggressiveness: aggressive
+  adaptive_feedback_pilot_fraction: 0.006
+  adaptive_feedback_validation_steps: 10000
+
+output:
+  out: chignolin_2d_newpackage/
+  traj_interval: 50
+  report_interval: 50
+  distance_output_interval: 50
+  progress_update_interval_sec: 10.0
+  traj_format: xtc
+
+platform:
+  platform: OpenCL
+  setup_cpu_threads: 8
+
+simulation:
+  run_mode: hmr-gamd
+  timestep_fs: 4.0
+  nvt_warmup_timestep_fs: 0.5
+  npt_ramp_timestep_fs: 1.0
+  equil_safe_chunk_steps: 5000
+
+gamd:
+  gamd_production_steps: 3000000
+  sigma0p_kcal_mol: 4.0
+  sigma0d_kcal_mol: 4.0
+  gamd_cmd_steps: 100000
+  gamd_equil_steps: 100000
+  gamd_averaging_window: 20000
+
+exchange:
+  exchange_mode: gibbs-walk
+  exchange_interval: 500
+
+tui:
+  tui_mode: interactive

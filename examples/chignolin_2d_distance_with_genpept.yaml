@@ -1,0 +1,167 @@
+schema_version: '1.0'
+description: >-
+  Combined Chignolin workflow config: GENPEPT conformer/seed generation first,
+  then GAREUS seeded 2D distance x Ramachandran-region HMR-GaMD/REUS.
+
+sequence:
+  seq: GYDPETGTWG
+
+# Stage 1. GENPEPT seed generation.  With the updated package, GENPEPT can read
+# this block directly:
+#   python GENPEPT.py --config chignolin_2d_distance_with_genpept.yaml
+# GAREUS ignores this top-level block when reading the same config file.
+conformer_generation:
+  seq: GYDPETGTWG
+  out: chignolin_genpept_seeds/
+  clean: true
+  n: 50000
+  n_candidate_seeds: 100
+  n_final_seeds: 32
+  seed: 12345
+  generation_backend: fast
+  rama_sampling: stratified
+  initial_diversity_features: mixed
+  shape_feature_weight: 1.0
+  state_feature_weight: 0.75
+  torsion_feature_weight: 0.35
+  clash_cutoff: 1.6
+  max_clashes: 0
+  contact_cutoff: 8.0
+  contact_min_sep: 3
+  jobs: 8
+  gen_chunk_size: 250
+  gen_chunks_per_worker: 4
+  min_jobs: 1
+  min_chunk_size: 0
+  platform: CUDA
+  precision: mixed
+  device_index: '0'
+  cpu_threads: 0
+  ff: amber14
+  water: tip3pfb
+  padding: 0.7
+  ionic_strength: 0.15
+  ph: 7.0
+  temperature: 300.0
+  friction: 1.0
+  cutoff: 1.0
+  constraints: none
+  implicit_max_iterations: 300
+  explicit_max_iterations: 500
+  two_stage: true
+  implicit_only: false
+  no_explicit: false
+  basin_hop: true
+  bh_parent_seeds: 0
+  bh_steps: 12
+  bh_md_steps: 250
+  bh_temperature: 600.0
+  bh_friction: 5.0
+  bh_timestep: 0.001
+  bh_hmr_mass: 0.0
+  bh_hmr_auto_constraints: true
+  bh_constraint_tolerance: 1.0e-5
+  bh_initial_min_iterations: 200
+  bh_min_iterations: 150
+  bh_restart_from_parent: true
+  nma_expand: false
+  progress_every: 1000
+  live_hist: true
+  hist_every: 1000
+  no_clear_screen: false
+  no_color: false
+
+# Stage 2. GAREUS seeded production.  This can read the same file:
+#   gareus --config chignolin_2d_distance_with_genpept.yaml
+output:
+  out: chignolin_2d_fix/
+  scratchdir: $SCRATCH
+  resume: false
+  traj_interval: 50
+  report_interval: 50
+  distance_output_interval: 50
+  checkpoint_interval: 50000
+  progress_mode: both
+  progress_update_interval_sec: 10.0
+  traj_format: xtc
+
+platform:
+  cpu_threads: 1
+  platform: CUDA
+  setup_platform: CUDA
+  setup_precision: mixed
+  setup_device_index: '0'
+  setup_cpu_threads: 8
+
+simulation:
+  run_mode: hmr-gamd
+  hmr: true
+  hydrogen_mass_amu: 3.024
+  timestep_fs: 4.0
+  nvt_warmup_timestep_fs: 0.5
+  npt_ramp_timestep_fs: 1.0
+  equil_safe_chunk_steps: 5000
+  box_shape: dodecahedron
+  padding_nm: 1.0
+  water_model: tip3p
+  ionic_strength_molar: 0.15
+
+cvs:
+  cv1: distance
+  cv2: rama-map
+
+windows:
+  window_mode: adaptive-feedback
+  adaptive_prescan_steps: 50000
+  adaptive_prescan_timestep_fs: 2.0
+  adaptive_window_aggressiveness: aggressive
+  adaptive_feedback_rounds: 3
+  adaptive_feedback_pilot_fraction: 0.006
+  adaptive_feedback_validation_steps: 10000
+  adaptive_min_windows: 4
+  adaptive_max_windows: 32
+
+primary_cv:
+  adaptive_min_k_kcal_a2: 0.5
+  adaptive_max_k_kcal_a2: 10.0
+
+secondary_cv:
+  adaptive_secondary_cv: auto
+  secondary_cv_k_mode: adaptive
+  secondary_cv_centers: [-1.0, 0.0, 1.0]
+  secondary_cv_adaptive_overlap_sigma: 20.0
+  secondary_cv_adaptive_min_k_kcal: 1.0
+  secondary_cv_adaptive_max_k_kcal: 50.0
+  secondary_cv_adaptive_min_sigma: 0.02
+  secondary_cv_adaptive_k_scale: 2.0
+
+gamd:
+  gamd_boost_type: lower-dual
+  gamd_production_steps: 3000000
+  sigma0p_kcal_mol: 4.0
+  sigma0d_kcal_mol: 4.0
+  gamd_cmd_prep_steps: 5000
+  gamd_cmd_steps: 100000
+  gamd_equil_prep_steps: 5000
+  gamd_equil_steps: 100000
+  gamd_averaging_window: 20000
+
+exchange:
+  exchange_mode: gibbs-walk
+  exchange_interval: 500
+
+tui:
+  tui_mode: interactive
+  tui_clear_mode: always
+
+starting_structures:
+  seed_conformers_dir: chignolin_genpept_seeds/
+  us_2d_start_relax_mode: auto
+  us_2d_start_distance_fraction: 0.05
+  us_2d_start_secondary_ramp_stages: 5
+  us_2d_start_secondary_k_pull_scale: 5.0
+  us_2d_start_minimize_each_ramp: false
+  us_2d_start_secondary_warn_delta: 0.35
+  us_2d_start_secondary_warn_bias_kcal: 1.0
+  us_2d_start_secondary_bad_bias_kcal: 5.0
+  us_pull_steps_per_window: 20000

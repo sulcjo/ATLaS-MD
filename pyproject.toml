@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gareus-peptide"
+version = "0.1.0"
+description = "Modular GaREUS/GaMD peptide simulation workflow with backward-compatible gareus_peptide shim."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Proprietary / research internal"}
+authors = [
+  {name = "GAREUS project"}
+]
+keywords = ["molecular dynamics", "OpenMM", "GaMD", "REUS", "umbrella sampling", "peptides"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Intended Audience :: Science/Research",
+  "Topic :: Scientific/Engineering :: Chemistry",
+]
+dependencies = [
+  "numpy>=1.23",
+]
+
+[project.optional-dependencies]
+config = ["PyYAML>=6"]
+openmm = [
+  "openmm>=8",
+  "pdbfixer",
+  "PeptideBuilder",
+]
+analysis = ["pymbar>=4"]
+dev = ["pytest>=7"]
+all = [
+  "PyYAML>=6",
+  "openmm>=8",
+  "pdbfixer",
+  "PeptideBuilder",
+  "pymbar>=4",
+  "pytest>=7",
+]
+
+[project.scripts]
+gareus-peptide = "gareus.core:main"
+gareus = "gareus.core:main"
+gareus-energy-decompose = "gareus.energy_decomposition:main"
+gareus-test-run = "gareus.integration_test:main"
+gareus-suggest-cvs = "gareus.cv_discovery:main"
+
+[tool.setuptools]
+py-modules = ["gareus_peptide", "GENPEPT"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["gareus*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
