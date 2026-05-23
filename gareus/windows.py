@@ -1123,21 +1123,40 @@ def load_explicit_2d_window_csv(args, path: Path) -> tuple[np.ndarray, list[floa
     type_counts: dict[str, int] = {}
 
     for offset, row in enumerate(rows, start=2):
+        primary_center_columns = [
+            "primary_cv_center", "primary_center", "primary_center_cv", "primary_cv_value",
+            "contact_cv_center", "contact_center", "primary_contact_center",
+            "distance_center_A", "primary_center_A", "center_A", "window_center_A", "r0_A",
+        ]
+        primary_k_columns = [
+            "primary_cv_k_kcal", "primary_k_kcal", "primary_cv_k_kcal_mol", "primary_k_kcal_mol",
+            "contact_cv_k_kcal", "contact_k_kcal", "primary_contact_k_kcal",
+            "distance_k_kcal_mol_A2", "primary_k_kcal_mol_A2", "k_kcal_mol_A2",
+            "window_k_kcal_mol_A2", "k_kcal/A2", "k_kcal", "k_kcal_mol_cv2",
+        ]
         center_a = _csv_float_field(
             row,
-            ["distance_center_A", "primary_center_A", "center_A", "window_center_A", "r0_A"],
+            primary_center_columns,
             offset,
-            "distance center (A)",
+            "primary-CV center (distance in A, contact fraction, or other primary-CV unit)",
         )
+        if primary_cv_is_contacts(args):
+            _manual_contact_k = getattr(args, "contact_k_kcal", None)
+            if _manual_contact_k is not None and len(_manual_contact_k) > 0:
+                default_primary_k = float(_manual_contact_k[0])
+            else:
+                default_primary_k = float(getattr(args, "contact_adaptive_default_k_kcal", getattr(args, "contact_adaptive_min_k_kcal", 25.0)) or 25.0)
+        else:
+            default_primary_k = float(getattr(args, "default_window_k_kcal_a2", 1.0) or 1.0)
         k = _csv_float_field(
             row,
-            ["distance_k_kcal_mol_A2", "primary_k_kcal_mol_A2", "k_kcal_mol_A2", "window_k_kcal_mol_A2", "k_kcal/A2"],
+            primary_k_columns,
             offset,
-            "distance force constant (kcal/mol/A^2)",
-            default=float(getattr(args, "default_window_k_kcal_a2", 1.0) or 1.0),
+            "primary-CV force constant (kcal/mol/A^2, kcal/mol/CV^2, or primary-CV units)",
+            default=default_primary_k,
         )
         if k < 0.0:
-            raise ValueError(f"distance force constant in explicit 2D window CSV row {offset} must be non-negative; got {k}")
+            raise ValueError(f"primary-CV force constant in explicit 2D window CSV row {offset} must be non-negative; got {k}")
 
         sec_raw = _csv_first_present(row, ["secondary_cv_center", "secondary_center", "secondary", "ss0", "secondary_cv_target"])
         has_secondary = sec_raw is not None
@@ -1180,8 +1199,13 @@ def load_explicit_2d_window_csv(args, path: Path) -> tuple[np.ndarray, list[floa
         if has_secondary:
             secondary_centers.append(float(sec))
             secondary_k_list.append(float(sec_k))
+        primary_mode = primary_cv_mode(args) if hasattr(args, "primary_cv") else "distance"
         normalized_rows.append({
             "window": int(idx),
+            "primary_cv_mode": str(primary_mode),
+            "primary_cv_center": float(center_a),
+            "primary_cv_k_kcal": float(k),
+            # Backward-compatible aliases retained for existing downstream code.
             "distance_center_A": float(center_a),
             "distance_k_kcal_mol_A2": float(k),
             "secondary_cv_center": "" if sec is None else float(sec),
@@ -1212,6 +1236,8 @@ def load_explicit_2d_window_csv(args, path: Path) -> tuple[np.ndarray, list[floa
         "n_total_windows": int(len(centers_a)),
         "n_primary_windows": int(len(primary_unique)),
         "n_secondary_centers": int(len(secondary_unique)),
+        "primary_cv_mode": primary_cv_mode(args) if hasattr(args, "primary_cv") else "distance",
+        "primary_centers": [float(x) for x in primary_unique],
         "primary_centers_A": [float(x) for x in primary_unique],
         "secondary_centers": [float(x) for x in secondary_unique],
         "window_type_counts": type_counts,

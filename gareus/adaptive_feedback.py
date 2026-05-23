@@ -1488,13 +1488,21 @@ def _adaptive_feedback_2d_sparse_patch_candidates(
     base_rows = []
     for i, row in enumerate(base_grid_rows or []):
         try:
+            pc = float(row.get("primary_cv_center", row.get("primary_center_A", row.get("distance_center_A"))))
+            pk = float(row.get("primary_cv_k_kcal", row.get("primary_k_kcal_mol_A2", row.get("distance_k_kcal_mol_A2"))))
             base_rows.append({
                 "candidate_window": int(i),
-                "window_type": "base_rectangular_grid",
-                "distance_center_A": float(row.get("primary_center_A", row.get("distance_center_A"))),
-                "distance_k_kcal_mol_A2": float(row.get("primary_k_kcal_mol_A2", row.get("distance_k_kcal_mol_A2"))),
+                "window_type": row.get("window_type", "base_rectangular_grid"),
+                "primary_cv_mode": str(row.get("primary_cv_mode", primary_cv_mode(args))),
+                "primary_cv_center": float(pc),
+                "primary_cv_k_kcal": float(pk),
+                # Legacy aliases retained because much of the downstream MD path still stores the
+                # primary coordinate in center_A-style arrays, even for non-distance CVs.
+                "distance_center_A": float(pc),
+                "distance_k_kcal_mol_A2": float(pk),
                 "secondary_cv_center": float(row.get("secondary_cv_center")),
                 "secondary_cv_k_kcal_mol": float(row.get("secondary_cv_k_kcal_mol")),
+                "secondary_cv_mode": str(row.get("secondary_cv_mode", secondary_cv_mode(args))),
                 "parent_edge": row.get("parent_edge", ""),
                 "source_window_i": row.get("source_window_i", ""),
                 "source_window_j": row.get("source_window_j", ""),
@@ -1503,7 +1511,7 @@ def _adaptive_feedback_2d_sparse_patch_candidates(
                 "target_overlap": row.get("target_overlap", ""),
                 "exchange_acceptance": row.get("exchange_acceptance", ""),
                 "priority": row.get("priority", ""),
-                "reason": row.get("reason", "base grid from axis-factorized adaptive proposal"),
+                "reason": row.get("reason", "base grid from adaptive-feedback proposal"),
                 "patch_lifecycle": row.get("patch_lifecycle", "base_or_manual_window"),
                 "use_in_current_production": False,
                 "used_by_adaptive_feedback_next_pilot_when_available": row.get("used_by_adaptive_feedback_next_pilot_when_available", True),
@@ -1569,15 +1577,25 @@ def _adaptive_feedback_2d_sparse_patch_candidates(
         row = candidates_by_key.get(key)
         source_edge = str(defect.get("edge", ""))
         if row is None:
-            dk_default = float(getattr(args, "default_window_k_kcal_a2", 1.0) or 1.0)
+            if primary_cv_is_contacts(args):
+                dk_default = float(getattr(args, "contact_adaptive_default_k_kcal", getattr(args, "contact_adaptive_min_k_kcal", 25.0)) or 25.0)
+            else:
+                dk_default = float(getattr(args, "default_window_k_kcal_a2", 1.0) or 1.0)
             sk_default = float(getattr(args, "secondary_cv_k_kcal", 25.0) or 25.0)
+            patch_pk = _adaptive_feedback_nearest_k_value(pc, proposed_primary, proposed_k, dk_default)
+            patch_sk = _adaptive_feedback_nearest_k_value(sc, proposed_secondary, proposed_secondary_k, sk_default)
             row = {
                 "candidate_window": -1,
                 "window_type": "local_midpoint_patch_candidate",
+                "primary_cv_mode": primary_cv_mode(args),
+                "primary_cv_center": float(pc),
+                "primary_cv_k_kcal": float(patch_pk),
+                # Backward-compatible aliases.  In contact mode these are contact-CV values, not Angstroms.
                 "distance_center_A": float(pc),
-                "distance_k_kcal_mol_A2": _adaptive_feedback_nearest_k_value(pc, proposed_primary, proposed_k, dk_default),
+                "distance_k_kcal_mol_A2": float(patch_pk),
+                "secondary_cv_mode": secondary_cv_mode(args),
                 "secondary_cv_center": float(sc),
-                "secondary_cv_k_kcal_mol": _adaptive_feedback_nearest_k_value(sc, proposed_secondary, proposed_secondary_k, sk_default),
+                "secondary_cv_k_kcal_mol": float(patch_sk),
                 "parent_edge": source_edge,
                 "source_window_i": int(defect.get("window_i", -1)),
                 "source_window_j": int(defect.get("window_j", -1)),
@@ -1590,6 +1608,7 @@ def _adaptive_feedback_2d_sparse_patch_candidates(
                 "supporting_edges": source_edge,
                 "reason": f"local {status} on {defect.get('edge_type', '2d_edge')}; midpoint patch only, not full row/column",
                 "use_in_current_production": False,
+                "used_by_adaptive_feedback_next_pilot_when_available": True,
                 "used_by_adaptive_feedback_final_production": True,
                 "requires_future_explicit_2d_window_support": False,
             }
@@ -1705,14 +1724,21 @@ def _adaptive_feedback_existing_explicit_rows_for_proposal(centers_a, k_list, se
         meta = normalized[i] if i < len(normalized) and isinstance(normalized[i], dict) else {}
         wtype = str(meta.get("window_type", meta.get("parent", meta.get("source", "explicit_2d_window"))))
         lifecycle = "retained_patch" if "patch" in wtype.lower() else "base_or_manual_window"
+        sec_val = float(secondary_cv_centers[i]) if secondary_cv_centers is not None and i < len(secondary_cv_centers) else ""
+        sec_k_val = float(secondary_cv_k_kcal_list[i]) if secondary_cv_k_kcal_list is not None and i < len(secondary_cv_k_kcal_list) else ""
         row = {
             "candidate_window": int(i),
             "window_type": wtype,
             "patch_lifecycle": lifecycle,
+            "primary_cv_mode": str(meta.get("primary_cv_mode", "")),
+            "primary_cv_center": float(c),
+            "primary_cv_k_kcal": float(k),
+            # Legacy aliases retained for current production arrays.
             "distance_center_A": float(c),
             "distance_k_kcal_mol_A2": float(k),
-            "secondary_cv_center": float(secondary_cv_centers[i]) if secondary_cv_centers is not None and i < len(secondary_cv_centers) else "",
-            "secondary_cv_k_kcal_mol": float(secondary_cv_k_kcal_list[i]) if secondary_cv_k_kcal_list is not None and i < len(secondary_cv_k_kcal_list) else "",
+            "secondary_cv_mode": str(meta.get("secondary_cv_mode", "")),
+            "secondary_cv_center": sec_val,
+            "secondary_cv_k_kcal_mol": sec_k_val,
             "parent_edge": str(meta.get("parent_edge", "")),
             "source_window_i": str(meta.get("source_window_i", "")),
             "source_window_j": str(meta.get("source_window_j", "")),
@@ -1995,8 +2021,12 @@ def run_adaptive_feedback_dispatcher_2d(args, out_dir: Path, centers_a, k_list, 
             expanded_secondary_k.append(float(sk))
             grid_rows.append({
                 "window": int(idx),
+                "primary_cv_mode": primary_cv_mode(args),
+                "primary_cv_center": float(pc),
+                "primary_cv_k_kcal": float(pk),
                 "primary_center_A": float(pc),
                 "primary_k_kcal_mol_A2": float(pk),
+                "secondary_cv_mode": secondary_cv_mode(args),
                 "secondary_cv_center": float(sc),
                 "secondary_cv_k_kcal_mol": float(sk),
             })
@@ -2007,15 +2037,14 @@ def run_adaptive_feedback_dispatcher_2d(args, out_dir: Path, centers_a, k_list, 
         proposed_primary, proposed_k, proposed_secondary, proposed_secondary_k,
         args, secondary_min=sec_min, secondary_max=sec_max,
     )
+    sparse_2d_enabled = bool(getattr(args, "sparse_2d_patches_enabled", True))
     if primary_cv_is_contacts(args):
-        # The explicit sparse-2D CSV path is still distance-column based.  For
-        # contact-primary adaptive-feedback, keep the factorized contact x
-        # secondary proposal and disable sparse local patch consumption until the
-        # explicit-table parser is upgraded to generic primary-CV columns.
+        sparse_2d_enabled = sparse_2d_enabled and bool(getattr(args, "contact_sparse_2d_patches_enabled", True))
+    if not sparse_2d_enabled:
         sparse_patch_rows = []
         explicit_candidate_rows = list(grid_rows)
         sparse_patch_skipped_rows = list(sparse_patch_skipped_rows) + [{
-            "reason": "sparse explicit 2D patches disabled for nonlocal-contact primary CV; using factorized contact x secondary proposal",
+            "reason": "sparse explicit 2D patches disabled by configuration; using factorized primary x secondary proposal",
             "primary_cv": primary_cv_mode(args),
         }]
 
@@ -2097,7 +2126,7 @@ def run_adaptive_feedback_dispatcher_2d(args, out_dir: Path, centers_a, k_list, 
         },
         "two_d_sparse_patch_proposal": {
             "description": "Candidate sparse midpoint windows derived from local 2D edge defects. In --window-mode adaptive-feedback, the automatic driver will use the explicit candidate table for the next pilot round and the final clean production run when patch candidates are present.",
-            "enabled_in_current_run": False,
+            "enabled_in_current_run": bool(sparse_2d_enabled),
             "used_by_adaptive_feedback_next_pilot_when_available": True,
             "used_by_adaptive_feedback_final_production_when_available": True,
             "base_rectangular_grid_windows": int(len(grid_rows)),
@@ -2127,7 +2156,7 @@ def run_adaptive_feedback_dispatcher_2d(args, out_dir: Path, centers_a, k_list, 
     write_json(out_dir / "adaptive_feedback_sparse_patch_proposal.json", _json_ready({
         "mode": "adaptive-feedback-2d-sparse-patch-candidates",
         "description": "Sparse local midpoint patches built from local 2D edge defects. The current pilot still uses its active window set, but --window-mode adaptive-feedback will consume this explicit candidate table for the next pilot and final clean production when patch candidates are present.",
-        "enabled_in_current_run": False,
+        "enabled_in_current_run": bool(sparse_2d_enabled),
         "used_by_adaptive_feedback_next_pilot_when_available": True,
         "used_by_adaptive_feedback_final_production_when_available": True,
         "base_rectangular_grid": grid_rows,
@@ -2144,10 +2173,10 @@ def run_adaptive_feedback_dispatcher_2d(args, out_dir: Path, centers_a, k_list, 
     write_json(out_dir / "adaptive_feedback_proposal.json", _json_ready(summary))
     print(f"Adaptive-feedback 2D proposal written to {out_dir / 'adaptive_feedback_proposal.json'}")
     print(f"    2D local diagnostics: {len(cell_rows_2d)} cells, {len(edge_rows_2d)} edges, {len(local_defect_rows_2d)} local defect rows")
-    if primary_cv_is_contacts(args):
-        print(f"    Sparse patch candidates disabled for contact-primary mode; using factorized contact x secondary grid ({len(expanded_centers)} windows)")
+    if sparse_2d_enabled:
+        print(f"    Sparse 2D patch candidates: {len(sparse_patch_rows)} local windows; adaptive-feedback will use the explicit candidate table in the next pilot/final when candidates are present ({len(explicit_candidate_rows)} windows)")
     else:
-        print(f"    Sparse patch candidates: {len(sparse_patch_rows)} local windows; adaptive-feedback will use the explicit candidate table in the next pilot/final when candidates are present ({len(explicit_candidate_rows)} windows)")
+        print(f"    Sparse 2D patches disabled; using factorized primary x secondary grid ({len(expanded_centers)} windows)")
     print(f"    {primary_cv_label(args)} centers {n_primary} -> {len(proposed_primary)}; secondary centers {n_secondary} -> {len(proposed_secondary)}; replicas {nwin} -> {len(expanded_centers)}")
     if total_budget_meta.get("enabled"):
         print(
@@ -3329,7 +3358,7 @@ def _load_adaptive_feedback_proposal(proposal_path: Path) -> Optional[dict]:
 
 
 
-def _adaptive_feedback_sparse_candidate_csv_from_proposal(proposal: Optional[dict], proposal_path: Path) -> Optional[Path]:
+def _adaptive_feedback_sparse_candidate_csv_from_proposal(args, proposal: Optional[dict], proposal_path: Path) -> Optional[Path]:
     """Return the sparse explicit-2D candidate CSV from a 2D proposal, if useful.
 
     The proposal still contains the axis-factorized rectangular centers for
@@ -3341,7 +3370,11 @@ def _adaptive_feedback_sparse_candidate_csv_from_proposal(proposal: Optional[dic
     """
     if not isinstance(proposal, dict):
         return None
-    if str(proposal.get("primary_cv", "distance")) == "nonlocal-contacts":
+    sparse_2d_enabled = bool(getattr(args, "sparse_2d_patches_enabled", True))
+    proposal_primary = str(proposal.get("primary_cv", primary_cv_mode(args) if args is not None else "distance"))
+    if proposal_primary == "nonlocal-contacts":
+        sparse_2d_enabled = sparse_2d_enabled and bool(getattr(args, "contact_sparse_2d_patches_enabled", True))
+    if not sparse_2d_enabled:
         return None
     sparse = proposal.get("two_d_sparse_patch_proposal")
     if not isinstance(sparse, dict):
@@ -3487,7 +3520,7 @@ def run_adaptive_feedback_auto_loop(args, out_dir: Path, openmm, app, unit, forc
             if isinstance(_existing_proposal.get("proposed_secondary_cv_k_kcal_mol"), list):
                 current_secondary_k = [float(x) for x in _existing_proposal.get("proposed_secondary_cv_k_kcal_mol")]
             adaptive_memory = _existing_proposal.get("adaptive_memory_after", adaptive_memory) if isinstance(_existing_proposal, dict) else adaptive_memory
-            current_windows_2d_csv = _adaptive_feedback_sparse_candidate_csv_from_proposal(_existing_proposal, round_dir / "adaptive_feedback_proposal.json")
+            current_windows_2d_csv = _adaptive_feedback_sparse_candidate_csv_from_proposal(args, _existing_proposal, round_dir / "adaptive_feedback_proposal.json")
             current_windows_2d_source_round = int(round_no) if current_windows_2d_csv is not None else None
             adaptive_workflow_done_so_far += current_pilot_steps
             print(f"    [resume] Pilot round {round_no}/{n_rounds} already complete; skipping MD and restoring proposal.")
@@ -3559,7 +3592,7 @@ def run_adaptive_feedback_auto_loop(args, out_dir: Path, openmm, app, unit, forc
             current_secondary_centers = [float(x) for x in proposal.get("proposed_secondary_cv_centers")]
         if isinstance(proposal.get("proposed_secondary_cv_k_kcal_mol"), list):
             current_secondary_k = [float(x) for x in proposal.get("proposed_secondary_cv_k_kcal_mol")]
-        current_windows_2d_csv = _adaptive_feedback_sparse_candidate_csv_from_proposal(proposal, proposal_path)
+        current_windows_2d_csv = _adaptive_feedback_sparse_candidate_csv_from_proposal(args, proposal, proposal_path)
         current_windows_2d_source_round = int(round_no) if current_windows_2d_csv is not None else None
         adaptive_memory = proposal.get("adaptive_memory_after", adaptive_memory) if isinstance(proposal, dict) else adaptive_memory
         write_json(out_dir / "adaptive_feedback_memory.json", _json_ready(adaptive_memory))

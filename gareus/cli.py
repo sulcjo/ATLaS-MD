@@ -146,7 +146,10 @@ def parse_args(argv: Optional[Iterable[str]] = None):
     p.add_argument("--adaptive-secondary-cv", choices=["auto", "fixed"], default="auto", help="For adaptive-feedback with --secondary-cv: auto adapts the secondary-CV center ladder as a second dimension; fixed keeps the user-provided secondary center(s) unchanged.")
     p.add_argument("--windows-a", nargs="+", type=float, default=[5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 21], help="Manual umbrella centers in Angstrom.")
     p.add_argument("--window-k-kcal-a2", nargs="*", type=float, default=None, help="Per-window force constants in kcal/mol/A^2.")
-    p.add_argument("--windows-2d-csv", default=None, help="Explicit per-window 2D umbrella table. Compatible with adaptive_feedback_explicit_window_candidates.csv; columns include distance_center_A, distance_k_kcal_mol_A2, secondary_cv_center, secondary_cv_k_kcal_mol. Bypasses rectangular cross-product expansion.")
+    p.add_argument("--windows-2d-csv", default=None, help="Explicit per-window 2D umbrella table. Compatible with adaptive_feedback_explicit_window_candidates.csv. Generic columns primary_cv_center/primary_cv_k_kcal plus secondary_cv_center/secondary_cv_k_kcal_mol are accepted; legacy distance_center_A/distance_k_kcal_mol_A2 remain supported. Bypasses rectangular cross-product expansion.")
+    p.add_argument("--sparse-2d-patches-enabled", action=argparse.BooleanOptionalAction, default=True, help="Enable generic sparse local 2D midpoint patches during adaptive-feedback. Works for any primary CV accepted by the primary-CV machinery; contact CVs get contact-specific units/bounds/K defaults.")
+    p.add_argument("--contact-sparse-2d-patches-enabled", action=argparse.BooleanOptionalAction, default=True, help="Contact-CV specific gate for sparse local 2D patches. This is checked in addition to --sparse-2d-patches-enabled when the primary CV is nonlocal-contacts.")
+    p.add_argument("--explicit-2d-window-schema", choices=["auto", "generic", "distance"], default="auto", help="Accepted schema for explicit 2D window CSVs. auto/generic accept primary_cv_* contact/distance-neutral fields and legacy distance_* aliases; distance documents the old alias names.")
     p.add_argument("--explicit-2d-exchange-neighbor-k", type=int, default=2, help="For --windows-2d-csv with --exchange-mode neighbor: add up to this many normalized k-nearest geometry edges per window in addition to row/column edges.")
     p.add_argument("--explicit-2d-exchange-radius", type=float, default=1.65, help="Normalized distance cutoff for extra k-nearest explicit-2D neighbor edges.")
     p.add_argument("--explicit-2d-exchange-slots", type=int, default=4, help="Round-robin slots for explicit-2D neighbor graph exchange scheduling; higher values reduce simultaneous edge attempts per interval.")
@@ -363,8 +366,9 @@ def parse_args(argv: Optional[Iterable[str]] = None):
     if args.primary_cv == "nonlocal-contacts":
         if args.contact_scheme not in {"atom-pairs", "residue-balanced", "ca-pairs"}:
             raise ValueError("--contact-scheme must be atom-pairs, residue-balanced, or ca-pairs")
-        if getattr(args, "windows_2d_csv", None):
-            raise ValueError("--windows-2d-csv remains distance-explicit for now; use contact centers/adaptive contact windows plus --secondary-cv-centers.")
+        # Explicit sparse 2D window tables are generic over the primary CV.
+        # In contact mode the primary values are dimensionless contact-CV centers
+        # even when legacy distance_* column aliases are used for compatibility.
         if not math.isfinite(float(getattr(args, "contact_r0_a", 4.5))) or float(getattr(args, "contact_r0_a", 4.5)) <= 0.0:
             raise ValueError("--contact-r0-a must be positive and finite")
         if not math.isfinite(float(getattr(args, "contact_beta_a_inv", 6.0))) or float(getattr(args, "contact_beta_a_inv", 6.0)) <= 0.0:
