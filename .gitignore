@@ -13,5 +13,6 @@ chignolin_genpept_seeds/
 chignolin_2d_newpackage/
 ABCold_monolith/
 
+*.tar.gz
 *.txt
 *.md
