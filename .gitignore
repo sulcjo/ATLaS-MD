@@ -3,6 +3,7 @@ __pycache__/
 .remember/
 .codex/
 .agents/
+query_gpt.py
 
 *.swp
 *.swo
