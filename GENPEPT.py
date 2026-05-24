@@ -4761,6 +4761,8 @@ def generate_adaptive_frontier_proposals(args, round_dir: Path, round_i: int, mo
         write_pdbs=False,
         rama_sampling=str(getattr(args, "rama_sampling", "stratified")),
         generation_backend=str(getattr(args, "generation_backend", "fast")),
+        diversity_bank_preset=str(getattr(args, "diversity_bank_preset", "off")),
+        diversity_bank_wide_angle_sd=float(getattr(args, "diversity_bank_wide_angle_sd", 45.0)),
     )
 
     rng = np.random.default_rng(args.seed + 424242 + round_i)
@@ -7008,12 +7010,17 @@ def parse_args(argv=None):
     p.add_argument("--no-smart-search", dest="smart_search", action="store_false", help=argparse.SUPPRESS)
     p.add_argument("--bh-from-candidates", dest="bh_from_candidates", action="store_true", help=argparse.SUPPRESS)
 
-    # Compatibility flags accepted by newer adaptive scripts. This v2 CLI base
-    # does not run adaptive PCA exploration; these are accepted as no-ops.
-    p.add_argument("--explore-loop", action="store_true")
-    p.add_argument("--explore-rounds", type=int, default=0)
-    p.add_argument("--explore-proposals", type=int, default=0)
-    p.add_argument("--explore-keep", type=int, default=0)
+    # Adaptive PCA frontier exploration. This is a cheap proposal/minimize loop:
+    # current relaxed archive -> 2D PCA/contact-shape frontier map -> cheap
+    # Ramachandran proposals -> keep sparse/frontier hits -> implicit minimize.
+    p.add_argument("--explore-loop", action="store_true",
+                   help="Enable adaptive PCA frontier exploration after BH/NMA, before final survivor selection.")
+    p.add_argument("--explore-rounds", type=int, default=0,
+                   help="Number of adaptive PCA frontier rounds. If --explore-loop is set and this is 0, a safe default of 1 is used.")
+    p.add_argument("--explore-proposals", type=int, default=0,
+                   help="Cheap Ramachandran proposals generated per PCA frontier round. If 0 with --explore-loop, defaults to max(10000, 20*explore_keep).")
+    p.add_argument("--explore-keep", type=int, default=0,
+                   help="Maximum frontier proposal PDBs kept/minimized per round. If 0 with --explore-loop, defaults to max(100, n_final_seeds//5).")
     p.add_argument("--explore-max-kept-per-bin", type=int, default=5,
                    help="Maximum accepted adaptive-PCA proposals kept per PCA bin before minimization. Use 0 to disable the per-bin cap.")
     p.add_argument("--explore-bins", type=int, default=40)
@@ -8283,6 +8290,18 @@ def main(argv=None):
         # SIRAH consumes the final selected implicit minima directly. Do not run
         # the atomistic explicit-solvent minimization stage in this workflow.
         args.implicit_only = True
+
+    if getattr(args, "explore_loop", False):
+        # Make --explore-loop useful even when a config only toggles it on.
+        # These defaults are deliberately modest; production configs should set
+        # explicit values. They also prevent the confusing "enabled but did
+        # exactly zero rounds" outcome.
+        if int(getattr(args, "explore_rounds", 0) or 0) <= 0:
+            args.explore_rounds = 1
+        if int(getattr(args, "explore_keep", 0) or 0) <= 0:
+            args.explore_keep = max(100, int(getattr(args, "n_final_seeds", 500) or 500) // 5)
+        if int(getattr(args, "explore_proposals", 0) or 0) <= 0:
+            args.explore_proposals = max(10000, int(args.explore_keep) * 20)
 
     if args.water not in FF_CHOICES[args.ff]["waters"]:
         valid = ", ".join(FF_CHOICES[args.ff]["waters"])

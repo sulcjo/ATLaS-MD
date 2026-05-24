@@ -3,15 +3,18 @@ __pycache__/
 .remember/
 .codex/
 .agents/
+_local_docs/
 query_gpt.py
 
 *.swp
 *.swo
 *.kate-swp
+*.pdb
 
 chignolin_genpept_seeds/
 chignolin_2d_newpackage/
 ABCold_monolith/
+_genpept_test/chignolin_genpept_run??_*/
 
 *.tar.gz
 *.txt

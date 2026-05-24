@@ -1,0 +1,58 @@
+# RUN 02: raw generation only control
+# Purpose: Same raw generation and candidate-minimization scale as run 01, but no BH/NMA. Tests whether the expansion stages are necessary beyond pure generation.
+
+genpept:
+  # Basic run identity
+  seq: "GYDPETGTWG"
+  out: "chignolin_genpept_run02_raw_generation_only"
+  clean: true
+
+  # Main workflow
+  two_stage: true
+  implicit_only: true
+
+  # Initial Ramachandran generation / candidate selection
+  n: 500000
+  n_candidate_seeds: 5000
+  n_final_seeds: 2000
+
+  generation_backend: fast
+  rama_sampling: stratified
+  initial_diversity_features: mixed
+  diversity_bank_preset: broad
+
+  # Cheap coarse quota filter before expensive clustering/minimization
+  preselection_bin_quota: 3
+  preselection_rg_bin_A: 1.0
+  preselection_e2e_bin_A: 1.0
+  preselection_contact_bin: 2
+  preselection_include_bank: true
+
+  # Implicit minimization
+  adaptive_min: true
+  implicit_max_iterations: 300
+  adaptive_min_chunk_iterations: 25
+  adaptive_min_energy_tol: 0.05
+  adaptive_min_force_tol: 500.0
+  adaptive_min_stall_rounds: 2
+
+  # Basin hopping disabled for this control
+  basin_hop: false
+
+  # NMA disabled for this control
+  nma_expand: false
+
+  # OpenMM / runtime
+  ff: amber14
+  water: tip3pfb
+  ph: 7.0
+  temperature: 300.0
+  platform: OpenCL        # change to CUDA, auto, or CPU if needed
+  precision: mixed
+  min_jobs: 1             # keep 1 for one GPU
+  jobs: 8
+  cpu_threads: 4
+
+  # Output / UI niceties
+  live_hist: true
+  turbo_summary: true

@@ -1,0 +1,61 @@
+# RUN 04: NMA-only control
+# Purpose: Runs NMA without BH. Candidate count is deliberately smaller because otherwise NMA expands every implicit-minimized candidate and creates a probe tsunami.
+
+genpept:
+  # Basic run identity
+  seq: "GYDPETGTWG"
+  out: "chignolin_genpept_run04_nma_only"
+  clean: true
+
+  # Main workflow
+  two_stage: true
+  implicit_only: true
+
+  # Initial Ramachandran generation / candidate selection
+  n: 150000
+  n_candidate_seeds: 800
+  n_final_seeds: 1800
+
+  generation_backend: fast
+  rama_sampling: stratified
+  initial_diversity_features: mixed
+  diversity_bank_preset: broad
+
+  # Cheap coarse quota filter before expensive clustering/minimization
+  preselection_bin_quota: 3
+  preselection_rg_bin_A: 1.0
+  preselection_e2e_bin_A: 1.0
+  preselection_contact_bin: 2
+  preselection_include_bank: true
+
+  # Implicit minimization
+  adaptive_min: true
+  implicit_max_iterations: 300
+  adaptive_min_chunk_iterations: 25
+  adaptive_min_energy_tol: 0.05
+  adaptive_min_force_tol: 500.0
+  adaptive_min_stall_rounds: 2
+
+  # Basin hopping disabled for this control
+  basin_hop: false
+
+  # ANM/NMA collective expansion
+  nma_expand: true
+  nma_modes: 3
+  nma_amplitudes: "0.75,1.25,1.75,2.15"
+  nma_cutoff: 12.0
+
+  # OpenMM / runtime
+  ff: amber14
+  water: tip3pfb
+  ph: 7.0
+  temperature: 300.0
+  platform: OpenCL        # change to CUDA, auto, or CPU if needed
+  precision: mixed
+  min_jobs: 1             # keep 1 for one GPU
+  jobs: 8
+  cpu_threads: 4
+
+  # Output / UI niceties
+  live_hist: true
+  turbo_summary: true

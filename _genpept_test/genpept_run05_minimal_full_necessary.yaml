@@ -1,0 +1,71 @@
+# RUN 05: cheaper full-pipeline necessity test
+# Purpose: Small full pipeline. Tests how much of the full-run benefit survives with much cheaper BH and NMA settings.
+
+genpept:
+  # Basic run identity
+  seq: "GYDPETGTWG"
+  out: "chignolin_genpept_run05_minimal_full"
+  clean: true
+
+  # Main workflow
+  two_stage: true
+  implicit_only: true
+
+  # Initial Ramachandran generation / candidate selection
+  n: 100000
+  n_candidate_seeds: 1500
+  n_final_seeds: 1000
+
+  generation_backend: fast
+  rama_sampling: stratified
+  initial_diversity_features: mixed
+  diversity_bank_preset: broad
+
+  # Cheap coarse quota filter before expensive clustering/minimization
+  preselection_bin_quota: 2
+  preselection_rg_bin_A: 1.0
+  preselection_e2e_bin_A: 1.0
+  preselection_contact_bin: 2
+  preselection_include_bank: true
+
+  # Implicit minimization
+  adaptive_min: true
+  implicit_max_iterations: 300
+  adaptive_min_chunk_iterations: 25
+  adaptive_min_energy_tol: 0.05
+  adaptive_min_force_tol: 500.0
+  adaptive_min_stall_rounds: 2
+
+  # Basin hopping / MC local basin search
+  basin_hop: true
+  bh_parent_seeds: 100
+  bh_steps: 3
+  bh_md_steps: 300
+  bh_temperature: 650.0
+  bh_friction: 5.0
+  bh_timestep: 0.0035
+  bh_hmr_mass: 3.014
+  bh_initial_min_iterations: 200
+  bh_min_iterations: 150
+  bh_restart_from_parent: true
+
+  # ANM/NMA collective expansion
+  nma_expand: true
+  nma_modes: 2
+  nma_amplitudes: "1.0,1.5"
+  nma_cutoff: 12.0
+
+  # OpenMM / runtime
+  ff: amber14
+  water: tip3pfb
+  ph: 7.0
+  temperature: 300.0
+  platform: OpenCL        # change to CUDA, auto, or CPU if needed
+  precision: mixed
+  min_jobs: 1             # keep 1 for one GPU
+  jobs: 8
+  cpu_threads: 4
+
+  # Output / UI niceties
+  live_hist: true
+  turbo_summary: true
