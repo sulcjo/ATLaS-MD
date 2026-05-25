@@ -30,19 +30,15 @@ from .helptext import SimpleHelpAction, HeavyHelpAction
 
 __all__ = ["parse_args", "main"]
 
-def parse_args(argv: Optional[Iterable[str]] = None):
-    argv_list = _argv_as_list(argv)
-    pre = argparse.ArgumentParser(add_help=False)
-    pre.add_argument("--config", default=None)
-    pre.add_argument("--write-config-template", nargs="?", const="chignolin_adaptive_feedback.yaml", default=None)
-    pre_args, _pre_unknown = pre.parse_known_args(argv_list)
 
-    p = argparse.ArgumentParser(
-        prog="gareus",
-        add_help=False,
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        description="GAREUS peptide GaMD/REUS workflow. Use -h for concise help or -hh for the method encyclopedia.",
-    )
+# ---------------------------------------------------------------------------
+# parse_args helpers — each adds one logical group of CLI flags to a parser.
+# None of these functions change argument names, defaults, or behavior;
+# they are pure structural decompositions of the original monolithic function.
+# ---------------------------------------------------------------------------
+
+def _add_core_args(p: argparse.ArgumentParser) -> None:
+    """Add help, config, I/O, sequence, and seed arguments."""
     p.add_argument("-h", "--help", action=SimpleHelpAction, help="Show concise practical help and exit.")
     p.add_argument("-hh", "--help-heavy", action=HeavyHelpAction, help="Show method encyclopedia, equations, design notes, and complete option reference; then exit.")
     p.add_argument("--config", default=None, help="YAML/JSON config file. Nested groups are allowed; leaf keys use argparse dest names. CLI flags override config values.")
@@ -52,6 +48,9 @@ def parse_args(argv: Optional[Iterable[str]] = None):
     p.add_argument("--out", default="gareus_peptide_out", help="Output directory.")
     p.add_argument("--seed", type=int, default=2026)
 
+
+def _add_system_args(p: argparse.ArgumentParser) -> None:
+    """Add peptide system / OpenMM simulation setup arguments."""
     p.add_argument("--initial-phi", type=float, default=-60.0, help="Initial PeptideBuilder internal phi angle for residues where applicable.")
     p.add_argument("--initial-psi", type=float, default=-45.0, help="Initial PeptideBuilder previous-residue psi angle for residues where applicable.")
     p.add_argument("--ph", type=float, default=7.0)
@@ -87,6 +86,9 @@ def parse_args(argv: Optional[Iterable[str]] = None):
     p.add_argument("--hmr", action="store_true", help="Enable hydrogen mass repartitioning.")
     p.add_argument("--hydrogen-mass-amu", type=float, default=0.0, help="Hydrogen mass for HMR; 0 means use 3.024 when --hmr is set.")
 
+
+def _add_cv_args(p: argparse.ArgumentParser) -> None:
+    """Add collective-variable (CV) arguments: primary and secondary CVs."""
     p.add_argument("--cv1", choices=["distance", "contacts", "nonlocal-contacts"], default=None, help="Friendly primary-CV selector. --cv1 distance maps to --primary-cv distance; --cv1 contacts maps to --primary-cv nonlocal-contacts.")
     p.add_argument("--cv2", choices=["none", "alpha", "beta", "alpha-coil-beta", "acb", "rama-map", "rama-regions", "rama", "ramachandran", "ramachandran-regions", "custom"], default=None, help="Friendly secondary-CV selector. Any non-none value enables a real 2D workflow; if no --secondary-cv-centers are supplied, sensible default centers are inserted automatically.")
     p.add_argument("--cv-mode", choices=["terminal-ca", "terminal-n-c"], default="terminal-ca")
@@ -134,6 +136,45 @@ def parse_args(argv: Optional[Iterable[str]] = None):
     p.add_argument("--contact-autocalibration-required", action=argparse.BooleanOptionalAction, default=False, help="If true, abort when contact-CV autocalibration fails instead of falling back to configured bounds.")
     p.add_argument("--contact-pair-warning-threshold", type=int, default=5000, help="Warn when the nonlocal-contact CV contains more atom pairs than this threshold.")
     p.add_argument("--self-test-primary-cv-force", action="store_true", help="Construct and evaluate the selected primary-CV OpenMM force in a tiny test Context, then exit. Currently most useful for validating --primary-cv nonlocal-contacts on a given OpenMM installation.")
+    p.add_argument("--secondary-cv", choices=["none", "alpha", "beta", "alpha-coil-beta", "acb", "rama-map", "rama-regions", "rama", "ramachandran", "ramachandran-regions", "custom"], default="none", help="Optional second umbrella CV based on smooth backbone phi/psi secondary-structure content. alpha and beta are 0..1 content scores; alpha-coil-beta/acb is a signed alpha-minus-beta coordinate; rama-map is an explicit beta/PPII/right-alpha/left-alpha Ramachandran basin map; rama-regions is the older signed soft region coordinate; custom uses --secondary-cv-phi0-deg/--secondary-cv-psi0-deg.")
+    p.add_argument("--secondary-cv-center", type=float, default=None, help="Secondary-CV target for all windows when --secondary-cv-centers is not provided. For alpha/beta/custom this is roughly 0..1; for alpha-coil-beta, rama-map, and rama-regions it is -1..1 and defaults internally to 0.0 if no center list is supplied.")
+    p.add_argument("--secondary-cv-centers", nargs="*", type=float, default=None, help="Secondary-CV targets. One value restrains all distance windows to that target; multiple values create a 2D grid by crossing every distance window with every secondary-CV target. For alpha-coil-beta use e.g. -0.8 0.0 0.8; for rama-map use the default basin centers -1 -0.333333 0.333333 1; for rama-regions use e.g. -1 -0.5 0 0.5 1.")
+    p.add_argument("--secondary-cv-k-kcal", type=float, default=50.0, help="Fixed secondary-CV harmonic force constant in kcal/mol/CV^2, or the one-center fallback when --secondary-cv-k-mode spacing is requested. This is not per-Angstrom; the CV is dimensionless.")
+    p.add_argument("--secondary-cv-k-mode", choices=["fixed", "constant", "spacing", "adaptive"], default="fixed", help="How to assign secondary-CV force constants. fixed/constant repeats --secondary-cv-k-kcal; spacing/adaptive mirrors the primary CV adaptive-k formula in dimensionless CV units using secondary-CV center spacing.")
+    p.add_argument("--secondary-cv-adaptive-overlap-sigma", type=float, default=0.0, help="Spacing/adaptive secondary-CV k parameter: sigma_CV ~= spacing/this value. 0 = reuse --adaptive-overlap-sigma. Larger values make stronger secondary-CV k.")
+    p.add_argument("--secondary-cv-adaptive-min-k-kcal", type=float, default=0.0, help="Minimum spacing/adaptive secondary-CV k in kcal/mol/CV^2.")
+    p.add_argument("--secondary-cv-adaptive-max-k-kcal", type=float, default=500.0, help="Maximum spacing/adaptive secondary-CV k in kcal/mol/CV^2.")
+    p.add_argument("--secondary-cv-adaptive-min-sigma", type=float, default=0.02, help="Lower bound on spacing-derived secondary-CV sigma before computing kBT/sigma^2; prevents extreme k for nearly duplicate centers.")
+    p.add_argument("--secondary-cv-adaptive-k-scale", type=float, default=1.0, help="Extra multiplier for spacing/adaptive secondary-CV k values after kBT/sigma^2.")
+    p.add_argument("--secondary-cv-sigma-deg", type=float, default=35.0, help="Angular width in degrees for the smooth phi/psi content score.")
+    p.add_argument("--secondary-cv-phi0-deg", type=float, default=-60.0, help="Custom secondary-CV phi target in degrees, used with --secondary-cv custom.")
+    p.add_argument("--secondary-cv-psi0-deg", type=float, default=-45.0, help="Custom secondary-CV psi target in degrees, used with --secondary-cv custom.")
+    p.add_argument("--secondary-cv-force-group", type=int, default=29, help="OpenMM force group for the optional secondary-structure CV bias. Must be 0..31; default 29 avoids the primary umbrella group 31 and restraint group 30.")
+
+
+def _add_window_args(p: argparse.ArgumentParser) -> None:
+    """Add umbrella window layout, adaptive-feedback, and US pulling arguments."""
+    p.add_argument("--us-starting-structure-mode", choices=["pull", "npt", "equilibrated", "same", "none"], default="pull", help="How to generate initial coordinates for each umbrella window. 'pull' performs a pre-production CV pulling walk and uses the resulting window conformers; 'npt' starts every replica from the same NPT state.")
+    p.add_argument("--us-pull-steps-per-window", type=int, default=5000, help="Plain Langevin steps used to relax/pull into each umbrella starting structure before GaMD calibration.")
+    p.add_argument("--us-pull-k-kcal-a2", type=float, default=5.0, help="Harmonic CV force constant for generating US starting conformers, in kcal/mol/A^2. This is only for pre-production pulling, not the production umbrella k values. In contact mode this legacy value is interpreted as kcal/mol/CV^2 unless contact-specific options override it.")
+    p.add_argument("--contact-us-pull-k-kcal", type=float, default=None, help="Contact-mode-only pre-production starting-pull k in kcal/mol/CV^2. Overrides --us-pull-k-kcal-a2 for --primary-cv nonlocal-contacts.")
+    p.add_argument("--contact-us-pull-max-k-kcal", type=float, default=20.0, help="Contact-mode safety cap for legacy --us-pull-k-kcal-a2 when --contact-us-pull-k-kcal is not set.")
+    p.add_argument("--us-pull-timestep-fs", type=float, default=0.0, help="Pre-production US pulling timestep. 0 = min(--timestep-fs, 2 fs).")
+    p.add_argument("--contact-us-pull-timestep-fs", type=float, default=1.0, help="Maximum timestep for contact-mode pre-production starting pulls. Contact pulls are capped to this value for stability.")
+    p.add_argument("--contact-us-pull-ramp-stages", type=int, default=8, help="Number of r0/k ramp stages for contact-mode primary-CV starting pulls.")
+    p.add_argument("--contact-us-pull-safe-chunk-steps", type=int, default=100, help="Maximum run_steps_safely chunk size for contact-mode starting pulls.")
+    p.add_argument("--contact-us-pull-min-friction-per-ps", type=float, default=20.0, help="Minimum Langevin friction used during contact-mode starting pulls.")
+    p.add_argument("--contact-us-pull-minimize-first-ramp", action=argparse.BooleanOptionalAction, default=True, help="Minimize briefly at the first contact primary-CV ramp stage.")
+    p.add_argument("--us-pull-friction-per-ps", type=float, default=10.0, help="Langevin friction used only for pre-production US starting-structure pulling.")
+    p.add_argument("--us-pull-minimize-iterations", type=int, default=100, help="Energy-minimization iterations at each pulled umbrella starting center.")
+    p.add_argument("--us-2d-start-relax-mode", choices=["auto", "staged", "off", "single", "ramp"], default="auto", help="For secondary-CV windows, pre-relax starting structures with distance-only pulling followed by a gradual secondary-CV ramp. auto/staged enables this when CV2 is active; off/single preserves one-stage behavior.")
+    p.add_argument("--us-2d-start-distance-fraction", type=float, default=0.50, help="Fraction of --us-pull-steps-per-window spent relaxing the distance CV before ramping the secondary CV in staged 2D starting-structure preparation.")
+    p.add_argument("--us-2d-start-secondary-ramp-stages", type=int, default=3, help="Number of secondary-CV force-ramp stages after the distance-only stage for 2D starting structures.")
+    p.add_argument("--us-2d-start-minimize-each-ramp", action="store_true", help="Minimize briefly at each secondary-CV ramp stage during 2D starting-structure preparation.")
+    p.add_argument("--us-2d-start-secondary-warn-delta", type=float, default=0.35, help="Warn if the starting secondary CV is this far from its target after 2D starting-structure preparation.")
+    p.add_argument("--us-2d-start-secondary-warn-bias-kcal", type=float, default=1.0, help="Warn if the starting secondary-CV bias exceeds this value in kcal/mol.")
+    p.add_argument("--us-2d-start-secondary-bad-bias-kcal", type=float, default=5.0, help="Mark a starting structure bad if the starting secondary-CV bias exceeds this value in kcal/mol.")
+    p.add_argument("--us-2d-start-secondary-k-pull-scale", type=float, default=1.0, help="Multiply the secondary-CV force constant by this factor during the 2D starting-structure pull ramp (production k is restored before saving). Values >1 push harder in fewer steps; try 5.0 with --us-2d-start-distance-fraction 0.05 to keep wall time near the 1D baseline.")
     p.add_argument("--window-mode", choices=["adaptive", "manual", "adaptive-feedback"], default="adaptive", help="manual: use --windows-a; adaptive: choose initial windows; adaptive-feedback: run short automatic feedback round(s), then a final full production run with the proposed fixed windows. In 2D secondary-CV runs, sparse local patch candidates are consumed automatically for final production when present.")
     p.add_argument("--adaptive-feedback-rounds", type=int, default=3, help="For --window-mode adaptive-feedback: number of short pilot refinement rounds before the final full production run. Default 3: usually enough for one broad diagnosis, one correction, and one validation pass; early convergence can skip remaining rounds.")
     p.add_argument("--adaptive-feedback-pilot-fraction", type=float, default=0.05, help="For --window-mode adaptive-feedback: pilot GaMD production fraction per refinement round relative to --gamd-production-steps. Default 0.05 = 1/20 of final production.")
@@ -174,41 +215,10 @@ def parse_args(argv: Optional[Iterable[str]] = None):
     p.add_argument("--adaptive-prescan-timestep-fs", type=float, default=1.0)
     p.add_argument("--adaptive-prescan-margin-a", type=float, default=1.0)
     p.add_argument("--umbrella-force-group", type=int, default=31)
-    p.add_argument("--secondary-cv", choices=["none", "alpha", "beta", "alpha-coil-beta", "acb", "rama-map", "rama-regions", "rama", "ramachandran", "ramachandran-regions", "custom"], default="none", help="Optional second umbrella CV based on smooth backbone phi/psi secondary-structure content. alpha and beta are 0..1 content scores; alpha-coil-beta/acb is a signed alpha-minus-beta coordinate; rama-map is an explicit beta/PPII/right-alpha/left-alpha Ramachandran basin map; rama-regions is the older signed soft region coordinate; custom uses --secondary-cv-phi0-deg/--secondary-cv-psi0-deg.")
-    p.add_argument("--secondary-cv-center", type=float, default=None, help="Secondary-CV target for all windows when --secondary-cv-centers is not provided. For alpha/beta/custom this is roughly 0..1; for alpha-coil-beta, rama-map, and rama-regions it is -1..1 and defaults internally to 0.0 if no center list is supplied.")
-    p.add_argument("--secondary-cv-centers", nargs="*", type=float, default=None, help="Secondary-CV targets. One value restrains all distance windows to that target; multiple values create a 2D grid by crossing every distance window with every secondary-CV target. For alpha-coil-beta use e.g. -0.8 0.0 0.8; for rama-map use the default basin centers -1 -0.333333 0.333333 1; for rama-regions use e.g. -1 -0.5 0 0.5 1.")
-    p.add_argument("--secondary-cv-k-kcal", type=float, default=50.0, help="Fixed secondary-CV harmonic force constant in kcal/mol/CV^2, or the one-center fallback when --secondary-cv-k-mode spacing is requested. This is not per-Angstrom; the CV is dimensionless.")
-    p.add_argument("--secondary-cv-k-mode", choices=["fixed", "constant", "spacing", "adaptive"], default="fixed", help="How to assign secondary-CV force constants. fixed/constant repeats --secondary-cv-k-kcal; spacing/adaptive mirrors the primary CV adaptive-k formula in dimensionless CV units using secondary-CV center spacing.")
-    p.add_argument("--secondary-cv-adaptive-overlap-sigma", type=float, default=0.0, help="Spacing/adaptive secondary-CV k parameter: sigma_CV ~= spacing/this value. 0 = reuse --adaptive-overlap-sigma. Larger values make stronger secondary-CV k.")
-    p.add_argument("--secondary-cv-adaptive-min-k-kcal", type=float, default=0.0, help="Minimum spacing/adaptive secondary-CV k in kcal/mol/CV^2.")
-    p.add_argument("--secondary-cv-adaptive-max-k-kcal", type=float, default=500.0, help="Maximum spacing/adaptive secondary-CV k in kcal/mol/CV^2.")
-    p.add_argument("--secondary-cv-adaptive-min-sigma", type=float, default=0.02, help="Lower bound on spacing-derived secondary-CV sigma before computing kBT/sigma^2; prevents extreme k for nearly duplicate centers.")
-    p.add_argument("--secondary-cv-adaptive-k-scale", type=float, default=1.0, help="Extra multiplier for spacing/adaptive secondary-CV k values after kBT/sigma^2.")
-    p.add_argument("--secondary-cv-sigma-deg", type=float, default=35.0, help="Angular width in degrees for the smooth phi/psi content score.")
-    p.add_argument("--secondary-cv-phi0-deg", type=float, default=-60.0, help="Custom secondary-CV phi target in degrees, used with --secondary-cv custom.")
-    p.add_argument("--secondary-cv-psi0-deg", type=float, default=-45.0, help="Custom secondary-CV psi target in degrees, used with --secondary-cv custom.")
-    p.add_argument("--secondary-cv-force-group", type=int, default=29, help="OpenMM force group for the optional secondary-structure CV bias. Must be 0..31; default 29 avoids the primary umbrella group 31 and restraint group 30.")
-    p.add_argument("--us-starting-structure-mode", choices=["pull", "npt", "equilibrated", "same", "none"], default="pull", help="How to generate initial coordinates for each umbrella window. 'pull' performs a pre-production CV pulling walk and uses the resulting window conformers; 'npt' starts every replica from the same NPT state.")
-    p.add_argument("--us-pull-steps-per-window", type=int, default=5000, help="Plain Langevin steps used to relax/pull into each umbrella starting structure before GaMD calibration.")
-    p.add_argument("--us-pull-k-kcal-a2", type=float, default=5.0, help="Harmonic CV force constant for generating US starting conformers, in kcal/mol/A^2. This is only for pre-production pulling, not the production umbrella k values. In contact mode this legacy value is interpreted as kcal/mol/CV^2 unless contact-specific options override it.")
-    p.add_argument("--contact-us-pull-k-kcal", type=float, default=None, help="Contact-mode-only pre-production starting-pull k in kcal/mol/CV^2. Overrides --us-pull-k-kcal-a2 for --primary-cv nonlocal-contacts.")
-    p.add_argument("--contact-us-pull-max-k-kcal", type=float, default=20.0, help="Contact-mode safety cap for legacy --us-pull-k-kcal-a2 when --contact-us-pull-k-kcal is not set.")
-    p.add_argument("--us-pull-timestep-fs", type=float, default=0.0, help="Pre-production US pulling timestep. 0 = min(--timestep-fs, 2 fs).")
-    p.add_argument("--contact-us-pull-timestep-fs", type=float, default=1.0, help="Maximum timestep for contact-mode pre-production starting pulls. Contact pulls are capped to this value for stability.")
-    p.add_argument("--contact-us-pull-ramp-stages", type=int, default=8, help="Number of r0/k ramp stages for contact-mode primary-CV starting pulls.")
-    p.add_argument("--contact-us-pull-safe-chunk-steps", type=int, default=100, help="Maximum run_steps_safely chunk size for contact-mode starting pulls.")
-    p.add_argument("--contact-us-pull-min-friction-per-ps", type=float, default=20.0, help="Minimum Langevin friction used during contact-mode starting pulls.")
-    p.add_argument("--contact-us-pull-minimize-first-ramp", action=argparse.BooleanOptionalAction, default=True, help="Minimize briefly at the first contact primary-CV ramp stage.")
-    p.add_argument("--us-pull-friction-per-ps", type=float, default=10.0, help="Langevin friction used only for pre-production US starting-structure pulling.")
-    p.add_argument("--us-pull-minimize-iterations", type=int, default=100, help="Energy-minimization iterations at each pulled umbrella starting center.")
-    p.add_argument("--us-2d-start-relax-mode", choices=["auto", "staged", "off", "single", "ramp"], default="auto", help="For secondary-CV windows, pre-relax starting structures with distance-only pulling followed by a gradual secondary-CV ramp. auto/staged enables this when CV2 is active; off/single preserves one-stage behavior.")
-    p.add_argument("--us-2d-start-distance-fraction", type=float, default=0.50, help="Fraction of --us-pull-steps-per-window spent relaxing the distance CV before ramping the secondary CV in staged 2D starting-structure preparation.")
-    p.add_argument("--us-2d-start-secondary-ramp-stages", type=int, default=3, help="Number of secondary-CV force-ramp stages after the distance-only stage for 2D starting structures.")
-    p.add_argument("--us-2d-start-minimize-each-ramp", action="store_true", help="Minimize briefly at each secondary-CV ramp stage during 2D starting-structure preparation.")
-    p.add_argument("--us-2d-start-secondary-warn-delta", type=float, default=0.35, help="Warn if the starting secondary CV is this far from its target after 2D starting-structure preparation.")
-    p.add_argument("--us-2d-start-secondary-warn-bias-kcal", type=float, default=1.0, help="Warn if the starting secondary-CV bias exceeds this value in kcal/mol.")
-    p.add_argument("--us-2d-start-secondary-bad-bias-kcal", type=float, default=5.0, help="Mark a starting structure bad if the starting secondary-CV bias exceeds this value in kcal/mol.")
-    p.add_argument("--us-2d-start-secondary-k-pull-scale", type=float, default=1.0, help="Multiply the secondary-CV force constant by this factor during the 2D starting-structure pull ramp (production k is restored before saving). Values >1 push harder in fewer steps; try 5.0 with --us-2d-start-distance-fraction 0.05 to keep wall time near the 1D baseline.")
+
+
+def _add_seeding_args(p: argparse.ArgumentParser) -> None:
+    """Add GENPEPT seeding / starting-structure arguments."""
     p.add_argument(
         "--seed-conformers-dir", type=Path, default=None,
         help=(
@@ -221,6 +231,9 @@ def parse_args(argv: Optional[Iterable[str]] = None):
     p.add_argument("--seed-secondary-weight", type=float, default=1.0, help="Relative weight of CV2 in active-cv GENPEPT seed scoring. 0 makes active-cv equivalent to primary-only scoring.")
     p.add_argument("--seed-max-reuse-per-conformer", type=int, default=0, help="Maximum number of windows that may reuse the same GENPEPT survivor during seed selection. 0 means unlimited reuse.")
 
+
+def _add_gamd_args(p: argparse.ArgumentParser) -> None:
+    """Add GaMD integrator, exchange, and production control arguments."""
     p.add_argument("--gamd-boost-type", default="lower-dual", choices=[
         "gamd-cmd-base", "lower-total", "upper-total", "lower-dihedral", "upper-dihedral",
         "lower-dual", "upper-dual", "lower-nonbonded", "upper-nonbonded",
@@ -242,9 +255,6 @@ def parse_args(argv: Optional[Iterable[str]] = None):
     p.add_argument("--traj-interval", type=int, default=5000)
     p.add_argument("--traj-format", choices=["dcd", "xtc", "none"], default="dcd", help="Production trajectory format for replica_trajectories. dcd preserves historical behavior; xtc writes compressed XTC trajectories when OpenMM provides XTCReporter; none disables coordinate trajectory reporters without affecting scalar reports/samples.")
     p.add_argument("--adaptive-pilot-trajectories", action=argparse.BooleanOptionalAction, default=False, help="Write coordinate trajectory reporters during adaptive-feedback pilot rounds. Default false because pilot coordinates are diagnostic/disposable and can dominate filesystem I/O.")
-    p.add_argument("--dashboard-render-interval-sec", type=float, default=0.0, help="Minimum wall-clock seconds between live dashboard frame renders. 0 preserves historical render-every-log behavior.")
-    p.add_argument("--dashboard-panels", choices=["minimal", "normal", "full"], default="normal", help="Live dashboard panel set. minimal keeps only the context/decision/CV panels; normal preserves the standard dashboard; full keeps all panels.")
-    p.add_argument("--dashboard-heavy-panels-every", type=int, default=1, help="Render heavy dashboard panels only every N rendered frames. 1 preserves historical behavior.")
     p.add_argument("--randomize-replica-velocities", action="store_true")
     p.add_argument("--checkpoint-interval", type=int, default=50000, help="Production steps between overwriting restart checkpoints; 0 disables checkpoint writing.")
     p.add_argument("--resume", action="store_true", help="Resume from --out checkpoints: load production Context checkpoints directly when available, otherwise reuse saved NPT state XML to skip minimization/equilibration. Appends samples/exchanges/distances when possible.")
@@ -254,6 +264,9 @@ def parse_args(argv: Optional[Iterable[str]] = None):
     p.add_argument("--production-nan-diagnostics", action=argparse.BooleanOptionalAction, default=True, help="When production stepping fails, scan replicas and write PRODUCTION_NAN_DIAGNOSTICS_*.json plus crash PDBs when possible.")
     p.add_argument("--shared-gamd-copy-strict", action="store_true", help="Abort if the copied shared GaMD integrator globals differ from the reference setup before production.")
 
+
+def _add_output_args(p: argparse.ArgumentParser) -> None:
+    """Add GUI/TUI progress, dashboard, distance, and analysis I/O arguments."""
     # GUI/progress/TUI output. The JSONL files are intentionally simple so an external GUI can tail them.
     p.add_argument("--progress-mode", choices=["none", "console", "jsonl", "both"], default="both")
     p.add_argument("--progress-jsonl", default="progress.jsonl")
@@ -266,6 +279,9 @@ def parse_args(argv: Optional[Iterable[str]] = None):
     p.add_argument("--dashboard-wide-threshold", type=int, default=132, help="Terminal width at which wide 2D side-by-side dashboard layout becomes eligible.")
     p.add_argument("--dashboard-min-panel-width", type=int, default=30, help="Minimum readable panel width before dashboard rows stack vertically.")
     p.add_argument("--dashboard-max-height", type=int, default=0, help="Optional maximum visible dashboard lines before truncation; 0 uses terminal height.")
+    p.add_argument("--dashboard-render-interval-sec", type=float, default=0.0, help="Minimum wall-clock seconds between live dashboard frame renders. 0 preserves historical render-every-log behavior.")
+    p.add_argument("--dashboard-panels", choices=["minimal", "normal", "full"], default="normal", help="Live dashboard panel set. minimal keeps only the context/decision/CV panels; normal preserves the standard dashboard; full keeps all panels.")
+    p.add_argument("--dashboard-heavy-panels-every", type=int, default=1, help="Render heavy dashboard panels only every N rendered frames. 1 preserves historical behavior.")
 
     p.add_argument("--distance-output-mode", choices=["none", "csv", "jsonl", "both"], default="both")
     p.add_argument("--distance-output-interval", type=int, default=1000, help="Steps between distance/TUI updates; 0 reuses min(report, exchange).")
@@ -293,6 +309,8 @@ def parse_args(argv: Optional[Iterable[str]] = None):
     p.add_argument("--jsonl-flush-rows", type=int, default=500, help="Buffered JSONL events before flushing progress/distances.")
 
 
+def _add_platform_args(p: argparse.ArgumentParser) -> None:
+    """Add OpenMM platform / GPU device selection arguments."""
     p.add_argument("--platform", default="auto", help="CUDA, HIP, OpenCL, CPU, Reference, or auto. Used for production replicas.")
     p.add_argument("--precision", default="mixed", help="Precision for production replicas on CUDA/HIP/OpenCL.")
     p.add_argument("--device-index", default="0", help="OpenMM DeviceIndex for production. With --replica-device-mode auto/round-robin, comma lists such as 0,1,2,3 are assigned one token per replica.")
@@ -310,15 +328,13 @@ def parse_args(argv: Optional[Iterable[str]] = None):
     p.add_argument("--us-pull-workers", default="auto", help="Parallel workers for US starting-structure pulls. 'auto': on CUDA/OpenCL uses one worker per GPU device token (from --setup-device-index / --device-index), on CPU uses 1. Explicit N overrides. Each worker owns a separate OpenMM Context; threads run concurrently since OpenMM releases the GIL during step().")
     p.add_argument("--scratchdir", default="", help="Fast local scratch directory for all simulation I/O (e.g. /local/nvme/run). If set, --out becomes a mirror that is updated at each checkpoint via a full directory copy. Use on HPC nodes with local NVMe to avoid writing DCD/NPZ/CSV traffic over a network filesystem.")
 
-    if pre_args.write_config_template:
-        _write_config_template(Path(pre_args.write_config_template))
-        print(f"Wrote config template: {pre_args.write_config_template}")
-        raise SystemExit(0)
 
-    config_info = _apply_config_defaults_to_parser(p, pre_args.config)
-    args = p.parse_args(argv_list)
-    args._config_values = config_info.get("config_values", {})
+# ---------------------------------------------------------------------------
+# Post-parse processing helpers
+# ---------------------------------------------------------------------------
 
+def _resolve_cv_aliases(args: argparse.Namespace, argv_list: list) -> None:  # noqa: ARG001
+    """Resolve --cv1/--cv2 friendly aliases onto the canonical CV flags."""
     # User-facing aliases.  The expert flags remain canonical in output metadata,
     # but --cv1/--cv2 make the common 1D/2D choices short and explicit.
     if getattr(args, "cv1", None) not in (None, ""):
@@ -346,6 +362,9 @@ def parse_args(argv: Optional[Iterable[str]] = None):
     else:
         args._cv2_auto_centers = False
 
+
+def _normalize_run_mode(args: argparse.Namespace, argv_list: list) -> None:
+    """Validate and normalise --run-mode; set HMR and auto-timestep flags."""
     _run_mode = str(getattr(args, "run_mode", "gamd") or "gamd").strip().lower().replace("_", "-")
     if _run_mode not in {"cmd", "hmr-cmd", "gamd", "hmr-gamd"}:
         raise ValueError("--run-mode must be one of: cmd, hmr-cmd, gamd, hmr-gamd")
@@ -362,44 +381,59 @@ def parse_args(argv: Optional[Iterable[str]] = None):
     else:
         args._run_mode_auto_timestep_fs = False
 
-    args.contact_scheme = contact_scheme(args)
-    if args.primary_cv == "nonlocal-contacts":
-        if args.contact_scheme not in {"atom-pairs", "residue-balanced", "ca-pairs"}:
-            raise ValueError("--contact-scheme must be atom-pairs, residue-balanced, or ca-pairs")
-        # Explicit sparse 2D window tables are generic over the primary CV.
-        # In contact mode the primary values are dimensionless contact-CV centers
-        # even when legacy distance_* column aliases are used for compatibility.
-        if not math.isfinite(float(getattr(args, "contact_r0_a", 4.5))) or float(getattr(args, "contact_r0_a", 4.5)) <= 0.0:
-            raise ValueError("--contact-r0-a must be positive and finite")
-        if not math.isfinite(float(getattr(args, "contact_beta_a_inv", 6.0))) or float(getattr(args, "contact_beta_a_inv", 6.0)) <= 0.0:
-            raise ValueError("--contact-beta-a-inv must be positive and finite")
-        if int(getattr(args, "contact_min_sequence_separation", 4) or 4) < 1:
-            raise ValueError("--contact-min-sequence-separation must be at least 1")
-        if bool(getattr(args, "contact_normalize", True)):
-            cmin = float(getattr(args, "contact_adaptive_min", 0.0) or 0.0)
-            cmax = float(getattr(args, "contact_adaptive_max", 0.80) or 0.80)
-            if not (math.isfinite(cmin) and math.isfinite(cmax)) or cmax <= cmin:
-                raise ValueError("--contact-adaptive-max must be finite and greater than --contact-adaptive-min")
-            if cmin < -1.0e-8 or cmax > 1.0 + 1.0e-8:
-                raise ValueError("Normalized contact adaptive bounds should be within [0, 1]")
-        if float(getattr(args, "contact_adaptive_target_spacing", 0.15) or 0.15) <= 0.0:
-            raise ValueError("--contact-adaptive-target-spacing must be positive")
-        if int(getattr(args, "contact_adaptive_min_windows", 4) or 4) < 2:
-            raise ValueError("--contact-adaptive-min-windows must be at least 2")
-        if int(getattr(args, "contact_adaptive_max_windows", 12) or 12) < int(getattr(args, "contact_adaptive_min_windows", 4) or 4):
-            raise ValueError("--contact-adaptive-max-windows must be >= --contact-adaptive-min-windows")
-        _autocalib_steps = getattr(args, "contact_autocalibration_steps", None)
-        if _autocalib_steps is not None and int(_autocalib_steps) < 0:
-            raise ValueError("--contact-autocalibration-steps must be >= 0")
-        _autocalib_ts = getattr(args, "contact_autocalibration_timestep_fs", None)
-        if _autocalib_ts is not None and float(_autocalib_ts) <= 0.0:
-            raise ValueError("--contact-autocalibration-timestep-fs must be positive")
-        if int(getattr(args, "contact_autocalibration_sample_interval", 100) or 100) <= 0:
-            raise ValueError("--contact-autocalibration-sample-interval must be positive")
-        if float(getattr(args, "contact_autocalibration_min_span", 0.10) or 0.10) <= 0.0:
-            raise ValueError("--contact-autocalibration-min-span must be positive")
-        if not bool(getattr(args, "resume", False)) and not bool(getattr(args, "self_test_primary_cv_force", False)) and str(getattr(args, "window_mode", "manual")) == "manual" and (getattr(args, "contact_centers", None) is None or len(args.contact_centers) == 0):
-            raise ValueError("--primary-cv nonlocal-contacts with --window-mode manual requires --contact-centers; adaptive/adaptive-feedback can generate them.")
+
+def _validate_contact_args(args: argparse.Namespace) -> None:
+    """Validate contact-CV argument combinations when nonlocal-contacts is active.
+
+    Assumes ``args.contact_scheme`` has already been set by the caller.
+    """
+    if args.primary_cv != "nonlocal-contacts":
+        return
+    if args.contact_scheme not in {"atom-pairs", "residue-balanced", "ca-pairs"}:
+        raise ValueError("--contact-scheme must be atom-pairs, residue-balanced, or ca-pairs")
+    # Explicit sparse 2D window tables are generic over the primary CV.
+    # In contact mode the primary values are dimensionless contact-CV centers
+    # even when legacy distance_* column aliases are used for compatibility.
+    if not math.isfinite(float(getattr(args, "contact_r0_a", 4.5))) or float(getattr(args, "contact_r0_a", 4.5)) <= 0.0:
+        raise ValueError("--contact-r0-a must be positive and finite")
+    if not math.isfinite(float(getattr(args, "contact_beta_a_inv", 6.0))) or float(getattr(args, "contact_beta_a_inv", 6.0)) <= 0.0:
+        raise ValueError("--contact-beta-a-inv must be positive and finite")
+    if int(getattr(args, "contact_min_sequence_separation", 4) or 4) < 1:
+        raise ValueError("--contact-min-sequence-separation must be at least 1")
+    if bool(getattr(args, "contact_normalize", True)):
+        cmin = float(getattr(args, "contact_adaptive_min", 0.0) or 0.0)
+        cmax = float(getattr(args, "contact_adaptive_max", 0.80) or 0.80)
+        if not (math.isfinite(cmin) and math.isfinite(cmax)) or cmax <= cmin:
+            raise ValueError("--contact-adaptive-max must be finite and greater than --contact-adaptive-min")
+        if cmin < -1.0e-8 or cmax > 1.0 + 1.0e-8:
+            raise ValueError("Normalized contact adaptive bounds should be within [0, 1]")
+    if float(getattr(args, "contact_adaptive_target_spacing", 0.15) or 0.15) <= 0.0:
+        raise ValueError("--contact-adaptive-target-spacing must be positive")
+    if int(getattr(args, "contact_adaptive_min_windows", 4) or 4) < 2:
+        raise ValueError("--contact-adaptive-min-windows must be at least 2")
+    if int(getattr(args, "contact_adaptive_max_windows", 12) or 12) < int(getattr(args, "contact_adaptive_min_windows", 4) or 4):
+        raise ValueError("--contact-adaptive-max-windows must be >= --contact-adaptive-min-windows")
+    _autocalib_steps = getattr(args, "contact_autocalibration_steps", None)
+    if _autocalib_steps is not None and int(_autocalib_steps) < 0:
+        raise ValueError("--contact-autocalibration-steps must be >= 0")
+    _autocalib_ts = getattr(args, "contact_autocalibration_timestep_fs", None)
+    if _autocalib_ts is not None and float(_autocalib_ts) <= 0.0:
+        raise ValueError("--contact-autocalibration-timestep-fs must be positive")
+    if int(getattr(args, "contact_autocalibration_sample_interval", 100) or 100) <= 0:
+        raise ValueError("--contact-autocalibration-sample-interval must be positive")
+    if float(getattr(args, "contact_autocalibration_min_span", 0.10) or 0.10) <= 0.0:
+        raise ValueError("--contact-autocalibration-min-span must be positive")
+    if (
+        not bool(getattr(args, "resume", False))
+        and not bool(getattr(args, "self_test_primary_cv_force", False))
+        and str(getattr(args, "window_mode", "manual")) == "manual"
+        and (getattr(args, "contact_centers", None) is None or len(args.contact_centers) == 0)
+    ):
+        raise ValueError("--primary-cv nonlocal-contacts with --window-mode manual requires --contact-centers; adaptive/adaptive-feedback can generate them.")
+
+
+def _validate_total_window_bounds(args: argparse.Namespace) -> None:
+    """Validate adaptive-min/max-total-windows consistency for both CV axes."""
     for _min_name, _max_name in (
         ("adaptive_min_total_windows", "adaptive_max_total_windows"),
         ("contact_adaptive_min_total_windows", "contact_adaptive_max_total_windows"),
@@ -412,9 +446,57 @@ def parse_args(argv: Optional[Iterable[str]] = None):
             raise ValueError(f"--{_min_name.replace('_','-')} cannot exceed --{_max_name.replace('_','-')}")
         if _max_total > 0 and _max_total < 2:
             raise ValueError(f"--{_max_name.replace('_','-')} must be at least 2 when enabled")
+
+
+# ---------------------------------------------------------------------------
+# Public entry points
+# ---------------------------------------------------------------------------
+
+def parse_args(argv: Optional[Iterable[str]] = None):
+    argv_list = _argv_as_list(argv)
+
+    # Pre-parse: read --config and --write-config-template before building the
+    # full parser so config defaults can be injected and templates can be
+    # written without requiring --seq.
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", default=None)
+    pre.add_argument("--write-config-template", nargs="?", const="chignolin_adaptive_feedback.yaml", default=None)
+    pre_args, _pre_unknown = pre.parse_known_args(argv_list)
+
+    p = argparse.ArgumentParser(
+        prog="gareus",
+        add_help=False,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description="GAREUS peptide GaMD/REUS workflow. Use -h for concise help or -hh for the method encyclopedia.",
+    )
+    _add_core_args(p)
+    _add_system_args(p)
+    _add_cv_args(p)
+    _add_window_args(p)
+    _add_seeding_args(p)
+    _add_gamd_args(p)
+    _add_output_args(p)
+    _add_platform_args(p)
+
+    if pre_args.write_config_template:
+        _write_config_template(Path(pre_args.write_config_template))
+        print(f"Wrote config template: {pre_args.write_config_template}")
+        raise SystemExit(0)
+
+    config_info = _apply_config_defaults_to_parser(p, pre_args.config)
+    args = p.parse_args(argv_list)
+    args._config_values = config_info.get("config_values", {})
+
+    _resolve_cv_aliases(args, argv_list)
+    _normalize_run_mode(args, argv_list)
+    args.contact_scheme = contact_scheme(args)
+    _validate_contact_args(args)
+    _validate_total_window_bounds(args)
+
     if args.hmr and float(args.hydrogen_mass_amu) <= 0:
         args.hydrogen_mass_amu = 3.024
     return args
+
 
 def main(argv: Optional[Iterable[str]] = None):
     _graceful_shutdown.clear()

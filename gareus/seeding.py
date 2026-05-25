@@ -37,7 +37,7 @@ from .cv import (
 )
 from .io import _json_ready, write_json
 from .progress import GuiProgressSink
-from .state import _scalar_to_float, cv_distance_from_positions_nm
+from .state import _scalar_to_float, cv_distance_from_positions_nm, cv_distance_nm, cv_distance_and_potential_from_state
 from .system_setup import (
     _first_device_index,
     make_langevin_integrator,
@@ -76,27 +76,7 @@ def kabsch_align_positions(
     return (mobile_all - mobile_center) @ R.T + target_center
 
 
-def cv_distance_nm(context, atom1: int, atom2: int, unit) -> float:
-    state = context.getState(getPositions=True, enforcePeriodicBox=True)
-    pos = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
-    return cv_distance_from_positions_nm(pos, atom1, atom2)
-
-
-def cv_distance_and_potential_from_state(context, atom1: int, atom2: int, unit) -> tuple[float, float]:
-    """Return CV distance and potential energy from one OpenMM state read.
-
-    GPU context synchronization is one of the hidden costs in live dashboards.
-    Sampling the CV and potential energy from the same State avoids the previous
-    pair of getState() calls per replica at every dashboard/sample update.
-    """
-    state = context.getState(getPositions=True, getEnergy=True, enforcePeriodicBox=True)
-    pos = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
-    cv_nm = cv_distance_from_positions_nm(pos, atom1, atom2)
-    potential_kj = float(state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole))
-    return cv_nm, potential_kj
-
-
-def bias_energy_kj(distance_nm: float, center_nm: float, k_kj_nm2: float) -> float:
+def harmonic_bias_energy_kj(distance_nm: float, center_nm: float, k_kj_nm2: float) -> float:
     dr = float(distance_nm) - float(center_nm)
     return 0.5 * float(k_kj_nm2) * dr * dr
 
@@ -1174,7 +1154,7 @@ def generate_us_starting_states_by_pulling(
         center_coord = float(centers_nm_arr[w])
         prod_k_openmm = float(ks_kj_nm2[w])
         prod_k_kcal_a2 = kj_nm2_to_kcal_a2(prod_k_openmm) if primary_cv_is_distance(args) else prod_k_openmm / 4.184
-        prod_bias_kj = bias_energy_kj(achieved_coord, center_coord, prod_k_openmm)
+        prod_bias_kj = harmonic_bias_energy_kj(achieved_coord, center_coord, prod_k_openmm)
         prod_bias_kcal = prod_bias_kj / 4.184
         abs_delta = abs(float(r.get("delta_A", float("nan"))))
         warnings = []
@@ -1348,7 +1328,7 @@ def generate_us_starting_states_by_pulling(
 
 __all__ = [
     "deserialize_system",
-    "bias_energy_kj",
+    "harmonic_bias_energy_kj",
     "kabsch_align_positions",
     "cv_distance_nm",
     "cv_distance_and_potential_from_state",

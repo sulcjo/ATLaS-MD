@@ -311,7 +311,7 @@ def _effective_config_payload(args: Any, argv: Optional[Iterable[str]] = None) -
         "schema_version": CONFIG_SCHEMA_VERSION,
         "generated_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "script": {
-            "path": str(Path(__file__).resolve()) if "__file__" in globals() else "",
+            "path": str(Path(__file__).resolve()),
             "sha256": _script_sha256(),
             "python": sys.version.split()[0],
             "argv": [sys.executable, str(Path(__file__).name)] + arg_list,
@@ -340,7 +340,7 @@ def _write_reproducibility_files(args: Any, out_dir: Path, argv: Optional[Iterab
     command_text = payload["script"].get("command_line", "")
     (cfg_dir / "command_line.txt").write_text(command_text + "\n")
     (out_dir / "command_line.txt").write_text(command_text + "\n")
-    script_name = str(Path(__file__).resolve()) if "__file__" in globals() else "gareus_peptide_openmm.py"
+    script_name = str(Path(__file__).resolve())
     resume_cmd = f"{shlex.quote(sys.executable)} {shlex.quote(script_name)} --config {shlex.quote(str((cfg_dir / 'effective_config.yaml').resolve()))} --resume\n"
     for path in (cfg_dir / "resume_command.sh", out_dir / "resume_command.sh"):
         path.write_text("#!/usr/bin/env bash\nset -euo pipefail\n" + resume_cmd)
@@ -442,6 +442,10 @@ def _basic_chignolin_config() -> Dict[str, Any]:
 
 
 def _write_config_template(path: Path, variant: str = "basic") -> None:
-    """Write a basic or variant config template to the given path."""
-    payload = _basic_chignolin_config() if str(variant or "basic") == "basic" else _basic_chignolin_config()
+    """Write a basic or variant config template to the given path.
+
+    The ``variant`` parameter is reserved for future template variants; currently
+    only ``"basic"`` is defined, so all variants resolve to the chignolin template.
+    """
+    payload = _basic_chignolin_config()
     _write_yaml_or_json(Path(path), payload)

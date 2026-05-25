@@ -40,10 +40,10 @@ from .system_setup import (
     make_trajectory_reporter,
     write_state_pdb,
 )
-from .seeding import generate_us_starting_states_by_pulling, deserialize_system, bias_energy_kj
+from .seeding import generate_us_starting_states_by_pulling, deserialize_system
 from .diagnostics import compute_gamd_reweighting_diagnostics, validate_us_mbar_inputs
 from .imports import import_gamd_factory, import_openmm
-from .state import _scalar_to_float
+from .state import _scalar_to_float, _energy_to_kj_mol
 from .cv import (
     apply_primary_cv_metadata_to_args,
     choose_cv_atoms,
@@ -72,6 +72,7 @@ from .windows import (
     build_explicit_2d_neighbor_edges,
     expand_windows_for_secondary_cv,
     choose_windows,
+    load_explicit_2d_window_csv,
     set_window,
     _adaptive_window_aggressiveness_settings,
     _rounded_unique_sorted,
@@ -117,23 +118,6 @@ __all__ = [
 ]
 
 
-
-def _energy_to_kj_mol(value, unit) -> Optional[float]:
-    """Convert a possible OpenMM energy Quantity to kJ/mol, else plain float."""
-    if value is None:
-        return None
-    try:
-        return float(value.value_in_unit(unit.kilojoule_per_mole))
-    except Exception:
-        pass
-    try:
-        return float(value)
-    except Exception:
-        pass
-    try:
-        return float(value._value)
-    except Exception:
-        return None
 
 def _flatten_numeric_object(obj, prefix: str, unit=None, energy: bool = False) -> dict[str, float]:
     """Flatten dict/list/scalar results from gamd-openmm diagnostic helpers."""
@@ -1018,181 +1002,6 @@ def write_window_assignment_csv(path: Path, rows: list[dict]) -> None:
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
-
-def load_explicit_2d_window_csv(args, path: Path) -> tuple[np.ndarray, list[float], Optional[np.ndarray], Optional[list[float]], dict, dict]:
-    """Load an explicit per-window table for sparse/non-rectangular 2D umbrella grids.
-
-    Accepted column aliases are intentionally compatible with the advisory table
-    written by the sparse-patch proposal helper:
-
-      distance_center_A, distance_k_kcal_mol_A2,
-      secondary_cv_center, secondary_cv_k_kcal_mol
-
-    The return shape mirrors choose_windows()+expand_windows_for_secondary_cv(),
-    but without forcing a rectangular cross-product.
-    """
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(f"--windows-2d-csv file not found: {path}")
-    with path.open(newline="") as handle:
-        reader = csv.DictReader(handle)
-        rows = list(reader)
-    if not rows:
-        raise ValueError(f"--windows-2d-csv is empty: {path}")
-
-    centers_a = []
-    k_list = []
-    secondary_centers = []
-    secondary_k_list = []
-    normalized_rows = []
-    seen = set()
-    duplicate_count = 0
-    any_secondary = False
-    all_secondary = True
-    type_counts: dict[str, int] = {}
-
-    for offset, row in enumerate(rows, start=2):
-        primary_center_columns = [
-            "primary_cv_center", "primary_center", "primary_center_cv", "primary_cv_value",
-            "contact_cv_center", "contact_center", "primary_contact_center",
-            "distance_center_A", "primary_center_A", "center_A", "window_center_A", "r0_A",
-        ]
-        primary_k_columns = [
-            "primary_cv_k_kcal", "primary_k_kcal", "primary_cv_k_kcal_mol", "primary_k_kcal_mol",
-            "contact_cv_k_kcal", "contact_k_kcal", "primary_contact_k_kcal",
-            "distance_k_kcal_mol_A2", "primary_k_kcal_mol_A2", "k_kcal_mol_A2",
-            "window_k_kcal_mol_A2", "k_kcal/A2", "k_kcal", "k_kcal_mol_cv2",
-        ]
-        center_a = _csv_float_field(
-            row,
-            primary_center_columns,
-            offset,
-            "primary-CV center (distance in A, contact fraction, or other primary-CV unit)",
-        )
-        if primary_cv_is_contacts(args):
-            _manual_contact_k = getattr(args, "contact_k_kcal", None)
-            if _manual_contact_k is not None and len(_manual_contact_k) > 0:
-                default_primary_k = float(_manual_contact_k[0])
-            else:
-                default_primary_k = float(getattr(args, "contact_adaptive_default_k_kcal", getattr(args, "contact_adaptive_min_k_kcal", 25.0)) or 25.0)
-        else:
-            default_primary_k = float(getattr(args, "default_window_k_kcal_a2", 1.0) or 1.0)
-        k = _csv_float_field(
-            row,
-            primary_k_columns,
-            offset,
-            "primary-CV force constant (kcal/mol/A^2, kcal/mol/CV^2, or primary-CV units)",
-            default=default_primary_k,
-        )
-        if k < 0.0:
-            raise ValueError(f"primary-CV force constant in explicit 2D window CSV row {offset} must be non-negative; got {k}")
-
-        sec_raw = _csv_first_present(row, ["secondary_cv_center", "secondary_center", "secondary", "ss0", "secondary_cv_target"])
-        has_secondary = sec_raw is not None
-        any_secondary = any_secondary or has_secondary
-        all_secondary = all_secondary and has_secondary
-        if has_secondary:
-            sec = _csv_float_field(row, ["secondary_cv_center", "secondary_center", "secondary", "ss0", "secondary_cv_target"], offset, "secondary-CV center")
-            sec_k = _csv_float_field(
-                row,
-                ["secondary_cv_k_kcal_mol", "secondary_k_kcal_mol", "secondary_cv_k_kcal", "ss_k_kcal_mol", "secondary_k"],
-                offset,
-                "secondary-CV force constant (kcal/mol/CV^2)",
-                default=float(getattr(args, "secondary_cv_k_kcal", 50.0) or 50.0),
-            )
-            if sec_k < 0.0:
-                raise ValueError(f"secondary-CV force constant in explicit 2D window CSV row {offset} must be non-negative; got {sec_k}")
-            sec_min, sec_max = secondary_cv_range(args)
-            if sec < sec_min - 0.000001 or sec > sec_max + 0.000001:
-                raise ValueError(
-                    f"secondary-CV center in row {offset} is outside [{sec_min:g}, {sec_max:g}] "
-                    f"for {secondary_cv_mode(args)!r} mode: {sec}"
-                )
-        else:
-            sec = None
-            sec_k = None
-
-        key = (round(center_a, 5), round(sec if sec is not None else float("nan"), 5))
-        if key in seen:
-            duplicate_count += 1
-            # Keep duplicates as separate thermodynamic states only if the user
-            # explicitly duplicated them. Warn through metadata, but do not drop
-            # a window behind the user's back.
-        seen.add(key)
-
-        wtype = str(_csv_first_present(row, ["window_type", "type", "parent", "source"]) or "explicit_2d_window")
-        type_counts[wtype] = int(type_counts.get(wtype, 0)) + 1
-        idx = len(centers_a)
-        centers_a.append(float(center_a))
-        k_list.append(float(k))
-        if has_secondary:
-            secondary_centers.append(float(sec))
-            secondary_k_list.append(float(sec_k))
-        primary_mode = primary_cv_mode(args) if hasattr(args, "primary_cv") else "distance"
-        normalized_rows.append({
-            "window": int(idx),
-            "primary_cv_mode": str(primary_mode),
-            "primary_cv_center": float(center_a),
-            "primary_cv_k_kcal": float(k),
-            # Backward-compatible aliases retained for existing downstream code.
-            "distance_center_A": float(center_a),
-            "distance_k_kcal_mol_A2": float(k),
-            "secondary_cv_center": "" if sec is None else float(sec),
-            "secondary_cv_k_kcal_mol": "" if sec_k is None else float(sec_k),
-            "window_type": wtype,
-            "source_row": int(offset),
-        })
-
-    if any_secondary and not all_secondary:
-        raise ValueError("--windows-2d-csv mixes rows with and without secondary_cv_center; provide secondary columns for every row or none.")
-    if any_secondary and not secondary_cv_enabled(args):
-        raise ValueError("--windows-2d-csv contains secondary-CV centers, but --secondary-cv is 'none'. Re-run with e.g. --secondary-cv alpha-coil-beta/acb/rama-regions/alpha/beta/custom.")
-
-    centers_arr = np.asarray(centers_a, dtype=float)
-    primary_unique = _rounded_unique_sorted(centers_a, ndigits=4)
-    secondary_unique = _rounded_unique_sorted(secondary_centers, ndigits=4) if any_secondary else []
-    rectangular = False
-    if any_secondary and primary_unique and secondary_unique:
-        pair_set = {(round(float(c), 4), round(float(s), 4)) for c, s in zip(centers_a, secondary_centers)}
-        rectangular = (len(pair_set) == len(primary_unique) * len(secondary_unique) == len(centers_a))
-
-    secondary_metadata = {
-        "enabled": bool(any_secondary),
-        "mode": secondary_cv_mode(args) if any_secondary else "none",
-        "explicit_2d_windows": bool(any_secondary),
-        "grid": bool(rectangular),
-        "source_csv": str(path),
-        "n_total_windows": int(len(centers_a)),
-        "n_primary_windows": int(len(primary_unique)),
-        "n_secondary_centers": int(len(secondary_unique)),
-        "primary_cv_mode": primary_cv_mode(args) if hasattr(args, "primary_cv") else "distance",
-        "primary_centers": [float(x) for x in primary_unique],
-        "primary_centers_A": [float(x) for x in primary_unique],
-        "secondary_centers": [float(x) for x in secondary_unique],
-        "window_type_counts": type_counts,
-        "duplicate_center_pairs": int(duplicate_count),
-        "normalized_rows": normalized_rows,
-        "note": "Explicit 2D window table loaded without rectangular cross-product expansion; neighbor exchange uses a geometry graph when --exchange-mode neighbor.",
-    }
-    if any_secondary:
-        sec_min, sec_max = secondary_cv_range(args)
-        secondary_metadata.update({
-            "range_min": float(sec_min),
-            "range_max": float(sec_max),
-        })
-    window_metadata = {
-        "mode": "explicit-2d-csv",
-        "source_csv": str(path),
-        "n_windows": int(len(centers_a)),
-        "n_primary_centers": int(len(primary_unique)),
-        "n_secondary_centers": int(len(secondary_unique)),
-        "rectangular_grid": bool(rectangular),
-        "normalized_rows": normalized_rows,
-        "duplicate_center_pairs": int(duplicate_count),
-    }
-    sec_arr = np.asarray(secondary_centers, dtype=float) if any_secondary else None
-    sec_k = [float(x) for x in secondary_k_list] if any_secondary else None
-    return centers_arr, [float(x) for x in k_list], sec_arr, sec_k, secondary_metadata, window_metadata
 
 def write_explicit_2d_neighbor_graph_files(out_dir: Path, centers_a, secondary_cv_centers, args=None, prefix: str = "explicit_2d_neighbor_graph") -> dict:
     """Write the geometry neighbor graph used for explicit/sparse 2D exchange.

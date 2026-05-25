@@ -49,27 +49,31 @@ def _hist_overlap(a: List[float], b: List[float], lo: float, hi: float, bins: in
     return float(np.minimum(pa, pb).sum())
 
 
-def _adaptive_hist_overlap(
-    values_a: List[float], values_b: List[float], lo: float, hi: float, bins: int = 80
-) -> float:
-    """Compute a histogram overlap for two samples with adaptive range padding.
+def _adaptive_hist_overlap(values_a: List[float] | np.ndarray, values_b: List[float] | np.ndarray, lo: float, hi: float, bins: int = 80) -> float:
+    """Histogram overlap sum(min(P_i, P_j)) for two 1D CV samples.
 
-    If ``lo``/``hi`` are not finite or invalid, the range is inferred
-    from the combined values with a 2 % padding.  Both histograms use
-    ``bins`` bins or at least eight bins.
+    Accepts lists or already-sliced NumPy arrays.  Keeping bootstrap resamples as
+    arrays avoids thousands of temporary Python-list conversions in adaptive
+    feedback without changing the histogram definition.
     """
-    if not values_a or not values_b:
+    a = np.asarray(values_a, dtype=np.float64)
+    b = np.asarray(values_b, dtype=np.float64)
+    if a.size == 0 or b.size == 0:
         return float("nan")
-    lo_f = float(lo)
-    hi_f = float(hi)
-    if not math.isfinite(lo_f) or not math.isfinite(hi_f) or hi_f <= lo_f:
-        vals = [float(x) for x in values_a + values_b if math.isfinite(float(x))]
-        if len(vals) < 2:
+    a = a[np.isfinite(a)]
+    b = b[np.isfinite(b)]
+    if a.size == 0 or b.size == 0:
+        return float("nan")
+    lo = float(lo)
+    hi = float(hi)
+    if not math.isfinite(lo) or not math.isfinite(hi) or hi <= lo:
+        vals = np.concatenate([a, b])
+        if vals.size < 2:
             return float("nan")
-        lo_f, hi_f = min(vals), max(vals)
-    pad = max(0.1, 0.02 * (hi_f - lo_f))
-    hist_a, _ = np.histogram(np.asarray(values_a, dtype=float), bins=max(8, int(bins)), range=(lo_f - pad, hi_f + pad))
-    hist_b, _ = np.histogram(np.asarray(values_b, dtype=float), bins=max(8, int(bins)), range=(lo_f - pad, hi_f + pad))
+        lo, hi = float(np.min(vals)), float(np.max(vals))
+    pad = max(0.1, 0.02 * (hi - lo))
+    hist_a, _ = np.histogram(a, bins=max(8, int(bins)), range=(lo - pad, hi + pad))
+    hist_b, _ = np.histogram(b, bins=max(8, int(bins)), range=(lo - pad, hi + pad))
     sa = float(np.sum(hist_a))
     sb = float(np.sum(hist_b))
     if sa <= 0.0 or sb <= 0.0:

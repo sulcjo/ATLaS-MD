@@ -53,6 +53,7 @@ from .cv import (
     secondary_cv_mode,
 )
 from .windows import build_explicit_2d_neighbor_edges
+from .math_helpers import _hist_overlap
 
 def _sparkline(values: list[float], width: int = 18) -> str:
     vals = [float(v) for v in values if math.isfinite(float(v))]
@@ -91,21 +92,6 @@ def _coverage_bar(values: list[float], lo: float, hi: float, width: int = 48) ->
             lvl = max(1, min(4, int(math.ceil(c / mx * 4))))
             out.append(chars[lvl])
     return "".join(out)
-
-
-def _hist_overlap(a: list[float], b: list[float], lo: float, hi: float, bins: int = 24) -> float:
-    av = np.asarray([x for x in a if math.isfinite(float(x))], dtype=float)
-    bv = np.asarray([x for x in b if math.isfinite(float(x))], dtype=float)
-    if av.size < 5 or bv.size < 5 or hi <= lo:
-        return float("nan")
-    ha, _ = np.histogram(av, bins=bins, range=(lo, hi), density=False)
-    hb, _ = np.histogram(bv, bins=bins, range=(lo, hi), density=False)
-    sa, sb = ha.sum(), hb.sum()
-    if sa <= 0 or sb <= 0:
-        return float("nan")
-    pa = ha.astype(float) / float(sa)
-    pb = hb.astype(float) / float(sb)
-    return float(np.minimum(pa, pb).sum())
 
 
 def boost_anharmonicity(values: list[float]) -> dict:
