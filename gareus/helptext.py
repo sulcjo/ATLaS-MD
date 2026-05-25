@@ -825,6 +825,13 @@ cross-product of primary centers x secondary centers.  `--windows-2d-csv` can
 instead load an explicit per-window table, which supports sparse local patches
 from adaptive feedback.
 
+`--genpept-prior-enabled` builds a round-zero explicit 2D table from GENPEPT
+output structures before the first adaptive-feedback pilot.  GAREUS rescoring
+uses the active CV1/CV2 definitions, writes `genpept_prior/genpept_prior_windows_2d.csv`,
+and feeds that table through the same sparse explicit-2D machinery.  This is a
+sampling prior only: it can place initial windows and seed suggestions, but it is
+not PMF/MBAR evidence.
+
 Neighbor exchange for explicit/sparse 2D tables uses a geometry graph.  The graph
 combines row/column-style relationships with k-nearest/radius edges controlled by:
 

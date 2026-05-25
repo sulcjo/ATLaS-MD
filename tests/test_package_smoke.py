@@ -196,6 +196,68 @@ def test_run_mode_and_cv_aliases_parse_to_canonical_values() -> None:
     assert acb.secondary_cv_centers == [-0.8, 0.0, 0.8]
 
 
+def test_genpept_prior_cli_and_selector_smoke() -> None:
+    from pathlib import Path
+    from types import SimpleNamespace
+    from gareus.cli import parse_args
+    from gareus.genpept_window_prior import ScoredGenpeptPoint, select_prior_windows_from_points
+
+    parsed = parse_args([
+        "--seq", "AA",
+        "--cv1", "distance",
+        "--cv2", "rama-map",
+        "--genpept-prior-enabled",
+        "--genpept-prior-dir", "seeds",
+        "--genpept-prior-max-windows", "8",
+    ])
+    assert parsed.genpept_prior_enabled is True
+    assert str(parsed.genpept_prior_dir) == "seeds"
+    assert parsed.secondary_cv == "rama-map"
+
+    args = SimpleNamespace(
+        primary_cv="distance",
+        secondary_cv="rama-map",
+        secondary_cv_centers=[-1.0, -1.0 / 3.0, 1.0 / 3.0, 1.0],
+        genpept_prior_bins="8,4",
+        genpept_prior_max_windows=8,
+        genpept_prior_min_hits_per_bin=1,
+        genpept_prior_absence_means_unknown=True,
+        genpept_prior_snap_secondary_centers=True,
+        genpept_prior_basin_windows=2,
+        genpept_prior_bridge_windows=2,
+        genpept_prior_frontier_windows=2,
+        genpept_prior_probe_windows=2,
+        default_window_k_kcal_a2=1.0,
+        adaptive_k_mode="spacing",
+        adaptive_overlap_sigma=1.25,
+        adaptive_min_k_kcal_a2=0.05,
+        adaptive_max_k_kcal_a2=20.0,
+        secondary_cv_k_mode="spacing",
+        secondary_cv_k_kcal=50.0,
+        secondary_cv_adaptive_overlap_sigma=1.25,
+        secondary_cv_adaptive_min_sigma=0.02,
+        secondary_cv_adaptive_min_k_kcal=0.0,
+        secondary_cv_adaptive_max_k_kcal=500.0,
+        secondary_cv_adaptive_k_scale=1.0,
+        temperature_k=300.0,
+    )
+    points = [
+        ScoredGenpeptPoint(Path(f"p{i}.pdb"), "final_search_pool", i, primary, secondary, -1000.0 + i, source="GENPEPT")
+        for i, (primary, secondary) in enumerate([
+            (4.0, -0.95), (4.2, -0.90), (5.5, -0.25), (7.0, 0.25),
+            (9.0, 0.95), (9.2, 0.90), (6.2, 0.30), (5.8, -0.30),
+        ])
+    ]
+    windows, graph = select_prior_windows_from_points(points, args)
+    assert windows
+    assert len(windows) <= 8
+    assert graph["n_components"] >= 1
+    assert all("primary_cv_center" in row for row in windows)
+    assert all("secondary_cv_center" in row for row in windows)
+    assert all("secondary_cv_k_kcal_mol" in row for row in windows)
+    assert any(str(row["window_type"]).startswith("genpept_") for row in windows)
+
+
 def test_energy_decomposition_help_is_available() -> None:
     result = subprocess.run(
         [sys.executable, "-m", "gareus.energy_decomposition", "--help"],
