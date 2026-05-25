@@ -151,6 +151,20 @@ def _add_cv_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--secondary-cv-psi0-deg", type=float, default=-45.0, help="Custom secondary-CV psi target in degrees, used with --secondary-cv custom.")
     p.add_argument("--secondary-cv-force-group", type=int, default=29, help="OpenMM force group for the optional secondary-structure CV bias. Must be 0..31; default 29 avoids the primary umbrella group 31 and restraint group 30.")
 
+    # Contact-CV frontier probing during adaptive-feedback.
+    p.add_argument("--contact-frontier-enabled", action=argparse.BooleanOptionalAction, default=False, help="Enable contact-CV frontier probing during adaptive-feedback.")
+    p.add_argument("--contact-frontier-percentile", type=float, default=99.0)
+    p.add_argument("--contact-frontier-margin", type=float, default=0.02)
+    p.add_argument("--contact-frontier-min-span", type=float, default=0.10)
+    p.add_argument("--contact-frontier-probe-count", type=int, default=2)
+    p.add_argument("--contact-frontier-probe-spacing", type=float, default=0.05)
+    p.add_argument("--contact-frontier-max-probe-offset", type=float, default=0.15)
+    p.add_argument("--contact-disable-gapfill-above-unvalidated-frontier", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--contact-frontier-confirm-rounds", type=int, default=2)
+    p.add_argument("--contact-frontier-min-hit-fraction", type=float, default=0.02)
+    p.add_argument("--contact-frontier-unreachable-deficit", type=float, default=0.08)
+    p.add_argument("--contact-frontier-by-secondary-slice", action=argparse.BooleanOptionalAction, default=True)
+
 
 def _add_window_args(p: argparse.ArgumentParser) -> None:
     """Add umbrella window layout, adaptive-feedback, and US pulling arguments."""
@@ -216,6 +230,22 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--adaptive-prescan-margin-a", type=float, default=1.0)
     p.add_argument("--umbrella-force-group", type=int, default=31)
 
+    # Stateful adaptive-feedback region classification and memory.
+    p.add_argument("--adaptive-feedback-region-state-enabled", action=argparse.BooleanOptionalAction, default=False, help="Enable stateful adaptive-feedback region classification and memory.")
+    p.add_argument("--adaptive-feedback-region-memory-decay", type=float, default=0.5)
+    p.add_argument("--adaptive-feedback-min-effective-samples", type=int, default=50)
+    p.add_argument("--adaptive-feedback-probe-unvalidated-regions", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--adaptive-feedback-prune-overscanned-regions", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--adaptive-feedback-extend-undersampled-regions", action=argparse.BooleanOptionalAction, default=True)
+
+    # Explicit 2D window CSV column-name overrides.
+    p.add_argument("--explicit-2d-primary-cv-mode-column", default="primary_cv_mode", help="Column name for primary-CV mode in explicit 2D window CSV.")
+    p.add_argument("--explicit-2d-primary-center-column", default="primary_cv_center")
+    p.add_argument("--explicit-2d-primary-k-column", default="primary_cv_k_kcal")
+    p.add_argument("--explicit-2d-secondary-cv-mode-column", default="secondary_cv_mode")
+    p.add_argument("--explicit-2d-secondary-center-column", default="secondary_cv_center")
+    p.add_argument("--explicit-2d-secondary-k-column", default="secondary_cv_k_kcal_mol")
+
 
 def _add_seeding_args(p: argparse.ArgumentParser) -> None:
     """Add GENPEPT seeding / starting-structure arguments."""
@@ -230,6 +260,43 @@ def _add_seeding_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--seed-selection-mode", choices=["auto", "active-cv", "primary", "distance"], default="auto", help="How GENPEPT survivors are scored against umbrella windows. auto/active-cv uses CV1 plus CV2 when active; primary ignores CV2; distance preserves legacy terminal-distance scoring.")
     p.add_argument("--seed-secondary-weight", type=float, default=1.0, help="Relative weight of CV2 in active-cv GENPEPT seed scoring. 0 makes active-cv equivalent to primary-only scoring.")
     p.add_argument("--seed-max-reuse-per-conformer", type=int, default=0, help="Maximum number of windows that may reuse the same GENPEPT survivor during seed selection. 0 means unlimited reuse.")
+
+
+def _add_genpept_prescan_args(p: argparse.ArgumentParser) -> None:
+    """Add GAREUS-side GENPEPT prescan prior arguments."""
+    p.add_argument("--genpept-prescan-enabled", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--genpept-prescan-dir", type=Path, default=None)
+    p.add_argument("--genpept-prescan-stages", nargs="*", default=None)
+    p.add_argument("--genpept-prescan-rescore-active-cvs", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--genpept-prescan-contact-bin-width", type=float, default=0.025)
+    p.add_argument("--genpept-prescan-rama-bin-width", type=float, default=0.25)
+    p.add_argument("--genpept-prescan-min-hits-per-bin", type=int, default=2)
+    p.add_argument("--genpept-prescan-frontier-stages", nargs="*", default=None)
+    p.add_argument("--genpept-prescan-use-as-window-prior", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--genpept-prescan-use-as-seed-library", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--genpept-prescan-absence-means-unknown", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--genpept-prescan-output-prefix", default="genpept_prescan")
+    p.add_argument("--genpept-prescan-write-maps", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--genpept-prescan-write-seed-assignments", action=argparse.BooleanOptionalAction, default=True)
+
+
+def _add_genpept_prior_args(p: argparse.ArgumentParser) -> None:
+    """Add GENPEPT round-zero window prior arguments."""
+    p.add_argument("--genpept-prior-enabled", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--genpept-prior-dir", type=Path, default=None)
+    p.add_argument("--genpept-prior-stages", nargs="*", default=None)
+    p.add_argument("--genpept-prior-max-structures", type=int, default=50000)
+    p.add_argument("--genpept-prior-min-points", type=int, default=10)
+    p.add_argument("--genpept-prior-max-windows", type=int, default=48)
+    p.add_argument("--genpept-prior-bins", default="24,12")
+    p.add_argument("--genpept-prior-min-hits-per-bin", type=int, default=2)
+    p.add_argument("--genpept-prior-basin-windows", type=int, default=0)
+    p.add_argument("--genpept-prior-bridge-windows", type=int, default=0)
+    p.add_argument("--genpept-prior-frontier-windows", type=int, default=0)
+    p.add_argument("--genpept-prior-probe-windows", type=int, default=0)
+    p.add_argument("--genpept-prior-absence-means-unknown", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--genpept-prior-snap-secondary-centers", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--genpept-prior-required", action=argparse.BooleanOptionalAction, default=False)
 
 
 def _add_gamd_args(p: argparse.ArgumentParser) -> None:
@@ -474,6 +541,8 @@ def parse_args(argv: Optional[Iterable[str]] = None):
     _add_cv_args(p)
     _add_window_args(p)
     _add_seeding_args(p)
+    _add_genpept_prescan_args(p)
+    _add_genpept_prior_args(p)
     _add_gamd_args(p)
     _add_output_args(p)
     _add_platform_args(p)

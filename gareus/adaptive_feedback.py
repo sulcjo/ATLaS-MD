@@ -60,6 +60,7 @@ from .cv import (
     secondary_cv_mode,
 )
 from .math_helpers import _adaptive_hist_overlap
+from .genpept_window_prior import build_genpept_window_prior, genpept_prior_enabled
 
 __all__ = [
     "adaptive_secondary_default_centers",
@@ -2880,6 +2881,43 @@ def run_adaptive_feedback_auto_loop(args, out_dir: Path, openmm, app, unit, forc
     current_secondary_k = None
     current_windows_2d_csv = None
     current_windows_2d_source_round = None
+    genpept_prior_summary = None
+    if getattr(args, "windows_2d_csv", None):
+        current_windows_2d_csv = Path(str(args.windows_2d_csv))
+        current_windows_2d_source_round = -1
+        driver_summary["initial_windows_2d_csv"] = str(current_windows_2d_csv)
+        driver_summary["initial_window_mode"] = "explicit_sparse_2d_from_user_csv"
+        write_json(out_dir / "adaptive_feedback_driver_summary.json", _json_ready(driver_summary))
+        print(f"    Adaptive-feedback round 1 will use explicit 2D window table: {current_windows_2d_csv}")
+    elif genpept_prior_enabled(args):
+        try:
+            genpept_prior_summary = build_genpept_window_prior(args, out_dir, topology)
+        except Exception as exc:
+            if bool(getattr(args, "genpept_prior_required", False)):
+                raise
+            genpept_prior_summary = {
+                "enabled": True,
+                "used": False,
+                "reason": f"GENPEPT prior build failed: {exc}",
+            }
+            print(f"WARNING: GENPEPT prior build failed; falling back to ordinary adaptive-feedback: {exc}")
+        if isinstance(genpept_prior_summary, dict):
+            driver_summary["genpept_prior"] = _json_ready(genpept_prior_summary)
+            prior_csv = genpept_prior_summary.get("windows_2d_csv") if genpept_prior_summary.get("used") else None
+            if prior_csv:
+                current_windows_2d_csv = Path(str(prior_csv))
+                current_windows_2d_source_round = 0
+                driver_summary["initial_windows_2d_csv"] = str(current_windows_2d_csv)
+                driver_summary["initial_window_mode"] = "explicit_sparse_2d_from_genpept_prior"
+                prior_dir = genpept_prior_summary.get("genpept_dir")
+                if prior_dir and getattr(args, "seed_conformers_dir", None) is None and (Path(str(prior_dir)) / "final_survivor_seeds.csv").exists():
+                    args.seed_conformers_dir = Path(str(prior_dir))
+                    driver_summary["seed_conformers_dir_from_genpept_prior"] = str(args.seed_conformers_dir)
+                print(f"    GENPEPT prior round-zero window table: {current_windows_2d_csv}")
+            else:
+                reason = str(genpept_prior_summary.get("reason", "no usable GENPEPT prior"))
+                print(f"    GENPEPT prior not used: {reason}")
+            write_json(out_dir / "adaptive_feedback_driver_summary.json", _json_ready(driver_summary))
     adaptive_memory = {
         "mode": "memory-guided adaptive-feedback",
         "target_overlap": float(target_overlap),
