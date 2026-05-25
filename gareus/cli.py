@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from .adaptive_feedback import run_adaptive_feedback_auto_loop
+from .adaptive_production import run_adaptive_production_auto_loop
 from .checkpoints import production_checkpoint_available, load_existing_openmm_setup_for_resume
 from .colors import configure_color
 from .config import (
@@ -189,7 +190,7 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--us-2d-start-secondary-warn-bias-kcal", type=float, default=1.0, help="Warn if the starting secondary-CV bias exceeds this value in kcal/mol.")
     p.add_argument("--us-2d-start-secondary-bad-bias-kcal", type=float, default=5.0, help="Mark a starting structure bad if the starting secondary-CV bias exceeds this value in kcal/mol.")
     p.add_argument("--us-2d-start-secondary-k-pull-scale", type=float, default=1.0, help="Multiply the secondary-CV force constant by this factor during the 2D starting-structure pull ramp (production k is restored before saving). Values >1 push harder in fewer steps; try 5.0 with --us-2d-start-distance-fraction 0.05 to keep wall time near the 1D baseline.")
-    p.add_argument("--window-mode", choices=["adaptive", "manual", "adaptive-feedback"], default="adaptive", help="manual: use --windows-a; adaptive: choose initial windows; adaptive-feedback: run short automatic feedback round(s), then a final full production run with the proposed fixed windows. In 2D secondary-CV runs, sparse local patch candidates are consumed automatically for final production when present.")
+    p.add_argument("--window-mode", choices=["adaptive", "manual", "adaptive-feedback", "adaptive-production"], default="adaptive", help="manual: use --windows-a; adaptive: choose initial windows; adaptive-feedback: run short automatic feedback round(s), then a final full production run with the proposed fixed windows. adaptive-production: run epoch-based production, add/retire windows between epochs, then finish with a frozen final phase.")
     p.add_argument("--adaptive-feedback-rounds", type=int, default=3, help="For --window-mode adaptive-feedback: number of short pilot refinement rounds before the final full production run. Default 3: usually enough for one broad diagnosis, one correction, and one validation pass; early convergence can skip remaining rounds.")
     p.add_argument("--adaptive-feedback-pilot-fraction", type=float, default=0.05, help="For --window-mode adaptive-feedback: pilot GaMD production fraction per refinement round relative to --gamd-production-steps. Default 0.05 = 1/20 of final production.")
     p.add_argument("--adaptive-feedback-validation-fraction", type=float, default=0.10, help="For --window-mode adaptive-feedback with more than one round: length of the last pre-production validation pilot as a fraction of --gamd-production-steps. The historical default is 0.10; set 0.05 to make it the same length as ordinary pilots, or use --adaptive-feedback-validation-steps 0 to disable the longer validation pass.")
@@ -237,6 +238,55 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--adaptive-feedback-probe-unvalidated-regions", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--adaptive-feedback-prune-overscanned-regions", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--adaptive-feedback-extend-undersampled-regions", action=argparse.BooleanOptionalAction, default=True)
+
+    # Epoch-based adaptive production. Unlike adaptive-feedback, these rounds
+    # are real production epochs: each epoch runs a fixed window table, then the
+    # registry may add/retire states before the next epoch. Final production is
+    # frozen for clean downstream analysis.
+    p.add_argument("--adaptive-production-epochs", type=int, default=3, help="For --window-mode adaptive-production: maximum number of adaptive production epochs before the frozen final phase.")
+    p.add_argument("--adaptive-production-epoch-steps", type=int, default=0, help="Steps per adaptive-production epoch. 0 = auto, roughly 1/20 of --gamd-production-steps.")
+    p.add_argument("--adaptive-production-final-steps", type=int, default=0, help="Frozen final-production steps after adaptive epochs. 0 = reuse --gamd-production-steps.")
+    p.add_argument("--adaptive-production-min-samples", type=int, default=50, help="Minimum per-state samples before using an edge for adaptive-production midpoint insertion.")
+    p.add_argument("--adaptive-production-retire-min-samples", type=int, default=200, help="Minimum samples before a state is eligible for optional adaptive-production retirement.")
+    p.add_argument("--adaptive-production-target-overlap", type=float, default=0.25, help="Target local histogram overlap for adaptive-production edge health.")
+    p.add_argument("--adaptive-production-min-exchange", type=float, default=0.08, help="Minimum local exchange acceptance for adaptive-production edge health when exchange attempts are available.")
+    p.add_argument("--adaptive-production-max-new-windows-per-epoch", type=int, default=4, help="Maximum midpoint windows added per adaptive-production epoch.")
+    p.add_argument("--adaptive-production-retire-converged", action=argparse.BooleanOptionalAction, default=False, help="Allow adaptive-production to retire graph-noncritical converged states. Default false: first implementation only adds windows and extends sampling.")
+    p.add_argument("--adaptive-production-max-gamd-boost-sd-kcal-mol", type=float, default=6.0, help="GaMD boost SD warning threshold used by adaptive-production diagnostics.")
+    p.add_argument("--adaptive-production-use-epoch-samples-for-mbar", action=argparse.BooleanOptionalAction, default=False, help="Record intent to include adaptive epoch samples in post-hoc MBAR. Default false keeps final-only analysis conservative.")
+    p.add_argument("--adaptive-production-resume", action=argparse.BooleanOptionalAction, default=False, help="Resume adaptive-production from adaptive_production/state_registry.json and the driver summary when available.")
+    p.add_argument("--adaptive-production-write-union-mbar-inputs", action=argparse.BooleanOptionalAction, default=True, help="After the frozen final phase, reconstruct union-state post-hoc MBAR input arrays from scalar traces and the adaptive registry.")
+    p.add_argument("--adaptive-production-run-union-mbar-analysis", action=argparse.BooleanOptionalAction, default=True, help="After writing union-state MBAR input arrays, try to run a PyMBAR state-free-energy/overlap analysis and write adaptive_union_mbar_analysis.* outputs.")
+    p.add_argument("--adaptive-production-union-fes-bins", default="80,40", help="Diagnostic histogram bins for adaptive union analysis, formatted as primary_bins[,secondary_bins]. This is a coverage diagnostic, not the final publication PMF.")
+    p.add_argument("--adaptive-production-write-action-reports", action=argparse.BooleanOptionalAction, default=True, help="Write per-epoch adaptive_epoch_actions.json/md reports explaining add/extend/retire decisions.")
+    p.add_argument("--adaptive-production-final-connectivity-required", action=argparse.BooleanOptionalAction, default=True, help="Require the final active window geometry graph to be connected before launching the frozen final phase.")
+    p.add_argument("--adaptive-production-final-min-samples-per-state", type=int, default=100, help="Quality-gate minimum final/extension sample rows required per active state before reporting the frozen final phase as analysis-ready.")
+    p.add_argument("--adaptive-production-quality-min-primary-coverage-fraction", type=float, default=0.25, help="Quality-gate warning threshold for diagnostic primary-CV histogram coverage fraction after union analysis.")
+    p.add_argument("--adaptive-production-quality-hard-fail", action=argparse.BooleanOptionalAction, default=False, help="Abort the run if the post-final adaptive-production quality gate reports error or needs_more_sampling. Default false writes reports but does not abort.")
+    p.add_argument("--adaptive-production-final-quality-extension-rounds", type=int, default=0, help="Number of optional frozen-final extension rounds to run if the pre-union quality gate reports needs_more_sampling. These rounds keep the final window set frozen.")
+    p.add_argument("--adaptive-production-final-quality-extension-steps", type=int, default=0, help="Steps per frozen-final quality-extension round. 0 = reuse --adaptive-production-final-steps.")
+    p.add_argument("--adaptive-production-propagate-seed-bank", action=argparse.BooleanOptionalAction, default=True, help="After each adaptive-production epoch, build a GENPEPT-compatible seed bank from final epoch PDBs and use it to initialize the next epoch/final phase. This preserves conformational discoveries between epoch workers without mutating OpenMM contexts in place.")
+    p.add_argument("--adaptive-production-seed-bank-max-per-state", type=int, default=1, help="Maximum number of final PDB seeds retained per persistent adaptive-production state in each epoch seed bank.")
+    p.add_argument("--adaptive-production-allocation-scheduler", action=argparse.BooleanOptionalAction, default=True, help="Use per-state adaptive step allocations after the first adaptive-production epoch. Runs a short all-state baseline plus top-up subset runs for high-priority states.")
+    p.add_argument("--adaptive-production-epoch-step-budget", type=int, default=0, help="Total approximate MD-step budget per adaptive-production epoch across active states. 0 = infer from active state count and --adaptive-production-epoch-steps.")
+    p.add_argument("--adaptive-production-min-state-steps", type=int, default=0, help="Minimum baseline steps per active state in adaptive-production scheduled epochs. 0 = min(epoch_steps, max(1000, epoch_steps/4)).")
+    p.add_argument("--adaptive-production-max-state-steps", type=int, default=0, help="Maximum requested steps for any single active state in a scheduled adaptive-production epoch. 0 = 4x baseline epoch steps.")
+    p.add_argument("--adaptive-production-new-state-steps", type=int, default=0, help="Requested steps for newly created states in the next scheduled epoch. 0 = max(epoch_steps, max_state_steps/2).")
+    p.add_argument("--adaptive-production-final-allocation-scheduler", action=argparse.BooleanOptionalAction, default=True, help="Before frozen final production, write a final per-state allocation schedule and use it for optional final extension planning. The first final run remains all-state for clean connectivity.")
+    p.add_argument("--adaptive-production-final-step-budget", type=int, default=0, help="Approximate total final clean step budget across active states for the final allocation schedule. 0 = infer from active state count and --adaptive-production-final-steps.")
+    p.add_argument("--adaptive-production-state-aware-seed-filtering", action=argparse.BooleanOptionalAction, default=True, help="For scheduled adaptive-production segments, filter the propagated seed bank to the closest seeds for the states present in that segment.")
+    p.add_argument("--adaptive-production-scheduled-final-segments", action=argparse.BooleanOptionalAction, default=True, help="Use the final allocation schedule to run a frozen all-state baseline plus top-up subset final segments instead of one uniform final run.")
+    p.add_argument("--adaptive-production-convergence-min-samples-per-state", type=int, default=50, help="Minimum epoch sample rows per active state required before adaptive-production may stop early and enter the frozen final phase.")
+    p.add_argument("--adaptive-production-convergence-max-weak-edges", type=int, default=0, help="Maximum number of weak overlap/exchange edges allowed by the adaptive-production stop gate. Default 0 is conservative.")
+    p.add_argument("--adaptive-production-convergence-allow-extend-actions", action=argparse.BooleanOptionalAction, default=True, help="Allow adaptive production to stop when only extend/no-op actions remain and the stop gate passes. Add/split actions always force another adaptive epoch.")
+    p.add_argument("--adaptive-production-require-convergence-before-final", action=argparse.BooleanOptionalAction, default=False, help="Abort instead of entering frozen final production when the adaptive stop gate has not passed by the last adaptive epoch.")
+    p.add_argument("--adaptive-production-total-md-pool-ns", type=float, default=0.0, help="Maximum aggregate MD simulation time, in ns, available to the whole adaptive-production campaign. This is a pool over all states/replicas: consumed ns = n_states * steps * timestep_fs / 1e6. 0 disables the global pool cap.")
+    p.add_argument("--adaptive-production-final-pool-fraction", type=float, default=0.50, help="When --adaptive-production-total-md-pool-ns is set, reserve roughly this fraction of the remaining pool for frozen final production. Default 0.50.")
+    p.add_argument("--adaptive-production-min-final-pool-ns", type=float, default=0.0, help="Minimum aggregate ns to reserve for frozen final production when using --adaptive-production-total-md-pool-ns. 0 disables an absolute final reserve.")
+    p.add_argument("--adaptive-production-pool-hard-stop", action=argparse.BooleanOptionalAction, default=True, help="If the total MD pool is exhausted, stop launching new adaptive/final segments. With --no-adaptive-production-pool-hard-stop, the pool only reports warnings.")
+    p.add_argument("--adaptive-production-context-reuse", action=argparse.BooleanOptionalAction, default=False, help="Request experimental in-process OpenMM context reuse across adaptive-production epochs. Current package writes a readiness report and safely falls back to epoch-worker mode unless --adaptive-production-context-reuse-require is set.")
+    p.add_argument("--adaptive-production-context-reuse-require", action=argparse.BooleanOptionalAction, default=False, help="Abort if true in-process adaptive-production context reuse is not available. Useful for testing future v12 workers; default false keeps safe epoch-worker fallback.")
+    p.add_argument("--adaptive-production-context-reuse-mode", choices=["off", "checkpoint-handoff", "inprocess-experimental"], default="off", help="Requested context-reuse strategy. off is current safe default; checkpoint-handoff/inprocess-experimental currently produce readiness diagnostics and fall back unless required.")
 
     # Explicit 2D window CSV column-name overrides.
     p.add_argument("--explicit-2d-primary-cv-mode-column", default="primary_cv_mode", help="Column name for primary-CV mode in explicit 2D window CSV.")
@@ -693,6 +743,8 @@ def main(argv: Optional[Iterable[str]] = None):
             openmm, app, unit, forcefield, topology, equil_state = minimize_and_npt_equilibrate(args, out_dir, progress=progress)
             if str(getattr(args, "window_mode", "adaptive")) == "adaptive-feedback":
                 run_adaptive_feedback_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
+            elif str(getattr(args, "window_mode", "adaptive")) == "adaptive-production":
+                run_adaptive_production_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
             else:
                 run_gareus(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
 

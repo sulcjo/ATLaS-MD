@@ -30,6 +30,7 @@ from . import windows  # noqa: F401
 from . import diagnostics  # noqa: F401
 from . import production  # noqa: F401
 from . import adaptive_feedback  # noqa: F401
+from . import adaptive_production  # noqa: F401
 from . import cli  # noqa: F401
 from . import checkpoints  # noqa: F401
 from . import analysis  # noqa: F401
@@ -61,4 +62,5 @@ __all__ = [
     "analysis",
     "forces",
     "provenance",
+    "adaptive_production",
 ]

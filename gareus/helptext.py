@@ -64,6 +64,13 @@ Useful starting points
     # automatic pilot rounds that refine windows before final production
     gareus --seq CLN025 --window-mode adaptive-feedback --out run_feedback
 
+    # epoch-based adaptive production with a global aggregate-MD runtime pool
+    gareus --seq CLN025 --run-mode hmr-gamd --cv1 contacts --cv2 rama-map \
+           --window-mode adaptive-production \
+           --adaptive-production-total-md-pool-ns 840 \
+           --contact-adaptive-max-total-windows 16 \
+           --out run_adaptive_pool
+
     # nonlocal-contact primary CV, with automatic contact-window calibration
     gareus --seq CLN025 --cv1 contacts --window-mode adaptive-feedback --out run_contacts
 
@@ -84,7 +91,7 @@ Common flags
     --seed INT                          Random seed.
 
     --run-mode MODE                    cmd, hmr-cmd, gamd, or hmr-gamd. cmd/hmr-cmd need no gamd-openmm.
-    --window-mode MODE                  manual, adaptive, or adaptive-feedback.
+    --window-mode MODE                  manual, adaptive, adaptive-feedback, or adaptive-production.
     --cv1 MODE                          Friendly primary CV: distance or contacts.
     --cv2 MODE                          Friendly secondary CV; non-none auto-enables 2D centers.
     --primary-cv MODE                   Expert primary CV: distance or nonlocal-contacts.
@@ -102,6 +109,15 @@ Common flags
     --gamd-production-steps N           Historical production-step flag, still supported.
     --exchange-mode MODE                neighbor, random-pair, all-pair-sweep, or gibbs-walk.
     --exchange-interval N               Steps between exchange attempts.
+    --adaptive-production-total-md-pool-ns NS
+                                         Aggregate adaptive-production MD pool over all states/replicas.
+    --adaptive-production-epochs N       Maximum adaptive-production epochs before frozen final production.
+    --adaptive-production-epoch-step-budget N
+                                         Approximate aggregate step budget per adaptive epoch.
+    --adaptive-production-final-pool-fraction F
+                                         Fraction of the runtime pool reserved for frozen final production.
+    --contact-adaptive-max-total-windows N
+                                         Total expanded 2D window/replica cap; useful for max active replicas.
     --traj-format FORMAT                dcd, xtc, or none.
     --no-sample-potential-energy        Skip live total-PE diagnostics; later decomposition still works from saved coordinates.
     --no-flush-every-log                Buffer CSV/JSONL between checkpoints for faster filesystem I/O.
@@ -639,7 +655,45 @@ Pilot folders are diagnostics, not final PMF inputs.  Adaptive feedback can add
 midpoint windows, shift centers, prune over-resolved regions, create sparse 2D
 local patches, and adapt secondary-CV centers when enabled.
 
-0.14 Outputs for analysis
+0.14 Adaptive-production mode
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+`--window-mode adaptive-production` runs epoch-based adaptive production rather
+than a single fixed final production.  The workflow is:
+
+    initial windows / GENPEPT prior
+    -> adaptive production epochs
+    -> diagnose overlap, exchange, coverage, GaMD boost health, and sample counts
+    -> add/extend/optionally retire states
+    -> convergence gate
+    -> frozen final production
+    -> post-hoc union-state MBAR inputs and quality reports
+
+Useful controls:
+
+    --adaptive-production-epochs
+    --adaptive-production-epoch-steps
+    --adaptive-production-epoch-step-budget
+    --adaptive-production-total-md-pool-ns
+    --adaptive-production-final-pool-fraction
+    --adaptive-production-min-final-pool-ns
+    --adaptive-production-pool-hard-stop
+    --adaptive-production-final-steps
+    --adaptive-production-final-step-budget
+    --adaptive-production-allocation-scheduler
+    --adaptive-production-scheduled-final-segments
+    --adaptive-production-resume
+    --adaptive-production-write-union-mbar-inputs
+    --adaptive-production-run-union-mbar-analysis
+
+The runtime pool is aggregate MD, not per-replica trajectory length:
+
+    consumed_ns = n_states * steps_per_state * timestep_fs / 1e6
+
+For example, 16 states run for 250,000 steps at 4 fs consume 16 aggregate ns.
+Use --contact-adaptive-max-total-windows or --adaptive-max-total-windows to cap
+the total active state/replica count in 2D campaigns.
+
+0.15 Outputs for analysis
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 Production outputs include:
 
@@ -659,7 +713,7 @@ Production outputs include:
 The analysis chunks store CVs and the full umbrella bias matrix needed for
 MBAR/PMF-style downstream analysis.
 
-0.15 Potential-energy handling and later decomposition
+0.16 Potential-energy handling and later decomposition
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 By default, sampled total potential energy is logged live.  The optional speed
 flag:
@@ -942,7 +996,59 @@ Important controls:
 Final production should be analyzed from `final_production/` when adaptive
 feedback is used.  Pilot folders are diagnostics, not final PMF inputs.
 
-12. Output and downstream analysis
+12. Adaptive production and global runtime pool
+-----------------------------------------------
+`--window-mode adaptive-production` turns production into an epoch-based
+adaptive campaign.  Each adaptive epoch runs fixed-bias production, analyzes the
+resulting samples/exchanges/overlaps, then updates the persistent state registry
+before the next epoch.  Once the adaptive convergence gate passes, the window set
+is frozen and the final clean production phase begins.
+
+The persistent adaptive-production output directory contains:
+
+    adaptive_production/state_registry.json/csv
+    adaptive_production/lifecycle.jsonl
+    adaptive_production/epoch_*/
+    adaptive_production/final/
+    adaptive_production/adaptive_runtime_pool.json/md
+    adaptive_production/adaptive_union_mbar.*
+    adaptive_production/adaptive_quality_gate*.json/md
+
+The global runtime pool limits aggregate MD across the whole campaign:
+
+    consumed_ns = n_states * steps * timestep_fs / 1e6
+
+Thus 16 states for 250,000 steps at 4 fs cost 16 aggregate ns from the pool.
+This is a resource budget, not the physical length of any single continuous
+replica trajectory.  The final-pool fraction reserves part of the pool for the
+frozen final phase, while adaptive epochs and topups consume the remainder.
+
+Important controls:
+
+    --adaptive-production-total-md-pool-ns
+    --adaptive-production-final-pool-fraction
+    --adaptive-production-min-final-pool-ns
+    --adaptive-production-pool-hard-stop
+    --adaptive-production-epochs
+    --adaptive-production-epoch-step-budget
+    --adaptive-production-final-step-budget
+    --adaptive-production-resume
+    --adaptive-production-require-convergence-before-final
+    --adaptive-production-quality-hard-fail
+
+For 2D contact x Rama campaigns, cap total active replicas with:
+
+    --contact-adaptive-max-total-windows
+
+or, for non-contact adaptive campaigns:
+
+    --adaptive-max-total-windows
+
+The current implementation uses safe epoch-worker execution rather than true
+in-process OpenMM context reuse.  Context reuse flags write readiness reports and
+fall back unless strict reuse is required.
+
+13. Output and downstream analysis
 ----------------------------------
 The run writes scalar CSV files for readability and chunked NPZ arrays for large
 analyses.  Important outputs include:
@@ -964,7 +1070,7 @@ friendly to MBAR/PMF workflows, while retaining enough metadata to diagnose bad
 window overlap before pretending the PMF is meaningful.  Science: proudly turning
 uncertainty into files with names.
 
-13. Analysis-driven CV suggestion report
+14. Analysis-driven CV suggestion report
 -----------------------------------------
 After a pilot or completed production run, `gareus-suggest-cvs` reads
 `analysis_arrays.npz` or `analysis_chunks_manifest.json` and writes heuristic

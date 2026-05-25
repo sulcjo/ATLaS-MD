@@ -3,6 +3,7 @@ __pycache__/
 .remember/
 .codex/
 .agents/
+.claude/
 _local_docs/
 query_gpt.py
 
@@ -15,6 +16,8 @@ chignolin_genpept_seeds/
 chignolin_2d_newpackage/
 ABCold_monolith/
 _genpept_test/chignolin_genpept_run??_*/
+_genpept_test/fes_*/
+gareus_adaptive_production_v*/
 
 *.tar.gz
 *.txt
