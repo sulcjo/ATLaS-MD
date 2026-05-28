@@ -55,6 +55,22 @@ from .cv import (
 from .windows import build_explicit_2d_neighbor_edges
 from .math_helpers import _hist_overlap
 
+def _compact_epoch_context(adaptive: dict) -> str:
+    """Short epoch/segment/topup label for the compact header line 3."""
+    if not adaptive:
+        return ""
+    if adaptive.get("is_pilot"):
+        return color_text(f"pilot {adaptive.get('round','?')}/{adaptive.get('rounds','?')}", "yellow", bold=True)
+    if adaptive.get("is_final"):
+        return color_text("FINAL production", "green", bold=True)
+    if adaptive.get("is_adaptive_epoch"):
+        ei = int(adaptive.get("epoch_index", 0)) + 1
+        et = adaptive.get("epoch_total", "?")
+        seg = "topup" if adaptive.get("is_topup") else "baseline"
+        return color_text(f"epoch {ei}/{et} {seg}", "magenta")
+    return ""
+
+
 def _sparkline(values: list[float], width: int = 18) -> str:
     vals = [float(v) for v in values if math.isfinite(float(v))]
     if not vals:
@@ -904,11 +920,18 @@ class DistanceLogger:
             lines.append(f"  r{r:02d} {trtxt:<34} span {span:2d}/{max(0,n_windows-1):2d}  trips {int(rt.get('roundtrips',0)):2d} {color_text('STUCK' if stuck else 'OK', 'red' if stuck else 'green', bold=stuck)}")
         return lines
 
-    def _render_replica_table(self, rows: list[dict], phase: str, n_windows: int, ncols: int = 1) -> list[str]:
+    def _render_replica_table(self, rows: list[dict], phase: str, n_windows: int, ncols: int = 1, info: Optional[dict] = None, is_2d_run: bool = False) -> list[str]:
         """All-replica table combining health, boost and diffusion data, optionally multi-column."""
         if not rows:
             return [color_text("no replica data", "dim")]
         max_span = max(0, n_windows - 1)
+        _info = info or {}
+        centers_a_inner = [float(x) for x in _info.get("centers_a", [])]
+        sec_targets_inner = [float(x) for x in _info.get("secondary_cv_centers", []) if str(x) not in {"", "None", "nan"}]
+        lo_inner = min(centers_a_inner) if centers_a_inner else 0.0
+        hi_inner = max(centers_a_inner) if centers_a_inner else 1.0
+        sec_lo_inner = min(sec_targets_inner) if sec_targets_inner else -1.0
+        sec_hi_inner = max(sec_targets_inner) if sec_targets_inner else 1.0
         rep_lines: list[str] = []
         for r in sorted(rows, key=lambda x: int(x.get("replica", 0))):
             rep = int(r.get("replica", 0))
@@ -928,7 +951,7 @@ class DistanceLogger:
                 b_kcal = float("nan")
 
             h = self.history_by_replica.get(rep, [])
-            spark = _sparkline(list(h)[-24:], 12) if h else " " * 12
+            spark = _sparkline(list(h)[-20:], 10) if h else " " * 10
             recent10 = list(h)[-10:]
             recent_span = (max(recent10) - min(recent10)) if len(recent10) >= 2 else float("nan")
             cv_stuck = len(recent10) >= 10 and math.isfinite(recent_span) and recent_span < 0.05
@@ -938,7 +961,7 @@ class DistanceLogger:
             span_val = int(rt.get("max", 0)) - int(rt.get("min", 0))
             trips = int(rt.get("roundtrips", 0))
             win_stuck = len(set(tr[-5:])) <= 1 and len(tr) >= 5
-            trail = "→".join(f"w{x:02d}" for x in tr[-5:])
+            trail = "→".join(f"w{x:02d}" for x in tr[-4:])
 
             if not math.isfinite(pe) and not math.isfinite(cv):
                 status, scol = "BAD", "red"
@@ -948,15 +971,37 @@ class DistanceLogger:
                 status, scol = "OK", "green"
 
             cv_str = (format_primary_cv_value(cv, self.args, precision=3).rjust(9) if math.isfinite(cv) else "      n/a")
-            delta_str = ("Δ" + format_primary_delta_value(delta, self.args, precision=3).rjust(8)) if math.isfinite(delta) else "Δ    n/a"
+            delta_str = ("Δ" + format_primary_delta_value(delta, self.args, precision=3).rjust(7)) if math.isfinite(delta) else "Δ   n/a"
             pe_str = f"{pe:8.1f}kJ" if math.isfinite(pe) else "     n/akJ"
-            b_str = f"b{b_kcal:6.2f}kc" if math.isfinite(b_kcal) else "b   n/akc"
+            b_str = f"b{b_kcal:5.2f}kc" if math.isfinite(b_kcal) else "b  n/akc"
             status_txt = color_text(status, scol, bold=scol != "green")
             rep_txt = replica_marker(f"r{rep:02d}", rep)
 
+            if is_2d_run:
+                try:
+                    cv2_val = float(r.get("secondary_cv", "nan"))
+                    cv2_str = f"CV2{cv2_val:+5.2f}" if math.isfinite(cv2_val) else "CV2   n/a"
+                except Exception:
+                    cv2_str = "CV2   n/a"
+                h2 = list(self.secondary_history_by_replica.get(rep, []))
+                h1 = list(h)[-len(h2):] if h2 else []
+                cells_2d: set = set()
+                for v1, v2 in zip(h1, h2):
+                    try:
+                        if math.isfinite(float(v1)) and math.isfinite(float(v2)):
+                            bi = int((float(v1) - lo_inner) / max(1e-9, hi_inner - lo_inner) * 8)
+                            bj = int((float(v2) - sec_lo_inner) / max(1e-9, sec_hi_inner - sec_lo_inner) * 8)
+                            cells_2d.add((max(0, min(7, bi)), max(0, min(7, bj))))
+                    except Exception:
+                        pass
+                cells_str = f"{len(cells_2d):2d}c"
+                extra = f"  {cv2_str}  {cells_str}"
+            else:
+                extra = ""
+
             line = (
                 f"  {rep_txt} w{win:02d}  {cv_str}  {delta_str}  {pe_str}  {b_str}"
-                f"  {spark}  {trail:<17}  {span_val:2d}/{max_span:2d}  {trips:2d}t  {status_txt}"
+                f"  {spark}  {trail:<12}  {span_val:2d}/{max_span:2d}  {trips:2d}t{extra}  {status_txt}"
             )
             rep_lines.append(line)
 
@@ -2065,6 +2110,25 @@ class DistanceLogger:
             )
         return lines
 
+    def _render_compact_decision_inline(self, decision: dict, term_w: int) -> list[str]:
+        """2-line inline health + action summary replacing the bordered decision box."""
+        health = str((decision or {}).get("health", "OK")).upper()
+        color = "green" if health == "OK" else "yellow" if health == "WATCH" else "red"
+        icon = "OK" if health == "OK" else "!!" if health == "WATCH" else "XX"
+        issues = (decision or {}).get("issues", []) or []
+        reasons = (decision or {}).get("reasons", []) or []
+        actions = (decision or {}).get("actions", []) or []
+        top_reason = reasons[0] if reasons else "diagnostics OK"
+        top_action = actions[0] if actions else "continue"
+        line1 = (
+            color_text(f"{icon} {health}", color, bold=True)
+            + f"  {len(issues)} issues  reason: {top_reason}"
+        )
+        line2 = color_text("action: ", "dim") + top_action
+        if len(reasons) > 1:
+            line2 += color_text(f"  (+{len(reasons)-1} more)", "dim")
+        return [_ansi_truncate(line1, term_w - 2), _ansi_truncate(line2, term_w - 2)]
+
     def _render_dashboard_context_panel(
         self,
         rows: list[dict],
@@ -2187,6 +2251,110 @@ class DistanceLogger:
             max_body_lines=9,
         )
 
+    def _render_compact_header(
+        self,
+        phase: str,
+        frac: float,
+        elapsed: float,
+        eta: Optional[float],
+        perf_txt: str,
+        display_step: int,
+        display_total: Optional[int],
+        summary: dict,
+        info: dict,
+        adaptive: dict,
+        primary_label: str,
+        primary_units: str,
+        unit_suffix: str,
+        primary_k_units_text: str,
+        is_2d_run: bool,
+        n_windows: int,
+        n_secondary_targets: int,
+        topology_label: str,
+        density: str,
+        term_w: int,
+        term_h: int,
+        centers_a: list[float],
+        eta_start_wall: float,
+    ) -> list[str]:
+        """Compact 3-line (or 4-line with pilot banner) header replacing the old 7+ line block."""
+        pbar = make_progress_bar(frac, min(36, max(18, term_w // 5)))
+        line1 = (
+            color_text("GaREUS", "magenta", bold=True)
+            + f"  {phase}  [{pbar}]  {display_step}/{display_total or '?'}  {100*frac:5.1f}%"
+            + f"  wall {format_duration(elapsed)}  eta {format_duration(eta)}"
+            + perf_txt
+        )
+
+        cv1_part = (
+            f"{primary_label} {summary.get('cv_min_A', float('nan')):6.2f}–"
+            f"{summary.get('cv_max_A', float('nan')):6.2f}{unit_suffix}"
+            f"  mean {summary.get('cv_mean_A', float('nan')):6.2f}{unit_suffix}"
+            f"  k {summary.get('k_min_kcal_mol_A2', float('nan')):.3g}–"
+            f"{summary.get('k_max_kcal_mol_A2', float('nan')):.3g} {primary_k_units_text}"
+        )
+        if is_2d_run and "secondary_cv_mean" in summary:
+            cv2_part = (
+                f"  │  CV2 {summary.get('secondary_cv_min', float('nan')):+6.2f}–"
+                f"{summary.get('secondary_cv_max', float('nan')):+6.2f}"
+                f" mean {summary.get('secondary_cv_mean', float('nan')):+6.2f}"
+            )
+        else:
+            cv2_part = ""
+        topo_part = (
+            color_text("  │  win", "dim") + f" {n_windows}"
+            + color_text("  topo", "dim") + f" {topology_label}"
+            + color_text(f"  {density} {term_w}×{term_h}", "dim")
+        )
+        line2 = cv1_part + cv2_part + topo_part
+
+        lo = min(centers_a) if centers_a else float(summary.get("cv_min_A", 0.0))
+        hi = max(centers_a) if centers_a else float(summary.get("cv_max_A", 1.0))
+        vals_flat: list[float] = []
+        for h in self.history_by_replica.values():
+            vals_flat.extend(h)
+        cov_w = max(12, min(48, term_w // 3))
+        cov_bar = _coverage_bar(vals_flat, lo, hi, cov_w)
+        epoch_ctx = _compact_epoch_context(adaptive)
+        wf_ctx = ""
+        if adaptive.get("is_pilot"):
+            try:
+                wf_start = float(adaptive.get("workflow_start_wall", eta_start_wall))
+                wf_done = float(adaptive.get("workflow_done_before", 0.0)) + float(display_step)
+                wf_total = float(adaptive.get("workflow_total_steps", 0.0))
+                wf_frac = max(0.0, min(1.0, wf_done / wf_total)) if wf_total > 0 else 0.0
+                wf_elapsed = max(0.0, time.time() - wf_start)
+                wf_eta = (wf_elapsed * (1.0 - wf_frac) / wf_frac) if wf_frac > 0 else None
+                wf_ctx = (
+                    color_text("  workflow", "dim")
+                    + f" {100*wf_frac:.0f}% ({wf_done:.0f}/{wf_total:.0f} steps)"
+                    + color_text(f"  ETA {format_duration(wf_eta)}", "yellow")
+                )
+            except Exception:
+                pass
+        line3 = (
+            color_text("cov", "dim")
+            + f" {lo:.2f}–{hi:.2f}{unit_suffix} |{cov_bar}|"
+            + (f"  {epoch_ctx}" if epoch_ctx else "")
+            + wf_ctx
+        )
+
+        if adaptive.get("is_pilot"):
+            banner = style_text(
+                f"  PILOT round {adaptive.get('round','?')}/{adaptive.get('rounds','?')}"
+                f"  overlap target {float(adaptive.get('target_overlap', 0.30)):.2f}"
+                f"  final target {adaptive.get('final_steps','?')} steps  DATA DISCARDED AFTER DIAGNOSTICS  ",
+                color="red", bold=True, bg256=52,
+            )
+            return [banner, line1, line2, line3]
+        if adaptive.get("is_final"):
+            final_note = color_text(
+                "FINAL CLEAN PRODUCTION after adaptive-feedback pilots — use this directory for MBAR/PMF",
+                "green", bold=True,
+            )
+            return [final_note, line1, line2, line3]
+        return [line1, line2, line3]
+
     def _render_dashboard(self, rows: list[dict], phase: str, step: int, total_steps: Optional[int], summary: dict, dashboard_info: Optional[dict]) -> str:
         info = dashboard_info or {}
         panel_mode = str(info.get("dashboard_panels", self.dashboard_panels) or self.dashboard_panels).lower()
@@ -2228,70 +2396,20 @@ class DistanceLogger:
         primary_units = str(info.get("primary_cv_units", primary_cv_units(self.args)))
         primary_k_units_text = str(info.get("primary_k_units", primary_k_units(self.args)))
         unit_suffix = "" if primary_units in {"", "dimensionless"} else f" {primary_units}"
-        primary_mode = str(info.get("primary_cv", primary_cv_mode(self.args)))
-
         adaptive = info.get("adaptive_phase") or {}
-        header = []
-        if adaptive.get("is_pilot"):
-            banner_text = "  !!!  ADAPTIVE PHASE / PILOT ONLY - DATA WILL BE DISCARDED AFTER WINDOW DIAGNOSTICS  !!!  "
-            banner_w = max(40, min(term_w - 2, len(strip_ansi(banner_text)) + 4))
-            banner = banner_text.center(banner_w, "!")
-            header.append(style_text(banner, color="red", bold=True, bg256=52))
-            header.append(color_text(
-                f"adaptive pilot round {adaptive.get('round', '?')}/{adaptive.get('rounds', '?')}  "
-                f"target overlap {float(adaptive.get('target_overlap', 0.30)):.2f}  "
-                f"pilot {display_step}/{display_total or '?'} steps  "
-                f"final target {adaptive.get('final_steps', '?')} steps",
-                "red", bold=True,
-            ))
-            try:
-                wf_start = float(adaptive.get("workflow_start_wall", eta_start_wall))
-                wf_done = float(adaptive.get("workflow_done_before", 0.0)) + float(display_step)
-                wf_total = float(adaptive.get("workflow_total_steps", 0.0))
-                wf_frac = max(0.0, min(1.0, wf_done / wf_total)) if wf_total > 0 else 0.0
-                wf_elapsed = max(0.0, time.time() - wf_start)
-                wf_eta = (wf_elapsed * (1.0 - wf_frac) / wf_frac) if wf_frac > 0 else None
-                header.append(color_text(
-                    f"adaptive workflow rough ETA {format_duration(wf_eta)}  "
-                    f"({wf_done:.0f}/{wf_total:.0f} production-step equivalents including final run)",
-                    "yellow", bold=True,
-                ))
-            except Exception:
-                pass
-        elif adaptive.get("is_final"):
-            header.append(color_text(
-                "FINAL CLEAN PRODUCTION after adaptive-feedback pilots - use this directory for MBAR/PMF",
-                "green", bold=True,
-            ))
-
-        header.extend([
-            color_text("GaREUS dashboard", "magenta", bold=True) + f"  phase {phase}  [{progress_bar}]  {display_step}/{display_total or '?'}  {100*frac:5.1f}%  wall {format_duration(elapsed)}  eta {format_duration(eta)}" + perf_txt,
-            f"{primary_label} {summary.get('cv_min_A', float('nan')):6.2f}–{summary.get('cv_max_A', float('nan')):6.2f}{unit_suffix}  mean {summary.get('cv_mean_A', float('nan')):6.2f}{unit_suffix}  k {summary.get('k_min_kcal_mol_A2', float('nan')):.3g}–{summary.get('k_max_kcal_mol_A2', float('nan')):.3g} {primary_k_units_text}",
-        ])
-        if "secondary_cv_mean" in summary:
-            header.append(
-                f"secondary CV {summary.get('secondary_cv_min', float('nan')):+6.2f}–{summary.get('secondary_cv_max', float('nan')):+6.2f}  "
-                f"mean {summary.get('secondary_cv_mean', float('nan')):+6.2f}"
-            )
         sec_meta = info.get("secondary_cv", {}) or {}
         n_secondary_targets = len([x for x in info.get("secondary_cv_centers", []) if str(x) not in {"", "None", "nan"}])
         explicit_2d = bool(sec_meta.get("explicit_2d_windows", info.get("explicit_2d", False)))
         rectangular_2d = bool(sec_meta.get("grid", info.get("rectangular_2d", False))) if explicit_2d else bool(n_secondary_targets > 1 and n_windows == max(1, len(set(round(float(x), 4) for x in centers_a))) * max(1, n_secondary_targets))
         sparse_2d = bool(explicit_2d and not rectangular_2d)
         topology_label = "sparse explicit 2D" if sparse_2d else "rectangular 2D" if n_secondary_targets > 1 else "1D/secondary-fixed"
-        header.append(
-            color_text("layout", "dim") + f" {density} {term_w}x{term_h}  "
-            + color_text("windows", "dim") + f" {n_windows}  "
-            + color_text("topology", "dim") + f" {topology_label}  "
-            + color_text("secondary targets", "dim") + f" {n_secondary_targets}"
+        is_2d_run = n_secondary_targets > 1 or explicit_2d
+        header = self._render_compact_header(
+            phase, frac, elapsed, eta, perf_txt, display_step, display_total,
+            summary, info, adaptive, primary_label, primary_units, unit_suffix,
+            primary_k_units_text, is_2d_run, n_windows, n_secondary_targets,
+            topology_label, density, term_w, term_h, centers_a, eta_start_wall,
         )
-        lo = min(centers_a) if centers_a else summary.get("cv_min_A", 0.0)
-        hi = max(centers_a) if centers_a else summary.get("cv_max_A", 1.0)
-        vals = []
-        for h in self.history_by_replica.values():
-            vals.extend(h)
-        coverage_w = max(12, min(64, max(12, usable_w - len(f"coverage {lo:.1f} A || {hi:.1f} A") - 2)))
-        header.append(f"coverage {lo:.2f}{unit_suffix} |{_coverage_bar(vals, lo, hi, coverage_w)}| {hi:.2f}{unit_suffix}")
         header = [_ansi_truncate(line, usable_w) for line in header]
         decision = self._dashboard_decision_state(rows, exchange_stats, centers_a, summary, phase, info)
 
@@ -2302,7 +2420,7 @@ class DistanceLogger:
         usable_w = max(40, term_w - 2)
         row_gap = 2 if term_w < 120 else 3
         min_panel_w = max(24, int(getattr(self.args, "dashboard_min_panel_width", 30) or 30))
-        wide_threshold = int(getattr(self.args, "dashboard_wide_threshold", 132) or 132)
+        wide_threshold = int(getattr(self.args, "dashboard_wide_threshold", 120) or 120)
         pe_panel_w = usable_w if usable_w < 105 else max(34, min(58, usable_w // 3))
         cv_panel_w = usable_w if usable_w < 105 else max(50, usable_w - pe_panel_w - row_gap)
         cv_bar_width = max(24, min(140 if full_dashboard else 110, cv_panel_w - 62))
@@ -2312,7 +2430,7 @@ class DistanceLogger:
         row4_max = (8 if compact_dashboard else 14 if density == "normal" else 18)
 
         hist_lines = []
-        if self.ascii_mode != "none":
+        if self.ascii_mode != "none" and not is_2d_run:
             hist_lines = render_distance_ascii(
                 rows, phase=phase, step=step, total_steps=total_steps,
                 width=cv_bar_width, max_replicas=self.ascii_max_replicas,
@@ -2332,11 +2450,19 @@ class DistanceLogger:
         sections = []
         sections.extend(header)
         sections.append("")
-        sections.extend(self._render_dashboard_context_panel(
-            rows, phase, display_step, display_total, summary, info, decision, centers_a, exchange_stats, term_w=term_w,
-        ))
-        sections.append("")
-        sections.extend(self._render_dashboard_decision_panel(decision, term_w=term_w))
+        sections.extend(self._render_compact_decision_inline(decision, term_w=term_w))
+        if is_2d_run:
+            sec_vals: list[float] = []
+            for _h in self.secondary_history_by_replica.values():
+                sec_vals.extend(_h)
+            sec_targets = [float(x) for x in info.get("secondary_cv_centers", []) if str(x) not in {"", "None", "nan"}]
+            if sec_vals and sec_targets:
+                sec_lo_cov, sec_hi_cov = min(sec_targets), max(sec_targets)
+                cov2_w = max(12, min(48, term_w // 3))
+                sections.append(
+                    color_text("CV2 cov", "dim")
+                    + f" {sec_lo_cov:+.2f}–{sec_hi_cov:+.2f} |{_coverage_bar(sec_vals, sec_lo_cov, sec_hi_cov, cov2_w)}|"
+                )
         sections.append("")
         if panel_mode == "minimal":
             # Keep the live TUI cheap: header + explanation + decision + compact CV map.
@@ -2361,21 +2487,20 @@ class DistanceLogger:
             ))
             sections.append("")
 
-        sections.extend(_dashboard_weighted_row(
-            "1/4 CV + potential-energy maps",
-            [
-                ("actual per-window CV distributions", hist_lines or [color_text("disabled", "dim")], 2.4),
-                ("potential energy histograms", self._render_potential_energy_map(rows, width=pe_bar_width)[1:], 0.9),
-            ],
-            term_w=term_w,
-            gap=row_gap,
-            max_panel_body_lines=max(row1_max, min(32, int(getattr(self.args, "distance_ascii_max_replicas", 32) or 32) + 4)),
-            min_panel_width=min_panel_w,
-        ))
-        sections.append("")
+        if not is_2d_run:
+            sections.extend(_dashboard_weighted_row(
+                "CV + potential-energy maps",
+                [
+                    ("per-window CV distributions", hist_lines or [color_text("disabled", "dim")], 2.4),
+                    ("potential energy histograms", self._render_potential_energy_map(rows, width=pe_bar_width)[1:], 0.9),
+                ],
+                term_w=term_w,
+                gap=row_gap,
+                max_panel_body_lines=max(row1_max, min(32, int(getattr(self.args, "distance_ascii_max_replicas", 32) or 32) + 4)),
+                min_panel_width=min_panel_w,
+            ))
+            sections.append("")
 
-        # Wide terminals (≥140 cols): the two 2D panels share a row side-by-side,
-        # cutting height by ~18 lines.  Narrow terminals fall back to stacked layout.
         wide_terminal = (term_w >= wide_threshold) and not compact_dashboard
         diff2d_w = max(50, (usable_w - row_gap) * 56 // 100) if wide_terminal else usable_w
         map2d_w = max(44, usable_w - diff2d_w - row_gap) if wide_terminal else usable_w
@@ -2422,34 +2547,18 @@ class DistanceLogger:
                 ))
                 sections.append("")
 
-        # Row 2: immediate production diagnostics. Replica-health and raw-PMF
-        # panels are intentionally no longer shown as standalone panels; the
-        # always-on Run decision panel handles health, and PMF previews belong in
-        # post-processing rather than the live TUI.
-        sections.extend(_dashboard_weighted_row(
-            "2/4 GaMD boost diagnostics",
-            [
-                ("GaMD boost", self._render_gamd_boost(rows, summary, phase)[1:], 1.0),
-            ],
-            term_w=term_w,
-            gap=row_gap,
-            max_panel_body_lines=row23_max,
-            min_panel_width=min_panel_w,
-        ))
-        sections.append("")
-
-        # Row 3: window coupling diagnostics. In 2D mode, graph-edge histogram
-        # overlap is integrated into the 2D topology panel above; the legacy
-        # flattened 1D overlap panel is shown only for non-2D runs.
+        # Coupling + boost diagnostics merged into one row.
+        # In 2D mode, graph-edge histogram overlap lives in the topology panel; 1D overlap shown only for 1D runs.
         two_d_dashboard_mode = bool(topology_lines)
         coupling_panels = [
             ("exchange acceptance", self._render_exchange_acceptance(exchange_stats, n_windows)[1:], 1.15),
-            ("umbrella pull", self._render_pull_map(rows, n_windows)[1:], 1.25),
+            ("umbrella pull", self._render_pull_map(rows, n_windows)[1:], 1.00),
+            ("GaMD boost", self._render_gamd_boost(rows, summary, phase)[1:], 1.00),
         ]
         if not two_d_dashboard_mode:
-            coupling_panels.insert(1, ("histogram overlap", self._render_overlap(centers_a)[1:], 0.95))
+            coupling_panels.insert(1, ("histogram overlap", self._render_overlap(centers_a)[1:], 0.85))
         sections.extend(_dashboard_weighted_row(
-            "3/4 window coupling" + (" + 2D graph overlap" if two_d_dashboard_mode else ""),
+            "diagnostics: coupling + boost",
             coupling_panels,
             term_w=term_w,
             gap=row_gap,
@@ -2458,17 +2567,14 @@ class DistanceLogger:
         ))
         sections.append("")
 
-        # Row 4: all-replica combined table (health + boost + diffusion).
-        # Measure natural line width at ncols=1, then compute how many columns
-        # fit in the available terminal width before re-rendering.
-        single_table = self._render_replica_table(rows, phase, n_windows, ncols=1)
+        # All-replica table: measure natural line width at ncols=1, compute how many columns fit.
+        single_table = self._render_replica_table(rows, phase, n_windows, ncols=1, info=info, is_2d_run=is_2d_run)
         line_w = max((strip_ansi_len(l) for l in single_table), default=78) if single_table else 78
-        # panel border consumes 2 chars; each additional column needs line_w + 3 gap
         inner_avail = usable_w - 2
         ncols_rep = max(1, (inner_avail + 3) // (line_w + 3))
         rep_table = (
             single_table if ncols_rep <= 1
-            else self._render_replica_table(rows, phase, n_windows, ncols=ncols_rep)
+            else self._render_replica_table(rows, phase, n_windows, ncols=ncols_rep, info=info, is_2d_run=is_2d_run)
         )
         # Only expand row height beyond row4_max in non-compact mode so compact
         # dashboards don't grow past the terminal.
@@ -2482,7 +2588,7 @@ class DistanceLogger:
             row4_panels.append(("recommendations", rec_lines[1:]))
         weighted_row4 = [(name, body, 1.5 if name == "replica motion + health" else 1.0) for name, body in row4_panels]
         sections.extend(_dashboard_weighted_row(
-            "4/4 motion + recommendations",
+            "motion + recommendations",
             weighted_row4,
             term_w=term_w,
             gap=row_gap,

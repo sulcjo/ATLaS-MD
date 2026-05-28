@@ -3655,6 +3655,22 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             }
         if adaptive_phase_info is not None:
             dashboard_info["adaptive_phase"] = adaptive_phase_info
+        # Merge adaptive-production epoch/topup context from _adaptive_phase_info if present.
+        _api = getattr(args, "_adaptive_phase_info", {}) or {}
+        if _api:
+            if adaptive_phase_info is None:
+                adaptive_phase_info = {
+                    "is_adaptive_epoch": True,
+                    "epoch_index": int(_api.get("epoch_index", 0)),
+                    "epoch_total": int(_api.get("epoch_total", 1)),
+                    "segment_name": str(_api.get("segment_name", "")),
+                    "is_topup": bool(_api.get("is_topup", False)),
+                    "topup_index": int(_api.get("topup_index", 0)),
+                }
+                dashboard_info["adaptive_phase"] = adaptive_phase_info
+            else:
+                adaptive_phase_info["epoch_index"] = int(_api.get("epoch_index", 0))
+                adaptive_phase_info["epoch_total"] = int(_api.get("epoch_total", 1))
 
         if bool(getattr(args, "resume", False)):
             manifest = load_production_checkpoint(out_dir, sims, centers_nm, ks_kj_nm2, rng, secondary_cv_centers, secondary_cv_ks_kj)

@@ -2800,6 +2800,20 @@ def run_scheduled_adaptive_epoch(
         seg_args.adaptive_feedback_pilot = False
         seg_args.adaptive_feedback_final_production = False
         seg_args.resume = False
+        # Derive epoch index from directory name for TUI epoch/topup display.
+        _epoch_dir_name = epoch_dir.name  # e.g. "epoch_001"
+        try:
+            _epoch_idx = int(_epoch_dir_name.rsplit("_", 1)[-1])
+        except Exception:
+            _epoch_idx = 0
+        setattr(seg_args, "_adaptive_phase_info", {
+            "is_adaptive_epoch": True,
+            "epoch_index": _epoch_idx,
+            "epoch_total": "?",
+            "segment_name": name,
+            "is_topup": name.startswith("topup"),
+            "topup_index": int(name.split("_")[1]) if name.startswith("topup") and "_" in name[6:] else 0,
+        })
         seed_report = None
         if current_seed_bank is not None and Path(current_seed_bank).exists():
             if bool(getattr(args, "adaptive_production_state_aware_seed_filtering", True)):
@@ -3141,6 +3155,14 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
         else:
             epoch_args = copy.copy(args)
             epoch_args.out = str(epoch_dir)
+            setattr(epoch_args, "_adaptive_phase_info", {
+                "is_adaptive_epoch": True,
+                "epoch_index": int(epoch),
+                "epoch_total": int(max_epochs),
+                "segment_name": "epoch",
+                "is_topup": False,
+                "topup_index": 0,
+            })
             epoch_state_estimate = _estimate_active_state_count(args, registry, current_windows_csv)
             actual_epoch_steps = runtime_pool.clip_steps(
                 epoch_state_estimate,
