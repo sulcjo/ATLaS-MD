@@ -445,6 +445,7 @@ def _basic_chignolin_config() -> Dict[str, Any]:
             "traj_interval": 50,
             "traj_format": "xtc",
             "adaptive_pilot_trajectories": False,
+            "adaptive_production_trajectories": True,
             "dashboard_render_interval_sec": 2.0,
             "dashboard_panels": "normal",
             "dashboard_heavy_panels_every": 2,

@@ -1,5 +1,5 @@
 schema_version: '1.0'
-description: "Chignolin (GYDPETGTWG) production 2D contacts x rama-map HMR-GaMD/REUS with 840 ns aggregate MD pool, variable active-replica count, 10 adaptive epochs using 60% of the pool, and a 40% frozen-final phase."
+description: "Chignolin (GYDPETGTWG) double-adaptive 2D contacts x rama-map HMR-GaMD/REUS: adaptive-feedback pilots seed adaptive-production, with 840 ns aggregate adaptive-production MD pool, variable active-replica count, 10 adaptive epochs using 60% of the pool, and a 40% frozen-final phase."
 
 genpept:
   # Basic run identity
@@ -177,7 +177,8 @@ starting_structures:
   us_pull_k_kcal_a2: 75
 
 windows:
-  window_mode: adaptive-production
+  # Double-adaptive = adaptive-feedback pilots only -> handoff window table -> adaptive-production epochs/topups -> frozen final.
+  window_mode: double-adaptive
   adaptive_window_aggressiveness: aggressive
   adaptive_feedback_pilot_fraction: 0.008
   adaptive_feedback_validation_steps: 20000
@@ -275,7 +276,7 @@ explicit_2d_windows:
 
 output:
   seq: GYDPETGTWG
-  out: chignolin_2d_run4_production_840ns_10ep60_stateagnostic/
+  out: chignolin_2d_run4_double_adaptive_840ns_10ep60_stateagnostic/
   traj_interval: 100
   report_interval: 100
   distance_output_interval: 100

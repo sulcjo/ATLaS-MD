@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import csv
 import json
 import math
 import os
@@ -190,7 +192,8 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--us-2d-start-secondary-warn-bias-kcal", type=float, default=1.0, help="Warn if the starting secondary-CV bias exceeds this value in kcal/mol.")
     p.add_argument("--us-2d-start-secondary-bad-bias-kcal", type=float, default=5.0, help="Mark a starting structure bad if the starting secondary-CV bias exceeds this value in kcal/mol.")
     p.add_argument("--us-2d-start-secondary-k-pull-scale", type=float, default=1.0, help="Multiply the secondary-CV force constant by this factor during the 2D starting-structure pull ramp (production k is restored before saving). Values >1 push harder in fewer steps; try 5.0 with --us-2d-start-distance-fraction 0.05 to keep wall time near the 1D baseline.")
-    p.add_argument("--window-mode", choices=["adaptive", "manual", "adaptive-feedback", "adaptive-production"], default="adaptive", help="manual: use --windows-a; adaptive: choose initial windows; adaptive-feedback: run short automatic feedback round(s), then a final full production run with the proposed fixed windows. adaptive-production: run epoch-based production, add/retire windows between epochs, then finish with a frozen final phase.")
+    p.add_argument("--window-mode", choices=["adaptive", "manual", "adaptive-feedback", "adaptive-production", "double-adaptive"], default="adaptive", help="manual: use --windows-a; adaptive: choose initial windows; adaptive-feedback: run short automatic feedback round(s), then a final full production run with the proposed fixed windows. adaptive-production: run epoch-based production, add/retire windows between epochs, then finish with a frozen final phase. double-adaptive: run adaptive-feedback pilots only, hand the proposal to adaptive-production, then finish with its frozen final phase.")
+    p.add_argument("--double-adaptive", action="store_true", help="Alias for --window-mode double-adaptive: adaptive-feedback pilots -> adaptive-production epochs/topups -> frozen final.")
     p.add_argument("--adaptive-feedback-rounds", type=int, default=3, help="For --window-mode adaptive-feedback: number of short pilot refinement rounds before the final full production run. Default 3: usually enough for one broad diagnosis, one correction, and one validation pass; early convergence can skip remaining rounds.")
     p.add_argument("--adaptive-feedback-pilot-fraction", type=float, default=0.05, help="For --window-mode adaptive-feedback: pilot GaMD production fraction per refinement round relative to --gamd-production-steps. Default 0.05 = 1/20 of final production.")
     p.add_argument("--adaptive-feedback-validation-fraction", type=float, default=0.10, help="For --window-mode adaptive-feedback with more than one round: length of the last pre-production validation pilot as a fraction of --gamd-production-steps. The historical default is 0.10; set 0.05 to make it the same length as ordinary pilots, or use --adaptive-feedback-validation-steps 0 to disable the longer validation pass.")
@@ -259,7 +262,6 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--adaptive-production-run-union-mbar-analysis", action=argparse.BooleanOptionalAction, default=True, help="After writing union-state MBAR input arrays, try to run a PyMBAR state-free-energy/overlap analysis and write adaptive_union_mbar_analysis.* outputs.")
     p.add_argument("--adaptive-production-union-fes-bins", default="80,40", help="Diagnostic histogram bins for adaptive union analysis, formatted as primary_bins[,secondary_bins]. This is a coverage diagnostic, not the final publication PMF.")
     p.add_argument("--adaptive-production-write-action-reports", action=argparse.BooleanOptionalAction, default=True, help="Write per-epoch adaptive_epoch_actions.json/md reports explaining add/extend/retire decisions.")
-    p.add_argument("--plot-epochs", action=argparse.BooleanOptionalAction, default=False, help="After adaptive-production completes, generate epoch CV exploration plots in {out_dir}/epoch_plots/.")
     p.add_argument("--adaptive-production-final-connectivity-required", action=argparse.BooleanOptionalAction, default=True, help="Require the final active window geometry graph to be connected before launching the frozen final phase.")
     p.add_argument("--adaptive-production-final-min-samples-per-state", type=int, default=100, help="Quality-gate minimum final/extension sample rows required per active state before reporting the frozen final phase as analysis-ready.")
     p.add_argument("--adaptive-production-quality-min-primary-coverage-fraction", type=float, default=0.25, help="Quality-gate warning threshold for diagnostic primary-CV histogram coverage fraction after union analysis.")
@@ -374,6 +376,7 @@ def _add_gamd_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--traj-interval", type=int, default=5000)
     p.add_argument("--traj-format", choices=["dcd", "xtc", "none"], default="dcd", help="Production trajectory format for replica_trajectories. dcd preserves historical behavior; xtc writes compressed XTC trajectories when OpenMM provides XTCReporter; none disables coordinate trajectory reporters without affecting scalar reports/samples.")
     p.add_argument("--adaptive-pilot-trajectories", action=argparse.BooleanOptionalAction, default=False, help="Write coordinate trajectory reporters during adaptive-feedback pilot rounds. Default false because pilot coordinates are diagnostic/disposable and can dominate filesystem I/O.")
+    p.add_argument("--adaptive-production-trajectories", action=argparse.BooleanOptionalAction, default=True, help="Write coordinate trajectory reporters during adaptive-production epoch, baseline, topup, scheduled-final, and final-extension workers using --traj-interval/--traj-format. Disable with --no-adaptive-production-trajectories for low-I/O diagnostic runs.")
     p.add_argument("--randomize-replica-velocities", action="store_true")
     p.add_argument("--checkpoint-interval", type=int, default=50000, help="Production steps between overwriting restart checkpoints; 0 disables checkpoint writing.")
     p.add_argument("--resume", action="store_true", help="Resume from --out checkpoints: load production Context checkpoints directly when available, otherwise reuse saved NPT state XML to skip minimization/equilibration. Appends samples/exchanges/distances when possible.")
@@ -612,6 +615,8 @@ def parse_args(argv: Optional[Iterable[str]] = None):
 
     _resolve_cv_aliases(args, argv_list)
     _normalize_run_mode(args, argv_list)
+    if bool(getattr(args, "double_adaptive", False)):
+        args.window_mode = "double-adaptive"
     args.contact_scheme = contact_scheme(args)
     _validate_contact_args(args)
     _validate_total_window_bounds(args)
@@ -619,6 +624,248 @@ def parse_args(argv: Optional[Iterable[str]] = None):
     if args.hmr and float(args.hydrogen_mass_amu) <= 0:
         args.hydrogen_mass_amu = 3.024
     return args
+
+
+
+def _float_list_from_summary(value, *, label: str) -> list[float]:
+    """Return a numeric list from a driver-summary field."""
+    if value is None:
+        return []
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"double-adaptive feedback handoff field {label!r} is not a list")
+    out = []
+    for item in value:
+        try:
+            val = float(item)
+        except Exception as exc:
+            raise ValueError(f"double-adaptive feedback handoff field {label!r} contains non-numeric value {item!r}") from exc
+        if not math.isfinite(val):
+            raise ValueError(f"double-adaptive feedback handoff field {label!r} contains non-finite value {item!r}")
+        out.append(val)
+    return out
+
+
+def _write_double_adaptive_factorized_handoff_csv(args, out_dir: Path, feedback_summary: dict) -> Path | None:
+    """Write an explicit window CSV from factorized adaptive-feedback proposals.
+
+    Adaptive-production already knows how to seed its registry from explicit
+    per-window CSVs.  Adaptive-feedback's ordinary 1D/rectangular proposal is
+    axis-factorized, so this helper expands it into one row per thermodynamic
+    state for the double-adaptive handoff.
+    """
+    out_dir = Path(out_dir)
+    sparse_csv = str(
+        feedback_summary.get("handoff_windows_2d_csv")
+        or feedback_summary.get("latest_sparse_windows_2d_csv_for_next_pilot_or_final")
+        or ""
+    ).strip()
+    if sparse_csv:
+        path = Path(sparse_csv)
+        if path.exists():
+            return path
+        raise FileNotFoundError(f"double-adaptive handoff referenced sparse window CSV that does not exist: {path}")
+
+    centers = _float_list_from_summary(
+        feedback_summary.get("handoff_centers_A", feedback_summary.get("latest_proposed_centers_A")),
+        label="handoff/latest primary centers",
+    )
+    k_values = _float_list_from_summary(
+        feedback_summary.get("handoff_k_kcal_mol_A2", feedback_summary.get("latest_proposed_k_kcal_mol_A2")),
+        label="handoff/latest primary force constants",
+    )
+    if not centers:
+        return None
+    if not k_values:
+        _k_default = getattr(args, "default_window_k_kcal_a2", None)
+        k_values = [float(_k_default if _k_default is not None else 1.0)] * len(centers)
+    if len(k_values) == 1 and len(centers) > 1:
+        k_values = k_values * len(centers)
+    if len(k_values) != len(centers):
+        raise ValueError(
+            f"double-adaptive feedback handoff has {len(centers)} centers but {len(k_values)} force constants"
+        )
+
+    secondary_centers = _float_list_from_summary(
+        feedback_summary.get("handoff_secondary_cv_centers", feedback_summary.get("latest_proposed_secondary_cv_centers")),
+        label="handoff/latest secondary centers",
+    )
+    secondary_k = _float_list_from_summary(
+        feedback_summary.get("handoff_secondary_cv_k_kcal_mol", feedback_summary.get("latest_proposed_secondary_cv_k_kcal_mol")),
+        label="handoff/latest secondary force constants",
+    )
+    if secondary_centers and not secondary_k:
+        _sk_default = getattr(args, "secondary_cv_k_kcal", None)
+        secondary_k = [float(_sk_default if _sk_default is not None else 50.0)] * len(secondary_centers)
+    if secondary_k and len(secondary_k) == 1 and len(secondary_centers) > 1:
+        secondary_k = secondary_k * len(secondary_centers)
+    if secondary_centers and len(secondary_k) != len(secondary_centers):
+        raise ValueError(
+            f"double-adaptive feedback handoff has {len(secondary_centers)} secondary centers but {len(secondary_k)} secondary force constants"
+        )
+
+    csv_path = out_dir / "double_adaptive_handoff_windows.csv"
+    rows = []
+    window = 0
+    if secondary_centers:
+        for i, center in enumerate(centers):
+            for j, sec in enumerate(secondary_centers):
+                rows.append({
+                    "window": int(window),
+                    "primary_cv_mode": str(primary_cv_mode(args)),
+                    "primary_cv_center": float(center),
+                    "primary_cv_k_kcal": float(k_values[i]),
+                    "distance_center_A": float(center),
+                    "distance_k_kcal_mol_A2": float(k_values[i]),
+                    "secondary_cv_mode": str(secondary_cv_mode(args)),
+                    "secondary_cv_center": float(sec),
+                    "secondary_cv_k_kcal_mol": float(secondary_k[j]),
+                    "window_type": "double_adaptive_feedback_handoff",
+                    "source": "adaptive_feedback_factorized_proposal",
+                })
+                window += 1
+    else:
+        for i, center in enumerate(centers):
+            rows.append({
+                "window": int(window),
+                "primary_cv_mode": str(primary_cv_mode(args)),
+                "primary_cv_center": float(center),
+                "primary_cv_k_kcal": float(k_values[i]),
+                "distance_center_A": float(center),
+                "distance_k_kcal_mol_A2": float(k_values[i]),
+                "secondary_cv_mode": "",
+                "secondary_cv_center": "",
+                "secondary_cv_k_kcal_mol": "",
+                "window_type": "double_adaptive_feedback_handoff",
+                "source": "adaptive_feedback_factorized_proposal",
+            })
+            window += 1
+
+    with csv_path.open("w", newline="") as handle:
+        fieldnames = list(rows[0].keys()) if rows else ["window", "primary_cv_center", "primary_cv_k_kcal"]
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    return csv_path
+
+
+def run_double_adaptive_auto_loop(args, out_dir: Path, openmm, app, unit, forcefield, topology, equil_state, progress: Optional[GuiProgressSink] = None) -> dict:
+    """Run adaptive-feedback pilots, then adaptive-production from the feedback proposal."""
+    out_dir = Path(out_dir)
+    summary_path = out_dir / "double_adaptive_driver_summary.json"
+    adaptive_registry = out_dir / "adaptive_production" / "state_registry.json"
+
+    feedback_driver_summary_path = out_dir / "adaptive_feedback_driver_summary.json"
+    feedback_completed = False
+    if feedback_driver_summary_path.exists():
+        try:
+            _fds = json.loads(feedback_driver_summary_path.read_text())
+            feedback_completed = bool(_fds.get("final_production_skipped") or _fds.get("handoff_to_adaptive_production"))
+        except Exception:
+            pass
+
+    if bool(getattr(args, "adaptive_production_resume", False)) and adaptive_registry.exists():
+        prod_args = copy.deepcopy(args)
+        prod_args.window_mode = "adaptive-production"
+        prod_args.resume = False
+        prod_args.adaptive_production_resume = True
+        prod_summary = run_adaptive_production_auto_loop(
+            prod_args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress
+        )
+        payload = {
+            "schema_version": "double_adaptive_driver_summary_v1",
+            "status": "completed",
+            "mode": "double-adaptive",
+            "resume_mode": "adaptive_production_registry",
+            "adaptive_production": prod_summary,
+        }
+        write_json(summary_path, payload)
+        return payload
+
+    if bool(getattr(args, "adaptive_production_resume", False)) and feedback_completed and not adaptive_registry.exists():
+        # Interrupted after feedback pilots completed but before adaptive-production wrote
+        # state_registry.json.  Skip the feedback stage and go straight to production.
+        print("[resume] Feedback pilots already completed; skipping to adaptive-production stage.")
+        try:
+            feedback_summary = json.loads(feedback_driver_summary_path.read_text())
+        except Exception:
+            feedback_summary = {}
+        handoff_csv = _write_double_adaptive_factorized_handoff_csv(args, out_dir, feedback_summary)
+        prod_args = copy.deepcopy(args)
+        prod_args.window_mode = "adaptive-production"
+        prod_args.resume = False
+        prod_args.adaptive_production_resume = False
+        prod_args.adaptive_feedback_enabled = False
+        prod_args.adaptive_feedback_pilot = False
+        prod_args.adaptive_feedback_final_production = False
+        if handoff_csv is not None:
+            prod_args.windows_2d_csv = str(handoff_csv)
+            print(f"    double-adaptive handoff window table: {handoff_csv}")
+        prod_summary = run_adaptive_production_auto_loop(
+            prod_args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress
+        )
+        payload = {
+            "schema_version": "double_adaptive_driver_summary_v1",
+            "status": "completed",
+            "mode": "double-adaptive",
+            "resume_mode": "feedback_completed_production_fresh",
+            "adaptive_feedback": feedback_summary,
+            "handoff_windows_csv": str(handoff_csv) if handoff_csv is not None else "",
+            "adaptive_production": prod_summary,
+        }
+        write_json(summary_path, payload)
+        return payload
+
+    print("Double-adaptive workflow")
+    print("    stage 1: adaptive-feedback pilots only")
+    print("    stage 2: adaptive-production initialized from feedback proposal")
+
+    feedback_args = copy.deepcopy(args)
+    feedback_args.window_mode = "adaptive-feedback"
+    feedback_args.resume = False
+    feedback_args.double_adaptive_handoff = True
+    feedback_args.adaptive_feedback_skip_final_production = True
+    feedback_summary = run_adaptive_feedback_auto_loop(
+        feedback_args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress
+    )
+    if _graceful_shutdown.is_set():
+        payload = {
+            "schema_version": "double_adaptive_driver_summary_v1",
+            "status": "interrupted_after_feedback",
+            "mode": "double-adaptive",
+            "adaptive_feedback": feedback_summary,
+        }
+        write_json(summary_path, payload)
+        return payload
+
+    handoff_csv = _write_double_adaptive_factorized_handoff_csv(args, out_dir, feedback_summary or {})
+    prod_args = copy.deepcopy(args)
+    prod_args.window_mode = "adaptive-production"
+    prod_args.resume = False
+    prod_args.adaptive_production_resume = False
+    prod_args.adaptive_feedback_enabled = False
+    prod_args.adaptive_feedback_pilot = False
+    prod_args.adaptive_feedback_final_production = False
+    if handoff_csv is not None:
+        prod_args.windows_2d_csv = str(handoff_csv)
+        print(f"    double-adaptive handoff window table: {handoff_csv}")
+    else:
+        print("    double-adaptive handoff: no feedback proposal CSV produced; adaptive-production will use its ordinary initial adaptive windows")
+
+    prod_summary = run_adaptive_production_auto_loop(
+        prod_args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress
+    )
+    payload = {
+        "schema_version": "double_adaptive_driver_summary_v1",
+        "status": "completed",
+        "mode": "double-adaptive",
+        "adaptive_feedback": feedback_summary,
+        "handoff_windows_csv": str(handoff_csv) if handoff_csv is not None else "",
+        "adaptive_production": prod_summary,
+        "final_dir": str((out_dir / "adaptive_production" / "final")),
+        "note": "Adaptive-feedback final_production is intentionally skipped. The feedback proposal seeds adaptive-production, whose frozen final phase remains the clean final sampling stage.",
+    }
+    write_json(summary_path, payload)
+    return payload
 
 
 def main(argv: Optional[Iterable[str]] = None):
@@ -660,11 +907,12 @@ def main(argv: Optional[Iterable[str]] = None):
     try:
         progress.emit({"event": "run_start", "sequence": args.seq, "out": str(out_dir), "resume": bool(getattr(args, "resume", False))})
 
-        if bool(getattr(args, "resume", False)) and str(getattr(args, "window_mode", "adaptive")) == "adaptive-production":
+        if bool(getattr(args, "resume", False)) and str(getattr(args, "window_mode", "adaptive")) in {"adaptive-production", "double-adaptive"}:
             # For epochal adaptive production, plain --resume means resume the
             # adaptive-production driver/registry. It does not mean resume one
             # transient epoch worker from its OpenMM checkpoints.
             setattr(args, "adaptive_production_resume", True)
+            _resume_window_mode = str(getattr(args, "window_mode", "adaptive"))
             setattr(args, "resume", False)
             loaded_resume_setup = None
             for _pdb_dir in list(dict.fromkeys([out_dir, out_dir.parent, out_dir.parent.parent])):
@@ -683,7 +931,10 @@ def main(argv: Optional[Iterable[str]] = None):
             print("[resume] Adaptive-production driver resume requested; continuing from registry/driver summary when available.")
             print("[resume] Epoch worker checkpoints are not auto-resumed; completed epochs/segments are tracked at driver level.")
             progress.emit({"event": "adaptive_production_resume_setup_loaded", "out": str(out_dir)})
-            run_adaptive_production_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
+            if _resume_window_mode == "double-adaptive":
+                run_double_adaptive_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
+            else:
+                run_adaptive_production_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
 
         elif bool(getattr(args, "resume", False)):
             # --resume: skip all setup/pilots and go straight to production.
@@ -774,14 +1025,8 @@ def main(argv: Optional[Iterable[str]] = None):
                 run_adaptive_feedback_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
             elif str(getattr(args, "window_mode", "adaptive")) == "adaptive-production":
                 run_adaptive_production_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
-                if getattr(args, "plot_epochs", False):
-                    from gareus.epoch_plots import plot_epoch_cv_exploration
-                    import logging
-                    _log = logging.getLogger(__name__)
-                    _log.info("Generating epoch CV exploration plots...")
-                    plots = plot_epoch_cv_exploration(out_dir)
-                    for p in plots:
-                        _log.info("  %s", p)
+            elif str(getattr(args, "window_mode", "adaptive")) == "double-adaptive":
+                run_double_adaptive_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
             else:
                 run_gareus(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
 

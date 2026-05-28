@@ -47,7 +47,6 @@ gareus = "gareus.core:main"
 gareus-energy-decompose = "gareus.energy_decomposition:main"
 gareus-test-run = "gareus.integration_test:main"
 gareus-suggest-cvs = "gareus.cv_discovery:main"
-gareus-epoch-plots = "gareus.epoch_plots:cli_main"
 
 [tool.setuptools]
 py-modules = ["gareus_peptide", "GENPEPT"]

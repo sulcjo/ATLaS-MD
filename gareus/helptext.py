@@ -71,6 +71,13 @@ Useful starting points
            --contact-adaptive-max-total-windows 16 \
            --out run_adaptive_pool
 
+    # double-adaptive: feedback pilots seed adaptive-production epochs/topups
+    gareus --seq CLN025 --run-mode hmr-gamd --cv1 contacts --cv2 rama-map \
+           --double-adaptive \
+           --adaptive-feedback-rounds 3 \
+           --adaptive-production-epochs 10 \
+           --out run_double_adaptive
+
     # nonlocal-contact primary CV, with automatic contact-window calibration
     gareus --seq CLN025 --cv1 contacts --window-mode adaptive-feedback --out run_contacts
 
@@ -91,7 +98,8 @@ Common flags
     --seed INT                          Random seed.
 
     --run-mode MODE                    cmd, hmr-cmd, gamd, or hmr-gamd. cmd/hmr-cmd need no gamd-openmm.
-    --window-mode MODE                  manual, adaptive, adaptive-feedback, or adaptive-production.
+    --window-mode MODE                  manual, adaptive, adaptive-feedback, adaptive-production, or double-adaptive.
+    --double-adaptive                   Alias for --window-mode double-adaptive.
     --cv1 MODE                          Friendly primary CV: distance or contacts.
     --cv2 MODE                          Friendly secondary CV; non-none auto-enables 2D centers.
     --primary-cv MODE                   Expert primary CV: distance or nonlocal-contacts.
@@ -996,7 +1004,25 @@ Important controls:
 Final production should be analyzed from `final_production/` when adaptive
 feedback is used.  Pilot folders are diagnostics, not final PMF inputs.
 
-12. Adaptive production and global runtime pool
+12. Double-adaptive mode
+------------------------
+`--double-adaptive` is an alias for `--window-mode double-adaptive`.  It runs
+adaptive-feedback pilot rounds first, intentionally skips adaptive-feedback's
+`final_production/`, writes/uses a handoff window table, and then starts
+`--window-mode adaptive-production` from that feedback-optimized proposal.
+
+Output landmarks:
+
+    adaptive_feedback_driver_summary.json
+    double_adaptive_handoff_windows.csv       # for factorized feedback proposals
+    double_adaptive_driver_summary.json
+    adaptive_production/
+    adaptive_production/final/                # clean frozen final phase
+
+Use `adaptive_production/final/` for the conservative final PMF/MBAR stage.
+There is no duplicate adaptive-feedback final run in this mode.
+
+13. Adaptive production and global runtime pool
 -----------------------------------------------
 `--window-mode adaptive-production` turns production into an epoch-based
 adaptive campaign.  Each adaptive epoch runs fixed-bias production, analyzes the

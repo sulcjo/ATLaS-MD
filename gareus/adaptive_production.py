@@ -2814,7 +2814,11 @@ def run_scheduled_adaptive_epoch(
                     seg_args.seed_conformers_dir = Path(current_seed_bank)
             else:
                 seg_args.seed_conformers_dir = Path(current_seed_bank)
-        if _arg_bool(args, "adaptive_pilot_trajectories", False) is False:
+        # Adaptive-production segments are real sampling, not disposable
+        # adaptive-feedback pilots, so preserve coordinate trajectories by
+        # default using the normal --traj-interval/--traj-format settings.
+        # Users can still disable this explicitly for low-I/O diagnostics.
+        if _arg_bool(args, "adaptive_production_trajectories", True) is False:
             seg_args.traj_interval = 0
             seg_args.traj_format = "none"
         requested_steps = int(steps)
@@ -3159,7 +3163,11 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                 epoch_args.windows_2d_csv = str(current_windows_csv)
             if bool(policy.propagate_seed_bank) and current_seed_bank is not None and Path(current_seed_bank).exists():
                 epoch_args.seed_conformers_dir = Path(current_seed_bank)
-            if _arg_bool(args, "adaptive_pilot_trajectories", False) is False:
+            # Adaptive-production epochs are real sampling, so inherit
+            # --traj-interval/--traj-format by default.  The separate
+            # adaptive_pilot_trajectories switch remains limited to feedback
+            # pilots.
+            if _arg_bool(args, "adaptive_production_trajectories", True) is False:
                 epoch_args.traj_interval = 0
                 epoch_args.traj_format = "none"
 
@@ -3370,6 +3378,9 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
         final_args.adaptive_feedback_pilot = False
         final_args.adaptive_feedback_final_production = False
         final_args.resume = False
+        if _arg_bool(args, "adaptive_production_trajectories", True) is False:
+            final_args.traj_interval = 0
+            final_args.traj_format = "none"
         if bool(policy.propagate_seed_bank) and current_seed_bank is not None and Path(current_seed_bank).exists():
             if bool(policy.state_aware_seed_filtering):
                 filtered_final_seed_dir = final_dir / "filtered_seed_bank"
@@ -3441,6 +3452,9 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
         ext_args.adaptive_feedback_pilot = False
         ext_args.adaptive_feedback_final_production = False
         ext_args.resume = False
+        if _arg_bool(args, "adaptive_production_trajectories", True) is False:
+            ext_args.traj_interval = 0
+            ext_args.traj_format = "none"
         if bool(policy.propagate_seed_bank) and current_seed_bank is not None and Path(current_seed_bank).exists():
             if bool(policy.state_aware_seed_filtering):
                 filtered_ext_seed_dir = ext_dir / "filtered_seed_bank"

@@ -2794,7 +2794,7 @@ def _adaptive_feedback_sparse_candidate_csv_from_proposal(args, proposal: Option
     return None
 
 def run_adaptive_feedback_auto_loop(args, out_dir: Path, openmm, app, unit, forcefield, topology, equil_state, progress: Optional[GuiProgressSink] = None):
-    """Run short adaptive-feedback pilot round(s), then a clean final production run.
+    """Run short adaptive-feedback pilot round(s), optionally followed by clean final production.
 
     The pilot rounds use --adaptive-feedback-pilot-fraction of the final
     production length, default 1/20.  The driver keeps a memory of previous
@@ -2803,7 +2803,10 @@ def run_adaptive_feedback_auto_loop(args, out_dir: Path, openmm, app, unit, forc
     final run is still a clean fixed-window GaREUS run for MBAR/reweighting.
     In 2D secondary-CV runs, local sparse patch candidates from each pilot can
     be consumed by the next pilot and by final production via the existing
-    adaptive-feedback mode; no separate refinement flag is required.
+    adaptive-feedback mode; no separate refinement flag is required.  When
+    ``args.adaptive_feedback_skip_final_production`` is true, the driver stops
+    after the pilots and returns a handoff-ready proposal for double-adaptive
+    workflows instead of launching ``final_production/``.
     """
     out_dir = Path(out_dir)
     n_rounds = max(0, int(getattr(args, "adaptive_feedback_rounds", 1) or 0))
@@ -2813,6 +2816,10 @@ def run_adaptive_feedback_auto_loop(args, out_dir: Path, openmm, app, unit, forc
         args.secondary_cv_centers = adaptive_secondary_default_centers(args)
         print("    adaptive secondary-CV feedback: starting centers " + ", ".join(f"{x:.3g}" for x in args.secondary_cv_centers))
     target_prod_steps = max(1, int(getattr(args, "gamd_production_steps", 1) or 1))
+    skip_final_production = bool(
+        getattr(args, "adaptive_feedback_skip_final_production", False)
+        or getattr(args, "double_adaptive_handoff", False)
+    )
     pilot_fraction = float(getattr(args, "adaptive_feedback_pilot_fraction", 0.05) or 0.05)
     if not math.isfinite(pilot_fraction) or pilot_fraction <= 0.0:
         pilot_fraction = 0.05
@@ -2853,7 +2860,10 @@ def run_adaptive_feedback_auto_loop(args, out_dir: Path, openmm, app, unit, forc
     print(f"    effective neighbor overlap: {effective_target_overlap:.3f} ({aggr.get('mode', 'balanced')} aggressiveness)")
     print("    target exchange acceptance for reduction: 0.300")
     print("    feedback memory: enabled; repeated over/under-resolved regions guide add/remove decisions")
-    print(f"    final production will be written under: {out_dir / 'final_production'}")
+    if skip_final_production:
+        print("    final production: skipped; proposal will be handed to adaptive-production")
+    else:
+        print(f"    final production will be written under: {out_dir / 'final_production'}")
 
     driver_summary = {
         "mode": "adaptive-feedback-auto-loop",
@@ -2868,12 +2878,14 @@ def run_adaptive_feedback_auto_loop(args, out_dir: Path, openmm, app, unit, forc
         "final_production_steps": int(target_prod_steps),
         "rounds": [],
         "final_production_dir": str(out_dir / "final_production"),
-        "note": "Pilot outputs are diagnostic. Use final_production for final PMF/MBAR unless intentionally analyzing pilot stages separately.",
+        "final_production_skipped": bool(skip_final_production),
+        "handoff_to_adaptive_production": bool(skip_final_production),
+        "note": "Pilot outputs are diagnostic. Use final_production for final PMF/MBAR unless intentionally analyzing pilot stages separately. In double-adaptive mode, final_production is intentionally skipped and the latest proposal is handed to adaptive-production.",
     }
     write_json(out_dir / "adaptive_feedback_driver_summary.json", driver_summary)
 
     adaptive_workflow_start_wall = time.time()
-    adaptive_workflow_total_steps = int(max(0, n_rounds - 1) * pilot_steps + (validation_pilot_steps if n_rounds > 0 else 0) + target_prod_steps)
+    adaptive_workflow_total_steps = int(max(0, n_rounds - 1) * pilot_steps + (validation_pilot_steps if n_rounds > 0 else 0) + (0 if skip_final_production else target_prod_steps))
     adaptive_workflow_done_so_far = 0
     current_centers = None
     current_k = None
@@ -3056,6 +3068,42 @@ def run_adaptive_feedback_auto_loop(args, out_dir: Path, openmm, app, unit, forc
             write_json(out_dir / "adaptive_feedback_driver_summary.json", _json_ready(driver_summary))
             print(f"    Adaptive-feedback converged after round {round_no}; skipping remaining pilot rounds.")
             break
+
+    if skip_final_production:
+        driver_summary["final_production_completed"] = False
+        driver_summary["final_production_skipped"] = True
+        driver_summary["handoff_to_adaptive_production"] = True
+        driver_summary["handoff_ready"] = bool(current_windows_2d_csv is not None or current_centers is not None)
+        if current_windows_2d_csv is not None:
+            driver_summary["handoff_window_mode"] = "explicit_sparse_2d_from_adaptive_feedback"
+            driver_summary["handoff_windows_2d_csv"] = str(current_windows_2d_csv)
+            driver_summary["handoff_sparse_patch_source_round"] = current_windows_2d_source_round
+        elif current_centers is not None:
+            driver_summary["handoff_window_mode"] = "rectangular_axis_factorized"
+            driver_summary["handoff_centers_A"] = current_centers
+            driver_summary["handoff_k_kcal_mol_A2"] = current_k
+            driver_summary["handoff_secondary_cv_centers"] = current_secondary_centers
+            driver_summary["handoff_secondary_cv_k_kcal_mol"] = current_secondary_k
+        else:
+            driver_summary["handoff_window_mode"] = "initial_adaptive_windows"
+            driver_summary["handoff_warning"] = "No adaptive-feedback proposal was generated, usually because adaptive-feedback-rounds=0; adaptive-production should initialize from its ordinary adaptive windows."
+        driver_summary["adaptive_memory_json"] = str(out_dir / "adaptive_feedback_memory.json")
+        driver_summary["adaptive_memory"] = adaptive_memory
+        write_json(out_dir / "adaptive_feedback_driver_summary.json", _json_ready(driver_summary))
+        try:
+            summary_payload = write_adaptive_feedback_summary_report(out_dir)
+            driver_summary["adaptive_feedback_summary_md"] = str(out_dir / "adaptive_feedback_summary.md")
+            driver_summary["adaptive_feedback_summary_json"] = str(out_dir / "adaptive_feedback_summary.json")
+            driver_summary["adaptive_feedback_summary_status"] = str(summary_payload.get("final_report_status", "unknown"))
+            write_json(out_dir / "adaptive_feedback_driver_summary.json", _json_ready(driver_summary))
+        except Exception as exc:
+            print(f"WARNING: adaptive-feedback summary report failed: {exc}")
+        try:
+            write_standardized_output_layout(out_dir)
+        except Exception as exc:
+            print(f"WARNING: adaptive-feedback output layout failed: {exc}")
+        print("Adaptive-feedback pilot workflow complete; final production skipped for adaptive-production handoff.")
+        return driver_summary
 
     final_dir = out_dir / "final_production"
     final_dir.mkdir(parents=True, exist_ok=True)

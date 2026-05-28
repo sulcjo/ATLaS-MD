@@ -53,7 +53,7 @@ def test_python_m_gareus_heavy_help() -> None:
     assert "OpenMM explicit-solvent Amber14 PME peptide CMD/GaMD/REUS" in result.stdout
     assert "0.14 Adaptive-production mode" in result.stdout
     assert "0.16 Potential-energy handling and later decomposition" in result.stdout
-    assert "12. Adaptive production and global runtime pool" in result.stdout
+    assert "13. Adaptive production and global runtime pool" in result.stdout
     assert "E_ij = k_e q_i q_j / r_ij" in result.stdout
     assert "gareus-energy-decompose -hh" in result.stdout
     assert "Provenance and reproducibility manifest" in result.stdout
