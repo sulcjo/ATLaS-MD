@@ -259,6 +259,7 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--adaptive-production-run-union-mbar-analysis", action=argparse.BooleanOptionalAction, default=True, help="After writing union-state MBAR input arrays, try to run a PyMBAR state-free-energy/overlap analysis and write adaptive_union_mbar_analysis.* outputs.")
     p.add_argument("--adaptive-production-union-fes-bins", default="80,40", help="Diagnostic histogram bins for adaptive union analysis, formatted as primary_bins[,secondary_bins]. This is a coverage diagnostic, not the final publication PMF.")
     p.add_argument("--adaptive-production-write-action-reports", action=argparse.BooleanOptionalAction, default=True, help="Write per-epoch adaptive_epoch_actions.json/md reports explaining add/extend/retire decisions.")
+    p.add_argument("--plot-epochs", action=argparse.BooleanOptionalAction, default=False, help="After adaptive-production completes, generate epoch CV exploration plots in {out_dir}/epoch_plots/.")
     p.add_argument("--adaptive-production-final-connectivity-required", action=argparse.BooleanOptionalAction, default=True, help="Require the final active window geometry graph to be connected before launching the frozen final phase.")
     p.add_argument("--adaptive-production-final-min-samples-per-state", type=int, default=100, help="Quality-gate minimum final/extension sample rows required per active state before reporting the frozen final phase as analysis-ready.")
     p.add_argument("--adaptive-production-quality-min-primary-coverage-fraction", type=float, default=0.25, help="Quality-gate warning threshold for diagnostic primary-CV histogram coverage fraction after union analysis.")
@@ -773,6 +774,14 @@ def main(argv: Optional[Iterable[str]] = None):
                 run_adaptive_feedback_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
             elif str(getattr(args, "window_mode", "adaptive")) == "adaptive-production":
                 run_adaptive_production_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
+                if getattr(args, "plot_epochs", False):
+                    from gareus.epoch_plots import plot_epoch_cv_exploration
+                    import logging
+                    _log = logging.getLogger(__name__)
+                    _log.info("Generating epoch CV exploration plots...")
+                    plots = plot_epoch_cv_exploration(out_dir)
+                    for p in plots:
+                        _log.info("  %s", p)
             else:
                 run_gareus(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
 
