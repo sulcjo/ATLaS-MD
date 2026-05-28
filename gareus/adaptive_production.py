@@ -685,7 +685,7 @@ def write_epoch_seed_bank(
         for row in rows[:80]:
             lines.append(f"| {row['source_state_id']} | {row['seed_name']} | `{row['survivor_pdb_path']}` |")
         lines.append("")
-    (seed_bank_dir / "seed_bank_report.md").write_text("\n".join(lines) + "\n")
+    (seed_bank_dir / "seed_bank_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return payload
 
 
@@ -770,7 +770,7 @@ def write_seed_bank_from_run_dirs(
         lines.append("|---:|---|---|")
         for row in rows[:100]:
             lines.append(f"| {row['source_state_id']} | {row['seed_name']} | `{row['source_run_dir']}` |")
-    (seed_bank_dir / "seed_bank_report.md").write_text("\n".join(lines) + "\n")
+    (seed_bank_dir / "seed_bank_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return payload
 
 
@@ -956,7 +956,7 @@ def filter_seed_bank_for_state_ids(
         lines.append("|---:|---:|---|")
         for row in chosen[:100]:
             lines.append(f"| {row.get('target_state_id','')} | {row.get('source_state_id','')} | `{row.get('survivor_pdb_path','')}` |")
-    (output_dir / "filtered_seed_bank_report.md").write_text("\n".join(lines) + "\n")
+    (output_dir / "filtered_seed_bank_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return payload
 
 
@@ -1629,7 +1629,7 @@ def _write_union_mbar_analysis_markdown(path: Path, payload: Dict[str, Any]) -> 
     lines.append("")
     if payload.get("min_offdiag_overlap") is not None:
         lines.append(f"Minimum off-diagonal MBAR overlap: **{payload.get('min_offdiag_overlap')}**")
-    Path(path).write_text("\n".join(lines) + "\n")
+    Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 
@@ -1922,7 +1922,7 @@ def _write_quality_gate_markdown(path: Path, payload: Dict[str, Any]) -> None:
         for row in low[:100]:
             lines.append(f"| {row.get('state_id')} | {row.get('sample_count')} | {row.get('minimum')} |")
         lines.append("")
-    Path(path).write_text("\n".join(lines) + "\n")
+    Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 # ---------------------------------------------------------------------------
 # Decisions
@@ -2273,7 +2273,7 @@ def write_epoch_schedule_files(epoch_dir: Path, schedule: Sequence[Dict[str, Any
             f"| {row.get('state_id')} | {row.get('requested_steps')} | {row.get('baseline_steps')} | "
             f"{row.get('extra_steps')} | {float(row.get('score', 0.0)):.3f} | {row.get('allocation_reason', '')} |"
         )
-    md_path.write_text("\n".join(lines) + "\n")
+    md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return {"csv": str(csv_path), "json": str(json_path), "md": str(md_path)}
 
 
@@ -2417,7 +2417,7 @@ def _write_runtime_pool_reports(adaptive_dir: Path, pool: AdaptiveRuntimePool) -
         lines.extend(["", "## Warnings", ""])
         for w in payload.get("warnings") or []:
             lines.append(f"- {w}")
-    md_path.write_text("\n".join(lines) + "\n")
+    md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return {"json": str(json_path), "md": str(md_path)}
 
 
@@ -2526,7 +2526,7 @@ def _adaptive_runtime_pool_validate(adaptive_dir: Path, pool: "AdaptiveRuntimePo
     lines += ["## Event ledger", "", "| i | label | kind | states | steps | ns | path exists |", "|---:|---|---|---:|---:|---:|---|"]
     for row in event_rows:
         lines.append(f"| {row['index']} | {row['label']} | {row['kind']} | {row['n_states']} | {row['steps_per_state']} | {row['consumed_ns']:.6g} | {row['path_exists']} |")
-    (adaptive_dir / f"{label}_validation.md").write_text("\n".join(lines) + "\n")
+    (adaptive_dir / f"{label}_validation.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return payload
 
 
@@ -2618,7 +2618,7 @@ def evaluate_context_reuse_readiness(args: Any, adaptive_dir: Path, registry: Op
         lines += ["## Blockers", ""] + [f"- {b}" for b in blockers] + [""]
     lines += ["## Safe fallback", "", str(payload["safe_fallback"]), "", "## Next refactor", ""]
     lines += [f"- {x}" for x in payload["next_required_refactor"]]
-    (adaptive_dir / "adaptive_context_reuse_readiness.md").write_text("\n".join(lines) + "\n")
+    (adaptive_dir / "adaptive_context_reuse_readiness.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     if requested and require:
         raise RuntimeError("adaptive-production context reuse was required, but the current package only supports safe epoch-worker fallback; see adaptive_context_reuse_readiness.json")
     return payload
@@ -3046,6 +3046,27 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
     epoch_steps = max(1, _arg_int(args, "adaptive_production_epoch_steps", max(1, int(getattr(args, "gamd_production_steps", 100000) or 100000) // 20)))
     final_steps = max(1, _arg_int(args, "adaptive_production_final_steps", int(getattr(args, "gamd_production_steps", epoch_steps) or epoch_steps)))
     use_epoch_samples_for_mbar = _arg_bool(args, "adaptive_production_use_epoch_samples_for_mbar", False)
+    global_shared_gamd_dir: Optional[Path] = None
+    if _arg_bool(args, "adaptive_production_global_shared_gamd", True):
+        requested_shared_dir = str(getattr(args, "shared_gamd_setup_dir", "") or "").strip()
+        global_shared_gamd_dir = Path(requested_shared_dir) if requested_shared_dir else adaptive_dir / "global_shared_gamd_setup"
+        global_shared_gamd_dir.mkdir(parents=True, exist_ok=True)
+        # These private attrs are propagated by copy.copy(args) into every
+        # epoch/baseline/topup/final worker.  The first worker exports the setup;
+        # later workers reuse it.  This keeps GaMD thresholds/statistics global
+        # over the whole adaptive-production campaign.
+        setattr(args, "_global_shared_gamd_setup_dir", str(global_shared_gamd_dir))
+        setattr(args, "_global_shared_gamd_export_dir", str(global_shared_gamd_dir))
+        if not str(getattr(args, "shared_gamd_setup_dir", "") or "").strip():
+            setattr(args, "shared_gamd_setup_dir", str(global_shared_gamd_dir))
+        if not str(getattr(args, "shared_gamd_export_dir", "") or "").strip():
+            setattr(args, "shared_gamd_export_dir", str(global_shared_gamd_dir))
+        write_json(adaptive_dir / "global_shared_gamd_setup_policy.json", {
+            "schema_version": "adaptive_production_global_shared_gamd_policy_v1",
+            "enabled": True,
+            "global_shared_gamd_dir": str(global_shared_gamd_dir),
+            "behavior": "First adaptive-production worker calibrates shared GaMD and exports it here; all later epoch, scheduled topup, final, and final-extension workers reuse the same setup.",
+        })
     current_seed_bank: Optional[Path] = None
     if bool(policy.propagate_seed_bank) and getattr(args, "seed_conformers_dir", None) is not None:
         current_seed_bank = Path(getattr(args, "seed_conformers_dir"))
@@ -3170,7 +3191,14 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
         actions = propose_actions_from_diagnostics(registry, diagnostics, policy=policy)
         action_report = None
         if _arg_bool(args, "adaptive_production_write_action_reports", True):
-            action_report = write_epoch_action_report(epoch_dir, epoch, registry, diagnostics, actions, policy)
+            try:
+                action_report = write_epoch_action_report(epoch_dir, epoch, registry, diagnostics, actions, policy)
+            except Exception as exc:
+                # Diagnostics reports are useful, but they must never invalidate
+                # a completed MD epoch. Keep going and record the failure in the
+                # driver summary.
+                action_report = {"status": "write_failed", "error": str(exc)}
+                print(f"WARNING: failed to write adaptive epoch action report for epoch {epoch}: {exc}")
         convergence_gate = evaluate_adaptive_convergence_gate(
             epoch_dir,
             epoch,
@@ -3239,6 +3267,8 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             "status": "running",
             "epochs_completed": int(epoch + 1),
             "epoch_summaries": epoch_summaries,
+            "global_shared_gamd_setup_dir": str(global_shared_gamd_dir) if global_shared_gamd_dir is not None else "",
+            "global_shared_gamd_enabled": bool(global_shared_gamd_dir is not None),
         })
 
         if bool(convergence_gate.get("stop_adaptive", False)):
@@ -3521,7 +3551,9 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
         "union_mbar_inputs": union_inputs or {},
         "union_mbar_analysis": union_analysis or {},
         "use_epoch_samples_for_mbar": bool(use_epoch_samples_for_mbar),
-        "note": "Final phase freezes the active window set. Epoch samples are retained and tagged, but final-only MBAR remains the conservative default.",
+        "global_shared_gamd_setup_dir": str(global_shared_gamd_dir) if global_shared_gamd_dir is not None else "",
+        "global_shared_gamd_enabled": bool(global_shared_gamd_dir is not None),
+        "note": "Final phase freezes the active window set. Epoch samples are retained and tagged, but final-only MBAR remains the conservative default. When global_shared_gamd_enabled is true, all adaptive-production workers reuse one campaign-wide shared GaMD setup.",
     }
     write_json(adaptive_dir / "adaptive_production_driver_summary.json", payload)
     _write_adaptive_production_markdown(adaptive_dir / "adaptive_production_summary.md", payload)
@@ -3624,7 +3656,7 @@ def _write_epoch_action_markdown(path: Path, report: Dict[str, Any]) -> None:
                 f"{edge.get('exchange_acceptance')} | {', '.join(edge.get('warnings', []) or [])} |"
             )
     lines.append("")
-    Path(path).write_text("\n".join(lines) + "\n")
+    Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _action_to_dict(action: Tuple) -> Dict[str, Any]:
@@ -3753,7 +3785,7 @@ def _write_adaptive_production_markdown(path: Path, payload: Dict[str, Any]) -> 
             if gate.get("md"):
                 lines.append(f"Gate report: `{gate.get('md')}`")
         lines.append("")
-    Path(path).write_text("\n".join(lines) + "\n")
+    Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def evaluate_adaptive_convergence_gate(
@@ -3924,4 +3956,4 @@ def _write_adaptive_convergence_gate_markdown(path: Path, payload: Dict[str, Any
         for row in low[:100]:
             lines.append(f"| {row.get('state_id')} | {row.get('sample_count')} | {row.get('minimum')} |")
         lines.append("")
-    Path(path).write_text("\n".join(lines) + "\n")
+    Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")

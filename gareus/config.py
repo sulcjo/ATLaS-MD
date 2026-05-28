@@ -177,13 +177,13 @@ def _write_yaml_or_json(path: Path, payload: Any) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.suffix.lower() == ".json":
-        path.write_text(json.dumps(_json_ready(payload), indent=2, sort_keys=True) + "\n")
+        path.write_text(json.dumps(_json_ready(payload), indent=2, sort_keys=True) + "\n", encoding="utf-8")
         return
     yaml_mod = _yaml_module()
     if yaml_mod is not None:
-        path.write_text(yaml_mod.safe_dump(_json_ready(payload), sort_keys=False, default_flow_style=False))
+        path.write_text(yaml_mod.safe_dump(_json_ready(payload), sort_keys=False, default_flow_style=False), encoding="utf-8")
     else:
-        path.write_text(_minimal_yaml_dump(_json_ready(payload)) + "\n")
+        path.write_text(_minimal_yaml_dump(_json_ready(payload)) + "\n", encoding="utf-8")
 
 
 def _load_config_file(path: Path) -> dict:
@@ -191,7 +191,7 @@ def _load_config_file(path: Path) -> dict:
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
-    text = path.read_text()
+    text = path.read_text(encoding="utf-8")
     if path.suffix.lower() == ".json":
         data = json.loads(text)
     else:
@@ -338,12 +338,12 @@ def _write_reproducibility_files(args: Any, out_dir: Path, argv: Optional[Iterab
     _write_yaml_or_json(out_dir / "effective_config.yaml", payload)
     _write_yaml_or_json(out_dir / "effective_config.json", payload)
     command_text = payload["script"].get("command_line", "")
-    (cfg_dir / "command_line.txt").write_text(command_text + "\n")
-    (out_dir / "command_line.txt").write_text(command_text + "\n")
+    (cfg_dir / "command_line.txt").write_text(command_text + "\n", encoding="utf-8")
+    (out_dir / "command_line.txt").write_text(command_text + "\n", encoding="utf-8")
     script_name = str(Path(__file__).resolve())
     resume_cmd = f"{shlex.quote(sys.executable)} {shlex.quote(script_name)} --config {shlex.quote(str((cfg_dir / 'effective_config.yaml').resolve()))} --resume\n"
     for path in (cfg_dir / "resume_command.sh", out_dir / "resume_command.sh"):
-        path.write_text("#!/usr/bin/env bash\nset -euo pipefail\n" + resume_cmd)
+        path.write_text("#!/usr/bin/env bash\nset -euo pipefail\n" + resume_cmd, encoding="utf-8")
         try:
             path.chmod(path.stat().st_mode | 0o111)
         except Exception:

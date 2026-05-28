@@ -50,7 +50,7 @@ def load_existing_openmm_setup_for_resume(args, out_dir: Path, require_equil_sta
     state_path = equilibration_state_xml_path(out_dir)
     if state_path.exists():
         try:
-            state = openmm.XmlSerializer.deserialize(state_path.read_text())
+            state = openmm.XmlSerializer.deserialize(state_path.read_text(encoding="utf-8"))
         except Exception as exc:
             if require_equil_state:
                 raise RuntimeError(f"Could not load saved equilibrated state {state_path}: {exc}") from exc

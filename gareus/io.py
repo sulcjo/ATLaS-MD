@@ -42,7 +42,7 @@ def write_json(path: Path, payload: Any) -> None:
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True, cls=_NumpyEncoder))
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True, cls=_NumpyEncoder), encoding="utf-8")
 
 
 def read_json_file(path: Path, default: Optional[Any] = None) -> Any:
@@ -51,7 +51,7 @@ def read_json_file(path: Path, default: Optional[Any] = None) -> Any:
         path = Path(path)
         if not path.exists():
             return default
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return default
 

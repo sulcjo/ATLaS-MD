@@ -168,7 +168,7 @@ def write_adaptive_feedback_summary_report(out_dir: Path) -> dict:
         lines.append(f"Exchange acceptance: **{100.0*float(payload['exchange_acceptance_fraction']):.1f}%**")
     lines.append("")
     lines.append("Use `final_production/` for downstream PMF/MBAR unless you intentionally analyze pilot diagnostics.")
-    (out_dir / "adaptive_feedback_summary.md").write_text("\n".join(lines) + "\n")
+    (out_dir / "adaptive_feedback_summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return payload
 
 
@@ -2720,7 +2720,7 @@ def _load_adaptive_feedback_proposal(proposal_path: Path) -> Optional[dict]:
     if not proposal_path.exists():
         return None
     try:
-        payload = json.loads(proposal_path.read_text())
+        payload = json.loads(proposal_path.read_text(encoding="utf-8"))
     except Exception as exc:
         print(f"WARNING: could not read adaptive-feedback proposal {proposal_path}: {exc}")
         return None

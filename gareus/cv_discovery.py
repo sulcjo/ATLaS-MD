@@ -300,7 +300,7 @@ def main(argv: list[str] | None = None) -> int:
     md_path = run_dir / f"{args.out_prefix}.md"
     write_json(json_path, _json_ready(payload))
     md = _markdown_report(payload)
-    md_path.write_text(md)
+    md_path.write_text(md, encoding="utf-8")
     if args.print_report:
         print(md)
     else:

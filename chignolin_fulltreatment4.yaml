@@ -1,11 +1,11 @@
 schema_version: '1.0'
-description: "Chignolin (GYDPETGTWG) adaptive-production 2D contacts x rama-map HMR-GaMD/REUS with 840 ns aggregate MD pool and <=16 active replicas."
+description: "Chignolin (GYDPETGTWG) production 2D contacts x rama-map HMR-GaMD/REUS with 840 ns aggregate MD pool, variable active-replica count, 10 adaptive epochs using 60% of the pool, and a 40% frozen-final phase."
 
 genpept:
   # Basic run identity
   seq: "GYDPETGTWG"
   out: "chignolin_genpept_3"
-  clean: true
+  clean: false
 
   # Main workflow
   two_stage: true
@@ -211,29 +211,34 @@ windows:
 
 
 adaptive_production:
-  # Global aggregate MD resource pool.  Aggregate ns = sum over all state segments
-  # of (number_of_states_in_segment * steps_per_state * timestep_fs / 1e6).
-  # At 4 fs and 16 active replicas, 840 aggregate ns is equivalent to ~13.125M
-  # steps per replica if all 16 replicas were run uniformly.
+  # Global aggregate MD resource pool. Aggregate ns is always the sum over
+  # all state segments: sum(states_in_segment * steps_per_state * timestep_fs / 1e6).
+  # Do not assume a fixed active-state count here. The scheduler should spend
+  # the aggregate step budgets below across however many active windows exist.
   adaptive_production_total_md_pool_ns: 840.0
   adaptive_production_pool_hard_stop: true
 
-  # Use multiple adaptive epochs; the convergence gate can still stop early.
-  adaptive_production_epochs: 8
-  adaptive_production_epoch_step_budget: 13125000   # 52.5 aggregate ns per adaptive epoch at 4 fs
-  adaptive_production_epoch_steps: 250000           # fallback/base worker length when not scheduled
+  # Use 10 adaptive epochs; the convergence gate can still stop early.
+  # 60% of 840 ns = 504 aggregate ns adaptive; 504 / 10 = 50.4 ns/epoch.
+  # At 4 fs, that is 12.6M aggregate MD steps per epoch, independent of
+  # whether the epoch has 8, 12, 16, or another number of active states.
+  adaptive_production_epochs: 10
+  adaptive_production_epoch_step_budget: 12600000   # authoritative aggregate epoch budget: 50.4 aggregate ns at 4 fs
+  adaptive_production_epoch_steps: 250000           # neutral per-state chunk/fallback hint only; not the target epoch budget
 
-  # Active-replica count is capped by contact_adaptive_max_total_windows above.
-  adaptive_production_min_state_steps: 100000       # 0.4 ns per state at 4 fs
-  adaptive_production_max_state_steps: 750000       # 3.0 ns per state at 4 fs
-  adaptive_production_new_state_steps: 750000       # give new bridge windows enough burn-in/sampling
+  # State-count-agnostic scheduler limits. The max is deliberately high so
+  # epochs with fewer active states can still spend the full aggregate budget.
+  adaptive_production_min_state_steps: 100000       # 0.4 ns minimum useful allocation per active state at 4 fs
+  adaptive_production_max_state_steps: 12600000     # do not cap below the aggregate epoch budget when active state count is small
+  adaptive_production_new_state_steps: 500000       # 2.0 ns starting allocation for newly added/bridge states, scheduler-limited by budget
   adaptive_production_allocation_scheduler: true
 
-  # Reserve enough clean frozen-final production while still allowing several adaptive epochs.
-  adaptive_production_final_pool_fraction: 0.50
+  # Reserve the remaining 40% of the aggregate pool for clean frozen-final production.
+  # 40% of 840 ns = 336 aggregate ns = 84.0M aggregate MD steps at 4 fs.
+  adaptive_production_final_pool_fraction: 0.40
   adaptive_production_min_final_pool_ns: 300.0
-  adaptive_production_final_steps: 2000000          # clipped by pool/scheduler as needed
-  adaptive_production_final_step_budget: 105000000  # 420 aggregate ns reserved target at 4 fs
+  adaptive_production_final_steps: 250000           # neutral per-state chunk/fallback hint only; final_step_budget is authoritative
+  adaptive_production_final_step_budget: 84000000   # authoritative aggregate frozen-final budget: 336 aggregate ns at 4 fs
   adaptive_production_final_allocation_scheduler: true
   adaptive_production_scheduled_final_segments: true
 
@@ -244,7 +249,7 @@ adaptive_production:
   adaptive_production_require_convergence_before_final: false
 
   # Resume/safety/analysis outputs.
-  adaptive_production_resume: false
+  adaptive_production_resume: true
   adaptive_production_write_action_reports: true
   adaptive_production_write_union_mbar_inputs: true
   adaptive_production_run_union_mbar_analysis: true
@@ -265,13 +270,16 @@ explicit_2d_windows:
   explicit_2d_secondary_center_column: secondary_cv_center
   explicit_2d_secondary_k_column: secondary_cv_k_kcal_mol
 
+# Production I/O: at 4 fs, interval 100 writes every 0.4 ps.
+# For the 840 ns aggregate pool this is roughly 2.1M saved samples.
+
 output:
   seq: GYDPETGTWG
-  out: chignolin_2d_run3/
-  traj_interval: 50
-  report_interval: 50
-  distance_output_interval: 50
-  progress_update_interval_sec: 30.0
+  out: chignolin_2d_run4_production_840ns_10ep60_stateagnostic/
+  traj_interval: 100
+  report_interval: 100
+  distance_output_interval: 100
+  progress_update_interval_sec: 60.0
   traj_format: xtc
 
 platform:

@@ -1202,6 +1202,118 @@ def set_integrator_globals_from_dict(integrator, values: dict[str, float]) -> tu
             skipped[str(name)] = str(exc)
     return copied, skipped
 
+
+_SHARED_GAMD_SETUP_FILES = (
+    "shared_gamd_setup_globals.json",
+    "shared_gamd_setup_context.chk",
+    "shared_gamd_setup_state.xml",
+    "shared_gamd_setup_final.pdb",
+    "shared_gamd_setup_state_write_warning.json",
+)
+
+
+def _path_arg(value: Any) -> Optional[Path]:
+    """Return a non-empty Path from an argparse value, or None."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return Path(text)
+
+
+def _copy_shared_gamd_setup_files(src_dir: Path, dst_dir: Path) -> dict[str, str]:
+    """Copy auditable shared-GaMD setup artifacts when they exist."""
+    src_dir = Path(src_dir)
+    dst_dir = Path(dst_dir)
+    copied: dict[str, str] = {}
+    try:
+        if src_dir.resolve() == dst_dir.resolve():
+            return copied
+    except Exception:
+        pass
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    for name in _SHARED_GAMD_SETUP_FILES:
+        src = src_dir / name
+        if not src.exists():
+            continue
+        dst = dst_dir / name
+        try:
+            shutil.copy2(src, dst)
+            copied[name] = str(dst)
+        except Exception as exc:
+            copied[name] = f"copy failed: {exc}"
+    return copied
+
+
+def load_reusable_shared_gamd_setup(args, out_dir: Path) -> Optional[tuple[dict[str, float], dict[str, float], int, Optional[bytes], dict]]:
+    """Load a previously calibrated shared GaMD setup for this worker run.
+
+    This is used by adaptive production so all epoch/baseline/topup/final worker
+    runs share the same GaMD thresholds/statistics.  The local worker directory
+    still receives a copy of the setup JSON/checkpoint for provenance.
+    """
+    setup_dir = _path_arg(getattr(args, "shared_gamd_setup_dir", None))
+    if setup_dir is None:
+        setup_dir = _path_arg(getattr(args, "_global_shared_gamd_setup_dir", None))
+    if setup_dir is None:
+        return None
+    globals_path = setup_dir / "shared_gamd_setup_globals.json"
+    if not globals_path.exists():
+        return None
+    payload = read_json_file(globals_path, None)
+    if not isinstance(payload, dict):
+        return None
+    all_globals = dict(payload.get("all_globals", {}) or {})
+    interesting = dict(payload.get("interesting_globals", {}) or {})
+    chk_path = setup_dir / "shared_gamd_setup_context.chk"
+    checkpoint = None
+    if chk_path.exists():
+        try:
+            checkpoint = chk_path.read_bytes()
+        except Exception:
+            checkpoint = None
+    if not all_globals and checkpoint is None:
+        return None
+    calib_steps = int(payload.get("calibration_steps", 0) or 0)
+    copied = _copy_shared_gamd_setup_files(setup_dir, out_dir)
+    local_payload = dict(payload)
+    reuse_note = {
+        "reused_shared_gamd_setup": True,
+        "source_shared_gamd_setup_dir": str(setup_dir),
+        "source_shared_gamd_globals_json": str(globals_path),
+        "source_shared_gamd_context_checkpoint": str(chk_path) if chk_path.exists() else "",
+        "local_copied_files": copied,
+        "description": "This worker reused a previously calibrated shared GaMD setup instead of recalibrating. Coordinates/window parameters are still worker-local; GaMD thresholds/statistics are campaign-global.",
+    }
+    local_payload.update(reuse_note)
+    write_json(Path(out_dir) / "shared_gamd_setup_globals.json", _json_ready(local_payload))
+    if checkpoint is not None and not (Path(out_dir) / "shared_gamd_setup_context.chk").exists():
+        try:
+            (Path(out_dir) / "shared_gamd_setup_context.chk").write_bytes(checkpoint)
+        except Exception:
+            pass
+    return all_globals, interesting, calib_steps, checkpoint, reuse_note
+
+
+def export_shared_gamd_setup_if_requested(args, out_dir: Path) -> dict[str, str]:
+    """Export this worker's calibrated shared-GaMD setup for later workers."""
+    export_dir = _path_arg(getattr(args, "shared_gamd_export_dir", None))
+    if export_dir is None:
+        export_dir = _path_arg(getattr(args, "_global_shared_gamd_export_dir", None))
+    if export_dir is None:
+        return {}
+    copied = _copy_shared_gamd_setup_files(Path(out_dir), export_dir)
+    manifest = {
+        "schema_version": "gareus_shared_gamd_export_v1",
+        "source_worker_dir": str(out_dir),
+        "export_dir": str(export_dir),
+        "copied_files": copied,
+        "note": "Adaptive production uses this directory as the campaign-wide shared GaMD setup source for all later epoch/topup/final worker runs.",
+    }
+    write_json(export_dir / "shared_gamd_export_manifest.json", _json_ready(manifest))
+    return copied
+
 class AnalysisArrayWriter:
     """Chunk production samples into NumPy files for fast downstream analysis.
 
@@ -1395,6 +1507,51 @@ class AnalysisArrayWriter:
             return arr.astype(np.float32, copy=False)
         return arr
 
+    def _concatenate_chunk_arrays(self, key: str, vals: list[np.ndarray]) -> np.ndarray:
+        """Concatenate one logical analysis array across chunk files.
+
+        Most arrays are sample-major, so appending chunks means axis=0.  The
+        legacy PyMBAR-compatible ``umbrella_reduced_bias_kn`` array is the one
+        intentional exception: it is window/state-major [n_windows, n_samples],
+        so chunks must be appended along axis=1.  Without this special case, a
+        final short chunk makes consolidation crash with mismatched dimension 1.
+        """
+        clean_vals = [np.asarray(v) for v in vals if v is not None]
+        if not clean_vals:
+            return np.asarray([])
+
+        if key == "umbrella_reduced_bias_kn":
+            fixed_vals: list[np.ndarray] = []
+            for arr in clean_vals:
+                if arr.ndim != 2:
+                    raise ValueError(
+                        f"Cannot consolidate {key}: expected 2D [n_windows, n_samples] chunks, "
+                        f"got shape {arr.shape}."
+                    )
+                if arr.shape[0] == self.n_windows:
+                    fixed_vals.append(arr)
+                elif arr.shape[1] == self.n_windows:
+                    # Be tolerant of accidental sample-major legacy chunks.
+                    fixed_vals.append(arr.T)
+                else:
+                    raise ValueError(
+                        f"Cannot consolidate {key}: chunk shape {arr.shape} does not match "
+                        f"n_windows={self.n_windows}."
+                    )
+            return np.concatenate(fixed_vals, axis=1)
+
+        try:
+            return np.concatenate(clean_vals, axis=0)
+        except ValueError as exc:
+            shapes = ", ".join(str(tuple(v.shape)) for v in clean_vals[:12])
+            if len(clean_vals) > 12:
+                shapes += ", ..."
+            raise ValueError(
+                f"Cannot consolidate analysis array {key!r} across chunks; "
+                f"chunk shapes are: {shapes}. Sample-major arrays should vary only "
+                f"along axis 0; legacy *_kn arrays must be handled explicitly."
+            ) from exc
+
     def _write_consolidated_from_chunks(self) -> Optional[Path]:
         if not self.chunks:
             return None
@@ -1413,7 +1570,11 @@ class AnalysisArrayWriter:
             with np.load(chunk["path"], allow_pickle=False) as data:
                 for key in data.files:
                     loaded.setdefault(key, []).append(np.asarray(data[key]))
-        arrays = {key: self._maybe_cast_consolidated_array(np.concatenate(vals, axis=0)) for key, vals in loaded.items() if vals}
+        arrays = {
+            key: self._maybe_cast_consolidated_array(self._concatenate_chunk_arrays(key, vals))
+            for key, vals in loaded.items()
+            if vals
+        }
         if not arrays:
             return None
         self._save_npz(self.path, arrays)
@@ -1448,6 +1609,7 @@ class AnalysisArrayWriter:
                 "umbrella_bias_kcal_mol_nk": "total umbrella U_k(x_n), kcal/mol",
                 "umbrella_bias_kj_mol_nk": "total umbrella U_k(x_n), kJ/mol",
                 "umbrella_reduced_bias_nk": "beta * total umbrella U_k(x_n), dimensionless",
+                "umbrella_reduced_bias_kn": "legacy PyMBAR transpose of umbrella_reduced_bias_nk with shape [n_windows, n_samples]",
             },
             "csv_companion": str(self.out_dir / "samples.csv"),
         })
@@ -1543,7 +1705,7 @@ def write_standardized_output_layout(out_dir: Path) -> dict:
         for r in adaptive_rounds:
             lines.append(f"- `{_safe_relative_path(Path(r), out_dir)}`")
         lines.append("")
-    (out_dir / "output_layout.md").write_text("\n".join(lines) + "\n")
+    (out_dir / "output_layout.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return payload
 
 def write_exchange_tuning_report(out_dir: Path, args, exchange_stats: dict, centers_a=None, secondary_cv_centers=None, secondary_cv_metadata: Optional[dict] = None) -> dict:
@@ -1639,7 +1801,7 @@ def write_exchange_tuning_report(out_dir: Path, args, exchange_stats: dict, cent
             lines.append(f"| {r['pair']} | {int(r['attempts'])} | {int(r['accepted'])} | {100.0*float(r['acceptance_fraction']):.1f}% | {r.get('edge_type','')} |")
         if len(attempted_pairs) > 80:
             lines.append(f"| ... | ... | ... | ... | {len(attempted_pairs)-80} more pairs omitted |")
-    (out_dir / "exchange_tuning_report.md").write_text("\n".join(lines) + "\n")
+    (out_dir / "exchange_tuning_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return payload
 
 def write_final_run_report(out_dir: Path, args, centers_a, k_list, exchange_stats: dict) -> dict:
@@ -1657,14 +1819,14 @@ def write_final_run_report(out_dir: Path, args, centers_a, k_list, exchange_stat
     pull_quality = None
     if pull_quality_path.exists():
         try:
-            pull_quality = json.loads(pull_quality_path.read_text())
+            pull_quality = json.loads(pull_quality_path.read_text(encoding="utf-8"))
         except Exception:
             pull_quality = {"status": "error", "path": str(pull_quality_path)}
     graft_report_path = out_dir / "us_starting_structures" / "graft_report.json"
     graft_report = None
     if graft_report_path.exists():
         try:
-            graft_report = json.loads(graft_report_path.read_text())
+            graft_report = json.loads(graft_report_path.read_text(encoding="utf-8"))
         except Exception:
             graft_report = None
     windows_rows = window_assignment_rows(np.asarray(centers_a, dtype=float), list(k_list), float(getattr(args, "temperature_k", 300.0) or 300.0), args=args)
@@ -1805,7 +1967,7 @@ def write_final_run_report(out_dir: Path, args, centers_a, k_list, exchange_stat
         lines.append("Run analysis, but treat the PMF cautiously and inspect warnings/overlap/ESS first.")
     else:
         lines.append("Inputs look structurally usable for downstream MBAR/PMF analysis.")
-    (out_dir / "final_report.md").write_text("\n".join(lines) + "\n")
+    (out_dir / "final_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return report_payload
 
 def compare_gamd_global_sets(reference: dict[str, float], current: dict[str, float], rtol: float = 1.0e-10, atol: float = 1.0e-10) -> dict:
@@ -1914,7 +2076,7 @@ def save_production_checkpoint(out_dir: Path, sims: list, assignments: list[int]
     if secondary_cv_k_kcal_list is not None:
         manifest["secondary_cv_k_kcal_mol"] = [float(x) for x in secondary_cv_k_kcal_list]
     tmp = chk_dir / "production_checkpoint_manifest.tmp"
-    tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+    tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
     tmp.replace(checkpoint_manifest_path(out_dir))
 
 def sync_scratch_to_main(scratch_dir: Path, main_dir: Path) -> None:
@@ -1940,7 +2102,7 @@ def load_production_checkpoint(out_dir: Path, sims: list, centers_nm, ks_kj_nm2,
     manifest_path = checkpoint_manifest_path(out_dir)
     if not manifest_path.exists():
         return None
-    manifest = json.loads(manifest_path.read_text())
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     files = manifest.get("replica_checkpoint_files", [])
     if len(files) != len(sims):
         raise RuntimeError(f"Checkpoint replica count mismatch: manifest has {len(files)} files, current run has {len(sims)} replicas")
@@ -2222,7 +2384,7 @@ def run_shared_gamd_setup_article_a(
 
     try:
         state = shared_sim.context.getState(getPositions=True, getVelocities=True, getEnergy=True, enforcePeriodicBox=True)
-        (out_dir / "shared_gamd_setup_state.xml").write_text(openmm.XmlSerializer.serialize(state))
+        (out_dir / "shared_gamd_setup_state.xml").write_text(openmm.XmlSerializer.serialize(state), encoding="utf-8")
         with (out_dir / "shared_gamd_setup_final.pdb").open("w") as handle:
             app.PDBFile.writeFile(topology, state.getPositions(), handle, keepIds=True)
     except Exception as exc:
@@ -2421,35 +2583,49 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         )
 
         if use_gamd:
-            # GaMD calibration is sensitive to the starting PE range.  The NPT-
-            # equilibrated structure is typically extended (high PE for chignolin),
-            # which causes Vmin to be overestimated and makes compact-window boosts
-            # disproportionately large.  Use the most compact pulled window instead:
-            # it is closest to the PMF minimum and gives a Vmin that covers the
-            # energy range production replicas actually visit.
-            if primary_cv_is_contacts(args) and window_start_positions:
-                try:
-                    _compact_idx = int(np.nanargmax(np.asarray(centers_a, dtype=float)))
-                except Exception:
+            reusable_gamd = load_reusable_shared_gamd_setup(args, out_dir)
+            if reusable_gamd is not None:
+                shared_gamd_globals_all, shared_gamd_globals_interesting, calib_steps, shared_gamd_context_checkpoint, reuse_note = reusable_gamd
+                print(
+                    "    GaMD shared setup: reusing campaign/global calibration from "
+                    f"{reuse_note.get('source_shared_gamd_setup_dir', '<unknown>')}"
+                )
+            else:
+                # GaMD calibration is sensitive to the starting PE range.  The NPT-
+                # equilibrated structure is typically extended (high PE for chignolin),
+                # which causes Vmin to be overestimated and makes compact-window boosts
+                # disproportionately large.  Use the most compact pulled window instead:
+                # it is closest to the PMF minimum and gives a Vmin that covers the
+                # energy range production replicas actually visit.
+                if primary_cv_is_contacts(args) and window_start_positions:
+                    try:
+                        _compact_idx = int(np.nanargmax(np.asarray(centers_a, dtype=float)))
+                    except Exception:
+                        _compact_idx = 0
+                else:
                     _compact_idx = 0
-            else:
-                _compact_idx = 0
-            _compact_pos = window_start_positions[_compact_idx] if window_start_positions and window_start_positions[_compact_idx] is not None else None
-            _compact_vel = window_start_velocities[_compact_idx] if window_start_velocities and window_start_velocities[_compact_idx] is not None else None
-            if _compact_pos is not None:
-                _equil_box = equil_state.getPeriodicBoxVectors()
-                class _CompactState:
-                    def getPositions(self): return _compact_pos
-                    def getVelocities(self): return _compact_vel
-                    def getPeriodicBoxVectors(self): return _equil_box
-                gamd_start_state = _CompactState()
-                print(f"    GaMD shared setup: starting from primary-CV window {_compact_idx} (better Vmin estimate than extended equil structure)")
-            else:
-                gamd_start_state = equil_state
-                print("    GaMD shared setup: compact window unavailable, falling back to NPT-equilibrated structure")
-            shared_gamd_globals_all, shared_gamd_globals_interesting, calib_steps, shared_gamd_context_checkpoint = run_shared_gamd_setup_article_a(
-                args, out_dir, openmm, app, unit, topology, base_system, gamd_start_state, setup_platform, setup_props, progress=progress
-            )
+                _compact_pos = window_start_positions[_compact_idx] if window_start_positions and window_start_positions[_compact_idx] is not None else None
+                _compact_vel = window_start_velocities[_compact_idx] if window_start_velocities and window_start_velocities[_compact_idx] is not None else None
+                if _compact_pos is not None:
+                    _equil_box = equil_state.getPeriodicBoxVectors()
+                    class _CompactState:
+                        def getPositions(self): return _compact_pos
+                        def getVelocities(self): return _compact_vel
+                        def getPeriodicBoxVectors(self): return _equil_box
+                    gamd_start_state = _CompactState()
+                    print(f"    GaMD shared setup: starting from primary-CV window {_compact_idx} (better Vmin estimate than extended equil structure)")
+                else:
+                    gamd_start_state = equil_state
+                    print("    GaMD shared setup: compact window unavailable, falling back to NPT-equilibrated structure")
+                shared_gamd_globals_all, shared_gamd_globals_interesting, calib_steps, shared_gamd_context_checkpoint = run_shared_gamd_setup_article_a(
+                    args, out_dir, openmm, app, unit, topology, base_system, gamd_start_state, setup_platform, setup_props, progress=progress
+                )
+                exported = export_shared_gamd_setup_if_requested(args, out_dir)
+                if exported:
+                    print(
+                        "    GaMD shared setup: exported campaign/global calibration to "
+                        f"{getattr(args, 'shared_gamd_export_dir', '') or getattr(args, '_global_shared_gamd_export_dir', '')}"
+                    )
         else:
             calib_steps = 0
             shared_gamd_globals_all = {}

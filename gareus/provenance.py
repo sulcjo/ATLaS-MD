@@ -76,7 +76,7 @@ def _write_manifest(out_dir: Path, payload: Mapping[str, Any]) -> None:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_suffix(path.suffix + ".tmp")
-            tmp.write_text(json.dumps(clean, indent=2, sort_keys=True) + "\n")
+            tmp.write_text(json.dumps(clean, indent=2, sort_keys=True) + "\n", encoding="utf-8")
             tmp.replace(path)
         except Exception:
             # Provenance must never make a long MD run fail.

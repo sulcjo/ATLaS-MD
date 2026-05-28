@@ -192,7 +192,7 @@ def validate_tiny_run_outputs(out_dir: str | os.PathLike[str]) -> dict:
 
 def _write_report(out_dir: Path, report: dict) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "tiny_integration_test_report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    (out_dir / "tiny_integration_test_report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     lines = [
         "# GAREUS tiny integration test report",
         "",
@@ -225,7 +225,7 @@ def _write_report(out_dir: Path, report: dict) -> None:
             lines.append("")
     if report.get("error"):
         lines.extend(["## Error", "", "```text", str(report["error"]), "```", ""])
-    (out_dir / "tiny_integration_test_report.md").write_text("\n".join(lines) + "\n")
+    (out_dir / "tiny_integration_test_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:

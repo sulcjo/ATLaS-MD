@@ -268,6 +268,7 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--adaptive-production-propagate-seed-bank", action=argparse.BooleanOptionalAction, default=True, help="After each adaptive-production epoch, build a GENPEPT-compatible seed bank from final epoch PDBs and use it to initialize the next epoch/final phase. This preserves conformational discoveries between epoch workers without mutating OpenMM contexts in place.")
     p.add_argument("--adaptive-production-seed-bank-max-per-state", type=int, default=1, help="Maximum number of final PDB seeds retained per persistent adaptive-production state in each epoch seed bank.")
     p.add_argument("--adaptive-production-allocation-scheduler", action=argparse.BooleanOptionalAction, default=True, help="Use per-state adaptive step allocations after the first adaptive-production epoch. Runs a short all-state baseline plus top-up subset runs for high-priority states.")
+    p.add_argument("--adaptive-production-global-shared-gamd", action=argparse.BooleanOptionalAction, default=True, help="For adaptive-production GaMD runs, calibrate shared GaMD once and reuse the same setup for all epochs, scheduled topups, final, and final extensions. Default true.")
     p.add_argument("--adaptive-production-epoch-step-budget", type=int, default=0, help="Total approximate MD-step budget per adaptive-production epoch across active states. 0 = infer from active state count and --adaptive-production-epoch-steps.")
     p.add_argument("--adaptive-production-min-state-steps", type=int, default=0, help="Minimum baseline steps per active state in adaptive-production scheduled epochs. 0 = min(epoch_steps, max(1000, epoch_steps/4)).")
     p.add_argument("--adaptive-production-max-state-steps", type=int, default=0, help="Maximum requested steps for any single active state in a scheduled adaptive-production epoch. 0 = 4x baseline epoch steps.")
@@ -380,6 +381,8 @@ def _add_gamd_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--production-safe-chunk-steps", type=int, default=0, help="Optional maximum subchunk size for production stepping. 0 uses the normal next-event chunk. Smaller values make NaN diagnostics more local but add overhead.")
     p.add_argument("--production-nan-diagnostics", action=argparse.BooleanOptionalAction, default=True, help="When production stepping fails, scan replicas and write PRODUCTION_NAN_DIAGNOSTICS_*.json plus crash PDBs when possible.")
     p.add_argument("--shared-gamd-copy-strict", action="store_true", help="Abort if the copied shared GaMD integrator globals differ from the reference setup before production.")
+    p.add_argument("--shared-gamd-setup-dir", default="", help="Reuse a previously calibrated shared GaMD setup from this directory instead of recalibrating in the current production worker. Expected files include shared_gamd_setup_globals.json and optionally shared_gamd_setup_context.chk.")
+    p.add_argument("--shared-gamd-export-dir", default="", help="After calibrating shared GaMD in this worker, copy the setup artifacts to this directory for later workers. Adaptive production uses this internally to keep one campaign-wide GaMD setup.")
 
 
 def _add_output_args(p: argparse.ArgumentParser) -> None:
@@ -656,7 +659,32 @@ def main(argv: Optional[Iterable[str]] = None):
     try:
         progress.emit({"event": "run_start", "sequence": args.seq, "out": str(out_dir), "resume": bool(getattr(args, "resume", False))})
 
-        if bool(getattr(args, "resume", False)):
+        if bool(getattr(args, "resume", False)) and str(getattr(args, "window_mode", "adaptive")) == "adaptive-production":
+            # For epochal adaptive production, plain --resume means resume the
+            # adaptive-production driver/registry. It does not mean resume one
+            # transient epoch worker from its OpenMM checkpoints.
+            setattr(args, "adaptive_production_resume", True)
+            setattr(args, "resume", False)
+            loaded_resume_setup = None
+            for _pdb_dir in list(dict.fromkeys([out_dir, out_dir.parent, out_dir.parent.parent])):
+                _setup = load_existing_openmm_setup_for_resume(args, _pdb_dir, require_equil_state=False)
+                if _setup is not None:
+                    loaded_resume_setup = _setup
+                    break
+            if loaded_resume_setup is None:
+                print()
+                print("ERROR: adaptive-production --resume could not load the solvated topology.")
+                print("  Expected 01_solvated_start.pdb in the run directory or one of its parents.")
+                print("  To restart from scratch, omit --resume and use a fresh --out directory.")
+                progress.emit({"event": "resume_failed", "reason": "no_solvated_topology", "out": str(out_dir)})
+                return
+            openmm, app, unit, forcefield, topology, equil_state = loaded_resume_setup
+            print("[resume] Adaptive-production driver resume requested; continuing from registry/driver summary when available.")
+            print("[resume] Epoch worker checkpoints are not auto-resumed; completed epochs/segments are tracked at driver level.")
+            progress.emit({"event": "adaptive_production_resume_setup_loaded", "out": str(out_dir)})
+            run_adaptive_production_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
+
+        elif bool(getattr(args, "resume", False)):
             # --resume: skip all setup/pilots and go straight to production.
             #
             # For adaptive-feedback runs the production checkpoint lives in
@@ -684,7 +712,7 @@ def main(argv: Optional[Iterable[str]] = None):
                     if _exists:
                         try:
                             import json as _json
-                            _m = _json.loads(_p.read_text())
+                            _m = _json.loads(_p.read_text(encoding="utf-8"))
                             _chk_files_ok = all((_p.parent / str(f)).exists() for f in _m.get("replica_checkpoint_files", []))
                         except Exception:
                             pass

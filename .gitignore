@@ -6,6 +6,7 @@ __pycache__/
 .claude/
 _local_docs/
 query_gpt.py
+check_gareus_pbc_mindist.py
 
 *.swp
 *.swo
@@ -14,6 +15,7 @@ query_gpt.py
 
 chignolin_genpept_seeds/
 chignolin_2d_newpackage/
+RUNS/
 ABCold_monolith/
 _genpept_test/chignolin_genpept_run??_*/
 _genpept_test/fes_*/
