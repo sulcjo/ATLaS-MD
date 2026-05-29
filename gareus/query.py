@@ -265,7 +265,7 @@ def export_analysis_arrays_npz(
 
     out_path = Path(out_path) if out_path is not None else (Path(run_dir) / "analysis_arrays.npz")
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(out_path, **save_kwargs)
+    np.savez_compressed(out_path, **save_kwargs)
     return out_path
 
 

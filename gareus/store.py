@@ -76,7 +76,7 @@ class ParquetSampleWriter:
         self._chunk_idx += 1
         chunk_path = self._out_dir / f"chunk_{self._chunk_idx:06d}.parquet"
         tmp_path = chunk_path.with_suffix(".parquet.tmp")
-        pq.write_table(tbl, tmp_path)
+        pq.write_table(tbl, tmp_path, compression="zstd", compression_level=3)
         tmp_path.rename(chunk_path)
 
         for lst in b.values():
@@ -137,7 +137,7 @@ class ParquetExchangeWriter:
         self._chunk_idx += 1
         chunk_path = self._out_dir / f"chunk_{self._chunk_idx:06d}.parquet"
         tmp_path = chunk_path.with_suffix(".parquet.tmp")
-        pq.write_table(tbl, tmp_path)
+        pq.write_table(tbl, tmp_path, compression="zstd", compression_level=3)
         tmp_path.rename(chunk_path)
 
         for lst in b.values():
