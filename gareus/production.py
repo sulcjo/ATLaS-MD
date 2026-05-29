@@ -243,6 +243,38 @@ def primary_secondary_and_potential_from_state(
         potential_kj = float(state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole))
     return primary_value, ss, potential_kj
 
+
+def _ss_scalar_from_sub_cv_values(sub_cv_values, metadata: dict) -> float:
+    """Reconstruct the secondary-structure scalar CV from CustomCVForce sub-variable values.
+
+    Mirrors the scalar expression baked into the OpenMM energy function so that
+    CustomCVForce.getCollectiveVariableValues() can replace a positions-based
+    recompute.  The force already evaluated these values on the GPU during the
+    preceding step(); this function is pure Python arithmetic over scalars.
+
+    For rama-map/rama-regions: sub-CVs interleave phi/psi per region in
+    definition order — [phi_0, psi_0, phi_1, psi_1, ...].
+    For alpha-coil-beta: [alpha_phi, alpha_psi, beta_phi, beta_psi].
+    For simple modes (alpha/beta/custom): [ss_phi, ss_psi].
+    """
+    mode = secondary_cv_mode(metadata)
+    arr = np.asarray(sub_cv_values, dtype=np.float64)
+    if mode == "alpha-coil-beta":
+        return float(0.5 * (arr[0] + arr[1]) - 0.5 * (arr[2] + arr[3]))
+    if mode in {"rama-regions", "rama-map"}:
+        regions = metadata.get("regions", [])
+        if not regions:
+            return 0.0
+        values = np.array([float(r["value"]) for r in regions], dtype=np.float64)
+        phi_scores = arr[0::2]
+        psi_scores = arr[1::2]
+        scores = 0.5 * (phi_scores + psi_scores)
+        denom = float(np.sum(scores)) + 1e-8
+        return float(np.dot(values, scores) / denom)
+    # alpha, beta, custom: [ss_phi, ss_psi]
+    return float(0.5 * (arr[0] + arr[1]))
+
+
 def _first_present(*values):
     for value in values:
         if value is not None:
@@ -2742,6 +2774,43 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
 
     if progress is not None:
         progress.progress("replica_construction", nrep, nrep, message=f"{nrep} replicas ready", force=True)
+
+    # ── Fast CV path: cache per-replica CustomCVForce references ────────────────
+    # After step(), OpenMM caches collective-variable values inside each Context.
+    # getCollectiveVariableValues(context) reads those cached scalars without any
+    # GPU→CPU position transfer, saving the dominant DMA cost at each sample and
+    # exchange interval.  All replica systems are deserialized copies of base_system
+    # and share the same force-index layout.
+    _primary_umbrella_fg = int(getattr(args, "umbrella_force_group", 31))
+    _secondary_cv_fg = int(getattr(args, "secondary_cv_force_group", 29))
+    _fast_primary_force_idx: int = -1
+    _fast_ss_force_idx: int = -1
+    if sims:
+        _probe_sys = sims[0].system
+        for _fi in range(_probe_sys.getNumForces()):
+            _f = _probe_sys.getForce(_fi)
+            if not hasattr(_f, "getCollectiveVariableValues"):
+                continue
+            _fg = _f.getForceGroup()
+            if _fg == _primary_umbrella_fg:
+                _fast_primary_force_idx = _fi
+            elif _fg == _secondary_cv_fg:
+                _fast_ss_force_idx = _fi
+    _fast_primary_forces = (
+        [sim.system.getForce(_fast_primary_force_idx) for sim in sims]
+        if _fast_primary_force_idx >= 0 else [None] * nrep
+    )
+    _fast_ss_forces = (
+        [sim.system.getForce(_fast_ss_force_idx) for sim in sims]
+        if _fast_ss_force_idx >= 0 else [None] * nrep
+    )
+    _ss_enabled_global = bool((secondary_cv_metadata or {}).get("enabled"))
+    _use_fast_cv_path = (
+        _fast_primary_force_idx >= 0
+        and (not _ss_enabled_global or _fast_ss_force_idx >= 0)
+    )
+    # ────────────────────────────────────────────────────────────────────────────
+
     copy_sanity_rows = []
     copy_problem_count = 0
     if not use_gamd:
@@ -3123,6 +3192,23 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
 
             def _fetch_state(r_sim):
                 r, sim = r_sim
+                if _use_fast_cv_path:
+                    ctx = sim.context
+                    pf = _fast_primary_forces[r]
+                    raw = float(pf.getCollectiveVariableValues(ctx)[0])
+                    norm = float(ctx.getParameter("contact_norm")) if bool(getattr(args, "contact_normalize", True)) else 0.0
+                    cv = raw / norm if norm > 0.0 else raw
+                    sf = _fast_ss_forces[r]
+                    ss = (
+                        _ss_scalar_from_sub_cv_values(sf.getCollectiveVariableValues(ctx), secondary_cv_metadata)
+                        if sf is not None else float("nan")
+                    )
+                    if read_sample_potential:
+                        state = ctx.getState(getEnergy=True, enforcePeriodicBox=True)
+                        pe = float(state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole))
+                    else:
+                        pe = float("nan")
+                    return r, cv, ss, pe
                 return r, *primary_secondary_and_potential_from_state(
                     sim.context, primary_cv_def, args, unit, secondary_cv_metadata,
                     read_potential_energy=read_sample_potential,
@@ -3427,20 +3513,33 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     if cached_cvs.shape == (nrep,) and cached_bias.shape == (nrep, nrep):
                         return cached_cvs, cached_bias
 
-            # One position read per replica at exchange time.  Then compute the
-            # full U[window, replica] umbrella matrix in NumPy/C for all swap and
-            # Gibbs candidates in this exchange batch.  Potential energies are not
-            # requested here because exchange depends only on umbrella differences.
+            # Compute CV values for every replica.  When the fast path is active
+            # (contacts primary + CustomCVForce secondary) this reads cached scalars
+            # via getCollectiveVariableValues() — no positions DMA at all.  The
+            # full U[window, replica] umbrella matrix is then built in NumPy for all
+            # swap/Gibbs candidates.  Potential energies are not needed here.
             primary_values = np.empty(nrep, dtype=np.float64)
             ss_values = np.full(nrep, np.nan, dtype=np.float64)
             _ss_enabled = bool((secondary_cv_metadata or {}).get("enabled"))
 
             def _fetch_exchange_state(r_sim):
                 r, sim = r_sim
-                state = sim.context.getState(getPositions=True, enforcePeriodicBox=True)
-                pos = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
-                cv = primary_cv_value_from_positions_nm(pos, primary_cv_def, args)
-                ss = secondary_structure_score_from_positions_nm(pos, secondary_cv_metadata) if _ss_enabled else float("nan")
+                if _use_fast_cv_path:
+                    ctx = sim.context
+                    pf = _fast_primary_forces[r]
+                    raw = float(pf.getCollectiveVariableValues(ctx)[0])
+                    norm = float(ctx.getParameter("contact_norm")) if bool(getattr(args, "contact_normalize", True)) else 0.0
+                    cv = raw / norm if norm > 0.0 else raw
+                    sf = _fast_ss_forces[r]
+                    ss = (
+                        _ss_scalar_from_sub_cv_values(sf.getCollectiveVariableValues(ctx), secondary_cv_metadata)
+                        if sf is not None and _ss_enabled else float("nan")
+                    )
+                else:
+                    state = sim.context.getState(getPositions=True, enforcePeriodicBox=True)
+                    pos = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+                    cv = primary_cv_value_from_positions_nm(pos, primary_cv_def, args)
+                    ss = secondary_structure_score_from_positions_nm(pos, secondary_cv_metadata) if _ss_enabled else float("nan")
                 return r, cv, ss
 
             for r, cv, ss in _sim_pool.map(_fetch_exchange_state, enumerate(sims)):
