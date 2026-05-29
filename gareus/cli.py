@@ -1,4 +1,4 @@
-"""Command-line parser and top-level workflow for GAREUS."""
+"""Command-line parser and top-level workflow for GAREUS (schema v2.0)."""
 
 from __future__ import annotations
 
@@ -35,541 +35,704 @@ __all__ = ["parse_args", "main"]
 
 
 # ---------------------------------------------------------------------------
-# parse_args helpers — each adds one logical group of CLI flags to a parser.
-# None of these functions change argument names, defaults, or behavior;
-# they are pure structural decompositions of the original monolithic function.
+# Argument group builders
 # ---------------------------------------------------------------------------
 
 def _add_core_args(p: argparse.ArgumentParser) -> None:
-    """Add help, config, I/O, sequence, and seed arguments."""
-    p.add_argument("-h", "--help", action=SimpleHelpAction, help="Show concise practical help and exit.")
-    p.add_argument("-hh", "--help-heavy", action=HeavyHelpAction, help="Show method encyclopedia, equations, design notes, and complete option reference; then exit.")
-    p.add_argument("--config", default=None, help="YAML/JSON config file. Nested groups are allowed; leaf keys use argparse dest names. CLI flags override config values.")
-    p.add_argument("--write-config-template", nargs="?", const="chignolin_adaptive_feedback.yaml", default=None, help="Write a ready-to-edit YAML config template and exit. Optional path argument supported.")
-    p.add_argument("--write-effective-config", action="store_true", help="Force writing effective_config.yaml/json immediately at run start. These files are also written by default for every run.")
+    p.add_argument("-h", "--help", action=SimpleHelpAction)
+    p.add_argument("-hh", "--help-heavy", action=HeavyHelpAction)
+    p.add_argument("--config", default=None, help="YAML/JSON config file.")
+    p.add_argument("--write-config-template", nargs="?", const="gareus_template.yaml", default=None)
+    p.add_argument("--write-effective-config", action="store_true")
     p.add_argument("--seq", required=True, help="One-letter peptide sequence.")
-    p.add_argument("--out", default="gareus_peptide_out", help="Output directory.")
+    p.add_argument("--out", default="gareus_out", help="Output directory.")
     p.add_argument("--seed", type=int, default=2026)
 
 
 def _add_system_args(p: argparse.ArgumentParser) -> None:
-    """Add peptide system / OpenMM simulation setup arguments."""
-    p.add_argument("--initial-phi", type=float, default=-60.0, help="Initial PeptideBuilder internal phi angle for residues where applicable.")
-    p.add_argument("--initial-psi", type=float, default=-45.0, help="Initial PeptideBuilder previous-residue psi angle for residues where applicable.")
-    p.add_argument("--ph", type=float, default=7.0)
     p.add_argument("--water-model", choices=["tip3p", "tip3pfb", "spce", "tip4pew"], default="tip3p")
-    p.add_argument("--box-shape", choices=["dodecahedron", "cube", "octahedron"], default="dodecahedron", help="Periodic solvent box shape passed to OpenMM Modeller.addSolvent. dodecahedron reduces solvent count for compact peptides; cube is the legacy rectangular default; octahedron is also supported by recent OpenMM versions.")
+    p.add_argument("--box-shape", choices=["dodecahedron", "cube", "octahedron"], default="dodecahedron")
     p.add_argument("--padding-nm", type=float, default=1.0)
     p.add_argument("--ionic-strength-molar", type=float, default=0.15)
     p.add_argument("--temperature-k", type=float, default=300.0)
     p.add_argument("--pressure-bar", type=float, default=1.0)
     p.add_argument("--barostat-frequency", type=int, default=25)
-    p.add_argument("--production-ensemble", choices=["npt", "nvt"], default="npt", help="Production ensemble. Default npt uses OpenMM MonteCarloBarostat; nvt preserves the previous fixed-box production behavior.")
-    p.add_argument("--production-barostat-frequency", type=int, default=0, help="MC barostat attempt frequency for production NPT. 0 reuses --barostat-frequency.")
-    p.add_argument("--run-mode", choices=["cmd", "hmr-cmd", "gamd", "hmr-gamd"], default="gamd", help="High-level dynamics mode: cmd = conventional umbrella/REUS MD without gamd-openmm; hmr-cmd = conventional umbrella/REUS with HMR and 4 fs default; gamd = GaMD/REUS without automatic HMR; hmr-gamd = HMR + GaMD/REUS with 4 fs default. Existing expert flags remain available.")
+    p.add_argument("--production-ensemble", choices=["npt", "nvt"], default="npt")
+    p.add_argument("--minimize-iterations", type=int, default=20000)
+    p.add_argument("--npt-steps", type=int, default=100000)
+    p.add_argument("--nvt-warmup-steps", type=int, default=20000)
+    p.add_argument("--equil-restraint-k-kcal-mol-a2", type=float, default=2.0)
+    p.add_argument("--equil-friction-per-ps", type=float, default=10.0)
+    # Simulation
+    p.add_argument("--run-mode", choices=["cmd", "hmr-cmd", "gamd", "hmr-gamd"], default="gamd",
+                   help="cmd/gamd = no HMR; hmr-cmd/hmr-gamd = HMR + 4 fs default timestep.")
     p.add_argument("--timestep-fs", type=float, default=2.0)
     p.add_argument("--friction-per-ps", type=float, default=1.0)
     p.add_argument("--nonbonded-cutoff-nm", type=float, default=0.8)
     p.add_argument("--ewald-error-tolerance", type=float, default=1e-4)
-    p.add_argument("--minimize-iterations", type=int, default=20000)
-    p.add_argument("--npt-steps", type=int, default=100000)
-
-    # Safer staged equilibration. Defaults are intentionally conservative:
-    # first prove the molecule can survive, then let production be fast.
-    p.add_argument("--nvt-warmup-steps", type=int, default=20000)
+    # Expert equil ramp (rarely changed, kept for completeness)
     p.add_argument("--nvt-warmup-timestep-fs", type=float, default=0.25)
-    p.add_argument("--nvt-start-temperature-k", type=float, default=50.0)
     p.add_argument("--npt-ramp-steps", type=int, default=50000)
     p.add_argument("--npt-ramp-timestep-fs", type=float, default=0.5)
-    p.add_argument("--npt-final-timestep-fs", type=float, default=0.0, help="0 = auto min(--timestep-fs, 2 fs) during NPT equilibration.")
-    p.add_argument("--equil-restraint-k-kcal-mol-a2", type=float, default=2.0)
-    p.add_argument("--equil-friction-per-ps", type=float, default=10.0)
-    p.add_argument("--equil-safe-chunk-steps", type=int, default=100)
-
-    p.add_argument("--hmr", action="store_true", help="Enable hydrogen mass repartitioning.")
-    p.add_argument("--hydrogen-mass-amu", type=float, default=0.0, help="Hydrogen mass for HMR; 0 means use 3.024 when --hmr is set.")
 
 
 def _add_cv_args(p: argparse.ArgumentParser) -> None:
-    """Add collective-variable (CV) arguments: primary and secondary CVs."""
-    p.add_argument("--cv1", choices=["distance", "contacts", "nonlocal-contacts"], default=None, help="Friendly primary-CV selector. --cv1 distance maps to --primary-cv distance; --cv1 contacts maps to --primary-cv nonlocal-contacts.")
-    p.add_argument("--cv2", choices=["none", "alpha", "beta", "alpha-coil-beta", "acb", "rama-map", "rama-regions", "rama", "ramachandran", "ramachandran-regions", "custom"], default=None, help="Friendly secondary-CV selector. Any non-none value enables a real 2D workflow; if no --secondary-cv-centers are supplied, sensible default centers are inserted automatically.")
-    p.add_argument("--cv-mode", choices=["terminal-ca", "terminal-n-c"], default="terminal-ca")
-    p.add_argument("--cv-atom1", default=None, help="Explicit selector, e.g. 1:CA or absolute atom index.")
-    p.add_argument("--cv-atom2", default=None, help="Explicit selector, e.g. -1:CA or absolute atom index.")
-    p.add_argument("--primary-cv", choices=["distance", "nonlocal-contacts"], default="distance", help="Primary umbrella CV. distance preserves historical terminal-distance behavior; nonlocal-contacts uses a reference-free smooth nonlocal contact fraction.")
-    p.add_argument("--contact-scheme", choices=["atom-pairs", "residue-balanced", "ca-pairs"], default="atom-pairs", help="How nonlocal contacts are counted. atom-pairs preserves v6 behavior; residue-balanced averages atom contacts within each residue pair so every residue pair contributes equally; ca-pairs uses only CA atom pairs.")
-    p.add_argument("--contact-atom-selection", choices=["heavy", "ca", "backbone-heavy", "sidechain-heavy", "all"], default="heavy", help="Atoms used to build the nonlocal-contact primary CV. Ignored by --contact-scheme ca-pairs.")
-    p.add_argument("--contact-min-sequence-separation", type=int, default=4, help="Minimum peptide residue-index separation for atom pairs in the nonlocal-contact CV.")
-    p.add_argument("--contact-r0-a", type=float, default=4.5, help="Smooth contact switching midpoint in Angstrom for --primary-cv nonlocal-contacts.")
-    p.add_argument("--contact-beta-a-inv", type=float, default=6.0, help="Smooth contact switching steepness in inverse Angstrom for --primary-cv nonlocal-contacts.")
-    p.add_argument("--contact-normalize", action=argparse.BooleanOptionalAction, default=True, help="Normalize nonlocal-contact CV by the number of selected pairs so the CV is approximately 0..1.")
-    p.add_argument("--contact-centers", nargs="+", type=float, default=None, help="Manual primary-CV centers for --primary-cv nonlocal-contacts. Normalized values should usually be in [0, 1].")
-    p.add_argument("--contact-k-kcal", nargs="*", type=float, default=None, help="Manual contact-CV harmonic force constants in kcal/mol/CV^2. One value is broadcast to all contact centers; default 25.")
-    p.add_argument("--contact-adaptive-min", type=float, default=0.0, help="Adaptive lower bound for normalized nonlocal-contact primary CV.")
-    p.add_argument("--contact-adaptive-max", type=float, default=0.80, help="Adaptive upper bound for normalized nonlocal-contact primary CV. Values near 1 can be unrealistically collapsed for heavy-atom contact fractions.")
-    p.add_argument("--contact-adaptive-target-spacing", type=float, default=0.15, help="Initial adaptive spacing for contact-CV windows in dimensionless CV units.")
-    p.add_argument("--contact-adaptive-min-windows", type=int, default=4, help="Legacy contact-axis minimum window count. In 2D contact x secondary workflows prefer --contact-adaptive-min-total-windows/replicas.")
-    p.add_argument("--contact-adaptive-max-windows", type=int, default=12, help="Legacy contact-axis maximum window count. In 2D contact x secondary workflows prefer --contact-adaptive-max-total-windows/replicas.")
-    p.add_argument("--contact-adaptive-min-total-windows", "--contact-adaptive-min-total-replicas", dest="contact_adaptive_min_total_windows", type=int, default=0, help="Minimum total contact-primary expanded windows/replicas after crossing with secondary-CV centers. Overrides legacy axis min when >0.")
-    p.add_argument("--contact-adaptive-max-total-windows", "--contact-adaptive-max-total-replicas", dest="contact_adaptive_max_total_windows", type=int, default=0, help="Maximum total contact-primary expanded windows/replicas after crossing with secondary-CV centers. Overrides legacy axis max when >0.")
-    p.add_argument("--contact-adaptive-k-mode", choices=["spacing", "fixed", "constant"], default="spacing", help="Contact-CV adaptive force-constant assignment. spacing uses local contact-center spacing; fixed/constant repeats --contact-adaptive-default-k-kcal.")
-    p.add_argument("--contact-adaptive-default-k-kcal", type=float, default=25.0, help="Fixed/default contact-CV k in kcal/mol/CV^2 when adaptive k is disabled or only one center is present.")
-    p.add_argument("--contact-adaptive-min-k-kcal", type=float, default=5.0, help="Lower clamp for adaptive contact-CV k in kcal/mol/CV^2.")
-    p.add_argument("--contact-adaptive-max-k-kcal", type=float, default=120.0, help="Upper clamp for adaptive contact-CV k in kcal/mol/CV^2.")
-    p.add_argument("--contact-adaptive-overlap-sigma", type=float, default=1.25, help="Overlap-sigma factor for spacing-derived contact-CV k proposals.")
-    p.add_argument("--contact-adaptive-min-sigma", type=float, default=0.02, help="Minimum contact-CV harmonic sigma used when deriving adaptive k.")
-    p.add_argument("--contact-adaptive-k-scale", type=float, default=1.0, help="Scale factor applied to spacing-derived contact-CV k proposals.")
-    p.add_argument("--contact-adaptive-hit-radius", type=float, default=0.08, help="Contact-CV hit radius for adaptive-feedback center visitation diagnostics.")
-    p.add_argument("--contact-adaptive-tight-hit-radius", type=float, default=0.04, help="Tight contact-CV hit radius for adaptive-feedback diagnostics.")
-    p.add_argument("--contact-adaptive-max-center-shift", type=float, default=0.08, help="Maximum contact-CV center shift per adaptive-feedback round.")
-    p.add_argument("--contact-adaptive-min-new-spacing", type=float, default=0.04, help="Minimum separation between contact-CV centers proposed by adaptive-feedback.")
-    p.add_argument("--contact-adaptive-coverage-gap-width", type=float, default=0.10, help="Minimum contact-CV interval width for adaptive-feedback coverage-gap additions.")
-    p.add_argument("--contact-autocalibrate-windows", action=argparse.BooleanOptionalAction, default=True, help="Before adaptive/adaptive-feedback contact runs, run a short unbiased contact-CV prescan and shrink the initial window range to a reachable first-round interval.")
-    p.add_argument("--contact-autocalibration-steps", type=int, default=None, help="Steps for contact-CV autocalibration prescan; 0 disables the prescan even when --contact-autocalibrate-windows is true. When unset, falls back to --adaptive-prescan-steps if > 0, else 5000.")
-    p.add_argument("--contact-autocalibration-timestep-fs", type=float, default=None, help="Timestep for contact-CV autocalibration prescan. When unset, falls back to --adaptive-prescan-timestep-fs, else 1.0 fs.")
-    p.add_argument("--contact-autocalibration-sample-interval", type=int, default=100, help="Steps between contact-CV samples during autocalibration.")
-    p.add_argument("--contact-autocalibration-safe-chunk-steps", type=int, default=50, help="Maximum MD chunk size during contact-CV autocalibration.")
-    p.add_argument("--contact-autocalibration-friction-per-ps", type=float, default=20.0, help="Langevin friction for contact-CV autocalibration prescan.")
-    p.add_argument("--contact-autocalibration-percentile", type=float, default=99.0, help="Observed percentile used when estimating the first-round contact adaptive upper bound.")
-    p.add_argument("--contact-autocalibration-margin", type=float, default=0.02, help="Extra contact-CV margin added above observed high-percentile values.")
-    p.add_argument("--contact-autocalibration-expand-factor", type=float, default=4.0, help="Multiplier for observed contact-CV spread when extrapolating first-round adaptive range.")
-    p.add_argument("--contact-autocalibration-max-multiple", type=float, default=4.0, help="Maximum multiple of observed contact-CV max used as a first-round adaptive upper-bound candidate.")
-    p.add_argument("--contact-autocalibration-min-span", type=float, default=0.10, help="Minimum first-round contact adaptive span after autocalibration.")
-    p.add_argument("--contact-autocalibration-required", action=argparse.BooleanOptionalAction, default=False, help="If true, abort when contact-CV autocalibration fails instead of falling back to configured bounds.")
-    p.add_argument("--contact-pair-warning-threshold", type=int, default=5000, help="Warn when the nonlocal-contact CV contains more atom pairs than this threshold.")
-    p.add_argument("--self-test-primary-cv-force", action="store_true", help="Construct and evaluate the selected primary-CV OpenMM force in a tiny test Context, then exit. Currently most useful for validating --primary-cv nonlocal-contacts on a given OpenMM installation.")
-    p.add_argument("--secondary-cv", choices=["none", "alpha", "beta", "alpha-coil-beta", "acb", "rama-map", "rama-regions", "rama", "ramachandran", "ramachandran-regions", "custom"], default="none", help="Optional second umbrella CV based on smooth backbone phi/psi secondary-structure content. alpha and beta are 0..1 content scores; alpha-coil-beta/acb is a signed alpha-minus-beta coordinate; rama-map is an explicit beta/PPII/right-alpha/left-alpha Ramachandran basin map; rama-regions is the older signed soft region coordinate; custom uses --secondary-cv-phi0-deg/--secondary-cv-psi0-deg.")
-    p.add_argument("--secondary-cv-center", type=float, default=None, help="Secondary-CV target for all windows when --secondary-cv-centers is not provided. For alpha/beta/custom this is roughly 0..1; for alpha-coil-beta, rama-map, and rama-regions it is -1..1 and defaults internally to 0.0 if no center list is supplied.")
-    p.add_argument("--secondary-cv-centers", nargs="*", type=float, default=None, help="Secondary-CV targets. One value restrains all distance windows to that target; multiple values create a 2D grid by crossing every distance window with every secondary-CV target. For alpha-coil-beta use e.g. -0.8 0.0 0.8; for rama-map use the default basin centers -1 -0.333333 0.333333 1; for rama-regions use e.g. -1 -0.5 0 0.5 1.")
-    p.add_argument("--secondary-cv-k-kcal", type=float, default=50.0, help="Fixed secondary-CV harmonic force constant in kcal/mol/CV^2, or the one-center fallback when --secondary-cv-k-mode spacing is requested. This is not per-Angstrom; the CV is dimensionless.")
-    p.add_argument("--secondary-cv-k-mode", choices=["fixed", "constant", "spacing", "adaptive"], default="fixed", help="How to assign secondary-CV force constants. fixed/constant repeats --secondary-cv-k-kcal; spacing/adaptive mirrors the primary CV adaptive-k formula in dimensionless CV units using secondary-CV center spacing.")
-    p.add_argument("--secondary-cv-adaptive-overlap-sigma", type=float, default=0.0, help="Spacing/adaptive secondary-CV k parameter: sigma_CV ~= spacing/this value. 0 = reuse --adaptive-overlap-sigma. Larger values make stronger secondary-CV k.")
-    p.add_argument("--secondary-cv-adaptive-min-k-kcal", type=float, default=0.0, help="Minimum spacing/adaptive secondary-CV k in kcal/mol/CV^2.")
-    p.add_argument("--secondary-cv-adaptive-max-k-kcal", type=float, default=500.0, help="Maximum spacing/adaptive secondary-CV k in kcal/mol/CV^2.")
-    p.add_argument("--secondary-cv-adaptive-min-sigma", type=float, default=0.02, help="Lower bound on spacing-derived secondary-CV sigma before computing kBT/sigma^2; prevents extreme k for nearly duplicate centers.")
-    p.add_argument("--secondary-cv-adaptive-k-scale", type=float, default=1.0, help="Extra multiplier for spacing/adaptive secondary-CV k values after kBT/sigma^2.")
-    p.add_argument("--secondary-cv-sigma-deg", type=float, default=35.0, help="Angular width in degrees for the smooth phi/psi content score.")
-    p.add_argument("--secondary-cv-phi0-deg", type=float, default=-60.0, help="Custom secondary-CV phi target in degrees, used with --secondary-cv custom.")
-    p.add_argument("--secondary-cv-psi0-deg", type=float, default=-45.0, help="Custom secondary-CV psi target in degrees, used with --secondary-cv custom.")
-    p.add_argument("--secondary-cv-force-group", type=int, default=29, help="OpenMM force group for the optional secondary-structure CV bias. Must be 0..31; default 29 avoids the primary umbrella group 31 and restraint group 30.")
+    # Primary / secondary CV selectors
+    p.add_argument("--cv1", choices=["distance", "contacts", "nonlocal-contacts"], default=None,
+                   help="Primary CV: distance or contacts.")
+    p.add_argument("--cv2", choices=["none", "alpha", "beta", "alpha-coil-beta", "acb",
+                                      "rama-map", "rama-regions", "rama", "ramachandran",
+                                      "ramachandran-regions", "custom"], default=None,
+                   help="Secondary CV for 2D workflow. Default centers inserted automatically.")
+    # Expert atom override
+    p.add_argument("--cv-atom1", default=None, help="Explicit primary CV atom, e.g. 1:CA.")
+    p.add_argument("--cv-atom2", default=None, help="Explicit primary CV atom, e.g. -1:CA.")
 
-    # Contact-CV frontier probing during adaptive-feedback.
-    p.add_argument("--contact-frontier-enabled", action=argparse.BooleanOptionalAction, default=False, help="Enable contact-CV frontier probing during adaptive-feedback.")
-    p.add_argument("--contact-frontier-percentile", type=float, default=99.0)
-    p.add_argument("--contact-frontier-margin", type=float, default=0.02)
-    p.add_argument("--contact-frontier-min-span", type=float, default=0.10)
-    p.add_argument("--contact-frontier-probe-count", type=int, default=2)
-    p.add_argument("--contact-frontier-probe-spacing", type=float, default=0.05)
-    p.add_argument("--contact-frontier-max-probe-offset", type=float, default=0.15)
-    p.add_argument("--contact-disable-gapfill-above-unvalidated-frontier", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--contact-frontier-confirm-rounds", type=int, default=2)
-    p.add_argument("--contact-frontier-min-hit-fraction", type=float, default=0.02)
-    p.add_argument("--contact-frontier-unreachable-deficit", type=float, default=0.08)
-    p.add_argument("--contact-frontier-by-secondary-slice", action=argparse.BooleanOptionalAction, default=True)
+    # Contact CV physics (contact-specific, no distance analog)
+    p.add_argument("--contact-scheme", choices=["atom-pairs", "residue-balanced", "ca-pairs"],
+                   default="atom-pairs")
+    p.add_argument("--contact-atom-selection",
+                   choices=["heavy", "ca", "backbone-heavy", "sidechain-heavy", "all"],
+                   default="heavy")
+    p.add_argument("--contact-min-sequence-separation", type=int, default=4)
+    p.add_argument("--contact-r0-a", type=float, default=4.5,
+                   help="Contact switching midpoint in Å.")
+    p.add_argument("--contact-beta-a-inv", type=float, default=6.0,
+                   help="Contact switching steepness in 1/Å.")
+    p.add_argument("--contact-normalize", action=argparse.BooleanOptionalAction, default=True)
+
+    # CV1 adaptive — unified regardless of CV type
+    p.add_argument("--cv1-range-min", type=float, default=0.0,
+                   help="Adaptive lower bound (Å for distance, dimensionless for contacts). 0 = auto.")
+    p.add_argument("--cv1-range-max", type=float, default=0.0,
+                   help="Adaptive upper bound. 0 = auto.")
+    p.add_argument("--cv1-target-spacing", type=float, default=0.0,
+                   help="Initial adaptive window spacing (units match CV1). 0 = auto.")
+    p.add_argument("--cv1-k-default", type=float, default=0.0,
+                   help="Default/fixed CV1 force constant. 0 = auto (spacing-derived).")
+    p.add_argument("--cv1-k-min", type=float, default=0.0,
+                   help="Lower clamp for adaptive CV1 k. 0 = auto.")
+    p.add_argument("--cv1-k-max", type=float, default=0.0,
+                   help="Upper clamp for adaptive CV1 k. 0 = auto.")
+    p.add_argument("--cv1-k-mode", choices=["spacing", "fixed", "constant"], default="spacing",
+                   help="CV1 force-constant assignment mode.")
+    p.add_argument("--cv1-adaptive-overlap-sigma", type=float, default=1.25,
+                   help="Overlap-sigma for spacing-derived CV1 k.")
+    p.add_argument("--cv1-prescan", action=argparse.BooleanOptionalAction, default=True,
+                   help="Run unbiased CV1 prescan/autocalibration before adaptive runs.")
+    p.add_argument("--cv1-prescan-steps", type=int, default=0,
+                   help="Steps for CV1 prescan. 0 = auto (5000).")
+    p.add_argument("--cv1-frontier", action=argparse.BooleanOptionalAction, default=False,
+                   help="Enable CV1 frontier probing during adaptive-feedback.")
+    p.add_argument("--cv1-frontier-probe-count", type=int, default=2,
+                   help="Number of frontier probe windows.")
+
+    # CV2 adaptive — secondary CV parameters
+    p.add_argument("--cv2-centers", nargs="*", type=float, default=None,
+                   help="Secondary CV targets. One value = all windows same; multiple = 2D grid.")
+    p.add_argument("--cv2-k-default", type=float, default=50.0,
+                   help="Default CV2 force constant in kcal/mol/CV².")
+    p.add_argument("--cv2-k-mode", choices=["fixed", "constant", "spacing", "adaptive"],
+                   default="fixed")
+    p.add_argument("--cv2-k-min", type=float, default=0.0,
+                   help="Min adaptive CV2 k. 0 = no lower clamp.")
+    p.add_argument("--cv2-k-max", type=float, default=500.0,
+                   help="Max adaptive CV2 k.")
+    p.add_argument("--cv2-adaptive-overlap-sigma", type=float, default=0.0,
+                   help="Overlap-sigma for spacing-derived CV2 k. 0 = reuse cv1 value.")
+    p.add_argument("--cv2-k-scale", type=float, default=1.0,
+                   help="Extra multiplier for spacing/adaptive CV2 k.")
+    # Custom secondary CV angles
+    p.add_argument("--cv2-sigma-deg", type=float, default=35.0,
+                   help="Angular width in degrees for phi/psi content score.")
+    p.add_argument("--cv2-phi0-deg", type=float, default=-60.0,
+                   help="Custom CV2 phi target in degrees (--cv2 custom).")
+    p.add_argument("--cv2-psi0-deg", type=float, default=-45.0,
+                   help="Custom CV2 psi target in degrees (--cv2 custom).")
+
+    # Debug
+    p.add_argument("--self-test-primary-cv-force", action="store_true",
+                   help="Test primary CV OpenMM force and exit.")
 
 
 def _add_window_args(p: argparse.ArgumentParser) -> None:
-    """Add umbrella window layout, adaptive-feedback, and US pulling arguments."""
-    p.add_argument("--us-starting-structure-mode", choices=["pull", "npt", "equilibrated", "same", "none"], default="pull", help="How to generate initial coordinates for each umbrella window. 'pull' performs a pre-production CV pulling walk and uses the resulting window conformers; 'npt' starts every replica from the same NPT state.")
-    p.add_argument("--us-pull-steps-per-window", type=int, default=5000, help="Plain Langevin steps used to relax/pull into each umbrella starting structure before GaMD calibration.")
-    p.add_argument("--us-pull-k-kcal-a2", type=float, default=5.0, help="Harmonic CV force constant for generating US starting conformers, in kcal/mol/A^2. This is only for pre-production pulling, not the production umbrella k values. In contact mode this legacy value is interpreted as kcal/mol/CV^2 unless contact-specific options override it.")
-    p.add_argument("--contact-us-pull-k-kcal", type=float, default=None, help="Contact-mode-only pre-production starting-pull k in kcal/mol/CV^2. Overrides --us-pull-k-kcal-a2 for --primary-cv nonlocal-contacts.")
-    p.add_argument("--contact-us-pull-max-k-kcal", type=float, default=20.0, help="Contact-mode safety cap for legacy --us-pull-k-kcal-a2 when --contact-us-pull-k-kcal is not set.")
-    p.add_argument("--us-pull-timestep-fs", type=float, default=0.0, help="Pre-production US pulling timestep. 0 = min(--timestep-fs, 2 fs).")
-    p.add_argument("--contact-us-pull-timestep-fs", type=float, default=1.0, help="Maximum timestep for contact-mode pre-production starting pulls. Contact pulls are capped to this value for stability.")
-    p.add_argument("--contact-us-pull-ramp-stages", type=int, default=8, help="Number of r0/k ramp stages for contact-mode primary-CV starting pulls.")
-    p.add_argument("--contact-us-pull-safe-chunk-steps", type=int, default=100, help="Maximum run_steps_safely chunk size for contact-mode starting pulls.")
-    p.add_argument("--contact-us-pull-min-friction-per-ps", type=float, default=20.0, help="Minimum Langevin friction used during contact-mode starting pulls.")
-    p.add_argument("--contact-us-pull-minimize-first-ramp", action=argparse.BooleanOptionalAction, default=True, help="Minimize briefly at the first contact primary-CV ramp stage.")
-    p.add_argument("--us-pull-friction-per-ps", type=float, default=10.0, help="Langevin friction used only for pre-production US starting-structure pulling.")
-    p.add_argument("--us-pull-minimize-iterations", type=int, default=100, help="Energy-minimization iterations at each pulled umbrella starting center.")
-    p.add_argument("--us-2d-start-relax-mode", choices=["auto", "staged", "off", "single", "ramp"], default="auto", help="For secondary-CV windows, pre-relax starting structures with distance-only pulling followed by a gradual secondary-CV ramp. auto/staged enables this when CV2 is active; off/single preserves one-stage behavior.")
-    p.add_argument("--us-2d-start-distance-fraction", type=float, default=0.50, help="Fraction of --us-pull-steps-per-window spent relaxing the distance CV before ramping the secondary CV in staged 2D starting-structure preparation.")
-    p.add_argument("--us-2d-start-secondary-ramp-stages", type=int, default=3, help="Number of secondary-CV force-ramp stages after the distance-only stage for 2D starting structures.")
-    p.add_argument("--us-2d-start-minimize-each-ramp", action="store_true", help="Minimize briefly at each secondary-CV ramp stage during 2D starting-structure preparation.")
-    p.add_argument("--us-2d-start-secondary-warn-delta", type=float, default=0.35, help="Warn if the starting secondary CV is this far from its target after 2D starting-structure preparation.")
-    p.add_argument("--us-2d-start-secondary-warn-bias-kcal", type=float, default=1.0, help="Warn if the starting secondary-CV bias exceeds this value in kcal/mol.")
-    p.add_argument("--us-2d-start-secondary-bad-bias-kcal", type=float, default=5.0, help="Mark a starting structure bad if the starting secondary-CV bias exceeds this value in kcal/mol.")
-    p.add_argument("--us-2d-start-secondary-k-pull-scale", type=float, default=1.0, help="Multiply the secondary-CV force constant by this factor during the 2D starting-structure pull ramp (production k is restored before saving). Values >1 push harder in fewer steps; try 5.0 with --us-2d-start-distance-fraction 0.05 to keep wall time near the 1D baseline.")
-    p.add_argument("--window-mode", choices=["adaptive", "manual", "adaptive-feedback", "adaptive-production", "double-adaptive"], default="adaptive", help="manual: use --windows-a; adaptive: choose initial windows; adaptive-feedback: run short automatic feedback round(s), then a final full production run with the proposed fixed windows. adaptive-production: run epoch-based production, add/retire windows between epochs, then finish with a frozen final phase. double-adaptive: run adaptive-feedback pilots only, hand the proposal to adaptive-production, then finish with its frozen final phase.")
-    p.add_argument("--double-adaptive", action="store_true", help="Alias for --window-mode double-adaptive: adaptive-feedback pilots -> adaptive-production epochs/topups -> frozen final.")
-    p.add_argument("--adaptive-feedback-rounds", type=int, default=3, help="For --window-mode adaptive-feedback: number of short pilot refinement rounds before the final full production run. Default 3: usually enough for one broad diagnosis, one correction, and one validation pass; early convergence can skip remaining rounds.")
-    p.add_argument("--adaptive-feedback-pilot-fraction", type=float, default=0.05, help="For --window-mode adaptive-feedback: pilot GaMD production fraction per refinement round relative to --gamd-production-steps. Default 0.05 = 1/20 of final production.")
-    p.add_argument("--adaptive-feedback-validation-fraction", type=float, default=0.10, help="For --window-mode adaptive-feedback with more than one round: length of the last pre-production validation pilot as a fraction of --gamd-production-steps. The historical default is 0.10; set 0.05 to make it the same length as ordinary pilots, or use --adaptive-feedback-validation-steps 0 to disable the longer validation pass.")
-    p.add_argument("--adaptive-feedback-validation-steps", type=int, default=-1, help="Exact step count for the last pre-production adaptive validation round. -1 uses --adaptive-feedback-validation-fraction, 0 disables the longer validation pass and uses ordinary pilot length, >0 uses that exact number of steps.")
-    p.add_argument("--adaptive-feedback-target-overlap", type=float, default=0.25, help="Target neighboring-window CV histogram overlap for adaptive-feedback proposals; pairs below this are refined, and clearly over-resolved high-overlap/high-exchange regions can be reduced. Exchange/replica-reduction target is fixed at 30% acceptance to avoid extra flags.")
-    p.add_argument("--adaptive-feedback-bootstrap-samples", type=int, default=50, help="Bootstrap resamples for adaptive-feedback overlap confidence intervals used in conservative replica pruning.")
-    p.add_argument("--adaptive-window-aggressiveness", choices=["conservative", "balanced", "aggressive", "very-aggressive"], default="balanced", help="Bias automatic/adaptive-feedback window selection. balanced preserves old behavior; aggressive/very-aggressive start with wider spacing, add fewer windows, prune more readily, and tolerate lower bypass overlap to minimize replica count.")
-    p.add_argument("--adaptive-window-count-weight", type=float, default=-1.0, help="Optional override for the adaptive-feedback score penalty per window. Negative = use the value implied by --adaptive-window-aggressiveness.")
-    p.add_argument("--adaptive-secondary-cv", choices=["auto", "fixed"], default="auto", help="For adaptive-feedback with --secondary-cv: auto adapts the secondary-CV center ladder as a second dimension; fixed keeps the user-provided secondary center(s) unchanged.")
-    p.add_argument("--windows-a", nargs="+", type=float, default=[5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 21], help="Manual umbrella centers in Angstrom.")
-    p.add_argument("--window-k-kcal-a2", nargs="*", type=float, default=None, help="Per-window force constants in kcal/mol/A^2.")
-    p.add_argument("--windows-2d-csv", default=None, help="Explicit per-window 2D umbrella table. Compatible with adaptive_feedback_explicit_window_candidates.csv. Generic columns primary_cv_center/primary_cv_k_kcal plus secondary_cv_center/secondary_cv_k_kcal_mol are accepted; legacy distance_center_A/distance_k_kcal_mol_A2 remain supported. Bypasses rectangular cross-product expansion.")
-    p.add_argument("--sparse-2d-patches-enabled", action=argparse.BooleanOptionalAction, default=True, help="Enable generic sparse local 2D midpoint patches during adaptive-feedback. Works for any primary CV accepted by the primary-CV machinery; contact CVs get contact-specific units/bounds/K defaults.")
-    p.add_argument("--contact-sparse-2d-patches-enabled", action=argparse.BooleanOptionalAction, default=True, help="Contact-CV specific gate for sparse local 2D patches. This is checked in addition to --sparse-2d-patches-enabled when the primary CV is nonlocal-contacts.")
-    p.add_argument("--explicit-2d-window-schema", choices=["auto", "generic", "distance"], default="auto", help="Accepted schema for explicit 2D window CSVs. auto/generic accept primary_cv_* contact/distance-neutral fields and legacy distance_* aliases; distance documents the old alias names.")
-    p.add_argument("--explicit-2d-exchange-neighbor-k", type=int, default=2, help="For --windows-2d-csv with --exchange-mode neighbor: add up to this many normalized k-nearest geometry edges per window in addition to row/column edges.")
-    p.add_argument("--explicit-2d-exchange-radius", type=float, default=1.65, help="Normalized distance cutoff for extra k-nearest explicit-2D neighbor edges.")
-    p.add_argument("--explicit-2d-exchange-slots", type=int, default=4, help="Round-robin slots for explicit-2D neighbor graph exchange scheduling; higher values reduce simultaneous edge attempts per interval.")
-    p.add_argument("--default-window-k-kcal-a2", type=float, default=1.0)
-    p.add_argument("--n-windows", type=int, default=0, help="Exact adaptive window count; 0 = choose from target spacing.")
-    p.add_argument("--adaptive-target-spacing-a", type=float, default=2)
-    p.add_argument("--adaptive-min-windows", type=int, default=4, help="Legacy primary-axis minimum window count for adaptive distance windows. In 2D workflows prefer --adaptive-min-total-windows/replicas.")
-    p.add_argument("--adaptive-max-windows", type=int, default=32, help="Legacy primary-axis maximum window count for adaptive distance windows. In 2D workflows prefer --adaptive-max-total-windows/replicas.")
-    p.add_argument("--adaptive-min-total-windows", "--adaptive-min-total-replicas", dest="adaptive_min_total_windows", type=int, default=0, help="Minimum total expanded windows/replicas after crossing primary and secondary CV centers. 0 disables.")
-    p.add_argument("--adaptive-max-total-windows", "--adaptive-max-total-replicas", dest="adaptive_max_total_windows", type=int, default=0, help="Maximum total expanded windows/replicas after crossing primary and secondary CV centers. 0 disables.")
-    p.add_argument("--adaptive-2d-max-local-patches", type=int, default=12, help="Maximum sparse local 2D midpoint patch windows to add per adaptive-feedback proposal.")
-    p.add_argument("--adaptive-2d-min-edge-samples", type=int, default=5, help="Minimum per-window samples before a 2D local edge diagnostic is trusted.")
-    p.add_argument("--adaptive-window-min-a", type=float, default=0.0, help="Override adaptive lower bound in A; <=0 means automatic.")
-    p.add_argument("--adaptive-window-max-a", type=float, default=0.0, help="Override adaptive upper bound in A; <=0 means automatic.")
-    p.add_argument("--adaptive-extension-fraction", type=float, default=0.95)
-    p.add_argument("--adaptive-compact-floor-a", type=float, default=3.5)
-    p.add_argument("--adaptive-k-mode", choices=["spacing", "constant"], default="spacing")
-    p.add_argument("--adaptive-overlap-sigma", type=float, default=1.25)
-    p.add_argument("--adaptive-min-k-kcal-a2", type=float, default=0.05)
-    p.add_argument("--adaptive-max-k-kcal-a2", type=float, default=20.0)
-    p.add_argument("--adaptive-prescan-steps", type=int, default=0)
-    p.add_argument("--adaptive-prescan-timestep-fs", type=float, default=1.0)
-    p.add_argument("--adaptive-prescan-margin-a", type=float, default=1.0)
-    p.add_argument("--umbrella-force-group", type=int, default=31)
+    # Mode
+    p.add_argument("--window-mode",
+                   choices=["adaptive", "manual", "adaptive-feedback",
+                             "adaptive-production", "double-adaptive"],
+                   default="adaptive")
 
-    # Stateful adaptive-feedback region classification and memory.
-    p.add_argument("--adaptive-feedback-region-state-enabled", action=argparse.BooleanOptionalAction, default=False, help="Enable stateful adaptive-feedback region classification and memory.")
-    p.add_argument("--adaptive-feedback-region-memory-decay", type=float, default=0.5)
-    p.add_argument("--adaptive-feedback-min-effective-samples", type=int, default=50)
-    p.add_argument("--adaptive-feedback-probe-unvalidated-regions", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--adaptive-feedback-prune-overscanned-regions", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--adaptive-feedback-extend-undersampled-regions", action=argparse.BooleanOptionalAction, default=True)
+    # Adaptive-feedback tuning
+    p.add_argument("--aggressiveness",
+                   choices=["conservative", "balanced", "aggressive", "very-aggressive"],
+                   default="balanced", help="Window selection bias.")
+    p.add_argument("--adaptive-rounds", type=int, default=3,
+                   help="Pilot refinement rounds before final production.")
+    p.add_argument("--pilot-fraction", type=float, default=0.05,
+                   help="Pilot steps as fraction of production-steps per round.")
+    p.add_argument("--validation-steps", type=int, default=-1,
+                   help="Last pre-production validation steps. -1 = 1/10 of production-steps.")
+    p.add_argument("--target-overlap", type=float, default=0.25,
+                   help="Target neighboring-window CV histogram overlap.")
+    p.add_argument("--sparse-2d", action=argparse.BooleanOptionalAction, default=True,
+                   help="Enable sparse local 2D midpoint patches during adaptive-feedback.")
+    p.add_argument("--max-2d-patches", type=int, default=12,
+                   help="Max sparse 2D patch windows per adaptive-feedback proposal.")
 
-    # Epoch-based adaptive production. Unlike adaptive-feedback, these rounds
-    # are real production epochs: each epoch runs a fixed window table, then the
-    # registry may add/retire states before the next epoch. Final production is
-    # frozen for clean downstream analysis.
-    p.add_argument("--adaptive-production-epochs", type=int, default=3, help="For --window-mode adaptive-production: maximum number of adaptive production epochs before the frozen final phase.")
-    p.add_argument("--adaptive-production-epoch-steps", type=int, default=0, help="Steps per adaptive-production epoch. 0 = auto, roughly 1/20 of --gamd-production-steps.")
-    p.add_argument("--adaptive-production-final-steps", type=int, default=0, help="Frozen final-production steps after adaptive epochs. 0 = reuse --gamd-production-steps.")
-    p.add_argument("--adaptive-production-min-samples", type=int, default=50, help="Minimum per-state samples before using an edge for adaptive-production midpoint insertion.")
-    p.add_argument("--adaptive-production-retire-min-samples", type=int, default=200, help="Minimum samples before a state is eligible for optional adaptive-production retirement.")
-    p.add_argument("--adaptive-production-target-overlap", type=float, default=0.25, help="Target local histogram overlap for adaptive-production edge health.")
-    p.add_argument("--adaptive-production-min-exchange", type=float, default=0.08, help="Minimum local exchange acceptance for adaptive-production edge health when exchange attempts are available.")
-    p.add_argument("--adaptive-production-max-new-windows-per-epoch", type=int, default=4, help="Maximum midpoint windows added per adaptive-production epoch.")
-    p.add_argument("--adaptive-production-retire-converged", action=argparse.BooleanOptionalAction, default=False, help="Allow adaptive-production to retire graph-noncritical converged states. Default false: first implementation only adds windows and extends sampling.")
-    p.add_argument("--adaptive-production-max-gamd-boost-sd-kcal-mol", type=float, default=6.0, help="GaMD boost SD warning threshold used by adaptive-production diagnostics.")
-    p.add_argument("--adaptive-production-use-epoch-samples-for-mbar", action=argparse.BooleanOptionalAction, default=False, help="Record intent to include adaptive epoch samples in post-hoc MBAR. Default false keeps final-only analysis conservative.")
-    p.add_argument("--adaptive-production-resume", action=argparse.BooleanOptionalAction, default=False, help="Resume adaptive-production from adaptive_production/state_registry.json and the driver summary when available.")
-    p.add_argument("--adaptive-production-write-union-mbar-inputs", action=argparse.BooleanOptionalAction, default=True, help="After the frozen final phase, reconstruct union-state post-hoc MBAR input arrays from scalar traces and the adaptive registry.")
-    p.add_argument("--adaptive-production-run-union-mbar-analysis", action=argparse.BooleanOptionalAction, default=True, help="After writing union-state MBAR input arrays, try to run a PyMBAR state-free-energy/overlap analysis and write adaptive_union_mbar_analysis.* outputs.")
-    p.add_argument("--adaptive-production-union-fes-bins", default="80,40", help="Diagnostic histogram bins for adaptive union analysis, formatted as primary_bins[,secondary_bins]. This is a coverage diagnostic, not the final publication PMF.")
-    p.add_argument("--adaptive-production-write-action-reports", action=argparse.BooleanOptionalAction, default=True, help="Write per-epoch adaptive_epoch_actions.json/md reports explaining add/extend/retire decisions.")
-    p.add_argument("--adaptive-production-final-connectivity-required", action=argparse.BooleanOptionalAction, default=True, help="Require the final active window geometry graph to be connected before launching the frozen final phase.")
-    p.add_argument("--adaptive-production-final-min-samples-per-state", type=int, default=100, help="Quality-gate minimum final/extension sample rows required per active state before reporting the frozen final phase as analysis-ready.")
-    p.add_argument("--adaptive-production-quality-min-primary-coverage-fraction", type=float, default=0.25, help="Quality-gate warning threshold for diagnostic primary-CV histogram coverage fraction after union analysis.")
-    p.add_argument("--adaptive-production-quality-hard-fail", action=argparse.BooleanOptionalAction, default=False, help="Abort the run if the post-final adaptive-production quality gate reports error or needs_more_sampling. Default false writes reports but does not abort.")
-    p.add_argument("--adaptive-production-final-quality-extension-rounds", type=int, default=0, help="Number of optional frozen-final extension rounds to run if the pre-union quality gate reports needs_more_sampling. These rounds keep the final window set frozen.")
-    p.add_argument("--adaptive-production-final-quality-extension-steps", type=int, default=0, help="Steps per frozen-final quality-extension round. 0 = reuse --adaptive-production-final-steps.")
-    p.add_argument("--adaptive-production-propagate-seed-bank", action=argparse.BooleanOptionalAction, default=True, help="After each adaptive-production epoch, build a GENPEPT-compatible seed bank from final epoch PDBs and use it to initialize the next epoch/final phase. This preserves conformational discoveries between epoch workers without mutating OpenMM contexts in place.")
-    p.add_argument("--adaptive-production-seed-bank-max-per-state", type=int, default=1, help="Maximum number of final PDB seeds retained per persistent adaptive-production state in each epoch seed bank.")
-    p.add_argument("--adaptive-production-allocation-scheduler", action=argparse.BooleanOptionalAction, default=True, help="Use per-state adaptive step allocations after the first adaptive-production epoch. Runs a short all-state baseline plus top-up subset runs for high-priority states.")
-    p.add_argument("--adaptive-production-global-shared-gamd", action=argparse.BooleanOptionalAction, default=True, help="For adaptive-production GaMD runs, calibrate shared GaMD once and reuse the same setup for all epochs, scheduled topups, final, and final extensions. Default true.")
-    p.add_argument("--adaptive-production-epoch-step-budget", type=int, default=0, help="Total approximate MD-step budget per adaptive-production epoch across active states. 0 = infer from active state count and --adaptive-production-epoch-steps.")
-    p.add_argument("--adaptive-production-min-state-steps", type=int, default=0, help="Minimum baseline steps per active state in adaptive-production scheduled epochs. 0 = min(epoch_steps, max(1000, epoch_steps/4)).")
-    p.add_argument("--adaptive-production-max-state-steps", type=int, default=0, help="Maximum requested steps for any single active state in a scheduled adaptive-production epoch. 0 = 4x baseline epoch steps.")
-    p.add_argument("--adaptive-production-new-state-steps", type=int, default=0, help="Requested steps for newly created states in the next scheduled epoch. 0 = max(epoch_steps, max_state_steps/2).")
-    p.add_argument("--adaptive-production-final-allocation-scheduler", action=argparse.BooleanOptionalAction, default=True, help="Before frozen final production, write a final per-state allocation schedule and use it for optional final extension planning. The first final run remains all-state for clean connectivity.")
-    p.add_argument("--adaptive-production-final-step-budget", type=int, default=0, help="Approximate total final clean step budget across active states for the final allocation schedule. 0 = infer from active state count and --adaptive-production-final-steps.")
-    p.add_argument("--adaptive-production-state-aware-seed-filtering", action=argparse.BooleanOptionalAction, default=True, help="For scheduled adaptive-production segments, filter the propagated seed bank to the closest seeds for the states present in that segment.")
-    p.add_argument("--adaptive-production-scheduled-final-segments", action=argparse.BooleanOptionalAction, default=True, help="Use the final allocation schedule to run a frozen all-state baseline plus top-up subset final segments instead of one uniform final run.")
-    p.add_argument("--adaptive-production-convergence-min-samples-per-state", type=int, default=50, help="Minimum epoch sample rows per active state required before adaptive-production may stop early and enter the frozen final phase.")
-    p.add_argument("--adaptive-production-convergence-max-weak-edges", type=int, default=0, help="Maximum number of weak overlap/exchange edges allowed by the adaptive-production stop gate. Default 0 is conservative.")
-    p.add_argument("--adaptive-production-convergence-allow-extend-actions", action=argparse.BooleanOptionalAction, default=True, help="Allow adaptive production to stop when only extend/no-op actions remain and the stop gate passes. Add/split actions always force another adaptive epoch.")
-    p.add_argument("--adaptive-production-require-convergence-before-final", action=argparse.BooleanOptionalAction, default=False, help="Abort instead of entering frozen final production when the adaptive stop gate has not passed by the last adaptive epoch.")
-    p.add_argument("--adaptive-production-total-md-pool-ns", type=float, default=0.0, help="Maximum aggregate MD simulation time, in ns, available to the whole adaptive-production campaign. This is a pool over all states/replicas: consumed ns = n_states * steps * timestep_fs / 1e6. 0 disables the global pool cap.")
-    p.add_argument("--adaptive-production-final-pool-fraction", type=float, default=0.50, help="When --adaptive-production-total-md-pool-ns is set, reserve roughly this fraction of the remaining pool for frozen final production. Default 0.50.")
-    p.add_argument("--adaptive-production-min-final-pool-ns", type=float, default=0.0, help="Minimum aggregate ns to reserve for frozen final production when using --adaptive-production-total-md-pool-ns. 0 disables an absolute final reserve.")
-    p.add_argument("--adaptive-production-pool-hard-stop", action=argparse.BooleanOptionalAction, default=True, help="If the total MD pool is exhausted, stop launching new adaptive/final segments. With --no-adaptive-production-pool-hard-stop, the pool only reports warnings.")
-    p.add_argument("--adaptive-production-context-reuse", action=argparse.BooleanOptionalAction, default=False, help="Request experimental in-process OpenMM context reuse across adaptive-production epochs. Current package writes a readiness report and safely falls back to epoch-worker mode unless --adaptive-production-context-reuse-require is set.")
-    p.add_argument("--adaptive-production-context-reuse-require", action=argparse.BooleanOptionalAction, default=False, help="Abort if true in-process adaptive-production context reuse is not available. Useful for testing future v12 workers; default false keeps safe epoch-worker fallback.")
-    p.add_argument("--adaptive-production-context-reuse-mode", choices=["off", "checkpoint-handoff", "inprocess-experimental"], default="off", help="Requested context-reuse strategy. off is current safe default; checkpoint-handoff/inprocess-experimental currently produce readiness diagnostics and fall back unless required.")
+    # Region memory
+    p.add_argument("--region-memory", action=argparse.BooleanOptionalAction, default=False,
+                   help="Enable stateful region classification and memory.")
+    p.add_argument("--region-memory-decay", type=float, default=0.5)
+    p.add_argument("--region-probe-unvalidated", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--region-prune-overscanned", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--region-extend-undersampled", action=argparse.BooleanOptionalAction, default=True)
 
-    # Explicit 2D window CSV column-name overrides.
-    p.add_argument("--explicit-2d-primary-cv-mode-column", default="primary_cv_mode", help="Column name for primary-CV mode in explicit 2D window CSV.")
+    # Manual / explicit window tables
+    p.add_argument("--windows-a", nargs="+", type=float,
+                   default=[5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 21],
+                   help="Manual umbrella centers in Å (--window-mode manual).")
+    p.add_argument("--window-k-kcal-a2", nargs="*", type=float, default=None)
+    p.add_argument("--windows-2d-csv", default=None,
+                   help="Explicit per-window 2D umbrella table CSV.")
+    p.add_argument("--explicit-2d-window-schema", choices=["auto", "generic", "distance"],
+                   default="auto")
+
+    # Explicit 2D CSV column-name overrides (data-format, keep for compatibility)
+    p.add_argument("--explicit-2d-primary-cv-mode-column", default="primary_cv_mode")
     p.add_argument("--explicit-2d-primary-center-column", default="primary_cv_center")
     p.add_argument("--explicit-2d-primary-k-column", default="primary_cv_k_kcal")
     p.add_argument("--explicit-2d-secondary-cv-mode-column", default="secondary_cv_mode")
     p.add_argument("--explicit-2d-secondary-center-column", default="secondary_cv_center")
     p.add_argument("--explicit-2d-secondary-k-column", default="secondary_cv_k_kcal_mol")
 
+    # Epoch-based adaptive production (ap_* prefix)
+    p.add_argument("--ap-epochs", type=int, default=3,
+                   help="Max adaptive-production epochs before frozen final.")
+    p.add_argument("--ap-epoch-steps", type=int, default=0,
+                   help="Steps per epoch. 0 = auto (~1/20 of production-steps).")
+    p.add_argument("--ap-final-steps", type=int, default=0,
+                   help="Frozen final steps. 0 = reuse production-steps.")
+    p.add_argument("--ap-resume", action=argparse.BooleanOptionalAction, default=False,
+                   help="Resume adaptive-production from state_registry.json.")
+    p.add_argument("--ap-include-epoch-samples", action=argparse.BooleanOptionalAction,
+                   default=False, help="Include epoch samples in post-hoc MBAR.")
+    p.add_argument("--ap-write-mbar-inputs", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--ap-run-mbar", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--ap-fes-bins", default="80,40",
+                   help="Diagnostic histogram bins: primary[,secondary].")
+    p.add_argument("--ap-seed-bank", action=argparse.BooleanOptionalAction, default=True,
+                   help="Propagate seed bank between epochs.")
+    p.add_argument("--ap-seed-bank-max", type=int, default=1,
+                   help="Max seeds per state per epoch.")
+    p.add_argument("--ap-target-overlap", type=float, default=0.25)
+    p.add_argument("--ap-min-exchange", type=float, default=0.08)
+    p.add_argument("--ap-min-samples", type=int, default=50)
+    p.add_argument("--ap-retire-min-samples", type=int, default=200)
+    p.add_argument("--ap-max-new-windows", type=int, default=4)
+    p.add_argument("--ap-retire-converged", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--ap-gamd-boost-sd-warn", type=float, default=6.0)
+    p.add_argument("--ap-write-reports", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--md-budget-ns", type=float, default=0.0,
+                   help="Max aggregate MD simulation time in ns. 0 disables.")
+    p.add_argument("--ap-final-pool-fraction", type=float, default=0.50)
+    p.add_argument("--ap-min-final-pool-ns", type=float, default=0.0)
+
+
+def _add_us_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--us-starting-structure-mode",
+                   choices=["pull", "npt", "equilibrated", "same", "none"], default="pull")
+    p.add_argument("--us-pull-steps-per-window", type=int, default=5000)
+    p.add_argument("--us-pull-k", type=float, default=5.0,
+                   help="Pre-production pull force constant (kcal/mol/CV²).")
+    p.add_argument("--us-pull-timestep-fs", type=float, default=0.0,
+                   help="Pull timestep. 0 = min(timestep-fs, 2 fs).")
+    p.add_argument("--us-pull-friction-per-ps", type=float, default=10.0)
+    p.add_argument("--us-pull-minimize-iterations", type=int, default=100)
+    p.add_argument("--us-pull-ramp-stages", type=int, default=8,
+                   help="Ramp stages for contact pulls and 2D secondary CV ramp.")
+    p.add_argument("--us-2d-relax-mode",
+                   choices=["auto", "staged", "off", "single", "ramp"], default="auto")
+    p.add_argument("--us-2d-secondary-k-scale", type=float, default=1.0,
+                   help="Multiply secondary CV k during 2D pull ramp.")
+
 
 def _add_seeding_args(p: argparse.ArgumentParser) -> None:
-    """Add GENPEPT seeding / starting-structure arguments."""
-    p.add_argument(
-        "--seed-conformers-dir", type=Path, default=None,
-        help=(
-            "Path to a GENPEPT output directory containing final_survivor_seeds.csv. "
-            "When set, each umbrella window's starting structure is seeded from the "
-            "nearest GENPEPT conformer in active CV space before the standard CV-pull step."
-        ),
-    )
-    p.add_argument("--seed-selection-mode", choices=["auto", "active-cv", "primary", "distance"], default="auto", help="How GENPEPT survivors are scored against umbrella windows. auto/active-cv uses CV1 plus CV2 when active; primary ignores CV2; distance preserves legacy terminal-distance scoring.")
-    p.add_argument("--seed-secondary-weight", type=float, default=1.0, help="Relative weight of CV2 in active-cv GENPEPT seed scoring. 0 makes active-cv equivalent to primary-only scoring.")
-    p.add_argument("--seed-max-reuse-per-conformer", type=int, default=0, help="Maximum number of windows that may reuse the same GENPEPT survivor during seed selection. 0 means unlimited reuse.")
+    p.add_argument("--seed-conformers-dir", type=Path, default=None,
+                   help="GENPEPT output directory with final_survivor_seeds.csv.")
+    p.add_argument("--seed-selection-mode",
+                   choices=["auto", "active-cv", "primary", "distance"], default="auto")
+    p.add_argument("--seed-cv2-weight", type=float, default=1.0,
+                   help="Weight of CV2 in active-cv seed scoring.")
+    p.add_argument("--seed-max-reuse-per-conformer", type=int, default=0)
 
 
 def _add_genpept_prescan_args(p: argparse.ArgumentParser) -> None:
-    """Add GAREUS-side GENPEPT prescan prior arguments."""
-    p.add_argument("--genpept-prescan-enabled", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--genpept-prescan", action=argparse.BooleanOptionalAction, default=False,
+                   help="Enable GAREUS-side GENPEPT prescan.")
     p.add_argument("--genpept-prescan-dir", type=Path, default=None)
     p.add_argument("--genpept-prescan-stages", nargs="*", default=None)
-    p.add_argument("--genpept-prescan-rescore-active-cvs", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--genpept-prescan-contact-bin-width", type=float, default=0.025)
-    p.add_argument("--genpept-prescan-rama-bin-width", type=float, default=0.25)
-    p.add_argument("--genpept-prescan-min-hits-per-bin", type=int, default=2)
     p.add_argument("--genpept-prescan-frontier-stages", nargs="*", default=None)
-    p.add_argument("--genpept-prescan-use-as-window-prior", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--genpept-prescan-use-as-seed-library", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--genpept-prescan-absence-means-unknown", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--genpept-prescan-output-prefix", default="genpept_prescan")
-    p.add_argument("--genpept-prescan-write-maps", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--genpept-prescan-write-seed-assignments", action=argparse.BooleanOptionalAction, default=True)
-
-
-def _add_genpept_prior_args(p: argparse.ArgumentParser) -> None:
-    """Add GENPEPT round-zero window prior arguments."""
-    p.add_argument("--genpept-prior-enabled", action=argparse.BooleanOptionalAction, default=False)
-    p.add_argument("--genpept-prior-dir", type=Path, default=None)
-    p.add_argument("--genpept-prior-stages", nargs="*", default=None)
-    p.add_argument("--genpept-prior-max-structures", type=int, default=50000)
-    p.add_argument("--genpept-prior-min-points", type=int, default=10)
-    p.add_argument("--genpept-prior-max-windows", type=int, default=48)
-    p.add_argument("--genpept-prior-bins", default="24,12")
-    p.add_argument("--genpept-prior-min-hits-per-bin", type=int, default=2)
-    p.add_argument("--genpept-prior-basin-windows", type=int, default=0)
-    p.add_argument("--genpept-prior-bridge-windows", type=int, default=0)
-    p.add_argument("--genpept-prior-frontier-windows", type=int, default=0)
-    p.add_argument("--genpept-prior-probe-windows", type=int, default=0)
-    p.add_argument("--genpept-prior-absence-means-unknown", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--genpept-prior-snap-secondary-centers", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--genpept-prior-required", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--genpept-prescan-use-as-window-prior",
+                   action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--genpept-prescan-use-as-seed-library",
+                   action=argparse.BooleanOptionalAction, default=True)
 
 
 def _add_gamd_args(p: argparse.ArgumentParser) -> None:
-    """Add GaMD integrator, exchange, and production control arguments."""
+    p.add_argument("--production-steps", "--gamd-production-steps", dest="production_steps",
+                   type=int, default=500000, help="Production steps per replica.")
     p.add_argument("--gamd-boost-type", default="lower-dual", choices=[
         "gamd-cmd-base", "lower-total", "upper-total", "lower-dihedral", "upper-dihedral",
         "lower-dual", "upper-dual", "lower-nonbonded", "upper-nonbonded",
         "lower-dual-nonbonded-dihedral", "upper-dual-nonbonded-dihedral",
     ])
-    p.add_argument("--sigma0p-kcal-mol", type=float, default=6.0, help="Primary sigma0 for gamd-openmm.")
-    p.add_argument("--sigma0d-kcal-mol", type=float, default=6.0, help="Secondary sigma0 for dual boost gamd-openmm.")
-    p.add_argument("--gamd-cmd-prep-steps", type=int, default=5000)
-    p.add_argument("--gamd-cmd-steps", type=int, default=50000)
-    p.add_argument("--gamd-equil-prep-steps", type=int, default=5000)
-    p.add_argument("--gamd-equil-steps", type=int, default=50000)
-    p.add_argument("--gamd-production-steps", "--production-steps", dest="gamd_production_steps", type=int, default=500000, help="Production steps per replica. Historical name retained; --production-steps is the run-mode-neutral alias.")
+    p.add_argument("--sigma0p", type=float, default=6.0,
+                   help="Primary sigma0 in kcal/mol for GaMD.")
+    p.add_argument("--sigma0d", type=float, default=6.0,
+                   help="Secondary sigma0 in kcal/mol for dual-boost GaMD.")
+    p.add_argument("--equil-steps", type=int, default=50000,
+                   help="GaMD equilibration steps for boost calibration.")
     p.add_argument("--gamd-averaging-window", type=int, default=5000)
     p.add_argument("--exchange-interval", type=int, default=5000)
-    p.add_argument("--exchange-mode", choices=["neighbor", "random-pair", "all-pair-sweep", "gibbs-walk"], default="neighbor", help="Umbrella state exchange scheme. neighbor = adjacent window REUS ladder; random-pair = arbitrary disjoint Metropolis window swaps; all-pair-sweep = randomized Metropolis sweep over many/all window pairs; gibbs-walk = experimental heat-bath-like long-jump window swap update.")
-    p.add_argument("--exchange-random-pairs", type=int, default=0, help="For --exchange-mode random-pair, number of disjoint arbitrary window pairs to try per exchange interval. 0 = floor(n_windows/2).")
-    p.add_argument("--exchange-max-pairs-per-interval", type=int, default=0, help="Cap attempted pairs/moves per interval for all-pair-sweep or gibbs-walk. 0 = no cap; all-pair-sweep tries all window pairs, gibbs-walk visits all replicas once.")
+    p.add_argument("--exchange-mode",
+                   choices=["neighbor", "random-pair", "all-pair-sweep", "gibbs-walk"],
+                   default="neighbor")
     p.add_argument("--report-interval", type=int, default=5000)
     p.add_argument("--traj-interval", type=int, default=5000)
-    p.add_argument("--traj-format", choices=["dcd", "xtc", "none"], default="dcd", help="Production trajectory format for replica_trajectories. dcd preserves historical behavior; xtc writes compressed XTC trajectories when OpenMM provides XTCReporter; none disables coordinate trajectory reporters without affecting scalar reports/samples.")
-    p.add_argument("--adaptive-pilot-trajectories", action=argparse.BooleanOptionalAction, default=False, help="Write coordinate trajectory reporters during adaptive-feedback pilot rounds. Default false because pilot coordinates are diagnostic/disposable and can dominate filesystem I/O.")
-    p.add_argument("--adaptive-production-trajectories", action=argparse.BooleanOptionalAction, default=True, help="Write coordinate trajectory reporters during adaptive-production epoch, baseline, topup, scheduled-final, and final-extension workers using --traj-interval/--traj-format. Disable with --no-adaptive-production-trajectories for low-I/O diagnostic runs.")
+    p.add_argument("--traj-format", choices=["dcd", "xtc", "none"], default="dcd")
+    p.add_argument("--adaptive-pilot-trajectories",
+                   action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--adaptive-production-trajectories",
+                   action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--randomize-replica-velocities", action="store_true")
-    p.add_argument("--checkpoint-interval", type=int, default=50000, help="Production steps between overwriting restart checkpoints; 0 disables checkpoint writing.")
-    p.add_argument("--resume", action="store_true", help="Resume from --out checkpoints: load production Context checkpoints directly when available, otherwise reuse saved NPT state XML to skip minimization/equilibration. Appends samples/exchanges/distances when possible.")
-    p.add_argument("--production-probe-steps", type=int, default=20, help="Rollback preflight steps per replica before production; catches NaNs without consuming production time. 0 disables.")
-    p.add_argument("--production-probe-warn-only", action="store_true", help="Warn instead of aborting if the rollback production probe fails.")
-    p.add_argument("--production-safe-chunk-steps", type=int, default=0, help="Optional maximum subchunk size for production stepping. 0 uses the normal next-event chunk. Smaller values make NaN diagnostics more local but add overhead.")
-    p.add_argument("--production-nan-diagnostics", action=argparse.BooleanOptionalAction, default=True, help="When production stepping fails, scan replicas and write PRODUCTION_NAN_DIAGNOSTICS_*.json plus crash PDBs when possible.")
-    p.add_argument("--shared-gamd-copy-strict", action="store_true", help="Abort if the copied shared GaMD integrator globals differ from the reference setup before production.")
-    p.add_argument("--shared-gamd-setup-dir", default="", help="Reuse a previously calibrated shared GaMD setup from this directory instead of recalibrating in the current production worker. Expected files include shared_gamd_setup_globals.json and optionally shared_gamd_setup_context.chk.")
-    p.add_argument("--shared-gamd-export-dir", default="", help="After calibrating shared GaMD in this worker, copy the setup artifacts to this directory for later workers. Adaptive production uses this internally to keep one campaign-wide GaMD setup.")
+    p.add_argument("--checkpoint-interval", type=int, default=50000)
+    p.add_argument("--resume", action="store_true")
 
 
 def _add_output_args(p: argparse.ArgumentParser) -> None:
-    """Add GUI/TUI progress, dashboard, distance, and analysis I/O arguments."""
-    # GUI/progress/TUI output. The JSONL files are intentionally simple so an external GUI can tail them.
     p.add_argument("--progress-mode", choices=["none", "console", "jsonl", "both"], default="both")
-    p.add_argument("--progress-jsonl", default="progress.jsonl")
-    p.add_argument("--progress-update-interval-sec", type=float, default=0.25)
-    p.add_argument("--progress-bar-width", type=int, default=36)
-    p.add_argument("--color", choices=["auto", "always", "never"], default="auto")
-    p.add_argument("--tui-mode", choices=["dashboard", "interactive", "line", "none"], default="dashboard")
-    p.add_argument("--tui-clear-mode", choices=["auto", "always", "never"], default="always", help="In full-frame TUI modes, clear and redraw the visible terminal instead of stacking progress/TUI panels. auto is treated like always because MPI/SLURM/tee often hide TTY status; use never for plain logs.")
-    p.add_argument("--dashboard-density", choices=["auto", "compact", "normal", "full"], default="auto", help="Dashboard information density. auto compacts on small terminals and expands on large terminals without hiding panels.")
-    p.add_argument("--dashboard-wide-threshold", type=int, default=132, help="Terminal width at which wide 2D side-by-side dashboard layout becomes eligible.")
-    p.add_argument("--dashboard-min-panel-width", type=int, default=30, help="Minimum readable panel width before dashboard rows stack vertically.")
-    p.add_argument("--dashboard-max-height", type=int, default=0, help="Optional maximum visible dashboard lines before truncation; 0 uses terminal height.")
-    p.add_argument("--dashboard-render-interval-sec", type=float, default=0.0, help="Minimum wall-clock seconds between live dashboard frame renders. 0 preserves historical render-every-log behavior.")
-    p.add_argument("--dashboard-panels", choices=["minimal", "normal", "full"], default="normal", help="Live dashboard panel set. minimal keeps only the context/decision/CV panels; normal preserves the standard dashboard; full keeps all panels.")
-    p.add_argument("--dashboard-heavy-panels-every", type=int, default=1, help="Render heavy dashboard panels only every N rendered frames. 1 preserves historical behavior.")
-
-    p.add_argument("--distance-output-mode", choices=["none", "csv", "jsonl", "both"], default="both")
-    p.add_argument("--distance-output-interval", type=int, default=1000, help="Steps between distance/TUI updates; 0 reuses min(report, exchange).")
-    p.add_argument("--distance-csv", default="distances.csv")
-    p.add_argument("--distance-jsonl", default="distances.jsonl")
-    p.add_argument("--no-distance-gui-events", action="store_true", help="Do not mirror distance events into progress.jsonl.")
-    p.add_argument("--distance-ascii-mode", choices=["none", "compact", "bars", "hist", "hist3d"], default="hist3d")
-    p.add_argument("--distance-ascii-width", type=int, default=54)
-    p.add_argument("--distance-ascii-max-replicas", type=int, default=32)
-    p.add_argument("--distance-history-limit", type=int, default=4000)
-    # No-database I/O optimization. Heavy N x K analysis matrices are written as
-    # chunked NumPy files; CSV remains a scalar human-readable companion by default.
-    p.add_argument("--analysis-chunk-size", type=int, default=10000, help="Number of production sample rows per analysis_chunks/chunk_XXXXXX.npz file.")
-    p.add_argument("--analysis-chunk-dir", default="analysis_chunks", help="Directory name under --out for chunked NumPy analysis arrays.")
-    p.add_argument("--write-analysis-chunks", action=argparse.BooleanOptionalAction, default=True, help="Write chunked NumPy analysis arrays during production.")
-    p.add_argument("--analysis-write-consolidated-npz", action=argparse.BooleanOptionalAction, default=True, help="Also write legacy consolidated analysis_arrays.npz at the end for compatibility. Disable for very large production runs.")
-    p.add_argument("--analysis-consolidated-max-elements", type=int, default=100_000_000, help="Skip writing legacy consolidated analysis_arrays.npz when n_samples*n_windows exceeds this value. 0 disables the guard.")
-    p.add_argument("--analysis-array-dtype", choices=["float64", "float32"], default="float64", help="Floating dtype for consolidated analysis_arrays.npz. Chunk files remain full precision; float32 can reduce compatibility-NPZ size after validation.")
-    p.add_argument("--analysis-npz-compressed", action=argparse.BooleanOptionalAction, default=False, help="Use compressed NPZ chunks/consolidated arrays. Smaller files, more CPU.")
-    p.add_argument("--write-full-bias-csv-vectors", action="store_true", help="Write all-window bias JSON vectors into samples.csv. Default false keeps samples.csv scalar-only; full matrices are in analysis_chunks.")
-    p.add_argument("--write-gamd-globals-json", action="store_true", help="Write full integrator diagnostic globals JSON into samples.csv. Default false reduces text I/O.")
-    p.add_argument("--sample-potential-energy", action=argparse.BooleanOptionalAction, default=True, help="Evaluate and log potential energy for samples.csv/distances.csv rows. Disable with --no-sample-potential-energy to avoid an extra GPU energy evaluation when only CV/bias observables are needed; trajectories, forces, GaMD, and exchange probabilities are unchanged.")
-    p.add_argument("--flush-every-log", action=argparse.BooleanOptionalAction, default=True, help="Flush scalar CSV writers after every sample/distance/exchange log event. Disable with --no-flush-every-log to rely on --csv-flush-rows buffering for faster network-filesystem runs; files are still flushed on checkpoints and clean shutdown.")
-    p.add_argument("--csv-flush-rows", type=int, default=1000, help="Buffered CSV rows before flushing samples/exchanges/distances.")
-    p.add_argument("--jsonl-flush-rows", type=int, default=500, help="Buffered JSONL events before flushing progress/distances.")
+    p.add_argument("--tui-mode", choices=["dashboard", "interactive", "line", "none"],
+                   default="dashboard")
+    p.add_argument("--distance-output-mode", choices=["none", "csv", "jsonl", "both"],
+                   default="both")
+    p.add_argument("--distance-output-interval", type=int, default=1000)
+    p.add_argument("--write-analysis-chunks", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--analysis-write-consolidated-npz",
+                   action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--analysis-chunk-size", type=int, default=10000)
+    p.add_argument("--analysis-chunk-dir", default="analysis_chunks")
+    p.add_argument("--sample-potential-energy",
+                   action=argparse.BooleanOptionalAction, default=True)
 
 
 def _add_platform_args(p: argparse.ArgumentParser) -> None:
-    """Add OpenMM platform / GPU device selection arguments."""
-    p.add_argument("--platform", default="auto", help="CUDA, HIP, OpenCL, CPU, Reference, or auto. Used for production replicas.")
-    p.add_argument("--precision", default="mixed", help="Precision for production replicas on CUDA/HIP/OpenCL.")
-    p.add_argument("--device-index", default="0", help="OpenMM DeviceIndex for production. With --replica-device-mode auto/round-robin, comma lists such as 0,1,2,3 are assigned one token per replica.")
-    p.add_argument("--replica-device-mode", choices=["auto", "round-robin", "single-context-split", "manual"], default="auto", help="How to interpret comma-separated --device-index for production replicas. auto uses round-robin when multiple device tokens are present; single-context-split gives each replica the full comma list; manual uses --replica-device-map.")
-    p.add_argument("--replica-device-map", default="", help="Explicit repeating per-replica DeviceIndex map, e.g. 0,1,2,3,0,1. Used by --replica-device-mode manual, or as an override for round-robin.")
-    p.add_argument("--cuda-use-cpu-pme", choices=["auto", "true", "false"], default="auto", help="Optional OpenMM CUDA/HIP UseCpuPme platform property. auto leaves the property unset.")
-    p.add_argument("--cuda-use-blocking-sync", choices=["auto", "true", "false"], default="auto", help="Optional OpenMM CUDA/HIP UseBlockingSync platform property. auto leaves the property unset.")
-    p.add_argument("--cuda-deterministic-forces", choices=["auto", "true", "false"], default="auto", help="Optional OpenMM CUDA/HIP DeterministicForces platform property. auto leaves the property unset.")
-    p.add_argument("--platform-temp-directory", default="", help="Optional CUDA/HIP TempDirectory platform property for temporary files.")
-    p.add_argument("--cpu-threads", type=int, default=1, help="CPU threads for production when --platform CPU is used.")
-    p.add_argument("--setup-platform", default="", help="OpenMM platform for single-context setup/prep phases: minimization/equilibration, adaptive prescan, US pulling, and shared GaMD setup. Empty = --platform.")
-    p.add_argument("--setup-precision", default="", help="Precision for setup on CUDA/HIP/OpenCL. Empty = --precision.")
-    p.add_argument("--setup-device-index", default="", help="DeviceIndex for single-context setup/prep phases. Empty = first entry of --device-index, so --device-index 0,1,2,3 uses only GPU 0 for setup. Set this explicitly, e.g. 1 or 0,1,2,3, to override.")
-    p.add_argument("--setup-cpu-threads", type=int, default=0, help="CPU threads for setup when --setup-platform CPU is used. 0 = --cpu-threads.")
-    p.add_argument("--us-pull-workers", default="auto", help="Parallel workers for US starting-structure pulls. 'auto': on CUDA/OpenCL uses one worker per GPU device token (from --setup-device-index / --device-index), on CPU uses 1. Explicit N overrides. Each worker owns a separate OpenMM Context; threads run concurrently since OpenMM releases the GIL during step().")
-    p.add_argument("--scratchdir", default="", help="Fast local scratch directory for all simulation I/O (e.g. /local/nvme/run). If set, --out becomes a mirror that is updated at each checkpoint via a full directory copy. Use on HPC nodes with local NVMe to avoid writing DCD/NPZ/CSV traffic over a network filesystem.")
+    p.add_argument("--platform", default="auto")
+    p.add_argument("--precision", default="mixed")
+    p.add_argument("--device-index", default="0")
+    p.add_argument("--replica-device-mode",
+                   choices=["auto", "round-robin", "single-context-split", "manual"],
+                   default="auto")
+    p.add_argument("--replica-device-map", default="")
+    p.add_argument("--cuda-use-cpu-pme", choices=["auto", "true", "false"], default="auto")
+    p.add_argument("--cuda-use-blocking-sync", choices=["auto", "true", "false"], default="auto")
+    p.add_argument("--cuda-deterministic-forces", choices=["auto", "true", "false"], default="auto")
+    p.add_argument("--platform-temp-directory", default="")
+    p.add_argument("--cpu-threads", type=int, default=1)
+    p.add_argument("--setup-platform", default="")
+    p.add_argument("--setup-precision", default="")
+    p.add_argument("--setup-device-index", default="")
+    p.add_argument("--setup-cpu-threads", type=int, default=0)
+    p.add_argument("--us-pull-workers", default="auto")
+    p.add_argument("--scratchdir", default="")
 
 
 # ---------------------------------------------------------------------------
-# Post-parse processing helpers
+# Post-parse resolution helpers
 # ---------------------------------------------------------------------------
 
-def _resolve_cv_aliases(args: argparse.Namespace, argv_list: list) -> None:  # noqa: ARG001
-    """Resolve --cv1/--cv2 friendly aliases onto the canonical CV flags."""
-    # User-facing aliases.  The expert flags remain canonical in output metadata,
-    # but --cv1/--cv2 make the common 1D/2D choices short and explicit.
+def _resolve_cv_aliases(args: argparse.Namespace, argv_list: list) -> None:
+    # cv1 → primary_cv
     if getattr(args, "cv1", None) not in (None, ""):
-        args.primary_cv = "nonlocal-contacts" if str(args.cv1).strip().lower().replace("_", "-") in {"contacts", "nonlocal-contacts"} else "distance"
+        args.primary_cv = ("nonlocal-contacts"
+                           if str(args.cv1).strip().lower().replace("_", "-")
+                           in {"contacts", "nonlocal-contacts"}
+                           else "distance")
 
-    _cv2_requested = getattr(args, "cv2", None) not in (None, "")
+    # cv2 is canonical secondary CV attr; secondary_cv_mode() reads args.secondary_cv
+    _cv2_val = getattr(args, "cv2", None)
+    _cv2_requested = _cv2_val not in (None, "")
     if _cv2_requested:
-        args.secondary_cv = str(args.cv2)
+        args.secondary_cv = str(_cv2_val)
+    else:
+        args.secondary_cv = getattr(args, "secondary_cv", "none")
+
     args.primary_cv = primary_cv_mode(args)
     args.secondary_cv = secondary_cv_mode(args)
+    args.cv2 = args.secondary_cv  # keep cv2 in sync
 
-    # Make --cv2 deliberately mean a 2D primary x secondary run.  The historical
-    # --secondary-cv flag still supports a single fixed secondary restraint unless
-    # the user supplies multiple --secondary-cv-centers themselves.
-    if _cv2_requested and str(args.secondary_cv) != "none" and not getattr(args, "secondary_cv_centers", None):
-        if args.secondary_cv == "rama-map":
-            args.secondary_cv_centers = [-1.0, -1.0 / 3.0, 1.0 / 3.0, 1.0]
-        elif args.secondary_cv == "rama-regions":
-            args.secondary_cv_centers = [-1.0, -0.5, 0.0, 0.5, 1.0]
-        elif args.secondary_cv == "alpha-coil-beta":
-            args.secondary_cv_centers = [-0.8, 0.0, 0.8]
+    # Auto-insert cv2_centers when cv2 active but no centers provided
+    if _cv2_requested and str(args.cv2) != "none" and not getattr(args, "cv2_centers", None):
+        if args.cv2 == "rama-map":
+            args.cv2_centers = [-1.0, -1.0 / 3.0, 1.0 / 3.0, 1.0]
+        elif args.cv2 in {"rama-regions", "ramachandran-regions"}:
+            args.cv2_centers = [-1.0, -0.5, 0.0, 0.5, 1.0]
+        elif args.cv2 in {"alpha-coil-beta", "acb"}:
+            args.cv2_centers = [-0.8, 0.0, 0.8]
         else:
-            args.secondary_cv_centers = [0.2, 0.5, 0.8]
+            args.cv2_centers = [0.2, 0.5, 0.8]
         args._cv2_auto_centers = True
     else:
         args._cv2_auto_centers = False
 
 
 def _normalize_run_mode(args: argparse.Namespace, argv_list: list) -> None:
-    """Validate and normalise --run-mode; set HMR and auto-timestep flags."""
-    _run_mode = str(getattr(args, "run_mode", "gamd") or "gamd").strip().lower().replace("_", "-")
-    if _run_mode not in {"cmd", "hmr-cmd", "gamd", "hmr-gamd"}:
-        raise ValueError("--run-mode must be one of: cmd, hmr-cmd, gamd, hmr-gamd")
-    args.run_mode = _run_mode
+    _rm = str(getattr(args, "run_mode", "gamd") or "gamd").strip().lower().replace("_", "-")
+    if _rm not in {"cmd", "hmr-cmd", "gamd", "hmr-gamd"}:
+        raise ValueError("--run-mode must be cmd, hmr-cmd, gamd, or hmr-gamd")
+    args.run_mode = _rm
     if args.run_mode in {"hmr-cmd", "hmr-gamd"}:
         args.hmr = True
-        _specified_timestep_cli = any(str(tok) == "--timestep-fs" or str(tok).startswith("--timestep-fs=") for tok in argv_list)
-        _specified_timestep_config = "timestep_fs" in (getattr(args, "_config_values", {}) or {})
-        if not _specified_timestep_cli and not _specified_timestep_config:
+        _specified_ts_cli = any(
+            str(t) == "--timestep-fs" or str(t).startswith("--timestep-fs=")
+            for t in argv_list
+        )
+        _specified_ts_cfg = "timestep_fs" in (getattr(args, "_config_values", {}) or {})
+        if not _specified_ts_cli and not _specified_ts_cfg:
             args.timestep_fs = 4.0
             args._run_mode_auto_timestep_fs = True
         else:
             args._run_mode_auto_timestep_fs = False
     else:
+        args.hmr = False
         args._run_mode_auto_timestep_fs = False
 
 
 def _validate_contact_args(args: argparse.Namespace) -> None:
-    """Validate contact-CV argument combinations when nonlocal-contacts is active.
-
-    Assumes ``args.contact_scheme`` has already been set by the caller.
-    """
+    """Validate contact-CV args. Runs after compat shims so old attr names are available."""
     if args.primary_cv != "nonlocal-contacts":
         return
     if args.contact_scheme not in {"atom-pairs", "residue-balanced", "ca-pairs"}:
         raise ValueError("--contact-scheme must be atom-pairs, residue-balanced, or ca-pairs")
-    # Explicit sparse 2D window tables are generic over the primary CV.
-    # In contact mode the primary values are dimensionless contact-CV centers
-    # even when legacy distance_* column aliases are used for compatibility.
-    if not math.isfinite(float(getattr(args, "contact_r0_a", 4.5))) or float(getattr(args, "contact_r0_a", 4.5)) <= 0.0:
+    if not math.isfinite(float(getattr(args, "contact_r0_a", 4.5))) or float(getattr(args, "contact_r0_a", 4.5)) <= 0:
         raise ValueError("--contact-r0-a must be positive and finite")
-    if not math.isfinite(float(getattr(args, "contact_beta_a_inv", 6.0))) or float(getattr(args, "contact_beta_a_inv", 6.0)) <= 0.0:
+    if not math.isfinite(float(getattr(args, "contact_beta_a_inv", 6.0))) or float(getattr(args, "contact_beta_a_inv", 6.0)) <= 0:
         raise ValueError("--contact-beta-a-inv must be positive and finite")
     if int(getattr(args, "contact_min_sequence_separation", 4) or 4) < 1:
-        raise ValueError("--contact-min-sequence-separation must be at least 1")
+        raise ValueError("--contact-min-sequence-separation must be >= 1")
     if bool(getattr(args, "contact_normalize", True)):
         cmin = float(getattr(args, "contact_adaptive_min", 0.0) or 0.0)
         cmax = float(getattr(args, "contact_adaptive_max", 0.80) or 0.80)
         if not (math.isfinite(cmin) and math.isfinite(cmax)) or cmax <= cmin:
-            raise ValueError("--contact-adaptive-max must be finite and greater than --contact-adaptive-min")
-        if cmin < -1.0e-8 or cmax > 1.0 + 1.0e-8:
+            raise ValueError("cv1-range-max must be finite and > cv1-range-min for contacts")
+        if cmin < -1e-8 or cmax > 1.0 + 1e-8:
             raise ValueError("Normalized contact adaptive bounds should be within [0, 1]")
-    if float(getattr(args, "contact_adaptive_target_spacing", 0.15) or 0.15) <= 0.0:
-        raise ValueError("--contact-adaptive-target-spacing must be positive")
-    if int(getattr(args, "contact_adaptive_min_windows", 4) or 4) < 2:
-        raise ValueError("--contact-adaptive-min-windows must be at least 2")
-    if int(getattr(args, "contact_adaptive_max_windows", 12) or 12) < int(getattr(args, "contact_adaptive_min_windows", 4) or 4):
-        raise ValueError("--contact-adaptive-max-windows must be >= --contact-adaptive-min-windows")
+    if float(getattr(args, "contact_adaptive_target_spacing", 0.15) or 0.15) <= 0:
+        raise ValueError("--cv1-target-spacing must be positive")
     _autocalib_steps = getattr(args, "contact_autocalibration_steps", None)
     if _autocalib_steps is not None and int(_autocalib_steps) < 0:
-        raise ValueError("--contact-autocalibration-steps must be >= 0")
-    _autocalib_ts = getattr(args, "contact_autocalibration_timestep_fs", None)
-    if _autocalib_ts is not None and float(_autocalib_ts) <= 0.0:
-        raise ValueError("--contact-autocalibration-timestep-fs must be positive")
-    if int(getattr(args, "contact_autocalibration_sample_interval", 100) or 100) <= 0:
-        raise ValueError("--contact-autocalibration-sample-interval must be positive")
-    if float(getattr(args, "contact_autocalibration_min_span", 0.10) or 0.10) <= 0.0:
-        raise ValueError("--contact-autocalibration-min-span must be positive")
+        raise ValueError("--cv1-prescan-steps must be >= 0")
     if (
         not bool(getattr(args, "resume", False))
         and not bool(getattr(args, "self_test_primary_cv_force", False))
         and str(getattr(args, "window_mode", "manual")) == "manual"
         and (getattr(args, "contact_centers", None) is None or len(args.contact_centers) == 0)
     ):
-        raise ValueError("--primary-cv nonlocal-contacts with --window-mode manual requires --contact-centers; adaptive/adaptive-feedback can generate them.")
+        raise ValueError("contacts + --window-mode manual requires --contact-centers")
 
 
-def _validate_total_window_bounds(args: argparse.Namespace) -> None:
-    """Validate adaptive-min/max-total-windows consistency for both CV axes."""
-    for _min_name, _max_name in (
-        ("adaptive_min_total_windows", "adaptive_max_total_windows"),
-        ("contact_adaptive_min_total_windows", "contact_adaptive_max_total_windows"),
-    ):
-        _min_total = int(getattr(args, _min_name, 0) or 0)
-        _max_total = int(getattr(args, _max_name, 0) or 0)
-        if _min_total < 0 or _max_total < 0:
-            raise ValueError(f"--{_min_name.replace('_','-')} and --{_max_name.replace('_','-')} must be >= 0")
-        if _min_total > 0 and _max_total > 0 and _min_total > _max_total:
-            raise ValueError(f"--{_min_name.replace('_','-')} cannot exceed --{_max_name.replace('_','-')}")
-        if _max_total > 0 and _max_total < 2:
-            raise ValueError(f"--{_max_name.replace('_','-')} must be at least 2 when enabled")
+def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
+    """Map schema-v2 attr names to legacy internal names expected by consumer modules.
+
+    This lets the public CLI/YAML API be clean and minimal while all downstream
+    code continues to work without changes.  Consumer modules can be updated to
+    the new names incrementally.
+    """
+    # ── CV ───────────────────────────────────────────────────────────────────
+    args.secondary_cv = args.cv2
+    cv2_centers = getattr(args, "cv2_centers", None)
+    args.secondary_cv_centers = cv2_centers
+    args.secondary_cv_center = (cv2_centers[0] if cv2_centers and len(cv2_centers) == 1 else None)
+    args.secondary_cv_k_kcal = args.cv2_k_default
+    args.secondary_cv_k_mode = args.cv2_k_mode
+    args.secondary_cv_adaptive_min_k_kcal = args.cv2_k_min
+    args.secondary_cv_adaptive_max_k_kcal = args.cv2_k_max
+    args.secondary_cv_adaptive_overlap_sigma = args.cv2_adaptive_overlap_sigma
+    args.secondary_cv_adaptive_k_scale = args.cv2_k_scale
+    args.secondary_cv_sigma_deg = args.cv2_sigma_deg
+    args.secondary_cv_phi0_deg = args.cv2_phi0_deg
+    args.secondary_cv_psi0_deg = args.cv2_psi0_deg
+    args.secondary_cv_adaptive_min_sigma = 0.02
+    args.secondary_cv_force_group = 29
+
+    # ── CV1 adaptive → distance legacy names ─────────────────────────────────
+    _cv1_range_min = args.cv1_range_min
+    _cv1_range_max = args.cv1_range_max
+    _cv1_spacing = args.cv1_target_spacing
+    _cv1_k_def = args.cv1_k_default
+    _cv1_k_min = args.cv1_k_min
+    _cv1_k_max = args.cv1_k_max
+    _cv1_k_mode = args.cv1_k_mode
+    _cv1_sigma = args.cv1_adaptive_overlap_sigma
+
+    # distance-mode legacy attrs
+    args.adaptive_window_min_a = _cv1_range_min
+    args.adaptive_window_max_a = _cv1_range_max
+    args.adaptive_target_spacing_a = _cv1_spacing if _cv1_spacing > 0 else 2.0
+    args.default_window_k_kcal_a2 = _cv1_k_def if _cv1_k_def > 0 else 1.0
+    args.adaptive_min_k_kcal_a2 = _cv1_k_min if _cv1_k_min > 0 else 0.05
+    args.adaptive_max_k_kcal_a2 = _cv1_k_max if _cv1_k_max > 0 else 20.0
+    args.adaptive_k_mode = _cv1_k_mode
+    args.adaptive_overlap_sigma = _cv1_sigma
+    args.adaptive_prescan_steps = args.cv1_prescan_steps
+
+    # contact-mode legacy attrs
+    args.contact_adaptive_min = _cv1_range_min
+    args.contact_adaptive_max = _cv1_range_max if _cv1_range_max > 0 else 0.80
+    args.contact_adaptive_target_spacing = _cv1_spacing if _cv1_spacing > 0 else 0.15
+    args.contact_adaptive_default_k_kcal = _cv1_k_def if _cv1_k_def > 0 else 25.0
+    args.contact_adaptive_min_k_kcal = _cv1_k_min if _cv1_k_min > 0 else 5.0
+    args.contact_adaptive_max_k_kcal = _cv1_k_max if _cv1_k_max > 0 else 120.0
+    args.contact_adaptive_k_mode = _cv1_k_mode
+    args.contact_adaptive_overlap_sigma = _cv1_sigma
+    args.contact_autocalibrate_windows = args.cv1_prescan
+    args.contact_autocalibration_steps = args.cv1_prescan_steps if args.cv1_prescan_steps > 0 else None
+    args.contact_autocalibration_timestep_fs = None  # auto-detect
+    args.contact_frontier_enabled = args.cv1_frontier
+    args.contact_frontier_probe_count = args.cv1_frontier_probe_count
+
+    # Dropped contact adaptive tuning → hardcoded defaults
+    args.contact_adaptive_min_sigma = 0.02
+    args.contact_adaptive_k_scale = 1.0
+    args.contact_adaptive_hit_radius = 0.08
+    args.contact_adaptive_tight_hit_radius = 0.04
+    args.contact_adaptive_max_center_shift = 0.08
+    args.contact_adaptive_min_new_spacing = 0.04
+    args.contact_adaptive_coverage_gap_width = 0.10
+    args.contact_autocalibration_sample_interval = 100
+    args.contact_autocalibration_safe_chunk_steps = 50
+    args.contact_autocalibration_friction_per_ps = 20.0
+    args.contact_autocalibration_percentile = 99.0
+    args.contact_autocalibration_margin = 0.02
+    args.contact_autocalibration_expand_factor = 4.0
+    args.contact_autocalibration_max_multiple = 4.0
+    args.contact_autocalibration_min_span = 0.10
+    args.contact_autocalibration_required = False
+    args.contact_pair_warning_threshold = 5000
+    args.contact_frontier_percentile = 99.0
+    args.contact_frontier_margin = 0.02
+    args.contact_frontier_min_span = 0.10
+    args.contact_frontier_probe_spacing = 0.05
+    args.contact_frontier_max_probe_offset = 0.15
+    args.contact_disable_gapfill_above_unvalidated_frontier = True
+    args.contact_frontier_confirm_rounds = 2
+    args.contact_frontier_min_hit_fraction = 0.02
+    args.contact_frontier_unreachable_deficit = 0.08
+    args.contact_frontier_by_secondary_slice = True
+
+    # Dropped legacy window count bounds
+    args.adaptive_min_windows = 4
+    args.adaptive_max_windows = 32
+    args.contact_adaptive_min_windows = 4
+    args.contact_adaptive_max_windows = 12
+    args.adaptive_min_total_windows = 0
+    args.adaptive_max_total_windows = 0
+    args.contact_adaptive_min_total_windows = 0
+    args.contact_adaptive_max_total_windows = 0
+    args.n_windows = 0
+    args.adaptive_compact_floor_a = 3.5
+    args.adaptive_extension_fraction = 0.95
+    args.adaptive_prescan_margin_a = 1.0
+    args.umbrella_force_group = 31
+    args.adaptive_secondary_cv = "auto"
+
+    # ── US Pulling ────────────────────────────────────────────────────────────
+    args.us_pull_k_kcal_a2 = args.us_pull_k
+    args.contact_us_pull_k_kcal = args.us_pull_k
+    args.contact_us_pull_max_k_kcal = max(args.us_pull_k * 2.0, 20.0)
+    args.contact_us_pull_ramp_stages = args.us_pull_ramp_stages
+    args.us_2d_start_relax_mode = args.us_2d_relax_mode
+    args.us_2d_start_secondary_k_pull_scale = args.us_2d_secondary_k_scale
+    args.us_2d_start_secondary_ramp_stages = args.us_pull_ramp_stages
+    # Dropped US pull tuning
+    args.contact_us_pull_timestep_fs = 1.0
+    args.contact_us_pull_safe_chunk_steps = 100
+    args.contact_us_pull_min_friction_per_ps = 20.0
+    args.contact_us_pull_minimize_first_ramp = True
+    args.us_2d_start_distance_fraction = 0.50
+    args.us_2d_start_minimize_each_ramp = False
+    args.us_2d_start_secondary_warn_delta = 0.35
+    args.us_2d_start_secondary_warn_bias_kcal = 1.0
+    args.us_2d_start_secondary_bad_bias_kcal = 5.0
+
+    # ── Windows ───────────────────────────────────────────────────────────────
+    args.adaptive_window_aggressiveness = args.aggressiveness
+    args.adaptive_feedback_rounds = args.adaptive_rounds
+    args.adaptive_feedback_pilot_fraction = args.pilot_fraction
+    args.adaptive_feedback_validation_steps = args.validation_steps
+    args.adaptive_feedback_target_overlap = args.target_overlap
+    args.sparse_2d_patches_enabled = args.sparse_2d
+    args.contact_sparse_2d_patches_enabled = args.sparse_2d
+    args.adaptive_2d_max_local_patches = args.max_2d_patches
+    args.adaptive_feedback_region_state_enabled = args.region_memory
+    args.adaptive_feedback_region_memory_decay = args.region_memory_decay
+    args.adaptive_feedback_probe_unvalidated_regions = args.region_probe_unvalidated
+    args.adaptive_feedback_prune_overscanned_regions = args.region_prune_overscanned
+    args.adaptive_feedback_extend_undersampled_regions = args.region_extend_undersampled
+    # Dropped window tuning
+    args.adaptive_window_count_weight = -1.0
+    args.adaptive_feedback_bootstrap_samples = 50
+    args.adaptive_feedback_validation_fraction = 0.10
+    args.adaptive_feedback_min_effective_samples = 50
+    args.adaptive_2d_min_edge_samples = 5
+    args.explicit_2d_exchange_neighbor_k = 2
+    args.explicit_2d_exchange_radius = 1.65
+    args.explicit_2d_exchange_slots = 4
+
+    # ── Seeding ───────────────────────────────────────────────────────────────
+    args.seed_secondary_weight = args.seed_cv2_weight
+
+    # ── GENPEPT prescan ───────────────────────────────────────────────────────
+    args.genpept_prescan_enabled = args.genpept_prescan
+    # Dropped prescan tuning
+    args.genpept_prescan_rescore_active_cvs = True
+    args.genpept_prescan_contact_bin_width = 0.025
+    args.genpept_prescan_rama_bin_width = 0.25
+    args.genpept_prescan_min_hits_per_bin = 2
+    args.genpept_prescan_absence_means_unknown = True
+    args.genpept_prescan_output_prefix = "genpept_prescan"
+    args.genpept_prescan_write_maps = True
+    args.genpept_prescan_write_seed_assignments = True
+    # Dropped genpept_prior entirely
+    args.genpept_prior_enabled = False
+    args.genpept_prior_dir = None
+    args.genpept_prior_stages = None
+    args.genpept_prior_max_structures = 50000
+    args.genpept_prior_min_points = 10
+    args.genpept_prior_max_windows = 48
+    args.genpept_prior_bins = "24,12"
+    args.genpept_prior_min_hits_per_bin = 2
+    args.genpept_prior_basin_windows = 0
+    args.genpept_prior_bridge_windows = 0
+    args.genpept_prior_frontier_windows = 0
+    args.genpept_prior_probe_windows = 0
+    args.genpept_prior_absence_means_unknown = True
+    args.genpept_prior_snap_secondary_centers = True
+    args.genpept_prior_required = False
+
+    # ── GaMD ─────────────────────────────────────────────────────────────────
+    args.gamd_production_steps = args.production_steps
+    args.sigma0p_kcal_mol = args.sigma0p
+    args.sigma0d_kcal_mol = args.sigma0d
+    args.gamd_equil_steps = args.equil_steps
+    # Dropped GaMD prep steps
+    args.gamd_cmd_prep_steps = 5000
+    args.gamd_equil_prep_steps = 5000
+    args.gamd_cmd_steps = 50000
+    # Dropped exchange tuning
+    args.exchange_random_pairs = 0
+    args.exchange_max_pairs_per_interval = 0
+    # Dropped production tuning
+    args.production_probe_steps = 0
+    args.production_probe_warn_only = False
+    args.production_safe_chunk_steps = 0
+    args.production_nan_diagnostics = True
+    args.shared_gamd_copy_strict = False
+    args.shared_gamd_setup_dir = ""
+    args.shared_gamd_export_dir = ""
+
+    # ── Adaptive production ───────────────────────────────────────────────────
+    args.adaptive_production_epochs = args.ap_epochs
+    args.adaptive_production_epoch_steps = args.ap_epoch_steps
+    args.adaptive_production_final_steps = args.ap_final_steps
+    args.adaptive_production_resume = args.ap_resume
+    args.adaptive_production_use_epoch_samples_for_mbar = args.ap_include_epoch_samples
+    args.adaptive_production_write_union_mbar_inputs = args.ap_write_mbar_inputs
+    args.adaptive_production_run_union_mbar_analysis = args.ap_run_mbar
+    args.adaptive_production_union_fes_bins = args.ap_fes_bins
+    args.adaptive_production_propagate_seed_bank = args.ap_seed_bank
+    args.adaptive_production_seed_bank_max_per_state = args.ap_seed_bank_max
+    args.adaptive_production_target_overlap = args.ap_target_overlap
+    args.adaptive_production_min_exchange = args.ap_min_exchange
+    args.adaptive_production_min_samples = args.ap_min_samples
+    args.adaptive_production_retire_min_samples = args.ap_retire_min_samples
+    args.adaptive_production_max_new_windows_per_epoch = args.ap_max_new_windows
+    args.adaptive_production_retire_converged = args.ap_retire_converged
+    args.adaptive_production_max_gamd_boost_sd_kcal_mol = args.ap_gamd_boost_sd_warn
+    args.adaptive_production_write_action_reports = args.ap_write_reports
+    args.adaptive_production_total_md_pool_ns = args.md_budget_ns
+    args.adaptive_production_final_pool_fraction = args.ap_final_pool_fraction
+    args.adaptive_production_min_final_pool_ns = args.ap_min_final_pool_ns
+    # Dropped adaptive production tuning → hardcoded defaults
+    args.adaptive_production_allocation_scheduler = True
+    args.adaptive_production_global_shared_gamd = True
+    args.adaptive_production_context_reuse = False
+    args.adaptive_production_context_reuse_require = False
+    args.adaptive_production_context_reuse_mode = "off"
+    args.adaptive_production_epoch_step_budget = 0
+    args.adaptive_production_min_state_steps = 0
+    args.adaptive_production_max_state_steps = 0
+    args.adaptive_production_new_state_steps = 0
+    args.adaptive_production_final_allocation_scheduler = True
+    args.adaptive_production_final_step_budget = 0
+    args.adaptive_production_state_aware_seed_filtering = True
+    args.adaptive_production_scheduled_final_segments = True
+    args.adaptive_production_convergence_min_samples_per_state = 50
+    args.adaptive_production_convergence_max_weak_edges = 0
+    args.adaptive_production_convergence_allow_extend_actions = True
+    args.adaptive_production_require_convergence_before_final = False
+    args.adaptive_production_pool_hard_stop = True
+    args.adaptive_production_final_connectivity_required = True
+    args.adaptive_production_final_min_samples_per_state = 100
+    args.adaptive_production_quality_min_primary_coverage_fraction = 0.25
+    args.adaptive_production_quality_hard_fail = False
+    args.adaptive_production_final_quality_extension_rounds = 0
+    args.adaptive_production_final_quality_extension_steps = 0
+
+    # ── Output ────────────────────────────────────────────────────────────────
+    args.color = "auto"
+    args.progress_jsonl = "progress.jsonl"
+    args.progress_update_interval_sec = 0.25
+    args.progress_bar_width = 36
+    args.tui_clear_mode = "always"
+    args.dashboard_density = "auto"
+    args.dashboard_wide_threshold = 132
+    args.dashboard_min_panel_width = 30
+    args.dashboard_max_height = 0
+    args.dashboard_render_interval_sec = 0.0
+    args.dashboard_panels = "normal"
+    args.dashboard_heavy_panels_every = 1
+    args.distance_csv = "distances.csv"
+    args.distance_jsonl = "distances.jsonl"
+    args.no_distance_gui_events = False
+    args.distance_ascii_mode = "hist3d"
+    args.distance_ascii_width = 54
+    args.distance_ascii_max_replicas = 32
+    args.distance_history_limit = 4000
+    args.flush_every_log = True
+    args.csv_flush_rows = 1000
+    args.jsonl_flush_rows = 500
+    args.analysis_consolidated_max_elements = 100_000_000
+    args.analysis_array_dtype = "float64"
+    args.analysis_npz_compressed = False
+    args.write_full_bias_csv_vectors = False
+    args.write_gamd_globals_json = False
+
+    # ── System ────────────────────────────────────────────────────────────────
+    args.initial_phi = -60.0
+    args.initial_psi = -45.0
+    args.ph = 7.0
+    args.hydrogen_mass_amu = 3.024 if getattr(args, "hmr", False) else 0.0
+    args.production_barostat_frequency = 0
+    args.equil_safe_chunk_steps = 100
+    args.nvt_start_temperature_k = 50.0
+    args.npt_final_timestep_fs = 0.0
+
+    # ── Misc ──────────────────────────────────────────────────────────────────
+    args.double_adaptive = (args.window_mode == "double-adaptive")
+    args.cv_mode = "terminal-ca"
+    # primary_cv alias kept for cv.py compatibility
+    if not hasattr(args, "primary_cv"):
+        args.primary_cv = "distance"
 
 
 # ---------------------------------------------------------------------------
@@ -579,27 +742,25 @@ def _validate_total_window_bounds(args: argparse.Namespace) -> None:
 def parse_args(argv: Optional[Iterable[str]] = None):
     argv_list = _argv_as_list(argv)
 
-    # Pre-parse: read --config and --write-config-template before building the
-    # full parser so config defaults can be injected and templates can be
-    # written without requiring --seq.
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--config", default=None)
-    pre.add_argument("--write-config-template", nargs="?", const="chignolin_adaptive_feedback.yaml", default=None)
-    pre_args, _pre_unknown = pre.parse_known_args(argv_list)
+    pre.add_argument("--write-config-template", nargs="?", const="gareus_template.yaml",
+                     default=None)
+    pre_args, _ = pre.parse_known_args(argv_list)
 
     p = argparse.ArgumentParser(
         prog="gareus",
         add_help=False,
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        description="GAREUS peptide GaMD/REUS workflow. Use -h for concise help or -hh for the method encyclopedia.",
+        description="GAREUS peptide GaMD/REUS workflow. Use -h for help or -hh for method details.",
     )
     _add_core_args(p)
     _add_system_args(p)
     _add_cv_args(p)
     _add_window_args(p)
+    _add_us_args(p)
     _add_seeding_args(p)
     _add_genpept_prescan_args(p)
-    _add_genpept_prior_args(p)
     _add_gamd_args(p)
     _add_output_args(p)
     _add_platform_args(p)
@@ -615,44 +776,34 @@ def parse_args(argv: Optional[Iterable[str]] = None):
 
     _resolve_cv_aliases(args, argv_list)
     _normalize_run_mode(args, argv_list)
-    if bool(getattr(args, "double_adaptive", False)):
-        args.window_mode = "double-adaptive"
+
+    # Apply compat shims before validation (validators use legacy attr names)
+    _apply_v2_compat_shims(args)
+
     args.contact_scheme = contact_scheme(args)
     _validate_contact_args(args)
-    _validate_total_window_bounds(args)
 
-    if args.hmr and float(args.hydrogen_mass_amu) <= 0:
-        args.hydrogen_mass_amu = 3.024
     return args
 
 
-
 def _float_list_from_summary(value, *, label: str) -> list[float]:
-    """Return a numeric list from a driver-summary field."""
     if value is None:
         return []
     if not isinstance(value, (list, tuple)):
-        raise ValueError(f"double-adaptive feedback handoff field {label!r} is not a list")
+        raise ValueError(f"double-adaptive handoff field {label!r} is not a list")
     out = []
     for item in value:
         try:
             val = float(item)
         except Exception as exc:
-            raise ValueError(f"double-adaptive feedback handoff field {label!r} contains non-numeric value {item!r}") from exc
+            raise ValueError(f"double-adaptive handoff field {label!r} contains non-numeric value {item!r}") from exc
         if not math.isfinite(val):
-            raise ValueError(f"double-adaptive feedback handoff field {label!r} contains non-finite value {item!r}")
+            raise ValueError(f"double-adaptive handoff field {label!r} contains non-finite value {item!r}")
         out.append(val)
     return out
 
 
 def _write_double_adaptive_factorized_handoff_csv(args, out_dir: Path, feedback_summary: dict) -> Path | None:
-    """Write an explicit window CSV from factorized adaptive-feedback proposals.
-
-    Adaptive-production already knows how to seed its registry from explicit
-    per-window CSVs.  Adaptive-feedback's ordinary 1D/rectangular proposal is
-    axis-factorized, so this helper expands it into one row per thermodynamic
-    state for the double-adaptive handoff.
-    """
     out_dir = Path(out_dir)
     sparse_csv = str(
         feedback_summary.get("handoff_windows_2d_csv")
@@ -676,8 +827,7 @@ def _write_double_adaptive_factorized_handoff_csv(args, out_dir: Path, feedback_
     if not centers:
         return None
     if not k_values:
-        _k_default = getattr(args, "default_window_k_kcal_a2", None)
-        k_values = [float(_k_default if _k_default is not None else 1.0)] * len(centers)
+        k_values = [float(getattr(args, "cv1_k_default", None) or 1.0)] * len(centers)
     if len(k_values) == 1 and len(centers) > 1:
         k_values = k_values * len(centers)
     if len(k_values) != len(centers):
@@ -694,8 +844,7 @@ def _write_double_adaptive_factorized_handoff_csv(args, out_dir: Path, feedback_
         label="handoff/latest secondary force constants",
     )
     if secondary_centers and not secondary_k:
-        _sk_default = getattr(args, "secondary_cv_k_kcal", None)
-        secondary_k = [float(_sk_default if _sk_default is not None else 50.0)] * len(secondary_centers)
+        secondary_k = [float(getattr(args, "cv2_k_default", None) or 50.0)] * len(secondary_centers)
     if secondary_k and len(secondary_k) == 1 and len(secondary_centers) > 1:
         secondary_k = secondary_k * len(secondary_centers)
     if secondary_centers and len(secondary_k) != len(secondary_centers):
@@ -749,7 +898,6 @@ def _write_double_adaptive_factorized_handoff_csv(args, out_dir: Path, feedback_
 
 
 def run_double_adaptive_auto_loop(args, out_dir: Path, openmm, app, unit, forcefield, topology, equil_state, progress: Optional[GuiProgressSink] = None) -> dict:
-    """Run adaptive-feedback pilots, then adaptive-production from the feedback proposal."""
     out_dir = Path(out_dir)
     summary_path = out_dir / "double_adaptive_driver_summary.json"
     adaptive_registry = out_dir / "adaptive_production" / "state_registry.json"
@@ -782,8 +930,6 @@ def run_double_adaptive_auto_loop(args, out_dir: Path, openmm, app, unit, forcef
         return payload
 
     if bool(getattr(args, "adaptive_production_resume", False)) and feedback_completed and not adaptive_registry.exists():
-        # Interrupted after feedback pilots completed but before adaptive-production wrote
-        # state_registry.json.  Skip the feedback stage and go straight to production.
         print("[resume] Feedback pilots already completed; skipping to adaptive-production stage.")
         try:
             feedback_summary = json.loads(feedback_driver_summary_path.read_text())
@@ -799,7 +945,6 @@ def run_double_adaptive_auto_loop(args, out_dir: Path, openmm, app, unit, forcef
         prod_args.adaptive_feedback_final_production = False
         if handoff_csv is not None:
             prod_args.windows_2d_csv = str(handoff_csv)
-            print(f"    double-adaptive handoff window table: {handoff_csv}")
         prod_summary = run_adaptive_production_auto_loop(
             prod_args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress
         )
@@ -849,7 +994,7 @@ def run_double_adaptive_auto_loop(args, out_dir: Path, openmm, app, unit, forcef
         prod_args.windows_2d_csv = str(handoff_csv)
         print(f"    double-adaptive handoff window table: {handoff_csv}")
     else:
-        print("    double-adaptive handoff: no feedback proposal CSV produced; adaptive-production will use its ordinary initial adaptive windows")
+        print("    double-adaptive handoff: no feedback proposal CSV; adaptive-production will use its own initial adaptive windows")
 
     prod_summary = run_adaptive_production_auto_loop(
         prod_args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress
@@ -862,7 +1007,6 @@ def run_double_adaptive_auto_loop(args, out_dir: Path, openmm, app, unit, forcef
         "handoff_windows_csv": str(handoff_csv) if handoff_csv is not None else "",
         "adaptive_production": prod_summary,
         "final_dir": str((out_dir / "adaptive_production" / "final")),
-        "note": "Adaptive-feedback final_production is intentionally skipped. The feedback proposal seeds adaptive-production, whose frozen final phase remains the clean final sampling stage.",
     }
     write_json(summary_path, payload)
     return payload
@@ -892,7 +1036,8 @@ def main(argv: Optional[Iterable[str]] = None):
             print(json.dumps(result, indent=2, sort_keys=True))
             return
         else:
-            print(json.dumps({"ok": True, "primary_cv": primary_cv_mode(args), "note": "distance primary CV uses the historical CustomBondForce path; full validation occurs in normal smoke tests."}, indent=2, sort_keys=True))
+            print(json.dumps({"ok": True, "primary_cv": primary_cv_mode(args),
+                              "note": "distance CV uses CustomBondForce; validated in smoke tests."}, indent=2, sort_keys=True))
             return
     _write_reproducibility_files(args, out_dir, argv=argv_list)
     public_args = {k: v for k, v in vars(args).items() if not str(k).startswith("_")}
@@ -905,13 +1050,12 @@ def main(argv: Optional[Iterable[str]] = None):
     _run_status = "started"
     _run_error = None
     try:
-        progress.emit({"event": "run_start", "sequence": args.seq, "out": str(out_dir), "resume": bool(getattr(args, "resume", False))})
+        progress.emit({"event": "run_start", "sequence": args.seq, "out": str(out_dir),
+                       "resume": bool(getattr(args, "resume", False))})
 
         if bool(getattr(args, "resume", False)) and str(getattr(args, "window_mode", "adaptive")) in {"adaptive-production", "double-adaptive"}:
-            # For epochal adaptive production, plain --resume means resume the
-            # adaptive-production driver/registry. It does not mean resume one
-            # transient epoch worker from its OpenMM checkpoints.
             setattr(args, "adaptive_production_resume", True)
+            setattr(args, "ap_resume", True)
             _resume_window_mode = str(getattr(args, "window_mode", "adaptive"))
             setattr(args, "resume", False)
             loaded_resume_setup = None
@@ -924,12 +1068,10 @@ def main(argv: Optional[Iterable[str]] = None):
                 print()
                 print("ERROR: adaptive-production --resume could not load the solvated topology.")
                 print("  Expected 01_solvated_start.pdb in the run directory or one of its parents.")
-                print("  To restart from scratch, omit --resume and use a fresh --out directory.")
                 progress.emit({"event": "resume_failed", "reason": "no_solvated_topology", "out": str(out_dir)})
                 return
             openmm, app, unit, forcefield, topology, equil_state = loaded_resume_setup
-            print("[resume] Adaptive-production driver resume requested; continuing from registry/driver summary when available.")
-            print("[resume] Epoch worker checkpoints are not auto-resumed; completed epochs/segments are tracked at driver level.")
+            print("[resume] Adaptive-production driver resume; continuing from registry/driver summary.")
             progress.emit({"event": "adaptive_production_resume_setup_loaded", "out": str(out_dir)})
             if _resume_window_mode == "double-adaptive":
                 run_double_adaptive_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
@@ -937,11 +1079,6 @@ def main(argv: Optional[Iterable[str]] = None):
                 run_adaptive_production_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
 
         elif bool(getattr(args, "resume", False)):
-            # --resume: skip all setup/pilots and go straight to production.
-            #
-            # For adaptive-feedback runs the production checkpoint lives in
-            # final_production/ even when the user passes the parent directory as
-            # --out.  Search both locations so either invocation works.
             resume_dir = None
             for _candidate in [out_dir, out_dir / "final_production"]:
                 if production_checkpoint_available(_candidate):
@@ -957,26 +1094,16 @@ def main(argv: Optional[Iterable[str]] = None):
                 print("ERROR: --resume requires a production checkpoint, but none was found.")
                 print(f"  Searched: {out_dir}")
                 print(f"            {out_dir / 'final_production'}")
-                print("  Expected file in either location:")
                 for _p in _manifest_paths:
                     _exists = _p.exists()
-                    _chk_files_ok = False
+                    _chk_ok = False
                     if _exists:
                         try:
-                            import json as _json
-                            _m = _json.loads(_p.read_text(encoding="utf-8"))
-                            _chk_files_ok = all((_p.parent / str(f)).exists() for f in _m.get("replica_checkpoint_files", []))
+                            _m = json.loads(_p.read_text(encoding="utf-8"))
+                            _chk_ok = all((_p.parent / str(f)).exists() for f in _m.get("replica_checkpoint_files", []))
                         except Exception:
                             pass
-                    print(f"    {_p}  [{'found but .chk files missing' if _exists and not _chk_files_ok else 'found' if _exists else 'NOT FOUND'}]")
-                print()
-                print("Possible causes:")
-                print("  - Wrong --out path (does not match the original run directory)")
-                print("  - Run was cancelled before the first checkpoint was written")
-                print(f"    (default checkpoint interval is 50000 steps; pass --checkpoint-interval N to tune)")
-                print("  - Checkpoint files were deleted or moved")
-                print()
-                print("To start a new run from scratch omit --resume.")
+                    print(f"    {_p}  [{'found but .chk files missing' if _exists and not _chk_ok else 'found' if _exists else 'NOT FOUND'}]")
                 progress.emit({"event": "resume_failed", "reason": "no_production_checkpoint", "out": str(out_dir)})
                 return
 
@@ -987,9 +1114,6 @@ def main(argv: Optional[Iterable[str]] = None):
                 _write_reproducibility_files(args, out_dir, argv=argv_list)
                 initialize_run_manifest(args, out_dir, argv=argv_list)
 
-            # The solvated topology PDB may live in a parent dir (e.g. when
-            # resuming final_production/ whose 01_solvated_start.pdb is one
-            # level up).  Search up to two levels.
             loaded_resume_setup = None
             for _pdb_dir in list(dict.fromkeys([out_dir, out_dir.parent, out_dir.parent.parent])):
                 _setup = load_existing_openmm_setup_for_resume(args, _pdb_dir, require_equil_state=False)
@@ -1000,26 +1124,18 @@ def main(argv: Optional[Iterable[str]] = None):
             if loaded_resume_setup is None:
                 print()
                 print("ERROR: --resume found a production checkpoint but could not load the solvated topology.")
-                print(f"  Searched for 01_solvated_start.pdb in:")
                 for _pdb_dir in list(dict.fromkeys([out_dir, out_dir.parent, out_dir.parent.parent])):
                     _pdb = _pdb_dir / "01_solvated_start.pdb"
                     print(f"    {_pdb}  [{'found' if _pdb.exists() else 'NOT FOUND'}]")
-                print()
-                print("The solvated PDB is written at the start of every fresh run.")
-                print("If it was deleted, start a new run from scratch without --resume.")
                 progress.emit({"event": "resume_failed", "reason": "no_solvated_topology", "out": str(out_dir)})
                 return
 
             openmm, app, unit, forcefield, topology, equil_state = loaded_resume_setup
             print("[resume] Reusing existing solvated topology and production checkpoints.")
             progress.emit({"event": "resume_setup_loaded", "production_checkpoint": True, "out": str(out_dir)})
-
-            # Always call run_gareus directly — adaptive-feedback pilots are
-            # already complete and must not be re-run on resume.
             run_gareus(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
 
         else:
-            # Fresh start: equilibrate, then run the requested workflow.
             openmm, app, unit, forcefield, topology, equil_state = minimize_and_npt_equilibrate(args, out_dir, progress=progress)
             if str(getattr(args, "window_mode", "adaptive")) == "adaptive-feedback":
                 run_adaptive_feedback_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)

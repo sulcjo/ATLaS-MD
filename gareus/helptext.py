@@ -67,15 +67,14 @@ Useful starting points
     # epoch-based adaptive production with a global aggregate-MD runtime pool
     gareus --seq CLN025 --run-mode hmr-gamd --cv1 contacts --cv2 rama-map \
            --window-mode adaptive-production \
-           --adaptive-production-total-md-pool-ns 840 \
-           --contact-adaptive-max-total-windows 16 \
+           --md-budget-ns 840 \
            --out run_adaptive_pool
 
     # double-adaptive: feedback pilots seed adaptive-production epochs/topups
     gareus --seq CLN025 --run-mode hmr-gamd --cv1 contacts --cv2 rama-map \
-           --double-adaptive \
-           --adaptive-feedback-rounds 3 \
-           --adaptive-production-epochs 10 \
+           --window-mode double-adaptive \
+           --adaptive-rounds 3 \
+           --ap-epochs 10 \
            --out run_double_adaptive
 
     # nonlocal-contact primary CV, with automatic contact-window calibration
@@ -97,38 +96,26 @@ Common flags
     --resume                            Resume from checkpoints or setup states under --out.
     --seed INT                          Random seed.
 
-    --run-mode MODE                    cmd, hmr-cmd, gamd, or hmr-gamd. cmd/hmr-cmd need no gamd-openmm.
+    --run-mode MODE                     cmd, hmr-cmd, gamd, or hmr-gamd. cmd/hmr-cmd need no gamd-openmm.
     --window-mode MODE                  manual, adaptive, adaptive-feedback, adaptive-production, or double-adaptive.
-    --double-adaptive                   Alias for --window-mode double-adaptive.
-    --cv1 MODE                          Friendly primary CV: distance or contacts.
-    --cv2 MODE                          Friendly secondary CV; non-none auto-enables 2D centers.
-    --primary-cv MODE                   Expert primary CV: distance or nonlocal-contacts.
-    --windows-a A ...                   Manual distance centers in Angstrom.
-    --contact-centers C ...             Manual contact-fraction centers.
-    --secondary-cv MODE                 Expert secondary CV: none, alpha, beta, alpha-coil-beta, rama-map, rama-regions, custom.
-    --secondary-cv-centers C ...        Create/override a 2D grid by crossing primary and secondary centers.
+    --cv1 MODE                          Primary CV: distance or contacts.
+    --cv2 MODE                          Secondary CV; non-none auto-enables 2D centers.
+    --cv2-centers C ...                 Override auto 2D centers (e.g. -0.8 0.0 0.8).
+    --windows-a A ...                   Manual distance centers in Angstrom (--window-mode manual).
     --seed-conformers-dir DIR           Use GENPEPT survivors for CV-aware window starts.
     --seed-selection-mode MODE          auto/active-cv, primary, or legacy distance seed scoring.
 
-    --box-shape SHAPE                   Solvent box shape: dodecahedron default, cube legacy.
+    --box-shape SHAPE                   Solvent box shape: dodecahedron (default), cube, octahedron.
     --padding-nm NM                     Solvent padding around the peptide.
 
-    --production-steps N                Production steps per replica; alias for --gamd-production-steps.
-    --gamd-production-steps N           Historical production-step flag, still supported.
+    --production-steps N                Production steps per replica.
     --exchange-mode MODE                neighbor, random-pair, all-pair-sweep, or gibbs-walk.
     --exchange-interval N               Steps between exchange attempts.
-    --adaptive-production-total-md-pool-ns NS
-                                         Aggregate adaptive-production MD pool over all states/replicas.
-    --adaptive-production-epochs N       Maximum adaptive-production epochs before frozen final production.
-    --adaptive-production-epoch-step-budget N
-                                         Approximate aggregate step budget per adaptive epoch.
-    --adaptive-production-final-pool-fraction F
-                                         Fraction of the runtime pool reserved for frozen final production.
-    --contact-adaptive-max-total-windows N
-                                         Total expanded 2D window/replica cap; useful for max active replicas.
+    --md-budget-ns NS                   Aggregate adaptive-production MD pool over all states/replicas.
+    --ap-epochs N                       Maximum adaptive-production epochs before frozen final.
+    --ap-final-pool-fraction F          Fraction of the runtime pool reserved for frozen final production.
     --traj-format FORMAT                dcd, xtc, or none.
-    --no-sample-potential-energy        Skip live total-PE diagnostics; later decomposition still works from saved coordinates.
-    --no-flush-every-log                Buffer CSV/JSONL between checkpoints for faster filesystem I/O.
+    --no-sample-potential-energy        Skip live total-PE diagnostics.
 
     --platform NAME                     auto, CUDA, HIP, OpenCL, CPU, or Reference.
     --device-index LIST                 GPU device token(s), e.g. 0 or 0,1,2,3.
@@ -218,23 +205,19 @@ High-level dynamics modes:
                          defaults to 4 fs unless --timestep-fs is explicit.
     --run-mode hmr-gamd  HMR + GaMD/REUS; defaults to 4 fs unless --timestep-fs is explicit.
 
-Friendly CV shortcuts:
+CV shortcuts (schema v2.0):
 
     --cv1 distance       Primary terminal-distance umbrella CV.
     --cv1 contacts       Primary smooth nonlocal-contact fraction CV.
-    --cv2 rama-map       Enable explicit Ramachandran basin-map CV and automatically
-                         cross primary windows with beta/PPII/right-alpha/left-alpha
-                         centers [-1, -1/3, 1/3, 1].
-    --cv2 rama-regions   Legacy scalar Ramachandran-region ladder with
-                         centers [-1, -0.5, 0, 0.5, 1].
+    --cv2 rama-map       Enable explicit Ramachandran basin-map CV; auto-inserts
+                         centers [-1, -1/3, 1/3, 1] (beta/PPII/right-alpha/left-alpha).
+    --cv2 rama-regions   Scalar Ramachandran-region ladder; auto-inserts [-1, -0.5, 0, 0.5, 1].
     --cv2 alpha-coil-beta
-                         Enable secondary alpha-minus-beta CV and automatically
-                         cross primary windows with [-0.8, 0, 0.8].
+                         Signed alpha-minus-beta CV; auto-inserts [-0.8, 0, 0.8].
+    --cv2-centers C ...  Override auto-inserted 2D centers explicitly.
 
-The expert flags --primary-cv, --secondary-cv, and --secondary-cv-centers remain
-available.  Supplying --secondary-cv without a center list keeps the historical
-single secondary restraint; supplying --cv2 non-none deliberately creates a 2D
-primary x secondary window set unless centers are explicitly overridden.
+--cv2 non-none deliberately creates a 2D primary x secondary window set.
+Supply --cv2-centers to override the auto-inserted center ladder.
 
 0.1 Peptide construction
 ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -302,17 +285,16 @@ The default physical model is:
     rigid water:        True
     HMR:                off by default, unless --run-mode hmr-cmd or hmr-gamd is used
 
-Hydrogen mass repartitioning can be enabled directly or through the high-level mode:
+Hydrogen mass repartitioning is enabled through the high-level run mode:
 
-    --hmr
     --run-mode hmr-cmd
     --run-mode hmr-gamd
 
-With HMR enabled, the default repartitioned hydrogen mass is:
+With HMR enabled, the repartitioned hydrogen mass is:
 
-    3.024 amu
+    3.024 amu (fixed internal default)
 
-unless overridden by --hydrogen-mass-amu. The high-level HMR run modes also default the production timestep to 4 fs when neither the CLI nor the config file sets --timestep-fs explicitly.
+HMR run modes also default the production timestep to 4 fs when neither the CLI nor the config file sets --timestep-fs explicitly.
 
 0.4 Staged equilibration
 ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -366,24 +348,19 @@ where 0 means automatic min(--timestep-fs, 2 fs).
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 The default primary CV is terminal C-alpha distance:
 
-    --primary-cv distance
-    --cv-mode terminal-ca
+    --cv1 distance
 
 Mathematically:
 
     x(q) = ||r_a(q) - r_b(q)||
 
-The terminal N/C selector is available with:
-
-    --cv-mode terminal-n-c
-
-and explicit atom selectors are available with:
+Explicit atom selectors (expert):
 
     --cv-atom1 1:CA --cv-atom2 -1:CA
 
 The alternative primary CV is a smooth nonlocal-contact fraction:
 
-    --primary-cv nonlocal-contacts
+    --cv1 contacts
 
 with:
 
@@ -406,13 +383,12 @@ Default window mode:
     --window-mode adaptive
 
 For the default distance CV, the package estimates a terminal-distance range
-from the sequence and constructs adaptive umbrella centers.  Default distance
-adaptive settings are:
+from the sequence and constructs adaptive umbrella centers.  Default settings:
 
-    target spacing   = 2 A
-    minimum windows  = 4
-    maximum windows  = 32
-    adaptive prescan = off by default
+    --cv1-target-spacing = 0 (auto: 2 A for distance)
+    --cv1-range-min/max  = 0 (auto-detect from sequence/prescan)
+    --cv1-prescan        = true (short unbiased prescan to calibrate range)
+    --cv1-prescan-steps  = 0 (auto: 5000 steps)
 
 The historical manual centers are still available in manual mode:
 
@@ -449,7 +425,7 @@ with default clamp:
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Default secondary CV mode is:
 
-    --secondary-cv none
+    --cv2 none  (omitted → 1D workflow)
 
 If enabled, the package adds a second harmonic umbrella term on a smooth
 backbone torsion-content score.  Available modes include:
@@ -469,10 +445,14 @@ Default angular width:
 
     sigma = 35 degrees
 
-If multiple secondary centers are supplied, the package creates a 2D umbrella
-grid:
+Multiple secondary centers create a 2D umbrella grid:
 
-    primary centers x secondary-CV centers
+    primary centers x secondary (--cv2-centers)
+
+Auto-inserted centers when --cv2 is set without --cv2-centers:
+    rama-map:         [-1, -1/3, 1/3, 1]
+    alpha-coil-beta:  [-0.8, 0, 0.8]
+    rama-regions:     [-1, -0.5, 0, 0.5, 1]
 
 Explicit sparse 2D windows can instead be loaded with:
 
@@ -496,17 +476,12 @@ The package therefore does not simply clone the NPT-equilibrated structure into
 every window.  It generates one starting structure per umbrella window by
 restrained CV pulling.  Default pull settings are:
 
-    5,000 steps per window
-    pull k = 5 kcal/mol/A^2 for distance CV
-    pull friction = 10 ps^-1
+    5,000 steps per window          (--us-pull-steps-per-window)
+    pull k = 5 kcal/mol/CV^2       (--us-pull-k; unified for all CV types)
+    pull friction = 10 ps^-1       (--us-pull-friction-per-ps)
     pull timestep = min(production timestep, 2 fs)
     minimization at pulled centers = 100 iterations
-
-For contact CVs, pulling is more conservative:
-
-    max contact pull timestep = 1 fs
-    minimum friction          = 20 ps^-1
-    contact pull k is capped unless explicitly overridden
+    ramp stages for contact / 2D secondary = 8  (--us-pull-ramp-stages)
 
 For 2D CVs, staged relaxation can first relax the primary CV and then ramp the
 secondary CV.  If --seed-conformers-dir points to a GENPEPT output, nearby
@@ -547,14 +522,12 @@ GaMD is provided through gamd-openmm.  Default boost type:
 
 Default GaMD parameters:
 
-    sigma0p           = 6 kcal/mol
-    sigma0d           = 6 kcal/mol
-    cmd prep          = 5,000 steps
-    cmd               = 50,000 steps
-    equil prep        = 5,000 steps
-    equil             = 50,000 steps
-    production        = 500,000 steps
-    averaging window  = 5,000 steps
+    --sigma0p              = 6 kcal/mol   (primary boost sigma)
+    --sigma0d              = 6 kcal/mol   (secondary boost sigma, dual modes)
+    --equil-steps          = 50,000       (GaMD equilibration/calibration)
+    --production-steps     = 500,000      (production per replica)
+    --gamd-averaging-window = 5,000 steps
+    cmd/equil prep steps   = 5,000/5,000  (hardcoded internal defaults)
 
 The package uses an article-style shared GaMD setup:
 
@@ -648,12 +621,11 @@ then the package performs:
 
 Default adaptive-feedback settings are:
 
-    rounds                                = 3
-    pilot fraction                        = 0.05 of final production
-    validation fraction                   = 0.10 for final pre-production validation
-    target neighboring-window overlap     = 0.25
-    bootstrap samples                     = 50
-    aggressiveness                        = balanced
+    --adaptive-rounds        = 3
+    --pilot-fraction         = 0.05 of production-steps
+    --validation-steps       = -1 (auto: 1/10 of production-steps)
+    --target-overlap         = 0.25
+    --aggressiveness         = balanced
 
 The final production lives under:
 
@@ -676,30 +648,25 @@ than a single fixed final production.  The workflow is:
     -> frozen final production
     -> post-hoc union-state MBAR inputs and quality reports
 
-Useful controls:
+Useful controls (v2.0 names):
 
-    --adaptive-production-epochs
-    --adaptive-production-epoch-steps
-    --adaptive-production-epoch-step-budget
-    --adaptive-production-total-md-pool-ns
-    --adaptive-production-final-pool-fraction
-    --adaptive-production-min-final-pool-ns
-    --adaptive-production-pool-hard-stop
-    --adaptive-production-final-steps
-    --adaptive-production-final-step-budget
-    --adaptive-production-allocation-scheduler
-    --adaptive-production-scheduled-final-segments
-    --adaptive-production-resume
-    --adaptive-production-write-union-mbar-inputs
-    --adaptive-production-run-union-mbar-analysis
+    --ap-epochs                        max adaptive epochs
+    --ap-epoch-steps                   per-state epoch steps (fallback hint)
+    --md-budget-ns                     aggregate MD pool over all states
+    --ap-final-pool-fraction           fraction reserved for frozen final
+    --ap-min-final-pool-ns             minimum ns reserved for frozen final
+    --ap-final-steps                   per-state frozen-final steps (fallback hint)
+    --ap-resume                        resume from state_registry.json
+    --ap-write-mbar-inputs             post-hoc union-state MBAR arrays
+    --ap-run-mbar                      run PyMBAR after final
 
 The runtime pool is aggregate MD, not per-replica trajectory length:
 
     consumed_ns = n_states * steps_per_state * timestep_fs / 1e6
 
 For example, 16 states run for 250,000 steps at 4 fs consume 16 aggregate ns.
-Use --contact-adaptive-max-total-windows or --adaptive-max-total-windows to cap
-the total active state/replica count in 2D campaigns.
+Active replica count grows adaptively; the md-budget-ns pool provides the
+overall resource constraint.
 
 0.15 Outputs for analysis
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -815,7 +782,7 @@ Nonlocal-contact CV:
     C(q)    = sum_ij w_ij s_ij           with --no-contact-normalize
 
 Relevant controls:
-    --primary-cv nonlocal-contacts
+    --cv1 contacts
     --contact-scheme atom-pairs | residue-balanced | ca-pairs
     --contact-atom-selection heavy | ca | backbone-heavy | sidechain-heavy | all
     --contact-min-sequence-separation N
@@ -849,13 +816,13 @@ exchange and downstream reweighting.
 ----------------------------------
 Spacing-derived k values are estimated from local center spacing:
 
-    sigma ~= spacing / overlap_sigma
+    sigma ~= spacing / cv1_adaptive_overlap_sigma
     k     ~= RT / sigma^2
 
-The result is clamped by the corresponding min/max k settings.  This is used by
-adaptive distance windows, contact windows, and secondary-CV spacing/adaptive k
-modes.  The goal is not a sacred theorem carved onto a GPU, but a practical
-initial overlap heuristic.
+Clamped by --cv1-k-min / --cv1-k-max (primary CV) and --cv2-k-min / --cv2-k-max
+(secondary CV).  All CV types (distance, contacts, secondary) use the same
+heuristic with CV-appropriate units.  The goal is a practical initial overlap
+heuristic, not a theorem.
 
 6. Secondary-structure CVs
 --------------------------
@@ -870,7 +837,7 @@ Supported modes include:
     alpha-coil-beta       signed alpha-minus-beta transition coordinate
     rama-map              explicit Ramachandran basin-map coordinate
     rama-regions          legacy soft Ramachandran basin coordinate
-    custom                target supplied by --secondary-cv-phi0-deg/psi0-deg
+    custom                target supplied by --cv2-phi0-deg/--cv2-psi0-deg
 
 For `alpha-coil-beta`, alpha-like states are positive, beta-like states are
 negative, and coil/disordered states tend toward zero.  For `rama-map`, the code
@@ -882,24 +849,17 @@ scalar ladder.
 
 7. 2D and sparse windows
 ------------------------
-With multiple `--secondary-cv-centers`, GAREUS normally creates a rectangular
+With multiple `--cv2-centers`, GAREUS normally creates a rectangular
 cross-product of primary centers x secondary centers.  `--windows-2d-csv` can
 instead load an explicit per-window table, which supports sparse local patches
 from adaptive feedback.
 
-`--genpept-prior-enabled` builds a round-zero explicit 2D table from GENPEPT
-output structures before the first adaptive-feedback pilot.  GAREUS rescoring
-uses the active CV1/CV2 definitions, writes `genpept_prior/genpept_prior_windows_2d.csv`,
-and feeds that table through the same sparse explicit-2D machinery.  This is a
-sampling prior only: it can place initial windows and seed suggestions, but it is
-not PMF/MBAR evidence.
+GENPEPT prescan (`--genpept-prescan`) reads GENPEPT output stages, rescores with
+active CV1/CV2 definitions, and uses the occupancy map as a window prior and seed
+library.  This is a sampling prior only, not PMF/MBAR evidence.
 
-Neighbor exchange for explicit/sparse 2D tables uses a geometry graph.  The graph
-combines row/column-style relationships with k-nearest/radius edges controlled by:
-
-    --explicit-2d-exchange-neighbor-k
-    --explicit-2d-exchange-radius
-    --explicit-2d-exchange-slots
+Neighbor exchange for explicit/sparse 2D tables uses a geometry graph with
+k-nearest/radius edges (internal defaults; not user-facing in v2.0).
 
 The graph is written to diagnostic files so the exchange topology is auditable.
 
@@ -926,7 +886,7 @@ The selector writes:
 Controls:
 
     --seed-selection-mode auto|active-cv|primary|distance
-    --seed-secondary-weight FLOAT
+    --seed-cv2-weight FLOAT          (weight of CV2 in active-cv scoring)
     --seed-max-reuse-per-conformer N
 
 `auto` is currently equivalent to `active-cv`: score by CV1 and, when CV2 is
@@ -954,11 +914,10 @@ especially `final_survivor_seeds.csv`.
 GaMD setup uses the selected `--gamd-boost-type` and sigma controls:
 
     --gamd-boost-type
-    --sigma0p-kcal-mol
-    --sigma0d-kcal-mol
-    --gamd-cmd-prep-steps / --gamd-cmd-steps
-    --gamd-equil-prep-steps / --gamd-equil-steps
-    --gamd-production-steps
+    --sigma0p
+    --sigma0d
+    --equil-steps
+    --production-steps
 
 The code performs a shared GaMD setup and copies compatible integrator global
 state into production replicas.  Diagnostics compare copied global variables and
@@ -994,12 +953,13 @@ window set.  It can add midpoint windows, shift centers, prune over-resolved
 regions, and create sparse 2D local patches.
 
 Important controls:
-    --adaptive-feedback-rounds
-    --adaptive-feedback-pilot-fraction
-    --adaptive-feedback-target-overlap
-    --adaptive-window-aggressiveness
-    --adaptive-min-total-windows / --adaptive-max-total-windows
-    --contact-adaptive-min-total-windows / --contact-adaptive-max-total-windows
+    --adaptive-rounds         (pilot refinement rounds)
+    --pilot-fraction          (pilot steps as fraction of production-steps)
+    --validation-steps        (last pre-production validation steps)
+    --target-overlap          (target neighboring-window overlap)
+    --aggressiveness          (conservative/balanced/aggressive/very-aggressive)
+    --sparse-2d               (sparse local 2D midpoint patches)
+    --region-memory           (stateful region classification between pilots)
 
 Final production should be analyzed from `final_production/` when adaptive
 feedback is used.  Pilot folders are diagnostics, not final PMF inputs.
@@ -1051,24 +1011,17 @@ frozen final phase, while adaptive epochs and topups consume the remainder.
 
 Important controls:
 
-    --adaptive-production-total-md-pool-ns
-    --adaptive-production-final-pool-fraction
-    --adaptive-production-min-final-pool-ns
-    --adaptive-production-pool-hard-stop
-    --adaptive-production-epochs
-    --adaptive-production-epoch-step-budget
-    --adaptive-production-final-step-budget
-    --adaptive-production-resume
-    --adaptive-production-require-convergence-before-final
-    --adaptive-production-quality-hard-fail
-
-For 2D contact x Rama campaigns, cap total active replicas with:
-
-    --contact-adaptive-max-total-windows
-
-or, for non-contact adaptive campaigns:
-
-    --adaptive-max-total-windows
+    --md-budget-ns                     (aggregate MD pool over all states)
+    --ap-final-pool-fraction           (fraction reserved for frozen final)
+    --ap-min-final-pool-ns             (minimum ns reserved for frozen final)
+    --ap-epochs                        (max adaptive epochs)
+    --ap-epoch-steps                   (per-state epoch steps fallback hint)
+    --ap-final-steps                   (per-state frozen-final steps fallback hint)
+    --ap-resume                        (resume from state_registry.json)
+    --ap-target-overlap / --ap-min-exchange
+                                       (per-epoch edge health thresholds)
+    --ap-write-mbar-inputs / --ap-run-mbar
+                                       (post-hoc union-state MBAR outputs)
 
 The current implementation uses safe epoch-worker execution rather than true
 in-process OpenMM context reuse.  Context reuse flags write readiness reports and
@@ -1168,9 +1121,7 @@ This helper constructs and optionally executes a deliberately tiny real workflow
 Default underlying workflow command, in compact form:
 
     gareus --seq AA --window-mode manual --windows-a 3.5 4.5 \
-      --gamd-cmd-prep-steps 1 --gamd-cmd-steps 1 \
-      --gamd-equil-prep-steps 1 --gamd-equil-steps 1 \
-      --gamd-production-steps 4 --exchange-interval 2 \
+      --equil-steps 1 --production-steps 4 --exchange-interval 2 \
       --traj-format none --progress-mode none --tui-mode none
 
 Operational commands:
@@ -1216,7 +1167,6 @@ For HPC runs, use:
     --replica-device-mode auto
     --scratchdir /local/nvme/run_name
     --traj-format xtc or --traj-format none for I/O reduction
-    --no-flush-every-log on slow/network filesystems
 
 `--scratchdir` mirrors results back to `--out` at checkpoints, reducing pressure
 on network filesystems during high-frequency trajectory/NPZ/CSV writes.
@@ -1229,9 +1179,7 @@ decomposition still works if coordinate trajectories or final PDB snapshots are
 kept.  Do not combine it with `--traj-format none` if you expect frame-by-frame
 post-hoc energies later.
 
-`--no-flush-every-log` lets `--csv-flush-rows`/`--jsonl-flush-rows` batch scalar
-I/O between checkpoints and clean shutdown.  This changes output durability during
-a hard crash, not the simulation trajectory or statistics.
+CSV/JSONL buffering thresholds are internal defaults in v2.0 (not user-facing).
 
 16. Post-hoc intra/inter peptide energy analysis
 ------------------------------------------------

@@ -84,7 +84,7 @@ def test_cli_performance_flags_are_documented() -> None:
     result = _run_cli("-hh")
     assert result.returncode == 0
     assert "--no-sample-potential-energy" in result.stdout
-    assert "--no-flush-every-log" in result.stdout
+    # --no-flush-every-log dropped in v2.0 (internal default; not user-facing)
 
 
 def test_adaptive_hist_overlap_accepts_numpy_arrays() -> None:
@@ -208,12 +208,10 @@ def test_genpept_prior_cli_and_selector_smoke() -> None:
         "--seq", "AA",
         "--cv1", "distance",
         "--cv2", "rama-map",
-        "--genpept-prior-enabled",
-        "--genpept-prior-dir", "seeds",
-        "--genpept-prior-max-windows", "8",
     ])
-    assert parsed.genpept_prior_enabled is True
-    assert str(parsed.genpept_prior_dir) == "seeds"
+    # genpept_prior dropped from CLI; compat shim sets disabled defaults
+    assert parsed.genpept_prior_enabled is False
+    assert parsed.genpept_prior_dir is None
     assert parsed.secondary_cv == "rama-map"
 
     args = SimpleNamespace(
@@ -509,14 +507,14 @@ def test_seed_selection_options_parse() -> None:
         "--cv2", "rama-map",
         "--seed-conformers-dir", "seeds",
         "--seed-selection-mode", "active-cv",
-        "--seed-secondary-weight", "2.5",
+        "--seed-cv2-weight", "2.5",
         "--seed-max-reuse-per-conformer", "1",
     ])
     assert args.primary_cv == "nonlocal-contacts"
     assert args.secondary_cv == "rama-map"
     assert str(args.seed_conformers_dir) == "seeds"
     assert args.seed_selection_mode == "active-cv"
-    assert abs(float(args.seed_secondary_weight) - 2.5) < 1.0e-12
+    assert abs(float(args.seed_cv2_weight) - 2.5) < 1.0e-12
     assert args.seed_max_reuse_per_conformer == 1
 
 
