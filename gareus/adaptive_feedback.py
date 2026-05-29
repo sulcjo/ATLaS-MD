@@ -2823,7 +2823,14 @@ def run_adaptive_feedback_auto_loop(args, out_dir: Path, openmm, app, unit, forc
     pilot_fraction = float(getattr(args, "adaptive_feedback_pilot_fraction", 0.05) or 0.05)
     if not math.isfinite(pilot_fraction) or pilot_fraction <= 0.0:
         pilot_fraction = 0.05
-    pilot_steps = max(1, int(round(pilot_fraction * float(target_prod_steps))))
+    try:
+        pilot_steps_override = int(getattr(args, "adaptive_feedback_pilot_steps", -1))
+    except Exception:
+        pilot_steps_override = -1
+    if pilot_steps_override > 0:
+        pilot_steps = int(pilot_steps_override)
+    else:
+        pilot_steps = max(1, int(round(pilot_fraction * float(target_prod_steps))))
     target_overlap = float(getattr(args, "adaptive_feedback_target_overlap", 0.30))
     if not math.isfinite(target_overlap) or target_overlap <= 0.0:
         target_overlap = 0.30
@@ -2853,7 +2860,12 @@ def run_adaptive_feedback_auto_loop(args, out_dir: Path, openmm, app, unit, forc
 
     print("Adaptive-feedback automatic workflow")
     print(f"    pilot rounds: {n_rounds}")
-    print(f"    pilot production steps per round: {pilot_steps} ({pilot_fraction:.4g} x final target {target_prod_steps})")
+    _pilot_source = (
+        f"explicit --pilot-steps override"
+        if pilot_steps_override > 0
+        else f"{pilot_fraction:.4g} x final target {target_prod_steps}"
+    )
+    print(f"    pilot production steps per round: {pilot_steps} ({_pilot_source})")
     if n_rounds > 1:
         print(f"    final validation pilot steps: {validation_pilot_steps} ({validation_step_source})")
     print(f"    requested neighbor overlap: {target_overlap:.3f}")

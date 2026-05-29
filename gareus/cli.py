@@ -172,6 +172,10 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                    help="Pilot refinement rounds before final production.")
     p.add_argument("--pilot-fraction", type=float, default=0.05,
                    help="Pilot steps as fraction of production-steps per round.")
+    p.add_argument("--pilot-steps", type=int, default=-1,
+                   help="Absolute pilot steps per round. Overrides --pilot-fraction when > 0. "
+                        "Use this when epoch/production steps are short and the fraction would give "
+                        "too few steps for reliable overlap statistics.")
     p.add_argument("--validation-steps", type=int, default=-1,
                    help="Last pre-production validation steps. -1 = 1/10 of production-steps.")
     p.add_argument("--target-overlap", type=float, default=0.25,
@@ -560,6 +564,7 @@ def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
     args.adaptive_window_aggressiveness = args.aggressiveness
     args.adaptive_feedback_rounds = args.adaptive_rounds
     args.adaptive_feedback_pilot_fraction = args.pilot_fraction
+    args.adaptive_feedback_pilot_steps = args.pilot_steps
     args.adaptive_feedback_validation_steps = args.validation_steps
     args.adaptive_feedback_target_overlap = args.target_overlap
     args.sparse_2d_patches_enabled = args.sparse_2d
