@@ -22,15 +22,32 @@ from .io import read_json_file
 from .store import SegmentRegistry
 
 
+def _concat_numpy_dicts(results: list) -> dict:
+    """Concatenate a list of numpy column-dicts into one, sorted by (step, replica)."""
+    non_empty = [r for r in results if r and "step" in r and len(r["step"]) > 0]
+    if not non_empty:
+        return {}
+    keys = list(non_empty[0].keys())
+    combined = {k: np.concatenate([r[k] for r in non_empty]) for k in keys}
+    order = np.lexsort((combined["replica"], combined["step"]))
+    return {k: v[order] for k, v in combined.items()}
+
+
 def load_samples(
     run_dir: Path,
     segment_ids: Optional[list] = None,
 ) -> dict:
-    """Load all production samples from Parquet files via DuckDB.
+    """Load production samples from Parquet files via DuckDB.
 
-    Returns a dict of numpy arrays keyed by column name.
-    Returns empty dict if no Parquet data found.
-    Samples are ordered by (step, replica).
+    Uses segments.json to determine which rows are valid:
+    - complete: all rows included
+    - running (last segment only): all rows included (active run)
+    - interrupted: rows with step <= end_step included (end_step = last checkpoint
+      absolute_step; rows beyond it are phantom frames from a rolled-back state)
+    - abandoned / running (non-last): skipped entirely
+    - No segments.json: falls back to reading all Parquet files (legacy)
+
+    segment_ids overrides the registry-based selection when provided.
     """
     import duckdb
 
@@ -39,20 +56,84 @@ def load_samples(
     if not samples_dir.exists():
         return {}
 
-    files = sorted(samples_dir.glob("**/*.parquet"))
+    # Explicit override: legacy path or caller-specified selection
     if segment_ids is not None:
-        files = [f for f in files if f.parent.name in segment_ids]
-    if not files:
+        files = sorted(f for f in samples_dir.glob("**/*.parquet")
+                       if f.parent.name in segment_ids)
+        if not files:
+            return {}
+        conn = duckdb.connect()
+        result = conn.execute(
+            "SELECT * FROM read_parquet(?) ORDER BY step, replica",
+            [[str(f) for f in files]],
+        ).fetchnumpy()
+        conn.close()
+        return result
+
+    # Registry-aware path
+    seg_json = run_dir / "segments.json"
+    if not seg_json.exists():
+        # Legacy fallback: no registry, read everything
+        files = sorted(samples_dir.glob("**/*.parquet"))
+        if not files:
+            return {}
+        conn = duckdb.connect()
+        result = conn.execute(
+            "SELECT * FROM read_parquet(?) ORDER BY step, replica",
+            [[str(f) for f in files]],
+        ).fetchnumpy()
+        conn.close()
+        return result
+
+    segs = json.loads(seg_json.read_text(encoding="utf-8"))
+    if not segs:
         return {}
 
-    file_strs = [str(f) for f in files]
+    last_seg_id = segs[-1]["segment_id"]
+    unfiltered_files: list = []
+    filtered_groups: list = []  # list of (end_step: int, files: list[str])
+
+    for seg in segs:
+        seg_id = seg["segment_id"]
+        status = seg.get("status", "running")
+        seg_dir = samples_dir / seg_id
+        if not seg_dir.exists():
+            continue
+        files = sorted(str(f) for f in seg_dir.glob("*.parquet"))
+        if not files:
+            continue
+
+        if status == "complete":
+            unfiltered_files.extend(files)
+        elif status == "running" and seg_id == last_seg_id:
+            # Active run — include all rows written so far
+            unfiltered_files.extend(files)
+        elif status == "interrupted":
+            end_step = seg.get("end_step", -1)
+            if end_step is not None and int(end_step) >= 0:
+                filtered_groups.append((int(end_step), files))
+            # end_step=-1 or None: skip (no valid boundary known)
+        # abandoned / running non-last: skip
+
+    if not unfiltered_files and not filtered_groups:
+        return {}
+
     conn = duckdb.connect()
-    result = conn.execute(
-        "SELECT * FROM read_parquet(?) ORDER BY step, replica",
-        [file_strs],
-    ).fetchnumpy()
+    results = []
+    if unfiltered_files:
+        r = conn.execute(
+            "SELECT * FROM read_parquet(?)",
+            [unfiltered_files],
+        ).fetchnumpy()
+        results.append(r)
+    for end_step, files in filtered_groups:
+        r = conn.execute(
+            "SELECT * FROM read_parquet(?) WHERE step <= ?",
+            [files, end_step],
+        ).fetchnumpy()
+        results.append(r)
     conn.close()
-    return result
+    return _concat_numpy_dicts(results)
 
 
 def load_windows(

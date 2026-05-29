@@ -2936,6 +2936,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     _run_id = str(out_dir.name)
     _parent_seg = _seg_registry.get_latest_segment()
     _parent_seg_id = _parent_seg["segment_id"] if _parent_seg else None
+    _parent_was_running = bool(_parent_seg and _parent_seg.get("status") == "running")
     _round_id = int(getattr(args, "adaptive_feedback_round", 1))
     _seg_id = _seg_registry.open_segment(_run_id, _parent_seg_id, _round_id)
     _win_snapshot_windows = [
@@ -3691,13 +3692,32 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                         reporter = make_trajectory_reporter(app, traj_dir / f"replica_{i:03d}_resume_from_{prod_done:09d}", effective_traj_interval, args)
                         if reporter is not None:
                             sim.reporters.append(reporter)
+                # Seal the previous crashed segment: rows beyond the checkpoint
+                # step have wrong window_id labels (exchange state was rolled back)
+                # and must be excluded from MBAR analysis.
+                if _parent_was_running and _parent_seg_id is not None:
+                    _seg_registry.seal_segment(
+                        _parent_seg_id,
+                        absolute_end_step=int(manifest.get("absolute_step", 0)),
+                        status="interrupted",
+                    )
+                # Record the absolute start step of the resumed segment.
+                _seg_registry.set_segment_start_step(_seg_id, int(manifest.get("absolute_step", 0)))
             else:
                 print("    --resume requested, but no production checkpoint manifest was found; starting production from step 0")
+                # No checkpoint: any previously-running segment has no valid
+                # end boundary — mark it abandoned so it is skipped in analysis.
+                if _parent_was_running and _parent_seg_id is not None:
+                    _seg_registry.seal_segment(_parent_seg_id, absolute_end_step=-1, status="abandoned")
                 if effective_traj_interval > 0:
                     for i, sim in enumerate(sims):
                         reporter = make_trajectory_reporter(app, traj_dir / f"replica_{i:03d}_resume_fresh_{int(time.time())}", effective_traj_interval, args)
                         if reporter is not None:
                             sim.reporters.append(reporter)
+        elif _parent_was_running and _parent_seg_id is not None:
+            # Fresh start (no --resume) while a previous segment is still marked
+            # running: the prior run was abandoned without a checkpoint.
+            _seg_registry.seal_segment(_parent_seg_id, absolute_end_step=-1, status="abandoned")
 
         if prod_done <= 0:
             run_production_probe(args, out_dir, sims, assignments, centers_nm, ks_kj_nm2, primary_cv_def, cv_atom1, cv_atom2, unit, shared_gamd_globals_all)
@@ -3867,7 +3887,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         except Exception:
             pass
         try:
-            _seg_registry.close_segment(_seg_id, end_step=int(prod_done))
+            _seg_registry.close_segment(_seg_id, end_step=int(calib_steps + prod_done))
         except Exception:
             pass
         distance_logger.close()

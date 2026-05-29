@@ -688,6 +688,13 @@ def run_cv_boundary_pulls(
     friction = 20.0
     safe_chunk = 100
     sample_interval = max(1, steps // 50)
+    # Plateau early-exit: stop a pull once the running extremum has not improved
+    # by more than plateau_tol for plateau_samples consecutive samples. Disabled
+    # (plateau_tol=0.0) by default; set via cv1_boundary_pull_plateau_tol in YAML.
+    # Guard: never exit before min_frac of total steps to avoid metastable traps.
+    plateau_tol = float(getattr(args, "cv1_boundary_pull_plateau_tol", 0.0) or 0.0)
+    plateau_samples = max(3, int(getattr(args, "cv1_boundary_pull_plateau_samples", 5) or 5))
+    min_steps_before_exit = max(safe_chunk, int(steps * float(getattr(args, "cv1_boundary_pull_min_frac", 0.25) or 0.25)))
 
     platform, props = setup_platform_and_properties(openmm, args)
     print(
@@ -736,14 +743,15 @@ def run_cv_boundary_pulls(
             return t / 10.0  # Å → nm
 
     pull_results: dict = {}
-    for label, target, agg in [("min", target_min, float(np.nanmin)), ("max", target_max, float(np.nanmax))]:
+    for label, target in [("min", target_min), ("max", target_max)]:
+        is_minimizing = (label == "min")
         system = _make_system()
         integrator = make_langevin_integrator(
             openmm, unit, args,
             timestep_fs=ts,
             temperature_k=float(args.temperature_k),
             friction_per_ps=friction,
-            seed_offset=998 if label == "min" else 999,
+            seed_offset=998 if is_minimizing else 999,
         )
         sim = app.Simulation(topology, system, integrator, platform, props)
         try:
@@ -755,15 +763,18 @@ def run_cv_boundary_pulls(
         sim.context.setPositions(equil_state.getPositions())
         try:
             vel = equil_state.getVelocities()
-            sim.context.setVelocities(vel) if vel is not None else sim.context.setVelocitiesToTemperature(float(args.temperature_k) * unit.kelvin, int(args.seed) + (998 if label == "min" else 999))
+            sim.context.setVelocities(vel) if vel is not None else sim.context.setVelocitiesToTemperature(float(args.temperature_k) * unit.kelvin, int(args.seed) + (998 if is_minimizing else 999))
         except Exception:
-            sim.context.setVelocitiesToTemperature(float(args.temperature_k) * unit.kelvin, int(args.seed) + (998 if label == "min" else 999))
+            sim.context.setVelocitiesToTemperature(float(args.temperature_k) * unit.kelvin, int(args.seed) + (998 if is_minimizing else 999))
         sim.context.setParameter("r0", _r0(target))
         sim.context.setParameter("k", pull_k_openmm)
 
         values: list[float] = []
         done = 0
         last_sample = 0
+        best_extreme: Optional[float] = None
+        no_improve_count = 0
+        early_exit = False
         try:
             while done < steps:
                 chunk = min(safe_chunk, steps - done)
@@ -773,6 +784,20 @@ def run_cv_boundary_pulls(
                     cv = _read_cv(sim)
                     if math.isfinite(cv):
                         values.append(cv)
+                        if best_extreme is None:
+                            best_extreme = cv
+                            no_improve_count = 0
+                        elif is_minimizing and cv < best_extreme - plateau_tol:
+                            best_extreme = cv
+                            no_improve_count = 0
+                        elif not is_minimizing and cv > best_extreme + plateau_tol:
+                            best_extreme = cv
+                            no_improve_count = 0
+                        else:
+                            no_improve_count += 1
+                        if (plateau_tol > 0.0 and done >= min_steps_before_exit
+                                and no_improve_count >= plateau_samples):
+                            early_exit = True
                     last_sample = done
                 if progress is not None:
                     progress.progress(
@@ -780,6 +805,8 @@ def run_cv_boundary_pulls(
                         message=f"CV boundary pull toward {label}",
                         timestep_fs=ts,
                     )
+                if early_exit:
+                    break
         except Exception as exc:
             print(f"WARNING: boundary pull toward {label} failed: {exc}")
         finally:
@@ -787,11 +814,18 @@ def run_cv_boundary_pulls(
 
         if values:
             arr = np.asarray(values, dtype=float)
-            achieved = agg(arr)
-            pull_results[label] = {"target": float(target), "achieved": float(achieved), "n_samples": int(arr.size)}
-            print(f"    CV boundary pull {label}: target={target:.4g} achieved={achieved:.4g}")
+            achieved = float(np.nanmin(arr) if is_minimizing else np.nanmax(arr))
+            pull_results[label] = {
+                "target": float(target),
+                "achieved": achieved,
+                "n_samples": int(arr.size),
+                "steps_run": int(done),
+                "early_exit": bool(early_exit),
+            }
+            print(f"    CV boundary pull {label}: target={target:.4g} achieved={achieved:.4g}"
+                  + (f" (plateau at step {done}/{steps})" if early_exit else ""))
         else:
-            pull_results[label] = {"target": float(target), "achieved": float(target), "n_samples": 0, "warning": "no samples"}
+            pull_results[label] = {"target": float(target), "achieved": float(target), "n_samples": 0, "steps_run": int(done), "early_exit": False, "warning": "no samples"}
 
     margin = float(getattr(args, "cv1_boundary_pull_margin", 0.0) or 0.0)
     raw_lo = float(pull_results["min"]["achieved"])

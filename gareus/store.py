@@ -189,6 +189,41 @@ class SegmentRegistry:
                 break
         self._save()
 
+    def seal_segment(self, segment_id: str, absolute_end_step: int, status: str = "interrupted") -> None:
+        """Mark a previously-running segment as interrupted or abandoned.
+
+        interrupted: crashed mid-run; absolute_end_step is the last valid checkpoint
+            step — rows with step > absolute_end_step in its Parquet files are
+            phantom frames from a simulation state that was rolled back.
+        abandoned: crashed before first checkpoint or fresh start after crash;
+            absolute_end_step=-1 means no valid data boundary known; query layer
+            skips the segment entirely.
+
+        Does NOT overwrite segments that are already "complete".
+        """
+        for seg in self._segments:
+            if seg["segment_id"] == segment_id:
+                if seg.get("status") == "complete":
+                    return
+                seg["end_step"] = absolute_end_step
+                seg["status"] = status
+                break
+        self._save()
+
+    def set_segment_start_step(self, segment_id: str, start_step: int) -> None:
+        """Record the absolute simulation step at which this segment begins."""
+        for seg in self._segments:
+            if seg["segment_id"] == segment_id:
+                seg["start_step"] = start_step
+                break
+        self._save()
+
+    def get_segment(self, segment_id: str) -> Optional[Dict[str, Any]]:
+        for seg in self._segments:
+            if seg["segment_id"] == segment_id:
+                return seg
+        return None
+
     def get_latest_segment(self) -> Optional[Dict[str, Any]]:
         return self._segments[-1] if self._segments else None
 

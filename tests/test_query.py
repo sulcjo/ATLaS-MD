@@ -115,6 +115,113 @@ def test_load_samples_empty_dir(tmp_path):
     assert result == {}
 
 
+def _write_parquet_rows(seg_dir, steps):
+    """Write one Parquet file with rows at the given step values (no registry update)."""
+    from gareus.store import ParquetSampleWriter
+    writer = ParquetSampleWriter(seg_dir, flush_rows=10000)
+    for s in steps:
+        writer.write_sample(s, 0, 0, 0.1, None, -100.0, 1.0, 0.5, 0.5)
+    writer.close()
+
+
+def test_load_samples_skips_abandoned_segment(tmp_path):
+    """Abandoned segments (crashed before first checkpoint) must not appear in results."""
+    from gareus.query import load_samples
+    from gareus.store import SegmentRegistry
+
+    reg = SegmentRegistry(tmp_path)
+    seg1 = reg.open_segment("run_001", None, 1)
+    _write_parquet_rows(tmp_path / "samples" / seg1, [100, 200, 300])
+    reg.seal_segment(seg1, absolute_end_step=-1, status="abandoned")
+
+    result = load_samples(tmp_path)
+    assert result == {}
+
+
+def test_load_samples_filters_interrupted_rows(tmp_path):
+    """Interrupted segment: only rows with step <= end_step are included."""
+    from gareus.query import load_samples
+    from gareus.store import SegmentRegistry
+
+    reg = SegmentRegistry(tmp_path)
+    seg1 = reg.open_segment("run_001", None, 1)
+    # steps 100..1000; checkpoint was at absolute_step=600
+    _write_parquet_rows(tmp_path / "samples" / seg1, list(range(100, 1100, 100)))
+    reg.seal_segment(seg1, absolute_end_step=600, status="interrupted")
+
+    result = load_samples(tmp_path)
+    assert set(result["step"].tolist()) == {100, 200, 300, 400, 500, 600}
+
+
+def test_load_samples_includes_last_running_segment(tmp_path):
+    """The last (and only) running segment is an active run — all its rows must appear."""
+    from gareus.query import load_samples
+    from gareus.store import SegmentRegistry
+
+    reg = SegmentRegistry(tmp_path)
+    seg1 = reg.open_segment("run_001", None, 1)
+    _write_parquet_rows(tmp_path / "samples" / seg1, [100, 200, 300])
+    # No close — segment stays "running"
+
+    result = load_samples(tmp_path)
+    assert len(result["step"]) == 3
+
+
+def test_load_samples_skips_non_last_running_segment(tmp_path):
+    """A running segment that is NOT the last is a crashed run — skip it."""
+    from gareus.query import load_samples
+    from gareus.store import SegmentRegistry
+
+    reg = SegmentRegistry(tmp_path)
+    # seg_001: running (crashed, not sealed)
+    seg1 = reg.open_segment("run_001", None, 1)
+    _write_parquet_rows(tmp_path / "samples" / seg1, [100, 200, 300])
+    # seg_002: complete (new run after crash)
+    seg2 = reg.open_segment("run_001", seg1, 1)
+    _write_parquet_rows(tmp_path / "samples" / seg2, [700, 800, 900])
+    reg.close_segment(seg2, end_step=900)
+
+    result = load_samples(tmp_path)
+    assert set(result["step"].tolist()) == {700, 800, 900}
+
+
+def test_load_samples_no_duplicates_after_crash_restart(tmp_path):
+    """Crash-restart scenario: seg_001 interrupted at step 500; seg_002 starts at 600.
+    Combined result must have no rows with step > 500 from seg_001."""
+    from gareus.query import load_samples
+    from gareus.store import SegmentRegistry
+
+    reg = SegmentRegistry(tmp_path)
+    # seg_001 wrote steps 100–900 but checkpoint was at absolute_step=500
+    seg1 = reg.open_segment("run_001", None, 1)
+    _write_parquet_rows(tmp_path / "samples" / seg1, list(range(100, 1000, 100)))
+    reg.seal_segment(seg1, absolute_end_step=500, status="interrupted")
+
+    # seg_002 continues from step 600 (next log interval after checkpoint 500)
+    seg2 = reg.open_segment("run_001", seg1, 1)
+    _write_parquet_rows(tmp_path / "samples" / seg2, list(range(600, 1600, 100)))
+    reg.close_segment(seg2, end_step=1500)
+
+    result = load_samples(tmp_path)
+    steps = sorted(result["step"].tolist())
+    # seg_001 contributes 100–500; seg_002 contributes 600–1500
+    assert max(result["step"][result["step"] <= 500]) <= 500
+    assert steps == list(range(100, 600, 100)) + list(range(600, 1600, 100))
+    # Monotonically increasing — no duplicates
+    assert steps == sorted(set(steps))
+
+
+def test_load_samples_no_segments_json_fallback(tmp_path):
+    """Without segments.json, all Parquet files are loaded (legacy behavior)."""
+    from gareus.query import load_samples
+
+    seg_dir = tmp_path / "samples" / "seg_001"
+    _write_parquet_rows(seg_dir, [100, 200, 300])
+
+    result = load_samples(tmp_path)
+    assert len(result["step"]) == 3
+
+
 # --- load_windows ---
 
 def test_load_windows_returns_correct_count(tmp_path):

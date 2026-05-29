@@ -202,6 +202,99 @@ def test_segment_registry_all_segments(tmp_path):
     assert segs[1]["segment_id"] == "seg_002"
 
 
+def test_segment_registry_seal_interrupted(tmp_path):
+    from gareus.store import SegmentRegistry
+
+    reg = SegmentRegistry(tmp_path)
+    seg_id = reg.open_segment("run_001", None, 1)
+    reg.seal_segment(seg_id, absolute_end_step=50000, status="interrupted")
+
+    data = json.loads((tmp_path / "segments.json").read_text())
+    assert data[0]["status"] == "interrupted"
+    assert data[0]["end_step"] == 50000
+
+
+def test_segment_registry_seal_abandoned(tmp_path):
+    from gareus.store import SegmentRegistry
+
+    reg = SegmentRegistry(tmp_path)
+    seg_id = reg.open_segment("run_001", None, 1)
+    reg.seal_segment(seg_id, absolute_end_step=-1, status="abandoned")
+
+    data = json.loads((tmp_path / "segments.json").read_text())
+    assert data[0]["status"] == "abandoned"
+    assert data[0]["end_step"] == -1
+
+
+def test_segment_registry_seal_does_not_override_complete(tmp_path):
+    from gareus.store import SegmentRegistry
+
+    reg = SegmentRegistry(tmp_path)
+    seg_id = reg.open_segment("run_001", None, 1)
+    reg.close_segment(seg_id, end_step=200000)
+    reg.seal_segment(seg_id, absolute_end_step=100000, status="interrupted")
+
+    data = json.loads((tmp_path / "segments.json").read_text())
+    assert data[0]["status"] == "complete"
+    assert data[0]["end_step"] == 200000
+
+
+def test_segment_registry_set_start_step(tmp_path):
+    from gareus.store import SegmentRegistry
+
+    reg = SegmentRegistry(tmp_path)
+    seg_id = reg.open_segment("run_001", None, 1)
+    assert reg.get_segment(seg_id)["start_step"] is None
+    reg.set_segment_start_step(seg_id, 75000)
+
+    data = json.loads((tmp_path / "segments.json").read_text())
+    assert data[0]["start_step"] == 75000
+
+
+def test_segment_registry_get_segment(tmp_path):
+    from gareus.store import SegmentRegistry
+
+    reg = SegmentRegistry(tmp_path)
+    id1 = reg.open_segment("run_001", None, 1)
+    reg.close_segment(id1, 100000)
+    id2 = reg.open_segment("run_001", id1, 2)
+
+    seg = reg.get_segment(id1)
+    assert seg is not None
+    assert seg["segment_id"] == id1
+    assert seg["status"] == "complete"
+
+    seg2 = reg.get_segment(id2)
+    assert seg2["status"] == "running"
+
+    assert reg.get_segment("nonexistent") is None
+
+
+def test_segment_registry_seal_persists_across_instances(tmp_path):
+    from gareus.store import SegmentRegistry
+
+    reg1 = SegmentRegistry(tmp_path)
+    seg_id = reg1.open_segment("run_001", None, 1)
+    reg1.seal_segment(seg_id, 60000, "interrupted")
+
+    reg2 = SegmentRegistry(tmp_path)
+    seg = reg2.get_segment(seg_id)
+    assert seg["status"] == "interrupted"
+    assert seg["end_step"] == 60000
+
+
+def test_segment_registry_close_uses_absolute_step(tmp_path):
+    from gareus.store import SegmentRegistry
+
+    reg = SegmentRegistry(tmp_path)
+    seg_id = reg.open_segment("run_001", None, 1)
+    reg.close_segment(seg_id, end_step=125000)
+
+    data = json.loads((tmp_path / "segments.json").read_text())
+    assert data[0]["end_step"] == 125000
+    assert data[0]["status"] == "complete"
+
+
 # --- WindowSnapshot ---
 
 def test_window_snapshot_writes_json(tmp_path):
