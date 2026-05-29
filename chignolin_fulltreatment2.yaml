@@ -105,8 +105,8 @@ starting_structures:
 windows:
   window_mode: adaptive-feedback
   aggressiveness: aggressive
-  pilot_fraction: 0.02
-  validation_steps: 20000
+  pilot_steps: 500000
+  validation_steps: 100000
   adaptive_rounds: 5
   sparse_2d: true
   max_2d_patches: 12
