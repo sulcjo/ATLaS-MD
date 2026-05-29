@@ -105,9 +105,9 @@ contact_cv:
   cv1_k_min: 50.0                # was: contact_adaptive_min_k_kcal
   cv1_k_max: 250.0               # was: contact_adaptive_max_k_kcal
 
-  # Prescan / autocalibration (was contact_autocalibrate_windows + contact_autocalibration_steps)
-  cv1_prescan: true
-  cv1_prescan_steps: 20000       # was: contact_autocalibration_steps
+  # CV boundary pull — active pull toward CV extremes to find achievable range
+  cv1_boundary_pull_steps: 20000
+  cv1_boundary_pull_k: 50.0
 
   # Frontier probing (was contact_frontier_enabled + contact_frontier_probe_count)
   cv1_frontier: true
@@ -116,7 +116,6 @@ contact_cv:
   #          max_probe_offset, disable_gapfill_above_unvalidated_frontier,
   #          confirm_rounds, min_hit_fraction, unreachable_deficit,
   #          by_secondary_slice — all hardcoded to former defaults.
-  # Dropped: contact_autocalibration_sample_interval — hardcoded 100.
 
 cv2:
   # CV2 adaptive (was secondary_cv_*)
