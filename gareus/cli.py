@@ -118,10 +118,12 @@ def _add_cv_args(p: argparse.ArgumentParser) -> None:
                    help="CV1 force-constant assignment mode.")
     p.add_argument("--cv1-adaptive-overlap-sigma", type=float, default=1.25,
                    help="Overlap-sigma for spacing-derived CV1 k.")
-    p.add_argument("--cv1-prescan", action=argparse.BooleanOptionalAction, default=True,
-                   help="Run unbiased CV1 prescan/autocalibration before adaptive runs.")
-    p.add_argument("--cv1-prescan-steps", type=int, default=0,
-                   help="Steps for CV1 prescan. 0 = auto (5000).")
+    p.add_argument("--cv1-boundary-pull-steps", type=int, default=5000,
+                   help="Steps per direction for CV boundary pull (0 = skip, use configured range).")
+    p.add_argument("--cv1-boundary-pull-k", type=float, default=50.0,
+                   help="Force constant for CV boundary pulls in kcal/mol/CV².")
+    p.add_argument("--cv1-boundary-pull-margin", type=float, default=0.0,
+                   help="Extra margin added beyond achieved extreme when setting window bounds.")
     p.add_argument("--cv1-frontier", action=argparse.BooleanOptionalAction, default=False,
                    help="Enable CV1 frontier probing during adaptive-feedback.")
     p.add_argument("--cv1-frontier-probe-count", type=int, default=2,
@@ -428,9 +430,8 @@ def _validate_contact_args(args: argparse.Namespace) -> None:
             raise ValueError("Normalized contact adaptive bounds should be within [0, 1]")
     if float(getattr(args, "contact_adaptive_target_spacing", 0.15) or 0.15) <= 0:
         raise ValueError("--cv1-target-spacing must be positive")
-    _autocalib_steps = getattr(args, "contact_autocalibration_steps", None)
-    if _autocalib_steps is not None and int(_autocalib_steps) < 0:
-        raise ValueError("--cv1-prescan-steps must be >= 0")
+    if int(getattr(args, "cv1_boundary_pull_steps", 5000) or 0) < 0:
+        raise ValueError("--cv1-boundary-pull-steps must be >= 0")
     if (
         not bool(getattr(args, "resume", False))
         and not bool(getattr(args, "self_test_primary_cv_force", False))
@@ -483,7 +484,10 @@ def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
     args.adaptive_max_k_kcal_a2 = _cv1_k_max if _cv1_k_max > 0 else 20.0
     args.adaptive_k_mode = _cv1_k_mode
     args.adaptive_overlap_sigma = _cv1_sigma
-    args.adaptive_prescan_steps = args.cv1_prescan_steps
+    args.cv1_boundary_pull_steps = args.cv1_boundary_pull_steps
+    args.cv1_boundary_pull_k = args.cv1_boundary_pull_k
+    args.cv1_boundary_pull_margin = args.cv1_boundary_pull_margin
+    args.cv1_boundary_pull_timestep_fs = 1.0
 
     # contact-mode legacy attrs
     args.contact_adaptive_min = _cv1_range_min
@@ -494,9 +498,7 @@ def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
     args.contact_adaptive_max_k_kcal = _cv1_k_max if _cv1_k_max > 0 else 120.0
     args.contact_adaptive_k_mode = _cv1_k_mode
     args.contact_adaptive_overlap_sigma = _cv1_sigma
-    args.contact_autocalibrate_windows = args.cv1_prescan
-    args.contact_autocalibration_steps = args.cv1_prescan_steps if args.cv1_prescan_steps > 0 else None
-    args.contact_autocalibration_timestep_fs = None  # auto-detect
+    # boundary pull replaces old autocalibration — no compat shims needed
     args.contact_frontier_enabled = args.cv1_frontier
     args.contact_frontier_probe_count = args.cv1_frontier_probe_count
 
@@ -508,15 +510,6 @@ def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
     args.contact_adaptive_max_center_shift = 0.08
     args.contact_adaptive_min_new_spacing = 0.04
     args.contact_adaptive_coverage_gap_width = 0.10
-    args.contact_autocalibration_sample_interval = 100
-    args.contact_autocalibration_safe_chunk_steps = 50
-    args.contact_autocalibration_friction_per_ps = 20.0
-    args.contact_autocalibration_percentile = 99.0
-    args.contact_autocalibration_margin = 0.02
-    args.contact_autocalibration_expand_factor = 4.0
-    args.contact_autocalibration_max_multiple = 4.0
-    args.contact_autocalibration_min_span = 0.10
-    args.contact_autocalibration_required = False
     args.contact_pair_warning_threshold = 5000
     args.contact_frontier_percentile = 99.0
     args.contact_frontier_margin = 0.02
@@ -541,7 +534,6 @@ def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
     args.n_windows = 0
     args.adaptive_compact_floor_a = 3.5
     args.adaptive_extension_fraction = 0.95
-    args.adaptive_prescan_margin_a = 1.0
     args.umbrella_force_group = 31
     args.adaptive_secondary_cv = "auto"
 

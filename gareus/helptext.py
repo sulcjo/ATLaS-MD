@@ -398,10 +398,10 @@ Default window mode:
 For the default distance CV, the package estimates a terminal-distance range
 from the sequence and constructs adaptive umbrella centers.  Default settings:
 
-    --cv1-target-spacing = 0 (auto: 2 A for distance)
-    --cv1-range-min/max  = 0 (auto-detect from sequence/prescan)
-    --cv1-prescan        = true (short unbiased prescan to calibrate range)
-    --cv1-prescan-steps  = 0 (auto: 5000 steps)
+    --cv1-target-spacing       = 0 (auto: 2 A for distance)
+    --cv1-range-min/max        = 0 (auto-detect from sequence/boundary pull)
+    --cv1-boundary-pull-steps  = 5000 (steps per direction; 0 = skip)
+    --cv1-boundary-pull-k      = 50.0 kcal/mol/CV² (aggressive pull force constant)
 
 The historical manual centers are still available in manual mode:
 

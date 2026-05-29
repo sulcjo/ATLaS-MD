@@ -26,6 +26,7 @@ from .cv import (
     primary_cv_mode,
     primary_cv_units,
     primary_cv_value_from_positions_nm,
+    primary_k_to_openmm_value,
     prepare_primary_cv_definition,
     contact_scheme,
     secondary_cv_enabled,
@@ -34,6 +35,7 @@ from .cv import (
     secondary_cv_range,
     adaptive_secondary_force_constants_kcal,
 )
+from .forces import add_umbrella_force, add_contact_umbrella_force
 from .state import cv_distance_nm, _scalar_to_float
 from .io import write_json, _json_ready
 from .progress import GuiProgressSink, release_openmm_contexts
@@ -51,9 +53,8 @@ __all__ = [
     "set_window",
     "build_explicit_2d_neighbor_edges",
     "estimate_terminal_cv_envelope_a",
-    "run_contact_cv_autocalibration",
+    "run_cv_boundary_pulls",
     "broadcast_contact_k_for_centers",
-    "run_adaptive_prescan",
     "choose_windows",
 ]
 
@@ -641,7 +642,7 @@ def estimate_terminal_cv_envelope_a(topology, args) -> tuple[float, float, dict]
     }
     return low_a, high_a, info
 
-def run_contact_cv_autocalibration(
+def run_cv_boundary_pulls(
     args,
     out_dir: Path,
     openmm,
@@ -652,237 +653,177 @@ def run_contact_cv_autocalibration(
     equil_state,
     cv_atom1: Optional[int] = None,
     cv_atom2: Optional[int] = None,
-    cv_label: Optional[str] = None,
     progress: Optional[GuiProgressSink] = None,
-) -> dict:
-    """Short unbiased/weakly-free probe used to calibrate contact-CV windows.
+) -> tuple[float, float, dict]:
+    """Pull aggressively toward each CV extreme to find the physically achievable range.
 
-    The nonlocal-contact CV is dimensionless and system-dependent: a target of
-    0.65 can mean "reasonable collapse" for one definition and "nearly all
-    nonlocal residue pairs touch at once" for another.  This prescan samples the
-    selected contact CV from the equilibrated structure with no contact umbrella,
-    then chooses a conservative first-round adaptive range that extends beyond
-    the observed values without blindly using an unreachable user maximum.
+    Two short restrained simulations are run from the NPT-equilibrated structure:
+    one targeting the CV minimum (extended state) and one targeting the maximum
+    (collapsed state).  The actual CV values reached under heavy restraint define
+    the achievable window bounds, preventing adaptive rounds from wasting windows
+    on physically inaccessible regions.
+
+    Returns (effective_lo, effective_hi, info_dict).  For contacts mode also sets
+    args.contact_adaptive_effective_min and args.contact_adaptive_effective_max so
+    that adaptive_contact_centers() picks up the calibrated range immediately.
     """
-    if not primary_cv_is_contacts(args):
-        return {"enabled": False, "reason": "primary CV is not nonlocal-contacts"}
-    if equil_state is None:
-        return {"enabled": False, "reason": "no equilibrated state available"}
-
-    _autocalib_steps = getattr(args, "contact_autocalibration_steps", None)
-    if _autocalib_steps is None:
-        _prescan_steps = int(getattr(args, "adaptive_prescan_steps", 0) or 0)
-        steps = _prescan_steps if _prescan_steps > 0 else 5000
-    else:
-        steps = int(_autocalib_steps)
-    if steps <= 0:
-        return {"enabled": False, "reason": "contact_autocalibration_steps <= 0"}
-    sample_interval = max(1, int(getattr(args, "contact_autocalibration_sample_interval", 100) or 100))
-    safe_chunk = max(1, int(getattr(args, "contact_autocalibration_safe_chunk_steps", min(sample_interval, 100)) or min(sample_interval, 100)))
-    _autocalib_ts = getattr(args, "contact_autocalibration_timestep_fs", None)
-    if _autocalib_ts is None:
-        _prescan_ts = float(getattr(args, "adaptive_prescan_timestep_fs", 1.0) or 1.0)
-        timestep_fs = _prescan_ts if _prescan_ts > 0.0 else 1.0
-    else:
-        timestep_fs = float(_autocalib_ts)
-    friction = float(getattr(args, "contact_autocalibration_friction_per_ps", 20.0) or 20.0)
-    if timestep_fs <= 0.0:
-        timestep_fs = min(float(getattr(args, "timestep_fs", 2.0) or 2.0), 1.0)
-    if friction <= 0.0:
-        friction = 20.0
-
-    primary_def = prepare_primary_cv_definition(topology, args, cv_atom1=cv_atom1, cv_atom2=cv_atom2, cv_label=cv_label)
-    platform, props = setup_platform_and_properties(openmm, args)
-    system = create_system(app, unit, forcefield, topology, args, include_barostat=False)
-    integrator = make_langevin_integrator(
-        openmm, unit, args,
-        timestep_fs=timestep_fs,
-        temperature_k=float(getattr(args, "temperature_k", 300.0) or 300.0),
-        friction_per_ps=friction,
-        seed_offset=707,
-    )
-    sim = app.Simulation(topology, system, integrator, platform, props)
-    try:
-        box = equil_state.getPeriodicBoxVectors()
-        if box is not None:
-            sim.context.setPeriodicBoxVectors(*box)
-    except Exception:
-        pass
-    sim.context.setPositions(equil_state.getPositions())
-    try:
-        vel = equil_state.getVelocities()
-        if vel is not None:
-            sim.context.setVelocities(vel)
-        else:
-            sim.context.setVelocitiesToTemperature(float(getattr(args, "temperature_k", 300.0)) * unit.kelvin, int(getattr(args, "seed", 1234)) + 707)
-    except Exception:
-        sim.context.setVelocitiesToTemperature(float(getattr(args, "temperature_k", 300.0)) * unit.kelvin, int(getattr(args, "seed", 1234)) + 707)
-
     out_dir = Path(out_dir)
-    values: list[float] = []
-    rows: list[dict] = []
+    is_contacts = primary_cv_is_contacts(args)
+    steps = int(getattr(args, "cv1_boundary_pull_steps", 5000) or 5000)
 
-    def _sample(step: int) -> None:
-        try:
-            state = sim.context.getState(getPositions=True, getEnergy=True, enforcePeriodicBox=True)
-            pos = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
-            cv = primary_cv_value_from_positions_nm(pos, primary_def, args)
-            pe = float(state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole))
-            if math.isfinite(float(cv)):
-                values.append(float(cv))
-                rows.append({"step": int(step), "primary_cv_value": float(cv), "potential_kj_mol": float(pe)})
-        except Exception as exc:
-            rows.append({"step": int(step), "error": str(exc)})
+    if equil_state is None or steps <= 0:
+        info: dict = {"used": False, "reason": "no equil_state" if equil_state is None else "cv1_boundary_pull_steps <= 0"}
+        if is_contacts:
+            lo = float(getattr(args, "contact_adaptive_min", 0.0) or 0.0)
+            hi = float(getattr(args, "contact_adaptive_max", 0.80) or 0.80)
+        else:
+            lo, hi, _ = estimate_terminal_cv_envelope_a(topology, args)
+        return lo, hi, info
 
+    pull_k_user = float(getattr(args, "cv1_boundary_pull_k", 50.0) or 50.0)
+    pull_k_openmm = primary_k_to_openmm_value(pull_k_user, args)
+    ts = float(getattr(args, "cv1_boundary_pull_timestep_fs", 1.0) or 1.0)
+    if ts <= 0.0:
+        ts = 1.0
+    friction = 20.0
+    safe_chunk = 100
+    sample_interval = max(1, steps // 50)
+
+    platform, props = setup_platform_and_properties(openmm, args)
     print(
-        f"    Contact-CV autocalibration: {steps} steps at {timestep_fs:g} fs, "
-        f"sampling every {sample_interval} steps on {platform_summary(platform, props)}"
+        f"    CV boundary pull: {steps} steps/direction at {ts:g} fs, "
+        f"k={pull_k_user:.1f} kcal/mol/CV² on {platform_summary(platform, props)}"
     )
-    if progress is not None:
-        progress.progress(
-            "contact_cv_autocalibration", 0, steps,
-            message="unbiased contact-CV prescan for adaptive window bounds",
-            timestep_fs=timestep_fs,
-            force=True,
+
+    if is_contacts:
+        primary_def = prepare_primary_cv_definition(topology, args, cv_atom1=cv_atom1, cv_atom2=cv_atom2)
+        contact_pairs = list(primary_def.get("contact_pairs", []))
+        target_min, target_max = 0.0, 1.0
+
+        def _make_system() -> object:
+            sys = create_system(app, unit, forcefield, topology, args, include_barostat=False)
+            add_contact_umbrella_force(openmm, sys, contact_pairs, args)
+            return sys
+
+        def _read_cv(sim) -> float:
+            try:
+                state = sim.context.getState(getPositions=True, enforcePeriodicBox=True)
+                pos = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+                return float(primary_cv_value_from_positions_nm(pos, primary_def, args))
+            except Exception:
+                return float("nan")
+
+        def _r0(t: float) -> float:
+            return float(t)
+
+        envelope_info: dict = {}
+    else:
+        lo_env, hi_env, envelope_info = estimate_terminal_cv_envelope_a(topology, args)
+        target_min, target_max = lo_env, hi_env
+
+        def _make_system() -> object:
+            sys = create_system(app, unit, forcefield, topology, args, include_barostat=False)
+            add_umbrella_force(openmm, sys, int(cv_atom1), int(cv_atom2))
+            return sys
+
+        def _read_cv(sim) -> float:
+            try:
+                return 10.0 * cv_distance_nm(sim.context, int(cv_atom1), int(cv_atom2), unit)
+            except Exception:
+                return float("nan")
+
+        def _r0(t: float) -> float:
+            return t / 10.0  # Å → nm
+
+    pull_results: dict = {}
+    for label, target, agg in [("min", target_min, float(np.nanmin)), ("max", target_max, float(np.nanmax))]:
+        system = _make_system()
+        integrator = make_langevin_integrator(
+            openmm, unit, args,
+            timestep_fs=ts,
+            temperature_k=float(args.temperature_k),
+            friction_per_ps=friction,
+            seed_offset=998 if label == "min" else 999,
         )
-    _sample(0)
-    done = 0
-    last_sample = 0
-    try:
-        while done < steps:
-            chunk = min(safe_chunk, steps - done)
-            sim.step(int(chunk))
-            done += int(chunk)
-            if done - last_sample >= sample_interval or done >= steps:
-                _sample(done)
-                last_sample = done
-            if progress is not None:
-                progress.progress(
-                    "contact_cv_autocalibration", done, steps,
-                    message="unbiased contact-CV prescan for adaptive window bounds",
-                    timestep_fs=timestep_fs,
-                    force=(done >= steps),
-                )
-    except Exception as exc:
-        crash_path = out_dir / "CRASH_contact_cv_autocalibration.pdb"
+        sim = app.Simulation(topology, system, integrator, platform, props)
         try:
-            state = sim.context.getState(getPositions=True, enforcePeriodicBox=True)
-            write_state_pdb(crash_path, app, topology, state.getPositions())
+            box = equil_state.getPeriodicBoxVectors()
+            if box is not None:
+                sim.context.setPeriodicBoxVectors(*box)
         except Exception:
             pass
-        payload = {
-            "enabled": True,
-            "ok": False,
-            "error": str(exc),
-            "crash_pdb": str(crash_path) if crash_path.exists() else "",
-            "values": values[-20:],
-        }
-        write_json(out_dir / "contact_cv_autocalibration.json", _json_ready(payload))
-        release_openmm_contexts(sim, integrator, system)
-        if bool(getattr(args, "contact_autocalibration_required", False)):
-            raise
-        print(f"WARNING: contact-CV autocalibration failed ({exc}); falling back to configured contact adaptive bounds.")
-        return payload
+        sim.context.setPositions(equil_state.getPositions())
+        try:
+            vel = equil_state.getVelocities()
+            sim.context.setVelocities(vel) if vel is not None else sim.context.setVelocitiesToTemperature(float(args.temperature_k) * unit.kelvin, int(args.seed) + (998 if label == "min" else 999))
+        except Exception:
+            sim.context.setVelocitiesToTemperature(float(args.temperature_k) * unit.kelvin, int(args.seed) + (998 if label == "min" else 999))
+        sim.context.setParameter("r0", _r0(target))
+        sim.context.setParameter("k", pull_k_openmm)
 
-    arr = np.asarray([float(x) for x in values if math.isfinite(float(x))], dtype=float)
-    if arr.size == 0:
-        payload = {"enabled": True, "ok": False, "reason": "no finite contact-CV samples"}
-        write_json(out_dir / "contact_cv_autocalibration.json", _json_ready(payload))
-        release_openmm_contexts(sim, integrator, system)
-        return payload
+        values: list[float] = []
+        done = 0
+        last_sample = 0
+        try:
+            while done < steps:
+                chunk = min(safe_chunk, steps - done)
+                sim.step(chunk)
+                done += chunk
+                if done - last_sample >= sample_interval or done >= steps:
+                    cv = _read_cv(sim)
+                    if math.isfinite(cv):
+                        values.append(cv)
+                    last_sample = done
+                if progress is not None:
+                    progress.progress(
+                        f"cv_boundary_pull_{label}", done, steps,
+                        message=f"CV boundary pull toward {label}",
+                        timestep_fs=ts,
+                    )
+        except Exception as exc:
+            print(f"WARNING: boundary pull toward {label} failed: {exc}")
+        finally:
+            release_openmm_contexts(sim, integrator, system)
 
-    p05, p25, p50, p75, p95, p99 = [float(np.nanpercentile(arr, q)) for q in (5, 25, 50, 75, 95, 99)]
-    vmin = float(np.nanmin(arr))
-    vmax = float(np.nanmax(arr))
-    mean = float(np.nanmean(arr))
-    sd = float(np.nanstd(arr))
+        if values:
+            arr = np.asarray(values, dtype=float)
+            achieved = agg(arr)
+            pull_results[label] = {"target": float(target), "achieved": float(achieved), "n_samples": int(arr.size)}
+            print(f"    CV boundary pull {label}: target={target:.4g} achieved={achieved:.4g}")
+        else:
+            pull_results[label] = {"target": float(target), "achieved": float(target), "n_samples": 0, "warning": "no samples"}
 
-    user_min = float(getattr(args, "contact_adaptive_min", 0.0) or 0.0)
-    user_max = float(getattr(args, "contact_adaptive_max", 0.80) or 0.80)
-    if bool(getattr(args, "contact_normalize", True)):
-        user_min = max(0.0, min(1.0, user_min))
-        user_max = max(0.0, min(1.0, user_max))
-    margin = max(0.0, float(getattr(args, "contact_autocalibration_margin", 0.02) or 0.02))
-    expand_factor = max(0.0, float(getattr(args, "contact_autocalibration_expand_factor", 4.0) or 4.0))
-    max_multiple = max(1.0, float(getattr(args, "contact_autocalibration_max_multiple", 4.0) or 4.0))
-    min_span = max(1.0e-6, float(getattr(args, "contact_autocalibration_min_span", 0.10) or 0.10))
-    percentile = float(getattr(args, "contact_autocalibration_percentile", 99.0) or 99.0)
-    percentile = max(50.0, min(100.0, percentile))
-    p_hi = float(np.nanpercentile(arr, percentile))
+    margin = float(getattr(args, "cv1_boundary_pull_margin", 0.0) or 0.0)
+    raw_lo = float(pull_results["min"]["achieved"])
+    raw_hi = float(pull_results["max"]["achieved"])
 
-    # Conservative first-round high bound: include the observed high tail plus a
-    # margin, plus a controlled extrapolation.  This keeps the first adaptive
-    # grid near the accessible range instead of placing windows at e.g. 0.65 when
-    # the unbiased peptide only samples 0.01-0.03.  Later adaptive feedback can
-    # still expand/repair as biased sampling discovers new accessible contacts.
-    candidate_highs = [
-        p_hi + margin,
-        p50 + expand_factor * max(1.0e-6, p95 - p05),
-        vmax * max_multiple + margin,
-        user_min + min_span,
-    ]
-    effective_min = user_min
-    effective_max = min(user_max, max(candidate_highs))
-    if bool(getattr(args, "contact_normalize", True)):
-        effective_min = max(0.0, min(1.0, effective_min))
-        effective_max = max(0.0, min(1.0, effective_max))
-    if effective_max <= effective_min:
-        effective_max = min(user_max, effective_min + min_span)
-    if effective_max <= effective_min:
-        effective_max = effective_min + min_span
+    if is_contacts:
+        user_min = float(getattr(args, "contact_adaptive_min", 0.0) or 0.0)
+        user_max = float(getattr(args, "contact_adaptive_max", 0.80) or 0.80)
+        lo = max(0.0, raw_lo - margin)
+        hi = min(1.0, raw_hi + margin)
+        if hi - lo < 0.05:
+            hi = min(1.0, lo + 0.10)
+        lo = min(lo, user_min)  # never push lower bound above user config
+        setattr(args, "contact_adaptive_effective_min", float(lo))
+        setattr(args, "contact_adaptive_effective_max", float(hi))
+    else:
+        lo = max(target_min, raw_lo - margin)
+        hi = min(target_max, raw_hi + margin)
 
-    setattr(args, "contact_adaptive_effective_min", float(effective_min))
-    setattr(args, "contact_adaptive_effective_max", float(effective_max))
-    summary = {
-        "enabled": True,
-        "ok": True,
-        "steps": int(steps),
-        "timestep_fs": float(timestep_fs),
-        "sample_interval": int(sample_interval),
-        "n_samples": int(arr.size),
-        "primary_cv": primary_cv_mode(args),
-        "primary_cv_label": primary_cv_label(args),
-        "primary_cv_units": primary_cv_units(args),
-        "contact_scheme": contact_scheme(args),
-        "contact_atom_selection": str(getattr(args, "contact_atom_selection", "heavy")),
-        "contact_r0_A": float(getattr(args, "contact_r0_a", 4.5) or 4.5),
-        "contact_beta_A_inv": float(getattr(args, "contact_beta_a_inv", 6.0) or 6.0),
-        "observed_min": vmin,
-        "observed_p05": p05,
-        "observed_p25": p25,
-        "observed_median": p50,
-        "observed_mean": mean,
-        "observed_sd": sd,
-        "observed_p75": p75,
-        "observed_p95": p95,
-        "observed_p99": p99,
-        "observed_max": vmax,
-        "user_requested_min": float(user_min),
-        "user_requested_max": float(user_max),
-        "effective_min": float(effective_min),
-        "effective_max": float(effective_max),
-        "margin": float(margin),
-        "expand_factor": float(expand_factor),
-        "max_multiple": float(max_multiple),
-        "min_span": float(min_span),
-        "note": "Initial contact adaptive centers use effective_min/effective_max; this avoids unreachable first-round contact windows. Adaptive-feedback may still expand/shift later.",
+    info = {
+        "used": True,
+        "steps_per_direction": int(steps),
+        "pull_k_user": float(pull_k_user),
+        "effective_lo": float(lo),
+        "effective_hi": float(hi),
+        "pull_to_min": pull_results.get("min", {}),
+        "pull_to_max": pull_results.get("max", {}),
+        **({} if is_contacts else {"envelope": envelope_info}),
     }
-    write_json(out_dir / "contact_cv_autocalibration.json", _json_ready({**summary, "samples_tail": rows[-50:]}))
-    try:
-        with (out_dir / "contact_cv_autocalibration.csv").open("w", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=["step", "primary_cv_value", "potential_kj_mol", "error"], extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(rows)
-    except Exception as exc:
-        summary["csv_write_warning"] = str(exc)
-    print(
-        "    Contact-CV autocalibration observed "
-        f"{vmin:.4f}..{vmax:.4f} (p95 {p95:.4f}, p99 {p99:.4f}); "
-        f"using adaptive range {effective_min:.4f}..{effective_max:.4f} "
-        f"instead of requested {user_min:.4f}..{user_max:.4f}"
-    )
-    release_openmm_contexts(sim, integrator, system)
-    return summary
+    write_json(out_dir / "cv_boundary_pulls.json", _json_ready(info))
+    print(f"    CV boundary pull: effective range {lo:.4g}..{hi:.4g}")
+    return lo, hi, info
 
 def broadcast_contact_k_for_centers(args, centers_c) -> tuple[list[float], str]:
     centers = list(centers_c)
@@ -895,62 +836,6 @@ def broadcast_contact_k_for_centers(args, centers_c) -> tuple[list[float], str]:
         raise ValueError("--contact-k-kcal must have length 1 or the same length as --contact-centers")
     return k_list, "manual-per-window"
 
-def run_adaptive_prescan(args, out_dir: Path, openmm, app, unit, forcefield, topology, equil_state, cv_atom1: int, cv_atom2: int, sequence_low_a: float, sequence_high_a: float, progress: Optional[GuiProgressSink] = None) -> tuple[float, float, dict]:
-    info = {"used": False, "steps": int(args.adaptive_prescan_steps)}
-    if int(args.adaptive_prescan_steps) <= 0:
-        return sequence_low_a, sequence_high_a, info
-    platform, props = setup_platform_and_properties(openmm, args)
-    print(f"    Adaptive prescan setup platform: {platform_summary(platform, props)}")
-    system = create_system(app, unit, forcefield, topology, args, include_barostat=False)
-    ts = min(float(args.timestep_fs), float(args.adaptive_prescan_timestep_fs))
-    integrator = make_langevin_integrator(
-        openmm, unit, args,
-        timestep_fs=ts,
-        temperature_k=float(args.temperature_k),
-        friction_per_ps=float(args.equil_friction_per_ps),
-        seed_offset=44,
-    )
-    sim = app.Simulation(topology, system, integrator, platform, props)
-    sim.context.setPeriodicBoxVectors(*equil_state.getPeriodicBoxVectors())
-    sim.context.setPositions(equil_state.getPositions())
-    try:
-        sim.context.setVelocities(equil_state.getVelocities())
-    except Exception:
-        sim.context.setVelocitiesToTemperature(args.temperature_k * unit.kelvin, int(args.seed) + 44)
-    values = []
-    prescan_csv = out_dir / "adaptive_window_prescan.csv"
-    with prescan_csv.open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["step", "cv_A"])
-        writer.writeheader()
-        done = 0
-        try:
-            while done < int(args.adaptive_prescan_steps):
-                chunk = min(max(1, int(args.report_interval)), int(args.adaptive_prescan_steps) - done)
-                run_steps_safely(sim, chunk, "adaptive_prescan", out_dir, app, topology, unit, chunk_size=int(args.equil_safe_chunk_steps), progress=progress, progress_total=int(args.adaptive_prescan_steps), progress_offset=done, timestep_fs=float(ts), message="adaptive CV pre-scan")
-                done += chunk
-                cv_a = 10.0 * cv_distance_nm(sim.context, cv_atom1, cv_atom2, unit)
-                values.append(cv_a)
-                writer.writerow({"step": done, "cv_A": cv_a})
-        except Exception as exc:
-            info["failed"] = str(exc)
-            return sequence_low_a, sequence_high_a, info
-    if values:
-        arr = np.asarray(values, dtype=float)
-        span = max(1.0, float(np.nanmax(arr) - np.nanmin(arr)))
-        low = min(sequence_low_a, float(np.nanmin(arr)) - float(args.adaptive_prescan_margin_a))
-        high = max(sequence_high_a, float(np.nanmax(arr)) + max(float(args.adaptive_prescan_margin_a), 0.25 * span))
-        info.update({
-            "used": True,
-            "observed_min_A": float(np.nanmin(arr)),
-            "observed_max_A": float(np.nanmax(arr)),
-            "observed_mean_A": float(np.nanmean(arr)),
-            "chosen_low_A": low,
-            "chosen_high_A": high,
-            "csv": str(prescan_csv),
-        })
-        return low, high, info
-    return sequence_low_a, sequence_high_a, info
-
 def choose_windows(args, out_dir: Path, openmm, app, unit, forcefield, topology, equil_state, cv_atom1: int, cv_atom2: int, progress: Optional[GuiProgressSink] = None) -> tuple[np.ndarray, list[float], dict]:
     if primary_cv_is_contacts(args):
         mode = str(getattr(args, "window_mode", "manual") or "manual")
@@ -960,9 +845,9 @@ def choose_windows(args, out_dir: Path, openmm, app, unit, forcefield, topology,
             centers_c = np.asarray([float(x) for x in args.contact_centers], dtype=float)
             k_list, k_assignment = broadcast_contact_k_for_centers(args, centers_c)
         elif mode in {"adaptive", "adaptive-feedback"}:
-            autocalibration_info = {"enabled": False, "reason": "disabled or explicit contact centers supplied"}
-            if bool(getattr(args, "contact_autocalibrate_windows", True)) and not getattr(args, "contact_centers", None):
-                autocalibration_info = run_contact_cv_autocalibration(
+            boundary_pull_info: dict = {"used": False, "reason": "explicit contact centers supplied"}
+            if not getattr(args, "contact_centers", None):
+                _, _, boundary_pull_info = run_cv_boundary_pulls(
                     args, out_dir, openmm, app, unit, forcefield, topology, equil_state,
                     cv_atom1=cv_atom1, cv_atom2=cv_atom2, progress=progress,
                 )
@@ -998,7 +883,7 @@ def choose_windows(args, out_dir: Path, openmm, app, unit, forcefield, topology,
                     label="contact",
                 )[2],
             },
-            "contact_autocalibration": autocalibration_info if mode in {"adaptive", "adaptive-feedback"} else {"enabled": False, "reason": "manual windows"},
+            "cv_boundary_pulls": boundary_pull_info if mode in {"adaptive", "adaptive-feedback"} else {"used": False, "reason": "manual windows"},
         }
         write_json(out_dir / "adaptive_contact_windows.json", _json_ready(meta))
         return centers_c, k_list, meta
@@ -1019,16 +904,16 @@ def choose_windows(args, out_dir: Path, openmm, app, unit, forcefield, topology,
             raise ValueError("--window-k-kcal-a2 must have length 1 or the same length as --windows-a")
         return centers_a, k_list, {"mode": "manual", "k_assignment": k_assignment}
 
-    low_a, high_a, info = estimate_terminal_cv_envelope_a(topology, args)
-    low_a, high_a, prescan_info = run_adaptive_prescan(
+    low_a, high_a, boundary_pull_info = run_cv_boundary_pulls(
         args, out_dir, openmm, app, unit, forcefield, topology, equil_state,
-        cv_atom1, cv_atom2, low_a, high_a, progress=progress,
+        cv_atom1, cv_atom2, progress=progress,
     )
     centers_a = build_adaptive_window_centers_a(low_a, high_a, args)
     k_list = adaptive_force_constants_kcal_a2(centers_a, args)
+    envelope_info = boundary_pull_info.get("envelope", {})
     warnings = []
     try:
-        contour_a = float(info.get("estimated_contour_A", float("nan")))
+        contour_a = float(envelope_info.get("estimated_contour_A", float("nan")))
         if math.isfinite(contour_a) and high_a > 1.05 * contour_a:
             warnings.append(
                 f"adaptive upper bound {high_a:.2f} A exceeds estimated contour length {contour_a:.2f} A; high-center windows may be physically unreachable."
@@ -1045,8 +930,8 @@ def choose_windows(args, out_dir: Path, openmm, app, unit, forcefield, topology,
         print("WARNING:", warning)
     meta = {
         "mode": str(args.window_mode),
-        "sequence_estimate": info,
-        "prescan": prescan_info,
+        "sequence_estimate": envelope_info,
+        "cv_boundary_pulls": boundary_pull_info,
         "warnings": warnings,
         "aggressiveness": _adaptive_window_aggressiveness_settings(args),
     }

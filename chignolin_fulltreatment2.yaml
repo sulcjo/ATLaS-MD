@@ -78,9 +78,9 @@ contact_cv:
   cv1_k_min: 50.0
   cv1_k_max: 100.0
 
-  # Prescan / autocalibration
-  cv1_prescan: true
-  cv1_prescan_steps: 10000
+  # CV boundary pull — active pull toward CV extremes to find achievable range
+  cv1_boundary_pull_steps: 10000
+  cv1_boundary_pull_k: 50.0
 
   # Frontier probing
   cv1_frontier: true
