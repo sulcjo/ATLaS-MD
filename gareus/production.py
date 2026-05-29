@@ -28,6 +28,7 @@ import numpy as np
 
 from .io import BufferedCsvDictWriter, write_json, read_json_file, _json_ready
 from .logger import DistanceLogger, is_gamd_production_phase
+from .store import ParquetSampleWriter, ParquetExchangeWriter, SegmentRegistry, WindowSnapshot, parse_gamd_boost_components
 from .progress import GuiProgressSink, release_openmm_contexts
 from .lifecycle import _graceful_shutdown, _register_graceful_shutdown
 from .units import kcal_to_kj, kcal_a2_to_kj_nm2
@@ -2931,15 +2932,38 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
 
     rng = np.random.default_rng(args.seed)
 
-    exchange_path = out_dir / "exchanges.csv"
-    append_exchange_csv = bool(getattr(args, "resume", False)) and exchange_path.exists() and exchange_path.stat().st_size > 0
+    _seg_registry = SegmentRegistry(out_dir)
+    _run_id = str(out_dir.name)
+    _parent_seg = _seg_registry.get_latest_segment()
+    _parent_seg_id = _parent_seg["segment_id"] if _parent_seg else None
+    _round_id = int(getattr(args, "adaptive_feedback_round", 1))
+    _seg_id = _seg_registry.open_segment(_run_id, _parent_seg_id, _round_id)
+    _win_snapshot_windows = [
+        {
+            "window_id": int(wi),
+            "center1": float(centers_a[wi]),
+            "k1": float(k_list[wi]),
+            **({"center2": float(secondary_cv_centers[wi]), "k2": float(secondary_cv_k_kcal_list[wi])}
+               if secondary_cv_centers is not None and secondary_cv_k_kcal_list is not None else {}),
+        }
+        for wi in range(nrep)
+    ]
+    _cv2_type = (secondary_cv_metadata or {}).get("mode") if secondary_cv_centers is not None else None
+    WindowSnapshot(out_dir).snapshot(_seg_id, _win_snapshot_windows, cv1_type=primary_cv_mode(args), cv2_type=_cv2_type)
+    parquet_sample_writer = ParquetSampleWriter(
+        out_dir / "samples" / _seg_id,
+        flush_rows=int(getattr(args, "parquet_flush_rows", 5000) or 5000),
+    )
+    parquet_exchange_writer = ParquetExchangeWriter(
+        out_dir / "exchanges" / _seg_id,
+        flush_rows=int(getattr(args, "parquet_flush_rows", 5000) or 5000),
+    )
     exchange_csv = None
     sample_csv = None
     sample_writer = None
     samples_started = False
-    analysis_array_writer = AnalysisArrayWriter(out_dir, nrep, args=args)
     analysis_arrays_written = False
-    distance_logger = DistanceLogger(out_dir, args, progress=progress)
+    distance_logger = DistanceLogger(out_dir, args, progress=progress, no_file_persistence=True)
     exchange_stats = {"attempts": 0, "accepted": 0, "pairs": {}, "jump_bins": {}, "mode": str(getattr(args, "exchange_mode", "neighbor")), "gibbs_choices": 0, "gibbs_moves": 0, "gibbs_stays": 0}
     dashboard_info = {
         "centers_a": [float(x) for x in centers_a],
@@ -3059,58 +3083,14 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             "will oversubscribe CPU cores. Set --cpu-threads 1 for parallel step_all()."
         )
     try:
-        exchange_fields = [
-            "attempt", "step", "replica_i", "replica_j", "window_i", "window_j",
-            "cv_i_A", "cv_j_A", "delta_kj_mol", "acceptance_probability", "accepted",
-        ]
-        exchange_csv = BufferedCsvDictWriter(
-            exchange_path, exchange_fields, append=append_exchange_csv,
-            flush_rows=int(getattr(args, "csv_flush_rows", 1000) or 1000),
-            extrasaction="ignore",
-        )
-        exchange_writer = exchange_csv
+        exchange_writer = parquet_exchange_writer
 
-        sample_fields = [
-            "step", "phase", "replica", "window", "center_A", "k_kcal_mol_A2",
-            "cv_A", "primary_cv", "primary_cv_label", "primary_cv_units",
-            "primary_cv_value", "primary_cv_center", "primary_cv_k", "primary_cv_k_units",
-            "primary_umbrella_bias_kcal_mol",
-            "secondary_cv", "secondary_cv_center", "secondary_cv_k_kcal_mol",
-            "distance_umbrella_bias_kcal_mol", "secondary_cv_bias_kcal_mol",
-            "umbrella_bias_kcal_mol", "umbrella_bias_kj_mol", "umbrella_reduced_bias",
-            "umbrella_restoring_force_kcal_mol_per_A", "potential_kj_mol",
-            "temperature_K", "beta_1_over_kJ_mol",
-            "gamd_boost_total_kj_mol", "gamd_boost_total_kcal_mol",
-            "gamd_boost_source", "gamd_boost_components_kj_mol_json", "gamd_globals_json",
-        ]
-        if bool(getattr(args, "write_full_bias_csv_vectors", False)):
-            sample_fields[19:19] = [
-                "primary_umbrella_bias_all_windows_kcal_mol_json",
-                "distance_umbrella_bias_all_windows_kcal_mol_json",
-                "secondary_cv_bias_all_windows_kcal_mol_json",
-                "umbrella_bias_all_windows_kcal_mol_json",
-                "umbrella_bias_all_windows_kj_mol_json",
-                "umbrella_reduced_bias_all_windows_json",
-            ]
         def ensure_sample_writer():
-            nonlocal sample_csv, sample_writer, samples_started
-            if sample_writer is not None:
-                return sample_writer
-            sample_path = out_dir / "samples.csv"
-            append_sample_csv = bool(getattr(args, "resume", False)) and sample_path.exists() and sample_path.stat().st_size > 0
-            sample_csv = BufferedCsvDictWriter(
-                sample_path, sample_fields, append=append_sample_csv,
-                flush_rows=int(getattr(args, "csv_flush_rows", 1000) or 1000),
-                extrasaction="ignore",
-            )
-            sample_writer = sample_csv
-            sample_csv.flush()
-            samples_started = True
-            if bool(getattr(args, "sample_potential_energy", True)):
-                print(f"    Production samples and GaMD/US per-sample potentials now writing to {out_dir / 'samples.csv'}")
-            else:
-                print(f"    Production samples now writing to {out_dir / 'samples.csv'} (potential energy logging disabled by --no-sample-potential-energy)")
-            return sample_writer
+            nonlocal samples_started
+            if not samples_started:
+                samples_started = True
+                print(f"    Production samples writing to {out_dir / 'samples' / _seg_id}")
+            return parquet_sample_writer
 
         def sample(step: int, phase: str) -> list[dict]:
             """Collect one reporting sample from every replica.
@@ -3167,7 +3147,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             observable_cache["primary_values"] = primary_values
             observable_cache["cvs_nm"] = (primary_values / 10.0) if is_distance_primary else primary_values
             observable_cache["bias_matrix_kj"] = bias_matrix_kj
-            writer = ensure_sample_writer() if is_prod else None
+            if is_prod:
+                ensure_sample_writer()
             for r, sim in enumerate(sims):
                 w = int(assignments[r])
                 cv_a = float(primary_values[r])
@@ -3227,29 +3208,32 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     json.dumps(integrator_globals(sim.integrator, unit=unit), sort_keys=True)
                     if write_gamd_globals else ""
                 )
-                if is_prod and writer is not None:
-                    writer.writerow(row)
-                    analysis_array_writer.append(
-                        row,
-                        all_reduced_bias,
-                        distance_bias_all_windows_kcal=all_distance_bias_kcal,
-                        secondary_bias_all_windows_kcal=all_ss_bias_kcal,
-                        umbrella_bias_all_windows_kcal=all_bias_kcal,
-                        umbrella_bias_all_windows_kj=all_bias_kj,
+                if is_prod:
+                    _boost_raw = row.get("gamd_boost_total_kj_mol")
+                    _boost_total = float(_boost_raw) if _boost_raw not in (None, "") else None
+                    _boost_comps = json.loads(row.get("gamd_boost_components_kj_mol_json", "{}") or "{}")
+                    _, _boost_dihe, _boost_nonb = parse_gamd_boost_components(_boost_total, _boost_comps)
+                    _ss_val = float(ss_values[r])
+                    parquet_sample_writer.write_sample(
+                        step=int(step),
+                        replica=r,
+                        window_id=w,
+                        cv1=cv_a,
+                        cv2=_ss_val if math.isfinite(_ss_val) else None,
+                        potential=float(potentials_kj[r]),
+                        boost_total=_boost_total,
+                        boost_dihedral=_boost_dihe,
+                        boost_nonbonded=_boost_nonb,
                     )
                 rows.append(row)
-            if is_prod and sample_csv is not None and bool(getattr(args, "flush_every_log", True)):
-                sample_csv.flush()
+            if is_prod and bool(getattr(args, "flush_every_log", True)):
+                parquet_sample_writer.flush()
             return rows
 
         def flush_scalar_writers() -> None:
-            """Flush open scalar writers before checkpoints/final reports."""
-            for _writer in (sample_csv, exchange_csv, getattr(distance_logger, "csv_handle", None), getattr(distance_logger, "jsonl_handle", None)):
-                if _writer is not None:
-                    try:
-                        _writer.flush()
-                    except Exception:
-                        pass
+            """Flush open writers before checkpoints/final reports."""
+            parquet_sample_writer.flush()
+            parquet_exchange_writer.flush()
 
         def _write_production_nan_diagnostics(exc: Exception, requested_steps: int, completed_substeps: int = 0) -> Path:
             """Write targeted diagnostics when production stepping creates NaNs.
@@ -3419,19 +3403,15 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 replica_of_window[int(assignments[j])] = int(j)
                 set_window(sims[i].context, centers_nm, ks_kj_nm2, assignments[i], secondary_cv_centers, secondary_cv_ks_kj)
                 set_window(sims[j].context, centers_nm, ks_kj_nm2, assignments[j], secondary_cv_centers, secondary_cv_ks_kj)
-            exchange_writer.writerow({
-                "attempt": attempt,
-                "step": absolute_step,
-                "replica_i": i,
-                "replica_j": j,
-                "window_i": wi,
-                "window_j": wj,
-                "cv_i_A": float(primary_values[i]),
-                "cv_j_A": float(primary_values[j]),
-                "delta_kj_mol": delta,
-                "acceptance_probability": pacc,
-                "accepted": int(accepted),
-            })
+            parquet_exchange_writer.write_exchange(
+                step=int(absolute_step),
+                replica_i=int(i),
+                replica_j=int(j),
+                window_i=int(wi),
+                window_j=int(wj),
+                delta_e=float(delta),
+                accepted=bool(accepted),
+            )
             return attempt + 1
 
         def _current_exchange_arrays(absolute_step: Optional[int] = None) -> tuple[np.ndarray, np.ndarray]:
@@ -3524,7 +3504,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                             "neighbor_source": "explicit_2d_geometry_graph",
                         })
                         attempt = _attempt_window_swap(wi, wj, primary_values, bias_matrix_kj, absolute_step, attempt)
-                    exchange_csv.flush() if bool(getattr(args, "flush_every_log", True)) else None
+                    parquet_exchange_writer.flush() if bool(getattr(args, "flush_every_log", True)) else None
                     return (int(parity) + 1) % max(1, int(graph_slots)), attempt
                 if grid_neighbor_pairs_by_parity is not None:
                     pairs = grid_neighbor_pairs_by_parity[int(parity) & 1]
@@ -3532,7 +3512,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     pairs = [(w, w + 1) for w in range(parity, nrep - 1, 2)]
                 for wi, wj in pairs:
                     attempt = _attempt_window_swap(wi, wj, primary_values, bias_matrix_kj, absolute_step, attempt)
-                exchange_csv.flush() if bool(getattr(args, "flush_every_log", True)) else None
+                parquet_exchange_writer.flush() if bool(getattr(args, "flush_every_log", True)) else None
                 return 1 - parity, attempt
 
             if mode == "random-pair":
@@ -3542,7 +3522,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 pairs = [(windows[k], windows[k + 1]) for k in range(0, len(windows) - 1, 2)][:max_pairs]
                 for wi, wj in pairs:
                     attempt = _attempt_window_swap(wi, wj, primary_values, bias_matrix_kj, absolute_step, attempt)
-                exchange_csv.flush() if bool(getattr(args, "flush_every_log", True)) else None
+                parquet_exchange_writer.flush() if bool(getattr(args, "flush_every_log", True)) else None
                 return parity, attempt
 
             if mode == "all-pair-sweep":
@@ -3553,7 +3533,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     pairs = pairs[:limit]
                 for wi, wj in pairs:
                     attempt = _attempt_window_swap(wi, wj, primary_values, bias_matrix_kj, absolute_step, attempt)
-                exchange_csv.flush() if bool(getattr(args, "flush_every_log", True)) else None
+                parquet_exchange_writer.flush() if bool(getattr(args, "flush_every_log", True)) else None
                 return parity, attempt
 
             if mode == "gibbs-walk":
@@ -3603,7 +3583,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                         continue
                     exchange_stats["gibbs_moves"] = int(exchange_stats.get("gibbs_moves", 0) or 0) + 1
                     attempt = _attempt_window_swap(wi, wj, primary_values, bias_matrix_kj, absolute_step, attempt, p_override=float(probs[choice_index]), force_accept=True)
-                exchange_csv.flush() if bool(getattr(args, "flush_every_log", True)) else None
+                parquet_exchange_writer.flush() if bool(getattr(args, "flush_every_log", True)) else None
                 return parity, attempt
 
             raise ValueError(f"Unknown --exchange-mode {mode!r}")
@@ -3806,17 +3786,15 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 )
 
         if not analysis_arrays_written:
-            arr_path = analysis_array_writer.write()
-            if arr_path is not None:
-                metadata["analysis_arrays_npz"] = str(arr_path)
-                metadata["analysis_arrays_n_samples"] = int(getattr(analysis_array_writer, "n_samples", len(getattr(analysis_array_writer, "step", []))))
-                write_json(out_dir / "gareus_metadata.json", metadata)
+            flush_scalar_writers()
+            metadata["parquet_samples_dir"] = str(out_dir / "samples")
+            metadata["parquet_exchanges_dir"] = str(out_dir / "exchanges")
+            metadata["parquet_segment_id"] = _seg_id
+            write_json(out_dir / "gareus_metadata.json", metadata)
             analysis_arrays_written = True
 
         if bool(getattr(args, "adaptive_feedback_enabled", False)) or str(getattr(args, "window_mode", "adaptive")) == "adaptive-feedback":
             try:
-                if sample_csv is not None:
-                    sample_csv.flush()
                 if (secondary_cv_metadata or {}).get("enabled") and secondary_cv_centers is not None and len(set(round(float(x), 4) for x in secondary_cv_centers)) > 1:
                     feedback_summary = run_adaptive_feedback_dispatcher_2d(
                         args, out_dir, centers_a, k_list, exchange_stats,
@@ -3880,14 +3858,17 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         except Exception:
             pass
         try:
-            if not analysis_arrays_written:
-                analysis_array_writer.write()
+            parquet_sample_writer.close()
         except Exception:
             pass
-        if exchange_csv is not None:
-            exchange_csv.close()
-        if sample_csv is not None:
-            sample_csv.close()
+        try:
+            parquet_exchange_writer.close()
+        except Exception:
+            pass
+        try:
+            _seg_registry.close_segment(_seg_id, end_step=int(prod_done))
+        except Exception:
+            pass
         distance_logger.close()
 
     print(f"Done. Outputs in {out_dir}")

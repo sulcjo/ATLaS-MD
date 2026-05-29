@@ -168,7 +168,7 @@ def _short_status(ok: bool, label: str) -> str:
 
 
 class DistanceLogger:
-    def __init__(self, out_dir: Path, args, progress: Optional[GuiProgressSink] = None):
+    def __init__(self, out_dir: Path, args, progress: Optional[GuiProgressSink] = None, no_file_persistence: bool = False):
         self.out_dir = Path(out_dir)
         self.args = args
         self.progress = progress
@@ -203,6 +203,8 @@ class DistanceLogger:
         self.csv_handle = None
         self.csv_writer = None
         self.jsonl_handle = None
+        if no_file_persistence:
+            return
         if self.mode in {"csv", "both"}:
             p = self.out_dir / str(getattr(args, "distance_csv", "distances.csv"))
             append_csv = bool(getattr(args, "resume", False)) and p.exists() and p.stat().st_size > 0

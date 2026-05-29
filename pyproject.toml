@@ -30,7 +30,7 @@ openmm = [
   "pdbfixer",
   "PeptideBuilder",
 ]
-analysis = ["pymbar>=4"]
+analysis = ["pymbar>=4", "pyarrow>=12", "duckdb>=0.9"]
 dev = ["pytest>=7"]
 all = [
   "PyYAML>=6",

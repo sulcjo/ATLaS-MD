@@ -36,6 +36,8 @@ from . import checkpoints  # noqa: F401
 from . import analysis  # noqa: F401
 from . import forces  # noqa: F401
 from . import provenance  # noqa: F401
+from . import store  # noqa: F401
+from . import query  # noqa: F401
 
 __all__ = [
     "constants",
@@ -63,4 +65,6 @@ __all__ = [
     "forces",
     "provenance",
     "adaptive_production",
+    "store",
+    "query",
 ]

@@ -23,6 +23,24 @@ def _read_window_table_for_validation(out_dir: Path) -> list[dict]:
         return _read_csv_dicts(preferred)
     return _read_csv_dicts(out_dir / "umbrella_windows.csv")
 
+def _ensure_analysis_arrays_npz(out_dir: Path) -> None:
+    """Reconstruct analysis_arrays.npz from Parquet data if NPZ is absent."""
+    npz_path = out_dir / "analysis_arrays.npz"
+    if npz_path.exists():
+        return
+    samples_dir = out_dir / "samples"
+    if not samples_dir.exists() or not any(samples_dir.glob("**/*.parquet")):
+        return
+    try:
+        from .query import export_analysis_arrays_npz
+        meta = read_json_file(out_dir / "gareus_metadata.json", {}) or {}
+        temp_k = float(meta.get("temperature_K", meta.get("temperature_k", 300.0)) or 300.0)
+        beta = 1.0 / (8.314462618e-3 * temp_k)
+        export_analysis_arrays_npz(out_dir, beta, npz_path)
+    except Exception as exc:
+        pass  # errors reported below when NPZ still absent
+
+
 def validate_analysis_metadata_readiness(out_dir: Path, target_overlap: float = 0.30) -> dict:
     """Sparse-aware MBAR/readiness validation for final production outputs.
 
@@ -32,6 +50,7 @@ def validate_analysis_metadata_readiness(out_dir: Path, target_overlap: float = 
     and the presence of bias-component arrays needed by downstream MBAR/PMF code.
     """
     out_dir = Path(out_dir)
+    _ensure_analysis_arrays_npz(out_dir)
     warnings: list[str] = []
     errors: list[str] = []
     table_path = out_dir / "umbrella_explicit_windows.csv"
