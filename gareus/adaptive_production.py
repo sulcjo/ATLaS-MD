@@ -3061,8 +3061,34 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
     adaptive_dir.mkdir(parents=True, exist_ok=True)
     policy = policy_from_args(args)
     max_epochs = max(1, _arg_int(args, "adaptive_production_epochs", 3))
-    epoch_steps = max(1, _arg_int(args, "adaptive_production_epoch_steps", max(1, int(getattr(args, "gamd_production_steps", 100000) or 100000) // 20)))
-    final_steps = max(1, _arg_int(args, "adaptive_production_final_steps", int(getattr(args, "gamd_production_steps", epoch_steps) or epoch_steps)))
+    _explicit_epoch_steps = _arg_int(args, "adaptive_production_epoch_steps", 0)
+    if _explicit_epoch_steps > 0:
+        epoch_steps = int(_explicit_epoch_steps)
+    else:
+        # Auto-compute from md_budget_ns when available to avoid inheriting a pilot's
+        # gamd_production_steps (e.g. validation_steps=20000 → epoch_steps=1000).
+        _md_budget_ns = float(getattr(args, "adaptive_production_total_md_pool_ns", 0.0) or 0.0)
+        _final_frac = float(getattr(args, "adaptive_production_final_pool_fraction", 0.50) or 0.50)
+        _timestep_fs = float(getattr(args, "timestep_fs", 2.0) or 2.0)
+        if _md_budget_ns > 0 and max_epochs > 0 and _timestep_fs > 0:
+            _n_states_hint = max(1, int(getattr(args, "contact_adaptive_max_total_replicas", 0) or 0) or 32)
+            _epoch_ns = _md_budget_ns * (1.0 - _final_frac) / max_epochs
+            epoch_steps = max(1, int(_epoch_ns * 1e6 / _timestep_fs / _n_states_hint))
+        else:
+            epoch_steps = max(1, int(getattr(args, "gamd_production_steps", 100000) or 100000) // 20)
+    _explicit_final_steps = _arg_int(args, "adaptive_production_final_steps", 0)
+    if _explicit_final_steps > 0:
+        final_steps = int(_explicit_final_steps)
+    else:
+        _md_budget_ns = float(getattr(args, "adaptive_production_total_md_pool_ns", 0.0) or 0.0)
+        _final_frac = float(getattr(args, "adaptive_production_final_pool_fraction", 0.50) or 0.50)
+        _timestep_fs = float(getattr(args, "timestep_fs", 2.0) or 2.0)
+        if _md_budget_ns > 0 and _timestep_fs > 0:
+            _n_states_hint = max(1, int(getattr(args, "contact_adaptive_max_total_replicas", 0) or 0) or 32)
+            _final_ns = _md_budget_ns * _final_frac
+            final_steps = max(1, int(_final_ns * 1e6 / _timestep_fs / _n_states_hint))
+        else:
+            final_steps = max(1, int(getattr(args, "gamd_production_steps", epoch_steps) or epoch_steps))
     use_epoch_samples_for_mbar = _arg_bool(args, "adaptive_production_use_epoch_samples_for_mbar", False)
     global_shared_gamd_dir: Optional[Path] = None
     if _arg_bool(args, "adaptive_production_global_shared_gamd", True):
