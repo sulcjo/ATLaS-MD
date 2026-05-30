@@ -428,6 +428,7 @@ def _basic_chignolin_config() -> Dict[str, Any]:
             "sigma0p": 5.0,
             "sigma0d": 5.0,
             "equil_steps": 100000,
+            "gamd_cmd_steps": 250000,
         },
         "exchange": {
             "exchange_mode": "gibbs-walk",

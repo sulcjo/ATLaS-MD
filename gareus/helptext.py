@@ -543,6 +543,7 @@ Default GaMD parameters:
     --sigma0p              = 6 kcal/mol   (primary boost sigma)
     --sigma0d              = 6 kcal/mol   (secondary boost sigma, dual modes)
     --equil-steps          = 50,000       (GaMD equilibration/calibration)
+    --gamd-cmd-steps       = 250,000      (CMD pre-equil for Vmax/Vmin stats; longer reduces anharmonicity)
     --production-steps     = 500,000      (production per replica)
     --gamd-averaging-window = 5,000 steps
     cmd/equil prep steps   = 5,000/5,000  (hardcoded internal defaults)

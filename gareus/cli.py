@@ -333,6 +333,8 @@ def _add_gamd_args(p: argparse.ArgumentParser) -> None:
                    help="Secondary sigma0 in kcal/mol for dual-boost GaMD.")
     p.add_argument("--equil-steps", type=int, default=50000,
                    help="GaMD equilibration steps for boost calibration.")
+    p.add_argument("--gamd-cmd-steps", type=int, default=250000,
+                   help="GaMD CMD pre-equilibration steps for Vmax/Vmin statistics (longer → better calibration, lower anharmonicity).")
     p.add_argument("--gamd-averaging-window", type=int, default=5000)
     p.add_argument("--exchange-interval", type=int, default=5000)
     p.add_argument("--exchange-mode",
@@ -666,7 +668,6 @@ def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
     # Dropped GaMD prep steps
     args.gamd_cmd_prep_steps = 5000
     args.gamd_equil_prep_steps = 5000
-    args.gamd_cmd_steps = 50000
     # Dropped exchange tuning
     args.exchange_random_pairs = 0
     args.exchange_max_pairs_per_interval = 0
