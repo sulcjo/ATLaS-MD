@@ -208,6 +208,17 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                    help="sigma = factor × neighbor spacing for Delaunay force constant.")
     p.add_argument("--delaunay-min-pilot-samples", type=int, default=50,
                    help="Minimum pilot samples required to proceed with Delaunay placement.")
+    p.add_argument("--delaunay-iterate", action=argparse.BooleanOptionalAction, default=None,
+                   help="Re-run Delaunay on every pilot round >= delaunay-after-round until anchor "
+                        "set stabilises. Default: on for delaunay-feedback, off otherwise.")
+    p.add_argument("--delaunay-stability-tol", type=float, default=0.05,
+                   help="Max normalised anchor shift below which Delaunay layout is considered "
+                        "stable and the CSV is not rewritten (used with --delaunay-iterate).")
+    p.add_argument("--delaunay-coverage-scaffold", action=argparse.BooleanOptionalAction, default=False,
+                   help="Inject uniform grid anchors in [0,1]^2 cells that have no KDE-peak "
+                        "anchor within dedup-radius, preventing blind spots in unvisited CV regions.")
+    p.add_argument("--delaunay-coverage-grid-n", type=int, default=3,
+                   help="N for the N×N coverage scaffold grid (default 3 → ≤9 scaffold points).")
 
     # Region memory
     p.add_argument("--region-memory", action=argparse.BooleanOptionalAction, default=False,

@@ -30,6 +30,8 @@ def _make_args(**kwargs):
         contact_adaptive_max_k_kcal=200.0,
         contact_adaptive_default_k_kcal=25.0,
         secondary_cv_k_kcal=25.0,
+        secondary_cv_adaptive_min_k_kcal=5.0,
+        secondary_cv_adaptive_max_k_kcal=100.0,
         default_window_k_kcal_a2=50.0,
         contact_k_kcal=None,
         # Delaunay args
@@ -195,7 +197,7 @@ def test_force_constant_formula(tmp_path):
         k1 = float(r["primary_cv_k_kcal"])
         k2 = float(r["secondary_cv_k_kcal_mol"])
         assert 5.0 <= k1 <= 300.0, f"primary k {k1} out of physical range [5, 300]"
-        assert 5.0 <= k2 <= 300.0, f"secondary k {k2} out of physical range [5, 300]"
+        assert 5.0 <= k2 <= 100.0, f"secondary k {k2} out of CV2 range [5, 100]"
 
 
 # ---------------------------------------------------------------------------
@@ -298,26 +300,108 @@ def test_trigger_predicate_off_for_adaptive_feedback(tmp_path):
     """adaptive-feedback with default delaunay_after_round=0 must NOT trigger Delaunay."""
     # Simulate the predicate logic from the trigger block in run_adaptive_feedback_auto_loop.
     # This catches the regression where default=1 silently enabled Delaunay for all adaptive runs.
-    def _would_trigger(window_mode: str, delaunay_after_round: int, round_no: int) -> bool:
+    def _would_trigger(window_mode: str, delaunay_after_round: int, round_no: int,
+                       iterate: bool | None = None) -> bool:
         _delaunay_trigger = int(delaunay_after_round or 0)
         if window_mode == "delaunay-feedback" and _delaunay_trigger == 0:
             _delaunay_trigger = 1
-        return _delaunay_trigger > 0 and round_no == _delaunay_trigger
+        _iterate = (bool(iterate) if iterate is not None else window_mode == "delaunay-feedback")
+        cond = round_no >= _delaunay_trigger if _iterate else round_no == _delaunay_trigger
+        return _delaunay_trigger > 0 and cond
 
-    # adaptive-feedback + default 0: must not fire
+    # adaptive-feedback + default 0: must not fire regardless of round
     assert not _would_trigger("adaptive-feedback", 0, 1)
     assert not _would_trigger("adaptive-feedback", 0, 2)
 
-    # delaunay-feedback + default 0: auto-sets trigger to 1, fires on round 1
+    # delaunay-feedback + default 0: iterate=True by default → fires on round 1 AND round 2
     assert _would_trigger("delaunay-feedback", 0, 1)
-    assert not _would_trigger("delaunay-feedback", 0, 2)
+    assert _would_trigger("delaunay-feedback", 0, 2)   # iterate: fires every round >= 1
 
-    # delaunay-feedback + explicit round 2: fires only on round 2
+    # delaunay-feedback with iterate explicitly disabled: fires only on the trigger round
+    assert _would_trigger("delaunay-feedback", 0, 1, iterate=False)
+    assert not _would_trigger("delaunay-feedback", 0, 2, iterate=False)
+
+    # delaunay-feedback + explicit round 2 + iterate: fires on rounds >= 2
     assert not _would_trigger("delaunay-feedback", 2, 1)
     assert _would_trigger("delaunay-feedback", 2, 2)
+    assert _would_trigger("delaunay-feedback", 2, 3)
 
-    # adaptive-feedback + explicit non-zero: fires (user explicitly opted in)
+    # adaptive-feedback + explicit non-zero, iterate disabled: fires exactly once
     assert _would_trigger("adaptive-feedback", 1, 1)
+    assert not _would_trigger("adaptive-feedback", 1, 2)
+
+    # adaptive-feedback + explicit non-zero, iterate enabled: fires every round >= trigger
+    assert _would_trigger("adaptive-feedback", 1, 1, iterate=True)
+    assert _would_trigger("adaptive-feedback", 1, 2, iterate=True)
+
+
+# ---------------------------------------------------------------------------
+# Test 8 — Coverage scaffold fills uncovered CV cells
+# ---------------------------------------------------------------------------
+
+def test_coverage_scaffold_fills_gap(tmp_path):
+    """Samples only in top-right CV corner → scaffold populates remaining 3×3 grid cells."""
+    from gareus.windows import build_delaunay_windows_from_pilot_samples
+
+    samples = tmp_path / "samples.csv"
+    # All samples clustered in top-right corner: cv1~0.85, cv2~0.8 (raw)
+    _write_samples_csv(samples, [(0.85, 0.02, 0.8, 0.05, 400)])
+
+    args = _make_args(
+        delaunay_n_anchors=4,
+        delaunay_min_pilot_samples=10,
+        delaunay_coverage_scaffold=True,
+        delaunay_coverage_grid_n=3,
+    )
+    rows, meta = build_delaunay_windows_from_pilot_samples(samples, args)
+
+    scaffold = [r for r in rows if r["window_type"] == "coverage_scaffold"]
+    anchors = [r for r in rows if r["window_type"] == "basin_anchor"]
+
+    assert len(anchors) >= 1, "Expected ≥1 basin_anchor from top-right cluster"
+    assert len(scaffold) >= 5, (
+        f"Expected ≥5 coverage_scaffold windows for uncovered 3×3 cells, got {len(scaffold)}"
+    )
+    # At least one scaffold window should be in the unsampled low-cv1 region
+    scaffold_cv1 = [float(r["primary_cv_center"]) for r in scaffold]
+    assert any(cv1 < 0.5 for cv1 in scaffold_cv1), (
+        "Scaffold windows should include low-cv1 cells not covered by the cluster"
+    )
+    # metadata tracks scaffold count
+    assert meta.get("n_scaffolds", 0) == len(scaffold)
+
+
+# ---------------------------------------------------------------------------
+# Test 9 — Coverage warning on long Delaunay edge
+# ---------------------------------------------------------------------------
+
+def test_coverage_warning_long_edge(tmp_path, capsys):
+    """Isolated outlier cluster creates a long Delaunay edge; WARNING is printed."""
+    from gareus.windows import build_delaunay_windows_from_pilot_samples
+
+    samples = tmp_path / "samples.csv"
+    # Three clusters tight together + one isolated outlier → very long edge to outlier
+    _write_samples_csv(samples, [
+        (0.10, 0.01, -0.80, 0.02, 300),  # cluster A at norm ~(0.10, 0.10)
+        (0.20, 0.01, -0.80, 0.02, 300),  # cluster B at norm ~(0.20, 0.10); dist 0.10 from A
+        (0.10, 0.01, -0.60, 0.02, 300),  # cluster C at norm ~(0.10, 0.20); dist 0.10 from A
+        (0.90, 0.01,  0.80, 0.02, 300),  # outlier D at norm ~(0.90, 0.90)
+    ])
+    args = _make_args(
+        delaunay_n_anchors=8,
+        delaunay_dedup_radius=0.08,   # tight enough to keep all 4 anchors
+        delaunay_min_pilot_samples=10,
+        delaunay_bridge_min_edge_length=0.50,  # suppress bridges to keep row count predictable
+    )
+    rows, meta = build_delaunay_windows_from_pilot_samples(samples, args)
+    captured = capsys.readouterr()
+
+    anchors = [r for r in rows if r["window_type"] == "basin_anchor"]
+    assert len(anchors) >= 3, f"Expected ≥3 basin_anchors, got {len(anchors)}"
+    assert "WARNING" in captured.out, (
+        "Expected coverage-gap WARNING in stdout when Delaunay has a long edge.\n"
+        f"Captured stdout: {captured.out!r}"
+    )
 
 
 def test_csv_round_trip(tmp_path):

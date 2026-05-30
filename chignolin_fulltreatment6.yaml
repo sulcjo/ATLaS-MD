@@ -1,6 +1,112 @@
 schema_version: '2.0'
 description: "Chignolin (GYDPETGTWG) delaunay-feedback 2D contacts x rama-map HMR-GaMD/REUS: KDE basin-anchor picking + Delaunay triangulation on pilot CV samples replaces rectangular grid topology. Based on fulltreatment5; adaptive_production block present but unused (delaunay-feedback dispatches to adaptive-feedback pipeline)."
 
+workflow_help: |
+  ============================================================
+  WORKFLOW: chignolin_fulltreatment6  (run as two commands)
+  ============================================================
+
+  COMMAND 1 — GENPEPT seed generation (separate, run first):
+    python GENPEPT.py --config chignolin_fulltreatment6.yaml
+  Output: chignolin_genpept_3/final_survivor_seeds.csv + PDBs
+  NOTE: genpept_prescan reads chignolin_genpept_5 (pre-existing),
+        not the freshly generated chignolin_genpept_3.
+
+  COMMAND 2 — GAREUS MD workflow:
+    gareus --config chignolin_fulltreatment6.yaml
+  Output: chignolin_2d_run6/
+
+  ============================================================
+  STAGE 0  GENPEPT (command 1)
+  ============================================================
+  - 3,000,000 raw structures, stratified Rama sampling, 64 workers
+  - Implicit-solvent adaptive minimisation (<=300 iter)
+  - Basin hopping: 120 parents x 3 hops x 350 MD steps at 675 K (HMR)
+  - NMA expand: modes 1-2, amplitudes 0.75 A + 1.35 A
+  - PCA frontier: 2 rounds x 50k proposals, 250 kept per 45 bins
+  - Funnel -> 1600 final seeds
+
+  ============================================================
+  STAGE 1  SYSTEM SETUP  (command 2, automatic)
+  ============================================================
+  - Build GYDPETGTWG, explicit-solvent dodecahedron
+  - NVT warmup 0.5 fs -> NPT ramp 1.0 fs
+  - CV1 boundary pull: 2 x 20,000 steps at 1 fs, k=100 kcal/mol
+    -> calibrates achievable contact-fraction range [lo, hi]
+  - GENPEPT prescan on chignolin_genpept_5:
+    scores candidate/minimised/BH/NMA/final-survivor PDBs by
+    contact fraction -> window-centre prior + seed library
+
+  ============================================================
+  STAGE 2  INITIAL WINDOWS
+  ============================================================
+  CV1  nonlocal contacts: residue-balanced heavy atoms,
+       r0=4.8 A, beta_inv=4.0 A^-1, normalised to [0,1]
+       target spacing 0.05, k in [50, 250] kcal/mol (adaptive)
+  CV2  rama-map discrete centres:
+       -1.0 (beta/extended), -0.333 (PPII/coil),
+        0.333 (right-alpha),   1.0  (left-alpha)
+       k in [5, 100] kcal/mol (Delaunay spacing, adaptive)
+  Seeds: best-scoring GENPEPT survivors per window (active-CV)
+  Starting-structure pull: 50,000 steps/window at 3 fs, k=75
+
+  ============================================================
+  STAGE 3  DELAUNAY-FEEDBACK PILOTS  (5 rounds)
+  ============================================================
+  Each pilot round:
+    pilot_fraction=0.008 x 1,000,000 = 8,000 steps/replica
+    = 32 ps/replica at 4 fs  (hmr-gamd)
+    GaMD: sigma0p=sigma0d=6 kcal/mol, 100k equil steps
+    Exchange: Gibbs-walk every 100 steps
+
+  After each pilot round >= 1 (iterative Delaunay):
+    samples.csv (CV1+CV2, all replicas pooled)
+    -> KDE 64x64 grid, Scott BW
+    -> greedy peak pick: up to 16 basin_anchor windows
+       (density floor = 5th percentile)
+    -> coverage scaffold (3x3 grid): inject coverage_scaffold
+       in any cell with no anchor within dedup_radius=0.10
+       (up to 9 extra points; fills unvisited CV regions)
+    -> scipy.spatial.Delaunay on all anchor points
+    -> WARNING printed if any edge >= 2x median
+       (signals coverage gap; check logs)
+    -> bridge midpoints on edges > 0.20 normalised
+    -> anisotropic k = 2*kBT/sigma^2 per window
+       sigma = 0.5 x local neighbour spacing, per-axis
+       k1 clamped [50, 250], k2 clamped [5, 100] kcal/mol
+    -> stability check: if max anchor shift vs previous
+       round < 0.05 (normalised) -> layout unchanged
+    -> write delaunay_initial_windows.csv -> next round
+
+  Adaptive-feedback layer (every round):
+    region memory (decay 0.5): tracks over/undersampled regions
+    probes unvalidated, prunes overscanned, extends undersampled
+    up to 16 sparse 2D local-patch candidates
+
+  Validation: 20,000 steps/replica (80 ps) with final layout
+
+  ============================================================
+  STAGE 4  FINAL PRODUCTION
+  ============================================================
+  - Fixed window set from last stable Delaunay layout
+  - 1,000,000 steps/replica at 4 fs = 4 ns/replica (hmr-gamd)
+  - GaMD: sigma0p=sigma0d=6 kcal/mol, 100k equil per replica
+  - Gibbs-walk exchange every 100 steps
+  - XTC trajectories every 50 steps (200 fs frames)
+  - Output: chignolin_2d_run6/final_production/
+  - analysis_arrays.npz + samples.csv (pooled) for MBAR/PMF
+
+  ============================================================
+  KEY NUMBERS
+  ============================================================
+  Pilot overhead:  ~32 ps x N_windows x 5 rounds
+  Final MD:         4 ns x N_windows  (N_windows ~ 10-25)
+  Platform:         CUDA
+  NOTE: adaptive_production block (md_budget_ns: 840)
+        is PRESENT but UNUSED -- delaunay-feedback routes
+        through adaptive-feedback pipeline only.
+  ============================================================
+
 # NOTE: Schema v2.0 migration from chignolin_fulltreatment4.yaml.
 # Lost params (dropped from CLI, now hardcoded internally):
 #   contact_adaptive_max_total_windows: 16  → no equivalent; replica count now uncapped
@@ -107,7 +213,7 @@ contact_cv:
 
   # CV boundary pull — active pull toward CV extremes to find achievable range
   cv1_boundary_pull_steps: 20000
-  cv1_boundary_pull_k: 50.0
+  cv1_boundary_pull_k: 100.0
 
   # Frontier probing (was contact_frontier_enabled + contact_frontier_probe_count)
   cv1_frontier: true
@@ -140,7 +246,7 @@ windows:
   validation_steps: 20000             # was: adaptive_feedback_validation_steps
   adaptive_rounds: 5                  # was: adaptive_feedback_rounds
   sparse_2d: true                     # was: sparse_2d_patches_enabled + contact_sparse_2d_patches_enabled
-  max_2d_patches: 12                  # was: adaptive_2d_max_local_patches
+  max_2d_patches: 16                  # was: adaptive_2d_max_local_patches
   explicit_2d_window_schema: generic
   region_memory: true                 # was: adaptive_feedback_region_state_enabled
   region_memory_decay: 0.5            # was: adaptive_feedback_region_memory_decay
@@ -148,6 +254,16 @@ windows:
   region_prune_overscanned: true      # was: adaptive_feedback_prune_overscanned_regions
   region_extend_undersampled: true    # was: adaptive_feedback_extend_undersampled_regions
   # Dropped: adaptive_feedback_min_effective_samples, adaptive_2d_min_edge_samples — hardcoded.
+
+  # Iterative Delaunay: re-run placement every pilot round >= 1 until anchor set stabilises.
+  # Prevents blind spots from poor first-round pilot coverage.
+  delaunay_iterate: true
+  delaunay_stability_tol: 0.05
+
+  # Coverage scaffold: inject grid windows in CV cells with no KDE-peak anchor.
+  # 3×3 grid → up to 9 scaffold points covering the full contacts×rama-map space.
+  delaunay_coverage_scaffold: true
+  delaunay_coverage_grid_n: 3
 
 adaptive_production:
   # Global aggregate MD pool

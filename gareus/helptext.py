@@ -98,6 +98,8 @@ Common flags
 
     --run-mode MODE                     cmd, hmr-cmd, gamd, or hmr-gamd. cmd/hmr-cmd need no gamd-openmm.
     --window-mode MODE                  manual, adaptive, adaptive-feedback, adaptive-production, double-adaptive, or delaunay-feedback.
+                                        delaunay-feedback: KDE basin anchors + Delaunay triangulation on pilot samples,
+                                        iterates each round until stable; add --delaunay-coverage-scaffold to fill gaps.
     --cv1 MODE                          Primary CV: distance or contacts.
     --cv2 MODE                          Secondary CV; non-none auto-enables 2D centers.
     --cv2-centers C ...                 Override auto 2D centers (e.g. -0.8 0.0 0.8).
@@ -654,25 +656,44 @@ local patches, and adapt secondary-CV centers when enabled.
 0.13b Delaunay-feedback mode
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 `--window-mode delaunay-feedback` extends adaptive-feedback with data-driven
-window placement from pilot CV samples.  After the designated pilot round:
+window placement from pilot CV samples.  Starting from the designated pilot round:
 
-    pilot round 1 samples (cv_A, secondary_cv)
+    pilot round N samples (cv_A, secondary_cv)
     -> KDE density field (Scott bandwidth)
     -> greedy KDE peak picking  -> basin_anchor windows
+    -> [optional] coverage scaffold: grid-inject in uncovered [0,1]^2 cells
     -> Delaunay triangulation   -> delaunay_bridge at long edges
     -> [optional] circumcenter_probe (density-filtered)
     -> anisotropic force constants from local neighbor spacing
-    -> explicit 2D window CSV  -> fed into adaptive-feedback rounds 2-N
+    -> explicit 2D window CSV  -> fed into subsequent adaptive-feedback rounds
+    -> repeat each round until anchor set is stable (iterative mode)
+
+Placement re-runs every pilot round >= delaunay-after-round (default) and
+stops updating the CSV once anchors shift less than --delaunay-stability-tol.
+A WARNING is printed whenever any Delaunay edge is >=2x the median edge length,
+indicating a possible coverage gap in CV space.
 
 Key controls:
 
-    --delaunay-after-round N       which pilot round's samples to use (default 1)
-    --delaunay-n-anchors N         max KDE basin anchors (default 16)
-    --delaunay-bridge-min-edge F   min normalised edge length for bridge windows (default 0.20)
-    --delaunay-density-floor-q F   KDE percentile floor; positions below are rejected (default 0.05)
-    --delaunay-k-sigma-factor F    sigma = factor × local neighbour spacing for force constants (default 0.50)
-    --delaunay-dedup-radius F      min normalised distance between anchors (default 0.10)
-    --delaunay-circumcenter-probes enable optional circumcenter probe windows (off by default)
+    --delaunay-after-round N          pilot round to start Delaunay (default 1)
+    --delaunay-iterate/--no-delaunay-iterate
+                                      re-run each round >= trigger (default: on)
+    --delaunay-stability-tol F        stop iterating when max anchor shift < F
+                                      in normalised space (default 0.05)
+    --delaunay-coverage-scaffold      inject grid anchors in cells with no KDE peak
+    --delaunay-coverage-grid-n N      N×N scaffold grid (default 3)
+    --delaunay-n-anchors N            max KDE basin anchors (default 16)
+    --delaunay-bridge-min-edge F      min normalised edge for bridge windows (default 0.20)
+    --delaunay-density-floor-q F      KDE percentile floor (default 0.05)
+    --delaunay-k-sigma-factor F       sigma = factor × local spacing for k (default 0.50)
+    --delaunay-dedup-radius F         min normalised distance between anchors (default 0.10)
+    --delaunay-circumcenter-probes    optional circumcenter probe windows (off by default)
+
+The coverage scaffold mitigates the blind-spot problem: if the pilot REUS does
+not visit a CV region (high barrier, short pilot), KDE finds no peak there and
+no anchor is placed.  Scaffold mode divides the normalised CV square into an
+N×N grid and injects a "coverage_scaffold" window in each cell that has no
+KDE anchor within dedup-radius, providing baseline coverage at no simulation cost.
 
 Rounds 2-N and final production use the existing explicit-sparse pipeline
 (build_explicit_2d_neighbor_edges + adaptive-feedback sparse-patch refinement).

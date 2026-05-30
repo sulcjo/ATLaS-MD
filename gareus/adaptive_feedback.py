@@ -3077,24 +3077,55 @@ def run_adaptive_feedback_auto_loop(args, out_dir: Path, openmm, app, unit, forc
         _delaunay_trigger = int(getattr(args, "delaunay_after_round", 0) or 0)
         if str(getattr(args, "window_mode", "")) == "delaunay-feedback" and _delaunay_trigger == 0:
             _delaunay_trigger = 1
-        if _delaunay_trigger > 0 and int(round_no) == _delaunay_trigger and secondary_cv_enabled(args):
+        # delaunay-feedback iterates every round >= trigger by default; explicit flag overrides.
+        _di_flag = getattr(args, "delaunay_iterate", None)
+        _delaunay_iterate = (
+            bool(_di_flag) if _di_flag is not None
+            else str(getattr(args, "window_mode", "")) == "delaunay-feedback"
+        )
+        _delaunay_stability_tol = float(getattr(args, "delaunay_stability_tol", 0.05) or 0.05)
+        _d_round_cond = (
+            int(round_no) >= _delaunay_trigger if _delaunay_iterate
+            else int(round_no) == _delaunay_trigger
+        )
+        if _delaunay_trigger > 0 and _d_round_cond and secondary_cv_enabled(args):
             try:
                 from .windows import build_delaunay_windows_from_pilot_samples as _bdelaunay
                 import csv as _csv_mod
-                # Pass out_dir=None: this block owns the CSV write below
                 _d_rows, _d_meta = _bdelaunay(
                     round_dir / "samples.csv", args, out_dir=None, round_index=int(round_no))
                 if _d_rows:
-                    _d_csv_path = round_dir / "delaunay_initial_windows.csv"
-                    with _d_csv_path.open("w", newline="") as _fh:
-                        _dw = _csv_mod.DictWriter(_fh, fieldnames=list(_d_rows[0].keys()), extrasaction="ignore")
-                        _dw.writeheader()
-                        _dw.writerows(_d_rows)
-                    current_windows_2d_csv = _d_csv_path
-                    current_windows_2d_source_round = int(round_no)
-                    driver_summary["delaunay_initial_windows_csv"] = str(_d_csv_path)
-                    driver_summary["delaunay_trigger_round"] = int(round_no)
-                    print(f"    Delaunay placement: {len(_d_rows)} windows from round {round_no} samples -> {_d_csv_path}")
+                    # Stability check: skip layout update if anchors barely moved
+                    _prev_anchors = driver_summary.get("_prev_delaunay_anchors")
+                    _new_anchors = _d_meta.get("anchor_norm_positions", [])
+                    _is_stable = False
+                    if _delaunay_iterate and _prev_anchors and _new_anchors and len(_prev_anchors) == len(_new_anchors):
+                        try:
+                            import numpy as _np_d
+                            from scipy.spatial import cKDTree as _CKD
+                            _t = _CKD(_np_d.array(_new_anchors))
+                            _dists, _ = _t.query(_np_d.array(_prev_anchors), k=1)
+                            _max_shift = float(_np_d.max(_dists))
+                            if _max_shift < _delaunay_stability_tol:
+                                _is_stable = True
+                                print(
+                                    f"    Delaunay stable: max anchor shift {_max_shift:.4f} "
+                                    f"< tol {_delaunay_stability_tol} — layout unchanged."
+                                )
+                        except Exception:
+                            pass
+                    driver_summary["_prev_delaunay_anchors"] = _new_anchors
+                    if not _is_stable:
+                        _d_csv_path = round_dir / "delaunay_initial_windows.csv"
+                        with _d_csv_path.open("w", newline="") as _fh:
+                            _dw = _csv_mod.DictWriter(_fh, fieldnames=list(_d_rows[0].keys()), extrasaction="ignore")
+                            _dw.writeheader()
+                            _dw.writerows(_d_rows)
+                        current_windows_2d_csv = _d_csv_path
+                        current_windows_2d_source_round = int(round_no)
+                        driver_summary["delaunay_initial_windows_csv"] = str(_d_csv_path)
+                        driver_summary["delaunay_trigger_round"] = int(round_no)
+                        print(f"    Delaunay placement: {len(_d_rows)} windows from round {round_no} samples -> {_d_csv_path}")
             except Exception as _delaunay_exc:
                 print(f"WARNING: Delaunay placement failed (round {round_no}): {_delaunay_exc}; "
                       f"keeping axis-factorized proposal.")

@@ -1322,6 +1322,8 @@ def _build_delaunay_windows_impl(samples_csv_path, args, out_dir, round_index: i
     k_sigma_factor = float(getattr(args, "delaunay_k_sigma_factor", 0.50) or 0.50)
     k_min = float(getattr(args, "contact_adaptive_min_k_kcal", 10.0) or 10.0)
     k_max = float(getattr(args, "contact_adaptive_max_k_kcal", 200.0) or 200.0)
+    k2_min = float(getattr(args, "secondary_cv_adaptive_min_k_kcal", 5.0) or 5.0)
+    k2_max = float(getattr(args, "secondary_cv_adaptive_max_k_kcal", 100.0) or 100.0)
     k_secondary_default = float(getattr(args, "secondary_cv_k_kcal", 25.0) or 25.0)
     kBT = 0.5961  # kcal/mol at 300 K
 
@@ -1406,6 +1408,22 @@ def _build_delaunay_windows_impl(samples_csv_path, args, out_dir, round_index: i
     if not anchors_norm:
         raise ValueError("No KDE peaks found above density floor — pilot may be too short or CV range too narrow.")
 
+    # --- coverage scaffold: grid-inject windows in uncovered [0,1]^2 cells ---
+    _scaffold_norm_set: set[tuple[float, float]] = set()
+    if bool(getattr(args, "delaunay_coverage_scaffold", False)):
+        _grid_n = int(getattr(args, "delaunay_coverage_grid_n", 3) or 3)
+        _step = 1.0 / max(1, _grid_n)
+        for _gi in range(_grid_n):
+            for _gj in range(_grid_n):
+                _n1 = _step * (_gi + 0.5)
+                _n2 = _step * (_gj + 0.5)
+                if all(
+                    math.sqrt((_n1 - a[0]) ** 2 + (_n2 - a[1]) ** 2) >= dedup_radius
+                    for a in anchors_norm
+                ):
+                    anchors_norm.append((_n1, _n2))
+                    _scaffold_norm_set.add((_n1, _n2))
+
     # --- un-normalize and snap CV2 to discrete centers ---
     configured_cv2_centers = None
     if secondary_cv_is_transition(args):
@@ -1454,6 +1472,21 @@ def _build_delaunay_windows_impl(samples_csv_path, args, out_dir, round_index: i
             for i in range(3):
                 e = (min(simplex[i], simplex[(i + 1) % 3]), max(simplex[i], simplex[(i + 1) % 3]))
                 edge_set.add(e)
+
+        # coverage warning: any edge >= 2× median signals a possible sampling gap
+        _edge_lens_all = [
+            math.sqrt((anc_norm[i][0] - anc_norm[j][0])**2 + (anc_norm[i][1] - anc_norm[j][1])**2)
+            for (i, j) in edge_set
+        ]
+        if _edge_lens_all:
+            _median_el = float(np.median(_edge_lens_all))
+            _n_long = sum(1 for el in _edge_lens_all if el >= 2.0 * _median_el)
+            if _n_long > 0:
+                print(
+                    f"    WARNING: Delaunay has {_n_long} long edge(s) (>=2x median "
+                    f"{_median_el:.3f}): possible coverage gap. "
+                    f"Consider --delaunay-coverage-scaffold or more pilot steps."
+                )
 
         # bridge windows at long edges
         for (i, j) in edge_set:
@@ -1512,7 +1545,11 @@ def _build_delaunay_windows_impl(samples_csv_path, args, out_dir, round_index: i
 
     # --- combine all positions ---
     all_positions: list[tuple[float, float, float, float, str]] = (
-        [(cv1, cv2, n1, n2, "basin_anchor") for (cv1, cv2, n1, n2) in anchor_positions]
+        [
+            (cv1, cv2, n1, n2,
+             "coverage_scaffold" if (n1, n2) in _scaffold_norm_set else "basin_anchor")
+            for (cv1, cv2, n1, n2) in anchor_positions
+        ]
         + [(cv1, cv2, n1, n2, "delaunay_bridge") for (cv1, cv2, n1, n2) in bridge_positions]
         + [(cv1, cv2, n1, n2, "circumcenter_probe") for (cv1, cv2, n1, n2) in probe_positions]
     )
@@ -1524,7 +1561,7 @@ def _build_delaunay_windows_impl(samples_csv_path, args, out_dir, round_index: i
     def _k_for_window(wi: int) -> tuple[float, float]:
         """Return (k_cv1, k_cv2) for window wi based on local Delaunay neighbor spacing."""
         if len(all_norm) < 2:
-            return k_min, k_secondary_default
+            return k_min, max(k2_min, k_secondary_default)
         pos = all_norm[wi]
         dists = np.sqrt(np.sum((all_norm - pos)**2, axis=1))
         dists[wi] = np.inf
@@ -1542,7 +1579,7 @@ def _build_delaunay_windows_impl(samples_csv_path, args, out_dir, round_index: i
         k1_raw = 2.0 * kBT / (sigma1**2)
         k2_raw = 2.0 * kBT / (sigma2**2)
         k1 = max(k_min, min(k_max, k1_raw))
-        k2 = max(k_min, min(k_max * 3, k2_raw))
+        k2 = max(k2_min, min(k2_max, k2_raw))
         return k1, k2
 
     # --- emit canonical CSV rows ---
@@ -1565,16 +1602,19 @@ def _build_delaunay_windows_impl(samples_csv_path, args, out_dir, round_index: i
         rows.append(row)
 
     # --- write output CSV and metadata ---
+    _n_scaffolds = sum(1 for r in rows if r.get("window_type") == "coverage_scaffold")
     metadata = {
         "round_index": round_index,
         "n_pilot_samples": len(primary_vals),
-        "n_anchors": len(anchor_positions),
+        "n_anchors": len(anchor_positions) - _n_scaffolds,
+        "n_scaffolds": _n_scaffolds,
         "n_bridges": len(bridge_positions),
         "n_probes": len(probe_positions),
         "n_total_windows": len(rows),
         "density_floor_value": float(density_floor),
         "cv1_range": [cv1_lo, cv1_hi],
         "cv2_range": [cv2_lo, cv2_hi],
+        "anchor_norm_positions": [[a[2], a[3]] for a in anchor_positions],
     }
     if out_dir is not None:
         out_dir = Path(out_dir)
