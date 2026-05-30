@@ -155,14 +155,13 @@ adaptive_production:
 
   # Epoch schedule
   ap_epochs: 10                       # was: adaptive_production_epochs
-  ap_epoch_steps: 450000              # explicit: 0.6*840ns / (10 epochs * 28 states * 4e-6 ms/step)
-  # NOTE: md_budget_ns auto-inference not yet implemented — gamd_production_steps bleeds from
-  # validation pilot (20000 steps) into adaptive-production giving epoch_steps=1000 without this.
+  # ap_epoch_steps / ap_final_steps: omit to let the code compute from pool balance.
+  # Code now distributes remaining budget evenly across remaining epochs using actual
+  # n_states and timestep. Explicit values override if set > 0.
 
   # Final phase
   ap_final_pool_fraction: 0.40        # was: adaptive_production_final_pool_fraction
   ap_min_final_pool_ns: 300.0         # was: adaptive_production_min_final_pool_ns
-  ap_final_steps: 3000000             # explicit: 0.4*840ns / (28 states * 4e-6 ms/step)
   # NOTE: adaptive_production_final_step_budget: 84000000 dropped — auto-inferred same way.
 
   # Resume / outputs

@@ -2387,6 +2387,39 @@ def _runtime_pool_final_reserve_ns(pool: AdaptiveRuntimePool, policy: AdaptiveDe
     return min(pool.remaining_ns(), reserve)
 
 
+def _epoch_steps_from_pool(
+    pool: AdaptiveRuntimePool,
+    policy: AdaptiveDecisionPolicy,
+    n_states: int,
+    epochs_remaining: int,
+    timestep_fs: float,
+) -> int:
+    """Per-state step target for one epoch: spread remaining epoch budget evenly.
+
+    Divides (remaining_ns - final_reserve) across epochs_remaining and converts
+    to per-state steps using n_states and timestep_fs.  clip_steps() then acts
+    as a safety net, but since target = fair share it should not clip.
+    """
+    if not pool.enabled or n_states <= 0 or epochs_remaining <= 0 or timestep_fs <= 0:
+        return 0
+    final_reserve = _runtime_pool_final_reserve_ns(pool, policy, final=False)
+    available_ns = max(0.0, pool.remaining_ns() - final_reserve)
+    epoch_ns = available_ns / epochs_remaining
+    return max(1, int(epoch_ns * 1e6 / timestep_fs / n_states))
+
+
+def _final_steps_from_pool(
+    pool: AdaptiveRuntimePool,
+    n_states: int,
+    timestep_fs: float,
+) -> int:
+    """Per-state step target for the frozen final phase: spend entire remaining budget."""
+    if not pool.enabled or n_states <= 0 or timestep_fs <= 0:
+        return 0
+    available_ns = max(0.0, pool.remaining_ns())
+    return max(1, int(available_ns * 1e6 / timestep_fs / n_states))
+
+
 def _write_runtime_pool_reports(adaptive_dir: Path, pool: AdaptiveRuntimePool) -> Dict[str, str]:
     adaptive_dir = Path(adaptive_dir)
     json_path = adaptive_dir / "adaptive_runtime_pool.json"
@@ -3061,34 +3094,17 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
     adaptive_dir.mkdir(parents=True, exist_ok=True)
     policy = policy_from_args(args)
     max_epochs = max(1, _arg_int(args, "adaptive_production_epochs", 3))
+    # Explicit overrides take precedence. When unset (0), epoch/final steps are
+    # computed dynamically per-epoch from the pool balance and actual state count.
+    # The fallback (gamd_production_steps//20) is used only when the pool is disabled.
     _explicit_epoch_steps = _arg_int(args, "adaptive_production_epoch_steps", 0)
-    if _explicit_epoch_steps > 0:
-        epoch_steps = int(_explicit_epoch_steps)
-    else:
-        # Auto-compute from md_budget_ns when available to avoid inheriting a pilot's
-        # gamd_production_steps (e.g. validation_steps=20000 → epoch_steps=1000).
-        _md_budget_ns = float(getattr(args, "adaptive_production_total_md_pool_ns", 0.0) or 0.0)
-        _final_frac = float(getattr(args, "adaptive_production_final_pool_fraction", 0.50) or 0.50)
-        _timestep_fs = float(getattr(args, "timestep_fs", 2.0) or 2.0)
-        if _md_budget_ns > 0 and max_epochs > 0 and _timestep_fs > 0:
-            _n_states_hint = max(1, int(getattr(args, "contact_adaptive_max_total_replicas", 0) or 0) or 32)
-            _epoch_ns = _md_budget_ns * (1.0 - _final_frac) / max_epochs
-            epoch_steps = max(1, int(_epoch_ns * 1e6 / _timestep_fs / _n_states_hint))
-        else:
-            epoch_steps = max(1, int(getattr(args, "gamd_production_steps", 100000) or 100000) // 20)
     _explicit_final_steps = _arg_int(args, "adaptive_production_final_steps", 0)
-    if _explicit_final_steps > 0:
-        final_steps = int(_explicit_final_steps)
-    else:
-        _md_budget_ns = float(getattr(args, "adaptive_production_total_md_pool_ns", 0.0) or 0.0)
-        _final_frac = float(getattr(args, "adaptive_production_final_pool_fraction", 0.50) or 0.50)
-        _timestep_fs = float(getattr(args, "timestep_fs", 2.0) or 2.0)
-        if _md_budget_ns > 0 and _timestep_fs > 0:
-            _n_states_hint = max(1, int(getattr(args, "contact_adaptive_max_total_replicas", 0) or 0) or 32)
-            _final_ns = _md_budget_ns * _final_frac
-            final_steps = max(1, int(_final_ns * 1e6 / _timestep_fs / _n_states_hint))
-        else:
-            final_steps = max(1, int(getattr(args, "gamd_production_steps", epoch_steps) or epoch_steps))
+    _timestep_fs = float(getattr(args, "timestep_fs", 2.0) or 2.0)
+    _gamd_fallback = max(1, int(getattr(args, "gamd_production_steps", 100000) or 100000) // 20)
+    # epoch_steps / final_steps used only as fallback when pool is disabled or for
+    # the scheduled-epoch path which needs a default_steps before the loop.
+    epoch_steps = int(_explicit_epoch_steps) if _explicit_epoch_steps > 0 else _gamd_fallback
+    final_steps = int(_explicit_final_steps) if _explicit_final_steps > 0 else _gamd_fallback
     use_epoch_samples_for_mbar = _arg_bool(args, "adaptive_production_use_epoch_samples_for_mbar", False)
     global_shared_gamd_dir: Optional[Path] = None
     if _arg_bool(args, "adaptive_production_global_shared_gamd", True):
@@ -3142,6 +3158,14 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
         epoch_dir = adaptive_dir / f"epoch_{epoch:03d}"
         epoch_dir.mkdir(parents=True, exist_ok=True)
         scheduled_summary = None
+        # For both scheduled and unscheduled paths: recompute default steps from pool
+        # when pool is enabled and no explicit override, so each epoch gets its fair share.
+        if _explicit_epoch_steps <= 0 and runtime_pool.enabled:
+            _sched_n = _estimate_active_state_count(args, registry, current_windows_csv)
+            _epochs_left = max(1, max_epochs - epoch)
+            _pool_epoch_steps = _epoch_steps_from_pool(runtime_pool, policy, _sched_n, _epochs_left, _timestep_fs)
+            if _pool_epoch_steps > 0:
+                epoch_steps = _pool_epoch_steps
         if registry is not None and bool(policy.allocation_scheduler):
             schedule_policy = _policy_with_pool_step_budget(
                 registry, policy, runtime_pool, default_steps=epoch_steps, final=False
@@ -3190,6 +3214,16 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                 "topup_index": 0,
             })
             epoch_state_estimate = _estimate_active_state_count(args, registry, current_windows_csv)
+            # Compute fair per-epoch target steps from pool when no explicit override.
+            # Distributes remaining epoch budget evenly across remaining epochs so each
+            # epoch gets its share regardless of how many states were active at config time.
+            if _explicit_epoch_steps <= 0 and runtime_pool.enabled:
+                epochs_remaining = max(1, max_epochs - epoch)
+                _target_epoch_steps = _epoch_steps_from_pool(
+                    runtime_pool, policy, epoch_state_estimate, epochs_remaining, _timestep_fs
+                )
+                if _target_epoch_steps > 0:
+                    epoch_steps = _target_epoch_steps
             actual_epoch_steps = runtime_pool.clip_steps(
                 epoch_state_estimate,
                 int(epoch_steps),
@@ -3409,8 +3443,14 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
     else:
         final_args = copy.copy(args)
         final_args.out = str(final_dir)
+        final_n_states = max(1, len(registry.active_states()))
+        # Compute final steps from pool when no explicit override: spend all remaining budget.
+        if _explicit_final_steps <= 0 and runtime_pool.enabled:
+            _target_final = _final_steps_from_pool(runtime_pool, final_n_states, _timestep_fs)
+            if _target_final > 0:
+                final_steps = _target_final
         actual_final_steps = runtime_pool.clip_steps(
-            max(1, len(registry.active_states())),
+            final_n_states,
             int(final_steps),
             reserve_ns=0.0,
             hard_stop=bool(policy.pool_hard_stop),
