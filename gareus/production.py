@@ -2752,9 +2752,17 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 loaded_shared_gamd_checkpoint = True
             except Exception as exc:
                 skipped_globals["<shared_context_checkpoint>"] = f"load failed; falling back to CustomIntegrator globals only: {exc}"
-        if use_gamd and not fast_resume and not loaded_shared_gamd_checkpoint:
-            copied_globals, copied_skipped = set_integrator_globals_from_dict(integrator_i, shared_gamd_globals_all)
-            skipped_globals.update(copied_skipped)
+        if use_gamd and not fast_resume:
+            # Always copy calibrated globals from the dict regardless of whether the
+            # checkpoint loaded.  loadCheckpoint() can silently succeed without
+            # actually restoring CustomIntegrator globals (e.g. cross-platform or
+            # cross-context mismatch), leaving Vmax/Vmin/k0/ForceScalingFactor at
+            # zero/default and causing NaN forces at step 0.  The dict copy is
+            # authoritative for calibration outputs; the checkpoint provides the
+            # opaque GaMD binary stage state as a bonus.
+            if shared_gamd_globals_all:
+                copied_globals, copied_skipped = set_integrator_globals_from_dict(integrator_i, shared_gamd_globals_all)
+                skipped_globals.update({k: v for k, v in copied_skipped.items() if k not in skipped_globals})
         replica_gamd_copy_report.append({
             "replica": int(i),
             "copied_count": int(len(copied_globals)),
