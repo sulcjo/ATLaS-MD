@@ -678,6 +678,9 @@ def minimize_and_npt_equilibrate(args, out_dir: Path, progress: Optional[GuiProg
         final_state = ramp_state
 
     write_state_pdb(out_dir / "02_npt_equilibrated.pdb", app, modeller.topology, final_state.getPositions())
+    (out_dir / "03_npt_equilibrated_state.xml").write_text(
+        openmm.XmlSerializer.serialize(final_state), encoding="utf-8"
+    )
 
     # Keep the fresh-run return contract identical to
     # load_existing_openmm_setup_for_resume(): callers need the OpenMM
