@@ -120,6 +120,9 @@ Common flags
     --platform NAME                     auto, CUDA, HIP, OpenCL, CPU, or Reference.
     --device-index LIST                 GPU device token(s), e.g. 0 or 0,1,2,3.
     --replica-device-mode MODE          auto, round-robin, single-context-split, or manual.
+    --cpu-budget N                      Total CPU cores; distributed as floor(N/n_replicas) threads/replica (CPU platform only).
+    --max-cpu-per-replica N             Cap threads per replica regardless of --cpu-budget.
+    --setup-cpu-threads N               CPU threads for setup/minimization/equilibration phase.
     --scratchdir DIR                    Use fast local scratch and mirror to --out at checkpoints.
 
     --self-test-primary-cv-force        Validate the selected primary CV force and exit.
@@ -647,6 +650,34 @@ The final production lives under:
 Pilot folders are diagnostics, not final PMF inputs.  Adaptive feedback can add
 midpoint windows, shift centers, prune over-resolved regions, create sparse 2D
 local patches, and adapt secondary-CV centers when enabled.
+
+0.13b Delaunay-feedback mode
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+`--window-mode delaunay-feedback` extends adaptive-feedback with data-driven
+window placement from pilot CV samples.  After the designated pilot round:
+
+    pilot round 1 samples (cv_A, secondary_cv)
+    -> KDE density field (Scott bandwidth)
+    -> greedy KDE peak picking  -> basin_anchor windows
+    -> Delaunay triangulation   -> delaunay_bridge at long edges
+    -> [optional] circumcenter_probe (density-filtered)
+    -> anisotropic force constants from local neighbor spacing
+    -> explicit 2D window CSV  -> fed into adaptive-feedback rounds 2-N
+
+Key controls:
+
+    --delaunay-after-round N       which pilot round's samples to use (default 1)
+    --delaunay-n-anchors N         max KDE basin anchors (default 16)
+    --delaunay-bridge-min-edge F   min normalised edge length for bridge windows (default 0.20)
+    --delaunay-density-floor-q F   KDE percentile floor; positions below are rejected (default 0.05)
+    --delaunay-k-sigma-factor F    sigma = factor × local neighbour spacing for force constants (default 0.50)
+    --delaunay-dedup-radius F      min normalised distance between anchors (default 0.10)
+    --delaunay-circumcenter-probes enable optional circumcenter probe windows (off by default)
+
+Rounds 2-N and final production use the existing explicit-sparse pipeline
+(build_explicit_2d_neighbor_edges + adaptive-feedback sparse-patch refinement).
+The adaptive_production block is unused; delaunay-feedback dispatches to the
+same run_adaptive_feedback_auto_loop as adaptive-feedback.
 
 0.14 Adaptive-production mode
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
