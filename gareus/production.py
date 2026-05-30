@@ -2567,6 +2567,21 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     secondary_cv_ks_kj = np.asarray([kcal_to_kj(k) for k in secondary_cv_k_kcal_list], dtype=float) if secondary_cv_k_kcal_list is not None else None
     nrep = len(centers_nm)
 
+    _max_replicas = int(getattr(args, "max_replicas", 0) or 0)
+    if _max_replicas > 0 and nrep > _max_replicas:
+        print(f"[production] --max-replicas {_max_replicas}: truncating {nrep} windows to {_max_replicas}")
+        centers_nm = centers_nm[:_max_replicas]
+        ks_kj_nm2 = ks_kj_nm2[:_max_replicas]
+        centers_a = centers_a[:_max_replicas]
+        k_list = k_list[:_max_replicas]
+        if secondary_cv_ks_kj is not None:
+            secondary_cv_ks_kj = secondary_cv_ks_kj[:_max_replicas]
+        if secondary_cv_centers is not None:
+            secondary_cv_centers = np.asarray(secondary_cv_centers, dtype=float)[:_max_replicas]
+        if secondary_cv_k_kcal_list is not None:
+            secondary_cv_k_kcal_list = list(secondary_cv_k_kcal_list)[:_max_replicas]
+        nrep = _max_replicas
+
     # Resolve per-replica CPU threads now that nrep is known.
     # --cpu-budget distributes total cores evenly; --max-cpu-per-replica caps the result.
     if str(getattr(args, "platform", "")).upper() == "CPU":

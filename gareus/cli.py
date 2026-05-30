@@ -388,6 +388,9 @@ def _add_platform_args(p: argparse.ArgumentParser) -> None:
                         "(floor(budget/n_replicas), min 1). 0 = use --cpu-threads directly.")
     p.add_argument("--max-cpu-per-replica", type=int, default=0,
                    help="Cap per-replica CPU thread count regardless of --cpu-budget. 0 = no cap.")
+    p.add_argument("--max-replicas", type=int, default=0,
+                   help="Hard cap on the number of replicas/windows for any run mode. "
+                        "Windows are truncated to this count after generation/loading. 0 = no cap.")
     p.add_argument("--setup-platform", default="")
     p.add_argument("--setup-precision", default="")
     p.add_argument("--setup-device-index", default="")

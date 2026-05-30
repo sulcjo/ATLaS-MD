@@ -124,6 +124,7 @@ Common flags
     --replica-device-mode MODE          auto, round-robin, single-context-split, or manual.
     --cpu-budget N                      Total CPU cores; distributed as floor(N/n_replicas) threads/replica (CPU platform only).
     --max-cpu-per-replica N             Cap threads per replica regardless of --cpu-budget.
+    --max-replicas N                    Hard cap on replicas/windows for any run mode; windows truncated after generation/loading. 0 = no cap.
     --setup-cpu-threads N               CPU threads for setup/minimization/equilibration phase.
     --scratchdir DIR                    Use fast local scratch and mirror to --out at checkpoints.
 
