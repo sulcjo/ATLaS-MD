@@ -699,6 +699,9 @@ def load_parquet_adaptive_union(adaptive_dir: Path) -> Data:
     state_ids = [int(r['state_id']) for r in reg_rows]
     state_id_to_k = {sid: k for k, sid in enumerate(state_ids)}
     K = len(state_ids)
+    # Per-state burnin thresholds (steps within an epoch to discard for equilibration).
+    # Currently 0 for all states by default; respected when explicitly set.
+    burnin_by_k = np.array([int(r.get('burnin_steps') or 0) for r in reg_rows], dtype=np.int64)
     primary_centers = np.array([float(r['primary_center']) for r in reg_rows])
     primary_ks     = np.array([float(r['primary_k'])      for r in reg_rows])
     sec_centers    = np.array([float(r['secondary_center']) if r.get('secondary_center', '') not in ('', 'None', 'nan') else np.nan for r in reg_rows])
@@ -754,6 +757,21 @@ def load_parquet_adaptive_union(adaptive_dir: Path) -> Data:
     pot_arr = np.concatenate(all_potential)
     potential = pot_arr if np.any(np.isfinite(pot_arr)) else None
 
+    epoch_src = np.concatenate(all_epoch_src) if all_epoch_src else np.zeros(len(cv), dtype=np.int32)
+
+    # Drop per-state burnin frames: for each sample, compare its epoch-local step
+    # against the burnin threshold for the state it was collected in.
+    if np.any(burnin_by_k > 0):
+        keep = step >= burnin_by_k[window]
+        n_dropped = int((~keep).sum())
+        if n_dropped > 0:
+            print(f'    [burnin filter] dropped {n_dropped}/{len(cv)} samples ({100*n_dropped/len(cv):.1f}%) from pre-equilibration steps')
+        cv = cv[keep]; cv2 = cv2[keep]; window = window[keep]
+        step = step[keep]; replica = replica[keep]; boost = boost[keep]
+        epoch_src = epoch_src[keep]
+        pot_arr = pot_arr[keep]
+        potential = pot_arr if np.any(np.isfinite(pot_arr)) else None
+
     if not math.isfinite(beta):
         _, beta = infer_temp_beta(adaptive_dir, meta)
     temp = 1.0 / (K_B_KJ_PER_MOL_K * beta)
@@ -766,8 +784,6 @@ def load_parquet_adaptive_union(adaptive_dir: Path) -> Data:
         if has_secondary and math.isfinite(sec_centers[k]) and sec_ks[k] > 0:
             d2 = np.where(np.isfinite(cv2), cv2 - sec_centers[k], 0.0)
             u_nk[:, k] += beta * 4.184 * 0.5 * sec_ks[k] * d2 * d2
-
-    epoch_src = np.concatenate(all_epoch_src) if all_epoch_src else np.zeros(len(cv), dtype=np.int32)
     meta_out = dict(meta)
     meta_out.update({'temperature_K': temp, 'beta_1_over_kJ_mol': beta,
                      'adaptive_union_states': K, 'adaptive_union_epochs': len(epoch_dirs),
@@ -6432,6 +6448,23 @@ def _analyze_epoch_cv_exploration(prod_dir: Path, out: Path, meta: dict, warn: l
     if not epochs:
         return {'available': False, 'reason': 'no epoch data found in adaptive_production/'}
 
+    # Also load final-phase samples for the growth plot (may not exist yet during a run).
+    final_entry = None
+    final_dir = ap / 'final'
+    if final_dir.is_dir():
+        try:
+            cv_f, sec_f = _load_subrun_cv(final_dir)
+            if cv_f is None:
+                cv_parts, sec_parts = [], []
+                for sub in sorted(final_dir.iterdir()):
+                    if not sub.is_dir(): continue
+                    a, b = _load_subrun_cv(sub)
+                    if a is not None: cv_parts.append(a); sec_parts.append(b)
+                if cv_parts: cv_f = np.concatenate(cv_parts); sec_f = np.concatenate(sec_parts)
+            if cv_f is not None:
+                final_entry = {'label': 'Final', 'cv_A': cv_f, 'secondary_cv': sec_f, 'n_samples': len(cv_f)}
+        except Exception: pass
+
     all_sec = np.concatenate([e['secondary_cv'] for e in epochs])
     is_2d = not np.all(np.isnan(all_sec))
 
@@ -6552,6 +6585,60 @@ def _analyze_epoch_cv_exploration(prod_dir: Path, out: Path, meta: dict, warn: l
             generated['epoch_window_evolution_png'] = str(p)
         except Exception as e:
             warn.append(f'epoch_window_evolution.png failed: {e}'); plt.close('all')
+
+    # Plot 4: cumulative space growth — panels show CV1×CV2 density after each epoch,
+    # plus a final-phase panel.  Fixed color scale across all panels so coverage
+    # accumulation is directly comparable.
+    if is_2d:
+        try:
+            GBINS = 40
+            panels = []
+            cum_cv, cum_sec = np.empty(0), np.empty(0)
+            for epoch in epochs:
+                mask = np.isfinite(epoch['cv_A']) & np.isfinite(epoch['secondary_cv'])
+                cum_cv = np.concatenate([cum_cv, epoch['cv_A'][mask]])
+                cum_sec = np.concatenate([cum_sec, epoch['secondary_cv'][mask]])
+                h, xe, ye = np.histogram2d(cum_cv, cum_sec, bins=GBINS,
+                                           range=[[cv_min, cv_max], [sec_min, sec_max]])
+                panels.append({'label': f'Up to epoch {epoch["epoch_idx"]}  ({len(cum_cv):,} samples)', 'h': h, 'xe': xe, 'ye': ye})
+            if final_entry is not None:
+                fmask = np.isfinite(final_entry['cv_A']) & np.isfinite(final_entry['secondary_cv'])
+                if fmask.sum() > 0:
+                    hf, xef, yef = np.histogram2d(
+                        final_entry['cv_A'][fmask], final_entry['secondary_cv'][fmask],
+                        bins=GBINS, range=[[cv_min, cv_max], [sec_min, sec_max]])
+                    panels.append({'label': f'Final phase  ({fmask.sum():,} samples)', 'h': hf, 'xe': xef, 'ye': yef, 'is_final': True})
+
+            if panels:
+                global_vmax = max(float(p['h'].max()) for p in panels)
+                global_vmax = max(global_vmax, 1.0)
+                ncols = min(len(panels), 4); nrows = math.ceil(len(panels) / ncols)
+                fig, axes = plt.subplots(nrows, ncols, figsize=(3.8 * ncols, 3.4 * nrows), squeeze=False)
+                for pi, panel in enumerate(panels):
+                    r, c = divmod(pi, ncols); ax = axes[r][c]
+                    h = panel['h']; xe = panel['xe']; ye = panel['ye']
+                    # mask empty bins so they show as background, not zero-color
+                    hm = np.ma.masked_where(h == 0, h)
+                    xc = 0.5 * (xe[:-1] + xe[1:]); yc = 0.5 * (ye[:-1] + ye[1:])
+                    im = ax.pcolormesh(xc, yc, hm.T, cmap='hot_r', vmin=1, vmax=global_vmax, shading='nearest')
+                    is_final = panel.get('is_final', False)
+                    for spine in ax.spines.values():
+                        spine.set_edgecolor('#2266cc' if is_final else 'black')
+                        spine.set_linewidth(2.0 if is_final else 0.8)
+                    ax.set_title(panel['label'], fontsize=8, color='#2266cc' if is_final else 'black')
+                    ax.set_xlabel(cv1_label, fontsize=8)
+                    ax.set_ylabel(cv2_label, fontsize=8)
+                    ax.tick_params(labelsize=7)
+                    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04).ax.tick_params(labelsize=6)
+                for pi in range(len(panels), nrows * ncols):
+                    r, c = divmod(pi, ncols); axes[r][c].set_visible(False)
+                fig.suptitle('Exploration space growth by epoch (CV1 × CV2 sample density)', fontsize=10, y=1.01)
+                fig.tight_layout()
+                p = ep_out / 'epoch_cv_space_growth.png'
+                fig.savefig(p, dpi=160, bbox_inches='tight'); plt.close(fig)
+                generated['epoch_cv_space_growth_png'] = str(p)
+        except Exception as e:
+            warn.append(f'epoch_cv_space_growth.png failed: {e}'); plt.close('all')
 
     return {'available': True, 'n_epochs': n, 'is_2d': is_2d, 'adaptive_dir': str(ap), 'files': generated}
 
