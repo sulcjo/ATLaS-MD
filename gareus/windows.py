@@ -52,6 +52,7 @@ __all__ = [
     "expand_windows_for_secondary_cv",
     "set_window",
     "build_explicit_2d_neighbor_edges",
+    "build_delaunay_windows_from_pilot_samples",
     "estimate_terminal_cv_envelope_a",
     "run_cv_boundary_pulls",
     "broadcast_contact_k_for_centers",
@@ -1267,3 +1268,323 @@ def build_explicit_2d_neighbor_edges(centers_a, secondary_cv_centers, args=None)
     out = list(edges.values())
     out.sort(key=lambda r: (float(r.get("normalized_distance", float("inf"))), int(r["wi"]), int(r["wj"]), str(r.get("edge_type", ""))))
     return out
+
+
+# ---------------------------------------------------------------------------
+# Delaunay-based window placement
+# ---------------------------------------------------------------------------
+
+def _require_scipy_delaunay():
+    """Lazy import guard for scipy Delaunay + KDE — avoids hard dependency at import time."""
+    try:
+        from scipy.spatial import Delaunay as _Delaunay  # noqa: F401
+        from scipy.stats import gaussian_kde as _gaussian_kde  # noqa: F401
+        return _Delaunay, _gaussian_kde
+    except ImportError as exc:
+        raise ImportError(
+            "Delaunay window placement requires scipy. "
+            "Install with: pip install gareus-peptide[analysis]"
+        ) from exc
+
+
+def build_delaunay_windows_from_pilot_samples(
+    samples_csv_path,
+    args,
+    out_dir=None,
+    round_index: int = 1,
+) -> tuple[list[dict], dict]:
+    """Build data-driven 2D umbrella windows from pilot simulation CV samples.
+
+    Reads a pilot samples.csv, KDE-picks basin anchors in (CV1, CV2) space,
+    Delaunay-triangulates them, adds bridge windows at long edges, and returns
+    canonical explicit-2D CSV rows compatible with load_explicit_2d_window_csv.
+
+    Returns (rows, metadata). On failure returns ([], {"error": ...}).
+    """
+    try:
+        return _build_delaunay_windows_impl(samples_csv_path, args, out_dir, round_index)
+    except Exception as exc:
+        return [], {"error": str(exc), "round_index": round_index}
+
+
+def _build_delaunay_windows_impl(samples_csv_path, args, out_dir, round_index: int) -> tuple[list[dict], dict]:
+    ScipyDelaunay, gaussian_kde = _require_scipy_delaunay()
+
+    # --- params from args (with defaults) ---
+    min_pilot_samples = int(getattr(args, "delaunay_min_pilot_samples", 50) or 50)
+    density_floor_q = float(getattr(args, "delaunay_density_floor_quantile", 0.05) or 0.05)
+    kde_grid_res = int(getattr(args, "delaunay_kde_grid_res", 64) or 64)
+    n_anchors_max = int(getattr(args, "delaunay_n_anchors", 16) or 16)
+    dedup_radius = float(getattr(args, "delaunay_dedup_radius", 0.10) or 0.10)
+    bridge_min_edge = float(getattr(args, "delaunay_bridge_min_edge_length", 0.20) or 0.20)
+    do_circumcenters = bool(getattr(args, "delaunay_circumcenter_probes", False))
+    circ_max_radius_factor = float(getattr(args, "delaunay_circumcenter_max_radius", 2.0) or 2.0)
+    k_sigma_factor = float(getattr(args, "delaunay_k_sigma_factor", 0.50) or 0.50)
+    k_min = float(getattr(args, "contact_adaptive_min_k_kcal", 10.0) or 10.0)
+    k_max = float(getattr(args, "contact_adaptive_max_k_kcal", 200.0) or 200.0)
+    k_secondary_default = float(getattr(args, "secondary_cv_k_kcal", 25.0) or 25.0)
+    kBT = 0.5961  # kcal/mol at 300 K
+
+    cv1_mode = primary_cv_mode(args)
+    cv2_mode = secondary_cv_mode(args)
+    cv2_lo, cv2_hi = secondary_cv_range(args)
+    is_contacts = primary_cv_is_contacts(args)
+    cv1_lo, cv1_hi = (0.0, 1.0) if is_contacts else (None, None)
+
+    # --- load samples ---
+    samples_csv_path = Path(samples_csv_path)
+    primary_vals: list[float] = []
+    secondary_vals: list[float] = []
+    if samples_csv_path.exists():
+        with samples_csv_path.open(newline="") as fh:
+            reader = csv.DictReader(fh)
+            for row in reader:
+                try:
+                    cv1 = float(row.get("cv_A", "nan"))
+                    cv2 = float(row.get("secondary_cv", "nan"))
+                    if math.isfinite(cv1) and math.isfinite(cv2):
+                        primary_vals.append(cv1)
+                        secondary_vals.append(cv2)
+                except (ValueError, TypeError):
+                    continue
+
+    if len(primary_vals) < min_pilot_samples:
+        raise ValueError(
+            f"Delaunay placement needs ≥{min_pilot_samples} pilot samples, "
+            f"got {len(primary_vals)} from {samples_csv_path}"
+        )
+
+    pts_raw = np.column_stack([primary_vals, secondary_vals])
+
+    # --- normalize to [0, 1]² ---
+    if cv1_lo is None:
+        cv1_lo = float(np.min(pts_raw[:, 0]))
+        cv1_hi = float(np.max(pts_raw[:, 0]))
+    cv1_span = max(cv1_hi - cv1_lo, 1e-8)
+    cv2_span = max(cv2_hi - cv2_lo, 1e-8)
+    pts_norm = np.column_stack([
+        (pts_raw[:, 0] - cv1_lo) / cv1_span,
+        (pts_raw[:, 1] - cv2_lo) / cv2_span,
+    ])
+
+    # --- KDE density ---
+    kde = gaussian_kde(pts_norm.T, bw_method="scott")
+    kde_at_samples = kde(pts_norm.T)
+    density_floor = float(np.percentile(kde_at_samples, 100.0 * density_floor_q))
+
+    # --- greedy KDE peak picking on uniform grid ---
+    gx = np.linspace(0.0, 1.0, kde_grid_res)
+    gy = np.linspace(0.0, 1.0, kde_grid_res)
+    gxx, gyy = np.meshgrid(gx, gy)
+    grid_pts = np.column_stack([gxx.ravel(), gyy.ravel()])
+    grid_kde = kde(grid_pts.T).reshape(kde_grid_res, kde_grid_res)
+
+    # local maxima: value > all 8 neighbours and > density_floor
+    local_max_mask = np.zeros((kde_grid_res, kde_grid_res), dtype=bool)
+    for di in (-1, 0, 1):
+        for dj in (-1, 0, 1):
+            if di == 0 and dj == 0:
+                continue
+            shifted = np.roll(np.roll(grid_kde, di, axis=0), dj, axis=1)
+            local_max_mask |= (grid_kde <= shifted)
+    local_max_mask = ~local_max_mask & (grid_kde > density_floor)
+
+    peak_rows, peak_cols = np.where(local_max_mask)
+    peak_values = grid_kde[peak_rows, peak_cols]
+    sort_idx = np.argsort(-peak_values)
+    peak_rows = peak_rows[sort_idx]
+    peak_cols = peak_cols[sort_idx]
+
+    anchors_norm: list[tuple[float, float]] = []
+    for r, c in zip(peak_rows, peak_cols):
+        pos = (gx[c], gy[r])
+        if all(math.sqrt((pos[0] - a[0])**2 + (pos[1] - a[1])**2) >= dedup_radius for a in anchors_norm):
+            anchors_norm.append(pos)
+        if len(anchors_norm) >= n_anchors_max:
+            break
+
+    if not anchors_norm:
+        raise ValueError("No KDE peaks found above density floor — pilot may be too short or CV range too narrow.")
+
+    # --- un-normalize and snap CV2 to discrete centers ---
+    configured_cv2_centers = None
+    if secondary_cv_is_transition(args):
+        raw = getattr(args, "secondary_cv_centers", None)
+        if raw and len(raw) > 0:
+            configured_cv2_centers = [float(x) for x in raw]
+
+    def _snap_cv2(val_raw: float) -> float:
+        if configured_cv2_centers:
+            return min(configured_cv2_centers, key=lambda c: abs(c - val_raw))
+        return val_raw
+
+    def _unnorm(norm_cv1: float, norm_cv2: float) -> tuple[float, float]:
+        raw_cv1 = norm_cv1 * cv1_span + cv1_lo
+        raw_cv2 = norm_cv2 * cv2_span + cv2_lo
+        raw_cv2 = _snap_cv2(raw_cv2)
+        return raw_cv1, raw_cv2
+
+    def _in_cv2_range(val: float) -> bool:
+        return cv2_lo - 1e-6 <= val <= cv2_hi + 1e-6
+
+    # Build anchor pool
+    seen_keys: set[tuple[float, float]] = set()
+    anchor_positions: list[tuple[float, float, float, float]] = []  # (cv1, cv2, norm1, norm2)
+    for (n1, n2) in anchors_norm:
+        cv1, cv2 = _unnorm(n1, n2)
+        if not _in_cv2_range(cv2):
+            continue
+        key = (round(cv1, 4), round(cv2, 4))
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        anchor_positions.append((cv1, cv2, n1, n2))
+
+    # --- Delaunay triangulation ---
+    bridge_positions: list[tuple[float, float, float, float]] = []
+    probe_positions: list[tuple[float, float, float, float]] = []
+
+    if len(anchor_positions) >= 3:
+        anc_norm = np.array([(a[2], a[3]) for a in anchor_positions])
+        tri = ScipyDelaunay(anc_norm)
+
+        # collect Delaunay edges (vertex index pairs)
+        edge_set: set[tuple[int, int]] = set()
+        for simplex in tri.simplices:
+            for i in range(3):
+                e = (min(simplex[i], simplex[(i + 1) % 3]), max(simplex[i], simplex[(i + 1) % 3]))
+                edge_set.add(e)
+
+        # bridge windows at long edges
+        for (i, j) in edge_set:
+            n1i, n2i = anc_norm[i]
+            n1j, n2j = anc_norm[j]
+            edge_len = math.sqrt((n1j - n1i)**2 + (n2j - n2i)**2)
+            if edge_len > bridge_min_edge:
+                mid_n1 = 0.5 * (n1i + n1j)
+                mid_n2 = 0.5 * (n2i + n2j)
+                cv1, cv2 = _unnorm(mid_n1, mid_n2)
+                if not _in_cv2_range(cv2):
+                    continue
+                key = (round(cv1, 4), round(cv2, 4))
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                bridge_positions.append((cv1, cv2, mid_n1, mid_n2))
+
+        # circumcenter probes (optional)
+        if do_circumcenters:
+            all_edge_lengths = [
+                math.sqrt((anc_norm[i][0] - anc_norm[j][0])**2 + (anc_norm[i][1] - anc_norm[j][1])**2)
+                for (i, j) in edge_set
+            ]
+            median_edge_len = float(np.median(all_edge_lengths)) if all_edge_lengths else 1.0
+
+            for simplex in tri.simplices:
+                ax, ay = anc_norm[simplex[0]]
+                bx, by = anc_norm[simplex[1]]
+                cx, cy = anc_norm[simplex[2]]
+                # circumcenter via perpendicular bisector intersection
+                D = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
+                if abs(D) < 1e-12:
+                    continue
+                ux = ((ax**2 + ay**2) * (by - cy) + (bx**2 + by**2) * (cy - ay) + (cx**2 + cy**2) * (ay - by)) / D
+                uy = ((ax**2 + ay**2) * (cx - bx) + (bx**2 + by**2) * (ax - cx) + (cx**2 + cy**2) * (bx - ax)) / D
+                # circumradius
+                circ_r = math.sqrt((ux - ax)**2 + (uy - ay)**2)
+                if circ_r > circ_max_radius_factor * median_edge_len:
+                    continue
+                if not (-0.05 <= ux <= 1.05 and -0.05 <= uy <= 1.05):
+                    continue
+                ux_c = max(0.0, min(1.0, ux))
+                uy_c = max(0.0, min(1.0, uy))
+                probe_pt = np.array([[ux_c, uy_c]])
+                if float(kde(probe_pt.T)[0]) < density_floor:
+                    continue
+                cv1, cv2 = _unnorm(ux_c, uy_c)
+                if not _in_cv2_range(cv2):
+                    continue
+                key = (round(cv1, 4), round(cv2, 4))
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                probe_positions.append((cv1, cv2, ux_c, uy_c))
+
+    # --- combine all positions ---
+    all_positions: list[tuple[float, float, float, float, str]] = (
+        [(cv1, cv2, n1, n2, "basin_anchor") for (cv1, cv2, n1, n2) in anchor_positions]
+        + [(cv1, cv2, n1, n2, "delaunay_bridge") for (cv1, cv2, n1, n2) in bridge_positions]
+        + [(cv1, cv2, n1, n2, "circumcenter_probe") for (cv1, cv2, n1, n2) in probe_positions]
+    )
+
+    # --- anisotropic force constants ---
+    # Build position arrays for k computation
+    all_norm = np.array([(n1, n2) for (_, _, n1, n2, _) in all_positions]) if all_positions else np.empty((0, 2))
+
+    def _k_for_window(wi: int) -> tuple[float, float]:
+        """Return (k_cv1, k_cv2) for window wi based on local Delaunay neighbor spacing."""
+        if len(all_norm) < 2:
+            return k_min, k_secondary_default
+        pos = all_norm[wi]
+        dists = np.sqrt(np.sum((all_norm - pos)**2, axis=1))
+        dists[wi] = np.inf
+        neighbor_idx = np.argsort(dists)[:max(1, min(6, len(all_norm) - 1))]
+        neighbor_vecs = all_norm[neighbor_idx] - pos
+        # CV1 axis projections (un-normalize to actual CV units)
+        cv1_projections = np.abs(neighbor_vecs[:, 0]) * cv1_span
+        cv2_projections = np.abs(neighbor_vecs[:, 1]) * cv2_span
+        cv1_projections = cv1_projections[cv1_projections > 1e-8]
+        cv2_projections = cv2_projections[cv2_projections > 1e-8]
+        s1 = float(np.median(cv1_projections)) if len(cv1_projections) > 0 else cv1_span * 0.3
+        s2 = float(np.median(cv2_projections)) if len(cv2_projections) > 0 else cv2_span * 0.3
+        sigma1 = max(k_sigma_factor * s1, 1e-6)
+        sigma2 = max(k_sigma_factor * s2, 1e-6)
+        k1_raw = 2.0 * kBT / (sigma1**2)
+        k2_raw = 2.0 * kBT / (sigma2**2)
+        k1 = max(k_min, min(k_max, k1_raw))
+        k2 = max(k_min, min(k_max * 3, k2_raw))
+        return k1, k2
+
+    # --- emit canonical CSV rows ---
+    rows: list[dict] = []
+    for wi, (cv1, cv2, n1, n2, wtype) in enumerate(all_positions):
+        k1, k2 = _k_for_window(wi)
+        row = {
+            "window": wi,
+            "primary_cv_mode": cv1_mode,
+            "primary_cv_center": cv1,
+            "primary_cv_k_kcal": k1,
+            "distance_center_A": cv1,          # legacy alias
+            "distance_k_kcal_mol_A2": k1,      # legacy alias
+            "secondary_cv_mode": cv2_mode,
+            "secondary_cv_center": cv2,
+            "secondary_cv_k_kcal_mol": k2,
+            "window_type": wtype,
+            "source_row": wi + 2,
+        }
+        rows.append(row)
+
+    # --- write output CSV and metadata ---
+    metadata = {
+        "round_index": round_index,
+        "n_pilot_samples": len(primary_vals),
+        "n_anchors": len(anchor_positions),
+        "n_bridges": len(bridge_positions),
+        "n_probes": len(probe_positions),
+        "n_total_windows": len(rows),
+        "density_floor_value": float(density_floor),
+        "cv1_range": [cv1_lo, cv1_hi],
+        "cv2_range": [cv2_lo, cv2_hi],
+    }
+    if out_dir is not None:
+        out_dir = Path(out_dir)
+        csv_path = out_dir / "delaunay_initial_windows.csv"
+        if rows:
+            with csv_path.open("w", newline="") as fh:
+                writer = csv.DictWriter(fh, fieldnames=list(rows[0].keys()), extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(rows)
+        meta_path = out_dir / "delaunay_initial_windows_metadata.json"
+        write_json(meta_path, metadata)
+
+    return rows, metadata

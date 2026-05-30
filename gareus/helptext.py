@@ -97,7 +97,7 @@ Common flags
     --seed INT                          Random seed.
 
     --run-mode MODE                     cmd, hmr-cmd, gamd, or hmr-gamd. cmd/hmr-cmd need no gamd-openmm.
-    --window-mode MODE                  manual, adaptive, adaptive-feedback, adaptive-production, or double-adaptive.
+    --window-mode MODE                  manual, adaptive, adaptive-feedback, adaptive-production, double-adaptive, or delaunay-feedback.
     --cv1 MODE                          Primary CV: distance or contacts.
     --cv2 MODE                          Secondary CV; non-none auto-enables 2D centers.
     --cv2-centers C ...                 Override auto 2D centers (e.g. -0.8 0.0 0.8).

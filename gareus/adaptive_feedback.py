@@ -511,27 +511,42 @@ def _adaptive_feedback_2d_edge_diagnostics(
     return rows
 
 
+_AXIS_EDGE_TYPES = frozenset({"distance_axis", "secondary_axis"})
+
+
 def _adaptive_feedback_2d_annotate_locality(edge_rows: list[dict], args) -> tuple[list[dict], list[dict]]:
-    """Annotate bad 2D edges as local-patch or full-axis refinement candidates."""
+    """Annotate bad 2D edges as local-patch or full-axis refinement candidates.
+
+    Pure axis edges (distance_axis, secondary_axis) are grouped by interval and
+    may be promoted to full_axis_refinement_candidate when a large fraction of
+    the interval is bad.  Non-axis edges (knn_geometry, delaunay_bridge, compound
+    axis+knn types) are annotated per-edge and always map to local_patch_candidate.
+    """
     if not edge_rows:
         return [], []
     threshold = float(getattr(args, "adaptive_2d_global_bad_fraction", 0.50) or 0.50)
     threshold = max(0.0, min(1.0, threshold))
+
     groups: dict[tuple[str, int], list[int]] = {}
+    non_axis_indices: list[int] = []
+
     for idx, row in enumerate(edge_rows):
-        et = str(row.get("edge_type", ""))
-        if et == "distance_axis":
-            key = (et, int(row.get("primary_pair_index", -1)))
-        elif et == "secondary_axis":
-            key = (et, int(row.get("secondary_pair_index", -1)))
+        pure_types = set(str(row.get("edge_type", "")).split("+")) - {""}
+        if pure_types and pure_types <= _AXIS_EDGE_TYPES:
+            # Pure axis edge — group by interval for bad-fraction logic
+            et = "distance_axis" if "distance_axis" in pure_types else "secondary_axis"
+            key_field = "primary_pair_index" if et == "distance_axis" else "secondary_pair_index"
+            key = (et, int(row.get(key_field, -1)))
+            groups.setdefault(key, []).append(idx)
         else:
-            key = (et, -1)
-        groups.setdefault(key, []).append(idx)
+            # Non-axis (knn_geometry, delaunay_bridge, compound, unknown): annotate per-edge
+            non_axis_indices.append(idx)
 
     annotated = [dict(r) for r in edge_rows]
     defects = []
     bad_statuses = {"low_overlap", "low_exchange", "low_overlap_low_exchange"}
     defect_statuses = bad_statuses | {"insufficient_samples"}
+
     for key, indices in groups.items():
         bad = [i for i in indices if str(annotated[i].get("edge_status")) in bad_statuses]
         bad_fraction = float(len(bad) / max(1, len(indices)))
@@ -552,6 +567,19 @@ def _adaptive_feedback_2d_annotate_locality(edge_rows: list[dict], args) -> tupl
                     rec = "prefer_full_axis_center_addition"
                 annotated[i]["recommendation"] = rec
                 defects.append(dict(annotated[i]))
+
+    for i in non_axis_indices:
+        annotated[i]["bad_edges_in_axis_interval"] = 0
+        annotated[i]["total_edges_in_axis_interval"] = 1
+        annotated[i]["bad_fraction_in_axis_interval"] = float("nan")
+        status = str(annotated[i].get("edge_status", ""))
+        if status in defect_statuses:
+            annotated[i]["defect_scope"] = "local_patch_candidate"
+            annotated[i]["recommendation"] = "add_or_test_local_midpoint_patch_only"
+            defects.append(dict(annotated[i]))
+        else:
+            annotated[i]["defect_scope"] = "none"
+
     return annotated, defects
 
 
@@ -3043,6 +3071,34 @@ def run_adaptive_feedback_auto_loop(args, out_dir: Path, openmm, app, unit, forc
             current_secondary_k = [float(x) for x in proposal.get("proposed_secondary_cv_k_kcal_mol")]
         current_windows_2d_csv = _adaptive_feedback_sparse_candidate_csv_from_proposal(args, proposal, proposal_path)
         current_windows_2d_source_round = int(round_no) if current_windows_2d_csv is not None else None
+
+        # Delaunay placement: override with data-driven positions from pilot samples.
+        # Must run BEFORE cleanup_adaptive_feedback_pilot_directory deletes samples.csv.
+        _delaunay_trigger = int(getattr(args, "delaunay_after_round", 0) or 0)
+        if str(getattr(args, "window_mode", "")) == "delaunay-feedback" and _delaunay_trigger == 0:
+            _delaunay_trigger = 1
+        if _delaunay_trigger > 0 and int(round_no) == _delaunay_trigger and secondary_cv_enabled(args):
+            try:
+                from .windows import build_delaunay_windows_from_pilot_samples as _bdelaunay
+                import csv as _csv_mod
+                # Pass out_dir=None: this block owns the CSV write below
+                _d_rows, _d_meta = _bdelaunay(
+                    round_dir / "samples.csv", args, out_dir=None, round_index=int(round_no))
+                if _d_rows:
+                    _d_csv_path = round_dir / "delaunay_initial_windows.csv"
+                    with _d_csv_path.open("w", newline="") as _fh:
+                        _dw = _csv_mod.DictWriter(_fh, fieldnames=list(_d_rows[0].keys()), extrasaction="ignore")
+                        _dw.writeheader()
+                        _dw.writerows(_d_rows)
+                    current_windows_2d_csv = _d_csv_path
+                    current_windows_2d_source_round = int(round_no)
+                    driver_summary["delaunay_initial_windows_csv"] = str(_d_csv_path)
+                    driver_summary["delaunay_trigger_round"] = int(round_no)
+                    print(f"    Delaunay placement: {len(_d_rows)} windows from round {round_no} samples -> {_d_csv_path}")
+            except Exception as _delaunay_exc:
+                print(f"WARNING: Delaunay placement failed (round {round_no}): {_delaunay_exc}; "
+                      f"keeping axis-factorized proposal.")
+
         adaptive_memory = proposal.get("adaptive_memory_after", adaptive_memory) if isinstance(proposal, dict) else adaptive_memory
         write_json(out_dir / "adaptive_feedback_memory.json", _json_ready(adaptive_memory))
         cleanup_manifest = cleanup_adaptive_feedback_pilot_directory(round_dir)

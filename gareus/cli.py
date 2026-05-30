@@ -161,7 +161,8 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
     # Mode
     p.add_argument("--window-mode",
                    choices=["adaptive", "manual", "adaptive-feedback",
-                             "adaptive-production", "double-adaptive"],
+                             "adaptive-production", "double-adaptive",
+                             "delaunay-feedback"],
                    default="adaptive")
 
     # Adaptive-feedback tuning
@@ -184,6 +185,29 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                    help="Enable sparse local 2D midpoint patches during adaptive-feedback.")
     p.add_argument("--max-2d-patches", type=int, default=12,
                    help="Max sparse 2D patch windows per adaptive-feedback proposal.")
+
+    # Delaunay-feedback window placement
+    p.add_argument("--delaunay-after-round", type=int, default=0,
+                   help="Pilot round whose samples trigger Delaunay placement (0 = disabled; "
+                        "auto-set to 1 when --window-mode delaunay-feedback).")
+    p.add_argument("--delaunay-n-anchors", type=int, default=16,
+                   help="Max KDE-peak basin anchors for Delaunay placement.")
+    p.add_argument("--delaunay-dedup-radius", type=float, default=0.10,
+                   help="Min normalized-space distance between Delaunay anchors.")
+    p.add_argument("--delaunay-bridge-min-edge", type=float, default=0.20,
+                   help="Min normalized Delaunay edge length to spawn a bridge window.")
+    p.add_argument("--delaunay-density-floor-q", type=float, default=0.05,
+                   help="Pilot KDE percentile below which candidate positions are rejected.")
+    p.add_argument("--delaunay-kde-grid-res", type=int, default=64,
+                   help="Resolution of the KDE evaluation grid for peak picking.")
+    p.add_argument("--delaunay-circumcenter-probes", action=argparse.BooleanOptionalAction, default=False,
+                   help="Enable optional circumcenter probe windows (density-filtered).")
+    p.add_argument("--delaunay-circumcenter-max-radius", type=float, default=2.0,
+                   help="Circumradius cutoff as multiple of median Delaunay edge length.")
+    p.add_argument("--delaunay-k-sigma-factor", type=float, default=0.50,
+                   help="sigma = factor × neighbor spacing for Delaunay force constant.")
+    p.add_argument("--delaunay-min-pilot-samples", type=int, default=50,
+                   help="Minimum pilot samples required to proceed with Delaunay placement.")
 
     # Region memory
     p.add_argument("--region-memory", action=argparse.BooleanOptionalAction, default=False,
@@ -1134,7 +1158,7 @@ def main(argv: Optional[Iterable[str]] = None):
 
         else:
             openmm, app, unit, forcefield, topology, equil_state = minimize_and_npt_equilibrate(args, out_dir, progress=progress)
-            if str(getattr(args, "window_mode", "adaptive")) == "adaptive-feedback":
+            if str(getattr(args, "window_mode", "adaptive")) in {"adaptive-feedback", "delaunay-feedback"}:
                 run_adaptive_feedback_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
             elif str(getattr(args, "window_mode", "adaptive")) == "adaptive-production":
                 run_adaptive_production_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
