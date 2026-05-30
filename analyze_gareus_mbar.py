@@ -6032,9 +6032,18 @@ def _compute_chignolin_distances(d, args, progress, warnings: list):
     """Load replica DCD trajectories; return per-sample (dist1_A, dist2_A) in Å or (None, None)."""
     traj_dir = d.prod_dir / "replica_trajectories"
     if not traj_dir.exists():
-        warnings.append("--chignolin_fes: replica_trajectories/ not found.")
-        return None, None
+        merged = _prepare_adaptive_merged_traj_dir(d, args)
+        if merged is not None:
+            traj_dir = merged
+        else:
+            warnings.append("--chignolin_fes: replica_trajectories/ not found.")
+            return None, None
     top_path = _find_rg_topology_path(d.prod_dir, args)
+    if top_path is None:
+        for ep_run_dir in d.meta.get('adaptive_epoch_run_dirs', []):
+            top_path = _find_rg_topology_path(Path(ep_run_dir), args)
+            if top_path is not None:
+                break
     if top_path is None:
         warnings.append("--chignolin_fes: no topology PDB found; use --rg-topology.")
         return None, None
