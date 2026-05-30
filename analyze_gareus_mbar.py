@@ -182,13 +182,16 @@ def prod_dir_of(path: Path) -> Path:
         return (p/'segments.json').exists() and (p/'samples').is_dir()
     def _has_data(p: Path) -> bool:
         return (p/'analysis_arrays.npz').exists() or (p/'samples.csv').exists() or (p/'analysis_chunks_manifest.json').exists()
+    def _has_adaptive_parquet(p: Path) -> bool:
+        ap = p/'adaptive_production'
+        return (ap/'final_registry_used_for_mbar.csv').exists() and any(ap.glob('*/samples/**/*.parquet'))
     if _has_parquet(path) or _has_data(path): return path
     fp=path/'final_production'
     if _has_parquet(fp) or _has_data(fp): return fp
-    # Adaptive-production in-progress: final_production/ has no data yet; use union MBAR inputs.
     ap=path/'adaptive_production'
     if (ap/'adaptive_union_mbar.npz').exists(): return ap
-    raise FileNotFoundError(f'No Parquet samples/, analysis_arrays.npz, or samples.csv in {path} or {fp}; no adaptive_union_mbar.npz in {ap}')
+    if _has_adaptive_parquet(path): return ap
+    raise FileNotFoundError(f'No Parquet samples/, analysis_arrays.npz, or samples.csv in {path} or {fp}; no adaptive_union_mbar.npz or epoch Parquet data in {ap}')
 
 def read_windows(path: Path):
     centers=[]; ks=[]; rows=[]
@@ -648,6 +651,136 @@ def load_csv(prod: Path, load_notes: Optional[list[str]] = None) -> Data:
     meta['umbrella_window_rows']=rows
     return clean(Data(prod,prod/'pmf_analysis',cv,cv2,rg,win,rep,step,u,centers,ks,beta,temp,boost,pot,str(prod/'samples.csv'),meta))
 
+def _find_adaptive_epoch_dirs(adaptive_dir: Path) -> list:
+    """Return list of (run_dir, window_map_path) for each epoch/final with Parquet samples."""
+    result = []
+    for cand in sorted(adaptive_dir.iterdir()):
+        if not cand.is_dir():
+            continue
+        # epoch_NNN/ directly holds samples/ (first epoch pattern)
+        if (cand/'samples').is_dir() and (cand/'segments.json').exists() and (cand/'epoch_window_map.csv').exists():
+            result.append((cand, cand/'epoch_window_map.csv'))
+            continue
+        # epoch_NNN/baseline/ or final/baseline/ (later epoch pattern)
+        baseline = cand/'baseline'
+        if baseline.is_dir() and (baseline/'samples').is_dir() and (baseline/'segments.json').exists():
+            wmap = baseline/'epoch_window_map.csv'
+            if not wmap.exists():
+                wmap = cand/'epoch_window_map.csv'
+            if wmap.exists():
+                result.append((baseline, wmap))
+    return result
+
+
+def load_parquet_adaptive_union(adaptive_dir: Path) -> Data:
+    """Load MBAR inputs from adaptive-production Parquet epoch data.
+
+    Pools samples from all epoch run directories, remaps per-epoch window IDs to
+    global state IDs via epoch_window_map.csv, and builds the union N×K bias
+    matrix against the full registry of usable states.
+    """
+    try:
+        from gareus.query import load_samples
+    except ImportError as exc:
+        raise ImportError(f'gareus package required for Parquet loading: {exc}') from exc
+
+    adaptive_dir = Path(adaptive_dir)
+    registry_csv = adaptive_dir / 'final_registry_used_for_mbar.csv'
+    if not registry_csv.exists():
+        raise FileNotFoundError(f'No final_registry_used_for_mbar.csv in {adaptive_dir}')
+
+    with registry_csv.open(newline='') as f:
+        reg_rows = [r for r in csv.DictReader(f)
+                    if str(r.get('usable_for_mbar', '')).strip().lower() in ('true', '1', 'yes')]
+    if not reg_rows:
+        raise ValueError(f'No usable states in {registry_csv}')
+    reg_rows.sort(key=lambda r: int(r['state_id']))
+
+    state_ids = [int(r['state_id']) for r in reg_rows]
+    state_id_to_k = {sid: k for k, sid in enumerate(state_ids)}
+    K = len(state_ids)
+    primary_centers = np.array([float(r['primary_center']) for r in reg_rows])
+    primary_ks     = np.array([float(r['primary_k'])      for r in reg_rows])
+    sec_centers    = np.array([float(r['secondary_center']) if r.get('secondary_center', '') not in ('', 'None', 'nan') else np.nan for r in reg_rows])
+    sec_ks         = np.array([float(r['secondary_k'])      if r.get('secondary_k', '')      not in ('', 'None', 'nan') else 0.0   for r in reg_rows])
+    has_secondary  = np.any(np.isfinite(sec_centers))
+
+    epoch_dirs = _find_adaptive_epoch_dirs(adaptive_dir)
+    if not epoch_dirs:
+        raise FileNotFoundError(f'No epoch Parquet data found in {adaptive_dir}')
+
+    all_cv = []; all_cv2 = []; all_window = []; all_step = []
+    all_replica = []; all_boost = []; all_potential = []
+    beta = float('nan')
+    meta: dict = rjson(adaptive_dir.parent / 'run_manifest.json', {})
+
+    for epoch_dir, wmap_path in epoch_dirs:
+        with wmap_path.open(newline='') as f:
+            wmap = {int(r['epoch_window']): int(r['state_id']) for r in csv.DictReader(f)}
+        samples = load_samples(epoch_dir)
+        if not samples or 'cv1' not in samples or len(samples['cv1']) == 0:
+            continue
+        if not math.isfinite(beta):
+            ep_meta = rjson(epoch_dir / 'umbrella_pymbar_metadata.json', {})
+            b = float(ep_meta.get('beta_1_over_kJ_mol') or 0.0)
+            beta = b if b > 0 else infer_temp_beta(epoch_dir, ep_meta)[1]
+        raw_w = samples['window_id'].astype(np.int32)
+        remapped = np.array([wmap.get(int(w), -1) for w in raw_w], dtype=np.int32)
+        valid = remapped >= 0
+        if not np.any(valid):
+            continue
+        all_cv.append(samples['cv1'].astype(np.float64)[valid])
+        cv2_raw = samples.get('cv2')
+        all_cv2.append(cv2_raw.astype(np.float64)[valid] if cv2_raw is not None else np.full(valid.sum(), np.nan))
+        all_window.append(np.array([state_id_to_k[int(s)] for s in remapped[valid]], dtype=np.int32))
+        all_step.append(samples['step'].astype(np.int64)[valid])
+        rep = samples['replica'].astype(np.int32) if 'replica' in samples else np.zeros(int(valid.sum()), np.int32)
+        all_replica.append(rep[valid])
+        boost_raw = samples.get('gamd_boost_total')
+        all_boost.append(boost_raw.astype(np.float64)[valid] if boost_raw is not None else np.full(valid.sum(), np.nan))
+        pot_raw = samples.get('potential')
+        all_potential.append(pot_raw.astype(np.float64)[valid] if pot_raw is not None else np.full(valid.sum(), np.nan))
+
+    if not all_cv:
+        raise ValueError(f'No valid samples after window remapping in {adaptive_dir}')
+
+    cv      = np.concatenate(all_cv)
+    cv2     = np.concatenate(all_cv2)
+    window  = np.concatenate(all_window)
+    step    = np.concatenate(all_step)
+    replica = np.concatenate(all_replica)
+    boost   = np.concatenate(all_boost)
+    pot_arr = np.concatenate(all_potential)
+    potential = pot_arr if np.any(np.isfinite(pot_arr)) else None
+
+    if not math.isfinite(beta):
+        _, beta = infer_temp_beta(adaptive_dir, meta)
+    temp = 1.0 / (K_B_KJ_PER_MOL_K * beta)
+
+    N = len(cv)
+    u_nk = np.zeros((N, K), dtype=np.float64)
+    for k in range(K):
+        d1 = cv - primary_centers[k]
+        u_nk[:, k] = beta * 4.184 * 0.5 * primary_ks[k] * d1 * d1
+        if has_secondary and math.isfinite(sec_centers[k]) and sec_ks[k] > 0:
+            d2 = np.where(np.isfinite(cv2), cv2 - sec_centers[k], 0.0)
+            u_nk[:, k] += beta * 4.184 * 0.5 * sec_ks[k] * d2 * d2
+
+    meta_out = dict(meta)
+    meta_out.update({'temperature_K': temp, 'beta_1_over_kJ_mol': beta,
+                     'adaptive_union_states': K, 'adaptive_union_epochs': len(epoch_dirs),
+                     'umbrella_window_rows': list(reg_rows)})
+
+    return clean(Data(
+        prod_dir=adaptive_dir, out_dir=adaptive_dir / 'pmf_analysis',
+        cv=cv, cv2=cv2, rg_A=np.full(cv.shape, np.nan),
+        window=window, replica=replica, step=step,
+        u_nk=u_nk, centers=primary_centers, k_kcal=primary_ks,
+        beta=beta, temp=temp, boost_kj=boost, potential_kj=potential,
+        source=str(registry_csv), meta=meta_out,
+    ))
+
+
 def _parquet_sample_count(prod: Path) -> int:
     """Count rows across Parquet sample chunks without loading full data."""
     try:
@@ -786,9 +919,14 @@ def _apply_analysis_stride(d: Data, stride: int, offset: int = 0) -> Data:
 
 def load_data(inp: Path, out: Optional[Path], source: str = 'auto') -> Data:
     prod=prod_dir_of(inp)
-    # Adaptive-production in-progress: union NPZ is the only MBAR-ready data source.
-    if prod.name == 'adaptive_production' and (prod / 'adaptive_union_mbar.npz').exists():
-        d = load_union_npz(prod)
+    # Adaptive-production: prefer new Parquet epoch data, fall back to legacy NPZ.
+    if prod.name == 'adaptive_production':
+        if (prod / 'final_registry_used_for_mbar.csv').exists() and any(prod.glob('*/samples/**/*.parquet')):
+            d = load_parquet_adaptive_union(prod)
+        elif (prod / 'adaptive_union_mbar.npz').exists():
+            d = load_union_npz(prod)
+        else:
+            raise FileNotFoundError(f'adaptive_production/ has neither epoch Parquet data nor adaptive_union_mbar.npz in {prod}')
         if out is not None: d.out_dir = Path(out)
         return d
     requested=str(source or 'auto').strip().lower()
