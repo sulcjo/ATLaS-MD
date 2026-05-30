@@ -213,9 +213,8 @@ platform:
   #   cpu_budget: 32
   #   max_cpu_per_replica: 2     → 2 threads/replica
   #   cpu_threads: 4             → 4 threads/replica (no budget, explicit)
-  # cpu_budget: 0
-  # max_cpu_per_replica: 0
-  # cpu_threads: 1
+  cpu_budget: 64
+  max_cpu_per_replica: 6
 
 simulation:
   run_mode: hmr-gamd
