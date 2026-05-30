@@ -785,6 +785,41 @@ def load_parquet_adaptive_union(adaptive_dir: Path) -> Data:
     ))
 
 
+_MERGED_TRAJ_STEP_STRIDE = 10_000_000_000  # must match _prepare_adaptive_merged_traj_dir
+
+
+def _adjusted_steps_for_merged_traj(d: Data, spf: int = 50) -> Optional[np.ndarray]:
+    """Return sample steps corrected for merged-dir resume offsets.
+
+    In GAREUS, absolute sample steps include GaMD calibration steps (e.g. step 160050
+    for calib=160000, report_interval=50).  Trajectory frame 0 of each epoch starts at
+    relative step spf (step 1 within that epoch's production).  We subtract the
+    calibration offset so relative steps are in [spf, n_frames*spf], then add the
+    per-epoch STEP_STRIDE so each epoch maps to a non-overlapping window.
+    """
+    epoch_src = d.meta.get('_epoch_source')
+    if not epoch_src:
+        return None
+    src = np.asarray(epoch_src, dtype=np.int64)
+    if src.size != d.step.size:
+        return None
+    spf = max(1, int(spf))
+    # Calibration offset: first production step corresponds to relative step = spf.
+    # Subtracting it makes all epoch step ranges start at ~spf regardless of calib length.
+    calib_offset = max(0, int(d.step.min()) - spf)
+    relative = d.step.astype(np.int64) - calib_offset
+    return relative + src * _MERGED_TRAJ_STEP_STRIDE
+
+
+def _read_traj_interval_from_epoch_dirs(d: Data) -> int:
+    """Read traj_interval from epoch run dirs when prod_dir has no effective_config."""
+    for run_dir in d.meta.get('adaptive_epoch_run_dirs', []):
+        spf = _read_traj_interval(Path(run_dir))
+        if spf > 0:
+            return spf
+    return 500  # fallback default
+
+
 def _get_adaptive_epoch_traj_dirs(d: Data) -> list:
     """Return [(epoch_idx, traj_dir)] for epochs that have non-empty replica_trajectories/."""
     run_dirs = d.meta.get('adaptive_epoch_run_dirs', [])
@@ -827,7 +862,7 @@ def _prepare_adaptive_merged_traj_dir(d: Data, args=None) -> Optional[Path]:
                 link = merged / f'{base_stem}{f.suffix}'
                 base_written.add(base_stem)
             else:
-                link = merged / f'{base_stem}_resume_from_{epoch_idx * STEP_STRIDE}{f.suffix}'
+                link = merged / f'{base_stem}_resume_from_{epoch_idx * _MERGED_TRAJ_STEP_STRIDE}{f.suffix}'
             if not link.exists():
                 try:
                     link.symlink_to(f.resolve())
@@ -3303,6 +3338,12 @@ def _compute_rg_from_trajectories(d: Data, args, progress: Optional[Progress], w
     if progress is not None:
         progress.step('Rg trajectories', f'using topology {top_path}; selection {selection!r}')
     spf=_read_traj_interval(d.prod_dir)
+    if spf <= 0 or spf == 500:
+        epoch_spf = _read_traj_interval_from_epoch_dirs(d)
+        if epoch_spf > 0:
+            spf = epoch_spf
+    use_adjusted = (traj_dir != d.prod_dir / 'replica_trajectories')
+    adj_steps = _adjusted_steps_for_merged_traj(d, spf) if use_adjusted else None
     # Pre-load topology once — avoids re-parsing PDB on every md.load() call
     try:
         _top_obj = md.load(str(top_path))
@@ -3333,6 +3374,7 @@ def _compute_rg_from_trajectories(d: Data, args, progress: Optional[Progress], w
         if idx.size==0:
             return 0, local_warns
         order=idx[np.argsort(d.step[idx], kind='stable')]
+        steps_for_align = adj_steps[order] if adj_steps is not None else d.step[order]
         rep_assigned=0
         for resume_start, seg_path in segs:
             try:
@@ -3348,7 +3390,7 @@ def _compute_rg_from_trajectories(d: Data, args, progress: Optional[Progress], w
             except Exception as exc:
                 local_warns.append(f'Rg trajectory reconstruction failed for replica {rep} ({seg_path}): {exc}')
                 continue
-            mask, local_frames=_sample_to_segment_frame(d.step[order], resume_start, traj.n_frames, spf)
+            mask, local_frames=_sample_to_segment_frame(steps_for_align, resume_start, traj.n_frames, spf)
             if not np.any(mask):
                 continue
             out[order[mask]]=rg[local_frames]
@@ -3601,6 +3643,11 @@ def _pca_replica_plan(d: Data, args, md, traj_dir: Path, warnings: list[str]) ->
     reps=sorted(set(int(x) for x in d.replica if np.isfinite(x)))
     plan=[]
     spf=_read_traj_interval(d.prod_dir)
+    if spf <= 0 or spf == 500:
+        epoch_spf = _read_traj_interval_from_epoch_dirs(d)
+        if epoch_spf > 0: spf = epoch_spf
+    use_adj = (traj_dir != d.prod_dir / 'replica_trajectories')
+    adj_steps_all = _adjusted_steps_for_merged_traj(d, spf) if use_adj else None
     for rep in reps:
         segs=_find_all_replica_trajectory_segments(traj_dir, rep, args)
         if not segs:
@@ -3610,11 +3657,12 @@ def _pca_replica_plan(d: Data, args, md, traj_dir: Path, warnings: list[str]) ->
         if idx.size==0:
             continue
         order=idx[np.argsort(d.step[idx], kind='stable')]
+        steps_for_align = adj_steps_all[order] if adj_steps_all is not None else d.step[order]
         for resume_start, seg_path in segs:
             n_seg_frames=_trajectory_frame_count(md, seg_path)
             if n_seg_frames is None or n_seg_frames<=0:
                 continue
-            mask, local_frames=_sample_to_segment_frame(d.step[order], resume_start, n_seg_frames, spf)
+            mask, local_frames=_sample_to_segment_frame(steps_for_align, resume_start, n_seg_frames, spf)
             if not np.any(mask):
                 continue
             seg_order=order[mask]
@@ -3936,6 +3984,11 @@ def _extra_replica_plan(d: Data, args, md, traj_dir: Path, warnings: list[str]) 
     reps=sorted(set(int(x) for x in d.replica if np.isfinite(x)))
     plan=[]
     spf=_read_traj_interval(d.prod_dir)
+    if spf <= 0 or spf == 500:
+        epoch_spf = _read_traj_interval_from_epoch_dirs(d)
+        if epoch_spf > 0: spf = epoch_spf
+    use_adj = (traj_dir != d.prod_dir / 'replica_trajectories')
+    adj_steps_all = _adjusted_steps_for_merged_traj(d, spf) if use_adj else None
     for rep in reps:
         segs=_find_all_replica_trajectory_segments(traj_dir, rep, args)
         if not segs:
@@ -3945,11 +3998,12 @@ def _extra_replica_plan(d: Data, args, md, traj_dir: Path, warnings: list[str]) 
         if idx.size==0:
             continue
         order=idx[np.argsort(d.step[idx], kind='stable')]
+        steps_for_align = adj_steps_all[order] if adj_steps_all is not None else d.step[order]
         for resume_start, seg_path in segs:
             n_seg_frames=_trajectory_frame_count(md, seg_path)
             if n_seg_frames is None or n_seg_frames<=0:
                 continue
-            mask, local_frames=_sample_to_segment_frame(d.step[order], resume_start, n_seg_frames, spf)
+            mask, local_frames=_sample_to_segment_frame(steps_for_align, resume_start, n_seg_frames, spf)
             if not np.any(mask):
                 continue
             seg_order=order[mask]
@@ -6074,6 +6128,13 @@ def _compute_chignolin_distances(d, args, progress, warnings: list):
     dist2_out = np.full(d.cv.shape, np.nan, dtype=np.float64)
     reps = sorted(set(int(x) for x in d.replica if np.isfinite(x)))
     spf = _read_traj_interval(d.prod_dir)
+    if spf <= 0 or spf == 500:  # 500 is the fallback default — check epoch dirs too
+        epoch_spf = _read_traj_interval_from_epoch_dirs(d)
+        if epoch_spf > 0:
+            spf = epoch_spf
+    # Use epoch-offset-adjusted steps when trajectories come from merged dir
+    use_adjusted = (traj_dir != d.prod_dir / 'replica_trajectories')
+    adj_steps = _adjusted_steps_for_merged_traj(d, spf) if use_adjusted else None
     # ref.topology reused — avoids re-parsing PDB for every segment
     top_topology = ref.topology
 
@@ -6087,6 +6148,7 @@ def _compute_chignolin_distances(d, args, progress, warnings: list):
         if idx.size == 0:
             return 0, local_warns
         order = idx[np.argsort(d.step[idx], kind="stable")]
+        steps_for_align = adj_steps[order] if adj_steps is not None else d.step[order]
         rep_assigned = 0
         for resume_start, seg_path in segs:
             try:
@@ -6097,7 +6159,7 @@ def _compute_chignolin_distances(d, args, progress, warnings: list):
             except Exception as exc:
                 local_warns.append(f"--chignolin_fes: distance failed for replica {rep} ({seg_path}): {exc}")
                 continue
-            mask, local_frames = _sample_to_segment_frame(d.step[order], resume_start, traj.n_frames, spf)
+            mask, local_frames = _sample_to_segment_frame(steps_for_align, resume_start, traj.n_frames, spf)
             if not np.any(mask):
                 continue
             dist1_out[order[mask]] = d1[local_frames]
