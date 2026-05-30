@@ -710,7 +710,7 @@ def load_parquet_adaptive_union(adaptive_dir: Path) -> Data:
         raise FileNotFoundError(f'No epoch Parquet data found in {adaptive_dir}')
 
     all_cv = []; all_cv2 = []; all_window = []; all_step = []
-    all_replica = []; all_boost = []; all_potential = []
+    all_replica = []; all_boost = []; all_potential = []; all_epoch_src = []
     beta = float('nan')
     meta: dict = rjson(adaptive_dir.parent / 'run_manifest.json', {})
 
@@ -740,6 +740,7 @@ def load_parquet_adaptive_union(adaptive_dir: Path) -> Data:
         all_boost.append(boost_raw.astype(np.float64)[valid] if boost_raw is not None else np.full(valid.sum(), np.nan))
         pot_raw = samples.get('potential')
         all_potential.append(pot_raw.astype(np.float64)[valid] if pot_raw is not None else np.full(valid.sum(), np.nan))
+        all_epoch_src.append(np.full(int(valid.sum()), len(all_cv) - 1, dtype=np.int32))
 
     if not all_cv:
         raise ValueError(f'No valid samples after window remapping in {adaptive_dir}')
@@ -766,10 +767,13 @@ def load_parquet_adaptive_union(adaptive_dir: Path) -> Data:
             d2 = np.where(np.isfinite(cv2), cv2 - sec_centers[k], 0.0)
             u_nk[:, k] += beta * 4.184 * 0.5 * sec_ks[k] * d2 * d2
 
+    epoch_src = np.concatenate(all_epoch_src) if all_epoch_src else np.zeros(len(cv), dtype=np.int32)
     meta_out = dict(meta)
     meta_out.update({'temperature_K': temp, 'beta_1_over_kJ_mol': beta,
                      'adaptive_union_states': K, 'adaptive_union_epochs': len(epoch_dirs),
-                     'umbrella_window_rows': list(reg_rows)})
+                     'umbrella_window_rows': list(reg_rows),
+                     '_epoch_source': epoch_src.tolist(),
+                     'adaptive_epoch_run_dirs': [str(ed) for ed, _ in epoch_dirs]})
 
     return clean(Data(
         prod_dir=adaptive_dir, out_dir=adaptive_dir / 'pmf_analysis',
@@ -779,6 +783,210 @@ def load_parquet_adaptive_union(adaptive_dir: Path) -> Data:
         beta=beta, temp=temp, boost_kj=boost, potential_kj=potential,
         source=str(registry_csv), meta=meta_out,
     ))
+
+
+def _get_adaptive_epoch_traj_dirs(d: Data) -> list:
+    """Return [(epoch_idx, traj_dir)] for epochs that have non-empty replica_trajectories/."""
+    run_dirs = d.meta.get('adaptive_epoch_run_dirs', [])
+    result = []
+    for i, run_dir in enumerate(run_dirs):
+        traj_dir = Path(run_dir) / 'replica_trajectories'
+        if traj_dir.is_dir() and any(traj_dir.iterdir()):
+            result.append((i, traj_dir))
+    return result
+
+
+def _prepare_adaptive_merged_traj_dir(d: Data, args=None) -> Optional[Path]:
+    """Create/update a merged replica_trajectories/ in adaptive_production/ using symlinks.
+
+    Each epoch's replica_NNN.xtc is linked so that
+    _find_all_replica_trajectory_segments treats them as resume segments in
+    chronological epoch order.  The first non-empty epoch file for each replica
+    gets the plain replica_NNN.xtc base link; subsequent non-empty epochs get
+    replica_NNN_resume_from_EPOCH*1e10.xtc links.  Empty (0-byte) files are skipped.
+    """
+    epoch_traj = _get_adaptive_epoch_traj_dirs(d)
+    if not epoch_traj:
+        return None
+    merged = d.prod_dir / '_merged_replica_trajectories'
+    merged.mkdir(exist_ok=True)
+    STEP_STRIDE = 10_000_000_000  # 1e10 — larger than any real epoch step count
+    TRAJ_EXTS = {'.xtc', '.dcd', '.nc', '.trr'}
+    # Track which replicas have had their "base" link created
+    base_written: set = set()
+    for epoch_idx, traj_dir in epoch_traj:
+        for f in sorted(traj_dir.iterdir()):
+            if f.suffix not in TRAJ_EXTS:
+                continue
+            if f.stat().st_size == 0:
+                continue  # skip empty/unwritten trajectory files
+            stem = f.stem  # e.g. "replica_000"
+            # Extract replica id from stem (first component before any _resume_from_)
+            base_stem = stem.split('_resume_from_')[0]
+            if base_stem not in base_written:
+                link = merged / f'{base_stem}{f.suffix}'
+                base_written.add(base_stem)
+            else:
+                link = merged / f'{base_stem}_resume_from_{epoch_idx * STEP_STRIDE}{f.suffix}'
+            if not link.exists():
+                try:
+                    link.symlink_to(f.resolve())
+                except Exception:
+                    pass
+    return merged if any(merged.iterdir()) else None
+
+
+def run_epoch_pmf_convergence(d: Data, args, bins: np.ndarray, selected: str,
+                               final_pmf: dict, out_base: Path,
+                               progress: Optional[Progress] = None,
+                               f_init_hint: Optional[np.ndarray] = None) -> dict:
+    """PMF convergence by cumulative epoch addition for adaptive-production runs.
+
+    Iterates [epoch_0], [epoch_0+1], ..., [all epochs].  Each prefix runs
+    MBAR on the pooled samples from those epochs and records PMF + JS/RMSE
+    vs the full-run final PMF.
+    """
+    if bool(getattr(args, 'no_convergence', False)):
+        return {'enabled': False, 'metric': 'epoch_convergence', 'reason': 'disabled'}
+    epoch_src = d.meta.get('_epoch_source')
+    if not epoch_src:
+        return {'enabled': False, 'metric': 'epoch_convergence', 'reason': 'no epoch tracking'}
+    epoch_src = np.asarray(epoch_src, dtype=np.int32)
+    if epoch_src.size != d.cv.size:
+        return {'enabled': False, 'metric': 'epoch_convergence', 'reason': 'epoch_source size mismatch'}
+    n_epochs = int(epoch_src.max()) + 1
+    if n_epochs < 2:
+        return {'enabled': False, 'metric': 'epoch_convergence', 'reason': f'only {n_epochs} epoch'}
+    run_dirs = d.meta.get('adaptive_epoch_run_dirs', [])
+    out = out_base / 'epoch_convergence'
+    out.mkdir(parents=True, exist_ok=True)
+    ref_prob = pmf_probability(final_pmf)
+    ref_F = np.asarray(final_pmf['pmf'], dtype=np.float64)
+    ref_counts = np.asarray(final_pmf.get('counts', np.zeros_like(ref_prob)), dtype=float)
+    ref_occ = int(np.count_nonzero(ref_counts > 0))
+    K = d.u_nk.shape[1]
+    kbt_kcal = (1.0 / d.beta) / KJ_PER_KCAL
+    conv_backend = str(getattr(args, 'convergence_mbar_backend', 'sambar') or 'sambar')
+    conv_sambar_epochs = int(getattr(args, 'convergence_sambar_epochs', 10) or 10)
+    conv_sambar_batch = int(getattr(args, 'convergence_sambar_initial_batch_size', SAMBAR_INITIAL_BATCH_SIZE) or SAMBAR_INITIAL_BATCH_SIZE)
+    conv_sambar_patience = int(getattr(args, 'convergence_sambar_batch_patience', 2) or 2)
+    conv_sambar_seed = int(getattr(args, 'convergence_sambar_seed', SAMBAR_SEED) or SAMBAR_SEED)
+    conv_sambar_lr = float(getattr(args, 'convergence_sambar_lr_scale', SAMBAR_LR_SCALE) or SAMBAR_LR_SCALE)
+    conv_sambar_delta = float(getattr(args, 'convergence_sambar_delta_f_max', SAMBAR_DELTA_F_MAX) or SAMBAR_DELTA_F_MAX)
+    conv_sambar_polish = str(getattr(args, 'convergence_sambar_polish_backend', SAMBAR_POLISH_BACKEND) or SAMBAR_POLISH_BACKEND)
+    conv_mbar_tol = float(getattr(args, 'convergence_mbar_tol', 1e-6) or 1e-6)
+    conv_mbar_maxiter = int(getattr(args, 'convergence_mbar_maxiter', 2000) or 2000)
+    prev_f_k = np.asarray(f_init_hint, dtype=np.float64) if f_init_hint is not None else None
+    prev_prob = prev_F = prev_counts = None
+    conv_rows: list = []; pmf_rows: list = []
+    if progress is not None:
+        progress.step('epoch convergence', f'{n_epochs} epochs; backend={conv_backend}')
+    for n_ep in range(1, n_epochs + 1):
+        mask = epoch_src < n_ep
+        n = int(np.count_nonzero(mask))
+        if n < max(5, K):
+            continue
+        if progress is not None:
+            progress.bar('epoch_convergence', n_ep, n_epochs,
+                         f'epochs 0-{n_ep-1}: {n} samples')
+        sub_u = d.u_nk[mask]; sub_w = d.window[mask]
+        sub_cv = d.cv[mask]; sub_boost = d.boost_kj[mask]
+        try:
+            mb = solve_mbar(sub_u, sub_w,
+                            tol=conv_mbar_tol, maxiter=conv_mbar_maxiter,
+                            progress=None, backend=conv_backend,
+                            threads=getattr(args, 'mbar_threads', 0),
+                            f_init=prev_f_k,
+                            sambar_epochs=conv_sambar_epochs,
+                            sambar_initial_batch_size=min(n, conv_sambar_batch),
+                            sambar_batch_patience=conv_sambar_patience,
+                            sambar_seed=conv_sambar_seed,
+                            sambar_lr_scale=conv_sambar_lr,
+                            sambar_delta_f_max=conv_sambar_delta,
+                            sambar_polish_backend=conv_sambar_polish)
+            prev_f_k = mb.get('f_k')
+            pmf, _diag, used_method = _observable_pmf_from_logw(
+                sub_cv, mb['logw'], sub_boost, bins, selected,
+                d.beta, kbt_kcal,
+                smooth_logfac_sigma=_eff_smooth(args, 'gamd_smooth_sigma'))
+            prob = pmf_probability(pmf)
+            F = np.asarray(pmf['pmf'], dtype=float)
+            counts = np.asarray(pmf['counts'], dtype=float)
+            js_vs_final = js_divergence_1d(prob, ref_prob)
+            rmse_vs_final = pmf_rmse_1d(F, ref_F, prob, ref_prob)
+            delta_js = js_divergence_1d(prob, prev_prob) if prev_prob is not None else np.nan
+            delta_rmse = pmf_rmse_1d(F, prev_F, prob, prev_prob) if prev_F is not None else np.nan
+            epoch_label = str(run_dirs[n_ep - 1]) if n_ep - 1 < len(run_dirs) else f'epoch_{n_ep-1}'
+            row = {
+                'variant': 'epoch', 'metric': 'cv_distance',
+                'selected_method': used_method,
+                'checkpoint_index': n_ep, 'checkpoint_step': n_ep,
+                'n_epochs_included': n_ep, 'epoch_label': epoch_label,
+                'n_samples': n, 'n_samples_total': int(d.cv.size),
+                'frac_total': float(n / max(1, d.cv.size)),
+                'JS': float(js_vs_final), 'RMSE_F_kcal_mol': float(rmse_vs_final),
+                'barrier_error_kcal_mol': barrier_error_1d(F, ref_F, prob, ref_prob),
+                'delta_JS': float(delta_js), 'delta_RMSE_F_kcal_mol': float(delta_rmse),
+                'occupied_bins': int(np.count_nonzero(counts > 0)),
+                'occupied_bins_ref': ref_occ,
+                'occupied_bins_frac_ref': float(np.count_nonzero(counts > 0) / max(1, ref_occ)),
+                'mbar_converged': int(bool(mb.get('converged'))),
+                'mbar_iterations': int(mb.get('iterations', 0)),
+                'mbar_max_delta': float(mb.get('max_delta', np.nan)),
+                'mbar_backend': str(mb.get('backend', 'unknown')),
+            }
+            conv_rows.append(row)
+            pmf_rows.append({'checkpoint_index': n_ep, 'checkpoint_step': n_ep,
+                              'frac_total': row['frac_total'],
+                              'x': pmf['cv_A'].copy(), 'pmf_kcal_mol': F.copy(),
+                              'probability': prob.copy(), 'counts': counts.astype(int).copy()})
+            prev_prob = prob; prev_F = F; prev_counts = counts
+        except Exception as exc:
+            conv_rows.append({'variant': 'epoch', 'metric': 'cv_distance',
+                               'checkpoint_index': n_ep, 'n_epochs_included': n_ep,
+                               'n_samples': n, 'error': str(exc)})
+    if not conv_rows:
+        return {'enabled': False, 'metric': 'epoch_convergence', 'reason': 'no valid epochs'}
+    _write_csv_rows(out / 'epoch_pmf_convergence.csv', conv_rows)
+    flat = []
+    for p in pmf_rows:
+        for i, x in enumerate(p['x']):
+            flat.append({'variant': 'epoch', 'metric': 'cv_distance',
+                         'checkpoint_index': p['checkpoint_index'],
+                         'n_epochs': p['checkpoint_index'],
+                         'frac_total': p['frac_total'],
+                         'bin': i, 'x': float(x),
+                         'F_kcal_mol': float(p['pmf_kcal_mol'][i]) if np.isfinite(p['pmf_kcal_mol'][i]) else '',
+                         'P': float(p['probability'][i]),
+                         'count': int(p['counts'][i])})
+    _write_csv_rows(out / 'epoch_pmf_by_epoch.csv', flat)
+    if progress is not None:
+        progress.bar('epoch_convergence', 1, 1, 'writing epoch convergence outputs', force=True)
+    finite_rows = [r for r in conv_rows if 'JS' in r and math.isfinite(float(r.get('JS', math.nan)))]
+    summary = {}
+    if finite_rows:
+        arr_js = np.asarray([r['JS'] for r in finite_rows], float)
+        arr_rmse = np.asarray([r['RMSE_F_kcal_mol'] for r in finite_rows], float)
+        js_thr = float(getattr(args, 'convergence_js_threshold', 0.01))
+        rmse_thr = float(getattr(args, 'convergence_rmse_threshold', 0.1))
+        summary = {
+            'final_JS': float(arr_js[-1]) if arr_js.size else float('nan'),
+            'final_RMSE_F_kcal_mol': float(arr_rmse[-1]) if arr_rmse.size else float('nan'),
+            'converged_JS': bool(arr_js[-1] < js_thr) if arr_js.size else False,
+            'converged_RMSE': bool(arr_rmse[-1] < rmse_thr) if arr_rmse.size else False,
+        }
+        summary['converged'] = summary['converged_JS'] and summary['converged_RMSE']
+    try:
+        write_convergence_plots(conv_rows, pmf_rows, [summary] if summary else [],
+                                out, args, warnings=[])
+    except Exception:
+        pass
+    wjson(out / 'epoch_convergence_summary.json',
+          {'n_epochs': n_epochs, 'n_rows': len(conv_rows), 'summary': summary,
+           'output_dir': str(out)})
+    return {'enabled': True, 'metric': 'epoch_convergence',
+            'n_epochs': n_epochs, 'n_rows': len(conv_rows),
+            'summary': summary, 'output_dir': str(out)}
 
 
 def _parquet_sample_count(prod: Path) -> int:
@@ -3072,8 +3280,12 @@ def _compute_rg_from_trajectories(d: Data, args, progress: Optional[Progress], w
         return None
     traj_dir=d.prod_dir/'replica_trajectories'
     if not traj_dir.exists():
-        if mode == 'force': warnings.append(f'Rg trajectory reconstruction requested but {traj_dir} is missing')
-        return None
+        merged = _prepare_adaptive_merged_traj_dir(d, args)
+        if merged is not None:
+            traj_dir = merged
+        else:
+            if mode == 'force': warnings.append(f'Rg trajectory reconstruction requested but {traj_dir} is missing')
+            return None
     top_path=_find_rg_topology_path(d.prod_dir,args)
     if top_path is None:
         if mode == 'force': warnings.append('Rg trajectory reconstruction requested but no topology PDB was found; use --rg-topology')
@@ -3451,9 +3663,19 @@ def _fit_and_project_pca_from_trajectories(d: Data, args, out: Path, progress: O
             warnings.append(f'Ignoring unreadable PCA cache {cache}: {exc}')
     traj_dir=d.prod_dir/'replica_trajectories'
     if not traj_dir.exists():
-        if mode == 'force': warnings.append(f'PCA requested but {traj_dir} is missing')
-        return {'available':False,'reason':f'{traj_dir} is missing'}
+        merged = _prepare_adaptive_merged_traj_dir(d, args)
+        if merged is not None:
+            traj_dir = merged
+        else:
+            if mode == 'force': warnings.append(f'PCA requested but {traj_dir} is missing')
+            return {'available':False,'reason':f'{traj_dir} is missing'}
     top_path=_find_pca_topology_path(d.prod_dir,args)
+    if top_path is None:
+        # For adaptive runs, check epoch dirs for topology
+        for ep_run_dir in d.meta.get('adaptive_epoch_run_dirs', []):
+            top_path = _find_pca_topology_path(Path(ep_run_dir), args)
+            if top_path is not None:
+                break
     if top_path is None:
         if mode == 'force': warnings.append('PCA requested but no topology PDB was found; use --pca-topology')
         return {'available':False,'reason':'no topology PDB found; use --pca-topology'}
@@ -4039,8 +4261,12 @@ def analyze_extra_observable_pmfs(d: Data, args, base_logw: np.ndarray, selected
         return {'available':False,'reason':'disabled by --extra-pmf-from-trajectories never'}
     traj_dir=d.prod_dir/'replica_trajectories'
     if not traj_dir.exists():
-        if mode == 'force': warnings.append(f'Extra observable PMFs requested but {traj_dir} is missing')
-        return {'available':False,'reason':f'{traj_dir} is missing'}
+        merged = _prepare_adaptive_merged_traj_dir(d, args)
+        if merged is not None:
+            traj_dir = merged
+        else:
+            if mode == 'force': warnings.append(f'Extra observable PMFs requested but {traj_dir} is missing')
+            return {'available':False,'reason':f'{traj_dir} is missing'}
     top_path=_find_extra_topology_path(d.prod_dir,args)
     if top_path is None:
         if mode == 'force': warnings.append('Extra observable PMFs requested but no topology PDB was found; use --extra-topology')
@@ -6316,6 +6542,9 @@ def analyze(d,args, progress: Optional[Progress] = None):
     plot_outputs(d,pmfs,selected,O,out,warn,smooth_sigma=_eff_smooth(args,'pmf_smooth_sigma'))
     epoch_cv_info=_analyze_epoch_cv_exploration(d.prod_dir,out,d.meta,warn)
     conv_info=run_pmf_convergence(d,args,bins,selected,sel,out,progress=progress,f_init_hint=m.get('f_k'))
+    epoch_conv_info={}
+    if d.meta.get('_epoch_source'):
+        epoch_conv_info=run_epoch_pmf_convergence(d,args,bins,selected,sel,out,progress=progress,f_init_hint=m.get('f_k'))
     s={'production_dir':str(d.prod_dir),'output_dir':str(out),'source':d.source,'n_samples':int(N),'n_windows':int(K),'temperature_K':float(d.temp),'beta_1_over_kj_mol':float(d.beta),'cv_min_A':float(np.nanmin(d.cv)),'cv_max_A':float(np.nanmax(d.cv)),'primary_cv_units':_primary_cv_units(d.meta),'primary_cv_axis_label':_primary_cv_axis_label(d.meta),'selected_unbiased_method':selected,'pmf_span_kcal_mol':span,'pmf_minimum_cv_A':float(sel['cv_A'][minidx]) if minidx>=0 else None,'mbar':{'converged':bool(m['converged']),'iterations':int(m['iterations']),'max_delta':float(m['max_delta']),'backend':m.get('backend','unknown'),'threads':m.get('threads',None),'active_states':[int(x) for x in m['active']],'n_k':[int(x) for x in m['n_k']],'base_ess':float(ess(base_w))},'boost':bs,'neighbor_overlap':neigh,'warnings':warn,'files':{'pmf_unbiased_csv':str(out/'pmf_unbiased.csv'),'pmf_all_methods_csv':str(out/'pmf_all_methods.csv'),'summary_md':str(out/'pmf_summary.md'),'summary_json':str(out/'pmf_summary.json')}}
     s['rg']=rg_info
     s['distance_rg_2d_fes']=fes2d_info
@@ -6324,6 +6553,7 @@ def analyze(d,args, progress: Optional[Progress] = None):
     s['chignolin_fes']=chignolin_fes_info
     s['secondary_cv_pmf']=secondary_cv_pmf_info
     s['cv1_cv2_2d_fes']=cv1_cv2_fes_info
+    s['epoch_convergence']=epoch_conv_info
     s['epoch_cv_exploration']=epoch_cv_info
     s['dtram']=_dtram_public_info(dtram_info)
     if isinstance(rg_info,dict) and rg_info.get('files'):
