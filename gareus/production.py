@@ -38,6 +38,7 @@ from .system_setup import (
     setup_platform_and_properties,
     platform_summary,
     replica_platform_properties,
+    resolve_cpu_threads_for_replicas,
     make_trajectory_reporter,
     write_state_pdb,
 )
@@ -2565,6 +2566,15 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     ks_kj_nm2 = np.asarray([primary_k_to_openmm_value(k, args) for k in k_list], dtype=float)
     secondary_cv_ks_kj = np.asarray([kcal_to_kj(k) for k in secondary_cv_k_kcal_list], dtype=float) if secondary_cv_k_kcal_list is not None else None
     nrep = len(centers_nm)
+
+    # Resolve per-replica CPU threads now that nrep is known.
+    # --cpu-budget distributes total cores evenly; --max-cpu-per-replica caps the result.
+    if str(getattr(args, "platform", "")).upper() == "CPU":
+        _resolved_threads = resolve_cpu_threads_for_replicas(args, nrep)
+        if _resolved_threads != int(getattr(args, "cpu_threads", 1) or 1):
+            print(f"[production] CPU budget: {_resolved_threads} threads/replica "
+                  f"(budget={getattr(args, 'cpu_budget', 0)}, max_per={getattr(args, 'max_cpu_per_replica', 0)}, replicas={nrep})")
+        props["Threads"] = str(_resolved_threads)
 
     production_ensemble = str(getattr(args, "production_ensemble", "npt") or "npt").lower()
     if production_ensemble not in {"npt", "nvt"}:

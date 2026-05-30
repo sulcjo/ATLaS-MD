@@ -287,6 +287,29 @@ def setup_platform_and_properties(openmm, args):
     )
 
 
+def resolve_cpu_threads_for_replicas(args, n_replicas: int) -> int:
+    """Return effective per-replica CPU thread count.
+
+    If --cpu-budget is set, distributes evenly: floor(cpu_budget / n_replicas),
+    clamped to at least 1. Capped by --max-cpu-per-replica when non-zero.
+    Falls back to --cpu-threads when no budget is specified.
+    """
+    budget = int(getattr(args, "cpu_budget", 0) or 0)
+    max_per = int(getattr(args, "max_cpu_per_replica", 0) or 0)
+    base = int(getattr(args, "cpu_threads", 1) or 1)
+
+    if budget > 0:
+        n = max(1, int(n_replicas))
+        per_replica = max(1, budget // n)
+    else:
+        per_replica = base
+
+    if max_per > 0:
+        per_replica = min(per_replica, max_per)
+
+    return max(1, per_replica)
+
+
 def platform_summary(platform, props: dict) -> str:
     """Return a compact log string for an OpenMM platform and its selected properties."""
     try:

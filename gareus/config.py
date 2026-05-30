@@ -357,6 +357,8 @@ def _basic_chignolin_config() -> Dict[str, Any]:
             "cuda_use_cpu_pme": "auto",
             "cuda_use_blocking_sync": "auto",
             "cpu_threads": 1,
+            "cpu_budget": 0,
+            "max_cpu_per_replica": 0,
             "setup_platform": "",
             "setup_precision": "",
             "setup_device_index": "",

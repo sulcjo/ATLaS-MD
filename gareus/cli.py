@@ -367,7 +367,14 @@ def _add_platform_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--cuda-use-blocking-sync", choices=["auto", "true", "false"], default="auto")
     p.add_argument("--cuda-deterministic-forces", choices=["auto", "true", "false"], default="auto")
     p.add_argument("--platform-temp-directory", default="")
-    p.add_argument("--cpu-threads", type=int, default=1)
+    p.add_argument("--cpu-threads", type=int, default=1,
+                   help="Threads per replica context (platform CPU only). "
+                        "Overridden by --cpu-budget when set.")
+    p.add_argument("--cpu-budget", type=int, default=0,
+                   help="Total CPU cores to distribute evenly across replicas "
+                        "(floor(budget/n_replicas), min 1). 0 = use --cpu-threads directly.")
+    p.add_argument("--max-cpu-per-replica", type=int, default=0,
+                   help="Cap per-replica CPU thread count regardless of --cpu-budget. 0 = no cap.")
     p.add_argument("--setup-platform", default="")
     p.add_argument("--setup-precision", default="")
     p.add_argument("--setup-device-index", default="")
