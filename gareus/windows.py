@@ -1325,7 +1325,7 @@ def _build_delaunay_windows_impl(samples_csv_path, args, out_dir, round_index: i
     k2_min = float(getattr(args, "secondary_cv_adaptive_min_k_kcal", 5.0) or 5.0)
     k2_max = float(getattr(args, "secondary_cv_adaptive_max_k_kcal", 100.0) or 100.0)
     k_secondary_default = float(getattr(args, "secondary_cv_k_kcal", 25.0) or 25.0)
-    kBT = 0.5961  # kcal/mol at 300 K
+    rt_kcal_mol = 0.00198720425864083 * float(getattr(args, "temperature_k", 300.0) or 300.0)
 
     cv1_mode = primary_cv_mode(args)
     cv2_mode = secondary_cv_mode(args)
@@ -1576,8 +1576,8 @@ def _build_delaunay_windows_impl(samples_csv_path, args, out_dir, round_index: i
         s2 = float(np.median(cv2_projections)) if len(cv2_projections) > 0 else cv2_span * 0.3
         sigma1 = max(k_sigma_factor * s1, 1e-6)
         sigma2 = max(k_sigma_factor * s2, 1e-6)
-        k1_raw = 2.0 * kBT / (sigma1**2)
-        k2_raw = 2.0 * kBT / (sigma2**2)
+        k1_raw = rt_kcal_mol / (sigma1**2)
+        k2_raw = rt_kcal_mol / (sigma2**2)
         k1 = max(k_min, min(k_max, k1_raw))
         k2 = max(k2_min, min(k2_max, k2_raw))
         return k1, k2
