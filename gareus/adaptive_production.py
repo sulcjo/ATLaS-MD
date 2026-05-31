@@ -36,6 +36,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 
 from .io import write_json, read_json_file, _json_ready
+from .cv import primary_cv_is_contacts
 
 logger = logging.getLogger(__name__)
 
@@ -2171,6 +2172,140 @@ def _weak_edge_touch_counts(diagnostics: Optional[Dict[str, Any]], policy: Adapt
     return counts
 
 
+def _apply_topup_k_boosts(
+    registry: "WindowStateRegistry",
+    diagnostics: Optional[Dict[str, Any]],
+    schedule: Sequence[Dict[str, Any]],
+    policy: "AdaptiveDecisionPolicy",
+    args: Any,
+) -> List[Dict[str, Any]]:
+    """Tighten force constants for leaking topup-candidate windows.
+
+    A window is a topup candidate when it has extra_steps > 0 in the schedule
+    (poor overlap, low samples, or high GaMD boost).  Among those, K is only
+    increased when the realized CV spread (cv_std) substantially exceeds the
+    planned thermal width sqrt(RT/K).  Raising K for a window that already
+    behaves harmonically would *reduce* overlap (overlap ∝ exp(-d²K/8kT)), so
+    the realized-vs-planned width ratio is a mandatory gate.
+
+    The new K is computed from the minimum distance to any active neighbor along
+    each CV axis, using the same spacing/overlap_sigma formula applied at window
+    creation time.  K is only ever increased, never decreased, and capped at the
+    mode-appropriate maximum.
+
+    Registry states are mutated in-place.  The change is sticky for future
+    epochs.  Samples collected before the boost used the old K; MBAR treats
+    them as approximate (error ∝ ΔK·<(ξ−ξ₀)²>_old, which is bounded because
+    leaking windows are precisely those with few well-localized samples).
+
+    Returns a list of boost-event dicts for logging.
+    """
+    if not bool(getattr(args, "adaptive_production_topup_k_boost", True)):
+        return []
+    if not isinstance(diagnostics, dict):
+        return []
+
+    sigma_ratio = float(getattr(args, "adaptive_production_topup_k_sigma_ratio", 1.5) or 1.5)
+    max_boost_factor = float(getattr(args, "adaptive_production_topup_k_max_boost_factor", 4.0) or 4.0)
+    rt_kcal_mol = 0.00198720425864083 * float(getattr(args, "temperature_k", 300.0) or 300.0)
+
+    # Identify states selected for topup.
+    topup_ids: set = {int(r["state_id"]) for r in schedule if int(r.get("extra_steps", 0) or 0) > 0}
+    if not topup_ids:
+        return []
+
+    state_rows = _state_rows_by_id(diagnostics)
+    active_states = registry.active_states()
+    if len(active_states) < 2:
+        return []
+
+    is_contacts = primary_cv_is_contacts(args)
+    if is_contacts:
+        overlap_sigma_primary = max(0.05, float(getattr(args, "contact_adaptive_overlap_sigma", getattr(args, "adaptive_overlap_sigma", 1.25)) or 1.25))
+        k_min_primary = max(0.0, float(getattr(args, "contact_adaptive_min_k_kcal", 5.0) or 5.0))
+        k_max_primary = max(k_min_primary, float(getattr(args, "contact_adaptive_max_k_kcal", 120.0) or 120.0))
+    else:
+        overlap_sigma_primary = max(0.05, float(getattr(args, "adaptive_overlap_sigma", 1.25) or 1.25))
+        k_min_primary = max(0.0, float(getattr(args, "adaptive_min_k_kcal_a2", 0.30) or 0.30))
+        k_max_primary = max(k_min_primary, float(getattr(args, "adaptive_max_k_kcal_a2", 5.0) or 5.0))
+
+    overlap_sigma_secondary = max(0.05, float(getattr(args, "secondary_cv_adaptive_overlap_sigma", 0.0) or 0.0) or float(getattr(args, "adaptive_overlap_sigma", 1.25) or 1.25))
+    k_min_secondary = max(0.0, float(getattr(args, "secondary_cv_adaptive_min_k_kcal", 0.0) or 0.0))
+    k_max_secondary = max(k_min_secondary, float(getattr(args, "secondary_cv_adaptive_max_k_kcal", 500.0) or 500.0))
+
+    events: List[Dict[str, Any]] = []
+    for state in active_states:
+        sid = int(state.state_id)
+        if sid not in topup_ids:
+            continue
+        diag = state_rows.get(sid, {})
+        cv_std = diag.get("cv_std")
+        if cv_std is None or not math.isfinite(float(cv_std)):
+            continue
+        cv_std = float(cv_std)
+
+        planned_sigma = math.sqrt(rt_kcal_mol / max(1e-12, float(state.primary_k)))
+        if cv_std <= sigma_ratio * planned_sigma:
+            continue  # window is not leaking; K increase would reduce overlap
+
+        # Minimum distance to any active neighbor along the primary CV axis.
+        d_primary = min(
+            (abs(float(s.primary_center) - float(state.primary_center)) for s in active_states if s.state_id != sid),
+            default=None,
+        )
+        if d_primary is None or d_primary < 1e-8:
+            continue
+
+        sigma_target = max(1e-8, d_primary / overlap_sigma_primary)
+        k1_raw = rt_kcal_mol / (sigma_target ** 2)
+        k1_new = max(float(state.primary_k), min(k_max_primary, max(k_min_primary, k1_raw)))
+        k1_new = min(k1_new, float(state.primary_k) * max_boost_factor)
+
+        boost_event: Dict[str, Any] = {
+            "state_id": sid,
+            "primary_k_old": float(state.primary_k),
+            "primary_k_new": float(k1_new),
+            "realized_sigma": float(cv_std),
+            "planned_sigma": float(planned_sigma),
+            "sigma_ratio": float(cv_std / planned_sigma),
+            "d_primary": float(d_primary),
+        }
+
+        state.primary_k = float(k1_new)
+
+        # Secondary CV boost when realized spread also exceeds threshold.
+        if state.secondary_center is not None and state.secondary_k is not None:
+            sec_std = diag.get("secondary_std")
+            if sec_std is not None and math.isfinite(float(sec_std)):
+                sec_std = float(sec_std)
+                planned_sigma2 = math.sqrt(rt_kcal_mol / max(1e-12, float(state.secondary_k)))
+                if sec_std > sigma_ratio * planned_sigma2:
+                    d_secondary = min(
+                        (
+                            abs(float(s.secondary_center) - float(state.secondary_center))
+                            for s in active_states
+                            if s.state_id != sid and s.secondary_center is not None
+                        ),
+                        default=None,
+                    )
+                    if d_secondary is not None and d_secondary >= 1e-8:
+                        sigma_target2 = max(1e-8, d_secondary / overlap_sigma_secondary)
+                        k2_raw = rt_kcal_mol / (sigma_target2 ** 2)
+                        k2_new = max(float(state.secondary_k), min(k_max_secondary, max(k_min_secondary, k2_raw)))
+                        k2_new = min(k2_new, float(state.secondary_k) * max_boost_factor)
+                        boost_event["secondary_k_old"] = float(state.secondary_k)
+                        boost_event["secondary_k_new"] = float(k2_new)
+                        state.secondary_k = float(k2_new)
+
+        events.append(boost_event)
+        print(
+            f"      topup K-boost state {sid}: K1 {boost_event['primary_k_old']:.2f}->{k1_new:.2f} "
+            f"(realized σ={cv_std:.4f}, planned σ={planned_sigma:.4f}, ratio={cv_std/planned_sigma:.2f})"
+        )
+
+    return events
+
+
 def build_adaptive_epoch_schedule(
     registry: WindowStateRegistry,
     diagnostics: Optional[Dict[str, Any]],
@@ -3178,6 +3313,9 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                 default_steps=epoch_steps,
                 final=False,
             )
+            k_boost_events = _apply_topup_k_boosts(registry, previous_diagnostics, schedule, schedule_policy, args)
+            if k_boost_events:
+                write_json(epoch_dir / "topup_k_boosts.json", {"schema_version": "topup_k_boost_v1", "epoch": epoch, "boosts": k_boost_events})
             print(
                 f"    Adaptive-production scheduled epoch {epoch + 1}/{max_epochs}: "
                 f"{len(schedule)} active states -> {epoch_dir}"
@@ -3408,6 +3546,9 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
     final_seed_bank = None
     final_scheduled_summary = None
     if bool(policy.scheduled_final_segments) and bool(policy.final_allocation_scheduler) and final_schedule is not None:
+        final_k_boost_events = _apply_topup_k_boosts(registry, previous_diagnostics, final_schedule, final_schedule_policy if 'final_schedule_policy' in locals() else policy, args)
+        if final_k_boost_events:
+            write_json(final_dir / "topup_k_boosts.json", {"schema_version": "topup_k_boost_v1", "epoch": max_epochs, "boosts": final_k_boost_events})
         print(f"    Adaptive-production final frozen scheduled phase -> {final_dir}")
         print(f"      final active window table: {final_windows_csv}")
         result = run_scheduled_adaptive_epoch(
