@@ -182,6 +182,7 @@ def compute_gamd_reweighting_diagnostics(out_dir: Path, temperature_k: float) ->
     try:
         with np.load(npz_path, allow_pickle=False) as data:
             boost_kj = np.asarray(data.get("gamd_boost_total_kj_mol", []), dtype=float)
+            window_arr = np.asarray(data.get("window", []), dtype=np.int32)
     except Exception as exc:
         result["status"] = "error"
         warnings.append(f"could not read GaMD boost array: {exc}")
@@ -209,6 +210,15 @@ def compute_gamd_reweighting_diagnostics(out_dir: Path, temperature_k: float) ->
     ess_frac = float(ess / finite.size) if finite.size else float("nan")
     mean_kcal = float(np.mean(boost_kcal))
     sd_kcal = float(np.std(boost_kcal))
+    # Per-window boost std — detect individual high-variance windows
+    per_window_sd: dict[int, float] = {}
+    if window_arr.size == boost_kj.size and window_arr.size > 0:
+        finite_mask = np.isfinite(boost_kj)
+        for wi in np.unique(window_arr[finite_mask]):
+            mask = finite_mask & (window_arr == wi)
+            vals = boost_kj[mask] / 4.184
+            if vals.size >= 2:
+                per_window_sd[int(wi)] = float(np.std(vals))
     result.update({
         "status": "ok",
         "n_finite": int(finite.size),
@@ -222,12 +232,22 @@ def compute_gamd_reweighting_diagnostics(out_dir: Path, temperature_k: float) ->
         "reweighting_ess_fraction": ess_frac,
         "beta_1_over_kj_mol": float(beta_1_over_kj),
         "reweighting_note": "ESS uses exp(beta*boost) as a diagnostic of weight degeneracy; final GaMD PMF details may use cumulant expansion or MBAR-specific treatment.",
+        "per_window_boost_sd_kcal_mol": per_window_sd,
     })
     # Add warnings based on heuristics from the monolith
     if finite.size < 100:
         warnings.append("fewer than 100 finite boost samples; GaMD boost diagnostics are noisy")
     if math.isfinite(sd_kcal) and sd_kcal > 6.0:
         warnings.append(f"boost standard deviation is {sd_kcal:.2f} kcal/mol (>~6); cumulant reweighting may be unreliable")
+    hot_windows = sorted(wi for wi, sd in per_window_sd.items() if sd > 2.0)
+    if hot_windows:
+        hot_str = ", ".join(str(w) for w in hot_windows[:10])
+        if len(hot_windows) > 10:
+            hot_str += f" ... ({len(hot_windows)} total)"
+        warnings.append(
+            f"windows [{hot_str}] have GaMD boost σ > 2.0 kcal/mol; "
+            f"high boost variance in these windows may corrupt MBAR/cumulant contributions"
+        )
     try:
         score = float(an.get("score", float("nan")))
     except Exception:

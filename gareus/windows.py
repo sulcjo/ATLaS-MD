@@ -1445,12 +1445,17 @@ def _build_delaunay_windows_impl(samples_csv_path, args, out_dir, round_index: i
     def _in_cv2_range(val: float) -> bool:
         return cv2_lo - 1e-6 <= val <= cv2_hi + 1e-6
 
+    def _in_cv1_range(val: float) -> bool:
+        return cv1_lo - 1e-6 <= val <= cv1_hi + 1e-6
+
     # Build anchor pool
     seen_keys: set[tuple[float, float]] = set()
     anchor_positions: list[tuple[float, float, float, float]] = []  # (cv1, cv2, norm1, norm2)
     for (n1, n2) in anchors_norm:
         cv1, cv2 = _unnorm(n1, n2)
         if not _in_cv2_range(cv2):
+            continue
+        if not _in_cv1_range(cv1):
             continue
         key = (round(cv1, 4), round(cv2, 4))
         if key in seen_keys:

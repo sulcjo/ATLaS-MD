@@ -3699,6 +3699,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                         log_weights[int(stay_idx[0])] = 0.0
                     finite = np.isfinite(log_weights)
                     if not np.any(finite):
+                        exchange_stats["gibbs_all_nan_skips"] = exchange_stats.get("gibbs_all_nan_skips", 0) + 1
                         continue
                     valid_windows = valid_windows[finite]
                     log_weights = log_weights[finite]
