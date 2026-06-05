@@ -1,5 +1,5 @@
 schema_version: '2.0'
-description: "Chignolin (GYDPETGTWG) delaunay-feedback 2D contacts x rama-map HMR-GaMD/REUS: KDE basin-anchor picking + Delaunay triangulation on pilot CV samples replaces rectangular grid topology. Based on fulltreatment5; adaptive_production block present but unused (delaunay-feedback dispatches to adaptive-feedback pipeline)."
+description: "Chignolin (GYDPETGTWG) delaunay-feedback 2D contacts x rama-map HMR-GaMD/REUS: KDE basin-anchor picking + Delaunay triangulation on pilot CV samples replaces rectangular grid topology. Based on fulltreatment5; adaptive_production block present but unused (delaunay-feedback dispatches to adaptive-feedback pipeline). v6 tuning: production 10M steps/window (matches run2 near-converged budget), pilot 40k steps (was 8k), equil 5 ns (was 0.4 ns), sigma0=5 (was 6), seq_sep=3, stability_tol=0.001 (all 5 rounds always run)."
 
 workflow_help: |
   ============================================================
@@ -54,9 +54,10 @@ workflow_help: |
   STAGE 3  DELAUNAY-FEEDBACK PILOTS  (5 rounds)
   ============================================================
   Each pilot round:
-    pilot_fraction=0.008 x 1,000,000 = 8,000 steps/replica
-    = 32 ps/replica at 4 fs  (hmr-gamd)
-    GaMD: sigma0p=sigma0d=6 kcal/mol, 100k equil steps
+    pilot_fraction=0.004 x 10,000,000 = 40,000 steps/replica
+    = 160 ps/replica at 4 fs  (hmr-gamd)
+    GaMD: sigma0p=sigma0d=5 kcal/mol, 1.25M equil steps (5 ns)
+    WARNING: equil runs in pilots too => ~103M steps pilot overhead vs 160M production
     Exchange: Gibbs-walk every 100 steps
 
   After each pilot round >= 1 (iterative Delaunay):
@@ -89,8 +90,8 @@ workflow_help: |
   STAGE 4  FINAL PRODUCTION
   ============================================================
   - Fixed window set from last stable Delaunay layout
-  - 1,000,000 steps/replica at 4 fs = 4 ns/replica (hmr-gamd)
-  - GaMD: sigma0p=sigma0d=6 kcal/mol, 100k equil per replica
+  - 10,000,000 steps/replica at 4 fs = 40 ns/replica (hmr-gamd)
+  - GaMD: sigma0p=sigma0d=5 kcal/mol, 1.25M equil per replica (5 ns)
   - Gibbs-walk exchange every 100 steps
   - XTC trajectories every 50 steps (200 fs frames)
   - Output: chignolin_2d_run6/final_production/
@@ -99,8 +100,8 @@ workflow_help: |
   ============================================================
   KEY NUMBERS
   ============================================================
-  Pilot overhead:  ~32 ps x N_windows x 5 rounds
-  Final MD:         4 ns x N_windows  (N_windows ~ 10-25)
+  Pilot overhead:  ~(160 ps production + 5 ns equil) x N_windows x 5 rounds
+  Final MD:        40 ns x N_windows  (N_windows ~ 10-25)
   Platform:         CUDA
   NOTE: adaptive_production block (md_budget_ns: 840)
         is PRESENT but UNUSED -- delaunay-feedback routes
@@ -199,7 +200,7 @@ contact_cv:
   # Contact physics (CV-specific)
   contact_scheme: residue-balanced
   contact_atom_selection: heavy
-  contact_min_sequence_separation: 2
+  contact_min_sequence_separation: 3   # was 2; sep=3 removes near-neighbor contacts, sharpens folded/unfolded discrimination for 10-residue peptide
   contact_r0_a: 4.8
   contact_beta_a_inv: 4.0
   contact_normalize: true
@@ -242,8 +243,8 @@ starting_structures:
 windows:
   window_mode: delaunay-feedback
   aggressiveness: aggressive          # was: adaptive_window_aggressiveness
-  pilot_fraction: 0.008               # was: adaptive_feedback_pilot_fraction
-  validation_steps: 20000             # was: adaptive_feedback_validation_steps
+  pilot_fraction: 0.004               # was 0.008; 0.004 x 10M production = 40,000 pilot steps/round (160 ps)
+  validation_steps: 50000             # was 20000; 200 ps validation with final layout
   adaptive_rounds: 5                  # was: adaptive_feedback_rounds
   sparse_2d: true                     # was: sparse_2d_patches_enabled + contact_sparse_2d_patches_enabled
   max_2d_patches: 16                  # was: adaptive_2d_max_local_patches
@@ -255,10 +256,19 @@ windows:
   region_extend_undersampled: true    # was: adaptive_feedback_extend_undersampled_regions
   # Dropped: adaptive_feedback_min_effective_samples, adaptive_2d_min_edge_samples — hardcoded.
 
+  # Minimum pilot rounds: early-stop cannot trigger before this count regardless of convergence score.
+  # Prevents run5-class failure where AF stopped after round 1 with a frozen ensemble.
+  adaptive_min_rounds: 2               # new pipeline parameter (adaptive_feedback_min_rounds)
+
+  # CV coverage gates: block early-stop if pilot under-samples CV space.
+  # Computed from samples.csv before cleanup; uses achievable range from boundary pull.
+  pilot_min_cv1_coverage: 0.60        # CV1 (contacts): require 60% of [lo,hi] achievable range sampled
+  pilot_min_cv2_coverage: 0.70        # CV2 (Ramachandran): require 70% of secondary-CV center span sampled
+
   # Iterative Delaunay: re-run placement every pilot round >= 1 until anchor set stabilises.
   # Prevents blind spots from poor first-round pilot coverage.
   delaunay_iterate: true
-  delaunay_stability_tol: 0.05
+  delaunay_stability_tol: 0.001        # was 0.05; near-zero => Delaunay never declares layout stable early; all 5 rounds always run (disables early-stop via stability criterion)
 
   # Coverage scaffold: inject grid windows in CV cells with no KDE-peak anchor.
   # 3×3 grid → up to 9 scaffold points covering the full contacts×rama-map space.
@@ -270,7 +280,7 @@ adaptive_production:
   md_budget_ns: 840.0                 # was: adaptive_production_total_md_pool_ns
 
   # Epoch schedule
-  ap_epochs: 10                       # was: adaptive_production_epochs
+  ap_epochs: 5                        # was 10; 5 epochs with larger per-epoch budget from 10M production steps
   # ap_epoch_steps / ap_final_steps: omit to let the code compute from pool balance.
   # Code now distributes remaining budget evenly across remaining epochs using actual
   # n_states and timestep. Explicit values override if set > 0.
@@ -285,7 +295,7 @@ adaptive_production:
   ap_write_reports: true              # was: adaptive_production_write_action_reports
   ap_write_mbar_inputs: true          # was: adaptive_production_write_union_mbar_inputs
   ap_run_mbar: true                   # was: adaptive_production_run_union_mbar_analysis
-  ap_fes_bins: "80,40"                # was: adaptive_production_union_fes_bins
+  ap_fes_bins: "80,100"               # was "80,40"; CV2 bins raised to 100 for higher Ramachandran PMF resolution
 
   # Seed bank
   ap_seed_bank: true                  # was: adaptive_production_propagate_seed_bank
@@ -340,10 +350,10 @@ simulation:
   # Dropped: equil_safe_chunk_steps — hardcoded 100.
 
 gamd:
-  production_steps: 1000000           # was: gamd_production_steps
-  sigma0p: 6.0                        # was: sigma0p_kcal_mol
-  sigma0d: 6.0                        # was: sigma0d_kcal_mol
-  equil_steps: 100000                 # was: gamd_equil_steps
+  production_steps: 10000000          # was 1000000; 10M steps = 40 ns/window at 4 fs; matches run2 near-converged budget (10M achieved RMSE=0.113, just above 0.1 threshold)
+  sigma0p: 5.0                        # was 6.0; reduced 15% to lower anharmonicity score from ~0.58 toward ~0.45
+  sigma0d: 5.0                        # was 6.0; idem
+  equil_steps: 1250000                # was 100000; 5 ns at 4 fs for thorough GaMD calibration; NOTE: runs in every pilot round too (heavy overhead, see workflow_help WARNING)
   gamd_averaging_window: 2000
   # Dropped: gamd_cmd_steps — hardcoded 50000.
 
