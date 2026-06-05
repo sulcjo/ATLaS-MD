@@ -6461,6 +6461,63 @@ def plot_gamd_boost(d, out, warnings):
     ax.set_title('GaMD reweighting quality per window  [↑ = worse ESS]'); ax.legend(fontsize=8)
     fig.savefig(out / 'gamd_reweight_quality.png', dpi=200, bbox_inches='tight'); plt.close(fig)
 
+    def _window_moments(arr_kcal, win_mask):
+        a = arr_kcal[win_mask]
+        a = a[np.isfinite(a)]
+        if a.size < 4:
+            return np.nan, np.nan, np.nan
+        mu, sigma = np.mean(a), np.std(a)
+        if sigma < 1e-12:
+            return 0.0, 0.0, 0.0
+        z = (a - mu) / sigma
+        skew = float(np.mean(z**3))
+        kurt = float(np.mean(z**4) - 3.0)
+        anharmonicity = float(np.sqrt(skew**2 + 0.25 * kurt**2))
+        return skew, kurt, anharmonicity
+
+    win_skew         = np.array([_window_moments(comb_kcal, d.window == k)[0] for k in range(K)])
+    win_kurt         = np.array([_window_moments(comb_kcal, d.window == k)[1] for k in range(K)])
+    win_anharmonicity = np.array([_window_moments(comb_kcal, d.window == k)[2] for k in range(K)])
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4.5), constrained_layout=True)
+    # Panel 1: skewness
+    ax = axes[0]
+    bar_colors_skew = ['#fa8072' if s >= 0 else '#87ceeb' for s in win_skew]
+    ax.bar(wins, win_skew, color=bar_colors_skew, alpha=0.85)
+    for thresh, color in [(0.5, 'orange'), (-0.5, 'orange'), (1.0, 'red'), (-1.0, 'red')]:
+        ax.axhline(thresh, color=color, ls='--', lw=1.0, label=f'{thresh:+.1f}' if thresh > 0 else None)
+    ax.set_xlabel('window index'); ax.set_ylabel('skewness')
+    ax.set_title('Boost skewness per window\n(pre-smoothing, raw ΔV)')
+    handles = [plt.Line2D([0], [0], color='orange', ls='--', lw=1, label='±0.5 (marginal)'),
+               plt.Line2D([0], [0], color='red',    ls='--', lw=1, label='±1.0 (poor)')]
+    ax.legend(handles=handles, fontsize=8)
+    # Panel 2: excess kurtosis
+    ax = axes[1]
+    ax.bar(wins, win_kurt, color='#8ecae6', alpha=0.85)
+    for thresh, color in [(1.0, 'orange'), (-1.0, 'orange'), (2.0, 'red'), (-2.0, 'red')]:
+        ax.axhline(thresh, color=color, ls='--', lw=1.0)
+    ax.set_xlabel('window index'); ax.set_ylabel('excess kurtosis')
+    ax.set_title('Boost excess kurtosis per window\n(pre-smoothing, raw ΔV)')
+    handles = [plt.Line2D([0], [0], color='orange', ls='--', lw=1, label='±1.0 (marginal)'),
+               plt.Line2D([0], [0], color='red',    ls='--', lw=1, label='±2.0 (poor)')]
+    ax.legend(handles=handles, fontsize=8)
+    # Panel 3: anharmonicity
+    ax = axes[2]
+    bar_colors_anh = ['#2ecc71' if v < 0.3 else ('#e08c2e' if v < 1.0 else '#e05c5c') for v in win_anharmonicity]
+    ax.bar(wins, win_anharmonicity, color=bar_colors_anh, alpha=0.85)
+    ax.axhline(0.3, color='green', ls='--', lw=1.0, label='0.3 (marginal)')
+    ax.axhline(1.0, color='red',   ls='--', lw=1.0, label='1.0 (poor)')
+    ax.set_xlabel('window index'); ax.set_ylabel('anharmonicity score')
+    ax.set_title('Cumulant2 validity score per window\n(0: Gaussian; >1: poor cumulant2)')
+    import matplotlib.patches as _mpatch
+    handles = [_mpatch.Patch(color='#2ecc71', alpha=0.85, label='<0.3 (good)'),
+               _mpatch.Patch(color='#e08c2e', alpha=0.85, label='0.3-1.0 (marginal)'),
+               _mpatch.Patch(color='#e05c5c', alpha=0.85, label='>1.0 (poor)'),
+               plt.Line2D([0], [0], color='green', ls='--', lw=1, label='0.3 threshold'),
+               plt.Line2D([0], [0], color='red',   ls='--', lw=1, label='1.0 threshold')]
+    ax.legend(handles=handles, fontsize=8)
+    fig.savefig(out / 'gamd_cumulant_quality.png', dpi=200, bbox_inches='tight'); plt.close(fig)
+
 def plot_outputs(d,pmfs,selected,O,out,warnings,smooth_sigma=0.0):
     try:
         import matplotlib.pyplot as plt
