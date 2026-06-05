@@ -152,6 +152,7 @@ class Data:
     potential_kj: Optional[np.ndarray]
     source: str
     meta: dict[str,Any]
+    boost_dih_kj: Optional[np.ndarray] = None  # dihedral-only component of GaMD boost
 
 def rjson(path: Path, default=None):
     try:
@@ -686,7 +687,7 @@ def load_csv(prod: Path, load_notes: Optional[list[str]] = None) -> Data:
         meta.setdefault('load_notes', []).extend(load_notes)
     centers,ks,rows=read_windows(prod/'umbrella_windows.csv')
     temp,beta=infer_temp_beta(prod,meta,None)
-    cv=[]; cv2=[]; rg=[]; win=[]; rep=[]; step=[]; boost=[]; pot=[]; urows=[]
+    cv=[]; cv2=[]; rg=[]; win=[]; rep=[]; step=[]; boost=[]; boost_dih=[]; pot=[]; urows=[]
     vector_keys = (
         'umbrella_reduced_bias_all_windows_json', 'umbrella_reduced_bias_all_windows',
         'umbrella_bias_all_windows_kj_mol_json', 'umbrella_bias_all_windows_kj_mol',
@@ -694,6 +695,7 @@ def load_csv(prod: Path, load_notes: Optional[list[str]] = None) -> Data:
     with (prod/'samples.csv').open(newline='') as f:
         reader=csv.DictReader(f)
         has_vectors=any(k in (reader.fieldnames or []) for k in vector_keys)
+        has_components='gamd_boost_components_kj_mol_json' in (reader.fieldnames or [])
         for row in reader:
             try: c=float(row['cv_A'])
             except Exception: continue
@@ -705,6 +707,13 @@ def load_csv(prod: Path, load_notes: Optional[list[str]] = None) -> Data:
             win.append(int(float(row.get('window',0) or 0))); rep.append(int(float(row.get('replica',0) or 0))); step.append(int(float(row.get('step',len(step)) or len(step))))
             try: boost.append(float(row.get('gamd_boost_total_kj_mol','') or row.get('gamd_boost_kj_mol','')))
             except Exception: boost.append(float('nan'))
+            if has_components:
+                try:
+                    _comps=json.loads(row.get('gamd_boost_components_kj_mol_json') or '{}')
+                    _dih=next((v for k,v in _comps.items() if 'dihedral' in k.lower() or 'torsion' in k.lower()),None)
+                    boost_dih.append(float(_dih) if _dih is not None else float('nan'))
+                except Exception: boost_dih.append(float('nan'))
+            else: boost_dih.append(float('nan'))
             try: pot.append(float(row.get('potential_kj_mol','')))
             except Exception: pot.append(float('nan'))
             if has_vectors:
@@ -715,7 +724,7 @@ def load_csv(prod: Path, load_notes: Optional[list[str]] = None) -> Data:
                     for key in ('umbrella_bias_all_windows_kj_mol_json','umbrella_bias_all_windows_kj_mol'):
                         if row.get(key): vec=[beta*x for x in jvec(row[key])]; break
                 urows.append(vec)
-    cv=np.asarray(cv,float); cv2=np.asarray(cv2,float); rg=np.asarray(rg,float); win=np.asarray(win,int); rep=np.asarray(rep,int); step=np.asarray(step,int); boost=np.asarray(boost,float); pot=np.asarray(pot,float)
+    cv=np.asarray(cv,float); cv2=np.asarray(cv2,float); rg=np.asarray(rg,float); win=np.asarray(win,int); rep=np.asarray(rep,int); step=np.asarray(step,int); boost=np.asarray(boost,float); boost_dih=np.asarray(boost_dih,float); pot=np.asarray(pot,float)
     if any(len(v)>0 for v in urows):
         K=max(len(v) for v in urows); u=np.full((len(urows),K),np.nan)
         for i,v in enumerate(urows):
@@ -742,7 +751,8 @@ def load_csv(prod: Path, load_notes: Optional[list[str]] = None) -> Data:
     if centers.size==0: centers=np.arange(u.shape[1],dtype=float)
     if ks.size==0: ks=np.full(u.shape[1],np.nan)
     meta['umbrella_window_rows']=rows
-    return clean(Data(prod,prod/'pmf_analysis',cv,cv2,rg,win,rep,step,u,centers,ks,beta,temp,boost,pot,str(prod/'samples.csv'),meta))
+    _boost_dih_arg = boost_dih if np.any(np.isfinite(boost_dih)) else None
+    return clean(Data(prod,prod/'pmf_analysis',cv,cv2,rg,win,rep,step,u,centers,ks,beta,temp,boost,pot,str(prod/'samples.csv'),meta,boost_dih_kj=_boost_dih_arg))
 
 def _find_adaptive_epoch_dirs(adaptive_dir: Path) -> list:
     """Return list of (run_dir, window_map_path) for each epoch/final with Parquet samples."""
@@ -943,7 +953,7 @@ def load_parquet_adaptive_union(adaptive_dir: Path) -> Data:
         raise FileNotFoundError(f'No epoch Parquet data found in {adaptive_dir}')
 
     all_cv = []; all_cv2 = []; all_window = []; all_step = []
-    all_replica = []; all_boost = []; all_potential = []; all_epoch_src = []
+    all_replica = []; all_boost = []; all_boost_dih = []; all_potential = []; all_epoch_src = []
     beta = float('nan')
     meta: dict = rjson(adaptive_dir.parent / 'run_manifest.json', {})
 
@@ -971,6 +981,8 @@ def load_parquet_adaptive_union(adaptive_dir: Path) -> Data:
         all_replica.append(rep[valid])
         boost_raw = samples.get('gamd_boost_total')
         all_boost.append(boost_raw.astype(np.float64)[valid] if boost_raw is not None else np.full(valid.sum(), np.nan))
+        boost_dih_raw = samples.get('gamd_boost_dihedral')
+        all_boost_dih.append(boost_dih_raw.astype(np.float64)[valid] if boost_dih_raw is not None else np.full(valid.sum(), np.nan))
         pot_raw = samples.get('potential')
         all_potential.append(pot_raw.astype(np.float64)[valid] if pot_raw is not None else np.full(valid.sum(), np.nan))
         all_epoch_src.append(np.full(int(valid.sum()), len(all_cv) - 1, dtype=np.int32))
@@ -983,7 +995,8 @@ def load_parquet_adaptive_union(adaptive_dir: Path) -> Data:
     window  = np.concatenate(all_window)
     step    = np.concatenate(all_step)
     replica = np.concatenate(all_replica)
-    boost   = np.concatenate(all_boost)
+    boost     = np.concatenate(all_boost)
+    boost_dih = np.concatenate(all_boost_dih)
     pot_arr = np.concatenate(all_potential)
     potential = pot_arr if np.any(np.isfinite(pot_arr)) else None
 
@@ -1021,6 +1034,7 @@ def load_parquet_adaptive_union(adaptive_dir: Path) -> Data:
                      '_epoch_source': epoch_src.tolist(),
                      'adaptive_epoch_run_dirs': [str(ed) for ed, _ in epoch_dirs]})
 
+    _boost_dih_arg = boost_dih if np.any(np.isfinite(boost_dih)) else None
     return clean(Data(
         prod_dir=adaptive_dir, out_dir=adaptive_dir / 'pmf_analysis',
         cv=cv, cv2=cv2, rg_A=np.full(cv.shape, np.nan),
@@ -1028,6 +1042,7 @@ def load_parquet_adaptive_union(adaptive_dir: Path) -> Data:
         u_nk=u_nk, centers=primary_centers, k_kcal=primary_ks,
         beta=beta, temp=temp, boost_kj=boost, potential_kj=potential,
         source=str(registry_csv), meta=meta_out,
+        boost_dih_kj=_boost_dih_arg,
     ))
 
 
@@ -1258,8 +1273,11 @@ def run_epoch_pmf_convergence(d: Data, args, bins: np.ndarray, selected: str,
         }
         summary['converged'] = summary['converged_JS'] and summary['converged_RMSE']
     try:
+        _fracs_ec = np.asarray([r['frac_total'] for r in conv_rows], dtype=float)
+        _ts_ec = float(d.meta.get('timestep_fs', 4.0) or 4.0)
         write_convergence_plots(conv_rows, pmf_rows, [summary] if summary else [],
-                                out, args, warnings=[], epoch_annotations=_epoch_source_annotations(d))
+                                out, args, warnings=[], epoch_annotations=_epoch_source_annotations(d),
+                                aggregate_ns=_aggregate_ns_for_fracs(d, _fracs_ec, _ts_ec))
     except Exception:
         pass
     wjson(out / 'epoch_convergence_summary.json',
@@ -1318,8 +1336,10 @@ def load_parquet(prod: Path) -> Data:
     window   = samples['window_id'].astype(np.int32)
     step     = samples['step'].astype(np.int64)
     replica  = samples['replica'].astype(np.int32) if 'replica' in samples else np.zeros(cv.shape, dtype=np.int32)
-    boost_raw= samples.get('gamd_boost_total')
-    boost    = boost_raw.astype(np.float64) if boost_raw is not None else np.full(cv.shape, np.nan)
+    boost_raw      = samples.get('gamd_boost_total')
+    boost          = boost_raw.astype(np.float64) if boost_raw is not None else np.full(cv.shape, np.nan)
+    boost_dih_raw  = samples.get('gamd_boost_dihedral')
+    boost_dih      = boost_dih_raw.astype(np.float64) if boost_dih_raw is not None else np.full(cv.shape, np.nan)
     pot_raw  = samples.get('potential')
     potential= pot_raw.astype(np.float64) if pot_raw is not None else None
 
@@ -1338,6 +1358,7 @@ def load_parquet(prod: Path) -> Data:
     meta['umbrella_window_rows'] = rows
     meta['parquet_windows']      = windows
 
+    _boost_dih_arg = boost_dih if np.any(np.isfinite(boost_dih)) else None
     return clean(Data(
         prod_dir=prod, out_dir=prod / 'pmf_analysis',
         cv=cv, cv2=cv2, rg_A=np.full(cv.shape, np.nan),
@@ -1345,6 +1366,7 @@ def load_parquet(prod: Path) -> Data:
         u_nk=u_nk, centers=centers, k_kcal=k_kcal,
         beta=beta, temp=temp, boost_kj=boost, potential_kj=potential,
         source=str(prod / 'samples'), meta=meta,
+        boost_dih_kj=_boost_dih_arg,
     ))
 
 
@@ -1356,6 +1378,8 @@ def clean(d: Data) -> Data:
     mask=np.isfinite(d.cv) & np.all(np.isfinite(d.u_nk),axis=1)
     d.cv=d.cv[mask]; d.cv2=d.cv2[mask]; d.rg_A=d.rg_A[mask]; d.window=d.window[mask]; d.replica=d.replica[mask]; d.step=d.step[mask]; d.u_nk=d.u_nk[mask]; d.boost_kj=d.boost_kj[mask]
     if d.potential_kj is not None and d.potential_kj.size==mask.size: d.potential_kj=d.potential_kj[mask]
+    if d.boost_dih_kj is not None and d.boost_dih_kj.size==mask.size: d.boost_dih_kj=d.boost_dih_kj[mask]
+    elif d.boost_dih_kj is not None: d.boost_dih_kj=None
     return d
 
 def _filter_epoch_source(d: Data, keep: np.ndarray) -> None:
@@ -1378,6 +1402,8 @@ def _skip_first_n_frames(d: Data, n: int) -> Data:
     d.u_nk=d.u_nk[keep]; d.boost_kj=d.boost_kj[keep]
     if d.potential_kj is not None and d.potential_kj.size==keep.size:
         d.potential_kj=d.potential_kj[keep]
+    if d.boost_dih_kj is not None and d.boost_dih_kj.size==keep.size:
+        d.boost_dih_kj=d.boost_dih_kj[keep]
     _filter_epoch_source(d, keep)
     return d
 
@@ -1410,6 +1436,8 @@ def _apply_analysis_stride(d: Data, stride: int, offset: int = 0) -> Data:
     d.u_nk=d.u_nk[keep]; d.boost_kj=d.boost_kj[keep]
     if d.potential_kj is not None and d.potential_kj.size==keep.size:
         d.potential_kj=d.potential_kj[keep]
+    if d.boost_dih_kj is not None and d.boost_dih_kj.size==keep.size:
+        d.boost_dih_kj=d.boost_dih_kj[keep]
     _filter_epoch_source(d, keep)
     d.meta.setdefault('load_notes',[]).append(f'Applied analysis stride {stride} with offset {offset}: kept {int(d.cv.size)}/{before} samples.')
     d.meta['analysis_stride']=int(stride)
@@ -2783,6 +2811,90 @@ def _add_epoch_annotations_to_axes(axes_list: list, epoch_annotations: list) -> 
                     fontsize=5.5, color=color, va='top', rotation=90, alpha=0.85)
 
 
+def _epoch_source_aggregate_ns_info(d: 'Data', timestep_fs: float = 4.0):
+    """Per-source (n_wins, step_range, cumulative_ns) triple for aggregate cost computation.
+
+    Returns None when _epoch_source metadata is absent or mismatched.
+    Aggregate ns for source k = n_windows_k × (max_step_k − min_step_k) × timestep_fs / 1e6.
+    """
+    src_meta = d.meta.get('_epoch_source')
+    if not src_meta or len(src_meta) != d.step.size:
+        return None
+    src = np.asarray(src_meta, dtype=np.int64)
+    n_sources = int(src.max()) + 1
+    n_wins: list = []
+    step_ranges: list = []
+    for k in range(n_sources):
+        mask = src == k
+        if not mask.any():
+            n_wins.append(1)
+            step_ranges.append((0, 0))
+        else:
+            n_wins.append(max(1, int(len(np.unique(d.window[mask])))))
+            s = d.step[mask]
+            step_ranges.append((int(s.min()), int(s.max())))
+    source_ns = [n_wins[k] * (step_ranges[k][1] - step_ranges[k][0]) * timestep_fs / 1e6
+                 for k in range(n_sources)]
+    cumulative = [0.0] + list(np.cumsum(source_ns).tolist())
+    return n_wins, step_ranges, cumulative
+
+
+def _aggregate_ns_for_fracs(d: 'Data', fracs: np.ndarray, timestep_fs: float = 4.0) -> Optional[np.ndarray]:
+    """Map fraction-of-samples values to cumulative aggregate simulation time (ns).
+
+    Cost = n_active_windows × sim_steps × timestep (REUS parallel replicas all run
+    simultaneously, so GPU cost scales with window count, not just wall-clock steps).
+    Samples are ordered by (src_idx, step) = chronological order across epochs.
+    Returns None when epoch-source metadata is unavailable.
+    """
+    info = _epoch_source_aggregate_ns_info(d, timestep_fs)
+    if info is None:
+        return None
+    n_wins, step_ranges, cumulative = info
+    src = np.asarray(d.meta['_epoch_source'], dtype=np.int64)
+    N = d.step.size
+    adj_step = src * int(1e10) + d.step.astype(np.int64)
+    sort_idx = np.argsort(adj_step, kind='stable')
+    src_sorted = src[sort_idx]
+    step_sorted = d.step[sort_idx]
+    completed = np.array([cumulative[k] for k in src_sorted], dtype=np.float64)
+    step_min = np.array([step_ranges[k][0] for k in src_sorted], dtype=np.float64)
+    n_wins_arr = np.array([n_wins[k] for k in src_sorted], dtype=np.float64)
+    partial = n_wins_arr * np.maximum(0.0, step_sorted.astype(np.float64) - step_min) * timestep_fs / 1e6
+    cum_agg_ns = completed + partial
+    sample_fracs = (np.arange(N, dtype=np.float64) + 1.0) / N
+    return np.interp(np.asarray(fracs, dtype=np.float64), sample_fracs, cum_agg_ns)
+
+
+def _add_aggregate_ns_secondary_axis(ax, x_frac: np.ndarray, agg_ns: np.ndarray) -> None:
+    """Add cumulative aggregate simulation time (ns) as a secondary top x-axis."""
+    if agg_ns is None or len(agg_ns) < 2:
+        return
+    x_f = np.asarray(x_frac, dtype=np.float64)
+    a_n = np.asarray(agg_ns, dtype=np.float64)
+    valid = np.isfinite(x_f) & np.isfinite(a_n)
+    x_f, a_n = x_f[valid], a_n[valid]
+    if len(x_f) < 2 or not np.all(np.diff(a_n) >= 0):
+        return
+    try:
+        import matplotlib.ticker as mticker
+        fwd = lambda f, _x=x_f, _a=a_n: np.interp(np.asarray(f, float), _x, _a)
+        inv = lambda n, _x=x_f, _a=a_n: np.interp(np.asarray(n, float), _a, _x)
+        ax2 = ax.secondary_xaxis('top', functions=(fwd, inv))
+        ax2.set_xlabel('aggregate simulation (ns)', fontsize=7.5)
+        total_ns = float(a_n[-1])
+        if total_ns < 1.0:
+            fmt = mticker.FuncFormatter(lambda v, _: f'{v * 1000:.0f}ps')
+        elif total_ns < 10.0:
+            fmt = mticker.FuncFormatter(lambda v, _: f'{v:.2f}ns')
+        else:
+            fmt = mticker.FuncFormatter(lambda v, _: f'{v:.1f}ns')
+        ax2.xaxis.set_major_formatter(fmt)
+        ax2.tick_params(labelsize=6.5)
+    except Exception:
+        pass
+
+
 def checkpoint_steps_from_data(step: np.ndarray, n_timepoints: int) -> np.ndarray:
     steps=np.asarray(step,dtype=np.int64)
     steps=steps[np.isfinite(steps)]
@@ -2814,7 +2926,7 @@ def _write_csv_rows(path: Path, rows: list[dict]) -> None:
         for r in rows:
             wr.writerow(r)
 
-def write_convergence_plots(conv_rows: list[dict], pmf_rows: list[dict], summary_rows: list[dict], out: Path, args, warnings: list[str], *, epoch_annotations: list = None) -> list[str]:
+def write_convergence_plots(conv_rows: list[dict], pmf_rows: list[dict], summary_rows: list[dict], out: Path, args, warnings: list[str], *, epoch_annotations: list = None, aggregate_ns: Optional[np.ndarray] = None) -> list[str]:
     paths=[]
     try:
         import matplotlib.pyplot as plt
@@ -2845,6 +2957,8 @@ def write_convergence_plots(conv_rows: list[dict], pmf_rows: list[dict], summary
     axes[1].set_xlabel('fraction of production samples'); axes[1].set_ylabel('PMF RMSE vs final (kcal/mol)'); axes[1].set_title('PMF RMSE convergence')
     axes[1].grid(True,alpha=0.25)
     _add_epoch_annotations_to_axes(list(axes), ea)
+    if aggregate_ns is not None:
+        for _ax in axes: _add_aggregate_ns_secondary_axis(_ax, x, aggregate_ns)
     path=out/'js_rmse_vs_timepoints.png'; fig.savefig(path,dpi=200,bbox_inches='tight'); plt.close(fig); paths.append(str(path))
 
     fig,axes=plt.subplots(1,2,figsize=(13,5),constrained_layout=True)
@@ -2855,6 +2969,8 @@ def write_convergence_plots(conv_rows: list[dict], pmf_rows: list[dict], summary
     axes[1].set_xlabel('fraction of production samples'); axes[1].set_ylabel('delta RMSE from previous (kcal/mol)'); axes[1].set_title('Consecutive-checkpoint PMF change')
     axes[1].grid(True,alpha=0.25)
     _add_epoch_annotations_to_axes(list(axes), ea)
+    if aggregate_ns is not None:
+        for _ax in axes: _add_aggregate_ns_secondary_axis(_ax, x, aggregate_ns)
     path=out/'delta_js_rmse_vs_timepoints.png'; fig.savefig(path,dpi=200,bbox_inches='tight'); plt.close(fig); paths.append(str(path))
 
     if np.any(np.isfinite(berr)):
@@ -2863,6 +2979,7 @@ def write_convergence_plots(conv_rows: list[dict], pmf_rows: list[dict], summary
         ax.set_xlabel('fraction of production samples'); ax.set_ylabel('barrier error vs final (kcal/mol)'); ax.set_title('Barrier-height convergence')
         ax.grid(True,alpha=0.25)
         _add_epoch_annotations_to_axes([ax], ea)
+        if aggregate_ns is not None: _add_aggregate_ns_secondary_axis(ax, x, aggregate_ns)
         path=out/'barrier_error_vs_timepoints.png'; fig.savefig(path,dpi=200,bbox_inches='tight'); plt.close(fig); paths.append(str(path))
 
     fig,axes=plt.subplots(1,2,figsize=(13,5),constrained_layout=True)
@@ -2873,6 +2990,8 @@ def write_convergence_plots(conv_rows: list[dict], pmf_rows: list[dict], summary
     axes[1].set_xlabel('fraction of production samples'); axes[1].set_ylabel('new bins since previous timepoint'); axes[1].set_title('New CV-bin discovery')
     axes[1].grid(True,alpha=0.25)
     _add_epoch_annotations_to_axes(list(axes), ea)
+    if aggregate_ns is not None:
+        for _ax in axes: _add_aggregate_ns_secondary_axis(_ax, x, aggregate_ns)
     path=out/'coverage_saturation_vs_timepoints.png'; fig.savefig(path,dpi=200,bbox_inches='tight'); plt.close(fig); paths.append(str(path))
 
     # scorecard: same spirit as the XVG convergence tool, but single-system.
@@ -2978,7 +3097,7 @@ def _observable_pmf_from_logw(values: np.ndarray, logw: np.ndarray, boost: np.nd
     return pmf_from_weights(values,base_w,bins,kbt_kcal), {}, 'umbrella_only'
 
 
-def write_observable_convergence_plots(conv_rows: list[dict], pmf_rows: list[dict], summary_rows: list[dict], out: Path, args, warnings: list[str], *, prefix: str, metric_label: str, x_label: str, smooth_sigma: float = 0.0, epoch_annotations: list = None) -> list[str]:
+def write_observable_convergence_plots(conv_rows: list[dict], pmf_rows: list[dict], summary_rows: list[dict], out: Path, args, warnings: list[str], *, prefix: str, metric_label: str, x_label: str, smooth_sigma: float = 0.0, epoch_annotations: list = None, aggregate_ns: Optional[np.ndarray] = None) -> list[str]:
     """Generic convergence plots for any scalar observable PMF."""
     paths=[]
     try:
@@ -3009,6 +3128,8 @@ def write_observable_convergence_plots(conv_rows: list[dict], pmf_rows: list[dic
     axes[1].set_xlabel('fraction of production samples'); axes[1].set_ylabel('PMF RMSE vs final (kcal/mol)'); axes[1].set_title(f'{metric_label} PMF RMSE convergence')
     axes[1].grid(True,alpha=0.25)
     _add_epoch_annotations_to_axes(list(axes), ea)
+    if aggregate_ns is not None:
+        for _ax in axes: _add_aggregate_ns_secondary_axis(_ax, x, aggregate_ns)
     path=out/f'{prefix}_js_rmse_vs_timepoints.png'; fig.savefig(path,dpi=200,bbox_inches='tight'); plt.close(fig); paths.append(str(path))
 
     fig,axes=plt.subplots(1,2,figsize=(13,5),constrained_layout=True)
@@ -3019,6 +3140,8 @@ def write_observable_convergence_plots(conv_rows: list[dict], pmf_rows: list[dic
     axes[1].set_xlabel('fraction of production samples'); axes[1].set_ylabel('delta RMSE from previous (kcal/mol)'); axes[1].set_title(f'{metric_label} consecutive-checkpoint PMF change')
     axes[1].grid(True,alpha=0.25)
     _add_epoch_annotations_to_axes(list(axes), ea)
+    if aggregate_ns is not None:
+        for _ax in axes: _add_aggregate_ns_secondary_axis(_ax, x, aggregate_ns)
     path=out/f'{prefix}_delta_js_rmse_vs_timepoints.png'; fig.savefig(path,dpi=200,bbox_inches='tight'); plt.close(fig); paths.append(str(path))
 
     if np.any(np.isfinite(berr)):
@@ -3027,6 +3150,7 @@ def write_observable_convergence_plots(conv_rows: list[dict], pmf_rows: list[dic
         ax.set_xlabel('fraction of production samples'); ax.set_ylabel('barrier error vs final (kcal/mol)'); ax.set_title(f'{metric_label} barrier-height convergence')
         ax.grid(True,alpha=0.25)
         _add_epoch_annotations_to_axes([ax], ea)
+        if aggregate_ns is not None: _add_aggregate_ns_secondary_axis(ax, x, aggregate_ns)
         path=out/f'{prefix}_barrier_error_vs_timepoints.png'; fig.savefig(path,dpi=200,bbox_inches='tight'); plt.close(fig); paths.append(str(path))
 
     fig,axes=plt.subplots(1,2,figsize=(13,5),constrained_layout=True)
@@ -3037,6 +3161,8 @@ def write_observable_convergence_plots(conv_rows: list[dict], pmf_rows: list[dic
     axes[1].set_xlabel('fraction of production samples'); axes[1].set_ylabel('new bins since previous timepoint'); axes[1].set_title(f'{metric_label} new-bin discovery')
     axes[1].grid(True,alpha=0.25)
     _add_epoch_annotations_to_axes(list(axes), ea)
+    if aggregate_ns is not None:
+        for _ax in axes: _add_aggregate_ns_secondary_axis(_ax, x, aggregate_ns)
     path=out/f'{prefix}_coverage_saturation_vs_timepoints.png'; fig.savefig(path,dpi=200,bbox_inches='tight'); plt.close(fig); paths.append(str(path))
 
     if summary_rows:
@@ -3394,7 +3520,9 @@ def run_observable_pmf_convergence(
                 f'{float(_first_rmse_ok)*100:.1f}% of data. Actual requirement may differ.'
             )
     ea = _epoch_source_annotations(d)
-    plot_paths=write_observable_convergence_plots(conv_rows,pmf_rows,summary_rows,out,args,cwarnings,prefix=file_prefix,metric_label=metric_label,x_label=x_label,smooth_sigma=_eff_smooth(args,'pmf_smooth_sigma'),epoch_annotations=ea)
+    _fracs_ob = np.asarray([r.get('frac_total', np.nan) for r in conv_rows], dtype=float)
+    _ts_ob = float(d.meta.get('timestep_fs', 4.0) or 4.0)
+    plot_paths=write_observable_convergence_plots(conv_rows,pmf_rows,summary_rows,out,args,cwarnings,prefix=file_prefix,metric_label=metric_label,x_label=x_label,smooth_sigma=_eff_smooth(args,'pmf_smooth_sigma'),epoch_annotations=ea,aggregate_ns=_aggregate_ns_for_fracs(d,_fracs_ob,_ts_ob))
     if summary:
         write_observable_convergence_report(out/report_name,summary,conv_rows,cwarnings,metric_label)
     basin_result: dict = {}
@@ -6271,6 +6399,68 @@ def boost_stats(boost,beta):
     w=norm_logw(beta*b); out['boost_reweight_ess']=float(ess(w)); out['boost_reweight_ess_fraction']=float(out['boost_reweight_ess']/b.size)
     return out
 
+def plot_gamd_boost(d, out, warnings):
+    """Write gamd_boost_diagnostics.png and gamd_reweight_quality.png to out/."""
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        warnings.append(f'matplotlib unavailable; GaMD boost plots skipped: {e}'); return
+    boost_comb = d.boost_kj
+    if not (np.isfinite(boost_comb).sum() > 10 and np.nanstd(boost_comb) > 1e-12):
+        return
+    kj_kcal = 1.0 / KJ_PER_KCAL
+    kbt_kcal = 1.0 / (d.beta * KJ_PER_KCAL)
+    comb_kcal = boost_comb * kj_kcal
+    has_dih = (d.boost_dih_kj is not None and np.isfinite(d.boost_dih_kj).sum() > 10)
+    dih_kcal = d.boost_dih_kj * kj_kcal if has_dih else None
+    tot_kcal = (comb_kcal - dih_kcal) if has_dih else None
+    K = d.u_nk.shape[1]
+    wins = np.arange(K)
+    win_means_comb = np.array([float(np.nanmean(comb_kcal[d.window == k])) if np.any(d.window == k) else np.nan for k in range(K)])
+    win_stds_comb  = np.array([float(np.nanstd(comb_kcal[d.window == k]))  if np.any(d.window == k) else np.nan for k in range(K)])
+    win_varbdv     = np.array([float(np.var(comb_kcal[d.window == k] / kbt_kcal)) if np.any(d.window == k) else np.nan for k in range(K)])
+    if has_dih:
+        win_means_dih = np.array([float(np.nanmean(dih_kcal[d.window == k])) if np.any(d.window == k) else np.nan for k in range(K)])
+        win_means_tot = win_means_comb - win_means_dih
+        _c_pos = comb_kcal.copy(); _c_pos[_c_pos <= 0] = np.nan
+        win_frac_dih = np.array([float(np.nanmedian(dih_kcal[d.window == k] / _c_pos[d.window == k])) if np.any(d.window == k) else np.nan for k in range(K)])
+    n_panels = 3 if has_dih else 2
+    fig, axes = plt.subplots(1, n_panels, figsize=(5.5 * n_panels, 4.5), constrained_layout=True)
+    ax = axes[0]
+    bins_hist = np.linspace(0, float(np.nanpercentile(comb_kcal, 99.5)), 80)
+    ax.hist(np.clip(comb_kcal, 0, None), bins=bins_hist, color='#2ecc71', alpha=0.5, label='combined', density=True)
+    if has_dih:
+        ax.hist(np.clip(dih_kcal, 0, None), bins=bins_hist, color='#e05c5c', alpha=0.6, label='dihedral', density=True)
+        ax.hist(np.clip(tot_kcal, 0, None), bins=bins_hist, color='#5c82e0', alpha=0.45, label='total-PE', density=True)
+    ax.axvline(kbt_kcal, color='k', ls='--', lw=0.9, label='kT')
+    ax.set_xlabel('GaMD boost ΔV (kcal/mol)'); ax.set_ylabel('density')
+    ax.set_title('GaMD boost distribution'); ax.legend(fontsize=8)
+    ax = axes[1]
+    if has_dih:
+        ax.bar(wins, win_means_dih, label='dihedral', color='#e05c5c', alpha=0.8)
+        ax.bar(wins, win_means_tot, bottom=win_means_dih, label='total-PE', color='#5c82e0', alpha=0.8)
+    else:
+        ax.bar(wins, win_means_comb, label='combined', color='#2ecc71', alpha=0.8)
+    ax.errorbar(wins, win_means_comb, yerr=win_stds_comb, fmt='none', color='k', capsize=3)
+    ax.set_xlabel('window index'); ax.set_ylabel('mean boost (kcal/mol)')
+    ax.set_title('Mean boost per window  (error bars = ±σ)'); ax.legend(fontsize=8)
+    if has_dih:
+        ax = axes[2]
+        ax.bar(wins, win_frac_dih, color='#9b59b6', alpha=0.85)
+        med_frac = float(np.nanmedian(win_frac_dih))
+        ax.axhline(med_frac, color='k', ls='--', lw=1.2, label=f'median={med_frac:.3f}')
+        ax.set_ylim(0, 1); ax.set_xlabel('window index')
+        ax.set_ylabel('dihedral / combined (median)'); ax.set_title('Dihedral fraction per window')
+        ax.legend(fontsize=8)
+    fig.savefig(out / 'gamd_boost_diagnostics.png', dpi=200, bbox_inches='tight'); plt.close(fig)
+    fig, ax = plt.subplots(figsize=(8, 4), constrained_layout=True)
+    ax.bar(wins, win_varbdv, color='#e08c5c', alpha=0.85)
+    for thresh, color, lbl in [(1.0, 'green', 'var=1'), (5.0, 'orange', 'var=5'), (10.0, 'red', 'var=10')]:
+        ax.axhline(thresh, color=color, ls='--', lw=1, label=lbl)
+    ax.set_xlabel('window index'); ax.set_ylabel('var(β·ΔV_combined)')
+    ax.set_title('GaMD reweighting quality per window  [↑ = worse ESS]'); ax.legend(fontsize=8)
+    fig.savefig(out / 'gamd_reweight_quality.png', dpi=200, bbox_inches='tight'); plt.close(fig)
+
 def plot_outputs(d,pmfs,selected,O,out,warnings,smooth_sigma=0.0):
     try:
         import matplotlib.pyplot as plt
@@ -6284,6 +6474,7 @@ def plot_outputs(d,pmfs,selected,O,out,warnings,smooth_sigma=0.0):
     p=pmfs[selected]; pmf_plot=_smooth_pmf_1d(p['pmf'],smooth_sigma); fig,ax=plt.subplots(figsize=(8,5)); m=np.isfinite(pmf_plot); ax.plot(p['cv_A'][m],pmf_plot[m],linewidth=2.5); ax.set_xlabel(_primary_cv_axis_label(d.meta)); ax.set_ylabel('PMF (kcal/mol, shifted)'); ax.set_title(f'Selected unbiased PMF: {selected}'); fig.tight_layout(); fig.savefig(out/'pmf_unbiased.png',dpi=200); plt.close(fig)
     counts=np.bincount(d.window[(d.window>=0)&(d.window<d.u_nk.shape[1])],minlength=d.u_nk.shape[1]); fig,ax=plt.subplots(figsize=(8,4)); ax.bar(np.arange(counts.size),counts); ax.set_xlabel('window'); ax.set_ylabel('samples'); ax.set_title('Samples per umbrella window'); fig.tight_layout(); fig.savefig(out/'window_sample_counts.png',dpi=200); plt.close(fig)
     fig,ax=plt.subplots(figsize=(6,5)); im=ax.imshow(O,origin='lower',vmin=0,vmax=1,aspect='auto'); ax.set_xlabel('window'); ax.set_ylabel('window'); ax.set_title('CV histogram overlap'); fig.colorbar(im,ax=ax,label='overlap'); fig.tight_layout(); fig.savefig(out/'overlap_matrix.png',dpi=200); plt.close(fig)
+    plot_gamd_boost(d, out, warnings)
 
 def summary_md(path,s):
     _cu=s.get('primary_cv_units','A')
