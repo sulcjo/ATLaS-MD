@@ -2983,6 +2983,11 @@ def run_adaptive_feedback_auto_loop(args, out_dir: Path, openmm, app, unit, forc
 
     for round_index in range(n_rounds):
         round_no = round_index + 1
+        # Capture centers used THIS pilot before the proposal replaces them (used for CV2 coverage check).
+        _loop_pilot_secondary_centers: list[float] = list(current_secondary_centers) if current_secondary_centers else []
+        _pilot_coverage: dict = {}
+        _pilot_cv1_blocked = False
+        _pilot_cv2_blocked = False
         current_pilot_steps = int(validation_pilot_steps if (n_rounds > 1 and round_index == n_rounds - 1) else pilot_steps)
         round_dir = out_dir / f"adaptive_feedback_round_{round_no:02d}"
 
@@ -3132,6 +3137,92 @@ def run_adaptive_feedback_auto_loop(args, out_dir: Path, openmm, app, unit, forc
 
         adaptive_memory = proposal.get("adaptive_memory_after", adaptive_memory) if isinstance(proposal, dict) else adaptive_memory
         write_json(out_dir / "adaptive_feedback_memory.json", _json_ready(adaptive_memory))
+
+        # ── Pilot CV coverage health check ────────────────────────────────────
+        # Must run BEFORE cleanup deletes samples.csv.
+        # Flags insufficient CV1/CV2 exploration and blocks premature early-stop.
+        _samples_path_cov = round_dir / "samples.csv"
+        if _samples_path_cov.exists():
+            import csv as _csv_cov
+            _all_cv1_cov: list[float] = []
+            _all_cv2_cov: list[float] = []
+            try:
+                with _samples_path_cov.open() as _fh_cov:
+                    for _row_cov in _csv_cov.DictReader(_fh_cov):
+                        try:
+                            _all_cv1_cov.append(float(_row_cov["cv_A"]))
+                        except (KeyError, ValueError):
+                            pass
+                        try:
+                            _all_cv2_cov.append(float(_row_cov["secondary_cv"]))
+                        except (KeyError, ValueError):
+                            pass
+            except Exception as _exc_cov:
+                print(f"    WARNING: pilot coverage check could not read samples.csv: {_exc_cov}")
+
+            # CV1 coverage: compare sampled span to achievable range from boundary pull.
+            if primary_cv_is_contacts(args):
+                _cv1_lo = float(getattr(args, "contact_adaptive_min", 0.0) or 0.0)
+                _cv1_hi = float(getattr(args, "contact_adaptive_max", 0.80) or 0.80)
+            else:
+                _cv1_lo = float(getattr(args, "adaptive_min_a", getattr(args, "windows_min_a", 0.0)) or 0.0)
+                _cv1_hi = float(getattr(args, "adaptive_max_a", getattr(args, "windows_max_a", 30.0)) or 30.0)
+            _cv1_expected_span = max(1e-9, _cv1_hi - _cv1_lo)
+            if _all_cv1_cov:
+                _cv1_span = max(_all_cv1_cov) - min(_all_cv1_cov)
+                _cv1_frac = _cv1_span / _cv1_expected_span
+                _cv1_thr = float(getattr(args, "pilot_min_cv1_coverage", 0.60) or 0.60)
+                _pilot_coverage.update({
+                    "cv1_sampled_min": min(_all_cv1_cov),
+                    "cv1_sampled_max": max(_all_cv1_cov),
+                    "cv1_expected_min": _cv1_lo,
+                    "cv1_expected_max": _cv1_hi,
+                    "cv1_coverage_fraction": _cv1_frac,
+                    "cv1_coverage_threshold": _cv1_thr,
+                })
+                if _cv1_frac < _cv1_thr:
+                    _pilot_cv1_blocked = True
+                    print(
+                        f"    WARNING [coverage gate]: CV1 pilot coverage "
+                        f"{_cv1_frac:.1%} < {_cv1_thr:.0%} of achievable range "
+                        f"[{_cv1_lo:.4f}, {_cv1_hi:.4f}] "
+                        f"(sampled [{min(_all_cv1_cov):.4f}, {max(_all_cv1_cov):.4f}]). "
+                        f"Ensemble may be trapped — early-stop blocked."
+                    )
+
+            # CV2 coverage: compare sampled span to the secondary-CV center range
+            # that was ACTIVE during this pilot (saved at loop top before proposal update).
+            if _all_cv2_cov and _loop_pilot_secondary_centers and len(_loop_pilot_secondary_centers) >= 2:
+                _cv2_lo = float(min(_loop_pilot_secondary_centers))
+                _cv2_hi = float(max(_loop_pilot_secondary_centers))
+                _cv2_expected_span = max(1e-9, _cv2_hi - _cv2_lo)
+                _cv2_span = max(_all_cv2_cov) - min(_all_cv2_cov)
+                _cv2_frac = _cv2_span / _cv2_expected_span
+                _cv2_thr = float(getattr(args, "pilot_min_cv2_coverage", 0.70) or 0.70)
+                _pilot_coverage.update({
+                    "cv2_sampled_min": min(_all_cv2_cov),
+                    "cv2_sampled_max": max(_all_cv2_cov),
+                    "cv2_expected_min": _cv2_lo,
+                    "cv2_expected_max": _cv2_hi,
+                    "cv2_coverage_fraction": _cv2_frac,
+                    "cv2_coverage_threshold": _cv2_thr,
+                })
+                if _cv2_frac < _cv2_thr:
+                    _pilot_cv2_blocked = True
+                    print(
+                        f"    WARNING [coverage gate]: CV2 pilot coverage "
+                        f"{_cv2_frac:.1%} < {_cv2_thr:.0%} of secondary CV range "
+                        f"[{_cv2_lo:.4f}, {_cv2_hi:.4f}] "
+                        f"(sampled [{min(_all_cv2_cov):.4f}, {max(_all_cv2_cov):.4f}]). "
+                        f"Ramachandran space under-sampled — early-stop blocked."
+                    )
+            if _pilot_coverage:
+                print(
+                    f"    Pilot coverage: CV1={_pilot_coverage.get('cv1_coverage_fraction', float('nan')):.1%}"
+                    + (f"  CV2={_pilot_coverage.get('cv2_coverage_fraction', float('nan')):.1%}" if "cv2_coverage_fraction" in _pilot_coverage else "")
+                )
+        # ──────────────────────────────────────────────────────────────────────
+
         cleanup_manifest = cleanup_adaptive_feedback_pilot_directory(round_dir)
         print(f"    Discarded adaptive pilot MD data; kept diagnostics/proposal in {round_dir}")
         driver_summary["rounds"].append({
@@ -3149,6 +3240,7 @@ def run_adaptive_feedback_auto_loop(args, out_dir: Path, openmm, app, unit, forc
             "adaptive_feedback_sparse_windows_2d_csv_for_next_pilot_or_final": str(current_windows_2d_csv) if current_windows_2d_csv is not None else "",
             "adaptive_feedback_sparse_source_round": current_windows_2d_source_round,
             "cleanup_manifest": cleanup_manifest,
+            "pilot_cv_coverage": _pilot_coverage,
         })
         driver_summary["latest_proposed_centers_A"] = current_centers
         driver_summary["latest_proposed_k_kcal_mol_A2"] = current_k
@@ -3161,12 +3253,27 @@ def run_adaptive_feedback_auto_loop(args, out_dir: Path, openmm, app, unit, forc
         write_json(out_dir / "adaptive_feedback_driver_summary.json", _json_ready(driver_summary))
         adaptive_workflow_done_so_far += int(current_pilot_steps)
         if bool(proposal.get("converged", False)) and round_no < n_rounds:
-            driver_summary["stopped_early"] = True
-            driver_summary["stopped_after_round"] = int(round_no)
-            driver_summary["early_stop_reason"] = "adaptive feedback converged by score/overlap/exchange/change criteria"
-            write_json(out_dir / "adaptive_feedback_driver_summary.json", _json_ready(driver_summary))
-            print(f"    Adaptive-feedback converged after round {round_no}; skipping remaining pilot rounds.")
-            break
+            # Gate 1: enforce minimum pilot rounds before any early-stop.
+            _min_rounds_es = int(getattr(args, "adaptive_feedback_min_rounds", 2) or 2)
+            # Gate 2: CV coverage — block if CV1 or CV2 under-sampled this round.
+            _es_block_reason: str = ""
+            if round_no < _min_rounds_es:
+                _es_block_reason = f"min_rounds={_min_rounds_es} not yet reached (round {round_no})"
+            elif _pilot_cv1_blocked or _pilot_cv2_blocked:
+                _blocked_axes = ", ".join(filter(None, [
+                    "CV1" if _pilot_cv1_blocked else "",
+                    "CV2" if _pilot_cv2_blocked else "",
+                ]))
+                _es_block_reason = f"coverage gate on {_blocked_axes}"
+            if _es_block_reason:
+                print(f"    Early-stop proposed but blocked ({_es_block_reason}); continuing pilots.")
+            else:
+                driver_summary["stopped_early"] = True
+                driver_summary["stopped_after_round"] = int(round_no)
+                driver_summary["early_stop_reason"] = "adaptive feedback converged by score/overlap/exchange/change criteria"
+                write_json(out_dir / "adaptive_feedback_driver_summary.json", _json_ready(driver_summary))
+                print(f"    Adaptive-feedback converged after round {round_no}; skipping remaining pilot rounds.")
+                break
 
     if skip_final_production:
         driver_summary["final_production_completed"] = False

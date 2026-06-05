@@ -2427,6 +2427,38 @@ def run_shared_gamd_setup_article_a(
     print(f"    Shared GaMD globals written to {out_dir / 'shared_gamd_setup_globals.json'}")
     if shared_context_checkpoint is not None:
         print(f"    Shared GaMD Context checkpoint written to {out_dir / 'shared_gamd_setup_context.chk'}")
+    # Post-equil sigma0 diagnostic: compare configured sigma0 to the actual
+    # potential-energy spread (sigmaV) accumulated during calibration/equil.
+    # sigmaV >> sigma0 → high anharmonicity, cumulant2 reweighting less reliable.
+    try:
+        _ig = shared_globals_interesting
+        _sig0_kj = float(_ig.get("sigma0_Total", 0.0) or 0.0)
+        _sigV_kj = float(_ig.get("sigmaV_Total", 0.0) or 0.0)
+        _kj_to_kcal = 1.0 / 4.184
+        if _sig0_kj > 0.0 and _sigV_kj > 0.0:
+            _ratio = _sigV_kj / _sig0_kj
+            _sig0_kcal = _sig0_kj * _kj_to_kcal
+            _sigV_kcal = _sigV_kj * _kj_to_kcal
+            print(
+                f"    [GaMD sigma0 diagnostic] sigma0={_sig0_kcal:.2f} kcal/mol  "
+                f"sigmaV(total)={_sigV_kcal:.2f} kcal/mol  ratio={_ratio:.2f}"
+            )
+            if _ratio > 3.0:
+                _rec_kcal = _sigV_kcal * 0.40
+                print(
+                    f"    WARNING: sigmaV/sigma0 = {_ratio:.1f} > 3 — boost likely anharmonic. "
+                    f"Consider sigma0p/sigma0d ≤ {_rec_kcal:.1f} kcal/mol "
+                    f"(= 0.4 × sigmaV) to reduce anharmonicity score."
+                )
+            elif _ratio > 2.0:
+                print(
+                    f"    NOTE: sigmaV/sigma0 = {_ratio:.1f}; moderate anharmonicity expected. "
+                    f"cumulant2 reweighting is appropriate."
+                )
+            else:
+                print(f"    sigma0 calibration OK (sigmaV/sigma0 = {_ratio:.1f}).")
+    except Exception:
+        pass
     release_openmm_contexts(shared_sim, shared_integrator, shared_system)
     return shared_globals_all, shared_globals_interesting, int(calib_steps), shared_context_checkpoint
 

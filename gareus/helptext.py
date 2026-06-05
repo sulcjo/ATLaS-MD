@@ -726,9 +726,6 @@ Useful controls (v2.0 names):
     --ap-resume                        resume from state_registry.json
     --ap-write-mbar-inputs             post-hoc union-state MBAR arrays
     --ap-run-mbar                      run PyMBAR after final
-    --ap-topup-k-boost / --no-...      tighten K for leaking topup windows (default: on)
-    --ap-topup-k-sigma-ratio           trigger ratio realized-σ/planned-σ (default 1.5)
-    --ap-topup-k-max-boost-factor      cap on K increase as multiple of current K (default 4)
 
 The runtime pool is aggregate MD, not per-replica trajectory length:
 
@@ -1111,9 +1108,6 @@ Important controls:
     --ap-resume                        (resume from state_registry.json)
     --ap-target-overlap / --ap-min-exchange
                                        (per-epoch edge health thresholds)
-    --ap-topup-k-boost / --no-...      (tighten K for leaking topup windows; on by default)
-    --ap-topup-k-sigma-ratio           (trigger: realized-σ/planned-σ threshold; default 1.5)
-    --ap-topup-k-max-boost-factor      (cap K increase as multiple of current K; default 4)
     --ap-write-mbar-inputs / --ap-run-mbar
                                        (post-hoc union-state MBAR outputs)
 

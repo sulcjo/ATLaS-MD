@@ -272,13 +272,6 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--ap-max-new-windows", type=int, default=4)
     p.add_argument("--ap-retire-converged", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--ap-gamd-boost-sd-warn", type=float, default=6.0)
-    p.add_argument("--ap-topup-k-boost", action=argparse.BooleanOptionalAction, default=True,
-                   help="Tighten umbrella K for leaking topup windows (realized σ > threshold × planned σ). "
-                        "Only increases K; gated on realized-vs-planned width ratio to avoid reducing overlap.")
-    p.add_argument("--ap-topup-k-sigma-ratio", type=float, default=1.5,
-                   help="Trigger K boost when realized CV σ > this × planned σ = sqrt(RT/K). Default 1.5.")
-    p.add_argument("--ap-topup-k-max-boost-factor", type=float, default=4.0,
-                   help="Cap K boost at this multiple of the current K. Default 4.0.")
     p.add_argument("--ap-write-reports", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--md-budget-ns", type=float, default=0.0,
                    help="Max aggregate MD simulation time in ns. 0 disables.")
@@ -708,9 +701,6 @@ def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
     args.adaptive_production_max_new_windows_per_epoch = args.ap_max_new_windows
     args.adaptive_production_retire_converged = args.ap_retire_converged
     args.adaptive_production_max_gamd_boost_sd_kcal_mol = args.ap_gamd_boost_sd_warn
-    args.adaptive_production_topup_k_boost = args.ap_topup_k_boost
-    args.adaptive_production_topup_k_sigma_ratio = args.ap_topup_k_sigma_ratio
-    args.adaptive_production_topup_k_max_boost_factor = args.ap_topup_k_max_boost_factor
     args.adaptive_production_write_action_reports = args.ap_write_reports
     args.adaptive_production_total_md_pool_ns = args.md_budget_ns
     args.adaptive_production_final_pool_fraction = args.ap_final_pool_fraction

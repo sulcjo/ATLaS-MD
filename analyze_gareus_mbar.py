@@ -191,6 +191,7 @@ def prod_dir_of(path: Path) -> Path:
     ap=path/'adaptive_production'
     if (ap/'adaptive_union_mbar.npz').exists(): return ap
     if _has_adaptive_parquet(path): return ap
+    if _has_epoch_csv_layout(ap): return ap
     raise FileNotFoundError(f'No Parquet samples/, analysis_arrays.npz, or samples.csv in {path} or {fp}; no adaptive_union_mbar.npz or epoch Parquet data in {ap}')
 
 def read_windows(path: Path):
@@ -507,6 +508,25 @@ def load_npz(prod: Path) -> Data:
     meta['umbrella_window_rows']=rows
     return clean(Data(prod,prod/'pmf_analysis',cv,cv2,rg,window,replica,step,u,centers,ks,beta,temp,boost,pot,str(prod/'analysis_arrays.npz'),meta))
 
+def _find_adaptive_final_run_dirs(ap_dir: Path) -> list:
+    """Return list of Path for each CSV-bearing dir under adaptive_production/final/ and final_extension_*/."""
+    sources = []
+    for top in sorted(ap_dir.iterdir()):
+        if not top.is_dir():
+            continue
+        if top.name != 'final' and not top.name.startswith('final_extension_'):
+            continue
+        if (top / 'samples.csv').exists():
+            sources.append(top)
+        for sub in sorted(top.iterdir()):
+            if not sub.is_dir():
+                continue
+            if sub.name == 'baseline' or sub.name.startswith('topup_'):
+                if (sub / 'samples.csv').exists():
+                    sources.append(sub)
+    return sources
+
+
 def load_union_npz(ap_dir: Path) -> Data:
     """Load MBAR inputs from adaptive_union_mbar.npz (adaptive-production runs where final_production/ not yet complete)."""
     npz_path = ap_dir / 'adaptive_union_mbar.npz'
@@ -541,6 +561,79 @@ def load_union_npz(ap_dir: Path) -> Data:
                 meta['umbrella_window_rows'] = list(csv.DictReader(fh))
         except Exception:
             pass
+    # Read per-sample step, boost, replica, and source info from companion CSV when present.
+    samples_csv = ap_dir / 'adaptive_union_mbar.samples.csv'
+    run_dirs = _find_adaptive_final_run_dirs(ap_dir)
+    if samples_csv.exists() and samples_csv.stat().st_size > 0:
+        try:
+            steps_list, boost_list, src_list = [], [], []
+            src_label_list: list = []
+            src_dir_to_idx: dict = {}
+            unique_src_labels: list = []
+            with samples_csv.open(newline='') as fh:
+                for row in csv.DictReader(fh):
+                    try: steps_list.append(int(float(row.get('step', 0) or 0)))
+                    except Exception: steps_list.append(len(steps_list))
+                    try: boost_list.append(float(row.get('gamd_boost_total_kj_mol', '') or 'nan'))
+                    except Exception: boost_list.append(float('nan'))
+                    src_label = row.get('source', '')
+                    if src_label not in src_dir_to_idx:
+                        src_dir_to_idx[src_label] = len(unique_src_labels)
+                        unique_src_labels.append(src_label)
+                    src_list.append(src_dir_to_idx[src_label])
+                    src_label_list.append(src_label)
+            if len(steps_list) == cv.size:
+                step = np.asarray(steps_list, dtype=int)
+                boost_kj = np.asarray(boost_list, dtype=np.float64)
+                meta['_epoch_source'] = src_list
+                # Build (source_label, step, epoch_window) → hardware replica lookup
+                # from per-source samples.csv files so trajectory frame matching works.
+                label_to_path: dict = {}
+                for rd in run_dirs:
+                    # Derive source label: relative path from adaptive_production root (e.g. "final/baseline")
+                    try:
+                        rel = Path(rd).relative_to(ap_dir)
+                        label_to_path[str(rel)] = Path(rd)
+                    except Exception:
+                        pass
+                rep_lookup: dict = {}  # (src_label, step, epoch_window) → replica
+                src_win_list_for_lookup = []
+                for i, row in enumerate([]):
+                    pass  # placeholder; we re-read the union CSV below for window column
+                # Re-read union CSV for sampled_epoch_window; annotate with replica from source CSVs
+                epoch_win_list = []
+                try:
+                    with samples_csv.open(newline='') as fh:
+                        for row in csv.DictReader(fh):
+                            try: epoch_win_list.append(int(float(row.get('sampled_epoch_window', 0) or 0)))
+                            except Exception: epoch_win_list.append(0)
+                except Exception:
+                    epoch_win_list = [0] * len(steps_list)
+                for src_label, src_path in label_to_path.items():
+                    src_csv = src_path / 'samples.csv'
+                    if not src_csv.exists():
+                        continue
+                    try:
+                        with src_csv.open(newline='') as fh:
+                            for row in csv.DictReader(fh):
+                                try:
+                                    s = int(float(row.get('step', 0) or 0))
+                                    w = int(float(row.get('window', 0) or 0))
+                                    r = int(float(row.get('replica', 0) or 0))
+                                    rep_lookup[(src_label, s, w)] = r
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                rep_list = []
+                for i, (lbl, s, w) in enumerate(zip(src_label_list, steps_list, epoch_win_list)):
+                    rep_list.append(rep_lookup.get((lbl, s, w), w))
+                replica = np.asarray(rep_list, dtype=int)
+        except Exception:
+            pass
+    # Populate adaptive_epoch_run_dirs so _prepare_adaptive_merged_traj_dir can find trajectories.
+    if run_dirs:
+        meta['adaptive_epoch_run_dirs'] = [str(d) for d in run_dirs]
     return clean(Data(root, root / 'pmf_analysis', cv, cv2, rg, window, replica, step, u_nk, centers, k_kcal, beta, temp, boost_kj, None, str(npz_path), meta))
 
 
@@ -670,6 +763,143 @@ def _find_adaptive_epoch_dirs(adaptive_dir: Path) -> list:
             if wmap.exists():
                 result.append((baseline, wmap))
     return result
+
+
+def _find_adaptive_epoch_csv_sources(ap: Path) -> list:
+    """Return list of Path for each CSV-bearing dir under adaptive_production/epoch_NNN/."""
+    sources = []
+    for epoch_dir in sorted(ap.glob('epoch_[0-9][0-9][0-9]')):
+        if not epoch_dir.is_dir():
+            continue
+        if (epoch_dir / 'samples.csv').exists():
+            sources.append(epoch_dir)
+        for sub in sorted(epoch_dir.iterdir()):
+            if not sub.is_dir():
+                continue
+            if sub.name == 'baseline' or sub.name.startswith('topup_'):
+                if (sub / 'samples.csv').exists():
+                    sources.append(sub)
+    return sources
+
+
+def _has_epoch_csv_layout(ap: Path) -> bool:
+    return bool(_find_adaptive_epoch_csv_sources(ap))
+
+
+def load_epoch_csv_adaptive(ap: Path) -> Data:
+    """Load all epoch/baseline/topup samples.csv files, union windows, rebuild N×K bias matrix."""
+    sources = _find_adaptive_epoch_csv_sources(ap)
+    if not sources:
+        raise FileNotFoundError(f'No epoch CSV sources found under {ap}')
+    root = ap.parent
+    meta: dict = {}
+    meta.update(rjson(root / 'run_args.json', {}))
+    meta.update(rjson(root / 'umbrella_pymbar_metadata.json', {}))
+    meta['source'] = 'epoch_csv_adaptive'
+
+    all_rows: list = []
+    for src_idx, src in enumerate(sources):
+        with (src / 'samples.csv').open(newline='') as fh:
+            for row in csv.DictReader(fh):
+                row['_src_idx'] = src_idx
+                all_rows.append(row)
+
+    if not all_rows:
+        raise ValueError(f'No sample rows found across {len(sources)} epoch CSV sources')
+
+    # Collect union window states keyed by (c_prim, k_prim, c_sec, k_sec)
+    # Use 8-sig-fig rounding to handle float noise
+    def _fkey(v, default=0.0):
+        try:
+            x = float(v)
+            return round(x, 8) if math.isfinite(x) else default
+        except Exception:
+            return default
+
+    state_key_to_idx: dict = {}
+    state_list: list = []  # list of (c_prim, k_prim, c_sec, k_sec)
+
+    def _row_state_key(row):
+        cp = _fkey(row.get('primary_cv_center', row.get('center_A', row.get('center', ''))))
+        kp = _fkey(row.get('primary_cv_k', row.get('k_kcal_mol_A2', row.get('k', ''))), 0.0)
+        cs = _fkey(row.get('secondary_cv_center', ''), float('nan'))
+        ks_ = _fkey(row.get('secondary_cv_k_kcal_mol', row.get('secondary_cv_k_kcal', '')), 0.0)
+        return (cp, kp, cs, ks_)
+
+    for row in all_rows:
+        key = _row_state_key(row)
+        if key not in state_key_to_idx:
+            state_key_to_idx[key] = len(state_list)
+            state_list.append(key)
+
+    K = len(state_list)
+    centers = np.asarray([s[0] for s in state_list], dtype=np.float64)
+    k_kcal = np.asarray([s[1] for s in state_list], dtype=np.float64)
+    sec_centers = np.asarray([s[2] for s in state_list], dtype=np.float64)
+    sec_ks = np.asarray([s[3] for s in state_list], dtype=np.float64)
+    has_secondary = np.any(np.isfinite(sec_centers) & (sec_ks != 0.0))
+
+    # Extract sample arrays
+    cv_list, cv2_list, rg_list, win_list, rep_list, step_list, boost_list, pot_list = [], [], [], [], [], [], [], []
+    beta_sample = []
+    src_idx_list = []
+    for row in all_rows:
+        cv_val = row.get('cv_A', row.get('primary_cv_value', ''))
+        try:
+            cv_list.append(float(cv_val))
+        except Exception:
+            continue
+        try: cv2_list.append(float(row.get('secondary_cv', '') or 'nan'))
+        except Exception: cv2_list.append(float('nan'))
+        try: rg_list.append(float(row.get('rg_A', '') or row.get('radius_gyration_A', '') or 'nan'))
+        except Exception: rg_list.append(float('nan'))
+        key = _row_state_key(row)
+        win_list.append(state_key_to_idx[key])
+        try: rep_list.append(int(float(row.get('replica', 0) or 0)))
+        except Exception: rep_list.append(0)
+        try: step_list.append(int(float(row.get('step', len(step_list)) or len(step_list))))
+        except Exception: step_list.append(len(step_list))
+        try: boost_list.append(float(row.get('gamd_boost_total_kj_mol', '') or 'nan'))
+        except Exception: boost_list.append(float('nan'))
+        try: pot_list.append(float(row.get('potential_kj_mol', '') or 'nan'))
+        except Exception: pot_list.append(float('nan'))
+        try: beta_sample.append(float(row.get('beta_1_over_kJ_mol', '') or 'nan'))
+        except Exception: beta_sample.append(float('nan'))
+        src_idx_list.append(int(row.get('_src_idx', 0)))
+
+    cv = np.asarray(cv_list, dtype=np.float64)
+    cv2 = np.asarray(cv2_list, dtype=np.float64)
+    rg = np.asarray(rg_list, dtype=np.float64)
+    window = np.asarray(win_list, dtype=int)
+    replica = np.asarray(rep_list, dtype=int)
+    step = np.asarray(step_list, dtype=int)
+    boost = np.asarray(boost_list, dtype=np.float64)
+    pot = np.asarray(pot_list, dtype=np.float64)
+    beta_arr = np.asarray(beta_sample, dtype=np.float64)
+    finite_betas = beta_arr[np.isfinite(beta_arr)]
+    if finite_betas.size:
+        beta = float(finite_betas[0])
+        temp = 1.0 / (K_B_KJ_PER_MOL_K * beta)
+    else:
+        temp, beta = infer_temp_beta(root, meta, None)
+
+    # Reconstruct full N×K bias matrix analytically
+    scale = beta * KJ_PER_KCAL
+    u_nk = np.empty((cv.size, K), dtype=np.float64)
+    for k in range(K):
+        total = 0.5 * float(k_kcal[k]) * (cv - float(centers[k])) ** 2
+        if has_secondary and np.isfinite(sec_centers[k]) and float(sec_ks[k]) != 0.0:
+            total = total + 0.5 * float(sec_ks[k]) * (cv2 - float(sec_centers[k])) ** 2
+        u_nk[:, k] = scale * total
+
+    meta['load_notes'] = [f'Loaded {cv.size} samples from {len(sources)} epoch CSV sources; union {K} windows.']
+    meta['umbrella_window_rows'] = [
+        {'center_A': str(centers[i]), 'k_kcal_mol_A2': str(k_kcal[i])} for i in range(K)
+    ]
+    meta['adaptive_epoch_run_dirs'] = [str(s) for s in sources]
+    meta['_epoch_source'] = src_idx_list
+    src_str = f'{sources[0]}/samples.csv ... {sources[-1]}/samples.csv'
+    return clean(Data(root, root / 'pmf_analysis', cv, cv2, rg, window, replica, step, u_nk, centers, k_kcal, beta, temp, boost, pot, src_str, meta))
 
 
 def load_parquet_adaptive_union(adaptive_dir: Path) -> Data:
@@ -1029,7 +1259,7 @@ def run_epoch_pmf_convergence(d: Data, args, bins: np.ndarray, selected: str,
         summary['converged'] = summary['converged_JS'] and summary['converged_RMSE']
     try:
         write_convergence_plots(conv_rows, pmf_rows, [summary] if summary else [],
-                                out, args, warnings=[])
+                                out, args, warnings=[], epoch_annotations=_epoch_source_annotations(d))
     except Exception:
         pass
     wjson(out / 'epoch_convergence_summary.json',
@@ -1128,6 +1358,14 @@ def clean(d: Data) -> Data:
     if d.potential_kj is not None and d.potential_kj.size==mask.size: d.potential_kj=d.potential_kj[mask]
     return d
 
+def _filter_epoch_source(d: Data, keep: np.ndarray) -> None:
+    """Filter d.meta['_epoch_source'] in-place to match the keep mask."""
+    src = d.meta.get('_epoch_source')
+    if src is not None and len(src) == keep.size:
+        arr = np.asarray(src, dtype=np.int64)
+        d.meta['_epoch_source'] = arr[keep].tolist()
+
+
 def _skip_first_n_frames(d: Data, n: int) -> Data:
     """Drop first n samples per replica (sorted by step) for equilibration burn-in."""
     keep = np.ones(d.cv.size, dtype=bool)
@@ -1140,6 +1378,7 @@ def _skip_first_n_frames(d: Data, n: int) -> Data:
     d.u_nk=d.u_nk[keep]; d.boost_kj=d.boost_kj[keep]
     if d.potential_kj is not None and d.potential_kj.size==keep.size:
         d.potential_kj=d.potential_kj[keep]
+    _filter_epoch_source(d, keep)
     return d
 
 
@@ -1171,6 +1410,7 @@ def _apply_analysis_stride(d: Data, stride: int, offset: int = 0) -> Data:
     d.u_nk=d.u_nk[keep]; d.boost_kj=d.boost_kj[keep]
     if d.potential_kj is not None and d.potential_kj.size==keep.size:
         d.potential_kj=d.potential_kj[keep]
+    _filter_epoch_source(d, keep)
     d.meta.setdefault('load_notes',[]).append(f'Applied analysis stride {stride} with offset {offset}: kept {int(d.cv.size)}/{before} samples.')
     d.meta['analysis_stride']=int(stride)
     d.meta['analysis_stride_offset']=int(offset)
@@ -1184,8 +1424,10 @@ def load_data(inp: Path, out: Optional[Path], source: str = 'auto') -> Data:
             d = load_parquet_adaptive_union(prod)
         elif (prod / 'adaptive_union_mbar.npz').exists():
             d = load_union_npz(prod)
+        elif _has_epoch_csv_layout(prod):
+            d = load_epoch_csv_adaptive(prod)
         else:
-            raise FileNotFoundError(f'adaptive_production/ has neither epoch Parquet data nor adaptive_union_mbar.npz in {prod}')
+            raise FileNotFoundError(f'adaptive_production/ has neither epoch Parquet data nor adaptive_union_mbar.npz nor epoch CSV layout in {prod}')
         if out is not None: d.out_dir = Path(out)
         return d
     requested=str(source or 'auto').strip().lower()
@@ -2475,6 +2717,72 @@ def _compute_basin_populations(prob: np.ndarray, basins: list) -> list:
     return [float(np.sum(prob[b['left_bin']:b['right_bin']+1])) for b in basins]
 
 
+def _epoch_source_annotations(d: 'Data') -> list:
+    """Return [(short_label, frac_end, color), ...] sorted by frac_end for convergence plot markers.
+
+    Each source (baseline/topup/epoch) contributes samples with steps up to some max.
+    frac_end = fraction of all samples (in step-sorted order) at which this source's
+    last sample falls, i.e. count(d.step <= max_step_of_source) / N.
+    """
+    src_meta = d.meta.get('_epoch_source')
+    if not src_meta or len(src_meta) != d.step.size:
+        return []
+    src = np.asarray(src_meta, dtype=np.int64)
+    N = d.step.size
+    if N == 0:
+        return []
+    # Map source index → label using adaptive_epoch_run_dirs or samples source labels
+    run_dirs = d.meta.get('adaptive_epoch_run_dirs', [])
+    src_labels = []
+    for rd in run_dirs:
+        p = Path(rd)
+        # Strip common prefix paths to get short label
+        for prefix in ('adaptive_production/', 'final/', 'epoch_'):
+            name = str(p.name)
+            parent = str(p.parent.name)
+            if parent in ('baseline', 'adaptive_production') or parent.startswith('epoch_'):
+                label = f'{parent}/{name}' if parent != 'adaptive_production' else name
+            else:
+                label = f'{parent}/{name}'
+            break
+        # Shorten topup labels: topup_001_658000 → topup@658k
+        import re as _re
+        label = _re.sub(r'topup_(\d+)_(\d+)', lambda m: f'topup_{m.group(1)}@{int(m.group(2))//1000}k', label)
+        src_labels.append(label)
+
+    if not src_labels:
+        return []
+
+    # Color palette
+    colors = ['#e41a1c', '#377eb8', '#4daf4a', '#984ea3', '#ff7f00', '#a65628', '#f781bf', '#999999']
+    step_sorted_order = np.argsort(d.step, kind='stable')
+    sorted_src = src[step_sorted_order]
+    result = []
+    for s_idx, label in enumerate(src_labels):
+        positions = np.where(sorted_src == s_idx)[0]
+        if positions.size == 0:
+            continue
+        frac_end = float(positions[-1]) / max(1, N - 1)
+        color = colors[s_idx % len(colors)]
+        result.append((label, frac_end, color))
+    result.sort(key=lambda x: x[1])
+    return result
+
+
+def _add_epoch_annotations_to_axes(axes_list: list, epoch_annotations: list) -> None:
+    """Add vertical lines + labels for epoch/topup boundaries to a list of matplotlib Axes."""
+    if not epoch_annotations:
+        return
+    for ax in axes_list:
+        ylim = ax.get_ylim()
+        for i, (label, frac, color) in enumerate(epoch_annotations):
+            ax.axvline(frac, color=color, lw=0.9, ls='--', alpha=0.7)
+            # Label above the plot: alternate y to avoid overlap
+            y_pos = 0.97 - 0.09 * (i % 4)
+            ax.text(frac + 0.005, y_pos, label, transform=ax.get_xaxis_transform(),
+                    fontsize=5.5, color=color, va='top', rotation=90, alpha=0.85)
+
+
 def checkpoint_steps_from_data(step: np.ndarray, n_timepoints: int) -> np.ndarray:
     steps=np.asarray(step,dtype=np.int64)
     steps=steps[np.isfinite(steps)]
@@ -2506,7 +2814,7 @@ def _write_csv_rows(path: Path, rows: list[dict]) -> None:
         for r in rows:
             wr.writerow(r)
 
-def write_convergence_plots(conv_rows: list[dict], pmf_rows: list[dict], summary_rows: list[dict], out: Path, args, warnings: list[str]) -> list[str]:
+def write_convergence_plots(conv_rows: list[dict], pmf_rows: list[dict], summary_rows: list[dict], out: Path, args, warnings: list[str], *, epoch_annotations: list = None) -> list[str]:
     paths=[]
     try:
         import matplotlib.pyplot as plt
@@ -2516,6 +2824,7 @@ def write_convergence_plots(conv_rows: list[dict], pmf_rows: list[dict], summary
     out.mkdir(parents=True,exist_ok=True)
     if not conv_rows:
         return paths
+    ea = epoch_annotations or []
     x=np.asarray([r['frac_total'] for r in conv_rows],dtype=float)
     step=np.asarray([r['checkpoint_step'] for r in conv_rows],dtype=float)
     js=np.asarray([r.get('JS',np.nan) for r in conv_rows],dtype=float)
@@ -2535,6 +2844,7 @@ def write_convergence_plots(conv_rows: list[dict], pmf_rows: list[dict], summary
     axes[1].axhline(float(args.convergence_rmse_threshold),ls='--',lw=0.9,alpha=0.6)
     axes[1].set_xlabel('fraction of production samples'); axes[1].set_ylabel('PMF RMSE vs final (kcal/mol)'); axes[1].set_title('PMF RMSE convergence')
     axes[1].grid(True,alpha=0.25)
+    _add_epoch_annotations_to_axes(list(axes), ea)
     path=out/'js_rmse_vs_timepoints.png'; fig.savefig(path,dpi=200,bbox_inches='tight'); plt.close(fig); paths.append(str(path))
 
     fig,axes=plt.subplots(1,2,figsize=(13,5),constrained_layout=True)
@@ -2544,6 +2854,7 @@ def write_convergence_plots(conv_rows: list[dict], pmf_rows: list[dict], summary
     axes[1].plot(x,drmse,marker='o',lw=1.8)
     axes[1].set_xlabel('fraction of production samples'); axes[1].set_ylabel('delta RMSE from previous (kcal/mol)'); axes[1].set_title('Consecutive-checkpoint PMF change')
     axes[1].grid(True,alpha=0.25)
+    _add_epoch_annotations_to_axes(list(axes), ea)
     path=out/'delta_js_rmse_vs_timepoints.png'; fig.savefig(path,dpi=200,bbox_inches='tight'); plt.close(fig); paths.append(str(path))
 
     if np.any(np.isfinite(berr)):
@@ -2551,6 +2862,7 @@ def write_convergence_plots(conv_rows: list[dict], pmf_rows: list[dict], summary
         ax.plot(x,berr,marker='o',lw=1.8)
         ax.set_xlabel('fraction of production samples'); ax.set_ylabel('barrier error vs final (kcal/mol)'); ax.set_title('Barrier-height convergence')
         ax.grid(True,alpha=0.25)
+        _add_epoch_annotations_to_axes([ax], ea)
         path=out/'barrier_error_vs_timepoints.png'; fig.savefig(path,dpi=200,bbox_inches='tight'); plt.close(fig); paths.append(str(path))
 
     fig,axes=plt.subplots(1,2,figsize=(13,5),constrained_layout=True)
@@ -2560,6 +2872,7 @@ def write_convergence_plots(conv_rows: list[dict], pmf_rows: list[dict], summary
     axes[1].step(x,newbins,where='post',lw=1.8)
     axes[1].set_xlabel('fraction of production samples'); axes[1].set_ylabel('new bins since previous timepoint'); axes[1].set_title('New CV-bin discovery')
     axes[1].grid(True,alpha=0.25)
+    _add_epoch_annotations_to_axes(list(axes), ea)
     path=out/'coverage_saturation_vs_timepoints.png'; fig.savefig(path,dpi=200,bbox_inches='tight'); plt.close(fig); paths.append(str(path))
 
     # scorecard: same spirit as the XVG convergence tool, but single-system.
@@ -2592,7 +2905,9 @@ def write_convergence_plots(conv_rows: list[dict], pmf_rows: list[dict], summary
         ax.set_xlim(-0.02,1.05); ax.set_yticks([0]); ax.set_yticklabels(['current'])
         ax.set_xlabel('fraction of production samples'); ax.set_title('Convergence milestone timeline')
         for xv in (0.5,0.8,1.0): ax.axvline(xv,ls=':',lw=0.8,alpha=0.5)
-        ax.grid(True,axis='x',alpha=0.25); ax.legend(frameon=False,fontsize=8,loc='lower right')
+        _add_epoch_annotations_to_axes([ax], ea)
+        ax.grid(True,axis='x',alpha=0.25)
+        if ax.get_legend_handles_labels()[0]: ax.legend(frameon=False,fontsize=8,loc='lower right')
         path=out/'milestone_timeline.png'; fig.savefig(path,dpi=200,bbox_inches='tight'); plt.close(fig); paths.append(str(path))
 
     # PMF overlays at checkpoints
@@ -2663,7 +2978,7 @@ def _observable_pmf_from_logw(values: np.ndarray, logw: np.ndarray, boost: np.nd
     return pmf_from_weights(values,base_w,bins,kbt_kcal), {}, 'umbrella_only'
 
 
-def write_observable_convergence_plots(conv_rows: list[dict], pmf_rows: list[dict], summary_rows: list[dict], out: Path, args, warnings: list[str], *, prefix: str, metric_label: str, x_label: str, smooth_sigma: float = 0.0) -> list[str]:
+def write_observable_convergence_plots(conv_rows: list[dict], pmf_rows: list[dict], summary_rows: list[dict], out: Path, args, warnings: list[str], *, prefix: str, metric_label: str, x_label: str, smooth_sigma: float = 0.0, epoch_annotations: list = None) -> list[str]:
     """Generic convergence plots for any scalar observable PMF."""
     paths=[]
     try:
@@ -2674,6 +2989,7 @@ def write_observable_convergence_plots(conv_rows: list[dict], pmf_rows: list[dic
     out.mkdir(parents=True,exist_ok=True)
     if not conv_rows:
         return paths
+    ea = epoch_annotations or []
     x=np.asarray([r.get('frac_total',np.nan) for r in conv_rows],dtype=float)
     js=np.asarray([r.get('JS',np.nan) for r in conv_rows],dtype=float)
     rmse=np.asarray([r.get('RMSE_F_kcal_mol',np.nan) for r in conv_rows],dtype=float)
@@ -2692,6 +3008,7 @@ def write_observable_convergence_plots(conv_rows: list[dict], pmf_rows: list[dic
     axes[1].axhline(float(args.convergence_rmse_threshold),ls='--',lw=0.9,alpha=0.6)
     axes[1].set_xlabel('fraction of production samples'); axes[1].set_ylabel('PMF RMSE vs final (kcal/mol)'); axes[1].set_title(f'{metric_label} PMF RMSE convergence')
     axes[1].grid(True,alpha=0.25)
+    _add_epoch_annotations_to_axes(list(axes), ea)
     path=out/f'{prefix}_js_rmse_vs_timepoints.png'; fig.savefig(path,dpi=200,bbox_inches='tight'); plt.close(fig); paths.append(str(path))
 
     fig,axes=plt.subplots(1,2,figsize=(13,5),constrained_layout=True)
@@ -2701,6 +3018,7 @@ def write_observable_convergence_plots(conv_rows: list[dict], pmf_rows: list[dic
     axes[1].plot(x,drmse,marker='o',lw=1.8)
     axes[1].set_xlabel('fraction of production samples'); axes[1].set_ylabel('delta RMSE from previous (kcal/mol)'); axes[1].set_title(f'{metric_label} consecutive-checkpoint PMF change')
     axes[1].grid(True,alpha=0.25)
+    _add_epoch_annotations_to_axes(list(axes), ea)
     path=out/f'{prefix}_delta_js_rmse_vs_timepoints.png'; fig.savefig(path,dpi=200,bbox_inches='tight'); plt.close(fig); paths.append(str(path))
 
     if np.any(np.isfinite(berr)):
@@ -2708,6 +3026,7 @@ def write_observable_convergence_plots(conv_rows: list[dict], pmf_rows: list[dic
         ax.plot(x,berr,marker='o',lw=1.8)
         ax.set_xlabel('fraction of production samples'); ax.set_ylabel('barrier error vs final (kcal/mol)'); ax.set_title(f'{metric_label} barrier-height convergence')
         ax.grid(True,alpha=0.25)
+        _add_epoch_annotations_to_axes([ax], ea)
         path=out/f'{prefix}_barrier_error_vs_timepoints.png'; fig.savefig(path,dpi=200,bbox_inches='tight'); plt.close(fig); paths.append(str(path))
 
     fig,axes=plt.subplots(1,2,figsize=(13,5),constrained_layout=True)
@@ -2717,6 +3036,7 @@ def write_observable_convergence_plots(conv_rows: list[dict], pmf_rows: list[dic
     axes[1].step(x,newbins,where='post',lw=1.8)
     axes[1].set_xlabel('fraction of production samples'); axes[1].set_ylabel('new bins since previous timepoint'); axes[1].set_title(f'{metric_label} new-bin discovery')
     axes[1].grid(True,alpha=0.25)
+    _add_epoch_annotations_to_axes(list(axes), ea)
     path=out/f'{prefix}_coverage_saturation_vs_timepoints.png'; fig.savefig(path,dpi=200,bbox_inches='tight'); plt.close(fig); paths.append(str(path))
 
     if summary_rows:
@@ -2745,7 +3065,9 @@ def write_observable_convergence_plots(conv_rows: list[dict], pmf_rows: list[dic
         ax.set_xlim(-0.02,1.05); ax.set_yticks([0]); ax.set_yticklabels(['current'])
         ax.set_xlabel('fraction of production samples'); ax.set_title(f'{metric_label} convergence milestone timeline')
         for xv in (0.5,0.8,1.0): ax.axvline(xv,ls=':',lw=0.8,alpha=0.5)
-        ax.grid(True,axis='x',alpha=0.25); ax.legend(frameon=False,fontsize=8,loc='lower right')
+        _add_epoch_annotations_to_axes([ax], ea)
+        ax.grid(True,axis='x',alpha=0.25)
+        if ax.get_legend_handles_labels()[0]: ax.legend(frameon=False,fontsize=8,loc='lower right')
         path=out/f'{prefix}_milestone_timeline.png'; fig.savefig(path,dpi=200,bbox_inches='tight'); plt.close(fig); paths.append(str(path))
 
     if pmf_rows:
@@ -3041,7 +3363,7 @@ def run_observable_pmf_convergence(
         arr_js=np.asarray([r['JS'] for r in finite_rows],float); arr_rmse=np.asarray([r['RMSE_F_kcal_mol'] for r in finite_rows],float)
         arr_djs=np.asarray([r.get('delta_JS',np.nan) for r in finite_rows],float); arr_drmse=np.asarray([r.get('delta_RMSE_F_kcal_mol',np.nan) for r in finite_rows],float)
         frac=np.asarray([r['frac_total'] for r in finite_rows],float)
-        tail=frac>=0.5
+        tail=frac>=(0.75 if len(finite_rows)>=15 else 0.5)
         if not np.any(tail): tail=np.ones_like(frac,dtype=bool)
         def first_frac(mask):
             idx=np.where(mask)[0]
@@ -3061,7 +3383,18 @@ def run_observable_pmf_convergence(
     cwarnings=[]
     if finite_rows and not summary.get('converged_bool'):
         cwarnings.append(f'{metric_label} PMF convergence thresholds were not both satisfied in the tail and last checkpoint.')
-    plot_paths=write_observable_convergence_plots(conv_rows,pmf_rows,summary_rows,out,args,cwarnings,prefix=file_prefix,metric_label=metric_label,x_label=x_label,smooth_sigma=_eff_smooth(args,'pmf_smooth_sigma'))
+        _first_rmse_ok=summary.get('first_frac_RMSE_lt_threshold',float('nan'))
+        _last_n=finite_rows[-1].get('n_samples_total') or finite_rows[-1].get('n_samples')
+        if np.isfinite(_first_rmse_ok) and float(_first_rmse_ok)>0 and _last_n:
+            _ext_frac=max(0.0,(1.0/float(_first_rmse_ok))-1.0)
+            _ext_n=int(round(_ext_frac*float(_last_n)))
+            cwarnings.append(
+                f'Extension estimate (linear): ~{_ext_frac*100:.0f}% more samples '
+                f'(~{_ext_n:,} additional) based on RMSE first crossing threshold at '
+                f'{float(_first_rmse_ok)*100:.1f}% of data. Actual requirement may differ.'
+            )
+    ea = _epoch_source_annotations(d)
+    plot_paths=write_observable_convergence_plots(conv_rows,pmf_rows,summary_rows,out,args,cwarnings,prefix=file_prefix,metric_label=metric_label,x_label=x_label,smooth_sigma=_eff_smooth(args,'pmf_smooth_sigma'),epoch_annotations=ea)
     if summary:
         write_observable_convergence_report(out/report_name,summary,conv_rows,cwarnings,metric_label)
     basin_result: dict = {}
