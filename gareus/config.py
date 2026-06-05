@@ -68,6 +68,7 @@ CONFIG_IGNORED_TOP_LEVEL_KEYS: set[str] = {
     "conformer_generation",
     "genpept",
     "seed_generation",
+    "workflow_help",
 }
 
 # Nested config groups are for human readability only.  Leaf keys normally
@@ -87,6 +88,7 @@ CONFIG_KEY_ALIASES: Dict[str, str] = {
     # v2.0: aggressiveness, pilot_fraction, validation_steps, adaptive_rounds,
     #        production_steps, equil_steps are now canonical dests — aliases removed.
     "boost_type": "gamd_boost_type",
+    "adaptive_min_rounds": "adaptive_feedback_min_rounds",
 }
 
 

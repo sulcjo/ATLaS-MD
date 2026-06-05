@@ -181,6 +181,14 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                    help="Last pre-production validation steps. -1 = 1/10 of production-steps.")
     p.add_argument("--target-overlap", type=float, default=0.25,
                    help="Target neighboring-window CV histogram overlap.")
+    p.add_argument("--adaptive-feedback-min-rounds", type=int, default=2,
+                   help="Minimum adaptive-feedback rounds regardless of convergence criteria.")
+    p.add_argument("--pilot-min-cv1-coverage", type=float, default=0.60,
+                   help="Required CV1 coverage fraction across achievable [lo,hi] range before "
+                        "pilot is accepted.")
+    p.add_argument("--pilot-min-cv2-coverage", type=float, default=0.70,
+                   help="Required CV2 coverage fraction across secondary-CV center span before "
+                        "pilot is accepted.")
     p.add_argument("--sparse-2d", action=argparse.BooleanOptionalAction, default=True,
                    help="Enable sparse local 2D midpoint patches during adaptive-feedback.")
     p.add_argument("--max-2d-patches", type=int, default=12,
