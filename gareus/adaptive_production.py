@@ -3212,6 +3212,15 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                 "segment_name": "epoch",
                 "is_topup": False,
                 "topup_index": 0,
+                "prev_epochs": [
+                    {
+                        "epoch": int(s["epoch"]),
+                        "stop_adaptive": bool(s.get("convergence_gate", {}).get("stop_adaptive", False)),
+                        "n_issues": len(s.get("convergence_gate", {}).get("issues", [])),
+                        "n_active": int(s.get("n_active_after_epoch", 0)),
+                    }
+                    for s in epoch_summaries
+                ],
             })
             epoch_state_estimate = _estimate_active_state_count(args, registry, current_windows_csv)
             # Compute fair per-epoch target steps from pool when no explicit override.

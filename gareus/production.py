@@ -3792,12 +3792,14 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 "workflow_done_before": int(getattr(args, "adaptive_feedback_workflow_done_before", 0) or 0),
                 "workflow_total_steps": int(getattr(args, "adaptive_feedback_workflow_total_steps", prod_total) or prod_total),
                 "discard_after_diagnostics": True,
+                "prev_rounds": list(getattr(args, "adaptive_feedback_prev_rounds", []) or []),
             }
         elif bool(getattr(args, "adaptive_feedback_final_production", False)):
             adaptive_phase_info = {
                 "is_final": True,
                 "rounds": int(getattr(args, "adaptive_feedback_rounds_total", 0) or 0),
                 "target_overlap": float(getattr(args, "adaptive_feedback_target_overlap", 0.30) or 0.30),
+                "prev_rounds": list(getattr(args, "adaptive_feedback_prev_rounds", []) or []),
             }
         if adaptive_phase_info is not None:
             dashboard_info["adaptive_phase"] = adaptive_phase_info
@@ -3812,6 +3814,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     "segment_name": str(_api.get("segment_name", "")),
                     "is_topup": bool(_api.get("is_topup", False)),
                     "topup_index": int(_api.get("topup_index", 0)),
+                    "prev_epochs": list(_api.get("prev_epochs", [])),
                 }
                 dashboard_info["adaptive_phase"] = adaptive_phase_info
             else:

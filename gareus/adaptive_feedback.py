@@ -3027,6 +3027,16 @@ def run_adaptive_feedback_auto_loop(args, out_dir: Path, openmm, app, unit, forc
         round_args.adaptive_feedback_workflow_done_before = int(adaptive_workflow_done_so_far)
         round_args.adaptive_feedback_workflow_total_steps = int(adaptive_workflow_total_steps)
         round_args.adaptive_feedback_memory = adaptive_memory
+        round_args.adaptive_feedback_prev_rounds = [
+            {
+                "round": int(r["round"]),
+                "converged": bool(r.get("converged", False)),
+                "n_windows": int(r.get("new_n_windows", 0)),
+                "overlap_mean": float(r.get("overlap_mean", float("nan"))),
+                "exchange_frac": float(r.get("exchange_frac", float("nan"))),
+            }
+            for r in driver_summary.get("rounds", [])
+        ]
         if current_windows_2d_csv is not None:
             # Iterate sparse explicit 2D tables through later pilot rounds while
             # keeping the public workflow spelling as --window-mode adaptive-feedback.
@@ -3225,6 +3235,8 @@ def run_adaptive_feedback_auto_loop(args, out_dir: Path, openmm, app, unit, forc
 
         cleanup_manifest = cleanup_adaptive_feedback_pilot_directory(round_dir)
         print(f"    Discarded adaptive pilot MD data; kept diagnostics/proposal in {round_dir}")
+        _obs = proposal.get("observed_score", {}) if isinstance(proposal.get("observed_score"), dict) else {}
+        _exch = proposal.get("exchange_acceptance_fraction", float("nan"))
         driver_summary["rounds"].append({
             "round": int(round_no),
             "directory": str(round_dir),
@@ -3241,6 +3253,9 @@ def run_adaptive_feedback_auto_loop(args, out_dir: Path, openmm, app, unit, forc
             "adaptive_feedback_sparse_source_round": current_windows_2d_source_round,
             "cleanup_manifest": cleanup_manifest,
             "pilot_cv_coverage": _pilot_coverage,
+            "converged": bool(proposal.get("converged", False)),
+            "overlap_mean": float(_obs.get("overlap_mean", float("nan"))),
+            "exchange_frac": float(_exch) if _exch is not None else float("nan"),
         })
         driver_summary["latest_proposed_centers_A"] = current_centers
         driver_summary["latest_proposed_k_kcal_mol_A2"] = current_k

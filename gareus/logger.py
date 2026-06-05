@@ -55,19 +55,63 @@ from .cv import (
 from .windows import build_explicit_2d_neighbor_edges
 from .math_helpers import _hist_overlap
 
-def _compact_epoch_context(adaptive: dict) -> str:
-    """Short epoch/segment/topup label for the compact header line 3."""
+def _epoch_label_inline(adaptive: dict) -> str:
+    """Short colored epoch/pilot/final label for header line 1."""
     if not adaptive:
         return ""
     if adaptive.get("is_pilot"):
-        return color_text(f"pilot {adaptive.get('round','?')}/{adaptive.get('rounds','?')}", "yellow", bold=True)
+        return color_text(f"PILOT {adaptive.get('round','?')}/{adaptive.get('rounds','?')}", "yellow", bold=True)
     if adaptive.get("is_final"):
-        return color_text("FINAL production", "green", bold=True)
+        return color_text("FINAL", "green", bold=True)
     if adaptive.get("is_adaptive_epoch"):
         ei = int(adaptive.get("epoch_index", 0)) + 1
         et = adaptive.get("epoch_total", "?")
-        seg = "topup" if adaptive.get("is_topup") else "baseline"
-        return color_text(f"epoch {ei}/{et} {seg}", "magenta")
+        seg = " topup" if adaptive.get("is_topup") else ""
+        return color_text(f"EPOCH {ei}/{et}{seg}", "magenta", bold=True)
+    return ""
+
+
+def _compact_epoch_context(adaptive: dict) -> str:
+    """Prev-round/epoch convergence summary for header line 3."""
+    if not adaptive:
+        return ""
+
+    def _fmt_round(r: dict) -> str:
+        rn = r.get("round", "?")
+        conv = r.get("converged", False)
+        sym = "✓" if conv else "·"
+        col = "green" if conv else "yellow"
+        nw = r.get("n_windows", "?")
+        ov = r.get("overlap_mean", float("nan"))
+        try:
+            ov_f = float(ov)
+        except Exception:
+            ov_f = float("nan")
+        ov_txt = f" ov:{100*ov_f:.0f}%" if math.isfinite(ov_f) else ""
+        return color_text(f"r{rn}:{sym}", col) + f"({nw}w{ov_txt})"
+
+    def _fmt_epoch(ep: dict) -> str:
+        en = int(ep.get("epoch", 0)) + 1
+        stop = ep.get("stop_adaptive", False)
+        ni = int(ep.get("n_issues", 0))
+        sym = "✓" if stop else ("!" if ni > 0 else "·")
+        col = "green" if stop else ("yellow" if ni > 0 else "dim")
+        return color_text(f"e{en}:{sym}", col) + f"({ni}iss)"
+
+    if adaptive.get("is_pilot") or adaptive.get("is_final"):
+        prev = list(adaptive.get("prev_rounds", []) or [])
+        if not prev:
+            return ""
+        parts = [_fmt_round(r) for r in prev[-5:]]
+        return color_text("prev:", "dim") + " ".join(parts)
+
+    if adaptive.get("is_adaptive_epoch"):
+        prev = list(adaptive.get("prev_epochs", []) or [])
+        if not prev:
+            return ""
+        parts = [_fmt_epoch(ep) for ep in prev[-5:]]
+        return color_text("prev:", "dim") + " ".join(parts)
+
     return ""
 
 
@@ -1001,9 +1045,10 @@ class DistanceLogger:
             else:
                 extra = ""
 
+            cov_pct = int(100 * span_val / max_span) if max_span > 0 else 0
             line = (
                 f"  {rep_txt} w{win:02d}  {cv_str}  {delta_str}  {pe_str}  {b_str}"
-                f"  {spark}  {trail:<12}  {span_val:2d}/{max_span:2d}  {trips:2d}t{extra}  {status_txt}"
+                f"  {spark}  {trail:<12}  {cov_pct:3d}%  {trips:2d}t{extra}  {status_txt}"
             )
             rep_lines.append(line)
 
@@ -2076,39 +2121,35 @@ class DistanceLogger:
             lines.append(
                 color_text("NOW ", "cyan", bold=True)
                 + color_text("adaptive pilot", "yellow", bold=True)
-                + f" {round_txt}: short diagnostic sampling; these frames tune windows and are discarded before final PMF."
-            )
-            lines.append(
-                color_text("NEXT ", "cyan", bold=True)
-                + "adaptive feedback will look for weak overlap/exchange and add, shift, or remove windows."
+                + f" {round_txt} — diagnostic sampling, frames discarded after window tuning"
             )
         elif adaptive and adaptive.get("is_final"):
             lines.append(
                 color_text("NOW ", "cyan", bold=True)
-                + color_text("final clean production", "green", bold=True)
-                + ": these are the samples intended for MBAR/PMF after pilot repair."
+                + color_text("final production", "green", bold=True)
+                + " — MBAR/PMF samples"
             )
         elif "calibration" in phase_l:
             lines.append(
                 color_text("NOW ", "cyan", bold=True)
                 + color_text("GaMD calibration", "yellow", bold=True)
-                + ": collecting potential-energy statistics so the boost can be set safely."
+                + " — collecting PE statistics for boost"
             )
         elif "production" in phase_l or "gareus" in phase_l:
             lines.append(
                 color_text("NOW ", "cyan", bold=True)
                 + color_text("GaREUS production", "green", bold=True)
-                + ": replicas sample biased windows; exchanges test whether neighboring thermodynamic states overlap."
+                + " — replicas sampling biased windows"
             )
         else:
             lines.append(
                 color_text("NOW ", "cyan", bold=True)
-                + f"phase {color_text(str(phase), 'white', bold=True)}: running current workflow stage."
+                + f"phase {color_text(str(phase), 'white', bold=True)}"
             )
         if display_total:
             lines.append(
                 color_text("PROGRESS ", "cyan", bold=True)
-                + f"{int(display_step)}/{int(display_total)} steps in this segment; ETA is segment-local, not a promise from the gods."
+                + f"{int(display_step)}/{int(display_total)} steps this segment"
             )
         return lines
 
@@ -2177,13 +2218,13 @@ class DistanceLogger:
             body.append(
                 color_text("CV1 ", "magenta", bold=True)
                 + color_text(plabel, "cyan", bold=True)
-                + f" ({scheme}, {atom_sel}): low=few nonlocal residue contacts/extended; high=collapsed. {cv_triplet}; {center_txt}."
+                + f" ({scheme},{atom_sel})  {cv_triplet}  {center_txt}"
             )
         else:
             body.append(
                 color_text("CV1 ", "magenta", bold=True)
                 + color_text(plabel, "cyan", bold=True)
-                + f": end-to-end extension/compaction. {cv_triplet}; {center_txt}."
+                + f"  {cv_triplet}  {center_txt}"
             )
 
         sec_centers = [float(x) for x in info.get("secondary_cv_centers", []) if str(x) not in {"", "None", "nan"}]
@@ -2193,13 +2234,13 @@ class DistanceLogger:
                 body.append(
                     color_text("CV2 ", "magenta", bold=True)
                     + color_text("rama-regions", "cyan", bold=True)
-                    + ": -1 beta/extended, -0.5 PPII, 0 turn/coil, +0.5 right-alpha, +1 left-alpha."
+                    + "  β=-1  PPII=-0.5  coil=0  α=+0.5  α_L=+1"
                 )
             else:
                 body.append(
                     color_text("CV2 ", "magenta", bold=True)
                     + color_text(mode_name, "cyan", bold=True)
-                    + f": secondary-CV targets {min(sec_centers):+.2f}..{max(sec_centers):+.2f}."
+                    + f"  targets {min(sec_centers):+.2f}..{max(sec_centers):+.2f}"
                 )
 
         vals = []
@@ -2213,7 +2254,7 @@ class DistanceLogger:
             body.append(
                 color_text("COVERAGE ", "magenta", bold=True)
                 + color_text(f"sampled {100.0*ratio:.0f}%", cov_col, bold=cov_col != "green")
-                + f" of target CV1 span; narrow early pilots are normal, persistent red means windows/restraints need repair."
+                + f" of target CV1 span"
             )
 
         if isinstance(exchange_stats, dict):
@@ -2227,23 +2268,22 @@ class DistanceLogger:
                     color_text("EXCHANGE ", "magenta", bold=True)
                     + f"mode {mode}; "
                     + color_text(f"{100.0*frac:.1f}%", ex_col, bold=ex_col != "green")
-                    + f" accepted ({accepted}/{attempts}). Low exchange means poor overlap; adaptive feedback should patch it."
+                    + f" accepted ({accepted}/{attempts})"
                 )
             else:
                 body.append(
                     color_text("EXCHANGE ", "magenta", bold=True)
-                    + f"mode {mode}; no attempts yet. Wait for the first exchange interval before judging overlap."
+                    + f"mode {mode}; no attempts yet"
                 )
 
         health = str((decision or {}).get("health", "OK")).upper()
         hcol = "green" if health == "OK" else "yellow" if health == "WATCH" else "red"
         body.append(
             color_text("LEGEND ", "magenta", bold=True)
-            + color_text("green", "green", bold=True) + "=OK, "
-            + color_text("yellow", "yellow", bold=True) + "=watch, "
-            + color_text("red", "red", bold=True) + "=fix/inspect; shaded bars=history, colored dots=current replicas; health="
+            + color_text("green", "green", bold=True) + "=OK  "
+            + color_text("yellow", "yellow", bold=True) + "=watch  "
+            + color_text("red", "red", bold=True) + "=fix  health="
             + color_text(health, hcol, bold=True)
-            + "."
         )
         return _dashboard_full_width_panel(
             "What is happening",
@@ -2279,11 +2319,33 @@ class DistanceLogger:
         centers_a: list[float],
         eta_start_wall: float,
     ) -> list[str]:
-        """Compact 3-line (or 4-line with pilot banner) header replacing the old 7+ line block."""
+        """Compact 3-line (or 4-line with pilot/epoch banner) header."""
         pbar = make_progress_bar(frac, min(36, max(18, term_w // 5)))
+        epoch_label = _epoch_label_inline(adaptive)
+
+        # Workflow-total % (segment % is already shown via frac).
+        wf_frac_txt = ""
+        try:
+            if adaptive.get("is_pilot") or adaptive.get("is_final"):
+                wf_done = float(adaptive.get("workflow_done_before", 0.0)) + float(display_step)
+                wf_total = float(adaptive.get("workflow_total_steps", 0.0))
+                if wf_total > 0:
+                    wf_frac = max(0.0, min(1.0, wf_done / wf_total))
+                    wf_frac_txt = color_text("  total", "dim") + f" {100*wf_frac:.0f}%"
+            elif adaptive.get("is_adaptive_epoch"):
+                ei = int(adaptive.get("epoch_index", 0))
+                et = adaptive.get("epoch_total", None)
+                if et is not None and et != "?" and int(et) > 0:
+                    wf_frac = max(0.0, min(1.0, (ei + frac) / int(et)))
+                    wf_frac_txt = color_text("  total", "dim") + f" {100*wf_frac:.0f}%"
+        except Exception:
+            pass
+
         line1 = (
             color_text("GaREUS", "magenta", bold=True)
+            + (f"  {epoch_label}" if epoch_label else "")
             + f"  {phase}  [{pbar}]  {display_step}/{display_total or '?'}  {100*frac:5.1f}%"
+            + wf_frac_txt
             + f"  wall {format_duration(elapsed)}  eta {format_duration(eta)}"
             + perf_txt
         )
@@ -2317,28 +2379,11 @@ class DistanceLogger:
             vals_flat.extend(h)
         cov_w = max(12, min(48, term_w // 3))
         cov_bar = _coverage_bar(vals_flat, lo, hi, cov_w)
-        epoch_ctx = _compact_epoch_context(adaptive)
-        wf_ctx = ""
-        if adaptive.get("is_pilot"):
-            try:
-                wf_start = float(adaptive.get("workflow_start_wall", eta_start_wall))
-                wf_done = float(adaptive.get("workflow_done_before", 0.0)) + float(display_step)
-                wf_total = float(adaptive.get("workflow_total_steps", 0.0))
-                wf_frac = max(0.0, min(1.0, wf_done / wf_total)) if wf_total > 0 else 0.0
-                wf_elapsed = max(0.0, time.time() - wf_start)
-                wf_eta = (wf_elapsed * (1.0 - wf_frac) / wf_frac) if wf_frac > 0 else None
-                wf_ctx = (
-                    color_text("  workflow", "dim")
-                    + f" {100*wf_frac:.0f}% ({wf_done:.0f}/{wf_total:.0f} steps)"
-                    + color_text(f"  ETA {format_duration(wf_eta)}", "yellow")
-                )
-            except Exception:
-                pass
+        prev_ctx = _compact_epoch_context(adaptive)
         line3 = (
             color_text("cov", "dim")
             + f" {lo:.2f}–{hi:.2f}{unit_suffix} |{cov_bar}|"
-            + (f"  {epoch_ctx}" if epoch_ctx else "")
-            + wf_ctx
+            + (f"  {prev_ctx}" if prev_ctx else "")
         )
 
         if adaptive.get("is_pilot"):
