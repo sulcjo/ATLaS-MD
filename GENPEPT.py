@@ -2948,6 +2948,67 @@ def write_min_csv(path: Path, rows: list[MinResult]):
             writer.writerow(asdict(r))
 
 
+def _resume_csv_done(csv_path, min_rows: int = 1) -> bool:
+    """True if csv_path exists and has at least min_rows data rows (excluding header)."""
+    try:
+        p = Path(csv_path)
+        if not p.exists():
+            return False
+        with p.open() as f:
+            f.readline()  # skip header
+            for i, _ in enumerate(f, 1):
+                if i >= min_rows:
+                    return True
+        return False
+    except Exception:
+        return False
+
+
+def minresults_from_score_csv(score_csv, mode_override: str = "implicit") -> list:
+    """Reconstruct MinResult list from a completed minimization score CSV (used for --resume)."""
+    p = Path(score_csv)
+    if not p.exists():
+        return []
+    try:
+        import pandas as _pd
+        df = _pd.read_csv(p)
+    except Exception:
+        return []
+    out = []
+    for _, row in df.iterrows():
+        if not bool(row.get("success", False)):
+            continue
+        pdb = Path(str(row.get("output_pdb", "")))
+        if not pdb.exists():
+            continue
+        try:
+            out.append(MinResult(
+                seed_name=str(row.get("seed_name", pdb.stem)),
+                input_pdb=str(row.get("input_pdb", "")),
+                output_pdb=str(pdb),
+                success=True,
+                error="",
+                mode=str(row.get("mode", mode_override)),
+                n_atoms=int(row.get("n_atoms", 0)),
+                n_residues=int(row.get("n_residues", 0)),
+                n_waters=int(row.get("n_waters", 0)),
+                n_ions=int(row.get("n_ions", 0)),
+                initial_energy_kj_mol=float(row.get("initial_energy_kj_mol", float("nan"))),
+                minimized_energy_kj_mol=float(row.get("minimized_energy_kj_mol", float("nan"))),
+                energy_drop_kj_mol=float(row.get("energy_drop_kj_mol", float("nan"))),
+                max_force_kj_mol_nm=float(row.get("max_force_kj_mol_nm", float("nan"))),
+                rg_nm=float(row.get("rg_nm", float("nan"))),
+                end_to_end_nm=float(row.get("end_to_end_nm", float("nan"))),
+                contact_count=int(row.get("contact_count", 0)),
+                minimization_iterations_used=int(row.get("minimization_iterations_used", 0)),
+                minimization_rounds=int(row.get("minimization_rounds", 0)),
+                minimization_stop_reason=str(row.get("minimization_stop_reason", "")),
+            ))
+        except Exception:
+            continue
+    return out
+
+
 class ReusableImplicitMinimizer:
     """Reuse one implicit OpenMM System/Simulation across same-topology seed PDBs."""
     def __init__(self, cfg: MinConfig, out_min_dir: Path, system_dir: Path):
@@ -4914,6 +4975,22 @@ def run_adaptive_exploration_loop(args, combined_results: list[MinResult]):
         round_dir = base_dir / f"round_{round_i + 1:02d}"
         round_dir.mkdir(parents=True, exist_ok=True)
 
+        # Resume: skip rounds whose minimization CSV already exists.
+        if getattr(args, "resume", False):
+            score_csv_r = round_dir / "pca_frontier_implicit_minimization_scores.csv"
+            bh_csv_r = round_dir / "pca_frontier_basin_hop_minima.csv"
+            bh_expected = bool(getattr(args, "basin_hop", False)) and bool(getattr(args, "explore_bh", True))
+            if _resume_csv_done(score_csv_r):
+                prior = minresults_from_score_csv(score_csv_r)
+                bh_prior = minresults_from_hop_csv(args, bh_csv_r) if bh_expected and _resume_csv_done(bh_csv_r) else []
+                ui_message(f"[resume] PCA round {round_i + 1}: skipping — {len(prior)} min + {len(bh_prior)} BH results loaded from CSV.")
+                render_dashboard()
+                combined_results.extend(prior)
+                combined_results.extend(bh_prior)
+                added_all.extend(prior)
+                added_all.extend(bh_prior)
+                continue
+
         print_stage(f"Adaptive PCA frontier map round {round_i + 1}", phase_key="exploration", cycle_step="map", cycle_round=round_i + 1, cycle_total=max(0, int(args.explore_rounds)))
         model = fit_adaptive_pca_model(args, combined_results, round_dir / "frontier")
         grid = build_adaptive_target_grid(args, model["scores"], round_dir / "frontier")
@@ -6878,6 +6955,9 @@ def parse_args(argv=None):
     p.add_argument("--seq", default=None)
     p.add_argument("--out", default=None, type=Path)
     p.add_argument("--clean", action="store_true")
+    p.add_argument("--resume", action="store_true",
+                   help="Skip pipeline stages whose output CSVs already exist. "
+                        "Safe restart after any between-stage interruption.")
 
     p.add_argument("--n", type=int, default=10000)
     p.add_argument("--angle-sd", type=float, default=20.0)
@@ -8330,47 +8410,80 @@ def main(argv=None):
         ui_message(f"Adaptive explore: enabled | rounds={args.explore_rounds} proposals/round={args.explore_proposals} keep/round={args.explore_keep}{explore_bh_note}")
     render_dashboard()
 
-    candidate_dir = generate_candidates(args)
+    _resume = getattr(args, "resume", False)
+    _out = Path(args.out)
+
+    # ── Stage 1: Generation ────────────────────────────────────────────────────
+    _cand_csv = _out / "candidate_seeds.csv"
+    _cand_dir = _out / "candidate_seeds"
+    if _resume and _resume_csv_done(_cand_csv) and _cand_dir.is_dir() and any(_cand_dir.glob("*.pdb")):
+        ui_message(f"[resume] Generation: skipping — existing {_cand_dir.name}/ ({_cand_csv.stat().st_size // 1024} KB CSV)")
+        render_dashboard()
+        candidate_dir = _cand_dir
+    else:
+        candidate_dir = generate_candidates(args)
 
     if args.two_stage or args.implicit_only:
-        implicit_dir = Path(args.out) / "aa_implicit_minimized_pdbs"
-        if getattr(args, "tiered_implicit_min", False):
+        implicit_dir = _out / "aa_implicit_minimized_pdbs"
+        implicit_scores = _out / "implicit_minimization_scores.csv"
+
+        # ── Stage 2: Implicit minimization ────────────────────────────────────
+        if _resume and _resume_csv_done(implicit_scores):
+            ui_message(f"[resume] Implicit min: skipping — loading {implicit_scores.name}")
+            render_dashboard()
+            implicit_results = minresults_from_score_csv(implicit_scores)
+        elif getattr(args, "tiered_implicit_min", False):
             implicit_results = run_tiered_implicit_minimization(args, candidate_dir)
         else:
-            implicit_scores = Path(args.out) / "implicit_minimization_scores.csv"
             implicit_results = run_minimization_batch(args, candidate_dir, implicit_dir, "implicit", implicit_scores)
 
         combined_results = list(implicit_results)
-        archive_dir = Path(args.out) / "basin_archive"
-        print_stage("Initial basin archive / scoring", phase_key="exploration", cycle_step="archive")
-        ui_message("Archiving/scoring initial implicit minima before optional exploration stages.")
-        render_dashboard()
-        write_basin_archive(args, combined_results, archive_dir, prefix="initial_implicit")
+        archive_dir = _out / "basin_archive"
 
-        if args.basin_hop:
-            # Smart default: hop from minimized basins, not raw candidates. This avoids
-            # spending the midphase on structures that immediately collapse during minimization.
-            bh_source_dir = candidate_dir if getattr(args, "bh_from_candidates", False) else implicit_dir
-            bh_dir = run_basin_hopping(args, bh_source_dir)
-            combined_results.extend(minresults_from_hop_csv(args, Path(args.out) / "basin_hop_minima.csv"))
-            print_stage("Post-BH/MC basin archive / scoring", phase_key="exploration", cycle_step="archive")
-            ui_message("Archiving/scoring search pool after basin hopping / Monte Carlo endpoints.")
+        _bh_csv = _out / "basin_hop_minima.csv"
+        _bh_done = _resume and _resume_csv_done(_bh_csv)
+        if not _bh_done:
+            print_stage("Initial basin archive / scoring", phase_key="exploration", cycle_step="archive")
+            ui_message("Archiving/scoring initial implicit minima before optional exploration stages.")
             render_dashboard()
-            write_basin_archive(args, combined_results, archive_dir, prefix="post_basin_hop", hop_csv=Path(args.out) / "basin_hop_minima.csv")
+            write_basin_archive(args, combined_results, archive_dir, prefix="initial_implicit")
 
-        if args.nma_expand:
-            # Expand from basin-hop minima if present, otherwise from implicit minima.
-            source_dir = Path(args.out) / "basin_hop_minima" if args.basin_hop else implicit_dir
-            nma_dir = nma_expand_from_dir(args, source_dir)
-            if any(nma_dir.glob("*.pdb")):
-                nma_imp_dir = Path(args.out) / "aa_nma_implicit_minimized_pdbs"
-                nma_scores = Path(args.out) / "nma_implicit_minimization_scores.csv"
-                nma_results = run_minimization_batch(args, nma_dir, nma_imp_dir, "implicit", nma_scores, ui_phase_key="exploration", ui_cycle_step="minimize")
-                combined_results.extend(nma_results)
-                print_stage("Post-NMA basin archive / scoring", phase_key="exploration", cycle_step="archive")
-                ui_message("Archiving/scoring search pool after NMA-generated minima.")
+        # ── Stage 3: Basin hopping ─────────────────────────────────────────────
+        if args.basin_hop:
+            if _bh_done:
+                ui_message(f"[resume] Basin hopping: skipping — loading {_bh_csv.name}")
                 render_dashboard()
-                write_basin_archive(args, combined_results, archive_dir, prefix="post_nma")
+                combined_results.extend(minresults_from_hop_csv(args, _bh_csv))
+            else:
+                # Smart default: hop from minimized basins, not raw candidates. This avoids
+                # spending the midphase on structures that immediately collapse during minimization.
+                bh_source_dir = candidate_dir if getattr(args, "bh_from_candidates", False) else implicit_dir
+                bh_dir = run_basin_hopping(args, bh_source_dir)
+                combined_results.extend(minresults_from_hop_csv(args, _bh_csv))
+                print_stage("Post-BH/MC basin archive / scoring", phase_key="exploration", cycle_step="archive")
+                ui_message("Archiving/scoring search pool after basin hopping / Monte Carlo endpoints.")
+                render_dashboard()
+                write_basin_archive(args, combined_results, archive_dir, prefix="post_basin_hop", hop_csv=_bh_csv)
+
+        # ── Stage 4: NMA expand + minimize ────────────────────────────────────
+        if args.nma_expand:
+            nma_scores = _out / "nma_implicit_minimization_scores.csv"
+            if _resume and _resume_csv_done(nma_scores):
+                ui_message(f"[resume] NMA + minimize: skipping — loading {nma_scores.name}")
+                render_dashboard()
+                combined_results.extend(minresults_from_score_csv(nma_scores))
+            else:
+                # Expand from basin-hop minima if present, otherwise from implicit minima.
+                source_dir = _out / "basin_hop_minima" if args.basin_hop else implicit_dir
+                nma_dir = nma_expand_from_dir(args, source_dir)
+                if any(nma_dir.glob("*.pdb")):
+                    nma_imp_dir = _out / "aa_nma_implicit_minimized_pdbs"
+                    nma_results = run_minimization_batch(args, nma_dir, nma_imp_dir, "implicit", nma_scores, ui_phase_key="exploration", ui_cycle_step="minimize")
+                    combined_results.extend(nma_results)
+                    print_stage("Post-NMA basin archive / scoring", phase_key="exploration", cycle_step="archive")
+                    ui_message("Archiving/scoring search pool after NMA-generated minima.")
+                    render_dashboard()
+                    write_basin_archive(args, combined_results, archive_dir, prefix="post_nma")
 
         if args.explore_loop:
             run_adaptive_exploration_loop(args, combined_results)
