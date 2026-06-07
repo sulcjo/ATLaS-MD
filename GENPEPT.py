@@ -277,9 +277,13 @@ def _genpept_config_defaults(config_path, parser: argparse.ArgumentParser, stric
             + ", ".join(f"{x['dest']}<-{x['source']}" for x in inherited)
         )
 
+    _config_parent = Path(config_path).parent.resolve() if config_path else None
     for dest in list(flat):
-        if dest in _path_arg_dests(parser) and flat[dest] is not None and not isinstance(flat[dest], Path):
-            flat[dest] = Path(str(flat[dest]))
+        if dest in _path_arg_dests(parser) and flat[dest] is not None:
+            p_val = Path(str(flat[dest]))
+            if not p_val.is_absolute() and _config_parent is not None:
+                p_val = (_config_parent / p_val).resolve()
+            flat[dest] = p_val
 
     ignored_unknown = [] if strict else list(unknown)
     if ignored_unknown:
