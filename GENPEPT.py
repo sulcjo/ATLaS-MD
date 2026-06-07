@@ -2968,8 +2968,12 @@ def _resume_csv_done(csv_path, min_rows: int = 1) -> bool:
         return False
 
 
-def minresults_from_score_csv(score_csv, mode_override: str = "implicit") -> list:
-    """Reconstruct MinResult list from a completed minimization score CSV (used for --resume)."""
+def minresults_from_score_csv(score_csv, mode_override: str = "implicit", out_dir=None) -> list:
+    """Reconstruct MinResult list from a completed minimization score CSV (used for --resume).
+
+    out_dir: when stored paths are relative to a prior run's CWD, pass args.out so that
+    paths are also tried relative to out_dir.parent (the original run's working directory).
+    """
     p = Path(score_csv)
     if not p.exists():
         return []
@@ -2978,13 +2982,17 @@ def minresults_from_score_csv(score_csv, mode_override: str = "implicit") -> lis
         df = _pd.read_csv(p)
     except Exception:
         return []
+    _fallback_root = Path(out_dir).parent if out_dir is not None else None
     out = []
     for _, row in df.iterrows():
         if not bool(row.get("success", False)):
             continue
         pdb = Path(str(row.get("output_pdb", "")))
         if not pdb.exists():
-            continue
+            if _fallback_root is not None and not pdb.is_absolute():
+                pdb = _fallback_root / pdb
+            if not pdb.exists():
+                continue
         try:
             out.append(MinResult(
                 seed_name=str(row.get("seed_name", pdb.stem)),
@@ -4985,7 +4993,7 @@ def run_adaptive_exploration_loop(args, combined_results: list[MinResult]):
             bh_csv_r = round_dir / "pca_frontier_basin_hop_minima.csv"
             bh_expected = bool(getattr(args, "basin_hop", False)) and bool(getattr(args, "explore_bh", True))
             if _resume_csv_done(score_csv_r):
-                prior = minresults_from_score_csv(score_csv_r)
+                prior = minresults_from_score_csv(score_csv_r, out_dir=Path(args.out))
                 bh_prior = minresults_from_hop_csv(args, bh_csv_r) if bh_expected and _resume_csv_done(bh_csv_r) else []
                 ui_message(f"[resume] PCA round {round_i + 1}: skipping — {len(prior)} min + {len(bh_prior)} BH results loaded from CSV.")
                 render_dashboard()
@@ -8435,7 +8443,7 @@ def main(argv=None):
         if _resume and _resume_csv_done(implicit_scores):
             ui_message(f"[resume] Implicit min: skipping — loading {implicit_scores.name}")
             render_dashboard()
-            implicit_results = minresults_from_score_csv(implicit_scores)
+            implicit_results = minresults_from_score_csv(implicit_scores, out_dir=_out)
         elif getattr(args, "tiered_implicit_min", False):
             implicit_results = run_tiered_implicit_minimization(args, candidate_dir)
         else:
@@ -8475,7 +8483,7 @@ def main(argv=None):
             if _resume and _resume_csv_done(nma_scores):
                 ui_message(f"[resume] NMA + minimize: skipping — loading {nma_scores.name}")
                 render_dashboard()
-                combined_results.extend(minresults_from_score_csv(nma_scores))
+                combined_results.extend(minresults_from_score_csv(nma_scores, out_dir=_out))
             else:
                 # Expand from basin-hop minima if present, otherwise from implicit minima.
                 source_dir = _out / "basin_hop_minima" if args.basin_hop else implicit_dir
