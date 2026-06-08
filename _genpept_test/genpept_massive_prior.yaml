@@ -1,0 +1,122 @@
+# MASSIVE PRIOR GENERATION — chignolin GYDPETGTWG
+# Purpose: generate the largest practical seed bank for constructing accurate
+#          2D contact × rama-map prior PMFs. All exploration methods at max depth.
+#          Output used as genpept_prescan_dir for GAREUS window priors + seed library.
+#
+# Expected output: ~20,000 high-quality, diverse, well-minimised seeds covering
+#                  all accessible (CV1, CV2) bins.
+#
+# Runtime estimate (single GPU, min_jobs=2):
+#   Raw generation:  ~10 min  (10M fast Ramachandran, 64 workers)
+#   Preselection:    ~5  min  (coarse bin filter, no OpenMM)
+#   Minimisation:    ~3–5 h   (50k candidates, adaptive min, min_jobs=2)
+#   Basin hopping:   ~6–10 h  (600 parents × 8 hops × 600 MD steps)
+#   NMA expand:      ~1–2 h   (6 modes, 10 amplitudes on all survivors)
+#   PCA frontier ×6: ~4–8 h   (300k proposals/round, 1500 kept, 5 rounds)
+#   Total wall-clock: ~15–25 h on a single modern GPU
+#
+# Tune min_jobs upward (4–8) on multi-GPU nodes or GPUs with large VRAM (≥24 GB).
+
+genpept:
+  seq: "GYDPETGTWG"
+  out: "chignolin_genpept_massive_prior"
+  clean: false          # keep intermediates — useful for debugging and partial reuse
+  resume: true          # skip completed stages; re-run with higher explore_rounds to add more PCA rounds
+
+  # ── Core workflow ──────────────────────────────────────────────────────────
+  two_stage: true       # implicit-only first stage; skips expensive explicit solvation
+  implicit_only: true   # all minimisation in implicit solvent (faster; fine for diversity)
+
+  # ── Raw Ramachandran generation ────────────────────────────────────────────
+  # 10M structures fills every stratified (φ, ψ) bin ≥30× before filtering.
+  # Stratified sampling avoids the uniform-prior bias toward extended coil.
+  n: 10000000
+  generation_backend: fast
+  rama_sampling: stratified
+  initial_diversity_features: mixed
+  diversity_bank_preset: broad    # broad bank covers all secondary-structure classes
+
+  # ── Preselection (coarse geometry filter, no OpenMM) ───────────────────────
+  # Keeps the top-N geometrically diverse candidates before expensive minimisation.
+  # Finer bins (0.5 Å Rg/e2e) than default to preserve more structural variety.
+  n_candidate_seeds: 150000        # large candidate pool entering minimisation
+  preselection_bin_quota: 25       # up to 5 structures per coarse bin
+  preselection_rg_bin_A: 0.5      # finer Rg bins → more diversity
+  preselection_e2e_bin_A: 0.5     # finer end-to-end distance bins
+  preselection_contact_bin: 1     # finest contact-fraction binning
+  preselection_include_bank: true # include diversity-bank structures in preselection
+
+  # ── Adaptive implicit minimisation ────────────────────────────────────────
+  # Tight convergence: force tol 200 kcal/mol/Å (default 500) and smaller chunks
+  # to catch slow-converging extended conformers that stall early.
+  adaptive_min: true
+  implicit_max_iterations: 500    # extra headroom for extended/strained conformers
+  adaptive_min_chunk_iterations: 25
+  adaptive_min_energy_tol: 0.02   # stricter energy convergence
+  adaptive_min_force_tol: 200.0   # stricter force convergence
+  adaptive_min_stall_rounds: 3    # allow one extra stall round before giving up
+
+  # ── Final seed target ─────────────────────────────────────────────────────
+  # 25,000 seeds → dense coverage of 2D CV grid for PMF construction
+  n_final_seeds: 25000
+
+  # ── Basin hopping — thorough local minimum search ─────────────────────────
+  # More parents × more hops × longer MD = denser local basin coverage.
+  # Especially important for compact/folded states that are local minima far
+  # from random Ramachandran starting points.
+  basin_hop: true
+  bh_parent_seeds: 1000            # 600 diverse parents (was 120 in run6)
+  bh_steps: 15                     # 8 hops per parent (was 3)
+  bh_md_steps: 1000                # 600 MD steps per hop (was 350) — longer escape trajectory
+  bh_temperature: 600.0           # slightly higher T → better barrier crossing
+  bh_friction: 5.0
+  bh_timestep: 0.0035
+  bh_hmr_mass: 3.014
+  bh_initial_min_iterations: 500  # thorough initial minimisation before first hop
+  bh_min_iterations: 200          # thorough inter-hop minimisation
+  bh_restart_from_parent: true    # restart from parent on failed acceptance → avoids drift
+
+  # ── NMA collective mode expansion ────────────────────────────────────────
+  # 6 modes × 10 amplitudes covers harmonic conformational subspace thoroughly.
+  # Modes 1–6 of a 10-residue peptide span backbone bending, twisting, and
+  # end-to-end compression — all relevant for contact and Ramachandran CVs.
+  nma_expand: true
+  nma_modes: 6                    # modes 1–6 (was 2 in run6, 3 in run01)
+  nma_amplitudes: "0.50,0.75,1.00,1.25,1.50,1.75,2.00,2.25,2.50,2.75"
+  nma_cutoff: 12.0
+
+  # ── PCA frontier exploration ──────────────────────────────────────────────
+  # Iterative frontier filling: each round identifies sparse CV regions in
+  # the accumulated pool, generates targeted proposals, minimises them, and
+  # injects them back into the archive.  More rounds + more proposals per
+  # round → more complete coverage of rare/compact states.
+  explore_loop: true
+  explore_rounds: 35              # 5 done + 30 new rounds
+  explore_proposals: 500000       # 300k Ramachandran proposals per round (was 50k)
+  explore_keep: 3000              # 1500 kept per round for minimisation
+  explore_bins: 60                # finer 60-bin frontier grid (was 45)
+  explore_target_max_count: 3     # no per-bin cap → allow rare bins to accumulate
+  explore_pca_padding: 0.10       # tight PCA hull padding → aggressive frontier fill
+  explore_frontier_only: true     # only fill frontier/sparse bins
+  explore_allow_outside: true     # allow proposals outside current hull → novel regions
+  explore_max_kept_per_bin: 8     # up to 8 per bin before minimisation (was 4)
+  explore_bh: true                # basin-hop on PCA frontier hits (was false) — finds
+                                  # local minima in newly populated frontier regions
+  pca_weight_mode: inverse-energy-rank  # soft energy ranking; Boltzmann unusable (48 kT spread)
+  pca_min_count: 5                      # drop singleton/doublet bins — too noisy
+  pca_args: "--fes-smooth-sigma 0.8 --fes-interp-factor 6"
+
+  # ── OpenMM runtime ───────────────────────────────────────────────────────
+  ff: amber14
+  water: tip3pfb
+  ph: 7.0
+  temperature: 300.0
+  platform: OpenCL              # CUDA unavailable in this env; use OpenCL (RTX 3060 Ti)
+  precision: mixed
+  min_jobs: 2       # parallel OpenMM minimisation workers; increase to 4–8 on large VRAM
+  jobs: 64          # parallel raw-generation workers (CPU-only, no GPU limit)
+  cpu_threads: 4
+
+  # ── Output ───────────────────────────────────────────────────────────────
+  live_hist: true
+  turbo_summary: true

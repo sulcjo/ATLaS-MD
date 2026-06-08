@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Optional helper: run after each GENPEPT output exists.
 # Expects compare_genpept_exploration.py in current directory or set COMPARE_PY.
-COMPARE_PY=${COMPARE_PY:-compare_genpept_exploration.py}
+COMPARE_PY=compare_genpept_exploration.py
 
 outputs=(
   chignolin_genpept_run01_full_heavy_max
@@ -14,6 +14,9 @@ outputs=(
   chignolin_genpept_run06_pca_frontier_control
   chignolin_genpept_run07_reasonable_all_methods
 )
+
+
+outputs=( chignolin_genpept_massive_prior )
 
 for out in "${outputs[@]}"; do
   if [[ -d "${out}" ]]; then

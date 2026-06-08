@@ -482,7 +482,7 @@ def test_combined_genpept_gareus_config_parses(tmp_path) -> None:
     import GENPEPT
     sargs = GENPEPT.parse_args(["--config", str(cfg)])
     assert sargs.seq == "GYDPETGTWG"
-    assert str(sargs.out) == "seeds"
+    assert str(sargs.out) == str(tmp_path / "seeds")
     assert sargs.n == 50000
     assert sargs.n_candidate_seeds == 100
     assert sargs.n_final_seeds == 32

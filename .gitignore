@@ -14,13 +14,20 @@ check_gareus_pbc_mindist.py
 *.pdb
 
 chignolin_genpept_seeds/
+chignolin_genpept_massive_prior/
 chignolin_2d_newpackage/
 RUNS/
 ABCold_monolith/
 _genpept_test/chignolin_genpept_run??_*/
+_genpept_test/chignolin_genpept_massive_prior/
 _genpept_test/fes_*/
 gareus_adaptive_production_v*/
 
 *.tar.gz
 *.txt
 *.md
+
+illustrate_seedbank.png
+poincare_map.py
+resume_command.sh
+compare_all_genpept_suite.sh

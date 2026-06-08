@@ -6907,6 +6907,850 @@ def analyze_cv1_cv2_2d_fes(d: Data, args, base_logw: np.ndarray, selected: str, 
     return info
 
 
+def analyze_poincare_map(d: Data, args, base_logw: np.ndarray, selected: str, boost_ok: bool, kbt_kcal: float, out: Path, warnings: list[str], progress: Optional[Progress]) -> dict:
+    """Poincaré return map analysis: backbone CV2 geometry at consecutive CV1 threshold crossings.
+
+    Defines two Poincaré sections in CV1 (primary, contact-fraction) space:
+      Σ_fold:   CV1 crosses c_fold upward   → entering folded/high-contact region
+      Σ_unfold: CV1 crosses c_unfold downward → entering unfolded/extended region
+
+    At each crossing, records CV2 (rama-map backbone score). Plots CV2_n vs CV2_{n+1}
+    (consecutive crossings) to reveal pathway memory and distinct folding/unfolding routes.
+    """
+    if getattr(args, 'no_poincare_map', False):
+        return {'available': False, 'reason': 'disabled via --no-poincare-map'}
+    cv1 = np.asarray(d.cv, dtype=np.float64)
+    cv2 = np.asarray(d.cv2, dtype=np.float64)
+    replica = np.asarray(d.replica, dtype=np.int32)
+    step = np.asarray(d.step, dtype=np.int64) if d.step is not None and len(d.step) == len(cv1) else np.arange(len(cv1), dtype=np.int64)
+    mask_valid = np.isfinite(cv1) & np.isfinite(cv2)
+    if np.count_nonzero(mask_valid) < 100:
+        return {'available': False, 'reason': 'Too few finite CV1+CV2 samples', 'n_finite': int(np.count_nonzero(mask_valid))}
+
+    # Threshold selection
+    c_fold_arg = getattr(args, 'poincare_fold_threshold', None)
+    c_unfold_arg = getattr(args, 'poincare_unfold_threshold', None)
+    cv1_finite = cv1[mask_valid]
+    if c_fold_arg is not None:
+        c_fold = float(c_fold_arg)
+    else:
+        # auto: use p90 of the biased distribution as fold entry threshold
+        c_fold = float(np.percentile(cv1_finite, 90))
+    if c_unfold_arg is not None:
+        c_unfold = float(c_unfold_arg)
+    else:
+        c_unfold = float(np.percentile(cv1_finite, 5))
+
+    min_seg = int(getattr(args, 'poincare_min_segment', 5))
+    min_dwell = int(getattr(args, 'poincare_min_dwell', 50))
+    timestep_fs = float(d.meta.get('timestep_fs', 4.0))
+    # stride: infer from step differences per replica; fall back to 50 steps
+    rep_ids = np.unique(replica)
+    stride_ns = None
+    for rid in rep_ids[:3]:
+        rs = np.sort(step[replica == rid])
+        if len(rs) > 2:
+            med_stride = float(np.median(np.diff(rs)))
+            if med_stride > 0:
+                stride_ns = med_stride * timestep_fs * 1e-6
+                break
+    if stride_ns is None:
+        stride_ns = 50 * timestep_fs * 1e-6
+
+    def _find_crossings(cv1_r, cv2_r, threshold, direction):
+        if direction > 0:
+            cross = (cv1_r[:-1] < threshold) & (cv1_r[1:] >= threshold)
+        else:
+            cross = (cv1_r[:-1] > threshold) & (cv1_r[1:] <= threshold)
+        idx = np.where(cross)[0] + 1
+        # Dwell (commitment) filter: crossing only counts if CV1 stays on the
+        # committed side for min_dwell consecutive frames after the crossing.
+        # Eliminates threshold-bounce artifacts without removing genuine events.
+        if min_dwell > 1 and len(idx) > 0:
+            committed = []
+            for ci in idx:
+                end = min(ci + min_dwell, len(cv1_r))
+                if direction > 0:
+                    if np.all(cv1_r[ci:end] >= threshold):
+                        committed.append(ci)
+                else:
+                    if np.all(cv1_r[ci:end] <= threshold):
+                        committed.append(ci)
+            idx = np.array(committed, dtype=np.int64) if committed else np.array([], dtype=np.int64)
+        if len(idx) > 1:
+            keep = np.concatenate([[True], np.diff(idx) >= min_seg])
+            idx = idx[keep]
+        ivs = np.diff(idx) * stride_ns if len(idx) > 1 else np.array([], dtype=np.float64)
+        return cv2_r[idx], ivs, idx
+
+    fold_cv2_per_rep, unfold_cv2_per_rep = [], []
+    fold_iv_all, unfold_iv_all = [], []
+    fold_step_per_rep, fold_rep_id_per_rep = [], []
+
+    for rid in rep_ids:
+        rmask = (replica == rid) & mask_valid
+        if not np.any(rmask):
+            continue
+        ord_idx = np.argsort(step[rmask])
+        cv1_r = cv1[rmask][ord_idx]
+        cv2_r = cv2[rmask][ord_idx]
+        step_r = step[rmask][ord_idx]
+        cv2_f, iv_f, idx_f = _find_crossings(cv1_r, cv2_r, c_fold, +1)
+        cv2_u, iv_u, idx_u = _find_crossings(cv1_r, cv2_r, c_unfold, -1)
+        fold_cv2_per_rep.append(cv2_f)
+        unfold_cv2_per_rep.append(cv2_u)
+        fold_iv_all.append(iv_f)
+        unfold_iv_all.append(iv_u)
+        fold_step_per_rep.append(step_r[idx_f] if len(idx_f) else np.array([], dtype=np.int64))
+        fold_rep_id_per_rep.append(np.full(len(idx_f), rid, dtype=np.int32))
+
+    cv2_fold = np.concatenate(fold_cv2_per_rep) if fold_cv2_per_rep else np.array([])
+    cv2_unfold = np.concatenate(unfold_cv2_per_rep) if unfold_cv2_per_rep else np.array([])
+    iv_fold = np.concatenate(fold_iv_all) if fold_iv_all else np.array([])
+    iv_unfold = np.concatenate(unfold_iv_all) if unfold_iv_all else np.array([])
+
+    def _return_pairs(cv2_list):
+        xs, ys = [], []
+        for arr in cv2_list:
+            if len(arr) > 1:
+                xs.append(arr[:-1]); ys.append(arr[1:])
+        return (np.concatenate(xs), np.concatenate(ys)) if xs else (np.array([]), np.array([]))
+
+    x_fold, y_fold = _return_pairs(fold_cv2_per_rep)
+    x_unfold, y_unfold = _return_pairs(unfold_cv2_per_rep)
+
+    # Basin definitions from metadata (rama-map) or defaults
+    regions = _secondary_cv_regions(d.meta)
+    cv2_label = _secondary_cv_label(d.meta)
+    default_basins = [
+        {'name': 'β/extended', 'cv2': -1.0,    'color': '#2c7bb6'},
+        {'name': 'PPII/coil',  'cv2': -1/3,    'color': '#74add1'},
+        {'name': 'right-α',   'cv2': +1/3,    'color': '#f46d43'},
+        {'name': 'left-α',    'cv2': +1.0,    'color': '#d73027'},
+    ]
+    basins = default_basins
+    if regions:
+        try:
+            basins = [{'name': r.get('label', r.get('name', '')),
+                       'cv2': float(r['value']),
+                       'color': default_basins[i % 4]['color']}
+                      for i, r in enumerate(regions) if 'value' in r]
+        except Exception:
+            basins = default_basins
+
+    def _nearest_basin(cv2_val):
+        return min(basins, key=lambda b: abs(b['cv2'] - cv2_val))
+
+    # CSV output
+    files: dict = {}
+    try:
+        fold_rows = []
+        for rep_arr, step_arr, cv2_arr in zip(fold_rep_id_per_rep, fold_step_per_rep, fold_cv2_per_rep):
+            for ri, si, c2 in zip(rep_arr, step_arr, cv2_arr):
+                fold_rows.append({'replica': int(ri), 'step': int(si), 'cv2': float(c2)})
+        _write_csv_rows(out / 'poincare_fold_crossings.csv', fold_rows)
+        files['poincare_fold_crossings_csv'] = str(out / 'poincare_fold_crossings.csv')
+    except Exception as e:
+        warnings.append(f'Poincaré fold crossings CSV failed: {e}')
+
+    unfold_rows = []
+    try:
+        unf_steps_rep = []
+        for rid in rep_ids:
+            rmask = (replica == rid) & mask_valid
+            if not np.any(rmask):
+                continue
+            ord_idx = np.argsort(step[rmask])
+            cv1_r = cv1[rmask][ord_idx]; cv2_r = cv2[rmask][ord_idx]; step_r = step[rmask][ord_idx]
+            _, _, idx_u = _find_crossings(cv1_r, cv2_r, c_unfold, -1)
+            for si, c2 in zip(step_r[idx_u] if len(idx_u) else [], cv2_r[idx_u] if len(idx_u) else []):
+                unfold_rows.append({'replica': int(rid), 'step': int(si), 'cv2': float(c2)})
+        _write_csv_rows(out / 'poincare_unfold_crossings.csv', unfold_rows)
+        files['poincare_unfold_crossings_csv'] = str(out / 'poincare_unfold_crossings.csv')
+    except Exception as e:
+        warnings.append(f'Poincaré unfold crossings CSV failed: {e}')
+
+    # KDE peak detection
+    fold_peaks, unfold_peaks = [], []
+    try:
+        from scipy.stats import gaussian_kde
+        from scipy.signal import argrelmax as _argrelmax
+        def _kde_peaks(data, bw=0.12, n=400):
+            if len(data) < 10:
+                return []
+            kde = gaussian_kde(data, bw_method=bw)
+            xg = np.linspace(-1, 1, n)
+            dens = kde(xg)
+            pk = _argrelmax(dens, order=10)[0]
+            return sorted([(float(xg[i]), float(dens[i])) for i in pk], key=lambda t: -t[1])
+        fold_peaks = _kde_peaks(cv2_fold) if len(cv2_fold) >= 10 else []
+        unfold_peaks = _kde_peaks(cv2_unfold) if len(cv2_unfold) >= 10 else []
+    except Exception:
+        pass
+
+    # Build plain-language summary
+    fold_route_str = 'unknown'
+    if len(fold_peaks) >= 2:
+        b1 = _nearest_basin(fold_peaks[0][0]); b2 = _nearest_basin(fold_peaks[1][0])
+        fold_route_str = (f"2 routes: '{b1['name']}' (CV2≈{fold_peaks[0][0]:+.2f}) "
+                          f"and '{b2['name']}' (CV2≈{fold_peaks[1][0]:+.2f})")
+    elif len(fold_peaks) == 1:
+        b1 = _nearest_basin(fold_peaks[0][0])
+        fold_route_str = f"1 route: '{b1['name']}' (CV2≈{fold_peaks[0][0]:+.2f})"
+    unfold_route_str = 'unknown'
+    if len(unfold_peaks) >= 1:
+        bu = _nearest_basin(unfold_peaks[0][0])
+        unfold_route_str = f"1 route: '{bu['name']}' (CV2≈{unfold_peaks[0][0]:+.2f})"
+
+    # Annotated plot
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import matplotlib.gridspec as mgrid
+        FOLD_C = '#c0392b'; UNFOLD_C = '#1a6b3c'; BG = '#f9f9f9'; PBG = '#ffffff'
+
+        fig = plt.figure(figsize=(18, 13))
+        fig.patch.set_facecolor(BG)
+        gs = mgrid.GridSpec(3, 3, figure=fig, height_ratios=[1.1, 2.4, 0.9],
+                            hspace=0.5, wspace=0.38, left=0.07, right=0.97, top=0.93, bottom=0.04)
+
+        def _pbg(ax):
+            ax.set_facecolor(PBG)
+            for sp in ax.spines.values(): sp.set_edgecolor('#cccccc')
+
+        def _blines(ax, ori='v'):
+            for b in basins:
+                fn = ax.axvline if ori == 'v' else ax.axhline
+                fn(b['cv2'], color=b['color'], lw=0.9, ls='--', alpha=0.45)
+
+        def _bbg(ax, alpha=0.07):
+            edges = [b['cv2'] - 0.333 for b in basins] + [basins[-1]['cv2'] + 0.333]
+            edges = sorted(set([-1.2] + [round((basins[i]['cv2'] + basins[i+1]['cv2'])/2, 4) for i in range(len(basins)-1)] + [1.2]))
+            for i, b in enumerate(basins):
+                lo = edges[i] if i < len(edges) else -1.2
+                hi = edges[i+1] if i+1 < len(edges) else 1.2
+                ax.axvspan(lo, hi, color=b['color'], alpha=alpha, zorder=0)
+                ax.axhspan(lo, hi, color=b['color'], alpha=alpha, zorder=0)
+
+        # Row 0: CV1 distribution
+        ax0 = fig.add_subplot(gs[0, :])
+        _pbg(ax0)
+        cv1_fin = cv1[mask_valid]
+        ax0.hist(cv1_fin, bins=300, density=True, color='#7f8c8d', alpha=0.6, linewidth=0)
+        ax0.axvspan(0, c_unfold, color=UNFOLD_C, alpha=0.10)
+        ax0.axvspan(c_fold, float(np.nanmax(cv1_fin)) * 1.05, color=FOLD_C, alpha=0.10)
+        ax0.axvline(c_unfold, color=UNFOLD_C, lw=2.2, ls='--',
+                    label=f'Σ_unfold  CV1={c_unfold:.3f}  (downward crossings counted here)')
+        ax0.axvline(c_fold, color=FOLD_C, lw=2.2, ls='--',
+                    label=f'Σ_fold   CV1={c_fold:.3f}   (upward crossings counted here)')
+        ax0.set_xlabel('CV1: nonlocal contact fraction  (0 = fully extended, max = native hairpin)', fontsize=10)
+        ax0.set_ylabel('Density (REUS-biased)', fontsize=9)
+        ax0.set_title('CV1 distribution — dashed lines are the two Poincaré sections\n'
+                      'Each time the trajectory crosses a dashed line, CV2 (backbone geometry) is recorded',
+                      fontsize=10, fontweight='bold')
+        ax0.legend(fontsize=9, loc='upper right')
+        ax0.set_xlim(-0.005, float(np.nanmax(cv1_fin)) * 1.08)
+
+        # Row 1 col 0: basin legend
+        ax_leg = fig.add_subplot(gs[1, 0])
+        ax_leg.set_facecolor(PBG); ax_leg.axis('off')
+        ax_leg.set_title('CV2 backbone\nbasin reference', fontsize=10, fontweight='bold')
+        for i, b in enumerate(basins):
+            y = 3.5 - i * (3.5 / max(1, len(basins) - 1)) if len(basins) > 1 else 1.75
+            ax_leg.add_patch(plt.matplotlib.patches.FancyBboxPatch(
+                (-1.2, y - 0.3), 2.4, 0.6, boxstyle='round,pad=0.05',
+                fc=b['color'], alpha=0.15, ec=b['color'], lw=1.2))
+            ax_leg.text(-1.1, y, b['name'], fontsize=10, va='center',
+                        fontweight='bold', color=b['color'])
+            ax_leg.text(0.5, y, f"CV2={b['cv2']:+.3f}", fontsize=9, va='center', color=b['color'])
+        ax_leg.set_xlim(-1.3, 1.3); ax_leg.set_ylim(-0.5, 4.5)
+        ax_leg.text(0, -0.3, 'CV2 = avg backbone similarity\nto each Ramachandran basin\n(all residues)',
+                    ha='center', fontsize=7.5, color='#666666', style='italic')
+
+        # Row 1 col 1: Σ_fold return map
+        ax_f = fig.add_subplot(gs[1, 1]); _pbg(ax_f); _bbg(ax_f)
+        if len(x_fold) > 0:
+            h, xe, ye = np.histogram2d(x_fold, y_fold, bins=65, range=[[-1,1],[-1,1]])
+            ax_f.imshow(np.log1p(h).T, origin='lower', extent=[-1,1,-1,1],
+                        aspect='auto', cmap='Reds', alpha=0.85, interpolation='bilinear')
+            ax_f.scatter(x_fold, y_fold, s=2, alpha=0.07, color='#7b241c', rasterized=True, zorder=2)
+        ax_f.plot([-1,1],[-1,1],'k--',lw=1,alpha=0.45,zorder=3,label='diagonal: perfect memory')
+        _blines(ax_f,'v'); _blines(ax_f,'h')
+        ax_f.set_xlim(-1,1); ax_f.set_ylim(-1,1)
+        ax_f.set_xlabel(f'CV2 ({cv2_label}) at folding event #n', fontsize=9)
+        ax_f.set_ylabel(f'CV2 ({cv2_label}) at folding event #n+1', fontsize=9)
+        ax_f.set_title(f'Σ_fold return map  ({len(x_fold):,} pairs)\n'
+                       f'Each dot = two consecutive times peptide\nreached CV1 > {c_fold:.3f}',
+                       fontsize=9, fontweight='bold')
+        for cv2_p, dens_p in fold_peaks[:2]:
+            if dens_p > 0.2:
+                nb = _nearest_basin(cv2_p)
+                ax_f.annotate(f"≈{nb['name']}\n{cv2_p:+.2f}",
+                              xy=(cv2_p, cv2_p), xytext=(cv2_p - 0.4, cv2_p + 0.3),
+                              fontsize=7.5, color=FOLD_C, fontweight='bold',
+                              arrowprops=dict(arrowstyle='->', color=FOLD_C, lw=1),
+                              bbox=dict(boxstyle='round,pad=0.2', fc='white', ec=FOLD_C, alpha=0.85), zorder=5)
+        ax_f.text(-0.97, 0.96, 'Tight cluster on diagonal\n= same backbone geometry\nevent after event\n(pathway memory)',
+                  fontsize=7, va='top', style='italic',
+                  bbox=dict(boxstyle='round,pad=0.25', fc='#fff9e6', ec='#ccaa00', alpha=0.9),
+                  transform=ax_f.transData, zorder=6)
+        ax_f.legend(fontsize=7, loc='lower right')
+
+        # Row 1 col 2: Σ_unfold return map
+        ax_u = fig.add_subplot(gs[1, 2]); _pbg(ax_u); _bbg(ax_u)
+        if len(x_unfold) > 0:
+            h2, _, _ = np.histogram2d(x_unfold, y_unfold, bins=65, range=[[-1,1],[-1,1]])
+            ax_u.imshow(np.log1p(h2).T, origin='lower', extent=[-1,1,-1,1],
+                        aspect='auto', cmap='Greens', alpha=0.85, interpolation='bilinear')
+            ax_u.scatter(x_unfold, y_unfold, s=2, alpha=0.07, color='#145a32', rasterized=True, zorder=2)
+        ax_u.plot([-1,1],[-1,1],'k--',lw=1,alpha=0.45,zorder=3)
+        _blines(ax_u,'v'); _blines(ax_u,'h')
+        ax_u.set_xlim(-1,1); ax_u.set_ylim(-1,1)
+        ax_u.set_xlabel(f'CV2 ({cv2_label}) at unfolding event #n', fontsize=9)
+        ax_u.set_ylabel(f'CV2 ({cv2_label}) at unfolding event #n+1', fontsize=9)
+        ax_u.set_title(f'Σ_unfold return map  ({len(x_unfold):,} pairs)\n'
+                       f'Each dot = two consecutive times peptide\nreached CV1 < {c_unfold:.3f}',
+                       fontsize=9, fontweight='bold')
+        for cv2_p, dens_p in unfold_peaks[:1]:
+            if dens_p > 0.2:
+                nb = _nearest_basin(cv2_p)
+                ax_u.annotate(f"≈{nb['name']}\n{cv2_p:+.2f}",
+                              xy=(cv2_p, cv2_p), xytext=(cv2_p + 0.1, cv2_p - 0.4),
+                              fontsize=7.5, color=UNFOLD_C, fontweight='bold',
+                              arrowprops=dict(arrowstyle='->', color=UNFOLD_C, lw=1),
+                              bbox=dict(boxstyle='round,pad=0.2', fc='white', ec=UNFOLD_C, alpha=0.85), zorder=5)
+        ax_u.text(-0.97, 0.96, 'Single cluster on diagonal\n= one stereotyped backbone\nunfolding route',
+                  fontsize=7, va='top', style='italic',
+                  bbox=dict(boxstyle='round,pad=0.25', fc='#e8f8ee', ec=UNFOLD_C, alpha=0.9),
+                  transform=ax_u.transData, zorder=6)
+
+        # Row 2: CV2 marginals (col 0+1) and summary (col 2)
+        ax_hist = fig.add_subplot(gs[2, :2]); _pbg(ax_hist)
+        bins_cv2 = np.linspace(-1, 1, 55)
+        basin_edges = sorted(set([-1.2] + [round((basins[i]['cv2'] + basins[i+1]['cv2'])/2, 4) for i in range(len(basins)-1)] + [1.2]))
+        for i, b in enumerate(basins):
+            lo = basin_edges[i] if i < len(basin_edges) else -1.2
+            hi = basin_edges[i+1] if i+1 < len(basin_edges) else 1.2
+            ax_hist.axvspan(lo, hi, color=b['color'], alpha=0.07)
+        if len(cv2_fold) > 0:
+            ax_hist.hist(cv2_fold, bins=bins_cv2, density=True, alpha=0.65, color=FOLD_C,
+                         label=f'at Σ_fold crossings (n={len(cv2_fold):,})')
+        if len(cv2_unfold) > 0:
+            ax_hist.hist(cv2_unfold, bins=bins_cv2, density=True, alpha=0.65, color=UNFOLD_C,
+                         label=f'at Σ_unfold crossings (n={len(cv2_unfold):,})')
+        for b in basins:
+            ax_hist.axvline(b['cv2'], color=b['color'], lw=1.3, ls='--', alpha=0.6)
+            ax_hist.text(b['cv2'], 0, b['name'], rotation=90, ha='center', va='bottom',
+                         fontsize=6.5, color=b['color'], fontweight='bold',
+                         transform=ax_hist.get_xaxis_transform())
+        ax_hist.set_xlabel(f'CV2: {cv2_label}  (backbone geometry at crossing)', fontsize=9)
+        ax_hist.set_ylabel('Density', fontsize=9)
+        ax_hist.set_title('Backbone geometry distribution at each crossing type', fontsize=9, fontweight='bold')
+        ax_hist.set_xlim(-1, 1); ax_hist.legend(fontsize=8)
+
+        ax_sum = fig.add_subplot(gs[2, 2]); ax_sum.axis('off')
+        med_f_ps = float(np.median(iv_fold) * 1000) if len(iv_fold) > 0 else float('nan')
+        med_u_ps = float(np.median(iv_unfold) * 1000) if len(iv_unfold) > 0 else float('nan')
+        dwell_ps = min_dwell * stride_ns * 1000
+        summary_txt = (
+            'KEY FINDINGS\n\n'
+            f'Folding routes:  {fold_route_str}\n'
+            f'Unfolding route: {unfold_route_str}\n\n'
+            f'Fold crossings:   {len(cv2_fold):,}  (median {med_f_ps:.1f} ps apart)\n'
+            f'Unfold crossings: {len(cv2_unfold):,}  (median {med_u_ps:.1f} ps apart)\n\n'
+            f'Dwell filter: {min_dwell} frames = {dwell_ps:.1f} ps\n'
+            '(only committed entries counted)\n\n'
+            'Return map on diagonal\n→ strong pathway memory\n\n'
+            'Note: recurrence times reflect\nREUS bias, not physical rates'
+        )
+        ax_sum.text(0.04, 0.96, summary_txt, transform=ax_sum.transAxes,
+                    fontsize=8.5, va='top', ha='left', family='monospace',
+                    bbox=dict(boxstyle='round,pad=0.5', fc='#f0f4ff', ec='#3498db', lw=1.3))
+
+        n_rep = len(rep_ids)
+        fig.suptitle(
+            f'Chignolin Poincaré map — pathway analysis via CV1/CV2 threshold crossings\n'
+            f'{n_rep} replicas  |  {int(np.count_nonzero(mask_valid)):,} frames  |  '
+            f'Σ_fold CV1↑{c_fold:.3f}  |  Σ_unfold CV1↓{c_unfold:.3f}',
+            fontsize=11, fontweight='bold', y=0.97)
+        fig.savefig(out / 'poincare_map.png', dpi=150, bbox_inches='tight', facecolor=BG)
+        plt.close(fig)
+        files['poincare_map_png'] = str(out / 'poincare_map.png')
+    except Exception as e:
+        warnings.append(f'Poincaré map plot failed: {e}')
+
+    info = {
+        'available': True,
+        'c_fold': c_fold,
+        'c_unfold': c_unfold,
+        'min_dwell_frames': min_dwell,
+        'min_dwell_ps': float(min_dwell * stride_ns * 1000),
+        'n_fold_crossings': int(len(cv2_fold)),
+        'n_unfold_crossings': int(len(cv2_unfold)),
+        'n_fold_return_pairs': int(len(x_fold)),
+        'n_unfold_return_pairs': int(len(x_unfold)),
+        'fold_recurrence_median_ns': float(np.median(iv_fold)) if len(iv_fold) > 0 else None,
+        'unfold_recurrence_median_ns': float(np.median(iv_unfold)) if len(iv_unfold) > 0 else None,
+        'fold_peaks': [{'cv2': float(c), 'density': float(r), 'nearest_basin': _nearest_basin(c)['name']} for c, r in fold_peaks[:4]],
+        'unfold_peaks': [{'cv2': float(c), 'density': float(r), 'nearest_basin': _nearest_basin(c)['name']} for c, r in unfold_peaks[:4]],
+        'fold_routes_summary': fold_route_str,
+        'unfold_routes_summary': unfold_route_str,
+        'files': files,
+    }
+    wjson(out / 'poincare_map_summary.json', info)
+    files['poincare_map_summary_json'] = str(out / 'poincare_map_summary.json')
+    return info
+
+
+def analyze_poincare_residue_torsions(d: Data, args, out: Path, poincare_info: dict, warnings: list, progress: Optional[Progress]) -> dict:
+    """Per-residue backbone torsion (phi/psi) analysis at committed Poincare fold/unfold crossing frames.
+
+    Loads the actual trajectory frames at each crossing step, computes phi/psi angles with MDTraj,
+    and produces a Ramachandran-per-residue figure coloured by folding route (A vs B split on CV2).
+    """
+    # --- Guard clauses ---
+    if getattr(args, 'no_poincare_residue_torsions', False):
+        return {'available': False, 'reason': 'disabled via --no-poincare-residue-torsions'}
+    if not isinstance(poincare_info, dict) or not poincare_info.get('available'):
+        return {'available': False, 'reason': 'poincare_info not available'}
+    if int(poincare_info.get('n_fold_crossings', 0)) < 5:
+        return {'available': False, 'reason': f'Too few fold crossings ({poincare_info.get("n_fold_crossings",0)}) for torsion analysis'}
+
+    try:
+        import mdtraj as md
+    except ImportError:
+        return {'available': False, 'reason': 'MDTraj not available'}
+
+    top_path = _find_rg_topology_path(d.prod_dir, args)
+    if top_path is None:
+        return {'available': False, 'reason': 'topology PDB not found; use --rg-topology'}
+
+    fold_csv = out / 'poincare_fold_crossings.csv'
+    unfold_csv = out / 'poincare_unfold_crossings.csv'
+    if not fold_csv.exists():
+        return {'available': False, 'reason': f'poincare_fold_crossings.csv not found at {fold_csv}'}
+    if not unfold_csv.exists():
+        return {'available': False, 'reason': f'poincare_unfold_crossings.csv not found at {unfold_csv}'}
+
+    # --- Load crossing CSVs ---
+    def _load_crossing_csv(path: Path) -> list:
+        rows = []
+        try:
+            with path.open() as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    try:
+                        rows.append({'replica': int(row['replica']), 'step': int(row['step']), 'cv2': float(row['cv2'])})
+                    except (KeyError, ValueError):
+                        pass
+        except Exception:
+            pass
+        return rows
+
+    fold_rows = _load_crossing_csv(fold_csv)
+    unfold_rows = _load_crossing_csv(unfold_csv)
+
+    # --- Route split CV2 cutpoint ---
+    route_split = getattr(args, 'poincare_route_split', None)
+    if route_split is not None:
+        route_split = float(route_split)
+    else:
+        peaks = poincare_info.get('fold_peaks', [])
+        if len(peaks) >= 2:
+            # Sort by density descending, take top 2, midpoint of their cv2 values
+            top2 = sorted(peaks, key=lambda p: -p['density'])[:2]
+            route_split = float((top2[0]['cv2'] + top2[1]['cv2']) / 2.0)
+        else:
+            route_split = 0.0
+
+    # Split fold events into Route A (cv2 < route_split) and Route B (cv2 >= route_split)
+    fold_A = [r for r in fold_rows if r['cv2'] < route_split]
+    fold_B = [r for r in fold_rows if r['cv2'] >= route_split]
+
+    # --- Prepare trajectory loading ---
+    traj_dir = d.prod_dir / 'replica_trajectories'
+    if not traj_dir.exists():
+        merged = _prepare_adaptive_merged_traj_dir(d, args)
+        if merged is not None:
+            traj_dir = merged
+        else:
+            return {'available': False, 'reason': f'replica_trajectories directory not found at {traj_dir}'}
+
+    traj_interval = _read_traj_interval(d.prod_dir)
+    if traj_interval <= 0:
+        traj_interval = 50  # fallback
+
+    # Load protein atom indices once from topology
+    try:
+        _top_traj = md.load(str(top_path))
+        protein_indices = _top_traj.topology.select('protein')
+        if protein_indices.size == 0:
+            return {'available': False, 'reason': 'topology protein selection returned zero atoms'}
+        protein_top = _top_traj.atom_slice(protein_indices).topology
+        # Get residue names for subplots (from protein-sliced topology, not full system)
+        residue_names = [f'{res.name.capitalize()}{res.resSeq}' for res in protein_top.residues]
+        n_residues = protein_top.n_residues
+    except Exception as exc:
+        return {'available': False, 'reason': f'topology loading failed: {exc}'}
+
+    # Determine phi/psi residue mapping from a small test frame.
+    # compute_phi returns N-1 angles (no phi for first residue),
+    # compute_psi returns N-1 angles (no psi for last residue).
+    # Map each angle column to its residue index via MDTraj atom indices.
+    try:
+        test_frame = md.load_frame(str(top_path), 0, top=str(top_path))
+        test_prot = test_frame.atom_slice(protein_indices)
+        phi_atom_indices, _ = md.compute_phi(test_prot)
+        psi_atom_indices, _ = md.compute_psi(test_prot)
+        # phi: [C(i-1), N(i), CA(i), C(i)] — residue i is the owner of N(i) = atom index 1
+        phi_col_to_resid = [protein_top.atom(int(a[1])).residue.index for a in phi_atom_indices]
+        # psi: [N(i), CA(i), C(i), N(i+1)] — residue i is the owner of N(i) = atom index 0
+        psi_col_to_resid = [protein_top.atom(int(a[0])).residue.index for a in psi_atom_indices]
+    except Exception as exc:
+        return {'available': False, 'reason': f'phi/psi residue mapping failed: {exc}'}
+
+    # --- Batch frame loading by (replica, segment_path) ---
+    all_crossings = (
+        [('fold_A', r) for r in fold_A] +
+        [('fold_B', r) for r in fold_B] +
+        [('unfold', r) for r in unfold_rows]
+    )
+
+    if not all_crossings:
+        return {'available': False, 'reason': 'no crossing events to analyze'}
+
+    # Build map: replica -> segments list
+    replica_segments: dict = {}
+    all_reps = set(r['replica'] for _, r in all_crossings)
+    for rep_id in all_reps:
+        segs = _find_all_replica_trajectory_segments(traj_dir, rep_id, args)
+        if segs:
+            replica_segments[rep_id] = segs  # [(start_step, path), ...]
+
+    def _find_segment_for_step(segs, step):
+        """Return (seg_start, seg_path, frame_idx) for the segment containing `step`."""
+        for i, (seg_start, seg_path) in enumerate(segs):
+            next_start = segs[i + 1][0] if i + 1 < len(segs) else float('inf')
+            if seg_start <= step < next_start:
+                frame_idx = int((step - seg_start) // traj_interval)
+                return seg_start, seg_path, frame_idx
+        return None, None, -1
+
+    # Group crossings by (replica, segment_path) to batch-load each file once
+    from collections import defaultdict
+    seg_batches: dict = defaultdict(list)
+    skipped = 0
+    for event_type, crossing in all_crossings:
+        rep_id = crossing['replica']
+        segs = replica_segments.get(rep_id)
+        if not segs:
+            skipped += 1
+            continue
+        seg_start, seg_path, frame_idx = _find_segment_for_step(segs, crossing['step'])
+        if seg_path is None or frame_idx < 0:
+            skipped += 1
+            continue
+        seg_batches[(rep_id, str(seg_path))].append((event_type, crossing, frame_idx))
+
+    if not seg_batches:
+        return {'available': False, 'reason': f'no trajectory segments found for any crossing replica (skipped {skipped})'}
+
+    # Load each segment once, extract needed frames
+    # results: list of (event_type, crossing_dict, phi_deg_aligned, psi_deg_aligned)
+    results: list = []
+
+    for (rep_id, seg_path_str), batch_items in seg_batches.items():
+        seg_path = Path(seg_path_str)
+        try:
+            traj = md.load(str(seg_path), top=str(top_path), atom_indices=protein_indices)
+        except Exception as exc:
+            warnings.append(f'Poincare torsions: failed to load segment {seg_path.name} for replica {rep_id}: {exc}')
+            continue
+
+        for event_type, crossing, frame_idx in batch_items:
+            if frame_idx < 0 or frame_idx >= traj.n_frames:
+                continue
+            try:
+                frame = traj[frame_idx]
+                _, phi_rad = md.compute_phi(frame)  # shape (1, n_phi_cols)
+                _, psi_rad = md.compute_psi(frame)  # shape (1, n_psi_cols)
+                phi_deg = np.degrees(phi_rad[0])    # shape (n_phi_cols,)
+                psi_deg = np.degrees(psi_rad[0])    # shape (n_psi_cols,)
+                # Scatter into per-residue aligned arrays (terminals stay NaN)
+                phi_aligned = np.full(n_residues, np.nan)
+                psi_aligned = np.full(n_residues, np.nan)
+                for k, ri in enumerate(phi_col_to_resid):
+                    if k < len(phi_deg) and 0 <= ri < n_residues:
+                        phi_aligned[ri] = phi_deg[k]
+                for k, ri in enumerate(psi_col_to_resid):
+                    if k < len(psi_deg) and 0 <= ri < n_residues:
+                        psi_aligned[ri] = psi_deg[k]
+                results.append((event_type, crossing, phi_aligned, psi_aligned))
+            except Exception:
+                continue
+
+    if not results:
+        return {'available': False, 'reason': 'no frames successfully loaded from any crossing event'}
+
+    # --- Build per-route arrays ---
+    def _collect(event_tag):
+        rows_et = [(c, ph, ps) for (et, c, ph, ps) in results if et == event_tag]
+        if not rows_et:
+            return np.empty((0, n_residues)), np.empty((0, n_residues)), []
+        phi_arr = np.stack([r[1] for r in rows_et])
+        psi_arr = np.stack([r[2] for r in rows_et])
+        crossings_list = [r[0] for r in rows_et]
+        return phi_arr, psi_arr, crossings_list
+
+    fold_A_phi, fold_A_psi, fold_A_crossings = _collect('fold_A')
+    fold_B_phi, fold_B_psi, fold_B_crossings = _collect('fold_B')
+    unfold_phi, unfold_psi, unfold_crossings = _collect('unfold')
+
+    n_A = len(fold_A_crossings)
+    n_B = len(fold_B_crossings)
+    n_unfold_cnt = len(unfold_crossings)
+    n_fold = n_A + n_B
+
+    # --- Save CSV ---
+    csv_rows = []
+    for et, c_list, ph_arr, ps_arr in [('fold_A', fold_A_crossings, fold_A_phi, fold_A_psi),
+                                        ('fold_B', fold_B_crossings, fold_B_phi, fold_B_psi),
+                                        ('unfold', unfold_crossings, unfold_phi, unfold_psi)]:
+        for i, c in enumerate(c_list):
+            row: dict = {'event_type': et, 'replica': c['replica'], 'step': c['step'], 'cv2': c['cv2']}
+            if i < len(ph_arr):
+                for ri in range(n_residues):
+                    row[f'phi_{ri}'] = float(ph_arr[i, ri]) if np.isfinite(ph_arr[i, ri]) else ''
+                    row[f'psi_{ri}'] = float(ps_arr[i, ri]) if np.isfinite(ps_arr[i, ri]) else ''
+            csv_rows.append(row)
+    try:
+        _write_csv_rows(out / 'poincare_residue_torsions.csv', csv_rows)
+    except Exception as exc:
+        warnings.append(f'Poincare torsions CSV write failed: {exc}')
+
+    # --- Compute mean/std differences for bar charts ---
+    def _mean_std(arr):
+        """Per-residue mean and std, ignoring NaN."""
+        if arr.shape[0] == 0:
+            return np.full(n_residues, np.nan), np.full(n_residues, np.nan)
+        return np.nanmean(arr, axis=0), np.nanstd(arr, axis=0)
+
+    phi_A_mean, phi_A_std = _mean_std(fold_A_phi)
+    phi_B_mean, phi_B_std = _mean_std(fold_B_phi)
+    psi_A_mean, psi_A_std = _mean_std(fold_A_psi)
+    psi_B_mean, psi_B_std = _mean_std(fold_B_psi)
+
+    dphi = phi_B_mean - phi_A_mean  # Route B minus Route A
+    dpsi = psi_B_mean - psi_A_mean
+    # Propagated std (assuming independence)
+    dphi_err = np.sqrt(np.where(np.isfinite(phi_A_std), phi_A_std**2, 0.0) +
+                       np.where(np.isfinite(phi_B_std), phi_B_std**2, 0.0))
+    dpsi_err = np.sqrt(np.where(np.isfinite(psi_A_std), psi_A_std**2, 0.0) +
+                       np.where(np.isfinite(psi_B_std), psi_B_std**2, 0.0))
+
+    # Most different residue
+    def _most_diff_res(darr):
+        abs_d = np.abs(darr)
+        if not np.any(np.isfinite(abs_d)):
+            return 'unknown'
+        return residue_names[int(np.nanargmax(abs_d))]
+
+    most_diff_psi = _most_diff_res(dpsi)
+    most_diff_phi = _most_diff_res(dphi)
+
+    # Nearest basin helper using poincare_info fold_peaks
+    def _nb(cv2_val):
+        if not isinstance(poincare_info.get('fold_peaks'), list) or not poincare_info['fold_peaks']:
+            return 'unknown'
+        peaks = poincare_info['fold_peaks']
+        return min(peaks, key=lambda p: abs(p['cv2'] - cv2_val)).get('nearest_basin', 'unknown')
+
+    dwell_ps = float(poincare_info.get('min_dwell_ps', 0.0))
+
+    # --- Figure ---
+    png_path = None
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import matplotlib.gridspec as gridspec
+        import matplotlib.patches as mpatches
+        from matplotlib.lines import Line2D
+
+        fig = plt.figure(figsize=(22, 14))
+        fig.patch.set_facecolor('#f0f0f0')
+
+        # Outer grid: 2 rows, ratio [2.2, 1]
+        outer_gs = gridspec.GridSpec(2, 1, figure=fig, height_ratios=[2.2, 1.0], hspace=0.35)
+
+        # Top sub-grid: 2 rows x 5 cols for Ramachandran subplots
+        top_gs = gridspec.GridSpecFromSubplotSpec(2, 5, subplot_spec=outer_gs[0], hspace=0.45, wspace=0.35)
+
+        # Bottom sub-grid: 1 row x 5 cols; panels span (0-1), (2-3), (4)
+        bot_gs = gridspec.GridSpecFromSubplotSpec(1, 5, subplot_spec=outer_gs[1], wspace=0.4)
+
+        # Ramachandran basin background: (phi_min, phi_max, psi_min, psi_max, color)
+        rama_basins = [
+            (-160, -90, 100, 180, '#d0e8ff'),   # beta/extended — pale blue
+            (-100, -50, 120, 180, '#ccf5f5'),    # PPII — pale cyan
+            (-90,  -30, -80,   0, '#ffe8cc'),    # right-alpha — pale orange
+            ( 30,   90,  10,  70, '#ffd5d5'),    # left-alpha — pale red
+        ]
+
+        # Proxy handles for legend — always show all three routes regardless
+        # of which residue subplot is drawn first (N-terminal lacks phi).
+        legend_handles = [
+            Line2D([0], [0], marker='o', color='w', markerfacecolor='green',
+                   markersize=6, alpha=0.7, label='Unfold'),
+            Line2D([0], [0], marker='o', color='w', markerfacecolor='red',
+                   markersize=6, alpha=0.7, label=f'Route A (CV2<{route_split:.2f})'),
+            Line2D([0], [0], marker='o', color='w', markerfacecolor='blue',
+                   markersize=6, alpha=0.7, label=f'Route B (CV2≥{route_split:.2f})'),
+        ]
+        legend_placed = False
+
+        n_subplots = min(n_residues, 10)  # 2x5 = max 10 subplots
+        for idx in range(n_subplots):
+            row_i, col_i = divmod(idx, 5)
+            ax = fig.add_subplot(top_gs[row_i, col_i])
+            ax.set_facecolor('white')
+            for pb_phi0, pb_phi1, pb_psi0, pb_psi1, pb_col in rama_basins:
+                ax.add_patch(mpatches.Rectangle(
+                    (pb_phi0, pb_psi0), pb_phi1 - pb_phi0, pb_psi1 - pb_psi0,
+                    color=pb_col, zorder=0, transform=ax.transData))
+            ax.axhline(0, color='gray', lw=0.5, zorder=1)
+            ax.axvline(0, color='gray', lw=0.5, zorder=1)
+
+            phi_A_i = fold_A_phi[:, idx] if fold_A_phi.shape[0] > 0 else np.array([])
+            psi_A_i = fold_A_psi[:, idx] if fold_A_psi.shape[0] > 0 else np.array([])
+            phi_B_i = fold_B_phi[:, idx] if fold_B_phi.shape[0] > 0 else np.array([])
+            psi_B_i = fold_B_psi[:, idx] if fold_B_psi.shape[0] > 0 else np.array([])
+            phi_U_i = unfold_phi[:, idx] if unfold_phi.shape[0] > 0 else np.array([])
+            psi_U_i = unfold_psi[:, idx] if unfold_psi.shape[0] > 0 else np.array([])
+
+            valid_A = np.isfinite(phi_A_i) & np.isfinite(psi_A_i)
+            valid_B = np.isfinite(phi_B_i) & np.isfinite(psi_B_i)
+            valid_U = np.isfinite(phi_U_i) & np.isfinite(psi_U_i)
+
+            if np.any(valid_U):
+                ax.scatter(phi_U_i[valid_U], psi_U_i[valid_U],
+                           c='green', alpha=0.3, s=12, zorder=3)
+            if np.any(valid_A):
+                ax.scatter(phi_A_i[valid_A], psi_A_i[valid_A],
+                           c='red', alpha=0.5, s=20, zorder=4)
+            if np.any(valid_B):
+                ax.scatter(phi_B_i[valid_B], psi_B_i[valid_B],
+                           c='blue', alpha=0.5, s=20, zorder=5)
+
+            # Place legend on first subplot that has any data, using proxy handles
+            if not legend_placed and (np.any(valid_A) or np.any(valid_B) or np.any(valid_U)):
+                ax.legend(handles=legend_handles, fontsize=5,
+                          loc='upper right', framealpha=0.7)
+                legend_placed = True
+
+            ax.set_xlim(-180, 180)
+            ax.set_ylim(-180, 180)
+            ax.set_title(residue_names[idx] if idx < len(residue_names) else f'Res{idx}', fontsize=8)
+            ax.tick_params(labelsize=6)
+            ax.set_xlabel('φ (°)', fontsize=6)
+            ax.set_ylabel('ψ (°)', fontsize=6)
+
+        # --- Bottom panels ---
+        x_pos = np.arange(n_residues)
+
+        # Panel A: Delta-psi bar chart (cols 0-1)
+        ax_psi = fig.add_subplot(bot_gs[0, 0:2])
+        colors_psi = ['red' if (np.isfinite(v) and v > 0) else 'blue' for v in dpsi]
+        ax_psi.bar(x_pos, np.where(np.isfinite(dpsi), dpsi, 0.0), color=colors_psi, alpha=0.75, zorder=2)
+        ax_psi.errorbar(x_pos, np.where(np.isfinite(dpsi), dpsi, 0.0),
+                        yerr=np.where(np.isfinite(dpsi_err), dpsi_err, 0.0),
+                        fmt='none', color='black', capsize=3, lw=1, zorder=3)
+        ax_psi.axhline(0, color='black', lw=1.0)
+        ax_psi.set_xticks(x_pos)
+        ax_psi.set_xticklabels(residue_names, rotation=45, ha='right', fontsize=7)
+        ax_psi.set_ylabel('Δψ (°)', fontsize=9)
+        ax_psi.set_title('Which residues drive the two folding routes? (ψ difference)\nRoute B − Route A', fontsize=9)
+        ax_psi.set_facecolor('white')
+
+        # Panel B: Delta-phi bar chart (cols 2-3)
+        ax_phi = fig.add_subplot(bot_gs[0, 2:4])
+        colors_phi = ['red' if (np.isfinite(v) and v > 0) else 'blue' for v in dphi]
+        ax_phi.bar(x_pos, np.where(np.isfinite(dphi), dphi, 0.0), color=colors_phi, alpha=0.75, zorder=2)
+        ax_phi.errorbar(x_pos, np.where(np.isfinite(dphi), dphi, 0.0),
+                        yerr=np.where(np.isfinite(dphi_err), dphi_err, 0.0),
+                        fmt='none', color='black', capsize=3, lw=1, zorder=3)
+        ax_phi.axhline(0, color='black', lw=1.0)
+        ax_phi.set_xticks(x_pos)
+        ax_phi.set_xticklabels(residue_names, rotation=45, ha='right', fontsize=7)
+        ax_phi.set_ylabel('Δφ (°)', fontsize=9)
+        ax_phi.set_title('φ difference: Route B − Route A', fontsize=9)
+        ax_phi.set_facecolor('white')
+
+        # Panel C: summary text box (col 4)
+        ax_txt = fig.add_subplot(bot_gs[0, 4])
+        ax_txt.axis('off')
+        mean_cv2_A = float(np.mean([c['cv2'] for c in fold_A_crossings])) if fold_A_crossings else float('nan')
+        mean_cv2_B = float(np.mean([c['cv2'] for c in fold_B_crossings])) if fold_B_crossings else float('nan')
+        mean_cv2_U = float(np.mean([c['cv2'] for c in unfold_crossings])) if unfold_crossings else float('nan')
+        nb_A = _nb(mean_cv2_A) if np.isfinite(mean_cv2_A) else 'unknown'
+        nb_B = _nb(mean_cv2_B) if np.isfinite(mean_cv2_B) else 'unknown'
+        nb_U = _nb(mean_cv2_U) if np.isfinite(mean_cv2_U) else 'unknown'
+        summary_text = (
+            f'Route A (CV2 < {route_split:.2f})\n'
+            f'  n = {n_A}\n'
+            f'  nearest basin: {nb_A}\n'
+            f'  mean CV2: {mean_cv2_A:.3f}\n\n'
+            f'Route B (CV2 >= {route_split:.2f})\n'
+            f'  n = {n_B}\n'
+            f'  nearest basin: {nb_B}\n'
+            f'  mean CV2: {mean_cv2_B:.3f}\n\n'
+            f'Unfold\n'
+            f'  n = {n_unfold_cnt}\n'
+            f'  nearest basin: {nb_U}\n'
+            f'  mean CV2: {mean_cv2_U:.3f}\n\n'
+            f'Most diff. residue\n'
+            f'  psi: {most_diff_psi}\n'
+            f'  phi: {most_diff_phi}\n\n'
+            f'Route split CV2: {route_split:.3f}'
+        )
+        ax_txt.text(0.05, 0.95, summary_text, transform=ax_txt.transAxes,
+                    fontsize=8, verticalalignment='top', fontfamily='monospace',
+                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+        fig.suptitle(
+            f'Per-residue backbone geometry at committed Poincaré crossing events\n'
+            f'{n_fold} fold (A:{n_A}, B:{n_B}) + {n_unfold_cnt} unfold committed crossings'
+            f'  |  dwell≥{dwell_ps:.0f} ps',
+            fontsize=12, fontweight='bold'
+        )
+
+        png_path = out / 'poincare_residue_torsions.png'
+        fig.savefig(str(png_path), dpi=120, bbox_inches='tight', facecolor=fig.get_facecolor())
+        plt.close(fig)
+    except Exception as exc:
+        warnings.append(f'Poincare residue torsions plot failed: {exc}')
+        png_path = None
+
+    files: dict = {}
+    if png_path is not None and Path(png_path).exists():
+        files['poincare_residue_torsions_png'] = str(png_path)
+    csv_out = out / 'poincare_residue_torsions.csv'
+    if csv_out.exists():
+        files['poincare_residue_torsions_csv'] = str(csv_out)
+
+    return {
+        'available': True,
+        'route_split_cv2': route_split,
+        'n_route_A': n_A,
+        'n_route_B': n_B,
+        'n_unfold': n_unfold_cnt,
+        'most_different_residue_psi': most_diff_psi,
+        'most_different_residue_phi': most_diff_phi,
+        'files': files,
+    }
+
+
 def analyze_chignolin_fes(d, args, base_logw: np.ndarray, selected: str, boost_ok: bool, kbt_kcal: float, out: Path, warnings: list, progress) -> dict:
     """2D FES: X=dist(Asp3N-Thr8O), Y=dist(Asp3N-Gly7O), energy in kJ/mol, 0-20 kJ/mol range."""
     if not getattr(args, "chignolin_fes", False):
@@ -7259,6 +8103,8 @@ def analyze(d,args, progress: Optional[Progress] = None):
     extra_obs_info=analyze_extra_observable_pmfs(d,args,np.asarray(m['logw'],dtype=np.float64),selected,boost_ok,kbt_kcal,out,warn,progress)
     chignolin_fes_info=analyze_chignolin_fes(d,args,np.asarray(m['logw'],dtype=np.float64),selected,boost_ok,kbt_kcal,out,warn,progress)
     secondary_cv_pmf_info=analyze_secondary_cv_pmf(d,args,np.asarray(m['logw'],dtype=np.float64),selected,boost_ok,kbt_kcal,out,warn,progress)
+    poincare_info=analyze_poincare_map(d,args,np.asarray(m['logw'],dtype=np.float64),selected,boost_ok,kbt_kcal,out,warn,progress)
+    poincare_torsions_info=analyze_poincare_residue_torsions(d,args,out,poincare_info,warn,progress)
     cv1_cv2_fes_info=analyze_cv1_cv2_2d_fes(d,args,np.asarray(m['logw'],dtype=np.float64),selected,boost_ok,kbt_kcal,out,warn,progress) if isinstance(secondary_cv_pmf_info,dict) and secondary_cv_pmf_info.get('available') else {'available':False,'reason':'Secondary CV PMF unavailable'}
     if progress is not None: progress.bar('analysis stages', 4, 6, 'writing CSV outputs', force=True)
     write_pmf(out/'pmf_unbiased.csv',sel,selected,{'boost_mean_kj_mol':cdiag.get('boost_mean_kj',np.full(args.bins,np.nan)),'boost_var_kj2_mol2':cdiag.get('boost_var_kj2',np.full(args.bins,np.nan))}); write_pmf(out/'pmf_umbrella_only.csv',umbrella,'umbrella_only'); write_pmf(out/'pmf_gamd_exponential.csv',exp_pmf,'gamd_exponential'); write_pmf(out/'pmf_gamd_cumulant2.csv',cum_pmf,'gamd_cumulant2',{'boost_mean_kj_mol':cdiag.get('boost_mean_kj',np.full(args.bins,np.nan)),'boost_var_kj2_mol2':cdiag.get('boost_var_kj2',np.full(args.bins,np.nan))})
@@ -7291,6 +8137,8 @@ def analyze(d,args, progress: Optional[Progress] = None):
     s['extra_observable_pmfs']=extra_obs_info
     s['chignolin_fes']=chignolin_fes_info
     s['secondary_cv_pmf']=secondary_cv_pmf_info
+    s['poincare_map']=poincare_info
+    s['poincare_residue_torsions']=poincare_torsions_info
     s['cv1_cv2_2d_fes']=cv1_cv2_fes_info
     s['epoch_convergence']=epoch_conv_info
     s['epoch_cv_exploration']=epoch_cv_info
@@ -7305,6 +8153,10 @@ def analyze(d,args, progress: Optional[Progress] = None):
         s['files'].update({k:v for k,v in extra_obs_info.get('files',{}).items()})
     if isinstance(chignolin_fes_info,dict) and chignolin_fes_info.get('files'):
         s['files'].update({k:v for k,v in chignolin_fes_info.get('files',{}).items()})
+    if isinstance(poincare_info,dict) and poincare_info.get('files'):
+        s['files'].update({k:v for k,v in poincare_info.get('files',{}).items()})
+    if isinstance(poincare_torsions_info,dict) and poincare_torsions_info.get('files'):
+        s['files'].update({k:v for k,v in poincare_torsions_info.get('files',{}).items()})
     if isinstance(secondary_cv_pmf_info,dict) and secondary_cv_pmf_info.get('files'):
         s['files'].update({k:v for k,v in secondary_cv_pmf_info.get('files',{}).items()})
     if isinstance(cv1_cv2_fes_info,dict) and cv1_cv2_fes_info.get('files'):
@@ -7438,6 +8290,13 @@ def parse_args(argv=None):
     p.add_argument('--skip-first-n-frames', type=int, default=0, metavar='N', help='Discard the first N samples from each replica (sorted by production step) before analysis. Useful for equilibration burn-in. Default 0 (keep all).')
     p.add_argument('--analysis-stride','--sample-stride','--frame-skip', dest='analysis_stride', type=int, default=1, metavar='N', help='Keep every Nth saved analysis sample per replica after --skip-first-n-frames. Aliases: --sample-stride and --frame-skip. Default 1 keeps all samples.')
     p.add_argument('--analysis-stride-offset', type=int, default=0, metavar='N', help='Offset within each replica before applying --analysis-stride. Default 0.')
+    p.add_argument('--no-poincare-map', action='store_true', help='Disable Poincaré return map analysis (poincare_map.png). Enabled by default when secondary CV (cv2) is available.')
+    p.add_argument('--poincare-fold-threshold', type=float, default=None, metavar='CV1', help='CV1 upward-crossing threshold for Poincaré Σ_fold section (entering folded/high-contact region). Default: 90th percentile of CV1 distribution.')
+    p.add_argument('--poincare-unfold-threshold', type=float, default=None, metavar='CV1', help='CV1 downward-crossing threshold for Poincaré Σ_unfold section (entering unfolded/extended region). Default: 5th percentile of CV1 distribution.')
+    p.add_argument('--poincare-min-segment', type=int, default=5, metavar='N', help='Minimum frames between two counted Poincaré crossings (prevents rapid threshold-bounce double-counting). Default 5.')
+    p.add_argument('--poincare-min-dwell', type=int, default=50, metavar='N', help='Committor dwell filter: a crossing only counts if CV1 remains on the committed side for at least N consecutive frames afterward. Filters threshold-bounce artifacts; preserves genuine folding/unfolding events. Default 50 frames (=10 ps at 0.2 ps/frame). Set 0 or 1 to disable.')
+    p.add_argument('--no-poincare-residue-torsions', action='store_true', help='Disable per-residue torsion analysis at Poincaré crossing frames.')
+    p.add_argument('--poincare-route-split', type=float, default=None, metavar='CV2', help='CV2 cutpoint to split Poincaré folding routes A (below) and B (above). Default: auto-midpoint of the two highest fold CV2 peaks.')
     args=p.parse_args(argv)
     if getattr(args,'no_rg',False):
         args.rg_from_trajectories='never'
