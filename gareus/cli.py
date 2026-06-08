@@ -387,6 +387,14 @@ def _add_platform_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--cuda-use-cpu-pme", choices=["auto", "true", "false"], default="auto")
     p.add_argument("--cuda-use-blocking-sync", choices=["auto", "true", "false"], default="auto")
     p.add_argument("--cuda-deterministic-forces", choices=["auto", "true", "false"], default="auto")
+    p.add_argument("--cuda-disable-pme-stream", choices=["auto", "true", "false"], default="auto",
+                   help="OpenMM 8.3+: disable the dedicated CUDA PME stream. 'false' explicitly "
+                        "keeps the stream enabled so PME overlaps direct-space computation on GPU. "
+                        "'auto' lets OpenMM choose the default for the installed version.")
+    p.add_argument("--cuda-mps", action="store_true", default=False,
+                   help="Apply CUDA MPS-optimal settings as soft defaults: UseBlockingSync=false, "
+                        "DeterministicForces=false. Individual --cuda-* flags override these. "
+                        "Requires CUDA MPS running on the node (nvidia-cuda-mps-control -d).")
     p.add_argument("--platform-temp-directory", default="")
     p.add_argument("--cpu-threads", type=int, default=1,
                    help="Threads per replica context (platform CPU only). "

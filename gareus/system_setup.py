@@ -170,6 +170,11 @@ def extra_platform_properties(platform_name: str, args=None) -> dict[str, str]:
     the corresponding option.  CUDA and HIP share most property names in OpenMM;
     OpenCL support is more platform-dependent, so only precision/device routing
     is set there unless the user extends this function.
+
+    ``--cuda-mps`` applies soft defaults (UseBlockingSync=false, DeterministicForces=false)
+    that individual ``--cuda-*`` flags can override.  These settings are required for
+    CUDA Multi-Process Service (MPS) to allow concurrent multi-replica GPU utilization;
+    enable MPS on the node with ``nvidia-cuda-mps-control -d`` before launching.
     """
     if args is None:
         return {}
@@ -177,13 +182,25 @@ def extra_platform_properties(platform_name: str, args=None) -> dict[str, str]:
     props: dict[str, str] = {}
     accelerated = name in {"CUDA", "HIP"}
     if accelerated:
+        mps = bool(getattr(args, "cuda_mps", False))
+        # Soft defaults applied when --cuda-mps is set and the flag is not explicitly overridden.
+        mps_defaults: dict[str, str] = (
+            {"cuda_use_blocking_sync": "false", "cuda_deterministic_forces": "false"} if mps else {}
+        )
         mappings = [
             ("cuda_use_cpu_pme", "UseCpuPme"),
             ("cuda_use_blocking_sync", "UseBlockingSync"),
             ("cuda_deterministic_forces", "DeterministicForces"),
+            # OpenMM 8.3+: DisablePmeStream=false keeps the dedicated PME CUDA stream
+            # enabled so PME reciprocal-space work overlaps direct-space on the GPU.
+            # Default (auto) lets OpenMM decide; set to 'false' to explicitly enable.
+            ("cuda_disable_pme_stream", "DisablePmeStream"),
         ]
         for attr, prop_name in mappings:
-            val = _tri_state_platform_property(getattr(args, attr, "auto"))
+            raw = getattr(args, attr, "auto")
+            if str(raw or "auto").strip().lower() in {"", "auto", "none", "default"} and attr in mps_defaults:
+                raw = mps_defaults[attr]
+            val = _tri_state_platform_property(raw)
             if val is not None:
                 props[prop_name] = val
         temp_dir = str(getattr(args, "platform_temp_directory", "") or "").strip()
