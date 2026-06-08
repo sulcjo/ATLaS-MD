@@ -1,5 +1,5 @@
 schema_version: '2.0'
-description: "Chignolin (GYDPETGTWG) delaunay-feedback 2D contacts x rama-map HMR-GaMD/REUS. Based on fulltreatment6. v7 fixes: (1) boundary pull 5x longer + 2x stronger so range calibration reaches compact states from extended coil; (2) cv2_centers adds -0.70 and 0.0 bridges to close 0.667-unit beta/PPII gap in initial 2D grid; (3) coverage scaffold 5x5=25 pts (was 3x3=9). cv1_range_max intentionally absent — pull calibrates range per system."
+description: "Chignolin (GYDPETGTWG) double-adaptive 2D contacts x rama-map HMR-GaMD/REUS. Run7: window_mode double-adaptive (Delaunay-scaffolded feedback pilots → adaptive-production), md_budget_ns 2000 (2 µs aggregate). All v7 physics unchanged from fulltreatment6."
 
 workflow_help: |
   ============================================================
@@ -9,7 +9,7 @@ workflow_help: |
   COMMAND 1 — GENPEPT seed generation (separate, run first):
     python GENPEPT.py --config chignolin_fulltreatment7.yaml
   Output: chignolin_genpept_3/final_survivor_seeds.csv + PDBs
-  NOTE: genpept_prescan reads chignolin_genpept_5 (pre-existing),
+  NOTE: genpept_prescan reads chignolin_genpept_massive_prior (pre-existing),
         not the freshly generated chignolin_genpept_3.
 
   COMMAND 2 — GAREUS MD workflow:
@@ -33,7 +33,7 @@ workflow_help: |
   - NVT warmup 0.5 fs -> NPT ramp 1.0 fs
   - CV1 boundary pull: 2 x 100,000 steps at 1 fs, k=200 kcal/mol  [v7: 5x longer, 2x stronger]
     -> calibrates achievable contact-fraction range [lo, hi] per system
-  - GENPEPT prescan on chignolin_genpept_5:
+  - GENPEPT prescan on chignolin_genpept_massive_prior:
     scores candidate/minimised/BH/NMA/final-survivor PDBs by
     contact fraction -> window-centre prior + seed library
 
@@ -52,21 +52,25 @@ workflow_help: |
   Starting-structure pull: 50,000 steps/window at 3 fs, k=75
 
   ============================================================
-  STAGE 3  DELAUNAY-FEEDBACK PILOTS  (5 rounds)
+  STAGE 3  DOUBLE-ADAPTIVE PILOT PHASE  (5 feedback rounds)
   ============================================================
+  window_mode=double-adaptive routes:
+    run_adaptive_feedback_auto_loop  (pilots, skip final production)
+    -> handoff CSV -> run_adaptive_production_auto_loop (stage 4)
+
   Each pilot round:
-    pilot_fraction=0.004 x 10,000,000 = 40,000 steps/replica
+    pilot_steps=40,000 steps/replica (explicit; pilot_fraction fallback unused)
     = 160 ps/replica at 4 fs  (hmr-gamd)
     GaMD: sigma0p=sigma0d=5 kcal/mol, 1.25M equil steps (5 ns)
-    WARNING: equil runs in pilots too => ~103M steps pilot overhead vs 160M production
+    WARNING: equil runs in pilots too => ~103M steps pilot overhead
     Exchange: Gibbs-walk every 100 steps
 
-  After each pilot round >= 1 (iterative Delaunay):
+  After each pilot round >= 0 (iterative Delaunay, delaunay_after_round=0):
     samples.csv (CV1+CV2, all replicas pooled)
     -> KDE 64x64 grid, Scott BW
     -> greedy peak pick: up to 16 basin_anchor windows
        (density floor = 5th percentile)
-    -> coverage scaffold (5x5 grid): inject coverage_scaffold   [v7: was 3x3=9]
+    -> coverage scaffold (5x5 grid): inject scaffold windows   [v7: was 3x3=9]
        in any cell with no anchor within dedup_radius=0.10
        (up to 25 extra points; fills unvisited CV regions)
     -> scipy.spatial.Delaunay on all anchor points
@@ -76,8 +80,8 @@ workflow_help: |
     -> anisotropic k = 2*kBT/sigma^2 per window
        sigma = 0.5 x local neighbour spacing, per-axis
        k1 clamped [50, 250], k2 clamped [5, 100] kcal/mol
-    -> stability check: if max anchor shift vs previous
-       round < 0.05 (normalised) -> layout unchanged
+    -> stability check: max anchor shift vs previous round
+       stability_tol=0.001 => all 5 rounds always run (no early-stop)
     -> write delaunay_initial_windows.csv -> next round
 
   Adaptive-feedback layer (every round):
@@ -85,28 +89,39 @@ workflow_help: |
     probes unvalidated, prunes overscanned, extends undersampled
     up to 16 sparse 2D local-patch candidates
 
-  Validation: 20,000 steps/replica (80 ps) with final layout
+  End of pilots: write double_adaptive_handoff_windows.csv
+  Validation: 50,000 steps/replica (200 ps) with final layout
 
   ============================================================
-  STAGE 4  FINAL PRODUCTION
+  STAGE 4  ADAPTIVE-PRODUCTION  (budget: 2000 ns aggregate)
   ============================================================
-  - Fixed window set from last stable Delaunay layout
-  - 10,000,000 steps/replica at 4 fs = 40 ns/replica (hmr-gamd)
-  - GaMD: sigma0p=sigma0d=5 kcal/mol, 1.25M equil per replica (5 ns)
+  Starts from Delaunay-optimised handoff window layout.
+
+  - Total pool: 2000 ns aggregate across all replicas
+  - 5 epochs: each gets ~240 ns aggregate (60% of 2000 ns pool)
+    Per-window per-epoch: ~240/N_windows ns (N_windows from pilots)
+  - Final phase: 800 ns aggregate  (40% pool, min 300 ns)
+    -> highest-quality samples for union-MBAR/PMF
+  - Between epochs: add/retire windows based on coverage/convergence
+    -> seed bank propagated per state (max 1 seed/state)
+    -> GaMD calibration NOT repeated per epoch
   - Gibbs-walk exchange every 100 steps
   - XTC trajectories every 50 steps (200 fs frames)
-  - Output: chignolin_2d_run7/final_production/
-  - analysis_arrays.npz + samples.csv (pooled) for MBAR/PMF
+  - Output: chignolin_2d_run7/adaptive_production/
+  - Union-MBAR across all epochs + analysis_arrays.npz
+
+  Resume: pool persisted in adaptive_production/adaptive_runtime_pool.json.
+  To extend budget after run completes: patch total_ns in that JSON and
+  re-run with --resume (NOT --md-budget-ns, which is ignored on resume).
 
   ============================================================
-  KEY NUMBERS
+  KEY NUMBERS (N_windows ~ 10-25 from pilots)
   ============================================================
-  Pilot overhead:  ~(160 ps production + 5 ns equil) x N_windows x 5 rounds
-  Final MD:        40 ns x N_windows  (N_windows ~ 10-25)
+  Pilot overhead:  ~(160 ps prod + 5 ns equil) x N_windows x 5 rounds
+  Adaptive-prod:   2000 ns total aggregate (budget-guaranteed)
+    - Epochs (60%):  1200 ns aggregate, 8 x ~150 ns
+    - Final  (40%):   800 ns aggregate
   Platform:         CUDA
-  NOTE: adaptive_production block (md_budget_ns: 840)
-        is PRESENT but UNUSED -- delaunay-feedback routes
-        through adaptive-feedback pipeline only.
   ============================================================
 
 # NOTE: Schema v2.0 migration from chignolin_fulltreatment4.yaml.
@@ -122,13 +137,13 @@ workflow_help: |
 
 genpept:
   seq: "GYDPETGTWG"
-  out: "chignolin_genpept_3"
+  out: "chignolin_genpept_7"
   clean: false
   two_stage: true
   implicit_only: true
-  n: 3000000
-  n_candidate_seeds: 2500
-  n_final_seeds: 1600
+  n: 5000000
+  n_candidate_seeds: 5000
+  n_final_seeds: 2500
   jobs: 64
   generation_backend: fast
   rama_sampling: stratified
@@ -161,7 +176,7 @@ genpept:
   nma_amplitudes: "0.75,1.35"
   nma_cutoff: 12.0
   explore_loop: true
-  explore_rounds: 2
+  explore_rounds: 5
   explore_proposals: 50000
   explore_keep: 250
   explore_bins: 45
@@ -174,7 +189,7 @@ genpept:
 
 genpept_prescan:
   genpept_prescan: true          # was: genpept_prescan_enabled
-  genpept_prescan_dir: _genpept_test/chignolin_genpept_massive_prior
+  genpept_prescan_dir: chignolin_genpept_7
   genpept_prescan_stages:
     - candidate_seeds
     - aa_implicit_minimized_pdbs
@@ -230,7 +245,7 @@ contact_cv:
 
 cv2:
   # CV2 adaptive (was secondary_cv_*)
-  cv2_k_min: 5.0                # was: secondary_cv_adaptive_min_k_kcal
+  cv2_k_min: 20.0                # was: secondary_cv_adaptive_min_k_kcal
   cv2_k_max: 100.0               # was: secondary_cv_adaptive_max_k_kcal
   cv2_k_mode: adaptive           # was: secondary_cv_k_mode
   cv2_adaptive_overlap_sigma: 20.0   # was: secondary_cv_adaptive_overlap_sigma
@@ -244,7 +259,7 @@ cv2:
   cv2_centers: [-1.0, -0.7, -0.333, 0.0, 0.333, 1.0]
 
 starting_structures:
-  seed_conformers_dir: _genpept_test/chignolin_genpept_massive_prior
+  seed_conformers_dir: chignolin_genpept_7
   us_pull_steps_per_window: 50000
   us_pull_timestep_fs: 3.0
   us_pull_k: 75.0                # was: us_pull_k_kcal_a2
@@ -252,13 +267,14 @@ starting_structures:
   us_2d_secondary_k_scale: 5.0  # was: us_2d_start_secondary_k_pull_scale
 
 windows:
-  window_mode: delaunay-feedback
+  window_mode: double-adaptive
   aggressiveness: aggressive          # was: adaptive_window_aggressiveness
-  pilot_fraction: 0.004               # was 0.008; 0.004 x 10M production = 40,000 pilot steps/round (160 ps)
-  validation_steps: 50000             # was 20000; 200 ps validation with final layout
+  pilot_fraction: 0.004               # used only when pilot_steps not set; kept as fallback
+  pilot_steps: 40000                  # explicit pilot steps/round (160 ps at 4 fs); overrides pilot_fraction x production_steps
+  validation_steps: 50000             # 200 ps validation with final layout
   adaptive_rounds: 5                  # was: adaptive_feedback_rounds
   sparse_2d: true                     # was: sparse_2d_patches_enabled + contact_sparse_2d_patches_enabled
-  max_2d_patches: 16                  # was: adaptive_2d_max_local_patches
+  max_2d_patches: 32                  # was: adaptive_2d_max_local_patches
   explicit_2d_window_schema: generic
   region_memory: true                 # was: adaptive_feedback_region_state_enabled
   region_memory_decay: 0.5            # was: adaptive_feedback_region_memory_decay
@@ -269,17 +285,19 @@ windows:
 
   # Minimum pilot rounds: early-stop cannot trigger before this count regardless of convergence score.
   # Prevents run5-class failure where AF stopped after round 1 with a frozen ensemble.
-  adaptive_min_rounds: 2               # new pipeline parameter (adaptive_feedback_min_rounds)
+  adaptive_min_rounds: 3               # new pipeline parameter (adaptive_feedback_min_rounds)
 
   # CV coverage gates: block early-stop if pilot under-samples CV space.
   # Computed from samples.csv before cleanup; uses achievable range from boundary pull.
-  pilot_min_cv1_coverage: 0.60        # CV1 (contacts): require 60% of [lo,hi] achievable range sampled
-  pilot_min_cv2_coverage: 0.70        # CV2 (Ramachandran): require 70% of secondary-CV center span sampled
+  pilot_min_cv1_coverage: 0.80        # CV1 (contacts): require 60% of [lo,hi] achievable range sampled
+  pilot_min_cv2_coverage: 0.80        # CV2 (Ramachandran): require 70% of secondary-CV center span sampled
 
-  # Iterative Delaunay: re-run placement every pilot round >= 1 until anchor set stabilises.
-  # Prevents blind spots from poor first-round pilot coverage.
+  # Iterative Delaunay within double-adaptive pilot phase.
+  # Default for non-delaunay-feedback modes is OFF; set explicitly to enable.
+  # delaunay_after_round=0: runs on every pilot round (0,1,2,3,4).
+  # delaunay_stability_tol=0.001: near-zero => all 5 rounds always run (no early-stop).
   delaunay_iterate: true
-  delaunay_stability_tol: 0.001        # was 0.05; near-zero => Delaunay never declares layout stable early; all 5 rounds always run (disables early-stop via stability criterion)
+  delaunay_stability_tol: 0.001
 
   # Coverage scaffold: inject grid windows in CV cells with no KDE-peak anchor.
   # v7: 5×5 grid → up to 25 scaffold points (was 3×3=9). Finer gap-fill ensures
@@ -289,14 +307,14 @@ windows:
   delaunay_coverage_grid_n: 5   # was: 3
 
 adaptive_production:
-  # Global aggregate MD pool
-  md_budget_ns: 840.0                 # was: adaptive_production_total_md_pool_ns
+  # Global aggregate MD pool — ACTIVE in double-adaptive (routes to adaptive-production)
+  md_budget_ns: 2000.0               # was 840.0; 2 µs aggregate across all replicas
 
   # Epoch schedule
-  ap_epochs: 5                        # was 10; 5 epochs with larger per-epoch budget from 10M production steps
+  ap_epochs: 8                        # was 5; 8 epochs at 2000 ns gives ~150 ns/epoch aggregate (~10 ns/window at 15 windows); more adaptation checkpoints than 5 with still ample per-epoch statistics
   # ap_epoch_steps / ap_final_steps: omit to let the code compute from pool balance.
-  # Code now distributes remaining budget evenly across remaining epochs using actual
-  # n_states and timestep. Explicit values override if set > 0.
+  # Code recomputes epoch budget live at each epoch start: (remaining - final_reserve) / epochs_remaining.
+  # With 2000 ns pool: 60% = 1200 ns epochs (8 x ~150 ns each), 40% = 800 ns final.
 
   # Final phase
   ap_final_pool_fraction: 0.40        # was: adaptive_production_final_pool_fraction
@@ -308,7 +326,7 @@ adaptive_production:
   ap_write_reports: true              # was: adaptive_production_write_action_reports
   ap_write_mbar_inputs: true          # was: adaptive_production_write_union_mbar_inputs
   ap_run_mbar: true                   # was: adaptive_production_run_union_mbar_analysis
-  ap_fes_bins: "80,100"               # was "80,40"; CV2 bins raised to 100 for higher Ramachandran PMF resolution
+  ap_fes_bins: "40,80"               # was "80,40"; CV2 bins raised to 100 for higher Ramachandran PMF resolution
 
   # Seed bank
   ap_seed_bank: true                  # was: adaptive_production_propagate_seed_bank
@@ -337,6 +355,7 @@ output:
   traj_interval: 50
   report_interval: 50
   distance_output_interval: 50
+  parquet_flush_rows: 200000             # was 5000; 200k rows/chunk ~= 13 ns/chunk at 15 windows/50-step interval → far fewer parquet parts
   traj_format: xtc
   # Dropped: progress_update_interval_sec — hardcoded internally.
 
@@ -352,7 +371,7 @@ platform:
   #   cpu_budget: 32
   #   max_cpu_per_replica: 2     → 2 threads/replica
   #   cpu_threads: 4             → 4 threads/replica (no budget, explicit)
-  cpu_budget: 64
+  cpu_budget: 32
   max_cpu_per_replica: 6
 
 simulation:
@@ -363,16 +382,16 @@ simulation:
   # Dropped: equil_safe_chunk_steps — hardcoded 100.
 
 gamd:
-  production_steps: 10000000          # was 1000000; 10M steps = 40 ns/window at 4 fs; matches run2 near-converged budget (10M achieved RMSE=0.113, just above 0.1 threshold)
-  sigma0p: 5.0                        # was 6.0; reduced 15% to lower anharmonicity score from ~0.58 toward ~0.45
-  sigma0d: 5.0                        # was 6.0; idem
+  production_steps: 10000000          # double-adaptive: unused for epoch lengths (adaptive-production overrides per epoch from md_budget_ns pool); only fallback if pool disabled
+  sigma0p: 6.0                        # was 6.0; reduced 15% to lower anharmonicity score from ~0.58 toward ~0.45
+  sigma0d: 6.0                        # was 6.0; idem
   equil_steps: 1250000                # was 100000; 5 ns at 4 fs for thorough GaMD calibration; NOTE: runs in every pilot round too (heavy overhead, see workflow_help WARNING)
   gamd_averaging_window: 2000
   # Dropped: gamd_cmd_steps — hardcoded 50000.
 
 exchange:
   exchange_mode: gibbs-walk
-  exchange_interval: 100
+  exchange_interval: 500
 
 tui:
   tui_mode: interactive

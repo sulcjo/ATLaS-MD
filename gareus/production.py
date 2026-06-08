@@ -3207,6 +3207,17 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     # following exchange instead of synchronizing all contexts again.
     observable_cache: dict[str, object] = {}
 
+    # Stuck-replica rescue: detect replicas pinned at CV1≈0 (fully-extended dead zone where
+    # the contact switching function gradient is ~0 and the umbrella provides no actual force).
+    # After _stuck_max_intervals consecutive exchange intervals below _stuck_threshold, copy
+    # positions from the nearest non-stuck replica and reinitialise velocities.
+    _stuck_reseed_flag = getattr(args, "cv1_stuck_reseed", None)
+    _stuck_enabled = bool(_stuck_reseed_flag) if _stuck_reseed_flag is not None else primary_cv_is_contacts(args)
+    _stuck_threshold = float(getattr(args, "cv1_stuck_threshold", 0.03) or 0.03)
+    _stuck_max_intervals = int(getattr(args, "cv1_stuck_detect_intervals", 500) or 500)
+    _stuck_counter = np.zeros(nrep, dtype=int)
+    _stuck_rescue_total = 0
+
     # Shared thread pool for parallel step_all() and getState() across replicas.
     # OpenMM releases the GIL during both context.step() and context.getState(),
     # so Python threads genuinely run in parallel.  One thread per replica is the
@@ -3936,6 +3947,43 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 parity, attempt = attempt_exchanges(absolute_step, parity, attempt)
                 while next_exchange <= prod_done:
                     next_exchange += int(args.exchange_interval) if int(args.exchange_interval) > 0 else prod_total + 1
+                # Stuck-replica rescue: replicas pinned at CV1≈0 have near-zero umbrella gradient
+                # (contact switching function decays to 0 when all pairs >> r0) so GaMD alone
+                # can't drive escape.  Copy positions from the closest non-stuck replica and
+                # reinitialise velocities to break the dead zone.
+                if _stuck_enabled:
+                    _pv = observable_cache.get("primary_values")
+                    if isinstance(_pv, np.ndarray) and len(_pv) == nrep:
+                        for _r in range(nrep):
+                            if float(_pv[_r]) < _stuck_threshold:
+                                _stuck_counter[_r] += 1
+                            else:
+                                _stuck_counter[_r] = 0
+                            if _stuck_counter[_r] >= _stuck_max_intervals:
+                                _w = int(assignments[_r])
+                                _target_cv = float(centers_a[_w])
+                                _dists = np.abs(_pv.astype(float) - _target_cv)
+                                _dists[_r] = 1e9
+                                _src = int(np.argmin(_dists))
+                                if float(_pv[_src]) > _stuck_threshold:
+                                    _src_state = sims[_src].context.getState(
+                                        getPositions=True, enforcePeriodicBox=True
+                                    )
+                                    sims[_r].context.setPositions(_src_state.getPositions())
+                                    sims[_r].context.setVelocitiesToTemperature(
+                                        float(args.temperature_k) * unit.kelvin,
+                                        int(args.seed) + _r + int(absolute_step % 99991),
+                                    )
+                                    _stuck_counter[_r] = 0
+                                    _stuck_rescue_total += 1
+                                    print(
+                                        f"STUCK-RESCUE step {absolute_step}: replica {_r} window {_w} "
+                                        f"(target CV1={_target_cv:.3f}) stuck at CV1={float(_pv[_r]):.3f} "
+                                        f"for {_stuck_max_intervals} intervals; "
+                                        f"positions from replica {_src} (CV1={float(_pv[_src]):.3f}); "
+                                        f"rescue #{_stuck_rescue_total}",
+                                        flush=True,
+                                    )
 
             if checkpoint_interval > 0 and (prod_done >= next_checkpoint or prod_done >= prod_total):
                 flush_scalar_writers()

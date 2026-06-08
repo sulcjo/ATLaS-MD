@@ -228,6 +228,17 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--delaunay-coverage-grid-n", type=int, default=3,
                    help="N for the N×N coverage scaffold grid (default 3 → ≤9 scaffold points).")
 
+    # Stuck-replica rescue (contact CV)
+    p.add_argument("--cv1-stuck-reseed", action=argparse.BooleanOptionalAction, default=None,
+                   help="Detect replicas pinned at CV1≈0 (fully-extended dead zone) and rescue by "
+                        "copying positions from a non-stuck replica. Default: on when contact CV active, "
+                        "off otherwise.")
+    p.add_argument("--cv1-stuck-threshold", type=float, default=0.03,
+                   help="Contact fraction below which a replica is considered potentially stuck (default 0.03).")
+    p.add_argument("--cv1-stuck-detect-intervals", type=int, default=500,
+                   help="Consecutive exchange intervals a replica must stay below --cv1-stuck-threshold "
+                        "before rescue fires (default 500; at exchange_interval=100 steps = 50,000 steps = 200 ps).")
+
     # Region memory
     p.add_argument("--region-memory", action=argparse.BooleanOptionalAction, default=False,
                    help="Enable stateful region classification and memory.")
@@ -367,6 +378,9 @@ def _add_output_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--distance-output-mode", choices=["none", "csv", "jsonl", "both"],
                    default="both")
     p.add_argument("--distance-output-interval", type=int, default=1000)
+    p.add_argument("--parquet-flush-rows", type=int, default=5000,
+                   help="Rows buffered per parquet writer before flushing a chunk to disk (default 5000). "
+                        "Larger values → fewer, bigger parquet parts per run.")
     p.add_argument("--write-analysis-chunks", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--analysis-write-consolidated-npz",
                    action=argparse.BooleanOptionalAction, default=True)
