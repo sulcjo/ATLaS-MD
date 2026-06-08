@@ -919,6 +919,180 @@ def load_epoch_csv_adaptive(ap: Path) -> Data:
     return clean(Data(root, root / 'pmf_analysis', cv, cv2, rg, window, replica, step, u_nk, centers, k_kcal, beta, temp, boost, pot, src_str, meta))
 
 
+# ---------------------------------------------------------------------------
+# Multi-round (adaptive_feedback_round_*) support
+# ---------------------------------------------------------------------------
+
+def _find_gareus_round_dirs(run_dir: Path) -> list:
+    """Return sorted adaptive_feedback_round_*/ dirs that contain analysis_chunks/*.npz."""
+    result = []
+    for d in sorted(run_dir.glob('adaptive_feedback_round_*')):
+        if d.is_dir() and (d / 'umbrella_windows.csv').exists():
+            chunks = d / 'analysis_chunks'
+            if chunks.is_dir() and any(chunks.glob('chunk_*.npz')):
+                result.append(d)
+    return result
+
+
+def _load_round_raw(round_dir: Path) -> Optional[dict]:
+    """Load per-sample arrays from all NPZ chunks in a round dir."""
+    chunks_dir = round_dir / 'analysis_chunks'
+    bufs: dict = {k: [] for k in ('cv_A', 'secondary_cv', 'step', 'replica', 'window',
+                                   'gamd_boost_total_kj_mol', 'potential_kj_mol')}
+    for chunk_path in sorted(chunks_dir.glob('chunk_*.npz')):
+        try:
+            with np.load(chunk_path, allow_pickle=False) as f:
+                n = len(f['cv_A'])
+                if n == 0:
+                    continue
+                bufs['cv_A'].append(np.asarray(f['cv_A'], float))
+                for key in ('secondary_cv', 'cv2_A'):
+                    if key in f.files:
+                        bufs['secondary_cv'].append(np.asarray(f[key], float))
+                        break
+                else:
+                    bufs['secondary_cv'].append(np.full(n, np.nan))
+                bufs['step'].append(np.asarray(f['step'], int) if 'step' in f.files else np.arange(n, dtype=int))
+                bufs['replica'].append(np.asarray(f['replica'], int) if 'replica' in f.files else np.zeros(n, int))
+                bufs['window'].append(np.asarray(f['window'], int) if 'window' in f.files else np.zeros(n, int))
+                for key in ('gamd_boost_total_kj_mol', 'gamd_boost_kj_mol'):
+                    if key in f.files:
+                        bufs['gamd_boost_total_kj_mol'].append(np.asarray(f[key], float))
+                        break
+                else:
+                    bufs['gamd_boost_total_kj_mol'].append(np.full(n, np.nan))
+                bufs['potential_kj_mol'].append(np.asarray(f['potential_kj_mol'], float) if 'potential_kj_mol' in f.files else np.full(n, np.nan))
+        except Exception:
+            pass
+    if not bufs['cv_A']:
+        return None
+    return {k: np.concatenate(v) for k, v in bufs.items()}
+
+
+def _build_union_window_table(all_dirs: list, tol: float = 5e-4) -> list:
+    """Deduplicate windows across all round dirs + final_production.
+
+    Returns list of dicts sorted by (primary_center, secondary_cv_center).
+    Tolerance tol is used to merge numerically identical centers.
+    """
+    seen: dict = {}
+    for rdir in all_dirs:
+        wcsv = rdir / 'umbrella_windows.csv'
+        if not wcsv.exists():
+            continue
+        _, _, rows = read_windows(wcsv)
+        for row in rows:
+            pc = float(row.get('primary_center', row.get('center_A', 0)))
+            sc = float(row.get('secondary_cv_center', 0))
+            pk = float(row.get('primary_k', row.get('k_kcal_mol_A2', 0)))
+            sk = float(row.get('secondary_cv_k_kcal_mol', 0))
+            key = (round(pc / tol), round(sc / tol))
+            if key not in seen:
+                seen[key] = {'primary_center': pc, 'secondary_cv_center': sc,
+                             'primary_k_kcal': pk, 'secondary_k_kcal': sk}
+    return sorted(seen.values(), key=lambda w: (w['primary_center'], w['secondary_cv_center']))
+
+
+def _round_window_to_union_map(round_dir: Path, union_windows: list, tol: float = 5e-4) -> dict:
+    """Map per-round local window index → union window index."""
+    _, _, rows = read_windows(round_dir / 'umbrella_windows.csv')
+    mapping: dict = {}
+    for row in rows:
+        w_local = int(float(row.get('window', 0)))
+        pc = float(row.get('primary_center', row.get('center_A', 0)))
+        sc = float(row.get('secondary_cv_center', 0))
+        for k_union, uw in enumerate(union_windows):
+            if abs(uw['primary_center'] - pc) < tol and abs(uw['secondary_cv_center'] - sc) < tol:
+                mapping[w_local] = k_union
+                break
+    return mapping
+
+
+def _compute_u_nk_analytical(cv1: np.ndarray, cv2: np.ndarray,
+                              union_windows: list, beta: float) -> np.ndarray:
+    """Compute N×K_union reduced bias matrix analytically from CV values."""
+    K = len(union_windows)
+    scale = beta * KJ_PER_KCAL
+    u = np.empty((cv1.size, K), dtype=np.float64)
+    for k, w in enumerate(union_windows):
+        dc1 = cv1 - w['primary_center']
+        dc2 = cv2 - w['secondary_cv_center']
+        bias_kcal = 0.5 * w['primary_k_kcal'] * dc1 ** 2 + 0.5 * w['secondary_k_kcal'] * dc2 ** 2
+        u[:, k] = scale * bias_kcal
+    return u
+
+
+def _augment_with_adaptive_rounds(d: Data, run_dir: Path) -> Data:
+    """Combine final_production Data with samples from adaptive_feedback_round_* dirs.
+
+    Builds the union window set across all rounds, recomputes u_nk analytically
+    for every sample, and returns a new Data with all samples concatenated.
+    """
+    round_dirs = _find_gareus_round_dirs(run_dir)
+    if not round_dirs:
+        return d
+
+    all_dirs = round_dirs + [d.prod_dir]
+    union_windows = _build_union_window_table(all_dirs)
+    K_union = len(union_windows)
+
+    round_data = []
+    for rdir in round_dirs:
+        raw = _load_round_raw(rdir)
+        if raw is None or raw['cv_A'].size == 0:
+            continue
+        w2u = _round_window_to_union_map(rdir, union_windows)
+        raw['window_union'] = np.array([w2u.get(int(w), 0) for w in raw['window']], dtype=int)
+        round_data.append(raw)
+
+    if not round_data:
+        return d
+
+    final_w2u = _round_window_to_union_map(d.prod_dir, union_windows)
+    final_window_union = np.array([final_w2u.get(int(w), int(w)) for w in d.window], dtype=int)
+
+    cv1_all = np.concatenate([d.cv] + [r['cv_A'] for r in round_data])
+    cv2_all = np.concatenate([d.cv2] + [r['secondary_cv'] for r in round_data])
+    rg_all = np.concatenate([d.rg_A] + [np.full(r['cv_A'].size, np.nan) for r in round_data])
+    win_all = np.concatenate([final_window_union] + [r['window_union'] for r in round_data])
+    rep_all = np.concatenate([d.replica] + [r['replica'] for r in round_data])
+    step_all = np.concatenate([d.step] + [r['step'] for r in round_data])
+    boost_all = np.concatenate([d.boost_kj] + [r['gamd_boost_total_kj_mol'] for r in round_data])
+    pot_parts = [d.potential_kj if d.potential_kj is not None else np.full(d.cv.size, np.nan)]
+    pot_parts += [r['potential_kj_mol'] for r in round_data]
+    pot_all = np.concatenate(pot_parts)
+
+    u_all = _compute_u_nk_analytical(cv1_all, cv2_all, union_windows, d.beta)
+
+    centers_union = np.array([w['primary_center'] for w in union_windows], float)
+    ks_union = np.array([w['primary_k_kcal'] for w in union_windows], float)
+
+    n_round_samples = sum(r['cv_A'].size for r in round_data)
+    meta = dict(d.meta)
+    meta['load_notes'] = list(meta.get('load_notes') or []) + [
+        f'Multi-round augmentation: {len(round_dirs)} adaptive_feedback_round_* dirs, '
+        f'+{n_round_samples} pilot samples ({cv1_all.size} total). '
+        f'Union {K_union} windows (final_production had {d.u_nk.shape[1]}).'
+    ]
+    meta['umbrella_window_rows'] = [
+        {'center_A': str(w['primary_center']), 'k_kcal_mol_A2': str(w['primary_k_kcal']),
+         'primary_center': str(w['primary_center']),
+         'secondary_cv_center': str(w['secondary_cv_center']),
+         'secondary_cv_k_kcal_mol': str(w['secondary_k_kcal'])}
+        for w in union_windows
+    ]
+    meta['adaptive_round_dirs'] = [str(r) for r in round_dirs]
+
+    return clean(Data(
+        d.prod_dir, d.out_dir,
+        cv1_all, cv2_all, rg_all, win_all, rep_all, step_all,
+        u_all, centers_union, ks_union,
+        d.beta, d.temp, boost_all, pot_all,
+        d.source + f'+{len(round_dirs)}rounds',
+        meta,
+    ))
+
+
 def load_parquet_adaptive_union(adaptive_dir: Path) -> Data:
     """Load MBAR inputs from adaptive-production Parquet epoch data.
 
@@ -1451,7 +1625,7 @@ def _apply_analysis_stride(d: Data, stride: int, offset: int = 0) -> Data:
     d.meta['analysis_stride_offset']=int(offset)
     return d
 
-def load_data(inp: Path, out: Optional[Path], source: str = 'auto') -> Data:
+def load_data(inp: Path, out: Optional[Path], source: str = 'auto', no_augment: bool = False) -> Data:
     prod=prod_dir_of(inp)
     # Adaptive-production: prefer new Parquet epoch data, fall back to legacy NPZ.
     if prod.name == 'adaptive_production':
@@ -1514,6 +1688,11 @@ def load_data(inp: Path, out: Optional[Path], source: str = 'auto') -> Data:
     else:
         raise ValueError(f'Unknown analysis source {source!r}; use auto, parquet, npz, or csv')
     if out is not None: d.out_dir=Path(out)
+    if not no_augment:
+        run_dir = prod.parent if prod.name == 'final_production' else prod
+        if _find_gareus_round_dirs(run_dir):
+            d = _augment_with_adaptive_rounds(d, run_dir)
+            if out is not None: d.out_dir = Path(out)
     return d
 
 def logsumexp(a,axis=None):
@@ -6934,20 +7113,17 @@ def analyze_poincare_map(d: Data, args, base_logw: np.ndarray, selected: str, bo
     """
     if getattr(args, 'no_poincare_map', False):
         return {'available': False, 'reason': 'disabled via --no-poincare-map'}
-    if not _poincare_primary_cv_supported(d.meta):
-        return {
-            'available': False,
-            'reason': 'Poincare fold/unfold labels require primary_cv=nonlocal-contacts/contact fraction; disabled for this primary CV',
-            'primary_cv': (d.meta or {}).get('primary_cv', ''),
-            'primary_cv_label': _primary_cv_label(d.meta),
-        }
     cv1 = np.asarray(d.cv, dtype=np.float64)
-    cv2 = np.asarray(d.cv2, dtype=np.float64)
+    cv2_raw = np.asarray(d.cv2, dtype=np.float64)
+    # If no secondary CV, use CV1 itself as the observable recorded at crossings
+    # (1-D first-return map: where in CV1 space does the trajectory land at each threshold crossing?)
+    cv2_is_self = np.sum(np.isfinite(cv2_raw)) < 100
+    cv2 = cv1.copy() if cv2_is_self else cv2_raw
     replica = np.asarray(d.replica, dtype=np.int32)
     step = np.asarray(d.step, dtype=np.int64) if d.step is not None and len(d.step) == len(cv1) else np.arange(len(cv1), dtype=np.int64)
     mask_valid = np.isfinite(cv1) & np.isfinite(cv2)
     if np.count_nonzero(mask_valid) < 100:
-        return {'available': False, 'reason': 'Too few finite CV1+CV2 samples', 'n_finite': int(np.count_nonzero(mask_valid))}
+        return {'available': False, 'reason': 'Too few finite CV1 samples', 'n_finite': int(np.count_nonzero(np.isfinite(cv1)))}
 
     # Threshold selection
     c_fold_arg = getattr(args, 'poincare_fold_threshold', None)
@@ -7101,7 +7277,9 @@ def analyze_poincare_map(d: Data, args, base_logw: np.ndarray, selected: str, bo
             if len(data) < 10:
                 return []
             kde = gaussian_kde(data, bw_method=bw)
-            xg = np.linspace(-1, 1, n)
+            lo = float(np.nanpercentile(data, 1)); hi = float(np.nanpercentile(data, 99))
+            pad = max((hi - lo) * 0.1, 1e-6)
+            xg = np.linspace(lo - pad, hi + pad, n)
             dens = kde(xg)
             pk = _argrelmax(dens, order=10)[0]
             return sorted([(float(xg[i]), float(dens[i])) for i in pk], key=lambda t: -t[1])
@@ -7125,6 +7303,22 @@ def analyze_poincare_map(d: Data, args, base_logw: np.ndarray, selected: str, bo
         unfold_route_str = f"1 route: '{bu['name']}' (CV2≈{unfold_peaks[0][0]:+.2f})"
 
     # Annotated plot
+    # Dynamic CV2 plot range (data-driven; not hardcoded [-1,1])
+    cv2_all = np.concatenate([cv2_fold, cv2_unfold]) if (len(cv2_fold) + len(cv2_unfold)) > 0 else cv2[mask_valid]
+    if len(cv2_all) > 0:
+        cv2_lo = float(np.nanpercentile(cv2_all, 1)); cv2_hi = float(np.nanpercentile(cv2_all, 99))
+    else:
+        cv2_lo = float(np.nanpercentile(cv2[mask_valid], 1)); cv2_hi = float(np.nanpercentile(cv2[mask_valid], 99))
+    cv2_pad = max((cv2_hi - cv2_lo) * 0.08, 0.05)
+    cv2_lo -= cv2_pad; cv2_hi += cv2_pad
+    # Section names: "fold/unfold" for contact CVs, "high/low" for others
+    is_contact_cv = _poincare_primary_cv_supported(d.meta)
+    sname_high = 'fold'  if is_contact_cv else 'high'
+    sname_low  = 'unfold' if is_contact_cv else 'low'
+    cv1_xlabel = _primary_cv_axis_label(d.meta)
+    # Whether to draw rama-map basin shading (only when cv2 has known region annotations)
+    use_basin_shading = bool(regions) and not cv2_is_self
+
     try:
         import matplotlib
         matplotlib.use('Agg')
@@ -7142,16 +7336,17 @@ def analyze_poincare_map(d: Data, args, base_logw: np.ndarray, selected: str, bo
             for sp in ax.spines.values(): sp.set_edgecolor('#cccccc')
 
         def _blines(ax, ori='v'):
+            if not use_basin_shading: return
             for b in basins:
                 fn = ax.axvline if ori == 'v' else ax.axhline
                 fn(b['cv2'], color=b['color'], lw=0.9, ls='--', alpha=0.45)
 
         def _bbg(ax, alpha=0.07):
-            edges = [b['cv2'] - 0.333 for b in basins] + [basins[-1]['cv2'] + 0.333]
-            edges = sorted(set([-1.2] + [round((basins[i]['cv2'] + basins[i+1]['cv2'])/2, 4) for i in range(len(basins)-1)] + [1.2]))
+            if not use_basin_shading: return
+            edges = sorted(set([cv2_lo] + [round((basins[i]['cv2'] + basins[i+1]['cv2'])/2, 4) for i in range(len(basins)-1)] + [cv2_hi]))
             for i, b in enumerate(basins):
-                lo = edges[i] if i < len(edges) else -1.2
-                hi = edges[i+1] if i+1 < len(edges) else 1.2
+                lo = edges[i] if i < len(edges) else cv2_lo
+                hi = edges[i+1] if i+1 < len(edges) else cv2_hi
                 ax.axvspan(lo, hi, color=b['color'], alpha=alpha, zorder=0)
                 ax.axhspan(lo, hi, color=b['color'], alpha=alpha, zorder=0)
 
@@ -7163,10 +7358,10 @@ def analyze_poincare_map(d: Data, args, base_logw: np.ndarray, selected: str, bo
         ax0.axvspan(0, c_unfold, color=UNFOLD_C, alpha=0.10)
         ax0.axvspan(c_fold, float(np.nanmax(cv1_fin)) * 1.05, color=FOLD_C, alpha=0.10)
         ax0.axvline(c_unfold, color=UNFOLD_C, lw=2.2, ls='--',
-                    label=f'Σ_unfold  CV1={c_unfold:.3f}  (downward crossings counted here)')
+                    label=f'Σ_{sname_low}  CV1={c_unfold:.3f}  (downward crossings counted here)')
         ax0.axvline(c_fold, color=FOLD_C, lw=2.2, ls='--',
-                    label=f'Σ_fold   CV1={c_fold:.3f}   (upward crossings counted here)')
-        ax0.set_xlabel('CV1: nonlocal contact fraction  (0 = fully extended, max = native hairpin)', fontsize=10)
+                    label=f'Σ_{sname_high}   CV1={c_fold:.3f}   (upward crossings counted here)')
+        ax0.set_xlabel(f'CV1: {cv1_xlabel}', fontsize=10)
         ax0.set_ylabel('Density (REUS-biased)', fontsize=9)
         ax0.set_title('CV1 distribution — dashed lines are the two Poincaré sections\n'
                       'Each time the trajectory crosses a dashed line, CV2 (backbone geometry) is recorded',
@@ -7174,36 +7369,49 @@ def analyze_poincare_map(d: Data, args, base_logw: np.ndarray, selected: str, bo
         ax0.legend(fontsize=9, loc='upper right')
         ax0.set_xlim(-0.005, float(np.nanmax(cv1_fin)) * 1.08)
 
-        # Row 1 col 0: basin legend
+        # Row 1 col 0: basin legend (or CV info when no basin regions)
         ax_leg = fig.add_subplot(gs[1, 0])
         ax_leg.set_facecolor(PBG); ax_leg.axis('off')
-        ax_leg.set_title('CV2 backbone\nbasin reference', fontsize=10, fontweight='bold')
-        for i, b in enumerate(basins):
-            y = 3.5 - i * (3.5 / max(1, len(basins) - 1)) if len(basins) > 1 else 1.75
-            ax_leg.add_patch(plt.matplotlib.patches.FancyBboxPatch(
-                (-1.2, y - 0.3), 2.4, 0.6, boxstyle='round,pad=0.05',
-                fc=b['color'], alpha=0.15, ec=b['color'], lw=1.2))
-            ax_leg.text(-1.1, y, b['name'], fontsize=10, va='center',
-                        fontweight='bold', color=b['color'])
-            ax_leg.text(0.5, y, f"CV2={b['cv2']:+.3f}", fontsize=9, va='center', color=b['color'])
-        ax_leg.set_xlim(-1.3, 1.3); ax_leg.set_ylim(-0.5, 4.5)
-        ax_leg.text(0, -0.3, 'CV2 = avg backbone similarity\nto each Ramachandran basin\n(all residues)',
-                    ha='center', fontsize=7.5, color='#666666', style='italic')
+        if use_basin_shading and basins:
+            ax_leg.set_title('CV2 reference\nregions', fontsize=10, fontweight='bold')
+            for i, b in enumerate(basins):
+                y = 3.5 - i * (3.5 / max(1, len(basins) - 1)) if len(basins) > 1 else 1.75
+                ax_leg.add_patch(plt.matplotlib.patches.FancyBboxPatch(
+                    (-1.2, y - 0.3), 2.4, 0.6, boxstyle='round,pad=0.05',
+                    fc=b['color'], alpha=0.15, ec=b['color'], lw=1.2))
+                ax_leg.text(-1.1, y, b['name'], fontsize=10, va='center',
+                            fontweight='bold', color=b['color'])
+                ax_leg.text(0.5, y, f"CV2={b['cv2']:+.3f}", fontsize=9, va='center', color=b['color'])
+            ax_leg.set_xlim(-1.3, 1.3); ax_leg.set_ylim(-0.5, 4.5)
+        else:
+            ax_leg.set_title('Poincaré sections', fontsize=10, fontweight='bold')
+            info_txt = (
+                f'CV1 = {cv1_xlabel}\n\n'
+                f'Σ_{sname_high}: CV1 ↑ {c_fold:.4g}\n'
+                f'(upward crossings)\n\n'
+                f'Σ_{sname_low}: CV1 ↓ {c_unfold:.4g}\n'
+                f'(downward crossings)\n\n'
+                + (f'CV2 = {cv2_label}' if not cv2_is_self else 'CV2 = CV1\n(no secondary CV;\n1-D return map)')
+            )
+            ax_leg.text(0.5, 0.5, info_txt, transform=ax_leg.transAxes,
+                        fontsize=9, va='center', ha='center',
+                        bbox=dict(boxstyle='round,pad=0.5', fc='#f0f4ff', ec='#3498db', lw=1.2))
 
-        # Row 1 col 1: Σ_fold return map
+        # Row 1 col 1: Σ_high/fold return map
         ax_f = fig.add_subplot(gs[1, 1]); _pbg(ax_f); _bbg(ax_f)
         if len(x_fold) > 0:
-            h, xe, ye = np.histogram2d(x_fold, y_fold, bins=65, range=[[-1,1],[-1,1]])
-            ax_f.imshow(np.log1p(h).T, origin='lower', extent=[-1,1,-1,1],
+            h, xe, ye = np.histogram2d(x_fold, y_fold, bins=65, range=[[cv2_lo,cv2_hi],[cv2_lo,cv2_hi]])
+            ax_f.imshow(np.log1p(h).T, origin='lower', extent=[cv2_lo,cv2_hi,cv2_lo,cv2_hi],
                         aspect='auto', cmap='Reds', alpha=0.85, interpolation='bilinear')
             ax_f.scatter(x_fold, y_fold, s=2, alpha=0.07, color='#7b241c', rasterized=True, zorder=2)
-        ax_f.plot([-1,1],[-1,1],'k--',lw=1,alpha=0.45,zorder=3,label='diagonal: perfect memory')
+        ax_f.plot([cv2_lo,cv2_hi],[cv2_lo,cv2_hi],'k--',lw=1,alpha=0.45,zorder=3,label='diagonal: perfect memory')
         _blines(ax_f,'v'); _blines(ax_f,'h')
-        ax_f.set_xlim(-1,1); ax_f.set_ylim(-1,1)
-        ax_f.set_xlabel(f'CV2 ({cv2_label}) at folding event #n', fontsize=9)
-        ax_f.set_ylabel(f'CV2 ({cv2_label}) at folding event #n+1', fontsize=9)
-        ax_f.set_title(f'Σ_fold return map  ({len(x_fold):,} pairs)\n'
-                       f'Each dot = two consecutive times peptide\nreached CV1 > {c_fold:.3f}',
+        ax_f.set_xlim(cv2_lo,cv2_hi); ax_f.set_ylim(cv2_lo,cv2_hi)
+        _cv2_obs_label = cv2_label if not cv2_is_self else cv1_xlabel
+        ax_f.set_xlabel(f'{_cv2_obs_label} at {sname_high} event #n', fontsize=9)
+        ax_f.set_ylabel(f'{_cv2_obs_label} at {sname_high} event #n+1', fontsize=9)
+        ax_f.set_title(f'Σ_{sname_high} return map  ({len(x_fold):,} pairs)\n'
+                       f'Each dot = two consecutive times trajectory\nreached CV1 > {c_fold:.3g}',
                        fontsize=9, fontweight='bold')
         for cv2_p, dens_p in fold_peaks[:2]:
             if dens_p > 0.2:
@@ -7219,20 +7427,20 @@ def analyze_poincare_map(d: Data, args, base_logw: np.ndarray, selected: str, bo
                   transform=ax_f.transData, zorder=6)
         ax_f.legend(fontsize=7, loc='lower right')
 
-        # Row 1 col 2: Σ_unfold return map
+        # Row 1 col 2: Σ_low/unfold return map
         ax_u = fig.add_subplot(gs[1, 2]); _pbg(ax_u); _bbg(ax_u)
         if len(x_unfold) > 0:
-            h2, _, _ = np.histogram2d(x_unfold, y_unfold, bins=65, range=[[-1,1],[-1,1]])
-            ax_u.imshow(np.log1p(h2).T, origin='lower', extent=[-1,1,-1,1],
+            h2, _, _ = np.histogram2d(x_unfold, y_unfold, bins=65, range=[[cv2_lo,cv2_hi],[cv2_lo,cv2_hi]])
+            ax_u.imshow(np.log1p(h2).T, origin='lower', extent=[cv2_lo,cv2_hi,cv2_lo,cv2_hi],
                         aspect='auto', cmap='Greens', alpha=0.85, interpolation='bilinear')
             ax_u.scatter(x_unfold, y_unfold, s=2, alpha=0.07, color='#145a32', rasterized=True, zorder=2)
-        ax_u.plot([-1,1],[-1,1],'k--',lw=1,alpha=0.45,zorder=3)
+        ax_u.plot([cv2_lo,cv2_hi],[cv2_lo,cv2_hi],'k--',lw=1,alpha=0.45,zorder=3)
         _blines(ax_u,'v'); _blines(ax_u,'h')
-        ax_u.set_xlim(-1,1); ax_u.set_ylim(-1,1)
-        ax_u.set_xlabel(f'CV2 ({cv2_label}) at unfolding event #n', fontsize=9)
-        ax_u.set_ylabel(f'CV2 ({cv2_label}) at unfolding event #n+1', fontsize=9)
-        ax_u.set_title(f'Σ_unfold return map  ({len(x_unfold):,} pairs)\n'
-                       f'Each dot = two consecutive times peptide\nreached CV1 < {c_unfold:.3f}',
+        ax_u.set_xlim(cv2_lo,cv2_hi); ax_u.set_ylim(cv2_lo,cv2_hi)
+        ax_u.set_xlabel(f'{_cv2_obs_label} at {sname_low} event #n', fontsize=9)
+        ax_u.set_ylabel(f'{_cv2_obs_label} at {sname_low} event #n+1', fontsize=9)
+        ax_u.set_title(f'Σ_{sname_low} return map  ({len(x_unfold):,} pairs)\n'
+                       f'Each dot = two consecutive times trajectory\nreached CV1 < {c_unfold:.3g}',
                        fontsize=9, fontweight='bold')
         for cv2_p, dens_p in unfold_peaks[:1]:
             if dens_p > 0.2:
@@ -7249,27 +7457,29 @@ def analyze_poincare_map(d: Data, args, base_logw: np.ndarray, selected: str, bo
 
         # Row 2: CV2 marginals (col 0+1) and summary (col 2)
         ax_hist = fig.add_subplot(gs[2, :2]); _pbg(ax_hist)
-        bins_cv2 = np.linspace(-1, 1, 55)
-        basin_edges = sorted(set([-1.2] + [round((basins[i]['cv2'] + basins[i+1]['cv2'])/2, 4) for i in range(len(basins)-1)] + [1.2]))
-        for i, b in enumerate(basins):
-            lo = basin_edges[i] if i < len(basin_edges) else -1.2
-            hi = basin_edges[i+1] if i+1 < len(basin_edges) else 1.2
-            ax_hist.axvspan(lo, hi, color=b['color'], alpha=0.07)
+        bins_cv2 = np.linspace(cv2_lo, cv2_hi, 55)
+        if use_basin_shading and basins:
+            basin_edges_h = sorted(set([cv2_lo] + [round((basins[i]['cv2'] + basins[i+1]['cv2'])/2, 4) for i in range(len(basins)-1)] + [cv2_hi]))
+            for i, b in enumerate(basins):
+                lo2 = basin_edges_h[i] if i < len(basin_edges_h) else cv2_lo
+                hi2 = basin_edges_h[i+1] if i+1 < len(basin_edges_h) else cv2_hi
+                ax_hist.axvspan(lo2, hi2, color=b['color'], alpha=0.07)
         if len(cv2_fold) > 0:
             ax_hist.hist(cv2_fold, bins=bins_cv2, density=True, alpha=0.65, color=FOLD_C,
-                         label=f'at Σ_fold crossings (n={len(cv2_fold):,})')
+                         label=f'at Σ_{sname_high} crossings (n={len(cv2_fold):,})')
         if len(cv2_unfold) > 0:
             ax_hist.hist(cv2_unfold, bins=bins_cv2, density=True, alpha=0.65, color=UNFOLD_C,
-                         label=f'at Σ_unfold crossings (n={len(cv2_unfold):,})')
-        for b in basins:
-            ax_hist.axvline(b['cv2'], color=b['color'], lw=1.3, ls='--', alpha=0.6)
-            ax_hist.text(b['cv2'], 0, b['name'], rotation=90, ha='center', va='bottom',
-                         fontsize=6.5, color=b['color'], fontweight='bold',
-                         transform=ax_hist.get_xaxis_transform())
-        ax_hist.set_xlabel(f'CV2: {cv2_label}  (backbone geometry at crossing)', fontsize=9)
+                         label=f'at Σ_{sname_low} crossings (n={len(cv2_unfold):,})')
+        if use_basin_shading and basins:
+            for b in basins:
+                ax_hist.axvline(b['cv2'], color=b['color'], lw=1.3, ls='--', alpha=0.6)
+                ax_hist.text(b['cv2'], 0, b['name'], rotation=90, ha='center', va='bottom',
+                             fontsize=6.5, color=b['color'], fontweight='bold',
+                             transform=ax_hist.get_xaxis_transform())
+        ax_hist.set_xlabel(f'{_cv2_obs_label}  (value at crossing)', fontsize=9)
         ax_hist.set_ylabel('Density', fontsize=9)
-        ax_hist.set_title('Backbone geometry distribution at each crossing type', fontsize=9, fontweight='bold')
-        ax_hist.set_xlim(-1, 1); ax_hist.legend(fontsize=8)
+        ax_hist.set_title(f'Observable distribution at each crossing type', fontsize=9, fontweight='bold')
+        ax_hist.set_xlim(cv2_lo, cv2_hi); ax_hist.legend(fontsize=8)
 
         ax_sum = fig.add_subplot(gs[2, 2]); ax_sum.axis('off')
         med_f_ps = float(np.median(iv_fold) * 1000) if len(iv_fold) > 0 else float('nan')
@@ -7277,10 +7487,10 @@ def analyze_poincare_map(d: Data, args, base_logw: np.ndarray, selected: str, bo
         dwell_ps = min_dwell * stride_ns * 1000
         summary_txt = (
             'KEY FINDINGS\n\n'
-            f'Folding routes:  {fold_route_str}\n'
-            f'Unfolding route: {unfold_route_str}\n\n'
-            f'Fold crossings:   {len(cv2_fold):,}  (median {med_f_ps:.1f} ps apart)\n'
-            f'Unfold crossings: {len(cv2_unfold):,}  (median {med_u_ps:.1f} ps apart)\n\n'
+            f'Σ_{sname_high} routes:  {fold_route_str}\n'
+            f'Σ_{sname_low} route: {unfold_route_str}\n\n'
+            f'Σ_{sname_high} crossings: {len(cv2_fold):,}  (median {med_f_ps:.1f} ps apart)\n'
+            f'Σ_{sname_low} crossings:  {len(cv2_unfold):,}  (median {med_u_ps:.1f} ps apart)\n\n'
             f'Dwell filter: {min_dwell} frames = {dwell_ps:.1f} ps\n'
             '(only committed entries counted)\n\n'
             'Return map on diagonal\n→ strong pathway memory\n\n'
@@ -7292,9 +7502,9 @@ def analyze_poincare_map(d: Data, args, base_logw: np.ndarray, selected: str, bo
 
         n_rep = len(rep_ids)
         fig.suptitle(
-            f'Chignolin Poincaré map — pathway analysis via CV1/CV2 threshold crossings\n'
+            f'Poincaré map — pathway analysis via CV1 threshold crossings\n'
             f'{n_rep} replicas  |  {int(np.count_nonzero(mask_valid)):,} frames  |  '
-            f'Σ_fold CV1↑{c_fold:.3f}  |  Σ_unfold CV1↓{c_unfold:.3f}',
+            f'Σ_{sname_high} CV1↑{c_fold:.4g}  |  Σ_{sname_low} CV1↓{c_unfold:.4g}',
             fontsize=11, fontweight='bold', y=0.97)
         fig.savefig(out / 'poincare_map.png', dpi=150, bbox_inches='tight', facecolor=BG)
         plt.close(fig)
@@ -8302,6 +8512,7 @@ def parse_args(argv=None):
     p.add_argument('--cv2-max', type=float, default=None, help='Upper bound for secondary CV PMF axis.')
     p.add_argument('--fes2d-cv2-bins', type=int, default=None, help='Bins along secondary CV axis for cv1-vs-cv2 2D FES. Defaults to --cv2-bins or --bins.')
     p.add_argument('--fes2d-cv2-smooth-sigma', type=float, default=0.0, help='Gaussian smoothing sigma (grid cells) for cv1-vs-cv2 2D FES heatmap.')
+    p.add_argument('--no-adaptive-rounds', action='store_true', help='Disable automatic augmentation with adaptive_feedback_round_*/ pilot data. By default all pilot rounds are combined with final_production using union-window MBAR.')
     p.add_argument('--no-rg', action='store_true', help='Disable trajectory-based Rg reconstruction/PMF. Convenience alias for --rg-from-trajectories never.')
     p.add_argument('--no-pca-fes', action='store_true', help='Disable PCA1-vs-PCA2 2D FES. Convenience alias for --pca-fes-from-trajectories never.')
     p.add_argument('--no-extra-pmfs', action='store_true', help='Disable phi/psi, Ramachandran, SASA, secondary-structure, and internal-contact PMFs. Convenience alias for --extra-pmf-from-trajectories never.')
@@ -8356,7 +8567,7 @@ def main(argv=None):
     args=parse_args(argv)
     progress=Progress()
     progress.step('load', 'reading current GaREUS outputs')
-    d=load_data(Path(args.input), Path(args.out) if args.out else None, args.analysis_source)
+    d=load_data(Path(args.input), Path(args.out) if args.out else None, args.analysis_source, no_augment=getattr(args,'no_adaptive_rounds',False))
     if getattr(args,'skip_first_n_frames',0)>0:
         n_before=d.cv.size
         d=_skip_first_n_frames(d,args.skip_first_n_frames)
