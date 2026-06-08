@@ -56,7 +56,7 @@ def _add_system_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--ionic-strength-molar", type=float, default=0.15)
     p.add_argument("--temperature-k", type=float, default=300.0)
     p.add_argument("--pressure-bar", type=float, default=1.0)
-    p.add_argument("--barostat-frequency", type=int, default=25)
+    p.add_argument("--barostat-frequency", type=int, default=100)
     p.add_argument("--production-ensemble", choices=["npt", "nvt"], default="npt")
     p.add_argument("--minimize-iterations", type=int, default=20000)
     p.add_argument("--npt-steps", type=int, default=100000)

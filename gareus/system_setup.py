@@ -368,7 +368,7 @@ def create_system(app, unit, forcefield, topology, args, include_barostat: bool,
         # Defer heavy imports to ``gareus.imports.import_openmm`` to avoid
         # importing OpenMM at module load time.
         openmm, _app, _unit = import_openmm()
-        frequency = int(barostat_frequency if barostat_frequency is not None else getattr(args, "barostat_frequency", 25))
+        frequency = int(barostat_frequency if barostat_frequency is not None else getattr(args, "barostat_frequency", 100))
         barostat = openmm.MonteCarloBarostat(
             args.pressure_bar * unit.bar,
             args.temperature_k * unit.kelvin,

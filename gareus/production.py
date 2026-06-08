@@ -2398,7 +2398,7 @@ def run_shared_gamd_setup_article_a(
         "pressure_bar": float(getattr(args, "pressure_bar", 1.0)),
         "production_ensemble": str(getattr(args, "production_ensemble", "npt")),
         "production_barostat": "OpenMM MonteCarloBarostat" if str(getattr(args, "production_ensemble", "npt")) == "npt" else "none",
-        "production_barostat_frequency": int(getattr(args, "production_barostat_frequency", 0) or getattr(args, "barostat_frequency", 25)),
+        "production_barostat_frequency": int(getattr(args, "production_barostat_frequency", 0) or getattr(args, "barostat_frequency", 100)),
         "timestep_fs": float(args.timestep_fs),
         "gamd_boost_type": str(args.gamd_boost_type),
         "sigma0p_kcal_mol": float(args.sigma0p_kcal_mol),
@@ -2627,7 +2627,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     if production_ensemble not in {"npt", "nvt"}:
         raise ValueError(f"Unsupported --production-ensemble {production_ensemble!r}; use npt or nvt")
     production_include_barostat = production_ensemble == "npt"
-    production_barostat_frequency = int(getattr(args, "production_barostat_frequency", 0) or getattr(args, "barostat_frequency", 25))
+    production_barostat_frequency = int(getattr(args, "production_barostat_frequency", 0) or getattr(args, "barostat_frequency", 100))
 
     # Base production system for GaREUS. Default production is now NPT with
     # OpenMM's MonteCarloBarostat; --production-ensemble nvt preserves the old
