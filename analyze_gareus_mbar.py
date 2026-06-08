@@ -293,6 +293,13 @@ def _primary_cv_axis_label(meta: dict) -> str:
     if units == 'dimensionless': return label
     return f'{label} ({units})'
 
+def _poincare_primary_cv_supported(meta: dict) -> bool:
+    meta = meta or {}
+    mode = str(meta.get('primary_cv', '') or '').lower()
+    label = str(meta.get('primary_cv_label', '') or '').lower()
+    units = str(meta.get('primary_cv_units', '') or '').lower()
+    return mode == 'nonlocal-contacts' or ('contact' in label and units in {'', 'dimensionless'})
+
 class _Arrays(dict):
     """Dict wrapper that exposes a .files attribute for drop-in NpzFile compatibility."""
     @property
@@ -3708,6 +3715,14 @@ def _sample_to_segment_frame(
     return mask, local
 
 
+def _saved_frame_index_from_step(step: int, resume_start: int, step_per_frame: int) -> int:
+    """Return local trajectory frame index for an absolute saved-frame step."""
+    spf = max(1, int(step_per_frame))
+    delta = int(step) - int(resume_start)
+    if delta <= 0:
+        return -1
+    return int(round(float(delta) / float(spf))) - 1
+
 
 def _sample_aligned_trajectory_frames(
     sample_indices: np.ndarray,
@@ -6919,6 +6934,13 @@ def analyze_poincare_map(d: Data, args, base_logw: np.ndarray, selected: str, bo
     """
     if getattr(args, 'no_poincare_map', False):
         return {'available': False, 'reason': 'disabled via --no-poincare-map'}
+    if not _poincare_primary_cv_supported(d.meta):
+        return {
+            'available': False,
+            'reason': 'Poincare fold/unfold labels require primary_cv=nonlocal-contacts/contact fraction; disabled for this primary CV',
+            'primary_cv': (d.meta or {}).get('primary_cv', ''),
+            'primary_cv_label': _primary_cv_label(d.meta),
+        }
     cv1 = np.asarray(d.cv, dtype=np.float64)
     cv2 = np.asarray(d.cv2, dtype=np.float64)
     replica = np.asarray(d.replica, dtype=np.int32)
@@ -7432,8 +7454,8 @@ def analyze_poincare_residue_torsions(d: Data, args, out: Path, poincare_info: d
         """Return (seg_start, seg_path, frame_idx) for the segment containing `step`."""
         for i, (seg_start, seg_path) in enumerate(segs):
             next_start = segs[i + 1][0] if i + 1 < len(segs) else float('inf')
-            if seg_start <= step < next_start:
-                frame_idx = int((step - seg_start) // traj_interval)
+            if seg_start < step <= next_start:
+                frame_idx = _saved_frame_index_from_step(step, seg_start, traj_interval)
                 return seg_start, seg_path, frame_idx
         return None, None, -1
 

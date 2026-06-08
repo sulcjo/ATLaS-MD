@@ -2596,6 +2596,7 @@ def generate_candidates(args):
     np.save(out_dir / "generation_shape_features.npy", X_shape)
     np.save(out_dir / "generation_cluster_features.npy", X)
     np.save(out_dir / "generation_selection_features.npy", X)
+    _write_resume_completion_marker(out_dir / "candidate_seeds.csv", "generation", len(selected_rows), n_candidate)
 
     if not args.keep_all_pdbs:
         shutil.rmtree(conf_dir, ignore_errors=True)
@@ -2952,20 +2953,156 @@ def write_min_csv(path: Path, rows: list[MinResult]):
             writer.writerow(asdict(r))
 
 
-def _resume_csv_done(csv_path, min_rows: int = 1) -> bool:
-    """True if csv_path exists and has at least min_rows data rows (excluding header)."""
+def _csv_data_row_count(csv_path) -> int:
+    """Count CSV data rows, excluding the header."""
     try:
         p = Path(csv_path)
         if not p.exists():
+            return 0
+        with p.open(newline="") as f:
+            reader = csv.reader(f)
+            try:
+                next(reader)
+            except StopIteration:
+                return 0
+            return sum(1 for _ in reader)
+    except Exception:
+        return 0
+
+
+def _write_resume_completion_marker(csv_path, stage: str, rows: int, expected_rows: int):
+    try:
+        p = Path(csv_path)
+        marker = p.with_suffix(p.suffix + ".complete.json")
+        marker.write_text(json.dumps({
+            "stage": str(stage),
+            "csv": str(p),
+            "rows": int(rows),
+            "expected_rows": int(expected_rows),
+            "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }, indent=2))
+    except Exception:
+        pass
+
+
+def _resume_completion_marker_done(csv_path, min_expected_rows: int) -> bool:
+    try:
+        p = Path(csv_path)
+        marker = p.with_suffix(p.suffix + ".complete.json")
+        if not marker.exists():
             return False
-        with p.open() as f:
-            f.readline()  # skip header
-            for i, _ in enumerate(f, 1):
-                if i >= min_rows:
-                    return True
-        return False
+        data = json.loads(marker.read_text())
+        marker_expected = int(data.get("expected_rows", 0) or 0)
+        marker_rows = int(data.get("rows", 0) or 0)
+        if marker_expected < max(1, int(min_expected_rows)) or marker_rows < 0:
+            return False
+        return _csv_data_row_count(p) >= marker_rows
     except Exception:
         return False
+
+
+def _resume_csv_done(csv_path, min_rows: int = 1) -> bool:
+    """True if csv_path exists and has at least min_rows data rows."""
+    min_rows = max(1, int(min_rows))
+    return _csv_data_row_count(csv_path) >= min_rows or _resume_completion_marker_done(csv_path, min_rows)
+
+
+def _csv_count_from_file(csv_path) -> int:
+    return _csv_data_row_count(csv_path)
+
+
+def _candidate_resume_expected_rows(args) -> int:
+    requested = int(getattr(args, "n_candidate_seeds", 0) or 0)
+    proposed = int(getattr(args, "n", requested) or requested)
+    if requested <= 0:
+        return 1
+    if proposed > 0:
+        return max(1, min(requested, proposed))
+    return max(1, requested)
+
+
+def _candidate_manifest_pdbs(args, pdb_dir: Path) -> list[Path]:
+    pdb_dir = Path(pdb_dir)
+    manifest = Path(getattr(args, "out", pdb_dir.parent)) / "candidate_seeds.csv"
+    if pdb_dir.name == "candidate_seeds" and manifest.exists():
+        try:
+            mdf = pd.read_csv(manifest)
+            col = "candidate_pdb_path" if "candidate_pdb_path" in mdf.columns else None
+            if col:
+                pdbs = [Path(x) for x in mdf[col].dropna().astype(str).tolist()]
+                return [p for p in pdbs if p.exists()]
+        except Exception:
+            pass
+    return sorted(pdb_dir.glob("*.pdb"))
+
+
+def _resume_candidate_generation_done(args, csv_path: Path, candidate_dir: Path) -> bool:
+    expected = _candidate_resume_expected_rows(args)
+    return (
+        _resume_csv_done(csv_path, expected)
+        and Path(candidate_dir).is_dir()
+        and len(_candidate_manifest_pdbs(args, candidate_dir)) >= expected
+    )
+
+
+def _resume_minimization_done(score_csv: Path, expected_inputs: int) -> bool:
+    return _resume_csv_done(score_csv, max(1, int(expected_inputs)))
+
+
+def _resume_tiered_implicit_done(args, score_csv: Path) -> bool:
+    out = Path(args.out)
+    summary_path = out / "tiered_implicit_summary.json"
+    expected = 0
+    try:
+        if summary_path.exists():
+            summary = json.loads(summary_path.read_text())
+            expected = int(summary.get("refine_total") or summary.get("refine_inputs") or 0)
+    except Exception:
+        expected = 0
+    if expected <= 0:
+        expected = _csv_count_from_file(out / "tiered_implicit_refine_inputs.csv")
+    if expected <= 0:
+        n_refine = int(getattr(args, "tier_refine_seeds", 0) or 0)
+        if n_refine <= 0:
+            n_candidates = int(getattr(args, "n_candidate_seeds", 0) or 0)
+            n_final = int(getattr(args, "n_final_seeds", 20) or 20)
+            n_refine = min(n_candidates, max(n_final * 2, n_candidates // 2))
+        expected = max(1, int(n_refine))
+    return _resume_minimization_done(score_csv, expected)
+
+
+def _basin_hop_source_pdbs(args, seed_dir: Path) -> list[Path]:
+    return _candidate_manifest_pdbs(args, seed_dir) if Path(seed_dir).name == "candidate_seeds" else sorted(Path(seed_dir).glob("*.pdb"))
+
+
+def _resume_basin_hop_done(args, hop_csv: Path, seed_dir: Path) -> bool:
+    pdbs_all = _basin_hop_source_pdbs(args, seed_dir)
+    if not pdbs_all:
+        return False
+    parent_csv = (Path(args.out) / "basin_hop_parent_seeds.csv") if Path(hop_csv).name == "basin_hop_minima.csv" else Path(hop_csv).with_name(Path(hop_csv).stem + "_parent_seeds.csv")
+    if parent_csv.exists():
+        parent_count = _csv_count_from_file(parent_csv)
+    else:
+        requested = int(getattr(args, "bh_parent_seeds", 0) or 0)
+        parent_count = min(requested, len(pdbs_all)) if requested > 0 else len(pdbs_all)
+    expected = max(1, int(parent_count)) * (1 + max(0, int(getattr(args, "bh_steps", 0) or 0)))
+    return _resume_csv_done(hop_csv, expected)
+
+
+def _resume_nma_minimization_done(score_csv: Path, nma_dir: Path) -> bool:
+    n_inputs = len(list(Path(nma_dir).glob("*.pdb"))) if Path(nma_dir).is_dir() else 0
+    return n_inputs > 0 and _resume_minimization_done(score_csv, n_inputs)
+
+
+def _resume_pca_round_done(args, score_csv: Path, proposal_manifest: Path, bh_csv: Path) -> tuple[bool, int]:
+    expected_min = _csv_count_from_file(proposal_manifest)
+    if expected_min <= 0 or not _resume_minimization_done(score_csv, expected_min):
+        return False, expected_min
+    if bool(getattr(args, "basin_hop", False)) and bool(getattr(args, "explore_bh", True)):
+        min_dir = Path(score_csv).with_name("aa_implicit_minimized_pca_frontier")
+        if not _resume_basin_hop_done(args, bh_csv, min_dir):
+            return False, expected_min
+    return True, expected_min
 
 
 def minresults_from_score_csv(score_csv, mode_override: str = "implicit", out_dir=None) -> list:
@@ -3321,6 +3458,7 @@ def run_minimization_batch(args, pdb_dir: Path, out_pdb_dir: Path, mode: str, sc
 
     results = sorted(results, key=lambda r: r.seed_name)
     write_min_csv(score_csv, results)
+    _write_resume_completion_marker(score_csv, f"{mode}_minimization", len(results), len(pdbs))
     fail = [r for r in results if not r.success]
     if fail:
         write_min_csv(Path(args.out) / f"failed_{mode}_minimizations.csv", fail)
@@ -3443,6 +3581,7 @@ def run_tiered_implicit_minimization(args, candidate_dir: Path):
         "refine_input_manifest": str(Path(args.out) / "tiered_implicit_refine_inputs.csv"),
     }
     (Path(args.out) / "tiered_implicit_summary.json").write_text(json.dumps(summary, indent=2))
+    _write_resume_completion_marker(refine_scores, "tiered_implicit_minimization", len(refined_results), len(selected_rows))
     return refined_results
 
 
@@ -4021,6 +4160,7 @@ def run_basin_hopping(
 
     df = pd.DataFrame([asdict(r) for r in all_records])
     df.to_csv(hop_csv, index=False)
+    _write_resume_completion_marker(hop_csv, "basin_hopping", len(df), len(pdbs) * (1 + max(0, int(args.bh_steps))))
 
     ok = int(df["success"].sum()) if len(df) and "success" in df.columns else 0
     ui_message(f"Basin-hop successful endpoints: {ok}/{len(df)}")
@@ -4987,14 +5127,15 @@ def run_adaptive_exploration_loop(args, combined_results: list[MinResult]):
         round_dir = base_dir / f"round_{round_i + 1:02d}"
         round_dir.mkdir(parents=True, exist_ok=True)
 
-        # Resume: skip rounds whose minimization CSV already exists.
+        # Resume: skip only rounds whose minimization and optional BH CSVs
+        # contain the expected number of completed rows.
         if getattr(args, "resume", False):
             score_csv_r = round_dir / "pca_frontier_implicit_minimization_scores.csv"
             bh_csv_r = round_dir / "pca_frontier_basin_hop_minima.csv"
-            bh_expected = bool(getattr(args, "basin_hop", False)) and bool(getattr(args, "explore_bh", True))
-            if _resume_csv_done(score_csv_r):
+            done, _expected_min_rows = _resume_pca_round_done(args, score_csv_r, round_dir / "pca_frontier_kept_proposals.csv", bh_csv_r)
+            if done:
                 prior = minresults_from_score_csv(score_csv_r, out_dir=Path(args.out))
-                bh_prior = minresults_from_hop_csv(args, bh_csv_r) if bh_expected and _resume_csv_done(bh_csv_r) else []
+                bh_prior = minresults_from_hop_csv(args, bh_csv_r) if bool(getattr(args, "basin_hop", False)) and bool(getattr(args, "explore_bh", True)) else []
                 ui_message(f"[resume] PCA round {round_i + 1}: skipping — {len(prior)} min + {len(bh_prior)} BH results loaded from CSV.")
                 render_dashboard()
                 combined_results.extend(prior)
@@ -8428,7 +8569,7 @@ def main(argv=None):
     # ── Stage 1: Generation ────────────────────────────────────────────────────
     _cand_csv = _out / "candidate_seeds.csv"
     _cand_dir = _out / "candidate_seeds"
-    if _resume and _resume_csv_done(_cand_csv) and _cand_dir.is_dir() and any(_cand_dir.glob("*.pdb")):
+    if _resume and _resume_candidate_generation_done(args, _cand_csv, _cand_dir):
         ui_message(f"[resume] Generation: skipping — existing {_cand_dir.name}/ ({_cand_csv.stat().st_size // 1024} KB CSV)")
         render_dashboard()
         candidate_dir = _cand_dir
@@ -8440,7 +8581,13 @@ def main(argv=None):
         implicit_scores = _out / "implicit_minimization_scores.csv"
 
         # ── Stage 2: Implicit minimization ────────────────────────────────────
-        if _resume and _resume_csv_done(implicit_scores):
+        _implicit_done = False
+        if _resume:
+            if getattr(args, "tiered_implicit_min", False):
+                _implicit_done = _resume_tiered_implicit_done(args, implicit_scores)
+            else:
+                _implicit_done = _resume_minimization_done(implicit_scores, len(_candidate_manifest_pdbs(args, candidate_dir)))
+        if _implicit_done:
             ui_message(f"[resume] Implicit min: skipping — loading {implicit_scores.name}")
             render_dashboard()
             implicit_results = minresults_from_score_csv(implicit_scores, out_dir=_out)
@@ -8453,7 +8600,8 @@ def main(argv=None):
         archive_dir = _out / "basin_archive"
 
         _bh_csv = _out / "basin_hop_minima.csv"
-        _bh_done = _resume and _resume_csv_done(_bh_csv)
+        _bh_source_dir = candidate_dir if getattr(args, "bh_from_candidates", False) else implicit_dir
+        _bh_done = _resume and _resume_basin_hop_done(args, _bh_csv, _bh_source_dir)
         if not _bh_done:
             print_stage("Initial basin archive / scoring", phase_key="exploration", cycle_step="archive")
             ui_message("Archiving/scoring initial implicit minima before optional exploration stages.")
@@ -8469,8 +8617,7 @@ def main(argv=None):
             else:
                 # Smart default: hop from minimized basins, not raw candidates. This avoids
                 # spending the midphase on structures that immediately collapse during minimization.
-                bh_source_dir = candidate_dir if getattr(args, "bh_from_candidates", False) else implicit_dir
-                bh_dir = run_basin_hopping(args, bh_source_dir)
+                bh_dir = run_basin_hopping(args, _bh_source_dir)
                 combined_results.extend(minresults_from_hop_csv(args, _bh_csv))
                 print_stage("Post-BH/MC basin archive / scoring", phase_key="exploration", cycle_step="archive")
                 ui_message("Archiving/scoring search pool after basin hopping / Monte Carlo endpoints.")
@@ -8480,7 +8627,8 @@ def main(argv=None):
         # ── Stage 4: NMA expand + minimize ────────────────────────────────────
         if args.nma_expand:
             nma_scores = _out / "nma_implicit_minimization_scores.csv"
-            if _resume and _resume_csv_done(nma_scores):
+            nma_dir = _out / "nma_probe_seeds"
+            if _resume and _resume_nma_minimization_done(nma_scores, nma_dir):
                 ui_message(f"[resume] NMA + minimize: skipping — loading {nma_scores.name}")
                 render_dashboard()
                 combined_results.extend(minresults_from_score_csv(nma_scores, out_dir=_out))
