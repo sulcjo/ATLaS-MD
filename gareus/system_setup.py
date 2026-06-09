@@ -395,9 +395,32 @@ def prepare_solvated_system(args, out_dir: Path):
     forcefield = make_forcefield(app, args.water_model)
     modeller = app.Modeller(pdb.topology, pdb.positions)
     modeller.addHydrogens(forcefield, pH=args.ph)
+
+    # Enforce a box floor so the box can always contain the fully-extended
+    # conformation.  The current structure is alpha-helical (phi=-60, psi=-45)
+    # and far more compact than a beta-strand, so padding against it would
+    # produce a box too small to hold the peptide once it unfolds in production.
+    #
+    # Strategy: measure the current (helical) bounding box; compute the minimum
+    # padding such that   helical_extent + 2*padding >= contour_nm + 2*r_cut.
+    # Contour length uses 3.8 Å / residue (fully-extended beta) + 4 Å for
+    # terminal atom radii — the largest possible end-to-end extent.
+    _pos_nm = np.array([list(p) for p in modeller.positions.value_in_unit(unit.nanometer)])
+    _extent_nm = float(np.max(np.max(_pos_nm, axis=0) - np.min(_pos_nm, axis=0)))
+    _contour_nm = (len(args.seq) - 1) * 0.38 + 0.40
+    _min_box_nm = _contour_nm + 2.0 * float(args.nonbonded_cutoff_nm)
+    _safe_padding_nm = max(float(args.padding_nm), (_min_box_nm - _extent_nm) / 2.0)
+    if _safe_padding_nm > float(args.padding_nm):
+        print(
+            f"[setup] Box floor (extended-conformation safety): "
+            f"seq={args.seq} ({len(args.seq)} res), "
+            f"contour={_contour_nm:.2f} nm, helical_extent={_extent_nm:.2f} nm, "
+            f"min_box={_min_box_nm:.2f} nm → padding {args.padding_nm:.2f} → {_safe_padding_nm:.2f} nm"
+        )
+
     solvent_kwargs = {
         "model": args.water_model,
-        "padding": args.padding_nm * unit.nanometer,
+        "padding": _safe_padding_nm * unit.nanometer,
         "ionicStrength": args.ionic_strength_molar * unit.molar,
         "neutralize": True,
     }
