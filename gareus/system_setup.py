@@ -410,7 +410,7 @@ def prepare_solvated_system(args, out_dir: Path):
 
     solvent_kwargs = {
         "model": args.water_model,
-        "boxSize": _box_nm * unit.nanometer,
+        "boxSize": openmm.Vec3(_box_nm, _box_nm, _box_nm) * unit.nanometer,
         "ionicStrength": args.ionic_strength_molar * unit.molar,
         "neutralize": True,
     }
