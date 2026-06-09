@@ -181,8 +181,10 @@ class PeptideState:
 
         self._prog: dict         = {}
         self._drvsumm: dict      = {}
+        self._pool: dict         = {}
         self._mtime_prog: float  = 0.0
         self._mtime_drv: float   = 0.0
+        self._mtime_pool: float  = 0.0
         self._epoch_count: Optional[int] = None
         self._ckpt_count: Optional[int]  = None
         self._ckpt_refresh: float        = 0.0
@@ -255,12 +257,27 @@ class PeptideState:
         else:
             self._genpept_status = "pending"
 
+    def _load_runtime_pool(self):
+        p = self.run_dir / "adaptive_production" / "adaptive_runtime_pool.json"
+        if not p.exists():
+            return
+        mt = p.stat().st_mtime
+        if mt == self._mtime_pool:
+            return
+        self._mtime_pool = mt
+        try:
+            with open(p) as f:
+                self._pool = json.load(f)
+        except Exception:
+            pass
+
     def refresh(self):
         self._load_progress()
         self._load_driver_summary()
         self._load_epochs()
         self._load_checkpoints()
         self._load_genpept()
+        self._load_runtime_pool()
 
     @property
     def phase(self) -> str:
@@ -324,6 +341,47 @@ class PeptideState:
         return self._drvsumm.get("epochs_completed") or self._epoch_count
 
     @property
+    def total_budget_ns(self) -> Optional[float]:
+        """Total MD budget from adaptive_runtime_pool (committed + remaining)."""
+        events = self._pool.get("events")
+        if not events:
+            return None
+        last = events[-1]
+        return last.get("used_ns_after", 0) + last.get("remaining_ns_after", 0)
+
+    @property
+    def committed_ns(self) -> Optional[float]:
+        """NS from fully completed pool segments (does not include in-progress topup)."""
+        events = self._pool.get("events")
+        if not events:
+            return None
+        return events[-1].get("used_ns_after", 0)
+
+    @property
+    def global_percent(self) -> Optional[float]:
+        """Total MD budget progress: (committed + in-progress agg) / total × 100."""
+        total = self.total_budget_ns
+        if total is None or total == 0:
+            return None
+        committed = self.committed_ns or 0.0
+        current   = self.agg_ns or 0.0
+        return min(100.0, (committed + current) / total * 100)
+
+    @property
+    def global_eta_s(self) -> Optional[float]:
+        """Estimated time to finish entire MD budget based on current ns/day."""
+        total    = self.total_budget_ns
+        nspd     = self.ns_per_day
+        if total is None or not nspd:
+            return None
+        committed = self.committed_ns or 0.0
+        current   = self.agg_ns or 0.0
+        remaining_ns = total - committed - current
+        if remaining_ns <= 0:
+            return 0.0
+        return remaining_ns / nspd * 86400  # seconds
+
+    @property
     def stale(self) -> bool:
         wt = self._prog.get("wall_time_s")
         return wt is not None and (time.time() - wt) > 900
@@ -366,14 +424,15 @@ COL = {
     "name":    14,
     "genpept":  9,
     "phase":   11,
-    "bar":     14,
-    "pct":      6,
+    "bar":     16,   # global progress bar
+    "gpct":     7,   # global % (total budget)
+    "epct":     6,   # current epoch/topup %
+    "budget":  11,   # ns_done/ns_total
     "epoch":    5,
     "ckpt":     5,
     "elapsed":  8,
-    "eta":      8,
+    "geta":     9,   # global ETA
     "nspd":     7,
-    "ans":      7,
     "sps":      7,
     "cv":      14,
     "gamd":     7,
@@ -383,14 +442,15 @@ HEADERS = {
     "name":    "Peptide",
     "genpept": "GENPEPT",
     "phase":   "Phase",
-    "bar":     "Progress",
-    "pct":     "%",
+    "bar":     "Total progress",
+    "gpct":    "G%",
+    "epct":    "E%",
+    "budget":  "ns/budget",
     "epoch":   "Epoch",
     "ckpt":    "Ckpts",
     "elapsed": "Elapsed",
-    "eta":     "ETA",
+    "geta":    "Global ETA",
     "nspd":    "ns/day",
-    "ans":     "Σns",
     "sps":     "Steps/s",
     "cv":      "CV range",
     "gamd":    "GaMDμ",
@@ -401,13 +461,14 @@ ALIGNS = {
     "genpept": "^",
     "phase":   "^",
     "bar":     "<",
-    "pct":     ">",
+    "gpct":    ">",
+    "epct":    ">",
+    "budget":  ">",
     "epoch":   ">",
     "ckpt":    ">",
     "elapsed": ">",
-    "eta":     ">",
+    "geta":    ">",
     "nspd":    ">",
-    "ans":     ">",
     "sps":     ">",
     "cv":      ">",
     "gamd":    ">",
@@ -434,7 +495,10 @@ def data_row(s: PeptideState) -> str:
     phase = s.phase
     pcol  = PHASE_COLOR.get(phase, A.DIM)
     ncol  = NAME_COLOR.get(phase, A.DIM)
-    pct   = s.percent
+
+    # global and epoch percentages
+    gpct = s.global_percent   # total budget progress
+    epct = s.percent          # current topup/epoch progress
 
     # name
     stale = c(A.DIM, A.ITALIC, " ~") + A.RESET if s.stale else ""
@@ -442,8 +506,7 @@ def data_row(s: PeptideState) -> str:
 
     # genpept
     if s._genpept_status == "done":
-        surv = s._genpept_surv
-        gp_val = c(A.BOLD, A.BGREEN) + f"✓ {surv or '?'}" + A.RESET
+        gp_val = c(A.BOLD, A.BGREEN) + f"✓ {s._genpept_surv or '?'}" + A.RESET
     elif s._genpept_status == "running":
         gp_val = c(A.BBLUE) + "run…" + A.RESET
     else:
@@ -453,14 +516,35 @@ def data_row(s: PeptideState) -> str:
     plabel = PHASE_LABEL.get(phase, phase.upper()[:10])
     phase_val = c(pcol) + plabel + A.RESET
 
-    # bar
-    bar_val = bar(pct, COL["bar"]) if pct is not None else c(A.DIM) + "░" * COL["bar"] + A.RESET
+    # global progress bar (uses gpct; fallback to epct if pool not available)
+    display_pct = gpct if gpct is not None else epct
+    bar_val = (bar(display_pct, COL["bar"]) if display_pct is not None
+               else c(A.DIM) + "░" * COL["bar"] + A.RESET)
 
-    # percent
-    if pct is not None:
-        pct_val = c(pcol) + f"{pct:.1f}%" + A.RESET
+    # G% — global percent
+    if gpct is not None:
+        gcol = A.BGREEN if gpct >= 80 else A.BYELLOW if gpct >= 40 else A.BRED
+        gpct_val = c(A.BOLD, gcol) + f"{gpct:.1f}%" + A.RESET
     else:
-        pct_val = c(A.DIM) + "—" + A.RESET
+        gpct_val = c(A.DIM) + "—" + A.RESET
+
+    # E% — current epoch/topup percent (dim, smaller context)
+    if epct is not None:
+        epct_val = c(A.DIM) + f"{epct:.0f}%" + A.RESET
+    else:
+        epct_val = c(A.DIM) + "—" + A.RESET
+
+    # ns/budget — e.g. "54/2000"
+    total = s.total_budget_ns
+    committed = s.committed_ns or 0.0
+    current   = s.agg_ns or 0.0
+    done_ns   = committed + current
+    if total:
+        budget_val = f"{done_ns:.0f}/{total:.0f}"
+    elif current:
+        budget_val = f"{current:.1f} ns"
+    else:
+        budget_val = "—"
 
     # epoch
     ep = s.epochs_completed
@@ -470,15 +554,16 @@ def data_row(s: PeptideState) -> str:
     ck = s._ckpt_count
     ck_val = str(ck) if ck is not None else "—"
 
-    # eta
-    eta = s.eta_s
-    if eta is not None and eta <= 0:
-        eta_val = c(A.BOLD, A.BGREEN) + "done" + A.RESET
+    # global ETA (falls back to per-topup eta if no pool)
+    geta = s.global_eta_s
+    if geta is None:
+        geta = s.eta_s
+    if geta is not None and geta <= 0:
+        geta_val = c(A.BOLD, A.BGREEN) + "done" + A.RESET
     else:
-        eta_val = fmt_dur(eta)
+        geta_val = fmt_dur(geta)
 
     nspd = s.ns_per_day
-    ans  = s.agg_ns
     sps  = s.steps_per_s
     gb   = s.gamd_boost
 
@@ -487,13 +572,14 @@ def data_row(s: PeptideState) -> str:
         "genpept": gp_val,
         "phase":   phase_val,
         "bar":     bar_val,
-        "pct":     pct_val,
+        "gpct":    gpct_val,
+        "epct":    epct_val,
+        "budget":  budget_val,
         "epoch":   ep_val,
         "ckpt":    ck_val,
         "elapsed": fmt_dur(s.elapsed_s),
-        "eta":     eta_val,
+        "geta":    geta_val,
         "nspd":    f"{nspd:.0f}" if nspd else "—",
-        "ans":     f"{ans:.2f}"  if ans  else "—",
         "sps":     f"{sps:.0f}"  if sps  else "—",
         "cv":      s.cv_range,
         "gamd":    f"{gb:.1f}"   if gb   else "—",
@@ -511,15 +597,24 @@ def summary_line(states: list) -> str:
     n_done  = sum(1 for s in states if s.phase in ("done", "converged"))
     n_err   = sum(1 for s in states if s.phase == "error")
     n_pend  = sum(1 for s in states if s.phase in ("not_started", "genpept", "unknown"))
-    total   = sum(s.agg_ns for s in states if s.agg_ns)
+
+    # aggregate global budget across all runs that have pool data
+    total_budget = sum(s.total_budget_ns for s in states if s.total_budget_ns)
+    committed    = sum((s.committed_ns or 0) + (s.agg_ns or 0) for s in states)
+    global_pct   = committed / total_budget * 100 if total_budget else None
 
     parts = []
-    if n_prod:  parts.append(c(A.BOLD, A.BGREEN)   + f"{n_prod} production" + A.RESET)
-    if n_adapt: parts.append(c(A.BOLD, A.BCYAN)    + f"{n_adapt} adapting"   + A.RESET)
-    if n_done:  parts.append(c(A.BOLD, A.BWHITE)   + f"{n_done} done"        + A.RESET)
-    if n_err:   parts.append(c(A.BOLD, A.BRED)     + f"{n_err} error"        + A.RESET)
-    if n_pend:  parts.append(c(A.DIM)              + f"{n_pend} pending"     + A.RESET)
-    parts.append(c(A.DIM) + f"total Σns: {total:.2f}" + A.RESET)
+    if n_prod:  parts.append(c(A.BOLD, A.BGREEN)  + f"{n_prod} production" + A.RESET)
+    if n_adapt: parts.append(c(A.BOLD, A.BCYAN)   + f"{n_adapt} adapting"  + A.RESET)
+    if n_done:  parts.append(c(A.BOLD, A.BWHITE)  + f"{n_done} done"       + A.RESET)
+    if n_err:   parts.append(c(A.BOLD, A.BRED)    + f"{n_err} error"       + A.RESET)
+    if n_pend:  parts.append(c(A.DIM)             + f"{n_pend} pending"    + A.RESET)
+    if total_budget:
+        pct_str = f"{global_pct:.1f}%" if global_pct is not None else "?%"
+        parts.append(
+            c(A.DIM) + f"fleet: {committed:.0f}/{total_budget:.0f} ns  " + A.RESET
+            + c(A.BOLD, A.BYELLOW) + pct_str + A.RESET
+        )
     return "  ".join(parts)
 
 
