@@ -376,6 +376,43 @@ class PeptideState:
             return 0.0
         return remaining_ns / nspd * 86400  # seconds
 
+    # ── quality signals ───────────────────────────────────────────────────────
+
+    @property
+    def gamd_anharmonicity(self) -> Optional[float]:
+        """Deviation of boost distribution from Gaussian (0=perfect, >0.5=bad)."""
+        return self._prog.get("gamd_boost_anharmonicity_score")
+
+    @property
+    def gamd_boost_sd(self) -> Optional[float]:
+        """Boost potential σ (kcal/mol). >5 risks poor reweighting."""
+        return self._prog.get("gamd_boost_sd_kcal_mol")
+
+    @property
+    def ubias_mean(self) -> Optional[float]:
+        """Mean umbrella bias (kcal/mol). Near-zero = windows not holding replicas."""
+        return self._prog.get("umbrella_bias_mean_kcal_mol")
+
+    @property
+    def n_replicas(self) -> Optional[int]:
+        m = re.search(r"(\d+)\s+replica", self._prog.get("message", ""))
+        return int(m.group(1)) if m else None
+
+    @property
+    def quality_grade(self) -> str:
+        """OK / WARN / BAD based on anharmonicity and boost σ thresholds."""
+        anh = self.gamd_anharmonicity
+        sd  = self.gamd_boost_sd
+        if anh is None and sd is None:
+            return "?"
+        bad  = (anh is not None and anh > 0.5) or (sd is not None and sd > 5.0)
+        warn = (anh is not None and anh > 0.3) or (sd is not None and sd > 3.0)
+        if bad:
+            return "BAD"
+        if warn:
+            return "WARN"
+        return "OK"
+
     @property
     def stale(self) -> bool:
         wt = self._prog.get("wall_time_s")
@@ -430,7 +467,13 @@ COL = {
     "nspd":     7,
     "sps":      7,
     "cv":      14,
-    "gamd":     7,
+    # ── quality ───────────
+    "qual":     4,   # OK/WARN/BAD badge
+    "nrep":     4,   # n replicas
+    "gamd_mu":  7,   # boost mean kcal/mol
+    "gamd_sd":  6,   # boost σ kcal/mol
+    "anharm":   7,   # anharmonicity score
+    "ubias":    6,   # umbrella bias mean
 }
 
 HEADERS = {
@@ -448,7 +491,12 @@ HEADERS = {
     "nspd":    "ns/day",
     "sps":     "Steps/s",
     "cv":      "CV range",
-    "gamd":    "GaMDμ",
+    "qual":    "Qual",
+    "nrep":    "Rep",
+    "gamd_mu": "Boost μ",
+    "gamd_sd": "Boost σ",
+    "anharm":  "Anharm",
+    "ubias":   "Ubias",
 }
 
 ALIGNS = {
@@ -466,7 +514,12 @@ ALIGNS = {
     "nspd":    ">",
     "sps":     ">",
     "cv":      ">",
-    "gamd":    ">",
+    "qual":    "^",
+    "nrep":    ">",
+    "gamd_mu": ">",
+    "gamd_sd": ">",
+    "anharm":  ">",
+    "ubias":   ">",
 }
 
 COLS = list(COL.keys())
@@ -560,7 +613,40 @@ def data_row(s: PeptideState) -> str:
 
     nspd = s.ns_per_day
     sps  = s.steps_per_s
-    gb   = s.gamd_boost
+
+    # ── quality ───────────────────────────────────────────────────────────────
+    grade = s.quality_grade
+    if grade == "BAD":
+        qual_val = c(A.BOLD, A.BRED) + "BAD" + A.RESET
+    elif grade == "WARN":
+        qual_val = c(A.BOLD, A.BYELLOW) + "WARN" + A.RESET
+    elif grade == "OK":
+        qual_val = c(A.BOLD, A.BGREEN) + "OK" + A.RESET
+    else:
+        qual_val = c(A.DIM) + "?" + A.RESET
+
+    nrep = s.n_replicas
+    nrep_val = str(nrep) if nrep else "—"
+
+    mu = s.gamd_boost
+    mu_val = f"{mu:.1f}" if mu is not None else "—"
+
+    sd = s.gamd_boost_sd
+    if sd is not None:
+        sd_col = A.BRED if sd > 5 else A.BYELLOW if sd > 3 else A.BGREEN
+        sd_val = c(sd_col) + f"{sd:.1f}" + A.RESET
+    else:
+        sd_val = c(A.DIM) + "—" + A.RESET
+
+    anh = s.gamd_anharmonicity
+    if anh is not None:
+        anh_col = A.BRED if anh > 0.5 else A.BYELLOW if anh > 0.3 else A.BGREEN
+        anh_val = c(anh_col) + f"{anh:.2f}" + A.RESET
+    else:
+        anh_val = c(A.DIM) + "—" + A.RESET
+
+    ub = s.ubias_mean
+    ub_val = f"{ub:.1f}" if ub is not None else "—"
 
     vals = {
         "name":    name_val,
@@ -577,7 +663,12 @@ def data_row(s: PeptideState) -> str:
         "nspd":    f"{nspd:.0f}" if nspd else "—",
         "sps":     f"{sps:.0f}"  if sps  else "—",
         "cv":      s.cv_range,
-        "gamd":    f"{gb:.1f}"   if gb   else "—",
+        "qual":    qual_val,
+        "nrep":    nrep_val,
+        "gamd_mu": mu_val,
+        "gamd_sd": sd_val,
+        "anharm":  anh_val,
+        "ubias":   ub_val,
     }
 
     cells = []
