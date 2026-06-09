@@ -342,20 +342,15 @@ class PeptideState:
 
     @property
     def total_budget_ns(self) -> Optional[float]:
-        """Total MD budget from adaptive_runtime_pool (committed + remaining)."""
-        events = self._pool.get("events")
-        if not events:
-            return None
-        last = events[-1]
-        return last.get("used_ns_after", 0) + last.get("remaining_ns_after", 0)
+        """Total MD budget ns — top-level field in adaptive_runtime_pool.json."""
+        v = self._pool.get("total_ns")
+        return float(v) if v else None
 
     @property
     def committed_ns(self) -> Optional[float]:
-        """NS from fully completed pool segments (does not include in-progress topup)."""
-        events = self._pool.get("events")
-        if not events:
-            return None
-        return events[-1].get("used_ns_after", 0)
+        """NS from fully committed segments (pool.used_ns, excludes in-progress topup)."""
+        v = self._pool.get("used_ns")
+        return float(v) if v is not None else None
 
     @property
     def global_percent(self) -> Optional[float]:
