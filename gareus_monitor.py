@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """
-GAREUS multi-peptide run monitor.
+GAREUS multi-peptide run monitor  —  stdlib only, no deps.
 
 Usage:
   python gareus_monitor.py [RUNS_DIR] [--interval SECS] [--once]
-
-Scans RUNS_DIR for peptide subdirs with {PEP}/{PEP}_2d_run/ layouts.
 """
 
 import argparse
@@ -18,61 +16,99 @@ import datetime
 from pathlib import Path
 from typing import Optional
 
-try:
-    from rich.live import Live
-    from rich.table import Table
-    from rich.console import Console
-    from rich.text import Text
-    from rich.panel import Panel
-    from rich import box
-except ImportError:
-    print("rich not installed. Run: pip install rich")
-    sys.exit(1)
+# ── ANSI helpers ──────────────────────────────────────────────────────────────
 
-# ── Phase metadata ────────────────────────────────────────────────────────────
+class A:
+    RESET  = "\033[0m"
+    BOLD   = "\033[1m"
+    DIM    = "\033[2m"
+    ITALIC = "\033[3m"
 
-PHASE_COLORS = {
-    "gareus_production": "bright_green",
-    "adaptive_feedback":  "cyan",
-    "setup":              "yellow",
-    "equilibration":      "yellow",
-    "genpept":            "bright_blue",
-    "done":               "bright_white",
-    "converged":          "bright_magenta",
-    "error":              "bright_red",
-    "not_started":        "dim",
-    "unknown":            "dim",
+    BLACK, RED, GREEN, YELLOW, BLUE, MAGENTA, CYAN, WHITE = \
+        (f"\033[3{i}m" for i in range(8))
+    BBLACK, BRED, BGREEN, BYELLOW, BBLUE, BMAGENTA, BCYAN, BWHITE = \
+        (f"\033[9{i}m" for i in range(8))
+
+    BG_GREY   = "\033[48;5;236m"
+    BG_RESET  = "\033[49m"
+
+def c(*codes) -> str:
+    return "".join(codes)
+
+def plain(s: str) -> str:
+    """Strip ANSI codes to measure display width."""
+    return re.sub(r"\033\[[0-9;]*m", "", s)
+
+def pad(s: str, width: int, align: str = "<") -> str:
+    """Pad an ANSI-colored string to display width."""
+    vis = len(plain(s))
+    diff = max(0, width - vis)
+    if align == ">":
+        return " " * diff + s
+    if align == "^":
+        l = diff // 2; r = diff - l
+        return " " * l + s + " " * r
+    return s + " " * diff
+
+CLEAR_SCREEN  = "\033[2J\033[H"
+HIDE_CURSOR   = "\033[?25l"
+SHOW_CURSOR   = "\033[?25h"
+MOVE_HOME     = "\033[H"
+
+# ── Phase styling ─────────────────────────────────────────────────────────────
+
+PHASE_COLOR = {
+    "gareus_production": c(A.BOLD, A.BGREEN),
+    "adaptive_feedback": c(A.BOLD, A.BCYAN),
+    "setup":             c(A.BOLD, A.BYELLOW),
+    "equilibration":     c(A.BOLD, A.BYELLOW),
+    "genpept":           c(A.BOLD, A.BBLUE),
+    "done":              c(A.BOLD, A.BWHITE),
+    "converged":         c(A.BOLD, A.BMAGENTA),
+    "error":             c(A.BOLD, A.BRED),
+    "not_started":       c(A.DIM),
+    "unknown":           c(A.DIM),
 }
 
-PHASE_LABELS = {
+PHASE_LABEL = {
     "gareus_production": "PRODUCTION",
-    "adaptive_feedback":  "ADAPT-FB",
-    "setup":              "SETUP",
-    "equilibration":      "EQUIL",
-    "genpept":            "GENPEPT",
-    "done":               "DONE ✓",
-    "converged":          "CONVERGED",
-    "error":              "ERROR ✗",
-    "not_started":        "PENDING",
-    "unknown":            "—",
+    "adaptive_feedback": "ADAPT-FB",
+    "setup":             "SETUP",
+    "equilibration":     "EQUIL",
+    "genpept":           "GENPEPT",
+    "done":              "DONE ✓",
+    "converged":         "CONVERGED",
+    "error":             "ERROR ✗",
+    "not_started":       "PENDING",
+    "unknown":           "—",
+}
+
+NAME_COLOR = {
+    "gareus_production": c(A.BOLD, A.BCYAN),
+    "adaptive_feedback": c(A.BOLD, A.BYELLOW),
+    "setup":             c(A.BOLD, A.BYELLOW),
+    "equilibration":     c(A.BOLD, A.BYELLOW),
+    "genpept":           c(A.BOLD, A.BBLUE),
+    "done":              c(A.BOLD, A.WHITE),
+    "error":             c(A.BOLD, A.BRED),
+    "not_started":       c(A.DIM),
+    "unknown":           c(A.DIM),
 }
 
 # ── JSONL helpers ─────────────────────────────────────────────────────────────
 
-def tail_jsonl(path: Path, n: int = 30) -> list:
-    """Read last n JSON lines from a jsonl file via tail-seek (O(1))."""
+def tail_jsonl(path: Path, n: int = 60) -> list:
     if not path.exists():
         return []
     try:
         size = path.stat().st_size
         if size == 0:
             return []
-        chunk = min(size, 65_536)  # 64 KB tail
+        chunk = min(size, 65536)
         with open(path, "rb") as f:
             f.seek(max(0, size - chunk))
             raw = f.read()
-        text = raw.decode("utf-8", errors="replace")
-        lines = text.splitlines()
+        lines = raw.decode("utf-8", errors="replace").splitlines()
         results = []
         for line in reversed(lines):
             line = line.strip()
@@ -90,26 +126,24 @@ def tail_jsonl(path: Path, n: int = 30) -> list:
 
 
 def last_progress_entry(path: Path) -> dict:
-    """Return the most recent 'progress' event from progress.jsonl."""
     entries = tail_jsonl(path, 60)
     for e in reversed(entries):
         if e.get("event") == "progress":
             return e
-    # fallback: any entry that has meaningful fields
     for e in reversed(entries):
         if "percent" in e or "fraction" in e:
             return e
     return entries[-1] if entries else {}
 
 
-# ── Formatting helpers ────────────────────────────────────────────────────────
+# ── Formatting ────────────────────────────────────────────────────────────────
 
-def fmt_dur(s: Optional[float], *, compact: bool = True) -> str:
+def fmt_dur(s: Optional[float]) -> str:
     if s is None or s < 0:
         return "—"
     s = int(s)
     h, rem = divmod(s, 3600)
-    m, sec  = divmod(rem, 60)
+    m, sec = divmod(rem, 60)
     if h >= 24:
         d, h = divmod(h, 24)
         return f"{d}d{h:02d}h"
@@ -118,46 +152,42 @@ def fmt_dur(s: Optional[float], *, compact: bool = True) -> str:
     return f"{m}m{sec:02d}s"
 
 
-def progress_bar(pct: float, width: int = 16) -> Text:
+def bar(pct: float, width: int = 14) -> str:
     pct = max(0.0, min(100.0, pct))
     filled = int(width * pct / 100)
     if pct >= 80:
-        col = "bright_green"
+        col = A.BGREEN
     elif pct >= 40:
-        col = "yellow"
+        col = A.BYELLOW
     elif pct > 0:
-        col = "red"
+        col = A.BRED
     else:
-        col = "dim"
-    bar = Text()
-    bar.append("█" * filled,          style=col)
-    bar.append("░" * (width - filled), style="dim")
-    return bar
+        col = A.DIM
+    return (
+        c(col) + "█" * filled
+        + c(A.DIM) + "░" * (width - filled)
+        + A.RESET
+    )
 
 
 # ── Per-peptide state ─────────────────────────────────────────────────────────
 
 class PeptideState:
-    """Live status for one peptide run, cached by file mtime."""
-
     def __init__(self, name: str, base_dir: Path):
         self.name        = name
         self.base_dir    = base_dir
         self.run_dir     = base_dir / f"{name}_2d_run"
         self.genpept_dir = base_dir / f"{name}_genpept"
 
-        self._prog: dict      = {}
-        self._drvsumm: dict   = {}
+        self._prog: dict         = {}
+        self._drvsumm: dict      = {}
         self._mtime_prog: float  = 0.0
         self._mtime_drv: float   = 0.0
-        self._epoch_count: Optional[int]  = None
-        self._topup_count: Optional[int]  = None
-        self._ckpt_count: Optional[int]   = None
-        self._ckpt_refresh: float = 0.0
+        self._epoch_count: Optional[int] = None
+        self._ckpt_count: Optional[int]  = None
+        self._ckpt_refresh: float        = 0.0
         self._genpept_status: Optional[str] = None
         self._genpept_surv: Optional[int]   = None
-
-    # ── loaders ──────────────────────────────────────────────────────────────
 
     def _load_progress(self):
         p = self.run_dir / "progress.jsonl"
@@ -187,11 +217,8 @@ class PeptideState:
         ap = self.run_dir / "adaptive_production"
         if not ap.exists():
             return
-        epoch_dirs = sorted(ap.glob("epoch_*"))
-        self._epoch_count = len(epoch_dirs)
-        if epoch_dirs:
-            topup_dirs = sorted(epoch_dirs[-1].glob("topup_*"))
-            self._topup_count = len(topup_dirs)
+        self._epoch_count = sum(1 for d in ap.iterdir()
+                                if d.is_dir() and d.name.startswith("epoch_"))
 
     def _load_checkpoints(self):
         ap = self.run_dir / "adaptive_production"
@@ -202,8 +229,12 @@ class PeptideState:
         if self._ckpt_count is not None and now - self._ckpt_refresh < 60:
             return
         self._ckpt_refresh = now
-        manifests = list(ap.rglob("production_checkpoint_manifest.json"))
-        self._ckpt_count = len(manifests)
+        count = 0
+        for root, dirs, files in os.walk(ap):
+            for f in files:
+                if f == "production_checkpoint_manifest.json":
+                    count += 1
+        self._ckpt_count = count
 
     def _load_genpept(self):
         if self._genpept_status is not None:
@@ -211,21 +242,18 @@ class PeptideState:
         if not self.genpept_dir.exists():
             self._genpept_status = "pending"
             return
-        seeds_csv = self.genpept_dir / "final_survivor_seeds.csv"
-        if seeds_csv.exists():
+        seeds = self.genpept_dir / "final_survivor_seeds.csv"
+        if seeds.exists():
             self._genpept_status = "done"
             try:
-                with open(seeds_csv) as f:
-                    lines = sum(1 for _ in f) - 1
-                self._genpept_surv = max(0, lines)
+                with open(seeds) as f:
+                    self._genpept_surv = max(0, sum(1 for _ in f) - 1)
             except Exception:
                 pass
         elif any(self.genpept_dir.iterdir()):
             self._genpept_status = "running"
         else:
             self._genpept_status = "pending"
-
-    # ── public ────────────────────────────────────────────────────────────────
 
     def refresh(self):
         self._load_progress()
@@ -234,18 +262,13 @@ class PeptideState:
         self._load_checkpoints()
         self._load_genpept()
 
-    # ── properties ────────────────────────────────────────────────────────────
-
     @property
     def phase(self) -> str:
         if not self.run_dir.exists():
-            if self._genpept_status == "running":
-                return "genpept"
-            return "not_started"
+            return "genpept" if self._genpept_status == "running" else "not_started"
         if self._drvsumm.get("status") == "done":
             return "done"
-        p = self._prog.get("phase", "")
-        return p if p else "unknown"
+        return self._prog.get("phase") or "unknown"
 
     @property
     def percent(self) -> Optional[float]:
@@ -253,9 +276,7 @@ class PeptideState:
         if v is not None:
             return float(v)
         f = self._prog.get("fraction")
-        if f is not None:
-            return float(f) * 100
-        return None
+        return float(f) * 100 if f is not None else None
 
     @property
     def eta_s(self) -> Optional[float]:
@@ -291,8 +312,7 @@ class PeptideState:
 
     @property
     def n_replicas(self) -> Optional[int]:
-        msg = self._prog.get("message", "")
-        m = re.search(r"(\d+)\s+replica", msg)
+        m = re.search(r"(\d+)\s+replica", self._prog.get("message", ""))
         return int(m.group(1)) if m else None
 
     @property
@@ -305,179 +325,252 @@ class PeptideState:
 
     @property
     def stale(self) -> bool:
-        """Progress not updated in >15 min."""
         wt = self._prog.get("wall_time_s")
-        if wt is None:
-            return False
-        return (time.time() - wt) > 900
-
-    @property
-    def genpept_ok(self) -> bool:
-        return self._genpept_status == "done"
+        return wt is not None and (time.time() - wt) > 900
 
 
 # ── Discovery ─────────────────────────────────────────────────────────────────
 
-_IGNORE_DIRS = {
-    ".git", ".claude", ".codex", ".remember", ".agents",
-    "__pycache__", "alpha_runs", "validation", "gamd-openmm", "gareus",
+_IGNORE = {
+    ".git", ".claude", ".codex", ".remember", ".agents", "__pycache__",
+    "alpha_runs", "validation", "gamd-openmm", "gareus",
 }
 
 
-def discover_peptides(runs_dir: Path) -> list:
-    results = []
+def discover(runs_dir: Path) -> list:
+    out = []
     for d in sorted(runs_dir.iterdir()):
         if not d.is_dir():
             continue
-        name = d.name
-        if name.startswith(".") or name in _IGNORE_DIRS:
+        n = d.name
+        if n.startswith(".") or n in _IGNORE:
             continue
-        if name.startswith("CONV") or name.startswith("chignolin") or name.startswith("alpha"):
+        if n.startswith("CONV") or n.startswith("chignolin") or n.startswith("alpha"):
             continue
-        has_yaml = (d / f"{name}.yaml").exists()
-        has_run  = (d / f"{name}_2d_run").exists()
-        if has_yaml or has_run:
-            results.append(PeptideState(name, d))
-    return results
+        if (d / f"{n}.yaml").exists() or (d / f"{n}_2d_run").exists():
+            out.append(PeptideState(n, d))
+    return out
 
 
-# ── Table builder ─────────────────────────────────────────────────────────────
+# ── Rendering ─────────────────────────────────────────────────────────────────
 
-def build_table(states: list) -> Table:
-    now_str = datetime.datetime.now().strftime("%Y-%m-%d  %H:%M:%S")
-
-    table = Table(
-        title=f"[bold bright_cyan] GAREUS Multi-Peptide Monitor [/]  [dim]{now_str}[/]",
-        box=box.ROUNDED,
-        border_style="bright_blue",
-        header_style="bold bright_white on grey19",
-        expand=True,
-        show_edge=True,
-        padding=(0, 1),
-    )
-
-    table.add_column("Peptide",  style="bold",   min_width=12, no_wrap=True)
-    table.add_column("GENPEPT",  justify="center", min_width=9, no_wrap=True)
-    table.add_column("Phase",    justify="center", min_width=11, no_wrap=True)
-    table.add_column("Progress", min_width=18,   no_wrap=True)
-    table.add_column("%",        justify="right", min_width=6,  no_wrap=True)
-    table.add_column("Epoch",    justify="right", min_width=5,  no_wrap=True)
-    table.add_column("Ckpts",    justify="right", min_width=5,  no_wrap=True)
-    table.add_column("Elapsed",  justify="right", min_width=8,  no_wrap=True)
-    table.add_column("ETA",      justify="right", min_width=8,  no_wrap=True)
-    table.add_column("ns/day",   justify="right", min_width=7,  no_wrap=True)
-    table.add_column("Σns",      justify="right", min_width=6,  no_wrap=True)
-    table.add_column("Steps/s",  justify="right", min_width=7,  no_wrap=True)
-    table.add_column("CV range", justify="right", min_width=14, no_wrap=True)
-    table.add_column("GaMD μ",   justify="right", min_width=7,  no_wrap=True)
-
-    for s in states:
-        phase  = s.phase
-        pcolor = PHASE_COLORS.get(phase, "dim")
-        plabel = PHASE_LABELS.get(phase, phase.upper()[:10])
-        pct    = s.percent
-
-        # name style
-        if phase == "gareus_production":
-            name_style = "bold bright_cyan"
-        elif phase in ("adaptive_feedback", "setup", "equilibration"):
-            name_style = "bold yellow"
-        elif phase == "done":
-            name_style = "bold bright_white"
-        elif phase == "error":
-            name_style = "bold red"
-        elif phase == "genpept":
-            name_style = "bold bright_blue"
-        else:
-            name_style = "dim"
-
-        stale_tag = " [dim italic](stale)[/]" if s.stale else ""
-        name_cell = Text.from_markup(f"[{name_style}]{s.name}[/]{stale_tag}")
-
-        # GENPEPT cell
-        if s.genpept_ok:
-            gp_cell = Text(f"✓ {s.genpept_surv if s._genpept_surv else '?'}", style="bright_green")
-        elif s._genpept_status == "running":
-            gp_cell = Text("running…", style="bright_blue")
-        else:
-            gp_cell = Text("—", style="dim")
-        # expose survivor count
-        if hasattr(s, '_genpept_surv') and s._genpept_surv:
-            gp_cell = Text(f"✓ {s._genpept_surv}", style="bright_green")
-
-        phase_cell = Text(plabel, style=f"bold {pcolor}")
-
-        bar = progress_bar(pct) if pct is not None else Text("░" * 16, style="dim")
-
-        pct_str   = f"[{pcolor}]{pct:.1f}%[/]" if pct is not None else "[dim]—[/]"
-        ep        = s.epochs_completed
-        ep_str    = str(ep) if ep is not None else "—"
-        ck        = s._ckpt_count
-        ck_str    = str(ck) if ck is not None else "—"
-
-        eta = s.eta_s
-        if eta is not None and eta <= 0:
-            eta_cell = Text("done", style="bright_green")
-        else:
-            eta_cell = Text(fmt_dur(eta), style="white")
-
-        nspd  = s.ns_per_day
-        ans   = s.agg_ns
-        sps   = s.steps_per_s
-        gb    = s.gamd_boost
-
-        table.add_row(
-            name_cell,
-            gp_cell,
-            phase_cell,
-            bar,
-            Text.from_markup(pct_str),
-            ep_str,
-            ck_str,
-            fmt_dur(s.elapsed_s),
-            eta_cell,
-            f"{nspd:.0f}" if nspd else "—",
-            f"{ans:.2f}"  if ans  else "—",
-            f"{sps:.0f}"  if sps  else "—",
-            s.cv_range,
-            f"{gb:.1f}"   if gb   else "—",
-        )
-
-    return table
+def term_width() -> int:
+    try:
+        return os.get_terminal_size().columns
+    except OSError:
+        return 120
 
 
-def build_footer(states: list) -> Text:
+# column widths (display chars)
+COL = {
+    "name":    14,
+    "genpept":  9,
+    "phase":   11,
+    "bar":     14,
+    "pct":      6,
+    "epoch":    5,
+    "ckpt":     5,
+    "elapsed":  8,
+    "eta":      8,
+    "nspd":     7,
+    "ans":      7,
+    "sps":      7,
+    "cv":      14,
+    "gamd":     7,
+}
+
+HEADERS = {
+    "name":    "Peptide",
+    "genpept": "GENPEPT",
+    "phase":   "Phase",
+    "bar":     "Progress",
+    "pct":     "%",
+    "epoch":   "Epoch",
+    "ckpt":    "Ckpts",
+    "elapsed": "Elapsed",
+    "eta":     "ETA",
+    "nspd":    "ns/day",
+    "ans":     "Σns",
+    "sps":     "Steps/s",
+    "cv":      "CV range",
+    "gamd":    "GaMDμ",
+}
+
+ALIGNS = {
+    "name":    "<",
+    "genpept": "^",
+    "phase":   "^",
+    "bar":     "<",
+    "pct":     ">",
+    "epoch":   ">",
+    "ckpt":    ">",
+    "elapsed": ">",
+    "eta":     ">",
+    "nspd":    ">",
+    "ans":     ">",
+    "sps":     ">",
+    "cv":      ">",
+    "gamd":    ">",
+}
+
+COLS = list(COL.keys())
+
+
+def hline(char: str = "─", cross: str = "┼",
+          left: str = "├", right: str = "┤") -> str:
+    segs = [char * (COL[k] + 2) for k in COLS]
+    return left + (cross + "").join(segs) + right
+
+
+def header_row() -> str:
+    cells = []
+    for k in COLS:
+        h = c(A.BOLD, A.BG_GREY, A.WHITE) + pad(HEADERS[k], COL[k], ALIGNS[k]) + A.RESET
+        cells.append(" " + h + " ")
+    return "│" + "│".join(cells) + "│"
+
+
+def data_row(s: PeptideState) -> str:
+    phase = s.phase
+    pcol  = PHASE_COLOR.get(phase, A.DIM)
+    ncol  = NAME_COLOR.get(phase, A.DIM)
+    pct   = s.percent
+
+    # name
+    stale = c(A.DIM, A.ITALIC, " ~") + A.RESET if s.stale else ""
+    name_val = c(ncol) + s.name[:COL["name"]] + A.RESET + stale
+
+    # genpept
+    if s._genpept_status == "done":
+        surv = s._genpept_surv
+        gp_val = c(A.BOLD, A.BGREEN) + f"✓ {surv or '?'}" + A.RESET
+    elif s._genpept_status == "running":
+        gp_val = c(A.BBLUE) + "run…" + A.RESET
+    else:
+        gp_val = c(A.DIM) + "—" + A.RESET
+
+    # phase
+    plabel = PHASE_LABEL.get(phase, phase.upper()[:10])
+    phase_val = c(pcol) + plabel + A.RESET
+
+    # bar
+    bar_val = bar(pct, COL["bar"]) if pct is not None else c(A.DIM) + "░" * COL["bar"] + A.RESET
+
+    # percent
+    if pct is not None:
+        pct_val = c(pcol) + f"{pct:.1f}%" + A.RESET
+    else:
+        pct_val = c(A.DIM) + "—" + A.RESET
+
+    # epoch
+    ep = s.epochs_completed
+    ep_val = str(ep) if ep is not None else "—"
+
+    # checkpoints
+    ck = s._ckpt_count
+    ck_val = str(ck) if ck is not None else "—"
+
+    # eta
+    eta = s.eta_s
+    if eta is not None and eta <= 0:
+        eta_val = c(A.BOLD, A.BGREEN) + "done" + A.RESET
+    else:
+        eta_val = fmt_dur(eta)
+
+    nspd = s.ns_per_day
+    ans  = s.agg_ns
+    sps  = s.steps_per_s
+    gb   = s.gamd_boost
+
+    vals = {
+        "name":    name_val,
+        "genpept": gp_val,
+        "phase":   phase_val,
+        "bar":     bar_val,
+        "pct":     pct_val,
+        "epoch":   ep_val,
+        "ckpt":    ck_val,
+        "elapsed": fmt_dur(s.elapsed_s),
+        "eta":     eta_val,
+        "nspd":    f"{nspd:.0f}" if nspd else "—",
+        "ans":     f"{ans:.2f}"  if ans  else "—",
+        "sps":     f"{sps:.0f}"  if sps  else "—",
+        "cv":      s.cv_range,
+        "gamd":    f"{gb:.1f}"   if gb   else "—",
+    }
+
+    cells = []
+    for k in COLS:
+        cells.append(" " + pad(vals[k], COL[k], ALIGNS[k]) + " ")
+    return "│" + "│".join(cells) + "│"
+
+
+def summary_line(states: list) -> str:
     n_prod  = sum(1 for s in states if s.phase == "gareus_production")
     n_adapt = sum(1 for s in states if s.phase == "adaptive_feedback")
     n_done  = sum(1 for s in states if s.phase in ("done", "converged"))
     n_err   = sum(1 for s in states if s.phase == "error")
-    n_pend  = sum(1 for s in states if s.phase in ("not_started", "genpept"))
-    total_ns = sum(s.agg_ns for s in states if s.agg_ns)
+    n_pend  = sum(1 for s in states if s.phase in ("not_started", "genpept", "unknown"))
+    total   = sum(s.agg_ns for s in states if s.agg_ns)
 
     parts = []
-    if n_prod:  parts.append(f"[bright_green]{n_prod} production[/]")
-    if n_adapt: parts.append(f"[cyan]{n_adapt} adapting[/]")
-    if n_done:  parts.append(f"[bright_white]{n_done} done[/]")
-    if n_err:   parts.append(f"[red]{n_err} error[/]")
-    if n_pend:  parts.append(f"[dim]{n_pend} pending[/]")
-    parts.append(f"[dim]total simulated: {total_ns:.2f} ns[/]")
+    if n_prod:  parts.append(c(A.BOLD, A.BGREEN)   + f"{n_prod} production" + A.RESET)
+    if n_adapt: parts.append(c(A.BOLD, A.BCYAN)    + f"{n_adapt} adapting"   + A.RESET)
+    if n_done:  parts.append(c(A.BOLD, A.BWHITE)   + f"{n_done} done"        + A.RESET)
+    if n_err:   parts.append(c(A.BOLD, A.BRED)     + f"{n_err} error"        + A.RESET)
+    if n_pend:  parts.append(c(A.DIM)              + f"{n_pend} pending"     + A.RESET)
+    parts.append(c(A.DIM) + f"total Σns: {total:.2f}" + A.RESET)
+    return "  ".join(parts)
 
-    return Text.from_markup("   ".join(parts))
+
+def render(states: list) -> str:
+    tw = term_width()
+    now = datetime.datetime.now().strftime("%Y-%m-%d  %H:%M:%S")
+
+    title = (
+        c(A.BOLD, A.BCYAN) + " GAREUS Monitor " + A.RESET
+        + c(A.DIM) + now + A.RESET
+    )
+
+    top    = "┌" + hline("─", "┬", "┌", "┐")[1:-1] + "┐"
+    mid    = hline("─", "┼", "├", "┤")
+    bot    = "└" + hline("─", "┴", "└", "┘")[1:-1] + "┘"
+
+    lines = [
+        "",
+        "  " + title,
+        "",
+        top,
+        header_row(),
+        mid,
+    ]
+    for i, s in enumerate(states):
+        lines.append(data_row(s))
+        if i < len(states) - 1:
+            lines.append(mid)
+    lines += [
+        bot,
+        "",
+        "  " + summary_line(states),
+        "",
+        c(A.DIM) + "  q/Ctrl-C quit   r refresh now" + A.RESET,
+    ]
+    return "\n".join(lines)
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="GAREUS multi-peptide live monitor",
+        description="GAREUS multi-peptide live monitor (stdlib only)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("runs_dir", nargs="?", default=".",
-                        help="Root directory containing peptide subdirs")
+                        help="Root dir containing peptide subdirs")
     parser.add_argument("--interval", "-i", type=float, default=10.0,
                         help="Refresh interval (seconds)")
     parser.add_argument("--once", action="store_true",
-                        help="Print once and exit (no live mode)")
+                        help="Print once and exit")
     args = parser.parse_args()
 
     runs_dir = Path(args.runs_dir).resolve()
@@ -485,38 +578,38 @@ def main():
         print(f"ERROR: {runs_dir} is not a directory", file=sys.stderr)
         sys.exit(1)
 
-    console = Console()
-    states  = discover_peptides(runs_dir)
-
+    states = discover(runs_dir)
     if not states:
-        console.print(f"[red]No peptide runs found in {runs_dir}[/]")
+        print(f"No peptide runs found in {runs_dir}", file=sys.stderr)
         sys.exit(1)
 
-    console.print(f"[dim]Found {len(states)} peptide(s): {', '.join(s.name for s in states)}[/]")
-
-    def render():
-        for s in states:
-            s.refresh()
-        tbl = build_table(states)
-        footer = build_footer(states)
-        return Panel(
-            tbl,
-            subtitle=footer,
-            border_style="bright_blue",
-            padding=(0, 0),
-        )
+    for s in states:
+        s.refresh()
 
     if args.once:
-        console.print(render())
+        print(render(states))
         return
 
+    # live loop
+    print(HIDE_CURSOR, end="", flush=True)
     try:
-        with Live(render(), console=console, refresh_per_second=1, screen=True) as live:
-            while True:
-                time.sleep(args.interval)
-                live.update(render())
+        first = True
+        while True:
+            for s in states:
+                s.refresh()
+            output = render(states)
+            if first:
+                print(CLEAR_SCREEN + output, flush=True)
+                first = False
+            else:
+                print(MOVE_HOME + output, flush=True)
+            # non-blocking wait with 'q' detection (best-effort; no termios)
+            time.sleep(args.interval)
     except KeyboardInterrupt:
-        console.print("\n[dim]Monitor stopped.[/]")
+        pass
+    finally:
+        print(SHOW_CURSOR, end="", flush=True)
+        print()
 
 
 if __name__ == "__main__":
