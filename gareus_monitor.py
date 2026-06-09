@@ -173,23 +173,38 @@ def bar(pct: float, width: int = 14) -> str:
 # ── Per-peptide state ─────────────────────────────────────────────────────────
 
 class PeptideState:
-    def __init__(self, name: str, base_dir: Path):
-        self.name        = name
-        self.base_dir    = base_dir
-        self.run_dir     = base_dir / f"{name}_2d_run"
-        self.genpept_dir = base_dir / f"{name}_genpept"
-
+    def _init_cache(self):
         self._prog: dict         = {}
         self._drvsumm: dict      = {}
         self._pool: dict         = {}
         self._mtime_prog: float  = 0.0
         self._mtime_drv: float   = 0.0
         self._mtime_pool: float  = 0.0
-        self._epoch_count: Optional[int] = None
-        self._ckpt_count: Optional[int]  = None
-        self._ckpt_refresh: float        = 0.0
-        self._genpept_status: Optional[str] = None
-        self._genpept_surv: Optional[int]   = None
+        self._epoch_count        = None
+        self._ckpt_count         = None
+        self._ckpt_refresh: float = 0.0
+        self._genpept_status     = None
+        self._genpept_surv       = None
+
+    def __init__(self, name: str, base_dir: Path):
+        self.name        = name
+        self.base_dir    = base_dir
+        self.run_dir     = base_dir / f"{name}_2d_run"
+        self.genpept_dir = base_dir / f"{name}_genpept"
+        self._init_cache()
+
+    @classmethod
+    def from_rundir(cls, run_dir: Path) -> "PeptideState":
+        """Create state for a flat run dir passed directly via --extra."""
+        obj = object.__new__(cls)
+        obj.name        = run_dir.name
+        obj.base_dir    = run_dir.parent
+        obj.run_dir     = run_dir
+        obj.genpept_dir = run_dir.parent / f"{run_dir.name}_genpept"
+        obj._init_cache()
+        return obj
+
+
 
     def _load_progress(self):
         p = self.run_dir / "progress.jsonl"
@@ -752,6 +767,8 @@ def main():
                         help="Refresh interval (seconds)")
     parser.add_argument("--once", action="store_true",
                         help="Print once and exit")
+    parser.add_argument("--extra", "-e", nargs="+", metavar="DIR",
+                        help="Additional run dirs to include (flat, e.g. chignolin_2d_run7)")
     args = parser.parse_args()
 
     runs_dir = Path(args.runs_dir).resolve()
@@ -760,6 +777,16 @@ def main():
         sys.exit(1)
 
     states = discover(runs_dir)
+    for extra in (args.extra or []):
+        p = Path(extra)
+        if not p.is_absolute():
+            p = runs_dir / p
+        p = p.resolve()
+        if not p.is_dir():
+            print(f"WARNING: --extra {extra} not found, skipping", file=sys.stderr)
+            continue
+        states.append(PeptideState.from_rundir(p))
+
     if not states:
         print(f"No peptide runs found in {runs_dir}", file=sys.stderr)
         sys.exit(1)
