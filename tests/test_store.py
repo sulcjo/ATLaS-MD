@@ -8,6 +8,7 @@ import pytest
 
 
 def test_parquet_writer_creates_chunk_on_flush(tmp_path):
+    import pyarrow.parquet as pq
     from gareus.store import ParquetSampleWriter
 
     writer = ParquetSampleWriter(tmp_path / "seg_001", flush_rows=5)
@@ -17,8 +18,10 @@ def test_parquet_writer_creates_chunk_on_flush(tmp_path):
     writer.flush()
     writer.close()
 
-    chunks = list((tmp_path / "seg_001").glob("chunk_*.parquet"))
-    assert len(chunks) == 1
+    # close() consolidates: no chunks remain, data.parquet holds all rows
+    assert not list((tmp_path / "seg_001").glob("chunk_*.parquet"))
+    assert (tmp_path / "seg_001" / "data.parquet").exists()
+    assert pq.read_table(tmp_path / "seg_001" / "data.parquet").num_rows == 5
 
 
 def test_parquet_writer_correct_columns(tmp_path):
@@ -69,10 +72,10 @@ def test_parquet_writer_multiple_chunks(tmp_path):
     writer.flush()
     writer.close()
 
-    chunks = sorted((tmp_path / "seg").glob("chunk_*.parquet"))
-    assert len(chunks) == 3
-    total = sum(pq.read_table(c).num_rows for c in chunks)
-    assert total == 9
+    # close() consolidates all chunks → data.parquet
+    assert not list((tmp_path / "seg").glob("chunk_*.parquet"))
+    tbl = pq.read_table(tmp_path / "seg" / "data.parquet")
+    assert tbl.num_rows == 9
 
 
 def test_parquet_writer_auto_flushes_at_threshold(tmp_path):
@@ -82,12 +85,12 @@ def test_parquet_writer_auto_flushes_at_threshold(tmp_path):
     writer = ParquetSampleWriter(tmp_path / "seg", flush_rows=4)
     for i in range(4):
         writer.write_sample(i, 0, 0, 0.1, -1.0, -100.0, 1.0, 0.5, 0.5)
-    # auto-flush triggered by 4th write; no explicit flush call
+    # auto-flush triggered by 4th write; close() consolidates to data.parquet
     writer.close()
 
-    chunks = list((tmp_path / "seg").glob("chunk_*.parquet"))
-    total = sum(pq.read_table(c).num_rows for c in chunks)
-    assert total == 4
+    assert not list((tmp_path / "seg").glob("chunk_*.parquet"))
+    tbl = pq.read_table(tmp_path / "seg" / "data.parquet")
+    assert tbl.num_rows == 4
 
 
 def test_parquet_writer_null_cv2(tmp_path):

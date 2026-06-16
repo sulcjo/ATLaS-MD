@@ -3389,7 +3389,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                         boost_nonbonded=_boost_nonb,
                     )
                 rows.append(row)
-            if is_prod and bool(getattr(args, "flush_every_log", True)):
+            if is_prod and bool(getattr(args, "flush_every_log", False)):
                 parquet_sample_writer.flush()
             return rows
 

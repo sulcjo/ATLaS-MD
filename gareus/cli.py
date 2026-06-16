@@ -372,15 +372,18 @@ def _add_gamd_args(p: argparse.ArgumentParser) -> None:
 
 
 def _add_output_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--progress-mode", choices=["none", "console", "jsonl", "both"], default="both")
+    p.add_argument("--progress-mode", choices=["none", "console", "jsonl", "both"], default="console")
     p.add_argument("--tui-mode", choices=["dashboard", "interactive", "line", "none"],
                    default="dashboard")
     p.add_argument("--distance-output-mode", choices=["none", "csv", "jsonl", "both"],
-                   default="both")
+                   default="none")
     p.add_argument("--distance-output-interval", type=int, default=1000)
-    p.add_argument("--parquet-flush-rows", type=int, default=5000,
-                   help="Rows buffered per parquet writer before flushing a chunk to disk (default 5000). "
+    p.add_argument("--parquet-flush-rows", type=int, default=200000,
+                   help="Rows buffered per parquet writer before flushing a chunk to disk (default 200000). "
                         "Larger values → fewer, bigger parquet parts per run.")
+    p.add_argument("--flush-every-log", action=argparse.BooleanOptionalAction, default=False,
+                   help="Flush parquet writers after every logging step (creates many tiny chunks). "
+                        "Default False: rely on --parquet-flush-rows threshold instead.")
     p.add_argument("--write-analysis-chunks", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--analysis-write-consolidated-npz",
                    action=argparse.BooleanOptionalAction, default=True)
