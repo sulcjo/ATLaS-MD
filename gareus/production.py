@@ -3299,6 +3299,11 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 ss_k_arr = ss_k_kcal_arr_global
                 ss_delta_matrix = ss_values[np.newaxis, :] - ss_centers_arr[:, np.newaxis]
                 ss_bias_matrix_kcal = 0.5 * ss_k_arr[:, np.newaxis] * ss_delta_matrix * ss_delta_matrix
+                # Guard NaN: windows without a secondary center (ss_centers_arr init to NaN)
+                # or replicas with a missing secondary value produce NaN in the Metropolis term,
+                # silently freezing that replica's exchanges and corrupting the cached bias matrix.
+                # Zero those entries — their exchange criterion falls back to primary CV only.
+                ss_bias_matrix_kcal = np.where(np.isfinite(ss_delta_matrix), ss_bias_matrix_kcal, 0.0)
             else:
                 ss_centers_arr = ss_centers_arr_global
                 ss_k_arr = ss_k_kcal_arr_global
@@ -3735,7 +3740,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     old_e = bias_matrix_kj[wi, rep] + bias_matrix_kj[valid_windows, target_reps]
                     new_e = bias_matrix_kj[valid_windows, rep] + bias_matrix_kj[wi, target_reps]
                     delta = new_e - old_e
-                    log_weights = np.clip(-float(beta) * delta.astype(np.float64, copy=False), -745.0, 0.0)
+                    log_weights = np.clip(-float(beta) * delta.astype(np.float64, copy=False), -745.0, None)
                     # The stay candidate must have unit weight relative to itself.
                     stay_idx = np.where(valid_windows == wi)[0]
                     if stay_idx.size:

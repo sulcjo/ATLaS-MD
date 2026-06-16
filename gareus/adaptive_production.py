@@ -2818,6 +2818,7 @@ def run_scheduled_adaptive_epoch(
     baseline_steps = min(int(r.get("baseline_steps", 0) or 0) for r in schedule if int(r.get("requested_steps", 0) or 0) > 0)
     baseline_steps = max(1, baseline_steps)
     segment_summaries: List[Dict[str, Any]] = []
+    _seg_call_counter: List[int] = [0]
 
     def run_segment(name: str, state_ids: Sequence[int], steps: int) -> Path:
         seg_dir = epoch_dir / name
@@ -2839,6 +2840,11 @@ def run_scheduled_adaptive_epoch(
             _epoch_idx = int(_epoch_dir_name.rsplit("_", 1)[-1])
         except Exception:
             _epoch_idx = 0
+        # Offset seed per segment so each segment gets fresh exchange-RNG and
+        # thermostat streams.  Without this every segment replays identical
+        # random sequences (N4: re-correlated RNG across segments).
+        seg_args.seed = int(args.seed) + _epoch_idx * 1_000_003 + _seg_call_counter[0] * 997
+        _seg_call_counter[0] += 1
         setattr(seg_args, "_adaptive_phase_info", {
             "is_adaptive_epoch": True,
             "epoch_index": _epoch_idx,
