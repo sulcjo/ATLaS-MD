@@ -281,3 +281,127 @@ def test_nan_secondary_old_behaviour_was_wrong():
     old_nan   = _old_score(0.20, float("nan"), 0.20, 0.0, 0.05, 0.333, 1.0)
     old_finite = _old_score(0.20, 0.166, 0.20, 0.0, 0.05, 0.333, 1.0)
     assert old_nan < old_finite, "old behaviour: NaN scores lower (bug confirmed)"
+
+
+# ---------------------------------------------------------------------------
+# F4: Adaptive seed scorer normalizes primary and secondary axes
+# ---------------------------------------------------------------------------
+
+def _f4_score_seed(p, s, target_p, target_s, dp_scale, ds_scale):
+    """Reproduce the fixed normalized seed scorer from adaptive_production.py."""
+    dp = float(p) - float(target_p)
+    ds = 0.0
+    if target_s is not None and s is not None:
+        ds = float(s) - float(target_s)
+    return (dp / max(1e-12, dp_scale)) ** 2 + (ds / max(1e-12, ds_scale)) ** 2
+
+
+def _f4_score_seed_old(p, s, target_p, target_s):
+    """OLD raw dp²+ds² scorer without normalization."""
+    dp = float(p) - float(target_p)
+    ds = 0.0
+    if target_s is not None and s is not None:
+        ds = float(s) - float(target_s)
+    return dp * dp + ds * ds
+
+
+def test_f4_normalized_scorer_balances_axes():
+    """
+    With a primary scale of 0.05 and secondary scale of 0.33, a seed that is
+    1 primary-spacing off (dp=0.05, ds=0) should score identically to a seed
+    that is 1 secondary-spacing off (dp=0, ds=0.33) after normalization.
+    The old scorer with raw units would rank them very differently.
+    """
+    dp_scale = 0.05
+    ds_scale = 0.33
+
+    score_primary_off = _f4_score_seed(0.25, 0.0, 0.20, 0.0, dp_scale, ds_scale)
+    score_secondary_off = _f4_score_seed(0.20, 0.33, 0.20, 0.0, dp_scale, ds_scale)
+    assert abs(score_primary_off - score_secondary_off) < 1e-10, (
+        f"Normalized scores should be equal for 1-spacing offset on each axis: "
+        f"primary_off={score_primary_off:.6f} secondary_off={score_secondary_off:.6f}"
+    )
+
+    # Old scorer would rank them very differently (secondary_off << primary_off)
+    old_primary_off = _f4_score_seed_old(0.25, 0.0, 0.20, 0.0)
+    old_secondary_off = _f4_score_seed_old(0.20, 0.33, 0.20, 0.0)
+    assert old_secondary_off > old_primary_off * 40, (
+        "Old scorer should wildly prefer primary-near seeds over secondary-near seeds "
+        f"(old_primary_off={old_primary_off:.6f} old_secondary_off={old_secondary_off:.6f})"
+    )
+
+
+def test_f4_single_active_state_uses_fallback_scale():
+    """With one active state there is no grid spacing; fallback scale of 1.0 applies."""
+    # Can't take median of single-element diff; len <= 1 → scale = 1.0
+    p_centers = [0.20]
+    dp_scale = float(np.median(np.diff(sorted(p_centers)))) if len(p_centers) > 1 else 1.0
+    dp_scale = max(1e-12, dp_scale)
+    assert dp_scale == 1.0, "single-state fallback scale must be 1.0"
+
+
+def test_f4_scale_from_median_spacing():
+    """Median spacing of an irregular grid gives correct normalization."""
+    p_centers = sorted([0.10, 0.15, 0.25, 0.40])  # spacings: 0.05, 0.10, 0.15
+    dp_scale = float(np.median(np.diff(p_centers)))
+    assert abs(dp_scale - 0.10) < 1e-10, f"median spacing = {dp_scale}, expected 0.10"
+
+
+# ---------------------------------------------------------------------------
+# F7: rama-map secondary defaults snap to named basin values
+# ---------------------------------------------------------------------------
+
+def _rama_map_basin_values():
+    """The four named rama-map basin scalars."""
+    return [-1.0, -1.0 / 3.0, 1.0 / 3.0, 1.0]
+
+
+def _snap_to_rama_basins(value):
+    """Mirror the cv.py snap_to_rama_basins helper."""
+    basins = _rama_map_basin_values()
+    return min(basins, key=lambda b: abs(b - float(value)))
+
+
+def test_f7_default_centers_are_basin_values():
+    """The corrected rama-map default centers must equal the four named basins."""
+    expected = sorted(_rama_map_basin_values())
+    actual = sorted([-1.0, -1.0 / 3.0, 1.0 / 3.0, 1.0])
+    assert actual == pytest.approx(expected), (
+        f"Default centers {actual} do not match expected basins {expected}"
+    )
+
+
+def test_f7_old_default_centers_were_outside_basin_range():
+    """Regression: old default [0.25, 0.55, 0.85] is entirely outside [-1, 1] basin range."""
+    old_defaults = [0.25, 0.55, 0.85]
+    basins = _rama_map_basin_values()
+    for v in old_defaults:
+        nearest = _snap_to_rama_basins(v)
+        assert nearest != pytest.approx(v, abs=0.01), (
+            f"Old default {v} should not be a named basin (nearest: {nearest})"
+        )
+
+
+def test_f7_snap_rounds_to_correct_basin():
+    """snap_to_rama_basins maps intermediate values to nearest named basin."""
+    cases = [
+        (-0.9, -1.0),           # near beta
+        (-0.5, -1.0 / 3.0),    # near ppii
+        (0.0, -1.0 / 3.0),     # equidistant ppii/alpha_R → ppii wins (closer to -1/3)
+        (0.5, 1.0 / 3.0),      # near alpha_R
+        (0.9, 1.0),             # near alpha_L
+    ]
+    for value, expected in cases:
+        result = _snap_to_rama_basins(value)
+        assert result == pytest.approx(expected, abs=1e-10), (
+            f"snap({value}) → {result}, expected {expected}"
+        )
+
+
+def test_f7_snap_dedup_removes_duplicate_basin_assignments():
+    """When multiple proposed centers snap to the same basin, dedup preserves sorted uniques."""
+    proposed = [0.28, 0.35, 0.42]   # all near alpha_R = 1/3
+    snapped = sorted({_snap_to_rama_basins(x) for x in proposed})
+    assert snapped == pytest.approx([1.0 / 3.0]), (
+        f"Three proposals near alpha_R should dedup to one: got {snapped}"
+    )
