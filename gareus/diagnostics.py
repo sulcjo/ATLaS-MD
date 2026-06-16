@@ -13,7 +13,7 @@ Available functions
 -------------------
 
 ``compute_gamd_reweighting_diagnostics``
-    Post‑run diagnostics for GaMD boost reweighting reliability.  This
+    Post\u2011run diagnostics for GaMD boost reweighting reliability.  This
     examines the boost magnitude trace stored in ``analysis_arrays.npz``
     and computes basic statistics and diagnostics such as the mean,
     standard deviation, anharmonicity and effective sample size (ESS)
@@ -21,7 +21,7 @@ Available functions
     and any warnings is returned.
 
 ``validate_us_mbar_inputs``
-    Validate final-production umbrella‑sampling data before running
+    Validate final-production umbrella\u2011sampling data before running
     PyMBAR/PMF analysis.  This checks that the umbrella bias matrix
     shape matches the number of windows and that sufficient samples
     exist in each window.  It also computes histogram overlaps
@@ -50,13 +50,7 @@ __all__ = [
 
 
 def _read_csv_dicts(path: Path) -> list[dict]:
-    """Return a list of dicts for each row in a CSV file.
-
-    If the file does not exist, an empty list is returned.  The
-    resulting dictionaries have keys corresponding to the CSV
-    column headers.  All values are kept as raw strings and are
-    converted to floats by the caller as needed.
-    """
+    """Return a list of dicts for each row in a CSV file."""
     path = Path(path)
     if not path.exists():
         return []
@@ -65,14 +59,7 @@ def _read_csv_dicts(path: Path) -> list[dict]:
 
 
 def _safe_float(value: Any, default: float = float("nan")) -> float:
-    """Convert ``value`` to ``float`` if possible, else return ``default``.
-
-    This helper attempts to cast arbitrary values (strings, numbers,
-    etc.) to ``float``.  Non‑finite results and exceptions result in
-    ``default``.  It is useful when parsing user‑provided values from
-    CSV files or CLI arguments where missing entries should be treated
-    gracefully.
-    """
+    """Convert ``value`` to ``float`` if possible, else return ``default``."""
     try:
         out = float(value)
     except Exception:
@@ -81,28 +68,9 @@ def _safe_float(value: Any, default: float = float("nan")) -> float:
 
 
 def _sample_counts_by_window(window_arr: np.ndarray, n_windows: int) -> list[int]:
-    """Compute the number of samples falling into each umbrella window.
-
-    Parameters
-    ----------
-    window_arr:
-        Array of length ``n_samples`` containing integer window indices
-        for each production frame.
-    n_windows:
-        Total number of umbrella windows.
-
-    Returns
-    -------
-    list of int
-        A list of length ``n_windows`` where each entry is the count
-        of samples assigned to the corresponding window.  Windows
-        outside the valid range [0, n_windows) are ignored.  If no
-        samples fall into a window, a count of 0 is returned for that
-        window.
-    """
+    """Compute the number of samples falling into each umbrella window."""
     out = np.zeros(int(n_windows), dtype=np.int64)
     if window_arr.size:
-        # Only count samples with valid integer indices within range
         valid = window_arr[(window_arr >= 0) & (window_arr < int(n_windows))]
         if valid.size:
             out += np.bincount(valid.astype(np.int64), minlength=int(n_windows))[: int(n_windows)]
@@ -110,27 +78,18 @@ def _sample_counts_by_window(window_arr: np.ndarray, n_windows: int) -> list[int
 
 
 def _hist_overlap_np(a: np.ndarray, b: np.ndarray, lo: float, hi: float, bins: int = 80) -> float:
-    """Estimate the histogram overlap between two distributions.
-
-    Two one‑dimensional arrays ``a`` and ``b`` are histogrammed into
-    ``bins`` equally spaced bins spanning the range ``[lo, hi]``.  The
-    overlap is computed as the sum of the minimum probabilities in
-    each bin.  NaN is returned if either distribution has fewer than
-    5 finite samples or if the bin range is degenerate.
-    """
+    """Estimate the histogram overlap between two distributions."""
     a = np.asarray(a, dtype=float)
     b = np.asarray(b, dtype=float)
     a = a[np.isfinite(a)]
     b = b[np.isfinite(b)]
     if a.size < 5 or b.size < 5:
         return float("nan")
-    # Derive range from data if unspecified or degenerate
     if not math.isfinite(lo) or not math.isfinite(hi) or hi <= lo:
         allv = np.concatenate([a, b])
         if allv.size < 2:
             return float("nan")
         lo, hi = float(np.min(allv)), float(np.max(allv))
-    # Pad the range slightly to avoid zero‑width bins
     pad = max(0.1, 0.02 * (hi - lo))
     ha, _ = np.histogram(a, bins=max(8, int(bins)), range=(lo - pad, hi + pad))
     hb, _ = np.histogram(b, bins=max(8, int(bins)), range=(lo - pad, hi + pad))
@@ -154,6 +113,14 @@ def compute_gamd_reweighting_diagnostics(out_dir: Path, temperature_k: float) ->
     finite values is small or the distribution exhibits anomalies.  If
     the array is missing or unreadable, an error status is returned.
 
+    In addition to the pooled ESS, per-window ESS values are computed
+    so that individual window reweighting quality can be assessed
+    without the bimodal collapse that occurs when windows have very
+    different mean boosts.  A ``calibration_range_warnings`` list
+    identifies windows whose mean boost far exceeds the median (a sign
+    that those windows sample PEs outside the [Vmin, Vmax] calibration
+    range and that the boost saturates or vanishes there).
+
     Parameters
     ----------
     out_dir:
@@ -167,6 +134,18 @@ def compute_gamd_reweighting_diagnostics(out_dir: Path, temperature_k: float) ->
         A dictionary summarising the diagnostics and warnings.  See
         ``gareus_peptide.compute_gamd_reweighting_diagnostics`` for
         further context.
+
+    New keys (F3, F2)
+    -----------------
+    per_window_ess : dict[int, dict]
+        Mapping window_id -> {"ess": float, "ess_fraction": float, "n_frames": int}.
+    ess_fraction_per_window_min : float
+        Minimum per-window ESS fraction across all windows.
+    ess_fraction_per_window_median : float
+        Median per-window ESS fraction across all windows.
+    calibration_range_warnings : list[str]
+        One entry per window whose mean boost exceeds 3x the median of all
+        windows\'  mean boosts, indicating calibration range mismatch.
     """
     out_dir = Path(out_dir)
     npz_path = out_dir / "analysis_arrays.npz"
@@ -210,7 +189,7 @@ def compute_gamd_reweighting_diagnostics(out_dir: Path, temperature_k: float) ->
     ess_frac = float(ess / finite.size) if finite.size else float("nan")
     mean_kcal = float(np.mean(boost_kcal))
     sd_kcal = float(np.std(boost_kcal))
-    # Per-window boost std — detect individual high-variance windows
+    # Per-window boost std -- detect individual high-variance windows
     per_window_sd: dict[int, float] = {}
     if window_arr.size == boost_kj.size and window_arr.size > 0:
         finite_mask = np.isfinite(boost_kj)
@@ -219,6 +198,63 @@ def compute_gamd_reweighting_diagnostics(out_dir: Path, temperature_k: float) ->
             vals = boost_kj[mask] / 4.184
             if vals.size >= 2:
                 per_window_sd[int(wi)] = float(np.std(vals))
+
+    # F3: Per-window ESS -- avoids the bimodal collapse that occurs when
+    # windows have very different mean boosts and the pooled distribution
+    # is multimodal.  Uses the same beta and formula as the pooled ESS
+    # but restricts each computation to frames from a single window.
+    per_window_ess: dict[int, dict] = {}
+    ess_fracs_per_window: list[float] = []
+    if window_arr.size == boost_kj.size and window_arr.size > 0:
+        finite_mask_ess = np.isfinite(boost_kj)
+        for wi in np.unique(window_arr[finite_mask_ess]):
+            mask_w = finite_mask_ess & (window_arr == wi)
+            vals_w = boost_kj[mask_w]
+            n_w = int(vals_w.size)
+            if n_w < 2:
+                continue
+            logw_w = beta_1_over_kj * vals_w
+            logw_w = logw_w - float(np.max(logw_w))
+            w_w = np.exp(logw_w)
+            sw_w = float(np.sum(w_w))
+            sw2_w = float(np.sum(w_w * w_w))
+            ess_w = float(sw_w * sw_w / sw2_w) if sw2_w > 0.0 else float("nan")
+            ess_frac_w = float(ess_w / n_w) if (n_w > 0 and math.isfinite(ess_w)) else float("nan")
+            per_window_ess[int(wi)] = {
+                "ess": ess_w,
+                "ess_fraction": ess_frac_w,
+                "n_frames": n_w,
+            }
+            if math.isfinite(ess_frac_w):
+                ess_fracs_per_window.append(ess_frac_w)
+    ess_frac_pw_min = float(np.min(ess_fracs_per_window)) if ess_fracs_per_window else float("nan")
+    ess_frac_pw_median = float(np.median(ess_fracs_per_window)) if ess_fracs_per_window else float("nan")
+
+    # F2: Calibration range warnings -- detect windows whose mean boost
+    # (in kJ/mol) is far above the median.  These windows likely sample
+    # PEs outside the [Vmin, Vmax] range frozen from the k=0 calibration
+    # run, causing the boost to saturate or vanish and corrupting
+    # reweighting for those windows.
+    calibration_range_warnings: list[str] = []
+    if window_arr.size == boost_kj.size and window_arr.size > 0:
+        finite_mask_cr = np.isfinite(boost_kj)
+        window_mean_boosts_kj: dict[int, float] = {}
+        for wi in np.unique(window_arr[finite_mask_cr]):
+            mask_w = finite_mask_cr & (window_arr == wi)
+            vals_w = boost_kj[mask_w]
+            if vals_w.size >= 1:
+                window_mean_boosts_kj[int(wi)] = float(np.mean(vals_w))
+        if len(window_mean_boosts_kj) >= 2:
+            all_means = list(window_mean_boosts_kj.values())
+            median_mean_kj = float(np.median(all_means))
+            if median_mean_kj > 0.0:
+                threshold_kj = 3.0 * median_mean_kj
+                for wi, mean_b in sorted(window_mean_boosts_kj.items()):
+                    if mean_b > threshold_kj:
+                        calibration_range_warnings.append(
+                            f"window {wi}: mean boost {mean_b:.1f} kJ/mol exceeds 3\u00d7 median ({median_mean_kj:.1f} kJ/mol)"
+                        )
+
     result.update({
         "status": "ok",
         "n_finite": int(finite.size),
@@ -233,6 +269,10 @@ def compute_gamd_reweighting_diagnostics(out_dir: Path, temperature_k: float) ->
         "beta_1_over_kj_mol": float(beta_1_over_kj),
         "reweighting_note": "ESS uses exp(beta*boost) as a diagnostic of weight degeneracy; final GaMD PMF details may use cumulant expansion or MBAR-specific treatment.",
         "per_window_boost_sd_kcal_mol": per_window_sd,
+        "per_window_ess": per_window_ess,
+        "ess_fraction_per_window_min": ess_frac_pw_min,
+        "ess_fraction_per_window_median": ess_frac_pw_median,
+        "calibration_range_warnings": calibration_range_warnings,
     })
     # Add warnings based on heuristics from the monolith
     if finite.size < 100:
@@ -245,7 +285,7 @@ def compute_gamd_reweighting_diagnostics(out_dir: Path, temperature_k: float) ->
         if len(hot_windows) > 10:
             hot_str += f" ... ({len(hot_windows)} total)"
         warnings.append(
-            f"windows [{hot_str}] have GaMD boost σ > 2.0 kcal/mol; "
+            f"windows [{hot_str}] have GaMD boost \u03c3 > 2.0 kcal/mol; "
             f"high boost variance in these windows may corrupt MBAR/cumulant contributions"
         )
     try:
@@ -258,13 +298,16 @@ def compute_gamd_reweighting_diagnostics(out_dir: Path, temperature_k: float) ->
         warnings.append(f"GaMD reweighting ESS fraction is {ess_frac:.3f}; weights are strongly degenerate")
     if sd_kcal <= 1.0e-8:
         warnings.append("GaMD boost trace is essentially constant; verify boost reading and GaMD production stage")
+    if calibration_range_warnings:
+        for crw in calibration_range_warnings:
+            warnings.append(f"calibration range: {crw}")
     if warnings:
         result["status"] = "warning"
     return result
 
 
 def validate_us_mbar_inputs(out_dir: Path, temperature_k: float, target_overlap: float = 0.30) -> dict:
-    """Validate umbrella‑sampling inputs for MBAR/PMF analysis.
+    """Validate umbrella\u2011sampling inputs for MBAR/PMF analysis.
 
     Checks umbrella windows and analysis arrays for consistent shapes,
     finite values and sufficient sample counts.  Computes histogram
@@ -288,7 +331,7 @@ def validate_us_mbar_inputs(out_dir: Path, temperature_k: float, target_overlap:
     -------
     dict
         A dictionary with keys documenting the validation outcome.  If
-        ``errors`` is non‑empty, the status will be "error" and
+        ``errors`` is non\u2011empty, the status will be "error" and
         downstream MBAR/PMF analysis should not proceed.
     """
     out_dir = Path(out_dir)
