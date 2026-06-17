@@ -209,19 +209,20 @@ def build_codebook(all_features: list[Optional[dict]], n_clusters: int = 80,
     km.fit(pca_all)
 
     umap_model = None
-    umap_coords = np.zeros((min(N, umap_n_landmarks), 2))
-    try:
-        import umap
-        idx = np.random.RandomState(42).choice(N, size=min(N, umap_n_landmarks), replace=False)
-        idx.sort()
-        landmarks = pca_all[idx]
-        print(f'  [codebook] UMAP on {len(idx):,} landmarks...')
-        umap_model = umap.UMAP(n_components=2, n_neighbors=15, min_dist=0.1,
-                                random_state=42, verbose=False)
-        umap_coords = umap_model.fit_transform(landmarks)
-        print('  [codebook] UMAP done')
-    except ImportError:
-        print('  [codebook] umap not available, skipping UMAP embedding')
+    umap_coords = np.zeros((0, 2))
+    if umap_n_landmarks > 0:
+        try:
+            import umap
+            idx = np.random.RandomState(42).choice(N, size=min(N, umap_n_landmarks), replace=False)
+            idx.sort()
+            landmarks = pca_all[idx]
+            print(f'  [codebook] UMAP on {len(idx):,} landmarks...')
+            umap_model = umap.UMAP(n_components=2, n_neighbors=15, min_dist=0.1,
+                                    random_state=42, verbose=False)
+            umap_coords = umap_model.fit_transform(landmarks)
+            print('  [codebook] UMAP done')
+        except ImportError:
+            print('  [codebook] umap not available, skipping UMAP embedding')
 
     return pca, km, umap_model, umap_coords
 
@@ -482,10 +483,10 @@ def write_report(metrics: list[PartMetrics], out_dir: Path, n_clusters: int) -> 
     rows = []
     for m in metrics:
         row = dict(
-            label=m.label, epoch=m.epoch, part_type=m.part_type,
-            n_frames=m.n_frames, ns=round(m.ns, 4),
-            new_clusters=m.new_clusters,
-            cumulative_cluster_frac=round(m.cumulative_cluster_frac, 4),
+            label=m.label, epoch=int(m.epoch), part_type=m.part_type,
+            n_frames=int(m.n_frames), ns=round(float(m.ns), 4),
+            new_clusters=int(m.new_clusters),
+            cumulative_cluster_frac=round(float(m.cumulative_cluster_frac), 4),
             rama_js_mean=round(float(np.nanmean(m.rama_js_vs_ref)), 5) if m.rama_js_vs_ref is not None else None,
             rama_js_max=round(float(np.nanmax(m.rama_js_vs_ref[np.isfinite(m.rama_js_vs_ref)])), 5)
                 if m.rama_js_vs_ref is not None and np.any(np.isfinite(m.rama_js_vs_ref)) else None,
@@ -777,7 +778,7 @@ def main() -> None:
     try:
         pca, kmeans, umap_model, umap_landmarks = build_codebook(
             all_features, n_clusters=args.n_clusters,
-            umap_n_landmarks=50_000 if not skip_umap else 0,
+            umap_n_landmarks=0 if skip_umap else 50_000,
         )
     except Exception as e:
         sys.exit(f'ERROR building codebook: {e}')
