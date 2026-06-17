@@ -384,6 +384,7 @@ simulation:
 
 gamd:
   production_steps: 10000000          # double-adaptive: unused for epoch lengths (adaptive-production overrides per epoch from md_budget_ns pool); only fallback if pool disabled
+  boost_type: lower-dual-nonbonded-dihedral  # fixes F1: lower-dual reads energy (all groups incl. umbrella group 0); this reads energy1+energy2 (group-specific), umbrella excluded
   sigma0p: 7.0                        # was 6.0; reduced 15% to lower anharmonicity score from ~0.58 toward ~0.45
   sigma0d: 7.0                        # was 6.0; idem
   equil_steps: 1500000                # was 100000; 5 ns at 4 fs for thorough GaMD calibration; NOTE: runs in every pilot round too (heavy overhead, see workflow_help WARNING)
