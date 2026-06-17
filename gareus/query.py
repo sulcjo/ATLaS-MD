@@ -36,6 +36,7 @@ def _concat_numpy_dicts(results: list) -> dict:
 def load_samples(
     run_dir: Path,
     segment_ids: Optional[list] = None,
+    n_threads: int = 0,
 ) -> dict:
     """Load production samples from Parquet files via DuckDB.
 
@@ -63,6 +64,8 @@ def load_samples(
         if not files:
             return {}
         conn = duckdb.connect()
+        if n_threads > 0:
+            conn.execute(f"SET threads={n_threads}")
         result = conn.execute(
             "SELECT * FROM read_parquet(?) ORDER BY step, replica",
             [[str(f) for f in files]],
@@ -78,6 +81,8 @@ def load_samples(
         if not files:
             return {}
         conn = duckdb.connect()
+        if n_threads > 0:
+            conn.execute(f"SET threads={n_threads}")
         result = conn.execute(
             "SELECT * FROM read_parquet(?) ORDER BY step, replica",
             [[str(f) for f in files]],
@@ -119,6 +124,8 @@ def load_samples(
         return {}
 
     conn = duckdb.connect()
+    if n_threads > 0:
+        conn.execute(f"SET threads={n_threads}")
     results = []
     if unfiltered_files:
         r = conn.execute(
