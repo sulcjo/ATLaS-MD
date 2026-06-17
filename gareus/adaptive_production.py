@@ -35,7 +35,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from .checkpoints import production_checkpoint_available
 from .io import write_json, read_json_file, _json_ready
+from .lifecycle import _graceful_shutdown
 
 logger = logging.getLogger(__name__)
 
@@ -2818,6 +2820,7 @@ def run_scheduled_adaptive_epoch(
     baseline_steps = min(int(r.get("baseline_steps", 0) or 0) for r in schedule if int(r.get("requested_steps", 0) or 0) > 0)
     baseline_steps = max(1, baseline_steps)
     segment_summaries: List[Dict[str, Any]] = []
+    resume_requested = _arg_bool(args, "adaptive_production_resume", False)
 
     def run_segment(name: str, state_ids: Sequence[int], steps: int) -> Path:
         seg_dir = epoch_dir / name
@@ -2832,7 +2835,9 @@ def run_scheduled_adaptive_epoch(
         seg_args.adaptive_feedback_enabled = False
         seg_args.adaptive_feedback_pilot = False
         seg_args.adaptive_feedback_final_production = False
-        seg_args.resume = False
+        seg_args.resume = bool(resume_requested and production_checkpoint_available(seg_dir))
+        if seg_args.resume:
+            print(f"      scheduled segment {name}: checkpoint manifest found; resuming from {seg_dir}")
         # Derive epoch index from directory name for TUI epoch/topup display.
         _epoch_dir_name = epoch_dir.name  # e.g. "epoch_001"
         try:
@@ -2898,6 +2903,18 @@ def run_scheduled_adaptive_epoch(
         seg_args.gamd_production_steps = int(actual_steps)
         print(f"      scheduled segment {name}: {len(state_ids)} state(s), {actual_steps} steps")
         run_gareus_callable(seg_args, seg_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
+        if _graceful_shutdown.is_set():
+            segment_summaries.append({
+                "segment": name,
+                "dir": str(seg_dir),
+                "windows_csv": str(windows_csv),
+                "state_ids": [int(x) for x in state_ids],
+                "steps": int(actual_steps),
+                "requested_steps": int(requested_steps),
+                "interrupted_after_checkpoint": True,
+                "seed_bank": seed_report or {},
+            })
+            return seg_dir
         if runtime_pool is not None:
             pool_event = runtime_pool.consume(
                 label=f"{epoch_dir.name}/{name}",
@@ -2919,6 +2936,18 @@ def run_scheduled_adaptive_epoch(
         return seg_dir
 
     run_segment("baseline", active_ids, baseline_steps)
+    if _graceful_shutdown.is_set():
+        payload = {
+            "schema_version": "adaptive_scheduled_epoch_v1",
+            "status": "interrupted_after_checkpoint",
+            "epoch_dir": str(epoch_dir),
+            "baseline_steps": int(baseline_steps),
+            "segments": segment_summaries,
+            "diagnostics_json": "",
+            "schedule_csv": str(epoch_dir / "epoch_schedule.csv"),
+        }
+        write_json(epoch_dir / "scheduled_epoch_summary.json", payload)
+        return {"summary": payload, "diagnostics": {}}
     groups: Dict[int, List[int]] = {}
     for row in schedule:
         extra = _quantized_extra_steps(int(row.get("requested_steps", 0) or 0) - baseline_steps)
@@ -2927,6 +2956,18 @@ def run_scheduled_adaptive_epoch(
         groups.setdefault(extra, []).append(int(row["state_id"]))
     for idx, (extra_steps, state_ids) in enumerate(sorted(groups.items()), start=1):
         run_segment(f"topup_{idx:03d}_{extra_steps}", state_ids, extra_steps)
+        if _graceful_shutdown.is_set():
+            payload = {
+                "schema_version": "adaptive_scheduled_epoch_v1",
+                "status": "interrupted_after_checkpoint",
+                "epoch_dir": str(epoch_dir),
+                "baseline_steps": int(baseline_steps),
+                "segments": segment_summaries,
+                "diagnostics_json": "",
+                "schedule_csv": str(epoch_dir / "epoch_schedule.csv"),
+            }
+            write_json(epoch_dir / "scheduled_epoch_summary.json", payload)
+            return {"summary": payload, "diagnostics": {}}
     diagnostics = collect_segmented_epoch_diagnostics(epoch_dir, registry, policy)
     payload = {
         "schema_version": "adaptive_scheduled_epoch_v1",
@@ -3202,6 +3243,18 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             )
             diagnostics = result["diagnostics"]
             scheduled_summary = result["summary"]
+            if _graceful_shutdown.is_set():
+                _write_runtime_pool_reports(adaptive_dir, runtime_pool)
+                payload = {
+                    "schema_version": "adaptive_production_driver_summary_v1",
+                    "status": "interrupted_after_checkpoint",
+                    "interrupted_segment": str(epoch_dir),
+                    "epochs_completed": int(start_epoch + len(epoch_summaries)),
+                    "epoch_summaries": _json_ready(epoch_summaries),
+                    "scheduled_epoch": _json_ready(scheduled_summary),
+                }
+                write_json(summary_path, payload)
+                return payload
         else:
             epoch_args = copy.copy(args)
             epoch_args.out = str(epoch_dir)
@@ -3249,7 +3302,9 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             epoch_args.adaptive_feedback_enabled = False
             epoch_args.adaptive_feedback_pilot = False
             epoch_args.adaptive_feedback_final_production = False
-            epoch_args.resume = False
+            epoch_args.resume = bool(resume_requested and production_checkpoint_available(epoch_dir))
+            if epoch_args.resume:
+                print(f"    Adaptive-production epoch {epoch + 1}/{max_epochs}: checkpoint manifest found; resuming from {epoch_dir}")
             if current_windows_csv is not None:
                 epoch_args.windows_2d_csv = str(current_windows_csv)
             if bool(policy.propagate_seed_bank) and current_seed_bank is not None and Path(current_seed_bank).exists():
@@ -3272,6 +3327,17 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             if current_windows_csv is not None:
                 print(f"      active window table: {current_windows_csv}")
             run_gareus(epoch_args, epoch_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
+            if _graceful_shutdown.is_set():
+                _write_runtime_pool_reports(adaptive_dir, runtime_pool)
+                payload = {
+                    "schema_version": "adaptive_production_driver_summary_v1",
+                    "status": "interrupted_after_checkpoint",
+                    "interrupted_segment": str(epoch_dir),
+                    "epochs_completed": int(start_epoch + len(epoch_summaries)),
+                    "epoch_summaries": _json_ready(epoch_summaries),
+                }
+                write_json(summary_path, payload)
+                return payload
 
             if registry is None:
                 table = find_best_window_table(epoch_dir)
@@ -3474,7 +3540,9 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
         final_args.adaptive_feedback_enabled = False
         final_args.adaptive_feedback_pilot = False
         final_args.adaptive_feedback_final_production = False
-        final_args.resume = False
+        final_args.resume = bool(resume_requested and production_checkpoint_available(final_dir))
+        if final_args.resume:
+            print(f"    Adaptive-production final frozen phase: checkpoint manifest found; resuming from {final_dir}")
         if _arg_bool(args, "adaptive_production_trajectories", True) is False:
             final_args.traj_interval = 0
             final_args.traj_format = "none"
@@ -3494,6 +3562,17 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             print(f"    Adaptive-production final frozen phase: {actual_final_steps} steps -> {final_dir}")
         print(f"      final active window table: {final_windows_csv}")
         run_gareus(final_args, final_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
+        if _graceful_shutdown.is_set():
+            _write_runtime_pool_reports(adaptive_dir, runtime_pool)
+            payload = {
+                "schema_version": "adaptive_production_driver_summary_v1",
+                "status": "interrupted_after_checkpoint",
+                "interrupted_segment": str(final_dir),
+                "epochs_completed": int(start_epoch + len(epoch_summaries)),
+                "epoch_summaries": _json_ready(epoch_summaries),
+            }
+            write_json(summary_path, payload)
+            return payload
         runtime_pool.consume(
             label="final",
             kind="final",
@@ -3548,7 +3627,9 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
         ext_args.adaptive_feedback_enabled = False
         ext_args.adaptive_feedback_pilot = False
         ext_args.adaptive_feedback_final_production = False
-        ext_args.resume = False
+        ext_args.resume = bool(resume_requested and production_checkpoint_available(ext_dir))
+        if ext_args.resume:
+            print(f"    Adaptive-production frozen final extension {ext_index + 1}/{ext_rounds}: checkpoint manifest found; resuming from {ext_dir}")
         if _arg_bool(args, "adaptive_production_trajectories", True) is False:
             ext_args.traj_interval = 0
             ext_args.traj_format = "none"
@@ -3568,6 +3649,17 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             f"{actual_ext_steps} steps -> {ext_dir}"
         )
         run_gareus(ext_args, ext_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
+        if _graceful_shutdown.is_set():
+            _write_runtime_pool_reports(adaptive_dir, runtime_pool)
+            payload = {
+                "schema_version": "adaptive_production_driver_summary_v1",
+                "status": "interrupted_after_checkpoint",
+                "interrupted_segment": str(ext_dir),
+                "epochs_completed": int(start_epoch + len(epoch_summaries)),
+                "epoch_summaries": _json_ready(epoch_summaries),
+            }
+            write_json(summary_path, payload)
+            return payload
         runtime_pool.consume(
             label=f"final_extension_{ext_index + 1:03d}",
             kind="final_extension",

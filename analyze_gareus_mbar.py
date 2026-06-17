@@ -185,7 +185,13 @@ def prod_dir_of(path: Path) -> Path:
         return (p/'analysis_arrays.npz').exists() or (p/'samples.csv').exists() or (p/'analysis_chunks_manifest.json').exists()
     def _has_adaptive_parquet(p: Path) -> bool:
         ap = p/'adaptive_production'
-        return (ap/'final_registry_used_for_mbar.csv').exists() and any(ap.glob('*/samples/**/*.parquet'))
+        if not ap.is_dir():
+            return False
+        has_registry = (ap/'final_registry_used_for_mbar.csv').exists() or (ap/'state_registry.csv').exists()
+        has_parquet = any(ap.glob('*/samples/**/*.parquet'))
+        if has_registry and has_parquet:
+            return True
+        return bool(_find_adaptive_epoch_dirs(ap))
     if _has_parquet(path) or _has_data(path): return path
     fp=path/'final_production'
     if _has_parquet(fp) or _has_data(fp): return fp
@@ -763,6 +769,17 @@ def load_csv(prod: Path, load_notes: Optional[list[str]] = None) -> Data:
 
 def _find_adaptive_epoch_dirs(adaptive_dir: Path) -> list:
     """Return list of (run_dir, window_map_path) for each epoch/final with Parquet samples."""
+    def _parquet_subdir(d: Path, parent_wmap: Path) -> tuple | None:
+        """Return (d, wmap) if d has Parquet samples, else None."""
+        if not ((d/'samples').is_dir() and (d/'segments.json').exists()):
+            return None
+        wmap = d/'epoch_window_map.csv'
+        if not wmap.exists():
+            wmap = parent_wmap
+        if wmap.exists():
+            return (d, wmap)
+        return None
+
     result = []
     for cand in sorted(adaptive_dir.iterdir()):
         if not cand.is_dir():
@@ -771,14 +788,15 @@ def _find_adaptive_epoch_dirs(adaptive_dir: Path) -> list:
         if (cand/'samples').is_dir() and (cand/'segments.json').exists() and (cand/'epoch_window_map.csv').exists():
             result.append((cand, cand/'epoch_window_map.csv'))
             continue
-        # epoch_NNN/baseline/ or final/baseline/ (later epoch pattern)
-        baseline = cand/'baseline'
-        if baseline.is_dir() and (baseline/'samples').is_dir() and (baseline/'segments.json').exists():
-            wmap = baseline/'epoch_window_map.csv'
-            if not wmap.exists():
-                wmap = cand/'epoch_window_map.csv'
-            if wmap.exists():
-                result.append((baseline, wmap))
+        # epoch_NNN/{baseline,topup_*}/ sub-dirs (double-adaptive / topup pattern)
+        epoch_wmap = cand/'epoch_window_map.csv'
+        for sub in sorted(cand.iterdir()):
+            if not sub.is_dir():
+                continue
+            if sub.name == 'baseline' or sub.name.startswith('topup_'):
+                entry = _parquet_subdir(sub, epoch_wmap)
+                if entry is not None:
+                    result.append(entry)
     return result
 
 
@@ -1108,7 +1126,11 @@ def load_parquet_adaptive_union(adaptive_dir: Path) -> Data:
     adaptive_dir = Path(adaptive_dir)
     registry_csv = adaptive_dir / 'final_registry_used_for_mbar.csv'
     if not registry_csv.exists():
-        raise FileNotFoundError(f'No final_registry_used_for_mbar.csv in {adaptive_dir}')
+        fallback = adaptive_dir / 'state_registry.csv'
+        if fallback.exists():
+            registry_csv = fallback
+        else:
+            raise FileNotFoundError(f'No final_registry_used_for_mbar.csv or state_registry.csv in {adaptive_dir}')
 
     with registry_csv.open(newline='') as f:
         reg_rows = [r for r in csv.DictReader(f)
@@ -1629,7 +1651,11 @@ def load_data(inp: Path, out: Optional[Path], source: str = 'auto', no_augment: 
     prod=prod_dir_of(inp)
     # Adaptive-production: prefer new Parquet epoch data, fall back to legacy NPZ.
     if prod.name == 'adaptive_production':
-        if (prod / 'final_registry_used_for_mbar.csv').exists() and any(prod.glob('*/samples/**/*.parquet')):
+        has_registry = (prod / 'final_registry_used_for_mbar.csv').exists() or (prod / 'state_registry.csv').exists()
+        has_epoch_parquet = has_registry and any(prod.glob('*/samples/**/*.parquet'))
+        if not has_epoch_parquet:
+            has_epoch_parquet = bool(_find_adaptive_epoch_dirs(prod))
+        if has_epoch_parquet:
             d = load_parquet_adaptive_union(prod)
         elif (prod / 'adaptive_union_mbar.npz').exists():
             d = load_union_npz(prod)
@@ -8530,6 +8556,9 @@ def parse_args(argv=None):
     p.add_argument('--poincare-min-dwell', type=int, default=50, metavar='N', help='Committor dwell filter: a crossing only counts if CV1 remains on the committed side for at least N consecutive frames afterward. Filters threshold-bounce artifacts; preserves genuine folding/unfolding events. Default 50 frames (=10 ps at 0.2 ps/frame). Set 0 or 1 to disable.')
     p.add_argument('--no-poincare-residue-torsions', action='store_true', help='Disable per-residue torsion analysis at Poincaré crossing frames.')
     p.add_argument('--poincare-route-split', type=float, default=None, metavar='CV2', help='CV2 cutpoint to split Poincaré folding routes A (below) and B (above). Default: auto-midpoint of the two highest fold CV2 peaks.')
+    p.add_argument('--no-adaptive-diag', action='store_true', help='Disable adaptive-production diagnostic plots (epoch/topup phase-space coverage, window layout, topup timeline, overlap). Enabled automatically for adaptive_production runs.')
+    p.add_argument('--adaptive-diag-stride', type=int, default=30, metavar='N', help='Sub-sample stride for adaptive diagnostic density maps. Higher = faster but coarser. Default 30.')
+    p.add_argument('--no-adaptive-diag-coverage', action='store_true', help='Skip the per-phase 2D density map panel (fig1) from adaptive diagnostics — the slowest panel. Other panels still run.')
     args=p.parse_args(argv)
     if getattr(args,'no_rg',False):
         args.rg_from_trajectories='never'
@@ -8578,6 +8607,21 @@ def main(argv=None):
         print(f'  [analysis-stride] kept {d.cv.size}/{n_before} samples (stride={args.analysis_stride}, offset={args.analysis_stride_offset})')
     progress.done('load', f'{d.cv.size} samples')
     s=analyze(d,args,progress=progress)
+    # Adaptive-production diagnostic plots (epoch/topup phase-space, window layout, overlap)
+    if getattr(d,'prod_dir',None) is not None and Path(d.prod_dir).name=='adaptive_production' and not getattr(args,'no_adaptive_diag',False):
+        try:
+            import importlib.util as _ilu
+            _diag_script=Path(__file__).parent/'plot_adaptive_diagnostics.py'
+            if _diag_script.exists():
+                _spec=_ilu.spec_from_file_location('plot_adaptive_diagnostics',_diag_script)
+                _diag=_ilu.module_from_spec(_spec); _spec.loader.exec_module(_diag)
+                _stride=int(getattr(args,'adaptive_diag_stride',30) or 30)
+                _skip_cov=bool(getattr(args,'no_adaptive_diag_coverage',False))
+                _diag.run_all(Path(d.prod_dir).parent, d.out_dir, stride=_stride, skip_coverage=_skip_cov)
+            else:
+                print(f'  [adaptive_diag] plot_adaptive_diagnostics.py not found next to analyze_gareus_mbar.py — skipping')
+        except Exception as _exc:
+            print(f'  [adaptive_diag] skipped: {_exc}')
     progress.done('complete', 'GaREUS PMF analysis complete')
     print('GaREUS PMF analysis complete')
     print(f"  production dir: {s['production_dir']}")

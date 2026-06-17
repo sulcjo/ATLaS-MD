@@ -1,0 +1,642 @@
+"""
+Diagnostic plots for GAREUS adaptive-production epoch/topup behavior.
+
+Usage:
+    python plot_adaptive_diagnostics.py <run_dir> [--out <out_dir>] [--stride N]
+
+Generates:
+  fig1_phase_coverage.png   -- per-phase 2D density maps
+  fig2_window_layout.png    -- window ellipses + sample counts
+  fig3_topup_timeline.png   -- cumulative samples, step allocation, overlap
+  fig4_topup_targeting.png  -- state participation matrix per topup round
+"""
+
+import argparse
+import csv as _csv
+import math
+import sys
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.patches as mpatches
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import numpy as np
+import pandas as pd
+
+KB_KCAL = 1.987204e-3  # kcal mol⁻¹ K⁻¹
+TEMP_K   = 300.0
+
+
+# ── utilities ─────────────────────────────────────────────────────────────────
+
+def _rcsv(path: Path) -> pd.DataFrame:
+    return pd.read_csv(path) if path.exists() else pd.DataFrame()
+
+
+def _sigma(k_kcal: float) -> float:
+    return math.sqrt((KB_KCAL * TEMP_K) / max(k_kcal, 1e-9))
+
+
+def _step_from_name(name: str) -> int:
+    """Extract cumulative step count from topup_NNN_MMMMM or topup_NNN_MMMMM_windows."""
+    parts = name.replace("_windows", "").split("_")
+    for tok in reversed(parts):
+        if tok.isdigit():
+            return int(tok)
+    return 0
+
+
+def _load_parquet_samples(samples_dir: Path, stride: int = 1) -> pd.DataFrame:
+    """Load cv1, cv2, window_id from all Parquet chunks under samples_dir."""
+    try:
+        import pyarrow.dataset as ds
+        dataset = ds.dataset(str(samples_dir), format="parquet")
+        table = dataset.to_table(columns=["cv1", "cv2", "window_id"])
+        df = table.to_pandas()
+        if stride > 1:
+            df = df.iloc[::stride].reset_index(drop=True)
+        return df
+    except Exception as exc:
+        print(f"  [warn] load {samples_dir}: {exc}", file=sys.stderr)
+        return pd.DataFrame(columns=["cv1", "cv2", "window_id"])
+
+
+# ── phase discovery ───────────────────────────────────────────────────────────
+
+def discover_phases(ap_dir: Path) -> list[dict]:
+    """
+    Return ordered list of phase dicts, each with:
+      name, label, path, wmap (DataFrame), step (cumulative step count)
+    Ordered chronologically by step count.
+    """
+    phases = []
+
+    # epoch_000
+    ep0 = ap_dir / "epoch_000"
+    if ep0.is_dir() and (ep0 / "samples").is_dir():
+        phases.append({
+            "name": "epoch_000",
+            "label": "Epoch 0\n(initial)",
+            "path": ep0,
+            "wmap": _rcsv(ep0 / "epoch_window_map.csv"),
+            "step": 0,
+        })
+
+    # epoch_001 sub-dirs sorted by step count
+    ep1 = ap_dir / "epoch_001"
+    if ep1.is_dir():
+        subs = [d for d in ep1.iterdir()
+                if d.is_dir() and (d / "samples").is_dir()
+                and (d.name == "baseline" or d.name.startswith("topup_"))]
+        subs.sort(key=lambda d: (0 if d.name == "baseline" else _step_from_name(d.name)))
+        for sub in subs:
+            if sub.name == "baseline":
+                lbl = "Ep1\nBaseline"
+                step = 0
+            else:
+                step = _step_from_name(sub.name)
+                ns = step * 4e-6
+                lbl = f"Topup\n{ns:.1f} ns"
+            phases.append({
+                "name": sub.name,
+                "label": lbl,
+                "path": sub,
+                "wmap": _rcsv(sub / "epoch_window_map.csv"),
+                "step": step,
+            })
+
+    return phases
+
+
+def _wmap_to_sid(wmap: pd.DataFrame) -> dict[int, int]:
+    """epoch_window → state_id mapping from wmap DataFrame."""
+    if wmap.empty:
+        return {}
+    sid_col = next((c for c in wmap.columns if "state_id" in c.lower()), None)
+    if sid_col is None:
+        return {}
+    return {int(r["epoch_window"]): int(r[sid_col]) for _, r in wmap.iterrows()}
+
+
+# ── figure 1: per-phase 2D density maps ──────────────────────────────────────
+
+def fig_phase_coverage(phases: list[dict], state_reg: pd.DataFrame,
+                        stride: int, out_path: Path) -> None:
+    """Small-multiples of 2D sample density per epoch/topup phase."""
+    n = len(phases)
+    ncols = min(3, n)
+    nrows = math.ceil(n / ncols)
+    sig1 = _sigma(250.0)
+    sig2 = _sigma(100.0)
+
+    # compute global CV range from registry
+    if not state_reg.empty:
+        cv1_cen = state_reg["primary_center"].astype(float)
+        cv2_cen = state_reg["secondary_center"].astype(float)
+        x_edges = np.linspace(max(0, cv1_cen.min() - 4*sig1), cv1_cen.max() + 4*sig1, 65)
+        y_edges = np.linspace(cv2_cen.min() - 3*sig2, cv2_cen.max() + 3*sig2, 65)
+    else:
+        x_edges = np.linspace(0, 0.3, 65)
+        y_edges = np.linspace(-1.2, 1.2, 65)
+
+    # load per-phase histograms
+    hists, counts, colors = [], [], []
+    phase_colors = plt.cm.tab10(np.linspace(0, 0.9, n))
+    for ph, pc in zip(phases, phase_colors):
+        sp = ph["path"] / "samples" / "seg_001"
+        if sp.is_dir():
+            df = _load_parquet_samples(sp, stride=stride)
+        else:
+            df = pd.DataFrame(columns=["cv1", "cv2"])
+        if len(df):
+            h, _, _ = np.histogram2d(df["cv1"], df["cv2"], bins=[x_edges, y_edges])
+        else:
+            h = np.zeros((len(x_edges)-1, len(y_edges)-1))
+        hists.append(h)
+        counts.append(len(df))
+        colors.append(pc)
+
+    global_max = max(h.max() for h in hists) if hists else 1.0
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5*ncols, 4.5*nrows),
+                              constrained_layout=True)
+    axes_flat = np.array(axes).flatten() if n > 1 else [axes]
+
+    for ax, ph, h, n_samp, pc in zip(axes_flat, phases, hists, counts, colors):
+        hm = np.ma.masked_where(h == 0, h)
+        ax.pcolormesh(x_edges, y_edges, hm.T, cmap="YlOrRd",
+                      vmin=0, vmax=global_max, rasterized=True)
+
+        # window ellipses from wmap
+        wmap = ph["wmap"]
+        if not wmap.empty:
+            for _, row in wmap.iterrows():
+                cx = float(row.get("primary_center", row.get("primary_cv_center", np.nan)))
+                cy = float(row.get("secondary_center", row.get("secondary_cv_center", np.nan)))
+                if math.isfinite(cx) and math.isfinite(cy):
+                    ell = mpatches.Ellipse((cx, cy), 2*sig1, 2*sig2,
+                                           fill=False, edgecolor="white",
+                                           linewidth=1.2, linestyle="--", alpha=0.85)
+                    ax.add_patch(ell)
+                    ax.plot(cx, cy, "w+", ms=5, mew=1.5, alpha=0.8)
+
+        ax.set_xlim(x_edges[0], x_edges[-1])
+        ax.set_ylim(y_edges[0], y_edges[-1])
+        ax.set_xlabel("CV1 (contacts)", fontsize=8)
+        ax.set_ylabel("CV2 (rama)", fontsize=8)
+        ax.set_title(f"{ph['label']}\n{n_samp:,} pts (stride {stride})",
+                     fontsize=9, color=pc)
+        ax.tick_params(labelsize=7)
+
+    for ax in axes_flat[n:]:
+        ax.set_visible(False)
+
+    sm = plt.cm.ScalarMappable(cmap="YlOrRd", norm=mcolors.Normalize(0, global_max))
+    sm.set_array([])
+    fig.colorbar(sm, ax=axes_flat[:n], shrink=0.6, label="Strided sample count per bin")
+    fig.suptitle("Phase-space Coverage: each Epoch/Topup Phase\n"
+                 "(dashed ellipses = ±1σ harmonic width)", fontsize=11)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  saved {out_path}")
+
+
+# ── figure 2: window layout ───────────────────────────────────────────────────
+
+def fig_window_layout(state_reg: pd.DataFrame, phases: list[dict],
+                       stride: int, out_path: Path) -> None:
+    """Window ellipses on total-density background + sample count summary."""
+    if state_reg.empty:
+        print("[warn] state_registry empty", file=sys.stderr)
+        return
+
+    sig1 = _sigma(250.0)
+    sig2 = _sigma(100.0)
+
+    # total samples per state_id
+    state_counts: dict[int, int] = {}
+    for ph in phases:
+        sp = ph["path"] / "samples" / "seg_001"
+        if not sp.is_dir():
+            continue
+        df = _load_parquet_samples(sp, stride=1)
+        ew2sid = _wmap_to_sid(ph["wmap"])
+        for ew, sid in ew2sid.items():
+            cnt = int((df["window_id"] == ew).sum())
+            state_counts[sid] = state_counts.get(sid, 0) + cnt
+
+    # all-sample density
+    cv1_all, cv2_all = [], []
+    for ph in phases:
+        sp = ph["path"] / "samples" / "seg_001"
+        if sp.is_dir():
+            df = _load_parquet_samples(sp, stride=stride)
+            if len(df):
+                cv1_all.append(df["cv1"].values)
+                cv2_all.append(df["cv2"].values)
+
+    fig = plt.figure(figsize=(15, 9), constrained_layout=True)
+    gs = fig.add_gridspec(2, 3, height_ratios=[3, 1], width_ratios=[2.2, 1, 1],
+                          hspace=0.35, wspace=0.3)
+    ax_main = fig.add_subplot(gs[0, :2])
+    ax_bar  = fig.add_subplot(gs[0, 2])
+    ax_heat = fig.add_subplot(gs[1, :])
+
+    # ─ main: hexbin background + ellipses ─
+    if cv1_all:
+        cv1_cat = np.concatenate(cv1_all)
+        cv2_cat = np.concatenate(cv2_all)
+        hb = ax_main.hexbin(cv1_cat, cv2_cat, gridsize=70, cmap="Greys",
+                            mincnt=1, linewidths=0, alpha=0.7, rasterized=True)
+
+    vmax_cnt = max(state_counts.values()) if state_counts else 1
+    vmin_cnt = max(1, min(state_counts.values())) if state_counts else 1
+    norm_c = mcolors.LogNorm(vmin=vmin_cnt, vmax=max(vmin_cnt + 1, vmax_cnt))
+    cmap_w = plt.cm.plasma
+
+    for _, row in state_reg.iterrows():
+        sid = int(row["state_id"])
+        cx = float(row["primary_center"])
+        cy = float(row["secondary_center"])
+        k1 = float(row["primary_k"])
+        k2 = float(row["secondary_k"])
+        s1, s2 = _sigma(k1), _sigma(k2)
+        cnt = state_counts.get(sid, 0)
+        fc = cmap_w(norm_c(max(cnt, vmin_cnt)))
+        ell = mpatches.Ellipse((cx, cy), 2*s1, 2*s2,
+                               fill=True, facecolor=(*fc[:3], 0.40),
+                               edgecolor=fc, linewidth=2.2)
+        ax_main.add_patch(ell)
+        ax_main.text(cx, cy, str(sid), ha="center", va="center",
+                     fontsize=7.5, fontweight="bold",
+                     color="white" if cnt > vmax_cnt * 0.3 else "black")
+
+    sm = plt.cm.ScalarMappable(cmap=cmap_w, norm=norm_c)
+    sm.set_array([])
+    fig.colorbar(sm, ax=ax_main, label="Total samples per window (log)", shrink=0.8)
+
+    cv1_cen = state_reg["primary_center"].astype(float)
+    cv2_cen = state_reg["secondary_center"].astype(float)
+    ax_main.set_xlim(max(0, cv1_cen.min() - 4*sig1), cv1_cen.max() + 4*sig1)
+    ax_main.set_ylim(cv2_cen.min() - 3*sig2, cv2_cen.max() + 3*sig2)
+    ax_main.set_xlabel("CV1 (nonlocal contact fraction)", fontsize=10)
+    ax_main.set_ylabel("CV2 (rama-map)", fontsize=10)
+    ax_main.set_title("Window Placement: ±1σ Harmonic Ellipses\n"
+                       "Fill color = total samples (log scale)", fontsize=10)
+
+    # ─ bar chart ─
+    sids  = sorted(state_counts)
+    cnts  = [state_counts[s] for s in sids]
+    bclrs = [cmap_w(norm_c(max(c, vmin_cnt))) for c in cnts]
+    ax_bar.barh(sids, cnts, color=bclrs, height=0.7)
+    ax_bar.set_xlabel("Total samples", fontsize=9)
+    ax_bar.set_ylabel("State ID", fontsize=9)
+    ax_bar.set_title("Samples\nper State", fontsize=9)
+    ax_bar.invert_yaxis()
+    ax_bar.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x/1e3:.0f}k"))
+    ax_bar.tick_params(labelsize=8)
+    for s, c in zip(sids, cnts):
+        ax_bar.text(c + max(cnts)*0.01, s, f"{c:,}", va="center", fontsize=6)
+
+    # ─ 2D sample count grid ─
+    p_vals = sorted(state_reg["primary_center"].unique())
+    s_vals = sorted(state_reg["secondary_center"].unique())
+    p_idx  = {v: i for i, v in enumerate(p_vals)}
+    s_idx  = {v: i for i, v in enumerate(s_vals)}
+    grid   = np.zeros((len(p_vals), len(s_vals)))
+    for _, row in state_reg.iterrows():
+        sid = int(row["state_id"])
+        pi = p_idx.get(round(float(row["primary_center"]), 6))
+        si = s_idx.get(round(float(row["secondary_center"]), 6))
+        if pi is not None and si is not None:
+            grid[pi, si] = state_counts.get(sid, 0)
+
+    gmin = grid[grid > 0].min() if grid.any() else 1
+    im = ax_heat.imshow(grid.T, aspect="auto", origin="lower",
+                         cmap="plasma", norm=mcolors.LogNorm(vmin=gmin, vmax=max(gmin+1, grid.max())))
+    ax_heat.set_xticks(range(len(p_vals)))
+    ax_heat.set_xticklabels([f"{v:.4f}" for v in p_vals], fontsize=8, rotation=40, ha="right")
+    ax_heat.set_yticks(range(len(s_vals)))
+    ax_heat.set_yticklabels([f"{v:.3f}" for v in s_vals], fontsize=8)
+    ax_heat.set_xlabel("Primary center (contact fraction)", fontsize=9)
+    ax_heat.set_ylabel("Secondary center (rama)", fontsize=9)
+    ax_heat.set_title("Sample Count Grid: Primary × Secondary CV Centers", fontsize=9)
+    for pi_i, pv in enumerate(p_vals):
+        for si_i, sv in enumerate(s_vals):
+            cnt = int(grid[pi_i, si_i])
+            if cnt > 0:
+                lbl = f"{cnt//1000}k" if cnt >= 1000 else str(cnt)
+                ax_heat.text(pi_i, si_i, lbl, ha="center", va="center",
+                             fontsize=7, color="white" if cnt > grid.max()*0.3 else "black")
+    fig.colorbar(im, ax=ax_heat, label="Samples (log)", shrink=0.5)
+
+    fig.suptitle("GAREUS: Window Layout & Sample Distribution", fontsize=12)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  saved {out_path}")
+
+
+# ── figure 3: topup timeline + overlap ───────────────────────────────────────
+
+def fig_topup_timeline(state_reg: pd.DataFrame, phases: list[dict],
+                        ap_dir: Path, out_path: Path) -> None:
+    """
+    A. Cumulative samples per state across phases.
+    B. Epoch-1 step allocation (from epoch_schedule.csv).
+    C. Analytical window overlap matrix.
+    """
+    all_sids = sorted(state_reg["state_id"].astype(int).tolist()) if not state_reg.empty else []
+
+    # per-phase sample counts per state
+    phase_state_counts = []
+    for ph in phases:
+        sp = ph["path"] / "samples" / "seg_001"
+        if not sp.is_dir():
+            phase_state_counts.append({})
+            continue
+        df = _load_parquet_samples(sp, stride=1)
+        ew2sid = _wmap_to_sid(ph["wmap"])
+        counts = {}
+        for ew, sid in ew2sid.items():
+            counts[sid] = counts.get(sid, 0) + int((df["window_id"] == ew).sum())
+        phase_state_counts.append(counts)
+
+    # cumulative
+    cum = np.zeros((len(all_sids), len(phases)), dtype=np.int64)
+    for pi, pc in enumerate(phase_state_counts):
+        for si, sid in enumerate(all_sids):
+            cum[si, pi] = pc.get(sid, 0)
+    cum_c = np.cumsum(cum, axis=1)
+
+    sched = _rcsv(ap_dir / "epoch_001" / "epoch_schedule.csv")
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 7), constrained_layout=True)
+    ax_cum, ax_sched, ax_ovlp = axes
+
+    # ─ A: cumulative sample count ─
+    colors_st = plt.cm.tab20(np.linspace(0, 1, max(len(all_sids), 1)))
+    xlabels = [ph["label"].replace("\n", " ") for ph in phases]
+    xpos = np.arange(len(phases))
+
+    for si, (sid, color) in enumerate(zip(all_sids, colors_st)):
+        vals = cum_c[si]
+        ax_cum.plot(xpos, vals, "o-", color=color, label=f"S{sid}",
+                    ms=5, lw=1.8, alpha=0.85)
+        if vals[-1] > 0:
+            ax_cum.text(len(phases) - 1 + 0.08, float(vals[-1]),
+                        f" {sid}", va="center", fontsize=7, color=color)
+
+    ax_cum.set_xticks(xpos)
+    ax_cum.set_xticklabels(xlabels, rotation=40, ha="right", fontsize=7.5)
+    ax_cum.set_ylabel("Cumulative samples", fontsize=9)
+    ax_cum.set_title("A. Cumulative Samples per State\nacross Phases", fontsize=9)
+    ax_cum.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v/1e3:.0f}k"))
+    ax_cum.grid(True, alpha=0.3)
+
+    # ─ B: epoch_schedule ─
+    if not sched.empty:
+        sids_s  = sched["state_id"].astype(int).tolist()
+        bl_s    = sched["baseline_steps"].astype(float).tolist()
+        ex_s    = sched["extra_steps"].astype(float).tolist()
+        reasons = sched["allocation_reason"].tolist()
+        ypos = np.arange(len(sids_s))
+        bar_ec = ["#e07b39" if "graph_bridge" in r else "#6ab187" for r in reasons]
+        ax_sched.barh(ypos, bl_s, color="#aecde8", height=0.55, label="Baseline")
+        ax_sched.barh(ypos, ex_s, left=bl_s, color=bar_ec, height=0.55, alpha=0.9, label="Extra")
+        ax_sched.set_yticks(ypos)
+        ax_sched.set_yticklabels([f"S{s}" for s in sids_s], fontsize=8)
+        ax_sched.set_xlabel("Requested steps", fontsize=9)
+        ax_sched.set_title("B. Epoch-1 Step Allocation\n(orange=bridge extra, teal=standard extra)", fontsize=9)
+        ax_sched.xaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v/1e6:.1f}M"))
+        ax_sched.invert_yaxis()
+        ax_sched.grid(axis="x", alpha=0.3)
+        handles = [mpatches.Patch(color="#aecde8", label="Baseline"),
+                   mpatches.Patch(color="#6ab187", label="Standard extra"),
+                   mpatches.Patch(color="#e07b39", label="Bridge-state extra")]
+        ax_sched.legend(handles=handles, fontsize=8)
+    else:
+        ax_sched.text(0.5, 0.5, "No epoch_schedule.csv", ha="center", va="center",
+                      transform=ax_sched.transAxes)
+
+    # ─ C: analytical overlap matrix ─
+    if not state_reg.empty:
+        K = len(all_sids)
+        sid_map = {int(r["state_id"]): r for _, r in state_reg.iterrows()}
+        ovlp = np.zeros((K, K))
+        for i, si in enumerate(all_sids):
+            ri = sid_map.get(si)
+            if ri is None:
+                continue
+            for j, sj in enumerate(all_sids):
+                if i == j:
+                    ovlp[i, j] = 1.0
+                    continue
+                rj = sid_map.get(sj)
+                if rj is None:
+                    continue
+                s1i = _sigma(float(ri["primary_k"]))
+                s2i = _sigma(float(ri["secondary_k"]))
+                s1j = _sigma(float(rj["primary_k"]))
+                s2j = _sigma(float(rj["secondary_k"]))
+                d1 = abs(float(ri["primary_center"]) - float(rj["primary_center"])) / math.sqrt(s1i**2 + s1j**2)
+                d2 = abs(float(ri["secondary_center"]) - float(rj["secondary_center"])) / math.sqrt(s2i**2 + s2j**2)
+                ovlp[i, j] = math.exp(-0.5 * (d1**2 + d2**2))
+
+        im = ax_ovlp.imshow(ovlp, cmap="hot_r", vmin=0, vmax=1, aspect="auto")
+        ticks = [str(s) for s in all_sids]
+        ax_ovlp.set_xticks(range(K)); ax_ovlp.set_xticklabels(ticks, fontsize=7, rotation=90)
+        ax_ovlp.set_yticks(range(K)); ax_ovlp.set_yticklabels(ticks, fontsize=7)
+        ax_ovlp.set_title("C. Analytical Window Overlap\nexp(−½|Δc|²/σ²) Gaussian metric", fontsize=9)
+        fig.colorbar(im, ax=ax_ovlp, label="Overlap (0→1)", shrink=0.8)
+        for i in range(K):
+            for j in range(K):
+                v = ovlp[i, j]
+                if i != j and v >= 0.01:
+                    ax_ovlp.text(j, i, f"{v:.2f}", ha="center", va="center",
+                                 fontsize=5.5, color="white" if v > 0.5 else "black")
+
+    fig.suptitle("GAREUS: Topup Timeline, Allocation & Window Overlap", fontsize=12)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  saved {out_path}")
+
+
+# ── figure 4: topup participation × state matrix ─────────────────────────────
+
+def fig_topup_targeting(ap_dir: Path, state_reg: pd.DataFrame, out_path: Path) -> None:
+    """
+    Left: which states were active in each topup (from topup_windows.csv).
+    Right: actual samples accumulated per state per topup subdir (from Parquet).
+    """
+    all_sids = sorted(state_reg["state_id"].astype(int).tolist()) if not state_reg.empty else []
+    sid_idx  = {s: i for i, s in enumerate(all_sids)}
+    ep1      = ap_dir / "epoch_001"
+
+    # ─ topup participation from windows CSV files ─
+    sched = _rcsv(ep1 / "epoch_schedule.csv")
+    sid_to_bl = {}
+    if not sched.empty:
+        for _, row in sched.iterrows():
+            sid_to_bl[int(row["state_id"])] = float(row.get("baseline_steps", 0))
+
+    topup_entries: list[dict] = []  # {label, step, present: set[int]}
+
+    # baseline from baseline_windows.csv
+    bl_wmap = _rcsv(ep1 / "baseline_windows.csv")
+    if not bl_wmap.empty:
+        sid_col = next((c for c in bl_wmap.columns if "state_id" in c.lower()), None)
+        present = set(bl_wmap[sid_col].astype(int).tolist()) if sid_col else set()
+        topup_entries.append({"label": "Baseline\n(0 ns)", "step": 0, "present": present})
+
+    # each topup_*_windows.csv sorted by step count
+    topup_csvs = sorted(
+        ep1.glob("topup_*_windows.csv"),
+        key=lambda p: _step_from_name(p.stem)
+    )
+    for tcsv in topup_csvs:
+        df = _rcsv(tcsv)
+        if df.empty:
+            continue
+        sid_col = next((c for c in df.columns if "state_id" in c.lower()), None)
+        present = set(df[sid_col].astype(int).tolist()) if sid_col else set()
+        step = _step_from_name(tcsv.stem)
+        ns = step * 4e-6
+        topup_entries.append({"label": f"Topup\n{ns:.1f} ns", "step": step, "present": present})
+
+    # ─ actual samples per state per topup subdir (from Parquet) ─
+    subdirs = [d for d in sorted(ep1.iterdir(),
+                key=lambda p: (0 if p.name == "baseline" else _step_from_name(p.name)))
+               if d.is_dir() and (d/"samples").is_dir()
+               and (d.name == "baseline" or d.name.startswith("topup_"))]
+
+    K = len(all_sids)
+    T_part = len(topup_entries)
+    T_samp = len(subdirs)
+
+    part_mat = np.zeros((K, T_part))
+    samp_mat = np.zeros((K, T_samp), dtype=np.int64)
+    samp_xlabels = []
+
+    for ti, entry in enumerate(topup_entries):
+        for sid in entry["present"]:
+            if sid in sid_idx:
+                part_mat[sid_idx[sid], ti] = 1
+
+    for ti, sub in enumerate(subdirs):
+        step = _step_from_name(sub.name) if sub.name != "baseline" else 0
+        ns = step * 4e-6
+        samp_xlabels.append(f"{sub.name[:12]}…\n{ns:.1f} ns" if len(sub.name) > 12 else f"{sub.name}\n{ns:.1f} ns")
+        sp = sub / "samples" / "seg_001"
+        if not sp.is_dir():
+            continue
+        df = _load_parquet_samples(sp, stride=1)
+        wmap = _rcsv(sub / "epoch_window_map.csv")
+        ew2sid = _wmap_to_sid(wmap)
+        for ew, sid in ew2sid.items():
+            if sid in sid_idx:
+                cnt = int((df["window_id"] == ew).sum())
+                samp_mat[sid_idx[sid], ti] += cnt
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 7), constrained_layout=True)
+    ax_part, ax_samp = axes
+
+    # ─ participation ─
+    part_xlabels = [e["label"] for e in topup_entries]
+    ylabels = [f"State {s}" for s in all_sids]
+
+    ax_part.imshow(part_mat, aspect="auto", cmap="Blues", vmin=0, vmax=1)
+    ax_part.set_xticks(range(T_part))
+    ax_part.set_xticklabels(part_xlabels, rotation=45, ha="right", fontsize=8)
+    ax_part.set_yticks(range(K))
+    ax_part.set_yticklabels(ylabels, fontsize=8)
+    ax_part.set_title("State Participation per Topup Round\n"
+                       "(from topup_*_windows.csv — blue = active)", fontsize=9)
+    # annotate state centers
+    for si, sid in enumerate(all_sids):
+        row = state_reg[state_reg["state_id"].astype(int) == sid]
+        if not row.empty:
+            cx = float(row["primary_center"].iloc[0])
+            cy = float(row["secondary_center"].iloc[0])
+            ax_part.text(-0.6, si, f"({cx:.3f},{cy:.2f})",
+                         ha="right", va="center", fontsize=6, color="gray",
+                         transform=ax_part.get_yaxis_transform())
+
+    # ─ actual sample counts ─
+    smin = samp_mat[samp_mat > 0].min() if samp_mat.any() else 1
+    smax = samp_mat.max()
+    snorm = mcolors.LogNorm(vmin=smin, vmax=max(smin+1, smax))
+    im2 = ax_samp.imshow(samp_mat, aspect="auto", cmap="plasma", norm=snorm)
+    ax_samp.set_xticks(range(T_samp))
+    ax_samp.set_xticklabels(samp_xlabels, rotation=45, ha="right", fontsize=8)
+    ax_samp.set_yticks(range(K))
+    ax_samp.set_yticklabels(ylabels, fontsize=8)
+    ax_samp.set_title("Actual Samples per State per Topup\n(Parquet counts, log scale)", fontsize=9)
+    for i in range(K):
+        for j in range(T_samp):
+            cnt = int(samp_mat[i, j])
+            if cnt > 0:
+                lbl = f"{cnt//1000}k" if cnt >= 1000 else str(cnt)
+                ax_samp.text(j, i, lbl, ha="center", va="center", fontsize=6,
+                             color="white" if samp_mat[i,j] > smax*0.2 else "black")
+    fig.colorbar(im2, ax=ax_samp, label="Samples (log scale)", shrink=0.8)
+
+    fig.suptitle("GAREUS: Topup Window Targeting & Sample Accumulation", fontsize=12)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  saved {out_path}")
+
+
+# ── main entry point ──────────────────────────────────────────────────────────
+
+def run_all(run_dir: Path, out_dir: Path, stride: int = 20,
+            skip_coverage: bool = False) -> None:
+    """Generate all diagnostic figures. Called by analyze_gareus_mbar or standalone."""
+    ap_dir = run_dir / "adaptive_production"
+    if not ap_dir.is_dir():
+        print(f"[adaptive_diag] no adaptive_production/ in {run_dir}", file=sys.stderr)
+        return
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[adaptive_diag] run={run_dir.name}  out={out_dir}  stride={stride}")
+
+    state_reg = _rcsv(ap_dir / "state_registry.csv")
+    if state_reg.empty:
+        state_reg = _rcsv(ap_dir / "final_registry_used_for_mbar.csv")
+    print(f"  {len(state_reg)} states, discovering phases …")
+
+    phases = discover_phases(ap_dir)
+    print(f"  phases: {[p['name'] for p in phases]}")
+
+    if not skip_coverage:
+        print("[fig1] phase-coverage …")
+        fig_phase_coverage(phases, state_reg, stride, out_dir / "adaptive_fig1_phase_coverage.png")
+
+    print("[fig2] window layout …")
+    fig_window_layout(state_reg, phases, stride, out_dir / "adaptive_fig2_window_layout.png")
+
+    print("[fig3] topup timeline …")
+    fig_topup_timeline(state_reg, phases, ap_dir, out_dir / "adaptive_fig3_topup_timeline.png")
+
+    print("[fig4] topup targeting …")
+    fig_topup_targeting(ap_dir, state_reg, out_dir / "adaptive_fig4_topup_targeting.png")
+
+    print(f"  [adaptive_diag] done → {out_dir}/")
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("run_dir")
+    p.add_argument("--out", default=None)
+    p.add_argument("--stride", type=int, default=20)
+    p.add_argument("--no-coverage", action="store_true")
+    args = p.parse_args()
+
+    run_dir = Path(args.run_dir).resolve()
+    out_dir = Path(args.out) if args.out else run_dir.parent / f"{run_dir.name}_adaptive_diag"
+    run_all(run_dir, out_dir, stride=args.stride, skip_coverage=args.no_coverage)
+
+
+if __name__ == "__main__":
+    main()

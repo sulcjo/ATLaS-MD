@@ -144,7 +144,8 @@ genpept:
   n: 5000000
   n_candidate_seeds: 5000
   n_final_seeds: 2500
-  jobs: 64
+  jobs: 16
+  min_jobs: 1
   generation_backend: fast
   rama_sampling: stratified
   initial_diversity_features: mixed
@@ -383,10 +384,10 @@ simulation:
 
 gamd:
   production_steps: 10000000          # double-adaptive: unused for epoch lengths (adaptive-production overrides per epoch from md_budget_ns pool); only fallback if pool disabled
-  sigma0p: 6.0                        # was 6.0; reduced 15% to lower anharmonicity score from ~0.58 toward ~0.45
-  sigma0d: 6.0                        # was 6.0; idem
-  equil_steps: 1250000                # was 100000; 5 ns at 4 fs for thorough GaMD calibration; NOTE: runs in every pilot round too (heavy overhead, see workflow_help WARNING)
-  gamd_averaging_window: 2000
+  sigma0p: 7.0                        # was 6.0; reduced 15% to lower anharmonicity score from ~0.58 toward ~0.45
+  sigma0d: 7.0                        # was 6.0; idem
+  equil_steps: 1500000                # was 100000; 5 ns at 4 fs for thorough GaMD calibration; NOTE: runs in every pilot round too (heavy overhead, see workflow_help WARNING)
+  gamd_averaging_window: 5000
   # Dropped: gamd_cmd_steps — hardcoded 50000.
 
 exchange:
