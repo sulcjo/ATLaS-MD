@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse, csv, hashlib, json, math, re, sys, time
+import os as _os_env
+_ne_cap = int(_os_env.environ.get('NUMEXPR_MAX_THREADS', 64))
+_ne_num = int(_os_env.environ.get('NUMEXPR_NUM_THREADS', _os_env.cpu_count() or _ne_cap))
+_thread_cap = str(min(_ne_num, _ne_cap))
+_os_env.environ['NUMEXPR_NUM_THREADS'] = _thread_cap  # force-cap even if already set
+_os_env.environ.setdefault('NUMBA_NUM_THREADS', _thread_cap)
+del _os_env, _ne_cap, _ne_num, _thread_cap
+import argparse, csv, hashlib, json, math, os, re, sys, time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -1111,17 +1118,31 @@ def _augment_with_adaptive_rounds(d: Data, run_dir: Path) -> Data:
     ))
 
 
-def load_parquet_adaptive_union(adaptive_dir: Path) -> Data:
+def _load_epoch_task(epoch_dir: Path, wmap_path: Path, n_threads: int) -> tuple:
+    """Load one epoch's samples and window map (runs in a thread)."""
+    from gareus.query import load_samples
+    with wmap_path.open(newline='') as f:
+        wmap = {int(r['epoch_window']): int(r['state_id']) for r in csv.DictReader(f)}
+    samples = load_samples(epoch_dir, n_threads=n_threads)
+    ep_meta = rjson(epoch_dir / 'umbrella_pymbar_metadata.json', {})
+    return samples, wmap, ep_meta
+
+
+def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_workers: int = 4) -> Data:
     """Load MBAR inputs from adaptive-production Parquet epoch data.
 
     Pools samples from all epoch run directories, remaps per-epoch window IDs to
     global state IDs via epoch_window_map.csv, and builds the union N×K bias
     matrix against the full registry of usable states.
+
+    n_threads: DuckDB threads per connection (0=auto, capped at min(cpu_count,64))
+    n_workers: parallel epoch-dir workers; each opens its own DuckDB connection
     """
     try:
-        from gareus.query import load_samples
+        from gareus.query import load_samples  # noqa: F401 – used in _load_epoch_task
     except ImportError as exc:
         raise ImportError(f'gareus package required for Parquet loading: {exc}') from exc
+    from concurrent.futures import ThreadPoolExecutor
 
     adaptive_dir = Path(adaptive_dir)
     registry_csv = adaptive_dir / 'final_registry_used_for_mbar.csv'
@@ -1160,14 +1181,23 @@ def load_parquet_adaptive_union(adaptive_dir: Path) -> Data:
     beta = float('nan')
     meta: dict = rjson(adaptive_dir.parent / 'run_manifest.json', {})
 
-    for epoch_dir, wmap_path in epoch_dirs:
-        with wmap_path.open(newline='') as f:
-            wmap = {int(r['epoch_window']): int(r['state_id']) for r in csv.DictReader(f)}
-        samples = load_samples(epoch_dir)
+    # Compute per-connection thread budget: distribute n_threads across n_workers.
+    _cpu_cap = min(os.cpu_count() or 64, int(os.environ.get('NUMEXPR_MAX_THREADS', 64)))
+    _total_threads = n_threads if n_threads > 0 else _cpu_cap
+    _n_workers = min(len(epoch_dirs), max(1, n_workers))
+    _threads_per_conn = max(1, _total_threads // _n_workers)
+
+    # Load all epochs in parallel (I/O bound); post-process sequentially (order-dependent).
+    with ThreadPoolExecutor(max_workers=_n_workers) as _pool:
+        epoch_loaded = list(_pool.map(
+            lambda _ewt: _load_epoch_task(_ewt[0], _ewt[1], _ewt[2]),
+            [(ed, wp, _threads_per_conn) for ed, wp in epoch_dirs],
+        ))
+
+    for (samples, wmap, ep_meta), (epoch_dir, _) in zip(epoch_loaded, epoch_dirs):
         if not samples or 'cv1' not in samples or len(samples['cv1']) == 0:
             continue
         if not math.isfinite(beta):
-            ep_meta = rjson(epoch_dir / 'umbrella_pymbar_metadata.json', {})
             b = float(ep_meta.get('beta_1_over_kJ_mol') or 0.0)
             beta = b if b > 0 else infer_temp_beta(epoch_dir, ep_meta)[1]
         raw_w = samples['window_id'].astype(np.int32)
@@ -1647,7 +1677,7 @@ def _apply_analysis_stride(d: Data, stride: int, offset: int = 0) -> Data:
     d.meta['analysis_stride_offset']=int(offset)
     return d
 
-def load_data(inp: Path, out: Optional[Path], source: str = 'auto', no_augment: bool = False) -> Data:
+def load_data(inp: Path, out: Optional[Path], source: str = 'auto', no_augment: bool = False, n_threads: int = 0, n_workers: int = 4) -> Data:
     prod=prod_dir_of(inp)
     # Adaptive-production: prefer new Parquet epoch data, fall back to legacy NPZ.
     if prod.name == 'adaptive_production':
@@ -1656,7 +1686,7 @@ def load_data(inp: Path, out: Optional[Path], source: str = 'auto', no_augment: 
         if not has_epoch_parquet:
             has_epoch_parquet = bool(_find_adaptive_epoch_dirs(prod))
         if has_epoch_parquet:
-            d = load_parquet_adaptive_union(prod)
+            d = load_parquet_adaptive_union(prod, n_threads=n_threads, n_workers=n_workers)
         elif (prod / 'adaptive_union_mbar.npz').exists():
             d = load_union_npz(prod)
         elif _has_epoch_csv_layout(prod):
@@ -8440,6 +8470,8 @@ def parse_args(argv=None):
     p.add_argument('--cv-max', type=float, default=None)
     p.add_argument('--min-neighbor-overlap', type=float, default=0.30)
     p.add_argument('--traj-workers', type=int, default=8, help='Number of parallel worker threads for trajectory-derived observables (Rg, chignolin FES). Each thread loads one replica\'s segments concurrently. mdtraj releases the GIL during XTC/DCD reads so true parallelism is achieved. Set to 1 to disable threading.')
+    p.add_argument('--duckdb-threads', type=int, default=0, help='Total DuckDB threads distributed across parallel parquet loaders. 0=auto (min(cpu_count, NUMEXPR_MAX_THREADS, 64)). Divide by --load-workers to get per-connection thread count.')
+    p.add_argument('--load-workers', type=int, default=8, help='Number of parallel epoch-dir workers for adaptive parquet loading. Each opens its own DuckDB connection with (--duckdb-threads / --load-workers) threads. Set to 1 to disable parallelism.')
     # MBAR solver backend selection.  Choices include auto, explicit deterministic
     # solvers (lbfgs, numpy, anderson), Numba variants (numba, numba-anderson,
     # numba-diis), and sambar which performs a stochastic warm‑start before a
@@ -8596,7 +8628,8 @@ def main(argv=None):
     args=parse_args(argv)
     progress=Progress()
     progress.step('load', 'reading current GaREUS outputs')
-    d=load_data(Path(args.input), Path(args.out) if args.out else None, args.analysis_source, no_augment=getattr(args,'no_adaptive_rounds',False))
+    _t0=time.time()
+    d=load_data(Path(args.input), Path(args.out) if args.out else None, args.analysis_source, no_augment=getattr(args,'no_adaptive_rounds',False), n_threads=getattr(args,'duckdb_threads',0), n_workers=getattr(args,'load_workers',8))
     if getattr(args,'skip_first_n_frames',0)>0:
         n_before=d.cv.size
         d=_skip_first_n_frames(d,args.skip_first_n_frames)
@@ -8605,8 +8638,11 @@ def main(argv=None):
         n_before=d.cv.size
         d=_apply_analysis_stride(d,args.analysis_stride,args.analysis_stride_offset)
         print(f'  [analysis-stride] kept {d.cv.size}/{n_before} samples (stride={args.analysis_stride}, offset={args.analysis_stride_offset})')
+    print(f'  [load] {d.cv.size} samples in {time.time()-_t0:.1f}s')
     progress.done('load', f'{d.cv.size} samples')
+    _t1=time.time()
     s=analyze(d,args,progress=progress)
+    print(f'  [analyze] total {time.time()-_t1:.1f}s')
     # Adaptive-production diagnostic plots (epoch/topup phase-space, window layout, overlap)
     if getattr(d,'prod_dir',None) is not None and Path(d.prod_dir).name=='adaptive_production' and not getattr(args,'no_adaptive_diag',False):
         try:

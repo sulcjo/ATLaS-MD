@@ -374,6 +374,35 @@ def test_export_npz_custom_out_path(tmp_path):
     assert custom_out.exists()
 
 
+def test_export_npz_uses_each_segment_window_snapshot(tmp_path):
+    """Rows from old segments must use old window centers, not latest snapshot."""
+    from gareus.query import export_analysis_arrays_npz
+    from gareus.store import ParquetSampleWriter, SegmentRegistry, WindowSnapshot
+
+    reg = SegmentRegistry(tmp_path)
+    snap = WindowSnapshot(tmp_path)
+
+    seg1 = reg.open_segment("run_001", None, 1)
+    snap.snapshot(seg1, [{"window_id": 0, "center1": 0.0, "k1": 100.0}], cv1_type="contacts", cv2_type=None)
+    writer1 = ParquetSampleWriter(tmp_path / "samples" / seg1, flush_rows=10)
+    writer1.write_sample(100, 0, 0, 0.0, None, -100.0, 0.0, 0.0, 0.0)
+    writer1.close()
+    reg.close_segment(seg1, end_step=100)
+
+    seg2 = reg.open_segment("run_001", seg1, 1)
+    snap.snapshot(seg2, [{"window_id": 0, "center1": 1.0, "k1": 100.0}], cv1_type="contacts", cv2_type=None)
+    writer2 = ParquetSampleWriter(tmp_path / "samples" / seg2, flush_rows=10)
+    writer2.write_sample(200, 0, 0, 1.0, None, -100.0, 0.0, 0.0, 0.0)
+    writer2.close()
+    reg.close_segment(seg2, end_step=200)
+
+    beta = 1.0 / (8.314462618e-3 * 300.0)
+    out = export_analysis_arrays_npz(tmp_path, beta)
+
+    with np.load(out, allow_pickle=False) as data:
+        np.testing.assert_allclose(data["umbrella_reduced_bias_nk"][:, 0], [0.0, 0.0], atol=1.0e-12)
+
+
 # --- validate_analysis_metadata_readiness Parquet fallback ---
 
 def test_validate_readiness_no_npz_error_when_parquet_present(tmp_path):

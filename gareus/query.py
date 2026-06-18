@@ -29,13 +29,113 @@ def _concat_numpy_dicts(results: list) -> dict:
         return {}
     keys = list(non_empty[0].keys())
     combined = {k: np.concatenate([r[k] for r in non_empty]) for k in keys}
-    order = np.lexsort((combined["replica"], combined["step"]))
+    if "replica" in combined:
+        order = np.lexsort((combined["replica"], combined["step"]))
+    elif "replica_i" in combined:
+        order = np.lexsort((combined["replica_i"], combined["step"]))
+    else:
+        order = np.argsort(combined["step"])
     return {k: v[order] for k, v in combined.items()}
+
+
+def _result_len(result: dict) -> int:
+    if not result or "step" not in result:
+        return 0
+    return int(len(result["step"]))
+
+
+def _group_parquet_files_by_segment(data_dir: Path, allowed_segments: Optional[set[str]] = None) -> dict[str, list[str]]:
+    groups: dict[str, list[str]] = {}
+    for path in sorted(Path(data_dir).glob("**/*.parquet")):
+        seg_id = str(path.parent.name)
+        if allowed_segments is not None and seg_id not in allowed_segments:
+            continue
+        groups.setdefault(seg_id, []).append(str(path))
+    return groups
+
+
+def _read_parquet_segment(conn, files: list[str], segment_id: str, end_step: Optional[int] = None) -> dict:
+    if not files:
+        return {}
+    if end_step is None:
+        result = conn.execute(
+            "SELECT * FROM read_parquet(?)",
+            [files],
+        ).fetchnumpy()
+    else:
+        result = conn.execute(
+            "SELECT * FROM read_parquet(?) WHERE step <= ?",
+            [files, int(end_step)],
+        ).fetchnumpy()
+    n = _result_len(result)
+    if n <= 0:
+        return {}
+    result["segment_id"] = np.asarray([str(segment_id)] * n, dtype=object)
+    return result
+
+
+def _load_segmented_parquet(
+    run_dir: Path,
+    dirname: str,
+    segment_ids: Optional[list] = None,
+    n_threads: int = 0,
+) -> dict:
+    import duckdb
+
+    run_dir = Path(run_dir)
+    data_dir = run_dir / dirname
+    if not data_dir.exists():
+        return {}
+
+    conn = duckdb.connect()
+    if n_threads > 0:
+        conn.execute(f"SET threads={n_threads}")
+    results = []
+    try:
+        if segment_ids is not None:
+            allowed = {str(x) for x in segment_ids}
+            groups = _group_parquet_files_by_segment(data_dir, allowed)
+            for seg_id, files in sorted(groups.items()):
+                results.append(_read_parquet_segment(conn, files, seg_id))
+            return _concat_numpy_dicts(results)
+
+        seg_json = run_dir / "segments.json"
+        if not seg_json.exists():
+            groups = _group_parquet_files_by_segment(data_dir)
+            for seg_id, files in sorted(groups.items()):
+                results.append(_read_parquet_segment(conn, files, seg_id))
+            return _concat_numpy_dicts(results)
+
+        segs = json.loads(seg_json.read_text(encoding="utf-8"))
+        if not segs:
+            return {}
+        last_seg_id = str(segs[-1]["segment_id"])
+        for seg in segs:
+            seg_id = str(seg["segment_id"])
+            seg_dir = data_dir / seg_id
+            if not seg_dir.exists():
+                continue
+            files = sorted(str(f) for f in seg_dir.glob("*.parquet"))
+            if not files:
+                continue
+            status = str(seg.get("status", "running"))
+            if status == "complete":
+                results.append(_read_parquet_segment(conn, files, seg_id))
+            elif status == "running" and seg_id == last_seg_id:
+                results.append(_read_parquet_segment(conn, files, seg_id))
+            elif status == "interrupted":
+                end_step = seg.get("end_step", -1)
+                if end_step is not None and int(end_step) >= 0:
+                    results.append(_read_parquet_segment(conn, files, seg_id, int(end_step)))
+        return _concat_numpy_dicts(results)
+    finally:
+        conn.close()
 
 
 def load_samples(
     run_dir: Path,
     segment_ids: Optional[list] = None,
+    n_threads: int = 0,
 ) -> dict:
     """Load production samples from Parquet files via DuckDB.
 
@@ -49,91 +149,24 @@ def load_samples(
 
     segment_ids overrides the registry-based selection when provided.
     """
-    import duckdb
-
     run_dir = Path(run_dir)
     samples_dir = run_dir / "samples"
     if not samples_dir.exists():
         return {}
+    return _load_segmented_parquet(run_dir, "samples", segment_ids=segment_ids, n_threads=n_threads)
 
-    # Explicit override: legacy path or caller-specified selection
-    if segment_ids is not None:
-        files = sorted(f for f in samples_dir.glob("**/*.parquet")
-                       if f.parent.name in segment_ids)
-        if not files:
-            return {}
-        conn = duckdb.connect()
-        result = conn.execute(
-            "SELECT * FROM read_parquet(?) ORDER BY step, replica",
-            [[str(f) for f in files]],
-        ).fetchnumpy()
-        conn.close()
-        return result
 
-    # Registry-aware path
-    seg_json = run_dir / "segments.json"
-    if not seg_json.exists():
-        # Legacy fallback: no registry, read everything
-        files = sorted(samples_dir.glob("**/*.parquet"))
-        if not files:
-            return {}
-        conn = duckdb.connect()
-        result = conn.execute(
-            "SELECT * FROM read_parquet(?) ORDER BY step, replica",
-            [[str(f) for f in files]],
-        ).fetchnumpy()
-        conn.close()
-        return result
-
-    segs = json.loads(seg_json.read_text(encoding="utf-8"))
-    if not segs:
+def load_exchanges(
+    run_dir: Path,
+    segment_ids: Optional[list] = None,
+    n_threads: int = 0,
+) -> dict:
+    """Load exchange events from Parquet with same segment filtering as samples."""
+    run_dir = Path(run_dir)
+    exchanges_dir = run_dir / "exchanges"
+    if not exchanges_dir.exists():
         return {}
-
-    last_seg_id = segs[-1]["segment_id"]
-    unfiltered_files: list = []
-    filtered_groups: list = []  # list of (end_step: int, files: list[str])
-
-    for seg in segs:
-        seg_id = seg["segment_id"]
-        status = seg.get("status", "running")
-        seg_dir = samples_dir / seg_id
-        if not seg_dir.exists():
-            continue
-        files = sorted(str(f) for f in seg_dir.glob("*.parquet"))
-        if not files:
-            continue
-
-        if status == "complete":
-            unfiltered_files.extend(files)
-        elif status == "running" and seg_id == last_seg_id:
-            # Active run — include all rows written so far
-            unfiltered_files.extend(files)
-        elif status == "interrupted":
-            end_step = seg.get("end_step", -1)
-            if end_step is not None and int(end_step) >= 0:
-                filtered_groups.append((int(end_step), files))
-            # end_step=-1 or None: skip (no valid boundary known)
-        # abandoned / running non-last: skip
-
-    if not unfiltered_files and not filtered_groups:
-        return {}
-
-    conn = duckdb.connect()
-    results = []
-    if unfiltered_files:
-        r = conn.execute(
-            "SELECT * FROM read_parquet(?)",
-            [unfiltered_files],
-        ).fetchnumpy()
-        results.append(r)
-    for end_step, files in filtered_groups:
-        r = conn.execute(
-            "SELECT * FROM read_parquet(?) WHERE step <= ?",
-            [files, end_step],
-        ).fetchnumpy()
-        results.append(r)
-    conn.close()
-    return _concat_numpy_dicts(results)
+    return _load_segmented_parquet(run_dir, "exchanges", segment_ids=segment_ids, n_threads=n_threads)
 
 
 def load_windows(
@@ -244,22 +277,51 @@ def export_analysis_arrays_npz(
     if not samples or "cv1" not in samples:
         raise ValueError(f"No Parquet sample data found in {run_dir}/samples/")
 
-    windows = load_windows(run_dir)
-    if not windows:
-        raise ValueError(f"No window snapshot found in {run_dir}/windows/")
-
     cv_A = samples["cv1"].astype(np.float64)
     window = samples["window_id"].astype(np.int32)
     cv2_raw = samples.get("cv2")
-    cv2: Optional[np.ndarray] = cv2_raw.astype(np.float64) if cv2_raw is not None else None
+    if cv2_raw is not None:
+        if np.ma.isMaskedArray(cv2_raw):
+            cv2 = np.asarray(cv2_raw.filled(np.nan), dtype=np.float64)
+        else:
+            cv2 = np.asarray(cv2_raw, dtype=np.float64)
+    else:
+        cv2 = None
 
-    nk = reconstruct_bias_matrix(cv_A, cv2, windows, beta)
+    seg_raw = samples.get("segment_id")
+    if seg_raw is not None:
+        seg_ids = np.asarray(seg_raw).astype(str)
+        first_windows = load_windows(run_dir, segment_id=str(seg_ids[0]))
+        if not first_windows:
+            raise ValueError(f"No window snapshot found in {run_dir}/windows/")
+        nk = np.empty((len(cv_A), len(first_windows)), dtype=np.float64)
+        expected_ids = [int(w.get("window_id", i)) for i, w in enumerate(first_windows)]
+        for seg_id in np.unique(seg_ids):
+            seg_windows = load_windows(run_dir, segment_id=str(seg_id))
+            if not seg_windows:
+                raise ValueError(f"No window snapshot found for segment {seg_id} in {run_dir}/windows/")
+            seg_ids_list = [int(w.get("window_id", i)) for i, w in enumerate(seg_windows)]
+            if len(seg_windows) != len(first_windows) or seg_ids_list != expected_ids:
+                raise ValueError(
+                    "Cannot write one legacy analysis_arrays.npz for segments with different window IDs/counts; "
+                    "use segment-specific or union-state analysis."
+                )
+            mask = seg_ids == str(seg_id)
+            nk[mask, :] = reconstruct_bias_matrix(cv_A[mask], cv2[mask] if cv2 is not None else None, seg_windows, beta)
+        windows = first_windows
+    else:
+        windows = load_windows(run_dir)
+        if not windows:
+            raise ValueError(f"No window snapshot found in {run_dir}/windows/")
+        nk = reconstruct_bias_matrix(cv_A, cv2, windows, beta)
 
     save_kwargs: dict = {
         "cv_A": cv_A,
         "window": window,
         "umbrella_reduced_bias_nk": nk,
     }
+    if seg_raw is not None:
+        save_kwargs["segment_id"] = np.asarray(seg_raw).astype(str)
     if cv2 is not None:
         save_kwargs["secondary_cv"] = cv2
 
@@ -271,6 +333,7 @@ def export_analysis_arrays_npz(
 
 __all__ = [
     "load_samples",
+    "load_exchanges",
     "load_windows",
     "load_windows_metadata",
     "reconstruct_bias_matrix",

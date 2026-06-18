@@ -975,6 +975,112 @@ def _read_csv_dicts(path: Path) -> List[Dict[str, str]]:
         return [dict(r) for r in csv.DictReader(handle)]
 
 
+def _has_parquet_rows(run_dir: Path, dirname: str) -> bool:
+    data_dir = Path(run_dir) / str(dirname)
+    return data_dir.exists() and any(data_dir.glob("**/*.parquet"))
+
+
+def _run_dir_has_samples(run_dir: Path) -> bool:
+    run_dir = Path(run_dir)
+    csv_path = run_dir / "samples.csv"
+    return _has_parquet_rows(run_dir, "samples") or (csv_path.exists() and csv_path.stat().st_size > 0)
+
+
+def _value_at(columns: Dict[str, Any], key: str, index: int, default: Any = None) -> Any:
+    arr = columns.get(key)
+    if arr is None:
+        return default
+    try:
+        value = arr[index]
+    except Exception:
+        return default
+    try:
+        if np.ma.is_masked(value):
+            return default
+    except Exception:
+        pass
+    try:
+        return value.item()
+    except Exception:
+        return value
+
+
+def _blank_if_nonfinite(value: Any) -> Any:
+    try:
+        f = float(value)
+    except Exception:
+        return ""
+    return float(f) if math.isfinite(f) else ""
+
+
+def _metadata_beta_1_over_kj_mol(run_dir: Path) -> Optional[float]:
+    meta = read_json_file(Path(run_dir) / "gareus_metadata.json", {}) or {}
+    temp = _float_or_none(meta.get("temperature_K", meta.get("temperature_k")))
+    if temp is None or temp <= 0.0:
+        return None
+    return 1.0 / (8.314462618e-3 * float(temp))
+
+
+def _read_sample_dicts(run_dir: Path) -> List[Dict[str, Any]]:
+    """Read canonical Parquet production samples, falling back to legacy CSV."""
+    run_dir = Path(run_dir)
+    if _has_parquet_rows(run_dir, "samples"):
+        try:
+            from .query import load_samples
+            data = load_samples(run_dir)
+        except Exception:
+            data = {}
+        n = int(len(data.get("step", []))) if data and "step" in data else 0
+        if n > 0:
+            beta = _metadata_beta_1_over_kj_mol(run_dir)
+            rows: List[Dict[str, Any]] = []
+            for i in range(n):
+                boost_kj = _blank_if_nonfinite(_value_at(data, "gamd_boost_total", i, ""))
+                row = {
+                    "step": _value_at(data, "step", i, ""),
+                    "replica": _value_at(data, "replica", i, ""),
+                    "window": _value_at(data, "window_id", i, ""),
+                    "cv_A": _blank_if_nonfinite(_value_at(data, "cv1", i, "")),
+                    "primary_cv_value": _blank_if_nonfinite(_value_at(data, "cv1", i, "")),
+                    "secondary_cv": _blank_if_nonfinite(_value_at(data, "cv2", i, "")),
+                    "potential_kj_mol": _blank_if_nonfinite(_value_at(data, "potential", i, "")),
+                    "gamd_boost_total_kj_mol": boost_kj,
+                    "gamd_boost_total_kcal_mol": (float(boost_kj) / 4.184) if boost_kj != "" else "",
+                    "beta_1_over_kJ_mol": "" if beta is None else float(beta),
+                    "segment_id": _value_at(data, "segment_id", i, ""),
+                }
+                rows.append(row)
+            return rows
+    return _read_csv_dicts(run_dir / "samples.csv")
+
+
+def _read_exchange_dicts(run_dir: Path) -> List[Dict[str, Any]]:
+    """Read canonical Parquet exchange events, falling back to legacy CSV."""
+    run_dir = Path(run_dir)
+    if _has_parquet_rows(run_dir, "exchanges"):
+        try:
+            from .query import load_exchanges
+            data = load_exchanges(run_dir)
+        except Exception:
+            data = {}
+        n = int(len(data.get("step", []))) if data and "step" in data else 0
+        if n > 0:
+            rows: List[Dict[str, Any]] = []
+            for i in range(n):
+                rows.append({
+                    "step": _value_at(data, "step", i, ""),
+                    "replica_i": _value_at(data, "replica_i", i, ""),
+                    "replica_j": _value_at(data, "replica_j", i, ""),
+                    "window_i": _value_at(data, "window_i", i, ""),
+                    "window_j": _value_at(data, "window_j", i, ""),
+                    "delta_e": _blank_if_nonfinite(_value_at(data, "delta_e", i, "")),
+                    "accepted": _value_at(data, "accepted", i, False),
+                    "segment_id": _value_at(data, "segment_id", i, ""),
+                })
+            return rows
+    return _read_csv_dicts(run_dir / "exchanges.csv")
+
+
 def _finite_float_list(values: Iterable[Any]) -> np.ndarray:
     out = []
     for val in values:
@@ -1084,8 +1190,8 @@ def collect_epoch_diagnostics(epoch_dir: Path, registry: WindowStateRegistry, po
     """Collect simple per-state and per-edge diagnostics from one epoch output."""
     epoch_dir = Path(epoch_dir)
     policy = policy or AdaptiveDecisionPolicy()
-    samples = _read_csv_dicts(epoch_dir / "samples.csv")
-    exchanges = _read_csv_dicts(epoch_dir / "exchanges.csv")
+    samples = _read_sample_dicts(epoch_dir)
+    exchanges = _read_exchange_dicts(epoch_dir)
     window_map = _load_epoch_window_map(epoch_dir, registry)
 
     by_state: Dict[int, List[Dict[str, str]]] = {sid: [] for sid in registry.active_state_ids()}
@@ -1207,13 +1313,13 @@ def _sample_sources_from_run_root(label: str, run_dir: Path) -> List[Tuple[str, 
     """Return sample-bearing directories for a plain or scheduled run root."""
     run_dir = Path(run_dir)
     out: List[Tuple[str, Path]] = []
-    if (run_dir / "samples.csv").exists():
+    if _run_dir_has_samples(run_dir):
         out.append((label, run_dir))
     for child in sorted(run_dir.iterdir() if run_dir.exists() else []):
         if not child.is_dir():
             continue
         if child.name == "baseline" or child.name.startswith("topup_"):
-            if (child / "samples.csv").exists():
+            if _run_dir_has_samples(child):
                 out.append((f"{label}/{child.name}", child))
     return out
 
@@ -1268,7 +1374,7 @@ def build_union_state_mbar_inputs(
 
     sample_rows: List[Dict[str, Any]] = []
     for source_label, sample_dir in _epoch_sample_sources(adaptive_dir, include_epochs=include_epochs):
-        rows = _read_csv_dicts(sample_dir / "samples.csv")
+        rows = _read_sample_dicts(sample_dir)
         if not rows:
             continue
         window_map = _load_epoch_window_map(sample_dir, registry)
@@ -1675,8 +1781,8 @@ def collect_final_combined_diagnostics(adaptive_dir: Path, registry: WindowState
 
     for source_label, sample_dir in sources:
         window_map = _load_epoch_window_map(sample_dir, registry)
-        samples = _read_csv_dicts(sample_dir / "samples.csv")
-        exchanges = _read_csv_dicts(sample_dir / "exchanges.csv")
+        samples = _read_sample_dicts(sample_dir)
+        exchanges = _read_exchange_dicts(sample_dir)
         total_samples += len(samples)
         total_exchanges += len(exchanges)
         source_summaries.append({
@@ -2713,18 +2819,81 @@ def _policy_with_pool_step_budget(
     return p
 
 
+# Threshold for the nonstationary_overlap warning: when the pooled overlap
+# exceeds the per-segment minimum by more than this amount, the edge's CV
+# distribution is likely non-stationary across segments (e.g. a topup that
+# only touched one endpoint inflated the minimum to 0).
+NONSTATIONARY_OVERLAP_DELTA: float = 0.2
+
+
 def collect_segmented_epoch_diagnostics(epoch_dir: Path, registry: WindowStateRegistry, policy: AdaptiveDecisionPolicy) -> Dict[str, Any]:
-    """Collect diagnostics for an epoch made of baseline/top-up sub-runs."""
+    """Collect diagnostics for an epoch made of baseline/top-up sub-runs.
+
+    Edge overlap is computed from **pooled** per-state cv_A arrays across all
+    segments, not from the nanmin of per-segment overlaps.  A topup that only
+    sampled one endpoint of an edge contributes valid data for that endpoint
+    while the other endpoint gets an empty array → the per-segment overlap for
+    that edge is degenerate (0.0), but the pooled overlap reflects the full
+    data from all segments and is unaffected.
+
+    Two extra fields are added to each edge dict:
+    - ``segment_min_overlap``: the minimum per-segment overlap (0.0 when a
+      segment had no samples for one endpoint), for diagnostic purposes only.
+      This field does NOT drive the weak-edge decision.
+    - ``nonstationary_overlap`` warning: appended when
+      ``pooled_overlap - segment_min_overlap > NONSTATIONARY_OVERLAP_DELTA``,
+      indicating that CV coverage varied significantly across segments.
+    """
     epoch_dir = Path(epoch_dir)
-    segment_dirs = [p for p in sorted(epoch_dir.iterdir()) if p.is_dir() and (p / "samples.csv").exists()]
+    segment_dirs = [p for p in sorted(epoch_dir.iterdir()) if p.is_dir() and _run_dir_has_samples(p)]
     if not segment_dirs:
         return collect_epoch_diagnostics(epoch_dir, registry, policy=policy)
+
     state_acc: Dict[int, Dict[str, Any]] = {}
     edge_acc: Dict[Tuple[int, int], Dict[str, Any]] = {}
     segment_payloads = []
+
+    # Pooled raw cv_A values per state_id — accumulated across all segments.
+    pooled_cv_by_state: Dict[int, List[float]] = {}
+    # Per-segment overlap values for each edge pair, using 0.0 when one
+    # endpoint of the edge had no samples in that segment (degenerate topup).
+    seg_overlap_by_edge: Dict[Tuple[int, int], List[float]] = {}
+
+    # Hoist the static edge list once — build_geometry_edges depends only on
+    # the registry, which is constant for the lifetime of this call.
+    geometry_edges = build_geometry_edges(registry)
+
     for seg in segment_dirs:
         diag = collect_epoch_diagnostics(seg, registry, policy=policy)
         segment_payloads.append({"segment": seg.name, "diagnostics_json": str(seg / "adaptive_epoch_diagnostics.json")})
+
+        # --- Accumulate raw cv_A values per state from this segment's samples ---
+        seg_window_map = _load_epoch_window_map(seg, registry)
+        seg_cv_by_state: Dict[int, List[float]] = {}
+        for sample_row in _read_sample_dicts(seg):
+            w = _float_or_none(sample_row.get("window"))
+            if w is None:
+                continue
+            sid = seg_window_map.get(int(w), int(w))
+            cv = _float_or_none(sample_row.get("cv_A", sample_row.get("primary_cv_value")))
+            if cv is not None:
+                seg_cv_by_state.setdefault(sid, []).append(float(cv))
+        for sid, vals in seg_cv_by_state.items():
+            pooled_cv_by_state.setdefault(sid, []).extend(vals)
+
+        # --- Compute per-segment per-edge overlap (0.0 for degenerate segments) ---
+        for si, sj, _etype, _nd in geometry_edges:
+            key = (int(min(si, sj)), int(max(si, sj)))
+            a = np.asarray(seg_cv_by_state.get(int(si), []), dtype=float)
+            b = np.asarray(seg_cv_by_state.get(int(sj), []), dtype=float)
+            # When at least one endpoint contributed samples to this segment,
+            # record an overlap value.  Use 0.0 when one side is missing
+            # (degenerate topup) rather than silently dropping the segment.
+            if a.size > 0 or b.size > 0:
+                ov = _hist_overlap(a, b)
+                seg_overlap_by_edge.setdefault(key, []).append(0.0 if ov is None else ov)
+
+        # --- State diagnostics aggregation (unchanged logic from Task 1) ---
         for row in diag.get("states", []) or []:
             sid = int(row.get("state_id"))
             acc = state_acc.setdefault(sid, {"state_id": sid, "epoch_window": row.get("epoch_window", -1), "sample_count": 0, "warnings": []})
@@ -2751,31 +2920,67 @@ def collect_segmented_epoch_diagnostics(epoch_dir: Path, registry: WindowStateRe
             for w in row.get("warnings", []) or []:
                 if w not in acc["warnings"]:
                     acc["warnings"].append(w)
+
+        # --- Edge exchange stats aggregation (overlap handled below via pooled data) ---
         for edge in diag.get("edges", []) or []:
-            key = tuple(sorted((int(edge.get("state_i")), int(edge.get("state_j")))))
-            acc = edge_acc.setdefault(key, {
-                "state_i": key[0], "state_j": key[1], "window_i": edge.get("window_i", -1), "window_j": edge.get("window_j", -1),
+            ekey = tuple(sorted((int(edge.get("state_i")), int(edge.get("state_j")))))
+            acc = edge_acc.setdefault(ekey, {
+                "state_i": ekey[0], "state_j": ekey[1], "window_i": edge.get("window_i", -1), "window_j": edge.get("window_j", -1),
                 "edge_type": edge.get("edge_type", "segmented"), "exchange_attempts": 0, "exchange_accepted": 0,
-                "overlap_values": [], "warnings": [],
+                "warnings": [],
             })
             acc["exchange_attempts"] += int(edge.get("exchange_attempts", 0) or 0)
             acc["exchange_accepted"] += int(edge.get("exchange_accepted", 0) or 0)
-            if edge.get("overlap") is not None:
-                acc["overlap_values"].append(float(edge.get("overlap")))
+            # Do NOT union per-segment warnings here: low_or_missing_overlap is
+            # re-derived from the pooled overlap below.  Union only non-overlap warnings.
             for w in edge.get("warnings", []) or []:
-                if w not in acc["warnings"]:
+                if w != "low_or_missing_overlap" and w not in acc["warnings"]:
                     acc["warnings"].append(w)
+
+    # Compute pooled numpy arrays once for all states.
+    pooled_np: Dict[int, np.ndarray] = {
+        sid: np.asarray(vals, dtype=float)
+        for sid, vals in pooled_cv_by_state.items()
+    }
+
     states = [dict(v) for _k, v in sorted(state_acc.items())]
     edges = []
-    for _key, acc in sorted(edge_acc.items()):
+    for ekey, acc in sorted(edge_acc.items()):
+        si, sj = ekey
         attempts = int(acc.pop("exchange_attempts", 0) or 0)
         accepted = int(acc.pop("exchange_accepted", 0) or 0)
-        ov = acc.pop("overlap_values", [])
         acc["exchange_attempts"] = attempts
         acc["exchange_accepted"] = accepted
         acc["exchange_acceptance"] = (accepted / float(attempts)) if attempts > 0 else None
-        acc["overlap"] = float(np.nanmin(ov)) if ov else None
+
+        # Pooled overlap — computed once from all segments' raw cv_A data.
+        pooled_overlap = _hist_overlap(
+            pooled_np.get(si, np.asarray([])),
+            pooled_np.get(sj, np.asarray([])),
+        )
+        acc["overlap"] = pooled_overlap
+
+        # segment_min_overlap: minimum across per-segment overlap values
+        # (0.0 when a segment only touched one endpoint of the edge).
+        per_seg_overlaps = seg_overlap_by_edge.get(ekey, [])
+        acc["segment_min_overlap"] = float(min(per_seg_overlaps)) if per_seg_overlaps else None
+
+        # Re-derive low_or_missing_overlap from pooled overlap only.
+        if pooled_overlap is None or float(pooled_overlap) < float(policy.target_overlap):
+            if "low_or_missing_overlap" not in acc["warnings"]:
+                acc["warnings"].append("low_or_missing_overlap")
+
+        # Nonstationary warning: pooled is fine but segment min was much lower.
+        if (
+            pooled_overlap is not None
+            and acc["segment_min_overlap"] is not None
+            and float(pooled_overlap) - float(acc["segment_min_overlap"]) > NONSTATIONARY_OVERLAP_DELTA
+        ):
+            if "nonstationary_overlap" not in acc["warnings"]:
+                acc["warnings"].append("nonstationary_overlap")
+
         edges.append(dict(acc))
+
     payload = {
         "schema_version": "adaptive_epoch_diagnostics_v2_segmented",
         "epoch_dir": str(epoch_dir),
@@ -2788,6 +2993,75 @@ def collect_segmented_epoch_diagnostics(epoch_dir: Path, registry: WindowStateRe
     }
     write_json(epoch_dir / "adaptive_epoch_diagnostics.json", payload)
     return payload
+
+
+def _assert_epoch_has_samples(
+    diagnostics: Dict[str, Any],
+    registry: "WindowStateRegistry",
+    epoch_dir: Path,
+    steps: int,
+) -> None:
+    """Raise RuntimeError if a non-empty epoch produced zero samples in diagnostics.
+
+    This guard catches the controller-freeze bug where the flat collector reads
+    ``epoch_dir/samples.csv`` which does not exist in segmented epochs
+    (data lives in ``baseline/`` and ``topup_*/`` subdirectories).  If the epoch
+    actually ran (``steps > 0``) but all states report zero samples, the
+    diagnostics are corrupt and must not be fed to the controller.
+
+    Also raises if any active state is missing from the diagnostics entirely,
+    since a missing state is indistinguishable from a zero-sample state for the
+    controller.
+    """
+    if steps <= 0:
+        return
+
+    def _safe_int_sample_count(s: Any) -> int:
+        """Return sample_count as int; coerce non-numeric/None to 0."""
+        try:
+            return int(s.get("sample_count", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _safe_state_id(s: Any) -> Optional[int]:
+        """Return state_id as int, or None if absent/non-numeric."""
+        raw = s.get("state_id")
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
+    try:
+        total_samples = sum(_safe_int_sample_count(s) for s in diagnostics.get("states", []))
+        reported_ids: set = set()
+        for s in diagnostics.get("states", []):
+            sid = _safe_state_id(s)
+            if sid is not None:
+                reported_ids.add(sid)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Epoch diagnostics in {epoch_dir} are malformed and cannot be validated: {exc}"
+        ) from exc
+
+    active_ids = set(registry.active_state_ids())
+    missing_ids = active_ids - reported_ids
+    if total_samples == 0 or missing_ids:
+        parts = [
+            f"Epoch diagnostics in {epoch_dir} are corrupt (controller-freezing data, not a soft quality issue)."
+        ]
+        if total_samples == 0:
+            parts.append(
+                f"Zero samples collected across all states despite epoch running {steps} steps. "
+                "This typically means the flat collector was used on a segmented epoch dir "
+                "(samples live in baseline/ and topup_*/ subdirs, not in the root)."
+            )
+        if missing_ids:
+            parts.append(
+                f"Active state(s) missing from diagnostics entirely: {sorted(missing_ids)}."
+            )
+        raise RuntimeError(" ".join(parts))
 
 
 def run_scheduled_adaptive_epoch(
@@ -3255,6 +3529,11 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                 }
                 write_json(summary_path, payload)
                 return payload
+            # Guard: only fires on a real completed scheduled epoch (shutdown path
+            # already returned above).  Uses epoch_steps (the default budget used
+            # to build the schedule) as the steps sentinel — sufficient because the
+            # guard only needs steps > 0 to confirm the epoch was non-trivial.
+            _assert_epoch_has_samples(diagnostics, registry, epoch_dir, int(epoch_steps))
         else:
             epoch_args = copy.copy(args)
             epoch_args.out = str(epoch_dir)
@@ -3352,7 +3631,8 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                 steps=int(actual_epoch_steps),
                 path=epoch_dir,
             )
-            diagnostics = collect_epoch_diagnostics(epoch_dir, registry, policy=policy)
+            diagnostics = collect_segmented_epoch_diagnostics(epoch_dir, registry, policy)
+            _assert_epoch_has_samples(diagnostics, registry, epoch_dir, int(actual_epoch_steps))
         actions = propose_actions_from_diagnostics(registry, diagnostics, policy=policy)
         action_report = None
         if _arg_bool(args, "adaptive_production_write_action_reports", True):
@@ -3581,7 +3861,7 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             path=final_dir,
         )
         _write_runtime_pool_reports(adaptive_dir, runtime_pool)
-        collect_epoch_diagnostics(final_dir, registry, policy=policy)
+        collect_segmented_epoch_diagnostics(final_dir, registry, policy)
         if bool(policy.propagate_seed_bank):
             final_seed_bank = write_epoch_seed_bank(
                 final_dir,
@@ -3668,7 +3948,7 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             path=ext_dir,
         )
         _write_runtime_pool_reports(adaptive_dir, runtime_pool)
-        ext_diag = collect_epoch_diagnostics(ext_dir, registry, policy=policy)
+        ext_diag = collect_segmented_epoch_diagnostics(ext_dir, registry, policy)
         final_diag = collect_final_combined_diagnostics(adaptive_dir, registry, policy=policy)
         quality_gate = evaluate_adaptive_quality_gate(
             adaptive_dir,
