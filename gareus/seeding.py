@@ -48,6 +48,21 @@ from .system_setup import (
 from .units import kj_nm2_to_kcal_a2
 
 
+def _safe_max_finite(rows, key) -> float:
+    """Max of ``rows[*][key]`` over finite numeric values; NaN if none.
+
+    Tolerates blanks (``""``), ``None``, NaN, and OpenMM quantities. Quality
+    rows store ``""`` for inactive coordinates (e.g. the secondary-CV bias when
+    ``cv2`` is ``none``), which a raw ``float()`` would choke on.
+    """
+    vals = []
+    for r in rows:
+        v = _scalar_to_float(r.get(key, None))
+        if v is not None and math.isfinite(v):
+            vals.append(v)
+    return float(max(vals)) if vals else float("nan")
+
+
 def deserialize_system(openmm, system):
     """Deep-copy an OpenMM System via XML serialization."""
     return openmm.XmlSerializer.deserialize(openmm.XmlSerializer.serialize(system))
@@ -1242,9 +1257,9 @@ def generate_us_starting_states_by_pulling(
         "max_abs_delta_A": float(max((abs(float(r.get("delta_A", 0.0))) for r in quality_rows), default=float("nan"))),
         "max_abs_primary_delta": float(max((abs(float(r.get("primary_cv_delta", r.get("delta_A", 0.0)))) for r in quality_rows), default=float("nan"))),
         "primary_delta_units": primary_cv_units(args),
-        "max_production_umbrella_bias_kcal_mol": float(max((float(r.get("production_umbrella_bias_kcal_mol", float("nan"))) for r in quality_rows if math.isfinite(float(r.get("production_umbrella_bias_kcal_mol", float("nan"))))), default=float("nan"))),
-        "max_production_secondary_cv_bias_kcal_mol": float(max((float(r.get("production_secondary_cv_bias_kcal_mol", float("nan"))) for r in quality_rows if math.isfinite(float(r.get("production_secondary_cv_bias_kcal_mol", float("nan"))))), default=float("nan"))),
-        "max_production_total_umbrella_bias_kcal_mol": float(max((float(r.get("production_total_umbrella_bias_kcal_mol", float("nan"))) for r in quality_rows if math.isfinite(float(r.get("production_total_umbrella_bias_kcal_mol", float("nan"))))), default=float("nan"))),
+        "max_production_umbrella_bias_kcal_mol": _safe_max_finite(quality_rows, "production_umbrella_bias_kcal_mol"),
+        "max_production_secondary_cv_bias_kcal_mol": _safe_max_finite(quality_rows, "production_secondary_cv_bias_kcal_mol"),
+        "max_production_total_umbrella_bias_kcal_mol": _safe_max_finite(quality_rows, "production_total_umbrella_bias_kcal_mol"),
         "two_d_relax_mode": "staged" if staged_2d_relax else "single_stage",
         "csv": str(log_path),
         "rows": quality_rows,
