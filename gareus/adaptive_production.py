@@ -3529,6 +3529,11 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                 }
                 write_json(summary_path, payload)
                 return payload
+            # Guard: only fires on a real completed scheduled epoch (shutdown path
+            # already returned above).  Uses epoch_steps (the default budget used
+            # to build the schedule) as the steps sentinel — sufficient because the
+            # guard only needs steps > 0 to confirm the epoch was non-trivial.
+            _assert_epoch_has_samples(diagnostics, registry, epoch_dir, int(epoch_steps))
         else:
             epoch_args = copy.copy(args)
             epoch_args.out = str(epoch_dir)
