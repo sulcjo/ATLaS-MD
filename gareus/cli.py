@@ -45,6 +45,10 @@ def _add_core_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--write-config-template", nargs="?", const="gareus_template.yaml", default=None)
     p.add_argument("--write-effective-config", action="store_true")
     p.add_argument("--seq", required=True, help="One-letter peptide sequence.")
+    p.add_argument("--input-pdb", default=None,
+                   help="Use this prebuilt PDB verbatim (skip PeptideBuilder + addHydrogens). "
+                        "For capped/non-standard structures, e.g. Ace-Ala-Nme. Relative paths "
+                        "resolve against the launch directory.")
     p.add_argument("--out", default="gareus_out", help="Output directory.")
     p.add_argument("--seed", type=int, default=2026)
 

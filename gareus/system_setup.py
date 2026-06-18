@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import collections
 import math
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -38,6 +39,7 @@ from .progress import GuiProgressSink
 __all__ = [
     "validate_sequence",
     "read_pdb_residue_sequence",
+    "resolve_input_pdb",
     "build_peptide_pdb",
     "platform_and_properties",
     "extra_platform_properties",
@@ -100,6 +102,28 @@ def read_pdb_residue_sequence(pdb_path: Path) -> list[str]:
                 seen.add(key)
                 residues.append(key)
     return [r[3] for r in residues]
+
+
+def resolve_input_pdb(args, base_dir=None) -> Optional[Path]:
+    """Return the resolved absolute path to an explicit input PDB, or None.
+
+    When ``args.input_pdb`` is set, the structure is used verbatim and the
+    PeptideBuilder build + ``addHydrogens`` step are bypassed. Relative paths are
+    resolved against ``base_dir`` (default: current working directory), matching
+    how gareus resolves config-relative paths at launch.
+    """
+    raw = getattr(args, "input_pdb", None)
+    if not raw:
+        return None
+    p = Path(raw)
+    if not p.is_absolute():
+        base = Path(base_dir) if base_dir is not None else Path.cwd()
+        p = base / p
+    if not p.exists():
+        raise FileNotFoundError(
+            f"--input-pdb {raw!r} not found (resolved to {p})"
+        )
+    return p
 
 
 def build_peptide_pdb(seq: str, out_pdb: Path, phi_deg: float = -60.0, psi_deg: float = -45.0) -> Path:
@@ -390,17 +414,36 @@ def prepare_solvated_system(args, out_dir: Path):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    raw_pdb = build_peptide_pdb(args.seq, out_dir / "00_built_peptide.pdb", args.initial_phi, args.initial_psi)
-    pdb = app.PDBFile(str(raw_pdb))
     forcefield = make_forcefield(app, args.water_model)
-    modeller = app.Modeller(pdb.topology, pdb.positions)
-    modeller.addHydrogens(forcefield, pH=args.ph)
+    input_pdb = resolve_input_pdb(args, base_dir=getattr(args, "config_base_dir", None))
+    if input_pdb is not None:
+        raw_pdb = out_dir / "00_input_structure.pdb"
+        shutil.copyfile(input_pdb, raw_pdb)
+        pdb = app.PDBFile(str(raw_pdb))
+        modeller = app.Modeller(pdb.topology, pdb.positions)
+        print(
+            f"[setup] input_pdb bypass: loaded {input_pdb} "
+            f"({modeller.topology.getNumAtoms()} atoms, "
+            f"residues={[r.name for r in modeller.topology.residues()]}); "
+            "skipping PeptideBuilder + addHydrogens"
+        )
+    else:
+        raw_pdb = build_peptide_pdb(args.seq, out_dir / "00_built_peptide.pdb", args.initial_phi, args.initial_psi)
+        pdb = app.PDBFile(str(raw_pdb))
+        modeller = app.Modeller(pdb.topology, pdb.positions)
+        modeller.addHydrogens(forcefield, pH=args.ph)
 
     # Size the box against the fully-extended conformation, not the compact
     # alpha-helical starting structure.  Treat the contour length (3.8 Å per
     # residue in a fully-extended beta-strand + 4 Å terminal radii) as the
     # effective peptide size, then add the user-requested padding on each side.
-    _contour_nm = (len(args.seq) - 1) * 0.38 + 0.40
+    if input_pdb is not None:
+        # Size the box from the actual solute extent; the seq-based contour
+        # estimate is meaningless for an externally supplied fixture.
+        _pos_nm = np.asarray(modeller.positions.value_in_unit(unit.nanometer), dtype=float)
+        _contour_nm = float((_pos_nm.max(axis=0) - _pos_nm.min(axis=0)).max()) + 0.40
+    else:
+        _contour_nm = (len(args.seq) - 1) * 0.38 + 0.40
     _box_nm = _contour_nm + 2.0 * float(args.padding_nm)
     print(
         f"[setup] Box size from extended conformation: "
