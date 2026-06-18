@@ -285,6 +285,155 @@ def test_assert_epoch_has_samples_raises_on_missing_active_state(tmp_path: Path)
         _assert_epoch_has_samples(truncated_diag, registry, epoch_dir, steps=5000)
 
 
+# ---------------------------------------------------------------------------
+# Test C — pooled overlap replaces nanmin-of-per-segment aggregation
+# ---------------------------------------------------------------------------
+
+
+def _write_samples_csv_good_overlap(path: Path, n_windows: int, rows_per_window: int = 300) -> None:
+    """Write samples.csv where adjacent windows genuinely overlap (wide std, close centers).
+
+    Centers: 0.3, 0.45, 0.6 with std=0.08 → adjacent windows ~15-25% overlap.
+    """
+    rng = np.random.default_rng(42)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for w in range(n_windows):
+        center = 0.3 + 0.15 * w
+        cv_vals = rng.normal(center, 0.08, rows_per_window).clip(0.0, 1.0)
+        sec_vals = rng.normal(-0.5 + 0.5 * w, 0.05, rows_per_window).clip(-1.0, 1.0)
+        boost_vals = rng.normal(1.0, 0.3, rows_per_window)
+        for cv, sec, boost in zip(cv_vals, sec_vals, boost_vals):
+            rows.append(
+                {
+                    "window": w,
+                    "cv_A": round(float(cv), 6),
+                    "secondary_cv": round(float(sec), 6),
+                    "gamd_boost_total_kcal_mol": round(float(boost), 6),
+                }
+            )
+    with path.open("w", newline="") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=["window", "cv_A", "secondary_cv", "gamd_boost_total_kcal_mol"],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _write_samples_csv_single_window(path: Path, window_idx: int = 1, rows: int = 300) -> None:
+    """Write samples.csv for a topup that only sampled one window.
+
+    This simulates a topup segment that ran only for window ``window_idx``.
+    For any edge where the other endpoint has no samples, the per-segment
+    overlap is degenerate (0 / None), but the pooled overlap across both
+    segments should remain healthy.
+    """
+    rng = np.random.default_rng(99)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    center = 0.3 + 0.15 * window_idx
+    cv_vals = rng.normal(center, 0.08, rows).clip(0.0, 1.0)
+    rows_data = [
+        {
+            "window": window_idx,
+            "cv_A": round(float(cv), 6),
+            "secondary_cv": round(0.0, 6),
+            "gamd_boost_total_kcal_mol": round(1.0, 6),
+        }
+        for cv in cv_vals
+    ]
+    with path.open("w", newline="") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=["window", "cv_A", "secondary_cv", "gamd_boost_total_kcal_mol"],
+        )
+        writer.writeheader()
+        writer.writerows(rows_data)
+
+
+def test_pooled_overlap_not_dragged_by_topup_segment(tmp_path: Path) -> None:
+    """Test C — pooled overlap aggregation.
+
+    Scenario: 3-window registry; segment 1 (baseline) covers all 3 windows
+    with good neighbor overlap; segment 2 (topup) covers ONLY window 1.
+
+    The old nanmin-of-per-segment approach would union the ``low_or_missing_overlap``
+    warning from the topup into the aggregate edge (because the topup produces None
+    overlap for edges 0-1 and 1-2, which the collector treated as missing/low).
+
+    The new pooled approach must:
+    1. Compute aggregate edge overlap from the pooled cv_A arrays (both segments
+       contribute window-1 data; only segment 1 contributes windows 0 and 2).
+    2. Edge 0-1 pooled overlap must be >= target_overlap (good, not dragged).
+    3. ``segment_min_overlap`` records the degenerate per-segment value (0.0) from
+       the topup segment that only saw one endpoint of the edge.
+    4. ``nonstationary_overlap`` warning is present because
+       pooled_overlap - segment_min_overlap > NONSTATIONARY_OVERLAP_DELTA.
+    5. ``low_or_missing_overlap`` is NOT in the aggregate edge warnings (the
+       pooled overlap is genuinely good; the warning must come from pooled data
+       only, not be blindly unioned from per-segment warnings).
+    """
+    window_csv = _write_window_csv(tmp_path / "windows.csv", n_windows=3)
+    registry = registry_from_window_csv(window_csv, epoch=0, source="test")
+    policy = AdaptiveDecisionPolicy()
+
+    epoch_dir = tmp_path / "epoch_pooled"
+
+    # Segment 1: all 3 windows, good overlap
+    _write_samples_csv_good_overlap(
+        epoch_dir / "baseline" / "samples.csv", n_windows=3
+    )
+    # Segment 2 (topup): ONLY window 1 — degenerate for edges 0-1 and 1-2
+    _write_samples_csv_single_window(
+        epoch_dir / "topup_001" / "samples.csv", window_idx=1
+    )
+
+    seg_diag = collect_segmented_epoch_diagnostics(epoch_dir, registry, policy)
+
+    edges_by_pair = {
+        (int(e["state_i"]), int(e["state_j"])): e
+        for e in seg_diag.get("edges", [])
+    }
+
+    # Edge (0, 1): the critical edge with a degenerate-topup per-segment overlap
+    assert (0, 1) in edges_by_pair, "Edge (0,1) must appear in diagnostics"
+    edge_01 = edges_by_pair[(0, 1)]
+
+    # 1. Pooled overlap must be >= target_overlap (good data from segment 1 must dominate)
+    pooled_overlap = edge_01.get("overlap")
+    assert pooled_overlap is not None, "Edge (0,1) must have a non-None pooled overlap"
+    assert float(pooled_overlap) >= float(policy.target_overlap), (
+        f"Pooled overlap {pooled_overlap:.4f} must be >= target_overlap "
+        f"{policy.target_overlap} — baseline segment has good overlap, "
+        "topup should not drag it down"
+    )
+
+    # 2. segment_min_overlap must exist and be low (0.0 — topup saw only window 1)
+    seg_min = edge_01.get("segment_min_overlap")
+    assert seg_min is not None, (
+        "Edge (0,1) must have 'segment_min_overlap' field (from topup degenerate segment)"
+    )
+    assert float(seg_min) == 0.0, (
+        f"segment_min_overlap for edge (0,1) must be 0.0 (topup only sampled window 1), "
+        f"got {seg_min}"
+    )
+
+    # 3. nonstationary_overlap warning must be present
+    warnings_01 = edge_01.get("warnings", [])
+    assert "nonstationary_overlap" in warnings_01, (
+        f"Edge (0,1) must have 'nonstationary_overlap' warning "
+        f"(pooled={pooled_overlap:.3f} >> segment_min={seg_min}), "
+        f"got warnings: {warnings_01}"
+    )
+
+    # 4. low_or_missing_overlap must NOT be in aggregate warnings (pooled overlap is good)
+    assert "low_or_missing_overlap" not in warnings_01, (
+        f"Edge (0,1) must NOT have spurious 'low_or_missing_overlap' warning when "
+        f"pooled overlap {pooled_overlap:.3f} >= target {policy.target_overlap}. "
+        f"Got warnings: {warnings_01}"
+    )
+
+
 def test_assert_epoch_has_samples_malformed_state_id_raises_runtime_error(tmp_path: Path) -> None:
     """Guard must raise RuntimeError (not TypeError) when a diagnostics entry has
     state_id=None (absent key).

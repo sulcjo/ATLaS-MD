@@ -2713,18 +2713,77 @@ def _policy_with_pool_step_budget(
     return p
 
 
+# Threshold for the nonstationary_overlap warning: when the pooled overlap
+# exceeds the per-segment minimum by more than this amount, the edge's CV
+# distribution is likely non-stationary across segments (e.g. a topup that
+# only touched one endpoint inflated the minimum to 0).
+NONSTATIONARY_OVERLAP_DELTA: float = 0.2
+
+
 def collect_segmented_epoch_diagnostics(epoch_dir: Path, registry: WindowStateRegistry, policy: AdaptiveDecisionPolicy) -> Dict[str, Any]:
-    """Collect diagnostics for an epoch made of baseline/top-up sub-runs."""
+    """Collect diagnostics for an epoch made of baseline/top-up sub-runs.
+
+    Edge overlap is computed from **pooled** per-state cv_A arrays across all
+    segments, not from the nanmin of per-segment overlaps.  A topup that only
+    sampled one endpoint of an edge contributes valid data for that endpoint
+    while the other endpoint gets an empty array → the per-segment overlap for
+    that edge is degenerate (0.0), but the pooled overlap reflects the full
+    data from all segments and is unaffected.
+
+    Two extra fields are added to each edge dict:
+    - ``segment_min_overlap``: the minimum per-segment overlap (0.0 when a
+      segment had no samples for one endpoint), for diagnostic purposes only.
+      This field does NOT drive the weak-edge decision.
+    - ``nonstationary_overlap`` warning: appended when
+      ``pooled_overlap - segment_min_overlap > NONSTATIONARY_OVERLAP_DELTA``,
+      indicating that CV coverage varied significantly across segments.
+    """
     epoch_dir = Path(epoch_dir)
     segment_dirs = [p for p in sorted(epoch_dir.iterdir()) if p.is_dir() and (p / "samples.csv").exists()]
     if not segment_dirs:
         return collect_epoch_diagnostics(epoch_dir, registry, policy=policy)
+
     state_acc: Dict[int, Dict[str, Any]] = {}
     edge_acc: Dict[Tuple[int, int], Dict[str, Any]] = {}
     segment_payloads = []
+
+    # Pooled raw cv_A values per state_id — accumulated across all segments.
+    pooled_cv_by_state: Dict[int, List[float]] = {}
+    # Per-segment overlap values for each edge pair, using 0.0 when one
+    # endpoint of the edge had no samples in that segment (degenerate topup).
+    seg_overlap_by_edge: Dict[Tuple[int, int], List[float]] = {}
+
     for seg in segment_dirs:
         diag = collect_epoch_diagnostics(seg, registry, policy=policy)
         segment_payloads.append({"segment": seg.name, "diagnostics_json": str(seg / "adaptive_epoch_diagnostics.json")})
+
+        # --- Accumulate raw cv_A values per state from this segment's samples ---
+        seg_window_map = _load_epoch_window_map(seg, registry)
+        seg_cv_by_state: Dict[int, List[float]] = {}
+        for sample_row in _read_csv_dicts(seg / "samples.csv"):
+            w = _float_or_none(sample_row.get("window"))
+            if w is None:
+                continue
+            sid = seg_window_map.get(int(w), int(w))
+            cv = _float_or_none(sample_row.get("cv_A", sample_row.get("primary_cv_value")))
+            if cv is not None:
+                seg_cv_by_state.setdefault(sid, []).append(float(cv))
+        for sid, vals in seg_cv_by_state.items():
+            pooled_cv_by_state.setdefault(sid, []).extend(vals)
+
+        # --- Compute per-segment per-edge overlap (0.0 for degenerate segments) ---
+        for si, sj, _etype, _nd in build_geometry_edges(registry):
+            key = (int(min(si, sj)), int(max(si, sj)))
+            a = np.asarray(seg_cv_by_state.get(int(si), []), dtype=float)
+            b = np.asarray(seg_cv_by_state.get(int(sj), []), dtype=float)
+            # When at least one endpoint contributed samples to this segment,
+            # record an overlap value.  Use 0.0 when one side is missing
+            # (degenerate topup) rather than silently dropping the segment.
+            if a.size > 0 or b.size > 0:
+                ov = _hist_overlap(a, b)
+                seg_overlap_by_edge.setdefault(key, []).append(0.0 if ov is None else ov)
+
+        # --- State diagnostics aggregation (unchanged logic from Task 1) ---
         for row in diag.get("states", []) or []:
             sid = int(row.get("state_id"))
             acc = state_acc.setdefault(sid, {"state_id": sid, "epoch_window": row.get("epoch_window", -1), "sample_count": 0, "warnings": []})
@@ -2751,31 +2810,67 @@ def collect_segmented_epoch_diagnostics(epoch_dir: Path, registry: WindowStateRe
             for w in row.get("warnings", []) or []:
                 if w not in acc["warnings"]:
                     acc["warnings"].append(w)
+
+        # --- Edge exchange stats aggregation (overlap handled below via pooled data) ---
         for edge in diag.get("edges", []) or []:
-            key = tuple(sorted((int(edge.get("state_i")), int(edge.get("state_j")))))
-            acc = edge_acc.setdefault(key, {
-                "state_i": key[0], "state_j": key[1], "window_i": edge.get("window_i", -1), "window_j": edge.get("window_j", -1),
+            ekey = tuple(sorted((int(edge.get("state_i")), int(edge.get("state_j")))))
+            acc = edge_acc.setdefault(ekey, {
+                "state_i": ekey[0], "state_j": ekey[1], "window_i": edge.get("window_i", -1), "window_j": edge.get("window_j", -1),
                 "edge_type": edge.get("edge_type", "segmented"), "exchange_attempts": 0, "exchange_accepted": 0,
-                "overlap_values": [], "warnings": [],
+                "warnings": [],
             })
             acc["exchange_attempts"] += int(edge.get("exchange_attempts", 0) or 0)
             acc["exchange_accepted"] += int(edge.get("exchange_accepted", 0) or 0)
-            if edge.get("overlap") is not None:
-                acc["overlap_values"].append(float(edge.get("overlap")))
+            # Do NOT union per-segment warnings here: low_or_missing_overlap is
+            # re-derived from the pooled overlap below.  Union only non-overlap warnings.
             for w in edge.get("warnings", []) or []:
-                if w not in acc["warnings"]:
+                if w != "low_or_missing_overlap" and w not in acc["warnings"]:
                     acc["warnings"].append(w)
+
+    # Compute pooled numpy arrays once for all states.
+    pooled_np: Dict[int, np.ndarray] = {
+        sid: np.asarray(vals, dtype=float)
+        for sid, vals in pooled_cv_by_state.items()
+    }
+
     states = [dict(v) for _k, v in sorted(state_acc.items())]
     edges = []
-    for _key, acc in sorted(edge_acc.items()):
+    for ekey, acc in sorted(edge_acc.items()):
+        si, sj = ekey
         attempts = int(acc.pop("exchange_attempts", 0) or 0)
         accepted = int(acc.pop("exchange_accepted", 0) or 0)
-        ov = acc.pop("overlap_values", [])
         acc["exchange_attempts"] = attempts
         acc["exchange_accepted"] = accepted
         acc["exchange_acceptance"] = (accepted / float(attempts)) if attempts > 0 else None
-        acc["overlap"] = float(np.nanmin(ov)) if ov else None
+
+        # Pooled overlap — computed once from all segments' raw cv_A data.
+        pooled_overlap = _hist_overlap(
+            pooled_np.get(si, np.asarray([])),
+            pooled_np.get(sj, np.asarray([])),
+        )
+        acc["overlap"] = pooled_overlap
+
+        # segment_min_overlap: minimum across per-segment overlap values
+        # (0.0 when a segment only touched one endpoint of the edge).
+        per_seg_overlaps = seg_overlap_by_edge.get(ekey, [])
+        acc["segment_min_overlap"] = float(min(per_seg_overlaps)) if per_seg_overlaps else None
+
+        # Re-derive low_or_missing_overlap from pooled overlap only.
+        if pooled_overlap is None or float(pooled_overlap) < float(policy.target_overlap):
+            if "low_or_missing_overlap" not in acc["warnings"]:
+                acc["warnings"].append("low_or_missing_overlap")
+
+        # Nonstationary warning: pooled is fine but segment min was much lower.
+        if (
+            pooled_overlap is not None
+            and acc["segment_min_overlap"] is not None
+            and float(pooled_overlap) - float(acc["segment_min_overlap"]) > NONSTATIONARY_OVERLAP_DELTA
+        ):
+            if "nonstationary_overlap" not in acc["warnings"]:
+                acc["warnings"].append("nonstationary_overlap")
+
         edges.append(dict(acc))
+
     payload = {
         "schema_version": "adaptive_epoch_diagnostics_v2_segmented",
         "epoch_dir": str(epoch_dir),
