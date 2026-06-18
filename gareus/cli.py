@@ -1093,7 +1093,9 @@ def main(argv: Optional[Iterable[str]] = None):
     _graceful_shutdown.clear()
     argv_list = _argv_as_list(argv)
     args = parse_args(argv_list)
-    args.seq = validate_sequence(args.seq)
+    # For --input-pdb runs the sequence is nominal (real topology comes from the
+    # supplied structure), so the >=2-residue terminal-CV gate does not apply.
+    args.seq = validate_sequence(args.seq, require_min_two=not bool(getattr(args, "input_pdb", None)))
     out_dir = Path(os.path.expandvars(str(args.out)))
     _scratchdir = os.path.expandvars(str(getattr(args, "scratchdir", "") or "")).strip()
     if _scratchdir:

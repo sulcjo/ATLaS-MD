@@ -59,13 +59,16 @@ __all__ = [
 ]
 
 
-def validate_sequence(seq: str) -> str:
+def validate_sequence(seq: str, require_min_two: bool = True) -> str:
     """Validate a peptide one‑letter sequence and return the upper‑case string.
 
     The sequence must consist solely of canonical residues defined in
-    ``gareus.constants.AA3``, must be non‑empty, and must contain at least
-    two residues to allow a terminal distance collective variable.  If
-    validation fails, a ``ValueError`` is raised.
+    ``gareus.constants.AA3`` and must be non‑empty.  By default it must also
+    contain at least two residues to allow a terminal distance collective
+    variable; pass ``require_min_two=False`` to relax this (e.g. for
+    ``--input-pdb`` runs where ``seq`` is nominal and the real topology comes
+    from the supplied structure).  If validation fails, a ``ValueError`` is
+    raised.
     """
     seq = seq.strip().upper()
     bad = sorted(set(seq) - set(AA3))
@@ -73,7 +76,7 @@ def validate_sequence(seq: str) -> str:
         raise ValueError("Empty sequence.")
     if bad:
         raise ValueError(f"Unsupported residues: {bad}. Only canonical one‑letter residues are supported.")
-    if len(seq) < 2:
+    if require_min_two and len(seq) < 2:
         raise ValueError("Need at least 2 residues for a terminal‑distance CV.")
     return seq
 
