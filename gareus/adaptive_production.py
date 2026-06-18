@@ -2790,6 +2790,49 @@ def collect_segmented_epoch_diagnostics(epoch_dir: Path, registry: WindowStateRe
     return payload
 
 
+def _assert_epoch_has_samples(
+    diagnostics: Dict[str, Any],
+    registry: "WindowStateRegistry",
+    epoch_dir: Path,
+    steps: int,
+) -> None:
+    """Raise RuntimeError if a non-empty epoch produced zero samples in diagnostics.
+
+    This guard catches the controller-freeze bug where the flat collector reads
+    ``epoch_dir/samples.csv`` which does not exist in segmented epochs
+    (data lives in ``baseline/`` and ``topup_*/`` subdirectories).  If the epoch
+    actually ran (``steps > 0``) but all states report zero samples, the
+    diagnostics are corrupt and must not be fed to the controller.
+
+    Also raises if any active state is missing from the diagnostics entirely,
+    since a missing state is indistinguishable from a zero-sample state for the
+    controller.
+    """
+    if steps <= 0:
+        return
+    total_samples = sum(
+        int(s.get("sample_count", 0) or 0) for s in diagnostics.get("states", [])
+    )
+    reported_ids = {int(s.get("state_id")) for s in diagnostics.get("states", [])}
+    active_ids = set(registry.active_state_ids())
+    missing_ids = active_ids - reported_ids
+    if total_samples == 0 or missing_ids:
+        parts = [
+            f"Epoch diagnostics in {epoch_dir} are corrupt (controller-freezing data, not a soft quality issue)."
+        ]
+        if total_samples == 0:
+            parts.append(
+                f"Zero samples collected across all states despite epoch running {steps} steps. "
+                "This typically means the flat collector was used on a segmented epoch dir "
+                "(samples live in baseline/ and topup_*/ subdirs, not in the root)."
+            )
+        if missing_ids:
+            parts.append(
+                f"Active state(s) missing from diagnostics entirely: {sorted(missing_ids)}."
+            )
+        raise RuntimeError(" ".join(parts))
+
+
 def run_scheduled_adaptive_epoch(
     args: Any,
     epoch_dir: Path,
@@ -3352,7 +3395,8 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                 steps=int(actual_epoch_steps),
                 path=epoch_dir,
             )
-            diagnostics = collect_epoch_diagnostics(epoch_dir, registry, policy=policy)
+            diagnostics = collect_segmented_epoch_diagnostics(epoch_dir, registry, policy)
+            _assert_epoch_has_samples(diagnostics, registry, epoch_dir, int(actual_epoch_steps))
         actions = propose_actions_from_diagnostics(registry, diagnostics, policy=policy)
         action_report = None
         if _arg_bool(args, "adaptive_production_write_action_reports", True):
@@ -3581,7 +3625,7 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             path=final_dir,
         )
         _write_runtime_pool_reports(adaptive_dir, runtime_pool)
-        collect_epoch_diagnostics(final_dir, registry, policy=policy)
+        collect_segmented_epoch_diagnostics(final_dir, registry, policy)
         if bool(policy.propagate_seed_bank):
             final_seed_bank = write_epoch_seed_bank(
                 final_dir,
@@ -3668,7 +3712,7 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             path=ext_dir,
         )
         _write_runtime_pool_reports(adaptive_dir, runtime_pool)
-        ext_diag = collect_epoch_diagnostics(ext_dir, registry, policy=policy)
+        ext_diag = collect_segmented_epoch_diagnostics(ext_dir, registry, policy)
         final_diag = collect_final_combined_diagnostics(adaptive_dir, registry, policy=policy)
         quality_gate = evaluate_adaptive_quality_gate(
             adaptive_dir,
