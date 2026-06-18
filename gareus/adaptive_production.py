@@ -2810,10 +2810,36 @@ def _assert_epoch_has_samples(
     """
     if steps <= 0:
         return
-    total_samples = sum(
-        int(s.get("sample_count", 0) or 0) for s in diagnostics.get("states", [])
-    )
-    reported_ids = {int(s.get("state_id")) for s in diagnostics.get("states", [])}
+
+    def _safe_int_sample_count(s: Any) -> int:
+        """Return sample_count as int; coerce non-numeric/None to 0."""
+        try:
+            return int(s.get("sample_count", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _safe_state_id(s: Any) -> Optional[int]:
+        """Return state_id as int, or None if absent/non-numeric."""
+        raw = s.get("state_id")
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
+    try:
+        total_samples = sum(_safe_int_sample_count(s) for s in diagnostics.get("states", []))
+        reported_ids: set = set()
+        for s in diagnostics.get("states", []):
+            sid = _safe_state_id(s)
+            if sid is not None:
+                reported_ids.add(sid)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Epoch diagnostics in {epoch_dir} are malformed and cannot be validated: {exc}"
+        ) from exc
+
     active_ids = set(registry.active_state_ids())
     missing_ids = active_ids - reported_ids
     if total_samples == 0 or missing_ids:

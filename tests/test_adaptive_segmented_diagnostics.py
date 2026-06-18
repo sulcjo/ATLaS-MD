@@ -251,3 +251,74 @@ def test_assert_epoch_has_samples_silent_when_samples_exist(tmp_path: Path) -> N
 
     # Should not raise when samples are present.
     _assert_epoch_has_samples(seg_diag, registry, epoch_dir, steps=5000)
+
+
+def test_assert_epoch_has_samples_raises_on_missing_active_state(tmp_path: Path) -> None:
+    """Guard raises RuntimeError when diagnostics have total_samples > 0 but one
+    active state is missing from the states list entirely.
+
+    This validates the ``missing_ids`` branch of the guard independently of the
+    zero-samples branch.
+    """
+    window_csv = _write_window_csv(tmp_path / "windows.csv", n_windows=N_WINDOWS)
+    registry = registry_from_window_csv(window_csv, epoch=0, source="test")
+
+    # Collect real diagnostics from a segmented epoch.
+    epoch_dir = tmp_path / "epoch_missing_state"
+    _make_segmented_epoch(epoch_dir)
+    policy = AdaptiveDecisionPolicy()
+    seg_diag = collect_segmented_epoch_diagnostics(epoch_dir, registry, policy)
+
+    # Confirm there ARE samples so the test exercises the missing-state branch only.
+    total = sum(int(s.get("sample_count", 0) or 0) for s in seg_diag.get("states", []))
+    assert total > 0, f"Test premise broken: segmented diag has {total} samples"
+
+    # Drop the last state entry to simulate a missing active state.
+    states_list = list(seg_diag.get("states", []))
+    assert len(states_list) == N_WINDOWS, (
+        f"Expected {N_WINDOWS} state entries, got {len(states_list)}"
+    )
+    truncated_diag = dict(seg_diag)
+    truncated_diag["states"] = states_list[:-1]  # drop one state
+
+    with pytest.raises(RuntimeError, match="missing from diagnostics"):
+        _assert_epoch_has_samples(truncated_diag, registry, epoch_dir, steps=5000)
+
+
+def test_assert_epoch_has_samples_malformed_state_id_raises_runtime_error(tmp_path: Path) -> None:
+    """Guard must raise RuntimeError (not TypeError) when a diagnostics entry has
+    state_id=None (absent key).
+
+    This validates Finding 1: the old ``int(s.get("state_id"))`` call would raise
+    ``TypeError`` for a None value; the hardened version must funnel that into the
+    guard's clean RuntimeError.
+    """
+    window_csv = _write_window_csv(tmp_path / "windows.csv", n_windows=2)
+    registry = registry_from_window_csv(window_csv, epoch=0, source="test")
+
+    epoch_dir = tmp_path / "epoch_malformed"
+
+    # Build a diagnostics dict: one well-formed state with samples, one entry
+    # whose state_id is None (missing key).  total_samples > 0 but the None-id
+    # entry will not appear in reported_ids, so the missing-state branch fires
+    # as a RuntimeError rather than a TypeError.
+    malformed_diag: dict = {
+        "states": [
+            {"state_id": 0, "sample_count": 100},   # well-formed
+            {"sample_count": 50},                     # state_id absent (None from .get)
+        ]
+    }
+
+    # Must raise RuntimeError, not TypeError.
+    with pytest.raises(RuntimeError):
+        _assert_epoch_has_samples(malformed_diag, registry, epoch_dir, steps=1000)
+
+    # Explicitly confirm it is NOT a TypeError bubbling up.
+    try:
+        _assert_epoch_has_samples(malformed_diag, registry, epoch_dir, steps=1000)
+    except RuntimeError:
+        pass  # expected
+    except TypeError as exc:
+        raise AssertionError(
+            f"Guard raised TypeError instead of RuntimeError for None state_id: {exc}"
+        ) from exc
