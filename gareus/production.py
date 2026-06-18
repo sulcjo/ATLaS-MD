@@ -116,6 +116,8 @@ __all__ = [
     "restore_exchange_stats_from_csv_if_needed",
     "run_production_probe",
     "run_shared_gamd_setup_article_a",
+    "_gibbs_window_proposal_distribution",
+    "_gibbs_mh_acceptance_probability",
     "run_gareus",
 ]
 
@@ -337,6 +339,90 @@ def extract_gamd_boost_kj(integrator, unit, globals_now: Optional[dict[str, floa
     if boost is not None:
         return float(boost), {}, "integrator_globals"
     return None, {}, "unavailable"
+
+
+def _gibbs_window_proposal_distribution(
+    beta: float,
+    bias_matrix_kj: np.ndarray,
+    replica_index: int,
+    current_window: int,
+    replica_of_window: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Heat-bath proposal over target windows for one replica transposition."""
+    rep = int(replica_index)
+    wi = int(current_window)
+    holders = np.asarray(replica_of_window, dtype=np.int64)
+    all_windows = np.arange(holders.size, dtype=np.int32)
+    valid_mask = holders >= 0
+    valid_windows = all_windows[valid_mask]
+    target_reps = holders[valid_mask]
+    if valid_windows.size <= 0:
+        return {
+            "windows": np.asarray([], dtype=np.int32),
+            "target_replicas": np.asarray([], dtype=np.int64),
+            "deltas_kj": np.asarray([], dtype=np.float64),
+            "probabilities": np.asarray([], dtype=np.float64),
+        }
+
+    bias = np.asarray(bias_matrix_kj, dtype=np.float64)
+    old_e = bias[wi, rep] + bias[valid_windows, target_reps]
+    new_e = bias[valid_windows, rep] + bias[wi, target_reps]
+    delta = np.asarray(new_e - old_e, dtype=np.float64)
+    stay_idx = np.where(valid_windows == wi)[0]
+    if stay_idx.size:
+        delta[int(stay_idx[0])] = 0.0
+    log_weights = np.clip(-float(beta) * delta, -745.0, 0.0)
+    finite = np.isfinite(log_weights)
+    if not np.any(finite):
+        return {
+            "windows": np.asarray([], dtype=np.int32),
+            "target_replicas": np.asarray([], dtype=np.int64),
+            "deltas_kj": np.asarray([], dtype=np.float64),
+            "probabilities": np.asarray([], dtype=np.float64),
+        }
+    valid_windows = valid_windows[finite]
+    target_reps = target_reps[finite]
+    delta = delta[finite]
+    log_weights = log_weights[finite]
+    m = float(np.max(log_weights))
+    weights = np.exp(log_weights - m)
+    sw = float(np.sum(weights))
+    if not math.isfinite(sw) or sw <= 0.0:
+        probabilities = np.full(valid_windows.shape, 1.0 / max(1, valid_windows.size), dtype=np.float64)
+    else:
+        probabilities = weights / sw
+    return {
+        "windows": valid_windows.astype(np.int32, copy=False),
+        "target_replicas": target_reps.astype(np.int64, copy=False),
+        "deltas_kj": delta.astype(np.float64, copy=False),
+        "probabilities": probabilities.astype(np.float64, copy=False),
+    }
+
+
+def _gibbs_mh_acceptance_probability(
+    delta_kj: float,
+    beta: float,
+    q_forward: float,
+    q_reverse: float,
+) -> float:
+    """Metropolis-Hastings correction for nonuniform Gibbs-walk proposals."""
+    try:
+        delta = float(delta_kj)
+        beta_val = float(beta)
+        qf = float(q_forward)
+        qr = float(q_reverse)
+    except Exception:
+        return 0.0
+    if not (math.isfinite(delta) and math.isfinite(beta_val) and math.isfinite(qf) and math.isfinite(qr)):
+        return 0.0
+    if qf <= 0.0 or qr <= 0.0:
+        return 0.0
+    log_alpha = -beta_val * delta + math.log(qr) - math.log(qf)
+    if log_alpha >= 0.0:
+        return 1.0
+    if log_alpha < -745.0:
+        return 0.0
+    return float(math.exp(log_alpha))
 
 def load_resume_run_definition(out_dir: Path, topology, args, manifest: Optional[dict] = None) -> dict:
     """Recover CV/window/GaMD bookkeeping from previous outputs for true --resume."""
@@ -3713,45 +3799,30 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 return parity, attempt
 
             if mode == "gibbs-walk":
-                # Experimental heat-bath-like long-jump update.  This vectorized
-                # form evaluates all candidate target-window ΔU values for one
-                # replica in one NumPy pass instead of a Python loop plus repeated
-                # window->replica scans.
+                # Heat-bath-like long-jump proposal with MH correction.  The
+                # proposal is nonuniform, so selected moves cannot be accepted
+                # unconditionally without biasing the permutation chain.
                 order = list(range(nrep))
                 rng.shuffle(order)
                 limit = int(getattr(args, "exchange_max_pairs_per_interval", 0) or 0)
                 if limit > 0:
                     order = order[:limit]
-                all_windows = np.arange(nrep, dtype=np.int32)
                 for rep in order:
                     rep = int(rep)
                     wi = int(assignments[rep])
-                    holders = replica_of_window.astype(np.int64, copy=False)
-                    valid_mask = holders >= 0
-                    valid_windows = all_windows[valid_mask]
-                    target_reps = holders[valid_mask]
-                    if valid_windows.size <= 0:
-                        continue
-                    old_e = bias_matrix_kj[wi, rep] + bias_matrix_kj[valid_windows, target_reps]
-                    new_e = bias_matrix_kj[valid_windows, rep] + bias_matrix_kj[wi, target_reps]
-                    delta = new_e - old_e
-                    log_weights = np.clip(-float(beta) * delta.astype(np.float64, copy=False), -745.0, 0.0)
-                    # The stay candidate must have unit weight relative to itself.
-                    stay_idx = np.where(valid_windows == wi)[0]
-                    if stay_idx.size:
-                        log_weights[int(stay_idx[0])] = 0.0
-                    finite = np.isfinite(log_weights)
-                    if not np.any(finite):
+                    proposal = _gibbs_window_proposal_distribution(
+                        beta=float(beta),
+                        bias_matrix_kj=bias_matrix_kj,
+                        replica_index=rep,
+                        current_window=wi,
+                        replica_of_window=replica_of_window,
+                    )
+                    valid_windows = proposal["windows"]
+                    probs = proposal["probabilities"]
+                    deltas = proposal["deltas_kj"]
+                    if valid_windows.size <= 0 or probs.size <= 0:
                         exchange_stats["gibbs_all_nan_skips"] = exchange_stats.get("gibbs_all_nan_skips", 0) + 1
                         continue
-                    valid_windows = valid_windows[finite]
-                    log_weights = log_weights[finite]
-                    m = float(np.max(log_weights))
-                    weights = np.exp(log_weights - m)
-                    sw = float(np.sum(weights))
-                    if not math.isfinite(sw) or sw <= 0.0:
-                        continue
-                    probs = weights / sw
                     choice_index = int(rng.choice(valid_windows.size, p=probs))
                     wj = int(valid_windows[choice_index])
                     exchange_stats["gibbs_choices"] = int(exchange_stats.get("gibbs_choices", 0) or 0) + 1
@@ -3759,7 +3830,30 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                         exchange_stats["gibbs_stays"] = int(exchange_stats.get("gibbs_stays", 0) or 0) + 1
                         continue
                     exchange_stats["gibbs_moves"] = int(exchange_stats.get("gibbs_moves", 0) or 0) + 1
-                    attempt = _attempt_window_swap(wi, wj, primary_values, bias_matrix_kj, absolute_step, attempt, p_override=float(probs[choice_index]), force_accept=True)
+                    q_forward = float(probs[choice_index])
+                    holders_after = replica_of_window.astype(np.int64, copy=True)
+                    target_rep = int(holders_after[wj])
+                    holders_after[wi] = target_rep
+                    holders_after[wj] = rep
+                    reverse = _gibbs_window_proposal_distribution(
+                        beta=float(beta),
+                        bias_matrix_kj=bias_matrix_kj,
+                        replica_index=rep,
+                        current_window=wj,
+                        replica_of_window=holders_after,
+                    )
+                    rev_windows = reverse["windows"]
+                    rev_probs = reverse["probabilities"]
+                    rev_idx = np.where(rev_windows == wi)[0]
+                    q_reverse = float(rev_probs[int(rev_idx[0])]) if rev_idx.size else 0.0
+                    pacc = _gibbs_mh_acceptance_probability(
+                        delta_kj=float(deltas[choice_index]),
+                        beta=float(beta),
+                        q_forward=q_forward,
+                        q_reverse=q_reverse,
+                    )
+                    exchange_stats["gibbs_mh_corrected"] = True
+                    attempt = _attempt_window_swap(wi, wj, primary_values, bias_matrix_kj, absolute_step, attempt, p_override=pacc)
                 parquet_exchange_writer.flush() if bool(getattr(args, "flush_every_log", True)) else None
                 return parity, attempt
 
