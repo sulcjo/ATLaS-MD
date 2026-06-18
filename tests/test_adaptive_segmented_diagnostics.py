@@ -20,6 +20,7 @@ fix was applied.
 from __future__ import annotations
 
 import csv
+import json
 import sys
 from pathlib import Path
 from typing import List, Tuple
@@ -32,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from gareus.adaptive_production import (
     AdaptiveDecisionPolicy,
     _assert_epoch_has_samples,
+    build_union_state_mbar_inputs,
     collect_epoch_diagnostics,
     collect_segmented_epoch_diagnostics,
     evaluate_adaptive_convergence_gate,
@@ -130,6 +132,37 @@ def _make_segmented_epoch(
     return n_baseline, n_topup
 
 
+def _write_parquet_epoch_run(run_dir: Path, n_windows: int = N_WINDOWS, rows_per_window: int = 24) -> int:
+    """Write current canonical Parquet production outputs under one run dir."""
+    from gareus.store import ParquetExchangeWriter, ParquetSampleWriter, SegmentRegistry
+
+    rng = np.random.default_rng(2468)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "gareus_metadata.json").write_text(json.dumps({"temperature_K": 300.0}), encoding="utf-8")
+
+    reg = SegmentRegistry(run_dir)
+    seg_id = reg.open_segment("run_001", None, 1)
+    samples = ParquetSampleWriter(run_dir / "samples" / seg_id, flush_rows=10000)
+    rows = 0
+    for w in range(n_windows):
+        center = 0.2 + 0.3 * w
+        for i in range(rows_per_window):
+            step = 100 * (rows + 1)
+            cv = float(rng.normal(center, 0.02))
+            sec = float(rng.normal(-0.5 + 0.5 * w, 0.05))
+            boost = 4.184 * float(abs(rng.normal(1.0, 0.1)))
+            samples.write_sample(step, i % 2, w, cv, sec, -100.0, boost, boost * 0.5, boost * 0.5)
+            rows += 1
+    samples.close()
+
+    exchanges = ParquetExchangeWriter(run_dir / "exchanges" / seg_id, flush_rows=1000)
+    exchanges.write_exchange(step=1000, replica_i=0, replica_j=1, window_i=0, window_j=1, delta_e=0.0, accepted=True)
+    exchanges.close()
+
+    reg.close_segment(seg_id, end_step=100 * rows)
+    return rows
+
+
 # ---------------------------------------------------------------------------
 # Test A — regression for the freeze
 # ---------------------------------------------------------------------------
@@ -195,6 +228,47 @@ def test_segmented_vs_flat_collector(tmp_path: Path) -> None:
     assert low_sample_states == [], (
         f"Expected no low_sample_states from segmented diagnostics, got: {low_sample_states}"
     )
+
+
+def test_collect_epoch_diagnostics_reads_parquet_outputs(tmp_path: Path) -> None:
+    """Canonical production output is Parquet; diagnostics must not require samples.csv."""
+    window_csv = _write_window_csv(tmp_path / "windows.csv", n_windows=N_WINDOWS)
+    registry = registry_from_window_csv(window_csv, epoch=0, source="test")
+    policy = AdaptiveDecisionPolicy()
+
+    epoch_dir = tmp_path / "epoch_parquet"
+    expected_rows = _write_parquet_epoch_run(epoch_dir, n_windows=N_WINDOWS, rows_per_window=12)
+
+    diag = collect_epoch_diagnostics(epoch_dir, registry, policy=policy)
+
+    assert int(diag.get("n_samples_rows", 0)) == expected_rows
+    assert int(diag.get("n_exchange_rows", 0)) == 1
+    counts = {int(s["state_id"]): int(s["sample_count"]) for s in diag.get("states", [])}
+    assert counts == {0: 12, 1: 12, 2: 12}
+    edge_01 = next(
+        e for e in diag.get("edges", [])
+        if {int(e["state_i"]), int(e["state_j"])} == {0, 1}
+    )
+    assert int(edge_01["exchange_attempts"]) == 1
+    assert int(edge_01["exchange_accepted"]) == 1
+
+
+def test_build_union_state_mbar_inputs_reads_parquet_final(tmp_path: Path) -> None:
+    """Union-state MBAR input builder must consume final/samples/*.parquet."""
+    window_csv = _write_window_csv(tmp_path / "windows.csv", n_windows=N_WINDOWS)
+    registry = registry_from_window_csv(window_csv, epoch=0, source="test")
+
+    adaptive_dir = tmp_path / "adaptive"
+    expected_rows = _write_parquet_epoch_run(adaptive_dir / "final", n_windows=N_WINDOWS, rows_per_window=10)
+
+    meta = build_union_state_mbar_inputs(adaptive_dir, registry)
+
+    assert int(meta["n_samples"]) == expected_rows
+    assert int(meta["n_states"]) == N_WINDOWS
+    with np.load(meta["arrays_npz"], allow_pickle=False) as data:
+        assert data["cv_A"].shape == (expected_rows,)
+        assert data["umbrella_reduced_bias_nk"].shape == (expected_rows, N_WINDOWS)
+        assert np.isfinite(data["umbrella_reduced_bias_nk"]).all()
 
 
 # ---------------------------------------------------------------------------
@@ -293,14 +367,15 @@ def test_assert_epoch_has_samples_raises_on_missing_active_state(tmp_path: Path)
 def _write_samples_csv_good_overlap(path: Path, n_windows: int, rows_per_window: int = 300) -> None:
     """Write samples.csv where adjacent windows genuinely overlap (wide std, close centers).
 
-    Centers: 0.3, 0.45, 0.6 with std=0.08 → adjacent windows ~15-25% overlap.
+    Centers: 0.3, 0.42, 0.54 with std=0.10 → pooled overlap for edge (0,1) ~0.49
+    with seed=42 (margin ~0.24 above target_overlap=0.25, robust across numpy versions).
     """
     rng = np.random.default_rng(42)
     path.parent.mkdir(parents=True, exist_ok=True)
     rows = []
     for w in range(n_windows):
-        center = 0.3 + 0.15 * w
-        cv_vals = rng.normal(center, 0.08, rows_per_window).clip(0.0, 1.0)
+        center = 0.3 + 0.12 * w
+        cv_vals = rng.normal(center, 0.10, rows_per_window).clip(0.0, 1.0)
         sec_vals = rng.normal(-0.5 + 0.5 * w, 0.05, rows_per_window).clip(-1.0, 1.0)
         boost_vals = rng.normal(1.0, 0.3, rows_per_window)
         for cv, sec, boost in zip(cv_vals, sec_vals, boost_vals):
@@ -331,8 +406,8 @@ def _write_samples_csv_single_window(path: Path, window_idx: int = 1, rows: int 
     """
     rng = np.random.default_rng(99)
     path.parent.mkdir(parents=True, exist_ok=True)
-    center = 0.3 + 0.15 * window_idx
-    cv_vals = rng.normal(center, 0.08, rows).clip(0.0, 1.0)
+    center = 0.3 + 0.12 * window_idx
+    cv_vals = rng.normal(center, 0.10, rows).clip(0.0, 1.0)
     rows_data = [
         {
             "window": window_idx,

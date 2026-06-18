@@ -975,6 +975,112 @@ def _read_csv_dicts(path: Path) -> List[Dict[str, str]]:
         return [dict(r) for r in csv.DictReader(handle)]
 
 
+def _has_parquet_rows(run_dir: Path, dirname: str) -> bool:
+    data_dir = Path(run_dir) / str(dirname)
+    return data_dir.exists() and any(data_dir.glob("**/*.parquet"))
+
+
+def _run_dir_has_samples(run_dir: Path) -> bool:
+    run_dir = Path(run_dir)
+    csv_path = run_dir / "samples.csv"
+    return _has_parquet_rows(run_dir, "samples") or (csv_path.exists() and csv_path.stat().st_size > 0)
+
+
+def _value_at(columns: Dict[str, Any], key: str, index: int, default: Any = None) -> Any:
+    arr = columns.get(key)
+    if arr is None:
+        return default
+    try:
+        value = arr[index]
+    except Exception:
+        return default
+    try:
+        if np.ma.is_masked(value):
+            return default
+    except Exception:
+        pass
+    try:
+        return value.item()
+    except Exception:
+        return value
+
+
+def _blank_if_nonfinite(value: Any) -> Any:
+    try:
+        f = float(value)
+    except Exception:
+        return ""
+    return float(f) if math.isfinite(f) else ""
+
+
+def _metadata_beta_1_over_kj_mol(run_dir: Path) -> Optional[float]:
+    meta = read_json_file(Path(run_dir) / "gareus_metadata.json", {}) or {}
+    temp = _float_or_none(meta.get("temperature_K", meta.get("temperature_k")))
+    if temp is None or temp <= 0.0:
+        return None
+    return 1.0 / (8.314462618e-3 * float(temp))
+
+
+def _read_sample_dicts(run_dir: Path) -> List[Dict[str, Any]]:
+    """Read canonical Parquet production samples, falling back to legacy CSV."""
+    run_dir = Path(run_dir)
+    if _has_parquet_rows(run_dir, "samples"):
+        try:
+            from .query import load_samples
+            data = load_samples(run_dir)
+        except Exception:
+            data = {}
+        n = int(len(data.get("step", []))) if data and "step" in data else 0
+        if n > 0:
+            beta = _metadata_beta_1_over_kj_mol(run_dir)
+            rows: List[Dict[str, Any]] = []
+            for i in range(n):
+                boost_kj = _blank_if_nonfinite(_value_at(data, "gamd_boost_total", i, ""))
+                row = {
+                    "step": _value_at(data, "step", i, ""),
+                    "replica": _value_at(data, "replica", i, ""),
+                    "window": _value_at(data, "window_id", i, ""),
+                    "cv_A": _blank_if_nonfinite(_value_at(data, "cv1", i, "")),
+                    "primary_cv_value": _blank_if_nonfinite(_value_at(data, "cv1", i, "")),
+                    "secondary_cv": _blank_if_nonfinite(_value_at(data, "cv2", i, "")),
+                    "potential_kj_mol": _blank_if_nonfinite(_value_at(data, "potential", i, "")),
+                    "gamd_boost_total_kj_mol": boost_kj,
+                    "gamd_boost_total_kcal_mol": (float(boost_kj) / 4.184) if boost_kj != "" else "",
+                    "beta_1_over_kJ_mol": "" if beta is None else float(beta),
+                    "segment_id": _value_at(data, "segment_id", i, ""),
+                }
+                rows.append(row)
+            return rows
+    return _read_csv_dicts(run_dir / "samples.csv")
+
+
+def _read_exchange_dicts(run_dir: Path) -> List[Dict[str, Any]]:
+    """Read canonical Parquet exchange events, falling back to legacy CSV."""
+    run_dir = Path(run_dir)
+    if _has_parquet_rows(run_dir, "exchanges"):
+        try:
+            from .query import load_exchanges
+            data = load_exchanges(run_dir)
+        except Exception:
+            data = {}
+        n = int(len(data.get("step", []))) if data and "step" in data else 0
+        if n > 0:
+            rows: List[Dict[str, Any]] = []
+            for i in range(n):
+                rows.append({
+                    "step": _value_at(data, "step", i, ""),
+                    "replica_i": _value_at(data, "replica_i", i, ""),
+                    "replica_j": _value_at(data, "replica_j", i, ""),
+                    "window_i": _value_at(data, "window_i", i, ""),
+                    "window_j": _value_at(data, "window_j", i, ""),
+                    "delta_e": _blank_if_nonfinite(_value_at(data, "delta_e", i, "")),
+                    "accepted": _value_at(data, "accepted", i, False),
+                    "segment_id": _value_at(data, "segment_id", i, ""),
+                })
+            return rows
+    return _read_csv_dicts(run_dir / "exchanges.csv")
+
+
 def _finite_float_list(values: Iterable[Any]) -> np.ndarray:
     out = []
     for val in values:
@@ -1084,8 +1190,8 @@ def collect_epoch_diagnostics(epoch_dir: Path, registry: WindowStateRegistry, po
     """Collect simple per-state and per-edge diagnostics from one epoch output."""
     epoch_dir = Path(epoch_dir)
     policy = policy or AdaptiveDecisionPolicy()
-    samples = _read_csv_dicts(epoch_dir / "samples.csv")
-    exchanges = _read_csv_dicts(epoch_dir / "exchanges.csv")
+    samples = _read_sample_dicts(epoch_dir)
+    exchanges = _read_exchange_dicts(epoch_dir)
     window_map = _load_epoch_window_map(epoch_dir, registry)
 
     by_state: Dict[int, List[Dict[str, str]]] = {sid: [] for sid in registry.active_state_ids()}
@@ -1207,13 +1313,13 @@ def _sample_sources_from_run_root(label: str, run_dir: Path) -> List[Tuple[str, 
     """Return sample-bearing directories for a plain or scheduled run root."""
     run_dir = Path(run_dir)
     out: List[Tuple[str, Path]] = []
-    if (run_dir / "samples.csv").exists():
+    if _run_dir_has_samples(run_dir):
         out.append((label, run_dir))
     for child in sorted(run_dir.iterdir() if run_dir.exists() else []):
         if not child.is_dir():
             continue
         if child.name == "baseline" or child.name.startswith("topup_"):
-            if (child / "samples.csv").exists():
+            if _run_dir_has_samples(child):
                 out.append((f"{label}/{child.name}", child))
     return out
 
@@ -1268,7 +1374,7 @@ def build_union_state_mbar_inputs(
 
     sample_rows: List[Dict[str, Any]] = []
     for source_label, sample_dir in _epoch_sample_sources(adaptive_dir, include_epochs=include_epochs):
-        rows = _read_csv_dicts(sample_dir / "samples.csv")
+        rows = _read_sample_dicts(sample_dir)
         if not rows:
             continue
         window_map = _load_epoch_window_map(sample_dir, registry)
@@ -1675,8 +1781,8 @@ def collect_final_combined_diagnostics(adaptive_dir: Path, registry: WindowState
 
     for source_label, sample_dir in sources:
         window_map = _load_epoch_window_map(sample_dir, registry)
-        samples = _read_csv_dicts(sample_dir / "samples.csv")
-        exchanges = _read_csv_dicts(sample_dir / "exchanges.csv")
+        samples = _read_sample_dicts(sample_dir)
+        exchanges = _read_exchange_dicts(sample_dir)
         total_samples += len(samples)
         total_exchanges += len(exchanges)
         source_summaries.append({
@@ -2739,7 +2845,7 @@ def collect_segmented_epoch_diagnostics(epoch_dir: Path, registry: WindowStateRe
       indicating that CV coverage varied significantly across segments.
     """
     epoch_dir = Path(epoch_dir)
-    segment_dirs = [p for p in sorted(epoch_dir.iterdir()) if p.is_dir() and (p / "samples.csv").exists()]
+    segment_dirs = [p for p in sorted(epoch_dir.iterdir()) if p.is_dir() and _run_dir_has_samples(p)]
     if not segment_dirs:
         return collect_epoch_diagnostics(epoch_dir, registry, policy=policy)
 
@@ -2753,6 +2859,10 @@ def collect_segmented_epoch_diagnostics(epoch_dir: Path, registry: WindowStateRe
     # endpoint of the edge had no samples in that segment (degenerate topup).
     seg_overlap_by_edge: Dict[Tuple[int, int], List[float]] = {}
 
+    # Hoist the static edge list once — build_geometry_edges depends only on
+    # the registry, which is constant for the lifetime of this call.
+    geometry_edges = build_geometry_edges(registry)
+
     for seg in segment_dirs:
         diag = collect_epoch_diagnostics(seg, registry, policy=policy)
         segment_payloads.append({"segment": seg.name, "diagnostics_json": str(seg / "adaptive_epoch_diagnostics.json")})
@@ -2760,7 +2870,7 @@ def collect_segmented_epoch_diagnostics(epoch_dir: Path, registry: WindowStateRe
         # --- Accumulate raw cv_A values per state from this segment's samples ---
         seg_window_map = _load_epoch_window_map(seg, registry)
         seg_cv_by_state: Dict[int, List[float]] = {}
-        for sample_row in _read_csv_dicts(seg / "samples.csv"):
+        for sample_row in _read_sample_dicts(seg):
             w = _float_or_none(sample_row.get("window"))
             if w is None:
                 continue
@@ -2772,7 +2882,7 @@ def collect_segmented_epoch_diagnostics(epoch_dir: Path, registry: WindowStateRe
             pooled_cv_by_state.setdefault(sid, []).extend(vals)
 
         # --- Compute per-segment per-edge overlap (0.0 for degenerate segments) ---
-        for si, sj, _etype, _nd in build_geometry_edges(registry):
+        for si, sj, _etype, _nd in geometry_edges:
             key = (int(min(si, sj)), int(max(si, sj)))
             a = np.asarray(seg_cv_by_state.get(int(si), []), dtype=float)
             b = np.asarray(seg_cv_by_state.get(int(sj), []), dtype=float)
