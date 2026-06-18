@@ -1,0 +1,29 @@
+# Unbiased reference: ground-truth phi/psi for Ace-Ala-Nme in TIP3P.
+# Single manual window, NO umbrella restraint (k=0), no secondary CV, no GaMD.
+description: "Ace-Ala-Nme unbiased reference (hmr-cmd, single unrestrained window)"
+seq: "A"
+input_pdb: "RUNS/ala_dipeptide_validation/ace_ala_nme.pdb"
+out: "RUNS/ala_dipeptide_validation/reference"
+
+water_model: tip3p
+padding_nm: 1.0
+temperature_k: 300.0
+box_shape: dodecahedron
+
+run_mode: hmr-cmd
+timestep_fs: 4.0
+
+window_mode: manual
+windows_a: [5.5]
+window_k_kcal_a2: [0.0]
+cv1: distance
+cv_atom1: "1:CH3"   # ACE methyl carbon
+cv_atom2: "-1:C"    # NME methyl carbon (amber14 renames NME CH3 -> C on load)
+cv2: none
+
+# SMOKE values — overridden up for the full run in Task 6.
+production_steps: 20000      # 80 ps smoke
+report_interval: 5000
+traj_interval: 5000          # keep == report_interval so frames align with samples
+traj_format: xtc
+exchange_mode: neighbor      # single window => no exchange anyway
