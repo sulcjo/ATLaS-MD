@@ -3951,29 +3951,46 @@ def _sample_to_segment_frame(
 
 
 def _base_segment_resume_start(resume_start: int, use_adj: bool, sample_steps, spf: int) -> int:
-    """Infer the production-start offset for a non-merged base trajectory segment.
+    """Anchor a non-merged trajectory segment to the absolute sample-step clock.
 
     GaMD runs count the (cMD + equilibration) phase in the absolute sample
-    ``step`` column, but the production trajectory's frame 0 corresponds to the
-    first production step, not step 0. The base segment is recorded with
-    ``resume_start=0`` (from _find_all_replica_trajectory_segments), so the
-    samples (absolute steps) fall entirely outside [spf, n*spf] and align to
-    nothing. Infer the offset from the data: the first production sample sits at
-    ``resume_start + spf``, so ``resume_start = min(step) - spf``.
+    ``step`` column (``absolute_step = calib_steps + prod_done``), but the
+    production trajectory's frame 0 corresponds to the first *production* step.
+    The base segment is recorded with ``resume_start=0`` and resume segments are
+    recorded with the *production-relative* ``prod_done`` in their filename
+    (``replica_NNN_resume_from_<prod_done>``) -- neither carries the
+    ``calib_steps`` offset. Without correction, every absolute sample step falls
+    outside a segment's [resume_start+spf, resume_start+n*spf] window and aligns
+    to nothing (empty Rg / phi-psi / SASA output for GaMD runs).
 
-    Scoped to be a no-op everywhere it must not change behaviour:
+    Infer the calibration offset from the data: the first production sample sits
+    at ``calib_steps + spf``, so ``calib_steps = min(step) - spf`` (the global
+    min is drawn from the base segment, which is sorted first and always present
+    when any segment exists). The effective anchor for ANY segment is then
+    ``calib_steps + resume_start``: for the base segment (resume_start=0) this is
+    just ``calib_steps``; for a resume segment it shifts the production-relative
+    filename offset into absolute coordinates.
+
+    No-op where it must be:
       * merged/adaptive trajectory dirs (use_adj=True) -> unchanged,
-      * resume-filename segments (resume_start != 0) -> unchanged,
-      * cMD runs whose steps are already production-relative (inferred <= 0) ->
-        unchanged (returns the original 0).
+      * cMD/hmr-cmd runs whose steps are already production-relative
+        (calib_steps inferred <= 0) -> unchanged.
+
+    ASSUMPTION: the sample cadence equals the trajectory frame interval
+    (``distance_output_interval == traj_interval``). All shipped configs satisfy
+    this. If they differ, ``min(step) - spf`` carries an extra
+    ``(distance_output_interval - spf)`` term and frames misalign; keep the two
+    intervals equal in any GaMD config whose trajectory observables matter.
     """
-    if use_adj or int(resume_start) != 0:
+    if use_adj:
         return int(resume_start)
     s = np.asarray(sample_steps, dtype=np.float64)
     if s.size == 0:
         return int(resume_start)
-    inferred = int(np.min(s)) - int(spf)
-    return inferred if inferred > 0 else int(resume_start)
+    calib = int(np.min(s)) - int(spf)
+    if calib <= 0:
+        return int(resume_start)
+    return calib + int(resume_start)
 
 
 def _saved_frame_index_from_step(step: int, resume_start: int, step_per_frame: int) -> int:

@@ -18,9 +18,19 @@ def test_cmd_run_left_unchanged():
     assert _base_segment_resume_start(0, False, steps, 5000) == 0
 
 
-def test_resume_segment_not_overridden():
+def test_resume_segment_anchored_to_absolute_clock():
+    # Resume filenames encode production-relative prod_done; sample steps are
+    # absolute (calib + prod_done). The anchor must shift the resume offset into
+    # absolute coordinates: calib (305000) + resume_start (50000) = 355000.
     steps = np.arange(306000, 326000, 1000, dtype=float)
-    assert _base_segment_resume_start(50000, False, steps, 1000) == 50000
+    assert _base_segment_resume_start(50000, False, steps, 1000) == 355000
+
+
+def test_cmd_resume_segment_unchanged():
+    # cmd run: calib=0 (steps production-relative), so a resume segment keeps its
+    # production-relative filename offset.
+    steps = np.arange(1000, 21000, 1000, dtype=float)  # min == spf -> calib 0
+    assert _base_segment_resume_start(7000, False, steps, 1000) == 7000
 
 
 def test_merged_adaptive_path_not_overridden():
