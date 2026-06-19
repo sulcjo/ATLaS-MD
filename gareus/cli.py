@@ -366,6 +366,10 @@ def _add_gamd_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--report-interval", type=int, default=5000)
     p.add_argument("--traj-interval", type=int, default=5000)
     p.add_argument("--traj-format", choices=["dcd", "xtc", "none"], default="dcd")
+    p.add_argument("--traj-solute-only", action=argparse.BooleanOptionalAction, default=False,
+                   help="Record only solute (non-water/ion) atoms in trajectories, and write a "
+                        "companion solute_only.pdb. Shrinks dense-sampling trajectories ~100x for "
+                        "a peptide in water. Analysis must use solute_only.pdb as topology.")
     p.add_argument("--adaptive-pilot-trajectories",
                    action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--adaptive-production-trajectories",

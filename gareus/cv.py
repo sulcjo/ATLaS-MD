@@ -644,6 +644,18 @@ def peptide_residues(topology) -> List[Any]:
     return residues
 
 
+def solute_atom_indices(topology) -> List[int]:
+    """Return atom indices of solute (non-water, non-ion) residues, ascending.
+
+    Used to record solute-only trajectories (``--traj-solute-only``): for a tiny
+    peptide in a large water box this shrinks frames ~100x. The ascending order
+    matches OpenMM's ``atomSubset`` output and a Modeller-deleted topology PDB,
+    so the saved trajectory and its companion ``solute_only.pdb`` stay aligned.
+    """
+    idx = [int(atom.index) for res in peptide_residues(topology) for atom in res.atoms()]
+    return sorted(idx)
+
+
 def find_atom_in_residue(residue, atom_name: str) -> int:
     """Return the index of the atom with ``atom_name`` in the given residue."""
     for atom in residue.atoms():

@@ -53,6 +53,7 @@ __all__ = [
     "make_langevin_integrator",
     "add_position_restraints",
     "make_trajectory_reporter",
+    "write_solute_only_topology_pdb",
     "write_state_pdb",
     "run_steps_safely",
     "minimize_and_npt_equilibrate",
@@ -521,13 +522,19 @@ def add_position_restraints(openmm, unit, system, topology, positions, k_kcal_mo
     return n
 
 
-def make_trajectory_reporter(app, base_path: Path, interval: int, args):
+def make_trajectory_reporter(app, base_path: Path, interval: int, args, atom_subset=None):
     """Create a trajectory reporter using the requested trajectory format.
 
     ``base_path`` should be a path without a suffix.  DCD remains the default
     for backward compatibility; XTC can be requested with ``--traj-format xtc``.
     The function deliberately returns None for format ``none`` so callers can
     keep the same reporter‑append pattern.
+
+    ``atom_subset`` (ascending list of atom indices, e.g. from
+    :func:`gareus.cv.solute_atom_indices`) records only those atoms — used by
+    ``--traj-solute-only`` to keep dense-sampling trajectories tiny. The OpenMM
+    DCD/XTC reporters accept ``atomSubset`` (OpenMM >= 8.1); a companion
+    ``solute_only.pdb`` topology must be written for analysis to read the file.
     """
     interval = int(interval)
     if interval <= 0:
@@ -537,7 +544,10 @@ def make_trajectory_reporter(app, base_path: Path, interval: int, args):
         return None
     base_path = Path(base_path)
     base_path.parent.mkdir(parents=True, exist_ok=True)
+    subset = list(atom_subset) if atom_subset is not None else None
     if fmt == "dcd":
+        if subset is not None:
+            return app.DCDReporter(str(base_path.with_suffix(".dcd")), interval, atomSubset=subset)
         return app.DCDReporter(str(base_path.with_suffix(".dcd")), interval)
     if fmt == "xtc":
         xtc_reporter = getattr(app, "XTCReporter", None)
@@ -546,8 +556,28 @@ def make_trajectory_reporter(app, base_path: Path, interval: int, args):
                 "--traj-format xtc was requested, but this OpenMM installation does not expose "
                 "openmm.app.XTCReporter. Upgrade OpenMM or use --traj-format dcd."
             )
+        if subset is not None:
+            return xtc_reporter(str(base_path.with_suffix(".xtc")), interval, atomSubset=subset)
         return xtc_reporter(str(base_path.with_suffix(".xtc")), interval)
     raise ValueError(f"Unsupported --traj-format {fmt!r}; use dcd, xtc, or none")
+
+
+def write_solute_only_topology_pdb(out_dir: Path, app, topology, positions, solute_indices) -> Path:
+    """Write ``solute_only.pdb`` containing only ``solute_indices`` (ascending).
+
+    Companion topology for ``--traj-solute-only`` trajectories: deleting every
+    non-solute atom preserves the kept atoms in ascending topology order, which
+    matches the reporter's ``atomSubset`` output exactly, so mdtraj can load the
+    trimmed trajectory against this PDB.
+    """
+    keep = {int(i) for i in solute_indices}
+    modeller = app.Modeller(topology, positions)
+    to_delete = [a for a in topology.atoms() if int(a.index) not in keep]
+    modeller.delete(to_delete)
+    path = Path(out_dir) / "solute_only.pdb"
+    with path.open("w") as handle:
+        app.PDBFile.writeFile(modeller.topology, modeller.positions, handle, keepIds=True)
+    return path
 
 
 def write_state_pdb(path: Path, app, topology, positions):

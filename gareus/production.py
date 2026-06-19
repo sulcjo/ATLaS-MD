@@ -40,6 +40,7 @@ from .system_setup import (
     replica_platform_properties,
     resolve_cpu_threads_for_replicas,
     make_trajectory_reporter,
+    write_solute_only_topology_pdb,
     write_state_pdb,
 )
 from .seeding import generate_us_starting_states_by_pulling, deserialize_system
@@ -58,6 +59,7 @@ from .cv import (
     primary_cv_mode,
     primary_cv_units,
     primary_cv_value_from_positions_nm,
+    solute_atom_indices,
     primary_k_to_openmm_value,
     primary_k_units,
     primary_openmm_k_units,
@@ -2839,6 +2841,17 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     if effective_traj_interval > 0:
         traj_dir.mkdir(exist_ok=True)
 
+    # Solute-only trajectories (--traj-solute-only): record just the peptide atoms
+    # (ascending indices) and write a companion solute_only.pdb so analysis can read
+    # the trimmed frames. Subset is derived from the topology so it stays consistent
+    # across resume segments even when positions are loaded from a checkpoint.
+    traj_atom_subset = None
+    if effective_traj_interval > 0 and bool(getattr(args, "traj_solute_only", False)):
+        traj_atom_subset = solute_atom_indices(topology) or None
+        if traj_atom_subset is not None and pos is not None:
+            _solute_pdb = write_solute_only_topology_pdb(out_dir, app, topology, pos, traj_atom_subset)
+            print(f"[setup] traj-solute-only: recording {len(traj_atom_subset)} solute atoms; topology -> {_solute_pdb}")
+
     if primary_cv_is_contacts(args):
         print(
             f"[4/4] Building {nrep} GaREUS replicas with primary CV {cv_label}: "
@@ -2916,7 +2929,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 sim_i.context.setVelocities(start_vel)
             set_window(sim_i.context, centers_nm, ks_kj_nm2, i, secondary_cv_centers, secondary_cv_ks_kj)
         if effective_traj_interval > 0 and not bool(getattr(args, "resume", False)):
-            reporter = make_trajectory_reporter(app, traj_dir / f"replica_{i:03d}", effective_traj_interval, args)
+            reporter = make_trajectory_reporter(app, traj_dir / f"replica_{i:03d}", effective_traj_interval, args, atom_subset=traj_atom_subset)
             if reporter is not None:
                 sim_i.reporters.append(reporter)
         sims.append(sim_i)
@@ -3962,7 +3975,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 print(f"    Resumed GaREUS production from checkpoint at production step {prod_done}/{prod_total}; attempt {attempt}")
                 if effective_traj_interval > 0:
                     for i, sim in enumerate(sims):
-                        reporter = make_trajectory_reporter(app, traj_dir / f"replica_{i:03d}_resume_from_{prod_done:09d}", effective_traj_interval, args)
+                        reporter = make_trajectory_reporter(app, traj_dir / f"replica_{i:03d}_resume_from_{prod_done:09d}", effective_traj_interval, args, atom_subset=traj_atom_subset)
                         if reporter is not None:
                             sim.reporters.append(reporter)
                 # Seal the previous crashed segment: rows beyond the checkpoint
@@ -3984,7 +3997,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     _seg_registry.seal_segment(_parent_seg_id, absolute_end_step=-1, status="abandoned")
                 if effective_traj_interval > 0:
                     for i, sim in enumerate(sims):
-                        reporter = make_trajectory_reporter(app, traj_dir / f"replica_{i:03d}_resume_fresh_{int(time.time())}", effective_traj_interval, args)
+                        reporter = make_trajectory_reporter(app, traj_dir / f"replica_{i:03d}_resume_fresh_{int(time.time())}", effective_traj_interval, args, atom_subset=traj_atom_subset)
                         if reporter is not None:
                             sim.reporters.append(reporter)
         elif _parent_was_running and _parent_seg_id is not None:
