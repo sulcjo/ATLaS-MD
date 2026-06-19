@@ -21,22 +21,21 @@ fi
 echo "[3/5] validation (hmr-gamd/REUS 2D, 20x5 ns) -> $LOG/validation.log"
 python -m gareus --config ala_dipeptide_validation.yaml > "$LOG/validation.log" 2>&1
 
-echo "[4/5] analysis x3 (one per estimator)"
-for sel in umbrella_only gamd_exponential gamd_cumulant2; do
-  echo "    --selected-method $sel"
-  python analyze_gareus_mbar.py "$ROOT/validation" \
-    --selected-method "$sel" \
-    --out "$ROOT/validation/ANALYSIS_$sel" > "$LOG/analysis_$sel.log" 2>&1
-done
+# Solute-only trajectories => analysis must read solute_only.pdb as topology.
+SOLUTE_TOP="$ROOT/validation/solute_only.pdb"
+echo "[4/5] analysis (gamd_cumulant2 only) using $SOLUTE_TOP"
+python analyze_gareus_mbar.py "$ROOT/validation" \
+  --selected-method gamd_cumulant2 \
+  --extra-topology "$SOLUTE_TOP" --rg-topology "$SOLUTE_TOP" --pca-topology "$SOLUTE_TOP" \
+  --rg-selection "all" --pca-selection "name CA" \
+  --out "$ROOT/validation/ANALYSIS_gamd_cumulant2" > "$LOG/analysis_gamd_cumulant2.log" 2>&1
 
-echo "[5/5] validate (reference vs 3 estimators)"
+echo "[5/5] validate (reference vs gamd_cumulant2)"
 python validate_ala_dipeptide.py \
   --reference-run "$ROOT/reference" \
   --rama-npz \
-    "$ROOT"/validation/ANALYSIS_umbrella_only/extra_observable_pmfs/ramachandran_2d_fes/rama_*_2d_fes.npz \
-    "$ROOT"/validation/ANALYSIS_gamd_exponential/extra_observable_pmfs/ramachandran_2d_fes/rama_*_2d_fes.npz \
     "$ROOT"/validation/ANALYSIS_gamd_cumulant2/extra_observable_pmfs/ramachandran_2d_fes/rama_*_2d_fes.npz \
-  --estimator-names umbrella_only gamd_exponential gamd_cumulant2 \
+  --estimator-names gamd_cumulant2 \
   --temperature-k 300.0 \
   --out "$ROOT/VALIDATION_REPORT" | tee "$LOG/validate.log"
 
