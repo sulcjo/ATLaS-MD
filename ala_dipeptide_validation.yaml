@@ -1,7 +1,7 @@
 # Validation: native chignolin pipeline on Ace-Ala-Nme.
 # Primary = cap-methyl end-to-end distance; secondary = rama-content scalar.
 # hmr-gamd + REUS, manual 2D grid (5 distance x 4 rama = 20 windows).
-description: "Ace-Ala-Nme hmr-gamd/REUS 2D (distance x rama-map) validation"
+description: "Ace-Ala-Nme hmr-gamd/REUS 2D (distance x rama-map) validation, 3x3 grid"
 seq: "A"
 input_pdb: "RUNS/ala_dipeptide_validation/ace_ala_nme.pdb"
 out: "RUNS/ala_dipeptide_validation/validation"
@@ -11,6 +11,8 @@ padding_nm: 1.0
 temperature_k: 300.0
 box_shape: dodecahedron
 
+# NOTE: this OpenMM build has no CUDA platform (only Reference/CPU/OpenCL);
+# auto -> OpenCL. Speedup here comes from the 9-window grid, not the platform.
 run_mode: hmr-gamd
 timestep_fs: 4.0
 
@@ -18,18 +20,18 @@ window_mode: manual
 cv1: distance
 cv_atom1: "1:CH3"   # ACE methyl carbon
 cv_atom2: "-1:C"    # NME methyl carbon (amber14 renames NME CH3 -> C on load)
-windows_a: [4.5, 5.25, 6.0, 6.75, 7.5]   # cap-methyl distance centers (A); tune after smoke
-window_k_kcal_a2: [40.0]                  # single value => applied to all primary windows
+windows_a: [4.5, 6.0, 7.5]   # 3 cap-methyl distance centers (A)
+window_k_kcal_a2: [40.0]     # single value => applied to all primary windows
 
 cv2: rama-map
-cv2_centers: [-1.0, -0.3333333, 0.3333333, 1.0]   # beta / PPII / alpha_r / alpha_l
+cv2_centers: [-1.0, 0.0, 1.0]   # beta / mid / alpha_l (GaMD boost + window 0 cover PPII & alpha_r)
 cv2_k_default: 50.0
 cv2_k_mode: fixed
 
 exchange_mode: gibbs-walk
 exchange_interval: 1000
 
-# Validation: 2 ns/window x 20 windows = 40 ns aggregate (500,000 steps/win at 4 fs).
+# Validation: 2 ns/window x 9 windows = 18 ns aggregate (500,000 steps/win at 4 fs).
 production_steps: 500000
 report_interval: 5000
 # traj_interval MUST equal the sample cadence (distance_output_interval, default
