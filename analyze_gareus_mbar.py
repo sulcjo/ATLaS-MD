@@ -3950,6 +3950,32 @@ def _sample_to_segment_frame(
     return mask, local
 
 
+def _base_segment_resume_start(resume_start: int, use_adj: bool, sample_steps, spf: int) -> int:
+    """Infer the production-start offset for a non-merged base trajectory segment.
+
+    GaMD runs count the (cMD + equilibration) phase in the absolute sample
+    ``step`` column, but the production trajectory's frame 0 corresponds to the
+    first production step, not step 0. The base segment is recorded with
+    ``resume_start=0`` (from _find_all_replica_trajectory_segments), so the
+    samples (absolute steps) fall entirely outside [spf, n*spf] and align to
+    nothing. Infer the offset from the data: the first production sample sits at
+    ``resume_start + spf``, so ``resume_start = min(step) - spf``.
+
+    Scoped to be a no-op everywhere it must not change behaviour:
+      * merged/adaptive trajectory dirs (use_adj=True) -> unchanged,
+      * resume-filename segments (resume_start != 0) -> unchanged,
+      * cMD runs whose steps are already production-relative (inferred <= 0) ->
+        unchanged (returns the original 0).
+    """
+    if use_adj or int(resume_start) != 0:
+        return int(resume_start)
+    s = np.asarray(sample_steps, dtype=np.float64)
+    if s.size == 0:
+        return int(resume_start)
+    inferred = int(np.min(s)) - int(spf)
+    return inferred if inferred > 0 else int(resume_start)
+
+
 def _saved_frame_index_from_step(step: int, resume_start: int, step_per_frame: int) -> int:
     """Return local trajectory frame index for an absolute saved-frame step."""
     spf = max(1, int(step_per_frame))
@@ -4117,7 +4143,8 @@ def _compute_rg_from_trajectories(d: Data, args, progress: Optional[Progress], w
             except Exception as exc:
                 local_warns.append(f'Rg trajectory reconstruction failed for replica {rep} ({seg_path}): {exc}')
                 continue
-            mask, local_frames=_sample_to_segment_frame(steps_for_align, resume_start, traj.n_frames, spf)
+            eff_resume_start=_base_segment_resume_start(resume_start, use_adjusted, steps_for_align, spf)
+            mask, local_frames=_sample_to_segment_frame(steps_for_align, eff_resume_start, traj.n_frames, spf)
             if not np.any(mask):
                 continue
             out[order[mask]]=rg[local_frames]
@@ -4389,7 +4416,8 @@ def _pca_replica_plan(d: Data, args, md, traj_dir: Path, warnings: list[str]) ->
             n_seg_frames=_trajectory_frame_count(md, seg_path)
             if n_seg_frames is None or n_seg_frames<=0:
                 continue
-            mask, local_frames=_sample_to_segment_frame(steps_for_align, resume_start, n_seg_frames, spf)
+            eff_resume_start=_base_segment_resume_start(resume_start, use_adj, steps_for_align, spf)
+            mask, local_frames=_sample_to_segment_frame(steps_for_align, eff_resume_start, n_seg_frames, spf)
             if not np.any(mask):
                 continue
             seg_order=order[mask]
@@ -4730,7 +4758,8 @@ def _extra_replica_plan(d: Data, args, md, traj_dir: Path, warnings: list[str]) 
             n_seg_frames=_trajectory_frame_count(md, seg_path)
             if n_seg_frames is None or n_seg_frames<=0:
                 continue
-            mask, local_frames=_sample_to_segment_frame(steps_for_align, resume_start, n_seg_frames, spf)
+            eff_resume_start=_base_segment_resume_start(resume_start, use_adj, steps_for_align, spf)
+            mask, local_frames=_sample_to_segment_frame(steps_for_align, eff_resume_start, n_seg_frames, spf)
             if not np.any(mask):
                 continue
             seg_order=order[mask]
@@ -8377,6 +8406,11 @@ def analyze(d,args, progress: Optional[Progress] = None):
     else:
         exp_pmf=umbrella; cum_pmf=umbrella; selected='umbrella_only'; cdiag={'boost_mean_kj':np.full(args.bins,np.nan),'boost_var_kj2':np.full(args.bins,np.nan)}; warn.append('No finite variable GaMD boosts found; selected PMF is umbrella-only unbiased.')
     pmfs={'umbrella_only':umbrella,'gamd_exponential':exp_pmf,'gamd_cumulant2':cum_pmf}
+    _force_method=str(getattr(args,'selected_method','auto') or 'auto')
+    if _force_method!='auto' and _force_method in pmfs:
+        if _force_method in ('gamd_exponential','gamd_cumulant2') and not boost_ok:
+            warn.append(f'--selected-method {_force_method} requested but no usable GaMD boost; it equals umbrella-only here.')
+        selected=_force_method
     dtram_info=run_dtram_cv_pmf(d,args,bins,kbt_kcal,warn,progress)
     if isinstance(dtram_info,dict) and dtram_info.get('available'):
         pmfs[dtram_info.get('method','dtram')]=dtram_info['pmf']
@@ -8508,6 +8542,7 @@ def parse_args(argv=None):
     p.add_argument('--convergence-js-threshold', type=float, default=0.01, help='JS threshold for convergence summary.')
     p.add_argument('--convergence-rmse-threshold', type=float, default=0.10, help='PMF RMSE threshold in kcal/mol for convergence summary.')
     p.add_argument('--convergence-dir', default='convergence', help='Subdirectory under output dir for convergence tables/plots.')
+    p.add_argument('--selected-method', choices=['auto', 'umbrella_only', 'gamd_exponential', 'gamd_cumulant2'], default='auto', help='Force the selected unbiased estimator written to the *_selected/*_unbiased outputs (incl. Ramachandran 2D FES). Default auto = gamd_cumulant2 when a usable boost is present, else umbrella_only. Use to emit each estimator surface separately for cross-estimator comparison.')
     p.add_argument('--dtram', action='store_true', help='Compute an experimental normal discrete TRAM PMF over the main CV bins using per-window transition counts and thermodynamic bias constraints. Does not replace the default selected MBAR/GaMD PMF.')
     p.add_argument('--dtram-2d-fes', action='store_true', help='Also compute experimental 2D dTRAM FES diagnostics for available 2D surfaces (distance-Rg, PCA1-PCA2, CV1-CV2, and chignolin when enabled). Requires --dtram.')
     p.add_argument('--dtram-2d-max-microstates', type=int, default=900, help='Safety limit for 2D dTRAM microstates. For a 30x30 grid this is 900. Increase only if you expect the sparse dTRAM solve to be affordable.')
