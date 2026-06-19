@@ -29,8 +29,8 @@ cv2_k_mode: fixed
 exchange_mode: gibbs-walk
 exchange_interval: 1000
 
-# Full validation: 5 ns/window x 20 windows = 100 ns aggregate (1,250,000 steps/win at 4 fs).
-production_steps: 1250000
+# Validation: 2 ns/window x 20 windows = 40 ns aggregate (500,000 steps/win at 4 fs).
+production_steps: 500000
 report_interval: 5000
 # traj_interval MUST equal the sample cadence (distance_output_interval, default
 # 1000) so each saved frame maps 1:1 to a logged sample for phi/psi reweighting.

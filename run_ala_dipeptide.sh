@@ -11,8 +11,12 @@ mkdir -p "$LOG"
 echo "[1/5] fixture"
 python ala_dipeptide_fixture.py "$ROOT/ace_ala_nme.pdb"
 
-echo "[2/5] reference (unbiased, 100 ns) -> $LOG/reference.log"
-python -m gareus --config ala_dipeptide_reference.yaml > "$LOG/reference.log" 2>&1
+if [ -f "$ROOT/reference/replica_trajectories/replica_000.xtc" ]; then
+  echo "[2/5] reference already present -> skipping"
+else
+  echo "[2/5] reference (unbiased, 100 ns) -> $LOG/reference.log"
+  python -m gareus --config ala_dipeptide_reference.yaml > "$LOG/reference.log" 2>&1
+fi
 
 echo "[3/5] validation (hmr-gamd/REUS 2D, 20x5 ns) -> $LOG/validation.log"
 python -m gareus --config ala_dipeptide_validation.yaml > "$LOG/validation.log" 2>&1
