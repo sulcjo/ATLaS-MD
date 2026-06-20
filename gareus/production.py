@@ -373,7 +373,10 @@ def _gibbs_window_proposal_distribution(
     stay_idx = np.where(valid_windows == wi)[0]
     if stay_idx.size:
         delta[int(stay_idx[0])] = 0.0
-    log_weights = np.clip(-float(beta) * delta, -745.0, 0.0)
+    # No upper clip: true heat-bath weights exp(-β·δ) can exceed 1 for favourable
+    # moves (δ < 0).  The log-sum-exp shift on line ~390 handles overflow.
+    # Lower bound -745 prevents underflow to exact zero (loses that candidate).
+    log_weights = np.clip(-float(beta) * delta, -745.0, 745.0)
     finite = np.isfinite(log_weights)
     if not np.any(finite):
         return {
@@ -1853,12 +1856,25 @@ def write_exchange_tuning_report(out_dir: Path, args, exchange_stats: dict, cent
         acc = int(st.get("accepted", 0) or 0)
         jump_rows.append({"jump_bin": str(key), "attempts": att, "accepted": acc, "acceptance_fraction": acc / max(1, att)})
     recommendations = []
+    is_gibbs = mode == "gibbs-walk"
     if attempts <= 0 and gibbs_choices <= 0:
         recommendations.append("No exchange attempts recorded yet; check --exchange-interval and whether production reached an exchange boundary.")
     elif total_acceptance < 0.08 and attempts > 0:
         recommendations.append("Total Metropolis exchange acceptance is very low; add/refine windows near weak pairs, reduce overly stiff k, or increase overlap targets.")
-    elif total_acceptance > 0.60 and attempts > 0:
+    elif total_acceptance > 0.60 and attempts > 0 and not is_gibbs:
         recommendations.append("Total exchange acceptance is high; the ladder may be over-resolved, so adaptive pruning or more aggressive spacing may reduce replica count.")
+    elif total_acceptance > 0.60 and attempts > 0 and is_gibbs:
+        # High MH acceptance among proposed Gibbs-walk moves is expected: the
+        # heat-bath proposal deliberately favours energetically favourable targets,
+        # so most accepted proposals are downhill.  Over-resolution should be judged
+        # from gibbs_move_fraction (fraction of choices that were actual moves) and
+        # PMF/MBAR diagnostics, not from MH acceptance alone.
+        recommendations.append(
+            "Gibbs-walk MH acceptance among proposed moves is high (>60%). "
+            "This is normal when the heat-bath proposal preferentially selects energetically favourable targets. "
+            "Use gibbs_move_fraction below as the primary health signal; if it is also high (>0.70), "
+            "check MBAR overlap to ensure replicas are not jumping between poorly-overlapping states."
+        )
     else:
         recommendations.append("Overall exchange acceptance is in a workable range; inspect weak local pairs before changing global settings.")
     if weak_pairs:
