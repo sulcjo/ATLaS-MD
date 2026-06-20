@@ -277,7 +277,7 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--ap-final-steps", type=int, default=0,
                    help="Frozen final steps. 0 = reuse production-steps.")
     p.add_argument("--ap-resume", action=argparse.BooleanOptionalAction, default=False,
-                   help="Resume adaptive-production from state_registry.json.")
+                   help="Resume adaptive-production from state_registry.json or epoch checkpoints.")
     p.add_argument("--ap-include-epoch-samples", action=argparse.BooleanOptionalAction,
                    default=False, help="Include epoch samples in post-hoc MBAR.")
     p.add_argument("--ap-write-mbar-inputs", action=argparse.BooleanOptionalAction, default=True)
@@ -1020,7 +1020,7 @@ def run_double_adaptive_auto_loop(args, out_dir: Path, openmm, app, unit, forcef
         prod_args = copy.deepcopy(args)
         prod_args.window_mode = "adaptive-production"
         prod_args.resume = False
-        prod_args.adaptive_production_resume = False
+        prod_args.adaptive_production_resume = True
         prod_args.adaptive_feedback_enabled = False
         prod_args.adaptive_feedback_pilot = False
         prod_args.adaptive_feedback_final_production = False
@@ -1033,7 +1033,7 @@ def run_double_adaptive_auto_loop(args, out_dir: Path, openmm, app, unit, forcef
             "schema_version": "double_adaptive_driver_summary_v1",
             "status": "completed",
             "mode": "double-adaptive",
-            "resume_mode": "feedback_completed_production_fresh",
+            "resume_mode": "feedback_completed_production_resume",
             "adaptive_feedback": feedback_summary,
             "handoff_windows_csv": str(handoff_csv) if handoff_csv is not None else "",
             "adaptive_production": prod_summary,

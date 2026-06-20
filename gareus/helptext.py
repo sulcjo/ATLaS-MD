@@ -723,7 +723,7 @@ Useful controls (v2.0 names):
     --ap-final-pool-fraction           fraction reserved for frozen final
     --ap-min-final-pool-ns             minimum ns reserved for frozen final
     --ap-final-steps                   per-state frozen-final steps (fallback hint)
-    --ap-resume                        resume from state_registry.json
+    --ap-resume                        resume from state_registry.json or epoch checkpoints
     --ap-write-mbar-inputs             post-hoc union-state MBAR arrays
     --ap-run-mbar                      run PyMBAR after final
 
@@ -1105,7 +1105,7 @@ Important controls:
     --ap-epochs                        (max adaptive epochs)
     --ap-epoch-steps                   (per-state epoch steps fallback hint)
     --ap-final-steps                   (per-state frozen-final steps fallback hint)
-    --ap-resume                        (resume from state_registry.json)
+    --ap-resume                        (resume from state_registry.json or epoch checkpoints)
     --ap-target-overlap / --ap-min-exchange
                                        (per-epoch edge health thresholds)
     --ap-write-mbar-inputs / --ap-run-mbar

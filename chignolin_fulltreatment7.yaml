@@ -288,6 +288,8 @@ windows:
   # Prevents run5-class failure where AF stopped after round 1 with a frozen ensemble.
   adaptive_min_rounds: 3               # new pipeline parameter (adaptive_feedback_min_rounds)
 
+  target_overlap: 0.25                 # target neighboring-window histogram overlap (pilot/AF phase); default 0.25
+
   # CV coverage gates: block early-stop if pilot under-samples CV space.
   # Computed from samples.csv before cleanup; uses achievable range from boundary pull.
   pilot_min_cv1_coverage: 0.80        # CV1 (contacts): require 60% of [lo,hi] achievable range sampled
@@ -312,13 +314,15 @@ adaptive_production:
   md_budget_ns: 2000.0               # was 840.0; 2 µs aggregate across all replicas
 
   # Epoch schedule
-  ap_epochs: 8                        # was 5; 8 epochs at 2000 ns gives ~150 ns/epoch aggregate (~10 ns/window at 15 windows); more adaptation checkpoints than 5 with still ample per-epoch statistics
+  ap_epochs: 2                        # was 8; production topup loop collapsed. v00 audit: epochs added <5% CV coverage & adaptive controller froze (extend-all every epoch, weak_edges=22/low_sample=18 constant). 2 epochs at 2000 ns = flat discovery + 1 mid-run MBAR checkpoint.
   # ap_epoch_steps / ap_final_steps: omit to let the code compute from pool balance.
   # Code recomputes epoch budget live at each epoch start: (remaining - final_reserve) / epochs_remaining.
   # With 2000 ns pool: 60% = 1200 ns epochs (8 x ~150 ns each), 40% = 800 ns final.
 
+  ap_target_overlap: 0.25              # target neighboring-window histogram overlap (production epochs); default 0.25
+
   # Final phase
-  ap_final_pool_fraction: 0.40        # was: adaptive_production_final_pool_fraction
+  ap_final_pool_fraction: 0.70        # was 0.40; precision bought in uniform locked-layout final phase (CV2/Ramachandran is slow-converging coordinate). 70% of 2000 ns = 1400 ns final.
   ap_min_final_pool_ns: 300.0         # was: adaptive_production_min_final_pool_ns
   # NOTE: adaptive_production_final_step_budget: 84000000 dropped — auto-inferred same way.
 
