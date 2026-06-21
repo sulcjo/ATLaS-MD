@@ -186,7 +186,7 @@ class AdaptiveDecisionPolicy:
     the machine would prefer to save GPU time by burning correctness first.
     """
 
-    target_overlap: float = 0.25
+    target_overlap: float = 0.30
     min_exchange_acceptance: float = 0.08
     min_samples_for_add: int = 50
     min_samples_for_retire: int = 200
@@ -3357,7 +3357,7 @@ def _arg_float(args: Any, name: str, default: float) -> float:
 
 def policy_from_args(args: Any) -> AdaptiveDecisionPolicy:
     return AdaptiveDecisionPolicy(
-        target_overlap=_arg_float(args, "adaptive_production_target_overlap", _arg_float(args, "adaptive_feedback_target_overlap", 0.25)),
+        target_overlap=_arg_float(args, "adaptive_production_target_overlap", _arg_float(args, "adaptive_feedback_target_overlap", 0.30)),
         min_exchange_acceptance=_arg_float(args, "adaptive_production_min_exchange", 0.08),
         min_samples_for_add=_arg_int(args, "adaptive_production_min_samples", 50),
         min_samples_for_retire=_arg_int(args, "adaptive_production_retire_min_samples", 200),
