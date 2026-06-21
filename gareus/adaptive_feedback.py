@@ -624,7 +624,7 @@ def _adaptive_feedback_axis_proposal(axis_name: str, centers: list[float], sampl
         min_spacing = float(aggr.get("min_new_spacing_A", 0.35)) if not is_secondary else max(0.05, 0.30 * med_spacing)
     target_exchange_acceptance = 0.30
     low_exchange_cut = max(0.01, target_exchange_acceptance - 0.05)
-    minimum_valid_overlap = max(0.05, min(0.15, 0.50 * target_overlap))
+    minimum_valid_overlap = _minimum_valid_overlap(target_overlap)
 
     pair_rows = []
     add_candidates = []
@@ -1046,6 +1046,13 @@ def _adaptive_feedback_2d_sparse_patch_candidates(
         allowed_patches = max_patches
     if adaptive_cap > 0:
         allowed_patches = min(allowed_patches, max(0, adaptive_cap - len(base_rows)))
+    # Honour the explicit total-window/replica budget (--max-total-windows) so
+    # sparse patches cannot grow the final window count past the cap. Without
+    # this, the budget would bound only the factorized base grid and patches
+    # could leak past it. No-op when no total budget is set (max_total == 0).
+    _max_total_windows = int(_adaptive_total_window_limits(args)[1] or 0)
+    if _max_total_windows > 0:
+        allowed_patches = min(allowed_patches, max(0, _max_total_windows - len(base_rows)))
     patch_rows = ranked_patch_rows[:allowed_patches]
     for row in ranked_patch_rows[allowed_patches:]:
         skipped = dict(row)
@@ -1625,6 +1632,23 @@ def _adaptive_feedback_exchange_acceptance(exchange_stats: dict, wi: int, wj: in
     return attempts, accepted, frac
 
 
+def _minimum_valid_overlap(target_overlap: float, aggr: dict | None = None) -> float:
+    """Minimum measured neighbor overlap a pruned/bypassed bridge may retain.
+
+    Raised to a 0.20 band at the default target (was an effective 0.15 ceiling).
+    Aggressive modes may still lower the floor via ``aggr`` overrides, but never
+    below the 0.10 hard minimum implied by the default floor.
+    """
+    aggr = aggr or {}
+    return max(
+        float(aggr.get("minimum_valid_overlap_floor", 0.10)),
+        min(
+            float(aggr.get("minimum_valid_overlap_ceiling", 0.25)),
+            float(aggr.get("minimum_valid_overlap_factor", 2.0 / 3.0)) * float(target_overlap),
+        ),
+    )
+
+
 def _adaptive_feedback_region_key(left_center_a: float, right_center_a: float, bin_width_a: float = 1.0) -> str:
     """Stable-ish key for adaptive memory over a CV region.
 
@@ -1976,10 +2000,7 @@ def run_adaptive_feedback_dispatcher(args, out_dir: Path, centers_a, k_list, exc
     # Minimum statistically supported overlap for a connected, least-replica
     # ladder.  Aggressive modes lower this bound so the optimizer can accept
     # a thinner but still explicitly tested bridge when pruning windows.
-    minimum_valid_overlap = max(
-        float(aggr.get("minimum_valid_overlap_floor", 0.08)),
-        min(float(aggr.get("minimum_valid_overlap_ceiling", 0.15)), float(aggr.get("minimum_valid_overlap_factor", 0.50)) * target_overlap),
-    )
+    minimum_valid_overlap = _minimum_valid_overlap(target_overlap, aggr)
     low_exchange_cut = max(0.01, target_exchange_acceptance - 0.05)
     high_overlap = min(0.95, max(target_overlap + float(aggr.get("high_overlap_offset", 0.25)), float(aggr.get("high_overlap_factor", 1.65)) * target_overlap))
     very_high_overlap = min(0.98, max(target_overlap + float(aggr.get("very_high_overlap_offset", 0.40)), high_overlap + 0.12))
