@@ -9,3 +9,9 @@ def test_dataclass_target_overlap_unified():
 def test_policy_from_args_defaults_to_030_when_unset():
     p = policy_from_args(types.SimpleNamespace())
     assert p.target_overlap == 0.30
+
+
+def test_retire_converged_on_by_default():
+    assert AdaptiveDecisionPolicy().retire_converged is True
+    p = policy_from_args(types.SimpleNamespace())
+    assert p.retire_converged is True

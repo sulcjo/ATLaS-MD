@@ -191,7 +191,7 @@ class AdaptiveDecisionPolicy:
     min_samples_for_add: int = 50
     min_samples_for_retire: int = 200
     max_new_windows_per_epoch: int = 4
-    retire_converged: bool = False
+    retire_converged: bool = True
     max_gamd_boost_sd_kcal_mol: float = 6.0
     duplicate_primary_tol: float = 1.0e-4
     duplicate_secondary_tol: float = 1.0e-4
@@ -3362,7 +3362,7 @@ def policy_from_args(args: Any) -> AdaptiveDecisionPolicy:
         min_samples_for_add=_arg_int(args, "adaptive_production_min_samples", 50),
         min_samples_for_retire=_arg_int(args, "adaptive_production_retire_min_samples", 200),
         max_new_windows_per_epoch=_arg_int(args, "adaptive_production_max_new_windows_per_epoch", 4),
-        retire_converged=_arg_bool(args, "adaptive_production_retire_converged", False),
+        retire_converged=_arg_bool(args, "adaptive_production_retire_converged", True),
         max_gamd_boost_sd_kcal_mol=_arg_float(args, "adaptive_production_max_gamd_boost_sd_kcal_mol", 6.0),
         final_connectivity_required=_arg_bool(args, "adaptive_production_final_connectivity_required", True),
         final_min_samples_per_state=_arg_int(args, "adaptive_production_final_min_samples_per_state", 100),
