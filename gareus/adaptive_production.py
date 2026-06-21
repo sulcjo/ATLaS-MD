@@ -1350,6 +1350,7 @@ def build_union_state_mbar_inputs(
     registry: WindowStateRegistry,
     *,
     include_epochs: bool = True,
+    pilot_dirs: "List[Path] | None" = None,
     output_prefix: str = "adaptive_union_mbar",
 ) -> Dict[str, Any]:
     """Build post-hoc bias matrices over the union of registry states.
@@ -1381,7 +1382,7 @@ def build_union_state_mbar_inputs(
     ], dtype=np.float64)
 
     sample_rows: List[Dict[str, Any]] = []
-    for source_label, sample_dir in _epoch_sample_sources(adaptive_dir, include_epochs=include_epochs):
+    for source_label, sample_dir in _epoch_sample_sources(adaptive_dir, include_epochs=include_epochs, pilot_dirs=pilot_dirs):
         rows = _read_sample_dicts(sample_dir)
         if not rows:
             continue
@@ -4010,10 +4011,16 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
     union_analysis = None
     if _arg_bool(args, "adaptive_production_write_union_mbar_inputs", True):
         try:
+            _pilot_dirs = [Path(p) for p in (getattr(args, "adaptive_production_pilot_sample_dirs", None) or [])]
+            if not _pilot_dirs:
+                # double-adaptive: feedback pilot round dirs are siblings of
+                # adaptive_dir under out_dir; include them so no pilot ns is discarded.
+                _pilot_dirs = sorted(Path(out_dir).glob("adaptive_feedback_round_*"))
             union_inputs = build_union_state_mbar_inputs(
                 adaptive_dir,
                 registry,
                 include_epochs=use_epoch_samples_for_mbar,
+                pilot_dirs=_pilot_dirs,
                 output_prefix="adaptive_union_mbar",
             )
         except Exception as exc:
