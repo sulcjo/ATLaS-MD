@@ -227,6 +227,7 @@ class AdaptiveDecisionPolicy:
     context_reuse: bool = False
     context_reuse_require: bool = False
     context_reuse_mode: str = "off"
+    redundant_overlap: float = 0.45
 
 
 class WindowStateRegistry:
@@ -2094,28 +2095,37 @@ def propose_actions_from_diagnostics(registry: WindowStateRegistry, diagnostics:
         actions.append(("add", int(s1.state_id), params, reason))
         added += 1
 
-    # 2. Optionally retire clearly converged non-critical states.  Disabled by
-    # default in the policy because graph-safe retirement needs conservative use.
+    # 2. Optionally retire clearly converged non-critical states.  Only reclaim
+    # windows that are genuinely redundant (measured overlap >= redundant_overlap).
     if bool(policy.retire_converged):
         graph_critical = _graph_articulation_states(registry)
         bad_touching = set()
+        state_max_overlap: Dict[int, float] = {}
         for edge in edge_rows:
-            if edge.get("overlap") is None or float(edge.get("overlap") or 0.0) < float(policy.target_overlap):
+            ov = edge.get("overlap")
+            if ov is None or float(ov) < float(policy.target_overlap):
                 bad_touching.add(int(edge["state_i"])); bad_touching.add(int(edge["state_j"]))
             acc = edge.get("exchange_acceptance")
             if acc is not None and float(acc) < float(policy.min_exchange_acceptance):
                 bad_touching.add(int(edge["state_i"])); bad_touching.add(int(edge["state_j"]))
+            if ov is not None:
+                for key in ("state_i", "state_j"):
+                    s = int(edge[key])
+                    state_max_overlap[s] = max(state_max_overlap.get(s, 0.0), float(ov))
         for state in registry.active_states():
             sid = int(state.state_id)
             diag = state_rows.get(sid, {})
             if sid in graph_critical or sid in bad_touching:
+                continue
+            # only reclaim genuinely redundant (over-overlapped) windows
+            if float(state_max_overlap.get(sid, 0.0)) < float(policy.redundant_overlap):
                 continue
             if int(diag.get("sample_count", 0) or 0) < int(policy.min_samples_for_retire):
                 continue
             bsd = diag.get("gamd_boost_sd_kcal_mol")
             if bsd is not None and float(bsd) > float(policy.max_gamd_boost_sd_kcal_mol):
                 continue
-            actions.append(("retire", sid, "converged and non-critical under conservative policy"))
+            actions.append(("retire", sid, "redundant (over-overlapped) and non-critical"))
 
     # 3. Explicitly record extensions for states that are obviously undersampled.
     action_keys = {(a[0], a[1]) for a in actions if len(a) > 1}
@@ -3392,6 +3402,7 @@ def policy_from_args(args: Any) -> AdaptiveDecisionPolicy:
         context_reuse=_arg_bool(args, "adaptive_production_context_reuse", False),
         context_reuse_require=_arg_bool(args, "adaptive_production_context_reuse_require", False),
         context_reuse_mode=str(getattr(args, "adaptive_production_context_reuse_mode", "off") or "off"),
+        redundant_overlap=_arg_float(args, "adaptive_production_redundant_overlap", 0.45),
     )
 
 
