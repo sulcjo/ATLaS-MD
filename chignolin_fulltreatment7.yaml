@@ -211,7 +211,7 @@ cvs:
   cv1: contacts
   cv2: rama-map
   # NOTE: adaptive-min/max-total-windows from old cvs block dropped in v2.
-  # contact_adaptive_max_total_windows: 16 is no longer settable; replica count uncapped.
+  # Total replica budget is settable again via windows.max_total_windows (below).
 
 contact_cv:
   # Contact physics (CV-specific)
@@ -225,7 +225,7 @@ contact_cv:
   # CV1 adaptive (unified; was contact_adaptive_*)
   cv1_range_min: 0.0             # was: contact_adaptive_min
   #cv1_range_max: 0.6             # was: contact_adaptive_max
-  cv1_target_spacing: 0.05       # was: contact_adaptive_target_spacing + adaptive_target_spacing_a
+  cv1_target_spacing: 0.10  # was: contact_adaptive_target_spacing + adaptive_target_spacing_a
   cv1_k_min: 50.0                # was: contact_adaptive_min_k_kcal
   cv1_k_max: 250.0               # was: contact_adaptive_max_k_kcal
 
@@ -257,7 +257,7 @@ cv2:
   # The default gap between beta(-1.0) and PPII(-0.333) is 0.667 CV2 units —
   # too large for MBAR overlap (poor reweighting across this transition).
   # Applicable to any peptide using cv2: rama-map, not chignolin-specific.
-  cv2_centers: [-1.0, -0.7, -0.333, 0.0, 0.333, 1.0]
+  cv2_centers: [-1.0, -0.333, 0.333, 1.0]
 
 starting_structures:
   seed_conformers_dir: chignolin_genpept_7
@@ -276,6 +276,7 @@ windows:
   adaptive_rounds: 5                  # was: adaptive_feedback_rounds
   sparse_2d: true                     # was: sparse_2d_patches_enabled + contact_sparse_2d_patches_enabled
   max_2d_patches: 32                  # was: adaptive_2d_max_local_patches
+  max_total_windows: 12      # principled total replica/window cap (CV1xCV2); adaptive thins both axes to honour it. 0=uncapped.
   explicit_2d_window_schema: generic
   region_memory: true                 # was: adaptive_feedback_region_state_enabled
   region_memory_decay: 0.5            # was: adaptive_feedback_region_memory_decay
@@ -357,11 +358,13 @@ explicit_2d_windows:
 output:
   seq: GYDPETGTWG
   out: chignolin_2d_run7
-  traj_interval: 50
-  report_interval: 50
-  distance_output_interval: 50
+  traj_interval: 150
+  report_interval: 150
+  distance_output_interval: 150
   parquet_flush_rows: 200000             # was 5000; 200k rows/chunk ~= 13 ns/chunk at 15 windows/50-step interval → far fewer parquet parts
   traj_format: xtc
+  traj_solute_only: true
+  sample_potential_energy: false
   # Dropped: progress_update_interval_sec — hardcoded internally.
 
 platform:

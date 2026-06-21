@@ -77,13 +77,15 @@ output:
   out: chignolin_2d_fix/
   scratchdir: $SCRATCH
   resume: false
-  traj_interval: 50
-  report_interval: 50
-  distance_output_interval: 50
+  traj_interval: 150
+  report_interval: 150
+  distance_output_interval: 150
   checkpoint_interval: 50000
   progress_mode: both
   progress_update_interval_sec: 10.0
   traj_format: xtc
+  traj_solute_only: true
+  sample_potential_energy: false
 
 platform:
   cpu_threads: 1

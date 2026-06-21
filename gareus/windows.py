@@ -409,11 +409,18 @@ def _axis_count_bounds_from_total_window_budget(
     axis_max = int(math.floor(float(max_total) / float(n_secondary))) if max_total > 0 else legacy_max_axis
     axis_min = max(2, axis_min)
     axis_max = max(2, axis_max)
+    # An explicit max-total budget overrides the soft legacy per-axis minimum: when
+    # the user asks for fewer total replicas than the legacy floor would allow and
+    # has NOT set an explicit min-total, let the axis shrink to what the budget
+    # permits (never below the hard floor of 2 needed for a rectangular grid /
+    # MBAR overlap) instead of raising.
+    if max_total > 0 and min_total <= 0 and axis_min > axis_max:
+        axis_min = max(2, axis_max)
     if axis_min > axis_max:
         raise ValueError(
             f"No rectangular 2D grid can satisfy total window budget min={min_total}, max={max_total} "
             f"with {n_secondary} secondary centers: {label}-axis bounds would be {axis_min}>{axis_max}. "
-            "Adjust total min/max or the number of secondary CV centers."
+            f"Need max_total >= 2*{n_secondary} = {2*n_secondary}; reduce --cv2-centers or raise --max-total-windows."
         )
     return axis_min, axis_max, {
         "enabled": True,

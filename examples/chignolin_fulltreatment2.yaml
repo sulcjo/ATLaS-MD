@@ -173,11 +173,13 @@ explicit_2d_windows:
 
 output:
   out: chignolin_2d_newpackage/
-  traj_interval: 50
-  report_interval: 50
-  distance_output_interval: 50
+  traj_interval: 150
+  report_interval: 150
+  distance_output_interval: 150
   progress_update_interval_sec: 30.0
   traj_format: xtc
+  traj_solute_only: true
+  sample_potential_energy: false
 
 platform:
   platform: CUDA

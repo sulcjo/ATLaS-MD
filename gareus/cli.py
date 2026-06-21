@@ -197,6 +197,14 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                    help="Enable sparse local 2D midpoint patches during adaptive-feedback.")
     p.add_argument("--max-2d-patches", type=int, default=12,
                    help="Max sparse 2D patch windows per adaptive-feedback proposal.")
+    p.add_argument("--max-total-windows", type=int, default=0,
+                   help="Hard cap on TOTAL umbrella windows/replicas across the 2D CV1xCV2 grid "
+                        "(0 = uncapped). Adaptive generation thins BOTH axes (axis_max = "
+                        "floor(max_total / N_cv2_centers)) to honour this budget instead of growing "
+                        "replicas unbounded. Requires max_total >= 2*N_cv2_centers; reduce "
+                        "--cv2-centers if the cap is too small for the secondary axis.")
+    p.add_argument("--min-total-windows", type=int, default=0,
+                   help="Minimum TOTAL umbrella windows/replicas across the 2D grid (0 = no floor).")
 
     # Delaunay-feedback window placement
     p.add_argument("--delaunay-after-round", type=int, default=0,
@@ -611,15 +619,22 @@ def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
     args.contact_frontier_unreachable_deficit = 0.08
     args.contact_frontier_by_secondary_slice = True
 
-    # Dropped legacy window count bounds
+    # Dropped legacy per-axis window count bounds (still used as fallbacks when no
+    # total-window budget is set).
     args.adaptive_min_windows = 4
     args.adaptive_max_windows = 32
     args.contact_adaptive_min_windows = 4
     args.contact_adaptive_max_windows = 12
-    args.adaptive_min_total_windows = 0
-    args.adaptive_max_total_windows = 0
-    args.contact_adaptive_min_total_windows = 0
-    args.contact_adaptive_max_total_windows = 0
+    # Total-window/replica budget — user-settable via --max-total-windows /
+    # --min-total-windows (mapped onto both the generic and contact-CV budget
+    # attrs that gareus.windows consumes). 0 = uncapped. This lets adaptive
+    # generation honour an overall replica budget instead of growing unbounded.
+    _min_total_windows = int(getattr(args, "min_total_windows", 0) or 0)
+    _max_total_windows = int(getattr(args, "max_total_windows", 0) or 0)
+    args.adaptive_min_total_windows = _min_total_windows
+    args.adaptive_max_total_windows = _max_total_windows
+    args.contact_adaptive_min_total_windows = _min_total_windows
+    args.contact_adaptive_max_total_windows = _max_total_windows
     args.n_windows = 0
     args.adaptive_compact_floor_a = 3.5
     args.adaptive_extension_fraction = 0.95
