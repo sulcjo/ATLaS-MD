@@ -11,6 +11,7 @@ from gareus.adaptive_production import (
     propose_actions_from_diagnostics,
     _apply_registry_actions,
     active_graph_connected,
+    build_geometry_edges,
 )
 
 
@@ -70,3 +71,27 @@ def test_non_redundant_chain_is_not_thinned():
     assert not any(a[0] == "retire" for a in actions)
     assert active_graph_connected(reg)
     assert len(reg.active_state_ids()) == len(ids)
+
+
+def test_2d_multi_retire_never_disconnects():
+    # 2D square: every window redundant + healthy. In a cyclic geometry graph,
+    # co-retiring opposite corners could disconnect it. The greedy connectivity-safe
+    # gate must refuse enough drops to keep the active graph connected and non-empty,
+    # even though each node is individually a non-articulation, redundant candidate.
+    reg = WindowStateRegistry()
+    for (p, s) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]:
+        reg.add_state(primary_center=p, primary_k=10.0,
+                      secondary_center=s, secondary_k=10.0, epoch=0, source="seed")
+    ids = reg.active_state_ids()
+    states = [{"state_id": s, "sample_count": 500, "gamd_boost_sd_kcal_mol": 1.0} for s in ids]
+    # mark every actual geometry edge as highly redundant + healthy
+    edges = [{"state_i": a, "state_j": b, "overlap": 0.60, "exchange_acceptance": 0.6}
+             for (a, b, _t, _n) in build_geometry_edges(reg)]
+    pol = AdaptiveDecisionPolicy(retire_converged=True)
+    actions = propose_actions_from_diagnostics(reg, {"states": states, "edges": edges}, pol)
+
+    retires = [a for a in actions if a[0] == "retire"]
+    _apply_registry_actions(reg, retires, epoch=1)
+
+    assert active_graph_connected(reg)            # INVARIANT: never disconnect
+    assert len(reg.active_state_ids()) >= 1       # never empties the graph

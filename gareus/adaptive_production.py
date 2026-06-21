@@ -2140,6 +2140,7 @@ def propose_actions_from_diagnostics(registry: WindowStateRegistry, diagnostics:
                 for key in ("state_i", "state_j"):
                     s = int(edge[key])
                     state_max_overlap[s] = max(state_max_overlap.get(s, 0.0), float(ov))
+        retire_candidates: List[int] = []
         for state in registry.active_states():
             sid = int(state.state_id)
             diag = state_rows.get(sid, {})
@@ -2153,6 +2154,31 @@ def propose_actions_from_diagnostics(registry: WindowStateRegistry, diagnostics:
             bsd = diag.get("gamd_boost_sd_kcal_mol")
             if bsd is not None and float(bsd) > float(policy.max_gamd_boost_sd_kcal_mol):
                 continue
+            retire_candidates.append(sid)
+        # Single-node articulation exclusion is necessary but NOT sufficient: in a
+        # cyclic (2D) geometry graph, co-retiring two individually-safe non-articulation
+        # nodes can disconnect the graph. Admit retirements greedily (most-redundant
+        # first), re-checking connectivity on the trial-reduced graph and REFUSING +
+        # logging any drop that would disconnect. Restore active flags before returning
+        # (retirement is applied later by _apply_registry_actions), so this function
+        # leaves the registry unmutated.
+        retire_candidates.sort(key=lambda s: float(state_max_overlap.get(s, 0.0)), reverse=True)
+        admitted: List[int] = []
+        for sid in retire_candidates:
+            st = registry.get_state(sid)
+            if st is None:
+                continue
+            st.active = False
+            if active_graph_connected(registry):
+                admitted.append(sid)  # keep tentatively removed so the next check is cumulative
+            else:
+                st.active = True  # refuse this drop; it would disconnect the active graph
+                logger.warning(
+                    "adaptive-production: refused retirement of state %s — would disconnect "
+                    "the active window graph", sid
+                )
+        for sid in admitted:
+            registry.get_state(sid).active = True  # restore; apply step performs the real retire
             actions.append(("retire", sid, "redundant (over-overlapped) and non-critical"))
 
     # 3. Explicitly record extensions for states that are obviously undersampled.
@@ -3459,7 +3485,7 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
     # the scheduled-epoch path which needs a default_steps before the loop.
     epoch_steps = int(_explicit_epoch_steps) if _explicit_epoch_steps > 0 else _gamd_fallback
     final_steps = int(_explicit_final_steps) if _explicit_final_steps > 0 else _gamd_fallback
-    use_epoch_samples_for_mbar = _arg_bool(args, "adaptive_production_use_epoch_samples_for_mbar", False)
+    use_epoch_samples_for_mbar = _arg_bool(args, "adaptive_production_use_epoch_samples_for_mbar", True)
     global_shared_gamd_dir: Optional[Path] = None
     if _arg_bool(args, "adaptive_production_global_shared_gamd", True):
         requested_shared_dir = str(getattr(args, "shared_gamd_setup_dir", "") or "").strip()
@@ -4011,11 +4037,18 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
     union_analysis = None
     if _arg_bool(args, "adaptive_production_write_union_mbar_inputs", True):
         try:
+            # Pilot pooling is OPT-IN only. Adaptive-feedback pilot windows are NOT
+            # registry states and pilot round dirs carry no epoch_window_map.csv, so
+            # auto-pooling them would misattribute samples to the wrong MBAR states
+            # and corrupt N_k. Only pool explicitly-provided pilot dirs (which must
+            # carry a valid window map); see spec B4 (pilot pooling is a stretch).
             _pilot_dirs = [Path(p) for p in (getattr(args, "adaptive_production_pilot_sample_dirs", None) or [])]
-            if not _pilot_dirs:
-                # double-adaptive: feedback pilot round dirs are siblings of
-                # adaptive_dir under out_dir; include them so no pilot ns is discarded.
-                _pilot_dirs = sorted(Path(out_dir).glob("adaptive_feedback_round_*"))
+            if _pilot_dirs:
+                print(
+                    "WARNING: pooling explicit pilot dirs into union MBAR — each MUST carry "
+                    "an epoch_window_map.csv matching the registry states, or samples will be "
+                    "misattributed."
+                )
             union_inputs = build_union_state_mbar_inputs(
                 adaptive_dir,
                 registry,
