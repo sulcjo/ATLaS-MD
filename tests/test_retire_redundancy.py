@@ -25,7 +25,7 @@ def test_non_redundant_state_is_not_retired():
         {"state_i": ids[0], "state_j": ids[1], "overlap": 0.30, "exchange_acceptance": 0.5},
         {"state_i": ids[1], "state_j": ids[2], "overlap": 0.30, "exchange_acceptance": 0.5},
     ]
-    pol = AdaptiveDecisionPolicy(retire_converged=True)
+    pol = AdaptiveDecisionPolicy(retire_converged=True, min_active_states=0)
     actions = propose_actions_from_diagnostics(reg, _diag(states, edges), pol)
     assert not any(a[0] == "retire" for a in actions)
 
@@ -42,7 +42,7 @@ def test_redundant_non_articulation_endpoint_is_retired():
         {"state_i": ids[0], "state_j": ids[1], "overlap": 0.30, "exchange_acceptance": 0.4},
         {"state_i": ids[1], "state_j": ids[2], "overlap": 0.60, "exchange_acceptance": 0.6},
     ]
-    pol = AdaptiveDecisionPolicy(retire_converged=True)
+    pol = AdaptiveDecisionPolicy(retire_converged=True, min_active_states=0)
     actions = propose_actions_from_diagnostics(reg, _diag(states, edges), pol)
     assert any(a[0] == "retire" and a[1] == ids[2] for a in actions)
     # The non-redundant endpoint (ids[0], overlap 0.30) must NOT be retired

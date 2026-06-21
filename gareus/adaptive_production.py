@@ -228,6 +228,7 @@ class AdaptiveDecisionPolicy:
     context_reuse_require: bool = False
     context_reuse_mode: str = "off"
     redundant_overlap: float = 0.45
+    min_active_states: int = 8
 
 
 class WindowStateRegistry:
@@ -2163,8 +2164,19 @@ def propose_actions_from_diagnostics(registry: WindowStateRegistry, diagnostics:
         # (retirement is applied later by _apply_registry_actions), so this function
         # leaves the registry unmutated.
         retire_candidates.sort(key=lambda s: float(state_max_overlap.get(s, 0.0)), reverse=True)
+        # Hard minimum-replica floor: never retire the active set below
+        # policy.min_active_states (default 8), independent of how many windows are
+        # redundant. Snapshot the count before any tentative removal.
+        min_active = max(0, int(getattr(policy, "min_active_states", 0)))
+        n_active_start = len(registry.active_state_ids())
         admitted: List[int] = []
         for sid in retire_candidates:
+            if n_active_start - len(admitted) - 1 < min_active:
+                logger.info(
+                    "adaptive-production: min_active_states floor (%d) reached; keeping the "
+                    "remaining redundant window(s)", min_active
+                )
+                break
             st = registry.get_state(sid)
             if st is None:
                 continue
@@ -3457,6 +3469,7 @@ def policy_from_args(args: Any) -> AdaptiveDecisionPolicy:
         context_reuse_require=_arg_bool(args, "adaptive_production_context_reuse_require", False),
         context_reuse_mode=str(getattr(args, "adaptive_production_context_reuse_mode", "off") or "off"),
         redundant_overlap=_arg_float(args, "adaptive_production_redundant_overlap", 0.45),
+        min_active_states=_arg_int(args, "adaptive_production_min_active_states", _arg_int(args, "min_total_windows", 0) or 8),
     )
 
 

@@ -38,7 +38,7 @@ def test_retirement_keeps_graph_connected_and_reclaims():
         {"state_i": ids[2], "state_j": ids[3], "overlap": 0.40, "exchange_acceptance": 0.5},
         {"state_i": ids[3], "state_j": ids[4], "overlap": 0.60, "exchange_acceptance": 0.6},
     ]
-    pol = AdaptiveDecisionPolicy(retire_converged=True)
+    pol = AdaptiveDecisionPolicy(retire_converged=True, min_active_states=0)
     actions = propose_actions_from_diagnostics(reg, {"states": states, "edges": edges}, pol)
 
     retires = [a for a in actions if a[0] == "retire"]
@@ -66,7 +66,7 @@ def test_non_redundant_chain_is_not_thinned():
         {"state_i": ids[1], "state_j": ids[2], "overlap": 0.35, "exchange_acceptance": 0.5},
         {"state_i": ids[2], "state_j": ids[3], "overlap": 0.33, "exchange_acceptance": 0.5},
     ]
-    pol = AdaptiveDecisionPolicy(retire_converged=True)
+    pol = AdaptiveDecisionPolicy(retire_converged=True, min_active_states=0)
     actions = propose_actions_from_diagnostics(reg, {"states": states, "edges": edges}, pol)
     assert not any(a[0] == "retire" for a in actions)
     assert active_graph_connected(reg)
@@ -87,7 +87,7 @@ def test_2d_multi_retire_never_disconnects():
     # mark every actual geometry edge as highly redundant + healthy
     edges = [{"state_i": a, "state_j": b, "overlap": 0.60, "exchange_acceptance": 0.6}
              for (a, b, _t, _n) in build_geometry_edges(reg)]
-    pol = AdaptiveDecisionPolicy(retire_converged=True)
+    pol = AdaptiveDecisionPolicy(retire_converged=True, min_active_states=0)
     actions = propose_actions_from_diagnostics(reg, {"states": states, "edges": edges}, pol)
 
     retires = [a for a in actions if a[0] == "retire"]
@@ -95,3 +95,33 @@ def test_2d_multi_retire_never_disconnects():
 
     assert active_graph_connected(reg)            # INVARIANT: never disconnect
     assert len(reg.active_state_ids()) >= 1       # never empties the graph
+
+
+def _redundant_chain(n):
+    # 1D chain of n windows where every neighbor edge is over-overlapped (>=0.45)
+    reg = _registry(n)
+    ids = reg.active_state_ids()
+    states = [{"state_id": s, "sample_count": 500, "gamd_boost_sd_kcal_mol": 1.0} for s in ids]
+    edges = [{"state_i": ids[i], "state_j": ids[i + 1], "overlap": 0.60, "exchange_acceptance": 0.6}
+             for i in range(n - 1)]
+    return reg, ids, {"states": states, "edges": edges}
+
+
+def test_min_active_states_floor_blocks_retirement_at_floor():
+    # floor == current count -> nothing may retire even though all windows are redundant
+    reg, ids, diag = _redundant_chain(5)
+    pol = AdaptiveDecisionPolicy(retire_converged=True, min_active_states=5)
+    actions = propose_actions_from_diagnostics(reg, diag, pol)
+    assert not any(a[0] == "retire" for a in actions)
+    _apply_registry_actions(reg, [a for a in actions if a[0] == "retire"], epoch=1)
+    assert len(reg.active_state_ids()) == 5
+
+
+def test_min_active_states_floor_caps_retirement():
+    # floor = count-1 -> at most one redundant window may be retired
+    reg, ids, diag = _redundant_chain(5)
+    pol = AdaptiveDecisionPolicy(retire_converged=True, min_active_states=4)
+    actions = propose_actions_from_diagnostics(reg, diag, pol)
+    _apply_registry_actions(reg, [a for a in actions if a[0] == "retire"], epoch=1)
+    assert len(reg.active_state_ids()) >= 4
+    assert active_graph_connected(reg)
