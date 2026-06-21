@@ -254,20 +254,25 @@ def test_collect_epoch_diagnostics_reads_parquet_outputs(tmp_path: Path) -> None
 
 
 def test_build_union_state_mbar_inputs_reads_parquet_final(tmp_path: Path) -> None:
-    """Union-state MBAR input builder must consume final/samples/*.parquet."""
+    """Union-state MBAR input builder must consume final/samples/*.parquet.
+
+    Subsampling (equilibration-discard + autocorrelation) is applied per state
+    so n_samples may be <= raw row count; matrices must remain shape-consistent.
+    """
     window_csv = _write_window_csv(tmp_path / "windows.csv", n_windows=N_WINDOWS)
     registry = registry_from_window_csv(window_csv, epoch=0, source="test")
 
     adaptive_dir = tmp_path / "adaptive"
-    expected_rows = _write_parquet_epoch_run(adaptive_dir / "final", n_windows=N_WINDOWS, rows_per_window=10)
+    raw_rows = _write_parquet_epoch_run(adaptive_dir / "final", n_windows=N_WINDOWS, rows_per_window=10)
 
     meta = build_union_state_mbar_inputs(adaptive_dir, registry)
 
-    assert int(meta["n_samples"]) == expected_rows
+    n_samples = int(meta["n_samples"])
+    assert 0 < n_samples <= raw_rows
     assert int(meta["n_states"]) == N_WINDOWS
     with np.load(meta["arrays_npz"], allow_pickle=False) as data:
-        assert data["cv_A"].shape == (expected_rows,)
-        assert data["umbrella_reduced_bias_nk"].shape == (expected_rows, N_WINDOWS)
+        assert data["cv_A"].shape == (n_samples,)
+        assert data["umbrella_reduced_bias_nk"].shape == (n_samples, N_WINDOWS)
         assert np.isfinite(data["umbrella_reduced_bias_nk"]).all()
 
 

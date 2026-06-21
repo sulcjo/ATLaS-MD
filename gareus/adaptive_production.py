@@ -1325,9 +1325,16 @@ def _sample_sources_from_run_root(label: str, run_dir: Path) -> List[Tuple[str, 
     return out
 
 
-def _epoch_sample_sources(adaptive_dir: Path, include_epochs: bool) -> List[Tuple[str, Path]]:
+def _epoch_sample_sources(
+    adaptive_dir: Path,
+    include_epochs: bool,
+    *,
+    pilot_dirs: "List[Path] | None" = None,
+) -> List[Tuple[str, Path]]:
     adaptive_dir = Path(adaptive_dir)
     sources: List[Tuple[str, Path]] = []
+    for pilot in (pilot_dirs or []):
+        sources.extend(_sample_sources_from_run_root(f"pilot::{Path(pilot).name}", Path(pilot)))
     if include_epochs:
         for epoch_dir in sorted(adaptive_dir.glob("epoch_[0-9][0-9][0-9]")):
             sources.extend(_sample_sources_from_run_root(epoch_dir.name, epoch_dir))
@@ -1342,7 +1349,7 @@ def build_union_state_mbar_inputs(
     adaptive_dir: Path,
     registry: WindowStateRegistry,
     *,
-    include_epochs: bool = False,
+    include_epochs: bool = True,
     output_prefix: str = "adaptive_union_mbar",
 ) -> Dict[str, Any]:
     """Build post-hoc bias matrices over the union of registry states.
@@ -1404,6 +1411,25 @@ def build_union_state_mbar_inputs(
 
     if not sample_rows:
         raise RuntimeError(f"no usable sample rows found under {adaptive_dir}")
+
+    # Per-state equilibration-discard + autocorrelation subsampling.
+    # Group row indices by sampled_state_id, thin each group's cv_A trace with
+    # equilibrated_subsample_indices, then rebuild sample_rows from kept indices.
+    # All downstream numpy arrays are derived from sample_rows so alignment is
+    # preserved automatically.
+    from .mbar_subsample import equilibrated_subsample_indices as _esi  # noqa: PLC0415
+    _state_to_indices: Dict[int, List[int]] = {}
+    for _gi, _row in enumerate(sample_rows):
+        _sid = int(_row["sampled_state_id"])
+        _state_to_indices.setdefault(_sid, []).append(_gi)
+    _kept_global: List[int] = []
+    _subsample_counts: Dict[str, Any] = {}
+    for _sid, _idx_list in _state_to_indices.items():
+        _trace = np.asarray([float(sample_rows[i]["cv_A"]) for i in _idx_list], dtype=np.float64)
+        _keep = _esi(_trace)
+        _kept_global.extend(_idx_list[k] for k in _keep.tolist())
+        _subsample_counts[str(_sid)] = {"raw": len(_idx_list), "kept": int(len(_keep))}
+    sample_rows = [sample_rows[i] for i in sorted(_kept_global)]
 
     cv_values = np.asarray([float(r["cv_A"]) for r in sample_rows], dtype=np.float64)
     secondary_values = np.asarray([
@@ -1479,6 +1505,7 @@ def build_union_state_mbar_inputs(
         "arrays_npz": str(npz_path),
         "matrix_shape_convention": "sample-major [n_samples, n_states]; transpose to u_kn if PyMBAR expects [K,N]",
         "note": "Biases are reconstructed post-hoc from scalar CV traces against the union of registry states. Final-only samples are the conservative default.",
+        "subsample_counts_per_state": _subsample_counts,
     }
     json_path = out_prefix.with_suffix(".json")
     write_json(json_path, _json_ready(meta))
