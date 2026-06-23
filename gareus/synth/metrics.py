@@ -179,14 +179,23 @@ def _mbar_weights(windows, samples_by_window, *, beta: float = 1.0,
 
 
 def pmf_recovery(landscape, samples_by_window, windows, *, axis: str = "cv1",
-                 res: int = 120, beta: float = 1.0) -> dict:
+                 res: int = 120, beta: float = 1.0, max_per_window=None) -> dict:
     """Per-sample MBAR-reweighted PMF estimate vs the true marginal PMF.
 
     ``windows`` must be a mapping ``{window_index: Window}`` aligned with
     ``samples_by_window`` so the applied umbrella bias can be removed.  Returns
     ``rmse_kbt`` / ``js`` / ``rmse_lowf_weighted`` on the explored support.
+
+    ``max_per_window`` (optional) strides each window's samples down to this many
+    before the MBAR fixed point — a cost guard for very deep sampling (MBAR is
+    well-converged at a few thousand per window); the harness's decision metrics
+    still use the full sets.
     """
     x_ref, pmf_ref = reference_pmf(landscape, axis=axis, res=res)
+    if max_per_window is not None:
+        from .ess import thin_to_ess
+        samples_by_window = {k: thin_to_ess(np.asarray(v, float), int(max_per_window))
+                             for k, v in samples_by_window.items()}
     pooled, log_w = _mbar_weights(windows, samples_by_window, beta=beta)
     if pooled.shape[0] == 0:
         return {"rmse_kbt": float("nan"), "js": float("nan"),
@@ -258,7 +267,7 @@ def dispatcher_overlap_from_samples(samples_by_window, windows, *, bins: int = 8
 
 
 def campaign_metrics(landscape, records, *, target: float = 0.30, res: int = 120,
-                     samples_by_window=None, windows=None) -> dict:
+                     samples_by_window=None, windows=None, max_per_window=None) -> dict:
     last = records[-1]
     out = {
         "final_overlap": final_overlap_vs_target(landscape, last, target=target, res=res),
@@ -271,6 +280,7 @@ def campaign_metrics(landscape, records, *, target: float = 0.30, res: int = 120
         "converged": bool(last.converged),
     }
     if samples_by_window is not None and windows is not None:
-        out["pmf_recovery"] = pmf_recovery(landscape, samples_by_window, windows, res=res)
+        out["pmf_recovery"] = pmf_recovery(landscape, samples_by_window, windows, res=res,
+                                           max_per_window=max_per_window)
         out["dispatcher_overlap"] = dispatcher_overlap_from_samples(samples_by_window, windows)
     return out

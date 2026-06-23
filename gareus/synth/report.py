@@ -41,12 +41,33 @@ def _recovered_fes_2d(landscape, samples_by_window, windows, res=80, beta=1.0):
     return 0.5 * (b1[:-1] + b1[1:]), 0.5 * (b2[:-1] + b2[1:]), f, explored
 
 
+def _smooth(a, sigma=1.0):
+    """Light Gaussian smoothing that ignores NaNs (for nicer recovered-FES/error maps)."""
+    try:
+        from scipy.ndimage import gaussian_filter
+    except Exception:
+        return a
+    m = np.isfinite(a)
+    if not m.any():
+        return a
+    filled = np.where(m, a, 0.0)
+    sm = gaussian_filter(filled, sigma)
+    norm = gaussian_filter(m.astype(float), sigma)
+    out = np.where(norm > 1e-6, sm / np.maximum(norm, 1e-6), np.nan)
+    out[~m] = np.nan
+    return out
+
+
 def plot_cv_space(landscape: Landscape, samples_by_window: dict, windows: dict,
-                  out_path, *, res: int = 100, title: str = None) -> Path:
+                  out_path, *, res: int = 100, rec_res: int = 70,
+                  smooth: bool = True, title: str = None) -> Path:
     """2x2 CV1xCV2 panel: true FES + windows, explored density, recovered FES, error.
 
     ``samples_by_window`` / ``windows`` are dicts keyed by window index
-    (windows[i] is a Window). Returns the written PNG path.
+    (windows[i] is a Window). ``res`` sets the true-FES contour resolution,
+    ``rec_res`` the MBAR-recovered grid (coarser = denser per bin = smoother),
+    ``smooth`` applies NaN-aware Gaussian smoothing to the recovered/error maps.
+    Returns the written PNG path.
     """
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -86,9 +107,12 @@ def plot_cv_space(landscape: Landscape, samples_by_window: dict, windows: dict,
 
     # (c) MBAR-recovered 2D FES
     ax = axes[1, 0]
-    rc1, rc2, fest, explored = _recovered_fes_2d(landscape, samples_by_window, windows, res=80)
+    rc1, rc2, fest, explored = _recovered_fes_2d(landscape, samples_by_window, windows, res=rec_res)
+    if smooth:
+        fest = _smooth(fest, 1.0)
     vmax = float(np.nanmax(fest)) if np.any(np.isfinite(fest)) else 1.0
     cf3 = ax.contourf(rc1, rc2, np.ma.masked_invalid(fest.T), levels=24, cmap="viridis", vmin=0, vmax=vmax)
+    ax.contour(rc1, rc2, np.ma.masked_invalid(fest.T), levels=8, colors="k", linewidths=0.3, alpha=0.4)
     fig.colorbar(cf3, ax=ax, label="F_est (kBT)")
     ax.set_title("MBAR-recovered FES (explored region)", fontsize=10, fontweight="bold")
     ax.set_xlabel("CV1 (contact fraction)"); ax.set_ylabel("CV2 (rama-map)")
@@ -102,6 +126,8 @@ def plot_cv_space(landscape: Landscape, samples_by_window: dict, windows: dict,
     gi2 = np.clip(np.searchsorted(c2, rc2) - 0, 0, len(c2) - 1)
     ftrue = f[np.ix_(gi1, gi2)]
     err = np.where(explored, fest - ftrue, np.nan)
+    if smooth:
+        err = _smooth(err, 1.0)
     if np.any(np.isfinite(err)):
         err -= np.nanmean(err[np.isfinite(err)])    # PMFs defined up to a constant
     amax = float(np.nanmax(np.abs(err))) if np.any(np.isfinite(err)) else 1.0
