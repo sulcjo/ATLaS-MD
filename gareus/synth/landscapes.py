@@ -163,9 +163,46 @@ def slow_cv2_double_branch() -> Landscape:
                      basins=((0.5, -0.6), (0.5, 0.6)))
 
 
+def rugged_1d() -> Landscape:
+    """Rugged 6-basin CV1 profile with a large barrier, plus a mild fast CV2 well.
+
+    Built for the replica-count study: the PMF lives along CV1 (six basins of
+    varied depth), with a deliberately LARGE (~10 kBT) barrier between basins 3
+    and 4 that a window ladder must bridge. CV2 is a single shallow, fast well so
+    the 2D machinery runs without CV2 confounding the few-vs-many-replica answer.
+    """
+    # (weight, mu1, sigma1) along CV1 — six basins of varied depth/width
+    wells = [
+        (1.00, 0.07, 0.035),   # deep edge basin
+        (0.45, 0.20, 0.030),   # shallow
+        (0.80, 0.36, 0.030),   # medium (left of the big barrier)
+        (0.70, 0.56, 0.030),   # medium (right of the big barrier)
+        (0.35, 0.73, 0.028),   # shallow
+        (0.90, 0.92, 0.035),   # deep edge basin
+    ]
+    cv2_k = 3.0   # shallow, fast single CV2 well at 0 (mild nuisance coordinate)
+
+    def f(cv1, cv2):
+        cv1 = np.asarray(cv1, float)
+        dens = np.zeros(np.broadcast(cv1, np.asarray(cv2, float)).shape)
+        for (w, m, s) in wells:
+            dens = dens + w * np.exp(-0.5 * ((cv1 - m) / s) ** 2)
+        dens = np.clip(dens, 1e-12, None)
+        g = -np.log(dens)
+        # large explicit barrier between basin 3 (0.36) and basin 4 (0.56)
+        g = g + 9.0 * np.exp(-0.5 * ((cv1 - 0.46) / 0.025) ** 2)
+        # mild fast CV2 confinement (single shallow well at 0)
+        g = g + 0.5 * cv2_k * np.asarray(cv2, float) ** 2
+        return g
+
+    basins = tuple((w[1], 0.0) for w in wells)
+    return Landscape("rugged-1d", f, (0.0, 1.0), (-1.0, 1.0), basins)
+
+
 LANDSCAPES: dict[str, Landscape] = {
     "mixture-wells": mixture_wells(),
     "gated-barrier": gated_barrier(),
     "banana-valley": banana_valley(),
     "slow-cv2-double-branch": slow_cv2_double_branch(),
+    "rugged-1d": rugged_1d(),
 }
