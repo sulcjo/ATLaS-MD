@@ -75,8 +75,14 @@ def run_cli(argv=None) -> dict:
             m = campaign_metrics(lp, recs, target=a.target_overlap, res=a.res,
                                  samples_by_window=final_samples, windows=final_windows)
             if a.plot:
-                from .report import plot_campaign
-                m["plots"] = [str(x) for x in plot_campaign(lp, recs, a.plot)]
+                from pathlib import Path as _P
+                from .report import plot_campaign, plot_cv_space
+                plots = [str(x) for x in plot_campaign(lp, recs, a.plot)]
+                # CV1xCV2 FES + space-exploration panel from the final layout samples
+                plots.append(str(plot_cv_space(
+                    lp, final_samples, final_windows,
+                    _P(a.plot) / f"{lp.name}_cv_space.png", res=a.res)))
+                m["plots"] = plots
 
     print(json.dumps(m, indent=2, default=float))
     return m
