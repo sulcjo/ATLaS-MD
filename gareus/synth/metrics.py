@@ -266,6 +266,46 @@ def dispatcher_overlap_from_samples(samples_by_window, windows, *, bins: int = 8
             "frac_pairs_below_target": float(np.mean(ovs < 0.30))}
 
 
+def pmf_recovery_2d(landscape, samples_by_window, windows, *, res: int = 100,
+                    beta: float = 1.0, threshold_kbt: float = 5.0, max_per_window=None) -> dict:
+    """MBAR-reweighted 2D PMF recovery vs the true F(cv1,cv2) over the low-F region.
+
+    Returns ``rmse_lowf`` (low-F-weighted RMSE in kBT over explored low-F cells)
+    and ``coverage`` (fraction of low-F cells that received samples).
+    """
+    if max_per_window is not None:
+        from .ess import thin_to_ess
+        samples_by_window = {k: thin_to_ess(np.asarray(v, float), int(max_per_window))
+                             for k, v in samples_by_window.items()}
+    pooled, log_w = _mbar_weights(windows, samples_by_window, beta=beta)
+    c1, c2, f_true = landscape.grid(res=res)        # true F, min 0
+    lo1, hi1 = landscape.cv1_bounds
+    lo2, hi2 = landscape.cv2_bounds
+    b1 = np.linspace(lo1, hi1, res + 1)
+    b2 = np.linspace(lo2, hi2, res + 1)
+    lowf = f_true <= (f_true.min() + threshold_kbt)
+    if pooled.shape[0] == 0:
+        return {"rmse_lowf": float("nan"), "coverage": 0.0}
+    w = np.exp(log_w)
+    dens, _, _ = np.histogram2d(pooled[:, 0], pooled[:, 1], bins=[b1, b2], weights=w)
+    raw, _, _ = np.histogram2d(pooled[:, 0], pooled[:, 1], bins=[b1, b2])
+    explored = raw > 0
+    f_est = np.full_like(dens, np.nan)
+    pos = dens > 0
+    f_est[pos] = -np.log(dens[pos])
+    if np.any(pos):
+        f_est[pos] -= np.nanmin(f_est[pos])
+    cmp = lowf & explored
+    if cmp.sum() < 3:
+        return {"rmse_lowf": float("nan"), "coverage": float(np.mean(explored[lowf]) if lowf.any() else 0.0)}
+    diff = f_est[cmp] - f_true[cmp]
+    diff = diff - np.mean(diff)                      # PMFs up to a constant
+    wgt = np.exp(-f_true[cmp]); wgt = wgt / wgt.sum()
+    rmse = float(np.sqrt(np.sum(wgt * diff ** 2)))
+    coverage = float(np.mean(explored[lowf])) if lowf.any() else 0.0
+    return {"rmse_lowf": rmse, "coverage": coverage}
+
+
 def campaign_metrics(landscape, records, *, target: float = 0.30, res: int = 120,
                      samples_by_window=None, windows=None, max_per_window=None) -> dict:
     last = records[-1]

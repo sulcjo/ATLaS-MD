@@ -199,10 +199,42 @@ def rugged_1d() -> Landscape:
     return Landscape("rugged-1d", f, (0.0, 1.0), (-1.0, 1.0), basins)
 
 
+def rugged_2d() -> Landscape:
+    """Rugged in BOTH CVs: the rugged-1d CV1 profile (6 basins, ~14 kBT barrier)
+    crossed with a structured CV2 — three CV2 wells (-0.6, 0, 0.6) separated by
+    ~6 kBT barriers. Now a window ladder must bridge barriers along both axes, so
+    a pure-CV1 ladder no longer suffices and the replica budget must cover 2D.
+    """
+    cv1_wells = [
+        (1.00, 0.07, 0.035), (0.45, 0.20, 0.030), (0.80, 0.36, 0.030),
+        (0.70, 0.56, 0.030), (0.35, 0.73, 0.028), (0.90, 0.92, 0.035),
+    ]
+    cv2_wells = [(1.0, -0.5, 0.13), (1.0, 0.5, 0.13)]   # double well
+
+    def f(cv1, cv2):
+        cv1 = np.asarray(cv1, float)
+        cv2 = np.asarray(cv2, float)
+        shape = np.broadcast(cv1, cv2).shape
+        d1 = np.zeros(shape)
+        for (w, m, s) in cv1_wells:
+            d1 = d1 + w * np.exp(-0.5 * ((cv1 - m) / s) ** 2)
+        d2 = np.zeros(shape)
+        for (w, m, s) in cv2_wells:
+            d2 = d2 + w * np.exp(-0.5 * ((cv2 - m) / s) ** 2)
+        g = -np.log(np.clip(d1, 1e-12, None)) - np.log(np.clip(d2, 1e-12, None))
+        g = g + 9.0 * np.exp(-0.5 * ((cv1 - 0.46) / 0.025) ** 2)        # big CV1 barrier
+        g = g + 7.0 * np.exp(-0.5 * (cv2 / 0.10) ** 2)                  # CV2 barrier at 0
+        return g
+
+    basins = tuple((c1[1], c2[1]) for c1 in cv1_wells for c2 in cv2_wells)
+    return Landscape("rugged-2d", f, (0.0, 1.0), (-1.0, 1.0), basins)
+
+
 LANDSCAPES: dict[str, Landscape] = {
     "mixture-wells": mixture_wells(),
     "gated-barrier": gated_barrier(),
     "banana-valley": banana_valley(),
     "slow-cv2-double-branch": slow_cv2_double_branch(),
     "rugged-1d": rugged_1d(),
+    "rugged-2d": rugged_2d(),
 }

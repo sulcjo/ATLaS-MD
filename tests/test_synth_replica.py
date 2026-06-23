@@ -59,3 +59,27 @@ def test_replica_run_single_window_cannot_bridge_barrier():
     # across the tall barrier -> worse than a proper ladder
     assert np.isfinite(r1["pmf_rmse_lowf"])
     assert r1["pmf_rmse_lowf"] > r4["pmf_rmse_lowf"]
+
+
+def test_rugged_2d_complex_both_axes():
+    lp = LANDSCAPES["rugged-2d"]
+    assert len(lp.basins) == 12                 # 6 CV1 x 2 CV2 sub-basins
+    c1, c2, f = lp.grid(res=80)
+    assert np.isclose(f.min(), 0.0) and np.all(np.isfinite(f))
+    # CV2 barrier at 0: the cv2=0 row is high-F relative to the cv2=+/-0.5 bands
+    mid = int(np.argmin(np.abs(c2 - 0.0)))
+    band = int(np.argmin(np.abs(c2 - 0.5)))
+    assert f[:, mid].min() > f[:, band].min() + 2.0
+
+
+def test_replica_2d_needs_more_replicas_than_1d():
+    pytest.importorskip("scipy")
+    from gareus.synth.replica import replica_run_2d
+    lp = LANDSCAPES["rugged-2d"]
+    B = 150000
+    r2 = replica_run_2d(lp, 2, B, seed=0, res=80)
+    r8 = replica_run_2d(lp, 8, B, seed=0, res=80)
+    # in a 2D-complex space a mid replica count beats a tiny ladder
+    assert r8["pmf_rmse_lowf"] < r2["pmf_rmse_lowf"]
+    assert r8["coverage"] > r2["coverage"]      # coverage rises with replicas
+    assert r8["gated_ok"] and not r2["gated_ok"]  # too few can't connect/cover 2D
