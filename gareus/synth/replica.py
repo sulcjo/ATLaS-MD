@@ -221,12 +221,12 @@ def calibrate_k_2d(landscape, centers, *, overlap_target=0.30, res=90,
 def replica_run_2d(landscape: Landscape, R: int, budget: int, *, seed: int = 0,
                    beta: float = 1.0, res: int = 90, overlap_target: float = 0.30,
                    coverage_min: float = 0.50, max_per_window: int = 3000,
-                   return_layout: bool = False):
+                   return_layout: bool = False, explicit_centers=None):
     """2D replica experiment: R fair-k windows tiling CV1xCV2, B/R ESS samples each,
     MBAR-recover the 2D PMF over the low-F region."""
     from .metrics import pmf_recovery_2d
     rng = np.random.default_rng(seed)
-    centers = place_windows_2d(landscape, R)
+    centers = [tuple(c) for c in explicit_centers] if explicit_centers is not None else place_windows_2d(landscape, R)
     k, min_ov, valid_k = calibrate_k_2d(landscape, centers, overlap_target=overlap_target, res=res)
     n_raw = int(budget // max(1, R))
     windows, samples, ess = {}, {}, {}
@@ -263,3 +263,128 @@ def replica_run_2d(landscape: Landscape, R: int, budget: int, *, seed: int = 0,
     if return_layout:
         return out, nonempty, wins_ne
     return out
+
+
+# ---------------------------------------------------------------------------
+# Adaptive 2D replica run: seed R windows, then production epochs with FUNCTIONAL
+# retire (raw-count gated) that REDISTRIBUTES the fixed budget to survivors.
+# Compare to replica_run_2d (fixed R, no retire) at the same (R, budget).
+# ---------------------------------------------------------------------------
+
+def replica_run_2d_adaptive(landscape: Landscape, R: int, budget: int, *, seed: int = 0,
+                            beta: float = 1.0, res: int = 90, overlap_target: float = 0.30,
+                            n_epochs: int = 4, policy=None, coverage_min: float = 0.50,
+                            max_per_window: int = 3000, explicit_centers=None):
+    """Seed R fair-k 2D windows, run production epochs with the REAL decision
+    pipeline (functional retire + budget reallocation), 2D-MBAR recover the PMF.
+
+    Budget gating uses RAW accumulated sample counts (NOT ESS) so retire can fire;
+    ESS thinning is applied only to overlap/PMF statistics."""
+    from dataclasses import replace
+    from gareus.adaptive_production import (AdaptiveDecisionPolicy, WindowStateRegistry,
+                                            build_adaptive_epoch_schedule,
+                                            propose_actions_from_diagnostics,
+                                            _apply_registry_actions, build_geometry_edges)
+    from gareus.math_helpers import _adaptive_hist_overlap
+    from .metrics import pmf_recovery_2d
+    from .drivers import _pair_overlap_exchange
+
+    rng = np.random.default_rng(seed)
+    policy = policy or AdaptiveDecisionPolicy()
+    centers = [tuple(c) for c in explicit_centers] if explicit_centers is not None else place_windows_2d(landscape, R, res=res)
+    k, min_ov0, valid_k = calibrate_k_2d(landscape, centers, overlap_target=overlap_target, res=res)
+    reg = WindowStateRegistry()
+    for (c1, c2) in centers:
+        reg.add_state(primary_center=float(c1), primary_k=float(k),
+                      secondary_center=float(c2), secondary_k=float(k), epoch=0, source="seed")
+    raw_by_id: dict = {}
+    created = {sid: 0 for sid in reg.active_state_ids()}
+    win_by_id: dict = {}
+    spent = 0
+    total_retired = total_added = 0
+
+    def win_of(st):
+        return Window(st.primary_center, st.primary_k, st.secondary_center, st.secondary_k)
+
+    def thinned(sid):
+        raw = raw_by_id.get(sid)
+        if raw is None or len(raw) == 0:
+            return np.empty((0, 2)), 0
+        tau = tau_int(landscape, win_by_id[sid])
+        ne = int(effective_count(len(raw), tau, burn_in=BURN_IN, is_new=(created.get(sid, 0) > 0)))
+        return thin_to_ess(raw, ne), ne
+
+    def build_diag(active):
+        sb = {}
+        for st in active:
+            sid = int(st.state_id)
+            win_by_id[sid] = win_of(st)
+        for st in active:
+            sb[int(st.state_id)], _ = thinned(int(st.state_id))
+        edges = []
+        for a, b, etype, nd in build_geometry_edges(reg):
+            sa, sbb = sb.get(a), sb.get(b)
+            if sa is None or sbb is None or len(sa) == 0 or len(sbb) == 0:
+                continue
+            ov, exch = _pair_overlap_exchange(win_by_id[a], win_by_id[b], sa, sbb,
+                                              beta=beta, rng=rng, hist_overlap=_adaptive_hist_overlap)
+            edges.append({"state_i": a, "state_j": b, "edge_type": etype,
+                          "normalized_distance": nd, "overlap": ov, "exchange_acceptance": exch})
+        states = [{"state_id": int(st.state_id),
+                   "sample_count": int(len(raw_by_id.get(int(st.state_id), []))),  # RAW, not ESS
+                   "gamd_boost_sd_kcal_mol": 0.0} for st in active]
+        return {"schema_version": "adaptive_production_epoch_diagnostics_v1",
+                "states": states, "edges": edges}, sb
+
+    for epoch in range(1, n_epochs + 1):
+        active = reg.active_states()
+        if not active or spent >= budget:
+            break
+        for st in active:
+            win_by_id[int(st.state_id)] = win_of(st)
+        diag_prev, _ = build_diag(active)
+        pol_e = replace(policy, epoch_step_budget=int(budget // n_epochs),
+                        min_state_steps=max(20, int(budget // n_epochs) // (4 * max(1, len(active)))),
+                        max_state_steps=int(budget))
+        sched = build_adaptive_epoch_schedule(reg, diag_prev, pol_e, epoch=epoch,
+                                              default_steps=max(50, int(budget // n_epochs) // max(1, len(active))))
+        for row in sched:
+            sid = int(row["state_id"])
+            n = int(row.get("requested_steps", 0))
+            n = min(n, int(budget) - spent)
+            if n <= 0:
+                continue
+            w = win_by_id.get(sid) or win_of(reg.get_state(sid))
+            new = sample_window_exact(landscape, w, n, beta=beta, res=res, rng=rng)
+            raw_by_id[sid] = np.vstack([raw_by_id[sid], new]) if sid in raw_by_id and len(raw_by_id[sid]) else new
+            spent += n
+        active2 = reg.active_states()
+        diag2, _ = build_diag(active2)
+        acts = propose_actions_from_diagnostics(reg, diag2, policy)
+        total_retired += sum(1 for a in acts if a[0] == "retire")
+        total_added += sum(1 for a in acts if a[0] == "add")
+        _apply_registry_actions(reg, acts, epoch)
+        for st in reg.active_states():
+            created.setdefault(int(st.state_id), epoch)
+            win_by_id[int(st.state_id)] = win_of(st)
+        if spent >= budget:
+            break
+
+    # final 2D PMF over surviving windows (ESS-thinned)
+    sb_final, wn_final = {}, {}
+    for st in reg.active_states():
+        sid = int(st.state_id)
+        win_by_id[sid] = win_of(st)
+        s, _ = thinned(sid)
+        if len(s):
+            sb_final[sid] = s
+            wn_final[sid] = win_by_id[sid]
+    rec = pmf_recovery_2d(landscape, sb_final, wn_final, res=res, max_per_window=max_per_window) \
+        if len(sb_final) >= 1 else {"rmse_lowf": float("nan"), "coverage": 0.0}
+    return {
+        "R": int(R), "budget": int(budget), "seed": int(seed),
+        "pmf_rmse_lowf": float(rec["rmse_lowf"]), "coverage": float(rec["coverage"]),
+        "final_n_active": int(len(reg.active_state_ids())), "n_seeded": int(len(centers)),
+        "total_retired": int(total_retired), "total_added": int(total_added),
+        "budget_spent": int(spent), "gated_ok": bool(rec["coverage"] >= coverage_min and len(sb_final) >= 2),
+    }

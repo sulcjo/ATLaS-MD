@@ -66,3 +66,20 @@ def test_topup_heavy_vs_eager_add_differ_under_ess():
     # different policies -> different evolution (window count and/or PMF)
     assert (a["final_n_active"] != b["final_n_active"]) or (
         abs(a["final_pmf_rmse_lowf"] - b["final_pmf_rmse_lowf"]) > 1e-6)
+
+
+def test_retire_fires_with_raw_sample_gating():
+    # Regression for the ESS-vs-raw gating bug: the production retire gate keys off
+    # min_samples_for_retire (200). When the diagnostics reported ESS-thinned counts
+    # (which stayed <200), retire could NEVER fire. With RAW accumulated counts it
+    # does, on a redundant layout at adequate budget -- while respecting the floor.
+    lp = mixture_wells()
+    redundant = {"centers1": [0.10, 0.18, 0.46, 0.50, 0.54, 0.58, 0.74, 0.90],
+                 "k1": [60.0] * 8, "centers2": [-0.5, 0.5], "k2": [50.0, 50.0]}
+    pol = AdaptiveDecisionPolicy(redundant_overlap=0.40, min_samples_for_retire=200,
+                                 retire_converged=True, min_state_steps=40, max_state_steps=4000)
+    out = double_adaptive_campaign(lp, layout=redundant, policy=pol, mode="exact",
+                                  n_epochs=5, epoch_raw_budget=6000, total_budget=40000,
+                                  res=80, seed=0, default_steps=400)
+    assert sum(len(e["retired"]) for e in out["epochs"]) >= 1     # retire now fires
+    assert all(e["n_active"] >= pol.min_active_states for e in out["epochs"])  # floor held

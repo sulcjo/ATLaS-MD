@@ -459,7 +459,15 @@ def double_adaptive_campaign(landscape: Landscape, *, layout=None, feedback_cfg=
         return pmf_recovery(landscape, sb2, wins, axis="cv1", res=res)["rmse_lowf_weighted"]
 
     def build_diag(sb, eff):
-        """Full epoch-diagnostics dict (states + geometry edges with real overlap)."""
+        """Full epoch-diagnostics dict (states + geometry edges with real overlap).
+
+        The decision gates (min_samples_for_add / min_samples_for_retire) key off
+        the RAW accumulated MD sample count per state -- matching the real
+        collect_epoch_diagnostics, which reports raw counts, not ESS. ESS-thinned
+        samples (``sb``) are still used for the edge OVERLAP and for PMF recovery;
+        only the gating sample_count is raw. (Feeding ESS here is what made retire
+        never fire, since ESS stayed below the 200-sample retirement floor.)
+        """
         edges = []
         for a, b, etype, nd in build_geometry_edges(registry):
             sa, sbb = sb.get(a), sb.get(b)
@@ -470,7 +478,8 @@ def double_adaptive_campaign(landscape: Landscape, *, layout=None, feedback_cfg=
             edges.append({"state_i": a, "state_j": b, "edge_type": etype,
                           "normalized_distance": nd, "overlap": ov, "exchange_acceptance": exch})
         return {"schema_version": "adaptive_production_epoch_diagnostics_v1",
-                "states": [{"state_id": sid, "sample_count": eff.get(sid, 0),
+                "states": [{"state_id": sid,
+                            "sample_count": int(len(raw_by_id.get(sid, [])) or 0),  # RAW, not ESS
                             "gamd_boost_sd_kcal_mol": 0.0} for sid in sb],
                 "edges": edges}
 
