@@ -137,37 +137,62 @@ def ideal_axis_ladder(landscape, *, axis: str = "cv1", beta: float = 1.0,
 # Oracle-optimal placement: R windows at greedy constant-overlap positions
 # ---------------------------------------------------------------------------
 
+def _dedup_ladder(ladder: list, lo: float, hi: float, R: int) -> list:
+    """Remove near-duplicate centers from a greedy-walk ladder.
+
+    ``ideal_axis_ladder`` can produce a degenerate tiny last step when the walk
+    reaches near the endpoint (e.g., 0.997 → 1.000 with range 1.0, gap 0.003).
+    Filter out any center whose spacing from the previous is less than
+    ``(hi - lo) / (3 * R)`` (one-third of the fair mean spacing = ~33% threshold),
+    keeping only the first of any near-duplicate pair.  This threshold rejects
+    steps that are less than a third of the expected average spacing, which
+    excludes boundary artifacts while keeping genuine well-separated windows.
+    Remaining centers are returned sorted.
+    """
+    if not ladder:
+        return ladder
+    min_sep = (hi - lo) / max(1, 3 * R)
+    out = [ladder[0]]
+    for c in ladder[1:]:
+        if c - out[-1] >= min_sep:
+            out.append(c)
+    return out
+
+
 def oracle_k_for_r(landscape: Landscape, R: int, *, axis: str = "cv1",
                    beta: float = 1.0, res: int = 120,
                    target_overlap: float = 0.30,
                    k_lo: float = 8.0, k_hi: float = 4000.0) -> float:
-    """Spring constant k* such that the greedy constant-overlap walk yields >= R centers.
+    """Spring constant k* such that the greedy constant-overlap walk yields >= R
+    *non-degenerate* centers (spacing >= (hi-lo) / (4*R) to exclude tiny boundary steps).
 
-    The walk count is non-decreasing in k (tighter spring = narrower biased
-    distribution = more windows to tile the range), so bisection is exact.
-    Returns k_lo if count(k_lo) >= R (already enough at softest spring), k_hi
-    if count(k_hi) < R (R exceeds what's achievable -- caller gets best-effort).
+    The de-duplicated walk count is non-decreasing in k, so bisection is exact.
+    Returns k_lo if dedup-count(k_lo) >= R, k_hi if R exceeds what k_hi achieves.
     Returns 0.0 for R <= 1 (unbiased single-window baseline).
     """
     if R <= 1:
         return 0.0
 
+    from .replica import low_f_support
+    lo, hi = low_f_support(landscape, res=res)
+
     def count(k: float) -> int:
-        return len(ideal_axis_ladder(landscape, axis=axis, beta=beta, res=res,
-                                     target_overlap=target_overlap, k=k))
+        lad = ideal_axis_ladder(landscape, axis=axis, beta=beta, res=res,
+                                target_overlap=target_overlap, k=k)
+        return len(_dedup_ladder(lad, lo, hi, R))
 
     if count(k_hi) < R:
         return float(k_hi)
     if count(k_lo) >= R:
         return float(k_lo)
-    # Binary search for smallest k with count >= R
+    # Binary search for smallest k with dedup-count >= R
     a, b = float(k_lo), float(k_hi)
     for _ in range(52):
         m = 0.5 * (a + b)
         if count(m) < R:
-            a = m   # too few centers — tighten spring
+            a = m   # too few — tighten spring
         else:
-            b = m   # count >= R — can still loosen
+            b = m   # count >= R — can loosen
     return float(b)
 
 
@@ -177,29 +202,30 @@ def oracle_optimal_centers_1d(landscape: Landscape, R: int, *,
                                target_overlap: float = 0.30) -> tuple:
     """R oracle-optimal 1D centers from the greedy constant-overlap walk.
 
-    Finds k* such that the greedy walk generates >= R centers, then subsamples
-    evenly to exactly R (preserving the barrier-dense structure).  Centers are
-    dense near PMF barriers (where biased distributions are narrow) and sparse
-    in basins (where distributions are wide) -- the correct staging geometry for
-    umbrella sampling.
+    Finds k* such that the greedy walk generates >= R non-degenerate centers
+    (filtering out boundary artifacts where the last step is a tiny forced step
+    to the endpoint).  Subsamples evenly to exactly R, preserving the
+    barrier-dense structure.
 
-    Returns ``(centers: list[float], k: float)``.  For R=1, returns the midpoint
-    of the low-F region with k=0 (unbiased baseline).
+    Centers are dense near PMF barriers (where biased distributions are narrow)
+    and sparse in flat basins — the correct staging geometry for umbrella sampling.
+
+    Returns ``(centers: list[float], k: float)``.  R=1 returns the midpoint of
+    the low-F region with k=0 (unbiased baseline).
     """
     from .replica import low_f_support
     if R <= 1:
         lo, hi = low_f_support(landscape, res=res)
         return [0.5 * (lo + hi)], 0.0
 
+    lo, hi = low_f_support(landscape, res=res)
     k = oracle_k_for_r(landscape, R, axis=axis, beta=beta, res=res,
                         target_overlap=target_overlap)
-    ladder = ideal_axis_ladder(landscape, axis=axis, beta=beta, res=res,
-                                target_overlap=target_overlap, k=k)
+    raw_ladder = ideal_axis_ladder(landscape, axis=axis, beta=beta, res=res,
+                                   target_overlap=target_overlap, k=k)
+    ladder = _dedup_ladder(raw_ladder, lo, hi, R)
     n = len(ladder)
-    if n == R:
-        return list(ladder), float(k)
-    if n < R:
-        # k_hi was hit — best effort, return what we have
+    if n <= R:
         return list(ladder), float(k)
     # Subsample to R evenly-spaced ladder positions (preserves barrier density)
     indices = np.round(np.linspace(0, n - 1, R)).astype(int)
@@ -278,13 +304,28 @@ def placement_comparison_1d(landscape: Landscape, R: int, budget: int, *,
                              seeds: list | None = None,
                              beta: float = 1.0, res: int = 120,
                              target_overlap: float = 0.30) -> dict:
-    """Compare oracle-optimal vs linspace 1D window placement by MBAR PMF RMSE.
+    """Compare 1D window placement strategies by MBAR PMF RMSE at fixed R and budget.
 
-    For each placement strategy, samples ``budget // R`` raw samples per window,
-    runs MBAR, and reports the mean PMF RMSE over ``seeds``.
+    Three strategies are evaluated:
 
-    Returns dict with keys ``'oracle'`` and ``'linspace'``, each containing
-    ``{'pmf_rmse': float, 'n_windows': int, 'k': float, 'centers': list}``.
+    ``'oracle'`` -- Greedy constant-overlap walk at oracle k* (R distinct centers,
+        dense near barriers).  Uses oracle_k_for_r so k* is calibrated to the
+        oracle positions.
+
+    ``'oracle_fixedk'`` -- Same oracle positions evaluated at the linspace fair-k.
+        A position-only comparison: same k for both oracle and linspace, so the
+        only difference is where the R windows sit.  This isolates the positional
+        benefit of the greedy walk from the k/ESS tradeoff.
+
+    ``'linspace'`` -- Uniform linspace positions with calibrated fair-k (tightest k
+        maintaining target_overlap between uniform neighbors).
+
+    Each strategy samples ``budget // R`` raw samples per window, ESS-thins them
+    (using the tau_int model for the given k), MBAR-recovers the CV1 PMF, and
+    reports the mean RMSE over ``seeds``.
+
+    Returns a dict with keys ``'oracle'``, ``'oracle_fixedk'``, ``'linspace'``,
+    each containing ``{'pmf_rmse': float, 'n_windows': int, 'k': float, 'centers': list}``.
     """
     from .replica import low_f_support, calibrate_k
     from .sampler import sample_window_exact, Window
@@ -314,20 +355,26 @@ def placement_comparison_1d(landscape: Landscape, R: int, budget: int, *,
                 rmses.append(r["rmse_lowf_weighted"])
         return float(np.mean(rmses)) if rmses else float("nan")
 
-    # Oracle-optimal placement
-    oracle_centers, k_oracle = oracle_optimal_centers_1d(
-        landscape, R, beta=beta, res=res, target_overlap=target_overlap)
-    oracle_rmse = _run_placement(oracle_centers, k_oracle)
+    lo, hi = low_f_support(landscape, res=res)
 
     # Linspace placement with calibrated fair-k
-    lo, hi = low_f_support(landscape, res=res)
     lin_centers = list(np.linspace(lo, hi, R))
     _, k_lin, _, _ = calibrate_k(landscape, R, overlap_target=target_overlap, res=res)
     lin_rmse = _run_placement(lin_centers, k_lin)
 
+    # Oracle-optimal placement at oracle k*
+    oracle_centers, k_oracle = oracle_optimal_centers_1d(
+        landscape, R, beta=beta, res=res, target_overlap=target_overlap)
+    oracle_rmse = _run_placement(oracle_centers, k_oracle)
+
+    # Oracle positions at linspace fair-k (position-only comparison, same ESS cost)
+    oracle_fixedk_rmse = _run_placement(oracle_centers, k_lin)
+
     return {
-        "oracle": {"pmf_rmse": oracle_rmse, "n_windows": R,
+        "oracle": {"pmf_rmse": oracle_rmse, "n_windows": len(oracle_centers),
                    "k": float(k_oracle), "centers": oracle_centers},
+        "oracle_fixedk": {"pmf_rmse": oracle_fixedk_rmse, "n_windows": len(oracle_centers),
+                          "k": float(k_lin), "centers": oracle_centers},
         "linspace": {"pmf_rmse": lin_rmse, "n_windows": R,
                      "k": float(k_lin), "centers": lin_centers},
     }

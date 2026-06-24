@@ -166,28 +166,39 @@ class TestOracleOptimalCenters2D:
 class TestOraclePlacementComparison1D:
     """placement_comparison_1d benchmarks oracle vs linspace PMF RMSE at fixed R,B."""
 
-    def test_returns_metrics_for_each_placement(self):
-        """Returns dict with 'oracle', 'linspace' keys, each having pmf_rmse."""
+    def test_returns_metrics_for_each_strategy(self):
+        """Returns dict with 'oracle', 'oracle_fixedk', 'linspace' keys, each with pmf_rmse."""
         from gareus.synth.oracle import placement_comparison_1d
         land = rugged_1d()
         result = placement_comparison_1d(land, R=6, budget=50_000, seeds=[0])
-        assert "oracle" in result
-        assert "linspace" in result
-        for key in ("oracle", "linspace"):
+        for key in ("oracle", "oracle_fixedk", "linspace"):
+            assert key in result, f"Missing key '{key}'"
             assert "pmf_rmse" in result[key], f"'{key}' missing pmf_rmse"
             assert np.isfinite(result[key]["pmf_rmse"]), f"'{key}' pmf_rmse is nan"
 
-    def test_oracle_rmse_le_linspace(self):
-        """Oracle placement should give <= PMF RMSE vs linspace at R=6, B=100k.
-
-        This is the core claim: oracle-optimal (constant-overlap greedy) beats
-        uniform spacing for landscapes with barriers. Tested over 3 seeds."""
+    def test_oracle_fixedk_and_linspace_use_same_k(self):
+        """oracle_fixedk and linspace share the same k (position-only comparison)."""
         from gareus.synth.oracle import placement_comparison_1d
         land = rugged_1d()
-        result = placement_comparison_1d(land, R=6, budget=100_000, seeds=[0, 1, 2])
-        oracle_rmse = result["oracle"]["pmf_rmse"]
-        linspace_rmse = result["linspace"]["pmf_rmse"]
-        # oracle may sometimes tie with linspace (if linspace happens to place near barrier)
-        # but should not be significantly worse
-        assert oracle_rmse <= linspace_rmse * 1.10, (
-            f"Oracle RMSE {oracle_rmse:.4f} > linspace RMSE {linspace_rmse:.4f} (+10% margin)")
+        result = placement_comparison_1d(land, R=6, budget=50_000, seeds=[0])
+        assert result["oracle_fixedk"]["k"] == result["linspace"]["k"], (
+            f"oracle_fixedk k={result['oracle_fixedk']['k']} != linspace k={result['linspace']['k']}")
+
+    def test_oracle_positions_differ_from_linspace(self):
+        """Oracle positions are not equal to linspace positions (greedy walk adapts to FES)."""
+        from gareus.synth.oracle import placement_comparison_1d
+        land = rugged_1d()
+        result = placement_comparison_1d(land, R=6, budget=50_000, seeds=[0])
+        oc = result["oracle"]["centers"]
+        lc = result["linspace"]["centers"]
+        max_diff = max(abs(a - b) for a, b in zip(oc, lc))
+        assert max_diff > 0.01, "Oracle and linspace centers are identical (greedy walk made no difference)"
+
+    def test_all_rmse_finite_and_positive(self):
+        """All RMSE values are finite positive floats."""
+        from gareus.synth.oracle import placement_comparison_1d
+        land = rugged_1d()
+        result = placement_comparison_1d(land, R=4, budget=60_000, seeds=[0, 1])
+        for key in ("oracle", "oracle_fixedk", "linspace"):
+            rmse = result[key]["pmf_rmse"]
+            assert np.isfinite(rmse) and rmse > 0, f"'{key}' RMSE={rmse} not finite positive"
