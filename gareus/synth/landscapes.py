@@ -230,6 +230,76 @@ def rugged_2d() -> Landscape:
     return Landscape("rugged-2d", f, (0.0, 1.0), (-1.0, 1.0), basins)
 
 
+def chaos_2d() -> Landscape:
+    """Highly rugged 2D: 8 CV1 basins × 3 CV2 wells (24 sub-basins) with two
+    independent barriers per CV axis, scattered metastable traps, and anisotropic
+    noise bumps. Much harder than rugged_2d — requires R≥16 for adequate coverage.
+
+    Challenges added vs rugged_2d:
+    - 8 (vs 6) CV1 basins + 3 (vs 2) CV2 wells = 24 sub-basins
+    - Main CV1 barrier 18 kBT (vs implied ~14 kBT in rugged_2d)
+    - Secondary CV1 barrier 10 kBT, CV2-dependent (asymmetric, diagonal bridging required)
+    - Extra CV2 saddle at +0.33 (4 effective CV2 zones)
+    - 10 noise Gaussian bumps (3–5 kBT) as reproducible metastable traps
+    """
+    cv1_wells = [
+        (1.00, 0.05, 0.030),
+        (0.50, 0.15, 0.025),
+        (0.85, 0.28, 0.028),
+        (0.75, 0.42, 0.025),
+        (0.70, 0.58, 0.025),
+        (0.60, 0.70, 0.025),
+        (0.45, 0.82, 0.022),
+        (0.95, 0.94, 0.032),
+    ]
+    cv2_wells = [
+        (1.00, -0.65, 0.10),
+        (0.70,  0.00, 0.08),
+        (0.90,  0.65, 0.10),
+    ]
+    # Reproducible metastable traps: (amplitude, mu1, mu2, s1, s2)
+    _traps = [
+        (4.0, 0.22, -0.30, 0.040, 0.040),
+        (5.0, 0.35,  0.40, 0.040, 0.050),
+        (3.5, 0.64, -0.50, 0.050, 0.050),
+        (4.5, 0.75,  0.25, 0.040, 0.040),
+        (3.0, 0.12,  0.50, 0.050, 0.060),
+        (4.0, 0.88, -0.30, 0.050, 0.040),
+        (3.5, 0.50, -0.80, 0.060, 0.040),
+        (4.0, 0.50,  0.80, 0.060, 0.040),
+        (5.0, 0.35, -0.15, 0.030, 0.040),
+        (4.5, 0.78,  0.55, 0.030, 0.030),
+    ]
+
+    def f(cv1, cv2):
+        cv1 = np.asarray(cv1, float)
+        cv2 = np.asarray(cv2, float)
+        shape = np.broadcast(cv1, cv2).shape
+        d1 = np.zeros(shape)
+        for (w, m, s) in cv1_wells:
+            d1 = d1 + w * np.exp(-0.5 * ((cv1 - m) / s) ** 2)
+        d2 = np.zeros(shape)
+        for (w, m, s) in cv2_wells:
+            d2 = d2 + w * np.exp(-0.5 * ((cv2 - m) / s) ** 2)
+        g = -np.log(np.clip(d1, 1e-12, None)) - np.log(np.clip(d2, 1e-12, None))
+        # Main CV1 barrier 18 kBT
+        g = g + 18.0 * np.exp(-0.5 * ((cv1 - 0.50) / 0.022) ** 2)
+        # Secondary CV1 barrier 10 kBT, CV2-dependent (highest at CV2~0)
+        g = g + 10.0 * np.exp(-0.5 * ((cv1 - 0.25) / 0.025) ** 2) \
+              * (0.5 + 0.5 * np.exp(-0.5 * (cv2 / 0.30) ** 2))
+        # CV2 main barrier 10 kBT at 0
+        g = g + 10.0 * np.exp(-0.5 * (cv2 / 0.08) ** 2)
+        # CV2 saddle 5 kBT at +0.33 (creates 4 effective CV2 zones)
+        g = g + 5.0 * np.exp(-0.5 * ((cv2 - 0.33) / 0.07) ** 2)
+        # Noise bumps / traps
+        for (amp, m1, m2, s1, s2) in _traps:
+            g = g + amp * np.exp(-0.5 * (((cv1 - m1) / s1) ** 2 + ((cv2 - m2) / s2) ** 2))
+        return g
+
+    basins = tuple((c1[1], c2[1]) for c1 in cv1_wells for c2 in cv2_wells)
+    return Landscape("chaos-2d", f, (0.0, 1.0), (-1.0, 1.0), basins)
+
+
 LANDSCAPES: dict[str, Landscape] = {
     "mixture-wells": mixture_wells(),
     "gated-barrier": gated_barrier(),
@@ -237,4 +307,5 @@ LANDSCAPES: dict[str, Landscape] = {
     "slow-cv2-double-branch": slow_cv2_double_branch(),
     "rugged-1d": rugged_1d(),
     "rugged-2d": rugged_2d(),
+    "chaos-2d": chaos_2d(),
 }

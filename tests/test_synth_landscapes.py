@@ -42,6 +42,20 @@ def test_gated_barrier_has_high_ridge_with_low_pass():
     assert ridge_col.min() < ridge_col.max() - 2.0   # a pass exists
 
 
+def test_chaos_2d_properties():
+    lp = LANDSCAPES["chaos-2d"]
+    c1, c2, f = lp.grid(res=80)
+    assert np.isclose(f.min(), 0.0)
+    assert np.all(np.isfinite(f))
+    assert f.max() > 20.0, "chaos_2d must have barriers >20 kBT"
+    assert len(lp.basins) == 24, f"expected 24 sub-basins, got {len(lp.basins)}"
+    # barriers exist along both CV axes
+    mid1 = int(np.argmin(np.abs(c1 - 0.50)))
+    mid2 = int(np.argmin(np.abs(c2 - 0.00)))
+    assert f[mid1, :].max() > 15.0, "main CV1 barrier must be >15 kBT"
+    assert f[:, mid2].max() > 8.0,  "CV2 barrier at 0 must be >8 kBT"
+
+
 def test_double_branch_has_two_cv2_minima():
     lp = LANDSCAPES["slow-cv2-double-branch"]
     c1, c2, f = lp.grid(res=120)
