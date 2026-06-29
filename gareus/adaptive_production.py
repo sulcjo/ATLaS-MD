@@ -104,9 +104,21 @@ def _resolve_and_apply_extend_mode(args: Any, out_dir: Path) -> str:
             args.adaptive_production_final_quality_extension_steps = steps
 
     elif mode == "adaptive":
-        current_epochs = int(getattr(args, "adaptive_production_epochs", 5) or 5)
+        current_epochs = int(getattr(args, "adaptive_production_epochs", 3) or 3)
         extra = max(1, int(getattr(args, "ap_extend_rounds", 1) or 1))
-        args.adaptive_production_epochs = current_epochs + extra
+        # Read epochs_completed from the summary JSON so that max_epochs always
+        # exceeds the *completed* count by exactly `extra`, regardless of the
+        # configured cap (e.g. if 3 of 5 were done, use 3 not 5 as the base).
+        summary_path = Path(out_dir) / "adaptive_production" / "adaptive_production_driver_summary.json"
+        epochs_completed = 0
+        try:
+            if summary_path.exists():
+                data = json.loads(summary_path.read_text(encoding="utf-8"))
+                epochs_completed = int(data.get("epochs_completed", 0) or 0)
+        except Exception:
+            epochs_completed = 0
+        effective_base = max(epochs_completed, current_epochs)
+        args.adaptive_production_epochs = effective_base + extra
 
     elif mode == "topup":
         args.adaptive_production_topup_only = True

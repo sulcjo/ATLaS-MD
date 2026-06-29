@@ -169,6 +169,36 @@ class TestAdaptiveModeArgs:
         self._resolve(args, tmp_path)
         assert args.adaptive_production_final_quality_extension_rounds == 0
 
+    def test_adaptive_uses_epochs_completed_when_less_than_configured(self, tmp_path):
+        """configured=5, completed=3, extra=2 → max(3,5)+2 = 7, not 5+2=7 (same but via completed path)."""
+        ap_dir = tmp_path / "adaptive_production"
+        ap_dir.mkdir()
+        (ap_dir / "adaptive_production_driver_summary.json").write_text(
+            json.dumps({"epochs_completed": 3, "status": "interrupted_after_checkpoint"}),
+            encoding="utf-8",
+        )
+        args = _make_args(extend=True, extend_mode="adaptive",
+                          adaptive_production_epochs=5, ap_extend_rounds=2)
+        mode = self._resolve(args, tmp_path)
+        assert mode == "adaptive"
+        # effective_base = max(3, 5) = 5; 5 + 2 = 7
+        assert args.adaptive_production_epochs == 7
+
+    def test_adaptive_uses_epochs_completed_when_greater_than_configured(self, tmp_path):
+        """configured=5, completed=6 (already ran extra epoch), extra=1 → max(6,5)+1 = 7, not 5+1=6."""
+        ap_dir = tmp_path / "adaptive_production"
+        ap_dir.mkdir()
+        (ap_dir / "adaptive_production_driver_summary.json").write_text(
+            json.dumps({"epochs_completed": 6, "status": "interrupted_after_checkpoint"}),
+            encoding="utf-8",
+        )
+        args = _make_args(extend=True, extend_mode="adaptive",
+                          adaptive_production_epochs=5, ap_extend_rounds=1)
+        mode = self._resolve(args, tmp_path)
+        assert mode == "adaptive"
+        # effective_base = max(6, 5) = 6; 6 + 1 = 7
+        assert args.adaptive_production_epochs == 7
+
 
 # ---------------------------------------------------------------------------
 # Test group 4: topup mode args
