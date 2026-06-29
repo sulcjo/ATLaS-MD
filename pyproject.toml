@@ -31,7 +31,7 @@ openmm = [
   "PeptideBuilder",
 ]
 analysis = ["pymbar>=4", "pyarrow>=12", "duckdb>=0.9", "scipy>=1.10"]
-dev = ["pytest>=7"]
+dev = ["pytest>=7", "pyarrow>=12", "duckdb>=0.9"]
 all = [
   "PyYAML>=6",
   "openmm>=8",
@@ -40,6 +40,8 @@ all = [
   "pymbar>=4",
   "scipy>=1.10",
   "pytest>=7",
+  "pyarrow>=12",
+  "duckdb>=0.9",
 ]
 
 [project.scripts]
