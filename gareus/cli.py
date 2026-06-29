@@ -430,6 +430,24 @@ def _add_output_args(p: argparse.ArgumentParser) -> None:
                    action=argparse.BooleanOptionalAction, default=True)
 
 
+def _add_tica_args(p: argparse.ArgumentParser) -> None:
+    """Args for inter-epoch tICA CVaux (all default to OFF; only active when tica_obs_interval > 0)."""
+    p.add_argument("--tica-obs-interval", type=int, default=0,
+                   help="Record backbone dihedral features every N samples for tICA refitting. "
+                        "0 = disabled (default).")
+    p.add_argument("--tica-update-after-epochs", type=int, nargs="*", default=None,
+                   metavar="EPOCH",
+                   help="Epoch numbers after which to refit tIC1 and update the secondary CV. "
+                        "Epoch indexing is 0-based. Default: None (disabled).")
+    p.add_argument("--tica-lag-frames", type=int, default=50,
+                   help="Lag in frames for tICA generalised eigenvalue problem (default 50).")
+    p.add_argument("--tica-state-file", default="",
+                   help="Path to a tICA state JSON file (TICAResult) for the tica-linear secondary CV. "
+                        "Set automatically by the adaptive production loop; leave empty for first epoch.")
+    p.add_argument("--tica-min-eigenvalue", type=float, default=0.0,
+                   help="Skip tICA update if the fitted eigenvalue is below this threshold (default 0.0 = always update).")
+
+
 def _add_platform_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--platform", default="auto")
     p.add_argument("--precision", default="mixed")
@@ -870,6 +888,31 @@ def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
 # Public entry points
 # ---------------------------------------------------------------------------
 
+def build_gareus_parser() -> argparse.ArgumentParser:
+    """Return a bare ArgumentParser with all GAREUS arguments registered.
+
+    Used by config validation and tests to enumerate valid YAML keys without
+    triggering config-file loading or arg parsing.
+    """
+    p = argparse.ArgumentParser(
+        prog="gareus",
+        add_help=False,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    _add_core_args(p)
+    _add_system_args(p)
+    _add_cv_args(p)
+    _add_window_args(p)
+    _add_us_args(p)
+    _add_seeding_args(p)
+    _add_genpept_prescan_args(p)
+    _add_gamd_args(p)
+    _add_output_args(p)
+    _add_platform_args(p)
+    _add_tica_args(p)
+    return p
+
+
 def parse_args(argv: Optional[Iterable[str]] = None):
     argv_list = _argv_as_list(argv)
 
@@ -895,6 +938,7 @@ def parse_args(argv: Optional[Iterable[str]] = None):
     _add_gamd_args(p)
     _add_output_args(p)
     _add_platform_args(p)
+    _add_tica_args(p)
 
     if pre_args.write_config_template:
         _write_config_template(Path(pre_args.write_config_template))

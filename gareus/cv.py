@@ -46,6 +46,7 @@ __all__ = [
     "secondary_cv_enabled",
     "secondary_cv_is_transition",
     "secondary_cv_range",
+    "build_tica_linear_metadata",
     "secondary_cv_target_angles",
     "secondary_structure_torsions",
     "rama_region_definitions",
@@ -294,6 +295,7 @@ def secondary_cv_mode(args_or_mode) -> str:
         "ramachandran-regions": "rama-regions",
         "rama-region": "rama-regions",
         "ramachandran-region": "rama-regions",
+        "tica": "tica-linear",
     }
     return aliases.get(mode, mode)
 
@@ -305,12 +307,45 @@ def secondary_cv_enabled(args) -> bool:
 
 def secondary_cv_is_transition(args_or_mode) -> bool:
     """Return True if the secondary CV is a transition coordinate."""
-    return secondary_cv_mode(args_or_mode) in {"alpha-coil-beta", "rama-regions", "rama-map"}
+    return secondary_cv_mode(args_or_mode) in {"alpha-coil-beta", "rama-regions", "rama-map", "tica-linear"}
 
 
 def secondary_cv_range(args_or_mode) -> Tuple[float, float]:
     """Return the valid scalar range for the selected secondary CV."""
+    mode = secondary_cv_mode(args_or_mode)
+    if mode == "tica-linear":
+        return (-6.0, 6.0)
     return (-1.0, 1.0) if secondary_cv_is_transition(args_or_mode) else (0.0, 1.0)
+
+
+def build_tica_linear_metadata(
+    *,
+    enabled: bool,
+    n_phi: int = 0,
+    n_psi: int = 0,
+    tica_state_path: str = "",
+) -> dict:
+    """Return a secondary-CV metadata dict for the tica-linear mode.
+
+    Used by ``add_secondary_structure_cv_force`` and stored in
+    ``umbrella_pymbar_metadata.json`` so downstream analysis knows the CV
+    definition used for each epoch.
+    """
+    return {
+        "enabled": bool(enabled),
+        "mode": "tica-linear",
+        "label": "inter-epoch tICA linear CV (tIC1, slowest mode)",
+        "range_min": -6.0,
+        "range_max": 6.0,
+        "n_phi_torsions": int(n_phi),
+        "n_psi_torsions": int(n_psi),
+        "tica_state_path": str(tica_state_path),
+        "note": (
+            "tIC1 projection: (X - mean) @ weights. Weights are updated each epoch via "
+            "inter-epoch tICA refitting of backbone sin/cos dihedral features. "
+            "Samples from different tica_cv_version epochs must not be mixed in MBAR."
+        ),
+    }
 
 
 

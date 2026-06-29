@@ -1413,6 +1413,90 @@ def _sample_sources_from_run_root(label: str, run_dir: Path) -> List[Tuple[str, 
     return out
 
 
+def _maybe_update_tica_cvaux(epoch: int, epoch_dir: Path, adaptive_dir: Path, args) -> dict:
+    """Refit tICA from epoch observations and update args for the next epoch.
+
+    Completely opt-in: returns an empty dict immediately if tica_obs_interval == 0
+    or the epoch is not in the tica_update_after_epochs list.
+
+    When active:
+    1. Loads dihedral obs from epoch_dir/tica_obs/
+    2. Fits tICA (enforcing sign continuity against the previous model)
+    3. Saves TICAResult to adaptive_dir/tica_state.json
+    4. Sets args.tica_state_file so the next epoch's force builder loads the new weights
+    5. Sets args.tica_cv_version for downstream MBAR cross-epoch filtering
+
+    Returns a summary dict stored in the epoch summary JSON.
+    """
+    tica_obs_interval = int(getattr(args, "tica_obs_interval", 0) or 0)
+    if tica_obs_interval <= 0:
+        return {}
+    update_after = getattr(args, "tica_update_after_epochs", None)
+    if update_after is None:
+        return {}
+    if int(epoch) not in [int(e) for e in update_after]:
+        return {}
+
+    tica_dir = epoch_dir / "tica_obs"
+    if not tica_dir.exists() or not any(tica_dir.glob("dihedral_obs_*.npz")):
+        print(f"    tICA: no dihedral observations found in {tica_dir}; skipping update for epoch {epoch}")
+        return {"status": "skipped_no_obs", "epoch": int(epoch)}
+
+    lag = int(getattr(args, "tica_lag_frames", 50) or 50)
+    try:
+        from .tica import compute_tica_from_epoch_obs, load_epoch_dihedral_obs, window_tica_centers, TICAResult
+    except ImportError as exc:
+        print(f"    tICA: import failed ({exc}); skipping update")
+        return {"status": "skipped_import_error", "error": str(exc)}
+
+    # Load existing model for sign continuity
+    prev_result = None
+    prev_state_path = str(getattr(args, "tica_state_file", "") or "")
+    if prev_state_path and Path(prev_state_path).exists():
+        try:
+            prev_result = TICAResult.load(prev_state_path)
+        except Exception:
+            prev_result = None
+
+    # Determine torsion indices from a previous model or from topology
+    phi_indices = list(prev_result.phi_torsion_indices) if prev_result else []
+    psi_indices = list(prev_result.psi_torsion_indices) if prev_result else []
+
+    try:
+        result = compute_tica_from_epoch_obs(
+            epoch_dir, lag, phi_indices, psi_indices, previous_result=prev_result
+        )
+    except Exception as exc:
+        print(f"    tICA: fitting failed ({exc}); skipping update for epoch {epoch}")
+        return {"status": "skipped_fit_error", "error": str(exc), "epoch": int(epoch)}
+
+    eigenvalue_threshold = float(getattr(args, "tica_min_eigenvalue", 0.0) or 0.0)
+    if result.eigenvalue < eigenvalue_threshold:
+        print(
+            f"    tICA: eigenvalue {result.eigenvalue:.4f} below threshold {eigenvalue_threshold:.4f}; "
+            f"skipping update for epoch {epoch}"
+        )
+        return {"status": "skipped_low_eigenvalue", "eigenvalue": float(result.eigenvalue), "epoch": int(epoch)}
+
+    state_path = adaptive_dir / "tica_state.json"
+    result.save(state_path)
+    print(f"    tICA: fitted from epoch {epoch} ({result.n_samples} samples, eigenvalue {result.eigenvalue:.4f}) -> {state_path}")
+
+    args.tica_state_file = str(state_path)
+    version_tag = f"v{epoch + 1}"
+    args.tica_cv_version = version_tag
+
+    return {
+        "status": "updated",
+        "epoch": int(epoch),
+        "eigenvalue": float(result.eigenvalue),
+        "n_samples": int(result.n_samples),
+        "lag_frames": int(lag),
+        "state_file": str(state_path),
+        "version": version_tag,
+    }
+
+
 def _epoch_sample_sources(
     adaptive_dir: Path,
     include_epochs: bool,
@@ -3859,6 +3943,14 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
         next_epoch_dir.mkdir(parents=True, exist_ok=True)
         registry.write_epoch_window_map(next_epoch_dir / "epoch_window_map.csv")
 
+        # tICA CVaux inter-epoch update (opt-in; no-op by default)
+        tica_update_report = {}
+        try:
+            tica_update_report = _maybe_update_tica_cvaux(epoch, epoch_dir, adaptive_dir, args)
+        except Exception as _tica_exc:
+            print(f"WARNING: _maybe_update_tica_cvaux failed for epoch {epoch}: {_tica_exc}")
+            tica_update_report = {"status": "error", "error": str(_tica_exc)}
+
         summary = {
             "epoch": int(epoch),
             "epoch_dir": str(epoch_dir),
@@ -3874,6 +3966,7 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             "registry": registry_paths,
             "runtime_pool": runtime_pool.to_dict(),
             "runtime_pool_reports": runtime_pool_paths,
+            "tica_update": tica_update_report,
         }
         previous_diagnostics = diagnostics
         epoch_summaries.append(summary)

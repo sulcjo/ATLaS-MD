@@ -264,6 +264,10 @@ def _ss_scalar_from_sub_cv_values(sub_cv_values, metadata: dict) -> float:
     """
     mode = secondary_cv_mode(metadata)
     arr = np.asarray(sub_cv_values, dtype=np.float64)
+    if mode == "tica-linear":
+        weights = np.asarray(metadata.get("weights", []), dtype=np.float64)
+        offset = float(metadata.get("tica_offset", 0.0))
+        return float(arr @ weights + offset)
     if mode == "alpha-coil-beta":
         return float(0.5 * (arr[0] + arr[1]) - 0.5 * (arr[2] + arr[3]))
     if mode in {"rama-regions", "rama-map"}:
@@ -950,6 +954,66 @@ def add_secondary_structure_cv_force(openmm, system, topology, args, force_group
             "psi_torsions": [list(map(int, t)) for t in psi_torsions],
             "note": "Rama-map secondary CV: one dimensionless map coordinate whose centers correspond to explicit phi/psi basins, including native left-alpha. It is not a dense phi/psi grid." if mode == "rama-map" else "Scalar softmax-like Ramachandran basin coordinate; useful as an adaptive umbrella ladder but not a full 2D phi/psi free-energy surface.",
         }
+
+    if mode == "tica-linear":
+        tica_state_file = str(getattr(args, "tica_state_file", "") or "")
+        if not tica_state_file or not Path(tica_state_file).exists():
+            # First epoch: no tICA fit yet — disable secondary CV until weights available.
+            return {"enabled": False, "mode": "tica-linear", "tica_state_path": tica_state_file, "note": "no tica_state_file; secondary CV disabled for this epoch"}
+        try:
+            from .tica import TICAResult
+            tica_result = TICAResult.load(tica_state_file)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load tICA state from {tica_state_file}: {exc}") from exc
+        weights = tica_result.weights
+        offset = float(tica_result.offset)
+        n_feat = len(weights)
+        n_phi = len(phi_torsions)
+        n_psi = len(psi_torsions)
+        expected_feats = 2 * n_phi + 2 * n_psi
+        if n_feat != expected_feats:
+            raise RuntimeError(
+                f"tICA weight vector has {n_feat} components but topology provides "
+                f"{expected_feats} features ({n_phi} phi + {n_psi} psi torsions, 2 features each)"
+            )
+        # Build one CustomTorsionForce per sin/cos per torsion (sub-CVs for CustomCVForce).
+        # Feature order: sin_phi_0, cos_phi_0, ..., sin_psi_0, cos_psi_0, ...
+        cv_force = openmm.CustomCVForce("0")  # expression set below
+        sub_cv_names = []
+        for j, (a, b, c, d) in enumerate(phi_torsions):
+            for trig, fname in (("sin", f"sin_phi_{j}"), ("cos", f"cos_phi_{j}")):
+                sub_f = openmm.CustomTorsionForce(f"{trig}(theta)")
+                sub_f.addTorsion(int(a), int(b), int(c), int(d), [])
+                cv_force.addCollectiveVariable(fname, sub_f)
+                sub_cv_names.append(fname)
+        for j, (a, b, c, d) in enumerate(psi_torsions):
+            for trig, fname in (("sin", f"sin_psi_{j}"), ("cos", f"cos_psi_{j}")):
+                sub_f = openmm.CustomTorsionForce(f"{trig}(theta)")
+                sub_f.addTorsion(int(a), int(b), int(c), int(d), [])
+                cv_force.addCollectiveVariable(fname, sub_f)
+                sub_cv_names.append(fname)
+        cv_force.addGlobalParameter("ss_k", 0.0)
+        cv_force.addGlobalParameter("ss0", 0.0)
+        linear_terms = " + ".join(f"{w:.12g}*{name}" for w, name in zip(weights, sub_cv_names))
+        tic1_expr = f"({linear_terms} + ({offset:.12g}))"
+        cv_force.setEnergyFunction(f"0.5*ss_k*({tic1_expr}-ss0)^2")
+        cv_force.setForceGroup(int(force_group))
+        system.addForce(cv_force)
+        from .cv import build_tica_linear_metadata
+        meta = build_tica_linear_metadata(
+            enabled=True,
+            n_phi=n_phi,
+            n_psi=n_psi,
+            tica_state_path=tica_state_file,
+        )
+        meta["weights"] = weights.tolist()
+        meta["tica_offset"] = float(offset)
+        meta["phi_torsions"] = [list(map(int, t)) for t in phi_torsions]
+        meta["psi_torsions"] = [list(map(int, t)) for t in psi_torsions]
+        meta["force_group"] = int(force_group)
+        meta["eigenvalue"] = float(tica_result.eigenvalue)
+        meta["n_samples"] = int(tica_result.n_samples)
+        return meta
 
     phi0, psi0, label = secondary_cv_target_angles(args)
     phi_force = _add_torsion_score_force(openmm, phi_torsions, phi0, sigma, "norm_phi", "phi0")
@@ -2991,6 +3055,19 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     )
     # ────────────────────────────────────────────────────────────────────────────
 
+    # ── tICA dihedral observation buffers (optional, gated by tica_obs_interval) ─
+    _tica_obs_interval = int(getattr(args, "tica_obs_interval", 0) or 0)
+    _dihedral_buffers = None
+    if _tica_obs_interval > 0:
+        from .tica import DihedralObsBuffer
+        _phi_obs_tors, _psi_obs_tors = secondary_structure_torsions(topology)
+        _dihedral_buffers = [
+            DihedralObsBuffer(_phi_obs_tors, _psi_obs_tors, r, out_dir)
+            for r in range(nrep)
+        ]
+        _tica_obs_counter = [0]  # mutable int in a list so the closure can update it
+    # ────────────────────────────────────────────────────────────────────────────
+
     copy_sanity_rows = []
     copy_problem_count = 0
     if not use_gamd:
@@ -3516,6 +3593,18 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 rows.append(row)
             if is_prod and bool(getattr(args, "flush_every_log", True)):
                 parquet_sample_writer.flush()
+
+            # ── tICA dihedral observation recording (opt-in via tica_obs_interval) ──
+            if is_prod and _dihedral_buffers is not None:
+                _tica_obs_counter[0] += 1
+                if _tica_obs_counter[0] % _tica_obs_interval == 0:
+                    for r, sim in enumerate(sims):
+                        w = int(assignments[r])
+                        _pos_state = sim.context.getState(getPositions=True, enforcePeriodicBox=True)
+                        _pos_nm = _pos_state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+                        _dihedral_buffers[r].record(_pos_nm, int(step), w)
+            # ──────────────────────────────────────────────────────────────────────
+
             return rows
 
         def flush_scalar_writers() -> None:
@@ -4270,5 +4359,13 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             print(f"WARNING: segment registry finalization failed: {_finalize_exc}", flush=True)
 
         distance_logger.close()
+
+        # Flush tICA dihedral observation buffers if active.
+        if _dihedral_buffers is not None:
+            for _buf in _dihedral_buffers:
+                try:
+                    _buf.save()
+                except Exception as _buf_exc:
+                    print(f"WARNING: dihedral obs buffer flush failed for replica {_buf._replica}: {_buf_exc}", flush=True)
 
     print(f"Done. Outputs in {out_dir}")
