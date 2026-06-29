@@ -347,10 +347,6 @@ def _basic_chignolin_config() -> Dict[str, Any]:
         "sequence": {
             "seq": "GYDPETGTWG",
         },
-        "output": {
-            "out": "chignolin/",
-            "resume": True,
-        },
         "platform": {
             "platform": "CUDA",
             "precision": "mixed",
@@ -437,6 +433,8 @@ def _basic_chignolin_config() -> Dict[str, Any]:
             "exchange_interval": 100,
         },
         "output": {
+            "out": "chignolin/",
+            "resume": True,
             "traj_interval": 50,
             "traj_format": "xtc",
             "adaptive_pilot_trajectories": False,
