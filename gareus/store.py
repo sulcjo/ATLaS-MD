@@ -231,6 +231,44 @@ class SegmentRegistry:
         return list(self._segments)
 
 
+def finalize_segment(
+    registry: "SegmentRegistry",
+    seg_id: str,
+    *,
+    completed_cleanly: bool,
+    writers_ok: bool,
+    end_step: int,
+) -> None:
+    """Atomically decide segment fate and update the registry.
+
+    Marks the segment as ``"complete"`` only when the production loop finished
+    without exception *and* all parquet writers flushed and closed without
+    error.  Any other outcome seals the segment as ``"interrupted"`` so the
+    next resume knows to pick up from the last valid checkpoint.
+
+    Parameters
+    ----------
+    registry:
+        The :class:`SegmentRegistry` for the current run.
+    seg_id:
+        Segment ID to finalize.
+    completed_cleanly:
+        ``True`` iff the production loop ran to completion (``prod_done >=
+        prod_total``) without raising an exception.
+    writers_ok:
+        ``True`` iff all parquet writer flush/close calls succeeded.
+    end_step:
+        ``calib_steps + prod_done`` — the absolute step boundary recorded in
+        the registry entry.  For interrupted segments this is the *last known
+        step*; phantom frames beyond a checkpoint boundary are filtered by the
+        resume-time safety net.
+    """
+    if completed_cleanly and writers_ok:
+        registry.close_segment(seg_id, end_step=end_step)
+    else:
+        registry.seal_segment(seg_id, absolute_end_step=end_step, status="interrupted")
+
+
 class WindowSnapshot:
     """Writes a per-segment window definition snapshot.
 
