@@ -435,6 +435,8 @@ def _basic_chignolin_config() -> Dict[str, Any]:
         "output": {
             "out": "chignolin/",
             "resume": True,
+            "extend": False,
+            "extend_mode": "auto",
             "traj_interval": 50,
             "traj_format": "xtc",
             "adaptive_pilot_trajectories": False,

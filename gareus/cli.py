@@ -399,6 +399,12 @@ def _add_gamd_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--randomize-replica-velocities", action="store_true")
     p.add_argument("--checkpoint-interval", type=int, default=50000)
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--extend", action="store_true", default=False,
+                   help="Extend a completed run instead of resuming an interrupted one.")
+    p.add_argument("--extend-mode", dest="extend_mode",
+                   choices=["auto", "regular", "adaptive", "frozen", "topup"],
+                   default="auto",
+                   help="Extension mode: auto detects last completed phase.")
 
 
 def _add_output_args(p: argparse.ArgumentParser) -> None:
@@ -804,6 +810,9 @@ def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
     args.adaptive_production_quality_hard_fail = False
     args.adaptive_production_final_quality_extension_rounds = 0
     args.adaptive_production_final_quality_extension_steps = 0
+    # extend support
+    args.extend = bool(getattr(args, "extend", False))
+    args.extend_mode = str(getattr(args, "extend_mode", "auto"))
 
     # ── Output ────────────────────────────────────────────────────────────────
     args.color = "auto"
@@ -1193,6 +1202,31 @@ def main(argv: Optional[Iterable[str]] = None):
             print("[resume] Adaptive-production driver resume; continuing from registry/driver summary.")
             progress.emit({"event": "adaptive_production_resume_setup_loaded", "out": str(out_dir)})
             if _resume_window_mode == "double-adaptive":
+                run_double_adaptive_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
+            else:
+                run_adaptive_production_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
+
+        elif bool(getattr(args, "extend", False)) and str(getattr(args, "window_mode", "adaptive")) in {"adaptive-production", "double-adaptive"}:
+            # Extend a completed adaptive-production run.
+            setattr(args, "adaptive_production_resume", True)
+            setattr(args, "ap_resume", True)
+            _extend_window_mode = str(getattr(args, "window_mode", "adaptive"))
+            loaded_extend_setup = None
+            for _pdb_dir in list(dict.fromkeys([out_dir, out_dir.parent, out_dir.parent.parent])):
+                _setup = load_existing_openmm_setup_for_resume(args, _pdb_dir, require_equil_state=False)
+                if _setup is not None:
+                    loaded_extend_setup = _setup
+                    break
+            if loaded_extend_setup is None:
+                print()
+                print("ERROR: --extend could not load the solvated topology.")
+                print("  Expected 01_solvated_start.pdb in the run directory or one of its parents.")
+                progress.emit({"event": "extend_failed", "reason": "no_solvated_topology", "out": str(out_dir)})
+                return
+            openmm, app, unit, forcefield, topology, equil_state = loaded_extend_setup
+            print("[extend] Adaptive-production extension; final-phase skip guard active.")
+            progress.emit({"event": "adaptive_production_extend_setup_loaded", "out": str(out_dir)})
+            if _extend_window_mode == "double-adaptive":
                 run_double_adaptive_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
             else:
                 run_adaptive_production_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
