@@ -3328,6 +3328,10 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     # positions from the nearest non-stuck replica and reinitialise velocities.
     _stuck_reseed_flag = getattr(args, "cv1_stuck_reseed", None)
     _stuck_enabled = bool(_stuck_reseed_flag) if _stuck_reseed_flag is not None else primary_cv_is_contacts(args)
+    # Disable rescue in final production by default (non-equilibrium intervention).
+    _is_final_production = bool(getattr(args, "adaptive_feedback_final_production", False))
+    if _is_final_production and not bool(getattr(args, "rescue_in_final_production", False)):
+        _stuck_enabled = False
     _stuck_threshold = float(getattr(args, "cv1_stuck_threshold", 0.03) or 0.03)
     _stuck_max_intervals = int(getattr(args, "cv1_stuck_detect_intervals", 500) or 500)
     _stuck_counter = np.zeros(nrep, dtype=int)

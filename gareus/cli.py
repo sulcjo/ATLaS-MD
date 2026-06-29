@@ -250,6 +250,11 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--cv1-stuck-detect-intervals", type=int, default=500,
                    help="Consecutive exchange intervals a replica must stay below --cv1-stuck-threshold "
                         "before rescue fires (default 500; at exchange_interval=100 steps = 50,000 steps = 200 ps).")
+    p.add_argument("--rescue-in-final-production", action="store_true", default=False,
+                   dest="rescue_in_final_production",
+                   help="Allow contact-CV stuck rescue during final MBAR-quality production. "
+                        "Disabled by default — rescue events are non-equilibrium and can "
+                        "contaminate final equilibrium statistics.")
 
     # Region memory
     p.add_argument("--region-memory", action=argparse.BooleanOptionalAction, default=False,
