@@ -1413,6 +1413,35 @@ def _sample_sources_from_run_root(label: str, run_dir: Path) -> List[Tuple[str, 
     return out
 
 
+def _write_tica_version_marker(run_dir: Path, args) -> None:
+    """Write tica_cv_version.txt to run_dir before MD starts (MBAR cross-epoch guard)."""
+    version = str(getattr(args, "tica_cv_version", None) or "disabled")
+    try:
+        (Path(run_dir) / "tica_cv_version.txt").write_text(version)
+    except Exception:
+        pass
+
+
+def _apply_tica_centers_to_registry(
+    registry: "WindowStateRegistry",
+    per_window_tic1_centers: Dict[int, float],
+    epoch_dir: Path,
+) -> int:
+    """Update registry secondary_center for active states using per-window tIC1 medians.
+
+    Returns number of states updated.
+    """
+    window_map = _load_epoch_window_map(epoch_dir, registry)
+    updated = 0
+    for win_idx, state_id in window_map.items():
+        if int(win_idx) in per_window_tic1_centers:
+            state = registry.get_state(int(state_id))
+            if state is not None and state.active:
+                state.secondary_center = float(per_window_tic1_centers[int(win_idx)])
+                updated += 1
+    return updated
+
+
 def _maybe_update_tica_cvaux(epoch: int, epoch_dir: Path, adaptive_dir: Path, args) -> dict:
     """Refit tICA from epoch observations and update args for the next epoch.
 
@@ -1444,7 +1473,7 @@ def _maybe_update_tica_cvaux(epoch: int, epoch_dir: Path, adaptive_dir: Path, ar
 
     lag = int(getattr(args, "tica_lag_frames", 50) or 50)
     try:
-        from .tica import compute_tica_from_epoch_obs, load_epoch_dihedral_obs, window_tica_centers, TICAResult
+        from .tica import compute_tica_from_epoch_obs, load_epoch_dihedral_obs, window_tica_centers, TICAResult  # noqa: F401 – all used below
     except ImportError as exc:
         print(f"    tICA: import failed ({exc}); skipping update")
         return {"status": "skipped_import_error", "error": str(exc)}
@@ -1482,6 +1511,14 @@ def _maybe_update_tica_cvaux(epoch: int, epoch_dir: Path, adaptive_dir: Path, ar
     result.save(state_path)
     print(f"    tICA: fitted from epoch {epoch} ({result.n_samples} samples, eigenvalue {result.eigenvalue:.4f}) -> {state_path}")
 
+    # Compute per-window tIC1 medians for registry secondary_center update.
+    per_window_centers: Dict[int, float] = {}
+    try:
+        X_all, window_ids = load_epoch_dihedral_obs(epoch_dir)
+        per_window_centers = window_tica_centers(X_all, window_ids, result)
+    except Exception as _wc_exc:
+        print(f"    tICA: per-window center computation failed ({_wc_exc}); registry centers will not be updated")
+
     args.tica_state_file = str(state_path)
     version_tag = f"v{epoch + 1}"
     args.tica_cv_version = version_tag
@@ -1494,6 +1531,7 @@ def _maybe_update_tica_cvaux(epoch: int, epoch_dir: Path, adaptive_dir: Path, ar
         "lag_frames": int(lag),
         "state_file": str(state_path),
         "version": version_tag,
+        "per_window_tic1_centers": {int(k): float(v) for k, v in per_window_centers.items()},
     }
 
 
@@ -1502,6 +1540,7 @@ def _epoch_sample_sources(
     include_epochs: bool,
     *,
     pilot_dirs: "List[Path] | None" = None,
+    tica_cv_version: "Optional[str]" = None,
 ) -> List[Tuple[str, Path]]:
     adaptive_dir = Path(adaptive_dir)
     sources: List[Tuple[str, Path]] = []
@@ -1509,6 +1548,15 @@ def _epoch_sample_sources(
         sources.extend(_sample_sources_from_run_root(f"pilot::{Path(pilot).name}", Path(pilot)))
     if include_epochs:
         for epoch_dir in sorted(adaptive_dir.glob("epoch_[0-9][0-9][0-9]")):
+            if tica_cv_version and tica_cv_version != "disabled":
+                marker = epoch_dir / "tica_cv_version.txt"
+                epoch_version = marker.read_text().strip() if marker.exists() else "disabled"
+                if epoch_version != tica_cv_version:
+                    print(
+                        f"    tICA MBAR guard: skipping {epoch_dir.name} "
+                        f"(CV version {epoch_version!r} != {tica_cv_version!r})"
+                    )
+                    continue
             sources.extend(_sample_sources_from_run_root(epoch_dir.name, epoch_dir))
     final_dir = adaptive_dir / "final"
     sources.extend(_sample_sources_from_run_root("final", final_dir))
@@ -1524,6 +1572,7 @@ def build_union_state_mbar_inputs(
     include_epochs: bool = True,
     pilot_dirs: "List[Path] | None" = None,
     output_prefix: str = "adaptive_union_mbar",
+    tica_cv_version: "Optional[str]" = None,
 ) -> Dict[str, Any]:
     """Build post-hoc bias matrices over the union of registry states.
 
@@ -1554,7 +1603,9 @@ def build_union_state_mbar_inputs(
     ], dtype=np.float64)
 
     sample_rows: List[Dict[str, Any]] = []
-    for source_label, sample_dir in _epoch_sample_sources(adaptive_dir, include_epochs=include_epochs, pilot_dirs=pilot_dirs):
+    for source_label, sample_dir in _epoch_sample_sources(
+        adaptive_dir, include_epochs=include_epochs, pilot_dirs=pilot_dirs, tica_cv_version=tica_cv_version
+    ):
         rows = _read_sample_dicts(sample_dir)
         if not rows:
             continue
@@ -3859,6 +3910,7 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                 print(f"    Adaptive-production epoch {epoch + 1}/{max_epochs}: {actual_epoch_steps} steps -> {epoch_dir}")
             if current_windows_csv is not None:
                 print(f"      active window table: {current_windows_csv}")
+            _write_tica_version_marker(epoch_dir, epoch_args)
             run_gareus(epoch_args, epoch_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
             if _graceful_shutdown.is_set():
                 _write_runtime_pool_reports(adaptive_dir, runtime_pool)
@@ -3947,6 +3999,14 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
         tica_update_report = {}
         try:
             tica_update_report = _maybe_update_tica_cvaux(epoch, epoch_dir, adaptive_dir, args)
+            if tica_update_report.get("status") == "updated" and registry is not None:
+                per_window_centers = tica_update_report.get("per_window_tic1_centers", {})
+                if per_window_centers:
+                    n_updated = _apply_tica_centers_to_registry(registry, per_window_centers, epoch_dir)
+                    tica_update_report["registry_states_updated"] = n_updated
+                    print(f"    tICA: updated secondary_center for {n_updated} active registry states")
+                    if n_updated > 0:
+                        registry.save(adaptive_dir)
         except Exception as _tica_exc:
             print(f"WARNING: _maybe_update_tica_cvaux failed for epoch {epoch}: {_tica_exc}")
             tica_update_report = {"status": "error", "error": str(_tica_exc)}
@@ -4121,6 +4181,7 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             else:
                 print(f"    Adaptive-production final frozen phase: {actual_final_steps} steps -> {final_dir}")
             print(f"      final active window table: {final_windows_csv}")
+            _write_tica_version_marker(final_dir, final_args)
             run_gareus(final_args, final_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
             if _graceful_shutdown.is_set():
                 _write_runtime_pool_reports(adaptive_dir, runtime_pool)
@@ -4208,6 +4269,7 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             f"    Adaptive-production frozen final extension {ext_index + 1}/{ext_rounds}: "
             f"{actual_ext_steps} steps -> {ext_dir}"
         )
+        _write_tica_version_marker(ext_dir, ext_args)
         run_gareus(ext_args, ext_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
         if _graceful_shutdown.is_set():
             _write_runtime_pool_reports(adaptive_dir, runtime_pool)
@@ -4270,6 +4332,7 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                 include_epochs=use_epoch_samples_for_mbar,
                 pilot_dirs=_pilot_dirs,
                 output_prefix="adaptive_union_mbar",
+                tica_cv_version=getattr(args, "tica_cv_version", None),
             )
         except Exception as exc:
             print(f"WARNING: adaptive-production union MBAR input builder failed: {exc}")

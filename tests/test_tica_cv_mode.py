@@ -72,3 +72,105 @@ class TestConfigKeyRejection:
         dests = _build_known_config_dests(parser)
         for key in ("tica_obs_interval", "tica_update_after_epochs", "tica_lag_frames"):
             assert key in dests, f"YAML key '{key}' not in argparse dests — add --{key.replace('_','-')} to cli.py"
+
+
+class TestMBARGuard:
+    def test_version_marker_written_disabled(self, tmp_path):
+        """_write_tica_version_marker writes 'disabled' when no tica_cv_version on args."""
+        import argparse
+        from gareus.adaptive_production import _write_tica_version_marker
+        args = argparse.Namespace()
+        _write_tica_version_marker(tmp_path, args)
+        assert (tmp_path / "tica_cv_version.txt").read_text() == "disabled"
+
+    def test_version_marker_written_versioned(self, tmp_path):
+        """_write_tica_version_marker writes the actual version string."""
+        import argparse
+        from gareus.adaptive_production import _write_tica_version_marker
+        args = argparse.Namespace(tica_cv_version="v2")
+        _write_tica_version_marker(tmp_path, args)
+        assert (tmp_path / "tica_cv_version.txt").read_text() == "v2"
+
+    def test_epoch_sample_sources_filters_incompatible(self, tmp_path):
+        """Epochs with mismatched tica_cv_version are excluded from sample sources."""
+        from gareus.adaptive_production import _epoch_sample_sources
+
+        # Create two fake epoch dirs; epoch_000 has v1, epoch_001 has v2
+        for name, version in [("epoch_000", "v1"), ("epoch_001", "v2")]:
+            d = tmp_path / name
+            d.mkdir()
+            (d / "tica_cv_version.txt").write_text(version)
+            # Write a minimal samples.csv so _run_dir_has_samples passes
+            (d / "samples.csv").write_text("step,window,cv_A\n1,0,0.5\n")
+
+        sources = _epoch_sample_sources(tmp_path, include_epochs=True, tica_cv_version="v2")
+        names = [label for label, _ in sources]
+        assert "epoch_001" in names
+        assert "epoch_000" not in names
+
+    def test_epoch_sample_sources_no_filter_when_disabled(self, tmp_path):
+        """tica_cv_version=None includes all epochs (tICA disabled)."""
+        from gareus.adaptive_production import _epoch_sample_sources
+
+        for name in ["epoch_000", "epoch_001"]:
+            d = tmp_path / name
+            d.mkdir()
+            (d / "samples.csv").write_text("step,window,cv_A\n1,0,0.5\n")
+
+        sources = _epoch_sample_sources(tmp_path, include_epochs=True, tica_cv_version=None)
+        names = [label for label, _ in sources]
+        assert "epoch_000" in names
+        assert "epoch_001" in names
+
+
+class TestApplyTICACentersToRegistry:
+    def test_updates_active_states(self, tmp_path):
+        """_apply_tica_centers_to_registry sets secondary_center on active states."""
+        from gareus.adaptive_production import (
+            WindowState, WindowStateRegistry, _apply_tica_centers_to_registry
+        )
+        import csv
+
+        # Build a registry with 2 active states
+        reg = WindowStateRegistry()
+        s0 = WindowState(state_id=0, primary_center=1.0, primary_k=1.0, secondary_center=0.0)
+        s1 = WindowState(state_id=1, primary_center=2.0, primary_k=1.0, secondary_center=0.0)
+        reg._states = {0: s0, 1: s1}
+        reg._next_state_id = 2
+
+        # Write an epoch_window_map.csv: window 0 → state 0, window 1 → state 1
+        wmap = tmp_path / "epoch_window_map.csv"
+        with open(wmap, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["epoch_window", "state_id"])
+            writer.writeheader()
+            writer.writerow({"epoch_window": 0, "state_id": 0})
+            writer.writerow({"epoch_window": 1, "state_id": 1})
+
+        per_window_centers = {0: 0.42, 1: -0.13}
+        n = _apply_tica_centers_to_registry(reg, per_window_centers, tmp_path)
+
+        assert n == 2
+        assert reg.get_state(0).secondary_center == pytest.approx(0.42)
+        assert reg.get_state(1).secondary_center == pytest.approx(-0.13)
+
+    def test_skips_retired_states(self, tmp_path):
+        """Retired states are not updated."""
+        from gareus.adaptive_production import (
+            WindowState, WindowStateRegistry, _apply_tica_centers_to_registry
+        )
+        import csv
+
+        reg = WindowStateRegistry()
+        s0 = WindowState(state_id=0, primary_center=1.0, primary_k=1.0, active=False, secondary_center=0.0)
+        reg._states = {0: s0}
+        reg._next_state_id = 1
+
+        wmap = tmp_path / "epoch_window_map.csv"
+        with open(wmap, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["epoch_window", "state_id"])
+            writer.writeheader()
+            writer.writerow({"epoch_window": 0, "state_id": 0})
+
+        n = _apply_tica_centers_to_registry(reg, {0: 1.5}, tmp_path)
+        assert n == 0
+        assert reg.get_state(0).secondary_center == pytest.approx(0.0)
