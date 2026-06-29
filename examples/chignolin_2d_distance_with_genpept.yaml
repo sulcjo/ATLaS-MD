@@ -82,7 +82,7 @@ output:
   distance_output_interval: 150
   checkpoint_interval: 50000
   progress_mode: both
-  progress_update_interval_sec: 10.0
+
   traj_format: xtc
   traj_solute_only: true
   sample_potential_energy: false
@@ -97,12 +97,9 @@ platform:
 
 simulation:
   run_mode: hmr-gamd
-  hmr: true
-  hydrogen_mass_amu: 3.024
   timestep_fs: 4.0
   nvt_warmup_timestep_fs: 0.5
   npt_ramp_timestep_fs: 1.0
-  equil_safe_chunk_steps: 5000
   box_shape: dodecahedron
   padding_nm: 1.0
   water_model: tip3p
@@ -114,38 +111,34 @@ cvs:
 
 windows:
   window_mode: adaptive-feedback
-  adaptive_prescan_steps: 50000
-  adaptive_prescan_timestep_fs: 2.0
-  adaptive_window_aggressiveness: aggressive
-  adaptive_feedback_rounds: 3
-  adaptive_feedback_pilot_fraction: 0.006
-  adaptive_feedback_validation_steps: 10000
-  adaptive_min_windows: 4
-  adaptive_max_windows: 32
+  aggressiveness: aggressive
+  adaptive_rounds: 3
+  pilot_fraction: 0.006
+  validation_steps: 10000
+  min_total_windows: 4
+  max_total_windows: 32
 
-primary_cv:
-  adaptive_min_k_kcal_a2: 0.5
-  adaptive_max_k_kcal_a2: 10.0
+contact_cv:
+  # CV1 adaptive (was primary_cv.adaptive_min/max_k_kcal_a2)
+  cv1_k_min: 0.5
+  cv1_k_max: 10.0
 
-secondary_cv:
-  adaptive_secondary_cv: auto
-  secondary_cv_k_mode: adaptive
-  secondary_cv_centers: [-1.0, 0.0, 1.0]
-  secondary_cv_adaptive_overlap_sigma: 20.0
-  secondary_cv_adaptive_min_k_kcal: 1.0
-  secondary_cv_adaptive_max_k_kcal: 50.0
-  secondary_cv_adaptive_min_sigma: 0.02
-  secondary_cv_adaptive_k_scale: 2.0
+cv2:
+  # CV2 adaptive (was secondary_cv_*)
+  cv2_k_mode: adaptive
+  cv2_centers: [-1.0, 0.0, 1.0]
+  cv2_adaptive_overlap_sigma: 20.0
+  cv2_k_min: 1.0
+  cv2_k_max: 50.0
+  cv2_k_scale: 2.0
 
 gamd:
   gamd_boost_type: lower-dual
-  gamd_production_steps: 3000000
-  sigma0p_kcal_mol: 4.0
-  sigma0d_kcal_mol: 4.0
-  gamd_cmd_prep_steps: 5000
+  production_steps: 3000000
+  sigma0p: 4.0
+  sigma0d: 4.0
   gamd_cmd_steps: 100000
-  gamd_equil_prep_steps: 5000
-  gamd_equil_steps: 100000
+  equil_steps: 100000
   gamd_averaging_window: 20000
 
 exchange:
@@ -154,16 +147,10 @@ exchange:
 
 tui:
   tui_mode: interactive
-  tui_clear_mode: always
 
 starting_structures:
   seed_conformers_dir: chignolin_genpept_seeds/
-  us_2d_start_relax_mode: auto
-  us_2d_start_distance_fraction: 0.05
-  us_2d_start_secondary_ramp_stages: 5
-  us_2d_start_secondary_k_pull_scale: 5.0
-  us_2d_start_minimize_each_ramp: false
-  us_2d_start_secondary_warn_delta: 0.35
-  us_2d_start_secondary_warn_bias_kcal: 1.0
-  us_2d_start_secondary_bad_bias_kcal: 5.0
+  us_2d_relax_mode: auto
+  us_pull_ramp_stages: 5
+  us_2d_secondary_k_scale: 5.0
   us_pull_steps_per_window: 20000
