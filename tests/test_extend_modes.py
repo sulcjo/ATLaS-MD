@@ -333,3 +333,64 @@ class TestApExtendArgsParsing:
         """--ap-extend-steps 50000 → ap_extend_steps == 50000."""
         args = self._parse(["--ap-extend-steps", "50000"])
         assert args.ap_extend_steps == 50000
+
+
+# ---------------------------------------------------------------------------
+# Test group 9: Guard condition — non-AP window_mode with non-regular extend_mode
+#
+# The dispatch guard in main() rejects --extend with non-regular extend_mode
+# when window_mode is not in {adaptive-production, double-adaptive}.  We verify
+# the *condition* logic (mode not regular AND mode not in AP set) directly,
+# without calling main() (which requires OpenMM).
+# ---------------------------------------------------------------------------
+
+class TestExtendGuardCondition:
+    """Verify that _resolve_and_apply_extend_mode does NOT set resume=True
+    for frozen/adaptive/topup modes, ensuring the dispatch guard fires."""
+
+    _AP_WINDOW_MODES = {"adaptive-production", "double-adaptive"}
+
+    def _resolve(self, args, out_dir):
+        from gareus.adaptive_production import _resolve_and_apply_extend_mode
+        return _resolve_and_apply_extend_mode(args, out_dir)
+
+    def _guard_would_fire(self, mode: str, window_mode: str) -> bool:
+        """Replicate the guard condition added to cli.py main()."""
+        return mode != "regular" and window_mode not in self._AP_WINDOW_MODES
+
+    def test_frozen_with_adaptive_feedback_triggers_guard(self, tmp_path):
+        """frozen mode + adaptive-feedback window_mode → guard fires."""
+        args = _make_args(extend=True, extend_mode="frozen",
+                          window_mode="adaptive-feedback")
+        mode = self._resolve(args, tmp_path)
+        assert self._guard_would_fire(mode, "adaptive-feedback")
+        assert not getattr(args, "resume", False), "resume must NOT be set — fresh-run path must be blocked"
+
+    def test_adaptive_mode_with_adaptive_feedback_triggers_guard(self, tmp_path):
+        """adaptive mode + adaptive-feedback window_mode → guard fires."""
+        args = _make_args(extend=True, extend_mode="adaptive",
+                          window_mode="adaptive-feedback", adaptive_production_epochs=3)
+        mode = self._resolve(args, tmp_path)
+        assert self._guard_would_fire(mode, "adaptive-feedback")
+
+    def test_topup_mode_with_adaptive_feedback_triggers_guard(self, tmp_path):
+        """topup mode + adaptive-feedback window_mode → guard fires."""
+        args = _make_args(extend=True, extend_mode="topup",
+                          window_mode="adaptive-feedback")
+        mode = self._resolve(args, tmp_path)
+        assert self._guard_would_fire(mode, "adaptive-feedback")
+
+    def test_regular_mode_does_not_trigger_guard(self, tmp_path):
+        """regular mode → guard does NOT fire (resume path is correct)."""
+        args = _make_args(extend=True, extend_mode="regular",
+                          window_mode="adaptive-feedback")
+        mode = self._resolve(args, tmp_path)
+        assert not self._guard_would_fire(mode, "adaptive-feedback")
+        assert args.resume is True
+
+    def test_frozen_with_adaptive_production_does_not_trigger_guard(self, tmp_path):
+        """frozen mode + adaptive-production → guard does NOT fire (AP path handles it)."""
+        args = _make_args(extend=True, extend_mode="frozen",
+                          window_mode="adaptive-production", ap_extend_rounds=1)
+        mode = self._resolve(args, tmp_path)
+        assert not self._guard_would_fire(mode, "adaptive-production")

@@ -1184,7 +1184,15 @@ def main(argv: Optional[Iterable[str]] = None):
     # can set args.resume=True and fall through to the elif resume: branch below.
     if bool(getattr(args, "extend", False)):
         from gareus.adaptive_production import _resolve_and_apply_extend_mode
-        _resolve_and_apply_extend_mode(args, out_dir)
+        _resolved_extend_mode = _resolve_and_apply_extend_mode(args, out_dir)
+        _ap_window_modes = {"adaptive-production", "double-adaptive"}
+        _current_window_mode = str(getattr(args, "window_mode", "adaptive"))
+        if _resolved_extend_mode != "regular" and _current_window_mode not in _ap_window_modes:
+            print()
+            print(f"ERROR: --extend with extend_mode='{_resolved_extend_mode}' requires window_mode in")
+            print(f"  {sorted(_ap_window_modes)}, but got window_mode='{_current_window_mode}'.")
+            print("  Use --extend-mode regular (or omit --extend) to resume a non-adaptive-production run.")
+            return
 
     progress = GuiProgressSink(out_dir, args)
     _run_status = "started"
