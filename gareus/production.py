@@ -4241,11 +4241,19 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             if _prod_completed_cleanly:
                 parquet_sample_writer.flush()
                 parquet_exchange_writer.flush()
-            parquet_sample_writer.close()
-            parquet_exchange_writer.close()
-        except Exception as _w_exc:
+        except Exception as _flush_exc:
             _writers_ok = False
-            print(f"WARNING: parquet writer flush/close failed: {_w_exc}", flush=True)
+            print(f"WARNING: parquet writer flush failed: {_flush_exc}", flush=True)
+        try:
+            parquet_sample_writer.close()
+        except Exception as _close_exc:
+            _writers_ok = False
+            print(f"WARNING: parquet_sample_writer.close() failed: {_close_exc}", flush=True)
+        try:
+            parquet_exchange_writer.close()
+        except Exception as _close_exc:
+            _writers_ok = False
+            print(f"WARNING: parquet_exchange_writer.close() failed: {_close_exc}", flush=True)
 
         # Gate segment-complete marking on BOTH a clean loop exit AND
         # successful writer flush/close.  Any failure leaves the segment
