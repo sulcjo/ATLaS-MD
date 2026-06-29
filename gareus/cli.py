@@ -250,6 +250,11 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--cv1-stuck-detect-intervals", type=int, default=500,
                    help="Consecutive exchange intervals a replica must stay below --cv1-stuck-threshold "
                         "before rescue fires (default 500; at exchange_interval=100 steps = 50,000 steps = 200 ps).")
+    p.add_argument("--rescue-in-final-production", action="store_true", default=False,
+                   dest="rescue_in_final_production",
+                   help="Allow contact-CV stuck rescue during final MBAR-quality production. "
+                        "Disabled by default — rescue events are non-equilibrium and can "
+                        "contaminate final equilibrium statistics.")
 
     # Region memory
     p.add_argument("--region-memory", action=argparse.BooleanOptionalAction, default=False,
@@ -299,7 +304,16 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--ap-target-overlap", type=float, default=0.25)
     p.add_argument("--ap-min-exchange", type=float, default=0.08)
     p.add_argument("--ap-min-samples", type=int, default=50)
-    p.add_argument("--ap-retire-min-samples", type=int, default=200)
+    p.add_argument("--ap-retire-min-samples", type=int, default=200,
+                   help="[compat alias] Minimum saved sample rows per window per adaptive round "
+                        "before retirement is considered. Prefer --ap-min-samples-per-window.")
+    p.add_argument("--ap-min-samples-per-window", type=int, default=200,
+                   help="Minimum saved sample rows per window per adaptive round (same unit as "
+                        "ap_retire_min_samples: rows written by ParquetSampleWriter, one row per "
+                        "distance_output_interval steps). Total steps >= value * distance_output_interval.")
+    p.add_argument("--ap-final-min-samples-per-window", type=int, default=100,
+                   help="Minimum saved sample rows per window in the final frozen production phase "
+                        "(same unit as ap_min_samples_per_window).")
     p.add_argument("--ap-max-new-windows", type=int, default=4)
     p.add_argument("--ap-retire-converged", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--ap-gamd-boost-sd-warn", type=float, default=6.0)
@@ -308,6 +322,10 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                    help="Max aggregate MD simulation time in ns. 0 disables.")
     p.add_argument("--ap-final-pool-fraction", type=float, default=0.50)
     p.add_argument("--ap-min-final-pool-ns", type=float, default=0.0)
+    p.add_argument("--ap-extend-rounds", dest="ap_extend_rounds", type=int, default=1,
+                   help="Extension rounds / extra epochs for --extend (frozen: extension rounds; adaptive: extra epochs).")
+    p.add_argument("--ap-extend-steps", dest="ap_extend_steps", type=int, default=0,
+                   help="Steps per extension round for --extend frozen mode. 0 = reuse final-phase steps.")
 
 
 def _add_us_args(p: argparse.ArgumentParser) -> None:
@@ -385,6 +403,12 @@ def _add_gamd_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--randomize-replica-velocities", action="store_true")
     p.add_argument("--checkpoint-interval", type=int, default=50000)
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--extend", action="store_true", default=False,
+                   help="Extend a completed run instead of resuming an interrupted one.")
+    p.add_argument("--extend-mode", dest="extend_mode",
+                   choices=["auto", "regular", "adaptive", "frozen", "topup"],
+                   default="auto",
+                   help="Extension mode: auto detects last completed phase.")
 
 
 def _add_output_args(p: argparse.ArgumentParser) -> None:
@@ -750,7 +774,14 @@ def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
     args.adaptive_production_target_overlap = args.ap_target_overlap
     args.adaptive_production_min_exchange = args.ap_min_exchange
     args.adaptive_production_min_samples = args.ap_min_samples
-    args.adaptive_production_retire_min_samples = args.ap_retire_min_samples
+    # ap_min_samples_per_window is the preferred name; ap_retire_min_samples is the legacy alias.
+    # Start from the new preferred key, then let the legacy alias override when it was set
+    # explicitly (i.e. differs from its argparse default of 200).
+    args.adaptive_production_retire_min_samples = args.ap_min_samples_per_window
+    if args.ap_retire_min_samples != 200:
+        # Legacy alias was explicitly set — honour it for backward compatibility.
+        args.adaptive_production_retire_min_samples = args.ap_retire_min_samples
+    args.adaptive_production_final_min_samples_per_state = args.ap_final_min_samples_per_window
     args.adaptive_production_max_new_windows_per_epoch = args.ap_max_new_windows
     args.adaptive_production_retire_converged = args.ap_retire_converged
     args.adaptive_production_max_gamd_boost_sd_kcal_mol = args.ap_gamd_boost_sd_warn
@@ -778,11 +809,15 @@ def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
     args.adaptive_production_require_convergence_before_final = False
     args.adaptive_production_pool_hard_stop = True
     args.adaptive_production_final_connectivity_required = True
-    args.adaptive_production_final_min_samples_per_state = 100
+    # final_min_samples_per_state is set earlier from ap_final_min_samples_per_window (default 100).
     args.adaptive_production_quality_min_primary_coverage_fraction = 0.25
     args.adaptive_production_quality_hard_fail = False
     args.adaptive_production_final_quality_extension_rounds = 0
     args.adaptive_production_final_quality_extension_steps = 0
+    # extend support
+    args.extend = bool(getattr(args, "extend", False))
+    args.extend_mode = str(getattr(args, "extend_mode", "auto"))
+    args.adaptive_production_topup_only = False
 
     # ── Output ────────────────────────────────────────────────────────────────
     args.color = "auto"
@@ -1144,6 +1179,21 @@ def main(argv: Optional[Iterable[str]] = None):
     else:
         write_json(out_dir / "run_args.json", public_args)
     initialize_run_manifest(args, out_dir, argv=argv_list)
+
+    # Resolve --extend mode BEFORE the dispatch chain so that extend_mode='regular'
+    # can set args.resume=True and fall through to the elif resume: branch below.
+    if bool(getattr(args, "extend", False)):
+        from gareus.adaptive_production import _resolve_and_apply_extend_mode
+        _resolved_extend_mode = _resolve_and_apply_extend_mode(args, out_dir)
+        _ap_window_modes = {"adaptive-production", "double-adaptive"}
+        _current_window_mode = str(getattr(args, "window_mode", "adaptive"))
+        if _resolved_extend_mode != "regular" and _current_window_mode not in _ap_window_modes:
+            print()
+            print(f"ERROR: --extend with extend_mode='{_resolved_extend_mode}' requires window_mode in")
+            print(f"  {sorted(_ap_window_modes)}, but got window_mode='{_current_window_mode}'.")
+            print("  Use --extend-mode regular (or omit --extend) to resume a non-adaptive-production run.")
+            return
+
     progress = GuiProgressSink(out_dir, args)
     _run_status = "started"
     _run_error = None
@@ -1172,6 +1222,31 @@ def main(argv: Optional[Iterable[str]] = None):
             print("[resume] Adaptive-production driver resume; continuing from registry/driver summary.")
             progress.emit({"event": "adaptive_production_resume_setup_loaded", "out": str(out_dir)})
             if _resume_window_mode == "double-adaptive":
+                run_double_adaptive_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
+            else:
+                run_adaptive_production_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
+
+        elif bool(getattr(args, "extend", False)) and str(getattr(args, "window_mode", "adaptive")) in {"adaptive-production", "double-adaptive"}:
+            # Extend a completed adaptive-production run.
+            setattr(args, "adaptive_production_resume", True)
+            setattr(args, "ap_resume", True)
+            _extend_window_mode = str(getattr(args, "window_mode", "adaptive"))
+            loaded_extend_setup = None
+            for _pdb_dir in list(dict.fromkeys([out_dir, out_dir.parent, out_dir.parent.parent])):
+                _setup = load_existing_openmm_setup_for_resume(args, _pdb_dir, require_equil_state=False)
+                if _setup is not None:
+                    loaded_extend_setup = _setup
+                    break
+            if loaded_extend_setup is None:
+                print()
+                print("ERROR: --extend could not load the solvated topology.")
+                print("  Expected 01_solvated_start.pdb in the run directory or one of its parents.")
+                progress.emit({"event": "extend_failed", "reason": "no_solvated_topology", "out": str(out_dir)})
+                return
+            openmm, app, unit, forcefield, topology, equil_state = loaded_extend_setup
+            print("[extend] Adaptive-production extension; final-phase skip guard active.")
+            progress.emit({"event": "adaptive_production_extend_setup_loaded", "out": str(out_dir)})
+            if _extend_window_mode == "double-adaptive":
                 run_double_adaptive_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
             else:
                 run_adaptive_production_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)

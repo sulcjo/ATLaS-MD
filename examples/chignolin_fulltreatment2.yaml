@@ -45,23 +45,15 @@ genpept:
 # GAREUS-side import of GENPEPT structures as a prescan prior.
 # GENPEPT itself still reads the top-level genpept: block above.
 genpept_prescan:
-  genpept_prescan_enabled: true
+  genpept_prescan: true
   genpept_prescan_dir: chignolin_genpept_seeds
 
-  # Rescore these GENPEPT outputs with the active GaREUS CV definitions.
   genpept_prescan_stages:
     - candidate_seeds
     - aa_implicit_minimized_pdbs
     - basin_hop_minima
     - nma_probe_seeds
     - final_survivor_seeds
-
-  genpept_prescan_rescore_active_cvs: true
-
-  # Contact x Rama occupancy map resolution.
-  genpept_prescan_contact_bin_width: 0.025
-  genpept_prescan_rama_bin_width: 0.25
-  genpept_prescan_min_hits_per_bin: 2
 
   # Use relaxed-ish stages for the stable contact frontier.
   genpept_prescan_frontier_stages:
@@ -72,11 +64,6 @@ genpept_prescan:
   # GENPEPT evidence biases windows/seeds but does not hard-exclude missing regions.
   genpept_prescan_use_as_window_prior: true
   genpept_prescan_use_as_seed_library: true
-  genpept_prescan_absence_means_unknown: true
-
-  genpept_prescan_output_prefix: genpept_prescan
-  genpept_prescan_write_maps: true
-  genpept_prescan_write_seed_assignments: true
 
 cvs:
   cv1: contacts
@@ -91,77 +78,52 @@ contact_cv:
   contact_beta_a_inv: 4.0
   contact_normalize: true
 
-  contact_adaptive_min: 0.0
-  contact_adaptive_max: 0.6
-  contact_adaptive_target_spacing: 0.05
-  contact_adaptive_min_k_kcal: 50
-  contact_adaptive_max_k_kcal: 100
+  # CV1 adaptive (unified; was contact_adaptive_*)
+  cv1_range_min: 0.0
+  cv1_range_max: 0.6
+  cv1_target_spacing: 0.05
+  cv1_k_min: 50.0
+  cv1_k_max: 100.0
 
-  contact_autocalibrate_windows: true
-  contact_autocalibration_steps: 10000
-  contact_autocalibration_sample_interval: 20
+  # Frontier probing (was contact_frontier_enabled + contact_frontier_probe_count)
+  cv1_frontier: true
+  cv1_frontier_probe_count: 2
 
-  # Contact-frontier/probe logic for contact-primary adaptive feedback.
-  contact_frontier_enabled: true
-  contact_frontier_percentile: 99.0
-  contact_frontier_margin: 0.02
-  contact_frontier_min_span: 0.10
-  contact_frontier_probe_count: 2
-  contact_frontier_probe_spacing: 0.05
-  contact_frontier_max_probe_offset: 0.15
-  contact_disable_gapfill_above_unvalidated_frontier: true
-  contact_frontier_confirm_rounds: 2
-  contact_frontier_min_hit_fraction: 0.02
-  contact_frontier_unreachable_deficit: 0.08
-  contact_frontier_by_secondary_slice: true
-
-secondary_cv:
-  secondary_cv_adaptive_min_k_kcal: 20.0
-  secondary_cv_adaptive_max_k_kcal: 50.0
-  secondary_cv_k_mode: adaptive
-  secondary_cv_adaptive_overlap_sigma: 20.0
-  secondary_cv_adaptive_k_scale: 2.0
+cv2:
+  # CV2 adaptive (was secondary_cv_*)
+  cv2_k_min: 20.0
+  cv2_k_max: 50.0
+  cv2_k_mode: adaptive
+  cv2_adaptive_overlap_sigma: 20.0
+  cv2_k_scale: 2.0
 
 starting_structures:
   seed_conformers_dir: chignolin_genpept_seeds
-  us_2d_start_secondary_ramp_stages: 5
-  us_2d_start_secondary_k_pull_scale: 5.0
+  us_pull_ramp_stages: 5
+  us_2d_secondary_k_scale: 5.0
   us_pull_steps_per_window: 50000
   us_pull_timestep_fs: 2.0
-  us_pull_k_kcal_a2: 50
+  us_pull_k: 50.0
 
 windows:
   window_mode: adaptive-feedback
-  adaptive_window_aggressiveness: aggressive
-  adaptive_feedback_pilot_fraction: 0.02
-  adaptive_feedback_validation_steps: 20000
-  adaptive_feedback_rounds: 5
-  adaptive_target_spacing_a: 0.05
+  aggressiveness: aggressive
+  pilot_fraction: 0.02
+  validation_steps: 20000
+  adaptive_rounds: 5
 
-  # Generic sparse 2D refinement. This is CV-agnostic and lets adaptive feedback
-  # switch from full rectangular grids to explicit local 2D patch windows when
-  # only specific primary-CV x secondary-CV neighborhoods need repair.
-  sparse_2d_patches_enabled: true
+  # Sparse 2D patch refinement (was sparse_2d_patches_enabled + contact_sparse_2d_patches_enabled).
+  sparse_2d: true
+  max_2d_patches: 12
 
-  # Contact-tuned sparse 2D refinement. This keeps the generic machinery active,
-  # but applies contact-specific frontier/probe behavior for nonlocal contacts.
-  contact_sparse_2d_patches_enabled: true
-  adaptive_2d_max_local_patches: 12
-  adaptive_2d_min_edge_samples: 5
-
-  # Explicit sparse 2D tables now use neutral primary-CV column names, while
-  # legacy distance_* aliases are still accepted by the code.
   explicit_2d_window_schema: generic
 
-  # Stateful adaptive-feedback classification.
-  adaptive_feedback_region_state_enabled: true
-  adaptive_feedback_region_memory_decay: 0.5
-  adaptive_feedback_min_effective_samples: 50
-
-  # Explicit action classes.
-  adaptive_feedback_probe_unvalidated_regions: true
-  adaptive_feedback_prune_overscanned_regions: true
-  adaptive_feedback_extend_undersampled_regions: true
+  # Stateful adaptive-feedback classification (was adaptive_feedback_region_state_enabled).
+  region_memory: true
+  region_memory_decay: 0.5
+  region_probe_unvalidated: true
+  region_prune_overscanned: true
+  region_extend_undersampled: true
 
 explicit_2d_windows:
   explicit_2d_primary_cv_mode_column: primary_cv_mode
@@ -176,7 +138,7 @@ output:
   traj_interval: 150
   report_interval: 150
   distance_output_interval: 150
-  progress_update_interval_sec: 30.0
+
   traj_format: xtc
   traj_solute_only: true
   sample_potential_energy: false
@@ -190,14 +152,13 @@ simulation:
   timestep_fs: 4.0
   nvt_warmup_timestep_fs: 0.5
   npt_ramp_timestep_fs: 1.0
-  equil_safe_chunk_steps: 5000
 
 gamd:
-  gamd_production_steps: 3000000
-  sigma0p_kcal_mol: 5.0
-  sigma0d_kcal_mol: 5.0
+  production_steps: 3000000
+  sigma0p: 5.0
+  sigma0d: 5.0
   gamd_cmd_steps: 100000
-  gamd_equil_steps: 100000
+  equil_steps: 100000
   gamd_averaging_window: 2000
 
 exchange:

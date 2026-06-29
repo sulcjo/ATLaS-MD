@@ -28,7 +28,7 @@ import numpy as np
 
 from .io import BufferedCsvDictWriter, write_json, read_json_file, _json_ready
 from .logger import DistanceLogger, is_gamd_production_phase
-from .store import ParquetSampleWriter, ParquetExchangeWriter, SegmentRegistry, WindowSnapshot, parse_gamd_boost_components
+from .store import ParquetSampleWriter, ParquetExchangeWriter, SegmentRegistry, WindowSnapshot, parse_gamd_boost_components, finalize_segment
 from .progress import GuiProgressSink, release_openmm_contexts
 from .lifecycle import _graceful_shutdown, _register_graceful_shutdown
 from .units import kcal_to_kj, kcal_a2_to_kj_nm2
@@ -3328,6 +3328,10 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     # positions from the nearest non-stuck replica and reinitialise velocities.
     _stuck_reseed_flag = getattr(args, "cv1_stuck_reseed", None)
     _stuck_enabled = bool(_stuck_reseed_flag) if _stuck_reseed_flag is not None else primary_cv_is_contacts(args)
+    # Disable rescue in final production by default (non-equilibrium intervention).
+    _is_final_production = bool(getattr(args, "adaptive_feedback_final_production", False))
+    if _is_final_production and not bool(getattr(args, "rescue_in_final_production", False)):
+        _stuck_enabled = False
     _stuck_threshold = float(getattr(args, "cv1_stuck_threshold", 0.03) or 0.03)
     _stuck_max_intervals = int(getattr(args, "cv1_stuck_detect_intervals", 500) or 500)
     _stuck_counter = np.zeros(nrep, dtype=int)
@@ -3343,6 +3347,12 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             f"WARNING: --cpu-threads 0 (use all cores) combined with {nrep} parallel replicas "
             "will oversubscribe CPU cores. Set --cpu-threads 1 for parallel step_all()."
         )
+    # Sentinel variables initialised here so the finally block can always read
+    # them safely, even if the try body raises before the loop sets prod_done or
+    # prod_total.
+    _prod_completed_cleanly = False
+    prod_done = 0
+    prod_total = 0
     try:
         exchange_writer = parquet_exchange_writer
 
@@ -4212,23 +4222,53 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         except Exception as exc:
             print(f"WARNING: final report/validation failed: {exc}")
 
+        # Mark the production run as cleanly completed only when the loop ran
+        # to completion (prod_done >= prod_total).  A graceful-shutdown break
+        # leaves prod_done < prod_total and correctly keeps the flag False.
+        _prod_completed_cleanly = (prod_done >= prod_total > 0)
+
     finally:
         try:
             _sim_pool.shutdown(wait=True)
         except Exception:
             pass
+
+        # Flush and close parquet writers.  Track whether ALL of these
+        # succeed so the segment registry can distinguish a fully written
+        # segment from a truncated or crashed one.
+        _writers_ok = True
+        try:
+            if _prod_completed_cleanly:
+                parquet_sample_writer.flush()
+                parquet_exchange_writer.flush()
+        except Exception as _flush_exc:
+            _writers_ok = False
+            print(f"WARNING: parquet writer flush failed: {_flush_exc}", flush=True)
         try:
             parquet_sample_writer.close()
-        except Exception:
-            pass
+        except Exception as _close_exc:
+            _writers_ok = False
+            print(f"WARNING: parquet_sample_writer.close() failed: {_close_exc}", flush=True)
         try:
             parquet_exchange_writer.close()
-        except Exception:
-            pass
+        except Exception as _close_exc:
+            _writers_ok = False
+            print(f"WARNING: parquet_exchange_writer.close() failed: {_close_exc}", flush=True)
+
+        # Gate segment-complete marking on BOTH a clean loop exit AND
+        # successful writer flush/close.  Any failure leaves the segment
+        # as "interrupted" so the next resume knows the last valid checkpoint.
         try:
-            _seg_registry.close_segment(_seg_id, end_step=int(calib_steps + prod_done))
-        except Exception:
-            pass
+            finalize_segment(
+                _seg_registry,
+                _seg_id,
+                completed_cleanly=_prod_completed_cleanly,
+                writers_ok=_writers_ok,
+                end_step=int(calib_steps + prod_done),
+            )
+        except Exception as _finalize_exc:
+            print(f"WARNING: segment registry finalization failed: {_finalize_exc}", flush=True)
+
         distance_logger.close()
 
     print(f"Done. Outputs in {out_dir}")

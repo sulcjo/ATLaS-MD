@@ -42,6 +42,93 @@ from .lifecycle import _graceful_shutdown
 logger = logging.getLogger(__name__)
 
 
+def _is_adaptive_production_completed(adaptive_dir: Path) -> bool:
+    """Return True iff adaptive_production_driver_summary.json has status == 'completed'."""
+    summary_path = Path(adaptive_dir) / "adaptive_production_driver_summary.json"
+    if not summary_path.exists():
+        return False
+    try:
+        data = json.loads(summary_path.read_text(encoding="utf-8"))
+        return str(data.get("status", "")) == "completed"
+    except Exception:
+        return False
+
+
+def _detect_extend_mode(out_dir: Path) -> str:
+    """Detect the appropriate extension mode based on what already exists in out_dir.
+
+    Returns one of: "regular", "adaptive", "frozen".
+    - "regular"  – no adaptive_production/ directory found; fall back to regular --resume.
+    - "adaptive" – adaptive directory exists but summary is missing or status != 'completed'.
+    - "frozen"   – adaptive production completed; add frozen extension rounds.
+    """
+    adaptive_dir = Path(out_dir) / "adaptive_production"
+    if not adaptive_dir.exists():
+        return "regular"
+    summary_path = adaptive_dir / "adaptive_production_driver_summary.json"
+    if not summary_path.exists():
+        return "adaptive"
+    try:
+        data = json.loads(summary_path.read_text(encoding="utf-8"))
+        status = str(data.get("status", ""))
+    except Exception:
+        return "adaptive"
+    if status == "completed":
+        return "frozen"
+    return "adaptive"
+
+
+def _resolve_and_apply_extend_mode(args: Any, out_dir: Path) -> str:
+    """Resolve extend_mode (handling 'auto') and apply per-mode arg mutations to args.
+
+    Must be called before the CLI dispatch chain so that the 'regular' mode can
+    set args.resume = True and fall through to the existing --resume branch.
+
+    Returns the resolved extend_mode string.
+    """
+    if not bool(getattr(args, "extend", False)):
+        return str(getattr(args, "extend_mode", "auto"))
+
+    mode = str(getattr(args, "extend_mode", "auto"))
+
+    if mode == "auto":
+        mode = _detect_extend_mode(out_dir)
+        args.extend_mode = mode
+        print(f"[extend] auto-detected extend_mode: {mode}")
+
+    if mode == "frozen":
+        rounds = max(1, int(getattr(args, "ap_extend_rounds", 1) or 1))
+        args.adaptive_production_final_quality_extension_rounds = rounds
+        steps = int(getattr(args, "ap_extend_steps", 0) or 0)
+        if steps > 0:
+            args.adaptive_production_final_quality_extension_steps = steps
+
+    elif mode == "adaptive":
+        current_epochs = int(getattr(args, "adaptive_production_epochs", 3) or 3)
+        extra = max(1, int(getattr(args, "ap_extend_rounds", 1) or 1))
+        # Read epochs_completed from the summary JSON so that max_epochs always
+        # exceeds the *completed* count by exactly `extra`, regardless of the
+        # configured cap (e.g. if 3 of 5 were done, use 3 not 5 as the base).
+        summary_path = Path(out_dir) / "adaptive_production" / "adaptive_production_driver_summary.json"
+        epochs_completed = 0
+        try:
+            if summary_path.exists():
+                data = json.loads(summary_path.read_text(encoding="utf-8"))
+                epochs_completed = int(data.get("epochs_completed", 0) or 0)
+        except Exception:
+            epochs_completed = 0
+        effective_base = max(epochs_completed, current_epochs)
+        args.adaptive_production_epochs = effective_base + extra
+
+    elif mode == "topup":
+        args.adaptive_production_topup_only = True
+
+    elif mode == "regular":
+        args.resume = True
+
+    return mode
+
+
 # ---------------------------------------------------------------------------
 # Data model
 # ---------------------------------------------------------------------------
@@ -3547,6 +3634,11 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
         print(f"    Adaptive-production resume: loaded {len(registry.all_states())} states; continuing at epoch {start_epoch}.")
         context_reuse_readiness = evaluate_context_reuse_readiness(args, adaptive_dir, registry=registry)
 
+    # topup-only mode: skip the epoch loop, let the final-phase skip guard fire, run extension rounds.
+    _topup_only = _arg_bool(args, "adaptive_production_topup_only", False)
+    if _topup_only:
+        max_epochs = start_epoch  # Skip epoch loop entirely.
+
     for epoch in range(start_epoch, max_epochs):
         epoch_dir = adaptive_dir / f"epoch_{epoch:03d}"
         epoch_dir.mkdir(parents=True, exist_ok=True)
@@ -3816,140 +3908,157 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             "disable --no-adaptive-production-final-connectivity-required only for debugging."
         )
 
-    final_dir = adaptive_dir / "final"
-    final_dir.mkdir(parents=True, exist_ok=True)
-    final_windows_csv = adaptive_dir / "final_active_windows.csv"
-    final_registry_csv = adaptive_dir / "final_registry_used_for_mbar.csv"
-    registry.write_active_window_csv(final_windows_csv, map_path=final_dir / "epoch_window_map.csv")
-    registry.write_state_csv(final_registry_csv)
-    final_schedule_files = {}
-    final_schedule = None
-    if bool(policy.final_allocation_scheduler):
-        final_schedule_policy = _policy_with_pool_step_budget(
-            registry, policy, runtime_pool, default_steps=final_steps, final=True
-        )
-        final_schedule = build_adaptive_epoch_schedule(
-            registry,
-            previous_diagnostics,
-            final_schedule_policy,
-            epoch=max_epochs,
-            default_steps=final_steps,
-            final=True,
-        )
-        final_schedule_files = write_epoch_schedule_files(final_dir, final_schedule, prefix="final_state_schedule")
-
-    final_seed_bank = None
-    final_scheduled_summary = None
-    if bool(policy.scheduled_final_segments) and bool(policy.final_allocation_scheduler) and final_schedule is not None:
-        print(f"    Adaptive-production final frozen scheduled phase -> {final_dir}")
-        print(f"      final active window table: {final_windows_csv}")
-        result = run_scheduled_adaptive_epoch(
-            args,
-            final_dir,
-            registry,
-            final_schedule,
-            run_gareus,
-            openmm,
-            app,
-            unit,
-            forcefield,
-            topology,
-            equil_state,
-            progress=progress,
-            current_seed_bank=current_seed_bank,
-            policy=final_schedule_policy if 'final_schedule_policy' in locals() else policy,
-            runtime_pool=runtime_pool,
-            pool_reserve_ns=0.0,
-        )
-        final_scheduled_summary = result.get("summary", {})
-        if bool(policy.propagate_seed_bank):
-            seg_dirs = [Path(s.get("dir")) for s in final_scheduled_summary.get("segments", []) if s.get("dir")]
-            final_seed_bank = write_seed_bank_from_run_dirs(
-                seg_dirs,
-                adaptive_dir / "seed_bank_final",
-                registry,
-                source_label="final",
-                max_per_state=max(1, int(policy.seed_bank_max_per_state or 1)),
+    # If extending a completed run, skip final phase if it already has sample data.
+    _final_already_done = (
+        resume_requested
+        and _is_adaptive_production_completed(adaptive_dir)
+        and _run_dir_has_samples(adaptive_dir / "final")
+    )
+    if _final_already_done:
+        print("[extend] Final phase already complete; skipping to extension rounds.")
+        # Restore the registry + paths the caller below expects to exist.
+        final_dir = adaptive_dir / "final"
+        final_windows_csv = adaptive_dir / "final_active_windows.csv"
+        final_registry_csv = adaptive_dir / "final_registry_used_for_mbar.csv"
+        final_schedule_files = {}
+        final_seed_bank = None
+        final_scheduled_summary = None
+        # Jump to extension rounds. (Extension rounds block follows below.)
+    if not _final_already_done:
+        final_dir = adaptive_dir / "final"
+        final_dir.mkdir(parents=True, exist_ok=True)
+        final_windows_csv = adaptive_dir / "final_active_windows.csv"
+        final_registry_csv = adaptive_dir / "final_registry_used_for_mbar.csv"
+        registry.write_active_window_csv(final_windows_csv, map_path=final_dir / "epoch_window_map.csv")
+        registry.write_state_csv(final_registry_csv)
+        final_schedule_files = {}
+        final_schedule = None
+        if bool(policy.final_allocation_scheduler):
+            final_schedule_policy = _policy_with_pool_step_budget(
+                registry, policy, runtime_pool, default_steps=final_steps, final=True
             )
-            if final_seed_bank.get("status") == "ok":
-                current_seed_bank = adaptive_dir / "seed_bank_final"
-    else:
-        final_args = copy.copy(args)
-        final_args.out = str(final_dir)
-        final_n_states = max(1, len(registry.active_states()))
-        # Compute final steps from pool when no explicit override: spend all remaining budget.
-        if _explicit_final_steps <= 0 and runtime_pool.enabled:
-            _target_final = _final_steps_from_pool(runtime_pool, final_n_states, _timestep_fs)
-            if _target_final > 0:
-                final_steps = _target_final
-        actual_final_steps = runtime_pool.clip_steps(
-            final_n_states,
-            int(final_steps),
-            reserve_ns=0.0,
-            hard_stop=bool(policy.pool_hard_stop),
-        )
-        if actual_final_steps <= 0:
-            if bool(policy.pool_hard_stop):
-                raise RuntimeError("adaptive-production MD pool exhausted before frozen final production could run")
-            actual_final_steps = int(final_steps)
-        final_args.gamd_production_steps = int(actual_final_steps)
-        final_args.window_mode = "adaptive"
-        final_args.windows_2d_csv = str(final_windows_csv)
-        final_args.adaptive_feedback_enabled = False
-        final_args.adaptive_feedback_pilot = False
-        final_args.adaptive_feedback_final_production = False
-        final_args.resume = bool(resume_requested and production_checkpoint_available(final_dir))
-        if final_args.resume:
-            print(f"    Adaptive-production final frozen phase: checkpoint manifest found; resuming from {final_dir}")
-        if _arg_bool(args, "adaptive_production_trajectories", True) is False:
-            final_args.traj_interval = 0
-            final_args.traj_format = "none"
-        if bool(policy.propagate_seed_bank) and current_seed_bank is not None and Path(current_seed_bank).exists():
-            if bool(policy.state_aware_seed_filtering):
-                filtered_final_seed_dir = final_dir / "filtered_seed_bank"
-                seed_filter_report = filter_seed_bank_for_state_ids(
-                    Path(current_seed_bank), registry.active_state_ids(), filtered_final_seed_dir,
+            final_schedule = build_adaptive_epoch_schedule(
+                registry,
+                previous_diagnostics,
+                final_schedule_policy,
+                epoch=max_epochs,
+                default_steps=final_steps,
+                final=True,
+            )
+            final_schedule_files = write_epoch_schedule_files(final_dir, final_schedule, prefix="final_state_schedule")
+
+        final_seed_bank = None
+        final_scheduled_summary = None
+        if bool(policy.scheduled_final_segments) and bool(policy.final_allocation_scheduler) and final_schedule is not None:
+            print(f"    Adaptive-production final frozen scheduled phase -> {final_dir}")
+            print(f"      final active window table: {final_windows_csv}")
+            result = run_scheduled_adaptive_epoch(
+                args,
+                final_dir,
+                registry,
+                final_schedule,
+                run_gareus,
+                openmm,
+                app,
+                unit,
+                forcefield,
+                topology,
+                equil_state,
+                progress=progress,
+                current_seed_bank=current_seed_bank,
+                policy=final_schedule_policy if 'final_schedule_policy' in locals() else policy,
+                runtime_pool=runtime_pool,
+                pool_reserve_ns=0.0,
+            )
+            final_scheduled_summary = result.get("summary", {})
+            if bool(policy.propagate_seed_bank):
+                seg_dirs = [Path(s.get("dir")) for s in final_scheduled_summary.get("segments", []) if s.get("dir")]
+                final_seed_bank = write_seed_bank_from_run_dirs(
+                    seg_dirs,
+                    adaptive_dir / "seed_bank_final",
+                    registry,
+                    source_label="final",
                     max_per_state=max(1, int(policy.seed_bank_max_per_state or 1)),
                 )
-                final_args.seed_conformers_dir = filtered_final_seed_dir if seed_filter_report.get("status") == "ok" else Path(current_seed_bank)
-            else:
-                final_args.seed_conformers_dir = Path(current_seed_bank)
-        if actual_final_steps != int(final_steps):
-            print(f"    Adaptive-production final frozen phase: clipped by MD pool {final_steps}->{actual_final_steps} steps -> {final_dir}")
+                if final_seed_bank.get("status") == "ok":
+                    current_seed_bank = adaptive_dir / "seed_bank_final"
         else:
-            print(f"    Adaptive-production final frozen phase: {actual_final_steps} steps -> {final_dir}")
-        print(f"      final active window table: {final_windows_csv}")
-        run_gareus(final_args, final_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
-        if _graceful_shutdown.is_set():
-            _write_runtime_pool_reports(adaptive_dir, runtime_pool)
-            payload = {
-                "schema_version": "adaptive_production_driver_summary_v1",
-                "status": "interrupted_after_checkpoint",
-                "interrupted_segment": str(final_dir),
-                "epochs_completed": int(start_epoch + len(epoch_summaries)),
-                "epoch_summaries": _json_ready(epoch_summaries),
-            }
-            write_json(summary_path, payload)
-            return payload
-        runtime_pool.consume(
-            label="final",
-            kind="final",
-            n_states=max(1, len(registry.active_states())),
-            steps=int(actual_final_steps),
-            path=final_dir,
-        )
-        _write_runtime_pool_reports(adaptive_dir, runtime_pool)
-        collect_segmented_epoch_diagnostics(final_dir, registry, policy)
-        if bool(policy.propagate_seed_bank):
-            final_seed_bank = write_epoch_seed_bank(
-                final_dir,
-                adaptive_dir / "seed_bank_final",
-                registry,
-                source_label="final",
-                max_per_state=max(1, int(policy.seed_bank_max_per_state or 1)),
+            final_args = copy.copy(args)
+            final_args.out = str(final_dir)
+            final_n_states = max(1, len(registry.active_states()))
+            # Compute final steps from pool when no explicit override: spend all remaining budget.
+            if _explicit_final_steps <= 0 and runtime_pool.enabled:
+                _target_final = _final_steps_from_pool(runtime_pool, final_n_states, _timestep_fs)
+                if _target_final > 0:
+                    final_steps = _target_final
+            actual_final_steps = runtime_pool.clip_steps(
+                final_n_states,
+                int(final_steps),
+                reserve_ns=0.0,
+                hard_stop=bool(policy.pool_hard_stop),
             )
-            if final_seed_bank.get("status") == "ok":
-                current_seed_bank = adaptive_dir / "seed_bank_final"
+            if actual_final_steps <= 0:
+                if bool(policy.pool_hard_stop):
+                    raise RuntimeError("adaptive-production MD pool exhausted before frozen final production could run")
+                actual_final_steps = int(final_steps)
+            final_args.gamd_production_steps = int(actual_final_steps)
+            final_args.window_mode = "adaptive"
+            final_args.windows_2d_csv = str(final_windows_csv)
+            final_args.adaptive_feedback_enabled = False
+            final_args.adaptive_feedback_pilot = False
+            final_args.adaptive_feedback_final_production = False
+            final_args.resume = bool(resume_requested and production_checkpoint_available(final_dir))
+            if final_args.resume:
+                print(f"    Adaptive-production final frozen phase: checkpoint manifest found; resuming from {final_dir}")
+            if _arg_bool(args, "adaptive_production_trajectories", True) is False:
+                final_args.traj_interval = 0
+                final_args.traj_format = "none"
+            if bool(policy.propagate_seed_bank) and current_seed_bank is not None and Path(current_seed_bank).exists():
+                if bool(policy.state_aware_seed_filtering):
+                    filtered_final_seed_dir = final_dir / "filtered_seed_bank"
+                    seed_filter_report = filter_seed_bank_for_state_ids(
+                        Path(current_seed_bank), registry.active_state_ids(), filtered_final_seed_dir,
+                        max_per_state=max(1, int(policy.seed_bank_max_per_state or 1)),
+                    )
+                    final_args.seed_conformers_dir = filtered_final_seed_dir if seed_filter_report.get("status") == "ok" else Path(current_seed_bank)
+                else:
+                    final_args.seed_conformers_dir = Path(current_seed_bank)
+            if actual_final_steps != int(final_steps):
+                print(f"    Adaptive-production final frozen phase: clipped by MD pool {final_steps}->{actual_final_steps} steps -> {final_dir}")
+            else:
+                print(f"    Adaptive-production final frozen phase: {actual_final_steps} steps -> {final_dir}")
+            print(f"      final active window table: {final_windows_csv}")
+            run_gareus(final_args, final_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
+            if _graceful_shutdown.is_set():
+                _write_runtime_pool_reports(adaptive_dir, runtime_pool)
+                payload = {
+                    "schema_version": "adaptive_production_driver_summary_v1",
+                    "status": "interrupted_after_checkpoint",
+                    "interrupted_segment": str(final_dir),
+                    "epochs_completed": int(start_epoch + len(epoch_summaries)),
+                    "epoch_summaries": _json_ready(epoch_summaries),
+                }
+                write_json(summary_path, payload)
+                return payload
+            runtime_pool.consume(
+                label="final",
+                kind="final",
+                n_states=max(1, len(registry.active_states())),
+                steps=int(actual_final_steps),
+                path=final_dir,
+            )
+            _write_runtime_pool_reports(adaptive_dir, runtime_pool)
+            collect_segmented_epoch_diagnostics(final_dir, registry, policy)
+            if bool(policy.propagate_seed_bank):
+                final_seed_bank = write_epoch_seed_bank(
+                    final_dir,
+                    adaptive_dir / "seed_bank_final",
+                    registry,
+                    source_label="final",
+                    max_per_state=max(1, int(policy.seed_bank_max_per_state or 1)),
+                )
+                if final_seed_bank.get("status") == "ok":
+                    current_seed_bank = adaptive_dir / "seed_bank_final"
 
     _write_runtime_pool_reports(adaptive_dir, runtime_pool)
 
