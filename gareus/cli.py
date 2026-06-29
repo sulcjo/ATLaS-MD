@@ -446,6 +446,11 @@ def _add_tica_args(p: argparse.ArgumentParser) -> None:
                         "Set automatically by the adaptive production loop; leave empty for first epoch.")
     p.add_argument("--tica-min-eigenvalue", type=float, default=0.0,
                    help="Skip tICA update if the fitted eigenvalue is below this threshold (default 0.0 = always update).")
+    p.add_argument("--tica-epochs-per-cycle", type=int, default=0, dest="tica_epochs_per_cycle",
+                   help="Auto-trigger tICA refit every N completed epochs (0 = off). "
+                        "Acts as an OR condition with --tica-update-after-epochs. "
+                        "Note: each refit bumps tica_cv_version so prior-version epochs "
+                        "are excluded from cross-epoch MBAR pooling.")
 
 
 def _add_platform_args(p: argparse.ArgumentParser) -> None:

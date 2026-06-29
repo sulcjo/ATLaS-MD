@@ -1460,10 +1460,17 @@ def _maybe_update_tica_cvaux(epoch: int, epoch_dir: Path, adaptive_dir: Path, ar
     tica_obs_interval = int(getattr(args, "tica_obs_interval", 0) or 0)
     if tica_obs_interval <= 0:
         return {}
+
     update_after = getattr(args, "tica_update_after_epochs", None)
-    if update_after is None:
-        return {}
-    if int(epoch) not in [int(e) for e in update_after]:
+    epochs_per_cycle = int(getattr(args, "tica_epochs_per_cycle", 0) or 0)
+
+    should_update = False
+    if update_after is not None and int(epoch) in [int(e) for e in update_after]:
+        should_update = True
+    if epochs_per_cycle > 0 and (int(epoch) + 1) % epochs_per_cycle == 0:
+        should_update = True
+
+    if not should_update:
         return {}
 
     tica_dir = epoch_dir / "tica_obs"
@@ -3769,6 +3776,17 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
         print(f"    Adaptive-production resume: loaded {len(registry.all_states())} states; continuing at epoch {start_epoch}.")
         context_reuse_readiness = evaluate_context_reuse_readiness(args, adaptive_dir, registry=registry)
 
+    # Warn when tica_epochs_per_cycle is set but observation collection is disabled:
+    # the refit will always be skipped (no obs → no data), making the cycle a no-op.
+    _tica_epc = int(getattr(args, "tica_epochs_per_cycle", 0) or 0)
+    _tica_obs = int(getattr(args, "tica_obs_interval", 0) or 0)
+    if _tica_epc > 0 and _tica_obs <= 0:
+        print(
+            f"WARNING: tica_epochs_per_cycle={_tica_epc} but tica_obs_interval=0 — "
+            "tICA refitting requires dihedral observations (set tica_obs_interval > 0). "
+            "All cycle refits will be silently skipped."
+        )
+
     # topup-only mode: skip the epoch loop, let the final-phase skip guard fire, run extension rounds.
     _topup_only = _arg_bool(args, "adaptive_production_topup_only", False)
     if _topup_only:
@@ -4007,6 +4025,12 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                     print(f"    tICA: updated secondary_center for {n_updated} active registry states")
                     if n_updated > 0:
                         registry.save(adaptive_dir)
+                        # Re-write window CSV so the next epoch sees updated centers.
+                        # (Initial write at lines above precedes this block; without
+                        # this re-write the center update would be silently lost.)
+                        registry.write_active_window_csv(next_csv, map_path=next_map)
+                        registry.write_epoch_window_map(next_epoch_dir / "epoch_window_map.csv")
+                        print(f"    tICA: re-wrote {next_csv.name} with updated secondary centers")
         except Exception as _tica_exc:
             print(f"WARNING: _maybe_update_tica_cvaux failed for epoch {epoch}: {_tica_exc}")
             tica_update_report = {"status": "error", "error": str(_tica_exc)}

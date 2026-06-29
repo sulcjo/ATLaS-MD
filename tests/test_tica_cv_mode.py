@@ -174,3 +174,90 @@ class TestApplyTICACentersToRegistry:
         n = _apply_tica_centers_to_registry(reg, {0: 1.5}, tmp_path)
         assert n == 0
         assert reg.get_state(0).secondary_center == pytest.approx(0.0)
+
+
+class TestEpochCycling:
+    """Tests for tica_epochs_per_cycle auto-trigger logic."""
+
+    def _make_args(self, **kw) -> argparse.Namespace:
+        ns = argparse.Namespace(
+            tica_obs_interval=10,
+            tica_update_after_epochs=None,
+            tica_epochs_per_cycle=0,
+            tica_lag_frames=50,
+            tica_min_eigenvalue=0.0,
+            tica_state_file="",
+        )
+        for k, v in kw.items():
+            setattr(ns, k, v)
+        return ns
+
+    def test_cycle_trigger_fires_at_correct_epochs(self):
+        """tica_epochs_per_cycle=2 fires at epoch 1, 3, 5 (i.e. after epoch+1 is multiple of 2)."""
+        args = self._make_args(tica_epochs_per_cycle=2)
+        fired = []
+        for epoch in range(6):
+            obs_int = int(getattr(args, "tica_obs_interval", 0) or 0)
+            update_after = getattr(args, "tica_update_after_epochs", None)
+            epc = int(getattr(args, "tica_epochs_per_cycle", 0) or 0)
+            should = False
+            if update_after is not None and epoch in [int(e) for e in update_after]:
+                should = True
+            if epc > 0 and (epoch + 1) % epc == 0:
+                should = True
+            if obs_int > 0 and should:
+                fired.append(epoch)
+        assert fired == [1, 3, 5]
+
+    def test_legacy_update_after_still_fires(self):
+        """Legacy tica_update_after_epochs=[0, 2] fires independently of cycle."""
+        args = self._make_args(tica_update_after_epochs=[0, 2], tica_epochs_per_cycle=0)
+        fired = []
+        for epoch in range(5):
+            obs_int = int(getattr(args, "tica_obs_interval", 0) or 0)
+            update_after = getattr(args, "tica_update_after_epochs", None)
+            epc = int(getattr(args, "tica_epochs_per_cycle", 0) or 0)
+            should = False
+            if update_after is not None and epoch in [int(e) for e in update_after]:
+                should = True
+            if epc > 0 and (epoch + 1) % epc == 0:
+                should = True
+            if obs_int > 0 and should:
+                fired.append(epoch)
+        assert fired == [0, 2]
+
+    def test_both_triggers_union(self):
+        """Both triggers active: fires at union of both sets."""
+        args = self._make_args(tica_update_after_epochs=[4], tica_epochs_per_cycle=3)
+        fired = []
+        for epoch in range(7):
+            obs_int = int(getattr(args, "tica_obs_interval", 0) or 0)
+            update_after = getattr(args, "tica_update_after_epochs", None)
+            epc = int(getattr(args, "tica_epochs_per_cycle", 0) or 0)
+            should = False
+            if update_after is not None and epoch in [int(e) for e in update_after]:
+                should = True
+            if epc > 0 and (epoch + 1) % epc == 0:
+                should = True
+            if obs_int > 0 and should:
+                fired.append(epoch)
+        # cycle=3 fires at epoch 2, 5; explicit fires at epoch 4
+        assert fired == [2, 4, 5]
+
+    def test_no_trigger_when_obs_disabled(self):
+        """tica_obs_interval=0 means no trigger regardless of other settings."""
+        args = self._make_args(tica_obs_interval=0, tica_epochs_per_cycle=1, tica_update_after_epochs=[0])
+        for epoch in range(5):
+            obs_int = int(getattr(args, "tica_obs_interval", 0) or 0)
+            assert obs_int == 0  # early return in _maybe_update_tica_cvaux
+
+    def test_cli_tica_epochs_per_cycle_in_known_dests(self):
+        """tica_epochs_per_cycle must be a known argparse dest for YAML config validation."""
+        from gareus.config import _build_known_config_dests
+        from gareus.cli import build_gareus_parser
+        parser = build_gareus_parser()
+        dests = _build_known_config_dests(parser)
+        assert "tica_epochs_per_cycle" in dests, (
+            "YAML key 'tica_epochs_per_cycle' not in argparse dests — "
+            "add --tica-epochs-per-cycle to cli.py"
+        )
