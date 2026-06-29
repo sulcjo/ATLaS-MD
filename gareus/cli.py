@@ -299,7 +299,16 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--ap-target-overlap", type=float, default=0.25)
     p.add_argument("--ap-min-exchange", type=float, default=0.08)
     p.add_argument("--ap-min-samples", type=int, default=50)
-    p.add_argument("--ap-retire-min-samples", type=int, default=200)
+    p.add_argument("--ap-retire-min-samples", type=int, default=200,
+                   help="[compat alias] Minimum saved sample rows per window per adaptive round "
+                        "before retirement is considered. Prefer --ap-min-samples-per-window.")
+    p.add_argument("--ap-min-samples-per-window", type=int, default=200,
+                   help="Minimum saved sample rows per window per adaptive round (same unit as "
+                        "ap_retire_min_samples: rows written by ParquetSampleWriter, one row per "
+                        "distance_output_interval steps). Total steps >= value * distance_output_interval.")
+    p.add_argument("--ap-final-min-samples-per-window", type=int, default=100,
+                   help="Minimum saved sample rows per window in the final frozen production phase "
+                        "(same unit as ap_min_samples_per_window).")
     p.add_argument("--ap-max-new-windows", type=int, default=4)
     p.add_argument("--ap-retire-converged", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--ap-gamd-boost-sd-warn", type=float, default=6.0)
@@ -750,7 +759,14 @@ def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
     args.adaptive_production_target_overlap = args.ap_target_overlap
     args.adaptive_production_min_exchange = args.ap_min_exchange
     args.adaptive_production_min_samples = args.ap_min_samples
-    args.adaptive_production_retire_min_samples = args.ap_retire_min_samples
+    # ap_min_samples_per_window is the preferred name; ap_retire_min_samples is the legacy alias.
+    # Start from the new preferred key, then let the legacy alias override when it was set
+    # explicitly (i.e. differs from its argparse default of 200).
+    args.adaptive_production_retire_min_samples = args.ap_min_samples_per_window
+    if args.ap_retire_min_samples != 200:
+        # Legacy alias was explicitly set — honour it for backward compatibility.
+        args.adaptive_production_retire_min_samples = args.ap_retire_min_samples
+    args.adaptive_production_final_min_samples_per_state = args.ap_final_min_samples_per_window
     args.adaptive_production_max_new_windows_per_epoch = args.ap_max_new_windows
     args.adaptive_production_retire_converged = args.ap_retire_converged
     args.adaptive_production_max_gamd_boost_sd_kcal_mol = args.ap_gamd_boost_sd_warn
@@ -778,7 +794,7 @@ def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
     args.adaptive_production_require_convergence_before_final = False
     args.adaptive_production_pool_hard_stop = True
     args.adaptive_production_final_connectivity_required = True
-    args.adaptive_production_final_min_samples_per_state = 100
+    # final_min_samples_per_state is set earlier from ap_final_min_samples_per_window (default 100).
     args.adaptive_production_quality_min_primary_coverage_fraction = 0.25
     args.adaptive_production_quality_hard_fail = False
     args.adaptive_production_final_quality_extension_rounds = 0
