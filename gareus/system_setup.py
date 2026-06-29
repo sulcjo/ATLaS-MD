@@ -22,6 +22,7 @@ legacy names in ``gareus_peptide.py`` which alias to this module.
 from __future__ import annotations
 
 import collections
+import json
 import math
 import shutil
 import sys
@@ -57,6 +58,7 @@ __all__ = [
     "write_state_pdb",
     "run_steps_safely",
     "minimize_and_npt_equilibrate",
+    "_write_box_audit",
 ]
 
 
@@ -406,6 +408,97 @@ def create_system(app, unit, forcefield, topology, args, include_barostat: bool,
     return system
 
 
+def _write_box_audit(
+    out_dir: Path,
+    pos_nm: "np.ndarray",
+    ca_pos_nm: "np.ndarray",
+    contour_nm: float,
+    box_nm: float,
+    args,
+) -> dict:
+    """Compute and write a PBC box-size audit JSON to *out_dir/box_audit.json*.
+
+    All inputs are pure numpy arrays — no OpenMM dependency in this function.
+    The audit checks whether the sequence contour estimate (fully-extended
+    peptide length) might cause self-contact through the periodic boundary.
+
+    Parameters
+    ----------
+    out_dir:
+        Directory where ``box_audit.json`` is written.
+    pos_nm:
+        All solute atom positions in nm, shape (N, 3).
+    ca_pos_nm:
+        Cα positions in chain order, shape (M, 3).  Caller must sort by
+        (chain, residue, atom) index before passing.
+    contour_nm:
+        The *box-sizing* contour used by ``prepare_solvated_system`` (may be
+        the actual-extent value for input_pdb runs — NOT used here for the
+        sequence estimate).
+    box_nm:
+        Final box edge length in nm (cubic / equivalent).
+    args:
+        Namespace with ``padding_nm`` and ``seq`` attributes.
+
+    Returns
+    -------
+    dict
+        The audit record that was written to disk.
+    """
+    # --- actual extent --------------------------------------------------
+    extent = pos_nm.max(axis=0) - pos_nm.min(axis=0)
+    actual_extent_nm = [float(v) for v in extent]
+
+    # --- sequence contour estimate: always from residue count -----------
+    # Use CA count (topology-aware) when available; fall back to seq length.
+    n_residues = len(ca_pos_nm) if len(ca_pos_nm) > 0 else len(args.seq)
+    sequence_contour_estimate_nm = float((n_residues - 1) * 0.38 + 0.40)
+
+    # --- backbone path length -------------------------------------------
+    if len(ca_pos_nm) >= 2:
+        diffs = ca_pos_nm[1:] - ca_pos_nm[:-1]
+        backbone_path_length_nm = float(np.sqrt((diffs ** 2).sum(axis=1)).sum())
+    else:
+        backbone_path_length_nm = 0.0
+
+    # --- margin and warning ---------------------------------------------
+    padding_nm = float(args.padding_nm)
+    minimum_margin_nm = float(box_nm / 2.0 - float(max(actual_extent_nm)) / 2.0)
+    pbc_self_contact_warning = bool(
+        sequence_contour_estimate_nm > box_nm / 2.0 - padding_nm
+    )
+    if pbc_self_contact_warning:
+        warning_message = (
+            f"PBC warning: sequence contour estimate "
+            f"{sequence_contour_estimate_nm:.2f} nm > box half-size minus padding "
+            f"{box_nm / 2.0 - padding_nm:.2f} nm. "
+            "Peptide may self-contact through periodic boundary during "
+            "extended conformations."
+        )
+    else:
+        warning_message = None
+
+    audit = {
+        "actual_extent_nm": actual_extent_nm,
+        "sequence_contour_estimate_nm": sequence_contour_estimate_nm,
+        "backbone_path_length_nm": backbone_path_length_nm,
+        "box_size_nm": float(box_nm),
+        "padding_nm": padding_nm,
+        "minimum_margin_nm": minimum_margin_nm,
+        "pbc_self_contact_warning": pbc_self_contact_warning,
+        "warning_message": warning_message,
+    }
+
+    out_dir = Path(out_dir)
+    with (out_dir / "box_audit.json").open("w") as fh:
+        json.dump(audit, fh, indent=2)
+
+    if pbc_self_contact_warning:
+        print(f"[setup] WARNING: {warning_message}", flush=True)
+
+    return audit
+
+
 def prepare_solvated_system(args, out_dir: Path):
     """Build and solvate a peptide system, writing intermediate PDB files.
 
@@ -441,14 +534,26 @@ def prepare_solvated_system(args, out_dir: Path):
     # alpha-helical starting structure.  Treat the contour length (3.8 Å per
     # residue in a fully-extended beta-strand + 4 Å terminal radii) as the
     # effective peptide size, then add the user-requested padding on each side.
+    # Always extract positions here so they are available for the audit below
+    # regardless of whether we are on the input_pdb or generated-peptide path.
+    _pos_nm = np.asarray(modeller.positions.value_in_unit(unit.nanometer), dtype=float)
     if input_pdb is not None:
         # Size the box from the actual solute extent; the seq-based contour
         # estimate is meaningless for an externally supplied fixture.
-        _pos_nm = np.asarray(modeller.positions.value_in_unit(unit.nanometer), dtype=float)
         _contour_nm = float((_pos_nm.max(axis=0) - _pos_nm.min(axis=0)).max()) + 0.40
     else:
         _contour_nm = (len(args.seq) - 1) * 0.38 + 0.40
     _box_nm = _contour_nm + 2.0 * float(args.padding_nm)
+
+    # Extract Cα positions in chain order for backbone path-length audit.
+    _ca_pos_nm = []
+    for atom in modeller.topology.atoms():
+        if atom.name == "CA":
+            _ca_pos_nm.append(_pos_nm[atom.index])
+    _ca_pos_nm = np.array(_ca_pos_nm) if _ca_pos_nm else np.empty((0, 3))
+
+    _write_box_audit(out_dir, _pos_nm, _ca_pos_nm, _contour_nm, _box_nm, args)
+
     print(
         f"[setup] Box size from extended conformation: "
         f"seq={args.seq} ({len(args.seq)} res), contour={_contour_nm:.2f} nm, "
