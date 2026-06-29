@@ -322,6 +322,10 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                    help="Max aggregate MD simulation time in ns. 0 disables.")
     p.add_argument("--ap-final-pool-fraction", type=float, default=0.50)
     p.add_argument("--ap-min-final-pool-ns", type=float, default=0.0)
+    p.add_argument("--ap-extend-rounds", dest="ap_extend_rounds", type=int, default=1,
+                   help="Extension rounds / extra epochs for --extend (frozen: extension rounds; adaptive: extra epochs).")
+    p.add_argument("--ap-extend-steps", dest="ap_extend_steps", type=int, default=0,
+                   help="Steps per extension round for --extend frozen mode. 0 = reuse final-phase steps.")
 
 
 def _add_us_args(p: argparse.ArgumentParser) -> None:
@@ -813,6 +817,7 @@ def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
     # extend support
     args.extend = bool(getattr(args, "extend", False))
     args.extend_mode = str(getattr(args, "extend_mode", "auto"))
+    args.adaptive_production_topup_only = False
 
     # ── Output ────────────────────────────────────────────────────────────────
     args.color = "auto"
@@ -1174,6 +1179,13 @@ def main(argv: Optional[Iterable[str]] = None):
     else:
         write_json(out_dir / "run_args.json", public_args)
     initialize_run_manifest(args, out_dir, argv=argv_list)
+
+    # Resolve --extend mode BEFORE the dispatch chain so that extend_mode='regular'
+    # can set args.resume=True and fall through to the elif resume: branch below.
+    if bool(getattr(args, "extend", False)):
+        from gareus.adaptive_production import _resolve_and_apply_extend_mode
+        _resolve_and_apply_extend_mode(args, out_dir)
+
     progress = GuiProgressSink(out_dir, args)
     _run_status = "started"
     _run_error = None

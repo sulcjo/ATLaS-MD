@@ -54,6 +54,69 @@ def _is_adaptive_production_completed(adaptive_dir: Path) -> bool:
         return False
 
 
+def _detect_extend_mode(out_dir: Path) -> str:
+    """Detect the appropriate extension mode based on what already exists in out_dir.
+
+    Returns one of: "regular", "adaptive", "frozen".
+    - "regular"  – no adaptive_production/ directory found; fall back to regular --resume.
+    - "adaptive" – adaptive directory exists but summary is missing or status != 'completed'.
+    - "frozen"   – adaptive production completed; add frozen extension rounds.
+    """
+    adaptive_dir = Path(out_dir) / "adaptive_production"
+    if not adaptive_dir.exists():
+        return "regular"
+    summary_path = adaptive_dir / "adaptive_production_driver_summary.json"
+    if not summary_path.exists():
+        return "adaptive"
+    try:
+        data = json.loads(summary_path.read_text(encoding="utf-8"))
+        status = str(data.get("status", ""))
+    except Exception:
+        return "adaptive"
+    if status == "completed":
+        return "frozen"
+    return "adaptive"
+
+
+def _resolve_and_apply_extend_mode(args: Any, out_dir: Path) -> str:
+    """Resolve extend_mode (handling 'auto') and apply per-mode arg mutations to args.
+
+    Must be called before the CLI dispatch chain so that the 'regular' mode can
+    set args.resume = True and fall through to the existing --resume branch.
+
+    Returns the resolved extend_mode string.
+    """
+    if not bool(getattr(args, "extend", False)):
+        return str(getattr(args, "extend_mode", "auto"))
+
+    mode = str(getattr(args, "extend_mode", "auto"))
+
+    if mode == "auto":
+        mode = _detect_extend_mode(out_dir)
+        args.extend_mode = mode
+        print(f"[extend] auto-detected extend_mode: {mode}")
+
+    if mode == "frozen":
+        rounds = max(1, int(getattr(args, "ap_extend_rounds", 1) or 1))
+        args.adaptive_production_final_quality_extension_rounds = rounds
+        steps = int(getattr(args, "ap_extend_steps", 0) or 0)
+        if steps > 0:
+            args.adaptive_production_final_quality_extension_steps = steps
+
+    elif mode == "adaptive":
+        current_epochs = int(getattr(args, "adaptive_production_epochs", 5) or 5)
+        extra = max(1, int(getattr(args, "ap_extend_rounds", 1) or 1))
+        args.adaptive_production_epochs = current_epochs + extra
+
+    elif mode == "topup":
+        args.adaptive_production_topup_only = True
+
+    elif mode == "regular":
+        args.resume = True
+
+    return mode
+
+
 # ---------------------------------------------------------------------------
 # Data model
 # ---------------------------------------------------------------------------
@@ -3558,6 +3621,11 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             registry.write_active_window_csv(current_windows_csv, map_path=adaptive_dir / f"window_map_epoch_{start_epoch:03d}.csv")
         print(f"    Adaptive-production resume: loaded {len(registry.all_states())} states; continuing at epoch {start_epoch}.")
         context_reuse_readiness = evaluate_context_reuse_readiness(args, adaptive_dir, registry=registry)
+
+    # topup-only mode: skip the epoch loop, let the final-phase skip guard fire, run extension rounds.
+    _topup_only = _arg_bool(args, "adaptive_production_topup_only", False)
+    if _topup_only:
+        max_epochs = start_epoch  # Skip epoch loop entirely.
 
     for epoch in range(start_epoch, max_epochs):
         epoch_dir = adaptive_dir / f"epoch_{epoch:03d}"
