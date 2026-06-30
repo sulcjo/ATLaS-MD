@@ -1146,7 +1146,7 @@ def load_explicit_2d_window_csv(args, path: Path) -> tuple[np.ndarray, list[floa
     if any_secondary and not all_secondary:
         raise ValueError("--windows-2d-csv mixes rows with and without secondary_cv_center; provide secondary columns for every row or none.")
     if any_secondary and not secondary_cv_enabled(args):
-        raise ValueError("--windows-2d-csv contains secondary-CV centers, but --secondary-cv is 'none'. Re-run with e.g. --secondary-cv alpha-coil-beta/acb/rama-regions/alpha/beta/custom.")
+        raise ValueError("--windows-2d-csv contains secondary-CV centers, but --secondary-cv is 'none'. Re-run with e.g. --secondary-cv alpha-coil-beta/acb/rama-map/alpha/beta/custom.")
 
     centers_arr = np.asarray(centers_a, dtype=float)
     primary_unique = _rounded_unique_sorted(centers_a, ndigits=4)

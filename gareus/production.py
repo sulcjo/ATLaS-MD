@@ -63,7 +63,6 @@ from .cv import (
     primary_k_to_openmm_value,
     primary_k_units,
     primary_openmm_k_units,
-    rama_region_definitions,
     rama_map_definitions,
     secondary_cv_enabled,
     secondary_cv_mode,
@@ -257,7 +256,7 @@ def _ss_scalar_from_sub_cv_values(sub_cv_values, metadata: dict) -> float:
     recompute.  The force already evaluated these values on the GPU during the
     preceding step(); this function is pure Python arithmetic over scalars.
 
-    For rama-map/rama-regions: sub-CVs interleave phi/psi per region in
+    For rama-map: sub-CVs interleave phi/psi per region in
     definition order — [phi_0, psi_0, phi_1, psi_1, ...].
     For alpha-coil-beta: [alpha_phi, alpha_psi, beta_phi, beta_psi].
     For simple modes (alpha/beta/custom): [ss_phi, ss_psi].
@@ -270,7 +269,7 @@ def _ss_scalar_from_sub_cv_values(sub_cv_values, metadata: dict) -> float:
         return float(arr @ weights + offset)
     if mode == "alpha-coil-beta":
         return float(0.5 * (arr[0] + arr[1]) - 0.5 * (arr[2] + arr[3]))
-    if mode in {"rama-regions", "rama-map"}:
+    if mode == "rama-map":
         regions = metadata.get("regions", [])
         if not regions:
             return 0.0
@@ -908,8 +907,8 @@ def add_secondary_structure_cv_force(openmm, system, topology, args, force_group
             "psi_torsions": [list(map(int, t)) for t in psi_torsions],
         }
 
-    if mode in {"rama-regions", "rama-map"}:
-        regions = rama_map_definitions() if mode == "rama-map" else rama_region_definitions()
+    if mode == "rama-map":
+        regions = rama_map_definitions()
         score_terms = []
         weighted_terms = []
         cv_force = openmm.CustomCVForce("0")

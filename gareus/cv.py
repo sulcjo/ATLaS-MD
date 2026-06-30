@@ -49,7 +49,6 @@ __all__ = [
     "build_tica_linear_metadata",
     "secondary_cv_target_angles",
     "secondary_structure_torsions",
-    "rama_region_definitions",
     "rama_map_definitions",
     "secondary_structure_score_from_positions_nm",
     "adaptive_secondary_force_constants_kcal",
@@ -289,12 +288,7 @@ def secondary_cv_mode(args_or_mode) -> str:
         "ss-transition": "alpha-coil-beta",
         "rama": "rama-map",
         "rama-map": "rama-map",
-        "ramachandran-map": "rama-map",
         "rama-basin-map": "rama-map",
-        "ramachandran": "rama-map",
-        "ramachandran-regions": "rama-regions",
-        "rama-region": "rama-regions",
-        "ramachandran-region": "rama-regions",
         "tica": "tica-linear",
     }
     return aliases.get(mode, mode)
@@ -307,7 +301,7 @@ def secondary_cv_enabled(args) -> bool:
 
 def secondary_cv_is_transition(args_or_mode) -> bool:
     """Return True if the secondary CV is a transition coordinate."""
-    return secondary_cv_mode(args_or_mode) in {"alpha-coil-beta", "rama-regions", "rama-map", "tica-linear"}
+    return secondary_cv_mode(args_or_mode) in {"alpha-coil-beta", "rama-map", "tica-linear"}
 
 
 def secondary_cv_range(args_or_mode) -> Tuple[float, float]:
@@ -398,30 +392,13 @@ def secondary_structure_torsions(topology) -> tuple[list[tuple[int, int, int, in
                 psi.append((int(n), int(ca), int(c), int(n_next)))
     return phi, psi
 
-def rama_region_definitions() -> List[Dict[str, Any]]:
-    """Built-in soft Ramachandran basins for the scalar ``rama-regions`` CV.
-
-    The values define an ordered, dimensionless umbrella coordinate.  The order
-    is a practical sampling ladder, not a claim that Ramachandran space is truly
-    one-dimensional.  Region scores are smooth phi/psi Gaussian-like contents.
-    """
-    return [
-        {"name": "beta", "label": "beta/extended", "phi_deg": -135.0, "psi_deg": 135.0, "value": -1.00},
-        {"name": "ppii", "label": "PPII", "phi_deg": -75.0, "psi_deg": 145.0, "value": -0.50},
-        {"name": "turn", "label": "turn/coil", "phi_deg": -75.0, "psi_deg": 60.0, "value": 0.00},
-        {"name": "alpha", "label": "right-alpha", "phi_deg": -60.0, "psi_deg": -45.0, "value": 0.50},
-        {"name": "left_alpha", "label": "left-alpha", "phi_deg": 60.0, "psi_deg": 40.0, "value": 1.00},
-    ]
-
-
-
 def rama_map_definitions() -> List[Dict[str, Any]]:
     """Built-in explicit Ramachandran basin map for the ``rama-map`` CV.
 
     ``rama-map`` is still represented as one dimensionless secondary CV so it can
     be crossed with the primary umbrella coordinate without creating a full 3D
-    distance x phi x psi grid.  Unlike the older ``rama-regions`` scalar ladder,
-    each center corresponds to a named Ramachandran basin that should be reported
+    distance x phi x psi grid.  Each center corresponds to a named Ramachandran
+    basin that should be reported
     and interpreted as a map target: beta/extended, PPII/coil, right-alpha, and
     left-alpha.  The left-alpha basin is intentionally included as a native
     target rather than hidden inside a generic coil value.
@@ -471,12 +448,11 @@ def _ensure_secondary_cv_numeric_cache(ss_info: Dict[str, Any], mode: str) -> fl
             math.radians(float(ss_info.get("alpha_psi0_deg", -45.0))),
             math.radians(float(ss_info.get("beta_psi0_deg", 135.0))),
         ], dtype=np.float64)
-    elif mode in {"rama-regions", "rama-map"} and "_np_rama_region_values" not in ss_info:
+    elif mode == "rama-map" and "_np_rama_region_values" not in ss_info:
         values = []
         phi_targets = []
         psi_targets = []
-        default_regions = rama_map_definitions() if mode == "rama-map" else rama_region_definitions()
-        for region in (ss_info.get("regions") or default_regions):
+        for region in (ss_info.get("regions") or rama_map_definitions()):
             try:
                 values.append(float(region["value"]))
                 phi_targets.append(math.radians(float(region["phi_deg"])))
@@ -486,7 +462,7 @@ def _ensure_secondary_cv_numeric_cache(ss_info: Dict[str, Any], mode: str) -> fl
         ss_info["_np_rama_region_values"] = np.asarray(values, dtype=np.float64)
         ss_info["_np_rama_phi_targets"] = np.asarray(phi_targets, dtype=np.float64)
         ss_info["_np_rama_psi_targets"] = np.asarray(psi_targets, dtype=np.float64)
-    elif mode not in {"alpha-coil-beta", "rama-regions", "rama-map"} and "_np_simple_phi_psi_targets" not in ss_info:
+    elif mode not in {"alpha-coil-beta", "rama-map"} and "_np_simple_phi_psi_targets" not in ss_info:
         ss_info["_np_simple_phi_psi_targets"] = np.asarray([
             math.radians(float(ss_info.get("phi0_deg", -60.0))),
             math.radians(float(ss_info.get("psi0_deg", -45.0))),
@@ -518,7 +494,7 @@ def secondary_structure_score_from_positions_nm(positions_nm, ss_info: Optional[
         # score arrays are [alpha, beta]
         return float(0.5 * (phi_scores[0] + psi_scores[0]) - 0.5 * (phi_scores[1] + psi_scores[1]))
 
-    if mode in {"rama-regions", "rama-map"}:
+    if mode == "rama-map":
         values = ss_info["_np_rama_region_values"]
         if values.size == 0:
             return 0.0

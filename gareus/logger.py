@@ -1292,17 +1292,6 @@ class DistanceLogger:
                 return " coil".rjust(label_w)
             elif abs(val + 1.0) < 0.15:
                 return " beta".rjust(label_w)
-        if mode == "rama-regions":
-            labels = [
-                (-1.00, "beta"),
-                (-0.50, "PPII"),
-                (0.00, "turn"),
-                (0.50, "alpha"),
-                (1.00, "L-alpha"),
-            ]
-            nearest, label = min(labels, key=lambda item: abs(float(val) - item[0]))
-            if abs(float(val) - nearest) < 0.16:
-                return label.rjust(label_w)
         raw = f"{val:+.2f}" if val < 0 else f" {val:.2f}"
         return raw.rjust(label_w)
 
@@ -2230,18 +2219,11 @@ class DistanceLogger:
         sec_centers = [float(x) for x in info.get("secondary_cv_centers", []) if str(x) not in {"", "None", "nan"}]
         if sec_centers:
             mode_name = str((info.get("secondary_cv", {}) or {}).get("mode", getattr(self.args, "secondary_cv", "secondary")))
-            if secondary_cv_mode(mode_name) == "rama-regions":
-                body.append(
-                    color_text("CV2 ", "magenta", bold=True)
-                    + color_text("rama-regions", "cyan", bold=True)
-                    + "  β=-1  PPII=-0.5  coil=0  α=+0.5  α_L=+1"
-                )
-            else:
-                body.append(
-                    color_text("CV2 ", "magenta", bold=True)
-                    + color_text(mode_name, "cyan", bold=True)
-                    + f"  targets {min(sec_centers):+.2f}..{max(sec_centers):+.2f}"
-                )
+            body.append(
+                color_text("CV2 ", "magenta", bold=True)
+                + color_text(mode_name, "cyan", bold=True)
+                + f"  targets {min(sec_centers):+.2f}..{max(sec_centers):+.2f}"
+            )
 
         vals = []
         for hist in self.history_by_replica.values():

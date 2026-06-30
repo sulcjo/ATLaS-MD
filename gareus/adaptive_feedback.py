@@ -223,8 +223,6 @@ def adaptive_secondary_default_centers(args) -> list[float]:
     mode = secondary_cv_mode(args)
     if mode == "alpha-coil-beta":
         return [-0.80, 0.0, 0.80]
-    if mode == "rama-regions":
-        return [-1.00, -0.50, 0.0, 0.50, 1.00]
     return [0.25, 0.55, 0.85]
 
 

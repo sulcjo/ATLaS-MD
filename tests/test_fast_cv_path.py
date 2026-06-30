@@ -88,19 +88,6 @@ def test_ss_scalar_rama_map_empty_regions():
     assert _ss_scalar_from_sub_cv_values([], meta) == 0.0
 
 
-def test_ss_scalar_rama_regions_alias():
-    """rama-regions mode uses same reconstruction logic as rama-map."""
-    from gareus.production import _ss_scalar_from_sub_cv_values
-
-    regions = [{"name": "x", "value": 0.5}]
-    meta_map = {"mode": "rama-map", "regions": regions}
-    meta_reg = {"mode": "rama-regions", "regions": regions}
-    sub = [0.6, 0.4]
-    assert abs(
-        _ss_scalar_from_sub_cv_values(sub, meta_map)
-        - _ss_scalar_from_sub_cv_values(sub, meta_reg)
-    ) < 1e-12
-
 
 def test_ss_scalar_contact_normalize_math():
     """Verify contact CV normalization formula used in _fetch_state/_fetch_exchange_state."""

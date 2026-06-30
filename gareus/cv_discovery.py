@@ -175,7 +175,7 @@ def suggest_cvs(run_dir: Path, target_overlap: float = 0.25) -> dict[str, Any]:
             "priority": "high",
             "title": "Only a primary CV appears to be biased",
             "details": "For short peptides, terminal distance or contacts alone often collapse distinct backbone basins into one coordinate.",
-            "try": "Use --cv2 rama-regions for a general backbone-basin axis, or --cv2 alpha-coil-beta for a simpler alpha/extended transition coordinate.",
+            "try": "Use --cv2 rama-map for a general backbone-basin axis, or --cv2 alpha-coil-beta for a simpler alpha/extended transition coordinate.",
         })
     elif finite_sec.size:
         smin, smax = min(secondary_centers), max(secondary_centers)
@@ -208,14 +208,14 @@ def suggest_cvs(run_dir: Path, target_overlap: float = 0.25) -> dict[str, Any]:
                 "priority": "medium",
                 "title": "Distance CV may miss topology-changing compact states",
                 "details": "Equal terminal distance can hide different contact maps/backbone folds.",
-                "try": "Compare a pilot with --cv1 contacts --cv2 rama-regions, or add a contacts-based campaign for cross-checking.",
+                "try": "Compare a pilot with --cv1 contacts --cv2 rama-map, or add a contacts-based campaign for cross-checking.",
             })
         elif any("contact" in x for x in primary_cv_labels):
             suggestions.append({
                 "priority": "medium",
                 "title": "Contact CV is nondirectional unless paired with backbone/geometry information",
                 "details": "A high contact fraction can mean many different collapsed topologies.",
-                "try": "Keep --cv2 rama-regions or use selected motif contacts rather than all atom-pair contacts for interpretability.",
+                "try": "Keep --cv2 rama-map or use selected motif contacts rather than all atom-pair contacts for interpretability.",
             })
 
     payload = {

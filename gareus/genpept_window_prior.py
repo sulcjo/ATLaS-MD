@@ -30,7 +30,6 @@ from .cv import (
     primary_cv_units,
     primary_cv_value_from_positions_nm,
     rama_map_definitions,
-    rama_region_definitions,
     secondary_cv_enabled,
     secondary_cv_mode,
     secondary_cv_range,
@@ -417,10 +416,10 @@ def build_secondary_cv_metadata_for_prior(args, topology) -> dict:
             "beta_psi0_deg": 135.0,
         })
         return base
-    if mode in {"rama-regions", "rama-map"}:
-        regions = rama_map_definitions() if mode == "rama-map" else rama_region_definitions()
+    if mode == "rama-map":
+        regions = rama_map_definitions()
         base.update({
-            "label": "explicit Ramachandran basin map" if mode == "rama-map" else "soft Ramachandran-region coordinate",
+            "label": "explicit Ramachandran basin map",
             "regions": [dict(r) for r in regions],
             "region_values": {str(r["name"]): float(r["value"]) for r in regions},
         })

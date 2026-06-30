@@ -86,8 +86,7 @@ def _add_cv_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--cv1", choices=["distance", "contacts", "nonlocal-contacts"], default=None,
                    help="Primary CV: distance or contacts.")
     p.add_argument("--cv2", choices=["none", "alpha", "beta", "alpha-coil-beta", "acb",
-                                      "rama-map", "rama-regions", "rama", "ramachandran",
-                                      "ramachandran-regions", "custom"], default=None,
+                                      "rama-map", "rama", "custom"], default=None,
                    help="Secondary CV for 2D workflow. Default centers inserted automatically.")
     # Expert atom override
     p.add_argument("--cv-atom1", default=None, help="Explicit primary CV atom, e.g. 1:CA.")
@@ -537,8 +536,6 @@ def _resolve_cv_aliases(args: argparse.Namespace, argv_list: list) -> None:
     if _cv2_requested and str(args.cv2) != "none" and not getattr(args, "cv2_centers", None):
         if args.cv2 == "rama-map":
             args.cv2_centers = [-1.0, -1.0 / 3.0, 1.0 / 3.0, 1.0]
-        elif args.cv2 in {"rama-regions", "ramachandran-regions"}:
-            args.cv2_centers = [-1.0, -0.5, 0.0, 0.5, 1.0]
         elif args.cv2 in {"alpha-coil-beta", "acb"}:
             args.cv2_centers = [-0.8, 0.0, 0.8]
         else:

@@ -189,9 +189,6 @@ def test_run_mode_and_cv_aliases_parse_to_canonical_values() -> None:
     assert two_d.secondary_cv == "rama-map"
     assert two_d.secondary_cv_centers == [-1.0, -1.0 / 3.0, 1.0 / 3.0, 1.0]
 
-    legacy_rama = parse_args(["--seq", "AA", "--cv1", "distance", "--cv2", "rama-regions"])
-    assert legacy_rama.secondary_cv == "rama-regions"
-    assert legacy_rama.secondary_cv_centers == [-1.0, -0.5, 0.0, 0.5, 1.0]
     assert getattr(two_d, "_cv2_auto_centers") is True
 
     acb = parse_args(["--seq", "AA", "--cv2", "alpha-coil-beta"])

@@ -267,7 +267,6 @@ CV shortcuts (schema v2.0):
     --cv1 contacts       Primary smooth nonlocal-contact fraction CV.
     --cv2 rama-map       Enable explicit Ramachandran basin-map CV; auto-inserts
                          centers [-1, -1/3, 1/3, 1] (beta/PPII/right-alpha/left-alpha).
-    --cv2 rama-regions   Scalar Ramachandran-region ladder; auto-inserts [-1, -0.5, 0, 0.5, 1].
     --cv2 alpha-coil-beta
                          Signed alpha-minus-beta CV; auto-inserts [-0.8, 0, 0.8].
     --cv2-centers C ...  Override auto-inserted 2D centers explicitly.
@@ -490,7 +489,6 @@ backbone torsion-content score.  Available modes include:
     beta
     alpha-coil-beta
     rama-map
-    rama-regions
     custom
 
 Secondary CVs use smooth periodic phi/psi scores:
@@ -508,7 +506,6 @@ Multiple secondary centers create a 2D umbrella grid:
 Auto-inserted centers when --cv2 is set without --cv2-centers:
     rama-map:         [-1, -1/3, 1/3, 1]
     alpha-coil-beta:  [-0.8, 0, 0.8]
-    rama-regions:     [-1, -0.5, 0, 0.5, 1]
 
 Explicit sparse 2D windows can instead be loaded with:
 
@@ -961,7 +958,6 @@ Supported modes include:
     beta                  beta-like phi/psi content
     alpha-coil-beta       signed alpha-minus-beta transition coordinate
     rama-map              explicit Ramachandran basin-map coordinate
-    rama-regions          legacy soft Ramachandran basin coordinate
     custom                target supplied by --cv2-phi0-deg/--cv2-psi0-deg
 
 For `alpha-coil-beta`, alpha-like states are positive, beta-like states are
@@ -969,8 +965,7 @@ negative, and coil/disordered states tend toward zero.  For `rama-map`, the code
 uses named smooth phi/psi basins: beta/extended (-135,+135), PPII/coil
 (-75,+145), right-alpha (-60,-45), and left-alpha (+60,+40).  It remains a
 one-dimensional secondary map coordinate crossed with CV1, not a dense phi/psi
-grid.  Legacy `rama-regions` keeps the older beta/PPII/turn/alpha/left-alpha
-scalar ladder.
+grid.
 
 7. 2D and sparse windows
 ------------------------
