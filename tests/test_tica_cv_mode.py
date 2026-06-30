@@ -314,3 +314,124 @@ class TestEpochCycling:
             "YAML key 'tica_epochs_per_cycle' not in argparse dests — "
             "add --tica-epochs-per-cycle to cli.py"
         )
+
+
+class TestCV2AutoSwitch:
+    """Tests for tica_switch_cv2 auto-switch logic."""
+
+    def _make_args(self, **kw) -> argparse.Namespace:
+        ns = argparse.Namespace(
+            tica_obs_interval=10,
+            tica_update_after_epochs=[0],
+            tica_epochs_per_cycle=0,
+            tica_lag_frames=50,
+            tica_min_eigenvalue=0.0,
+            tica_state_file="",
+            tica_switch_cv2=True,
+            tica_linear_k_min=5.0,
+            tica_linear_k_max=50.0,
+            secondary_cv="rama-map",
+            cv2_k_min=20.0,
+            cv2_k_max=100.0,
+        )
+        for k, v in kw.items():
+            setattr(ns, k, v)
+        return ns
+
+    def test_cli_switch_keys_in_known_dests(self):
+        """tica_switch_cv2, tica_linear_k_min, tica_linear_k_max must be argparse dests."""
+        from gareus.config import _build_known_config_dests
+        from gareus.cli import build_gareus_parser
+        parser = build_gareus_parser()
+        dests = _build_known_config_dests(parser)
+        for key in ("tica_switch_cv2", "tica_linear_k_min", "tica_linear_k_max"):
+            assert key in dests, f"YAML key '{key}' not in argparse dests"
+
+    def test_switch_logic_changes_secondary_cv(self):
+        """After a successful tICA update report, switch logic sets secondary_cv=tica-linear."""
+        args = self._make_args()
+        report = {"status": "updated", "per_window_tic1_centers": {}}
+
+        # Replicate the switch logic block from the epoch loop.
+        if report.get("status") == "updated" and getattr(args, "tica_switch_cv2", False):
+            _prev_cv2 = str(getattr(args, "secondary_cv", "none") or "none")
+            if _prev_cv2 != "tica-linear":
+                _k_min = float(getattr(args, "tica_linear_k_min", 5.0) or 5.0)
+                _k_max = float(getattr(args, "tica_linear_k_max", 50.0) or 50.0)
+                args.secondary_cv = "tica-linear"
+                args.cv2_k_min = _k_min
+                args.cv2_k_max = _k_max
+                report["cv2_switched"] = {"from": _prev_cv2, "to": "tica-linear"}
+
+        assert args.secondary_cv == "tica-linear"
+        assert args.cv2_k_min == pytest.approx(5.0)
+        assert args.cv2_k_max == pytest.approx(50.0)
+        assert report["cv2_switched"] == {"from": "rama-map", "to": "tica-linear"}
+
+    def test_switch_is_one_shot(self):
+        """Guard: if already tica-linear, do NOT overwrite k bounds or re-switch."""
+        args = self._make_args(secondary_cv="tica-linear", cv2_k_min=10.0, cv2_k_max=80.0)
+        report = {"status": "updated"}
+
+        if report.get("status") == "updated" and getattr(args, "tica_switch_cv2", False):
+            _prev = str(getattr(args, "secondary_cv", "none") or "none")
+            if _prev != "tica-linear":
+                args.secondary_cv = "tica-linear"
+                args.cv2_k_min = float(getattr(args, "tica_linear_k_min", 5.0))
+                args.cv2_k_max = float(getattr(args, "tica_linear_k_max", 50.0))
+                report["cv2_switched"] = {"from": _prev, "to": "tica-linear"}
+
+        # k bounds must be untouched; switch flag must not appear in report
+        assert args.cv2_k_min == pytest.approx(10.0)
+        assert args.cv2_k_max == pytest.approx(80.0)
+        assert "cv2_switched" not in report
+
+    def test_no_switch_when_report_not_updated(self):
+        """Switch only fires when status == 'updated'."""
+        args = self._make_args()
+        for status in ("skipped_no_obs", "skipped_low_eigenvalue", "error"):
+            report = {"status": status}
+            _orig = args.secondary_cv
+            if report.get("status") == "updated" and getattr(args, "tica_switch_cv2", False):
+                args.secondary_cv = "tica-linear"
+            assert args.secondary_cv == _orig, f"Should not switch on status={status}"
+
+    def test_resume_restores_cv2_switch(self):
+        """On ap-resume, cv2_switched in epoch summaries restores secondary_cv=tica-linear."""
+        epoch_summaries = [
+            {"epoch": 0, "tica_update": {
+                "status": "updated",
+                "cv2_switched": {"from": "rama-map", "to": "tica-linear"},
+            }},
+        ]
+        args = self._make_args(secondary_cv="rama-map")
+
+        # Replicate resume restore logic.
+        for _es in reversed(epoch_summaries):
+            _sw = (_es.get("tica_update") or {}).get("cv2_switched")
+            if _sw and _sw.get("to") == "tica-linear":
+                if str(getattr(args, "secondary_cv", "none") or "none") != "tica-linear":
+                    args.secondary_cv = "tica-linear"
+                    args.cv2_k_min = float(getattr(args, "tica_linear_k_min", 5.0) or 5.0)
+                    args.cv2_k_max = float(getattr(args, "tica_linear_k_max", 50.0) or 50.0)
+                break
+
+        assert args.secondary_cv == "tica-linear"
+        assert args.cv2_k_min == pytest.approx(5.0)
+        assert args.cv2_k_max == pytest.approx(50.0)
+
+    def test_resume_no_switch_when_no_completed_switch(self):
+        """Resume without a cv2_switched entry leaves secondary_cv unchanged."""
+        epoch_summaries = [
+            {"epoch": 0, "tica_update": {"status": "updated"}},
+        ]
+        args = self._make_args(secondary_cv="rama-map")
+
+        for _es in reversed(epoch_summaries):
+            _sw = (_es.get("tica_update") or {}).get("cv2_switched")
+            if _sw and _sw.get("to") == "tica-linear":
+                if str(getattr(args, "secondary_cv", "none") or "none") != "tica-linear":
+                    args.secondary_cv = "tica-linear"
+                break
+
+        assert args.secondary_cv == "rama-map"

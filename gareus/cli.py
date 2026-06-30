@@ -451,6 +451,20 @@ def _add_tica_args(p: argparse.ArgumentParser) -> None:
                         "Acts as an OR condition with --tica-update-after-epochs. "
                         "Note: each refit bumps tica_cv_version so prior-version epochs "
                         "are excluded from cross-epoch MBAR pooling.")
+    p.add_argument("--tica-switch-cv2", action="store_true", default=False, dest="tica_switch_cv2",
+                   help="After a successful tICA fit, permanently switch the secondary CV type to "
+                        "tica-linear for all remaining epochs and final production. "
+                        "The switch is one-shot: once triggered it is not re-triggered. "
+                        "Requires tica_obs_interval > 0. k bounds default to "
+                        "--tica-linear-k-min/max; supply explicit values if the defaults "
+                        "do not fit your system.")
+    p.add_argument("--tica-linear-k-min", type=float, default=5.0, dest="tica_linear_k_min",
+                   help="cv2_k_min applied immediately after the tica-linear CV2 switch "
+                        "(default 5.0 kcal/mol). tICA projects onto [-6, 6]; softer than the "
+                        "rama-map default (20 kcal/mol) to avoid over-constraining the wider range.")
+    p.add_argument("--tica-linear-k-max", type=float, default=50.0, dest="tica_linear_k_max",
+                   help="cv2_k_max applied immediately after the tica-linear CV2 switch "
+                        "(default 50.0 kcal/mol).")
 
 
 def _add_platform_args(p: argparse.ArgumentParser) -> None:

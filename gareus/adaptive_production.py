@@ -3791,6 +3791,21 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                 print(f"    tICA resume: restored model {_sf} (version {_ver})")
             else:
                 print(f"    tICA resume: WARNING: prior tICA state file {_sf} not found; starting fresh")
+
+        # Restore CV2 switch if it fired during a completed epoch.
+        for _es in reversed(epoch_summaries):
+            _sw = (_es.get("tica_update") or {}).get("cv2_switched")
+            if _sw and _sw.get("to") == "tica-linear":
+                if str(getattr(args, "secondary_cv", "none") or "none") != "tica-linear":
+                    args.secondary_cv = "tica-linear"
+                    args.cv2_k_min = float(getattr(args, "tica_linear_k_min", 5.0) or 5.0)
+                    args.cv2_k_max = float(getattr(args, "tica_linear_k_max", 50.0) or 50.0)
+                    print(
+                        f"    tICA resume: restored CV2 switch '{_sw.get('from')}' → 'tica-linear' "
+                        f"(k=[{args.cv2_k_min:.1f}, {args.cv2_k_max:.1f}] kcal/mol) "
+                        f"from epoch {_es['epoch']} summary"
+                    )
+                break
         context_reuse_readiness = evaluate_context_reuse_readiness(args, adaptive_dir, registry=registry)
 
     # Warn when tica_epochs_per_cycle is set but observation collection is disabled:
@@ -3802,6 +3817,11 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             f"WARNING: tica_epochs_per_cycle={_tica_epc} but tica_obs_interval=0 — "
             "tICA refitting requires dihedral observations (set tica_obs_interval > 0). "
             "All cycle refits will be silently skipped."
+        )
+    if getattr(args, "tica_switch_cv2", False) and _tica_obs <= 0:
+        print(
+            "WARNING: tica_switch_cv2=True but tica_obs_interval=0 — "
+            "CV2 auto-switch requires dihedral observations. Switch will never trigger."
         )
 
     # topup-only mode: skip the epoch loop, let the final-phase skip guard fire, run extension rounds.
@@ -4048,6 +4068,24 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                         registry.write_active_window_csv(next_csv, map_path=next_map)
                         registry.write_epoch_window_map(next_epoch_dir / "epoch_window_map.csv")
                         print(f"    tICA: re-wrote {next_csv.name} with updated secondary centers")
+
+            # CV2 auto-switch: permanently replace secondary_cv with tica-linear so
+            # all subsequent epochs and final production run with the fitted tIC1.
+            # One-shot guard: skip if already tica-linear.
+            if getattr(args, "tica_switch_cv2", False):
+                _prev_cv2 = str(getattr(args, "secondary_cv", "none") or "none")
+                if _prev_cv2 != "tica-linear":
+                    _k_min = float(getattr(args, "tica_linear_k_min", 5.0) or 5.0)
+                    _k_max = float(getattr(args, "tica_linear_k_max", 50.0) or 50.0)
+                    args.secondary_cv = "tica-linear"
+                    args.cv2_k_min = _k_min
+                    args.cv2_k_max = _k_max
+                    print(
+                        f"    tICA: switched CV2 '{_prev_cv2}' → 'tica-linear' "
+                        f"(k=[{_k_min:.1f}, {_k_max:.1f}] kcal/mol). "
+                        f"Effective from epoch {epoch + 1}."
+                    )
+                    tica_update_report["cv2_switched"] = {"from": _prev_cv2, "to": "tica-linear"}
         except Exception as _tica_exc:
             print(f"WARNING: _maybe_update_tica_cvaux failed for epoch {epoch}: {_tica_exc}")
             tica_update_report = {"status": "error", "error": str(_tica_exc)}

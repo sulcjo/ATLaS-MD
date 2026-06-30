@@ -123,6 +123,10 @@ Common flags
     --tica-epochs-per-cycle N           Auto-refit tICA every N completed epochs (0=off; OR with --tica-update-after-epochs).
     --tica-update-after-epochs E ...    Explicit epoch list for tICA refit, e.g. 2 5 8.
     --tica-min-eigenvalue V             Skip refit if tIC1 eigenvalue below V (default 0.0=always update).
+    --tica-switch-cv2                   After first successful tICA fit, permanently switch CV2 type to tica-linear.
+                                        One-shot: triggers once, persists through final production and on --ap-resume.
+    --tica-linear-k-min V               cv2_k_min applied after the CV2 switch (default 5.0 kcal/mol).
+    --tica-linear-k-max V               cv2_k_max applied after the CV2 switch (default 50.0 kcal/mol).
 
     --traj-format FORMAT                dcd, xtc, or none.
     --no-sample-potential-energy        Skip live total-PE diagnostics.
@@ -1387,6 +1391,32 @@ the updated center is directly the per-window tIC1 median.  For other CV2 types
 but secondary_center still holds a value in the original CV2 coordinate; the
 update reflects where the data landed in CV2 space, not tIC1 space.
 
+CV2 auto-switch (tica_switch_cv2)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Setting tica_switch_cv2: true enables a one-shot automatic CV2 type change:
+after the first successful tICA refit, the secondary CV type is permanently
+replaced with tica-linear for all remaining epochs and final production.
+
+This allows a single YAML config to run a two-stage strategy:
+
+  Epoch 0:   cv2 = rama-map  (broad discrete exploration; cheap, no model needed)
+  tICA fit:  collect obs from epoch 0, fit tIC1, update window centers
+  Epoch 1+:  cv2 = tica-linear  (data-driven slowest-mode coordinate)
+  Final:     cv2 = tica-linear  (high-quality MBAR samples)
+
+The switch is permanent once triggered.  On --ap-resume the switch is
+restored from the epoch summary JSON so the resumed run continues with
+tica-linear rather than reverting to the original cv2 setting.
+
+k bounds are separately adjustable for the tica-linear regime:
+
+  tica_linear_k_min: 5.0    # default 5.0 kcal/mol (softer than rama-map's 20)
+  tica_linear_k_max: 50.0   # default 50.0 kcal/mol
+
+tICA projects onto [-6, 6] (dimensionless).  The wider range relative to
+rama-map's [-1, 1] requires softer springs; the adaptive overlap system will
+scale further if needed.
+
 Trigger modes
 ~~~~~~~~~~~~~
 The refit fires when either (or both) of the following conditions is true AND
@@ -1410,8 +1440,14 @@ Recommended cycle lengths:
     tica_epochs_per_cycle: 3   practical default; pools 3 epochs before refit
     tica_epochs_per_cycle: 5   more data per refit; slower adaptation
 
+With tica_switch_cv2: epoch 0 (rama-map) and epoch 1+ (tica-linear) have
+different tica_cv_version values by construction.  The MBAR pool for final
+production only includes post-switch epochs, which is the correct behavior.
+
 YAML configuration
 ~~~~~~~~~~~~~~~~~~
+Minimal (center-update only, same CV2 throughout):
+
     tica:
       tica_obs_interval: 50        # >0 required to enable; typically 50-200
       tica_lag_frames: 50          # lag tau; increase for slow folding peptides
@@ -1419,6 +1455,24 @@ YAML configuration
       tica_min_eigenvalue: 0.0     # skip refits with poor slow-mode separation
       # tica_update_after_epochs: [2, 5, 8]   # alternative: explicit epoch list
       # tica_state_file: ""                   # managed automatically; omit
+
+Two-stage auto-switch (epoch 0 rama-map → epoch 1+ tica-linear):
+
+    cvs:
+      cv1: contacts
+      cv2: rama-map               # starting CV2; switched automatically after epoch 0
+
+    adaptive_production:
+      ap_epochs: 2                # epoch 0: rama-map, epoch 1: tica-linear
+      ap_final_pool_fraction: 0.60
+
+    tica:
+      tica_obs_interval: 50
+      tica_lag_frames: 50
+      tica_update_after_epochs: [0]  # fit after epoch 0, then switch
+      tica_switch_cv2: true          # permanently switch CV2 to tica-linear
+      tica_linear_k_min: 5.0         # k bounds for the tICA-linear regime
+      tica_linear_k_max: 50.0
 
 The tica: section name is cosmetic.  _flatten_config_mapping descends any nested
 dict, so tica_* keys may appear under any section heading.  tica_state_file is
