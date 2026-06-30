@@ -322,7 +322,7 @@ adaptive_production:
   # Code recomputes epoch budget live at each epoch start: (remaining - final_reserve) / epochs_remaining.
   # With 4000 ns pool, ap_final_pool_fraction=0.70: epochs 30% = 1200 ns (3 x ~400 ns), final 70% = 2800 ns.
 
-  ap_target_overlap: 0.25              # target neighboring-window histogram overlap (production epochs); default 0.25
+  # ap_target_overlap removed (unified → target_overlap; set once for both feedback and production loops)
 
   # Final phase
   ap_final_pool_fraction: 0.70        # was 0.40; precision bought in uniform locked-layout final phase (CV2/Ramachandran is slow-converging coordinate). 70% of 2000 ns = 1400 ns final.

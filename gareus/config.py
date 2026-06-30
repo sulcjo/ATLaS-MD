@@ -87,7 +87,7 @@ CONFIG_KEY_ALIASES: Dict[str, str] = {
     "cv_2": "cv2",
     # v2.0: aggressiveness, pilot_fraction, validation_steps, adaptive_rounds,
     #        production_steps, equil_steps are now canonical dests — aliases removed.
-    "boost_type": "gamd_boost_type",
+    "boost_type": "gamd_boost_type",  # documented backward-compat alias
     "adaptive_min_rounds": "adaptive_feedback_min_rounds",
 }
 

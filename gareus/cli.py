@@ -8,6 +8,7 @@ import csv
 import json
 import math
 import os
+import warnings
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -120,8 +121,10 @@ def _add_cv_args(p: argparse.ArgumentParser) -> None:
                    help="Upper clamp for adaptive CV1 k. 0 = auto.")
     p.add_argument("--cv1-k-mode", choices=["spacing", "fixed", "constant"], default="spacing",
                    help="CV1 force-constant assignment mode.")
-    p.add_argument("--cv1-adaptive-overlap-sigma", type=float, default=1.25,
-                   help="Overlap-sigma for spacing-derived CV1 k.")
+    p.add_argument("--cv1-adaptive-overlap-sigma", type=float, default=2.3,
+                   help="Overlap-sigma for spacing-derived CV1 k. "
+                        "spacing/sigma_gaussian ratio; erfc(sigma/(2*sqrt(2))) gives actual overlap. "
+                        "Default 2.3 yields ~0.25 fractional overlap, matching --target-overlap default.")
     p.add_argument("--cv1-boundary-pull-steps", type=int, default=5000,
                    help="Steps per direction for CV boundary pull (0 = skip, use configured range).")
     p.add_argument("--cv1-boundary-pull-k", type=float, default=50.0,
@@ -150,11 +153,12 @@ def _add_cv_args(p: argparse.ArgumentParser) -> None:
                    help="Extra multiplier for spacing/adaptive CV2 k.")
     # Custom secondary CV angles
     p.add_argument("--cv2-sigma-deg", type=float, default=35.0,
-                   help="Angular width in degrees for phi/psi content score.")
+                   help="Angular width in degrees for phi/psi content score. "
+                        "Only active when --cv2 custom; ignored for all other CV2 types.")
     p.add_argument("--cv2-phi0-deg", type=float, default=-60.0,
-                   help="Custom CV2 phi target in degrees (--cv2 custom).")
+                   help="Custom CV2 phi target in degrees. Only active when --cv2 custom.")
     p.add_argument("--cv2-psi0-deg", type=float, default=-45.0,
-                   help="Custom CV2 psi target in degrees (--cv2 custom).")
+                   help="Custom CV2 psi target in degrees. Only active when --cv2 custom.")
 
     # Debug
     p.add_argument("--self-test-primary-cv-force", action="store_true",
@@ -301,7 +305,6 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                    help="Propagate seed bank between epochs.")
     p.add_argument("--ap-seed-bank-max", type=int, default=1,
                    help="Max seeds per state per epoch.")
-    p.add_argument("--ap-target-overlap", type=float, default=0.25)
     p.add_argument("--ap-min-exchange", type=float, default=0.08)
     p.add_argument("--ap-min-samples", type=int, default=50)
     p.add_argument("--ap-retire-min-samples", type=int, default=200,
@@ -369,7 +372,7 @@ def _add_genpept_prescan_args(p: argparse.ArgumentParser) -> None:
 
 
 def _add_gamd_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--production-steps", "--gamd-production-steps", dest="production_steps",
+    p.add_argument("--production-steps", dest="production_steps",
                    type=int, default=500000, help="Production steps per replica.")
     p.add_argument("--gamd-boost-type", default="lower-dual", choices=[
         "gamd-cmd-base", "lower-total", "upper-total", "lower-dihedral", "upper-dihedral",
@@ -808,7 +811,7 @@ def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
     args.adaptive_production_union_fes_bins = args.ap_fes_bins
     args.adaptive_production_propagate_seed_bank = args.ap_seed_bank
     args.adaptive_production_seed_bank_max_per_state = args.ap_seed_bank_max
-    args.adaptive_production_target_overlap = args.ap_target_overlap
+    args.adaptive_production_target_overlap = args.target_overlap
     args.adaptive_production_min_exchange = args.ap_min_exchange
     args.adaptive_production_min_samples = args.ap_min_samples
     # ap_min_samples_per_window is the preferred name; ap_retire_min_samples is the legacy alias.
@@ -817,6 +820,10 @@ def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
     args.adaptive_production_retire_min_samples = args.ap_min_samples_per_window
     if args.ap_retire_min_samples != 200:
         # Legacy alias was explicitly set — honour it for backward compatibility.
+        warnings.warn(
+            "ap_retire_min_samples is deprecated; use ap_min_samples_per_window instead.",
+            DeprecationWarning, stacklevel=2,
+        )
         args.adaptive_production_retire_min_samples = args.ap_retire_min_samples
     args.adaptive_production_final_min_samples_per_state = args.ap_final_min_samples_per_window
     args.adaptive_production_max_new_windows_per_epoch = args.ap_max_new_windows
@@ -901,6 +908,37 @@ def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
     # primary_cv alias kept for cv.py compatibility
     if not hasattr(args, "primary_cv"):
         args.primary_cv = "distance"
+
+    # ── Config sanity warnings ────────────────────────────────────────────────
+    # R5: cv1_k_default silently ignored in non-fixed mode
+    if getattr(args, "cv1_k_mode", "spacing") not in ("fixed", "constant") and float(getattr(args, "cv1_k_default", 0.0) or 0.0) != 0.0:
+        warnings.warn(
+            f"cv1_k_default={args.cv1_k_default} is set but cv1_k_mode='{args.cv1_k_mode}' — "
+            "cv1_k_default is only used in 'fixed' mode. Use cv1_k_min/cv1_k_max for spacing mode.",
+            UserWarning, stacklevel=2,
+        )
+    # R6: cv2_k_default silently ignored when cv2_k_mode is not fixed/constant
+    _cv2_k_mode = getattr(args, "cv2_k_mode", "fixed")
+    if _cv2_k_mode not in ("fixed", "constant") and float(getattr(args, "cv2_k_default", 50.0) or 50.0) != 50.0:
+        warnings.warn(
+            f"cv2_k_default={args.cv2_k_default} is set but cv2_k_mode='{_cv2_k_mode}' — "
+            "cv2_k_default is only used in 'fixed' mode. Use cv2_k_min/cv2_k_max for other modes.",
+            UserWarning, stacklevel=2,
+        )
+    # R8: tICA trigger conflict
+    _tica_cycle = int(getattr(args, "tica_epochs_per_cycle", 0) or 0)
+    _tica_explicit = getattr(args, "tica_update_after_epochs", None)
+    if _tica_cycle > 0 and _tica_explicit is not None:
+        raise ValueError(
+            "tica_epochs_per_cycle and tica_update_after_epochs are mutually exclusive. "
+            f"Got tica_epochs_per_cycle={_tica_cycle} and tica_update_after_epochs={_tica_explicit}. "
+            "Use one trigger mechanism only."
+        )
+    # R9: genpept_prescan_dir fallback
+    if getattr(args, "genpept_prescan", False) and getattr(args, "genpept_prescan_dir", None) is None:
+        _fallback = getattr(args, "seed_conformers_dir", None)
+        if _fallback is not None:
+            args.genpept_prescan_dir = _fallback
 
 
 # ---------------------------------------------------------------------------

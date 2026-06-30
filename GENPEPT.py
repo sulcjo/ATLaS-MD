@@ -8518,6 +8518,11 @@ def main(argv=None):
     UI_COLOR = not getattr(args, "no_color", False)
     args.seq = validate_sequence(args.seq)
     if args.no_explicit:
+        import warnings
+        warnings.warn(
+            "--no-explicit is deprecated; use --implicit-only instead.",
+            DeprecationWarning, stacklevel=2,
+        )
         args.implicit_only = True
     if getattr(args, "sirah_cg", False):
         # SIRAH consumes the final selected implicit minima directly. Do not run

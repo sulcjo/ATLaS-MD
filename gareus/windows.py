@@ -543,7 +543,9 @@ def adaptive_force_constants_kcal_a2(centers_a: np.ndarray, args) -> list[float]
     if centers_a.size > 2:
         local[1:-1] = 0.5 * (spacings[:-1] + spacings[1:])
     overlap_sigma = max(0.25, float(args.adaptive_overlap_sigma))
-    # sigma ~= spacing/overlap_sigma, k = kBT/sigma^2.
+    # sigma_gaussian = spacing/overlap_sigma; k = kBT/sigma_gaussian^2.
+    # Fractional overlap = erfc(overlap_sigma / (2*sqrt(2))).
+    # Default 2.3 → overlap ≈ 0.25.
     ks = rt_kcal_mol / np.maximum(0.05, local / overlap_sigma) ** 2
     return [float(max(args.adaptive_min_k_kcal_a2, min(args.adaptive_max_k_kcal_a2, k))) for k in ks]
 
