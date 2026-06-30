@@ -469,7 +469,7 @@ OpenMM internal units are:
 
 Adaptive k values use the spacing heuristic:
 
-    sigma ~= spacing / overlap_sigma
+    sigma ~= spacing / overlap_sigma          (default overlap_sigma=2.3 → overlap ≈ 0.25)
     k     ~= RT / sigma^2
 
 with default clamp:
@@ -938,7 +938,7 @@ exchange and downstream reweighting.
 ----------------------------------
 Spacing-derived k values are estimated from local center spacing:
 
-    sigma ~= spacing / cv1_adaptive_overlap_sigma
+    sigma ~= spacing / cv1_adaptive_overlap_sigma    (default 2.3 → overlap ≈ 0.25)
     k     ~= RT / sigma^2
 
 Clamped by --cv1-k-min / --cv1-k-max (primary CV) and --cv2-k-min / --cv2-k-max
@@ -1138,7 +1138,7 @@ Important controls:
     --ap-epoch-steps                   (per-state epoch steps fallback hint)
     --ap-final-steps                   (per-state frozen-final steps fallback hint)
     --ap-resume                        (resume from state_registry.json or epoch checkpoints)
-    --ap-target-overlap / --ap-min-exchange
+    --target-overlap / --ap-min-exchange
                                        (per-epoch edge health thresholds)
     --ap-write-mbar-inputs / --ap-run-mbar
                                        (post-hoc union-state MBAR outputs)
@@ -1186,7 +1186,7 @@ Outputs:
 The report checks symptoms such as weak primary-window overlap, primary-CV
 sampling piled up near edges, missing secondary-CV coverage, secondary CVs that
 do not respond to their targets, and whether a distance-only run should be
-compared with contacts or Ramachandran-region CVs.  It is deliberately heuristic:
+compared with contacts or Ramachandran CVs.  It is deliberately heuristic:
 it suggests what to test next, not what to publish as truth.  Apparently the
 molecule still refuses to fill out a reaction-coordinate declaration form.
 
