@@ -8333,7 +8333,8 @@ def analyze_chignolin_fes(d, args, base_logw: np.ndarray, selected: str, boost_o
 
 
 def _analyze_tica_epochs(prod_dir: Path, out: Path, meta: dict, warn: list) -> dict:
-    """Analyze per-epoch tICA CVaux updates: eigenvalue progression, MBAR vs uniform reweighting, per-window tIC1 center evolution."""
+    """Analyze per-epoch tICA CVaux updates: eigenvalue progression, MBAR vs uniform reweighting,
+    per-window tIC1 center evolution, and dihedral distribution convergence across epochs."""
     ap = None
     for candidate in (prod_dir / 'adaptive_production', prod_dir.parent / 'adaptive_production'):
         if candidate.is_dir():
@@ -8361,10 +8362,12 @@ def _analyze_tica_epochs(prod_dir: Path, out: Path, meta: dict, warn: list) -> d
         if isinstance(tu, dict) and tu.get('status') == 'updated':
             tica_records.append({
                 'epoch': int(es.get('epoch', tu.get('epoch', -1))),
+                'epoch_dir': str(es.get('epoch_dir', '')),
                 'eigenvalue': float(tu.get('eigenvalue', float('nan'))),
                 'n_samples': int(tu.get('n_samples', 0)),
                 'mbar_reweighted': bool(tu.get('mbar_reweighted', False)),
                 'lag_frames': int(tu.get('lag_frames', 0)),
+                'n_windows_updated': int(tu.get('registry_states_updated', len(tu.get('per_window_tic1_centers', {})))),
                 'per_window_tic1_centers': {int(k): float(v) for k, v in tu.get('per_window_tic1_centers', {}).items()},
             })
 
@@ -8372,6 +8375,93 @@ def _analyze_tica_epochs(prod_dir: Path, out: Path, meta: dict, warn: list) -> d
         return {'available': False, 'reason': 'no successful tICA updates in epoch summaries'}
 
     tica_state_path = ap / 'tica_state.json'
+
+    # Δeigenvalue: change from previous update (nan for first)
+    delta_eig = [float('nan')]
+    for i in range(1, len(tica_records)):
+        delta_eig.append(tica_records[i]['eigenvalue'] - tica_records[i-1]['eigenvalue'])
+    for i, r in enumerate(tica_records):
+        r['delta_eigenvalue'] = delta_eig[i]
+
+    # --- Dihedral distribution convergence via mean JS divergence -----------------
+    # Load sin/cos dihedral features from each epoch's tica_obs/*.npz.
+    # Compute cumulative histograms and compare against final (all-epochs) distribution.
+    _DBINS = 60
+    _DRANGE = (-1.01, 1.01)
+
+    def _load_epoch_features(epoch_dir_str):
+        """Return (features array N×D, ok). Loads all replica npz files."""
+        edir = Path(epoch_dir_str) if epoch_dir_str else Path('__nonexistent__')
+        tica_dir = edir / 'tica_obs'
+        if not tica_dir.is_dir():
+            return None, False
+        npz_files = sorted(tica_dir.glob('dihedral_obs_*.npz'))
+        chunks = []
+        for p in npz_files:
+            try:
+                d = np.load(p)
+                if 'features' in d.files:
+                    chunks.append(d['features'].astype(np.float32))
+            except Exception:
+                pass
+        if not chunks:
+            return None, False
+        return np.concatenate(chunks, axis=0), True
+
+    def _feature_histograms(X, n_bins=_DBINS, rng=_DRANGE):
+        """Per-feature histogram counts. Returns (D, n_bins) int array."""
+        D = X.shape[1]
+        counts = np.zeros((D, n_bins), dtype=np.int64)
+        for d in range(D):
+            counts[d], _ = np.histogram(X[:, d], bins=n_bins, range=rng)
+        return counts
+
+    def _mean_js(counts_a, counts_b):
+        """Mean Jensen-Shannon divergence (nats) across features. counts: (D, n_bins)."""
+        a = counts_a.astype(np.float64); b = counts_b.astype(np.float64)
+        a_sum = a.sum(axis=1, keepdims=True); b_sum = b.sum(axis=1, keepdims=True)
+        a /= np.where(a_sum > 0, a_sum, 1.0)
+        b /= np.where(b_sum > 0, b_sum, 1.0)
+        m = 0.5 * (a + b)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            log_m = np.where(m > 0, np.log(m), 0.0)
+            kl_am = np.where(a > 0, a * (np.log(np.where(a > 0, a, 1.0)) - log_m), 0.0)
+            kl_bm = np.where(b > 0, b * (np.log(np.where(b > 0, b, 1.0)) - log_m), 0.0)
+        return float(np.mean(0.5 * (kl_am + kl_bm).sum(axis=1)))
+
+    epoch_features = []  # per-record: (D, _DBINS) count array or None
+    n_features = 0
+    for r in tica_records:
+        X, ok = _load_epoch_features(r['epoch_dir'])
+        if ok and X.ndim == 2 and X.shape[1] > 0:
+            epoch_features.append(_feature_histograms(X))
+            n_features = max(n_features, X.shape[1])
+        else:
+            epoch_features.append(None)
+
+    # Compute cumulative → final JS (convergence to asymptote) and incremental JS
+    dihedral_js_vs_final = []
+    dihedral_js_incremental = []
+    has_dihedral_data = any(e is not None for e in epoch_features)
+    if has_dihedral_data:
+        valid_counts = [e for e in epoch_features if e is not None]
+        final_counts = sum(valid_counts) if len(valid_counts) > 1 else valid_counts[0]
+        cumulative = None
+        for i, ec in enumerate(epoch_features):
+            if ec is None:
+                dihedral_js_vs_final.append(float('nan'))
+                dihedral_js_incremental.append(float('nan'))
+                continue
+            prev_cum = cumulative
+            cumulative = ec if cumulative is None else (cumulative + ec)
+            dihedral_js_vs_final.append(_mean_js(cumulative, final_counts))
+            if prev_cum is not None:
+                dihedral_js_incremental.append(_mean_js(prev_cum, cumulative))
+            else:
+                dihedral_js_incremental.append(float('nan'))
+        for i, r in enumerate(tica_records):
+            r['dihedral_js_vs_final'] = dihedral_js_vs_final[i]
+            r['dihedral_js_incremental'] = dihedral_js_incremental[i]
 
     tica_out = out / 'tica_epochs'; tica_out.mkdir(parents=True, exist_ok=True)
     try:
@@ -8384,35 +8474,75 @@ def _analyze_tica_epochs(prod_dir: Path, out: Path, meta: dict, warn: list) -> d
     generated = {}
     epochs_arr = np.array([r['epoch'] for r in tica_records])
     eigenvalues_arr = np.array([r['eigenvalue'] for r in tica_records])
+    delta_eig_arr = np.array([r['delta_eigenvalue'] for r in tica_records])
     n_samples_arr = np.array([r['n_samples'] for r in tica_records])
     mbar_flags = [r['mbar_reweighted'] for r in tica_records]
     colors_mbar = ['#2266cc' if m else '#cc4422' for m in mbar_flags]
+    legend_handles = [
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='#2266cc', markersize=8, label='MBAR-reweighted'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='#cc4422', markersize=8, label='Unweighted'),
+    ]
 
-    # Plot 1: eigenvalue progression + training-set size
+    # Plot 1: eigenvalue + Δeigenvalue + training-set size (3-panel)
     try:
-        fig, axes = plt.subplots(2, 1, figsize=(7, 6), sharex=True)
-        ax1, ax2 = axes
+        fig, axes = plt.subplots(3, 1, figsize=(7, 8), sharex=True)
+        ax1, ax2, ax3 = axes
         ax1.scatter(epochs_arr, eigenvalues_arr, c=colors_mbar, s=60, zorder=5)
         ax1.plot(epochs_arr, eigenvalues_arr, 'k-', alpha=0.4, linewidth=1)
-        ax1.legend(handles=[
-            Line2D([0], [0], marker='o', color='w', markerfacecolor='#2266cc', markersize=8, label='MBAR-reweighted'),
-            Line2D([0], [0], marker='o', color='w', markerfacecolor='#cc4422', markersize=8, label='Unweighted'),
-        ], fontsize=8)
-        ax1.set_ylabel('tIC1 eigenvalue (Koopman)')
-        ax1.set_title('tICA CVaux: eigenvalue progression per update epoch')
+        ax1.legend(handles=legend_handles, fontsize=8)
+        ax1.set_ylabel('tIC1 eigenvalue')
+        ax1.set_title('tICA CVaux: eigenvalue + model stability per update epoch')
         ax1.grid(True, alpha=0.3)
-        ax2.bar(epochs_arr, n_samples_arr / 1000, color=colors_mbar, alpha=0.7)
-        ax2.set_xlabel('Adaptive epoch')
-        ax2.set_ylabel('Training samples (×10³)')
-        ax2.set_title('tICA training set size')
-        ax2.grid(True, alpha=0.3, axis='y')
+        # Δeigenvalue: filled area around zero, markers for each update
+        valid_delta = np.isfinite(delta_eig_arr)
+        if valid_delta.any():
+            ax2.axhline(0, color='k', linewidth=0.8, alpha=0.5)
+            ax2.bar(epochs_arr[valid_delta], delta_eig_arr[valid_delta],
+                    color=[('#2266cc' if m else '#cc4422') for m, v in zip(mbar_flags, valid_delta) if v],
+                    alpha=0.7)
+            ax2.set_ylabel('Δ eigenvalue')
+            ax2.set_title('Eigenvalue change per update (→ 0 = converged model)')
+            ax2.grid(True, alpha=0.3, axis='y')
+        ax3.bar(epochs_arr, n_samples_arr / 1000, color=colors_mbar, alpha=0.7)
+        ax3.set_xlabel('Adaptive epoch')
+        ax3.set_ylabel('Training samples (×10³)')
+        ax3.set_title('tICA training set size')
+        ax3.grid(True, alpha=0.3, axis='y')
         fig.tight_layout()
         p = tica_out / 'tica_eigenvalue_progression.png'; fig.savefig(p, dpi=150, bbox_inches='tight'); plt.close(fig)
         generated['tica_eigenvalue_progression_png'] = str(p)
     except Exception as e:
         warn.append(f'tica_eigenvalue_progression.png failed: {e}'); plt.close('all')
 
-    # Plot 2: per-window tIC1 center heatmap (row=epoch, col=window)
+    # Plot 2: dihedral distribution convergence (mean JS vs epoch)
+    if has_dihedral_data:
+        try:
+            js_final_arr = np.array([r.get('dihedral_js_vs_final', float('nan')) for r in tica_records])
+            js_incr_arr = np.array([r.get('dihedral_js_incremental', float('nan')) for r in tica_records])
+            fig, axes = plt.subplots(2, 1, figsize=(7, 6), sharex=True)
+            ax1, ax2 = axes
+            # Panel 1: convergence to final distribution
+            ax1.plot(epochs_arr, js_final_arr, 'o-', color='#2266cc', linewidth=1.5, markersize=6)
+            ax1.fill_between(epochs_arr, 0, js_final_arr, alpha=0.15, color='#2266cc')
+            ax1.set_ylabel('Mean JS divergence (nats)')
+            ax1.set_title(f'Dihedral convergence vs final distribution  ({n_features} features = {n_features // 2} dihedrals × sin/cos)')
+            ax1.grid(True, alpha=0.3)
+            ax1.set_ylim(bottom=0)
+            # Panel 2: incremental shift per epoch
+            valid = np.isfinite(js_incr_arr)
+            if valid.any():
+                ax2.bar(epochs_arr[valid], js_incr_arr[valid], color='#884499', alpha=0.7)
+                ax2.set_ylabel('Incremental JS (nats)')
+                ax2.set_title('Per-epoch dihedral distribution shift (→ 0 = diminishing returns)')
+                ax2.grid(True, alpha=0.3, axis='y')
+            ax2.set_xlabel('Adaptive epoch')
+            fig.tight_layout()
+            p = tica_out / 'tica_dihedral_convergence.png'; fig.savefig(p, dpi=150, bbox_inches='tight'); plt.close(fig)
+            generated['tica_dihedral_convergence_png'] = str(p)
+        except Exception as e:
+            warn.append(f'tica_dihedral_convergence.png failed: {e}'); plt.close('all')
+
+    # Plot 3: per-window tIC1 center heatmap (row=epoch, col=window) + Δ from first epoch
     try:
         all_windows = sorted({w for r in tica_records for w in r['per_window_tic1_centers']})
         if all_windows:
@@ -8425,28 +8555,46 @@ def _analyze_tica_epochs(prod_dir: Path, out: Path, meta: dict, warn: list) -> d
                         heatmap[i, j] = v
             finite_vals = heatmap[np.isfinite(heatmap)]
             if finite_vals.size > 0:
+                # Main heatmap + Δ from epoch-0 side by side
+                n_plots = 2 if n_ep > 1 else 1
+                fig, axes = plt.subplots(1, n_plots, figsize=(max(6, n_w * 0.25 + 2) * n_plots, max(4, n_ep * 0.4 + 1.5)))
+                if n_plots == 1:
+                    axes = [axes]
                 vabs = max(abs(float(finite_vals.min())), abs(float(finite_vals.max())), 1e-9)
-                fig, ax = plt.subplots(figsize=(max(6, n_w * 0.25 + 2), max(4, n_ep * 0.4 + 1.5)))
-                im = ax.imshow(heatmap, aspect='auto', cmap='RdBu_r', vmin=-vabs, vmax=vabs, origin='lower', interpolation='nearest')
-                ax.set_yticks(range(n_ep))
-                ax.set_yticklabels([f'Epoch {r["epoch"]}' for r in tica_records], fontsize=7)
-                ax.set_xlabel('Window index'); ax.set_ylabel('tICA update epoch')
-                ax.set_title('Per-window tIC1 center evolution')
-                plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='tIC1 center')
+                ylabels = [f'Ep{r["epoch"]} n_win={r["n_windows_updated"]}' for r in tica_records]
+                im0 = axes[0].imshow(heatmap, aspect='auto', cmap='RdBu_r', vmin=-vabs, vmax=vabs,
+                                     origin='lower', interpolation='nearest')
+                axes[0].set_yticks(range(n_ep)); axes[0].set_yticklabels(ylabels, fontsize=7)
+                axes[0].set_xlabel('Window index'); axes[0].set_ylabel('tICA update epoch')
+                axes[0].set_title('Per-window tIC1 center')
+                plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04, label='tIC1 center')
+                if n_plots > 1:
+                    delta_map = heatmap - heatmap[0:1, :]  # change from first epoch
+                    dabs = float(np.nanmax(np.abs(delta_map[1:]))) if n_ep > 1 else 1e-9
+                    dabs = max(dabs, 1e-9)
+                    im1 = axes[1].imshow(delta_map, aspect='auto', cmap='PiYG', vmin=-dabs, vmax=dabs,
+                                         origin='lower', interpolation='nearest')
+                    axes[1].set_yticks(range(n_ep)); axes[1].set_yticklabels(ylabels, fontsize=7)
+                    axes[1].set_xlabel('Window index')
+                    axes[1].set_title('Δ tIC1 center from epoch 0')
+                    plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04, label='Δ tIC1 center')
                 fig.tight_layout()
                 p = tica_out / 'tica_window_center_heatmap.png'; fig.savefig(p, dpi=150, bbox_inches='tight'); plt.close(fig)
                 generated['tica_window_center_heatmap_png'] = str(p)
     except Exception as e:
         warn.append(f'tica_window_center_heatmap.png failed: {e}'); plt.close('all')
 
-    # CSV summary
+    # CSV summary (enhanced)
     try:
         csv_path = tica_out / 'tica_epoch_summary.csv'
+        fields = ['epoch', 'eigenvalue', 'delta_eigenvalue', 'n_samples', 'n_windows_updated',
+                  'mbar_reweighted', 'lag_frames', 'dihedral_js_vs_final', 'dihedral_js_incremental']
         with csv_path.open('w', newline='') as fh:
-            wr = csv.DictWriter(fh, fieldnames=['epoch', 'eigenvalue', 'n_samples', 'mbar_reweighted', 'lag_frames'])
+            wr = csv.DictWriter(fh, fieldnames=fields, extrasaction='ignore')
             wr.writeheader()
             for r in tica_records:
-                wr.writerow({k: r[k] for k in ['epoch', 'eigenvalue', 'n_samples', 'mbar_reweighted', 'lag_frames']})
+                row = {k: r.get(k, '') for k in fields}
+                wr.writerow(row)
         generated['tica_epoch_summary_csv'] = str(csv_path)
     except Exception as e:
         warn.append(f'tica_epoch_summary.csv failed: {e}')
@@ -8455,8 +8603,11 @@ def _analyze_tica_epochs(prod_dir: Path, out: Path, meta: dict, warn: list) -> d
         'available': True,
         'n_updates': len(tica_records),
         'n_mbar_reweighted': sum(1 for r in tica_records if r['mbar_reweighted']),
+        'n_dihedral_features': n_features,
         'latest_eigenvalue': float(tica_records[-1]['eigenvalue']) if tica_records else None,
+        'latest_delta_eigenvalue': float(tica_records[-1]['delta_eigenvalue']) if tica_records else None,
         'latest_epoch': int(tica_records[-1]['epoch']) if tica_records else None,
+        'dihedral_js_vs_final': [r.get('dihedral_js_vs_final', float('nan')) for r in tica_records],
         'adaptive_dir': str(ap),
         'tica_state_file': str(tica_state_path) if tica_state_path.exists() else None,
         'files': generated,
