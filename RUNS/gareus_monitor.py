@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-GAREUS multi-peptide run monitor  —  stdlib only, no deps.
+GAREUS multi-peptide run monitor  —  Textual/Rich when available, ANSI fallback.
 
 Usage:
-  python gareus_monitor.py [RUNS_DIR] [--interval SECS] [--once]
+  python gareus_monitor.py [RUNS_DIR] [--interval SECS] [--once] [--ui auto|textual|rich|ansi]
   python gareus_monitor.py RUNS/runs2/ RUNS/v01_runs/
 
 Interactive keys (TTY mode):
@@ -17,6 +17,8 @@ Interactive keys (TTY mode):
 
 import argparse
 import csv
+from dataclasses import dataclass, field
+import importlib.util
 import json
 import math
 import os
@@ -25,9 +27,314 @@ import sys
 import time
 import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Literal
 
 KT_KCAL = 0.5962   # k_B T at ~300 K, kcal/mol (matches run beta 0.4009 /kJ)
+UI_MODES = ("auto", "textual", "rich", "ansi")
+
+
+@dataclass(frozen=True)
+class Diagnostic:
+    severity: Literal["error", "warn", "info"]
+    code: str
+    message: str
+    source: str = ""
+    action: str = ""
+
+
+@dataclass(frozen=True)
+class RunPlanSegment:
+    label: str
+    kind: str
+    planned_ns: float
+    consumed_ns: float = 0.0
+
+
+@dataclass(frozen=True)
+class RunPlan:
+    name: str
+    source: str
+    total_ns: Optional[float]
+    adaptive_ns: Optional[float]
+    final_ns: Optional[float]
+    epochs: Optional[int]
+    final_fraction: Optional[float]
+    min_final_ns: Optional[float]
+    target_overlap: Optional[float]
+    max_windows: Optional[int]
+    pilot_rounds: Optional[int]
+    pilot_steps: Optional[int]
+    validation_steps: Optional[int]
+    segments: list[RunPlanSegment] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class RunSnapshot:
+    name: str
+    phase: str
+    global_percent: Optional[float]
+    epoch_percent: Optional[float]
+    total_budget_ns: Optional[float]
+    done_ns: Optional[float]
+    committed_ns: Optional[float]
+    live_ns: Optional[float]
+    global_eta_s: Optional[float]
+    eta_s: Optional[float]
+    elapsed_s: Optional[float]
+    ns_per_day: Optional[float]
+    steps_per_s: Optional[float]
+    epochs_completed: Optional[int]
+    total_epochs: Optional[int]
+    checkpoint_count: Optional[int]
+    mbar_grade: str
+    quality_grade: str
+    cv_range: str
+    latest_message: str
+    stale: bool
+    run_plan: Optional[RunPlan]
+    diagnostics: list[Diagnostic] = field(default_factory=list)
+
+    @property
+    def top_issue(self) -> Diagnostic:
+        if self.diagnostics:
+            return self.diagnostics[0]
+        return Diagnostic("info", "ok", "No monitor diagnostics")
+
+
+@dataclass(frozen=True)
+class FleetSnapshot:
+    runs: list[RunSnapshot]
+    total_budget_ns: float
+    done_ns: float
+    global_percent: Optional[float]
+    counts: dict[str, int]
+    diagnostics: list[Diagnostic]
+
+
+_SEVERITY_RANK = {"error": 0, "warn": 1, "info": 2}
+_DIAG_PRIORITY = {
+    "pool_overrun": 0,
+    "mbar_disconnected": 1,
+    "mbar_zero_coverage": 2,
+    "gamd_anharm_high": 3,
+    "gamd_sigma_high": 4,
+    "checkpoint_missing": 5,
+    "stale_progress": 6,
+    "missing_pool": 7,
+    "missing_progress": 8,
+    "mbar_weak_edges": 9,
+    "pool_blank_epoch0": 10,
+    "no_completed_epoch_diag": 11,
+    "driver_done": 12,
+}
+
+
+def _diag_sort_key(d: Diagnostic):
+    return (_SEVERITY_RANK.get(d.severity, 9), _DIAG_PRIORITY.get(d.code, 99), d.code)
+
+
+def _module_available(name: str) -> bool:
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def resolve_ui_mode(requested: str,
+                    textual_available: Optional[bool] = None,
+                    rich_available: Optional[bool] = None) -> str:
+    """Resolve requested UI mode without importing optional UI packages."""
+    if requested not in UI_MODES:
+        raise RuntimeError(f"Unknown --ui mode {requested!r}; choose auto, textual, rich, or ansi")
+    if textual_available is None:
+        textual_available = _module_available("textual")
+    if rich_available is None:
+        rich_available = _module_available("rich")
+
+    if requested == "ansi":
+        return "ansi"
+    if requested == "rich":
+        if rich_available:
+            return "rich"
+        raise RuntimeError("Rich is not installed. Use --ui ansi or install rich.")
+    if requested == "textual":
+        if textual_available:
+            return "textual"
+        raise RuntimeError("Textual is not installed. Use --ui rich, --ui ansi, or install textual.")
+    if textual_available:
+        return "textual"
+    if rich_available:
+        return "rich"
+    return "ansi"
+
+
+def _get_value(obj, name: str, default=None):
+    try:
+        value = getattr(obj, name)
+    except Exception:
+        return default
+    return default if value is None else value
+
+
+def _path_str(path) -> str:
+    try:
+        return str(path)
+    except Exception:
+        return ""
+
+
+def diagnostics_for_state(s, now: Optional[float] = None) -> list[Diagnostic]:
+    """Promote hidden monitor fields into explicit run diagnostics."""
+    now = time.time() if now is None else now
+    run_dir = _get_value(s, "run_dir")
+    progress_path = Path(run_dir) / "progress.jsonl" if run_dir else None
+    pool_path = Path(run_dir) / "adaptive_production" / "adaptive_runtime_pool.json" if run_dir else None
+    diag_path = Path(run_dir) / "adaptive_production" if run_dir else None
+
+    diags: list[Diagnostic] = []
+    prog = _get_value(s, "_prog", {}) or {}
+    phase = str(_get_value(s, "phase", "unknown"))
+    total = _get_value(s, "total_budget_ns")
+    committed = _get_value(s, "committed_ns", 0.0) or 0.0
+    live = _get_value(s, "agg_ns", 0.0) or 0.0
+    done = committed + live
+
+    if not prog:
+        if phase not in ("planned", "not_started", "genpept", "staged"):
+            diags.append(Diagnostic(
+                "warn", "missing_progress", "No progress.jsonl data loaded",
+                _path_str(progress_path), "Check whether run has started or path discovery is correct."))
+    else:
+        wall_time = prog.get("wall_time_s")
+        stale = bool(_get_value(s, "stale", False))
+        if isinstance(wall_time, (int, float)) and now - wall_time > 900:
+            stale = True
+        if stale:
+            diags.append(Diagnostic(
+                "warn", "stale_progress", "Progress data is stale",
+                _path_str(progress_path), "Check job status, filesystem sync, or last writer."))
+
+    pool = _get_value(s, "_pool", {}) or {}
+    if total is None:
+        if phase in ("gareus_production", "adaptive_feedback", "done", "converged"):
+            diags.append(Diagnostic(
+                "warn", "missing_pool", "No adaptive runtime pool budget loaded",
+                _path_str(pool_path), "G% cannot be trusted without total_ns and used_ns."))
+    else:
+        if done > float(total) * 1.01:
+            diags.append(Diagnostic(
+                "error", "pool_overrun",
+                f"Used/live ns exceeds budget ({done:.1f}/{float(total):.1f} ns)",
+                _path_str(pool_path), "Inspect resume accounting before extending this run."))
+        events = pool.get("events") if isinstance(pool, dict) else None
+        if isinstance(events, list) and not events and committed <= 0 and phase == "gareus_production":
+            diags.append(Diagnostic(
+                "info", "pool_blank_epoch0", "Runtime pool has no committed events yet",
+                _path_str(pool_path), "Expected early in epoch_000; use top-level total_ns/used_ns."))
+
+    if _get_value(s, "mbar_connected") is False:
+        diags.append(Diagnostic(
+            "error", "mbar_disconnected", "MBAR overlap graph disconnected",
+            _path_str(diag_path), "Inspect weak windows before pooling PMFs."))
+    n_weak = _get_value(s, "mbar_n_weak", 0) or 0
+    if n_weak:
+        diags.append(Diagnostic(
+            "warn", "mbar_weak_edges", f"{n_weak} neighbor overlap edge(s) below target",
+            _path_str(diag_path), "Top up weak edges or review window placement."))
+    readiness = _get_value(s, "readiness", {}) or {}
+    cov_zero = readiness.get("cov_zero") if isinstance(readiness, dict) else None
+    cov_min = _get_value(s, "mbar_cov_min")
+    if cov_min == 0 or (isinstance(cov_zero, (int, float)) and cov_zero > 0):
+        diags.append(Diagnostic(
+            "error", "mbar_zero_coverage", "At least one MBAR window has zero samples",
+            _path_str(diag_path), "Do not trust pooled MBAR until coverage is repaired."))
+    if _get_value(s, "mbar_grade", "?") == "?" and phase in ("adaptive_feedback", "done", "converged"):
+        diags.append(Diagnostic(
+            "info", "no_completed_epoch_diag", "No completed-epoch diagnostics available",
+            _path_str(diag_path), "Wait for first epoch diagnostics or check artifact paths."))
+
+    anh = _get_value(s, "gamd_anharmonicity")
+    if isinstance(anh, (int, float)) and anh > 0.5:
+        diags.append(Diagnostic(
+            "error", "gamd_anharm_high", f"GaMD anharmonicity high ({anh:.2f})",
+            _path_str(progress_path), "Treat reweighting quality as poor until boost distribution improves."))
+    elif isinstance(anh, (int, float)) and anh > 0.3:
+        diags.append(Diagnostic(
+            "warn", "gamd_anharm_high", f"GaMD anharmonicity elevated ({anh:.2f})",
+            _path_str(progress_path), "Monitor boost distribution before trusting reweighted estimates."))
+
+    sigma = _get_value(s, "gamd_boost_sd")
+    if isinstance(sigma, (int, float)) and sigma > 5.0:
+        diags.append(Diagnostic(
+            "error", "gamd_sigma_high", f"GaMD boost sigma high ({sigma:.1f} kcal/mol)",
+            _path_str(progress_path), "Expect noisy exponential reweighting."))
+    elif isinstance(sigma, (int, float)) and sigma > 3.0:
+        diags.append(Diagnostic(
+            "warn", "gamd_sigma_high", f"GaMD boost sigma elevated ({sigma:.1f} kcal/mol)",
+            _path_str(progress_path), "Watch anharmonicity and effective sample quality."))
+
+    ckpts = _get_value(s, "_ckpt_count")
+    if phase == "gareus_production" and prog and (ckpts is None or ckpts == 0):
+        diags.append(Diagnostic(
+            "warn", "checkpoint_missing", "Production progress exists but no checkpoint manifests found",
+            _path_str(diag_path), "Check checkpoint writer before relying on restart safety."))
+    if phase in ("done", "converged"):
+        diags.append(Diagnostic(
+            "info", "driver_done", "Adaptive driver reports completion",
+            _path_str(pool_path), "Ready for analysis checks if diagnostics are clean."))
+
+    return sorted(diags, key=_diag_sort_key)
+
+
+def build_run_snapshot(s, now: Optional[float] = None) -> RunSnapshot:
+    committed = _get_value(s, "committed_ns", 0.0) or 0.0
+    live = _get_value(s, "agg_ns", 0.0) or 0.0
+    total = _get_value(s, "total_budget_ns")
+    return RunSnapshot(
+        name=str(_get_value(s, "name", "?")),
+        phase=str(_get_value(s, "phase", "unknown")),
+        global_percent=_get_value(s, "global_percent"),
+        epoch_percent=_get_value(s, "percent"),
+        total_budget_ns=total,
+        done_ns=committed + live if (committed or live) else None,
+        committed_ns=committed,
+        live_ns=live,
+        global_eta_s=_get_value(s, "global_eta_s"),
+        eta_s=_get_value(s, "eta_s"),
+        elapsed_s=_get_value(s, "elapsed_s"),
+        ns_per_day=_get_value(s, "ns_per_day"),
+        steps_per_s=_get_value(s, "steps_per_s"),
+        epochs_completed=_get_value(s, "epochs_completed"),
+        total_epochs=_get_value(s, "total_epochs"),
+        checkpoint_count=_get_value(s, "_ckpt_count"),
+        mbar_grade=str(_get_value(s, "mbar_grade", "?")),
+        quality_grade=str(_get_value(s, "quality_grade", "?")),
+        cv_range=str(_get_value(s, "cv_range", "—")),
+        latest_message=str(_get_value(s, "latest_message", "")),
+        stale=bool(_get_value(s, "stale", False)),
+        run_plan=_get_value(s, "run_plan"),
+        diagnostics=diagnostics_for_state(s, now=now),
+    )
+
+
+def build_fleet_snapshot(states: list, now: Optional[float] = None) -> FleetSnapshot:
+    runs = [build_run_snapshot(s, now=now) for s in states]
+    total_budget = sum(r.total_budget_ns or 0.0 for r in runs)
+    done_ns = sum(r.done_ns or 0.0 for r in runs)
+    pct = done_ns / total_budget * 100.0 if total_budget else None
+    counts = {
+        "production": sum(1 for r in runs if r.phase == "gareus_production"),
+        "adapting": sum(1 for r in runs if r.phase == "adaptive_feedback"),
+        "done": sum(1 for r in runs if r.phase in ("done", "converged")),
+        "error": sum(1 for r in runs if r.phase == "error" or r.top_issue.severity == "error"),
+        "pending": sum(1 for r in runs if r.phase in ("planned", "not_started", "genpept", "staged", "unknown")),
+    }
+    diags = sorted(
+        (Diagnostic(d.severity, d.code, f"{r.name}: {d.message}", d.source, d.action)
+         for r in runs for d in r.diagnostics),
+        key=_diag_sort_key,
+    )
+    return FleetSnapshot(runs, total_budget, done_ns, pct, counts, diags)
 
 try:
     import termios
@@ -86,6 +393,8 @@ PHASE_COLOR = {
     "setup":             c(A.BOLD, A.BYELLOW),
     "equilibration":     c(A.BOLD, A.BYELLOW),
     "genpept":           c(A.BOLD, A.BBLUE),
+    "staged":            c(A.BOLD, A.BBLUE),
+    "planned":           c(A.DIM),
     "done":              c(A.BOLD, A.BWHITE),
     "converged":         c(A.BOLD, A.BMAGENTA),
     "error":             c(A.BOLD, A.BRED),
@@ -99,6 +408,8 @@ PHASE_LABEL = {
     "setup":             "SETUP",
     "equilibration":     "EQUIL",
     "genpept":           "GENPEPT",
+    "staged":            "STAGED",
+    "planned":           "PLANNED",
     "done":              "DONE ✓",
     "converged":         "CONVERGED",
     "error":             "ERROR ✗",
@@ -112,6 +423,8 @@ NAME_COLOR = {
     "setup":             c(A.BOLD, A.BYELLOW),
     "equilibration":     c(A.BOLD, A.BYELLOW),
     "genpept":           c(A.BOLD, A.BBLUE),
+    "staged":            c(A.BOLD, A.BLUE),
+    "planned":           c(A.DIM),
     "done":              c(A.BOLD, A.WHITE),
     "error":             c(A.BOLD, A.BRED),
     "not_started":       c(A.DIM),
@@ -159,6 +472,18 @@ def last_progress_entry(path: Path) -> dict:
     return entries[-1] if entries else {}
 
 
+def progress_tail_state(path: Path) -> tuple[dict, dict]:
+    entries = tail_jsonl(path, 60)
+    last_event = entries[-1] if entries else {}
+    for e in reversed(entries):
+        if e.get("event") == "progress":
+            return e, last_event
+    return {}, last_event
+
+
+_TERMINAL_PROGRESS_EVENTS = {"run_complete", "error", "exception", "fatal"}
+
+
 # ── Diagnostics parse layer (pure, stdlib, testable) ───────────────────────────
 #
 # These functions turn the small per-epoch JSON/CSV artifacts into normalized
@@ -176,6 +501,281 @@ def _safe_json(path: Path):
             return json.load(f)
     except Exception:
         return None
+
+
+def _strip_yaml_comment(line: str) -> str:
+    quote = None
+    esc = False
+    for i, ch in enumerate(line):
+        if esc:
+            esc = False
+            continue
+        if ch == "\\":
+            esc = True
+            continue
+        if quote:
+            if ch == quote:
+                quote = None
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            continue
+        if ch == "#":
+            return line[:i]
+    return line
+
+
+def _parse_yaml_scalar(value: str):
+    value = value.strip()
+    if not value:
+        return ""
+    if (value[0], value[-1:]) in (("'", "'"), ('"', '"')):
+        return value[1:-1]
+    low = value.lower()
+    if low in ("true", "false"):
+        return low == "true"
+    if low in ("null", "none", "~"):
+        return None
+    try:
+        if re.match(r"^[+-]?\d+$", value):
+            return int(value)
+        if re.match(r"^[+-]?(\d+\.\d*|\.\d+|\d+)([eE][+-]?\d+)?$", value):
+            return float(value)
+    except Exception:
+        pass
+    return value
+
+
+def _yaml_scalar_map(path: Path) -> dict:
+    """Small dependency-free YAML scalar reader for monitor-plan keys."""
+    out = {}
+    stack: list[str] = []
+    indents: list[int] = []
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except Exception:
+        return out
+    for raw in lines:
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        line = _strip_yaml_comment(raw).rstrip()
+        if not line.strip():
+            continue
+        m = re.match(r"^(\s*)([A-Za-z0-9_-]+):(?:\s*(.*))?$", line)
+        if not m:
+            continue
+        indent = len(m.group(1).replace("\t", "    "))
+        key = m.group(2).replace("-", "_")
+        value = (m.group(3) or "").strip()
+        while indents and indent <= indents[-1]:
+            indents.pop()
+            stack.pop()
+        if value == "":
+            stack.append(key)
+            indents.append(indent)
+            continue
+        out[".".join(stack + [key])] = _parse_yaml_scalar(value)
+    return out
+
+
+def _effective_config_args(run_dir: Path) -> tuple[dict, Optional[Path]]:
+    for p in (run_dir / "effective_config.json", run_dir / "config" / "effective_config.json"):
+        d = _safe_json(p)
+        if isinstance(d, dict):
+            args = d.get("args")
+            if isinstance(args, dict):
+                return args, p
+            return d, p
+    return {}, None
+
+
+def _plan_yaml_path(s) -> Optional[Path]:
+    base = _get_value(s, "base_dir")
+    name = str(_get_value(s, "name", ""))
+    if not base or not name:
+        base = None
+    if base and name:
+        p = Path(base) / f"{name}.yaml"
+        if p.exists():
+            return p
+    run_dir = _get_value(s, "run_dir")
+    if run_dir:
+        rd = Path(run_dir)
+        m = re.match(r"^(.+)_2d_run\d*$", rd.name)
+        if m:
+            p = rd.parent / f"{m.group(1)}.yaml"
+            if p.exists():
+                return p
+        p = rd.parent / f"{rd.name}.yaml"
+        if p.exists():
+            return p
+    return None
+
+
+def _num(v) -> Optional[float]:
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    try:
+        return float(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _intnum(v) -> Optional[int]:
+    n = _num(v)
+    return int(n) if n is not None else None
+
+
+def _first_cfg(args: dict, yml: dict, *keys):
+    for k in keys:
+        if k in args and args[k] is not None:
+            return args[k]
+        if k in yml and yml[k] is not None:
+            return yml[k]
+    return None
+
+
+def _consumed_by_plan_segment(pool: dict) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for p in (parse_pool_timeline(pool) or {}).get("phases") or []:
+        label = p.get("name")
+        ns = _num(p.get("ns")) or 0.0
+        if label:
+            out[str(label)] = out.get(str(label), 0.0) + ns
+    return out
+
+
+def build_run_plan(s) -> Optional[RunPlan]:
+    run_dir = _get_value(s, "run_dir")
+    pool = _get_value(s, "_pool", {}) or {}
+    args, cfg_path = _effective_config_args(Path(run_dir)) if run_dir else ({}, None)
+    yml_path = _plan_yaml_path(s)
+    yml = _yaml_scalar_map(yml_path) if yml_path else {}
+
+    sources = []
+    if pool:
+        sources.append("pool")
+    if cfg_path:
+        sources.append("effective_config")
+    if yml:
+        sources.append("yaml")
+    source = "+".join(sources) if sources else "none"
+
+    total_ns = _num(pool.get("total_ns"))
+    if total_ns is None:
+        total_ns = _num(_first_cfg(
+            args, yml,
+            "adaptive_production_total_md_pool_ns",
+            "md_budget_ns",
+            "adaptive_production.md_budget_ns",
+            "adaptive_production.adaptive_production_total_md_pool_ns",
+        ))
+    epochs = _intnum(_first_cfg(
+        args, yml,
+        "adaptive_production_epochs",
+        "ap_epochs",
+        "adaptive_production.ap_epochs",
+    ))
+    final_fraction = _num(_first_cfg(
+        args, yml,
+        "adaptive_production_final_pool_fraction",
+        "ap_final_pool_fraction",
+        "adaptive_production.ap_final_pool_fraction",
+    ))
+    min_final_ns = _num(_first_cfg(
+        args, yml,
+        "adaptive_production_min_final_pool_ns",
+        "ap_min_final_pool_ns",
+        "adaptive_production.ap_min_final_pool_ns",
+    ))
+    target_overlap = _num(_first_cfg(
+        args, yml,
+        "adaptive_production_target_overlap",
+        "ap_target_overlap",
+        "adaptive_production.ap_target_overlap",
+    ))
+    max_windows = _intnum(_first_cfg(
+        args, yml,
+        "adaptive_max_total_windows",
+        "contact_adaptive_max_total_windows",
+        "max_total_windows",
+        "windows.max_total_windows",
+    ))
+    pilot_rounds = _intnum(_first_cfg(
+        args, yml,
+        "adaptive_feedback_rounds",
+        "adaptive_rounds",
+        "windows.adaptive_rounds",
+    ))
+    pilot_steps = _intnum(_first_cfg(
+        args, yml,
+        "adaptive_feedback_pilot_steps",
+        "pilot_steps",
+        "windows.pilot_steps",
+    ))
+    validation_steps = _intnum(_first_cfg(
+        args, yml,
+        "adaptive_feedback_validation_steps",
+        "validation_steps",
+        "windows.validation_steps",
+    ))
+
+    if total_ns is None and not any((epochs, final_fraction, target_overlap, max_windows,
+                                     pilot_rounds, pilot_steps, validation_steps)):
+        return None
+
+    segments: list[RunPlanSegment] = []
+    adaptive_ns = None
+    final_ns = None
+    consumed = _consumed_by_plan_segment(pool)
+    if total_ns is not None and total_ns > 0:
+        if final_fraction is not None:
+            frac = max(0.0, min(1.0, final_fraction))
+            final_ns = total_ns * frac
+            if min_final_ns is not None:
+                final_ns = max(final_ns, min_final_ns)
+            final_ns = min(total_ns, final_ns)
+            adaptive_ns = max(0.0, total_ns - final_ns)
+        elif epochs:
+            adaptive_ns = total_ns
+            final_ns = 0.0
+
+        if epochs and adaptive_ns is not None and epochs > 0:
+            per_epoch = adaptive_ns / epochs
+            for i in range(epochs):
+                label = f"ep{i}"
+                segments.append(RunPlanSegment(
+                    label=label,
+                    kind="epoch",
+                    planned_ns=per_epoch,
+                    consumed_ns=consumed.get(label, 0.0),
+                ))
+        elif adaptive_ns is not None and adaptive_ns > 0:
+            segments.append(RunPlanSegment("ADAPT", "epoch", adaptive_ns, consumed.get("adapt", 0.0)))
+
+        if final_ns is not None and final_ns > 0:
+            segments.append(RunPlanSegment("FINAL", "final", final_ns, consumed.get("final", 0.0)))
+        elif not segments:
+            segments.append(RunPlanSegment("TOTAL", "total", total_ns, _num(pool.get("used_ns")) or 0.0))
+
+    return RunPlan(
+        name=str(_get_value(s, "name", "?")),
+        source=source,
+        total_ns=total_ns,
+        adaptive_ns=adaptive_ns,
+        final_ns=final_ns,
+        epochs=epochs,
+        final_fraction=final_fraction,
+        min_final_ns=min_final_ns,
+        target_overlap=target_overlap,
+        max_windows=max_windows,
+        pilot_rounds=pilot_rounds,
+        pilot_steps=pilot_steps,
+        validation_steps=validation_steps,
+        segments=segments,
+    )
 
 
 def _safe_rows(path: Path) -> list:
@@ -735,11 +1335,34 @@ def sparkline(values: list, width: int = 60) -> str:
 
 # ── Per-peptide state ─────────────────────────────────────────────────────────
 
+def _run_dir_sort_key(path: Path):
+    m = re.match(r"^(.+)_2d_run(\d*)$", path.name)
+    suffix = int(m.group(2)) if (m and m.group(2)) else 0
+    has_progress = (path / "progress.jsonl").exists()
+    has_pool = (path / "adaptive_production" / "adaptive_runtime_pool.json").exists()
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    return (has_progress, has_pool, suffix, mtime)
+
+
+def _find_container_rundir(base_dir: Path, name: str) -> Path:
+    """Return best PEPTIDE/PEPTIDE_2d_run* dir; supports cluster suffixes."""
+    candidates = [
+        d for d in base_dir.iterdir()
+        if d.is_dir() and re.match(rf"^{re.escape(name)}_2d_run\d*$", d.name)
+    ]
+    if not candidates:
+        return base_dir / f"{name}_2d_run"
+    return max(candidates, key=_run_dir_sort_key)
+
 class PeptideState:
     def _init_cache(self):
         self._prog: dict          = {}
         self._drvsumm: dict       = {}
         self._pool: dict          = {}
+        self._last_event: dict    = {}
         self._mtime_prog: float   = 0.0
         self._mtime_drv: float    = 0.0
         self._mtime_pool: float   = 0.0
@@ -762,7 +1385,7 @@ class PeptideState:
     def __init__(self, name: str, base_dir: Path):
         self.name        = name
         self.base_dir    = base_dir
-        self.run_dir     = base_dir / f"{name}_2d_run"
+        self.run_dir     = _find_container_rundir(base_dir, name)
         self.genpept_dir = base_dir / f"{name}_genpept"
         self._init_cache()
 
@@ -784,7 +1407,7 @@ class PeptideState:
         if mt == self._mtime_prog:
             return
         self._mtime_prog = mt
-        self._prog = last_progress_entry(p)
+        self._prog, self._last_event = progress_tail_state(p)
 
     def _load_driver_summary(self):
         p = self.run_dir / "adaptive_production" / "adaptive_production_driver_summary.json"
@@ -941,10 +1564,16 @@ class PeptideState:
     @property
     def phase(self) -> str:
         if not self.run_dir.exists():
-            return "genpept" if self._genpept_status == "running" else "not_started"
+            return "genpept" if self._genpept_status == "running" else "planned"
         if self._drvsumm.get("status") == "done":
             return "done"
-        return self._prog.get("phase") or "unknown"
+        if self._prog.get("phase") and not self._progress_is_terminal():
+            return self._prog["phase"]
+        if (self.run_dir / "adaptive_production").is_dir():
+            return "staged"
+        if self._genpept_status == "running":
+            return "genpept"
+        return "staged"
 
     @property
     def percent(self) -> Optional[float]:
@@ -964,11 +1593,18 @@ class PeptideState:
 
     @property
     def ns_per_day(self) -> Optional[float]:
+        if not self._progress_has_uncommitted_live_ns():
+            return None
         return self._prog.get("aggregate_ns_per_day") or self._prog.get("ns_per_day")
 
     @property
     def agg_ns(self) -> Optional[float]:
-        return self._prog.get("aggregate_sim_time_ns")
+        v = self._prog.get("aggregate_sim_time_ns")
+        if v is None:
+            return None
+        if not self._progress_has_uncommitted_live_ns():
+            return 0.0
+        return float(v)
 
     @property
     def steps_per_s(self) -> Optional[float]:
@@ -998,25 +1634,65 @@ class PeptideState:
     @property
     def epochs_completed(self) -> Optional[int]:
         v = self._drvsumm.get("epochs_completed")
-        return v if v is not None else self._epoch_count
+        if v is not None:
+            return int(v)
+        events = self._pool.get("events")
+        if isinstance(events, list):
+            completed = set()
+            for ev in events:
+                if not isinstance(ev, dict):
+                    continue
+                label = str(ev.get("label") or "")
+                m = re.match(r"epoch_(\d+)", label)
+                if m:
+                    completed.add(int(m.group(1)))
+            return len(completed)
+        return self._epoch_count
 
     @property
     def total_epochs(self) -> Optional[int]:
-        cfg = self.run_dir / "effective_config.json"
-        if not cfg.exists():
-            return None
-        try:
-            mt = cfg.stat().st_mtime
-            if self._total_ep_cache is not None and mt == self._total_ep_mtime:
+        for cfg in (self.run_dir / "effective_config.json", self.run_dir / "config" / "effective_config.json"):
+            if not cfg.exists():
+                continue
+            try:
+                mt = cfg.stat().st_mtime
+                if self._total_ep_cache is not None and mt == self._total_ep_mtime:
+                    return self._total_ep_cache
+                self._total_ep_mtime = mt
+                with open(cfg) as f:
+                    d = json.load(f)
+                args = d.get("args") if isinstance(d.get("args"), dict) else d
+                v = (args.get("ap_epochs") or args.get("adaptive_production_epochs")
+                     or args.get("adaptive_production", {}).get("ap_epochs")
+                     or args.get("adaptive_production", {}).get("adaptive_production_epochs"))
+                self._total_ep_cache = int(v) if v is not None else None
                 return self._total_ep_cache
-            self._total_ep_mtime = mt
-            with open(cfg) as f:
-                d = json.load(f)
-            v = d.get("ap_epochs") or d.get("adaptive_production", {}).get("ap_epochs")
-            self._total_ep_cache = int(v) if v is not None else None
-            return self._total_ep_cache
-        except Exception:
-            return None
+            except Exception:
+                continue
+        return None
+
+    def _progress_is_terminal(self) -> bool:
+        event = self._last_event.get("event")
+        if event not in _TERMINAL_PROGRESS_EVENTS:
+            return False
+        try:
+            last_wall = float(self._last_event.get("wall_time_s"))
+            prog_wall = float(self._prog.get("wall_time_s"))
+        except (TypeError, ValueError):
+            return True
+        return last_wall >= prog_wall
+
+    def _progress_has_uncommitted_live_ns(self) -> bool:
+        if not self._prog or self._progress_is_terminal():
+            return False
+        if self._prog.get("aggregate_sim_time_ns") is None:
+            return False
+        if not self._pool or self._mtime_pool <= 0:
+            return True
+        events = self._pool.get("events")
+        if isinstance(events, list) and not events and (self.committed_ns or 0.0) <= 0.0:
+            return True
+        return self._mtime_prog > self._mtime_pool
 
     @property
     def total_budget_ns(self) -> Optional[float]:
@@ -1158,6 +1834,10 @@ class PeptideState:
     def pool_timeline(self) -> dict:
         return parse_pool_timeline(self._pool)
 
+    @property
+    def run_plan(self) -> Optional[RunPlan]:
+        return build_run_plan(self)
+
     def ns_history(self, n: int = 500) -> list:
         p = self.run_dir / "progress.jsonl"
         if not p.exists():
@@ -1235,6 +1915,16 @@ def _is_flat_rundir(d: Path) -> bool:
     return (d / "adaptive_production").is_dir() or (d / "progress.jsonl").exists()
 
 
+def _has_container_rundir(d: Path, name: str) -> bool:
+    try:
+        return any(
+            c.is_dir() and re.match(rf"^{re.escape(name)}_2d_run\d*$", c.name)
+            for c in d.iterdir()
+        )
+    except OSError:
+        return False
+
+
 def discover(runs_dir: Path) -> list:
     out = []
     for d in sorted(runs_dir.iterdir()):
@@ -1246,8 +1936,8 @@ def discover(runs_dir: Path) -> list:
         if n.startswith("CONV") or n.startswith("alpha"):
             continue
 
-        # peptide container: PEPTIDE/PEPTIDE_2d_run  or  PEPTIDE/PEPTIDE.yaml
-        if (d / f"{n}.yaml").exists() or (d / f"{n}_2d_run").exists():
+        # peptide container: PEPTIDE/PEPTIDE_2d_run*, or PEPTIDE/PEPTIDE.yaml
+        if (d / f"{n}.yaml").exists() or _has_container_rundir(d, n):
             out.append(PeptideState(n, d))
             continue
 
@@ -1257,6 +1947,19 @@ def discover(runs_dir: Path) -> list:
     return out
 
 
+def preferred_selection(states: list) -> int:
+    """Pick the run most worth showing in detail by default."""
+    priority = ("error", "gareus_production", "adaptive_feedback", "setup", "equilibration")
+    for phase in priority:
+        for i, s in enumerate(states):
+            if _get_value(s, "phase", "unknown") == phase:
+                return i
+    for i, s in enumerate(states):
+        if _get_value(s, "_prog", {}):
+            return i
+    return 0
+
+
 # ── Rendering ─────────────────────────────────────────────────────────────────
 
 def term_width() -> int:
@@ -1264,6 +1967,13 @@ def term_width() -> int:
         return os.get_terminal_size().columns
     except OSError:
         return 120
+
+
+def term_height() -> int:
+    try:
+        return os.get_terminal_size().lines
+    except OSError:
+        return 42
 
 
 # column widths (display chars)
@@ -1506,7 +2216,7 @@ def summary_line(states: list) -> str:
     n_adapt = sum(1 for s in states if s.phase == "adaptive_feedback")
     n_done  = sum(1 for s in states if s.phase in ("done", "converged"))
     n_err   = sum(1 for s in states if s.phase == "error")
-    n_pend  = sum(1 for s in states if s.phase in ("not_started", "genpept", "unknown"))
+    n_pend  = sum(1 for s in states if s.phase in ("planned", "not_started", "genpept", "staged", "unknown"))
 
     total_budget = sum(s.total_budget_ns for s in states if s.total_budget_ns)
     committed    = sum((s.committed_ns or 0) + (s.agg_ns or 0) for s in states)
@@ -1527,42 +2237,496 @@ def summary_line(states: list) -> str:
     return "  ".join(parts)
 
 
-def render(states: list, selected: Optional[int] = None) -> str:
-    now = datetime.datetime.now().strftime("%Y-%m-%d  %H:%M:%S")
+def _ansi_severity(severity: str) -> str:
+    if severity == "error":
+        return c(A.BOLD, A.BRED)
+    if severity == "warn":
+        return c(A.BOLD, A.BYELLOW)
+    return c(A.DIM, A.BCYAN)
 
-    title = (
-        c(A.BOLD, A.BCYAN) + " GAREUS Monitor " + A.RESET
-        + c(A.DIM) + now + A.RESET
+
+def _ansi_grade(value: str) -> str:
+    if value == "BAD":
+        return c(A.BOLD, A.BRED) + value + A.RESET
+    if value == "WARN":
+        return c(A.BOLD, A.BYELLOW) + value + A.RESET
+    if value == "OK":
+        return c(A.BOLD, A.BGREEN) + value + A.RESET
+    return c(A.DIM) + value + A.RESET
+
+
+def _ansi_phase(phase: str) -> str:
+    label = PHASE_LABEL.get(phase, phase.upper()[:10])
+    return c(PHASE_COLOR.get(phase, A.DIM)) + label + A.RESET
+
+
+def _fmt_ns_plain(v: Optional[float]) -> str:
+    if not isinstance(v, (int, float)):
+        return "—"
+    if abs(float(v) - round(float(v))) < 0.05:
+        return f"{float(v):.0f} ns"
+    return f"{float(v):.1f} ns"
+
+
+def _fmt_ns_compact(v: Optional[float]) -> str:
+    if not isinstance(v, (int, float)):
+        return "—"
+    if abs(float(v) - round(float(v))) < 0.05:
+        return f"{float(v):.0f}"
+    return f"{float(v):.1f}"
+
+
+def _segment_ansi_color(seg: RunPlanSegment, index: int) -> str:
+    if seg.kind == "final":
+        return _FINAL_COLOR
+    if seg.kind == "total":
+        return A.BYELLOW
+    return _PHASE_PALETTE[index % len(_PHASE_PALETTE)]
+
+
+def render_plan_bar(plan: Optional[RunPlan], width: int = 46) -> tuple[str, str]:
+    if not plan or not plan.segments:
+        return (c(A.DIM) + "░" * width + A.RESET,
+                c(A.DIM) + "no run plan" + A.RESET)
+    total = sum(max(0.0, seg.planned_ns) for seg in plan.segments)
+    if total <= 0:
+        return (c(A.DIM) + "░" * width + A.RESET,
+                c(A.DIM) + "no planned ns budget" + A.RESET)
+
+    cells = []
+    legend = []
+    for i, seg in enumerate(plan.segments):
+        col = _segment_ansi_color(seg, i)
+        n = max(1, int(round(seg.planned_ns / total * width)))
+        done = max(0.0, min(seg.consumed_ns, seg.planned_ns))
+        filled = int(round(n * done / seg.planned_ns)) if seg.planned_ns > 0 else 0
+        for j in range(n):
+            if j < filled:
+                cells.append((col, "█"))
+            else:
+                cells.append((c(A.DIM, col), "░"))
+        label = seg.label.upper() if seg.kind == "final" else seg.label
+        legend.append(
+            c(A.BOLD, col) + label + A.RESET
+            + c(A.DIM) + f" {_fmt_ns_compact(seg.consumed_ns)}/{_fmt_ns_compact(seg.planned_ns)}ns" + A.RESET
+        )
+    cells = cells[:width]
+    while len(cells) < width:
+        cells.append((A.DIM, "░"))
+    return "".join(c(col) + glyph for col, glyph in cells) + A.RESET, "  ".join(legend)
+
+
+def _plan_detail_line(plan: Optional[RunPlan]) -> str:
+    if not plan:
+        return c(A.DIM) + "no plan config loaded" + A.RESET
+    bits = []
+    if plan.total_ns is not None:
+        bits.append(c(A.BOLD) + f"{_fmt_ns_plain(plan.total_ns)} planned" + A.RESET)
+    if plan.adaptive_ns is not None:
+        ep = f"/{plan.epochs} ep" if plan.epochs else ""
+        bits.append(c(A.BCYAN) + f"adaptive {_fmt_ns_plain(plan.adaptive_ns)}{ep}" + A.RESET)
+    if plan.final_ns is not None:
+        if isinstance(plan.final_fraction, (int, float)):
+            final = f"final {_fmt_ns_plain(plan.final_ns)} ({plan.final_fraction * 100:.0f}%)"
+        else:
+            final = f"final {_fmt_ns_plain(plan.final_ns)}"
+        bits.append(c(A.BMAGENTA) + final + A.RESET)
+    if plan.target_overlap is not None:
+        bits.append(c(A.DIM) + f"target overlap {plan.target_overlap:g}" + A.RESET)
+    if plan.max_windows:
+        bits.append(c(A.DIM) + f"max windows {plan.max_windows}" + A.RESET)
+    if plan.pilot_rounds or plan.pilot_steps or plan.validation_steps:
+        pilot = []
+        if plan.pilot_rounds:
+            pilot.append(f"{plan.pilot_rounds} pilot rounds")
+        if plan.pilot_steps:
+            pilot.append(f"{plan.pilot_steps} pilot steps")
+        if plan.validation_steps:
+            pilot.append(f"{plan.validation_steps} validation")
+        bits.append(c(A.DIM) + ", ".join(pilot) + A.RESET)
+    bits.append(c(A.DIM) + f"source {plan.source}" + A.RESET)
+    return "  ".join(bits)
+
+
+def _plan_consumed_total(plan: Optional[RunPlan]) -> float:
+    if not plan:
+        return 0.0
+    return sum(seg.consumed_ns for seg in plan.segments)
+
+
+def _fleet_plan_bar(adaptive: float, final: float, width: int = 32) -> str:
+    total = max(0.0, adaptive) + max(0.0, final)
+    if total <= 0:
+        return c(A.DIM) + "░" * width + A.RESET
+    adaptive_n = int(round(width * max(0.0, adaptive) / total))
+    adaptive_n = max(0, min(width, adaptive_n))
+    final_n = width - adaptive_n
+    return (
+        c(A.BCYAN) + "█" * adaptive_n
+        + c(A.BMAGENTA) + "█" * final_n
+        + A.RESET
     )
 
-    top = "┌" + hline("─", "┬", "┌", "┐")[1:-1] + "┐"
-    mid = hline("─", "┼", "├", "┤")
-    bot = "└" + hline("─", "┴", "└", "┘")[1:-1] + "┘"
+
+def _fleet_plan_line(states: list) -> Optional[str]:
+    plans = []
+    for state in states:
+        try:
+            plan = state.run_plan
+        except Exception:
+            plan = None
+        if plan and isinstance(plan.total_ns, (int, float)):
+            plans.append(plan)
+    if not plans:
+        return None
+    total = sum(plan.total_ns or 0.0 for plan in plans)
+    adaptive = sum(plan.adaptive_ns or 0.0 for plan in plans)
+    final = sum(plan.final_ns or 0.0 for plan in plans)
+    done = sum(_plan_consumed_total(plan) for plan in plans)
+    pct = done / total * 100.0 if total else None
+    bar_s = _fleet_plan_bar(adaptive, final, 32)
+    us = total / 1000.0
+    return (
+        c(A.DIM) + "Fleet plan " + A.RESET
+        + bar_s + "  "
+        + c(A.BOLD) + f"{_fmt_ns_plain(total)} planned" + A.RESET
+        + c(A.DIM) + f" ({us:.1f} us)  " + A.RESET
+        + c(A.BCYAN) + f"adaptive {_fmt_ns_plain(adaptive)}" + A.RESET + "  "
+        + c(A.BMAGENTA) + f"final {_fmt_ns_plain(final)}" + A.RESET
+        + (c(A.BOLD, A.BYELLOW) + f"  {pct:.1f}% consumed" + A.RESET if pct is not None else "")
+    )
+
+
+_YAML_CATEGORY_PRIORITY = {
+    "adaptive_production": 0,
+    "windows": 1,
+    "genpept": 2,
+    "cvs": 3,
+    "contact_cv": 4,
+    "cv2": 5,
+    "starting_structures": 6,
+    "genpept_prescan": 7,
+    "output": 8,
+    "explicit_2d_windows": 9,
+}
+
+
+def _yaml_category_color(name: str) -> str:
+    if name == "adaptive_production":
+        return A.BMAGENTA
+    if name == "windows":
+        return A.BCYAN
+    if name in ("genpept", "genpept_prescan"):
+        return A.BBLUE
+    if name in ("cvs", "contact_cv", "cv2"):
+        return A.BGREEN
+    if name in ("starting_structures", "explicit_2d_windows"):
+        return A.BYELLOW
+    return A.BWHITE
+
+
+def _yaml_categories(path: Path) -> list[dict]:
+    try:
+        raw_lines = path.read_text(errors="replace").splitlines()
+    except Exception:
+        return []
+    cats: list[dict] = []
+    current = None
+    preamble: list[tuple[int, str]] = []
+    for lineno, raw in enumerate(raw_lines, 1):
+        m = re.match(r"^([A-Za-z0-9_-]+):(?:\s*(.*))?$", raw)
+        if m:
+            current = {"name": m.group(1), "start": lineno, "lines": [(lineno, raw)]}
+            cats.append(current)
+        elif current is not None:
+            current["lines"].append((lineno, raw))
+        elif raw.strip():
+            preamble.append((lineno, raw))
+    if preamble:
+        cats.insert(0, {"name": "preamble", "start": preamble[0][0], "lines": preamble})
+    return cats
+
+
+def _yaml_category_sort_key(cat: dict):
+    name = str(cat.get("name", ""))
+    return (_YAML_CATEGORY_PRIORITY.get(name, 99), int(cat.get("start", 0) or 0))
+
+
+def _yaml_render_line(raw: str) -> str:
+    stripped = raw.strip()
+    if not stripped:
+        return c(A.DIM) + "·" + A.RESET
+    if stripped.startswith("#"):
+        return c(A.DIM) + stripped + A.RESET
+    m = re.match(r"^(\s*)([A-Za-z0-9_-]+):(.*)$", raw)
+    if m:
+        indent, key, rest = m.groups()
+        rest = rest.rstrip()
+        return (
+            c(A.DIM) + indent.replace(" ", "·") + A.RESET
+            + c(A.BYELLOW) + key + A.RESET
+            + c(A.DIM) + ":" + A.RESET
+            + (c(A.WHITE) + rest + A.RESET if rest else "")
+        )
+    return c(A.WHITE) + raw.strip() + A.RESET
+
+
+def _yaml_knob_lines(s, width: int) -> list[str]:
+    p = _plan_yaml_path(s)
+    data = _yaml_scalar_map(p) if p else {}
+    keys = [
+        ("seq", "genpept.seq"),
+        ("mode", "windows.window_mode"),
+        ("max windows", "windows.max_total_windows"),
+        ("CVs", "cvs.cv1", "cvs.cv2"),
+        ("pool", "adaptive_production.md_budget_ns"),
+        ("epochs", "adaptive_production.ap_epochs"),
+        ("final fraction", "adaptive_production.ap_final_pool_fraction"),
+        ("min final", "adaptive_production.ap_min_final_pool_ns"),
+        ("target overlap", "adaptive_production.ap_target_overlap"),
+    ]
+    bits = []
+    for item in keys:
+        label = item[0]
+        vals = [data.get(k) for k in item[1:]]
+        vals = [v for v in vals if v is not None]
+        if not vals:
+            continue
+        if label == "CVs" and len(vals) == 2:
+            value = f"{vals[0]} × {vals[1]}"
+        else:
+            value = str(vals[0])
+        bits.append(c(A.DIM) + f"{label} " + A.RESET + c(A.BOLD, A.BWHITE) + value + A.RESET)
+    if not bits:
+        return []
+    lines = []
+    line = ""
+    for bit in bits:
+        sep = "  "
+        if line and len(plain(line + sep + bit)) > width:
+            lines.append(line)
+            line = bit
+        else:
+            line = bit if not line else line + sep + bit
+    if line:
+        lines.append(line)
+    return lines
+
+
+def render_yaml(s: PeptideState, width: Optional[int] = None) -> str:
+    tw = min(width or term_width(), 120)
+    inner = tw - 2
+    max_body = max(14, term_height() - 8)
+    top = "┌" + "─" * inner + "┐"
+    sep = "├" + "─" * inner + "┤"
+    bot = "└" + "─" * inner + "┘"
+
+    def line(content: str) -> str:
+        return "│" + _fill(content, inner) + "│"
+
+    path = _plan_yaml_path(s)
+    lines = [top]
+    lines.append(line(
+        c(A.BOLD, A.BCYAN) + f" YAML viewer  {s.name} " + A.RESET
+        + c(A.DIM) + "top-level categories from peptide config" + A.RESET
+    ))
+    if not path:
+        lines += [
+            sep,
+            line(c(A.BYELLOW) + "  No YAML file found" + A.RESET),
+            line(c(A.DIM) + f"  looked near {s.base_dir} and {s.run_dir}" + A.RESET),
+            sep,
+            line(c(A.DIM) + "  y/ESC/q back   ↑↓/jk peptide   r refresh" + A.RESET),
+            bot,
+        ]
+        return "\n".join(lines)
+
+    cats = _yaml_categories(path)
+    lines.append(line(c(A.DIM) + f"  path {path}" + A.RESET))
+    knob_lines = _yaml_knob_lines(s, inner - 4)
+    for knob in knob_lines[:3]:
+        lines.append(line("  " + knob))
+
+    index_bits = []
+    for cat in cats:
+        name = str(cat.get("name", "?"))
+        count = len(cat.get("lines") or [])
+        col = _yaml_category_color(name)
+        index_bits.append(c(A.BOLD, col) + name + A.RESET + c(A.DIM) + f"({count})" + A.RESET)
+    lines.append(sep)
+    prefix = c(A.DIM) + "  category index  " + A.RESET
+    current = prefix
+    for bit in index_bits:
+        sep_s = "" if current == prefix else "  "
+        if len(plain(current + sep_s + bit)) > inner:
+            lines.append(line(current))
+            current = c(A.DIM) + "                  " + A.RESET + bit
+        else:
+            current += sep_s + bit
+    lines.append(line(current))
+    lines.append(sep)
+
+    used = 0
+    hidden = 0
+    for cat in sorted(cats, key=_yaml_category_sort_key):
+        if used >= max_body:
+            hidden += 1
+            continue
+        name = str(cat.get("name", "?"))
+        col = _yaml_category_color(name)
+        cat_lines = list(cat.get("lines") or [])
+        start = cat.get("start", "?")
+        lines.append(line(c(A.BOLD, col) + f"  ▸ {name}" + A.RESET + c(A.DIM) + f"  line {start}  {len(cat_lines)} lines" + A.RESET))
+        used += 1
+        per_cat = 9 if name in ("adaptive_production", "windows") else 6
+        for _, raw in cat_lines[:per_cat]:
+            if used >= max_body:
+                hidden += 1
+                break
+            lines.append(line("    " + _yaml_render_line(raw)))
+            used += 1
+        if len(cat_lines) > per_cat and used < max_body:
+            lines.append(line(c(A.DIM) + f"    ... {len(cat_lines) - per_cat} more line(s)" + A.RESET))
+            used += 1
+    if hidden:
+        lines.append(line(c(A.DIM) + f"  ... {hidden} category/line block(s) hidden by terminal height" + A.RESET))
+    lines += [
+        sep,
+        line(c(A.DIM) + "  y/ESC/q back   ↑↓/jk peptide   d detail   m diagnostics   c connect   r refresh" + A.RESET),
+        bot,
+    ]
+    return "\n".join(lines)
+
+
+def _snap_row(r: RunSnapshot, selected: bool = False) -> str:
+    marker = c(A.BOLD, A.BYELLOW) + "▶" + A.RESET if selected else " "
+    name_col = c(NAME_COLOR.get(r.phase, A.DIM)) + r.name[:12] + A.RESET
+    gpct = r.global_percent
+    epct = r.epoch_percent
+    progress = bar(gpct if gpct is not None else epct, 10) if (gpct is not None or epct is not None) else c(A.DIM) + "░" * 10 + A.RESET
+    budget = "—"
+    if r.total_budget_ns:
+        budget = f"{(r.done_ns or 0.0):.0f}/{r.total_budget_ns:.0f}"
+    elif r.live_ns:
+        budget = f"{r.live_ns:.1f}ns"
+    epoch = "—"
+    if r.epochs_completed is not None and r.total_epochs:
+        epoch = f"{r.epochs_completed}/{r.total_epochs}"
+    elif r.epochs_completed is not None:
+        epoch = str(r.epochs_completed)
+    eta = fmt_dur(r.global_eta_s if r.global_eta_s is not None else r.eta_s)
+    issue = r.top_issue
+    if issue.code == "ok":
+        issue_s = c(A.DIM) + "ok" + A.RESET
+    else:
+        issue_s = _ansi_severity(issue.severity) + f"{issue.severity[:1].upper()} {issue.code}" + A.RESET
+    cells = [
+        marker,
+        pad(name_col, 12),
+        pad(_ansi_phase(r.phase), 11),
+        pad(progress, 10),
+        pad(_fmt_pct(gpct), 7, ">"),
+        pad(_fmt_pct(epct), 6, ">"),
+        pad(budget, 11, ">"),
+        pad(epoch, 6, ">"),
+        pad(_ansi_grade(r.mbar_grade), 6, "^"),
+        pad(_ansi_grade(r.quality_grade), 6, "^"),
+        pad(eta, 8, ">"),
+        pad(issue_s, 24),
+    ]
+    return "  ".join(cells)
+
+
+def render(states: list, selected: Optional[int] = None) -> str:
+    now = datetime.datetime.now().strftime("%Y-%m-%d  %H:%M:%S")
+    selected = 0 if selected is None else max(0, min(len(states) - 1, selected))
+    fleet = build_fleet_snapshot(states)
+
+    title = c(A.BOLD, A.BCYAN) + " GAREUS Monitor " + A.RESET + c(A.DIM) + now + A.RESET
+    lines = ["", "  " + title]
+
+    if fleet.global_percent is not None:
+        fbar = bar(fleet.global_percent, 46)
+        budget = (c(A.BOLD) + f"{fleet.done_ns:.0f}" + A.RESET
+                  + c(A.DIM) + f"/{fleet.total_budget_ns:.0f} ns" + A.RESET
+                  + c(A.BOLD, A.BYELLOW) + f" {fleet.global_percent:.1f}%" + A.RESET)
+    else:
+        fbar = c(A.DIM) + "░" * 46 + A.RESET
+        budget = c(A.DIM) + "no runtime budget yet" + A.RESET
+    counts = (
+        c(A.BGREEN) + f"prod {fleet.counts.get('production', 0)}" + A.RESET + "  "
+        + c(A.BCYAN) + f"adapt {fleet.counts.get('adapting', 0)}" + A.RESET + "  "
+        + c(A.WHITE) + f"done {fleet.counts.get('done', 0)}" + A.RESET + "  "
+        + c(A.BRED) + f"error {fleet.counts.get('error', 0)}" + A.RESET + "  "
+        + c(A.DIM) + f"pending {fleet.counts.get('pending', 0)}" + A.RESET
+    )
+    lines += [
+        "",
+        "  " + c(A.DIM) + "Fleet budget " + A.RESET + fbar + "  " + budget,
+        "  " + counts,
+    ]
+    fleet_plan = _fleet_plan_line(states)
+    if fleet_plan:
+        lines.append("  " + fleet_plan)
+    lines.append("")
+
+    if states:
+        sel_state = states[selected]
+        try:
+            plan = sel_state.run_plan
+        except Exception:
+            plan = None
+        pbar, plegend = render_plan_bar(plan, width=46)
+        pname = _get_value(sel_state, "name", "?")
+        consumed = _plan_consumed_total(plan)
+        if plan and plan.total_ns:
+            consumed_s = c(A.BOLD, A.BYELLOW) + f"{_fmt_ns_compact(consumed)}/{_fmt_ns_compact(plan.total_ns)} ns consumed" + A.RESET
+        else:
+            consumed_s = c(A.DIM) + "no consumed budget" + A.RESET
+        lines += [
+            "  " + c(A.DIM) + "Run plan " + A.RESET + c(A.BOLD, A.BCYAN) + str(pname) + A.RESET + "  " + pbar + "  " + consumed_s,
+            "  " + _plan_detail_line(plan),
+            "  " + plegend,
+            "",
+        ]
+        try:
+            tl = sel_state.pool_timeline
+        except Exception:
+            tl = {}
+        if tl and tl.get("phases"):
+            tbar, tlegend = render_progress_bar(tl, width=46)
+            lines += [
+                "  " + c(A.DIM) + "Selected timeline " + A.RESET + tbar,
+                "  " + tlegend,
+                "",
+            ]
+
+    header = (
+        "  " + c(A.BOLD, A.BG_GREY, A.WHITE)
+        + "  Peptide       Phase        Graph          G%     E%   ns/budget  Epoch   MBAR  Qual   ETA  top issue"
+        + A.RESET
+    )
+    lines.append(header)
+    lines.append("  " + c(A.DIM) + "─" * 122 + A.RESET)
+    for i, snap in enumerate(fleet.runs):
+        lines.append(_snap_row(snap, selected=(selected == i)))
+
+    lines += ["", "  " + c(A.BOLD, A.BYELLOW) + "Diagnostics" + A.RESET]
+    if fleet.diagnostics:
+        for d in fleet.diagnostics[:10]:
+            sev = _ansi_severity(d.severity) + d.severity.upper() + A.RESET
+            msg = f"{d.code}: {d.message}"
+            if d.action:
+                msg += c(A.DIM) + f" | {d.action}" + A.RESET
+            lines.append("  " + pad(sev, 5) + "  " + _clip(msg, 110))
+    else:
+        lines.append("  " + c(A.DIM) + "No active diagnostics." + A.RESET)
 
     if selected is not None:
-        hint = c(A.DIM) + "  ↑↓/jk select   Enter detail   m MBAR diag   c connect (live)   r refresh   q quit" + A.RESET
+        hint = c(A.DIM) + "  ↑↓/jk select   Enter detail   y YAML   m MBAR diag   c connect   r refresh   q quit" + A.RESET
     else:
         hint = c(A.DIM) + "  q/Ctrl-C quit   r refresh now" + A.RESET
-
-    lines = [
-        "",
-        "  " + title,
-        "",
-        top,
-        header_row(),
-        mid,
-    ]
-    for i, s in enumerate(states):
-        lines.append(data_row(s, selected=(selected is not None and selected == i)))
-        if i < len(states) - 1:
-            lines.append(mid)
-    lines += [
-        bot,
-        "",
-        "  " + summary_line(states),
-        "",
-        hint,
-    ]
+    lines += ["", hint]
     return "\n".join(lines)
 
 
@@ -2193,6 +3357,589 @@ def render_connected(s: PeptideState) -> str:
     return "\n".join(lines)
 
 
+# ── Rich/Textual adapters (optional, lazy imports) ────────────────────────────
+
+def _fmt_pct(v: Optional[float]) -> str:
+    return f"{v:.1f}%" if isinstance(v, (int, float)) else "—"
+
+
+def _fmt_num(v: Optional[float], digits: int = 1) -> str:
+    return f"{v:.{digits}f}" if isinstance(v, (int, float)) else "—"
+
+
+def _diag_rich_style(d: Diagnostic) -> str:
+    if d.severity == "error":
+        return "bold red"
+    if d.severity == "warn":
+        return "yellow"
+    return "dim cyan"
+
+
+def _phase_rich_style(phase: str) -> str:
+    return {
+        "gareus_production": "bold green",
+        "adaptive_feedback": "bold cyan",
+        "setup": "yellow",
+        "equilibration": "yellow",
+        "genpept": "blue",
+        "staged": "blue",
+        "planned": "dim",
+        "done": "bold white",
+        "converged": "bold magenta",
+        "error": "bold red",
+        "not_started": "dim",
+        "unknown": "dim",
+    }.get(phase, "dim")
+
+
+def _rich_bar_text(pct: Optional[float], width: int = 18):
+    from rich.text import Text
+
+    if not isinstance(pct, (int, float)):
+        return Text("░" * width, style="dim")
+    pct = max(0.0, min(100.0, float(pct)))
+    filled = int(round(width * pct / 100.0))
+    style = "green" if pct >= 80 else "yellow" if pct >= 40 else "red"
+    t = Text()
+    t.append("█" * filled, style=style)
+    t.append("░" * (width - filled), style="dim")
+    return t
+
+
+def _rich_timeline_text(state, width: int = 54):
+    from rich.text import Text
+
+    try:
+        tl = state.pool_timeline
+        if tl and tl.get("phases"):
+            tbar, _ = render_progress_bar(tl, width=width)
+            return Text.from_ansi(tbar)
+    except Exception:
+        pass
+    return Text("░" * width, style="dim")
+
+
+def _rich_summary_panel(fleet: FleetSnapshot):
+    from rich.panel import Panel
+    from rich.text import Text
+
+    t = Text()
+    t.append("GAREUS fleet  ", style="bold cyan")
+    if fleet.global_percent is not None:
+        t.append(f"{fleet.done_ns:.0f}/{fleet.total_budget_ns:.0f} ns  ", style="white")
+        t.append(f"{fleet.global_percent:.1f}%  ", style="bold yellow")
+    t.append(f"prod {fleet.counts.get('production', 0)}  ", style="green")
+    t.append(f"adapt {fleet.counts.get('adapting', 0)}  ", style="cyan")
+    t.append(f"done {fleet.counts.get('done', 0)}  ", style="white")
+    t.append(f"errors {fleet.counts.get('error', 0)}  ", style="red")
+    t.append(f"pending {fleet.counts.get('pending', 0)}", style="dim")
+    return Panel(t, title="fleet", border_style="cyan")
+
+
+def _rich_ns(v: Optional[float]) -> str:
+    return _fmt_ns_plain(v)
+
+
+def _rich_plan_bar(plan: Optional[RunPlan], width: int = 48):
+    from rich.text import Text
+
+    style_map = {
+        "epoch": ("cyan", "bright_blue", "green", "yellow", "white"),
+        "final": ("magenta",),
+        "total": ("yellow",),
+    }
+    if not plan or not plan.segments:
+        return Text("░" * width, style="dim")
+    total = sum(max(0.0, seg.planned_ns) for seg in plan.segments)
+    if total <= 0:
+        return Text("░" * width, style="dim")
+    text = Text()
+    used = 0
+    for i, seg in enumerate(plan.segments):
+        palette = style_map.get(seg.kind, style_map["epoch"])
+        style = palette[i % len(palette)]
+        n = max(1, int(round(seg.planned_ns / total * width)))
+        done = max(0.0, min(seg.consumed_ns, seg.planned_ns))
+        filled = int(round(n * done / seg.planned_ns)) if seg.planned_ns > 0 else 0
+        text.append("█" * filled, style=f"bold {style}")
+        text.append("░" * (n - filled), style=f"dim {style}")
+        used += n
+    if used < width:
+        text.append("░" * (width - used), style="dim")
+    if len(text.plain) > width:
+        text = text[:width]
+    return text
+
+
+def _rich_plan_panel(states: list, selected: int):
+    from rich.console import Group
+    from rich.panel import Panel
+    from rich.text import Text
+
+    plans = []
+    for state in states:
+        try:
+            plan = state.run_plan
+        except Exception:
+            plan = None
+        if plan:
+            plans.append(plan)
+    sel_plan = None
+    if states:
+        try:
+            sel_plan = states[selected].run_plan
+        except Exception:
+            sel_plan = None
+
+    fleet_total = sum(plan.total_ns or 0.0 for plan in plans if plan.total_ns)
+    fleet_done = sum(_plan_consumed_total(plan) for plan in plans)
+    title = Text()
+    title.append("Fleet plan  ", style="bold cyan")
+    if fleet_total:
+        title.append(f"{_rich_ns(fleet_total)} planned  ", style="bold white")
+        title.append(f"{fleet_total / 1000.0:.1f} us  ", style="dim")
+        title.append(f"{fleet_done / fleet_total * 100.0:.1f}% consumed", style="bold yellow")
+    else:
+        title.append("no plan loaded", style="dim")
+
+    if not sel_plan:
+        return Panel(Group(title, Text("Selected run has no plan config.", style="dim")),
+                     title="run plan", border_style="blue")
+
+    detail = Text()
+    detail.append(f"{sel_plan.name}  ", style="bold cyan")
+    if sel_plan.total_ns is not None:
+        detail.append(f"{_rich_ns(sel_plan.total_ns)} planned  ", style="bold white")
+    if sel_plan.adaptive_ns is not None:
+        ep = f"/{sel_plan.epochs} ep" if sel_plan.epochs else ""
+        detail.append(f"adaptive {_rich_ns(sel_plan.adaptive_ns)}{ep}  ", style="cyan")
+    if sel_plan.final_ns is not None:
+        frac = f" ({sel_plan.final_fraction * 100:.0f}%)" if isinstance(sel_plan.final_fraction, (int, float)) else ""
+        detail.append(f"final {_rich_ns(sel_plan.final_ns)}{frac}  ", style="magenta")
+    if sel_plan.target_overlap is not None:
+        detail.append(f"target overlap {sel_plan.target_overlap:g}  ", style="dim")
+    if sel_plan.max_windows:
+        detail.append(f"max windows {sel_plan.max_windows}  ", style="dim")
+    detail.append(f"source {sel_plan.source}", style="dim")
+
+    legend = Text()
+    for i, seg in enumerate(sel_plan.segments):
+        style = "magenta" if seg.kind == "final" else ("cyan", "bright_blue", "green", "yellow", "white")[i % 5]
+        label = seg.label.upper() if seg.kind == "final" else seg.label
+        legend.append(label, style=f"bold {style}")
+        legend.append(f" {_fmt_ns_compact(seg.consumed_ns)}/{_fmt_ns_compact(seg.planned_ns)}ns  ", style="dim")
+
+    return Panel(Group(title, _rich_plan_bar(sel_plan), detail, legend),
+                 title="run plan", border_style="blue")
+
+
+def _rich_runs_table(fleet: FleetSnapshot, selected: int = 0):
+    from rich import box
+    from rich.table import Table
+
+    table = Table(box=box.SIMPLE_HEAVY, expand=True, pad_edge=False)
+    table.add_column("", width=1, no_wrap=True)
+    table.add_column("run", overflow="ellipsis", max_width=13, no_wrap=True)
+    table.add_column("phase", overflow="ellipsis", max_width=10, no_wrap=True)
+    table.add_column("G%", justify="right")
+    table.add_column("budget", justify="right")
+    table.add_column("ep", justify="right")
+    table.add_column("MBAR", justify="center")
+    table.add_column("qual", justify="center")
+    table.add_column("ETA", justify="right")
+    table.add_column("top issue", overflow="ellipsis", max_width=26, no_wrap=True)
+
+    for i, r in enumerate(fleet.runs):
+        marker = ">" if i == selected else ""
+        budget = "—"
+        if r.total_budget_ns:
+            budget = f"{(r.done_ns or 0.0):.0f}/{r.total_budget_ns:.0f}"
+        elif r.live_ns:
+            budget = f"{r.live_ns:.1f}ns"
+        epoch = "—"
+        if r.epochs_completed is not None and r.total_epochs:
+            epoch = f"{r.epochs_completed}/{r.total_epochs}"
+        elif r.epochs_completed is not None:
+            epoch = str(r.epochs_completed)
+        issue = r.top_issue
+        issue_label = "ok" if issue.code == "ok" else f"{issue.severity[:1].upper()} {issue.code}"
+        table.add_row(
+            marker,
+            r.name,
+            PHASE_LABEL.get(r.phase, r.phase),
+            _fmt_pct(r.global_percent),
+            budget,
+            epoch,
+            r.mbar_grade,
+            r.quality_grade,
+            fmt_dur(r.global_eta_s if r.global_eta_s is not None else r.eta_s),
+            issue_label,
+            style=("reverse" if i == selected else None),
+        )
+    return table
+
+
+def _rich_detail_panel(state, snap: RunSnapshot):
+    from rich.console import Group
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+
+    header = Text()
+    header.append(snap.name + "  ", style="bold cyan")
+    header.append(PHASE_LABEL.get(snap.phase, snap.phase), style=_phase_rich_style(snap.phase))
+    header.append("  G " + _fmt_pct(snap.global_percent), style="bold yellow")
+    header.append("  E " + _fmt_pct(snap.epoch_percent), style="dim")
+    if snap.global_eta_s is not None:
+        header.append("  ETA " + fmt_dur(snap.global_eta_s), style="white")
+    if snap.stale:
+        header.append("  stale", style="yellow")
+
+    metrics = Table.grid(expand=True)
+    metrics.add_column(ratio=1)
+    metrics.add_column(ratio=1)
+    metrics.add_row("budget", f"{_fmt_num(snap.done_ns, 1)} / {_fmt_num(snap.total_budget_ns, 0)} ns")
+    metrics.add_row("throughput", f"{_fmt_num(snap.ns_per_day, 0)} ns/day  {_fmt_num(snap.steps_per_s, 0)} steps/s")
+    metrics.add_row("CV range", snap.cv_range)
+    metrics.add_row("quality", f"{snap.quality_grade}  MBAR {snap.mbar_grade}")
+
+    diag = Table(box=None, expand=True, pad_edge=False)
+    diag.add_column("severity", no_wrap=True)
+    diag.add_column("code", no_wrap=True)
+    diag.add_column("message")
+    for d in snap.diagnostics[:6]:
+        diag.add_row(d.severity, d.code, d.message, style=_diag_rich_style(d))
+    if not snap.diagnostics:
+        diag.add_row("info", "ok", "No monitor diagnostics", style="dim")
+
+    msg = Text(snap.latest_message[:180] if snap.latest_message else "no latest message", style="dim")
+    body = Group(
+        header,
+        _rich_bar_text(snap.global_percent, width=42),
+        _rich_timeline_text(state, width=54),
+        metrics,
+        diag,
+        msg,
+    )
+    return Panel(body, title="selected run", border_style=_diag_rich_style(snap.top_issue))
+
+
+def _rich_diagnostics_table(fleet: FleetSnapshot):
+    from rich import box
+    from rich.table import Table
+
+    table = Table(box=box.SIMPLE, expand=True, pad_edge=False)
+    table.add_column("severity", no_wrap=True)
+    table.add_column("code", no_wrap=True)
+    table.add_column("message")
+    table.add_column("source", overflow="fold")
+    for d in fleet.diagnostics[:12]:
+        table.add_row(d.severity, d.code, d.message, d.source, style=_diag_rich_style(d))
+    if not fleet.diagnostics:
+        table.add_row("info", "ok", "No monitor diagnostics", "", style="dim")
+    return table
+
+
+def _rich_ansi_view(ansi_text: str, title: str, border_style: str = "cyan"):
+    from rich.panel import Panel
+    from rich.text import Text
+
+    return Panel(Text.from_ansi(ansi_text), title=title, border_style=border_style)
+
+
+def _rich_controls(mode: str):
+    from rich.panel import Panel
+
+    text = "↑/↓ or j/k select  d detail  y YAML  m diagnostics  c connect  r refresh  q quit"
+    if mode in ("detail", "diag", "connect", "yaml"):
+        text = "↑/↓ or j/k select  d detail  y YAML  m diagnostics  c connect  r refresh  ESC/q back"
+    return Panel(text, border_style="dim")
+
+
+def _rich_yaml_panel(state):
+    from rich.panel import Panel
+    from rich.text import Text
+
+    path = _plan_yaml_path(state)
+    body = Text()
+    body.append(f"YAML viewer  {state.name}\n", style="bold cyan")
+    if not path:
+        body.append("No YAML file found\n", style="yellow")
+        body.append(f"looked near {state.base_dir} and {state.run_dir}", style="dim")
+        return Panel(body, title="YAML config", border_style="blue")
+
+    cats = _yaml_categories(path)
+    body.append(f"path {path}\n", style="dim")
+    for knob in _yaml_knob_lines(state, 96)[:3]:
+        body.append(plain(knob) + "\n")
+
+    body.append("\ncategory index  ", style="dim")
+    for cat in cats:
+        name = str(cat.get("name", "?"))
+        idx_style = "bold magenta" if name == "adaptive_production" else "bold cyan" if name == "windows" else "bold white"
+        body.append(name, style=idx_style)
+        body.append(f"({len(cat.get('lines') or [])})  ", style="dim")
+
+    used = 0
+    max_body = max(14, term_height() - 10)
+    for cat in sorted(cats, key=_yaml_category_sort_key):
+        if used >= max_body:
+            body.append("\n... more categories hidden by terminal height\n", style="dim")
+            break
+        name = str(cat.get("name", "?"))
+        style = "bold magenta" if name == "adaptive_production" else "bold cyan" if name == "windows" else "bold green"
+        cat_lines = list(cat.get("lines") or [])
+        body.append(f"\n\n▸ {name}", style=style)
+        body.append(f"  line {cat.get('start', '?')}  {len(cat_lines)} lines\n", style="dim")
+        used += 1
+        per_cat = 9 if name in ("adaptive_production", "windows") else 6
+        for _, raw in cat_lines[:per_cat]:
+            if used >= max_body:
+                break
+            body.append("  " + plain(_yaml_render_line(raw)) + "\n")
+            used += 1
+        if len(cat_lines) > per_cat and used < max_body:
+            body.append(f"  ... {len(cat_lines) - per_cat} more line(s)\n", style="dim")
+            used += 1
+    return Panel(body, title="YAML config", border_style="blue")
+
+
+def rich_dashboard(states: list, selected: int = 0, mode: str = "fleet"):
+    from rich.console import Group
+    from rich.panel import Panel
+
+    fleet = build_fleet_snapshot(states)
+    if not fleet.runs:
+        return Panel("No peptide runs found.", border_style="red")
+    selected = max(0, min(len(states) - 1, selected))
+    if mode == "textual":
+        mode = "fleet"
+    if mode not in ("fleet", "detail", "diag", "connect", "yaml"):
+        mode = "fleet"
+
+    if mode == "detail":
+        return Group(
+            _rich_summary_panel(fleet),
+            _rich_plan_panel(states, selected),
+            _rich_detail_panel(states[selected], fleet.runs[selected]),
+            _rich_controls(mode),
+        )
+    if mode == "diag":
+        return Group(
+            _rich_summary_panel(fleet),
+            _rich_ansi_view(render_diag(states[selected]), "MBAR / adaptive diagnostics", "yellow"),
+            _rich_controls(mode),
+        )
+    if mode == "connect":
+        return Group(
+            _rich_summary_panel(fleet),
+            _rich_ansi_view(render_connected(states[selected]), "live connect", "green"),
+            _rich_controls(mode),
+        )
+    if mode == "yaml":
+        return Group(
+            _rich_summary_panel(fleet),
+            _rich_yaml_panel(states[selected]),
+            _rich_controls(mode),
+        )
+
+    detail = _rich_detail_panel(states[selected], fleet.runs[selected])
+    return Group(
+        _rich_summary_panel(fleet),
+        _rich_plan_panel(states, selected),
+        _rich_runs_table(fleet, selected=selected),
+        detail,
+        Panel(_rich_diagnostics_table(fleet), title="diagnostics", border_style="yellow"),
+        _rich_controls(mode),
+    )
+
+
+def print_rich_once(states: list, selected: int = 0):
+    from rich.console import Console
+
+    Console().print(rich_dashboard(states, selected=selected))
+
+
+def ui_transition(mode: str, selected: int, n_items: int, key: str):
+    """Shared key state for Rich/Textual dashboards.
+
+    Returns (mode, selected, action). action is None, "refresh",
+    "connect_reset", or "quit".
+    """
+    if n_items <= 0:
+        return mode, selected, "noop"
+    mode = mode if mode in ("fleet", "detail", "diag", "connect", "yaml") else "fleet"
+    selected = selected % n_items
+    if key in ("UP", "k"):
+        return mode, (selected - 1) % n_items, None
+    if key in ("DOWN", "j"):
+        return mode, (selected + 1) % n_items, None
+    if key in ("r", "R"):
+        return mode, selected, "refresh"
+    if key in ("ESC", "q", "h") and mode != "fleet":
+        return "fleet", selected, None
+    if key == "q":
+        return mode, selected, "quit"
+    if key in ("ENTER", "d", " "):
+        return "detail", selected, None
+    if key == "y":
+        return ("fleet" if mode == "yaml" else "yaml"), selected, None
+    if key == "m":
+        return ("fleet" if mode == "diag" else "diag"), selected, None
+    if key == "c":
+        if mode == "connect":
+            return "fleet", selected, None
+        return "connect", selected, "connect_reset"
+    return mode, selected, "noop"
+
+
+def rich_loop(states: list, interval: float, start_sel: int = 0):
+    from rich.console import Console
+    from rich.live import Live
+
+    console = Console()
+    sel = max(0, min(len(states) - 1, start_sel))
+    mode = "fleet"
+
+    if not _HAS_TTY or not sys.stdin.isatty():
+        try:
+            with Live(rich_dashboard(states, selected=sel, mode=mode), console=console,
+                      refresh_per_second=4, screen=True) as live:
+                while True:
+                    for s in states:
+                        s.refresh()
+                    live.update(rich_dashboard(states, selected=sel, mode=mode))
+                    time.sleep(interval)
+        except KeyboardInterrupt:
+            return
+        return
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    new = termios.tcgetattr(fd)
+    new[3] = new[3] & ~(termios.ICANON | termios.ECHO)
+    new[6][termios.VMIN] = 1
+    new[6][termios.VTIME] = 0
+    last_refresh = 0.0
+    last_connect = 0.0
+    force_refresh = True
+    try:
+        termios.tcsetattr(fd, termios.TCSAFLUSH, new)
+        with Live(rich_dashboard(states, selected=sel, mode=mode), console=console,
+                  refresh_per_second=8, screen=True) as live:
+            while True:
+                now = time.time()
+                if force_refresh or (now - last_refresh) >= interval:
+                    for s in states:
+                        s.refresh()
+                    last_refresh = time.time()
+                    force_refresh = False
+                    live.update(rich_dashboard(states, selected=sel, mode=mode))
+                if mode == "connect" and (now - last_connect) >= CONNECT_INTERVAL:
+                    states[sel].refresh()
+                    last_connect = now
+                    live.update(rich_dashboard(states, selected=sel, mode=mode))
+                key = _read_key_raw(fd, timeout=0.15 if mode != "connect" else 0.25)
+                if key is None:
+                    continue
+                mode, sel, action = ui_transition(mode, sel, len(states), key)
+                if action == "quit":
+                    break
+                if action == "refresh":
+                    force_refresh = True
+                elif action == "connect_reset":
+                    last_connect = 0.0
+                live.update(rich_dashboard(states, selected=sel, mode=mode))
+    except KeyboardInterrupt:
+        return
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def run_textual_app(states: list, interval: float, start_sel: int = 0):
+    """Run optional Textual UI. Import stays inside function for fallback safety."""
+    from textual.app import App, ComposeResult
+    from textual.widgets import Footer, Header, Static
+
+    class TextualMonitorApp(App):
+        CSS = """
+        Screen { background: #071014; color: #d8e6e8; }
+        #dashboard { height: 1fr; padding: 0 1; }
+        """
+        BINDINGS = [
+            ("q", "back_or_quit", "back/quit"),
+            ("escape", "back_or_quit", "back"),
+            ("r", "refresh", "refresh"),
+            ("up", "cursor_up", "up"),
+            ("k", "cursor_up", "up"),
+            ("down", "cursor_down", "down"),
+            ("j", "cursor_down", "down"),
+            ("d", "detail", "detail"),
+            ("enter", "detail", "detail"),
+            ("y", "yaml", "yaml"),
+            ("m", "diag", "diag"),
+            ("c", "connect", "connect"),
+        ]
+
+        def __init__(self, run_states: list, refresh_interval: float, selected: int = 0):
+            super().__init__()
+            self.run_states = run_states
+            self.refresh_interval = refresh_interval
+            self.selected = max(0, min(len(run_states) - 1, selected)) if run_states else 0
+            self.mode = "fleet"
+
+        def compose(self) -> ComposeResult:
+            yield Header()
+            yield Static(id="dashboard")
+            yield Footer()
+
+        def on_mount(self) -> None:
+            self.refresh_data()
+            self.set_interval(self.refresh_interval, self.refresh_data)
+
+        def refresh_data(self) -> None:
+            for st in self.run_states:
+                st.refresh()
+            self.query_one("#dashboard", Static).update(
+                rich_dashboard(self.run_states, selected=self.selected, mode=self.mode)
+            )
+
+        def _apply_key(self, key: str) -> None:
+            self.mode, self.selected, action = ui_transition(
+                self.mode, self.selected, len(self.run_states), key
+            )
+            if action == "quit":
+                self.exit()
+                return
+            self.refresh_data()
+
+        def action_back_or_quit(self) -> None:
+            self._apply_key("q")
+
+        def action_refresh(self) -> None:
+            self._apply_key("r")
+
+        def action_cursor_up(self) -> None:
+            self._apply_key("UP")
+
+        def action_cursor_down(self) -> None:
+            self._apply_key("DOWN")
+
+        def action_detail(self) -> None:
+            self._apply_key("d")
+
+        def action_yaml(self) -> None:
+            self._apply_key("y")
+
+        def action_diag(self) -> None:
+            self._apply_key("m")
+
+        def action_connect(self) -> None:
+            self._apply_key("c")
+
+    TextualMonitorApp(states, interval, start_sel).run()
+
+
 # ── Keyboard reader ───────────────────────────────────────────────────────────
 
 def _read_key_raw(fd: int, timeout: float) -> Optional[str]:
@@ -2257,6 +4004,8 @@ def next_view(view: str, key: str):
             return view, "quit"
         if key in ("ENTER", "d", " "):
             return "detail", None
+        if key == "y":
+            return "yaml", None
         if key == "m":
             return "diag", None
         if key == "c":
@@ -2269,6 +4018,8 @@ def next_view(view: str, key: str):
         return "list", None
     if key == "c":
         return ("list", None) if view == "connected" else ("connected", "connect_reset")
+    if key == "y":
+        return ("list", None) if view == "yaml" else ("yaml", None)
     if key == "m":
         return ("detail" if view == "diag" else "diag"), None
     if key in ("ENTER", "d") and view in ("diag", "connected"):
@@ -2335,6 +4086,8 @@ def interactive_loop(states: list, interval: float,
             if need_redraw:
                 if view == "detail":
                     out = render_detail(states[sel])
+                elif view == "yaml":
+                    out = render_yaml(states[sel])
                 elif view == "diag":
                     out = render_diag(states[sel])
                 elif view == "connected":
@@ -2382,7 +4135,7 @@ def interactive_loop(states: list, interval: float,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="GAREUS multi-peptide live monitor (stdlib only)",
+        description="GAREUS multi-peptide live monitor (Textual/Rich optional, ANSI fallback)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("runs_dirs", nargs="*", default=["."],
@@ -2395,6 +4148,8 @@ def main():
                         help="Additional flat run dirs to include explicitly")
     parser.add_argument("--connect", "-c", metavar="PEPTIDE",
                         help="Start attached to one run's live view (substring match on name)")
+    parser.add_argument("--ui", choices=UI_MODES, default="auto",
+                        help="UI backend: auto chooses textual, rich, then ansi")
     args = parser.parse_args()
 
     states: list = []
@@ -2431,11 +4186,7 @@ def main():
     for s in states:
         s.refresh()
 
-    if args.once:
-        print(render(states))
-        return
-
-    start_view, start_sel = "list", 0
+    start_view, start_sel = "list", preferred_selection(states)
     if args.connect:
         q = args.connect.lower()
         match = next((i for i, s in enumerate(states) if q in s.name.lower()), None)
@@ -2445,7 +4196,45 @@ def main():
         else:
             start_view, start_sel = "connected", match
 
-    interactive_loop(states, args.interval, start_view=start_view, start_sel=start_sel)
+    if args.once:
+        try:
+            ui_mode = resolve_ui_mode(args.ui)
+        except RuntimeError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(2)
+        if ui_mode in ("textual", "rich"):
+            try:
+                print_rich_once(states, selected=start_sel)
+            except Exception as exc:
+                if args.ui in ("textual", "rich"):
+                    print(f"ERROR: failed to render {ui_mode} UI: {exc}", file=sys.stderr)
+                    sys.exit(2)
+                print(render(states))
+        else:
+            print(render(states, selected=start_sel))
+        return
+
+    try:
+        ui_mode = resolve_ui_mode(args.ui)
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+    if ui_mode == "textual":
+        try:
+            run_textual_app(states, args.interval, start_sel=start_sel)
+        except Exception as exc:
+            if args.ui == "textual":
+                print(f"ERROR: failed to start Textual UI: {exc}", file=sys.stderr)
+                sys.exit(2)
+            if _module_available("rich"):
+                rich_loop(states, args.interval, start_sel=start_sel)
+            else:
+                interactive_loop(states, args.interval, start_view=start_view, start_sel=start_sel)
+    elif ui_mode == "rich":
+        rich_loop(states, args.interval, start_sel=start_sel)
+    else:
+        interactive_loop(states, args.interval, start_view=start_view, start_sel=start_sel)
 
 
 if __name__ == "__main__":
