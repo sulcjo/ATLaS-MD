@@ -165,5 +165,18 @@ exchange:
   exchange_mode: gibbs-walk
   exchange_interval: 200
 
+# Inter-epoch tICA CV update (all off by default; set tica_obs_interval > 0 to enable).
+# tICA fits the slowest backbone-dihedral mode from accumulated epoch observations
+# and updates secondary_center for each window (CV2-type agnostic).
+# MBAR note: each refit bumps tica_cv_version; prior-version epochs are excluded
+# from cross-epoch MBAR pooling, so choose tica_epochs_per_cycle >= 3 in practice.
+#tica:
+#  tica_obs_interval: 50           # record dihedral features every N samples (0 = off)
+#  tica_lag_frames: 50             # lag tau for generalised eigenvalue problem
+#  tica_min_eigenvalue: 0.0        # skip update if fitted eigenvalue below threshold
+#  tica_epochs_per_cycle: 0        # refit every N epochs (0 = off); OR with tica_update_after_epochs
+#  tica_update_after_epochs:       # explicit epoch list, e.g. [2, 5, 8] (null = off)
+#  tica_state_file: ""             # set automatically; leave empty for first epoch
+
 tui:
   tui_mode: interactive
