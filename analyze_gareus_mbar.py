@@ -1434,6 +1434,15 @@ def run_epoch_pmf_convergence(d: Data, args, bins: np.ndarray, selected: str,
                             sambar_delta_f_max=conv_sambar_delta,
                             sambar_polish_backend=conv_sambar_polish)
             prev_f_k = mb.get('f_k')
+            # ESS diagnostics: MBAR umbrella-debiasing ESS, plus the GaMD
+            # exponential-reweighting ESS (umbrella + boost).  The latter exposes
+            # the boost-reweighting collapse — it stays tiny no matter how many
+            # epochs accumulate, while MBAR ESS grows with samples.
+            _logw = np.asarray(mb['logw'], dtype=np.float64)
+            mbar_ess = float(ess(norm_logw(_logw)))
+            gamd_reweight_ess = float('nan')
+            if np.any(np.isfinite(sub_boost)) and float(np.nanstd(sub_boost)) > 1e-12:
+                gamd_reweight_ess = float(ess(norm_logw(_logw + d.beta * sub_boost)))
             pmf, _diag, used_method = _observable_pmf_from_logw(
                 sub_cv, mb['logw'], sub_boost, bins, selected,
                 d.beta, kbt_kcal,
@@ -1463,6 +1472,11 @@ def run_epoch_pmf_convergence(d: Data, args, bins: np.ndarray, selected: str,
                 'mbar_iterations': int(mb.get('iterations', 0)),
                 'mbar_max_delta': float(mb.get('max_delta', np.nan)),
                 'mbar_backend': str(mb.get('backend', 'unknown')),
+                'mbar_ess': mbar_ess,
+                'mbar_ess_frac': float(mbar_ess / max(1, n)),
+                'gamd_reweight_ess': gamd_reweight_ess,
+                'gamd_reweight_ess_frac': (float(gamd_reweight_ess / max(1, n))
+                                           if math.isfinite(gamd_reweight_ess) else float('nan')),
             }
             conv_rows.append(row)
             pmf_rows.append({'checkpoint_index': n_ep, 'checkpoint_step': n_ep,
@@ -1489,7 +1503,17 @@ def run_epoch_pmf_convergence(d: Data, args, bins: np.ndarray, selected: str,
                          'P': float(p['probability'][i]),
                          'count': int(p['counts'][i])})
     _write_csv_rows(out / 'epoch_pmf_by_epoch.csv', flat)
+    # Per-source pooling table: confirms every epoch + final source fed the PMF.
+    pooling = _epoch_source_pooling_table(d)
+    if pooling:
+        _write_csv_rows(out / 'epoch_source_pooling.csv', pooling)
+    # Flag planned epoch_NNN dirs that produced no loaded samples so they don't
+    # read as silently dropped.
+    skipped_epochs = _skipped_empty_epochs(d)
     if progress is not None:
+        progress.step('epoch pooling',
+                      f'{len(pooling)} sources pooled (incl. final)'
+                      + (f'; empty epochs skipped: {", ".join(skipped_epochs)}' if skipped_epochs else ''))
         progress.bar('epoch_convergence', 1, 1, 'writing epoch convergence outputs', force=True)
     finite_rows = [r for r in conv_rows if 'JS' in r and math.isfinite(float(r.get('JS', math.nan)))]
     summary = {}
@@ -1498,27 +1522,43 @@ def run_epoch_pmf_convergence(d: Data, args, bins: np.ndarray, selected: str,
         arr_rmse = np.asarray([r['RMSE_F_kcal_mol'] for r in finite_rows], float)
         js_thr = float(getattr(args, 'convergence_js_threshold', 0.01))
         rmse_thr = float(getattr(args, 'convergence_rmse_threshold', 0.1))
+        _last = finite_rows[-1]
         summary = {
             'final_JS': float(arr_js[-1]) if arr_js.size else float('nan'),
             'final_RMSE_F_kcal_mol': float(arr_rmse[-1]) if arr_rmse.size else float('nan'),
             'converged_JS': bool(arr_js[-1] < js_thr) if arr_js.size else False,
             'converged_RMSE': bool(arr_rmse[-1] < rmse_thr) if arr_rmse.size else False,
+            'final_mbar_ess': float(_last.get('mbar_ess', float('nan'))),
+            'final_mbar_ess_frac': float(_last.get('mbar_ess_frac', float('nan'))),
+            'final_gamd_reweight_ess': float(_last.get('gamd_reweight_ess', float('nan'))),
+            'final_gamd_reweight_ess_frac': float(_last.get('gamd_reweight_ess_frac', float('nan'))),
         }
         summary['converged'] = summary['converged_JS'] and summary['converged_RMSE']
+    _ea_ec = _epoch_source_annotations(d)
+    _agg_ec = None
     try:
         _fracs_ec = np.asarray([r['frac_total'] for r in conv_rows], dtype=float)
         _ts_ec = float(d.meta.get('timestep_fs', 4.0) or 4.0)
+        _agg_ec = _aggregate_ns_for_fracs(d, _fracs_ec, _ts_ec)
         write_convergence_plots(conv_rows, pmf_rows, [summary] if summary else [],
-                                out, args, warnings=[], epoch_annotations=_epoch_source_annotations(d),
-                                aggregate_ns=_aggregate_ns_for_fracs(d, _fracs_ec, _ts_ec))
+                                out, args, warnings=[], epoch_annotations=_ea_ec,
+                                aggregate_ns=_agg_ec)
+    except Exception:
+        pass
+    try:
+        _write_epoch_ess_plot(conv_rows, out, ea=_ea_ec, aggregate_ns=_agg_ec)
     except Exception:
         pass
     wjson(out / 'epoch_convergence_summary.json',
           {'n_epochs': n_epochs, 'n_rows': len(conv_rows), 'summary': summary,
+           'n_sources_pooled': len(pooling), 'sources': [p['label'] for p in pooling],
+           'skipped_empty_epochs': skipped_epochs, 'source_pooling': pooling,
            'output_dir': str(out)})
     return {'enabled': True, 'metric': 'epoch_convergence',
             'n_epochs': n_epochs, 'n_rows': len(conv_rows),
-            'summary': summary, 'output_dir': str(out)}
+            'summary': summary, 'n_sources_pooled': len(pooling),
+            'sources': [p['label'] for p in pooling], 'skipped_empty_epochs': skipped_epochs,
+            'output_dir': str(out)}
 
 
 def _parquet_sample_count(prod: Path) -> int:
@@ -2987,56 +3027,118 @@ def _compute_basin_populations(prob: np.ndarray, basins: list) -> list:
     return [float(np.sum(prob[b['left_bin']:b['right_bin']+1])) for b in basins]
 
 
-def _epoch_source_annotations(d: 'Data') -> list:
-    """Return [(short_label, frac_end, color), ...] sorted by frac_end for convergence plot markers.
+def _short_source_label(rd) -> str:
+    """Short display label for one adaptive epoch / baseline / topup / final source dir.
 
-    Each source (baseline/topup/epoch) contributes samples with steps up to some max.
-    frac_end = fraction of all samples (in step-sorted order) at which this source's
-    last sample falls, i.e. count(d.step <= max_step_of_source) / N.
+    examples: adaptive_production/epoch_000          -> 'epoch_000'
+              adaptive_production/epoch_001/baseline  -> 'epoch_001/baseline'
+              adaptive_production/final/topup_001_658000 -> 'final/topup_001@658k'
+    """
+    import re as _re
+    p = Path(str(rd))
+    name = p.name
+    parent = p.parent.name
+    label = name if parent == 'adaptive_production' else f'{parent}/{name}'
+    # Shorten topup step suffix: topup_001_658000 -> topup_001@658k
+    return _re.sub(r'topup_(\d+)_(\d+)', lambda m: f'topup_{m.group(1)}@{int(m.group(2))//1000}k', label)
+
+
+def _epoch_source_annotations(d: 'Data') -> list:
+    """Return [(short_label, frac_end, color), ...] for convergence-plot boundary markers.
+
+    Each source (epoch / baseline / topup / final) contributes a contiguous block
+    of the pooled samples in source order.  The epoch-convergence x-axis is
+    ``frac_total = cum_samples(sources 0..k) / N``, so source k's right-edge boundary
+    is ``cum_count(src <= k) / N``.
+
+    This is independent of the per-epoch-LOCAL step counter (which resets each
+    epoch): the previous implementation sorted by ``d.step`` alone, which pushed the
+    longest-running epoch (largest local step) to the far right and short late
+    top-ups to the left — i.e. the markers came out reversed relative to the curve.
     """
     src_meta = d.meta.get('_epoch_source')
     if not src_meta or len(src_meta) != d.step.size:
         return []
     src = np.asarray(src_meta, dtype=np.int64)
-    N = d.step.size
-    if N == 0:
-        return []
-    # Map source index → label using adaptive_epoch_run_dirs or samples source labels
+    N = src.size
     run_dirs = d.meta.get('adaptive_epoch_run_dirs', [])
-    src_labels = []
-    for rd in run_dirs:
-        p = Path(rd)
-        # Strip common prefix paths to get short label
-        for prefix in ('adaptive_production/', 'final/', 'epoch_'):
-            name = str(p.name)
-            parent = str(p.parent.name)
-            if parent in ('baseline', 'adaptive_production') or parent.startswith('epoch_'):
-                label = f'{parent}/{name}' if parent != 'adaptive_production' else name
-            else:
-                label = f'{parent}/{name}'
-            break
-        # Shorten topup labels: topup_001_658000 → topup@658k
-        import re as _re
-        label = _re.sub(r'topup_(\d+)_(\d+)', lambda m: f'topup_{m.group(1)}@{int(m.group(2))//1000}k', label)
-        src_labels.append(label)
-
-    if not src_labels:
+    if N == 0 or not run_dirs:
         return []
+    src_labels = [_short_source_label(rd) for rd in run_dirs]
 
-    # Color palette
     colors = ['#e41a1c', '#377eb8', '#4daf4a', '#984ea3', '#ff7f00', '#a65628', '#f781bf', '#999999']
-    step_sorted_order = np.argsort(d.step, kind='stable')
-    sorted_src = src[step_sorted_order]
+    counts = np.bincount(src, minlength=len(src_labels))
+    cum = np.cumsum(counts)
     result = []
     for s_idx, label in enumerate(src_labels):
-        positions = np.where(sorted_src == s_idx)[0]
-        if positions.size == 0:
+        if s_idx >= counts.size or counts[s_idx] == 0:
             continue
-        frac_end = float(positions[-1]) / max(1, N - 1)
-        color = colors[s_idx % len(colors)]
-        result.append((label, frac_end, color))
+        frac_end = float(cum[s_idx]) / max(1, N)  # right edge of this source in source order
+        result.append((label, frac_end, colors[s_idx % len(colors)]))
     result.sort(key=lambda x: x[1])
     return result
+
+
+def _epoch_source_pooling_table(d: 'Data', timestep_fs: float = 4.0) -> list:
+    """Per-source pooling summary for the MBAR union that was actually built.
+
+    Confirms which epoch / baseline / topup / final sources were pooled into the
+    PMF and how much each contributed.  Built from ``d.meta['_epoch_source']`` (the
+    real loaded union) rather than a disk rescan, so it reflects the PMF that was
+    constructed.  Returns [] when epoch-source metadata is unavailable.
+    """
+    src_meta = d.meta.get('_epoch_source')
+    if not src_meta or len(src_meta) != d.step.size:
+        return []
+    src = np.asarray(src_meta, dtype=np.int64)
+    N = src.size
+    run_dirs = d.meta.get('adaptive_epoch_run_dirs', [])
+    if N == 0 or not run_dirs:
+        return []
+    labels = [_short_source_label(rd) for rd in run_dirs]
+    ts = float(d.meta.get('timestep_fs', timestep_fs) or timestep_fs)
+    agg = _epoch_source_aggregate_ns_info(d, ts)
+    cum_ns = agg[2] if agg is not None else None
+    rows = []
+    cum_n = 0
+    for s_idx in range(len(labels)):
+        mask = src == s_idx
+        n = int(mask.sum())
+        if n == 0:
+            continue
+        cum_n += n
+        step_s = d.step[mask]
+        rows.append({
+            'src_idx': s_idx,
+            'label': labels[s_idx],
+            'n_samples': n,
+            'frac_total': float(n / N),
+            'cum_frac': float(cum_n / N),
+            'n_windows': int(np.unique(d.window[mask]).size),
+            'step_min': int(step_s.min()) if step_s.size else 0,
+            'step_max': int(step_s.max()) if step_s.size else 0,
+            'cum_aggregate_ns': (float(cum_ns[s_idx + 1])
+                                 if cum_ns is not None and s_idx + 1 < len(cum_ns) else float('nan')),
+        })
+    return rows
+
+
+def _skipped_empty_epochs(d: 'Data') -> list:
+    """epoch_NNN dirs on disk that contributed no loaded samples to the union.
+
+    e.g. an aborted/promoted epoch that holds only epoch_window_map.csv.  Listing
+    these makes clear they were intentionally skipped, not silently dropped.
+    """
+    run_dirs = d.meta.get('adaptive_epoch_run_dirs', [])
+    if not run_dirs:
+        return []
+    try:
+        ap = d.prod_dir if d.prod_dir.name == 'adaptive_production' else d.prod_dir / 'adaptive_production'
+        loaded_tops = {_short_source_label(rd).split('/')[0] for rd in run_dirs}
+        return [ed.name for ed in sorted(ap.glob('epoch_[0-9][0-9][0-9]'))
+                if ed.is_dir() and ed.name not in loaded_tops]
+    except Exception:
+        return []
 
 
 def _add_epoch_annotations_to_axes(axes_list: list, epoch_annotations: list) -> None:
@@ -3047,9 +3149,11 @@ def _add_epoch_annotations_to_axes(axes_list: list, epoch_annotations: list) -> 
         ylim = ax.get_ylim()
         for i, (label, frac, color) in enumerate(epoch_annotations):
             ax.axvline(frac, color=color, lw=0.9, ls='--', alpha=0.7)
-            # Label above the plot: alternate y to avoid overlap
+            # Label above the plot: alternate y to avoid overlap; clamp x so the
+            # right-edge (frac≈1.0) label stays inside the axes instead of clipping.
             y_pos = 0.97 - 0.09 * (i % 4)
-            ax.text(frac + 0.005, y_pos, label, transform=ax.get_xaxis_transform(),
+            tx = min(frac + 0.005, 0.985)
+            ax.text(tx, y_pos, label, transform=ax.get_xaxis_transform(),
                     fontsize=5.5, color=color, va='top', rotation=90, alpha=0.85)
 
 
@@ -3135,6 +3239,50 @@ def _add_aggregate_ns_secondary_axis(ax, x_frac: np.ndarray, agg_ns: np.ndarray)
         ax2.tick_params(labelsize=6.5)
     except Exception:
         pass
+
+
+def _write_epoch_ess_plot(conv_rows: list, out: Path, *, ea: list = None,
+                          aggregate_ns: Optional[np.ndarray] = None) -> Optional[str]:
+    """Plot MBAR vs GaMD-reweight effective-sample-size fraction across epochs.
+
+    MBAR ESS (umbrella debiasing) typically grows as epochs accumulate; the GaMD
+    exponential-reweighting ESS (umbrella + boost) usually stays near zero — so the
+    two on one log-y axis make the boost-reweighting collapse legible at a glance.
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except Exception:
+        return None
+    rows = [r for r in conv_rows if 'frac_total' in r
+            and ('mbar_ess_frac' in r or 'gamd_reweight_ess_frac' in r)]
+    if not rows:
+        return None
+    x = np.asarray([r['frac_total'] for r in rows], dtype=float)
+    mbar = np.asarray([r.get('mbar_ess_frac', np.nan) for r in rows], dtype=float)
+    gamd = np.asarray([r.get('gamd_reweight_ess_frac', np.nan) for r in rows], dtype=float)
+    out.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(7.2, 4.3))
+    if np.any(np.isfinite(mbar) & (mbar > 0)):
+        ax.plot(x, mbar, 'o-', color='#377eb8', lw=1.4, ms=4,
+                label='MBAR ESS / N  (umbrella debias)')
+    if np.any(np.isfinite(gamd) & (gamd > 0)):
+        ax.plot(x, gamd, 's-', color='#e41a1c', lw=1.4, ms=4,
+                label='GaMD reweight ESS / N  (incl. boost)')
+    ax.set_yscale('log')
+    ax.set_xlabel('fraction of production samples')
+    ax.set_ylabel('effective sample size fraction (log)')
+    ax.set_title('Effective sample size vs accumulated sampling')
+    ax.axhline(0.05, color='gray', ls=':', lw=0.8, alpha=0.7)
+    ax.text(0.02, 0.052, '5% ESS floor', fontsize=6, color='gray', va='bottom',
+            transform=ax.get_yaxis_transform())
+    ax.grid(True, which='both', alpha=0.25)
+    ax.legend(fontsize=8, loc='best')
+    _add_epoch_annotations_to_axes([ax], ea or [])
+    _add_aggregate_ns_secondary_axis(ax, x, aggregate_ns)
+    path = out / 'ess_vs_timepoints.png'
+    fig.savefig(path, dpi=200, bbox_inches='tight')
+    plt.close(fig)
+    return str(path)
 
 
 def checkpoint_steps_from_data(step: np.ndarray, n_timepoints: int) -> np.ndarray:
@@ -3761,7 +3909,12 @@ def run_observable_pmf_convergence(
                 f'(~{_ext_n:,} additional) based on RMSE first crossing threshold at '
                 f'{float(_first_rmse_ok)*100:.1f}% of data. Actual requirement may differ.'
             )
-    ea = _epoch_source_annotations(d)
+    # No epoch/source boundary markers here: this cost-axis convergence accumulates
+    # by raw production step (mask = d.step <= ck), and adaptive sources share the
+    # same step_min, so they interleave — there is no single x at which "epoch_000
+    # ends".  Source-annotated convergence lives in epoch_convergence/ (chronological
+    # source-cumulative x-axis); see run_epoch_pmf_convergence.
+    ea = []
     _fracs_ob = np.asarray([r.get('frac_total', np.nan) for r in conv_rows], dtype=float)
     _ts_ob = float(d.meta.get('timestep_fs', 4.0) or 4.0)
     plot_paths=write_observable_convergence_plots(conv_rows,pmf_rows,summary_rows,out,args,cwarnings,prefix=file_prefix,metric_label=metric_label,x_label=x_label,smooth_sigma=_eff_smooth(args,'pmf_smooth_sigma'),epoch_annotations=ea,aggregate_ns=_aggregate_ns_for_fracs(d,_fracs_ob,_ts_ob))
@@ -3803,19 +3956,59 @@ def run_pmf_convergence(d: Data, args, bins: np.ndarray, selected: str, final_pm
         legacy_total_names=True,basin_tracking=True,progress=progress,f_init_hint=f_init_hint,
     )
 
-def _find_rg_topology_path(prod: Path, args) -> Optional[Path]:
-    if getattr(args, 'rg_topology', None):
-        p=Path(args.rg_topology)
-        if p.exists(): return p
+def _find_first_existing_path(candidates) -> Optional[Path]:
+    for p in candidates:
+        p = Path(p)
+        if p.exists():
+            return p
+    return None
+
+
+def _find_explicit_topology_path(args, names) -> Optional[Path]:
+    for name in names:
+        value = getattr(args, name, None)
+        if value:
+            p = Path(value)
+            if p.exists():
+                return p
+    return None
+
+
+def _find_default_topology_path(prod: Path) -> Optional[Path]:
     candidates=[
+        prod/'solute_only.pdb', prod.parent/'solute_only.pdb',
         prod/'03_npt_equilibrated.pdb', prod.parent/'03_npt_equilibrated.pdb',
         prod/'shared_gamd_setup_final.pdb', prod.parent/'shared_gamd_setup_final.pdb',
         prod/'01_solvated_start.pdb', prod.parent/'01_solvated_start.pdb',
         prod/'02_minimized.pdb', prod.parent/'02_minimized.pdb',
     ]
-    for p in candidates:
-        if p.exists(): return p
-    return None
+    return _find_first_existing_path(candidates)
+
+
+def _find_trajectory_companion_topology_path(run_dirs) -> Optional[Path]:
+    candidates = []
+    for run_dir in run_dirs or []:
+        base = Path(run_dir)
+        candidates.append(base/'solute_only.pdb')
+        candidates.append(base.parent/'solute_only.pdb')
+    return _find_first_existing_path(candidates)
+
+
+def _find_data_topology_path(d: Data, args, names) -> Optional[Path]:
+    explicit = _find_explicit_topology_path(args, names)
+    if explicit is not None:
+        return explicit
+    companion = _find_trajectory_companion_topology_path(d.meta.get('adaptive_epoch_run_dirs', []))
+    if companion is not None:
+        return companion
+    return _find_default_topology_path(d.prod_dir)
+
+
+def _find_rg_topology_path(prod: Path, args) -> Optional[Path]:
+    explicit = _find_explicit_topology_path(args, ('rg_topology',))
+    if explicit is not None:
+        return explicit
+    return _find_default_topology_path(prod)
 
 
 
@@ -4091,7 +4284,7 @@ def _compute_rg_from_trajectories(d: Data, args, progress: Optional[Progress], w
         else:
             if mode == 'force': warnings.append(f'Rg trajectory reconstruction requested but {traj_dir} is missing')
             return None
-    top_path=_find_rg_topology_path(d.prod_dir,args)
+    top_path=_find_data_topology_path(d, args, ('rg_topology',))
     if top_path is None:
         if mode == 'force': warnings.append('Rg trajectory reconstruction requested but no topology PDB was found; use --rg-topology')
         return None
@@ -4388,13 +4581,10 @@ def analyze_distance_rg_2d_fes(d: Data, args, base_logw: np.ndarray, selected: s
 
 
 def _find_pca_topology_path(prod: Path, args) -> Optional[Path]:
-    if getattr(args, 'pca_topology', None):
-        p=Path(args.pca_topology)
-        if p.exists(): return p
-    if getattr(args, 'rg_topology', None):
-        p=Path(args.rg_topology)
-        if p.exists(): return p
-    return _find_rg_topology_path(prod,args)
+    explicit = _find_explicit_topology_path(args, ('pca_topology', 'rg_topology'))
+    if explicit is not None:
+        return explicit
+    return _find_default_topology_path(prod)
 
 def _trajectory_frame_count(md, traj_path: Path) -> Optional[int]:
     try:
@@ -4489,13 +4679,7 @@ def _fit_and_project_pca_from_trajectories(d: Data, args, out: Path, progress: O
         else:
             if mode == 'force': warnings.append(f'PCA requested but {traj_dir} is missing')
             return {'available':False,'reason':f'{traj_dir} is missing'}
-    top_path=_find_pca_topology_path(d.prod_dir,args)
-    if top_path is None:
-        # For adaptive runs, check epoch dirs for topology
-        for ep_run_dir in d.meta.get('adaptive_epoch_run_dirs', []):
-            top_path = _find_pca_topology_path(Path(ep_run_dir), args)
-            if top_path is not None:
-                break
+    top_path=_find_data_topology_path(d, args, ('pca_topology', 'rg_topology'))
     if top_path is None:
         if mode == 'force': warnings.append('PCA requested but no topology PDB was found; use --pca-topology')
         return {'available':False,'reason':'no topology PDB found; use --pca-topology'}
@@ -4747,10 +4931,10 @@ def _md_residue_label(res) -> str:
     return f'{idx:03d}_{name}{resseq}'
 
 def _find_extra_topology_path(prod: Path, args) -> Optional[Path]:
-    if getattr(args,'extra_topology',None):
-        p=Path(args.extra_topology)
-        if p.exists(): return p
-    return _find_pca_topology_path(prod,args)
+    explicit = _find_explicit_topology_path(args, ('extra_topology', 'pca_topology', 'rg_topology'))
+    if explicit is not None:
+        return explicit
+    return _find_default_topology_path(prod)
 
 def _extra_replica_plan(d: Data, args, md, traj_dir: Path, warnings: list[str]) -> list[dict]:
     reps=sorted(set(int(x) for x in d.replica if np.isfinite(x)))
@@ -5094,7 +5278,7 @@ def analyze_extra_observable_pmfs(d: Data, args, base_logw: np.ndarray, selected
         else:
             if mode == 'force': warnings.append(f'Extra observable PMFs requested but {traj_dir} is missing')
             return {'available':False,'reason':f'{traj_dir} is missing'}
-    top_path=_find_extra_topology_path(d.prod_dir,args)
+    top_path=_find_data_topology_path(d, args, ('extra_topology', 'pca_topology', 'rg_topology'))
     if top_path is None:
         if mode == 'force': warnings.append('Extra observable PMFs requested but no topology PDB was found; use --extra-topology')
         return {'available':False,'reason':'no topology PDB found; use --extra-topology'}
@@ -6985,12 +7169,7 @@ def _compute_chignolin_distances(d, args, progress, warnings: list):
         else:
             warnings.append("--chignolin_fes: replica_trajectories/ not found.")
             return None, None
-    top_path = _find_rg_topology_path(d.prod_dir, args)
-    if top_path is None:
-        for ep_run_dir in d.meta.get('adaptive_epoch_run_dirs', []):
-            top_path = _find_rg_topology_path(Path(ep_run_dir), args)
-            if top_path is not None:
-                break
+    top_path = _find_data_topology_path(d, args, ('rg_topology',))
     if top_path is None:
         warnings.append("--chignolin_fes: no topology PDB found; use --rg-topology.")
         return None, None
@@ -7656,7 +7835,7 @@ def analyze_poincare_residue_torsions(d: Data, args, out: Path, poincare_info: d
     except ImportError:
         return {'available': False, 'reason': 'MDTraj not available'}
 
-    top_path = _find_rg_topology_path(d.prod_dir, args)
+    top_path = _find_data_topology_path(d, args, ('rg_topology',))
     if top_path is None:
         return {'available': False, 'reason': 'topology PDB not found; use --rg-topology'}
 
@@ -8153,6 +8332,137 @@ def analyze_chignolin_fes(d, args, base_logw: np.ndarray, selected: str, boost_o
     return info
 
 
+def _analyze_tica_epochs(prod_dir: Path, out: Path, meta: dict, warn: list) -> dict:
+    """Analyze per-epoch tICA CVaux updates: eigenvalue progression, MBAR vs uniform reweighting, per-window tIC1 center evolution."""
+    ap = None
+    for candidate in (prod_dir / 'adaptive_production', prod_dir.parent / 'adaptive_production'):
+        if candidate.is_dir():
+            ap = candidate; break
+    if ap is None:
+        return {'available': False, 'reason': 'adaptive_production/ not found'}
+
+    summary_path = ap / 'adaptive_production_driver_summary.json'
+    if not summary_path.exists():
+        return {'available': False, 'reason': 'adaptive_production_driver_summary.json not found'}
+
+    try:
+        with summary_path.open() as fh:
+            driver_summary = json.load(fh)
+    except Exception as e:
+        return {'available': False, 'reason': f'driver summary read error: {e}'}
+
+    epoch_summaries = driver_summary.get('epoch_summaries', [])
+    if not epoch_summaries:
+        return {'available': False, 'reason': 'no epoch_summaries in driver summary'}
+
+    tica_records = []
+    for es in epoch_summaries:
+        tu = es.get('tica_update', {})
+        if isinstance(tu, dict) and tu.get('status') == 'updated':
+            tica_records.append({
+                'epoch': int(es.get('epoch', tu.get('epoch', -1))),
+                'eigenvalue': float(tu.get('eigenvalue', float('nan'))),
+                'n_samples': int(tu.get('n_samples', 0)),
+                'mbar_reweighted': bool(tu.get('mbar_reweighted', False)),
+                'lag_frames': int(tu.get('lag_frames', 0)),
+                'per_window_tic1_centers': {int(k): float(v) for k, v in tu.get('per_window_tic1_centers', {}).items()},
+            })
+
+    if not tica_records:
+        return {'available': False, 'reason': 'no successful tICA updates in epoch summaries'}
+
+    tica_state_path = ap / 'tica_state.json'
+
+    tica_out = out / 'tica_epochs'; tica_out.mkdir(parents=True, exist_ok=True)
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib.lines import Line2D
+    except Exception as e:
+        warn.append(f'matplotlib unavailable; tICA epoch plots skipped: {e}')
+        return {'available': True, 'n_updates': len(tica_records), 'reason': str(e), 'files': {}}
+
+    generated = {}
+    epochs_arr = np.array([r['epoch'] for r in tica_records])
+    eigenvalues_arr = np.array([r['eigenvalue'] for r in tica_records])
+    n_samples_arr = np.array([r['n_samples'] for r in tica_records])
+    mbar_flags = [r['mbar_reweighted'] for r in tica_records]
+    colors_mbar = ['#2266cc' if m else '#cc4422' for m in mbar_flags]
+
+    # Plot 1: eigenvalue progression + training-set size
+    try:
+        fig, axes = plt.subplots(2, 1, figsize=(7, 6), sharex=True)
+        ax1, ax2 = axes
+        ax1.scatter(epochs_arr, eigenvalues_arr, c=colors_mbar, s=60, zorder=5)
+        ax1.plot(epochs_arr, eigenvalues_arr, 'k-', alpha=0.4, linewidth=1)
+        ax1.legend(handles=[
+            Line2D([0], [0], marker='o', color='w', markerfacecolor='#2266cc', markersize=8, label='MBAR-reweighted'),
+            Line2D([0], [0], marker='o', color='w', markerfacecolor='#cc4422', markersize=8, label='Unweighted'),
+        ], fontsize=8)
+        ax1.set_ylabel('tIC1 eigenvalue (Koopman)')
+        ax1.set_title('tICA CVaux: eigenvalue progression per update epoch')
+        ax1.grid(True, alpha=0.3)
+        ax2.bar(epochs_arr, n_samples_arr / 1000, color=colors_mbar, alpha=0.7)
+        ax2.set_xlabel('Adaptive epoch')
+        ax2.set_ylabel('Training samples (×10³)')
+        ax2.set_title('tICA training set size')
+        ax2.grid(True, alpha=0.3, axis='y')
+        fig.tight_layout()
+        p = tica_out / 'tica_eigenvalue_progression.png'; fig.savefig(p, dpi=150, bbox_inches='tight'); plt.close(fig)
+        generated['tica_eigenvalue_progression_png'] = str(p)
+    except Exception as e:
+        warn.append(f'tica_eigenvalue_progression.png failed: {e}'); plt.close('all')
+
+    # Plot 2: per-window tIC1 center heatmap (row=epoch, col=window)
+    try:
+        all_windows = sorted({w for r in tica_records for w in r['per_window_tic1_centers']})
+        if all_windows:
+            n_ep = len(tica_records); n_w = len(all_windows)
+            heatmap = np.full((n_ep, n_w), np.nan)
+            for i, r in enumerate(tica_records):
+                for j, w in enumerate(all_windows):
+                    v = r['per_window_tic1_centers'].get(w)
+                    if v is not None:
+                        heatmap[i, j] = v
+            finite_vals = heatmap[np.isfinite(heatmap)]
+            if finite_vals.size > 0:
+                vabs = max(abs(float(finite_vals.min())), abs(float(finite_vals.max())), 1e-9)
+                fig, ax = plt.subplots(figsize=(max(6, n_w * 0.25 + 2), max(4, n_ep * 0.4 + 1.5)))
+                im = ax.imshow(heatmap, aspect='auto', cmap='RdBu_r', vmin=-vabs, vmax=vabs, origin='lower', interpolation='nearest')
+                ax.set_yticks(range(n_ep))
+                ax.set_yticklabels([f'Epoch {r["epoch"]}' for r in tica_records], fontsize=7)
+                ax.set_xlabel('Window index'); ax.set_ylabel('tICA update epoch')
+                ax.set_title('Per-window tIC1 center evolution')
+                plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='tIC1 center')
+                fig.tight_layout()
+                p = tica_out / 'tica_window_center_heatmap.png'; fig.savefig(p, dpi=150, bbox_inches='tight'); plt.close(fig)
+                generated['tica_window_center_heatmap_png'] = str(p)
+    except Exception as e:
+        warn.append(f'tica_window_center_heatmap.png failed: {e}'); plt.close('all')
+
+    # CSV summary
+    try:
+        csv_path = tica_out / 'tica_epoch_summary.csv'
+        with csv_path.open('w', newline='') as fh:
+            wr = csv.DictWriter(fh, fieldnames=['epoch', 'eigenvalue', 'n_samples', 'mbar_reweighted', 'lag_frames'])
+            wr.writeheader()
+            for r in tica_records:
+                wr.writerow({k: r[k] for k in ['epoch', 'eigenvalue', 'n_samples', 'mbar_reweighted', 'lag_frames']})
+        generated['tica_epoch_summary_csv'] = str(csv_path)
+    except Exception as e:
+        warn.append(f'tica_epoch_summary.csv failed: {e}')
+
+    return {
+        'available': True,
+        'n_updates': len(tica_records),
+        'n_mbar_reweighted': sum(1 for r in tica_records if r['mbar_reweighted']),
+        'latest_eigenvalue': float(tica_records[-1]['eigenvalue']) if tica_records else None,
+        'latest_epoch': int(tica_records[-1]['epoch']) if tica_records else None,
+        'adaptive_dir': str(ap),
+        'tica_state_file': str(tica_state_path) if tica_state_path.exists() else None,
+        'files': generated,
+    }
+
+
 def _analyze_epoch_cv_exploration(prod_dir: Path, out: Path, meta: dict, warn: list) -> dict:
     for candidate in (prod_dir / 'adaptive_production', prod_dir.parent / 'adaptive_production'):
         if candidate.is_dir():
@@ -8465,6 +8775,7 @@ def analyze(d,args, progress: Optional[Progress] = None):
     if progress is not None: progress.bar('analysis stages', 5, 6, 'plotting PNG outputs', force=True)
     plot_outputs(d,pmfs,selected,O,out,warn,smooth_sigma=_eff_smooth(args,'pmf_smooth_sigma'))
     epoch_cv_info=_analyze_epoch_cv_exploration(d.prod_dir,out,d.meta,warn)
+    tica_epoch_info=_analyze_tica_epochs(d.prod_dir,out,d.meta,warn)
     conv_info=run_pmf_convergence(d,args,bins,selected,sel,out,progress=progress,f_init_hint=m.get('f_k'))
     epoch_conv_info={}
     if d.meta.get('_epoch_source'):
@@ -8481,32 +8792,14 @@ def analyze(d,args, progress: Optional[Progress] = None):
     s['cv1_cv2_2d_fes']=cv1_cv2_fes_info
     s['epoch_convergence']=epoch_conv_info
     s['epoch_cv_exploration']=epoch_cv_info
+    s['tica_epochs']=tica_epoch_info
     s['dtram']=_dtram_public_info(dtram_info)
-    if isinstance(rg_info,dict) and rg_info.get('files'):
-        s['files'].update({k:v for k,v in rg_info.get('files',{}).items()})
-    if isinstance(fes2d_info,dict) and fes2d_info.get('files'):
-        s['files'].update({k:v for k,v in fes2d_info.get('files',{}).items()})
-    if isinstance(pca2d_info,dict) and pca2d_info.get('files'):
-        s['files'].update({k:v for k,v in pca2d_info.get('files',{}).items()})
-    if isinstance(extra_obs_info,dict) and extra_obs_info.get('files'):
-        s['files'].update({k:v for k,v in extra_obs_info.get('files',{}).items()})
-    if isinstance(chignolin_fes_info,dict) and chignolin_fes_info.get('files'):
-        s['files'].update({k:v for k,v in chignolin_fes_info.get('files',{}).items()})
-    if isinstance(poincare_info,dict) and poincare_info.get('files'):
-        s['files'].update({k:v for k,v in poincare_info.get('files',{}).items()})
-    if isinstance(poincare_torsions_info,dict) and poincare_torsions_info.get('files'):
-        s['files'].update({k:v for k,v in poincare_torsions_info.get('files',{}).items()})
-    if isinstance(secondary_cv_pmf_info,dict) and secondary_cv_pmf_info.get('files'):
-        s['files'].update({k:v for k,v in secondary_cv_pmf_info.get('files',{}).items()})
-    if isinstance(cv1_cv2_fes_info,dict) and cv1_cv2_fes_info.get('files'):
-        s['files'].update({k:v for k,v in cv1_cv2_fes_info.get('files',{}).items()})
-    if isinstance(epoch_cv_info,dict) and epoch_cv_info.get('files'):
-        s['files'].update({k:v for k,v in epoch_cv_info.get('files',{}).items()})
-    if isinstance(dtram_info,dict) and dtram_info.get('files'):
-        s['files'].update({k:v for k,v in dtram_info.get('files',{}).items()})
     s['convergence']=conv_info
-    if isinstance(conv_info,dict) and conv_info.get('files'):
-        s['files'].update({k:v for k,v in conv_info.get('files',{}).items()})
+    for _info in (rg_info,fes2d_info,pca2d_info,extra_obs_info,chignolin_fes_info,
+                  poincare_info,poincare_torsions_info,secondary_cv_pmf_info,
+                  cv1_cv2_fes_info,epoch_cv_info,tica_epoch_info,dtram_info,conv_info):
+        if isinstance(_info,dict) and _info.get('files'):
+            s['files'].update(_info['files'])
     wjson(out/'pmf_summary.json',s); summary_md(out/'pmf_summary.md',s)
     if progress is not None: progress.bar('analysis stages', 6, 6, 'summary written', force=True)
     return s
@@ -8714,6 +9007,13 @@ def main(argv=None):
     print('GaREUS PMF analysis complete')
     print(f"  production dir: {s['production_dir']}")
     print(f"  samples/windows: {s['n_samples']} / {s['n_windows']}")
+    _pool = _epoch_source_pooling_table(d)
+    if _pool:
+        print(f"  adaptive sources pooled into PMF: {len(_pool)} (incl. final) — "
+              + ", ".join(f"{p['label']}={p['n_samples']}" for p in _pool))
+        _skipped = _skipped_empty_epochs(d)
+        if _skipped:
+            print(f"    empty epochs skipped (no samples): {', '.join(_skipped)}")
     print(f"  selected PMF: {s['selected_unbiased_method']}")
     print(f"  MBAR backend: {s['mbar'].get('backend','unknown')}")
     print(f"  PMF minimum: {s['pmf_minimum_cv_A']} {s.get('primary_cv_units','A')}")
