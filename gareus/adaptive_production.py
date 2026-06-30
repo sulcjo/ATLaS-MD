@@ -1442,7 +1442,130 @@ def _apply_tica_centers_to_registry(
     return updated
 
 
-def _maybe_update_tica_cvaux(epoch: int, epoch_dir: Path, adaptive_dir: Path, args) -> dict:
+def _compute_mbar_weights_for_tica(
+    primary_cv: np.ndarray,
+    secondary_cv: np.ndarray,
+    window_ids: np.ndarray,
+    epoch_dir: Path,
+    registry: "WindowStateRegistry",
+    temperature_K: float = 298.0,
+) -> np.ndarray:
+    """Compute MBAR importance weights for tICA reweighting.
+
+    Runs a standalone MBAR solve on the tICA dihedral-obs frames using each
+    frame's primary (and optional secondary) CV value against all epoch-active
+    registry states.  The resulting weights reweight the biased REUS ensemble
+    toward the unbiased equilibrium distribution so that the tICA eigenvectors
+    reflect true physical slow modes rather than the sampling distribution.
+
+    Falls back silently to uniform weights (1/N) on any failure (pymbar
+    unavailable, NaN CVs, numerical singularity, etc.).
+
+    Parameters
+    ----------
+    primary_cv, secondary_cv : np.ndarray, shape (N,)
+        Per-frame CV values from dihedral obs.  secondary_cv may be all-NaN
+        when CV2 is inactive; those frames receive zero secondary-bias contribution.
+    window_ids : np.ndarray, shape (N,)
+        Local epoch window index for each frame.
+    epoch_dir : Path
+        Epoch directory used to load the epoch window map.
+    registry : WindowStateRegistry
+    temperature_K : float
+        Simulation temperature in Kelvin.
+
+    Returns
+    -------
+    np.ndarray, shape (N,), sums to 1.0
+        MBAR importance weights.
+    """
+    N = len(primary_cv)
+    uniform = np.full(N, 1.0 / N, dtype=np.float64)
+
+    # Cannot reweight without primary CV (old obs files)
+    if not np.isfinite(primary_cv).any():
+        return uniform
+
+    try:
+        from pymbar import MBAR as _MBAR  # noqa: PLC0415
+        from scipy.special import logsumexp as _logsumexp  # noqa: PLC0415
+    except ImportError:
+        return uniform
+
+    try:
+        # Map local window indices to registry state IDs
+        epoch_wmap = _load_epoch_window_map(epoch_dir, registry)
+        sample_state_ids = np.array([epoch_wmap.get(int(w), int(w)) for w in window_ids], dtype=np.int64)
+        unique_sids = sorted(set(epoch_wmap.values()))
+        states = [registry.get_state(int(sid)) for sid in unique_sids]
+        states = [s for s in states if s is not None]
+        if not states:
+            return uniform
+
+        K = len(states)
+        primary_centers = np.array([float(s.primary_center) for s in states])
+        primary_k = np.array([float(s.primary_k) for s in states])
+        secondary_centers = np.array([
+            np.nan if s.secondary_center is None else float(s.secondary_center)
+            for s in states
+        ])
+        secondary_k = np.array([
+            0.0 if s.secondary_k is None else float(s.secondary_k)
+            for s in states
+        ])
+
+        # Reduced potential matrix u_nk[n, k] = beta * U_k(x_n), dimensionless
+        kB_kcal = 1.987204e-3  # kcal/mol/K
+        beta_kcal = 1.0 / (kB_kcal * temperature_K)
+
+        primary_delta = primary_cv[:, None] - primary_centers[None, :]
+        u_nk = beta_kcal * 0.5 * primary_k[None, :] * primary_delta ** 2
+
+        # Secondary bias (only where both CV and state have finite values)
+        has_sec_sample = np.isfinite(secondary_cv)
+        has_sec_state = np.isfinite(secondary_centers) & (secondary_k > 0)
+        if has_sec_sample.any() and has_sec_state.any():
+            sec_delta = np.where(
+                has_sec_sample[:, None] & has_sec_state[None, :],
+                secondary_cv[:, None] - secondary_centers[None, :],
+                0.0,
+            )
+            u_nk += beta_kcal * 0.5 * secondary_k[None, :] * sec_delta ** 2
+
+        # Samples per state (from obs window map)
+        state_id_to_ki = {int(sid): ki for ki, sid in enumerate(unique_sids)}
+        N_k = np.zeros(K, dtype=np.int64)
+        for sid_sample in sample_state_ids:
+            ki = state_id_to_ki.get(int(sid_sample))
+            if ki is not None:
+                N_k[ki] += 1
+
+        # pymbar convention: u_kn shape (K, N)
+        mbar = _MBAR(u_nk.T, N_k, verbose=False)
+        f_k = mbar.f_k  # dimensionless free energies, shape (K,)
+
+        # MBAR weights for unbiased (zero-bias) ensemble:
+        #   w_n ∝ 1 / sum_k N_k * exp(f_k - u_nk[n,k])
+        log_N_k = np.where(N_k > 0, np.log(N_k.astype(np.float64)), -np.inf)
+        log_N_f = log_N_k + f_k  # log(N_k) + f_k, shape (K,)
+        # logsumexp over k for each n: log denominator
+        log_denom = _logsumexp(log_N_f[None, :] - u_nk, axis=1)  # shape (N,)
+        log_w = -log_denom
+        log_w -= _logsumexp(log_w)  # log-normalise
+        weights = np.exp(log_w)
+
+        # Sanity: all finite, non-negative, sum to ~1
+        if not np.isfinite(weights).all() or (weights < 0).any():
+            return uniform
+        weights = np.clip(weights, 0.0, None)
+        weights /= weights.sum()
+        return weights
+
+    except Exception:
+        return uniform
+
+
+def _maybe_update_tica_cvaux(epoch: int, epoch_dir: Path, adaptive_dir: Path, args, *, registry=None) -> dict:
     """Refit tICA from epoch observations and update args for the next epoch.
 
     Completely opt-in: returns an empty dict immediately if tica_obs_interval == 0
@@ -1498,9 +1621,32 @@ def _maybe_update_tica_cvaux(epoch: int, epoch_dir: Path, adaptive_dir: Path, ar
     phi_indices = list(prev_result.phi_torsion_indices) if prev_result else []
     psi_indices = list(prev_result.psi_torsion_indices) if prev_result else []
 
+    # Compute MBAR importance weights to reweight biased REUS frames to unbiased distribution.
+    # Falls back to uniform (unweighted tICA) silently on any failure.
+    mbar_weights = None
+    mbar_reweighted = False
+    if registry is not None:
+        try:
+            _, _wids_tmp, _pcv_tmp, _scv_tmp = load_epoch_dihedral_obs(epoch_dir)
+            if np.isfinite(_pcv_tmp).any():
+                temp_K = float(getattr(args, "temperature", 298.0) or 298.0)
+                mbar_weights = _compute_mbar_weights_for_tica(
+                    _pcv_tmp, _scv_tmp, _wids_tmp, epoch_dir, registry, temp_K
+                )
+                mbar_reweighted = True
+                print(
+                    f"    tICA: MBAR reweighting from {int(np.isfinite(_pcv_tmp).sum())} frames "
+                    f"across {len(np.unique(_wids_tmp))} windows"
+                )
+            else:
+                print("    tICA: no primary_cv in obs (old files); using unweighted tICA")
+        except Exception as _mw_exc:
+            print(f"    tICA: MBAR weight computation failed ({_mw_exc}); using unweighted tICA")
+
     try:
         result = compute_tica_from_epoch_obs(
-            epoch_dir, lag, phi_indices, psi_indices, previous_result=prev_result
+            epoch_dir, lag, phi_indices, psi_indices,
+            previous_result=prev_result, weights=mbar_weights,
         )
     except Exception as exc:
         print(f"    tICA: fitting failed ({exc}); skipping update for epoch {epoch}")
@@ -1521,7 +1667,7 @@ def _maybe_update_tica_cvaux(epoch: int, epoch_dir: Path, adaptive_dir: Path, ar
     # Compute per-window tIC1 medians for registry secondary_center update.
     per_window_centers: Dict[int, float] = {}
     try:
-        X_all, window_ids = load_epoch_dihedral_obs(epoch_dir)
+        X_all, window_ids, _, _ = load_epoch_dihedral_obs(epoch_dir)
         per_window_centers = window_tica_centers(X_all, window_ids, result)
     except Exception as _wc_exc:
         print(f"    tICA: per-window center computation failed ({_wc_exc}); registry centers will not be updated")
@@ -1538,6 +1684,7 @@ def _maybe_update_tica_cvaux(epoch: int, epoch_dir: Path, adaptive_dir: Path, ar
         "lag_frames": int(lag),
         "state_file": str(state_path),
         "version": version_tag,
+        "mbar_reweighted": mbar_reweighted,
         "per_window_tic1_centers": {int(k): float(v) for k, v in per_window_centers.items()},
     }
 
@@ -4053,7 +4200,7 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
         # tICA CVaux inter-epoch update (opt-in; no-op by default)
         tica_update_report = {}
         try:
-            tica_update_report = _maybe_update_tica_cvaux(epoch, epoch_dir, adaptive_dir, args)
+            tica_update_report = _maybe_update_tica_cvaux(epoch, epoch_dir, adaptive_dir, args, registry=registry)
             if tica_update_report.get("status") == "updated" and registry is not None:
                 per_window_centers = tica_update_report.get("per_window_tic1_centers", {})
                 if per_window_centers:

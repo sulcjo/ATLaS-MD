@@ -184,6 +184,7 @@ def compute_tica(
     psi_torsion_indices: Optional[List] = None,
     previous_result: Optional[TICAResult] = None,
     epsilon: float = 1e-10,
+    weights: Optional[np.ndarray] = None,
 ) -> TICAResult:
     """Fit a tICA model to feature matrix X and return the slowest mode.
 
@@ -203,6 +204,11 @@ def compute_tica(
         anti-correlates with the previous weight vector).
     epsilon : float
         Small regularisation added to C(0) diagonal for numerical stability.
+    weights : np.ndarray, shape (n_samples,), optional
+        Importance weights for each frame (e.g. MBAR weights to reweight
+        the biased REUS ensemble to the unbiased equilibrium distribution).
+        Must be non-negative; are normalised internally to sum to 1.
+        When None, standard unweighted tICA is used.
 
     Returns
     -------
@@ -226,18 +232,43 @@ def compute_tica(
             f"X has only {n} rows; need > 2*lag={2*lag} for a valid lagged covariance estimate"
         )
 
-    mean = X.mean(axis=0)
-    Xc = X - mean
+    if weights is not None:
+        w = np.asarray(weights, dtype=np.float64)
+        if w.shape != (n,):
+            raise ValueError(f"weights shape {w.shape} != (n_samples,) = ({n},)")
+        w_sum = w.sum()
+        if w_sum <= 0.0:
+            raise ValueError("weights must sum to a positive value")
+        w = w / w_sum
+    else:
+        w = None
 
-    # Unlagged covariance C(0)
-    C0 = (Xc.T @ Xc) / (n - 1)
-    C0 += epsilon * np.eye(d)
-
-    # Lagged covariance C(lag) — symmetrised
-    Xl = Xc[:-lag]
-    Xr = Xc[lag:]
-    Ctau = (Xl.T @ Xr) / (n - lag - 1)
-    Ctau = 0.5 * (Ctau + Ctau.T)
+    if w is None:
+        # Standard unweighted tICA
+        mean = X.mean(axis=0)
+        Xc = X - mean
+        C0 = (Xc.T @ Xc) / (n - 1)
+        C0 += epsilon * np.eye(d)
+        Xl = Xc[:-lag]
+        Xr = Xc[lag:]
+        Ctau = (Xl.T @ Xr) / (n - lag - 1)
+        Ctau = 0.5 * (Ctau + Ctau.T)
+    else:
+        # Reweighted tICA: symmetric estimator with pair weights
+        # (Nüske et al. 2017 / standard MBAR-reweighted TICA form)
+        mean = w @ X  # weighted mean, shape (d,)
+        Xc = X - mean
+        Xl = Xc[:-lag]
+        Xr = Xc[lag:]
+        # Arithmetic-mean pair weights: each pair (t, t+lag) gets
+        # the average of source and target frame weights, then renormalised.
+        w_pairs = 0.5 * (w[:-lag] + w[lag:])
+        w_pairs = w_pairs / w_pairs.sum()
+        # Symmetric weighted C(0): average contribution from source and target
+        C0 = 0.5 * ((Xl.T * w_pairs) @ Xl + (Xr.T * w_pairs) @ Xr)
+        C0 += epsilon * np.eye(d)
+        # Symmetric weighted C(tau): symmetrise to enforce time-reversibility
+        Ctau = 0.5 * ((Xl.T * w_pairs) @ Xr + (Xr.T * w_pairs) @ Xl)
 
     # Generalised eigenvalue problem via scipy, numpy fallback
     try:
@@ -418,8 +449,18 @@ class DihedralObsBuffer:
         self._features: List[np.ndarray] = []
         self._steps: List[int] = []
         self._windows: List[int] = []
+        self._primary_cv: List[float] = []
+        self._secondary_cv: List[float] = []
 
-    def record(self, positions_nm: np.ndarray, step: int, window: int) -> None:
+    def record(
+        self,
+        positions_nm: np.ndarray,
+        step: int,
+        window: int,
+        *,
+        cv_primary: float = float("nan"),
+        cv_secondary: float = float("nan"),
+    ) -> None:
         """Record backbone dihedral features for one frame.
 
         Parameters
@@ -430,11 +471,17 @@ class DihedralObsBuffer:
             Absolute simulation step index.
         window : int
             Active umbrella window index biasing this replica.
+        cv_primary : float, optional
+            Primary CV value for this frame; used for MBAR reweighting.
+        cv_secondary : float, optional
+            Secondary CV value (NaN when CV2 is inactive).
         """
         feat = backbone_dihedral_features(positions_nm, self._phi, self._psi)
         self._features.append(feat)
         self._steps.append(int(step))
         self._windows.append(int(window))
+        self._primary_cv.append(float(cv_primary))
+        self._secondary_cv.append(float(cv_secondary))
 
     def save(self) -> Optional[Path]:
         """Flush buffered observations to ``tica_obs/dihedral_obs_{replica:03d}.npz``.
@@ -453,6 +500,8 @@ class DihedralObsBuffer:
             features=np.stack(self._features, axis=0),
             steps=np.asarray(self._steps, dtype=np.int64),
             window=np.asarray(self._windows, dtype=np.int64),
+            primary_cv=np.asarray(self._primary_cv, dtype=np.float64),
+            secondary_cv=np.asarray(self._secondary_cv, dtype=np.float64),
         )
         return out_path
 
@@ -461,6 +510,8 @@ class DihedralObsBuffer:
         self._features.clear()
         self._steps.clear()
         self._windows.clear()
+        self._primary_cv.clear()
+        self._secondary_cv.clear()
 
     def __len__(self) -> int:
         return len(self._features)
@@ -470,7 +521,9 @@ class DihedralObsBuffer:
 # Epoch-level I/O helpers
 # ---------------------------------------------------------------------------
 
-def load_epoch_dihedral_obs(epoch_dir) -> Tuple[np.ndarray, np.ndarray]:
+def load_epoch_dihedral_obs(
+    epoch_dir,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Load and concatenate all replica dihedral observations from an epoch.
 
     Parameters
@@ -484,6 +537,10 @@ def load_epoch_dihedral_obs(epoch_dir) -> Tuple[np.ndarray, np.ndarray]:
         Concatenated feature rows from all replicas.
     window_ids : np.ndarray, shape (n_samples,)
         Corresponding window assignments.
+    primary_cv : np.ndarray, shape (n_samples,)
+        Primary CV values per frame (NaN if not recorded — old obs files).
+    secondary_cv : np.ndarray, shape (n_samples,)
+        Secondary CV values per frame (NaN if inactive or not recorded).
 
     Raises
     ------
@@ -498,13 +555,25 @@ def load_epoch_dihedral_obs(epoch_dir) -> Tuple[np.ndarray, np.ndarray]:
         )
     feature_chunks: List[np.ndarray] = []
     window_chunks: List[np.ndarray] = []
+    primary_cv_chunks: List[np.ndarray] = []
+    secondary_cv_chunks: List[np.ndarray] = []
     for npz_path in npz_files:
         data = np.load(npz_path)
-        feature_chunks.append(data["features"])
+        feats = data["features"]
+        n = len(feats)
+        feature_chunks.append(feats)
         window_chunks.append(data["window"])
+        primary_cv_chunks.append(
+            data["primary_cv"] if "primary_cv" in data else np.full(n, np.nan)
+        )
+        secondary_cv_chunks.append(
+            data["secondary_cv"] if "secondary_cv" in data else np.full(n, np.nan)
+        )
     X = np.concatenate(feature_chunks, axis=0)
     window_ids = np.concatenate(window_chunks, axis=0)
-    return X, window_ids
+    primary_cv = np.concatenate(primary_cv_chunks, axis=0)
+    secondary_cv = np.concatenate(secondary_cv_chunks, axis=0)
+    return X, window_ids, primary_cv, secondary_cv
 
 
 def compute_tica_from_epoch_obs(
@@ -514,6 +583,7 @@ def compute_tica_from_epoch_obs(
     psi_torsion_indices: List[Tuple[int, int, int, int]],
     *,
     previous_result: Optional[TICAResult] = None,
+    weights: Optional[np.ndarray] = None,
 ) -> TICAResult:
     """Fit tICA from all dihedral observations in an epoch directory.
 
@@ -527,16 +597,20 @@ def compute_tica_from_epoch_obs(
     phi_torsion_indices, psi_torsion_indices : torsion atom-index lists
     previous_result : TICAResult, optional
         Used for sign-continuity check across epochs.
+    weights : np.ndarray, shape (n_samples,), optional
+        Importance weights per frame (e.g. MBAR weights).  When provided,
+        weighted covariance matrices are used; see :func:`compute_tica`.
 
     Returns
     -------
     TICAResult
     """
-    X, _ = load_epoch_dihedral_obs(epoch_dir)
+    X, _, _, _ = load_epoch_dihedral_obs(epoch_dir)
     return compute_tica(
         X,
         lag_frames,
         phi_torsion_indices=phi_torsion_indices,
         psi_torsion_indices=psi_torsion_indices,
         previous_result=previous_result,
+        weights=weights,
     )

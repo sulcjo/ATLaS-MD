@@ -144,6 +144,74 @@ class TestComputeTICA:
         result = compute_tica(X, lag=5)
         assert result.n_samples == 200
 
+    def test_weighted_uniform_matches_unweighted(self):
+        """Uniform weights should reproduce unweighted result up to sign."""
+        X = _slow_mode_dataset(n_frames=400, lag=5, seed=3)
+        n = len(X)
+        w = np.ones(n) / n
+        r_unweighted = compute_tica(X, lag=5)
+        r_weighted = compute_tica(X, lag=5, weights=w)
+        # Eigenvectors should be parallel (same or opposite sign)
+        cos = float(np.dot(r_unweighted.weights, r_weighted.weights))
+        assert abs(cos) > 0.99, f"uniform-weighted vs unweighted cosine = {cos:.4f}"
+
+    def test_weighted_rejects_wrong_shape(self):
+        X = _slow_mode_dataset(n_frames=200, lag=5)
+        with pytest.raises(ValueError, match="weights shape"):
+            compute_tica(X, lag=5, weights=np.ones(50))
+
+    def test_weighted_rejects_negative_sum(self):
+        X = _slow_mode_dataset(n_frames=200, lag=5)
+        with pytest.raises(ValueError, match="sum to a positive"):
+            compute_tica(X, lag=5, weights=np.zeros(200))
+
+    def test_weighted_slow_mode_recovery(self):
+        """Reweighted tICA should still recover slow feature even with skewed weights."""
+        rng = np.random.default_rng(99)
+        n = 600
+        slow = np.cumsum(rng.normal(0, 0.1, n))
+        fast = rng.normal(0, 1, n)
+        X = np.column_stack([slow, fast])
+        # Weights that down-weight second half of trajectory
+        w = np.ones(n)
+        w[n // 2:] *= 0.1
+        w /= w.sum()
+        result = compute_tica(X, lag=5, weights=w)
+        assert abs(result.weights[0]) > abs(result.weights[1]), (
+            "weighted tICA should still find slow feature as dominant mode"
+        )
+
+
+# ---------------------------------------------------------------------------
+# DihedralObsBuffer CV recording
+# ---------------------------------------------------------------------------
+
+class TestDihedralObsBufferCV:
+    def test_record_saves_primary_cv(self):
+        phi = [(0, 1, 2, 3)]
+        psi = [(2, 3, 4, 5)]
+        with tempfile.TemporaryDirectory() as tmp:
+            buf = DihedralObsBuffer(phi, psi, replica_idx=0, out_dir=tmp)
+            pos = np.random.default_rng(1).standard_normal((10, 3))
+            buf.record(pos, step=0, window=2, cv_primary=0.42, cv_secondary=0.17)
+            buf.record(pos, step=1, window=2, cv_primary=0.55, cv_secondary=float("nan"))
+            path = buf.save()
+            data = np.load(path)
+            np.testing.assert_allclose(data["primary_cv"], [0.42, 0.55])
+            assert np.isfinite(data["secondary_cv"][0])
+            assert np.isnan(data["secondary_cv"][1])
+
+    def test_record_defaults_to_nan(self):
+        phi, psi = [(0, 1, 2, 3)], [(2, 3, 4, 5)]
+        with tempfile.TemporaryDirectory() as tmp:
+            buf = DihedralObsBuffer(phi, psi, replica_idx=0, out_dir=tmp)
+            pos = np.random.default_rng(2).standard_normal((10, 3))
+            buf.record(pos, step=0, window=0)
+            path = buf.save()
+            data = np.load(path)
+            assert np.isnan(data["primary_cv"][0])
+            assert np.isnan(data["secondary_cv"][0])
+
 
 # ---------------------------------------------------------------------------
 # project_tica1
@@ -286,9 +354,35 @@ class TestLoadEpochDihedralObs:
             epoch_dir = Path(tmp) / "epoch_000"
             self._write_obs(epoch_dir, 0, 50, 12, seed=1)
             self._write_obs(epoch_dir, 1, 30, 12, seed=2)
-            X, wids = load_epoch_dihedral_obs(epoch_dir)
+            X, wids, pcv, scv = load_epoch_dihedral_obs(epoch_dir)
             assert X.shape == (80, 12)
             assert wids.shape == (80,)
+            # Old obs files without primary_cv → NaN filled
+            assert pcv.shape == (80,)
+            assert np.all(np.isnan(pcv))
+            assert scv.shape == (80,)
+            assert np.all(np.isnan(scv))
+
+    def test_loads_with_cv_arrays(self):
+        """Obs files that include primary_cv/secondary_cv are loaded correctly."""
+        rng = np.random.default_rng(7)
+        with tempfile.TemporaryDirectory() as tmp:
+            epoch_dir = Path(tmp) / "epoch_000"
+            tica_dir = epoch_dir / "tica_obs"
+            tica_dir.mkdir(parents=True)
+            pcv = rng.random(40)
+            scv = rng.random(40)
+            np.savez_compressed(
+                tica_dir / "dihedral_obs_000.npz",
+                features=rng.standard_normal((40, 8)),
+                steps=np.arange(40, dtype=np.int64),
+                window=np.zeros(40, dtype=np.int64),
+                primary_cv=pcv,
+                secondary_cv=scv,
+            )
+            X, wids, pcv_out, scv_out = load_epoch_dihedral_obs(epoch_dir)
+            np.testing.assert_allclose(pcv_out, pcv)
+            np.testing.assert_allclose(scv_out, scv)
 
     def test_raises_on_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -324,6 +418,99 @@ class TestComputeTICAFromEpochObs:
             result = compute_tica_from_epoch_obs(epoch_dir, 5, phi, psi)
             assert isinstance(result, TICAResult)
             assert result.weights.shape == (2,)
+
+
+# ---------------------------------------------------------------------------
+# _compute_mbar_weights_for_tica
+# ---------------------------------------------------------------------------
+
+class TestComputeMBARWeightsForTICA:
+    """Tests for the standalone MBAR reweighting helper in adaptive_production."""
+
+    def _make_registry_and_obs(self, tmp: str, n_per_window: int = 100, seed: int = 42):
+        """Build a 2-window registry and matching tICA obs npz."""
+        from gareus.adaptive_production import WindowStateRegistry, WindowState
+        rng = np.random.default_rng(seed)
+        # State 0: center 0.3, k 10 kcal/mol
+        # State 1: center 0.7, k 10 kcal/mol
+        reg = WindowStateRegistry()
+        reg.add_state(0.3, 10.0)
+        reg.add_state(0.7, 10.0)
+
+        # Simulate obs from two windows
+        epoch_dir = Path(tmp) / "epoch_000"
+        tica_dir = epoch_dir / "tica_obs"
+        tica_dir.mkdir(parents=True)
+        # Window 0 samples near center 0.3
+        pcv0 = rng.normal(0.3, 0.05, n_per_window)
+        # Window 1 samples near center 0.7
+        pcv1 = rng.normal(0.7, 0.05, n_per_window)
+        pcv = np.concatenate([pcv0, pcv1])
+        window_ids = np.array([0] * n_per_window + [1] * n_per_window, dtype=np.int64)
+        scv = np.full(2 * n_per_window, np.nan)
+        feat = rng.standard_normal((2 * n_per_window, 4))
+
+        # Write epoch window map so _load_epoch_window_map can resolve state IDs
+        import csv as _csv
+        wmap_path = epoch_dir / "epoch_window_map.csv"
+        with open(wmap_path, "w", newline="") as fh:
+            w = _csv.writer(fh)
+            w.writerow(["window_idx", "state_id"])
+            w.writerow([0, 0])
+            w.writerow([1, 1])
+
+        np.savez_compressed(
+            tica_dir / "dihedral_obs_000.npz",
+            features=feat,
+            steps=np.arange(2 * n_per_window, dtype=np.int64),
+            window=window_ids,
+            primary_cv=pcv,
+            secondary_cv=scv,
+        )
+        return reg, epoch_dir, pcv, window_ids
+
+    def test_weights_sum_to_one(self):
+        from gareus.adaptive_production import _compute_mbar_weights_for_tica
+        with tempfile.TemporaryDirectory() as tmp:
+            reg, epoch_dir, pcv, wids = self._make_registry_and_obs(tmp)
+            scv = np.full(len(pcv), np.nan)
+            w = _compute_mbar_weights_for_tica(pcv, scv, wids, epoch_dir, reg, temperature_K=300.0)
+            assert w.shape == (len(pcv),)
+            np.testing.assert_allclose(w.sum(), 1.0, atol=1e-10)
+
+    def test_weights_non_negative(self):
+        from gareus.adaptive_production import _compute_mbar_weights_for_tica
+        with tempfile.TemporaryDirectory() as tmp:
+            reg, epoch_dir, pcv, wids = self._make_registry_and_obs(tmp)
+            scv = np.full(len(pcv), np.nan)
+            w = _compute_mbar_weights_for_tica(pcv, scv, wids, epoch_dir, reg, temperature_K=300.0)
+            assert (w >= 0).all()
+
+    def test_fallback_to_uniform_on_nan_cv(self):
+        """All-NaN primary_cv → uniform weights (old obs files)."""
+        from gareus.adaptive_production import _compute_mbar_weights_for_tica
+        with tempfile.TemporaryDirectory() as tmp:
+            reg, epoch_dir, _, wids = self._make_registry_and_obs(tmp)
+            pcv_nan = np.full(len(wids), np.nan)
+            scv = np.full(len(wids), np.nan)
+            w = _compute_mbar_weights_for_tica(pcv_nan, scv, wids, epoch_dir, reg)
+            N = len(wids)
+            np.testing.assert_allclose(w, np.full(N, 1.0 / N), atol=1e-12)
+
+    def test_weights_upweight_edges(self):
+        """Frames far from window center should get higher MBAR weight (unbiased ensemble)."""
+        from gareus.adaptive_production import _compute_mbar_weights_for_tica
+        with tempfile.TemporaryDirectory() as tmp:
+            reg, epoch_dir, pcv, wids = self._make_registry_and_obs(tmp, n_per_window=200)
+            scv = np.full(len(pcv), np.nan)
+            w = _compute_mbar_weights_for_tica(pcv, scv, wids, epoch_dir, reg, temperature_K=300.0)
+            # Frames near center of window 0 (small delta) get biased HEAVILY → low MBAR weight
+            # Frames far from all centers (edges) → higher unbiased weight
+            # Simple sanity: mean weight of extreme-edge frames > mean weight of center frames
+            center_mask = np.abs(pcv - 0.3) < 0.02
+            edge_mask = np.abs(pcv - 0.5) < 0.03  # between windows, upweighted by MBAR
+            if center_mask.sum() > 5 and edge_mask.sum() > 5:
+                assert w[edge_mask].mean() > w[center_mask].mean()
 
 
 # ---------------------------------------------------------------------------

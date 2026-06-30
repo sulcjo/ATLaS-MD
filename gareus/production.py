@@ -3601,7 +3601,11 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                         w = int(assignments[r])
                         _pos_state = sim.context.getState(getPositions=True, enforcePeriodicBox=True)
                         _pos_nm = _pos_state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
-                        _dihedral_buffers[r].record(_pos_nm, int(step), w)
+                        _dihedral_buffers[r].record(
+                            _pos_nm, int(step), w,
+                            cv_primary=float(primary_values[r]),
+                            cv_secondary=float(ss_values[r]),
+                        )
             # ──────────────────────────────────────────────────────────────────────
 
             return rows
