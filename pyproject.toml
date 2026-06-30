@@ -52,7 +52,7 @@ gareus-test-run = "gareus.integration_test:main"
 gareus-suggest-cvs = "gareus.cv_discovery:main"
 
 [tool.setuptools]
-py-modules = ["gareus_peptide", "GENPEPT"]
+py-modules = ["gareus_peptide", "GENPEPT", "config_profiles"]
 
 [tool.setuptools.packages.find]
 where = ["."]

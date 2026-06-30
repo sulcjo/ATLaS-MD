@@ -92,6 +92,8 @@ Common flags
     --seq SEQUENCE                      One-letter peptide sequence. Required for runs.
     --out DIR                           Output directory.
     --config FILE                       YAML/JSON config; CLI flags override config values.
+    --profile NAME                      Named bundle of boilerplate config keys (config_profiles.py),
+                                        shared with GENPEPT.py. Explicit YAML/CLI keys override it.
     --write-config-template [FILE]      Write a starter YAML config and exit.
     --resume                            Resume from checkpoints or setup states under --out.
     --seed INT                          Random seed.

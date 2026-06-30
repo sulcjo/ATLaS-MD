@@ -32,6 +32,8 @@ from typing import Iterable, Optional, Tuple, Dict, Any, List
 
 from .io import _json_ready  # type: ignore
 
+import config_profiles
+
 __all__ = [
     "CONFIG_SCHEMA_VERSION",
     "CONFIG_IGNORED_TOP_LEVEL_KEYS",
@@ -187,6 +189,7 @@ def _load_config_file(path: Path) -> dict:
                 f"Config file {path} looks like YAML, but PyYAML is not installed. "
                 "Install pyyaml or use a .json config."
             )
+        config_profiles.assert_no_duplicate_keys(text, path)
         data = yaml_mod.safe_load(text)
     if data is None:
         return {}
@@ -236,15 +239,22 @@ def _build_known_config_dests(parser: argparse.ArgumentParser) -> set[str]:
     return {str(a.dest) for a in parser._actions if getattr(a, "dest", None) and a.dest != argparse.SUPPRESS}
 
 
-def _apply_config_defaults_to_parser(parser: argparse.ArgumentParser, config_path: Optional[str]) -> dict:
+def _apply_config_defaults_to_parser(
+    parser: argparse.ArgumentParser,
+    config_path: Optional[str],
+    cli_profile: Optional[str] = None,
+) -> dict:
     """Load a config file and apply its defaults to an argparse parser.
 
     Unknown keys raise a ValueError.  Returns a dictionary with keys
     ``config_path``, ``config_values`` and ``unknown_keys``.
+
+    `cli_profile` is the pre-parsed value of a bare ``--profile NAME`` flag,
+    which must keep working even when no ``--config`` file is given at all.
     """
-    if not config_path:
+    if not config_path and not cli_profile:
         return {"config_path": None, "config_values": {}, "unknown_keys": []}
-    raw = _load_config_file(Path(config_path))
+    raw: dict = _load_config_file(Path(config_path)) if config_path else {}
     # Effective configs written by this script contain metadata plus an ``args``
     # block.  Treat that block as the actual input config so resume_command.sh can
     # point at config/effective_config.yaml directly.
@@ -257,12 +267,27 @@ def _apply_config_defaults_to_parser(parser: argparse.ArgumentParser, config_pat
             ". Use argparse destination names such as 'gamd_production_steps', "
             "or run --write-config-template to generate a reference file."
         )
-    parser.set_defaults(**flat)
+    # A bare CLI --profile overrides whatever the file's own `profile:` key says.
+    profile_name = cli_profile or flat.get("profile")
+    merged = config_profiles.merge_profile(config_profiles.GAREUS_PROFILES, flat, profile_name, tool="gareus")
+    # Forward-only fix for the cross-peptide seed-contamination bug: a minimal
+    # profile-based config doesn't need to copy-paste seed_conformers_dir, it
+    # can be derived from GENPEPT's own output directory in the same YAML.
+    if not merged.get("seed_conformers_dir") and isinstance(raw, dict):
+        for block_key in ("genpept", "conformer_generation", "seed_generation"):
+            block = raw.get(block_key)
+            if isinstance(block, dict) and block.get("out"):
+                derived = Path(str(block["out"]))
+                if not derived.is_absolute() and config_path is not None:
+                    derived = (Path(config_path).parent.resolve() / derived).resolve()
+                merged["seed_conformers_dir"] = str(derived)
+                break
+    parser.set_defaults(**merged)
     # Required CLI args, especially --seq, can be satisfied by config defaults.
     for action in parser._actions:
-        if getattr(action, "dest", None) in flat:
+        if getattr(action, "dest", None) in merged:
             action.required = False
-    return {"config_path": str(config_path), "config_values": flat, "unknown_keys": []}
+    return {"config_path": str(config_path) if config_path else None, "config_values": merged, "unknown_keys": []}
 
 
 # -----------------------------------------------------------------------------
@@ -293,6 +318,11 @@ def _script_sha256() -> str:
 def _effective_config_payload(args: Any, argv: Optional[Iterable[str]] = None) -> Dict[str, Any]:
     """Return a reproducibility payload describing the script, config and args."""
     arg_list = _argv_as_list(argv)
+    # Compat shims (_apply_v2_compat_shims) inject ~200 derived attrs onto args
+    # that aren't real argparse dests; they're lossless to recompute on every
+    # run, so they're excluded here. Without this filter, the loader's own
+    # unknown-key check rejects them on `--config effective_config.yaml --resume`.
+    known_dests = getattr(args, "_known_dests", None)
     return {
         "schema_version": CONFIG_SCHEMA_VERSION,
         "generated_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -308,7 +338,10 @@ def _effective_config_payload(args: Any, argv: Optional[Iterable[str]] = None) -
             "config": getattr(args, "config", None),
             "config_values": getattr(args, "_config_values", {}),
         },
-        "args": {k: v for k, v in vars(args).items() if not str(k).startswith("_")},
+        "args": {
+            k: v for k, v in vars(args).items()
+            if not str(k).startswith("_") and (known_dests is None or k in known_dests)
+        },
     }
 
 

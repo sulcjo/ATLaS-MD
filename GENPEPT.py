@@ -75,6 +75,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
 
+import config_profiles
+
 # Avoid accidental thread oversubscription when many Python/OpenMM worker
 # processes are launched. Users can still override these in the shell.
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -98,6 +100,7 @@ def _load_yaml_or_json_config(path: Path) -> dict:
                 f"Config file {path} looks like YAML, but PyYAML is not installed. "
                 "Install pyyaml or use a JSON config."
             ) from exc
+        config_profiles.assert_no_duplicate_keys(text, path)
         data = yaml.safe_load(text)
     if data is None:
         return {}
@@ -116,6 +119,9 @@ GAREUS_FRIENDLY_TOP_LEVEL_BLOCKS = {
     "starting_structures", "output", "platform", "simulation", "windows",
     "gamd", "exchange", "tui", "analysis", "restraints", "pulling",
     "umbrella", "reus", "hmr", "solvent", "system", "files",
+    # Shared cross-tool key (config_profiles.py); read directly below rather
+    # than swept into GENPEPT's legacy-top-level-filtered flatten body.
+    "profile",
 }
 
 _CONFIG_COMPAT_MESSAGES: list[str] = []
@@ -197,6 +203,10 @@ def _apply_gareus_friendly_hints(flat: dict, raw: dict) -> list[dict]:
         _set_if_missing(flat, "seq", seq_block.get("seq") or seq_block.get("sequence") or seq_block.get("peptide_sequence"), "sequence.seq", inherited)
     elif isinstance(seq_block, str):
         _set_if_missing(flat, "seq", seq_block, "sequence", inherited)
+    elif isinstance(raw.get("seq"), str):
+        # Minimal profile-based configs write one bare top-level `seq:`
+        # shared by both tools instead of duplicating it under `sequence:`.
+        _set_if_missing(flat, "seq", raw.get("seq"), "seq", inherited)
 
     start_block = raw.get("starting_structures")
     if isinstance(start_block, dict):
@@ -223,14 +233,19 @@ def _apply_gareus_friendly_hints(flat: dict, raw: dict) -> list[dict]:
 
     return inherited
 
-def _genpept_config_defaults(config_path, parser: argparse.ArgumentParser, strict: bool = False) -> tuple[dict, list[str]]:
+def _genpept_config_defaults(
+    config_path,
+    parser: argparse.ArgumentParser,
+    strict: bool = False,
+    cli_profile: Optional[str] = None,
+) -> tuple[dict, list[str]]:
     global _CONFIG_COMPAT_MESSAGES, _CONFIG_COMPAT_REPORT
     _CONFIG_COMPAT_MESSAGES = []
     _CONFIG_COMPAT_REPORT = {}
-    if not config_path:
+    if not config_path and not cli_profile:
         return {}, []
 
-    raw = _load_yaml_or_json_config(Path(config_path))
+    raw = _load_yaml_or_json_config(Path(config_path)) if config_path else {}
     known_dests = {str(a.dest) for a in parser._actions if getattr(a, "dest", None) and a.dest != argparse.SUPPRESS}
 
     selected_block_name = None
@@ -276,6 +291,13 @@ def _genpept_config_defaults(config_path, parser: argparse.ArgumentParser, stric
             "Inherited missing GENPEPT defaults from combined YAML: "
             + ", ".join(f"{x['dest']}<-{x['source']}" for x in inherited)
         )
+
+    # `profile:` is a shared top-level key (config_profiles.py), read directly
+    # from `raw` since it sits alongside the genpept:/conformer_generation:
+    # block rather than inside it. A bare CLI --profile overrides the file's
+    # own key; explicit keys in `flat` always win over either.
+    profile_name = cli_profile or raw.get("profile")
+    flat = config_profiles.merge_profile(config_profiles.GENPEPT_PROFILES, flat, profile_name, tool="genpept")
 
     _config_parent = Path(config_path).parent.resolve() if config_path else None
     for dest in list(flat):
@@ -7098,12 +7120,16 @@ def parse_args(argv=None):
     argv_list = list(sys.argv[1:] if argv is None else argv)
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--config", default=None)
+    pre.add_argument("--profile", default=None)
     pre.add_argument("--strict-config", action="store_true")
     pre_args, _ = pre.parse_known_args(argv_list)
 
     p = argparse.ArgumentParser(description="Fast Ramachandran + implicit basin-hopping peptide seed workflow.")
 
     p.add_argument("--config", default=None, help="YAML/JSON config file. In combined workflow YAMLs, GENPEPT reads the top-level conformer_generation/genpept/seed_generation block and ignores GAREUS blocks.")
+    p.add_argument("--profile", default=None,
+                   help="Named bundle of boilerplate config keys, shared with GAREUS (see config_profiles.py). "
+                        "Explicit YAML/CLI keys override anything from the profile.")
     p.add_argument("--strict-config", action="store_true", help="Treat unknown keys inside the GENPEPT config block as fatal. Default is friendly/warn-only for combined GaREUS YAMLs.")
     p.add_argument("--seq", default=None)
     p.add_argument("--out", default=None, type=Path)
@@ -7355,7 +7381,9 @@ def parse_args(argv=None):
     p.add_argument("--sirah-clusters-sel-name", default="SIRAH_SEEDS_SEL",
                    help="Name of the root-level file listing successfully prepared compact seed names. Default: SIRAH_SEEDS_SEL.")
 
-    config_defaults, config_unknown = _genpept_config_defaults(pre_args.config, p, strict=bool(getattr(pre_args, "strict_config", False)))
+    config_defaults, config_unknown = _genpept_config_defaults(
+        pre_args.config, p, strict=bool(getattr(pre_args, "strict_config", False)), cli_profile=pre_args.profile
+    )
     if config_unknown:
         preview = ", ".join(config_unknown[:20])
         more = "" if len(config_unknown) <= 20 else f" ... and {len(config_unknown) - 20} more"

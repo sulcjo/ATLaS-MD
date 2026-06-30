@@ -19,6 +19,7 @@ from .colors import configure_color
 from .config import (
     _argv_as_list,
     _apply_config_defaults_to_parser,
+    _build_known_config_dests,
     _write_config_template,
     _write_reproducibility_files,
 )
@@ -43,6 +44,9 @@ def _add_core_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("-h", "--help", action=SimpleHelpAction)
     p.add_argument("-hh", "--help-heavy", action=HeavyHelpAction)
     p.add_argument("--config", default=None, help="YAML/JSON config file.")
+    p.add_argument("--profile", default=None,
+                   help="Named bundle of boilerplate config keys (see config_profiles.py). "
+                        "Explicit YAML/CLI keys override anything from the profile.")
     p.add_argument("--write-config-template", nargs="?", const="gareus_template.yaml", default=None)
     p.add_argument("--write-effective-config", action="store_true")
     p.add_argument("--seq", required=True, help="One-letter peptide sequence.")
@@ -972,6 +976,7 @@ def parse_args(argv: Optional[Iterable[str]] = None):
 
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--config", default=None)
+    pre.add_argument("--profile", default=None)
     pre.add_argument("--write-config-template", nargs="?", const="gareus_template.yaml",
                      default=None)
     pre_args, _ = pre.parse_known_args(argv_list)
@@ -999,9 +1004,10 @@ def parse_args(argv: Optional[Iterable[str]] = None):
         print(f"Wrote config template: {pre_args.write_config_template}")
         raise SystemExit(0)
 
-    config_info = _apply_config_defaults_to_parser(p, pre_args.config)
+    config_info = _apply_config_defaults_to_parser(p, pre_args.config, cli_profile=pre_args.profile)
     args = p.parse_args(argv_list)
     args._config_values = config_info.get("config_values", {})
+    args._known_dests = _build_known_config_dests(p)
 
     _resolve_cv_aliases(args, argv_list)
     _normalize_run_mode(args, argv_list)
