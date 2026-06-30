@@ -116,6 +116,14 @@ Common flags
     --md-budget-ns NS                   Aggregate adaptive-production MD pool over all states/replicas.
     --ap-epochs N                       Maximum adaptive-production epochs before frozen final.
     --ap-final-pool-fraction F          Fraction of the runtime pool reserved for frozen final production.
+
+    # Inter-epoch tICA secondary-CV update (all off by default):
+    --tica-obs-interval N               Record backbone dihedral features every N samples (0=off).
+    --tica-lag-frames N                 Lag tau for tIC1 generalised eigenvalue problem (default 50).
+    --tica-epochs-per-cycle N           Auto-refit tICA every N completed epochs (0=off; OR with --tica-update-after-epochs).
+    --tica-update-after-epochs E ...    Explicit epoch list for tICA refit, e.g. 2 5 8.
+    --tica-min-eigenvalue V             Skip refit if tIC1 eigenvalue below V (default 0.0=always update).
+
     --traj-format FORMAT                dcd, xtc, or none.
     --no-sample-potential-energy        Skip live total-PE diagnostics.
 
@@ -186,6 +194,31 @@ Post-hoc analysis
     samples = load_samples(run_dir)           # dict of numpy arrays
     windows = load_windows(run_dir)           # list of window dicts
     nk = reconstruct_bias_matrix(samples['cv1'], samples['cv2'], windows, beta)
+
+Inter-epoch tICA secondary-CV update (YAML)
+--------------------------------------------
+tICA fits the slowest backbone-dihedral mode from accumulated epoch observations
+and re-centers umbrella windows in that coordinate after each cycle.  CV2-type
+agnostic: works with rama-map, contacts, tica-linear, or any other secondary CV.
+
+YAML block (add under top-level section named "tica:", all keys are optional):
+
+    tica:
+      tica_obs_interval: 50        # record dihedral features every N samples; >0 to enable
+      tica_lag_frames: 50          # lag tau (frames) for tIC1; increase for slower modes
+      tica_epochs_per_cycle: 3     # refit every 3 completed epochs (recommended >= 3;
+                                   # N=1 means each refit excludes all prior epochs from
+                                   # MBAR pooling because tica_cv_version bumps every cycle)
+      tica_min_eigenvalue: 0.0     # skip refit if tIC1 eigenvalue below threshold
+
+    # OR use an explicit epoch list instead of (or in addition to) the cycle:
+    tica:
+      tica_obs_interval: 50
+      tica_update_after_epochs: [2, 5, 8]
+
+The tica: section name is cosmetic.  The config loader flattens any nested dict
+so you may put the tica_* keys in any section (cvs:, windows:, etc.).
+The tica_state_file key is managed automatically; leave it empty or absent.
 
 Use -hh for the method encyclopedia, equations, design notes, and the complete flag list.
 """
@@ -1309,6 +1342,88 @@ Non-exception pairs use the particle charges and Lorentz-Berthelot mixing.
 The diagnostic intentionally does not claim an exact PME reciprocal-space pair
 decomposition.  Use `--write-total-forcefield-energy` when an exact whole-system
 unbiased OpenMM potential-energy scalar is needed alongside the pair diagnostics.
+
+17. Inter-epoch tICA secondary-CV update
+-----------------------------------------
+After each completed adaptive epoch the package can optionally refit the slowest
+backbone-dihedral mode via time-lagged Independent Component Analysis (tICA) and
+update the secondary_center for every active umbrella window.  This is an
+inter-epoch operation: it does not change CV2 type or the bias force; it
+recalibrates where each window's harmonic potential is centered so that the
+umbrella biases track the true data-density of the tIC1 coordinate.
+
+Algorithm
+~~~~~~~~~
+1. During production, backbone (phi, psi) dihedral angles are recorded every
+   tica_obs_interval samples into epoch_dir/tica_obs/dihedral_obs_*.npz.
+
+2. At the end of each trigger epoch the package solves the generalized eigenvalue
+   problem for the time-lagged covariance matrices C(tau) and C(0):
+
+       C(tau) v = lambda C(0) v
+
+   using scipy.linalg.eigh with a Cholesky-based numpy fallback.  The leading
+   eigenvector v_1 (largest eigenvalue lambda_1) defines the tIC1 projection.
+
+3. Sign continuity is enforced against the previous model:
+   if dot(v_1_new, v_1_prev) < 0 then v_1_new = -v_1_new.
+
+4. Per-window tIC1 medians are computed from the epoch's observations.
+
+5. state.secondary_center is updated in the registry for each active window.
+
+6. The next-epoch window CSV is re-written with the updated centers, so the new
+   umbrella positions take effect at the start of the following epoch.
+
+7. The tICA model is versioned (tica_cv_version).  The cross-epoch MBAR guard
+   excludes any epoch whose version differs from the current model, preventing
+   incoherent bias matrices when the coordinate has changed.
+
+CV2-type agnosticism
+~~~~~~~~~~~~~~~~~~~~
+The center update is agnostic to the secondary CV type.  If CV2 = tica-linear,
+the updated center is directly the per-window tIC1 median.  For other CV2 types
+(rama-map, contacts, etc.) the tICA model is fitted for information/diagnostics
+but secondary_center still holds a value in the original CV2 coordinate; the
+update reflects where the data landed in CV2 space, not tIC1 space.
+
+Trigger modes
+~~~~~~~~~~~~~
+The refit fires when either (or both) of the following conditions is true AND
+tica_obs_interval > 0:
+
+  a) epoch is in tica_update_after_epochs (explicit list, 0-indexed)
+  b) (epoch + 1) % tica_epochs_per_cycle == 0  (periodic cycle, >=1)
+
+Both conditions act as an OR union; set one or both.  If neither is set the
+refit is disabled even when observation collection is active.
+
+MBAR guard and cycle-length choice
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Each refit bumps tica_cv_version.  The MBAR guard then excludes all prior-version
+epochs from cross-epoch MBAR pooling.  With tica_epochs_per_cycle = 1 every epoch
+is a new version, so the MBAR pool is always just the current epoch.
+
+Recommended cycle lengths:
+
+    tica_epochs_per_cycle: 1   only if each epoch is already sufficient for MBAR
+    tica_epochs_per_cycle: 3   practical default; pools 3 epochs before refit
+    tica_epochs_per_cycle: 5   more data per refit; slower adaptation
+
+YAML configuration
+~~~~~~~~~~~~~~~~~~
+    tica:
+      tica_obs_interval: 50        # >0 required to enable; typically 50-200
+      tica_lag_frames: 50          # lag tau; increase for slow folding peptides
+      tica_epochs_per_cycle: 3     # recommended >= 3 for MBAR pooling
+      tica_min_eigenvalue: 0.0     # skip refits with poor slow-mode separation
+      # tica_update_after_epochs: [2, 5, 8]   # alternative: explicit epoch list
+      # tica_state_file: ""                   # managed automatically; omit
+
+The tica: section name is cosmetic.  _flatten_config_mapping descends any nested
+dict, so tica_* keys may appear under any section heading.  tica_state_file is
+written by the adaptive loop; starting from a previous model requires setting it
+explicitly to the path of the saved TICAResult JSON.
 """
 
 
