@@ -3774,6 +3774,23 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             current_windows_csv = adaptive_dir / "resume_active_windows.csv"
             registry.write_active_window_csv(current_windows_csv, map_path=adaptive_dir / f"window_map_epoch_{start_epoch:03d}.csv")
         print(f"    Adaptive-production resume: loaded {len(registry.all_states())} states; continuing at epoch {start_epoch}.")
+        # Restore tICA state from the most recent successful refit so the resumed
+        # run inherits the correct model weights and MBAR cross-epoch guard version.
+        _latest_tica = None
+        for _es in reversed(epoch_summaries):
+            _tu = _es.get("tica_update") or {}
+            if _tu.get("status") == "updated" and _tu.get("state_file") and _tu.get("version"):
+                _latest_tica = _tu
+                break
+        if _latest_tica is not None:
+            _sf = str(_latest_tica["state_file"])
+            _ver = str(_latest_tica["version"])
+            if Path(_sf).exists():
+                args.tica_state_file = _sf
+                args.tica_cv_version = _ver
+                print(f"    tICA resume: restored model {_sf} (version {_ver})")
+            else:
+                print(f"    tICA resume: WARNING: prior tICA state file {_sf} not found; starting fresh")
         context_reuse_readiness = evaluate_context_reuse_readiness(args, adaptive_dir, registry=registry)
 
     # Warn when tica_epochs_per_cycle is set but observation collection is disabled:

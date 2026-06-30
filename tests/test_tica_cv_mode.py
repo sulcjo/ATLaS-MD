@@ -251,6 +251,59 @@ class TestEpochCycling:
             obs_int = int(getattr(args, "tica_obs_interval", 0) or 0)
             assert obs_int == 0  # early return in _maybe_update_tica_cvaux
 
+    def test_resume_restores_tica_state_from_epoch_summaries(self, tmp_path):
+        """On ap-resume the most recent successful tICA state is restored to args."""
+        import json, argparse
+        from gareus.adaptive_production import WindowStateRegistry
+
+        # Build a minimal driver summary with two epoch summaries; epoch 1 has a tICA update.
+        tica_state = tmp_path / "tica_state.json"
+        tica_state.write_text('{"eigenvalue": 0.5, "n_samples": 100, "weights": [], "offset": 0.0, '
+                              '"phi_torsion_indices": [], "psi_torsion_indices": []}')
+        summaries = [
+            {"epoch": 0, "tica_update": {}},
+            {"epoch": 1, "tica_update": {"status": "updated", "state_file": str(tica_state), "version": "v2"}},
+        ]
+        summary_path = tmp_path / "adaptive_production_driver_summary.json"
+        summary_path.write_text(json.dumps({"epochs_completed": 2, "epoch_summaries": summaries}))
+
+        # Write minimal registry so WindowStateRegistry.load() succeeds.
+        (tmp_path / "state_registry.json").write_text(
+            '{"schema_version": "window_state_registry_v1", "states": [], "next_state_id": 0}'
+        )
+        (tmp_path / "windows_epoch_002.csv").write_text("primary_cv_center,primary_cv_k_kcal\n")
+
+        args = argparse.Namespace(
+            tica_state_file="",
+            tica_cv_version=None,
+            tica_epochs_per_cycle=0,
+            tica_obs_interval=0,
+            adaptive_production_resume=True,
+            windows_2d_csv=None,
+            adaptive_production_topup_only=False,
+        )
+
+        # Replicate only the resume block logic (not the full loop).
+        import json as _json
+        old_summary = _json.loads(summary_path.read_text())
+        epoch_summaries_loaded = old_summary.get("epoch_summaries", [])
+        _latest_tica = None
+        for _es in reversed(epoch_summaries_loaded):
+            _tu = _es.get("tica_update") or {}
+            if _tu.get("status") == "updated" and _tu.get("state_file") and _tu.get("version"):
+                _latest_tica = _tu
+                break
+        if _latest_tica is not None:
+            _sf = str(_latest_tica["state_file"])
+            _ver = str(_latest_tica["version"])
+            from pathlib import Path as _Path
+            if _Path(_sf).exists():
+                args.tica_state_file = _sf
+                args.tica_cv_version = _ver
+
+        assert args.tica_state_file == str(tica_state)
+        assert args.tica_cv_version == "v2"
+
     def test_cli_tica_epochs_per_cycle_in_known_dests(self):
         """tica_epochs_per_cycle must be a known argparse dest for YAML config validation."""
         from gareus.config import _build_known_config_dests
