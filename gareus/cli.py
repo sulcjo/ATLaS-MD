@@ -100,7 +100,7 @@ def _add_cv_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--contact-scheme", choices=["atom-pairs", "residue-balanced", "ca-pairs"],
                    default="atom-pairs")
     p.add_argument("--contact-atom-selection",
-                   choices=["heavy", "ca", "backbone-heavy", "sidechain-heavy", "all"],
+                   choices=["heavy", "ca", "backbone-heavy", "sidechain-heavy", "sidechain-all", "all"],
                    default="heavy")
     p.add_argument("--contact-min-sequence-separation", type=int, default=4)
     p.add_argument("--contact-r0-a", type=float, default=4.5,

@@ -625,11 +625,16 @@ def contact_scheme(args_or_scheme) -> str:
     return aliases.get(scheme, scheme)
 
 
+_BACKBONE_HEAVY_ATOM_NAMES = {"N", "CA", "C", "O", "OXT"}
+_BACKBONE_HYDROGEN_ATOM_NAMES = {"H", "H1", "H2", "H3", "HA", "HA2", "HA3"}
+
+
 def contact_atom_allowed(atom, mode: str) -> bool:
     """Return True if an atom is eligible for nonlocal contacts under the selection mode.
 
-    ``mode`` may be ``all``, ``heavy``, ``ca``, ``backbone-heavy``, or
-    ``sidechain-heavy``.  In all cases the atom must belong to the peptide.
+    ``mode`` may be ``all``, ``heavy``, ``ca``, ``backbone-heavy``,
+    ``sidechain-heavy``, or ``sidechain-all``.  In all cases the atom must
+    belong to the peptide.
     """
     mode = str(mode or "heavy").strip().lower().replace("_", "-")
     name = str(getattr(atom, "name", ""))
@@ -642,7 +647,9 @@ def contact_atom_allowed(atom, mode: str) -> bool:
     if mode == "backbone-heavy":
         return name in {"N", "CA", "C", "O"}
     if mode == "sidechain-heavy":
-        return (not _atom_is_hydrogen(atom)) and name not in {"N", "CA", "C", "O", "OXT"}
+        return (not _atom_is_hydrogen(atom)) and name not in _BACKBONE_HEAVY_ATOM_NAMES
+    if mode == "sidechain-all":
+        return name not in _BACKBONE_HEAVY_ATOM_NAMES and name not in _BACKBONE_HYDROGEN_ATOM_NAMES
     raise ValueError(f"Unsupported --contact-atom-selection {mode!r}")
 
 

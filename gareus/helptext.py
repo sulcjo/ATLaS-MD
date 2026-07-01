@@ -103,6 +103,7 @@ Common flags
                                         delaunay-feedback: KDE basin anchors + Delaunay triangulation on pilot samples,
                                         iterates each round until stable; add --delaunay-coverage-scaffold to fill gaps.
     --cv1 MODE                          Primary CV: distance or contacts.
+    --contact-atom-selection MODE       heavy, ca, backbone-heavy, sidechain-heavy, sidechain-all, or all.
     --cv2 MODE                          Secondary CV; non-none auto-enables 2D centers.
     --cv2-centers C ...                 Override auto 2D centers (e.g. -0.8 0.0 0.8).
     --windows-a A ...                   Manual distance centers in Angstrom (--window-mode manual).
@@ -908,7 +909,7 @@ Nonlocal-contact CV:
 Relevant controls:
     --cv1 contacts
     --contact-scheme atom-pairs | residue-balanced | ca-pairs
-    --contact-atom-selection heavy | ca | backbone-heavy | sidechain-heavy | all
+    --contact-atom-selection heavy | ca | backbone-heavy | sidechain-heavy | sidechain-all | all
     --contact-min-sequence-separation N
     --contact-r0-a A
     --contact-beta-a-inv B
