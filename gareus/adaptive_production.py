@@ -239,6 +239,8 @@ class StateDiagnostics:
     secondary_std: Optional[float] = None
     gamd_boost_sd_kcal_mol: Optional[float] = None
     gamd_ess_fraction_proxy: Optional[float] = None
+    primary_target_deviation_sigma: Optional[float] = None
+    secondary_target_deviation_sigma: Optional[float] = None
     warnings: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -316,6 +318,11 @@ class AdaptiveDecisionPolicy:
     context_reuse_mode: str = "off"
     redundant_overlap: float = 0.45
     min_active_states: int = 8
+    # A state's achieved cv_mean deviating this many of its own sample std-devs
+    # from its nominal target center means the window failed to reach target
+    # (e.g. blocked by a secondary-CV-coupled physical barrier), not just
+    # normal thermal wobble around the restraint minimum.
+    max_target_deviation_sigma: float = 3.0
 
 
 class WindowStateRegistry:
@@ -1275,6 +1282,80 @@ def _positive_scale(values: np.ndarray) -> float:
     return float(np.median(diffs)) if diffs.size else 1.0
 
 
+def _target_deviation_sigma(
+    mean: Optional[float], std: Optional[float], target: Optional[float], min_abs_deviation: float = 1.0e-3
+) -> Optional[float]:
+    """How many of a state's own achieved sample std-devs its mean sits from
+    its nominal restraint target. Using the state's own std as the scale (not
+    an external kT/k estimate) keeps this CV-agnostic (contacts, distance,
+    rama, ...).  A window that failed to reach its target due to a physical
+    barrier typically also has an artificially small std (pinned near the
+    barrier), which makes the deviation large in sigma units even when the
+    raw offset looks modest.  Returns None when mean/target are unavailable.
+    """
+    if mean is None or target is None:
+        return None
+    deviation = abs(float(mean) - float(target))
+    if deviation < float(min_abs_deviation):
+        return 0.0
+    scale = float(std) if std is not None and math.isfinite(float(std)) else 0.0
+    return deviation / max(scale, 1.0e-9)
+
+
+def _non_neighbor_redundant_pairs(
+    registry: WindowStateRegistry,
+    window_map: Dict[int, int],
+    by_window_values: Dict[int, np.ndarray],
+    geometry_edges: List[Tuple[int, int, str, Optional[float]]],
+    policy: AdaptiveDecisionPolicy,
+) -> List[Dict[str, Any]]:
+    """Flag active state pairs with high ACHIEVED-sample overlap that are not
+    already nominal geometry neighbors.
+
+    ``build_geometry_edges`` only wires up nominal near-neighbors (sorted
+    primary chain plus one nearest-2D neighbor per state), so a window that
+    failed to reach its target and drifted onto a distant window's basin
+    (e.g. blocked by a secondary-CV-coupled physical barrier) is invisible to
+    the normal weak/redundant-edge machinery -- its geometry neighbors are
+    still distinct real states, so its edges look fine, while its true
+    duplicate sits several rungs away and is never compared.
+    """
+    active_ids = sorted(registry.active_state_ids())
+    if len(active_ids) < 2:
+        return []
+    existing_pairs = {tuple(sorted((int(a), int(b)))) for a, b, _et, _nd in geometry_edges}
+    state_to_window = {sid: w for w, sid in window_map.items() if sid in active_ids}
+    alerts: List[Dict[str, Any]] = []
+    for idx_i in range(len(active_ids)):
+        for idx_j in range(idx_i + 1, len(active_ids)):
+            si, sj = active_ids[idx_i], active_ids[idx_j]
+            key = (si, sj)
+            if key in existing_pairs:
+                continue
+            wi = state_to_window.get(si)
+            wj = state_to_window.get(sj)
+            if wi is None or wj is None:
+                continue
+            overlap = _hist_overlap(by_window_values.get(wi, np.asarray([])), by_window_values.get(wj, np.asarray([])))
+            if overlap is None or overlap < float(policy.redundant_overlap):
+                continue
+            st_i = registry.get_state(si)
+            st_j = registry.get_state(sj)
+            alerts.append(
+                {
+                    "state_i": int(si),
+                    "state_j": int(sj),
+                    "window_i": int(wi),
+                    "window_j": int(wj),
+                    "overlap": float(overlap),
+                    "primary_center_i": None if st_i is None else float(st_i.primary_center),
+                    "primary_center_j": None if st_j is None else float(st_j.primary_center),
+                }
+            )
+    alerts.sort(key=lambda a: -float(a["overlap"]))
+    return alerts
+
+
 def collect_epoch_diagnostics(epoch_dir: Path, registry: WindowStateRegistry, policy: Optional[AdaptiveDecisionPolicy] = None) -> Dict[str, Any]:
     """Collect simple per-state and per-edge diagnostics from one epoch output."""
     epoch_dir = Path(epoch_dir)
@@ -1321,6 +1402,18 @@ def collect_epoch_diagnostics(epoch_dir: Path, registry: WindowStateRegistry, po
             diag.warnings.append("low_sample_count")
         if bstd is not None and bstd > float(policy.max_gamd_boost_sd_kcal_mol):
             diag.warnings.append("high_gamd_boost_sd")
+        if len(rows) >= int(policy.min_samples_for_add):
+            state_obj = registry.get_state(int(state_id))
+            if state_obj is not None:
+                dev_sigma = _target_deviation_sigma(cv_mean, cv_std, state_obj.primary_center)
+                diag.primary_target_deviation_sigma = dev_sigma
+                if dev_sigma is not None and dev_sigma >= float(policy.max_target_deviation_sigma):
+                    diag.warnings.append("off_target_primary")
+                if state_obj.secondary_center is not None:
+                    sec_dev_sigma = _target_deviation_sigma(smean, sstd, state_obj.secondary_center)
+                    diag.secondary_target_deviation_sigma = sec_dev_sigma
+                    if sec_dev_sigma is not None and sec_dev_sigma >= float(policy.max_target_deviation_sigma):
+                        diag.warnings.append("off_target_secondary")
         state_rows.append(diag)
         state_by_id[int(state_id)] = diag
         by_window_values[int(epoch_window)] = cv
@@ -1343,8 +1436,9 @@ def collect_epoch_diagnostics(epoch_dir: Path, registry: WindowStateRegistry, po
         pair_stats[key] = (attempts, accepted)
 
     state_to_window = {sid: w for w, sid in window_map.items()}
+    geometry_edges = build_geometry_edges(registry)
     edge_rows: List[EdgeDiagnostics] = []
-    for si, sj, etype, nd in build_geometry_edges(registry):
+    for si, sj, etype, nd in geometry_edges:
         wi = state_to_window.get(int(si), -1)
         wj = state_to_window.get(int(sj), -1)
         overlap = None
@@ -1370,6 +1464,15 @@ def collect_epoch_diagnostics(epoch_dir: Path, registry: WindowStateRegistry, po
             edge.warnings.append("low_exchange_acceptance")
         edge_rows.append(edge)
 
+    non_neighbor_redundancies = _non_neighbor_redundant_pairs(
+        registry, window_map, by_window_values, geometry_edges, policy
+    )
+    for alert in non_neighbor_redundancies:
+        for sid in (int(alert["state_i"]), int(alert["state_j"])):
+            diag = state_by_id.get(sid)
+            if diag is not None and "non_neighbor_redundant" not in diag.warnings:
+                diag.warnings.append("non_neighbor_redundant")
+
     payload = {
         "schema_version": "adaptive_production_epoch_diagnostics_v1",
         "epoch_dir": str(epoch_dir),
@@ -1378,6 +1481,7 @@ def collect_epoch_diagnostics(epoch_dir: Path, registry: WindowStateRegistry, po
         "window_map": {str(k): int(v) for k, v in sorted(window_map.items())},
         "states": [s.to_dict() for s in state_rows],
         "edges": [e.to_dict() for e in edge_rows],
+        "non_neighbor_redundancies": non_neighbor_redundancies,
         "policy": _json_ready(asdict(policy)),
     }
     write_json(epoch_dir / "adaptive_epoch_diagnostics.json", payload)
@@ -2517,6 +2621,35 @@ def propose_actions_from_diagnostics(registry: WindowStateRegistry, diagnostics:
                 for key in ("state_i", "state_j"):
                     s = int(edge[key])
                     state_max_overlap[s] = max(state_max_overlap.get(s, 0.0), float(ov))
+        # Non-geometry-neighbor collapses (see collect_epoch_diagnostics /
+        # _non_neighbor_redundant_pairs) must also count toward redundancy —
+        # otherwise a window that drifted onto a distant window's basin never
+        # becomes retirement-eligible just because its actual geometry edges
+        # (to its still-distinct real neighbors) look fine.
+        #
+        # _hist_overlap (and therefore the alert) is SYMMETRIC: both the
+        # healthy anchor a collapsed window drifted onto and the collapsed
+        # window itself get the same overlap value. Crediting it to both
+        # sides indiscriminately can make the retirement path drop the
+        # correct on-target anchor instead of (or alongside) the actual
+        # interloper. Use the off-target signal computed above to credit the
+        # overlap ONLY to whichever side actually failed to reach its
+        # target; if neither or both sides are flagged off-target the pair
+        # is ambiguous and is skipped rather than guessed at.
+        def _is_off_target(sid: int) -> bool:
+            warnings = state_rows.get(int(sid), {}).get("warnings") or []
+            return "off_target_primary" in warnings or "off_target_secondary" in warnings
+
+        for alert in diagnostics.get("non_neighbor_redundancies", []) or []:
+            ov = alert.get("overlap")
+            if ov is None:
+                continue
+            si, sj = int(alert["state_i"]), int(alert["state_j"])
+            off_i, off_j = _is_off_target(si), _is_off_target(sj)
+            if off_i == off_j:
+                continue  # ambiguous (both or neither off-target) -- do not guess
+            interloper = si if off_i else sj
+            state_max_overlap[interloper] = max(state_max_overlap.get(interloper, 0.0), float(ov))
         retire_candidates: List[int] = []
         for state in registry.active_states():
             sid = int(state.state_id)
@@ -3846,6 +3979,7 @@ def policy_from_args(args: Any) -> AdaptiveDecisionPolicy:
         context_reuse_mode=str(getattr(args, "adaptive_production_context_reuse_mode", "off") or "off"),
         redundant_overlap=_arg_float(args, "adaptive_production_redundant_overlap", 0.45),
         min_active_states=_arg_int(args, "adaptive_production_min_active_states", _arg_int(args, "min_total_windows", 0) or 8),
+        max_target_deviation_sigma=_arg_float(args, "adaptive_production_max_target_deviation_sigma", 3.0),
     )
 
 

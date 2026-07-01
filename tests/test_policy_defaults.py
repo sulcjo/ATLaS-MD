@@ -32,3 +32,14 @@ def test_min_active_states_honors_min_total_windows():
 def test_min_active_states_explicit_override_can_disable():
     p = policy_from_args(types.SimpleNamespace(adaptive_production_min_active_states=0))
     assert p.min_active_states == 0
+
+
+def test_max_target_deviation_sigma_default_is_3():
+    assert AdaptiveDecisionPolicy().max_target_deviation_sigma == 3.0
+    p = policy_from_args(types.SimpleNamespace())
+    assert p.max_target_deviation_sigma == 3.0
+
+
+def test_max_target_deviation_sigma_explicit_override():
+    p = policy_from_args(types.SimpleNamespace(adaptive_production_max_target_deviation_sigma=5.0))
+    assert p.max_target_deviation_sigma == 5.0
