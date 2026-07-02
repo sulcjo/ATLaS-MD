@@ -575,7 +575,7 @@ def _warn_on_subfloor_clamped_overlap(
         f"{axis_label} umbrella window(s) MBAR-DISCONNECTED from a neighbor "
         f"(overlap < floor {floor:g}) because the [min_k, max_k] clamp left "
         f"the force constant too high for the local spacing: {detail}. "
-        f"Loosen this axis's overlap_sigma / raise k_max / lower k_min so "
+        f"Loosen this axis's overlap_sigma / lower k_max / lower k_min so "
         f"the clamp does not over-restrain it.",
         UserWarning,
         stacklevel=2,
