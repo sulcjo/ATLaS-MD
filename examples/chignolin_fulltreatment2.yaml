@@ -74,7 +74,7 @@ contact_cv:
   contact_atom_selection: backbone-heavy
   contact_min_sequence_separation: 3
   contact_r0_a: 4.8
-  contact_beta_a_inv: 4.0
+  contact_beta_a_inv: 2.5
   contact_normalize: true
 
   # CV1 adaptive (unified; was contact_adaptive_*)
@@ -90,11 +90,11 @@ contact_cv:
 
 cv2:
   # CV2 adaptive (was secondary_cv_*)
-  cv2_k_min: 20.0
+  cv2_k_min: 5.0
   cv2_k_max: 50.0
   cv2_k_mode: adaptive
-  cv2_adaptive_overlap_sigma: 20.0
-  cv2_k_scale: 2.0
+  cv2_adaptive_overlap_sigma: 2.3
+  cv2_k_scale: 1.0
 
 starting_structures:
   seed_conformers_dir: chignolin_genpept_seeds

@@ -34,6 +34,9 @@ from .cv import (
     secondary_cv_is_transition,
     secondary_cv_range,
     adaptive_secondary_force_constants_kcal,
+    MBAR_DISCONNECT_OVERLAP_FLOOR,
+    _implied_neighbor_overlap_from_k,
+    _warn_on_subfloor_clamped_overlap,
 )
 from .forces import add_umbrella_force, add_contact_umbrella_force
 from .state import cv_distance_nm, _scalar_to_float
@@ -614,10 +617,16 @@ def adaptive_contact_force_constants_kcal(centers_c: np.ndarray, args) -> list[f
     max_k = max(min_k, float(getattr(args, "contact_adaptive_max_k_kcal", 120.0) or 120.0))
     scale = max(0.0, float(getattr(args, "contact_adaptive_k_scale", 1.0) or 1.0))
     ks = []
-    for spacing in local:
+    offenders: List[Tuple[float, float, float, float]] = []
+    for c, spacing in zip(centers, local):
         sigma = max(min_sigma, float(spacing) / overlap_sigma)
         k = scale * rt_kcal_mol / (sigma * sigma)
-        ks.append(float(max(min_k, min(max_k, k))))
+        k_clamped = float(max(min_k, min(max_k, k)))
+        ks.append(k_clamped)
+        overlap = _implied_neighbor_overlap_from_k(k_clamped, float(spacing), rt_kcal_mol)
+        if math.isfinite(overlap) and overlap < MBAR_DISCONNECT_OVERLAP_FLOOR:
+            offenders.append((float(c), float(spacing), k_clamped, overlap))
+    _warn_on_subfloor_clamped_overlap(offenders, "CV1 (primary/contacts)")
     return ks
 
 # Adaptive/manual window selection helpers.

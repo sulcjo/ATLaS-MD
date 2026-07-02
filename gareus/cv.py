@@ -13,6 +13,7 @@ construction, unit conversions, and secondary‑CV support.
 from __future__ import annotations
 
 import math
+import warnings
 from typing import Optional, Iterable, Tuple, List, Dict, Any
 
 import numpy as np
@@ -525,6 +526,62 @@ def secondary_structure_score_from_positions_nm(positions_nm, ss_info: Optional[
     return float(phi_mean if phi_mean is not None else psi_mean)
 
 
+# MBAR-disconnection guard-rail: below this analytic flat-PMF neighbor
+# overlap, adjacent umbrella windows can no longer be stitched by MBAR.
+MBAR_DISCONNECT_OVERLAP_FLOOR = 0.03
+
+
+def _implied_neighbor_overlap_from_k(k_kcal: float, spacing: float, rt_kcal_mol: float) -> float:
+    """Return the analytic flat-PMF neighbor overlap implied by ``k``.
+
+    Two adjacent equal-variance Gaussian umbrella windows with
+    ``sigma_eff = sqrt(RT / k)`` and centers separated by ``spacing`` overlap
+    (flat-PMF approximation) by ``erfc(d / (2*sqrt(2)))`` with
+    ``d = spacing / sigma_eff``.  Returns ``nan`` for non-finite/non-positive
+    ``k`` or ``spacing`` -- an unrestrained (``k=0``) window is not evaluated.
+    """
+    if not (math.isfinite(k_kcal) and k_kcal > 0.0):
+        return float("nan")
+    if not (math.isfinite(spacing) and spacing > 0.0):
+        return float("nan")
+    sigma_eff = math.sqrt(rt_kcal_mol / k_kcal)
+    if not (math.isfinite(sigma_eff) and sigma_eff > 0.0):
+        return float("nan")
+    d = spacing / sigma_eff
+    return math.erfc(d / (2.0 * math.sqrt(2.0)))
+
+
+def _warn_on_subfloor_clamped_overlap(
+    offenders: List[Tuple[float, float, float, float]],
+    axis_label: str,
+    floor: float = MBAR_DISCONNECT_OVERLAP_FLOOR,
+) -> None:
+    """Emit one aggregated warning for clamp-induced sub-floor overlap.
+
+    ``offenders`` is a list of ``(center, spacing, k_clamped, overlap)``
+    tuples for windows whose post-clamp force constant implies a neighbor
+    overlap below ``floor`` -- the point at which MBAR can no longer stitch
+    neighboring windows together.  Emits a single warning per call (not
+    per-frame) listing every offending window.
+    """
+    if not offenders:
+        return
+    detail = "; ".join(
+        f"center={c:.4f} (spacing={sp:.4f}): k_clamped={k:.3f} kcal/mol/CV^2 "
+        f"-> overlap={ov:.4f}"
+        for c, sp, k, ov in offenders
+    )
+    warnings.warn(
+        f"{axis_label} umbrella window(s) MBAR-DISCONNECTED from a neighbor "
+        f"(overlap < floor {floor:g}) because the [min_k, max_k] clamp left "
+        f"the force constant too high for the local spacing: {detail}. "
+        f"Loosen this axis's overlap_sigma / raise k_max / lower k_min so "
+        f"the clamp does not over-restrain it.",
+        UserWarning,
+        stacklevel=2,
+    )
+
+
 def adaptive_secondary_force_constants_kcal(centers: Iterable[float], args) -> List[float]:
     """Return secondary‑CV umbrella force constants in kcal/mol/CV².
 
@@ -575,10 +632,16 @@ def adaptive_secondary_force_constants_kcal(centers: Iterable[float], args) -> L
     scale = max(0.0, float(getattr(args, "secondary_cv_adaptive_k_scale", 1.0) or 1.0))
     rt_kcal_mol = 0.00198720425864083 * float(getattr(args, "temperature_k", 300.0) or 300.0)
     k_by_center: Dict[float, float] = {}
+    offenders: List[Tuple[float, float, float, float]] = []
     for c, local in zip(unique_arr, local_unique):
         sigma_cv = max(min_sigma, float(local) / overlap_sigma)
         k_val = scale * rt_kcal_mol / (sigma_cv * sigma_cv)
-        k_by_center[round(float(c), 8)] = float(max(min_k, min(max_k, k_val)))
+        k_clamped = float(max(min_k, min(max_k, k_val)))
+        k_by_center[round(float(c), 8)] = k_clamped
+        overlap = _implied_neighbor_overlap_from_k(k_clamped, float(local), rt_kcal_mol)
+        if math.isfinite(overlap) and overlap < MBAR_DISCONNECT_OVERLAP_FLOOR:
+            offenders.append((float(c), float(local), k_clamped, overlap))
+    _warn_on_subfloor_clamped_overlap(offenders, "CV2 (secondary)")
     return [float(k_by_center.get(round(float(c), 8), base)) for c in centers_arr]
 
 # ---------------------------------------------------------------------------
