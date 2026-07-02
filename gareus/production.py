@@ -2629,6 +2629,42 @@ def run_shared_gamd_setup_article_a(
     release_openmm_contexts(shared_sim, shared_integrator, shared_system)
     return shared_globals_all, shared_globals_interesting, int(calib_steps), shared_context_checkpoint
 
+
+def reconcile_resume_secondary_cv_metadata(secondary_cv_metadata: Optional[dict], secondary_cv_centers) -> dict:
+    """Reconcile a resumed run's secondary-CV metadata against its centers.
+
+    The fast-resume path reads ``secondary_cv_metadata`` and
+    ``secondary_cv_centers`` independently from the checkpoint manifest
+    (they are stored as separate keys). If a 2D run resumes with
+    ``secondary_cv_centers`` present and non-empty but ``secondary_cv_metadata``
+    missing or ``enabled`` false/absent, CV2 seed scoring/biasing would
+    silently drop out of the resumed run even though production windows are
+    still 2D — the exact "silent collapse to a lower-dimensional proxy"
+    regression this project forbids.
+
+    This is a pure function (no I/O, no OpenMM): given the two
+    independently-read values, it returns a metadata dict with ``enabled``
+    reconciled to ``True`` whenever centers are present, preserving whatever
+    other fields (mode, phi0_deg, psi0_deg, sigma_deg, torsion lists, ...)
+    were already present. It always warns loudly when it has to reconcile;
+    it never silently continues with CV2 dropped.
+    """
+    meta = dict(secondary_cv_metadata or {})
+    has_centers = secondary_cv_centers is not None and len(secondary_cv_centers) > 0
+    if has_centers and not meta.get("enabled"):
+        print(
+            "!" * 78 + "\n"
+            "WARNING [RESUME]: secondary_cv_centers present "
+            f"({len(secondary_cv_centers)} windows) but secondary_cv_metadata is "
+            f"missing/disabled (enabled={meta.get('enabled')!r}). This resumed run "
+            "would silently drop CV2 from seed scoring/biasing. Reconciling by "
+            "enabling secondary-CV metadata from the fields available in the "
+            "checkpoint manifest so CV2 is not silently dropped.\n" + "!" * 78
+        )
+        meta["enabled"] = True
+    return meta
+
+
 def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equil_state, progress: Optional[GuiProgressSink] = None):
     _register_graceful_shutdown()
     platform, props = platform_and_properties(openmm, args.platform, args.precision, args.device_index, args.cpu_threads, args=args)
@@ -2680,6 +2716,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         secondary_cv_metadata = dict(resume_def.get("secondary_cv_metadata", {"enabled": False}) or {"enabled": False})
         secondary_cv_centers = resume_def.get("secondary_cv_centers")
         secondary_cv_k_kcal_list = resume_def.get("secondary_cv_k_kcal_list")
+        secondary_cv_metadata = reconcile_resume_secondary_cv_metadata(secondary_cv_metadata, secondary_cv_centers)
         if secondary_cv_metadata.get("enabled") and not secondary_cv_enabled(args):
             # Resume must rebuild the same optional CV force even if the user did
             # not repeat the --secondary-cv flags on the command line.
