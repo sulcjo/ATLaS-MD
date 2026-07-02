@@ -276,7 +276,12 @@ def secondary_cv_mode(args_or_mode) -> str:
     if isinstance(args_or_mode, str):
         mode = args_or_mode
     elif isinstance(args_or_mode, dict):
-        mode = args_or_mode.get("mode", "none")
+        if args_or_mode.get("secondary_cv") not in (None, ""):
+            mode = args_or_mode.get("secondary_cv")
+        elif args_or_mode.get("secondary_cv_mode") not in (None, ""):
+            mode = args_or_mode.get("secondary_cv_mode")
+        else:
+            mode = args_or_mode.get("mode", "none")
     else:
         mode = getattr(args_or_mode, "secondary_cv", "none")
     mode = str(mode or "none").strip().lower().replace("_", "-")
@@ -291,6 +296,10 @@ def secondary_cv_mode(args_or_mode) -> str:
         "rama-map": "rama-map",
         "rama-basin-map": "rama-map",
         "tica": "tica-linear",
+        "bootstrap-torsion": "torsion-pca",
+        "bootstrap-linear": "torsion-pca",
+        "torsion-linear": "torsion-pca",
+        "torsion-pca": "torsion-pca",
     }
     return aliases.get(mode, mode)
 
@@ -302,13 +311,13 @@ def secondary_cv_enabled(args) -> bool:
 
 def secondary_cv_is_transition(args_or_mode) -> bool:
     """Return True if the secondary CV is a transition coordinate."""
-    return secondary_cv_mode(args_or_mode) in {"alpha-coil-beta", "rama-map", "tica-linear"}
+    return secondary_cv_mode(args_or_mode) in {"alpha-coil-beta", "rama-map", "tica-linear", "torsion-pca"}
 
 
 def secondary_cv_range(args_or_mode) -> Tuple[float, float]:
     """Return the valid scalar range for the selected secondary CV."""
     mode = secondary_cv_mode(args_or_mode)
-    if mode == "tica-linear":
+    if mode in {"tica-linear", "torsion-pca"}:
         return (-6.0, 6.0)
     return (-1.0, 1.0) if secondary_cv_is_transition(args_or_mode) else (0.0, 1.0)
 

@@ -20,6 +20,7 @@ import numpy as np
 __all__ = [
     "TICAResult",
     "backbone_dihedral_features",
+    "compute_bootstrap_torsion_pca",
     "compute_tica",
     "project_tica1",
     "window_tica_centers",
@@ -56,6 +57,10 @@ class TICAResult:
         Atom-index 4-tuples defining backbone psi torsions.
     n_samples : int
         Number of rows used to fit this model.
+    method : str
+        Fit family used to produce this state, e.g. ``tica`` or ``pca``.
+    explained_variance_ratio : float, optional
+        Fraction of total variance explained by the returned component.
     """
     weights: np.ndarray
     eigenvalue: float
@@ -65,11 +70,14 @@ class TICAResult:
     phi_torsion_indices: List[Tuple[int, int, int, int]]
     psi_torsion_indices: List[Tuple[int, int, int, int]]
     n_samples: int = 0
+    method: str = "tica"
+    explained_variance_ratio: Optional[float] = None
     sign_ref: Optional[np.ndarray] = field(default=None, repr=False)
 
     def to_dict(self) -> dict:
         d: dict = {
             "eigenvalue": float(self.eigenvalue),
+            "method": str(self.method or "tica"),
             "lag": int(self.lag),
             "n_samples": int(self.n_samples),
             "mean": self.mean.tolist(),
@@ -78,6 +86,8 @@ class TICAResult:
             "phi_torsion_indices": [list(t) for t in self.phi_torsion_indices],
             "psi_torsion_indices": [list(t) for t in self.psi_torsion_indices],
         }
+        if self.explained_variance_ratio is not None:
+            d["explained_variance_ratio"] = float(self.explained_variance_ratio)
         if self.sign_ref is not None:
             d["sign_ref"] = self.sign_ref.tolist()
         return d
@@ -92,10 +102,16 @@ class TICAResult:
             eigenvalue=float(d["eigenvalue"]),
             mean=mean,
             offset=float(d["offset"]),
-            lag=int(d["lag"]),
-            phi_torsion_indices=[tuple(t) for t in d["phi_torsion_indices"]],
-            psi_torsion_indices=[tuple(t) for t in d["psi_torsion_indices"]],
+            lag=int(d.get("lag", 0 if d.get("method") == "pca" else 1)),
+            phi_torsion_indices=[tuple(t) for t in d.get("phi_torsion_indices", [])],
+            psi_torsion_indices=[tuple(t) for t in d.get("psi_torsion_indices", [])],
             n_samples=int(d.get("n_samples", 0)),
+            method=str(d.get("method", "tica") or "tica"),
+            explained_variance_ratio=(
+                float(d["explained_variance_ratio"])
+                if d.get("explained_variance_ratio") is not None
+                else None
+            ),
             sign_ref=sign_ref,
         )
 
@@ -309,6 +325,79 @@ def compute_tica(
         phi_torsion_indices=list(phi_torsion_indices or []),
         psi_torsion_indices=list(psi_torsion_indices or []),
         n_samples=n,
+        method="tica",
+        sign_ref=v.copy(),
+    )
+
+
+def compute_bootstrap_torsion_pca(
+    X: np.ndarray,
+    cv1: Optional[np.ndarray] = None,
+    *,
+    residualize: bool = True,
+    component: int = 1,
+    phi_torsion_indices: Optional[List] = None,
+    psi_torsion_indices: Optional[List] = None,
+    epsilon: float = 1e-12,
+) -> TICAResult:
+    """Fit a PCA model to seed conformer backbone features."""
+    X = np.asarray(X, dtype=np.float64)
+    if X.ndim != 2:
+        raise ValueError(f"X must be 2-D, got shape {X.shape}")
+    n, d = X.shape
+    if n < 2:
+        raise ValueError(f"bootstrap torsion PCA needs at least 2 samples, got {n}")
+    if d < 1:
+        raise ValueError("bootstrap torsion PCA needs at least 1 feature")
+    if not np.isfinite(X).all():
+        raise ValueError("bootstrap torsion PCA feature matrix contains non-finite values")
+
+    X_work = X.copy()
+    if residualize:
+        if cv1 is None:
+            raise ValueError("cv1 values are required when residualize=True")
+        cv1_arr = np.asarray(cv1, dtype=np.float64)
+        if cv1_arr.shape != (n,):
+            raise ValueError(f"cv1 shape {cv1_arr.shape} != ({n},)")
+        if not np.isfinite(cv1_arr).all():
+            raise ValueError("cv1 values contain non-finite values")
+        design = np.column_stack([np.ones(n, dtype=np.float64), cv1_arr])
+        beta, *_ = np.linalg.lstsq(design, X_work, rcond=None)
+        X_work = X_work - design @ beta
+
+    mean = X_work.mean(axis=0)
+    Xc = X_work - mean
+    _, singular_values, vt = np.linalg.svd(Xc, full_matrices=False)
+    variances = (singular_values * singular_values) / max(1, n - 1)
+    total_variance = float(np.sum(variances))
+    if total_variance <= float(epsilon):
+        raise ValueError("zero bootstrap torsion PCA variance")
+    idx = int(component) - 1
+    if idx < 0 or idx >= vt.shape[0]:
+        raise ValueError(f"component must be in 1..{vt.shape[0]}, got {component}")
+    if float(variances[idx]) <= float(epsilon):
+        raise ValueError("zero bootstrap torsion PCA variance")
+    explained = float(variances[idx] / total_variance)
+    v = np.asarray(vt[idx], dtype=np.float64)
+    norm = float(np.linalg.norm(v))
+    if norm <= float(epsilon):
+        raise ValueError("zero bootstrap torsion PCA component norm")
+    v = v / norm
+    pivot = int(np.argmax(np.abs(v)))
+    if v[pivot] < 0.0:
+        v = -v
+    offset = float(-mean @ v)
+    return TICAResult(
+        weights=v,
+        eigenvalue=explained,
+        mean=mean,
+        offset=offset,
+        lag=0,
+        phi_torsion_indices=list(phi_torsion_indices or []),
+        psi_torsion_indices=list(psi_torsion_indices or []),
+        n_samples=n,
+        method="pca",
+        explained_variance_ratio=explained,
         sign_ref=v.copy(),
     )
 
