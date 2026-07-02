@@ -606,6 +606,34 @@ def test_genpept_library_scores_active_cv_space(tmp_path) -> None:
     assert "secondary_cv_value" in lib[0]
 
 
+def test_genpept_library_reroots_stale_absolute_survivor_path(tmp_path) -> None:
+    """final_survivor_seeds.csv bakes absolute paths at GENPEPT-generation time.
+
+    If the run tree is later moved/renamed (e.g. RUNS/runs3 -> RUNS/runs_rdy),
+    those baked paths point nowhere. The loader must re-root them under the
+    current seed_conformers_dir by matching the genpept output directory's own
+    name, instead of silently skipping every survivor.
+    """
+    from gareus.seeding import load_genpept_conformer_library
+
+    seed_dir = tmp_path / "runs_rdy" / "PEP" / "PEP_genpept_r3"
+    survivors_dir = seed_dir / "final_implicit_survivor_seeds"
+    survivors_dir.mkdir(parents=True)
+    pdb = survivors_dir / "survivor_000.pdb"
+    lines = [
+        "ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00  0.00           C\n",
+        "ATOM      2  CA  ALA A   2       3.000   0.000   0.000  1.00  0.00           C\n",
+    ]
+    pdb.write_text("".join(lines))
+
+    stale_abs = "/old/runs3/PEP/PEP_genpept_r3/final_implicit_survivor_seeds/survivor_000.pdb"
+    (seed_dir / "final_survivor_seeds.csv").write_text(f"survivor_pdb_path\n{stale_abs}\n")
+
+    lib = load_genpept_conformer_library(seed_dir, cv_atom1=0, cv_atom2=1)
+    assert len(lib) == 1
+    assert abs(float(lib[0]["primary_cv_value"]) - 3.0) < 1.0e-12
+
+
 def test_json_ready_serializes_path_objects():
     from pathlib import Path
     import json

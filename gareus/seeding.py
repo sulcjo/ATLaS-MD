@@ -243,10 +243,24 @@ def load_genpept_conformer_library(
     skipped = 0
     for row in rows:
         pdb_path = Path(row.get("survivor_pdb_path", ""))
-        if not pdb_path.exists() and not pdb_path.is_absolute():
-            candidate = Path(seed_conformers_dir) / pdb_path
-            if candidate.exists():
-                pdb_path = candidate
+        if not pdb_path.exists():
+            if pdb_path.is_absolute():
+                # Paths are baked in at GENPEPT-generation time. If the run
+                # tree was since moved/renamed (e.g. RUNS/runs3 -> RUNS/runs_rdy),
+                # the baked path is stale but its tail still starts at the
+                # genpept output directory itself, so re-root the tail under
+                # the current seed_conformers_dir.
+                seed_dir_name = Path(seed_conformers_dir).name
+                parts = pdb_path.parts
+                if seed_dir_name in parts:
+                    idx = len(parts) - 1 - parts[::-1].index(seed_dir_name)
+                    candidate = Path(seed_conformers_dir).joinpath(*parts[idx + 1 :])
+                    if candidate.exists():
+                        pdb_path = candidate
+            else:
+                candidate = Path(seed_conformers_dir) / pdb_path
+                if candidate.exists():
+                    pdb_path = candidate
         if not pdb_path.exists():
             skipped += 1
             continue
