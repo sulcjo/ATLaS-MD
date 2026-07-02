@@ -512,6 +512,16 @@ def load_resume_run_definition(out_dir: Path, topology, args, manifest: Optional
         metadata.get("secondary_cv_k_kcal_mol"),
         pymbar.get("secondary_cv_k_kcal_mol"),
     )
+    # Reconcile BEFORE the enabled/disabled branch below: secondary_meta and
+    # secondary_cv_centers/secondary_k are read independently from the
+    # checkpoint manifest, so a desynced checkpoint can have real centers/k
+    # arrays with metadata that is missing or has enabled=False. If we only
+    # reconciled after this point (as a downstream post-processing step), the
+    # `else` branch immediately below would already have nulled centers/k by
+    # the time any caller saw them, making the desync unrecoverable and
+    # unobservable. Reconciling here, against the raw values, is the only
+    # place that can actually catch and fix it.
+    secondary_meta = reconcile_resume_secondary_cv_metadata(secondary_meta, secondary_centers)
     if isinstance(secondary_meta, dict) and secondary_meta.get("enabled"):
         if secondary_centers is None or secondary_k is None:
             raise RuntimeError("Resume metadata says secondary CV was enabled, but secondary centers/k arrays are missing")
@@ -2713,10 +2723,12 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         cv_label = str(primary_cv_def.get("label", cv_label))
         centers_a = np.asarray(resume_def["centers_a"], dtype=float)
         k_list = [float(x) for x in resume_def["k_list"]]
+        # secondary_cv_metadata is already reconciled against secondary_cv_centers
+        # inside load_resume_run_definition (against the raw, pre-null values —
+        # see the comment there for why it cannot be done here).
         secondary_cv_metadata = dict(resume_def.get("secondary_cv_metadata", {"enabled": False}) or {"enabled": False})
         secondary_cv_centers = resume_def.get("secondary_cv_centers")
         secondary_cv_k_kcal_list = resume_def.get("secondary_cv_k_kcal_list")
-        secondary_cv_metadata = reconcile_resume_secondary_cv_metadata(secondary_cv_metadata, secondary_cv_centers)
         if secondary_cv_metadata.get("enabled") and not secondary_cv_enabled(args):
             # Resume must rebuild the same optional CV force even if the user did
             # not repeat the --secondary-cv flags on the command line.
