@@ -2473,6 +2473,30 @@ def run_production_probe(args, out_dir: Path, sims: list, assignments: list[int]
         print(f"    Production probe passed: {nsteps} rollback steps on {len(sims)} replicas")
     return report
 
+def _gamd_boost_group_targets(system, args, unit) -> tuple[list[tuple[str, Optional[int]]], object]:
+    """Discover this run's GaMD boost-group targets and force-group ids.
+
+    Building a throwaway gamd-openmm integrator for `system` mutates its Force
+    objects' force groups as a side effect (gamd-openmm's own
+    GamdIntegratorFactory.get_integrator convention: set_all_forces_to_group(0),
+    then e.g. set_non_bonded_group/set_dihedral_group override specific Force
+    classes) and exposes the resulting group names generically via
+    integrator.get_group_dict()/get_statistics_names() -- valid for any
+    --gamd-boost-type, not just the flagship lower-dual-nonbonded-dihedral.
+    """
+    integrator, _result = make_gamd_integrator(system, args, unit)
+    group_dict = integrator.get_group_dict()  # {force_group_id: group_name}
+    targets: list[tuple[str, Optional[int]]] = [(name, int(gid)) for gid, name in group_dict.items()]
+    stat_names = integrator.get_statistics_names()
+    if any(name.endswith("_Total") for name in stat_names) and not any(t[0] == "Total" for t in targets):
+        targets.append(("Total", None))
+    if not targets:
+        raise RuntimeError(
+            f"Could not determine GaMD boost-group targets for --gamd-boost-type {args.gamd_boost_type!r}; "
+            f"get_group_dict()={group_dict!r}, get_statistics_names()={stat_names!r}"
+        )
+    return targets, integrator
+
 def run_shared_gamd_setup_article_a(
     args,
     out_dir: Path,
