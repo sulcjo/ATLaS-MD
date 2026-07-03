@@ -104,7 +104,8 @@ Common flags
                                         iterates each round until stable; add --delaunay-coverage-scaffold to fill gaps.
     --cv1 MODE                          Primary CV: distance or contacts.
     --contact-atom-selection MODE       heavy, ca, backbone-heavy, sidechain-heavy, sidechain-all, or all.
-    --cv2 MODE                          Secondary CV; non-none auto-enables 2D centers.
+    --cv2 MODE                          Secondary CV: none, alpha, beta, alpha-coil-beta, rama-map, torsion-pca, custom, or tica-linear.
+                                        Non-none auto-enables 2D centers.
     --cv2-centers C ...                 Override auto 2D centers (e.g. -0.8 0.0 0.8).
     --windows-a A ...                   Manual distance centers in Angstrom (--window-mode manual).
     --seed-conformers-dir DIR           Use GENPEPT survivors for CV-aware window starts.
@@ -270,6 +271,8 @@ CV shortcuts (schema v2.0):
     --cv1 contacts       Primary smooth nonlocal-contact fraction CV.
     --cv2 rama-map       Enable explicit Ramachandran basin-map CV; auto-inserts
                          centers [-1, -1/3, 1/3, 1] (beta/PPII/right-alpha/left-alpha).
+    --cv2 torsion-pca    Fit bootstrap backbone-torsion PC1 from GENPEPT seed conformers
+                         and bias the same shared linear torsion force used by tica-linear.
     --cv2 alpha-coil-beta
                          Signed alpha-minus-beta CV; auto-inserts [-0.8, 0, 0.8].
     --cv2-centers C ...  Override auto-inserted 2D centers explicitly.
@@ -492,6 +495,8 @@ backbone torsion-content score.  Available modes include:
     beta
     alpha-coil-beta
     rama-map
+    torsion-pca
+    tica-linear
     custom
 
 Secondary CVs use smooth periodic phi/psi scores:
@@ -961,6 +966,8 @@ Supported modes include:
     beta                  beta-like phi/psi content
     alpha-coil-beta       signed alpha-minus-beta transition coordinate
     rama-map              explicit Ramachandran basin-map coordinate
+    torsion-pca           bootstrap seed-fit backbone torsion PC1
+    tica-linear           learned tIC1 backbone torsion coordinate
     custom                target supplied by --cv2-phi0-deg/--cv2-psi0-deg
 
 For `alpha-coil-beta`, alpha-like states are positive, beta-like states are
@@ -968,7 +975,9 @@ negative, and coil/disordered states tend toward zero.  For `rama-map`, the code
 uses named smooth phi/psi basins: beta/extended (-135,+135), PPII/coil
 (-75,+145), right-alpha (-60,-45), and left-alpha (+60,+40).  It remains a
 one-dimensional secondary map coordinate crossed with CV1, not a dense phi/psi
-grid.
+grid.  `torsion-pca` and `tica-linear` both use the shared linear torsion force,
+but `torsion-pca` is a bootstrap PC fit from seed conformers whereas
+`tica-linear` is the inter-epoch learned slow-mode coordinate.
 
 7. 2D and sparse windows
 ------------------------
@@ -1394,6 +1403,34 @@ CV2 auto-switch (tica_switch_cv2)
 Setting tica_switch_cv2: true enables a one-shot automatic CV2 type change:
 after the first successful tICA refit, the secondary CV type is permanently
 replaced with tica-linear for all remaining epochs and final production.
+
+Bootstrap torsion PCA
+~~~~~~~~~~~~~~~~~~~~~
+`cv2: torsion-pca` fits a first-epoch linear backbone torsion CV from GENPEPT
+seed conformers before production MD starts.  Features are per-residue
+sin(phi), cos(phi), sin(psi), and cos(psi).  By default, each feature is
+residualized against seed CV1 before PCA so CV2 is less redundant with the
+nonlocal contact axis.  The state file is written to
+<out>/tica/bootstrap_torsion_cv.json and the OpenMM force uses the same linear
+torsion machinery as `tica-linear`.
+
+Recommended two-stage setup:
+
+    cvs:
+      cv1: contacts
+      cv2: torsion-pca
+
+    bootstrap_torsion_cv:
+      bootstrap_torsion_source: seeds
+      bootstrap_torsion_residualize_against_cv1: true
+      bootstrap_torsion_component: 1
+      bootstrap_torsion_min_seed_count: 20
+
+    tica:
+      tica_obs_interval: 50
+      tica_lag_frames: 50
+      tica_update_after_epochs: [0]
+      tica_switch_cv2: true
 
 This allows a single YAML config to run a two-stage strategy:
 

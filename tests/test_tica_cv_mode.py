@@ -122,6 +122,25 @@ class TestMBARGuard:
         assert "epoch_000" in names
         assert "epoch_001" in names
 
+    def test_epoch_sample_sources_excludes_bootstrap_disabled_epoch_when_tica_active(self, tmp_path):
+        """After torsion-pca -> tica-linear switch, disabled bootstrap epoch is not pooled with active tICA version."""
+        from gareus.adaptive_production import _epoch_sample_sources
+
+        epoch0 = tmp_path / "epoch_000"
+        epoch0.mkdir()
+        (epoch0 / "tica_cv_version.txt").write_text("disabled")
+        (epoch0 / "samples.csv").write_text("step,window,cv_A,secondary_cv\n1,0,0.5,0.0\n")
+
+        epoch1 = tmp_path / "epoch_001"
+        epoch1.mkdir()
+        (epoch1 / "tica_cv_version.txt").write_text("v1")
+        (epoch1 / "samples.csv").write_text("step,window,cv_A,secondary_cv\n1,0,0.5,0.0\n")
+
+        sources = _epoch_sample_sources(tmp_path, include_epochs=True, tica_cv_version="v1")
+        labels = [label for label, _ in sources]
+        assert "epoch_001" in labels
+        assert "epoch_000" not in labels
+
 
 class TestApplyTICACentersToRegistry:
     def test_updates_active_states(self, tmp_path):
@@ -367,6 +386,26 @@ class TestCV2AutoSwitch:
         assert args.cv2_k_min == pytest.approx(5.0)
         assert args.cv2_k_max == pytest.approx(50.0)
         assert report["cv2_switched"] == {"from": "rama-map", "to": "tica-linear"}
+
+    def test_switch_logic_changes_torsion_pca_to_tica_linear(self):
+        """After a successful tICA update, bootstrap torsion CV2 switches to tica-linear."""
+        args = self._make_args(secondary_cv="torsion-pca")
+        report = {"status": "updated", "per_window_tic1_centers": {}}
+
+        if report.get("status") == "updated" and getattr(args, "tica_switch_cv2", False):
+            _prev_cv2 = str(getattr(args, "secondary_cv", "none") or "none")
+            if _prev_cv2 != "tica-linear":
+                _k_min = float(getattr(args, "tica_linear_k_min", 5.0) or 5.0)
+                _k_max = float(getattr(args, "tica_linear_k_max", 50.0) or 50.0)
+                args.secondary_cv = "tica-linear"
+                args.cv2_k_min = _k_min
+                args.cv2_k_max = _k_max
+                report["cv2_switched"] = {"from": _prev_cv2, "to": "tica-linear"}
+
+        assert args.secondary_cv == "tica-linear"
+        assert args.cv2_k_min == pytest.approx(5.0)
+        assert args.cv2_k_max == pytest.approx(50.0)
+        assert report["cv2_switched"] == {"from": "torsion-pca", "to": "tica-linear"}
 
     def test_switch_is_one_shot(self):
         """Guard: if already tica-linear, do NOT overwrite k bounds or re-switch."""

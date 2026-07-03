@@ -270,12 +270,17 @@ def _secondary_cv_label(meta: dict) -> str:
     """Extract human-readable secondary CV label from run metadata."""
     raw = (meta or {}).get('secondary_cv', {})
     if isinstance(raw, str):
-        if 'rama' in raw.lower(): return 'Ramachandran CV'
+        low = raw.lower()
+        if 'rama' in low: return 'Ramachandran CV'
+        if 'torsion-pca' in low or 'bootstrap' in low: return 'Bootstrap torsion PC1'
+        if 'tica' in low: return 'tIC1 torsion CV'
         return f'Secondary CV ({raw})'
     sec = raw or {}
     label = sec.get('label', '')
     mode = sec.get('mode', '')
     if label: return label
+    if mode == 'torsion-pca': return 'Bootstrap torsion PC1'
+    if mode == 'tica-linear': return 'tIC1 torsion CV'
     if mode: return f'Secondary CV ({mode})'
     return 'Secondary CV'
 

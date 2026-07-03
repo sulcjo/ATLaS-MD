@@ -1,5 +1,5 @@
 schema_version: '2.0'
-description: "Chignolin (GYDPETGTWG) double-adaptive 2D contacts x rama-map HMR-GaMD/REUS. Runs3: sigma0=3 kcal/mol, max_windows=24, min_windows=8, 4 µs budget, 3 epochs."
+description: "Chignolin (GYDPETGTWG) double-adaptive 2D contacts x torsion-pca HMR-GaMD/REUS with epoch-0 bootstrap handoff to tica-linear. Runs3: sigma0=3 kcal/mol, max_windows=24, min_windows=8, 4 µs budget, 3 epochs."
 
 workflow_help: |
   ============================================================
@@ -43,11 +43,10 @@ workflow_help: |
   CV1  nonlocal contacts: residue-balanced heavy atoms,
        r0=4.8 A, beta_inv=4.0 A^-1, normalised to [0,1]
        target spacing 0.05, k in [50, 250] kcal/mol (adaptive)
-  CV2  rama-map discrete centres:
-       -1.0 (beta/extended), -0.700 (beta->PPII bridge),  [v7: added]
-       -0.333 (PPII/coil),    0.000 (PPII->aR bridge),    [v7: added]
-        0.333 (right-alpha),   1.0  (left-alpha)
-       k in [5, 100] kcal/mol (Delaunay spacing, adaptive)
+  CV2  bootstrap torsion PC1:
+       seed-fit backbone torsion PCA coordinate for epoch 0,
+       then one-shot handoff to tica-linear after first successful refit
+       k in [5, 100] kcal/mol after handoff (adaptive spacing)
   Seeds: best-scoring GENPEPT survivors per window (active-CV)
   Starting-structure pull: 50,000 steps/window at 3 fs, k=75
 
@@ -209,9 +208,15 @@ genpept_prescan:
 
 cvs:
   cv1: contacts
-  cv2: rama-map
+  cv2: torsion-pca
   # NOTE: adaptive-min/max-total-windows from old cvs block dropped in v2.
   # Total replica budget is settable again via windows.max_total_windows (below).
+
+bootstrap_torsion_cv:
+  bootstrap_torsion_source: seeds
+  bootstrap_torsion_residualize_against_cv1: true
+  bootstrap_torsion_component: 1
+  bootstrap_torsion_min_seed_count: 20
 
 contact_cv:
   # Contact physics (CV-specific)
@@ -258,6 +263,14 @@ cv2:
   # too large for MBAR overlap (poor reweighting across this transition).
   # Applicable to any peptide using cv2: rama-map, not chignolin-specific.
   cv2_centers: [-1.0, -0.333, 0.333, 1.0]
+
+tica:
+  tica_obs_interval: 50
+  tica_lag_frames: 50
+  tica_update_after_epochs: [0]
+  tica_switch_cv2: true
+  tica_linear_k_min: 5.0
+  tica_linear_k_max: 50.0
 
 starting_structures:
   seed_conformers_dir: chignolin_genpept_7  # reuse run7 seeds
