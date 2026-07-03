@@ -386,7 +386,7 @@ def test_tiny_integration_command_dry_run(tmp_path) -> None:
     assert "--window-mode manual" in result.stdout
     assert "--windows-a 3.5 4.5" in result.stdout
     assert "--run-mode gamd" in result.stdout
-    assert "--gamd-production-steps 4" in result.stdout
+    assert "--production-steps 20" in result.stdout
     assert "--exchange-interval 2" in result.stdout
     assert "--traj-format none" in result.stdout
 

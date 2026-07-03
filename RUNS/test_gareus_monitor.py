@@ -6,7 +6,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from gareus_monitor import PeptideState
+from gareus_monitor import (
+    PeptideState,
+    _plan_yaml_path,
+    build_run_snapshot,
+    discover,
+    match_slurm_jobs_to_states,
+    parse_squeue_rows,
+)
 
 
 def _write_json(path: Path, payload: dict) -> None:
@@ -90,6 +97,97 @@ class PeptideStateBudgetTests(unittest.TestCase):
             self.assertEqual(state.global_percent, 12.5)
             self.assertEqual(state.epochs_completed, 0)
             self.assertEqual(state.total_epochs, 4)
+
+
+class SlurmMonitorTests(unittest.TestCase):
+    def test_parse_squeue_rows_keeps_running_job_fields_and_workdir(self):
+        rows = parse_squeue_rows(
+            "12345|chignolin_2d_run|RUNNING|12:03|1|gpu-a01|/runs/chignolin/chignolin_2d_run\n"
+            "12346|DYKDDDDK-prod|PENDING|0:00|1|Priority|\n"
+        )
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0].job_id, "12345")
+        self.assertEqual(rows[0].name, "chignolin_2d_run")
+        self.assertEqual(rows[0].state, "RUNNING")
+        self.assertEqual(rows[0].elapsed, "12:03")
+        self.assertEqual(rows[0].nodes, "1")
+        self.assertEqual(rows[0].reason, "gpu-a01")
+        self.assertEqual(rows[0].workdir, "/runs/chignolin/chignolin_2d_run")
+        self.assertEqual(rows[1].workdir, "")
+
+    def test_match_slurm_jobs_prefers_workdir_and_falls_back_to_job_name(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            chig = PeptideState.from_rundir(root / "chignolin" / "chignolin_2d_run")
+            dyk = PeptideState.from_rundir(root / "DYKDDDDK" / "DYKDDDDK_2d_run")
+            states = [chig, dyk]
+            jobs = parse_squeue_rows(
+                f"12345|some_wrapper|RUNNING|12:03|1|gpu-a01|{chig.run_dir}\n"
+                "12346|DYKDDDDK-prod|PENDING|0:00|1|Priority|\n"
+                "99999|unrelated|RUNNING|1:00|1|node-x|\n"
+            )
+
+            unmatched = match_slurm_jobs_to_states(states, jobs, fleet_roots=[root])
+
+            self.assertEqual([j.job_id for j in chig._slurm_jobs], ["12345"])
+            self.assertEqual([j.job_id for j in dyk._slurm_jobs], ["12346"])
+            self.assertEqual([j.job_id for j in unmatched], [])
+
+    def test_match_slurm_jobs_keeps_chignolin_tica_separate_from_chignolin(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            chig = PeptideState.from_rundir(root / "chignolin" / "chignolin_2d_run")
+            tica = PeptideState.from_rundir(root / "chignolin_tica" / "chignolin_tica_2d_run")
+            states = [chig, tica]
+            jobs = parse_squeue_rows(
+                "12345|chignolin-prod|RUNNING|12:03|1|gpu-a01|\n"
+                "12346|chignolin_tica-prod|RUNNING|12:04|1|gpu-a02|\n"
+            )
+
+            unmatched = match_slurm_jobs_to_states(states, jobs, fleet_roots=[root])
+
+            self.assertEqual([j.job_id for j in chig._slurm_jobs], ["12345"])
+            self.assertEqual([j.job_id for j in tica._slurm_jobs], ["12346"])
+            self.assertEqual([j.job_id for j in unmatched], [])
+
+    def test_run_snapshot_includes_matched_slurm_jobs(self):
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td) / "PEP_2d_run"
+            state = PeptideState.from_rundir(run_dir)
+            jobs = parse_squeue_rows(f"222|PEP_2d_run|RUNNING|1:00|1|node-a|{run_dir}\n")
+            match_slurm_jobs_to_states([state], jobs, fleet_roots=[Path(td)])
+
+            snap = build_run_snapshot(state)
+
+            self.assertEqual([j.job_id for j in snap.slurm_jobs], ["222"])
+
+
+class DiscoveryTests(unittest.TestCase):
+    def test_discover_keeps_chignolin_tica_autoswitch_yaml_as_distinct_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "chignolin").mkdir()
+            (root / "chignolin" / "chignolin.yaml").write_text("md_budget_ns: 10\n")
+            (root / "chignolin_tica").mkdir()
+            (root / "chignolin_tica" / "chignolin_tica_autoswitch.yaml").write_text("md_budget_ns: 20\n")
+
+            states = discover(root)
+
+            self.assertEqual([s.name for s in states], ["chignolin", "chignolin_tica"])
+            self.assertEqual(_plan_yaml_path(states[1]).name, "chignolin_tica_autoswitch.yaml")
+
+
+class SourceCompatibilityTests(unittest.TestCase):
+    def test_postpones_annotations_for_python39_generic_alias_unions(self):
+        source = Path(__file__).with_name("gareus_monitor.py").read_text()
+
+        self.assertIn("tuple[SlurmJob, ...] | list[SlurmJob]", source)
+        self.assertIn(
+            "from __future__ import annotations",
+            source.splitlines()[:30],
+            "Python 3.9 evaluates tuple[...] | list[...] annotations at import time.",
+        )
 
 
 if __name__ == "__main__":

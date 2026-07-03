@@ -224,7 +224,7 @@ contact_cv:
   contact_atom_selection: heavy
   contact_min_sequence_separation: 3   # was 2; sep=3 removes near-neighbor contacts, sharpens folded/unfolded discrimination for 10-residue peptide
   contact_r0_a: 4.8
-  contact_beta_a_inv: 4.0
+  contact_beta_a_inv: 2.5
   contact_normalize: true
 
   # CV1 adaptive (unified; was contact_adaptive_*)

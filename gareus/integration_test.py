@@ -98,8 +98,6 @@ def build_tiny_run_argv(
         "--npt-ramp-steps", "2",
         "--npt-ramp-timestep-fs", "0.25",
         "--npt-steps", "4",
-        "--npt-final-timestep-fs", "0.25",
-        "--equil-safe-chunk-steps", "2",
         "--window-mode", "manual",
         "--windows-a", "3.5", "4.5",
         "--window-k-kcal-a2", "1.0", "1.0",
@@ -107,12 +105,13 @@ def build_tiny_run_argv(
         "--us-pull-steps-per-window", "2",
         "--us-pull-timestep-fs", "0.25",
         "--us-pull-minimize-iterations", "1",
-        "--gamd-cmd-prep-steps", "1",
-        "--gamd-cmd-steps", "1",
-        "--gamd-equil-prep-steps", "1",
-        "--gamd-equil-steps", "1",
-        "--gamd-production-steps", "4",
-        "--gamd-averaging-window", "1",
+        "--gamd-cmd-steps", "100",
+        "--equil-steps", "100",
+        "--production-steps", "20",
+        "--gamd-averaging-window", "50",
+        "--gamd-multiwindow-recon-prep-steps", "1",
+        "--gamd-multiwindow-recon-steps", "2",
+        "--gamd-multiwindow-recon-report-interval", "1",
         "--exchange-mode", "neighbor",
         "--exchange-interval", "2",
         "--report-interval", "2",
@@ -120,10 +119,8 @@ def build_tiny_run_argv(
         "--distance-output-mode", "csv",
         "--traj-format", str(traj_format),
         "--checkpoint-interval", "0",
-        "--production-probe-steps", "0",
         "--progress-mode", "none",
         "--tui-mode", "none",
-        "--no-flush-every-log",
     ]
     if extra_args:
         argv.extend(str(x) for x in extra_args)
@@ -181,12 +178,28 @@ def validate_tiny_run_outputs(out_dir: str | os.PathLike[str]) -> dict:
         elif path.exists() and path.is_dir():
             artifact_sizes[name] = sum(1 for _ in path.rglob("*"))
     ok = not missing_required
+    gamd_globals_path = root / "shared_gamd_setup_globals.json"
+    gamd_calibration_ok = True
+    gamd_calibration_note = "shared_gamd_setup_globals.json not present (conventional MD run_mode)"
+    if gamd_globals_path.exists():
+        gamd_globals = json.loads(gamd_globals_path.read_text())
+        mode = str(gamd_globals.get("mode", ""))
+        if mode.startswith("disabled_"):
+            gamd_calibration_note = f"GaMD disabled for this run_mode ({mode})"
+        elif mode == "joint_envelope_gamd_calibration" and gamd_globals.get("joint_envelope"):
+            gamd_calibration_note = f"joint_envelope_gamd_calibration OK, groups={sorted(gamd_globals['joint_envelope'])}"
+        else:
+            gamd_calibration_ok = False
+            gamd_calibration_note = f"expected mode='joint_envelope_gamd_calibration' with non-empty 'joint_envelope', got mode={mode!r}"
+    ok = ok and gamd_calibration_ok
     return {
         "ok": ok,
         "out_dir": str(root),
         "missing_required": missing_required,
         "present_optional": present_optional,
         "artifact_sizes": artifact_sizes,
+        "gamd_calibration_ok": gamd_calibration_ok,
+        "gamd_calibration_note": gamd_calibration_note,
     }
 
 

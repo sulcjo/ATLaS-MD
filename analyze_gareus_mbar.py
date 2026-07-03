@@ -2542,8 +2542,18 @@ def pmf_from_weights(cv,w,bins,kbt_kcal):
     if np.any(mask): F-=np.nanmin(F[mask])
     return {'cv_A':0.5*(edges[:-1]+edges[1:]),'prob':prob,'pmf':F,'counts':counts.astype(int)}
 
-def cumulant2(cv,base_w,boost,bins,beta,kbt_kcal,smooth_logfac_sigma=0.0):
-    """Second-order cumulant GaMD reweighting, vectorized by CV bin."""
+def _cumulant_expansion(cv,base_w,boost,bins,beta,kbt_kcal,order=2,smooth_logfac_sigma=0.0):
+    """Cumulant GaMD reweighting, vectorized by CV bin.
+
+    order=2 keeps the mean+variance terms (Gaussian/CE2 approximation).
+    order=3 adds the beta^3/6 * kappa3 term, where kappa3 is the per-bin
+    third cumulant (= third central moment) of the boost. kappa3/var are
+    computed via a two-pass mean-centered accumulation rather than raw
+    moments, since raw <x^3>-3<x^2><x>+2<x>^3 catastrophically cancels
+    when the boost mean (O(10-200) kJ/mol) dominates its spread.
+    """
+    if order not in (2,3):
+        raise ValueError(f"cumulant expansion order must be 2 or 3, got {order}")
     cv=np.asarray(cv,dtype=np.float64)
     base_w=np.asarray(base_w,dtype=np.float64)
     boost=np.asarray(boost,dtype=np.float64)
@@ -2556,6 +2566,7 @@ def cumulant2(cv,base_w,boost,bins,beta,kbt_kcal,smooth_logfac_sigma=0.0):
     good=(bi>=0)&(bi<B)&np.isfinite(boost)&np.isfinite(base_w)&(base_w>0)
     mean=np.full(B,np.nan,dtype=np.float64)
     var=np.full(B,np.nan,dtype=np.float64)
+    kappa3=np.full(B,np.nan,dtype=np.float64)
     logfac=np.zeros(B,dtype=np.float64)
     if np.any(good):
         idx=bi[good].astype(np.int64,copy=False)
@@ -2563,11 +2574,16 @@ def cumulant2(cv,base_w,boost,bins,beta,kbt_kcal,smooth_logfac_sigma=0.0):
         x=boost[good]
         sw=np.bincount(idx,weights=w,minlength=B).astype(np.float64)
         sx=np.bincount(idx,weights=w*x,minlength=B).astype(np.float64)
-        sx2=np.bincount(idx,weights=w*x*x,minlength=B).astype(np.float64)
         nz=sw>0
         mean[nz]=sx[nz]/sw[nz]
-        var[nz]=np.maximum(0.0,sx2[nz]/sw[nz]-mean[nz]*mean[nz])
+        dx=x-mean[idx]
+        sdx2=np.bincount(idx,weights=w*dx*dx,minlength=B).astype(np.float64)
+        var[nz]=np.maximum(0.0,sdx2[nz]/sw[nz])
         logfac[nz]=beta*mean[nz]+0.5*beta*beta*var[nz]
+        if order==3:
+            sdx3=np.bincount(idx,weights=w*dx*dx*dx,minlength=B).astype(np.float64)
+            kappa3[nz]=sdx3[nz]/sw[nz]
+            logfac[nz]+=(beta**3/6.0)*kappa3[nz]
     if smooth_logfac_sigma and float(smooth_logfac_sigma) > 0:
         try:
             from scipy.ndimage import gaussian_filter1d
@@ -2581,7 +2597,17 @@ def cumulant2(cv,base_w,boost,bins,beta,kbt_kcal,smooth_logfac_sigma=0.0):
         F=-kbt_kcal*np.log(p)
     mask=np.isfinite(F)
     if np.any(mask): F-=np.nanmin(F[mask])
-    return {'cv_A':centers,'prob':p,'pmf':F,'counts':counts.astype(int)}, {'boost_mean_kj':mean,'boost_var_kj2':var,'log_reweight_factor':logfac}
+    return {'cv_A':centers,'prob':p,'pmf':F,'counts':counts.astype(int)}, {'boost_mean_kj':mean,'boost_var_kj2':var,'boost_kappa3_kj3':kappa3,'log_reweight_factor':logfac}
+
+
+def cumulant2(cv,base_w,boost,bins,beta,kbt_kcal,smooth_logfac_sigma=0.0):
+    """Second-order cumulant GaMD reweighting, vectorized by CV bin."""
+    return _cumulant_expansion(cv,base_w,boost,bins,beta,kbt_kcal,order=2,smooth_logfac_sigma=smooth_logfac_sigma)
+
+
+def cumulant3(cv,base_w,boost,bins,beta,kbt_kcal,smooth_logfac_sigma=0.0):
+    """Third-order cumulant GaMD reweighting (adds the beta^3/6 * kappa3 term)."""
+    return _cumulant_expansion(cv,base_w,boost,bins,beta,kbt_kcal,order=3,smooth_logfac_sigma=smooth_logfac_sigma)
 
 
 def pmf2d_from_weights(x,y,w,xbins,ybins,kbt_kcal):
@@ -2608,7 +2634,10 @@ def pmf2d_from_weights(x,y,w,xbins,ybins,kbt_kcal):
         'counts':counts.astype(int),
     }
 
-def cumulant2_2d(x,y,base_w,boost,xbins,ybins,beta,kbt_kcal,smooth_logfac_sigma=0.0):
+def _cumulant_expansion_2d(x,y,base_w,boost,xbins,ybins,beta,kbt_kcal,order=2,smooth_logfac_sigma=0.0):
+    """2D counterpart of _cumulant_expansion; see that docstring for order/kappa3 notes."""
+    if order not in (2,3):
+        raise ValueError(f"cumulant expansion order must be 2 or 3, got {order}")
     x=np.asarray(x,dtype=np.float64)
     y=np.asarray(y,dtype=np.float64)
     base_w=np.asarray(base_w,dtype=np.float64)
@@ -2625,6 +2654,7 @@ def cumulant2_2d(x,y,base_w,boost,xbins,ybins,beta,kbt_kcal,smooth_logfac_sigma=
     good=(xi>=0)&(xi<Bx)&(yi>=0)&(yi<By)&np.isfinite(boost)&np.isfinite(base_w)&(base_w>0)
     mean=np.full((Bx,By),np.nan,dtype=np.float64)
     var=np.full((Bx,By),np.nan,dtype=np.float64)
+    kappa3=np.full((Bx,By),np.nan,dtype=np.float64)
     logfac=np.zeros((Bx,By),dtype=np.float64)
     if np.any(good):
         xf=xi[good].astype(np.int64,copy=False)
@@ -2634,11 +2664,17 @@ def cumulant2_2d(x,y,base_w,boost,xbins,ybins,beta,kbt_kcal,smooth_logfac_sigma=
         b=boost[good]
         sw=np.bincount(idx,weights=w,minlength=Bx*By).astype(np.float64).reshape(Bx,By)
         sb=np.bincount(idx,weights=w*b,minlength=Bx*By).astype(np.float64).reshape(Bx,By)
-        sb2=np.bincount(idx,weights=w*b*b,minlength=Bx*By).astype(np.float64).reshape(Bx,By)
         nz=sw>0
         mean[nz]=sb[nz]/sw[nz]
-        var[nz]=np.maximum(0.0,sb2[nz]/sw[nz]-mean[nz]*mean[nz])
+        flat_mean=mean.reshape(-1)
+        db=b-flat_mean[idx]
+        sdb2=np.bincount(idx,weights=w*db*db,minlength=Bx*By).astype(np.float64).reshape(Bx,By)
+        var[nz]=np.maximum(0.0,sdb2[nz]/sw[nz])
         logfac[nz]=beta*mean[nz]+0.5*beta*beta*var[nz]
+        if order==3:
+            sdb3=np.bincount(idx,weights=w*db*db*db,minlength=Bx*By).astype(np.float64).reshape(Bx,By)
+            kappa3[nz]=sdb3[nz]/sw[nz]
+            logfac[nz]+=(beta**3/6.0)*kappa3[nz]
     if smooth_logfac_sigma and float(smooth_logfac_sigma) > 0:
         try:
             from scipy.ndimage import gaussian_filter
@@ -2665,8 +2701,17 @@ def cumulant2_2d(x,y,base_w,boost,xbins,ybins,beta,kbt_kcal,smooth_logfac_sigma=
     }, {
         'boost_mean_kj':mean,
         'boost_var_kj2':var,
+        'boost_kappa3_kj3':kappa3,
         'log_reweight_factor':logfac,
     }
+
+
+def cumulant2_2d(x,y,base_w,boost,xbins,ybins,beta,kbt_kcal,smooth_logfac_sigma=0.0):
+    return _cumulant_expansion_2d(x,y,base_w,boost,xbins,ybins,beta,kbt_kcal,order=2,smooth_logfac_sigma=smooth_logfac_sigma)
+
+
+def cumulant3_2d(x,y,base_w,boost,xbins,ybins,beta,kbt_kcal,smooth_logfac_sigma=0.0):
+    return _cumulant_expansion_2d(x,y,base_w,boost,xbins,ybins,beta,kbt_kcal,order=3,smooth_logfac_sigma=smooth_logfac_sigma)
 
 def write_2d_fes_csv(path, fes, method):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -3483,6 +3528,9 @@ def _observable_pmf_from_logw(values: np.ndarray, logw: np.ndarray, boost: np.nd
     selected=str(selected or 'umbrella_only')
     base_w=norm_logw(logw)
     boost_ok=np.isfinite(boost).sum()>10 and np.nanstd(boost)>1.0e-12
+    if selected=='gamd_cumulant3' and boost_ok:
+        pmf,diag=cumulant3(values,base_w,boost,bins,beta,kbt_kcal,smooth_logfac_sigma=smooth_logfac_sigma)
+        return pmf, diag, 'gamd_cumulant3'
     if selected=='gamd_cumulant2' and boost_ok:
         pmf,diag=cumulant2(values,base_w,boost,bins,beta,kbt_kcal,smooth_logfac_sigma=smooth_logfac_sigma)
         return pmf, diag, 'gamd_cumulant2'
@@ -4436,14 +4484,14 @@ def write_rg_all(path,pmfs):
             for i,x in enumerate(p['cv_A']):
                 wr.writerow({'method':name,'bin':i,'rg_A':float(x),'probability':float(p['prob'][i]),'pmf_kcal_mol':float(p['pmf'][i]) if np.isfinite(p['pmf'][i]) else '', 'counts':int(p['counts'][i])})
 
-def plot_rg_outputs(d: Data, rg_pmfs: dict, selected: str, out: Path, warnings: list[str], smooth_sigma: float = 0.0):
+def plot_rg_outputs(d: Data, rg_pmfs: dict, selected: str, out: Path, warnings: list[str], smooth_sigma: float = 0.0, args=None):
     try:
         import matplotlib.pyplot as plt
     except Exception as e:
         warnings.append(f'matplotlib unavailable; no Rg PNG plots written: {e}')
         return
     fig,ax=plt.subplots(figsize=(8,5))
-    for name,p in rg_pmfs.items():
+    for name,p in _visible_pmfs(rg_pmfs, selected, args).items():
         pmf_plot=_smooth_pmf_1d(p['pmf'],smooth_sigma); m=np.isfinite(pmf_plot)
         if np.any(m): ax.plot(p['cv_A'][m],pmf_plot[m],label=name,linewidth=2.5 if name==selected else 1.3)
     ax.set_xlabel('Rg (A)'); ax.set_ylabel('PMF (kcal/mol, shifted)'); ax.set_title('Radius of gyration PMF estimates'); ax.legend(frameon=False); fig.tight_layout(); fig.savefig(out/'rg_pmf_all_methods.png',dpi=200); plt.close(fig)
@@ -4480,19 +4528,21 @@ def analyze_rg(d: Data, args, m: dict, base_w: np.ndarray, selected: str, boost_
         exp_w=norm_logw(exp_logw)
         exp_pmf=pmf_from_weights(rg_sel,exp_w,bins,kbt_kcal)
         cum_pmf,cdiag=cumulant2(rg_sel,base_w_rg,boost_sel,bins,d.beta,kbt_kcal,smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
-        rg_selected=selected if selected in {'gamd_exponential','gamd_cumulant2'} else 'gamd_cumulant2'
+        cum3_pmf,cdiag3=cumulant3(rg_sel,base_w_rg,boost_sel,bins,d.beta,kbt_kcal,smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
+        rg_selected=selected if selected in {'gamd_exponential','gamd_cumulant2','gamd_cumulant3'} else 'gamd_cumulant2'
     else:
         exp_w=base_w_rg
-        exp_pmf=umbrella; cum_pmf=umbrella; cdiag={'boost_mean_kj':np.full(len(bins)-1,np.nan),'boost_var_kj2':np.full(len(bins)-1,np.nan)}; rg_selected='umbrella_only'
-    rg_pmfs={'umbrella_only':umbrella,'gamd_exponential':exp_pmf,'gamd_cumulant2':cum_pmf}
+        exp_pmf=umbrella; cum_pmf=umbrella; cum3_pmf=umbrella; cdiag={'boost_mean_kj':np.full(len(bins)-1,np.nan),'boost_var_kj2':np.full(len(bins)-1,np.nan)}; cdiag3=cdiag; rg_selected='umbrella_only'
+    rg_pmfs={'umbrella_only':umbrella,'gamd_exponential':exp_pmf,'gamd_cumulant2':cum_pmf,'gamd_cumulant3':cum3_pmf}
     sel=rg_pmfs.get(rg_selected, umbrella)
     finite=sel['pmf'][np.isfinite(sel['pmf'])]
     minidx=int(np.nanargmin(sel['pmf'])) if finite.size else -1
-    mean_A,std_A=_pmf_distribution_mean_std(sel) if rg_selected=='gamd_cumulant2' else _weighted_mean_std(rg_sel, exp_w if rg_selected=='gamd_exponential' else base_w_rg)
+    mean_A,std_A=_pmf_distribution_mean_std(sel) if rg_selected in ('gamd_cumulant2','gamd_cumulant3') else _weighted_mean_std(rg_sel, exp_w if rg_selected=='gamd_exponential' else base_w_rg)
     write_rg_pmf(out/'rg_pmf_unbiased.csv',sel,rg_selected,{'boost_mean_kj_mol':cdiag.get('boost_mean_kj',np.full(len(bins)-1,np.nan)),'boost_var_kj2_mol2':cdiag.get('boost_var_kj2',np.full(len(bins)-1,np.nan))})
     write_rg_pmf(out/'rg_pmf_umbrella_only.csv',umbrella,'umbrella_only')
     write_rg_pmf(out/'rg_pmf_gamd_exponential.csv',exp_pmf,'gamd_exponential')
     write_rg_pmf(out/'rg_pmf_gamd_cumulant2.csv',cum_pmf,'gamd_cumulant2',{'boost_mean_kj_mol':cdiag.get('boost_mean_kj',np.full(len(bins)-1,np.nan)),'boost_var_kj2_mol2':cdiag.get('boost_var_kj2',np.full(len(bins)-1,np.nan))})
+    write_rg_pmf(out/'rg_pmf_gamd_cumulant3.csv',cum3_pmf,'gamd_cumulant3',{'boost_mean_kj_mol':cdiag3.get('boost_mean_kj',np.full(len(bins)-1,np.nan)),'boost_var_kj2_mol2':cdiag3.get('boost_var_kj2',np.full(len(bins)-1,np.nan))})
     write_rg_all(out/'rg_pmf_all_methods.csv',rg_pmfs)
     sample_rows=[]
     base_w_full=np.full(d.cv.shape,np.nan); base_w_full[mask]=base_w_rg
@@ -4500,7 +4550,7 @@ def analyze_rg(d: Data, args, m: dict, base_w: np.ndarray, selected: str, boost_
     for i in np.where(mask)[0]:
         sample_rows.append({'step':int(d.step[i]),'replica':int(d.replica[i]),'window':int(d.window[i]),'cv_A':float(d.cv[i]),'rg_A':float(rg[i]),'umbrella_mbar_weight':float(base_w_full[i]),'gamd_exponential_weight':float(exp_w_full[i]) if np.isfinite(exp_w_full[i]) else ''})
     _write_csv_rows(out/'rg_samples_with_weights.csv',sample_rows)
-    plot_rg_outputs(d,rg_pmfs,rg_selected,out,warnings,smooth_sigma=_eff_smooth(args,'pmf_smooth_sigma'))
+    plot_rg_outputs(d,rg_pmfs,rg_selected,out,warnings,smooth_sigma=_eff_smooth(args,'pmf_smooth_sigma'),args=args)
     span=float(np.max(finite)-np.min(finite)) if finite.size else float('nan')
     rg_conv=run_observable_pmf_convergence(
         d,args,rg,bins,rg_selected,sel,out,
@@ -4537,17 +4587,29 @@ def analyze_distance_rg_2d_fes(d: Data, args, base_logw: np.ndarray, selected: s
         exp_w=norm_logw(exp_logw)
         fes_exp=pmf2d_from_weights(cv_sel, rg_sel, exp_w, xbins, ybins, kbt_kcal)
         fes_cum, cdiag = cumulant2_2d(cv_sel, rg_sel, base_w, boost_sel, xbins, ybins, d.beta, kbt_kcal, smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
-        chosen = selected if selected in {'gamd_exponential','gamd_cumulant2'} else 'gamd_cumulant2'
+        fes_cum3, cdiag3 = cumulant3_2d(cv_sel, rg_sel, base_w, boost_sel, xbins, ybins, d.beta, kbt_kcal, smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
+        chosen = selected if selected in {'gamd_exponential','gamd_cumulant2','gamd_cumulant3'} else 'gamd_cumulant2'
     else:
         fes_exp=fes_umbrella
         fes_cum=fes_umbrella
+        fes_cum3=fes_umbrella
         cdiag={'boost_mean_kj':np.full((len(xbins)-1, len(ybins)-1), np.nan), 'boost_var_kj2':np.full((len(xbins)-1, len(ybins)-1), np.nan)}
+        cdiag3=cdiag
         chosen='umbrella_only'
-    fes_map={'umbrella_only': fes_umbrella, 'gamd_exponential': fes_exp, 'gamd_cumulant2': fes_cum}
+    fes_map={'umbrella_only': fes_umbrella, 'gamd_exponential': fes_exp, 'gamd_cumulant2': fes_cum, 'gamd_cumulant3': fes_cum3}
     chosen_fes=fes_map.get(chosen, fes_umbrella)
     write_2d_fes_csv(out/'distance_rg_2d_fes_selected.csv', chosen_fes, chosen)
     write_2d_fes_npz(out/'distance_rg_2d_fes_selected.npz', chosen_fes, chosen)
     plot_files=plot_2d_fes(chosen_fes, chosen, out/'distance_rg_2d_fes_selected.png', f'Distance vs Rg 2D free-energy surface ({chosen})', warnings, smooth_sigma=float(getattr(args,'fes2d_smooth_sigma',1.0)))
+    write_2d_fes_csv(out/'distance_rg_2d_fes_cumulant2.csv', fes_cum, 'gamd_cumulant2')
+    write_2d_fes_npz(out/'distance_rg_2d_fes_cumulant2.npz', fes_cum, 'gamd_cumulant2')
+    plot_files_c2=plot_2d_fes(fes_cum, 'gamd_cumulant2', out/'distance_rg_2d_fes_cumulant2.png', 'Distance vs Rg 2D free-energy surface (gamd_cumulant2)', warnings, smooth_sigma=float(getattr(args,'fes2d_smooth_sigma',1.0)))
+    want_cum3=_want_gamd_method('gamd_cumulant3', chosen, args)
+    plot_files_c3={}
+    if want_cum3:
+        write_2d_fes_csv(out/'distance_rg_2d_fes_cumulant3.csv', fes_cum3, 'gamd_cumulant3')
+        write_2d_fes_npz(out/'distance_rg_2d_fes_cumulant3.npz', fes_cum3, 'gamd_cumulant3')
+        plot_files_c3=plot_2d_fes(fes_cum3, 'gamd_cumulant3', out/'distance_rg_2d_fes_cumulant3.png', 'Distance vs Rg 2D free-energy surface (gamd_cumulant3)', warnings, smooth_sigma=float(getattr(args,'fes2d_smooth_sigma',1.0)))
     dtram2d_info=run_dtram_2d_fes(d,args,d.cv,rg,np.asarray(base_logw,dtype=np.float64),xbins,ybins,kbt_kcal,chosen_fes,chosen,'distance_rg_2d_fes','Distance vs Rg 2D free-energy surface',_primary_cv_axis_label(d.meta),'Rg (A)',out,warnings,progress,mbar_result=None)
     finite=np.isfinite(chosen_fes['pmf'])
     if np.any(finite):
@@ -4573,6 +4635,16 @@ def analyze_distance_rg_2d_fes(d: Data, args, base_logw: np.ndarray, selected: s
             'distance_rg_2d_fes_npz': str(out/'distance_rg_2d_fes_selected.npz'),
             'distance_rg_2d_fes_png': str(out/'distance_rg_2d_fes_selected.png'),
             **{f'distance_rg_2d_fes_png_{k}': v for k, v in (plot_files or {}).items()},
+            'distance_rg_2d_fes_cumulant2_csv': str(out/'distance_rg_2d_fes_cumulant2.csv'),
+            'distance_rg_2d_fes_cumulant2_npz': str(out/'distance_rg_2d_fes_cumulant2.npz'),
+            'distance_rg_2d_fes_cumulant2_png': str(out/'distance_rg_2d_fes_cumulant2.png'),
+            **{f'distance_rg_2d_fes_cumulant2_png_{k}': v for k, v in (plot_files_c2 or {}).items()},
+            **({
+                'distance_rg_2d_fes_cumulant3_csv': str(out/'distance_rg_2d_fes_cumulant3.csv'),
+                'distance_rg_2d_fes_cumulant3_npz': str(out/'distance_rg_2d_fes_cumulant3.npz'),
+                'distance_rg_2d_fes_cumulant3_png': str(out/'distance_rg_2d_fes_cumulant3.png'),
+                **{f'distance_rg_2d_fes_cumulant3_png_{k}': v for k, v in (plot_files_c3 or {}).items()},
+            } if want_cum3 else {}),
         },
     }
     if isinstance(dtram2d_info,dict) and dtram2d_info.get('available'):
@@ -4865,16 +4937,27 @@ def analyze_pca_2d_fes(d: Data, args, base_logw: np.ndarray, selected: str, boos
         exp_w=norm_logw(base_logw_sel+d.beta*boost_sel)
         fes_exp=pmf2d_from_weights(x,y,exp_w,xbins,ybins,kbt_kcal)
         fes_cum,_cdiag=cumulant2_2d(x,y,base_w,boost_sel,xbins,ybins,d.beta,kbt_kcal,smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
-        chosen=selected if selected in {'gamd_exponential','gamd_cumulant2'} else 'gamd_cumulant2'
+        fes_cum3,_cdiag3=cumulant3_2d(x,y,base_w,boost_sel,xbins,ybins,d.beta,kbt_kcal,smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
+        chosen=selected if selected in {'gamd_exponential','gamd_cumulant2','gamd_cumulant3'} else 'gamd_cumulant2'
     else:
         fes_exp=fes_umbrella
         fes_cum=fes_umbrella
+        fes_cum3=fes_umbrella
         chosen='umbrella_only'
-    fes_map={'umbrella_only':fes_umbrella,'gamd_exponential':fes_exp,'gamd_cumulant2':fes_cum}
+    fes_map={'umbrella_only':fes_umbrella,'gamd_exponential':fes_exp,'gamd_cumulant2':fes_cum,'gamd_cumulant3':fes_cum3}
     chosen_fes=fes_map.get(chosen,fes_umbrella)
     write_pca_2d_fes_csv(out/'pca_2d_fes_selected.csv',chosen_fes,chosen)
     write_pca_2d_fes_npz(out/'pca_2d_fes_selected.npz',chosen_fes,chosen)
     plot_files=plot_pca_2d_fes(chosen_fes,chosen,out/'pca_2d_fes_selected.png',f'PCA1 vs PCA2 2D free-energy surface ({chosen})',warnings,smooth_sigma=float(getattr(args,'pca_smooth_sigma',1.0)))
+    write_pca_2d_fes_csv(out/'pca_2d_fes_cumulant2.csv',fes_cum,'gamd_cumulant2')
+    write_pca_2d_fes_npz(out/'pca_2d_fes_cumulant2.npz',fes_cum,'gamd_cumulant2')
+    plot_files_c2=plot_pca_2d_fes(fes_cum,'gamd_cumulant2',out/'pca_2d_fes_cumulant2.png','PCA1 vs PCA2 2D free-energy surface (gamd_cumulant2)',warnings,smooth_sigma=float(getattr(args,'pca_smooth_sigma',1.0)))
+    want_cum3=_want_gamd_method('gamd_cumulant3', chosen, args)
+    plot_files_c3={}
+    if want_cum3:
+        write_pca_2d_fes_csv(out/'pca_2d_fes_cumulant3.csv',fes_cum3,'gamd_cumulant3')
+        write_pca_2d_fes_npz(out/'pca_2d_fes_cumulant3.npz',fes_cum3,'gamd_cumulant3')
+        plot_files_c3=plot_pca_2d_fes(fes_cum3,'gamd_cumulant3',out/'pca_2d_fes_cumulant3.png','PCA1 vs PCA2 2D free-energy surface (gamd_cumulant3)',warnings,smooth_sigma=float(getattr(args,'pca_smooth_sigma',1.0)))
     dtram2d_info=run_dtram_2d_fes(d,args,pca1,pca2,np.asarray(base_logw,dtype=np.float64),xbins,ybins,kbt_kcal,chosen_fes,chosen,'pca_2d_fes','PCA1 vs PCA2 2D free-energy surface','PCA1 (A)','PCA2 (A)',out,warnings,progress,mbar_result=None)
     finite=np.isfinite(chosen_fes['pmf'])
     if np.any(finite):
@@ -4884,7 +4967,10 @@ def analyze_pca_2d_fes(d: Data, args, base_logw: np.ndarray, selected: str, boos
         span=float(np.nanmax(chosen_fes['pmf'][finite])-np.nanmin(chosen_fes['pmf'][finite]))
     else:
         min_pca1=min_pca2=span=float('nan')
-    files={'pca_2d_fes_csv':str(out/'pca_2d_fes_selected.csv'),'pca_2d_fes_npz':str(out/'pca_2d_fes_selected.npz'),'pca_2d_fes_png':str(out/'pca_2d_fes_selected.png'), **{f'pca_2d_fes_png_{k}': v for k, v in (plot_files or {}).items()}, 'pca_2d_fes_summary_json':str(out/'pca_2d_fes_summary.json')}
+    files={'pca_2d_fes_csv':str(out/'pca_2d_fes_selected.csv'),'pca_2d_fes_npz':str(out/'pca_2d_fes_selected.npz'),'pca_2d_fes_png':str(out/'pca_2d_fes_selected.png'), **{f'pca_2d_fes_png_{k}': v for k, v in (plot_files or {}).items()},
+           'pca_2d_fes_cumulant2_csv':str(out/'pca_2d_fes_cumulant2.csv'),'pca_2d_fes_cumulant2_npz':str(out/'pca_2d_fes_cumulant2.npz'),'pca_2d_fes_cumulant2_png':str(out/'pca_2d_fes_cumulant2.png'), **{f'pca_2d_fes_cumulant2_png_{k}': v for k, v in (plot_files_c2 or {}).items()},
+           **({'pca_2d_fes_cumulant3_csv':str(out/'pca_2d_fes_cumulant3.csv'),'pca_2d_fes_cumulant3_npz':str(out/'pca_2d_fes_cumulant3.npz'),'pca_2d_fes_cumulant3_png':str(out/'pca_2d_fes_cumulant3.png'), **{f'pca_2d_fes_cumulant3_png_{k}': v for k, v in (plot_files_c3 or {}).items()}} if want_cum3 else {}),
+           'pca_2d_fes_summary_json':str(out/'pca_2d_fes_summary.json')}
     if isinstance(score_info.get('files'),dict):
         files.update(score_info['files'])
     info={
@@ -4986,7 +5072,7 @@ def _bin_indices_1d(values: np.ndarray, edges: np.ndarray) -> tuple[np.ndarray,n
 
 def _make_acc_1d(edges: np.ndarray) -> dict:
     nb=len(edges)-1
-    return {'edges':np.asarray(edges,dtype=np.float64),'counts':np.zeros(nb,dtype=np.int64),'umbrella':np.zeros(nb,dtype=np.float64),'exp':np.zeros(nb,dtype=np.float64),'sw':np.zeros(nb,dtype=np.float64),'sx':np.zeros(nb,dtype=np.float64),'sx2':np.zeros(nb,dtype=np.float64)}
+    return {'edges':np.asarray(edges,dtype=np.float64),'counts':np.zeros(nb,dtype=np.int64),'umbrella':np.zeros(nb,dtype=np.float64),'exp':np.zeros(nb,dtype=np.float64),'sw':np.zeros(nb,dtype=np.float64),'sx':np.zeros(nb,dtype=np.float64),'sx2':np.zeros(nb,dtype=np.float64),'sx3':np.zeros(nb,dtype=np.float64)}
 
 def _accumulate_1d(acc: dict, values: np.ndarray, sample_idx: np.ndarray, d: Data, base_w_full: np.ndarray, exp_w_full: np.ndarray) -> None:
     idx,good=_bin_indices_1d(values,acc['edges'])
@@ -5010,6 +5096,7 @@ def _accumulate_1d(acc: dict, values: np.ndarray, sample_idx: np.ndarray, d: Dat
         acc['sw']+=np.bincount(ii[finite_boost],weights=bw[finite_boost],minlength=nb)
         acc['sx']+=np.bincount(ii[finite_boost],weights=bw[finite_boost]*bboost[finite_boost],minlength=nb)
         acc['sx2']+=np.bincount(ii[finite_boost],weights=bw[finite_boost]*bboost[finite_boost]*bboost[finite_boost],minlength=nb)
+        acc['sx3']+=np.bincount(ii[finite_boost],weights=bw[finite_boost]*bboost[finite_boost]*bboost[finite_boost]*bboost[finite_boost],minlength=nb)
 
 def _pmf_from_probability_centers(x: np.ndarray, prob: np.ndarray, counts: np.ndarray, kbt_kcal: float) -> dict:
     p=np.asarray(prob,dtype=np.float64)
@@ -5030,26 +5117,36 @@ def _finalize_acc_1d(acc: dict, d: Data, kbt_kcal: float, smooth_logfac_sigma: f
     exp_pmf=_pmf_from_probability_centers(x,acc['exp'],acc['counts'],kbt_kcal)
     mean=np.full_like(x,np.nan,dtype=np.float64)
     var=np.full_like(x,np.nan,dtype=np.float64)
+    kappa3=np.full_like(x,np.nan,dtype=np.float64)
     logfac=np.zeros_like(x,dtype=np.float64)
+    logfac3=np.zeros_like(x,dtype=np.float64)
     nz=acc['sw']>0
     if np.any(nz):
         mean[nz]=acc['sx'][nz]/acc['sw'][nz]
         var[nz]=np.maximum(0.0,acc['sx2'][nz]/acc['sw'][nz]-mean[nz]*mean[nz])
         logfac[nz]=d.beta*mean[nz]+0.5*d.beta*d.beta*var[nz]
+        # streaming accumulator: mean not known until all chunks are in, so a
+        # mean-centered two-pass kappa3 isn't possible here; fall back to the
+        # raw-moment identity (same cancellation risk already accepted by var above).
+        kappa3[nz]=acc['sx3'][nz]/acc['sw'][nz]-3.0*mean[nz]*(acc['sx2'][nz]/acc['sw'][nz])+2.0*mean[nz]**3
+        logfac3[nz]=logfac[nz]+(d.beta**3/6.0)*kappa3[nz]
     if smooth_logfac_sigma and float(smooth_logfac_sigma) > 0:
         try:
             from scipy.ndimage import gaussian_filter1d
             logfac=gaussian_filter1d(logfac,sigma=float(smooth_logfac_sigma),mode='nearest')
+            logfac3=gaussian_filter1d(logfac3,sigma=float(smooth_logfac_sigma),mode='nearest')
         except Exception:
             pass
     cum_prob=acc['umbrella']*np.exp(np.clip(logfac,-700,700))
     cum_pmf=_pmf_from_probability_centers(x,cum_prob,acc['counts'],kbt_kcal)
-    return {'umbrella_only':umbrella,'gamd_exponential':exp_pmf,'gamd_cumulant2':cum_pmf},{'boost_mean_kj':mean,'boost_var_kj2':var,'log_reweight_factor':logfac}
+    cum3_prob=acc['umbrella']*np.exp(np.clip(logfac3,-700,700))
+    cum3_pmf=_pmf_from_probability_centers(x,cum3_prob,acc['counts'],kbt_kcal)
+    return {'umbrella_only':umbrella,'gamd_exponential':exp_pmf,'gamd_cumulant2':cum_pmf,'gamd_cumulant3':cum3_pmf},{'boost_mean_kj':mean,'boost_var_kj2':var,'boost_kappa3_kj3':kappa3,'log_reweight_factor':logfac}
 
 def _make_acc_2d(xedges: np.ndarray, yedges: np.ndarray) -> dict:
     nx=len(xedges)-1; ny=len(yedges)-1
     shape=(nx,ny)
-    return {'xedges':np.asarray(xedges,dtype=np.float64),'yedges':np.asarray(yedges,dtype=np.float64),'counts':np.zeros(shape,dtype=np.int64),'umbrella':np.zeros(shape,dtype=np.float64),'exp':np.zeros(shape,dtype=np.float64),'sw':np.zeros(shape,dtype=np.float64),'sx':np.zeros(shape,dtype=np.float64),'sx2':np.zeros(shape,dtype=np.float64)}
+    return {'xedges':np.asarray(xedges,dtype=np.float64),'yedges':np.asarray(yedges,dtype=np.float64),'counts':np.zeros(shape,dtype=np.int64),'umbrella':np.zeros(shape,dtype=np.float64),'exp':np.zeros(shape,dtype=np.float64),'sw':np.zeros(shape,dtype=np.float64),'sx':np.zeros(shape,dtype=np.float64),'sx2':np.zeros(shape,dtype=np.float64),'sx3':np.zeros(shape,dtype=np.float64)}
 
 def _accumulate_2d(acc: dict, xvals: np.ndarray, yvals: np.ndarray, sample_idx: np.ndarray, d: Data, base_w_full: np.ndarray, exp_w_full: np.ndarray) -> None:
     x=np.asarray(xvals,dtype=np.float64); y=np.asarray(yvals,dtype=np.float64)
@@ -5072,6 +5169,7 @@ def _accumulate_2d(acc: dict, xvals: np.ndarray, yvals: np.ndarray, sample_idx: 
         acc['sw']+=np.bincount(linear[finite_boost],weights=bw[finite_boost],minlength=nx*ny).reshape(nx,ny)
         acc['sx']+=np.bincount(linear[finite_boost],weights=bw[finite_boost]*boost[finite_boost],minlength=nx*ny).reshape(nx,ny)
         acc['sx2']+=np.bincount(linear[finite_boost],weights=bw[finite_boost]*boost[finite_boost]*boost[finite_boost],minlength=nx*ny).reshape(nx,ny)
+        acc['sx3']+=np.bincount(linear[finite_boost],weights=bw[finite_boost]*boost[finite_boost]*boost[finite_boost]*boost[finite_boost],minlength=nx*ny).reshape(nx,ny)
 
 def _pmf2d_from_probability(xedges: np.ndarray, yedges: np.ndarray, prob: np.ndarray, counts: np.ndarray, kbt_kcal: float) -> dict:
     p=np.asarray(prob,dtype=np.float64)
@@ -5087,30 +5185,51 @@ def _finalize_acc_2d(acc: dict, d: Data, kbt_kcal: float, smooth_logfac_sigma: f
     xe=acc['xedges']; ye=acc['yedges']
     umbrella=_pmf2d_from_probability(xe,ye,acc['umbrella'],acc['counts'],kbt_kcal)
     exp_pmf=_pmf2d_from_probability(xe,ye,acc['exp'],acc['counts'],kbt_kcal)
-    mean=np.full(acc['umbrella'].shape,np.nan,dtype=np.float64); var=np.full_like(mean,np.nan); logfac=np.zeros_like(mean)
+    mean=np.full(acc['umbrella'].shape,np.nan,dtype=np.float64); var=np.full_like(mean,np.nan); kappa3=np.full_like(mean,np.nan)
+    logfac=np.zeros_like(mean); logfac3=np.zeros_like(mean)
     nz=acc['sw']>0
     if np.any(nz):
         mean[nz]=acc['sx'][nz]/acc['sw'][nz]
         var[nz]=np.maximum(0.0,acc['sx2'][nz]/acc['sw'][nz]-mean[nz]*mean[nz])
         logfac[nz]=d.beta*mean[nz]+0.5*d.beta*d.beta*var[nz]
+        # streaming accumulator: see _finalize_acc_1d note on raw-moment kappa3.
+        kappa3[nz]=acc['sx3'][nz]/acc['sw'][nz]-3.0*mean[nz]*(acc['sx2'][nz]/acc['sw'][nz])+2.0*mean[nz]**3
+        logfac3[nz]=logfac[nz]+(d.beta**3/6.0)*kappa3[nz]
     if smooth_logfac_sigma and float(smooth_logfac_sigma) > 0:
         try:
             from scipy.ndimage import gaussian_filter
             logfac=gaussian_filter(logfac,sigma=float(smooth_logfac_sigma),mode='nearest')
+            logfac3=gaussian_filter(logfac3,sigma=float(smooth_logfac_sigma),mode='nearest')
         except Exception:
             pass
     cum_prob=acc['umbrella']*np.exp(np.clip(logfac,-700,700))
     cum_pmf=_pmf2d_from_probability(xe,ye,cum_prob,acc['counts'],kbt_kcal)
-    return {'umbrella_only':umbrella,'gamd_exponential':exp_pmf,'gamd_cumulant2':cum_pmf},{'boost_mean_kj':mean,'boost_var_kj2':var,'log_reweight_factor':logfac}
+    cum3_prob=acc['umbrella']*np.exp(np.clip(logfac3,-700,700))
+    cum3_pmf=_pmf2d_from_probability(xe,ye,cum3_prob,acc['counts'],kbt_kcal)
+    return {'umbrella_only':umbrella,'gamd_exponential':exp_pmf,'gamd_cumulant2':cum_pmf,'gamd_cumulant3':cum3_pmf},{'boost_mean_kj':mean,'boost_var_kj2':var,'boost_kappa3_kj3':kappa3,'log_reweight_factor':logfac}
+
+_OPT_IN_GAMD_METHODS = {'gamd_exponential': 'plot_gamd_exponential', 'gamd_cumulant3': 'plot_gamd_cumulant3'}
+
+def _want_gamd_method(method: str, chosen: str, args) -> bool:
+    """gamd_exponential/gamd_cumulant3 are opt-in (--plot-gamd-exponential/--plot-gamd-cumulant3);
+    umbrella_only and gamd_cumulant2 are always shown. The currently chosen/selected method is
+    always shown even if it is one of the opt-in ones (explicit --selected-method forces it)."""
+    flag = _OPT_IN_GAMD_METHODS.get(method)
+    return flag is None or bool(getattr(args, flag, False)) or method == chosen
+
+def _visible_pmfs(pmfs: dict, chosen: str, args) -> dict:
+    """Filter a {method: pmf} dict down to the methods that should be drawn in a multi-method
+    comparison plot, per _want_gamd_method."""
+    return {name: p for name, p in pmfs.items() if _want_gamd_method(name, chosen, args)}
 
 def _choose_method(selected: str, boost_ok: bool) -> str:
-    if boost_ok and selected in {'gamd_exponential','gamd_cumulant2'}:
+    if boost_ok and selected in {'gamd_exponential','gamd_cumulant2','gamd_cumulant3'}:
         return selected
-    if boost_ok and selected not in {'umbrella_only','gamd_exponential','gamd_cumulant2'}:
+    if boost_ok and selected not in {'umbrella_only','gamd_exponential','gamd_cumulant2','gamd_cumulant3'}:
         return 'gamd_cumulant2'
     return 'umbrella_only'
 
-def _write_scalar_pmfs(out_dir: Path, prefix: str, label: str, xlabel: str, pmfs: dict, selected_method: str, warnings: list[str], smooth_sigma: float = 0.0) -> dict:
+def _write_scalar_pmfs(out_dir: Path, prefix: str, label: str, xlabel: str, pmfs: dict, selected_method: str, warnings: list[str], smooth_sigma: float = 0.0, args=None) -> dict:
     out_dir.mkdir(parents=True,exist_ok=True)
     all_path=out_dir/f'{prefix}_pmf_all_methods.csv'
     selected_path=out_dir/f'{prefix}_pmf_unbiased.csv'
@@ -5129,7 +5248,7 @@ def _write_scalar_pmfs(out_dir: Path, prefix: str, label: str, xlabel: str, pmfs
     try:
         import matplotlib.pyplot as plt
         fig,ax=plt.subplots(figsize=(8,5))
-        for method,p in pmfs.items():
+        for method,p in _visible_pmfs(pmfs, selected_method, args).items():
             pmf_plot=_smooth_pmf_1d(p['pmf'],smooth_sigma); m=np.isfinite(pmf_plot)
             if np.any(m):
                 ax.plot(p['x'][m],pmf_plot[m],label=method,linewidth=2.5 if method==selected_method else 1.3)
@@ -5143,7 +5262,7 @@ def _write_scalar_pmfs(out_dir: Path, prefix: str, label: str, xlabel: str, pmfs
         mi=int(np.nanargmin(sel['pmf'])); min_x=float(sel['x'][mi]); span=float(np.nanmax(finite)-np.nanmin(finite))
     return {'selected_method':selected_method,'minimum_x':min_x,'span_kcal_mol':span,'files':{f'{prefix}_pmf_unbiased_csv':str(selected_path),f'{prefix}_pmf_all_methods_csv':str(all_path),f'{prefix}_pmf_png':str(png)}}
 
-def _write_generic_2d_fes(out_dir: Path, prefix: str, title: str, xlabel: str, ylabel: str, pmfs2d: dict, selected_method: str, warnings: list[str], x_field: str='x', y_field: str='y', x_unit: str='', y_unit: str='', smooth_sigma: float = 1.0) -> dict:
+def _write_generic_2d_fes(out_dir: Path, prefix: str, title: str, xlabel: str, ylabel: str, pmfs2d: dict, selected_method: str, warnings: list[str], x_field: str='x', y_field: str='y', x_unit: str='', y_unit: str='', smooth_sigma: float = 1.0, args=None) -> dict:
     out_dir.mkdir(parents=True,exist_ok=True)
     sel=pmfs2d.get(selected_method,pmfs2d.get('umbrella_only'))
     csv_path=out_dir/f'{prefix}_2d_fes.csv'
@@ -5164,9 +5283,29 @@ def _write_generic_2d_fes(out_dir: Path, prefix: str, title: str, xlabel: str, y
         min_x=float(sel['x'][mi[0]]); min_y=float(sel['y'][mi[1]]); span=float(np.nanmax(finite)-np.nanmin(finite))
     files={'csv':str(csv_path),'npz':str(npz_path),'png':str(png_path)}
     files.update({f'png_{k}':v for k,v in (plot_files or {}).items()})
+    for cum_method in ('gamd_cumulant2','gamd_cumulant3'):
+        if not _want_gamd_method(cum_method, selected_method, args):
+            continue
+        sel_cum=pmfs2d.get(cum_method)
+        if sel_cum is None:
+            continue
+        cum_tag=cum_method.replace('gamd_','')
+        csv_path_cum=out_dir/f'{prefix}_2d_fes_{cum_tag}.csv'
+        npz_path_cum=out_dir/f'{prefix}_2d_fes_{cum_tag}.npz'
+        png_path_cum=out_dir/f'{prefix}_2d_fes_{cum_tag}.png'
+        with csv_path_cum.open('w',newline='') as f:
+            wr=csv.DictWriter(f,fieldnames=['method',f'{x_field}_bin',f'{y_field}_bin',x_field,y_field,'probability','pmf_kcal_mol','counts'])
+            wr.writeheader()
+            for i,x in enumerate(sel_cum['x']):
+                for j,y in enumerate(sel_cum['y']):
+                    wr.writerow({'method':cum_method,f'{x_field}_bin':i,f'{y_field}_bin':j,x_field:float(x),y_field:float(y),'probability':float(sel_cum['prob'][i,j]) if np.isfinite(sel_cum['prob'][i,j]) else '', 'pmf_kcal_mol':float(sel_cum['pmf'][i,j]) if np.isfinite(sel_cum['pmf'][i,j]) else '', 'counts':int(sel_cum['counts'][i,j])})
+        np.savez_compressed(npz_path_cum, method=np.asarray([cum_method]), x=sel_cum['x'], y=sel_cum['y'], xedges=sel_cum['xedges'], yedges=sel_cum['yedges'], probability=sel_cum['prob'], pmf_kcal_mol=sel_cum['pmf'], counts=sel_cum['counts'], x_label=np.asarray([xlabel]), y_label=np.asarray([ylabel]), x_field=np.asarray([x_field]), y_field=np.asarray([y_field]), x_unit=np.asarray([x_unit]), y_unit=np.asarray([y_unit]))
+        plot_files_cum=_plot_2d_fes_multirange(sel_cum['pmf'],sel_cum['xedges'],sel_cum['yedges'],sel_cum['x'],sel_cum['y'],png_path_cum,title.rsplit(' (',1)[0]+f' ({cum_method})',xlabel,ylabel,warnings,smooth_sigma=smooth_sigma,figsize=(8.0,6.2),dpi=210,cmap_name='viridis',contour=True)
+        files[f'{cum_tag}_csv']=str(csv_path_cum); files[f'{cum_tag}_npz']=str(npz_path_cum); files[f'{cum_tag}_png']=str(png_path_cum)
+        files.update({f'{cum_tag}_png_{k}':v for k,v in (plot_files_cum or {}).items()})
     return {'selected_method':selected_method,'minimum_x':min_x,'minimum_y':min_y,'span_kcal_mol':span,'plot_ranges_kcal_mol':['0-2','0-5','0-10','0-20','0-all'],'files':files,'x_label':xlabel,'y_label':ylabel,'x_field':x_field,'y_field':y_field}
 
-def _write_rama_2d(out_dir: Path, residue_label: str, pmfs2d: dict, selected_method: str, warnings: list[str], smooth_sigma: float = 1.0) -> dict:
+def _write_rama_2d(out_dir: Path, residue_label: str, pmfs2d: dict, selected_method: str, warnings: list[str], smooth_sigma: float = 1.0, args=None) -> dict:
     out_dir.mkdir(parents=True,exist_ok=True)
     slug=_slug(residue_label)
     sel=pmfs2d.get(selected_method,pmfs2d.get('umbrella_only'))
@@ -5188,6 +5327,26 @@ def _write_rama_2d(out_dir: Path, residue_label: str, pmfs2d: dict, selected_met
         min_phi=float(sel['x'][mi[0]]); min_psi=float(sel['y'][mi[1]]); span=float(np.nanmax(finite)-np.nanmin(finite))
     files={'csv':str(csv_path),'npz':str(npz_path),'png':str(png_path)}
     files.update({f'png_{k}':v for k,v in plot_files.items()})
+    for cum_method in ('gamd_cumulant2','gamd_cumulant3'):
+        if not _want_gamd_method(cum_method, selected_method, args):
+            continue
+        sel_cum=pmfs2d.get(cum_method)
+        if sel_cum is None:
+            continue
+        cum_tag=cum_method.replace('gamd_','')
+        csv_path_cum=out_dir/f'rama_{slug}_2d_fes_{cum_tag}.csv'
+        npz_path_cum=out_dir/f'rama_{slug}_2d_fes_{cum_tag}.npz'
+        png_path_cum=out_dir/f'rama_{slug}_2d_fes_{cum_tag}.png'
+        with csv_path_cum.open('w',newline='') as f:
+            wr=csv.DictWriter(f,fieldnames=['method','phi_bin','psi_bin','phi_deg','psi_deg','probability','pmf_kcal_mol','counts'])
+            wr.writeheader()
+            for i,x in enumerate(sel_cum['x']):
+                for j,y in enumerate(sel_cum['y']):
+                    wr.writerow({'method':cum_method,'phi_bin':i,'psi_bin':j,'phi_deg':float(x),'psi_deg':float(y),'probability':float(sel_cum['prob'][i,j]) if np.isfinite(sel_cum['prob'][i,j]) else '', 'pmf_kcal_mol':float(sel_cum['pmf'][i,j]) if np.isfinite(sel_cum['pmf'][i,j]) else '', 'counts':int(sel_cum['counts'][i,j])})
+        np.savez_compressed(npz_path_cum, method=np.asarray([cum_method]), phi_deg=sel_cum['x'], psi_deg=sel_cum['y'], phi_edges_deg=sel_cum['xedges'], psi_edges_deg=sel_cum['yedges'], probability=sel_cum['prob'], pmf_kcal_mol=sel_cum['pmf'], counts=sel_cum['counts'])
+        plot_files_cum=_plot_2d_fes_multirange(sel_cum['pmf'],sel_cum['xedges'],sel_cum['yedges'],sel_cum['x'],sel_cum['y'],png_path_cum,f'Ramachandran FES {residue_label} ({cum_method})','phi (deg)','psi (deg)',warnings,smooth_sigma=smooth_sigma,figsize=(6.6,5.8),dpi=200,cmap_name='viridis',contour=True)
+        files[f'{cum_tag}_csv']=str(csv_path_cum); files[f'{cum_tag}_npz']=str(npz_path_cum); files[f'{cum_tag}_png']=str(png_path_cum)
+        files.update({f'{cum_tag}_png_{k}':v for k,v in (plot_files_cum or {}).items()})
     return {'residue':residue_label,'selected_method':selected_method,'minimum_phi_deg':min_phi,'minimum_psi_deg':min_psi,'span_kcal_mol':span,'plot_ranges_kcal_mol':['0-2','0-5','0-10','0-20','0-all'],'files':files}
 
 def _wrap_degrees(rad_values: np.ndarray) -> np.ndarray:
@@ -5537,7 +5696,7 @@ def analyze_extra_observable_pmfs(d: Data, args, base_logw: np.ndarray, selected
         pmfs,_diag=_finalize_acc_1d(acc,d,kbt_kcal,smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
         scalar_pmfs_cache[key]=(pmfs,np.asarray(acc['edges'],dtype=np.float64))
         lab,xlab=scalar_labels.get(key,(key,key))
-        info=_write_scalar_pmfs(out_extra,key,lab,xlab,pmfs,selected_method,warnings,smooth_sigma=_eff_smooth(args,'pmf_smooth_sigma'))
+        info=_write_scalar_pmfs(out_extra,key,lab,xlab,pmfs,selected_method,warnings,smooth_sigma=_eff_smooth(args,'pmf_smooth_sigma'),args=args)
         scalar_summaries[key]=info
         files.update(info.get('files',{}))
     summary['scalar_pmfs']=scalar_summaries
@@ -5552,7 +5711,7 @@ def analyze_extra_observable_pmfs(d: Data, args, base_logw: np.ndarray, selected
     for key,acc in contact2d_accs.items():
         pmfs2d,_diag=_finalize_acc_2d(acc,d,kbt_kcal,smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
         prefix,title,xlab,ylab,xfield,yfield=contact2d_meta[key]
-        info=_write_generic_2d_fes(contact2d_dir,prefix,title+f' ({selected_method})',xlab,ylab,pmfs2d,selected_method,warnings,x_field=xfield,y_field=yfield,smooth_sigma=float(getattr(args,'fes2d_smooth_sigma',1.0)))
+        info=_write_generic_2d_fes(contact2d_dir,prefix,title+f' ({selected_method})',xlab,ylab,pmfs2d,selected_method,warnings,x_field=xfield,y_field=yfield,smooth_sigma=float(getattr(args,'fes2d_smooth_sigma',1.0)),args=args)
         contact2d_summary[key]=info
         files.update({f'{prefix}_2d_fes_{fk}':fv for fk,fv in info.get('files',{}).items()})
     if contact2d_summary:
@@ -5566,7 +5725,7 @@ def analyze_extra_observable_pmfs(d: Data, args, base_logw: np.ndarray, selected
         for lab,acc in accs.items():
             pmfs,_diag=_finalize_acc_1d(acc,d,kbt_kcal,smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
             torsion_pmfs_cache[(torsion_name,lab)]=(pmfs,np.asarray(acc['edges'],dtype=np.float64))
-            info=_write_scalar_pmfs(torsion_dir,f'{torsion_name}_{_slug(lab)}',f'{torsion_name.upper()} PMF {lab}',f'{torsion_name} (deg)',pmfs,selected_method,warnings,smooth_sigma=_eff_smooth(args,'pmf_smooth_sigma'))
+            info=_write_scalar_pmfs(torsion_dir,f'{torsion_name}_{_slug(lab)}',f'{torsion_name.upper()} PMF {lab}',f'{torsion_name} (deg)',pmfs,selected_method,warnings,smooth_sigma=_eff_smooth(args,'pmf_smooth_sigma'),args=args)
             files.update(info.get('files',{}))
             for method,p in pmfs.items():
                 for i,x in enumerate(p['x']):
@@ -5576,7 +5735,7 @@ def analyze_extra_observable_pmfs(d: Data, args, base_logw: np.ndarray, selected
     rama_dir=out_extra/'ramachandran_2d_fes'; rama_dir.mkdir(exist_ok=True)
     for lab,acc in rama_accs.items():
         pmfs2d,_diag=_finalize_acc_2d(acc,d,kbt_kcal,smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
-        rinfo=_write_rama_2d(rama_dir,lab,pmfs2d,selected_method,warnings,smooth_sigma=float(getattr(args,'fes2d_smooth_sigma',1.0)))
+        rinfo=_write_rama_2d(rama_dir,lab,pmfs2d,selected_method,warnings,smooth_sigma=float(getattr(args,'fes2d_smooth_sigma',1.0)),args=args)
         torsion_info['ramachandran'].append(rinfo)
     files['ramachandran_2d_fes_dir']=str(rama_dir)
     summary['torsions']=torsion_info
@@ -6314,7 +6473,7 @@ def write_dtram_diagnostic_outputs(d: Data, args, bins: np.ndarray, kbt_kcal: fl
         method=dtram_info.get('method','dtram')
         # PMF comparison
         fig,ax=plt.subplots(figsize=(8,5),constrained_layout=True)
-        for name,p in pmfs.items():
+        for name,p in _visible_pmfs(pmfs, selected, args).items():
             if not isinstance(p,dict) or 'pmf' not in p:
                 continue
             F=_smooth_pmf_1d(np.asarray(p['pmf'],dtype=float),_eff_smooth(args,'pmf_smooth_sigma'))
@@ -6478,6 +6637,9 @@ def _selected_2d_fes_from_logw(x: np.ndarray, y: np.ndarray, logw: np.ndarray, b
     selected=str(selected or 'umbrella_only')
     if selected == 'gamd_exponential' and boost_ok:
         return pmf2d_from_weights(x,y,norm_logw(logw+beta*boost),xedges,yedges,kbt_kcal), 'gamd_exponential'
+    if selected == 'gamd_cumulant3' and boost_ok:
+        fes,_diag=cumulant3_2d(x,y,base_w,boost,xedges,yedges,beta,kbt_kcal,smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
+        return fes, 'gamd_cumulant3'
     if selected == 'gamd_cumulant2' and boost_ok:
         fes,_diag=cumulant2_2d(x,y,base_w,boost,xedges,yedges,beta,kbt_kcal,smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
         return fes, 'gamd_cumulant2'
@@ -6885,7 +7047,8 @@ def boost_stats(boost,beta):
     return out
 
 def plot_gamd_boost(d, out, warnings):
-    """Write gamd_boost_diagnostics.png and gamd_reweight_quality.png to out/."""
+    """Write gamd_boost_diagnostics.png, gamd_dv_distribution_per_window.png,
+    gamd_reweight_quality.png, and gamd_cumulant_quality.png to out/."""
     try:
         import matplotlib.pyplot as plt
     except Exception as e:
@@ -6938,6 +7101,26 @@ def plot_gamd_boost(d, out, warnings):
         ax.set_ylabel('dihedral / combined (median)'); ax.set_title('Dihedral fraction per window')
         ax.legend(fontsize=8)
     fig.savefig(out / 'gamd_boost_diagnostics.png', dpi=200, bbox_inches='tight'); plt.close(fig)
+
+    win_groups = [comb_kcal[d.window == k] for k in range(K)]
+    win_groups = [g[np.isfinite(g)] for g in win_groups]
+    valid_wins = [k for k in range(K) if win_groups[k].size >= 4]
+    if valid_wins:
+        fig, ax = plt.subplots(figsize=(max(8, 0.35 * len(valid_wins)), 4.5), constrained_layout=True)
+        vp = ax.violinplot([win_groups[k] for k in valid_wins], positions=valid_wins, widths=0.8,
+                            showmeans=True, showextrema=True)
+        for body in vp['bodies']:
+            body.set_facecolor('#2ecc71'); body.set_alpha(0.55)
+        for part in ('cbars', 'cmins', 'cmaxes', 'cmeans'):
+            if part in vp: vp[part].set_color('#1e8449')
+        ax.axhline(kbt_kcal, color='k', ls='--', lw=0.9, label='kT')
+        ax.set_xlabel('window index'); ax.set_ylabel('GaMD boost ΔV (kcal/mol)')
+        ax.set_title('ΔV distribution per window (combined boost)')
+        ax.legend(fontsize=8)
+        fig.savefig(out / 'gamd_dv_distribution_per_window.png', dpi=200, bbox_inches='tight'); plt.close(fig)
+    else:
+        warnings.append('GaMD ΔV per-window distribution plot skipped: no window has >=4 finite boost samples')
+
     fig, ax = plt.subplots(figsize=(8, 4), constrained_layout=True)
     ax.bar(wins, win_varbdv, color='#e08c5c', alpha=0.85)
     for thresh, color, lbl in [(1.0, 'green', 'var=1'), (5.0, 'orange', 'var=5'), (10.0, 'red', 'var=10')]:
@@ -7003,13 +7186,13 @@ def plot_gamd_boost(d, out, warnings):
     ax.legend(handles=handles, fontsize=8)
     fig.savefig(out / 'gamd_cumulant_quality.png', dpi=200, bbox_inches='tight'); plt.close(fig)
 
-def plot_outputs(d,pmfs,selected,O,out,warnings,smooth_sigma=0.0):
+def plot_outputs(d,pmfs,selected,O,out,warnings,smooth_sigma=0.0,args=None):
     try:
         import matplotlib.pyplot as plt
     except Exception as e:
         warnings.append(f'matplotlib unavailable; no PNG plots written: {e}'); return
     fig,ax=plt.subplots(figsize=(8,5))
-    for name,p in pmfs.items():
+    for name,p in _visible_pmfs(pmfs, selected, args).items():
         pmf_plot=_smooth_pmf_1d(p['pmf'],smooth_sigma); m=np.isfinite(pmf_plot)
         if np.any(m): ax.plot(p['cv_A'][m],pmf_plot[m],label=name,linewidth=2.5 if name==selected else 1.3)
     ax.set_xlabel(_primary_cv_axis_label(d.meta)); ax.set_ylabel('PMF (kcal/mol, shifted)'); ax.set_title('GaREUS PMF estimates'); ax.legend(frameon=False); fig.tight_layout(); fig.savefig(out/'pmf_all_methods.png',dpi=200); plt.close(fig)
@@ -7289,17 +7472,20 @@ def analyze_secondary_cv_pmf(d: Data, args, base_logw: np.ndarray, selected: str
         exp_w=norm_logw(base_logw_sel + d.beta*boost_sel)
         exp_pmf=pmf_from_weights(cv2_sel, exp_w, bins, kbt_kcal)
         cum_pmf,cdiag=cumulant2(cv2_sel, base_w, boost_sel, bins, d.beta, kbt_kcal, smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
-        chosen=selected if selected in {'gamd_exponential','gamd_cumulant2'} else 'gamd_cumulant2'
+        cum3_pmf,cdiag3=cumulant3(cv2_sel, base_w, boost_sel, bins, d.beta, kbt_kcal, smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
+        chosen=selected if selected in {'gamd_exponential','gamd_cumulant2','gamd_cumulant3'} else 'gamd_cumulant2'
     else:
-        exp_pmf=umbrella; cum_pmf=umbrella
+        exp_pmf=umbrella; cum_pmf=umbrella; cum3_pmf=umbrella
         cdiag={'boost_mean_kj':np.full(len(bins)-1,np.nan),'boost_var_kj2':np.full(len(bins)-1,np.nan)}
+        cdiag3=cdiag
         chosen='umbrella_only'
-    pmfs={'umbrella_only':umbrella,'gamd_exponential':exp_pmf,'gamd_cumulant2':cum_pmf}
+    pmfs={'umbrella_only':umbrella,'gamd_exponential':exp_pmf,'gamd_cumulant2':cum_pmf,'gamd_cumulant3':cum3_pmf}
     chosen_pmf=pmfs.get(chosen, umbrella)
     write_cv2_pmf(out/'cv2_pmf_unbiased.csv', chosen_pmf, chosen)
     write_cv2_pmf(out/'cv2_pmf_umbrella_only.csv', umbrella, 'umbrella_only')
     write_cv2_pmf(out/'cv2_pmf_gamd_exponential.csv', exp_pmf, 'gamd_exponential')
     write_cv2_pmf(out/'cv2_pmf_gamd_cumulant2.csv', cum_pmf, 'gamd_cumulant2')
+    write_cv2_pmf(out/'cv2_pmf_gamd_cumulant3.csv', cum3_pmf, 'gamd_cumulant3')
     plot_file=None
     cv2_label=_secondary_cv_label(d.meta)
     regions=_secondary_cv_regions(d.meta)
@@ -7307,7 +7493,7 @@ def analyze_secondary_cv_pmf(d: Data, args, base_logw: np.ndarray, selected: str
         import matplotlib.pyplot as plt
         fig,ax=plt.subplots(figsize=(8,5))
         _cv2_smooth=_eff_smooth(args,'pmf_smooth_sigma')
-        for name,p in pmfs.items():
+        for name,p in _visible_pmfs(pmfs, chosen, args).items():
             pmf_plot=_smooth_pmf_1d(p['pmf'],_cv2_smooth); m=np.isfinite(pmf_plot)
             if np.any(m): ax.plot(p['cv_A'][m],pmf_plot[m],label=name,linewidth=2.5 if name==chosen else 1.3)
         for reg in regions:
@@ -7329,7 +7515,7 @@ def analyze_secondary_cv_pmf(d: Data, args, base_logw: np.ndarray, selected: str
         out_dir_name='cv2_convergence',file_prefix='cv2',
         legacy_total_names=False,basin_tracking=True,progress=progress,
     )
-    info={'available':True,'selected_unbiased_method':chosen,'n_samples':int(np.count_nonzero(mask)),'bins':int(len(bins)-1),'pmf_span_kcal_mol':span,'convergence':cv2_conv,'files':{'cv2_pmf_unbiased_csv':str(out/'cv2_pmf_unbiased.csv'),'cv2_pmf_umbrella_only_csv':str(out/'cv2_pmf_umbrella_only.csv'),'cv2_pmf_gamd_exponential_csv':str(out/'cv2_pmf_gamd_exponential.csv'),'cv2_pmf_gamd_cumulant2_csv':str(out/'cv2_pmf_gamd_cumulant2.csv')}}
+    info={'available':True,'selected_unbiased_method':chosen,'n_samples':int(np.count_nonzero(mask)),'bins':int(len(bins)-1),'pmf_span_kcal_mol':span,'convergence':cv2_conv,'files':{'cv2_pmf_unbiased_csv':str(out/'cv2_pmf_unbiased.csv'),'cv2_pmf_umbrella_only_csv':str(out/'cv2_pmf_umbrella_only.csv'),'cv2_pmf_gamd_exponential_csv':str(out/'cv2_pmf_gamd_exponential.csv'),'cv2_pmf_gamd_cumulant2_csv':str(out/'cv2_pmf_gamd_cumulant2.csv'),'cv2_pmf_gamd_cumulant3_csv':str(out/'cv2_pmf_gamd_cumulant3.csv')}}
     if plot_file: info['files']['cv2_pmf_png']=plot_file
     if isinstance(cv2_conv,dict) and cv2_conv.get('files'):
         info['files'].update({k:v for k,v in cv2_conv['files'].items()})
@@ -7356,18 +7542,29 @@ def analyze_cv1_cv2_2d_fes(d: Data, args, base_logw: np.ndarray, selected: str, 
         exp_w=norm_logw(exp_logw)
         fes_exp=pmf2d_from_weights(cv_sel, cv2_sel, exp_w, xbins, ybins, kbt_kcal)
         fes_cum,cdiag=cumulant2_2d(cv_sel, cv2_sel, base_w, boost_sel, xbins, ybins, d.beta, kbt_kcal, smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
-        chosen=selected if selected in {'gamd_exponential','gamd_cumulant2'} else 'gamd_cumulant2'
+        fes_cum3,cdiag3=cumulant3_2d(cv_sel, cv2_sel, base_w, boost_sel, xbins, ybins, d.beta, kbt_kcal, smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
+        chosen=selected if selected in {'gamd_exponential','gamd_cumulant2','gamd_cumulant3'} else 'gamd_cumulant2'
     else:
-        fes_exp=fes_umbrella; fes_cum=fes_umbrella
+        fes_exp=fes_umbrella; fes_cum=fes_umbrella; fes_cum3=fes_umbrella
         cdiag={'boost_mean_kj':np.full((len(xbins)-1,len(ybins)-1),np.nan),'boost_var_kj2':np.full((len(xbins)-1,len(ybins)-1),np.nan)}
+        cdiag3=cdiag
         chosen='umbrella_only'
-    chosen_fes=({'umbrella_only':fes_umbrella,'gamd_exponential':fes_exp,'gamd_cumulant2':fes_cum}).get(chosen,fes_umbrella)
+    chosen_fes=({'umbrella_only':fes_umbrella,'gamd_exponential':fes_exp,'gamd_cumulant2':fes_cum,'gamd_cumulant3':fes_cum3}).get(chosen,fes_umbrella)
     smooth_sigma=float(getattr(args,'fes2d_cv2_smooth_sigma',1.0))
     cv2_label=_secondary_cv_label(d.meta)
     regions=_secondary_cv_regions(d.meta)
     write_cv1_cv2_2d_fes_csv(out/'cv1_cv2_2d_fes_selected.csv', chosen_fes, chosen)
     write_cv1_cv2_2d_fes_npz(out/'cv1_cv2_2d_fes_selected.npz', chosen_fes, chosen)
     plot_files=plot_cv1_cv2_2d_fes(chosen_fes, chosen, out/'cv1_cv2_2d_fes_selected.png', f'CV1 vs {cv2_label} 2D FES ({chosen})', warnings, smooth_sigma=smooth_sigma, cv2_label=cv2_label, cv1_label=_primary_cv_axis_label(d.meta), regions=regions or None)
+    write_cv1_cv2_2d_fes_csv(out/'cv1_cv2_2d_fes_cumulant2.csv', fes_cum, 'gamd_cumulant2')
+    write_cv1_cv2_2d_fes_npz(out/'cv1_cv2_2d_fes_cumulant2.npz', fes_cum, 'gamd_cumulant2')
+    plot_files_c2=plot_cv1_cv2_2d_fes(fes_cum, 'gamd_cumulant2', out/'cv1_cv2_2d_fes_cumulant2.png', f'CV1 vs {cv2_label} 2D FES (gamd_cumulant2)', warnings, smooth_sigma=smooth_sigma, cv2_label=cv2_label, cv1_label=_primary_cv_axis_label(d.meta), regions=regions or None)
+    want_cum3=_want_gamd_method('gamd_cumulant3', chosen, args)
+    plot_files_c3={}
+    if want_cum3:
+        write_cv1_cv2_2d_fes_csv(out/'cv1_cv2_2d_fes_cumulant3.csv', fes_cum3, 'gamd_cumulant3')
+        write_cv1_cv2_2d_fes_npz(out/'cv1_cv2_2d_fes_cumulant3.npz', fes_cum3, 'gamd_cumulant3')
+        plot_files_c3=plot_cv1_cv2_2d_fes(fes_cum3, 'gamd_cumulant3', out/'cv1_cv2_2d_fes_cumulant3.png', f'CV1 vs {cv2_label} 2D FES (gamd_cumulant3)', warnings, smooth_sigma=smooth_sigma, cv2_label=cv2_label, cv1_label=_primary_cv_axis_label(d.meta), regions=regions or None)
     dtram2d_info=run_dtram_2d_fes(d,args,d.cv,cv2,np.asarray(base_logw,dtype=np.float64),xbins,ybins,kbt_kcal,chosen_fes,chosen,'cv1_cv2_2d_fes',f'CV1 vs {cv2_label} 2D FES',_primary_cv_axis_label(d.meta),cv2_label,out,warnings,progress,mbar_result=None)
     finite=np.isfinite(chosen_fes['pmf'])
     if np.any(finite):
@@ -7376,7 +7573,11 @@ def analyze_cv1_cv2_2d_fes(d: Data, args, base_logw: np.ndarray, selected: str, 
         span=float(np.nanmax(chosen_fes['pmf'][finite])-np.nanmin(chosen_fes['pmf'][finite]))
     else:
         min_cv=min_cv2=span=float('nan')
-    info={'available':True,'selected_unbiased_method':chosen,'n_samples':int(np.count_nonzero(mask)),'cv_bins':int(len(xbins)-1),'cv2_bins':int(len(ybins)-1),'pmf_minimum_cv_A':min_cv,'pmf_minimum_cv2_A':min_cv2,'pmf_span_kcal_mol':span,'normalization':'Minimum finite free energy shifted to 0 kcal/mol','files':{'cv1_cv2_2d_fes_csv':str(out/'cv1_cv2_2d_fes_selected.csv'),'cv1_cv2_2d_fes_npz':str(out/'cv1_cv2_2d_fes_selected.npz'),'cv1_cv2_2d_fes_png':str(out/'cv1_cv2_2d_fes_selected.png'),**{f'cv1_cv2_2d_fes_png_{k}':v for k,v in (plot_files or {}).items()}}}
+    info={'available':True,'selected_unbiased_method':chosen,'n_samples':int(np.count_nonzero(mask)),'cv_bins':int(len(xbins)-1),'cv2_bins':int(len(ybins)-1),'pmf_minimum_cv_A':min_cv,'pmf_minimum_cv2_A':min_cv2,'pmf_span_kcal_mol':span,'normalization':'Minimum finite free energy shifted to 0 kcal/mol','files':{
+        'cv1_cv2_2d_fes_csv':str(out/'cv1_cv2_2d_fes_selected.csv'),'cv1_cv2_2d_fes_npz':str(out/'cv1_cv2_2d_fes_selected.npz'),'cv1_cv2_2d_fes_png':str(out/'cv1_cv2_2d_fes_selected.png'),**{f'cv1_cv2_2d_fes_png_{k}':v for k,v in (plot_files or {}).items()},
+        'cv1_cv2_2d_fes_cumulant2_csv':str(out/'cv1_cv2_2d_fes_cumulant2.csv'),'cv1_cv2_2d_fes_cumulant2_npz':str(out/'cv1_cv2_2d_fes_cumulant2.npz'),'cv1_cv2_2d_fes_cumulant2_png':str(out/'cv1_cv2_2d_fes_cumulant2.png'),**{f'cv1_cv2_2d_fes_cumulant2_png_{k}':v for k,v in (plot_files_c2 or {}).items()},
+        **({'cv1_cv2_2d_fes_cumulant3_csv':str(out/'cv1_cv2_2d_fes_cumulant3.csv'),'cv1_cv2_2d_fes_cumulant3_npz':str(out/'cv1_cv2_2d_fes_cumulant3.npz'),'cv1_cv2_2d_fes_cumulant3_png':str(out/'cv1_cv2_2d_fes_cumulant3.png'),**{f'cv1_cv2_2d_fes_cumulant3_png_{k}':v for k,v in (plot_files_c3 or {}).items()}} if want_cum3 else {}),
+    }}
     if isinstance(dtram2d_info,dict) and dtram2d_info.get('available'):
         info['dtram']=_dtram_public_info(dtram2d_info)
         if isinstance(dtram2d_info.get('files'),dict):
@@ -8291,16 +8492,25 @@ def analyze_chignolin_fes(d, args, base_logw: np.ndarray, selected: str, boost_o
         exp_w = norm_logw(logw_sel + d.beta * boost_sel)
         fes_exp = pmf2d_from_weights(x_sel, y_sel, exp_w, xbins, ybins, kbt_kcal)
         fes_cum, _ = cumulant2_2d(x_sel, y_sel, base_w, boost_sel, xbins, ybins, d.beta, kbt_kcal, smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
-        chosen = selected if selected in {"gamd_exponential", "gamd_cumulant2"} else "gamd_cumulant2"
+        fes_cum3, _ = cumulant3_2d(x_sel, y_sel, base_w, boost_sel, xbins, ybins, d.beta, kbt_kcal, smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
+        chosen = selected if selected in {"gamd_exponential", "gamd_cumulant2", "gamd_cumulant3"} else "gamd_cumulant2"
     else:
-        fes_exp = fes_cum = fes_umbrella
+        fes_exp = fes_cum = fes_cum3 = fes_umbrella
         chosen = "umbrella_only"
-    chosen_fes = {"umbrella_only": fes_umbrella, "gamd_exponential": fes_exp, "gamd_cumulant2": fes_cum}.get(chosen, fes_umbrella)
+    chosen_fes = {"umbrella_only": fes_umbrella, "gamd_exponential": fes_exp, "gamd_cumulant2": fes_cum, "gamd_cumulant3": fes_cum3}.get(chosen, fes_umbrella)
     # kcal/mol CSVs (standard format); kJ/mol plot
     write_2d_fes_csv(out / "chignolin_fes_selected.csv", chosen_fes, chosen)
     write_2d_fes_npz(out / "chignolin_fes_selected.npz", chosen_fes, chosen)
     fes_kj = dict(chosen_fes); fes_kj["pmf"] = chosen_fes["pmf"] * KJ_PER_KCAL
     plot_files = _plot_chignolin_fes_kj_multirange(fes_kj, out / "chignolin_fes.png", chosen, warnings)
+    write_2d_fes_csv(out / "chignolin_fes_cumulant2.csv", fes_cum, "gamd_cumulant2")
+    write_2d_fes_npz(out / "chignolin_fes_cumulant2.npz", fes_cum, "gamd_cumulant2")
+    fes_kj_cum2 = dict(fes_cum); fes_kj_cum2["pmf"] = fes_cum["pmf"] * KJ_PER_KCAL
+    plot_files_c2 = _plot_chignolin_fes_kj_multirange(fes_kj_cum2, out / "chignolin_fes_cumulant2.png", "gamd_cumulant2", warnings)
+    write_2d_fes_csv(out / "chignolin_fes_cumulant3.csv", fes_cum3, "gamd_cumulant3")
+    write_2d_fes_npz(out / "chignolin_fes_cumulant3.npz", fes_cum3, "gamd_cumulant3")
+    fes_kj_cum3 = dict(fes_cum3); fes_kj_cum3["pmf"] = fes_cum3["pmf"] * KJ_PER_KCAL
+    plot_files_c3 = _plot_chignolin_fes_kj_multirange(fes_kj_cum3, out / "chignolin_fes_cumulant3.png", "gamd_cumulant3", warnings)
     dtram2d_info=run_dtram_2d_fes(d,args,dist1,dist2,np.asarray(base_logw,dtype=np.float64),xbins,ybins,kbt_kcal,chosen_fes,chosen,'chignolin_fes','Chignolin native-contact 2D FES','dist(Asp3N-Thr8O) (A)','dist(Asp3N-Gly7O) (A)',out,warnings,progress,mbar_result=None)
     finite = np.isfinite(chosen_fes["pmf"])
     if np.any(finite):
@@ -8325,6 +8535,12 @@ def analyze_chignolin_fes(d, args, base_logw: np.ndarray, selected: str, boost_o
             "chignolin_fes_npz": str(out / "chignolin_fes_selected.npz"),
             "chignolin_fes_png": str(out / "chignolin_fes.png"),
             **({f"chignolin_fes_png_{k}": v for k, v in plot_files.items()} if plot_files else {}),
+            "chignolin_fes_cumulant2_csv": str(out / "chignolin_fes_cumulant2.csv"),
+            "chignolin_fes_cumulant2_npz": str(out / "chignolin_fes_cumulant2.npz"),
+            **({f"chignolin_fes_cumulant2_png_{k}": v for k, v in plot_files_c2.items()} if plot_files_c2 else {}),
+            "chignolin_fes_cumulant3_csv": str(out / "chignolin_fes_cumulant3.csv"),
+            "chignolin_fes_cumulant3_npz": str(out / "chignolin_fes_cumulant3.npz"),
+            **({f"chignolin_fes_cumulant3_png_{k}": v for k, v in plot_files_c3.items()} if plot_files_c3 else {}),
         },
     }
     if isinstance(dtram2d_info,dict) and dtram2d_info.get('available'):
@@ -8881,17 +9097,17 @@ def analyze(d,args, progress: Optional[Progress] = None):
     umbrella=pmf_from_weights(d.cv,base_w,bins,kbt_kcal)
     bs=boost_stats(d.boost_kj,d.beta); boost_ok=bool(bs.get('available')) and np.nanstd(d.boost_kj)>1e-12
     if boost_ok:
-        exp_w=norm_logw(m['logw']+d.beta*d.boost_kj); exp_pmf=pmf_from_weights(d.cv,exp_w,bins,kbt_kcal); cum_pmf,cdiag=cumulant2(d.cv,base_w,d.boost_kj,bins,d.beta,kbt_kcal,smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma')); selected='gamd_cumulant2'
+        exp_w=norm_logw(m['logw']+d.beta*d.boost_kj); exp_pmf=pmf_from_weights(d.cv,exp_w,bins,kbt_kcal); cum_pmf,cdiag=cumulant2(d.cv,base_w,d.boost_kj,bins,d.beta,kbt_kcal,smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma')); cum3_pmf,cdiag3=cumulant3(d.cv,base_w,d.boost_kj,bins,d.beta,kbt_kcal,smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma')); selected='gamd_cumulant2'
         e=ess(exp_w)
         if e/max(1,N)<0.05: warn.append(f'GaMD exponential reweighting ESS is very low: {e:.1f}/{N}')
         if bs.get('std_kcal_mol',0)>6.0: warn.append(f"GaMD boost std is large ({bs['std_kcal_mol']:.2f} kcal/mol); cumulant reweighting may be unreliable")
         if bs.get('anharmonicity_score') is not None and bs['anharmonicity_score']>1.0: warn.append(f"GaMD boost anharmonicity score is high ({bs['anharmonicity_score']:.2f})")
     else:
-        exp_pmf=umbrella; cum_pmf=umbrella; selected='umbrella_only'; cdiag={'boost_mean_kj':np.full(args.bins,np.nan),'boost_var_kj2':np.full(args.bins,np.nan)}; warn.append('No finite variable GaMD boosts found; selected PMF is umbrella-only unbiased.')
-    pmfs={'umbrella_only':umbrella,'gamd_exponential':exp_pmf,'gamd_cumulant2':cum_pmf}
+        exp_pmf=umbrella; cum_pmf=umbrella; cum3_pmf=umbrella; selected='umbrella_only'; cdiag={'boost_mean_kj':np.full(args.bins,np.nan),'boost_var_kj2':np.full(args.bins,np.nan)}; cdiag3=cdiag; warn.append('No finite variable GaMD boosts found; selected PMF is umbrella-only unbiased.')
+    pmfs={'umbrella_only':umbrella,'gamd_exponential':exp_pmf,'gamd_cumulant2':cum_pmf,'gamd_cumulant3':cum3_pmf}
     _force_method=str(getattr(args,'selected_method','auto') or 'auto')
     if _force_method!='auto' and _force_method in pmfs:
-        if _force_method in ('gamd_exponential','gamd_cumulant2') and not boost_ok:
+        if _force_method in ('gamd_exponential','gamd_cumulant2','gamd_cumulant3') and not boost_ok:
             warn.append(f'--selected-method {_force_method} requested but no usable GaMD boost; it equals umbrella-only here.')
         selected=_force_method
     dtram_info=run_dtram_cv_pmf(d,args,bins,kbt_kcal,warn,progress)
@@ -8912,7 +9128,8 @@ def analyze(d,args, progress: Optional[Progress] = None):
     poincare_torsions_info=analyze_poincare_residue_torsions(d,args,out,poincare_info,warn,progress)
     cv1_cv2_fes_info=analyze_cv1_cv2_2d_fes(d,args,np.asarray(m['logw'],dtype=np.float64),selected,boost_ok,kbt_kcal,out,warn,progress) if isinstance(secondary_cv_pmf_info,dict) and secondary_cv_pmf_info.get('available') else {'available':False,'reason':'Secondary CV PMF unavailable'}
     if progress is not None: progress.bar('analysis stages', 4, 6, 'writing CSV outputs', force=True)
-    write_pmf(out/'pmf_unbiased.csv',sel,selected,{'boost_mean_kj_mol':cdiag.get('boost_mean_kj',np.full(args.bins,np.nan)),'boost_var_kj2_mol2':cdiag.get('boost_var_kj2',np.full(args.bins,np.nan))}); write_pmf(out/'pmf_umbrella_only.csv',umbrella,'umbrella_only'); write_pmf(out/'pmf_gamd_exponential.csv',exp_pmf,'gamd_exponential'); write_pmf(out/'pmf_gamd_cumulant2.csv',cum_pmf,'gamd_cumulant2',{'boost_mean_kj_mol':cdiag.get('boost_mean_kj',np.full(args.bins,np.nan)),'boost_var_kj2_mol2':cdiag.get('boost_var_kj2',np.full(args.bins,np.nan))})
+    _sel_diag={'gamd_cumulant2':cdiag,'gamd_cumulant3':cdiag3}.get(selected,cdiag)
+    write_pmf(out/'pmf_unbiased.csv',sel,selected,{'boost_mean_kj_mol':_sel_diag.get('boost_mean_kj',np.full(args.bins,np.nan)),'boost_var_kj2_mol2':_sel_diag.get('boost_var_kj2',np.full(args.bins,np.nan))}); write_pmf(out/'pmf_umbrella_only.csv',umbrella,'umbrella_only'); write_pmf(out/'pmf_gamd_exponential.csv',exp_pmf,'gamd_exponential'); write_pmf(out/'pmf_gamd_cumulant2.csv',cum_pmf,'gamd_cumulant2',{'boost_mean_kj_mol':cdiag.get('boost_mean_kj',np.full(args.bins,np.nan)),'boost_var_kj2_mol2':cdiag.get('boost_var_kj2',np.full(args.bins,np.nan))}); write_pmf(out/'pmf_gamd_cumulant3.csv',cum3_pmf,'gamd_cumulant3',{'boost_mean_kj_mol':cdiag3.get('boost_mean_kj',np.full(args.bins,np.nan)),'boost_var_kj2_mol2':cdiag3.get('boost_var_kj2',np.full(args.bins,np.nan))})
     if isinstance(dtram_info,dict) and dtram_info.get('available'):
         write_pmf(out/'pmf_dtram.csv',dtram_info['pmf'],dtram_info.get('method','dtram'))
         dtram_info.setdefault('files',{})['pmf_dtram_csv']=str(out/'pmf_dtram.csv')
@@ -8929,7 +9146,7 @@ def analyze(d,args, progress: Optional[Progress] = None):
         for k in range(K):
             vals=d.cv[d.window==k]; wr.writerow({'window':k,'center_A':float(d.centers[k]) if k<d.centers.size and np.isfinite(d.centers[k]) else '', 'k_kcal_mol_A2':float(d.k_kcal[k]) if k<d.k_kcal.size and np.isfinite(d.k_kcal[k]) else '', 'samples':int(m['n_k'][k]), 'cv_mean_A':float(np.mean(vals)) if vals.size else '', 'cv_std_A':float(np.std(vals)) if vals.size else '', 'overlap_left':float(O[k-1,k]) if k>0 else '', 'overlap_right':float(O[k,k+1]) if k+1<K else ''})
     if progress is not None: progress.bar('analysis stages', 5, 6, 'plotting PNG outputs', force=True)
-    plot_outputs(d,pmfs,selected,O,out,warn,smooth_sigma=_eff_smooth(args,'pmf_smooth_sigma'))
+    plot_outputs(d,pmfs,selected,O,out,warn,smooth_sigma=_eff_smooth(args,'pmf_smooth_sigma'),args=args)
     epoch_cv_info=_analyze_epoch_cv_exploration(d.prod_dir,out,d.meta,warn)
     tica_epoch_info=_analyze_tica_epochs(d.prod_dir,out,d.meta,warn)
     conv_info=run_pmf_convergence(d,args,bins,selected,sel,out,progress=progress,f_init_hint=m.get('f_k'))
@@ -9008,7 +9225,9 @@ def parse_args(argv=None):
     p.add_argument('--convergence-js-threshold', type=float, default=0.01, help='JS threshold for convergence summary.')
     p.add_argument('--convergence-rmse-threshold', type=float, default=0.10, help='PMF RMSE threshold in kcal/mol for convergence summary.')
     p.add_argument('--convergence-dir', default='convergence', help='Subdirectory under output dir for convergence tables/plots.')
-    p.add_argument('--selected-method', choices=['auto', 'umbrella_only', 'gamd_exponential', 'gamd_cumulant2'], default='auto', help='Force the selected unbiased estimator written to the *_selected/*_unbiased outputs (incl. Ramachandran 2D FES). Default auto = gamd_cumulant2 when a usable boost is present, else umbrella_only. Use to emit each estimator surface separately for cross-estimator comparison.')
+    p.add_argument('--selected-method', choices=['auto', 'umbrella_only', 'gamd_exponential', 'gamd_cumulant2', 'gamd_cumulant3'], default='auto', help='Force the selected unbiased estimator written to the *_selected/*_unbiased outputs (incl. Ramachandran 2D FES). Default auto = gamd_cumulant2 when a usable boost is present, else umbrella_only. gamd_cumulant3 adds the beta^3/6*kappa3 (third-cumulant) term on top of gamd_cumulant2, correcting for boost-distribution skew (see gamd_boost_anharmonicity_score); still no exponential/direct reweighting. Use to emit each estimator surface separately for cross-estimator comparison.')
+    p.add_argument('--plot-gamd-exponential', action='store_true', help='Include gamd_exponential (direct exponential reweighting) in multi-method comparison plots. Off by default: exponential reweighting has near-zero ESS under typical GaMD boost variance and mostly adds clutter/noise to comparison plots. Always shown regardless of this flag when explicitly forced via --selected-method gamd_exponential.')
+    p.add_argument('--plot-gamd-cumulant3', action='store_true', help='Include gamd_cumulant3 (third-cumulant/skew-corrected) in multi-method comparison plots and generate its dedicated 2D FES CSV/NPZ/PNG outputs. Off by default: gamd_cumulant2 is the standard default estimator and cumulant3 is a diagnostic extension. Always generated regardless of this flag when explicitly forced via --selected-method gamd_cumulant3.')
     p.add_argument('--dtram', action='store_true', help='Compute an experimental normal discrete TRAM PMF over the main CV bins using per-window transition counts and thermodynamic bias constraints. Does not replace the default selected MBAR/GaMD PMF.')
     p.add_argument('--dtram-2d-fes', action='store_true', help='Also compute experimental 2D dTRAM FES diagnostics for available 2D surfaces (distance-Rg, PCA1-PCA2, CV1-CV2, and chignolin when enabled). Requires --dtram.')
     p.add_argument('--dtram-2d-max-microstates', type=int, default=900, help='Safety limit for 2D dTRAM microstates. For a 30x30 grid this is 900. Increase only if you expect the sparse dTRAM solve to be affordable.')

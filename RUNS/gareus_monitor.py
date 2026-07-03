@@ -3,8 +3,9 @@
 GAREUS multi-peptide run monitor  —  Textual/Rich when available, ANSI fallback.
 
 Usage:
-  python gareus_monitor.py [RUNS_DIR] [--interval SECS] [--once] [--ui auto|textual|rich|ansi]
+  python gareus_monitor.py [RUNS_DIR] [--interval SECS] [--once] [--ui auto|textual|rich|ansi] [--no-slurm]
   python gareus_monitor.py RUNS/runs2/ RUNS/v01_runs/
+  python gareus_monitor.py . --slurm-user sulcjo
 
 Interactive keys (TTY mode):
   ↑/k  ↓/j   navigate
@@ -15,6 +16,8 @@ Interactive keys (TTY mode):
   r           force refresh
 """
 
+from __future__ import annotations
+
 import argparse
 import csv
 from dataclasses import dataclass, field
@@ -23,6 +26,7 @@ import json
 import math
 import os
 import re
+import subprocess
 import sys
 import time
 import datetime
@@ -69,6 +73,17 @@ class RunPlan:
 
 
 @dataclass(frozen=True)
+class SlurmJob:
+    job_id: str
+    name: str
+    state: str
+    elapsed: str
+    nodes: str
+    reason: str
+    workdir: str = ""
+
+
+@dataclass(frozen=True)
 class RunSnapshot:
     name: str
     phase: str
@@ -92,6 +107,7 @@ class RunSnapshot:
     latest_message: str
     stale: bool
     run_plan: Optional[RunPlan]
+    slurm_jobs: tuple[SlurmJob, ...] = field(default_factory=tuple)
     diagnostics: list[Diagnostic] = field(default_factory=list)
 
     @property
@@ -109,6 +125,8 @@ class FleetSnapshot:
     global_percent: Optional[float]
     counts: dict[str, int]
     diagnostics: list[Diagnostic]
+    slurm_unmatched_jobs: tuple[SlurmJob, ...] = field(default_factory=tuple)
+    slurm_error: Optional[str] = None
 
 
 _SEVERITY_RANK = {"error": 0, "warn": 1, "info": 2}
@@ -120,12 +138,13 @@ _DIAG_PRIORITY = {
     "gamd_sigma_high": 4,
     "checkpoint_missing": 5,
     "stale_progress": 6,
-    "missing_pool": 7,
-    "missing_progress": 8,
-    "mbar_weak_edges": 9,
-    "pool_blank_epoch0": 10,
-    "no_completed_epoch_diag": 11,
-    "driver_done": 12,
+    "slurm_unavailable": 7,
+    "missing_pool": 8,
+    "missing_progress": 9,
+    "mbar_weak_edges": 10,
+    "pool_blank_epoch0": 11,
+    "no_completed_epoch_diag": 12,
+    "driver_done": 13,
 }
 
 
@@ -181,6 +200,178 @@ def _path_str(path) -> str:
         return str(path)
     except Exception:
         return ""
+
+
+def parse_squeue_rows(text: str) -> list[SlurmJob]:
+    """Parse pipe-delimited squeue rows: id|name|state|time|nodes|reason|workdir."""
+    jobs: list[SlurmJob] = []
+    for raw in text.splitlines():
+        if not raw.strip():
+            continue
+        parts = [p.strip() for p in raw.rstrip("\n").split("|")]
+        if len(parts) < 6:
+            continue
+        while len(parts) < 7:
+            parts.append("")
+        job_id, name, state, elapsed, nodes, reason = parts[:6]
+        workdir = "|".join(parts[6:]).strip()
+        if workdir in ("(null)", "None", "N/A"):
+            workdir = ""
+        jobs.append(SlurmJob(job_id, name, state, elapsed, nodes, reason, workdir))
+    return jobs
+
+
+def _norm_token(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def _job_state_code(state: str) -> str:
+    state = (state or "").upper()
+    return {
+        "RUNNING": "R",
+        "PENDING": "PD",
+        "COMPLETING": "CG",
+        "CONFIGURING": "CF",
+        "SUSPENDED": "S",
+        "FAILED": "F",
+        "CANCELLED": "CA",
+        "TIMEOUT": "TO",
+        "PREEMPTED": "PR",
+    }.get(state, state[:2] or "?")
+
+
+def _slurm_tokens_for_state(s) -> set[str]:
+    names = {
+        str(_get_value(s, "name", "")),
+        str(_get_value(s, "run_dir", Path(""))).split("/")[-1],
+        str(_get_value(s, "base_dir", Path(""))).split("/")[-1],
+    }
+    tokens: set[str] = set()
+    for name in names:
+        if not name:
+            continue
+        tokens.add(_norm_token(name))
+        tokens.add(_norm_token(re.sub(r"_2d_run\d*$", "", name, flags=re.IGNORECASE)))
+    return {t for t in tokens if len(t) >= 3}
+
+
+def _path_related(path_text: str, candidates: list[Path]) -> bool:
+    if not path_text:
+        return False
+    try:
+        p = Path(path_text).expanduser().resolve(strict=False)
+    except OSError:
+        return False
+    for c in candidates:
+        try:
+            cp = Path(c).expanduser().resolve(strict=False)
+        except OSError:
+            continue
+        if p == cp or cp in p.parents:
+            return True
+    return False
+
+
+def _job_matches_state(job: SlurmJob, s) -> bool:
+    job_name = _norm_token(job.name)
+    return _job_state_match_score(job, s, job_name=job_name) > 0
+
+
+def _job_state_match_score(job: SlurmJob, s, job_name: Optional[str] = None) -> int:
+    if _path_related(job.workdir, [_get_value(s, "run_dir", Path("")), _get_value(s, "base_dir", Path(""))]):
+        return 10_000
+    job_name = _norm_token(job.name) if job_name is None else job_name
+    matches = [len(token) for token in _slurm_tokens_for_state(s) if token and token in job_name]
+    return max(matches, default=0)
+
+
+def _is_fleet_related_job(job: SlurmJob, fleet_roots: list[Path], states: list) -> bool:
+    if _path_related(job.workdir, fleet_roots):
+        return True
+    job_name = _norm_token(job.name)
+    if any(token and token in job_name for s in states for token in _slurm_tokens_for_state(s)):
+        return True
+    return any(token in job_name for token in ("gareus", "gamd", "2drun", "adaptive", "peptide"))
+
+
+def match_slurm_jobs_to_states(states: list, jobs: list[SlurmJob],
+                               fleet_roots: Optional[list[Path]] = None) -> list[SlurmJob]:
+    """Attach Slurm jobs to states and return unmatched jobs that still look fleet-related."""
+    fleet_roots = list(fleet_roots or [])
+    for s in states:
+        s._slurm_jobs = []
+        s._slurm_error = None
+
+    unmatched: list[SlurmJob] = []
+    for job in jobs:
+        job_name = _norm_token(job.name)
+        matches: list[tuple[int, object]] = []
+        for s in states:
+            score = _job_state_match_score(job, s, job_name=job_name)
+            if score > 0:
+                matches.append((score, s))
+        if matches:
+            best = max(score for score, _ in matches)
+            for score, s in matches:
+                if score == best:
+                    s._slurm_jobs.append(job)
+        elif _is_fleet_related_job(job, fleet_roots, states):
+            unmatched.append(job)
+
+    for s in states:
+        s._slurm_unmatched_jobs = unmatched
+    return unmatched
+
+
+def query_squeue(user: str, timeout_s: float = 4.0) -> tuple[list[SlurmJob], Optional[str]]:
+    if not user:
+        return [], "No Slurm user configured"
+    formats = (
+        "%i|%j|%T|%M|%D|%R|%Z",
+        "%i|%j|%T|%M|%D|%R|",
+    )
+    last_error = None
+    for fmt in formats:
+        try:
+            proc = subprocess.run(
+                ["squeue", "-h", "-u", user, "-o", fmt],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+            )
+        except FileNotFoundError:
+            return [], "squeue not found"
+        except subprocess.TimeoutExpired:
+            return [], f"squeue timed out after {timeout_s:g}s"
+        except OSError as exc:
+            return [], str(exc)
+        if proc.returncode == 0:
+            return parse_squeue_rows(proc.stdout), None
+        last_error = (proc.stderr or proc.stdout or f"squeue exited {proc.returncode}").strip()
+    return [], last_error or "squeue failed"
+
+
+def refresh_all(states: list, slurm_user: Optional[str] = None,
+                fleet_roots: Optional[list[Path]] = None,
+                slurm_enabled: bool = False,
+                slurm_timeout_s: float = 4.0) -> None:
+    for s in states:
+        s.refresh()
+    if not slurm_enabled:
+        for s in states:
+            s._slurm_jobs = []
+            s._slurm_unmatched_jobs = []
+            s._slurm_error = None
+        return
+    jobs, error = query_squeue(slurm_user or "", timeout_s=slurm_timeout_s)
+    if error:
+        for s in states:
+            s._slurm_jobs = []
+            s._slurm_unmatched_jobs = []
+            s._slurm_error = error
+        return
+    match_slurm_jobs_to_states(states, jobs, fleet_roots=fleet_roots)
 
 
 def diagnostics_for_state(s, now: Optional[float] = None) -> list[Diagnostic]:
@@ -313,6 +504,7 @@ def build_run_snapshot(s, now: Optional[float] = None) -> RunSnapshot:
         latest_message=str(_get_value(s, "latest_message", "")),
         stale=bool(_get_value(s, "stale", False)),
         run_plan=_get_value(s, "run_plan"),
+        slurm_jobs=tuple(_get_value(s, "_slurm_jobs", []) or []),
         diagnostics=diagnostics_for_state(s, now=now),
     )
 
@@ -328,13 +520,30 @@ def build_fleet_snapshot(states: list, now: Optional[float] = None) -> FleetSnap
         "done": sum(1 for r in runs if r.phase in ("done", "converged")),
         "error": sum(1 for r in runs if r.phase == "error" or r.top_issue.severity == "error"),
         "pending": sum(1 for r in runs if r.phase in ("planned", "not_started", "genpept", "staged", "unknown")),
+        "slurm_running": sum(1 for r in runs for j in r.slurm_jobs if j.state.upper() == "RUNNING"),
+        "slurm_pending": sum(1 for r in runs for j in r.slurm_jobs if j.state.upper() == "PENDING"),
+        "slurm_other": sum(1 for r in runs for j in r.slurm_jobs
+                           if j.state.upper() not in ("RUNNING", "PENDING")),
     }
     diags = sorted(
         (Diagnostic(d.severity, d.code, f"{r.name}: {d.message}", d.source, d.action)
          for r in runs for d in r.diagnostics),
         key=_diag_sort_key,
     )
-    return FleetSnapshot(runs, total_budget, done_ns, pct, counts, diags)
+    slurm_error = next((_get_value(s, "_slurm_error") for s in states
+                        if _get_value(s, "_slurm_error")), None)
+    if slurm_error:
+        diags = sorted(
+            diags + [Diagnostic("warn", "slurm_unavailable",
+                                f"Slurm jobs unavailable: {slurm_error}",
+                                "squeue", "File-based monitor remains active.")],
+            key=_diag_sort_key,
+        )
+    unmatched = next((_get_value(s, "_slurm_unmatched_jobs") for s in states
+                      if _get_value(s, "_slurm_unmatched_jobs")), []) or []
+    return FleetSnapshot(runs, total_budget, done_ns, pct, counts, diags,
+                         slurm_unmatched_jobs=tuple(unmatched),
+                         slurm_error=slurm_error)
 
 try:
     import termios
@@ -589,25 +798,36 @@ def _effective_config_args(run_dir: Path) -> tuple[dict, Optional[Path]]:
     return {}, None
 
 
+def _named_yaml_path(base_dir: Path, name: str) -> Optional[Path]:
+    exact = base_dir / f"{name}.yaml"
+    if exact.exists():
+        return exact
+    try:
+        matches = sorted(p for p in base_dir.glob(f"{name}*.yaml") if p.is_file())
+    except OSError:
+        return None
+    return matches[0] if matches else None
+
+
 def _plan_yaml_path(s) -> Optional[Path]:
     base = _get_value(s, "base_dir")
     name = str(_get_value(s, "name", ""))
     if not base or not name:
         base = None
     if base and name:
-        p = Path(base) / f"{name}.yaml"
-        if p.exists():
+        p = _named_yaml_path(Path(base), name)
+        if p:
             return p
     run_dir = _get_value(s, "run_dir")
     if run_dir:
         rd = Path(run_dir)
         m = re.match(r"^(.+)_2d_run\d*$", rd.name)
         if m:
-            p = rd.parent / f"{m.group(1)}.yaml"
-            if p.exists():
+            p = _named_yaml_path(rd.parent, m.group(1))
+            if p:
                 return p
-        p = rd.parent / f"{rd.name}.yaml"
-        if p.exists():
+        p = _named_yaml_path(rd.parent, rd.name)
+        if p:
             return p
     return None
 
@@ -1381,6 +1601,9 @@ class PeptideState:
         self._mtime_diag: float   = 0.0
         self._registry: dict      = {}
         self._mtime_reg: float    = 0.0
+        self._slurm_jobs: list[SlurmJob] = []
+        self._slurm_unmatched_jobs: list[SlurmJob] = []
+        self._slurm_error: Optional[str] = None
 
     def __init__(self, name: str, base_dir: Path):
         self.name        = name
@@ -1936,8 +2159,8 @@ def discover(runs_dir: Path) -> list:
         if n.startswith("CONV") or n.startswith("alpha"):
             continue
 
-        # peptide container: PEPTIDE/PEPTIDE_2d_run*, or PEPTIDE/PEPTIDE.yaml
-        if (d / f"{n}.yaml").exists() or _has_container_rundir(d, n):
+        # peptide container: PEPTIDE/PEPTIDE_2d_run*, PEPTIDE/PEPTIDE*.yaml
+        if _named_yaml_path(d, n) is not None or _has_container_rundir(d, n):
             out.append(PeptideState(n, d))
             continue
 
@@ -2276,6 +2499,45 @@ def _fmt_ns_compact(v: Optional[float]) -> str:
     return f"{float(v):.1f}"
 
 
+def _fmt_slurm_jobs(jobs: tuple[SlurmJob, ...] | list[SlurmJob],
+                    width: int = 12,
+                    color: bool = True) -> str:
+    if not jobs:
+        return c(A.DIM) + "—" + A.RESET if color else "—"
+    counts: dict[str, int] = {}
+    for job in jobs:
+        code = _job_state_code(job.state)
+        counts[code] = counts.get(code, 0) + 1
+    state_s = "/".join(f"{code}{'' if n == 1 else 'x' + str(n)}"
+                       for code, n in sorted(counts.items()))
+    first = jobs[0].job_id
+    text = f"{state_s} {first}" if len(jobs) == 1 else f"{state_s} {len(jobs)}j"
+    text = text[:width]
+    if not color:
+        return text
+    if any(j.state.upper() == "RUNNING" for j in jobs):
+        style = A.BGREEN
+    elif any(j.state.upper() == "PENDING" for j in jobs):
+        style = A.BYELLOW
+    else:
+        style = A.BCYAN
+    return c(style) + text + A.RESET
+
+
+def _slurm_detail(jobs: tuple[SlurmJob, ...] | list[SlurmJob]) -> str:
+    if not jobs:
+        return c(A.DIM) + "no matching squeue job" + A.RESET
+    parts = []
+    for job in jobs[:4]:
+        state = _job_state_code(job.state)
+        where = job.reason or job.workdir or ""
+        parts.append(f"{state} {job.job_id} {job.name} {job.elapsed} {where}".strip())
+    if len(jobs) > 4:
+        parts.append(f"+{len(jobs) - 4} more")
+    style = A.BGREEN if any(j.state.upper() == "RUNNING" for j in jobs) else A.BYELLOW
+    return c(style) + " | ".join(parts) + A.RESET
+
+
 def _segment_ansi_color(seg: RunPlanSegment, index: int) -> str:
     if seg.kind == "final":
         return _FINAL_COLOR
@@ -2600,7 +2862,7 @@ def render_yaml(s: PeptideState, width: Optional[int] = None) -> str:
 
 def _snap_row(r: RunSnapshot, selected: bool = False) -> str:
     marker = c(A.BOLD, A.BYELLOW) + "▶" + A.RESET if selected else " "
-    name_col = c(NAME_COLOR.get(r.phase, A.DIM)) + r.name[:12] + A.RESET
+    name_col = c(NAME_COLOR.get(r.phase, A.DIM)) + r.name[:14] + A.RESET
     gpct = r.global_percent
     epct = r.epoch_percent
     progress = bar(gpct if gpct is not None else epct, 10) if (gpct is not None or epct is not None) else c(A.DIM) + "░" * 10 + A.RESET
@@ -2622,8 +2884,9 @@ def _snap_row(r: RunSnapshot, selected: bool = False) -> str:
         issue_s = _ansi_severity(issue.severity) + f"{issue.severity[:1].upper()} {issue.code}" + A.RESET
     cells = [
         marker,
-        pad(name_col, 12),
+        pad(name_col, 14),
         pad(_ansi_phase(r.phase), 11),
+        pad(_fmt_slurm_jobs(r.slurm_jobs, width=10), 10),
         pad(progress, 10),
         pad(_fmt_pct(gpct), 7, ">"),
         pad(_fmt_pct(epct), 6, ">"),
@@ -2658,7 +2921,9 @@ def render(states: list, selected: Optional[int] = None) -> str:
         + c(A.BCYAN) + f"adapt {fleet.counts.get('adapting', 0)}" + A.RESET + "  "
         + c(A.WHITE) + f"done {fleet.counts.get('done', 0)}" + A.RESET + "  "
         + c(A.BRED) + f"error {fleet.counts.get('error', 0)}" + A.RESET + "  "
-        + c(A.DIM) + f"pending {fleet.counts.get('pending', 0)}" + A.RESET
+        + c(A.DIM) + f"pending {fleet.counts.get('pending', 0)}" + A.RESET + "  "
+        + c(A.BGREEN) + f"slurm R {fleet.counts.get('slurm_running', 0)}" + A.RESET + "  "
+        + c(A.BYELLOW) + f"PD {fleet.counts.get('slurm_pending', 0)}" + A.RESET
     )
     lines += [
         "",
@@ -2703,11 +2968,11 @@ def render(states: list, selected: Optional[int] = None) -> str:
 
     header = (
         "  " + c(A.BOLD, A.BG_GREY, A.WHITE)
-        + "  Peptide       Phase        Graph          G%     E%   ns/budget  Epoch   MBAR  Qual   ETA  top issue"
+        + "  Peptide         Phase        Slurm       Graph          G%     E%   ns/budget  Epoch   MBAR  Qual   ETA  top issue"
         + A.RESET
     )
     lines.append(header)
-    lines.append("  " + c(A.DIM) + "─" * 122 + A.RESET)
+    lines.append("  " + c(A.DIM) + "─" * 138 + A.RESET)
     for i, snap in enumerate(fleet.runs):
         lines.append(_snap_row(snap, selected=(selected == i)))
 
@@ -2721,6 +2986,15 @@ def render(states: list, selected: Optional[int] = None) -> str:
             lines.append("  " + pad(sev, 5) + "  " + _clip(msg, 110))
     else:
         lines.append("  " + c(A.DIM) + "No active diagnostics." + A.RESET)
+
+    if fleet.slurm_unmatched_jobs:
+        lines += ["", "  " + c(A.BOLD, A.BYELLOW) + "Unmatched Slurm fleet jobs" + A.RESET]
+        for job in fleet.slurm_unmatched_jobs[:8]:
+            where = job.reason or job.workdir or ""
+            lines.append("  " + _clip(
+                f"{_job_state_code(job.state):<2} {job.job_id:<10} {job.name:<24} {job.elapsed:<8} {where}",
+                120,
+            ))
 
     if selected is not None:
         hint = c(A.DIM) + "  ↑↓/jk select   Enter detail   y YAML   m MBAR diag   c connect   r refresh   q quit" + A.RESET
@@ -2845,6 +3119,7 @@ def render_detail(s: PeptideState) -> str:
     if extras:
         ep_val += c(A.DIM) + "   " + "   ".join(extras) + A.RESET
     lines.append(labeled("Epoch", ep_val))
+    lines.append(labeled("Slurm", _slurm_detail(getattr(s, "_slurm_jobs", []))))
     lines += [blank(), sep]
 
     # ── total-progress timeline (epochs · topups · final · free budget) ────────
@@ -3432,7 +3707,9 @@ def _rich_summary_panel(fleet: FleetSnapshot):
     t.append(f"adapt {fleet.counts.get('adapting', 0)}  ", style="cyan")
     t.append(f"done {fleet.counts.get('done', 0)}  ", style="white")
     t.append(f"errors {fleet.counts.get('error', 0)}  ", style="red")
-    t.append(f"pending {fleet.counts.get('pending', 0)}", style="dim")
+    t.append(f"pending {fleet.counts.get('pending', 0)}  ", style="dim")
+    t.append(f"slurm R {fleet.counts.get('slurm_running', 0)}  ", style="green")
+    t.append(f"PD {fleet.counts.get('slurm_pending', 0)}", style="yellow")
     return Panel(t, title="fleet", border_style="cyan")
 
 
@@ -3539,8 +3816,9 @@ def _rich_runs_table(fleet: FleetSnapshot, selected: int = 0):
 
     table = Table(box=box.SIMPLE_HEAVY, expand=True, pad_edge=False)
     table.add_column("", width=1, no_wrap=True)
-    table.add_column("run", overflow="ellipsis", max_width=13, no_wrap=True)
+    table.add_column("run", overflow="ellipsis", max_width=14, no_wrap=True)
     table.add_column("phase", overflow="ellipsis", max_width=10, no_wrap=True)
+    table.add_column("slurm", overflow="ellipsis", max_width=10, no_wrap=True)
     table.add_column("G%", justify="right")
     table.add_column("budget", justify="right")
     table.add_column("ep", justify="right")
@@ -3567,6 +3845,7 @@ def _rich_runs_table(fleet: FleetSnapshot, selected: int = 0):
             marker,
             r.name,
             PHASE_LABEL.get(r.phase, r.phase),
+            _fmt_slurm_jobs(r.slurm_jobs, width=10, color=False),
             _fmt_pct(r.global_percent),
             budget,
             epoch,
@@ -3600,6 +3879,7 @@ def _rich_detail_panel(state, snap: RunSnapshot):
     metrics.add_column(ratio=1)
     metrics.add_row("budget", f"{_fmt_num(snap.done_ns, 1)} / {_fmt_num(snap.total_budget_ns, 0)} ns")
     metrics.add_row("throughput", f"{_fmt_num(snap.ns_per_day, 0)} ns/day  {_fmt_num(snap.steps_per_s, 0)} steps/s")
+    metrics.add_row("Slurm", _fmt_slurm_jobs(snap.slurm_jobs, width=18, color=False))
     metrics.add_row("CV range", snap.cv_range)
     metrics.add_row("quality", f"{snap.quality_grade}  MBAR {snap.mbar_grade}")
 
@@ -3635,7 +3915,16 @@ def _rich_diagnostics_table(fleet: FleetSnapshot):
     table.add_column("source", overflow="fold")
     for d in fleet.diagnostics[:12]:
         table.add_row(d.severity, d.code, d.message, d.source, style=_diag_rich_style(d))
-    if not fleet.diagnostics:
+    for job in fleet.slurm_unmatched_jobs[:8]:
+        where = job.reason or job.workdir or ""
+        table.add_row(
+            "info",
+            "slurm_unmatched",
+            f"{_job_state_code(job.state)} {job.job_id} {job.name} {job.elapsed}",
+            where,
+            style="yellow",
+        )
+    if not fleet.diagnostics and not fleet.slurm_unmatched_jobs:
         table.add_row("info", "ok", "No monitor diagnostics", "", style="dim")
     return table
 
@@ -3793,7 +4082,11 @@ def ui_transition(mode: str, selected: int, n_items: int, key: str):
     return mode, selected, "noop"
 
 
-def rich_loop(states: list, interval: float, start_sel: int = 0):
+def rich_loop(states: list, interval: float, start_sel: int = 0,
+              slurm_user: Optional[str] = None,
+              fleet_roots: Optional[list[Path]] = None,
+              slurm_enabled: bool = False,
+              slurm_timeout_s: float = 4.0):
     from rich.console import Console
     from rich.live import Live
 
@@ -3806,8 +4099,8 @@ def rich_loop(states: list, interval: float, start_sel: int = 0):
             with Live(rich_dashboard(states, selected=sel, mode=mode), console=console,
                       refresh_per_second=4, screen=True) as live:
                 while True:
-                    for s in states:
-                        s.refresh()
+                    refresh_all(states, slurm_user=slurm_user, fleet_roots=fleet_roots,
+                                slurm_enabled=slurm_enabled, slurm_timeout_s=slurm_timeout_s)
                     live.update(rich_dashboard(states, selected=sel, mode=mode))
                     time.sleep(interval)
         except KeyboardInterrupt:
@@ -3830,8 +4123,8 @@ def rich_loop(states: list, interval: float, start_sel: int = 0):
             while True:
                 now = time.time()
                 if force_refresh or (now - last_refresh) >= interval:
-                    for s in states:
-                        s.refresh()
+                    refresh_all(states, slurm_user=slurm_user, fleet_roots=fleet_roots,
+                                slurm_enabled=slurm_enabled, slurm_timeout_s=slurm_timeout_s)
                     last_refresh = time.time()
                     force_refresh = False
                     live.update(rich_dashboard(states, selected=sel, mode=mode))
@@ -3856,7 +4149,11 @@ def rich_loop(states: list, interval: float, start_sel: int = 0):
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
-def run_textual_app(states: list, interval: float, start_sel: int = 0):
+def run_textual_app(states: list, interval: float, start_sel: int = 0,
+                    slurm_user: Optional[str] = None,
+                    fleet_roots: Optional[list[Path]] = None,
+                    slurm_enabled: bool = False,
+                    slurm_timeout_s: float = 4.0):
     """Run optional Textual UI. Import stays inside function for fallback safety."""
     from textual.app import App, ComposeResult
     from textual.widgets import Footer, Header, Static
@@ -3898,8 +4195,13 @@ def run_textual_app(states: list, interval: float, start_sel: int = 0):
             self.set_interval(self.refresh_interval, self.refresh_data)
 
         def refresh_data(self) -> None:
-            for st in self.run_states:
-                st.refresh()
+            refresh_all(
+                self.run_states,
+                slurm_user=slurm_user,
+                fleet_roots=fleet_roots,
+                slurm_enabled=slurm_enabled,
+                slurm_timeout_s=slurm_timeout_s,
+            )
             self.query_one("#dashboard", Static).update(
                 rich_dashboard(self.run_states, selected=self.selected, mode=self.mode)
             )
@@ -4030,15 +4332,19 @@ def next_view(view: str, key: str):
 
 
 def interactive_loop(states: list, interval: float,
-                     start_view: str = "list", start_sel: int = 0):
+                     start_view: str = "list", start_sel: int = 0,
+                     slurm_user: Optional[str] = None,
+                     fleet_roots: Optional[list[Path]] = None,
+                     slurm_enabled: bool = False,
+                     slurm_timeout_s: float = 4.0):
     if not _HAS_TTY or not sys.stdin.isatty():
         # non-TTY fallback: plain sleep loop
         _write(HIDE_CURSOR)
         try:
             first = True
             while True:
-                for s in states:
-                    s.refresh()
+                refresh_all(states, slurm_user=slurm_user, fleet_roots=fleet_roots,
+                            slurm_enabled=slurm_enabled, slurm_timeout_s=slurm_timeout_s)
                 out = render(states)
                 _write((CLEAR_SCREEN if first else MOVE_HOME + CLEAR_EOS) + out)
                 first = False
@@ -4072,8 +4378,8 @@ def interactive_loop(states: list, interval: float,
         while True:
             now = time.time()
             if force_refresh or (now - last_refresh) >= interval:
-                for s in states:
-                    s.refresh()
+                refresh_all(states, slurm_user=slurm_user, fleet_roots=fleet_roots,
+                            slurm_enabled=slurm_enabled, slurm_timeout_s=slurm_timeout_s)
                 last_refresh  = time.time()
                 force_refresh = False
                 need_redraw   = True
@@ -4150,16 +4456,27 @@ def main():
                         help="Start attached to one run's live view (substring match on name)")
     parser.add_argument("--ui", choices=UI_MODES, default="auto",
                         help="UI backend: auto chooses textual, rich, then ansi")
+    parser.add_argument("--slurm", dest="slurm", action="store_true",
+                        help="Poll squeue and match Slurm jobs to monitored runs")
+    parser.add_argument("--no-slurm", dest="slurm", action="store_false",
+                        help="Disable squeue polling")
+    parser.add_argument("--slurm-user", default="sulcjo",
+                        help="Slurm username passed to squeue -u")
+    parser.add_argument("--slurm-timeout", type=float, default=4.0,
+                        help="squeue timeout in seconds")
+    parser.set_defaults(slurm=True)
     args = parser.parse_args()
 
     states: list = []
     seen: set = set()
+    fleet_roots: list[Path] = []
 
     for rd in args.runs_dirs:
         p = Path(rd).resolve()
         if not p.is_dir():
             print(f"ERROR: {p} is not a directory", file=sys.stderr)
             sys.exit(1)
+        fleet_roots.append(p)
         for s in discover(p):
             key = str(s.run_dir)
             if key not in seen:
@@ -4183,8 +4500,8 @@ def main():
         print("No peptide runs found.", file=sys.stderr)
         sys.exit(1)
 
-    for s in states:
-        s.refresh()
+    refresh_all(states, slurm_user=args.slurm_user, fleet_roots=fleet_roots,
+                slurm_enabled=args.slurm, slurm_timeout_s=args.slurm_timeout)
 
     start_view, start_sel = "list", preferred_selection(states)
     if args.connect:
@@ -4222,19 +4539,29 @@ def main():
 
     if ui_mode == "textual":
         try:
-            run_textual_app(states, args.interval, start_sel=start_sel)
+            run_textual_app(states, args.interval, start_sel=start_sel,
+                            slurm_user=args.slurm_user, fleet_roots=fleet_roots,
+                            slurm_enabled=args.slurm, slurm_timeout_s=args.slurm_timeout)
         except Exception as exc:
             if args.ui == "textual":
                 print(f"ERROR: failed to start Textual UI: {exc}", file=sys.stderr)
                 sys.exit(2)
             if _module_available("rich"):
-                rich_loop(states, args.interval, start_sel=start_sel)
+                rich_loop(states, args.interval, start_sel=start_sel,
+                          slurm_user=args.slurm_user, fleet_roots=fleet_roots,
+                          slurm_enabled=args.slurm, slurm_timeout_s=args.slurm_timeout)
             else:
-                interactive_loop(states, args.interval, start_view=start_view, start_sel=start_sel)
+                interactive_loop(states, args.interval, start_view=start_view, start_sel=start_sel,
+                                 slurm_user=args.slurm_user, fleet_roots=fleet_roots,
+                                 slurm_enabled=args.slurm, slurm_timeout_s=args.slurm_timeout)
     elif ui_mode == "rich":
-        rich_loop(states, args.interval, start_sel=start_sel)
+        rich_loop(states, args.interval, start_sel=start_sel,
+                  slurm_user=args.slurm_user, fleet_roots=fleet_roots,
+                  slurm_enabled=args.slurm, slurm_timeout_s=args.slurm_timeout)
     else:
-        interactive_loop(states, args.interval, start_view=start_view, start_sel=start_sel)
+        interactive_loop(states, args.interval, start_view=start_view, start_sel=start_sel,
+                         slurm_user=args.slurm_user, fleet_roots=fleet_roots,
+                         slurm_enabled=args.slurm, slurm_timeout_s=args.slurm_timeout)
 
 
 if __name__ == "__main__":
