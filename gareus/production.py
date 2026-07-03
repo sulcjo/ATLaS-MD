@@ -197,6 +197,10 @@ def _ensure_bootstrap_torsion_cv_ready(args, out_dir: Path, topology, primary_cv
 
     if state_path.exists():
         result = TICAResult.load(state_path)
+        if str(getattr(result, "method", "") or "") != "pca":
+            raise ValueError(
+                f"bootstrap torsion state {state_path} has method {result.method!r}; expected method='pca'"
+            )
         if len(result.weights) != expected_features:
             raise ValueError(
                 f"bootstrap torsion state {state_path} has {len(result.weights)} weights; expected {expected_features}"

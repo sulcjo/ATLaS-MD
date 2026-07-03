@@ -123,6 +123,71 @@ def test_ensure_bootstrap_torsion_cv_ready_builds_seed_state_and_auto_centers(tm
     assert all(-6.0 <= value <= 6.0 for value in args.cv2_centers)
 
 
+def test_ensure_bootstrap_torsion_cv_ready_rejects_non_pca_state(tmp_path, monkeypatch):
+    import gareus.cv as cv_mod
+    import gareus.seeding as seeding_mod
+    from gareus.production import _ensure_bootstrap_torsion_cv_ready
+
+    out_dir = tmp_path / "out"
+    seed_dir = tmp_path / "seeds"
+    seed_dir.mkdir()
+    phi = [(0, 1, 2, 3)]
+    psi = [(1, 2, 3, 4)]
+
+    def _positions(theta: float) -> np.ndarray:
+        return np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [1.0 + np.cos(theta), 1.0, np.sin(theta)],
+                [2.0 + np.cos(0.5 * theta), 1.5, np.sin(0.5 * theta)],
+            ],
+            dtype=float,
+        )
+
+    library = [
+        {"positions_nm": _positions(theta), "primary_cv_value": float(theta)}
+        for theta in np.linspace(0.2, 2.6, 8)
+    ]
+    state_path = out_dir / "tica" / "bootstrap_torsion_cv.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    TICAResult(
+        weights=np.ones(4, dtype=float),
+        eigenvalue=0.5,
+        mean=np.zeros(4, dtype=float),
+        offset=0.0,
+        lag=1,
+        phi_torsion_indices=phi,
+        psi_torsion_indices=psi,
+        n_samples=len(library),
+        method="tica",
+    ).save(state_path)
+
+    args = _args(
+        secondary_cv="torsion-pca",
+        bootstrap_torsion_source="seeds",
+        bootstrap_torsion_residualize_against_cv1=True,
+        bootstrap_torsion_component=1,
+        bootstrap_torsion_min_seed_count=3,
+        bootstrap_torsion_state_file=str(state_path),
+        seed_conformers_dir=str(seed_dir),
+        _cv2_auto_centers=True,
+        secondary_cv_centers=None,
+        cv2_centers=None,
+    )
+
+    monkeypatch.setattr(cv_mod, "secondary_structure_torsions", lambda topology: (phi, psi))
+    monkeypatch.setattr(
+        seeding_mod,
+        "load_genpept_conformer_library",
+        lambda *args, **kwargs: list(library),
+    )
+
+    with pytest.raises((ValueError, RuntimeError), match="method.*pca|pca.*method"):
+        _ensure_bootstrap_torsion_cv_ready(args, out_dir, topology=object(), primary_cv_def={"mode": "distance"})
+
+
 def test_bootstrap_pca_returns_ticaresult_compatible_state():
     rng = np.random.default_rng(123)
     latent = np.linspace(-2.0, 2.0, 80)
