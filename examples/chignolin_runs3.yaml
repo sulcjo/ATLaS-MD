@@ -46,7 +46,7 @@ workflow_help: |
   CV2  bootstrap torsion PC1:
        seed-fit backbone torsion PCA coordinate for epoch 0,
        then one-shot handoff to tica-linear after first successful refit
-       k in [5, 100] kcal/mol after handoff (adaptive spacing)
+       k in [5, 50] kcal/mol after handoff (adaptive spacing)
   Seeds: best-scoring GENPEPT survivors per window (active-CV)
   Starting-structure pull: 50,000 steps/window at 3 fs, k=75
 
