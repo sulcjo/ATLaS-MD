@@ -428,10 +428,13 @@ def _basic_chignolin_config() -> Dict[str, Any]:
         "cv2": {
             # CV2 adaptive params
             "cv2_k_mode": "adaptive",
-            "cv2_k_min": 20.0,
+            "cv2_k_min": 5.0,
             "cv2_k_max": 50.0,
-            "cv2_adaptive_overlap_sigma": 20.0,
-            "cv2_k_scale": 2.0,
+            # overlap_sigma is spacing/sigma: larger => tighter windows => LESS
+            # overlap. 2.3 targets ~0.25 neighbour overlap on the rama ladder
+            # (k~=7 kcal/mol, unclamped); the old 20.0 collapsed overlap to ~1e-5.
+            "cv2_adaptive_overlap_sigma": 2.3,
+            "cv2_k_scale": 1.0,
         },
         "starting_structures": {
             "seed_conformers_dir": "chignolin_genpept_seeds/",
@@ -454,7 +457,9 @@ def _basic_chignolin_config() -> Dict[str, Any]:
             "region_memory": True,
         },
         "gamd": {
-            "gamd_boost_type": "lower-dual",
+            # C1-safe group boost (see cli.py --gamd-boost-type): total boost would
+            # entangle the umbrella and misspecify MBAR/exchange.
+            "gamd_boost_type": "lower-dual-nonbonded-dihedral",
             "production_steps": 3000000,
             "sigma0p": 5.0,
             "sigma0d": 5.0,

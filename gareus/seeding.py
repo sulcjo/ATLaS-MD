@@ -195,6 +195,64 @@ def _relative_secondary_cv_metadata_for_conformer(secondary_cv_metadata: Optiona
     return meta
 
 
+def detect_seed_scoring_degradations(
+    primary_is_contacts: bool,
+    rel_primary: Optional[dict],
+    secondary_available: bool,
+    seed_secondary_weight: float,
+    seed_selection_mode: str,
+    rel_secondary: Optional[dict],
+) -> list[dict]:
+    """Detect silent collapse of GENPEPT seed scoring to a lower-dimensional proxy.
+
+    Pure helper (no I/O, no OpenMM): takes already-resolved active-CV flags and
+    definitions and flags two scientific-audit failure modes that must never
+    pass silently when 2D sampling is active:
+
+      (a) ``primary_cv_collapsed_to_distance`` — the run's primary CV is
+          ``contacts``, but the loader could not map any production contact
+          pair into the peptide-only seed atom range, so it silently
+          substituted terminal Ca-Ca distance for every seed.
+      (b) ``secondary_cv_dropped`` — the secondary CV is intended to be part
+          of active-CV seed selection (available, weighted > 0, and
+          ``seed_selection_mode == "active-cv"``), but its relative CV
+          metadata resolved to ``None`` (missing/disabled/unmapped), so seed
+          scoring silently became CV1-only.
+
+    A run that legitimately chose distance as its primary CV, or that
+    deliberately excludes CV2 from seed scoring (``seed_selection_mode ==
+    "distance"`` or ``seed_secondary_weight == 0``), is not a degradation.
+    """
+    degradations: list[dict] = []
+    if primary_is_contacts and isinstance(rel_primary, dict) and str(rel_primary.get("mode")) == "distance":
+        degradations.append({
+            "kind": "primary_cv_collapsed_to_distance",
+            "message": (
+                "Seed scoring collapsed: primary CV is 'contacts' but no production "
+                "contact pair mapped into the peptide-only seed atom range, so every "
+                "seed was scored by terminal Ca-Ca distance instead "
+                "(CV1 contacts -> terminal-distance proxy)."
+            ),
+        })
+    secondary_intended_active = (
+        bool(secondary_available)
+        and float(seed_secondary_weight or 0.0) > 0.0
+        and str(seed_selection_mode) == "active-cv"
+    )
+    if secondary_intended_active and rel_secondary is None:
+        degradations.append({
+            "kind": "secondary_cv_dropped",
+            "message": (
+                "Seed scoring collapsed: secondary CV was intended active for seed "
+                "selection but its relative CV metadata resolved to None (metadata "
+                "missing/disabled or unmapped to the seed's peptide-only atoms), so "
+                "seed scoring silently became CV1-only "
+                "(CV2 rama-map dropped: metadata disabled while centers present, or unmapped)."
+            ),
+        })
+    return degradations
+
+
 def load_genpept_conformer_library(
     seed_conformers_dir: Path,
     cv_atom1: Optional[int] = None,
@@ -204,6 +262,7 @@ def load_genpept_conformer_library(
     args=None,
     topology=None,
     secondary_cv_metadata: Optional[dict] = None,
+    resolved_cv_defs_out: Optional[dict] = None,
 ) -> list[dict]:
     """Load GENPEPT final survivor PDBs and score them in active GAREUS CV space.
 
@@ -217,12 +276,18 @@ def load_genpept_conformer_library(
     csv_path = Path(seed_conformers_dir) / "final_survivor_seeds.csv"
     if not csv_path.exists():
         print(f"WARNING: --seed-conformers-dir: {csv_path} not found; falling back to NPT-pull for all windows.")
+        if resolved_cv_defs_out is not None:
+            resolved_cv_defs_out["rel_primary"] = None
+            resolved_cv_defs_out["rel_secondary"] = None
         return []
     try:
         with csv_path.open(newline="") as f:
             rows = list(csv.DictReader(f))
     except Exception as exc:
         print(f"WARNING: --seed-conformers-dir: could not read {csv_path}: {exc}")
+        if resolved_cv_defs_out is not None:
+            resolved_cv_defs_out["rel_primary"] = None
+            resolved_cv_defs_out["rel_secondary"] = None
         return []
 
     rel_primary = _relative_primary_cv_def_for_conformer(primary_cv_def, topology) if topology is not None else None
@@ -236,6 +301,9 @@ def load_genpept_conformer_library(
             "contact_pairs": [],
         }
     rel_secondary = _relative_secondary_cv_metadata_for_conformer(secondary_cv_metadata, topology) if topology is not None else None
+    if resolved_cv_defs_out is not None:
+        resolved_cv_defs_out["rel_primary"] = rel_primary
+        resolved_cv_defs_out["rel_secondary"] = rel_secondary
     mode = primary_cv_mode(rel_primary or "distance")
     units = primary_cv_units(rel_primary or "distance")
 
@@ -496,6 +564,7 @@ def generate_us_starting_states_by_pulling(
 
     seed_dir = getattr(args, "seed_conformers_dir", None)
     conformer_library: list[dict] = []
+    resolved_cv_defs: dict = {}
     if seed_dir is not None:
         conformer_library = load_genpept_conformer_library(
             Path(seed_dir), cv_atom1, cv_atom2,
@@ -503,6 +572,7 @@ def generate_us_starting_states_by_pulling(
             args=args,
             topology=topology,
             secondary_cv_metadata=secondary_cv_metadata,
+            resolved_cv_defs_out=resolved_cv_defs,
         )
 
     pull_dir = out_dir / "us_starting_structures"
@@ -826,6 +896,28 @@ def generate_us_starting_states_by_pulling(
     primary_seed_scale = _finite_spacing_scale(centers_user_arr, fallback=(0.2 if primary_cv_is_contacts(args) else 1.0))
     secondary_seed_scale = _finite_spacing_scale(secondary_cv_centers if secondary_cv_centers is not None else [], fallback=0.25)
 
+    seed_scoring_degradations: list[dict] = []
+    if conformer_library:
+        # Scientific-audit requirement: active-CV seed scoring must never
+        # silently collapse to a lower-dimensional proxy (e.g. CV1 contacts
+        # -> terminal distance, or CV2 dropped while intended active).  Detect
+        # it here from the already-resolved flags/defs, warn loudly, and
+        # record it in the seed_selection_report — do not hard-raise.
+        seed_scoring_degradations = detect_seed_scoring_degradations(
+            primary_is_contacts=primary_cv_is_contacts(args),
+            rel_primary=resolved_cv_defs.get("rel_primary"),
+            secondary_available=secondary_available,
+            seed_secondary_weight=seed_secondary_weight,
+            seed_selection_mode=seed_selection_mode,
+            rel_secondary=resolved_cv_defs.get("rel_secondary"),
+        )
+        for _deg in seed_scoring_degradations:
+            print(
+                "!" * 78 + "\n"
+                f"WARNING [SEED SCORING COLLAPSE] ({_deg['kind']}): {_deg['message']}\n"
+                + "!" * 78
+            )
+
     def _select_conformer_for_window(w: int) -> tuple[dict, dict]:
         """Choose the best GENPEPT seed for a window using active CV-space distance."""
         if not conformer_library:
@@ -1033,6 +1125,7 @@ def generate_us_starting_states_by_pulling(
                 "primary_cv": primary_cv_mode(args),
                 "primary_cv_units": primary_cv_units(args),
                 "secondary_cv_enabled": bool(secondary_available),
+                "degradations": seed_scoring_degradations,
                 "rows": seed_selection_rows_sorted,
             }))
             report_csv = pull_dir / "seed_selection_report.csv"

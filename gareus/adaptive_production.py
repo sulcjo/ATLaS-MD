@@ -1763,7 +1763,7 @@ def _maybe_update_tica_cvaux(epoch: int, epoch_dir: Path, adaptive_dir: Path, ar
     mbar_reweighted = False
     if registry is not None:
         try:
-            _, _wids_tmp, _pcv_tmp, _scv_tmp = load_epoch_dihedral_obs(epoch_dir)
+            _, _wids_tmp, _pcv_tmp, _scv_tmp, _ = load_epoch_dihedral_obs(epoch_dir)
             if np.isfinite(_pcv_tmp).any():
                 temp_K = float(getattr(args, "temperature", 298.0) or 298.0)
                 mbar_weights = _compute_mbar_weights_for_tica(
@@ -1803,7 +1803,7 @@ def _maybe_update_tica_cvaux(epoch: int, epoch_dir: Path, adaptive_dir: Path, ar
     # Compute per-window tIC1 medians for registry secondary_center update.
     per_window_centers: Dict[int, float] = {}
     try:
-        X_all, window_ids, _, _ = load_epoch_dihedral_obs(epoch_dir)
+        X_all, window_ids, _, _, _ = load_epoch_dihedral_obs(epoch_dir)
         per_window_centers = window_tica_centers(X_all, window_ids, result)
     except Exception as _wc_exc:
         print(f"    tICA: per-window center computation failed ({_wc_exc}); registry centers will not be updated")

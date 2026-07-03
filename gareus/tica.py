@@ -192,6 +192,103 @@ def backbone_dihedral_features(
 # tICA core
 # ---------------------------------------------------------------------------
 
+def _normalize_segments(segments: Optional[np.ndarray], n: int) -> np.ndarray:
+    """Normalise a ``segments`` argument to an array of segment lengths.
+
+    Accepts either:
+      * ``None`` — the whole array is treated as a single segment.
+      * A 1-D array/list of segment lengths (one entry per trajectory
+        segment, in concatenation order), summing to ``n``.
+      * A per-frame segment-id array of length ``n`` (values need not be
+        contiguous integers, but each distinct id must occupy a single
+        contiguous run — i.e. the array must already be grouped by
+        trajectory segment, which is guaranteed by concatenation order).
+
+    The lengths interpretation is tried FIRST whenever it is
+    self-consistent (all positive and summing to ``n``); the per-frame-id
+    interpretation is only used as a fallback when the array does not
+    parse as a valid lengths array. This avoids ambiguity in the
+    degenerate case where the number of segments happens to equal ``n``
+    (e.g. every trajectory contributed exactly one frame): a lengths
+    array of ``n`` ones must NOT be misread as a single per-frame id run
+    covering all ``n`` frames, which would silently reintroduce
+    cross-segment lagged pairs.
+
+    Returns
+    -------
+    np.ndarray, dtype int64
+        Segment lengths, in order, summing to ``n``.
+    """
+    if segments is None:
+        return np.asarray([n], dtype=np.int64)
+    arr = np.asarray(segments)
+    if arr.ndim != 1:
+        raise ValueError(f"segments must be 1-D, got shape {arr.shape}")
+
+    as_lengths = arr.astype(np.int64)
+    if as_lengths.shape[0] > 0 and as_lengths.sum() == n and np.all(as_lengths > 0):
+        return as_lengths
+
+    if arr.shape[0] == n:
+        # Per-frame segment-id array: run-length encode contiguous blocks.
+        lengths: List[int] = []
+        seen_ids = set()
+        current_id = arr[0]
+        current_len = 1
+        seen_ids.add(current_id)
+        for val in arr[1:]:
+            if val == current_id:
+                current_len += 1
+            else:
+                if val in seen_ids:
+                    raise ValueError(
+                        f"segment id {val!r} appears in non-contiguous blocks; "
+                        "per-frame segment ids must be grouped by trajectory segment"
+                    )
+                lengths.append(current_len)
+                seen_ids.add(val)
+                current_id = val
+                current_len = 1
+        lengths.append(current_len)
+        return np.asarray(lengths, dtype=np.int64)
+
+    if as_lengths.sum() != n:
+        raise ValueError(
+            f"segments sum to {int(as_lengths.sum())}, expected n_samples={n}"
+        )
+    raise ValueError("segment lengths must all be positive")
+
+
+def _segment_lagged_pair_indices(lengths: np.ndarray, lag: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Build within-segment lagged-pair frame indices.
+
+    For each contiguous segment of length ``L`` (offset ``s`` in the
+    concatenated array), valid pairs are ``(s+t, s+t+lag)`` for
+    ``t in [0, L-lag)``. Segments with ``L <= lag`` contribute zero pairs.
+    Pairs are never formed across segment boundaries.
+
+    Returns
+    -------
+    (left, right) : np.ndarray, np.ndarray
+        Integer index arrays into the concatenated array, same length,
+        such that ``right = left + lag`` and every ``(left[i], right[i])``
+        pair lies within a single segment.
+    """
+    left_parts: List[np.ndarray] = []
+    offset = 0
+    for L in lengths:
+        L = int(L)
+        if L > lag:
+            left_parts.append(np.arange(offset, offset + L - lag, dtype=np.int64))
+        offset += L
+    if left_parts:
+        left = np.concatenate(left_parts)
+    else:
+        left = np.asarray([], dtype=np.int64)
+    right = left + lag
+    return left, right
+
+
 def compute_tica(
     X: np.ndarray,
     lag: int,
@@ -201,6 +298,7 @@ def compute_tica(
     previous_result: Optional[TICAResult] = None,
     epsilon: float = 1e-10,
     weights: Optional[np.ndarray] = None,
+    segments: Optional[np.ndarray] = None,
 ) -> TICAResult:
     """Fit a tICA model to feature matrix X and return the slowest mode.
 
@@ -225,6 +323,18 @@ def compute_tica(
         the biased REUS ensemble to the unbiased equilibrium distribution).
         Must be non-negative; are normalised internally to sum to 1.
         When None, standard unweighted tICA is used.
+    segments : np.ndarray or list, optional
+        Trajectory-segment boundaries within the concatenated ``X`` (e.g.
+        one segment per replica trajectory file). Either a 1-D array of
+        segment lengths (summing to ``n_samples``) or a per-frame
+        segment-id array of length ``n_samples`` (each id must occupy one
+        contiguous run). When given, lagged pairs ``(x_t, x_{t+lag})`` are
+        built ONLY within each segment — pairs never cross a segment
+        boundary, so a join between two different replica trajectories
+        cannot masquerade as a real transition in C(tau).  A segment with
+        length <= lag contributes zero pairs. When ``None`` (default), the
+        whole array is treated as a single segment, reproducing the
+        previous (pre-fix) behaviour exactly.
 
     Returns
     -------
@@ -234,7 +344,9 @@ def compute_tica(
     Raises
     ------
     ValueError
-        If ``lag`` is not positive or X has fewer rows than 2*lag.
+        If ``lag`` is not positive, X has fewer rows than 2*lag, or no
+        segment has more than ``lag`` frames (zero valid within-segment
+        lagged pairs).
     """
     if int(lag) <= 0:
         raise ValueError(f"lag must be a positive integer, got {lag!r}")
@@ -246,6 +358,18 @@ def compute_tica(
     if n <= 2 * lag:
         raise ValueError(
             f"X has only {n} rows; need > 2*lag={2*lag} for a valid lagged covariance estimate"
+        )
+
+    lengths = _normalize_segments(segments, n)
+    left, right = _segment_lagged_pair_indices(lengths, lag)
+    n_pairs = int(left.shape[0])
+    if n_pairs < 2:
+        raise ValueError(
+            f"too few valid within-segment lagged pairs ({n_pairs}) for a "
+            f"stable tICA C(tau) estimate: need >= 2, got segment lengths "
+            f"{lengths.tolist()} with lag={lag} (total n={n}); pairs are "
+            "never built across trajectory-segment boundaries, so no "
+            "segment longer than lag means zero valid pairs"
         )
 
     if weights is not None:
@@ -265,20 +389,20 @@ def compute_tica(
         Xc = X - mean
         C0 = (Xc.T @ Xc) / (n - 1)
         C0 += epsilon * np.eye(d)
-        Xl = Xc[:-lag]
-        Xr = Xc[lag:]
-        Ctau = (Xl.T @ Xr) / (n - lag - 1)
+        Xl = Xc[left]
+        Xr = Xc[right]
+        Ctau = (Xl.T @ Xr) / (n_pairs - 1)
         Ctau = 0.5 * (Ctau + Ctau.T)
     else:
         # Reweighted tICA: symmetric estimator with pair weights
         # (Nüske et al. 2017 / standard MBAR-reweighted TICA form)
         mean = w @ X  # weighted mean, shape (d,)
         Xc = X - mean
-        Xl = Xc[:-lag]
-        Xr = Xc[lag:]
+        Xl = Xc[left]
+        Xr = Xc[right]
         # Arithmetic-mean pair weights: each pair (t, t+lag) gets
         # the average of source and target frame weights, then renormalised.
-        w_pairs = 0.5 * (w[:-lag] + w[lag:])
+        w_pairs = 0.5 * (w[left] + w[right])
         w_pairs = w_pairs / w_pairs.sum()
         # Symmetric weighted C(0): average contribution from source and target
         C0 = 0.5 * ((Xl.T * w_pairs) @ Xl + (Xr.T * w_pairs) @ Xr)
@@ -628,8 +752,16 @@ class DihedralObsBuffer:
 
 def load_epoch_dihedral_obs(
     epoch_dir,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Load and concatenate all replica dihedral observations from an epoch.
+
+    Each ``dihedral_obs_*.npz`` file is one contiguous replica MD
+    trajectory (window swaps do not break the configurational trajectory:
+    a replica's MD is continuous within its file regardless of which
+    umbrella currently biases it). The per-file frame counts are returned
+    as ``segment_lengths`` so downstream lagged-covariance code (see
+    :func:`compute_tica`) can avoid forming spurious lagged pairs across
+    the boundary between two different replica trajectories.
 
     Parameters
     ----------
@@ -646,6 +778,10 @@ def load_epoch_dihedral_obs(
         Primary CV values per frame (NaN if not recorded — old obs files).
     secondary_cv : np.ndarray, shape (n_samples,)
         Secondary CV values per frame (NaN if inactive or not recorded).
+    segment_lengths : np.ndarray, shape (n_files,)
+        Frame count of each source npz file, in concatenation order. Pass
+        this straight through as ``segments=`` to :func:`compute_tica` so
+        lagged pairs are never built across a replica-trajectory boundary.
 
     Raises
     ------
@@ -662,6 +798,7 @@ def load_epoch_dihedral_obs(
     window_chunks: List[np.ndarray] = []
     primary_cv_chunks: List[np.ndarray] = []
     secondary_cv_chunks: List[np.ndarray] = []
+    segment_lengths: List[int] = []
     for npz_path in npz_files:
         data = np.load(npz_path)
         feats = data["features"]
@@ -674,11 +811,12 @@ def load_epoch_dihedral_obs(
         secondary_cv_chunks.append(
             data["secondary_cv"] if "secondary_cv" in data else np.full(n, np.nan)
         )
+        segment_lengths.append(int(n))
     X = np.concatenate(feature_chunks, axis=0)
     window_ids = np.concatenate(window_chunks, axis=0)
     primary_cv = np.concatenate(primary_cv_chunks, axis=0)
     secondary_cv = np.concatenate(secondary_cv_chunks, axis=0)
-    return X, window_ids, primary_cv, secondary_cv
+    return X, window_ids, primary_cv, secondary_cv, np.asarray(segment_lengths, dtype=np.int64)
 
 
 def compute_tica_from_epoch_obs(
@@ -710,7 +848,7 @@ def compute_tica_from_epoch_obs(
     -------
     TICAResult
     """
-    X, _, _, _ = load_epoch_dihedral_obs(epoch_dir)
+    X, _, _, _, segment_lengths = load_epoch_dihedral_obs(epoch_dir)
     return compute_tica(
         X,
         lag_frames,
@@ -718,4 +856,5 @@ def compute_tica_from_epoch_obs(
         psi_torsion_indices=psi_torsion_indices,
         previous_result=previous_result,
         weights=weights,
+        segments=segment_lengths,
     )
