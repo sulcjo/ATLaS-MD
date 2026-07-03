@@ -16,6 +16,8 @@ from gareus.tica import (
     tica_k_from_spread,
     window_tica_centers,
     DihedralObsBuffer,
+    _normalize_segments,
+    _segment_lagged_pair_indices,
 )
 
 
@@ -42,6 +44,58 @@ def _slow_mode_dataset(n_frames: int = 400, lag: int = 5, seed: int = 0):
         slow[t] = 0.99 * slow[t - 1] + rng.normal(0, 0.14)
     fast = rng.normal(0, 1, n_frames)
     return np.column_stack([slow, fast])
+
+
+def _hand_tica_reference(X, lag, seg_lengths, weights=None, epsilon=1e-10):
+    """Independent (test-only) reference tICA solve.
+
+    Builds within-segment lagged pairs via a plain Python loop (deliberately
+    NOT using gareus.tica._segment_lagged_pair_indices), assembles C(0)/C(tau)
+    with the same formulas as gareus.tica.compute_tica, and solves the
+    generalised eigenproblem directly via scipy — used as an independent
+    oracle to check that compute_tica(..., segments=...) never forms a
+    lagged pair across a trajectory-segment boundary.
+    """
+    from scipy.linalg import eigh as scipy_eigh
+
+    X = np.asarray(X, dtype=np.float64)
+    n, d = X.shape
+    pairs = []
+    offset = 0
+    for L in seg_lengths:
+        for t in range(L - lag):
+            pairs.append((offset + t, offset + t + lag))
+        offset += L
+    assert pairs, "reference expects at least one valid pair"
+    left = np.array([p[0] for p in pairs], dtype=np.int64)
+    right = np.array([p[1] for p in pairs], dtype=np.int64)
+    n_pairs = len(pairs)
+
+    if weights is None:
+        mean = X.mean(axis=0)
+        Xc = X - mean
+        C0 = (Xc.T @ Xc) / (n - 1) + epsilon * np.eye(d)
+        Xl, Xr = Xc[left], Xc[right]
+        Ctau = (Xl.T @ Xr) / (n_pairs - 1)
+        Ctau = 0.5 * (Ctau + Ctau.T)
+    else:
+        w = np.asarray(weights, dtype=np.float64)
+        w = w / w.sum()
+        mean = w @ X
+        Xc = X - mean
+        Xl, Xr = Xc[left], Xc[right]
+        w_pairs = 0.5 * (w[left] + w[right])
+        w_pairs = w_pairs / w_pairs.sum()
+        C0 = 0.5 * ((Xl.T * w_pairs) @ Xl + (Xr.T * w_pairs) @ Xr) + epsilon * np.eye(d)
+        Ctau = 0.5 * ((Xl.T * w_pairs) @ Xr + (Xr.T * w_pairs) @ Xl)
+
+    eigenvalues, eigenvectors = scipy_eigh(Ctau, C0, subset_by_index=[d - 1, d - 1])
+    v = eigenvectors[:, 0].copy()
+    ev = float(eigenvalues[0])
+    norm_sq = float(v @ C0 @ v)
+    if norm_sq > 0.0:
+        v /= np.sqrt(norm_sq)
+    return ev, v
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +234,219 @@ class TestComputeTICA:
         assert abs(result.weights[0]) > abs(result.weights[1]), (
             "weighted tICA should still find slow feature as dominant mode"
         )
+
+
+# ---------------------------------------------------------------------------
+# Segment-boundary helpers (_normalize_segments, _segment_lagged_pair_indices)
+# ---------------------------------------------------------------------------
+
+class TestNormalizeSegments:
+    def test_none_returns_whole_array_as_one_segment(self):
+        out = _normalize_segments(None, 42)
+        np.testing.assert_array_equal(out, [42])
+
+    def test_lengths_list_passthrough(self):
+        out = _normalize_segments([10, 20, 12], 42)
+        np.testing.assert_array_equal(out, [10, 20, 12])
+
+    def test_per_frame_id_array_run_length_encoded(self):
+        ids = np.array([0, 0, 0, 1, 1, 2, 2, 2, 2])
+        out = _normalize_segments(ids, 9)
+        np.testing.assert_array_equal(out, [3, 2, 4])
+
+    def test_rejects_noncontiguous_ids(self):
+        ids = np.array([0, 0, 1, 1, 0, 0])  # id 0 reappears after id 1
+        with pytest.raises(ValueError, match="non-contiguous"):
+            _normalize_segments(ids, 6)
+
+    def test_rejects_bad_sum(self):
+        with pytest.raises(ValueError, match="sum"):
+            _normalize_segments([10, 10], 25)
+
+    def test_rejects_nonpositive_length(self):
+        with pytest.raises(ValueError, match="positive"):
+            _normalize_segments([10, 0, 15], 25)
+
+    def test_all_ones_lengths_not_misread_as_single_id_run(self):
+        """Regression: when the number of segments equals n (e.g. every
+        replica file has exactly 1 frame), a lengths array of all 1s must
+        be treated as n separate length-1 segments — NOT misread as a
+        per-frame id array (all entries equal -> one contiguous "id" run
+        spanning all n frames), which would silently reintroduce
+        cross-segment lagged pairs."""
+        n = 5
+        out = _normalize_segments([1, 1, 1, 1, 1], n)
+        np.testing.assert_array_equal(out, [1, 1, 1, 1, 1])
+        assert out.sum() == n
+        assert len(out) == n  # NOT collapsed into a single segment of length n
+
+
+class TestSegmentLaggedPairIndices:
+    def test_excludes_cross_boundary_pairs(self):
+        lengths = np.array([5, 4])
+        lag = 2
+        left, right = _segment_lagged_pair_indices(lengths, lag)
+        # Segment 1 (len 5, offset 0): valid lefts 0,1,2 (L-lag=3)
+        # Segment 2 (len 4, offset 5): valid lefts 5,6 (L-lag=2)
+        # Cross-boundary lefts 3,4 (whose right = 5,6 would land in segment 2)
+        # must NOT appear.
+        np.testing.assert_array_equal(left, [0, 1, 2, 5, 6])
+        np.testing.assert_array_equal(right, np.asarray([0, 1, 2, 5, 6]) + lag)
+        assert 3 not in left
+        assert 4 not in left
+
+    def test_zero_pairs_when_every_segment_shorter_than_lag(self):
+        lengths = np.array([3, 3, 3])
+        left, right = _segment_lagged_pair_indices(lengths, lag=5)
+        assert left.shape[0] == 0
+        assert right.shape[0] == 0
+
+    def test_segment_equal_to_lag_contributes_zero_pairs(self):
+        lengths = np.array([5, 10])
+        left, right = _segment_lagged_pair_indices(lengths, lag=5)
+        # First segment length == lag -> zero pairs from it.
+        # Second segment (offset 5, len 10): valid lefts 5..9 (L-lag=5)
+        np.testing.assert_array_equal(left, [5, 6, 7, 8, 9])
+
+
+# ---------------------------------------------------------------------------
+# compute_tica: segment-boundary-aware lagged covariance (fix under test)
+# ---------------------------------------------------------------------------
+
+class TestComputeTICASegments:
+    def test_explicit_single_segment_matches_implicit_none(self):
+        """Backward compat: segments=[n] (whole array as one segment) must
+        reproduce the segments=None default path exactly."""
+        X = _slow_mode_dataset(n_frames=300, lag=5, seed=3)
+        n = len(X)
+        r_none = compute_tica(X, lag=5)
+        r_explicit = compute_tica(X, lag=5, segments=[n])
+        np.testing.assert_allclose(r_none.weights, r_explicit.weights, atol=1e-12)
+        assert abs(r_none.eigenvalue - r_explicit.eigenvalue) < 1e-12
+        np.testing.assert_allclose(r_none.mean, r_explicit.mean, atol=1e-12)
+        assert abs(r_none.offset - r_explicit.offset) < 1e-12
+        assert r_none.n_samples == r_explicit.n_samples == n
+
+    def test_explicit_single_segment_matches_implicit_none_weighted(self):
+        X = _slow_mode_dataset(n_frames=300, lag=5, seed=4)
+        n = len(X)
+        rng = np.random.default_rng(5)
+        w = rng.random(n)
+        r_none = compute_tica(X, lag=5, weights=w)
+        r_explicit = compute_tica(X, lag=5, weights=w, segments=[n])
+        np.testing.assert_allclose(r_none.weights, r_explicit.weights, atol=1e-12)
+        assert abs(r_none.eigenvalue - r_explicit.eigenvalue) < 1e-12
+
+    def test_boundary_exclusion_matches_hand_computed_reference(self):
+        """C(tau) from compute_tica(segments=[L1,L2]) must match an
+        independently hand-computed per-segment C(tau)/C(0) solve — i.e. no
+        pair straddling the L1/L2 join is used."""
+        lag = 5
+        L1, L2 = 220, 180
+        seg1 = _slow_mode_dataset(n_frames=L1, lag=lag, seed=11)
+        seg2 = _slow_mode_dataset(n_frames=L2, lag=lag, seed=22)
+        # Inject a large artificial discontinuity in feature 0 at the join —
+        # if a cross-boundary pair were ever formed, it would inject a
+        # spurious correlation into C(tau).
+        seg2 = seg2.copy()
+        seg2[:, 0] += 50.0
+        X = np.concatenate([seg1, seg2], axis=0)
+        seg_lengths = [L1, L2]
+
+        result = compute_tica(X, lag=lag, segments=seg_lengths)
+        ref_eigenvalue, ref_weights = _hand_tica_reference(X, lag, seg_lengths)
+
+        # result.weights / ref_weights are C(0)-normalised, not L2-unit, so a
+        # raw dot product is not a bounded cosine similarity — normalise by
+        # both L2 norms explicitly.
+        cos = float(
+            np.dot(result.weights, ref_weights)
+            / (np.linalg.norm(result.weights) * np.linalg.norm(ref_weights))
+        )
+        assert abs(cos) > 0.999, f"cosine similarity to reference = {cos:.6f}"
+        assert abs(result.eigenvalue - ref_eigenvalue) < 1e-6
+
+    def test_boundary_pairs_excluded_changes_result_vs_naive_concatenation(self):
+        """With a discontinuity at the join, the segment-aware result must
+        differ from the naive (segments=None, boundary pairs included)
+        result — proving the fix actually changes behaviour."""
+        lag = 5
+        L1, L2 = 220, 180
+        seg1 = _slow_mode_dataset(n_frames=L1, lag=lag, seed=11)
+        seg2 = _slow_mode_dataset(n_frames=L2, lag=lag, seed=22)
+        seg2 = seg2.copy()
+        seg2[:, 0] += 50.0
+        X = np.concatenate([seg1, seg2], axis=0)
+
+        r_segmented = compute_tica(X, lag=lag, segments=[L1, L2])
+        r_naive = compute_tica(X, lag=lag)  # old behaviour: boundary pairs included
+
+        cos = float(
+            np.dot(r_segmented.weights, r_naive.weights)
+            / (np.linalg.norm(r_segmented.weights) * np.linalg.norm(r_naive.weights))
+        )
+        differs = abs(cos) < 0.999 or abs(r_segmented.eigenvalue - r_naive.eigenvalue) > 1e-4
+        assert differs, (
+            "segmented result should differ from naive whole-array concatenation "
+            "when a spurious cross-boundary jump is present"
+        )
+
+    def test_weighted_boundary_exclusion_matches_hand_computed_reference(self):
+        """Weighted branch: pair-weight bookkeeping must also respect
+        segment boundaries."""
+        lag = 5
+        L1, L2 = 220, 180
+        seg1 = _slow_mode_dataset(n_frames=L1, lag=lag, seed=31)
+        seg2 = _slow_mode_dataset(n_frames=L2, lag=lag, seed=32)
+        seg2 = seg2.copy()
+        seg2[:, 0] += 50.0
+        X = np.concatenate([seg1, seg2], axis=0)
+        seg_lengths = [L1, L2]
+
+        rng = np.random.default_rng(77)
+        w = rng.random(L1 + L2) + 0.1  # strictly positive, non-uniform
+
+        result = compute_tica(X, lag=lag, segments=seg_lengths, weights=w)
+        ref_eigenvalue, ref_weights = _hand_tica_reference(X, lag, seg_lengths, weights=w)
+
+        cos = float(
+            np.dot(result.weights, ref_weights)
+            / (np.linalg.norm(result.weights) * np.linalg.norm(ref_weights))
+        )
+        assert abs(cos) > 0.999, f"cosine similarity to weighted reference = {cos:.6f}"
+        assert abs(result.eigenvalue - ref_eigenvalue) < 1e-6
+
+    def test_short_segments_all_below_lag_raises_even_though_total_n_large(self):
+        """16 replicas x 30 frames with default-style lag=50: total n=480 >
+        2*lag=100 (old guard would pass) but every segment is shorter than
+        the lag, so there are ZERO valid within-segment pairs — must raise."""
+        lag = 50
+        seg_lengths = [30] * 16
+        n = sum(seg_lengths)
+        assert n > 2 * lag  # sanity: the old total-length guard would NOT catch this
+        X = np.random.default_rng(1).standard_normal((n, 4))
+        with pytest.raises(ValueError, match="too few valid"):
+            compute_tica(X, lag=lag, segments=seg_lengths)
+
+    def test_segment_equal_to_lag_contributes_no_pairs_but_others_do(self):
+        """A segment with length == lag contributes zero pairs (per spec:
+        L <= lag -> zero pairs), but the fit should still succeed using the
+        other segment's pairs."""
+        lag = 5
+        seg_lengths = [lag, 200]
+        X = np.random.default_rng(2).standard_normal((sum(seg_lengths), 3))
+        result = compute_tica(X, lag=lag, segments=seg_lengths)
+        assert np.isfinite(result.weights).all()
+
+    def test_rejects_when_too_few_pairs_for_stable_estimate(self):
+        """A single remaining pair (n_pairs < 2) must raise rather than
+        silently divide by zero in the (n_pairs - 1) denominator."""
+        lag = 5
+        # One segment barely longer than lag (1 pair) plus short segments.
+        seg_lengths = [lag + 1, 3, 3]
+        X = np.random.default_rng(3).standard_normal((sum(seg_lengths), 3))
+        with pytest.raises(ValueError, match="too few valid"):
+            compute_tica(X, lag=lag, segments=seg_lengths)
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +621,7 @@ class TestLoadEpochDihedralObs:
             epoch_dir = Path(tmp) / "epoch_000"
             self._write_obs(epoch_dir, 0, 50, 12, seed=1)
             self._write_obs(epoch_dir, 1, 30, 12, seed=2)
-            X, wids, pcv, scv = load_epoch_dihedral_obs(epoch_dir)
+            X, wids, pcv, scv, seg_lengths = load_epoch_dihedral_obs(epoch_dir)
             assert X.shape == (80, 12)
             assert wids.shape == (80,)
             # Old obs files without primary_cv → NaN filled
@@ -362,6 +629,9 @@ class TestLoadEpochDihedralObs:
             assert np.all(np.isnan(pcv))
             assert scv.shape == (80,)
             assert np.all(np.isnan(scv))
+            # Segment lengths track per-file frame counts, in glob-sorted order
+            np.testing.assert_array_equal(seg_lengths, [50, 30])
+            assert int(seg_lengths.sum()) == 80
 
     def test_loads_with_cv_arrays(self):
         """Obs files that include primary_cv/secondary_cv are loaded correctly."""
@@ -380,9 +650,10 @@ class TestLoadEpochDihedralObs:
                 primary_cv=pcv,
                 secondary_cv=scv,
             )
-            X, wids, pcv_out, scv_out = load_epoch_dihedral_obs(epoch_dir)
+            X, wids, pcv_out, scv_out, seg_lengths = load_epoch_dihedral_obs(epoch_dir)
             np.testing.assert_allclose(pcv_out, pcv)
             np.testing.assert_allclose(scv_out, scv)
+            np.testing.assert_array_equal(seg_lengths, [40])
 
     def test_raises_on_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
