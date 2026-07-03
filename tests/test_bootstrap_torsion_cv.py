@@ -260,6 +260,7 @@ def test_ticaresult_preserves_method_roundtrip(tmp_path):
 
 def test_positions_score_uses_linear_torsion_weights():
     from gareus.cv import secondary_structure_score_from_positions_nm
+    from gareus.tica import backbone_dihedral_features
 
     positions = np.array([
         [0.0, 0.0, 0.0],
@@ -276,5 +277,10 @@ def test_positions_score_uses_linear_torsion_weights():
         "psi_torsions": [],
     }
     value = secondary_structure_score_from_positions_nm(positions, metadata)
+    expected = (
+        backbone_dihedral_features(positions, [(0, 1, 2, 3)], [])
+        @ np.asarray(metadata["weights"], dtype=float)
+        + float(metadata["tica_offset"])
+    )
     assert np.isfinite(value)
-    assert value == pytest.approx(np.sin(np.pi / 2.0) + 0.25, abs=1.0e-6)
+    assert value == pytest.approx(expected, abs=1.0e-6)

@@ -480,17 +480,6 @@ def _ensure_secondary_cv_numeric_cache(ss_info: Dict[str, Any], mode: str) -> fl
     return sigma
 
 
-def _linear_torsion_features_from_angles(phi_angles: np.ndarray, psi_angles: np.ndarray) -> np.ndarray:
-    feats: list[float] = []
-    for angle in phi_angles:
-        feats.append(float(np.sin(angle)))
-        feats.append(float(np.cos(angle)))
-    for angle in psi_angles:
-        feats.append(float(np.sin(angle)))
-        feats.append(float(np.cos(angle)))
-    return np.asarray(feats, dtype=np.float64)
-
-
 def secondary_structure_score_from_positions_nm(positions_nm, ss_info: Optional[Dict[str, Any]]) -> float:
     """Compute the same smooth secondary-structure score used by the OpenMM CV.
 
@@ -504,18 +493,24 @@ def secondary_structure_score_from_positions_nm(positions_nm, ss_info: Optional[
     mode = secondary_cv_mode(ss_info)
     sigma = _ensure_secondary_cv_numeric_cache(ss_info, mode)
 
-    phi_angles = _batch_torsion_angles_rad(positions_nm, ss_info["_np_phi_idx"])
-    psi_angles = _batch_torsion_angles_rad(positions_nm, ss_info["_np_psi_idx"])
-    has_phi = len(phi_angles) > 0
-    has_psi = len(psi_angles) > 0
-
     if mode in {"tica-linear", "torsion-pca"}:
+        from .tica import backbone_dihedral_features
+
         weights = np.asarray(ss_info.get("weights", []), dtype=np.float64)
-        feats = _linear_torsion_features_from_angles(phi_angles, psi_angles)
+        feats = backbone_dihedral_features(
+            np.asarray(positions_nm, dtype=np.float64),
+            [tuple(map(int, quart)) for quart in ss_info.get("phi_torsions", [])],
+            [tuple(map(int, quart)) for quart in ss_info.get("psi_torsions", [])],
+        )
         if weights.shape != feats.shape:
             raise ValueError(f"{mode} weights shape {weights.shape} does not match feature shape {feats.shape}")
         offset = float(ss_info.get("tica_offset", 0.0))
         return float(feats @ weights + offset)
+
+    phi_angles = _batch_torsion_angles_rad(positions_nm, ss_info["_np_phi_idx"])
+    psi_angles = _batch_torsion_angles_rad(positions_nm, ss_info["_np_psi_idx"])
+    has_phi = len(phi_angles) > 0
+    has_psi = len(psi_angles) > 0
 
     if mode == "alpha-coil-beta":
         phi_scores = _mean_torsion_scores_from_angles(phi_angles, ss_info["_np_alpha_beta_phi_targets"], sigma)
