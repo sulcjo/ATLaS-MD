@@ -2497,6 +2497,75 @@ def _gamd_boost_group_targets(system, args, unit) -> tuple[list[tuple[str, Optio
         )
     return targets, integrator
 
+def run_multiwindow_gamd_recon(
+    args, openmm, app, unit, topology, base_system, platform, props,
+    centers_nm, ks_kj_nm2, secondary_cv_centers, secondary_cv_ks_kj,
+    window_start_positions, window_start_velocities, equil_state,
+    progress: Optional[GuiProgressSink] = None,
+) -> dict[str, "PooledEnvelope"]:
+    """Recon every initial/pilot window's local potential energy under its own
+    umbrella bias, then pool per boost-group across all windows.
+
+    `base_system` already has the primary umbrella force (and secondary CV
+    force, if enabled) added -- deserialize_system(openmm, base_system) gives
+    each window a ready-to-bias system copy with no further force additions
+    needed (mirrors how production replicas are built at the call site below).
+    """
+    from gareus.gamd_calibration import WelfordAccumulator, pool_window_stats
+
+    nwin = int(len(centers_nm))
+    prep_steps = int(getattr(args, "gamd_multiwindow_recon_prep_steps", 2000) or 0)
+    recon_steps = int(getattr(args, "gamd_multiwindow_recon_steps", 20000) or 0)
+    report_interval = int(getattr(args, "gamd_multiwindow_recon_report_interval", 0) or 0)
+    if report_interval <= 0:
+        report_interval = max(1, recon_steps // 200)
+
+    per_group_window_stats: dict[str, list] = {}
+    equil_box = equil_state.getPeriodicBoxVectors()
+    for i in range(nwin):
+        system_i = deserialize_system(openmm, base_system)
+        targets, integrator_i = _gamd_boost_group_targets(system_i, args, unit)
+        props_i = replica_platform_properties(platform, props, args, i)
+        sim_i = app.Simulation(topology, system_i, integrator_i, platform, props_i)
+        pos = window_start_positions[i] if window_start_positions and window_start_positions[i] is not None else equil_state.getPositions()
+        vel = window_start_velocities[i] if window_start_velocities and window_start_velocities[i] is not None else None
+        if equil_box is not None:
+            sim_i.context.setPeriodicBoxVectors(*equil_box)
+        sim_i.context.setPositions(pos)
+        if vel is not None:
+            sim_i.context.setVelocities(vel)
+        else:
+            sim_i.context.setVelocitiesToTemperature(args.temperature_k * unit.kelvin, args.seed + 4021 + i)
+        set_window(sim_i.context, centers_nm, ks_kj_nm2, i, secondary_cv_centers, secondary_cv_ks_kj)
+
+        if prep_steps > 0:
+            sim_i.step(prep_steps)
+
+        accumulators = {name: WelfordAccumulator() for name, _gid in targets}
+        done = 0
+        while done < recon_steps:
+            chunk = min(report_interval, recon_steps - done)
+            sim_i.step(int(chunk))
+            done += int(chunk)
+            for name, gid in targets:
+                groups = {gid} if gid is not None else set(range(32))
+                state = sim_i.context.getState(getEnergy=True, groups=groups)
+                pe_kj = float(state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole))
+                accumulators[name].update(pe_kj)
+
+        if progress is not None:
+            progress.progress(
+                "gamd_multiwindow_recon", i + 1, nwin,
+                message=f"window {i + 1}/{nwin} recon done", force=(i == nwin - 1),
+            )
+        for name, acc in accumulators.items():
+            per_group_window_stats.setdefault(name, []).append(acc.to_stats(name, i))
+        release_openmm_contexts(sim_i, integrator_i, system_i)
+
+    if not per_group_window_stats:
+        raise RuntimeError("Multi-window GaMD recon collected no boost-group statistics")
+    return {name: pool_window_stats(stats) for name, stats in per_group_window_stats.items()}
+
 def run_shared_gamd_setup_article_a(
     args,
     out_dir: Path,
