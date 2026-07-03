@@ -352,7 +352,41 @@ def _linear_torsion_state_for_mode(args, mode: str) -> tuple[Path, "TICAResult"]
     else:
         raise ValueError(f"Unsupported linear torsion CV mode {mode!r}")
     path = Path(state_file)
-    return path, TICAResult.load(path)
+    result = TICAResult.load(path)
+    method = str(getattr(result, "method", "tica") or "tica")
+    if mode == "torsion-pca" and method != "pca":
+        raise RuntimeError(f"cv2=torsion-pca requires state method='pca', got {method!r}")
+    if mode == "tica-linear" and method != "tica":
+        raise RuntimeError(f"cv2=tica-linear requires state method='tica', got {method!r}")
+    return path, result
+
+
+def _restore_secondary_cv_args_from_metadata(args, secondary_cv_metadata: dict, out_dir: Optional[Path] = None) -> None:
+    meta = dict(secondary_cv_metadata or {})
+    if not meta.get("enabled"):
+        return
+    mode = secondary_cv_mode(str(meta.get("mode", "custom") or "custom"))
+    args.secondary_cv = mode
+    args.secondary_cv_phi0_deg = float(meta.get("phi0_deg", getattr(args, "secondary_cv_phi0_deg", -60.0)))
+    args.secondary_cv_psi0_deg = float(meta.get("psi0_deg", getattr(args, "secondary_cv_psi0_deg", -45.0)))
+    args.secondary_cv_sigma_deg = float(meta.get("sigma_deg", getattr(args, "secondary_cv_sigma_deg", 35.0)))
+    if mode not in {"tica-linear", "torsion-pca"}:
+        return
+
+    raw_state = str(meta.get("tica_state_path", "") or "")
+    candidates: list[Path] = []
+    if raw_state:
+        state_path = Path(raw_state)
+        candidates.append(state_path)
+        if out_dir is not None and not state_path.is_absolute():
+            candidates.append(Path(out_dir) / state_path)
+    chosen = next((path for path in candidates if path.exists()), None)
+    if chosen is None:
+        raise RuntimeError(f"Resume metadata for {mode} has missing tica_state_path: {raw_state or '<empty>'}")
+    if mode == "tica-linear":
+        args.tica_state_file = str(chosen)
+    else:
+        args.bootstrap_torsion_state_file = str(chosen)
 
 
 def _add_linear_torsion_cv_force(
@@ -2853,13 +2887,10 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         secondary_cv_metadata = dict(resume_def.get("secondary_cv_metadata", {"enabled": False}) or {"enabled": False})
         secondary_cv_centers = resume_def.get("secondary_cv_centers")
         secondary_cv_k_kcal_list = resume_def.get("secondary_cv_k_kcal_list")
-        if secondary_cv_metadata.get("enabled") and not secondary_cv_enabled(args):
-            # Resume must rebuild the same optional CV force even if the user did
-            # not repeat the --secondary-cv flags on the command line.
-            args.secondary_cv = str(secondary_cv_metadata.get("mode", "custom") or "custom")
-            args.secondary_cv_phi0_deg = float(secondary_cv_metadata.get("phi0_deg", getattr(args, "secondary_cv_phi0_deg", -60.0)))
-            args.secondary_cv_psi0_deg = float(secondary_cv_metadata.get("psi0_deg", getattr(args, "secondary_cv_psi0_deg", -45.0)))
-            args.secondary_cv_sigma_deg = float(secondary_cv_metadata.get("sigma_deg", getattr(args, "secondary_cv_sigma_deg", 35.0)))
+        if secondary_cv_metadata.get("enabled"):
+            # Resume must rebuild the same optional CV force, including linear
+            # torsion state files, even if the user omits CV flags.
+            _restore_secondary_cv_args_from_metadata(args, secondary_cv_metadata, out_dir=out_dir)
         window_metadata = dict(resume_def.get("window_metadata", {}))
         shared_gamd_globals_all = dict(resume_def.get("shared_gamd_globals_all", {}) or {})
         shared_gamd_globals_interesting = dict(resume_def.get("shared_gamd_globals_interesting", {}) or {})

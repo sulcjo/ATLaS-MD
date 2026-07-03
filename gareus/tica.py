@@ -352,7 +352,10 @@ def compute_bootstrap_torsion_pca(
     if not np.isfinite(X).all():
         raise ValueError("bootstrap torsion PCA feature matrix contains non-finite values")
 
-    X_work = X.copy()
+    X_raw = X.copy()
+    X_work = X_raw.copy()
+    raw_mean = X_raw.mean(axis=0)
+    cv1_slope = None
     if residualize:
         if cv1 is None:
             raise ValueError("cv1 values are required when residualize=True")
@@ -363,6 +366,7 @@ def compute_bootstrap_torsion_pca(
             raise ValueError("cv1 values contain non-finite values")
         design = np.column_stack([np.ones(n, dtype=np.float64), cv1_arr])
         beta, *_ = np.linalg.lstsq(design, X_work, rcond=None)
+        cv1_slope = np.asarray(beta[1], dtype=np.float64)
         X_work = X_work - design @ beta
 
     mean = X_work.mean(axis=0)
@@ -383,14 +387,26 @@ def compute_bootstrap_torsion_pca(
     if norm <= float(epsilon):
         raise ValueError("zero bootstrap torsion PCA component norm")
     v = v / norm
+    if cv1_slope is not None:
+        slope_norm_sq = float(cv1_slope @ cv1_slope)
+        if slope_norm_sq > float(epsilon):
+            v = v - cv1_slope * (float(v @ cv1_slope) / slope_norm_sq)
+            norm = float(np.linalg.norm(v))
+            if norm <= float(epsilon):
+                raise ValueError("bootstrap torsion PCA component collapsed after CV1 decorrelation")
+            v = v / norm
+            component_variance = float(np.var(Xc @ v, ddof=1)) if n > 1 else 0.0
+            if component_variance <= float(epsilon):
+                raise ValueError("zero bootstrap torsion PCA variance")
+            explained = float(component_variance / total_variance)
     pivot = int(np.argmax(np.abs(v)))
     if v[pivot] < 0.0:
         v = -v
-    offset = float(-mean @ v)
+    offset = float(-raw_mean @ v)
     return TICAResult(
         weights=v,
         eigenvalue=explained,
-        mean=mean,
+        mean=raw_mean,
         offset=offset,
         lag=0,
         phi_torsion_indices=list(phi_torsion_indices or []),

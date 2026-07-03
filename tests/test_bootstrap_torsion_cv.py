@@ -188,6 +188,78 @@ def test_ensure_bootstrap_torsion_cv_ready_rejects_non_pca_state(tmp_path, monke
         _ensure_bootstrap_torsion_cv_ready(args, out_dir, topology=object(), primary_cv_def={"mode": "distance"})
 
 
+def test_linear_torsion_state_loader_rejects_wrong_method(tmp_path):
+    from gareus.production import _linear_torsion_state_for_mode
+
+    tica_path = tmp_path / "tica.json"
+    pca_path = tmp_path / "pca.json"
+    common = dict(
+        weights=np.ones(4, dtype=float),
+        eigenvalue=0.5,
+        mean=np.zeros(4, dtype=float),
+        offset=0.0,
+        lag=1,
+        phi_torsion_indices=[(0, 1, 2, 3)],
+        psi_torsion_indices=[(1, 2, 3, 4)],
+        n_samples=8,
+    )
+    TICAResult(method="tica", **common).save(tica_path)
+    TICAResult(method="pca", explained_variance_ratio=0.5, **common).save(pca_path)
+
+    with pytest.raises(RuntimeError, match="torsion-pca.*method='pca'"):
+        _linear_torsion_state_for_mode(_args(bootstrap_torsion_state_file=str(tica_path)), "torsion-pca")
+    with pytest.raises(RuntimeError, match="tica-linear.*method='tica'"):
+        _linear_torsion_state_for_mode(_args(tica_state_file=str(pca_path)), "tica-linear")
+
+
+def test_resume_restores_linear_torsion_state_path_from_metadata(tmp_path):
+    from gareus.production import _restore_secondary_cv_args_from_metadata
+
+    tica_path = tmp_path / "tica.json"
+    pca_path = tmp_path / "pca.json"
+    tica_path.write_text("{}", encoding="utf-8")
+    pca_path.write_text("{}", encoding="utf-8")
+
+    args = _args(secondary_cv="none", tica_state_file="", bootstrap_torsion_state_file="")
+    _restore_secondary_cv_args_from_metadata(
+        args,
+        {
+            "enabled": True,
+            "mode": "tica-linear",
+            "tica_state_path": str(tica_path),
+        },
+    )
+    assert args.secondary_cv == "tica-linear"
+    assert args.tica_state_file == str(tica_path)
+
+    args = _args(secondary_cv="none", tica_state_file="", bootstrap_torsion_state_file="")
+    _restore_secondary_cv_args_from_metadata(
+        args,
+        {
+            "enabled": True,
+            "mode": "torsion-pca",
+            "tica_state_path": str(pca_path),
+        },
+    )
+    assert args.secondary_cv == "torsion-pca"
+    assert args.bootstrap_torsion_state_file == str(pca_path)
+
+
+def test_resume_rejects_missing_linear_torsion_state_path(tmp_path):
+    from gareus.production import _restore_secondary_cv_args_from_metadata
+
+    args = _args(secondary_cv="none", tica_state_file="", bootstrap_torsion_state_file="")
+    with pytest.raises(RuntimeError, match="missing.*tica_state_path"):
+        _restore_secondary_cv_args_from_metadata(
+            args,
+            {
+                "enabled": True,
+                "mode": "tica-linear",
+                "tica_state_path": str(tmp_path / "missing.json"),
+            },
+        )
+
+
 def test_bootstrap_pca_returns_ticaresult_compatible_state():
     rng = np.random.default_rng(123)
     latent = np.linspace(-2.0, 2.0, 80)
@@ -233,6 +305,28 @@ def test_bootstrap_pca_residualizes_linear_cv1_signal():
     projected = project_tica1(X, result)
     corr = np.corrcoef(projected, cv1)[0, 1]
     assert abs(corr) < 0.20
+
+
+def test_bootstrap_pca_raw_projection_remains_decorrelated_from_cv1():
+    cv1 = np.linspace(-1.0, 1.0, 200)
+    orthogonal = np.sin(np.linspace(0.0, 8.0 * np.pi, 200))
+    nuisance = np.cos(np.linspace(0.0, 6.0 * np.pi, 200))
+    X = np.column_stack(
+        [
+            50.0 * cv1 + 5.0 * orthogonal,
+            -40.0 * cv1 + 5.0 * orthogonal,
+            0.20 * nuisance,
+            -0.10 * nuisance,
+        ]
+    )
+    result = compute_bootstrap_torsion_pca(X, cv1=cv1, residualize=True, component=1)
+
+    projected = project_tica1(X, result)
+    corr = np.corrcoef(projected, cv1)[0, 1]
+    slope = np.polyfit(cv1, projected, deg=1)[0]
+
+    assert abs(corr) < 0.05
+    assert abs(slope) < 0.05
 
 
 def test_bootstrap_pca_fail_closed_on_zero_variance():

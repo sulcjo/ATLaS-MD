@@ -368,57 +368,44 @@ class TestCV2AutoSwitch:
 
     def test_switch_logic_changes_secondary_cv(self):
         """After a successful tICA update report, switch logic sets secondary_cv=tica-linear."""
-        args = self._make_args()
-        report = {"status": "updated", "per_window_tic1_centers": {}}
+        from gareus.adaptive_production import _apply_tica_cv2_switch
 
-        # Replicate the switch logic block from the epoch loop.
-        if report.get("status") == "updated" and getattr(args, "tica_switch_cv2", False):
-            _prev_cv2 = str(getattr(args, "secondary_cv", "none") or "none")
-            if _prev_cv2 != "tica-linear":
-                _k_min = float(getattr(args, "tica_linear_k_min", 5.0) or 5.0)
-                _k_max = float(getattr(args, "tica_linear_k_max", 50.0) or 50.0)
-                args.secondary_cv = "tica-linear"
-                args.cv2_k_min = _k_min
-                args.cv2_k_max = _k_max
-                report["cv2_switched"] = {"from": _prev_cv2, "to": "tica-linear"}
+        args = self._make_args()
+        report = {"status": "updated", "state_file": __file__, "per_window_tic1_centers": {}}
+
+        _apply_tica_cv2_switch(args, report, next_epoch=1)
 
         assert args.secondary_cv == "tica-linear"
         assert args.cv2_k_min == pytest.approx(5.0)
         assert args.cv2_k_max == pytest.approx(50.0)
-        assert report["cv2_switched"] == {"from": "rama-map", "to": "tica-linear"}
+        assert report["cv2_switched"]["from"] == "rama-map"
+        assert report["cv2_switched"]["to"] == "tica-linear"
+        assert report["cv2_switched"]["state_file"] == __file__
 
     def test_switch_logic_changes_torsion_pca_to_tica_linear(self):
         """After a successful tICA update, bootstrap torsion CV2 switches to tica-linear."""
-        args = self._make_args(secondary_cv="torsion-pca")
-        report = {"status": "updated", "per_window_tic1_centers": {}}
+        from gareus.adaptive_production import _apply_tica_cv2_switch
 
-        if report.get("status") == "updated" and getattr(args, "tica_switch_cv2", False):
-            _prev_cv2 = str(getattr(args, "secondary_cv", "none") or "none")
-            if _prev_cv2 != "tica-linear":
-                _k_min = float(getattr(args, "tica_linear_k_min", 5.0) or 5.0)
-                _k_max = float(getattr(args, "tica_linear_k_max", 50.0) or 50.0)
-                args.secondary_cv = "tica-linear"
-                args.cv2_k_min = _k_min
-                args.cv2_k_max = _k_max
-                report["cv2_switched"] = {"from": _prev_cv2, "to": "tica-linear"}
+        args = self._make_args(secondary_cv="torsion-pca")
+        report = {"status": "updated", "state_file": __file__, "per_window_tic1_centers": {}}
+
+        _apply_tica_cv2_switch(args, report, next_epoch=1)
 
         assert args.secondary_cv == "tica-linear"
         assert args.cv2_k_min == pytest.approx(5.0)
         assert args.cv2_k_max == pytest.approx(50.0)
-        assert report["cv2_switched"] == {"from": "torsion-pca", "to": "tica-linear"}
+        assert report["cv2_switched"]["from"] == "torsion-pca"
+        assert report["cv2_switched"]["to"] == "tica-linear"
+        assert report["cv2_switched"]["state_file"] == __file__
 
     def test_switch_is_one_shot(self):
         """Guard: if already tica-linear, do NOT overwrite k bounds or re-switch."""
-        args = self._make_args(secondary_cv="tica-linear", cv2_k_min=10.0, cv2_k_max=80.0)
-        report = {"status": "updated"}
+        from gareus.adaptive_production import _apply_tica_cv2_switch
 
-        if report.get("status") == "updated" and getattr(args, "tica_switch_cv2", False):
-            _prev = str(getattr(args, "secondary_cv", "none") or "none")
-            if _prev != "tica-linear":
-                args.secondary_cv = "tica-linear"
-                args.cv2_k_min = float(getattr(args, "tica_linear_k_min", 5.0))
-                args.cv2_k_max = float(getattr(args, "tica_linear_k_max", 50.0))
-                report["cv2_switched"] = {"from": _prev, "to": "tica-linear"}
+        args = self._make_args(secondary_cv="tica-linear", cv2_k_min=10.0, cv2_k_max=80.0)
+        report = {"status": "updated", "state_file": __file__}
+
+        _apply_tica_cv2_switch(args, report, next_epoch=1)
 
         # k bounds must be untouched; switch flag must not appear in report
         assert args.cv2_k_min == pytest.approx(10.0)
@@ -427,13 +414,27 @@ class TestCV2AutoSwitch:
 
     def test_no_switch_when_report_not_updated(self):
         """Switch only fires when status == 'updated'."""
+        from gareus.adaptive_production import _apply_tica_cv2_switch
+
         args = self._make_args()
         for status in ("skipped_no_obs", "skipped_low_eigenvalue", "error"):
             report = {"status": status}
             _orig = args.secondary_cv
-            if report.get("status") == "updated" and getattr(args, "tica_switch_cv2", False):
-                args.secondary_cv = "tica-linear"
+            _apply_tica_cv2_switch(args, report, next_epoch=1)
             assert args.secondary_cv == _orig, f"Should not switch on status={status}"
+
+    def test_no_switch_when_updated_report_has_missing_state_file(self, tmp_path):
+        """Switch requires a real tICA state file."""
+        from gareus.adaptive_production import _apply_tica_cv2_switch
+
+        args = self._make_args(secondary_cv="torsion-pca")
+        report = {"status": "updated", "state_file": str(tmp_path / "missing.json")}
+
+        _apply_tica_cv2_switch(args, report, next_epoch=1)
+
+        assert args.secondary_cv == "torsion-pca"
+        assert "cv2_switched" not in report
+        assert report["cv2_switch_skipped"]["reason"] == "missing_tica_state_file"
 
     def test_resume_restores_cv2_switch(self):
         """On ap-resume, cv2_switched in epoch summaries restores secondary_cv=tica-linear."""

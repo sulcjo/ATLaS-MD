@@ -1526,6 +1526,38 @@ def _write_tica_version_marker(run_dir: Path, args) -> None:
         pass
 
 
+def _apply_tica_cv2_switch(args, tica_update_report: dict, *, next_epoch: int) -> bool:
+    """Apply one-shot tica-linear CV2 switch only after a valid tICA update."""
+    if not getattr(args, "tica_switch_cv2", False):
+        return False
+    prev_cv2 = str(getattr(args, "secondary_cv", "none") or "none")
+    if prev_cv2 == "tica-linear":
+        return False
+    if not isinstance(tica_update_report, dict) or tica_update_report.get("status") != "updated":
+        return False
+    state_file = str(tica_update_report.get("state_file", "") or getattr(args, "tica_state_file", "") or "")
+    if not state_file or not Path(state_file).exists():
+        tica_update_report["cv2_switch_skipped"] = {
+            "reason": "missing_tica_state_file",
+            "state_file": state_file,
+        }
+        return False
+
+    k_min = float(getattr(args, "tica_linear_k_min", 5.0) or 5.0)
+    k_max = float(getattr(args, "tica_linear_k_max", 50.0) or 50.0)
+    args.secondary_cv = "tica-linear"
+    args.tica_state_file = state_file
+    args.cv2_k_min = k_min
+    args.cv2_k_max = k_max
+    tica_update_report["cv2_switched"] = {
+        "from": prev_cv2,
+        "to": "tica-linear",
+        "state_file": state_file,
+        "effective_epoch": int(next_epoch),
+    }
+    return True
+
+
 def _apply_tica_centers_to_registry(
     registry: "WindowStateRegistry",
     per_window_tic1_centers: Dict[int, float],
@@ -4350,23 +4382,18 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                         registry.write_epoch_window_map(next_epoch_dir / "epoch_window_map.csv")
                         print(f"    tICA: re-wrote {next_csv.name} with updated secondary centers")
 
-            # CV2 auto-switch: permanently replace secondary_cv with tica-linear so
-            # all subsequent epochs and final production run with the fitted tIC1.
-            # One-shot guard: skip if already tica-linear.
-            if getattr(args, "tica_switch_cv2", False):
-                _prev_cv2 = str(getattr(args, "secondary_cv", "none") or "none")
-                if _prev_cv2 != "tica-linear":
-                    _k_min = float(getattr(args, "tica_linear_k_min", 5.0) or 5.0)
-                    _k_max = float(getattr(args, "tica_linear_k_max", 50.0) or 50.0)
-                    args.secondary_cv = "tica-linear"
-                    args.cv2_k_min = _k_min
-                    args.cv2_k_max = _k_max
-                    print(
-                        f"    tICA: switched CV2 '{_prev_cv2}' → 'tica-linear' "
-                        f"(k=[{_k_min:.1f}, {_k_max:.1f}] kcal/mol). "
-                        f"Effective from epoch {epoch + 1}."
-                    )
-                    tica_update_report["cv2_switched"] = {"from": _prev_cv2, "to": "tica-linear"}
+            # CV2 auto-switch: permanently replace secondary_cv with tica-linear
+            # only after a successful tICA fit wrote a state file.
+            if _apply_tica_cv2_switch(args, tica_update_report, next_epoch=epoch + 1):
+                _sw = tica_update_report.get("cv2_switched", {})
+                print(
+                    f"    tICA: switched CV2 '{_sw.get('from')}' → 'tica-linear' "
+                    f"(k=[{float(getattr(args, 'cv2_k_min', 0.0)):.1f}, {float(getattr(args, 'cv2_k_max', 0.0)):.1f}] kcal/mol). "
+                    f"Effective from epoch {epoch + 1}."
+                )
+            elif isinstance(tica_update_report, dict) and tica_update_report.get("cv2_switch_skipped"):
+                _skip = tica_update_report.get("cv2_switch_skipped", {})
+                print(f"WARNING: tICA CV2 switch skipped: {_skip.get('reason', 'unknown')}")
         except Exception as _tica_exc:
             print(f"WARNING: _maybe_update_tica_cvaux failed for epoch {epoch}: {_tica_exc}")
             tica_update_report = {"status": "error", "error": str(_tica_exc)}
