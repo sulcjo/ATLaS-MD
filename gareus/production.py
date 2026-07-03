@@ -2524,9 +2524,10 @@ def run_multiwindow_gamd_recon(
     equil_box = equil_state.getPeriodicBoxVectors()
     for i in range(nwin):
         system_i = deserialize_system(openmm, base_system)
-        targets, integrator_i = _gamd_boost_group_targets(system_i, args, unit)
+        targets, _peek_integrator = _gamd_boost_group_targets(system_i, args, unit)
+        cmd_integrator, _ = make_cmd_integrator(openmm, args, unit)
         props_i = replica_platform_properties(platform, props, args, i)
-        sim_i = app.Simulation(topology, system_i, integrator_i, platform, props_i)
+        sim_i = app.Simulation(topology, system_i, cmd_integrator, platform, props_i)
         pos = window_start_positions[i] if window_start_positions and window_start_positions[i] is not None else equil_state.getPositions()
         vel = window_start_velocities[i] if window_start_velocities and window_start_velocities[i] is not None else None
         if equil_box is not None:
@@ -2560,7 +2561,7 @@ def run_multiwindow_gamd_recon(
             )
         for name, acc in accumulators.items():
             per_group_window_stats.setdefault(name, []).append(acc.to_stats(name, i))
-        release_openmm_contexts(sim_i, integrator_i, system_i)
+        release_openmm_contexts(sim_i, cmd_integrator, system_i)
 
     if not per_group_window_stats:
         raise RuntimeError("Multi-window GaMD recon collected no boost-group statistics")
