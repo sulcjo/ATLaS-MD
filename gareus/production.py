@@ -337,6 +337,96 @@ def _add_torsion_score_force(openmm, torsions, target_rad: float, sigma_rad: flo
         force.addTorsion(int(a), int(b), int(c), int(d), [])
     return force
 
+
+def _linear_torsion_state_for_mode(args, mode: str) -> tuple[Path, "TICAResult"]:
+    from .tica import TICAResult
+
+    if mode == "tica-linear":
+        state_file = str(getattr(args, "tica_state_file", "") or "")
+        if not state_file or not Path(state_file).exists():
+            raise FileNotFoundError(state_file)
+    elif mode == "torsion-pca":
+        state_file = str(getattr(args, "bootstrap_torsion_state_file", "") or "")
+        if not state_file or not Path(state_file).exists():
+            raise RuntimeError("cv2=torsion-pca selected but bootstrap torsion state file is missing")
+    else:
+        raise ValueError(f"Unsupported linear torsion CV mode {mode!r}")
+    path = Path(state_file)
+    return path, TICAResult.load(path)
+
+
+def _add_linear_torsion_cv_force(
+    openmm,
+    system,
+    phi_torsions,
+    psi_torsions,
+    result,
+    *,
+    mode: str,
+    state_path: Path,
+    force_group: int,
+) -> dict:
+    weights = np.asarray(result.weights, dtype=np.float64)
+    offset = float(result.offset)
+    n_phi = len(phi_torsions)
+    n_psi = len(psi_torsions)
+    expected_feats = 2 * n_phi + 2 * n_psi
+    if len(weights) != expected_feats:
+        raise RuntimeError(
+            f"{mode} weight vector has {len(weights)} components but topology provides "
+            f"{expected_feats} features ({n_phi} phi + {n_psi} psi torsions, 2 features each)"
+        )
+    cv_force = openmm.CustomCVForce("0")
+    sub_cv_names = []
+    for j, (a, b, c, d) in enumerate(phi_torsions):
+        for trig, fname in (("sin", f"sin_phi_{j}"), ("cos", f"cos_phi_{j}")):
+            sub_f = openmm.CustomTorsionForce(f"{trig}(theta)")
+            sub_f.addTorsion(int(a), int(b), int(c), int(d), [])
+            cv_force.addCollectiveVariable(fname, sub_f)
+            sub_cv_names.append(fname)
+    for j, (a, b, c, d) in enumerate(psi_torsions):
+        for trig, fname in (("sin", f"sin_psi_{j}"), ("cos", f"cos_psi_{j}")):
+            sub_f = openmm.CustomTorsionForce(f"{trig}(theta)")
+            sub_f.addTorsion(int(a), int(b), int(c), int(d), [])
+            cv_force.addCollectiveVariable(fname, sub_f)
+            sub_cv_names.append(fname)
+    cv_force.addGlobalParameter("ss_k", 0.0)
+    cv_force.addGlobalParameter("ss0", 0.0)
+    linear_terms = " + ".join(f"{w:.12g}*{name}" for w, name in zip(weights, sub_cv_names))
+    linear_expr = f"({linear_terms} + ({offset:.12g}))"
+    cv_force.setEnergyFunction(f"0.5*ss_k*({linear_expr}-ss0)^2")
+    cv_force.setForceGroup(int(force_group))
+    system.addForce(cv_force)
+
+    label = "inter-epoch tICA linear CV (tIC1, slowest mode)"
+    if mode == "torsion-pca":
+        label = "bootstrap torsion PC1 from GENPEPT seed ensemble"
+    return {
+        "enabled": True,
+        "mode": mode,
+        "linear_cv_kind": str(getattr(result, "method", "tica") or "tica"),
+        "label": label,
+        "range_min": -6.0,
+        "range_max": 6.0,
+        "n_phi_torsions": int(n_phi),
+        "n_psi_torsions": int(n_psi),
+        "tica_state_path": str(state_path),
+        "weights": weights.tolist(),
+        "tica_offset": float(offset),
+        "phi_torsions": [list(map(int, t)) for t in phi_torsions],
+        "psi_torsions": [list(map(int, t)) for t in psi_torsions],
+        "force_group": int(force_group),
+        "eigenvalue": float(result.eigenvalue),
+        "n_samples": int(result.n_samples),
+        "method": str(getattr(result, "method", "tica") or "tica"),
+        "explained_variance_ratio": (
+            float(result.explained_variance_ratio)
+            if getattr(result, "explained_variance_ratio", None) is not None
+            else None
+        ),
+    }
+
+
 def primary_secondary_and_potential_from_state(
     context,
     primary_cv_def: dict,
@@ -381,7 +471,7 @@ def _ss_scalar_from_sub_cv_values(sub_cv_values, metadata: dict) -> float:
     """
     mode = secondary_cv_mode(metadata)
     arr = np.asarray(sub_cv_values, dtype=np.float64)
-    if mode == "tica-linear":
+    if mode in {"tica-linear", "torsion-pca"}:
         weights = np.asarray(metadata.get("weights", []), dtype=np.float64)
         offset = float(metadata.get("tica_offset", 0.0))
         return float(arr @ weights + offset)
@@ -1072,65 +1162,30 @@ def add_secondary_structure_cv_force(openmm, system, topology, args, force_group
             "note": "Rama-map secondary CV: one dimensionless map coordinate whose centers correspond to explicit phi/psi basins, including native left-alpha. It is not a dense phi/psi grid." if mode == "rama-map" else "Scalar softmax-like Ramachandran basin coordinate; useful as an adaptive umbrella ladder but not a full 2D phi/psi free-energy surface.",
         }
 
-    if mode == "tica-linear":
-        tica_state_file = str(getattr(args, "tica_state_file", "") or "")
-        if not tica_state_file or not Path(tica_state_file).exists():
-            # First epoch: no tICA fit yet — disable secondary CV until weights available.
-            return {"enabled": False, "mode": "tica-linear", "tica_state_path": tica_state_file, "note": "no tica_state_file; secondary CV disabled for this epoch"}
+    if mode in {"tica-linear", "torsion-pca"}:
         try:
-            from .tica import TICAResult
-            tica_result = TICAResult.load(tica_state_file)
+            state_path, result = _linear_torsion_state_for_mode(args, mode)
+        except FileNotFoundError:
+            return {
+                "enabled": False,
+                "mode": "tica-linear",
+                "tica_state_path": str(getattr(args, "tica_state_file", "") or ""),
+                "note": "no tica_state_file; secondary CV disabled for this epoch",
+            }
         except Exception as exc:
-            raise RuntimeError(f"Failed to load tICA state from {tica_state_file}: {exc}") from exc
-        weights = tica_result.weights
-        offset = float(tica_result.offset)
-        n_feat = len(weights)
-        n_phi = len(phi_torsions)
-        n_psi = len(psi_torsions)
-        expected_feats = 2 * n_phi + 2 * n_psi
-        if n_feat != expected_feats:
-            raise RuntimeError(
-                f"tICA weight vector has {n_feat} components but topology provides "
-                f"{expected_feats} features ({n_phi} phi + {n_psi} psi torsions, 2 features each)"
-            )
-        # Build one CustomTorsionForce per sin/cos per torsion (sub-CVs for CustomCVForce).
-        # Feature order: sin_phi_0, cos_phi_0, ..., sin_psi_0, cos_psi_0, ...
-        cv_force = openmm.CustomCVForce("0")  # expression set below
-        sub_cv_names = []
-        for j, (a, b, c, d) in enumerate(phi_torsions):
-            for trig, fname in (("sin", f"sin_phi_{j}"), ("cos", f"cos_phi_{j}")):
-                sub_f = openmm.CustomTorsionForce(f"{trig}(theta)")
-                sub_f.addTorsion(int(a), int(b), int(c), int(d), [])
-                cv_force.addCollectiveVariable(fname, sub_f)
-                sub_cv_names.append(fname)
-        for j, (a, b, c, d) in enumerate(psi_torsions):
-            for trig, fname in (("sin", f"sin_psi_{j}"), ("cos", f"cos_psi_{j}")):
-                sub_f = openmm.CustomTorsionForce(f"{trig}(theta)")
-                sub_f.addTorsion(int(a), int(b), int(c), int(d), [])
-                cv_force.addCollectiveVariable(fname, sub_f)
-                sub_cv_names.append(fname)
-        cv_force.addGlobalParameter("ss_k", 0.0)
-        cv_force.addGlobalParameter("ss0", 0.0)
-        linear_terms = " + ".join(f"{w:.12g}*{name}" for w, name in zip(weights, sub_cv_names))
-        tic1_expr = f"({linear_terms} + ({offset:.12g}))"
-        cv_force.setEnergyFunction(f"0.5*ss_k*({tic1_expr}-ss0)^2")
-        cv_force.setForceGroup(int(force_group))
-        system.addForce(cv_force)
-        from .cv import build_tica_linear_metadata
-        meta = build_tica_linear_metadata(
-            enabled=True,
-            n_phi=n_phi,
-            n_psi=n_psi,
-            tica_state_path=tica_state_file,
+            if mode == "torsion-pca":
+                raise RuntimeError(f"Failed to load bootstrap torsion state: {exc}") from exc
+            raise RuntimeError(f"Failed to load tICA state: {exc}") from exc
+        return _add_linear_torsion_cv_force(
+            openmm,
+            system,
+            phi_torsions,
+            psi_torsions,
+            result,
+            mode=mode,
+            state_path=state_path,
+            force_group=force_group,
         )
-        meta["weights"] = weights.tolist()
-        meta["tica_offset"] = float(offset)
-        meta["phi_torsions"] = [list(map(int, t)) for t in phi_torsions]
-        meta["psi_torsions"] = [list(map(int, t)) for t in psi_torsions]
-        meta["force_group"] = int(force_group)
-        meta["eigenvalue"] = float(tica_result.eigenvalue)
-        meta["n_samples"] = int(tica_result.n_samples)
-        return meta
 
     phi0, psi0, label = secondary_cv_target_angles(args)
     phi_force = _add_torsion_score_force(openmm, phi_torsions, phi0, sigma, "norm_phi", "phi0")

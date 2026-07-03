@@ -256,3 +256,25 @@ def test_ticaresult_preserves_method_roundtrip(tmp_path):
     assert loaded.lag == 0
     assert loaded.weights.shape == result.weights.shape
     assert loaded.explained_variance_ratio == result.explained_variance_ratio
+
+
+def test_positions_score_uses_linear_torsion_weights():
+    from gareus.cv import secondary_structure_score_from_positions_nm
+
+    positions = np.array([
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [1.0, 1.0, 0.0],
+        [1.0, 1.0, 1.0],
+    ], dtype=float)
+    metadata = {
+        "enabled": True,
+        "mode": "torsion-pca",
+        "weights": [1.0, 0.0],
+        "tica_offset": 0.25,
+        "phi_torsions": [[0, 1, 2, 3]],
+        "psi_torsions": [],
+    }
+    value = secondary_structure_score_from_positions_nm(positions, metadata)
+    assert np.isfinite(value)
+    assert value == pytest.approx(np.sin(np.pi / 2.0) + 0.25, abs=1.0e-6)

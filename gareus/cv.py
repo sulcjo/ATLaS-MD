@@ -472,12 +472,23 @@ def _ensure_secondary_cv_numeric_cache(ss_info: Dict[str, Any], mode: str) -> fl
         ss_info["_np_rama_region_values"] = np.asarray(values, dtype=np.float64)
         ss_info["_np_rama_phi_targets"] = np.asarray(phi_targets, dtype=np.float64)
         ss_info["_np_rama_psi_targets"] = np.asarray(psi_targets, dtype=np.float64)
-    elif mode not in {"alpha-coil-beta", "rama-map"} and "_np_simple_phi_psi_targets" not in ss_info:
+    elif mode not in {"alpha-coil-beta", "rama-map", "tica-linear", "torsion-pca"} and "_np_simple_phi_psi_targets" not in ss_info:
         ss_info["_np_simple_phi_psi_targets"] = np.asarray([
             math.radians(float(ss_info.get("phi0_deg", -60.0))),
             math.radians(float(ss_info.get("psi0_deg", -45.0))),
         ], dtype=np.float64)
     return sigma
+
+
+def _linear_torsion_features_from_angles(phi_angles: np.ndarray, psi_angles: np.ndarray) -> np.ndarray:
+    feats: list[float] = []
+    for angle in phi_angles:
+        feats.append(float(np.sin(angle)))
+        feats.append(float(np.cos(angle)))
+    for angle in psi_angles:
+        feats.append(float(np.sin(angle)))
+        feats.append(float(np.cos(angle)))
+    return np.asarray(feats, dtype=np.float64)
 
 
 def secondary_structure_score_from_positions_nm(positions_nm, ss_info: Optional[Dict[str, Any]]) -> float:
@@ -497,6 +508,14 @@ def secondary_structure_score_from_positions_nm(positions_nm, ss_info: Optional[
     psi_angles = _batch_torsion_angles_rad(positions_nm, ss_info["_np_psi_idx"])
     has_phi = len(phi_angles) > 0
     has_psi = len(psi_angles) > 0
+
+    if mode in {"tica-linear", "torsion-pca"}:
+        weights = np.asarray(ss_info.get("weights", []), dtype=np.float64)
+        feats = _linear_torsion_features_from_angles(phi_angles, psi_angles)
+        if weights.shape != feats.shape:
+            raise ValueError(f"{mode} weights shape {weights.shape} does not match feature shape {feats.shape}")
+        offset = float(ss_info.get("tica_offset", 0.0))
+        return float(feats @ weights + offset)
 
     if mode == "alpha-coil-beta":
         phi_scores = _mean_torsion_scores_from_angles(phi_angles, ss_info["_np_alpha_beta_phi_targets"], sigma)
