@@ -584,6 +584,9 @@ Default GaMD parameters:
     --gamd-cmd-steps       = 250,000      (CMD pre-equil for Vmax/Vmin stats; longer reduces anharmonicity)
     --production-steps     = 500,000      (production per replica)
     --gamd-averaging-window = 5,000 steps
+    --gamd-multiwindow-recon-prep-steps = 2000     (unrecorded relaxation per window before recon stats collection)
+    --gamd-multiwindow-recon-steps      = 20000    (per-window recon budget for joint-envelope GaMD calibration; short by design)
+    --gamd-multiwindow-recon-report-interval = 0   (0 = auto cadence; see --gamd-multiwindow-recon-steps)
     cmd/equil prep steps   = 5,000/5,000  (hardcoded internal defaults)
 
 The package uses an article-style shared GaMD setup:

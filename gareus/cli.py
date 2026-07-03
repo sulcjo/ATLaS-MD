@@ -396,6 +396,12 @@ def _add_gamd_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--gamd-cmd-steps", type=int, default=250000,
                    help="GaMD CMD pre-equilibration steps for Vmax/Vmin statistics (longer → better calibration, lower anharmonicity).")
     p.add_argument("--gamd-averaging-window", type=int, default=5000)
+    p.add_argument("--gamd-multiwindow-recon-prep-steps", type=int, default=2000,
+                   help="Unrecorded relaxation steps per window before multi-window GaMD recon starts collecting statistics.")
+    p.add_argument("--gamd-multiwindow-recon-steps", type=int, default=20000,
+                   help="Per-window recon steps used to build the joint-envelope GaMD calibration (short, dedicated budget -- decoupled from --gamd-cmd-steps). Breadth across windows substitutes for depth within one window.")
+    p.add_argument("--gamd-multiwindow-recon-report-interval", type=int, default=0,
+                   help="Potential-energy sampling cadence (steps) during multi-window GaMD recon. 0 = auto (max(1, recon_steps // 200)).")
     p.add_argument("--exchange-interval", type=int, default=5000)
     p.add_argument("--exchange-mode",
                    choices=["neighbor", "random-pair", "all-pair-sweep", "gibbs-walk"],

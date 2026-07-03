@@ -23,3 +23,25 @@ def test_argparse_default_gamd_boost_type_is_c1_safe():
 def test_config_template_gamd_boost_type_is_c1_safe():
     from gareus.config import _basic_chignolin_config
     assert _basic_chignolin_config()["gamd"]["gamd_boost_type"] == SAFE
+
+
+def test_gamd_multiwindow_recon_flags_have_expected_defaults():
+    from gareus.cli import build_gareus_parser
+    parser = build_gareus_parser()
+    assert parser.get_default("gamd_multiwindow_recon_prep_steps") == 2000
+    assert parser.get_default("gamd_multiwindow_recon_steps") == 20000
+    assert parser.get_default("gamd_multiwindow_recon_report_interval") == 0
+
+
+def test_gamd_multiwindow_recon_flags_are_overridable():
+    from gareus.cli import build_gareus_parser
+    parser = build_gareus_parser()
+    args = parser.parse_args([
+        "--seq", "GYDPETGTWG",
+        "--gamd-multiwindow-recon-prep-steps", "500",
+        "--gamd-multiwindow-recon-steps", "5000",
+        "--gamd-multiwindow-recon-report-interval", "100",
+    ])
+    assert args.gamd_multiwindow_recon_prep_steps == 500
+    assert args.gamd_multiwindow_recon_steps == 5000
+    assert args.gamd_multiwindow_recon_report_interval == 100
