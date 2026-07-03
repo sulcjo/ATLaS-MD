@@ -377,7 +377,12 @@ def _add_genpept_prescan_args(p: argparse.ArgumentParser) -> None:
 def _add_gamd_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--production-steps", dest="production_steps",
                    type=int, default=500000, help="Production steps per replica.")
-    p.add_argument("--gamd-boost-type", default="lower-dual", choices=[
+    # Default is the group-boost variant (nonbonded+dihedral), NOT `lower-dual`.
+    # `lower-dual`'s total-boost portion reads the full potential, which includes
+    # the umbrella restraint (gamd-openmm folds all forces into the boosted group),
+    # making the boost window-dependent -> misspecifies MBAR + breaks REUS detailed
+    # balance (audit finding C1). Group boost leaves the umbrella unboosted.
+    p.add_argument("--gamd-boost-type", default="lower-dual-nonbonded-dihedral", choices=[
         "gamd-cmd-base", "lower-total", "upper-total", "lower-dihedral", "upper-dihedral",
         "lower-dual", "upper-dual", "lower-nonbonded", "upper-nonbonded",
         "lower-dual-nonbonded-dihedral", "upper-dual-nonbonded-dihedral",

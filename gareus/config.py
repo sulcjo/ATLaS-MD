@@ -457,7 +457,9 @@ def _basic_chignolin_config() -> Dict[str, Any]:
             "region_memory": True,
         },
         "gamd": {
-            "gamd_boost_type": "lower-dual",
+            # C1-safe group boost (see cli.py --gamd-boost-type): total boost would
+            # entangle the umbrella and misspecify MBAR/exchange.
+            "gamd_boost_type": "lower-dual-nonbonded-dihedral",
             "production_steps": 3000000,
             "sigma0p": 5.0,
             "sigma0d": 5.0,
