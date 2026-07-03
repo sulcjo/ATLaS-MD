@@ -145,12 +145,30 @@ def suggest_cvs(run_dir: Path, target_overlap: float = 0.25) -> dict[str, Any]:
         })
     else:
         if n_windows > 1 and win.size == cv.size:
-            weak = _count_low_overlap_neighbors(cv, win, n_windows, rows, target_overlap)
+            # Windows are a flat list; on sparse explicit 2D grids flat index
+            # i/i+1 is not a CV-space neighbor relation. Detect sparse 2D the
+            # same way gareus.analysis.validate_analysis_metadata_readiness
+            # does (explicit_2d/rectangular_grid flags on the window table)
+            # so the flat-adjacency loop is gated off even if the `readiness`
+            # call above failed to produce a sparse_2d verdict of its own.
+            explicit_2d = any(str(r.get("explicit_2d", "0")) in {"1", "True", "true"} for r in rows)
+            rectangular = all(str(r.get("rectangular_grid", "0")) in {"1", "True", "true"} for r in rows) if explicit_2d and rows else False
+            sparse_2d = bool(explicit_2d and not rectangular)
+            if sparse_2d:
+                # `readiness` already computed graph-adjacent overlaps the
+                # sparse-2D-safe way; reuse that instead of re-deriving flat
+                # adjacency here. If it is unavailable, soften to "no known
+                # weak pairs" rather than fall back to flat i,i+1.
+                weak = list(readiness.get("neighbor_pairs_below_target_overlap", []) or [])
+                weak_label = "graph-neighbor pair(s)"
+            else:
+                weak = _count_low_overlap_neighbors(cv, win, n_windows, rows, target_overlap)
+                weak_label = "adjacent pair(s)"
             if weak:
                 suggestions.append({
                     "priority": "high",
                     "title": "Primary-CV neighbor overlap is weak in one or more adjacent windows",
-                    "details": f"{len(weak)} adjacent pair(s) are below target overlap {target_overlap:.2f}.",
+                    "details": f"{len(weak)} {weak_label} are below target overlap {target_overlap:.2f}.",
                     "try": "Use --window-mode adaptive-feedback, add midpoint windows near weak pairs, or lower local umbrella k.",
                     "evidence": weak[:12],
                 })

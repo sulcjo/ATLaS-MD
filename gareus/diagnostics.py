@@ -295,6 +295,8 @@ def validate_us_mbar_inputs(out_dir: Path, temperature_k: float, target_overlap:
     warnings: list[str] = []
     errors: list[str] = []
     windows_path = out_dir / "umbrella_windows.csv"
+    explicit_windows_path = out_dir / "umbrella_explicit_windows.csv"
+    graph_path = out_dir / "explicit_2d_neighbor_graph.csv"
     npz_path = out_dir / "analysis_arrays.npz"
     windows = _read_csv_dicts(windows_path)
     n_windows = len(windows)
@@ -314,6 +316,21 @@ def validate_us_mbar_inputs(out_dir: Path, temperature_k: float, target_overlap:
     if errors:
         result["status"] = "error"
         return result
+
+    # Sparse-2D detection mirrors gareus.analysis.validate_analysis_metadata_readiness:
+    # the legacy umbrella_windows.csv table never carries explicit_2d/rectangular_grid
+    # flags, so prefer umbrella_explicit_windows.csv (when present) for detection.
+    # Windows are stored in a flat list; on sparse 2D grids flat index i/i+1 is
+    # NOT a meaningful CV-space neighbor relation, so flat-adjacency overlap must
+    # not be used there (see explicit_2d_neighbor_graph.csv edges instead).
+    detect_rows = _read_csv_dicts(explicit_windows_path) or windows
+    explicit_2d = any(str(r.get("explicit_2d", "0")) in {"1", "True", "true"} for r in detect_rows)
+    rectangular = all(str(r.get("rectangular_grid", "0")) in {"1", "True", "true"} for r in detect_rows) if explicit_2d and detect_rows else False
+    sparse_2d = bool(explicit_2d and not rectangular)
+    result["explicit_2d"] = bool(explicit_2d)
+    result["rectangular_grid"] = bool(rectangular)
+    result["sparse_2d"] = bool(sparse_2d)
+
     # Load arrays and ensure required keys are present
     try:
         with np.load(npz_path, allow_pickle=False) as data:
@@ -362,26 +379,56 @@ def validate_us_mbar_inputs(out_dir: Path, temperature_k: float, target_overlap:
         errors.append("windows with zero production samples: " + ", ".join(map(str, zero)))
     if low:
         warnings.append("windows with fewer than 10 production samples: " + ", ".join(map(str, low)))
-    # Neighbour histogram overlaps
+    # Neighbour histogram overlaps.
     centers = [_safe_float(r.get("center_A")) for r in windows]
     pair_rows: list[dict[str, Any]] = []
     connected = True
-    if n_windows >= 2 and n_samples > 0:
-        finite_centers = [c for c in centers if math.isfinite(c)]
-        lo = min(finite_centers) if finite_centers else float(np.nanmin(cv))
-        hi = max(finite_centers) if finite_centers else float(np.nanmax(cv))
-        for i in range(n_windows - 1):
-            a = cv[win == i]
-            b = cv[win == i + 1]
-            ov = _hist_overlap_np(a, b, lo, hi, bins=80)
-            pair_rows.append({"left_window": i, "right_window": i + 1, "overlap": ov, "left_count": int(a.size), "right_count": int(b.size)})
-            if (not math.isfinite(ov)) or ov < 0.03:
-                connected = False
+    if sparse_2d:
+        # Sparse explicit 2D: flattened window order is not a neighbor relation.
+        # Only compare windows that the neighbor GRAPH says are adjacent.
+        result["neighbor_overlap_mode"] = "graph_edges_only; flattened window-order overlap intentionally skipped"
+        if n_windows >= 2 and n_samples > 0:
+            graph_rows = _read_csv_dicts(graph_path)
+            if not graph_rows:
+                warnings.append("sparse explicit 2D run has no explicit_2d_neighbor_graph.csv; skipping neighbor overlap connectivity check")
+            else:
+                finite_centers = [c for c in centers if math.isfinite(c)]
+                lo = min(finite_centers) if finite_centers else float(np.nanmin(cv))
+                hi = max(finite_centers) if finite_centers else float(np.nanmax(cv))
+                for row in graph_rows:
+                    wi = int(_safe_float(row.get("window_i"), -1))
+                    wj = int(_safe_float(row.get("window_j"), -1))
+                    if not (0 <= wi < n_windows and 0 <= wj < n_windows):
+                        continue
+                    a = cv[win == wi]
+                    b = cv[win == wj]
+                    ov = _hist_overlap_np(a, b, lo, hi, bins=80)
+                    pair_rows.append({
+                        "left_window": wi, "right_window": wj,
+                        "edge_type": str(row.get("edge_type", "")),
+                        "overlap": ov, "left_count": int(a.size), "right_count": int(b.size),
+                    })
+                # No flat-adjacency "disconnected" verdict on sparse 2D: soften to a
+                # weak-overlap warning below rather than a false disconnection error.
+    else:
+        # 1D/rectangular fallback: flat i, i+1 is a meaningful CV-space neighbor.
+        result["neighbor_overlap_mode"] = "flat adjacent windows for 1D/rectangular fallback"
+        if n_windows >= 2 and n_samples > 0:
+            finite_centers = [c for c in centers if math.isfinite(c)]
+            lo = min(finite_centers) if finite_centers else float(np.nanmin(cv))
+            hi = max(finite_centers) if finite_centers else float(np.nanmax(cv))
+            for i in range(n_windows - 1):
+                a = cv[win == i]
+                b = cv[win == i + 1]
+                ov = _hist_overlap_np(a, b, lo, hi, bins=80)
+                pair_rows.append({"left_window": i, "right_window": i + 1, "overlap": ov, "left_count": int(a.size), "right_count": int(b.size)})
+                if (not math.isfinite(ov)) or ov < 0.03:
+                    connected = False
     result["neighbor_overlaps"] = pair_rows
     result["overlap_connected_at_0p03"] = bool(connected)
     weak = [r for r in pair_rows if math.isfinite(float(r["overlap"])) and float(r["overlap"]) < float(target_overlap)]
     result["neighbor_pairs_below_target_overlap"] = weak
-    if pair_rows and not connected:
+    if pair_rows and not sparse_2d and not connected:
         errors.append("neighbor CV histogram overlap graph appears disconnected at threshold 0.03")
     if weak:
         warnings.append(f"{len(weak)} neighbor pair(s) below target overlap {target_overlap:.2f}")
