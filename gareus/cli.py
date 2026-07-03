@@ -90,7 +90,9 @@ def _add_cv_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--cv1", choices=["distance", "contacts", "nonlocal-contacts"], default=None,
                    help="Primary CV: distance or contacts.")
     p.add_argument("--cv2", choices=["none", "alpha", "beta", "alpha-coil-beta", "acb",
-                                      "rama-map", "rama", "custom"], default=None,
+                                      "rama-map", "rama", "custom", "tica", "tica-linear",
+                                      "torsion-pca", "bootstrap-torsion", "bootstrap-linear",
+                                      "torsion-linear"], default=None,
                    help="Secondary CV for 2D workflow. Default centers inserted automatically.")
     # Expert atom override
     p.add_argument("--cv-atom1", default=None, help="Explicit primary CV atom, e.g. 1:CA.")
@@ -471,6 +473,18 @@ def _add_tica_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--tica-linear-k-max", type=float, default=50.0, dest="tica_linear_k_max",
                    help="cv2_k_max applied immediately after the tica-linear CV2 switch "
                         "(default 50.0 kcal/mol).")
+    p.add_argument("--bootstrap-torsion-source", default="seeds",
+                   choices=["seeds"],
+                   help="Source ensemble for cv2=torsion-pca bootstrap model.")
+    p.add_argument("--bootstrap-torsion-residualize-against-cv1",
+                   action=argparse.BooleanOptionalAction, default=True,
+                   help="For cv2=torsion-pca, regress seed torsion features against seed CV1 before PCA.")
+    p.add_argument("--bootstrap-torsion-component", type=int, default=1,
+                   help="1-based PCA component index for cv2=torsion-pca.")
+    p.add_argument("--bootstrap-torsion-min-seed-count", type=int, default=20,
+                   help="Minimum usable GENPEPT survivors needed for cv2=torsion-pca.")
+    p.add_argument("--bootstrap-torsion-state-file", default="",
+                   help="Bootstrap torsion PCA state JSON. Empty means <out>/tica/bootstrap_torsion_cv.json.")
 
 
 def _add_platform_args(p: argparse.ArgumentParser) -> None:
@@ -536,12 +550,15 @@ def _resolve_cv_aliases(args: argparse.Namespace, argv_list: list) -> None:
     args.secondary_cv = secondary_cv_mode(args)
     args.cv2 = args.secondary_cv  # keep cv2 in sync
 
-    # Auto-insert cv2_centers when cv2 active but no centers provided
+    # Auto-insert cv2_centers when cv2 active but no centers provided.
+    # torsion-pca centers are data-derived after seed PCA is fitted in run_gareus.
     if _cv2_requested and str(args.cv2) != "none" and not getattr(args, "cv2_centers", None):
         if args.cv2 == "rama-map":
             args.cv2_centers = [-1.0, -1.0 / 3.0, 1.0 / 3.0, 1.0]
         elif args.cv2 in {"alpha-coil-beta", "acb"}:
             args.cv2_centers = [-0.8, 0.0, 0.8]
+        elif args.cv2 == "torsion-pca":
+            args.cv2_centers = None
         else:
             args.cv2_centers = [0.2, 0.5, 0.8]
         args._cv2_auto_centers = True

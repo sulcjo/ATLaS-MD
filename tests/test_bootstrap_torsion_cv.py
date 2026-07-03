@@ -1,4 +1,5 @@
 import argparse
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -33,6 +34,93 @@ def test_torsion_pca_mode_aliases_and_range():
     assert secondary_cv_enabled(_args(secondary_cv="torsion-pca")) is True
     assert secondary_cv_is_transition("torsion-pca") is True
     assert secondary_cv_range("torsion-pca") == pytest.approx((-6.0, 6.0))
+
+
+def test_bootstrap_torsion_cli_keys_are_known_config_dests():
+    from gareus.cli import build_gareus_parser
+    from gareus.config import _build_known_config_dests
+
+    parser = build_gareus_parser()
+    dests = _build_known_config_dests(parser)
+    for key in (
+        "bootstrap_torsion_source",
+        "bootstrap_torsion_residualize_against_cv1",
+        "bootstrap_torsion_component",
+        "bootstrap_torsion_min_seed_count",
+        "bootstrap_torsion_state_file",
+    ):
+        assert key in dests
+
+
+def test_torsion_pca_no_bad_generic_auto_centers():
+    from gareus.cli import parse_args
+
+    args = parse_args(["--seq", "GYDPETGTWG", "--cv1", "contacts", "--cv2", "torsion-pca"])
+    assert args.cv2 == "torsion-pca"
+    assert args.cv2_centers is None
+    assert args.secondary_cv_centers is None
+    assert args._cv2_auto_centers is True
+
+
+def test_ensure_bootstrap_torsion_cv_ready_builds_seed_state_and_auto_centers(tmp_path, monkeypatch):
+    import gareus.cv as cv_mod
+    import gareus.seeding as seeding_mod
+    from gareus.production import _ensure_bootstrap_torsion_cv_ready
+
+    out_dir = tmp_path / "out"
+    seed_dir = tmp_path / "seeds"
+    seed_dir.mkdir()
+    phi = [(0, 1, 2, 3)]
+    psi = [(1, 2, 3, 4)]
+
+    def _positions(theta: float) -> np.ndarray:
+        return np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [1.0 + np.cos(theta), 1.0, np.sin(theta)],
+                [2.0 + np.cos(0.5 * theta), 1.5, np.sin(0.5 * theta)],
+            ],
+            dtype=float,
+        )
+
+    library = [
+        {"positions_nm": _positions(theta), "primary_cv_value": float(theta)}
+        for theta in np.linspace(0.2, 2.6, 8)
+    ]
+    args = _args(
+        secondary_cv="torsion-pca",
+        bootstrap_torsion_source="seeds",
+        bootstrap_torsion_residualize_against_cv1=True,
+        bootstrap_torsion_component=1,
+        bootstrap_torsion_min_seed_count=3,
+        bootstrap_torsion_state_file="",
+        seed_conformers_dir=str(seed_dir),
+        _cv2_auto_centers=True,
+        secondary_cv_centers=None,
+        cv2_centers=None,
+    )
+
+    monkeypatch.setattr(cv_mod, "secondary_structure_torsions", lambda topology: (phi, psi))
+    monkeypatch.setattr(
+        seeding_mod,
+        "load_genpept_conformer_library",
+        lambda *args, **kwargs: list(library),
+    )
+
+    summary = _ensure_bootstrap_torsion_cv_ready(args, out_dir, topology=object(), primary_cv_def={"mode": "distance"})
+
+    state_path = out_dir / "tica" / "bootstrap_torsion_cv.json"
+    assert Path(args.bootstrap_torsion_state_file) == state_path
+    assert state_path.exists()
+    assert summary["state_file"] == str(state_path)
+    assert summary["method"] == "pca"
+    assert summary["n_samples"] == len(library)
+    assert len(args.cv2_centers) == 3
+    assert args.secondary_cv_centers == args.cv2_centers
+    assert summary["seed_projection_centers"] == args.cv2_centers
+    assert all(-6.0 <= value <= 6.0 for value in args.cv2_centers)
 
 
 def test_bootstrap_pca_returns_ticaresult_compatible_state():

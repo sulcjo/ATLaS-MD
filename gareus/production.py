@@ -123,6 +123,120 @@ __all__ = [
 ]
 
 
+def _bootstrap_torsion_state_path(args, out_dir: Path) -> Path:
+    configured = str(getattr(args, "bootstrap_torsion_state_file", "") or "")
+    if configured:
+        return Path(configured)
+    return Path(out_dir) / "tica" / "bootstrap_torsion_cv.json"
+
+
+def _seed_projection_centers(values: np.ndarray) -> list[float]:
+    arr = np.asarray(values, dtype=np.float64)
+    arr = arr[np.isfinite(arr)]
+    if arr.size < 3:
+        raise ValueError(f"torsion-pca center selection needs at least 3 finite projections, got {arr.size}")
+    centers = [float(x) for x in np.quantile(arr, [0.15, 0.50, 0.85])]
+    centers = [max(-6.0, min(6.0, c)) for c in centers]
+    if len({round(c, 6) for c in centers}) < 3:
+        raise ValueError("torsion-pca seed projections collapsed; cannot choose three distinct CV2 centers")
+    return centers
+
+
+def _ensure_bootstrap_torsion_cv_ready(args, out_dir: Path, topology, primary_cv_def: dict) -> dict:
+    from .cv import secondary_structure_torsions
+    from .seeding import load_genpept_conformer_library
+    from .tica import backbone_dihedral_features, compute_bootstrap_torsion_pca, project_tica1, TICAResult
+
+    if secondary_cv_mode(args) != "torsion-pca":
+        return {}
+
+    source = str(getattr(args, "bootstrap_torsion_source", "seeds") or "seeds").strip().lower()
+    if source != "seeds":
+        raise ValueError(f"Unsupported bootstrap_torsion_source={source!r}; only 'seeds' is supported")
+
+    state_path = _bootstrap_torsion_state_path(args, out_dir)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    args.bootstrap_torsion_state_file = str(state_path)
+
+    phi_torsions, psi_torsions = secondary_structure_torsions(topology)
+    if not phi_torsions and not psi_torsions:
+        raise ValueError("torsion-pca requires at least one backbone phi/psi torsion")
+    expected_features = 2 * len(phi_torsions) + 2 * len(psi_torsions)
+
+    seed_dir = str(getattr(args, "seed_conformers_dir", "") or "")
+    if not seed_dir:
+        raise ValueError("cv2=torsion-pca requires seed_conformers_dir")
+
+    library = load_genpept_conformer_library(
+        Path(seed_dir),
+        primary_cv_def=primary_cv_def,
+        args=args,
+        topology=topology,
+        secondary_cv_metadata=None,
+    )
+    usable = [entry for entry in library if np.asarray(entry.get("positions_nm", [])).ndim == 2]
+    min_count = int(getattr(args, "bootstrap_torsion_min_seed_count", 20) or 20)
+    if len(usable) < min_count:
+        raise ValueError(
+            f"cv2=torsion-pca requires at least {min_count} usable seed conformers, got {len(usable)}"
+        )
+
+    X = np.vstack(
+        [
+            backbone_dihedral_features(np.asarray(entry["positions_nm"], dtype=np.float64), phi_torsions, psi_torsions)
+            for entry in usable
+        ]
+    )
+    if X.shape[1] != expected_features:
+        raise ValueError(f"torsion-pca feature count {X.shape[1]} != expected {expected_features}")
+
+    cv1 = np.asarray([float(entry.get("primary_cv_value", np.nan)) for entry in usable], dtype=np.float64)
+    residualize = bool(getattr(args, "bootstrap_torsion_residualize_against_cv1", True))
+    if residualize and not np.isfinite(cv1).all():
+        raise ValueError("cv2=torsion-pca residualization requires finite seed primary_cv_value for every usable seed")
+
+    if state_path.exists():
+        result = TICAResult.load(state_path)
+        if len(result.weights) != expected_features:
+            raise ValueError(
+                f"bootstrap torsion state {state_path} has {len(result.weights)} weights; expected {expected_features}"
+            )
+        explained = result.explained_variance_ratio
+        if explained is None:
+            explained = result.eigenvalue
+        explained = float(explained)
+        if not np.isfinite(explained) or explained <= 0.0:
+            raise ValueError(f"bootstrap torsion state {state_path} has no valid PCA variance")
+    else:
+        result = compute_bootstrap_torsion_pca(
+            X,
+            cv1=cv1 if residualize else None,
+            residualize=residualize,
+            component=int(getattr(args, "bootstrap_torsion_component", 1) or 1),
+            phi_torsion_indices=phi_torsions,
+            psi_torsion_indices=psi_torsions,
+        )
+        result.save(state_path)
+
+    projections = project_tica1(X, result)
+    if getattr(args, "_cv2_auto_centers", False) and not getattr(args, "secondary_cv_centers", None):
+        centers = _seed_projection_centers(projections)
+        args.cv2_centers = centers
+        args.secondary_cv_centers = centers
+
+    explained = result.explained_variance_ratio
+    if explained is None:
+        explained = result.eigenvalue
+    return {
+        "state_file": str(state_path),
+        "method": str(result.method),
+        "n_samples": int(result.n_samples),
+        "explained_variance_ratio": float(explained),
+        "seed_projection_min": float(np.min(projections)),
+        "seed_projection_max": float(np.max(projections)),
+        "seed_projection_centers": [float(x) for x in getattr(args, "secondary_cv_centers", []) or []],
+    }
+
 
 def _flatten_numeric_object(obj, prefix: str, unit=None, energy: bool = False) -> dict[str, float]:
     """Flatten dict/list/scalar results from gamd-openmm diagnostic helpers."""
@@ -2691,6 +2805,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         shared_gamd_globals_all = dict(resume_def.get("shared_gamd_globals_all", {}) or {})
         shared_gamd_globals_interesting = dict(resume_def.get("shared_gamd_globals_interesting", {}) or {})
         calib_steps = int(resume_def.get("calib_steps", 0) or 0)
+        bootstrap_torsion_summary = {}
         shared_gamd_context_checkpoint = None
         print(f"[resume] Production checkpoint manifest found; skipping window generation, US pulling, and shared GaMD setup.")
     else:
@@ -2699,6 +2814,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         cv_atom1, cv_atom2, distance_cv_label = choose_cv_atoms(topology, args)
         primary_cv_def = prepare_primary_cv_definition(topology, args, cv_atom1=cv_atom1, cv_atom2=cv_atom2, cv_label=distance_cv_label)
         cv_label = str(primary_cv_def.get("label", distance_cv_label))
+        bootstrap_torsion_summary = _ensure_bootstrap_torsion_cv_ready(args, out_dir, topology, primary_cv_def)
         if getattr(args, "windows_2d_csv", None):
             centers_a, k_list, secondary_cv_centers, secondary_cv_k_kcal_list, secondary_cv_metadata, window_metadata = load_explicit_2d_window_csv(args, Path(args.windows_2d_csv))
             print(f"    Explicit 2D window table loaded: {len(centers_a)} windows from {args.windows_2d_csv}")
@@ -2722,6 +2838,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 window_metadata["secondary_cv_expansion"] = secondary_cv_metadata
 
     window_metadata = dict(window_metadata or {})
+    if bootstrap_torsion_summary:
+        window_metadata["bootstrap_torsion_cv"] = bootstrap_torsion_summary
     window_metadata.update({
         "primary_cv": primary_cv_mode(args),
         "primary_cv_label": primary_cv_label(args),
