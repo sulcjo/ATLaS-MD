@@ -32,7 +32,10 @@ from typing import Iterable, Optional, Tuple, Dict, Any, List
 
 from .io import _json_ready  # type: ignore
 
-import config_profiles
+try:
+    import config_profiles  # optional top-level module: profile: bundles + YAML dup-key lint
+except ImportError:  # keep the workflow runnable without it (guarded at every call site below)
+    config_profiles = None
 
 __all__ = [
     "CONFIG_SCHEMA_VERSION",
@@ -189,7 +192,8 @@ def _load_config_file(path: Path) -> dict:
                 f"Config file {path} looks like YAML, but PyYAML is not installed. "
                 "Install pyyaml or use a .json config."
             )
-        config_profiles.assert_no_duplicate_keys(text, path)
+        if config_profiles is not None:
+            config_profiles.assert_no_duplicate_keys(text, path)
         data = yaml_mod.safe_load(text)
     if data is None:
         return {}
@@ -269,7 +273,16 @@ def _apply_config_defaults_to_parser(
         )
     # A bare CLI --profile overrides whatever the file's own `profile:` key says.
     profile_name = cli_profile or flat.get("profile")
-    merged = config_profiles.merge_profile(config_profiles.GAREUS_PROFILES, flat, profile_name, tool="gareus")
+    if config_profiles is not None:
+        merged = config_profiles.merge_profile(config_profiles.GAREUS_PROFILES, flat, profile_name, tool="gareus")
+    elif profile_name:
+        raise ValueError(
+            f"Config requests profile '{profile_name}', but the optional 'config_profiles' "
+            "module is not importable. Copy config_profiles.py (repo root) next to the package, "
+            "or remove the profile: key to run without profile expansion."
+        )
+    else:
+        merged = flat
     # Forward-only fix for the cross-peptide seed-contamination bug: a minimal
     # profile-based config doesn't need to copy-paste seed_conformers_dir, it
     # can be derived from GENPEPT's own output directory in the same YAML.

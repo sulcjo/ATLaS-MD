@@ -75,7 +75,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
 
-import config_profiles
+try:
+    import config_profiles  # optional top-level module: profile: bundles + YAML dup-key lint
+except ImportError:  # keep GENPEPT runnable without it (guarded at every call site below)
+    config_profiles = None
 
 # Avoid accidental thread oversubscription when many Python/OpenMM worker
 # processes are launched. Users can still override these in the shell.
@@ -100,7 +103,8 @@ def _load_yaml_or_json_config(path: Path) -> dict:
                 f"Config file {path} looks like YAML, but PyYAML is not installed. "
                 "Install pyyaml or use a JSON config."
             ) from exc
-        config_profiles.assert_no_duplicate_keys(text, path)
+        if config_profiles is not None:
+            config_profiles.assert_no_duplicate_keys(text, path)
         data = yaml.safe_load(text)
     if data is None:
         return {}
@@ -297,7 +301,14 @@ def _genpept_config_defaults(
     # block rather than inside it. A bare CLI --profile overrides the file's
     # own key; explicit keys in `flat` always win over either.
     profile_name = cli_profile or raw.get("profile")
-    flat = config_profiles.merge_profile(config_profiles.GENPEPT_PROFILES, flat, profile_name, tool="genpept")
+    if config_profiles is not None:
+        flat = config_profiles.merge_profile(config_profiles.GENPEPT_PROFILES, flat, profile_name, tool="genpept")
+    elif profile_name:
+        raise ValueError(
+            f"Config requests profile '{profile_name}', but the optional 'config_profiles' "
+            "module is not importable. Copy config_profiles.py (repo root) next to GENPEPT.py, "
+            "or remove the profile: key."
+        )
 
     _config_parent = Path(config_path).parent.resolve() if config_path else None
     for dest in list(flat):
