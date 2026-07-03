@@ -102,3 +102,4 @@ def test_ticaresult_preserves_method_roundtrip(tmp_path):
     assert loaded.method == "pca"
     assert loaded.lag == 0
     assert loaded.weights.shape == result.weights.shape
+    assert loaded.explained_variance_ratio == result.explained_variance_ratio
