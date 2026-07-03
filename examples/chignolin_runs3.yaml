@@ -257,12 +257,7 @@ cv2:
   cv2_adaptive_overlap_sigma: 20.0   # was: secondary_cv_adaptive_overlap_sigma
   cv2_k_scale: 2.0               # was: secondary_cv_adaptive_k_scale
 
-  # v7: explicit CV2 initial centers — 6 instead of 4 (auto-default).
-  # Adds -0.70 (beta→PPII bridge) and 0.00 (PPII→alpha-R bridge).
-  # The default gap between beta(-1.0) and PPII(-0.333) is 0.667 CV2 units —
-  # too large for MBAR overlap (poor reweighting across this transition).
-  # Applicable to any peptide using cv2: rama-map, not chignolin-specific.
-  cv2_centers: [-1.0, -0.333, 0.333, 1.0]
+  # cv2 centers are derived automatically from bootstrap_torsion_cv for torsion-pca.
 
 tica:
   tica_obs_interval: 50

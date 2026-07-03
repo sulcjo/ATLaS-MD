@@ -1432,9 +1432,9 @@ Recommended two-stage setup:
       tica_update_after_epochs: [0]
       tica_switch_cv2: true
 
-This allows a single YAML config to run a two-stage strategy:
+This allows a single YAML config to run a two-stage bootstrap strategy:
 
-  Epoch 0:   cv2 = rama-map  (broad discrete exploration; cheap, no model needed)
+  Epoch 0:   cv2 = torsion-pca  (bootstrap seed-fit torsion PCA; cheap, no model needed)
   tICA fit:  collect obs from epoch 0, fit tIC1, update window centers
   Epoch 1+:  cv2 = tica-linear  (data-driven slowest-mode coordinate)
   Final:     cv2 = tica-linear  (high-quality MBAR samples)
