@@ -64,14 +64,18 @@ Useful starting points
     # automatic pilot rounds that refine windows before final production
     gareus --seq CLN025 --window-mode adaptive-feedback --out run_feedback
 
-    # epoch-based adaptive production with a global aggregate-MD runtime pool
-    gareus --seq CLN025 --run-mode hmr-gamd --cv1 contacts --cv2 rama-map \
+    # first-run orthogonal CVs: contacts x seed-fit torsion PCA, then tICA handoff
+    python GENPEPT.py --config chignolin.yaml
+    gareus --config chignolin.yaml --run-mode hmr-gamd --cv1 contacts --cv2 torsion-pca \
+           --seed-conformers-dir chignolin_genpept_seeds \
            --window-mode adaptive-production \
+           --tica-obs-interval 50 --tica-update-after-epochs 0 --tica-switch-cv2 \
            --md-budget-ns 840 \
-           --out run_adaptive_pool
+           --out run_torsion_pca
 
     # double-adaptive: feedback pilots seed adaptive-production epochs/topups
-    gareus --seq CLN025 --run-mode hmr-gamd --cv1 contacts --cv2 rama-map \
+    gareus --config chignolin.yaml --run-mode hmr-gamd --cv1 contacts --cv2 torsion-pca \
+           --seed-conformers-dir chignolin_genpept_seeds \
            --window-mode double-adaptive \
            --adaptive-rounds 3 \
            --ap-epochs 10 \
@@ -80,8 +84,10 @@ Useful starting points
     # nonlocal-contact primary CV, with automatic contact-window calibration
     gareus --seq CLN025 --cv1 contacts --window-mode adaptive-feedback --out run_contacts
 
-    # 2D primary-CV x secondary-structure workflow, automatic secondary centers
-    gareus --seq CLN025 --cv1 distance --cv2 rama-map --out run_2d_rama_map
+    # 2D primary-CV x seed-derived torsion-PCA CV, automatic secondary centers
+    gareus --config chignolin.yaml --cv1 contacts --cv2 torsion-pca \
+           --seed-conformers-dir chignolin_genpept_seeds \
+           --out run_2d_torsion_pca
 
     # seed each umbrella window from GENPEPT survivors scored in active CV space
     python GENPEPT.py --config chignolin.yaml
@@ -207,7 +213,8 @@ Inter-epoch tICA secondary-CV update (YAML)
 --------------------------------------------
 tICA fits the slowest backbone-dihedral mode from accumulated epoch observations
 and re-centers umbrella windows in that coordinate after each cycle.  CV2-type
-agnostic: works with rama-map, contacts, tica-linear, or any other secondary CV.
+agnostic: works with torsion-pca, rama-map, contacts, tica-linear, or any other
+secondary CV.
 
 YAML block (add under top-level section named "tica:", all keys are optional):
 
@@ -514,6 +521,7 @@ Multiple secondary centers create a 2D umbrella grid:
 Auto-inserted centers when --cv2 is set without --cv2-centers:
     rama-map:         [-1, -1/3, 1/3, 1]
     alpha-coil-beta:  [-0.8, 0, 0.8]
+    torsion-pca:      derived from GENPEPT seed projections after the bootstrap fit
 
 Explicit sparse 2D windows can instead be loaded with:
 
@@ -1009,6 +1017,8 @@ the active GAREUS CV space before the normal CV-pull step.  In practical terms:
     --cv1 contacts                  scores survivor nonlocal-contact CV vs window center
     --cv1 distance --cv2 rama-map
                                     scores both distance and secondary backbone basin
+    --cv1 contacts --cv2 torsion-pca
+                                    scores contacts and seed-fit torsion PC1 after bootstrap
 
 The selector writes:
 
@@ -1394,9 +1404,10 @@ CV2-type agnosticism
 ~~~~~~~~~~~~~~~~~~~~
 The center update is agnostic to the secondary CV type.  If CV2 = tica-linear,
 the updated center is directly the per-window tIC1 median.  For other CV2 types
-(rama-map, contacts, etc.) the tICA model is fitted for information/diagnostics
-but secondary_center still holds a value in the original CV2 coordinate; the
-update reflects where the data landed in CV2 space, not tIC1 space.
+(torsion-pca, rama-map, contacts, etc.) the tICA model is fitted for
+information/diagnostics but secondary_center still holds a value in the
+original CV2 coordinate; the update reflects where the data landed in CV2
+space, not tIC1 space.
 
 CV2 auto-switch (tica_switch_cv2)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
