@@ -2567,6 +2567,111 @@ def run_multiwindow_gamd_recon(
         raise RuntimeError("Multi-window GaMD recon collected no boost-group statistics")
     return {name: pool_window_stats(stats) for name, stats in per_group_window_stats.items()}
 
+def apply_joint_envelope_gamd_calibration(
+    args, openmm, app, unit, topology, base_system, setup_platform, setup_props,
+    out_dir, nrep, centers_nm, ks_kj_nm2, secondary_cv_centers, secondary_cv_ks_kj,
+    window_start_positions, window_start_velocities, equil_state,
+    shared_gamd_globals_all, shared_gamd_globals_interesting, calib_steps,
+    progress: Optional[GuiProgressSink] = None,
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Recon every initial window, pool per boost-group, and overwrite the
+    physics globals in the shared-setup globals dicts before export.
+
+    Returns (shared_gamd_globals_all, shared_gamd_globals_interesting) with
+    Vmax/Vmin/Vavg/sigmaV/k0/threshold_energy/k overwritten per boost group;
+    every other global (stepCount, stage, windowCount, ForceScalingFactor,
+    sigma0_<group>, ...) is unchanged. Also writes the updated
+    shared_gamd_setup_globals.json (superseding the one
+    run_shared_gamd_setup_article_a already wrote) and runs a 50-step
+    finite-energy verification before returning, raising RuntimeError if it
+    is not finite.
+    """
+    from gareus.gamd_calibration import compute_group_calibration, overwrite_physics_globals
+
+    _peek_system = deserialize_system(openmm, base_system)
+    joint_targets, _peek_integrator = _gamd_boost_group_targets(_peek_system, args, unit)
+    release_openmm_contexts(_peek_integrator, _peek_system)
+
+    print(f"    GaMD joint-envelope calibration: reconning {nrep} windows "
+          f"({getattr(args, 'gamd_multiwindow_recon_prep_steps', 2000)} prep + "
+          f"{getattr(args, 'gamd_multiwindow_recon_steps', 20000)} steps each) for boost group(s) "
+          f"{', '.join(name for name, _gid in joint_targets)}")
+    pooled_envelopes = run_multiwindow_gamd_recon(
+        args, openmm, app, unit, topology, base_system, setup_platform, setup_props,
+        centers_nm, ks_kj_nm2, secondary_cv_centers, secondary_cv_ks_kj,
+        window_start_positions, window_start_velocities, equil_state,
+        progress=progress,
+    )
+    calibrations = {}
+    for name, _gid in joint_targets:
+        if name not in pooled_envelopes:
+            raise RuntimeError(f"Multi-window recon produced no pooled statistics for boost group {name!r}")
+        sigma0 = float(shared_gamd_globals_all.get(f"sigma0_{name}", 0.0) or 0.0)
+        calibrations[name] = compute_group_calibration(str(args.gamd_boost_type), pooled_envelopes[name], sigma0)
+
+    shared_gamd_globals_all = overwrite_physics_globals(shared_gamd_globals_all, calibrations)
+    shared_gamd_globals_interesting = overwrite_physics_globals(shared_gamd_globals_interesting, calibrations)
+
+    joint_envelope_report = {
+        name: {
+            "vmax_kj_mol": c.vmax, "vmin_kj_mol": c.vmin, "vavg_kj_mol": c.vavg,
+            "sigmaV_kj_mol": c.sigmav,
+            "sigma0_kj_mol": float(shared_gamd_globals_all.get(f"sigma0_{name}", 0.0) or 0.0),
+            "k0": c.k0, "k": c.k, "threshold_energy_kj_mol": c.threshold_energy,
+            "boosted": c.boosted, "n_windows_pooled": c.n_windows, "n_samples_pooled": c.n_total,
+        }
+        for name, c in calibrations.items()
+    }
+    write_json(out_dir / "shared_gamd_setup_globals.json", {
+        "mode": "joint_envelope_gamd_calibration",
+        "description": (
+            "Vmax/Vmin/Vavg/sigmaV/k0/threshold_energy were calibrated by running a short "
+            "recon under each initial window's own umbrella bias, then pooling the joint "
+            "min/max extrema and combined-sample mean/variance across all windows. The "
+            "resulting CustomIntegrator globals are copied to every GaREUS replica before "
+            "production, exactly as before this change."
+        ),
+        "calibration_steps": int(calib_steps),
+        "gamd_multiwindow_recon_prep_steps": int(getattr(args, "gamd_multiwindow_recon_prep_steps", 0) or 0),
+        "gamd_multiwindow_recon_steps": int(getattr(args, "gamd_multiwindow_recon_steps", 0) or 0),
+        "joint_envelope": joint_envelope_report,
+        "temperature_K": float(args.temperature_k),
+        "gamd_boost_type": str(args.gamd_boost_type),
+        "sigma0p_kcal_mol": float(args.sigma0p_kcal_mol),
+        "sigma0d_kcal_mol": float(args.sigma0d_kcal_mol),
+        "interesting_globals": shared_gamd_globals_interesting,
+        "all_globals": shared_gamd_globals_all,
+    })
+    print("    GaMD joint-envelope calibration: " + ", ".join(
+        f"{name} k0={c.k0:.3f} threshold={c.threshold_energy:.1f} kJ/mol (pooled {c.n_windows} windows, {c.n_total} samples)"
+        for name, c in calibrations.items()
+    ))
+
+    _check_sim = _check_integrator = _check_system = None
+    try:
+        _check_system = deserialize_system(openmm, base_system)
+        _check_integrator, _ = make_gamd_integrator(_check_system, args, unit)
+        set_integrator_globals_from_dict(_check_integrator, shared_gamd_globals_all)
+        _check_sim = app.Simulation(topology, _check_system, _check_integrator, setup_platform, setup_props)
+        _check_box = equil_state.getPeriodicBoxVectors()
+        if _check_box is not None:
+            _check_sim.context.setPeriodicBoxVectors(*_check_box)
+        _check_sim.context.setPositions(equil_state.getPositions())
+        _check_sim.context.setVelocitiesToTemperature(args.temperature_k * unit.kelvin, args.seed + 909)
+        set_window(_check_sim.context, centers_nm, ks_kj_nm2, 0, secondary_cv_centers, secondary_cv_ks_kj)
+        _check_sim.step(50)
+        _check_pe = float(_check_sim.context.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole))
+        if not math.isfinite(_check_pe):
+            raise RuntimeError(
+                f"Joint-envelope GaMD calibration produced a non-finite potential energy "
+                f"({_check_pe}) on a 50-step verification run; refusing to proceed to production."
+            )
+        print(f"    GaMD joint-envelope calibration verified: 50-step check run finite (PE={_check_pe:.1f} kJ/mol)")
+    finally:
+        release_openmm_contexts(_check_sim, _check_integrator, _check_system)
+
+    return shared_gamd_globals_all, shared_gamd_globals_interesting
+
 def run_shared_gamd_setup_article_a(
     args,
     out_dir: Path,
@@ -3019,6 +3124,13 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     print("    GaMD shared setup: compact window unavailable, falling back to NPT-equilibrated structure")
                 shared_gamd_globals_all, shared_gamd_globals_interesting, calib_steps, shared_gamd_context_checkpoint = run_shared_gamd_setup_article_a(
                     args, out_dir, openmm, app, unit, topology, base_system, gamd_start_state, setup_platform, setup_props, progress=progress
+                )
+                shared_gamd_globals_all, shared_gamd_globals_interesting = apply_joint_envelope_gamd_calibration(
+                    args, openmm, app, unit, topology, base_system, setup_platform, setup_props,
+                    out_dir, nrep, centers_nm, ks_kj_nm2, secondary_cv_centers, secondary_cv_ks_kj,
+                    window_start_positions, window_start_velocities, equil_state,
+                    shared_gamd_globals_all, shared_gamd_globals_interesting, calib_steps,
+                    progress=progress,
                 )
                 exported = export_shared_gamd_setup_if_requested(args, out_dir)
                 if exported:
