@@ -1475,7 +1475,7 @@ Recommended cycle lengths:
     tica_epochs_per_cycle: 3   practical default; pools 3 epochs before refit
     tica_epochs_per_cycle: 5   more data per refit; slower adaptation
 
-With tica_switch_cv2: epoch 0 (rama-map) and epoch 1+ (tica-linear) have
+With tica_switch_cv2: epoch 0 (torsion-pca) and epoch 1+ (tica-linear) have
 different tica_cv_version values by construction.  The MBAR pool for final
 production only includes post-switch epochs, which is the correct behavior.
 
@@ -1491,14 +1491,20 @@ Minimal (center-update only, same CV2 throughout):
       # tica_update_after_epochs: [2, 5, 8]   # alternative: explicit epoch list
       # tica_state_file: ""                   # managed automatically; omit
 
-Two-stage auto-switch (epoch 0 rama-map → epoch 1+ tica-linear):
+Two-stage auto-switch (epoch 0 torsion-pca → epoch 1+ tica-linear):
 
     cvs:
       cv1: contacts
-      cv2: rama-map               # starting CV2; switched automatically after epoch 0
+      cv2: torsion-pca            # starting CV2; switched automatically after epoch 0
+
+    bootstrap_torsion_cv:
+      bootstrap_torsion_source: seeds
+      bootstrap_torsion_residualize_against_cv1: true
+      bootstrap_torsion_component: 1
+      bootstrap_torsion_min_seed_count: 20
 
     adaptive_production:
-      ap_epochs: 2                # epoch 0: rama-map, epoch 1: tica-linear
+      ap_epochs: 2                # epoch 0: torsion-pca, epoch 1: tica-linear
       ap_final_pool_fraction: 0.60
 
     tica:
