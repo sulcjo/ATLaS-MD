@@ -14,6 +14,7 @@ from gareus_monitor import (
     discover,
     match_slurm_jobs_to_states,
     parse_squeue_rows,
+    render_detail,
     summarize_boost_values,
 )
 
@@ -266,6 +267,64 @@ class GaMDBoostSummaryTests(unittest.TestCase):
 
     def test_summarize_boost_values_returns_empty_summary_when_no_samples_exist(self):
         self.assertEqual(summarize_boost_values([]), {})
+
+    def test_render_detail_shows_gamd_boost_distribution_when_live_samples_exist(self):
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td) / "PEP_2d_run"
+            _append_jsonl(
+                run_dir / "progress.jsonl",
+                {
+                    "event": "progress",
+                    "phase": "gareus_production",
+                    "percent": 50.0,
+                    "aggregate_sim_time_ns": 4.0,
+                    "gamd_boost_mean_kcal_mol": 2.5,
+                    "gamd_boost_sd_kcal_mol": 0.8,
+                    "gamd_boost_anharmonicity_score": 0.1,
+                    "wall_time_s": 2000.0,
+                },
+                {
+                    "event": "distances",
+                    "distances": [
+                        {"primary_cv_value": 0.1, "secondary_cv": 0.2, "gamd_boost_total_kcal_mol": 1.0},
+                        {"primary_cv_value": 0.3, "secondary_cv": 0.4, "gamd_boost_total_kcal_mol": 2.0},
+                        {"primary_cv_value": 0.5, "secondary_cv": 0.6, "gamd_boost_total_kcal_mol": 4.0},
+                    ],
+                },
+            )
+            state = PeptideState.from_rundir(run_dir)
+            state.refresh()
+
+            out = render_detail(state)
+
+            self.assertIn("GaMD boost dist", out)
+            self.assertIn("p10=", out)
+            self.assertIn("p50=", out)
+            self.assertIn("p90=", out)
+
+    def test_render_detail_reports_no_live_boost_samples_when_absent(self):
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td) / "PEP_2d_run"
+            _append_jsonl(
+                run_dir / "progress.jsonl",
+                {
+                    "event": "progress",
+                    "phase": "gareus_production",
+                    "percent": 50.0,
+                    "aggregate_sim_time_ns": 4.0,
+                    "gamd_boost_mean_kcal_mol": 2.5,
+                    "gamd_boost_sd_kcal_mol": 0.8,
+                    "gamd_boost_anharmonicity_score": 0.1,
+                    "wall_time_s": 2000.0,
+                },
+            )
+            state = PeptideState.from_rundir(run_dir)
+            state.refresh()
+
+            out = render_detail(state)
+
+            self.assertIn("GaMD boost dist", out)
+            self.assertIn("no live boost samples", out)
 
 
 class DiscoveryTests(unittest.TestCase):

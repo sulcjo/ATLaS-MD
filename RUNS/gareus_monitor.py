@@ -1260,6 +1260,35 @@ def summarize_boost_values(values: list[float]) -> dict:
     }
 
 
+def boost_histogram_bins(values: list[float], bins: int = 16) -> list[int]:
+    if not values:
+        return []
+    lo, hi = min(values), max(values)
+    if hi <= lo:
+        counts = [0] * max(1, bins)
+        counts[len(counts) // 2] = len(values)
+        return counts
+    counts = [0] * max(1, bins)
+    span = hi - lo
+    for v in values:
+        idx = min(len(counts) - 1, int((v - lo) / span * len(counts) * 0.999999))
+        counts[idx] += 1
+    return counts
+
+
+def render_boost_histogram(values: list[float], width: int = 24) -> str:
+    counts = boost_histogram_bins(values, bins=max(8, width))
+    if not counts:
+        return c(A.DIM) + "(no live boost samples)" + A.RESET
+    peak = max(counts) or 1
+    chars = " ▁▂▃▄▅▆▇█"
+    glyphs = []
+    for count in counts:
+        level = int(round(count / peak * (len(chars) - 1)))
+        glyphs.append(chars[max(0, min(len(chars) - 1, level))])
+    return c(A.BCYAN) + "".join(glyphs[:width]) + A.RESET
+
+
 def approx_basins(samples: list, kT: float = KT_KCAL,
                   n1: int = 16, n2: int = 12, n_minima: int = 4) -> dict:
     """APPROXIMATE free-energy basins from biased CV snapshots — NO MBAR.
@@ -3209,6 +3238,19 @@ def render_detail(s: PeptideState) -> str:
     if bias:
         cv_val += c(A.DIM) + "   " + "  ".join(bias) + A.RESET
     lines.append(labeled("CV1", cv_val))
+    lines.append("│" + _fill(c(A.DIM) + "  GaMD boost dist" + A.RESET, inner) + "│")
+    boost_vals = s.live_boost_values()
+    stats = summarize_boost_values(boost_vals)
+    if stats:
+        hist_w = max(16, min(inner - 4, 40))
+        lines.append("│" + _fill("  " + render_boost_histogram(boost_vals, width=hist_w), inner) + "│")
+        stats_line = (
+            f"  n={stats['n']}  min={stats['min']:.1f}  p10={stats['p10']:.1f}"
+            f"  p50={stats['p50']:.1f}  p90={stats['p90']:.1f}  max={stats['max']:.1f}"
+        )
+        lines.append("│" + _fill(c(A.DIM) + stats_line + A.RESET, inner) + "│")
+    else:
+        lines.append("│" + _fill(c(A.DIM) + "  (no live boost samples)" + A.RESET, inner) + "│")
     lines += [blank(), sep]
 
     # ns history sparkline
