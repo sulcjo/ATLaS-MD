@@ -186,6 +186,20 @@ class GaMDBoostSummaryTests(unittest.TestCase):
 
         self.assertEqual(boost_values_from_entries(entries, limit=2), [2.5, 3.5])
 
+    def test_boost_values_from_entries_skips_missing_boost_samples_instead_of_treating_them_as_zero(self):
+        entries = [
+            {
+                "event": "distances",
+                "distances": [
+                    {"primary_cv_value": 1.0, "secondary_cv": 2.0},
+                    {"primary_cv_value": 1.1, "secondary_cv": 2.1, "gamd_boost_total_kcal_mol": 0.0},
+                    {"primary_cv_value": 1.2, "secondary_cv": 2.2, "gamd_boost_total_kcal_mol": 1.5},
+                ],
+            },
+        ]
+
+        self.assertEqual(boost_values_from_entries(entries), [0.0, 1.5])
+
     def test_summarize_boost_values_reports_percentiles_and_bounds(self):
         stats = summarize_boost_values([1.0, 2.0, 3.0, 4.0, 5.0])
 

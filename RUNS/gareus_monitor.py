@@ -1221,11 +1221,12 @@ def parse_distances_samples(entries: list) -> list:
             if cv1 is None or cv2 is None:
                 continue
             try:
+                boost = w.get("gamd_boost_total_kcal_mol")
                 out.append({
                     "cv1":   float(cv1),
                     "cv2":   float(cv2),
                     "ubias": float(w.get("umbrella_bias_kcal_mol") or 0.0),
-                    "boost": float(w.get("gamd_boost_total_kcal_mol") or 0.0),
+                    "boost": None if boost is None else float(boost),
                 })
             except (TypeError, ValueError):
                 continue
@@ -1272,7 +1273,9 @@ def approx_basins(samples: list, kT: float = KT_KCAL,
     """
     pts = [s for s in samples
            if isinstance(s.get("cv1"), float) and isinstance(s.get("cv2"), float)
-           and math.isfinite(s["cv1"]) and math.isfinite(s["cv2"])]
+           and isinstance(s.get("boost"), (int, float)) and isinstance(s.get("ubias"), (int, float))
+           and math.isfinite(s["cv1"]) and math.isfinite(s["cv2"])
+           and math.isfinite(float(s["boost"])) and math.isfinite(float(s["ubias"]))]
     res = {"minima": [], "n_samples": len(pts), "n_bins": 0}
     if len(pts) < 3:
         return res
