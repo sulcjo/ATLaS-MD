@@ -2101,6 +2101,10 @@ class PeptideState:
                 if e.get("aggregate_sim_time_ns") is not None]
 
     def live_boost_values(self, n: int = 4000) -> list[float]:
+        self._load_progress()
+        self._load_runtime_pool()
+        if not self._progress_has_uncommitted_live_ns():
+            return []
         p = self.run_dir / "progress.jsonl"
         if not p.exists():
             return []

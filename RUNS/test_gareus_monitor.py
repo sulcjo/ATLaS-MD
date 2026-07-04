@@ -172,6 +172,13 @@ class GaMDBoostSummaryTests(unittest.TestCase):
             _append_jsonl(
                 run_dir / "progress.jsonl",
                 {
+                    "event": "progress",
+                    "phase": "gareus_production",
+                    "percent": 50.0,
+                    "aggregate_sim_time_ns": 12.5,
+                    "wall_time_s": 1000.0,
+                },
+                {
                     "event": "distances",
                     "distances": [
                         {"primary_cv_value": 0.1, "secondary_cv": 0.2, "gamd_boost_total_kcal_mol": 1.0},
@@ -188,6 +195,30 @@ class GaMDBoostSummaryTests(unittest.TestCase):
             state = PeptideState.from_rundir(run_dir)
 
             self.assertEqual(state.live_boost_values(2), [2.0, 3.0])
+
+    def test_peptide_state_live_boost_values_returns_empty_after_terminal_progress(self):
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td) / "PEP_2d_run"
+            _append_jsonl(
+                run_dir / "progress.jsonl",
+                {
+                    "event": "progress",
+                    "phase": "gareus_production",
+                    "percent": 50.0,
+                    "aggregate_sim_time_ns": 12.5,
+                    "wall_time_s": 1000.0,
+                },
+                {
+                    "event": "distances",
+                    "distances": [
+                        {"primary_cv_value": 0.1, "secondary_cv": 0.2, "gamd_boost_total_kcal_mol": 1.0},
+                    ],
+                },
+                {"event": "run_complete", "wall_time_s": 1001.0},
+            )
+            state = PeptideState.from_rundir(run_dir)
+
+            self.assertEqual(state.live_boost_values(), [])
 
     def test_boost_values_from_entries_keeps_recent_distances_values_only(self):
         entries = [
