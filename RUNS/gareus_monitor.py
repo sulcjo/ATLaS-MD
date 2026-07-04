@@ -1232,6 +1232,33 @@ def parse_distances_samples(entries: list) -> list:
     return out
 
 
+def boost_values_from_entries(entries: list, limit: int = 4000) -> list[float]:
+    samples = parse_distances_samples(entries)
+    vals = [
+        float(s["boost"])
+        for s in samples
+        if isinstance(s.get("boost"), float) and math.isfinite(s["boost"])
+    ]
+    if limit > 0:
+        vals = vals[-limit:]
+    return vals
+
+
+def summarize_boost_values(values: list[float]) -> dict:
+    clean = [float(v) for v in values if math.isfinite(v)]
+    if not clean:
+        return {}
+    clean.sort()
+    return {
+        "n": len(clean),
+        "min": clean[0],
+        "p10": _percentile(clean, 10),
+        "p50": _percentile(clean, 50),
+        "p90": _percentile(clean, 90),
+        "max": clean[-1],
+    }
+
+
 def approx_basins(samples: list, kT: float = KT_KCAL,
                   n1: int = 16, n2: int = 12, n_minima: int = 4) -> dict:
     """APPROXIMATE free-energy basins from biased CV snapshots — NO MBAR.

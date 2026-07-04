@@ -9,10 +9,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gareus_monitor import (
     PeptideState,
     _plan_yaml_path,
+    boost_values_from_entries,
     build_run_snapshot,
     discover,
     match_slurm_jobs_to_states,
     parse_squeue_rows,
+    summarize_boost_values,
 )
 
 
@@ -161,6 +163,41 @@ class SlurmMonitorTests(unittest.TestCase):
             snap = build_run_snapshot(state)
 
             self.assertEqual([j.job_id for j in snap.slurm_jobs], ["222"])
+
+
+class GaMDBoostSummaryTests(unittest.TestCase):
+    def test_boost_values_from_entries_keeps_recent_distances_values_only(self):
+        entries = [
+            {"event": "progress", "gamd_boost_mean_kcal_mol": 3.0},
+            {
+                "event": "distances",
+                "distances": [
+                    {"primary_cv_value": 1.0, "secondary_cv": 2.0, "gamd_boost_total_kcal_mol": 1.5},
+                    {"primary_cv_value": 1.1, "secondary_cv": 2.1, "gamd_boost_total_kcal_mol": 2.5},
+                ],
+            },
+            {
+                "event": "distances",
+                "distances": [
+                    {"primary_cv_value": 1.2, "secondary_cv": 2.2, "gamd_boost_total_kcal_mol": 3.5},
+                ],
+            },
+        ]
+
+        self.assertEqual(boost_values_from_entries(entries, limit=2), [2.5, 3.5])
+
+    def test_summarize_boost_values_reports_percentiles_and_bounds(self):
+        stats = summarize_boost_values([1.0, 2.0, 3.0, 4.0, 5.0])
+
+        self.assertEqual(stats["n"], 5)
+        self.assertEqual(stats["min"], 1.0)
+        self.assertEqual(stats["p10"], 1.0)
+        self.assertEqual(stats["p50"], 3.0)
+        self.assertEqual(stats["p90"], 5.0)
+        self.assertEqual(stats["max"], 5.0)
+
+    def test_summarize_boost_values_returns_empty_summary_when_no_samples_exist(self):
+        self.assertEqual(summarize_boost_values([]), {})
 
 
 class DiscoveryTests(unittest.TestCase):
