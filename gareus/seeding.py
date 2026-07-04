@@ -113,7 +113,128 @@ def _peptide_atom_offset_and_count(topology) -> tuple[int, int]:
     return first, len(atom_indices)
 
 
-def _relative_primary_cv_def_for_conformer(primary_cv_def: Optional[dict], topology) -> Optional[dict]:
+def _pdb_atom_name(line: str) -> str:
+    return str(line[12:16]).strip()
+
+
+def _canonical_atom_name(name: str) -> str:
+    return str(name or "").strip().upper()
+
+
+def _read_pdb_conformer_atoms(pdb_path: Path) -> tuple[np.ndarray, list[dict]]:
+    positions_a = []
+    atoms = []
+    residue_ord = -1
+    last_residue_key = None
+    with Path(pdb_path).open() as handle:
+        for line in handle:
+            if not line.startswith(("ATOM", "HETATM")):
+                continue
+            try:
+                x = float(line[30:38])
+                y = float(line[38:46])
+                z = float(line[46:54])
+            except Exception:
+                continue
+            residue_key = (line[21:22], line[22:26], line[26:27])
+            if residue_key != last_residue_key:
+                residue_ord += 1
+                last_residue_key = residue_key
+            atom_index = len(positions_a)
+            positions_a.append([x, y, z])
+            atoms.append({
+                "index": int(atom_index),
+                "name": _pdb_atom_name(line),
+                "residue_ordinal": int(residue_ord),
+            })
+    return np.asarray(positions_a, dtype=float) / 10.0, atoms
+
+
+def _topology_to_conformer_atom_index(topology, conformer_atoms: list[dict]) -> dict[int, int]:
+    """Map production topology atom indices to peptide-only conformer PDB indices.
+
+    GENPEPT survivor PDBs can differ from the production sequence or atom order
+    (for example all-glycine backbone seeds for a sidechain-rich peptide), so
+    offsetting by the first peptide atom is not enough.  Backbone atoms needed
+    for torsions still map by residue ordinal and atom name.
+    """
+    if topology is None:
+        return {}
+    seed_by_res_atom: dict[tuple[int, str], int] = {}
+    for atom in conformer_atoms or []:
+        key = (int(atom.get("residue_ordinal", -1)), _canonical_atom_name(str(atom.get("name", ""))))
+        seed_by_res_atom.setdefault(key, int(atom.get("index", -1)))
+    mapped: dict[int, int] = {}
+    topology_atom_indices: list[int] = []
+    for res_ord, residue in enumerate(peptide_residues(topology)):
+        for atom in residue.atoms():
+            topology_atom_indices.append(int(atom.index))
+            key = (int(res_ord), _canonical_atom_name(str(getattr(atom, "name", ""))))
+            seed_idx = seed_by_res_atom.get(key)
+            if seed_idx is not None and seed_idx >= 0:
+                mapped[int(atom.index)] = int(seed_idx)
+    if len(conformer_atoms or []) == len(topology_atom_indices):
+        for seed_idx, topology_idx in enumerate(topology_atom_indices):
+            mapped.setdefault(int(topology_idx), int(seed_idx))
+    return mapped
+
+
+def _map_topology_atom_index(
+    atom_index: int,
+    topology,
+    topology_to_seed: Optional[dict[int, int]] = None,
+) -> Optional[int]:
+    if topology_to_seed is not None:
+        mapped = topology_to_seed.get(int(atom_index))
+        return int(mapped) if mapped is not None else None
+    if topology is None:
+        return int(atom_index)
+    first, n_pep = _peptide_atom_offset_and_count(topology)
+    rel = int(atom_index) - int(first)
+    return int(rel) if 0 <= rel < n_pep else None
+
+
+def map_topology_torsions_to_conformer(
+    torsions,
+    topology,
+    topology_to_seed: Optional[dict[int, int]] = None,
+) -> list[tuple[int, int, int, int]]:
+    mapped = []
+    for tor in torsions or []:
+        rel = [_map_topology_atom_index(int(x), topology, topology_to_seed) for x in tor]
+        if len(rel) == 4 and all(x is not None for x in rel):
+            mapped.append(tuple(int(x) for x in rel))
+    return mapped
+
+
+def _relative_distance_cv_def_for_conformer(
+    cv_atom1,
+    cv_atom2,
+    topology,
+    topology_to_seed: Optional[dict[int, int]] = None,
+) -> Optional[dict]:
+    try:
+        a1 = _map_topology_atom_index(int(cv_atom1), topology, topology_to_seed)
+        a2 = _map_topology_atom_index(int(cv_atom2), topology, topology_to_seed)
+    except Exception:
+        return None
+    if a1 is None or a2 is None:
+        return None
+    return {
+        "mode": "distance",
+        "label": "terminal distance",
+        "units": "A",
+        "cv_atom1": int(a1),
+        "cv_atom2": int(a2),
+        "contact_pairs": [],
+    }
+
+
+def _relative_primary_cv_def_for_conformer(
+    primary_cv_def: Optional[dict],
+    topology,
+    topology_to_seed: Optional[dict[int, int]] = None,
+) -> Optional[dict]:
     """Map an absolute-topology primary-CV definition to peptide-only seed indices."""
     if not isinstance(primary_cv_def, dict):
         return None
@@ -128,11 +249,11 @@ def _relative_primary_cv_def_for_conformer(primary_cv_def: Optional[dict], topol
             rel.pop(key, None)
     if mode == "distance":
         try:
-            a1 = int(primary_cv_def["cv_atom1"]) - first
-            a2 = int(primary_cv_def["cv_atom2"]) - first
+            a1 = _map_topology_atom_index(int(primary_cv_def["cv_atom1"]), topology, topology_to_seed)
+            a2 = _map_topology_atom_index(int(primary_cv_def["cv_atom2"]), topology, topology_to_seed)
         except Exception:
             return None
-        if not (0 <= a1 < n_pep and 0 <= a2 < n_pep):
+        if a1 is None or a2 is None:
             return None
         rel["cv_atom1"] = int(a1)
         rel["cv_atom2"] = int(a2)
@@ -142,12 +263,12 @@ def _relative_primary_cv_def_for_conformer(primary_cv_def: Optional[dict], topol
         pairs = []
         for pair in (primary_cv_def.get("contact_pairs", []) or []):
             try:
-                i = int(pair[0]) - first
-                j = int(pair[1]) - first
+                i = _map_topology_atom_index(int(pair[0]), topology, topology_to_seed)
+                j = _map_topology_atom_index(int(pair[1]), topology, topology_to_seed)
                 w = float(pair[2]) if len(pair) > 2 else 1.0
             except Exception:
                 continue
-            if 0 <= i < n_pep and 0 <= j < n_pep and i != j:
+            if i is not None and j is not None and i != j:
                 pairs.append((int(i), int(j), float(w)))
         if not pairs:
             return None
@@ -167,7 +288,11 @@ def _relative_primary_cv_def_for_conformer(primary_cv_def: Optional[dict], topol
     return None
 
 
-def _relative_secondary_cv_metadata_for_conformer(secondary_cv_metadata: Optional[dict], topology) -> Optional[dict]:
+def _relative_secondary_cv_metadata_for_conformer(
+    secondary_cv_metadata: Optional[dict],
+    topology,
+    topology_to_seed: Optional[dict[int, int]] = None,
+) -> Optional[dict]:
     """Map secondary-CV torsion indices to peptide-only GENPEPT survivor indices."""
     if not isinstance(secondary_cv_metadata, dict) or not secondary_cv_metadata.get("enabled"):
         return None
@@ -179,15 +304,7 @@ def _relative_secondary_cv_metadata_for_conformer(secondary_cv_metadata: Optiona
         if str(key).startswith("_np_"):
             meta.pop(key, None)
     def _map_torsions(torsions):
-        mapped = []
-        for tor in torsions or []:
-            try:
-                rel = tuple(int(x) - first for x in tor)
-            except Exception:
-                continue
-            if len(rel) == 4 and all(0 <= x < n_pep for x in rel):
-                mapped.append(rel)
-        return mapped
+        return map_topology_torsions_to_conformer(torsions, topology, topology_to_seed)
     meta["phi_torsions"] = _map_torsions(meta.get("phi_torsions", []))
     meta["psi_torsions"] = _map_torsions(meta.get("psi_torsions", []))
     if not meta["phi_torsions"] and not meta["psi_torsions"]:
@@ -292,20 +409,13 @@ def load_genpept_conformer_library(
 
     rel_primary = _relative_primary_cv_def_for_conformer(primary_cv_def, topology) if topology is not None else None
     if rel_primary is None and cv_atom1 is not None and cv_atom2 is not None:
-        rel_primary = {
-            "mode": "distance",
-            "label": "terminal distance",
-            "units": "A",
-            "cv_atom1": int(cv_atom1),
-            "cv_atom2": int(cv_atom2),
-            "contact_pairs": [],
-        }
+        rel_primary = _relative_distance_cv_def_for_conformer(cv_atom1, cv_atom2, topology)
     rel_secondary = _relative_secondary_cv_metadata_for_conformer(secondary_cv_metadata, topology) if topology is not None else None
     if resolved_cv_defs_out is not None:
         resolved_cv_defs_out["rel_primary"] = rel_primary
         resolved_cv_defs_out["rel_secondary"] = rel_secondary
-    mode = primary_cv_mode(rel_primary or "distance")
-    units = primary_cv_units(rel_primary or "distance")
+    mode = primary_cv_mode(rel_primary or primary_cv_def or "distance")
+    units = primary_cv_units(rel_primary or primary_cv_def or "distance")
 
     library = []
     skipped = 0
@@ -333,35 +443,45 @@ def load_genpept_conformer_library(
             skipped += 1
             continue
         try:
-            positions_a = []
-            with pdb_path.open() as pf:
-                for line in pf:
-                    if line.startswith(("ATOM", "HETATM")):
-                        x = float(line[30:38])
-                        y = float(line[38:46])
-                        z = float(line[46:54])
-                        positions_a.append([x, y, z])
-            if not positions_a:
+            pos_nm, conformer_atoms = _read_pdb_conformer_atoms(pdb_path)
+            if pos_nm.size == 0:
                 skipped += 1
                 continue
-            pos_nm = np.array(positions_a, dtype=float) / 10.0  # Å → nm
-            if rel_primary is not None:
-                primary_value = primary_cv_value_from_positions_nm(pos_nm, rel_primary, args)
-            elif cv_atom1 is not None and cv_atom2 is not None:
-                primary_value = 10.0 * cv_distance_from_positions_nm(pos_nm, int(cv_atom1), int(cv_atom2))
+            atom_map = _topology_to_conformer_atom_index(topology, conformer_atoms) if topology is not None else None
+            row_rel_primary = (
+                _relative_primary_cv_def_for_conformer(primary_cv_def, topology, atom_map)
+                if topology is not None
+                else rel_primary
+            )
+            if row_rel_primary is None and cv_atom1 is not None and cv_atom2 is not None:
+                row_rel_primary = _relative_distance_cv_def_for_conformer(cv_atom1, cv_atom2, topology, atom_map)
+            row_rel_secondary = (
+                _relative_secondary_cv_metadata_for_conformer(secondary_cv_metadata, topology, atom_map)
+                if topology is not None
+                else rel_secondary
+            )
+            if resolved_cv_defs_out is not None:
+                if resolved_cv_defs_out.get("rel_primary") is None and row_rel_primary is not None:
+                    resolved_cv_defs_out["rel_primary"] = row_rel_primary
+                if resolved_cv_defs_out.get("rel_secondary") is None and row_rel_secondary is not None:
+                    resolved_cv_defs_out["rel_secondary"] = row_rel_secondary
+
+            if row_rel_primary is not None:
+                primary_value = primary_cv_value_from_positions_nm(pos_nm, row_rel_primary, args)
             else:
                 primary_value = float("nan")
             secondary_value = float("nan")
-            if rel_secondary is not None:
-                secondary_value = secondary_structure_score_from_positions_nm(pos_nm, rel_secondary)
+            if row_rel_secondary is not None:
+                secondary_value = secondary_structure_score_from_positions_nm(pos_nm, row_rel_secondary)
             entry = {
                 "primary_cv": mode,
                 "primary_cv_value": float(primary_value),
                 "primary_cv_units": units,
                 "secondary_cv_value": float(secondary_value),
-                "secondary_cv_mode": str((secondary_cv_metadata or {}).get("mode", "none")) if rel_secondary is not None else "none",
+                "secondary_cv_mode": str((secondary_cv_metadata or {}).get("mode", "none")) if row_rel_secondary is not None else "none",
                 "pdb_path": pdb_path,
                 "positions_nm": pos_nm,
+                "topology_to_conformer_atom_index": dict(atom_map or {}),
                 "source_row": dict(row),
             }
             # Legacy reports/tools look for cv_A.  In contact mode this is a
@@ -373,10 +493,15 @@ def load_genpept_conformer_library(
             skipped += 1
     if skipped:
         print(f"WARNING: --seed-conformers-dir: {skipped}/{len(rows)} survivors skipped.")
-    library.sort(key=lambda x: (float(x.get("primary_cv_value", float("inf"))), str(x.get("pdb_path", ""))))
+    def _sort_key(entry):
+        value = float(entry.get("primary_cv_value", float("inf")))
+        if not math.isfinite(value):
+            value = float("inf")
+        return value, str(entry.get("pdb_path", ""))
+    library.sort(key=_sort_key)
     sec_msg = ""
-    if rel_secondary is not None:
-        finite_sec = sum(1 for x in library if math.isfinite(float(x.get("secondary_cv_value", float("nan")))))
+    finite_sec = sum(1 for x in library if math.isfinite(float(x.get("secondary_cv_value", float("nan")))))
+    if finite_sec:
         sec_msg = f", {finite_sec} with secondary-CV scores"
     print(
         f"    GENPEPT conformer library: {len(library)} survivors loaded from {seed_conformers_dir} "

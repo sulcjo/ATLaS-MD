@@ -39,8 +39,10 @@ from .cv import (
 )
 from .io import _json_ready, write_json
 from .seeding import (
+    _read_pdb_conformer_atoms,
     _relative_primary_cv_def_for_conformer,
     _relative_secondary_cv_metadata_for_conformer,
+    _topology_to_conformer_atom_index,
 )
 from .windows import adaptive_contact_force_constants_kcal, adaptive_force_constants_kcal_a2
 
@@ -278,19 +280,8 @@ def _thin_rows_by_stage(rows: list[dict], max_rows: int) -> list[dict]:
 
 
 def _read_pdb_positions_nm(path: Path) -> np.ndarray:
-    coords = []
-    with Path(path).open() as handle:
-        for line in handle:
-            if not line.startswith(("ATOM", "HETATM")):
-                continue
-            try:
-                x = float(line[30:38])
-                y = float(line[38:46])
-                z = float(line[46:54])
-            except Exception:
-                continue
-            coords.append((0.1 * x, 0.1 * y, 0.1 * z))
-    return np.asarray(coords, dtype=float)
+    positions, _atoms = _read_pdb_conformer_atoms(path)
+    return positions
 
 
 def _row_source(row: dict, stage: str) -> str:
@@ -328,17 +319,10 @@ def _score_genpept_rows(
     secondary_cv_metadata: dict,
 ) -> tuple[list[ScoredGenpeptPoint], list[str]]:
     warnings: list[str] = []
-    rel_primary = _relative_primary_cv_def_for_conformer(primary_cv_def, topology)
-    if rel_primary is None:
-        warnings.append("could not map active primary CV to peptide-only GENPEPT atom indices")
-        return [], warnings
-    rel_secondary = _relative_secondary_cv_metadata_for_conformer(secondary_cv_metadata, topology)
-    if secondary_cv_enabled(args) and rel_secondary is None:
-        warnings.append("could not map active secondary CV to peptide-only GENPEPT atom indices")
-        return [], warnings
-
     points: list[ScoredGenpeptPoint] = []
     skipped = 0
+    primary_unmapped = 0
+    secondary_unmapped = 0
     seen_paths: set[str] = set()
     for row in rows:
         path = _resolve_pdb_path(genpept_dir, row.get("_genpept_prior_pdb_path"))
@@ -354,8 +338,19 @@ def _score_genpept_rows(
             continue
         seen_paths.add(dedup_key)
         try:
-            pos_nm = _read_pdb_positions_nm(path)
+            pos_nm, conformer_atoms = _read_pdb_conformer_atoms(path)
             if pos_nm.size == 0:
+                skipped += 1
+                continue
+            atom_map = _topology_to_conformer_atom_index(topology, conformer_atoms)
+            rel_primary = _relative_primary_cv_def_for_conformer(primary_cv_def, topology, atom_map)
+            if rel_primary is None:
+                primary_unmapped += 1
+                skipped += 1
+                continue
+            rel_secondary = _relative_secondary_cv_metadata_for_conformer(secondary_cv_metadata, topology, atom_map)
+            if secondary_cv_enabled(args) and rel_secondary is None:
+                secondary_unmapped += 1
                 skipped += 1
                 continue
             primary_value = primary_cv_value_from_positions_nm(pos_nm, rel_primary, args)
@@ -380,6 +375,10 @@ def _score_genpept_rows(
             source=_row_source(row, stage),
             seed_name=str(row.get("seed_name", path.stem)),
         ))
+    if primary_unmapped:
+        warnings.append(f"could not map active primary CV to peptide-only GENPEPT atom indices for {primary_unmapped} rows")
+    if secondary_unmapped:
+        warnings.append(f"could not map active secondary CV to peptide-only GENPEPT atom indices for {secondary_unmapped} rows")
     if skipped:
         warnings.append(f"skipped {skipped} GENPEPT rows that could not be resolved or scored")
     return points, warnings

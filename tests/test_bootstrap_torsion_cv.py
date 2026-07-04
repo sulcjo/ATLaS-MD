@@ -188,6 +188,97 @@ def test_ensure_bootstrap_torsion_cv_ready_rejects_non_pca_state(tmp_path, monke
         _ensure_bootstrap_torsion_cv_ready(args, out_dir, topology=object(), primary_cv_def={"mode": "distance"})
 
 
+def test_bootstrap_torsion_pca_uses_atom_name_mapping_for_genpept_seeds(tmp_path, monkeypatch):
+    import gareus.cv as cv_mod
+    from gareus.production import _ensure_bootstrap_torsion_cv_ready
+
+    class Atom:
+        def __init__(self, index, name):
+            self.index = index
+            self.name = name
+
+    class Residue:
+        def __init__(self, index, name, atoms):
+            self.index = index
+            self.name = name
+            self._atoms = [Atom(index + i, atom_name) for i, atom_name in enumerate(atoms)]
+
+        def atoms(self):
+            return iter(self._atoms)
+
+    class Topology:
+        def __init__(self):
+            self._residues = [
+                Residue(0, "GLY", ["N", "CA", "C", "O"]),
+                Residue(4, "TYR", ["N", "CA", "C", "O"] + [f"SC{i}" for i in range(44)]),
+                Residue(52, "ASP", ["N", "CA", "C", "O"]),
+            ]
+
+        def residues(self):
+            return iter(self._residues)
+
+    def write_seed(path: Path, bend: float) -> None:
+        rows = [
+            ("N", 1, 0.0, 0.0, 0.0),
+            ("CA", 1, 1.0, 0.0, 0.0),
+            ("C", 1, 2.0, 0.0, 0.0),
+            ("O", 1, 2.4, -0.6, 0.0),
+            ("N", 2, 2.8, 0.2, 0.2 * np.sin(bend)),
+            ("CA", 2, 3.4, 1.0, 0.3 * np.cos(bend)),
+            ("C", 2, 4.6, 0.8, 0.7 * np.sin(bend)),
+            ("O", 2, 5.0, 0.0, 0.4),
+            ("N", 3, 5.3, 1.8, 0.5 * np.cos(bend)),
+            ("CA", 3, 6.5, 1.7, 0.2),
+            ("C", 3, 7.2, 2.6, -0.2),
+            ("O", 3, 6.8, 3.6, -0.6),
+        ]
+        text = "".join(
+            f"ATOM  {i:5d} {name:^4s} GLY A{resid:4d}    "
+            f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00           {name[0]:>2s}\n"
+            for i, (name, resid, x, y, z) in enumerate(rows, start=1)
+        )
+        path.write_text(text, encoding="utf-8")
+
+    seed_dir = tmp_path / "seeds"
+    seed_dir.mkdir()
+    csv_rows = ["survivor_pdb_path\n"]
+    for idx, bend in enumerate(np.linspace(0.2, 2.8, 6)):
+        pdb = seed_dir / f"seed_{idx:03d}.pdb"
+        write_seed(pdb, float(bend))
+        csv_rows.append(f"{pdb.name}\n")
+    (seed_dir / "final_survivor_seeds.csv").write_text("".join(csv_rows), encoding="utf-8")
+
+    phi = [(2, 4, 5, 6)]
+    psi = [(4, 5, 6, 52)]
+    monkeypatch.setattr(cv_mod, "secondary_structure_torsions", lambda topology: (phi, psi))
+    args = _args(
+        secondary_cv="torsion-pca",
+        bootstrap_torsion_source="seeds",
+        bootstrap_torsion_residualize_against_cv1=False,
+        bootstrap_torsion_component=1,
+        bootstrap_torsion_min_seed_count=3,
+        bootstrap_torsion_state_file="",
+        seed_conformers_dir=str(seed_dir),
+        _cv2_auto_centers=False,
+        secondary_cv_centers=None,
+        cv2_centers=None,
+    )
+    primary = {
+        "mode": "nonlocal-contacts",
+        "contact_pairs": [(20, 21, 1.0)],
+        "contact_normalize": True,
+        "_np_r0_nm": 0.36,
+        "_np_beta_nm_inv": 25.0,
+    }
+
+    summary = _ensure_bootstrap_torsion_cv_ready(args, tmp_path / "out", Topology(), primary)
+
+    assert summary["n_samples"] == 6
+    state = TICAResult.load(tmp_path / "out" / "tica" / "bootstrap_torsion_cv.json")
+    assert state.phi_torsion_indices == phi
+    assert state.psi_torsion_indices == psi
+
+
 def test_linear_torsion_state_loader_rejects_wrong_method(tmp_path):
     from gareus.production import _linear_torsion_state_for_mode
 

@@ -144,7 +144,7 @@ def _seed_projection_centers(values: np.ndarray) -> list[float]:
 
 def _ensure_bootstrap_torsion_cv_ready(args, out_dir: Path, topology, primary_cv_def: dict) -> dict:
     from .cv import secondary_structure_torsions
-    from .seeding import load_genpept_conformer_library
+    from .seeding import load_genpept_conformer_library, map_topology_torsions_to_conformer
     from .tica import backbone_dihedral_features, compute_bootstrap_torsion_pca, project_tica1, TICAResult
 
     if secondary_cv_mode(args) != "torsion-pca":
@@ -174,7 +174,21 @@ def _ensure_bootstrap_torsion_cv_ready(args, out_dir: Path, topology, primary_cv
         topology=topology,
         secondary_cv_metadata=None,
     )
-    usable = [entry for entry in library if np.asarray(entry.get("positions_nm", [])).ndim == 2]
+    usable = []
+    for entry in library:
+        pos = np.asarray(entry.get("positions_nm", []), dtype=np.float64)
+        if pos.ndim != 2:
+            continue
+        atom_map = entry.get("topology_to_conformer_atom_index")
+        if isinstance(atom_map, dict):
+            seed_phi_torsions = map_topology_torsions_to_conformer(phi_torsions, topology, atom_map)
+            seed_psi_torsions = map_topology_torsions_to_conformer(psi_torsions, topology, atom_map)
+        else:
+            seed_phi_torsions = map_topology_torsions_to_conformer(phi_torsions, None, None)
+            seed_psi_torsions = map_topology_torsions_to_conformer(psi_torsions, None, None)
+        if len(seed_phi_torsions) != len(phi_torsions) or len(seed_psi_torsions) != len(psi_torsions):
+            continue
+        usable.append((entry, pos, seed_phi_torsions, seed_psi_torsions))
     min_count = int(getattr(args, "bootstrap_torsion_min_seed_count", 20) or 20)
     if len(usable) < min_count:
         raise ValueError(
@@ -183,17 +197,21 @@ def _ensure_bootstrap_torsion_cv_ready(args, out_dir: Path, topology, primary_cv
 
     X = np.vstack(
         [
-            backbone_dihedral_features(np.asarray(entry["positions_nm"], dtype=np.float64), phi_torsions, psi_torsions)
-            for entry in usable
+            backbone_dihedral_features(pos, seed_phi_torsions, seed_psi_torsions)
+            for _entry, pos, seed_phi_torsions, seed_psi_torsions in usable
         ]
     )
     if X.shape[1] != expected_features:
         raise ValueError(f"torsion-pca feature count {X.shape[1]} != expected {expected_features}")
 
-    cv1 = np.asarray([float(entry.get("primary_cv_value", np.nan)) for entry in usable], dtype=np.float64)
+    cv1 = np.asarray([float(entry.get("primary_cv_value", np.nan)) for entry, _pos, _phi, _psi in usable], dtype=np.float64)
     residualize = bool(getattr(args, "bootstrap_torsion_residualize_against_cv1", True))
     if residualize and not np.isfinite(cv1).all():
-        raise ValueError("cv2=torsion-pca residualization requires finite seed primary_cv_value for every usable seed")
+        print(
+            "WARNING: cv2=torsion-pca residualization requested, but seed primary_cv_value "
+            "is unavailable for at least one usable seed; using non-residualized bootstrap torsion PCA."
+        )
+        residualize = False
 
     if state_path.exists():
         result = TICAResult.load(state_path)
@@ -236,6 +254,7 @@ def _ensure_bootstrap_torsion_cv_ready(args, out_dir: Path, topology, primary_cv
         "method": str(result.method),
         "n_samples": int(result.n_samples),
         "explained_variance_ratio": float(explained),
+        "residualized_against_cv1": bool(residualize),
         "seed_projection_min": float(np.min(projections)),
         "seed_projection_max": float(np.max(projections)),
         "seed_projection_centers": [float(x) for x in getattr(args, "secondary_cv_centers", []) or []],
