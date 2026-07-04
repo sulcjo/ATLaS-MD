@@ -166,6 +166,29 @@ class SlurmMonitorTests(unittest.TestCase):
 
 
 class GaMDBoostSummaryTests(unittest.TestCase):
+    def test_peptide_state_live_boost_values_reads_progress_tail(self):
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td) / "PEP_2d_run"
+            _append_jsonl(
+                run_dir / "progress.jsonl",
+                {
+                    "event": "distances",
+                    "distances": [
+                        {"primary_cv_value": 0.1, "secondary_cv": 0.2, "gamd_boost_total_kcal_mol": 1.0},
+                        {"primary_cv_value": 0.3, "secondary_cv": 0.4, "gamd_boost_total_kcal_mol": 2.0},
+                    ],
+                },
+                {
+                    "event": "distances",
+                    "distances": [
+                        {"primary_cv_value": 0.5, "secondary_cv": 0.6, "gamd_boost_total_kcal_mol": 3.0},
+                    ],
+                },
+            )
+            state = PeptideState.from_rundir(run_dir)
+
+            self.assertEqual(state.live_boost_values(2), [2.0, 3.0])
+
     def test_boost_values_from_entries_keeps_recent_distances_values_only(self):
         entries = [
             {"event": "progress", "gamd_boost_mean_kcal_mol": 3.0},

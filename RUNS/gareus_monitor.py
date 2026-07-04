@@ -2100,6 +2100,13 @@ class PeptideState:
                 for e in entries
                 if e.get("aggregate_sim_time_ns") is not None]
 
+    def live_boost_values(self, n: int = 4000) -> list[float]:
+        p = self.run_dir / "progress.jsonl"
+        if not p.exists():
+            return []
+        entries = tail_jsonl(p, max(200, n), chunk_bytes=1 << 20)
+        return boost_values_from_entries(entries, limit=n)
+
     _LIVE_FIELDS = (
         "phase", "step", "total_steps", "percent", "fraction",
         "aggregate_ns_per_day", "ns_per_day", "aggregate_sim_time_ns",
