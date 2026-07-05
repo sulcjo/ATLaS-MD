@@ -12,7 +12,9 @@ from gareus_monitor import (
     boost_values_from_entries,
     build_run_snapshot,
     discover,
+    group_boost_values_by_window,
     match_slurm_jobs_to_states,
+    parse_distances_samples,
     parse_squeue_rows,
     render_detail,
     summarize_boost_values,
@@ -167,6 +169,37 @@ class SlurmMonitorTests(unittest.TestCase):
 
 
 class GaMDBoostSummaryTests(unittest.TestCase):
+    def test_parse_distances_samples_preserves_explicit_window_fields(self):
+        samples = parse_distances_samples([
+            {
+                "event": "distances",
+                "distances": [
+                    {
+                        "primary_cv_value": 0.1,
+                        "secondary_cv": 0.2,
+                        "gamd_boost_total_kcal_mol": 1.0,
+                        "window": 7,
+                        "replica": 3,
+                    },
+                ],
+            },
+        ])
+
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(samples[0]["window"], 7)
+        self.assertEqual(samples[0]["replica"], 3)
+
+    def test_group_boost_values_by_window_uses_only_explicit_ids(self):
+        groups = group_boost_values_by_window([
+            {"boost": 1.0, "window": 1},
+            {"boost": 2.0, "window": 1},
+            {"boost": 4.0, "state_id": 9},
+            {"boost": 5.0},
+            {"boost": None, "window": 2},
+        ])
+
+        self.assertEqual(groups, [("W1", [1.0, 2.0]), ("S9", [4.0])])
+
     def test_peptide_state_live_boost_values_reads_progress_tail(self):
         with tempfile.TemporaryDirectory() as td:
             run_dir = Path(td) / "PEP_2d_run"

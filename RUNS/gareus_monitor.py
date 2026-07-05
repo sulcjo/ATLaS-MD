@@ -1227,9 +1227,46 @@ def parse_distances_samples(entries: list) -> list:
                     "cv2":   float(cv2),
                     "ubias": float(w.get("umbrella_bias_kcal_mol") or 0.0),
                     "boost": None if boost is None else float(boost),
+                    "window": w.get("window"),
+                    "window_index": w.get("window_index"),
+                    "state_id": w.get("state_id"),
+                    "replica": w.get("replica"),
                 })
             except (TypeError, ValueError):
                 continue
+    return out
+
+
+def _sample_window_label(sample: dict) -> Optional[str]:
+    if sample.get("window") is not None:
+        return f"W{sample['window']}"
+    if sample.get("window_index") is not None:
+        return f"W{sample['window_index']}"
+    if sample.get("state_id") is not None:
+        return f"S{sample['state_id']}"
+    if sample.get("replica") is not None:
+        return f"R{sample['replica']}"
+    return None
+
+
+def group_boost_values_by_window(samples: list[dict], limit_per_window: int = 400) -> list[tuple[str, list[float]]]:
+    grouped: dict[str, list[float]] = {}
+    order: list[str] = []
+    for sample in samples:
+        label = _sample_window_label(sample)
+        boost = sample.get("boost")
+        if label is None or not isinstance(boost, (int, float)) or not math.isfinite(float(boost)):
+            continue
+        if label not in grouped:
+            grouped[label] = []
+            order.append(label)
+        grouped[label].append(float(boost))
+    out = []
+    for label in order:
+        vals = grouped[label]
+        if limit_per_window > 0:
+            vals = vals[-limit_per_window:]
+        out.append((label, vals))
     return out
 
 
