@@ -400,6 +400,64 @@ class GaMDBoostSummaryTests(unittest.TestCase):
 
             self.assertIn("per-window boost dist", out)
             self.assertIn("no explicit window ids", out)
+            self.assertNotIn("explicit window ids present but no usable boost values", out)
+
+    def test_render_detail_reports_unavailable_when_explicit_ids_have_no_usable_boost_values(self):
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td) / "PEP_2d_run"
+            _append_jsonl(
+                run_dir / "progress.jsonl",
+                {
+                    "event": "progress",
+                    "phase": "gareus_production",
+                    "percent": 50.0,
+                    "aggregate_sim_time_ns": 4.0,
+                    "wall_time_s": 2000.0,
+                },
+                {
+                    "event": "distances",
+                    "distances": [
+                        {"primary_cv_value": 0.1, "secondary_cv": 0.2, "gamd_boost_total_kcal_mol": None, "window": 7},
+                        {"primary_cv_value": 0.3, "secondary_cv": 0.4, "gamd_boost_total_kcal_mol": float("nan"), "window": 7},
+                    ],
+                },
+            )
+            state = PeptideState.from_rundir(run_dir)
+            state.refresh()
+
+            out = render_detail(state)
+
+            self.assertIn("per-window boost dist", out)
+            self.assertIn("explicit window ids present but no usable boost values", out)
+            self.assertNotIn("no explicit window ids", out)
+
+    def test_render_detail_hides_per_window_section_after_terminal_progress(self):
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td) / "PEP_2d_run"
+            _append_jsonl(
+                run_dir / "progress.jsonl",
+                {
+                    "event": "progress",
+                    "phase": "gareus_production",
+                    "percent": 100.0,
+                    "aggregate_sim_time_ns": 4.0,
+                    "wall_time_s": 2000.0,
+                },
+                {
+                    "event": "distances",
+                    "distances": [
+                        {"primary_cv_value": 0.1, "secondary_cv": 0.2, "gamd_boost_total_kcal_mol": 1.0, "window": 1},
+                    ],
+                },
+                {"event": "run_complete", "wall_time_s": 2001.0},
+            )
+            state = PeptideState.from_rundir(run_dir)
+            state.refresh()
+
+            out = render_detail(state)
+
+            self.assertNotIn("per-window boost dist", out)
+            self.assertNotIn("W1", out)
 
     def test_render_detail_reports_no_live_boost_samples_when_absent(self):
         with tempfile.TemporaryDirectory() as td:

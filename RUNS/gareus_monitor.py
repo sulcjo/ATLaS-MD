@@ -1301,6 +1301,21 @@ def _live_boost_window_groups(state, n: int = 4000, limit_per_window: int = 400)
     return group_boost_values_by_window(samples[-n:], limit_per_window=limit_per_window)
 
 
+def _live_boost_window_view(state, n: int = 4000, limit_per_window: int = 400):
+    state._load_progress()
+    state._load_runtime_pool()
+    if not state._progress_has_uncommitted_live_ns():
+        return None
+    snap = state.live_snapshot()
+    samples = (snap.get("_dist_samples") or [])[-n:]
+    groups = group_boost_values_by_window(samples, limit_per_window=limit_per_window)
+    has_explicit_ids = any(_sample_window_label(sample) is not None for sample in samples)
+    return {
+        "groups": groups,
+        "has_explicit_ids": has_explicit_ids,
+    }
+
+
 def boost_histogram_bins(values: list[float], bins: int = 16) -> list[int]:
     if not values:
         return []
@@ -3292,24 +3307,30 @@ def render_detail(s: PeptideState) -> str:
         lines.append("│" + _fill(c(A.DIM) + stats_line + A.RESET, inner) + "│")
     else:
         lines.append("│" + _fill(c(A.DIM) + "  (no live boost samples)" + A.RESET, inner) + "│")
-    lines.append("│" + _fill(c(A.DIM) + "  per-window boost dist" + A.RESET, inner) + "│")
-    groups = _live_boost_window_groups(s)
-    if groups:
-        shown = max(1, min(len(groups), 6))
-        hist_w = max(8, min(18, inner - 28))
-        for label, vals in groups[:shown]:
-            win_stats = summarize_boost_values(vals)
-            row = (
-                f"  {label:<4} "
-                + plain(render_boost_histogram(vals, width=hist_w))
-                + f"  n={win_stats['n']} p50={win_stats['p50']:.1f} p90={win_stats['p90']:.1f}"
-            )
-            lines.append("│" + _fill(c(A.DIM) + row + A.RESET, inner) + "│")
-        hidden = len(groups) - shown
-        if hidden > 0:
-            lines.append("│" + _fill(c(A.DIM) + f"  ... {hidden} window row(s) hidden" + A.RESET, inner) + "│")
-    else:
-        lines.append("│" + _fill(c(A.DIM) + "  per-window boost dist unavailable: no explicit window ids in live payload" + A.RESET, inner) + "│")
+    window_view = _live_boost_window_view(s)
+    if window_view is not None:
+        lines.append("│" + _fill(c(A.DIM) + "  per-window boost dist" + A.RESET, inner) + "│")
+        groups = window_view["groups"]
+        if groups:
+            shown = max(1, min(len(groups), 6))
+            hist_w = max(8, min(18, inner - 28))
+            for label, vals in groups[:shown]:
+                win_stats = summarize_boost_values(vals)
+                row = (
+                    f"  {label:<4} "
+                    + plain(render_boost_histogram(vals, width=hist_w))
+                    + f"  n={win_stats['n']} p50={win_stats['p50']:.1f} p90={win_stats['p90']:.1f}"
+                )
+                lines.append("│" + _fill(c(A.DIM) + row + A.RESET, inner) + "│")
+            hidden = len(groups) - shown
+            if hidden > 0:
+                lines.append("│" + _fill(c(A.DIM) + f"  ... {hidden} window row(s) hidden" + A.RESET, inner) + "│")
+        else:
+            if window_view["has_explicit_ids"]:
+                note = "  per-window boost dist unavailable: explicit window ids present but no usable boost values"
+            else:
+                note = "  per-window boost dist unavailable: no explicit window ids in live payload"
+            lines.append("│" + _fill(c(A.DIM) + note + A.RESET, inner) + "│")
     lines += [blank(), sep]
 
     # ns history sparkline
