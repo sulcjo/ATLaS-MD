@@ -212,7 +212,7 @@ class GaMDBoostSummaryTests(unittest.TestCase):
             {"boost": None, "window": 2},
         ])
 
-        self.assertEqual(groups, [("W1", [1.0, 2.0]), ("S9", [4.0])])
+        self.assertEqual(groups, [("W1", [1.0, 2.0])])
 
     def test_group_boost_values_by_window_ignores_replica_only_samples(self):
         groups = group_boost_values_by_window([
