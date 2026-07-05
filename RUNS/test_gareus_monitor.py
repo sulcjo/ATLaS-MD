@@ -1,6 +1,8 @@
+import io
 import json
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -9,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gareus_monitor import (
     PeptideState,
     _plan_yaml_path,
+    _rich_detail_panel,
     boost_values_from_entries,
     build_run_snapshot,
     discover,
@@ -31,6 +34,14 @@ def _append_jsonl(path: Path, *payloads: dict) -> None:
     with path.open("a") as f:
         for payload in payloads:
             f.write(json.dumps(payload) + "\n")
+
+
+def _render_rich(renderable) -> str:
+    from rich.console import Console
+
+    console = Console(file=io.StringIO(), width=160, record=True, color_system=None, force_terminal=False)
+    console.print(renderable)
+    return console.export_text()
 
 
 class PeptideStateBudgetTests(unittest.TestCase):
@@ -482,6 +493,62 @@ class GaMDBoostSummaryTests(unittest.TestCase):
 
             self.assertIn("GaMD boost dist", out)
             self.assertIn("no live boost samples", out)
+
+    def test_rich_detail_panel_shows_per_window_boost_section_when_ids_exist(self):
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td) / "PEP_2d_run"
+            _append_jsonl(
+                run_dir / "progress.jsonl",
+                {
+                    "event": "progress",
+                    "phase": "gareus_production",
+                    "percent": 50.0,
+                    "aggregate_sim_time_ns": 4.0,
+                    "wall_time_s": time.time(),
+                },
+                {
+                    "event": "distances",
+                    "distances": [
+                        {"primary_cv_value": 0.1, "secondary_cv": 0.2, "gamd_boost_total_kcal_mol": 1.0, "window": 1},
+                        {"primary_cv_value": 0.3, "secondary_cv": 0.4, "gamd_boost_total_kcal_mol": 2.0, "window": 2},
+                    ],
+                },
+            )
+            state = PeptideState.from_rundir(run_dir)
+            state.refresh()
+            panel = _rich_detail_panel(state, build_run_snapshot(state))
+            rendered = _render_rich(panel)
+
+            self.assertIn("per-window boost dist", rendered)
+            self.assertIn("W1", rendered)
+            self.assertIn("W2", rendered)
+
+    def test_rich_detail_panel_shows_unavailable_note_without_ids(self):
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td) / "PEP_2d_run"
+            _append_jsonl(
+                run_dir / "progress.jsonl",
+                {
+                    "event": "progress",
+                    "phase": "gareus_production",
+                    "percent": 50.0,
+                    "aggregate_sim_time_ns": 4.0,
+                    "wall_time_s": time.time(),
+                },
+                {
+                    "event": "distances",
+                    "distances": [
+                        {"primary_cv_value": 0.1, "secondary_cv": 0.2, "gamd_boost_total_kcal_mol": 1.0},
+                    ],
+                },
+            )
+            state = PeptideState.from_rundir(run_dir)
+            state.refresh()
+            panel = _rich_detail_panel(state, build_run_snapshot(state))
+            rendered = _render_rich(panel)
+
+            self.assertIn("per-window boost dist", rendered)
+            self.assertIn("no explicit window ids", rendered)
 
 
 class DiscoveryTests(unittest.TestCase):

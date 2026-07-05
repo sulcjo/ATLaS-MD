@@ -4056,14 +4056,22 @@ def _rich_detail_panel(state, snap: RunSnapshot):
         diag.add_row("info", "ok", "No monitor diagnostics", style="dim")
 
     msg = Text(snap.latest_message[:180] if snap.latest_message else "no latest message", style="dim")
-    body = Group(
+    rows = [
         header,
         _rich_bar_text(snap.global_percent, width=42),
         _rich_timeline_text(state, width=54),
         metrics,
         diag,
         msg,
-    )
+        _rich_boost_summary_group(state),
+    ]
+    window_table = _rich_window_boost_table(state)
+    if window_table is not None:
+        rows.extend([
+            _rich_section_title("per-window boost dist"),
+            window_table,
+        ])
+    body = Group(*rows)
     return Panel(body, title="selected run", border_style=_diag_rich_style(snap.top_issue))
 
 
@@ -4097,6 +4105,83 @@ def _rich_ansi_view(ansi_text: str, title: str, border_style: str = "cyan"):
     from rich.text import Text
 
     return Panel(Text.from_ansi(ansi_text), title=title, border_style=border_style)
+
+
+def _rich_section_title(label: str):
+    from rich.text import Text
+
+    return Text("  " + label, style="dim")
+
+
+def _rich_boost_summary_group(state):
+    from rich.console import Group
+    from rich.text import Text
+
+    mu = state.gamd_boost
+    sd = state.gamd_boost_sd
+    anh = state.gamd_anharmonicity
+    ub = state.ubias_mean
+    parts = []
+    if mu is not None:
+        parts.append(f"boost mu={mu:.1f}")
+    if sd is not None:
+        parts.append(f"boost sigma={sd:.1f}")
+    if anh is not None:
+        parts.append(f"anharmonicity={anh:.2f}")
+    if ub is not None:
+        parts.append(f"umbrella bias={ub:.1f}")
+
+    rows = [_rich_section_title("GaMD boost dist")]
+    if parts:
+        rows.append(Text("  " + "  ".join(parts), style="dim"))
+
+    boost_vals = state.live_boost_values()
+    stats = summarize_boost_values(boost_vals)
+    if stats:
+        rows.append(Text("  " + plain(render_boost_histogram(boost_vals, width=24)), style="cyan"))
+        rows.append(Text(
+            "  "
+            + f"n={stats['n']}  min={stats['min']:.1f}  p10={stats['p10']:.1f}"
+            + f"  p50={stats['p50']:.1f}  p90={stats['p90']:.1f}  max={stats['max']:.1f}",
+            style="dim",
+        ))
+    else:
+        rows.append(Text("  (no live boost samples)", style="dim"))
+    return Group(*rows)
+
+
+def _rich_window_boost_table(state):
+    from rich.table import Table
+
+    view = _live_boost_window_view(state)
+    if view is None:
+        return None
+
+    groups = view["groups"]
+    table = Table(box=None, expand=True, pad_edge=False, show_header=False)
+    table.add_column("window", no_wrap=True)
+    table.add_column("hist")
+    table.add_column("stats")
+    if not groups:
+        if view["has_explicit_ids"]:
+            note = "per-window boost dist unavailable: explicit window ids present but no usable boost values"
+        else:
+            note = "per-window boost dist unavailable: no explicit window ids in live payload"
+        table.add_row("—", "—", note, style="dim")
+        return table
+
+    shown = max(1, min(len(groups), 8))
+    for label, vals in groups[:shown]:
+        stats = summarize_boost_values(vals)
+        table.add_row(
+            label,
+            plain(render_boost_histogram(vals, width=16)),
+            f"n={stats['n']}  p50={stats['p50']:.1f}  p90={stats['p90']:.1f}",
+        )
+    hidden = len(groups) - shown
+    if hidden > 0:
+        table.add_row("…", "", f"{hidden} window row(s) hidden", style="dim")
+    return table
 
 
 def _rich_controls(mode: str):
