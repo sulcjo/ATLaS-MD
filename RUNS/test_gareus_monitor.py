@@ -1,4 +1,5 @@
 import io
+import importlib.util
 import json
 import sys
 import tempfile
@@ -22,6 +23,8 @@ from gareus_monitor import (
     render_detail,
     summarize_boost_values,
 )
+
+_HAS_RICH = importlib.util.find_spec("rich") is not None
 
 
 def _write_json(path: Path, payload: dict) -> None:
@@ -494,6 +497,7 @@ class GaMDBoostSummaryTests(unittest.TestCase):
             self.assertIn("GaMD boost dist", out)
             self.assertIn("no live boost samples", out)
 
+    @unittest.skipUnless(_HAS_RICH, "rich not installed")
     def test_rich_detail_panel_shows_per_window_boost_section_when_ids_exist(self):
         with tempfile.TemporaryDirectory() as td:
             run_dir = Path(td) / "PEP_2d_run"
@@ -523,6 +527,7 @@ class GaMDBoostSummaryTests(unittest.TestCase):
             self.assertIn("W1", rendered)
             self.assertIn("W2", rendered)
 
+    @unittest.skipUnless(_HAS_RICH, "rich not installed")
     def test_rich_detail_panel_shows_unavailable_note_without_ids(self):
         with tempfile.TemporaryDirectory() as td:
             run_dir = Path(td) / "PEP_2d_run"
