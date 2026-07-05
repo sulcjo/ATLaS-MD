@@ -1244,8 +1244,6 @@ def _sample_window_label(sample: dict) -> Optional[str]:
         return f"W{sample['window_index']}"
     if sample.get("state_id") is not None:
         return f"S{sample['state_id']}"
-    if sample.get("replica") is not None:
-        return f"R{sample['replica']}"
     return None
 
 

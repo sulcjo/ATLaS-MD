@@ -200,6 +200,15 @@ class GaMDBoostSummaryTests(unittest.TestCase):
 
         self.assertEqual(groups, [("W1", [1.0, 2.0]), ("S9", [4.0])])
 
+    def test_group_boost_values_by_window_ignores_replica_only_samples(self):
+        groups = group_boost_values_by_window([
+            {"boost": 3.0, "replica": 7},
+            {"boost": 4.0, "replica": 7, "window": None},
+            {"boost": 5.0, "window": 2},
+        ])
+
+        self.assertEqual(groups, [("W2", [5.0])])
+
     def test_peptide_state_live_boost_values_reads_progress_tail(self):
         with tempfile.TemporaryDirectory() as td:
             run_dir = Path(td) / "PEP_2d_run"
