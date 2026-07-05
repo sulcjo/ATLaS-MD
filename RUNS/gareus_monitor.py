@@ -1295,6 +1295,12 @@ def summarize_boost_values(values: list[float]) -> dict:
     }
 
 
+def _live_boost_window_groups(state, n: int = 4000, limit_per_window: int = 400) -> list[tuple[str, list[float]]]:
+    snap = state.live_snapshot()
+    samples = snap.get("_dist_samples") or []
+    return group_boost_values_by_window(samples[-n:], limit_per_window=limit_per_window)
+
+
 def boost_histogram_bins(values: list[float], bins: int = 16) -> list[int]:
     if not values:
         return []
@@ -3286,6 +3292,24 @@ def render_detail(s: PeptideState) -> str:
         lines.append("│" + _fill(c(A.DIM) + stats_line + A.RESET, inner) + "│")
     else:
         lines.append("│" + _fill(c(A.DIM) + "  (no live boost samples)" + A.RESET, inner) + "│")
+    lines.append("│" + _fill(c(A.DIM) + "  per-window boost dist" + A.RESET, inner) + "│")
+    groups = _live_boost_window_groups(s)
+    if groups:
+        shown = max(1, min(len(groups), 6))
+        hist_w = max(8, min(18, inner - 28))
+        for label, vals in groups[:shown]:
+            win_stats = summarize_boost_values(vals)
+            row = (
+                f"  {label:<4} "
+                + plain(render_boost_histogram(vals, width=hist_w))
+                + f"  n={win_stats['n']} p50={win_stats['p50']:.1f} p90={win_stats['p90']:.1f}"
+            )
+            lines.append("│" + _fill(c(A.DIM) + row + A.RESET, inner) + "│")
+        hidden = len(groups) - shown
+        if hidden > 0:
+            lines.append("│" + _fill(c(A.DIM) + f"  ... {hidden} window row(s) hidden" + A.RESET, inner) + "│")
+    else:
+        lines.append("│" + _fill(c(A.DIM) + "  per-window boost dist unavailable: no explicit window ids in live payload" + A.RESET, inner) + "│")
     lines += [blank(), sep]
 
     # ns history sparkline
