@@ -29,8 +29,17 @@ def test_gamd_multiwindow_recon_flags_have_expected_defaults():
     from gareus.cli import build_gareus_parser
     parser = build_gareus_parser()
     assert parser.get_default("gamd_multiwindow_recon_prep_steps") == 2000
+    assert parser.get_default("gamd_multiwindow_recon_cmd_steps") == 20000
     assert parser.get_default("gamd_multiwindow_recon_steps") == 20000
     assert parser.get_default("gamd_multiwindow_recon_report_interval") == 0
+
+
+def test_gamd_boosted_calibration_flags_default_on():
+    from gareus.cli import build_gareus_parser
+    parser = build_gareus_parser()
+    # Boosted self-consistent calibration is on by default.
+    assert parser.get_default("gamd_recon_boosted_iters") == 4
+    assert parser.get_default("gamd_recon_boosted_tol") == 0.05
 
 
 def test_gamd_multiwindow_recon_flags_are_overridable():
@@ -39,9 +48,15 @@ def test_gamd_multiwindow_recon_flags_are_overridable():
     args = parser.parse_args([
         "--seq", "GYDPETGTWG",
         "--gamd-multiwindow-recon-prep-steps", "500",
+        "--gamd-multiwindow-recon-cmd-steps", "3000",
         "--gamd-multiwindow-recon-steps", "5000",
         "--gamd-multiwindow-recon-report-interval", "100",
+        "--gamd-recon-boosted-iters", "2",
+        "--gamd-recon-boosted-tol", "0.1",
     ])
     assert args.gamd_multiwindow_recon_prep_steps == 500
+    assert args.gamd_multiwindow_recon_cmd_steps == 3000
     assert args.gamd_multiwindow_recon_steps == 5000
     assert args.gamd_multiwindow_recon_report_interval == 100
+    assert args.gamd_recon_boosted_iters == 2
+    assert args.gamd_recon_boosted_tol == 0.1

@@ -598,7 +598,10 @@ Default GaMD parameters:
     --production-steps     = 500,000      (production per replica)
     --gamd-averaging-window = 5,000 steps
     --gamd-multiwindow-recon-prep-steps = 2000     (unrecorded relaxation per window before recon stats collection)
-    --gamd-multiwindow-recon-steps      = 20000    (per-window recon budget for joint-envelope GaMD calibration; short by design)
+    --gamd-multiwindow-recon-cmd-steps  = 20000    (per-window conventional-MD SEED recon, boost OFF; short bootstrap of Vmax/Vmin/sigmaV)
+    --gamd-multiwindow-recon-steps      = 20000    (per-window BOOSTED recon steps per self-consistency iteration; boost ON)
+    --gamd-recon-boosted-iters          = 4        (max boosted self-consistency iters; 0 = legacy cMD-only calibration)
+    --gamd-recon-boosted-tol            = 0.05     (relative sigmaV convergence tolerance for the boosted loop)
     --gamd-multiwindow-recon-report-interval = 0   (0 = auto cadence; see --gamd-multiwindow-recon-steps)
     cmd/equil prep steps   = 5,000/5,000  (hardcoded internal defaults)
 
@@ -614,6 +617,21 @@ The package uses an article-style shared GaMD setup:
 It does not run a full independent GaMD calibration for each umbrella window.
 The intention is a common GaMD boost setup with different umbrella thermodynamic
 states.
+
+The shared boost is calibrated in two stages so its parameters match the
+BOOSTED production ensemble rather than an unboosted one (a mismatch inflates
+boost anharmonicity and breaks cumulant2 reweighting):
+
+    a. cMD seed recon (boost OFF, --gamd-multiwindow-recon-cmd-steps) to get an
+       initial Vmax/Vmin/Vavg/sigmaV envelope pooled over all initial windows.
+    b. Boosted recon (boost ON, --gamd-multiwindow-recon-steps per iteration),
+       re-measuring and re-pooling sigmaV, iterating to self-consistency
+       (--gamd-recon-boosted-iters / --gamd-recon-boosted-tol). The boost
+       broadens the sampled energy, so sigmaV grows until it settles at a fixed
+       point; the converged Vmax/Vmin/Vavg/sigmaV/k0/threshold are then frozen.
+
+The per-group sigmaV trace, convergence flag, and a warning when k0 saturates at
+1.0 (sigma0 too large to bind) are recorded in shared_gamd_setup_globals.json.
 
 Relevant outputs include:
 

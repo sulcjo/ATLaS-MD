@@ -176,3 +176,125 @@ def test_overwrite_physics_globals_raises_when_no_keys_match():
             PooledEnvelope(group="NonBonded", vmax=1.0, vmin=0.0, vavg=0.5, sigmav=0.1, n_total=10, n_windows=2),
             sigma0=6.0,
         )})
+
+
+from gareus.gamd_calibration import (
+    ConvergenceResult,
+    envelope_converged,
+    run_calibration_convergence,
+)
+
+_BOOST = "lower-dual-nonbonded-dihedral"
+_SIGMA0 = 20.92  # kJ/mol (= 5 kcal/mol), formula is unit-agnostic
+
+
+def _env(sigmav, group="Dihedral", vmax=530.0, vmin=390.0, vavg=440.0, n_total=1200, n_windows=6):
+    return PooledEnvelope(
+        group=group, vmax=vmax, vmin=vmin, vavg=vavg, sigmav=sigmav,
+        n_total=n_total, n_windows=n_windows,
+    )
+
+
+def _measure_from_sequence(sigmav_seq, group="Dihedral"):
+    """measure_fn(calibrations) -> {group: PooledEnvelope} replaying scripted sigmaV."""
+    it = iter(sigmav_seq)
+
+    def measure(_calibrations):
+        return {group: _env(next(it), group=group)}
+
+    return measure
+
+
+def _measure_multigroup(seq_by_group):
+    """measure_fn(calibrations) -> {group: PooledEnvelope} for several groups at once.
+
+    seq_by_group maps group -> list of per-iteration sigmaV (one MD pass yields
+    every group's value simultaneously).
+    """
+    iters = {g: iter(seq) for g, seq in seq_by_group.items()}
+
+    def measure(_calibrations):
+        return {g: _env(next(it), group=g) for g, it in iters.items()}
+
+    return measure
+
+
+def _sigma0_map(*groups):
+    return {g: _SIGMA0 for g in groups}
+
+
+def test_envelope_converged_true_below_tol_false_above():
+    prev = _env(30.0)
+    assert envelope_converged(prev, _env(30.3), tol=0.05) is True   # 1.0% change
+    assert envelope_converged(prev, _env(33.0), tol=0.05) is False  # 10% change
+
+
+def test_envelope_converged_false_when_prev_sigmav_nonpositive():
+    assert envelope_converged(_env(0.0), _env(5.0), tol=0.05) is False
+
+
+def test_run_calibration_convergence_monotone_approach_reaches_fixed_point():
+    seed = {"Dihedral": _env(20.0)}
+    measure = _measure_from_sequence([26.0, 29.0, 30.5, 30.7])
+    out = run_calibration_convergence(measure, _BOOST, _sigma0_map("Dihedral"), seed, max_iters=6, tol=0.05)
+    result = out["Dihedral"]
+    assert isinstance(result, ConvergenceResult)
+    assert result.converged is True
+    assert result.iters == 4
+    assert result.sigmav_trace == [20.0, 26.0, 29.0, 30.5, 30.7]
+    # final calibration is computed from the last measured envelope
+    assert result.calibration.sigmav == pytest.approx(30.7)
+    assert result.calibration.k0 == pytest.approx(
+        compute_group_calibration(_BOOST, _env(30.7), _SIGMA0).k0
+    )
+
+
+def test_run_calibration_convergence_oscillation_hits_max_iters():
+    seed = {"Dihedral": _env(25.0)}
+    measure = _measure_from_sequence([30.0, 20.0, 30.0, 20.0])
+    out = run_calibration_convergence(measure, _BOOST, _sigma0_map("Dihedral"), seed, max_iters=4, tol=0.05)
+    result = out["Dihedral"]
+    assert result.converged is False
+    assert result.iters == 4
+    assert result.sigmav_trace == [25.0, 30.0, 20.0, 30.0, 20.0]
+
+
+def test_run_calibration_convergence_already_converged_single_iteration():
+    seed = {"Dihedral": _env(30.0)}
+    measure = _measure_from_sequence([30.3])
+    out = run_calibration_convergence(measure, _BOOST, _sigma0_map("Dihedral"), seed, max_iters=6, tol=0.05)
+    result = out["Dihedral"]
+    assert result.converged is True
+    assert result.iters == 1
+    assert result.sigmav_trace == [30.0, 30.3]
+
+
+def test_run_calibration_convergence_joint_waits_for_slowest_group():
+    seed = {"Dihedral": _env(20.0, "Dihedral"), "NonBonded": _env(20.0, "NonBonded")}
+    # Dihedral converges by iter 2, but NonBonded only by iter 3; loop runs until both.
+    measure = _measure_multigroup({
+        "Dihedral": [30.0, 30.5, 30.6],
+        "NonBonded": [30.0, 25.0, 25.5],
+    })
+    out = run_calibration_convergence(measure, _BOOST, _sigma0_map("Dihedral", "NonBonded"), seed, max_iters=6, tol=0.05)
+    assert out["Dihedral"].iters == 3
+    assert out["NonBonded"].iters == 3
+    assert out["Dihedral"].converged is True
+    assert out["NonBonded"].converged is True
+    assert out["Dihedral"].sigmav_trace == [20.0, 30.0, 30.5, 30.6]
+    assert out["NonBonded"].sigmav_trace == [20.0, 30.0, 25.0, 25.5]
+
+
+def test_run_calibration_convergence_max_iters_zero_is_legacy_cmd_only():
+    seed = {"Dihedral": _env(18.98)}
+
+    def measure(_c):
+        raise AssertionError("measure_fn must not be called when max_iters=0")
+
+    out = run_calibration_convergence(measure, _BOOST, _sigma0_map("Dihedral"), seed, max_iters=0, tol=0.05)
+    result = out["Dihedral"]
+    assert result.iters == 0
+    assert result.sigmav_trace == [18.98]
+    assert result.calibration.k0 == pytest.approx(
+        compute_group_calibration(_BOOST, _env(18.98), _SIGMA0).k0
+    )

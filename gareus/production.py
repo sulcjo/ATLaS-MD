@@ -2728,20 +2728,43 @@ def run_multiwindow_gamd_recon(
     centers_nm, ks_kj_nm2, secondary_cv_centers, secondary_cv_ks_kj,
     window_start_positions, window_start_velocities, equil_state,
     progress: Optional[GuiProgressSink] = None,
+    *,
+    integrator_kind: str = "cmd",
+    seed_globals: Optional[dict] = None,
+    recon_steps: Optional[int] = None,
+    prep_steps: Optional[int] = None,
+    phase_label: str = "gamd_multiwindow_recon",
 ) -> dict[str, "PooledEnvelope"]:
-    """Recon every initial/pilot window's local potential energy under its own
-    umbrella bias, then pool per boost-group across all windows.
+    """Recon every initial/pilot window's boost-group potential energy under its
+    own umbrella bias, then pool per boost-group across all windows.
 
     `base_system` already has the primary umbrella force (and secondary CV
     force, if enabled) added -- deserialize_system(openmm, base_system) gives
     each window a ready-to-bias system copy with no further force additions
     needed (mirrors how production replicas are built at the call site below).
+
+    `integrator_kind` selects the stepping integrator:
+      - "cmd": plain conventional MD (boost OFF) -- used to seed the boost with
+        an initial Vmax/Vmin/Vavg/sigmaV (the GaMD integrator needs starting
+        extrema before it can boost).
+      - "gamd": the GaMD boost integrator seeded with `seed_globals` (a full
+        integrator-globals dict, expected to carry the fixed-boost production
+        `stage`). This measures sigmaV under the boost the run will actually use.
+    The measured potential energy is the boost-group force-group energy in both
+    cases (the boost is applied by the integrator, not as a separate force, so
+    getState(groups=...) returns the true group energy regardless of boost).
     """
     from gareus.gamd_calibration import WelfordAccumulator, pool_window_stats
 
     nwin = int(len(centers_nm))
-    prep_steps = int(getattr(args, "gamd_multiwindow_recon_prep_steps", 2000) or 0)
-    recon_steps = int(getattr(args, "gamd_multiwindow_recon_steps", 20000) or 0)
+    if prep_steps is None:
+        prep_steps = int(getattr(args, "gamd_multiwindow_recon_prep_steps", 2000) or 0)
+    else:
+        prep_steps = int(prep_steps)
+    if recon_steps is None:
+        recon_steps = int(getattr(args, "gamd_multiwindow_recon_steps", 20000) or 0)
+    else:
+        recon_steps = int(recon_steps)
     report_interval = int(getattr(args, "gamd_multiwindow_recon_report_interval", 0) or 0)
     if report_interval <= 0:
         report_interval = max(1, recon_steps // 200)
@@ -2751,9 +2774,14 @@ def run_multiwindow_gamd_recon(
     for i in range(nwin):
         system_i = deserialize_system(openmm, base_system)
         targets, _peek_integrator = _gamd_boost_group_targets(system_i, args, unit)
-        cmd_integrator, _ = make_cmd_integrator(openmm, args, unit)
+        if integrator_kind == "gamd":
+            step_integrator, _ = make_gamd_integrator(system_i, args, unit)
+        else:
+            step_integrator, _ = make_cmd_integrator(openmm, args, unit)
         props_i = replica_platform_properties(platform, props, args, i)
-        sim_i = app.Simulation(topology, system_i, cmd_integrator, platform, props_i)
+        sim_i = app.Simulation(topology, system_i, step_integrator, platform, props_i)
+        if integrator_kind == "gamd" and seed_globals:
+            set_integrator_globals_from_dict(step_integrator, seed_globals)
         pos = window_start_positions[i] if window_start_positions and window_start_positions[i] is not None else equil_state.getPositions()
         vel = window_start_velocities[i] if window_start_velocities and window_start_velocities[i] is not None else None
         if equil_box is not None:
@@ -2782,12 +2810,12 @@ def run_multiwindow_gamd_recon(
 
         if progress is not None:
             progress.progress(
-                "gamd_multiwindow_recon", i + 1, nwin,
+                phase_label, i + 1, nwin,
                 message=f"window {i + 1}/{nwin} recon done", force=(i == nwin - 1),
             )
         for name, acc in accumulators.items():
             per_group_window_stats.setdefault(name, []).append(acc.to_stats(name, i))
-        release_openmm_contexts(sim_i, cmd_integrator, system_i)
+        release_openmm_contexts(sim_i, step_integrator, system_i)
 
     if not per_group_window_stats:
         raise RuntimeError("Multi-window GaMD recon collected no boost-group statistics")
@@ -2812,32 +2840,72 @@ def apply_joint_envelope_gamd_calibration(
     finite-energy verification before returning, raising RuntimeError if it
     is not finite.
     """
-    from gareus.gamd_calibration import compute_group_calibration, overwrite_physics_globals
+    from gareus.gamd_calibration import (
+        compute_group_calibration, overwrite_physics_globals, run_calibration_convergence,
+    )
 
     _peek_system = deserialize_system(openmm, base_system)
     joint_targets, _peek_integrator = _gamd_boost_group_targets(_peek_system, args, unit)
     release_openmm_contexts(_peek_integrator, _peek_system)
 
-    print(f"    GaMD joint-envelope calibration: reconning {nrep} windows "
-          f"({getattr(args, 'gamd_multiwindow_recon_prep_steps', 2000)} prep + "
-          f"{getattr(args, 'gamd_multiwindow_recon_steps', 20000)} steps each) for boost group(s) "
-          f"{', '.join(name for name, _gid in joint_targets)}")
-    pooled_envelopes = run_multiwindow_gamd_recon(
+    cmd_seed_steps = int(getattr(args, "gamd_multiwindow_recon_cmd_steps", 20000) or 0)
+    boosted_steps = int(getattr(args, "gamd_multiwindow_recon_steps", 20000) or 0)
+    boosted_iters = int(getattr(args, "gamd_recon_boosted_iters", 0) or 0)
+    boosted_tol = float(getattr(args, "gamd_recon_boosted_tol", 0.05) or 0.05)
+    group_names = [name for name, _gid in joint_targets]
+
+    # Stage 1: short conventional-MD seed recon (boost OFF) -> initial envelope.
+    print(f"    GaMD calibration: cMD seed recon of {nrep} windows "
+          f"({cmd_seed_steps} steps each) for boost group(s) {', '.join(group_names)}")
+    seed_envelopes = run_multiwindow_gamd_recon(
         args, openmm, app, unit, topology, base_system, setup_platform, setup_props,
         centers_nm, ks_kj_nm2, secondary_cv_centers, secondary_cv_ks_kj,
         window_start_positions, window_start_velocities, equil_state,
-        progress=progress,
+        integrator_kind="cmd", recon_steps=cmd_seed_steps,
+        phase_label="gamd_recon_cmd_seed", progress=progress,
     )
-    calibrations = {}
-    for name, _gid in joint_targets:
-        if name not in pooled_envelopes:
+    for name in group_names:
+        if name not in seed_envelopes:
             raise RuntimeError(f"Multi-window recon produced no pooled statistics for boost group {name!r}")
-        sigma0 = float(shared_gamd_globals_all.get(f"sigma0_{name}", 0.0) or 0.0)
-        calibrations[name] = compute_group_calibration(str(args.gamd_boost_type), pooled_envelopes[name], sigma0)
+    sigma0_by_group = {
+        name: float(shared_gamd_globals_all.get(f"sigma0_{name}", 0.0) or 0.0)
+        for name in group_names
+    }
+
+    # Stage 2: measure sigmaV under the boost, iterating to self-consistency.
+    def _measure_boosted(calibrations):
+        seed_g = dict(overwrite_physics_globals(shared_gamd_globals_all, calibrations))
+        seed_g["stage"] = 5.0  # fixed-boost production stage
+        return run_multiwindow_gamd_recon(
+            args, openmm, app, unit, topology, base_system, setup_platform, setup_props,
+            centers_nm, ks_kj_nm2, secondary_cv_centers, secondary_cv_ks_kj,
+            window_start_positions, window_start_velocities, equil_state,
+            integrator_kind="gamd", seed_globals=seed_g, recon_steps=boosted_steps,
+            phase_label="gamd_recon_boosted", progress=progress,
+        )
+
+    if boosted_iters > 0:
+        print(f"    GaMD calibration: iterating boosted recon to self-consistency "
+              f"(max {boosted_iters} iters, {boosted_steps} steps/window/iter, tol {boosted_tol:.3f})")
+    conv = run_calibration_convergence(
+        _measure_boosted, str(args.gamd_boost_type), sigma0_by_group,
+        seed_envelopes, max_iters=boosted_iters, tol=boosted_tol,
+    )
+    calibrations = {name: conv[name].calibration for name in conv}
 
     shared_gamd_globals_all = overwrite_physics_globals(shared_gamd_globals_all, calibrations)
     shared_gamd_globals_interesting = overwrite_physics_globals(shared_gamd_globals_interesting, calibrations)
 
+    boosted_calibration_report = {
+        name: {
+            "cmd_seed_sigmaV_kj_mol": seed_envelopes[name].sigmav,
+            "final_sigmaV_kj_mol": conv[name].calibration.sigmav,
+            "sigmaV_trace_kj_mol": list(conv[name].sigmav_trace),
+            "converged": bool(conv[name].converged),
+            "boosted_iters": int(conv[name].iters),
+        }
+        for name in conv
+    }
     joint_envelope_report = {
         name: {
             "vmax_kj_mol": c.vmax, "vmin_kj_mol": c.vmin, "vavg_kj_mol": c.vavg,
@@ -2851,15 +2919,21 @@ def apply_joint_envelope_gamd_calibration(
     write_json(out_dir / "shared_gamd_setup_globals.json", {
         "mode": "joint_envelope_gamd_calibration",
         "description": (
-            "Vmax/Vmin/Vavg/sigmaV/k0/threshold_energy were calibrated by running a short "
-            "recon under each initial window's own umbrella bias, then pooling the joint "
-            "min/max extrema and combined-sample mean/variance across all windows. The "
-            "resulting CustomIntegrator globals are copied to every GaREUS replica before "
-            "production, exactly as before this change."
+            "Vmax/Vmin/Vavg/sigmaV/k0/threshold_energy were calibrated in two stages: "
+            "(1) a short conventional-MD recon under each initial window's own umbrella "
+            "bias seeds the boost, then (2) the boost is turned on and the per-window "
+            "recon is repeated and pooled, iterating to self-consistency on sigmaV so the "
+            "frozen boost matches the boosted production ensemble (not the unboosted one). "
+            "The resulting CustomIntegrator globals are copied to every GaREUS replica "
+            "before production."
         ),
         "calibration_steps": int(calib_steps),
+        "gamd_multiwindow_recon_cmd_steps": cmd_seed_steps,
         "gamd_multiwindow_recon_prep_steps": int(getattr(args, "gamd_multiwindow_recon_prep_steps", 0) or 0),
-        "gamd_multiwindow_recon_steps": int(getattr(args, "gamd_multiwindow_recon_steps", 0) or 0),
+        "gamd_multiwindow_recon_steps": boosted_steps,
+        "gamd_recon_boosted_iters": boosted_iters,
+        "gamd_recon_boosted_tol": boosted_tol,
+        "boosted_calibration": boosted_calibration_report,
         "joint_envelope": joint_envelope_report,
         "temperature_K": float(args.temperature_k),
         "gamd_boost_type": str(args.gamd_boost_type),
@@ -2868,10 +2942,22 @@ def apply_joint_envelope_gamd_calibration(
         "interesting_globals": shared_gamd_globals_interesting,
         "all_globals": shared_gamd_globals_all,
     })
-    print("    GaMD joint-envelope calibration: " + ", ".join(
-        f"{name} k0={c.k0:.3f} threshold={c.threshold_energy:.1f} kJ/mol (pooled {c.n_windows} windows, {c.n_total} samples)"
+    print("    GaMD calibration: " + ", ".join(
+        f"{name} k0={c.k0:.3f} sigmaV={c.sigmav:.1f} threshold={c.threshold_energy:.1f} kJ/mol "
+        f"(pooled {c.n_windows} windows, {c.n_total} samples, {conv[name].iters} boosted iters"
+        f"{'' if conv[name].converged else ', NOT converged'})"
         for name, c in calibrations.items()
     ))
+    # k0-saturation warning: the sigmaV<=sigma0 guardrail is inert once k0 hits 1.0.
+    for name, c in calibrations.items():
+        if c.boosted and c.k0 >= 0.999:
+            sig0 = float(shared_gamd_globals_all.get(f"sigma0_{name}", 0.0) or 0.0)
+            print(
+                f"    WARNING: GaMD boost group {name!r} k0={c.k0:.3f} is saturated at 1.0 -- "
+                f"the sigmaV<=sigma0 guardrail is inert, so sigma_DV is uncontrolled and "
+                f"cumulant2 reweighting may remain unreliable even after self-consistent "
+                f"calibration. Consider a smaller sigma0 (sigma0_{name}={sig0:.2f} kJ/mol)."
+            )
 
     _check_sim = _check_integrator = _check_system = None
     try:

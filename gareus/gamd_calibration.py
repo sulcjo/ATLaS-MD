@@ -188,6 +188,73 @@ def compute_group_calibration(boost_type: str, envelope: PooledEnvelope, sigma0:
     )
 
 
+@dataclass
+class ConvergenceResult:
+    """Outcome of the self-consistent boosted-recon calibration loop for one group.
+
+    ``sigmav_trace`` is ``[seed_sigmav, iter1_sigmav, ...]`` (the seed comes from
+    the cMD recon; each subsequent entry is a boosted-recon measurement).
+    ``iters`` is the number of boosted iterations actually run (0 = legacy
+    cMD-only path). ``converged`` is True when the last two sigmaV values agree
+    within tolerance (trivially True when ``iters == 0``).
+    """
+    calibration: GroupCalibration
+    sigmav_trace: list
+    converged: bool
+    iters: int
+
+
+def envelope_converged(prev: PooledEnvelope, curr: PooledEnvelope, tol: float) -> bool:
+    """True when curr.sigmav is within relative ``tol`` of prev.sigmav.
+
+    Returns False for a non-positive previous sigmaV (no meaningful baseline).
+    """
+    if prev.sigmav <= 0.0:
+        return False
+    return abs(curr.sigmav - prev.sigmav) / prev.sigmav < tol
+
+
+def run_calibration_convergence(measure_fn, boost_type: str, sigma0_by_group: dict,
+                                seed_envelopes: dict, max_iters: int,
+                                tol: float) -> dict:
+    """Jointly iterate a boosted recon to self-consistency on sigmaV, all groups.
+
+    One boosted recon pass measures every boost group's potential energy at once,
+    so this driver is joint: ``measure_fn(calibrations) -> dict[group ->
+    PooledEnvelope]`` runs a single boosted recon seeded with the current
+    per-group ``GroupCalibration`` mapping and returns each group's freshly
+    measured envelope. It is injected so this module stays OpenMM-free (see the
+    module docstring).
+
+    The loop is a negative feedback (larger sigmaV -> smaller k0' -> weaker boost
+    -> smaller sigmaV) and converges to a fixed point; it stops when *every*
+    group's sigmaV is within relative ``tol`` of its previous iteration, or at
+    ``max_iters``. ``max_iters <= 0`` skips the boosted loop and returns the
+    cMD-seed calibrations unchanged (legacy behavior).
+
+    Returns ``dict[group -> ConvergenceResult]``.
+    """
+    groups = list(seed_envelopes.keys())
+    envelopes = dict(seed_envelopes)
+    calibrations = {g: compute_group_calibration(boost_type, envelopes[g], sigma0_by_group[g]) for g in groups}
+    traces = {g: [envelopes[g].sigmav] for g in groups}
+    if max_iters <= 0:
+        return {g: ConvergenceResult(calibrations[g], traces[g], True, 0) for g in groups}
+    per_group_conv = {g: False for g in groups}
+    iters = 0
+    for _ in range(int(max_iters)):
+        new_envelopes = measure_fn(calibrations)
+        iters += 1
+        for g in groups:
+            traces[g].append(new_envelopes[g].sigmav)
+            per_group_conv[g] = envelope_converged(envelopes[g], new_envelopes[g], tol)
+            envelopes[g] = new_envelopes[g]
+            calibrations[g] = compute_group_calibration(boost_type, new_envelopes[g], sigma0_by_group[g])
+        if all(per_group_conv.values()):
+            break
+    return {g: ConvergenceResult(calibrations[g], traces[g], per_group_conv[g], iters) for g in groups}
+
+
 _PHYSICS_GLOBAL_PREFIXES = {
     "Vmax": "vmax", "Vmin": "vmin", "Vavg": "vavg", "sigmaV": "sigmav",
     "k0": "k0", "k": "k", "threshold_energy": "threshold_energy",

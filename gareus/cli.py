@@ -399,9 +399,15 @@ def _add_gamd_args(p: argparse.ArgumentParser) -> None:
                    help="GaMD CMD pre-equilibration steps for Vmax/Vmin statistics (longer → better calibration, lower anharmonicity).")
     p.add_argument("--gamd-averaging-window", type=int, default=5000)
     p.add_argument("--gamd-multiwindow-recon-prep-steps", type=int, default=2000,
-                   help="Unrecorded relaxation steps per window before multi-window GaMD recon starts collecting statistics.")
+                   help="Unrecorded relaxation steps per window before multi-window GaMD recon starts collecting statistics (applies to both the cMD seed and the boosted passes).")
+    p.add_argument("--gamd-multiwindow-recon-cmd-steps", type=int, default=20000,
+                   help="Per-window conventional-MD (boost OFF) seed-recon steps. Seeds the initial Vmax/Vmin/Vavg/sigmaV the GaMD boost needs before it can turn on. Keep short -- it only bootstraps the boosted passes.")
     p.add_argument("--gamd-multiwindow-recon-steps", type=int, default=20000,
-                   help="Per-window recon steps used to build the joint-envelope GaMD calibration (short, dedicated budget -- decoupled from --gamd-cmd-steps). Breadth across windows substitutes for depth within one window.")
+                   help="Per-window BOOSTED recon steps per self-consistency iteration (boost ON, seeded from the current calibration). Measures sigmaV under the boost the run actually uses, so the frozen boost matches the boosted production ensemble.")
+    p.add_argument("--gamd-recon-boosted-iters", type=int, default=4,
+                   help="Max boosted self-consistency iterations for GaMD calibration. Each iteration re-measures sigmaV under the boost and recomputes k0/threshold; the loop stops early when every boost group's sigmaV settles within --gamd-recon-boosted-tol. 0 = legacy cMD-only calibration (boost measured OFF).")
+    p.add_argument("--gamd-recon-boosted-tol", type=float, default=0.05,
+                   help="Relative sigmaV convergence tolerance for the boosted GaMD calibration loop (0.05 = 5%%). The loop stops once each boost group's sigmaV changes by less than this between successive boosted iterations.")
     p.add_argument("--gamd-multiwindow-recon-report-interval", type=int, default=0,
                    help="Potential-energy sampling cadence (steps) during multi-window GaMD recon. 0 = auto (max(1, recon_steps // 200)).")
     p.add_argument("--exchange-interval", type=int, default=5000)
