@@ -206,7 +206,25 @@ def prod_dir_of(path: Path) -> Path:
     if (ap/'adaptive_union_mbar.npz').exists(): return ap
     if _has_adaptive_parquet(path): return ap
     if _has_epoch_csv_layout(ap): return ap
-    raise FileNotFoundError(f'No Parquet samples/, analysis_arrays.npz, or samples.csv in {path} or {fp}; no adaptive_union_mbar.npz or epoch Parquet data in {ap}')
+    # Interrupted adaptive_production run: union-MBAR artifacts (registry,
+    # epoch_window_map.csv) are only written once an epoch finalizes.  If the
+    # driver was interrupted mid-epoch, the completed epoch dir is still a
+    # self-contained single-production run (samples/ + segments.json + windows/)
+    # and can be analyzed on its own.  Resolve to the latest such epoch; it goes
+    # through the standard load_parquet path (not union MBAR, which needs the
+    # registry that was never written).  `path` itself may already be the
+    # adaptive_production dir when the user points at it directly.
+    for base in (ap, path):
+        solo = _find_selfcontained_epoch_dirs(base)
+        if solo:
+            return solo[-1]
+    raise FileNotFoundError(
+        f'No analyzable samples found for {path}. Checked {path}/ and {fp}/ '
+        f'(Parquet samples/, analysis_arrays.npz, samples.csv) and {ap}/ '
+        f'(adaptive_union_mbar.npz, epoch Parquet/CSV, self-contained epoch dirs). '
+        f'If this is an interrupted adaptive_production run, point directly at a '
+        f'completed epoch dir, e.g. {ap/"epoch_000"}.'
+    )
 
 def read_windows(path: Path):
     centers=[]; ks=[]; rows=[]
@@ -810,6 +828,27 @@ def _find_adaptive_epoch_dirs(adaptive_dir: Path) -> list:
                 if entry is not None:
                     result.append(entry)
     return result
+
+
+def _find_selfcontained_epoch_dirs(ap: Path) -> list:
+    """Epoch dirs under an interrupted adaptive_production/ that are complete
+    single-production runs on their own.
+
+    Used as a resolution fallback when the union scheme (registry +
+    epoch_window_map.csv) was never written.  Requires the same artifacts
+    load_parquet() needs to succeed: samples/ (Parquet), segments.json, and a
+    windows/ snapshot.  Returned sorted so the caller can pick the latest.
+    """
+    if not ap.is_dir():
+        return []
+    out = []
+    for cand in sorted(ap.glob('epoch_[0-9]*')):
+        if not cand.is_dir():
+            continue
+        if ((cand/'samples').is_dir() and (cand/'segments.json').exists()
+                and (cand/'windows').is_dir()):
+            out.append(cand)
+    return out
 
 
 def _find_adaptive_epoch_csv_sources(ap: Path) -> list:
@@ -4490,11 +4529,12 @@ def plot_rg_outputs(d: Data, rg_pmfs: dict, selected: str, out: Path, warnings: 
     except Exception as e:
         warnings.append(f'matplotlib unavailable; no Rg PNG plots written: {e}')
         return
+    import gareus_plotstyle as ps
     fig,ax=plt.subplots(figsize=(8,5))
-    for name,p in _visible_pmfs(rg_pmfs, selected, args).items():
+    for i,(name,p) in enumerate(_visible_pmfs(rg_pmfs, selected, args).items()):
         pmf_plot=_smooth_pmf_1d(p['pmf'],smooth_sigma); m=np.isfinite(pmf_plot)
-        if np.any(m): ax.plot(p['cv_A'][m],pmf_plot[m],label=name,linewidth=2.5 if name==selected else 1.3)
-    ax.set_xlabel('Rg (A)'); ax.set_ylabel('PMF (kcal/mol, shifted)'); ax.set_title('Radius of gyration PMF estimates'); ax.legend(frameon=False); fig.tight_layout(); fig.savefig(out/'rg_pmf_all_methods.png',dpi=200); plt.close(fig)
+        if np.any(m): ps.plot_method_curve(ax,p['cv_A'][m],pmf_plot[m],name,selected,idx=i)
+    ps.style_line_axes(ax,xlabel='Rg (Å)',ylabel='PMF (kcal/mol, shifted)',title='Radius of gyration PMF estimates'); fig.tight_layout(); fig.savefig(out/'rg_pmf_all_methods.png',dpi=200); plt.close(fig)
     rg=np.asarray(d.rg_A,dtype=float); mask=np.isfinite(rg)&np.isfinite(d.cv)
     if np.count_nonzero(mask)>5:
         fig,ax=plt.subplots(figsize=(6,5))
@@ -5247,12 +5287,13 @@ def _write_scalar_pmfs(out_dir: Path, prefix: str, label: str, xlabel: str, pmfs
     png=out_dir/f'{prefix}_pmf.png'
     try:
         import matplotlib.pyplot as plt
+        import gareus_plotstyle as ps
         fig,ax=plt.subplots(figsize=(8,5))
-        for method,p in _visible_pmfs(pmfs, selected_method, args).items():
+        for i,(method,p) in enumerate(_visible_pmfs(pmfs, selected_method, args).items()):
             pmf_plot=_smooth_pmf_1d(p['pmf'],smooth_sigma); m=np.isfinite(pmf_plot)
             if np.any(m):
-                ax.plot(p['x'][m],pmf_plot[m],label=method,linewidth=2.5 if method==selected_method else 1.3)
-        ax.set_xlabel(xlabel); ax.set_ylabel('PMF (kcal/mol, shifted)'); ax.set_title(label); ax.legend(frameon=False); ax.grid(True,alpha=0.2)
+                ps.plot_method_curve(ax,p['x'][m],pmf_plot[m],method,selected_method,idx=i)
+        ps.style_line_axes(ax,xlabel=xlabel,ylabel='PMF (kcal/mol, shifted)',title=label)
         fig.tight_layout(); fig.savefig(png,dpi=200); plt.close(fig)
     except Exception as exc:
         warnings.append(f'Could not plot {label}: {exc}')
@@ -7191,19 +7232,65 @@ def plot_outputs(d,pmfs,selected,O,out,warnings,smooth_sigma=0.0,args=None):
         import matplotlib.pyplot as plt
     except Exception as e:
         warnings.append(f'matplotlib unavailable; no PNG plots written: {e}'); return
+    import gareus_plotstyle as ps
+    _cvlab=_primary_cv_axis_label(d.meta)
     fig,ax=plt.subplots(figsize=(8,5))
-    for name,p in _visible_pmfs(pmfs, selected, args).items():
+    for i,(name,p) in enumerate(_visible_pmfs(pmfs, selected, args).items()):
         pmf_plot=_smooth_pmf_1d(p['pmf'],smooth_sigma); m=np.isfinite(pmf_plot)
-        if np.any(m): ax.plot(p['cv_A'][m],pmf_plot[m],label=name,linewidth=2.5 if name==selected else 1.3)
-    ax.set_xlabel(_primary_cv_axis_label(d.meta)); ax.set_ylabel('PMF (kcal/mol, shifted)'); ax.set_title('GaREUS PMF estimates'); ax.legend(frameon=False); fig.tight_layout(); fig.savefig(out/'pmf_all_methods.png',dpi=200); plt.close(fig)
-    p=pmfs[selected]; pmf_plot=_smooth_pmf_1d(p['pmf'],smooth_sigma); fig,ax=plt.subplots(figsize=(8,5)); m=np.isfinite(pmf_plot); ax.plot(p['cv_A'][m],pmf_plot[m],linewidth=2.5); ax.set_xlabel(_primary_cv_axis_label(d.meta)); ax.set_ylabel('PMF (kcal/mol, shifted)'); ax.set_title(f'Selected unbiased PMF: {selected}'); fig.tight_layout(); fig.savefig(out/'pmf_unbiased.png',dpi=200); plt.close(fig)
-    counts=np.bincount(d.window[(d.window>=0)&(d.window<d.u_nk.shape[1])],minlength=d.u_nk.shape[1]); fig,ax=plt.subplots(figsize=(8,4)); ax.bar(np.arange(counts.size),counts); ax.set_xlabel('window'); ax.set_ylabel('samples'); ax.set_title('Samples per umbrella window'); fig.tight_layout(); fig.savefig(out/'window_sample_counts.png',dpi=200); plt.close(fig)
+        if np.any(m): ps.plot_method_curve(ax,p['cv_A'][m],pmf_plot[m],name,selected,idx=i)
+    ps.style_line_axes(ax,xlabel=_cvlab,ylabel='PMF (kcal/mol, shifted)',title='GaREUS PMF estimates'); fig.tight_layout(); fig.savefig(out/'pmf_all_methods.png',dpi=200); plt.close(fig)
+    p=pmfs[selected]; pmf_plot=_smooth_pmf_1d(p['pmf'],smooth_sigma); fig,ax=plt.subplots(figsize=(8,5)); m=np.isfinite(pmf_plot); _selc,_=ps.method_style(selected); ax.plot(p['cv_A'][m],pmf_plot[m],linewidth=2.6,color=_selc); ps.annotate_minimum(ax,p['cv_A'][m],pmf_plot[m]); ps.style_line_axes(ax,xlabel=_cvlab,ylabel='PMF (kcal/mol, shifted)',title=f'Selected unbiased PMF: {ps.pretty_method(selected)}',legend=False); fig.tight_layout(); fig.savefig(out/'pmf_unbiased.png',dpi=200); plt.close(fig)
+    counts=np.bincount(d.window[(d.window>=0)&(d.window<d.u_nk.shape[1])],minlength=d.u_nk.shape[1]); fig,ax=plt.subplots(figsize=(8,4)); ax.bar(np.arange(counts.size),counts,color=ps.BAR_COLOR); ps.style_line_axes(ax,xlabel='window',ylabel='samples',title='Samples per umbrella window',legend=False); fig.tight_layout(); fig.savefig(out/'window_sample_counts.png',dpi=200); plt.close(fig)
     fig,ax=plt.subplots(figsize=(6,5)); im=ax.imshow(O,origin='lower',vmin=0,vmax=1,aspect='auto'); ax.set_xlabel('window'); ax.set_ylabel('window'); ax.set_title('CV histogram overlap'); fig.colorbar(im,ax=ax,label='overlap'); fig.tight_layout(); fig.savefig(out/'overlap_matrix.png',dpi=200); plt.close(fig)
     plot_gamd_boost(d, out, warnings)
 
+def _render_health_section_md(s):
+    """Markdown lines for the result-health verdict (top of pmf_summary.md)."""
+    try:
+        from gareus_report import render_verdict_md
+        return render_verdict_md(s.get('health'), s.get('warnings_grouped'))
+    except Exception:
+        return []
+
+
+def _key_diagnostics_md(s):
+    """Surface diagnostics that are otherwise buried in sub-directory files:
+    conformational basins, Poincaré recurrence routes. Defensive throughout."""
+    lines=[]
+    try:
+        bt=((s.get('convergence') or {}).get('basin_tracking')) or {}
+        if bt.get('enabled') and bt.get('n_basins'):
+            _cu=s.get('primary_cv_units','A')
+            parts=[]
+            for b in (bt.get('basins') or [])[:6]:
+                lo=b.get('left_cv_A'); hi=b.get('right_cv_A'); ctr=b.get('center_cv_A')
+                if lo is not None and hi is not None:
+                    parts.append(f"[{float(lo):.2f}–{float(hi):.2f} {_cu}]")
+                elif ctr is not None:
+                    parts.append(f"~{float(ctr):.2f} {_cu}")
+            det=(': '+', '.join(parts)) if parts else ''
+            lines.append(f"- **Basins (CV1):** {int(bt['n_basins'])}{det}")
+    except Exception:
+        pass
+    try:
+        pm=s.get('poincare_map') or {}
+        if pm.get('available'):
+            fr=pm.get('fold_routes_summary'); ur=pm.get('unfold_routes_summary')
+            frn=pm.get('fold_recurrence_median_ns'); urn=pm.get('unfold_recurrence_median_ns')
+            if fr and str(fr)!='unknown':
+                extra=f" (median recurrence {float(frn):.1f} ns)" if frn is not None else ""
+                lines.append(f"- **Poincaré fold routes:** {fr}{extra}")
+            if ur and str(ur)!='unknown':
+                extra=f" (median recurrence {float(urn):.1f} ns)" if urn is not None else ""
+                lines.append(f"- **Poincaré unfold routes:** {ur}{extra}")
+    except Exception:
+        pass
+    return (['### Key diagnostics','']+lines+['']) if lines else []
+
+
 def summary_md(path,s):
     _cu=s.get('primary_cv_units','A')
-    lines=['# GaREUS PMF analysis summary','',f"Input: `{s['production_dir']}`",f"Samples/windows: **{s['n_samples']} / {s['n_windows']}**",f"Temperature: **{s['temperature_K']:.2f} K**",f"CV range: **{s['cv_min_A']:.3f} - {s['cv_max_A']:.3f} {_cu}**",f"Selected unbiased PMF: **{s['selected_unbiased_method']}**",f"PMF minimum: **{s['pmf_minimum_cv_A']} {_cu}**",f"PMF span: **{s['pmf_span_kcal_mol']:.3f} kcal/mol**",'', '## MBAR / umbrella diagnostics','',f"Converged: **{s['mbar']['converged']}** after {s['mbar']['iterations']} iterations",f"Backend: **{s['mbar'].get('backend','unknown')}**" + (f" / threads: **{s['mbar'].get('threads')}**" if s['mbar'].get('threads') else ""),f"Base ESS: **{s['mbar']['base_ess']:.1f}** / {s['n_samples']}", '', '## GaMD boost diagnostics','']
+    lines=['# GaREUS PMF analysis summary','',f"Input: `{s['production_dir']}`",f"Samples/windows: **{s['n_samples']} / {s['n_windows']}**",f"Temperature: **{s['temperature_K']:.2f} K**",f"CV range: **{s['cv_min_A']:.3f} - {s['cv_max_A']:.3f} {_cu}**",f"Selected unbiased PMF: **{s['selected_unbiased_method']}**",f"PMF minimum: **{s['pmf_minimum_cv_A']} {_cu}**",f"PMF span: **{s['pmf_span_kcal_mol']:.3f} kcal/mol**",''] + _render_health_section_md(s) + _key_diagnostics_md(s) + ['## MBAR / umbrella diagnostics','',f"Converged: **{s['mbar']['converged']}** after {s['mbar']['iterations']} iterations",f"Backend: **{s['mbar'].get('backend','unknown')}**" + (f" / threads: **{s['mbar'].get('threads')}**" if s['mbar'].get('threads') else ""),f"Base ESS: **{s['mbar']['base_ess']:.1f}** / {s['n_samples']}", '', '## GaMD boost diagnostics','']
     b=s['boost']
     if b.get('available'):
         lines += [f"Boost mean/std: **{b['mean_kcal_mol']:.3f} / {b['std_kcal_mol']:.3f} kcal/mol**",f"Boost range: **{b['min_kcal_mol']:.3f} - {b['max_kcal_mol']:.3f} kcal/mol**",f"Anharmonicity score: **{b.get('anharmonicity_score')}**",f"Boost exponential ESS fraction: **{b.get('boost_reweight_ess_fraction',0):.3f}**"]
@@ -7491,19 +7578,20 @@ def analyze_secondary_cv_pmf(d: Data, args, base_logw: np.ndarray, selected: str
     regions=_secondary_cv_regions(d.meta)
     try:
         import matplotlib.pyplot as plt
+        import gareus_plotstyle as ps
         fig,ax=plt.subplots(figsize=(8,5))
         _cv2_smooth=_eff_smooth(args,'pmf_smooth_sigma')
-        for name,p in _visible_pmfs(pmfs, chosen, args).items():
+        for i,(name,p) in enumerate(_visible_pmfs(pmfs, chosen, args).items()):
             pmf_plot=_smooth_pmf_1d(p['pmf'],_cv2_smooth); m=np.isfinite(pmf_plot)
-            if np.any(m): ax.plot(p['cv_A'][m],pmf_plot[m],label=name,linewidth=2.5 if name==chosen else 1.3)
+            if np.any(m): ps.plot_method_curve(ax,p['cv_A'][m],pmf_plot[m],name,chosen,idx=i)
         for reg in regions:
             v=float(reg.get('value',float('nan'))); lbl=str(reg.get('label',''))
             if np.isfinite(v):
                 ax.axvline(v, color='gray', linewidth=0.8, linestyle='--', alpha=0.6)
                 ax.text(v, ax.get_ylim()[1] if ax.get_ylim()[1] != ax.get_ylim()[0] else 0, lbl,
                         rotation=90, va='top', ha='right', fontsize=7, color='gray')
-        ax.set_xlabel(cv2_label); ax.set_ylabel('PMF (kcal/mol, shifted)'); ax.set_title(f'{cv2_label} PMF ({chosen})')
-        ax.legend(frameon=False); fig.tight_layout(); fig.savefig(out/'cv2_pmf_unbiased.png',dpi=200); plt.close(fig)
+        ps.style_line_axes(ax,xlabel=cv2_label,ylabel='PMF (kcal/mol, shifted)',title=f'{cv2_label} PMF ({ps.pretty_method(chosen)})')
+        fig.tight_layout(); fig.savefig(out/'cv2_pmf_unbiased.png',dpi=200); plt.close(fig)
         plot_file=str(out/'cv2_pmf_unbiased.png')
     except Exception as e:
         warnings.append(f'Secondary CV PMF plot failed: {e}')
@@ -9173,6 +9261,16 @@ def analyze(d,args, progress: Optional[Progress] = None):
                   cv1_cv2_fes_info,epoch_cv_info,tica_epoch_info,dtram_info,conv_info):
         if isinstance(_info,dict) and _info.get('files'):
             s['files'].update(_info['files'])
+    # Presentation-only result-health verdict + warning triage (derived from the
+    # numbers already in `s`; computes no new physics). Guarded so a verdict
+    # edge-case never aborts an otherwise-complete analysis run.
+    try:
+        from gareus_report import build_health_verdict, classify_warnings
+        s['health']=build_health_verdict(s,float(getattr(args,'min_neighbor_overlap',0.30)))
+        s['warnings_grouped']=classify_warnings(s.get('warnings',[]),s.get('selected_unbiased_method'))
+    except Exception as _hv_exc:
+        s['health']={'overall':'UNKNOWN','checks':[],'error':str(_hv_exc)}
+        s.setdefault('warnings_grouped',[])
     wjson(out/'pmf_summary.json',s); summary_md(out/'pmf_summary.md',s)
     if progress is not None: progress.bar('analysis stages', 6, 6, 'summary written', force=True)
     return s
@@ -9394,9 +9492,13 @@ def main(argv=None):
     print(f"  PMF minimum: {s['pmf_minimum_cv_A']} {s.get('primary_cv_units','A')}")
     print(f"  PMF span: {s['pmf_span_kcal_mol']:.3f} kcal/mol")
     print(f"  output dir: {s['output_dir']}")
-    if s['warnings']:
-        print('  warnings:')
-        for w in s['warnings']: print(f'    - {w}')
+    try:
+        from gareus_report import render_verdict_terminal
+        print(render_verdict_terminal(s.get('health'), s.get('warnings_grouped')))
+    except Exception:
+        if s['warnings']:
+            print('  warnings:')
+            for w in s['warnings']: print(f'    - {w}')
     return 0
 
 if __name__=='__main__':

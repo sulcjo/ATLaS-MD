@@ -88,6 +88,18 @@ def test_ss_scalar_rama_map_empty_regions():
     assert _ss_scalar_from_sub_cv_values([], meta) == 0.0
 
 
+def test_ss_scalar_grouped_linear_torsion_sums():
+    from gareus.production import _ss_scalar_from_sub_cv_values
+
+    meta = {
+        "mode": "torsion-pca",
+        "linear_subcv_mode": "grouped-weighted-sums",
+        "tica_offset": 0.25,
+    }
+    sub = [1.5, -0.5, 0.75, -0.25]
+    assert abs(_ss_scalar_from_sub_cv_values(sub, meta) - 1.75) < 1.0e-12
+
+
 
 def test_ss_scalar_contact_normalize_math():
     """Verify contact CV normalization formula used in _fetch_state/_fetch_exchange_state."""
