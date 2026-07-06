@@ -17,6 +17,9 @@ chignolin_genpept_seeds/
 chignolin_genpept_massive_prior/
 chignolin_2d_newpackage/
 RUNS/
+OLD/
+test_ch/
+.~lock.*#
 ABCold_monolith/
 _genpept_test/chignolin_genpept_run??_*/
 _genpept_test/chignolin_genpept_massive_prior/
