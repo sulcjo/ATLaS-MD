@@ -357,6 +357,16 @@ def _add_torsion_score_force(openmm, torsions, target_rad: float, sigma_rad: flo
     return force
 
 
+def _add_weighted_trig_torsion_force(openmm, torsions, weights, trig: str):
+    """Return one force summing per-torsion weighted sin/cos contributions."""
+    expr = f"w*{trig}(theta)"
+    force = openmm.CustomTorsionForce(expr)
+    force.addPerTorsionParameter("w")
+    for (a, b, c, d), weight in zip(torsions, weights):
+        force.addTorsion(int(a), int(b), int(c), int(d), [float(weight)])
+    return force
+
+
 def _linear_torsion_state_for_mode(args, mode: str) -> tuple[Path, "TICAResult"]:
     from .tica import TICAResult
 
@@ -431,21 +441,21 @@ def _add_linear_torsion_cv_force(
         )
     cv_force = openmm.CustomCVForce("0")
     sub_cv_names = []
-    for j, (a, b, c, d) in enumerate(phi_torsions):
-        for trig, fname in (("sin", f"sin_phi_{j}"), ("cos", f"cos_phi_{j}")):
-            sub_f = openmm.CustomTorsionForce(f"{trig}(theta)")
-            sub_f.addTorsion(int(a), int(b), int(c), int(d), [])
-            cv_force.addCollectiveVariable(fname, sub_f)
-            sub_cv_names.append(fname)
-    for j, (a, b, c, d) in enumerate(psi_torsions):
-        for trig, fname in (("sin", f"sin_psi_{j}"), ("cos", f"cos_psi_{j}")):
-            sub_f = openmm.CustomTorsionForce(f"{trig}(theta)")
-            sub_f.addTorsion(int(a), int(b), int(c), int(d), [])
-            cv_force.addCollectiveVariable(fname, sub_f)
-            sub_cv_names.append(fname)
+    grouped_terms = [
+        ("sum_sin_phi", phi_torsions, weights[0 : 2 * n_phi : 2], "sin"),
+        ("sum_cos_phi", phi_torsions, weights[1 : 2 * n_phi : 2], "cos"),
+        ("sum_sin_psi", psi_torsions, weights[2 * n_phi : 2 * n_phi + 2 * n_psi : 2], "sin"),
+        ("sum_cos_psi", psi_torsions, weights[2 * n_phi + 1 : 2 * n_phi + 2 * n_psi : 2], "cos"),
+    ]
+    for fname, torsions, grouped_weights, trig in grouped_terms:
+        if len(torsions) == 0:
+            continue
+        sub_f = _add_weighted_trig_torsion_force(openmm, torsions, grouped_weights, trig)
+        cv_force.addCollectiveVariable(fname, sub_f)
+        sub_cv_names.append(fname)
     cv_force.addGlobalParameter("ss_k", 0.0)
     cv_force.addGlobalParameter("ss0", 0.0)
-    linear_terms = " + ".join(f"{w:.12g}*{name}" for w, name in zip(weights, sub_cv_names))
+    linear_terms = " + ".join(sub_cv_names)
     linear_expr = f"({linear_terms} + ({offset:.12g}))"
     cv_force.setEnergyFunction(f"0.5*ss_k*({linear_expr}-ss0)^2")
     cv_force.setForceGroup(int(force_group))
@@ -468,6 +478,8 @@ def _add_linear_torsion_cv_force(
         "tica_offset": float(offset),
         "phi_torsions": [list(map(int, t)) for t in phi_torsions],
         "psi_torsions": [list(map(int, t)) for t in psi_torsions],
+        "linear_subcv_mode": "grouped-weighted-sums",
+        "linear_subcv_names": list(sub_cv_names),
         "force_group": int(force_group),
         "eigenvalue": float(result.eigenvalue),
         "n_samples": int(result.n_samples),
@@ -525,8 +537,10 @@ def _ss_scalar_from_sub_cv_values(sub_cv_values, metadata: dict) -> float:
     mode = secondary_cv_mode(metadata)
     arr = np.asarray(sub_cv_values, dtype=np.float64)
     if mode in {"tica-linear", "torsion-pca"}:
-        weights = np.asarray(metadata.get("weights", []), dtype=np.float64)
         offset = float(metadata.get("tica_offset", 0.0))
+        if str(metadata.get("linear_subcv_mode", "")) == "grouped-weighted-sums":
+            return float(np.sum(arr) + offset)
+        weights = np.asarray(metadata.get("weights", []), dtype=np.float64)
         return float(arr @ weights + offset)
     if mode == "alpha-coil-beta":
         return float(0.5 * (arr[0] + arr[1]) - 0.5 * (arr[2] + arr[3]))

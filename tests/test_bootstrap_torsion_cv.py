@@ -279,6 +279,90 @@ def test_bootstrap_torsion_pca_uses_atom_name_mapping_for_genpept_seeds(tmp_path
     assert state.psi_torsion_indices == psi
 
 
+def test_linear_torsion_force_stays_under_customcv_variable_limit(tmp_path):
+    from gareus.production import _add_linear_torsion_cv_force
+
+    class FakeCustomTorsionForce:
+        def __init__(self, expr):
+            self.expr = expr
+            self.torsions = []
+            self.globals = []
+            self.per_torsion = []
+
+        def addGlobalParameter(self, name, value):
+            self.globals.append((name, value))
+
+        def addPerTorsionParameter(self, name):
+            self.per_torsion.append(name)
+
+        def addTorsion(self, a, b, c, d, params):
+            self.torsions.append((a, b, c, d, list(params)))
+
+    class FakeCustomCVForce:
+        def __init__(self, expr):
+            self.expr = expr
+            self.variables = []
+            self.globals = []
+            self.group = None
+
+        def addCollectiveVariable(self, name, variable):
+            if len(self.variables) >= 32:
+                raise RuntimeError("CustomCVForce cannot have more than 32 collective variables")
+            self.variables.append((name, variable))
+
+        def addGlobalParameter(self, name, value):
+            self.globals.append((name, value))
+
+        def setEnergyFunction(self, expr):
+            self.expr = expr
+
+        def setForceGroup(self, group):
+            self.group = group
+
+    class FakeSystem:
+        def __init__(self):
+            self.forces = []
+
+        def addForce(self, force):
+            self.forces.append(force)
+
+    class FakeOpenMM:
+        CustomCVForce = FakeCustomCVForce
+        CustomTorsionForce = FakeCustomTorsionForce
+
+    phi = [(i, i + 1, i + 2, i + 3) for i in range(9)]
+    psi = [(100 + i, 101 + i, 102 + i, 103 + i) for i in range(8)]
+    weights = np.linspace(-1.0, 1.0, 2 * len(phi) + 2 * len(psi))
+    result = TICAResult(
+        weights=weights,
+        eigenvalue=1.0,
+        mean=np.zeros_like(weights),
+        offset=0.25,
+        lag=0,
+        phi_torsion_indices=phi,
+        psi_torsion_indices=psi,
+        n_samples=64,
+        method="pca",
+        explained_variance_ratio=0.4,
+    )
+    system = FakeSystem()
+
+    info = _add_linear_torsion_cv_force(
+        FakeOpenMM(),
+        system,
+        phi,
+        psi,
+        result,
+        mode="torsion-pca",
+        state_path=tmp_path / "bootstrap_torsion_cv.json",
+        force_group=29,
+    )
+
+    assert info["enabled"] is True
+    assert len(system.forces) == 1
+    assert len(system.forces[0].variables) <= 4
+
+
 def test_linear_torsion_state_loader_rejects_wrong_method(tmp_path):
     from gareus.production import _linear_torsion_state_for_mode
 
