@@ -156,6 +156,10 @@ gamd:
   production_steps: 3000000
   sigma0p: 5.0
   sigma0d: 5.0
+  gamd_multiwindow_recon_cmd_steps: 50000   # short cMD seed (boost OFF) -> initial Vmax/Vmin/sigmaV
+  gamd_multiwindow_recon_steps: 250000      # boosted recon steps per self-consistency iteration
+  gamd_recon_boosted_iters: 4              # self-consistent boosted recon: measure sigmaV with boost ON
+  gamd_recon_boosted_tol: 0.05             # stop when each group's sigmaV settles within 5%
   gamd_cmd_steps: 100000
   equil_steps: 100000
   gamd_averaging_window: 2000
