@@ -80,7 +80,9 @@ def fit_cv2_field(pc1, pc2, cv2, order: int = 1) -> Cv2Field:
     ss_res = float(np.sum((cv2 - pred) ** 2))
     ss_tot = float(np.sum((cv2 - cv2.mean()) ** 2))
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 0.0 else 0.0
-    usable = bool(rank == n_cols and np.isfinite(r2))
+    # A zero-variance target (ss_tot == 0) fits trivially but carries no signal,
+    # so it must not be treated as a usable field for iso-contours.
+    usable = bool(rank == n_cols and np.isfinite(r2) and ss_tot > 0.0)
     return Cv2Field(coef=coef, order=order, r2=float(r2), usable=usable)
 
 
@@ -279,62 +281,68 @@ def plot_overlay(data, field: Cv2Field, out_png, labels: Optional[dict] = None, 
     yc = np.asarray(data.pc2_centers, dtype=np.float64)
     dE = np.asarray(data.grid_dE, dtype=np.float64)
 
+    axes_finite = bool(xc.size and yc.size and np.isfinite(xc).all() and np.isfinite(yc).all())
     fig, ax = plt.subplots(figsize=(8.8, 6.8))
-    if xc.size and yc.size and np.isfinite(dE).any():
-        extent = [xc[0], xc[-1], yc[0], yc[-1]]
-        ax.imshow(
-            np.ma.masked_invalid(dE.T),
-            origin="lower",
-            extent=extent,
-            aspect="auto",
-            interpolation="bicubic",
-            cmap="Greys",
-            alpha=0.85,
-        )
-
-    sc = ax.scatter(
-        data.pc1, data.pc2, c=data.cv2, cmap="viridis", s=18,
-        edgecolors="k", linewidths=0.2, zorder=3,
-    )
-    cbar = fig.colorbar(sc, ax=ax, pad=0.02)
-    cbar.set_label(labels.get("cv2", "epoch-0 CV2 (torsion-PC1)"))
-
     contours_drawn = False
-    if field is not None and field.usable and np.isfinite(field.r2) and field.r2 >= r2_min and xc.size and yc.size:
-        XX, YY = np.meshgrid(xc, yc, indexing="ij")
-        Z = field.evaluate(XX, YY)
-        try:
-            cs = ax.contour(XX, YY, Z, levels=8, colors="k", linewidths=0.8, alpha=0.7, zorder=4)
-            ax.clabel(cs, cs.levels[::2], inline=True, fontsize=7, fmt="%.2f")
-            contours_drawn = True
-        except Exception:
-            contours_drawn = False
-        # CV2 gradient direction (linear part), drawn from the point cloud centre
-        if field.order >= 1 and field.coef.size >= 3:
-            gx, gy = float(field.coef[1]), float(field.coef[2])
-            norm = float(np.hypot(gx, gy))
-            if norm > 0:
-                span = 0.25 * float(np.nanmax(xc) - np.nanmin(xc) + 1e-9)
-                cx, cy = float(np.mean(data.pc1)), float(np.mean(data.pc2))
-                ax.annotate(
-                    "", xy=(cx + span * gx / norm, cy + span * gy / norm), xytext=(cx, cy),
-                    arrowprops=dict(arrowstyle="->", color="crimson", lw=1.6), zorder=5,
-                )
+    try:
+        if axes_finite and np.isfinite(dE).any():
+            extent = [xc[0], xc[-1], yc[0], yc[-1]]
+            ax.imshow(
+                np.ma.masked_invalid(dE.T),
+                origin="lower",
+                extent=extent,
+                aspect="auto",
+                interpolation="bicubic",
+                cmap="Greys",
+                alpha=0.85,
+            )
 
-    fit_note = (
-        f"CV2≈f(PC1,PC2) fit: R²={field.r2:.2f}"
-        + ("" if contours_drawn else "  (too weak for iso-lines — scatter only)")
-        if field is not None else ""
-    )
-    ax.set_xlabel(labels.get("pc1", "pseudo-FES PCA1 (imaginary CV1)"))
-    ax.set_ylabel(labels.get("pc2", "pseudo-FES PCA2 (imaginary CV2)"))
-    ax.set_title(labels.get("title", "GENPEPT pseudo-FES with epoch-0 CV2 overlay"))
-    ax.text(
-        0.01, 0.99, fit_note, transform=ax.transAxes, va="top", ha="left",
-        fontsize=8, bbox=dict(boxstyle="round", fc="white", ec="0.6", alpha=0.85),
-    )
-    fig.tight_layout()
-    fig.savefig(out_png, dpi=200)
-    plt.close(fig)
+        sc = ax.scatter(
+            data.pc1, data.pc2, c=data.cv2, cmap="viridis", s=18,
+            edgecolors="k", linewidths=0.2, zorder=3,
+        )
+        cbar = fig.colorbar(sc, ax=ax, pad=0.02)
+        cbar.set_label(labels.get("cv2", "epoch-0 CV2 (torsion-PC1)"))
+
+        if field is not None and field.usable and np.isfinite(field.r2) and field.r2 >= r2_min and axes_finite:
+            XX, YY = np.meshgrid(xc, yc, indexing="ij")
+            Z = field.evaluate(XX, YY)
+            try:
+                cs = ax.contour(XX, YY, Z, levels=8, colors="k", linewidths=0.8, alpha=0.7, zorder=4)
+                ax.clabel(cs, cs.levels[::2], inline=True, fontsize=7, fmt="%.2f")
+                contours_drawn = True
+            except Exception:
+                contours_drawn = False
+            # CV2 gradient direction (linear part), drawn from the point-cloud centre
+            if field.order >= 1 and field.coef.size >= 3:
+                gx, gy = float(field.coef[1]), float(field.coef[2])
+                norm = float(np.hypot(gx, gy))
+                cx, cy = float(np.nanmean(data.pc1)), float(np.nanmean(data.pc2))
+                if norm > 0 and np.isfinite(cx) and np.isfinite(cy):
+                    span = 0.25 * float(np.nanmax(xc) - np.nanmin(xc) + 1e-9)
+                    try:
+                        ax.annotate(
+                            "", xy=(cx + span * gx / norm, cy + span * gy / norm), xytext=(cx, cy),
+                            arrowprops=dict(arrowstyle="->", color="crimson", lw=1.6), zorder=5,
+                        )
+                    except Exception:
+                        pass
+
+        fit_note = (
+            f"CV2≈f(PC1,PC2) fit: R²={field.r2:.2f}"
+            + ("" if contours_drawn else "  (too weak for iso-lines — scatter only)")
+            if field is not None else ""
+        )
+        ax.set_xlabel(labels.get("pc1", "pseudo-FES PCA1 (imaginary CV1)"))
+        ax.set_ylabel(labels.get("pc2", "pseudo-FES PCA2 (imaginary CV2)"))
+        ax.set_title(labels.get("title", "GENPEPT pseudo-FES with epoch-0 CV2 overlay"))
+        ax.text(
+            0.01, 0.99, fit_note, transform=ax.transAxes, va="top", ha="left",
+            fontsize=8, bbox=dict(boxstyle="round", fc="white", ec="0.6", alpha=0.85),
+        )
+        fig.tight_layout()
+        fig.savefig(out_png, dpi=200)
+    finally:
+        plt.close(fig)
     return {"contours_drawn": contours_drawn, "r2": float(field.r2) if field is not None else float("nan"), "png": str(out_png)}
 

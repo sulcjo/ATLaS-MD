@@ -104,6 +104,16 @@ def test_fit_cv2_field_marks_unusable_when_too_few_points():
     assert field.usable is False
 
 
+def test_fit_cv2_field_constant_target_is_unusable():
+    rng = np.random.default_rng(11)
+    pc1 = rng.normal(size=30)  # independent, full-rank design
+    pc2 = rng.normal(size=30)
+    cv2 = np.full(30, 3.0)  # degenerate: zero variance in the target
+    field = fit_cv2_field(pc1, pc2, cv2, order=1)
+    assert field.r2 == 0.0
+    assert field.usable is False
+
+
 def test_fit_cv2_field_ignores_nonfinite_samples():
     pc1 = np.array([0.0, 1.0, 2.0, 3.0, np.nan])
     pc2 = np.array([0.0, 1.0, 0.0, 1.0, 5.0])
@@ -256,3 +266,22 @@ def test_plot_overlay_writes_png(tmp_path):
     info = plot_overlay(data, field, out, labels={"title": "t", "cv2": "CV2"})
     assert out.exists() and out.stat().st_size > 0
     assert info["contours_drawn"] is True  # R2 is high for this linear field
+
+
+def test_plot_overlay_degrades_on_all_nan_input(tmp_path):
+    class _Data:
+        pass
+
+    data = _Data()
+    data.pc1 = np.full(5, np.nan)
+    data.pc2 = np.full(5, np.nan)
+    data.cv2 = np.full(5, np.nan)
+    data.pc1_centers = np.array([np.nan, np.nan])
+    data.pc2_centers = np.array([np.nan, np.nan])
+    data.grid_dE = np.full((2, 2), np.nan)
+    field = fit_cv2_field(data.pc1, data.pc2, data.cv2, order=1)
+
+    out = tmp_path / "nan_overlay.png"
+    info = plot_overlay(data, field, out, labels={})  # must not raise
+    assert out.exists()
+    assert info["contours_drawn"] is False
