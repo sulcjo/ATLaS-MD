@@ -361,6 +361,34 @@ def _secondary_center_count_for_total_budget(args) -> int:
             pass
     return max(1, len(sorted(set(vals))))
 
+# Hard floor on the number of REUS replicas a 2D factorized grid may finalize.
+# The double-adaptive feedback loop optimizes neighbor overlap and can collapse
+# an under-sampled grid to very few windows (the chignolin 2.5 µs run finalized
+# 9); without a creation floor nothing forces the count back up. Applied only to
+# the 2D factorized grid (not 1D / legacy axis paths). Single source of truth so
+# a one-line change re-tunes it.
+DEFAULT_MIN_TOTAL_REPLICAS = 14
+
+
+def _densify_axis_to_count(centers: list[float], target_count: int) -> list[float]:
+    """Return >= target_count evenly-spaced centers spanning the SAME range.
+
+    Expansion stays within [min, max] of the input centers -- it subdivides the
+    already-accessible axis span (tighter spacing) rather than widening into
+    un-sampled CV territory. Tighter spacing lets the spacing-derived adaptive-k
+    assign a stronger (narrower) force constant, holding neighbor overlap near
+    target instead of over-overlapping.
+    """
+    vals = sorted(_unique_axis_values([float(x) for x in centers]))
+    target_count = int(target_count)
+    if target_count <= len(vals) or len(vals) == 0:
+        return vals
+    lo, hi = vals[0], vals[-1]
+    if not (math.isfinite(lo) and math.isfinite(hi)) or hi <= lo:
+        return vals  # degenerate span (single accessible point): cannot subdivide
+    return [float(x) for x in np.round(np.linspace(lo, hi, target_count), 6)]
+
+
 def _adaptive_total_window_limits(args) -> tuple[int, int]:
     """Return (min_total, max_total) for expanded 1D/2D window count.
 
@@ -495,11 +523,53 @@ def _apply_total_window_budget_to_factorized_grid(args, primary_centers: list[fl
                 secondary = _thin_axis_centers_to_count(secondary, max_secondary)
                 notes.append(f"thinned secondary axis {old}->{len(secondary)} to respect total replica cap {max_total}")
     new_total = len(primary) * len(secondary)
-    if min_total > 0 and new_total < min_total:
-        notes.append(f"total replicas {new_total} below requested minimum {min_total}; rectangular grid/axis caps or sampled proposals limited expansion")
+    # Creation floor: force the finalized replica count UP to the minimum, instead
+    # of merely noting the shortfall. An explicit --min-total-windows wins; else the
+    # DEFAULT floor applies. Soft-clamp to an explicit max (never exceed the cap,
+    # never raise). Expansion subdivides the existing accessible span (tighter
+    # spacing -> spacing-derived adaptive-k assigns a stronger, narrower k), rather
+    # than widening into un-sampled CV territory.
+    effective_min = int(min_total) if min_total > 0 else DEFAULT_MIN_TOTAL_REPLICAS
+    if max_total > 0:
+        effective_min = min(effective_min, int(max_total))
+    expanded = False
+    if new_total < effective_min and len(secondary) >= 1:
+        cap_primary = (int(max_total) // len(secondary)) if max_total > 0 else None
+        want_primary = int(math.ceil(effective_min / max(1, len(secondary))))
+        if cap_primary is not None:
+            want_primary = min(want_primary, cap_primary)
+        if want_primary > len(primary):
+            grown = _densify_axis_to_count(primary, want_primary)
+            if len(grown) > len(primary):
+                primary = grown
+                expanded = True
+        new_total = len(primary) * len(secondary)
+        if new_total < effective_min:  # primary span degenerate or secondary-bound
+            cap_secondary = (int(max_total) // max(1, len(primary))) if max_total > 0 else None
+            want_secondary = int(math.ceil(effective_min / max(1, len(primary))))
+            if cap_secondary is not None:
+                want_secondary = min(want_secondary, cap_secondary)
+            if want_secondary > len(secondary):
+                grown = _densify_axis_to_count(secondary, want_secondary)
+                if len(grown) > len(secondary):
+                    secondary = grown
+                    expanded = True
+        new_total = len(primary) * len(secondary)
+    if expanded:
+        notes.append(
+            f"expanded factorized grid to {new_total} replicas to honour minimum {effective_min} "
+            f"(subdivided accessible span; spacing-derived k strengthens accordingly)"
+        )
+    elif new_total < effective_min:
+        notes.append(
+            f"total replicas {new_total} below floor {effective_min}: axis span(s) too "
+            f"degenerate to subdivide (single accessible CV point?) or capped by max_total"
+        )
     return primary, secondary, {
         "enabled": bool(min_total > 0 or max_total > 0),
         "min_total_windows": int(min_total),
+        "effective_min_replicas": int(effective_min),
+        "expanded_to_floor": bool(expanded),
         "max_total_windows": int(max_total),
         "old_total_windows": int(old_total),
         "new_total_windows": int(new_total),
