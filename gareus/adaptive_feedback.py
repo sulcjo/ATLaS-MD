@@ -1321,6 +1321,37 @@ def run_adaptive_feedback_dispatcher_2d_explicit_sparse(args, out_dir: Path, cen
     print(f"    Explicit sparse graph: {graph_summary.get('n_edges', 0)} edges; local patch candidates: {len(sparse_patch_rows)}; candidate windows: {len(explicit_candidate_rows)}")
     return summary
 
+
+def _check_per_cell_overlap_before_removal(
+    primary_idx: int,
+    n_secondary: int,
+    samples_2d_by_window: dict,
+    minimum_valid_overlap: float,
+) -> bool:
+    """Return True only if removing primary_idx is safe for ALL secondary slices.
+
+    For each secondary slice j, checks that the left neighbor (primary_idx-1, j)
+    and right neighbor (primary_idx+1, j) have sufficient overlap to span the gap.
+    Returns False (block removal) if any cell lacks data or fails the overlap check.
+
+    ``samples_2d_by_window`` must be keyed by ``(primary_idx, secondary_idx)``
+    tuples, where each value is a list of primary-CV float samples for that cell.
+    """
+    for j in range(n_secondary):
+        left_samples = samples_2d_by_window.get((primary_idx - 1, j), [])
+        right_samples = samples_2d_by_window.get((primary_idx + 1, j), [])
+        if len(left_samples) < 10 or len(right_samples) < 10:
+            return False  # insufficient data to evaluate — block
+        all_vals = list(left_samples) + list(right_samples)
+        lo, hi = min(all_vals), max(all_vals)
+        if hi <= lo:
+            return False
+        ov = _adaptive_hist_overlap(left_samples, right_samples, lo, hi)
+        if not math.isfinite(ov) or ov < minimum_valid_overlap:
+            return False
+    return True
+
+
 def run_adaptive_feedback_dispatcher_2d(args, out_dir: Path, centers_a, k_list, exchange_stats: dict, secondary_cv_centers, secondary_cv_k_kcal_list, secondary_cv_metadata: dict, fallback_history_by_window: Optional[dict[int, list[float]]] = None) -> Optional[dict]:
     """Adaptive-feedback proposal for a distance x secondary-structure CV grid."""
     out_dir = Path(out_dir)
@@ -1410,6 +1441,36 @@ def run_adaptive_feedback_dispatcher_2d(args, out_dir: Path, centers_a, k_list, 
         center_min=_pcmin, center_max=_pcmax, is_secondary=False,
         exchange_stats_by_pair=primary_axis_exchange, seed_offset=1,
     )
+
+    # N2: per-cell 2D overlap check — block primary-axis removal when any
+    # secondary slice lacks cross-neighbor overlap after the gap is opened.
+    # Build a 2D sample dict keyed by (primary_idx, secondary_idx) using the
+    # flat window indexing: w = primary_idx * n_secondary + secondary_idx.
+    _samples_2d: dict[tuple[int, int], list[float]] = {}
+    for _ip in range(n_primary):
+        for _js in range(n_secondary):
+            _w = _ip * n_secondary + _js
+            _vals = [float(x) for x in samples_distance_by_window.get(_w, []) if math.isfinite(float(x))]
+            if _vals:
+                _samples_2d[(_ip, _js)] = _vals
+    _minimum_valid_overlap_2d = max(0.05, min(0.15, 0.50 * target_overlap))
+    _proposed_set = {float(x) for x in primary["proposed_centers"]}
+    _restored: list[float] = []
+    for _cand in primary.get("removed_centers", []):
+        _removed_center = float(_cand["center"])
+        _removed_primary_idx = int(_cand["index"])
+        if _removed_primary_idx <= 0 or _removed_primary_idx >= n_primary - 1:
+            # Endpoint removal is not spanned by two neighbors; skip per-cell gate.
+            continue
+        if not _check_per_cell_overlap_before_removal(
+            _removed_primary_idx, n_secondary, _samples_2d, _minimum_valid_overlap_2d
+        ):
+            _proposed_set.add(_removed_center)
+            _restored.append(_removed_center)
+    if _restored:
+        primary["proposed_centers"] = sorted(_proposed_set)
+        primary.setdefault("per_cell_overlap_restored", []).extend(_restored)
+
     sec_min = float((secondary_cv_metadata or {}).get("range_min", -1.0 if secondary_cv_is_transition(args) else 0.0))
     sec_max = float((secondary_cv_metadata or {}).get("range_max", 1.0))
     secondary = _adaptive_feedback_axis_proposal(
