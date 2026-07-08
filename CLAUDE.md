@@ -6,7 +6,7 @@ Updated 2026-07-03.
 
 - Added `cv2: torsion-pca` as first-run bootstrap secondary CV for peptide runs.
 - Intended first-run pair: `cv1: contacts`, `cv2: torsion-pca`.
-- `torsion-pca` fits backbone torsion PCA from GENPEPT seed conformers, residualized against seed CV1 by default.
+- `torsion-pca` fits backbone torsion PCA from GENPEPT seed conformers. Residualization against seed CV1 is now OFF by default: for a folder the fold is correlated torsion+contact motion, so residualizing strips the fold signal and collapses PC1, cramming CV2 window centers into a thin band. Opt in only when an orthogonal-to-CV1 secondary motion is genuinely wanted. CV2 seed centers span the full seed PC1 distribution (2/98% quantiles).
 - Runtime force uses same raw-feature linear torsion projection as `tica-linear`.
 - `tica_switch_cv2: true` switches only after a successful tICA update writes a valid tICA state file.
 - Fast resume restores linear torsion state paths from secondary-CV metadata and fails closed if missing.

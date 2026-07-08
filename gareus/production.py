@@ -135,7 +135,11 @@ def _seed_projection_centers(values: np.ndarray) -> list[float]:
     arr = arr[np.isfinite(arr)]
     if arr.size < 3:
         raise ValueError(f"torsion-pca center selection needs at least 3 finite projections, got {arr.size}")
-    centers = [float(x) for x in np.quantile(arr, [0.15, 0.50, 0.85])]
+    # Span (near-)full seed distribution, not the inner 70%: the outer windows
+    # must reach the folded/extended tails of the seed ensemble so the umbrella
+    # ladder covers the fold coordinate. Robust 2/98% quantiles avoid a single
+    # outlier stretching the range. The dispatcher then refines the count.
+    centers = [float(x) for x in np.quantile(arr, [0.02, 0.50, 0.98])]
     centers = [max(-6.0, min(6.0, c)) for c in centers]
     if len({round(c, 6) for c in centers}) < 3:
         raise ValueError("torsion-pca seed projections collapsed; cannot choose three distinct CV2 centers")
@@ -205,7 +209,13 @@ def _ensure_bootstrap_torsion_cv_ready(args, out_dir: Path, topology, primary_cv
         raise ValueError(f"torsion-pca feature count {X.shape[1]} != expected {expected_features}")
 
     cv1 = np.asarray([float(entry.get("primary_cv_value", np.nan)) for entry, _pos, _phi, _psi in usable], dtype=np.float64)
-    residualize = bool(getattr(args, "bootstrap_torsion_residualize_against_cv1", True))
+    # Default OFF: residualizing the backbone-torsion features against cv1 removes
+    # the cv1-correlated component, but for a folder the fold IS correlated torsion
+    # + contact motion -- so residualizing strips the fold signal and collapses the
+    # seed PC1 variance, leaving CV2 window centers crammed into a thin band that
+    # never spans the coordinate the runtime restraint explores. Opt in only when
+    # an orthogonal-to-cv1 secondary motion is genuinely wanted.
+    residualize = bool(getattr(args, "bootstrap_torsion_residualize_against_cv1", False))
     if residualize and not np.isfinite(cv1).all():
         print(
             "WARNING: cv2=torsion-pca residualization requested, but seed primary_cv_value "
