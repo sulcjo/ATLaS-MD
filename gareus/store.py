@@ -84,6 +84,24 @@ class ParquetSampleWriter:
 
     def close(self) -> None:
         self.flush()
+        self._consolidate()
+
+    def _consolidate(self) -> None:
+        """Merge all chunk_*.parquet into data.parquet then remove chunks."""
+        chunks = sorted(self._out_dir.glob("chunk_*.parquet"))
+        if len(chunks) <= 1:
+            if len(chunks) == 1:
+                chunks[0].rename(self._out_dir / "data.parquet")
+            return
+        import pyarrow.dataset as ds
+        import pyarrow.parquet as pq
+        tbl = ds.dataset(chunks, format="parquet").to_table()
+        tbl = tbl.sort_by([("step", "ascending"), ("replica", "ascending")])
+        tmp = self._out_dir / "data.parquet.tmp"
+        pq.write_table(tbl, tmp, compression="zstd", compression_level=3)
+        tmp.rename(self._out_dir / "data.parquet")
+        for c in chunks:
+            c.unlink(missing_ok=True)
 
 
 class ParquetExchangeWriter:
@@ -145,6 +163,24 @@ class ParquetExchangeWriter:
 
     def close(self) -> None:
         self.flush()
+        self._consolidate()
+
+    def _consolidate(self) -> None:
+        """Merge all chunk_*.parquet into data.parquet then remove chunks."""
+        chunks = sorted(self._out_dir.glob("chunk_*.parquet"))
+        if len(chunks) <= 1:
+            if len(chunks) == 1:
+                chunks[0].rename(self._out_dir / "data.parquet")
+            return
+        import pyarrow.dataset as ds
+        import pyarrow.parquet as pq
+        tbl = ds.dataset(chunks, format="parquet").to_table()
+        tbl = tbl.sort_by([("step", "ascending")])
+        tmp = self._out_dir / "data.parquet.tmp"
+        pq.write_table(tbl, tmp, compression="zstd", compression_level=3)
+        tmp.rename(self._out_dir / "data.parquet")
+        for c in chunks:
+            c.unlink(missing_ok=True)
 
 
 class SegmentRegistry:
