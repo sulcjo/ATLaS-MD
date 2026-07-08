@@ -36,6 +36,16 @@ from typing import Optional, Literal
 KT_KCAL = 0.5962   # k_B T at ~300 K, kcal/mol (matches run beta 0.4009 /kJ)
 UI_MODES = ("auto", "textual", "rich", "ansi")
 
+# GaMD boost detail views accumulate this many live samples per window.  Each
+# 'distances' progress event carries at most one boost value per window and
+# windows are written intermittently, so the byte span needed to reach a depth
+# is data-dependent: read the tail once at BOOST_READ_START_BYTES (sized to
+# clear the target in a single read for typical runs) and grow geometrically up
+# to BOOST_READ_MAX_BYTES only if a window is still short.
+BOOST_TARGET_PER_WINDOW = 2000
+BOOST_READ_START_BYTES  = 64 * 1024 * 1024
+BOOST_READ_MAX_BYTES    = 256 * 1024 * 1024
+
 
 @dataclass(frozen=True)
 class Diagnostic:
@@ -1245,7 +1255,8 @@ def _sample_window_label(sample: dict) -> Optional[str]:
     return None
 
 
-def group_boost_values_by_window(samples: list[dict], limit_per_window: int = 400) -> list[tuple[str, list[float]]]:
+def group_boost_values_by_window(samples: list[dict],
+                                 limit_per_window: int = BOOST_TARGET_PER_WINDOW) -> list[tuple[str, list[float]]]:
     grouped: dict[str, list[float]] = {}
     order: list[str] = []
     for sample in samples:
@@ -1264,6 +1275,56 @@ def group_boost_values_by_window(samples: list[dict], limit_per_window: int = 40
             vals = vals[-limit_per_window:]
         out.append((label, vals))
     return out
+
+
+def _min_boost_samples_per_window(samples: list[dict]) -> int:
+    """Smallest usable-boost sample count across windows carrying explicit ids.
+
+    Returns 0 when no sample has an explicit window id, so a tail reader keeps
+    growing until every identified window reaches its target depth.
+    """
+    counts: dict[str, int] = {}
+    for sample in samples:
+        label = _sample_window_label(sample)
+        boost = sample.get("boost")
+        if label is None or not isinstance(boost, (int, float)) or not math.isfinite(float(boost)):
+            continue
+        counts[label] = counts.get(label, 0) + 1
+    return min(counts.values()) if counts else 0
+
+
+def read_boost_samples(path: Path,
+                       target_per_window: int = BOOST_TARGET_PER_WINDOW,
+                       start_bytes: int = BOOST_READ_START_BYTES,
+                       max_bytes: int = BOOST_READ_MAX_BYTES) -> list[dict]:
+    """Tail progress.jsonl for live 'distances' samples, deep enough per window.
+
+    Reads the tail once at start_bytes and grows it geometrically only while a
+    window is still short of target_per_window, stopping at the file start or
+    max_bytes (a safety bound for stalled windows or very wide runs).  Because
+    each event contributes at most one sample per window, the read size that
+    yields a given per-window depth is not known up front; start_bytes is sized
+    so typical runs finish in a single read.
+    """
+    if not path.exists():
+        return []
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return []
+    if size == 0:
+        return []
+    chunk = min(size, max(1, start_bytes))
+    samples: list[dict] = []
+    while True:
+        entries = tail_jsonl(path, 1_000_000, chunk_bytes=chunk)
+        samples = parse_distances_samples(entries)
+        if chunk >= size or chunk >= max_bytes:
+            break
+        if _min_boost_samples_per_window(samples) >= target_per_window:
+            break
+        chunk = min(size, max_bytes, chunk * 2)
+    return samples
 
 
 def boost_values_from_entries(entries: list, limit: int = 4000) -> list[float]:
@@ -1293,20 +1354,21 @@ def summarize_boost_values(values: list[float]) -> dict:
     }
 
 
-def _live_boost_window_groups(state, n: int = 4000, limit_per_window: int = 400) -> list[tuple[str, list[float]]]:
-    snap = state.live_snapshot()
-    samples = snap.get("_dist_samples") or []
-    return group_boost_values_by_window(samples[-n:], limit_per_window=limit_per_window)
+def _live_boost_window_groups(state,
+                              target_per_window: int = BOOST_TARGET_PER_WINDOW) -> list[tuple[str, list[float]]]:
+    samples = state.live_boost_samples(target_per_window=target_per_window)
+    return group_boost_values_by_window(samples, limit_per_window=target_per_window)
 
 
-def _live_boost_window_view(state, n: int = 4000, limit_per_window: int = 400):
+def _live_boost_window_view(state,
+                            target_per_window: int = BOOST_TARGET_PER_WINDOW,
+                            max_bytes: int = BOOST_READ_MAX_BYTES):
     state._load_progress()
     state._load_runtime_pool()
     if not state._progress_has_uncommitted_live_ns():
         return None
-    snap = state.live_snapshot()
-    samples = (snap.get("_dist_samples") or [])[-n:]
-    groups = group_boost_values_by_window(samples, limit_per_window=limit_per_window)
+    samples = state.live_boost_samples(target_per_window=target_per_window, max_bytes=max_bytes)
+    groups = group_boost_values_by_window(samples, limit_per_window=target_per_window)
     has_explicit_ids = any(_sample_window_label(sample) is not None for sample in samples)
     return {
         "groups": groups,
@@ -1706,6 +1768,9 @@ class PeptideState:
         self._genpept_surv        = None
         self._total_ep_cache      = None
         self._total_ep_mtime: float = 0.0
+        # live boost samples cache: (progress mtime, size, target) -> samples,
+        # so aggregate + per-window boost views share one deep tail read per tick
+        self._boost_samples_cache = None
         # diagnostics (MBAR readiness) — parsed from the latest COMPLETED epoch
         self._diag: dict          = {}
         self._diag_epoch_dir      = None
@@ -2183,7 +2248,18 @@ class PeptideState:
                 for e in entries
                 if e.get("aggregate_sim_time_ns") is not None]
 
-    def live_boost_values(self, n: int = 4000) -> list[float]:
+    def live_boost_samples(self,
+                           target_per_window: int = BOOST_TARGET_PER_WINDOW,
+                           max_bytes: int = BOOST_READ_MAX_BYTES) -> list[dict]:
+        """Deep live 'distances' samples for boost detail views (cached per tick).
+
+        Bypasses the shallow live_snapshot tail (capped for the fast connect
+        view) so per-window and aggregate boost distributions reach
+        BOOST_TARGET_PER_WINDOW depth.  Returns [] once progress is terminal or
+        no uncommitted live ns remains.  Cached by progress.jsonl
+        (mtime, size, target) so aggregate and per-window views triggered in the
+        same refresh share a single read.
+        """
         self._load_progress()
         self._load_runtime_pool()
         if not self._progress_has_uncommitted_live_ns():
@@ -2191,8 +2267,28 @@ class PeptideState:
         p = self.run_dir / "progress.jsonl"
         if not p.exists():
             return []
-        entries = tail_jsonl(p, max(200, n), chunk_bytes=1 << 20)
-        return boost_values_from_entries(entries, limit=n)
+        try:
+            st = p.stat()
+            key = (st.st_mtime, st.st_size, target_per_window)
+        except OSError:
+            key = None
+        if key is not None and self._boost_samples_cache is not None \
+                and self._boost_samples_cache[0] == key:
+            return self._boost_samples_cache[1]
+        samples = read_boost_samples(p, target_per_window=target_per_window, max_bytes=max_bytes)
+        if key is not None:
+            self._boost_samples_cache = (key, samples)
+        return samples
+
+    def live_boost_values(self, n: int = 0) -> list[float]:
+        vals = [
+            float(s["boost"])
+            for s in self.live_boost_samples()
+            if isinstance(s.get("boost"), float) and math.isfinite(s["boost"])
+        ]
+        if n and n > 0:
+            vals = vals[-n:]
+        return vals
 
     _LIVE_FIELDS = (
         "phase", "step", "total_steps", "percent", "fraction",
