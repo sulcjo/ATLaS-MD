@@ -7713,8 +7713,8 @@ def analyze_genpept_cv2_overlay(d: Data, args, out: Path, warnings: list[str]) -
     warning when the seed conformers, OpenMM, topology, or torsion-PCA state are
     unavailable.
     """
-    if not getattr(args, 'genpept_cv2_overlay', False):
-        return {'available': False, 'reason': 'disabled (use --genpept-cv2-overlay)'}
+    if not getattr(args, 'genpept_cv2_overlay', True):
+        return {'available': False, 'reason': 'disabled (--no-genpept-cv2-overlay)'}
     try:
         from gareus.genpept_cv2_overlay import (
             collect_seed_pdbs, fit_cv2_field, locate_genpept_seed_dir,
@@ -7725,14 +7725,15 @@ def analyze_genpept_cv2_overlay(d: Data, args, out: Path, warnings: list[str]) -
         warnings.append(f'genpept CV2 overlay skipped: import failed ({exc})')
         return {'available': False, 'reason': f'import failed: {exc}'}
 
+    # This stage runs by default, so the "not applicable to this run" skips
+    # (no genpept seed dir, or CV2 is not torsion-pca) stay silent — only
+    # surprising failures below append to the user-facing warnings list.
     seed_dir = locate_genpept_seed_dir(d.prod_dir, d.meta)
     if seed_dir is None:
-        warnings.append('genpept CV2 overlay skipped: seed_conformers_dir not found')
         return {'available': False, 'reason': 'seed_conformers_dir not found'}
     state_path = _find_bootstrap_torsion_state(d)
     if state_path is None:
-        warnings.append('genpept CV2 overlay skipped: bootstrap_torsion_cv.json not found (CV2 may not be torsion-pca)')
-        return {'available': False, 'reason': 'torsion-PCA state not found'}
+        return {'available': False, 'reason': 'torsion-PCA state not found (CV2 not torsion-pca)'}
     try:
         result = TICAResult.load(state_path)
     except Exception as exc:
@@ -9485,7 +9486,7 @@ def parse_args(argv=None):
     p.add_argument('--pca-allow-truncate', action='store_true', help='If trajectory frame counts differ from sample counts, align PCA trajectory frames to sample rows by production step instead of skipping.')
     p.add_argument('--pca-recompute', action='store_true', help='Recompute PCA scores even if pca_scores.npz already exists in the output directory.')
     p.add_argument('--pca-bins', type=int, default=None, help='Number of bins along both PCA axes for the PCA1-vs-PCA2 2D FES. Defaults to --bins.')
-    p.add_argument('--genpept-cv2-overlay', action='store_true', help='Reproduce the GENPEPT pseudo-FES (contacts/distance PCA of seed conformers) and overlay the epoch-0 secondary CV (torsion-PCA CV2) on it as a CV2-colored scatter plus fitted iso-CV2 contours. CV2 is regressed onto the pseudo-FES axes (an approximation across spaces). Requires the genpept seed dir, OpenMM, a topology PDB, and the torsion-PCA state file.')
+    p.add_argument('--genpept-cv2-overlay', action=argparse.BooleanOptionalAction, default=True, help='Reproduce the GENPEPT pseudo-FES (contacts/distance PCA of seed conformers) and overlay the epoch-0 secondary CV (torsion-PCA CV2) on it as a CV2-colored scatter plus fitted iso-CV2 contours. CV2 is regressed onto the pseudo-FES axes (an approximation across spaces). On by default; automatically no-ops (no warning) when the genpept seed dir or torsion-PCA state are absent. Use --no-genpept-cv2-overlay to skip; needs the seed dir, OpenMM, a topology PDB, and the torsion-PCA state file.')
     p.add_argument('--genpept-cv2-overlay-bins', type=int, default=None, help='Bins along both pseudo-FES PCA axes for the genpept CV2 overlay. Defaults to --bins.')
     p.add_argument('--genpept-cv2-overlay-order', type=int, default=1, help='Polynomial order (1=linear, 2=quadratic) for the CV2~f(PCA1,PCA2) fit in the genpept CV2 overlay.')
     p.add_argument('--genpept-cv2-overlay-r2-min', type=float, default=0.3, help='Minimum R2 of the CV2~f(PCA1,PCA2) fit required to draw iso-CV2 contours in the genpept CV2 overlay; below this only the CV2-colored scatter is shown.')

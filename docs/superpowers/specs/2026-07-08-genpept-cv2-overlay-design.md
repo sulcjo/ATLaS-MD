@@ -55,11 +55,14 @@ seed PDBs. Unweighted `deltaE_2d` by default (no energy CSV assumed).
    Fit CV2 ≈ f(pc1, pc2) (linear; quadratic optional); draw iso-CV2 contours +
    gradient arrow ONLY when R² ≥ threshold (default 0.3), else scatter-only.
    Always annotate R² on the figure. Save PNG + CSV of `(pc1, pc2, cv2)` per PDB.
-7. **Gate + degrade gracefully.** Behind a CLI flag (`--genpept-cv2-overlay`,
-   default off). Skip with a recorded warning when the seed dir, seed PDBs,
-   OpenMM, topology PDB, or torsion state file are missing. Handle the
-   adaptive-union load path dropping `meta['secondary_cv']` by pulling the
-   projection from per-epoch `umbrella_pymbar_metadata.json` or the state file.
+7. **Gate + degrade gracefully.** On by default (`--genpept-cv2-overlay` /
+   `--no-genpept-cv2-overlay`). "Not applicable to this run" skips (no genpept
+   seed dir, or CV2 is not torsion-pca) are silent — only surprising failures
+   (missing topology PDB, load/build errors) append to the warnings list. The
+   expensive PDB parse runs only once the seed dir + state + topology are all
+   present, so non-applicable runs skip cheaply. Handle the adaptive-union load
+   path dropping `meta['secondary_cv']` by pulling the projection from per-epoch
+   `umbrella_pymbar_metadata.json` or the state file.
 
 ## Module boundaries
 
