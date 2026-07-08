@@ -10,7 +10,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from gareus_monitor import (
+    BOOST_TARGET_PER_WINDOW,
     PeptideState,
+    _live_boost_window_view,
+    _min_boost_samples_per_window,
     _plan_yaml_path,
     _rich_detail_panel,
     boost_values_from_entries,
@@ -20,6 +23,7 @@ from gareus_monitor import (
     match_slurm_jobs_to_states,
     parse_distances_samples,
     parse_squeue_rows,
+    read_boost_samples,
     render_detail,
     summarize_boost_values,
 )
@@ -222,6 +226,120 @@ class GaMDBoostSummaryTests(unittest.TestCase):
         ])
 
         self.assertEqual(groups, [("W2", [5.0])])
+
+    def test_default_per_window_limit_is_at_least_two_thousand(self):
+        self.assertGreaterEqual(BOOST_TARGET_PER_WINDOW, 2000)
+
+    def test_group_boost_values_by_window_keeps_up_to_two_thousand_samples(self):
+        samples = [{"boost": float(i), "window": 1} for i in range(2500)]
+
+        groups = group_boost_values_by_window(samples)
+
+        self.assertEqual(len(groups), 1)
+        label, vals = groups[0]
+        self.assertEqual(label, "W1")
+        # keeps the target depth, dropping only the oldest overflow
+        self.assertEqual(len(vals), BOOST_TARGET_PER_WINDOW)
+        self.assertEqual(vals[-1], 2499.0)
+
+    def test_group_boost_values_by_window_keeps_all_when_under_target(self):
+        samples = [{"boost": float(i), "window": 1} for i in range(500)]
+
+        groups = group_boost_values_by_window(samples)
+
+        self.assertEqual(len(groups[0][1]), 500)
+
+    def test_min_boost_samples_per_window_reports_shallowest_window(self):
+        samples = (
+            [{"boost": 1.0, "window": 1}] * 5
+            + [{"boost": 2.0, "window": 2}] * 3
+            + [{"boost": None, "window": 3}]
+        )
+
+        self.assertEqual(_min_boost_samples_per_window(samples), 3)
+
+    def test_min_boost_samples_per_window_zero_without_explicit_ids(self):
+        self.assertEqual(_min_boost_samples_per_window([{"boost": 1.0}]), 0)
+
+    def test_read_boost_samples_reads_all_distances_from_small_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "progress.jsonl"
+            events = [
+                {
+                    "event": "distances",
+                    "distances": [
+                        {"primary_cv_value": 0.1, "secondary_cv": 0.2,
+                         "gamd_boost_total_kcal_mol": float(i), "window": 1},
+                    ],
+                }
+                for i in range(700)
+            ]
+            _append_jsonl(path, *events)
+
+            samples = read_boost_samples(path)
+
+            self.assertEqual(len(samples), 700)
+            self.assertEqual(_min_boost_samples_per_window(samples), 700)
+
+    def test_live_boost_window_view_keeps_more_than_old_four_hundred_cap(self):
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td) / "PEP_2d_run"
+            events = [
+                {
+                    "event": "distances",
+                    "distances": [
+                        {"primary_cv_value": 0.1, "secondary_cv": 0.2,
+                         "gamd_boost_total_kcal_mol": float(i), "window": 1},
+                    ],
+                }
+                for i in range(700)
+            ]
+            progress = {
+                "event": "progress",
+                "phase": "gareus_production",
+                "percent": 50.0,
+                "aggregate_sim_time_ns": 4.0,
+                "wall_time_s": 2000.0,
+            }
+            # progress lines interleave with distances in real runs; the tail
+            # gate scans only recent entries, so keep one near the end too
+            _append_jsonl(run_dir / "progress.jsonl", progress, *events, progress)
+            state = PeptideState.from_rundir(run_dir)
+            state.refresh()
+
+            view = _live_boost_window_view(state)
+
+            self.assertIsNotNone(view)
+            self.assertTrue(view["has_explicit_ids"])
+            groups = dict(view["groups"])
+            self.assertIn("W1", groups)
+            self.assertEqual(len(groups["W1"]), 700)
+
+    def test_live_boost_values_aggregate_reads_beyond_old_four_thousand_cap(self):
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td) / "PEP_2d_run"
+            events = [
+                {
+                    "event": "distances",
+                    "distances": [
+                        {"primary_cv_value": 0.1, "secondary_cv": 0.2,
+                         "gamd_boost_total_kcal_mol": float(i)},
+                    ],
+                }
+                for i in range(4200)
+            ]
+            progress = {
+                "event": "progress",
+                "phase": "gareus_production",
+                "percent": 50.0,
+                "aggregate_sim_time_ns": 4.0,
+                "wall_time_s": 2000.0,
+            }
+            _append_jsonl(run_dir / "progress.jsonl", progress, *events, progress)
+            state = PeptideState.from_rundir(run_dir)
+            state.refresh()
+
+            self.assertEqual(len(state.live_boost_values()), 4200)
 
     def test_peptide_state_live_boost_values_reads_progress_tail(self):
         with tempfile.TemporaryDirectory() as td:
