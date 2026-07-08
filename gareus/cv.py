@@ -664,7 +664,7 @@ def adaptive_secondary_force_constants_kcal(centers: Iterable[float], args) -> L
     overlap_sigma = max(0.05, overlap_sigma)
     min_sigma = max(1.0e-6, float(getattr(args, "secondary_cv_adaptive_min_sigma", 0.02) or 0.02))
     min_k = max(0.0, float(getattr(args, "secondary_cv_adaptive_min_k_kcal", 0.0) or 0.0))
-    max_k = max(min_k, float(getattr(args, "secondary_cv_adaptive_max_k_kcal", 500.0) or 500.0))
+    max_k = max(min_k, float(getattr(args, "secondary_cv_adaptive_max_k_kcal", 1000.0) or 1000.0))
     scale = max(0.0, float(getattr(args, "secondary_cv_adaptive_k_scale", 1.0) or 1.0))
     rt_kcal_mol = 0.00198720425864083 * float(getattr(args, "temperature_k", 300.0) or 300.0)
     k_by_center: Dict[float, float] = {}
