@@ -58,6 +58,7 @@ from .cv import (
     secondary_cv_enabled,
     secondary_cv_is_transition,
     secondary_cv_mode,
+    snap_to_rama_basins,
 )
 from .math_helpers import _adaptive_hist_overlap
 from .genpept_window_prior import build_genpept_window_prior, genpept_prior_enabled
@@ -223,6 +224,13 @@ def adaptive_secondary_default_centers(args) -> list[float]:
     mode = secondary_cv_mode(args)
     if mode == "alpha-coil-beta":
         return [-0.80, 0.0, 0.80]
+    if mode == "rama-regions":
+        return [-1.00, -0.50, 0.0, 0.50, 1.00]
+    if mode == "rama-map":
+        # The four named Ramachandran basins (beta/PPII/alpha_R/alpha_L).
+        # The old fall-through default [0.25, 0.55, 0.85] placed all windows
+        # outside the physical basin range [-1, 1] and was wrong.
+        return [-1.0, -1.0 / 3.0, 1.0 / 3.0, 1.0]
     return [0.25, 0.55, 0.85]
 
 
@@ -3161,7 +3169,15 @@ def run_adaptive_feedback_auto_loop(args, out_dir: Path, openmm, app, unit, forc
         current_centers = proposal["proposed_centers_A"]
         current_k = proposal["proposed_k_kcal_mol_A2"]
         if isinstance(proposal.get("proposed_secondary_cv_centers"), list):
-            current_secondary_centers = [float(x) for x in proposal.get("proposed_secondary_cv_centers")]
+            _proposed_sec = [float(x) for x in proposal.get("proposed_secondary_cv_centers")]
+            if secondary_cv_mode(args) == "rama-map":
+                # Snap proposed centers to named basin values and dedup.
+                # Adaptive 1D feedback can propose inter-basin positions that are
+                # unphysical for a softmax-output CV; snapping prevents phantom
+                # windows between basins while dedup avoids duplicate centers when
+                # two proposals round to the same basin.
+                _proposed_sec = sorted({snap_to_rama_basins(x) for x in _proposed_sec})
+            current_secondary_centers = _proposed_sec
         if isinstance(proposal.get("proposed_secondary_cv_k_kcal_mol"), list):
             current_secondary_k = [float(x) for x in proposal.get("proposed_secondary_cv_k_kcal_mol")]
         current_windows_2d_csv = _adaptive_feedback_sparse_candidate_csv_from_proposal(args, proposal, proposal_path)

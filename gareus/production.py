@@ -3092,6 +3092,31 @@ def run_shared_gamd_setup_article_a(
     shared_globals_all = all_integrator_globals(shared_integrator)
     shared_globals_interesting = integrator_globals(shared_integrator)
 
+    # F2: Extract Vmin/Vmax from calibration globals for downstream diagnostics.
+    # gamd-openmm stores these as "Vmin_Total"/"Vmax_Total" (kJ/mol) in the
+    # CustomIntegrator.  The exact key name is version-dependent, so we scan
+    # case-insensitively and prefer keys containing "total".
+    def _extract_vminmax(globals_dict: dict) -> tuple:
+        """Return (vmin_kj, vmax_kj) from integrator globals, defaulting to nan."""
+        vmin_kj = float("nan")
+        vmax_kj = float("nan")
+        candidates_min = [(k, v) for k, v in globals_dict.items() if "vmin" in k.lower()]
+        candidates_max = [(k, v) for k, v in globals_dict.items() if "vmax" in k.lower()]
+        # Prefer "total" variant if available, else take the first candidate
+        def _pick(candidates):
+            total_hits = [(k, v) for k, v in candidates if "total" in k.lower()]
+            chosen = total_hits[0] if total_hits else (candidates[0] if candidates else None)
+            if chosen is None:
+                return float("nan")
+            try:
+                val = float(chosen[1])
+                return val if math.isfinite(val) else float("nan")
+            except Exception:
+                return float("nan")
+        return _pick(candidates_min), _pick(candidates_max)
+
+    _vmin_kj, _vmax_kj = _extract_vminmax(shared_globals_all)
+
     payload = {
         "mode": "article_a_single_equilibrated_shared_gamd",
         "description": "One GaMD calibration/equilibration was run from the NPT-equilibrated peptide with umbrella k=0. The resulting same-name CustomIntegrator globals are copied to every GaREUS replica before production.",
@@ -3108,6 +3133,14 @@ def run_shared_gamd_setup_article_a(
         "interesting_globals": shared_globals_interesting,
         "all_globals": shared_globals_all,
         "note": "If using a gamd-openmm version that stores additional production restart information outside CustomIntegrator globals, compare this JSON with the package's native restart/log files before production science.",
+        "gamd_calibration_note": (
+            "Single shared GaMD calibration performed with umbrella k=0 (free peptide). "
+            "Vmin/Vmax are frozen from this run and copied to all production replicas. "
+            "Windows sampling PEs far outside [Vmin, Vmax] will have saturated or zero boost; "
+            "see calibration_range_warnings in the diagnostics output."
+        ),
+        "gamd_vmin_kj": _vmin_kj,
+        "gamd_vmax_kj": _vmax_kj,
     }
     write_json(out_dir / "shared_gamd_setup_globals.json", payload)
 
@@ -4082,6 +4115,11 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 ss_k_arr = ss_k_kcal_arr_global
                 ss_delta_matrix = ss_values[np.newaxis, :] - ss_centers_arr[:, np.newaxis]
                 ss_bias_matrix_kcal = 0.5 * ss_k_arr[:, np.newaxis] * ss_delta_matrix * ss_delta_matrix
+                # Guard NaN: windows without a secondary center (ss_centers_arr init to NaN)
+                # or replicas with a missing secondary value produce NaN in the Metropolis term,
+                # silently freezing that replica's exchanges and corrupting the cached bias matrix.
+                # Zero those entries — their exchange criterion falls back to primary CV only.
+                ss_bias_matrix_kcal = np.where(np.isfinite(ss_delta_matrix), ss_bias_matrix_kcal, 0.0)
             else:
                 ss_centers_arr = ss_centers_arr_global
                 ss_k_arr = ss_k_kcal_arr_global

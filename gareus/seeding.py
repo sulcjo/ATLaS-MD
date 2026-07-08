@@ -1070,6 +1070,15 @@ def generate_us_starting_states_by_pulling(
             if use_secondary:
                 secondary_delta = abs(secondary_value - target_secondary)
                 secondary_score = seed_secondary_weight * secondary_delta / max(1.0e-12, secondary_seed_scale)
+            elif (seed_selection_mode == "active-cv"
+                  and secondary_available
+                  and seed_secondary_weight > 0.0
+                  and math.isfinite(target_secondary)
+                  and not math.isfinite(secondary_value)):
+                # NaN secondary CV: assign a unit penalty so this seed never beats a seed
+                # with any finite secondary value.  Without this, NaN seeds score 0
+                # on the secondary term and are systematically preferred.
+                secondary_score = float(seed_secondary_weight)
             total = float(primary_score + secondary_score)
             components = {
                 "window": int(w),

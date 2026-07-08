@@ -420,6 +420,19 @@ def rama_map_definitions() -> List[Dict[str, Any]]:
         {"name": "alpha_l", "label": "left-alpha", "phi_deg": 60.0, "psi_deg": 40.0, "value": 1.0},
     ]
 
+
+def snap_to_rama_basins(value: float) -> float:
+    """Snap *value* to the nearest named rama-map basin scalar.
+
+    Basin scalars are the softmax output values defined in
+    ``rama_map_definitions()``: β=-1, PPII=-1/3, α_R=1/3, α_L=+1.
+    Useful for constraining adaptive-feedback proposals to physically
+    meaningful window centers instead of arbitrary inter-basin positions.
+    """
+    basins = [d["value"] for d in rama_map_definitions()]
+    return min(basins, key=lambda b: abs(b - float(value)))
+
+
 def _mean_torsion_scores_from_angles(angles: np.ndarray, targets_rad: np.ndarray, sigma_rad: float) -> np.ndarray:
     """Vectorized version of _mean_torsion_score_from_angles for many targets."""
     targets = np.asarray(targets_rad, dtype=np.float64)

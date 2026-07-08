@@ -884,6 +884,15 @@ def select_state_aware_seeds_for_targets(seed_bank_dir: Path, registry: WindowSt
     seed_bank_dir = Path(seed_bank_dir)
     rows = _read_csv_dicts(seed_bank_dir / "final_survivor_seeds.csv")
     assignments: List[Dict[str, Any]] = []
+    # Pre-compute axis spacings for normalized 2D scoring.  Raw dp²+ds² mixes
+    # incompatible units (e.g. contact fraction 0-1 vs rama-map -1 to 1), so a
+    # 1-window-spacing displacement on each axis should contribute equally.
+    _p_sorted = sorted({float(t.primary_center) for t in registry.active_states()})
+    _dp_scale = float(np.median(np.diff(_p_sorted))) if len(_p_sorted) > 1 else 1.0
+    _dp_scale = max(1e-12, _dp_scale)
+    _s_sorted = sorted({float(t.secondary_center) for t in registry.active_states() if t.secondary_center is not None})
+    _ds_scale = float(np.median(np.diff(_s_sorted))) if len(_s_sorted) > 1 else 1.0
+    _ds_scale = max(1e-12, _ds_scale)
     for target in registry.active_states():
         best = None
         best_score = float("inf")
@@ -896,7 +905,7 @@ def select_state_aware_seeds_for_targets(seed_bank_dir: Path, registry: WindowSt
             ds = 0.0
             if target.secondary_center is not None and s is not None:
                 ds = float(s) - float(target.secondary_center)
-            score = dp * dp + ds * ds
+            score = (dp / _dp_scale) ** 2 + (ds / _ds_scale) ** 2
             if score < best_score:
                 best_score = score
                 best = row
@@ -3712,6 +3721,7 @@ def run_scheduled_adaptive_epoch(
     baseline_steps = max(1, baseline_steps)
     segment_summaries: List[Dict[str, Any]] = []
     resume_requested = _arg_bool(args, "adaptive_production_resume", False)
+    _seg_call_counter: List[int] = [0]
 
     def run_segment(name: str, state_ids: Sequence[int], steps: int) -> Path:
         seg_dir = epoch_dir / name
@@ -3735,6 +3745,11 @@ def run_scheduled_adaptive_epoch(
             _epoch_idx = int(_epoch_dir_name.rsplit("_", 1)[-1])
         except Exception:
             _epoch_idx = 0
+        # Offset seed per segment so each segment gets fresh exchange-RNG and
+        # thermostat streams.  Without this every segment replays identical
+        # random sequences (N4: re-correlated RNG across segments).
+        seg_args.seed = int(args.seed) + _epoch_idx * 1_000_003 + _seg_call_counter[0] * 997
+        _seg_call_counter[0] += 1
         setattr(seg_args, "_adaptive_phase_info", {
             "is_adaptive_epoch": True,
             "epoch_index": _epoch_idx,
