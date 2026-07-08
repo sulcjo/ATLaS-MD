@@ -315,7 +315,7 @@ def _adaptive_window_aggressiveness_settings(args) -> dict:
             "max_add_cap": 2,
             "max_remove_fraction": 0.55,
             "max_remove_cap": 8,
-            "remove_block_radius": 0,
+            "remove_block_radius": 1,  # min 1 prevents adjacent removal gap (N3)
             "min_center_hit_for_removal": 0.03,
             "min_new_spacing_A": 0.75,
             "coverage_gap_ratio": 0.12,
