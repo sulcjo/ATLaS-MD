@@ -30,21 +30,34 @@ seed PDBs. Unweighted `deltaE_2d` by default (no energy CSV assumed).
 1. **Locate the genpept run dir.** Read `seed_conformers_dir` from the run's
    `run_args.json` (`analyze` already reads `run_args.json` at 259/591/882/4188).
    Re-root relative/stale paths using the existing logic in `seeding.py:425`.
-2. **Build (or load) the pseudo-FES.** Gather PDBs from the standard genpept
-   subdirs (`RUN_ROOT_PDB_DIR_NAMES`), `make_features(mode="mixed")` per structure,
-   `pca_svd(X, 2)` → per-structure `(pc1, pc2)`, `deltaE_2d(...)` → ΔE grid +
-   centers. (Reuse `pca_points.csv`/`deltaE_grid.csv` when present.)
-3. **Compute per-structure CV2.** Load the torsion-PCA state
-   `<epoch>/tica/bootstrap_torsion_cv.json` (`TICAResult.load`); for each structure
-   `tica.backbone_dihedral_features(...)` → `tica.project_tica1(X, result)` → CV2.
-   Same machinery as `production._ensure_bootstrap_torsion_cv_ready`.
-4. **Regress + render.** Fit CV2 ≈ f(pc1, pc2) (linear + optional quadratic),
-   evaluate over the ΔE grid → iso-CV2 contours; scatter seeds colored by CV2;
-   draw the CV2 gradient arrow; annotate R². Save PNG + a CSV of
-   `(pc1, pc2, cv2)` per structure and the fitted iso-CV2 grid.
-5. **Gate + degrade gracefully.** Behind a CLI flag
-   (`--genpept-cv2-overlay`, default off). Skip with a recorded warning when the
-   seed dir, seed PDBs, or torsion state file are missing. Handle the
+2. **Enumerate the same population genpept plots.** `expand_pdb_dirs([seed_dir])`
+   + `collect_pdbs` (genpept's own helpers) → the `RUN_ROOT_PDB_DIR_NAMES` set
+   (`basin_hop_minima`, `final_implicit_survivor_seeds`, `candidate_seeds`
+   fallback, adaptive rounds). This is the population behind the genpept
+   `pca_pseudo_fes` map — NOT `final_survivor_seeds.csv` (the smaller GAREUS
+   seeding list). When persisted `pca_points.csv`/`deltaE_grid.csv` exist, reuse
+   them (they carry `pc1/pc2` + `pdb_path` for this same broad population).
+3. **One parse per PDB feeds both layers.** `seeding._read_pdb_conformer_atoms`
+   → `positions_nm` + atom records (name, residue_ordinal). From the same parse:
+   CA coords (Å = nm·10) → `GENPEPT.make_features(mode="mixed")`; backbone atoms →
+   CV2. Guarantees the two layers come from identical geometry.
+4. **Pseudo-FES background.** Stack CA features, `pca_svd(X, 2)` → per-PDB
+   `(pc1, pc2)`, `deltaE_2d(...)` → ΔE grid + centers.
+5. **Per-PDB CV2.** OpenMM topology via `PDBFile(top_path).topology`
+   (`_find_data_topology_path` finds it). Load torsion-PCA state
+   `tica/bootstrap_torsion_cv.json` (`TICAResult.load`; torsions stored in it).
+   Per PDB: `_topology_to_conformer_atom_index(top, atoms)` →
+   `map_topology_torsions_to_conformer(result.phi/psi_torsion_indices, top, map)`
+   → `backbone_dihedral_features(pos_nm, ...)` → `project_tica1(X, result)`. Same
+   projection the runtime force uses.
+6. **Regress + render (scatter-primary).** Primary layer: scatter PDBs at
+   `(pc1, pc2)` colored by CV2 over the ΔE background — the honest ground truth.
+   Fit CV2 ≈ f(pc1, pc2) (linear; quadratic optional); draw iso-CV2 contours +
+   gradient arrow ONLY when R² ≥ threshold (default 0.3), else scatter-only.
+   Always annotate R² on the figure. Save PNG + CSV of `(pc1, pc2, cv2)` per PDB.
+7. **Gate + degrade gracefully.** Behind a CLI flag (`--genpept-cv2-overlay`,
+   default off). Skip with a recorded warning when the seed dir, seed PDBs,
+   OpenMM, topology PDB, or torsion state file are missing. Handle the
    adaptive-union load path dropping `meta['secondary_cv']` by pulling the
    projection from per-epoch `umbrella_pymbar_metadata.json` or the state file.
 
@@ -54,14 +67,17 @@ New module `gareus/genpept_cv2_overlay.py` (keeps the 9.5k-line analyze script
 lean; coding-style favors small focused files):
 
 - `locate_genpept_seed_dir(run_root, run_args) -> Path | None` — pure path logic.
-- `build_pseudo_fes(seed_dir) -> PseudoFES` — PDBs → PCA scores + ΔE grid
-  (reuse-or-recompute). `PseudoFES` is a small immutable dataclass
-  (`pc1`, `pc2`, `pdb_paths`, `grid_dE`, `pc1_centers`, `pc2_centers`, `components`).
-- `seed_cv2_values(pdb_paths, tica_result) -> np.ndarray` — per-structure CV2.
-- `fit_cv2_field(pc1, pc2, cv2, order=1) -> Cv2Field` — regression + R²; returns a
-  callable evaluated on the grid. Pure, unit-testable.
-- `plot_pseudo_fes_cv2_overlay(pseudo, cv2, field, out_png, labels) -> dict` — the
-  matplotlib render (imshow ΔE + contour iso-CV2 + scatter + arrow).
+- `collect_seed_pdbs(seed_dir) -> list[Path]` — thin wrapper over genpept's
+  `expand_pdb_dirs` + `collect_pdbs` (broad `pca_pseudo_fes` population).
+- `overlay_from_pdbs(pdb_paths, topology, tica_result) -> OverlayData` — the
+  single-parse loop: per PDB, CA→features + backbone→CV2. Builds ΔE grid via
+  `pca_svd` + `deltaE_2d`. `OverlayData` is a small immutable dataclass
+  (`pc1`, `pc2`, `cv2`, `grid_dE`, `pc1_centers`, `pc2_centers`).
+- `fit_cv2_field(pc1, pc2, cv2, order=1) -> Cv2Field` — regression + R²; callable
+  evaluated on the grid. Pure, unit-testable (the genuinely new logic).
+- `plot_overlay(data, field, out_png, labels, r2_min=0.3) -> dict` — matplotlib
+  render: imshow ΔE + scatter colored by CV2 (primary) + iso-CV2 contours/arrow
+  only when `field.r2 >= r2_min`; R² annotated always.
 
 `analyze_gareus_mbar.py` gets one thin driver `analyze_genpept_cv2_overlay(d, args,
 out, warnings)` that wires the module in and is a no-op (warning) when gated off or
@@ -80,18 +96,22 @@ data is missing.
 Data layer is pure and unit-tested; plotting is smoke-tested.
 
 - `fit_cv2_field`: recovers a known linear CV2 = a·pc1 + b·pc2 + c with R²≈1;
-  reports low R² for noise; handles rank-deficient input.
-- `seed_cv2_values`: with a synthetic `TICAResult` (known weights/mean/offset,
-  identity torsion indices) and mock dihedral features, matches `project_tica1`.
+  reports low R² for noise; handles rank-deficient / collinear input (no crash,
+  low R², `usable=False`).
+- `overlay_from_pdbs`: over ≥3 tiny mock PDBs + a synthetic OpenMM-like topology,
+  yields finite `pc1/pc2`, a finite ΔE grid, and CV2 matching a direct
+  `project_tica1` on hand-built features.
 - `locate_genpept_seed_dir`: absolute, relative, and re-rooted paths; missing → None.
-- `build_pseudo_fes`: reuse path (temp `pca_points.csv`/`deltaE_grid.csv`) returns
-  those values; recompute path over ≥3 tiny mock PDBs yields finite PCA scores.
-- `plot_pseudo_fes_cv2_overlay`: writes a non-empty PNG (Agg backend).
+- `collect_seed_pdbs`: over a temp tree with `basin_hop_minima/` etc., returns the
+  expected PDBs (deduped).
+- `plot_overlay`: writes a non-empty PNG (Agg backend); draws contours when
+  `r2 >= r2_min`, scatter-only below it.
 - Driver: returns `available=False` + warning when gated off / data missing.
 
-Real-data smoke check: run against `RUNS/chignolin/chignolin_2d_run3` (seed dir
-`chignolin_genpept_r3`, torsion state under `adaptive_feedback_round_03/tica/`) and
-confirm a PNG is produced.
+Real-data smoke check (verify the FIGURE, not just file-exists): run against the
+original-checkout `RUNS/chignolin/chignolin_2d_run3` (seed dir `chignolin_genpept_r3`,
+torsion state under `adaptive_feedback_round_03/tica/`); confirm the ΔE background
+resembles the genpept `pca_pseudo_fes` map and report the CV2 regression R².
 
 ## Out of scope
 
