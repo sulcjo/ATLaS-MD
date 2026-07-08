@@ -432,7 +432,7 @@ def _basic_chignolin_config() -> Dict[str, Any]:
             "cv1_range_max": 0.6,
             "cv1_target_spacing": 0.05,
             "cv1_k_min": 50.0,
-            "cv1_k_max": 100.0,
+            "cv1_k_max": 1000.0,
             "cv1_boundary_pull_steps": 10000,
             "cv1_boundary_pull_k": 50.0,
             "cv1_frontier": True,
@@ -442,7 +442,7 @@ def _basic_chignolin_config() -> Dict[str, Any]:
             # CV2 adaptive params
             "cv2_k_mode": "adaptive",
             "cv2_k_min": 5.0,
-            "cv2_k_max": 50.0,
+            "cv2_k_max": 1000.0,
             # overlap_sigma is spacing/sigma: larger => tighter windows => LESS
             # overlap. 2.3 targets ~0.25 neighbour overlap on the rama ladder
             # (k~=7 kcal/mol, unclamped); the old 20.0 collapsed overlap to ~1e-5.

@@ -83,6 +83,15 @@ def test_default_floor_soft_clamps_to_smaller_max_no_raise():
     assert len(new_primary) * len(new_secondary) <= 8
 
 
+def test_adaptive_k_max_ceiling_defaults_to_1000():
+    # The adaptive-k clamp must allow k up to 1000 so a tightly-spaced ladder can
+    # reach the target neighbour overlap (the old 120 / 500 ceilings capped it,
+    # leaving windows over-overlapped). Applies to both CVs when unset.
+    args = _parsed(BASE)
+    assert args.contact_adaptive_max_k_kcal == 1000.0
+    assert args.secondary_cv_adaptive_max_k_kcal == 1000.0
+
+
 def test_explicit_min_exceeding_max_still_raises():
     args = _parsed(BASE + ["--max-total-windows", "8", "--min-total-windows", "20"])
     with pytest.raises(ValueError):

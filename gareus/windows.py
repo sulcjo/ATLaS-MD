@@ -684,7 +684,7 @@ def adaptive_contact_force_constants_kcal(centers_c: np.ndarray, args) -> list[f
     overlap_sigma = max(0.05, float(getattr(args, "contact_adaptive_overlap_sigma", getattr(args, "adaptive_overlap_sigma", 1.25)) or 1.25))
     min_sigma = max(1.0e-5, float(getattr(args, "contact_adaptive_min_sigma", 0.02) or 0.02))
     min_k = max(0.0, float(getattr(args, "contact_adaptive_min_k_kcal", 5.0) or 5.0))
-    max_k = max(min_k, float(getattr(args, "contact_adaptive_max_k_kcal", 120.0) or 120.0))
+    max_k = max(min_k, float(getattr(args, "contact_adaptive_max_k_kcal", 1000.0) or 1000.0))
     scale = max(0.0, float(getattr(args, "contact_adaptive_k_scale", 1.0) or 1.0))
     ks = []
     offenders: List[Tuple[float, float, float, float]] = []
