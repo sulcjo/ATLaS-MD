@@ -7676,6 +7676,128 @@ def analyze_cv1_cv2_2d_fes(d: Data, args, base_logw: np.ndarray, selected: str, 
     return info
 
 
+def _find_bootstrap_torsion_state(d: Data) -> Optional[Path]:
+    """Locate the zeroth-epoch torsion-PCA state file (bootstrap_torsion_cv.json).
+
+    The bootstrap CV2 is fit once from the GENPEPT seeds and reused across
+    epochs, so any epoch's copy is the epoch-0 projection.  Prefer a direct
+    ``<dir>/tica/`` hit, then fall back to a recursive search.
+    """
+    roots: list[Path] = [d.prod_dir, d.prod_dir.parent]
+    roots += [Path(x) for x in d.meta.get('adaptive_epoch_run_dirs', [])]
+    for root in roots:
+        try:
+            direct = Path(root)/'tica'/'bootstrap_torsion_cv.json'
+            if direct.is_file():
+                return direct
+        except Exception:
+            continue
+    for root in roots:
+        try:
+            for cand in sorted(Path(root).glob('**/tica/bootstrap_torsion_cv.json')):
+                if cand.is_file():
+                    return cand
+        except Exception:
+            continue
+    return None
+
+
+def analyze_genpept_cv2_overlay(d: Data, args, out: Path, warnings: list[str]) -> dict:
+    """Overlay the epoch-0 torsion-PCA CV2 onto the GENPEPT pseudo-FES.
+
+    Approximate cross-space visualisation: the pseudo-FES lives in a
+    contacts/distance PCA space ("imaginary CV1/CV2"), so the torsion-PCA CV2 is
+    regressed onto those axes and drawn as iso-contours over a CV2-colored seed
+    scatter (the scatter is the ground truth; contours appear only when the fit
+    is strong).  Gated behind ``--genpept-cv2-overlay``; degrades to a recorded
+    warning when the seed conformers, OpenMM, topology, or torsion-PCA state are
+    unavailable.
+    """
+    if not getattr(args, 'genpept_cv2_overlay', False):
+        return {'available': False, 'reason': 'disabled (use --genpept-cv2-overlay)'}
+    try:
+        from gareus.genpept_cv2_overlay import (
+            collect_seed_pdbs, fit_cv2_field, locate_genpept_seed_dir,
+            overlay_from_pdbs, plot_overlay,
+        )
+        from gareus.tica import TICAResult
+    except Exception as exc:
+        warnings.append(f'genpept CV2 overlay skipped: import failed ({exc})')
+        return {'available': False, 'reason': f'import failed: {exc}'}
+
+    seed_dir = locate_genpept_seed_dir(d.prod_dir, d.meta)
+    if seed_dir is None:
+        warnings.append('genpept CV2 overlay skipped: seed_conformers_dir not found')
+        return {'available': False, 'reason': 'seed_conformers_dir not found'}
+    state_path = _find_bootstrap_torsion_state(d)
+    if state_path is None:
+        warnings.append('genpept CV2 overlay skipped: bootstrap_torsion_cv.json not found (CV2 may not be torsion-pca)')
+        return {'available': False, 'reason': 'torsion-PCA state not found'}
+    try:
+        result = TICAResult.load(state_path)
+    except Exception as exc:
+        warnings.append(f'genpept CV2 overlay skipped: could not load {state_path} ({exc})')
+        return {'available': False, 'reason': f'state load failed: {exc}'}
+    top_path = _find_data_topology_path(d, args, ('pca_topology', 'rg_topology'))
+    if top_path is None:
+        warnings.append('genpept CV2 overlay skipped: no topology PDB (use --pca-topology/--rg-topology)')
+        return {'available': False, 'reason': 'no topology PDB'}
+    try:
+        from openmm.app import PDBFile
+        topology = PDBFile(str(top_path)).topology
+    except Exception as exc:
+        warnings.append(f'genpept CV2 overlay skipped: OpenMM topology load failed ({exc})')
+        return {'available': False, 'reason': f'topology load failed: {exc}'}
+    try:
+        pdbs = collect_seed_pdbs(seed_dir)
+    except Exception as exc:
+        warnings.append(f'genpept CV2 overlay skipped: seed PDB collection failed ({exc})')
+        return {'available': False, 'reason': f'seed collection failed: {exc}'}
+    if len(pdbs) < 3:
+        warnings.append(f'genpept CV2 overlay skipped: only {len(pdbs)} seed PDBs found')
+        return {'available': False, 'reason': 'too few seed PDBs'}
+    try:
+        bins = int(getattr(args, 'genpept_cv2_overlay_bins', None) or args.bins)
+        data = overlay_from_pdbs(pdbs, topology, result, bins=bins)
+    except Exception as exc:
+        warnings.append(f'genpept CV2 overlay skipped: pseudo-FES build failed ({exc})')
+        return {'available': False, 'reason': f'pseudo-FES build failed: {exc}'}
+
+    order = int(getattr(args, 'genpept_cv2_overlay_order', 1) or 1)
+    field = fit_cv2_field(data.pc1, data.pc2, data.cv2, order=order)
+    r2_min = float(getattr(args, 'genpept_cv2_overlay_r2_min', 0.3) or 0.3)
+    labels = {'cv2': f'epoch-0 {_secondary_cv_label(d.meta)}',
+              'title': 'GENPEPT pseudo-FES with epoch-0 CV2 overlay (approximate)'}
+    out_png = out/'genpept_cv2_overlay.png'
+    plot_info = plot_overlay(data, field, out_png, labels=labels, r2_min=r2_min)
+
+    csv_path = out/'genpept_cv2_overlay_points.csv'
+    with csv_path.open('w', newline='') as f:
+        wr = csv.writer(f)
+        wr.writerow(['pdb', 'pc1', 'pc2', 'cv2'])
+        for p, a, b, c in zip(data.pdb_paths, data.pc1, data.pc2, data.cv2):
+            wr.writerow([str(p), float(a), float(b), float(c)])
+
+    info = {
+        'available': True,
+        'approximate': True,
+        'note': ('CV2 (torsion-PCA) regressed onto the GENPEPT contacts/distance-PCA '
+                 'pseudo-FES axes; the CV2-colored scatter is ground truth, iso-contours '
+                 'are the fitted approximation.'),
+        'n_conformers': int(data.n_used),
+        'n_finite_cv2': int(np.isfinite(data.cv2).sum()),
+        'cv2_vs_pseudofes_r2': float(field.r2),
+        'iso_contours_drawn': bool(plot_info['contours_drawn']),
+        'seed_dir': str(seed_dir),
+        'torsion_state': str(state_path),
+        'topology': str(top_path),
+        'files': {'genpept_cv2_overlay_png': str(out_png),
+                  'genpept_cv2_overlay_points_csv': str(csv_path)},
+    }
+    wjson(out/'genpept_cv2_overlay_summary.json', info)
+    return info
+
+
 def analyze_poincare_map(d: Data, args, base_logw: np.ndarray, selected: str, boost_ok: bool, kbt_kcal: float, out: Path, warnings: list[str], progress: Optional[Progress]) -> dict:
     """Poincaré return map analysis: backbone CV2 geometry at consecutive CV1 threshold crossings.
 
@@ -9215,6 +9337,7 @@ def analyze(d,args, progress: Optional[Progress] = None):
     poincare_info=analyze_poincare_map(d,args,np.asarray(m['logw'],dtype=np.float64),selected,boost_ok,kbt_kcal,out,warn,progress)
     poincare_torsions_info=analyze_poincare_residue_torsions(d,args,out,poincare_info,warn,progress)
     cv1_cv2_fes_info=analyze_cv1_cv2_2d_fes(d,args,np.asarray(m['logw'],dtype=np.float64),selected,boost_ok,kbt_kcal,out,warn,progress) if isinstance(secondary_cv_pmf_info,dict) and secondary_cv_pmf_info.get('available') else {'available':False,'reason':'Secondary CV PMF unavailable'}
+    genpept_cv2_overlay_info=analyze_genpept_cv2_overlay(d,args,out,warn)
     if progress is not None: progress.bar('analysis stages', 4, 6, 'writing CSV outputs', force=True)
     _sel_diag={'gamd_cumulant2':cdiag,'gamd_cumulant3':cdiag3}.get(selected,cdiag)
     write_pmf(out/'pmf_unbiased.csv',sel,selected,{'boost_mean_kj_mol':_sel_diag.get('boost_mean_kj',np.full(args.bins,np.nan)),'boost_var_kj2_mol2':_sel_diag.get('boost_var_kj2',np.full(args.bins,np.nan))}); write_pmf(out/'pmf_umbrella_only.csv',umbrella,'umbrella_only'); write_pmf(out/'pmf_gamd_exponential.csv',exp_pmf,'gamd_exponential'); write_pmf(out/'pmf_gamd_cumulant2.csv',cum_pmf,'gamd_cumulant2',{'boost_mean_kj_mol':cdiag.get('boost_mean_kj',np.full(args.bins,np.nan)),'boost_var_kj2_mol2':cdiag.get('boost_var_kj2',np.full(args.bins,np.nan))}); write_pmf(out/'pmf_gamd_cumulant3.csv',cum3_pmf,'gamd_cumulant3',{'boost_mean_kj_mol':cdiag3.get('boost_mean_kj',np.full(args.bins,np.nan)),'boost_var_kj2_mol2':cdiag3.get('boost_var_kj2',np.full(args.bins,np.nan))})
@@ -9251,6 +9374,7 @@ def analyze(d,args, progress: Optional[Progress] = None):
     s['poincare_map']=poincare_info
     s['poincare_residue_torsions']=poincare_torsions_info
     s['cv1_cv2_2d_fes']=cv1_cv2_fes_info
+    s['genpept_cv2_overlay']=genpept_cv2_overlay_info
     s['epoch_convergence']=epoch_conv_info
     s['epoch_cv_exploration']=epoch_cv_info
     s['tica_epochs']=tica_epoch_info
@@ -9361,6 +9485,10 @@ def parse_args(argv=None):
     p.add_argument('--pca-allow-truncate', action='store_true', help='If trajectory frame counts differ from sample counts, align PCA trajectory frames to sample rows by production step instead of skipping.')
     p.add_argument('--pca-recompute', action='store_true', help='Recompute PCA scores even if pca_scores.npz already exists in the output directory.')
     p.add_argument('--pca-bins', type=int, default=None, help='Number of bins along both PCA axes for the PCA1-vs-PCA2 2D FES. Defaults to --bins.')
+    p.add_argument('--genpept-cv2-overlay', action='store_true', help='Reproduce the GENPEPT pseudo-FES (contacts/distance PCA of seed conformers) and overlay the epoch-0 secondary CV (torsion-PCA CV2) on it as a CV2-colored scatter plus fitted iso-CV2 contours. CV2 is regressed onto the pseudo-FES axes (an approximation across spaces). Requires the genpept seed dir, OpenMM, a topology PDB, and the torsion-PCA state file.')
+    p.add_argument('--genpept-cv2-overlay-bins', type=int, default=None, help='Bins along both pseudo-FES PCA axes for the genpept CV2 overlay. Defaults to --bins.')
+    p.add_argument('--genpept-cv2-overlay-order', type=int, default=1, help='Polynomial order (1=linear, 2=quadratic) for the CV2~f(PCA1,PCA2) fit in the genpept CV2 overlay.')
+    p.add_argument('--genpept-cv2-overlay-r2-min', type=float, default=0.3, help='Minimum R2 of the CV2~f(PCA1,PCA2) fit required to draw iso-CV2 contours in the genpept CV2 overlay; below this only the CV2-colored scatter is shown.')
     p.add_argument('--pca1-min', type=float, default=None, help='Lower PCA1 bound in Angstrom for PCA 2D FES.')
     p.add_argument('--pca1-max', type=float, default=None, help='Upper PCA1 bound in Angstrom for PCA 2D FES.')
     p.add_argument('--pca2-min', type=float, default=None, help='Lower PCA2 bound in Angstrom for PCA 2D FES.')
