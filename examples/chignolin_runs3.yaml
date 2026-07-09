@@ -214,7 +214,7 @@ cvs:
 
 bootstrap_torsion_cv:
   bootstrap_torsion_source: seeds
-  bootstrap_torsion_residualize_against_cv1: true
+  bootstrap_torsion_residualize_against_cv1: false
   bootstrap_torsion_component: 1
   bootstrap_torsion_min_seed_count: 20
 
