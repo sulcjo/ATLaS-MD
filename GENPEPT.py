@@ -2897,6 +2897,29 @@ def make_min_config(args, mode: str) -> MinConfig:
     )
 
 
+def _minimization_succeeded(minimized_energy_kj_mol) -> bool:
+    """A minimization is usable only if it produced a finite energy.
+
+    OpenMM minimization can return a non-finite energy (e.g. a real-sequence
+    conformer with a bad sidechain clash that diverges) without raising an
+    exception.  Treating that as success let NaN energies reach the basin
+    archive, where a basin whose members are all NaN made np.nanargmin raise
+    'All-NaN slice encountered'.
+    """
+    try:
+        return bool(np.isfinite(float(minimized_energy_kj_mol)))
+    except (TypeError, ValueError):
+        return False
+
+
+def _best_energy_index(energies) -> Optional[int]:
+    """Index of the minimum finite energy; None if empty or all non-finite."""
+    arr = np.asarray(list(energies), dtype=float)
+    if arr.size == 0 or not np.isfinite(arr).any():
+        return None
+    return int(np.nanargmin(arr))
+
+
 def minimize_one(task):
     pdb_path_str, out_min_dir_str, system_dir_str, cfg_dict = task
     openmm, app, unit, XmlSerializer = import_openmm()
@@ -2955,12 +2978,13 @@ def minimize_one(task):
         rg, e2e, ccount, cvec = rg_e2e_contact(unit, positions, peptide_ca_indices(simulation.topology), cfg.contact_cutoff_A, cfg.contact_min_sep)
         remember_pdb_geometry(out_pdb, cfg.contact_cutoff_A, cfg.contact_min_sep, cvec, ccount, rg * 10.0, e2e * 10.0)
 
+        energy_ok = _minimization_succeeded(minimized_energy)
         return MinResult(
             seed_name=seed_name,
             input_pdb=str(pdb_path),
             output_pdb=str(out_pdb),
-            success=True,
-            error="",
+            success=energy_ok,
+            error="" if energy_ok else "non-finite minimized energy (minimization diverged)",
             mode=cfg.mode,
             n_atoms=sum(1 for _ in simulation.topology.atoms()),
             n_residues=sum(1 for _ in simulation.topology.residues()),
@@ -4745,7 +4769,12 @@ def write_basin_archive(args, results: list[MinResult], out_dir: Path, prefix: s
     basin_rows = []
     for basin_id, grp in points.groupby("basin_id"):
         energies = grp["energy_kj_mol"].to_numpy(dtype=float)
-        best_idx = int(np.nanargmin(energies)) if len(energies) else 0
+        # Guard against an all-NaN (or empty) basin: np.nanargmin raises on an
+        # all-NaN slice.  Failed minimizations are normally excluded upstream
+        # (success=False on non-finite energy), so this is belt-and-suspenders.
+        best_idx = _best_energy_index(energies)
+        if best_idx is None:
+            best_idx = 0
         best_row = grp.iloc[best_idx]
         basin_rows.append({
             "basin_id": int(basin_id),
