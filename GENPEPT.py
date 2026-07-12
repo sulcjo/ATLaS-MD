@@ -1360,6 +1360,29 @@ def decode_angle_list(value) -> list[float]:
     return [float(x) for x in text.split(";") if x]
 
 
+def _residue_geometry(Geometry, aa: str):
+    """Return PeptideBuilder geometry for a ONE-letter residue code.
+
+    PeptideBuilder's ``Geometry.geometry()`` expects a one-letter amino-acid code
+    and silently returns a glycine geometry (``GlyGeo``) for anything it does not
+    recognize — in particular any three-letter code.  Passing the three-letter
+    code (``AA3[aa]``) therefore built every residue as glycine, so survivor
+    conformers were poly-glycine backbones whose Ramachandran statistics did not
+    match the real sequence.  Guard against that silent substitution so a code or
+    PeptideBuilder-version regression fails loudly instead of degrading sampling.
+    """
+    aa = str(aa).strip().upper()
+    geo = Geometry.geometry(aa)
+    built = str(getattr(geo, "residue_name", "") or "").strip().upper()
+    if aa != "G" and built in {"G", "GLY"}:
+        raise RuntimeError(
+            f"PeptideBuilder built residue {aa!r} as glycine (residue_name={built!r}). "
+            "Geometry.geometry() expects a one-letter amino-acid code; a three-letter "
+            "code or an unsupported PeptideBuilder version silently falls back to glycine."
+        )
+    return geo
+
+
 def build_structure(seq: str, phis_deg: list[float], psis_deg: list[float]):
     PeptideBuilder, _ = require_generation_imports()
     from PeptideBuilder import Geometry
@@ -1368,9 +1391,9 @@ def build_structure(seq: str, phis_deg: list[float], psis_deg: list[float]):
     phi_by_idx = {i: phis_deg[i - 1] for i in range(1, n - 1)}
     psi_by_idx = {i: psis_deg[i - 1] for i in range(1, n - 1)}
 
-    structure = PeptideBuilder.initialize_res(Geometry.geometry(AA3[seq[0]]))
+    structure = PeptideBuilder.initialize_res(_residue_geometry(Geometry, seq[0]))
     for i, aa in enumerate(seq[1:], start=1):
-        geo = Geometry.geometry(AA3[aa])
+        geo = _residue_geometry(Geometry, aa)
         if i in phi_by_idx and hasattr(geo, "phi"):
             geo.phi = float(phi_by_idx[i])
         prev_i = i - 1
