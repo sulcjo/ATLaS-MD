@@ -3069,6 +3069,36 @@ def run_adaptive_feedback_auto_loop(args, out_dir: Path, openmm, app, unit, forc
     }
     write_json(out_dir / "adaptive_feedback_memory.json", _json_ready(adaptive_memory))
 
+    # GaMD shared setup (conventional-MD envelope + boosted multiwindow recon) is a
+    # campaign-global property of the system, not something to recalibrate every pilot
+    # round.  Calibrate it ONCE in the first pilot round, export it to a shared dir, and
+    # reuse it in every later pilot round and in final production instead of re-running
+    # the expensive recon each time.  Reuse is efficiency-only: GaMD reweighting stays
+    # formally valid regardless of which envelope was used (per-frame delta-V is
+    # recorded), and the sampling-time boost-SD guard still fires per window.
+    feedback_shared_gamd_dir = None
+    if bool(getattr(args, "adaptive_feedback_reuse_shared_gamd", True)) and "gamd" in str(getattr(args, "run_mode", "") or "").lower():
+        _requested_shared = str(getattr(args, "shared_gamd_setup_dir", "") or "").strip()
+        feedback_shared_gamd_dir = Path(_requested_shared) if _requested_shared else out_dir / "global_shared_gamd_setup"
+        feedback_shared_gamd_dir.mkdir(parents=True, exist_ok=True)
+        print(
+            "    Adaptive-feedback GaMD policy: calibrating the shared GaMD envelope ONCE "
+            "in the first pilot round and reusing it for all later rounds + final production "
+            f"(-> {feedback_shared_gamd_dir})"
+        )
+        write_json(out_dir / "adaptive_feedback_shared_gamd_policy.json", {
+            "schema_version": "adaptive_feedback_shared_gamd_policy_v1",
+            "enabled": True,
+            "shared_gamd_dir": str(feedback_shared_gamd_dir),
+            "behavior": (
+                "First pilot round calibrates the shared GaMD setup (cMD envelope + boosted "
+                "multiwindow recon) and exports it here; all later pilot rounds and final "
+                "production reuse it instead of recalibrating. Efficiency-only: per-frame "
+                "delta-V recording keeps GaMD reweighting valid and the sampling-time "
+                "boost-SD guard (ap_gamd_boost_sd_warn) still fires per window."
+            ),
+        })
+
     for round_index in range(n_rounds):
         round_no = round_index + 1
         # Capture centers used THIS pilot before the proposal replaces them (used for CV2 coverage check).
@@ -3102,6 +3132,10 @@ def run_adaptive_feedback_auto_loop(args, out_dir: Path, openmm, app, unit, forc
         round_dir.mkdir(parents=True, exist_ok=True)
         round_args = _clone_args(args)
         round_args.out = str(round_dir)
+        if feedback_shared_gamd_dir is not None:
+            # Round 1 calibrates + exports here; later rounds load it and skip the recon.
+            setattr(round_args, "_global_shared_gamd_setup_dir", str(feedback_shared_gamd_dir))
+            setattr(round_args, "_global_shared_gamd_export_dir", str(feedback_shared_gamd_dir))
         round_args.gamd_production_steps = int(current_pilot_steps)
         round_args.resume = False
         round_args.adaptive_feedback_enabled = True
@@ -3426,6 +3460,10 @@ def run_adaptive_feedback_auto_loop(args, out_dir: Path, openmm, app, unit, forc
     final_dir.mkdir(parents=True, exist_ok=True)
     final_args = _clone_args(args)
     final_args.out = str(final_dir)
+    if feedback_shared_gamd_dir is not None:
+        # Reuse the shared GaMD envelope calibrated during the pilot rounds.
+        setattr(final_args, "_global_shared_gamd_setup_dir", str(feedback_shared_gamd_dir))
+        setattr(final_args, "_global_shared_gamd_export_dir", str(feedback_shared_gamd_dir))
     final_args.gamd_production_steps = int(target_prod_steps)
     final_args.adaptive_feedback_enabled = False
     final_args.adaptive_feedback_target_overlap = float(target_overlap)

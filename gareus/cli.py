@@ -196,6 +196,10 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                    help="Target neighboring-window CV histogram overlap.")
     p.add_argument("--adaptive-feedback-min-rounds", type=int, default=2,
                    help="Minimum adaptive-feedback rounds regardless of convergence criteria.")
+    p.add_argument("--adaptive-feedback-reuse-shared-gamd", action=argparse.BooleanOptionalAction, default=True,
+                   help="Calibrate the shared GaMD envelope once in the first adaptive-feedback "
+                        "pilot round and reuse it for all later rounds and final production, instead "
+                        "of re-running the expensive multiwindow GaMD recon every round. Default on.")
     p.add_argument("--pilot-min-cv1-coverage", type=float, default=0.60,
                    help="Required CV1 coverage fraction across achievable [lo,hi] range before "
                         "pilot is accepted.")
