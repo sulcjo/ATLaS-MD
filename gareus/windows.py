@@ -552,6 +552,36 @@ def adaptive_force_constants_kcal_a2(centers_a: np.ndarray, args) -> list[float]
     ks = rt_kcal_mol / np.maximum(0.05, local / overlap_sigma) ** 2
     return [float(max(args.adaptive_min_k_kcal_a2, min(args.adaptive_max_k_kcal_a2, k))) for k in ks]
 
+def _contact_effective_range(
+    raw_lo: float,
+    raw_hi: float,
+    user_min: float,
+    user_max: float,
+    margin: float = 0.0,
+) -> tuple[float, float]:
+    """Effective [min, max] contact-fraction window range from CV1 boundary pulls.
+
+    The extended (min) direction equilibrates in picoseconds, so the pulled
+    minimum is trustworthy.  Folding (the max direction) is slow: a short
+    boundary pull routinely under-reaches the native contact fraction, and
+    trusting it collapses every umbrella window into the unfolded band, leaving
+    the folded basin unsampled.  The max is therefore floored at the
+    user-configured ``contact_adaptive_max`` — a pull may still EXPAND beyond it,
+    but never SHRINK below it — mirroring the lower bound's protection against
+    ``user_min``.  Both bounds are clamped to the [0, 1] fraction interval and a
+    minimum window width is enforced.
+    """
+    lo = max(0.0, float(raw_lo) - float(margin))
+    hi = min(1.0, float(raw_hi) + float(margin))
+    lo = min(lo, float(user_min))                    # never push lower bound above user config
+    hi = max(hi, min(1.0, float(user_max)))          # never let a short fold-pull shrink below user config
+    lo = max(0.0, min(1.0, lo))
+    hi = max(0.0, min(1.0, hi))
+    if hi - lo < 0.05:
+        hi = min(1.0, lo + 0.10)
+    return float(lo), float(hi)
+
+
 def adaptive_contact_centers(args) -> np.ndarray:
     """Initial adaptive centers for the dimensionless nonlocal-contact primary CV.
 
@@ -853,11 +883,7 @@ def run_cv_boundary_pulls(
     if is_contacts:
         user_min = float(getattr(args, "contact_adaptive_min", 0.0) or 0.0)
         user_max = float(getattr(args, "contact_adaptive_max", 0.80) or 0.80)
-        lo = max(0.0, raw_lo - margin)
-        hi = min(1.0, raw_hi + margin)
-        if hi - lo < 0.05:
-            hi = min(1.0, lo + 0.10)
-        lo = min(lo, user_min)  # never push lower bound above user config
+        lo, hi = _contact_effective_range(raw_lo, raw_hi, user_min, user_max, margin)
         setattr(args, "contact_adaptive_effective_min", float(lo))
         setattr(args, "contact_adaptive_effective_max", float(hi))
     else:
