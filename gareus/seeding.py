@@ -91,6 +91,39 @@ def kabsch_align_positions(
     return (mobile_all - mobile_center) @ R.T + target_center
 
 
+# Minimum number of real-topology atoms that must map onto seed atoms for a
+# backbone-subset graft.  Two residues' worth of backbone (N, CA, C, O) is enough
+# for a stable Kabsch superposition and a meaningful backbone conformation.
+_MIN_GRAFT_BACKBONE_ATOMS = 6
+
+
+def _assemble_grafted_positions_nm(
+    full_pos_nm: np.ndarray,
+    seed_pos_nm: np.ndarray,
+    topo_indices: np.ndarray,
+    seed_indices: np.ndarray,
+) -> np.ndarray:
+    """Backbone-subset graft: Kabsch-align the seed onto the mapped topology atoms,
+    then overwrite only those mapped atoms with the aligned seed coordinates.
+
+    ``topo_indices[k]`` and ``seed_indices[k]`` are a corresponding pair (same real
+    atom identified in the production topology and in the seed conformer).  Unmapped
+    atoms (e.g. sidechains absent from a poly-glycine backbone seed) keep their
+    existing positions and are relaxed by the caller's energy minimization.
+
+    Pure NumPy so the mapping/scatter logic is unit-testable without an OpenMM
+    context.  Returns a new array; ``full_pos_nm`` is not mutated.
+    """
+    topo_indices = np.asarray(topo_indices, dtype=int)
+    seed_indices = np.asarray(seed_indices, dtype=int)
+    target_sub = full_pos_nm[topo_indices, :]
+    mobile_sub = seed_pos_nm[seed_indices, :]
+    aligned_seed_all = kabsch_align_positions(mobile_sub, target_sub, seed_pos_nm)
+    new_full_pos = np.array(full_pos_nm, dtype=float, copy=True)
+    new_full_pos[topo_indices, :] = aligned_seed_all[seed_indices, :]
+    return new_full_pos
+
+
 def harmonic_bias_energy_kj(distance_nm: float, center_nm: float, k_kj_nm2: float) -> float:
     dr = float(distance_nm) - float(center_nm)
     return 0.5 * float(k_kj_nm2) * dr * dr
@@ -547,16 +580,31 @@ def graft_conformer_into_context(
     minimize_iters: int = 100,
     seed: int = 0,
 ) -> dict:
-    """Graft a gas-phase GENPEPT conformer into the solvated context, minimize clashes, re-thermalize."""
+    """Graft a gas-phase GENPEPT conformer into the solvated context, minimize clashes, re-thermalize.
+
+    GENPEPT survivor seeds are frequently poly-glycine backbone-only conformers with
+    fewer atoms than the real sidechain-bearing peptide.  We map seed atoms onto the
+    real topology by (residue, atom name) and overwrite only the mapped (backbone)
+    atoms, retaining the real sidechains for minimization to relax.  A seed whose atom
+    count matches the peptide and carries no name map keeps the legacy wholesale path.
+    """
     # Early guards run unguarded — these are programming errors if they fail
     pep_residues = peptide_residues(topology)
     n_pep = sum(sum(1 for _ in res.atoms()) for res in pep_residues)
-    if conformer["positions_nm"].shape[0] != n_pep:
-        return {"fallback": True, "fallback_reason": "atom_count_mismatch"}
+    first_pep_atom_index = next(iter(pep_residues[0].atoms())).index if pep_residues else 0
+    seed_pos_nm = np.asarray(conformer["positions_nm"], dtype=float)
+    n_seed = int(seed_pos_nm.shape[0])
+
+    # Real-topology peptide atom index -> seed conformer atom index, restricted to
+    # the peptide atom range and to seed atoms that actually exist.
+    topo_to_seed = {
+        int(t): int(s)
+        for t, s in (conformer.get("topology_to_conformer_atom_index") or {}).items()
+        if first_pep_atom_index <= int(t) < first_pep_atom_index + n_pep and 0 <= int(s) < n_seed
+    }
 
     ca_abs = []
     ca_rel = []
-    first_pep_atom_index = next(iter(pep_residues[0].atoms())).index if pep_residues else 0
     for res in pep_residues:
         try:
             idx = find_atom_in_residue(res, "CA")
@@ -566,19 +614,44 @@ def graft_conformer_into_context(
             pass
     if len(ca_abs) < 2:
         return {"fallback": True, "fallback_reason": "too_few_ca"}
-
     ca_abs_arr = np.array(ca_abs, dtype=int)
     ca_rel_arr = np.array(ca_rel, dtype=int)
+
+    # Legacy path: same atom count and no name map -> wholesale overwrite by
+    # peptide-block order.  Otherwise do a name-mapped backbone-subset graft.
+    wholesale = (n_seed == n_pep) and not topo_to_seed
+    if not wholesale and len(topo_to_seed) < _MIN_GRAFT_BACKBONE_ATOMS:
+        return {"fallback": True, "fallback_reason": "too_few_mapped_atoms"}
 
     # OpenMM calls — wrapped so a platform failure falls back gracefully
     try:
         state = sim.context.getState(getPositions=True, enforcePeriodicBox=True)
         full_pos_nm = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
-        target_ca = full_pos_nm[ca_abs_arr, :]
-        mobile_ca = conformer["positions_nm"][ca_rel_arr, :]
-        aligned_pep_pos_nm = kabsch_align_positions(mobile_ca, target_ca, conformer["positions_nm"])
-        new_full_pos = full_pos_nm.copy()
-        new_full_pos[first_pep_atom_index : first_pep_atom_index + n_pep, :] = aligned_pep_pos_nm
+        graft_mode = "wholesale" if wholesale else "backbone-subset"
+        if wholesale:
+            target_ca = full_pos_nm[ca_abs_arr, :]
+            mobile_ca = seed_pos_nm[ca_rel_arr, :]
+            aligned_pep_pos_nm = kabsch_align_positions(mobile_ca, target_ca, seed_pos_nm)
+            new_full_pos = full_pos_nm.copy()
+            new_full_pos[first_pep_atom_index : first_pep_atom_index + n_pep, :] = aligned_pep_pos_nm
+            ca_aligned_nm = aligned_pep_pos_nm[ca_rel_arr, :]
+            n_grafted = int(n_pep)
+        else:
+            topo_idx = np.fromiter(topo_to_seed.keys(), dtype=int, count=len(topo_to_seed))
+            seed_idx = np.fromiter((topo_to_seed[int(t)] for t in topo_idx), dtype=int, count=len(topo_to_seed))
+            new_full_pos = _assemble_grafted_positions_nm(full_pos_nm, seed_pos_nm, topo_idx, seed_idx)
+            n_grafted = int(topo_idx.size)
+            # Cα RMSD only over Cα atoms that mapped to a seed atom.
+            ca_map = {int(a): int(topo_to_seed[int(a)]) for a in ca_abs if int(a) in topo_to_seed}
+            if len(ca_map) >= 1:
+                aligned_seed_all = kabsch_align_positions(
+                    seed_pos_nm[seed_idx, :], full_pos_nm[topo_idx, :], seed_pos_nm
+                )
+                ca_abs_arr = np.array(list(ca_map.keys()), dtype=int)
+                ca_aligned_nm = aligned_seed_all[np.array(list(ca_map.values()), dtype=int), :]
+            else:
+                ca_abs_arr = np.array([], dtype=int)
+                ca_aligned_nm = None
         sim.context.setPositions(new_full_pos * unit.nanometer)
         sim.minimizeEnergy(maxIterations=minimize_iters)
         min_state = sim.context.getState(getPositions=True, enforcePeriodicBox=True)
@@ -590,12 +663,16 @@ def graft_conformer_into_context(
         # Cα RMSD: Kabsch-aligned conformer vs post-minimization peptide — measures
         # how much clash minimization distorted the graft; large values (>2 Å) indicate
         # the conformer was strained after insertion into the solvated box.
-        ca_aligned_nm = aligned_pep_pos_nm[ca_rel_arr, :]
-        ca_post_nm = min_pos_nm[ca_abs_arr, :]
-        ca_rmsd_A = float(np.sqrt(np.mean(np.sum((ca_aligned_nm - ca_post_nm) ** 2, axis=1)))) * 10.0
+        if ca_aligned_nm is not None and ca_abs_arr.size:
+            ca_post_nm = min_pos_nm[ca_abs_arr, :]
+            ca_rmsd_A = float(np.sqrt(np.mean(np.sum((ca_aligned_nm - ca_post_nm) ** 2, axis=1)))) * 10.0
+        else:
+            ca_rmsd_A = float("nan")
         return {
             "fallback": False,
             "used_conformer": str(conformer["pdb_path"]),
+            "graft_mode": graft_mode,
+            "n_grafted_atoms": n_grafted,
             "cv_before_A": float(conformer.get("cv_A", float("nan"))),
             "cv_after_A": float(cv_after_nm * 10.0),
             "primary_cv_before": float(conformer.get("primary_cv_value", conformer.get("cv_A", float("nan")))),
