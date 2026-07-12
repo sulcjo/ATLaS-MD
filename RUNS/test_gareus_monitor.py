@@ -688,6 +688,80 @@ class DiscoveryTests(unittest.TestCase):
             self.assertEqual([s.name for s in states], ["chignolin", "chignolin_tica"])
             self.assertEqual(_plan_yaml_path(states[1]).name, "chignolin_tica_autoswitch.yaml")
 
+    @staticmethod
+    def _mkrun(d: Path, markers):
+        d.mkdir(parents=True, exist_ok=True)
+        for name in markers:
+            (d / name).write_text("{}")
+        return d
+
+    def test_discovers_descriptively_named_run(self):
+        """A run dir not matching PEPTIDE_2d_run<N> is still resolved by markers."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            foo = root / "foo"
+            foo.mkdir()
+            (foo / "foo.yaml").write_text("md_budget_ns: 10\n")
+            # Early/hung run: only setup artifacts written, no progress yet.
+            self._mkrun(foo / "foo_fullrun",
+                        ("effective_config.json", "run_manifest.json", "00_built_peptide.pdb"))
+
+            states = {s.name: Path(s.run_dir).name for s in discover(root)}
+            self.assertEqual(states.get("foo"), "foo_fullrun")
+
+    def test_config_and_genpept_siblings_not_mistaken_for_run(self):
+        """A run's config/ provenance subdir and the genpept sibling never win."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            foo = root / "foo"
+            foo.mkdir()
+            (foo / "foo.yaml").write_text("md_budget_ns: 10\n")
+            run = self._mkrun(foo / "foo_fullrun", ("effective_config.json", "progress.jsonl"))
+            self._mkrun(run / "config", ("effective_config.json", "run_manifest.json"))
+            (foo / "foo_genpept").mkdir()
+            (foo / "foo_genpept" / "candidate_seeds").mkdir()
+
+            from gareus_monitor import _find_container_rundir
+            self.assertEqual(_find_container_rundir(foo, "foo").name, "foo_fullrun")
+            # Pointing directly at the container lists the run, never config/.
+            sub = {s.run_dir.name for s in discover(foo)}
+            self.assertIn("foo_fullrun", sub)
+            self.assertNotIn("config", sub)
+
+    def test_active_run_preferred_over_legacy_2d_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            foo = root / "foo"
+            foo.mkdir()
+            (foo / "foo.yaml").write_text("md_budget_ns: 10\n")
+            self._mkrun(foo / "foo_2d_run2", ("effective_config.json",))       # legacy, no progress
+            self._mkrun(foo / "foo_fullrun", ("effective_config.json", "progress.jsonl"))  # active
+
+            states = {s.name: Path(s.run_dir).name for s in discover(root)}
+            self.assertEqual(states.get("foo"), "foo_fullrun")
+
+    def test_collection_dir_not_collapsed_into_single_state(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            coll = root / "v09_runs"
+            coll.mkdir()
+            bar = coll / "bar"
+            bar.mkdir()
+            (bar / "bar.yaml").write_text("md_budget_ns: 10\n")
+            self._mkrun(bar / "bar_prodrun", ("progress.jsonl",))
+
+            names = [s.name for s in discover(root)]
+            self.assertNotIn("v09_runs", names)
+
+    def test_empty_container_uses_legacy_fallback_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            emp = root / "emp"
+            emp.mkdir()
+            (emp / "emp.yaml").write_text("md_budget_ns: 10\n")
+            from gareus_monitor import _find_container_rundir
+            self.assertEqual(_find_container_rundir(emp, "emp").name, "emp_2d_run")
+
 
 class SourceCompatibilityTests(unittest.TestCase):
     def test_postpones_annotations_for_python39_generic_alias_unions(self):

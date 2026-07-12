@@ -1730,6 +1730,52 @@ def sparkline(values: list, width: int = 60) -> str:
 
 # ── Per-peptide state ─────────────────────────────────────────────────────────
 
+# A GAREUS run output directory is identified by these markers, not by its name,
+# so descriptively named runs (PEPTIDE_fullrun, PEPTIDE_prod, ...) are discovered
+# too — not only the historical PEPTIDE_2d_run<N> convention.  These markers are
+# written by the run itself and never appear in a peptide-container dir, a genpept
+# prescan dir, or a run's own config/ provenance subdir.
+_RUN_MARKER_FILES = (
+    "progress.jsonl",
+    "run_manifest.json",
+    "effective_config.json",
+    "00_built_peptide.pdb",
+    "01_solvated_start.pdb",
+)
+
+
+def _looks_like_run(d: Path) -> bool:
+    """True if directory d is (or was) a GAREUS run output directory (any name)."""
+    try:
+        if (d / "adaptive_production").is_dir():
+            return True
+        return any((d / marker).exists() for marker in _RUN_MARKER_FILES)
+    except OSError:
+        return False
+
+
+def _is_named_run_child(child: Path, name: str) -> bool:
+    """True if `child` is a run output dir belonging to peptide `name`.
+
+    Scoped to the peptide name (exact, or ``name_*``) so a run's config/ subdir,
+    the genpept prescan sibling, and unrelated collection dirs are never mistaken
+    for the run.  Accepts the legacy ``name_2d_run<N>`` pattern and any other
+    ``name_*`` directory that carries run-output markers.
+    """
+    try:
+        if not child.is_dir():
+            return False
+    except OSError:
+        return False
+    if child.name != name and not child.name.startswith(f"{name}_"):
+        return False
+    if child.name == f"{name}_genpept" or child.name.startswith(f"{name}_genpept"):
+        return False
+    if re.match(rf"^{re.escape(name)}_2d_run\d*$", child.name):
+        return True
+    return _looks_like_run(child)
+
+
 def _run_dir_sort_key(path: Path):
     m = re.match(r"^(.+)_2d_run(\d*)$", path.name)
     suffix = int(m.group(2)) if (m and m.group(2)) else 0
@@ -1739,15 +1785,23 @@ def _run_dir_sort_key(path: Path):
         mtime = path.stat().st_mtime
     except OSError:
         mtime = 0.0
-    return (has_progress, has_pool, suffix, mtime)
+    # Prefer a run with live progress, then a runtime pool, then the most recently
+    # written dir (the active run), and only then the legacy _2d_run suffix.
+    return (has_progress, has_pool, mtime, suffix)
 
 
 def _find_container_rundir(base_dir: Path, name: str) -> Path:
-    """Return best PEPTIDE/PEPTIDE_2d_run* dir; supports cluster suffixes."""
-    candidates = [
-        d for d in base_dir.iterdir()
-        if d.is_dir() and re.match(rf"^{re.escape(name)}_2d_run\d*$", d.name)
-    ]
+    """Return the best run-output dir for peptide `name` inside its container.
+
+    Prefers the historical PEPTIDE_2d_run<N> layout but also accepts any
+    ``PEPTIDE_*`` subdir that looks like a run (see _is_named_run_child), so
+    descriptively named runs are discovered.  Falls back to the legacy path name
+    when nothing is present yet.
+    """
+    try:
+        candidates = [d for d in base_dir.iterdir() if _is_named_run_child(d, name)]
+    except OSError:
+        candidates = []
     if not candidates:
         return base_dir / f"{name}_2d_run"
     return max(candidates, key=_run_dir_sort_key)
@@ -2355,15 +2409,12 @@ _IGNORE = {
 
 def _is_flat_rundir(d: Path) -> bool:
     """True if d itself is a GAREUS run dir (not a peptide container)."""
-    return (d / "adaptive_production").is_dir() or (d / "progress.jsonl").exists()
+    return _looks_like_run(d)
 
 
 def _has_container_rundir(d: Path, name: str) -> bool:
     try:
-        return any(
-            c.is_dir() and re.match(rf"^{re.escape(name)}_2d_run\d*$", c.name)
-            for c in d.iterdir()
-        )
+        return any(_is_named_run_child(c, name) for c in d.iterdir())
     except OSError:
         return False
 
