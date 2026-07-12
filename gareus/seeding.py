@@ -124,6 +124,25 @@ def _assemble_grafted_positions_nm(
     return new_full_pos
 
 
+def _primary_seed_score(
+    primary_value: float,
+    target_primary: float,
+    primary_seed_scale: float,
+) -> tuple[float, float]:
+    """Return ``(abs_delta, score)`` for a seed's primary CV vs a window target.
+
+    A non-finite ``primary_value`` means the primary CV is unavailable for this
+    seed (e.g. a sidechain-contact CV cannot be evaluated on a backbone-only
+    poly-glycine seed).  Return score ``0`` so seed selection falls to the
+    secondary CV rather than an infinite penalty that swamps every seed equally
+    and defeats CV2 ranking.
+    """
+    if math.isfinite(primary_value):
+        delta = abs(float(primary_value) - float(target_primary))
+        return delta, delta / max(1.0e-12, float(primary_seed_scale))
+    return float("nan"), 0.0
+
+
 def harmonic_bias_energy_kj(distance_nm: float, center_nm: float, k_kj_nm2: float) -> float:
     dr = float(distance_nm) - float(center_nm)
     return 0.5 * float(k_kj_nm2) * dr * dr
@@ -501,6 +520,16 @@ def load_genpept_conformer_library(
 
             if row_rel_primary is not None:
                 primary_value = primary_cv_value_from_positions_nm(pos_nm, row_rel_primary, args)
+                # A contacts primary that resolved to a terminal-distance def on this
+                # seed (e.g. a backbone-only poly-glycine seed with no mappable
+                # sidechain contacts) is a units mismatch: the distance (Å) is NOT a
+                # dimensionless contact fraction.  Scoring on it corrupts active-CV
+                # seed selection (observed as conformer_primary_cv ~ 3.8 vs [0,1]
+                # centers).  Mark the primary CV unavailable so selection falls to the
+                # backbone-torsion secondary CV; the collapse is still flagged by
+                # detect_seed_scoring_degradations above.
+                if primary_cv_is_contacts(args) and primary_cv_mode(row_rel_primary) == "distance":
+                    primary_value = float("nan")
             else:
                 primary_value = float("nan")
             secondary_value = float("nan")
@@ -1132,8 +1161,7 @@ def generate_us_starting_states_by_pulling(
             # Legacy explicit distance mode is kept for reproducibility/debugging.
             if seed_selection_mode == "distance":
                 primary_value = float(conf.get("cv_A", primary_value))
-            primary_delta = abs(primary_value - target_primary) if math.isfinite(primary_value) else float("inf")
-            primary_score = primary_delta / max(1.0e-12, primary_seed_scale)
+            primary_delta, primary_score = _primary_seed_score(primary_value, target_primary, primary_seed_scale)
             secondary_value = float(conf.get("secondary_cv_value", float("nan")))
             secondary_delta = float("nan")
             secondary_score = 0.0
