@@ -24,6 +24,63 @@ def _args(**kw) -> argparse.Namespace:
     return ns
 
 
+def test_secondary_centers_are_data_derived_only_for_torsion_pca():
+    from gareus.adaptive_feedback import secondary_centers_are_data_derived
+
+    assert secondary_centers_are_data_derived(_args(secondary_cv="torsion-pca")) is True
+    assert secondary_centers_are_data_derived(_args(secondary_cv="alpha-coil-beta")) is False
+    assert secondary_centers_are_data_derived(_args(secondary_cv="rama-map")) is False
+    assert secondary_centers_are_data_derived(_args(secondary_cv="rama-regions")) is False
+    assert secondary_centers_are_data_derived(_args(secondary_cv="none")) is False
+
+
+def test_fallback_secondary_centers_skips_torsion_pca(monkeypatch):
+    """Regression test: run_adaptive_feedback_auto_loop used to pre-set
+    secondary_cv_centers to the generic [0.25, 0.55, 0.85] placeholder before
+    the seed-PCA bootstrap ran, permanently blocking the data-derived ladder
+    (and --cv2-n-centers) via the bootstrap's own "only fill in when None" guard.
+    """
+    import gareus.adaptive_feedback as af_mod
+
+    args = _args(
+        secondary_cv="torsion-pca",
+        secondary_cv_centers=None,
+        adaptive_secondary_cv="auto",
+    )
+
+    def _boom(*_a, **_kw):
+        raise AssertionError("adaptive_secondary_default_centers must not run for torsion-pca")
+
+    monkeypatch.setattr(af_mod, "adaptive_secondary_default_centers", _boom)
+
+    # Left None: the round-1 setup's seed-PCA bootstrap fills this in next.
+    assert af_mod._fallback_secondary_centers_if_needed(args, n_rounds=1) is None
+
+
+def test_fallback_secondary_centers_still_applies_for_fixed_ladder_modes():
+    from gareus.adaptive_feedback import _fallback_secondary_centers_if_needed
+
+    args = _args(
+        secondary_cv="alpha-coil-beta",
+        secondary_cv_centers=None,
+        adaptive_secondary_cv="auto",
+    )
+    assert _fallback_secondary_centers_if_needed(args, n_rounds=1) == [-0.80, 0.0, 0.80]
+
+
+def test_fallback_secondary_centers_noop_when_already_set_or_disabled():
+    from gareus.adaptive_feedback import _fallback_secondary_centers_if_needed
+
+    already_set = _args(secondary_cv="alpha-coil-beta", secondary_cv_centers=[-1.0, 0.0, 1.0], adaptive_secondary_cv="auto")
+    assert _fallback_secondary_centers_if_needed(already_set, n_rounds=1) is None
+
+    zero_rounds = _args(secondary_cv="alpha-coil-beta", secondary_cv_centers=None, adaptive_secondary_cv="auto")
+    assert _fallback_secondary_centers_if_needed(zero_rounds, n_rounds=0) is None
+
+    fixed_mode = _args(secondary_cv="alpha-coil-beta", secondary_cv_centers=None, adaptive_secondary_cv="fixed")
+    assert _fallback_secondary_centers_if_needed(fixed_mode, n_rounds=1) is None
+
+
 def test_torsion_pca_mode_aliases_and_range():
     assert secondary_cv_mode("torsion-pca") == "torsion-pca"
     assert secondary_cv_mode("bootstrap-torsion") == "torsion-pca"

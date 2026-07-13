@@ -65,6 +65,7 @@ from .genpept_window_prior import build_genpept_window_prior, genpept_prior_enab
 
 __all__ = [
     "adaptive_secondary_default_centers",
+    "secondary_centers_are_data_derived",
     "adaptive_contact_centers",
     "adaptive_contact_force_constants_kcal",
     "build_adaptive_window_centers_a",
@@ -232,6 +233,18 @@ def adaptive_secondary_default_centers(args) -> list[float]:
         # outside the physical basin range [-1, 1] and was wrong.
         return [-1.0, -1.0 / 3.0, 1.0 / 3.0, 1.0]
     return [0.25, 0.55, 0.85]
+
+
+def secondary_centers_are_data_derived(args) -> bool:
+    """True for secondary CV modes fit from seed data rather than a fixed ladder.
+
+    torsion-pca's real centers come from a seed-PCA quantile fit
+    (_ensure_bootstrap_torsion_cv_ready), which only runs once
+    secondary_cv_centers is still None. Applying adaptive_secondary_default_centers
+    first would win that guard and permanently lock the run onto the generic
+    placeholder instead of the data-derived ladder.
+    """
+    return secondary_cv_mode(args) == "torsion-pca"
 
 
 def _unique_axis_values(values, ndigits: int = 4) -> list[float]:
@@ -2909,6 +2922,28 @@ def _adaptive_feedback_sparse_candidate_csv_from_proposal(args, proposal: Option
         return None
     return None
 
+def _fallback_secondary_centers_if_needed(args, n_rounds: int) -> Optional[list[float]]:
+    """Return a placeholder secondary-CV ladder to seed round 1 with, or None.
+
+    None means no fallback is needed: adaptive secondary feedback is off,
+    centers are already set, or the mode fits its own data-derived ladder
+    later instead (see secondary_centers_are_data_derived) -- setting the
+    generic placeholder here would win that later guard and permanently lock
+    the run onto it.
+    """
+    raw_secondary_centers = getattr(args, "secondary_cv_centers", None)
+    adaptive_secondary_enabled = bool(
+        secondary_cv_enabled(args) and n_rounds > 0 and str(getattr(args, "adaptive_secondary_cv", "auto") or "auto") != "fixed"
+    )
+    if not adaptive_secondary_enabled:
+        return None
+    if raw_secondary_centers is not None and len(raw_secondary_centers) > 1:
+        return None
+    if secondary_centers_are_data_derived(args):
+        return None
+    return adaptive_secondary_default_centers(args)
+
+
 def run_adaptive_feedback_auto_loop(args, out_dir: Path, openmm, app, unit, forcefield, topology, equil_state, progress: Optional[GuiProgressSink] = None):
     """Run short adaptive-feedback pilot round(s), optionally followed by clean final production.
 
@@ -2926,10 +2961,9 @@ def run_adaptive_feedback_auto_loop(args, out_dir: Path, openmm, app, unit, forc
     """
     out_dir = Path(out_dir)
     n_rounds = max(0, int(getattr(args, "adaptive_feedback_rounds", 1) or 0))
-    raw_secondary_centers = getattr(args, "secondary_cv_centers", None)
-    adaptive_secondary_enabled = bool(secondary_cv_enabled(args) and n_rounds > 0 and str(getattr(args, "adaptive_secondary_cv", "auto") or "auto") != "fixed")
-    if adaptive_secondary_enabled and (raw_secondary_centers is None or len(raw_secondary_centers) <= 1):
-        args.secondary_cv_centers = adaptive_secondary_default_centers(args)
+    fallback_secondary_centers = _fallback_secondary_centers_if_needed(args, n_rounds)
+    if fallback_secondary_centers is not None:
+        args.secondary_cv_centers = fallback_secondary_centers
         print("    adaptive secondary-CV feedback: starting centers " + ", ".join(f"{x:.3g}" for x in args.secondary_cv_centers))
     target_prod_steps = max(1, int(getattr(args, "gamd_production_steps", 1) or 1))
     skip_final_production = bool(

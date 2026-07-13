@@ -115,6 +115,23 @@ def test_explicit_min_total_still_validates_conflict():
         )
 
 
+def test_adaptive_contact_centers_axis_shrinks_with_more_secondary_centers():
+    # This is the load-bearing link for rebalancing a CV1 x CV2 grid via CV2
+    # center count alone (e.g. torsion-pca's --cv2-n-centers): with a fixed
+    # total budget of 24 and 6 secondary (CV2) centers already resolved, the
+    # CV1 axis must be capped at floor(24 / 6) = 4, not left at whatever a
+    # smaller/default secondary count would have allowed.
+    args = _parsed(BASE + ["--max-total-windows", "24", "--min-total-windows", "8"])
+    args.contact_adaptive_min = 0.0
+    args.contact_adaptive_max = 0.45
+    args.contact_adaptive_target_spacing = 0.01  # fine enough that the axis cap binds, not spacing
+    args.secondary_cv_centers = [0.25, 0.55, 0.85, 1.1, 1.4, 1.7]
+
+    centers = windows.adaptive_contact_centers(args)
+
+    assert len(centers) == 4
+
+
 def test_sparse_patches_respect_total_budget():
     # The total-window budget must bound the FINAL count (base grid + sparse
     # patches), not just the factorized base grid. 10 base + 4 candidate patches,
