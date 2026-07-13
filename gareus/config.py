@@ -448,6 +448,7 @@ def _basic_chignolin_config() -> Dict[str, Any]:
             # (k~=7 kcal/mol, unclamped); the old 20.0 collapsed overlap to ~1e-5.
             "cv2_adaptive_overlap_sigma": 2.3,
             "cv2_k_scale": 1.0,
+            "cv2_n_centers": 3,
         },
         "starting_structures": {
             "seed_conformers_dir": "chignolin_genpept_seeds/",

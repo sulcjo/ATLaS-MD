@@ -144,6 +144,9 @@ def _add_cv_args(p: argparse.ArgumentParser) -> None:
     # CV2 adaptive — secondary CV parameters
     p.add_argument("--cv2-centers", nargs="*", type=float, default=None,
                    help="Secondary CV targets. One value = all windows same; multiple = 2D grid.")
+    p.add_argument("--cv2-n-centers", type=int, default=3,
+                   help="Number of data-derived CV2 quantile centers for torsion-pca "
+                        "auto-centering (ignored if --cv2-centers is set explicitly). Must be >= 3.")
     p.add_argument("--cv2-k-default", type=float, default=50.0,
                    help="Default CV2 force constant in kcal/mol/CV².")
     p.add_argument("--cv2-k-mode", choices=["fixed", "constant", "spacing", "adaptive"],
