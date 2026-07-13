@@ -130,19 +130,21 @@ def _bootstrap_torsion_state_path(args, out_dir: Path) -> Path:
     return Path(out_dir) / "tica" / "bootstrap_torsion_cv.json"
 
 
-def _seed_projection_centers(values: np.ndarray) -> list[float]:
+def _seed_projection_centers(values: np.ndarray, n_centers: int = 3) -> list[float]:
     arr = np.asarray(values, dtype=np.float64)
     arr = arr[np.isfinite(arr)]
-    if arr.size < 3:
-        raise ValueError(f"torsion-pca center selection needs at least 3 finite projections, got {arr.size}")
+    n_centers = max(3, int(n_centers))
+    if arr.size < n_centers:
+        raise ValueError(f"torsion-pca center selection needs at least {n_centers} finite projections, got {arr.size}")
     # Span (near-)full seed distribution, not the inner 70%: the outer windows
     # must reach the folded/extended tails of the seed ensemble so the umbrella
     # ladder covers the fold coordinate. Robust 2/98% quantiles avoid a single
     # outlier stretching the range. The dispatcher then refines the count.
-    centers = [float(x) for x in np.quantile(arr, [0.02, 0.50, 0.98])]
+    quantiles = np.linspace(0.02, 0.98, n_centers)
+    centers = [float(x) for x in np.quantile(arr, quantiles)]
     centers = [max(-6.0, min(6.0, c)) for c in centers]
-    if len({round(c, 6) for c in centers}) < 3:
-        raise ValueError("torsion-pca seed projections collapsed; cannot choose three distinct CV2 centers")
+    if len({round(c, 6) for c in centers}) < n_centers:
+        raise ValueError(f"torsion-pca seed projections collapsed; cannot choose {n_centers} distinct CV2 centers")
     return centers
 
 
@@ -252,7 +254,8 @@ def _ensure_bootstrap_torsion_cv_ready(args, out_dir: Path, topology, primary_cv
 
     projections = project_tica1(X, result)
     if getattr(args, "_cv2_auto_centers", False) and not getattr(args, "secondary_cv_centers", None):
-        centers = _seed_projection_centers(projections)
+        n_centers = int(getattr(args, "cv2_n_centers", 3) or 3)
+        centers = _seed_projection_centers(projections, n_centers=n_centers)
         args.cv2_centers = centers
         args.secondary_cv_centers = centers
 
