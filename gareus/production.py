@@ -2795,9 +2795,22 @@ def run_multiwindow_gamd_recon(
     report_interval = int(getattr(args, "gamd_multiwindow_recon_report_interval", 0) or 0)
     if report_interval <= 0:
         report_interval = max(1, recon_steps // 200)
+    if str(getattr(args, "platform", "")).upper() == "CPU" and int(getattr(args, "cpu_threads", 1)) == 0 and nwin > 1:
+        print(
+            f"WARNING: --cpu-threads 0 (use all cores) combined with {nwin} parallel recon windows "
+            "will oversubscribe CPU cores. Set --cpu-threads 1 for parallel recon."
+        )
 
-    per_group_window_stats: dict[str, list] = {}
     equil_box = equil_state.getPeriodicBoxVectors()
+
+    # Build every window's Context serially, exactly like the production replica
+    # burst (see the "[4/4] Building N GaREUS replicas" loop): concurrent context
+    # creation on OpenCL/CUDA can trip clCreateContext(-6)-style failures, so
+    # construction stays single-threaded even though stepping will fan out.
+    sims: list = []
+    systems: list = []
+    integrators: list = []
+    targets_per_window: list = []
     for i in range(nwin):
         system_i = deserialize_system(openmm, base_system)
         targets, _peek_integrator = _gamd_boost_group_targets(system_i, args, unit)
@@ -2819,30 +2832,53 @@ def run_multiwindow_gamd_recon(
         else:
             sim_i.context.setVelocitiesToTemperature(args.temperature_k * unit.kelvin, args.seed + 4021 + i)
         set_window(sim_i.context, centers_nm, ks_kj_nm2, i, secondary_cv_centers, secondary_cv_ks_kj)
+        sims.append(sim_i)
+        systems.append(system_i)
+        integrators.append(step_integrator)
+        targets_per_window.append(targets)
 
+    # Parallel prep + recon across windows, mirroring the production step_all()
+    # fan-out: OpenMM releases the GIL during context.step()/getState(), so one
+    # thread per window genuinely runs concurrently across GPUs/devices.
+    recon_pool = ThreadPoolExecutor(max_workers=nwin)
+    try:
         if prep_steps > 0:
-            sim_i.step(prep_steps)
+            list(recon_pool.map(lambda sim_i: sim_i.step(int(prep_steps)), sims))
 
-        accumulators = {name: WelfordAccumulator() for name, _gid in targets}
-        done = 0
-        while done < recon_steps:
-            chunk = min(report_interval, recon_steps - done)
+        accumulators_by_window = [
+            {name: WelfordAccumulator() for name, _gid in targets_per_window[i]}
+            for i in range(nwin)
+        ]
+
+        def _recon_chunk(item):
+            i, sim_i = item
             sim_i.step(int(chunk))
-            done += int(chunk)
-            for name, gid in targets:
+            for name, gid in targets_per_window[i]:
                 groups = {gid} if gid is not None else set(range(32))
                 state = sim_i.context.getState(getEnergy=True, groups=groups)
                 pe_kj = float(state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole))
-                accumulators[name].update(pe_kj)
+                accumulators_by_window[i][name].update(pe_kj)
+            return i
 
-        if progress is not None:
-            progress.progress(
-                phase_label, i + 1, nwin,
-                message=f"window {i + 1}/{nwin} recon done", force=(i == nwin - 1),
-            )
-        for name, acc in accumulators.items():
+        done = 0
+        while done < recon_steps:
+            chunk = min(report_interval, recon_steps - done)
+            list(recon_pool.map(_recon_chunk, enumerate(sims)))
+            done += int(chunk)
+            if progress is not None:
+                progress.progress(
+                    phase_label, done, recon_steps,
+                    message=f"{nwin} windows in parallel | recon {done}/{recon_steps} steps",
+                    n_replicas=nwin, force=(done >= recon_steps),
+                )
+    finally:
+        recon_pool.shutdown(wait=True)
+
+    per_group_window_stats: dict[str, list] = {}
+    for i in range(nwin):
+        for name, acc in accumulators_by_window[i].items():
             per_group_window_stats.setdefault(name, []).append(acc.to_stats(name, i))
-        release_openmm_contexts(sim_i, step_integrator, system_i)
+        release_openmm_contexts(sims[i], integrators[i], systems[i])
 
     if not per_group_window_stats:
         raise RuntimeError("Multi-window GaMD recon collected no boost-group statistics")
