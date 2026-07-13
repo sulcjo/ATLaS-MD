@@ -424,6 +424,7 @@ class GenConfig:
     generation_backend: str = "fast"
     diversity_bank_preset: str = "off"
     diversity_bank_wide_angle_sd: float = 45.0
+    contact_bias_strength: float = 0.0
 
 
 @dataclass
@@ -1750,6 +1751,31 @@ def materialize_conformer_from_record(
     return full_rec, cvec, desc
 
 
+def _contact_bias_max_ccount(n_residues: int, min_sep: int) -> int:
+    """Combinatorial upper bound on contact_count: (i, j) pairs with j - i > min_sep."""
+    m = max(0, int(n_residues) - 1 - int(min_sep))
+    return m * (m + 1) // 2
+
+
+def _contact_bias_accept(rng, cfg, ccount: int) -> bool:
+    """Metropolis-style soft acceptance biasing generation toward higher contact_count.
+
+    accept_prob = min(1, exp(strength * (ccount - ref))), where ref is the
+    combinatorial max contact_count for this sequence/min-sep when strength > 0
+    (so the highest-contact conformer is always accepted and lower-contact ones
+    are progressively suppressed), or 0 when strength < 0 (mirrored: favors fewer
+    contacts). strength == 0.0 (default) disables the bias entirely (always
+    accept), preserving prior behavior by default.
+    """
+    strength = float(getattr(cfg, "contact_bias_strength", 0.0))
+    if strength == 0.0:
+        return True
+    ref = _contact_bias_max_ccount(len(str(cfg.seq)), int(cfg.contact_min_sep)) if strength > 0.0 else 0
+    exponent = max(-50.0, min(50.0, strength * (float(ccount) - ref)))
+    accept_prob = min(1.0, math.exp(exponent))
+    return bool(rng.random() < accept_prob)
+
+
 def generate_one(task):
     seq, idx, out_conf_dir, cfg_dict, worker_seed = task
     cfg = GenConfig(**cfg_dict)
@@ -1778,6 +1804,8 @@ def generate_one(task):
             rg = radius_of_gyration(ca)
             e2e = float(np.linalg.norm(ca[-1] - ca[0]))
             cvec, ccount = contact_vector_from_coords(ca, cfg.contact_cutoff_A, cfg.contact_min_sep)
+            if not _contact_bias_accept(rng, cfg, ccount):
+                return None, None, "ContactBiasReject: below contact-count acceptance threshold"
             rec = ConformerRecord(
                 idx,
                 "",
@@ -1806,6 +1834,8 @@ def generate_one(task):
         rg = radius_of_gyration(ca)
         e2e = float(np.linalg.norm(ca[-1] - ca[0]))
         cvec, ccount = contact_vector_from_coords(ca, cfg.contact_cutoff_A, cfg.contact_min_sep)
+        if not _contact_bias_accept(rng, cfg, ccount):
+            return None, None, "ContactBiasReject: below contact-count acceptance threshold"
 
         pdb_path = Path(out_conf_dir) / f"conf_{idx:06d}.pdb"
         if cfg.write_pdbs:
@@ -2469,6 +2499,7 @@ def generate_candidates(args):
         generation_backend=generation_backend,
         diversity_bank_preset=str(getattr(args, "diversity_bank_preset", "off")),
         diversity_bank_wide_angle_sd=float(getattr(args, "diversity_bank_wide_angle_sd", 45.0)),
+        contact_bias_strength=float(getattr(args, "contact_bias_strength", 0.0)),
     )
     (out_dir / "generation_config.json").write_text(json.dumps(asdict(cfg), indent=2))
     require_generation_imports()
@@ -5061,6 +5092,7 @@ def generate_adaptive_frontier_proposals(args, round_dir: Path, round_i: int, mo
         generation_backend=str(getattr(args, "generation_backend", "fast")),
         diversity_bank_preset=str(getattr(args, "diversity_bank_preset", "off")),
         diversity_bank_wide_angle_sd=float(getattr(args, "diversity_bank_wide_angle_sd", 45.0)),
+        contact_bias_strength=float(getattr(args, "contact_bias_strength", 0.0)),
     )
 
     rng = np.random.default_rng(args.seed + 424242 + round_i)
@@ -7219,6 +7251,16 @@ def parse_args(argv=None):
                    help="Generate conformers from multiple Ramachandran-prior banks before global diversity selection. 'broad/turbo' covers generic alpha/beta/turn/left/wide banks; 'chignolin' biases toward hairpin/turn-rich banks.")
     p.add_argument("--diversity-bank-wide-angle-sd", type=float, default=45.0,
                    help="Angle SD used by the wide_random diversity bank.")
+    p.add_argument("--contact-bias-strength", type=float, default=0.0,
+                   help="Metropolis-style soft acceptance bias during generation, applied per "
+                        "conformer against contact_count. Positive values favor more contacts "
+                        "(the max-possible-contact conformer is always accepted, lower-contact "
+                        "ones progressively rejected); negative values favor fewer. "
+                        "0.0 (default) disables the bias entirely. The reference point is the "
+                        "combinatorial max contact_count for this sequence/--contact-min-sep "
+                        "(often well above what's actually reachable), so start small "
+                        "(0.05-0.3): values near or above 1.0 can crush acceptance to near-zero "
+                        "and exhaust --n before enough candidates are found.")
     p.add_argument("--preselection-bin-quota", type=int, default=0,
                    help="If >0, keep at most this many generated conformers per coarse Rg/E2E/contact-count/bin before clustering. Cheaply removes duplicate shapes.")
     p.add_argument("--preselection-rg-bin-A", type=float, default=1.0)
@@ -8542,6 +8584,7 @@ def write_turbo_summary(args, sirah_out=None, pca_out=None):
             "generation_backend": str(args.generation_backend),
             "rama_sampling": str(args.rama_sampling),
             "diversity_bank_preset": str(getattr(args, "diversity_bank_preset", "off")),
+            "contact_bias_strength": float(getattr(args, "contact_bias_strength", 0.0)),
             "preselection_bin_quota": int(getattr(args, "preselection_bin_quota", 0) or 0),
             "tiered_implicit_min": bool(getattr(args, "tiered_implicit_min", False)),
             "basin_hop": bool(args.basin_hop),
