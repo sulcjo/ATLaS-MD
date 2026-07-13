@@ -1182,6 +1182,52 @@ def _write_double_adaptive_factorized_handoff_csv(args, out_dir: Path, feedback_
     return csv_path
 
 
+def _propagate_pilot_shared_gamd_dir(prod_args, out_dir: Path) -> None:
+    """Point adaptive-production at the pilot feedback stage's shared GaMD calibration.
+
+    Without this, adaptive-production resolves its own empty shared_gamd_setup_dir
+    to a fresh adaptive_production/global_shared_gamd_setup/ and recalibrates from
+    scratch, even though the feedback stage already calibrated the same campaign-
+    global envelope once in its own first pilot round. GaMD calibration is a
+    property of the system, not the workflow stage, so double-adaptive runs should
+    calibrate it exactly once -- in the pilot stage, before adaptive-production's
+    epoch 0 -- and reuse it thereafter. Only call this before adaptive-production
+    has run any epoch of its own; a run that already has epoch state committed to
+    its own shared dir must keep using that dir, not switch mid-campaign.
+    """
+    if str(getattr(prod_args, "shared_gamd_setup_dir", "") or "").strip():
+        return
+    policy_path = Path(out_dir) / "adaptive_feedback_shared_gamd_policy.json"
+    if not policy_path.exists():
+        return
+    try:
+        policy = json.loads(policy_path.read_text())
+        pilot_shared_gamd_dir = str(policy.get("shared_gamd_dir", "") or "").strip()
+    except Exception:
+        return
+    if not pilot_shared_gamd_dir:
+        return
+    if not (Path(pilot_shared_gamd_dir) / "shared_gamd_setup_globals.json").exists():
+        return
+    prod_args.shared_gamd_setup_dir = pilot_shared_gamd_dir
+
+
+def _committed_shared_gamd_dir(out_dir: Path) -> str:
+    """Return the shared_gamd_setup_dir a prior adaptive-production invocation
+    already committed epoch state against, so resuming an in-progress campaign
+    reuses that calibration instead of silently defaulting to the (empty,
+    never-calibrated) adaptive_production/global_shared_gamd_setup/ path.
+    """
+    summary_path = Path(out_dir) / "adaptive_production" / "adaptive_production_driver_summary.json"
+    if not summary_path.exists():
+        return ""
+    try:
+        summary = json.loads(summary_path.read_text())
+    except Exception:
+        return ""
+    return str(summary.get("global_shared_gamd_setup_dir", "") or "").strip()
+
+
 def run_double_adaptive_auto_loop(args, out_dir: Path, openmm, app, unit, forcefield, topology, equil_state, progress: Optional[GuiProgressSink] = None) -> dict:
     out_dir = Path(out_dir)
     summary_path = out_dir / "double_adaptive_driver_summary.json"
@@ -1201,6 +1247,10 @@ def run_double_adaptive_auto_loop(args, out_dir: Path, openmm, app, unit, forcef
         prod_args.window_mode = "adaptive-production"
         prod_args.resume = False
         prod_args.adaptive_production_resume = True
+        if not str(getattr(prod_args, "shared_gamd_setup_dir", "") or "").strip():
+            _committed_dir = _committed_shared_gamd_dir(out_dir)
+            if _committed_dir:
+                prod_args.shared_gamd_setup_dir = _committed_dir
         prod_summary = run_adaptive_production_auto_loop(
             prod_args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress
         )
@@ -1228,6 +1278,7 @@ def run_double_adaptive_auto_loop(args, out_dir: Path, openmm, app, unit, forcef
         prod_args.adaptive_feedback_enabled = False
         prod_args.adaptive_feedback_pilot = False
         prod_args.adaptive_feedback_final_production = False
+        _propagate_pilot_shared_gamd_dir(prod_args, out_dir)
         if handoff_csv is not None:
             prod_args.windows_2d_csv = str(handoff_csv)
         prod_summary = run_adaptive_production_auto_loop(
@@ -1275,6 +1326,7 @@ def run_double_adaptive_auto_loop(args, out_dir: Path, openmm, app, unit, forcef
     prod_args.adaptive_feedback_enabled = False
     prod_args.adaptive_feedback_pilot = False
     prod_args.adaptive_feedback_final_production = False
+    _propagate_pilot_shared_gamd_dir(prod_args, out_dir)
     if handoff_csv is not None:
         prod_args.windows_2d_csv = str(handoff_csv)
         print(f"    double-adaptive handoff window table: {handoff_csv}")
