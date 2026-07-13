@@ -897,6 +897,12 @@ def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
     args.adaptive_production_convergence_allow_extend_actions = True
     args.adaptive_production_require_convergence_before_final = False
     args.adaptive_production_pool_hard_stop = True
+    # Epoch 0 also bootstraps tICA from real GaMD-boosted sampling, so it doubles
+    # as the cheapest place to recalibrate the shared GaMD envelope for epoch 1+
+    # (see gareus/adaptive_production.py:_maybe_recalibrate_gamd_boost) and can run
+    # at half length -- the unused MD-pool budget is redistributed to later epochs.
+    args.adaptive_production_gamd_recalibrate_after_epoch0 = True
+    args.adaptive_production_epoch0_step_fraction = 0.5
     args.adaptive_production_final_connectivity_required = True
     # final_min_samples_per_state is set earlier from ap_final_min_samples_per_window (default 100).
     args.adaptive_production_quality_min_primary_coverage_fraction = 0.25

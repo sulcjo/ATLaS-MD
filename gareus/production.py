@@ -3436,6 +3436,37 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             f"with {secondary_cv_metadata.get('n_phi_torsions', 0)} phi and {secondary_cv_metadata.get('n_psi_torsions', 0)} psi torsions"
         )
 
+    # GaMD production-envelope recalibration: adaptive-production's epoch 0 already
+    # runs real GaMD-boosted sampling to bootstrap tICA, so it is also the cheapest
+    # place to measure the boost groups' *actual* potential-energy envelope and
+    # recalibrate the shared k0/threshold for epoch 1+ instead of trusting the
+    # throwaway calibration recon forever. Opt-in per-worker via _adaptive_phase_info
+    # (set by adaptive_production.py); every other run pays zero extra cost.
+    _phase_info = getattr(args, "_adaptive_phase_info", {}) or {}
+    try:
+        _phase_epoch_index = int(_phase_info.get("epoch_index", -1))
+    except (TypeError, ValueError):
+        _phase_epoch_index = -1
+    _gamd_recal_active = bool(
+        use_gamd
+        and _phase_info.get("is_adaptive_epoch")
+        and _phase_epoch_index == 0
+        and getattr(args, "adaptive_production_gamd_recalibrate_after_epoch0", True)
+    )
+    _gamd_recal_targets: list[tuple[str, Optional[int]]] = []
+    _gamd_recal_accumulators: dict[str, dict[int, Any]] = {}
+    if _gamd_recal_active:
+        from gareus.gamd_calibration import WelfordAccumulator as _WelfordAccumulator
+        _peek_system = deserialize_system(openmm, base_system)
+        _gamd_recal_targets, _peek_integrator = _gamd_boost_group_targets(_peek_system, args, unit)
+        release_openmm_contexts(_peek_integrator, _peek_system)
+        _gamd_recal_accumulators = {name: {} for name, _gid in _gamd_recal_targets}
+        print(
+            "    GaMD production-envelope recalibration: sampling boost-group energies "
+            f"this epoch for groups {[name for name, _gid in _gamd_recal_targets]} "
+            "(will recalibrate the shared envelope for epoch 1+)"
+        )
+
     if fast_resume:
         pos = vel = box = None
         window_start_positions = [None] * nrep
@@ -4079,6 +4110,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             The same matrix feeds samples.csv, analysis_arrays.npz, and dashboard
             rows without recomputing per-window JSON vectors in Python loops.
             """
+            nonlocal _gamd_recal_active
             rows: list[dict] = []
             is_prod = is_gamd_production_phase(phase)
             primary_mode_name = primary_cv_mode(args)
@@ -4205,6 +4237,24 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     json.dumps(integrator_globals(sim.integrator, unit=unit), sort_keys=True)
                     if write_gamd_globals else ""
                 )
+                if is_prod and _gamd_recal_active:
+                    try:
+                        for _gname, _gid in _gamd_recal_targets:
+                            _groups = {_gid} if _gid is not None else set(range(32))
+                            _gstate = sim.context.getState(getEnergy=True, groups=_groups)
+                            _gpe = float(_gstate.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole))
+                            _gamd_recal_accumulators[_gname].setdefault(w, _WelfordAccumulator()).update(_gpe)
+                    except Exception as _gamd_recal_sample_exc:
+                        # Best-effort measurement only: a failure here must never take
+                        # down a real production epoch. Disable for the rest of this
+                        # run; whatever was accumulated before the failure is still
+                        # written out and pooled (partial data degrades gracefully at
+                        # the recalibration step, same as "no data").
+                        print(
+                            "WARNING: GaMD production-envelope sampling failed "
+                            f"({_gamd_recal_sample_exc}); disabling for the rest of this run"
+                        )
+                        _gamd_recal_active = False
                 if is_prod:
                     _boost_raw = row.get("gamd_boost_total_kj_mol")
                     _boost_total = float(_boost_raw) if _boost_raw not in (None, "") else None
@@ -4951,6 +5001,33 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         # to completion (prod_done >= prod_total).  A graceful-shutdown break
         # leaves prod_done < prod_total and correctly keeps the flag False.
         _prod_completed_cleanly = (prod_done >= prod_total > 0)
+
+        # Write out whatever was accumulated even if sampling was disabled partway
+        # through the run (see the try/except around the per-frame update above) --
+        # partial data still degrades gracefully at the recalibration step.
+        if any(_gamd_recal_accumulators.get(name) for name, _gid in _gamd_recal_targets):
+            _stats_payload = {}
+            for _gname, _accs in _gamd_recal_accumulators.items():
+                _window_stats = []
+                for _window, _acc in _accs.items():
+                    if _acc.n < 2:
+                        continue
+                    _s = _acc.to_stats(_gname, _window)
+                    _window_stats.append({
+                        "group": _s.group, "window": _s.window, "vmax": _s.vmax,
+                        "vmin": _s.vmin, "mean": _s.mean, "var": _s.var, "n": _s.n,
+                    })
+                if _window_stats:
+                    _stats_payload[_gname] = _window_stats
+            if _stats_payload:
+                _stats_path = out_dir / "gamd_production_envelope_stats.json"
+                write_json(_stats_path, {
+                    "schema_version": "gamd_production_envelope_stats_v1",
+                    "gamd_boost_type": str(args.gamd_boost_type),
+                    "epoch_index": int(_phase_epoch_index),
+                    "per_group_window_stats": _stats_payload,
+                })
+                print(f"    GaMD production-envelope recalibration: wrote boost-group energy stats -> {_stats_path}")
 
     finally:
         try:

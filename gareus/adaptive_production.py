@@ -1834,6 +1834,142 @@ def _maybe_update_tica_cvaux(epoch: int, epoch_dir: Path, adaptive_dir: Path, ar
     }
 
 
+def _maybe_recalibrate_gamd_boost(
+    epoch: int,
+    epoch_dir: Path,
+    args,
+    global_shared_gamd_dir: Optional[Path],
+) -> dict:
+    """Recalibrate the campaign-shared GaMD envelope from epoch 0's real sampling.
+
+    Epoch 0 already runs full GaMD-boosted production to bootstrap tICA, so its
+    replicas' actual per-boost-group potential-energy statistics (written by
+    gareus/production.py to ``gamd_production_envelope_stats.json`` when
+    ``_adaptive_phase_info`` marks epoch_index == 0) are a real, in-campaign
+    measurement of the envelope -- unlike the throwaway calibration recon, which
+    only ever saw a handful of pre-production windows.  This recomputes
+    k0/threshold/Vmax/Vmin/Vavg/sigmaV per boost group from that real data
+    (same pure-Python formulas the recon uses) and overwrites the exported
+    shared envelope so every epoch 1+ worker loads the recalibrated version
+    instead of the original recon's guess.
+
+    Fires at most once (only ``epoch == 0``), is a no-op if GaMD/shared-envelope
+    is disabled, and degrades to a no-op (not an error) if no stats files were
+    written (e.g. epoch 0 was itself resumed from a checkpoint that predates
+    this feature). Reweighting validity does not depend on which envelope was
+    active for a given frame (per-frame delta-V is recorded), so recalibrating
+    is efficiency/variance-only -- exactly like the existing shared-envelope
+    reuse policy, just recalibrated from real data instead of frozen forever.
+    """
+    if int(epoch) != 0:
+        return {}
+    if global_shared_gamd_dir is None:
+        return {}
+    if not bool(getattr(args, "adaptive_production_gamd_recalibrate_after_epoch0", True)):
+        return {}
+    if "gamd" not in str(getattr(args, "run_mode", "") or "").lower():
+        return {}
+
+    stat_files = sorted(Path(epoch_dir).rglob("gamd_production_envelope_stats.json"))
+    if not stat_files:
+        return {"status": "skipped_no_stats", "epoch": int(epoch)}
+
+    from .gamd_calibration import WindowEnergyStats, pool_window_stats, compute_group_calibration, overwrite_physics_globals
+
+    globals_path = Path(global_shared_gamd_dir) / "shared_gamd_setup_globals.json"
+    payload = read_json_file(globals_path, None)
+    if not isinstance(payload, dict) or not payload.get("all_globals"):
+        return {"status": "skipped_no_shared_envelope", "epoch": int(epoch), "globals_path": str(globals_path)}
+    all_globals = dict(payload.get("all_globals", {}) or {})
+    interesting_globals = dict(payload.get("interesting_globals", {}) or {})
+
+    per_group_raw: Dict[str, List[WindowEnergyStats]] = {}
+    for sf in stat_files:
+        file_payload = read_json_file(sf, None)
+        if not isinstance(file_payload, dict):
+            continue
+        for group, window_stats in (file_payload.get("per_group_window_stats", {}) or {}).items():
+            for ws in window_stats or []:
+                try:
+                    per_group_raw.setdefault(str(group), []).append(WindowEnergyStats(
+                        group=str(group), window=int(ws["window"]), vmax=float(ws["vmax"]),
+                        vmin=float(ws["vmin"]), mean=float(ws["mean"]), var=float(ws["var"]), n=int(ws["n"]),
+                    ))
+                except (KeyError, TypeError, ValueError):
+                    continue
+
+    if not per_group_raw:
+        return {"status": "skipped_no_usable_stats", "epoch": int(epoch), "n_stats_files": len(stat_files)}
+
+    boost_type = str(getattr(args, "gamd_boost_type", "lower-total"))
+    calibrations = {}
+    group_reports = {}
+    for group, stats in per_group_raw.items():
+        sigma0_key = f"sigma0_{group}"
+        if sigma0_key not in all_globals:
+            continue
+        try:
+            envelope = pool_window_stats(stats)
+            calib = compute_group_calibration(boost_type, envelope, float(all_globals[sigma0_key]))
+        except Exception as exc:
+            group_reports[group] = {"status": "failed", "error": str(exc)}
+            continue
+        calibrations[group] = calib
+        group_reports[group] = {
+            "status": "recalibrated",
+            "n_windows": envelope.n_windows,
+            "n_total_samples": envelope.n_total,
+            "sigmaV_before_kj_mol": float(all_globals.get(f"sigmaV_{group}", float("nan"))),
+            "sigmaV_after_kj_mol": float(calib.sigmav),
+            "k0_before": float(all_globals.get(f"k0_{group}", float("nan"))),
+            "k0_after": float(calib.k0),
+            "threshold_energy_before_kj_mol": float(all_globals.get(f"threshold_energy_{group}", float("nan"))),
+            "threshold_energy_after_kj_mol": float(calib.threshold_energy),
+            "boosted": bool(calib.boosted),
+        }
+
+    if not calibrations:
+        return {"status": "skipped_no_matching_groups", "epoch": int(epoch), "n_stats_files": len(stat_files)}
+
+    all_globals = overwrite_physics_globals(all_globals, calibrations)
+    interesting_globals = overwrite_physics_globals(interesting_globals, calibrations) if interesting_globals else interesting_globals
+    envelope_version = int(payload.get("gamd_envelope_version", 1) or 1) + 1
+    history = list(payload.get("recalibration_history", []) or [])
+    history.append({"recalibrated_from_epoch": int(epoch), "groups": group_reports, "envelope_version": envelope_version})
+
+    new_payload = dict(payload)
+    new_payload.update({
+        "all_globals": all_globals,
+        "interesting_globals": interesting_globals,
+        "gamd_envelope_version": envelope_version,
+        "recalibration_history": history,
+        "description": str(payload.get("description", "")) + (
+            " | Recalibrated after epoch 0 from real production sampling "
+            "(see recalibration_history)."
+        ),
+    })
+    write_json(globals_path, _json_ready(new_payload))
+    print(
+        f"    GaMD recalibration: updated shared envelope (version {envelope_version}) from "
+        f"epoch 0 sampling ({len(stat_files)} worker file(s)) -> {globals_path}"
+    )
+    for group, rep in group_reports.items():
+        if rep.get("status") == "recalibrated":
+            print(
+                f"      {group}: sigmaV {rep['sigmaV_before_kj_mol']:.1f} -> {rep['sigmaV_after_kj_mol']:.1f} kJ/mol, "
+                f"k0 {rep['k0_before']:.3f} -> {rep['k0_after']:.3f}"
+            )
+
+    return {
+        "status": "recalibrated",
+        "epoch": int(epoch),
+        "envelope_version": envelope_version,
+        "n_stats_files": len(stat_files),
+        "shared_gamd_dir": str(global_shared_gamd_dir),
+        "groups": group_reports,
+    }
+
+
 def _epoch_sample_sources(
     adaptive_dir: Path,
     include_epochs: bool,
@@ -3154,6 +3290,24 @@ def _final_steps_from_pool(
     return max(1, int(available_ns * 1e6 / timestep_fs / n_states))
 
 
+def _epoch0_scaled_steps(steps: int, epoch: int, fraction: float) -> int:
+    """Scale one epoch's step budget by ``fraction`` when ``epoch == 0``, else pass through.
+
+    Epoch 0 also bootstraps tICA and (optionally) recalibrates the shared GaMD
+    envelope from real sampling, so it needs only a short look, not a full-length
+    epoch. Steps left unused by a shorter epoch 0 stay in the runtime pool and
+    are redistributed across the remaining epochs by the normal per-epoch
+    pool-share recompute -- this is a plain multiply, no bookkeeping needed here.
+    """
+    steps = max(0, int(steps))
+    if epoch != 0 or steps <= 0:
+        return steps
+    fraction = max(0.0, min(1.0, float(fraction)))
+    if fraction == 1.0:
+        return steps
+    return max(1, int(round(steps * fraction)))
+
+
 def _write_runtime_pool_reports(adaptive_dir: Path, pool: AdaptiveRuntimePool) -> Dict[str, str]:
     adaptive_dir = Path(adaptive_dir)
     json_path = adaptive_dir / "adaptive_runtime_pool.json"
@@ -4044,6 +4198,11 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
     adaptive_dir.mkdir(parents=True, exist_ok=True)
     policy = policy_from_args(args)
     max_epochs = max(1, _arg_int(args, "adaptive_production_epochs", 3))
+    # Epoch 0 also bootstraps the tICA model and (when enabled) the shared GaMD
+    # envelope recalibration -- both need only a short look at real sampling, not
+    # a full-length epoch. Scale its step budget down; the unused steps stay in
+    # the pool and are redistributed across the remaining epochs automatically.
+    epoch0_step_fraction = max(0.0, min(1.0, _arg_float(args, "adaptive_production_epoch0_step_fraction", 0.5)))
     # Explicit overrides take precedence. When unset (0), epoch/final steps are
     # computed dynamically per-epoch from the pool balance and actual state count.
     # The fallback (gamd_production_steps//20) is used only when the pool is disabled.
@@ -4170,15 +4329,16 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             if _pool_epoch_steps > 0:
                 epoch_steps = _pool_epoch_steps
         if registry is not None and bool(policy.allocation_scheduler):
+            epoch_default_steps = _epoch0_scaled_steps(epoch_steps, epoch, epoch0_step_fraction)
             schedule_policy = _policy_with_pool_step_budget(
-                registry, policy, runtime_pool, default_steps=epoch_steps, final=False
+                registry, policy, runtime_pool, default_steps=epoch_default_steps, final=False
             )
             schedule = build_adaptive_epoch_schedule(
                 registry,
                 previous_diagnostics,
                 schedule_policy,
                 epoch=epoch,
-                default_steps=epoch_steps,
+                default_steps=epoch_default_steps,
                 final=False,
             )
             print(
@@ -4218,10 +4378,10 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                 write_json(summary_path, payload)
                 return payload
             # Guard: only fires on a real completed scheduled epoch (shutdown path
-            # already returned above).  Uses epoch_steps (the default budget used
-            # to build the schedule) as the steps sentinel — sufficient because the
-            # guard only needs steps > 0 to confirm the epoch was non-trivial.
-            _assert_epoch_has_samples(diagnostics, registry, epoch_dir, int(epoch_steps))
+            # already returned above).  Uses epoch_default_steps (the default budget
+            # used to build the schedule) as the steps sentinel — sufficient because
+            # the guard only needs steps > 0 to confirm the epoch was non-trivial.
+            _assert_epoch_has_samples(diagnostics, registry, epoch_dir, int(epoch_default_steps))
         else:
             epoch_args = copy.copy(args)
             epoch_args.out = str(epoch_dir)
@@ -4259,6 +4419,7 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                 reserve_ns=_runtime_pool_final_reserve_ns(runtime_pool, policy, final=False),
                 hard_stop=bool(policy.pool_hard_stop),
             )
+            actual_epoch_steps = _epoch0_scaled_steps(actual_epoch_steps, epoch, epoch0_step_fraction)
             if actual_epoch_steps <= 0:
                 if registry is None:
                     raise RuntimeError("adaptive-production MD pool is exhausted before the first epoch could initialize a state registry")
@@ -4413,6 +4574,16 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             print(f"WARNING: _maybe_update_tica_cvaux failed for epoch {epoch}: {_tica_exc}")
             tica_update_report = {"status": "error", "error": str(_tica_exc)}
 
+        # GaMD shared-envelope recalibration from epoch 0's real sampling (opt-in;
+        # fires at most once, no-op for epoch >= 1 and when GaMD/shared-envelope
+        # reuse is disabled).
+        gamd_recal_report = {}
+        try:
+            gamd_recal_report = _maybe_recalibrate_gamd_boost(epoch, epoch_dir, args, global_shared_gamd_dir)
+        except Exception as _gamd_recal_exc:
+            print(f"WARNING: _maybe_recalibrate_gamd_boost failed for epoch {epoch}: {_gamd_recal_exc}")
+            gamd_recal_report = {"status": "error", "error": str(_gamd_recal_exc)}
+
         summary = {
             "epoch": int(epoch),
             "epoch_dir": str(epoch_dir),
@@ -4429,6 +4600,7 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             "runtime_pool": runtime_pool.to_dict(),
             "runtime_pool_reports": runtime_pool_paths,
             "tica_update": tica_update_report,
+            "gamd_recalibration": gamd_recal_report,
         }
         previous_diagnostics = diagnostics
         epoch_summaries.append(summary)
