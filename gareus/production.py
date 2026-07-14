@@ -4981,6 +4981,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                         args, out_dir, centers_a, k_list, exchange_stats,
                         secondary_cv_centers, secondary_cv_k_kcal_list, secondary_cv_metadata,
                         fallback_history_by_window=distance_logger.history_by_window,
+                        fallback_secondary_history_by_window=distance_logger.secondary_history_by_window,
                     )
                 else:
                     feedback_summary = run_adaptive_feedback_dispatcher(
