@@ -8641,6 +8641,27 @@ def analyze_chignolin_fes(d, args, base_logw: np.ndarray, selected: str, boost_o
     return info
 
 
+def _load_epoch_dihedral_features(epoch_dir_str) -> tuple:
+    """Return (features array N×D, ok). Loads all replica tica_obs/dihedral_obs_*.npz files
+    for one adaptive-production epoch. Shared by tICA-epoch and torsion-PCA-scree analyses."""
+    edir = Path(epoch_dir_str) if epoch_dir_str else Path('__nonexistent__')
+    tica_dir = edir / 'tica_obs'
+    if not tica_dir.is_dir():
+        return None, False
+    npz_files = sorted(tica_dir.glob('dihedral_obs_*.npz'))
+    chunks = []
+    for p in npz_files:
+        try:
+            d = np.load(p)
+            if 'features' in d.files:
+                chunks.append(d['features'].astype(np.float32))
+        except Exception:
+            pass
+    if not chunks:
+        return None, False
+    return np.concatenate(chunks, axis=0), True
+
+
 def _analyze_tica_epochs(prod_dir: Path, out: Path, meta: dict, warn: list) -> dict:
     """Analyze per-epoch tICA CVaux updates: eigenvalue progression, MBAR vs uniform reweighting,
     per-window tIC1 center evolution, and dihedral distribution convergence across epochs."""
@@ -8698,25 +8719,6 @@ def _analyze_tica_epochs(prod_dir: Path, out: Path, meta: dict, warn: list) -> d
     _DBINS = 60
     _DRANGE = (-1.01, 1.01)
 
-    def _load_epoch_features(epoch_dir_str):
-        """Return (features array N×D, ok). Loads all replica npz files."""
-        edir = Path(epoch_dir_str) if epoch_dir_str else Path('__nonexistent__')
-        tica_dir = edir / 'tica_obs'
-        if not tica_dir.is_dir():
-            return None, False
-        npz_files = sorted(tica_dir.glob('dihedral_obs_*.npz'))
-        chunks = []
-        for p in npz_files:
-            try:
-                d = np.load(p)
-                if 'features' in d.files:
-                    chunks.append(d['features'].astype(np.float32))
-            except Exception:
-                pass
-        if not chunks:
-            return None, False
-        return np.concatenate(chunks, axis=0), True
-
     def _feature_histograms(X, n_bins=_DBINS, rng=_DRANGE):
         """Per-feature histogram counts. Returns (D, n_bins) int array."""
         D = X.shape[1]
@@ -8741,7 +8743,7 @@ def _analyze_tica_epochs(prod_dir: Path, out: Path, meta: dict, warn: list) -> d
     epoch_features = []  # per-record: (D, _DBINS) count array or None
     n_features = 0
     for r in tica_records:
-        X, ok = _load_epoch_features(r['epoch_dir'])
+        X, ok = _load_epoch_dihedral_features(r['epoch_dir'])
         if ok and X.ndim == 2 and X.shape[1] > 0:
             epoch_features.append(_feature_histograms(X))
             n_features = max(n_features, X.shape[1])
@@ -8919,6 +8921,148 @@ def _analyze_tica_epochs(prod_dir: Path, out: Path, meta: dict, warn: list) -> d
         'dihedral_js_vs_final': [r.get('dihedral_js_vs_final', float('nan')) for r in tica_records],
         'adaptive_dir': str(ap),
         'tica_state_file': str(tica_state_path) if tica_state_path.exists() else None,
+        'files': generated,
+    }
+
+
+def _analyze_torsion_pca_scree(prod_dir: Path, out: Path, meta: dict, args, warn: list) -> dict:
+    """Full-spectrum scree analysis of the backbone torsion-PCA feature space (sin/cos phi/psi),
+    computed from one adaptive-production epoch's real ``tica_obs/dihedral_obs_*.npz`` samples
+    (default epoch 0). Complements the single PC1 used as CV2: shows the whole eigenvalue
+    spectrum plus, per component, the top loading torsions (which residue's backbone motion
+    that component actually encodes) -- both known to matter for judging whether torsion-PCA
+    or a switch to tICA is the better CV2 (see docs/... torsion-PCA scree discussion).
+    """
+    if getattr(args, 'no_torsion_pca_scree', False):
+        return {'available': False, 'reason': 'disabled via --no-torsion-pca-scree'}
+
+    ap = None
+    for candidate in (prod_dir / 'adaptive_production', prod_dir.parent / 'adaptive_production'):
+        if candidate.is_dir():
+            ap = candidate; break
+    if ap is None:
+        return {'available': False, 'reason': 'adaptive_production/ not found'}
+
+    epoch_idx = int(getattr(args, 'torsion_pca_scree_epoch', 0) or 0)
+    epoch_dir = ap / f'epoch_{epoch_idx:03d}'
+    if not epoch_dir.is_dir():
+        return {'available': False, 'reason': f'{epoch_dir} not found'}
+
+    X, ok = _load_epoch_dihedral_features(str(epoch_dir))
+    if not ok or X is None or X.shape[0] < 2:
+        return {'available': False, 'reason': f'no usable tica_obs dihedral features in {epoch_dir}'}
+
+    X = X.astype(np.float64)
+    n_samples, n_features = X.shape
+    if n_features < 2 or n_features % 2 != 0:
+        return {'available': False, 'reason': f'unexpected feature count ({n_features}); expected sin/cos pairs'}
+    n_torsions_total = n_features // 2
+    n_phi = n_torsions_total // 2  # gareus backbone torsion CVs always pair n_phi == n_psi
+
+    mean = X.mean(axis=0)
+    Xc = X - mean
+    try:
+        _, singular_values, vt = np.linalg.svd(Xc, full_matrices=False)
+    except Exception as e:
+        warn.append(f'torsion_pca_scree SVD failed: {e}')
+        return {'available': False, 'reason': f'SVD failed: {e}'}
+    variances = (singular_values ** 2) / max(1, n_samples - 1)
+    total_variance = float(np.sum(variances))
+    if total_variance <= 1e-12:
+        return {'available': False, 'reason': 'zero variance in dihedral features'}
+    evr = variances / total_variance
+    cum_evr = np.cumsum(evr)
+    n_components = len(evr)
+
+    # Residue-based torsion labels when the sequence length matches n_phi+1 residues;
+    # otherwise fall back to generic phi_i/psi_i (still numerically correct, just less readable).
+    seq = str(meta.get('sequence', '') or '')
+    labels = None
+    if len(seq) == n_phi + 1:
+        try:
+            labels = [f'phi-{seq[i + 1]}{i + 2}' for i in range(n_phi)] + \
+                     [f'psi-{seq[i]}{i + 1}' for i in range(n_phi)]
+        except IndexError:
+            labels = None
+    if labels is None:
+        labels = [f'phi_{i + 1}' for i in range(n_phi)] + [f'psi_{i + 1}' for i in range(n_phi)]
+
+    def _top_loadings(pc_idx: int, k: int = 3):
+        loadings = np.sqrt(vt[pc_idx, 0::2] ** 2 + vt[pc_idx, 1::2] ** 2)  # per-torsion sin/cos pair magnitude
+        order = np.argsort(-loadings)[:k]
+        return [(labels[i], float(loadings[i])) for i in order]
+
+    scree_out = out / 'torsion_pca_scree'
+    scree_out.mkdir(parents=True, exist_ok=True)
+    generated = {}
+
+    try:
+        np.savez_compressed(
+            scree_out / 'torsion_pca_scree_data.npz',
+            mean=mean.astype(np.float32), components=vt.astype(np.float32),
+            eigenvalues=variances.astype(np.float64), explained_variance_ratio=evr.astype(np.float64),
+            cumulative_evr=cum_evr.astype(np.float64), labels=np.asarray(labels), n_samples=n_samples,
+            epoch=epoch_idx,
+        )
+        generated['torsion_pca_scree_data_npz'] = str(scree_out / 'torsion_pca_scree_data.npz')
+    except Exception as e:
+        warn.append(f'torsion_pca_scree_data.npz failed: {e}')
+
+    try:
+        csv_path = scree_out / 'torsion_pca_scree_table.csv'
+        fields = ['pc', 'eigenvalue', 'explained_variance_ratio_pct', 'cumulative_evr_pct',
+                  'top1_torsion', 'top1_loading', 'top2_torsion', 'top2_loading', 'top3_torsion', 'top3_loading']
+        with csv_path.open('w', newline='') as fh:
+            wr = csv.DictWriter(fh, fieldnames=fields)
+            wr.writeheader()
+            for i in range(n_components):
+                top = _top_loadings(i, k=3)
+                row = {'pc': i + 1, 'eigenvalue': float(variances[i]),
+                       'explained_variance_ratio_pct': float(evr[i] * 100.0),
+                       'cumulative_evr_pct': float(cum_evr[i] * 100.0)}
+                for j in range(3):
+                    tors, load = top[j] if j < len(top) else ('', float('nan'))
+                    row[f'top{j + 1}_torsion'] = tors
+                    row[f'top{j + 1}_loading'] = load
+                wr.writerow(row)
+        generated['torsion_pca_scree_table_csv'] = str(csv_path)
+    except Exception as e:
+        warn.append(f'torsion_pca_scree_table.csv failed: {e}')
+
+    try:
+        import matplotlib.pyplot as plt
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
+        idx = np.arange(1, n_components + 1)
+        ax1.bar(idx, evr * 100.0, color=['#2a78d6' if i == 0 else '#b9b7ad' for i in range(n_components)])
+        ax1.set_ylabel('Explained variance (%)')
+        ax1.set_title(f'Torsion-PCA scree — epoch {epoch_idx} ({n_samples} samples, {n_torsions_total} torsions)')
+        ax1.grid(True, alpha=0.3, axis='y')
+        ax2.plot(idx, cum_evr * 100.0, 'o-', color='#1baf7a', markersize=4, linewidth=1.5)
+        for ref in (50, 80):
+            ax2.axhline(ref, color='k', linestyle='--', alpha=0.3, linewidth=0.8)
+        ax2.set_ylabel('Cumulative variance (%)')
+        ax2.set_xlabel('Principal component')
+        ax2.set_ylim(0, 105)
+        ax2.grid(True, alpha=0.3)
+        fig.tight_layout()
+        p = scree_out / 'torsion_pca_scree.png'
+        fig.savefig(p, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        generated['torsion_pca_scree_png'] = str(p)
+    except Exception as e:
+        warn.append(f'torsion_pca_scree.png failed: {e}')
+
+    return {
+        'available': True,
+        'epoch': epoch_idx,
+        'epoch_dir': str(epoch_dir),
+        'n_samples': int(n_samples),
+        'n_torsions': int(n_torsions_total),
+        'n_components': int(n_components),
+        'pc1_explained_variance_ratio': float(evr[0]),
+        'top10_explained_variance_ratio': [float(x) for x in evr[:10]],
+        'top10_cumulative_evr': [float(x) for x in cum_evr[:10]],
+        'top10_top_loadings': [_top_loadings(i, k=1)[0][0] for i in range(min(10, n_components))],
         'files': generated,
     }
 
@@ -9237,6 +9381,7 @@ def analyze(d,args, progress: Optional[Progress] = None):
     plot_outputs(d,pmfs,selected,O,out,warn,smooth_sigma=_eff_smooth(args,'pmf_smooth_sigma'),args=args)
     epoch_cv_info=_analyze_epoch_cv_exploration(d.prod_dir,out,d.meta,warn)
     tica_epoch_info=_analyze_tica_epochs(d.prod_dir,out,d.meta,warn)
+    torsion_pca_scree_info=_analyze_torsion_pca_scree(d.prod_dir,out,d.meta,args,warn)
     conv_info=run_pmf_convergence(d,args,bins,selected,sel,out,progress=progress,f_init_hint=m.get('f_k'))
     epoch_conv_info={}
     if d.meta.get('_epoch_source'):
@@ -9254,11 +9399,12 @@ def analyze(d,args, progress: Optional[Progress] = None):
     s['epoch_convergence']=epoch_conv_info
     s['epoch_cv_exploration']=epoch_cv_info
     s['tica_epochs']=tica_epoch_info
+    s['torsion_pca_scree']=torsion_pca_scree_info
     s['dtram']=_dtram_public_info(dtram_info)
     s['convergence']=conv_info
     for _info in (rg_info,fes2d_info,pca2d_info,extra_obs_info,chignolin_fes_info,
                   poincare_info,poincare_torsions_info,secondary_cv_pmf_info,
-                  cv1_cv2_fes_info,epoch_cv_info,tica_epoch_info,dtram_info,conv_info):
+                  cv1_cv2_fes_info,epoch_cv_info,tica_epoch_info,torsion_pca_scree_info,dtram_info,conv_info):
         if isinstance(_info,dict) and _info.get('files'):
             s['files'].update(_info['files'])
     # Presentation-only result-health verdict + warning triage (derived from the
@@ -9407,7 +9553,9 @@ def parse_args(argv=None):
     p.add_argument('--no-poincare-residue-torsions', action='store_true', help='Disable per-residue torsion analysis at Poincaré crossing frames.')
     p.add_argument('--poincare-route-split', type=float, default=None, metavar='CV2', help='CV2 cutpoint to split Poincaré folding routes A (below) and B (above). Default: auto-midpoint of the two highest fold CV2 peaks.')
     p.add_argument('--no-adaptive-diag', action='store_true', help='Disable adaptive-production diagnostic plots (epoch/topup phase-space coverage, window layout, topup timeline, overlap). Enabled automatically for adaptive_production runs.')
-    p.add_argument('--adaptive-diag-stride', type=int, default=30, metavar='N', help='Sub-sample stride for adaptive diagnostic density maps. Higher = faster but coarser. Default 30.')
+    p.add_argument('--no-torsion-pca-scree', action='store_true', help='Disable the torsion-PCA scree analysis (full eigenvalue spectrum + per-component torsion loadings, computed from one epoch\'s real tica_obs dihedral samples). Enabled by default when adaptive_production/epoch_NNN/tica_obs/ is present.')
+    p.add_argument('--torsion-pca-scree-epoch', type=int, default=0, metavar='N', help='Adaptive-production epoch index to source real dihedral samples from for the torsion-PCA scree analysis. Default 0 (bootstrap/first epoch).')
+    p.add_argument('--adaptive-diag-stride', type=int, default=3, metavar='N', help='Sub-sample stride for adaptive diagnostic density maps. Higher = faster but coarser. Default 3.')
     p.add_argument('--no-adaptive-diag-coverage', action='store_true', help='Skip the per-phase 2D density map panel (fig1) from adaptive diagnostics — the slowest panel. Other panels still run.')
     args=p.parse_args(argv)
     if getattr(args,'no_rg',False):
@@ -9469,7 +9617,7 @@ def main(argv=None):
             if _diag_script.exists():
                 _spec=_ilu.spec_from_file_location('plot_adaptive_diagnostics',_diag_script)
                 _diag=_ilu.module_from_spec(_spec); _spec.loader.exec_module(_diag)
-                _stride=int(getattr(args,'adaptive_diag_stride',30) or 30)
+                _stride=int(getattr(args,'adaptive_diag_stride',3) or 3)
                 _skip_cov=bool(getattr(args,'no_adaptive_diag_coverage',False))
                 _diag.run_all(Path(d.prod_dir).parent, d.out_dir, stride=_stride, skip_coverage=_skip_cov)
             else:
