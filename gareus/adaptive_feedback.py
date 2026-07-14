@@ -420,6 +420,35 @@ def _adaptive_feedback_2d_cell_diagnostics(
     return rows
 
 
+_OFF_CENTER_CELL_STATUSES = frozenset({"off_center", "low_2d_hit"})
+
+
+def _adaptive_feedback_2d_flag_off_center_edges(edge_rows: list[dict], cell_rows: list[dict]) -> list[dict]:
+    """Escalate edges touching a window whose own samples miss its 2D target.
+
+    Pairwise overlap/exchange-acceptance between neighboring windows can read as
+    healthy even when one of them never actually sits near its own center (e.g. a
+    force constant too weak to hold it there just lets it drift back into the
+    neighbor's basin). ``_adaptive_feedback_2d_cell_diagnostics`` already detects
+    that case per-window (``cell_status`` "off_center"/"low_2d_hit"); this cross-
+    references it onto the edge rows so an otherwise-"ok" edge is not treated as
+    resolved just because two under-restrained windows blend into each other.
+    """
+    off_center_windows = {int(r["window"]) for r in cell_rows if str(r.get("cell_status")) in _OFF_CENTER_CELL_STATUSES}
+    if not off_center_windows:
+        return edge_rows
+    flagged = []
+    for row in edge_rows:
+        row = dict(row)
+        if str(row.get("edge_status")) == "ok" and (
+            int(row.get("window_i", -1)) in off_center_windows or int(row.get("window_j", -1)) in off_center_windows
+        ):
+            row["edge_status"] = "off_center_window"
+            row["recommendation"] = "diagnose_local_patch_or_axis_refinement"
+        flagged.append(row)
+    return flagged
+
+
 def _adaptive_feedback_2d_edge_diagnostics(
     samples_distance_by_window: dict[int, list[float]],
     samples_secondary_by_window: dict[int, list[float]],
@@ -563,7 +592,7 @@ def _adaptive_feedback_2d_annotate_locality(edge_rows: list[dict], args) -> tupl
 
     annotated = [dict(r) for r in edge_rows]
     defects = []
-    bad_statuses = {"low_overlap", "low_exchange", "low_overlap_low_exchange"}
+    bad_statuses = {"low_overlap", "low_exchange", "low_overlap_low_exchange", "off_center_window"}
     defect_statuses = bad_statuses | {"insufficient_samples"}
 
     for key, indices in groups.items():
@@ -965,7 +994,7 @@ def _adaptive_feedback_2d_sparse_patch_candidates(
 
     max_patches = int(getattr(args, "adaptive_2d_max_local_patches", 12) or 12)
     max_patches = max(0, max_patches)
-    bad_statuses = {"low_overlap", "low_exchange", "low_overlap_low_exchange"}
+    bad_statuses = {"low_overlap", "low_exchange", "low_overlap_low_exchange", "off_center_window"}
     candidates_by_key: dict[tuple[float, float], dict] = {}
     skipped_rows = []
 
@@ -1004,7 +1033,13 @@ def _adaptive_feedback_2d_sparse_patch_candidates(
         if math.isfinite(acc):
             priority += max(0.0, low_cut - acc) * 40.0
         status = str(defect.get("edge_status"))
-        if status == "low_overlap_low_exchange":
+        if status == "off_center_window":
+            # decision_overlap/exchange_acceptance for this status are typically
+            # misleadingly high (the flagged window has drifted into its
+            # neighbor's basin rather than sitting near its own target), so the
+            # overlap/acceptance-derived priority terms above under-count it.
+            priority += 50.0
+        elif status == "low_overlap_low_exchange":
             priority += 20.0
         elif status in {"low_overlap", "low_exchange"}:
             priority += 8.0
@@ -1199,7 +1234,7 @@ def _adaptive_feedback_existing_explicit_rows_for_proposal(centers_a, k_list, se
     return rows
 
 
-def run_adaptive_feedback_dispatcher_2d_explicit_sparse(args, out_dir: Path, centers_a, k_list, exchange_stats: dict, secondary_cv_centers, secondary_cv_k_kcal_list, secondary_cv_metadata: dict, fallback_history_by_window: Optional[dict[int, list[float]]] = None) -> Optional[dict]:
+def run_adaptive_feedback_dispatcher_2d_explicit_sparse(args, out_dir: Path, centers_a, k_list, exchange_stats: dict, secondary_cv_centers, secondary_cv_k_kcal_list, secondary_cv_metadata: dict, fallback_history_by_window: Optional[dict[int, list[float]]] = None, fallback_secondary_history_by_window: Optional[dict[int, list[float]]] = None) -> Optional[dict]:
     """Adaptive-feedback proposal for explicit sparse/non-rectangular 2D windows.
 
     Unlike the rectangular dispatcher, this keeps the active explicit 2D table and
@@ -1219,6 +1254,11 @@ def run_adaptive_feedback_dispatcher_2d_explicit_sparse(args, out_dir: Path, cen
         for w in range(nwin):
             samples_distance_by_window[w] = [float(x) for x in fallback_history_by_window.get(w, []) if math.isfinite(float(x))]
         total_samples = sum(len(v) for v in samples_distance_by_window.values())
+    total_secondary_samples = sum(len(v) for v in samples_secondary_by_window.values())
+    if total_secondary_samples == 0 and fallback_secondary_history_by_window:
+        for w in range(nwin):
+            samples_secondary_by_window[w] = [float(x) for x in fallback_secondary_history_by_window.get(w, []) if math.isfinite(float(x))]
+        total_secondary_samples = sum(len(v) for v in samples_secondary_by_window.values())
 
     aggr = _adaptive_window_aggressiveness_settings(args)
     requested_target_overlap = float(getattr(args, "adaptive_feedback_target_overlap", 0.30))
@@ -1236,6 +1276,7 @@ def run_adaptive_feedback_dispatcher_2d_explicit_sparse(args, out_dir: Path, cen
         samples_distance_by_window, samples_secondary_by_window,
         centers_arr, sec_arr, exchange_stats, target_overlap, args,
     )
+    edge_rows_2d = _adaptive_feedback_2d_flag_off_center_edges(edge_rows_2d, cell_rows_2d)
     edge_rows_2d, local_defect_rows_2d = _adaptive_feedback_2d_annotate_locality(edge_rows_2d, args)
 
     retained_rows = _adaptive_feedback_existing_explicit_rows_for_proposal(centers_arr, k_list, sec_arr, secondary_cv_k_kcal_list, secondary_cv_metadata)
@@ -1272,7 +1313,7 @@ def run_adaptive_feedback_dispatcher_2d_explicit_sparse(args, out_dir: Path, cen
             if rows:
                 writer.writerows(rows)
 
-    unresolved_edges = [r for r in edge_rows_2d if str(r.get("edge_status")) in {"low_overlap", "low_exchange", "low_overlap_low_exchange", "insufficient_samples"}]
+    unresolved_edges = [r for r in edge_rows_2d if str(r.get("edge_status")) in {"low_overlap", "low_exchange", "low_overlap_low_exchange", "insufficient_samples", "off_center_window"}]
     converged = bool(len(sparse_patch_rows) == 0 and len(unresolved_edges) == 0)
     summary = {
         "mode": "adaptive-feedback-2d-explicit-sparse",
@@ -1373,7 +1414,7 @@ def _check_per_cell_overlap_before_removal(
     return True
 
 
-def run_adaptive_feedback_dispatcher_2d(args, out_dir: Path, centers_a, k_list, exchange_stats: dict, secondary_cv_centers, secondary_cv_k_kcal_list, secondary_cv_metadata: dict, fallback_history_by_window: Optional[dict[int, list[float]]] = None) -> Optional[dict]:
+def run_adaptive_feedback_dispatcher_2d(args, out_dir: Path, centers_a, k_list, exchange_stats: dict, secondary_cv_centers, secondary_cv_k_kcal_list, secondary_cv_metadata: dict, fallback_history_by_window: Optional[dict[int, list[float]]] = None, fallback_secondary_history_by_window: Optional[dict[int, list[float]]] = None) -> Optional[dict]:
     """Adaptive-feedback proposal for a distance x secondary-structure CV grid."""
     out_dir = Path(out_dir)
     centers_arr = np.asarray(centers_a, dtype=float)
@@ -1392,6 +1433,7 @@ def run_adaptive_feedback_dispatcher_2d(args, out_dir: Path, centers_a, k_list, 
                 args, out_dir, centers_a, k_list, exchange_stats,
                 secondary_cv_centers, secondary_cv_k_kcal_list, secondary_cv_metadata,
                 fallback_history_by_window=fallback_history_by_window,
+                fallback_secondary_history_by_window=fallback_secondary_history_by_window,
             )
         # Fallback for unusual non-rectangular input.
         return run_adaptive_feedback_dispatcher(args, out_dir, centers_a, k_list, exchange_stats, fallback_history_by_window=fallback_history_by_window)
@@ -1403,6 +1445,11 @@ def run_adaptive_feedback_dispatcher_2d(args, out_dir: Path, centers_a, k_list, 
         for w in range(nwin):
             samples_distance_by_window[w] = [float(x) for x in fallback_history_by_window.get(w, []) if math.isfinite(float(x))]
         total_samples = sum(len(v) for v in samples_distance_by_window.values())
+    total_secondary_samples = sum(len(v) for v in samples_secondary_by_window.values())
+    if total_secondary_samples == 0 and fallback_secondary_history_by_window:
+        for w in range(nwin):
+            samples_secondary_by_window[w] = [float(x) for x in fallback_secondary_history_by_window.get(w, []) if math.isfinite(float(x))]
+        total_secondary_samples = sum(len(v) for v in samples_secondary_by_window.values())
 
     primary_samples = _group_window_samples_by_axis(samples_distance_by_window, centers_arr, primary_centers)
     secondary_samples = _group_window_samples_by_axis(samples_secondary_by_window, sec_arr, secondary_centers)
@@ -1422,6 +1469,7 @@ def run_adaptive_feedback_dispatcher_2d(args, out_dir: Path, centers_a, k_list, 
         centers_arr, sec_arr, exchange_stats, n_primary, n_secondary,
         target_overlap, args,
     )
+    edge_rows_2d = _adaptive_feedback_2d_flag_off_center_edges(edge_rows_2d, cell_rows_2d)
     edge_rows_2d, local_defect_rows_2d = _adaptive_feedback_2d_annotate_locality(edge_rows_2d, args)
 
     # Compute per-axis exchange acceptance using min over the orthogonal axis.
