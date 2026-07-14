@@ -1,6 +1,6 @@
 # Claude Handoff
 
-Updated 2026-07-12.
+Updated 2026-07-14.
 
 ## GENPEPT contact-count bias
 
@@ -18,6 +18,16 @@ Updated 2026-07-12.
 - Runtime force uses same raw-feature linear torsion projection as `tica-linear`.
 - `tica_switch_cv2: true` switches only after a successful tICA update writes a valid tICA state file.
 - Fast resume restores linear torsion state paths from secondary-CV metadata and fails closed if missing.
+
+## Torsion-PCA scree diagnostic (analyze_gareus_mbar.py)
+
+- Added `_analyze_torsion_pca_scree` to `analyze_gareus_mbar.py`: full-spectrum PCA (all components, not just PC1) over the same sin/cos backbone-torsion feature space used by `cv2: torsion-pca`, computed from one adaptive-production epoch's real `tica_obs/dihedral_obs_*.npz` samples (default epoch 0) rather than the GENPEPT seed bank — real sampled dynamics, not generator diversity.
+- Outputs land in `<out>/torsion_pca_scree/`: `torsion_pca_scree.png` (per-component + cumulative variance), `torsion_pca_scree_table.csv` (per-PC eigenvalue/EVR/cumulative-EVR plus top-3 loading torsions), `torsion_pca_scree_data.npz` (mean, full eigenvector matrix, eigenvalues, labels — for reuse without recomputing).
+- Per-torsion labels are residue-derived (`phi-D3`, `psi-G7`, ...) when the run's sequence length matches the torsion count; falls back to generic `phi_i`/`psi_i` otherwise. Loading magnitude per torsion = `sqrt(w_sin² + w_cos²)` from the eigenvector, not a full angular-span reconstruction (that heavier pseudo-trajectory/PDB-structure version — sweeping each PC from lowest to highest observed seed-bootstrap projection and rebuilding real 3D structures via `GENPEPT.build_structure` — was a one-off ad hoc analysis, not wired into this script; see chat history / `chignolin_2d_run7/torsion_pca_pseudotrajectories/` if regenerating it).
+- `tica_obs/dihedral_obs_*.npz` is only flushed to disk at **epoch end** (`DihedralObsBuffer.save`, `gareus/tica.py`) — the analysis returns `available: False` gracefully if run mid-epoch, not a bug.
+- Gated by `--no-torsion-pca-scree` (on by default) and `--torsion-pca-scree-epoch N` (default 0). Result merged into the JSON summary under `s['torsion_pca_scree']`, files merged into `s['files']` — same integration pattern as `_analyze_tica_epochs`/`_analyze_epoch_cv_exploration` (no bespoke markdown section).
+- Shares the epoch-npz loader with `_analyze_tica_epochs` via the hoisted top-level `_load_epoch_dihedral_features` (previously a private nested closure).
+- `--adaptive-diag-stride` default lowered 30→3 (denser adaptive diagnostic density maps by default).
 
 ## Main Files
 
@@ -38,6 +48,6 @@ Updated 2026-07-12.
 
 - `pytest -q tests/test_bootstrap_torsion_cv.py tests/test_tica_cv_mode.py tests/test_genpept_contact_bias.py`
 - `python -m py_compile GENPEPT.py gareus/cv.py gareus/tica.py gareus/production.py gareus/adaptive_production.py gareus/cli.py gareus/helptext.py analyze_gareus_mbar.py`
-- Parser smoke: `--cv2 torsion-pca`, `--contact-bias-strength 0.15`
+- Parser smoke: `--cv2 torsion-pca`, `--contact-bias-strength 0.15`, `analyze_gareus_mbar.py --no-torsion-pca-scree`, `--torsion-pca-scree-epoch 0`
 - Help smoke: `python -m gareus -h` and `python -m gareus -hh`, `python GENPEPT.py -h`
 - `git diff --check`
