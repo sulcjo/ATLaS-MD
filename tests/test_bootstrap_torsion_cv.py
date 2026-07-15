@@ -657,9 +657,57 @@ def test_bootstrap_pca_fail_closed_on_zero_variance():
 
 
 def test_bootstrap_pca_fail_closed_on_zero_component_variance():
-    X = np.column_stack([np.linspace(-1.0, 1.0, 12), np.zeros(12), np.zeros(12), np.zeros(12)])
+    # All 4 columns carry only floating-point noise well below epsilon, so even
+    # combining every requested top-N component keeps total explained variance
+    # at zero -- this is the new analog of "the requested component(s) carry no
+    # real variance" under the variance-weighted top-N combination scheme.
+    rng = np.random.default_rng(0)
+    X = 1e-13 * rng.standard_normal((12, 4))
     with pytest.raises(ValueError, match="zero bootstrap torsion PCA variance"):
         compute_bootstrap_torsion_pca(X, residualize=False, component=2)
+
+
+def test_bootstrap_pca_component_count_combines_top_n_variance_weighted():
+    # Two independent real signals (distinct variances) plus two zero-variance
+    # columns. component=2 should combine PC1 and PC2 with coefficients
+    # proportional to sqrt(variance), not just return PC1 alone.
+    rng = np.random.default_rng(7)
+    n = 500
+    strong = 3.0 * rng.standard_normal(n)
+    weak = 1.0 * rng.standard_normal(n)
+    X = np.column_stack([strong, weak, np.zeros(n), np.zeros(n)])
+
+    result_1 = compute_bootstrap_torsion_pca(X, residualize=False, component=1)
+    result_2 = compute_bootstrap_torsion_pca(X, residualize=False, component=2)
+
+    # component=1 must reduce to "PC1 alone": weights point along the strong axis
+    # (small residual on the weak axis is expected finite-sample noise, not signal).
+    assert abs(abs(result_1.weights[0]) - 1.0) < 0.01
+    assert abs(result_1.weights[1]) < 0.01
+
+    # component=2 must pull in the second (weak) axis -- not identical to PC1 alone.
+    assert abs(result_2.weights[1]) > 0.1
+    cos_sim = abs(float(np.dot(result_1.weights, result_2.weights)))
+    assert cos_sim < 0.999
+
+    # component=2's combined coefficients should be variance-weighted:
+    # coefficient ratio = sqrt(variance_strong / variance_weak) = sqrt(9/1) = 3,
+    # by construction (strong has 3x the stdev of weak).
+    ratio = abs(result_2.weights[0]) / abs(result_2.weights[1])
+    assert abs(ratio - 3.0) < 0.3
+
+    # PC1 is by definition the single direction of maximum variance, so any
+    # other direction -- including this variance-weighted blend with PC2 --
+    # explains equal or (here, strictly) less variance along itself than PC1
+    # alone. The payoff isn't "more variance," it's "some influence from a
+    # mode PC1 alone can't see" (e.g. DPETG's phi-Gly7 living mostly on PC4).
+    assert result_2.eigenvalue < result_1.eigenvalue
+
+
+def test_bootstrap_pca_component_out_of_range_raises():
+    X = np.column_stack([np.linspace(-1.0, 1.0, 12), np.linspace(1.0, -1.0, 12)])
+    with pytest.raises(ValueError, match=r"component must be in 1\.\.2"):
+        compute_bootstrap_torsion_pca(X, residualize=False, component=3)
 
 
 def test_ticaresult_preserves_method_roundtrip(tmp_path):

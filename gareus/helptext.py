@@ -1446,6 +1446,12 @@ nonlocal contact axis.  The state file is written to
 <out>/tica/bootstrap_torsion_cv.json and the OpenMM force uses the same linear
 torsion machinery as `tica-linear`.
 
+CV2 stays a single scalar restraint, but `bootstrap_torsion_component` (default
+5) does not pick one PCA component index -- it is a count: the top N
+components (by variance) are combined into that one direction via a
+variance-weighted linear combination (coefficient_i = sqrt(variance_i), then
+renormalized).  `bootstrap_torsion_component: 1` reduces to "PC1 alone."
+
 Recommended two-stage setup:
 
     cvs:
@@ -1455,7 +1461,7 @@ Recommended two-stage setup:
     bootstrap_torsion_cv:
       bootstrap_torsion_source: seeds
       bootstrap_torsion_residualize_against_cv1: true
-      bootstrap_torsion_component: 1
+      bootstrap_torsion_component: 1  # PC1 alone; default is 5 (top-5, variance-weighted)
       bootstrap_torsion_min_seed_count: 20
 
     tica:
@@ -1532,7 +1538,7 @@ Two-stage auto-switch (epoch 0 torsion-pca → epoch 1+ tica-linear):
     bootstrap_torsion_cv:
       bootstrap_torsion_source: seeds
       bootstrap_torsion_residualize_against_cv1: true
-      bootstrap_torsion_component: 1
+      bootstrap_torsion_component: 1  # PC1 alone; default is 5 (top-5, variance-weighted)
       bootstrap_torsion_min_seed_count: 20
 
     adaptive_production:

@@ -1,6 +1,31 @@
 # Claude Handoff
 
-Updated 2026-07-14.
+Updated 2026-07-15.
+
+## Minimization step-count defaults raised to >= 1000
+
+Every "how many minimization steps by default" argparse default under 1000 raised to 1000 — these were all short defaults tuned for a bigger/older workflow, not a hard physical requirement:
+
+- `GENPEPT.py`: `--implicit-max-iterations` 300→1000, `--explicit-max-iterations` 500→1000, `--bh-initial-min-iterations` 200→1000, `--bh-min-iterations` 150→1000 (basin-hop minimization, part of GENPEPT seed generation).
+- `gareus/cli.py`: `--us-pull-minimize-iterations` 100→1000 — this one governs *both* the graft-into-solvated-context clash minimization (`graft_conformer_into_context` in `gareus/seeding.py`, used when seeding umbrella windows from GENPEPT survivors) and the umbrella-pull-ramp minimizations (`relax_to_window`'s `_run_primary_pull_segment` calls) — "for seeds" and "in pulling" both trace back to this one knob.
+- `gareus/cli.py`'s `--minimize-iterations` (main NVT-stage system minimization, `gareus/system_setup.py`) was already 20000 — untouched.
+
+**Deliberate exceptions, not touched:**
+- `GENPEPT.py --tier-scout-iterations` (default 25) — the scout tier of `--tiered-implicit-min` (off by default) is *designed* to be a cheap fast pre-filter before refining a smaller subset; forcing it to 1000 would make scout as expensive as refine and defeat the tier split's purpose.
+- `GENPEPT.py --adaptive-min-chunk-iterations` (default 25) — a convergence-check chunk *granularity* inside the adaptive-minimization loop, not a total step count; the actual total is still governed by `--implicit-max-iterations`/`--explicit-max-iterations` above.
+- `GENPEPT.py --tier-refine-iterations` (default 0) — `0` is a sentinel meaning "fall back to `--implicit-max-iterations`," not literally zero steps.
+- `gareus/seeding.py`'s first-ramp-stage clash minimization (`relax_to_window`'s `_run_primary_pull_segment`, the exact stage the pull-crash-recovery logic guards) was hardcoded `min(minimize_iters, 25)` regardless of `--us-pull-minimize-iterations`. Raised: now just `minimize_iters` (uncapped), matching every other minimization call site in that function — a longer clash-relax before the ramp's first dynamics steps is a stabilizing change, not a destabilizing one, so this doesn't fight the crash-recovery mechanism.
+- These are argparse *default* changes only, not a runtime floor/clamp — a YAML config or CLI flag can still explicitly set a lower value (e.g. `RUNS/chignolin/chignolin_quicktest.yaml` intentionally uses smaller values for fast local smoke tests; those overrides are untouched and still apply).
+- No existing test asserted the old default values, so no test changes were needed for this one.
+
+## Torsion-PCA CV2 — `bootstrap_torsion_component` is a count, not an index
+
+- `compute_bootstrap_torsion_pca` (`gareus/tica.py`) previously took `component` as a 1-based index selecting a *single* PCA eigenvector as the `cv2: torsion-pca` direction. Changed: `component` is now a **count** — the top N components (by variance, ranked 1..N) are combined into one unit-norm direction via a variance-weighted linear combination, `coefficient_i = sqrt(variance_i)` then renormalized. CV2 stays a single scalar restraint either way; this just lets that one restraint draw on more than PC1 alone.
+- `component=1` is exactly backward compatible: a single positive scalar coefficient doesn't change a normalized direction's identity, so it reduces to the old "PC1 alone" behavior bit-for-bit.
+- Default changed `1` → `5` (`--bootstrap-torsion-component`, `gareus/cli.py`; same default fallback in `gareus/production.py`'s `getattr`).
+- Important asymmetry: PC1 is *by construction* the single direction of maximum variance, so combining in more components can only match or **reduce** that one direction's own explained variance (`TICAResult.eigenvalue`/`explained_variance_ratio`) relative to PC1 alone — the payoff isn't more variance, it's picking up influence from a mode PC1 alone doesn't see (e.g. a torsion that only loads heavily on PC4).
+- Tests: `tests/test_bootstrap_torsion_cv.py::test_bootstrap_pca_component_count_combines_top_n_variance_weighted` verifies the coefficient ratio matches `sqrt(variance_i/variance_j)` exactly and that combined-direction variance is strictly ≤ PC1-alone variance; `test_bootstrap_pca_component_out_of_range_raises` covers the bounds check. `test_bootstrap_pca_fail_closed_on_zero_component_variance` updated for the new semantics (old test's X made requesting component=2 trivially succeed under the new scheme, since PC1 there still carried real variance — not a bug, just no longer a failure case).
+- Any cached `<out>/tica/bootstrap_torsion_cv.json` from a run predating this change holds a single raw eigenvector under the old semantics; it's loaded as-is if present (`_ensure_bootstrap_torsion_cv_ready` in `gareus/production.py`), so changing `bootstrap_torsion_component` on a resumed run does nothing until that cache file is deleted and window/seed setup is redone.
 
 ## GENPEPT contact-count bias
 

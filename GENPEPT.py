@@ -7326,8 +7326,8 @@ def parse_args(argv=None):
                    help="When --bh-hmr-mass > 0 and global --constraints is none, use HBonds constraints for the BH system. Default: enabled.")
     p.add_argument("--bh-constraint-tolerance", type=float, default=1.0e-5,
                    help="Constraint tolerance for the basin-hop Langevin integrator.")
-    p.add_argument("--bh-initial-min-iterations", type=int, default=200)
-    p.add_argument("--bh-min-iterations", type=int, default=150)
+    p.add_argument("--bh-initial-min-iterations", type=int, default=1000)
+    p.add_argument("--bh-min-iterations", type=int, default=1000)
     p.add_argument("--bh-restart-from-parent", action="store_true", default=True)
     p.add_argument("--bh-chunk-size", type=int, default=0,
                    help="Parent PDBs per reusable basin-hop worker batch. 0 chooses one batch for single-worker runs and 4 for parallel runs.")
@@ -7346,8 +7346,8 @@ def parse_args(argv=None):
     p.add_argument("--temperature", type=float, default=300.0)
     p.add_argument("--friction", type=float, default=1.0)
     p.add_argument("--cutoff", type=float, default=1.0)
-    p.add_argument("--implicit-max-iterations", type=int, default=300)
-    p.add_argument("--explicit-max-iterations", type=int, default=500)
+    p.add_argument("--implicit-max-iterations", type=int, default=1000)
+    p.add_argument("--explicit-max-iterations", type=int, default=1000)
     p.add_argument("--tiered-implicit-min", action=argparse.BooleanOptionalAction, default=False,
                    help="Run a fast scout implicit minimization on many candidates, diversity-select a smaller subset, then refine only those. Speeds up diverse basin discovery.")
     p.add_argument("--tier-scout-iterations", type=int, default=25,
