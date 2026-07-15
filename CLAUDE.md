@@ -2,6 +2,21 @@
 
 Updated 2026-07-15.
 
+## `-hh` is now an auto-numbered, pageable, jumpable encyclopedia
+
+- `gareus/helptext.py`'s `-hh` used to be a single wall of text with two colliding hand-numbered topic schemes (`0.x` methodology walkthrough, then a `1.`-`17.` reference list — with `13.`, `14.`, and `16.` each reused for two different topics). Fixed at the root: topic numbers are no longer hand-authored. `_parse_encyclopedia` scans the same `Title\n----`-underline heading convention already used throughout the prose (regex `_HEADING_RE`, filtered by underline-length match) and assigns sequential numbers at render time, so the TOC can never drift out of sync with the text again — add/reorder/remove a heading and the numbering just follows.
+- `render_encyclopedia_help(parser, encyclopedia_text, topic=None, color=None)` in `gareus/helptext.py` is the shared builder: banner + auto TOC + all topic bodies + `parser.format_help()`. `heavy_help_text` (gareus's own `-hh`) is now a one-line wrapper around it. `gareus/energy_decomposition.py`'s separate `-hh` (`_EnergyDecompHeavyHelpAction`) was ported to the same builder instead of its own hand-rolled dump, so both heavy-help surfaces in the package now look and behave identically ("unite tui design completely").
+- `-hh` took an argparse `nargs=0` flag before; now `nargs="?"` (`metavar="TOPIC"`), so it accepts an optional topic:
+  - `gareus -hh` — full encyclopedia (banner + TOC + every topic + full flag list).
+  - `gareus -hh list` — just the table of contents, no paging.
+  - `gareus -hh 8` — jump straight to topic 8 (matched by the auto-assigned number).
+  - `gareus -hh <keyword>` — case-insensitive substring match against topic titles; zero matches prints a hint to run `-hh list`, multiple matches lists the candidates and asks for a number instead of guessing.
+- New `page_text(text, parser=None)`: when `sys.stdout.isatty()` (interactive terminal) it pipes the rendered text through `$PAGER` (default `less`, with `$LESS` defaulted to `FRX` — raw ANSI passthrough + quit-if-one-screen — only when the user hasn't already set `$LESS`, and without clobbering a custom `$PAGER`'s own args). When stdout is redirected/piped (scripts, `| grep`, CI) it falls straight back to the old plain single print — automation is unaffected, confirmed no automated test or CLAUDE.md smoke command asserts on `-hh`'s exact text. `GAREUS_NO_PAGER=1` forces the plain path even at a tty.
+- Section-heading hierarchy in the TOC (indented "sub-topics" under a bold top-level topic) is derived, not hardcoded: a topic is top-level if its original heading looks like bare `"N. Title"`, or — for a document with no such numbering at all, like `energy_decomposition`'s smaller reference — every heading in that document is top-level (checked once per document via `any_level1`, not per-heading) so a flat doc renders flat instead of nesting everything under nothing.
+- Color (bold TOC/heading text) is auto-detected from `sys.stdout.isatty()` and disabled by `NO_COLOR`; same detection gates paging, so redirected output is always plain ANSI-free text.
+- Deliberately did not touch `GENPEPT.py`'s or `analyze_gareus_mbar.py`'s help — both use plain unmodified argparse `-h` with no `-hh`/encyclopedia concept, out of scope for this change.
+- Verification: `python -m gareus -hh`, `-hh list`, `-hh 8`, `-hh torsion` (unique match), `-hh gamd` (ambiguous — lists 2 candidates), `-hh 999`/`-hh nosuchtopic` (no-match hint), all piped (non-tty) so no pager spawns; same via `gareus.energy_decomposition.build_arg_parser().parse_args(['-hh', ...])`. `pytest -q tests/test_bootstrap_torsion_cv.py tests/test_tica_cv_mode.py tests/test_genpept_contact_bias.py tests/test_trajectory_reporter_atom_subset.py` still green (energy_decomposition.py's now-unused `sys`/`textwrap` imports were also dropped).
+
 ## Minimization step-count defaults raised to >= 1000
 
 Every "how many minimization steps by default" argparse default under 1000 raised to 1000 — these were all short defaults tuned for a bigger/older workflow, not a hard physical requirement:
@@ -76,6 +91,7 @@ Every "how many minimization steps by default" argparse default under 1000 raise
 - `gareus/seeding.py`
 - `analyze_gareus_mbar.py`
 - `gareus/helptext.py`
+- `gareus/energy_decomposition.py`
 - `examples/chignolin_runs3.yaml`
 - `tests/test_bootstrap_torsion_cv.py`
 - `tests/test_tica_cv_mode.py`
@@ -85,7 +101,7 @@ Every "how many minimization steps by default" argparse default under 1000 raise
 
 - `pytest -q tests/test_bootstrap_torsion_cv.py tests/test_tica_cv_mode.py tests/test_genpept_contact_bias.py`
 - `pytest -q -k seed` (32 seeding-related tests; no dedicated crash-recovery test — the retry/fallback logic lives in closures over a live OpenMM `Simulation`/`Context`, same untestable-without-full-MD-stack constraint as `relax_to_window` itself)
-- `python -m py_compile GENPEPT.py gareus/cv.py gareus/tica.py gareus/production.py gareus/adaptive_production.py gareus/cli.py gareus/helptext.py gareus/seeding.py analyze_gareus_mbar.py`
+- `python -m py_compile GENPEPT.py gareus/cv.py gareus/tica.py gareus/production.py gareus/adaptive_production.py gareus/cli.py gareus/helptext.py gareus/seeding.py gareus/energy_decomposition.py analyze_gareus_mbar.py`
 - Parser smoke: `--cv2 torsion-pca`, `--contact-bias-strength 0.15`, `analyze_gareus_mbar.py --no-torsion-pca-scree`, `--torsion-pca-scree-epoch 0`
-- Help smoke: `python -m gareus -h` and `python -m gareus -hh`, `python GENPEPT.py -h`
+- Help smoke: `python -m gareus -h` and `python -m gareus -hh`, `-hh list`, `-hh 8`, `-hh torsion`; `gareus.energy_decomposition.build_arg_parser().parse_args(['-hh', ...])`; `python GENPEPT.py -h`
 - `git diff --check`

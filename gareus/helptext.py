@@ -5,11 +5,31 @@ module keeps the user-facing help split into two tiers:
 
 * ``-h`` / ``--help``: concise operational help for starting a run.
 * ``-hh`` / ``--help-heavy``: method encyclopedia plus the complete option list.
+
+``-hh`` text is auto-organized into numbered topics by parsing the
+``Title\\n----`` heading convention used throughout the encyclopedia blocks
+below (see :func:`_parse_encyclopedia`) -- topic numbers are never hand
+authored, so they can't drift out of sync with the prose.  ``-hh`` accepts an
+optional topic (``-hh 8`` or ``-hh torsion``) to jump straight to one
+section, or ``-hh list`` for just the table of contents.  When stdout is an
+interactive terminal, the result is piped through the user's ``$PAGER``
+(``less`` by default) so long topics stay scrollable/searchable instead of
+scrolling off the screen; non-interactive/redirected output (scripts, ``| grep``)
+falls back to a single plain print, unchanged from before.
+
+:mod:`gareus.energy_decomposition`'s own ``-hh`` reuses the same
+:func:`render_encyclopedia_help`/:func:`page_text` machinery so both heavy-help
+surfaces in this package share one look and feel.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
+import re
+import shlex
+import shutil
+import subprocess
 import sys
 import textwrap
 from typing import Iterable
@@ -19,6 +39,8 @@ __all__ = [
     "HeavyHelpAction",
     "simple_help_text",
     "heavy_help_text",
+    "render_encyclopedia_help",
+    "page_text",
 ]
 
 
@@ -235,7 +257,14 @@ The tica: section name is cosmetic.  The config loader flattens any nested dict
 so you may put the tica_* keys in any section (cvs:, windows:, etc.).
 The tica_state_file key is managed automatically; leave it empty or absent.
 
-Use -hh for the method encyclopedia, equations, design notes, and the complete flag list.
+Use -hh for the method encyclopedia, equations, design notes, and the complete
+flag list.  When run at a terminal it opens in your pager (less by default),
+with a numbered table of contents up front:
+
+    gareus -hh              full encyclopedia, paged, table of contents first
+    gareus -hh list         just the table of contents, no paging
+    gareus -hh 8            jump straight to topic 8
+    gareus -hh torsion       jump to whichever topic title matches
 """
 
 
@@ -1582,16 +1611,185 @@ def simple_help_text(prog: str = "gareus") -> str:
     return text
 
 
-def heavy_help_text(parser: argparse.ArgumentParser) -> str:
-    """Return the encyclopedia-style help page plus complete argparse output."""
-    method_text = _dedent(_METHOD_ENCYCLOPEDIA)
+# ---------------------------------------------------------------------------
+# Encyclopedia parsing: every heavy-help block in this package (and in
+# gareus.energy_decomposition) is plain text made of "Title\n----" headings.
+# Rather than hand-maintain a table of contents (which is exactly how the
+# encyclopedia ended up with two colliding "13."/"14."/"16." numbering
+# schemes), topic numbers are derived once, at render time, from whatever
+# headings are actually present -- add/remove/reorder a heading and the TOC
+# and jump targets follow automatically.
+# ---------------------------------------------------------------------------
+
+_HEADING_RE = re.compile(r"^(?P<title>[^\n]+)\n(?P<underline>[~=\-]{3,})[ \t]*$", re.MULTILINE)
+_NUM_PREFIX_RE = re.compile(r"^\d+(\.\d+)?[a-z]?\.?\s+")
+_LEVEL1_RE = re.compile(r"^\d+\.\s")
+
+_BOLD = "\x1b[1m"
+_RESET = "\x1b[0m"
+
+
+class _Section:
+    __slots__ = ("number", "level", "title", "body")
+
+    def __init__(self, number: int, level: int, title: str, body: str):
+        self.number = number
+        self.level = level
+        self.title = title
+        self.body = body
+
+
+def _style(text: str, color: bool, *, bold: bool = False) -> str:
+    if not color or not bold:
+        return text
+    return f"{_BOLD}{text}{_RESET}"
+
+
+def _parse_encyclopedia(text: str) -> "tuple[str, list[_Section]]":
+    """Split an encyclopedia text block into (banner_title, [sections]).
+
+    A heading is a line immediately followed by a same-length run of ``~``,
+    ``=``, or ``-``.  The first heading found is the document banner (e.g.
+    "Method encyclopedia"), not a numbered topic.  Sections whose original
+    heading looks like bare "N. Title" (one integer, no sub-number) become
+    top-level topics; everything else (e.g. "0.7 Optional secondary CV...",
+    or an unnumbered heading) nests as a sub-topic under the most recently
+    seen top-level topic -- which is exactly how this document is already
+    organized.
+    """
+    matches = [
+        m
+        for m in _HEADING_RE.finditer(text)
+        if abs(len(m.group("title")) - len(m.group("underline"))) <= 3
+    ]
+    if not matches:
+        return text.strip(), []
+    banner = matches[0].group("title").strip()
+    raw_titles = [matches[idx].group("title").strip() for idx in range(1, len(matches))]
+    # If nothing in the document uses the bare "N. Title" top-level numbering
+    # (e.g. energy_decomposition's smaller, flat reference), there is no real
+    # hierarchy to show -- render every heading top-level/un-indented rather
+    # than nesting everything under nothing.
+    any_level1 = any(_LEVEL1_RE.match(t) for t in raw_titles)
+    sections: list[_Section] = []
+    for idx, raw_title in enumerate(raw_titles, start=1):
+        m = matches[idx]
+        body_start = m.end()
+        body_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        body = text[body_start:body_end].strip("\n")
+        clean_title = _NUM_PREFIX_RE.sub("", raw_title).strip() or raw_title
+        level = 1 if (not any_level1 or _LEVEL1_RE.match(raw_title)) else 2
+        sections.append(_Section(number=idx, level=level, title=clean_title, body=body))
+    return banner, sections
+
+
+def _render_toc(sections: "list[_Section]", *, color: bool) -> str:
+    lines = ["Table of contents", "-----------------", ""]
+    for s in sections:
+        indent = "    " if s.level == 2 else ""
+        label = f"{s.number:>2}. {s.title}"
+        lines.append(indent + _style(label, color, bold=(s.level == 1)))
+    lines.append("")
+    lines.append("Jump to a topic:   -hh <number>   or   -hh <keyword>   (e.g. -hh torsion)")
+    lines.append("This list only:    -hh list")
+    return "\n".join(lines)
+
+
+def _render_section(s: "_Section", *, color: bool) -> str:
+    plain_heading = f"{s.number}. {s.title}"
+    underline = "-" * len(plain_heading)
+    heading = _style(plain_heading, color, bold=True)
+    return f"{heading}\n{underline}\n{s.body}\n"
+
+
+def _render_topic(sections: "list[_Section]", topic: str, *, color: bool) -> str:
+    topic = topic.strip()
+    if topic.isdigit():
+        matches = [s for s in sections if s.number == int(topic)]
+    else:
+        needle = topic.lower()
+        matches = [s for s in sections if needle in s.title.lower()]
+    if not matches:
+        return (
+            f"No -hh topic matches {topic!r}.\n"
+            "Run `-hh list` to see every topic number and title.\n"
+        )
+    if len(matches) > 1:
+        lines = [f"{topic!r} matches {len(matches)} topics -- re-run with a number:", ""]
+        for s in matches:
+            lines.append(f"  {s.number:>2}. {s.title}")
+        return "\n".join(lines) + "\n"
+    return (
+        _render_section(matches[0], color=color)
+        + "\nFull list: -hh list    Full encyclopedia: -hh\n"
+    )
+
+
+def render_encyclopedia_help(
+    parser: argparse.ArgumentParser,
+    encyclopedia_text: str,
+    *,
+    topic: "str | None" = None,
+    color: "bool | None" = None,
+) -> str:
+    """Build the full heavy-help page: banner, auto TOC, all topics, then
+    ``parser.format_help()``.  If ``topic`` is given, jump straight to the
+    matching topic (by number or title substring) instead; ``topic="list"``
+    returns just the table of contents.  Shared by :func:`heavy_help_text`
+    and :mod:`gareus.energy_decomposition`'s own ``-hh``.
+    """
+    if color is None:
+        color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+    banner, sections = _parse_encyclopedia(_dedent(encyclopedia_text))
+    if topic and topic.strip().lower() != "list":
+        return _render_topic(sections, topic, color=color)
+    toc = _render_toc(sections, color=color)
+    if topic and topic.strip().lower() == "list":
+        return toc + "\n"
+    heading = _style(banner, color, bold=True)
+    underline = "=" * len(banner)
+    body = "\n\n".join(_render_section(s, color=color) for s in sections)
     full_options = parser.format_help()
     return (
-        method_text
+        f"{heading}\n{underline}\n\n{toc}\n\n\n"
+        + body
         + "\n\nComplete option reference\n"
         + "=========================\n\n"
         + full_options
     )
+
+
+def heavy_help_text(parser: argparse.ArgumentParser, topic: "str | None" = None) -> str:
+    """Return the encyclopedia-style help page plus complete argparse output."""
+    return render_encyclopedia_help(parser, _METHOD_ENCYCLOPEDIA, topic=topic)
+
+
+def page_text(text: str, parser: "argparse.ArgumentParser | None" = None) -> None:
+    """Print ``text`` through the user's pager when stdout is an interactive
+    terminal; otherwise print it plainly (unchanged behavior for scripts,
+    ``| grep``, redirected output, etc.).  ``$PAGER`` is honored; plain
+    ``less`` gets sane default flags (raw ANSI, quit-if-one-screen) via
+    ``$LESS`` without overriding a user-customized ``$PAGER``.
+    """
+    stream = sys.stdout
+    interactive = stream.isatty() and not os.environ.get("GAREUS_NO_PAGER")
+    if interactive:
+        pager_cmd = shlex.split(os.environ.get("PAGER") or "less")
+        if pager_cmd and shutil.which(pager_cmd[0]):
+            env = dict(os.environ)
+            env.setdefault("LESS", "FRX")
+            try:
+                subprocess.run(pager_cmd, input=text.encode("utf-8", "replace"), env=env, check=False)
+                return
+            except (OSError, BrokenPipeError):
+                pass
+    if parser is not None:
+        parser._print_message(text, stream)
+    else:
+        try:
+            stream.write(text)
+        except BrokenPipeError:
+            pass
 
 
 class SimpleHelpAction(argparse.Action):
@@ -1606,11 +1804,11 @@ class SimpleHelpAction(argparse.Action):
 
 
 class HeavyHelpAction(argparse.Action):
-    """Argparse action that prints method encyclopedia help and exits."""
+    """Argparse action that prints the paged, topic-jumpable method encyclopedia and exits."""
 
     def __init__(self, option_strings: Iterable[str], dest: str = argparse.SUPPRESS, default=argparse.SUPPRESS, help: str | None = None):
-        super().__init__(option_strings=list(option_strings), dest=dest, nargs=0, default=default, help=help)
+        super().__init__(option_strings=list(option_strings), dest=dest, nargs="?", default=default, help=help, metavar="TOPIC")
 
     def __call__(self, parser, namespace, values, option_string=None):  # noqa: D401 - argparse signature
-        parser._print_message(heavy_help_text(parser), sys.stdout)
+        page_text(heavy_help_text(parser, topic=values), parser)
         parser.exit(0)
