@@ -246,7 +246,7 @@ def _ensure_bootstrap_torsion_cv_ready(args, out_dir: Path, topology, primary_cv
             X,
             cv1=cv1 if residualize else None,
             residualize=residualize,
-            component=int(getattr(args, "bootstrap_torsion_component", 1) or 1),
+            component=int(getattr(args, "bootstrap_torsion_component", 5) or 5),
             phi_torsion_indices=phi_torsions,
             psi_torsion_indices=psi_torsions,
         )

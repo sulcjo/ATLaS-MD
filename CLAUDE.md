@@ -1,6 +1,15 @@
 # Claude Handoff
 
-Updated 2026-07-14.
+Updated 2026-07-15.
+
+## Torsion-PCA CV2 — `bootstrap_torsion_component` is a count, not an index
+
+- `compute_bootstrap_torsion_pca` (`gareus/tica.py`) previously took `component` as a 1-based index selecting a *single* PCA eigenvector as the `cv2: torsion-pca` direction. Changed: `component` is now a **count** — the top N components (by variance, ranked 1..N) are combined into one unit-norm direction via a variance-weighted linear combination, `coefficient_i = sqrt(variance_i)` then renormalized. CV2 stays a single scalar restraint either way; this just lets that one restraint draw on more than PC1 alone.
+- `component=1` is exactly backward compatible: a single positive scalar coefficient doesn't change a normalized direction's identity, so it reduces to the old "PC1 alone" behavior bit-for-bit.
+- Default changed `1` → `5` (`--bootstrap-torsion-component`, `gareus/cli.py`; same default fallback in `gareus/production.py`'s `getattr`).
+- Important asymmetry: PC1 is *by construction* the single direction of maximum variance, so combining in more components can only match or **reduce** that one direction's own explained variance (`TICAResult.eigenvalue`/`explained_variance_ratio`) relative to PC1 alone — the payoff isn't more variance, it's picking up influence from a mode PC1 alone doesn't see (e.g. a torsion that only loads heavily on PC4).
+- Tests: `tests/test_bootstrap_torsion_cv.py::test_bootstrap_pca_component_count_combines_top_n_variance_weighted` verifies the coefficient ratio matches `sqrt(variance_i/variance_j)` exactly and that combined-direction variance is strictly ≤ PC1-alone variance; `test_bootstrap_pca_component_out_of_range_raises` covers the bounds check. `test_bootstrap_pca_fail_closed_on_zero_component_variance` updated for the new semantics (old test's X made requesting component=2 trivially succeed under the new scheme, since PC1 there still carried real variance — not a bug, just no longer a failure case).
+- Any cached `<out>/tica/bootstrap_torsion_cv.json` from a run predating this change holds a single raw eigenvector under the old semantics; it's loaded as-is if present (`_ensure_bootstrap_torsion_cv_ready` in `gareus/production.py`), so changing `bootstrap_torsion_component` on a resumed run does nothing until that cache file is deleted and window/seed setup is redone.
 
 ## GENPEPT contact-count bias
 
