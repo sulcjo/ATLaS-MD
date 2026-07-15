@@ -352,7 +352,7 @@ def _add_us_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--us-pull-timestep-fs", type=float, default=0.0,
                    help="Pull timestep. 0 = min(timestep-fs, 2 fs).")
     p.add_argument("--us-pull-friction-per-ps", type=float, default=10.0)
-    p.add_argument("--us-pull-minimize-iterations", type=int, default=100)
+    p.add_argument("--us-pull-minimize-iterations", type=int, default=1000)
     p.add_argument("--us-pull-ramp-stages", type=int, default=8,
                    help="Ramp stages for contact pulls and 2D secondary CV ramp.")
     p.add_argument("--us-2d-relax-mode",
