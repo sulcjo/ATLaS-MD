@@ -549,13 +549,23 @@ restrained CV pulling.  Default pull settings are:
     pull k = 5 kcal/mol/CV^2       (--us-pull-k; unified for all CV types)
     pull friction = 10 ps^-1       (--us-pull-friction-per-ps)
     pull timestep = min(production timestep, 2 fs)
-    minimization at pulled centers = 100 iterations
+    minimization at pulled centers = 1000 iterations  (--us-pull-minimize-iterations;
+                                       also governs seed-graft clash minimization)
     ramp stages for contact / 2D secondary = 8  (--us-pull-ramp-stages)
 
 For 2D CVs, staged relaxation can first relax the primary CV and then ramp the
 secondary CV.  If --seed-conformers-dir points to a GENPEPT output, nearby
 conformer seeds can be selected or grafted first, then the normal CV-pull
 preparation is still performed.
+
+If a window's target CV combination is sterically close to unreachable, the
+pull ramp can NaN on its first, gentlest sub-stage.  Each window now recovers
+automatically: on failure the simulation context is rebuilt (the crashed one
+may be CUDA-poisoned) and the pull is retried once with a 4x-finer contact
+ramp; if that also fails, the window falls back to its plain unpulled
+equilibrated structure, tagged pull_crash_fallback_unpulled and flagged bad
+in us_starting_structure_quality.json.  One bad steric target degrades one
+window instead of aborting the whole run.
 
 0.9 Production system
 ~~~~~~~~~~~~~~~~~~~~~
