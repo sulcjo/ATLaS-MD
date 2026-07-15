@@ -2,6 +2,17 @@
 
 Updated 2026-07-14.
 
+## US pull-crash recovery (`gareus/seeding.py`)
+
+- Root cause: contact-CV umbrella pull (`generate_us_starting_states_by_pulling` → `relax_to_window`) can NaN a window's positions on the very first, gentlest ramp sub-stage if that window's target contact combination is sterically close to unreachable given where the secondary CV sits. NaN corrupts CUDA addressing → `CUDA_ERROR_ILLEGAL_ADDRESS` → hard process abort, no auto-recovery, whole run dies (observed twice: `adaptive_feedback_round_01` and `adaptive_production/epoch_000`, both at primary-pull ramp stage 1/5 for a contact-CV window).
+- Fix, all in `gareus/seeding.py`:
+  - `_run_primary_pull_segment` takes `stage_override` (finer contact ramp than `--contact-us-pull-ramp-stages`, used only for crash retries).
+  - `relax_to_window` takes `contact_ramp_stage_override`, threaded through to both its internal `_run_primary_pull_segment` calls (staged-2D distance phase and single-stage path).
+  - New `_relax_to_window_recovering(sim, w, direction_label, device_idx)` wraps `relax_to_window`: on any exception, rebuilds a fresh `Simulation` (the raising Context may be CUDA-poisoned — never reused), resets to the equilibrated state, and retries once with a 4×-finer contact ramp (`max(16, contact_us_pull_ramp_stages*4)` stages). If the retry also fails, falls back to `_unpulled_window_row` — the plain unpulled equilibrated state for that window only, tagged `direction: pull_crash_fallback_unpulled (...)`, written to `window_..._CRASHFALLBACK_start.pdb`.
+  - All 7 call sites of `relax_to_window` (conformer-seeded concurrent/sequential, independent concurrent, nearest/compact_branch/extended_branch/fallback in the sequential walk) now go through `_relax_to_window_recovering`; the 2D row-base pre-pull loop is wrapped in its own try/except that rebuilds the context and skips that row's warm-start state on failure (individual windows still get attempted below).
+  - Quality-control loop (`us_starting_structure_quality.json`) flags any `pull_crash_fallback_unpulled` row as `status: bad` with an explicit warning — one bad window can no longer take down the run, but it's never silently marked "ok".
+- One bad steric target now costs one degraded window (flagged `bad` in quality report), not the whole umbrella-window seeding run.
+
 ## GENPEPT contact-count bias
 
 - Added `--contact-bias-strength` (default `0.0`, no behavior change) to `GENPEPT.py`: a Metropolis-style soft acceptance bias applied per-conformer in `generate_one`, on top of the existing energy/steric-only filtering.
@@ -37,6 +48,7 @@ Updated 2026-07-14.
 - `gareus/cli.py`
 - `gareus/production.py`
 - `gareus/adaptive_production.py`
+- `gareus/seeding.py`
 - `analyze_gareus_mbar.py`
 - `gareus/helptext.py`
 - `examples/chignolin_runs3.yaml`
@@ -47,7 +59,8 @@ Updated 2026-07-14.
 ## Verification
 
 - `pytest -q tests/test_bootstrap_torsion_cv.py tests/test_tica_cv_mode.py tests/test_genpept_contact_bias.py`
-- `python -m py_compile GENPEPT.py gareus/cv.py gareus/tica.py gareus/production.py gareus/adaptive_production.py gareus/cli.py gareus/helptext.py analyze_gareus_mbar.py`
+- `pytest -q -k seed` (32 seeding-related tests; no dedicated crash-recovery test — the retry/fallback logic lives in closures over a live OpenMM `Simulation`/`Context`, same untestable-without-full-MD-stack constraint as `relax_to_window` itself)
+- `python -m py_compile GENPEPT.py gareus/cv.py gareus/tica.py gareus/production.py gareus/adaptive_production.py gareus/cli.py gareus/helptext.py gareus/seeding.py analyze_gareus_mbar.py`
 - Parser smoke: `--cv2 torsion-pca`, `--contact-bias-strength 0.15`, `analyze_gareus_mbar.py --no-torsion-pca-scree`, `--torsion-pca-scree-epoch 0`
 - Help smoke: `python -m gareus -h` and `python -m gareus -hh`, `python GENPEPT.py -h`
 - `git diff --check`

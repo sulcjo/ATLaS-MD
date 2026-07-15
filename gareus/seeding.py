@@ -928,6 +928,7 @@ def generate_us_starting_states_by_pulling(
         progress_offset: int,
         message: str,
         start_center: Optional[float] = None,
+        stage_override: Optional[int] = None,
     ) -> None:
         """Run a primary-CV pull segment, ramping contact pulls to avoid NaNs.
 
@@ -953,7 +954,11 @@ def generate_us_starting_states_by_pulling(
             )
             return
 
-        stages = max(1, int(getattr(args, "contact_us_pull_ramp_stages", 8) or 8))
+        stages = max(
+            1,
+            int(stage_override) if stage_override is not None
+            else int(getattr(args, "contact_us_pull_ramp_stages", 8) or 8),
+        )
         stages = min(stages, max(1, nsteps))
         if start_center is None or not math.isfinite(float(start_center)):
             start_center = _current_primary_cv_from_context(sim)
@@ -994,7 +999,7 @@ def generate_us_starting_states_by_pulling(
         sim.context.setParameter("r0", float(target_center))
         sim.context.setParameter("k", float(final_k_openmm))
 
-    def relax_to_window(sim, w: int, direction_label: str):
+    def relax_to_window(sim, w: int, direction_label: str, contact_ramp_stage_override: Optional[int] = None):
         """Pull sim to window w and return (row_dict, positions, velocities)."""
         if primary_cv_is_contacts(args):
             # Start contact pulls from the current CV with k=0, then ramp in the
@@ -1031,6 +1036,7 @@ def generate_us_starting_states_by_pulling(
                         "us_starting_pull_primary",
                         progress_base + done_local,
                         f"Pull w{w+1}/{nwin}: cv1→{centers_user_arr[w]:.3f} cv2→{float(secondary_cv_centers[w]):+.2f} k={pull_k_kcal_a2:.1f} [cv1 phase]",
+                        stage_override=contact_ramp_stage_override,
                     )
                     done_local += int(distance_steps)
                 stage_steps = []
@@ -1066,6 +1072,7 @@ def generate_us_starting_states_by_pulling(
                     "us_starting_pull",
                     progress_base,
                     f"Pull w{w+1}/{nwin}: cv1→{centers_user_arr[w]:.3f}{primary_cv_units(args)} k={pull_k_kcal_a2:.1f}",
+                    stage_override=contact_ramp_stage_override,
                 )
         state = sim.context.getState(getPositions=True, getVelocities=True, getEnergy=True, enforcePeriodicBox=True)
         pos = state.getPositions()
@@ -1234,6 +1241,88 @@ def generate_us_starting_states_by_pulling(
         except Exception:
             s.context.setVelocitiesToTemperature(float(args.temperature_k) * unit.kelvin, int(args.seed) + seed_offset)
 
+    def _unpulled_window_row(w: int, device_idx: str, seed_offset: int, note: str):
+        """Last-resort row for a window whose pull crashed twice: the plain
+        equilibrated state, unpulled, with a fresh context so the crashed one
+        (possibly CUDA-context-poisoned) is never touched again."""
+        s = _make_pull_sim(device_idx, seed_offset=seed_offset)
+        _reset_sim_to_equil(s, seed_offset=seed_offset)
+        state = s.context.getState(getPositions=True, getVelocities=True, getEnergy=True, enforcePeriodicBox=True)
+        pos = state.getPositions()
+        vel = state.getVelocities()
+        pe_kj = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+        _unit_tag = "C" if primary_cv_is_contacts(args) else "A"
+        _center_user = float(centers_user_arr[w])
+        pdb_path = pull_dir / f"window_{w:03d}_center_{_center_user:.3f}{_unit_tag}_CRASHFALLBACK_start.pdb"
+        write_state_pdb(pdb_path, app, topology, pos)
+        row = {
+            "window": int(w),
+            "center_A": _center_user,
+            "achieved_cv_A": float("nan"),
+            "delta_A": float("nan"),
+            "primary_cv_value": float("nan"),
+            "primary_cv_center": _center_user,
+            "primary_cv_delta": float("nan"),
+            "primary_cv_units": primary_cv_units(args),
+            "pull_k_kcal_mol_A2": float(pull_k_kcal_a2),
+            "pull_steps": 0,
+            "pull_timestep_fs": float(ts),
+            "two_d_relax_mode": "staged" if staged_2d_relax else "single_stage",
+            "secondary_cv_center": "",
+            "achieved_secondary_cv": "",
+            "secondary_cv_delta": "",
+            "secondary_cv_k_kcal_mol": "",
+            "production_secondary_cv_bias_kcal_mol": "",
+            "potential_kj_mol": float(pe_kj),
+            "direction": f"pull_crash_fallback_unpulled ({note})",
+            "pdb": str(pdb_path),
+        }
+        return s, row, pos, vel
+
+    def _relax_to_window_recovering(sim, w: int, direction_label: str, device_idx: str):
+        """relax_to_window with crash recovery.
+
+        A NaN blow-up during pulling (contact-CV clashes are the usual cause)
+        surfaces as an OpenMM CUDA exception that can leave the Context in a
+        broken state, so recovery always hands back a freshly built Simulation
+        rather than reusing the one that raised. First retry: fresh context,
+        reset to the equilibrated state, and a much finer contact ramp. If that
+        also fails, give up on pulling this window and fall back to the
+        unpulled equilibrated state so one bad window can't take down the
+        whole run.
+        """
+        try:
+            row, pos, vel = relax_to_window(sim, w, direction_label)
+            return sim, row, pos, vel
+        except Exception as exc:
+            print(
+                f"WARNING [US pull crash] window {w+1}/{nwin} ({direction_label}) failed "
+                f"with {type(exc).__name__}: {exc}\n"
+                f"    -> rebuilding simulation context and retrying window {w+1} from the "
+                f"equilibrated state with a finer contact ramp."
+            )
+            try:
+                retry_sim = _make_pull_sim(device_idx, seed_offset=7000 + w)
+            except Exception as rebuild_exc:
+                print(f"ERROR: failed to rebuild simulation context after crash on window {w+1}: {rebuild_exc}")
+                raise
+            _reset_sim_to_equil(retry_sim, seed_offset=7000 + w)
+            finer_stages = max(16, int(getattr(args, "contact_us_pull_ramp_stages", 8) or 8) * 4)
+            try:
+                row, pos, vel = relax_to_window(
+                    retry_sim, w, f"{direction_label}_recovered_after_crash",
+                    contact_ramp_stage_override=finer_stages,
+                )
+                return retry_sim, row, pos, vel
+            except Exception as exc2:
+                print(
+                    f"WARNING [US pull crash] window {w+1}/{nwin} retry also failed "
+                    f"with {type(exc2).__name__}: {exc2}\n"
+                    f"    -> giving up on pulling window {w+1}; using the unpulled "
+                    f"equilibrated state for this window only (quality-flagged in the report)."
+                )
+                return _unpulled_window_row(w, device_idx, 7100 + w, f"{type(exc2).__name__}: {exc2}")
+
     if conformer_library:
         print(
             f"    Generating US starting structures with GENPEPT seeding: "
@@ -1242,6 +1331,7 @@ def generate_us_starting_states_by_pulling(
         if n_pull_workers > 1:
             def _seed_task(w):
                 s = _sim_pool.get()
+                device_idx = device_tokens[w % len(device_tokens)]
                 try:
                     _reset_sim_to_equil(s, seed_offset=5000 + w)
                     nearest_conf, seed_score_info = _select_conformer_for_window(w)
@@ -1256,7 +1346,7 @@ def generate_us_starting_states_by_pulling(
                         direction = "pull_fallback"
                     else:
                         direction = "seeded"
-                    row, pos, vel = relax_to_window(s, w, direction)
+                    s, row, pos, vel = _relax_to_window_recovering(s, w, direction, device_idx)
                     return w, row, pos, vel, graft_status, seed_score_info
                 finally:
                     _sim_pool.put(s)
@@ -1302,7 +1392,7 @@ def generate_us_starting_states_by_pulling(
                     direction = "pull_fallback"
                 else:
                     direction = "seeded"
-                row, pos, vel = relax_to_window(sim, w, direction)
+                sim, row, pos, vel = _relax_to_window_recovering(sim, w, direction, device_tokens[0])
                 positions_by_window[w] = pos
                 velocities_by_window[w] = vel
                 rows.append(row)
@@ -1390,9 +1480,10 @@ def generate_us_starting_states_by_pulling(
             # every window bears the full CV-distance cost from equilibrated.
             def _pull_task(w):
                 s = _sim_pool.get()
+                device_idx = device_tokens[w % len(device_tokens)]
                 try:
                     _reset_sim_to_equil(s, seed_offset=4242 + w)
-                    row, pos, vel = relax_to_window(s, w, "independent")
+                    s, row, pos, vel = _relax_to_window_recovering(s, w, "independent", device_idx)
                     return w, row, pos, vel
                 finally:
                     _sim_pool.put(s)
@@ -1429,22 +1520,32 @@ def generate_us_starting_states_by_pulling(
                 row_base_done = 0
                 previous_row_center = _current_primary_cv_from_context(sim) if primary_cv_is_contacts(args) else None
                 for row_dist_nm in unique_dist_nm:
-                    _run_primary_pull_segment(
-                        sim,
-                        float(row_dist_nm), float(pull_k_kj_nm2), row_pull_steps,
-                        "us_starting_pull_row_base",
-                        row_base_done,
-                        f"US start 2D row base to {primary_cv_format_value(float(row_dist_nm if primary_cv_is_contacts(args) else row_dist_nm * 10.0), args)}",
-                        start_center=previous_row_center,
-                    )
+                    try:
+                        _run_primary_pull_segment(
+                            sim,
+                            float(row_dist_nm), float(pull_k_kj_nm2), row_pull_steps,
+                            "us_starting_pull_row_base",
+                            row_base_done,
+                            f"US start 2D row base to {primary_cv_format_value(float(row_dist_nm if primary_cv_is_contacts(args) else row_dist_nm * 10.0), args)}",
+                            start_center=previous_row_center,
+                        )
+                        row_base_states[round(float(row_dist_nm), 8)] = sim.context.getState(
+                            getPositions=True, getVelocities=True, enforcePeriodicBox=True
+                        )
+                    except Exception as exc:
+                        print(
+                            f"WARNING [US pull crash] 2D row-base pull to {row_dist_nm:.4f} failed "
+                            f"with {type(exc).__name__}: {exc}\n"
+                            f"    -> rebuilding simulation context; windows on this row lose the "
+                            f"row-base warm start but are still attempted individually below."
+                        )
+                        sim = _make_pull_sim(device_tokens[0], seed_offset=9999)
+                        _reset_sim_to_equil(sim, seed_offset=9999)
                     previous_row_center = float(row_dist_nm)
                     row_base_done += int(row_pull_steps)
-                    row_base_states[round(float(row_dist_nm), 8)] = sim.context.getState(
-                        getPositions=True, getVelocities=True, enforcePeriodicBox=True
-                    )
                 _reset_sim_to_equil(sim, seed_offset=4242)
 
-            row, pos, vel = relax_to_window(sim, nearest, "nearest")
+            sim, row, pos, vel = _relax_to_window_recovering(sim, nearest, "nearest", device_tokens[0])
             positions_by_window[nearest] = pos
             velocities_by_window[nearest] = vel
             rows.append(row)
@@ -1462,7 +1563,7 @@ def generate_us_starting_states_by_pulling(
                         sim.context.setVelocities(base.getVelocities())
                     except Exception:
                         sim.context.setVelocitiesToTemperature(float(args.temperature_k) * unit.kelvin, int(args.seed) + 4343 + w)
-                row, pos, vel = relax_to_window(sim, w, "compact_branch")
+                sim, row, pos, vel = _relax_to_window_recovering(sim, w, "compact_branch", device_tokens[0])
                 positions_by_window[w] = pos
                 velocities_by_window[w] = vel
                 rows.append(row)
@@ -1484,7 +1585,7 @@ def generate_us_starting_states_by_pulling(
                         sim.context.setVelocities(base.getVelocities())
                     except Exception:
                         sim.context.setVelocitiesToTemperature(float(args.temperature_k) * unit.kelvin, int(args.seed) + 4344 + w)
-                row, pos, vel = relax_to_window(sim, w, "extended_branch")
+                sim, row, pos, vel = _relax_to_window_recovering(sim, w, "extended_branch", device_tokens[0])
                 positions_by_window[w] = pos
                 velocities_by_window[w] = vel
                 rows.append(row)
@@ -1493,7 +1594,7 @@ def generate_us_starting_states_by_pulling(
             for w in range(nwin):
                 if positions_by_window[w] is None:
                     _reset_sim_to_equil(sim, seed_offset=4444 + w)
-                    row, pos, vel = relax_to_window(sim, w, "fallback")
+                    sim, row, pos, vel = _relax_to_window_recovering(sim, w, "fallback", device_tokens[0])
                     positions_by_window[w] = pos
                     velocities_by_window[w] = vel
                     rows.append(row)
@@ -1520,6 +1621,9 @@ def generate_us_starting_states_by_pulling(
         abs_delta = abs(float(r.get("delta_A", float("nan"))))
         warnings = []
         status = "ok"
+        if str(r.get("direction", "")).startswith("pull_crash_fallback"):
+            warnings.append(f"pull crashed twice for this window; using unpulled equilibrated state ({r['direction']})")
+            status = "bad"
         if primary_cv_is_contacts(args):
             contact_scale = contact_normalization_denominator(primary_cv_def.get("contact_pairs", []), args)
             warn_delta = 0.15 if bool(getattr(args, "contact_normalize", True)) else max(1.0, 0.15 * max(1.0, contact_scale))
