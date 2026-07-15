@@ -637,9 +637,12 @@ def make_trajectory_reporter(app, base_path: Path, interval: int, args, atom_sub
 
     ``atom_subset`` (ascending list of atom indices, e.g. from
     :func:`gareus.cv.solute_atom_indices`) records only those atoms — used by
-    ``--traj-solute-only`` to keep dense-sampling trajectories tiny. The OpenMM
-    DCD/XTC reporters accept ``atomSubset`` (OpenMM >= 8.1); a companion
-    ``solute_only.pdb`` topology must be written for analysis to read the file.
+    ``--traj-solute-only`` to keep dense-sampling trajectories tiny. OpenMM's
+    own ``app.DCDReporter``/``app.XTCReporter`` never accept an ``atomSubset``
+    kwarg (that's an ``mdtraj.reporters`` feature, in any OpenMM version), so
+    when a subset is requested we dispatch to ``mdtraj.reporters`` instead. A
+    companion ``solute_only.pdb`` topology must be written for analysis to
+    read the file.
     """
     interval = int(interval)
     if interval <= 0:
@@ -650,9 +653,22 @@ def make_trajectory_reporter(app, base_path: Path, interval: int, args, atom_sub
     base_path = Path(base_path)
     base_path.parent.mkdir(parents=True, exist_ok=True)
     subset = list(atom_subset) if atom_subset is not None else None
+
+    if subset is not None:
+        try:
+            import mdtraj.reporters as mdtraj_reporters
+        except ImportError as exc:
+            raise RuntimeError(
+                "--traj-solute-only requires mdtraj (for mdtraj.reporters.DCDReporter/"
+                "XTCReporter, which support atomSubset); OpenMM's own reporters do not."
+            ) from exc
+        if fmt == "dcd":
+            return mdtraj_reporters.DCDReporter(str(base_path.with_suffix(".dcd")), interval, atomSubset=subset)
+        if fmt == "xtc":
+            return mdtraj_reporters.XTCReporter(str(base_path.with_suffix(".xtc")), interval, atomSubset=subset)
+        raise ValueError(f"Unsupported --traj-format {fmt!r}; use dcd, xtc, or none")
+
     if fmt == "dcd":
-        if subset is not None:
-            return app.DCDReporter(str(base_path.with_suffix(".dcd")), interval, atomSubset=subset)
         return app.DCDReporter(str(base_path.with_suffix(".dcd")), interval)
     if fmt == "xtc":
         xtc_reporter = getattr(app, "XTCReporter", None)
@@ -661,8 +677,6 @@ def make_trajectory_reporter(app, base_path: Path, interval: int, args, atom_sub
                 "--traj-format xtc was requested, but this OpenMM installation does not expose "
                 "openmm.app.XTCReporter. Upgrade OpenMM or use --traj-format dcd."
             )
-        if subset is not None:
-            return xtc_reporter(str(base_path.with_suffix(".xtc")), interval, atomSubset=subset)
         return xtc_reporter(str(base_path.with_suffix(".xtc")), interval)
     raise ValueError(f"Unsupported --traj-format {fmt!r}; use dcd, xtc, or none")
 
