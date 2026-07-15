@@ -983,7 +983,7 @@ def generate_us_starting_states_by_pulling(
             sim.context.setParameter("k", float(k_stage))
             if idx == 0 and minimize_iters > 0 and bool(getattr(args, "contact_us_pull_minimize_first_ramp", True)):
                 try:
-                    sim.minimizeEnergy(maxIterations=max(1, min(minimize_iters, 25)))
+                    sim.minimizeEnergy(maxIterations=max(1, minimize_iters))
                 except TypeError:
                     sim.minimizeEnergy()
             run_steps_safely(

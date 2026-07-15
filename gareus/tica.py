@@ -464,7 +464,18 @@ def compute_bootstrap_torsion_pca(
     psi_torsion_indices: Optional[List] = None,
     epsilon: float = 1e-12,
 ) -> TICAResult:
-    """Fit a PCA model to seed conformer backbone features."""
+    """Fit a PCA model to seed conformer backbone features.
+
+    ``component`` is a count, not a single index: the top ``component``
+    principal components (by variance, 1..component) are combined into one
+    unit-norm CV direction via a variance-weighted linear combination
+    (coefficient_i = sqrt(variance_i), then renormalized). This keeps CV2 a
+    single scalar restraint while letting it draw on more than the single
+    top mode. ``component=1`` reduces exactly to "use PC1 alone" (a positive
+    scalar coefficient does not change a direction's normalized identity),
+    so this is fully backward compatible with the old single-component
+    behavior.
+    """
     X = np.asarray(X, dtype=np.float64)
     if X.ndim != 2:
         raise ValueError(f"X must be 2-D, got shape {X.shape}")
@@ -500,17 +511,19 @@ def compute_bootstrap_torsion_pca(
     total_variance = float(np.sum(variances))
     if total_variance <= float(epsilon):
         raise ValueError("zero bootstrap torsion PCA variance")
-    idx = int(component) - 1
-    if idx < 0 or idx >= vt.shape[0]:
+    n_top = int(component)
+    if n_top < 1 or n_top > vt.shape[0]:
         raise ValueError(f"component must be in 1..{vt.shape[0]}, got {component}")
-    if float(variances[idx]) <= float(epsilon):
-        raise ValueError("zero bootstrap torsion PCA variance")
-    explained = float(variances[idx] / total_variance)
-    v = np.asarray(vt[idx], dtype=np.float64)
-    norm = float(np.linalg.norm(v))
+    selected_variances = variances[:n_top]
+    coeffs = np.sqrt(np.clip(selected_variances, 0.0, None))
+    v_raw = (coeffs[:, None] * vt[:n_top]).sum(axis=0)
+    norm = float(np.linalg.norm(v_raw))
     if norm <= float(epsilon):
         raise ValueError("zero bootstrap torsion PCA component norm")
-    v = v / norm
+    v = v_raw / norm
+    explained = float(np.var(Xc @ v, ddof=1) / total_variance) if n > 1 else 0.0
+    if explained <= float(epsilon):
+        raise ValueError("zero bootstrap torsion PCA variance")
     if cv1_slope is not None:
         slope_norm_sq = float(cv1_slope @ cv1_slope)
         if slope_norm_sq > float(epsilon):

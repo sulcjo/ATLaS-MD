@@ -352,7 +352,7 @@ def _add_us_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--us-pull-timestep-fs", type=float, default=0.0,
                    help="Pull timestep. 0 = min(timestep-fs, 2 fs).")
     p.add_argument("--us-pull-friction-per-ps", type=float, default=10.0)
-    p.add_argument("--us-pull-minimize-iterations", type=int, default=100)
+    p.add_argument("--us-pull-minimize-iterations", type=int, default=1000)
     p.add_argument("--us-pull-ramp-stages", type=int, default=8,
                    help="Ramp stages for contact pulls and 2D secondary CV ramp.")
     p.add_argument("--us-2d-relax-mode",
@@ -506,8 +506,10 @@ def _add_tica_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--bootstrap-torsion-residualize-against-cv1",
                    action=argparse.BooleanOptionalAction, default=True,
                    help="For cv2=torsion-pca, regress seed torsion features against seed CV1 before PCA.")
-    p.add_argument("--bootstrap-torsion-component", type=int, default=1,
-                   help="1-based PCA component index for cv2=torsion-pca.")
+    p.add_argument("--bootstrap-torsion-component", type=int, default=5,
+                   help="Number of top PCA components to combine (variance-weighted, "
+                        "1..N by variance rank) into the single cv2=torsion-pca direction. "
+                        "1 means PC1 alone.")
     p.add_argument("--bootstrap-torsion-min-seed-count", type=int, default=20,
                    help="Minimum usable GENPEPT survivors needed for cv2=torsion-pca.")
     p.add_argument("--bootstrap-torsion-state-file", default="",
