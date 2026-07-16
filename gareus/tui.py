@@ -30,6 +30,7 @@ __all__ = [
     "make_progress_bar",
     "format_duration",
     "render_distance_ascii",
+    "dashboard_body_budget",
     # Internal helpers that may be useful elsewhere
     "replica_marker",
     "replica_fg256",
@@ -339,6 +340,18 @@ def _dashboard_density(args, term_w: Optional[int] = None, term_h: Optional[int]
     if term_w_val >= 150 and term_h_val >= 48:
         return "full"
     return "normal"
+
+
+def dashboard_body_budget(term_h: int, fraction: float, floor: int = 10) -> int:
+    """Proportional body-line budget for one dashboard row/panel.
+
+    Scales continuously with terminal height instead of a fixed ceiling tied
+    to a coarse density bucket, so a tall terminal shows more content rather
+    than the same capped amount plus blank margin. `_safe_tui_frame_text`
+    already truncates a frame that ends up taller than the terminal, so this
+    does not need to sum exactly across rows to stay safe.
+    """
+    return max(int(floor), int(round(float(term_h) * float(fraction))))
 
 
 def format_duration(seconds: Optional[float]) -> str:
