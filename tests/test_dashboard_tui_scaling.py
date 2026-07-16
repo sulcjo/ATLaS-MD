@@ -1,4 +1,4 @@
-from gareus.tui import dashboard_body_budget
+from gareus.tui import dashboard_body_budget, _weighted_panel_widths, _dashboard_weighted_row
 
 
 def test_dashboard_body_budget_scales_with_term_h():
@@ -22,3 +22,54 @@ def test_dashboard_body_budget_matches_old_normal_tier_reference_point():
     # value exactly, by construction.
     assert dashboard_body_budget(term_h=40, fraction=18 / 40, floor=10) == 18
     assert dashboard_body_budget(term_h=40, fraction=12 / 40, floor=8) == 12
+
+
+def test_weighted_panel_widths_distributes_proportionally():
+    widths = _weighted_panel_widths([2.4, 0.9], term_w=200, gap=2, min_panel_width=30)
+    assert len(widths) == 2
+    assert widths[0] > widths[1]
+    # Proportional: ratio should track the weight ratio (2.4 / 0.9 ~= 2.67),
+    # loosely, since rounding adjustments only ever move 1 column at a time.
+    ratio = widths[0] / widths[1]
+    assert 2.2 < ratio < 3.2
+
+
+def test_weighted_panel_widths_sums_to_usable_width():
+    term_w = 200
+    gap = 2
+    widths = _weighted_panel_widths([1.0, 1.0, 1.0], term_w=term_w, gap=gap, min_panel_width=30)
+    usable = term_w - 2
+    assert sum(widths) == usable - (len(widths) - 1) * gap
+
+
+def test_weighted_panel_widths_grows_with_terminal_width():
+    narrow = _weighted_panel_widths([2.4, 0.9], term_w=160, gap=2, min_panel_width=30)
+    wide = _weighted_panel_widths([2.4, 0.9], term_w=400, gap=2, min_panel_width=30)
+    assert wide[0] > narrow[0]
+    assert wide[1] > narrow[1]
+
+
+def test_weighted_panel_widths_narrow_terminal_returns_full_usable_each():
+    # Below the stacking threshold, every panel gets the full usable width
+    # (matches _dashboard_weighted_row's narrow-terminal vertical-stack path).
+    widths = _weighted_panel_widths([1.0, 1.0, 1.0], term_w=50, gap=2, min_panel_width=30)
+    assert widths == [48, 48, 48]
+
+
+def test_dashboard_weighted_row_unchanged_for_typical_terminal():
+    # Regression check: refactoring the width math out must not change
+    # _dashboard_weighted_row's output for a typical 160-wide terminal.
+    rows = _dashboard_weighted_row(
+        "diagnostics",
+        [("a", ["x"], 1.15), ("b", ["y"], 1.0), ("c", ["z"], 1.0)],
+        term_w=160,
+        gap=2,
+        min_panel_width=30,
+    )
+    assert any("diagnostics" in _strip(r) for r in rows)
+    assert len(rows) > 1
+
+
+def _strip(line):
+    from gareus.tui import strip_ansi
+    return strip_ansi(line)

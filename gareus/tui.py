@@ -34,6 +34,7 @@ __all__ = [
     # Internal helpers that may be useful elsewhere
     "replica_marker",
     "replica_fg256",
+    "_weighted_panel_widths",
 ]
 
 
@@ -255,6 +256,49 @@ def _dashboard_row(
     return [color_text(title, "magenta", bold=True)] + _join_columns(cols, gap=gap)
 
 
+def _weighted_panel_widths(
+    weights: List[float],
+    term_w: Optional[int] = None,
+    gap: int = 2,
+    min_panel_width: int = 30,
+) -> List[int]:
+    """Compute proportional panel widths for a weighted dashboard row.
+
+    Exposed standalone (not just inline in `_dashboard_weighted_row`) so a
+    caller can pre-render panel content — e.g. an ASCII histogram bar — at
+    the exact width the row will allocate, instead of guessing a width up
+    front and letting the row silently pad or truncate the mismatch away.
+    """
+    term_w_val = int(term_w or shutil.get_terminal_size((160, 40)).columns or 160)
+    usable = max(40, term_w_val - 2)
+    clean_weights = [max(0.05, float(w)) for w in weights]
+    n = len(clean_weights)
+    if n <= 0:
+        return []
+    gap_total = max(0, n - 1) * gap
+    min_w = max(22, int(min_panel_width))
+    if n > 1 and usable < n * min_w + gap_total:
+        return [usable] * n
+    available = max(n * min_w, usable - gap_total)
+    total_weight = sum(clean_weights) or 1.0
+    raw_widths = [max(min_w, int(round(available * w / total_weight))) for w in clean_weights]
+    delta = available - sum(raw_widths)
+    order = sorted(range(n), key=lambda i: raw_widths[i], reverse=True)
+    idx = 0
+    while delta != 0 and order:
+        i = order[idx % len(order)]
+        if delta > 0:
+            raw_widths[i] += 1
+            delta -= 1
+        elif raw_widths[i] > min_w:
+            raw_widths[i] -= 1
+            delta += 1
+        idx += 1
+        if idx > 10000:
+            break
+    return raw_widths
+
+
 def _dashboard_weighted_row(
     title: str,
     panels: List[tuple[str, List[str] | tuple]],
@@ -269,8 +313,6 @@ def _dashboard_weighted_row(
     rows make wide terminals useful instead of giving every diagnostic
     the same cramped column even when one panel is visually dominant.
     """
-    term_w_val = int(term_w or shutil.get_terminal_size((160, 40)).columns or 160)
-    usable = max(40, term_w_val - 2)
     clean: List[tuple[str, List[str], float]] = []
     for item in panels:
         if len(item) >= 3:
@@ -281,34 +323,21 @@ def _dashboard_weighted_row(
     n = len(clean)
     if n <= 0:
         return [color_text(title, "magenta", bold=True)]
-    gap_total = max(0, n - 1) * gap
+    widths = _weighted_panel_widths(
+        [w for _n, _b, w in clean], term_w=term_w, gap=gap, min_panel_width=min_panel_width
+    )
+    term_w_val = int(term_w or shutil.get_terminal_size((160, 40)).columns or 160)
+    usable = max(40, term_w_val - 2)
     min_w = max(22, int(min_panel_width))
+    gap_total = max(0, n - 1) * gap
     if n > 1 and usable < n * min_w + gap_total:
         out: List[str] = [color_text(title, "magenta", bold=True)]
         for name, body, _weight in clean:
             out.extend(_panel_lines(name, body, usable, max_panel_body_lines))
         return out
-    available = max(n * min_w, usable - gap_total)
-    total_weight = sum(w for _name, _body, w in clean) or 1.0
-    raw_widths = [max(min_w, int(round(available * w / total_weight))) for _name, _body, w in clean]
-    delta = available - sum(raw_widths)
-    # Adjust the widest panel first so total visible width stays within terminal.
-    order = sorted(range(n), key=lambda i: raw_widths[i], reverse=True)
-    idx = 0
-    while delta != 0 and order:
-        i = order[idx % len(order)]
-        if delta > 0:
-            raw_widths[i] += 1
-            delta -= 1
-        elif raw_widths[i] > min_w:
-            raw_widths[i] -= 1
-            delta += 1
-        idx += 1
-        if idx > 10000:
-            break
     cols = [
         _panel_lines(name, body, width, max_panel_body_lines)
-        for (name, body, _w), width in zip(clean, raw_widths)
+        for (name, body, _w), width in zip(clean, widths)
     ]
     return [color_text(title, "magenta", bold=True)] + _join_columns(cols, gap=gap)
 
