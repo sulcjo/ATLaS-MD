@@ -35,7 +35,19 @@ __all__ = [
     "replica_marker",
     "replica_fg256",
     "_weighted_panel_widths",
+    "MIN_PANEL_WIDTH",
+    "ABSOLUTE_MIN_PANEL_WIDTH",
+    "dashboard_row_gap",
 ]
+
+
+MIN_PANEL_WIDTH = 30
+ABSOLUTE_MIN_PANEL_WIDTH = 22
+
+
+def dashboard_row_gap(term_w: int) -> int:
+    """Inter-panel gap for a dashboard row, shared by every row layout call."""
+    return 2 if int(term_w) < 120 else 3
 
 
 def tui_clear_enabled(args) -> bool:
@@ -245,7 +257,7 @@ def _dashboard_row(
     usable = max(40, term_w_val - 2)
     n = max(1, len(panels))
     gap_total = max(0, n - 1) * gap
-    min_panel_w = 28
+    min_panel_w = MIN_PANEL_WIDTH
     if n > 1 and usable < n * min_panel_w + gap_total:
         out: List[str] = [color_text(title, "magenta", bold=True)]
         for name, body in panels:
@@ -276,7 +288,7 @@ def _weighted_panel_widths(
     if n <= 0:
         return []
     gap_total = max(0, n - 1) * gap
-    min_w = max(22, int(min_panel_width))
+    min_w = max(ABSOLUTE_MIN_PANEL_WIDTH, int(min_panel_width))
     if n > 1 and usable < n * min_w + gap_total:
         return [usable] * n
     available = max(n * min_w, usable - gap_total)
@@ -305,7 +317,7 @@ def _dashboard_weighted_row(
     term_w: Optional[int] = None,
     gap: int = 2,
     max_panel_body_lines: Optional[int] = None,
-    min_panel_width: int = 30,
+    min_panel_width: int = MIN_PANEL_WIDTH,
 ) -> List[str]:
     """A themed row with proportional panel widths and safe narrow stacking.
 
@@ -328,7 +340,7 @@ def _dashboard_weighted_row(
     )
     term_w_val = int(term_w or shutil.get_terminal_size((160, 40)).columns or 160)
     usable = max(40, term_w_val - 2)
-    min_w = max(22, int(min_panel_width))
+    min_w = max(ABSOLUTE_MIN_PANEL_WIDTH, int(min_panel_width))
     gap_total = max(0, n - 1) * gap
     if n > 1 and usable < n * min_w + gap_total:
         out: List[str] = [color_text(title, "magenta", bold=True)]

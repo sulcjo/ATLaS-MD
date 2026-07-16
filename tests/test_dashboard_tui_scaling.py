@@ -1,4 +1,17 @@
-from gareus.tui import dashboard_body_budget, _weighted_panel_widths, _dashboard_weighted_row
+from gareus.tui import dashboard_body_budget, _weighted_panel_widths, _dashboard_weighted_row, MIN_PANEL_WIDTH, ABSOLUTE_MIN_PANEL_WIDTH, dashboard_row_gap
+
+
+def test_min_panel_width_constants():
+    assert MIN_PANEL_WIDTH == 30
+    assert ABSOLUTE_MIN_PANEL_WIDTH == 22
+    assert ABSOLUTE_MIN_PANEL_WIDTH < MIN_PANEL_WIDTH
+
+
+def test_dashboard_row_gap_narrow_vs_wide():
+    assert dashboard_row_gap(100) == 2
+    assert dashboard_row_gap(119) == 2
+    assert dashboard_row_gap(120) == 3
+    assert dashboard_row_gap(300) == 3
 
 
 def test_dashboard_body_budget_scales_with_term_h():
