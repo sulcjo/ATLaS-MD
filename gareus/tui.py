@@ -534,6 +534,12 @@ def render_distance_ascii(
             return f"{float(value):6.2f}"
         return f"{float(value):6.2f} {primary_units_val}"
 
+    from .colors import severity_role
+
+    def _delta_severity_color(delta: float) -> str:
+        role = severity_role(delta, warn_at=0.5, bad_at=1.5)
+        return {"good": "green", "warn": "yellow", "bad": "red"}[role]
+
     clean: List[dict] = []
     for row in rows:
         try:
@@ -601,7 +607,7 @@ def render_distance_ascii(
     header = (
         "\n"
         + color_text(f"+-- CV {primary_label_val} coverage ", "cyan", bold=True)
-        + color_text("-" * 58, "cyan")
+        + color_text("-" * max(0, width_int - 2), "cyan")
         + "\n"
         + f"| {color_text('phase', 'dim')} {color_text(phase, 'cyan', bold=True)}  "
         + f"{color_text('step', 'dim')} {color_text(str(int(step)) + total_txt, 'white', bold=True)}\n"
@@ -645,7 +651,7 @@ def render_distance_ascii(
                 hist_values = [r["cv_A"]]
             bar = _render_histogram_row(hist_values, r["cv_A"], r["center_A"], lo, hi, width_int, replica=int(r["replica"]))
             delta = r["cv_A"] - r["center_A"]
-            delta_col = "green" if abs(delta) <= 0.5 else "yellow" if abs(delta) <= 1.5 else "red"
+            delta_col = _delta_severity_color(delta)
             lines.append(
                 f"r{r['replica']:02d} w{r['window']:02d}  "
                 + f"{r['cv_A']:8.2f} {r['center_A']:7.2f} {r['k_kcal_mol_A2']:7.3f} "
@@ -671,7 +677,7 @@ def render_distance_ascii(
             hist_values = [r["cv_A"]]
         bar = _render_histogram_row(hist_values, r["cv_A"], r["center_A"], lo, hi, width_int, replica=int(r["replica"]))
         delta = r["cv_A"] - r["center_A"]
-        delta_col = "green" if abs(delta) <= 0.5 else "yellow" if abs(delta) <= 1.5 else "red"
+        delta_col = _delta_severity_color(delta)
         lines.append(
             f"r{r['replica']:02d} w{r['window']:02d}  "
             + f"{r['cv_A']:8.2f} {r['center_A']:7.2f} {r['k_kcal_mol_A2']:7.3f} "

@@ -110,3 +110,21 @@ def test_dashboard_row_section_title_uses_section_role(monkeypatch):
     lines = tui_mod._dashboard_row("my section", [("p", ["x"])], term_w=160)
     expected = role_text("my section", ROLE_SECTION)
     assert lines[0] == expected
+
+
+def test_render_distance_ascii_header_separator_matches_width():
+    from gareus.tui import render_distance_ascii, strip_ansi
+
+    rows = [{"replica": 0, "window": 0, "center_A": 1.0, "k_kcal_mol_A2": 1.0, "cv_A": 1.0}]
+    out = render_distance_ascii(rows, phase="test", step=1, width=80, mode="hist3d")
+    header_line = [l for l in strip_ansi(out).splitlines() if l.startswith("+--")][0]
+    assert header_line.count("-") == 80
+
+
+def test_render_distance_ascii_short_width_separator_also_matches():
+    from gareus.tui import render_distance_ascii, strip_ansi
+
+    rows = [{"replica": 0, "window": 0, "center_A": 1.0, "k_kcal_mol_A2": 1.0, "cv_A": 1.0}]
+    out = render_distance_ascii(rows, phase="test", step=1, width=24, mode="hist3d")
+    header_line = [l for l in strip_ansi(out).splitlines() if l.startswith("+--")][0]
+    assert header_line.count("-") == 24
