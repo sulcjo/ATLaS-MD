@@ -649,6 +649,35 @@ def _validate_contact_args(args: argparse.Namespace) -> None:
         raise ValueError("contacts + --window-mode manual requires --contact-centers")
 
 
+# The upstream `gamd` package's integrator_factory.get_integrator only forwards
+# sigma0d to the dual-boost integrators (lower-dual, upper-dual, and their
+# nonbonded-dihedral variants). Every single-boost type is calibrated entirely
+# from sigma0p (see create_lower_dihedral_boost_integrator etc. in
+# gamd/integrator_factory.py, which accept a single `sigma0` positional filled
+# from sigma0p) and silently ignores sigma0d.
+_SINGLE_BOOST_GAMD_TYPES = frozenset({
+    "gamd-cmd-base", "lower-total", "upper-total",
+    "lower-dihedral", "upper-dihedral",
+    "lower-nonbonded", "upper-nonbonded",
+})
+
+
+def _validate_gamd_args(args: argparse.Namespace) -> None:
+    """Warn when --sigma0d is set but the selected GaMD boost type can't use it."""
+    boost_type = str(getattr(args, "gamd_boost_type", "") or "")
+    if boost_type not in _SINGLE_BOOST_GAMD_TYPES:
+        return
+    sigma0d = float(getattr(args, "sigma0d_kcal_mol", None) if getattr(args, "sigma0d_kcal_mol", None) is not None else getattr(args, "sigma0d", 6.0))
+    if abs(sigma0d - 6.0) > 1e-9:
+        print(
+            f"WARNING: --sigma0d={sigma0d:.3f} kcal/mol is set, but --gamd-boost-type={boost_type!r} "
+            "is a single-boost mode -- sigma0d is silently ignored for this boost type (only "
+            "dual-boost modes use it). --sigma0p is the parameter that actually governs GaMD "
+            "calibration here; set that instead.",
+            flush=True,
+        )
+
+
 def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
     """Map schema-v2 attr names to legacy internal names expected by consumer modules.
 
@@ -1069,6 +1098,7 @@ def parse_args(argv: Optional[Iterable[str]] = None):
 
     args.contact_scheme = contact_scheme(args)
     _validate_contact_args(args)
+    _validate_gamd_args(args)
 
     return args
 

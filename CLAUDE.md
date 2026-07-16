@@ -1,6 +1,15 @@
 # Claude Handoff
 
-Updated 2026-07-15.
+Updated 2026-07-16.
+
+## `--sigma0d` is a no-op for single-boost GaMD types (only `--sigma0p` matters)
+
+- Root cause of a real finding on the chignolin quicktest run: its `gamd:` section set `sigma0d: 2.0` under `boost_type: lower-dihedral`, expecting that to control the boost target. It does nothing there. Traced into the upstream `gamd` package (`gamd/integrator_factory.py`): `get_integrator`'s `"lower-dihedral"` branch (and every other single-boost type) calls `create_lower_dihedral_boost_integrator(..., sigma0p)` — passing only `sigma0p`. That function's signature is `(..., sigma0=6.0*kcal)`; `sigma0d` isn't even a parameter. `sigma0d` only reaches anything for the *dual*-boost integrators (`lower-dual`, `upper-dual`, and their `*-nonbonded-dihedral` variants), which do take both.
+- Confirmed in the quicktest run's own recorded state: `run_args.json` had `sigma0d_kcal_mol: 2.0` (set) and `sigma0p_kcal_mol: 6.0` (untouched default), and `global_shared_gamd_setup/shared_gamd_setup_globals.json` shows the calibration actually targeted `sigma0_Dihedral: 25.104 kJ/mol` — exactly 6.0 kcal/mol, i.e. sigma0p, not the intended 2.0.
+- Consequence: 6.0 kcal/mol was too large a target for DPETG's dihedral-energy dynamic range (calibrated `Vmax-Vmin ≈ 129 kJ/mol` for a 5-residue/8-torsion system). `k0` saturated at its ceiling (1.0) and stayed there even after the epoch-0 real-sampling recalibration (`recalibration_history`: `k0_before == k0_after == 1.0`) — a structural ceiling, not calibration noise — achieving only `sigmaV ≈ 11.5-11.7 kJ/mol`, under half the target. A maxed-out, unmoderated boost applied to DPETG's fast multi-basin flickering (Poincaré map: median recurrence 0.1-0.2 ns) produced a strongly non-Gaussian boost distribution: `anharmonicity_score = 1.11` (skew 0.96, excess kurtosis 1.13), flagged HIGH by the pipeline's own PMF analysis (`analyze_gareus_mbar.py`, threshold >1.0).
+- Fix: `gareus/cli.py`'s `_validate_gamd_args` (new, called from `parse_args` alongside `_validate_contact_args`) warns when `--sigma0d` is set to a non-default value but `--gamd-boost-type` is one of the single-boost types (`gamd-cmd-base`, `lower-total`, `upper-total`, `lower-dihedral`, `upper-dihedral`, `lower-nonbonded`, `upper-nonbonded`) — so this exact mistake surfaces immediately instead of silently mis-calibrating. Tests: `tests/test_gamd_boost_default.py` (warns for all 7 single-boost types with `sigma0d` set, doesn't warn for the 4 dual-boost types or when `sigma0d` is left at default).
+- `RUNS/chignolin/chignolin_quicktest.yaml` fixed: `sigma0d: 2.0` → `sigma0p: 2.0` (the parameter that actually governs `boost_type: lower-dihedral`).
+- **Not yet fixed**: `RUNS/chignolin/chignolin.yaml` (the real 10-residue production config) has the *identical* pattern — `gamd: sigma0d: 2.0` under `boost_type: lower-dihedral`, `sigma0p` unset (defaults to 6.0). Every past production run using this config (chignolin_2d_run5/7 etc.) was very likely calibrated against the same accidental 6.0 kcal/mol sigma0p target, not the intended 2.0. Left untouched pending a decision — chignolin's dihedral-energy dynamic range (more torsions, bigger system) may or may not actually saturate at 6.0 the way DPETG's did; that needs its own calibration data before picking a new number, and retroactively changing it affects comparability with prior runs.
 
 ## Minimization step-count defaults raised to >= 1000
 
@@ -62,17 +71,20 @@ Every "how many minimization steps by default" argparse default under 1000 raise
 - `gareus/cli.py`
 - `gareus/production.py`
 - `gareus/adaptive_production.py`
+- `gareus/seeding.py`
 - `analyze_gareus_mbar.py`
 - `gareus/helptext.py`
 - `examples/chignolin_runs3.yaml`
 - `tests/test_bootstrap_torsion_cv.py`
 - `tests/test_tica_cv_mode.py`
 - `tests/test_genpept_contact_bias.py`
+- `tests/test_gamd_boost_default.py`
 
 ## Verification
 
-- `pytest -q tests/test_bootstrap_torsion_cv.py tests/test_tica_cv_mode.py tests/test_genpept_contact_bias.py`
-- `python -m py_compile GENPEPT.py gareus/cv.py gareus/tica.py gareus/production.py gareus/adaptive_production.py gareus/cli.py gareus/helptext.py analyze_gareus_mbar.py`
+- `pytest -q tests/test_bootstrap_torsion_cv.py tests/test_tica_cv_mode.py tests/test_genpept_contact_bias.py tests/test_gamd_boost_default.py`
+- `pytest -q -k seed` (32+ seeding-related tests; no dedicated crash-recovery test — the retry/fallback logic lives in closures over a live OpenMM `Simulation`/`Context`, same untestable-without-full-MD-stack constraint as `relax_to_window` itself)
+- `python -m py_compile GENPEPT.py gareus/cv.py gareus/tica.py gareus/production.py gareus/adaptive_production.py gareus/cli.py gareus/helptext.py gareus/seeding.py analyze_gareus_mbar.py`
 - Parser smoke: `--cv2 torsion-pca`, `--contact-bias-strength 0.15`, `analyze_gareus_mbar.py --no-torsion-pca-scree`, `--torsion-pca-scree-epoch 0`
 - Help smoke: `python -m gareus -h` and `python -m gareus -hh`, `python GENPEPT.py -h`
 - `git diff --check`
