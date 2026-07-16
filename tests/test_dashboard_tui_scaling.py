@@ -86,3 +86,27 @@ def test_dashboard_weighted_row_unchanged_for_typical_terminal():
 def _strip(line):
     from gareus.tui import strip_ansi
     return strip_ansi(line)
+
+
+def test_panel_title_uses_title_role(monkeypatch):
+    import gareus.tui as tui_mod
+    import gareus.colors as colors_mod
+
+    monkeypatch.setattr(colors_mod, "ASCII_COLOR_ENABLED", True)
+    from gareus.colors import role_text, ROLE_TITLE
+
+    lines = tui_mod._panel_lines("my panel", ["line1"], width=30)
+    expected_title = role_text("my panel", ROLE_TITLE)
+    assert any(expected_title in line for line in lines)
+
+
+def test_dashboard_row_section_title_uses_section_role(monkeypatch):
+    import gareus.tui as tui_mod
+    import gareus.colors as colors_mod
+
+    monkeypatch.setattr(colors_mod, "ASCII_COLOR_ENABLED", True)
+    from gareus.colors import role_text, ROLE_SECTION
+
+    lines = tui_mod._dashboard_row("my section", [("p", ["x"])], term_w=160)
+    expected = role_text("my section", ROLE_SECTION)
+    assert lines[0] == expected

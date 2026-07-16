@@ -18,7 +18,7 @@ from typing import Optional, Iterable, List
 
 import numpy as np
 
-from .colors import ASCII_COLOR_ENABLED, color_text, style_text
+from .colors import ASCII_COLOR_ENABLED, ROLE_SECTION, ROLE_TITLE, color_text, role_text, style_text
 
 __all__ = [
     "tui_clear_enabled",
@@ -212,7 +212,7 @@ def _panel_lines(title: str, body: List[str], width: int, max_body_lines: Option
         keep = max(0, int(max_body_lines) - 1)
         body = body[:keep] + [color_text(f"… {len(body) - keep} more", "dim")]
     top = "┌" + "─" * inner + "┐"
-    title_line = "│" + _ansi_pad(color_text(title, "cyan", bold=True), inner) + "│"
+    title_line = "│" + _ansi_pad(role_text(title, ROLE_TITLE), inner) + "│"
     sep = "├" + "─" * inner + "┤"
     out: List[str] = [top, title_line, sep]
     if not body:
@@ -259,13 +259,13 @@ def _dashboard_row(
     gap_total = max(0, n - 1) * gap
     min_panel_w = MIN_PANEL_WIDTH
     if n > 1 and usable < n * min_panel_w + gap_total:
-        out: List[str] = [color_text(title, "magenta", bold=True)]
+        out: List[str] = [role_text(title, ROLE_SECTION)]
         for name, body in panels:
             out.extend(_panel_lines(name, body, usable, max_panel_body_lines))
         return out
     panel_w = max(min_panel_w, (usable - gap_total) // n)
     cols = [_panel_lines(name, body, panel_w, max_panel_body_lines) for name, body in panels]
-    return [color_text(title, "magenta", bold=True)] + _join_columns(cols, gap=gap)
+    return [role_text(title, ROLE_SECTION)] + _join_columns(cols, gap=gap)
 
 
 def _weighted_panel_widths(
@@ -334,7 +334,7 @@ def _dashboard_weighted_row(
         clean.append((str(name), list(body), max(0.05, weight)))
     n = len(clean)
     if n <= 0:
-        return [color_text(title, "magenta", bold=True)]
+        return [role_text(title, ROLE_SECTION)]
     widths = _weighted_panel_widths(
         [w for _n, _b, w in clean], term_w=term_w, gap=gap, min_panel_width=min_panel_width
     )
@@ -343,7 +343,7 @@ def _dashboard_weighted_row(
     min_w = max(ABSOLUTE_MIN_PANEL_WIDTH, int(min_panel_width))
     gap_total = max(0, n - 1) * gap
     if n > 1 and usable < n * min_w + gap_total:
-        out: List[str] = [color_text(title, "magenta", bold=True)]
+        out: List[str] = [role_text(title, ROLE_SECTION)]
         for name, body, _weight in clean:
             out.extend(_panel_lines(name, body, usable, max_panel_body_lines))
         return out
@@ -351,7 +351,7 @@ def _dashboard_weighted_row(
         _panel_lines(name, body, width, max_panel_body_lines)
         for (name, body, _w), width in zip(clean, widths)
     ]
-    return [color_text(title, "magenta", bold=True)] + _join_columns(cols, gap=gap)
+    return [role_text(title, ROLE_SECTION)] + _join_columns(cols, gap=gap)
 
 
 def _dashboard_full_width_panel(
@@ -364,7 +364,7 @@ def _dashboard_full_width_panel(
     """A themed dashboard row containing one full‑width panel."""
     term_w_val = int(term_w or shutil.get_terminal_size((160, 40)).columns or 160)
     usable = max(40, term_w_val - 2)
-    prefix = [color_text(title, "magenta", bold=True)] if title else []
+    prefix = [role_text(title, ROLE_SECTION)] if title else []
     return prefix + _panel_lines(panel_title, body, usable, max_body_lines)
 
 
