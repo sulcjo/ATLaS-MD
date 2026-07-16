@@ -272,7 +272,7 @@ def _weighted_panel_widths(
     weights: List[float],
     term_w: Optional[int] = None,
     gap: int = 2,
-    min_panel_width: int = 30,
+    min_panel_width: int = MIN_PANEL_WIDTH,
 ) -> List[int]:
     """Compute proportional panel widths for a weighted dashboard row.
 
