@@ -80,23 +80,6 @@ Every "how many minimization steps by default" argparse default under 1000 raise
 - Shares the epoch-npz loader with `_analyze_tica_epochs` via the hoisted top-level `_load_epoch_dihedral_features` (previously a private nested closure).
 - `--adaptive-diag-stride` default lowered 30→3 (denser adaptive diagnostic density maps by default).
 
-## Main Files
-
-- `GENPEPT.py`
-- `gareus/tica.py`
-- `gareus/cv.py`
-- `gareus/cli.py`
-- `gareus/production.py`
-- `gareus/adaptive_production.py`
-- `gareus/seeding.py`
-- `analyze_gareus_mbar.py`
-- `gareus/helptext.py`
-- `gareus/energy_decomposition.py`
-- `examples/chignolin_runs3.yaml`
-- `tests/test_bootstrap_torsion_cv.py`
-- `tests/test_tica_cv_mode.py`
-- `tests/test_genpept_contact_bias.py`
-
 ## Verification
 
 - `pytest -q tests/test_bootstrap_torsion_cv.py tests/test_tica_cv_mode.py tests/test_genpept_contact_bias.py`
