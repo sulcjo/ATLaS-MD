@@ -33,6 +33,9 @@ from .tui import (
     _dashboard_weighted_row,
     _join_columns,
     _panel_lines,
+    _weighted_panel_widths,
+    dashboard_body_budget,
+    dashboard_row_gap,
     format_duration,
     make_progress_bar,
     render_distance_ascii,
@@ -41,6 +44,8 @@ from .tui import (
     strip_ansi,
     strip_ansi_len,
     write_tui_frame,
+    ABSOLUTE_MIN_PANEL_WIDTH,
+    MIN_PANEL_WIDTH,
 )
 from .cv import (
     format_primary_cv_value,
@@ -2447,16 +2452,29 @@ class DistanceLogger:
         # notice a replica whose coordinate looks fine while its energy is doing
         # modern art.
         usable_w = max(40, term_w - 2)
-        row_gap = 2 if term_w < 120 else 3
-        min_panel_w = max(24, int(getattr(self.args, "dashboard_min_panel_width", 30) or 30))
+        row_gap = dashboard_row_gap(term_w)
+        min_panel_w = max(
+            ABSOLUTE_MIN_PANEL_WIDTH,
+            int(getattr(self.args, "dashboard_min_panel_width", MIN_PANEL_WIDTH) or MIN_PANEL_WIDTH),
+        )
         wide_threshold = int(getattr(self.args, "dashboard_wide_threshold", 120) or 120)
-        pe_panel_w = usable_w if usable_w < 105 else max(34, min(58, usable_w // 3))
-        cv_panel_w = usable_w if usable_w < 105 else max(50, usable_w - pe_panel_w - row_gap)
-        cv_bar_width = max(24, min(140 if full_dashboard else 110, cv_panel_w - 62))
-        pe_bar_width = max(10, min(36 if full_dashboard else 28, pe_panel_w - 24))
-        row1_max = (10 if compact_dashboard else 18 if density == "normal" else 30)
-        row23_max = (8 if compact_dashboard else 12 if density == "normal" else 18)
-        row4_max = (8 if compact_dashboard else 14 if density == "normal" else 18)
+        if usable_w < 105:
+            cv_panel_w = pe_panel_w = usable_w
+        else:
+            cv_panel_w, pe_panel_w = _weighted_panel_widths(
+                [2.4, 0.9], term_w=term_w, gap=row_gap, min_panel_width=min_panel_w
+            )
+        # -72 (not the naive -62 "text prefix" width) leaves room for the
+        # hist3d row's closing "] nw=<n>" suffix after the bar (measured: 62
+        # chars of prefix + bracket, then "] nw=<n>" after the bar content —
+        # ~68 chars of fixed overhead at typical single/double-digit sample
+        # counts) so `_panel_lines` doesn't ellipsis-truncate the closing
+        # bracket off a bar sized right up to the panel's edge.
+        cv_bar_width = max(24, cv_panel_w - 72)
+        pe_bar_width = max(10, pe_panel_w - 24)
+        row1_max = dashboard_body_budget(term_h, 18 / 40, floor=10)
+        row23_max = dashboard_body_budget(term_h, 12 / 40, floor=8)
+        row4_max = dashboard_body_budget(term_h, 14 / 40, floor=8)
 
         hist_lines = []
         if self.ascii_mode != "none" and not is_2d_run:
@@ -2487,7 +2505,7 @@ class DistanceLogger:
             sec_targets = [float(x) for x in info.get("secondary_cv_centers", []) if str(x) not in {"", "None", "nan"}]
             if sec_vals and sec_targets:
                 sec_lo_cov, sec_hi_cov = min(sec_targets), max(sec_targets)
-                cov2_w = max(12, min(48, term_w // 3))
+                cov2_w = max(12, term_w // 3)
                 sections.append(
                     color_text("CV2 cov", "dim")
                     + f" {sec_lo_cov:+.2f}–{sec_hi_cov:+.2f} |{_coverage_bar(sec_vals, sec_lo_cov, sec_hi_cov, cov2_w)}|"
@@ -2512,7 +2530,7 @@ class DistanceLogger:
                 "windows + 2D graph-edge overlap/exchange",
                 topology_lines[1:],
                 term_w=term_w,
-                max_body_lines=(10 if compact_dashboard else 18 if density == "normal" else 26),
+                max_body_lines=dashboard_body_budget(term_h, 18 / 40, floor=10),
             ))
             sections.append("")
 
@@ -2525,7 +2543,7 @@ class DistanceLogger:
                 ],
                 term_w=term_w,
                 gap=row_gap,
-                max_panel_body_lines=max(row1_max, min(32, int(getattr(self.args, "distance_ascii_max_replicas", 32) or 32) + 4)),
+                max_panel_body_lines=max(row1_max, int(getattr(self.args, "distance_ascii_max_replicas", 32) or 32) + 4),
                 min_panel_width=min_panel_w,
             ))
             sections.append("")
@@ -2538,14 +2556,14 @@ class DistanceLogger:
         map2d_lines = self._render_2d_replica_map(rows, info, width=map2d_w) if heavy_panels else []
 
         n_sec = len(self._unique_axis_values([float(x) for x in info.get("secondary_cv_centers", []) if str(x) not in {"", "None", "nan"}], ndigits=4))
-        map2d_max_body = max(10, min(24, n_sec + 8))
+        map2d_max_body = max(10, n_sec + 8)
 
         if wide_terminal and diff2d_lines and map2d_lines:
             diff_panel = _panel_lines(
                 f"log-density: {primary_label} × secondary-CV  (░▒▓█ = increasing density)",
                 diff2d_lines[1:],
                 diff2d_w,
-                max_body_lines=(14 if compact_dashboard else 22 if density == "normal" else 28),
+                max_body_lines=dashboard_body_budget(term_h, 22 / 40, floor=14),
             )
             map_panel = _panel_lines(
                 f"{primary_label} × secondary-CV replica grid",
@@ -2563,7 +2581,7 @@ class DistanceLogger:
                     f"log-density: {primary_label} × secondary-CV  (░▒▓█ = increasing sample density)",
                     diff2d_lines[1:],
                     term_w=term_w,
-                    max_body_lines=(14 if compact_dashboard else 22 if density == "normal" else 28),
+                    max_body_lines=dashboard_body_budget(term_h, 22 / 40, floor=14),
                 ))
                 sections.append("")
             if map2d_lines:
