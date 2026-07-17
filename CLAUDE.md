@@ -1,6 +1,32 @@
 # Claude Handoff
 
-Updated 2026-07-16.
+Updated 2026-07-17.
+
+## `plot_adaptive_diagnostics.py` — epoch/phase figures were badly wrong
+
+Found by visually inspecting `adaptive_fig1-4_*.png` from an analysis of a real completed run (`chignolin_quicktest`) whose adaptive-production loop stopped after epoch 0 (see the `stop_adaptive` entry above) and was resumed mid-epoch via SIGTERM once. Called from `analyze_gareus_mbar.py` (dynamically loaded, `_diag.run_all(...)`, wrapped in try/except so a failure here only prints a one-line skip message) but all three bugs and their fixes are in `plot_adaptive_diagnostics.py` itself:
+
+1. **`discover_phases` only ever found `epoch_000`.** It looked for baseline/topup_* segments inside a literal `ap_dir/"epoch_001"` directory. The driver always writes scheduled final-phase segments under a separate top-level `ap_dir/"final"` instead, regardless of how many numbered epochs ran (the epoch loop can stop after epoch 0 via its convergence gate — see above — handing the rest of the MD-pool budget straight to `final`). Real run: `epoch_001/` existed but held only a stray planning CSV; `final/baseline`, `final/topup_001_12000`, `final/topup_002_31000` held all the real segments. Result: every "per-phase" figure (1, 2, 3) silently rendered a single panel/degenerate range instead of all real phases. Fixed: generalized to glob all `epoch_*` dirs with a real `samples/` dir (not just `epoch_000`), then separately look under `ap_dir/"final"` for baseline/topup_* children. `fig_topup_timeline`'s and `fig_topup_targeting`'s own `epoch_001`-hardcoded lookups (`epoch_schedule.csv`, `baseline_windows.csv`, `topup_*_windows.csv`) fixed the same way.
+2. **Every figure loaded only `path/"samples"/"seg_001"`, silently dropping later segments.** A SIGTERM-interrupted-then-resumed segment writes a *new* segment directory (`seg_002`, ...) rather than appending to `seg_001`. Real run: `epoch_000/samples/` had `seg_001` (200,556 rows, pre-interruption) *and* `seg_002` (2,924,448 rows, post-resume) — the old code was reading 6.4% of epoch_000's real samples and reporting it as the whole phase. Fixed: point `pyarrow.dataset` at the `samples/` directory itself (it discovers all segment subdirectories automatically) instead of hardcoding `seg_001`.
+3. **The "Sample Count Grid" heatmap panel (fig 2) was always all-zero.** Its lookup dicts (`p_idx`/`s_idx`) were keyed by the raw unrounded `primary_center`/`secondary_center` floats, then looked up with `round(x, 6)` — `secondary_center` is a continuous CV projection with far more significant digits than that, so every lookup silently missed. Fixed by rounding both the dict keys and the lookup the same way. Extracted into a standalone `_sample_count_grid(state_reg, state_counts)` helper so this is unit-testable without rendering a figure.
+4. **CV2 axis labels were hardcoded to `"rama"`/`"rama-map"`** in three places, regardless of the run's actual secondary CV type (this run used `torsion-pca` → `tica-linear`). Fixed with a new `_secondary_cv_label(phases)` helper that reads `secondary_cv` from the *last* phase's `run_manifest.json` (CV2 can switch mid-run; the last phase is where most plotted production weight sits) and maps known types to short display names, falling back to the raw string or `"secondary"`.
+- Tests: `tests/test_plot_adaptive_diagnostics.py` (8 tests) — phase discovery finds `final/*` not `epoch_001/*`, generalizes to however many real numbered epochs exist, loads all segments under `samples/` not just `seg_001`; grid math matches high-precision floats; CV2 label mapping/fallback/last-phase-preference.
+- Verified end-to-end against the real affected run (`plot_adaptive_diagnostics.py RUNS/chignolin/chignolin_quicktest`, before/after): phase count 1 → 4, epoch_000 point count 10,028 → 156,251 (stride 20; matches the real ~3.13M-sample run), per-window sample bar chart 33,426 (flat, wrong) → 521,199-521,579 (matches `pmf_analysis/window_diagnostics.csv` exactly), grid heatmap empty → populated.
+
+## `--ap-epoch0-step-fraction` — new flag, epoch0:epoch1 was structurally forced 1:3
+
+- `adaptive_production_epoch0_step_fraction` was hardcoded to `0.5` in `gareus/cli.py`'s `_apply_v2_compat_shims`, with no argparse flag reaching it. With `--ap-epochs 2`, the pool's live per-epoch recompute (`gareus/adaptive_production.py`'s `_epoch0_scaled_steps` + the fresh `remaining_ns`-based share for epoch 1) gives epoch 0 exactly **1/4** and epoch 1 exactly **3/4** of the epoch-portion MD-pool budget — not the 1:1 split the "0.5" name suggests. Epoch 0's unused half isn't dropped, it's redistributed to epoch 1 via the pool's live recompute.
+- Added `--ap-epoch0-step-fraction` (default `0.5`, unchanged behavior) so this is finally reachable. Set to `1.0` to disable the redistribution and get an even split across epochs.
+- Tests: `tests/test_ap_epoch0_step_fraction.py` — confirms the argparse default/override wiring, and reproduces the exact 1/4:3/4 (fraction=0.5) vs 1:1 (fraction=1.0) split math via `_epoch0_scaled_steps` directly.
+- Independent of this: the epoch loop can also stop after epoch 0 entirely regardless of `--ap-epochs`, via the convergence gate (`stop_adaptive`) — see below. This flag only affects the *ratio* epoch 0 gets when the loop does run a further epoch; it doesn't force a second epoch to happen.
+
+## Adaptive-production epoch loop can stop after 1 epoch regardless of `--ap-epochs`
+
+- Root-caused why a run configured for `ap_epochs: 2` (torsion-pca epoch 0 → tica-linear epoch 1) only ever produced real samples in `epoch_000`, with `epoch_001/` left holding just a stray planning CSV and the rest of the MD-pool budget going straight to `final/baseline` + `final/topup_*`.
+- `run_adaptive_production_auto_loop` (`gareus/adaptive_production.py`) runs a convergence gate after every epoch (`status`/`stop_adaptive` computed around line 5288): if there are no errors, no `continue_reasons` (a state below `convergence_min_samples_per_state`, default 50 — trivially cleared by any real epoch — or a proposed add/split action, impossible once already at the window cap), and no warnings, `status="converged"` and `stop_adaptive=True` unconditionally, and the epoch loop `break`s regardless of how many epochs `--ap-epochs` still allows. Confirmed directly: `adaptive_production/epoch_000/adaptive_convergence_gate.json` had `{"status": "converged", "stop_adaptive": true, "continue_reasons": []}`.
+- This is not a bug in the sense of doing the wrong thing — it's "already converged, don't waste epoch budget" — but there's no minimum-epoch floor, so it can't distinguish "genuinely converged" from "just never got a reason to keep going." A short, cheap epoch 0 (exactly the kind `--ap-epoch0-step-fraction`/the hardcoded 0.5 default are *for*) is especially likely to trip this the same way every time, since low sample counts and window-cap-blocked add-actions are the only two things that can produce a `continue_reason`.
+- The tICA CV2 switch itself is **not** at risk from this — it's tied to the tICA refit succeeding at the end of whichever epoch triggers `tica_update_after_epochs`, independent of the adaptive loop's own convergence-based early exit. Confirmed: `final/baseline`, `final/topup_001_12000`, `final/topup_002_31000` all ran with `secondary_cv: tica-linear` in their `run_manifest.json` even though `epoch_001` (the epoch that was "supposed to" be the tica-linear one) never ran.
+- No fix implemented — flagging for a decision. A real fix would need a `min_epochs_before_convergence_stop` -style floor exposed the same way `--ap-epoch0-step-fraction` was just exposed.
 
 ## `--sigma0d` is a no-op for single-boost GaMD types (only `--sigma0p` matters)
 
@@ -73,18 +99,22 @@ Every "how many minimization steps by default" argparse default under 1000 raise
 - `gareus/adaptive_production.py`
 - `gareus/seeding.py`
 - `analyze_gareus_mbar.py`
+- `plot_adaptive_diagnostics.py`
 - `gareus/helptext.py`
 - `examples/chignolin_runs3.yaml`
 - `tests/test_bootstrap_torsion_cv.py`
 - `tests/test_tica_cv_mode.py`
 - `tests/test_genpept_contact_bias.py`
 - `tests/test_gamd_boost_default.py`
+- `tests/test_ap_epoch0_step_fraction.py`
+- `tests/test_plot_adaptive_diagnostics.py`
 
 ## Verification
 
-- `pytest -q tests/test_bootstrap_torsion_cv.py tests/test_tica_cv_mode.py tests/test_genpept_contact_bias.py tests/test_gamd_boost_default.py`
+- `pytest -q tests/test_bootstrap_torsion_cv.py tests/test_tica_cv_mode.py tests/test_genpept_contact_bias.py tests/test_gamd_boost_default.py tests/test_ap_epoch0_step_fraction.py tests/test_plot_adaptive_diagnostics.py`
 - `pytest -q -k seed` (32+ seeding-related tests; no dedicated crash-recovery test — the retry/fallback logic lives in closures over a live OpenMM `Simulation`/`Context`, same untestable-without-full-MD-stack constraint as `relax_to_window` itself)
-- `python -m py_compile GENPEPT.py gareus/cv.py gareus/tica.py gareus/production.py gareus/adaptive_production.py gareus/cli.py gareus/helptext.py gareus/seeding.py analyze_gareus_mbar.py`
+- `python -m py_compile GENPEPT.py gareus/cv.py gareus/tica.py gareus/production.py gareus/adaptive_production.py gareus/cli.py gareus/helptext.py gareus/seeding.py analyze_gareus_mbar.py plot_adaptive_diagnostics.py`
+- `python plot_adaptive_diagnostics.py <run_dir> --out <dir>` end-to-end against a real completed adaptive-production run to sanity-check phase count/labels/sample totals against `pmf_analysis/window_diagnostics.csv`
 - Parser smoke: `--cv2 torsion-pca`, `--contact-bias-strength 0.15`, `analyze_gareus_mbar.py --no-torsion-pca-scree`, `--torsion-pca-scree-epoch 0`
 - Help smoke: `python -m gareus -h` and `python -m gareus -hh`, `python GENPEPT.py -h`
 - `git diff --check`

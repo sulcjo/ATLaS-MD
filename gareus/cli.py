@@ -305,6 +305,12 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                    help="Steps per epoch. 0 = auto (~1/20 of production-steps).")
     p.add_argument("--ap-final-steps", type=int, default=0,
                    help="Frozen final steps. 0 = reuse production-steps.")
+    p.add_argument("--ap-epoch0-step-fraction", type=float, default=0.5,
+                   help="Fraction of epoch 0's fair MD-pool share it actually consumes (default "
+                        "0.5, since epoch 0 only needs a short look to bootstrap tICA/GaMD "
+                        "recalibration). Unused budget is redistributed to later epochs, so with "
+                        "the default and ap_epochs=2 the split is 1:3, not 1:1 -- set to 1.0 for "
+                        "an even split across epochs.")
     p.add_argument("--ap-resume", action=argparse.BooleanOptionalAction, default=False,
                    help="Resume adaptive-production from state_registry.json or epoch checkpoints.")
     p.add_argument("--ap-include-epoch-samples", action=argparse.BooleanOptionalAction,
@@ -933,7 +939,7 @@ def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
     # (see gareus/adaptive_production.py:_maybe_recalibrate_gamd_boost) and can run
     # at half length -- the unused MD-pool budget is redistributed to later epochs.
     args.adaptive_production_gamd_recalibrate_after_epoch0 = True
-    args.adaptive_production_epoch0_step_fraction = 0.5
+    args.adaptive_production_epoch0_step_fraction = args.ap_epoch0_step_fraction
     args.adaptive_production_final_connectivity_required = True
     # final_min_samples_per_state is set earlier from ap_final_min_samples_per_window (default 100).
     args.adaptive_production_quality_min_primary_coverage_fraction = 0.25
