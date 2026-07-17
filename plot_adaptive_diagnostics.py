@@ -69,38 +69,56 @@ def discover_phases(ap_dir: Path) -> list[dict]:
     """
     Return ordered list of phase dicts, each with:
       name, label, path, wmap (DataFrame), step (cumulative step count)
-    Ordered chronologically by step count.
+    Ordered chronologically: numbered epochs in whatever order/count they
+    actually ran, then the final phase's baseline + topup_* segments.
+
+    The scheduled final-phase segments (baseline, topup_NNN_MMMMM) always
+    live under ap_dir/"final", never inside the last epoch_NNN directory --
+    the adaptive-production driver hands the remaining MD-pool budget to
+    "final" as soon as the per-epoch convergence gate reports stop_adaptive,
+    which can happen after just 1 epoch regardless of --ap-epochs (see
+    run_adaptive_production_auto_loop's convergence_gate.get("stop_adaptive")
+    check). Assuming exactly 2 epochs with epoch 1 = baseline/topup's parent
+    directory silently produced a single-phase figure whenever the loop
+    stopped early -- which is common, since epoch 0 alone often already
+    satisfies the gate (no low-sample states, no proposed add/split actions).
     """
     phases = []
 
-    # epoch_000
-    ep0 = ap_dir / "epoch_000"
-    if ep0.is_dir() and (ep0 / "samples").is_dir():
+    epoch_dirs = sorted(
+        (d for d in ap_dir.glob("epoch_*") if d.is_dir() and (d / "samples").is_dir()),
+        key=lambda d: d.name,
+    )
+    for i, ep in enumerate(epoch_dirs):
+        try:
+            n = int(ep.name.split("_")[-1])
+        except ValueError:
+            n = i
+        lbl = f"Epoch {n}\n(initial)" if i == 0 else f"Epoch {n}"
         phases.append({
-            "name": "epoch_000",
-            "label": "Epoch 0\n(initial)",
-            "path": ep0,
-            "wmap": _rcsv(ep0 / "epoch_window_map.csv"),
+            "name": ep.name,
+            "label": lbl,
+            "path": ep,
+            "wmap": _rcsv(ep / "epoch_window_map.csv"),
             "step": 0,
         })
 
-    # epoch_001 sub-dirs sorted by step count
-    ep1 = ap_dir / "epoch_001"
-    if ep1.is_dir():
-        subs = [d for d in ep1.iterdir()
+    final_dir = ap_dir / "final"
+    if final_dir.is_dir():
+        subs = [d for d in final_dir.iterdir()
                 if d.is_dir() and (d / "samples").is_dir()
                 and (d.name == "baseline" or d.name.startswith("topup_"))]
         subs.sort(key=lambda d: (0 if d.name == "baseline" else _step_from_name(d.name)))
         for sub in subs:
             if sub.name == "baseline":
-                lbl = "Ep1\nBaseline"
+                lbl = "Final\nBaseline"
                 step = 0
             else:
                 step = _step_from_name(sub.name)
                 ns = step * 4e-6
-                lbl = f"Topup\n{ns:.1f} ns"
+                lbl = f"Final Topup\n{ns:.1f} ns"
             phases.append({
-                "name": sub.name,
+                "name": f"final/{sub.name}",
                 "label": lbl,
                 "path": sub,
                 "wmap": _rcsv(sub / "epoch_window_map.csv"),
@@ -108,6 +126,38 @@ def discover_phases(ap_dir: Path) -> list[dict]:
             })
 
     return phases
+
+
+_CV2_LABELS = {
+    "torsion-pca": "torsion-PCA",
+    "tica-linear": "tICA",
+    "rama-map": "rama",
+    "contacts": "contacts",
+    "distance": "distance",
+}
+
+
+def _secondary_cv_label(phases: list[dict]) -> str:
+    """Best-effort human label for the CV2 axis, from the last phase's
+    run_manifest.json. CV2 type can switch mid-run (e.g. torsion-pca ->
+    tica-linear after a tICA refit); the last phase is where most of the
+    plotted production weight actually sits, so prefer its label over
+    epoch 0's -- hardcoding "rama"/"rama-map" regardless of actual CV2 type
+    mislabels every run that doesn't use rama-map (e.g. torsion-pca,
+    tica-linear, or no secondary CV at all)."""
+    import json as _json
+    for ph in reversed(phases):
+        manifest = ph["path"] / "run_manifest.json"
+        if not manifest.exists():
+            continue
+        try:
+            d = _json.loads(manifest.read_text())
+            cv2 = d.get("method_settings", {}).get("secondary_cv")
+        except Exception:
+            continue
+        if cv2:
+            return _CV2_LABELS.get(cv2, str(cv2))
+    return "secondary"
 
 
 def _wmap_to_sid(wmap: pd.DataFrame) -> dict[int, int]:
@@ -120,6 +170,29 @@ def _wmap_to_sid(wmap: pd.DataFrame) -> dict[int, int]:
     return {int(r["epoch_window"]): int(r[sid_col]) for _, r in wmap.iterrows()}
 
 
+def _sample_count_grid(state_reg: pd.DataFrame, state_counts: dict[int, int]):
+    """Build the primary x secondary sample-count grid for fig_window_layout's
+    heatmap panel. Returns (p_vals, s_vals, grid) where grid[i, j] is the
+    total sample count for the state at (p_vals[i], s_vals[j]).
+
+    Dict keys are rounded the same way on both construction and lookup --
+    secondary_center is a continuous CV projection with far more than 6
+    significant digits, so keying by the raw unrounded float while looking
+    up a rounded one made every lookup miss silently (grid stayed all-zero)."""
+    p_vals = sorted(state_reg["primary_center"].unique())
+    s_vals = sorted(state_reg["secondary_center"].unique())
+    p_idx = {round(float(v), 6): i for i, v in enumerate(p_vals)}
+    s_idx = {round(float(v), 6): i for i, v in enumerate(s_vals)}
+    grid = np.zeros((len(p_vals), len(s_vals)))
+    for _, row in state_reg.iterrows():
+        sid = int(row["state_id"])
+        pi = p_idx.get(round(float(row["primary_center"]), 6))
+        si = s_idx.get(round(float(row["secondary_center"]), 6))
+        if pi is not None and si is not None:
+            grid[pi, si] = state_counts.get(sid, 0)
+    return p_vals, s_vals, grid
+
+
 # ── figure 1: per-phase 2D density maps ──────────────────────────────────────
 
 def fig_phase_coverage(phases: list[dict], state_reg: pd.DataFrame,
@@ -130,6 +203,7 @@ def fig_phase_coverage(phases: list[dict], state_reg: pd.DataFrame,
     nrows = math.ceil(n / ncols)
     sig1 = _sigma(250.0)
     sig2 = _sigma(100.0)
+    cv2_label = _secondary_cv_label(phases)
 
     # compute global CV range from registry
     if not state_reg.empty:
@@ -145,7 +219,7 @@ def fig_phase_coverage(phases: list[dict], state_reg: pd.DataFrame,
     hists, counts, colors = [], [], []
     phase_colors = plt.cm.tab10(np.linspace(0, 0.9, n))
     for ph, pc in zip(phases, phase_colors):
-        sp = ph["path"] / "samples" / "seg_001"
+        sp = ph["path"] / "samples"
         if sp.is_dir():
             df = _load_parquet_samples(sp, stride=stride)
         else:
@@ -185,7 +259,7 @@ def fig_phase_coverage(phases: list[dict], state_reg: pd.DataFrame,
         ax.set_xlim(x_edges[0], x_edges[-1])
         ax.set_ylim(y_edges[0], y_edges[-1])
         ax.set_xlabel("CV1 (contacts)", fontsize=8)
-        ax.set_ylabel("CV2 (rama)", fontsize=8)
+        ax.set_ylabel(f"CV2 ({cv2_label})", fontsize=8)
         ax.set_title(f"{ph['label']}\n{n_samp:,} pts (stride {stride})",
                      fontsize=9, color=pc)
         ax.tick_params(labelsize=7)
@@ -214,11 +288,12 @@ def fig_window_layout(state_reg: pd.DataFrame, phases: list[dict],
 
     sig1 = _sigma(250.0)
     sig2 = _sigma(100.0)
+    cv2_label = _secondary_cv_label(phases)
 
     # total samples per state_id
     state_counts: dict[int, int] = {}
     for ph in phases:
-        sp = ph["path"] / "samples" / "seg_001"
+        sp = ph["path"] / "samples"
         if not sp.is_dir():
             continue
         df = _load_parquet_samples(sp, stride=1)
@@ -230,7 +305,7 @@ def fig_window_layout(state_reg: pd.DataFrame, phases: list[dict],
     # all-sample density
     cv1_all, cv2_all = [], []
     for ph in phases:
-        sp = ph["path"] / "samples" / "seg_001"
+        sp = ph["path"] / "samples"
         if sp.is_dir():
             df = _load_parquet_samples(sp, stride=stride)
             if len(df):
@@ -282,7 +357,7 @@ def fig_window_layout(state_reg: pd.DataFrame, phases: list[dict],
     ax_main.set_xlim(max(0, cv1_cen.min() - 4*sig1), cv1_cen.max() + 4*sig1)
     ax_main.set_ylim(cv2_cen.min() - 3*sig2, cv2_cen.max() + 3*sig2)
     ax_main.set_xlabel("CV1 (nonlocal contact fraction)", fontsize=10)
-    ax_main.set_ylabel("CV2 (rama-map)", fontsize=10)
+    ax_main.set_ylabel(f"CV2 ({cv2_label})", fontsize=10)
     ax_main.set_title("Window Placement: ±1σ Harmonic Ellipses\n"
                        "Fill color = total samples (log scale)", fontsize=10)
 
@@ -301,17 +376,7 @@ def fig_window_layout(state_reg: pd.DataFrame, phases: list[dict],
         ax_bar.text(c + max(cnts)*0.01, s, f"{c:,}", va="center", fontsize=6)
 
     # ─ 2D sample count grid ─
-    p_vals = sorted(state_reg["primary_center"].unique())
-    s_vals = sorted(state_reg["secondary_center"].unique())
-    p_idx  = {v: i for i, v in enumerate(p_vals)}
-    s_idx  = {v: i for i, v in enumerate(s_vals)}
-    grid   = np.zeros((len(p_vals), len(s_vals)))
-    for _, row in state_reg.iterrows():
-        sid = int(row["state_id"])
-        pi = p_idx.get(round(float(row["primary_center"]), 6))
-        si = s_idx.get(round(float(row["secondary_center"]), 6))
-        if pi is not None and si is not None:
-            grid[pi, si] = state_counts.get(sid, 0)
+    p_vals, s_vals, grid = _sample_count_grid(state_reg, state_counts)
 
     gmin = grid[grid > 0].min() if grid.any() else 1
     im = ax_heat.imshow(grid.T, aspect="auto", origin="lower",
@@ -321,7 +386,7 @@ def fig_window_layout(state_reg: pd.DataFrame, phases: list[dict],
     ax_heat.set_yticks(range(len(s_vals)))
     ax_heat.set_yticklabels([f"{v:.3f}" for v in s_vals], fontsize=8)
     ax_heat.set_xlabel("Primary center (contact fraction)", fontsize=9)
-    ax_heat.set_ylabel("Secondary center (rama)", fontsize=9)
+    ax_heat.set_ylabel(f"Secondary center ({cv2_label})", fontsize=9)
     ax_heat.set_title("Sample Count Grid: Primary × Secondary CV Centers", fontsize=9)
     for pi_i, pv in enumerate(p_vals):
         for si_i, sv in enumerate(s_vals):
@@ -352,7 +417,7 @@ def fig_topup_timeline(state_reg: pd.DataFrame, phases: list[dict],
     # per-phase sample counts per state
     phase_state_counts = []
     for ph in phases:
-        sp = ph["path"] / "samples" / "seg_001"
+        sp = ph["path"] / "samples"
         if not sp.is_dir():
             phase_state_counts.append({})
             continue
@@ -370,7 +435,7 @@ def fig_topup_timeline(state_reg: pd.DataFrame, phases: list[dict],
             cum[si, pi] = pc.get(sid, 0)
     cum_c = np.cumsum(cum, axis=1)
 
-    sched = _rcsv(ap_dir / "epoch_001" / "epoch_schedule.csv")
+    sched = _rcsv(ap_dir / "final" / "epoch_schedule.csv")
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 7), constrained_layout=True)
     ax_cum, ax_sched, ax_ovlp = axes
@@ -408,7 +473,7 @@ def fig_topup_timeline(state_reg: pd.DataFrame, phases: list[dict],
         ax_sched.set_yticks(ypos)
         ax_sched.set_yticklabels([f"S{s}" for s in sids_s], fontsize=8)
         ax_sched.set_xlabel("Requested steps", fontsize=9)
-        ax_sched.set_title("B. Epoch-1 Step Allocation\n(orange=bridge extra, teal=standard extra)", fontsize=9)
+        ax_sched.set_title("B. Final-Phase Step Allocation\n(orange=bridge extra, teal=standard extra)", fontsize=9)
         ax_sched.xaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v/1e6:.1f}M"))
         ax_sched.invert_yaxis()
         ax_sched.grid(axis="x", alpha=0.3)
@@ -472,10 +537,10 @@ def fig_topup_targeting(ap_dir: Path, state_reg: pd.DataFrame, out_path: Path) -
     """
     all_sids = sorted(state_reg["state_id"].astype(int).tolist()) if not state_reg.empty else []
     sid_idx  = {s: i for i, s in enumerate(all_sids)}
-    ep1      = ap_dir / "epoch_001"
+    final_dir = ap_dir / "final"
 
     # ─ topup participation from windows CSV files ─
-    sched = _rcsv(ep1 / "epoch_schedule.csv")
+    sched = _rcsv(final_dir / "epoch_schedule.csv")
     sid_to_bl = {}
     if not sched.empty:
         for _, row in sched.iterrows():
@@ -484,7 +549,7 @@ def fig_topup_targeting(ap_dir: Path, state_reg: pd.DataFrame, out_path: Path) -
     topup_entries: list[dict] = []  # {label, step, present: set[int]}
 
     # baseline from baseline_windows.csv
-    bl_wmap = _rcsv(ep1 / "baseline_windows.csv")
+    bl_wmap = _rcsv(final_dir / "baseline_windows.csv")
     if not bl_wmap.empty:
         sid_col = next((c for c in bl_wmap.columns if "state_id" in c.lower()), None)
         present = set(bl_wmap[sid_col].astype(int).tolist()) if sid_col else set()
@@ -492,7 +557,7 @@ def fig_topup_targeting(ap_dir: Path, state_reg: pd.DataFrame, out_path: Path) -
 
     # each topup_*_windows.csv sorted by step count
     topup_csvs = sorted(
-        ep1.glob("topup_*_windows.csv"),
+        final_dir.glob("topup_*_windows.csv"),
         key=lambda p: _step_from_name(p.stem)
     )
     for tcsv in topup_csvs:
@@ -506,7 +571,7 @@ def fig_topup_targeting(ap_dir: Path, state_reg: pd.DataFrame, out_path: Path) -
         topup_entries.append({"label": f"Topup\n{ns:.1f} ns", "step": step, "present": present})
 
     # ─ actual samples per state per topup subdir (from Parquet) ─
-    subdirs = [d for d in sorted(ep1.iterdir(),
+    subdirs = [d for d in sorted(final_dir.iterdir(),
                 key=lambda p: (0 if p.name == "baseline" else _step_from_name(p.name)))
                if d.is_dir() and (d/"samples").is_dir()
                and (d.name == "baseline" or d.name.startswith("topup_"))]
@@ -528,7 +593,7 @@ def fig_topup_targeting(ap_dir: Path, state_reg: pd.DataFrame, out_path: Path) -
         step = _step_from_name(sub.name) if sub.name != "baseline" else 0
         ns = step * 4e-6
         samp_xlabels.append(f"{sub.name[:12]}…\n{ns:.1f} ns" if len(sub.name) > 12 else f"{sub.name}\n{ns:.1f} ns")
-        sp = sub / "samples" / "seg_001"
+        sp = sub / "samples"
         if not sp.is_dir():
             continue
         df = _load_parquet_samples(sp, stride=1)
