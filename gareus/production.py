@@ -720,6 +720,29 @@ def _gibbs_mh_acceptance_probability(
         return 0.0
     return float(math.exp(log_alpha))
 
+
+def _exchange_probability(delta_kj: float, beta: float) -> float:
+    """Metropolis probability for a proposed umbrella-window swap.
+
+    Extracted from run_gareus's exchange-loop closures (was a nested def
+    capturing beta from the enclosing scope) so it's unit-testable without a
+    live OpenMM Context.
+    """
+    try:
+        delta_kj = float(delta_kj)
+        beta = float(beta)
+    except Exception:
+        return 0.0
+    if not (math.isfinite(delta_kj) and math.isfinite(beta)):
+        return 0.0
+    if delta_kj <= 0.0:
+        return 1.0
+    x = -beta * delta_kj
+    if x < -745.0:
+        return 0.0
+    return float(math.exp(x))
+
+
 def load_resume_run_definition(out_dir: Path, topology, args, manifest: Optional[dict] = None) -> dict:
     """Recover CV/window/GaMD bookkeeping from previous outputs for true --resume."""
     out_dir = Path(out_dir)
@@ -4437,21 +4460,6 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 )
                 raise RuntimeError(msg) from exc
 
-        def _exchange_probability(delta_kj: float) -> float:
-            """Metropolis probability for a proposed umbrella-window swap."""
-            try:
-                delta_kj = float(delta_kj)
-            except Exception:
-                return 0.0
-            if not math.isfinite(delta_kj):
-                return 0.0
-            if delta_kj <= 0.0:
-                return 1.0
-            x = -float(beta) * delta_kj
-            if x < -745.0:
-                return 0.0
-            return float(math.exp(x))
-
         def _record_exchange_stats(wi: int, wj: int, accepted: bool) -> None:
             wi = int(wi)
             wj = int(wj)
@@ -4492,7 +4500,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             old_e = float(bias_matrix_kj[wi, i] + bias_matrix_kj[wj, j])
             new_e = float(bias_matrix_kj[wj, i] + bias_matrix_kj[wi, j])
             delta = float(new_e - old_e)
-            pacc = float(p_override) if p_override is not None else _exchange_probability(delta)
+            pacc = float(p_override) if p_override is not None else _exchange_probability(delta, beta)
             pacc = max(0.0, min(1.0, pacc)) if math.isfinite(pacc) else 0.0
             accepted = bool(force_accept) or (rng.random() < pacc)
             _record_exchange_stats(wi, wj, accepted)

@@ -143,6 +143,76 @@ def _primary_seed_score(
     return float("nan"), 0.0
 
 
+def _score_seed_conformer(
+    conf: dict,
+    *,
+    window_index: int,
+    seed_selection_mode: str,
+    primary_seed_scale: float,
+    target_primary: float,
+    target_secondary: float,
+    secondary_available: bool,
+    seed_secondary_weight: float,
+    secondary_seed_scale: float,
+    args,
+) -> tuple[float, dict]:
+    """Score one GENPEPT conformer against a window's primary/secondary CV targets.
+
+    Extracted from generate_us_starting_states_by_pulling's nested closures
+    (was a pure-arithmetic ``_score`` trapped two levels deep inside the
+    god-function) so it's unit-testable without a live OpenMM Context. Every
+    value the original closure captured from its enclosing scope is now an
+    explicit parameter; behavior is unchanged.
+    """
+    primary_value = float(conf.get("primary_cv_value", conf.get("cv_A", float("nan"))))
+    # Legacy explicit distance mode is kept for reproducibility/debugging.
+    if seed_selection_mode == "distance":
+        primary_value = float(conf.get("cv_A", primary_value))
+    primary_delta, primary_score = _primary_seed_score(primary_value, target_primary, primary_seed_scale)
+    secondary_value = float(conf.get("secondary_cv_value", float("nan")))
+    secondary_delta = float("nan")
+    secondary_score = 0.0
+    use_secondary = bool(
+        seed_selection_mode == "active-cv"
+        and secondary_available
+        and seed_secondary_weight > 0.0
+        and math.isfinite(target_secondary)
+        and math.isfinite(secondary_value)
+    )
+    if use_secondary:
+        secondary_delta = abs(secondary_value - target_secondary)
+        secondary_score = seed_secondary_weight * secondary_delta / max(1.0e-12, secondary_seed_scale)
+    elif (seed_selection_mode == "active-cv"
+          and secondary_available
+          and seed_secondary_weight > 0.0
+          and math.isfinite(target_secondary)
+          and not math.isfinite(secondary_value)):
+        # NaN secondary CV: assign a unit penalty so this seed never beats a seed
+        # with any finite secondary value.  Without this, NaN seeds score 0
+        # on the secondary term and are systematically preferred.
+        secondary_score = float(seed_secondary_weight)
+    total = float(primary_score + secondary_score)
+    components = {
+        "window": int(window_index),
+        "seed_selection_mode": seed_selection_mode,
+        "target_primary_cv": target_primary,
+        "primary_cv_units": primary_cv_units(args),
+        "conformer_primary_cv": primary_value,
+        "abs_primary_delta": primary_delta,
+        "primary_scale": primary_seed_scale,
+        "primary_score": primary_score,
+        "target_secondary_cv": target_secondary,
+        "conformer_secondary_cv": secondary_value,
+        "abs_secondary_delta": secondary_delta,
+        "secondary_scale": secondary_seed_scale,
+        "secondary_weight": seed_secondary_weight,
+        "secondary_score": secondary_score,
+        "total_score": total,
+        "conformer_pdb": str(conf.get("pdb_path", "")),
+    }
+    return total, components
+
+
 def harmonic_bias_energy_kj(distance_nm: float, center_nm: float, k_kj_nm2: float) -> float:
     dr = float(distance_nm) - float(center_nm)
     return 0.5 * float(k_kj_nm2) * dr * dr
@@ -1164,53 +1234,18 @@ def generate_us_starting_states_by_pulling(
         target_secondary = float(secondary_cv_centers[w]) if secondary_available else float("nan")
 
         def _score(conf: dict) -> tuple[float, dict]:
-            primary_value = float(conf.get("primary_cv_value", conf.get("cv_A", float("nan"))))
-            # Legacy explicit distance mode is kept for reproducibility/debugging.
-            if seed_selection_mode == "distance":
-                primary_value = float(conf.get("cv_A", primary_value))
-            primary_delta, primary_score = _primary_seed_score(primary_value, target_primary, primary_seed_scale)
-            secondary_value = float(conf.get("secondary_cv_value", float("nan")))
-            secondary_delta = float("nan")
-            secondary_score = 0.0
-            use_secondary = bool(
-                seed_selection_mode == "active-cv"
-                and secondary_available
-                and seed_secondary_weight > 0.0
-                and math.isfinite(target_secondary)
-                and math.isfinite(secondary_value)
+            return _score_seed_conformer(
+                conf,
+                window_index=w,
+                seed_selection_mode=seed_selection_mode,
+                primary_seed_scale=primary_seed_scale,
+                target_primary=target_primary,
+                target_secondary=target_secondary,
+                secondary_available=secondary_available,
+                seed_secondary_weight=seed_secondary_weight,
+                secondary_seed_scale=secondary_seed_scale,
+                args=args,
             )
-            if use_secondary:
-                secondary_delta = abs(secondary_value - target_secondary)
-                secondary_score = seed_secondary_weight * secondary_delta / max(1.0e-12, secondary_seed_scale)
-            elif (seed_selection_mode == "active-cv"
-                  and secondary_available
-                  and seed_secondary_weight > 0.0
-                  and math.isfinite(target_secondary)
-                  and not math.isfinite(secondary_value)):
-                # NaN secondary CV: assign a unit penalty so this seed never beats a seed
-                # with any finite secondary value.  Without this, NaN seeds score 0
-                # on the secondary term and are systematically preferred.
-                secondary_score = float(seed_secondary_weight)
-            total = float(primary_score + secondary_score)
-            components = {
-                "window": int(w),
-                "seed_selection_mode": seed_selection_mode,
-                "target_primary_cv": target_primary,
-                "primary_cv_units": primary_cv_units(args),
-                "conformer_primary_cv": primary_value,
-                "abs_primary_delta": primary_delta,
-                "primary_scale": primary_seed_scale,
-                "primary_score": primary_score,
-                "target_secondary_cv": target_secondary,
-                "conformer_secondary_cv": secondary_value,
-                "abs_secondary_delta": secondary_delta,
-                "secondary_scale": secondary_seed_scale,
-                "secondary_weight": seed_secondary_weight,
-                "secondary_score": secondary_score,
-                "total_score": total,
-                "conformer_pdb": str(conf.get("pdb_path", "")),
-            }
-            return total, components
 
         with seed_selection_lock:
             ranked = []
