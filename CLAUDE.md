@@ -37,6 +37,21 @@ Found by visually inspecting `adaptive_fig1-4_*.png` from an analysis of a real 
 - `RUNS/chignolin/chignolin_quicktest.yaml` fixed: `sigma0d: 2.0` → `sigma0p: 2.0` (the parameter that actually governs `boost_type: lower-dihedral`).
 - **Not yet fixed**: `RUNS/chignolin/chignolin.yaml` (the real 10-residue production config) has the *identical* pattern — `gamd: sigma0d: 2.0` under `boost_type: lower-dihedral`, `sigma0p` unset (defaults to 6.0). Every past production run using this config (chignolin_2d_run5/7 etc.) was very likely calibrated against the same accidental 6.0 kcal/mol sigma0p target, not the intended 2.0. Left untouched pending a decision — chignolin's dihedral-energy dynamic range (more torsions, bigger system) may or may not actually saturate at 6.0 the way DPETG's did; that needs its own calibration data before picking a new number, and retroactively changing it affects comparability with prior runs.
 
+## `-hh` is now an auto-numbered, pageable, jumpable encyclopedia
+
+- `gareus/helptext.py`'s `-hh` used to be a single wall of text with two colliding hand-numbered topic schemes (`0.x` methodology walkthrough, then a `1.`-`17.` reference list — with `13.`, `14.`, and `16.` each reused for two different topics). Fixed at the root: topic numbers are no longer hand-authored. `_parse_encyclopedia` scans the same `Title\n----`-underline heading convention already used throughout the prose (regex `_HEADING_RE`, filtered by underline-length match) and assigns sequential numbers at render time, so the TOC can never drift out of sync with the text again — add/reorder/remove a heading and the numbering just follows.
+- `render_encyclopedia_help(parser, encyclopedia_text, topic=None, color=None)` in `gareus/helptext.py` is the shared builder: banner + auto TOC + all topic bodies + `parser.format_help()`. `heavy_help_text` (gareus's own `-hh`) is now a one-line wrapper around it. `gareus/energy_decomposition.py`'s separate `-hh` (`_EnergyDecompHeavyHelpAction`) was ported to the same builder instead of its own hand-rolled dump, so both heavy-help surfaces in the package now look and behave identically ("unite tui design completely").
+- `-hh` took an argparse `nargs=0` flag before; now `nargs="?"` (`metavar="TOPIC"`), so it accepts an optional topic:
+  - `gareus -hh` — full encyclopedia (banner + TOC + every topic + full flag list).
+  - `gareus -hh list` — just the table of contents, no paging.
+  - `gareus -hh 8` — jump straight to topic 8 (matched by the auto-assigned number).
+  - `gareus -hh <keyword>` — case-insensitive substring match against topic titles; zero matches prints a hint to run `-hh list`, multiple matches lists the candidates and asks for a number instead of guessing.
+- New `page_text(text, parser=None)`: when `sys.stdout.isatty()` (interactive terminal) it pipes the rendered text through `$PAGER` (default `less`, with `$LESS` defaulted to `FRX` — raw ANSI passthrough + quit-if-one-screen — only when the user hasn't already set `$LESS`, and without clobbering a custom `$PAGER`'s own args). When stdout is redirected/piped (scripts, `| grep`, CI) it falls straight back to the old plain single print — automation is unaffected, confirmed no automated test or CLAUDE.md smoke command asserts on `-hh`'s exact text. `GAREUS_NO_PAGER=1` forces the plain path even at a tty.
+- Section-heading hierarchy in the TOC (indented "sub-topics" under a bold top-level topic) is derived, not hardcoded: a topic is top-level if its original heading looks like bare `"N. Title"`, or — for a document with no such numbering at all, like `energy_decomposition`'s smaller reference — every heading in that document is top-level (checked once per document via `any_level1`, not per-heading) so a flat doc renders flat instead of nesting everything under nothing.
+- Color (bold TOC/heading text) is auto-detected from `sys.stdout.isatty()` and disabled by `NO_COLOR`; same detection gates paging, so redirected output is always plain ANSI-free text.
+- Deliberately did not touch `GENPEPT.py`'s or `analyze_gareus_mbar.py`'s help — both use plain unmodified argparse `-h` with no `-hh`/encyclopedia concept, out of scope for this change.
+- Verification: `python -m gareus -hh`, `-hh list`, `-hh 8`, `-hh torsion` (unique match), `-hh gamd` (ambiguous — lists 2 candidates), `-hh 999`/`-hh nosuchtopic` (no-match hint), all piped (non-tty) so no pager spawns; same via `gareus.energy_decomposition.build_arg_parser().parse_args(['-hh', ...])`. `pytest -q tests/test_bootstrap_torsion_cv.py tests/test_tica_cv_mode.py tests/test_genpept_contact_bias.py tests/test_trajectory_reporter_atom_subset.py` still green (energy_decomposition.py's now-unused `sys`/`textwrap` imports were also dropped).
+
 ## Minimization step-count defaults raised to >= 1000
 
 Every "how many minimization steps by default" argparse default under 1000 raised to 1000 — these were all short defaults tuned for a bigger/older workflow, not a hard physical requirement:
@@ -61,6 +76,17 @@ Every "how many minimization steps by default" argparse default under 1000 raise
 - Important asymmetry: PC1 is *by construction* the single direction of maximum variance, so combining in more components can only match or **reduce** that one direction's own explained variance (`TICAResult.eigenvalue`/`explained_variance_ratio`) relative to PC1 alone — the payoff isn't more variance, it's picking up influence from a mode PC1 alone doesn't see (e.g. a torsion that only loads heavily on PC4).
 - Tests: `tests/test_bootstrap_torsion_cv.py::test_bootstrap_pca_component_count_combines_top_n_variance_weighted` verifies the coefficient ratio matches `sqrt(variance_i/variance_j)` exactly and that combined-direction variance is strictly ≤ PC1-alone variance; `test_bootstrap_pca_component_out_of_range_raises` covers the bounds check. `test_bootstrap_pca_fail_closed_on_zero_component_variance` updated for the new semantics (old test's X made requesting component=2 trivially succeed under the new scheme, since PC1 there still carried real variance — not a bug, just no longer a failure case).
 - Any cached `<out>/tica/bootstrap_torsion_cv.json` from a run predating this change holds a single raw eigenvector under the old semantics; it's loaded as-is if present (`_ensure_bootstrap_torsion_cv_ready` in `gareus/production.py`), so changing `bootstrap_torsion_component` on a resumed run does nothing until that cache file is deleted and window/seed setup is redone.
+
+## US pull-crash recovery (`gareus/seeding.py`)
+
+- Root cause: contact-CV umbrella pull (`generate_us_starting_states_by_pulling` → `relax_to_window`) can NaN a window's positions on the very first, gentlest ramp sub-stage if that window's target contact combination is sterically close to unreachable given where the secondary CV sits. NaN corrupts CUDA addressing → `CUDA_ERROR_ILLEGAL_ADDRESS` → hard process abort, no auto-recovery, whole run dies (observed twice: `adaptive_feedback_round_01` and `adaptive_production/epoch_000`, both at primary-pull ramp stage 1/5 for a contact-CV window).
+- Fix, all in `gareus/seeding.py`:
+  - `_run_primary_pull_segment` takes `stage_override` (finer contact ramp than `--contact-us-pull-ramp-stages`, used only for crash retries).
+  - `relax_to_window` takes `contact_ramp_stage_override`, threaded through to both its internal `_run_primary_pull_segment` calls (staged-2D distance phase and single-stage path).
+  - New `_relax_to_window_recovering(sim, w, direction_label, device_idx)` wraps `relax_to_window`: on any exception, rebuilds a fresh `Simulation` (the raising Context may be CUDA-poisoned — never reused), resets to the equilibrated state, and retries once with a 4×-finer contact ramp (`max(16, contact_us_pull_ramp_stages*4)` stages). If the retry also fails, falls back to `_unpulled_window_row` — the plain unpulled equilibrated state for that window only, tagged `direction: pull_crash_fallback_unpulled (...)`, written to `window_..._CRASHFALLBACK_start.pdb`.
+  - All 7 call sites of `relax_to_window` (conformer-seeded concurrent/sequential, independent concurrent, nearest/compact_branch/extended_branch/fallback in the sequential walk) now go through `_relax_to_window_recovering`; the 2D row-base pre-pull loop is wrapped in its own try/except that rebuilds the context and skips that row's warm-start state on failure (individual windows still get attempted below).
+  - Quality-control loop (`us_starting_structure_quality.json`) flags any `pull_crash_fallback_unpulled` row as `status: bad` with an explicit warning — one bad window can no longer take down the run, but it's never silently marked "ok".
+- One bad steric target now costs one degraded window (flagged `bad` in quality report), not the whole umbrella-window seeding run.
 
 ## GENPEPT contact-count bias
 
@@ -101,6 +127,7 @@ Every "how many minimization steps by default" argparse default under 1000 raise
 - `analyze_gareus_mbar.py`
 - `plot_adaptive_diagnostics.py`
 - `gareus/helptext.py`
+- `gareus/energy_decomposition.py`
 - `examples/chignolin_runs3.yaml`
 - `tests/test_bootstrap_torsion_cv.py`
 - `tests/test_tica_cv_mode.py`
@@ -113,8 +140,8 @@ Every "how many minimization steps by default" argparse default under 1000 raise
 
 - `pytest -q tests/test_bootstrap_torsion_cv.py tests/test_tica_cv_mode.py tests/test_genpept_contact_bias.py tests/test_gamd_boost_default.py tests/test_ap_epoch0_step_fraction.py tests/test_plot_adaptive_diagnostics.py`
 - `pytest -q -k seed` (32+ seeding-related tests; no dedicated crash-recovery test — the retry/fallback logic lives in closures over a live OpenMM `Simulation`/`Context`, same untestable-without-full-MD-stack constraint as `relax_to_window` itself)
-- `python -m py_compile GENPEPT.py gareus/cv.py gareus/tica.py gareus/production.py gareus/adaptive_production.py gareus/cli.py gareus/helptext.py gareus/seeding.py analyze_gareus_mbar.py plot_adaptive_diagnostics.py`
+- `python -m py_compile GENPEPT.py gareus/cv.py gareus/tica.py gareus/production.py gareus/adaptive_production.py gareus/cli.py gareus/helptext.py gareus/seeding.py gareus/energy_decomposition.py analyze_gareus_mbar.py plot_adaptive_diagnostics.py`
 - `python plot_adaptive_diagnostics.py <run_dir> --out <dir>` end-to-end against a real completed adaptive-production run to sanity-check phase count/labels/sample totals against `pmf_analysis/window_diagnostics.csv`
 - Parser smoke: `--cv2 torsion-pca`, `--contact-bias-strength 0.15`, `analyze_gareus_mbar.py --no-torsion-pca-scree`, `--torsion-pca-scree-epoch 0`
-- Help smoke: `python -m gareus -h` and `python -m gareus -hh`, `python GENPEPT.py -h`
+- Help smoke: `python -m gareus -h` and `python -m gareus -hh`, `-hh list`, `-hh 8`, `-hh torsion`; `gareus.energy_decomposition.build_arg_parser().parse_args(['-hh', ...])`; `python GENPEPT.py -h`
 - `git diff --check`

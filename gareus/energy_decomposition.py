@@ -29,8 +29,6 @@ import csv
 import glob
 import math
 import re
-import sys
-import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, Optional, Sequence
@@ -38,6 +36,7 @@ from typing import Iterable, Iterator, Optional, Sequence
 import numpy as np
 
 from .constants import ION_RESNAMES, WATER_RESNAMES
+from .helptext import page_text, render_encyclopedia_help
 from .imports import import_openmm
 from .system_setup import make_forcefield
 
@@ -161,20 +160,19 @@ Subsample a large trajectory:
 
 
 class _EnergyDecompHeavyHelpAction(argparse.Action):
-    """Argparse action for the energy-decomposition method reference."""
+    """Argparse action for the energy-decomposition method reference.
+
+    Shares gareus.helptext's auto-numbered-TOC/pager machinery with the main
+    ``gareus -hh`` so both heavy-help surfaces behave the same way: paged
+    (via $PAGER, default less) when run at a terminal, plain when piped, and
+    jumpable straight to one topic with ``-hh <number>`` / ``-hh <keyword>``.
+    """
 
     def __init__(self, option_strings, dest=argparse.SUPPRESS, default=argparse.SUPPRESS, help=None):
-        super().__init__(option_strings=list(option_strings), dest=dest, nargs=0, default=default, help=help)
+        super().__init__(option_strings=list(option_strings), dest=dest, nargs="?", default=default, help=help, metavar="TOPIC")
 
     def __call__(self, parser, namespace, values, option_string=None):  # noqa: D401 - argparse signature
-        method_text = textwrap.dedent(_ENERGY_DECOMP_HEAVY_HELP).strip() + "\n\n"
-        parser._print_message(
-            method_text
-            + "Complete option reference\n"
-            + "=========================\n\n"
-            + parser.format_help(),
-            sys.stdout,
-        )
+        page_text(render_encyclopedia_help(parser, _ENERGY_DECOMP_HEAVY_HELP, topic=values), parser)
         parser.exit(0)
 
 
