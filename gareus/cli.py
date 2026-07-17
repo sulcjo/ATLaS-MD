@@ -305,6 +305,12 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                    help="Steps per epoch. 0 = auto (~1/20 of production-steps).")
     p.add_argument("--ap-final-steps", type=int, default=0,
                    help="Frozen final steps. 0 = reuse production-steps.")
+    p.add_argument("--ap-epoch0-step-fraction", type=float, default=0.5,
+                   help="Fraction of epoch 0's fair MD-pool share it actually consumes (default "
+                        "0.5, since epoch 0 only needs a short look to bootstrap tICA/GaMD "
+                        "recalibration). Unused budget is redistributed to later epochs, so with "
+                        "the default and ap_epochs=2 the split is 1:3, not 1:1 -- set to 1.0 for "
+                        "an even split across epochs.")
     p.add_argument("--ap-resume", action=argparse.BooleanOptionalAction, default=False,
                    help="Resume adaptive-production from state_registry.json or epoch checkpoints.")
     p.add_argument("--ap-include-epoch-samples", action=argparse.BooleanOptionalAction,
@@ -649,6 +655,35 @@ def _validate_contact_args(args: argparse.Namespace) -> None:
         raise ValueError("contacts + --window-mode manual requires --contact-centers")
 
 
+# The upstream `gamd` package's integrator_factory.get_integrator only forwards
+# sigma0d to the dual-boost integrators (lower-dual, upper-dual, and their
+# nonbonded-dihedral variants). Every single-boost type is calibrated entirely
+# from sigma0p (see create_lower_dihedral_boost_integrator etc. in
+# gamd/integrator_factory.py, which accept a single `sigma0` positional filled
+# from sigma0p) and silently ignores sigma0d.
+_SINGLE_BOOST_GAMD_TYPES = frozenset({
+    "gamd-cmd-base", "lower-total", "upper-total",
+    "lower-dihedral", "upper-dihedral",
+    "lower-nonbonded", "upper-nonbonded",
+})
+
+
+def _validate_gamd_args(args: argparse.Namespace) -> None:
+    """Warn when --sigma0d is set but the selected GaMD boost type can't use it."""
+    boost_type = str(getattr(args, "gamd_boost_type", "") or "")
+    if boost_type not in _SINGLE_BOOST_GAMD_TYPES:
+        return
+    sigma0d = float(getattr(args, "sigma0d_kcal_mol", None) if getattr(args, "sigma0d_kcal_mol", None) is not None else getattr(args, "sigma0d", 6.0))
+    if abs(sigma0d - 6.0) > 1e-9:
+        print(
+            f"WARNING: --sigma0d={sigma0d:.3f} kcal/mol is set, but --gamd-boost-type={boost_type!r} "
+            "is a single-boost mode -- sigma0d is silently ignored for this boost type (only "
+            "dual-boost modes use it). --sigma0p is the parameter that actually governs GaMD "
+            "calibration here; set that instead.",
+            flush=True,
+        )
+
+
 def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
     """Map schema-v2 attr names to legacy internal names expected by consumer modules.
 
@@ -904,7 +939,7 @@ def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
     # (see gareus/adaptive_production.py:_maybe_recalibrate_gamd_boost) and can run
     # at half length -- the unused MD-pool budget is redistributed to later epochs.
     args.adaptive_production_gamd_recalibrate_after_epoch0 = True
-    args.adaptive_production_epoch0_step_fraction = 0.5
+    args.adaptive_production_epoch0_step_fraction = args.ap_epoch0_step_fraction
     args.adaptive_production_final_connectivity_required = True
     # final_min_samples_per_state is set earlier from ap_final_min_samples_per_window (default 100).
     args.adaptive_production_quality_min_primary_coverage_fraction = 0.25
@@ -1069,6 +1104,7 @@ def parse_args(argv: Optional[Iterable[str]] = None):
 
     args.contact_scheme = contact_scheme(args)
     _validate_contact_args(args)
+    _validate_gamd_args(args)
 
     return args
 

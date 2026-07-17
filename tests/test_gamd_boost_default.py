@@ -60,3 +60,41 @@ def test_gamd_multiwindow_recon_flags_are_overridable():
     assert args.gamd_multiwindow_recon_report_interval == 100
     assert args.gamd_recon_boosted_iters == 2
     assert args.gamd_recon_boosted_tol == 0.1
+
+
+def test_sigma0d_warns_for_single_boost_types(capsys):
+    """sigma0d only reaches the upstream gamd package's dual-boost integrators
+    (integrator_factory.get_integrator forwards sigma0p alone to every
+    single-boost create_*_integrator function) -- setting it for a
+    single-boost type is always a no-op, so this should warn, not silently
+    calibrate off the (possibly wrong) sigma0p default instead."""
+    from gareus.cli import parse_args
+
+    for boost_type in (
+        "gamd-cmd-base", "lower-total", "upper-total",
+        "lower-dihedral", "upper-dihedral",
+        "lower-nonbonded", "upper-nonbonded",
+    ):
+        parse_args(["--seq", "DPETG", "--gamd-boost-type", boost_type, "--sigma0d", "2.0"])
+        out = capsys.readouterr().out
+        assert "sigma0d" in out and "silently ignored" in out, boost_type
+
+
+def test_sigma0d_no_warning_for_dual_boost_types(capsys):
+    from gareus.cli import parse_args
+
+    for boost_type in (
+        "lower-dual", "upper-dual",
+        "lower-dual-nonbonded-dihedral", "upper-dual-nonbonded-dihedral",
+    ):
+        parse_args(["--seq", "DPETG", "--gamd-boost-type", boost_type, "--sigma0d", "2.0"])
+        out = capsys.readouterr().out
+        assert "sigma0d" not in out, boost_type
+
+
+def test_sigma0d_no_warning_when_left_at_default(capsys):
+    from gareus.cli import parse_args
+
+    parse_args(["--seq", "DPETG", "--gamd-boost-type", "lower-dihedral"])
+    out = capsys.readouterr().out
+    assert "sigma0d" not in out
