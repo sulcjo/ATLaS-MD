@@ -18,7 +18,7 @@ from typing import Optional, Iterable, List
 
 import numpy as np
 
-from .colors import ASCII_COLOR_ENABLED, color_text, style_text
+from .colors import ASCII_COLOR_ENABLED, ROLE_SECTION, ROLE_TITLE, color_text, role_text, style_text
 
 __all__ = [
     "tui_clear_enabled",
@@ -30,10 +30,24 @@ __all__ = [
     "make_progress_bar",
     "format_duration",
     "render_distance_ascii",
+    "dashboard_body_budget",
     # Internal helpers that may be useful elsewhere
     "replica_marker",
     "replica_fg256",
+    "_weighted_panel_widths",
+    "MIN_PANEL_WIDTH",
+    "ABSOLUTE_MIN_PANEL_WIDTH",
+    "dashboard_row_gap",
 ]
+
+
+MIN_PANEL_WIDTH = 30
+ABSOLUTE_MIN_PANEL_WIDTH = 22
+
+
+def dashboard_row_gap(term_w: int) -> int:
+    """Inter-panel gap for a dashboard row, shared by every row layout call."""
+    return 2 if int(term_w) < 120 else 3
 
 
 def tui_clear_enabled(args) -> bool:
@@ -198,7 +212,7 @@ def _panel_lines(title: str, body: List[str], width: int, max_body_lines: Option
         keep = max(0, int(max_body_lines) - 1)
         body = body[:keep] + [color_text(f"… {len(body) - keep} more", "dim")]
     top = "┌" + "─" * inner + "┐"
-    title_line = "│" + _ansi_pad(color_text(title, "cyan", bold=True), inner) + "│"
+    title_line = "│" + _ansi_pad(role_text(title, ROLE_TITLE), inner) + "│"
     sep = "├" + "─" * inner + "┤"
     out: List[str] = [top, title_line, sep]
     if not body:
@@ -243,55 +257,44 @@ def _dashboard_row(
     usable = max(40, term_w_val - 2)
     n = max(1, len(panels))
     gap_total = max(0, n - 1) * gap
-    min_panel_w = 28
+    min_panel_w = MIN_PANEL_WIDTH
     if n > 1 and usable < n * min_panel_w + gap_total:
-        out: List[str] = [color_text(title, "magenta", bold=True)]
+        out: List[str] = [role_text(title, ROLE_SECTION)]
         for name, body in panels:
             out.extend(_panel_lines(name, body, usable, max_panel_body_lines))
         return out
     panel_w = max(min_panel_w, (usable - gap_total) // n)
     cols = [_panel_lines(name, body, panel_w, max_panel_body_lines) for name, body in panels]
-    return [color_text(title, "magenta", bold=True)] + _join_columns(cols, gap=gap)
+    return [role_text(title, ROLE_SECTION)] + _join_columns(cols, gap=gap)
 
 
-def _dashboard_weighted_row(
-    title: str,
-    panels: List[tuple[str, List[str] | tuple]],
+def _weighted_panel_widths(
+    weights: List[float],
     term_w: Optional[int] = None,
     gap: int = 2,
-    max_panel_body_lines: Optional[int] = None,
-    min_panel_width: int = 30,
-) -> List[str]:
-    """A themed row with proportional panel widths and safe narrow stacking.
+    min_panel_width: int = MIN_PANEL_WIDTH,
+) -> List[int]:
+    """Compute proportional panel widths for a weighted dashboard row.
 
-    Each panel may be ``(name, body)`` or ``(name, body, weight)``.  Weighted
-    rows make wide terminals useful instead of giving every diagnostic
-    the same cramped column even when one panel is visually dominant.
+    Exposed standalone (not just inline in `_dashboard_weighted_row`) so a
+    caller can pre-render panel content — e.g. an ASCII histogram bar — at
+    the exact width the row will allocate, instead of guessing a width up
+    front and letting the row silently pad or truncate the mismatch away.
     """
     term_w_val = int(term_w or shutil.get_terminal_size((160, 40)).columns or 160)
     usable = max(40, term_w_val - 2)
-    clean: List[tuple[str, List[str], float]] = []
-    for item in panels:
-        if len(item) >= 3:
-            name, body, weight = item[0], item[1], float(item[2])
-        else:
-            name, body, weight = item[0], item[1], 1.0
-        clean.append((str(name), list(body), max(0.05, weight)))
-    n = len(clean)
+    clean_weights = [max(0.05, float(w)) for w in weights]
+    n = len(clean_weights)
     if n <= 0:
-        return [color_text(title, "magenta", bold=True)]
+        return []
     gap_total = max(0, n - 1) * gap
-    min_w = max(22, int(min_panel_width))
+    min_w = max(ABSOLUTE_MIN_PANEL_WIDTH, int(min_panel_width))
     if n > 1 and usable < n * min_w + gap_total:
-        out: List[str] = [color_text(title, "magenta", bold=True)]
-        for name, body, _weight in clean:
-            out.extend(_panel_lines(name, body, usable, max_panel_body_lines))
-        return out
+        return [usable] * n
     available = max(n * min_w, usable - gap_total)
-    total_weight = sum(w for _name, _body, w in clean) or 1.0
-    raw_widths = [max(min_w, int(round(available * w / total_weight))) for _name, _body, w in clean]
+    total_weight = sum(clean_weights) or 1.0
+    raw_widths = [max(min_w, int(round(available * w / total_weight))) for w in clean_weights]
     delta = available - sum(raw_widths)
-    # Adjust the widest panel first so total visible width stays within terminal.
     order = sorted(range(n), key=lambda i: raw_widths[i], reverse=True)
     idx = 0
     while delta != 0 and order:
@@ -305,11 +308,50 @@ def _dashboard_weighted_row(
         idx += 1
         if idx > 10000:
             break
+    return raw_widths
+
+
+def _dashboard_weighted_row(
+    title: str,
+    panels: List[tuple[str, List[str] | tuple]],
+    term_w: Optional[int] = None,
+    gap: int = 2,
+    max_panel_body_lines: Optional[int] = None,
+    min_panel_width: int = MIN_PANEL_WIDTH,
+) -> List[str]:
+    """A themed row with proportional panel widths and safe narrow stacking.
+
+    Each panel may be ``(name, body)`` or ``(name, body, weight)``.  Weighted
+    rows make wide terminals useful instead of giving every diagnostic
+    the same cramped column even when one panel is visually dominant.
+    """
+    clean: List[tuple[str, List[str], float]] = []
+    for item in panels:
+        if len(item) >= 3:
+            name, body, weight = item[0], item[1], float(item[2])
+        else:
+            name, body, weight = item[0], item[1], 1.0
+        clean.append((str(name), list(body), max(0.05, weight)))
+    n = len(clean)
+    if n <= 0:
+        return [role_text(title, ROLE_SECTION)]
+    widths = _weighted_panel_widths(
+        [w for _n, _b, w in clean], term_w=term_w, gap=gap, min_panel_width=min_panel_width
+    )
+    term_w_val = int(term_w or shutil.get_terminal_size((160, 40)).columns or 160)
+    usable = max(40, term_w_val - 2)
+    min_w = max(ABSOLUTE_MIN_PANEL_WIDTH, int(min_panel_width))
+    gap_total = max(0, n - 1) * gap
+    if n > 1 and usable < n * min_w + gap_total:
+        out: List[str] = [role_text(title, ROLE_SECTION)]
+        for name, body, _weight in clean:
+            out.extend(_panel_lines(name, body, usable, max_panel_body_lines))
+        return out
     cols = [
         _panel_lines(name, body, width, max_panel_body_lines)
-        for (name, body, _w), width in zip(clean, raw_widths)
+        for (name, body, _w), width in zip(clean, widths)
     ]
-    return [color_text(title, "magenta", bold=True)] + _join_columns(cols, gap=gap)
+    return [role_text(title, ROLE_SECTION)] + _join_columns(cols, gap=gap)
 
 
 def _dashboard_full_width_panel(
@@ -322,7 +364,7 @@ def _dashboard_full_width_panel(
     """A themed dashboard row containing one full‑width panel."""
     term_w_val = int(term_w or shutil.get_terminal_size((160, 40)).columns or 160)
     usable = max(40, term_w_val - 2)
-    prefix = [color_text(title, "magenta", bold=True)] if title else []
+    prefix = [role_text(title, ROLE_SECTION)] if title else []
     return prefix + _panel_lines(panel_title, body, usable, max_body_lines)
 
 
@@ -339,6 +381,18 @@ def _dashboard_density(args, term_w: Optional[int] = None, term_h: Optional[int]
     if term_w_val >= 150 and term_h_val >= 48:
         return "full"
     return "normal"
+
+
+def dashboard_body_budget(term_h: int, fraction: float, floor: int = 10) -> int:
+    """Proportional body-line budget for one dashboard row/panel.
+
+    Scales continuously with terminal height instead of a fixed ceiling tied
+    to a coarse density bucket, so a tall terminal shows more content rather
+    than the same capped amount plus blank margin. `_safe_tui_frame_text`
+    already truncates a frame that ends up taller than the terminal, so this
+    does not need to sum exactly across rows to stay safe.
+    """
+    return max(int(floor), int(round(float(term_h) * float(fraction))))
 
 
 def format_duration(seconds: Optional[float]) -> str:
@@ -480,6 +534,18 @@ def render_distance_ascii(
             return f"{float(value):6.2f}"
         return f"{float(value):6.2f} {primary_units_val}"
 
+    from .colors import severity_role
+
+    def _delta_severity_color(delta: float) -> str:
+        role = severity_role(delta, warn_at=0.5, bad_at=1.5)
+        # Deliberate decoupling, not an oversight: this re-encodes (rather
+        # than reuses) colors.py's `_ROLE_STYLE` choices to keep this
+        # function's ANSI output byte-for-byte unchanged. Routing through
+        # `role_text` instead would tie this output to `_ROLE_STYLE`'s
+        # bold/format handling, which could diverge from today's output if
+        # that ever changes.
+        return {"good": "green", "warn": "yellow", "bad": "red"}[role]
+
     clean: List[dict] = []
     for row in rows:
         try:
@@ -547,7 +613,7 @@ def render_distance_ascii(
     header = (
         "\n"
         + color_text(f"+-- CV {primary_label_val} coverage ", "cyan", bold=True)
-        + color_text("-" * 58, "cyan")
+        + color_text("-" * max(0, width_int - 2), "cyan")
         + "\n"
         + f"| {color_text('phase', 'dim')} {color_text(phase, 'cyan', bold=True)}  "
         + f"{color_text('step', 'dim')} {color_text(str(int(step)) + total_txt, 'white', bold=True)}\n"
@@ -591,7 +657,7 @@ def render_distance_ascii(
                 hist_values = [r["cv_A"]]
             bar = _render_histogram_row(hist_values, r["cv_A"], r["center_A"], lo, hi, width_int, replica=int(r["replica"]))
             delta = r["cv_A"] - r["center_A"]
-            delta_col = "green" if abs(delta) <= 0.5 else "yellow" if abs(delta) <= 1.5 else "red"
+            delta_col = _delta_severity_color(delta)
             lines.append(
                 f"r{r['replica']:02d} w{r['window']:02d}  "
                 + f"{r['cv_A']:8.2f} {r['center_A']:7.2f} {r['k_kcal_mol_A2']:7.3f} "
@@ -617,7 +683,7 @@ def render_distance_ascii(
             hist_values = [r["cv_A"]]
         bar = _render_histogram_row(hist_values, r["cv_A"], r["center_A"], lo, hi, width_int, replica=int(r["replica"]))
         delta = r["cv_A"] - r["center_A"]
-        delta_col = "green" if abs(delta) <= 0.5 else "yellow" if abs(delta) <= 1.5 else "red"
+        delta_col = _delta_severity_color(delta)
         lines.append(
             f"r{r['replica']:02d} w{r['window']:02d}  "
             + f"{r['cv_A']:8.2f} {r['center_A']:7.2f} {r['k_kcal_mol_A2']:7.3f} "

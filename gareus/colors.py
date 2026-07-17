@@ -25,6 +25,24 @@ ANSI_COLORS: dict[str, str] = {
     "white": "\033[37m",
 }
 
+ROLE_TITLE = "title"
+ROLE_SECTION = "section"
+ROLE_GOOD = "good"
+ROLE_WARN = "warn"
+ROLE_BAD = "bad"
+ROLE_MUTED = "muted"
+ROLE_VALUE = "value"
+
+_ROLE_STYLE: dict[str, tuple[str, bool]] = {
+    ROLE_TITLE: ("cyan", True),
+    ROLE_SECTION: ("magenta", True),
+    ROLE_GOOD: ("green", True),
+    ROLE_WARN: ("yellow", True),
+    ROLE_BAD: ("red", True),
+    ROLE_MUTED: ("dim", False),
+    ROLE_VALUE: ("white", True),
+}
+
 # This flag controls whether colour escapes are emitted.  It defaults to
 # ``False`` because typical HPC launchers and log parsers may not
 # handle ANSI escapes well.  Use :func:`configure_color` to change it.
@@ -99,10 +117,43 @@ def color_text(
     return style_text(text, color=color, bold=bold, dim=dim)
 
 
+def role_text(text: object, role: str, bold: Optional[bool] = None) -> str:
+    """Style `text` using a named semantic role instead of a raw color name.
+
+    Centralizing role -> color mapping here means every dashboard panel
+    that asks for "a title" or "a warning" gets the same color, instead of
+    each call site picking cyan/magenta/yellow ad hoc.
+    """
+    color, default_bold = _ROLE_STYLE.get(role, _ROLE_STYLE[ROLE_MUTED])
+    use_bold = default_bold if bold is None else bool(bold)
+    if color == "dim":
+        return style_text(text, dim=True, bold=use_bold)
+    return style_text(text, color=color, bold=use_bold)
+
+
+def severity_role(value: float, warn_at: float, bad_at: float) -> str:
+    """Map a magnitude to ROLE_GOOD/ROLE_WARN/ROLE_BAD by absolute thresholds."""
+    magnitude = abs(float(value))
+    if magnitude <= float(warn_at):
+        return ROLE_GOOD
+    if magnitude <= float(bad_at):
+        return ROLE_WARN
+    return ROLE_BAD
+
+
 __all__ = [
     "ANSI_COLORS",
     "ASCII_COLOR_ENABLED",
     "configure_color",
     "style_text",
     "color_text",
+    "role_text",
+    "severity_role",
+    "ROLE_TITLE",
+    "ROLE_SECTION",
+    "ROLE_GOOD",
+    "ROLE_WARN",
+    "ROLE_BAD",
+    "ROLE_MUTED",
+    "ROLE_VALUE",
 ]
