@@ -12,6 +12,10 @@ from gareus.tui import strip_ansi
 # umbrella-center/current-value/overlap.
 _BAR_RE = re.compile(r"\[([·▁▂▃▄▅▆▇█ │◉●]+)\]")
 
+# Matches the header's "cov <lo>-<hi> |<bar>|" coverage-bar line — see
+# gareus/logger.py's `_coverage_bar` glyph set (" ░▒▓█" plus "·" for empty bins).
+_COV_BAR_RE = re.compile(r"^cov .*?\|([ ░▒▓█·]+)\|", re.MULTILINE)
+
 
 def _make_logger(tmp_path):
     args = argparse.Namespace()
@@ -52,6 +56,20 @@ def test_cv_histogram_bar_grows_past_old_ceiling_on_large_terminal(tmp_path, mon
     # Old code capped this at 140 (full-density tier) regardless of terminal
     # width; a 500-wide terminal must clearly exceed that fixed ceiling.
     assert max_bar_len > 140
+    logger.close()
+
+
+def test_cv1_coverage_bar_grows_past_old_ceiling_on_large_terminal(tmp_path, monkeypatch):
+    # Same bug class as the CV histogram bar above, in a different, always-
+    # rendered header line: `_render_compact_header`'s CV1 coverage bar
+    # (`cov_w`) was independently capped at 48 columns regardless of terminal
+    # width, unrelated to and missed by the earlier `cov2_w` fix (which only
+    # covers the 2D-run secondary-CV coverage line).
+    logger = _make_logger(tmp_path)
+    out = strip_ansi(_render_at(monkeypatch, logger, 500, 60))
+    matches = _COV_BAR_RE.findall(out)
+    assert matches, "expected a 'cov ...|...|' coverage bar line in dashboard output"
+    assert len(matches[0]) > 48
     logger.close()
 
 

@@ -2364,7 +2364,7 @@ class DistanceLogger:
         vals_flat: list[float] = []
         for h in self.history_by_replica.values():
             vals_flat.extend(h)
-        cov_w = max(12, min(48, term_w // 3))
+        cov_w = max(12, term_w // 3)
         cov_bar = _coverage_bar(vals_flat, lo, hi, cov_w)
         prev_ctx = _compact_epoch_context(adaptive)
         line3 = (
