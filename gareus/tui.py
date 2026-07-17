@@ -538,6 +538,12 @@ def render_distance_ascii(
 
     def _delta_severity_color(delta: float) -> str:
         role = severity_role(delta, warn_at=0.5, bad_at=1.5)
+        # Deliberate decoupling, not an oversight: this re-encodes (rather
+        # than reuses) colors.py's `_ROLE_STYLE` choices to keep this
+        # function's ANSI output byte-for-byte unchanged. Routing through
+        # `role_text` instead would tie this output to `_ROLE_STYLE`'s
+        # bold/format handling, which could diverge from today's output if
+        # that ever changes.
         return {"good": "green", "warn": "yellow", "bad": "red"}[role]
 
     clean: List[dict] = []

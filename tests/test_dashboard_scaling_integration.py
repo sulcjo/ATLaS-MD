@@ -1,11 +1,12 @@
 import argparse
+import collections
 import os
 import re
 
 import pytest
 
 from gareus.logger import DistanceLogger
-from gareus.tui import strip_ansi
+from gareus.tui import _weighted_panel_widths, strip_ansi
 
 # Matches a bracketed hist3d bar, e.g. "[▁▂▃·◉●...]" — see
 # gareus/tui.py's `_hist3d_cell` glyph set plus the │/◉/● markers used for
@@ -15,6 +16,11 @@ _BAR_RE = re.compile(r"\[([·▁▂▃▄▅▆▇█ │◉●]+)\]")
 # Matches the header's "cov <lo>-<hi> |<bar>|" coverage-bar line — see
 # gareus/logger.py's `_coverage_bar` glyph set (" ░▒▓█" plus "·" for empty bins).
 _COV_BAR_RE = re.compile(r"^cov .*?\|([ ░▒▓█·]+)\|", re.MULTILINE)
+
+# Matches the potential-energy histogram bar's "kJ |<bar>|" suffix — see
+# gareus/logger.py's `_render_potential_energy_map`, which uses the glyph set
+# " ·░▒▓█" plus the "●" current-value marker.
+_PE_BAR_RE = re.compile(r"kJ \|([ ·░▒▓█●]+)\|")
 
 
 def _make_logger(tmp_path):
@@ -87,3 +93,42 @@ def test_dashboard_renders_at_typical_terminal(tmp_path, monkeypatch):
     assert isinstance(out, str)
     assert "production" in strip_ansi(out)
     logger.close()
+
+
+def test_pe_histogram_bar_width_pinned_at_160x40(tmp_path, monkeypatch):
+    # The CV/PE histogram row switched from hand-split ceilings to a weighted
+    # proportional split (`_weighted_panel_widths([2.4, 0.9], ...)`). At the
+    # most common terminal size (160x40) this narrows the PE histogram bar
+    # from the old hand-split 28 columns to 18 -- an intended, reviewed
+    # redesign, but nothing pinned the new value down. Pin it here so any
+    # future change to the weight/offset arithmetic is a deliberate, visible
+    # test change instead of silent drift.
+    logger = _make_logger(tmp_path)
+    # `_render_dashboard` doesn't itself populate potential-energy history
+    # (that happens in `_update_history`, called by the public logging
+    # entrypoint, not exercised by this test's direct `_render_dashboard`
+    # call) -- seed it directly so `_render_potential_energy_map` renders
+    # real histogram bars instead of its "PE unavailable" early-return.
+    for rep in range(4):
+        logger.potential_history_by_replica[rep] = collections.deque(
+            [100.0 + rep + i for i in range(20)], maxlen=logger.history_limit
+        )
+    out = strip_ansi(_render_at(monkeypatch, logger, 160, 40))
+    matches = _PE_BAR_RE.findall(out)
+    assert matches, "expected a 'kJ |<bar>|' potential-energy histogram bar in dashboard output"
+    assert len(matches[0]) == 18
+    logger.close()
+
+
+def test_pe_bar_width_arithmetic_pinned_at_160x40():
+    # Narrowly-scoped companion to the rendered-output test above: mirrors
+    # the exact arithmetic in `gareus/logger.py`'s `_render_dashboard` (weight
+    # split then `pe_bar_width = max(10, pe_panel_w - 24)`) directly, so this
+    # still catches a silent width change even if the rendered-text format
+    # around the bar changes for unrelated reasons.
+    _cv_panel_w, pe_panel_w = _weighted_panel_widths(
+        [2.4, 0.9], term_w=160, gap=3, min_panel_width=30
+    )
+    pe_bar_width = max(10, pe_panel_w - 24)
+    assert pe_panel_w - 24 == 18
+    assert pe_bar_width == 18

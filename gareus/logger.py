@@ -2307,6 +2307,12 @@ class DistanceLogger:
         eta_start_wall: float,
     ) -> list[str]:
         """Compact 3-line (or 4-line with pilot/epoch banner) header."""
+        # Deliberate keep: unlike the histogram/coverage panels this rework
+        # uncapped elsewhere (cv_bar_width, pe_bar_width, cov2_w, cov_w), the
+        # progress bar stays capped at 36 columns. It shares its header line
+        # with other running text rather than owning a data-density panel, so
+        # an ultrawide bar would look odd rather than add useful resolution.
+        # Out of scope for the terminal-size-scaling rework.
         pbar = make_progress_bar(frac, min(36, max(18, term_w // 5)))
         epoch_label = _epoch_label_inline(adaptive)
 
@@ -2423,7 +2429,6 @@ class DistanceLogger:
         term_h = int(term_size.lines or 40)
         density = _dashboard_density(self.args, term_w=term_w, term_h=term_h)
         compact_dashboard = density == "compact"
-        full_dashboard = density == "full"
         usable_w = max(40, term_w - 2)
 
         primary_label = str(info.get("primary_cv_label", primary_cv_label(self.args)))
