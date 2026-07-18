@@ -58,19 +58,29 @@ comparable size, because "peaky" forces both stiffer umbrellas and finer
 spacing at once).
 
 MBAR backend: "numba-anderson", not the "anderson" (pure-NumPy) backend the
-sibling files use - a K=364, N=182,000 problem takes minutes in pure NumPy
-and seconds with the Numba kernels. Real solve_mbar code either way; this is
-a backend choice, not a shortcut.
+sibling files use - a K=364, N=910,000 problem takes many minutes in pure
+NumPy and seconds with the Numba kernels. Real solve_mbar code either way;
+this is a backend choice, not a shortcut.
 
 Deliberately NOT covered, same scope boundaries as the rest of this family:
 no torsion-based real CV2 force construction (periodic, would break the
 flat-measure ground truth - see test_thermodynamic_validity_2d.py's longer
 note on this), no replica exchange, no GaMD boost.
 
-Runtime note: this file is the heaviest oracle in the family (~150s: ~30s
-real MD across 364 windows, plus MBAR+histogram+pointwise-comparison run
-five times - once for the control, once per mutation). That cost is the
-direct, load-bearing consequence of "peaky" (see the budget paragraph
+Steps per window: PRODUCTION_STEPS was raised 5x (10,000 -> 50,000; 2500
+samples/window at RECORD_STRIDE=20) after the report's convergence-by-frame
+sweep (write_thermodynamic_validity_2d_rough_report.py) showed the pointwise
+RMS still dropping noticeably between 70% and 100% of the original budget.
+At 5x, the same sweep flattens out (control RMS 0.157 -> 0.097 kcal/mol,
+frac_used 60% -> 66%, and the fraction-to-fraction deltas shrink to a few
+hundredths of a kcal/mol by the end) rather than still trending steeply
+down - "enough steps to converge", not just "enough to pass".
+
+Runtime note: this file is the heaviest oracle in the family (~800s / ~13
+min: ~85s real MD across 364 windows at 2500 samples/window, plus MBAR+
+histogram+pointwise-comparison run five times - once for the control, once
+per mutation). That cost is the direct, load-bearing consequence of
+"peaky" plus "converged" (see the budget and steps-per-window paragraphs
 above), not padding.
 """
 from __future__ import annotations
@@ -143,8 +153,13 @@ BUMPS = (
 
 K_BIAS_KCAL_A2 = 35.0
 K_PIN_KCAL_A2 = 200.0
-EQUIL_STEPS = 1000
-PRODUCTION_STEPS = 10000
+EQUIL_STEPS = 2000
+# 5x the step count first used here: the report's convergence-by-frame sweep
+# (fractions of these production samples, see write_thermodynamic_validity_
+# 2d_rough_report.py) showed pointwise RMS still dropping ~11% between 70%
+# and 100% of the old 10000-step budget - not yet plateaued. Raised until
+# the same sweep flattens out at the top end instead of still trending down.
+PRODUCTION_STEPS = 50000
 RECORD_STRIDE = 20
 TIMESTEP_FS = 0.5
 FRICTION_PER_PS = 5.0
@@ -404,10 +419,11 @@ def test_real_md_recovers_noisy_multibarrier_surface(real_md_2d_rough_windows):
 def test_mutation_is_caught(real_md_2d_rough_windows, label, transform, analog):
     """Each defect is applied to the SAME real MD data (no re-running MD) and
     must push the pointwise RMS well outside the control's pass band. Margins
-    here are large by construction: the control recovers RMS ~0.16 kcal/mol
-    and every one of these four mutations was verified at design time to land
-    at RMS >= 1.3 kcal/mol (8x-400x the control), so 0.5 kcal/mol is a
-    comfortable, non-brittle line between them.
+    here are large by construction: the control recovers RMS ~0.10 kcal/mol
+    (at the 5x/converged step count - see module docstring) and every one of
+    these four mutations was verified at design time to land at RMS >= 1.4
+    kcal/mol (14x-730x the control), so 0.5 kcal/mol is a comfortable,
+    non-brittle line between them.
     """
     d = real_md_2d_rough_windows
     beta = _beta_kj_per_mol()
