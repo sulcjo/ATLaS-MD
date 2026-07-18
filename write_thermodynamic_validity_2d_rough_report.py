@@ -219,10 +219,11 @@ rms_vals = [float(r[1]) for r in mut_rows]
 colors = ["#27ae60" if "PASS" in r[3] else "#c0392b" for r in mut_rows]
 ax[0].bar(labels, rms_vals, color=colors)
 ax[0].axhline(0.5, ls="--", c="k", label="pass/fail line (0.5 kcal/mol)")
-ax[0].set_ylabel("pointwise RMS(F - V)  (kcal/mol)")
+ax[0].set_yscale("log")
+ax[0].set_ylabel("pointwise RMS(F - V)  (kcal/mol, log scale)")
 ax[0].set_title("Mutation test: does the oracle have teeth?")
 ax[0].legend(fontsize=8)
-ax[0].grid(alpha=0.3, axis="y")
+ax[0].grid(alpha=0.3, axis="y", which="both")
 fracs = [r[0] for r in conv_rows]
 rmss = [r[1] for r in conv_rows]
 ax[1].plot(fracs, rmss, "o-", color="#2980b9")
@@ -236,19 +237,29 @@ fig.savefig(FIG2, dpi=150)
 plt.close(fig)
 
 FIG3 = FIGDIR / "solver_comparison.png"
-fig, ax = plt.subplots(1, 2, figsize=(10, 4.0))
+fig, ax = plt.subplots(1, 2, figsize=(10, 4.2))
 ok_rows = [r for r in solver_rows if r[1] != "FAILED"]
 b_names = [r[0] for r in ok_rows]
 b_times = [float(r[1].rstrip("s")) for r in ok_rows]
 b_rms = [float(r[4]) for r in ok_rows]
+b_converged = [r[3] == "True" for r in ok_rows]
 ax[0].bar(b_names, b_times, color="#8e44ad")
 ax[0].set_ylabel("wall time (s)")
 ax[0].set_title(f"MBAR backend wall time (K={len(sub_windows)}, N={sub_cv1.size})")
 ax[0].tick_params(axis="x", rotation=30)
-ax[1].bar(b_names, b_rms, color="#16a085")
+# Colored by converged status, NOT accuracy: a LOWER bar here does not mean a
+# better backend - see the report text. Non-converged backends stopped at an
+# arbitrary intermediate iterate of the fixed-point map; whether that iterate
+# happens to sit closer to or further from the truth than the converged
+# answer is not something this metric can be trusted to rank.
+bar_colors = ["#27ae60" if c else "#c0392b" for c in b_converged]
+ax[1].bar(b_names, b_rms, color=bar_colors)
 ax[1].set_ylabel("pointwise RMS vs truth (kcal/mol)")
-ax[1].set_title("Recovery accuracy by backend (same subsampled data)")
+ax[1].set_title("RMS vs truth (NOT ranking - see text)", fontsize=10)
 ax[1].tick_params(axis="x", rotation=30)
+from matplotlib.patches import Patch
+ax[1].legend(handles=[Patch(color="#27ae60", label="converged"), Patch(color="#c0392b", label="did NOT converge")],
+             fontsize=8)
 fig.tight_layout()
 fig.savefig(FIG3, dpi=150)
 plt.close(fig)
@@ -356,7 +367,10 @@ doc.add_paragraph(
     f"{sub_n_per_window} samples/window -> K={len(sub_windows)}, N={sub_cv1.size}), "
     "so every solver, including the slow ones, finishes in a reasonable time. The "
     "headline control/mutation/convergence numbers above all used the FULL dataset "
-    "with numba-anderson, not this subsampled comparison."
+    "with numba-anderson, not this subsampled comparison. Because it is a much "
+    "smaller, sparser problem (52 of 364 windows), its own RMS-vs-truth values are "
+    "not comparable to Sections 1-3's — this section is about solver-to-solver "
+    "agreement, not a second accuracy headline."
 )
 add_table(doc, ["Backend", "Wall time", "Iterations", "Converged", "RMS vs truth (kcal/mol)"],
           solver_rows, widths=[1.6, 1.0, 1.1, 1.1, 1.8])
@@ -368,15 +382,24 @@ if non_converged:
     doc.add_paragraph(
         f"Finding: the plain fixed-point backends ({', '.join(non_converged)}) did NOT "
         f"converge within the 3000-iteration cap on this real, noisy, multi-basin "
-        f"dataset, and their (unconverged) recovered PMFs disagree with the "
-        f"accelerated/quasi-Newton backends (anderson, numba-anderson, lbfgs — which "
-        f"agree with each other essentially exactly). Anderson/DIIS mixing or L-BFGS "
-        f"is not just a speed optimization here; on a rough real surface, plain "
-        f"fixed-point iteration within a practical iteration budget can silently hand "
-        f"back an under-converged, measurably wrong PMF while still returning without "
-        f"error. Prefer an accelerated backend (or raise the iteration cap and check "
-        f"'converged') whenever the free-energy surface is not a simple, well-"
-        f"conditioned single well."
+        f"dataset. The accelerated/quasi-Newton backends (anderson, numba-anderson, "
+        f"lbfgs) DID converge and agree with each other to within "
+        f"{max((float(v.split()[0]) for _, v in agreement_rows), default=0.0):.1e} "
+        f"kcal/mol — mutual agreement between independent algorithms reaching the "
+        f"same fixed point, the actual cross-validation signal here."
+    )
+    doc.add_paragraph(
+        "Caution on reading the RMS-vs-truth column above: the non-converged "
+        "backends happen to show a LOWER RMS-vs-truth than the converged ones on "
+        "this particular subsampled problem (visible in the right panel below, "
+        "colored by converged status, not accuracy). That is not evidence they are "
+        "more accurate — an unconverged fixed-point iterate is an arbitrary "
+        "intermediate point on the way to an answer, and whether it happens to sit "
+        "closer to the truth than the converged answer is not something this one "
+        "run can generalize from. The trustworthy signals in this section are wall "
+        "time and converged-backend agreement, not this RMS column; whether a "
+        "backend reports converged=True is what should gate trust, not how its "
+        "RMS-vs-truth happens to compare on one sparse subsampled run."
     )
 doc.add_picture(str(FIG3), width=Inches(6.6))
 
