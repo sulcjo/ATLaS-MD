@@ -51,6 +51,11 @@ from .system_setup import (
     write_state_pdb,
 )
 
+# Gas constant R in kcal/mol/K. Was hardcoded as this same literal independently
+# three times in this file (adaptive_force_constants_kcal_a2,
+# contact_adaptive_force_constants_kcal, and the 2D window-grid builder).
+_R_KCAL_MOL_K = 0.00198720425864083
+
 __all__ = [
     "expand_windows_for_secondary_cv",
     "set_window",
@@ -538,7 +543,7 @@ def adaptive_force_constants_kcal_a2(centers_a: np.ndarray, args) -> list[float]
         return [float(args.default_window_k_kcal_a2)]
     if str(args.adaptive_k_mode) == "constant":
         return [float(args.default_window_k_kcal_a2)] * int(centers_a.size)
-    rt_kcal_mol = 0.00198720425864083 * float(args.temperature_k)
+    rt_kcal_mol = _R_KCAL_MOL_K * float(args.temperature_k)
     spacings = np.diff(centers_a)
     local = np.empty_like(centers_a)
     local[0] = spacings[0]
@@ -634,7 +639,7 @@ def adaptive_contact_force_constants_kcal(centers_c: np.ndarray, args) -> list[f
         return [float(getattr(args, "contact_adaptive_default_k_kcal", 25.0) or 25.0)]
     if str(getattr(args, "contact_adaptive_k_mode", "spacing") or "spacing").lower() in {"fixed", "constant"}:
         return [float(getattr(args, "contact_adaptive_default_k_kcal", 25.0) or 25.0)] * int(centers.size)
-    rt_kcal_mol = 0.00198720425864083 * float(getattr(args, "temperature_k", 300.0) or 300.0)
+    rt_kcal_mol = _R_KCAL_MOL_K * float(getattr(args, "temperature_k", 300.0) or 300.0)
     spacings = np.diff(centers)
     local = np.empty_like(centers)
     local[0] = spacings[0]
@@ -1369,7 +1374,7 @@ def _build_delaunay_windows_impl(samples_csv_path, args, out_dir, round_index: i
     k2_min = float(getattr(args, "secondary_cv_adaptive_min_k_kcal", 5.0) or 5.0)
     k2_max = float(getattr(args, "secondary_cv_adaptive_max_k_kcal", 100.0) or 100.0)
     k_secondary_default = float(getattr(args, "secondary_cv_k_kcal", 25.0) or 25.0)
-    rt_kcal_mol = 0.00198720425864083 * float(getattr(args, "temperature_k", 300.0) or 300.0)
+    rt_kcal_mol = _R_KCAL_MOL_K * float(getattr(args, "temperature_k", 300.0) or 300.0)
 
     cv1_mode = primary_cv_mode(args)
     cv2_mode = secondary_cv_mode(args)

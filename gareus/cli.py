@@ -684,14 +684,8 @@ def _validate_gamd_args(args: argparse.Namespace) -> None:
         )
 
 
-def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
-    """Map schema-v2 attr names to legacy internal names expected by consumer modules.
-
-    This lets the public CLI/YAML API be clean and minimal while all downstream
-    code continues to work without changes.  Consumer modules can be updated to
-    the new names incrementally.
-    """
-    # ── CV ───────────────────────────────────────────────────────────────────
+def _shim_cv(args: argparse.Namespace) -> None:
+    """CV2 (secondary CV) schema-v2 -> legacy attr names."""
     args.secondary_cv = args.cv2
     cv2_centers = getattr(args, "cv2_centers", None)
     args.secondary_cv_centers = cv2_centers
@@ -708,7 +702,9 @@ def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
     args.secondary_cv_adaptive_min_sigma = 0.02
     args.secondary_cv_force_group = 29
 
-    # ── CV1 adaptive → distance legacy names ─────────────────────────────────
+
+def _shim_cv1_legacy_names(args: argparse.Namespace) -> None:
+    """CV1 (primary CV) adaptive-window schema-v2 -> legacy distance/contact attr names."""
     _cv1_range_min = args.cv1_range_min
     _cv1_range_max = args.cv1_range_max
     _cv1_spacing = args.cv1_target_spacing
@@ -787,7 +783,9 @@ def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
     args.umbrella_force_group = 31
     args.adaptive_secondary_cv = "auto"
 
-    # ── US Pulling ────────────────────────────────────────────────────────────
+
+def _shim_us_pulling(args: argparse.Namespace) -> None:
+    """Umbrella-sampling pull-ramp schema-v2 -> legacy attr names."""
     args.us_pull_k_kcal_a2 = args.us_pull_k
     args.contact_us_pull_k_kcal = args.us_pull_k
     args.contact_us_pull_max_k_kcal = max(args.us_pull_k * 2.0, 20.0)
@@ -806,7 +804,9 @@ def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
     args.us_2d_start_secondary_warn_bias_kcal = 1.0
     args.us_2d_start_secondary_bad_bias_kcal = 5.0
 
-    # ── Windows ───────────────────────────────────────────────────────────────
+
+def _shim_windows(args: argparse.Namespace) -> None:
+    """Adaptive-window-placement schema-v2 -> legacy attr names."""
     args.adaptive_window_aggressiveness = args.aggressiveness
     args.adaptive_feedback_rounds = args.adaptive_rounds
     args.adaptive_feedback_pilot_fraction = args.pilot_fraction
@@ -831,10 +831,14 @@ def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
     args.explicit_2d_exchange_radius = 1.65
     args.explicit_2d_exchange_slots = 4
 
-    # ── Seeding ───────────────────────────────────────────────────────────────
+
+def _shim_seeding(args: argparse.Namespace) -> None:
+    """Seeding schema-v2 -> legacy attr names."""
     args.seed_secondary_weight = args.seed_cv2_weight
 
-    # ── GENPEPT prescan ───────────────────────────────────────────────────────
+
+def _shim_genpept_prescan(args: argparse.Namespace) -> None:
+    """GENPEPT-prescan (live feature) schema-v2 -> legacy attr names."""
     args.genpept_prescan_enabled = args.genpept_prescan
     # Dropped prescan tuning
     args.genpept_prescan_rescore_active_cvs = True
@@ -845,7 +849,16 @@ def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
     args.genpept_prescan_output_prefix = "genpept_prescan"
     args.genpept_prescan_write_maps = True
     args.genpept_prescan_write_seed_assignments = True
-    # Dropped genpept_prior entirely
+
+
+def _shim_genpept_prior_disabled(args: argparse.Namespace) -> None:
+    """GENPEPT-prior window-seeding pipeline (gareus/genpept_window_prior.py) — deliberately
+    retired, not exposed via any CLI/YAML knob. ``genpept_prior_enabled`` is unconditionally
+    False here on purpose: the pipeline is still imported and called by
+    gareus/adaptive_feedback.py (it takes the disabled early-return branch every time), it is
+    not dead code, just permanently gated off. Flip ``genpept_prior_enabled`` back to a real
+    CLI flag only as a deliberate product decision to revive the feature, not as a bugfix.
+    """
     args.genpept_prior_enabled = False
     args.genpept_prior_dir = None
     args.genpept_prior_stages = None
@@ -862,7 +875,9 @@ def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
     args.genpept_prior_snap_secondary_centers = True
     args.genpept_prior_required = False
 
-    # ── GaMD ─────────────────────────────────────────────────────────────────
+
+def _shim_gamd(args: argparse.Namespace) -> None:
+    """GaMD schema-v2 -> legacy attr names."""
     args.gamd_production_steps = args.production_steps
     args.sigma0p_kcal_mol = args.sigma0p
     args.sigma0d_kcal_mol = args.sigma0d
@@ -882,7 +897,9 @@ def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
     args.shared_gamd_setup_dir = ""
     args.shared_gamd_export_dir = ""
 
-    # ── Adaptive production ───────────────────────────────────────────────────
+
+def _shim_adaptive_production(args: argparse.Namespace) -> None:
+    """Adaptive-production schema-v2 -> legacy attr names."""
     args.adaptive_production_epochs = args.ap_epochs
     args.adaptive_production_epoch_steps = args.ap_epoch_steps
     args.adaptive_production_final_steps = args.ap_final_steps
@@ -951,7 +968,9 @@ def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
     args.extend_mode = str(getattr(args, "extend_mode", "auto"))
     args.adaptive_production_topup_only = False
 
-    # ── Output ────────────────────────────────────────────────────────────────
+
+def _shim_output(args: argparse.Namespace) -> None:
+    """Output/logging/progress schema-v2 -> legacy attr names."""
     args.color = "auto"
     args.progress_jsonl = "progress.jsonl"
     args.progress_update_interval_sec = 0.25
@@ -971,7 +990,9 @@ def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
     args.distance_ascii_width = 54
     args.distance_ascii_max_replicas = 32
     args.distance_history_limit = 4000
-    args.flush_every_log = True
+    # flush_every_log is a real, documented user flag (default False: "rely on
+    # --parquet-flush-rows threshold instead", see --flush-every-log's own help text) —
+    # it must NOT be forced here. Leave args.flush_every_log exactly as argparse set it.
     args.csv_flush_rows = 1000
     args.jsonl_flush_rows = 500
     args.analysis_consolidated_max_elements = 100_000_000
@@ -980,7 +1001,9 @@ def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
     args.write_full_bias_csv_vectors = False
     args.write_gamd_globals_json = False
 
-    # ── System ────────────────────────────────────────────────────────────────
+
+def _shim_system(args: argparse.Namespace) -> None:
+    """System-setup schema-v2 -> legacy attr names."""
     args.initial_phi = -60.0
     args.initial_psi = -45.0
     args.ph = 7.0
@@ -990,14 +1013,18 @@ def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
     args.nvt_start_temperature_k = 50.0
     args.npt_final_timestep_fs = 0.0
 
-    # ── Misc ──────────────────────────────────────────────────────────────────
+
+def _shim_misc(args: argparse.Namespace) -> None:
+    """Miscellaneous schema-v2 -> legacy attr names."""
     args.double_adaptive = (args.window_mode == "double-adaptive")
     args.cv_mode = "terminal-ca"
     # primary_cv alias kept for cv.py compatibility
     if not hasattr(args, "primary_cv"):
         args.primary_cv = "distance"
 
-    # ── Config sanity warnings ────────────────────────────────────────────────
+
+def _validate_config_sanity(args: argparse.Namespace) -> None:
+    """Cross-flag sanity warnings/errors, run after all v2-compat shims are applied."""
     # R5: cv1_k_default silently ignored in non-fixed mode
     if getattr(args, "cv1_k_mode", "spacing") not in ("fixed", "constant") and float(getattr(args, "cv1_k_default", 0.0) or 0.0) != 0.0:
         warnings.warn(
@@ -1027,6 +1054,34 @@ def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
         _fallback = getattr(args, "seed_conformers_dir", None)
         if _fallback is not None:
             args.genpept_prescan_dir = _fallback
+
+
+def _apply_v2_compat_shims(args: argparse.Namespace) -> None:
+    """Map schema-v2 attr names to legacy internal names expected by consumer modules.
+
+    This lets the public CLI/YAML API be clean and minimal while all downstream
+    code continues to work without changes.  Consumer modules can be updated to
+    the new names incrementally.
+
+    Split into one function per subsystem so each override is a named, visible
+    thing instead of a line buried in one 340-line function — that's what let
+    ``args.flush_every_log = True`` silently defeat a real, documented user flag
+    for as long as it did. Order matters (later sections may read attrs set by
+    earlier ones) and must match the original single-function order exactly.
+    """
+    _shim_cv(args)
+    _shim_cv1_legacy_names(args)
+    _shim_us_pulling(args)
+    _shim_windows(args)
+    _shim_seeding(args)
+    _shim_genpept_prescan(args)
+    _shim_genpept_prior_disabled(args)
+    _shim_gamd(args)
+    _shim_adaptive_production(args)
+    _shim_output(args)
+    _shim_system(args)
+    _shim_misc(args)
+    _validate_config_sanity(args)
 
 
 # ---------------------------------------------------------------------------
