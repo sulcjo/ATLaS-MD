@@ -312,13 +312,18 @@ doc.add_paragraph(
     "curvature fit to a direct pointwise comparison of the recovered 2-D PMF "
     "against the exact known potential, bin by bin."
 )
+_mutation_rms_values = [float(row[1]) for row in mut_rows[1:]]  # exclude the control row (index 0)
+_mut_rms_lo, _mut_rms_hi = min(_mutation_rms_values), max(_mutation_rms_values)
+_mut_ratio_lo = _mut_rms_lo / control["rms"]
+_mut_ratio_hi = _mut_rms_hi / control["rms"]
 doc.add_paragraph(
     f"Result: control recovers the full surface with pointwise RMS(F-V)="
     f"{control['rms']:.3f} kcal/mol (ESS {control['ess_frac']:.1%}, "
     f"{control['frac_used']:.1%} of bins adequately sampled). A 4-mutation battery "
     f"(mis-scaled bias, dropped bias, sign-flipped bias, and — the case this file "
     f"exists for — the secondary-CV bias stripped from reconstruction) is caught at "
-    f"RMS 1.3-64 kcal/mol, 8x-400x the control. Real MD ran across "
+    f"RMS {_mut_rms_lo:.1f}-{_mut_rms_hi:.1f} kcal/mol, {_mut_ratio_lo:.0f}x-{_mut_ratio_hi:.0f}x "
+    f"the control. Real MD ran across "
     f"{K_WINDOWS} windows ({t_md:.0f}s); MBAR solved via the numba-anderson backend "
     f"(pure-NumPy backends were empirically too slow at this scale — see Section 5)."
 )
