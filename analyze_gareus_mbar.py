@@ -1162,6 +1162,34 @@ def _augment_with_adaptive_rounds(d: Data, run_dir: Path) -> Data:
     ))
 
 
+def _is_usable_for_mbar(row: dict) -> bool:
+    return str(row.get('usable_for_mbar', '')).strip().lower() in ('true', '1', 'yes')
+
+
+def _merge_missing_usable_states(primary_rows: list, live_rows: list) -> list:
+    """Merge usable states present in `live_rows` but absent from `primary_rows`.
+
+    `final_registry_used_for_mbar.csv` is written once, when a run first enters
+    its final phase, and is *not* regenerated if the run is later resumed and the
+    epoch loop adds more states (e.g. adaptive splits) before re-entering final
+    phase. `state_registry.csv` keeps growing as the live source of truth. A
+    state_id referenced by a later epoch's samples but missing from the frozen
+    snapshot must not be silently excluded (that would drop real samples and bias
+    the recovered free energies) — so any usable state_id absent from
+    `primary_rows` is appended here, sourced from `live_rows`.
+    """
+    seen = {int(r['state_id']) for r in primary_rows}
+    merged = list(primary_rows)
+    for r in live_rows:
+        sid = int(r['state_id'])
+        if sid in seen:
+            continue
+        if _is_usable_for_mbar(r):
+            merged.append(r)
+            seen.add(sid)
+    return merged
+
+
 def _load_epoch_task(epoch_dir: Path, wmap_path: Path, n_threads: int) -> tuple:
     """Load one epoch's samples and window map (runs in a thread)."""
     from gareus.query import load_samples
@@ -1198,8 +1226,25 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
             raise FileNotFoundError(f'No final_registry_used_for_mbar.csv or state_registry.csv in {adaptive_dir}')
 
     with registry_csv.open(newline='') as f:
-        reg_rows = [r for r in csv.DictReader(f)
-                    if str(r.get('usable_for_mbar', '')).strip().lower() in ('true', '1', 'yes')]
+        reg_rows = [r for r in csv.DictReader(f) if _is_usable_for_mbar(r)]
+
+    # `final_registry_used_for_mbar.csv` is a one-time snapshot taken when the
+    # run first entered its final phase; if the run was later resumed and the
+    # epoch loop added more states before re-entering final phase, this file
+    # goes stale relative to the live `state_registry.csv`. Merge in any usable
+    # states the snapshot is missing so their samples aren't silently dropped.
+    live_registry_csv = adaptive_dir / 'state_registry.csv'
+    if registry_csv.name != live_registry_csv.name and live_registry_csv.exists():
+        with live_registry_csv.open(newline='') as f:
+            live_rows = list(csv.DictReader(f))
+        n_before = len(reg_rows)
+        reg_rows = _merge_missing_usable_states(reg_rows, live_rows)
+        n_added = len(reg_rows) - n_before
+        if n_added:
+            print(f'    [registry merge] {registry_csv.name} was missing {n_added} usable '
+                  f'state(s) present in state_registry.csv (added after the final-phase '
+                  f'snapshot was taken); merging them in so their samples are included')
+
     if not reg_rows:
         raise ValueError(f'No usable states in {registry_csv}')
     reg_rows.sort(key=lambda r: int(r['state_id']))
