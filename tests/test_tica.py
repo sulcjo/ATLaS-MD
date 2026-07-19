@@ -11,7 +11,9 @@ from gareus.tica import (
     backbone_dihedral_features,
     compute_tica,
     compute_tica_components,
+    compute_tica_combined,
     compute_tica_from_epoch_obs,
+    compute_combined_tica_from_epoch_obs,
     load_epoch_dihedral_obs,
     project_tica1,
     tica_k_from_spread,
@@ -331,6 +333,105 @@ class TestComputeTicaComponents:
         for r in results:
             assert r.phi_torsion_indices == phi
             assert r.psi_torsion_indices == psi
+
+
+# ---------------------------------------------------------------------------
+# compute_tica_combined (production-facing: combine top-N modes into one CV2 direction)
+# ---------------------------------------------------------------------------
+
+class TestComputeTicaCombined:
+    def test_n_components_one_matches_compute_tica_exactly(self):
+        X = _multi_slow_mode_dataset(n_features=5, n_frames=600, seed=5)
+        single = compute_tica(X, lag=5)
+        combined = compute_tica_combined(X, lag=5, n_components=1)
+        np.testing.assert_array_equal(combined.weights, single.weights)
+        assert combined.eigenvalue == single.eigenvalue
+        assert combined.offset == single.offset
+
+    def test_default_n_components_matches_compute_tica(self):
+        """Default n_components=1 must reproduce old single-mode behavior untouched."""
+        X = _multi_slow_mode_dataset(n_features=4, n_frames=500, seed=6)
+        single = compute_tica(X, lag=5)
+        combined = compute_tica_combined(X, lag=5)
+        np.testing.assert_array_equal(combined.weights, single.weights)
+
+    def test_combines_top_n_eigenvalue_weighted(self):
+        # Two independent AR(1) features with distinct, well-separated eigenvalues,
+        # plus two near-zero-signal columns. n_components=2 should pull in the
+        # second (faster) mode with a coefficient ratio = sqrt(eigenvalue_1/eigenvalue_2).
+        rng = np.random.default_rng(8)
+        n = 900
+        a1, a2 = 0.97, 0.6
+        f1 = np.zeros(n)
+        f2 = np.zeros(n)
+        for t in range(1, n):
+            f1[t] = a1 * f1[t - 1] + rng.normal(0, np.sqrt(1 - a1 * a1))
+            f2[t] = a2 * f2[t - 1] + rng.normal(0, np.sqrt(1 - a2 * a2))
+        X = np.column_stack([f1, f2, rng.normal(0, 1e-6, n), rng.normal(0, 1e-6, n)])
+
+        result_1 = compute_tica_combined(X, lag=5, n_components=1)
+        result_2 = compute_tica_combined(X, lag=5, n_components=2)
+
+        # n_components=1 must reduce to "tIC1 alone": dominated by the slow feature.
+        assert abs(result_1.weights[0]) > abs(result_1.weights[1])
+
+        # n_components=2 must pull in the second (faster) axis -- not identical to tIC1 alone.
+        assert abs(result_2.weights[1]) > 1e-3
+        a, b = result_1.weights, result_2.weights
+        cos_sim = abs(float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))))
+        assert cos_sim < 0.999
+
+        # Combining can only match or reduce tIC1-alone autocorrelation (weighted
+        # average of the selected eigenvalues, weighted by eigenvalue itself).
+        assert result_2.eigenvalue < result_1.eigenvalue
+
+    def test_out_of_range_raises(self):
+        X = _multi_slow_mode_dataset(n_features=3, n_frames=300, seed=7)
+        with pytest.raises(ValueError, match=r"n_components must be in 1\.\.3"):
+            compute_tica_combined(X, lag=5, n_components=4)
+
+    def test_projectable_with_project_tica1(self):
+        X = _multi_slow_mode_dataset(n_features=4, n_frames=500, seed=8)
+        result = compute_tica_combined(X, lag=5, n_components=3)
+        proj_a = (X - result.mean) @ result.weights
+        proj_b = project_tica1(X, result)
+        np.testing.assert_allclose(proj_a, proj_b, atol=1e-9)
+
+    def test_sign_continuity_respected(self):
+        X = _multi_slow_mode_dataset(n_features=4, n_frames=500, seed=9)
+        r1 = compute_tica_combined(X, lag=5, n_components=2)
+        r1_flipped = TICAResult(
+            weights=-r1.weights, eigenvalue=r1.eigenvalue, mean=r1.mean,
+            offset=-r1.offset, lag=r1.lag,
+            phi_torsion_indices=r1.phi_torsion_indices,
+            psi_torsion_indices=r1.psi_torsion_indices,
+            n_samples=r1.n_samples, sign_ref=-r1.weights,
+        )
+        r2 = compute_tica_combined(X, lag=5, n_components=2, previous_result=r1_flipped)
+        assert float(np.dot(r2.weights, r1_flipped.weights)) > 0
+
+
+class TestComputeCombinedTicaFromEpochObs:
+    def test_n_components_one_matches_plain_wrapper(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            epoch_dir = Path(tmp) / "epoch_000"
+            tica_dir = epoch_dir / "tica_obs"
+            tica_dir.mkdir(parents=True)
+            rng = np.random.default_rng(11)
+            slow = np.cumsum(rng.normal(0, 0.1, 300))
+            fast = rng.normal(0, 1, 300)
+            X = np.column_stack([slow, fast])
+            np.savez_compressed(
+                tica_dir / "dihedral_obs_000.npz",
+                features=X,
+                steps=np.arange(300, dtype=np.int64),
+                window=np.zeros(300, dtype=np.int64),
+            )
+            phi = [(0, 1, 2, 3)]
+            psi = [(2, 3, 4, 5)]
+            plain = compute_tica_from_epoch_obs(epoch_dir, 5, phi, psi)
+            combined = compute_combined_tica_from_epoch_obs(epoch_dir, 5, 1, phi, psi)
+            np.testing.assert_array_equal(combined.weights, plain.weights)
 
 
 # ---------------------------------------------------------------------------

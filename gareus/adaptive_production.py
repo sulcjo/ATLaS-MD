@@ -1748,7 +1748,7 @@ def _maybe_update_tica_cvaux(epoch: int, epoch_dir: Path, adaptive_dir: Path, ar
 
     lag = int(getattr(args, "tica_lag_frames", 50) or 50)
     try:
-        from .tica import compute_tica_from_epoch_obs, load_epoch_dihedral_obs, window_tica_centers, TICAResult  # noqa: F401 – all used below
+        from .tica import compute_combined_tica_from_epoch_obs, load_epoch_dihedral_obs, window_tica_centers, TICAResult  # noqa: F401 – all used below
     except ImportError as exc:
         print(f"    tICA: import failed ({exc}); skipping update")
         return {"status": "skipped_import_error", "error": str(exc)}
@@ -1788,9 +1788,10 @@ def _maybe_update_tica_cvaux(epoch: int, epoch_dir: Path, adaptive_dir: Path, ar
         except Exception as _mw_exc:
             print(f"    tICA: MBAR weight computation failed ({_mw_exc}); using unweighted tICA")
 
+    tica_n_components = int(getattr(args, "tica_component_count", 1) or 1)
     try:
-        result = compute_tica_from_epoch_obs(
-            epoch_dir, lag, phi_indices, psi_indices,
+        result = compute_combined_tica_from_epoch_obs(
+            epoch_dir, lag, tica_n_components, phi_indices, psi_indices,
             previous_result=prev_result, weights=mbar_weights,
         )
     except Exception as exc:
@@ -1807,7 +1808,8 @@ def _maybe_update_tica_cvaux(epoch: int, epoch_dir: Path, adaptive_dir: Path, ar
 
     state_path = adaptive_dir / "tica_state.json"
     result.save(state_path)
-    print(f"    tICA: fitted from epoch {epoch} ({result.n_samples} samples, eigenvalue {result.eigenvalue:.4f}) -> {state_path}")
+    _n_comp_note = f", combining top {tica_n_components} components" if tica_n_components > 1 else ""
+    print(f"    tICA: fitted from epoch {epoch} ({result.n_samples} samples, eigenvalue {result.eigenvalue:.4f}{_n_comp_note}) -> {state_path}")
 
     # Compute per-window tIC1 medians for registry secondary_center update.
     per_window_centers: Dict[int, float] = {}
@@ -1827,6 +1829,7 @@ def _maybe_update_tica_cvaux(epoch: int, epoch_dir: Path, adaptive_dir: Path, ar
         "eigenvalue": float(result.eigenvalue),
         "n_samples": int(result.n_samples),
         "lag_frames": int(lag),
+        "n_components": int(tica_n_components),
         "state_file": str(state_path),
         "version": version_tag,
         "mbar_reweighted": mbar_reweighted,
