@@ -506,6 +506,11 @@ def _add_tica_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--tica-linear-k-max", type=float, default=50.0, dest="tica_linear_k_max",
                    help="cv2_k_max applied immediately after the tica-linear CV2 switch "
                         "(default 50.0 kcal/mol).")
+    p.add_argument("--tica-component-count", type=int, default=1, dest="tica_component_count",
+                   help="Number of top tICA modes to combine (eigenvalue-weighted, "
+                        "1..N by slowness rank) into the single cv2=tica-linear direction "
+                        "each time tICA is (re)fit. 1 means tIC1 alone (default, unchanged "
+                        "behavior).")
     p.add_argument("--bootstrap-torsion-source", default="seeds",
                    choices=["seeds"],
                    help="Source ensemble for cv2=torsion-pca bootstrap model.")

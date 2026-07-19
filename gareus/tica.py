@@ -23,12 +23,14 @@ __all__ = [
     "compute_bootstrap_torsion_pca",
     "compute_tica",
     "compute_tica_components",
+    "compute_tica_combined",
     "project_tica1",
     "window_tica_centers",
     "tica_k_from_spread",
     "DihedralObsBuffer",
     "load_epoch_dihedral_obs",
     "compute_tica_from_epoch_obs",
+    "compute_combined_tica_from_epoch_obs",
 ]
 
 # ---------------------------------------------------------------------------
@@ -566,6 +568,116 @@ def compute_tica_components(
     return results
 
 
+def compute_tica_combined(
+    X: np.ndarray,
+    lag: int,
+    n_components: int = 1,
+    *,
+    phi_torsion_indices: Optional[List] = None,
+    psi_torsion_indices: Optional[List] = None,
+    previous_result: Optional[TICAResult] = None,
+    epsilon: float = 1e-10,
+    weights: Optional[np.ndarray] = None,
+    segments: Optional[np.ndarray] = None,
+) -> TICAResult:
+    """Fit tICA and combine the top ``n_components`` modes into one CV2 direction.
+
+    Mirrors :func:`compute_bootstrap_torsion_pca`'s ``component``-as-count
+    semantics: the top ``n_components`` tICA eigenvectors (ranked by
+    eigenvalue, i.e. by slowness rather than variance) are combined into a
+    single direction via an eigenvalue-weighted linear combination
+    (coefficient_i = sqrt(eigenvalue_i)), then renormalized under the C(0)
+    inner product -- the metric tICA eigenvectors are themselves orthonormal
+    under (PCA's combination renormalizes under plain L2 instead, since SVD
+    right-singular-vectors are already L2-orthonormal; this is the same idea
+    adapted to tICA's natural metric). ``n_components=1`` delegates directly
+    to :func:`compute_tica` (bit-for-bit identical output), since a single
+    positive scalar coefficient never changes a normalized direction's
+    identity -- fully backward compatible with the pre-existing single-mode
+    behavior.
+
+    CV2 stays a single scalar restraint either way -- this only lets that one
+    restraint draw on more than tIC1 alone (e.g. a slow mode that tIC1's own
+    ranking doesn't fully capture).
+
+    Returns
+    -------
+    TICAResult
+        ``eigenvalue`` is the *combined* direction's own autocorrelation
+        (v^T C(tau) v, re-derived after combining -- not just tIC1's raw
+        eigenvalue), mirroring how compute_bootstrap_torsion_pca re-derives
+        the combined direction's actual explained variance.
+
+    Raises
+    ------
+    ValueError
+        If ``n_components`` is not in ``1..d`` (feature count), mirroring
+        compute_bootstrap_torsion_pca's explicit bounds check.
+    """
+    lag = int(lag)
+    if int(n_components) <= 1:
+        return compute_tica(
+            X, lag,
+            phi_torsion_indices=phi_torsion_indices,
+            psi_torsion_indices=psi_torsion_indices,
+            previous_result=previous_result,
+            epsilon=epsilon,
+            weights=weights,
+            segments=segments,
+        )
+
+    C0, Ctau, mean, d = _tica_covariance_matrices(
+        X, lag, epsilon=epsilon, weights=weights, segments=segments
+    )
+    if int(n_components) > d:
+        raise ValueError(f"n_components must be in 1..{d}, got {n_components}")
+
+    eigenvalues, eigenvectors = _tica_generalized_eigh(C0, Ctau, d, n_keep=int(n_components))
+    order = np.argsort(eigenvalues)[::-1]
+
+    combined = np.zeros(d, dtype=np.float64)
+    for idx in order:
+        v = eigenvectors[:, idx].copy()
+        norm_sq = float(v @ C0 @ v)
+        if norm_sq > 0.0:
+            v /= np.sqrt(norm_sq)
+        coeff = np.sqrt(max(float(eigenvalues[idx]), 0.0))
+        combined += coeff * v
+
+    comb_norm_sq = float(combined @ C0 @ combined)
+    if comb_norm_sq <= float(epsilon):
+        raise ValueError("zero combined tICA component norm")
+    combined /= np.sqrt(comb_norm_sq)
+
+    # Honest eigenvalue for the *combined* direction, mirroring PCA's
+    # re-derived explained-variance step -- not just the top component's own
+    # eigenvalue (combining can only match or reduce tIC1-alone autocorrelation).
+    combined_eigenvalue = float(combined @ Ctau @ combined)
+
+    if previous_result is not None and previous_result.weights is not None:
+        ref = previous_result.sign_ref if previous_result.sign_ref is not None else previous_result.weights
+        if float(np.dot(combined, ref)) < 0.0:
+            combined = -combined
+    else:
+        pivot = int(np.argmax(np.abs(combined)))
+        if combined[pivot] < 0.0:
+            combined = -combined
+
+    offset = float(-mean @ combined)
+    return TICAResult(
+        weights=combined,
+        eigenvalue=combined_eigenvalue,
+        mean=mean,
+        offset=offset,
+        lag=lag,
+        phi_torsion_indices=list(phi_torsion_indices or []),
+        psi_torsion_indices=list(psi_torsion_indices or []),
+        n_samples=X.shape[0],
+        method="tica",
+        sign_ref=combined.copy(),
+    )
+
+
 def compute_bootstrap_torsion_pca(
     X: np.ndarray,
     cv1: Optional[np.ndarray] = None,
@@ -977,6 +1089,53 @@ def compute_tica_from_epoch_obs(
     return compute_tica(
         X,
         lag_frames,
+        phi_torsion_indices=phi_torsion_indices,
+        psi_torsion_indices=psi_torsion_indices,
+        previous_result=previous_result,
+        weights=weights,
+        segments=segment_lengths,
+    )
+
+
+def compute_combined_tica_from_epoch_obs(
+    epoch_dir,
+    lag_frames: int,
+    n_components: int,
+    phi_torsion_indices: List[Tuple[int, int, int, int]],
+    psi_torsion_indices: List[Tuple[int, int, int, int]],
+    *,
+    previous_result: Optional[TICAResult] = None,
+    weights: Optional[np.ndarray] = None,
+) -> TICAResult:
+    """Fit combined multi-component tICA from all dihedral observations in an epoch.
+
+    Convenience wrapper around :func:`load_epoch_dihedral_obs` +
+    :func:`compute_tica_combined`, mirroring
+    :func:`compute_tica_from_epoch_obs`. ``n_components=1`` reproduces
+    :func:`compute_tica_from_epoch_obs` exactly.
+
+    Parameters
+    ----------
+    epoch_dir : path-like
+    lag_frames : int
+    n_components : int
+        Count of top tICA modes (by eigenvalue) to combine into CV2's
+        direction. 1 = tIC1 alone (backward compatible default).
+    phi_torsion_indices, psi_torsion_indices : torsion atom-index lists
+    previous_result : TICAResult, optional
+        Used for sign-continuity check across epochs.
+    weights : np.ndarray, shape (n_samples,), optional
+        Importance weights per frame (e.g. MBAR weights).
+
+    Returns
+    -------
+    TICAResult
+    """
+    X, _, _, _, segment_lengths = load_epoch_dihedral_obs(epoch_dir)
+    return compute_tica_combined(
+        X,
+        lag_frames,
+        n_components,
         phi_torsion_indices=phi_torsion_indices,
         psi_torsion_indices=psi_torsion_indices,
         previous_result=previous_result,
