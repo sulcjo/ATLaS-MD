@@ -10,6 +10,7 @@ from gareus.tica import (
     TICAResult,
     backbone_dihedral_features,
     compute_tica,
+    compute_tica_components,
     compute_tica_from_epoch_obs,
     load_epoch_dihedral_obs,
     project_tica1,
@@ -44,6 +45,24 @@ def _slow_mode_dataset(n_frames: int = 400, lag: int = 5, seed: int = 0):
         slow[t] = 0.99 * slow[t - 1] + rng.normal(0, 0.14)
     fast = rng.normal(0, 1, n_frames)
     return np.column_stack([slow, fast])
+
+
+def _multi_slow_mode_dataset(n_features: int = 5, n_frames: int = 800, seed: int = 0):
+    """AR(1) features with strictly decreasing persistence (feature 0 slowest).
+
+    Each feature is an independent AR(1) process with a distinct decay
+    constant, so the true tICA ranking is unambiguous: feature i is always
+    slower than feature i+1, giving ``compute_tica_components`` a dataset
+    where "top-N components" has one clear right answer to check against.
+    """
+    rng = np.random.default_rng(seed)
+    decays = np.linspace(0.97, 0.5, n_features)  # feature 0 slowest, last fastest
+    X = np.zeros((n_frames, n_features))
+    for j, a in enumerate(decays):
+        noise_sd = np.sqrt(1.0 - a * a)  # keeps each feature's stationary variance ~1
+        for t in range(1, n_frames):
+            X[t, j] = a * X[t - 1, j] + rng.normal(0, noise_sd)
+    return X
 
 
 def _hand_tica_reference(X, lag, seg_lengths, weights=None, epsilon=1e-10):
@@ -234,6 +253,84 @@ class TestComputeTICA:
         assert abs(result.weights[0]) > abs(result.weights[1]), (
             "weighted tICA should still find slow feature as dominant mode"
         )
+
+
+# ---------------------------------------------------------------------------
+# compute_tica_components (multi-component, analysis-only sibling of compute_tica)
+# ---------------------------------------------------------------------------
+
+class TestComputeTicaComponents:
+    def test_returns_requested_component_count(self):
+        X = _multi_slow_mode_dataset(n_features=5, n_frames=600)
+        results = compute_tica_components(X, lag=5, n_components=3)
+        assert len(results) == 3
+
+    def test_clamps_to_feature_dimensionality(self):
+        X = _multi_slow_mode_dataset(n_features=4, n_frames=600)
+        results = compute_tica_components(X, lag=5, n_components=10)
+        assert len(results) == 4
+
+    def test_eigenvalues_descending(self):
+        X = _multi_slow_mode_dataset(n_features=5, n_frames=800)
+        results = compute_tica_components(X, lag=5, n_components=5)
+        eigenvalues = [r.eigenvalue for r in results]
+        assert eigenvalues == sorted(eigenvalues, reverse=True)
+
+    def test_top_component_matches_single_component_fit(self):
+        """tIC1 from compute_tica_components must agree with compute_tica itself."""
+        X = _multi_slow_mode_dataset(n_features=5, n_frames=800, seed=1)
+        single = compute_tica(X, lag=5)
+        multi = compute_tica_components(X, lag=5, n_components=3)
+        assert multi[0].eigenvalue == pytest.approx(single.eigenvalue, abs=1e-8)
+        # Sign conventions differ (pivot-based vs unconstrained) -- compare direction.
+        # weights are C(0)-normalised, not L2-unit, so normalise by L2 norm before
+        # reading the dot product as a cosine similarity.
+        a, b = multi[0].weights, single.weights
+        cos_sim = float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+        assert abs(cos_sim) == pytest.approx(1.0, abs=1e-6)
+
+    def test_recovers_known_slow_to_fast_ranking(self):
+        """Feature 0 is the slowest AR(1) process by construction; tIC1 should
+        load on it most heavily among the top components."""
+        X = _multi_slow_mode_dataset(n_features=5, n_frames=1000, seed=2)
+        results = compute_tica_components(X, lag=5, n_components=5)
+        tic1_weights = np.abs(results[0].weights)
+        assert int(np.argmax(tic1_weights)) == 0
+
+    def test_components_are_c0_orthogonal(self):
+        """Generalised eigenvectors of a symmetric problem are C(0)-orthogonal."""
+        X = _multi_slow_mode_dataset(n_features=5, n_frames=800, seed=3)
+        results = compute_tica_components(X, lag=5, n_components=5)
+        from gareus.tica import _tica_covariance_matrices
+        C0, _, _, _ = _tica_covariance_matrices(X, lag=5)
+        for i in range(len(results)):
+            for j in range(i + 1, len(results)):
+                cross = float(results[i].weights @ C0 @ results[j].weights)
+                assert abs(cross) < 1e-6
+
+    def test_each_component_projectable_with_project_tica1(self):
+        X = _multi_slow_mode_dataset(n_features=5, n_frames=600, seed=4)
+        results = compute_tica_components(X, lag=5, n_components=3)
+        for r in results:
+            proj_a = (X - r.mean) @ r.weights
+            proj_b = project_tica1(X, r)
+            np.testing.assert_allclose(proj_a, proj_b, atol=1e-9)
+
+    def test_rejects_lag_zero(self):
+        X = _multi_slow_mode_dataset(n_features=3, n_frames=200)
+        with pytest.raises(ValueError):
+            compute_tica_components(X, lag=0, n_components=2)
+
+    def test_stores_torsion_indices_on_every_component(self):
+        X = _multi_slow_mode_dataset(n_features=3, n_frames=300)
+        phi = [(0, 1, 2, 3)]
+        psi = [(2, 3, 4, 5)]
+        results = compute_tica_components(
+            X, lag=5, n_components=2, phi_torsion_indices=phi, psi_torsion_indices=psi
+        )
+        for r in results:
+            assert r.phi_torsion_indices == phi
+            assert r.psi_torsion_indices == psi
 
 
 # ---------------------------------------------------------------------------

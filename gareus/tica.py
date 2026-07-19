@@ -22,6 +22,7 @@ __all__ = [
     "backbone_dihedral_features",
     "compute_bootstrap_torsion_pca",
     "compute_tica",
+    "compute_tica_components",
     "project_tica1",
     "window_tica_centers",
     "tica_k_from_spread",
@@ -289,57 +290,26 @@ def _segment_lagged_pair_indices(lengths: np.ndarray, lag: int) -> Tuple[np.ndar
     return left, right
 
 
-def compute_tica(
+def _tica_covariance_matrices(
     X: np.ndarray,
     lag: int,
     *,
-    phi_torsion_indices: Optional[List] = None,
-    psi_torsion_indices: Optional[List] = None,
-    previous_result: Optional[TICAResult] = None,
     epsilon: float = 1e-10,
     weights: Optional[np.ndarray] = None,
     segments: Optional[np.ndarray] = None,
-) -> TICAResult:
-    """Fit a tICA model to feature matrix X and return the slowest mode.
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """Build the C(0)/C(tau) lagged-covariance pair shared by every tICA fit.
 
-    Solves the generalised eigenvalue problem:
-        C(tau) @ v = lambda * C(0) @ v
-
-    Parameters
-    ----------
-    X : np.ndarray, shape (n_samples, n_features)
-        Row-major feature matrix.
-    lag : int > 0
-        Time lag in frames.
-    phi_torsion_indices, psi_torsion_indices : lists, optional
-        Stored on the returned TICAResult for downstream force-building.
-    previous_result : TICAResult, optional
-        If given, enforce sign continuity (flip eigenvector if the new one
-        anti-correlates with the previous weight vector).
-    epsilon : float
-        Small regularisation added to C(0) diagonal for numerical stability.
-    weights : np.ndarray, shape (n_samples,), optional
-        Importance weights for each frame (e.g. MBAR weights to reweight
-        the biased REUS ensemble to the unbiased equilibrium distribution).
-        Must be non-negative; are normalised internally to sum to 1.
-        When None, standard unweighted tICA is used.
-    segments : np.ndarray or list, optional
-        Trajectory-segment boundaries within the concatenated ``X`` (e.g.
-        one segment per replica trajectory file). Either a 1-D array of
-        segment lengths (summing to ``n_samples``) or a per-frame
-        segment-id array of length ``n_samples`` (each id must occupy one
-        contiguous run). When given, lagged pairs ``(x_t, x_{t+lag})`` are
-        built ONLY within each segment — pairs never cross a segment
-        boundary, so a join between two different replica trajectories
-        cannot masquerade as a real transition in C(tau).  A segment with
-        length <= lag contributes zero pairs. When ``None`` (default), the
-        whole array is treated as a single segment, reproducing the
-        previous (pre-fix) behaviour exactly.
+    Extracted so the single-component (production) and multi-component
+    (analysis-only) fitters can never diverge in how C(0)/C(tau) are
+    estimated — only in how many eigenpairs each one keeps afterward.
 
     Returns
     -------
-    TICAResult
-        The fitted model for tIC1 (slowest mode).
+    C0, Ctau : np.ndarray, shape (d, d)
+    mean : np.ndarray, shape (d,)
+    d : int
+        Feature dimensionality.
 
     Raises
     ------
@@ -410,10 +380,19 @@ def compute_tica(
         # Symmetric weighted C(tau): symmetrise to enforce time-reversibility
         Ctau = 0.5 * ((Xl.T * w_pairs) @ Xr + (Xr.T * w_pairs) @ Xl)
 
-    # Generalised eigenvalue problem via scipy, numpy fallback
+    return C0, Ctau, mean, d
+
+
+def _tica_generalized_eigh(C0: np.ndarray, Ctau: np.ndarray, d: int, n_keep: int):
+    """Solve C(tau) v = lambda C(0) v, returning the top ``n_keep`` pairs.
+
+    Returned eigenvalues/eigenvectors are NOT guaranteed sorted descending
+    (mirrors scipy's ``subset_by_index`` contract, which returns ascending
+    order) — callers must sort/select by eigenvalue themselves.
+    """
     try:
         from scipy.linalg import eigh as scipy_eigh
-        eigenvalues, eigenvectors = scipy_eigh(Ctau, C0, subset_by_index=[d - 1, d - 1])
+        return scipy_eigh(Ctau, C0, subset_by_index=[d - n_keep, d - 1])
     except Exception:
         # Numpy fallback: transform generalized to standard EVP via Cholesky.
         # C0 = L@L.T → A = L^{-1}@Ctau@L^{-T} has same spectrum; eigvecs transform back.
@@ -423,6 +402,74 @@ def compute_tica(
         A = 0.5 * (A + A.T)
         eigenvalues, eigvec_u = np.linalg.eigh(A)
         eigenvectors = L_inv.T @ eigvec_u
+        return eigenvalues, eigenvectors
+
+
+def compute_tica(
+    X: np.ndarray,
+    lag: int,
+    *,
+    phi_torsion_indices: Optional[List] = None,
+    psi_torsion_indices: Optional[List] = None,
+    previous_result: Optional[TICAResult] = None,
+    epsilon: float = 1e-10,
+    weights: Optional[np.ndarray] = None,
+    segments: Optional[np.ndarray] = None,
+) -> TICAResult:
+    """Fit a tICA model to feature matrix X and return the slowest mode.
+
+    Solves the generalised eigenvalue problem:
+        C(tau) @ v = lambda * C(0) @ v
+
+    Parameters
+    ----------
+    X : np.ndarray, shape (n_samples, n_features)
+        Row-major feature matrix.
+    lag : int > 0
+        Time lag in frames.
+    phi_torsion_indices, psi_torsion_indices : lists, optional
+        Stored on the returned TICAResult for downstream force-building.
+    previous_result : TICAResult, optional
+        If given, enforce sign continuity (flip eigenvector if the new one
+        anti-correlates with the previous weight vector).
+    epsilon : float
+        Small regularisation added to C(0) diagonal for numerical stability.
+    weights : np.ndarray, shape (n_samples,), optional
+        Importance weights for each frame (e.g. MBAR weights to reweight
+        the biased REUS ensemble to the unbiased equilibrium distribution).
+        Must be non-negative; are normalised internally to sum to 1.
+        When None, standard unweighted tICA is used.
+    segments : np.ndarray or list, optional
+        Trajectory-segment boundaries within the concatenated ``X`` (e.g.
+        one segment per replica trajectory file). Either a 1-D array of
+        segment lengths (summing to ``n_samples``) or a per-frame
+        segment-id array of length ``n_samples`` (each id must occupy one
+        contiguous run). When given, lagged pairs ``(x_t, x_{t+lag})`` are
+        built ONLY within each segment — pairs never cross a segment
+        boundary, so a join between two different replica trajectories
+        cannot masquerade as a real transition in C(tau).  A segment with
+        length <= lag contributes zero pairs. When ``None`` (default), the
+        whole array is treated as a single segment, reproducing the
+        previous (pre-fix) behaviour exactly.
+
+    Returns
+    -------
+    TICAResult
+        The fitted model for tIC1 (slowest mode).
+
+    Raises
+    ------
+    ValueError
+        If ``lag`` is not positive, X has fewer rows than 2*lag, or no
+        segment has more than ``lag`` frames (zero valid within-segment
+        lagged pairs).
+    """
+    lag = int(lag)
+    C0, Ctau, mean, d = _tica_covariance_matrices(
+        X, lag, epsilon=epsilon, weights=weights, segments=segments
+    )
+
+    eigenvalues, eigenvectors = _tica_generalized_eigh(C0, Ctau, d, n_keep=1)
 
     idx = int(np.argmax(eigenvalues))
     v = eigenvectors[:, idx].copy()
@@ -448,10 +495,75 @@ def compute_tica(
         lag=lag,
         phi_torsion_indices=list(phi_torsion_indices or []),
         psi_torsion_indices=list(psi_torsion_indices or []),
-        n_samples=n,
+        n_samples=X.shape[0],
         method="tica",
         sign_ref=v.copy(),
     )
+
+
+def compute_tica_components(
+    X: np.ndarray,
+    lag: int,
+    n_components: int = 5,
+    *,
+    phi_torsion_indices: Optional[List] = None,
+    psi_torsion_indices: Optional[List] = None,
+    epsilon: float = 1e-10,
+    weights: Optional[np.ndarray] = None,
+    segments: Optional[np.ndarray] = None,
+) -> List[TICAResult]:
+    """Fit tICA and return the top ``n_components`` modes, not just tIC1.
+
+    Analysis-only sibling of :func:`compute_tica` — same C(0)/C(tau)
+    estimate (via :func:`_tica_covariance_matrices`), but keeps the top
+    ``n_components`` eigenpairs instead of discarding all but the slowest.
+    The live GaMD/REUS runtime CV force always uses :func:`compute_tica`'s
+    single tIC1 result; this function exists for offline multi-component
+    analysis (e.g. per-component pseudo-trajectory sweeps) and does not
+    change production behaviour.
+
+    Returns
+    -------
+    list of TICAResult, ordered by descending eigenvalue (tIC1 first).
+    """
+    lag = int(lag)
+    C0, Ctau, mean, d = _tica_covariance_matrices(
+        X, lag, epsilon=epsilon, weights=weights, segments=segments
+    )
+    n_components = max(1, min(int(n_components), d))
+    eigenvalues, eigenvectors = _tica_generalized_eigh(C0, Ctau, d, n_keep=n_components)
+
+    order = np.argsort(eigenvalues)[::-1]
+    results: List[TICAResult] = []
+    for idx in order:
+        v = eigenvectors[:, idx].copy()
+        ev = float(eigenvalues[idx])
+
+        norm_sq = float(v @ C0 @ v)
+        if norm_sq > 0.0:
+            v /= np.sqrt(norm_sq)
+
+        # Canonical sign per component: largest-magnitude coefficient positive
+        # (matches compute_bootstrap_torsion_pca's convention; there is no
+        # cross-epoch "previous_result" to chain sign continuity against here).
+        pivot = int(np.argmax(np.abs(v)))
+        if v[pivot] < 0.0:
+            v = -v
+
+        offset = float(-mean @ v)
+        results.append(TICAResult(
+            weights=v,
+            eigenvalue=ev,
+            mean=mean,
+            offset=offset,
+            lag=lag,
+            phi_torsion_indices=list(phi_torsion_indices or []),
+            psi_torsion_indices=list(psi_torsion_indices or []),
+            n_samples=X.shape[0],
+            method="tica",
+            sign_ref=v.copy(),
+        ))
+    return results
 
 
 def compute_bootstrap_torsion_pca(
