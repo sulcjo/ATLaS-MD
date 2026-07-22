@@ -3623,6 +3623,40 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         # otherwise fail at clCreateContext(-6) even before the first replica.
         release_openmm_contexts()
 
+    class _ReplicaAffinityExecutor:
+        """One dedicated single-thread worker per replica, for the replica's
+        entire lifetime (Context construction through every later step()).
+
+        A plain ThreadPoolExecutor does not guarantee which worker thread
+        picks up which task across separate .map()/.submit() calls, so a
+        replica's CUDA Context built during replica_construction (main
+        thread, sequential) could get its first step() dispatched from a
+        different OS thread by the production step pool. Concurrent
+        first-touch of many CUDA contexts across threads is a driver-level
+        segfault hazard - matches a SIGSEGV firing the instant after
+        replica_construction hit N/N, invariant across CUDA_LAUNCH_BLOCKING
+        and MPS toggles. Pinning each replica to one thread for good removes
+        the hazard; interface mirrors ThreadPoolExecutor.map/.shutdown so
+        call sites below are unchanged.
+        """
+
+        def __init__(self, n):
+            self._pools = [ThreadPoolExecutor(max_workers=1) for _ in range(n)]
+
+        def submit(self, replica_index, fn, *args, **kwargs):
+            return self._pools[replica_index].submit(fn, *args, **kwargs)
+
+        def map(self, fn, items):
+            items = list(items)
+            futures = [self._pools[i].submit(fn, item) for i, item in enumerate(items)]
+            return [f.result() for f in futures]
+
+        def shutdown(self, wait=True):
+            for p in self._pools:
+                p.shutdown(wait=wait)
+
+    _sim_pool = _ReplicaAffinityExecutor(nrep)
+
     sims = []
     assignments = list(range(nrep))
     traj_dir = out_dir / "replica_trajectories"
@@ -3668,44 +3702,66 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         copied_globals, skipped_globals = {}, {}
         loaded_shared_gamd_checkpoint = False
         props_i = replica_platform_properties(platform, props, args, i)
-        try:
-            sim_i = app.Simulation(topology, system_i, integrator_i, platform, props_i)
-        except Exception as exc:
-            # Context construction can fail transiently if Python still holds old
-            # OpenMM contexts from setup/pulling phases.  Force a collection and
-            # retry once before surfacing a targeted diagnostic.
-            release_openmm_contexts()
+
+        def _build_context_i():
+            # Runs entirely on replica i's dedicated _sim_pool thread: Context
+            # construction and every context-touching call below must happen on
+            # the same OS thread that will later step() this replica, so the
+            # CUDA driver never has to migrate a Context to a different thread
+            # on first use (see _ReplicaAffinityExecutor docstring above).
             try:
                 sim_i = app.Simulation(topology, system_i, integrator_i, platform, props_i)
-            except Exception as exc2:
-                platform_name = str(platform.getName()) if platform is not None else str(getattr(args, "platform", "auto"))
-                raise RuntimeError(
-                    f"Failed to initialize OpenMM context for replica {i}/{nrep} on platform {platform_name}: {exc2}. "
-                    "If this is OpenCL clCreateContext(-6), the driver could not allocate host/platform resources. "
-                    "Use --platform CUDA when available, reduce the number of adaptive windows/replicas, split devices with --device-index, "
-                    "or force --platform CPU for a small debugging run. Also start from a fresh output directory after this failure."
-                ) from exc2
-        if use_gamd and not fast_resume and shared_gamd_context_checkpoint is not None:
-            try:
-                # Loading the calibrated shared Context checkpoint preserves the
-                # gamd-openmm native stage/step state in addition to readable
-                # CustomIntegrator globals.  We overwrite coordinates, velocities,
-                # and umbrella parameters below, so only the GaMD setup state is reused.
-                sim_i.context.loadCheckpoint(shared_gamd_context_checkpoint)
-                loaded_shared_gamd_checkpoint = True
-            except Exception as exc:
-                skipped_globals["<shared_context_checkpoint>"] = f"load failed; falling back to CustomIntegrator globals only: {exc}"
-        if use_gamd and not fast_resume:
-            # Always copy calibrated globals from the dict regardless of whether the
-            # checkpoint loaded.  loadCheckpoint() can silently succeed without
-            # actually restoring CustomIntegrator globals (e.g. cross-platform or
-            # cross-context mismatch), leaving Vmax/Vmin/k0/ForceScalingFactor at
-            # zero/default and causing NaN forces at step 0.  The dict copy is
-            # authoritative for calibration outputs; the checkpoint provides the
-            # opaque GaMD binary stage state as a bonus.
-            if shared_gamd_globals_all:
-                copied_globals, copied_skipped = set_integrator_globals_from_dict(integrator_i, shared_gamd_globals_all)
-                skipped_globals.update({k: v for k, v in copied_skipped.items() if k not in skipped_globals})
+            except Exception:
+                # Context construction can fail transiently if Python still holds old
+                # OpenMM contexts from setup/pulling phases.  Force a collection and
+                # retry once before surfacing a targeted diagnostic.
+                release_openmm_contexts()
+                try:
+                    sim_i = app.Simulation(topology, system_i, integrator_i, platform, props_i)
+                except Exception as exc2:
+                    platform_name = str(platform.getName()) if platform is not None else str(getattr(args, "platform", "auto"))
+                    raise RuntimeError(
+                        f"Failed to initialize OpenMM context for replica {i}/{nrep} on platform {platform_name}: {exc2}. "
+                        "If this is OpenCL clCreateContext(-6), the driver could not allocate host/platform resources. "
+                        "Use --platform CUDA when available, reduce the number of adaptive windows/replicas, split devices with --device-index, "
+                        "or force --platform CPU for a small debugging run. Also start from a fresh output directory after this failure."
+                    ) from exc2
+            loaded_checkpoint = False
+            copied, skipped = {}, {}
+            if use_gamd and not fast_resume and shared_gamd_context_checkpoint is not None:
+                try:
+                    # Loading the calibrated shared Context checkpoint preserves the
+                    # gamd-openmm native stage/step state in addition to readable
+                    # CustomIntegrator globals.  We overwrite coordinates, velocities,
+                    # and umbrella parameters below, so only the GaMD setup state is reused.
+                    sim_i.context.loadCheckpoint(shared_gamd_context_checkpoint)
+                    loaded_checkpoint = True
+                except Exception as exc:
+                    skipped["<shared_context_checkpoint>"] = f"load failed; falling back to CustomIntegrator globals only: {exc}"
+            if use_gamd and not fast_resume:
+                # Always copy calibrated globals from the dict regardless of whether the
+                # checkpoint loaded.  loadCheckpoint() can silently succeed without
+                # actually restoring CustomIntegrator globals (e.g. cross-platform or
+                # cross-context mismatch), leaving Vmax/Vmin/k0/ForceScalingFactor at
+                # zero/default and causing NaN forces at step 0.  The dict copy is
+                # authoritative for calibration outputs; the checkpoint provides the
+                # opaque GaMD binary stage state as a bonus.
+                if shared_gamd_globals_all:
+                    copied, copied_skipped = set_integrator_globals_from_dict(integrator_i, shared_gamd_globals_all)
+                    skipped.update({k: v for k, v in copied_skipped.items() if k not in skipped})
+            if not fast_resume:
+                sim_i.context.setPeriodicBoxVectors(*box)
+                start_pos = window_start_positions[i] if i < len(window_start_positions) and window_start_positions[i] is not None else pos
+                start_vel = window_start_velocities[i] if i < len(window_start_velocities) and window_start_velocities[i] is not None else vel
+                sim_i.context.setPositions(start_pos)
+                if args.randomize_replica_velocities:
+                    sim_i.context.setVelocitiesToTemperature(args.temperature_k * unit.kelvin, args.seed + i + 17)
+                else:
+                    sim_i.context.setVelocities(start_vel)
+                set_window(sim_i.context, centers_nm, ks_kj_nm2, i, secondary_cv_centers, secondary_cv_ks_kj)
+            return sim_i, loaded_checkpoint, copied, skipped
+
+        sim_i, loaded_shared_gamd_checkpoint, copied_globals, skipped_globals = _sim_pool.submit(i, _build_context_i).result()
         replica_gamd_copy_report.append({
             "replica": int(i),
             "copied_count": int(len(copied_globals)),
@@ -3715,16 +3771,6 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             "loaded_from_context_checkpoint": bool(fast_resume),
             "loaded_from_shared_gamd_setup_checkpoint": bool(loaded_shared_gamd_checkpoint),
         })
-        if not fast_resume:
-            sim_i.context.setPeriodicBoxVectors(*box)
-            start_pos = window_start_positions[i] if i < len(window_start_positions) and window_start_positions[i] is not None else pos
-            start_vel = window_start_velocities[i] if i < len(window_start_velocities) and window_start_velocities[i] is not None else vel
-            sim_i.context.setPositions(start_pos)
-            if args.randomize_replica_velocities:
-                sim_i.context.setVelocitiesToTemperature(args.temperature_k * unit.kelvin, args.seed + i + 17)
-            else:
-                sim_i.context.setVelocities(start_vel)
-            set_window(sim_i.context, centers_nm, ks_kj_nm2, i, secondary_cv_centers, secondary_cv_ks_kj)
         if effective_traj_interval > 0 and not bool(getattr(args, "resume", False)):
             reporter = make_trajectory_reporter(app, traj_dir / f"replica_{i:03d}", effective_traj_interval, args, atom_subset=traj_atom_subset)
             if reporter is not None:
@@ -4131,11 +4177,9 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     _stuck_counter = np.zeros(nrep, dtype=int)
     _stuck_rescue_total = 0
 
-    # Shared thread pool for parallel step_all() and getState() across replicas.
-    # OpenMM releases the GIL during both context.step() and context.getState(),
-    # so Python threads genuinely run in parallel.  One thread per replica is the
-    # right fan-out; do not create a new pool each call.
-    _sim_pool = ThreadPoolExecutor(max_workers=nrep)
+    # _sim_pool (one thread per replica, pinned since before replica_construction)
+    # was created above, before Context construction, so every replica's Context
+    # is built and stepped on the same OS thread for its whole lifetime.
     if str(getattr(args, "platform", "")).upper() == "CPU" and int(getattr(args, "cpu_threads", 1)) == 0 and nrep > 1:
         print(
             f"WARNING: --cpu-threads 0 (use all cores) combined with {nrep} parallel replicas "
