@@ -370,6 +370,19 @@ def _add_us_args(p: argparse.ArgumentParser) -> None:
                         "as 'bad' (start far enough from its production center that the full-strength "
                         "restraint force at step 0 can blow up the simulation). Default: refuse and "
                         "raise, listing the offending windows.")
+    p.add_argument("--us-auto-drop-bad-windows", action=argparse.BooleanOptionalAction, default=False,
+                   help="When the post-pull quality gate would otherwise raise, automatically drop the "
+                        "'bad' windows from the active window set and continue with the rest, instead of "
+                        "failing the run. Use for windows whose pull never converges regardless of tuning "
+                        "(kinetic trapping, not a missing seed - the pre-pull reachability filter already "
+                        "screens those out). All window-indexed arrays are reindexed and the explicit-2D "
+                        "neighbor graph is rebuilt around the surviving windows. Refused (raises instead) "
+                        "if the drop would exceed --us-auto-drop-max-fraction of all windows, or if it "
+                        "would leave the neighbor graph disconnected. Default: off (hard-raise, as before).")
+    p.add_argument("--us-auto-drop-max-fraction", type=float, default=1.0 / 3.0,
+                   help="Safety floor for --us-auto-drop-bad-windows: refuse to auto-drop (raise instead) "
+                        "if more than this fraction of windows are 'bad', since that usually signals a "
+                        "real configuration problem rather than a few unlucky windows. Default: 1/3.")
 
 
 def _add_seeding_args(p: argparse.ArgumentParser) -> None:

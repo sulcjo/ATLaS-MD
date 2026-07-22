@@ -1590,6 +1590,124 @@ def write_explicit_window_analysis_files(
         "json": str(json_path),
     }
 
+def _connected_components_count(n_nodes: int, edges: list[dict]) -> int:
+    """Union-find component count over an explicit-2D neighbor-graph edge list."""
+    parent = list(range(n_nodes))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for edge in edges:
+        wi, wj = int(edge.get("wi", -1)), int(edge.get("wj", -1))
+        if 0 <= wi < n_nodes and 0 <= wj < n_nodes:
+            ri, rj = find(wi), find(wj)
+            if ri != rj:
+                parent[ri] = rj
+
+    return len({find(i) for i in range(n_nodes)}) if n_nodes else 0
+
+
+def drop_bad_us_windows_and_rebuild(
+    out_dir: Path,
+    dropped_window_indices: list[int],
+    centers_a, k_list, centers_nm, ks_kj_nm2,
+    secondary_cv_centers, secondary_cv_k_kcal_list, secondary_cv_ks_kj,
+    window_start_positions, window_start_velocities,
+    secondary_cv_metadata: dict, window_metadata: dict,
+    args,
+) -> dict:
+    """Drop windows the post-pull US quality gate flagged 'bad' (--us-auto-drop-bad-windows)
+    and rebuild every window-indexed artifact - arrays, neighbor graph, window CSVs - so
+    production proceeds with a smaller, internally consistent window set.
+
+    Mirrors the reindexing pattern used by filter_explicit_2d_windows_by_seed_reachability,
+    but runs after the pull (using the gate's actual achieved-position verdict) instead of
+    before it (using seed availability alone) - some windows only fail to converge once
+    pulling actually starts, regardless of how good their seed looked on paper.
+    """
+    nwin_before = len(centers_a)
+    dropped = sorted({int(i) for i in dropped_window_indices})
+    keep = [i for i in range(nwin_before) if i not in dropped]
+
+    def _sub(seq):
+        if seq is None:
+            return None
+        return [seq[i] for i in keep]
+
+    new_centers_a = np.asarray(_sub(list(centers_a)), dtype=float)
+    new_k_list = _sub(list(k_list))
+    new_centers_nm = np.asarray(_sub(list(centers_nm)), dtype=float)
+    new_ks_kj_nm2 = np.asarray(_sub(list(ks_kj_nm2)), dtype=float)
+    new_secondary_cv_centers = np.asarray(_sub(list(secondary_cv_centers)), dtype=float) if secondary_cv_centers is not None else None
+    new_secondary_cv_k_kcal_list = _sub(list(secondary_cv_k_kcal_list)) if secondary_cv_k_kcal_list is not None else None
+    new_secondary_cv_ks_kj = np.asarray(_sub(list(secondary_cv_ks_kj)), dtype=float) if secondary_cv_ks_kj is not None else None
+    new_window_start_positions = _sub(list(window_start_positions))
+    new_window_start_velocities = _sub(list(window_start_velocities))
+
+    graph_summary = None
+    if isinstance(secondary_cv_metadata, dict) and bool(secondary_cv_metadata.get("explicit_2d_windows", False)) and new_secondary_cv_centers is not None:
+        edges = build_explicit_2d_neighbor_edges(new_centers_a, new_secondary_cv_centers, args=args)
+        n_components = _connected_components_count(len(new_centers_a), edges)
+        if n_components > 1:
+            raise RuntimeError(
+                f"US auto-drop: dropping windows {dropped} would leave the explicit-2D neighbor graph "
+                f"disconnected ({n_components} components among the {len(keep)} surviving windows). "
+                "Refusing to start a REUS run with a broken exchange graph. Fix the seed/pull for "
+                "these windows instead, or pass --us-allow-bad-windows."
+            )
+        graph_summary = write_explicit_2d_neighbor_graph_files(
+            out_dir, new_centers_a, new_secondary_cv_centers, args=args, prefix="explicit_2d_neighbor_graph"
+        )
+
+    window_rows = window_assignment_rows(
+        new_centers_a, new_k_list, args.temperature_k,
+        new_secondary_cv_centers, new_secondary_cv_k_kcal_list, args=args,
+    )
+    write_window_assignment_csv(out_dir / "umbrella_windows.csv", window_rows)
+    try:
+        explicit_window_table_summary = write_explicit_window_analysis_files(
+            out_dir, new_centers_a, new_k_list, new_secondary_cv_centers, new_secondary_cv_k_kcal_list,
+            secondary_cv_metadata=secondary_cv_metadata,
+            window_metadata=window_metadata,
+            neighbor_graph_summary=graph_summary,
+        )
+    except Exception as exc:
+        explicit_window_table_summary = {}
+        print(f"WARNING: failed to rewrite sparse-safe explicit window metadata after auto-drop: {exc}")
+
+    secondary_cv_metadata = dict(secondary_cv_metadata or {})
+    secondary_cv_metadata["dropped_post_pull_bad_windows"] = dropped
+    window_metadata = dict(window_metadata or {})
+    window_metadata["dropped_post_pull_bad_windows"] = dropped
+    if graph_summary is not None:
+        secondary_cv_metadata["explicit_2d_neighbor_graph"] = graph_summary
+        window_metadata["explicit_2d_neighbor_graph"] = graph_summary
+    if explicit_window_table_summary:
+        window_metadata["explicit_window_table"] = explicit_window_table_summary
+
+    print(
+        f"    US auto-drop: {len(dropped)}/{nwin_before} windows dropped post-pull; "
+        f"{len(keep)} windows remain for production (window indices reassigned 0..{len(keep) - 1})."
+    )
+
+    return {
+        "centers_a": new_centers_a,
+        "k_list": new_k_list,
+        "centers_nm": new_centers_nm,
+        "ks_kj_nm2": new_ks_kj_nm2,
+        "secondary_cv_centers": new_secondary_cv_centers,
+        "secondary_cv_k_kcal_list": new_secondary_cv_k_kcal_list,
+        "secondary_cv_ks_kj": new_secondary_cv_ks_kj,
+        "window_start_positions": new_window_start_positions,
+        "window_start_velocities": new_window_start_velocities,
+        "secondary_cv_metadata": secondary_cv_metadata,
+        "window_metadata": window_metadata,
+    }
+
+
 def print_window_assignment_table(rows: list[dict], max_rows: int = 40) -> None:
     if not rows:
         return
@@ -3552,12 +3670,33 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         vel = equil_state.getVelocities()
         box = equil_state.getPeriodicBoxVectors()
 
-        window_start_positions, window_start_velocities = generate_us_starting_states_by_pulling(
+        window_start_positions, window_start_velocities, dropped_window_indices = generate_us_starting_states_by_pulling(
             args, out_dir, openmm, app, unit, topology, starting_structure_system, centers_nm, ks_kj_nm2,
             equil_state, primary_cv_def, cv_atom1, cv_atom2, setup_platform, setup_props, progress=progress,
             secondary_cv_centers=secondary_cv_centers, secondary_cv_ks_kj=secondary_cv_ks_kj,
             secondary_cv_metadata=secondary_cv_metadata,
         )
+
+        if dropped_window_indices:
+            _drop_result = drop_bad_us_windows_and_rebuild(
+                out_dir, dropped_window_indices,
+                centers_a, k_list, centers_nm, ks_kj_nm2,
+                secondary_cv_centers, secondary_cv_k_kcal_list, secondary_cv_ks_kj,
+                window_start_positions, window_start_velocities,
+                secondary_cv_metadata, window_metadata, args,
+            )
+            centers_a = _drop_result["centers_a"]
+            k_list = _drop_result["k_list"]
+            centers_nm = _drop_result["centers_nm"]
+            ks_kj_nm2 = _drop_result["ks_kj_nm2"]
+            secondary_cv_centers = _drop_result["secondary_cv_centers"]
+            secondary_cv_k_kcal_list = _drop_result["secondary_cv_k_kcal_list"]
+            secondary_cv_ks_kj = _drop_result["secondary_cv_ks_kj"]
+            window_start_positions = _drop_result["window_start_positions"]
+            window_start_velocities = _drop_result["window_start_velocities"]
+            secondary_cv_metadata = _drop_result["secondary_cv_metadata"]
+            window_metadata = _drop_result["window_metadata"]
+            nrep = len(centers_nm)
 
         if use_gamd:
             reusable_gamd = load_reusable_shared_gamd_setup(args, out_dir)

@@ -966,7 +966,7 @@ def generate_us_starting_states_by_pulling(
     """
     nwin = int(len(centers_nm))
     if nwin <= 0:
-        return [], []
+        return [], [], []
 
     mode = str(getattr(args, "us_starting_structure_mode", "pull") or "pull").lower()
     if mode in {"npt", "equilibrated", "same", "none"}:
@@ -976,7 +976,7 @@ def generate_us_starting_states_by_pulling(
             vel = equil_state.getVelocities()
         except Exception:
             vel = None
-        return [pos for _ in range(nwin)], [vel for _ in range(nwin)]
+        return [pos for _ in range(nwin)], [vel for _ in range(nwin)], []
 
     pull_steps = int(getattr(args, "us_pull_steps_per_window", 5000) or 0)
     pull_k_kcal_a2_requested = float(getattr(args, "us_pull_k_kcal_a2", 5.0) or 5.0)
@@ -1970,6 +1970,7 @@ def generate_us_starting_states_by_pulling(
                 f"(current max: {float(getattr(args, 'secondary_cv_adaptive_max_k_kcal', 10.0)):.1f}, try 50.0)."
             )
         print(_qmsg + f"\n  See: {pull_dir / 'us_starting_structure_quality.json'}")
+    dropped_window_indices: list[int] = []
     if n_bad > 0 and not bool(getattr(args, "us_allow_bad_windows", False)):
         # Gate: a "bad" start is far enough from its production umbrella center that
         # the full-strength restraint force hits on production's very first step,
@@ -1989,16 +1990,42 @@ def generate_us_starting_states_by_pulling(
             f"({r.get('quality_warnings', '')})"
             for r in bad_windows
         )
-        raise RuntimeError(
-            f"US starting-structure quality gate: {n_bad}/{nwin} windows are 'bad' "
-            "(starting structure far enough from its production umbrella center that the "
-            "full-strength restraint force at step 0 can blow up the simulation):\n"
-            f"{_bad_lines}\n"
-            f"See {pull_dir / 'us_starting_structure_quality.json'} for full details.\n"
-            "Fix the seed for these windows (raise --us-pull-steps-per-window, raise "
-            "--us-2d-start-secondary-k-pull-scale, or supply a better GENPEPT seed for that "
-            "CV region), or pass --us-allow-bad-windows to start production anyway."
-        )
+        auto_drop = bool(getattr(args, "us_auto_drop_bad_windows", False))
+        max_drop_fraction = float(getattr(args, "us_auto_drop_max_fraction", 1.0 / 3.0) or (1.0 / 3.0))
+        drop_fraction = n_bad / float(nwin)
+        if auto_drop and drop_fraction <= max_drop_fraction:
+            # Some windows never converge on the secondary CV no matter how hard they
+            # are pulled (kinetic trapping / no path from the available seed, not a
+            # seed-existence gap - the pre-pull reachability filter already lets these
+            # through). Re-tuning pull strength case-by-case does not scale and, per
+            # observation, can even shift which windows end up bad. Drop them
+            # automatically instead of hard-failing; production.py reindexes every
+            # window-indexed array and rebuilds the neighbor graph around the survivors.
+            dropped_window_indices = sorted(int(r["window"]) for r in bad_windows)
+            print(
+                f"WARNING [US auto-drop]: {n_bad}/{nwin} windows remained 'bad' after the starting-structure "
+                f"pull and will be dropped from production (--us-auto-drop-bad-windows):\n{_bad_lines}\n"
+                f"See {pull_dir / 'us_starting_structure_quality.json'} for full details."
+            )
+        else:
+            _reason = (
+                f"auto-drop would remove {n_bad}/{nwin} windows (> {max_drop_fraction:.0%} floor); "
+                "refusing to silently gut the window grid - this usually means a real configuration "
+                "problem, not a few unlucky windows."
+                if auto_drop
+                else "pass --us-auto-drop-bad-windows to automatically drop them and continue, or"
+            )
+            raise RuntimeError(
+                f"US starting-structure quality gate: {n_bad}/{nwin} windows are 'bad' "
+                "(starting structure far enough from its production umbrella center that the "
+                "full-strength restraint force at step 0 can blow up the simulation):\n"
+                f"{_bad_lines}\n"
+                f"See {pull_dir / 'us_starting_structure_quality.json'} for full details.\n"
+                f"{_reason} "
+                "Fix the seed for these windows (raise --us-pull-steps-per-window, raise "
+                "--us-2d-start-secondary-k-pull-scale, or supply a better GENPEPT seed for that "
+                "CV region), or pass --us-allow-bad-windows to start production anyway."
+            )
     # Inter-window pairwise Cα RMSD — diversity check for all final US starting structures
     try:
         _pep_res = peptide_residues(topology)
@@ -2052,7 +2079,7 @@ def generate_us_starting_states_by_pulling(
         print(f"    WARNING: inter-window RMSD computation failed: {_rmsd_exc}")
 
     print(f"    US starting structures written to {pull_dir}")
-    return positions_by_window, velocities_by_window
+    return positions_by_window, velocities_by_window, dropped_window_indices
 
 
 __all__ = [
