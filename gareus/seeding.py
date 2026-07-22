@@ -1069,8 +1069,18 @@ def generate_us_starting_states_by_pulling(
         sim.context.setParameter("r0", float(target_center))
         sim.context.setParameter("k", float(final_k_openmm))
 
-    def relax_to_window(sim, w: int, direction_label: str, contact_ramp_stage_override: Optional[int] = None):
-        """Pull sim to window w and return (row_dict, positions, velocities)."""
+    def relax_to_window(sim, w: int, direction_label: str, contact_ramp_stage_override: Optional[int] = None,
+                         pull_steps_override: Optional[int] = None):
+        """Pull sim to window w and return (row_dict, positions, velocities).
+
+        ``pull_steps_override``, when given, replaces the configured pull_steps
+        for this call only (0 skips the restrained pull entirely, capturing the
+        just-grafted/minimized state as-is - used by the seed-preflight check
+        below to avoid spending the full pull budget on a window whose best
+        available GENPEPT seed is already far enough off that pulling is very
+        unlikely to close the gap).
+        """
+        effective_pull_steps = int(pull_steps if pull_steps_override is None else pull_steps_override)
         if primary_cv_is_contacts(args):
             # Start contact pulls from the current CV with k=0, then ramp in the
             # MD segment.  This avoids an instantaneous many-contact impulse before
@@ -1092,11 +1102,11 @@ def generate_us_starting_states_by_pulling(
             except TypeError:
                 sim.minimizeEnergy()
         progress_base = int(sum(1 for x in positions_by_window if x is not None) * max(1, pull_steps))
-        if pull_steps > 0:
+        if effective_pull_steps > 0:
             if staged_2d_relax:
-                distance_steps = int(round(float(pull_steps) * distance_fraction))
-                distance_steps = max(0, min(int(pull_steps), distance_steps))
-                remaining_steps = int(pull_steps) - int(distance_steps)
+                distance_steps = int(round(float(effective_pull_steps) * distance_fraction))
+                distance_steps = max(0, min(int(effective_pull_steps), distance_steps))
+                remaining_steps = int(effective_pull_steps) - int(distance_steps)
                 done_local = 0
                 if distance_steps > 0:
                     _set_secondary_restraint_for_window(sim, w, 0.0)
@@ -1138,7 +1148,7 @@ def generate_us_starting_states_by_pulling(
             else:
                 _run_primary_pull_segment(
                     sim,
-                    float(centers_nm_arr[w]), float(pull_k_kj_nm2), pull_steps,
+                    float(centers_nm_arr[w]), float(pull_k_kj_nm2), effective_pull_steps,
                     "us_starting_pull",
                     progress_base,
                     f"Pull w{w+1}/{nwin}: cv1→{centers_user_arr[w]:.3f}{primary_cv_units(args)} k={pull_k_kcal_a2:.1f}",
@@ -1178,7 +1188,7 @@ def generate_us_starting_states_by_pulling(
             "primary_cv_delta": float(primary_value - centers_user_arr[w]),
             "primary_cv_units": primary_cv_units(args),
             "pull_k_kcal_mol_A2": float(pull_k_kcal_a2),
-            "pull_steps": int(pull_steps),
+            "pull_steps": int(effective_pull_steps),
             "pull_timestep_fs": float(ts),
             "two_d_relax_mode": "staged" if staged_2d_relax else "single_stage",
             "secondary_cv_center": secondary_center if math.isfinite(float(secondary_center)) else "",
@@ -1203,6 +1213,25 @@ def generate_us_starting_states_by_pulling(
     seed_max_reuse = int(getattr(args, "seed_max_reuse_per_conformer", 0) or 0)
     primary_seed_scale = _finite_spacing_scale(centers_user_arr, fallback=(0.2 if primary_cv_is_contacts(args) else 1.0))
     secondary_seed_scale = _finite_spacing_scale(secondary_cv_centers if secondary_cv_centers is not None else [], fallback=0.25)
+
+    # Seed preflight: if the BEST available GENPEPT seed across the whole library
+    # is already this many window-spacings off target (on either axis) before any
+    # pulling starts, a restrained pull essentially never closes that gap - it was
+    # observed to leave primary_cv_delta ~unchanged even after raising pull steps/k
+    # (chignolin_sigma2_2d epoch_001, windows requesting nonlocal-contacts=0.8 with
+    # no seed above ~0.45 in a 1970-conformer library). Skipping the pull for those
+    # windows saves the wasted steps; the post-pull quality gate still flags and
+    # reports them exactly as before.
+    seed_preflight_max_score = float(getattr(args, "us_seed_preflight_max_score", 1.2) or 1.2)
+
+    def _seed_preflight_pull_steps_override(seed_score_info: dict) -> Optional[int]:
+        if seed_preflight_max_score <= 0:
+            return None
+        primary_score = float(seed_score_info.get("primary_score", 0.0) or 0.0)
+        secondary_score = float(seed_score_info.get("secondary_score", 0.0) or 0.0)
+        if primary_score > seed_preflight_max_score or secondary_score > seed_preflight_max_score:
+            return 0
+        return None
 
     seed_scoring_degradations: list[dict] = []
     if conformer_library:
@@ -1314,7 +1343,8 @@ def generate_us_starting_states_by_pulling(
         }
         return s, row, pos, vel
 
-    def _relax_to_window_recovering(sim, w: int, direction_label: str, device_idx: str):
+    def _relax_to_window_recovering(sim, w: int, direction_label: str, device_idx: str,
+                                     pull_steps_override: Optional[int] = None):
         """relax_to_window with crash recovery.
 
         A NaN blow-up during pulling (contact-CV clashes are the usual cause)
@@ -1327,7 +1357,7 @@ def generate_us_starting_states_by_pulling(
         whole run.
         """
         try:
-            row, pos, vel = relax_to_window(sim, w, direction_label)
+            row, pos, vel = relax_to_window(sim, w, direction_label, pull_steps_override=pull_steps_override)
             return sim, row, pos, vel
         except Exception as exc:
             print(
@@ -1347,6 +1377,7 @@ def generate_us_starting_states_by_pulling(
                 row, pos, vel = relax_to_window(
                     retry_sim, w, f"{direction_label}_recovered_after_crash",
                     contact_ramp_stage_override=finer_stages,
+                    pull_steps_override=pull_steps_override,
                 )
                 return retry_sim, row, pos, vel
             except Exception as exc2:
@@ -1381,7 +1412,16 @@ def generate_us_starting_states_by_pulling(
                         direction = "pull_fallback"
                     else:
                         direction = "seeded"
-                    s, row, pos, vel = _relax_to_window_recovering(s, w, direction, device_idx)
+                    pull_steps_override = _seed_preflight_pull_steps_override(seed_score_info)
+                    if pull_steps_override == 0:
+                        print(
+                            f"WARNING [seed preflight] window {w+1}/{nwin}: best available GENPEPT seed is "
+                            f"{seed_score_info.get('primary_score', 0):.2f}/{seed_score_info.get('secondary_score', 0):.2f} "
+                            f"(primary/secondary score) off target, past --us-seed-preflight-max-score="
+                            f"{seed_preflight_max_score:g}; skipping pull for this window (won't converge)."
+                        )
+                        direction = f"{direction}_seed_preflight_unreachable"
+                    s, row, pos, vel = _relax_to_window_recovering(s, w, direction, device_idx, pull_steps_override=pull_steps_override)
                     return w, row, pos, vel, graft_status, seed_score_info
                 finally:
                     _sim_pool.put(s)
@@ -1427,7 +1467,16 @@ def generate_us_starting_states_by_pulling(
                     direction = "pull_fallback"
                 else:
                     direction = "seeded"
-                sim, row, pos, vel = _relax_to_window_recovering(sim, w, direction, device_tokens[0])
+                pull_steps_override = _seed_preflight_pull_steps_override(seed_score_info)
+                if pull_steps_override == 0:
+                    print(
+                        f"WARNING [seed preflight] window {w+1}/{nwin}: best available GENPEPT seed is "
+                        f"{seed_score_info.get('primary_score', 0):.2f}/{seed_score_info.get('secondary_score', 0):.2f} "
+                        f"(primary/secondary score) off target, past --us-seed-preflight-max-score="
+                        f"{seed_preflight_max_score:g}; skipping pull for this window (won't converge)."
+                    )
+                    direction = f"{direction}_seed_preflight_unreachable"
+                sim, row, pos, vel = _relax_to_window_recovering(sim, w, direction, device_tokens[0], pull_steps_override=pull_steps_override)
                 positions_by_window[w] = pos
                 velocities_by_window[w] = vel
                 rows.append(row)

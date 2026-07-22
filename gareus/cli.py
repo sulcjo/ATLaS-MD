@@ -380,6 +380,14 @@ def _add_seeding_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--seed-cv2-weight", type=float, default=1.0,
                    help="Weight of CV2 in active-cv seed scoring.")
     p.add_argument("--seed-max-reuse-per-conformer", type=int, default=0)
+    p.add_argument("--us-seed-preflight-max-score", type=float, default=1.2,
+                   help="Skip the restrained pull for a window when its best available GENPEPT seed "
+                        "is already this many window-spacings off target (primary_score or "
+                        "secondary_score from active-CV seed selection) before any pulling starts. "
+                        "A pull rarely closes a gap that large - it means no seed in the library is "
+                        "anywhere near this window's target, so pulling just wastes steps. The "
+                        "post-pull quality gate still flags/reports the window as before. Set <= 0 "
+                        "to disable and always attempt the full pull.")
 
 
 def _add_genpept_prescan_args(p: argparse.ArgumentParser) -> None:
