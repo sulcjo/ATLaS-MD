@@ -1770,6 +1770,35 @@ def generate_us_starting_states_by_pulling(
                 f"(current max: {float(getattr(args, 'secondary_cv_adaptive_max_k_kcal', 10.0)):.1f}, try 50.0)."
             )
         print(_qmsg + f"\n  See: {pull_dir / 'us_starting_structure_quality.json'}")
+    if n_bad > 0 and not bool(getattr(args, "us_allow_bad_windows", False)):
+        # Gate: a "bad" start is far enough from its production umbrella center that
+        # the full-strength restraint force hits on production's very first step,
+        # before any chunk-boundary NaN check runs. On CUDA that has produced a hard
+        # SIGSEGV (out-of-bounds PME grid write) instead of a catchable OpenMM
+        # exception, killing the job after replica_construction with no diagnostic.
+        # Raising here, in seconds, beats discovering it after a multi-GPU allocation
+        # burns wall time to reach that same crash.
+        bad_windows = sorted(
+            (r for r in quality_rows if r.get("quality_status") == "bad"),
+            key=lambda r: -float(r.get("production_total_umbrella_bias_kcal_mol", 0.0) or 0.0),
+        )
+        _bad_lines = "\n".join(
+            f"  window {int(r['window'])}: primary_delta={float(r.get('primary_cv_delta', 0.0) or 0.0):+.4g}, "
+            f"secondary_delta={float(r.get('secondary_cv_delta', 0.0) or 0.0):+.4g}, "
+            f"total_start_bias={float(r.get('production_total_umbrella_bias_kcal_mol', 0.0) or 0.0):.2f} kcal/mol "
+            f"({r.get('quality_warnings', '')})"
+            for r in bad_windows
+        )
+        raise RuntimeError(
+            f"US starting-structure quality gate: {n_bad}/{nwin} windows are 'bad' "
+            "(starting structure far enough from its production umbrella center that the "
+            "full-strength restraint force at step 0 can blow up the simulation):\n"
+            f"{_bad_lines}\n"
+            f"See {pull_dir / 'us_starting_structure_quality.json'} for full details.\n"
+            "Fix the seed for these windows (raise --us-pull-steps-per-window, raise "
+            "--us-2d-start-secondary-k-pull-scale, or supply a better GENPEPT seed for that "
+            "CV region), or pass --us-allow-bad-windows to start production anyway."
+        )
     # Inter-window pairwise Cα RMSD — diversity check for all final US starting structures
     try:
         _pep_res = peptide_residues(topology)

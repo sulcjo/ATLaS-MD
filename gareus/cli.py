@@ -365,6 +365,11 @@ def _add_us_args(p: argparse.ArgumentParser) -> None:
                    choices=["auto", "staged", "off", "single", "ramp"], default="auto")
     p.add_argument("--us-2d-secondary-k-scale", type=float, default=1.0,
                    help="Multiply secondary CV k during 2D pull ramp.")
+    p.add_argument("--us-allow-bad-windows", action=argparse.BooleanOptionalAction, default=False,
+                   help="Start production even if US starting-structure quality-control flags windows "
+                        "as 'bad' (start far enough from its production center that the full-strength "
+                        "restraint force at step 0 can blow up the simulation). Default: refuse and "
+                        "raise, listing the offending windows.")
 
 
 def _add_seeding_args(p: argparse.ArgumentParser) -> None:
