@@ -43,7 +43,11 @@ from .system_setup import (
     write_solute_only_topology_pdb,
     write_state_pdb,
 )
-from .seeding import generate_us_starting_states_by_pulling, deserialize_system
+from .seeding import (
+    generate_us_starting_states_by_pulling,
+    deserialize_system,
+    filter_explicit_2d_windows_by_seed_reachability,
+)
 from .diagnostics import compute_gamd_reweighting_diagnostics, validate_us_mbar_inputs
 from .imports import import_gamd_factory, import_openmm
 from .state import _scalar_to_float, _energy_to_kj_mol
@@ -3379,6 +3383,11 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         bootstrap_torsion_summary = _ensure_bootstrap_torsion_cv_ready(args, out_dir, topology, primary_cv_def)
         if getattr(args, "windows_2d_csv", None):
             centers_a, k_list, secondary_cv_centers, secondary_cv_k_kcal_list, secondary_cv_metadata, window_metadata = load_explicit_2d_window_csv(args, Path(args.windows_2d_csv))
+            centers_a, k_list, secondary_cv_centers, secondary_cv_k_kcal_list, secondary_cv_metadata, window_metadata = filter_explicit_2d_windows_by_seed_reachability(
+                args, topology, primary_cv_def,
+                centers_a, k_list, secondary_cv_centers, secondary_cv_k_kcal_list,
+                secondary_cv_metadata, window_metadata,
+            )
             print(f"    Explicit 2D window table loaded: {len(centers_a)} windows from {args.windows_2d_csv}")
             try:
                 with (out_dir / "explicit_2d_window_table_loaded.csv").open("w", newline="") as handle:

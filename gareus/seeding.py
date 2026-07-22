@@ -657,6 +657,95 @@ def _finite_spacing_scale(values, fallback: float = 1.0) -> float:
     return max(1.0e-12, span / max(1, uniq.size - 1), float(fallback))
 
 
+def filter_explicit_2d_windows_by_seed_reachability(
+    args,
+    topology,
+    primary_cv_def: dict,
+    centers_a,
+    k_list,
+    secondary_cv_centers,
+    secondary_cv_k_kcal_list,
+    secondary_cv_metadata: dict,
+    window_metadata: dict,
+):
+    """Drop explicit-2D window rows whose primary-CV target no GENPEPT seed can reach.
+
+    load_explicit_2d_window_csv has no reachability awareness: unlike the
+    adaptive/choose_windows path (which empirically boundary-pulls the CV and
+    caps contact_adaptive_effective_max - see run_cv_boundary_pulls), an
+    explicit CSV's primary centers are trusted as-is. When GENPEPT seeding is
+    configured, cross-check each row's target against what any seed in the
+    library actually achieves, before nrep/the neighbor graph are ever built
+    from it.
+
+    Root cause this guards: chignolin_sigma2_2d epoch_001 had seven windows
+    requesting primary_cv (nonlocal-contacts) = 0.8 with no seed above ~0.45
+    anywhere in a 1970-conformer library. The seeding-time quality gate
+    correctly refused to start production on them, and forcing it anyway with
+    --us-allow-bad-windows reproducibly segfaulted mid-production. Filtering
+    here means future epochs/peptides never propose that window at all.
+    """
+    seed_conformers_dir = str(getattr(args, "seed_conformers_dir", "") or "")
+    if not seed_conformers_dir or not primary_cv_is_contacts(args) or len(centers_a) == 0:
+        return centers_a, k_list, secondary_cv_centers, secondary_cv_k_kcal_list, secondary_cv_metadata, window_metadata
+
+    library = load_genpept_conformer_library(
+        Path(seed_conformers_dir), primary_cv_def=primary_cv_def, args=args, topology=topology,
+        secondary_cv_metadata=None,
+    )
+    primary_values = np.asarray([float(e.get("primary_cv_value", float("nan"))) for e in library], dtype=float)
+    primary_values = primary_values[np.isfinite(primary_values)]
+    if primary_values.size == 0:
+        return centers_a, k_list, secondary_cv_centers, secondary_cv_k_kcal_list, secondary_cv_metadata, window_metadata
+
+    max_score = float(getattr(args, "us_seed_preflight_max_score", 1.2) or 1.2)
+    scale = _finite_spacing_scale(centers_a, fallback=0.2)
+    centers_arr = np.asarray(centers_a, dtype=float)
+    keep_mask = np.zeros(centers_arr.shape[0], dtype=bool)
+    dropped = []
+    for i, c in enumerate(centers_arr):
+        deltas = np.abs(primary_values - float(c))
+        j = int(np.argmin(deltas))
+        score = float(deltas[j]) / max(1.0e-12, scale)
+        keep_mask[i] = score <= max_score
+        if not keep_mask[i]:
+            dropped.append({
+                "window": int(i),
+                "primary_center": float(c),
+                "nearest_seed_primary_cv": float(primary_values[j]),
+                "score": float(score),
+            })
+    if not dropped:
+        return centers_a, k_list, secondary_cv_centers, secondary_cv_k_kcal_list, secondary_cv_metadata, window_metadata
+
+    print(
+        f"WARNING [explicit-2D reachability]: dropping {len(dropped)}/{len(centers_arr)} windows - "
+        f"no GENPEPT seed within --us-seed-preflight-max-score={max_score:g} window-spacings of their "
+        f"primary-CV target (library primary_cv max observed: {float(np.nanmax(primary_values)):.3g}):"
+    )
+    for d in dropped:
+        print(
+            f"    window {d['window']}: target={d['primary_center']:.4g}, "
+            f"nearest seed={d['nearest_seed_primary_cv']:.4g}, score={d['score']:.2f}"
+        )
+
+    filtered_centers = centers_arr[keep_mask]
+    filtered_k_list = [k for k, keep in zip(k_list, keep_mask) if keep]
+    filtered_secondary_centers = np.asarray(secondary_cv_centers, dtype=float)[keep_mask] if secondary_cv_centers is not None else None
+    filtered_secondary_k = [k for k, keep in zip(secondary_cv_k_kcal_list, keep_mask) if keep] if secondary_cv_k_kcal_list is not None else None
+
+    secondary_cv_metadata = dict(secondary_cv_metadata or {})
+    secondary_cv_metadata["dropped_unreachable_windows"] = dropped
+    window_metadata = dict(window_metadata or {})
+    kept_rows = [dict(r) for r, keep in zip(window_metadata.get("normalized_rows") or [], keep_mask) if keep]
+    for new_idx, row in enumerate(kept_rows):
+        row["window"] = int(new_idx)
+    window_metadata["normalized_rows"] = kept_rows
+    window_metadata["n_windows"] = int(len(kept_rows))
+    window_metadata["dropped_unreachable_windows"] = dropped
+    return filtered_centers, filtered_k_list, filtered_secondary_centers, filtered_secondary_k, secondary_cv_metadata, window_metadata
+
+
 def _format_seed_component_dict(d: dict) -> dict:
     out = {}
     for k, v in d.items():
