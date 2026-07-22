@@ -33,6 +33,7 @@ from .cv import (
     primary_cv_units,
     primary_cv_value_from_positions_nm,
     primary_k_to_openmm_value,
+    secondary_cv_mode,
     secondary_structure_score_from_positions_nm,
 )
 from .io import _json_ready, write_json
@@ -659,6 +660,7 @@ def _finite_spacing_scale(values, fallback: float = 1.0) -> float:
 
 def filter_explicit_2d_windows_by_seed_reachability(
     args,
+    out_dir: Path,
     topology,
     primary_cv_def: dict,
     centers_a,
@@ -668,52 +670,109 @@ def filter_explicit_2d_windows_by_seed_reachability(
     secondary_cv_metadata: dict,
     window_metadata: dict,
 ):
-    """Drop explicit-2D window rows whose primary-CV target no GENPEPT seed can reach.
+    """Drop explicit-2D window rows no GENPEPT seed can jointly reach.
 
     load_explicit_2d_window_csv has no reachability awareness: unlike the
     adaptive/choose_windows path (which empirically boundary-pulls the CV and
     caps contact_adaptive_effective_max - see run_cv_boundary_pulls), an
-    explicit CSV's primary centers are trusted as-is. When GENPEPT seeding is
-    configured, cross-check each row's target against what any seed in the
-    library actually achieves, before nrep/the neighbor graph are ever built
-    from it.
+    explicit CSV's centers are trusted as-is. When GENPEPT seeding is
+    configured, cross-check each row's (primary, secondary) target against the
+    same active-CV seed-selection scoring used at seeding time
+    (_score_seed_conformer), before nrep/the neighbor graph are ever built.
 
     Root cause this guards: chignolin_sigma2_2d epoch_001 had seven windows
     requesting primary_cv (nonlocal-contacts) = 0.8 with no seed above ~0.45
-    anywhere in a 1970-conformer library. The seeding-time quality gate
-    correctly refused to start production on them, and forcing it anyway with
-    --us-allow-bad-windows reproducibly segfaulted mid-production. Filtering
-    here means future epochs/peptides never propose that window at all.
+    anywhere in a 1970-conformer library (primary-axis gap), plus a further
+    couple of windows with a good primary match but no seed near their
+    secondary-CV (torsion-PC1) target (secondary-axis gap, joint density
+    sparse even where each axis is populated on its own). The seeding-time
+    quality gate correctly refused to start production on all of these, and
+    forcing the first batch through with --us-allow-bad-windows reproducibly
+    segfaulted mid-production. Filtering both axes here, jointly, means
+    future epochs/peptides never propose an unreachable window at all -
+    whether the mismatch is on primary, secondary, or their combination.
     """
     seed_conformers_dir = str(getattr(args, "seed_conformers_dir", "") or "")
     if not seed_conformers_dir or not primary_cv_is_contacts(args) or len(centers_a) == 0:
         return centers_a, k_list, secondary_cv_centers, secondary_cv_k_kcal_list, secondary_cv_metadata, window_metadata
 
+    secondary_configured = bool(
+        secondary_cv_centers is not None and len(secondary_cv_centers) > 0
+        and secondary_cv_metadata and secondary_cv_metadata.get("enabled")
+    )
+    scoring_secondary_metadata = None
+    if secondary_configured and secondary_cv_mode(args) == "torsion-pca":
+        # The torsion-PC1 fit is already on disk by this point: run_gareus calls
+        # _ensure_bootstrap_torsion_cv_ready before loading the window CSV. Reload
+        # it directly rather than re-fitting or calling the force-adding builder
+        # (which needs a live System, not available here).
+        from .tica import TICAResult
+        configured_state_file = str(getattr(args, "bootstrap_torsion_state_file", "") or "")
+        state_path = Path(configured_state_file) if configured_state_file else Path(out_dir) / "tica" / "bootstrap_torsion_cv.json"
+        if state_path.exists():
+            try:
+                result = TICAResult.load(state_path)
+                scoring_secondary_metadata = {
+                    "enabled": True,
+                    "mode": "torsion-pca",
+                    "weights": [float(x) for x in result.weights],
+                    "phi_torsions": [list(map(int, t)) for t in result.phi_torsion_indices],
+                    "psi_torsions": [list(map(int, t)) for t in result.psi_torsion_indices],
+                    "tica_offset": float(result.offset),
+                }
+            except Exception as exc:
+                print(f"WARNING [explicit-2D reachability]: could not load bootstrap torsion fit "
+                      f"for secondary-CV reachability check ({exc}); checking primary CV only.")
+    can_score_secondary = bool(secondary_configured and scoring_secondary_metadata is not None)
+    if secondary_configured and not can_score_secondary:
+        print(f"WARNING [explicit-2D reachability]: secondary CV mode {secondary_cv_mode(args)!r} has no "
+              f"reachability scorer wired up yet; checking primary CV only for this run.")
+
     library = load_genpept_conformer_library(
         Path(seed_conformers_dir), primary_cv_def=primary_cv_def, args=args, topology=topology,
-        secondary_cv_metadata=None,
+        secondary_cv_metadata=scoring_secondary_metadata,
     )
-    primary_values = np.asarray([float(e.get("primary_cv_value", float("nan"))) for e in library], dtype=float)
-    primary_values = primary_values[np.isfinite(primary_values)]
-    if primary_values.size == 0:
+    if not any(math.isfinite(float(e.get("primary_cv_value", float("nan")))) for e in library):
         return centers_a, k_list, secondary_cv_centers, secondary_cv_k_kcal_list, secondary_cv_metadata, window_metadata
 
     max_score = float(getattr(args, "us_seed_preflight_max_score", 1.2) or 1.2)
-    scale = _finite_spacing_scale(centers_a, fallback=0.2)
+    seed_selection_mode = str(getattr(args, "seed_selection_mode", "auto") or "auto").strip().lower().replace("_", "-")
+    if seed_selection_mode == "auto":
+        seed_selection_mode = "active-cv"
+    seed_secondary_weight = max(0.0, float(getattr(args, "seed_secondary_weight", getattr(args, "seed_cv2_weight", 1.0)) or 0.0))
+    primary_scale = _finite_spacing_scale(centers_a, fallback=0.2)
+    secondary_scale = _finite_spacing_scale(secondary_cv_centers, fallback=0.25) if can_score_secondary else 1.0
+
     centers_arr = np.asarray(centers_a, dtype=float)
     keep_mask = np.zeros(centers_arr.shape[0], dtype=bool)
     dropped = []
     for i, c in enumerate(centers_arr):
-        deltas = np.abs(primary_values - float(c))
-        j = int(np.argmin(deltas))
-        score = float(deltas[j]) / max(1.0e-12, scale)
-        keep_mask[i] = score <= max_score
+        target_secondary = float(secondary_cv_centers[i]) if can_score_secondary else float("nan")
+        best_score, best_components = None, None
+        for conf in library:
+            score, components = _score_seed_conformer(
+                conf, window_index=i, seed_selection_mode=seed_selection_mode,
+                primary_seed_scale=primary_scale, target_primary=float(c), target_secondary=target_secondary,
+                secondary_available=can_score_secondary, seed_secondary_weight=seed_secondary_weight,
+                secondary_seed_scale=secondary_scale, args=args,
+            )
+            if best_score is None or score < best_score:
+                best_score, best_components = score, components
+        if best_components is None:
+            keep_mask[i] = True
+            continue
+        primary_score = float(best_components.get("primary_score", 0.0) or 0.0)
+        secondary_score = float(best_components.get("secondary_score", 0.0) or 0.0)
+        keep_mask[i] = primary_score <= max_score and secondary_score <= max_score
         if not keep_mask[i]:
             dropped.append({
                 "window": int(i),
                 "primary_center": float(c),
-                "nearest_seed_primary_cv": float(primary_values[j]),
-                "score": float(score),
+                "secondary_center": target_secondary if can_score_secondary else None,
+                "nearest_seed_primary_cv": best_components.get("conformer_primary_cv"),
+                "nearest_seed_secondary_cv": best_components.get("conformer_secondary_cv"),
+                "primary_score": primary_score,
+                "secondary_score": secondary_score,
             })
     if not dropped:
         return centers_a, k_list, secondary_cv_centers, secondary_cv_k_kcal_list, secondary_cv_metadata, window_metadata
@@ -721,12 +780,15 @@ def filter_explicit_2d_windows_by_seed_reachability(
     print(
         f"WARNING [explicit-2D reachability]: dropping {len(dropped)}/{len(centers_arr)} windows - "
         f"no GENPEPT seed within --us-seed-preflight-max-score={max_score:g} window-spacings of their "
-        f"primary-CV target (library primary_cv max observed: {float(np.nanmax(primary_values)):.3g}):"
+        f"target on primary and/or secondary CV:"
     )
     for d in dropped:
         print(
-            f"    window {d['window']}: target={d['primary_center']:.4g}, "
-            f"nearest seed={d['nearest_seed_primary_cv']:.4g}, score={d['score']:.2f}"
+            f"    window {d['window']}: primary target={d['primary_center']:.4g} "
+            f"(nearest seed {d['nearest_seed_primary_cv']:.4g}, score={d['primary_score']:.2f})"
+            + (f", secondary target={d['secondary_center']:.4g} "
+               f"(nearest seed {d['nearest_seed_secondary_cv']:.4g}, score={d['secondary_score']:.2f})"
+               if d["secondary_center"] is not None else "")
         )
 
     filtered_centers = centers_arr[keep_mask]

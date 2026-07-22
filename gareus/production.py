@@ -3384,7 +3384,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         if getattr(args, "windows_2d_csv", None):
             centers_a, k_list, secondary_cv_centers, secondary_cv_k_kcal_list, secondary_cv_metadata, window_metadata = load_explicit_2d_window_csv(args, Path(args.windows_2d_csv))
             centers_a, k_list, secondary_cv_centers, secondary_cv_k_kcal_list, secondary_cv_metadata, window_metadata = filter_explicit_2d_windows_by_seed_reachability(
-                args, topology, primary_cv_def,
+                args, out_dir, topology, primary_cv_def,
                 centers_a, k_list, secondary_cv_centers, secondary_cv_k_kcal_list,
                 secondary_cv_metadata, window_metadata,
             )
