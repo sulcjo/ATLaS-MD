@@ -428,6 +428,15 @@ def _add_gamd_args(p: argparse.ArgumentParser) -> None:
         "lower-dual", "upper-dual", "lower-nonbonded", "upper-nonbonded",
         "lower-dual-nonbonded-dihedral", "upper-dual-nonbonded-dihedral",
     ])
+    p.add_argument("--gamd-reuse-context-checkpoint", action=argparse.BooleanOptionalAction, default=False,
+                   help="When reusing a shared GaMD setup exported by an earlier adaptive-production epoch, "
+                        "also restore its binary OpenMM Context checkpoint (gamd-openmm native stage/step "
+                        "state) via loadCheckpoint(), on top of the calibrated-globals dict copy. Off by "
+                        "default: confirmed on a live run to segfault at the first production step when the "
+                        "checkpoint is loaded into a freshly rebuilt Context (reproduced independent of window "
+                        "quality, MPS, PME-stream setting, and replica-per-GPU count). The globals-dict copy "
+                        "alone is authoritative for calibration; the checkpoint only adds opaque native stage "
+                        "state on top, which is not worth this crash risk by default.")
     p.add_argument("--sigma0p", type=float, default=6.0,
                    help="Primary sigma0 in kcal/mol for GaMD.")
     p.add_argument("--sigma0d", type=float, default=6.0,

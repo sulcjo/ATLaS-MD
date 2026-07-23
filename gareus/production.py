@@ -3876,12 +3876,26 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     ) from exc2
             loaded_checkpoint = False
             copied, skipped = {}, {}
-            if use_gamd and not fast_resume and shared_gamd_context_checkpoint is not None:
+            if (
+                use_gamd and not fast_resume and shared_gamd_context_checkpoint is not None
+                and bool(getattr(args, "gamd_reuse_context_checkpoint", False))
+            ):
                 try:
                     # Loading the calibrated shared Context checkpoint preserves the
                     # gamd-openmm native stage/step state in addition to readable
                     # CustomIntegrator globals.  We overwrite coordinates, velocities,
                     # and umbrella parameters below, so only the GaMD setup state is reused.
+                    #
+                    # Off by default: loadCheckpoint() restores a binary snapshot into a
+                    # freshly deserialize_system()'d Context for this epoch's (possibly
+                    # smaller, reachability-/auto-drop-filtered) window set. Confirmed on
+                    # a live run to segfault at the first step() of every epoch that reused
+                    # a checkpoint exported from a different epoch's Context - reproduced
+                    # with clean-quality windows, MPS on/off, PME-stream on/off, and down
+                    # to 1 replica/GPU, so it is not a data-quality or concurrency issue.
+                    # The globals-dict copy below is authoritative for calibration anyway
+                    # (see comment there); the checkpoint only adds opaque native stage
+                    # state on top, which is not worth this crash risk by default.
                     sim_i.context.loadCheckpoint(shared_gamd_context_checkpoint)
                     loaded_checkpoint = True
                 except Exception as exc:
