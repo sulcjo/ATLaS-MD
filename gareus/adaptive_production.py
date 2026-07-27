@@ -36,7 +36,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 
 from .checkpoints import production_checkpoint_available
-from .io import write_json, read_json_file, _json_ready
+from .io import write_json, read_json_file, resolve_run_temperature_k, _json_ready
 from .lifecycle import _graceful_shutdown
 
 logger = logging.getLogger(__name__)
@@ -1119,9 +1119,15 @@ def _blank_if_nonfinite(value: Any) -> Any:
 
 
 def _metadata_beta_1_over_kj_mol(run_dir: Path) -> Optional[float]:
-    meta = read_json_file(Path(run_dir) / "gareus_metadata.json", {}) or {}
-    temp = _float_or_none(meta.get("temperature_K", meta.get("temperature_k")))
-    if temp is None or temp <= 0.0:
+    """Resolve 1/(kB*T) in mol/kJ for a per-window run directory.
+
+    See gareus.io.resolve_run_temperature_k: gareus_metadata.json never
+    carries a temperature field in practice, so this used to silently
+    resolve to None for every run, leaving every union-MBAR sample's beta
+    blank and the reduced-bias matrix NaN.
+    """
+    temp = resolve_run_temperature_k(run_dir)
+    if temp is None:
         return None
     return 1.0 / (8.314462618e-3 * float(temp))
 
@@ -4187,6 +4193,19 @@ def policy_from_args(args: Any) -> AdaptiveDecisionPolicy:
     )
 
 
+def _epoch_loop_missing_convergence(epoch: int, max_epochs: int, gate_converged: bool,
+                                     require_convergence_before_final: bool) -> bool:
+    """True when the adaptive epoch loop must raise instead of proceeding to final.
+
+    Convergence at any one epoch no longer breaks the loop early (see
+    run_adaptive_production_auto_loop: it just continues to the next
+    scheduled epoch), so the loop always runs its configured budget. This
+    only fires on the very last epoch, and only when that epoch never
+    converged and the policy demands convergence before final.
+    """
+    return bool(epoch + 1 >= max_epochs and not gate_converged and require_convergence_before_final)
+
+
 def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, forcefield, topology, equil_state, progress=None) -> Dict[str, Any]:
     """Run adaptive production by calling the existing GAREUS worker per epoch.
 
@@ -4616,14 +4635,21 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             "global_shared_gamd_enabled": bool(global_shared_gamd_dir is not None),
         })
 
-        if bool(convergence_gate.get("stop_adaptive", False)):
+        gate_converged = bool(convergence_gate.get("stop_adaptive", False))
+        if gate_converged:
+            # Convergence at one epoch does not mean the discovery loop is
+            # done: it only means this epoch proposed no further actions.
+            # Keep running the configured adaptive_production_epochs budget
+            # and only fall through to the final phase once that budget is
+            # exhausted -- jumping straight to final here just meant the
+            # final-phase quality gate would immediately demand another
+            # --extend round anyway (see epoch_000 of chignolin_sigma3_2d).
             print(
                 f"    Adaptive-production convergence gate passed after epoch {epoch + 1}: "
-                f"{convergence_gate.get('status')}"
+                f"{convergence_gate.get('status')} (continuing to the next scheduled epoch)"
             )
-            break
 
-        if epoch + 1 >= max_epochs and bool(policy.require_convergence_before_final):
+        if _epoch_loop_missing_convergence(epoch, max_epochs, gate_converged, bool(policy.require_convergence_before_final)):
             raise RuntimeError(
                 "adaptive-production reached the maximum number of adaptive epochs without passing the convergence gate; "
                 f"see {convergence_gate.get('json')}"

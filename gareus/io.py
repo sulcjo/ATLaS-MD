@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import csv
+import math
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -54,6 +55,37 @@ def read_json_file(path: Path, default: Optional[Any] = None) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return default
+
+
+def _finite_positive_float(value: Any) -> Optional[float]:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(out) or out <= 0.0:
+        return None
+    return out
+
+
+def resolve_run_temperature_k(run_dir: Path) -> Optional[float]:
+    """Resolve a run directory's simulation temperature in Kelvin.
+
+    gareus_metadata.json never carries a temperature field in practice (it's
+    CV/window bookkeeping only), so that lookup alone is a silent no-op. Fall
+    back to run_manifest.json's resolved_args/method_settings, which every
+    run directory's provenance writer (gareus/provenance.py) always
+    populates with temperature_k. Returns None if no source has a usable
+    value.
+    """
+    run_dir = Path(run_dir)
+    meta = read_json_file(run_dir / "gareus_metadata.json", {}) or {}
+    temp = _finite_positive_float(meta.get("temperature_K", meta.get("temperature_k")))
+    if temp is not None:
+        return temp
+    manifest = read_json_file(run_dir / "run_manifest.json", {}) or {}
+    resolved_args = manifest.get("resolved_args", {}) or {}
+    method_settings = manifest.get("method_settings", {}) or {}
+    return _finite_positive_float(resolved_args.get("temperature_k", method_settings.get("temperature_k")))
 
 
 def _json_ready(obj: Any) -> Any:
@@ -186,6 +218,7 @@ __all__ = [
     "_NumpyEncoder",
     "write_json",
     "read_json_file",
+    "resolve_run_temperature_k",
     "_json_ready",
     "BufferedCsvDictWriter",
     "BufferedJsonlWriter",
