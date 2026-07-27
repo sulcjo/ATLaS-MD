@@ -73,15 +73,14 @@ def discover_phases(ap_dir: Path) -> list[dict]:
     actually ran, then the final phase's baseline + topup_* segments.
 
     The scheduled final-phase segments (baseline, topup_NNN_MMMMM) always
-    live under ap_dir/"final", never inside the last epoch_NNN directory --
-    the adaptive-production driver hands the remaining MD-pool budget to
-    "final" as soon as the per-epoch convergence gate reports stop_adaptive,
-    which can happen after just 1 epoch regardless of --ap-epochs (see
-    run_adaptive_production_auto_loop's convergence_gate.get("stop_adaptive")
-    check). Assuming exactly 2 epochs with epoch 1 = baseline/topup's parent
-    directory silently produced a single-phase figure whenever the loop
-    stopped early -- which is common, since epoch 0 alone often already
-    satisfies the gate (no low-sample states, no proposed add/split actions).
+    live under ap_dir/"final", never inside the last epoch_NNN directory.
+    As of 2026-07-27, run_adaptive_production_auto_loop's per-epoch
+    convergence gate no longer hands the remaining MD-pool budget to
+    "final" the moment it reports stop_adaptive -- it just continues to the
+    next scheduled epoch, so the loop always runs the full --ap-epochs
+    budget before final starts. (Historically it did break early there,
+    which is why this function must not assume exactly N phases from
+    --ap-epochs alone: it globs whatever epoch_* directories actually ran.)
     """
     phases = []
 

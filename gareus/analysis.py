@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 
-from .io import read_json_file, _json_ready
+from .io import read_json_file, resolve_run_temperature_k, _json_ready
 from .diagnostics import _read_csv_dicts, _safe_float, _sample_counts_by_window, _hist_overlap_np
 
 __all__ = [
@@ -33,8 +33,14 @@ def _ensure_analysis_arrays_npz(out_dir: Path) -> None:
         return
     try:
         from .query import export_analysis_arrays_npz
-        meta = read_json_file(out_dir / "gareus_metadata.json", {}) or {}
-        temp_k = float(meta.get("temperature_K", meta.get("temperature_k", 300.0)) or 300.0)
+        temp_k = resolve_run_temperature_k(out_dir)
+        if temp_k is None:
+            # gareus_metadata.json/run_manifest.json have no usable
+            # temperature; guessing 300 K here would silently corrupt the
+            # reduced-bias matrix for any run not actually at 300 K.
+            print(f"WARNING: could not resolve simulation temperature for {out_dir}; "
+                  f"defaulting to 300.0 K when reconstructing analysis_arrays.npz")
+            temp_k = 300.0
         beta = 1.0 / (8.314462618e-3 * temp_k)
         export_analysis_arrays_npz(out_dir, beta, npz_path)
     except Exception as exc:
