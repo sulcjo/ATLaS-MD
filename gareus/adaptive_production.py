@@ -2533,6 +2533,24 @@ def collect_final_combined_diagnostics(adaptive_dir: Path, registry: WindowState
         )
         if len(rows) < int(policy.final_min_samples_per_state):
             diag.warnings.append("low_final_sample_count")
+        else:
+            # Same off-target check collect_epoch_diagnostics runs during the
+            # adaptive-discovery loop (where it reliably flags a genuine
+            # restraint-too-soft window), but that check was never wired into
+            # the frozen final phase: the pooled final samples are exactly
+            # what feeds the PMF, so an off-target window here matters more,
+            # not less, than during discovery.
+            state_obj = registry.get_state(int(state_id))
+            if state_obj is not None:
+                dev_sigma = _target_deviation_sigma(cv_mean, cv_std, state_obj.primary_center)
+                diag.primary_target_deviation_sigma = dev_sigma
+                if dev_sigma is not None and dev_sigma >= float(policy.max_target_deviation_sigma):
+                    diag.warnings.append("off_target_primary")
+                if state_obj.secondary_center is not None:
+                    sec_dev_sigma = _target_deviation_sigma(smean, sstd, state_obj.secondary_center)
+                    diag.secondary_target_deviation_sigma = sec_dev_sigma
+                    if sec_dev_sigma is not None and sec_dev_sigma >= float(policy.max_target_deviation_sigma):
+                        diag.warnings.append("off_target_secondary")
         if bstd is not None and bstd > float(policy.max_gamd_boost_sd_kcal_mol):
             diag.warnings.append("high_gamd_boost_sd")
         state_rows.append(diag)
@@ -2608,6 +2626,7 @@ def evaluate_adaptive_quality_gate(
 
     low_states = []
     high_boost = []
+    off_target_states = []
     for state in final_diagnostics.get("states", []) or []:
         sid = int(state.get("state_id", -1))
         count = int(state.get("sample_count", 0) or 0)
@@ -2616,12 +2635,31 @@ def evaluate_adaptive_quality_gate(
         bsd = state.get("gamd_boost_sd_kcal_mol")
         if bsd is not None and float(bsd) > float(policy.max_gamd_boost_sd_kcal_mol):
             high_boost.append({"state_id": sid, "boost_sd_kcal_mol": float(bsd), "maximum": float(policy.max_gamd_boost_sd_kcal_mol)})
+        state_warnings = state.get("warnings", []) or []
+        if "off_target_primary" in state_warnings or "off_target_secondary" in state_warnings:
+            off_target_states.append({
+                "state_id": sid,
+                "primary_target_deviation_sigma": state.get("primary_target_deviation_sigma"),
+                "secondary_target_deviation_sigma": state.get("secondary_target_deviation_sigma"),
+                "maximum_sigma": float(policy.max_target_deviation_sigma),
+                "warnings": [w for w in state_warnings if w.startswith("off_target_")],
+            })
     if low_states:
         needs_more_sampling.append(f"{len(low_states)} state(s) have fewer than {policy.final_min_samples_per_state} final samples")
         recommendations.append("Run additional frozen final sampling with the same active window table.")
     if high_boost:
         needs_more_sampling.append(f"{len(high_boost)} state(s) exceed the GaMD boost SD threshold")
         recommendations.append("Inspect GaMD boost distributions; consider lower sigma0 or final unboosted/weakly boosted production.")
+    if off_target_states:
+        needs_more_sampling.append(
+            f"{len(off_target_states)} final state(s) sample more than {policy.max_target_deviation_sigma:g} "
+            "of their own sigma away from their restraint target"
+        )
+        recommendations.append(
+            "Restraint is too soft relative to the free-energy gradient at these windows -- "
+            "raise the umbrella force constant (or use a per-window table) for a future run; "
+            "this run's PMF should treat these windows' contribution cautiously."
+        )
 
     weak_edges = []
     for edge in final_diagnostics.get("edges", []) or []:
@@ -2674,6 +2712,7 @@ def evaluate_adaptive_quality_gate(
         "recommendations": sorted(set(recommendations)),
         "low_sample_states": low_states,
         "high_boost_states": high_boost,
+        "off_target_states": off_target_states,
         "weak_edges": _json_ready(weak_edges),
         "primary_coverage_fraction": coverage_fraction,
         "policy": _json_ready(asdict(policy)),
@@ -2689,6 +2728,21 @@ def evaluate_adaptive_quality_gate(
     payload["json"] = str(json_path)
     payload["md"] = str(md_path)
     return payload
+
+
+def quality_gate_fixable_by_more_final_sampling(quality_gate: Dict[str, Any]) -> bool:
+    """True only for findings more frozen-final sampling can actually fix.
+
+    ``status == "needs_more_sampling"`` also covers off_target_states and
+    high_boost_states, neither of which improves by adding more samples at
+    the same restraint center/GaMD calibration -- an off-target window is a
+    restraint-vs-landscape-stiffness problem, and pooling in more samples
+    from the same collapsed basin can even inflate the achieved std enough
+    to shrink dev_sigma back under threshold on a later round, silently
+    clearing the flag with no physical change. The frozen-final extension
+    loop must not treat those as a reason to keep spinning.
+    """
+    return bool(quality_gate.get("low_sample_states")) or bool(quality_gate.get("weak_edges"))
 
 
 def _write_quality_gate_markdown(path: Path, payload: Dict[str, Any]) -> None:
@@ -2725,6 +2779,19 @@ def _write_quality_gate_markdown(path: Path, payload: Dict[str, Any]) -> None:
         lines.append("|---:|---:|---:|")
         for row in low[:100]:
             lines.append(f"| {row.get('state_id')} | {row.get('sample_count')} | {row.get('minimum')} |")
+        lines.append("")
+    off_target = payload.get("off_target_states", []) or []
+    if off_target:
+        lines.append("## Off-target final states")
+        lines.append("Mean sampled CV sits more than the configured sigma threshold away from the window's own restraint target -- the restraint is too soft relative to the free-energy gradient there.")
+        lines.append("")
+        lines.append("| state_id | primary dev (sigma) | secondary dev (sigma) | max allowed |")
+        lines.append("|---:|---:|---:|---:|")
+        for row in off_target[:100]:
+            lines.append(
+                f"| {row.get('state_id')} | {row.get('primary_target_deviation_sigma')} | "
+                f"{row.get('secondary_target_deviation_sigma')} | {row.get('maximum_sigma')} |"
+            )
         lines.append("")
     Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -4830,7 +4897,7 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
     ext_rounds = max(0, int(policy.final_quality_extension_rounds or 0))
     ext_steps = int(policy.final_quality_extension_steps or final_steps)
     for ext_index in range(ext_rounds):
-        if quality_gate.get("status") not in {"needs_more_sampling"}:
+        if not quality_gate_fixable_by_more_final_sampling(quality_gate):
             break
         ext_dir = adaptive_dir / f"final_extension_{ext_index + 1:03d}"
         ext_dir.mkdir(parents=True, exist_ok=True)
