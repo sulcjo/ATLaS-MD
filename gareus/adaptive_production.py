@@ -1593,6 +1593,99 @@ def _apply_tica_centers_to_registry(
     return updated
 
 
+def _propose_tica_coverage_actions(
+    registry: "WindowStateRegistry",
+    primary_cv: np.ndarray,
+    tic1: np.ndarray,
+    policy: Optional[AdaptiveDecisionPolicy] = None,
+    *,
+    temperature_K: float = 298.0,
+    population_fraction: float = 0.01,
+) -> List[Tuple]:
+    """Add home states for substantially populated uncovered tIC1 regions.
+
+    This runs only after a tICA coordinate change.  It uses the newly projected
+    tIC1 values, rather than stale scalar CV2 values from the preceding epoch.
+    Normal weak-edge additions are intentionally not used as a cap here: the
+    existing runtime replica limit remains responsible for launch capacity.
+    """
+    policy = policy or AdaptiveDecisionPolicy()
+    primary = np.asarray(primary_cv, dtype=float)
+    secondary = np.asarray(tic1, dtype=float)
+    active = [s for s in registry.active_states()
+              if s.secondary_center is not None and (s.secondary_k or 0.0) > 0.0]
+    finite = np.isfinite(primary) & np.isfinite(secondary)
+    if not active or not np.any(finite):
+        return []
+
+    kbt_kcal = 1.987204e-3 * float(temperature_K)
+    centers = np.asarray([float(s.secondary_center) for s in active], dtype=float)
+    springs = np.asarray([float(s.secondary_k) for s in active], dtype=float)
+    radii = 2.0 * np.sqrt(kbt_kcal / springs)
+    values = secondary[finite]
+    nearest = np.min(np.abs(values[:, None] - centers[None, :]) - radii[None, :], axis=1)
+    uncovered = nearest > 0.0
+    if not np.any(uncovered):
+        return []
+
+    uncovered_values = values[uncovered]
+    uncovered_primary = primary[finite][uncovered]
+    width = max(float(np.median(radii)), np.finfo(float).eps)
+    origin = float(np.min(uncovered_values))
+    bin_ids = np.floor((uncovered_values - origin) / width).astype(int)
+    threshold = max(3, int(math.ceil(float(population_fraction) * int(finite.sum()))))
+    actions: List[Tuple] = []
+    unique_ids, per_bin_counts = np.unique(bin_ids, return_counts=True)
+    unique_ids = unique_ids[per_bin_counts >= threshold]
+    start = 0
+    while start < len(unique_ids):
+        end = start + 1
+        while end < len(unique_ids) and unique_ids[end] == unique_ids[end - 1] + 1:
+            end += 1
+        contiguous_ids = unique_ids[start:end]
+        start = end
+        segment_start = 0
+        while segment_start < len(contiguous_ids):
+            segment_end = segment_start + 1
+            while (segment_end < len(contiguous_ids)
+                   and (contiguous_ids[segment_end] - contiguous_ids[segment_start] + 1) * width <= 2.0 * width):
+                segment_end += 1
+            group_ids = contiguous_ids[segment_start:segment_end]
+            segment_start = segment_end
+            mask = np.isin(bin_ids, group_ids)
+            population = int(mask.sum())
+            target_primary = float(np.median(uncovered_primary[mask]))
+            target_secondary = float(np.median(uncovered_values[mask]))
+            if registry.has_near_duplicate(target_primary, target_secondary, policy):
+                continue
+            # Select a parent using harmonic distance in both umbrella dimensions.
+            distances = []
+            for state in active:
+                p_width = math.sqrt(kbt_kcal / float(state.primary_k))
+                s_width = math.sqrt(kbt_kcal / float(state.secondary_k))
+                distances.append(
+                    ((target_primary - float(state.primary_center)) / p_width) ** 2
+                    + ((target_secondary - float(state.secondary_center)) / s_width) ** 2
+                )
+            parent = active[int(np.argmin(distances))]
+            params = (target_primary, float(parent.primary_k), target_secondary, float(parent.secondary_k))
+            lo = float(np.min(uncovered_values[mask]))
+            hi = float(np.max(uncovered_values[mask]))
+            reason = (
+                "post-tICA populated uncovered region: "
+                f"tic1=[{lo:.6g},{hi:.6g}], n={population}"
+            )
+            metadata = {
+                "population_count": population,
+                "population_fraction": population / int(finite.sum()),
+                "tic1_min": lo,
+                "tic1_max": hi,
+                "coverage_radius": float(radii[int(np.argmin(np.abs(centers - target_secondary)))]),
+            }
+            actions.append(("tica_coverage_add", int(parent.state_id), params, reason, metadata))
+    return actions
+
+
 def _compute_mbar_weights_for_tica(
     primary_cv: np.ndarray,
     secondary_cv: np.ndarray,
@@ -4167,6 +4260,16 @@ class AdaptiveProductionController:
                     parent_state_id=None if parent is None else int(parent),
                     epoch=int(epoch) + 1, source="adaptive_production", reason=str(reason),
                 )
+            elif kind == "tica_coverage_add":
+                _, parent, params, reason, metadata = action
+                self.registry.add_state(
+                    primary_center=params[0], primary_k=params[1],
+                    secondary_center=params[2] if len(params) > 2 else None,
+                    secondary_k=params[3] if len(params) > 3 else None,
+                    parent_state_id=None if parent is None else int(parent),
+                    epoch=int(epoch) + 1, source="tica_coverage", reason=str(reason),
+                    metadata=dict(metadata),
+                )
             elif kind == "split":
                 _, parent, children_params, reason = action
                 self.registry.retire_state(int(parent), int(epoch) + 1, f"split: {reason}")
@@ -4639,6 +4742,26 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                     tica_update_report["registry_states_updated"] = n_updated
                     print(f"    tICA: updated secondary_center for {n_updated} active registry states")
                     if n_updated > 0:
+                        try:
+                            from .tica import TICAResult, load_epoch_dihedral_obs, project_tica1
+                            _X, _wids, _primary, _secondary, _steps = load_epoch_dihedral_obs(epoch_dir)
+                            _result = TICAResult.load(tica_update_report["state_file"])
+                            _coverage_actions = _propose_tica_coverage_actions(
+                                registry, _primary, project_tica1(_X, _result), policy,
+                                temperature_K=float(getattr(args, "temperature", 298.0) or 298.0),
+                            )
+                            if _coverage_actions:
+                                _apply_registry_actions(registry, _coverage_actions, epoch)
+                            tica_update_report["tica_coverage_actions"] = [
+                                {"action": action[0], "parent_state_id": action[1],
+                                 "params": list(action[2]), "reason": action[3],
+                                 "metadata": action[4]}
+                                for action in _coverage_actions
+                            ]
+                            print(f"    tICA: added {len(_coverage_actions)} populated-region coverage state(s)")
+                        except Exception as _coverage_exc:
+                            tica_update_report["tica_coverage_error"] = str(_coverage_exc)
+                            print(f"WARNING: tICA coverage extension skipped ({_coverage_exc})")
                         registry.save(adaptive_dir)
                         # Re-write window CSV so the next epoch sees updated centers.
                         # (Initial write at lines above precedes this block; without
