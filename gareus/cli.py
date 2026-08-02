@@ -140,6 +140,14 @@ def _add_cv_args(p: argparse.ArgumentParser) -> None:
                    help="Enable CV1 frontier probing during adaptive-feedback.")
     p.add_argument("--cv1-frontier-probe-count", type=int, default=2,
                    help="Number of frontier probe windows.")
+    p.add_argument("--cv1-frontier-probe-spacing", type=float, default=0.05,
+                   help="Contact-fraction increment between empirical frontier probes.")
+    p.add_argument("--cv1-frontier-confirm-rounds", type=int, default=2,
+                   help="Independent restrained probes required before extending contact frontier.")
+    p.add_argument("--cv1-frontier-min-hit-fraction", type=float, default=0.02,
+                   help="Minimum probe-sample fraction at/above target required to confirm frontier.")
+    p.add_argument("--cv1-frontier-unreachable-deficit", type=float, default=0.08,
+                   help="Target-minus-achieved fraction marking a frontier probe unreachable.")
 
     # CV2 adaptive — secondary CV parameters
     p.add_argument("--cv2-centers", nargs="*", type=float, default=None,
@@ -677,7 +685,7 @@ def _validate_contact_args(args: argparse.Namespace) -> None:
         raise ValueError("--contact-min-sequence-separation must be >= 1")
     if bool(getattr(args, "contact_normalize", True)):
         cmin = float(getattr(args, "contact_adaptive_min", 0.0) or 0.0)
-        cmax = float(getattr(args, "contact_adaptive_max", 0.80) or 0.80)
+        cmax = float(getattr(args, "contact_adaptive_max", 1.0) or 1.0)
         if not (math.isfinite(cmin) and math.isfinite(cmax)) or cmax <= cmin:
             raise ValueError("cv1-range-max must be finite and > cv1-range-min for contacts")
         if cmin < -1e-8 or cmax > 1.0 + 1e-8:
@@ -686,6 +694,19 @@ def _validate_contact_args(args: argparse.Namespace) -> None:
         raise ValueError("--cv1-target-spacing must be positive")
     if int(getattr(args, "cv1_boundary_pull_steps", 5000) or 0) < 0:
         raise ValueError("--cv1-boundary-pull-steps must be >= 0")
+    if bool(getattr(args, "contact_frontier_enabled", False)):
+        probe_spacing = float(getattr(args, "contact_frontier_probe_spacing", 0.05) or 0.0)
+        confirm_rounds = int(getattr(args, "contact_frontier_confirm_rounds", 0) or 0)
+        min_hit_fraction = float(getattr(args, "contact_frontier_min_hit_fraction", 0.0) or 0.0)
+        unreachable_deficit = float(getattr(args, "contact_frontier_unreachable_deficit", 0.0) or 0.0)
+        if not math.isfinite(probe_spacing) or probe_spacing <= 0.0:
+            raise ValueError("--cv1-frontier-probe-spacing must be positive and finite")
+        if confirm_rounds < 1:
+            raise ValueError("--cv1-frontier-confirm-rounds must be >= 1")
+        if not math.isfinite(min_hit_fraction) or not 0.0 < min_hit_fraction <= 1.0:
+            raise ValueError("--cv1-frontier-min-hit-fraction must be in (0, 1]")
+        if not math.isfinite(unreachable_deficit) or unreachable_deficit <= 0.0:
+            raise ValueError("--cv1-frontier-unreachable-deficit must be positive and finite")
     if (
         not bool(getattr(args, "resume", False))
         and not bool(getattr(args, "self_test_primary_cv_force", False))
@@ -770,7 +791,7 @@ def _shim_cv1_legacy_names(args: argparse.Namespace) -> None:
 
     # contact-mode legacy attrs
     args.contact_adaptive_min = _cv1_range_min
-    args.contact_adaptive_max = _cv1_range_max if _cv1_range_max > 0 else 0.80
+    args.contact_adaptive_max = _cv1_range_max if _cv1_range_max > 0 else 1.0
     args.contact_adaptive_target_spacing = _cv1_spacing if _cv1_spacing > 0 else 0.15
     args.contact_adaptive_default_k_kcal = _cv1_k_def if _cv1_k_def > 0 else 25.0
     args.contact_adaptive_min_k_kcal = _cv1_k_min if _cv1_k_min > 0 else 5.0
@@ -793,12 +814,12 @@ def _shim_cv1_legacy_names(args: argparse.Namespace) -> None:
     args.contact_frontier_percentile = 99.0
     args.contact_frontier_margin = 0.02
     args.contact_frontier_min_span = 0.10
-    args.contact_frontier_probe_spacing = 0.05
+    args.contact_frontier_probe_spacing = args.cv1_frontier_probe_spacing
     args.contact_frontier_max_probe_offset = 0.15
     args.contact_disable_gapfill_above_unvalidated_frontier = True
-    args.contact_frontier_confirm_rounds = 2
-    args.contact_frontier_min_hit_fraction = 0.02
-    args.contact_frontier_unreachable_deficit = 0.08
+    args.contact_frontier_confirm_rounds = args.cv1_frontier_confirm_rounds
+    args.contact_frontier_min_hit_fraction = args.cv1_frontier_min_hit_fraction
+    args.contact_frontier_unreachable_deficit = args.cv1_frontier_unreachable_deficit
     args.contact_frontier_by_secondary_slice = True
 
     # Dropped legacy per-axis window count bounds (still used as fallbacks when no

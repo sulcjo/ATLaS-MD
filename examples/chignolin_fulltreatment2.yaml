@@ -84,9 +84,13 @@ contact_cv:
   cv1_k_min: 50.0
   cv1_k_max: 100.0
 
-  # Frontier probing (was contact_frontier_enabled + contact_frontier_probe_count)
+  # Frontier probing: empirical ceiling; each accepted step must hold in both rounds.
   cv1_frontier: true
   cv1_frontier_probe_count: 2
+  cv1_frontier_probe_spacing: 0.05
+  cv1_frontier_confirm_rounds: 2
+  cv1_frontier_min_hit_fraction: 0.02
+  cv1_frontier_unreachable_deficit: 0.08
 
 cv2:
   # CV2 adaptive (was secondary_cv_*)
