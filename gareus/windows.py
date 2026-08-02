@@ -566,25 +566,58 @@ def _contact_effective_range(
 ) -> tuple[float, float]:
     """Effective [min, max] contact-fraction window range from CV1 boundary pulls.
 
-    The extended (min) direction equilibrates in picoseconds, so the pulled
-    minimum is trustworthy.  Folding (the max direction) is slow: a short
-    boundary pull routinely under-reaches the native contact fraction, and
-    trusting it collapses every umbrella window into the unfolded band, leaving
-    the folded basin unsampled.  The max is therefore floored at the
-    user-configured ``contact_adaptive_max`` — a pull may still EXPAND beyond it,
-    but never SHRINK below it — mirroring the lower bound's protection against
-    ``user_min``.  Both bounds are clamped to the [0, 1] fraction interval and a
-    minimum window width is enforced.
+    The lower bound retains its configured safety floor.  The upper bound is
+    empirical: contact-frontier probes establish where restrained production
+    can hold, so a guessed ``contact_adaptive_max`` must not override them.
+    Both bounds are clamped to [0, 1] and a minimum window width is enforced.
     """
     lo = max(0.0, float(raw_lo) - float(margin))
     hi = min(1.0, float(raw_hi) + float(margin))
     lo = min(lo, float(user_min))                    # never push lower bound above user config
-    hi = max(hi, min(1.0, float(user_max)))          # never let a short fold-pull shrink below user config
     lo = max(0.0, min(1.0, lo))
     hi = max(0.0, min(1.0, hi))
     if hi - lo < 0.05:
         hi = min(1.0, lo + 0.10)
     return float(lo), float(hi)
+
+
+def _frontier_probe_confirmed(
+    values: Sequence[float],
+    target: float,
+    *,
+    min_hit_fraction: float,
+    unreachable_deficit: float,
+) -> dict:
+    """Classify one frontier probe from sustained target occupancy."""
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return {
+            "confirmed": False, "reason": "no_samples", "n_samples": 0,
+            "n_hits": 0, "required_hits": 0, "hit_fraction": 0.0, "achieved": None,
+        }
+    achieved = float(np.max(arr))
+    deficit = float(target) - achieved
+    if deficit >= float(unreachable_deficit):
+        return {
+            "confirmed": False, "reason": "unreachable", "n_samples": int(arr.size),
+            "n_hits": 0, "required_hits": max(2, int(math.ceil(arr.size * min_hit_fraction))),
+            "hit_fraction": 0.0, "achieved": achieved,
+        }
+    n_hits = int(np.count_nonzero(arr >= float(target)))
+    required_hits = max(2, int(math.ceil(arr.size * float(min_hit_fraction))))
+    hit_fraction = float(n_hits / arr.size)
+    if n_hits < required_hits:
+        return {
+            "confirmed": False, "reason": "insufficient_hold", "n_samples": int(arr.size),
+            "n_hits": n_hits, "required_hits": required_hits,
+            "hit_fraction": hit_fraction, "achieved": achieved,
+        }
+    return {
+        "confirmed": True, "reason": "confirmed", "n_samples": int(arr.size),
+        "n_hits": n_hits, "required_hits": required_hits,
+        "hit_fraction": hit_fraction, "achieved": achieved,
+    }
 
 
 def adaptive_contact_centers(args) -> np.ndarray:
@@ -599,7 +632,7 @@ def adaptive_contact_centers(args) -> np.ndarray:
         centers = np.asarray([float(x) for x in args.contact_centers], dtype=float)
     else:
         lo = float(getattr(args, "contact_adaptive_effective_min", getattr(args, "contact_adaptive_min", 0.0)) or 0.0)
-        hi = float(getattr(args, "contact_adaptive_effective_max", getattr(args, "contact_adaptive_max", 0.80)) or 0.80)
+        hi = float(getattr(args, "contact_adaptive_effective_max", getattr(args, "contact_adaptive_max", 1.0)) or 1.0)
         if bool(getattr(args, "contact_normalize", True)):
             lo = max(0.0, min(1.0, lo))
             hi = max(0.0, min(1.0, hi))
@@ -729,7 +762,7 @@ def run_cv_boundary_pulls(
         info: dict = {"used": False, "reason": "no equil_state" if equil_state is None else "cv1_boundary_pull_steps <= 0"}
         if is_contacts:
             lo = float(getattr(args, "contact_adaptive_min", 0.0) or 0.0)
-            hi = float(getattr(args, "contact_adaptive_max", 0.80) or 0.80)
+            hi = float(getattr(args, "contact_adaptive_max", 1.0) or 1.0)
         else:
             lo, hi, _ = estimate_terminal_cv_envelope_a(topology, args)
         return lo, hi, info
@@ -872,6 +905,7 @@ def run_cv_boundary_pulls(
             pull_results[label] = {
                 "target": float(target),
                 "achieved": achieved,
+                "values": arr.tolist(),
                 "n_samples": int(arr.size),
                 "steps_run": int(done),
                 "early_exit": bool(early_exit),
@@ -881,13 +915,89 @@ def run_cv_boundary_pulls(
         else:
             pull_results[label] = {"target": float(target), "achieved": float(target), "n_samples": 0, "steps_run": int(done), "early_exit": False, "warning": "no samples"}
 
-    margin = float(getattr(args, "cv1_boundary_pull_margin", 0.0) or 0.0)
     raw_lo = float(pull_results["min"]["achieved"])
     raw_hi = float(pull_results["max"]["achieved"])
+    frontier_info: dict = {}
+    if is_contacts and bool(getattr(args, "contact_frontier_enabled", False)):
+        max_values = np.asarray(pull_results.get("max", {}).get("values", []), dtype=float)
+        max_values = max_values[np.isfinite(max_values)]
+        min_hit_fraction = float(getattr(args, "contact_frontier_min_hit_fraction", 0.02) or 0.02)
+        unreachable_deficit = float(getattr(args, "contact_frontier_unreachable_deficit", 0.08) or 0.08)
+        spacing = float(getattr(args, "contact_frontier_probe_spacing", 0.05) or 0.05)
+        rounds = max(1, int(getattr(args, "contact_frontier_confirm_rounds", 2) or 2))
+        n_probes = max(0, int(getattr(args, "contact_frontier_probe_count", 2) or 2))
+        # Highest value held by at least the configured fraction of the initial
+        # pull samples.  Unlike the raw maximum, this is not a one-frame touch.
+        confirmed = float(np.quantile(max_values, max(0.0, 1.0 - min_hit_fraction))) if max_values.size else 0.0
+        probes = []
+
+        def _run_contact_probe(target: float, seed_offset: int) -> np.ndarray:
+            system = _make_system()
+            integrator = make_langevin_integrator(
+                openmm, unit, args, timestep_fs=ts,
+                temperature_k=float(args.temperature_k), friction_per_ps=friction,
+                seed_offset=seed_offset,
+            )
+            sim = app.Simulation(topology, system, integrator, platform, props)
+            try:
+                box = equil_state.getPeriodicBoxVectors()
+                if box is not None:
+                    sim.context.setPeriodicBoxVectors(*box)
+            except Exception:
+                pass
+            sim.context.setPositions(equil_state.getPositions())
+            try:
+                vel = equil_state.getVelocities()
+                sim.context.setVelocities(vel) if vel is not None else sim.context.setVelocitiesToTemperature(float(args.temperature_k) * unit.kelvin, int(args.seed) + seed_offset)
+            except Exception:
+                sim.context.setVelocitiesToTemperature(float(args.temperature_k) * unit.kelvin, int(args.seed) + seed_offset)
+            sim.context.setParameter("r0", _r0(target))
+            sim.context.setParameter("k", pull_k_openmm)
+            values = []
+            done = 0
+            try:
+                while done < steps:
+                    chunk = min(safe_chunk, steps - done)
+                    sim.step(chunk)
+                    done += chunk
+                    if done % sample_interval == 0 or done >= steps:
+                        value = _read_cv(sim)
+                        if math.isfinite(value):
+                            values.append(value)
+            finally:
+                release_openmm_contexts(sim, integrator, system)
+            return np.asarray(values, dtype=float)
+
+        for probe_index in range(n_probes):
+            target = min(1.0, confirmed + spacing)
+            rounds_report = []
+            for round_index in range(rounds):
+                values = _run_contact_probe(target, 1200 + 100 * probe_index + round_index)
+                verdict = _frontier_probe_confirmed(
+                    values, target, min_hit_fraction=min_hit_fraction,
+                    unreachable_deficit=unreachable_deficit,
+                )
+                rounds_report.append(verdict)
+            accepted = bool(rounds_report) and all(r["confirmed"] for r in rounds_report)
+            probes.append({"target": target, "accepted": accepted, "rounds": rounds_report})
+            if not accepted:
+                break
+            confirmed = target
+            if confirmed >= 1.0:
+                break
+        raw_hi = confirmed
+        frontier_info = {
+            "enabled": True, "initial_confirmed": float(np.quantile(max_values, max(0.0, 1.0 - min_hit_fraction))) if max_values.size else None,
+            "confirmed_max": confirmed, "probe_spacing": spacing,
+            "confirm_rounds": rounds, "min_hit_fraction": min_hit_fraction,
+            "unreachable_deficit": unreachable_deficit, "probes": probes,
+        }
+
+    margin = float(getattr(args, "cv1_boundary_pull_margin", 0.0) or 0.0)
 
     if is_contacts:
         user_min = float(getattr(args, "contact_adaptive_min", 0.0) or 0.0)
-        user_max = float(getattr(args, "contact_adaptive_max", 0.80) or 0.80)
+        user_max = float(getattr(args, "contact_adaptive_max", 1.0) or 1.0)
         lo, hi = _contact_effective_range(raw_lo, raw_hi, user_min, user_max, margin)
         setattr(args, "contact_adaptive_effective_min", float(lo))
         setattr(args, "contact_adaptive_effective_max", float(hi))
@@ -903,6 +1013,7 @@ def run_cv_boundary_pulls(
         "effective_hi": float(hi),
         "pull_to_min": pull_results.get("min", {}),
         "pull_to_max": pull_results.get("max", {}),
+        **({} if not frontier_info else {"contact_frontier": frontier_info}),
         **({} if is_contacts else {"envelope": envelope_info}),
     }
     write_json(out_dir / "cv_boundary_pulls.json", _json_ready(info))
@@ -953,9 +1064,9 @@ def choose_windows(args, out_dir: Path, openmm, app, unit, forcefield, topology,
             "contact_adaptive": {
                 "enabled": bool(mode in {"adaptive", "adaptive-feedback"}),
                 "min": float(getattr(args, "contact_adaptive_min", 0.0) or 0.0),
-                "max": float(getattr(args, "contact_adaptive_max", 0.80) or 0.80),
+                "max": float(getattr(args, "contact_adaptive_max", 1.0) or 1.0),
                 "effective_min": float(getattr(args, "contact_adaptive_effective_min", getattr(args, "contact_adaptive_min", 0.0)) or 0.0),
-                "effective_max": float(getattr(args, "contact_adaptive_effective_max", getattr(args, "contact_adaptive_max", 0.80)) or 0.80),
+                "effective_max": float(getattr(args, "contact_adaptive_effective_max", getattr(args, "contact_adaptive_max", 1.0)) or 1.0),
                 "target_spacing": float(getattr(args, "contact_adaptive_target_spacing", 0.15) or 0.15),
                 "min_windows_axis_legacy": int(getattr(args, "contact_adaptive_min_windows", 4) or 4),
                 "max_windows_axis_legacy": int(getattr(args, "contact_adaptive_max_windows", 12) or 12),

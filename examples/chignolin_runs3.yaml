@@ -241,13 +241,13 @@ contact_cv:
   cv1_boundary_pull_steps: 100000  # was: 20000
   cv1_boundary_pull_k: 200.0       # was: 100.0
 
-  # Frontier probing (was contact_frontier_enabled + contact_frontier_probe_count)
+  # Frontier probing: empirical ceiling; each accepted step must hold in both rounds.
   cv1_frontier: true
   cv1_frontier_probe_count: 2
-  # Dropped: contact_frontier_percentile, margin, min_span, probe_spacing,
-  #          max_probe_offset, disable_gapfill_above_unvalidated_frontier,
-  #          confirm_rounds, min_hit_fraction, unreachable_deficit,
-  #          by_secondary_slice — all hardcoded to former defaults.
+  cv1_frontier_probe_spacing: 0.05
+  cv1_frontier_confirm_rounds: 2
+  cv1_frontier_min_hit_fraction: 0.02
+  cv1_frontier_unreachable_deficit: 0.08
 
 cv2:
   # CV2 adaptive (was secondary_cv_*)
