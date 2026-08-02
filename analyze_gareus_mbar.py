@@ -797,7 +797,13 @@ def load_csv(prod: Path, load_notes: Optional[list[str]] = None) -> Data:
     _boost_dih_arg = boost_dih if np.any(np.isfinite(boost_dih)) else None
     return clean(Data(prod,prod/'pmf_analysis',cv,cv2,rg,win,rep,step,u,centers,ks,beta,temp,boost,pot,str(prod/'samples.csv'),meta,boost_dih_kj=_boost_dih_arg))
 
-def _find_adaptive_epoch_dirs(adaptive_dir: Path) -> list:
+def _epoch_dir_index(path: Path) -> Optional[int]:
+    """Return ``epoch_NNN`` index, or ``None`` for non-epoch directories."""
+    match = re.fullmatch(r'epoch_(\d+)', path.name)
+    return int(match.group(1)) if match else None
+
+
+def _find_adaptive_epoch_dirs(adaptive_dir: Path, epoch_ids: Optional[set[int]] = None) -> list:
     """Return list of (run_dir, window_map_path) for each epoch/final with Parquet samples."""
     def _parquet_subdir(d: Path, parent_wmap: Path) -> tuple | None:
         """Return (d, wmap) if d has Parquet samples, else None."""
@@ -813,6 +819,8 @@ def _find_adaptive_epoch_dirs(adaptive_dir: Path) -> list:
     result = []
     for cand in sorted(adaptive_dir.iterdir()):
         if not cand.is_dir():
+            continue
+        if epoch_ids is not None and _epoch_dir_index(cand) not in epoch_ids:
             continue
         # epoch_NNN/ directly holds samples/ (first epoch pattern)
         if (cand/'samples').is_dir() and (cand/'segments.json').exists() and (cand/'epoch_window_map.csv').exists():
@@ -851,11 +859,13 @@ def _find_selfcontained_epoch_dirs(ap: Path) -> list:
     return out
 
 
-def _find_adaptive_epoch_csv_sources(ap: Path) -> list:
+def _find_adaptive_epoch_csv_sources(ap: Path, epoch_ids: Optional[set[int]] = None) -> list:
     """Return list of Path for each CSV-bearing dir under adaptive_production/epoch_NNN/."""
     sources = []
     for epoch_dir in sorted(ap.glob('epoch_[0-9][0-9][0-9]')):
         if not epoch_dir.is_dir():
+            continue
+        if epoch_ids is not None and _epoch_dir_index(epoch_dir) not in epoch_ids:
             continue
         if (epoch_dir / 'samples.csv').exists():
             sources.append(epoch_dir)
@@ -868,15 +878,16 @@ def _find_adaptive_epoch_csv_sources(ap: Path) -> list:
     return sources
 
 
-def _has_epoch_csv_layout(ap: Path) -> bool:
-    return bool(_find_adaptive_epoch_csv_sources(ap))
+def _has_epoch_csv_layout(ap: Path, epoch_ids: Optional[set[int]] = None) -> bool:
+    return bool(_find_adaptive_epoch_csv_sources(ap, epoch_ids=epoch_ids))
 
 
-def load_epoch_csv_adaptive(ap: Path) -> Data:
+def load_epoch_csv_adaptive(ap: Path, epoch_ids: Optional[set[int]] = None) -> Data:
     """Load all epoch/baseline/topup samples.csv files, union windows, rebuild N×K bias matrix."""
-    sources = _find_adaptive_epoch_csv_sources(ap)
+    sources = _find_adaptive_epoch_csv_sources(ap, epoch_ids=epoch_ids)
     if not sources:
-        raise FileNotFoundError(f'No epoch CSV sources found under {ap}')
+        selected = f' for requested epoch(s) {sorted(epoch_ids)}' if epoch_ids is not None else ''
+        raise FileNotFoundError(f'No epoch CSV sources found under {ap}{selected}')
     root = ap.parent
     meta: dict = {}
     meta.update(rjson(root / 'run_args.json', {}))
@@ -1200,7 +1211,8 @@ def _load_epoch_task(epoch_dir: Path, wmap_path: Path, n_threads: int) -> tuple:
     return samples, wmap, ep_meta
 
 
-def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_workers: int = 4) -> Data:
+def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_workers: int = 4,
+                                epoch_ids: Optional[set[int]] = None) -> Data:
     """Load MBAR inputs from adaptive-production Parquet epoch data.
 
     Pools samples from all epoch run directories, remaps per-epoch window IDs to
@@ -1261,9 +1273,10 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
     sec_ks         = np.array([float(r['secondary_k'])      if r.get('secondary_k', '')      not in ('', 'None', 'nan') else 0.0   for r in reg_rows])
     has_secondary  = np.any(np.isfinite(sec_centers))
 
-    epoch_dirs = _find_adaptive_epoch_dirs(adaptive_dir)
+    epoch_dirs = _find_adaptive_epoch_dirs(adaptive_dir, epoch_ids=epoch_ids)
     if not epoch_dirs:
-        raise FileNotFoundError(f'No epoch Parquet data found in {adaptive_dir}')
+        selected = f' for requested epoch(s) {sorted(epoch_ids)}' if epoch_ids is not None else ''
+        raise FileNotFoundError(f'No epoch Parquet data found in {adaptive_dir}{selected}')
 
     all_cv = []; all_cv2 = []; all_window = []; all_step = []
     all_replica = []; all_boost = []; all_boost_dih = []; all_potential = []; all_epoch_src = []
@@ -1806,22 +1819,32 @@ def _apply_analysis_stride(d: Data, stride: int, offset: int = 0) -> Data:
     d.meta['analysis_stride_offset']=int(offset)
     return d
 
-def load_data(inp: Path, out: Optional[Path], source: str = 'auto', no_augment: bool = False, n_threads: int = 0, n_workers: int = 4) -> Data:
+def load_data(inp: Path, out: Optional[Path], source: str = 'auto', no_augment: bool = False,
+              n_threads: int = 0, n_workers: int = 4,
+              epoch_ids: Optional[set[int]] = None) -> Data:
     prod=prod_dir_of(inp)
     # Adaptive-production: prefer new Parquet epoch data, fall back to legacy NPZ.
     if prod.name == 'adaptive_production':
         has_registry = (prod / 'final_registry_used_for_mbar.csv').exists() or (prod / 'state_registry.csv').exists()
         has_epoch_parquet = has_registry and any(prod.glob('*/samples/**/*.parquet'))
         if not has_epoch_parquet:
-            has_epoch_parquet = bool(_find_adaptive_epoch_dirs(prod))
+            has_epoch_parquet = bool(_find_adaptive_epoch_dirs(prod, epoch_ids=epoch_ids))
         if has_epoch_parquet:
-            d = load_parquet_adaptive_union(prod, n_threads=n_threads, n_workers=n_workers)
+            d = load_parquet_adaptive_union(
+                prod, n_threads=n_threads, n_workers=n_workers, epoch_ids=epoch_ids)
         elif (prod / 'adaptive_union_mbar.npz').exists():
+            if epoch_ids is not None:
+                raise ValueError(
+                    '--epoch requires per-epoch Parquet or CSV inputs; '
+                    'adaptive_union_mbar.npz cannot be subset safely.')
             d = load_union_npz(prod)
-        elif _has_epoch_csv_layout(prod):
-            d = load_epoch_csv_adaptive(prod)
+        elif _has_epoch_csv_layout(prod, epoch_ids=epoch_ids):
+            d = load_epoch_csv_adaptive(prod, epoch_ids=epoch_ids)
         else:
-            raise FileNotFoundError(f'adaptive_production/ has neither epoch Parquet data nor adaptive_union_mbar.npz nor epoch CSV layout in {prod}')
+            selected = f' for requested epoch(s) {sorted(epoch_ids)}' if epoch_ids is not None else ''
+            raise FileNotFoundError(
+                'adaptive_production/ has neither epoch Parquet data nor '
+                f'adaptive_union_mbar.npz nor epoch CSV layout in {prod}{selected}')
         if out is not None: d.out_dir = Path(out)
         return d
     requested=str(source or 'auto').strip().lower()
@@ -9469,6 +9492,8 @@ def analyze(d,args, progress: Optional[Progress] = None):
 def parse_args(argv=None):
     p=argparse.ArgumentParser(description='GaREUS MBAR/PMF analysis. By default, this runs the full analysis suite: main CV PMF, convergence plots, Rg, distance-Rg 2D FES, PCA1-PCA2 FES, phi/psi/Ramachandran, SASA, secondary-structure fractions, and internal-contact PMFs whenever trajectories/topology are available.', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument('input', help='Run directory or final_production directory')
+    p.add_argument('--epoch', dest='epochs', type=int, action='append', default=None,
+                   metavar='N', help='Pool only adaptive-production epoch N; repeat to select multiple epochs.')
     p.add_argument('--out', default=None, help='PMF analysis output directory; default: <final_production>/pmf_analysis')
     p.add_argument('--analysis-source', choices=['auto','parquet','npz','csv'], default='auto', help='Analysis input source. auto prefers Parquet chunks (new format) then npz then csv; parquet reads segments.json + samples/*.parquet directly (new gareus package format); npz uses analysis_arrays.npz/analysis_chunks; csv uses samples.csv.')
     p.add_argument('--bins', type=int, default=60)
@@ -9603,6 +9628,8 @@ def parse_args(argv=None):
     p.add_argument('--adaptive-diag-stride', type=int, default=3, metavar='N', help='Sub-sample stride for adaptive diagnostic density maps. Higher = faster but coarser. Default 3.')
     p.add_argument('--no-adaptive-diag-coverage', action='store_true', help='Skip the per-phase 2D density map panel (fig1) from adaptive diagnostics — the slowest panel. Other panels still run.')
     args=p.parse_args(argv)
+    if args.epochs is not None and any(epoch < 0 for epoch in args.epochs):
+        p.error('--epoch must be non-negative')
     if getattr(args,'no_rg',False):
         args.rg_from_trajectories='never'
     if getattr(args,'no_pca_fes',False):
@@ -9640,7 +9667,8 @@ def main(argv=None):
     progress=Progress()
     progress.step('load', 'reading current GaREUS outputs')
     _t0=time.time()
-    d=load_data(Path(args.input), Path(args.out) if args.out else None, args.analysis_source, no_augment=getattr(args,'no_adaptive_rounds',False), n_threads=getattr(args,'duckdb_threads',0), n_workers=getattr(args,'load_workers',8))
+    epoch_ids = set(args.epochs) if args.epochs is not None else None
+    d=load_data(Path(args.input), Path(args.out) if args.out else None, args.analysis_source, no_augment=getattr(args,'no_adaptive_rounds',False), n_threads=getattr(args,'duckdb_threads',0), n_workers=getattr(args,'load_workers',8), epoch_ids=epoch_ids)
     if getattr(args,'skip_first_n_frames',0)>0:
         n_before=d.cv.size
         d=_skip_first_n_frames(d,args.skip_first_n_frames)
