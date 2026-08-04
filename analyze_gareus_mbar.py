@@ -438,8 +438,16 @@ def run_secondary_cv_analyses(d: 'Data', args, base_logw: np.ndarray, selected: 
         fes_info = (analyze_cv1_cv2_2d_fes(d_regime, args, base_logw_regime, selected, boost_ok, kbt_kcal, regime_out, warnings, progress)
                     if isinstance(pmf_info, dict) and pmf_info.get('available')
                     else {'available': False, 'reason': 'Secondary CV PMF unavailable'})
-        breakdown[regime] = {'is_dominant': is_dominant, 'n_samples': int(np.count_nonzero(mask)),
-                             'secondary_cv_pmf': pmf_info, 'cv1_cv2_2d_fes': fes_info}
+        # Store shallow copies in the breakdown, not the live dicts -- the
+        # dominant regime's own pmf_info/fes_info get a 'regime_breakdown' key
+        # added to them below, and aliasing the same object here would nest
+        # that dict inside itself (a real circular reference JSON serialization
+        # rejects; caught by an actual end-to-end run against chignolin_5).
+        breakdown[regime] = {
+            'is_dominant': is_dominant, 'n_samples': int(np.count_nonzero(mask)),
+            'secondary_cv_pmf': dict(pmf_info) if isinstance(pmf_info, dict) else pmf_info,
+            'cv1_cv2_2d_fes': dict(fes_info) if isinstance(fes_info, dict) else fes_info,
+        }
         if is_dominant:
             dominant_pmf_info, dominant_fes_info = pmf_info, fes_info
 

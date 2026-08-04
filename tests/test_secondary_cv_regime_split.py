@@ -229,3 +229,33 @@ def test_two_regimes_split_into_separate_directories_with_different_data(tmp_pat
     assert (minority_dir / "cv2_pmf_unbiased.csv").exists()
     minority_pmf = np.genfromtxt(minority_dir / "cv2_pmf_unbiased.csv", delimiter=",", names=True)
     assert np.nanmean(minority_pmf["cv2_A"]) < 0  # centered near -5, not blended with +5
+
+
+def test_regime_breakdown_is_json_serializable_like_the_real_pmf_summary(tmp_path):
+    """Regression: the dominant regime's own info dict must not end up nested
+    inside its own regime_breakdown (a real circular reference caught by an
+    actual end-to-end run against chignolin_5 -- json.dumps raised
+    ValueError: Circular reference detected). analyze() serializes these
+    exact dicts via wjson(out/'pmf_summary.json', s), so exercise that here
+    instead of only checking file/content assertions that don't catch it.
+    """
+    e0 = tmp_path / "epoch_000"; e0.mkdir()
+    (e0 / "run_manifest.json").write_text(json.dumps({"resolved_args": {"secondary_cv": "torsion-pca"}}))
+    e1 = tmp_path / "epoch_001"; e1.mkdir()
+    (e1 / "run_manifest.json").write_text(json.dumps({"resolved_args": {"secondary_cv": "tica-linear"}}))
+
+    rng = np.random.default_rng(2)
+    n0, n1 = 100, 100
+    cv2 = np.concatenate([rng.normal(-5.0, 0.5, n0), rng.normal(5.0, 0.5, n1)])
+    cv = rng.normal(0, 1, n0 + n1)
+    epoch_src = [0] * n0 + [1] * n1
+    out = tmp_path / "pmf_analysis"
+
+    d = _full_data(cv, cv2, epoch_src=epoch_src, run_dirs=[str(e0), str(e1)])
+    logw = np.zeros(n0 + n1)
+
+    pmf_info, fes_info = run_secondary_cv_analyses(
+        d, _test_args(), logw, "umbrella_only", False, 0.6, out, [], None)
+
+    s = {"secondary_cv_pmf": pmf_info, "cv1_cv2_2d_fes": fes_info}
+    json.dumps(s, default=lambda o: o.tolist() if isinstance(o, np.ndarray) else str(o))
