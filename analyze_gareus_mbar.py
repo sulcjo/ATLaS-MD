@@ -1201,14 +1201,106 @@ def _merge_missing_usable_states(primary_rows: list, live_rows: list) -> list:
     return merged
 
 
+def _parse_epoch_window_map_native_params(rows: list) -> dict:
+    """Return ``{state_id: {primary_center, primary_k, secondary_center, secondary_k}}``.
+
+    These are the window parameters that were *actually in effect* for that
+    specific epoch, as recorded in that epoch's own ``epoch_window_map.csv``
+    snapshot at the time it ran — as opposed to whatever a state's row in the
+    live/final registry says today. A state's secondary (or even primary)
+    center/k can be recentered by later epochs (e.g. the tICA CV2 auto-switch
+    in ``gareus/adaptive_production.py``, which overwrites
+    ``state.secondary_center`` in place); this dict preserves the
+    epoch-specific ground truth so bias energies for that epoch's own samples
+    can be reconstructed against what was really applied, not what the state
+    looks like now.
+    """
+    def _f(row: dict, key: str, default: float) -> float:
+        v = row.get(key, '')
+        if v in ('', 'None', 'nan', None):
+            return default
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return default
+
+    out: dict = {}
+    for r in rows:
+        if 'state_id' not in r:
+            continue
+        sid = int(r['state_id'])
+        out[sid] = {
+            'primary_center': _f(r, 'primary_center', float('nan')),
+            'primary_k': _f(r, 'primary_k', float('nan')),
+            'secondary_center': _f(r, 'secondary_center', float('nan')),
+            'secondary_k': _f(r, 'secondary_k', 0.0),
+        }
+    return out
+
+
+def _epoch_bias_param_vectors(native_params: dict, state_ids: list,
+                               global_primary_centers: np.ndarray, global_primary_ks: np.ndarray,
+                               global_sec_centers: np.ndarray, global_sec_ks: np.ndarray) -> tuple:
+    """Per-epoch (primary_center, primary_k, secondary_center, secondary_k) vectors.
+
+    Starts from the global (final-registry) arrays — the existing fallback
+    behavior — then overrides entries for any state_id this epoch's own
+    ``epoch_window_map.csv`` snapshot actually covers. States created in a
+    later epoch (absent from this epoch's snapshot) keep the global fallback,
+    which is correct: they didn't exist yet, so there is no "native" value to
+    prefer, and no sample from this epoch can be assigned to them anyway.
+    """
+    pc = global_primary_centers.copy()
+    pk = global_primary_ks.copy()
+    sc = global_sec_centers.copy()
+    sk = global_sec_ks.copy()
+    for k, sid in enumerate(state_ids):
+        row = native_params.get(sid)
+        if row is None:
+            continue
+        if math.isfinite(row['primary_center']):
+            pc[k] = row['primary_center']
+        if math.isfinite(row['primary_k']):
+            pk[k] = row['primary_k']
+        if math.isfinite(row['secondary_center']):
+            sc[k] = row['secondary_center']
+        if math.isfinite(row['secondary_k']):
+            sk[k] = row['secondary_k']
+    return pc, pk, sc, sk
+
+
+def _reconstruct_union_bias_block(cv: np.ndarray, cv2: np.ndarray, beta: float,
+                                   primary_centers: np.ndarray, primary_ks: np.ndarray,
+                                   sec_centers: np.ndarray, sec_ks: np.ndarray) -> np.ndarray:
+    """Build one epoch-block's N x K reduced-bias-energy matrix.
+
+    Pure function (no I/O) so the bias math can be unit-tested independently
+    of Parquet/DuckDB loading. Same formula as the legacy single-snapshot
+    reconstruction, just parameterized so callers can pass per-epoch-native
+    center/k vectors instead of one static array shared across every epoch.
+    """
+    n = len(cv)
+    k_count = len(primary_centers)
+    u = np.zeros((n, k_count), dtype=np.float64)
+    for k in range(k_count):
+        d1 = cv - primary_centers[k]
+        u[:, k] = beta * 4.184 * 0.5 * primary_ks[k] * d1 * d1
+        if math.isfinite(sec_centers[k]) and sec_ks[k] > 0:
+            d2 = np.where(np.isfinite(cv2), cv2 - sec_centers[k], 0.0)
+            u[:, k] += beta * 4.184 * 0.5 * sec_ks[k] * d2 * d2
+    return u
+
+
 def _load_epoch_task(epoch_dir: Path, wmap_path: Path, n_threads: int) -> tuple:
-    """Load one epoch's samples and window map (runs in a thread)."""
+    """Load one epoch's samples, window map, and native bias params (runs in a thread)."""
     from gareus.query import load_samples
     with wmap_path.open(newline='') as f:
-        wmap = {int(r['epoch_window']): int(r['state_id']) for r in csv.DictReader(f)}
+        wmap_rows = list(csv.DictReader(f))
+    wmap = {int(r['epoch_window']): int(r['state_id']) for r in wmap_rows}
+    native_params = _parse_epoch_window_map_native_params(wmap_rows)
     samples = load_samples(epoch_dir, n_threads=n_threads)
     ep_meta = rjson(epoch_dir / 'umbrella_pymbar_metadata.json', {})
-    return samples, wmap, ep_meta
+    return samples, wmap, ep_meta, native_params
 
 
 def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_workers: int = 4,
@@ -1271,7 +1363,6 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
     primary_ks     = np.array([float(r['primary_k'])      for r in reg_rows])
     sec_centers    = np.array([float(r['secondary_center']) if r.get('secondary_center', '') not in ('', 'None', 'nan') else np.nan for r in reg_rows])
     sec_ks         = np.array([float(r['secondary_k'])      if r.get('secondary_k', '')      not in ('', 'None', 'nan') else 0.0   for r in reg_rows])
-    has_secondary  = np.any(np.isfinite(sec_centers))
 
     epoch_dirs = _find_adaptive_epoch_dirs(adaptive_dir, epoch_ids=epoch_ids)
     if not epoch_dirs:
@@ -1280,6 +1371,7 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
 
     all_cv = []; all_cv2 = []; all_window = []; all_step = []
     all_replica = []; all_boost = []; all_boost_dih = []; all_potential = []; all_epoch_src = []
+    all_unk_blocks = []
     beta = float('nan')
     meta: dict = rjson(adaptive_dir.parent / 'run_manifest.json', {})
 
@@ -1296,20 +1388,33 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
             [(ed, wp, _threads_per_conn) for ed, wp in epoch_dirs],
         ))
 
-    for (samples, wmap, ep_meta), (epoch_dir, _) in zip(epoch_loaded, epoch_dirs):
+    # Resolve beta once, up front, using the same fallback order as before (first
+    # epoch whose metadata yields it, else a top-level adaptive_dir inference).
+    # Must be fixed *before* any per-epoch bias block is built below, since every
+    # block needs the same beta.
+    for (samples, _wmap, ep_meta, _native_params), (epoch_dir, _) in zip(epoch_loaded, epoch_dirs):
+        if math.isfinite(beta):
+            break
         if not samples or 'cv1' not in samples or len(samples['cv1']) == 0:
             continue
-        if not math.isfinite(beta):
-            b = float(ep_meta.get('beta_1_over_kJ_mol') or 0.0)
-            beta = b if b > 0 else infer_temp_beta(epoch_dir, ep_meta)[1]
+        b = float(ep_meta.get('beta_1_over_kJ_mol') or 0.0)
+        beta = b if b > 0 else infer_temp_beta(epoch_dir, ep_meta)[1]
+    if not math.isfinite(beta):
+        _, beta = infer_temp_beta(adaptive_dir, meta)
+
+    for (samples, wmap, ep_meta, native_params), (epoch_dir, _) in zip(epoch_loaded, epoch_dirs):
+        if not samples or 'cv1' not in samples or len(samples['cv1']) == 0:
+            continue
         raw_w = samples['window_id'].astype(np.int32)
         remapped = np.array([wmap.get(int(w), -1) for w in raw_w], dtype=np.int32)
         valid = remapped >= 0
         if not np.any(valid):
             continue
-        all_cv.append(samples['cv1'].astype(np.float64)[valid])
+        cv_epoch = samples['cv1'].astype(np.float64)[valid]
+        all_cv.append(cv_epoch)
         cv2_raw = samples.get('cv2')
-        all_cv2.append(cv2_raw.astype(np.float64)[valid] if cv2_raw is not None else np.full(valid.sum(), np.nan))
+        cv2_epoch = cv2_raw.astype(np.float64)[valid] if cv2_raw is not None else np.full(valid.sum(), np.nan)
+        all_cv2.append(cv2_epoch)
         all_window.append(np.array([state_id_to_k[int(s)] for s in remapped[valid]], dtype=np.int32))
         all_step.append(samples['step'].astype(np.int64)[valid])
         rep = samples['replica'].astype(np.int32) if 'replica' in samples else np.zeros(int(valid.sum()), np.int32)
@@ -1321,6 +1426,14 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
         pot_raw = samples.get('potential')
         all_potential.append(pot_raw.astype(np.float64)[valid] if pot_raw is not None else np.full(valid.sum(), np.nan))
         all_epoch_src.append(np.full(int(valid.sum()), len(all_cv) - 1, dtype=np.int32))
+        # Bias energies for THIS epoch's samples must use the window params that
+        # were actually in effect during this epoch (native_params), not whatever
+        # a state's row in the live/final registry says today — that snapshot can
+        # be stale for any state recentered by a later epoch (e.g. the tICA CV2
+        # auto-switch overwrites secondary_center in place; see CLAUDE.md).
+        pc_e, pk_e, sc_e, sk_e = _epoch_bias_param_vectors(
+            native_params, state_ids, primary_centers, primary_ks, sec_centers, sec_ks)
+        all_unk_blocks.append(_reconstruct_union_bias_block(cv_epoch, cv2_epoch, beta, pc_e, pk_e, sc_e, sk_e))
 
     if not all_cv:
         raise ValueError(f'No valid samples after window remapping in {adaptive_dir}')
@@ -1334,6 +1447,7 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
     boost_dih = np.concatenate(all_boost_dih)
     pot_arr = np.concatenate(all_potential)
     potential = pot_arr if np.any(np.isfinite(pot_arr)) else None
+    u_nk    = np.concatenate(all_unk_blocks, axis=0)
 
     epoch_src = np.concatenate(all_epoch_src) if all_epoch_src else np.zeros(len(cv), dtype=np.int32)
 
@@ -1349,19 +1463,10 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
         epoch_src = epoch_src[keep]
         pot_arr = pot_arr[keep]
         potential = pot_arr if np.any(np.isfinite(pot_arr)) else None
+        u_nk = u_nk[keep]
 
-    if not math.isfinite(beta):
-        _, beta = infer_temp_beta(adaptive_dir, meta)
     temp = 1.0 / (K_B_KJ_PER_MOL_K * beta)
 
-    N = len(cv)
-    u_nk = np.zeros((N, K), dtype=np.float64)
-    for k in range(K):
-        d1 = cv - primary_centers[k]
-        u_nk[:, k] = beta * 4.184 * 0.5 * primary_ks[k] * d1 * d1
-        if has_secondary and math.isfinite(sec_centers[k]) and sec_ks[k] > 0:
-            d2 = np.where(np.isfinite(cv2), cv2 - sec_centers[k], 0.0)
-            u_nk[:, k] += beta * 4.184 * 0.5 * sec_ks[k] * d2 * d2
     meta_out = dict(meta)
     meta_out.update({'temperature_K': temp, 'beta_1_over_kJ_mol': beta,
                      'adaptive_union_states': K, 'adaptive_union_epochs': len(epoch_dirs),
