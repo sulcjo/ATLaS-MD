@@ -309,6 +309,146 @@ def _secondary_cv_regions(meta: dict) -> list:
     return [{'value': float(r['value']), 'label': r.get('label', r.get('name', ''))}
             for r in sec.get('regions', []) if 'value' in r]
 
+
+def _epoch_run_manifest_secondary_cv_type(run_dir) -> str:
+    """Return ``resolved_args.secondary_cv`` from one epoch/phase run_dir's own
+    ``run_manifest.json`` (e.g. ``"torsion-pca"`` or ``"tica-linear"``), or
+    ``''`` if unavailable. This is that specific epoch's own recorded config,
+    not whatever a state's row in the live registry says today.
+    """
+    manifest = rjson(Path(run_dir) / 'run_manifest.json', {})
+    return str((manifest.get('resolved_args') or {}).get('secondary_cv') or '')
+
+
+def _secondary_cv_epoch_regime_masks(d: 'Data', warnings: Optional[list] = None) -> Optional[dict]:
+    """Group this Data's samples by which secondary-CV *type* was actually
+    active when each one was sampled, using every epoch/phase run_dir's own
+    ``run_manifest.json`` (``d.meta['adaptive_epoch_run_dirs']``, indexed by
+    ``d.meta['_epoch_source']``).
+
+    Two different secondary-CV modes (e.g. torsion-pca vs tica-linear across
+    the tICA CV2 auto-switch, ``gareus/adaptive_production.py``) are not a
+    recentering of one coordinate -- they are different linear projections of
+    the same raw torsion features, i.e. genuinely different order parameters.
+    Pooling their raw cv2 values into one axis for a combined PMF/2D-FES
+    conflates two different physical quantities. This does *not* affect
+    MBAR's f_k/weights themselves (those are already correct after the
+    per-epoch-native bias fix in ``load_parquet_adaptive_union``) -- only
+    which samples' cv2 values get binned together for CV2-facing plots.
+
+    Returns ``None`` when there is only one regime (the overwhelming
+    majority of runs) -- callers should fall back to the existing
+    single-pass analysis, unchanged. Otherwise returns
+    ``{regime_type: (mask, is_dominant)}``, where exactly one regime is
+    "dominant": the one containing the *last* epoch/phase, matching the
+    "last phase wins" convention already used elsewhere in this pipeline
+    for CV2 labeling. Any epoch/phase whose own ``run_manifest.json`` is
+    unreadable is folded into the dominant regime (with a warning) rather
+    than silently dropping its samples from every regime-specific plot.
+    """
+    epoch_src = d.meta.get('_epoch_source')
+    run_dirs = d.meta.get('adaptive_epoch_run_dirs')
+    if not epoch_src or not run_dirs:
+        return None
+    epoch_src = np.asarray(epoch_src, dtype=np.int64)
+    if epoch_src.size != len(d.cv2) or int(epoch_src.max()) >= len(run_dirs):
+        return None
+    regime_by_epoch = [_epoch_run_manifest_secondary_cv_type(rd) for rd in run_dirs]
+    distinct = sorted({r for r in regime_by_epoch if r})
+    if len(distinct) < 2:
+        return None
+    dominant = next((r for r in reversed(regime_by_epoch) if r), distinct[-1])
+    unresolved = [i for i, r in enumerate(regime_by_epoch) if not r]
+    if unresolved and warnings is not None:
+        warnings.append(
+            f'{len(unresolved)} adaptive-production epoch/phase run_dir(s) had no '
+            f"readable secondary_cv type in run_manifest.json; folded into the "
+            f"dominant regime ({dominant!r}) for the per-regime CV2 breakdown."
+        )
+    out: dict = {}
+    for regime in distinct:
+        idxs = [i for i, r in enumerate(regime_by_epoch) if r == regime]
+        if regime == dominant:
+            idxs = idxs + unresolved
+        out[regime] = (np.isin(epoch_src, idxs), regime == dominant)
+    return out
+
+
+def _masked_data(d: 'Data', mask: np.ndarray, meta_override: Optional[dict] = None) -> 'Data':
+    """Row-slice a Data by a boolean sample mask.
+
+    K-length/scalar fields (window-space arrays, beta, temp, ...) are shared
+    with the original -- only per-sample arrays are sliced. Used to run the
+    existing single-regime analysis functions unmodified against a subset of
+    samples (one secondary-CV regime at a time).
+    """
+    def _sl(arr):
+        return arr[mask] if arr is not None else None
+    return Data(
+        prod_dir=d.prod_dir, out_dir=d.out_dir,
+        cv=_sl(d.cv), cv2=_sl(d.cv2), rg_A=_sl(d.rg_A),
+        window=_sl(d.window), replica=_sl(d.replica), step=_sl(d.step),
+        u_nk=d.u_nk[mask] if d.u_nk is not None else None,
+        centers=d.centers, k_kcal=d.k_kcal,
+        beta=d.beta, temp=d.temp,
+        boost_kj=_sl(d.boost_kj),
+        potential_kj=_sl(d.potential_kj),
+        source=d.source, meta=(d.meta if meta_override is None else meta_override),
+        boost_dih_kj=_sl(d.boost_dih_kj),
+    )
+
+
+def _regime_slug(regime: str) -> str:
+    return ''.join(c if (c.isalnum() or c in '-_') else '_' for c in regime) or 'unknown'
+
+
+def run_secondary_cv_analyses(d: 'Data', args, base_logw: np.ndarray, selected: str,
+                               boost_ok: bool, kbt_kcal: float, out: Path,
+                               warnings: list, progress: Optional['Progress']) -> tuple:
+    """Secondary-CV PMF + CV1xCV2 2D FES, split by secondary-CV regime when the
+    run's CV2 definition changed mid-campaign (see
+    ``_secondary_cv_epoch_regime_masks``). Single-regime runs (the common
+    case) are entirely unaffected: this degrades to the plain unmodified
+    calls, writing to the same paths as before.
+
+    Returns ``(secondary_cv_pmf_info, cv1_cv2_fes_info)`` for the *dominant*
+    regime (or the only regime, if there's just one) -- same shape/keys
+    downstream code already expects. When multiple regimes exist, each gets
+    its own analysis written under ``out/secondary_cv_regime_<type>/``, and
+    both dominant-regime info dicts additionally carry a ``regime_breakdown``
+    key with every regime's own info (including the dominant one).
+    """
+    regimes = _secondary_cv_epoch_regime_masks(d, warnings=warnings)
+    if regimes is None:
+        pmf_info = analyze_secondary_cv_pmf(d, args, base_logw, selected, boost_ok, kbt_kcal, out, warnings, progress)
+        fes_info = (analyze_cv1_cv2_2d_fes(d, args, base_logw, selected, boost_ok, kbt_kcal, out, warnings, progress)
+                    if isinstance(pmf_info, dict) and pmf_info.get('available')
+                    else {'available': False, 'reason': 'Secondary CV PMF unavailable'})
+        return pmf_info, fes_info
+
+    breakdown: dict = {}
+    dominant_pmf_info = dominant_fes_info = None
+    for regime, (mask, is_dominant) in regimes.items():
+        regime_meta = dict(d.meta); regime_meta['secondary_cv'] = regime
+        d_regime = _masked_data(d, mask, meta_override=regime_meta)
+        base_logw_regime = np.asarray(base_logw, dtype=np.float64)[mask]
+        regime_out = out if is_dominant else out / f'secondary_cv_regime_{_regime_slug(regime)}'
+        regime_out.mkdir(parents=True, exist_ok=True)
+        pmf_info = analyze_secondary_cv_pmf(d_regime, args, base_logw_regime, selected, boost_ok, kbt_kcal, regime_out, warnings, progress)
+        fes_info = (analyze_cv1_cv2_2d_fes(d_regime, args, base_logw_regime, selected, boost_ok, kbt_kcal, regime_out, warnings, progress)
+                    if isinstance(pmf_info, dict) and pmf_info.get('available')
+                    else {'available': False, 'reason': 'Secondary CV PMF unavailable'})
+        breakdown[regime] = {'is_dominant': is_dominant, 'n_samples': int(np.count_nonzero(mask)),
+                             'secondary_cv_pmf': pmf_info, 'cv1_cv2_2d_fes': fes_info}
+        if is_dominant:
+            dominant_pmf_info, dominant_fes_info = pmf_info, fes_info
+
+    if isinstance(dominant_pmf_info, dict):
+        dominant_pmf_info['regime_breakdown'] = breakdown
+    if isinstance(dominant_fes_info, dict):
+        dominant_fes_info['regime_breakdown'] = breakdown
+    return dominant_pmf_info, dominant_fes_info
+
 def _primary_cv_label(meta: dict) -> str:
     label = (meta or {}).get('primary_cv_label', '')
     if label: return label
@@ -9528,10 +9668,9 @@ def analyze(d,args, progress: Optional[Progress] = None):
     pca2d_info=analyze_pca_2d_fes(d,args,np.asarray(m['logw'],dtype=np.float64),selected,boost_ok,kbt_kcal,out,warn,progress)
     extra_obs_info=analyze_extra_observable_pmfs(d,args,np.asarray(m['logw'],dtype=np.float64),selected,boost_ok,kbt_kcal,out,warn,progress)
     chignolin_fes_info=analyze_chignolin_fes(d,args,np.asarray(m['logw'],dtype=np.float64),selected,boost_ok,kbt_kcal,out,warn,progress)
-    secondary_cv_pmf_info=analyze_secondary_cv_pmf(d,args,np.asarray(m['logw'],dtype=np.float64),selected,boost_ok,kbt_kcal,out,warn,progress)
+    secondary_cv_pmf_info,cv1_cv2_fes_info=run_secondary_cv_analyses(d,args,np.asarray(m['logw'],dtype=np.float64),selected,boost_ok,kbt_kcal,out,warn,progress)
     poincare_info=analyze_poincare_map(d,args,np.asarray(m['logw'],dtype=np.float64),selected,boost_ok,kbt_kcal,out,warn,progress)
     poincare_torsions_info=analyze_poincare_residue_torsions(d,args,out,poincare_info,warn,progress)
-    cv1_cv2_fes_info=analyze_cv1_cv2_2d_fes(d,args,np.asarray(m['logw'],dtype=np.float64),selected,boost_ok,kbt_kcal,out,warn,progress) if isinstance(secondary_cv_pmf_info,dict) and secondary_cv_pmf_info.get('available') else {'available':False,'reason':'Secondary CV PMF unavailable'}
     if progress is not None: progress.bar('analysis stages', 4, 6, 'writing CSV outputs', force=True)
     _sel_diag={'gamd_cumulant2':cdiag,'gamd_cumulant3':cdiag3}.get(selected,cdiag)
     write_pmf(out/'pmf_unbiased.csv',sel,selected,{'boost_mean_kj_mol':_sel_diag.get('boost_mean_kj',np.full(args.bins,np.nan)),'boost_var_kj2_mol2':_sel_diag.get('boost_var_kj2',np.full(args.bins,np.nan))}); write_pmf(out/'pmf_umbrella_only.csv',umbrella,'umbrella_only'); write_pmf(out/'pmf_gamd_exponential.csv',exp_pmf,'gamd_exponential'); write_pmf(out/'pmf_gamd_cumulant2.csv',cum_pmf,'gamd_cumulant2',{'boost_mean_kj_mol':cdiag.get('boost_mean_kj',np.full(args.bins,np.nan)),'boost_var_kj2_mol2':cdiag.get('boost_var_kj2',np.full(args.bins,np.nan))}); write_pmf(out/'pmf_gamd_cumulant3.csv',cum3_pmf,'gamd_cumulant3',{'boost_mean_kj_mol':cdiag3.get('boost_mean_kj',np.full(args.bins,np.nan)),'boost_var_kj2_mol2':cdiag3.get('boost_var_kj2',np.full(args.bins,np.nan))})
