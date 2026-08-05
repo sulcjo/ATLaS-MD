@@ -129,6 +129,85 @@ def test_discover_phases_uses_whole_samples_dir_not_just_seg_001(tmp_path):
     assert table.num_rows == 100  # both segments, not just seg_001's 10
 
 
+def test_discover_phases_finds_scheduled_layout_for_numbered_epoch(tmp_path):
+    """A numbered epoch can itself use the scheduled baseline/topup_* layout
+    (run_scheduled_adaptive_epoch's allocation_scheduler isn't only used for
+    "final") -- it must not be silently dropped just because it lacks a flat
+    epoch_NNN/samples/ dir. Real run (chignolin_5): epoch_001 used this
+    layout and held 61% of the run's real samples; the old code jumped
+    straight from "Epoch 0 (initial)" to "Final Baseline" as if epoch_001
+    never happened.
+    """
+    ap_dir = tmp_path / "adaptive_production"
+    ap_dir.mkdir()
+
+    ep0 = ap_dir / "epoch_000"
+    ep0.mkdir()
+    _make_samples_dir(ep0, [("seg_001", 10)])
+    (ep0 / "epoch_window_map.csv").write_text("epoch_window,state_id\n0,0\n")
+
+    ep1 = ap_dir / "epoch_001"
+    ep1_baseline = ep1 / "baseline"
+    ep1_baseline.mkdir(parents=True)
+    _make_samples_dir(ep1_baseline, [("seg_001", 20)])
+    (ep1_baseline / "epoch_window_map.csv").write_text("epoch_window,state_id\n0,0\n")
+
+    ep1_topup = ep1 / "topup_001_5000"
+    ep1_topup.mkdir()
+    _make_samples_dir(ep1_topup, [("seg_001", 30)])
+    (ep1_topup / "epoch_window_map.csv").write_text("epoch_window,state_id\n0,0\n")
+
+    phases = discover_phases(ap_dir)
+    names = [p["name"] for p in phases]
+
+    assert names == ["epoch_000", "epoch_001/baseline", "epoch_001/topup_001_5000"]
+    assert phases[1]["label"] == "Epoch 1\nBaseline"
+    assert "Epoch 1" in phases[2]["label"]
+
+
+def test_discover_phases_orders_topups_by_creation_time_not_step_suffix(tmp_path):
+    """topup_NNN_MMMMM's MMMMM is that segment's own extra-step duration, not
+    a cumulative/creation-order marker -- a quality-gate extension loop can
+    re-invoke the same epoch/final with a shrinking remaining-gap value each
+    round, so ascending-suffix order is the *reverse* of creation order.
+    Real run (chignolin_5/epoch_001): topup_001_34794000 created first, then
+    topup_001_25733000, then topup_001_18937000 created last.
+    """
+    import os
+    import time
+
+    ap_dir = tmp_path / "adaptive_production"
+    ep1 = ap_dir / "epoch_001"
+    baseline = ep1 / "baseline"
+    baseline.mkdir(parents=True)
+    _make_samples_dir(baseline, [("seg_001", 1)])
+    (baseline / "epoch_window_map.csv").write_text("epoch_window,state_id\n0,0\n")
+
+    # Created in this order: large suffix first, small suffix last --
+    # mirrors the real run's shrinking-remaining-gap pattern.
+    now = time.time()
+    topup_big = ep1 / "topup_001_34794000"
+    topup_big.mkdir()
+    _make_samples_dir(topup_big, [("seg_001", 1)])
+    (topup_big / "epoch_window_map.csv").write_text("epoch_window,state_id\n0,0\n")
+    os.utime(topup_big, (now, now))
+
+    topup_small = ep1 / "topup_001_18937000"
+    topup_small.mkdir()
+    _make_samples_dir(topup_small, [("seg_001", 1)])
+    (topup_small / "epoch_window_map.csv").write_text("epoch_window,state_id\n0,0\n")
+    os.utime(topup_small, (now + 10, now + 10))
+
+    phases = discover_phases(ap_dir)
+    names = [p["name"] for p in phases]
+
+    assert names == [
+        "epoch_001/baseline",
+        "epoch_001/topup_001_34794000",  # created first -- must come before...
+        "epoch_001/topup_001_18937000",  # ...the smaller-suffix one created later
+    ]
+
+
 def test_sample_count_grid_matches_high_precision_secondary_centers():
     """Regression for the rounding-mismatch bug: secondary_center values
     with more than 6 significant decimal digits must still populate the

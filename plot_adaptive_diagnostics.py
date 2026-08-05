@@ -65,15 +65,67 @@ def _load_parquet_samples(samples_dir: Path, stride: int = 1) -> pd.DataFrame:
 
 # ── phase discovery ───────────────────────────────────────────────────────────
 
+def _discover_subrun_phases(base_dir: Path, label_prefix: str) -> list[dict]:
+    """baseline + topup_* sub-phases under one epoch/final directory, in true
+    chronological order.
+
+    Sorted by directory mtime, NOT by the topup directory's own step-count
+    suffix (topup_NNN_MMMMM). MMMMM is that segment's own *extra-step
+    duration* -- run_scheduled_adaptive_epoch (gareus/adaptive_production.py)
+    groups states needing the same additional steps into one topup_NNN_MMMMM
+    segment per call; when a quality-gate extension loop re-invokes this for
+    the same epoch/final with a fresh single deficiency group, NNN is always
+    1 and MMMMM shrinks round over round as the remaining gap closes. Sorting
+    ascending by that number is the *reverse* of creation order whenever a
+    phase got more than one extension round -- confirmed on a real run
+    (chignolin_5/epoch_001: topup_001_34794000 created first at the largest
+    remaining-gap value, then topup_001_25733000, then topup_001_18937000
+    created last at the smallest).
+    """
+    subs = [d for d in base_dir.iterdir()
+            if d.is_dir() and (d / "samples").is_dir()
+            and (d.name == "baseline" or d.name.startswith("topup_"))]
+    subs.sort(key=lambda d: (0 if d.name == "baseline" else 1, d.stat().st_mtime))
+    phases = []
+    topup_i = 0
+    for sub in subs:
+        if sub.name == "baseline":
+            lbl = f"{label_prefix}\nBaseline"
+            step = 0
+        else:
+            topup_i += 1
+            step = _step_from_name(sub.name)
+            ns = step * 4e-6
+            suffix = f"Topup {topup_i}" if topup_i > 1 or len(subs) > 2 else "Topup"
+            lbl = f"{label_prefix} {suffix}\n+{ns:.1f} ns"
+        phases.append({
+            "name": f"{base_dir.name}/{sub.name}",
+            "label": lbl,
+            "path": sub,
+            "wmap": _rcsv(sub / "epoch_window_map.csv"),
+            "step": step,
+        })
+    return phases
+
+
 def discover_phases(ap_dir: Path) -> list[dict]:
     """
     Return ordered list of phase dicts, each with:
-      name, label, path, wmap (DataFrame), step (cumulative step count)
+      name, label, path, wmap (DataFrame), step (this phase's own extra-step
+      count if it's a topup, else 0 -- not a cumulative/global step count)
     Ordered chronologically: numbered epochs in whatever order/count they
     actually ran, then the final phase's baseline + topup_* segments.
 
-    The scheduled final-phase segments (baseline, topup_NNN_MMMMM) always
-    live under ap_dir/"final", never inside the last epoch_NNN directory.
+    A numbered epoch can itself use either layout: a flat epoch_NNN/samples/
+    (the unscheduled path, e.g. real epoch_000 runs) or -- when
+    run_scheduled_adaptive_epoch's allocation_scheduler is active for that
+    epoch too, not just for "final" -- its own baseline/topup_* sub-run
+    layout, identical in shape to "final"'s. Missing that second case used
+    to silently drop the entire epoch from every figure: on a real run
+    (chignolin_5) epoch_001 used the scheduled layout and held 61% of the
+    run's real samples, but the topup timeline jumped straight from
+    "Epoch 0 (initial)" to "Final Baseline" as if epoch_001 never happened.
+
     As of 2026-07-27, run_adaptive_production_auto_loop's per-epoch
     convergence gate no longer hands the remaining MD-pool budget to
     "final" the moment it reports stop_adaptive -- it just continues to the
@@ -85,7 +137,7 @@ def discover_phases(ap_dir: Path) -> list[dict]:
     phases = []
 
     epoch_dirs = sorted(
-        (d for d in ap_dir.glob("epoch_*") if d.is_dir() and (d / "samples").is_dir()),
+        (d for d in ap_dir.glob("epoch_*") if d.is_dir()),
         key=lambda d: d.name,
     )
     for i, ep in enumerate(epoch_dirs):
@@ -93,36 +145,21 @@ def discover_phases(ap_dir: Path) -> list[dict]:
             n = int(ep.name.split("_")[-1])
         except ValueError:
             n = i
-        lbl = f"Epoch {n}\n(initial)" if i == 0 else f"Epoch {n}"
-        phases.append({
-            "name": ep.name,
-            "label": lbl,
-            "path": ep,
-            "wmap": _rcsv(ep / "epoch_window_map.csv"),
-            "step": 0,
-        })
+        if (ep / "samples").is_dir():
+            lbl = f"Epoch {n}\n(initial)" if i == 0 else f"Epoch {n}"
+            phases.append({
+                "name": ep.name,
+                "label": lbl,
+                "path": ep,
+                "wmap": _rcsv(ep / "epoch_window_map.csv"),
+                "step": 0,
+            })
+        else:
+            phases.extend(_discover_subrun_phases(ep, f"Epoch {n}"))
 
     final_dir = ap_dir / "final"
     if final_dir.is_dir():
-        subs = [d for d in final_dir.iterdir()
-                if d.is_dir() and (d / "samples").is_dir()
-                and (d.name == "baseline" or d.name.startswith("topup_"))]
-        subs.sort(key=lambda d: (0 if d.name == "baseline" else _step_from_name(d.name)))
-        for sub in subs:
-            if sub.name == "baseline":
-                lbl = "Final\nBaseline"
-                step = 0
-            else:
-                step = _step_from_name(sub.name)
-                ns = step * 4e-6
-                lbl = f"Final Topup\n{ns:.1f} ns"
-            phases.append({
-                "name": f"final/{sub.name}",
-                "label": lbl,
-                "path": sub,
-                "wmap": _rcsv(sub / "epoch_window_map.csv"),
-                "step": step,
-            })
+        phases.extend(_discover_subrun_phases(final_dir, "Final"))
 
     return phases
 
@@ -554,11 +591,10 @@ def fig_topup_targeting(ap_dir: Path, state_reg: pd.DataFrame, out_path: Path) -
         present = set(bl_wmap[sid_col].astype(int).tolist()) if sid_col else set()
         topup_entries.append({"label": "Baseline\n(0 ns)", "step": 0, "present": present})
 
-    # each topup_*_windows.csv sorted by step count
-    topup_csvs = sorted(
-        final_dir.glob("topup_*_windows.csv"),
-        key=lambda p: _step_from_name(p.stem)
-    )
+    # each topup_*_windows.csv in true chronological (mtime) order -- the
+    # step-count suffix is that topup's own extra-step duration, not a
+    # cumulative/creation-order marker (see _discover_subrun_phases).
+    topup_csvs = sorted(final_dir.glob("topup_*_windows.csv"), key=lambda p: p.stat().st_mtime)
     for tcsv in topup_csvs:
         df = _rcsv(tcsv)
         if df.empty:
@@ -570,10 +606,10 @@ def fig_topup_targeting(ap_dir: Path, state_reg: pd.DataFrame, out_path: Path) -
         topup_entries.append({"label": f"Topup\n{ns:.1f} ns", "step": step, "present": present})
 
     # ─ actual samples per state per topup subdir (from Parquet) ─
-    subdirs = [d for d in sorted(final_dir.iterdir(),
-                key=lambda p: (0 if p.name == "baseline" else _step_from_name(p.name)))
+    subdirs = [d for d in final_dir.iterdir()
                if d.is_dir() and (d/"samples").is_dir()
                and (d.name == "baseline" or d.name.startswith("topup_"))]
+    subdirs.sort(key=lambda p: (0 if p.name == "baseline" else 1, p.stat().st_mtime))
 
     K = len(all_sids)
     T_part = len(topup_entries)
