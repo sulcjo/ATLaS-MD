@@ -9637,6 +9637,118 @@ def _analyze_epoch_cv_exploration(prod_dir: Path, out: Path, meta: dict, warn: l
     return {'available': True, 'n_epochs': n, 'is_2d': is_2d, 'adaptive_dir': str(ap), 'files': generated}
 
 
+def _epoch_zero_split_masks(d: 'Data') -> Optional[tuple]:
+    """(mask_epoch0, mask_rest) for a Data with real epoch_000 samples alongside
+    later-epoch samples, else None.
+
+    epoch_000 is systematically different from later epochs in ways that make
+    pooling it into the main PMF/GaMD-boost report misleading, not just
+    inconsistent style: the GaMD shared-envelope recalibration
+    (``_maybe_recalibrate_gamd_boost``, ``gareus/adaptive_production.py``)
+    recalibrates the boost envelope from epoch 0's own real sampling and fires
+    at most once, so epoch 0 runs under a *different* GaMD envelope than every
+    later epoch; and the tICA CV2 auto-switch typically also fires after
+    epoch 0. Callers should treat the whole Data as one report (unchanged)
+    when this returns None -- e.g. non-adaptive-production sources, or a run
+    with only epoch_000 and nothing else to compare it against.
+    """
+    epoch_src = d.meta.get('_epoch_source')
+    if not epoch_src:
+        return None
+    epoch_src = np.asarray(epoch_src, dtype=np.int64)
+    if epoch_src.size != len(d.cv):
+        return None
+    mask0 = epoch_src == 0
+    mask_rest = ~mask0
+    if not np.any(mask0) or not np.any(mask_rest):
+        return None
+    return mask0, mask_rest
+
+
+def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.ndarray,
+                                   kbt_kcal: float, out: Path, warnings: list,
+                                   progress: Optional['Progress'], warning_prefix: str = '',
+                                   extra_pmfs: Optional[dict] = None) -> dict:
+    """Core PMF (4 methods) + GaMD boost diagnostics for one Data.
+
+    Extracted from analyze() so the identical formula can run twice against
+    different sample subsets sharing the same global MBAR solve (see the
+    epoch_000/rest split in analyze()) instead of only ever pooling every
+    epoch into one report. ``logw`` is the *raw* per-sample MBAR log-weight
+    (``m['logw']``, masked to this subset if applicable) -- renormalized
+    internally, same pattern as ``analyze_secondary_cv_pmf``.
+    """
+    K = d.u_nk.shape[1]
+    N = len(d.cv)
+    base_w = norm_logw(np.asarray(logw, dtype=np.float64))
+    umbrella = pmf_from_weights(d.cv, base_w, bins, kbt_kcal)
+    bs = boost_stats(d.boost_kj, d.beta)
+    boost_ok = bool(bs.get('available')) and np.nanstd(d.boost_kj) > 1e-12
+    if boost_ok:
+        exp_w = norm_logw(logw + d.beta * d.boost_kj)
+        exp_pmf = pmf_from_weights(d.cv, exp_w, bins, kbt_kcal)
+        cum_pmf, cdiag = cumulant2(d.cv, base_w, d.boost_kj, bins, d.beta, kbt_kcal, smooth_logfac_sigma=_eff_smooth(args, 'gamd_smooth_sigma'))
+        cum3_pmf, cdiag3 = cumulant3(d.cv, base_w, d.boost_kj, bins, d.beta, kbt_kcal, smooth_logfac_sigma=_eff_smooth(args, 'gamd_smooth_sigma'))
+        selected = 'gamd_cumulant2'
+        e = ess(exp_w)
+        if e / max(1, N) < 0.05:
+            warnings.append(f'{warning_prefix}GaMD exponential reweighting ESS is very low: {e:.1f}/{N}')
+        if bs.get('std_kcal_mol', 0) > 6.0:
+            warnings.append(f"{warning_prefix}GaMD boost std is large ({bs['std_kcal_mol']:.2f} kcal/mol); cumulant reweighting may be unreliable")
+        if bs.get('anharmonicity_score') is not None and bs['anharmonicity_score'] > 1.0:
+            warnings.append(f"{warning_prefix}GaMD boost anharmonicity score is high ({bs['anharmonicity_score']:.2f})")
+    else:
+        exp_pmf = umbrella; cum_pmf = umbrella; cum3_pmf = umbrella; selected = 'umbrella_only'
+        cdiag = {'boost_mean_kj': np.full(args.bins, np.nan), 'boost_var_kj2': np.full(args.bins, np.nan)}; cdiag3 = cdiag
+        warnings.append(f'{warning_prefix}No finite variable GaMD boosts found; selected PMF is umbrella-only unbiased.')
+    pmfs = {'umbrella_only': umbrella, 'gamd_exponential': exp_pmf, 'gamd_cumulant2': cum_pmf, 'gamd_cumulant3': cum3_pmf}
+    if extra_pmfs:
+        pmfs.update(extra_pmfs)
+    _force_method = str(getattr(args, 'selected_method', 'auto') or 'auto')
+    if _force_method != 'auto' and _force_method in pmfs:
+        if _force_method in ('gamd_exponential', 'gamd_cumulant2', 'gamd_cumulant3') and not boost_ok:
+            warnings.append(f'{warning_prefix}--selected-method {_force_method} requested but no usable GaMD boost; it equals umbrella-only here.')
+        selected = _force_method
+    O = overlap_matrix(d.cv, d.window, bins, K)
+    neigh = [float(O[i, i + 1]) for i in range(K - 1)]
+    bad = [i for i, x in enumerate(neigh) if x < args.min_neighbor_overlap]
+    if bad:
+        warnings.append(f'{warning_prefix}Weak neighbor CV overlap below %.2f for pairs: ' % args.min_neighbor_overlap + ', '.join(f'{i}-{i + 1} ({neigh[i]:.2f})' for i in bad))
+    sel = pmfs[selected]
+    finite = sel['pmf'][np.isfinite(sel['pmf'])]
+    span = float(np.max(finite) - np.min(finite)) if finite.size else float('nan')
+    minidx = int(np.nanargmin(sel['pmf'])) if finite.size else -1
+    _sel_diag = {'gamd_cumulant2': cdiag, 'gamd_cumulant3': cdiag3}.get(selected, cdiag)
+    write_pmf(out / 'pmf_unbiased.csv', sel, selected, {'boost_mean_kj_mol': _sel_diag.get('boost_mean_kj', np.full(args.bins, np.nan)), 'boost_var_kj2_mol2': _sel_diag.get('boost_var_kj2', np.full(args.bins, np.nan))})
+    write_pmf(out / 'pmf_umbrella_only.csv', umbrella, 'umbrella_only')
+    write_pmf(out / 'pmf_gamd_exponential.csv', exp_pmf, 'gamd_exponential')
+    write_pmf(out / 'pmf_gamd_cumulant2.csv', cum_pmf, 'gamd_cumulant2', {'boost_mean_kj_mol': cdiag.get('boost_mean_kj', np.full(args.bins, np.nan)), 'boost_var_kj2_mol2': cdiag.get('boost_var_kj2', np.full(args.bins, np.nan))})
+    write_pmf(out / 'pmf_gamd_cumulant3.csv', cum3_pmf, 'gamd_cumulant3', {'boost_mean_kj_mol': cdiag3.get('boost_mean_kj', np.full(args.bins, np.nan)), 'boost_var_kj2_mol2': cdiag3.get('boost_var_kj2', np.full(args.bins, np.nan))})
+    write_all(out / 'pmf_all_methods.csv', pmfs)
+    with (out / 'overlap_matrix.csv').open('w', newline='') as f:
+        wr = csv.writer(f); wr.writerow(['window'] + list(range(K))); [wr.writerow([i] + [float(x) for x in O[i]]) for i in range(K)]
+    n_k_local = np.bincount(d.window[(d.window >= 0) & (d.window < K)], minlength=K)
+    with (out / 'window_diagnostics.csv').open('w', newline='') as f:
+        wr = csv.DictWriter(f, fieldnames=['window', 'center_A', 'k_kcal_mol_A2', 'samples', 'cv_mean_A', 'cv_std_A', 'overlap_left', 'overlap_right']); wr.writeheader()
+        for k in range(K):
+            vals = d.cv[d.window == k]
+            wr.writerow({'window': k, 'center_A': float(d.centers[k]) if k < d.centers.size and np.isfinite(d.centers[k]) else '', 'k_kcal_mol_A2': float(d.k_kcal[k]) if k < d.k_kcal.size and np.isfinite(d.k_kcal[k]) else '', 'samples': int(n_k_local[k]), 'cv_mean_A': float(np.mean(vals)) if vals.size else '', 'cv_std_A': float(np.std(vals)) if vals.size else '', 'overlap_left': float(O[k - 1, k]) if k > 0 else '', 'overlap_right': float(O[k, k + 1]) if k + 1 < K else ''})
+    if progress is not None:
+        progress.bar('analysis stages', 5, 6, 'plotting PNG outputs', force=True)
+    plot_outputs(d, pmfs, selected, O, out, warnings, smooth_sigma=_eff_smooth(args, 'pmf_smooth_sigma'), args=args)
+    return {
+        'pmfs': pmfs, 'selected': selected, 'boost_ok': boost_ok, 'boost': bs,
+        'pmf_span_kcal_mol': span, 'pmf_minimum_cv_A': float(sel['cv_A'][minidx]) if minidx >= 0 else None,
+        'neighbor_overlap': neigh, 'n_samples': N, 'O': O,
+        'files': {
+            'pmf_unbiased_csv': str(out / 'pmf_unbiased.csv'), 'pmf_all_methods_csv': str(out / 'pmf_all_methods.csv'),
+            'pmf_umbrella_only_csv': str(out / 'pmf_umbrella_only.csv'), 'pmf_gamd_exponential_csv': str(out / 'pmf_gamd_exponential.csv'),
+            'pmf_gamd_cumulant2_csv': str(out / 'pmf_gamd_cumulant2.csv'), 'pmf_gamd_cumulant3_csv': str(out / 'pmf_gamd_cumulant3.csv'),
+            'overlap_matrix_csv': str(out / 'overlap_matrix.csv'), 'window_diagnostics_csv': str(out / 'window_diagnostics.csv'),
+        },
+    }
+
+
 def analyze(d,args, progress: Optional[Progress] = None):
     out=d.out_dir; out.mkdir(parents=True,exist_ok=True); N,K=d.u_nk.shape; kbt_kj=1.0/d.beta; kbt_kcal=kbt_kj/KJ_PER_KCAL; warn=list(d.meta.get('load_notes',[]))
     if progress is not None: progress.step('analysis', f'loaded {N} samples across {K} windows from {d.source}')
@@ -9647,41 +9759,38 @@ def analyze(d,args, progress: Optional[Progress] = None):
     if zero: warn.append(f'Zero production samples for windows: {zero}')
     bins=make_bins(d.cv,args.bins,args.cv_min,args.cv_max)
     if progress is not None: progress.bar('analysis stages', 2, 6, 'building PMFs', force=True)
-    umbrella=pmf_from_weights(d.cv,base_w,bins,kbt_kcal)
-    bs=boost_stats(d.boost_kj,d.beta); boost_ok=bool(bs.get('available')) and np.nanstd(d.boost_kj)>1e-12
-    if boost_ok:
-        exp_w=norm_logw(m['logw']+d.beta*d.boost_kj); exp_pmf=pmf_from_weights(d.cv,exp_w,bins,kbt_kcal); cum_pmf,cdiag=cumulant2(d.cv,base_w,d.boost_kj,bins,d.beta,kbt_kcal,smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma')); cum3_pmf,cdiag3=cumulant3(d.cv,base_w,d.boost_kj,bins,d.beta,kbt_kcal,smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma')); selected='gamd_cumulant2'
-        e=ess(exp_w)
-        if e/max(1,N)<0.05: warn.append(f'GaMD exponential reweighting ESS is very low: {e:.1f}/{N}')
-        if bs.get('std_kcal_mol',0)>6.0: warn.append(f"GaMD boost std is large ({bs['std_kcal_mol']:.2f} kcal/mol); cumulant reweighting may be unreliable")
-        if bs.get('anharmonicity_score') is not None and bs['anharmonicity_score']>1.0: warn.append(f"GaMD boost anharmonicity score is high ({bs['anharmonicity_score']:.2f})")
-    else:
-        exp_pmf=umbrella; cum_pmf=umbrella; cum3_pmf=umbrella; selected='umbrella_only'; cdiag={'boost_mean_kj':np.full(args.bins,np.nan),'boost_var_kj2':np.full(args.bins,np.nan)}; cdiag3=cdiag; warn.append('No finite variable GaMD boosts found; selected PMF is umbrella-only unbiased.')
-    pmfs={'umbrella_only':umbrella,'gamd_exponential':exp_pmf,'gamd_cumulant2':cum_pmf,'gamd_cumulant3':cum3_pmf}
-    _force_method=str(getattr(args,'selected_method','auto') or 'auto')
-    if _force_method!='auto' and _force_method in pmfs:
-        if _force_method in ('gamd_exponential','gamd_cumulant2','gamd_cumulant3') and not boost_ok:
-            warn.append(f'--selected-method {_force_method} requested but no usable GaMD boost; it equals umbrella-only here.')
-        selected=_force_method
+    logw=np.asarray(m['logw'],dtype=np.float64)
+
     dtram_info=run_dtram_cv_pmf(d,args,bins,kbt_kcal,warn,progress)
-    if isinstance(dtram_info,dict) and dtram_info.get('available'):
-        pmfs[dtram_info.get('method','dtram')]=dtram_info['pmf']
+    extra_pmfs={dtram_info.get('method','dtram'):dtram_info['pmf']} if isinstance(dtram_info,dict) and dtram_info.get('available') else None
+
+    # Never pool epoch_000 into the main PMF/GaMD-boost report: it runs under
+    # a different GaMD envelope (the shared-envelope recalibration fires from
+    # epoch 0's own sampling and at most once, gareus/adaptive_production.py's
+    # _maybe_recalibrate_gamd_boost) and often a different secondary-CV
+    # definition than every later epoch (see run_secondary_cv_analyses above).
+    # When a split is available, epoch_000 gets its own report under
+    # epoch_000_separate/ and the "main" report -- the one at the normal
+    # paths, feeding pmf_summary.json's headline numbers -- covers only
+    # epoch_001+ (and final). Both reuse this same global MBAR solve (m/logw)
+    # rather than re-solving -- only which samples get binned differs.
+    epoch0_split=_epoch_zero_split_masks(d)
+    epoch0_report_info=None
+    if epoch0_split is not None:
+        mask0,mask_rest=epoch0_split
+        d_epoch0=_masked_data(d,mask0)
+        out_epoch0=out/'epoch_000_separate'; out_epoch0.mkdir(parents=True,exist_ok=True)
+        epoch0_report_info=run_pmf_and_gamd_boost_report(d_epoch0,args,logw[mask0],bins,kbt_kcal,out_epoch0,warn,progress,warning_prefix='[epoch_000 report] ')
+        d_main=_masked_data(d,mask_rest); logw_main=logw[mask_rest]
+    else:
+        d_main=d; logw_main=logw
+
     if progress is not None: progress.bar('analysis stages', 3, 6, 'overlap diagnostics', force=True)
-    O=overlap_matrix(d.cv,d.window,bins,K); neigh=[float(O[i,i+1]) for i in range(K-1)]
-    bad=[i for i,x in enumerate(neigh) if x<args.min_neighbor_overlap]
-    if bad: warn.append('Weak neighbor CV overlap below %.2f for pairs: '%args.min_neighbor_overlap + ', '.join(f'{i}-{i+1} ({neigh[i]:.2f})' for i in bad))
-    sel=pmfs[selected]; finite=sel['pmf'][np.isfinite(sel['pmf'])]; span=float(np.max(finite)-np.min(finite)) if finite.size else float('nan'); minidx=int(np.nanargmin(sel['pmf'])) if finite.size else -1
-    rg_info=analyze_rg(d,args,m,base_w,selected,boost_ok,kbt_kcal,out,warn,progress)
-    fes2d_info=analyze_distance_rg_2d_fes(d,args,np.asarray(m['logw'],dtype=np.float64),selected,boost_ok,kbt_kcal,out,warn,progress) if isinstance(rg_info,dict) and rg_info.get('available') else {'available':False,'reason':'Rg analysis unavailable'}
-    pca2d_info=analyze_pca_2d_fes(d,args,np.asarray(m['logw'],dtype=np.float64),selected,boost_ok,kbt_kcal,out,warn,progress)
-    extra_obs_info=analyze_extra_observable_pmfs(d,args,np.asarray(m['logw'],dtype=np.float64),selected,boost_ok,kbt_kcal,out,warn,progress)
-    chignolin_fes_info=analyze_chignolin_fes(d,args,np.asarray(m['logw'],dtype=np.float64),selected,boost_ok,kbt_kcal,out,warn,progress)
-    secondary_cv_pmf_info,cv1_cv2_fes_info=run_secondary_cv_analyses(d,args,np.asarray(m['logw'],dtype=np.float64),selected,boost_ok,kbt_kcal,out,warn,progress)
-    poincare_info=analyze_poincare_map(d,args,np.asarray(m['logw'],dtype=np.float64),selected,boost_ok,kbt_kcal,out,warn,progress)
-    poincare_torsions_info=analyze_poincare_residue_torsions(d,args,out,poincare_info,warn,progress)
-    if progress is not None: progress.bar('analysis stages', 4, 6, 'writing CSV outputs', force=True)
-    _sel_diag={'gamd_cumulant2':cdiag,'gamd_cumulant3':cdiag3}.get(selected,cdiag)
-    write_pmf(out/'pmf_unbiased.csv',sel,selected,{'boost_mean_kj_mol':_sel_diag.get('boost_mean_kj',np.full(args.bins,np.nan)),'boost_var_kj2_mol2':_sel_diag.get('boost_var_kj2',np.full(args.bins,np.nan))}); write_pmf(out/'pmf_umbrella_only.csv',umbrella,'umbrella_only'); write_pmf(out/'pmf_gamd_exponential.csv',exp_pmf,'gamd_exponential'); write_pmf(out/'pmf_gamd_cumulant2.csv',cum_pmf,'gamd_cumulant2',{'boost_mean_kj_mol':cdiag.get('boost_mean_kj',np.full(args.bins,np.nan)),'boost_var_kj2_mol2':cdiag.get('boost_var_kj2',np.full(args.bins,np.nan))}); write_pmf(out/'pmf_gamd_cumulant3.csv',cum3_pmf,'gamd_cumulant3',{'boost_mean_kj_mol':cdiag3.get('boost_mean_kj',np.full(args.bins,np.nan)),'boost_var_kj2_mol2':cdiag3.get('boost_var_kj2',np.full(args.bins,np.nan))})
+    main_report_info=run_pmf_and_gamd_boost_report(d_main,args,logw_main,bins,kbt_kcal,out,warn,progress,extra_pmfs=extra_pmfs)
+    pmfs=main_report_info['pmfs']; selected=main_report_info['selected']; boost_ok=main_report_info['boost_ok']
+    bs=main_report_info['boost']; O=main_report_info['O']; neigh=main_report_info['neighbor_overlap']
+    span=main_report_info['pmf_span_kcal_mol']; sel=pmfs[selected]
+
     if isinstance(dtram_info,dict) and dtram_info.get('available'):
         write_pmf(out/'pmf_dtram.csv',dtram_info['pmf'],dtram_info.get('method','dtram'))
         dtram_info.setdefault('files',{})['pmf_dtram_csv']=str(out/'pmf_dtram.csv')
@@ -9690,15 +9799,16 @@ def analyze(d,args, progress: Optional[Progress] = None):
             dtram_info.setdefault('files',{}).update(dtram_plot_files)
         dtram_info.setdefault('files',{})['dtram_summary_json']=str(out/'dtram_summary.json')
         wjson(out/'dtram_summary.json',_dtram_public_info(dtram_info))
-    write_all(out/'pmf_all_methods.csv',pmfs)
-    with (out/'overlap_matrix.csv').open('w',newline='') as f:
-        wr=csv.writer(f); wr.writerow(['window']+list(range(K))); [wr.writerow([i]+[float(x) for x in O[i]]) for i in range(K)]
-    with (out/'window_diagnostics.csv').open('w',newline='') as f:
-        wr=csv.DictWriter(f,fieldnames=['window','center_A','k_kcal_mol_A2','samples','cv_mean_A','cv_std_A','overlap_left','overlap_right']); wr.writeheader()
-        for k in range(K):
-            vals=d.cv[d.window==k]; wr.writerow({'window':k,'center_A':float(d.centers[k]) if k<d.centers.size and np.isfinite(d.centers[k]) else '', 'k_kcal_mol_A2':float(d.k_kcal[k]) if k<d.k_kcal.size and np.isfinite(d.k_kcal[k]) else '', 'samples':int(m['n_k'][k]), 'cv_mean_A':float(np.mean(vals)) if vals.size else '', 'cv_std_A':float(np.std(vals)) if vals.size else '', 'overlap_left':float(O[k-1,k]) if k>0 else '', 'overlap_right':float(O[k,k+1]) if k+1<K else ''})
-    if progress is not None: progress.bar('analysis stages', 5, 6, 'plotting PNG outputs', force=True)
-    plot_outputs(d,pmfs,selected,O,out,warn,smooth_sigma=_eff_smooth(args,'pmf_smooth_sigma'),args=args)
+
+    if progress is not None: progress.bar('analysis stages', 4, 6, 'writing CSV outputs', force=True)
+    rg_info=analyze_rg(d,args,m,base_w,selected,boost_ok,kbt_kcal,out,warn,progress)
+    fes2d_info=analyze_distance_rg_2d_fes(d,args,logw,selected,boost_ok,kbt_kcal,out,warn,progress) if isinstance(rg_info,dict) and rg_info.get('available') else {'available':False,'reason':'Rg analysis unavailable'}
+    pca2d_info=analyze_pca_2d_fes(d,args,logw,selected,boost_ok,kbt_kcal,out,warn,progress)
+    extra_obs_info=analyze_extra_observable_pmfs(d,args,logw,selected,boost_ok,kbt_kcal,out,warn,progress)
+    chignolin_fes_info=analyze_chignolin_fes(d,args,logw,selected,boost_ok,kbt_kcal,out,warn,progress)
+    secondary_cv_pmf_info,cv1_cv2_fes_info=run_secondary_cv_analyses(d,args,logw,selected,boost_ok,kbt_kcal,out,warn,progress)
+    poincare_info=analyze_poincare_map(d,args,logw,selected,boost_ok,kbt_kcal,out,warn,progress)
+    poincare_torsions_info=analyze_poincare_residue_torsions(d,args,out,poincare_info,warn,progress)
     epoch_cv_info=_analyze_epoch_cv_exploration(d.prod_dir,out,d.meta,warn)
     tica_epoch_info=_analyze_tica_epochs(d.prod_dir,out,d.meta,warn)
     torsion_pca_scree_info=_analyze_torsion_pca_scree(d.prod_dir,out,d.meta,args,warn)
@@ -9706,7 +9816,16 @@ def analyze(d,args, progress: Optional[Progress] = None):
     epoch_conv_info={}
     if d.meta.get('_epoch_source'):
         epoch_conv_info=run_epoch_pmf_convergence(d,args,bins,selected,sel,out,progress=progress,f_init_hint=m.get('f_k'))
-    s={'production_dir':str(d.prod_dir),'output_dir':str(out),'source':d.source,'n_samples':int(N),'n_windows':int(K),'temperature_K':float(d.temp),'beta_1_over_kj_mol':float(d.beta),'cv_min_A':float(np.nanmin(d.cv)),'cv_max_A':float(np.nanmax(d.cv)),'primary_cv_units':_primary_cv_units(d.meta),'primary_cv_axis_label':_primary_cv_axis_label(d.meta),'selected_unbiased_method':selected,'pmf_span_kcal_mol':span,'pmf_minimum_cv_A':float(sel['cv_A'][minidx]) if minidx>=0 else None,'mbar':{'converged':bool(m['converged']),'iterations':int(m['iterations']),'max_delta':float(m['max_delta']),'backend':m.get('backend','unknown'),'threads':m.get('threads',None),'active_states':[int(x) for x in m['active']],'n_k':[int(x) for x in m['n_k']],'base_ess':float(ess(base_w))},'boost':bs,'neighbor_overlap':neigh,'warnings':warn,'files':{'pmf_unbiased_csv':str(out/'pmf_unbiased.csv'),'pmf_all_methods_csv':str(out/'pmf_all_methods.csv'),'summary_md':str(out/'pmf_summary.md'),'summary_json':str(out/'pmf_summary.json')}}
+    s={'production_dir':str(d.prod_dir),'output_dir':str(out),'source':d.source,'n_samples':int(N),'n_windows':int(K),'temperature_K':float(d.temp),'beta_1_over_kj_mol':float(d.beta),'cv_min_A':float(np.nanmin(d.cv)),'cv_max_A':float(np.nanmax(d.cv)),'primary_cv_units':_primary_cv_units(d.meta),'primary_cv_axis_label':_primary_cv_axis_label(d.meta),'selected_unbiased_method':selected,'pmf_span_kcal_mol':span,'pmf_minimum_cv_A':main_report_info['pmf_minimum_cv_A'],'mbar':{'converged':bool(m['converged']),'iterations':int(m['iterations']),'max_delta':float(m['max_delta']),'backend':m.get('backend','unknown'),'threads':m.get('threads',None),'active_states':[int(x) for x in m['active']],'n_k':[int(x) for x in m['n_k']],'base_ess':float(ess(base_w))},'boost':bs,'neighbor_overlap':neigh,'warnings':warn,'files':{**main_report_info['files'],'summary_md':str(out/'pmf_summary.md'),'summary_json':str(out/'pmf_summary.json')}}
+    if epoch0_report_info is not None:
+        s['epoch_000_report']={'available':True,'reason':'epoch_000 excluded from the main PMF/GaMD-boost report above; this covers epoch_000 only',
+                               'n_samples':epoch0_report_info['n_samples'],'selected_unbiased_method':epoch0_report_info['selected'],
+                               'pmf_span_kcal_mol':epoch0_report_info['pmf_span_kcal_mol'],'pmf_minimum_cv_A':epoch0_report_info['pmf_minimum_cv_A'],
+                               'boost':epoch0_report_info['boost'],'neighbor_overlap':epoch0_report_info['neighbor_overlap'],
+                               'files':epoch0_report_info['files']}
+        s['files'].update({f'epoch_000_{k}':v for k,v in epoch0_report_info['files'].items()})
+    else:
+        s['epoch_000_report']={'available':False,'reason':'no epoch_000/rest split available (single-epoch run or non-adaptive-production source)'}
     s['rg']=rg_info
     s['distance_rg_2d_fes']=fes2d_info
     s['pca_2d_fes']=pca2d_info
