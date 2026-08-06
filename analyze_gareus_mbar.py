@@ -7,7 +7,7 @@ _thread_cap = str(min(_ne_num, _ne_cap))
 _os_env.environ['NUMEXPR_NUM_THREADS'] = _thread_cap  # force-cap even if already set
 _os_env.environ.setdefault('NUMBA_NUM_THREADS', _thread_cap)
 del _os_env, _ne_cap, _ne_num, _thread_cap
-import argparse, csv, hashlib, json, math, os, re, sys, time
+import argparse, csv, hashlib, json, math, os, re, shutil, sys, time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -1680,38 +1680,63 @@ def _get_adaptive_epoch_traj_dirs(d: Data) -> list:
     return result
 
 
+_MERGED_TRAJ_RESUME_RE = re.compile(r'^(.*)_resume_from_(\d+)$')
+
+
 def _prepare_adaptive_merged_traj_dir(d: Data, args=None) -> Optional[Path]:
     """Create/update a merged replica_trajectories/ in adaptive_production/ using symlinks.
 
-    Each epoch's replica_NNN.xtc is linked so that
+    Each phase's own trajectory segments are linked so that
     _find_all_replica_trajectory_segments treats them as resume segments in
-    chronological epoch order.  The first non-empty epoch file for each replica
-    gets the plain replica_NNN.xtc base link; subsequent non-empty epochs get
-    replica_NNN_resume_from_EPOCH*1e10.xtc links.  Empty (0-byte) files are skipped.
+    chronological phase order, each keyed by a globally-unique
+    ``resume_from_{epoch_idx * STEP_STRIDE + local_resume_start}`` offset --
+    matching _adjusted_steps_for_merged_traj's own ``+ src * STEP_STRIDE``
+    per-phase window. Empty (0-byte) files are skipped.
+
+    A phase can itself have been interrupted and resumed multiple times
+    within its own directory (SIGTERM + auto-resume writes a fresh
+    ``replica_NNN_resume_from_<local_step>`` file each time, independent of
+    which phase this is) -- the previous version of this function collapsed
+    every one of a phase's OWN internal resume segments onto a single link
+    name derived from ``epoch_idx`` alone, so only the first-processed
+    segment per (phase, replica) survived; every other internal resume
+    segment for that phase/replica was silently dropped before ever
+    reaching the analysis. Confirmed on a real run (chignolin_5,
+    epoch_001/baseline): 4 real trajectory segments per replica (1 base + 3
+    internal resumes) collapsed to 1 merged file, discarding roughly 3/4 of
+    that phase's coordinate data -- the dominant reason chignolin-FES/Rg/PCA
+    only matched 856,655 of 3,348,831 available merged-directory frames
+    (25.6%) even though the true per-segment step ranges are fully
+    self-consistent and non-overlapping. Fixed by keying each segment's
+    link by its own *local* resume_start (parsed from its original
+    filename, 0 for a phase's true base file) folded into the same
+    global-offset scheme, so every segment gets a distinct name.
+
+    Rebuilds from scratch each call (removes any previous merged dir first)
+    so a stale run from before this fix -- or from a run whose phase list
+    changed -- can never leave incorrect leftover links in place.
     """
     epoch_traj = _get_adaptive_epoch_traj_dirs(d)
     if not epoch_traj:
         return None
     merged = d.prod_dir / '_merged_replica_trajectories'
+    if merged.exists():
+        shutil.rmtree(merged)
     merged.mkdir(exist_ok=True)
-    STEP_STRIDE = 10_000_000_000  # 1e10 — larger than any real epoch step count
+    STEP_STRIDE = _MERGED_TRAJ_STEP_STRIDE
     TRAJ_EXTS = {'.xtc', '.dcd', '.nc', '.trr'}
-    # Track which replicas have had their "base" link created
-    base_written: set = set()
     for epoch_idx, traj_dir in epoch_traj:
         for f in sorted(traj_dir.iterdir()):
             if f.suffix not in TRAJ_EXTS:
                 continue
             if f.stat().st_size == 0:
                 continue  # skip empty/unwritten trajectory files
-            stem = f.stem  # e.g. "replica_000"
-            # Extract replica id from stem (first component before any _resume_from_)
-            base_stem = stem.split('_resume_from_')[0]
-            if base_stem not in base_written:
-                link = merged / f'{base_stem}{f.suffix}'
-                base_written.add(base_stem)
-            else:
-                link = merged / f'{base_stem}_resume_from_{epoch_idx * _MERGED_TRAJ_STEP_STRIDE}{f.suffix}'
+            stem = f.stem  # e.g. "replica_000" or "replica_000_resume_from_3736350"
+            m = _MERGED_TRAJ_RESUME_RE.match(stem)
+            base_stem, local_resume = (m.group(1), int(m.group(2))) if m else (stem, 0)
+            global_resume = epoch_idx * STEP_STRIDE + local_resume
+            link = (merged / f'{base_stem}{f.suffix}' if global_resume == 0
+                    else merged / f'{base_stem}_resume_from_{global_resume}{f.suffix}')
             if not link.exists():
                 try:
                     link.symlink_to(f.resolve())
