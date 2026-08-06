@@ -323,6 +323,16 @@ class AdaptiveDecisionPolicy:
     # (e.g. blocked by a secondary-CV-coupled physical barrier), not just
     # normal thermal wobble around the restraint minimum.
     max_target_deviation_sigma: float = 3.0
+    # tica_coverage_add extrapolates a new window's secondary-CV restraint onto
+    # a previously-uncovered region, unlike weak-edge bridges which interpolate
+    # between two already-sampled neighbors. Inheriting the nearest parent's
+    # secondary_k unchanged assumes the free-energy curvature there matches the
+    # parent's own (already-covered) location; when it doesn't, the restraint is
+    # too soft to hold the new window and it relaxes back into the parent's
+    # basin instead of sampling the new region (observed: a window landed >10
+    # sigma from its own target after being added this way). Stiffen the
+    # inherited secondary_k by this factor for coverage-extrapolated windows.
+    coverage_k_stiffen_factor: float = 2.0
 
 
 class WindowStateRegistry:
@@ -1668,7 +1678,11 @@ def _propose_tica_coverage_actions(
                     + ((target_secondary - float(state.secondary_center)) / s_width) ** 2
                 )
             parent = active[int(np.argmin(distances))]
-            params = (target_primary, float(parent.primary_k), target_secondary, float(parent.secondary_k))
+            # Extrapolating past the parent's own coverage, not interpolating
+            # between two neighbors -- stiffen rather than blindly inherit (see
+            # coverage_k_stiffen_factor docstring).
+            stiffened_secondary_k = float(parent.secondary_k) * float(policy.coverage_k_stiffen_factor)
+            params = (target_primary, float(parent.primary_k), target_secondary, stiffened_secondary_k)
             lo = float(np.min(uncovered_values[mask]))
             hi = float(np.max(uncovered_values[mask]))
             reason = (
@@ -4360,6 +4374,7 @@ def policy_from_args(args: Any) -> AdaptiveDecisionPolicy:
         redundant_overlap=_arg_float(args, "adaptive_production_redundant_overlap", 0.45),
         min_active_states=_arg_int(args, "adaptive_production_min_active_states", _arg_int(args, "min_total_windows", 0) or 8),
         max_target_deviation_sigma=_arg_float(args, "adaptive_production_max_target_deviation_sigma", 3.0),
+        coverage_k_stiffen_factor=_arg_float(args, "adaptive_production_coverage_k_stiffen_factor", 2.0),
     )
 
 

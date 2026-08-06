@@ -92,3 +92,45 @@ def test_tica_coverage_action_records_distinct_auditable_state_source():
     added = registry.active_states()[-1]
     assert added.source == "tica_coverage"
     assert added.metadata["population_count"] == 20
+
+
+def test_tica_coverage_add_stiffens_secondary_k_relative_to_parent():
+    """Extrapolated coverage windows must not just inherit the parent's secondary_k.
+
+    Regression for chignolin_5 window 27: a tica_coverage window inherited its
+    parent's secondary_k unchanged, was too soft to hold the newly-discovered
+    (previously uncovered) target, and relaxed >10 sigma back into the
+    parent's own basin instead.
+    """
+    registry = _registry()
+    policy = AdaptiveDecisionPolicy()
+    primary = np.concatenate([np.full(990, 0.5), np.full(20, 0.6)])
+    tic1 = np.concatenate([np.full(990, 0.0), np.full(20, 3.0)])
+
+    actions = _propose_tica_coverage_actions(registry, primary, tic1, policy)
+
+    assert len(actions) == 1
+    _, parent_id, params, _, _ = actions[0]
+    parent = registry.get_state(parent_id)
+    _target_primary, primary_k, _target_secondary, secondary_k = params
+
+    assert primary_k == parent.primary_k
+    assert secondary_k == parent.secondary_k * policy.coverage_k_stiffen_factor
+
+
+def test_tica_coverage_k_stiffen_factor_is_configurable():
+    """The stiffening amount is a policy knob, not a hardcoded constant."""
+    registry = _registry()
+    primary = np.concatenate([np.full(990, 0.5), np.full(20, 0.6)])
+    tic1 = np.concatenate([np.full(990, 0.0), np.full(20, 3.0)])
+
+    unstiffened = AdaptiveDecisionPolicy(coverage_k_stiffen_factor=1.0)
+    actions = _propose_tica_coverage_actions(registry, primary, tic1, unstiffened)
+    parent = registry.get_state(actions[0][1])
+    assert actions[0][2][3] == parent.secondary_k
+
+    registry = _registry()
+    stiffened = AdaptiveDecisionPolicy(coverage_k_stiffen_factor=5.0)
+    actions = _propose_tica_coverage_actions(registry, primary, tic1, stiffened)
+    parent = registry.get_state(actions[0][1])
+    assert actions[0][2][3] == parent.secondary_k * 5.0
