@@ -1,6 +1,7 @@
 """Post-switch tICA coverage-extension regression tests."""
 
 import numpy as np
+import pytest
 
 from gareus.adaptive_production import (
     AdaptiveDecisionPolicy,
@@ -94,8 +95,11 @@ def test_tica_coverage_action_records_distinct_auditable_state_source():
     assert added.metadata["population_count"] == 20
 
 
-def test_tica_coverage_add_stiffens_secondary_k_relative_to_parent():
-    """Extrapolated coverage windows must not just inherit the parent's secondary_k.
+_KBT_KCAL_298K = 1.987204e-3 * 298.0  # matches _propose_tica_coverage_actions' default temperature_K
+
+
+def test_tica_coverage_k_derived_from_observed_spread_via_equipartition():
+    """Stiffening is data-derived (k = kT/Var of the new population), not a flat guess.
 
     Regression for chignolin_5 window 27: a tica_coverage window inherited its
     parent's secondary_k unchanged, was too soft to hold the newly-discovered
@@ -105,32 +109,72 @@ def test_tica_coverage_add_stiffens_secondary_k_relative_to_parent():
     registry = _registry()
     policy = AdaptiveDecisionPolicy()
     primary = np.concatenate([np.full(990, 0.5), np.full(20, 0.6)])
-    tic1 = np.concatenate([np.full(990, 0.0), np.full(20, 3.0)])
+    cluster = np.linspace(2.85, 3.15, 20)
+    tic1 = np.concatenate([np.full(990, 0.0), cluster])
 
     actions = _propose_tica_coverage_actions(registry, primary, tic1, policy)
 
     assert len(actions) == 1
-    _, parent_id, params, _, _ = actions[0]
+    _, parent_id, params, _, metadata = actions[0]
     parent = registry.get_state(parent_id)
     _target_primary, primary_k, _target_secondary, secondary_k = params
 
-    assert primary_k == parent.primary_k
-    assert secondary_k == parent.secondary_k * policy.coverage_k_stiffen_factor
+    assert metadata["population_count"] == 20  # whole cluster formed one group, none dropped
+    expected_k = _KBT_KCAL_298K / float(np.std(cluster)) ** 2
+    assert secondary_k == pytest.approx(expected_k)
+    assert secondary_k != parent.secondary_k  # actually moved, not a no-op
+    assert primary_k == parent.primary_k  # primary axis untouched (it wasn't the failure mode)
+    assert secondary_k >= parent.secondary_k  # never loosens below the parent's own k
 
 
-def test_tica_coverage_k_stiffen_factor_is_configurable():
-    """The stiffening amount is a policy knob, not a hardcoded constant."""
+def test_tica_coverage_k_capped_for_tight_but_nonzero_spread():
+    """A very tight (but non-degenerate) cluster must not blow secondary_k up unbounded."""
+    registry = _registry()
+    policy = AdaptiveDecisionPolicy()
+    primary = np.concatenate([np.full(990, 0.5), np.full(20, 0.6)])
+    tic1 = np.concatenate([np.full(990, 0.0), np.linspace(2.98, 3.02, 20)])
+
+    actions = _propose_tica_coverage_actions(registry, primary, tic1, policy)
+
+    assert len(actions) == 1
+    parent = registry.get_state(actions[0][1])
+    secondary_k = actions[0][2][3]
+    assert secondary_k == pytest.approx(parent.secondary_k * policy.coverage_k_stiffen_cap)
+
+
+def test_tica_coverage_k_falls_back_to_parent_for_degenerate_zero_spread():
+    """A perfectly repeated (zero-variance) sample carries no spread information.
+
+    Must fall back to the parent's own k, not divide by zero / blow up to inf.
+    """
     registry = _registry()
     primary = np.concatenate([np.full(990, 0.5), np.full(20, 0.6)])
     tic1 = np.concatenate([np.full(990, 0.0), np.full(20, 3.0)])
 
-    unstiffened = AdaptiveDecisionPolicy(coverage_k_stiffen_factor=1.0)
-    actions = _propose_tica_coverage_actions(registry, primary, tic1, unstiffened)
+    actions = _propose_tica_coverage_actions(registry, primary, tic1)
+
+    assert len(actions) == 1
     parent = registry.get_state(actions[0][1])
-    assert actions[0][2][3] == parent.secondary_k
+    secondary_k = actions[0][2][3]
+    assert secondary_k == parent.secondary_k
+    assert np.isfinite(secondary_k)
+
+
+def test_tica_coverage_k_stiffen_cap_is_configurable():
+    """The safety ceiling on the data-derived estimate is a policy knob."""
+    registry = _registry()
+    primary = np.concatenate([np.full(990, 0.5), np.full(20, 0.6)])
+    tic1 = np.concatenate([np.full(990, 0.0), np.linspace(2.98, 3.02, 20)])
+
+    tight_cap = AdaptiveDecisionPolicy(coverage_k_stiffen_cap=1.0)
+    actions = _propose_tica_coverage_actions(registry, primary, tic1, tight_cap)
+    parent = registry.get_state(actions[0][1])
+    assert actions[0][2][3] == pytest.approx(parent.secondary_k)  # cap=1x -> no stiffening allowed
 
     registry = _registry()
-    stiffened = AdaptiveDecisionPolicy(coverage_k_stiffen_factor=5.0)
-    actions = _propose_tica_coverage_actions(registry, primary, tic1, stiffened)
+    loose_cap = AdaptiveDecisionPolicy(coverage_k_stiffen_cap=1000.0)
+    actions = _propose_tica_coverage_actions(registry, primary, tic1, loose_cap)
     parent = registry.get_state(actions[0][1])
-    assert actions[0][2][3] == parent.secondary_k * 5.0
+    # cap=1000x is so loose the raw equipartition estimate wins uncapped, and
+    # that raw estimate is nowhere near the 1000x ceiling for this cluster.
+    assert parent.secondary_k < actions[0][2][3] < parent.secondary_k * 1000.0

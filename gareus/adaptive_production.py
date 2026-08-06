@@ -330,9 +330,19 @@ class AdaptiveDecisionPolicy:
     # parent's own (already-covered) location; when it doesn't, the restraint is
     # too soft to hold the new window and it relaxes back into the parent's
     # basin instead of sampling the new region (observed: a window landed >10
-    # sigma from its own target after being added this way). Stiffen the
-    # inherited secondary_k by this factor for coverage-extrapolated windows.
-    coverage_k_stiffen_factor: float = 2.0
+    # sigma from its own target after being added this way).
+    #
+    # Rather than guess a flat multiplier, the new secondary_k is estimated by
+    # equipartition (k = kT/Var) from the observed spread of the frames that
+    # populate the newly-discovered region -- an approximation grounded in
+    # data actually available at the new target, not the parent's unrelated
+    # location. Those frames were still sampled under some other window's
+    # bias though, so this can still be noisy (population near the minimum
+    # threshold) or degenerate (near-zero spread, e.g. a coarse/quantized CV):
+    # this cap bounds how far above the parent's own k that estimate is
+    # allowed to push, and the estimate is always floored at the parent's k
+    # (only ever tighten, never loosen).
+    coverage_k_stiffen_cap: float = 10.0
 
 
 class WindowStateRegistry:
@@ -1679,9 +1689,21 @@ def _propose_tica_coverage_actions(
                 )
             parent = active[int(np.argmin(distances))]
             # Extrapolating past the parent's own coverage, not interpolating
-            # between two neighbors -- stiffen rather than blindly inherit (see
-            # coverage_k_stiffen_factor docstring).
-            stiffened_secondary_k = float(parent.secondary_k) * float(policy.coverage_k_stiffen_factor)
+            # between two neighbors: derive the new secondary_k from the
+            # observed spread of the frames that actually populate this
+            # region (equipartition, k = kT/Var) instead of guessing a flat
+            # multiplier or blindly inheriting the parent's own -- see
+            # coverage_k_stiffen_cap docstring for the rationale and bounds.
+            group_secondary_std = float(np.std(uncovered_values[mask]))
+            if group_secondary_std > 1.0e-6:
+                k_from_spread = kbt_kcal / (group_secondary_std ** 2)
+            else:
+                k_from_spread = float(parent.secondary_k)
+            stiffened_secondary_k = float(np.clip(
+                k_from_spread,
+                float(parent.secondary_k),
+                float(parent.secondary_k) * float(policy.coverage_k_stiffen_cap),
+            ))
             params = (target_primary, float(parent.primary_k), target_secondary, stiffened_secondary_k)
             lo = float(np.min(uncovered_values[mask]))
             hi = float(np.max(uncovered_values[mask]))
@@ -4374,7 +4396,7 @@ def policy_from_args(args: Any) -> AdaptiveDecisionPolicy:
         redundant_overlap=_arg_float(args, "adaptive_production_redundant_overlap", 0.45),
         min_active_states=_arg_int(args, "adaptive_production_min_active_states", _arg_int(args, "min_total_windows", 0) or 8),
         max_target_deviation_sigma=_arg_float(args, "adaptive_production_max_target_deviation_sigma", 3.0),
-        coverage_k_stiffen_factor=_arg_float(args, "adaptive_production_coverage_k_stiffen_factor", 2.0),
+        coverage_k_stiffen_cap=_arg_float(args, "adaptive_production_coverage_k_stiffen_cap", 10.0),
     )
 
 
