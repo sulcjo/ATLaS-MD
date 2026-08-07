@@ -1694,15 +1694,16 @@ def _propose_tica_coverage_actions(
             # region (equipartition, k = kT/Var) instead of guessing a flat
             # multiplier or blindly inheriting the parent's own -- see
             # coverage_k_stiffen_cap docstring for the rationale and bounds.
-            group_secondary_std = float(np.std(uncovered_values[mask]))
+            group_secondary_std = float(np.std(uncovered_values[mask], ddof=1))
             if group_secondary_std > 1.0e-6:
                 k_from_spread = kbt_kcal / (group_secondary_std ** 2)
             else:
                 k_from_spread = float(parent.secondary_k)
+            stiffen_cap = max(float(policy.coverage_k_stiffen_cap), 1.0)
             stiffened_secondary_k = float(np.clip(
                 k_from_spread,
                 float(parent.secondary_k),
-                float(parent.secondary_k) * float(policy.coverage_k_stiffen_cap),
+                float(parent.secondary_k) * stiffen_cap,
             ))
             params = (target_primary, float(parent.primary_k), target_secondary, stiffened_secondary_k)
             lo = float(np.min(uncovered_values[mask]))
