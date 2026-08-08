@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import csv
+import itertools
 import json
 import math
 import os
@@ -1629,7 +1630,79 @@ def drop_bad_us_windows_and_rebuild(
     pulling actually starts, regardless of how good their seed looked on paper.
     """
     nwin_before = len(centers_a)
-    dropped = sorted({int(i) for i in dropped_window_indices})
+    dropped_requested = sorted({int(i) for i in dropped_window_indices})
+
+    def _components_for_drop(drop_set):
+        keep_idx = [i for i in range(nwin_before) if i not in drop_set]
+        ca = np.asarray([centers_a[i] for i in keep_idx], dtype=float)
+        sc = np.asarray([secondary_cv_centers[i] for i in keep_idx], dtype=float)
+        edges = build_explicit_2d_neighbor_edges(ca, sc, args=args)
+        return _connected_components_count(len(keep_idx), edges)
+
+    needs_2d_check = (
+        isinstance(secondary_cv_metadata, dict)
+        and bool(secondary_cv_metadata.get("explicit_2d_windows", False))
+        and secondary_cv_centers is not None
+    )
+
+    def _minimal_restore_for_connectivity(drop_set):
+        """Smallest subset of drop_set whose restoration reconnects the graph, or None."""
+        drop_list = sorted(drop_set)
+        if _components_for_drop(set(drop_list)) <= 1:
+            return []
+        if len(drop_list) <= 12:
+            for r in range(1, len(drop_list) + 1):
+                for combo in itertools.combinations(drop_list, r):
+                    if _components_for_drop(set(drop_list) - set(combo)) <= 1:
+                        return list(combo)
+            return None
+        # Drop sets this large are not expected in practice (bounded by
+        # us_auto_drop_max_fraction); fall back to a greedy hill-climb rather than
+        # the exponential brute force above.
+        remaining = list(drop_list)
+        restored: list[int] = []
+        n_components = _components_for_drop(set(remaining))
+        while n_components > 1 and remaining:
+            best_candidate, best_components = None, n_components
+            for candidate in remaining:
+                trial = _components_for_drop(set(remaining) - {candidate})
+                if trial < best_components:
+                    best_components, best_candidate = trial, candidate
+            if best_candidate is None:
+                return None
+            remaining.remove(best_candidate)
+            restored.append(best_candidate)
+            n_components = best_components
+        return restored
+
+    restored: list[int] = []
+    dropped = list(dropped_requested)
+    if needs_2d_check and dropped:
+        # Dropping every flagged-bad window can fragment the REUS exchange graph even
+        # though dropping none of them (or a subset) would not. Rather than hard-failing
+        # a whole adaptive epoch over this, restore the fewest bad windows back into
+        # production needed to keep the graph connected - same principle as the
+        # auto-drop itself (favor continuing over crashing), just extended to the case
+        # where the drop set and the graph topology interact badly.
+        restore_needed = _minimal_restore_for_connectivity(set(dropped))
+        if restore_needed is None:
+            raise RuntimeError(
+                f"US auto-drop: even restoring every flagged-bad window ({dropped_requested}) back into "
+                "production, the window set is still disconnected. This is not a marginal auto-drop edge "
+                "case - the base window/CV grid itself has a connectivity gap. Fix the window grid, or "
+                "pass --us-allow-bad-windows."
+            )
+        if restore_needed:
+            restored = sorted(restore_needed)
+            dropped = [i for i in dropped if i not in restore_needed]
+            print(
+                f"WARNING [US auto-drop]: keeping {restored} in production despite failing the "
+                f"post-pull quality gate - dropping the full bad-window set {dropped_requested} would "
+                "have disconnected the explicit-2D neighbor exchange graph. These replicas start further "
+                "from their umbrella center than the gate normally allows; expect elevated initial bias "
+                "and possibly slower equilibration for them."
+            )
+
     keep = [i for i in range(nwin_before) if i not in dropped]
 
     def _sub(seq):
@@ -1648,16 +1721,7 @@ def drop_bad_us_windows_and_rebuild(
     new_window_start_velocities = _sub(list(window_start_velocities))
 
     graph_summary = None
-    if isinstance(secondary_cv_metadata, dict) and bool(secondary_cv_metadata.get("explicit_2d_windows", False)) and new_secondary_cv_centers is not None:
-        edges = build_explicit_2d_neighbor_edges(new_centers_a, new_secondary_cv_centers, args=args)
-        n_components = _connected_components_count(len(new_centers_a), edges)
-        if n_components > 1:
-            raise RuntimeError(
-                f"US auto-drop: dropping windows {dropped} would leave the explicit-2D neighbor graph "
-                f"disconnected ({n_components} components among the {len(keep)} surviving windows). "
-                "Refusing to start a REUS run with a broken exchange graph. Fix the seed/pull for "
-                "these windows instead, or pass --us-allow-bad-windows."
-            )
+    if needs_2d_check and new_secondary_cv_centers is not None:
         graph_summary = write_explicit_2d_neighbor_graph_files(
             out_dir, new_centers_a, new_secondary_cv_centers, args=args, prefix="explicit_2d_neighbor_graph"
         )
