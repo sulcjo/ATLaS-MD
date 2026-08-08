@@ -1425,6 +1425,45 @@ def build_explicit_2d_neighbor_edges(centers_a, secondary_cv_centers, args=None)
             for nd, j in candidates[:k_nearest]:
                 add_edge(i, j, "knn_geometry", nd)
 
+    # The row/column/knn passes above are all radius- or tolerance-limited, so a
+    # window whose nearest neighbor sits further out than that (an adaptive round
+    # placing a window in newly-discovered, still-sparse CV territory, for example)
+    # can end up with zero edges - silently violating this function's own "every
+    # window has a chance to exchange" intent and leaving the exchange graph
+    # fragmented regardless of pull/seed quality. Guarantee a single connected
+    # component by repeatedly bridging the closest pair of nodes that still sit in
+    # different components, ignoring the radius cutoff for these bridge edges only.
+    def _components(edge_list):
+        parent = list(range(n))
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        for e in edge_list:
+            ri, rj = find(int(e["wi"])), find(int(e["wj"]))
+            if ri != rj:
+                parent[ri] = rj
+        groups: dict[int, list[int]] = {}
+        for i in range(n):
+            groups.setdefault(find(i), []).append(i)
+        return list(groups.values())
+
+    components = _components(list(edges.values()))
+    while len(components) > 1:
+        best = None  # (normalized_distance, i, j)
+        for ci in range(len(components)):
+            for cj in range(ci + 1, len(components)):
+                for i in components[ci]:
+                    for j in components[cj]:
+                        nd = math.sqrt(((centers[j] - centers[i]) / d_scale) ** 2 + ((secondary[j] - secondary[i]) / s_scale) ** 2)
+                        if best is None or nd < best[0]:
+                            best = (nd, i, j)
+        add_edge(best[1], best[2], "connectivity_bridge", best[0])
+        components = _components(list(edges.values()))
+
     out = list(edges.values())
     out.sort(key=lambda r: (float(r.get("normalized_distance", float("inf"))), int(r["wi"]), int(r["wj"]), str(r.get("edge_type", ""))))
     return out
