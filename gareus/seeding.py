@@ -1140,6 +1140,40 @@ def generate_us_starting_states_by_pulling(
         except Exception:
             return float("nan")
 
+    def _current_secondary_cv_from_context(sim) -> float:
+        if not (secondary_available and secondary_cv_metadata and secondary_cv_metadata.get("enabled")):
+            return float("nan")
+        try:
+            state = sim.context.getState(getPositions=True, enforcePeriodicBox=True)
+            pos_nm = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+            value = secondary_structure_score_from_positions_nm(pos_nm, secondary_cv_metadata)
+            return float(value) if math.isfinite(float(value)) else float("nan")
+        except Exception:
+            return float("nan")
+
+    secondary_hold_scale = max(0.0, float(getattr(args, "us_2d_start_secondary_hold_scale", 0.0) or 0.0))
+    secondary_close_delta = float(getattr(args, "us_2d_start_secondary_warn_delta", 0.35) or 0.35)
+
+    def _seed_secondary_hold_scale(sim, w: int) -> float:
+        """Restraint scale to use for a seed already close to its secondary CV target.
+
+        The primary-only phase of a 2D pull otherwise zeroes the secondary
+        restraint outright, on the assumption there is a gap to close. When the
+        GENPEPT seed already starts within secondary_close_delta of the target,
+        that phase has nothing to close and only gives the secondary CV time to
+        drift away from an already-good position (observed directly: seeds with
+        abs_secondary_delta < 0.03 at selection time ending up 0.4-1.4 off after
+        a longer/stronger primary-only phase). Hold it lightly instead.
+        """
+        if secondary_hold_scale <= 0.0 or not staged_2d_relax:
+            return 0.0
+        current = _current_secondary_cv_from_context(sim)
+        if not math.isfinite(current):
+            return 0.0
+        if abs(float(current) - float(secondary_cv_centers[w])) > secondary_close_delta:
+            return 0.0
+        return secondary_hold_scale
+
     def _run_primary_pull_segment(
         sim,
         target_center: float,
@@ -1232,6 +1266,9 @@ def generate_us_starting_states_by_pulling(
         unlikely to close the gap).
         """
         effective_pull_steps = int(pull_steps if pull_steps_override is None else pull_steps_override)
+        # Measured before any parameter/position changes below, so it reflects
+        # the just-loaded seed, not anything this function is about to do to it.
+        hold_scale = _seed_secondary_hold_scale(sim, w)
         if primary_cv_is_contacts(args):
             # Start contact pulls from the current CV with k=0, then ramp in the
             # MD segment.  This avoids an instantaneous many-contact impulse before
@@ -1246,7 +1283,7 @@ def generate_us_starting_states_by_pulling(
             sim.context.setParameter("r0", float(centers_nm_arr[w]))
             sim.context.setParameter("k", float(pull_k_kj_nm2))
         if secondary_available:
-            _set_secondary_restraint_for_window(sim, w, 0.0 if staged_2d_relax else 1.0)
+            _set_secondary_restraint_for_window(sim, w, hold_scale if staged_2d_relax else 1.0)
         if minimize_iters > 0:
             try:
                 sim.minimizeEnergy(maxIterations=minimize_iters)
@@ -1260,7 +1297,7 @@ def generate_us_starting_states_by_pulling(
                 remaining_steps = int(effective_pull_steps) - int(distance_steps)
                 done_local = 0
                 if distance_steps > 0:
-                    _set_secondary_restraint_for_window(sim, w, 0.0)
+                    _set_secondary_restraint_for_window(sim, w, hold_scale)
                     _run_primary_pull_segment(
                         sim,
                         float(centers_nm_arr[w]), float(pull_k_kj_nm2), distance_steps,
