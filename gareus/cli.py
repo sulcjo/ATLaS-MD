@@ -373,6 +373,12 @@ def _add_us_args(p: argparse.ArgumentParser) -> None:
                    choices=["auto", "staged", "off", "single", "ramp"], default="auto")
     p.add_argument("--us-2d-secondary-k-scale", type=float, default=1.0,
                    help="Multiply secondary CV k during 2D pull ramp.")
+    p.add_argument("--us-2d-secondary-hold-scale", type=float, default=0.35,
+                   help="Secondary CV restraint strength (fraction of production k) to hold during the "
+                        "primary-only phase of a 2D pull, but only when the GENPEPT seed already starts "
+                        "close to both CV targets. Prevents an already-good seed from drifting off its "
+                        "secondary CV target while the fully unrestrained primary-only phase runs. 0 "
+                        "keeps the historical fully-unrestrained behavior for every seed, good or bad.")
     p.add_argument("--us-allow-bad-windows", action=argparse.BooleanOptionalAction, default=False,
                    help="Start production even if US starting-structure quality-control flags windows "
                         "as 'bad' (start far enough from its production center that the full-strength "
@@ -853,6 +859,7 @@ def _shim_us_pulling(args: argparse.Namespace) -> None:
     args.contact_us_pull_ramp_stages = args.us_pull_ramp_stages
     args.us_2d_start_relax_mode = args.us_2d_relax_mode
     args.us_2d_start_secondary_k_pull_scale = args.us_2d_secondary_k_scale
+    args.us_2d_start_secondary_hold_scale = args.us_2d_secondary_hold_scale
     args.us_2d_start_secondary_ramp_stages = args.us_pull_ramp_stages
     # Dropped US pull tuning
     args.contact_us_pull_timestep_fs = 1.0

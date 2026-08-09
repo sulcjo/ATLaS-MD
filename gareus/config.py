@@ -459,6 +459,7 @@ def _basic_chignolin_config() -> Dict[str, Any]:
             "us_pull_k": 50.0,
             "us_pull_ramp_stages": 5,
             "us_2d_secondary_k_scale": 5.0,
+            "us_2d_secondary_hold_scale": 0.35,
         },
         "windows": {
             "window_mode": "adaptive-feedback",
