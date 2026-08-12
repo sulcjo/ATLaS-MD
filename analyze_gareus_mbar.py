@@ -447,18 +447,78 @@ def _masked_data(d: 'Data', mask: np.ndarray, meta_override: Optional[dict] = No
     )
 
 
+def _subset_logw_from_global_fk(d_subset: 'Data', f_k_global: np.ndarray) -> np.ndarray:
+    """Correct per-sample MBAR log-weights for a SUBSET of the full sample
+    population (e.g. an epoch_000/rest split, or a secondary-CV regime
+    split), reusing the already-solved GLOBAL free energies ``f_k_global``
+    but the subset's own per-state sample counts ``N_k^subset`` in the MBAR
+    self-consistency denominator:
+
+        logw_S[n] = -logsumexp_k( log(N_k^subset[k]) + f_k[k] - u_nk[n, k] )
+
+    Naively slicing the GLOBAL logw to a subset and renormalizing (``
+    norm_logw(logw[mask])``) only corrects for the subset's overall size --
+    it silently keeps using N_k^GLOBAL inside every sample's denominator,
+    which is wrong whenever different states lose different *fractions* of
+    their samples to the exclusion (e.g. one window losing 80% of its
+    samples to an epoch_000 exclusion while another loses 10%). That
+    produces a real, direction-consistent tilt across the CV axis.
+
+    This recomputes just the denominator with the subset's own N_k while
+    still reusing f_k_global -- state free energies are a property of the
+    whole population and don't need re-solving for a subset reweight. It is
+    an approximation (not a from-scratch MBAR resolve of the subset alone),
+    but a substantially better one than the naive mask-and-renormalize.
+    States with zero subset representation (N_k^subset == 0) are dropped
+    from the denominator sum entirely (equivalent to log(0) = -inf), and
+    states with a non-finite global f_k (never solved -- zero global
+    samples) are dropped the same way for safety, though a subset can never
+    contain samples from a state absent at the global level.
+
+    Degenerate case: when d_subset covers the ENTIRE global population, this
+    reduces to f_k_global's own logw exactly (same N_k, same f_k, same u_nk
+    used to derive it in the first place).
+    """
+    K = int(f_k_global.size)
+    u_nk = np.asarray(d_subset.u_nk, dtype=np.float64)
+    window = np.asarray(d_subset.window, dtype=np.int64)
+    f_k_global = np.asarray(f_k_global, dtype=np.float64)
+    n_k_subset = np.bincount(window[(window >= 0) & (window < K)], minlength=K).astype(np.float64)
+    active = np.where((n_k_subset > 0) & np.isfinite(f_k_global[:K]))[0]
+    if active.size == 0:
+        return np.full(u_nk.shape[0], -np.inf, dtype=np.float64)
+    log_n = np.log(n_k_subset[active])
+    f_active = f_k_global[active]
+    tmp = log_n[None, :] + f_active[None, :] - u_nk[:, active]
+    ld = logsumexp_axis1_finite(tmp)
+    logw_s = -ld
+    logw_s -= logsumexp(logw_s)
+    return logw_s
+
+
 def _regime_slug(regime: str) -> str:
     return _slug(regime) if regime else 'unknown'
 
 
 def run_secondary_cv_analyses(d: 'Data', args, base_logw: np.ndarray, selected: str,
                                boost_ok: bool, kbt_kcal: float, out: Path,
-                               warnings: list, progress: Optional['Progress']) -> tuple:
+                               warnings: list, progress: Optional['Progress'],
+                               f_k_global: Optional[np.ndarray] = None) -> tuple:
     """Secondary-CV PMF + CV1xCV2 2D FES, split by secondary-CV regime when the
     run's CV2 definition changed mid-campaign (see
     ``_secondary_cv_epoch_regime_masks``). Single-regime runs (the common
     case) are entirely unaffected: this degrades to the plain unmodified
     calls, writing to the same paths as before.
+
+    ``f_k_global`` should be the GLOBAL MBAR solve's ``f_k`` (``m['f_k']``)
+    when available. When multiple regimes exist, each regime's own logw is
+    recomputed from ``f_k_global`` and that regime's own per-state sample
+    counts (``_subset_logw_from_global_fk``) rather than naively slicing
+    ``base_logw`` to the regime's mask and renormalizing -- the naive slice
+    only corrects for the regime's overall size, not for different states
+    losing different *fractions* of their samples to the regime split. When
+    ``f_k_global`` is not supplied (e.g. older/direct callers), this falls
+    back to the previous naive mask-and-renormalize behavior.
 
     Returns ``(secondary_cv_pmf_info, cv1_cv2_fes_info)`` for the *dominant*
     regime (or the only regime, if there's just one) -- same shape/keys
@@ -486,7 +546,10 @@ def run_secondary_cv_analyses(d: 'Data', args, base_logw: np.ndarray, selected: 
             _regime_secondary_cv = regime
         regime_meta = dict(d.meta); regime_meta['secondary_cv'] = _regime_secondary_cv
         d_regime = _masked_data(d, mask, meta_override=regime_meta)
-        base_logw_regime = np.asarray(base_logw, dtype=np.float64)[mask]
+        if f_k_global is not None:
+            base_logw_regime = _subset_logw_from_global_fk(d_regime, f_k_global)
+        else:
+            base_logw_regime = np.asarray(base_logw, dtype=np.float64)[mask]
         regime_out = out if is_dominant else out / f'secondary_cv_regime_{_regime_slug(regime)}'
         regime_out.mkdir(parents=True, exist_ok=True)
         pmf_info = analyze_secondary_cv_pmf(d_regime, args, base_logw_regime, selected, boost_ok, kbt_kcal, regime_out, warnings, progress)
@@ -8632,9 +8695,16 @@ def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.nd
     Extracted from analyze() so the identical formula can run twice against
     different sample subsets sharing the same global MBAR solve (see the
     epoch_000/rest split in analyze()) instead of only ever pooling every
-    epoch into one report. ``logw`` is the *raw* per-sample MBAR log-weight
-    (``m['logw']``, masked to this subset if applicable) -- renormalized
-    internally, same pattern as ``analyze_secondary_cv_pmf``.
+    epoch into one report. ``logw`` is the per-sample MBAR log-weight for
+    THIS subset -- renormalized internally, same pattern as
+    ``analyze_secondary_cv_pmf``. When ``d`` is a subset of the full
+    population (e.g. the epoch_000/rest split), callers must pass
+    ``_subset_logw_from_global_fk(d, f_k_global)`` here rather than a naive
+    ``m['logw'][mask]`` slice of the global logw -- the naive slice only
+    renormalizes for the subset's overall size, not for different states
+    losing different fractions of their samples to the split, which
+    produces a real direction-consistent tilt in the resulting PMF. When
+    ``d`` is the full population, plain ``m['logw']`` is already correct.
     """
     K = d.u_nk.shape[1]
     N = len(d.cv)
@@ -8740,14 +8810,24 @@ def analyze(d,args, progress: Optional[Progress] = None):
     # paths, feeding pmf_summary.json's headline numbers -- covers only
     # epoch_001+ (and final). Both reuse this same global MBAR solve (m/logw)
     # rather than re-solving -- only which samples get binned differs.
+    #
+    # Each subset's logw is recomputed via _subset_logw_from_global_fk (reuses
+    # the global f_k, but the SUBSET's own per-state N_k in the MBAR
+    # self-consistency denominator) rather than naively sliced from the global
+    # logw and renormalized. The naive slice only corrects for the subset's
+    # overall size, not for different states losing different *fractions* of
+    # their samples to the split -- that mismatch produces a real,
+    # direction-consistent tilt in the resulting PMF (confirmed on real data:
+    # ~0.11 kcal/mol shift in pmf_span_kcal_mol on a ~13 kcal/mol span).
     epoch0_split=_epoch_zero_split_masks(d)
     epoch0_report_info=None
     if epoch0_split is not None:
         mask0,mask_rest=epoch0_split
         d_epoch0=_masked_data(d,mask0)
         out_epoch0=out/'epoch_000_separate'; out_epoch0.mkdir(parents=True,exist_ok=True)
-        epoch0_report_info=run_pmf_and_gamd_boost_report(d_epoch0,args,logw[mask0],bins,kbt_kcal,out_epoch0,warn,progress,warning_prefix='[epoch_000 report] ')
-        d_main=_masked_data(d,mask_rest); logw_main=logw[mask_rest]
+        logw_epoch0=_subset_logw_from_global_fk(d_epoch0,m['f_k'])
+        epoch0_report_info=run_pmf_and_gamd_boost_report(d_epoch0,args,logw_epoch0,bins,kbt_kcal,out_epoch0,warn,progress,warning_prefix='[epoch_000 report] ')
+        d_main=_masked_data(d,mask_rest); logw_main=_subset_logw_from_global_fk(d_main,m['f_k'])
     else:
         d_main=d; logw_main=logw
 
@@ -8763,16 +8843,24 @@ def analyze(d,args, progress: Optional[Progress] = None):
     pca2d_info=analyze_pca_2d_fes(d,args,logw,selected,boost_ok,kbt_kcal,out,warn,progress)
     extra_obs_info=analyze_extra_observable_pmfs(d,args,logw,selected,boost_ok,kbt_kcal,out,warn,progress)
     chignolin_fes_info=analyze_chignolin_fes(d,args,logw,selected,boost_ok,kbt_kcal,out,warn,progress)
-    secondary_cv_pmf_info,cv1_cv2_fes_info=run_secondary_cv_analyses(d,args,logw,selected,boost_ok,kbt_kcal,out,warn,progress)
+    secondary_cv_pmf_info,cv1_cv2_fes_info=run_secondary_cv_analyses(d,args,logw,selected,boost_ok,kbt_kcal,out,warn,progress,f_k_global=m['f_k'])
     poincare_info=analyze_poincare_map(d,args,logw,selected,boost_ok,kbt_kcal,out,warn,progress)
     poincare_torsions_info=analyze_poincare_residue_torsions(d,args,out,poincare_info,warn,progress)
     epoch_cv_info=_analyze_epoch_cv_exploration(d.prod_dir,out,d.meta,warn)
     tica_epoch_info=_analyze_tica_epochs(d.prod_dir,out,d.meta,warn)
     torsion_pca_scree_info=_analyze_torsion_pca_scree(d.prod_dir,out,d.meta,args,warn)
-    conv_info=run_pmf_convergence(d,args,bins,selected,sel,out,progress=progress,f_init_hint=m.get('f_k'))
+    # sel (the reference PMF) was built from d_main -- epoch_000 excluded when
+    # a split exists (see above). The convergence checks must be run against
+    # that SAME population, not the full d: otherwise even the 100%-of-data
+    # checkpoint can never match a reference it structurally can't reach,
+    # forcing a spurious converged=False purely from population mismatch
+    # (confirmed: this propagated into gareus_report.py's top-level
+    # PASS/CAUTION/FAIL verdict for every multi-epoch adaptive-production
+    # run). When no split exists, d_main is d itself, so this is unchanged.
+    conv_info=run_pmf_convergence(d_main,args,bins,selected,sel,out,progress=progress,f_init_hint=m.get('f_k'))
     epoch_conv_info={}
-    if d.meta.get('_epoch_source'):
-        epoch_conv_info=run_epoch_pmf_convergence(d,args,bins,selected,sel,out,progress=progress,f_init_hint=m.get('f_k'))
+    if d_main.meta.get('_epoch_source'):
+        epoch_conv_info=run_epoch_pmf_convergence(d_main,args,bins,selected,sel,out,progress=progress,f_init_hint=m.get('f_k'))
     s={'production_dir':str(d.prod_dir),'output_dir':str(out),'source':d.source,'n_samples':int(N),'n_windows':int(K),'temperature_K':float(d.temp),'beta_1_over_kj_mol':float(d.beta),'cv_min_A':float(np.nanmin(d.cv)),'cv_max_A':float(np.nanmax(d.cv)),'primary_cv_units':_primary_cv_units(d.meta),'primary_cv_axis_label':_primary_cv_axis_label(d.meta),'selected_unbiased_method':selected,'pmf_span_kcal_mol':span,'pmf_minimum_cv_A':main_report_info['pmf_minimum_cv_A'],'mbar':{'converged':bool(m['converged']),'iterations':int(m['iterations']),'max_delta':float(m['max_delta']),'backend':m.get('backend','unknown'),'threads':m.get('threads',None),'active_states':[int(x) for x in m['active']],'n_k':[int(x) for x in m['n_k']],'base_ess':float(ess(base_w))},'boost':bs,'neighbor_overlap':neigh,'warnings':warn,'files':{**main_report_info['files'],'summary_md':str(out/'pmf_summary.md'),'summary_json':str(out/'pmf_summary.json')}}
     if epoch0_report_info is not None:
         s['epoch_000_report']={'available':True,'reason':'epoch_000 excluded from the main PMF/GaMD-boost report above; this covers epoch_000 only',
