@@ -29,7 +29,7 @@ def test_method_style_is_stable_per_estimator():
 
 
 def test_method_style_gives_distinct_colors_to_core_estimators():
-    core = ["umbrella_only", "gamd_exponential", "gamd_cumulant2", "gamd_cumulant3", "dtram"]
+    core = ["umbrella_only", "gamd_exponential", "gamd_cumulant2", "gamd_cumulant3"]
     colors = [ps.method_style(m)[0] for m in core]
     assert len(set(colors)) == len(core)              # all distinct
 
@@ -37,7 +37,7 @@ def test_method_style_gives_distinct_colors_to_core_estimators():
 def test_method_style_weak_hues_get_linestyle_relief():
     # Light Okabe-Ito hues (contrast WARN) must carry a non-solid linestyle so
     # identity survives low contrast / CVD / print.
-    for m in ("gamd_exponential", "gamd_cumulant3", "dtram"):
+    for m in ("gamd_exponential", "gamd_cumulant3"):
         _, ls = ps.method_style(m)
         assert ls != "-"
 

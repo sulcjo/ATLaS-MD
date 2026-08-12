@@ -44,7 +44,6 @@ METHOD_STYLE: dict[str, tuple[str, str]] = {
     "umbrella_only":   ("#009E73", _SOLID),    # the honest unbiased reference
     "gamd_exponential":("#D55E00", _DASH),
     "gamd_cumulant3":  ("#CC79A7", _DASHDOT),
-    "dtram":           ("#E69F00", _DASH),
 }
 
 _PRETTY: dict[str, str] = {
@@ -52,7 +51,6 @@ _PRETTY: dict[str, str] = {
     "gamd_cumulant3":  "GaMD cumulant-3",
     "gamd_exponential":"GaMD exponential",
     "umbrella_only":   "umbrella (unbiased)",
-    "dtram":           "dTRAM",
 }
 
 # Deterministic fallback for observables/methods with no fixed slot.
