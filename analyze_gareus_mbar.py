@@ -357,7 +357,15 @@ def _secondary_cv_epoch_regime_masks(d: 'Data', warnings: Optional[list] = None)
     distinct = sorted({r for r in regime_by_epoch if r})
     if len(distinct) < 2:
         return None
-    dominant = next((r for r in reversed(regime_by_epoch) if r), distinct[-1])
+
+    def _run_dir_mtime(rd):
+        try:
+            return Path(rd).stat().st_mtime
+        except OSError:
+            return -1.0
+
+    chronological = sorted(range(len(run_dirs)), key=lambda i: _run_dir_mtime(run_dirs[i]))
+    dominant = next((regime_by_epoch[i] for i in reversed(chronological) if regime_by_epoch[i]), distinct[-1])
     unresolved = [i for i, r in enumerate(regime_by_epoch) if not r]
     if unresolved and warnings is not None:
         warnings.append(
@@ -378,12 +386,17 @@ def _masked_data(d: 'Data', mask: np.ndarray, meta_override: Optional[dict] = No
     """Row-slice a Data by a boolean sample mask.
 
     K-length/scalar fields (window-space arrays, beta, temp, ...) are shared
-    with the original -- only per-sample arrays are sliced. Used to run the
-    existing single-regime analysis functions unmodified against a subset of
-    samples (one secondary-CV regime at a time).
+    with the original -- only per-sample arrays (including meta['_epoch_source'],
+    when present) are sliced. Used to run the existing single-regime analysis
+    functions unmodified against a subset of samples (one secondary-CV regime,
+    or the epoch_000/rest split, at a time).
     """
     def _sl(arr):
         return arr[mask] if arr is not None else None
+    meta_out = dict(meta_override if meta_override is not None else d.meta)
+    _epoch_src_meta = meta_out.get('_epoch_source')
+    if _epoch_src_meta is not None and len(_epoch_src_meta) == mask.size:
+        meta_out['_epoch_source'] = np.asarray(_epoch_src_meta)[mask].tolist()
     return Data(
         prod_dir=d.prod_dir, out_dir=d.out_dir,
         cv=_sl(d.cv), cv2=_sl(d.cv2), rg_A=_sl(d.rg_A),
@@ -393,13 +406,13 @@ def _masked_data(d: 'Data', mask: np.ndarray, meta_override: Optional[dict] = No
         beta=d.beta, temp=d.temp,
         boost_kj=_sl(d.boost_kj),
         potential_kj=_sl(d.potential_kj),
-        source=d.source, meta=(d.meta if meta_override is None else meta_override),
+        source=d.source, meta=meta_out,
         boost_dih_kj=_sl(d.boost_dih_kj),
     )
 
 
 def _regime_slug(regime: str) -> str:
-    return ''.join(c if (c.isalnum() or c in '-_') else '_' for c in regime) or 'unknown'
+    return _slug(regime) if regime else 'unknown'
 
 
 def run_secondary_cv_analyses(d: 'Data', args, base_logw: np.ndarray, selected: str,
@@ -429,7 +442,13 @@ def run_secondary_cv_analyses(d: 'Data', args, base_logw: np.ndarray, selected: 
     breakdown: dict = {}
     dominant_pmf_info = dominant_fes_info = None
     for regime, (mask, is_dominant) in regimes.items():
-        regime_meta = dict(d.meta); regime_meta['secondary_cv'] = regime
+        _orig_secondary_cv = d.meta.get('secondary_cv')
+        if isinstance(_orig_secondary_cv, dict):
+            _regime_secondary_cv = dict(_orig_secondary_cv)
+            _regime_secondary_cv['mode'] = regime
+        else:
+            _regime_secondary_cv = regime
+        regime_meta = dict(d.meta); regime_meta['secondary_cv'] = _regime_secondary_cv
         d_regime = _masked_data(d, mask, meta_override=regime_meta)
         base_logw_regime = np.asarray(base_logw, dtype=np.float64)[mask]
         regime_out = out if is_dominant else out / f'secondary_cv_regime_{_regime_slug(regime)}'
