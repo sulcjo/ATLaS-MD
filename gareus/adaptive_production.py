@@ -957,6 +957,98 @@ def select_state_aware_seeds_for_targets(seed_bank_dir: Path, registry: WindowSt
     return payload
 
 
+def rescore_seed_bank_secondary_cv(
+    seed_bank_dir: Path,
+    tica_result: "TICAResult",
+    app,
+    unit,
+) -> Dict[str, Any]:
+    """Replace each seed-bank row's placeholder secondary_cv_value with a real
+    measurement of that row's own PDB, projected onto the given tICA model.
+
+    write_epoch_seed_bank()/write_seed_bank_from_run_dirs() write
+    secondary_cv_value as a copy of the *source* state's own secondary_center
+    at seed-bank-write time -- never a measurement of the seed structure
+    itself -- and that write happens before _apply_tica_centers_to_registry
+    moves any center. select_state_aware_seeds_for_targets() then "matches"
+    every state to its own seed trivially (both numbers are the same
+    not-yet-updated value), and that assignment is never revisited once
+    centers move to their post-tICA-switch tIC1 medians.
+
+    Confirmed empirically on a real crashed run (chignolin_6 epoch_001): all
+    12 gate-failing "seeded" (non-preflight-unreachable) windows matched their
+    own source state via this tautological comparison, each still 0.6-1.6 tIC1
+    units off its actual (post-switch) target. Re-measuring every available
+    seed under the current model and re-running select_state_aware_seeds_for_
+    targets lets a window borrow a *different* state's seed when that is the
+    closer match under the new coordinate -- collapsed the same 12 deltas to
+    <0.1 in an offline replay using only frames already on disk (no new MD).
+
+    Call only after the registry's active-state centers reflect the update
+    this ``tica_result`` produced (i.e. after _apply_tica_centers_to_registry
+    and any _propose_tica_coverage_actions/_apply_registry_actions for newly
+    added states), so the following select_state_aware_seeds_for_targets call
+    scores against final, not intermediate, targets.
+    """
+    from .tica import backbone_dihedral_features, project_tica1
+
+    seed_bank_dir = Path(seed_bank_dir)
+    csv_path = seed_bank_dir / "final_survivor_seeds.csv"
+    rows = _read_csv_dicts(csv_path)
+    if not rows:
+        return {"status": "empty", "seed_bank_dir": str(seed_bank_dir)}
+    if not tica_result.phi_torsion_indices and not tica_result.psi_torsion_indices:
+        return {"status": "no_torsion_indices", "seed_bank_dir": str(seed_bank_dir)}
+
+    n_ok = 0
+    n_failed = 0
+    for row in rows:
+        pdb_text = str(row.get("survivor_pdb_path", "")).strip()
+        pdb_path = Path(pdb_text) if pdb_text else None
+        if pdb_path is not None and not pdb_path.is_absolute():
+            pdb_path = seed_bank_dir / pdb_path
+        if pdb_path is not None and not pdb_path.exists():
+            alt = seed_bank_dir / "pdbs" / Path(pdb_text).name
+            pdb_path = alt if alt.exists() else pdb_path
+        if pdb_path is None or not pdb_path.exists():
+            n_failed += 1
+            continue
+        try:
+            pdb = app.PDBFile(str(pdb_path))
+            positions_nm = np.asarray(
+                pdb.positions.value_in_unit(unit.nanometer), dtype=np.float64
+            )
+            feats = backbone_dihedral_features(
+                positions_nm, tica_result.phi_torsion_indices, tica_result.psi_torsion_indices
+            )
+            tic1 = float(project_tica1(feats[np.newaxis, :], tica_result)[0])
+        except Exception:
+            n_failed += 1
+            continue
+        if not math.isfinite(tic1):
+            n_failed += 1
+            continue
+        row["secondary_cv_value"] = tic1
+        n_ok += 1
+
+    fieldnames = [
+        "seed_name", "survivor_pdb_path", "source_run_dir", "source_pdb_path",
+        "source_label", "source_state_id", "source_epoch_window",
+        "primary_cv_value", "secondary_cv_value",
+    ]
+    with csv_path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+    return {
+        "status": "ok" if n_ok else "all_failed",
+        "seed_bank_dir": str(seed_bank_dir),
+        "n_rescored": int(n_ok),
+        "n_failed": int(n_failed),
+    }
+
+
 def filter_seed_bank_for_state_ids(
     seed_bank_dir: Path,
     target_state_ids: Sequence[int],
@@ -1901,6 +1993,28 @@ def _maybe_update_tica_cvaux(epoch: int, epoch_dir: Path, adaptive_dir: Path, ar
     # Determine torsion indices from a previous model or from topology
     phi_indices = list(prev_result.phi_torsion_indices) if prev_result else []
     psi_indices = list(prev_result.psi_torsion_indices) if prev_result else []
+    if not phi_indices and not psi_indices:
+        # First-ever fit (no prev_result), or a prior fit saved before this
+        # fallback existed: nothing to carry forward. The "or from topology"
+        # half of the comment above was never implemented, so TICAResult got
+        # saved with permanently empty index lists -- harmless for the
+        # window-center update (that only ever projects the *already*
+        # feature-extracted dihedral_obs arrays, never round-tripping through
+        # the saved indices) but it silently makes the saved TICAResult
+        # unusable for projecting any *new* structure (e.g. re-scoring a
+        # candidate seed PDB against tIC1). The two-stage torsion-pca ->
+        # tica-linear design fits both CV2 stages on the identical backbone
+        # phi/psi basis (see helptext: "Epoch 0 (torsion-pca) ... Epoch 1+
+        # (tica-linear)"), so the one-time bootstrap CV2 fit's indices are the
+        # correct -- and only available -- source.
+        bootstrap_state = adaptive_dir / "epoch_000" / "tica" / "bootstrap_torsion_cv.json"
+        if bootstrap_state.exists():
+            try:
+                _bs = read_json_file(bootstrap_state)
+                phi_indices = [tuple(t) for t in _bs.get("phi_torsion_indices", [])]
+                psi_indices = [tuple(t) for t in _bs.get("psi_torsion_indices", [])]
+            except Exception:
+                phi_indices, psi_indices = [], []
 
     # Compute MBAR importance weights to reweight biased REUS frames to unbiased distribution.
     # Falls back to uniform (unweighted tICA) silently on any failure.
@@ -4800,6 +4914,35 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                         except Exception as _coverage_exc:
                             tica_update_report["tica_coverage_error"] = str(_coverage_exc)
                             print(f"WARNING: tICA coverage extension skipped ({_coverage_exc})")
+
+                        # Re-measure every seed-bank candidate's secondary CV under
+                        # the model that just moved every target center, then
+                        # re-run the nearest-seed assignment against those real
+                        # values instead of the write-time placeholder (which was
+                        # always each state's own pre-update center, making every
+                        # state trivially "match" its own seed regardless of how
+                        # far that seed actually now sits from its new target).
+                        # Must run after the coverage-action block above so any
+                        # newly added state is already in the registry and gets
+                        # a real assignment too, not left with none at all.
+                        if current_seed_bank is not None:
+                            try:
+                                _rescore_report = rescore_seed_bank_secondary_cv(
+                                    Path(current_seed_bank), _result, app, unit,
+                                )
+                                tica_update_report["seed_bank_rescore"] = _rescore_report
+                                if _rescore_report.get("status") == "ok":
+                                    select_state_aware_seeds_for_targets(Path(current_seed_bank), registry)
+                                    print(
+                                        f"    tICA: re-scored {_rescore_report.get('n_rescored', 0)} seed-bank "
+                                        f"candidate(s) and re-ran state-aware seed assignment against updated centers"
+                                    )
+                                else:
+                                    print(f"WARNING: seed-bank rescore skipped ({_rescore_report.get('status')})")
+                            except Exception as _rescore_exc:
+                                tica_update_report["seed_bank_rescore_error"] = str(_rescore_exc)
+                                print(f"WARNING: seed-bank rescore failed ({_rescore_exc})")
+
                         registry.save(adaptive_dir)
                         # Re-write window CSV so the next epoch sees updated centers.
                         # (Initial write at lines above precedes this block; without
