@@ -2827,7 +2827,13 @@ def solve_mbar_lbfgs(u_nk, window, tol=1e-10, maxiter=10000, progress: Optional[
     f = np.empty(Ka, dtype=np.float64)
     f[0] = 0.0
     f[1:] = result.x
-    conv = result.success or (result.status in (0, 1))
+    # scipy L-BFGS-B status codes: 0 = converged (gtol/ftol satisfied), 1 =
+    # iteration/function-eval limit reached (NOT converged), 2 = other
+    # abnormal termination.  Only status 0 (or a scipy-reported success, kept
+    # for forward compatibility) counts as converged here -- status 1 must
+    # never be treated as convergence, or a run that merely hit maxiter gets
+    # silently reported as fully converged.
+    conv = result.success or result.status == 0
     it = int(result.nit)
     grad_norm = float(np.max(np.abs(result.jac))) if result.jac is not None else float('nan')
 
