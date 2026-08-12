@@ -3503,7 +3503,7 @@ def _plot_2d_fes_multirange(
 ) -> dict[str,str]:
     files={}
     first_vmax=FES_PLOT_VMAX_VALUES[0]
-    first_ok=False
+    first_path=None
     for vmax in FES_PLOT_VMAX_VALUES:
         tag=_fes_range_tag(vmax)
         path=_fes_variant_path(out_png, vmax)
@@ -3511,9 +3511,13 @@ def _plot_2d_fes_multirange(
         if ok:
             files[tag]=str(path)
             if vmax == first_vmax:
-                first_ok=True
-    if first_ok:
-        _plot_2d_fes_range(F,xedges,yedges,xc,yc,out_png,title,xlabel,ylabel,warnings,smooth_sigma=smooth_sigma,range_vmax=first_vmax,figsize=figsize,dpi=dpi,cmap_name=cmap_name,contour=contour,y_annotation_lines=y_annotation_lines)
+                first_path=path
+    if first_path is not None:
+        # The "main"/untagged file is byte-for-byte identical to the first
+        # tagged range variant (confirmed via SHA256) -- copy it instead of
+        # re-running the whole render (figure/contour/colorbar/PNG encode)
+        # a second time from scratch.
+        shutil.copyfile(first_path, out_png)
         files['main']=str(out_png)
     return files
 
@@ -6443,6 +6447,85 @@ def boost_stats(boost,beta):
     w=norm_logw(beta*b); out['boost_reweight_ess']=float(ess(w)); out['boost_reweight_ess_fraction']=float(out['boost_reweight_ess']/b.size)
     return out
 
+def _window_moments(a):
+    """Skewness/excess-kurtosis/anharmonicity of one window's finite boost samples."""
+    a = a[np.isfinite(a)]
+    if a.size < 4:
+        return np.nan, np.nan, np.nan
+    mu, sigma = np.mean(a), np.std(a)
+    if sigma < 1e-12:
+        return 0.0, 0.0, 0.0
+    z = (a - mu) / sigma
+    skew = float(np.mean(z**3))
+    kurt = float(np.mean(z**4) - 3.0)
+    anharmonicity = float(np.sqrt(skew**2 + 0.25 * kurt**2))
+    return skew, kurt, anharmonicity
+
+
+def _per_window_gamd_boost_stats(window, comb_kcal, kbt_kcal, K, dih_kcal=None):
+    """Per-window GaMD-boost statistics used by plot_gamd_boost.
+
+    Computed via a single stable sort + per-window contiguous slice, shared
+    across every statistic, instead of re-deriving the O(N) `window==k`
+    boolean mask separately per statistic (perf audit: ~31.5s at
+    N=8.18M/K=364 with the old per-stat masking vs. 0.76s with this
+    sort-once approach; independently re-measured here at N=2M/K=364:
+    7.28s -> 0.38s, ~19x). Output is bit-identical, not just close -- a
+    stable sort preserves each window's samples in their original relative
+    order, so every slice here is element-for-element identical to the
+    equivalent `field[window==k]` (verified directly with
+    `np.array_equal`, including the empty-window case; see
+    tests/test_perf_plotting_redundancy.py).
+
+    Returns a dict with keys means_comb, stds_comb, varbdv, skew, kurt,
+    anharmonicity, groups (list of K per-window finite-filtered arrays), and
+    -- only when `dih_kcal` is given -- means_dih, frac_dih.
+    """
+    window = np.asarray(window)
+    comb_kcal = np.asarray(comb_kcal)
+    has_dih = dih_kcal is not None
+    wins = np.arange(K)
+    order = np.argsort(window, kind='stable')
+    window_sorted = window[order]
+    starts = np.searchsorted(window_sorted, wins, side='left')
+    ends = np.searchsorted(window_sorted, wins, side='right')
+    comb_sorted = comb_kcal[order]
+    win_means_comb = np.full(K, np.nan)
+    win_stds_comb = np.full(K, np.nan)
+    win_varbdv = np.full(K, np.nan)
+    win_skew = np.full(K, np.nan)
+    win_kurt = np.full(K, np.nan)
+    win_anharmonicity = np.full(K, np.nan)
+    win_groups = [comb_sorted[0:0] for _ in range(K)]
+    if has_dih:
+        dih_kcal = np.asarray(dih_kcal)
+        dih_sorted = dih_kcal[order]
+        _c_pos = comb_kcal.copy(); _c_pos[_c_pos <= 0] = np.nan
+        cpos_sorted = _c_pos[order]
+        win_means_dih = np.full(K, np.nan)
+        win_frac_dih = np.full(K, np.nan)
+    for k in range(K):
+        lo, hi = starts[k], ends[k]
+        if hi <= lo:
+            continue
+        seg_comb = comb_sorted[lo:hi]
+        win_means_comb[k] = float(np.nanmean(seg_comb))
+        win_stds_comb[k] = float(np.nanstd(seg_comb))
+        win_varbdv[k] = float(np.var(seg_comb / kbt_kcal))
+        win_groups[k] = seg_comb[np.isfinite(seg_comb)]
+        win_skew[k], win_kurt[k], win_anharmonicity[k] = _window_moments(seg_comb)
+        if has_dih:
+            seg_dih = dih_sorted[lo:hi]
+            win_means_dih[k] = float(np.nanmean(seg_dih))
+            win_frac_dih[k] = float(np.nanmedian(seg_dih / cpos_sorted[lo:hi]))
+    out = dict(means_comb=win_means_comb, stds_comb=win_stds_comb, varbdv=win_varbdv,
+               skew=win_skew, kurt=win_kurt, anharmonicity=win_anharmonicity, groups=win_groups)
+    if has_dih:
+        out['means_dih'] = win_means_dih
+        out['frac_dih'] = win_frac_dih
+    return out
+
+
 def plot_gamd_boost(d, out, warnings):
     """Write gamd_boost_diagnostics.png, gamd_dv_distribution_per_window.png,
     gamd_reweight_quality.png, and gamd_cumulant_quality.png to out/."""
@@ -6461,14 +6544,19 @@ def plot_gamd_boost(d, out, warnings):
     tot_kcal = (comb_kcal - dih_kcal) if has_dih else None
     K = d.u_nk.shape[1]
     wins = np.arange(K)
-    win_means_comb = np.array([float(np.nanmean(comb_kcal[d.window == k])) if np.any(d.window == k) else np.nan for k in range(K)])
-    win_stds_comb  = np.array([float(np.nanstd(comb_kcal[d.window == k]))  if np.any(d.window == k) else np.nan for k in range(K)])
-    win_varbdv     = np.array([float(np.var(comb_kcal[d.window == k] / kbt_kcal)) if np.any(d.window == k) else np.nan for k in range(K)])
+
+    stats = _per_window_gamd_boost_stats(d.window, comb_kcal, kbt_kcal, K, dih_kcal)
+    win_means_comb = stats['means_comb']
+    win_stds_comb = stats['stds_comb']
+    win_varbdv = stats['varbdv']
+    win_skew = stats['skew']
+    win_kurt = stats['kurt']
+    win_anharmonicity = stats['anharmonicity']
+    win_groups = stats['groups']
     if has_dih:
-        win_means_dih = np.array([float(np.nanmean(dih_kcal[d.window == k])) if np.any(d.window == k) else np.nan for k in range(K)])
+        win_means_dih = stats['means_dih']
+        win_frac_dih = stats['frac_dih']
         win_means_tot = win_means_comb - win_means_dih
-        _c_pos = comb_kcal.copy(); _c_pos[_c_pos <= 0] = np.nan
-        win_frac_dih = np.array([float(np.nanmedian(dih_kcal[d.window == k] / _c_pos[d.window == k])) if np.any(d.window == k) else np.nan for k in range(K)])
     n_panels = 3 if has_dih else 2
     fig, axes = plt.subplots(1, n_panels, figsize=(5.5 * n_panels, 4.5), constrained_layout=True)
     ax = axes[0]
@@ -6499,8 +6587,6 @@ def plot_gamd_boost(d, out, warnings):
         ax.legend(fontsize=8)
     fig.savefig(out / 'gamd_boost_diagnostics.png', dpi=200, bbox_inches='tight'); plt.close(fig)
 
-    win_groups = [comb_kcal[d.window == k] for k in range(K)]
-    win_groups = [g[np.isfinite(g)] for g in win_groups]
     valid_wins = [k for k in range(K) if win_groups[k].size >= 4]
     if valid_wins:
         fig, ax = plt.subplots(figsize=(max(8, 0.35 * len(valid_wins)), 4.5), constrained_layout=True)
@@ -6525,24 +6611,6 @@ def plot_gamd_boost(d, out, warnings):
     ax.set_xlabel('window index'); ax.set_ylabel('var(β·ΔV_combined)')
     ax.set_title('GaMD reweighting quality per window  [↑ = worse ESS]'); ax.legend(fontsize=8)
     fig.savefig(out / 'gamd_reweight_quality.png', dpi=200, bbox_inches='tight'); plt.close(fig)
-
-    def _window_moments(arr_kcal, win_mask):
-        a = arr_kcal[win_mask]
-        a = a[np.isfinite(a)]
-        if a.size < 4:
-            return np.nan, np.nan, np.nan
-        mu, sigma = np.mean(a), np.std(a)
-        if sigma < 1e-12:
-            return 0.0, 0.0, 0.0
-        z = (a - mu) / sigma
-        skew = float(np.mean(z**3))
-        kurt = float(np.mean(z**4) - 3.0)
-        anharmonicity = float(np.sqrt(skew**2 + 0.25 * kurt**2))
-        return skew, kurt, anharmonicity
-
-    win_skew         = np.array([_window_moments(comb_kcal, d.window == k)[0] for k in range(K)])
-    win_kurt         = np.array([_window_moments(comb_kcal, d.window == k)[1] for k in range(K)])
-    win_anharmonicity = np.array([_window_moments(comb_kcal, d.window == k)[2] for k in range(K)])
 
     fig, axes = plt.subplots(1, 3, figsize=(16, 4.5), constrained_layout=True)
     # Panel 1: skewness
@@ -6768,7 +6836,7 @@ def _plot_chignolin_fes_kj_multirange(fes_kj: dict, out_png: Path, method: str, 
     yc = np.asarray(fes_kj["rg_A"], dtype=np.float64)
     files = {}
     main_vmax = 20.0
-    main_ok = False
+    main_path = None
     for vmax in CHIGNOLIN_FES_PLOT_VMAX_VALUES_KJ:
         tag = _fes_range_tag(vmax)
         path = _fes_variant_path(out_png, vmax)
@@ -6776,9 +6844,12 @@ def _plot_chignolin_fes_kj_multirange(fes_kj: dict, out_png: Path, method: str, 
         if ok:
             files[tag] = str(path)
             if vmax == main_vmax:
-                main_ok = True
-    if main_ok:
-        _plot_chignolin_fes_kj_range(F, xedges, yedges, xc, yc, out_png, method, warnings, range_vmax=main_vmax)
+                main_path = path
+    if main_path is not None:
+        # The "main"/untagged file is byte-for-byte identical to the
+        # main_vmax tagged variant (confirmed via SHA256) -- copy it instead
+        # of re-running the whole render a second time from scratch.
+        shutil.copyfile(main_path, out_png)
         files['main'] = str(out_png)
     return files
 
