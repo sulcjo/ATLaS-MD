@@ -1049,6 +1049,68 @@ def rescore_seed_bank_secondary_cv(
     }
 
 
+def _seed_bank_dir_is_usable(seed_bank_dir: Path) -> bool:
+    """True if seed_bank_dir has a real, non-empty final_survivor_seeds.csv."""
+    csv_path = seed_bank_dir / "final_survivor_seeds.csv"
+    if not csv_path.exists():
+        return False
+    report_path = seed_bank_dir / "seed_bank_report.json"
+    if report_path.exists():
+        try:
+            report = read_json_file(report_path)
+            if report.get("status") not in (None, "ok"):
+                return False
+        except Exception:
+            pass
+    try:
+        return len(_read_csv_dicts(csv_path)) > 0
+    except Exception:
+        return False
+
+
+def _discover_latest_seed_bank(adaptive_dir: Path) -> Optional[Path]:
+    """Find the most advanced on-disk adaptive seed bank for a resumed run.
+
+    current_seed_bank is a plain local variable in run_adaptive_production_
+    auto_loop -- it only ever gets advanced in-process, right after
+    write_epoch_seed_bank()/write_seed_bank_from_run_dirs() succeeds for the
+    epoch that just finished. Nothing persists it, so a fresh process
+    invocation (every --resume is a fresh process) re-initializes it from
+    args.seed_conformers_dir -- the raw GENPEPT library set once in the YAML
+    -- regardless of how many epochs of real, state-tagged adaptive sampling
+    already exist on disk. If the resumed run picks straight back up inside
+    an epoch's baseline/topup segment (i.e. past the point in the loop where
+    current_seed_bank would normally be advanced this process), the adaptive
+    seed bank is silently never used again: filter_seed_bank_for_state_ids
+    finds no source_state_id match in the untagged GENPEPT library, seeding
+    falls back to generic/no-seed starts, and the US starting-structure
+    quality gate fails unpredictably window-by-window -- indistinguishable,
+    from the crash message alone, from a genuinely bad seed/CV problem.
+    Confirmed on a real run (chignolin_6): filtered_seed_bank_report.json
+    recorded source_seed_bank as the raw GENPEPT dir with 0 matched rows on
+    a resume that should have used seed_bank_epoch_000.
+
+    Prefers seed_bank_final over the highest-numbered seed_bank_epoch_NNN,
+    matching this module's own end-of-campaign precedence. Only returns a
+    directory whose own write recorded real matched rows, so an empty/failed
+    seed-bank write is not mistaken for a usable one.
+    """
+    final_dir = adaptive_dir / "seed_bank_final"
+    if _seed_bank_dir_is_usable(final_dir):
+        return final_dir
+    candidates: List[Tuple[int, Path]] = []
+    for child in adaptive_dir.glob("seed_bank_epoch_*"):
+        if not child.is_dir():
+            continue
+        suffix = child.name[len("seed_bank_epoch_"):]
+        if suffix.isdigit():
+            candidates.append((int(suffix), child))
+    for _, child in sorted(candidates, reverse=True):
+        if _seed_bank_dir_is_usable(child):
+            return child
+    return None
+
+
 def filter_seed_bank_for_state_ids(
     seed_bank_dir: Path,
     target_state_ids: Sequence[int],
@@ -4585,6 +4647,14 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
         current_seed_bank = Path(getattr(args, "seed_conformers_dir"))
 
     resume_requested = _arg_bool(args, "adaptive_production_resume", False)
+    if resume_requested and bool(policy.propagate_seed_bank):
+        _resumed_seed_bank = _discover_latest_seed_bank(adaptive_dir)
+        if _resumed_seed_bank is not None:
+            current_seed_bank = _resumed_seed_bank
+            print(
+                f"    resume: found existing adaptive seed bank {_resumed_seed_bank}; "
+                "using it instead of the initial seed_conformers_dir"
+            )
     runtime_pool, runtime_pool_resume_validation = _load_or_initialize_runtime_pool(adaptive_dir, args, policy, resume_requested=resume_requested)
     context_reuse_readiness = evaluate_context_reuse_readiness(args, adaptive_dir, registry=None)
     registry: Optional[WindowStateRegistry] = None
