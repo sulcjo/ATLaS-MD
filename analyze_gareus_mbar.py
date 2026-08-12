@@ -489,7 +489,18 @@ def _subset_logw_from_global_fk(d_subset: 'Data', f_k_global: np.ndarray) -> np.
         return np.full(u_nk.shape[0], -np.inf, dtype=np.float64)
     log_n = np.log(n_k_subset[active])
     f_active = f_k_global[active]
-    tmp = log_n[None, :] + f_active[None, :] - u_nk[:, active]
+    if active.size == K and u_nk.shape[1] == K:
+        # active is every column 0..K-1 (a size-K subset of the size-K
+        # np.where domain must BE the whole domain) AND u_nk has exactly K
+        # columns, so u_nk[:, active] would just be a full copy of u_nk
+        # itself. Skip the copy. (Guarding on u_nk.shape[1] too, not just
+        # active.size==K, matters here specifically because K comes from
+        # f_k_global.size rather than from u_nk.shape as in the solve_mbar*
+        # backends below -- the two are not structurally guaranteed equal at
+        # this call site the way they are there.)
+        tmp = log_n[None, :] + f_active[None, :] - u_nk
+    else:
+        tmp = log_n[None, :] + f_active[None, :] - u_nk[:, active]
     ld = logsumexp_axis1_finite(tmp)
     logw_s = -ld
     logw_s -= logsumexp(logw_s)
@@ -1384,6 +1395,120 @@ def _compute_u_nk_analytical(cv1: np.ndarray, cv2: np.ndarray,
     return u
 
 
+# A lookup table is only built when the key range actually needed (mapping
+# keys unioned with the array's own value range) stays small -- otherwise a
+# sparse key space (e.g. one huge outlier ID) would turn a memory-savings
+# fix into a memory blowup. Above this, fall back to the original per-element
+# Python-level lookup, which stays correct (just not vectorized) regardless
+# of key sparsity.
+_VECTORIZED_LOOKUP_MAX_TABLE_SIZE = 10_000_000
+
+
+def _vectorized_map_lookup(arr: np.ndarray, mapping: dict, default: int, dtype=np.int64) -> np.ndarray:
+    """Vectorized equivalent of ``np.array([mapping.get(int(x), default) for x in arr], dtype=dtype)``.
+
+    Builds a small dense lookup table spanning the key range actually needed
+    (mapping keys union arr's own value range) and does one fancy-index
+    instead of a per-element Python-level ``dict.get`` call. Falls back to
+    the exact original comprehension whenever a negative key is involved (a
+    map key or an array value), the array is empty, or the key range needed
+    is too large to be worth a dense table -- so correctness never depends on
+    the LUT approach, only performance does.
+    """
+    arr = np.asarray(arr)
+    if arr.size == 0:
+        return np.array([], dtype=dtype)
+    if not mapping:
+        return np.full(arr.shape, default, dtype=dtype)
+
+    def _naive():
+        return np.array([mapping.get(int(x), default) for x in arr], dtype=dtype)
+
+    try:
+        arr_i64 = arr.astype(np.int64, copy=False)
+    except (TypeError, ValueError):
+        return _naive()
+    map_keys = np.fromiter(mapping.keys(), dtype=np.int64, count=len(mapping))
+    if arr_i64.min() < 0 or map_keys.min() < 0:
+        return _naive()
+    hi = max(int(arr_i64.max()), int(map_keys.max()))
+    if hi + 1 > _VECTORIZED_LOOKUP_MAX_TABLE_SIZE:
+        return _naive()
+    lut = np.full(hi + 1, default, dtype=np.int64)
+    map_vals = np.fromiter(mapping.values(), dtype=np.int64, count=len(mapping))
+    lut[map_keys] = map_vals
+    return lut[arr_i64].astype(dtype, copy=False)
+
+
+def _vectorized_map_lookup_or_self(arr: np.ndarray, mapping: dict, dtype=np.int64) -> np.ndarray:
+    """Vectorized equivalent of ``np.array([mapping.get(int(x), int(x)) for x in arr], dtype=dtype)``.
+
+    Same LUT strategy as ``_vectorized_map_lookup``, but the default for a
+    key absent from ``mapping`` is the key itself (an identity fallback)
+    rather than a fixed sentinel.
+    """
+    arr = np.asarray(arr)
+    if arr.size == 0:
+        return np.array([], dtype=dtype)
+    if not mapping:
+        return arr.astype(dtype, copy=True)
+
+    def _naive():
+        return np.array([mapping.get(int(x), int(x)) for x in arr], dtype=dtype)
+
+    try:
+        arr_i64 = arr.astype(np.int64, copy=False)
+    except (TypeError, ValueError):
+        return _naive()
+    map_keys = np.fromiter(mapping.keys(), dtype=np.int64, count=len(mapping))
+    if arr_i64.min() < 0 or map_keys.min() < 0:
+        return _naive()
+    hi = max(int(arr_i64.max()), int(map_keys.max()))
+    if hi + 1 > _VECTORIZED_LOOKUP_MAX_TABLE_SIZE:
+        return _naive()
+    lut = np.arange(hi + 1, dtype=np.int64)
+    map_vals = np.fromiter(mapping.values(), dtype=np.int64, count=len(mapping))
+    lut[map_keys] = map_vals
+    return lut[arr_i64].astype(dtype, copy=False)
+
+
+def _vectorized_map_index(arr: np.ndarray, mapping: dict, dtype=np.int64) -> np.ndarray:
+    """Vectorized equivalent of ``np.array([mapping[int(x)] for x in arr], dtype=dtype)``.
+
+    Unlike ``_vectorized_map_lookup`` there is no default: a value in ``arr``
+    absent from ``mapping`` raises ``KeyError``, matching plain ``dict[key]``
+    subscripting semantics exactly (including on an empty mapping).
+    """
+    arr = np.asarray(arr)
+    if arr.size == 0:
+        return np.array([], dtype=dtype)
+
+    def _naive():
+        return np.array([mapping[int(x)] for x in arr], dtype=dtype)
+
+    if not mapping:
+        return _naive()  # raises KeyError on the first element, same as dict[key]
+    try:
+        arr_i64 = arr.astype(np.int64, copy=False)
+    except (TypeError, ValueError):
+        return _naive()
+    map_keys = np.fromiter(mapping.keys(), dtype=np.int64, count=len(mapping))
+    if arr_i64.min() < 0 or map_keys.min() < 0:
+        return _naive()
+    hi = max(int(arr_i64.max()), int(map_keys.max()))
+    if hi + 1 > _VECTORIZED_LOOKUP_MAX_TABLE_SIZE:
+        return _naive()
+    present = np.zeros(hi + 1, dtype=bool)
+    present[map_keys] = True
+    missing = ~present[arr_i64]
+    if np.any(missing):
+        raise KeyError(int(arr_i64[missing][0]))
+    lut = np.zeros(hi + 1, dtype=np.int64)
+    map_vals = np.fromiter(mapping.values(), dtype=np.int64, count=len(mapping))
+    lut[map_keys] = map_vals
+    return lut[arr_i64].astype(dtype, copy=False)
+
+
 def _augment_with_adaptive_rounds(d: Data, run_dir: Path) -> Data:
     """Combine final_production Data with samples from adaptive_feedback_round_* dirs.
 
@@ -1404,14 +1529,14 @@ def _augment_with_adaptive_rounds(d: Data, run_dir: Path) -> Data:
         if raw is None or raw['cv_A'].size == 0:
             continue
         w2u = _round_window_to_union_map(rdir, union_windows)
-        raw['window_union'] = np.array([w2u.get(int(w), 0) for w in raw['window']], dtype=int)
+        raw['window_union'] = _vectorized_map_lookup(raw['window'], w2u, default=0, dtype=int)
         round_data.append(raw)
 
     if not round_data:
         return d
 
     final_w2u = _round_window_to_union_map(d.prod_dir, union_windows)
-    final_window_union = np.array([final_w2u.get(int(w), int(w)) for w in d.window], dtype=int)
+    final_window_union = _vectorized_map_lookup_or_self(d.window, final_w2u, dtype=int)
 
     cv1_all = np.concatenate([d.cv] + [r['cv_A'] for r in round_data])
     cv2_all = np.concatenate([d.cv2] + [r['secondary_cv'] for r in round_data])
@@ -1688,18 +1813,34 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
         if not samples or 'cv1' not in samples or len(samples['cv1']) == 0:
             continue
         raw_w = samples['window_id'].astype(np.int32)
-        remapped = np.array([wmap.get(int(w), -1) for w in raw_w], dtype=np.int32)
+        # Vectorized equivalent of [wmap.get(int(w), -1) for w in raw_w] -- see
+        # _vectorized_map_lookup docstring; bit-identical output including the
+        # -1 sentinel for keys absent from wmap.
+        remapped = _vectorized_map_lookup(raw_w, wmap, default=-1, dtype=np.int32)
         valid = remapped >= 0
         if not np.any(valid):
             continue
-        cv_epoch = samples['cv1'].astype(np.float64)[valid]
+        # Filter first, cast second: avoids allocating a full-epoch-length
+        # float64 transient that's then mostly discarded by [valid].
+        cv_epoch = samples['cv1'][valid].astype(np.float64, copy=False)
         all_cv.append(cv_epoch)
         cv2_raw = samples.get('cv2')
-        cv2_epoch = cv2_raw.astype(np.float64)[valid] if cv2_raw is not None else np.full(valid.sum(), np.nan)
+        cv2_epoch = cv2_raw[valid].astype(np.float64, copy=False) if cv2_raw is not None else np.full(valid.sum(), np.nan)
         all_cv2.append(cv2_epoch)
-        all_window.append(np.array([state_id_to_k[int(s)] for s in remapped[valid]], dtype=np.int32))
-        all_step.append(samples['step'].astype(np.int64)[valid])
-        rep = samples['replica'].astype(np.int32) if 'replica' in samples else np.zeros(int(valid.sum()), np.int32)
+        # Vectorized equivalent of [state_id_to_k[int(s)] for s in remapped[valid]]
+        # -- see _vectorized_map_index docstring; raises KeyError on a missing
+        # state_id exactly like the original dict subscripting did. Narrowed to
+        # int16 (Data.window's on-disk source is uint16; downstream consumers
+        # already defensively re-cast to int64 before use -- see CLAUDE.md/audit).
+        all_window.append(_vectorized_map_index(remapped[valid], state_id_to_k, dtype=np.int16))
+        all_step.append(samples['step'][valid].astype(np.int64, copy=False))
+        # NOTE: intentionally NOT applying the filter-then-cast reorder here --
+        # the `else` branch already builds an array sized to valid.sum() (not
+        # the full epoch length), and rebasing it on `[valid]` after slicing
+        # would require restructuring around a latent shape mismatch in that
+        # branch (np.zeros(int(valid.sum()), ...) then indexed again by the
+        # full-length `valid` mask) that is out of scope to touch here.
+        rep = samples['replica'].astype(np.int16) if 'replica' in samples else np.zeros(int(valid.sum()), np.int16)
         all_replica.append(rep[valid])
         boost_raw = samples.get('gamd_boost_total')
         all_boost.append(boost_raw.astype(np.float64)[valid] if boost_raw is not None else np.full(valid.sum(), np.nan))
@@ -1720,18 +1861,23 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
     if not all_cv:
         raise ValueError(f'No valid samples after window remapping in {adaptive_dir}')
 
-    cv      = np.concatenate(all_cv)
-    cv2     = np.concatenate(all_cv2)
-    window  = np.concatenate(all_window)
-    step    = np.concatenate(all_step)
-    replica = np.concatenate(all_replica)
-    boost     = np.concatenate(all_boost)
-    boost_dih = np.concatenate(all_boost_dih)
-    pot_arr = np.concatenate(all_potential)
+    # Free each per-epoch block list right after it's concatenated -- these
+    # hold the same data twice (once per-epoch, once pooled) until GC'd, and
+    # this is the dominant contributor to the loader's peak memory footprint
+    # for large multi-epoch runs.
+    cv      = np.concatenate(all_cv);      del all_cv
+    cv2     = np.concatenate(all_cv2);     del all_cv2
+    window  = np.concatenate(all_window);  del all_window
+    step    = np.concatenate(all_step);    del all_step
+    replica = np.concatenate(all_replica); del all_replica
+    boost     = np.concatenate(all_boost);     del all_boost
+    boost_dih = np.concatenate(all_boost_dih); del all_boost_dih
+    pot_arr = np.concatenate(all_potential); del all_potential
     potential = pot_arr if np.any(np.isfinite(pot_arr)) else None
-    u_nk    = np.concatenate(all_unk_blocks, axis=0)
+    u_nk    = np.concatenate(all_unk_blocks, axis=0); del all_unk_blocks
 
     epoch_src = np.concatenate(all_epoch_src) if all_epoch_src else np.zeros(len(cv), dtype=np.int32)
+    del all_epoch_src
 
     # Drop per-state burnin frames: for each sample, compare its epoch-local step
     # against the burnin threshold for the state it was collected in.
@@ -2149,9 +2295,12 @@ def load_parquet(prod: Path) -> Data:
     cv       = samples['cv1'].astype(np.float64)
     cv2_raw  = samples.get('cv2')
     cv2      = cv2_raw.astype(np.float64) if cv2_raw is not None else np.full(cv.shape, np.nan)
-    window   = samples['window_id'].astype(np.int32)
+    # window/replica are stored on-disk as uint16 (see gareus/store.py's Parquet
+    # schema); downstream consumers already defensively re-cast to int64 before
+    # use, so keep them narrow here rather than widening to int32 for no reason.
+    window   = samples['window_id'].astype(np.int16)
     step     = samples['step'].astype(np.int64)
-    replica  = samples['replica'].astype(np.int32) if 'replica' in samples else np.zeros(cv.shape, dtype=np.int32)
+    replica  = samples['replica'].astype(np.int16) if 'replica' in samples else np.zeros(cv.shape, dtype=np.int16)
     boost_raw      = samples.get('gamd_boost_total')
     boost          = boost_raw.astype(np.float64) if boost_raw is not None else np.full(cv.shape, np.nan)
     boost_dih_raw  = samples.get('gamd_boost_dihedral')
@@ -2192,6 +2341,15 @@ def clean(d: Data) -> Data:
     if d.cv2.shape != d.cv.shape: d.cv2=np.full(d.cv.shape,np.nan)
     if d.rg_A.shape != d.cv.shape: d.rg_A=np.full(d.cv.shape,np.nan)
     mask=np.isfinite(d.cv) & np.all(np.isfinite(d.u_nk),axis=1)
+    if mask.all():
+        # Nothing to filter: boolean fancy indexing always copies in NumPy,
+        # even when the mask keeps every element, so skip the copies below
+        # entirely in the common (fully-finite) case. The boost_dih_kj shape
+        # normalization just below is independent of sample finiteness (it
+        # only depends on whether the array's own length already matches the
+        # sample count) and must still run regardless of this fast path.
+        if d.boost_dih_kj is not None and d.boost_dih_kj.size!=mask.size: d.boost_dih_kj=None
+        return d
     d.cv=d.cv[mask]; d.cv2=d.cv2[mask]; d.rg_A=d.rg_A[mask]; d.window=d.window[mask]; d.replica=d.replica[mask]; d.step=d.step[mask]; d.u_nk=d.u_nk[mask]; d.boost_kj=d.boost_kj[mask]
     if d.potential_kj is not None and d.potential_kj.size==mask.size: d.potential_kj=d.potential_kj[mask]
     if d.boost_dih_kj is not None and d.boost_dih_kj.size==mask.size: d.boost_dih_kj=d.boost_dih_kj[mask]
@@ -2480,7 +2638,12 @@ def solve_mbar_numba(u_nk, window, tol=1e-10, maxiter=10000, progress: Optional[
     active=np.where(nk>0)[0]
     if active.size==0:
         raise ValueError('no samples assigned to any state')
-    u=np.ascontiguousarray(u_nk[:,active],dtype=np.float64)
+    # active.size==K (a size-K subset of np.where's size-K domain) implies
+    # active==arange(K) exactly, i.e. every window has samples -- the common
+    # case. u_nk is already float64/C-contiguous from the np.asarray call
+    # above, so u_nk[:, active] would just be a full copy of u_nk itself;
+    # skip it and use u_nk directly instead of paying for that copy.
+    u = u_nk if active.size==K else np.ascontiguousarray(u_nk[:,active],dtype=np.float64)
     n=nk[active]
     logn=np.log(n)
     f=np.zeros(active.size,dtype=np.float64)
@@ -2579,8 +2742,11 @@ def solve_mbar_numba_anderson(u_nk, window, tol: float = 1e-10, maxiter: int = 1
     active = np.where(nk > 0)[0]
     if active.size == 0:
         raise ValueError('no samples assigned to any state')
-    # Restrict bias energies and counts to active states
-    u = np.ascontiguousarray(u_nk[:, active], dtype=np.float64)
+    # Restrict bias energies and counts to active states. active.size==K
+    # (every window has samples, the common case) implies active==arange(K)
+    # exactly; u_nk is already float64/C-contiguous, so u_nk[:, active] would
+    # just copy u_nk itself -- skip that copy and use u_nk directly.
+    u = u_nk if active.size == K else np.ascontiguousarray(u_nk[:, active], dtype=np.float64)
     n = nk[active]
     logn = np.log(n)
     Ka = active.size
@@ -2730,7 +2896,10 @@ def solve_mbar_sambar_warmstart(u_nk, window,
     active = np.where(nk > 0)[0]
     if active.size == 0:
         raise ValueError('no samples assigned to any state')
-    u = np.ascontiguousarray(u_nk[:, active], dtype=np.float64)
+    # active.size==K (every window has samples, the common case) implies
+    # active==arange(K) exactly, so u_nk[:, active] would just copy u_nk
+    # itself; skip that copy and use u_nk directly.
+    u = u_nk if active.size == K else np.ascontiguousarray(u_nk[:, active], dtype=np.float64)
     n = nk[active]
     logn = np.log(n)
     Ka = active.size
@@ -2885,7 +3054,10 @@ def solve_mbar_lbfgs(u_nk, window, tol=1e-10, maxiter=10000, progress: Optional[
     if active.size == 0:
         raise ValueError('no samples assigned to any state')
     Ka = active.size
-    u = np.ascontiguousarray(u_nk[:, active], dtype=np.float64)
+    # active.size==K (every window has samples, the common case) implies
+    # active==arange(K) exactly, so u_nk[:, active] would just copy u_nk
+    # itself; skip that copy and use u_nk directly.
+    u = u_nk if active.size == K else np.ascontiguousarray(u_nk[:, active], dtype=np.float64)
     n = nk[active]
     logn = np.log(n)
 
@@ -3031,7 +3203,10 @@ def solve_mbar(u_nk, window, tol=1e-10, maxiter=10000, progress: Optional[Progre
     nk=np.bincount(window[(window>=0)&(window<K)],minlength=K).astype(np.float64)
     active=np.where(nk>0)[0]
     if active.size==0: raise ValueError('no samples assigned to any state')
-    u=np.ascontiguousarray(u_nk[:,active],dtype=np.float64)
+    # active.size==K (every window has samples, the common case) implies
+    # active==arange(K) exactly, so u_nk[:, active] would just copy u_nk
+    # itself; skip that copy and use u_nk directly.
+    u = u_nk if active.size==K else np.ascontiguousarray(u_nk[:,active],dtype=np.float64)
     n=nk[active]
     logn=np.log(n)
     f=np.zeros(active.size,dtype=np.float64)
