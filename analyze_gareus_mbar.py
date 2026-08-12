@@ -357,7 +357,15 @@ def _secondary_cv_epoch_regime_masks(d: 'Data', warnings: Optional[list] = None)
     distinct = sorted({r for r in regime_by_epoch if r})
     if len(distinct) < 2:
         return None
-    dominant = next((r for r in reversed(regime_by_epoch) if r), distinct[-1])
+
+    def _run_dir_mtime(rd):
+        try:
+            return Path(rd).stat().st_mtime
+        except OSError:
+            return -1.0
+
+    chronological = sorted(range(len(run_dirs)), key=lambda i: _run_dir_mtime(run_dirs[i]))
+    dominant = next((regime_by_epoch[i] for i in reversed(chronological) if regime_by_epoch[i]), distinct[-1])
     unresolved = [i for i, r in enumerate(regime_by_epoch) if not r]
     if unresolved and warnings is not None:
         warnings.append(
@@ -378,12 +386,17 @@ def _masked_data(d: 'Data', mask: np.ndarray, meta_override: Optional[dict] = No
     """Row-slice a Data by a boolean sample mask.
 
     K-length/scalar fields (window-space arrays, beta, temp, ...) are shared
-    with the original -- only per-sample arrays are sliced. Used to run the
-    existing single-regime analysis functions unmodified against a subset of
-    samples (one secondary-CV regime at a time).
+    with the original -- only per-sample arrays (including meta['_epoch_source'],
+    when present) are sliced. Used to run the existing single-regime analysis
+    functions unmodified against a subset of samples (one secondary-CV regime,
+    or the epoch_000/rest split, at a time).
     """
     def _sl(arr):
         return arr[mask] if arr is not None else None
+    meta_out = dict(meta_override if meta_override is not None else d.meta)
+    _epoch_src_meta = meta_out.get('_epoch_source')
+    if _epoch_src_meta is not None and len(_epoch_src_meta) == mask.size:
+        meta_out['_epoch_source'] = np.asarray(_epoch_src_meta)[mask].tolist()
     return Data(
         prod_dir=d.prod_dir, out_dir=d.out_dir,
         cv=_sl(d.cv), cv2=_sl(d.cv2), rg_A=_sl(d.rg_A),
@@ -393,13 +406,13 @@ def _masked_data(d: 'Data', mask: np.ndarray, meta_override: Optional[dict] = No
         beta=d.beta, temp=d.temp,
         boost_kj=_sl(d.boost_kj),
         potential_kj=_sl(d.potential_kj),
-        source=d.source, meta=(d.meta if meta_override is None else meta_override),
+        source=d.source, meta=meta_out,
         boost_dih_kj=_sl(d.boost_dih_kj),
     )
 
 
 def _regime_slug(regime: str) -> str:
-    return ''.join(c if (c.isalnum() or c in '-_') else '_' for c in regime) or 'unknown'
+    return _slug(regime) if regime else 'unknown'
 
 
 def run_secondary_cv_analyses(d: 'Data', args, base_logw: np.ndarray, selected: str,
@@ -429,7 +442,13 @@ def run_secondary_cv_analyses(d: 'Data', args, base_logw: np.ndarray, selected: 
     breakdown: dict = {}
     dominant_pmf_info = dominant_fes_info = None
     for regime, (mask, is_dominant) in regimes.items():
-        regime_meta = dict(d.meta); regime_meta['secondary_cv'] = regime
+        _orig_secondary_cv = d.meta.get('secondary_cv')
+        if isinstance(_orig_secondary_cv, dict):
+            _regime_secondary_cv = dict(_orig_secondary_cv)
+            _regime_secondary_cv['mode'] = regime
+        else:
+            _regime_secondary_cv = regime
+        regime_meta = dict(d.meta); regime_meta['secondary_cv'] = _regime_secondary_cv
         d_regime = _masked_data(d, mask, meta_override=regime_meta)
         base_logw_regime = np.asarray(base_logw, dtype=np.float64)[mask]
         regime_out = out if is_dominant else out / f'secondary_cv_regime_{_regime_slug(regime)}'
@@ -951,6 +970,17 @@ def _epoch_dir_index(path: Path) -> Optional[int]:
     return int(match.group(1)) if match else None
 
 
+def _epoch_number_for_run_dir(run_dir: Path) -> Optional[int]:
+    """Literal epoch_NNN number for a run_dir, checking both the flat
+    (epoch_NNN/) and baseline/topup_* sub-run (epoch_NNN/{baseline,topup_*}/)
+    layouts. None for non-numbered dirs (e.g. final/*).
+    """
+    idx = _epoch_dir_index(run_dir)
+    if idx is not None:
+        return idx
+    return _epoch_dir_index(run_dir.parent)
+
+
 def _find_adaptive_epoch_dirs(adaptive_dir: Path, epoch_ids: Optional[set[int]] = None) -> list:
     """Return list of (run_dir, window_map_path) for each epoch/final with Parquet samples."""
     def _parquet_subdir(d: Path, parent_wmap: Path) -> tuple | None:
@@ -968,7 +998,8 @@ def _find_adaptive_epoch_dirs(adaptive_dir: Path, epoch_ids: Optional[set[int]] 
     for cand in sorted(adaptive_dir.iterdir()):
         if not cand.is_dir():
             continue
-        if epoch_ids is not None and _epoch_dir_index(cand) not in epoch_ids:
+        idx = _epoch_dir_index(cand)
+        if epoch_ids is not None and idx is not None and idx not in epoch_ids:
             continue
         # epoch_NNN/ directly holds samples/ (first epoch pattern)
         if (cand/'samples').is_dir() and (cand/'segments.json').exists() and (cand/'epoch_window_map.csv').exists():
@@ -1381,7 +1412,7 @@ def _parse_epoch_window_map_native_params(rows: list) -> dict:
             'primary_center': _f(r, 'primary_center', float('nan')),
             'primary_k': _f(r, 'primary_k', float('nan')),
             'secondary_center': _f(r, 'secondary_center', float('nan')),
-            'secondary_k': _f(r, 'secondary_k', 0.0),
+            'secondary_k': _f(r, 'secondary_k', float('nan')),
         }
     return out
 
@@ -1608,6 +1639,7 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
             print(f'    [burnin filter] dropped {n_dropped}/{len(cv)} samples ({100*n_dropped/len(cv):.1f}%) from pre-equilibration steps')
         cv = cv[keep]; cv2 = cv2[keep]; window = window[keep]
         step = step[keep]; replica = replica[keep]; boost = boost[keep]
+        boost_dih = boost_dih[keep]
         epoch_src = epoch_src[keep]
         pot_arr = pot_arr[keep]
         potential = pot_arr if np.any(np.isfinite(pot_arr)) else None
@@ -1683,6 +1715,9 @@ def _get_adaptive_epoch_traj_dirs(d: Data) -> list:
 _MERGED_TRAJ_RESUME_RE = re.compile(r'^(.*)_resume_from_(\d+)$')
 
 
+_MERGED_TRAJ_DIR_CACHE: dict = {}
+
+
 def _prepare_adaptive_merged_traj_dir(d: Data, args=None) -> Optional[Path]:
     """Create/update a merged replica_trajectories/ in adaptive_production/ using symlinks.
 
@@ -1712,19 +1747,30 @@ def _prepare_adaptive_merged_traj_dir(d: Data, args=None) -> Optional[Path]:
     filename, 0 for a phase's true base file) folded into the same
     global-offset scheme, so every segment gets a distinct name.
 
-    Rebuilds from scratch each call (removes any previous merged dir first)
-    so a stale run from before this fix -- or from a run whose phase list
-    changed -- can never leave incorrect leftover links in place.
+    Memoized per-process by ``d.prod_dir`` (this function is called from
+    several independent analysis functions within a single ``analyze()``
+    run, all against the same prod_dir -- only the first call actually
+    rebuilds; later calls reuse the cached result). Rebuilds are done into a
+    fresh temp directory and atomically swapped into place via ``os.replace``
+    rather than ``shutil.rmtree``-then-repopulate-in-place, so a concurrent
+    reader (e.g. a second ``analyze_gareus_mbar.py`` process analyzing a
+    different ``--epoch`` subset of the same run) never observes a
+    partially-built directory.
     """
     epoch_traj = _get_adaptive_epoch_traj_dirs(d)
     if not epoch_traj:
         return None
     merged = d.prod_dir / '_merged_replica_trajectories'
-    if merged.exists():
-        shutil.rmtree(merged)
-    merged.mkdir(exist_ok=True)
+    cache_key = str(merged)
+    if cache_key in _MERGED_TRAJ_DIR_CACHE:
+        return _MERGED_TRAJ_DIR_CACHE[cache_key]
+
     STEP_STRIDE = _MERGED_TRAJ_STEP_STRIDE
     TRAJ_EXTS = {'.xtc', '.dcd', '.nc', '.trr'}
+    building = d.prod_dir / f'_merged_replica_trajectories.building-{os.getpid()}'
+    if building.exists():
+        shutil.rmtree(building)
+    building.mkdir(parents=True)
     for epoch_idx, traj_dir in epoch_traj:
         for f in sorted(traj_dir.iterdir()):
             if f.suffix not in TRAJ_EXTS:
@@ -1735,14 +1781,28 @@ def _prepare_adaptive_merged_traj_dir(d: Data, args=None) -> Optional[Path]:
             m = _MERGED_TRAJ_RESUME_RE.match(stem)
             base_stem, local_resume = (m.group(1), int(m.group(2))) if m else (stem, 0)
             global_resume = epoch_idx * STEP_STRIDE + local_resume
-            link = (merged / f'{base_stem}{f.suffix}' if global_resume == 0
-                    else merged / f'{base_stem}_resume_from_{global_resume}{f.suffix}')
+            link = (building / f'{base_stem}{f.suffix}' if global_resume == 0
+                    else building / f'{base_stem}_resume_from_{global_resume}{f.suffix}')
             if not link.exists():
                 try:
                     link.symlink_to(f.resolve())
                 except Exception:
                     pass
-    return merged if any(merged.iterdir()) else None
+
+    if not any(building.iterdir()):
+        shutil.rmtree(building, ignore_errors=True)
+        _MERGED_TRAJ_DIR_CACHE[cache_key] = None
+        return None
+
+    stale = d.prod_dir / f'_merged_replica_trajectories.stale-{os.getpid()}'
+    if merged.exists():
+        os.replace(merged, stale)
+    os.replace(building, merged)
+    if stale.exists():
+        shutil.rmtree(stale, ignore_errors=True)
+
+    _MERGED_TRAJ_DIR_CACHE[cache_key] = merged
+    return merged
 
 
 def run_epoch_pmf_convergence(d: Data, args, bins: np.ndarray, selected: str,
@@ -6843,7 +6903,8 @@ def _write_dtram_vs_mbar_convergence(d: Data, args, bins: np.ndarray, kbt_kcal: 
 def write_dtram_diagnostic_outputs(d: Data, args, bins: np.ndarray, kbt_kcal: float,
                                    dtram_info: dict, pmfs: dict, selected: str,
                                    out: Path, warnings: list[str], progress: Optional[Progress],
-                                   mbar_result: Optional[dict] = None) -> dict:
+                                   mbar_result: Optional[dict] = None,
+                                   full_dataset_note: str = '') -> dict:
     files={}
     if not isinstance(dtram_info,dict) or not dtram_info.get('available'):
         return files
@@ -6868,7 +6929,7 @@ def write_dtram_diagnostic_outputs(d: Data, args, bins: np.ndarray, kbt_kcal: fl
             if np.any(m):
                 lw=2.6 if name in {selected,method} else 1.1
                 ax.plot(np.asarray(p['cv_A'])[m],F[m],lw=lw,label=name)
-        ax.set_xlabel(_primary_cv_axis_label(d.meta)); ax.set_ylabel('PMF (kcal/mol, shifted)'); ax.set_title('dTRAM PMF comparison')
+        ax.set_xlabel(_primary_cv_axis_label(d.meta)); ax.set_ylabel('PMF (kcal/mol, shifted)'); ax.set_title('dTRAM PMF comparison' + full_dataset_note)
         ax.legend(frameon=False,fontsize=8); ax.grid(True,alpha=0.2)
         path=out/'dtram_pmf_comparison.png'; fig.savefig(path,dpi=200,bbox_inches='tight'); plt.close(fig); files['dtram_pmf_comparison_png']=str(path)
         # Delta vs selected baseline
@@ -6890,14 +6951,14 @@ def write_dtram_diagnostic_outputs(d: Data, args, bins: np.ndarray, kbt_kcal: fl
         T=np.sum(C,axis=0)
         fig,ax=plt.subplots(figsize=(6.5,5.5),constrained_layout=True)
         im=ax.imshow(np.log10(T+1.0),origin='lower',aspect='auto')
-        ax.set_xlabel('to microstate bin'); ax.set_ylabel('from microstate bin'); ax.set_title('dTRAM transition matrix (sum over windows)')
+        ax.set_xlabel('to microstate bin'); ax.set_ylabel('from microstate bin'); ax.set_title('dTRAM transition matrix (sum over windows)' + full_dataset_note)
         fig.colorbar(im,ax=ax,label='log10(count + 1)')
         path=out/'dtram_transition_matrix.png'; fig.savefig(path,dpi=200,bbox_inches='tight'); plt.close(fig); files['dtram_transition_matrix_png']=str(path)
         # Occupancy matrix
         occ=_dtram_window_microstate_counts(d,states,M)
         fig,ax=plt.subplots(figsize=(8,5),constrained_layout=True)
         im=ax.imshow(np.log10(occ+1.0),origin='lower',aspect='auto')
-        ax.set_xlabel('microstate bin'); ax.set_ylabel('window'); ax.set_title('dTRAM occupancy: window x microstate')
+        ax.set_xlabel('microstate bin'); ax.set_ylabel('window'); ax.set_title('dTRAM occupancy: window x microstate' + full_dataset_note)
         fig.colorbar(im,ax=ax,label='log10(samples + 1)')
         path=out/'dtram_occupancy_window_microstate.png'; fig.savefig(path,dpi=200,bbox_inches='tight'); plt.close(fig); files['dtram_occupancy_window_microstate_png']=str(path)
         # Transitions per window
@@ -9678,12 +9739,19 @@ def _epoch_zero_split_masks(d: 'Data') -> Optional[tuple]:
     with only epoch_000 and nothing else to compare it against.
     """
     epoch_src = d.meta.get('_epoch_source')
-    if not epoch_src:
+    run_dirs = d.meta.get('adaptive_epoch_run_dirs')
+    if not epoch_src or not run_dirs:
         return None
     epoch_src = np.asarray(epoch_src, dtype=np.int64)
-    if epoch_src.size != len(d.cv):
+    if epoch_src.size != len(d.cv) or int(epoch_src.max()) >= len(run_dirs):
         return None
-    mask0 = epoch_src == 0
+    epoch_numbers = []
+    for rd in run_dirs:
+        n = _epoch_number_for_run_dir(Path(rd))
+        epoch_numbers.append(-1 if n is None else n)
+    epoch_numbers = np.asarray(epoch_numbers, dtype=np.int64)
+    sample_epoch_numbers = epoch_numbers[epoch_src]
+    mask0 = sample_epoch_numbers == 0
     mask_rest = ~mask0
     if not np.any(mask0) or not np.any(mask_rest):
         return None
@@ -9819,7 +9887,12 @@ def analyze(d,args, progress: Optional[Progress] = None):
     if isinstance(dtram_info,dict) and dtram_info.get('available'):
         write_pmf(out/'pmf_dtram.csv',dtram_info['pmf'],dtram_info.get('method','dtram'))
         dtram_info.setdefault('files',{})['pmf_dtram_csv']=str(out/'pmf_dtram.csv')
-        dtram_plot_files=write_dtram_diagnostic_outputs(d,args,bins,kbt_kcal,dtram_info,pmfs,selected,out,warn,progress,mbar_result=m)
+        if epoch0_split is not None:
+            dtram_full_dataset_note=' [full dataset incl. epoch_000]'
+            warn.append('[dtram] dtram_pmf_comparison.png / occupancy / transition-matrix panels are computed from the full dataset (including epoch_000); the rest of this report (pmfs, window_diagnostics.csv) excludes epoch_000 -- see epoch_000_report.')
+        else:
+            dtram_full_dataset_note=''
+        dtram_plot_files=write_dtram_diagnostic_outputs(d,args,bins,kbt_kcal,dtram_info,pmfs,selected,out,warn,progress,mbar_result=m,full_dataset_note=dtram_full_dataset_note)
         if dtram_plot_files:
             dtram_info.setdefault('files',{}).update(dtram_plot_files)
         dtram_info.setdefault('files',{})['dtram_summary_json']=str(out/'dtram_summary.json')
@@ -9889,7 +9962,8 @@ def parse_args(argv=None):
     p=argparse.ArgumentParser(description='GaREUS MBAR/PMF analysis. By default, this runs the full analysis suite: main CV PMF, convergence plots, Rg, distance-Rg 2D FES, PCA1-PCA2 FES, phi/psi/Ramachandran, SASA, secondary-structure fractions, and internal-contact PMFs whenever trajectories/topology are available.', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument('input', help='Run directory or final_production directory')
     p.add_argument('--epoch', dest='epochs', type=int, action='append', default=None,
-                   metavar='N', help='Pool only adaptive-production epoch N; repeat to select multiple epochs.')
+                   metavar='N', help='Pool only adaptive-production epoch N; repeat to select multiple epochs. '
+                   'The final/ phase (baseline + topup_*) is always included regardless of this filter.')
     p.add_argument('--out', default=None, help='PMF analysis output directory; default: <final_production>/pmf_analysis')
     p.add_argument('--analysis-source', choices=['auto','parquet','npz','csv'], default='auto', help='Analysis input source. auto prefers Parquet chunks (new format) then npz then csv; parquet reads segments.json + samples/*.parquet directly (new gareus package format); npz uses analysis_arrays.npz/analysis_chunks; csv uses samples.csv.')
     p.add_argument('--bins', type=int, default=60)

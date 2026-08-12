@@ -43,6 +43,31 @@ def test_epoch_filter_selects_only_requested_baseline_and_topups(tmp_path):
     assert parse_args(["run", "--epoch", "1", "--epoch", "3"]).epochs == [1, 3]
 
 
+def test_epoch_filter_always_includes_final_phase(tmp_path):
+    """`--epoch` restricted to numbered epochs must not drop final/."""
+    ap = tmp_path / "adaptive_production"
+
+    _parquet_source(ap / "epoch_000")
+    (ap / "epoch_000" / "epoch_window_map.csv").write_text("epoch_window,state_id\n0,0\n", encoding="utf-8")
+
+    _parquet_source(ap / "epoch_001" / "baseline")
+    (ap / "epoch_001" / "epoch_window_map.csv").write_text("epoch_window,state_id\n0,0\n", encoding="utf-8")
+
+    _parquet_source(ap / "epoch_002" / "baseline")
+    (ap / "epoch_002" / "epoch_window_map.csv").write_text("epoch_window,state_id\n0,0\n", encoding="utf-8")
+
+    _parquet_source(ap / "final" / "baseline")
+    _parquet_source(ap / "final" / "topup_001_10")
+    (ap / "final" / "epoch_window_map.csv").write_text("epoch_window,state_id\n0,0\n", encoding="utf-8")
+
+    expected = [
+        ap / "epoch_001" / "baseline",
+        ap / "final" / "baseline",
+        ap / "final" / "topup_001_10",
+    ]
+    assert [path for path, _ in _find_adaptive_epoch_dirs(ap, epoch_ids={1})] == expected
+
+
 def test_csv_epoch_filter_pools_requested_epoch_sources_only(tmp_path):
     """Prevent `--epoch 1` from retaining epoch-000 CV2 samples in MBAR."""
     ap = tmp_path / "adaptive_production"

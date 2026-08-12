@@ -27,6 +27,7 @@ pytest.importorskip("analyze_gareus_mbar")
 
 from analyze_gareus_mbar import (
     Data,
+    _MERGED_TRAJ_DIR_CACHE,
     _MERGED_TRAJ_STEP_STRIDE,
     _prepare_adaptive_merged_traj_dir,
 )
@@ -118,3 +119,50 @@ def test_rebuilds_from_scratch_discarding_stale_links(tmp_path):
     assert merged is not None
     assert not stale.exists()
     assert sorted(p.name for p in merged.iterdir()) == ["replica_000.xtc"]
+
+
+def test_second_call_is_memoized_and_skips_rebuild(tmp_path):
+    """A second call against the same d.prod_dir must return the identical
+    cached Path without redoing any filesystem work. Proven by planting a
+    marker file inside the merged directory after the first call: a real
+    rebuild (rmtree/replace) would destroy it, so its survival across the
+    second call proves the second call short-circuited on the cache."""
+    _MERGED_TRAJ_DIR_CACHE.clear()  # guarantee a fresh build for this tmp_path
+
+    prod_dir = tmp_path / "adaptive_production"
+    phase0 = prod_dir / "epoch_000"
+    _write_traj(phase0 / "replica_trajectories" / "replica_000.xtc")
+
+    d = _make_data(prod_dir, [phase0])
+    merged_first = _prepare_adaptive_merged_traj_dir(d)
+    assert merged_first is not None
+
+    marker = merged_first / "_test_marker"
+    marker.write_text("still here")
+
+    merged_second = _prepare_adaptive_merged_traj_dir(d)
+
+    assert merged_second == merged_first
+    assert marker.exists()  # would be gone if the second call rebuilt
+
+
+def test_no_leftover_building_or_stale_dirs_after_rebuild(tmp_path):
+    """After a successful rebuild, no temp _merged_replica_trajectories.building-*
+    or .stale-* directories should remain under d.prod_dir."""
+    _MERGED_TRAJ_DIR_CACHE.clear()  # guarantee a fresh build for this tmp_path
+
+    prod_dir = tmp_path / "adaptive_production"
+    phase0 = prod_dir / "epoch_000"
+    _write_traj(phase0 / "replica_trajectories" / "replica_000.xtc")
+
+    # Pre-existing merged dir, so the rebuild also exercises the
+    # merged.exists() -> stale-swap-and-remove branch, not just a fresh mkdir.
+    merged_dir = prod_dir / "_merged_replica_trajectories"
+    _write_traj(merged_dir / "replica_999_old.xtc")
+
+    d = _make_data(prod_dir, [phase0])
+    merged = _prepare_adaptive_merged_traj_dir(d)
+
+    assert merged is not None
+    leftovers = list(prod_dir.glob("_merged_replica_trajectories.*"))
+    assert leftovers == [], leftovers
