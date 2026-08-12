@@ -63,12 +63,44 @@ def test_parses_full_params_keyed_by_state_id():
     assert parsed[5]["secondary_center"] == 1.5
 
 
-def test_blank_secondary_fields_become_nan_center_zero_k():
+def test_blank_secondary_fields_become_nan():
+    """Both secondary fields blank together: both must come back NaN so
+    `_epoch_bias_param_vectors`'s `math.isfinite(...)` check falls back to the
+    global registry value for both, not just `secondary_center`.
+    """
     rows = [{"epoch_window": "0", "state_id": "0", "primary_center": "0.0",
              "primary_k": "44.3", "secondary_center": "", "secondary_k": ""}]
     parsed = _parse_epoch_window_map_native_params(rows)
     assert math.isnan(parsed[0]["secondary_center"])
-    assert parsed[0]["secondary_k"] == 0.0
+    assert math.isnan(parsed[0]["secondary_k"])
+
+
+def test_blank_secondary_k_alone_falls_back_to_global_k_not_zero():
+    """Distinct from the blank-both case above: secondary_center is a real,
+    present value but secondary_k is blank/missing on its own. Before the fix,
+    secondary_k's missing-value default was the finite 0.0 (unlike its sibling
+    fields, which default to NaN) -- so a row like this would force-override
+    the epoch's secondary_k to 0.0 via `_epoch_bias_param_vectors`'s
+    `math.isfinite` check, even though only secondary_k (not
+    secondary_center) was actually missing from this row. That zero then
+    silently disables the whole secondary-restraint bias term for this
+    state's samples in `_reconstruct_union_bias_block`. Fixed: secondary_k's
+    missing-value default is now NaN too, so a missing k correctly falls back
+    to the global registry's real k instead of forcing zero.
+    """
+    rows = [{"epoch_window": "0", "state_id": "0", "primary_center": "0.0",
+             "primary_k": "44.3", "secondary_center": "-2.1337", "secondary_k": ""}]
+    native = _parse_epoch_window_map_native_params(rows)
+    assert native[0]["secondary_center"] == -2.1337
+    assert math.isnan(native[0]["secondary_k"])
+
+    global_pc = np.array([0.0]); global_pk = np.array([44.3])
+    global_sc = np.array([1.1632]); global_sk = np.array([11.87])  # real global k
+
+    pc, pk, sc, sk = _epoch_bias_param_vectors(native, [0], global_pc, global_pk, global_sc, global_sk)
+
+    assert sc[0] == pytest.approx(-2.1337)  # native center still used
+    assert sk[0] == pytest.approx(11.87)    # falls back to GLOBAL k, not forced to 0.0
 
 
 def test_rows_without_state_id_are_skipped():
@@ -245,3 +277,39 @@ def test_union_falls_back_to_global_row_for_state_absent_from_epoch_snapshot(tmp
     d1 = data.cv - 0.5
     expected_col1 = data.beta * 4.184 * 0.5 * 20.0 * d1 * d1
     np.testing.assert_allclose(data.u_nk[:, 1], expected_col1)
+
+
+# --- Burnin filter must slice boost_dih alongside every other per-sample array --
+
+def test_burnin_filter_keeps_boost_dih_kj_aligned_with_cv(tmp_path):
+    """Every per-sample array except boost_dih used to be sliced by the
+    burnin `keep` mask, leaving boost_dih at its original, unfiltered length
+    whenever any registry state has burnin_steps > 0. `clean()` treats that
+    length mismatch against the (already burnin-filtered) cv array as
+    "corrupt" and silently sets boost_dih_kj to None -- so the whole
+    dihedral-only GaMD boost component vanished from any burnin-filtered
+    adaptive-production run, with no warning printed anywhere.
+
+    Reproduce with a state whose burnin_steps discards some but not all of
+    its samples, and assert boost_dih_kj survives at the same, filtered
+    length as cv/window rather than being dropped to None.
+    """
+    adaptive_dir = tmp_path / "adaptive_production"
+    adaptive_dir.mkdir(parents=True)
+
+    # _write_epoch's writer.write_sample(...) call passes gamd_boost_dihedral=0.6
+    # for every sample (non-trivial, non-NaN) and steps 0, 50, 100, 150, 200.
+    _write_epoch(adaptive_dir / "epoch_000", cv1_val=0.3, cv2_val=0.0,
+                 n_samples=5, secondary_center=0.0, secondary_k=0.0)
+    _write_registry(adaptive_dir, [{
+        "state_id": 0, "primary_center": 0.0, "primary_k": 44.3,
+        "secondary_center": 0.0, "secondary_k": 0.0, "burnin_steps": 100,
+    }])
+
+    data = load_parquet_adaptive_union(adaptive_dir)
+
+    # burnin_steps=100 keeps only step >= 100 -> 3 of the 5 samples survive.
+    assert data.cv.size == 3
+    assert data.boost_dih_kj is not None
+    assert data.boost_dih_kj.size == data.cv.size
+    np.testing.assert_allclose(data.boost_dih_kj, 0.6)
