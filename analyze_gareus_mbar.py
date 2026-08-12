@@ -3088,6 +3088,23 @@ def make_bins(cv,bins,lo,hi):
     if lo==hi: hi=lo+1.0
     return np.linspace(lo-pad if lo is None else lo, hi+pad if hi is None else hi, bins+1)
 
+def _bin_indices(values, edges):
+    """0-based bin index of each value against `edges`, using the same
+    half-open-on-the-left/closed-on-the-right convention as np.histogram
+    (the last bin includes its right edge). Values outside
+    [edges[0], edges[-1]] land on an out-of-range index (-1 or
+    len(edges)-1); callers must mask those out via
+    ``(bi >= 0) & (bi < len(edges) - 1)`` before using bi to index a
+    length-(len(edges)-1) array. Verified (see tests) to reproduce
+    np.histogram's own bin assignment bit-for-bit, so
+    ``np.bincount(bi[inrange], minlength=B)`` on unweighted data is
+    interchangeable with ``np.histogram(values, bins=edges)[0]``.
+    """
+    B=len(edges)-1
+    bi=np.searchsorted(edges,values,side='right')-1
+    bi[values==edges[-1]]=B-1
+    return bi
+
 def pmf_from_weights(cv,w,bins,kbt_kcal):
     cv=np.asarray(cv,dtype=np.float64); w=np.asarray(w,dtype=np.float64)
     prob,edges=np.histogram(cv,bins=bins,weights=w)
@@ -3097,7 +3114,11 @@ def pmf_from_weights(cv,w,bins,kbt_kcal):
     # consumers like the occupied_bins convergence diagnostic. Reuse `edges`
     # (not `bins`) so counts stays aligned with prob even if bins was an int.
     valid=np.isfinite(w)&(w>0)
-    counts,_=np.histogram(cv[valid],bins=edges)
+    B=len(edges)-1
+    cv_valid=cv[valid]
+    bi=_bin_indices(cv_valid,edges)
+    inrange=(bi>=0)&(bi<B)
+    counts=np.bincount(bi[inrange],minlength=B)
     prob=np.asarray(prob,float)
     if np.sum(prob)>0: prob/=np.sum(prob)
     with np.errstate(divide='ignore',invalid='ignore'): F=-kbt_kcal*np.log(prob)
@@ -3105,33 +3126,28 @@ def pmf_from_weights(cv,w,bins,kbt_kcal):
     if np.any(mask): F-=np.nanmin(F[mask])
     return {'cv_A':0.5*(edges[:-1]+edges[1:]),'prob':prob,'pmf':F,'counts':counts.astype(int)}
 
-def _cumulant_expansion(cv,base_w,boost,bins,beta,kbt_kcal,order=2,smooth_logfac_sigma=0.0):
-    """Cumulant GaMD reweighting, vectorized by CV bin.
-
-    order=2 keeps the mean+variance terms (Gaussian/CE2 approximation).
-    order=3 adds the beta^3/6 * kappa3 term, where kappa3 is the per-bin
-    third cumulant (= third central moment) of the boost. kappa3/var are
-    computed via a two-pass mean-centered accumulation rather than raw
-    moments, since raw <x^3>-3<x^2><x>+2<x>^3 catastrophically cancels
-    when the boost mean (O(10-200) kJ/mol) dominates its spread.
+def _cumulant_shared_stats(cv,base_w,boost,bins):
+    """The O(N) work shared by the order-2 and order-3 cumulant expansions:
+    histogram/bin-edges, per-bin unweighted counts, bin-index assignment,
+    and the per-bin boost mean/variance (order=2's full computation).
+    order=3 adds exactly one more O(N) bincount (kappa3) on top of this;
+    nothing in this shared stage depends on which order is requested.
     """
-    if order not in (2,3):
-        raise ValueError(f"cumulant expansion order must be 2 or 3, got {order}")
     cv=np.asarray(cv,dtype=np.float64)
     base_w=np.asarray(base_w,dtype=np.float64)
     boost=np.asarray(boost,dtype=np.float64)
     p0,edges=np.histogram(cv,bins=bins,weights=base_w)
-    counts,_=np.histogram(cv,bins=bins)
     centers=0.5*(edges[:-1]+edges[1:])
     B=centers.size
-    bi=np.searchsorted(edges,cv,side='right')-1
-    bi[cv==edges[-1]]=B-1
-    good=(bi>=0)&(bi<B)&np.isfinite(boost)&np.isfinite(base_w)&(base_w>0)
+    bi=_bin_indices(cv,edges)
+    inrange=(bi>=0)&(bi<B)
+    counts=np.bincount(bi[inrange],minlength=B)
+    good=inrange&np.isfinite(boost)&np.isfinite(base_w)&(base_w>0)
     mean=np.full(B,np.nan,dtype=np.float64)
     var=np.full(B,np.nan,dtype=np.float64)
-    kappa3=np.full(B,np.nan,dtype=np.float64)
-    logfac=np.zeros(B,dtype=np.float64)
     nz=np.zeros(B,dtype=bool)
+    idx=w=x=dx=None
+    sw=np.zeros(B,dtype=np.float64)
     if np.any(good):
         idx=bi[good].astype(np.int64,copy=False)
         w=base_w[good]
@@ -3143,8 +3159,28 @@ def _cumulant_expansion(cv,base_w,boost,bins,beta,kbt_kcal,order=2,smooth_logfac
         dx=x-mean[idx]
         sdx2=np.bincount(idx,weights=w*dx*dx,minlength=B).astype(np.float64)
         var[nz]=np.maximum(0.0,sdx2[nz]/sw[nz])
+    return {'edges':edges,'centers':centers,'B':B,'p0':p0,'counts':counts,
+            'nz':nz,'mean':mean,'var':var,'idx':idx,'w':w,'x':x,'dx':dx,'sw':sw}
+
+
+def _cumulant_from_shared(shared,beta,kbt_kcal,order,smooth_logfac_sigma=0.0):
+    """Finish an order-2 or order-3 cumulant PMF from `_cumulant_shared_stats`
+    output. order=2 keeps the mean+variance terms (Gaussian/CE2
+    approximation). order=3 adds the beta^3/6 * kappa3 term, where kappa3
+    is the per-bin third cumulant (= third central moment) of the boost.
+    kappa3/var are computed via a two-pass mean-centered accumulation
+    rather than raw moments, since raw <x^3>-3<x^2><x>+2<x>^3
+    catastrophically cancels when the boost mean (O(10-200) kJ/mol)
+    dominates its spread.
+    """
+    B=shared['B']; nz=shared['nz']; mean=shared['mean']; var=shared['var']
+    p0=shared['p0']; counts=shared['counts']; centers=shared['centers']
+    kappa3=np.full(B,np.nan,dtype=np.float64)
+    logfac=np.zeros(B,dtype=np.float64)
+    if np.any(nz):
         logfac[nz]=beta*mean[nz]+0.5*beta*beta*var[nz]
         if order==3:
+            idx=shared['idx']; w=shared['w']; dx=shared['dx']; sw=shared['sw']
             sdx3=np.bincount(idx,weights=w*dx*dx*dx,minlength=B).astype(np.float64)
             kappa3[nz]=sdx3[nz]/sw[nz]
             logfac[nz]+=(beta**3/6.0)*kappa3[nz]
@@ -3169,7 +3205,39 @@ def _cumulant_expansion(cv,base_w,boost,bins,beta,kbt_kcal,order=2,smooth_logfac
         F=-kbt_kcal*np.log(p)
     mask=np.isfinite(F)
     if np.any(mask): F-=np.nanmin(F[mask])
-    return {'cv_A':centers,'prob':p,'pmf':F,'counts':counts.astype(int)}, {'boost_mean_kj':mean,'boost_var_kj2':var,'boost_kappa3_kj3':kappa3,'log_reweight_factor':logfac}
+    return {'cv_A':centers.copy(),'prob':p,'pmf':F,'counts':counts.astype(int)}, {'boost_mean_kj':mean.copy(),'boost_var_kj2':var.copy(),'boost_kappa3_kj3':kappa3,'log_reweight_factor':logfac}
+
+
+def _cumulant_expansion(cv,base_w,boost,bins,beta,kbt_kcal,order=2,smooth_logfac_sigma=0.0):
+    """Cumulant GaMD reweighting, vectorized by CV bin.
+
+    order=2 keeps the mean+variance terms (Gaussian/CE2 approximation).
+    order=3 adds the beta^3/6 * kappa3 term, where kappa3 is the per-bin
+    third cumulant (= third central moment) of the boost. See
+    `_cumulant_from_shared` for the reweighting-factor math and
+    `_cumulant_shared_stats` for the shared histogram/mean/variance pass.
+    """
+    if order not in (2,3):
+        raise ValueError(f"cumulant expansion order must be 2 or 3, got {order}")
+    shared=_cumulant_shared_stats(cv,base_w,boost,bins)
+    return _cumulant_from_shared(shared,beta,kbt_kcal,order,smooth_logfac_sigma=smooth_logfac_sigma)
+
+
+def _cumulant_expansion_both(cv,base_w,boost,bins,beta,kbt_kcal,smooth_logfac_sigma=0.0):
+    """Compute the order-2 AND order-3 cumulant PMFs from a single shared
+    pass, for callers that need both (as every current caller of
+    cumulant2+cumulant3 back-to-back does). Equivalent to calling
+    `_cumulant_expansion(order=2)` then `_cumulant_expansion(order=3)`
+    separately -- same bit-for-bit numbers -- but the shared O(N)
+    histogram/bin-assignment/mean/variance work (the expensive part) is
+    only performed once instead of twice.
+
+    Returns ((pmf2, diag2), (pmf3, diag3)).
+    """
+    shared=_cumulant_shared_stats(cv,base_w,boost,bins)
+    result2=_cumulant_from_shared(shared,beta,kbt_kcal,2,smooth_logfac_sigma=smooth_logfac_sigma)
+    result3=_cumulant_from_shared(shared,beta,kbt_kcal,3,smooth_logfac_sigma=smooth_logfac_sigma)
+    return result2, result3
 
 
 def cumulant2(cv,base_w,boost,bins,beta,kbt_kcal,smooth_logfac_sigma=0.0):
@@ -3206,29 +3274,27 @@ def pmf2d_from_weights(x,y,w,xbins,ybins,kbt_kcal):
         'counts':counts.astype(int),
     }
 
-def _cumulant_expansion_2d(x,y,base_w,boost,xbins,ybins,beta,kbt_kcal,order=2,smooth_logfac_sigma=0.0):
-    """2D counterpart of _cumulant_expansion; see that docstring for order/kappa3 notes."""
-    if order not in (2,3):
-        raise ValueError(f"cumulant expansion order must be 2 or 3, got {order}")
+def _cumulant_shared_stats_2d(x,y,base_w,boost,xbins,ybins):
+    """2D counterpart of `_cumulant_shared_stats`; see that docstring."""
     x=np.asarray(x,dtype=np.float64)
     y=np.asarray(y,dtype=np.float64)
     base_w=np.asarray(base_w,dtype=np.float64)
     boost=np.asarray(boost,dtype=np.float64)
     p0,xedges,yedges=np.histogram2d(x,y,bins=[xbins,ybins],weights=base_w)
-    counts,_,_=np.histogram2d(x,y,bins=[xbins,ybins])
     xc=0.5*(xedges[:-1]+xedges[1:])
     yc=0.5*(yedges[:-1]+yedges[1:])
     Bx=len(xc); By=len(yc)
-    xi=np.searchsorted(xedges,x,side='right')-1
-    yi=np.searchsorted(yedges,y,side='right')-1
-    xi[x==xedges[-1]]=Bx-1
-    yi[y==yedges[-1]]=By-1
-    good=(xi>=0)&(xi<Bx)&(yi>=0)&(yi<By)&np.isfinite(boost)&np.isfinite(base_w)&(base_w>0)
+    xi=_bin_indices(x,xedges)
+    yi=_bin_indices(y,yedges)
+    inrange=(xi>=0)&(xi<Bx)&(yi>=0)&(yi<By)
+    idx_all=xi[inrange].astype(np.int64,copy=False)*By+yi[inrange].astype(np.int64,copy=False)
+    counts=np.bincount(idx_all,minlength=Bx*By).reshape(Bx,By)
+    good=inrange&np.isfinite(boost)&np.isfinite(base_w)&(base_w>0)
     mean=np.full((Bx,By),np.nan,dtype=np.float64)
     var=np.full((Bx,By),np.nan,dtype=np.float64)
-    kappa3=np.full((Bx,By),np.nan,dtype=np.float64)
-    logfac=np.zeros((Bx,By),dtype=np.float64)
     nz=np.zeros((Bx,By),dtype=bool)
+    idx=w=b=db=None
+    sw=np.zeros((Bx,By),dtype=np.float64)
     if np.any(good):
         xf=xi[good].astype(np.int64,copy=False)
         yf=yi[good].astype(np.int64,copy=False)
@@ -3243,12 +3309,26 @@ def _cumulant_expansion_2d(x,y,base_w,boost,xbins,ybins,beta,kbt_kcal,order=2,sm
         db=b-flat_mean[idx]
         sdb2=np.bincount(idx,weights=w*db*db,minlength=Bx*By).astype(np.float64).reshape(Bx,By)
         var[nz]=np.maximum(0.0,sdb2[nz]/sw[nz])
+    return {'xc':xc,'yc':yc,'xedges':xedges,'yedges':yedges,'Bx':Bx,'By':By,
+            'p0':p0,'counts':counts,'nz':nz,'mean':mean,'var':var,
+            'idx':idx,'w':w,'b':b,'db':db,'sw':sw}
+
+
+def _cumulant_from_shared_2d(shared,beta,kbt_kcal,order,smooth_logfac_sigma=0.0):
+    """2D counterpart of `_cumulant_from_shared`; see that docstring."""
+    Bx=shared['Bx']; By=shared['By']; nz=shared['nz']
+    mean=shared['mean']; var=shared['var']; p0=shared['p0']; counts=shared['counts']
+    xc=shared['xc']; yc=shared['yc']; xedges=shared['xedges']; yedges=shared['yedges']
+    kappa3=np.full((Bx,By),np.nan,dtype=np.float64)
+    logfac=np.zeros((Bx,By),dtype=np.float64)
+    if np.any(nz):
         logfac[nz]=beta*mean[nz]+0.5*beta*beta*var[nz]
         if order==3:
+            idx=shared['idx']; w=shared['w']; db=shared['db']; sw=shared['sw']
             sdb3=np.bincount(idx,weights=w*db*db*db,minlength=Bx*By).astype(np.float64).reshape(Bx,By)
             kappa3[nz]=sdb3[nz]/sw[nz]
             logfac[nz]+=(beta**3/6.0)*kappa3[nz]
-    # See _cumulant_expansion: a bin with real weighted samples (p0>0) but
+    # See _cumulant_from_shared: a bin with real weighted samples (p0>0) but
     # zero finite-boost samples gets an unknown (NaN) correction, not a
     # silent logfac=0 fallback. Genuinely empty bins (p0==0) stay at
     # logfac=0 -> p=0, unchanged.
@@ -3269,19 +3349,36 @@ def _cumulant_expansion_2d(x,y,base_w,boost,xbins,ybins,beta,kbt_kcal,order=2,sm
     if np.any(mask):
         F-=np.nanmin(F[mask])
     return {
-        'cv_A':xc,
-        'rg_A':yc,
-        'cv_edges_A':np.asarray(xedges,dtype=np.float64),
-        'rg_edges_A':np.asarray(yedges,dtype=np.float64),
+        'cv_A':xc.copy(),
+        'rg_A':yc.copy(),
+        'cv_edges_A':np.array(xedges,dtype=np.float64),
+        'rg_edges_A':np.array(yedges,dtype=np.float64),
         'prob':p,
         'pmf':F,
         'counts':counts.astype(int),
     }, {
-        'boost_mean_kj':mean,
-        'boost_var_kj2':var,
+        'boost_mean_kj':mean.copy(),
+        'boost_var_kj2':var.copy(),
         'boost_kappa3_kj3':kappa3,
         'log_reweight_factor':logfac,
     }
+
+
+def _cumulant_expansion_2d(x,y,base_w,boost,xbins,ybins,beta,kbt_kcal,order=2,smooth_logfac_sigma=0.0):
+    """2D counterpart of _cumulant_expansion; see that docstring for order/kappa3 notes."""
+    if order not in (2,3):
+        raise ValueError(f"cumulant expansion order must be 2 or 3, got {order}")
+    shared=_cumulant_shared_stats_2d(x,y,base_w,boost,xbins,ybins)
+    return _cumulant_from_shared_2d(shared,beta,kbt_kcal,order,smooth_logfac_sigma=smooth_logfac_sigma)
+
+
+def _cumulant_expansion_2d_both(x,y,base_w,boost,xbins,ybins,beta,kbt_kcal,smooth_logfac_sigma=0.0):
+    """2D counterpart of `_cumulant_expansion_both`; see that docstring.
+    Returns ((fes2, diag2), (fes3, diag3))."""
+    shared=_cumulant_shared_stats_2d(x,y,base_w,boost,xbins,ybins)
+    result2=_cumulant_from_shared_2d(shared,beta,kbt_kcal,2,smooth_logfac_sigma=smooth_logfac_sigma)
+    result3=_cumulant_from_shared_2d(shared,beta,kbt_kcal,3,smooth_logfac_sigma=smooth_logfac_sigma)
+    return result2, result3
 
 
 def cumulant2_2d(x,y,base_w,boost,xbins,ybins,beta,kbt_kcal,smooth_logfac_sigma=0.0):
@@ -5106,8 +5203,7 @@ def analyze_rg(d: Data, args, m: dict, base_w: np.ndarray, selected: str, boost_
         exp_logw=base_logw+d.beta*boost_sel
         exp_w=norm_logw(exp_logw)
         exp_pmf=pmf_from_weights(rg_sel,exp_w,bins,kbt_kcal)
-        cum_pmf,cdiag=cumulant2(rg_sel,base_w_rg,boost_sel,bins,d.beta,kbt_kcal,smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
-        cum3_pmf,cdiag3=cumulant3(rg_sel,base_w_rg,boost_sel,bins,d.beta,kbt_kcal,smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
+        (cum_pmf,cdiag),(cum3_pmf,cdiag3)=_cumulant_expansion_both(rg_sel,base_w_rg,boost_sel,bins,d.beta,kbt_kcal,smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
         rg_selected=selected if selected in {'gamd_exponential','gamd_cumulant2','gamd_cumulant3'} else 'gamd_cumulant2'
     else:
         exp_w=base_w_rg
@@ -5165,8 +5261,7 @@ def analyze_distance_rg_2d_fes(d: Data, args, base_logw: np.ndarray, selected: s
         exp_logw=base_logw_sel + d.beta*boost_sel
         exp_w=norm_logw(exp_logw)
         fes_exp=pmf2d_from_weights(cv_sel, rg_sel, exp_w, xbins, ybins, kbt_kcal)
-        fes_cum, cdiag = cumulant2_2d(cv_sel, rg_sel, base_w, boost_sel, xbins, ybins, d.beta, kbt_kcal, smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
-        fes_cum3, cdiag3 = cumulant3_2d(cv_sel, rg_sel, base_w, boost_sel, xbins, ybins, d.beta, kbt_kcal, smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
+        (fes_cum, cdiag), (fes_cum3, cdiag3) = _cumulant_expansion_2d_both(cv_sel, rg_sel, base_w, boost_sel, xbins, ybins, d.beta, kbt_kcal, smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
         chosen = selected if selected in {'gamd_exponential','gamd_cumulant2','gamd_cumulant3'} else 'gamd_cumulant2'
     else:
         fes_exp=fes_umbrella
@@ -5508,8 +5603,7 @@ def analyze_pca_2d_fes(d: Data, args, base_logw: np.ndarray, selected: str, boos
     if boost_ok and np.isfinite(boost_sel).sum()>10 and np.nanstd(boost_sel)>1e-12:
         exp_w=norm_logw(base_logw_sel+d.beta*boost_sel)
         fes_exp=pmf2d_from_weights(x,y,exp_w,xbins,ybins,kbt_kcal)
-        fes_cum,_cdiag=cumulant2_2d(x,y,base_w,boost_sel,xbins,ybins,d.beta,kbt_kcal,smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
-        fes_cum3,_cdiag3=cumulant3_2d(x,y,base_w,boost_sel,xbins,ybins,d.beta,kbt_kcal,smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
+        (fes_cum,_cdiag),(fes_cum3,_cdiag3)=_cumulant_expansion_2d_both(x,y,base_w,boost_sel,xbins,ybins,d.beta,kbt_kcal,smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
         chosen=selected if selected in {'gamd_exponential','gamd_cumulant2','gamd_cumulant3'} else 'gamd_cumulant2'
     else:
         fes_exp=fes_umbrella
@@ -6907,8 +7001,7 @@ def analyze_secondary_cv_pmf(d: Data, args, base_logw: np.ndarray, selected: str
     if boost_ok and np.isfinite(boost_sel).sum()>10 and np.nanstd(boost_sel)>1e-12:
         exp_w=norm_logw(base_logw_sel + d.beta*boost_sel)
         exp_pmf=pmf_from_weights(cv2_sel, exp_w, bins, kbt_kcal)
-        cum_pmf,cdiag=cumulant2(cv2_sel, base_w, boost_sel, bins, d.beta, kbt_kcal, smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
-        cum3_pmf,cdiag3=cumulant3(cv2_sel, base_w, boost_sel, bins, d.beta, kbt_kcal, smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
+        (cum_pmf,cdiag),(cum3_pmf,cdiag3)=_cumulant_expansion_both(cv2_sel, base_w, boost_sel, bins, d.beta, kbt_kcal, smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
         chosen=selected if selected in {'gamd_exponential','gamd_cumulant2','gamd_cumulant3'} else 'gamd_cumulant2'
     else:
         exp_pmf=umbrella; cum_pmf=umbrella; cum3_pmf=umbrella
@@ -6978,8 +7071,7 @@ def analyze_cv1_cv2_2d_fes(d: Data, args, base_logw: np.ndarray, selected: str, 
         exp_logw=base_logw_sel + d.beta*boost_sel
         exp_w=norm_logw(exp_logw)
         fes_exp=pmf2d_from_weights(cv_sel, cv2_sel, exp_w, xbins, ybins, kbt_kcal)
-        fes_cum,cdiag=cumulant2_2d(cv_sel, cv2_sel, base_w, boost_sel, xbins, ybins, d.beta, kbt_kcal, smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
-        fes_cum3,cdiag3=cumulant3_2d(cv_sel, cv2_sel, base_w, boost_sel, xbins, ybins, d.beta, kbt_kcal, smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
+        (fes_cum,cdiag),(fes_cum3,cdiag3)=_cumulant_expansion_2d_both(cv_sel, cv2_sel, base_w, boost_sel, xbins, ybins, d.beta, kbt_kcal, smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
         chosen=selected if selected in {'gamd_exponential','gamd_cumulant2','gamd_cumulant3'} else 'gamd_cumulant2'
     else:
         fes_exp=fes_umbrella; fes_cum=fes_umbrella; fes_cum3=fes_umbrella
@@ -7921,8 +8013,7 @@ def analyze_chignolin_fes(d, args, base_logw: np.ndarray, selected: str, boost_o
     if boost_ok and np.isfinite(boost_sel).sum() > 10 and np.nanstd(boost_sel) > 1e-12:
         exp_w = norm_logw(logw_sel + d.beta * boost_sel)
         fes_exp = pmf2d_from_weights(x_sel, y_sel, exp_w, xbins, ybins, kbt_kcal)
-        fes_cum, _ = cumulant2_2d(x_sel, y_sel, base_w, boost_sel, xbins, ybins, d.beta, kbt_kcal, smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
-        fes_cum3, _ = cumulant3_2d(x_sel, y_sel, base_w, boost_sel, xbins, ybins, d.beta, kbt_kcal, smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
+        (fes_cum, _), (fes_cum3, _) = _cumulant_expansion_2d_both(x_sel, y_sel, base_w, boost_sel, xbins, ybins, d.beta, kbt_kcal, smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
         chosen = selected if selected in {"gamd_exponential", "gamd_cumulant2", "gamd_cumulant3"} else "gamd_cumulant2"
     else:
         fes_exp = fes_cum = fes_cum3 = fes_umbrella
@@ -8715,8 +8806,7 @@ def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.nd
     if boost_ok:
         exp_w = norm_logw(logw + d.beta * d.boost_kj)
         exp_pmf = pmf_from_weights(d.cv, exp_w, bins, kbt_kcal)
-        cum_pmf, cdiag = cumulant2(d.cv, base_w, d.boost_kj, bins, d.beta, kbt_kcal, smooth_logfac_sigma=_eff_smooth(args, 'gamd_smooth_sigma'))
-        cum3_pmf, cdiag3 = cumulant3(d.cv, base_w, d.boost_kj, bins, d.beta, kbt_kcal, smooth_logfac_sigma=_eff_smooth(args, 'gamd_smooth_sigma'))
+        (cum_pmf, cdiag), (cum3_pmf, cdiag3) = _cumulant_expansion_both(d.cv, base_w, d.boost_kj, bins, d.beta, kbt_kcal, smooth_logfac_sigma=_eff_smooth(args, 'gamd_smooth_sigma'))
         selected = 'gamd_cumulant2'
         # A bin can have real samples (counts>0) but zero with a finite GaMD
         # boost -- e.g. a whole segment/epoch missing gamd_boost_total_kj_mol
