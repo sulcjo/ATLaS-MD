@@ -2990,7 +2990,16 @@ def make_bins(cv,bins,lo,hi):
     return np.linspace(lo-pad if lo is None else lo, hi+pad if hi is None else hi, bins+1)
 
 def pmf_from_weights(cv,w,bins,kbt_kcal):
-    prob,edges=np.histogram(cv,bins=bins,weights=w); counts,_=np.histogram(cv,bins=bins); prob=np.asarray(prob,float)
+    cv=np.asarray(cv,dtype=np.float64); w=np.asarray(w,dtype=np.float64)
+    prob,edges=np.histogram(cv,bins=bins,weights=w)
+    # counts must reflect samples that actually contribute to `prob` (finite,
+    # positive weight) -- a bin populated only by zero/NaN-weight samples has
+    # true reweighted probability 0 and must NOT read as "occupied" to
+    # consumers like the occupied_bins convergence diagnostic. Reuse `edges`
+    # (not `bins`) so counts stays aligned with prob even if bins was an int.
+    valid=np.isfinite(w)&(w>0)
+    counts,_=np.histogram(cv[valid],bins=edges)
+    prob=np.asarray(prob,float)
     if np.sum(prob)>0: prob/=np.sum(prob)
     with np.errstate(divide='ignore',invalid='ignore'): F=-kbt_kcal*np.log(prob)
     mask=np.isfinite(F)
@@ -3023,6 +3032,7 @@ def _cumulant_expansion(cv,base_w,boost,bins,beta,kbt_kcal,order=2,smooth_logfac
     var=np.full(B,np.nan,dtype=np.float64)
     kappa3=np.full(B,np.nan,dtype=np.float64)
     logfac=np.zeros(B,dtype=np.float64)
+    nz=np.zeros(B,dtype=bool)
     if np.any(good):
         idx=bi[good].astype(np.int64,copy=False)
         w=base_w[good]
@@ -3039,6 +3049,14 @@ def _cumulant_expansion(cv,base_w,boost,bins,beta,kbt_kcal,order=2,smooth_logfac
             sdx3=np.bincount(idx,weights=w*dx*dx*dx,minlength=B).astype(np.float64)
             kappa3[nz]=sdx3[nz]/sw[nz]
             logfac[nz]+=(beta**3/6.0)*kappa3[nz]
+    # A bin with real weighted samples (p0>0) but zero samples with a finite
+    # boost has an UNKNOWN GaMD correction -- flag NaN rather than silently
+    # falling back to logfac=0 (which would look like "no correction needed"
+    # and reproduce the raw/unbiased-looking p0 value for that bin). Bins
+    # with no samples at all (p0==0) keep logfac=0 so p=0*exp(0)=0 there,
+    # matching the existing "no samples" -> F=inf -> excluded-by-isfinite
+    # convention used throughout this file.
+    logfac[(~nz)&(p0>0)]=np.nan
     if smooth_logfac_sigma and float(smooth_logfac_sigma) > 0:
         try:
             from scipy.ndimage import gaussian_filter1d
@@ -3046,7 +3064,7 @@ def _cumulant_expansion(cv,base_w,boost,bins,beta,kbt_kcal,order=2,smooth_logfac
         except Exception:
             pass
     p=p0*np.exp(np.clip(logfac,-700,700))
-    ps=float(np.sum(p))
+    ps=float(np.nansum(p))
     if ps>0: p/=ps
     with np.errstate(divide='ignore',invalid='ignore'):
         F=-kbt_kcal*np.log(p)
@@ -3111,6 +3129,7 @@ def _cumulant_expansion_2d(x,y,base_w,boost,xbins,ybins,beta,kbt_kcal,order=2,sm
     var=np.full((Bx,By),np.nan,dtype=np.float64)
     kappa3=np.full((Bx,By),np.nan,dtype=np.float64)
     logfac=np.zeros((Bx,By),dtype=np.float64)
+    nz=np.zeros((Bx,By),dtype=bool)
     if np.any(good):
         xf=xi[good].astype(np.int64,copy=False)
         yf=yi[good].astype(np.int64,copy=False)
@@ -3130,6 +3149,11 @@ def _cumulant_expansion_2d(x,y,base_w,boost,xbins,ybins,beta,kbt_kcal,order=2,sm
             sdb3=np.bincount(idx,weights=w*db*db*db,minlength=Bx*By).astype(np.float64).reshape(Bx,By)
             kappa3[nz]=sdb3[nz]/sw[nz]
             logfac[nz]+=(beta**3/6.0)*kappa3[nz]
+    # See _cumulant_expansion: a bin with real weighted samples (p0>0) but
+    # zero finite-boost samples gets an unknown (NaN) correction, not a
+    # silent logfac=0 fallback. Genuinely empty bins (p0==0) stay at
+    # logfac=0 -> p=0, unchanged.
+    logfac[(~nz)&(p0>0)]=np.nan
     if smooth_logfac_sigma and float(smooth_logfac_sigma) > 0:
         try:
             from scipy.ndimage import gaussian_filter
@@ -3137,7 +3161,7 @@ def _cumulant_expansion_2d(x,y,base_w,boost,xbins,ybins,beta,kbt_kcal,order=2,sm
         except Exception:
             pass
     p=p0*np.exp(np.clip(logfac,-700,700))
-    ps=float(np.sum(p))
+    ps=float(np.nansum(p))
     if ps>0:
         p/=ps
     with np.errstate(divide='ignore', invalid='ignore'):
@@ -5572,6 +5596,13 @@ def _finalize_acc_1d(acc: dict, d: Data, kbt_kcal: float, smooth_logfac_sigma: f
         # raw-moment identity (same cancellation risk already accepted by var above).
         kappa3[nz]=acc['sx3'][nz]/acc['sw'][nz]-3.0*mean[nz]*(acc['sx2'][nz]/acc['sw'][nz])+2.0*mean[nz]**3
         logfac3[nz]=logfac[nz]+(d.beta**3/6.0)*kappa3[nz]
+    # See _cumulant_expansion: a bin with real (umbrella-weighted) samples but
+    # zero finite-boost samples has an unknown correction -- NaN, not a
+    # silent logfac=0 fallback. Genuinely empty bins (acc['umbrella']==0)
+    # stay at logfac=0 -> cum_prob=0, unchanged.
+    unknown=(~nz)&(acc['umbrella']>0)
+    logfac[unknown]=np.nan
+    logfac3[unknown]=np.nan
     if smooth_logfac_sigma and float(smooth_logfac_sigma) > 0:
         try:
             from scipy.ndimage import gaussian_filter1d
@@ -5637,6 +5668,12 @@ def _finalize_acc_2d(acc: dict, d: Data, kbt_kcal: float, smooth_logfac_sigma: f
         # streaming accumulator: see _finalize_acc_1d note on raw-moment kappa3.
         kappa3[nz]=acc['sx3'][nz]/acc['sw'][nz]-3.0*mean[nz]*(acc['sx2'][nz]/acc['sw'][nz])+2.0*mean[nz]**3
         logfac3[nz]=logfac[nz]+(d.beta**3/6.0)*kappa3[nz]
+    # See _cumulant_expansion / _finalize_acc_1d: a bin with real samples but
+    # zero finite-boost samples gets an unknown (NaN) correction rather than
+    # a silent logfac=0 fallback.
+    unknown=(~nz)&(acc['umbrella']>0)
+    logfac[unknown]=np.nan
+    logfac3[unknown]=np.nan
     if smooth_logfac_sigma and float(smooth_logfac_sigma) > 0:
         try:
             from scipy.ndimage import gaussian_filter
@@ -8536,6 +8573,17 @@ def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.nd
         cum_pmf, cdiag = cumulant2(d.cv, base_w, d.boost_kj, bins, d.beta, kbt_kcal, smooth_logfac_sigma=_eff_smooth(args, 'gamd_smooth_sigma'))
         cum3_pmf, cdiag3 = cumulant3(d.cv, base_w, d.boost_kj, bins, d.beta, kbt_kcal, smooth_logfac_sigma=_eff_smooth(args, 'gamd_smooth_sigma'))
         selected = 'gamd_cumulant2'
+        # A bin can have real samples (counts>0) but zero with a finite GaMD
+        # boost -- e.g. a whole segment/epoch missing gamd_boost_total_kj_mol
+        # dominating that CV bin. _cumulant_expansion flags this NaN rather
+        # than silently reproducing the unbiased value; surface it here since
+        # this is the main choke point with a `warnings` list in scope.
+        nan_bins2 = np.isnan(cdiag['log_reweight_factor']) & (np.asarray(cum_pmf['counts']) > 0)
+        if np.any(nan_bins2):
+            warnings.append(f"{warning_prefix}GaMD cumulant2 correction is undefined (NaN) for {int(np.sum(nan_bins2))} CV bin(s) with samples but no finite boost values; those pmf_gamd_cumulant2 bins are NaN.")
+        nan_bins3 = np.isnan(cdiag3['log_reweight_factor']) & (np.asarray(cum3_pmf['counts']) > 0)
+        if np.any(nan_bins3):
+            warnings.append(f"{warning_prefix}GaMD cumulant3 correction is undefined (NaN) for {int(np.sum(nan_bins3))} CV bin(s) with samples but no finite boost values; those pmf_gamd_cumulant3 bins are NaN.")
         e = ess(exp_w)
         if e / max(1, N) < 0.05:
             warnings.append(f'{warning_prefix}GaMD exponential reweighting ESS is very low: {e:.1f}/{N}')
