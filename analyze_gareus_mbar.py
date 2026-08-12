@@ -3649,6 +3649,49 @@ def overlap_matrix(cv,window,bins,K):
     return np.minimum(H[:,None,:],H[None,:,:]).sum(axis=2)
 
 
+def _window_cv_mean_std(window: np.ndarray, cv: np.ndarray, K: int) -> tuple:
+    """Vectorized per-window sample count / mean / std of a CV array.
+
+    Same bincount-over-linear-index idiom as overlap_matrix above, extracted
+    so window_diagnostics.csv's writer (run_pmf_and_gamd_boost_report) avoids
+    an O(N*K) Python loop that rebuilt a fresh boolean mask (``cv[window ==
+    k]``) once per window.
+
+    Two-pass form (mean first, then mean of squared deviations from that
+    mean) mirrors np.std's own algorithm, unlike a raw-moment
+    ``sum(x**2)/n - mean**2`` formulation, which can lose several digits to
+    cancellation for CV values with a large mean and small within-window
+    spread -- this keeps results numerically equivalent to (though not
+    always bit-identical with) the original per-window np.mean/np.std.
+
+    Returns ``(n_k, mean_per_window, std_per_window)``, each length K:
+    - ``n_k``: per-window sample count (same as
+      ``np.bincount(window, minlength=K)`` restricted to valid window
+      indices in [0, K), matching the original loop's implicit assumption
+      that every ``k`` iterated over ``range(K)`` is itself a valid index).
+    - ``mean_per_window``/``std_per_window``: NaN for any window with zero
+      samples (callers should treat that the same as the original's empty
+      ``cv[window == k]`` slice, i.e. write '' rather than the NaN literal);
+      a window containing any non-finite (e.g. NaN) cv sample also gets a
+      NaN mean/std for that whole window, matching np.mean/np.std's own
+      NaN-propagation behavior on such a slice.
+    """
+    window=np.asarray(window,dtype=np.int64)
+    cv=np.asarray(cv,dtype=np.float64)
+    valid=(window>=0)&(window<K)
+    w_valid=window[valid]
+    cv_valid=cv[valid]
+    n_k=np.bincount(w_valid,minlength=K)
+    has_samples=n_k>0
+    mean=np.full(K,np.nan)
+    sum_per_window=np.bincount(w_valid,weights=cv_valid,minlength=K)
+    mean[has_samples]=sum_per_window[has_samples]/n_k[has_samples]
+    dev_sq=(cv_valid-mean[w_valid])**2
+    sumsq_dev=np.bincount(w_valid,weights=dev_sq,minlength=K)
+    std=np.full(K,np.nan)
+    std[has_samples]=np.sqrt(sumsq_dev[has_samples]/n_k[has_samples])
+    return n_k,mean,std
+
 
 def pmf_probability(pmf: dict) -> np.ndarray:
     prob=np.asarray(pmf.get('prob',[]),dtype=np.float64)
@@ -4419,6 +4462,52 @@ def _convergence_mbar_cache_key(d: Data, args, mask: np.ndarray, checkpoint_step
     )
 
 
+def _get_checkpoint_steps_cache(args) -> dict:
+    """Return the per-run cache for checkpoint_steps_from_data results.
+
+    Mirrors _get_convergence_mbar_cache below it. run_observable_pmf_convergence
+    is called ~20+ times per analyze() run (main CV1, Rg, secondary CV2,
+    per-residue phi/psi, SASA, contact-count family, secondary-structure
+    fractions), and most of those calls share both the same production `d`
+    (only the main CV1 call uses a genuinely different, possibly-masked
+    population) and, for the trajectory-derived observables, the same
+    finite-sample mask: which samples have a real trajectory-derived value is
+    a property of which frames were scanned, not of which per-frame
+    observable is being histogrammed from them (see
+    analyze_extra_observable_pmfs -- phi/psi/SASA/contacts/secondary-structure
+    are all filled from the same per-chunk `sample_idx`). checkpoint_steps_
+    from_data's np.unique(step) is then identical work repeated many times.
+    Keyed on (production dir, population size, a content digest of the
+    finite-sample mask, n_timepoints) -- content-based, like
+    _convergence_mbar_cache_key, not object identity, since callers filter a
+    fresh boolean-indexed copy of `step` on every call, so a naive id()-keyed
+    cache would simply never hit. That key alone isn't a airtight guarantee
+    two different Data populations can never coincide on it (e.g. two
+    same-size masked subsets of the same run), so each cache entry also
+    stores the exact `d.step` array the result was computed from; the call
+    site (run_observable_pmf_convergence) requires `is` identity against it
+    before trusting a hit, making a wrong reuse structurally impossible
+    regardless of key collisions.
+    """
+    cache = getattr(args, '_checkpoint_steps_cache', None)
+    if cache is None:
+        cache = {}
+        try:
+            setattr(args, '_checkpoint_steps_cache', cache)
+        except Exception:
+            return {}
+    return cache
+
+
+def _checkpoint_steps_cache_key(d: Data, finite_global: np.ndarray, n_timepoints: int) -> tuple:
+    return (
+        str(d.prod_dir),
+        int(np.asarray(d.step).shape[0]),
+        _convergence_mask_digest(finite_global),
+        int(n_timepoints),
+    )
+
+
 def write_observable_convergence_report(path: Path, row: dict, conv_rows: list[dict], warnings: list[str], metric_label: str) -> None:
     lines=[f'# {metric_label} PMF convergence report','']
     lines.append(f"Timepoints: **{int(row.get('n_checkpoints',0))}**")
@@ -4481,7 +4570,21 @@ def run_observable_pmf_convergence(
         return {'enabled':False,'metric':metric_name,'reason':'too few finite observable samples','n_finite':int(np.count_nonzero(finite_global))}
     out=out_base/out_dir_name
     out.mkdir(parents=True,exist_ok=True)
-    steps=checkpoint_steps_from_data(d.step[finite_global],int(getattr(args,'convergence_timepoints',10)))
+    _n_timepoints=int(getattr(args,'convergence_timepoints',10))
+    _ckpt_cache=_get_checkpoint_steps_cache(args)
+    _ckpt_cache_key=_checkpoint_steps_cache_key(d,finite_global,_n_timepoints)
+    _ckpt_hit=_ckpt_cache.get(_ckpt_cache_key)
+    # The cache key is content-based (prod_dir/population size/mask digest),
+    # not a guarantee that two Data objects sharing those can't coincide
+    # (e.g. two same-size masked subsets of the same run). Storing d.step
+    # itself alongside the cached result and requiring `is` identity on hit
+    # makes a wrong hit structurally impossible: the cached steps are only
+    # ever reused for the EXACT step array they were computed from.
+    if _ckpt_hit is not None and _ckpt_hit[0] is d.step:
+        steps=_ckpt_hit[1]
+    else:
+        steps=checkpoint_steps_from_data(d.step[finite_global],_n_timepoints)
+        _ckpt_cache[_ckpt_cache_key]=(d.step,steps)
     if steps.size<2:
         return {'enabled':False,'metric':metric_name,'reason':'not enough distinct production steps for convergence testing'}
     ref_prob=pmf_probability(final_pmf)
@@ -8780,7 +8883,8 @@ def _epoch_zero_split_masks(d: 'Data') -> Optional[tuple]:
 def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.ndarray,
                                    kbt_kcal: float, out: Path, warnings: list,
                                    progress: Optional['Progress'], warning_prefix: str = '',
-                                   extra_pmfs: Optional[dict] = None) -> dict:
+                                   extra_pmfs: Optional[dict] = None,
+                                   precomputed_base_w: Optional[np.ndarray] = None) -> dict:
     """Core PMF (4 methods) + GaMD boost diagnostics for one Data.
 
     Extracted from analyze() so the identical formula can run twice against
@@ -8796,10 +8900,30 @@ def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.nd
     losing different fractions of their samples to the split, which
     produces a real direction-consistent tilt in the resulting PMF. When
     ``d`` is the full population, plain ``m['logw']`` is already correct.
+
+    ``precomputed_base_w``: optional escape hatch for the common no-split
+    case, where analyze() has already computed ``norm_logw(m['logw'])`` for
+    the exact same full-population ``logw`` passed in here -- recomputing it
+    is a deterministic no-op that still costs a real logsumexp/exp pass over
+    every sample. Callers must only pass this when ``logw`` is that SAME
+    full-population array (unmodified); for any genuinely different
+    population (e.g. an epoch_000/rest subset with its own renormalized
+    logw), pass ``None`` so it's computed fresh here instead of silently
+    reusing a value for the wrong population. Copied defensively on the way
+    in: analyze() keeps using its own ``base_w`` after this call returns
+    (Rg analysis, ``base_ess`` in pmf_summary.json), so nothing this
+    function or its callees (pmf_from_weights/cumulant2/cumulant3, all
+    read-only on this array today) do to the local name here can ever reach
+    back and corrupt that array -- a guarantee worth the one extra O(N)
+    copy, still far cheaper than the norm_logw() this parameter exists to
+    skip (isfinite mask + logsumexp + exp over every sample).
     """
     K = d.u_nk.shape[1]
     N = len(d.cv)
-    base_w = norm_logw(np.asarray(logw, dtype=np.float64))
+    if precomputed_base_w is not None:
+        base_w = np.array(precomputed_base_w, dtype=np.float64, copy=True)
+    else:
+        base_w = norm_logw(np.asarray(logw, dtype=np.float64))
     umbrella = pmf_from_weights(d.cv, base_w, bins, kbt_kcal)
     bs = boost_stats(d.boost_kj, d.beta)
     boost_ok = bool(bs.get('available')) and np.nanstd(d.boost_kj) > 1e-12
@@ -8856,12 +8980,12 @@ def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.nd
     write_all(out / 'pmf_all_methods.csv', pmfs)
     with (out / 'overlap_matrix.csv').open('w', newline='') as f:
         wr = csv.writer(f); wr.writerow(['window'] + list(range(K))); [wr.writerow([i] + [float(x) for x in O[i]]) for i in range(K)]
-    n_k_local = np.bincount(d.window[(d.window >= 0) & (d.window < K)], minlength=K)
+    n_k_local, _mean_per_window, _std_per_window = _window_cv_mean_std(d.window, d.cv, K)
+    _has_samples = n_k_local > 0
     with (out / 'window_diagnostics.csv').open('w', newline='') as f:
         wr = csv.DictWriter(f, fieldnames=['window', 'center_A', 'k_kcal_mol_A2', 'samples', 'cv_mean_A', 'cv_std_A', 'overlap_left', 'overlap_right']); wr.writeheader()
         for k in range(K):
-            vals = d.cv[d.window == k]
-            wr.writerow({'window': k, 'center_A': float(d.centers[k]) if k < d.centers.size and np.isfinite(d.centers[k]) else '', 'k_kcal_mol_A2': float(d.k_kcal[k]) if k < d.k_kcal.size and np.isfinite(d.k_kcal[k]) else '', 'samples': int(n_k_local[k]), 'cv_mean_A': float(np.mean(vals)) if vals.size else '', 'cv_std_A': float(np.std(vals)) if vals.size else '', 'overlap_left': float(O[k - 1, k]) if k > 0 else '', 'overlap_right': float(O[k, k + 1]) if k + 1 < K else ''})
+            wr.writerow({'window': k, 'center_A': float(d.centers[k]) if k < d.centers.size and np.isfinite(d.centers[k]) else '', 'k_kcal_mol_A2': float(d.k_kcal[k]) if k < d.k_kcal.size and np.isfinite(d.k_kcal[k]) else '', 'samples': int(n_k_local[k]), 'cv_mean_A': float(_mean_per_window[k]) if _has_samples[k] else '', 'cv_std_A': float(_std_per_window[k]) if _has_samples[k] else '', 'overlap_left': float(O[k - 1, k]) if k > 0 else '', 'overlap_right': float(O[k, k + 1]) if k + 1 < K else ''})
     if progress is not None:
         progress.bar('analysis stages', 5, 6, 'plotting PNG outputs', force=True)
     plot_outputs(d, pmfs, selected, O, out, warnings, smooth_sigma=_eff_smooth(args, 'pmf_smooth_sigma'), args=args)
@@ -8918,11 +9042,16 @@ def analyze(d,args, progress: Optional[Progress] = None):
         logw_epoch0=_subset_logw_from_global_fk(d_epoch0,m['f_k'])
         epoch0_report_info=run_pmf_and_gamd_boost_report(d_epoch0,args,logw_epoch0,bins,kbt_kcal,out_epoch0,warn,progress,warning_prefix='[epoch_000 report] ')
         d_main=_masked_data(d,mask_rest); logw_main=_subset_logw_from_global_fk(d_main,m['f_k'])
+        main_precomputed_base_w=None
     else:
         d_main=d; logw_main=logw
+        # No split: logw_main is the exact same full-population array as
+        # m['logw'] used to compute base_w above, so norm_logw(logw_main)
+        # would just recompute an identical value. Thread it through instead.
+        main_precomputed_base_w=base_w
 
     if progress is not None: progress.bar('analysis stages', 3, 6, 'overlap diagnostics', force=True)
-    main_report_info=run_pmf_and_gamd_boost_report(d_main,args,logw_main,bins,kbt_kcal,out,warn,progress)
+    main_report_info=run_pmf_and_gamd_boost_report(d_main,args,logw_main,bins,kbt_kcal,out,warn,progress,precomputed_base_w=main_precomputed_base_w)
     pmfs=main_report_info['pmfs']; selected=main_report_info['selected']; boost_ok=main_report_info['boost_ok']
     bs=main_report_info['boost']; O=main_report_info['O']; neigh=main_report_info['neighbor_overlap']
     span=main_report_info['pmf_span_kcal_mol']; sel=pmfs[selected]
