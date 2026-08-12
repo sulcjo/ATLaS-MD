@@ -951,6 +951,17 @@ def _epoch_dir_index(path: Path) -> Optional[int]:
     return int(match.group(1)) if match else None
 
 
+def _epoch_number_for_run_dir(run_dir: Path) -> Optional[int]:
+    """Literal epoch_NNN number for a run_dir, checking both the flat
+    (epoch_NNN/) and baseline/topup_* sub-run (epoch_NNN/{baseline,topup_*}/)
+    layouts. None for non-numbered dirs (e.g. final/*).
+    """
+    idx = _epoch_dir_index(run_dir)
+    if idx is not None:
+        return idx
+    return _epoch_dir_index(run_dir.parent)
+
+
 def _find_adaptive_epoch_dirs(adaptive_dir: Path, epoch_ids: Optional[set[int]] = None) -> list:
     """Return list of (run_dir, window_map_path) for each epoch/final with Parquet samples."""
     def _parquet_subdir(d: Path, parent_wmap: Path) -> tuple | None:
@@ -6843,7 +6854,8 @@ def _write_dtram_vs_mbar_convergence(d: Data, args, bins: np.ndarray, kbt_kcal: 
 def write_dtram_diagnostic_outputs(d: Data, args, bins: np.ndarray, kbt_kcal: float,
                                    dtram_info: dict, pmfs: dict, selected: str,
                                    out: Path, warnings: list[str], progress: Optional[Progress],
-                                   mbar_result: Optional[dict] = None) -> dict:
+                                   mbar_result: Optional[dict] = None,
+                                   full_dataset_note: str = '') -> dict:
     files={}
     if not isinstance(dtram_info,dict) or not dtram_info.get('available'):
         return files
@@ -6868,7 +6880,7 @@ def write_dtram_diagnostic_outputs(d: Data, args, bins: np.ndarray, kbt_kcal: fl
             if np.any(m):
                 lw=2.6 if name in {selected,method} else 1.1
                 ax.plot(np.asarray(p['cv_A'])[m],F[m],lw=lw,label=name)
-        ax.set_xlabel(_primary_cv_axis_label(d.meta)); ax.set_ylabel('PMF (kcal/mol, shifted)'); ax.set_title('dTRAM PMF comparison')
+        ax.set_xlabel(_primary_cv_axis_label(d.meta)); ax.set_ylabel('PMF (kcal/mol, shifted)'); ax.set_title('dTRAM PMF comparison' + full_dataset_note)
         ax.legend(frameon=False,fontsize=8); ax.grid(True,alpha=0.2)
         path=out/'dtram_pmf_comparison.png'; fig.savefig(path,dpi=200,bbox_inches='tight'); plt.close(fig); files['dtram_pmf_comparison_png']=str(path)
         # Delta vs selected baseline
@@ -6890,14 +6902,14 @@ def write_dtram_diagnostic_outputs(d: Data, args, bins: np.ndarray, kbt_kcal: fl
         T=np.sum(C,axis=0)
         fig,ax=plt.subplots(figsize=(6.5,5.5),constrained_layout=True)
         im=ax.imshow(np.log10(T+1.0),origin='lower',aspect='auto')
-        ax.set_xlabel('to microstate bin'); ax.set_ylabel('from microstate bin'); ax.set_title('dTRAM transition matrix (sum over windows)')
+        ax.set_xlabel('to microstate bin'); ax.set_ylabel('from microstate bin'); ax.set_title('dTRAM transition matrix (sum over windows)' + full_dataset_note)
         fig.colorbar(im,ax=ax,label='log10(count + 1)')
         path=out/'dtram_transition_matrix.png'; fig.savefig(path,dpi=200,bbox_inches='tight'); plt.close(fig); files['dtram_transition_matrix_png']=str(path)
         # Occupancy matrix
         occ=_dtram_window_microstate_counts(d,states,M)
         fig,ax=plt.subplots(figsize=(8,5),constrained_layout=True)
         im=ax.imshow(np.log10(occ+1.0),origin='lower',aspect='auto')
-        ax.set_xlabel('microstate bin'); ax.set_ylabel('window'); ax.set_title('dTRAM occupancy: window x microstate')
+        ax.set_xlabel('microstate bin'); ax.set_ylabel('window'); ax.set_title('dTRAM occupancy: window x microstate' + full_dataset_note)
         fig.colorbar(im,ax=ax,label='log10(samples + 1)')
         path=out/'dtram_occupancy_window_microstate.png'; fig.savefig(path,dpi=200,bbox_inches='tight'); plt.close(fig); files['dtram_occupancy_window_microstate_png']=str(path)
         # Transitions per window
@@ -9678,12 +9690,19 @@ def _epoch_zero_split_masks(d: 'Data') -> Optional[tuple]:
     with only epoch_000 and nothing else to compare it against.
     """
     epoch_src = d.meta.get('_epoch_source')
-    if not epoch_src:
+    run_dirs = d.meta.get('adaptive_epoch_run_dirs')
+    if not epoch_src or not run_dirs:
         return None
     epoch_src = np.asarray(epoch_src, dtype=np.int64)
-    if epoch_src.size != len(d.cv):
+    if epoch_src.size != len(d.cv) or int(epoch_src.max()) >= len(run_dirs):
         return None
-    mask0 = epoch_src == 0
+    epoch_numbers = []
+    for rd in run_dirs:
+        n = _epoch_number_for_run_dir(Path(rd))
+        epoch_numbers.append(-1 if n is None else n)
+    epoch_numbers = np.asarray(epoch_numbers, dtype=np.int64)
+    sample_epoch_numbers = epoch_numbers[epoch_src]
+    mask0 = sample_epoch_numbers == 0
     mask_rest = ~mask0
     if not np.any(mask0) or not np.any(mask_rest):
         return None
@@ -9819,7 +9838,12 @@ def analyze(d,args, progress: Optional[Progress] = None):
     if isinstance(dtram_info,dict) and dtram_info.get('available'):
         write_pmf(out/'pmf_dtram.csv',dtram_info['pmf'],dtram_info.get('method','dtram'))
         dtram_info.setdefault('files',{})['pmf_dtram_csv']=str(out/'pmf_dtram.csv')
-        dtram_plot_files=write_dtram_diagnostic_outputs(d,args,bins,kbt_kcal,dtram_info,pmfs,selected,out,warn,progress,mbar_result=m)
+        if epoch0_split is not None:
+            dtram_full_dataset_note=' [full dataset incl. epoch_000]'
+            warn.append('[dtram] dtram_pmf_comparison.png / occupancy / transition-matrix panels are computed from the full dataset (including epoch_000); the rest of this report (pmfs, window_diagnostics.csv) excludes epoch_000 -- see epoch_000_report.')
+        else:
+            dtram_full_dataset_note=''
+        dtram_plot_files=write_dtram_diagnostic_outputs(d,args,bins,kbt_kcal,dtram_info,pmfs,selected,out,warn,progress,mbar_result=m,full_dataset_note=dtram_full_dataset_note)
         if dtram_plot_files:
             dtram_info.setdefault('files',{}).update(dtram_plot_files)
         dtram_info.setdefault('files',{})['dtram_summary_json']=str(out/'dtram_summary.json')

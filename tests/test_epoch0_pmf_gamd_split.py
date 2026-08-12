@@ -29,6 +29,7 @@ pytest.importorskip("analyze_gareus_mbar")
 
 from analyze_gareus_mbar import (
     Data,
+    _epoch_number_for_run_dir,
     _epoch_zero_split_masks,
     _masked_data,
     parse_args,
@@ -42,10 +43,13 @@ def _test_args():
     return args
 
 
-def _data_with_epoch_source(epoch_src, n=None, cv=None, boost=None):
+def _data_with_epoch_source(epoch_src, n=None, cv=None, boost=None, run_dirs=None):
     n = n or len(epoch_src)
     cv = np.zeros(n) if cv is None else np.asarray(cv, dtype=np.float64)
     boost = np.zeros(n) if boost is None else np.asarray(boost, dtype=np.float64)
+    meta = {"_epoch_source": list(epoch_src)}
+    if run_dirs is not None:
+        meta["adaptive_epoch_run_dirs"] = list(run_dirs)
     return Data(
         prod_dir=Path("."), out_dir=Path("."),
         cv=cv, cv2=np.full(n, np.nan), rg_A=np.full(n, np.nan),
@@ -53,7 +57,7 @@ def _data_with_epoch_source(epoch_src, n=None, cv=None, boost=None):
         step=np.arange(n, dtype=np.int64), u_nk=np.zeros((n, 1)),
         centers=np.zeros(1), k_kcal=np.zeros(1), beta=0.4, temp=300.0,
         boost_kj=boost, potential_kj=None, source="test",
-        meta={"_epoch_source": list(epoch_src)},
+        meta=meta,
     )
 
 
@@ -71,16 +75,72 @@ def test_none_when_no_epoch_source_metadata():
 
 
 def test_splits_epoch_zero_from_everything_else():
-    d = _data_with_epoch_source([0, 0, 1, 1, 2, 2])
+    # Positions 0, 1, 2 map to literal epoch_000, epoch_001, epoch_002 --
+    # positional order matches literal epoch number here, so the split
+    # behaves the same as before the literal-epoch-number fix.
+    d = _data_with_epoch_source(
+        [0, 0, 1, 1, 2, 2],
+        run_dirs=["/x/epoch_000", "/x/epoch_001", "/x/epoch_002"],
+    )
     mask0, mask_rest = _epoch_zero_split_masks(d)
     np.testing.assert_array_equal(mask0, [True, True, False, False, False, False])
     np.testing.assert_array_equal(mask_rest, [False, False, True, True, True, True])
 
 
 def test_none_when_metadata_size_mismatches_samples():
-    d = _data_with_epoch_source([0, 1])
-    d.meta = {"_epoch_source": [0, 1, 2]}  # deliberately wrong length
+    d = _data_with_epoch_source([0, 1], run_dirs=["/x/epoch_000", "/x/epoch_001"])
+    # deliberately wrong length vs len(d.cv) == 2
+    d.meta = {
+        "_epoch_source": [0, 1, 2],
+        "adaptive_epoch_run_dirs": ["/x/epoch_000", "/x/epoch_001", "/x/epoch_002"],
+    }
     assert _epoch_zero_split_masks(d) is None
+
+
+def test_none_when_run_dirs_metadata_missing():
+    """Even with valid _epoch_source, a missing adaptive_epoch_run_dirs means
+    literal epoch numbers can't be resolved -- must not fall back to treating
+    positions as literal epoch numbers.
+    """
+    d = _data_with_epoch_source([0, 0, 1, 1])
+    assert _epoch_zero_split_masks(d) is None
+
+
+# --- Fix A regression: literal epoch number, not load position ---------------
+
+def test_none_when_position_zero_is_not_literal_epoch_zero():
+    """--epoch 1 --epoch 2 loads epoch_001 as position 0 and epoch_002 as
+    position 1. _epoch_source positions are [0, 0, 1, 1] (positional), but
+    neither run_dir is literal epoch_000 -- there is no real epoch_000 data
+    here at all, so the split must not fire.
+    """
+    d = _data_with_epoch_source(
+        [0, 0, 1, 1],
+        run_dirs=["/x/epoch_001/baseline", "/x/epoch_002/baseline"],
+    )
+    assert _epoch_zero_split_masks(d) is None
+
+
+def test_splits_by_literal_epoch_number_when_position_zero_is_real_epoch_zero():
+    """Original correct-detection case: position 0 maps to a literal
+    epoch_000 run_dir, position 1+ to epoch_001/final -- split still fires
+    and masks reflect literal epoch_000 membership.
+    """
+    d = _data_with_epoch_source(
+        [0, 0, 1, 1, 1],
+        run_dirs=["/x/epoch_000", "/x/epoch_001/baseline", "/x/final/baseline"],
+    )
+    mask0, mask_rest = _epoch_zero_split_masks(d)
+    np.testing.assert_array_equal(mask0, [True, True, False, False, False])
+    np.testing.assert_array_equal(mask_rest, [False, False, True, True, True])
+
+
+def test_epoch_number_for_run_dir():
+    assert _epoch_number_for_run_dir(Path("/x/epoch_003")) == 3
+    assert _epoch_number_for_run_dir(Path("/x/epoch_003/baseline")) == 3
+    assert _epoch_number_for_run_dir(Path("/x/epoch_003/topup_001_5000")) == 3
+    assert _epoch_number_for_run_dir(Path("/x/final")) is None
+    assert _epoch_number_for_run_dir(Path("/x/final/baseline")) is None
 
 
 # --- _masked_data reuse (sanity: already covered by test_secondary_cv_regime_split.py) ---
@@ -163,7 +223,10 @@ def test_epoch0_and_main_reports_are_independent_and_not_blended(tmp_path):
     boost = np.concatenate([boost0, boost_rest])
 
     d = _full_data(cv, boost)
-    d.meta = {"_epoch_source": epoch_src}
+    d.meta = {
+        "_epoch_source": epoch_src,
+        "adaptive_epoch_run_dirs": ["/x/epoch_000", "/x/epoch_001/baseline"],
+    }
     logw = np.zeros(n0 + n_rest)
     bins = np.linspace(-4, 4, 21)
 
