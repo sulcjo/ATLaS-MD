@@ -1382,7 +1382,7 @@ def _parse_epoch_window_map_native_params(rows: list) -> dict:
             'primary_center': _f(r, 'primary_center', float('nan')),
             'primary_k': _f(r, 'primary_k', float('nan')),
             'secondary_center': _f(r, 'secondary_center', float('nan')),
-            'secondary_k': _f(r, 'secondary_k', 0.0),
+            'secondary_k': _f(r, 'secondary_k', float('nan')),
         }
     return out
 
@@ -1609,6 +1609,7 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
             print(f'    [burnin filter] dropped {n_dropped}/{len(cv)} samples ({100*n_dropped/len(cv):.1f}%) from pre-equilibration steps')
         cv = cv[keep]; cv2 = cv2[keep]; window = window[keep]
         step = step[keep]; replica = replica[keep]; boost = boost[keep]
+        boost_dih = boost_dih[keep]
         epoch_src = epoch_src[keep]
         pot_arr = pot_arr[keep]
         potential = pot_arr if np.any(np.isfinite(pot_arr)) else None
