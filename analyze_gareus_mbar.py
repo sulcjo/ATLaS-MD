@@ -1275,8 +1275,12 @@ def _compute_u_nk_analytical(cv1: np.ndarray, cv2: np.ndarray,
     u = np.empty((cv1.size, K), dtype=np.float64)
     for k, w in enumerate(union_windows):
         dc1 = cv1 - w['primary_center']
-        dc2 = cv2 - w['secondary_cv_center']
-        bias_kcal = 0.5 * w['primary_k_kcal'] * dc1 ** 2 + 0.5 * w['secondary_k_kcal'] * dc2 ** 2
+        sec_c = w['secondary_cv_center']
+        sec_k = w['secondary_k_kcal']
+        bias_kcal = 0.5 * w['primary_k_kcal'] * dc1 ** 2
+        if math.isfinite(sec_c) and math.isfinite(sec_k) and sec_k > 0:
+            dc2 = cv2 - sec_c
+            bias_kcal = bias_kcal + 0.5 * sec_k * dc2 ** 2
         u[:, k] = scale * bias_kcal
     return u
 
@@ -1463,10 +1467,10 @@ def _reconstruct_union_bias_block(cv: np.ndarray, cv2: np.ndarray, beta: float,
     u = np.zeros((n, k_count), dtype=np.float64)
     for k in range(k_count):
         d1 = cv - primary_centers[k]
-        u[:, k] = beta * 4.184 * 0.5 * primary_ks[k] * d1 * d1
+        u[:, k] = beta * KJ_PER_KCAL * 0.5 * primary_ks[k] * d1 * d1
         if math.isfinite(sec_centers[k]) and sec_ks[k] > 0:
-            d2 = np.where(np.isfinite(cv2), cv2 - sec_centers[k], 0.0)
-            u[:, k] += beta * 4.184 * 0.5 * sec_ks[k] * d2 * d2
+            d2 = cv2 - sec_centers[k]
+            u[:, k] += beta * KJ_PER_KCAL * 0.5 * sec_ks[k] * d2 * d2
     return u
 
 
