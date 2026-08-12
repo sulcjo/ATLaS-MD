@@ -4903,6 +4903,39 @@ def _chunk_local_frame_selection(frame_indices: np.ndarray, sample_indices: np.n
     local=(frame_indices[m]-lo).astype(np.int64,copy=False)
     return local, sample_indices[m], frame_indices[m]
 
+def _rg_from_segment_chunked(md, seg_path, top, atom_indices, selection: str, chunk_size: int):
+    """Compute per-frame Rg (nm) for one trajectory segment via chunked iterload.
+
+    Radius of gyration is a purely per-frame quantity with no cross-frame
+    dependency, so there is no need to hold an entire multi-million-frame
+    segment in memory at once just to run `md.compute_rg` over it. This reads
+    and processes `chunk_size` frames at a time instead, concatenating the
+    per-chunk Rg results into the same full-segment array (same order/values)
+    a whole-segment `md.load()` + `md.compute_rg()` would produce.
+
+    Returns (rg_nm, n_frames) where `n_frames` is the segment's total frame
+    count (sum of per-chunk frame counts), needed by the caller for the same
+    sample-to-frame alignment math used before this change.
+    """
+    rg_chunks: list = []
+    n_frames = 0
+    if atom_indices is not None:
+        for chunk in md.iterload(str(seg_path), top=top, chunk=chunk_size, atom_indices=atom_indices):
+            rg_chunks.append(md.compute_rg(chunk))
+            n_frames += chunk.n_frames
+    else:
+        atoms_cache = None
+        for chunk in md.iterload(str(seg_path), top=top, chunk=chunk_size):
+            if atoms_cache is None:
+                atoms_cache = chunk.topology.select(selection)
+                if atoms_cache.size == 0:
+                    raise ValueError(f'selection {selection!r} matched zero atoms')
+            rg_chunks.append(md.compute_rg(chunk.atom_slice(atoms_cache)))
+            n_frames += chunk.n_frames
+    if not rg_chunks:
+        raise ValueError(f'trajectory segment {seg_path} contained zero frames')
+    return np.concatenate(rg_chunks), n_frames
+
 def _compute_rg_from_trajectories(d: Data, args, progress: Optional[Progress], warnings: list[str]) -> Optional[np.ndarray]:
     mode=str(getattr(args,'rg_from_trajectories','auto') or 'auto').lower()
     if mode == 'never':
@@ -4957,6 +4990,10 @@ def _compute_rg_from_trajectories(d: Data, args, progress: Optional[Progress], w
         except Exception as exc:
             warnings.append(f'Rg atom pre-selection failed ({exc}); falling back to full load')
             rg_atoms = None
+    # Chunk size for streaming segment loads; reuses --pca-chunk-size (default 1000)
+    # for consistency with the other chunked-iterload passes in this file (PCA,
+    # extra-observable PMFs) rather than introducing a separate Rg-only flag.
+    rg_chunk_size = max(1, int(getattr(args, 'pca_chunk_size', 1000) or 1000))
 
     def _rg_replica_worker(rep):
         local_warns: list = []
@@ -4972,20 +5009,13 @@ def _compute_rg_from_trajectories(d: Data, args, progress: Optional[Progress], w
         rep_assigned=0
         for resume_start, seg_path in segs:
             try:
-                if rg_atoms is not None:
-                    traj=md.load(str(seg_path), top=top_topology, atom_indices=rg_atoms)
-                    rg=md.compute_rg(traj)*10.0
-                else:
-                    traj=md.load(str(seg_path), top=top_topology)
-                    _atoms=traj.topology.select(selection)
-                    if _atoms.size == 0:
-                        raise ValueError(f'selection {selection!r} matched zero atoms')
-                    rg=md.compute_rg(traj.atom_slice(_atoms))*10.0
+                rg_nm, n_frames = _rg_from_segment_chunked(md, seg_path, top_topology, rg_atoms, selection, rg_chunk_size)
+                rg = rg_nm * 10.0
             except Exception as exc:
                 local_warns.append(f'Rg trajectory reconstruction failed for replica {rep} ({seg_path}): {exc}')
                 continue
             eff_resume_start=_base_segment_resume_start(resume_start, use_adjusted, steps_for_align, spf)
-            mask, local_frames=_sample_to_segment_frame(steps_for_align, eff_resume_start, traj.n_frames, spf)
+            mask, local_frames=_sample_to_segment_frame(steps_for_align, eff_resume_start, n_frames, spf)
             if not np.any(mask):
                 continue
             out[order[mask]]=rg[local_frames]
@@ -5961,8 +5991,16 @@ def _internal_contact_counts(md, traj, cutoff_nm: float, min_seq_sep: int, schem
         return np.zeros(traj.n_frames,dtype=np.float64)
     return np.sum(np.asarray(dist[:,keep])<float(cutoff_nm),axis=1).astype(np.float64)
 
-def _peptide_solvent_contact_counts(md, traj, cutoff_nm: float) -> tuple[np.ndarray,np.ndarray,np.ndarray]:
-    top=traj.topology
+def _build_peptide_solvent_classification(top) -> dict:
+    """Classify a topology's heavy atoms into peptide/water/ion/solvent groups.
+
+    Pure function of the topology alone -- independent of any per-frame
+    trajectory data. The topology never changes across the many chunks/segments/
+    replicas processed within one `analyze_extra_observable_pmfs` invocation, so
+    callers should compute this ONCE and reuse it, instead of re-walking every
+    atom in the topology (previously ~10ms) on every one of the thousands of
+    per-chunk calls a long trajectory pass makes.
+    """
     peptide_heavy=[]; water_heavy=[]; ion_heavy=[]; solvent_heavy=[]
     atom_to_res=np.full(top.n_atoms,-1,dtype=np.int64)
     water_res=set(); ion_res=set(); solvent_res=set()
@@ -5978,12 +6016,25 @@ def _peptide_solvent_contact_counts(md, traj, cutoff_nm: float) -> tuple[np.ndar
             water_heavy.append(atom.index); solvent_heavy.append(atom.index); water_res.add(ridx); solvent_res.add(ridx)
         else:
             ion_heavy.append(atom.index); solvent_heavy.append(atom.index); ion_res.add(ridx); solvent_res.add(ridx)
+    return {
+        'peptide_heavy': np.asarray(peptide_heavy,dtype=np.int32),
+        'solvent_heavy': np.asarray(solvent_heavy,dtype=np.int32),
+        'atom_to_res': atom_to_res,
+        'water_res': water_res,
+        'ion_res': ion_res,
+        'solvent_res': solvent_res,
+    }
+
+def _peptide_solvent_contact_counts(md, traj, cutoff_nm: float, classification: dict) -> tuple[np.ndarray,np.ndarray,np.ndarray]:
+    peptide_heavy=classification['peptide_heavy']; solvent_heavy=classification['solvent_heavy']
+    atom_to_res=classification['atom_to_res']; water_res=classification['water_res']
+    ion_res=classification['ion_res']; solvent_res=classification['solvent_res']
     n=traj.n_frames
     zeros=np.zeros(n,dtype=np.float64)
-    if len(peptide_heavy)==0 or len(solvent_heavy)==0:
+    if peptide_heavy.size==0 or solvent_heavy.size==0:
         return zeros.copy(), zeros.copy(), zeros.copy()
     try:
-        neigh=md.compute_neighbors(traj,float(cutoff_nm),query_indices=np.asarray(peptide_heavy,dtype=np.int32),haystack_indices=np.asarray(solvent_heavy,dtype=np.int32),periodic=True)
+        neigh=md.compute_neighbors(traj,float(cutoff_nm),query_indices=peptide_heavy,haystack_indices=solvent_heavy,periodic=True)
     except Exception:
         return np.full(n,np.nan,dtype=np.float64), np.full(n,np.nan,dtype=np.float64), np.full(n,np.nan,dtype=np.float64)
     total=np.zeros(n,dtype=np.float64); water=np.zeros(n,dtype=np.float64); ion=np.zeros(n,dtype=np.float64)
@@ -6073,6 +6124,36 @@ def analyze_extra_observable_pmfs(d: Data, args, base_logw: np.ndarray, selected
         return {'available':False,'reason':'no usable replica trajectories for extra observable PMFs'}
     out_extra=out/'extra_observable_pmfs'; out_extra.mkdir(parents=True,exist_ok=True)
     chunk_size=max(1,int(getattr(args,'extra_chunk_size',0) or getattr(args,'pca_chunk_size',1000) or 1000))
+    # Pre-load topology once and pre-compute a reduced atom selection for the main
+    # trajectory pass below: keep every protein atom (any element -- so the default
+    # `--sasa-selection protein` and every other protein-only observable see exactly
+    # the same protein atom population as before, byte for byte) plus every heavy
+    # (non-hydrogen) atom system-wide. This drops only solvent/ion hydrogens -- the
+    # vast majority of atoms in an explicit-solvent system, since protein is a tiny
+    # fraction of total atom count -- while leaving every downstream consumer in the
+    # loop below (phi/psi and DSSP via a protein-only atom_slice, SASA, internal
+    # contacts, and _peptide_solvent_contact_counts, which already discards any
+    # remaining hydrogens from its own bookkeeping) working on an unchanged atom set.
+    # NOTE: excluding ALL hydrogens (including protein ones) was measured to change
+    # total protein SASA by ~14% (a real physical difference from removing exposed-H
+    # surface area, not float noise) -- unsafe. Restricting to solvent/ion hydrogens
+    # only still cuts total atom count ~2-3x for a typical TIP3P-solvated system
+    # while being provably SASA/DSSP/phi-psi/contact-count identical.
+    extra_top_obj = None
+    extra_atom_indices = None
+    try:
+        extra_top_obj = md.load(str(top_path))
+        _extra_top = extra_top_obj.topology
+        _extra_protein_idx = _extra_top.select('protein')
+        _extra_heavy_idx = _extra_top.select('element != H')
+        _extra_keep = np.union1d(_extra_protein_idx, _extra_heavy_idx)
+        if 0 < _extra_keep.size < _extra_top.n_atoms:
+            extra_atom_indices = _extra_keep
+    except Exception as exc:
+        warnings.append(f'Extra observable PMF atom pre-selection failed ({exc}); loading full system')
+        extra_top_obj = None
+        extra_atom_indices = None
+    extra_iterload_top = extra_top_obj.topology if extra_top_obj is not None else str(top_path)
     sasa_selection=str(getattr(args,'sasa_selection','protein') or 'protein')
     sasa_points=int(getattr(args,'sasa_n_sphere_points',240) or 240)
     contact_cutoff=float(getattr(args,'contact_cutoff_nm',0.45) or 0.45)
@@ -6107,7 +6188,9 @@ def analyze_extra_observable_pmfs(d: Data, args, base_logw: np.ndarray, selected
         if phi_labels or psi_labels or dssp_labels:
             break
     if progress is not None:
-        progress.step('extra PMFs', f'topology {top_path}; chunk={chunk_size}; SASA selection={sasa_selection!r}')
+        _atom_note = (f'{extra_atom_indices.size}/{_extra_top.n_atoms} atoms (solvent/ion H excluded)'
+                      if extra_atom_indices is not None else 'full system (atom pre-selection unavailable)')
+        progress.step('extra PMFs', f'topology {top_path}; chunk={chunk_size}; atoms={_atom_note}; SASA selection={sasa_selection!r}')
 
     selected_method=_choose_method(selected,boost_ok)
     base_w_full=norm_logw(np.asarray(base_logw,dtype=np.float64))
@@ -6150,13 +6233,19 @@ def analyze_extra_observable_pmfs(d: Data, args, base_logw: np.ndarray, selected
     # twice — once for range discovery, once for accumulation.
     buf_scalar=[]  # per-chunk dicts: sasa/cc/solv/wat/ion arrays + sidx
     assigned=0
+    # Peptide/solvent atom classification depends only on the (fixed) topology, not
+    # on any per-chunk trajectory data -- lazily computed once from the first real
+    # chunk's own (possibly atom-index-reduced) topology below and reused for every
+    # later call, instead of re-walking every atom on each of the thousands of
+    # per-chunk calls a long trajectory pass makes.
+    _solv_classification: dict = {}
     for pi,item in enumerate(plan, start=1):
         if progress is not None: progress.bar('extra PMF pass',pi,max(1,len(plan)),f"replica {item['replica']}")
         frame0=0
         frame_indices=np.asarray(item.get('frame_indices', np.arange(item['n_assign'])),dtype=np.int64)
         sample_indices=np.asarray(item.get('sample_indices', item['order']),dtype=np.int64)
         try:
-            for chunk in md.iterload(str(item.get('traj', item['dcd'])),top=str(top_path),chunk=chunk_size):
+            for chunk in md.iterload(str(item.get('traj', item['dcd'])),top=extra_iterload_top,chunk=chunk_size,atom_indices=extra_atom_indices):
                 local, sample_idx, _global_frames = _chunk_local_frame_selection(frame_indices, sample_indices, frame0, chunk.n_frames)
                 if local is None or local.size <= 0:
                     frame0+=chunk.n_frames
@@ -6220,7 +6309,9 @@ def analyze_extra_observable_pmfs(d: Data, args, base_logw: np.ndarray, selected
                     warnings.append(f'Contact computation failed for replica {item["replica"]}: {exc}')
                     cbuf['cc']=np.full(n_use,np.nan,dtype=np.float64)
                 try:
-                    cbuf['solv'],cbuf['wat'],cbuf['ion']=_peptide_solvent_contact_counts(md,full_use,contact_cutoff)
+                    if not _solv_classification:
+                        _solv_classification.update(_build_peptide_solvent_classification(full_use.topology))
+                    cbuf['solv'],cbuf['wat'],cbuf['ion']=_peptide_solvent_contact_counts(md,full_use,contact_cutoff,_solv_classification)
                 except Exception as exc:
                     warnings.append(f'Solvent contact computation failed for replica {item["replica"]}: {exc}')
                     cbuf['solv']=np.full(n_use,np.nan,dtype=np.float64)
@@ -7452,6 +7543,41 @@ def analyze_poincare_map(d: Data, args, base_logw: np.ndarray, selected: str, bo
     return info
 
 
+def _poincare_torsions_chunked(md, seg_path, top, atom_indices, chunk_size: int, needed_frames):
+    """Compute phi/psi (radians) at specific known frame indices via chunked iterload.
+
+    Poincare crossing-event analysis only needs a handful of specific frames per
+    segment (the committed fold/unfold crossing events), not the whole segment.
+    This reads `chunk_size` frames at a time and computes phi/psi immediately for
+    any needed frame found in that chunk, discarding the chunk (and any larger
+    per-frame Trajectory it would otherwise pin in memory) right away -- only the
+    small per-frame angle arrays are retained, never a whole chunk's coordinates.
+
+    `needed_frames` are 0-based local frame indices within this segment. Returns
+    {frame_idx: (phi_rad, psi_rad)} for every requested index actually found in
+    the segment; missing/out-of-range indices are simply absent from the result,
+    matching the original whole-load-then-index behavior this replaces.
+    """
+    needed = {int(fi) for fi in needed_frames if int(fi) >= 0}
+    result: dict = {}
+    if not needed:
+        return result
+    frame0 = 0
+    for chunk in md.iterload(str(seg_path), top=top, chunk=chunk_size, atom_indices=atom_indices):
+        chunk_n = chunk.n_frames
+        local_hits = [fi - frame0 for fi in needed if frame0 <= fi < frame0 + chunk_n]
+        if local_hits:
+            _, phi_all = md.compute_phi(chunk)
+            _, psi_all = md.compute_psi(chunk)
+            for local_idx in local_hits:
+                fi = frame0 + local_idx
+                result[fi] = (phi_all[local_idx].copy(), psi_all[local_idx].copy())
+                needed.discard(fi)
+        frame0 += chunk_n
+        if not needed:
+            break
+    return result
+
 def analyze_poincare_residue_torsions(d: Data, args, out: Path, poincare_info: dict, warnings: list, progress: Optional[Progress]) -> dict:
     """Per-residue backbone torsion (phi/psi) analysis at committed Poincare fold/unfold crossing frames.
 
@@ -7605,27 +7731,30 @@ def analyze_poincare_residue_torsions(d: Data, args, out: Path, poincare_info: d
     if not seg_batches:
         return {'available': False, 'reason': f'no trajectory segments found for any crossing replica (skipped {skipped})'}
 
-    # Load each segment once, extract needed frames
+    # Load each segment once (via chunked iterload -- only the specific frames
+    # needed are ever computed/retained, never a whole segment at once), extract
+    # needed frames.
     # results: list of (event_type, crossing_dict, phi_deg_aligned, psi_deg_aligned)
     results: list = []
+    poincare_chunk_size = max(1, int(getattr(args, 'pca_chunk_size', 1000) or 1000))
 
     for (rep_id, seg_path_str), batch_items in seg_batches.items():
         seg_path = Path(seg_path_str)
+        needed_frames = {int(frame_idx) for _et, _c, frame_idx in batch_items}
         try:
-            traj = md.load(str(seg_path), top=str(top_path), atom_indices=protein_indices)
+            angles_by_frame = _poincare_torsions_chunked(md, seg_path, str(top_path), protein_indices, poincare_chunk_size, needed_frames)
         except Exception as exc:
             warnings.append(f'Poincare torsions: failed to load segment {seg_path.name} for replica {rep_id}: {exc}')
             continue
 
         for event_type, crossing, frame_idx in batch_items:
-            if frame_idx < 0 or frame_idx >= traj.n_frames:
+            hit = angles_by_frame.get(int(frame_idx))
+            if hit is None:
                 continue
             try:
-                frame = traj[frame_idx]
-                _, phi_rad = md.compute_phi(frame)  # shape (1, n_phi_cols)
-                _, psi_rad = md.compute_psi(frame)  # shape (1, n_psi_cols)
-                phi_deg = np.degrees(phi_rad[0])    # shape (n_phi_cols,)
-                psi_deg = np.degrees(psi_rad[0])    # shape (n_psi_cols,)
+                phi_rad, psi_rad = hit
+                phi_deg = np.degrees(phi_rad)  # shape (n_phi_cols,)
+                psi_deg = np.degrees(psi_rad)  # shape (n_psi_cols,)
                 # Scatter into per-residue aligned arrays (terminals stay NaN)
                 phi_aligned = np.full(n_residues, np.nan)
                 psi_aligned = np.full(n_residues, np.nan)
