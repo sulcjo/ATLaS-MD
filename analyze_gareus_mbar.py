@@ -1715,6 +1715,9 @@ def _get_adaptive_epoch_traj_dirs(d: Data) -> list:
 _MERGED_TRAJ_RESUME_RE = re.compile(r'^(.*)_resume_from_(\d+)$')
 
 
+_MERGED_TRAJ_DIR_CACHE: dict = {}
+
+
 def _prepare_adaptive_merged_traj_dir(d: Data, args=None) -> Optional[Path]:
     """Create/update a merged replica_trajectories/ in adaptive_production/ using symlinks.
 
@@ -1744,19 +1747,30 @@ def _prepare_adaptive_merged_traj_dir(d: Data, args=None) -> Optional[Path]:
     filename, 0 for a phase's true base file) folded into the same
     global-offset scheme, so every segment gets a distinct name.
 
-    Rebuilds from scratch each call (removes any previous merged dir first)
-    so a stale run from before this fix -- or from a run whose phase list
-    changed -- can never leave incorrect leftover links in place.
+    Memoized per-process by ``d.prod_dir`` (this function is called from
+    several independent analysis functions within a single ``analyze()``
+    run, all against the same prod_dir -- only the first call actually
+    rebuilds; later calls reuse the cached result). Rebuilds are done into a
+    fresh temp directory and atomically swapped into place via ``os.replace``
+    rather than ``shutil.rmtree``-then-repopulate-in-place, so a concurrent
+    reader (e.g. a second ``analyze_gareus_mbar.py`` process analyzing a
+    different ``--epoch`` subset of the same run) never observes a
+    partially-built directory.
     """
     epoch_traj = _get_adaptive_epoch_traj_dirs(d)
     if not epoch_traj:
         return None
     merged = d.prod_dir / '_merged_replica_trajectories'
-    if merged.exists():
-        shutil.rmtree(merged)
-    merged.mkdir(exist_ok=True)
+    cache_key = str(merged)
+    if cache_key in _MERGED_TRAJ_DIR_CACHE:
+        return _MERGED_TRAJ_DIR_CACHE[cache_key]
+
     STEP_STRIDE = _MERGED_TRAJ_STEP_STRIDE
     TRAJ_EXTS = {'.xtc', '.dcd', '.nc', '.trr'}
+    building = d.prod_dir / f'_merged_replica_trajectories.building-{os.getpid()}'
+    if building.exists():
+        shutil.rmtree(building)
+    building.mkdir(parents=True)
     for epoch_idx, traj_dir in epoch_traj:
         for f in sorted(traj_dir.iterdir()):
             if f.suffix not in TRAJ_EXTS:
@@ -1767,14 +1781,28 @@ def _prepare_adaptive_merged_traj_dir(d: Data, args=None) -> Optional[Path]:
             m = _MERGED_TRAJ_RESUME_RE.match(stem)
             base_stem, local_resume = (m.group(1), int(m.group(2))) if m else (stem, 0)
             global_resume = epoch_idx * STEP_STRIDE + local_resume
-            link = (merged / f'{base_stem}{f.suffix}' if global_resume == 0
-                    else merged / f'{base_stem}_resume_from_{global_resume}{f.suffix}')
+            link = (building / f'{base_stem}{f.suffix}' if global_resume == 0
+                    else building / f'{base_stem}_resume_from_{global_resume}{f.suffix}')
             if not link.exists():
                 try:
                     link.symlink_to(f.resolve())
                 except Exception:
                     pass
-    return merged if any(merged.iterdir()) else None
+
+    if not any(building.iterdir()):
+        shutil.rmtree(building, ignore_errors=True)
+        _MERGED_TRAJ_DIR_CACHE[cache_key] = None
+        return None
+
+    stale = d.prod_dir / f'_merged_replica_trajectories.stale-{os.getpid()}'
+    if merged.exists():
+        os.replace(merged, stale)
+    os.replace(building, merged)
+    if stale.exists():
+        shutil.rmtree(stale, ignore_errors=True)
+
+    _MERGED_TRAJ_DIR_CACHE[cache_key] = merged
+    return merged
 
 
 def run_epoch_pmf_convergence(d: Data, args, bins: np.ndarray, selected: str,
