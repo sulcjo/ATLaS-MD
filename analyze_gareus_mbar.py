@@ -5850,6 +5850,23 @@ def _peptide_solvent_contact_counts(md, traj, cutoff_nm: float) -> tuple[np.ndar
         ion[i]=float(len(residues & ion_res))
     return total, water, ion
 
+def _dssp_valid_counts(arr, axis):
+    """Count DSSP H/E/coil occurrences and valid (non-'NA') entries along `axis`.
+
+    mdtraj's `compute_dssp` assigns 'NA' to any topology "residue" lacking a
+    full CA/N/C/O backbone quad -- notably capping groups like ACE/NME, which
+    this pipeline explicitly supports. 'NA' entries must be excluded from both
+    the coil/other count and the denominator used to turn counts into
+    fractions/probabilities, otherwise capped termini are silently counted as
+    coil and bias helix/strand fractions low.
+    """
+    valid=(arr != 'NA')
+    n_h=np.sum(arr == 'H', axis=axis)
+    n_e=np.sum(arr == 'E', axis=axis)
+    n_coil=np.sum((arr != 'H') & (arr != 'E') & valid, axis=axis)
+    n_valid=np.sum(valid, axis=axis)
+    return n_h, n_e, n_coil, n_valid
+
 def _dssp_fraction_arrays(md, traj):
     try:
         ss=md.compute_dssp(traj,simplified=True)
@@ -5858,10 +5875,31 @@ def _dssp_fraction_arrays(md, traj):
     arr=np.asarray(ss)
     if arr.ndim != 2 or arr.shape[1] == 0:
         return None
-    helix=np.mean(arr=='H',axis=1).astype(np.float64)
-    strand=np.mean(arr=='E',axis=1).astype(np.float64)
-    coil=np.mean((arr!='H')&(arr!='E'),axis=1).astype(np.float64)
+    n_h,n_e,n_coil,n_valid=_dssp_valid_counts(arr,axis=1)
+    denom=np.maximum(n_valid,1)
+    helix=(n_h/denom).astype(np.float64)
+    strand=(n_e/denom).astype(np.float64)
+    coil=(n_coil/denom).astype(np.float64)
     return arr,helix,strand,coil
+
+def _dssp_residue_probability_rows(dssp_labels, dssp_counts, dssp_valid_counts, dssp_total):
+    """Build per-residue secondary-structure probability rows.
+
+    `dssp_valid_counts[i]` is the number of frames where residue index `i` was
+    not mdtraj's 'NA' code (see `_dssp_valid_counts`). A residue index that is
+    'NA' in every frame -- a capped terminus (ACE/NME) or other non-protein
+    "residue" -- has no real secondary structure to report; it's excluded
+    entirely rather than emitted as a spurious 0/0 probability. Real residues
+    use their own valid-frame count as the denominator instead of the total
+    frame count, so an occasional NA frame (if any) doesn't dilute them either.
+    """
+    rows=[]
+    for i,lab in enumerate(dssp_labels):
+        n_valid_i=int(dssp_valid_counts[i]) if dssp_valid_counts is not None else dssp_total
+        if n_valid_i <= 0:
+            continue
+        rows.append({'residue':lab,'n_frames':n_valid_i,'helix_probability':float(dssp_counts['H'][i]/n_valid_i),'strand_probability':float(dssp_counts['E'][i]/n_valid_i),'coil_other_probability':float(dssp_counts['C'][i]/n_valid_i)})
+    return rows
 
 def analyze_extra_observable_pmfs(d: Data, args, base_logw: np.ndarray, selected: str, boost_ok: bool, kbt_kcal: float, out: Path, warnings: list[str], progress: Optional[Progress]) -> dict:
     mode=str(getattr(args,'extra_pmf_from_trajectories','auto') or 'auto').lower()
@@ -5948,9 +5986,10 @@ def analyze_extra_observable_pmfs(d: Data, args, base_logw: np.ndarray, selected
         'strand_fraction':_make_acc_1d(ss_edges),
         'coil_fraction':_make_acc_1d(ss_edges),
     }
-    dssp_counts=None; dssp_total=0
+    dssp_counts=None; dssp_valid_counts=None; dssp_total=0
     if dssp_labels:
         dssp_counts={code:np.zeros(len(dssp_labels),dtype=np.int64) for code in ('H','E','C')}
+        dssp_valid_counts=np.zeros(len(dssp_labels),dtype=np.int64)
 
     # Per-sample arrays for convergence + basin tracking.  Indexed by MBAR sample
     # position (same ordering as d.cv / d.step).  NaN = not observed from trajectory.
@@ -6017,9 +6056,11 @@ def analyze_extra_observable_pmfs(d: Data, args, base_logw: np.ndarray, selected
                     ss_samps['strand_fraction'][sample_idx]=strand
                     ss_samps['coil_fraction'][sample_idx]=coil
                     if dssp_counts is not None and ss.shape[1] == len(dssp_labels):
-                        dssp_counts['H']+=np.sum(ss=='H',axis=0).astype(np.int64)
-                        dssp_counts['E']+=np.sum(ss=='E',axis=0).astype(np.int64)
-                        dssp_counts['C']+=np.sum((ss!='H')&(ss!='E'),axis=0).astype(np.int64)
+                        _n_h,_n_e,_n_coil,_n_valid=_dssp_valid_counts(ss,axis=0)
+                        dssp_counts['H']+=_n_h.astype(np.int64)
+                        dssp_counts['E']+=_n_e.astype(np.int64)
+                        dssp_counts['C']+=_n_coil.astype(np.int64)
+                        dssp_valid_counts+=_n_valid.astype(np.int64)
                         dssp_total+=int(ss.shape[0])
                 cbuf={'sidx':np.asarray(sample_idx,dtype=np.int64).copy()}
                 try:
@@ -6174,9 +6215,7 @@ def analyze_extra_observable_pmfs(d: Data, args, base_logw: np.ndarray, selected
     summary['torsions']=torsion_info
 
     if dssp_counts is not None and dssp_total>0:
-        rows=[]
-        for i,lab in enumerate(dssp_labels):
-            rows.append({'residue':lab,'n_frames':int(dssp_total),'helix_probability':float(dssp_counts['H'][i]/dssp_total),'strand_probability':float(dssp_counts['E'][i]/dssp_total),'coil_other_probability':float(dssp_counts['C'][i]/dssp_total)})
+        rows=_dssp_residue_probability_rows(dssp_labels,dssp_counts,dssp_valid_counts,dssp_total)
         ss_path=out_extra/'secondary_structure_residue_probabilities.csv'
         _write_csv_rows(ss_path,rows); files['secondary_structure_residue_probabilities_csv']=str(ss_path)
         summary['secondary_structure_residue_count']=len(rows)
