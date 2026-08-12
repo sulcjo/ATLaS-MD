@@ -968,7 +968,8 @@ def _find_adaptive_epoch_dirs(adaptive_dir: Path, epoch_ids: Optional[set[int]] 
     for cand in sorted(adaptive_dir.iterdir()):
         if not cand.is_dir():
             continue
-        if epoch_ids is not None and _epoch_dir_index(cand) not in epoch_ids:
+        idx = _epoch_dir_index(cand)
+        if epoch_ids is not None and idx is not None and idx not in epoch_ids:
             continue
         # epoch_NNN/ directly holds samples/ (first epoch pattern)
         if (cand/'samples').is_dir() and (cand/'segments.json').exists() and (cand/'epoch_window_map.csv').exists():
@@ -9889,7 +9890,8 @@ def parse_args(argv=None):
     p=argparse.ArgumentParser(description='GaREUS MBAR/PMF analysis. By default, this runs the full analysis suite: main CV PMF, convergence plots, Rg, distance-Rg 2D FES, PCA1-PCA2 FES, phi/psi/Ramachandran, SASA, secondary-structure fractions, and internal-contact PMFs whenever trajectories/topology are available.', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument('input', help='Run directory or final_production directory')
     p.add_argument('--epoch', dest='epochs', type=int, action='append', default=None,
-                   metavar='N', help='Pool only adaptive-production epoch N; repeat to select multiple epochs.')
+                   metavar='N', help='Pool only adaptive-production epoch N; repeat to select multiple epochs. '
+                   'The final/ phase (baseline + topup_*) is always included regardless of this filter.')
     p.add_argument('--out', default=None, help='PMF analysis output directory; default: <final_production>/pmf_analysis')
     p.add_argument('--analysis-source', choices=['auto','parquet','npz','csv'], default='auto', help='Analysis input source. auto prefers Parquet chunks (new format) then npz then csv; parquet reads segments.json + samples/*.parquet directly (new gareus package format); npz uses analysis_arrays.npz/analysis_chunks; csv uses samples.csv.')
     p.add_argument('--bins', type=int, default=60)
