@@ -8,6 +8,9 @@ _os_env.environ['NUMEXPR_NUM_THREADS'] = _thread_cap  # force-cap even if alread
 _os_env.environ.setdefault('NUMBA_NUM_THREADS', _thread_cap)
 del _os_env, _ne_cap, _ne_num, _thread_cap
 import argparse, csv, hashlib, json, math, os, re, shutil, sys, time
+import warnings as _warnings  # aliased: this file uses `warnings` as a local list-of-strings
+                               # parameter name in many function signatures (e.g. analyze_rg,
+                               # plot_2d_fes); avoid any chance of that shadowing the stdlib module.
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -250,18 +253,51 @@ def infer_temp_beta(prod: Path, meta: dict, arrays=None):
                 a=np.asarray(arrays[name],float)
                 if a.size and np.isfinite(np.nanmedian(a)):
                     t=float(np.nanmedian(a)); return t, 1.0/(K_B_KJ_PER_MOL_K*t)
+    if meta is None:
+        meta = {}
     for key in ('temperature_K','temperature_k','temperature'):
         if key in meta:
             try:
                 t=float(meta[key]);
                 if t>0: return t, 1.0/(K_B_KJ_PER_MOL_K*t)
             except Exception: pass
-    for p in (prod/'run_args.json', prod.parent/'run_args.json'):
+    # Top-level lookup above misses run_manifest.json-shaped meta dicts, where the
+    # real value lives nested under 'method_settings'/'resolved_args' (see
+    # gareus/provenance.py's _method_settings/_public_args). Check those too before
+    # falling through to the less-reliable run_args.json file search below.
+    for key_path in (
+        ('method_settings', 'temperature_k'), ('method_settings', 'temperature_K'),
+        ('resolved_args', 'temperature_k'), ('resolved_args', 'temperature_K'),
+    ):
+        val = meta
+        for k in key_path:
+            val = val.get(k) if isinstance(val, dict) else None
+            if val is None:
+                break
+        if val is not None:
+            try:
+                t = float(val)
+                if t > 0:
+                    return t, 1.0/(K_B_KJ_PER_MOL_K*t)
+            except (TypeError, ValueError):
+                pass
+    # Shallowest-first: prod itself, then one level up (final_production/epoch_NNN
+    # style callers), then two levels up (covers epoch_dir -> adaptive_production ->
+    # run_root, where the real run_args.json lives at the run root).
+    for p in (prod/'run_args.json', prod.parent/'run_args.json', prod.parent.parent/'run_args.json'):
         m=rjson(p,{})
         for key in ('temperature_k','temperature_K','temperature'):
             if key in m:
                 t=float(m[key]); return t, 1.0/(K_B_KJ_PER_MOL_K*t)
-    t=300.0; return t, 1.0/(K_B_KJ_PER_MOL_K*t)
+    t=300.0
+    msg=(f'infer_temp_beta: could not resolve run temperature for {prod} from arrays, '
+         f'meta, or run_args.json (checked {prod}, {prod.parent}, {prod.parent.parent}); '
+         f'falling back to default {t:.1f} K. MBAR reduced-bias energies will be wrong '
+         f'if the real run temperature differs.')
+    if isinstance(meta, dict):
+        meta.setdefault('load_notes', []).append(msg)
+    _warnings.warn(msg, RuntimeWarning, stacklevel=2)
+    return t, 1.0/(K_B_KJ_PER_MOL_K*t)
 
 def jvec(txt):
     if txt is None or txt=='': return []
