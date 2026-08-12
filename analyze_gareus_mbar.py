@@ -8,6 +8,9 @@ _os_env.environ['NUMEXPR_NUM_THREADS'] = _thread_cap  # force-cap even if alread
 _os_env.environ.setdefault('NUMBA_NUM_THREADS', _thread_cap)
 del _os_env, _ne_cap, _ne_num, _thread_cap
 import argparse, csv, hashlib, json, math, os, re, shutil, sys, time
+import warnings as _warnings  # aliased: this file uses `warnings` as a local list-of-strings
+                               # parameter name in many function signatures (e.g. analyze_rg,
+                               # plot_2d_fes); avoid any chance of that shadowing the stdlib module.
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -250,18 +253,51 @@ def infer_temp_beta(prod: Path, meta: dict, arrays=None):
                 a=np.asarray(arrays[name],float)
                 if a.size and np.isfinite(np.nanmedian(a)):
                     t=float(np.nanmedian(a)); return t, 1.0/(K_B_KJ_PER_MOL_K*t)
+    if meta is None:
+        meta = {}
     for key in ('temperature_K','temperature_k','temperature'):
         if key in meta:
             try:
                 t=float(meta[key]);
                 if t>0: return t, 1.0/(K_B_KJ_PER_MOL_K*t)
             except Exception: pass
-    for p in (prod/'run_args.json', prod.parent/'run_args.json'):
+    # Top-level lookup above misses run_manifest.json-shaped meta dicts, where the
+    # real value lives nested under 'method_settings'/'resolved_args' (see
+    # gareus/provenance.py's _method_settings/_public_args). Check those too before
+    # falling through to the less-reliable run_args.json file search below.
+    for key_path in (
+        ('method_settings', 'temperature_k'), ('method_settings', 'temperature_K'),
+        ('resolved_args', 'temperature_k'), ('resolved_args', 'temperature_K'),
+    ):
+        val = meta
+        for k in key_path:
+            val = val.get(k) if isinstance(val, dict) else None
+            if val is None:
+                break
+        if val is not None:
+            try:
+                t = float(val)
+                if t > 0:
+                    return t, 1.0/(K_B_KJ_PER_MOL_K*t)
+            except (TypeError, ValueError):
+                pass
+    # Shallowest-first: prod itself, then one level up (final_production/epoch_NNN
+    # style callers), then two levels up (covers epoch_dir -> adaptive_production ->
+    # run_root, where the real run_args.json lives at the run root).
+    for p in (prod/'run_args.json', prod.parent/'run_args.json', prod.parent.parent/'run_args.json'):
         m=rjson(p,{})
         for key in ('temperature_k','temperature_K','temperature'):
             if key in m:
                 t=float(m[key]); return t, 1.0/(K_B_KJ_PER_MOL_K*t)
-    t=300.0; return t, 1.0/(K_B_KJ_PER_MOL_K*t)
+    t=300.0
+    msg=(f'infer_temp_beta: could not resolve run temperature for {prod} from arrays, '
+         f'meta, or run_args.json (checked {prod}, {prod.parent}, {prod.parent.parent}); '
+         f'falling back to default {t:.1f} K. MBAR reduced-bias energies will be wrong '
+         f'if the real run temperature differs.')
+    if isinstance(meta, dict):
+        meta.setdefault('load_notes', []).append(msg)
+    _warnings.warn(msg, RuntimeWarning, stacklevel=2)
+    return t, 1.0/(K_B_KJ_PER_MOL_K*t)
 
 def jvec(txt):
     if txt is None or txt=='': return []
@@ -411,18 +447,78 @@ def _masked_data(d: 'Data', mask: np.ndarray, meta_override: Optional[dict] = No
     )
 
 
+def _subset_logw_from_global_fk(d_subset: 'Data', f_k_global: np.ndarray) -> np.ndarray:
+    """Correct per-sample MBAR log-weights for a SUBSET of the full sample
+    population (e.g. an epoch_000/rest split, or a secondary-CV regime
+    split), reusing the already-solved GLOBAL free energies ``f_k_global``
+    but the subset's own per-state sample counts ``N_k^subset`` in the MBAR
+    self-consistency denominator:
+
+        logw_S[n] = -logsumexp_k( log(N_k^subset[k]) + f_k[k] - u_nk[n, k] )
+
+    Naively slicing the GLOBAL logw to a subset and renormalizing (``
+    norm_logw(logw[mask])``) only corrects for the subset's overall size --
+    it silently keeps using N_k^GLOBAL inside every sample's denominator,
+    which is wrong whenever different states lose different *fractions* of
+    their samples to the exclusion (e.g. one window losing 80% of its
+    samples to an epoch_000 exclusion while another loses 10%). That
+    produces a real, direction-consistent tilt across the CV axis.
+
+    This recomputes just the denominator with the subset's own N_k while
+    still reusing f_k_global -- state free energies are a property of the
+    whole population and don't need re-solving for a subset reweight. It is
+    an approximation (not a from-scratch MBAR resolve of the subset alone),
+    but a substantially better one than the naive mask-and-renormalize.
+    States with zero subset representation (N_k^subset == 0) are dropped
+    from the denominator sum entirely (equivalent to log(0) = -inf), and
+    states with a non-finite global f_k (never solved -- zero global
+    samples) are dropped the same way for safety, though a subset can never
+    contain samples from a state absent at the global level.
+
+    Degenerate case: when d_subset covers the ENTIRE global population, this
+    reduces to f_k_global's own logw exactly (same N_k, same f_k, same u_nk
+    used to derive it in the first place).
+    """
+    K = int(f_k_global.size)
+    u_nk = np.asarray(d_subset.u_nk, dtype=np.float64)
+    window = np.asarray(d_subset.window, dtype=np.int64)
+    f_k_global = np.asarray(f_k_global, dtype=np.float64)
+    n_k_subset = np.bincount(window[(window >= 0) & (window < K)], minlength=K).astype(np.float64)
+    active = np.where((n_k_subset > 0) & np.isfinite(f_k_global[:K]))[0]
+    if active.size == 0:
+        return np.full(u_nk.shape[0], -np.inf, dtype=np.float64)
+    log_n = np.log(n_k_subset[active])
+    f_active = f_k_global[active]
+    tmp = log_n[None, :] + f_active[None, :] - u_nk[:, active]
+    ld = logsumexp_axis1_finite(tmp)
+    logw_s = -ld
+    logw_s -= logsumexp(logw_s)
+    return logw_s
+
+
 def _regime_slug(regime: str) -> str:
     return _slug(regime) if regime else 'unknown'
 
 
 def run_secondary_cv_analyses(d: 'Data', args, base_logw: np.ndarray, selected: str,
                                boost_ok: bool, kbt_kcal: float, out: Path,
-                               warnings: list, progress: Optional['Progress']) -> tuple:
+                               warnings: list, progress: Optional['Progress'],
+                               f_k_global: Optional[np.ndarray] = None) -> tuple:
     """Secondary-CV PMF + CV1xCV2 2D FES, split by secondary-CV regime when the
     run's CV2 definition changed mid-campaign (see
     ``_secondary_cv_epoch_regime_masks``). Single-regime runs (the common
     case) are entirely unaffected: this degrades to the plain unmodified
     calls, writing to the same paths as before.
+
+    ``f_k_global`` should be the GLOBAL MBAR solve's ``f_k`` (``m['f_k']``)
+    when available. When multiple regimes exist, each regime's own logw is
+    recomputed from ``f_k_global`` and that regime's own per-state sample
+    counts (``_subset_logw_from_global_fk``) rather than naively slicing
+    ``base_logw`` to the regime's mask and renormalizing -- the naive slice
+    only corrects for the regime's overall size, not for different states
+    losing different *fractions* of their samples to the regime split. When
+    ``f_k_global`` is not supplied (e.g. older/direct callers), this falls
+    back to the previous naive mask-and-renormalize behavior.
 
     Returns ``(secondary_cv_pmf_info, cv1_cv2_fes_info)`` for the *dominant*
     regime (or the only regime, if there's just one) -- same shape/keys
@@ -450,7 +546,10 @@ def run_secondary_cv_analyses(d: 'Data', args, base_logw: np.ndarray, selected: 
             _regime_secondary_cv = regime
         regime_meta = dict(d.meta); regime_meta['secondary_cv'] = _regime_secondary_cv
         d_regime = _masked_data(d, mask, meta_override=regime_meta)
-        base_logw_regime = np.asarray(base_logw, dtype=np.float64)[mask]
+        if f_k_global is not None:
+            base_logw_regime = _subset_logw_from_global_fk(d_regime, f_k_global)
+        else:
+            base_logw_regime = np.asarray(base_logw, dtype=np.float64)[mask]
         regime_out = out if is_dominant else out / f'secondary_cv_regime_{_regime_slug(regime)}'
         regime_out.mkdir(parents=True, exist_ok=True)
         pmf_info = analyze_secondary_cv_pmf(d_regime, args, base_logw_regime, selected, boost_ok, kbt_kcal, regime_out, warnings, progress)
@@ -1275,8 +1374,12 @@ def _compute_u_nk_analytical(cv1: np.ndarray, cv2: np.ndarray,
     u = np.empty((cv1.size, K), dtype=np.float64)
     for k, w in enumerate(union_windows):
         dc1 = cv1 - w['primary_center']
-        dc2 = cv2 - w['secondary_cv_center']
-        bias_kcal = 0.5 * w['primary_k_kcal'] * dc1 ** 2 + 0.5 * w['secondary_k_kcal'] * dc2 ** 2
+        sec_c = w['secondary_cv_center']
+        sec_k = w['secondary_k_kcal']
+        bias_kcal = 0.5 * w['primary_k_kcal'] * dc1 ** 2
+        if math.isfinite(sec_c) and math.isfinite(sec_k) and sec_k > 0:
+            dc2 = cv2 - sec_c
+            bias_kcal = bias_kcal + 0.5 * sec_k * dc2 ** 2
         u[:, k] = scale * bias_kcal
     return u
 
@@ -1463,10 +1566,10 @@ def _reconstruct_union_bias_block(cv: np.ndarray, cv2: np.ndarray, beta: float,
     u = np.zeros((n, k_count), dtype=np.float64)
     for k in range(k_count):
         d1 = cv - primary_centers[k]
-        u[:, k] = beta * 4.184 * 0.5 * primary_ks[k] * d1 * d1
+        u[:, k] = beta * KJ_PER_KCAL * 0.5 * primary_ks[k] * d1 * d1
         if math.isfinite(sec_centers[k]) and sec_ks[k] > 0:
-            d2 = np.where(np.isfinite(cv2), cv2 - sec_centers[k], 0.0)
-            u[:, k] += beta * 4.184 * 0.5 * sec_ks[k] * d2 * d2
+            d2 = cv2 - sec_centers[k]
+            u[:, k] += beta * KJ_PER_KCAL * 0.5 * sec_ks[k] * d2 * d2
     return u
 
 
@@ -2827,7 +2930,13 @@ def solve_mbar_lbfgs(u_nk, window, tol=1e-10, maxiter=10000, progress: Optional[
     f = np.empty(Ka, dtype=np.float64)
     f[0] = 0.0
     f[1:] = result.x
-    conv = result.success or (result.status in (0, 1))
+    # scipy L-BFGS-B status codes: 0 = converged (gtol/ftol satisfied), 1 =
+    # iteration/function-eval limit reached (NOT converged), 2 = other
+    # abnormal termination.  Only status 0 (or a scipy-reported success, kept
+    # for forward compatibility) counts as converged here -- status 1 must
+    # never be treated as convergence, or a run that merely hit maxiter gets
+    # silently reported as fully converged.
+    conv = result.success or result.status == 0
     it = int(result.nit)
     grad_norm = float(np.max(np.abs(result.jac))) if result.jac is not None else float('nan')
 
@@ -2980,7 +3089,16 @@ def make_bins(cv,bins,lo,hi):
     return np.linspace(lo-pad if lo is None else lo, hi+pad if hi is None else hi, bins+1)
 
 def pmf_from_weights(cv,w,bins,kbt_kcal):
-    prob,edges=np.histogram(cv,bins=bins,weights=w); counts,_=np.histogram(cv,bins=bins); prob=np.asarray(prob,float)
+    cv=np.asarray(cv,dtype=np.float64); w=np.asarray(w,dtype=np.float64)
+    prob,edges=np.histogram(cv,bins=bins,weights=w)
+    # counts must reflect samples that actually contribute to `prob` (finite,
+    # positive weight) -- a bin populated only by zero/NaN-weight samples has
+    # true reweighted probability 0 and must NOT read as "occupied" to
+    # consumers like the occupied_bins convergence diagnostic. Reuse `edges`
+    # (not `bins`) so counts stays aligned with prob even if bins was an int.
+    valid=np.isfinite(w)&(w>0)
+    counts,_=np.histogram(cv[valid],bins=edges)
+    prob=np.asarray(prob,float)
     if np.sum(prob)>0: prob/=np.sum(prob)
     with np.errstate(divide='ignore',invalid='ignore'): F=-kbt_kcal*np.log(prob)
     mask=np.isfinite(F)
@@ -3013,6 +3131,7 @@ def _cumulant_expansion(cv,base_w,boost,bins,beta,kbt_kcal,order=2,smooth_logfac
     var=np.full(B,np.nan,dtype=np.float64)
     kappa3=np.full(B,np.nan,dtype=np.float64)
     logfac=np.zeros(B,dtype=np.float64)
+    nz=np.zeros(B,dtype=bool)
     if np.any(good):
         idx=bi[good].astype(np.int64,copy=False)
         w=base_w[good]
@@ -3029,6 +3148,14 @@ def _cumulant_expansion(cv,base_w,boost,bins,beta,kbt_kcal,order=2,smooth_logfac
             sdx3=np.bincount(idx,weights=w*dx*dx*dx,minlength=B).astype(np.float64)
             kappa3[nz]=sdx3[nz]/sw[nz]
             logfac[nz]+=(beta**3/6.0)*kappa3[nz]
+    # A bin with real weighted samples (p0>0) but zero samples with a finite
+    # boost has an UNKNOWN GaMD correction -- flag NaN rather than silently
+    # falling back to logfac=0 (which would look like "no correction needed"
+    # and reproduce the raw/unbiased-looking p0 value for that bin). Bins
+    # with no samples at all (p0==0) keep logfac=0 so p=0*exp(0)=0 there,
+    # matching the existing "no samples" -> F=inf -> excluded-by-isfinite
+    # convention used throughout this file.
+    logfac[(~nz)&(p0>0)]=np.nan
     if smooth_logfac_sigma and float(smooth_logfac_sigma) > 0:
         try:
             from scipy.ndimage import gaussian_filter1d
@@ -3036,7 +3163,7 @@ def _cumulant_expansion(cv,base_w,boost,bins,beta,kbt_kcal,order=2,smooth_logfac
         except Exception:
             pass
     p=p0*np.exp(np.clip(logfac,-700,700))
-    ps=float(np.sum(p))
+    ps=float(np.nansum(p))
     if ps>0: p/=ps
     with np.errstate(divide='ignore',invalid='ignore'):
         F=-kbt_kcal*np.log(p)
@@ -3101,6 +3228,7 @@ def _cumulant_expansion_2d(x,y,base_w,boost,xbins,ybins,beta,kbt_kcal,order=2,sm
     var=np.full((Bx,By),np.nan,dtype=np.float64)
     kappa3=np.full((Bx,By),np.nan,dtype=np.float64)
     logfac=np.zeros((Bx,By),dtype=np.float64)
+    nz=np.zeros((Bx,By),dtype=bool)
     if np.any(good):
         xf=xi[good].astype(np.int64,copy=False)
         yf=yi[good].astype(np.int64,copy=False)
@@ -3120,6 +3248,11 @@ def _cumulant_expansion_2d(x,y,base_w,boost,xbins,ybins,beta,kbt_kcal,order=2,sm
             sdb3=np.bincount(idx,weights=w*db*db*db,minlength=Bx*By).astype(np.float64).reshape(Bx,By)
             kappa3[nz]=sdb3[nz]/sw[nz]
             logfac[nz]+=(beta**3/6.0)*kappa3[nz]
+    # See _cumulant_expansion: a bin with real weighted samples (p0>0) but
+    # zero finite-boost samples gets an unknown (NaN) correction, not a
+    # silent logfac=0 fallback. Genuinely empty bins (p0==0) stay at
+    # logfac=0 -> p=0, unchanged.
+    logfac[(~nz)&(p0>0)]=np.nan
     if smooth_logfac_sigma and float(smooth_logfac_sigma) > 0:
         try:
             from scipy.ndimage import gaussian_filter
@@ -3127,7 +3260,7 @@ def _cumulant_expansion_2d(x,y,base_w,boost,xbins,ybins,beta,kbt_kcal,order=2,sm
         except Exception:
             pass
     p=p0*np.exp(np.clip(logfac,-700,700))
-    ps=float(np.sum(p))
+    ps=float(np.nansum(p))
     if ps>0:
         p/=ps
     with np.errstate(divide='ignore', invalid='ignore'):
@@ -5562,6 +5695,13 @@ def _finalize_acc_1d(acc: dict, d: Data, kbt_kcal: float, smooth_logfac_sigma: f
         # raw-moment identity (same cancellation risk already accepted by var above).
         kappa3[nz]=acc['sx3'][nz]/acc['sw'][nz]-3.0*mean[nz]*(acc['sx2'][nz]/acc['sw'][nz])+2.0*mean[nz]**3
         logfac3[nz]=logfac[nz]+(d.beta**3/6.0)*kappa3[nz]
+    # See _cumulant_expansion: a bin with real (umbrella-weighted) samples but
+    # zero finite-boost samples has an unknown correction -- NaN, not a
+    # silent logfac=0 fallback. Genuinely empty bins (acc['umbrella']==0)
+    # stay at logfac=0 -> cum_prob=0, unchanged.
+    unknown=(~nz)&(acc['umbrella']>0)
+    logfac[unknown]=np.nan
+    logfac3[unknown]=np.nan
     if smooth_logfac_sigma and float(smooth_logfac_sigma) > 0:
         try:
             from scipy.ndimage import gaussian_filter1d
@@ -5627,6 +5767,12 @@ def _finalize_acc_2d(acc: dict, d: Data, kbt_kcal: float, smooth_logfac_sigma: f
         # streaming accumulator: see _finalize_acc_1d note on raw-moment kappa3.
         kappa3[nz]=acc['sx3'][nz]/acc['sw'][nz]-3.0*mean[nz]*(acc['sx2'][nz]/acc['sw'][nz])+2.0*mean[nz]**3
         logfac3[nz]=logfac[nz]+(d.beta**3/6.0)*kappa3[nz]
+    # See _cumulant_expansion / _finalize_acc_1d: a bin with real samples but
+    # zero finite-boost samples gets an unknown (NaN) correction rather than
+    # a silent logfac=0 fallback.
+    unknown=(~nz)&(acc['umbrella']>0)
+    logfac[unknown]=np.nan
+    logfac3[unknown]=np.nan
     if smooth_logfac_sigma and float(smooth_logfac_sigma) > 0:
         try:
             from scipy.ndimage import gaussian_filter
@@ -5850,6 +5996,23 @@ def _peptide_solvent_contact_counts(md, traj, cutoff_nm: float) -> tuple[np.ndar
         ion[i]=float(len(residues & ion_res))
     return total, water, ion
 
+def _dssp_valid_counts(arr, axis):
+    """Count DSSP H/E/coil occurrences and valid (non-'NA') entries along `axis`.
+
+    mdtraj's `compute_dssp` assigns 'NA' to any topology "residue" lacking a
+    full CA/N/C/O backbone quad -- notably capping groups like ACE/NME, which
+    this pipeline explicitly supports. 'NA' entries must be excluded from both
+    the coil/other count and the denominator used to turn counts into
+    fractions/probabilities, otherwise capped termini are silently counted as
+    coil and bias helix/strand fractions low.
+    """
+    valid=(arr != 'NA')
+    n_h=np.sum(arr == 'H', axis=axis)
+    n_e=np.sum(arr == 'E', axis=axis)
+    n_coil=np.sum((arr != 'H') & (arr != 'E') & valid, axis=axis)
+    n_valid=np.sum(valid, axis=axis)
+    return n_h, n_e, n_coil, n_valid
+
 def _dssp_fraction_arrays(md, traj):
     try:
         ss=md.compute_dssp(traj,simplified=True)
@@ -5858,10 +6021,31 @@ def _dssp_fraction_arrays(md, traj):
     arr=np.asarray(ss)
     if arr.ndim != 2 or arr.shape[1] == 0:
         return None
-    helix=np.mean(arr=='H',axis=1).astype(np.float64)
-    strand=np.mean(arr=='E',axis=1).astype(np.float64)
-    coil=np.mean((arr!='H')&(arr!='E'),axis=1).astype(np.float64)
+    n_h,n_e,n_coil,n_valid=_dssp_valid_counts(arr,axis=1)
+    denom=np.maximum(n_valid,1)
+    helix=(n_h/denom).astype(np.float64)
+    strand=(n_e/denom).astype(np.float64)
+    coil=(n_coil/denom).astype(np.float64)
     return arr,helix,strand,coil
+
+def _dssp_residue_probability_rows(dssp_labels, dssp_counts, dssp_valid_counts, dssp_total):
+    """Build per-residue secondary-structure probability rows.
+
+    `dssp_valid_counts[i]` is the number of frames where residue index `i` was
+    not mdtraj's 'NA' code (see `_dssp_valid_counts`). A residue index that is
+    'NA' in every frame -- a capped terminus (ACE/NME) or other non-protein
+    "residue" -- has no real secondary structure to report; it's excluded
+    entirely rather than emitted as a spurious 0/0 probability. Real residues
+    use their own valid-frame count as the denominator instead of the total
+    frame count, so an occasional NA frame (if any) doesn't dilute them either.
+    """
+    rows=[]
+    for i,lab in enumerate(dssp_labels):
+        n_valid_i=int(dssp_valid_counts[i]) if dssp_valid_counts is not None else dssp_total
+        if n_valid_i <= 0:
+            continue
+        rows.append({'residue':lab,'n_frames':n_valid_i,'helix_probability':float(dssp_counts['H'][i]/n_valid_i),'strand_probability':float(dssp_counts['E'][i]/n_valid_i),'coil_other_probability':float(dssp_counts['C'][i]/n_valid_i)})
+    return rows
 
 def analyze_extra_observable_pmfs(d: Data, args, base_logw: np.ndarray, selected: str, boost_ok: bool, kbt_kcal: float, out: Path, warnings: list[str], progress: Optional[Progress]) -> dict:
     mode=str(getattr(args,'extra_pmf_from_trajectories','auto') or 'auto').lower()
@@ -5948,9 +6132,10 @@ def analyze_extra_observable_pmfs(d: Data, args, base_logw: np.ndarray, selected
         'strand_fraction':_make_acc_1d(ss_edges),
         'coil_fraction':_make_acc_1d(ss_edges),
     }
-    dssp_counts=None; dssp_total=0
+    dssp_counts=None; dssp_valid_counts=None; dssp_total=0
     if dssp_labels:
         dssp_counts={code:np.zeros(len(dssp_labels),dtype=np.int64) for code in ('H','E','C')}
+        dssp_valid_counts=np.zeros(len(dssp_labels),dtype=np.int64)
 
     # Per-sample arrays for convergence + basin tracking.  Indexed by MBAR sample
     # position (same ordering as d.cv / d.step).  NaN = not observed from trajectory.
@@ -6017,9 +6202,11 @@ def analyze_extra_observable_pmfs(d: Data, args, base_logw: np.ndarray, selected
                     ss_samps['strand_fraction'][sample_idx]=strand
                     ss_samps['coil_fraction'][sample_idx]=coil
                     if dssp_counts is not None and ss.shape[1] == len(dssp_labels):
-                        dssp_counts['H']+=np.sum(ss=='H',axis=0).astype(np.int64)
-                        dssp_counts['E']+=np.sum(ss=='E',axis=0).astype(np.int64)
-                        dssp_counts['C']+=np.sum((ss!='H')&(ss!='E'),axis=0).astype(np.int64)
+                        _n_h,_n_e,_n_coil,_n_valid=_dssp_valid_counts(ss,axis=0)
+                        dssp_counts['H']+=_n_h.astype(np.int64)
+                        dssp_counts['E']+=_n_e.astype(np.int64)
+                        dssp_counts['C']+=_n_coil.astype(np.int64)
+                        dssp_valid_counts+=_n_valid.astype(np.int64)
                         dssp_total+=int(ss.shape[0])
                 cbuf={'sidx':np.asarray(sample_idx,dtype=np.int64).copy()}
                 try:
@@ -6174,9 +6361,7 @@ def analyze_extra_observable_pmfs(d: Data, args, base_logw: np.ndarray, selected
     summary['torsions']=torsion_info
 
     if dssp_counts is not None and dssp_total>0:
-        rows=[]
-        for i,lab in enumerate(dssp_labels):
-            rows.append({'residue':lab,'n_frames':int(dssp_total),'helix_probability':float(dssp_counts['H'][i]/dssp_total),'strand_probability':float(dssp_counts['E'][i]/dssp_total),'coil_other_probability':float(dssp_counts['C'][i]/dssp_total)})
+        rows=_dssp_residue_probability_rows(dssp_labels,dssp_counts,dssp_valid_counts,dssp_total)
         ss_path=out_extra/'secondary_structure_residue_probabilities.csv'
         _write_csv_rows(ss_path,rows); files['secondary_structure_residue_probabilities_csv']=str(ss_path)
         summary['secondary_structure_residue_count']=len(rows)
@@ -8510,9 +8695,16 @@ def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.nd
     Extracted from analyze() so the identical formula can run twice against
     different sample subsets sharing the same global MBAR solve (see the
     epoch_000/rest split in analyze()) instead of only ever pooling every
-    epoch into one report. ``logw`` is the *raw* per-sample MBAR log-weight
-    (``m['logw']``, masked to this subset if applicable) -- renormalized
-    internally, same pattern as ``analyze_secondary_cv_pmf``.
+    epoch into one report. ``logw`` is the per-sample MBAR log-weight for
+    THIS subset -- renormalized internally, same pattern as
+    ``analyze_secondary_cv_pmf``. When ``d`` is a subset of the full
+    population (e.g. the epoch_000/rest split), callers must pass
+    ``_subset_logw_from_global_fk(d, f_k_global)`` here rather than a naive
+    ``m['logw'][mask]`` slice of the global logw -- the naive slice only
+    renormalizes for the subset's overall size, not for different states
+    losing different fractions of their samples to the split, which
+    produces a real direction-consistent tilt in the resulting PMF. When
+    ``d`` is the full population, plain ``m['logw']`` is already correct.
     """
     K = d.u_nk.shape[1]
     N = len(d.cv)
@@ -8526,6 +8718,17 @@ def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.nd
         cum_pmf, cdiag = cumulant2(d.cv, base_w, d.boost_kj, bins, d.beta, kbt_kcal, smooth_logfac_sigma=_eff_smooth(args, 'gamd_smooth_sigma'))
         cum3_pmf, cdiag3 = cumulant3(d.cv, base_w, d.boost_kj, bins, d.beta, kbt_kcal, smooth_logfac_sigma=_eff_smooth(args, 'gamd_smooth_sigma'))
         selected = 'gamd_cumulant2'
+        # A bin can have real samples (counts>0) but zero with a finite GaMD
+        # boost -- e.g. a whole segment/epoch missing gamd_boost_total_kj_mol
+        # dominating that CV bin. _cumulant_expansion flags this NaN rather
+        # than silently reproducing the unbiased value; surface it here since
+        # this is the main choke point with a `warnings` list in scope.
+        nan_bins2 = np.isnan(cdiag['log_reweight_factor']) & (np.asarray(cum_pmf['counts']) > 0)
+        if np.any(nan_bins2):
+            warnings.append(f"{warning_prefix}GaMD cumulant2 correction is undefined (NaN) for {int(np.sum(nan_bins2))} CV bin(s) with samples but no finite boost values; those pmf_gamd_cumulant2 bins are NaN.")
+        nan_bins3 = np.isnan(cdiag3['log_reweight_factor']) & (np.asarray(cum3_pmf['counts']) > 0)
+        if np.any(nan_bins3):
+            warnings.append(f"{warning_prefix}GaMD cumulant3 correction is undefined (NaN) for {int(np.sum(nan_bins3))} CV bin(s) with samples but no finite boost values; those pmf_gamd_cumulant3 bins are NaN.")
         e = ess(exp_w)
         if e / max(1, N) < 0.05:
             warnings.append(f'{warning_prefix}GaMD exponential reweighting ESS is very low: {e:.1f}/{N}')
@@ -8607,14 +8810,24 @@ def analyze(d,args, progress: Optional[Progress] = None):
     # paths, feeding pmf_summary.json's headline numbers -- covers only
     # epoch_001+ (and final). Both reuse this same global MBAR solve (m/logw)
     # rather than re-solving -- only which samples get binned differs.
+    #
+    # Each subset's logw is recomputed via _subset_logw_from_global_fk (reuses
+    # the global f_k, but the SUBSET's own per-state N_k in the MBAR
+    # self-consistency denominator) rather than naively sliced from the global
+    # logw and renormalized. The naive slice only corrects for the subset's
+    # overall size, not for different states losing different *fractions* of
+    # their samples to the split -- that mismatch produces a real,
+    # direction-consistent tilt in the resulting PMF (confirmed on real data:
+    # ~0.11 kcal/mol shift in pmf_span_kcal_mol on a ~13 kcal/mol span).
     epoch0_split=_epoch_zero_split_masks(d)
     epoch0_report_info=None
     if epoch0_split is not None:
         mask0,mask_rest=epoch0_split
         d_epoch0=_masked_data(d,mask0)
         out_epoch0=out/'epoch_000_separate'; out_epoch0.mkdir(parents=True,exist_ok=True)
-        epoch0_report_info=run_pmf_and_gamd_boost_report(d_epoch0,args,logw[mask0],bins,kbt_kcal,out_epoch0,warn,progress,warning_prefix='[epoch_000 report] ')
-        d_main=_masked_data(d,mask_rest); logw_main=logw[mask_rest]
+        logw_epoch0=_subset_logw_from_global_fk(d_epoch0,m['f_k'])
+        epoch0_report_info=run_pmf_and_gamd_boost_report(d_epoch0,args,logw_epoch0,bins,kbt_kcal,out_epoch0,warn,progress,warning_prefix='[epoch_000 report] ')
+        d_main=_masked_data(d,mask_rest); logw_main=_subset_logw_from_global_fk(d_main,m['f_k'])
     else:
         d_main=d; logw_main=logw
 
@@ -8630,16 +8843,24 @@ def analyze(d,args, progress: Optional[Progress] = None):
     pca2d_info=analyze_pca_2d_fes(d,args,logw,selected,boost_ok,kbt_kcal,out,warn,progress)
     extra_obs_info=analyze_extra_observable_pmfs(d,args,logw,selected,boost_ok,kbt_kcal,out,warn,progress)
     chignolin_fes_info=analyze_chignolin_fes(d,args,logw,selected,boost_ok,kbt_kcal,out,warn,progress)
-    secondary_cv_pmf_info,cv1_cv2_fes_info=run_secondary_cv_analyses(d,args,logw,selected,boost_ok,kbt_kcal,out,warn,progress)
+    secondary_cv_pmf_info,cv1_cv2_fes_info=run_secondary_cv_analyses(d,args,logw,selected,boost_ok,kbt_kcal,out,warn,progress,f_k_global=m['f_k'])
     poincare_info=analyze_poincare_map(d,args,logw,selected,boost_ok,kbt_kcal,out,warn,progress)
     poincare_torsions_info=analyze_poincare_residue_torsions(d,args,out,poincare_info,warn,progress)
     epoch_cv_info=_analyze_epoch_cv_exploration(d.prod_dir,out,d.meta,warn)
     tica_epoch_info=_analyze_tica_epochs(d.prod_dir,out,d.meta,warn)
     torsion_pca_scree_info=_analyze_torsion_pca_scree(d.prod_dir,out,d.meta,args,warn)
-    conv_info=run_pmf_convergence(d,args,bins,selected,sel,out,progress=progress,f_init_hint=m.get('f_k'))
+    # sel (the reference PMF) was built from d_main -- epoch_000 excluded when
+    # a split exists (see above). The convergence checks must be run against
+    # that SAME population, not the full d: otherwise even the 100%-of-data
+    # checkpoint can never match a reference it structurally can't reach,
+    # forcing a spurious converged=False purely from population mismatch
+    # (confirmed: this propagated into gareus_report.py's top-level
+    # PASS/CAUTION/FAIL verdict for every multi-epoch adaptive-production
+    # run). When no split exists, d_main is d itself, so this is unchanged.
+    conv_info=run_pmf_convergence(d_main,args,bins,selected,sel,out,progress=progress,f_init_hint=m.get('f_k'))
     epoch_conv_info={}
-    if d.meta.get('_epoch_source'):
-        epoch_conv_info=run_epoch_pmf_convergence(d,args,bins,selected,sel,out,progress=progress,f_init_hint=m.get('f_k'))
+    if d_main.meta.get('_epoch_source'):
+        epoch_conv_info=run_epoch_pmf_convergence(d_main,args,bins,selected,sel,out,progress=progress,f_init_hint=m.get('f_k'))
     s={'production_dir':str(d.prod_dir),'output_dir':str(out),'source':d.source,'n_samples':int(N),'n_windows':int(K),'temperature_K':float(d.temp),'beta_1_over_kj_mol':float(d.beta),'cv_min_A':float(np.nanmin(d.cv)),'cv_max_A':float(np.nanmax(d.cv)),'primary_cv_units':_primary_cv_units(d.meta),'primary_cv_axis_label':_primary_cv_axis_label(d.meta),'selected_unbiased_method':selected,'pmf_span_kcal_mol':span,'pmf_minimum_cv_A':main_report_info['pmf_minimum_cv_A'],'mbar':{'converged':bool(m['converged']),'iterations':int(m['iterations']),'max_delta':float(m['max_delta']),'backend':m.get('backend','unknown'),'threads':m.get('threads',None),'active_states':[int(x) for x in m['active']],'n_k':[int(x) for x in m['n_k']],'base_ess':float(ess(base_w))},'boost':bs,'neighbor_overlap':neigh,'warnings':warn,'files':{**main_report_info['files'],'summary_md':str(out/'pmf_summary.md'),'summary_json':str(out/'pmf_summary.json')}}
     if epoch0_report_info is not None:
         s['epoch_000_report']={'available':True,'reason':'epoch_000 excluded from the main PMF/GaMD-boost report above; this covers epoch_000 only',
