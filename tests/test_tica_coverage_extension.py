@@ -120,7 +120,7 @@ def test_tica_coverage_k_derived_from_observed_spread_via_equipartition():
     _target_primary, primary_k, _target_secondary, secondary_k = params
 
     assert metadata["population_count"] == 20  # whole cluster formed one group, none dropped
-    expected_k = _KBT_KCAL_298K / float(np.std(cluster)) ** 2
+    expected_k = _KBT_KCAL_298K / float(np.std(cluster, ddof=1)) ** 2
     assert secondary_k == pytest.approx(expected_k)
     assert secondary_k != parent.secondary_k  # actually moved, not a no-op
     assert primary_k == parent.primary_k  # primary axis untouched (it wasn't the failure mode)
@@ -178,3 +178,19 @@ def test_tica_coverage_k_stiffen_cap_is_configurable():
     # cap=1000x is so loose the raw equipartition estimate wins uncapped, and
     # that raw estimate is nowhere near the 1000x ceiling for this cluster.
     assert parent.secondary_k < actions[0][2][3] < parent.secondary_k * 1000.0
+
+
+def test_tica_coverage_k_stiffen_cap_below_one_never_loosens_below_parent():
+    """Regression: np.clip(x, lo, hi) with hi < lo silently returns hi, not lo.
+
+    A cap < 1.0 must not be able to push secondary_k below the parent's own k
+    -- the docstring's invariant is "only ever tighten, never loosen."
+    """
+    registry = _registry()
+    primary = np.concatenate([np.full(990, 0.5), np.full(20, 0.6)])
+    tic1 = np.concatenate([np.full(990, 0.0), np.linspace(2.98, 3.02, 20)])
+
+    sub_one_cap = AdaptiveDecisionPolicy(coverage_k_stiffen_cap=0.5)
+    actions = _propose_tica_coverage_actions(registry, primary, tic1, sub_one_cap)
+    parent = registry.get_state(actions[0][1])
+    assert actions[0][2][3] == pytest.approx(parent.secondary_k)
