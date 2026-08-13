@@ -241,3 +241,17 @@ def test_2d_bootstrap_collapses_to_1d_case_with_degenerate_y():
     # same sequence of resampled index sets, so the collapsed (single-y-bin)
     # 2D result must match the 1D result bit-for-bit.
     assert np.allclose(result_2d['pmf_std'][:, 0], result_1d['pmf_std'], atol=1e-10, equal_nan=True)
+
+
+def test_pmf_uncertainty_flags_default_off_and_parse_correctly():
+    args = agm.parse_args(['some_run_dir'])
+    assert args.pmf_uncertainty is False
+    assert args.pmf_uncertainty_n_boot == 100
+    assert args.pmf_uncertainty_seed == 0
+
+    args_on = agm.parse_args(['some_run_dir', '--pmf-uncertainty',
+                               '--pmf-uncertainty-n-boot', '250',
+                               '--pmf-uncertainty-seed', '7'])
+    assert args_on.pmf_uncertainty is True
+    assert args_on.pmf_uncertainty_n_boot == 250
+    assert args_on.pmf_uncertainty_seed == 7
