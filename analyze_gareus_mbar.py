@@ -2364,6 +2364,36 @@ def _filter_epoch_source(d: Data, keep: np.ndarray) -> None:
         d.meta['_epoch_source'] = arr[keep].tolist()
 
 
+def _sample_block_ids(d: 'Data') -> np.ndarray:
+    """Per-sample block id for the fixed-f_k block bootstrap (see
+    docs/superpowers/specs/2026-08-13-pmf-bootstrap-uncertainty-design.md):
+    one block = one (epoch_source, replica) pair, matching one replica's
+    samples within one epoch/phase -- treating the same replica index reused
+    in a later epoch as a NEW block, since adaptive-production runs don't
+    guarantee trajectory continuity across epoch boundaries. Falls back to
+    `replica` alone when `d.meta['_epoch_source']` is absent (single-source/
+    non-adaptive-production runs).
+
+    Returns a compact 0..M-1 int64 array, same length as d.replica.
+    """
+    replica = np.asarray(d.replica)
+    epoch_src = d.meta.get('_epoch_source')
+    if epoch_src is not None and len(epoch_src) != replica.size:
+        # Stale relative to replica/cv/etc. -- clean() row-filters per-sample
+        # arrays by a finiteness mask but doesn't sync this metadata list, so
+        # it can be longer than replica.size on any path where clean() ever
+        # dropped a sample. Same defensive length check every other consumer
+        # of _epoch_source in this file already applies; fall back to
+        # replica-only blocks rather than let np.stack raise below.
+        epoch_src = None
+    if epoch_src is None:
+        keys = replica.reshape(-1, 1)
+    else:
+        keys = np.stack([np.asarray(epoch_src), replica], axis=1)
+    _, block_ids = np.unique(keys, axis=0, return_inverse=True)
+    return block_ids.reshape(-1).astype(np.int64)
+
+
 def _skip_first_n_frames(d: Data, n: int) -> Data:
     """Drop first n samples per replica (sorted by step) for equilibration burn-in."""
     keep = np.ones(d.cv.size, dtype=bool)
@@ -3554,6 +3584,167 @@ def _cumulant_expansion_2d_both(x,y,base_w,boost,xbins,ybins,beta,kbt_kcal,smoot
     result2=_cumulant_from_shared_2d(shared,beta,kbt_kcal,2,smooth_logfac_sigma=smooth_logfac_sigma)
     result3=_cumulant_from_shared_2d(shared,beta,kbt_kcal,3,smooth_logfac_sigma=smooth_logfac_sigma)
     return result2, result3
+
+
+def _bootstrap_pmf_uncertainty_1d(cv, logw, boost, bins, beta, kbt_kcal,
+                                   window, block_ids, selected_method,
+                                   main_pmf, n_boot, rng, smooth_logfac_sigma=0.0):
+    """Fixed-f_k block bootstrap uncertainty for a 1D PMF (see
+    docs/superpowers/specs/2026-08-13-pmf-bootstrap-uncertainty-design.md).
+
+    For each window, resamples that window's own blocks (see
+    `_sample_block_ids`) with replacement -- same number of blocks drawn as
+    the window originally had, different composition -- reusing each drawn
+    sample's already-computed per-sample log-weight `logw` (f_k stays
+    fixed; no MBAR re-solve). Rebuilds `selected_method`'s PMF on the
+    resampled set for each of `n_boot` replicates, re-anchors every
+    replicate to read exactly 0 at the SAME bin `main_pmf` uses as its own
+    minimum (never the replicate's own minimum -- anchoring to each
+    replicate's own minimum would artificially erase uncertainty exactly at
+    that bin and distort every other bin's uncertainty relative to it), and
+    returns the per-bin std across replicates.
+
+    `selected_method` must be one of 'umbrella_only', 'gamd_exponential',
+    'gamd_cumulant2', 'gamd_cumulant3' -- the same keys as the `pmfs` dict
+    built in `run_pmf_and_gamd_boost_report`.
+
+    `smooth_logfac_sigma`: forwarded to `_cumulant_expansion` for the
+    'gamd_cumulant2'/'gamd_cumulant3' branches only (the other two branches
+    don't smooth). Callers must pass the SAME value used to build `main_pmf`
+    -- otherwise the replicates describe a different (differently-smoothed)
+    curve than the one `pmf_std` is meant to describe the uncertainty of.
+
+    Returns {'pmf_std': ndarray (len(bins)-1,),
+             'blocks_per_window': ndarray (K,),
+             'low_block_windows': list[int]} -- windows with fewer than 3
+    blocks, whose contribution to the estimate is unreliable.
+    """
+    cv = np.asarray(cv, dtype=np.float64)
+    logw = np.asarray(logw, dtype=np.float64)
+    boost = np.asarray(boost, dtype=np.float64)
+    window = np.asarray(window)
+    block_ids = np.asarray(block_ids)
+    K = int(np.max(window)) + 1 if window.size else 0
+    minidx = int(np.nanargmin(main_pmf['pmf']))
+
+    window_block_map = []
+    blocks_per_window = np.zeros(K, dtype=np.int64)
+    for k in range(K):
+        idx_k = np.where(window == k)[0]
+        blocks_k = block_ids[idx_k]
+        uniq = np.unique(blocks_k)
+        blocks_per_window[k] = uniq.size
+        grouped = {b: idx_k[blocks_k == b] for b in uniq}
+        window_block_map.append((uniq, grouped))
+    low_block_windows = [k for k in range(K) if 0 < blocks_per_window[k] < 3]
+
+    n_bins = len(bins) - 1
+    reps = np.full((n_boot, n_bins), np.nan, dtype=np.float64)
+    for b in range(n_boot):
+        resampled_parts = []
+        for k in range(K):
+            uniq, grouped = window_block_map[k]
+            if uniq.size == 0:
+                continue
+            chosen = rng.choice(uniq, size=uniq.size, replace=True)
+            for blk in chosen:
+                resampled_parts.append(grouped[blk])
+        if not resampled_parts:
+            continue
+        resampled_idx = np.concatenate(resampled_parts)
+        cv_b = cv[resampled_idx]
+        logw_b = logw[resampled_idx]
+        boost_b = boost[resampled_idx]
+        if selected_method == 'umbrella_only':
+            w_b = norm_logw(logw_b)
+            rep_pmf = pmf_from_weights(cv_b, w_b, bins, kbt_kcal)
+        elif selected_method == 'gamd_exponential':
+            w_b = norm_logw(logw_b + beta * boost_b)
+            rep_pmf = pmf_from_weights(cv_b, w_b, bins, kbt_kcal)
+        elif selected_method in ('gamd_cumulant2', 'gamd_cumulant3'):
+            base_w_b = norm_logw(logw_b)
+            order = 2 if selected_method == 'gamd_cumulant2' else 3
+            rep_pmf, _ = _cumulant_expansion(cv_b, base_w_b, boost_b, bins, beta, kbt_kcal, order=order, smooth_logfac_sigma=smooth_logfac_sigma)
+        else:
+            raise ValueError(f"unknown selected_method {selected_method!r}")
+        rep_arr = np.asarray(rep_pmf['pmf'], dtype=np.float64)
+        anchor = rep_arr[minidx]
+        reps[b] = rep_arr - anchor
+
+    with np.errstate(invalid='ignore'):
+        pmf_std = np.nanstd(reps, axis=0)
+    return {'pmf_std': pmf_std, 'blocks_per_window': blocks_per_window, 'low_block_windows': low_block_windows}
+
+
+def _bootstrap_pmf_uncertainty_2d(x, y, logw, boost, xbins, ybins, beta, kbt_kcal,
+                                   window, block_ids, selected_method,
+                                   main_fes, n_boot, rng, smooth_logfac_sigma=0.0):
+    """2D counterpart of `_bootstrap_pmf_uncertainty_1d`; see that
+    docstring (including the `smooth_logfac_sigma` note). Iterates
+    windows/blocks identically, so with the same `rng` state and the same
+    `window`/`block_ids`, it draws the exact same resampled index sets per
+    replicate as the 1D helper -- verified by the degenerate-y collapse
+    test.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    logw = np.asarray(logw, dtype=np.float64)
+    boost = np.asarray(boost, dtype=np.float64)
+    window = np.asarray(window)
+    block_ids = np.asarray(block_ids)
+    K = int(np.max(window)) + 1 if window.size else 0
+    main_arr = np.asarray(main_fes['pmf'], dtype=np.float64)
+    minidx_flat = int(np.nanargmin(main_arr.ravel()))
+    minidx = np.unravel_index(minidx_flat, main_arr.shape)
+
+    window_block_map = []
+    blocks_per_window = np.zeros(K, dtype=np.int64)
+    for k in range(K):
+        idx_k = np.where(window == k)[0]
+        blocks_k = block_ids[idx_k]
+        uniq = np.unique(blocks_k)
+        blocks_per_window[k] = uniq.size
+        grouped = {b: idx_k[blocks_k == b] for b in uniq}
+        window_block_map.append((uniq, grouped))
+    low_block_windows = [k for k in range(K) if 0 < blocks_per_window[k] < 3]
+
+    Bx, By = main_arr.shape
+    reps = np.full((n_boot, Bx, By), np.nan, dtype=np.float64)
+    for b in range(n_boot):
+        resampled_parts = []
+        for k in range(K):
+            uniq, grouped = window_block_map[k]
+            if uniq.size == 0:
+                continue
+            chosen = rng.choice(uniq, size=uniq.size, replace=True)
+            for blk in chosen:
+                resampled_parts.append(grouped[blk])
+        if not resampled_parts:
+            continue
+        resampled_idx = np.concatenate(resampled_parts)
+        x_b = x[resampled_idx]
+        y_b = y[resampled_idx]
+        logw_b = logw[resampled_idx]
+        boost_b = boost[resampled_idx]
+        if selected_method == 'umbrella_only':
+            w_b = norm_logw(logw_b)
+            rep_fes = pmf2d_from_weights(x_b, y_b, w_b, xbins, ybins, kbt_kcal)
+        elif selected_method == 'gamd_exponential':
+            w_b = norm_logw(logw_b + beta * boost_b)
+            rep_fes = pmf2d_from_weights(x_b, y_b, w_b, xbins, ybins, kbt_kcal)
+        elif selected_method in ('gamd_cumulant2', 'gamd_cumulant3'):
+            base_w_b = norm_logw(logw_b)
+            order = 2 if selected_method == 'gamd_cumulant2' else 3
+            rep_fes, _ = _cumulant_expansion_2d(x_b, y_b, base_w_b, boost_b, xbins, ybins, beta, kbt_kcal, order=order, smooth_logfac_sigma=smooth_logfac_sigma)
+        else:
+            raise ValueError(f"unknown selected_method {selected_method!r}")
+        rep_arr = np.asarray(rep_fes['pmf'], dtype=np.float64)
+        anchor = rep_arr[minidx]
+        reps[b] = rep_arr - anchor
+
+    with np.errstate(invalid='ignore'):
+        pmf_std = np.nanstd(reps, axis=0)
+    return {'pmf_std': pmf_std, 'blocks_per_window': blocks_per_window, 'low_block_windows': low_block_windows}
 
 
 def cumulant2_2d(x,y,base_w,boost,xbins,ybins,beta,kbt_kcal,smooth_logfac_sigma=0.0):
@@ -9347,7 +9538,34 @@ def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.nd
     span = float(np.max(finite) - np.min(finite)) if finite.size else float('nan')
     minidx = int(np.nanargmin(sel['pmf'])) if finite.size else -1
     _sel_diag = {'gamd_cumulant2': cdiag, 'gamd_cumulant3': cdiag3}.get(selected, cdiag)
-    write_pmf(out / 'pmf_unbiased.csv', sel, selected, {'boost_mean_kj_mol': _sel_diag.get('boost_mean_kj', np.full(args.bins, np.nan)), 'boost_var_kj2_mol2': _sel_diag.get('boost_var_kj2', np.full(args.bins, np.nan))})
+    pmf_uncertainty_std = None
+    _uncertainty_extra = {}
+    if getattr(args, 'pmf_uncertainty', False) and minidx >= 0:
+        # minidx<0 means sel['pmf'] has no finite bin at all (see the
+        # finite/minidx guard two lines above) -- _bootstrap_pmf_uncertainty_1d's
+        # own np.nanargmin on an all-NaN main_pmf['pmf'] would raise, so skip
+        # the uncertainty computation the same way pmf_minimum_cv_A is
+        # already silently skipped for this degenerate case.
+        block_ids = _sample_block_ids(d)
+        boot_rng = np.random.default_rng(int(getattr(args, 'pmf_uncertainty_seed', 0)))
+        n_boot = int(getattr(args, 'pmf_uncertainty_n_boot', 100))
+        # `selected` can be force-overridden to a gamd_* name via
+        # --selected-method even when boost_ok is False (sel is then really
+        # umbrella-only, an all-NaN boost array under the hood) -- dispatch
+        # the bootstrap on what `sel` actually IS, not on the possibly-forced
+        # label, so it doesn't try to rebuild gamd-style replicates from an
+        # all-NaN boost.
+        _boot_method = selected if boost_ok else 'umbrella_only'
+        boot_result = _bootstrap_pmf_uncertainty_1d(
+            d.cv, logw, d.boost_kj, bins, d.beta, kbt_kcal, d.window, block_ids,
+            _boot_method, sel, n_boot, boot_rng,
+            smooth_logfac_sigma=_eff_smooth(args, 'gamd_smooth_sigma'),
+        )
+        pmf_uncertainty_std = boot_result['pmf_std']
+        _uncertainty_extra = {'pmf_std_kcal_mol': pmf_uncertainty_std}
+        if boot_result['low_block_windows']:
+            warnings.append(f"{warning_prefix}PMF uncertainty is unreliable near windows {boot_result['low_block_windows']} (fewer than 3 independent trajectory blocks).")
+    write_pmf(out / 'pmf_unbiased.csv', sel, selected, {'boost_mean_kj_mol': _sel_diag.get('boost_mean_kj', np.full(args.bins, np.nan)), 'boost_var_kj2_mol2': _sel_diag.get('boost_var_kj2', np.full(args.bins, np.nan)), **_uncertainty_extra})
     write_pmf(out / 'pmf_umbrella_only.csv', umbrella, 'umbrella_only')
     write_pmf(out / 'pmf_gamd_exponential.csv', exp_pmf, 'gamd_exponential')
     write_pmf(out / 'pmf_gamd_cumulant2.csv', cum_pmf, 'gamd_cumulant2', {'boost_mean_kj_mol': cdiag.get('boost_mean_kj', np.full(args.bins, np.nan)), 'boost_var_kj2_mol2': cdiag.get('boost_var_kj2', np.full(args.bins, np.nan))})
@@ -9368,6 +9586,7 @@ def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.nd
         'pmfs': pmfs, 'selected': selected, 'boost_ok': boost_ok, 'boost': bs,
         'pmf_span_kcal_mol': span, 'pmf_minimum_cv_A': float(sel['cv_A'][minidx]) if minidx >= 0 else None,
         'neighbor_overlap': neigh, 'n_samples': N, 'O': O,
+        'pmf_uncertainty_std': pmf_uncertainty_std,
         'files': {
             'pmf_unbiased_csv': str(out / 'pmf_unbiased.csv'), 'pmf_all_methods_csv': str(out / 'pmf_all_methods.csv'),
             'pmf_umbrella_only_csv': str(out / 'pmf_umbrella_only.csv'), 'pmf_gamd_exponential_csv': str(out / 'pmf_gamd_exponential.csv'),
@@ -9510,6 +9729,9 @@ def parse_args(argv=None):
     p.add_argument('--cv-min', type=float, default=None)
     p.add_argument('--cv-max', type=float, default=None)
     p.add_argument('--min-neighbor-overlap', type=float, default=0.30)
+    p.add_argument('--pmf-uncertainty', action='store_true', help='Compute per-bin statistical uncertainty (std, kcal/mol) for the selected/headline PMF via a fixed-f_k block bootstrap (blocks = one replica within one epoch/phase). Off by default: adds real compute cost (roughly n_boot resample-and-rebuild passes) with no MBAR re-solve.')
+    p.add_argument('--pmf-uncertainty-n-boot', type=int, default=100, help='Number of block-bootstrap replicates for --pmf-uncertainty. Higher is more precise but slower; below ~20 the uncertainty-of-the-uncertainty is itself noisy.')
+    p.add_argument('--pmf-uncertainty-seed', type=int, default=0, help='Seed for --pmf-uncertainty block resampling, for reproducible error bars across runs.')
     p.add_argument('--traj-workers', type=int, default=8, help='Number of parallel worker threads for trajectory-derived observables (Rg, chignolin FES). Each thread loads one replica\'s segments concurrently. mdtraj releases the GIL during XTC/DCD reads so true parallelism is achieved. Set to 1 to disable threading.')
     p.add_argument('--duckdb-threads', type=int, default=0, help='Total DuckDB threads distributed across parallel parquet loaders. 0=auto (min(cpu_count, NUMEXPR_MAX_THREADS, 64)). Divide by --load-workers to get per-connection thread count.')
     p.add_argument('--load-workers', type=int, default=8, help='Number of parallel epoch-dir workers for adaptive parquet loading. Each opens its own DuckDB connection with (--duckdb-threads / --load-workers) threads. Set to 1 to disable parallelism.')
