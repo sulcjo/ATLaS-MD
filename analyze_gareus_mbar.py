@@ -2364,6 +2364,28 @@ def _filter_epoch_source(d: Data, keep: np.ndarray) -> None:
         d.meta['_epoch_source'] = arr[keep].tolist()
 
 
+def _sample_block_ids(d: 'Data') -> np.ndarray:
+    """Per-sample block id for the fixed-f_k block bootstrap (see
+    docs/superpowers/specs/2026-08-13-pmf-bootstrap-uncertainty-design.md):
+    one block = one (epoch_source, replica) pair, matching one replica's
+    samples within one epoch/phase -- treating the same replica index reused
+    in a later epoch as a NEW block, since adaptive-production runs don't
+    guarantee trajectory continuity across epoch boundaries. Falls back to
+    `replica` alone when `d.meta['_epoch_source']` is absent (single-source/
+    non-adaptive-production runs).
+
+    Returns a compact 0..M-1 int64 array, same length as d.replica.
+    """
+    replica = np.asarray(d.replica)
+    epoch_src = d.meta.get('_epoch_source')
+    if epoch_src is None:
+        keys = replica.reshape(-1, 1)
+    else:
+        keys = np.stack([np.asarray(epoch_src), replica], axis=1)
+    _, block_ids = np.unique(keys, axis=0, return_inverse=True)
+    return block_ids.reshape(-1).astype(np.int64)
+
+
 def _skip_first_n_frames(d: Data, n: int) -> Data:
     """Drop first n samples per replica (sorted by step) for equilibration burn-in."""
     keep = np.ones(d.cv.size, dtype=bool)
