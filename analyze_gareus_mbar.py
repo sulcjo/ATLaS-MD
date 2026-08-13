@@ -3578,6 +3578,90 @@ def _cumulant_expansion_2d_both(x,y,base_w,boost,xbins,ybins,beta,kbt_kcal,smoot
     return result2, result3
 
 
+def _bootstrap_pmf_uncertainty_1d(cv, logw, boost, bins, beta, kbt_kcal,
+                                   window, block_ids, selected_method,
+                                   main_pmf, n_boot, rng):
+    """Fixed-f_k block bootstrap uncertainty for a 1D PMF (see
+    docs/superpowers/specs/2026-08-13-pmf-bootstrap-uncertainty-design.md).
+
+    For each window, resamples that window's own blocks (see
+    `_sample_block_ids`) with replacement -- same number of blocks drawn as
+    the window originally had, different composition -- reusing each drawn
+    sample's already-computed per-sample log-weight `logw` (f_k stays
+    fixed; no MBAR re-solve). Rebuilds `selected_method`'s PMF on the
+    resampled set for each of `n_boot` replicates, re-anchors every
+    replicate to read exactly 0 at the SAME bin `main_pmf` uses as its own
+    minimum (never the replicate's own minimum -- anchoring to each
+    replicate's own minimum would artificially erase uncertainty exactly at
+    that bin and distort every other bin's uncertainty relative to it), and
+    returns the per-bin std across replicates.
+
+    `selected_method` must be one of 'umbrella_only', 'gamd_exponential',
+    'gamd_cumulant2', 'gamd_cumulant3' -- the same keys as the `pmfs` dict
+    built in `run_pmf_and_gamd_boost_report`.
+
+    Returns {'pmf_std': ndarray (len(bins)-1,),
+             'blocks_per_window': ndarray (K,),
+             'low_block_windows': list[int]} -- windows with fewer than 3
+    blocks, whose contribution to the estimate is unreliable.
+    """
+    cv = np.asarray(cv, dtype=np.float64)
+    logw = np.asarray(logw, dtype=np.float64)
+    boost = np.asarray(boost, dtype=np.float64)
+    window = np.asarray(window)
+    block_ids = np.asarray(block_ids)
+    K = int(np.max(window)) + 1 if window.size else 0
+    minidx = int(np.nanargmin(main_pmf['pmf']))
+
+    window_block_map = []
+    blocks_per_window = np.zeros(K, dtype=np.int64)
+    for k in range(K):
+        idx_k = np.where(window == k)[0]
+        blocks_k = block_ids[idx_k]
+        uniq = np.unique(blocks_k)
+        blocks_per_window[k] = uniq.size
+        grouped = {b: idx_k[blocks_k == b] for b in uniq}
+        window_block_map.append((uniq, grouped))
+    low_block_windows = [k for k in range(K) if 0 < blocks_per_window[k] < 3]
+
+    n_bins = len(bins) - 1
+    reps = np.full((n_boot, n_bins), np.nan, dtype=np.float64)
+    for b in range(n_boot):
+        resampled_parts = []
+        for k in range(K):
+            uniq, grouped = window_block_map[k]
+            if uniq.size == 0:
+                continue
+            chosen = rng.choice(uniq, size=uniq.size, replace=True)
+            for blk in chosen:
+                resampled_parts.append(grouped[blk])
+        if not resampled_parts:
+            continue
+        resampled_idx = np.concatenate(resampled_parts)
+        cv_b = cv[resampled_idx]
+        logw_b = logw[resampled_idx]
+        boost_b = boost[resampled_idx]
+        if selected_method == 'umbrella_only':
+            w_b = norm_logw(logw_b)
+            rep_pmf = pmf_from_weights(cv_b, w_b, bins, kbt_kcal)
+        elif selected_method == 'gamd_exponential':
+            w_b = norm_logw(logw_b + beta * boost_b)
+            rep_pmf = pmf_from_weights(cv_b, w_b, bins, kbt_kcal)
+        elif selected_method in ('gamd_cumulant2', 'gamd_cumulant3'):
+            base_w_b = norm_logw(logw_b)
+            order = 2 if selected_method == 'gamd_cumulant2' else 3
+            rep_pmf, _ = _cumulant_expansion(cv_b, base_w_b, boost_b, bins, beta, kbt_kcal, order=order)
+        else:
+            raise ValueError(f"unknown selected_method {selected_method!r}")
+        rep_arr = np.asarray(rep_pmf['pmf'], dtype=np.float64)
+        anchor = rep_arr[minidx]
+        reps[b] = rep_arr - anchor
+
+    with np.errstate(invalid='ignore'):
+        pmf_std = np.nanstd(reps, axis=0)
+    return {'pmf_std': pmf_std, 'blocks_per_window': blocks_per_window, 'low_block_windows': low_block_windows}
+
+
 def cumulant2_2d(x,y,base_w,boost,xbins,ybins,beta,kbt_kcal,smooth_logfac_sigma=0.0):
     return _cumulant_expansion_2d(x,y,base_w,boost,xbins,ybins,beta,kbt_kcal,order=2,smooth_logfac_sigma=smooth_logfac_sigma)
 
