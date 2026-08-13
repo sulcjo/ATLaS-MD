@@ -255,3 +255,146 @@ def test_pmf_uncertainty_flags_default_off_and_parse_correctly():
     assert args_on.pmf_uncertainty is True
     assert args_on.pmf_uncertainty_n_boot == 250
     assert args_on.pmf_uncertainty_seed == 7
+
+
+import csv as _csv
+from pathlib import Path as _Path
+
+
+def _make_real_data(tmp_path, rng, n_windows=3, samples_per_window=300, n_blocks_per_window=5):
+    """A minimal but real analyze_gareus_mbar.Data with a genuine multi-window
+    harmonic-umbrella u_nk, suitable for a real solve_mbar + run_pmf_and_gamd_boost_report call."""
+    centers = np.linspace(-1.0, 1.0, n_windows)
+    k_kcal = np.full(n_windows, 5.0)
+    beta = 1.0 / (agm.K_B_KJ_PER_MOL_K * 300.0)
+
+    cv_parts, window_parts, replica_parts, epoch_src_parts = [], [], [], []
+    for k in range(n_windows):
+        cv_parts.append(centers[k] + rng.normal(0.0, 0.3, size=samples_per_window))
+        window_parts.append(np.full(samples_per_window, k, dtype=np.int64))
+        # Spread this window's samples across n_blocks_per_window (replica, epoch_source=0) blocks.
+        replica_parts.append(np.repeat(np.arange(n_blocks_per_window), samples_per_window // n_blocks_per_window))
+        epoch_src_parts.append(np.zeros(samples_per_window, dtype=np.int64))
+    cv = np.concatenate(cv_parts)
+    window = np.concatenate(window_parts)
+    replica = np.concatenate([p[:len(w)] for p, w in zip(replica_parts, window_parts)])
+    epoch_src = np.concatenate(epoch_src_parts)
+    n = cv.size
+
+    u_nk = np.zeros((n, n_windows), dtype=np.float64)
+    for k in range(n_windows):
+        u_nk[:, k] = beta * agm.KJ_PER_KCAL * 0.5 * k_kcal[k] * (cv - centers[k]) ** 2
+
+    out_dir = _Path(tmp_path) / 'out'
+    out_dir.mkdir(parents=True, exist_ok=True)
+    d = agm.Data(
+        prod_dir=_Path(tmp_path), out_dir=out_dir, cv=cv, cv2=np.full(n, np.nan),
+        rg_A=np.full(n, np.nan), window=window, replica=replica, step=np.arange(n),
+        u_nk=u_nk, centers=centers, k_kcal=k_kcal, beta=beta, temp=300.0,
+        boost_kj=np.full(n, np.nan), potential_kj=None, source='test',
+        meta={'_epoch_source': epoch_src.tolist()},
+    )
+    return d
+
+
+class _Args:
+    def __init__(self, **kw):
+        self.bins = 20
+        self.min_neighbor_overlap = 0.0
+        self.selected_method = 'auto'
+        self.gamd_smooth_sigma = 0.0
+        self.pmf_smooth_sigma = 0.0
+        self.pmf_uncertainty = False
+        self.pmf_uncertainty_n_boot = 30
+        self.pmf_uncertainty_seed = 0
+        self.__dict__.update(kw)
+
+
+def test_pmf_uncertainty_off_by_default_leaves_csv_unchanged(tmp_path):
+    rng = np.random.default_rng(10)
+    d = _make_real_data(tmp_path, rng)
+    m = agm.solve_mbar(d.u_nk, d.window)
+    logw = np.asarray(m['logw'], dtype=np.float64)
+    bins = agm.make_bins(d.cv, 20, None, None)
+    kbt_kcal = (1.0 / d.beta) / agm.KJ_PER_KCAL
+
+    args_off = _Args(pmf_uncertainty=False)
+    info_off = agm.run_pmf_and_gamd_boost_report(d, args_off, logw, bins, kbt_kcal, d.out_dir, [], None)
+    assert info_off.get('pmf_uncertainty_std') is None
+
+    with (d.out_dir / 'pmf_unbiased.csv').open() as f:
+        header = next(_csv.reader(f))
+    assert 'pmf_std_kcal_mol' not in header
+
+
+def test_pmf_uncertainty_on_adds_std_column_and_return_value(tmp_path):
+    rng = np.random.default_rng(11)
+    d = _make_real_data(tmp_path, rng)
+    m = agm.solve_mbar(d.u_nk, d.window)
+    logw = np.asarray(m['logw'], dtype=np.float64)
+    bins = agm.make_bins(d.cv, 20, None, None)
+    kbt_kcal = (1.0 / d.beta) / agm.KJ_PER_KCAL
+
+    args_on = _Args(pmf_uncertainty=True)
+    warnings = []
+    info_on = agm.run_pmf_and_gamd_boost_report(d, args_on, logw, bins, kbt_kcal, d.out_dir, warnings, None)
+    assert info_on.get('pmf_uncertainty_std') is not None
+    assert info_on['pmf_uncertainty_std'].shape == info_on['pmfs'][info_on['selected']]['pmf'].shape
+
+    with (d.out_dir / 'pmf_unbiased.csv').open() as f:
+        header = next(_csv.reader(f))
+    assert 'pmf_std_kcal_mol' in header
+
+
+def test_pmf_uncertainty_warns_on_low_block_count_windows(tmp_path):
+    rng = np.random.default_rng(12)
+    # n_blocks_per_window=1 -> every window is a "low block count" window.
+    d = _make_real_data(tmp_path, rng, n_blocks_per_window=1)
+    m = agm.solve_mbar(d.u_nk, d.window)
+    logw = np.asarray(m['logw'], dtype=np.float64)
+    bins = agm.make_bins(d.cv, 20, None, None)
+    kbt_kcal = (1.0 / d.beta) / agm.KJ_PER_KCAL
+
+    args_on = _Args(pmf_uncertainty=True)
+    warnings = []
+    agm.run_pmf_and_gamd_boost_report(d, args_on, logw, bins, kbt_kcal, d.out_dir, warnings, None)
+    assert any('uncertainty' in w.lower() and 'block' in w.lower() for w in warnings)
+
+
+def test_pmf_uncertainty_skips_gracefully_when_selected_pmf_is_all_nan(tmp_path):
+    """sel['pmf'] can be entirely non-finite (see the finite/minidx guard
+    right above the uncertainty insertion point in
+    run_pmf_and_gamd_boost_report) -- an all-NaN case is reachable in
+    practice by GaMD-cumulant NaN-bin-flagging combined with smoothing.
+    _bootstrap_pmf_uncertainty_1d's own np.nanargmin on an all-NaN
+    main_pmf['pmf'] raises ValueError (verified directly), so the
+    integration point must not call it when minidx<0 -- exercised here via
+    the function's own extra_pmfs/selected_method-forcing mechanism to
+    construct a genuinely all-NaN selected PMF without fragile GaMD-data
+    crafting."""
+    rng = np.random.default_rng(13)
+    d = _make_real_data(tmp_path, rng)
+    m = agm.solve_mbar(d.u_nk, d.window)
+    logw = np.asarray(m['logw'], dtype=np.float64)
+    bins = agm.make_bins(d.cv, 20, None, None)
+    kbt_kcal = (1.0 / d.beta) / agm.KJ_PER_KCAL
+    n_bins = len(bins) - 1
+
+    all_nan_pmf = {
+        'cv_A': 0.5 * (bins[:-1] + bins[1:]),
+        'prob': np.zeros(n_bins),
+        'pmf': np.full(n_bins, np.nan),
+        'counts': np.zeros(n_bins, dtype=int),
+    }
+    args_on = _Args(pmf_uncertainty=True, selected_method='forced_all_nan')
+    warnings = []
+    info = agm.run_pmf_and_gamd_boost_report(
+        d, args_on, logw, bins, kbt_kcal, d.out_dir, warnings, None,
+        extra_pmfs={'forced_all_nan': all_nan_pmf},
+    )
+    assert info['selected'] == 'forced_all_nan'
+    assert info.get('pmf_uncertainty_std') is None
+
+    with (d.out_dir / 'pmf_unbiased.csv').open() as f:
+        header = next(_csv.reader(f))
+    assert 'pmf_std_kcal_mol' not in header

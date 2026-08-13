@@ -9523,7 +9523,26 @@ def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.nd
     span = float(np.max(finite) - np.min(finite)) if finite.size else float('nan')
     minidx = int(np.nanargmin(sel['pmf'])) if finite.size else -1
     _sel_diag = {'gamd_cumulant2': cdiag, 'gamd_cumulant3': cdiag3}.get(selected, cdiag)
-    write_pmf(out / 'pmf_unbiased.csv', sel, selected, {'boost_mean_kj_mol': _sel_diag.get('boost_mean_kj', np.full(args.bins, np.nan)), 'boost_var_kj2_mol2': _sel_diag.get('boost_var_kj2', np.full(args.bins, np.nan))})
+    pmf_uncertainty_std = None
+    _uncertainty_extra = {}
+    if getattr(args, 'pmf_uncertainty', False) and minidx >= 0:
+        # minidx<0 means sel['pmf'] has no finite bin at all (see the
+        # finite/minidx guard two lines above) -- _bootstrap_pmf_uncertainty_1d's
+        # own np.nanargmin on an all-NaN main_pmf['pmf'] would raise, so skip
+        # the uncertainty computation the same way pmf_minimum_cv_A is
+        # already silently skipped for this degenerate case.
+        block_ids = _sample_block_ids(d)
+        boot_rng = np.random.default_rng(int(getattr(args, 'pmf_uncertainty_seed', 0)))
+        n_boot = int(getattr(args, 'pmf_uncertainty_n_boot', 100))
+        boot_result = _bootstrap_pmf_uncertainty_1d(
+            d.cv, logw, d.boost_kj, bins, d.beta, kbt_kcal, d.window, block_ids,
+            selected, sel, n_boot, boot_rng,
+        )
+        pmf_uncertainty_std = boot_result['pmf_std']
+        _uncertainty_extra = {'pmf_std_kcal_mol': pmf_uncertainty_std}
+        if boot_result['low_block_windows']:
+            warnings.append(f"{warning_prefix}PMF uncertainty is unreliable near windows {boot_result['low_block_windows']} (fewer than 3 independent trajectory blocks).")
+    write_pmf(out / 'pmf_unbiased.csv', sel, selected, {'boost_mean_kj_mol': _sel_diag.get('boost_mean_kj', np.full(args.bins, np.nan)), 'boost_var_kj2_mol2': _sel_diag.get('boost_var_kj2', np.full(args.bins, np.nan)), **_uncertainty_extra})
     write_pmf(out / 'pmf_umbrella_only.csv', umbrella, 'umbrella_only')
     write_pmf(out / 'pmf_gamd_exponential.csv', exp_pmf, 'gamd_exponential')
     write_pmf(out / 'pmf_gamd_cumulant2.csv', cum_pmf, 'gamd_cumulant2', {'boost_mean_kj_mol': cdiag.get('boost_mean_kj', np.full(args.bins, np.nan)), 'boost_var_kj2_mol2': cdiag.get('boost_var_kj2', np.full(args.bins, np.nan))})
@@ -9544,6 +9563,7 @@ def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.nd
         'pmfs': pmfs, 'selected': selected, 'boost_ok': boost_ok, 'boost': bs,
         'pmf_span_kcal_mol': span, 'pmf_minimum_cv_A': float(sel['cv_A'][minidx]) if minidx >= 0 else None,
         'neighbor_overlap': neigh, 'n_samples': N, 'O': O,
+        'pmf_uncertainty_std': pmf_uncertainty_std,
         'files': {
             'pmf_unbiased_csv': str(out / 'pmf_unbiased.csv'), 'pmf_all_methods_csv': str(out / 'pmf_all_methods.csv'),
             'pmf_umbrella_only_csv': str(out / 'pmf_umbrella_only.csv'), 'pmf_gamd_exponential_csv': str(out / 'pmf_gamd_exponential.csv'),
