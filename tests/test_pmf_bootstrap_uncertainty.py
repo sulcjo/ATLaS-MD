@@ -179,3 +179,40 @@ def test_bootstrap_handles_gamd_cumulant2_selected_method():
     )
     assert result['pmf_std'].shape == main_pmf['pmf'].shape
     assert np.any(np.isfinite(result['pmf_std']))
+
+
+def test_bootstrap_handles_gamd_exponential_selected_method():
+    rng = np.random.default_rng(6)
+    cv, block_ids, window, _, _ = _synthetic_blocked_cv(rng)
+    logw = np.zeros_like(cv)
+    boost = rng.normal(50.0, 8.0, size=cv.size)  # realistic GaMD boost scale, kJ/mol
+    bins = agm.make_bins(cv, 15, None, None)
+    beta = 1.0 / (agm.K_B_KJ_PER_MOL_K * 300.0)
+    # gamd_exponential computes PMF via: norm_logw(logw + beta*boost) -> pmf_from_weights
+    w_exp = agm.norm_logw(logw + beta * boost)
+    main_pmf = agm.pmf_from_weights(cv, w_exp, bins, KBT_KCAL)
+
+    result = agm._bootstrap_pmf_uncertainty_1d(
+        cv, logw, boost, bins, beta, KBT_KCAL, window, block_ids,
+        'gamd_exponential', main_pmf, n_boot=30, rng=np.random.default_rng(0),
+    )
+    assert result['pmf_std'].shape == main_pmf['pmf'].shape
+    assert np.any(np.isfinite(result['pmf_std']))
+
+
+def test_bootstrap_handles_gamd_cumulant3_selected_method():
+    rng = np.random.default_rng(7)
+    cv, block_ids, window, _, _ = _synthetic_blocked_cv(rng)
+    logw = np.zeros_like(cv)
+    boost = rng.normal(50.0, 8.0, size=cv.size)  # realistic GaMD boost scale, kJ/mol
+    bins = agm.make_bins(cv, 15, None, None)
+    beta = 1.0 / (agm.K_B_KJ_PER_MOL_K * 300.0)
+    base_w = agm.norm_logw(logw)
+    main_pmf, _ = agm._cumulant_expansion(cv, base_w, boost, bins, beta, KBT_KCAL, order=3)
+
+    result = agm._bootstrap_pmf_uncertainty_1d(
+        cv, logw, boost, bins, beta, KBT_KCAL, window, block_ids,
+        'gamd_cumulant3', main_pmf, n_boot=30, rng=np.random.default_rng(0),
+    )
+    assert result['pmf_std'].shape == main_pmf['pmf'].shape
+    assert np.any(np.isfinite(result['pmf_std']))
