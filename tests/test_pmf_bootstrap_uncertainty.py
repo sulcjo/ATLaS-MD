@@ -50,7 +50,7 @@ KBT_KCAL = 0.596  # ~300K, matches the file's own documented round-trip check
 
 
 def _synthetic_blocked_cv(rng, n_blocks=5, samples_per_block=200,
-                           between_block_std=1.0, within_block_std=0.1):
+                           between_block_std=0.3, within_block_std=0.5):
     """One window's worth of samples: `n_blocks` blocks, each block a tight
     cluster around its own randomly-offset center. between_block_std >>
     within_block_std means the block structure carries real information a
@@ -78,7 +78,8 @@ def _naive_per_sample_bootstrap_std(cv, logw, bins, n_boot, rng):
         idx = rng.integers(0, n, size=n)
         w = agm.norm_logw(logw[idx])
         reps[b] = agm.pmf_from_weights(cv[idx], w, bins, KBT_KCAL)['pmf']
-    return np.nanstd(reps, axis=0)
+    with np.errstate(invalid='ignore'):
+        return np.nanstd(reps, axis=0)
 
 
 def test_block_bootstrap_reports_wider_uncertainty_than_naive_per_sample():
