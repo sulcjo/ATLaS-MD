@@ -2378,6 +2378,14 @@ def _sample_block_ids(d: 'Data') -> np.ndarray:
     """
     replica = np.asarray(d.replica)
     epoch_src = d.meta.get('_epoch_source')
+    if epoch_src is not None and len(epoch_src) != replica.size:
+        # Stale relative to replica/cv/etc. -- clean() row-filters per-sample
+        # arrays by a finiteness mask but doesn't sync this metadata list, so
+        # it can be longer than replica.size on any path where clean() ever
+        # dropped a sample. Same defensive length check every other consumer
+        # of _epoch_source in this file already applies; fall back to
+        # replica-only blocks rather than let np.stack raise below.
+        epoch_src = None
     if epoch_src is None:
         keys = replica.reshape(-1, 1)
     else:
@@ -3580,7 +3588,7 @@ def _cumulant_expansion_2d_both(x,y,base_w,boost,xbins,ybins,beta,kbt_kcal,smoot
 
 def _bootstrap_pmf_uncertainty_1d(cv, logw, boost, bins, beta, kbt_kcal,
                                    window, block_ids, selected_method,
-                                   main_pmf, n_boot, rng):
+                                   main_pmf, n_boot, rng, smooth_logfac_sigma=0.0):
     """Fixed-f_k block bootstrap uncertainty for a 1D PMF (see
     docs/superpowers/specs/2026-08-13-pmf-bootstrap-uncertainty-design.md).
 
@@ -3599,6 +3607,12 @@ def _bootstrap_pmf_uncertainty_1d(cv, logw, boost, bins, beta, kbt_kcal,
     `selected_method` must be one of 'umbrella_only', 'gamd_exponential',
     'gamd_cumulant2', 'gamd_cumulant3' -- the same keys as the `pmfs` dict
     built in `run_pmf_and_gamd_boost_report`.
+
+    `smooth_logfac_sigma`: forwarded to `_cumulant_expansion` for the
+    'gamd_cumulant2'/'gamd_cumulant3' branches only (the other two branches
+    don't smooth). Callers must pass the SAME value used to build `main_pmf`
+    -- otherwise the replicates describe a different (differently-smoothed)
+    curve than the one `pmf_std` is meant to describe the uncertainty of.
 
     Returns {'pmf_std': ndarray (len(bins)-1,),
              'blocks_per_window': ndarray (K,),
@@ -3650,7 +3664,7 @@ def _bootstrap_pmf_uncertainty_1d(cv, logw, boost, bins, beta, kbt_kcal,
         elif selected_method in ('gamd_cumulant2', 'gamd_cumulant3'):
             base_w_b = norm_logw(logw_b)
             order = 2 if selected_method == 'gamd_cumulant2' else 3
-            rep_pmf, _ = _cumulant_expansion(cv_b, base_w_b, boost_b, bins, beta, kbt_kcal, order=order)
+            rep_pmf, _ = _cumulant_expansion(cv_b, base_w_b, boost_b, bins, beta, kbt_kcal, order=order, smooth_logfac_sigma=smooth_logfac_sigma)
         else:
             raise ValueError(f"unknown selected_method {selected_method!r}")
         rep_arr = np.asarray(rep_pmf['pmf'], dtype=np.float64)
@@ -3664,12 +3678,13 @@ def _bootstrap_pmf_uncertainty_1d(cv, logw, boost, bins, beta, kbt_kcal,
 
 def _bootstrap_pmf_uncertainty_2d(x, y, logw, boost, xbins, ybins, beta, kbt_kcal,
                                    window, block_ids, selected_method,
-                                   main_fes, n_boot, rng):
+                                   main_fes, n_boot, rng, smooth_logfac_sigma=0.0):
     """2D counterpart of `_bootstrap_pmf_uncertainty_1d`; see that
-    docstring. Iterates windows/blocks identically, so with the same `rng`
-    state and the same `window`/`block_ids`, it draws the exact same
-    resampled index sets per replicate as the 1D helper -- verified by the
-    degenerate-y collapse test.
+    docstring (including the `smooth_logfac_sigma` note). Iterates
+    windows/blocks identically, so with the same `rng` state and the same
+    `window`/`block_ids`, it draws the exact same resampled index sets per
+    replicate as the 1D helper -- verified by the degenerate-y collapse
+    test.
     """
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
@@ -3720,7 +3735,7 @@ def _bootstrap_pmf_uncertainty_2d(x, y, logw, boost, xbins, ybins, beta, kbt_kca
         elif selected_method in ('gamd_cumulant2', 'gamd_cumulant3'):
             base_w_b = norm_logw(logw_b)
             order = 2 if selected_method == 'gamd_cumulant2' else 3
-            rep_fes, _ = _cumulant_expansion_2d(x_b, y_b, base_w_b, boost_b, xbins, ybins, beta, kbt_kcal, order=order)
+            rep_fes, _ = _cumulant_expansion_2d(x_b, y_b, base_w_b, boost_b, xbins, ybins, beta, kbt_kcal, order=order, smooth_logfac_sigma=smooth_logfac_sigma)
         else:
             raise ValueError(f"unknown selected_method {selected_method!r}")
         rep_arr = np.asarray(rep_fes['pmf'], dtype=np.float64)
@@ -9534,9 +9549,17 @@ def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.nd
         block_ids = _sample_block_ids(d)
         boot_rng = np.random.default_rng(int(getattr(args, 'pmf_uncertainty_seed', 0)))
         n_boot = int(getattr(args, 'pmf_uncertainty_n_boot', 100))
+        # `selected` can be force-overridden to a gamd_* name via
+        # --selected-method even when boost_ok is False (sel is then really
+        # umbrella-only, an all-NaN boost array under the hood) -- dispatch
+        # the bootstrap on what `sel` actually IS, not on the possibly-forced
+        # label, so it doesn't try to rebuild gamd-style replicates from an
+        # all-NaN boost.
+        _boot_method = selected if boost_ok else 'umbrella_only'
         boot_result = _bootstrap_pmf_uncertainty_1d(
             d.cv, logw, d.boost_kj, bins, d.beta, kbt_kcal, d.window, block_ids,
-            selected, sel, n_boot, boot_rng,
+            _boot_method, sel, n_boot, boot_rng,
+            smooth_logfac_sigma=_eff_smooth(args, 'gamd_smooth_sigma'),
         )
         pmf_uncertainty_std = boot_result['pmf_std']
         _uncertainty_extra = {'pmf_std_kcal_mol': pmf_uncertainty_std}

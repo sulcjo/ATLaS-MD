@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 import sys
+import warnings
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -44,6 +45,24 @@ def test_block_ids_are_compact_zero_based():
     block_ids = agm._sample_block_ids(d)
     assert set(np.unique(block_ids)) == {0, 1}
     assert block_ids.dtype == np.int64
+
+
+def test_block_ids_falls_back_to_replica_only_when_epoch_source_is_stale():
+    """clean() row-filters every per-sample array by a finiteness mask but
+    does NOT sync meta['_epoch_source'] -- every loader that populates
+    _epoch_source calls clean(Data(...)), so a dropped sample leaves
+    _epoch_source one (or more) entries too long relative to d.replica,
+    permanently. _sample_block_ids must not crash on this (np.stack would
+    otherwise raise 'all input arrays must have the same shape'); it should
+    fall back to replica-only blocks, identical to calling it with no
+    _epoch_source at all on the same replica array."""
+    d_stale = _make_data_stub(replica=[0, 0, 1, 1, 2], epoch_source=[0, 0, 0, 1, 1, 2])
+    d_no_epoch_source = _make_data_stub(replica=[0, 0, 1, 1, 2])
+
+    block_ids_stale = agm._sample_block_ids(d_stale)  # must not raise
+    block_ids_fallback = agm._sample_block_ids(d_no_epoch_source)
+
+    assert np.array_equal(block_ids_stale, block_ids_fallback)
 
 
 KBT_KCAL = 0.596  # ~300K, matches the file's own documented round-trip check
@@ -216,6 +235,46 @@ def test_bootstrap_handles_gamd_cumulant3_selected_method():
     )
     assert result['pmf_std'].shape == main_pmf['pmf'].shape
     assert np.any(np.isfinite(result['pmf_std']))
+
+
+def test_bootstrap_smooth_logfac_sigma_reaches_cumulant_expansion():
+    """smooth_logfac_sigma must be threaded through to the internal
+    _cumulant_expansion call for the gamd_cumulant2/3 branches -- otherwise
+    the bootstrap replicates describe a different (unsmoothed) curve than
+    whatever smoothed main_pmf is actually being reported. Passing a
+    nonzero value must change the result relative to smooth_logfac_sigma=0,
+    and omitting the argument entirely must still default to 0.0 (matching
+    every existing call site/test in this file, unmodified)."""
+    rng = np.random.default_rng(8)
+    cv, block_ids, window, _, _ = _synthetic_blocked_cv(rng)
+    logw = np.zeros_like(cv)
+    boost = rng.normal(50.0, 8.0, size=cv.size)
+    bins = agm.make_bins(cv, 15, None, None)
+    beta = 1.0 / (agm.K_B_KJ_PER_MOL_K * 300.0)
+    base_w = agm.norm_logw(logw)
+    main_pmf, _ = agm._cumulant_expansion(cv, base_w, boost, bins, beta, KBT_KCAL, order=2, smooth_logfac_sigma=1.5)
+
+    result_smoothed = agm._bootstrap_pmf_uncertainty_1d(
+        cv, logw, boost, bins, beta, KBT_KCAL, window, block_ids,
+        'gamd_cumulant2', main_pmf, n_boot=30, rng=np.random.default_rng(0),
+        smooth_logfac_sigma=1.5,
+    )['pmf_std']
+    result_default = agm._bootstrap_pmf_uncertainty_1d(
+        cv, logw, boost, bins, beta, KBT_KCAL, window, block_ids,
+        'gamd_cumulant2', main_pmf, n_boot=30, rng=np.random.default_rng(0),
+    )['pmf_std']
+    result_explicit_zero = agm._bootstrap_pmf_uncertainty_1d(
+        cv, logw, boost, bins, beta, KBT_KCAL, window, block_ids,
+        'gamd_cumulant2', main_pmf, n_boot=30, rng=np.random.default_rng(0),
+        smooth_logfac_sigma=0.0,
+    )['pmf_std']
+
+    # Omitting the argument is bit-for-bit identical to passing 0.0 explicitly.
+    assert np.array_equal(result_default, result_explicit_zero, equal_nan=True)
+
+    finite = np.isfinite(result_smoothed) & np.isfinite(result_default)
+    assert finite.sum() >= 3
+    assert not np.allclose(result_smoothed[finite], result_default[finite])
 
 
 def test_2d_bootstrap_collapses_to_1d_case_with_degenerate_y():
@@ -398,3 +457,39 @@ def test_pmf_uncertainty_skips_gracefully_when_selected_pmf_is_all_nan(tmp_path)
     with (d.out_dir / 'pmf_unbiased.csv').open() as f:
         header = next(_csv.reader(f))
     assert 'pmf_std_kcal_mol' not in header
+
+
+def test_pmf_uncertainty_dispatches_on_actual_pmf_not_forced_selected_label(tmp_path):
+    """`selected` can be force-overridden to a gamd_* method name via
+    --selected-method even when boost_ok is False -- `sel` is then really
+    the umbrella-only PMF under the hood (d.boost_kj all-NaN, boost_ok
+    False), but before the fix the bootstrap dispatched on the forced label
+    and tried to rebuild gamd_cumulant2-style replicates from an all-NaN
+    boost array, producing an all-NaN pmf_std plus a spurious numpy
+    'Degrees of freedom <= 0 for slice' RuntimeWarning. The bootstrap must
+    dispatch on what `sel` actually contains instead, so this is a real
+    umbrella-only bootstrap that produces finite uncertainty and no
+    warning."""
+    rng = np.random.default_rng(14)
+    d = _make_real_data(tmp_path, rng)  # boost_kj is all-NaN -> boost_ok False
+    m = agm.solve_mbar(d.u_nk, d.window)
+    logw = np.asarray(m['logw'], dtype=np.float64)
+    bins = agm.make_bins(d.cv, 20, None, None)
+    kbt_kcal = (1.0 / d.beta) / agm.KJ_PER_KCAL
+
+    args_on = _Args(pmf_uncertainty=True, selected_method='gamd_cumulant2')
+    warn_list = []
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        info = agm.run_pmf_and_gamd_boost_report(
+            d, args_on, logw, bins, kbt_kcal, d.out_dir, warn_list, None,
+        )
+
+    assert info['boost_ok'] is False
+    assert info['selected'] == 'gamd_cumulant2'  # label is still forced, per existing behavior
+    std = info.get('pmf_uncertainty_std')
+    assert std is not None
+    assert np.any(np.isfinite(std))  # a real umbrella-only bootstrap ran, not an all-NaN one
+
+    dof_warnings = [w for w in caught if 'degrees of freedom' in str(w.message).lower()]
+    assert not dof_warnings
