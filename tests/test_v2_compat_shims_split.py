@@ -69,6 +69,23 @@ def test_flush_every_log_explicit_false_is_honoured():
     assert args.flush_every_log is False
 
 
+def test_us_2d_distance_fraction_default_matches_historical_value():
+    # --us-2d-distance-fraction did not exist as a CLI flag until this test was
+    # added: _shim_us_pulling unconditionally hardcoded
+    # args.us_2d_start_distance_fraction = 0.50 regardless of any config,
+    # silently defeating the --us-2d-start-distance-fraction tuning advice
+    # cv_discovery.py's own diagnostics have long recommended. This pins the
+    # historical default so introducing the real flag doesn't change behavior
+    # for anyone who never sets it.
+    args = _parsed()
+    assert args.us_2d_start_distance_fraction == 0.50
+
+
+def test_us_2d_distance_fraction_is_actually_configurable():
+    args = _parsed(["--us-2d-distance-fraction", "0.05"])
+    assert args.us_2d_start_distance_fraction == pytest.approx(0.05)
+
+
 def test_genpept_prior_stays_deliberately_disabled():
     args = _parsed()
     assert args.genpept_prior_enabled is False

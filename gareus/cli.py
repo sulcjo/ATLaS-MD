@@ -379,6 +379,15 @@ def _add_us_args(p: argparse.ArgumentParser) -> None:
                         "close to both CV targets. Prevents an already-good seed from drifting off its "
                         "secondary CV target while the fully unrestrained primary-only phase runs. 0 "
                         "keeps the historical fully-unrestrained behavior for every seed, good or bad.")
+    p.add_argument("--us-2d-distance-fraction", type=float, default=0.50,
+                   help="Fraction of a 2D pull's steps spent in the primary-only phase (secondary CV held "
+                        "at --us-2d-secondary-hold-scale, or fully unrestrained for seeds too far to hold) "
+                        "before the remaining steps ramp the secondary CV in toward its own target. "
+                        "Lower this (e.g. 0.05-0.15) when the post-pull US starting-structure quality gate "
+                        "still fails on secondary_cv_delta despite good seeds: it gives the secondary-CV "
+                        "ramp far more of the pull budget to actually converge, instead of spending half of "
+                        "it on a primary-only phase whose own convergence (primary_cv_delta) is rarely the "
+                        "bottleneck. Clamped to [0, 0.95].")
     p.add_argument("--us-allow-bad-windows", action=argparse.BooleanOptionalAction, default=False,
                    help="Start production even if US starting-structure quality-control flags windows "
                         "as 'bad' (start far enough from its production center that the full-strength "
@@ -860,13 +869,13 @@ def _shim_us_pulling(args: argparse.Namespace) -> None:
     args.us_2d_start_relax_mode = args.us_2d_relax_mode
     args.us_2d_start_secondary_k_pull_scale = args.us_2d_secondary_k_scale
     args.us_2d_start_secondary_hold_scale = args.us_2d_secondary_hold_scale
+    args.us_2d_start_distance_fraction = args.us_2d_distance_fraction
     args.us_2d_start_secondary_ramp_stages = args.us_pull_ramp_stages
     # Dropped US pull tuning
     args.contact_us_pull_timestep_fs = 1.0
     args.contact_us_pull_safe_chunk_steps = 100
     args.contact_us_pull_min_friction_per_ps = 20.0
     args.contact_us_pull_minimize_first_ramp = True
-    args.us_2d_start_distance_fraction = 0.50
     args.us_2d_start_minimize_each_ramp = False
     args.us_2d_start_secondary_warn_delta = 0.35
     args.us_2d_start_secondary_warn_bias_kcal = 1.0
