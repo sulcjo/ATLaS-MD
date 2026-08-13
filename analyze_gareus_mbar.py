@@ -3662,6 +3662,76 @@ def _bootstrap_pmf_uncertainty_1d(cv, logw, boost, bins, beta, kbt_kcal,
     return {'pmf_std': pmf_std, 'blocks_per_window': blocks_per_window, 'low_block_windows': low_block_windows}
 
 
+def _bootstrap_pmf_uncertainty_2d(x, y, logw, boost, xbins, ybins, beta, kbt_kcal,
+                                   window, block_ids, selected_method,
+                                   main_fes, n_boot, rng):
+    """2D counterpart of `_bootstrap_pmf_uncertainty_1d`; see that
+    docstring. Iterates windows/blocks identically, so with the same `rng`
+    state and the same `window`/`block_ids`, it draws the exact same
+    resampled index sets per replicate as the 1D helper -- verified by the
+    degenerate-y collapse test.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    logw = np.asarray(logw, dtype=np.float64)
+    boost = np.asarray(boost, dtype=np.float64)
+    window = np.asarray(window)
+    block_ids = np.asarray(block_ids)
+    K = int(np.max(window)) + 1 if window.size else 0
+    main_arr = np.asarray(main_fes['pmf'], dtype=np.float64)
+    minidx_flat = int(np.nanargmin(main_arr.ravel()))
+    minidx = np.unravel_index(minidx_flat, main_arr.shape)
+
+    window_block_map = []
+    blocks_per_window = np.zeros(K, dtype=np.int64)
+    for k in range(K):
+        idx_k = np.where(window == k)[0]
+        blocks_k = block_ids[idx_k]
+        uniq = np.unique(blocks_k)
+        blocks_per_window[k] = uniq.size
+        grouped = {b: idx_k[blocks_k == b] for b in uniq}
+        window_block_map.append((uniq, grouped))
+    low_block_windows = [k for k in range(K) if 0 < blocks_per_window[k] < 3]
+
+    Bx, By = main_arr.shape
+    reps = np.full((n_boot, Bx, By), np.nan, dtype=np.float64)
+    for b in range(n_boot):
+        resampled_parts = []
+        for k in range(K):
+            uniq, grouped = window_block_map[k]
+            if uniq.size == 0:
+                continue
+            chosen = rng.choice(uniq, size=uniq.size, replace=True)
+            for blk in chosen:
+                resampled_parts.append(grouped[blk])
+        if not resampled_parts:
+            continue
+        resampled_idx = np.concatenate(resampled_parts)
+        x_b = x[resampled_idx]
+        y_b = y[resampled_idx]
+        logw_b = logw[resampled_idx]
+        boost_b = boost[resampled_idx]
+        if selected_method == 'umbrella_only':
+            w_b = norm_logw(logw_b)
+            rep_fes = pmf2d_from_weights(x_b, y_b, w_b, xbins, ybins, kbt_kcal)
+        elif selected_method == 'gamd_exponential':
+            w_b = norm_logw(logw_b + beta * boost_b)
+            rep_fes = pmf2d_from_weights(x_b, y_b, w_b, xbins, ybins, kbt_kcal)
+        elif selected_method in ('gamd_cumulant2', 'gamd_cumulant3'):
+            base_w_b = norm_logw(logw_b)
+            order = 2 if selected_method == 'gamd_cumulant2' else 3
+            rep_fes, _ = _cumulant_expansion_2d(x_b, y_b, base_w_b, boost_b, xbins, ybins, beta, kbt_kcal, order=order)
+        else:
+            raise ValueError(f"unknown selected_method {selected_method!r}")
+        rep_arr = np.asarray(rep_fes['pmf'], dtype=np.float64)
+        anchor = rep_arr[minidx]
+        reps[b] = rep_arr - anchor
+
+    with np.errstate(invalid='ignore'):
+        pmf_std = np.nanstd(reps, axis=0)
+    return {'pmf_std': pmf_std, 'blocks_per_window': blocks_per_window, 'low_block_windows': low_block_windows}
+
+
 def cumulant2_2d(x,y,base_w,boost,xbins,ybins,beta,kbt_kcal,smooth_logfac_sigma=0.0):
     return _cumulant_expansion_2d(x,y,base_w,boost,xbins,ybins,beta,kbt_kcal,order=2,smooth_logfac_sigma=smooth_logfac_sigma)
 

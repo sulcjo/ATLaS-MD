@@ -216,3 +216,28 @@ def test_bootstrap_handles_gamd_cumulant3_selected_method():
     )
     assert result['pmf_std'].shape == main_pmf['pmf'].shape
     assert np.any(np.isfinite(result['pmf_std']))
+
+
+def test_2d_bootstrap_collapses_to_1d_case_with_degenerate_y():
+    rng = np.random.default_rng(6)
+    cv, block_ids, window, logw, boost = _synthetic_blocked_cv(rng)
+    y = np.zeros_like(cv)
+    bins = agm.make_bins(cv, 15, None, None)
+    ybins = np.array([-0.5, 0.5])
+    beta = 1.0 / (agm.K_B_KJ_PER_MOL_K * 300.0)
+
+    main_pmf_1d = agm.pmf_from_weights(cv, agm.norm_logw(logw), bins, KBT_KCAL)
+    main_fes_2d = agm.pmf2d_from_weights(cv, y, agm.norm_logw(logw), bins, ybins, KBT_KCAL)
+
+    result_1d = agm._bootstrap_pmf_uncertainty_1d(
+        cv, logw, boost, bins, beta, KBT_KCAL, window, block_ids,
+        'umbrella_only', main_pmf_1d, n_boot=100, rng=np.random.default_rng(42),
+    )
+    result_2d = agm._bootstrap_pmf_uncertainty_2d(
+        cv, y, logw, boost, bins, ybins, beta, KBT_KCAL, window, block_ids,
+        'umbrella_only', main_fes_2d, n_boot=100, rng=np.random.default_rng(42),
+    )
+    # Same seed, same window/block structure -> both helpers draw the exact
+    # same sequence of resampled index sets, so the collapsed (single-y-bin)
+    # 2D result must match the 1D result bit-for-bit.
+    assert np.allclose(result_2d['pmf_std'][:, 0], result_1d['pmf_std'], atol=1e-10, equal_nan=True)
