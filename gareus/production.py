@@ -365,7 +365,17 @@ def infer_gamd_boost_kj_from_globals(globals_now: dict[str, float]) -> Optional[
     return float(sum(v for _, v in candidates))
 
 def _add_torsion_score_force(openmm, torsions, target_rad: float, sigma_rad: float, norm_name: str, target_name: str, sigma_name: str = "ss_sigma"):
-    """Return a CustomTorsionForce that sums normalized periodic Gaussian scores."""
+    """Return a CustomTorsionForce that sums normalized periodic Gaussian scores.
+
+    Uses OpenMM's ``theta`` directly, unlike ``_add_weighted_trig_torsion_force``
+    below. That's correct here, not an oversight: ``target_rad`` comes from
+    hardcoded literature Ramachandran angles (see ``secondary_cv_target_angles``
+    and ``rama_map_definitions``) already expressed in OpenMM's own convention,
+    never from ``tica._dihedral_rad``. Don't "fix" this by analogy with the
+    tica-linear/torsion-pca sign fix -- cos(theta-target) is not symmetric in
+    theta the way a bare cos(theta) is, so negating theta here would silently
+    break alpha/beta and rama-map scoring instead of correcting it.
+    """
     force = openmm.CustomTorsionForce(f"{norm_name}*exp(-(1-cos(theta-{target_name}))/({sigma_name}*{sigma_name}))")
     force.addGlobalParameter(str(target_name), float(target_rad))
     force.addGlobalParameter(str(sigma_name), float(sigma_rad))
@@ -376,8 +386,21 @@ def _add_torsion_score_force(openmm, torsions, target_rad: float, sigma_rad: flo
 
 
 def _add_weighted_trig_torsion_force(openmm, torsions, weights, trig: str):
-    """Return one force summing per-torsion weighted sin/cos contributions."""
-    expr = f"w*{trig}(theta)"
+    """Return one force summing per-torsion weighted sin/cos contributions.
+
+    Uses ``-theta`` because OpenMM's CustomTorsionForce ``theta`` is the negative
+    of the dihedral convention used by ``tica._dihedral_rad`` (no ``b0`` flip),
+    which is the basis every stored TICAResult (weights/offset), window center,
+    and seed-bank rescore value is expressed in. cos(-theta) == cos(theta), so
+    this only matters for the sin terms, but flipping unconditionally keeps the
+    weight-slicing/grouping logic below untouched. Without it, this force pulls
+    toward a value that disagrees with project_tica1() on the same structure by
+    an amount that grows with the sin-component weight -- reproducible in the
+    US-seeding quality gate as a fixed-looking per-window secondary_cv_delta
+    that no amount of extra pull time or restraint strength can close, because
+    the restraint is converging correctly to the wrong number.
+    """
+    expr = f"w*{trig}(-theta)"
     force = openmm.CustomTorsionForce(expr)
     force.addPerTorsionParameter("w")
     for (a, b, c, d), weight in zip(torsions, weights):
