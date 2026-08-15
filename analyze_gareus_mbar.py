@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 import numpy as np
+from gareus.units import KJ_PER_KCAL, K_B_KJ_PER_MOL_K
 
 try:
     from numba import njit, prange, set_num_threads, get_num_threads
@@ -39,9 +40,6 @@ try:
 except Exception:
     _scipy_find_peaks = None
     SCIPY_SIGNAL_AVAILABLE = False
-
-K_B_KJ_PER_MOL_K=0.00831446261815324
-KJ_PER_KCAL=4.184
 
 # -----------------------------------------------------------------------------
 # MBAR solver configuration defaults
