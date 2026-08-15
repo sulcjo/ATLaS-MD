@@ -118,3 +118,23 @@ def test_load_data_auto_selects_csv_when_only_csv_present(tmp_path):
     d = load_data(prod, out=None)
     assert d.cv.size == 1
     assert d.source.endswith("samples.csv")
+
+
+def test_npz_sample_count_reads_real_npz_file(tmp_path):
+    p = tmp_path / "analysis_arrays.npz"
+    np.savez(p, cv_A=np.arange(5, dtype=float))
+    assert _npz_sample_count(p) == 5
+
+
+def test_npz_sample_count_missing_file_returns_zero(tmp_path):
+    assert _npz_sample_count(tmp_path / "does_not_exist.npz") == 0
+
+
+def test_analysis_binary_sample_count_sums_main_and_chunk_files(tmp_path):
+    prod = tmp_path / "prod"
+    prod.mkdir()
+    np.savez(prod / "analysis_arrays.npz", cv_A=np.arange(5, dtype=float))
+    chunks = prod / "analysis_chunks"
+    chunks.mkdir()
+    np.savez(chunks / "chunk_001.npz", cv_A=np.arange(3, dtype=float))
+    assert _analysis_binary_sample_count(prod) == 8
