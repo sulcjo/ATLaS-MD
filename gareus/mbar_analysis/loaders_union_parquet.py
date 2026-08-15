@@ -19,7 +19,7 @@ from typing import Optional
 import numpy as np
 
 from gareus.units import K_B_KJ_PER_MOL_K
-from .data import Data, clean, infer_temp_beta, rjson
+from .data import Data, clean, infer_temp_beta, rjson, _fill_masked_nan
 from .loaders_adaptive import _find_adaptive_epoch_dirs, _vectorized_map_lookup, _vectorized_map_index
 
 
@@ -189,7 +189,7 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
         cv_epoch = samples['cv1'][valid].astype(np.float64, copy=False)
         all_cv.append(cv_epoch)
         cv2_raw = samples.get('cv2')
-        cv2_epoch = cv2_raw[valid].astype(np.float64, copy=False) if cv2_raw is not None else np.full(valid.sum(), np.nan)
+        cv2_epoch = _fill_masked_nan(cv2_raw[valid]) if cv2_raw is not None else np.full(valid.sum(), np.nan)
         all_cv2.append(cv2_epoch)
         # Vectorized equivalent of [state_id_to_k[int(s)] for s in remapped[valid]]
         # -- see _vectorized_map_index docstring; raises KeyError on a missing

@@ -67,6 +67,27 @@ def jvec(txt):
     return [float(x) for x in v]
 
 
+def _fill_masked_nan(arr):
+    """Convert array-like to plain float64, mapping masked entries to NaN.
+
+    DuckDB's ``fetchnumpy()`` returns a ``numpy.ma.MaskedArray`` for any
+    column with a real SQL NULL (e.g. an unmeasured secondary CV on a
+    CV1-only run) -- the mask marks which entries are null, but the
+    underlying ``.data`` holds an arbitrary fill value (observed: ``0.0``
+    for a float32 Parquet column). A plain ``.astype(np.float64)`` silently
+    discards the mask and exposes that fill value as real data. Callers
+    that need NaN to mean "sample excluded" (bias-matrix reconstruction,
+    MBAR filtering) must route through this instead of casting directly.
+    Mirrors the pattern already used in ``gareus/query.py``'s
+    ``export_analysis_arrays_npz``.
+    """
+    if arr is None:
+        return None
+    if np.ma.isMaskedArray(arr):
+        return np.asarray(arr.filled(np.nan), dtype=np.float64)
+    return np.asarray(arr, dtype=np.float64)
+
+
 @dataclass
 class Data:
     prod_dir: Path

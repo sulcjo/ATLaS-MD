@@ -20,7 +20,7 @@ from typing import Optional
 import numpy as np
 
 from gareus.units import KJ_PER_KCAL
-from .data import Data, clean, infer_temp_beta, rjson, read_windows, jvec
+from .data import Data, clean, infer_temp_beta, rjson, read_windows, jvec, _fill_masked_nan
 from .loaders_adaptive import (
     _find_adaptive_epoch_dirs, _find_selfcontained_epoch_dirs,
     _find_adaptive_epoch_csv_sources, _has_epoch_csv_layout,
@@ -424,7 +424,7 @@ def load_parquet(prod: Path) -> Data:
 
     cv       = samples['cv1'].astype(np.float64)
     cv2_raw  = samples.get('cv2')
-    cv2      = cv2_raw.astype(np.float64) if cv2_raw is not None else np.full(cv.shape, np.nan)
+    cv2      = _fill_masked_nan(cv2_raw) if cv2_raw is not None else np.full(cv.shape, np.nan)
     # window/replica are stored on-disk as uint16 (see gareus/store.py's Parquet
     # schema); downstream consumers already defensively re-cast to int64 before
     # use, so keep them narrow here rather than widening to int32 for no reason.
@@ -439,7 +439,7 @@ def load_parquet(prod: Path) -> Data:
     potential= pot_raw.astype(np.float64) if pot_raw is not None else None
 
     # Reconstruct full N×K dimensionless reduced-bias matrix
-    cv2_for_nk = cv2_raw.astype(np.float64) if cv2_raw is not None else None
+    cv2_for_nk = _fill_masked_nan(cv2_raw) if cv2_raw is not None else None
     u_nk = reconstruct_bias_matrix(cv, cv2_for_nk, windows, beta)
 
     centers = np.array([float(w['center1']) for w in windows])

@@ -31,12 +31,33 @@ from .units import KJ_PER_KCAL
 
 
 def _concat_numpy_dicts(results: list) -> dict:
-    """Concatenate a list of numpy column-dicts into one, sorted by (step, replica)."""
+    """Concatenate a list of numpy column-dicts into one, sorted by (step, replica).
+
+    DuckDB's fetchnumpy() returns a numpy.ma.MaskedArray for any column with a
+    real SQL NULL (e.g. an unmeasured secondary CV). Plain np.concatenate
+    preserves the MaskedArray *subclass* on its output but silently drops the
+    *mask itself* -- a well-known numpy.ma gotcha, reproduced directly even
+    for a single-element input list (i.e. every single-segment run hits this,
+    not just multi-segment concatenation). That corrupted every null entry
+    into its arbitrary underlying fill value with mask=False ("not null"),
+    upstream of and regardless of any unmasking callers do afterwards (see
+    gareus/mbar_analysis/data.py's _fill_masked_nan and this module's own
+    export_analysis_arrays_npz). Use np.ma.concatenate for any column DuckDB
+    actually returned as masked; plain columns keep the cheaper np.concatenate
+    (avoids allocating a mask array for step/window_id/replica/segment_id on
+    the multi-million-row hot path).
+    """
     non_empty = [r for r in results if r and "step" in r and len(r["step"]) > 0]
     if not non_empty:
         return {}
     keys = list(non_empty[0].keys())
-    combined = {k: np.concatenate([r[k] for r in non_empty]) for k in keys}
+    combined = {}
+    for k in keys:
+        cols = [r[k] for r in non_empty]
+        if any(np.ma.isMaskedArray(c) for c in cols):
+            combined[k] = np.ma.concatenate(cols)
+        else:
+            combined[k] = np.concatenate(cols)
     if "replica" in combined:
         order = np.lexsort((combined["replica"], combined["step"]))
     elif "replica_i" in combined:
