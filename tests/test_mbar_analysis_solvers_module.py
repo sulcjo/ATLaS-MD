@@ -66,6 +66,7 @@ def test_sambar_epochs_cli_override_updates_the_solvers_module_attribute():
     exactly the mechanism under test without needing to extract any new
     helper function out of parse_args()."""
     original = solvers_mod.SAMBAR_EPOCHS
+    original_agm = agm.SAMBAR_EPOCHS
 
     agm.parse_args(["dummy_run_dir", "--sambar-epochs", "7"])
 
@@ -73,6 +74,12 @@ def test_sambar_epochs_cli_override_updates_the_solvers_module_attribute():
         assert solvers_mod.SAMBAR_EPOCHS == 7
     finally:
         solvers_mod.SAMBAR_EPOCHS = original
+        # Also reset analyze_gareus_mbar.py's own re-exported copy: parse_args()
+        # rebuilds its argparse parser fresh each call with default=SAMBAR_EPOCHS
+        # read from THIS module-level name, so leaving it at 7 would silently
+        # re-poison solvers_mod.SAMBAR_EPOCHS back to 7 on the next parse_args()
+        # call in this test session, even one with no --sambar-epochs flag at all.
+        agm.SAMBAR_EPOCHS = original_agm
 
 
 def test_sambar_epochs_cli_override_actually_reaches_a_solver_call(monkeypatch):
