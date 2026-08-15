@@ -12,6 +12,12 @@ from pathlib import Path
 from typing import Optional
 import numpy as np
 from gareus.units import KJ_PER_KCAL, K_B_KJ_PER_MOL_K
+from gareus.mbar_analysis.bias import (
+    _compute_u_nk_analytical,
+    _parse_epoch_window_map_native_params,
+    _epoch_bias_param_vectors,
+    _reconstruct_union_bias_block,
+)
 from gareus.mbar_analysis.data import (
     Data, rjson, wjson, read_windows, jvec, infer_temp_beta,
     clean, _masked_data, _apply_analysis_stride, _filter_epoch_source,
@@ -354,113 +360,6 @@ def _poincare_primary_cv_supported(meta: dict) -> bool:
     label = str(meta.get('primary_cv_label', '') or '').lower()
     units = str(meta.get('primary_cv_units', '') or '').lower()
     return mode == 'nonlocal-contacts' or ('contact' in label and units in {'', 'dimensionless'})
-
-def _compute_u_nk_analytical(cv1: np.ndarray, cv2: np.ndarray,
-                              union_windows: list, beta: float) -> np.ndarray:
-    """Compute N×K_union reduced bias matrix analytically from CV values."""
-    K = len(union_windows)
-    scale = beta * KJ_PER_KCAL
-    u = np.empty((cv1.size, K), dtype=np.float64)
-    for k, w in enumerate(union_windows):
-        dc1 = cv1 - w['primary_center']
-        sec_c = w['secondary_cv_center']
-        sec_k = w['secondary_k_kcal']
-        bias_kcal = 0.5 * w['primary_k_kcal'] * dc1 ** 2
-        if math.isfinite(sec_c) and math.isfinite(sec_k) and sec_k > 0:
-            dc2 = cv2 - sec_c
-            bias_kcal = bias_kcal + 0.5 * sec_k * dc2 ** 2
-        u[:, k] = scale * bias_kcal
-    return u
-
-
-def _parse_epoch_window_map_native_params(rows: list) -> dict:
-    """Return ``{state_id: {primary_center, primary_k, secondary_center, secondary_k}}``.
-
-    These are the window parameters that were *actually in effect* for that
-    specific epoch, as recorded in that epoch's own ``epoch_window_map.csv``
-    snapshot at the time it ran — as opposed to whatever a state's row in the
-    live/final registry says today. A state's secondary (or even primary)
-    center/k can be recentered by later epochs (e.g. the tICA CV2 auto-switch
-    in ``gareus/adaptive_production.py``, which overwrites
-    ``state.secondary_center`` in place); this dict preserves the
-    epoch-specific ground truth so bias energies for that epoch's own samples
-    can be reconstructed against what was really applied, not what the state
-    looks like now.
-    """
-    def _f(row: dict, key: str, default: float) -> float:
-        v = row.get(key, '')
-        if v in ('', 'None', 'nan', None):
-            return default
-        try:
-            return float(v)
-        except (TypeError, ValueError):
-            return default
-
-    out: dict = {}
-    for r in rows:
-        if 'state_id' not in r:
-            continue
-        sid = int(r['state_id'])
-        out[sid] = {
-            'primary_center': _f(r, 'primary_center', float('nan')),
-            'primary_k': _f(r, 'primary_k', float('nan')),
-            'secondary_center': _f(r, 'secondary_center', float('nan')),
-            'secondary_k': _f(r, 'secondary_k', float('nan')),
-        }
-    return out
-
-
-def _epoch_bias_param_vectors(native_params: dict, state_ids: list,
-                               global_primary_centers: np.ndarray, global_primary_ks: np.ndarray,
-                               global_sec_centers: np.ndarray, global_sec_ks: np.ndarray) -> tuple:
-    """Per-epoch (primary_center, primary_k, secondary_center, secondary_k) vectors.
-
-    Starts from the global (final-registry) arrays — the existing fallback
-    behavior — then overrides entries for any state_id this epoch's own
-    ``epoch_window_map.csv`` snapshot actually covers. States created in a
-    later epoch (absent from this epoch's snapshot) keep the global fallback,
-    which is correct: they didn't exist yet, so there is no "native" value to
-    prefer, and no sample from this epoch can be assigned to them anyway.
-    """
-    pc = global_primary_centers.copy()
-    pk = global_primary_ks.copy()
-    sc = global_sec_centers.copy()
-    sk = global_sec_ks.copy()
-    for k, sid in enumerate(state_ids):
-        row = native_params.get(sid)
-        if row is None:
-            continue
-        if math.isfinite(row['primary_center']):
-            pc[k] = row['primary_center']
-        if math.isfinite(row['primary_k']):
-            pk[k] = row['primary_k']
-        if math.isfinite(row['secondary_center']):
-            sc[k] = row['secondary_center']
-        if math.isfinite(row['secondary_k']):
-            sk[k] = row['secondary_k']
-    return pc, pk, sc, sk
-
-
-def _reconstruct_union_bias_block(cv: np.ndarray, cv2: np.ndarray, beta: float,
-                                   primary_centers: np.ndarray, primary_ks: np.ndarray,
-                                   sec_centers: np.ndarray, sec_ks: np.ndarray) -> np.ndarray:
-    """Build one epoch-block's N x K reduced-bias-energy matrix.
-
-    Pure function (no I/O) so the bias math can be unit-tested independently
-    of Parquet/DuckDB loading. Same formula as the legacy single-snapshot
-    reconstruction, just parameterized so callers can pass per-epoch-native
-    center/k vectors instead of one static array shared across every epoch.
-    """
-    n = len(cv)
-    k_count = len(primary_centers)
-    u = np.zeros((n, k_count), dtype=np.float64)
-    for k in range(k_count):
-        d1 = cv - primary_centers[k]
-        u[:, k] = beta * KJ_PER_KCAL * 0.5 * primary_ks[k] * d1 * d1
-        if math.isfinite(sec_centers[k]) and sec_ks[k] > 0:
-            d2 = cv2 - sec_centers[k]
-            u[:, k] += beta * KJ_PER_KCAL * 0.5 * sec_ks[k] * d2 * d2
-    return u
 
 
 _MERGED_TRAJ_STEP_STRIDE = 10_000_000_000  # must match _prepare_adaptive_merged_traj_dir
