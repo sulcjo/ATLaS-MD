@@ -290,3 +290,127 @@ def _apply_analysis_stride(d: Data, stride: int, offset: int = 0) -> Data:
     d.meta['analysis_stride']=int(stride)
     d.meta['analysis_stride_offset']=int(offset)
     return d
+
+
+def _epoch_dir_index(path: Path) -> Optional[int]:
+    """Return ``epoch_NNN`` index, or ``None`` for non-epoch directories."""
+    match = re.fullmatch(r'epoch_(\d+)', path.name)
+    return int(match.group(1)) if match else None
+
+
+def _epoch_number_for_run_dir(run_dir: Path) -> Optional[int]:
+    """Literal epoch_NNN number for a run_dir, checking both the flat
+    (epoch_NNN/) and baseline/topup_* sub-run (epoch_NNN/{baseline,topup_*}/)
+    layouts. None for non-numbered dirs (e.g. final/*).
+    """
+    idx = _epoch_dir_index(run_dir)
+    if idx is not None:
+        return idx
+    return _epoch_dir_index(run_dir.parent)
+
+
+def _epoch_run_manifest_secondary_cv_type(run_dir) -> str:
+    """Return ``resolved_args.secondary_cv`` from one epoch/phase run_dir's own
+    ``run_manifest.json`` (e.g. ``"torsion-pca"`` or ``"tica-linear"``), or
+    ``''`` if unavailable. This is that specific epoch's own recorded config,
+    not whatever a state's row in the live registry says today.
+    """
+    manifest = rjson(Path(run_dir) / 'run_manifest.json', {})
+    return str((manifest.get('resolved_args') or {}).get('secondary_cv') or '')
+
+
+def _epoch_zero_split_masks(d: 'Data') -> Optional[tuple]:
+    """(mask_epoch0, mask_rest) for a Data with real epoch_000 samples alongside
+    later-epoch samples, else None.
+
+    epoch_000 is systematically different from later epochs in ways that make
+    pooling it into the main PMF/GaMD-boost report misleading, not just
+    inconsistent style: the GaMD shared-envelope recalibration
+    (``_maybe_recalibrate_gamd_boost``, ``gareus/adaptive_production.py``)
+    recalibrates the boost envelope from epoch 0's own real sampling and fires
+    at most once, so epoch 0 runs under a *different* GaMD envelope than every
+    later epoch; and the tICA CV2 auto-switch typically also fires after
+    epoch 0. Callers should treat the whole Data as one report (unchanged)
+    when this returns None -- e.g. non-adaptive-production sources, or a run
+    with only epoch_000 and nothing else to compare it against.
+    """
+    epoch_src = d.meta.get('_epoch_source')
+    run_dirs = d.meta.get('adaptive_epoch_run_dirs')
+    if not epoch_src or not run_dirs:
+        return None
+    epoch_src = np.asarray(epoch_src, dtype=np.int64)
+    if epoch_src.size != len(d.cv) or int(epoch_src.max()) >= len(run_dirs):
+        return None
+    epoch_numbers = []
+    for rd in run_dirs:
+        n = _epoch_number_for_run_dir(Path(rd))
+        epoch_numbers.append(-1 if n is None else n)
+    epoch_numbers = np.asarray(epoch_numbers, dtype=np.int64)
+    sample_epoch_numbers = epoch_numbers[epoch_src]
+    mask0 = sample_epoch_numbers == 0
+    mask_rest = ~mask0
+    if not np.any(mask0) or not np.any(mask_rest):
+        return None
+    return mask0, mask_rest
+
+
+def _secondary_cv_epoch_regime_masks(d: 'Data', warnings: Optional[list] = None) -> Optional[dict]:
+    """Group this Data's samples by which secondary-CV *type* was actually
+    active when each one was sampled, using every epoch/phase run_dir's own
+    ``run_manifest.json`` (``d.meta['adaptive_epoch_run_dirs']``, indexed by
+    ``d.meta['_epoch_source']``).
+
+    Two different secondary-CV modes (e.g. torsion-pca vs tica-linear across
+    the tICA CV2 auto-switch, ``gareus/adaptive_production.py``) are not a
+    recentering of one coordinate -- they are different linear projections of
+    the same raw torsion features, i.e. genuinely different order parameters.
+    Pooling their raw cv2 values into one axis for a combined PMF/2D-FES
+    conflates two different physical quantities. This does *not* affect
+    MBAR's f_k/weights themselves (those are already correct after the
+    per-epoch-native bias fix in ``load_parquet_adaptive_union``) -- only
+    which samples' cv2 values get binned together for CV2-facing plots.
+
+    Returns ``None`` when there is only one regime (the overwhelming
+    majority of runs) -- callers should fall back to the existing
+    single-pass analysis, unchanged. Otherwise returns
+    ``{regime_type: (mask, is_dominant)}``, where exactly one regime is
+    "dominant": the one containing the *last* epoch/phase, matching the
+    "last phase wins" convention already used elsewhere in this pipeline
+    for CV2 labeling. Any epoch/phase whose own ``run_manifest.json`` is
+    unreadable is folded into the dominant regime (with a warning) rather
+    than silently dropping its samples from every regime-specific plot.
+    """
+    epoch_src = d.meta.get('_epoch_source')
+    run_dirs = d.meta.get('adaptive_epoch_run_dirs')
+    if not epoch_src or not run_dirs:
+        return None
+    epoch_src = np.asarray(epoch_src, dtype=np.int64)
+    if epoch_src.size != len(d.cv2) or int(epoch_src.max()) >= len(run_dirs):
+        return None
+    regime_by_epoch = [_epoch_run_manifest_secondary_cv_type(rd) for rd in run_dirs]
+    distinct = sorted({r for r in regime_by_epoch if r})
+    if len(distinct) < 2:
+        return None
+
+    def _run_dir_mtime(rd):
+        try:
+            return Path(rd).stat().st_mtime
+        except OSError:
+            return -1.0
+
+    chronological = sorted(range(len(run_dirs)), key=lambda i: _run_dir_mtime(run_dirs[i]))
+    dominant = next((regime_by_epoch[i] for i in reversed(chronological) if regime_by_epoch[i]), distinct[-1])
+    unresolved = [i for i, r in enumerate(regime_by_epoch) if not r]
+    if unresolved and warnings is not None:
+        warnings.append(
+            f'{len(unresolved)} adaptive-production epoch/phase run_dir(s) had no '
+            f"readable secondary_cv type in run_manifest.json; folded into the "
+            f"dominant regime ({dominant!r}) for the per-regime CV2 breakdown."
+        )
+    out: dict = {}
+    for regime in distinct:
+        idxs = [i for i, r in enumerate(regime_by_epoch) if r == regime]
+        if regime == dominant:
+            idxs = idxs + unresolved
+        out[regime] = (np.isin(epoch_src, idxs), regime == dominant)
+    return out
