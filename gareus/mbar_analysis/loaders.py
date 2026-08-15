@@ -431,12 +431,22 @@ def load_parquet(prod: Path) -> Data:
     window   = samples['window_id'].astype(np.int16)
     step     = samples['step'].astype(np.int64)
     replica  = samples['replica'].astype(np.int16) if 'replica' in samples else np.zeros(cv.shape, dtype=np.int16)
+    # gamd_boost_total/gamd_boost_dihedral are real SQL NULLs for every sample
+    # of a non-GaMD/plain-umbrella run (gareus/production.py's
+    # extract_gamd_boost_kj returns None for a non-GaMD integrator) -- route
+    # through _fill_masked_nan like cv2 above, not a bare .astype(), so
+    # Data.boost_kj/boost_dih_kj are always plain NaN-filled float64 arrays,
+    # never a live MaskedArray reaching downstream mask-unaware consumers
+    # (e.g. analyze_gareus_mbar.py's np.nanstd(d.boost_kj)/boost_stats()).
+    # potential isn't proven reachable-null at the current writer, but there's
+    # no cost to guarding it the same way, and casing 2 of 3 near-identical
+    # columns differently would be worse style than treating all 3 alike.
     boost_raw      = samples.get('gamd_boost_total')
-    boost          = boost_raw.astype(np.float64) if boost_raw is not None else np.full(cv.shape, np.nan)
+    boost          = _fill_masked_nan(boost_raw) if boost_raw is not None else np.full(cv.shape, np.nan)
     boost_dih_raw  = samples.get('gamd_boost_dihedral')
-    boost_dih      = boost_dih_raw.astype(np.float64) if boost_dih_raw is not None else np.full(cv.shape, np.nan)
+    boost_dih      = _fill_masked_nan(boost_dih_raw) if boost_dih_raw is not None else np.full(cv.shape, np.nan)
     pot_raw  = samples.get('potential')
-    potential= pot_raw.astype(np.float64) if pot_raw is not None else None
+    potential= _fill_masked_nan(pot_raw) if pot_raw is not None else None
 
     # Reconstruct full N×K dimensionless reduced-bias matrix
     cv2_for_nk = _fill_masked_nan(cv2_raw) if cv2_raw is not None else None

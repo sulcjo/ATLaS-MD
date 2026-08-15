@@ -39,6 +39,35 @@ sites: `_concat_numpy_dicts` now uses `np.ma.concatenate` for any column
 DuckDB actually returned as masked, keeping the cheaper plain
 `np.concatenate` for ordinary (never-masked) columns like `step`/`window_id`.
 
+Fix round 1: the `_concat_numpy_dicts` fix above is column-agnostic -- it
+also started correctly preserving masks for `gamd_boost_total` and
+`gamd_boost_dihedral`, which are real SQL NULLs for every sample of a
+non-GaMD/plain-umbrella run (`gareus/production.py`'s
+`extract_gamd_boost_kj` returns `None` for a non-GaMD integrator, `4611-4614`).
+`load_parquet`/`load_parquet_adaptive_union` cast those columns with a bare
+`.astype()` (not `_fill_masked_nan`), so post-fix they started handing back
+a genuinely-masked `numpy.ma.MaskedArray` for `Data.boost_kj` on any
+non-GaMD run -- a regression this task's own upstream fix introduced.
+`analyze_gareus_mbar.py`'s `run_pmf_and_gamd_boost_report` then crashed with
+`ValueError: output array is read-only` from `np.nanstd(d.boost_kj)`
+(reached because `boost_stats`'s own `boost[np.isfinite(boost)]` masked-
+boolean-indexing bug incorrectly reported `available=True` for an
+all-masked `boost`, defeating the `bool(bs.get('available')) and
+np.nanstd(...)` short-circuit that would otherwise skip it). Fixed by
+routing `boost`/`boost_dih`/`potential` (all three, for uniformity, even
+though only the first two are proven reachable-null at the current writer)
+through `_fill_masked_nan` in both loaders -- `loaders.py`'s `load_parquet`
+(named in the review) and `loaders_union_parquet.py`'s
+`load_parquet_adaptive_union` (not named in the review, but subject to the
+exact same regression via its own local `np.concatenate(all_boost)`, which
+denatures the mask the same way `_concat_numpy_dicts` used to -- see the
+report's Fix round 1 section for the direct verification of this). With
+this fix, `Data.boost_kj`/`boost_dih_kj`/`potential_kj` can never reach
+`boost_stats` (or anything else) as a live `MaskedArray` via any current
+call path -- see the report for the reachability audit -- so `boost_stats`'s
+own masked-indexing bug, while real, is dead code for defensive purposes and
+was intentionally left alone rather than patched reflexively.
+
 Note on `clean()` (`gareus/mbar_analysis/data.py`): its sample mask is
 `np.isfinite(d.cv) & np.all(np.isfinite(d.u_nk), axis=1)` -- ANY window
 column being NaN for a row drops that row from the whole returned `Data`,
@@ -63,6 +92,7 @@ from __future__ import annotations
 import csv
 import json
 import sys
+import warnings
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -368,3 +398,156 @@ def test_load_parquet_adaptive_union_masks_null_cv2_as_nan_not_zero(tmp_path):
     assert np.all(np.ma.getdata(cv2_buggy)[null_rows] == 0.0)
     u_nk_buggy = _reconstruct_union_bias_block(cv1, cv2_buggy, beta, pc, pk, sc, sk)
     assert np.all(np.isfinite(u_nk_buggy[null_rows, 0]))
+
+
+# --- Fix round 1: gamd_boost_total/gamd_boost_dihedral regression ----------
+#
+# _concat_numpy_dicts is shared by every column, not just cv2 -- once it
+# started correctly preserving masks, a non-GaMD/plain-umbrella run's
+# gamd_boost_total/gamd_boost_dihedral (real SQL NULLs for every sample of
+# such a run, gareus/production.py:4611-4614) started reaching Data.boost_kj
+# as a live MaskedArray via a bare `.astype()` cast, crashing
+# analyze_gareus_mbar.py's run_pmf_and_gamd_boost_report with
+# `ValueError: output array is read-only` from np.nanstd(d.boost_kj).
+# Fixed by routing boost/boost_dih/potential through the same
+# _fill_masked_nan helper as cv2, in both load_parquet and
+# load_parquet_adaptive_union (the latter has its own local
+# np.concatenate(all_boost) subject to the identical mask-drop hazard).
+
+def test_load_parquet_non_gamd_run_boost_is_plain_nan_not_masked(tmp_path):
+    """A plain-umbrella (non-GaMD) run: gamd_boost_total/gamd_boost_dihedral
+    are real SQL NULLs for every sample. Data.boost_kj/boost_dih_kj must be
+    plain NaN-filled arrays (boost_dih_kj None, since ALL its values are
+    null) -- never a live MaskedArray reaching mask-unaware downstream
+    consumers (boost_stats, np.nanstd).
+    """
+    pytest.importorskip("analyze_gareus_mbar")
+    from analyze_gareus_mbar import boost_stats
+    from gareus.mbar_analysis.loaders import load_parquet
+    from gareus.store import ParquetSampleWriter, SegmentRegistry, WindowSnapshot
+
+    prod = tmp_path
+    windows = [{"window_id": 0, "center1": 0.0, "k1": 10.0}]
+    reg = SegmentRegistry(prod)
+    seg_id = reg.open_segment("run_001", None, 1)
+    WindowSnapshot(prod).snapshot(seg_id, windows, cv1_type="contacts", cv2_type=None)
+
+    writer = ParquetSampleWriter(prod / "samples" / seg_id, flush_rows=1000)
+    for i in range(5):
+        # boost_total/boost_dihedral/boost_nonbonded all None: a non-GaMD run.
+        writer.write_sample(i * 50, 0, 0, 0.0, 1.0 + 0.1 * i, -100.0, None, None, None)
+    writer.close()
+    reg.close_segment(seg_id, end_step=200)
+
+    (prod / "run_args.json").write_text(json.dumps({"temperature_k": 300.0}))
+
+    d = load_parquet(prod)
+
+    assert not np.ma.isMaskedArray(d.boost_kj)
+    assert np.all(np.isnan(d.boost_kj))
+    assert d.boost_dih_kj is None  # _boost_dih_arg guard: no finite values at all
+
+    # The exact crash repro: must not raise, and boost_stats must correctly
+    # report unavailable (so run_pmf_and_gamd_boost_report's own
+    # `bool(bs.get('available')) and np.nanstd(...)` short-circuits and never
+    # even reaches np.nanstd in the real code path).
+    bs = boost_stats(d.boost_kj, d.beta)
+    assert bs == {"available": False}
+    # "Degrees of freedom <= 0" is numpy's expected, harmless advisory for
+    # nanstd on an all-NaN slice -- suppressed here since it's not the thing
+    # under test; the thing under test is that no ValueError is raised.
+    with np.errstate(all="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        val = np.nanstd(d.boost_kj)  # must not raise ValueError: output array is read-only
+    assert np.isnan(val)
+
+
+def test_load_parquet_adaptive_union_non_gamd_run_boost_is_plain_nan_not_masked(tmp_path):
+    """Same regression, via load_parquet_adaptive_union -- this loader has
+    its own local np.concatenate(all_boost)/(all_boost_dih)/(all_potential),
+    independent of gareus.query._concat_numpy_dicts, subject to the same
+    mask-drop-on-concatenate hazard once the per-epoch cast preserves a real
+    mask.
+    """
+    pytest.importorskip("analyze_gareus_mbar")
+    from analyze_gareus_mbar import boost_stats
+    from gareus.mbar_analysis.loaders_union_parquet import load_parquet_adaptive_union
+    from gareus.store import ParquetSampleWriter, SegmentRegistry, WindowSnapshot
+
+    adaptive_dir = tmp_path / "adaptive_production"
+    adaptive_dir.mkdir(parents=True)
+    (tmp_path / "run_args.json").write_text(json.dumps({"temperature_k": 300.0}))
+
+    epoch_dir = adaptive_dir / "epoch_000"
+    epoch_dir.mkdir(parents=True, exist_ok=True)
+    reg = SegmentRegistry(epoch_dir)
+    seg_id = reg.open_segment("run_001", None, 1)
+    WindowSnapshot(epoch_dir).snapshot(
+        seg_id, [{"window_id": 0, "center1": 0.0, "k1": 44.3, "center2": 0.0, "k2": 0.0}],
+        cv1_type="contacts", cv2_type=None,
+    )
+    writer = ParquetSampleWriter(epoch_dir / "samples" / seg_id, flush_rows=1000)
+    for i in range(4):
+        writer.write_sample(i * 50, 0, 0, 0.0, None, -100.0, None, None, None)
+    writer.close()
+    reg.close_segment(seg_id, end_step=150)
+    (epoch_dir / "epoch_window_map.csv").write_text(
+        "epoch_window,state_id,primary_center,primary_k,secondary_center,secondary_k\n"
+        "0,0,0.0,44.3,0.0,0.0\n",
+        encoding="utf-8",
+    )
+    _write_registry(adaptive_dir, [{
+        "state_id": 0, "primary_center": 0.0, "primary_k": 44.3,
+        "secondary_center": 0.0, "secondary_k": 0.0,
+    }])
+
+    data = load_parquet_adaptive_union(adaptive_dir)
+
+    assert not np.ma.isMaskedArray(data.boost_kj)
+    assert np.all(np.isnan(data.boost_kj))
+    assert data.boost_dih_kj is None
+    # potential is real (never null) at the current writer, but confirm it
+    # was correctly routed through _fill_masked_nan (plain array) too.
+    assert not np.ma.isMaskedArray(data.potential_kj)
+    np.testing.assert_allclose(data.potential_kj, -100.0)
+
+    bs = boost_stats(data.boost_kj, data.beta)
+    assert bs == {"available": False}
+    with np.errstate(all="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        val = np.nanstd(data.boost_kj)
+    assert np.isnan(val)
+
+
+def test_load_parquet_partially_null_boost_dihedral_is_nan_not_zero(tmp_path):
+    """A GaMD run with a components gap on one sample only: boost_dihedral
+    null for one sample, real for the rest. loaders.py:456's
+    `_boost_dih_arg = boost_dih if np.any(np.isfinite(boost_dih)) else None`
+    guard must keep the array (not collapse to None, since most values are
+    real) with NaN -- not 0.0 -- at the null row.
+    """
+    from gareus.mbar_analysis.loaders import load_parquet
+    from gareus.store import ParquetSampleWriter, SegmentRegistry, WindowSnapshot
+
+    prod = tmp_path
+    windows = [{"window_id": 0, "center1": 0.0, "k1": 10.0}]
+    reg = SegmentRegistry(prod)
+    seg_id = reg.open_segment("run_001", None, 1)
+    WindowSnapshot(prod).snapshot(seg_id, windows, cv1_type="contacts", cv2_type=None)
+
+    writer = ParquetSampleWriter(prod / "samples" / seg_id, flush_rows=1000)
+    writer.write_sample(0,   0, 0, 0.0, 1.0, -100.0, 1.0, 0.6, 0.4)
+    writer.write_sample(50,  0, 0, 0.0, 1.1, -100.0, 1.0, None, 0.4)  # null boost_dihedral only
+    writer.write_sample(100, 0, 0, 0.0, 1.2, -100.0, 1.0, 0.7, 0.4)
+    writer.close()
+    reg.close_segment(seg_id, end_step=100)
+
+    (prod / "run_args.json").write_text(json.dumps({"temperature_k": 300.0}))
+
+    d = load_parquet(prod)
+
+    assert d.boost_dih_kj is not None
+    assert not np.ma.isMaskedArray(d.boost_dih_kj)
+    assert np.isnan(d.boost_dih_kj[1])
+    assert not np.any(d.boost_dih_kj == 0.0)
+    np.testing.assert_allclose(sorted(d.boost_dih_kj[np.isfinite(d.boost_dih_kj)]), [0.6, 0.7])

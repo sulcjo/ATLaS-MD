@@ -206,12 +206,24 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
         # full-length `valid` mask) that is out of scope to touch here.
         rep = samples['replica'].astype(np.int16) if 'replica' in samples else np.zeros(int(valid.sum()), np.int16)
         all_replica.append(rep[valid])
+        # Same masked-null hazard as cv2 above (and same fix): gamd_boost_total/
+        # gamd_boost_dihedral are real SQL NULLs for every sample of a
+        # non-GaMD/plain-umbrella run, and this module's own
+        # _concat_numpy_dicts fix (gareus/query.py) means samples.get(...)
+        # now correctly hands back a live-masked array for them instead of a
+        # silently-denatured one -- a bare .astype()[valid] preserves that
+        # mask (both .astype() and boolean indexing keep it), and the
+        # unconditional np.concatenate(all_boost) below would then silently
+        # drop it again, exposing the arbitrary fill value as fabricated real
+        # boost/potential data. Route through _fill_masked_nan so every
+        # per-epoch block is already a plain NaN-filled array before that
+        # final concatenate.
         boost_raw = samples.get('gamd_boost_total')
-        all_boost.append(boost_raw.astype(np.float64)[valid] if boost_raw is not None else np.full(valid.sum(), np.nan))
+        all_boost.append(_fill_masked_nan(boost_raw[valid]) if boost_raw is not None else np.full(valid.sum(), np.nan))
         boost_dih_raw = samples.get('gamd_boost_dihedral')
-        all_boost_dih.append(boost_dih_raw.astype(np.float64)[valid] if boost_dih_raw is not None else np.full(valid.sum(), np.nan))
+        all_boost_dih.append(_fill_masked_nan(boost_dih_raw[valid]) if boost_dih_raw is not None else np.full(valid.sum(), np.nan))
         pot_raw = samples.get('potential')
-        all_potential.append(pot_raw.astype(np.float64)[valid] if pot_raw is not None else np.full(valid.sum(), np.nan))
+        all_potential.append(_fill_masked_nan(pot_raw[valid]) if pot_raw is not None else np.full(valid.sum(), np.nan))
         all_epoch_src.append(np.full(int(valid.sum()), len(all_cv) - 1, dtype=np.int32))
         # Bias energies for THIS epoch's samples must use the window params that
         # were actually in effect during this epoch (native_params), not whatever
