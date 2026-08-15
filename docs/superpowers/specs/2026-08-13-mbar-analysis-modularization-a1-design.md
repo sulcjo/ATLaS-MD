@@ -48,6 +48,24 @@ entry point; reconcile constants into `gareus/units.py`.** Concretely:
    cross-import from the script into the package. Every one of the script's
    ~50+ existing use sites is unchanged (same names, same values, now a
    single source).
+
+   **Scope note (added after Plan A1's final review):** "single source" above
+   refers only to the `analyze_gareus_mbar.py` <-> `gareus/units.py` pair this
+   plan reconciles. It is not a claim that every `4.184`/Boltzmann-constant
+   literal in the `gareus` package is now unified. A post-implementation sweep
+   found ~21 further inline `4.184` literals (`gareus/query.py`,
+   `gareus/diagnostics.py`, `gareus/seeding.py`, `gareus/production.py`,
+   `gareus/adaptive_production.py`) and ~7 further Boltzmann/molar-gas-constant
+   literals in two non-identical spellings (`0.00831446261815324` vs.
+   `8.314462618e-3`, differing at the ~10th significant digit — numerically
+   harmless today, but two different constants feeding `beta` depending on
+   code path). Plan A3 already independently picked up `gareus/query.py`'s
+   copy while fixing that file's NaN-guard bug (see A3's own design doc);
+   Plan A5 should do the same for `gareus/diagnostics.py`'s copies while
+   already touching that file. The remaining sites (`seeding.py`,
+   `production.py`, `adaptive_production.py`, `GENPEPT.py`) are outside every
+   plan's file scope in this modularization sequence and are not addressed by
+   A1-A6.
 3. New subpackage `gareus/mbar_analysis/` (auto-discovered by
    `pyproject.toml`'s existing `packages.find include = ["gareus*"]` — no
    packaging-config change needed for the subpackage itself):

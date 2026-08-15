@@ -454,6 +454,12 @@ python -m py_compile analyze_gareus_mbar.py gareus/diagnostics.py gareus/math_he
   `gareus.diagnostics` once this plan lands.
 - **`overlap_matrix`** (Plan A3) and **`gareus/logger.py`'s `_hist_overlap`**
   (left coexisting, see Alternatives Considered) — not touched.
+- **`gareus/diagnostics.py`'s own inline `4.184`/Boltzmann-constant literals**
+  (lines ~174, ~182, ~198 per Plan A1's final-review sweep) — in scope for
+  this plan to replace with `gareus.units.KJ_PER_KCAL`/`K_B_KJ_PER_MOL_K`
+  while this plan is already touching `gareus/diagnostics.py` for the
+  histogram-overlap reconciliation; not a new task, just a note that this
+  plan's implementer should not skip these while in the file.
 - **`solve_mbar`/`solve_mbar_numba*`/`solve_mbar_sambar*`/`solve_mbar_lbfgs`**
   and the `logsumexp`/`logsumexp_axis0_finite`/`norm_logw` cluster
   (Plan A3) — not touched, despite `ess` always being called as

@@ -18,7 +18,14 @@ def test_kj_per_kcal_is_the_exact_conversion_factor():
 
 
 def test_k_b_matches_codata_value():
-    assert K_B_KJ_PER_MOL_K == 0.00831446261815324
+    # Independently derived from the CODATA 2018 / SI-2019 exact definitions
+    # (k_B = 1.380649e-23 J/K exactly, N_A = 6.02214076e23 /mol exactly), not
+    # a copy of the constant under test — this genuinely re-derives the value
+    # rather than restating it.
+    k_b_j_per_k = 1.380649e-23
+    n_a_per_mol = 6.02214076e23
+    expected = k_b_j_per_k * n_a_per_mol / 1000.0
+    assert K_B_KJ_PER_MOL_K == expected
 
 
 def test_k_b_and_kj_per_kcal_round_trip_kbt_at_300k():

@@ -7,13 +7,13 @@ They were originally defined in ``gareus_peptide.py``.
 """
 
 KJ_PER_KCAL = 4.184
-K_B_KJ_PER_MOL_K = 0.00831446261815324  # Boltzmann constant, kJ/(mol*K)
+K_B_KJ_PER_MOL_K = 0.00831446261815324  # Molar gas constant R = k_B * N_A, kJ/(mol*K)
 
 
 def kcal_a2_to_kj_nm2(k_kcal_a2: float) -> float:
     """Convert a force constant from kcal/mol/Å² to kJ/mol/nm².
 
-    KJ_PER_KCAL converts kcal to kJ, and 0.01 converts Å² to nm².
+    KJ_PER_KCAL (4.184) converts kcal to kJ, and 0.01 converts Å² to nm².
 
     Args:
         k_kcal_a2: Force constant in kcal/mol/Å².

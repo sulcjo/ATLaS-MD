@@ -31,3 +31,35 @@ def test_cli_help_output_matches_analyze_gareus_mbar_help_output():
     )
     assert new_entry.stdout == old_entry.stdout
     assert new_entry.returncode == old_entry.returncode
+
+
+def test_cli_main_forwards_argv_none_to_real_sys_argv(monkeypatch, tmp_path, capsys):
+    # main(argv=None) must let argparse fall through to the real process
+    # sys.argv[1:], not silently swallow it. Use an invalid flag value so
+    # argparse's own error path (SystemExit(2)) proves argv was actually read.
+    monkeypatch.setattr(sys, "argv", ["gareus-analyze", "--bins", "NOT_AN_INT"])
+    from gareus.mbar_analysis.cli import main
+    import pytest
+    with pytest.raises(SystemExit) as exc_info:
+        main(None)
+    assert exc_info.value.code == 2
+    assert "invalid int value" in capsys.readouterr().err
+
+
+def test_cli_main_restores_sys_argv0_after_call(monkeypatch):
+    # The sys.argv[0] mutation used to make argparse's --help output match
+    # the old script must not leak past the call, success or failure.
+    sentinel = "sentinel-argv0-for-test"
+    monkeypatch.setattr(sys, "argv", [sentinel, "--help"])
+    from gareus.mbar_analysis.cli import main
+    import pytest
+    with pytest.raises(SystemExit):
+        main(None)
+    assert sys.argv[0] == sentinel
+
+
+def test_cli_main_return_type_is_int():
+    from gareus.mbar_analysis.cli import main
+    import inspect
+    sig = inspect.signature(main)
+    assert sig.return_annotation in (int, "int")
