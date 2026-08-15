@@ -54,13 +54,13 @@ def _merge_missing_usable_states(primary_rows: list, live_rows: list) -> list:
 def _load_epoch_task(epoch_dir: Path, wmap_path: Path, n_threads: int) -> tuple:
     """Load one epoch's samples, window map, and native bias params (runs in a thread)."""
     from gareus.query import load_samples
-    # NOTE (Plan A2 -> Plan A3 handoff): _parse_epoch_window_map_native_params
-    # is one of four bias-reconstruction functions deliberately left behind in
-    # analyze_gareus_mbar.py for Plan A3's audited reconciliation with
-    # gareus.query.reconstruct_bias_matrix. This import MUST stay
-    # function-body-local (lazy) for the same circular-import reason
-    # documented in loaders_adaptive.py's _augment_with_adaptive_rounds; when
-    # Plan A3 relocates this function, update the module path in this line.
+    # NOTE: _parse_epoch_window_map_native_params now lives in
+    # gareus.mbar_analysis.bias (Plan A3) and analyze_gareus_mbar.py
+    # re-exports it unchanged -- importing it from analyze_gareus_mbar here
+    # (rather than switching to gareus.mbar_analysis.bias directly) is
+    # deliberate, not stale: this import MUST stay function-body-local
+    # (lazy) for the same circular-import reason documented in
+    # loaders_adaptive.py's _augment_with_adaptive_rounds.
     from analyze_gareus_mbar import _parse_epoch_window_map_native_params
     with wmap_path.open(newline='') as f:
         wmap_rows = list(csv.DictReader(f))
@@ -86,9 +86,10 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
         from gareus.query import load_samples  # noqa: F401 – used in _load_epoch_task
     except ImportError as exc:
         raise ImportError(f'gareus package required for Parquet loading: {exc}') from exc
-    # NOTE (Plan A2 -> Plan A3 handoff): both of these stay behind in
-    # analyze_gareus_mbar.py for Plan A3; see _load_epoch_task's own note
-    # above for why this import must be lazy.
+    # NOTE: both of these now live in gareus.mbar_analysis.bias (Plan A3);
+    # see _load_epoch_task's own note above for why importing them from
+    # analyze_gareus_mbar's re-export (rather than from gareus.mbar_analysis.bias
+    # directly) is deliberate, and why this import must stay lazy.
     from analyze_gareus_mbar import _epoch_bias_param_vectors, _reconstruct_union_bias_block
 
     adaptive_dir = Path(adaptive_dir)

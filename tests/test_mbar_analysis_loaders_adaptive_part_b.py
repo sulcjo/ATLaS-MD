@@ -138,10 +138,11 @@ def test_augment_with_adaptive_rounds_merges_round_samples_with_final(tmp_path):
     """Real invocation of the full merge path (not just the no-round-dirs
     early return above) -- exercises the lazy
     `from analyze_gareus_mbar import _compute_u_nk_analytical` import inside
-    the function body. At this point in the plan sequence,
-    analyze_gareus_mbar.py still defines _compute_u_nk_analytical itself
-    (Plan A3 relocates it later), so this import resolves against the
-    original, untouched definition."""
+    the function body. _compute_u_nk_analytical now lives in
+    gareus.mbar_analysis.bias (Plan A3); analyze_gareus_mbar.py re-exports it
+    unchanged, so this lazy import (kept pointed at analyze_gareus_mbar
+    deliberately, for the circular-import reason documented at the import
+    site itself) still resolves correctly."""
     import gareus.mbar_analysis.data as mdata
 
     run_dir = tmp_path
