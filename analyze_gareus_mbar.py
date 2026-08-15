@@ -2956,7 +2956,7 @@ def plot_rg_outputs(d: Data, rg_pmfs: dict, selected: str, out: Path, warnings: 
     except Exception as e:
         warnings.append(f'matplotlib unavailable; no Rg PNG plots written: {e}')
         return
-    import gareus_plotstyle as ps
+    import gareus.mbar_analysis.plotstyle as ps
     fig,ax=plt.subplots(figsize=(8,5))
     for i,(name,p) in enumerate(_visible_pmfs(rg_pmfs, selected, args).items()):
         pmf_plot=_smooth_pmf_1d(p['pmf'],smooth_sigma); m=np.isfinite(pmf_plot)
@@ -3710,7 +3710,7 @@ def _write_scalar_pmfs(out_dir: Path, prefix: str, label: str, xlabel: str, pmfs
     png=out_dir/f'{prefix}_pmf.png'
     try:
         import matplotlib.pyplot as plt
-        import gareus_plotstyle as ps
+        import gareus.mbar_analysis.plotstyle as ps
         fig,ax=plt.subplots(figsize=(8,5))
         for i,(method,p) in enumerate(_visible_pmfs(pmfs, selected_method, args).items()):
             pmf_plot=_smooth_pmf_1d(p['pmf'],smooth_sigma); m=np.isfinite(pmf_plot)
@@ -4598,7 +4598,7 @@ def plot_outputs(d,pmfs,selected,O,out,warnings,smooth_sigma=0.0,args=None):
         import matplotlib.pyplot as plt
     except Exception as e:
         warnings.append(f'matplotlib unavailable; no PNG plots written: {e}'); return
-    import gareus_plotstyle as ps
+    import gareus.mbar_analysis.plotstyle as ps
     _cvlab=_primary_cv_axis_label(d.meta)
     fig,ax=plt.subplots(figsize=(8,5))
     for i,(name,p) in enumerate(_visible_pmfs(pmfs, selected, args).items()):
@@ -4939,7 +4939,7 @@ def analyze_secondary_cv_pmf(d: Data, args, base_logw: np.ndarray, selected: str
     regions=_secondary_cv_regions(d.meta)
     try:
         import matplotlib.pyplot as plt
-        import gareus_plotstyle as ps
+        import gareus.mbar_analysis.plotstyle as ps
         fig,ax=plt.subplots(figsize=(8,5))
         _cv2_smooth=_eff_smooth(args,'pmf_smooth_sigma')
         for i,(name,p) in enumerate(_visible_pmfs(pmfs, chosen, args).items()):
