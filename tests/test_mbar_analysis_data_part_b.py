@@ -54,6 +54,22 @@ def test_clean_drops_nonfinite_cv_rows():
     assert not np.any(np.isnan(out.cv))
 
 
+def test_clean_keeps_epoch_source_in_sync_when_dropping_rows():
+    """Regression: clean() row-filters every per-sample array on a genuine
+    drop, but used to leave meta['_epoch_source'] untouched -- any consumer
+    that zips it against a per-sample array (e.g. _sample_block_ids,
+    _epoch_zero_split_masks, _secondary_cv_epoch_regime_masks) would then
+    silently degrade (length-mismatch guard -> fall back to pooled/disabled)
+    rather than crash. Found during Plan A3's final whole-plan review, once
+    a real Parquet run could genuinely have clean() drop rows (a null cv2
+    sample under a secondary-restrained window) for the first time."""
+    d = _mk_data(n=4, meta={"_epoch_source": [0, 0, 1, 1]})
+    d.cv[1] = float("nan")
+    out = clean(d)
+    assert out.cv.size == 3
+    assert out.meta["_epoch_source"] == [0, 1, 1]
+
+
 def test_clean_raises_on_shape_mismatch():
     d = _mk_data(n=4, k=2)
     d.u_nk = np.zeros((3, 2))

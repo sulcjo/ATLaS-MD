@@ -188,6 +188,7 @@ def clean(d: Data) -> Data:
     if d.potential_kj is not None and d.potential_kj.size==mask.size: d.potential_kj=d.potential_kj[mask]
     if d.boost_dih_kj is not None and d.boost_dih_kj.size==mask.size: d.boost_dih_kj=d.boost_dih_kj[mask]
     elif d.boost_dih_kj is not None: d.boost_dih_kj=None
+    _filter_epoch_source(d, mask)
     return d
 
 
