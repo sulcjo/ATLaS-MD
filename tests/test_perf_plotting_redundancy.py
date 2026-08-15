@@ -288,24 +288,32 @@ def test_plot_2d_fes_multirange_renders_each_range_exactly_once(monkeypatch):
     reinstated (it would just re-produce the same bytes, slower). The
     regression this fix actually targets is the *render count*: assert
     `_plot_2d_fes_range` is called exactly once per FES_PLOT_VMAX_VALUES
-    entry, with no extra call to (re-)produce the 'main' file."""
-    import analyze_gareus_mbar as agm
+    entry, with no extra call to (re-)produce the 'main' file.
+
+    Patches and calls through `gareus.mbar_analysis.plotting` directly, not
+    `analyze_gareus_mbar`'s re-export -- `_plot_2d_fes_multirange` resolves
+    `_plot_2d_fes_range` in its own module's globals (Plan A6a relocated
+    both), so patching the re-exported `analyze_gareus_mbar` name would
+    silently patch a different binding than the one the real call site
+    reads.
+    """
+    import gareus.mbar_analysis.plotting as plotting
 
     F, xedges, yedges, xc, yc = _synthetic_2d_grid()
-    real = agm._plot_2d_fes_range
+    real = plotting._plot_2d_fes_range
     calls = []
 
     def counting(*a, **kw):
         calls.append(kw.get("range_vmax"))
         return real(*a, **kw)
 
-    monkeypatch.setattr(agm, "_plot_2d_fes_range", counting)
+    monkeypatch.setattr(plotting, "_plot_2d_fes_range", counting)
     warnings = []
     with tempfile.TemporaryDirectory() as td:
         out_png = Path(td) / "test_fes.png"
-        files = agm._plot_2d_fes_multirange(F, xedges, yedges, xc, yc, out_png, "Test FES", "x", "y", warnings)
+        files = plotting._plot_2d_fes_multirange(F, xedges, yedges, xc, yc, out_png, "Test FES", "x", "y", warnings)
         assert "main" in files
-    assert calls == list(agm.FES_PLOT_VMAX_VALUES)
+    assert calls == list(plotting.FES_PLOT_VMAX_VALUES)
 
 
 def test_plot_chignolin_fes_kj_multirange_renders_each_range_exactly_once(monkeypatch):
