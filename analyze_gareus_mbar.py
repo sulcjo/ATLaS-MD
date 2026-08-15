@@ -8,12 +8,8 @@ _os_env.environ['NUMEXPR_NUM_THREADS'] = _thread_cap  # force-cap even if alread
 _os_env.environ.setdefault('NUMBA_NUM_THREADS', _thread_cap)
 del _os_env, _ne_cap, _ne_num, _thread_cap
 import argparse, csv, hashlib, json, math, os, re, shutil, sys, time
-import warnings as _warnings  # aliased: this file uses `warnings` as a local list-of-strings
-                               # parameter name in many function signatures (e.g. analyze_rg,
-                               # plot_2d_fes); avoid any chance of that shadowing the stdlib module.
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 import numpy as np
 from gareus.units import KJ_PER_KCAL, K_B_KJ_PER_MOL_K
 from gareus.mbar_analysis.data import (
@@ -375,15 +371,6 @@ def _compute_u_nk_analytical(cv1: np.ndarray, cv2: np.ndarray,
             bias_kcal = bias_kcal + 0.5 * sec_k * dc2 ** 2
         u[:, k] = scale * bias_kcal
     return u
-
-
-# A lookup table is only built when the key range actually needed (mapping
-# keys unioned with the array's own value range) stays small -- otherwise a
-# sparse key space (e.g. one huge outlier ID) would turn a memory-savings
-# fix into a memory blowup. Above this, fall back to the original per-element
-# Python-level lookup, which stays correct (just not vectorized) regardless
-# of key sparsity.
-_VECTORIZED_LOOKUP_MAX_TABLE_SIZE = 10_000_000
 
 
 def _parse_epoch_window_map_native_params(rows: list) -> dict:

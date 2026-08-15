@@ -463,6 +463,7 @@ def test_load_parquet_narrows_window_replica_dtype(tmp_path, monkeypatch):
     mocked at the gareus.query boundary so this doesn't need a full run
     directory (windows/, umbrella_windows.csv, etc.)."""
     import gareus.query as query_mod
+    import gareus.mbar_analysis.loaders as loaders_mod
 
     n = 8
     fake_samples = {
@@ -490,7 +491,7 @@ def test_load_parquet_narrows_window_replica_dtype(tmp_path, monkeypatch):
     monkeypatch.setattr(query_mod, "load_samples", lambda prod: fake_samples)
     monkeypatch.setattr(query_mod, "load_windows", lambda prod: fake_windows)
     monkeypatch.setattr(query_mod, "reconstruct_bias_matrix", fake_reconstruct_bias_matrix)
-    monkeypatch.setattr(agm, "infer_temp_beta", lambda prod, meta: (TEMP_K, BETA))
+    monkeypatch.setattr(loaders_mod, "infer_temp_beta", lambda prod, meta: (TEMP_K, BETA))
 
     d = agm.load_parquet(tmp_path)
 

@@ -420,10 +420,14 @@ A2 simply keeps doing it for the two now-reversed-direction imports.
 **Handoff note for Plan A3**: once A3 relocates
 `_compute_u_nk_analytical`/`_parse_epoch_window_map_native_params`/
 `_epoch_bias_param_vectors`/`_reconstruct_union_bias_block` to their own new
-home, exactly two lazy-import lines need their source module string updated
-(one inside `_augment_with_adaptive_rounds` in `loaders_adaptive.py`, one
-inside `_load_epoch_task`/`load_parquet_adaptive_union` in
-`loaders_union_parquet.py`) — a small, mechanical follow-up, not a redesign.
+home, exactly three lazy-import lines need their source module string
+updated (one inside `_augment_with_adaptive_rounds` in
+`loaders_adaptive.py`, importing `_compute_u_nk_analytical`; two inside
+`loaders_union_parquet.py` — one inside `_load_epoch_task` importing
+`_parse_epoch_window_map_native_params`, one inside
+`load_parquet_adaptive_union` importing `_epoch_bias_param_vectors` and
+`_reconstruct_union_bias_block`) — a small, mechanical follow-up, not a
+redesign.
 
 ### `gareus/mbar_analysis/data.py` (imports)
 
