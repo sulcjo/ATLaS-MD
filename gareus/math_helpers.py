@@ -83,6 +83,28 @@ def _adaptive_hist_overlap(values_a: List[float] | np.ndarray, values_b: List[fl
     return float(np.sum(np.minimum(pa, pb)))
 
 
+def ess(w: np.ndarray) -> float:
+    """Effective sample size (Kish estimator) from an array of importance weights.
+
+    ``sum(w)**2 / sum(w**2)``. Non-finite and negative entries are dropped
+    before computing; an all-dropped or all-non-positive input returns 0.0.
+
+    Kept without this module's usual leading underscore because it is
+    already public API on ``analyze_gareus_mbar`` (``agm.ess``), called
+    directly by three real-MD physics-oracle test files
+    (tests/test_thermodynamic_validity_2d.py,
+    tests/test_thermodynamic_validity_2d_rough.py,
+    tests/test_thermodynamic_validity_real_md.py).
+    """
+    w = np.asarray(w, dtype=np.float64)
+    w = w[np.isfinite(w) & (w >= 0)]
+    if w.size == 0:
+        return 0.0
+    s1 = float(np.sum(w))
+    s2 = float(np.sum(w * w))
+    return 0.0 if s2 <= 0 else s1 * s1 / s2
+
+
 def _batch_torsion_angles_rad(positions_nm: np.ndarray, torsion_idx: np.ndarray) -> np.ndarray:
     """Compute torsion angles for all atom quadruples in ``torsion_idx``.
 
@@ -158,6 +180,7 @@ def _torsion_angle_rad_from_positions(positions_nm: np.ndarray, a: int, b: int, 
 __all__ = [
     "_hist_overlap",
     "_adaptive_hist_overlap",
+    "ess",
     "_batch_torsion_angles_rad",
     "_mean_torsion_score_from_angles",
     "_torsion_angle_rad_from_positions",

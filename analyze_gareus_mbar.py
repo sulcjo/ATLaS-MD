@@ -15,6 +15,7 @@ from gareus.units import KJ_PER_KCAL, K_B_KJ_PER_MOL_K
 from gareus.diagnostics import pmf_probability, js_divergence_1d, pmf_rmse_1d, barrier_error_1d
 from gareus.diagnostics import identify_basins_1d, _compute_basin_populations
 from gareus.diagnostics import _weighted_mean_std, _pmf_distribution_mean_std
+from gareus.math_helpers import ess
 from gareus.mbar_analysis.pmf import (
     make_bins, _bin_indices, pmf_from_weights,
     _cumulant_shared_stats, _cumulant_from_shared, _cumulant_expansion, _cumulant_expansion_both,
@@ -477,11 +478,6 @@ def run_epoch_pmf_convergence(d: Data, args, bins: np.ndarray, selected: str,
             'sources': [p['label'] for p in pooling], 'skipped_empty_epochs': skipped_epochs,
             'output_dir': str(out)}
 
-
-def ess(w):
-    w=np.asarray(w,float); w=w[np.isfinite(w)&(w>=0)]
-    if w.size==0: return 0.0
-    s1=float(np.sum(w)); s2=float(np.sum(w*w)); return 0.0 if s2<=0 else s1*s1/s2
 
 from gareus.mbar_analysis.writers import (
     write_2d_fes_csv, write_2d_fes_npz, write_cv1_cv2_2d_fes_csv, write_cv1_cv2_2d_fes_npz,
