@@ -268,6 +268,45 @@ def _compute_basin_populations(prob: np.ndarray, basins: list) -> list:
     return [float(np.sum(prob[b['left_bin']:b['right_bin'] + 1])) for b in basins]
 
 
+def _weighted_mean_std(values, weights):
+    v = np.asarray(values, dtype=np.float64)
+    w = np.asarray(weights, dtype=np.float64)
+    mask = np.isfinite(v) & np.isfinite(w) & (w >= 0)
+    if not np.any(mask):
+        return float('nan'), float('nan')
+    v = v[mask]
+    w = w[mask]
+    sw = float(np.sum(w))
+    if sw <= 0:
+        return float('nan'), float('nan')
+    w = w / sw
+    mean = float(np.sum(w * v))
+    var = float(np.sum(w * (v - mean) ** 2))
+    return mean, float(math.sqrt(max(0.0, var)))
+
+
+def _pmf_distribution_mean_std(pmf: dict):
+    x = np.asarray(pmf.get('cv_A', []), dtype=np.float64)
+    p = pmf_probability(pmf)
+    if x.size == 0 or p.size == 0:
+        return float('nan'), float('nan')
+    n = min(x.size, p.size)
+    x = x[:n]
+    p = p[:n]
+    mask = np.isfinite(x) & np.isfinite(p) & (p >= 0)
+    if not np.any(mask):
+        return float('nan'), float('nan')
+    x = x[mask]
+    p = p[mask]
+    sp = float(np.sum(p))
+    if sp <= 0:
+        return float('nan'), float('nan')
+    p = p / sp
+    mean = float(np.sum(p * x))
+    var = float(np.sum(p * (x - mean) ** 2))
+    return mean, float(math.sqrt(max(0.0, var)))
+
+
 def compute_gamd_reweighting_diagnostics(out_dir: Path, temperature_k: float) -> dict:
     """Compute diagnostics assessing GaMD boost reweighting reliability.
 

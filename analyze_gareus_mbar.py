@@ -14,6 +14,7 @@ import numpy as np
 from gareus.units import KJ_PER_KCAL, K_B_KJ_PER_MOL_K
 from gareus.diagnostics import pmf_probability, js_divergence_1d, pmf_rmse_1d, barrier_error_1d
 from gareus.diagnostics import identify_basins_1d, _compute_basin_populations
+from gareus.diagnostics import _weighted_mean_std, _pmf_distribution_mean_std
 from gareus.mbar_analysis.pmf import (
     make_bins, _bin_indices, pmf_from_weights,
     _cumulant_shared_stats, _cumulant_from_shared, _cumulant_expansion, _cumulant_expansion_both,
@@ -1524,31 +1525,6 @@ def _compute_rg_from_trajectories(d: Data, args, progress: Optional[Progress], w
     if assigned <= 0:
         return None
     return out
-
-def _weighted_mean_std(values, weights):
-    v=np.asarray(values,dtype=np.float64); w=np.asarray(weights,dtype=np.float64)
-    mask=np.isfinite(v)&np.isfinite(w)&(w>=0)
-    if not np.any(mask): return float('nan'), float('nan')
-    v=v[mask]; w=w[mask]
-    sw=float(np.sum(w))
-    if sw<=0: return float('nan'), float('nan')
-    w=w/sw
-    mean=float(np.sum(w*v)); var=float(np.sum(w*(v-mean)**2))
-    return mean, float(math.sqrt(max(0.0,var)))
-
-def _pmf_distribution_mean_std(pmf: dict):
-    x=np.asarray(pmf.get('cv_A',[]),dtype=np.float64)
-    p=pmf_probability(pmf)
-    if x.size==0 or p.size==0: return float('nan'), float('nan')
-    n=min(x.size,p.size); x=x[:n]; p=p[:n]
-    mask=np.isfinite(x)&np.isfinite(p)&(p>=0)
-    if not np.any(mask): return float('nan'), float('nan')
-    x=x[mask]; p=p[mask]
-    sp=float(np.sum(p))
-    if sp<=0: return float('nan'), float('nan')
-    p=p/sp
-    mean=float(np.sum(p*x)); var=float(np.sum(p*(x-mean)**2))
-    return mean, float(math.sqrt(max(0.0,var)))
 
 def analyze_rg(d: Data, args, m: dict, base_w: np.ndarray, selected: str, boost_ok: bool, kbt_kcal: float, out: Path, warnings: list[str], progress: Optional[Progress]) -> dict:
     rg=np.asarray(d.rg_A,dtype=np.float64)
