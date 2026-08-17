@@ -229,3 +229,80 @@ def test_analyze_secondary_cv_pmf_end_to_end_still_works(tmp_path):
     assert info['available'] is True
     assert (out_dir / 'cv2_pmf_unbiased.csv').exists()
     assert (out_dir / 'cv2_pmf_summary.json').exists()
+
+
+def test_analyze_secondary_cv_pmf_boost_branch_end_to_end(tmp_path):
+    """Regression: the existing end-to-end test above always passes
+    boost_ok=False with an all-NaN boost_kj, so `if boost_ok and
+    np.isfinite(boost_sel).sum()>10 and np.nanstd(boost_sel)>1e-12:`'s whole
+    branch (a second _agm.norm_logw call, plus the _agm._eff_smooth kwarg
+    feeding _cumulant_expansion_both) is never reached by any existing test
+    -- found during this plan's own final-task review as a real coverage
+    gap structurally invisible to both the byte-identity diff and the
+    undefined-name checker (neither can see whether a bridged attribute
+    access actually executes correctly, only whether the bare name is
+    resolvable). Separately, the plotting try-block below (_eff_smooth,
+    _visible_pmfs, _smooth_pmf_1d) runs unconditionally either way but
+    silently swallows any exception into `warnings` -- no existing test
+    asserts `warnings == []`, so a broken bridge there would produce a
+    missing PNG with no test failure. This test closes both gaps at once:
+    real finite, non-trivial-variance boost_kj with boost_ok=True exercises
+    the boost branch for real, and asserting `warnings == []` (not just
+    `info['available']`) means a swallowed AttributeError from any of the
+    7 bridge points reachable from this call would now fail the test."""
+    import gareus.mbar_analysis.pmf as pmfmod
+    import analyze_gareus_mbar as agm
+    import numpy as np
+    from pathlib import Path as _Path
+
+    rng = np.random.default_rng(31)
+    n_windows, samples_per_window = 3, 300
+    centers = np.linspace(-1.0, 1.0, n_windows)
+    k_kcal = np.full(n_windows, 5.0)
+    beta = 1.0 / (agm.K_B_KJ_PER_MOL_K * 300.0)
+    cv_parts, cv2_parts, window_parts = [], [], []
+    for k in range(n_windows):
+        cv_parts.append(centers[k] + rng.normal(0.0, 0.3, size=samples_per_window))
+        cv2_parts.append(rng.normal(0.0, 1.0, size=samples_per_window))
+        window_parts.append(np.full(samples_per_window, k, dtype=np.int64))
+    cv = np.concatenate(cv_parts)
+    cv2 = np.concatenate(cv2_parts)
+    window = np.concatenate(window_parts)
+    n = cv.size
+    u_nk = np.zeros((n, n_windows), dtype=np.float64)
+    for k in range(n_windows):
+        u_nk[:, k] = beta * agm.KJ_PER_KCAL * 0.5 * k_kcal[k] * (cv - centers[k]) ** 2
+    boost_kj = rng.normal(20.0, 5.0, size=n)  # real, finite, non-trivial variance
+
+    out_dir = _Path(tmp_path) / 'out'
+    out_dir.mkdir(parents=True, exist_ok=True)
+    d = agm.Data(
+        prod_dir=_Path(tmp_path), out_dir=out_dir, cv=cv, cv2=cv2,
+        rg_A=np.full(n, np.nan), window=window, replica=window.copy(), step=np.arange(n),
+        u_nk=u_nk, centers=centers, k_kcal=k_kcal, beta=beta, temp=300.0,
+        boost_kj=boost_kj, potential_kj=None, source='test', meta={},
+    )
+    m = agm.solve_mbar(d.u_nk, d.window)
+    logw = np.asarray(m['logw'], dtype=np.float64)
+    kbt_kcal = (1.0 / d.beta) / agm.KJ_PER_KCAL
+
+    class _Args:
+        bins = 20
+        cv2_bins = None
+        cv2_min = None
+        cv2_max = None
+        gamd_smooth_sigma = 0.0
+        pmf_smooth_sigma = 0.0
+        smooth_sigma = 0.0
+        plot_gamd_exponential = False
+        plot_gamd_cumulant3 = False
+        no_convergence = True
+
+    warnings_list = []
+    info = pmfmod.analyze_secondary_cv_pmf(d, _Args(), logw, 'gamd_cumulant2', True, kbt_kcal, out_dir, warnings_list, None)
+    assert info['available'] is True
+    assert warnings_list == [], f"boost-branch/plotting bridge silently failed: {warnings_list}"
+    assert info['selected_unbiased_method'] != 'umbrella_only', "boost branch was not actually taken"
+    assert (out_dir / 'cv2_pmf_unbiased.csv').exists()
+    assert (out_dir / 'cv2_pmf_summary.json').exists()
+    assert (out_dir / 'cv2_pmf_unbiased.png').exists()
