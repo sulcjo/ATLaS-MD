@@ -208,6 +208,45 @@ Key facts for whoever specs A6b:
   computes per-row `mbar_ess`/`gamd_reweight_ess`). Not this plan's job to
   unify — a pure relocation should carry the asymmetry over unchanged and
   flag it in scope notes, exactly as this document does.
+- **`_bridge()`'s branch order is broken and `run_observable_pmf_convergence`
+  is the exact function the pattern was written to protect — fix this before
+  reusing `_bridge()` here, do not just copy it forward.** Plan A4's final
+  whole-plan review (`docs/superpowers/sdd/.../2026-08-13-mbar-analysis-modularization-a4/final-review-report.md`
+  — see Finding F1) found and reproduced that `gareus/mbar_analysis/pmf.py`'s
+  `_bridge()` (`sys.modules.get('analyze_gareus_mbar')` checked *before*
+  `__main__`) does **not** deliver the guarantee the A4 design spec claims
+  for it. Under `python analyze_gareus_mbar.py <run_dir>`, several already-landed
+  sibling modules (`gareus/mbar_analysis/loaders_union_parquet.py`,
+  `loaders_adaptive.py`, `writers.py`, `plotting.py`) do a bare
+  `from analyze_gareus_mbar import ...`, which registers a *second*,
+  independent script copy under `sys.modules['analyze_gareus_mbar']` before
+  any `_bridge()`-using function ever runs (`loaders_union_parquet.py`'s
+  fires unconditionally on every adaptive-Parquet data load). `_bridge()`
+  then matches branch 1 and returns that second, never-`parse_args()`'d
+  copy — never `__main__`, the copy the CLI user's actual flags landed on.
+  Today (A4 only) this is bounded: `pmf.py`'s three script-local bridged
+  names (`ess`, `analyze_cv1_cv2_2d_fes`, `run_observable_pmf_convergence`)
+  only diverge on `--sambar-*`/`--mbar-anderson-history`-derived state, and
+  only when the paired `--convergence-sambar-*`/`--mbar-anderson-history`
+  flag is left falsy. **A6b is exactly the plan that changes that**:
+  `run_observable_pmf_convergence` (and its siblings above, once relocated
+  here) becomes the module that itself resolves `_agm.<name>` for whatever
+  still lives in the script at that point, and per A4's own design-spec
+  rationale (`...-a4-design.md:143-152`), this exact function is the one the
+  whole resolver was written to protect against a copy-divergent read. Do
+  not carry `_bridge()`'s current branch order forward into A6b's own bridge
+  calls (if any) or leave A4's copy unfixed and load-bearing by the time A6b
+  ships. Recommended fix (already verified correct and given verbatim in the
+  A4 final-review report): swap the two branches so `__main__` is checked
+  first, then the module name, then fresh-import — strictly better in all
+  three invocation shapes (`python analyze_gareus_mbar.py`, pytest/notebook,
+  `python -m analyze_gareus_mbar`). One existing test needs re-stating
+  (`test_bridge_prefers_already_loaded_real_module` in
+  `tests/test_mbar_analysis_pmf_module.py`); the other two `_bridge()` branch
+  tests remain valid unchanged. Fix this in `gareus/mbar_analysis/pmf.py`
+  directly (not a new copy) as A6b's first task, before any new bridged call
+  into `run_observable_pmf_convergence`'s new home is written against the
+  broken ordering.
 
 ### A6c — Trajectory I/O Infra + Structural Observables (~1,090 lines into package + 284 to a new top-level file, 41 functions total)
 
