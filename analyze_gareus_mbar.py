@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Optional
 import numpy as np
 from gareus.units import KJ_PER_KCAL, K_B_KJ_PER_MOL_K
+from gareus.diagnostics import pmf_probability, js_divergence_1d, pmf_rmse_1d, barrier_error_1d
 from gareus.mbar_analysis.pmf import (
     make_bins, _bin_indices, pmf_from_weights,
     _cumulant_shared_stats, _cumulant_from_shared, _cumulant_expansion, _cumulant_expansion_both,
@@ -503,44 +504,6 @@ from gareus.mbar_analysis.plotting import (
     plot_rg_outputs, _OPT_IN_GAMD_METHODS, _want_gamd_method, _visible_pmfs,
 )
 
-
-def pmf_probability(pmf: dict) -> np.ndarray:
-    prob=np.asarray(pmf.get('prob',[]),dtype=np.float64)
-    total=float(np.nansum(prob))
-    if total>0:
-        prob=prob/total
-    return np.where(np.isfinite(prob)&(prob>=0),prob,0.0)
-
-def js_divergence_1d(P,Q):
-    P=pmf_probability({'prob':P})
-    Q=pmf_probability({'prob':Q})
-    if P.size!=Q.size:
-        n=min(P.size,Q.size); P=P[:n]; Q=Q[:n]
-    M=0.5*(P+Q)
-    with np.errstate(divide='ignore',invalid='ignore'):
-        a=np.where(P>0,P*np.log(P/np.maximum(M,1e-300)),0.0)
-        b=np.where(Q>0,Q*np.log(Q/np.maximum(M,1e-300)),0.0)
-    return float(0.5*(np.sum(a)+np.sum(b)))
-
-def pmf_rmse_1d(F,Fref,P,Pref,min_prob=0.0):
-    F=np.asarray(F,dtype=np.float64); Fref=np.asarray(Fref,dtype=np.float64)
-    P=np.asarray(P,dtype=np.float64); Pref=np.asarray(Pref,dtype=np.float64)
-    n=min(F.size,Fref.size,P.size,Pref.size)
-    if n<=0: return float('nan')
-    F=F[:n]; Fref=Fref[:n]; P=P[:n]; Pref=Pref[:n]
-    mask=np.isfinite(F)&np.isfinite(Fref)&(P>float(min_prob))&(Pref>float(min_prob))
-    if not np.any(mask): return float('nan')
-    d=F[mask]-Fref[mask]
-    return float(np.sqrt(np.mean(d*d)))
-
-def barrier_error_1d(F,Fref,P,Pref):
-    F=np.asarray(F,dtype=np.float64); Fref=np.asarray(Fref,dtype=np.float64)
-    P=np.asarray(P,dtype=np.float64); Pref=np.asarray(Pref,dtype=np.float64)
-    n=min(F.size,Fref.size,P.size,Pref.size)
-    if n<=0: return float('nan')
-    mask=np.isfinite(F[:n])&np.isfinite(Fref[:n])&(P[:n]>0)&(Pref[:n]>0)
-    if not np.any(mask): return float('nan')
-    return float(abs(np.nanmax(F[:n][mask])-np.nanmax(Fref[:n][mask])))
 
 def identify_basins_1d(cv_A: np.ndarray, F: np.ndarray, min_depth_kcal: float = 0.5) -> list:
     """Find basins in a 1D PMF and partition the CV axis into basin domains.

@@ -27,6 +27,12 @@ Available functions
     exist in each window.  It also computes histogram overlaps
     between neighbouring windows to identify weakly connected regions.
 
+``pmf_probability``, ``js_divergence_1d``, ``pmf_rmse_1d``, ``barrier_error_1d``
+    PMF-vs-reference comparison metrics used by the epoch/frame-count
+    convergence loops: normalising a raw PMF into a probability
+    distribution, Jensen-Shannon divergence and RMSE/barrier-height
+    error between two PMFs restricted to well-sampled bins.
+
 The private helpers ``_read_csv_dicts``, ``_safe_float``,
 ``_sample_counts_by_window`` and ``_hist_overlap_np`` are exposed for
 internal use but not exported by the package.
@@ -46,6 +52,10 @@ import numpy as np
 __all__ = [
     "compute_gamd_reweighting_diagnostics",
     "validate_us_mbar_inputs",
+    "pmf_probability",
+    "js_divergence_1d",
+    "pmf_rmse_1d",
+    "barrier_error_1d",
 ]
 
 
@@ -98,6 +108,65 @@ def _hist_overlap_np(a: np.ndarray, b: np.ndarray, lo: float, hi: float, bins: i
     pa = ha.astype(float) / float(ha.sum())
     pb = hb.astype(float) / float(hb.sum())
     return float(np.minimum(pa, pb).sum())
+
+
+def pmf_probability(pmf: dict) -> np.ndarray:
+    """Normalize a raw PMF ``prob`` array to a finite, non-negative distribution."""
+    prob = np.asarray(pmf.get('prob', []), dtype=np.float64)
+    total = float(np.nansum(prob))
+    if total > 0:
+        prob = prob / total
+    return np.where(np.isfinite(prob) & (prob >= 0), prob, 0.0)
+
+
+def js_divergence_1d(P, Q) -> float:
+    """Jensen-Shannon divergence (nats) between two (unnormalized) 1D distributions."""
+    P = pmf_probability({'prob': P})
+    Q = pmf_probability({'prob': Q})
+    if P.size != Q.size:
+        n = min(P.size, Q.size)
+        P = P[:n]
+        Q = Q[:n]
+    M = 0.5 * (P + Q)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        a = np.where(P > 0, P * np.log(P / np.maximum(M, 1e-300)), 0.0)
+        b = np.where(Q > 0, Q * np.log(Q / np.maximum(M, 1e-300)), 0.0)
+    return float(0.5 * (np.sum(a) + np.sum(b)))
+
+
+def pmf_rmse_1d(F, Fref, P, Pref, min_prob=0.0) -> float:
+    """RMSE between two PMFs, restricted to bins with probability above ``min_prob`` on both sides."""
+    F = np.asarray(F, dtype=np.float64)
+    Fref = np.asarray(Fref, dtype=np.float64)
+    P = np.asarray(P, dtype=np.float64)
+    Pref = np.asarray(Pref, dtype=np.float64)
+    n = min(F.size, Fref.size, P.size, Pref.size)
+    if n <= 0:
+        return float('nan')
+    F = F[:n]
+    Fref = Fref[:n]
+    P = P[:n]
+    Pref = Pref[:n]
+    mask = np.isfinite(F) & np.isfinite(Fref) & (P > float(min_prob)) & (Pref > float(min_prob))
+    if not np.any(mask):
+        return float('nan')
+    d = F[mask] - Fref[mask]
+    return float(np.sqrt(np.mean(d * d)))
+
+
+def barrier_error_1d(F, Fref, P, Pref) -> float:
+    """Absolute difference between two PMFs' maxima, restricted to bins with positive probability on both sides."""
+    F = np.asarray(F, dtype=np.float64)
+    Fref = np.asarray(Fref, dtype=np.float64)
+    P = np.asarray(P, dtype=np.float64)
+    Pref = np.asarray(Pref, dtype=np.float64)
+    n = min(F.size, Fref.size, P.size, Pref.size)
+    if n <= 0:
+        return float('nan')
+    mask = np.isfinite(F[:n]) & np.isfinite(Fref[:n]) & (P[:n] > 0) & (Pref[:n] > 0)
+    if not np.any(mask):
+        return float('nan')
+    return float(abs(np.nanmax(F[:n][mask]) - np.nanmax(Fref[:n][mask])))
 
 
 def compute_gamd_reweighting_diagnostics(out_dir: Path, temperature_k: float) -> dict:
