@@ -64,6 +64,70 @@ mechanical extraction and verification.
   `grep -n "from gareus.units import"`). If that line is not present
   (Plan A1 not yet executed in this checkout), add immediately after the
   `import numpy as np` line instead (`grep -n "^import numpy as np"`).
+- **CORRECTION (found during Plan A6a's final whole-plan review, before this
+  plan's own execution began) — line 54-55's "no existing test file is
+  modified... must keep passing unchanged" is FALSE for 3 specific tests,
+  and this plan needs an explicit fix step, not just a passive
+  expectation.** This plan relocates both the caller AND callee of three
+  existing monkeypatch-based tests into the *same* new module
+  (`gareus/mbar_analysis/pmf.py`) — exactly the monkeypatch-vs-shim hazard
+  Plan A6a's own Task 2/Task 6 already hit once for `_plot_2d_fes_range`/
+  `_plot_2d_fes_multirange` (see that plan's ledger and CLAUDE.md-adjacent
+  history for the full mechanism: once both sides of a monkeypatched call
+  live in one module, the patched function's internal call resolves via
+  that module's own `__globals__`, not the `analyze_gareus_mbar`
+  re-exported binding a test patched — so the patch silently stops taking
+  effect, and the test then fails on its own downstream assertion, not on
+  an import error). Confirmed independently (test names, exact patch
+  lines, and current behavior all re-verified directly in this worktree
+  before writing this correction) — not merely inferred from the design
+  spec:
+  - `tests/test_cumulant_shared_computation.py::test_run_pmf_and_gamd_boost_report_uses_combined_path_exactly_once`
+    (currently at L510; patches `agm._cumulant_expansion_both`/`agm.cumulant2`/
+    `agm.cumulant3` at L541-543, then calls `agm.run_pmf_and_gamd_boost_report`).
+    Task 1 relocates the three patched names; **Task 3** relocates the
+    calling orchestrator into the same module — Task 3 is where this test
+    breaks and where its fix belongs.
+  - `tests/test_secondary_cv_regime_split.py::test_regime_meta_preserves_dict_shape_with_regions`
+    (currently at L353; patches `analyze_gareus_mbar.analyze_secondary_cv_pmf`
+    at L389, then calls through `run_secondary_cv_analyses`).
+  - `tests/test_masked_logw_subset_pmf.py::test_run_secondary_cv_analyses_uses_corrected_reweight_when_f_k_global_given`
+    (currently at L218; directly *reassigns*
+    `analyze_gareus_mbar.analyze_secondary_cv_pmf` at L245/L252, restoring
+    the real function via a `finally`-block-style reset, then calls
+    `run_secondary_cv_analyses`). Both of these break once **Task 4**
+    relocates `run_secondary_cv_analyses` AND `analyze_secondary_cv_pmf`
+    together (this plan already puts both in the same task, for the same
+    reason A6a's Task 2 put `_plot_2d_fes_range`/`_plot_2d_fes_multirange`
+    together) — Task 4 is where these two tests break and where their fix
+    belongs.
+  - **Required fix, mirroring A6a's Task 6 exactly**: whichever of Task 3/4
+    actually causes each test's caller+callee pair to co-locate must, as
+    part of that same task (not a separate later task — do not defer this
+    the way A6a *could* afford to since A6a's plan had a dedicated Task 6
+    slot already reserved for it; this plan does not, so build the
+    repointing directly into Tasks 3 and 4's own step lists), repoint each
+    test's monkeypatch/reassignment target from `analyze_gareus_mbar.<name>`
+    to `gareus.mbar_analysis.pmf.<name>` (or wherever the callee actually
+    lands — re-verify against this plan's own Task 1/2 output before
+    assuming `pmf.py` is correct by the time Task 3/4 executes). Do **not**
+    add a new patch-and-forget shim; repoint the test itself, exactly as
+    A6a Task 6 did.
+  - Line 54-55 above, and the design spec's equivalent "must pass unchanged"
+    Testing-section claim (naming these same tests), are both **incorrect
+    as literally written** and must be read as "must pass, after the
+    Task 3/4 patch-target repointing above" — not "requires zero test
+    changes." This is a plan-defect correction, not new scope: the tests
+    still assert exactly the same behavior as before — after repointing,
+    they pass with the same behavioral guarantee they always had, just
+    verified against the functions' new module location.
+  - Whoever runs this plan: do this verification as part of Task 3's Step 5
+    and Task 4's Step 5 (or equivalent), the same way A6a's Task 2 Step 5
+    deliberately ran the not-yet-fixed test to confirm the predicted
+    failure before Task 6 fixed it — confirm each test fails with the
+    predicted symptom immediately after the relocation that breaks it,
+    *then* fix it in the same task, rather than discovering it only at
+    this plan's own final full-suite verification (Task 5).
 
 ---
 

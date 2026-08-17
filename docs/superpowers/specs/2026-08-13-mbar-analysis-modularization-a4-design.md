@@ -445,7 +445,19 @@ new physics coverage:
   ends with `analyze_gareus_mbar.py` (the `python analyze_gareus_mbar.py
   <run_dir>` invocation); neither present (falls back to a fresh import).
 - **The existing, substantial test suite for this code must pass unchanged**
-  — confirmed present via direct `grep`:
+  — confirmed present via direct `grep`. **CORRECTION (found during Plan
+  A6a's final whole-plan review): this claim is false for 3 of the tests
+  below** (`test_run_pmf_and_gamd_boost_report_uses_combined_path_exactly_once`,
+  `test_regime_meta_preserves_dict_shape_with_regions`,
+  `test_run_secondary_cv_analyses_uses_corrected_reweight_when_f_k_global_given`)
+  — each monkeypatches/reassigns a name whose caller this plan relocates
+  into the same module as the callee (Task 3 for the first, Task 4 for the
+  other two), the identical monkeypatch-vs-shim hazard Plan A6a's Task 2/
+  Task 6 already hit once. These 3 tests must be REPOINTED (not left
+  unchanged) as part of Tasks 3/4 themselves, mirroring A6a's Task 6 fix
+  exactly. Full detail, exact line numbers, and the required fix shape are
+  in the implementation plan's own Global Constraints CORRECTION block —
+  read that before executing Task 3 or Task 4.
   - `tests/test_cumulant_expansion.py` (86 lines) — `cumulant2`/`cumulant3`/
     `cumulant2_2d`/`cumulant3_2d` hand-computed-value and symmetric-boost
     checks, `_cumulant_expansion`'s bad-order `ValueError`.
