@@ -12,6 +12,7 @@ from typing import Optional
 import numpy as np
 
 from gareus.mbar_analysis import plotstyle as ps
+from gareus.mbar_analysis.data import Data
 from gareus.units import KJ_PER_KCAL
 
 def _secondary_cv_label(meta: dict) -> str:
