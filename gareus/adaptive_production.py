@@ -1111,6 +1111,194 @@ def _discover_latest_seed_bank(adaptive_dir: Path) -> Optional[Path]:
     return None
 
 
+def _find_replica_trajectory(segment_dir: Path, replica_id: int) -> Optional[Path]:
+    """Find replica_trajectories/replica_<replica_id>.xtc under segment_dir.
+
+    Discovers the actual filename by parsing the integer out of each
+    candidate rather than assuming a fixed zero-pad width.
+    """
+    traj_dir = Path(segment_dir) / "replica_trajectories"
+    if not traj_dir.is_dir():
+        return None
+    for candidate in sorted(traj_dir.glob("replica_*.xtc")):
+        match = re.search(r"(\d+)$", candidate.stem)
+        if match and int(match.group(1)) == int(replica_id):
+            return candidate
+    return None
+
+
+def resolve_seed_frame_pdb(seed_frame: Dict[str, Any], topology, out_pdb_path: Path) -> Optional[Dict[str, Any]]:
+    """Extract the real structure a tICA coverage ``seed_frame`` points at and write it as a PDB.
+
+    Returns a small info dict on success, or None (never raises) if
+    extraction is not safely possible for this frame - callers must fall
+    back to the normal seed-library path, never guess. Every fact needed is
+    read from the ORIGINATING SEGMENT's own recorded config
+    (``resolved_args.traj_interval``/``traj_solute_only`` in that segment's
+    own ``config/run_manifest.json``) rather than assumed, so this works for
+    any system/run whose segment actually recorded a trajectory - not just
+    the one it was written against.
+
+    A wrong extraction would silently hand seeding a plausible-looking but
+    physically wrong starting structure, worse than skipping it entirely, so
+    every check below is fail-closed: any missing file, disabled trajectory
+    recording, non-divisible/out-of-range step, or read error returns None
+    rather than guessing.
+    """
+    try:
+        replica_id = int(seed_frame["replica_id"])
+        step = int(seed_frame["step"])
+        epoch_dir_value = seed_frame.get("epoch_dir")
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not epoch_dir_value:
+        return None
+    segment_dir = Path(epoch_dir_value)
+    xtc_path = _find_replica_trajectory(segment_dir, replica_id)
+    if xtc_path is None:
+        return None
+
+    manifest = read_json_file(segment_dir / "config" / "run_manifest.json", {}) or {}
+    resolved_args = manifest.get("resolved_args", {}) or {}
+    traj_interval = int(resolved_args.get("traj_interval", 0) or 0)
+    if traj_interval <= 0:
+        # Trajectory recording was off for this segment (e.g. an
+        # adaptive-feedback pilot, which skips it by default) - no XTC frame
+        # can correspond to this step even though the file above happens to
+        # exist (a stale/unrelated file from a different config).
+        return None
+    traj_solute_only = bool(resolved_args.get("traj_solute_only", False))
+
+    frame_index = int(round(step / traj_interval))
+    step_offset = abs(frame_index * traj_interval - step)
+    # Half the interval is the largest possible pure-rounding offset; more
+    # than that means a real mismatch (e.g. resumed step-numbering not
+    # accounted for here), not just imprecision - refuse rather than guess.
+    if frame_index < 0 or step_offset > traj_interval / 2.0 + 1.0e-6:
+        return None
+
+    try:
+        import mdtraj
+    except ImportError:
+        return None
+
+    try:
+        with mdtraj.open(str(xtc_path)) as handle:
+            n_frames = len(handle)
+    except Exception:
+        return None
+    if frame_index >= n_frames:
+        # Segment likely crashed/was truncated before reaching this step.
+        return None
+
+    try:
+        if traj_solute_only:
+            from .cv import solute_atom_indices
+            mdtraj_top = mdtraj.Topology.from_openmm(topology).subset(solute_atom_indices(topology))
+        else:
+            mdtraj_top = mdtraj.Topology.from_openmm(topology)
+        frame = mdtraj.load_frame(str(xtc_path), frame_index, top=mdtraj_top)
+    except Exception:
+        return None
+
+    positions_nm = frame.xyz[0]
+    if positions_nm.shape[0] == 0 or not np.all(np.isfinite(positions_nm)):
+        return None
+
+    out_pdb_path = Path(out_pdb_path)
+    out_pdb_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        frame.save_pdb(str(out_pdb_path))
+    except Exception:
+        return None
+
+    return {
+        "pdb_path": str(out_pdb_path),
+        "source_xtc": str(xtc_path),
+        "frame_index": int(frame_index),
+        "step_offset": int(step_offset),
+        "n_atoms": int(positions_nm.shape[0]),
+        "traj_solute_only": traj_solute_only,
+    }
+
+
+def _append_seed_bank_row(seed_bank_dir: Path, row: Dict[str, Any]) -> None:
+    """Append one row to final_survivor_seeds.csv, creating it if needed."""
+    seed_bank_dir = Path(seed_bank_dir)
+    seed_bank_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = seed_bank_dir / "final_survivor_seeds.csv"
+    fieldnames = [
+        "seed_name", "survivor_pdb_path", "source_run_dir", "source_pdb_path",
+        "source_label", "source_state_id", "source_epoch_window",
+        "primary_cv_value", "secondary_cv_value",
+    ]
+    existing = _read_csv_dicts(csv_path)
+    existing.append(row)
+    with csv_path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(existing)
+
+
+def extract_and_register_coverage_seeds(
+    coverage_actions: List[Tuple],
+    new_state_ids: List[int],
+    seed_bank_dir: Path,
+    topology,
+    source_label: str,
+) -> Dict[str, Any]:
+    """Extract a real seed structure for each coverage action that has one, register it.
+
+    ``new_state_ids`` must be the state ids created by applying
+    ``coverage_actions``, in the same order. The call site derives this from
+    a before/after set-difference on ``registry.active_states()``: safe there
+    because ``add_state`` assigns ids strictly increasing and
+    ``AdaptiveProductionController.apply_actions`` applies a list of actions
+    in order with nothing else adding states in between - not a generically
+    reusable pairing outside that specific call path.
+    """
+    coverage_actions = list(coverage_actions)
+    new_state_ids = list(new_state_ids)
+    if len(new_state_ids) != len(coverage_actions):
+        logger.warning(
+            "extract_and_register_coverage_seeds: %d actions but %d new state ids - "
+            "id/action pairing assumption broke, skipping extraction this round",
+            len(coverage_actions), len(new_state_ids),
+        )
+        return {"n_extracted": 0, "n_skipped": len(coverage_actions), "rows": [], "error": "id_count_mismatch"}
+
+    seed_bank_dir = Path(seed_bank_dir)
+    pdb_dir = seed_bank_dir / "pdbs"
+    n_extracted = 0
+    n_skipped = 0
+    rows: List[Dict[str, Any]] = []
+    for action, state_id in zip(coverage_actions, new_state_ids):
+        metadata = action[4] if len(action) > 4 else None
+        seed_frame = metadata.get("seed_frame") if isinstance(metadata, dict) else None
+        if not seed_frame:
+            continue
+        pdb_path = pdb_dir / f"tica_coverage_state_{int(state_id):04d}.pdb"
+        info = resolve_seed_frame_pdb(seed_frame, topology, pdb_path)
+        if info is None:
+            n_skipped += 1
+            continue
+        row = {
+            "seed_name": f"tica_coverage_state_{int(state_id):04d}",
+            "survivor_pdb_path": str(Path("pdbs") / pdb_path.name),
+            "source_run_dir": str(seed_frame.get("epoch_dir", "")),
+            "source_pdb_path": info["source_xtc"],
+            "source_label": str(source_label),
+            "source_state_id": int(state_id),
+            "source_epoch_window": info["frame_index"],
+            "primary_cv_value": seed_frame.get("primary_cv", ""),
+            "secondary_cv_value": seed_frame.get("secondary_cv", ""),
+        }
+        _append_seed_bank_row(seed_bank_dir, row)
+        rows.append(row)
+        n_extracted += 1
+    return {"n_extracted": n_extracted, "n_skipped": n_skipped, "rows": rows}
+
+
 def filter_seed_bank_for_state_ids(
     seed_bank_dir: Path,
     target_state_ids: Sequence[int],
@@ -1775,7 +1963,8 @@ def _propose_tica_coverage_actions(
     *,
     temperature_K: float = 298.0,
     population_fraction: float = 0.01,
-    window_ids: Optional[np.ndarray] = None,
+    umbrella_state_ids: Optional[np.ndarray] = None,
+    replica_ids: Optional[np.ndarray] = None,
     steps: Optional[np.ndarray] = None,
     epoch_dir: Optional[Path] = None,
 ) -> List[Tuple]:
@@ -1786,29 +1975,31 @@ def _propose_tica_coverage_actions(
     Normal weak-edge additions are intentionally not used as a cap here: the
     existing runtime replica limit remains responsible for launch capacity.
 
-    ``window_ids``/``steps`` (both from :func:`gareus.tica.load_epoch_dihedral_obs`,
+    ``replica_ids``/``steps`` (both from :func:`gareus.tica.load_epoch_dihedral_obs`,
     same length/order as ``primary_cv``/``tic1``) are optional. When given, each
     new state's action metadata records a ``seed_frame`` pointing at one frame
     that actually populated the newly covered region - real, already-visited
     coordinates, unlike the parent's own GENPEPT-library seed which may sit
     nowhere near the new target (confirmed on chignolin_6: parent state 18's
     seed was 1.5 tIC1 units from a child state added for a region 82 real
-    frames had already visited).
+    frames had already visited). ``umbrella_state_ids`` is recorded alongside
+    purely for diagnostics (which umbrella was biasing the replica at that
+    moment) - it is NOT the file/replica identifier needed to locate a
+    trajectory; that is ``replica_ids``.
 
-    NOT YET CONSUMED: nothing currently reads ``seed_frame`` back out to build
-    an actual seed structure. Resolving (window_id, step) to real coordinates
-    means locating whichever segment directory's own
-    ``replica_trajectories/replica_<window_id>.xtc`` (if any - trajectory
-    recording can be off entirely, e.g. adaptive-feedback pilots skip it by
-    default) covers this step range, confirming its ``--traj-interval``
-    divides evenly into the recorded step spacing, and only then indexing into
-    it - see the caveats on ``load_epoch_dihedral_obs``. That mapping needs
-    validating against a real run before anything trusts it for seeding.
+    ``seed_frame`` itself only records the reference; resolving it to an
+    actual structure (locating the right segment's
+    ``replica_trajectories/replica_<replica_id>.xtc``, if trajectory
+    recording was even on, confirming/relaxing to the nearest available frame
+    for that segment's own ``--traj-interval``, and reading it with the
+    matching topology) is a separate, deliberately isolated step - see
+    :func:`resolve_seed_frame_to_conformer`.
     """
     policy = policy or AdaptiveDecisionPolicy()
     primary = np.asarray(primary_cv, dtype=float)
     secondary = np.asarray(tic1, dtype=float)
-    window_ids_arr = np.asarray(window_ids) if window_ids is not None else None
+    umbrella_state_ids_arr = np.asarray(umbrella_state_ids) if umbrella_state_ids is not None else None
+    replica_ids_arr = np.asarray(replica_ids) if replica_ids is not None else None
     steps_arr = np.asarray(steps) if steps is not None else None
     active = [s for s in registry.active_states()
               if s.secondary_center is not None and (s.secondary_k or 0.0) > 0.0]
@@ -1828,9 +2019,14 @@ def _propose_tica_coverage_actions(
 
     uncovered_values = values[uncovered]
     uncovered_primary = primary[finite][uncovered]
-    uncovered_window_ids = (
-        window_ids_arr[finite][uncovered]
-        if window_ids_arr is not None and len(window_ids_arr) == len(finite)
+    uncovered_umbrella_state_ids = (
+        umbrella_state_ids_arr[finite][uncovered]
+        if umbrella_state_ids_arr is not None and len(umbrella_state_ids_arr) == len(finite)
+        else None
+    )
+    uncovered_replica_ids = (
+        replica_ids_arr[finite][uncovered]
+        if replica_ids_arr is not None and len(replica_ids_arr) == len(finite)
         else None
     )
     uncovered_steps = (
@@ -1907,7 +2103,7 @@ def _propose_tica_coverage_actions(
                 "tic1_max": hi,
                 "coverage_radius": float(radii[int(np.argmin(np.abs(centers - target_secondary)))]),
             }
-            if uncovered_window_ids is not None and uncovered_steps is not None:
+            if uncovered_replica_ids is not None and uncovered_steps is not None:
                 # Frame in this group closest to the group's own median target -
                 # a representative already-visited structure, not the closest
                 # thing in a static seed library that may be nowhere near here.
@@ -1916,15 +2112,14 @@ def _propose_tica_coverage_actions(
                     int(np.argmin(np.abs(uncovered_values[group_indices] - target_secondary)))
                 ]
                 metadata["seed_frame"] = {
-                    "window_id": int(uncovered_window_ids[best_local]),
+                    "replica_id": int(uncovered_replica_ids[best_local]),
                     "step": int(uncovered_steps[best_local]),
                     "epoch_dir": str(epoch_dir) if epoch_dir is not None else None,
                     "primary_cv": float(uncovered_primary[best_local]),
                     "secondary_cv": float(uncovered_values[best_local]),
-                    "note": (
-                        "NOT YET RESOLVED TO A STRUCTURE - see _propose_tica_coverage_actions "
-                        "docstring. step is this replica's own integration step count, not a "
-                        "trajectory-file frame index."
+                    "umbrella_state_at_frame": (
+                        int(uncovered_umbrella_state_ids[best_local])
+                        if uncovered_umbrella_state_ids is not None else None
                     ),
                 }
             actions.append(("tica_coverage_add", int(parent.state_id), params, reason, metadata))
@@ -2138,7 +2333,7 @@ def _maybe_update_tica_cvaux(epoch: int, epoch_dir: Path, adaptive_dir: Path, ar
     mbar_reweighted = False
     if registry is not None:
         try:
-            _, _wids_tmp, _pcv_tmp, _scv_tmp, _, _ = load_epoch_dihedral_obs(epoch_dir)
+            _, _wids_tmp, _pcv_tmp, _scv_tmp, _, _, _ = load_epoch_dihedral_obs(epoch_dir)
             if np.isfinite(_pcv_tmp).any():
                 temp_K = float(getattr(args, "temperature", 298.0) or 298.0)
                 mbar_weights = _compute_mbar_weights_for_tica(
@@ -2180,7 +2375,7 @@ def _maybe_update_tica_cvaux(epoch: int, epoch_dir: Path, adaptive_dir: Path, ar
     # Compute per-window tIC1 medians for registry secondary_center update.
     per_window_centers: Dict[int, float] = {}
     try:
-        X_all, window_ids, _, _, _, _ = load_epoch_dihedral_obs(epoch_dir)
+        X_all, window_ids, _, _, _, _, _ = load_epoch_dihedral_obs(epoch_dir)
         per_window_centers = window_tica_centers(X_all, window_ids, result)
     except Exception as _wc_exc:
         print(f"    tICA: per-window center computation failed ({_wc_exc}); registry centers will not be updated")
@@ -5022,14 +5217,16 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                             from .tica import TICAResult, load_epoch_dihedral_obs, project_tica1
                             # NOTE: the 5th return value is per-*file* segment_lengths, not
                             # per-frame steps (a pre-existing naming mismatch here, now fixed
-                            # by using the real per-frame steps array below instead).
-                            _X, _wids, _primary, _secondary, _, _steps = load_epoch_dihedral_obs(epoch_dir)
+                            # by using the real per-frame steps/replica_ids arrays below).
+                            _X, _wids, _primary, _secondary, _, _steps, _replica_ids = load_epoch_dihedral_obs(epoch_dir)
                             _result = TICAResult.load(tica_update_report["state_file"])
                             _coverage_actions = _propose_tica_coverage_actions(
                                 registry, _primary, project_tica1(_X, _result), policy,
                                 temperature_K=float(getattr(args, "temperature", 298.0) or 298.0),
-                                window_ids=_wids, steps=_steps, epoch_dir=epoch_dir,
+                                umbrella_state_ids=_wids, replica_ids=_replica_ids, steps=_steps,
+                                epoch_dir=epoch_dir,
                             )
+                            _state_ids_before = {s.state_id for s in registry.active_states()}
                             if _coverage_actions:
                                 _apply_registry_actions(registry, _coverage_actions, epoch)
                             tica_update_report["tica_coverage_actions"] = [
@@ -5039,6 +5236,22 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                                 for action in _coverage_actions
                             ]
                             print(f"    tICA: added {len(_coverage_actions)} populated-region coverage state(s)")
+                            if _coverage_actions and current_seed_bank is not None:
+                                _new_state_ids = sorted(
+                                    s.state_id for s in registry.active_states()
+                                    if s.state_id not in _state_ids_before
+                                )
+                                _extraction_report = extract_and_register_coverage_seeds(
+                                    _coverage_actions, _new_state_ids, Path(current_seed_bank),
+                                    topology, source_label=f"epoch_{epoch:03d}_tica_coverage",
+                                )
+                                tica_update_report["coverage_seed_extraction"] = _extraction_report
+                                if _extraction_report["n_extracted"] or _extraction_report["n_skipped"]:
+                                    print(
+                                        f"    tICA coverage: extracted {_extraction_report['n_extracted']} real "
+                                        f"starting structure(s) from trajectory, {_extraction_report['n_skipped']} "
+                                        "not extractable (fell back to normal seed-library matching for those)"
+                                    )
                         except Exception as _coverage_exc:
                             tica_update_report["tica_coverage_error"] = str(_coverage_exc)
                             print(f"WARNING: tICA coverage extension skipped ({_coverage_exc})")
