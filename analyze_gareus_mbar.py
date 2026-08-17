@@ -13,6 +13,7 @@ from typing import Optional
 import numpy as np
 from gareus.units import KJ_PER_KCAL, K_B_KJ_PER_MOL_K
 from gareus.diagnostics import pmf_probability, js_divergence_1d, pmf_rmse_1d, barrier_error_1d
+from gareus.diagnostics import identify_basins_1d, _compute_basin_populations
 from gareus.mbar_analysis.pmf import (
     make_bins, _bin_indices, pmf_from_weights,
     _cumulant_shared_stats, _cumulant_from_shared, _cumulant_expansion, _cumulant_expansion_both,
@@ -68,13 +69,6 @@ from gareus.mbar_analysis.loaders import (
     _analysis_binary_sample_count, _window_float_array, load_csv,
     _parquet_sample_count, load_parquet, prod_dir_of, load_data,
 )
-
-try:
-    from scipy.signal import find_peaks as _scipy_find_peaks
-    SCIPY_SIGNAL_AVAILABLE = True
-except Exception:
-    _scipy_find_peaks = None
-    SCIPY_SIGNAL_AVAILABLE = False
 
 class Progress:
     """Small stderr progress bar for long analysis steps.
@@ -503,70 +497,6 @@ from gareus.mbar_analysis.plotting import (
     _per_window_gamd_boost_stats, plot_gamd_boost, plot_outputs,
     plot_rg_outputs, _OPT_IN_GAMD_METHODS, _want_gamd_method, _visible_pmfs,
 )
-
-
-def identify_basins_1d(cv_A: np.ndarray, F: np.ndarray, min_depth_kcal: float = 0.5) -> list:
-    """Find basins in a 1D PMF and partition the CV axis into basin domains.
-
-    Returns a list of dicts (sorted by CV position):
-      basin_id, center_cv_A, min_F_kcal, prominence_kcal,
-      left_bin, right_bin (inclusive bin indices into cv_A/F),
-      left_cv_A, right_cv_A.
-
-    Basin boundaries sit at the local maximum between adjacent minima so that
-    every bin belongs to exactly one basin and populations sum to 1.
-    """
-    cv_A = np.asarray(cv_A, dtype=np.float64)
-    F = np.asarray(F, dtype=np.float64)
-    n = len(F)
-    if n < 3:
-        return []
-    F_safe = np.where(np.isfinite(F), F, np.inf)
-    neg_F = np.where(np.isfinite(F_safe), -F_safe, -np.inf)
-    minima_idx: list = []; prominences: list = []
-    if SCIPY_SIGNAL_AVAILABLE and _scipy_find_peaks is not None:
-        try:
-            peaks, props = _scipy_find_peaks(neg_F, prominence=min_depth_kcal)
-            minima_idx = list(peaks); prominences = list(props['prominences'])
-        except Exception:
-            pass
-    if not minima_idx:
-        finite_mask = np.isfinite(F)
-        for i in range(1, n - 1):
-            if not finite_mask[i]: continue
-            left_ok = finite_mask[:i]; right_ok = finite_mask[i+1:]
-            if not (left_ok.any() and right_ok.any()): continue
-            if F[i] >= F[i-1] or F[i] >= F[i+1]: continue
-            lmax = float(np.max(F[:i][left_ok])); rmax = float(np.max(F[i+1:][right_ok]))
-            prom = min(lmax, rmax) - F[i]
-            if prom >= min_depth_kcal:
-                minima_idx.append(i); prominences.append(float(prom))
-    if not minima_idx:
-        finite_idx = np.where(np.isfinite(F))[0]
-        if len(finite_idx) == 0: return []
-        gmin = int(finite_idx[np.argmin(F[finite_idx])])
-        minima_idx = [gmin]; prominences = [0.0]
-    order = np.argsort(minima_idx)
-    minima_idx = [minima_idx[i] for i in order]; prominences = [prominences[i] for i in order]
-    # barrier_bins[i] = argmax between minima_idx[i] and minima_idx[i+1]
-    barrier_bins = []
-    for i in range(len(minima_idx) - 1):
-        lo, hi = minima_idx[i], minima_idx[i+1]
-        barrier_bins.append(lo + int(np.argmax(F_safe[lo:hi+1])))
-    # Partition: basin i covers [left_edges[i], right_edges[i]] inclusive.
-    # Barrier bin belongs to the left basin so the union is [0, n-1] without gaps or overlap.
-    left_edges  = [0] + [b + 1 for b in barrier_bins]
-    right_edges = barrier_bins + [n - 1]
-    basins = []
-    for i, mi in enumerate(minima_idx):
-        lb, rb = left_edges[i], right_edges[i]
-        basins.append({'basin_id': i, 'center_cv_A': float(cv_A[mi]), 'min_F_kcal': float(F[mi]) if np.isfinite(F[mi]) else float('nan'), 'prominence_kcal': float(prominences[i]), 'left_bin': int(lb), 'right_bin': int(rb), 'left_cv_A': float(cv_A[lb]), 'right_cv_A': float(cv_A[rb])})
-    return basins
-
-
-def _compute_basin_populations(prob: np.ndarray, basins: list) -> list:
-    prob = np.asarray(prob, dtype=np.float64)
-    return [float(np.sum(prob[b['left_bin']:b['right_bin']+1])) for b in basins]
 
 
 def _short_source_label(rd) -> str:
