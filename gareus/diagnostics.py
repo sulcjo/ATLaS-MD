@@ -56,6 +56,8 @@ from typing import List, Dict, Any, Optional
 
 import numpy as np
 
+from .math_helpers import _adaptive_hist_overlap
+
 try:
     from scipy.signal import find_peaks as _scipy_find_peaks
     SCIPY_SIGNAL_AVAILABLE = True
@@ -103,26 +105,15 @@ def _sample_counts_by_window(window_arr: np.ndarray, n_windows: int) -> list[int
 
 
 def _hist_overlap_np(a: np.ndarray, b: np.ndarray, lo: float, hi: float, bins: int = 80) -> float:
-    """Estimate the histogram overlap between two distributions."""
-    a = np.asarray(a, dtype=float)
-    b = np.asarray(b, dtype=float)
-    a = a[np.isfinite(a)]
-    b = b[np.isfinite(b)]
-    if a.size < 5 or b.size < 5:
-        return float("nan")
-    if not math.isfinite(lo) or not math.isfinite(hi) or hi <= lo:
-        allv = np.concatenate([a, b])
-        if allv.size < 2:
-            return float("nan")
-        lo, hi = float(np.min(allv)), float(np.max(allv))
-    pad = max(0.1, 0.02 * (hi - lo))
-    ha, _ = np.histogram(a, bins=max(8, int(bins)), range=(lo - pad, hi + pad))
-    hb, _ = np.histogram(b, bins=max(8, int(bins)), range=(lo - pad, hi + pad))
-    if ha.sum() <= 0 or hb.sum() <= 0:
-        return float("nan")
-    pa = ha.astype(float) / float(ha.sum())
-    pb = hb.astype(float) / float(hb.sum())
-    return float(np.minimum(pa, pb).sum())
+    """Estimate the histogram overlap between two distributions.
+
+    Delegates to gareus.math_helpers._adaptive_hist_overlap -- this
+    module's own pre-existing 5-finite-sample floor is preserved via
+    min_samples=5, so validate_us_mbar_inputs's exact prior behavior is
+    unchanged: a window pair with fewer than 5 finite samples on either
+    side reads as NaN, not a statistically meaningless finite number.
+    """
+    return _adaptive_hist_overlap(a, b, lo, hi, bins=bins, min_samples=5)
 
 
 def pmf_probability(pmf: dict) -> np.ndarray:

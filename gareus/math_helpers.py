@@ -49,12 +49,18 @@ def _hist_overlap(a: List[float], b: List[float], lo: float, hi: float, bins: in
     return float(np.minimum(pa, pb).sum())
 
 
-def _adaptive_hist_overlap(values_a: List[float] | np.ndarray, values_b: List[float] | np.ndarray, lo: float, hi: float, bins: int = 80) -> float:
+def _adaptive_hist_overlap(values_a: List[float] | np.ndarray, values_b: List[float] | np.ndarray, lo: float, hi: float, bins: int = 80, min_samples: int = 0) -> float:
     """Histogram overlap sum(min(P_i, P_j)) for two 1D CV samples.
 
     Accepts lists or already-sliced NumPy arrays.  Keeping bootstrap resamples as
     arrays avoids thousands of temporary Python-list conversions in adaptive
     feedback without changing the histogram definition.
+
+    ``min_samples`` is an optional post-finite-filter floor on each side's
+    sample count (default 0, i.e. only the empty-array case returns NaN --
+    unchanged behavior for every existing call site in adaptive_feedback.py).
+    gareus.diagnostics._hist_overlap_np delegates here with min_samples=5,
+    its own pre-existing floor.
     """
     a = np.asarray(values_a, dtype=np.float64)
     b = np.asarray(values_b, dtype=np.float64)
@@ -62,7 +68,8 @@ def _adaptive_hist_overlap(values_a: List[float] | np.ndarray, values_b: List[fl
         return float("nan")
     a = a[np.isfinite(a)]
     b = b[np.isfinite(b)]
-    if a.size == 0 or b.size == 0:
+    floor = max(1, int(min_samples))
+    if a.size < floor or b.size < floor:
         return float("nan")
     lo = float(lo)
     hi = float(hi)
