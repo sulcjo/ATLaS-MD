@@ -57,6 +57,7 @@ from typing import List, Dict, Any, Optional
 import numpy as np
 
 from .math_helpers import _adaptive_hist_overlap
+from .units import KJ_PER_KCAL, K_B_KJ_PER_MOL_K
 
 try:
     from scipy.signal import find_peaks as _scipy_find_peaks
@@ -369,7 +370,7 @@ def compute_gamd_reweighting_diagnostics(out_dir: Path, temperature_k: float) ->
         result["status"] = "warning"
         warnings.append("no finite GaMD boost values were found in analysis_arrays.npz")
         return result
-    boost_kcal = finite / 4.184
+    boost_kcal = finite / KJ_PER_KCAL
     # Defer to the implementation in gareus_peptide for anharmonicity
     try:
         from .logger import boost_anharmonicity
@@ -377,7 +378,7 @@ def compute_gamd_reweighting_diagnostics(out_dir: Path, temperature_k: float) ->
     except Exception:
         an = {"score": float("nan")}
     # Effective sample size diagnostics based on exp(beta*boost)
-    beta_1_over_kj = 1.0 / (0.00831446261815324 * float(temperature_k))
+    beta_1_over_kj = 1.0 / (K_B_KJ_PER_MOL_K * float(temperature_k))
     logw = beta_1_over_kj * finite
     logw -= float(np.max(logw))
     weights = np.exp(logw)
@@ -393,7 +394,7 @@ def compute_gamd_reweighting_diagnostics(out_dir: Path, temperature_k: float) ->
         finite_mask = np.isfinite(boost_kj)
         for wi in np.unique(window_arr[finite_mask]):
             mask = finite_mask & (window_arr == wi)
-            vals = boost_kj[mask] / 4.184
+            vals = boost_kj[mask] / KJ_PER_KCAL
             if vals.size >= 2:
                 per_window_sd[int(wi)] = float(np.std(vals))
 
