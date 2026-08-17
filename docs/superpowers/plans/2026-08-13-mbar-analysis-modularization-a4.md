@@ -608,6 +608,13 @@ git commit -m "refactor: relocate boost/window statistics into gareus.mbar_analy
 
 ### Task 3: Relocate `run_pmf_and_gamd_boost_report`
 
+**See the CORRECTION in Global Constraints before Step 5**: this task
+co-locates `run_pmf_and_gamd_boost_report` with `_cumulant_expansion_both`/
+`cumulant2`/`cumulant3` (Task 1's), breaking
+`tests/test_cumulant_shared_computation.py::test_run_pmf_and_gamd_boost_report_uses_combined_path_exactly_once`'s
+monkeypatch — repoint that test's patch target as part of this task's own
+Step 5, do not leave it for later.
+
 **Files:**
 - Modify: `gareus/mbar_analysis/pmf.py` (append 1 function)
 - Modify: `analyze_gareus_mbar.py` (delete the source range; extend the re-export import)
@@ -804,6 +811,16 @@ git commit -m "refactor: relocate run_pmf_and_gamd_boost_report into gareus.mbar
 ---
 
 ### Task 4: Relocate `run_secondary_cv_analyses` + `analyze_secondary_cv_pmf`
+
+**See the CORRECTION in Global Constraints before Step 5**: this task
+co-locates `run_secondary_cv_analyses` and `analyze_secondary_cv_pmf` in
+the same module, breaking two existing tests'
+monkeypatch/direct-reassignment of `analyze_secondary_cv_pmf` —
+`tests/test_secondary_cv_regime_split.py::test_regime_meta_preserves_dict_shape_with_regions`
+and
+`tests/test_masked_logw_subset_pmf.py::test_run_secondary_cv_analyses_uses_corrected_reweight_when_f_k_global_given`.
+Repoint both tests' patch targets as part of this task's own Step 5, do
+not leave it for later.
 
 **Files:**
 - Modify: `gareus/mbar_analysis/pmf.py` (append 2 functions)
