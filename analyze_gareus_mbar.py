@@ -22,6 +22,7 @@ from gareus.mbar_analysis.pmf import (
     cumulant2_2d, cumulant3_2d,
     _window_cv_mean_std, boost_stats, _window_moments,
     run_pmf_and_gamd_boost_report,
+    run_secondary_cv_analyses, analyze_secondary_cv_pmf,
 )
 from gareus.mbar_analysis.bias import (
     _compute_u_nk_analytical,
@@ -136,82 +137,6 @@ from gareus.mbar_analysis.plotting import (
     _secondary_cv_label, _secondary_cv_regions, _regime_slug,
     _primary_cv_label, _primary_cv_units, _primary_cv_axis_label,
 )
-
-
-def run_secondary_cv_analyses(d: 'Data', args, base_logw: np.ndarray, selected: str,
-                               boost_ok: bool, kbt_kcal: float, out: Path,
-                               warnings: list, progress: Optional['Progress'],
-                               f_k_global: Optional[np.ndarray] = None) -> tuple:
-    """Secondary-CV PMF + CV1xCV2 2D FES, split by secondary-CV regime when the
-    run's CV2 definition changed mid-campaign (see
-    ``_secondary_cv_epoch_regime_masks``). Single-regime runs (the common
-    case) are entirely unaffected: this degrades to the plain unmodified
-    calls, writing to the same paths as before.
-
-    ``f_k_global`` should be the GLOBAL MBAR solve's ``f_k`` (``m['f_k']``)
-    when available. When multiple regimes exist, each regime's own logw is
-    recomputed from ``f_k_global`` and that regime's own per-state sample
-    counts (``_subset_logw_from_global_fk``) rather than naively slicing
-    ``base_logw`` to the regime's mask and renormalizing -- the naive slice
-    only corrects for the regime's overall size, not for different states
-    losing different *fractions* of their samples to the regime split. When
-    ``f_k_global`` is not supplied (e.g. older/direct callers), this falls
-    back to the previous naive mask-and-renormalize behavior.
-
-    Returns ``(secondary_cv_pmf_info, cv1_cv2_fes_info)`` for the *dominant*
-    regime (or the only regime, if there's just one) -- same shape/keys
-    downstream code already expects. When multiple regimes exist, each gets
-    its own analysis written under ``out/secondary_cv_regime_<type>/``, and
-    both dominant-regime info dicts additionally carry a ``regime_breakdown``
-    key with every regime's own info (including the dominant one).
-    """
-    regimes = _secondary_cv_epoch_regime_masks(d, warnings=warnings)
-    if regimes is None:
-        pmf_info = analyze_secondary_cv_pmf(d, args, base_logw, selected, boost_ok, kbt_kcal, out, warnings, progress)
-        fes_info = (analyze_cv1_cv2_2d_fes(d, args, base_logw, selected, boost_ok, kbt_kcal, out, warnings, progress)
-                    if isinstance(pmf_info, dict) and pmf_info.get('available')
-                    else {'available': False, 'reason': 'Secondary CV PMF unavailable'})
-        return pmf_info, fes_info
-
-    breakdown: dict = {}
-    dominant_pmf_info = dominant_fes_info = None
-    for regime, (mask, is_dominant) in regimes.items():
-        _orig_secondary_cv = d.meta.get('secondary_cv')
-        if isinstance(_orig_secondary_cv, dict):
-            _regime_secondary_cv = dict(_orig_secondary_cv)
-            _regime_secondary_cv['mode'] = regime
-        else:
-            _regime_secondary_cv = regime
-        regime_meta = dict(d.meta); regime_meta['secondary_cv'] = _regime_secondary_cv
-        d_regime = _masked_data(d, mask, meta_override=regime_meta)
-        if f_k_global is not None:
-            base_logw_regime = _subset_logw_from_global_fk(d_regime, f_k_global)
-        else:
-            base_logw_regime = np.asarray(base_logw, dtype=np.float64)[mask]
-        regime_out = out if is_dominant else out / f'secondary_cv_regime_{_regime_slug(regime)}'
-        regime_out.mkdir(parents=True, exist_ok=True)
-        pmf_info = analyze_secondary_cv_pmf(d_regime, args, base_logw_regime, selected, boost_ok, kbt_kcal, regime_out, warnings, progress)
-        fes_info = (analyze_cv1_cv2_2d_fes(d_regime, args, base_logw_regime, selected, boost_ok, kbt_kcal, regime_out, warnings, progress)
-                    if isinstance(pmf_info, dict) and pmf_info.get('available')
-                    else {'available': False, 'reason': 'Secondary CV PMF unavailable'})
-        # Store shallow copies in the breakdown, not the live dicts -- the
-        # dominant regime's own pmf_info/fes_info get a 'regime_breakdown' key
-        # added to them below, and aliasing the same object here would nest
-        # that dict inside itself (a real circular reference JSON serialization
-        # rejects; caught by an actual end-to-end run against chignolin_5).
-        breakdown[regime] = {
-            'is_dominant': is_dominant, 'n_samples': int(np.count_nonzero(mask)),
-            'secondary_cv_pmf': dict(pmf_info) if isinstance(pmf_info, dict) else pmf_info,
-            'cv1_cv2_2d_fes': dict(fes_info) if isinstance(fes_info, dict) else fes_info,
-        }
-        if is_dominant:
-            dominant_pmf_info, dominant_fes_info = pmf_info, fes_info
-
-    if isinstance(dominant_pmf_info, dict):
-        dominant_pmf_info['regime_breakdown'] = breakdown
-    if isinstance(dominant_fes_info, dict):
-        dominant_fes_info['regime_breakdown'] = breakdown
-    return dominant_pmf_info, dominant_fes_info
 
 
 def _poincare_primary_cv_supported(meta: dict) -> bool:
@@ -3169,74 +3094,6 @@ def _compute_chignolin_distances(d, args, progress, warnings: list):
         warnings.append("--chignolin_fes: no distances assigned; check topology and trajectories.")
         return None, None
     return dist1_out, dist2_out
-
-
-def analyze_secondary_cv_pmf(d: Data, args, base_logw: np.ndarray, selected: str, boost_ok: bool, kbt_kcal: float, out: Path, warnings: list[str], progress: Optional[Progress]) -> dict:
-    """1D PMF along the secondary collective variable (cv2_A from samples.csv)."""
-    cv2=np.asarray(d.cv2, dtype=np.float64)
-    mask=np.isfinite(cv2) & np.isfinite(base_logw)
-    if np.count_nonzero(mask) < max(20, d.u_nk.shape[1]):
-        return {'available': False, 'reason': 'Too few finite secondary CV (cv2_A) samples', 'n_finite': int(np.count_nonzero(mask))}
-    cv2_sel=cv2[mask]
-    boost_sel=d.boost_kj[mask]
-    base_logw_sel=np.asarray(base_logw, dtype=np.float64)[mask]
-    base_w=norm_logw(base_logw_sel)
-    bins_n=int(getattr(args,'cv2_bins',None) or args.bins)
-    bins=make_bins(cv2_sel, bins_n, getattr(args,'cv2_min',None), getattr(args,'cv2_max',None))
-    umbrella=pmf_from_weights(cv2_sel, base_w, bins, kbt_kcal)
-    if boost_ok and np.isfinite(boost_sel).sum()>10 and np.nanstd(boost_sel)>1e-12:
-        exp_w=norm_logw(base_logw_sel + d.beta*boost_sel)
-        exp_pmf=pmf_from_weights(cv2_sel, exp_w, bins, kbt_kcal)
-        (cum_pmf,cdiag),(cum3_pmf,cdiag3)=_cumulant_expansion_both(cv2_sel, base_w, boost_sel, bins, d.beta, kbt_kcal, smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
-        chosen=selected if selected in {'gamd_exponential','gamd_cumulant2','gamd_cumulant3'} else 'gamd_cumulant2'
-    else:
-        exp_pmf=umbrella; cum_pmf=umbrella; cum3_pmf=umbrella
-        cdiag={'boost_mean_kj':np.full(len(bins)-1,np.nan),'boost_var_kj2':np.full(len(bins)-1,np.nan)}
-        cdiag3=cdiag
-        chosen='umbrella_only'
-    pmfs={'umbrella_only':umbrella,'gamd_exponential':exp_pmf,'gamd_cumulant2':cum_pmf,'gamd_cumulant3':cum3_pmf}
-    chosen_pmf=pmfs.get(chosen, umbrella)
-    write_cv2_pmf(out/'cv2_pmf_unbiased.csv', chosen_pmf, chosen)
-    write_cv2_pmf(out/'cv2_pmf_umbrella_only.csv', umbrella, 'umbrella_only')
-    write_cv2_pmf(out/'cv2_pmf_gamd_exponential.csv', exp_pmf, 'gamd_exponential')
-    write_cv2_pmf(out/'cv2_pmf_gamd_cumulant2.csv', cum_pmf, 'gamd_cumulant2')
-    write_cv2_pmf(out/'cv2_pmf_gamd_cumulant3.csv', cum3_pmf, 'gamd_cumulant3')
-    plot_file=None
-    cv2_label=_secondary_cv_label(d.meta)
-    regions=_secondary_cv_regions(d.meta)
-    try:
-        import matplotlib.pyplot as plt
-        import gareus.mbar_analysis.plotstyle as ps
-        fig,ax=plt.subplots(figsize=(8,5))
-        _cv2_smooth=_eff_smooth(args,'pmf_smooth_sigma')
-        for i,(name,p) in enumerate(_visible_pmfs(pmfs, chosen, args).items()):
-            pmf_plot=_smooth_pmf_1d(p['pmf'],_cv2_smooth); m=np.isfinite(pmf_plot)
-            if np.any(m): ps.plot_method_curve(ax,p['cv_A'][m],pmf_plot[m],name,chosen,idx=i)
-        for reg in regions:
-            v=float(reg.get('value',float('nan'))); lbl=str(reg.get('label',''))
-            if np.isfinite(v):
-                ax.axvline(v, color='gray', linewidth=0.8, linestyle='--', alpha=0.6)
-                ax.text(v, ax.get_ylim()[1] if ax.get_ylim()[1] != ax.get_ylim()[0] else 0, lbl,
-                        rotation=90, va='top', ha='right', fontsize=7, color='gray')
-        ps.style_line_axes(ax,xlabel=cv2_label,ylabel='PMF (kcal/mol, shifted)',title=f'{cv2_label} PMF ({ps.pretty_method(chosen)})')
-        fig.tight_layout(); fig.savefig(out/'cv2_pmf_unbiased.png',dpi=200); plt.close(fig)
-        plot_file=str(out/'cv2_pmf_unbiased.png')
-    except Exception as e:
-        warnings.append(f'Secondary CV PMF plot failed: {e}')
-    finite=np.isfinite(chosen_pmf['pmf'])
-    span=float(np.nanmax(chosen_pmf['pmf'][finite])-np.nanmin(chosen_pmf['pmf'][finite])) if np.any(finite) else float('nan')
-    cv2_conv=run_observable_pmf_convergence(
-        d,args,d.cv2,bins,chosen,chosen_pmf,out,
-        metric_name='secondary_cv',metric_label=cv2_label,x_label=cv2_label,
-        out_dir_name='cv2_convergence',file_prefix='cv2',
-        legacy_total_names=False,basin_tracking=True,progress=progress,
-    )
-    info={'available':True,'selected_unbiased_method':chosen,'n_samples':int(np.count_nonzero(mask)),'bins':int(len(bins)-1),'pmf_span_kcal_mol':span,'convergence':cv2_conv,'files':{'cv2_pmf_unbiased_csv':str(out/'cv2_pmf_unbiased.csv'),'cv2_pmf_umbrella_only_csv':str(out/'cv2_pmf_umbrella_only.csv'),'cv2_pmf_gamd_exponential_csv':str(out/'cv2_pmf_gamd_exponential.csv'),'cv2_pmf_gamd_cumulant2_csv':str(out/'cv2_pmf_gamd_cumulant2.csv'),'cv2_pmf_gamd_cumulant3_csv':str(out/'cv2_pmf_gamd_cumulant3.csv')}}
-    if plot_file: info['files']['cv2_pmf_png']=plot_file
-    if isinstance(cv2_conv,dict) and cv2_conv.get('files'):
-        info['files'].update({k:v for k,v in cv2_conv['files'].items()})
-    wjson(out/'cv2_pmf_summary.json', info)
-    return info
 
 
 def analyze_cv1_cv2_2d_fes(d: Data, args, base_logw: np.ndarray, selected: str, boost_ok: bool, kbt_kcal: float, out: Path, warnings: list[str], progress: Optional[Progress]) -> dict:

@@ -231,7 +231,8 @@ def test_run_secondary_cv_analyses_uses_corrected_reweight_when_f_k_global_given
     captured_naive: list[np.ndarray] = []
     captured_corrected: list[np.ndarray] = []
 
-    real_analyze = A.analyze_secondary_cv_pmf
+    import gareus.mbar_analysis.pmf as pmfmod
+    real_analyze = pmfmod.analyze_secondary_cv_pmf
 
     def _spy(sink):
         def _inner(d_regime, args, logw_arg, *a, **kw):
@@ -241,20 +242,19 @@ def test_run_secondary_cv_analyses_uses_corrected_reweight_when_f_k_global_given
 
     args = _test_args()
 
-    import analyze_gareus_mbar
-    analyze_gareus_mbar.analyze_secondary_cv_pmf = _spy(captured_naive)
+    pmfmod.analyze_secondary_cv_pmf = _spy(captured_naive)
     try:
         run_secondary_cv_analyses(d, args, m_global["logw"], "umbrella_only", False, 0.6,
                                    tmp_path / "naive_out", [], None)
     finally:
-        analyze_gareus_mbar.analyze_secondary_cv_pmf = real_analyze
+        pmfmod.analyze_secondary_cv_pmf = real_analyze
 
-    analyze_gareus_mbar.analyze_secondary_cv_pmf = _spy(captured_corrected)
+    pmfmod.analyze_secondary_cv_pmf = _spy(captured_corrected)
     try:
         run_secondary_cv_analyses(d, args, m_global["logw"], "umbrella_only", False, 0.6,
                                    tmp_path / "corrected_out", [], None, f_k_global=m_global["f_k"])
     finally:
-        analyze_gareus_mbar.analyze_secondary_cv_pmf = real_analyze
+        pmfmod.analyze_secondary_cv_pmf = real_analyze
 
     assert len(captured_naive) == 2
     assert len(captured_corrected) == 2

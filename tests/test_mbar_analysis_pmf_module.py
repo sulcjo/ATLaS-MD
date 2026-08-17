@@ -164,3 +164,68 @@ def test_run_pmf_and_gamd_boost_report_end_to_end_still_works(tmp_path):
     assert (out_dir / 'pmf_unbiased.csv').exists()
     assert (out_dir / 'window_diagnostics.csv').exists()
     assert (out_dir / 'overlap_matrix.csv').exists()
+
+
+def test_task4_names_are_reexported_identically():
+    import gareus.mbar_analysis.pmf as pmfmod
+    import analyze_gareus_mbar as agm
+    assert agm.run_secondary_cv_analyses is pmfmod.run_secondary_cv_analyses
+    assert agm.analyze_secondary_cv_pmf is pmfmod.analyze_secondary_cv_pmf
+
+
+def test_analyze_secondary_cv_pmf_end_to_end_still_works(tmp_path):
+    """Real end-to-end call proving every bridged name in this function
+    (norm_logw, _eff_smooth, write_cv2_pmf, _secondary_cv_label,
+    _secondary_cv_regions, _visible_pmfs, _smooth_pmf_1d,
+    run_observable_pmf_convergence, wjson) resolves via _bridge()."""
+    import gareus.mbar_analysis.pmf as pmfmod
+    import analyze_gareus_mbar as agm
+    import numpy as np
+    from pathlib import Path as _Path
+
+    rng = np.random.default_rng(30)
+    n_windows, samples_per_window = 3, 300
+    centers = np.linspace(-1.0, 1.0, n_windows)
+    k_kcal = np.full(n_windows, 5.0)
+    beta = 1.0 / (agm.K_B_KJ_PER_MOL_K * 300.0)
+    cv_parts, cv2_parts, window_parts = [], [], []
+    for k in range(n_windows):
+        cv_parts.append(centers[k] + rng.normal(0.0, 0.3, size=samples_per_window))
+        cv2_parts.append(rng.normal(0.0, 1.0, size=samples_per_window))
+        window_parts.append(np.full(samples_per_window, k, dtype=np.int64))
+    cv = np.concatenate(cv_parts)
+    cv2 = np.concatenate(cv2_parts)
+    window = np.concatenate(window_parts)
+    n = cv.size
+    u_nk = np.zeros((n, n_windows), dtype=np.float64)
+    for k in range(n_windows):
+        u_nk[:, k] = beta * agm.KJ_PER_KCAL * 0.5 * k_kcal[k] * (cv - centers[k]) ** 2
+
+    out_dir = _Path(tmp_path) / 'out'
+    out_dir.mkdir(parents=True, exist_ok=True)
+    d = agm.Data(
+        prod_dir=_Path(tmp_path), out_dir=out_dir, cv=cv, cv2=cv2,
+        rg_A=np.full(n, np.nan), window=window, replica=window.copy(), step=np.arange(n),
+        u_nk=u_nk, centers=centers, k_kcal=k_kcal, beta=beta, temp=300.0,
+        boost_kj=np.full(n, np.nan), potential_kj=None, source='test', meta={},
+    )
+    m = agm.solve_mbar(d.u_nk, d.window)
+    logw = np.asarray(m['logw'], dtype=np.float64)
+    kbt_kcal = (1.0 / d.beta) / agm.KJ_PER_KCAL
+
+    class _Args:
+        bins = 20
+        cv2_bins = None
+        cv2_min = None
+        cv2_max = None
+        gamd_smooth_sigma = 0.0
+        pmf_smooth_sigma = 0.0
+        smooth_sigma = 0.0
+        plot_gamd_exponential = False
+        plot_gamd_cumulant3 = False
+        no_convergence = True
+
+    info = pmfmod.analyze_secondary_cv_pmf(d, _Args(), logw, 'umbrella_only', False, kbt_kcal, out_dir, [], None)
+    assert info['available'] is True
+    assert (out_dir / 'cv2_pmf_unbiased.csv').exists()
+    assert (out_dir / 'cv2_pmf_summary.json').exists()
