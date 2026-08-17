@@ -69,3 +69,30 @@ def test_task1_names_are_reexported_identically_by_analyze_gareus_mbar():
             f'analyze_gareus_mbar.{name} is not the SAME object as '
             f'gareus.mbar_analysis.pmf.{name} -- re-export import did not replace the local def'
         )
+
+
+_TASK2_NAMES = ['_window_cv_mean_std', 'boost_stats', '_window_moments']
+
+
+def test_task2_names_are_reexported_identically_by_analyze_gareus_mbar():
+    import gareus.mbar_analysis.pmf as pmfmod
+    import analyze_gareus_mbar as agm
+    for name in _TASK2_NAMES:
+        assert hasattr(pmfmod, name), f'{name} missing from gareus.mbar_analysis.pmf'
+        assert getattr(agm, name) is getattr(pmfmod, name)
+
+
+def test_boost_stats_still_resolves_norm_logw_and_ess_via_bridge():
+    """boost_stats calls norm_logw/ess internally (via _bridge()); a real,
+    non-degenerate boost array must still produce a finite ESS -- this is
+    the one behavioral check that _bridge() is actually wired into this
+    function's body, not just present in the module."""
+    import gareus.mbar_analysis.pmf as pmfmod
+    import numpy as np
+    rng = np.random.default_rng(0)
+    boost = rng.normal(50.0, 8.0, size=2000)
+    beta = 1.0 / (0.00831446261815324 * 300.0)
+    out = pmfmod.boost_stats(boost, beta)
+    assert out['available'] is True
+    assert np.isfinite(out['boost_reweight_ess'])
+    assert 0.0 < out['boost_reweight_ess_fraction'] <= 1.0

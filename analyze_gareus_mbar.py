@@ -20,6 +20,7 @@ from gareus.mbar_analysis.pmf import (
     _cumulant_shared_stats_2d, _cumulant_from_shared_2d, _cumulant_expansion_2d, _cumulant_expansion_2d_both,
     _bootstrap_pmf_uncertainty_1d, _bootstrap_pmf_uncertainty_2d,
     cumulant2_2d, cumulant3_2d,
+    _window_cv_mean_std, boost_stats, _window_moments,
 )
 from gareus.mbar_analysis.bias import (
     _compute_u_nk_analytical,
@@ -575,50 +576,6 @@ from gareus.mbar_analysis.plotting import (
     _per_window_gamd_boost_stats, plot_gamd_boost, plot_outputs,
     plot_rg_outputs, _OPT_IN_GAMD_METHODS, _want_gamd_method, _visible_pmfs,
 )
-
-
-def _window_cv_mean_std(window: np.ndarray, cv: np.ndarray, K: int) -> tuple:
-    """Vectorized per-window sample count / mean / std of a CV array.
-
-    Same bincount-over-linear-index idiom as overlap_matrix above, extracted
-    so window_diagnostics.csv's writer (run_pmf_and_gamd_boost_report) avoids
-    an O(N*K) Python loop that rebuilt a fresh boolean mask (``cv[window ==
-    k]``) once per window.
-
-    Two-pass form (mean first, then mean of squared deviations from that
-    mean) mirrors np.std's own algorithm, unlike a raw-moment
-    ``sum(x**2)/n - mean**2`` formulation, which can lose several digits to
-    cancellation for CV values with a large mean and small within-window
-    spread -- this keeps results numerically equivalent to (though not
-    always bit-identical with) the original per-window np.mean/np.std.
-
-    Returns ``(n_k, mean_per_window, std_per_window)``, each length K:
-    - ``n_k``: per-window sample count (same as
-      ``np.bincount(window, minlength=K)`` restricted to valid window
-      indices in [0, K), matching the original loop's implicit assumption
-      that every ``k`` iterated over ``range(K)`` is itself a valid index).
-    - ``mean_per_window``/``std_per_window``: NaN for any window with zero
-      samples (callers should treat that the same as the original's empty
-      ``cv[window == k]`` slice, i.e. write '' rather than the NaN literal);
-      a window containing any non-finite (e.g. NaN) cv sample also gets a
-      NaN mean/std for that whole window, matching np.mean/np.std's own
-      NaN-propagation behavior on such a slice.
-    """
-    window=np.asarray(window,dtype=np.int64)
-    cv=np.asarray(cv,dtype=np.float64)
-    valid=(window>=0)&(window<K)
-    w_valid=window[valid]
-    cv_valid=cv[valid]
-    n_k=np.bincount(w_valid,minlength=K)
-    has_samples=n_k>0
-    mean=np.full(K,np.nan)
-    sum_per_window=np.bincount(w_valid,weights=cv_valid,minlength=K)
-    mean[has_samples]=sum_per_window[has_samples]/n_k[has_samples]
-    dev_sq=(cv_valid-mean[w_valid])**2
-    sumsq_dev=np.bincount(w_valid,weights=dev_sq,minlength=K)
-    std=np.full(K,np.nan)
-    std[has_samples]=np.sqrt(sumsq_dev[has_samples]/n_k[has_samples])
-    return n_k,mean,std
 
 
 def pmf_probability(pmf: dict) -> np.ndarray:
@@ -2995,32 +2952,6 @@ def analyze_extra_observable_pmfs(d: Data, args, base_logw: np.ndarray, selected
     wjson(out_extra/'extra_observable_pmfs_summary.json',summary)
     files['extra_observable_pmfs_summary_json']=str(out_extra/'extra_observable_pmfs_summary.json')
     return summary
-
-
-def boost_stats(boost,beta):
-    b=boost[np.isfinite(boost)]
-    if b.size==0: return {'available':False}
-    kc=b/KJ_PER_KCAL; out={'available':True,'n':int(b.size),'mean_kcal_mol':float(np.mean(kc)),'std_kcal_mol':float(np.std(kc)),'min_kcal_mol':float(np.min(kc)),'max_kcal_mol':float(np.max(kc))}
-    if b.size>=3 and np.std(b)>0:
-        z=(b-np.mean(b))/np.std(b); out['skew']=float(np.mean(z**3)); out['excess_kurtosis']=float(np.mean(z**4)-3.0); out['anharmonicity_score']=float(math.sqrt(out['skew']**2+0.25*out['excess_kurtosis']**2))
-    else: out.update({'skew':None,'excess_kurtosis':None,'anharmonicity_score':None})
-    w=norm_logw(beta*b); out['boost_reweight_ess']=float(ess(w)); out['boost_reweight_ess_fraction']=float(out['boost_reweight_ess']/b.size)
-    return out
-
-def _window_moments(a):
-    """Skewness/excess-kurtosis/anharmonicity of one window's finite boost samples."""
-    a = a[np.isfinite(a)]
-    if a.size < 4:
-        return np.nan, np.nan, np.nan
-    mu, sigma = np.mean(a), np.std(a)
-    if sigma < 1e-12:
-        return 0.0, 0.0, 0.0
-    z = (a - mu) / sigma
-    skew = float(np.mean(z**3))
-    kurt = float(np.mean(z**4) - 3.0)
-    anharmonicity = float(np.sqrt(skew**2 + 0.25 * kurt**2))
-    return skew, kurt, anharmonicity
-
 
 
 from gareus.mbar_analysis.summary import (
