@@ -518,6 +518,7 @@ def test_run_pmf_and_gamd_boost_report_uses_combined_path_exactly_once(tmp_path,
     removes.
     """
     import analyze_gareus_mbar as agm
+    import gareus.mbar_analysis.pmf as pmfmod
 
     rng = _rng()
     n = 500
@@ -528,7 +529,7 @@ def test_run_pmf_and_gamd_boost_report_uses_combined_path_exactly_once(tmp_path,
     bins = np.linspace(cv.min() - 0.2, cv.max() + 0.2, 11)
 
     calls = {"both": 0, "single": 0}
-    real_both = agm._cumulant_expansion_both
+    real_both = pmfmod._cumulant_expansion_both
 
     def _counting_both(*args, **kwargs):
         calls["both"] += 1
@@ -538,9 +539,9 @@ def test_run_pmf_and_gamd_boost_report_uses_combined_path_exactly_once(tmp_path,
         calls["single"] += 1
         raise AssertionError("standalone cumulant2/cumulant3 must not be called from this site")
 
-    monkeypatch.setattr(agm, "_cumulant_expansion_both", _counting_both)
-    monkeypatch.setattr(agm, "cumulant2", _fail_if_called)
-    monkeypatch.setattr(agm, "cumulant3", _fail_if_called)
+    monkeypatch.setattr(pmfmod, "_cumulant_expansion_both", _counting_both)
+    monkeypatch.setattr(pmfmod, "cumulant2", _fail_if_called)
+    monkeypatch.setattr(pmfmod, "cumulant3", _fail_if_called)
 
     agm.run_pmf_and_gamd_boost_report(d, _test_args(), logw, bins, KBT_KCAL, tmp_path, [], None)
 

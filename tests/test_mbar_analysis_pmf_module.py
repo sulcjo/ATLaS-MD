@@ -96,3 +96,71 @@ def test_boost_stats_still_resolves_norm_logw_and_ess_via_bridge():
     assert out['available'] is True
     assert np.isfinite(out['boost_reweight_ess'])
     assert 0.0 < out['boost_reweight_ess_fraction'] <= 1.0
+
+
+def test_run_pmf_and_gamd_boost_report_is_reexported_identically():
+    import gareus.mbar_analysis.pmf as pmfmod
+    import analyze_gareus_mbar as agm
+    assert agm.run_pmf_and_gamd_boost_report is pmfmod.run_pmf_and_gamd_boost_report
+
+
+def test_run_pmf_and_gamd_boost_report_end_to_end_still_works(tmp_path):
+    """Real end-to-end call through the relocated function, proving every
+    bridged name (norm_logw, _eff_smooth, overlap_matrix, _sample_block_ids,
+    write_pmf, write_all, plot_outputs) resolves correctly via _bridge()."""
+    import gareus.mbar_analysis.pmf as pmfmod
+    import analyze_gareus_mbar as agm
+    import numpy as np
+    from pathlib import Path as _Path
+
+    rng = np.random.default_rng(20)
+    n_windows, samples_per_window = 3, 300
+    centers = np.linspace(-1.0, 1.0, n_windows)
+    k_kcal = np.full(n_windows, 5.0)
+    beta = 1.0 / (agm.K_B_KJ_PER_MOL_K * 300.0)
+
+    cv_parts, window_parts, replica_parts, epoch_src_parts = [], [], [], []
+    for k in range(n_windows):
+        cv_parts.append(centers[k] + rng.normal(0.0, 0.3, size=samples_per_window))
+        window_parts.append(np.full(samples_per_window, k, dtype=np.int64))
+        replica_parts.append(np.zeros(samples_per_window, dtype=np.int64) + k)
+        epoch_src_parts.append(np.zeros(samples_per_window, dtype=np.int64))
+    cv = np.concatenate(cv_parts)
+    window = np.concatenate(window_parts)
+    replica = np.concatenate(replica_parts)
+    epoch_src = np.concatenate(epoch_src_parts)
+    n = cv.size
+    u_nk = np.zeros((n, n_windows), dtype=np.float64)
+    for k in range(n_windows):
+        u_nk[:, k] = beta * agm.KJ_PER_KCAL * 0.5 * k_kcal[k] * (cv - centers[k]) ** 2
+
+    out_dir = _Path(tmp_path) / 'out'
+    out_dir.mkdir(parents=True, exist_ok=True)
+    d = agm.Data(
+        prod_dir=_Path(tmp_path), out_dir=out_dir, cv=cv, cv2=np.full(n, np.nan),
+        rg_A=np.full(n, np.nan), window=window, replica=replica, step=np.arange(n),
+        u_nk=u_nk, centers=centers, k_kcal=k_kcal, beta=beta, temp=300.0,
+        boost_kj=np.full(n, np.nan), potential_kj=None, source='test',
+        meta={'_epoch_source': epoch_src.tolist()},
+    )
+    m = agm.solve_mbar(d.u_nk, d.window)
+    logw = np.asarray(m['logw'], dtype=np.float64)
+    bins = agm.make_bins(d.cv, 20, None, None)
+    kbt_kcal = (1.0 / d.beta) / agm.KJ_PER_KCAL
+
+    class _Args:
+        bins = 20
+        min_neighbor_overlap = 0.0
+        selected_method = 'auto'
+        gamd_smooth_sigma = 0.0
+        pmf_smooth_sigma = 0.0
+        smooth_sigma = 0.0
+        pmf_uncertainty = False
+        pmf_uncertainty_n_boot = 30
+        pmf_uncertainty_seed = 0
+
+    info = pmfmod.run_pmf_and_gamd_boost_report(d, _Args(), logw, bins, kbt_kcal, out_dir, [], None)
+    assert info['selected'] == 'umbrella_only'  # no finite boost in this fixture
+    assert (out_dir / 'pmf_unbiased.csv').exists()
+    assert (out_dir / 'window_diagnostics.csv').exists()
+    assert (out_dir / 'overlap_matrix.csv').exists()

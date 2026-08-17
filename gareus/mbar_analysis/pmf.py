@@ -15,11 +15,15 @@ header by those tasks; see _bridge()'s own docstring for why a plain
 """
 from __future__ import annotations
 
+import csv
 import math
 import sys
+from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
+
+from gareus.mbar_analysis.data import Data
 
 
 def _bridge() -> Any:
@@ -599,3 +603,153 @@ def _window_moments(a):
     kurt = float(np.mean(z**4) - 3.0)
     anharmonicity = float(np.sqrt(skew**2 + 0.25 * kurt**2))
     return skew, kurt, anharmonicity
+
+def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.ndarray,
+                                   kbt_kcal: float, out: Path, warnings: list,
+                                   progress: Optional['Progress'], warning_prefix: str = '',
+                                   extra_pmfs: Optional[dict] = None,
+                                   precomputed_base_w: Optional[np.ndarray] = None) -> dict:
+    """Core PMF (4 methods) + GaMD boost diagnostics for one Data.
+
+    Extracted from analyze() so the identical formula can run twice against
+    different sample subsets sharing the same global MBAR solve (see the
+    epoch_000/rest split in analyze()) instead of only ever pooling every
+    epoch into one report. ``logw`` is the per-sample MBAR log-weight for
+    THIS subset -- renormalized internally, same pattern as
+    ``analyze_secondary_cv_pmf``. When ``d`` is a subset of the full
+    population (e.g. the epoch_000/rest split), callers must pass
+    ``_subset_logw_from_global_fk(d, f_k_global)`` here rather than a naive
+    ``m['logw'][mask]`` slice of the global logw -- the naive slice only
+    renormalizes for the subset's overall size, not for different states
+    losing different fractions of their samples to the split, which
+    produces a real direction-consistent tilt in the resulting PMF. When
+    ``d`` is the full population, plain ``m['logw']`` is already correct.
+
+    ``precomputed_base_w``: optional escape hatch for the common no-split
+    case, where analyze() has already computed ``norm_logw(m['logw'])`` for
+    the exact same full-population ``logw`` passed in here -- recomputing it
+    is a deterministic no-op that still costs a real logsumexp/exp pass over
+    every sample. Callers must only pass this when ``logw`` is that SAME
+    full-population array (unmodified); for any genuinely different
+    population (e.g. an epoch_000/rest subset with its own renormalized
+    logw), pass ``None`` so it's computed fresh here instead of silently
+    reusing a value for the wrong population. Copied defensively on the way
+    in: analyze() keeps using its own ``base_w`` after this call returns
+    (Rg analysis, ``base_ess`` in pmf_summary.json), so nothing this
+    function or its callees (pmf_from_weights/cumulant2/cumulant3, all
+    read-only on this array today) do to the local name here can ever reach
+    back and corrupt that array -- a guarantee worth the one extra O(N)
+    copy, still far cheaper than the norm_logw() this parameter exists to
+    skip (isfinite mask + logsumexp + exp over every sample).
+    """
+    _agm = _bridge()
+    K = d.u_nk.shape[1]
+    N = len(d.cv)
+    if precomputed_base_w is not None:
+        base_w = np.array(precomputed_base_w, dtype=np.float64, copy=True)
+    else:
+        base_w = _agm.norm_logw(np.asarray(logw, dtype=np.float64))
+    umbrella = pmf_from_weights(d.cv, base_w, bins, kbt_kcal)
+    bs = boost_stats(d.boost_kj, d.beta)
+    boost_ok = bool(bs.get('available')) and np.nanstd(d.boost_kj) > 1e-12
+    if boost_ok:
+        exp_w = _agm.norm_logw(logw + d.beta * d.boost_kj)
+        exp_pmf = pmf_from_weights(d.cv, exp_w, bins, kbt_kcal)
+        (cum_pmf, cdiag), (cum3_pmf, cdiag3) = _cumulant_expansion_both(d.cv, base_w, d.boost_kj, bins, d.beta, kbt_kcal, smooth_logfac_sigma=_agm._eff_smooth(args, 'gamd_smooth_sigma'))
+        selected = 'gamd_cumulant2'
+        # A bin can have real samples (counts>0) but zero with a finite GaMD
+        # boost -- e.g. a whole segment/epoch missing gamd_boost_total_kj_mol
+        # dominating that CV bin. _cumulant_expansion flags this NaN rather
+        # than silently reproducing the unbiased value; surface it here since
+        # this is the main choke point with a `warnings` list in scope.
+        nan_bins2 = np.isnan(cdiag['log_reweight_factor']) & (np.asarray(cum_pmf['counts']) > 0)
+        if np.any(nan_bins2):
+            warnings.append(f"{warning_prefix}GaMD cumulant2 correction is undefined (NaN) for {int(np.sum(nan_bins2))} CV bin(s) with samples but no finite boost values; those pmf_gamd_cumulant2 bins are NaN.")
+        nan_bins3 = np.isnan(cdiag3['log_reweight_factor']) & (np.asarray(cum3_pmf['counts']) > 0)
+        if np.any(nan_bins3):
+            warnings.append(f"{warning_prefix}GaMD cumulant3 correction is undefined (NaN) for {int(np.sum(nan_bins3))} CV bin(s) with samples but no finite boost values; those pmf_gamd_cumulant3 bins are NaN.")
+        e = _agm.ess(exp_w)
+        if e / max(1, N) < 0.05:
+            warnings.append(f'{warning_prefix}GaMD exponential reweighting ESS is very low: {e:.1f}/{N}')
+        if bs.get('std_kcal_mol', 0) > 6.0:
+            warnings.append(f"{warning_prefix}GaMD boost std is large ({bs['std_kcal_mol']:.2f} kcal/mol); cumulant reweighting may be unreliable")
+        if bs.get('anharmonicity_score') is not None and bs['anharmonicity_score'] > 1.0:
+            warnings.append(f"{warning_prefix}GaMD boost anharmonicity score is high ({bs['anharmonicity_score']:.2f})")
+    else:
+        exp_pmf = umbrella; cum_pmf = umbrella; cum3_pmf = umbrella; selected = 'umbrella_only'
+        cdiag = {'boost_mean_kj': np.full(args.bins, np.nan), 'boost_var_kj2': np.full(args.bins, np.nan)}; cdiag3 = cdiag
+        warnings.append(f'{warning_prefix}No finite variable GaMD boosts found; selected PMF is umbrella-only unbiased.')
+    pmfs = {'umbrella_only': umbrella, 'gamd_exponential': exp_pmf, 'gamd_cumulant2': cum_pmf, 'gamd_cumulant3': cum3_pmf}
+    if extra_pmfs:
+        pmfs.update(extra_pmfs)
+    _force_method = str(getattr(args, 'selected_method', 'auto') or 'auto')
+    if _force_method != 'auto' and _force_method in pmfs:
+        if _force_method in ('gamd_exponential', 'gamd_cumulant2', 'gamd_cumulant3') and not boost_ok:
+            warnings.append(f'{warning_prefix}--selected-method {_force_method} requested but no usable GaMD boost; it equals umbrella-only here.')
+        selected = _force_method
+    O = _agm.overlap_matrix(d.cv, d.window, bins, K)
+    neigh = [float(O[i, i + 1]) for i in range(K - 1)]
+    bad = [i for i, x in enumerate(neigh) if x < args.min_neighbor_overlap]
+    if bad:
+        warnings.append(f'{warning_prefix}Weak neighbor CV overlap below %.2f for pairs: ' % args.min_neighbor_overlap + ', '.join(f'{i}-{i + 1} ({neigh[i]:.2f})' for i in bad))
+    sel = pmfs[selected]
+    finite = sel['pmf'][np.isfinite(sel['pmf'])]
+    span = float(np.max(finite) - np.min(finite)) if finite.size else float('nan')
+    minidx = int(np.nanargmin(sel['pmf'])) if finite.size else -1
+    _sel_diag = {'gamd_cumulant2': cdiag, 'gamd_cumulant3': cdiag3}.get(selected, cdiag)
+    pmf_uncertainty_std = None
+    _uncertainty_extra = {}
+    if getattr(args, 'pmf_uncertainty', False) and minidx >= 0:
+        # minidx<0 means sel['pmf'] has no finite bin at all (see the
+        # finite/minidx guard two lines above) -- _bootstrap_pmf_uncertainty_1d's
+        # own np.nanargmin on an all-NaN main_pmf['pmf'] would raise, so skip
+        # the uncertainty computation the same way pmf_minimum_cv_A is
+        # already silently skipped for this degenerate case.
+        block_ids = _agm._sample_block_ids(d)
+        boot_rng = np.random.default_rng(int(getattr(args, 'pmf_uncertainty_seed', 0)))
+        n_boot = int(getattr(args, 'pmf_uncertainty_n_boot', 100))
+        # `selected` can be force-overridden to a gamd_* name via
+        # --selected-method even when boost_ok is False (sel is then really
+        # umbrella-only, an all-NaN boost array under the hood) -- dispatch
+        # the bootstrap on what `sel` actually IS, not on the possibly-forced
+        # label, so it doesn't try to rebuild gamd-style replicates from an
+        # all-NaN boost.
+        _boot_method = selected if boost_ok else 'umbrella_only'
+        boot_result = _bootstrap_pmf_uncertainty_1d(
+            d.cv, logw, d.boost_kj, bins, d.beta, kbt_kcal, d.window, block_ids,
+            _boot_method, sel, n_boot, boot_rng,
+            smooth_logfac_sigma=_agm._eff_smooth(args, 'gamd_smooth_sigma'),
+        )
+        pmf_uncertainty_std = boot_result['pmf_std']
+        _uncertainty_extra = {'pmf_std_kcal_mol': pmf_uncertainty_std}
+        if boot_result['low_block_windows']:
+            warnings.append(f"{warning_prefix}PMF uncertainty is unreliable near windows {boot_result['low_block_windows']} (fewer than 3 independent trajectory blocks).")
+    _agm.write_pmf(out / 'pmf_unbiased.csv', sel, selected, {'boost_mean_kj_mol': _sel_diag.get('boost_mean_kj', np.full(args.bins, np.nan)), 'boost_var_kj2_mol2': _sel_diag.get('boost_var_kj2', np.full(args.bins, np.nan)), **_uncertainty_extra})
+    _agm.write_pmf(out / 'pmf_umbrella_only.csv', umbrella, 'umbrella_only')
+    _agm.write_pmf(out / 'pmf_gamd_exponential.csv', exp_pmf, 'gamd_exponential')
+    _agm.write_pmf(out / 'pmf_gamd_cumulant2.csv', cum_pmf, 'gamd_cumulant2', {'boost_mean_kj_mol': cdiag.get('boost_mean_kj', np.full(args.bins, np.nan)), 'boost_var_kj2_mol2': cdiag.get('boost_var_kj2', np.full(args.bins, np.nan))})
+    _agm.write_pmf(out / 'pmf_gamd_cumulant3.csv', cum3_pmf, 'gamd_cumulant3', {'boost_mean_kj_mol': cdiag3.get('boost_mean_kj', np.full(args.bins, np.nan)), 'boost_var_kj2_mol2': cdiag3.get('boost_var_kj2', np.full(args.bins, np.nan))})
+    _agm.write_all(out / 'pmf_all_methods.csv', pmfs)
+    with (out / 'overlap_matrix.csv').open('w', newline='') as f:
+        wr = csv.writer(f); wr.writerow(['window'] + list(range(K))); [wr.writerow([i] + [float(x) for x in O[i]]) for i in range(K)]
+    n_k_local, _mean_per_window, _std_per_window = _window_cv_mean_std(d.window, d.cv, K)
+    _has_samples = n_k_local > 0
+    with (out / 'window_diagnostics.csv').open('w', newline='') as f:
+        wr = csv.DictWriter(f, fieldnames=['window', 'center_A', 'k_kcal_mol_A2', 'samples', 'cv_mean_A', 'cv_std_A', 'overlap_left', 'overlap_right']); wr.writeheader()
+        for k in range(K):
+            wr.writerow({'window': k, 'center_A': float(d.centers[k]) if k < d.centers.size and np.isfinite(d.centers[k]) else '', 'k_kcal_mol_A2': float(d.k_kcal[k]) if k < d.k_kcal.size and np.isfinite(d.k_kcal[k]) else '', 'samples': int(n_k_local[k]), 'cv_mean_A': float(_mean_per_window[k]) if _has_samples[k] else '', 'cv_std_A': float(_std_per_window[k]) if _has_samples[k] else '', 'overlap_left': float(O[k - 1, k]) if k > 0 else '', 'overlap_right': float(O[k, k + 1]) if k + 1 < K else ''})
+    if progress is not None:
+        progress.bar('analysis stages', 5, 6, 'plotting PNG outputs', force=True)
+    _agm.plot_outputs(d, pmfs, selected, O, out, warnings, smooth_sigma=_agm._eff_smooth(args, 'pmf_smooth_sigma'), args=args)
+    return {
+        'pmfs': pmfs, 'selected': selected, 'boost_ok': boost_ok, 'boost': bs,
+        'pmf_span_kcal_mol': span, 'pmf_minimum_cv_A': float(sel['cv_A'][minidx]) if minidx >= 0 else None,
+        'neighbor_overlap': neigh, 'n_samples': N, 'O': O,
+        'pmf_uncertainty_std': pmf_uncertainty_std,
+        'files': {
+            'pmf_unbiased_csv': str(out / 'pmf_unbiased.csv'), 'pmf_all_methods_csv': str(out / 'pmf_all_methods.csv'),
+            'pmf_umbrella_only_csv': str(out / 'pmf_umbrella_only.csv'), 'pmf_gamd_exponential_csv': str(out / 'pmf_gamd_exponential.csv'),
+            'pmf_gamd_cumulant2_csv': str(out / 'pmf_gamd_cumulant2.csv'), 'pmf_gamd_cumulant3_csv': str(out / 'pmf_gamd_cumulant3.csv'),
+            'overlap_matrix_csv': str(out / 'overlap_matrix.csv'), 'window_diagnostics_csv': str(out / 'window_diagnostics.csv'),
+        },
+    }
