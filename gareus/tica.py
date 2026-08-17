@@ -989,7 +989,7 @@ class DihedralObsBuffer:
 
 def load_epoch_dihedral_obs(
     epoch_dir,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Load and concatenate all replica dihedral observations from an epoch.
 
     Each ``dihedral_obs_*.npz`` file is one contiguous replica MD
@@ -1019,6 +1019,20 @@ def load_epoch_dihedral_obs(
         Frame count of each source npz file, in concatenation order. Pass
         this straight through as ``segments=`` to :func:`compute_tica` so
         lagged pairs are never built across a replica-trajectory boundary.
+    steps : np.ndarray, shape (n_samples,)
+        Integration step number of each frame within its own replica's
+        continuous MD history (-1 if not recorded — old obs files). Does
+        NOT by itself identify a trajectory-file frame index: the on-disk
+        XTC reporter interval (``--traj-interval``) is configured
+        independently of the interval these dihedral observations were
+        recorded at, per-segment trajectory recording can be disabled
+        entirely (e.g. adaptive-feedback pilots skip it by default), and
+        segment step-numbering resets/continuations across --resume are
+        not accounted for here. Consumers that want an actual structure
+        for a given (window_id, step) still need to resolve which segment
+        directory's replica_trajectories/replica_<window_id>.xtc (if any)
+        covers this step range and confirm the interval divides evenly
+        before indexing into it.
 
     Raises
     ------
@@ -1035,6 +1049,7 @@ def load_epoch_dihedral_obs(
     window_chunks: List[np.ndarray] = []
     primary_cv_chunks: List[np.ndarray] = []
     secondary_cv_chunks: List[np.ndarray] = []
+    step_chunks: List[np.ndarray] = []
     segment_lengths: List[int] = []
     for npz_path in npz_files:
         data = np.load(npz_path)
@@ -1048,12 +1063,16 @@ def load_epoch_dihedral_obs(
         secondary_cv_chunks.append(
             data["secondary_cv"] if "secondary_cv" in data else np.full(n, np.nan)
         )
+        step_chunks.append(
+            data["steps"] if "steps" in data else np.full(n, -1, dtype=np.int64)
+        )
         segment_lengths.append(int(n))
     X = np.concatenate(feature_chunks, axis=0)
     window_ids = np.concatenate(window_chunks, axis=0)
     primary_cv = np.concatenate(primary_cv_chunks, axis=0)
     secondary_cv = np.concatenate(secondary_cv_chunks, axis=0)
-    return X, window_ids, primary_cv, secondary_cv, np.asarray(segment_lengths, dtype=np.int64)
+    steps = np.concatenate(step_chunks, axis=0)
+    return X, window_ids, primary_cv, secondary_cv, np.asarray(segment_lengths, dtype=np.int64), steps
 
 
 def compute_tica_from_epoch_obs(
@@ -1085,7 +1104,7 @@ def compute_tica_from_epoch_obs(
     -------
     TICAResult
     """
-    X, _, _, _, segment_lengths = load_epoch_dihedral_obs(epoch_dir)
+    X, _, _, _, segment_lengths, _ = load_epoch_dihedral_obs(epoch_dir)
     return compute_tica(
         X,
         lag_frames,
@@ -1131,7 +1150,7 @@ def compute_combined_tica_from_epoch_obs(
     -------
     TICAResult
     """
-    X, _, _, _, segment_lengths = load_epoch_dihedral_obs(epoch_dir)
+    X, _, _, _, segment_lengths, _ = load_epoch_dihedral_obs(epoch_dir)
     return compute_tica_combined(
         X,
         lag_frames,

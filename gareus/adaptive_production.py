@@ -1775,6 +1775,9 @@ def _propose_tica_coverage_actions(
     *,
     temperature_K: float = 298.0,
     population_fraction: float = 0.01,
+    window_ids: Optional[np.ndarray] = None,
+    steps: Optional[np.ndarray] = None,
+    epoch_dir: Optional[Path] = None,
 ) -> List[Tuple]:
     """Add home states for substantially populated uncovered tIC1 regions.
 
@@ -1782,10 +1785,31 @@ def _propose_tica_coverage_actions(
     tIC1 values, rather than stale scalar CV2 values from the preceding epoch.
     Normal weak-edge additions are intentionally not used as a cap here: the
     existing runtime replica limit remains responsible for launch capacity.
+
+    ``window_ids``/``steps`` (both from :func:`gareus.tica.load_epoch_dihedral_obs`,
+    same length/order as ``primary_cv``/``tic1``) are optional. When given, each
+    new state's action metadata records a ``seed_frame`` pointing at one frame
+    that actually populated the newly covered region - real, already-visited
+    coordinates, unlike the parent's own GENPEPT-library seed which may sit
+    nowhere near the new target (confirmed on chignolin_6: parent state 18's
+    seed was 1.5 tIC1 units from a child state added for a region 82 real
+    frames had already visited).
+
+    NOT YET CONSUMED: nothing currently reads ``seed_frame`` back out to build
+    an actual seed structure. Resolving (window_id, step) to real coordinates
+    means locating whichever segment directory's own
+    ``replica_trajectories/replica_<window_id>.xtc`` (if any - trajectory
+    recording can be off entirely, e.g. adaptive-feedback pilots skip it by
+    default) covers this step range, confirming its ``--traj-interval``
+    divides evenly into the recorded step spacing, and only then indexing into
+    it - see the caveats on ``load_epoch_dihedral_obs``. That mapping needs
+    validating against a real run before anything trusts it for seeding.
     """
     policy = policy or AdaptiveDecisionPolicy()
     primary = np.asarray(primary_cv, dtype=float)
     secondary = np.asarray(tic1, dtype=float)
+    window_ids_arr = np.asarray(window_ids) if window_ids is not None else None
+    steps_arr = np.asarray(steps) if steps is not None else None
     active = [s for s in registry.active_states()
               if s.secondary_center is not None and (s.secondary_k or 0.0) > 0.0]
     finite = np.isfinite(primary) & np.isfinite(secondary)
@@ -1804,6 +1828,16 @@ def _propose_tica_coverage_actions(
 
     uncovered_values = values[uncovered]
     uncovered_primary = primary[finite][uncovered]
+    uncovered_window_ids = (
+        window_ids_arr[finite][uncovered]
+        if window_ids_arr is not None and len(window_ids_arr) == len(finite)
+        else None
+    )
+    uncovered_steps = (
+        steps_arr[finite][uncovered]
+        if steps_arr is not None and len(steps_arr) == len(finite)
+        else None
+    )
     width = max(float(np.median(radii)), np.finfo(float).eps)
     origin = float(np.min(uncovered_values))
     bin_ids = np.floor((uncovered_values - origin) / width).astype(int)
@@ -1873,6 +1907,26 @@ def _propose_tica_coverage_actions(
                 "tic1_max": hi,
                 "coverage_radius": float(radii[int(np.argmin(np.abs(centers - target_secondary)))]),
             }
+            if uncovered_window_ids is not None and uncovered_steps is not None:
+                # Frame in this group closest to the group's own median target -
+                # a representative already-visited structure, not the closest
+                # thing in a static seed library that may be nowhere near here.
+                group_indices = np.flatnonzero(mask)
+                best_local = group_indices[
+                    int(np.argmin(np.abs(uncovered_values[group_indices] - target_secondary)))
+                ]
+                metadata["seed_frame"] = {
+                    "window_id": int(uncovered_window_ids[best_local]),
+                    "step": int(uncovered_steps[best_local]),
+                    "epoch_dir": str(epoch_dir) if epoch_dir is not None else None,
+                    "primary_cv": float(uncovered_primary[best_local]),
+                    "secondary_cv": float(uncovered_values[best_local]),
+                    "note": (
+                        "NOT YET RESOLVED TO A STRUCTURE - see _propose_tica_coverage_actions "
+                        "docstring. step is this replica's own integration step count, not a "
+                        "trajectory-file frame index."
+                    ),
+                }
             actions.append(("tica_coverage_add", int(parent.state_id), params, reason, metadata))
     return actions
 
@@ -2084,7 +2138,7 @@ def _maybe_update_tica_cvaux(epoch: int, epoch_dir: Path, adaptive_dir: Path, ar
     mbar_reweighted = False
     if registry is not None:
         try:
-            _, _wids_tmp, _pcv_tmp, _scv_tmp, _ = load_epoch_dihedral_obs(epoch_dir)
+            _, _wids_tmp, _pcv_tmp, _scv_tmp, _, _ = load_epoch_dihedral_obs(epoch_dir)
             if np.isfinite(_pcv_tmp).any():
                 temp_K = float(getattr(args, "temperature", 298.0) or 298.0)
                 mbar_weights = _compute_mbar_weights_for_tica(
@@ -2126,7 +2180,7 @@ def _maybe_update_tica_cvaux(epoch: int, epoch_dir: Path, adaptive_dir: Path, ar
     # Compute per-window tIC1 medians for registry secondary_center update.
     per_window_centers: Dict[int, float] = {}
     try:
-        X_all, window_ids, _, _, _ = load_epoch_dihedral_obs(epoch_dir)
+        X_all, window_ids, _, _, _, _ = load_epoch_dihedral_obs(epoch_dir)
         per_window_centers = window_tica_centers(X_all, window_ids, result)
     except Exception as _wc_exc:
         print(f"    tICA: per-window center computation failed ({_wc_exc}); registry centers will not be updated")
@@ -4966,11 +5020,15 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                     if n_updated > 0:
                         try:
                             from .tica import TICAResult, load_epoch_dihedral_obs, project_tica1
-                            _X, _wids, _primary, _secondary, _steps = load_epoch_dihedral_obs(epoch_dir)
+                            # NOTE: the 5th return value is per-*file* segment_lengths, not
+                            # per-frame steps (a pre-existing naming mismatch here, now fixed
+                            # by using the real per-frame steps array below instead).
+                            _X, _wids, _primary, _secondary, _, _steps = load_epoch_dihedral_obs(epoch_dir)
                             _result = TICAResult.load(tica_update_report["state_file"])
                             _coverage_actions = _propose_tica_coverage_actions(
                                 registry, _primary, project_tica1(_X, _result), policy,
                                 temperature_K=float(getattr(args, "temperature", 298.0) or 298.0),
+                                window_ids=_wids, steps=_steps, epoch_dir=epoch_dir,
                             )
                             if _coverage_actions:
                                 _apply_registry_actions(registry, _coverage_actions, epoch)
