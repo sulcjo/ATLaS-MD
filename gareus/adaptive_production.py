@@ -1111,20 +1111,68 @@ def _discover_latest_seed_bank(adaptive_dir: Path) -> Optional[Path]:
     return None
 
 
-def _find_replica_trajectory(segment_dir: Path, replica_id: int) -> Optional[Path]:
-    """Find replica_trajectories/replica_<replica_id>.xtc under segment_dir.
+_REPLICA_XTC_RE = re.compile(r"^replica_(\d+)(?:_resume_from_(\d+))?\.xtc$")
 
-    Discovers the actual filename by parsing the integer out of each
-    candidate rather than assuming a fixed zero-pad width.
+
+def _iter_epoch_segment_dirs(epoch_dir: Path):
+    """Yield epoch_dir itself plus its baseline/topup_* sub-segment directories.
+
+    An adaptive-production epoch's own MD can span multiple internal
+    sub-segments (baseline, topup_NNN_STEPS, ...) when the convergence gate
+    asks for more sampling for specific states - each gets its own
+    replica_trajectories/, tica_obs/, and config/, as a SIBLING of (not
+    nested inside) whatever the top-level epoch_dir itself holds from its
+    own direct run. A frame search scoped to epoch_dir alone silently misses
+    everything recorded during a topup - confirmed on real data (chignolin_6
+    epoch_000/topup_001_1387000 has its own replica_015.xtc, invisible to
+    code that only globs epoch_000/replica_trajectories/).
     """
-    traj_dir = Path(segment_dir) / "replica_trajectories"
-    if not traj_dir.is_dir():
-        return None
-    for candidate in sorted(traj_dir.glob("replica_*.xtc")):
-        match = re.search(r"(\d+)$", candidate.stem)
-        if match and int(match.group(1)) == int(replica_id):
-            return candidate
-    return None
+    epoch_dir = Path(epoch_dir)
+    yield epoch_dir
+    baseline = epoch_dir / "baseline"
+    if baseline.is_dir():
+        yield baseline
+    for child in sorted(epoch_dir.glob("topup_*")):
+        if child.is_dir():
+            yield child
+
+
+def _discover_replica_trajectory_fragments(
+    epoch_dir: Path, replica_id: int
+) -> List[Tuple[int, Path, Path]]:
+    """Find every trajectory fragment for one replica across an epoch's sub-segments.
+
+    A replica's continuous MD history can be split across several files even
+    within a single sub-segment directory: SLURM restarts mid-segment produce
+    ``replica_<id>_resume_from_<N>.xtc`` alongside the original
+    ``replica_<id>.xtc``, each covering a different range. This matches on the
+    replica id as a filename PREFIX (``replica_(\\d+)``), not trailing digits,
+    so a resume fragment's own number is never mistaken for a different
+    replica.
+
+    Returns (start_prod_done, xtc_path, segment_dir) tuples, sorted by
+    start_prod_done. ``N`` in a ``_resume_from_<N>`` fragment's name - and the
+    implicit 0 for the plain ``replica_<id>.xtc`` base file - is PRODUCTION
+    steps completed in that specific segment invocation (``prod_done`` in
+    production.py), NOT the same absolute step counter dihedral_obs uses
+    (``calib_steps + prod_done``) - confirmed on real data: treating a
+    fragment's own number as directly comparable to a dihedral_obs "step"
+    silently picked the wrong frame. Callers must subtract the segment's own
+    calibration offset before comparing against these start values.
+    """
+    fragments: List[Tuple[int, Path, Path]] = []
+    for segment_dir in _iter_epoch_segment_dirs(epoch_dir):
+        traj_dir = segment_dir / "replica_trajectories"
+        if not traj_dir.is_dir():
+            continue
+        for candidate in traj_dir.glob("replica_*.xtc"):
+            match = _REPLICA_XTC_RE.match(candidate.name)
+            if not match or int(match.group(1)) != int(replica_id):
+                continue
+            start_prod_done = int(match.group(2)) if match.group(2) else 0
+            fragments.append((start_prod_done, candidate, segment_dir))
+    fragments.sort(key=lambda f: f[0])
+    return fragments
 
 
 def resolve_seed_frame_pdb(seed_frame: Dict[str, Any], topology, out_pdb_path: Path) -> Optional[Dict[str, Any]]:
@@ -1132,18 +1180,31 @@ def resolve_seed_frame_pdb(seed_frame: Dict[str, Any], topology, out_pdb_path: P
 
     Returns a small info dict on success, or None (never raises) if
     extraction is not safely possible for this frame - callers must fall
-    back to the normal seed-library path, never guess. Every fact needed is
-    read from the ORIGINATING SEGMENT's own recorded config
-    (``resolved_args.traj_interval``/``traj_solute_only`` in that segment's
-    own ``config/run_manifest.json``) rather than assumed, so this works for
-    any system/run whose segment actually recorded a trajectory - not just
-    the one it was written against.
+    back to the normal seed-library path, never guess. Searches every
+    trajectory fragment for this replica across the epoch's own sub-segments
+    (see ``_discover_replica_trajectory_fragments``) and, for whichever
+    fragment's own step range actually reaches the target, reads that
+    fragment's OWN recorded config (``resolved_args.traj_interval``/
+    ``traj_solute_only`` in that specific sub-segment's own
+    ``config/run_manifest.json``) rather than assuming any value - so this
+    works for any system/run, not just the one it was written against.
 
     A wrong extraction would silently hand seeding a plausible-looking but
-    physically wrong starting structure, worse than skipping it entirely, so
-    every check below is fail-closed: any missing file, disabled trajectory
-    recording, non-divisible/out-of-range step, or read error returns None
-    rather than guessing.
+    physically wrong starting structure, worse than skipping it entirely.
+    Filename/arithmetic-based step->frame mapping has a real, confirmed
+    ambiguity at sub-segment boundaries: a fresh topup directory's own
+    ``replica_<id>.xtc`` (no ``_resume_from_`` suffix) is NOT guaranteed to
+    start at absolute step 0 the way a segment's very first-ever trajectory
+    file does - only ``_resume_from_<step>`` fragments carry an explicit,
+    trustworthy absolute step in their own name. So arithmetic alone is
+    treated as a *candidate*, never accepted on faith: every candidate frame
+    is verified by recomputing its backbone dihedral features and comparing
+    them against the ground-truth feature vector already recorded for this
+    exact step in this replica's own ``tica_obs/dihedral_obs_<id>.npz`` (the
+    same data ``_propose_tica_coverage_actions`` built this ``seed_frame``
+    from in the first place). No reference feature vector, or no candidate
+    frame whose recomputed features match it, means every check below fails
+    closed and this returns None rather than guessing.
     """
     try:
         replica_id = int(seed_frame["replica_id"])
@@ -1153,73 +1214,154 @@ def resolve_seed_frame_pdb(seed_frame: Dict[str, Any], topology, out_pdb_path: P
         return None
     if not epoch_dir_value:
         return None
-    segment_dir = Path(epoch_dir_value)
-    xtc_path = _find_replica_trajectory(segment_dir, replica_id)
-    if xtc_path is None:
-        return None
-
-    manifest = read_json_file(segment_dir / "config" / "run_manifest.json", {}) or {}
-    resolved_args = manifest.get("resolved_args", {}) or {}
-    traj_interval = int(resolved_args.get("traj_interval", 0) or 0)
-    if traj_interval <= 0:
-        # Trajectory recording was off for this segment (e.g. an
-        # adaptive-feedback pilot, which skips it by default) - no XTC frame
-        # can correspond to this step even though the file above happens to
-        # exist (a stale/unrelated file from a different config).
-        return None
-    traj_solute_only = bool(resolved_args.get("traj_solute_only", False))
-
-    frame_index = int(round(step / traj_interval))
-    step_offset = abs(frame_index * traj_interval - step)
-    # Half the interval is the largest possible pure-rounding offset; more
-    # than that means a real mismatch (e.g. resumed step-numbering not
-    # accounted for here), not just imprecision - refuse rather than guess.
-    if frame_index < 0 or step_offset > traj_interval / 2.0 + 1.0e-6:
-        return None
+    epoch_dir = Path(epoch_dir_value)
 
     try:
         import mdtraj
     except ImportError:
         return None
 
+    ref_npz_path = epoch_dir / "tica_obs" / f"dihedral_obs_{replica_id:03d}.npz"
     try:
-        with mdtraj.open(str(xtc_path)) as handle:
-            n_frames = len(handle)
-    except Exception:
-        return None
-    if frame_index >= n_frames:
-        # Segment likely crashed/was truncated before reaching this step.
-        return None
-
-    try:
-        if traj_solute_only:
-            from .cv import solute_atom_indices
-            mdtraj_top = mdtraj.Topology.from_openmm(topology).subset(solute_atom_indices(topology))
-        else:
-            mdtraj_top = mdtraj.Topology.from_openmm(topology)
-        frame = mdtraj.load_frame(str(xtc_path), frame_index, top=mdtraj_top)
+        ref_data = np.load(ref_npz_path)
+        ref_match = np.flatnonzero(ref_data["steps"] == step)
+        if ref_match.size == 0:
+            return None
+        reference_features = np.asarray(ref_data["features"][ref_match[0]], dtype=float)
     except Exception:
         return None
 
-    positions_nm = frame.xyz[0]
-    if positions_nm.shape[0] == 0 or not np.all(np.isfinite(positions_nm)):
-        return None
-
-    out_pdb_path = Path(out_pdb_path)
-    out_pdb_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        frame.save_pdb(str(out_pdb_path))
+        from .cv import secondary_structure_torsions, solute_atom_indices
+        from .tica import backbone_dihedral_features
+        phi_torsions, psi_torsions = secondary_structure_torsions(topology)
     except Exception:
         return None
+    solute_indices = solute_atom_indices(topology)
+    full_to_solute_local = {full_idx: local_idx for local_idx, full_idx in enumerate(solute_indices)}
+    try:
+        phi_local = [tuple(full_to_solute_local[a] for a in quad) for quad in phi_torsions]
+        psi_local = [tuple(full_to_solute_local[a] for a in quad) for quad in psi_torsions]
+    except KeyError:
+        # A backbone torsion atom fell outside the solute set - shouldn't
+        # happen (backbone torsions are peptide-only), but refuse rather
+        # than silently verify against the wrong atoms.
+        return None
 
-    return {
-        "pdb_path": str(out_pdb_path),
-        "source_xtc": str(xtc_path),
-        "frame_index": int(frame_index),
-        "step_offset": int(step_offset),
-        "n_atoms": int(positions_nm.shape[0]),
-        "traj_solute_only": traj_solute_only,
-    }
+    manifest_cache: Dict[Path, Dict[str, Any]] = {}
+
+    def _segment_traj_config(segment_dir: Path) -> Tuple[int, bool]:
+        if segment_dir not in manifest_cache:
+            manifest = read_json_file(segment_dir / "config" / "run_manifest.json", {}) or {}
+            manifest_cache[segment_dir] = manifest.get("resolved_args", {}) or {}
+        resolved_args = manifest_cache[segment_dir]
+        return (
+            int(resolved_args.get("traj_interval", 0) or 0),
+            bool(resolved_args.get("traj_solute_only", False)),
+        )
+
+    calib_steps_cache: Dict[Path, int] = {}
+
+    def _segment_calib_steps(segment_dir: Path) -> int:
+        # dihedral_obs "step" is calib_steps + prod_done (production.py's
+        # absolute_step), but trajectory fragment start markers (a base
+        # replica_<id>.xtc's implicit 0, or a _resume_from_<N> fragment's own
+        # N) are prod_done alone - confirmed on real data: a fragment's frame
+        # only matched its recorded reference features once this calibration
+        # offset was subtracted first. Shared-GaMD calibration is done ONCE
+        # per campaign and reused by every later segment (see
+        # global_shared_gamd_setup_policy.json), so this is the same value
+        # across baseline/topup/epoch segments - but still read per-segment
+        # (not assumed) in case shared-GaMD is off (calib_steps=0) somewhere.
+        if segment_dir not in calib_steps_cache:
+            metadata = read_json_file(segment_dir / "gareus_metadata.json", {}) or {}
+            calib_steps_cache[segment_dir] = int(metadata.get("shared_gamd_calibration_steps", 0) or 0)
+        return calib_steps_cache[segment_dir]
+
+    # Feature space is sin/cos per torsion (bounded [-1, 1] per component);
+    # the true frame should match to floating-point/PBC-wrap precision, a
+    # wrong frame differs by an amount comparable to the feature range itself.
+    _FEATURE_RMSE_TOLERANCE = 0.05
+
+    for start_prod_done, xtc_path, segment_dir in _discover_replica_trajectory_fragments(epoch_dir, replica_id):
+        traj_interval, traj_solute_only = _segment_traj_config(segment_dir)
+        if traj_interval <= 0:
+            # Trajectory recording was off for this sub-segment (e.g. an
+            # adaptive-feedback pilot, which skips it by default).
+            continue
+        calib_steps = _segment_calib_steps(segment_dir)
+        prod_done = step - calib_steps
+        if prod_done < start_prod_done:
+            continue
+
+        try:
+            with mdtraj.open(str(xtc_path)) as handle:
+                n_frames = len(handle)
+        except Exception:
+            continue
+        if n_frames <= 0:
+            continue
+
+        local_prod_done = prod_done - start_prod_done
+        # A step-based reporter writes its first frame only after completing
+        # traj_interval steps (frame 0 <-> prod_done == traj_interval, not 0)
+        # - confirmed on real data by brute-force search, not assumed.
+        frame_index = int(round(local_prod_done / traj_interval)) - 1
+        step_offset = abs((frame_index + 1) * traj_interval - local_prod_done)
+        # Half the interval is the largest possible pure-rounding offset; more
+        # than that means this fragment doesn't really cover the target step
+        # under the (unverified) assumption that start_prod_done is correct.
+        if frame_index < 0 or frame_index >= n_frames or step_offset > traj_interval / 2.0 + 1.0e-6:
+            continue
+
+        try:
+            if traj_solute_only:
+                mdtraj_top = mdtraj.Topology.from_openmm(topology).subset(solute_indices)
+            else:
+                mdtraj_top = mdtraj.Topology.from_openmm(topology)
+            frame = mdtraj.load_frame(str(xtc_path), frame_index, top=mdtraj_top)
+        except Exception:
+            continue
+
+        positions_nm = frame.xyz[0]
+        if positions_nm.shape[0] == 0 or not np.all(np.isfinite(positions_nm)):
+            continue
+
+        try:
+            if traj_solute_only:
+                candidate_features = backbone_dihedral_features(positions_nm, phi_local, psi_local)
+            else:
+                candidate_features = backbone_dihedral_features(positions_nm, phi_torsions, psi_torsions)
+        except Exception:
+            continue
+        if candidate_features.shape != reference_features.shape:
+            continue
+        feature_rmse = float(np.sqrt(np.mean((candidate_features - reference_features) ** 2)))
+        if feature_rmse > _FEATURE_RMSE_TOLERANCE:
+            # This candidate's step->frame arithmetic didn't actually land on
+            # the right frame (e.g. a topup base file whose start_step isn't
+            # really 0) - keep searching other fragments instead of trusting
+            # unverified arithmetic.
+            continue
+
+        out_pdb_path = Path(out_pdb_path)
+        out_pdb_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            frame.save_pdb(str(out_pdb_path))
+        except Exception:
+            continue
+
+        return {
+            "pdb_path": str(out_pdb_path),
+            "source_xtc": str(xtc_path),
+            "frame_index": int(frame_index),
+            "step_offset": int(step_offset),
+            "n_atoms": int(positions_nm.shape[0]),
+            "traj_solute_only": traj_solute_only,
+            "feature_rmse": feature_rmse,
+        }
+
+    return None
 
 
 def _append_seed_bank_row(seed_bank_dir: Path, row: Dict[str, Any]) -> None:
