@@ -379,14 +379,16 @@ def test_regime_meta_preserves_dict_shape_with_regions(tmp_path, monkeypatch):
     d.meta["secondary_cv"] = {"mode": "seed-mode-should-be-overridden", "label": "", "regions": original_regions}
     logw = np.zeros(n0 + n1)
 
+    import gareus.mbar_analysis.pmf as pmfmod
+
     captured_secondary_cv = []
-    real_analyze = analyze_gareus_mbar.analyze_secondary_cv_pmf
+    real_analyze = pmfmod.analyze_secondary_cv_pmf
 
     def _spy(d_regime, *a, **kw):
         captured_secondary_cv.append(d_regime.meta.get("secondary_cv"))
         return real_analyze(d_regime, *a, **kw)
 
-    monkeypatch.setattr(analyze_gareus_mbar, "analyze_secondary_cv_pmf", _spy)
+    monkeypatch.setattr(pmfmod, "analyze_secondary_cv_pmf", _spy)
 
     run_secondary_cv_analyses(d, _test_args(), logw, "umbrella_only", False, 0.6, out, [], None)
 

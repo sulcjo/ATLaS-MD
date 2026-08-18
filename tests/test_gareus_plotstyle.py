@@ -9,7 +9,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
-import gareus_plotstyle as ps  # noqa: E402
+import gareus.mbar_analysis.plotstyle as ps  # noqa: E402
 
 
 # --- palette / mapping (pure) -----------------------------------------------

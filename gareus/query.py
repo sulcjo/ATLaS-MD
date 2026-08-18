@@ -5,14 +5,21 @@ The N×K bias matrix (umbrella_reduced_bias_nk) is reconstructed analytically
 from stored CV values and window parameters rather than being persisted:
 
     U_k(cv) = 0.5 * k1_k * (cv1 - center1_k)^2  [kcal/mol]
-            + 0.5 * k2_k * (cv2 - center2_k)^2  [kcal/mol, 2D only]
-    reduced_bias[n,k] = beta * 4.184 * U_k(cv[n])
+            + 0.5 * k2_k * (cv2 - center2_k)^2  [kcal/mol, only when window k
+                                                  has isfinite(center2_k) and
+                                                  isfinite(k2_k) and k2_k > 0]
+    reduced_bias[n,k] = beta * KJ_PER_KCAL * U_k(cv[n])
+
+A sample whose own cv2 is non-finite gets NaN for any window that DOES
+restrain CV2 (exclusion-by-propagation), rather than a fabricated zero
+deviation -- see reconstruct_bias_matrix's docstring.
 
 This is 10-100x smaller than storing the full matrix.
 """
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Optional
 
@@ -20,15 +27,37 @@ import numpy as np
 
 from .io import read_json_file
 from .store import SegmentRegistry
+from .units import KJ_PER_KCAL
 
 
 def _concat_numpy_dicts(results: list) -> dict:
-    """Concatenate a list of numpy column-dicts into one, sorted by (step, replica)."""
+    """Concatenate a list of numpy column-dicts into one, sorted by (step, replica).
+
+    DuckDB's fetchnumpy() returns a numpy.ma.MaskedArray for any column with a
+    real SQL NULL (e.g. an unmeasured secondary CV). Plain np.concatenate
+    preserves the MaskedArray *subclass* on its output but silently drops the
+    *mask itself* -- a well-known numpy.ma gotcha, reproduced directly even
+    for a single-element input list (i.e. every single-segment run hits this,
+    not just multi-segment concatenation). That corrupted every null entry
+    into its arbitrary underlying fill value with mask=False ("not null"),
+    upstream of and regardless of any unmasking callers do afterwards (see
+    gareus/mbar_analysis/data.py's _fill_masked_nan and this module's own
+    export_analysis_arrays_npz). Use np.ma.concatenate for any column DuckDB
+    actually returned as masked; plain columns keep the cheaper np.concatenate
+    (avoids allocating a mask array for step/window_id/replica/segment_id on
+    the multi-million-row hot path).
+    """
     non_empty = [r for r in results if r and "step" in r and len(r["step"]) > 0]
     if not non_empty:
         return {}
     keys = list(non_empty[0].keys())
-    combined = {k: np.concatenate([r[k] for r in non_empty]) for k in keys}
+    combined = {}
+    for k in keys:
+        cols = [r[k] for r in non_empty]
+        if any(np.ma.isMaskedArray(c) for c in cols):
+            combined[k] = np.ma.concatenate(cols)
+        else:
+            combined[k] = np.concatenate(cols)
     if "replica" in combined:
         order = np.lexsort((combined["replica"], combined["step"]))
     elif "replica_i" in combined:
@@ -229,6 +258,19 @@ def reconstruct_bias_matrix(
 ) -> np.ndarray:
     """Reconstruct umbrella_reduced_bias_nk analytically.
 
+    A window is "secondary-restrained" iff it has both a "center2" and "k2"
+    key AND those values are finite with k2 > 0 -- such a window's CV2 term
+    is included only when that holds; otherwise the CV2 term is omitted
+    entirely (a 1D run, or an unrestrained 2D state, gets a purely-CV1 bias
+    regardless of what cv2 holds for its samples).
+
+    For a secondary-restrained window, a sample whose own cv2 value is not
+    finite gets NaN for that (sample, window) entry -- this is intentional
+    exclusion-by-propagation (the same convention analyze_gareus_mbar.py's
+    clean() and every other bias-reconstruction site in this codebase uses),
+    not a bug: fabricating a zero deviation would silently claim the sample
+    was on-target for a coordinate that was never actually measured.
+
     Parameters
     ----------
     cv_A : (N,) array of primary CV values
@@ -244,15 +286,17 @@ def reconstruct_bias_matrix(
     N = len(cv_A)
     K = len(windows)
     nk = np.zeros((N, K), dtype=np.float64)
+    cv2_arr = np.asarray(cv2, dtype=np.float64) if cv2 is not None else None
 
     for k, w in enumerate(windows):
         d1 = cv_A - float(w["center1"])
-        nk[:, k] = 4.184 * 0.5 * float(w["k1"]) * d1 * d1  # kcal → kJ
-        if cv2 is not None and "center2" in w and "k2" in w:
-            c2 = np.asarray(cv2, dtype=np.float64)
-            valid = np.isfinite(c2)
-            d2 = np.where(valid, c2 - float(w["center2"]), 0.0)
-            nk[:, k] += 4.184 * 0.5 * float(w["k2"]) * d2 * d2
+        nk[:, k] = KJ_PER_KCAL * 0.5 * float(w["k1"]) * d1 * d1  # kcal -> kJ
+        if cv2_arr is not None and "center2" in w and "k2" in w:
+            k2 = float(w["k2"])
+            c2 = float(w["center2"])
+            if math.isfinite(c2) and math.isfinite(k2) and k2 > 0.0:
+                d2 = cv2_arr - c2
+                nk[:, k] += KJ_PER_KCAL * 0.5 * k2 * d2 * d2
 
     return beta * nk
 

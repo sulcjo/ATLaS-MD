@@ -27,9 +27,22 @@ Available functions
     exist in each window.  It also computes histogram overlaps
     between neighbouring windows to identify weakly connected regions.
 
+``pmf_probability``, ``js_divergence_1d``, ``pmf_rmse_1d``, ``barrier_error_1d``
+    PMF-vs-reference comparison metrics used by the epoch/frame-count
+    convergence loops: normalising a raw PMF into a probability
+    distribution, Jensen-Shannon divergence and RMSE/barrier-height
+    error between two PMFs restricted to well-sampled bins.
+
+``identify_basins_1d``
+    Basin identification and CV-axis partitioning for a 1D PMF, used by
+    basin-population tracking in the convergence loops.  Prefers
+    ``scipy.signal.find_peaks`` when available, with a pure-Python
+    local-minimum fallback.
+
 The private helpers ``_read_csv_dicts``, ``_safe_float``,
-``_sample_counts_by_window`` and ``_hist_overlap_np`` are exposed for
-internal use but not exported by the package.
+``_sample_counts_by_window``, ``_hist_overlap_np`` and
+``_compute_basin_populations`` are exposed for internal use but not
+exported by the package.
 """
 
 from __future__ import annotations
@@ -43,9 +56,24 @@ from typing import List, Dict, Any, Optional
 
 import numpy as np
 
+from .math_helpers import _adaptive_hist_overlap
+from .units import KJ_PER_KCAL, K_B_KJ_PER_MOL_K
+
+try:
+    from scipy.signal import find_peaks as _scipy_find_peaks
+    SCIPY_SIGNAL_AVAILABLE = True
+except Exception:  # scipy is optional; identify_basins_1d has a pure-Python fallback.
+    _scipy_find_peaks = None
+    SCIPY_SIGNAL_AVAILABLE = False
+
 __all__ = [
     "compute_gamd_reweighting_diagnostics",
     "validate_us_mbar_inputs",
+    "pmf_probability",
+    "js_divergence_1d",
+    "pmf_rmse_1d",
+    "barrier_error_1d",
+    "identify_basins_1d",
 ]
 
 
@@ -78,26 +106,197 @@ def _sample_counts_by_window(window_arr: np.ndarray, n_windows: int) -> list[int
 
 
 def _hist_overlap_np(a: np.ndarray, b: np.ndarray, lo: float, hi: float, bins: int = 80) -> float:
-    """Estimate the histogram overlap between two distributions."""
-    a = np.asarray(a, dtype=float)
-    b = np.asarray(b, dtype=float)
-    a = a[np.isfinite(a)]
-    b = b[np.isfinite(b)]
-    if a.size < 5 or b.size < 5:
-        return float("nan")
-    if not math.isfinite(lo) or not math.isfinite(hi) or hi <= lo:
-        allv = np.concatenate([a, b])
-        if allv.size < 2:
-            return float("nan")
-        lo, hi = float(np.min(allv)), float(np.max(allv))
-    pad = max(0.1, 0.02 * (hi - lo))
-    ha, _ = np.histogram(a, bins=max(8, int(bins)), range=(lo - pad, hi + pad))
-    hb, _ = np.histogram(b, bins=max(8, int(bins)), range=(lo - pad, hi + pad))
-    if ha.sum() <= 0 or hb.sum() <= 0:
-        return float("nan")
-    pa = ha.astype(float) / float(ha.sum())
-    pb = hb.astype(float) / float(hb.sum())
-    return float(np.minimum(pa, pb).sum())
+    """Estimate the histogram overlap between two distributions.
+
+    Delegates to gareus.math_helpers._adaptive_hist_overlap -- this
+    module's own pre-existing 5-finite-sample floor is preserved via
+    min_samples=5, so validate_us_mbar_inputs's exact prior behavior is
+    unchanged: a window pair with fewer than 5 finite samples on either
+    side reads as NaN, not a statistically meaningless finite number.
+    """
+    return _adaptive_hist_overlap(a, b, lo, hi, bins=bins, min_samples=5)
+
+
+def pmf_probability(pmf: dict) -> np.ndarray:
+    """Normalize a raw PMF ``prob`` array to a finite, non-negative distribution."""
+    prob = np.asarray(pmf.get('prob', []), dtype=np.float64)
+    total = float(np.nansum(prob))
+    if total > 0:
+        prob = prob / total
+    return np.where(np.isfinite(prob) & (prob >= 0), prob, 0.0)
+
+
+def js_divergence_1d(P, Q) -> float:
+    """Jensen-Shannon divergence (nats) between two (unnormalized) 1D distributions."""
+    P = pmf_probability({'prob': P})
+    Q = pmf_probability({'prob': Q})
+    if P.size != Q.size:
+        n = min(P.size, Q.size)
+        P = P[:n]
+        Q = Q[:n]
+    M = 0.5 * (P + Q)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        a = np.where(P > 0, P * np.log(P / np.maximum(M, 1e-300)), 0.0)
+        b = np.where(Q > 0, Q * np.log(Q / np.maximum(M, 1e-300)), 0.0)
+    return float(0.5 * (np.sum(a) + np.sum(b)))
+
+
+def pmf_rmse_1d(F, Fref, P, Pref, min_prob=0.0) -> float:
+    """RMSE between two PMFs, restricted to bins with probability above ``min_prob`` on both sides."""
+    F = np.asarray(F, dtype=np.float64)
+    Fref = np.asarray(Fref, dtype=np.float64)
+    P = np.asarray(P, dtype=np.float64)
+    Pref = np.asarray(Pref, dtype=np.float64)
+    n = min(F.size, Fref.size, P.size, Pref.size)
+    if n <= 0:
+        return float('nan')
+    F = F[:n]
+    Fref = Fref[:n]
+    P = P[:n]
+    Pref = Pref[:n]
+    mask = np.isfinite(F) & np.isfinite(Fref) & (P > float(min_prob)) & (Pref > float(min_prob))
+    if not np.any(mask):
+        return float('nan')
+    d = F[mask] - Fref[mask]
+    return float(np.sqrt(np.mean(d * d)))
+
+
+def barrier_error_1d(F, Fref, P, Pref) -> float:
+    """Absolute difference between two PMFs' maxima, restricted to bins with positive probability on both sides."""
+    F = np.asarray(F, dtype=np.float64)
+    Fref = np.asarray(Fref, dtype=np.float64)
+    P = np.asarray(P, dtype=np.float64)
+    Pref = np.asarray(Pref, dtype=np.float64)
+    n = min(F.size, Fref.size, P.size, Pref.size)
+    if n <= 0:
+        return float('nan')
+    mask = np.isfinite(F[:n]) & np.isfinite(Fref[:n]) & (P[:n] > 0) & (Pref[:n] > 0)
+    if not np.any(mask):
+        return float('nan')
+    return float(abs(np.nanmax(F[:n][mask]) - np.nanmax(Fref[:n][mask])))
+
+
+def identify_basins_1d(cv_A: np.ndarray, F: np.ndarray, min_depth_kcal: float = 0.5) -> list:
+    """Find basins in a 1D PMF and partition the CV axis into basin domains.
+
+    Returns a list of dicts (sorted by CV position):
+      basin_id, center_cv_A, min_F_kcal, prominence_kcal,
+      left_bin, right_bin (inclusive bin indices into cv_A/F),
+      left_cv_A, right_cv_A.
+
+    Basin boundaries sit at the local maximum between adjacent minima so that
+    every bin belongs to exactly one basin and populations sum to 1.
+    """
+    cv_A = np.asarray(cv_A, dtype=np.float64)
+    F = np.asarray(F, dtype=np.float64)
+    n = len(F)
+    if n < 3:
+        return []
+    F_safe = np.where(np.isfinite(F), F, np.inf)
+    neg_F = np.where(np.isfinite(F_safe), -F_safe, -np.inf)
+    minima_idx: list = []
+    prominences: list = []
+    if SCIPY_SIGNAL_AVAILABLE and _scipy_find_peaks is not None:
+        try:
+            peaks, props = _scipy_find_peaks(neg_F, prominence=min_depth_kcal)
+            minima_idx = list(peaks)
+            prominences = list(props['prominences'])
+        except Exception:
+            pass
+    if not minima_idx:
+        finite_mask = np.isfinite(F)
+        for i in range(1, n - 1):
+            if not finite_mask[i]:
+                continue
+            left_ok = finite_mask[:i]
+            right_ok = finite_mask[i + 1:]
+            if not (left_ok.any() and right_ok.any()):
+                continue
+            if F[i] >= F[i - 1] or F[i] >= F[i + 1]:
+                continue
+            lmax = float(np.max(F[:i][left_ok]))
+            rmax = float(np.max(F[i + 1:][right_ok]))
+            prom = min(lmax, rmax) - F[i]
+            if prom >= min_depth_kcal:
+                minima_idx.append(i)
+                prominences.append(float(prom))
+    if not minima_idx:
+        finite_idx = np.where(np.isfinite(F))[0]
+        if len(finite_idx) == 0:
+            return []
+        gmin = int(finite_idx[np.argmin(F[finite_idx])])
+        minima_idx = [gmin]
+        prominences = [0.0]
+    order = np.argsort(minima_idx)
+    minima_idx = [minima_idx[i] for i in order]
+    prominences = [prominences[i] for i in order]
+    # barrier_bins[i] = argmax between minima_idx[i] and minima_idx[i+1]
+    barrier_bins = []
+    for i in range(len(minima_idx) - 1):
+        lo, hi = minima_idx[i], minima_idx[i + 1]
+        barrier_bins.append(lo + int(np.argmax(F_safe[lo:hi + 1])))
+    # Partition: basin i covers [left_edges[i], right_edges[i]] inclusive.
+    # Barrier bin belongs to the left basin so the union is [0, n-1] without gaps or overlap.
+    left_edges = [0] + [b + 1 for b in barrier_bins]
+    right_edges = barrier_bins + [n - 1]
+    basins = []
+    for i, mi in enumerate(minima_idx):
+        lb, rb = left_edges[i], right_edges[i]
+        basins.append({
+            'basin_id': i,
+            'center_cv_A': float(cv_A[mi]),
+            'min_F_kcal': float(F[mi]) if np.isfinite(F[mi]) else float('nan'),
+            'prominence_kcal': float(prominences[i]),
+            'left_bin': int(lb),
+            'right_bin': int(rb),
+            'left_cv_A': float(cv_A[lb]),
+            'right_cv_A': float(cv_A[rb]),
+        })
+    return basins
+
+
+def _compute_basin_populations(prob: np.ndarray, basins: list) -> list:
+    prob = np.asarray(prob, dtype=np.float64)
+    return [float(np.sum(prob[b['left_bin']:b['right_bin'] + 1])) for b in basins]
+
+
+def _weighted_mean_std(values, weights):
+    v = np.asarray(values, dtype=np.float64)
+    w = np.asarray(weights, dtype=np.float64)
+    mask = np.isfinite(v) & np.isfinite(w) & (w >= 0)
+    if not np.any(mask):
+        return float('nan'), float('nan')
+    v = v[mask]
+    w = w[mask]
+    sw = float(np.sum(w))
+    if sw <= 0:
+        return float('nan'), float('nan')
+    w = w / sw
+    mean = float(np.sum(w * v))
+    var = float(np.sum(w * (v - mean) ** 2))
+    return mean, float(math.sqrt(max(0.0, var)))
+
+
+def _pmf_distribution_mean_std(pmf: dict):
+    x = np.asarray(pmf.get('cv_A', []), dtype=np.float64)
+    p = pmf_probability(pmf)
+    if x.size == 0 or p.size == 0:
+        return float('nan'), float('nan')
+    n = min(x.size, p.size)
+    x = x[:n]
+    p = p[:n]
+    mask = np.isfinite(x) & np.isfinite(p) & (p >= 0)
+    if not np.any(mask):
+        return float('nan'), float('nan')
+    x = x[mask]
+    p = p[mask]
+    sp = float(np.sum(p))
+    if sp <= 0:
+        return float('nan'), float('nan')
+    p = p / sp
+    mean = float(np.sum(p * x))
+    var = float(np.sum(p * (x - mean) ** 2))
+    return mean, float(math.sqrt(max(0.0, var)))
 
 
 def compute_gamd_reweighting_diagnostics(out_dir: Path, temperature_k: float) -> dict:
@@ -171,7 +370,7 @@ def compute_gamd_reweighting_diagnostics(out_dir: Path, temperature_k: float) ->
         result["status"] = "warning"
         warnings.append("no finite GaMD boost values were found in analysis_arrays.npz")
         return result
-    boost_kcal = finite / 4.184
+    boost_kcal = finite / KJ_PER_KCAL
     # Defer to the implementation in gareus_peptide for anharmonicity
     try:
         from .logger import boost_anharmonicity
@@ -179,7 +378,7 @@ def compute_gamd_reweighting_diagnostics(out_dir: Path, temperature_k: float) ->
     except Exception:
         an = {"score": float("nan")}
     # Effective sample size diagnostics based on exp(beta*boost)
-    beta_1_over_kj = 1.0 / (0.00831446261815324 * float(temperature_k))
+    beta_1_over_kj = 1.0 / (K_B_KJ_PER_MOL_K * float(temperature_k))
     logw = beta_1_over_kj * finite
     logw -= float(np.max(logw))
     weights = np.exp(logw)
@@ -195,7 +394,7 @@ def compute_gamd_reweighting_diagnostics(out_dir: Path, temperature_k: float) ->
         finite_mask = np.isfinite(boost_kj)
         for wi in np.unique(window_arr[finite_mask]):
             mask = finite_mask & (window_arr == wi)
-            vals = boost_kj[mask] / 4.184
+            vals = boost_kj[mask] / KJ_PER_KCAL
             if vals.size >= 2:
                 per_window_sd[int(wi)] = float(np.std(vals))
 
