@@ -3514,6 +3514,136 @@ def reconcile_resume_secondary_cv_metadata(secondary_cv_metadata: Optional[dict]
     return meta
 
 
+def _find_adaptive_dir_root(out_dir: Path) -> Optional[Path]:
+    """Walk up from a segment's own out_dir to find the campaign's adaptive_production/ root.
+
+    Always named "adaptive_production" throughout this codebase (see
+    adaptive_production.py's own adaptive_dir construction). Walking up
+    rather than assuming a fixed nesting depth, since baseline/topup
+    segments nest one level deeper than a plain epoch, and "final" one
+    level deeper still.
+    """
+    for parent in Path(out_dir).resolve().parents:
+        if parent.name == "adaptive_production":
+            return parent
+    return None
+
+
+def _seed_bank_row_exists(seed_bank_dir: Path, seed_name: str) -> bool:
+    csv_path = Path(seed_bank_dir) / "final_survivor_seeds.csv"
+    if not csv_path.exists() or csv_path.stat().st_size <= 0:
+        return False
+    try:
+        with csv_path.open(newline="") as handle:
+            return any(row.get("seed_name") == seed_name for row in csv.DictReader(handle))
+    except Exception:
+        return False
+
+
+def _augment_seed_bank_with_campaign_search(
+    args, out_dir: Path, topology, centers_a, secondary_cv_centers,
+) -> None:
+    """For topup segments, search the campaign's own accumulated trajectory
+    history for a real frame close to each window's target, adding one to
+    the seed bank when found - before generate_us_starting_states_by_pulling
+    runs its own per-window nearest-conformer selection over whatever the
+    (otherwise static) GENPEPT library currently offers.
+
+    Scoped to topup-tagged segments only (``_adaptive_phase_info["is_topup"]``):
+    a baseline/initial-epoch window getting seeded wrong sets a worse
+    foundation for everything the adaptive process subsequently builds on
+    top of it, so those keep the stricter, unmodified library-only path. A
+    topup is always re-seeding an ALREADY-established window, and the
+    accumulated trajectory is exactly the kind of real data a static
+    pre-generated library can never anticipate (confirmed on real data:
+    chignolin_6 state 27, an original edge-of-range window, kept failing its
+    seed-preflight check on every topup retry with only the static library
+    to draw from).
+
+    Never raises, and only ever ADDS a new seed-bank row - never removes or
+    replaces anything - so generate_us_starting_states_by_pulling's own
+    existing per-window nearest-conformer selection just naturally discovers
+    and prefers it if (and only if) it scores closer than every existing
+    candidate. Every fail-closed/ground-truth-verification guarantee in
+    resolve_seed_frame_pdb/search_campaign_for_near_frame still applies -
+    this can only ever help or be a no-op, never make a window's seeding
+    worse than it already was.
+    """
+    phase_info = getattr(args, "_adaptive_phase_info", {}) or {}
+    if not phase_info.get("is_topup"):
+        return
+    if secondary_cv_centers is None or centers_a is None or len(centers_a) == 0:
+        return
+    seed_bank_dir_value = getattr(args, "seed_conformers_dir", None)
+    if not seed_bank_dir_value:
+        return
+    seed_bank_dir = Path(seed_bank_dir_value)
+    if not seed_bank_dir.is_dir():
+        return
+    adaptive_dir = _find_adaptive_dir_root(out_dir)
+    if adaptive_dir is None:
+        return
+
+    try:
+        from .tica import search_campaign_for_near_frame
+        from .seeding import _finite_spacing_scale
+    except Exception:
+        return
+
+    primary_scale = _finite_spacing_scale(list(centers_a), fallback=1.0)
+    finite_secondary = [
+        float(c) for c in secondary_cv_centers if c is not None and math.isfinite(float(c))
+    ]
+    secondary_scale = _finite_spacing_scale(finite_secondary, fallback=0.25)
+    max_score = float(getattr(args, "us_seed_preflight_max_score", 1.2) or 1.2)
+
+    n_added = 0
+    n_searched = 0
+    for w in range(len(centers_a)):
+        secondary_c = secondary_cv_centers[w] if secondary_cv_centers is not None else None
+        if secondary_c is None or not math.isfinite(float(secondary_c)):
+            continue
+        primary_c = float(centers_a[w])
+        secondary_c = float(secondary_c)
+        seed_name = f"campaign_search_p{primary_c:.4f}_s{secondary_c:.4f}"
+        if _seed_bank_row_exists(seed_bank_dir, seed_name):
+            continue
+        n_searched += 1
+        pdb_path = seed_bank_dir / "pdbs" / f"{seed_name}.pdb"
+        try:
+            info = search_campaign_for_near_frame(
+                adaptive_dir, topology, primary_c, secondary_c,
+                primary_scale, secondary_scale, max_score, pdb_path,
+            )
+        except Exception as exc:
+            print(f"WARNING: campaign seed search failed for window {w} ({exc})")
+            continue
+        if info is None:
+            continue
+        try:
+            from .adaptive_production import _append_seed_bank_row
+            _append_seed_bank_row(seed_bank_dir, {
+                "seed_name": seed_name,
+                "survivor_pdb_path": str(Path("pdbs") / pdb_path.name),
+                "source_run_dir": info["seed_frame"]["epoch_dir"],
+                "source_pdb_path": info["source_xtc"],
+                "source_label": "campaign_search_topup",
+                "source_state_id": "",
+                "source_epoch_window": info["frame_index"],
+                "primary_cv_value": primary_c,
+                "secondary_cv_value": secondary_c,
+            })
+        except Exception as exc:
+            print(f"WARNING: failed to register campaign-search seed for window {w} ({exc})")
+            continue
+        n_added += 1
+    if n_searched:
+        print(
+            f"    Campaign seed search (topup): searched {n_searched} window(s) with no prior "
+            f"campaign-search seed, added {n_added} real extracted frame(s) to {seed_bank_dir}"
+        )
+
+
 def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equil_state, progress: Optional[GuiProgressSink] = None):
     _register_graceful_shutdown()
     platform, props = platform_and_properties(openmm, args.platform, args.precision, args.device_index, args.cpu_threads, args=args)
@@ -3756,6 +3886,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         pos = equil_state.getPositions()
         vel = equil_state.getVelocities()
         box = equil_state.getPeriodicBoxVectors()
+
+        _augment_seed_bank_with_campaign_search(args, out_dir, topology, centers_a, secondary_cv_centers)
 
         window_start_positions, window_start_velocities, dropped_window_indices = generate_us_starting_states_by_pulling(
             args, out_dir, openmm, app, unit, topology, starting_structure_system, centers_nm, ks_kj_nm2,
