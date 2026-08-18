@@ -2030,6 +2030,8 @@ def generate_us_starting_states_by_pulling(
         auto_drop = bool(getattr(args, "us_auto_drop_bad_windows", False))
         max_drop_fraction = float(getattr(args, "us_auto_drop_max_fraction", 1.0 / 3.0) or (1.0 / 3.0))
         drop_fraction = n_bad / float(nwin)
+        _phase_info = getattr(args, "_adaptive_phase_info", {}) or {}
+        _topup_auto_allow = bool(_phase_info.get("is_topup"))
         if auto_drop and drop_fraction <= max_drop_fraction:
             # Some windows never converge on the secondary CV no matter how hard they
             # are pulled (kinetic trapping / no path from the available seed, not a
@@ -2042,6 +2044,24 @@ def generate_us_starting_states_by_pulling(
             print(
                 f"WARNING [US auto-drop]: {n_bad}/{nwin} windows remained 'bad' after the starting-structure "
                 f"pull and will be dropped from production (--us-auto-drop-bad-windows):\n{_bad_lines}\n"
+                f"See {pull_dir / 'us_starting_structure_quality.json'} for full details."
+            )
+        elif _topup_auto_allow:
+            # Last-resort fallback, topup segments ONLY: a topup is always re-seeding
+            # an already-established window (never a baseline/initial-epoch window,
+            # which keeps the strict raise below), and by this point the campaign-wide
+            # trajectory search (production.py's _augment_seed_bank_with_campaign_search)
+            # has already had a chance to supply a better real seed before this pull
+            # ever ran. If windows are still bad after both of those, hard-failing the
+            # whole topup segment over a handful of stubborn windows blocks every OTHER
+            # window in the same segment for no benefit - proceed instead, accepting the
+            # same risk --us-allow-bad-windows opts into explicitly, just auto-applied
+            # and scoped to topup only.
+            print(
+                f"WARNING [US topup auto-allow]: {n_bad}/{nwin} windows remained 'bad' after the "
+                "starting-structure pull (and after the campaign-wide seed search) during a topup "
+                "segment; proceeding with production anyway instead of hard-failing the segment:\n"
+                f"{_bad_lines}\n"
                 f"See {pull_dir / 'us_starting_structure_quality.json'} for full details."
             )
         else:
