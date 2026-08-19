@@ -1,10 +1,19 @@
-"""The always-visible header: ten lines that answer all three operator questions.
+"""The always-visible header: the real lines that answer all three operator questions.
+
+Nine line-kinds exist (eight for a 1D run, which has no CV2 line): identity
+and verdict, run progress, pool budget, CV1 coverage, CV2 coverage (2D only),
+window sample strip, neighbour-exchange strip, GaMD boost envelope, and top
+alerts. `FULL_SPINE_LINES = 10` is the budget `render_screen` reserves for
+the spine, not a line count this module pads out to -- the design mockup's
+tenth row is the view-tab/clock divider that `render_screen` renders as its
+own footer. `spine_lines` returns only real content; whatever's left of the
+reservation goes back to the view body instead of sitting here as blank rows.
 
 Every line is `label + elastic middle + fixed right summary`; the middle is sized
 from the measured width of the fixed parts -- bracket characters included, never
 guessed -- so a normal-width terminal never has to fall back on the final
-`_ansi_truncate` safety net to fit. Lines 6 and 7 (window strip, exchange strip)
-share an x-axis on purpose: the exchange strip's first cell starts one column to
+`_ansi_truncate` safety net to fit. The window strip and exchange strip share an
+x-axis on purpose: the exchange strip's first cell starts one column to
 the right of the window strip's first cell, so pair *i* (between windows *i* and
 *i+1*) reads as a seam between two window columns rather than sitting directly
 under either window's own glyph.
@@ -157,7 +166,12 @@ def _alert_line(ranked: Sequence[WindowStatus]) -> str:
 
 
 def spine_lines(ctx: DashboardContext, lines_budget: int) -> tuple[str, ...]:
-    """Render the spine at the requested height (10 full, 5 compact)."""
+    """Render the spine's real content lines (9 full/2D, 8 full/1D, 5 compact).
+
+    `lines_budget` selects a tier (>= `FULL_SPINE_LINES` for the full tier,
+    else the 5-line compact tier) -- it is not a target length the return
+    value is padded to reach.
+    """
     width = max(40, ctx.term_w - 2)
     ranked = _ranked_windows(ctx)
     statuses = _statuses_by_window(ranked, ctx.n_windows)
@@ -206,14 +220,21 @@ def spine_lines(ctx: DashboardContext, lines_budget: int) -> tuple[str, ...]:
 
     budget = max(1, int(lines_budget))
     if budget >= FULL_SPINE_LINES:
+        # No blank padding. There are nine real line-kinds (eight for a 1D run,
+        # which has no CV2 line) -- the design mockup's tenth line is the
+        # view-tab/clock divider that `render_screen` renders as its own
+        # footer, not a spine line. `FULL_SPINE_LINES` is still the budget
+        # `render_screen` reserves for the spine (frame_tiers' contract is
+        # unchanged); the spine simply doesn't need to fill all of it, and
+        # `render_screen` hands the unused reservation to the view body
+        # instead of the spine wasting it as blank rows.
         chosen = lines[:FULL_SPINE_LINES]
     else:
-        # Compact tier: identity, run, pool, window strip, top alert.
+        # Compact tier: identity, run, pool, window strip, top alert -- all
+        # five are always real content, so no padding is needed here either.
         chosen = [lines[0], lines[1], lines[2],
                   next((l for l in lines if l.startswith("win   ")), ""),
                   lines[-1]][:budget]
-    while len(chosen) < min(budget, FULL_SPINE_LINES):
-        chosen.append("")
     return tuple(_ansi_truncate(l, width) for l in chosen)
 
 

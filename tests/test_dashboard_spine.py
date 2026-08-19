@@ -48,10 +48,17 @@ def test_bucket_strip_handles_an_empty_input():
     assert bucket_strip([], [], cells=20) == ""
 
 
-def test_spine_lines_returns_exactly_ten_lines_and_fits_the_width(tmp_path):
+def test_spine_lines_returns_the_real_1d_line_count_with_no_blank_padding(tmp_path):
+    """Nine line-kinds exist in the full tier; a 1D run (no CV2 line) has
+    eight, all real content. `spine_lines` no longer pads the return value up
+    to `FULL_SPINE_LINES` -- that constant is only the budget `render_screen`
+    reserves for the spine, not a line count this function fills with blanks
+    (the design mockup's tenth row is `render_screen`'s own footer divider).
+    """
     lines = spine_lines(_ctx(tmp_path), FULL_SPINE_LINES)
-    assert len(lines) == FULL_SPINE_LINES
+    assert len(lines) == 8
     assert all(strip_ansi_len(l) <= 140 - 2 for l in lines)
+    assert all(strip_ansi(l).strip() != "" for l in lines)
 
 
 def test_spine_lines_names_the_phase_epoch_and_window_count(tmp_path):
@@ -93,12 +100,45 @@ def test_spine_omits_the_cv2_line_for_a_1d_run(tmp_path):
     assert not any(strip_ansi(l).startswith("cv2") for l in lines)
 
 
+def test_spine_lines_returns_the_real_2d_line_count_with_no_blank_padding(tmp_path):
+    """A 2D run has all nine line-kinds (the eight 1D ones plus CV2), all real
+    content -- the mirror case of the 1D count test above, pinning the other
+    number a later task's frame geometry needs (Task 11/14 both assert
+    against these exact counts).
+    """
+    n = 10
+    centers = [4.0 + 0.5 * i for i in range(n)]
+    sec_centers = [float(i - 4) for i in range(n)]   # varying -> ctx.is_2d True
+    logger = DistanceLogger(tmp_path, argparse.Namespace(timestep_fs=2.0), no_file_persistence=True)
+    for w in range(n):
+        logger.history_by_window[w] = [centers[w] + 0.02 * (i % 5 - 2) for i in range(30)]
+        logger.secondary_history_by_window[w] = [sec_centers[w] + 0.02 * (i % 5 - 2) for i in range(30)]
+    rows = [{"replica": w, "window": w, "center_A": centers[w], "k_kcal_mol_A2": 2.5,
+             "cv_A": centers[w] + 0.01} for w in range(n)]
+    exchange_stats = {f"{i}-{i+1}": {"attempts": 40, "accepted": 12} for i in range(n - 1)}
+    ctx = build_context(
+        logger=logger, rows=rows, phase="gareus_production", step=1000, total_steps=100000,
+        summary={}, dashboard_info={
+            "centers_a": centers, "n_windows": n, "k_list": [2.5] * n,
+            "secondary_cv_centers": sec_centers, "secondary_cv": {"type": "torsion-pca"},
+            "exchange_stats": exchange_stats,
+            "primary_cv_label": "contacts", "primary_cv_units": "A"},
+        sidecar=SidecarSnapshot(), term_w=140, term_h=45, now=1000.0,
+        view="progress", glyphs="unicode",
+    )
+    assert ctx.is_2d
+    lines = spine_lines(ctx, FULL_SPINE_LINES)
+    assert len(lines) == 9
+    assert all(strip_ansi(l).strip() != "" for l in lines)
+    assert any(strip_ansi(l).startswith("cv2") for l in lines)
+
+
 # --- Regression coverage for defects found while implementing this task -----
 #
-# The three tests below were added on top of the task brief's own 11 -- each
-# pins a real bug that the given 11 tests do not (and, for the truncation
-# case, cannot) catch, since `spine_lines`' own final `_ansi_truncate` safety
-# net silently rescues an over-length line by clipping it.
+# The tests below were added on top of the task brief's own 11 -- each pins a
+# real bug that the given 11 tests do not (and, for the truncation case,
+# cannot) catch, since `spine_lines`' own final `_ansi_truncate` safety net
+# silently rescues an over-length line by clipping it.
 
 
 def test_verdict_reflects_actual_decision_health_not_hardcoded_ok(tmp_path):
