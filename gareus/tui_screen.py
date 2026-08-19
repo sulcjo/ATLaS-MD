@@ -69,18 +69,43 @@ def row_priority(row: Row) -> int:
     return min((p.priority for p in row.panels), default=9)
 
 
-def row_min(row: Row) -> int:
-    """Total lines a row occupies at its minimum, chrome included."""
+def _would_stack_on_narrow_terminal(row: Row, term_w: int) -> bool:
+    """Predicate shared between allocator and composer to detect narrow-terminal stacking.
+
+    Returns True if the row's panels would be stacked vertically instead of
+    side-by-side, using the exact same threshold arithmetic as compose_rows.
+    """
+    gap_v = dashboard_row_gap(term_w)
+    usable = max(40, int(term_w) - 2)
+    n = len(row.panels)
+    min_w = max(ABSOLUTE_MIN_PANEL_WIDTH, MIN_PANEL_WIDTH)
+    return n > 1 and usable < n * min_w + (n - 1) * gap_v
+
+
+def row_min(row: Row, term_w: int | None = None) -> int:
+    """Total lines a row occupies at its minimum, chrome included.
+
+    If term_w is provided, prices the row for the layout it would use on that
+    terminal width (stacked vs side-by-side). Otherwise uses side-by-side pricing.
+    """
+    if term_w is not None and _would_stack_on_narrow_terminal(row, term_w):
+        return sum(p.min_lines for p in row.panels) + PANEL_CHROME_LINES * len(row.panels)
     return max((p.min_lines for p in row.panels), default=1) + PANEL_CHROME_LINES
 
 
-def row_want(row: Row) -> int:
-    """Total lines a row would occupy if fully satisfied, chrome included."""
+def row_want(row: Row, term_w: int | None = None) -> int:
+    """Total lines a row would occupy if fully satisfied, chrome included.
+
+    If term_w is provided, prices the row for the layout it would use on that
+    terminal width (stacked vs side-by-side). Otherwise uses side-by-side pricing.
+    """
+    if term_w is not None and _would_stack_on_narrow_terminal(row, term_w):
+        return sum(p.want_lines for p in row.panels) + PANEL_CHROME_LINES * len(row.panels)
     return max((p.want_lines for p in row.panels), default=1) + PANEL_CHROME_LINES
 
 
 def allocate_rows(
-    rows: Sequence[Row], budget: int
+    rows: Sequence[Row], budget: int, term_w: int | None = None
 ) -> tuple[tuple[tuple[Row, int], ...], tuple[str, ...]]:
     """Fit ``rows`` into ``budget`` lines.
 
@@ -88,21 +113,33 @@ def allocate_rows(
     panels that were dropped entirely. Dropped panels are reported so the caller
     can name them in the footer -- silence is what made the old behaviour a bug
     rather than a limitation.
+
+    When term_w is provided, rows are priced according to whether they would
+    stack vertically (ensuring "fits by construction" even on narrow terminals).
     """
     kept = list(rows)
     dropped: list[str] = []
-    while kept and sum(row_min(r) for r in kept) > int(budget):
+    while kept and sum(row_min(r, term_w) for r in kept) > int(budget):
         victim = max(range(len(kept)), key=lambda i: (row_priority(kept[i]), i))
         dropped.extend(p.key for p in kept.pop(victim).panels)
     if not kept:
         return (), tuple(dropped)
 
-    body = {i: row_min(r) - PANEL_CHROME_LINES for i, r in enumerate(kept)}
-    spare = int(budget) - sum(row_min(r) for r in kept)
+    # Compute body lines based on stacking layout
+    body: dict[int, int] = {}
+    for i, r in enumerate(kept):
+        if term_w is not None and _would_stack_on_narrow_terminal(r, term_w):
+            # Stacked: each panel gets its own border set
+            body[i] = sum(p.min_lines for p in r.panels)
+        else:
+            # Side-by-side: panels share one border set
+            body[i] = max((p.min_lines for p in r.panels), default=1)
+
+    spare = int(budget) - sum(row_min(r, term_w) for r in kept)
     for i in sorted(range(len(kept)), key=lambda i: (row_priority(kept[i]), i)):
         if spare <= 0:
             break
-        room = row_want(kept[i]) - row_min(kept[i])
+        room = row_want(kept[i], term_w) - row_min(kept[i], term_w)
         give = min(max(0, room), spare)
         body[i] += give
         spare -= give
@@ -170,14 +207,18 @@ def compose_rows(
         panels = [trim_panel(p, body) for p in row.panels]
         n = len(panels)
         min_w = max(ABSOLUTE_MIN_PANEL_WIDTH, MIN_PANEL_WIDTH)
-        if n > 1 and usable < n * min_w + (n - 1) * gap_v:
+        if _would_stack_on_narrow_terminal(row, term_w):
+            # Clamp render width to actual terminal usable width
+            render_w = max(18, int(term_w) - 2)
             for p in panels:
-                out.extend(_panel_lines(p.title, list(p.lines), usable))
+                out.extend(_panel_lines(p.title, list(p.lines), render_w))
             continue
         widths = _weighted_panel_widths(
             [p.weight for p in panels], term_w=term_w, gap=gap_v, min_panel_width=min_w
         )
-        cols = [_panel_lines(p.title, list(p.lines), w) for p, w in zip(panels, widths)]
+        # Clamp widths to actual terminal usable width
+        clamped_widths = [max(18, min(w, int(term_w) - 2)) for w in widths]
+        cols = [_panel_lines(p.title, list(p.lines), w) for p, w in zip(panels, clamped_widths)]
         out.extend(_join_columns(cols, gap=gap_v))
     return tuple(out)
 

@@ -162,3 +162,42 @@ def test_compose_rows_trims_panel_content_to_its_allocation():
     out = compose_rows([(row, 3)], term_w=120)
     assert len(out) == 3 + PANEL_CHROME_LINES
     assert "… 7 more" in "\n".join(out)
+
+
+def test_compose_rows_never_exceeds_a_very_narrow_terminal_two_panel():
+    """Verify narrow-terminal stacking doesn't overflow term_w."""
+    row = Row(panels=(
+        Panel(key="a", title="left", lines=("l1", "l2"), min_lines=2, want_lines=2),
+        Panel(key="b", title="right", lines=("r1", "r2"), min_lines=2, want_lines=2),
+    ))
+    out = compose_rows([(row, 2)], term_w=30)
+    # Every line must fit within term_w - 2 = 28 columns
+    assert all(strip_ansi_len(line) <= 28 for line in out)
+
+
+def test_compose_rows_never_exceeds_a_very_narrow_terminal_single_panel():
+    """Verify single-panel rows don't overflow narrow terminal."""
+    row = Row(panels=(
+        Panel(key="a", title="t", lines=("l1", "l2"), min_lines=2, want_lines=2, weight=1.0),
+    ))
+    out = compose_rows([(row, 2)], term_w=30)
+    # Every line must fit within term_w - 2 = 28 columns
+    assert all(strip_ansi_len(line) <= 28 for line in out)
+
+
+def test_allocate_rows_prices_stacked_layouts_correctly():
+    """Verify allocator prices stacked rows for narrow terminals."""
+    # A 2-panel row: 3 lines each. Side-by-side: max(3) + 4 = 7 lines
+    # Stacked: 3 + 3 + 4 + 4 = 14 lines
+    row = Row(panels=(
+        Panel(key="a", title="left", lines=("l1", "l2", "l3"), min_lines=3, want_lines=3),
+        Panel(key="b", title="right", lines=("r1", "r2", "r3"), min_lines=3, want_lines=3),
+    ))
+    # With term_w=50, should stack. Budget = 15 should be enough for stacked (14).
+    allocated, dropped = allocate_rows([row], budget=15, term_w=50)
+    assert len(allocated) == 1
+    assert dropped == ()
+    row_out, body_lines = allocated[0]
+    # Compose and verify it fits
+    out = compose_rows([(row_out, body_lines)], term_w=50)
+    assert len(out) <= 15
