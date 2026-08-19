@@ -197,22 +197,46 @@ def frame_tiers(term_h: int) -> tuple[int, int]:
 
 
 def compose_rows(
-    allocated: Sequence[tuple[Row, int]], term_w: int, gap: int | None = None
+    allocated: Sequence[tuple[Row, int]], term_w: int
 ) -> tuple[str, ...]:
     """Render allocated rows to text lines, stacking when too narrow for columns."""
-    gap_v = dashboard_row_gap(term_w) if gap is None else int(gap)
-    usable = max(40, int(term_w) - 2)
+    gap_v = dashboard_row_gap(term_w)
     out: list[str] = []
     for row, body in allocated:
-        panels = [trim_panel(p, body) for p in row.panels]
-        n = len(panels)
         min_w = max(ABSOLUTE_MIN_PANEL_WIDTH, MIN_PANEL_WIDTH)
         if _would_stack_on_narrow_terminal(row, term_w):
-            # Clamp render width to actual terminal usable width
+            # Stacked layout: split the body budget across panels.
+            # Row was priced at: body + PANEL_CHROME_LINES (one shared border set)
+            # Stacked needs: PANEL_CHROME_LINES * n (n separate border sets)
+            # Available body lines to divide: body + PANEL_CHROME_LINES - PANEL_CHROME_LINES * n
+            n = len(row.panels)
+            available = body + PANEL_CHROME_LINES - PANEL_CHROME_LINES * n
+            # Sanity check: at body = sum(min_lines) + 4n - 4, available = sum(min_lines)
+            # so every panel can get at least min_lines.
+
+            # Distribute: give each panel its min_lines first, then remaining toward want_lines
+            panel_bodies: dict[int, int] = {}
+            for i, p in enumerate(row.panels):
+                panel_bodies[i] = max(1, p.min_lines)
+
+            spare = available - sum(panel_bodies.values())
+            for i, p in enumerate(row.panels):
+                if spare <= 0:
+                    break
+                room = p.want_lines - p.min_lines
+                give = min(max(0, room), spare)
+                panel_bodies[i] += give
+                spare -= give
+
+            # Trim each panel to its own budget and render
             render_w = max(18, int(term_w) - 2)
-            for p in panels:
-                out.extend(_panel_lines(p.title, list(p.lines), render_w))
+            for i, p in enumerate(row.panels):
+                trimmed = trim_panel(p, panel_bodies[i])
+                out.extend(_panel_lines(trimmed.title, list(trimmed.lines), render_w))
             continue
+
+        # Side-by-side layout: all panels get the same body height
+        panels = [trim_panel(p, body) for p in row.panels]
         widths = _weighted_panel_widths(
             [p.weight for p in panels], term_w=term_w, gap=gap_v, min_panel_width=min_w
         )

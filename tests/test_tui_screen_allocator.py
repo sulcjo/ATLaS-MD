@@ -186,18 +186,30 @@ def test_compose_rows_never_exceeds_a_very_narrow_terminal_single_panel():
 
 
 def test_allocate_rows_prices_stacked_layouts_correctly():
-    """Verify allocator prices stacked rows for narrow terminals."""
-    # A 2-panel row: 3 lines each. Side-by-side: max(3) + 4 = 7 lines
-    # Stacked: 3 + 3 + 4 + 4 = 14 lines
+    """Verify allocator and composer split stacked row budgets across panels.
+
+    This test ensures that when panels stack, each panel gets a portion of the
+    body budget, not the full budget. The key is panels with content longer than
+    min_lines so truncation reveals whether the split is correct.
+    """
+    # Two panels: each with min_lines=1, want_lines=3, but 10 real content lines.
+    # Side-by-side: max(1, 1) + 4 = 5 lines total
+    # Stacked: (1 + 1) + 4 + 4 = 10 lines total
+    # With term_w=50 the panels stack.
     row = Row(panels=(
-        Panel(key="a", title="left", lines=("l1", "l2", "l3"), min_lines=3, want_lines=3),
-        Panel(key="b", title="right", lines=("r1", "r2", "r3"), min_lines=3, want_lines=3),
+        Panel(key="a", title="left", lines=tuple(f"l{i}" for i in range(10)),
+              min_lines=1, want_lines=3),
+        Panel(key="b", title="right", lines=tuple(f"r{i}" for i in range(10)),
+              min_lines=1, want_lines=3),
     ))
-    # With term_w=50, should stack. Budget = 15 should be enough for stacked (14).
-    allocated, dropped = allocate_rows([row], budget=15, term_w=50)
+    # Budget of 10 is just enough for stacked at min_lines (1+1+4+4).
+    allocated, dropped = allocate_rows([row], budget=10, term_w=50)
     assert len(allocated) == 1
     assert dropped == ()
     row_out, body_lines = allocated[0]
-    # Compose and verify it fits
+    # Compose and verify line count does not exceed budget.
+    # The critical assertion: if the body budget is not split across panels,
+    # the second panel would try to trim to 10 lines, causing both panels to
+    # render 10+ lines each, and the total would exceed 10.
     out = compose_rows([(row_out, body_lines)], term_w=50)
-    assert len(out) <= 15
+    assert len(out) <= 10, f"Composed {len(out)} lines, budget was 10"
