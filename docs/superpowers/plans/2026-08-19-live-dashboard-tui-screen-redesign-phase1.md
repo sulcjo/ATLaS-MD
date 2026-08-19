@@ -31,7 +31,7 @@
 | `gareus/tui_screen.py` | create | Domain-free: `Panel`, `Row`, `allocate_rows`, `trim_panel`, `frame_tiers`, `compose_rows`. Knows nothing about MD. |
 | `gareus/dashboard/__init__.py` | create | Package marker; re-exports `render_screen`. |
 | `gareus/dashboard/sidecar.py` | create | `SidecarSnapshot`, `SidecarCache` — mtime-polled JSON reads, run-root discovery. |
-| `gareus/dashboard/ranking.py` | create | `WindowStatus`, `rank_windows`, `tail_summary`, `Hysteresis`. |
+| `gareus/dashboard/ranking.py` | create | `WindowStatus`, `rank_windows`, `Hysteresis`. |
 | `gareus/dashboard/context.py` | create | `DashboardContext` frozen snapshot + `build_context`. |
 | `gareus/dashboard/panels.py` | create | Panel-producing functions ported from `logger.py`'s `_render_*`. |
 | `gareus/dashboard/spine.py` | create | `spine_lines(ctx, lines_budget)` — 10-line and 5-line variants. |
@@ -722,12 +722,17 @@ git commit -m "feat(dashboard): add mtime-gated sidecar JSON cache"
 
 **Interfaces:**
 - Consumes: `gareus.units.K_B_KJ_PER_MOL_K`, `gareus.units.KJ_PER_KCAL`.
-- Produces: `OK`/`WARN`/`BAD` string constants; `WindowStatus` (frozen dataclass: `window: int`, `severity: int`, `status: str`, `reasons: tuple[str, ...]`); `restraint_sigma(k_kcal_per_a2: float, temperature_k: float) -> float`; `rank_windows(*, n_windows, centers_a, k_list, acceptance_by_window, overlap_by_pair, delta_by_window, temperature_k) -> tuple[WindowStatus, ...]`; `tail_summary(hidden: Sequence[WindowStatus]) -> str`; `Hysteresis(frames: int = 5)` with `update(bad_keys: Iterable[str]) -> frozenset[str]`.
+- Produces: `OK`/`WARN`/`BAD` string constants; `WindowStatus` (frozen dataclass: `window: int`, `severity: int`, `status: str`, `reasons: tuple[str, ...]`); `restraint_sigma(k_kcal_per_a2: float, temperature_k: float) -> float`; `rank_windows(*, n_windows, centers_a, k_list, acceptance_by_window, overlap_by_pair, delta_by_window, temperature_k) -> tuple[WindowStatus, ...]`; `Hysteresis(frames: int = 5)` with `update(bad_keys: Iterable[str]) -> frozenset[str]`.
 
 Severity is the first matching rule; higher `severity` number is worse, so sorting is
 `(-severity, window)`. Rules, from the spec §8: dead exchange (<0.02) → overlap < 0.10 →
 |Δ| > 2σ → samples below half the median (Phase 2, not evaluated here) → per-window
 anharmonicity (Phase 2) → acceptance < 0.15.
+
+**Tail composition lives in `gareus/tui_screen.py`, not here.** An earlier draft of this
+plan also gave `ranking.py` a `tail_summary(hidden)` helper. It was removed once
+`trim_panel` gained `line_statuses`: only the allocator knows how many lines get hidden, so
+a second severity-counting implementation here would be dead code duplicating live logic.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -742,7 +747,6 @@ from gareus.dashboard.ranking import (
     Hysteresis,
     rank_windows,
     restraint_sigma,
-    tail_summary,
 )
 
 
@@ -805,13 +809,6 @@ def test_low_but_not_dead_acceptance_is_a_warning():
 def test_ties_break_by_window_index_so_order_is_stable():
     statuses = _rank(delta_by_window={0: 3.0, 1: 0.0, 2: 3.0, 3: 0.0})
     assert [s.window for s in statuses[:2]] == [0, 2]
-
-
-def test_tail_summary_reports_composition_of_hidden_entries():
-    hidden = _rank(acceptance_by_window={0: 0.001, 1: 0.11, 2: 0.30, 3: 0.30})
-    assert tail_summary(hidden) == "+4 more (1 bad, 1 warn)"
-    assert tail_summary([s for s in hidden if s.status == OK]) == "+2 more (all ok)"
-    assert tail_summary([]) == ""
 
 
 def test_hysteresis_keeps_a_recovered_key_for_the_configured_frames():
@@ -930,20 +927,6 @@ def rank_windows(
     return tuple(sorted(out, key=lambda s: (-s.severity, s.window)))
 
 
-def tail_summary(hidden: Sequence[WindowStatus]) -> str:
-    """Describe what a truncated list is not showing, by severity."""
-    if not hidden:
-        return ""
-    bad = sum(1 for s in hidden if s.status == BAD)
-    warn = sum(1 for s in hidden if s.status == WARN)
-    if not bad and not warn:
-        return f"+{len(hidden)} more (all ok)"
-    parts = [f"{bad} bad"] if bad else []
-    if warn:
-        parts.append(f"{warn} warn")
-    return f"+{len(hidden)} more ({', '.join(parts)})"
-
-
 class Hysteresis:
     """Hold a key in its ranked slot until it has been clear for `frames` frames."""
 
@@ -966,7 +949,6 @@ class Hysteresis:
 __all__ = [
     "BAD", "DEAD_ACCEPTANCE", "DEAD_OVERLAP", "Hysteresis", "LOW_ACCEPTANCE", "OK",
     "PINNED_SIGMA_MULTIPLE", "WARN", "WindowStatus", "rank_windows", "restraint_sigma",
-    "tail_summary",
 ]
 ```
 
@@ -1410,7 +1392,7 @@ git commit -m "feat(dashboard): add frozen DashboardContext snapshot"
 - Read (source of the ports): `gareus/logger.py:634-1137`
 
 **Interfaces:**
-- Consumes: Task 1's `Panel`; Task 4's `rank_windows`, `tail_summary`, `restraint_sigma`, `OK`/`WARN`/`BAD`; Task 5's `DashboardContext`.
+- Consumes: Task 1's `Panel`; Task 4's `rank_windows`, `restraint_sigma`, `OK`/`WARN`/`BAD`; Task 5's `DashboardContext`. Tail composition is **not** imported from `ranking`: `gareus.tui_screen.trim_panel` owns it, driven by each panel's `line_statuses`.
 - Produces: `panel(key, title, lines, *, min_lines, want_lines, priority, weight=1.0, line_statuses=()) -> Panel`; `overlap_panel(ctx) -> Panel`; `boost_envelope_panel(ctx) -> Panel`; `cv_map_panel(ctx, bar_width) -> Panel`; `pe_map_panel(ctx, bar_width) -> Panel`; `exchange_panel(ctx) -> Panel`; `pull_panel(ctx) -> Panel`; `replica_table_panel(ctx, ncols) -> Panel`; `window_table_panel(ctx, statuses) -> Panel`; `window_detail_panel(ctx, window) -> Panel`.
 
 **Port rule.** Each source method returns `list[str]` whose first element is its own title
@@ -1619,7 +1601,7 @@ from ..math_helpers import boost_anharmonicity
 from ..tui import _mini_bar
 from ..tui_screen import Panel
 from .context import DashboardContext
-from .ranking import BAD, DEAD_OVERLAP, OK, WARN, WindowStatus, restraint_sigma, tail_summary
+from .ranking import BAD, DEAD_OVERLAP, OK, WARN, WindowStatus, restraint_sigma
 
 _K0_SATURATED = 0.999
 

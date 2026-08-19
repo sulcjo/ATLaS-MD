@@ -107,8 +107,9 @@ panels their budget instead of panels rendering blind.
 ### 5.3 Severity-ranked truncation
 
 Every list panel carries a rank key. Truncation keeps the *worst* k entries; the tail line
-reports composition, e.g. `+24 more (all ok, min 0.31)` versus
-`+9 more (2 warn, 1 bad)`.
+is composed at trim time from the hidden slice (the panel cannot know how many lines the
+allocator will hide) and reports composition, worst severity first, e.g. `+24 more (all ok)` versus
+`+9 more (1 bad, 2 warn)`.
 
 ### 5.4 Two data tiers
 
@@ -420,7 +421,7 @@ class Panel:
     min_lines: int
     want_lines: int
     priority: int
-    tail: str = ""               # "+24 more (2 warn, 1 bad)" when trimmed
+    line_statuses: tuple[str, ...] = ()   # one severity label per line, for the tail
 
 def allocate(
     panels: Sequence[Panel], budget: int
