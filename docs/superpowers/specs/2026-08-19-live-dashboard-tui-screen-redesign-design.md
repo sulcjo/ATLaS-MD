@@ -136,7 +136,10 @@ allocator will hide) and reports composition, worst severity first, e.g. `+24 mo
     `remaining_ns`, and an `events[]` ledger (per segment: `label`, `kind`,
     `consumed_ns`, `n_states`, `steps_per_state`, `remaining_ns_after`).
   - `global_shared_gamd_setup/shared_gamd_setup_globals.json` — `sigma0_*` (target),
-    `sigmaV_*` (achieved), `k0_*`, `joint_envelope`, `recalibration_history`.
+    `sigmaV_*` (achieved), `k0_*`, `joint_envelope`, `recalibration_history`. Note
+    `joint_envelope` holds the *pre-recalibration* calibration; when
+    `recalibration_history` is present its `*_after` values are the envelope actually
+    in force, and panels must prefer them (verified on a real run: 10.77 vs 11.04 kJ).
   - `adaptive_production/adaptive_quality_gate.json`, and the umbrella-seeding quality
     report (for `pull_crash_fallback_unpulled` flags).
 
@@ -224,7 +227,7 @@ Each view must fit its worst case in 24 body lines (a 35-line terminal) and expa
 ### 7.1 View 1 — PROGRESS
 
 ```
-PROGRESS   28 pool events   projection at current throughput                              [2] physics  [3] windows
+PROGRESS   27 pool events   projection at current throughput                              [2] physics  [3] windows
 ┌ campaign timeline ─────────────────────────────────────────────────────────────────────────────────────────┐
 │ epoch_000          ████████████████████████                              1875.0 ns  27 st  ✓ done         │
 │ final/baseline     ▏                                                       14.5 ns  29 st  ✓ done         │

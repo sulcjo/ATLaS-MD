@@ -1393,7 +1393,7 @@ git commit -m "feat(dashboard): add frozen DashboardContext snapshot"
 
 **Interfaces:**
 - Consumes: Task 1's `Panel`; Task 4's `rank_windows`, `restraint_sigma`, `OK`/`WARN`/`BAD`; Task 5's `DashboardContext`. Tail composition is **not** imported from `ranking`: `gareus.tui_screen.trim_panel` owns it, driven by each panel's `line_statuses`.
-- Produces: `panel(key, title, lines, *, min_lines, want_lines, priority, weight=1.0, line_statuses=()) -> Panel`; `overlap_panel(ctx) -> Panel`; `boost_envelope_panel(ctx) -> Panel`; `cv_map_panel(ctx, bar_width) -> Panel`; `pe_map_panel(ctx, bar_width) -> Panel`; `exchange_panel(ctx) -> Panel`; `pull_panel(ctx) -> Panel`; `replica_table_panel(ctx, ncols) -> Panel`; `window_table_panel(ctx, statuses) -> Panel`; `window_detail_panel(ctx, window) -> Panel`.
+- Produces: `panel(key, title, lines, *, min_lines, want_lines, priority, weight=1.0, line_statuses=()) -> Panel`; `live_gamd_envelope(gamd) -> dict`; `overlap_panel(ctx) -> Panel`; `boost_envelope_panel(ctx) -> Panel`; `cv_map_panel(ctx, bar_width) -> Panel`; `pe_map_panel(ctx, bar_width) -> Panel`; `exchange_panel(ctx) -> Panel`; `pull_panel(ctx) -> Panel`; `replica_table_panel(ctx, ncols) -> Panel`; `window_table_panel(ctx, statuses) -> Panel`; `window_detail_panel(ctx, window) -> Panel`.
 
 **Port rule.** Each source method returns `list[str]` whose first element is its own title
 line, which `_render_dashboard` strips with `[1:]`. Ported functions drop the title line
@@ -1655,6 +1655,44 @@ def overlap_panel(ctx: DashboardContext) -> Panel:
                  line_statuses=statuses)
 
 
+def live_gamd_envelope(gamd: "Mapping[str, object] | None") -> dict:
+    """The GaMD envelope actually in force — not the one first calibrated.
+
+    ``joint_envelope`` records the calibration frozen before production. If the
+    run later recalibrated from real epoch-0 sampling (``recalibration_history``,
+    which fires at most once), the ``*_after`` values are what the integrator is
+    actually running. Verified against a real run: ``joint_envelope`` held
+    ``sigmaV 10.7737`` while both the live integrator globals and the
+    recalibration record held ``11.0394`` — so reading ``joint_envelope`` alone
+    displays a stale envelope for the entire post-epoch-0 run, which is most of it.
+
+    ``sigma0`` is the calibration *target* and is not changed by recalibration, so
+    it always comes from ``joint_envelope``.
+    """
+    payload = dict(gamd or {})
+    envelope = payload.get("joint_envelope") or {}
+    if not isinstance(envelope, dict) or not envelope:
+        return {}
+    group_name, group = next(iter(envelope.items()))
+    out = dict(group if isinstance(group, dict) else {})
+    out["group"] = str(group_name)
+    history = payload.get("recalibration_history") or []
+    if isinstance(history, list) and history and isinstance(history[-1], dict):
+        last = history[-1]
+        recal = ((last.get("groups") or {}).get(group_name)) or {}
+        for src, dst in (
+            ("sigmaV_after_kj_mol", "sigmaV_kj_mol"),
+            ("k0_after", "k0"),
+            ("threshold_energy_after_kj_mol", "threshold_energy_kj_mol"),
+        ):
+            if src in recal:
+                out[dst] = recal[src]
+        if "sigmaV_before_kj_mol" in recal:
+            out["sigmaV_before_kj_mol"] = recal["sigmaV_before_kj_mol"]
+        out["recalibrated_from_epoch"] = last.get("recalibrated_from_epoch")
+    return out
+
+
 def boost_envelope_panel(ctx: DashboardContext) -> Panel:
     """GaMD envelope: achieved sigma vs calibration target, k0 saturation, shape.
 
@@ -1662,8 +1700,7 @@ def boost_envelope_panel(ctx: DashboardContext) -> Panel:
     from live boost samples. A run with no GaMD says so rather than rendering
     an empty box.
     """
-    envelope = ((ctx.sidecar.gamd or {}).get("joint_envelope") or {})
-    group = next(iter(envelope.values()), {}) if isinstance(envelope, dict) else {}
+    group = live_gamd_envelope(ctx.sidecar.gamd)
     boosts = [b for b in ctx.boost_history_all if math.isfinite(b)]
     if not group and not boosts:
         return panel("boost", "GaMD boost envelope",
@@ -1692,6 +1729,12 @@ def boost_envelope_panel(ctx: DashboardContext) -> Panel:
             k0_label = "SATURATED at ceiling" if k0 >= _K0_SATURATED else OK
             role = ROLE_BAD if k0 >= _K0_SATURATED else ROLE_GOOD
             lines.append(f"  k0 {k0:.2f}  " + role_text(k0_label, role))
+        epoch = group.get("recalibrated_from_epoch")
+        if epoch is not None:
+            before = float(group.get("sigmaV_before_kj_mol", float("nan")))
+            lines.append(
+                f"  recalibrated after epoch {epoch}: σΔV {before:.2f} → {sigma_v:.2f} kJ"
+            )
     return panel("boost", "GaMD boost envelope", lines,
                  min_lines=5, want_lines=11, priority=1)
 ```
@@ -1940,6 +1983,7 @@ import numpy as np
 from ..colors import ROLE_BAD, ROLE_GOOD, ROLE_WARN, color_text, role_text
 from ..tui import _ansi_truncate, _coverage_bar, format_duration, make_progress_bar, strip_ansi_len
 from .context import DashboardContext
+from .panels import live_gamd_envelope
 from .ranking import BAD, OK, WARN, rank_windows, restraint_sigma
 
 FULL_SPINE_LINES = 10
@@ -2034,7 +2078,9 @@ def _run_line(ctx: DashboardContext, width: int) -> str:
 
 
 def _gamd_line(ctx: DashboardContext) -> str:
-    group = next(iter(((ctx.sidecar.gamd or {}).get("joint_envelope") or {}).values()), {})
+    # Same helper the boost panel uses: never re-read `joint_envelope` directly,
+    # or the spine shows the pre-recalibration envelope for most of the run.
+    group = live_gamd_envelope(ctx.sidecar.gamd)
     if not group:
         return "gamd  " + color_text("no GaMD boost (plain umbrella run)", "dim")
     sigma_v = float(group.get("sigmaV_kj_mol", float("nan")))
