@@ -1034,6 +1034,9 @@ def test_build_context_copies_histories_into_immutable_tuples(tmp_path):
     assert ctx.temperature_k == 310.0
     assert ctx.n_windows == 4
     assert ctx.is_2d is False
+    # render_distance_ascii needs per-replica history and the ascii knobs too.
+    assert ctx.cv_history_by_replica == {}
+    assert (ctx.ascii_mode, ctx.ascii_max_replicas) == ("hist3d", 32)
 
 
 def test_build_context_marks_a_2d_run_and_records_its_secondary_cv_type(tmp_path):
@@ -1193,6 +1196,7 @@ class DashboardContext:
     rows: tuple[Mapping[str, Any], ...]
     summary: Mapping[str, Any]
     cv_history_by_window: Mapping[int, tuple[float, ...]]
+    cv_history_by_replica: Mapping[int, tuple[float, ...]]
     secondary_history_by_window: Mapping[int, tuple[float, ...]]
     pe_history_by_replica: Mapping[int, tuple[float, ...]]
     boost_history_all: tuple[float, ...]
@@ -1207,6 +1211,8 @@ class DashboardContext:
     primary_cv_label: str
     primary_cv_units: str
     primary_k_units: str
+    ascii_mode: str = "hist3d"
+    ascii_max_replicas: int = 32
     sidecar: SidecarSnapshot = field(default_factory=SidecarSnapshot)
     view: str = "progress"
     glyphs: str = "unicode"
@@ -1313,6 +1319,7 @@ def build_context(
         rows=tuple(dict(r) for r in rows),
         summary=dict(summary),
         cv_history_by_window=hist_windows,
+        cv_history_by_replica=_tuple_map(getattr(logger, "history_by_replica", {})),
         secondary_history_by_window=_tuple_map(
             getattr(logger, "secondary_history_by_window", {})),
         pe_history_by_replica=_tuple_map(getattr(logger, "potential_history_by_replica", {})),
@@ -1330,6 +1337,8 @@ def build_context(
         primary_cv_label=str(info.get("primary_cv_label", "primary CV")),
         primary_cv_units=str(info.get("primary_cv_units", "")),
         primary_k_units=str(info.get("primary_k_units", "")),
+        ascii_mode=str(getattr(logger, "ascii_mode", "hist3d") or "hist3d"),
+        ascii_max_replicas=int(getattr(logger, "ascii_max_replicas", 32) or 32),
         sidecar=sidecar,
         view=str(view),
         glyphs=str(glyphs),
@@ -1664,9 +1673,42 @@ def boost_envelope_panel(ctx: DashboardContext) -> Panel:
                  min_lines=5, want_lines=11, priority=1)
 ```
 
-Then port, in this order, following the table and the substitution rule:
-`cv_map_panel` (wraps `gareus.tui.render_distance_ascii` and drops its first three
-header lines exactly as `logger.py:2497-2500` does today), `pe_map_panel`,
+`cv_map_panel` is the one function that is *not* a `self.X -> ctx.X` substitution: it wraps
+`gareus.tui.render_distance_ascii`, whose full signature is `(rows, phase, step,
+total_steps, width, max_replicas, mode, history_by_replica, history_by_window,
+histogram_source, primary_label, primary_units, primary_k_unit_label)`. Every argument comes
+from `ctx` (including the `cv_history_by_replica`, `ascii_mode` and `ascii_max_replicas`
+fields added in Task 5), and its first three lines — its own border, title and separator —
+are dropped because the Panel now supplies them, exactly as `gareus/logger.py:2497-2500`
+does today. Written out:
+
+```python
+def cv_map_panel(ctx: DashboardContext, bar_width: int) -> Panel:
+    """Per-window CV distributions: the densest panel on the dashboard."""
+    if ctx.ascii_mode == "none":
+        return panel("cv_map", "per-window CV distributions",
+                     [color_text("disabled (--distance-ascii-mode none)", "dim")],
+                     min_lines=1, want_lines=2, priority=2, weight=2.4)
+    block = render_distance_ascii(
+        [dict(r) for r in ctx.rows], phase=ctx.phase, step=ctx.step,
+        total_steps=ctx.total_steps, width=int(bar_width),
+        max_replicas=ctx.ascii_max_replicas, mode=ctx.ascii_mode,
+        history_by_replica={k: list(v) for k, v in ctx.cv_history_by_replica.items()},
+        history_by_window={k: list(v) for k, v in ctx.cv_history_by_window.items()},
+        histogram_source="window", primary_label=ctx.primary_cv_label,
+        primary_units=ctx.primary_cv_units, primary_k_unit_label=ctx.primary_k_units,
+    )
+    lines = block.splitlines()
+    if len(lines) > 4:
+        lines = lines[3:]                 # drop its own border/title/separator
+    return panel("cv_map", "per-window CV distributions",
+                 lines or [color_text("no samples yet", "dim")],
+                 min_lines=6, want_lines=18, priority=2, weight=2.4)
+```
+
+(add `from ..tui import _mini_bar, render_distance_ascii` to the imports).
+
+Then port, in this order, following the table and the substitution rule: `pe_map_panel`,
 `exchange_panel`, `pull_panel`, `replica_table_panel`, and write the two new ones:
 
 ```python
@@ -3058,15 +3100,30 @@ def _render_at(monkeypatch, logger, term_w, term_h):
 Run: `python -m pytest tests/test_dashboard_tui_scaling.py tests/test_dashboard_scaling_integration.py tests/test_dashboard_screen.py -v`
 Expected: all pass (20 pre-existing + 10 new)
 
-- [ ] **Step 6: Verify against the real frame harness**
+- [ ] **Step 6: Point the evidence harness at the new entrypoint**
 
-Run: `python tests/manual_render_dashboard_frame.py`
-Expected: `dropped` is `0` and `loss` is `0%` for all three cases — the whole point of the change.
+`tests/manual_render_dashboard_frame.py` calls `logger._render_dashboard`, which this task
+deletes, so it must be updated in the same commit or it breaks. In its `render_frame`, set
+the view and call the new method:
+
+```python
+    logger.tui_view = "windows"          # densest view, closest to the old single frame
+    _force_terminal_size(term_w, term_h)
+    return logger._render_screen_frame(
+        rows, "gareus_production", info["display_step"],
+        info["display_total_steps"], logger.summarize(rows), info,
+    )
+```
+
+Then run it: `python tests/manual_render_dashboard_frame.py`
+Expected: `dropped` is `0` and `loss` is `0%` for all three cases — the whole point of the
+change. Before this rework the same harness reported 27/33%, 47/52% and 43/44%.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add gareus/logger.py tests/test_dashboard_scaling_integration.py tests/test_dashboard_screen.py
+git add gareus/logger.py tests/test_dashboard_scaling_integration.py \
+        tests/test_dashboard_screen.py tests/manual_render_dashboard_frame.py
 git commit -m "refactor(dashboard): render the live frame through the screen engine"
 ```
 
@@ -3100,6 +3157,9 @@ import pytest
 
 from gareus import cli
 
+# Verified against this checkout: `cli.parse_args(["--seq", "AAAA", "--out", "out"])`
+# succeeds and yields tui_mode='dashboard', color='auto', dashboard_density='auto',
+# distance_ascii_max_replicas=32 -- i.e. the shim's values, pre-change.
 BASE = ["--seq", "AAAA", "--out", "out"]      # minimal accepted invocation
 
 
