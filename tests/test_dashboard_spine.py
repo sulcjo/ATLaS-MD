@@ -157,6 +157,37 @@ def test_win_and_exchange_strips_are_offset_by_one_column(tmp_path):
     assert exch_line[:win_strip_start + 1] == "exch    "
 
 
+def test_alert_line_carries_the_literal_status_word_not_just_the_reason(tmp_path):
+    """`SATURATED`/`ok` already appear as literal text on the gamd line; `BAD`
+    now does too on the identity line's verdict (see the fix above). The alert
+    line itself used to print only `s.reasons` ("low accept 0.12"), never the
+    window's own `BAD`/`WARN` status word -- this fixture builds a window pair
+    with real overlap (so the overlap check doesn't out-rank it) and a low but
+    not-dead acceptance rate, landing it squarely in WARN, to pin that the
+    alert line surfaces the status word itself.
+    """
+    n = 5
+    centers = [0.3 * i for i in range(n)]
+    logger = DistanceLogger(tmp_path, argparse.Namespace(timestep_fs=2.0), no_file_persistence=True)
+    for w in range(n):
+        logger.history_by_window[w] = [centers[w] + 0.15 * (i % 5 - 2) for i in range(50)]
+    rows = [{"replica": w, "window": w, "center_A": centers[w], "k_kcal_mol_A2": 2.5,
+             "cv_A": centers[w] + 0.01} for w in range(n)]
+    exchange_stats = {f"{i}-{i+1}": {"attempts": 40, "accepted": 20} for i in range(n - 1)}
+    exchange_stats["0-1"] = {"attempts": 40, "accepted": 5}   # 0.125: WARN, not dead
+    ctx = build_context(
+        logger=logger, rows=rows, phase="gareus_production", step=1000, total_steps=100000,
+        summary={}, dashboard_info={
+            "centers_a": centers, "n_windows": n, "k_list": [2.5] * n,
+            "exchange_stats": exchange_stats,
+            "primary_cv_label": "contacts", "primary_cv_units": "A"},
+        sidecar=SidecarSnapshot(), term_w=140, term_h=45, now=1000.0,
+        view="progress", glyphs="unicode",
+    )
+    text = strip_ansi("\n".join(spine_lines(ctx, FULL_SPINE_LINES)))
+    assert "WARN" in text
+
+
 def test_run_and_pool_bars_fit_without_needing_ellipsis_truncation(tmp_path):
     """The elastic middle must be sized from the *measured* width of the fixed
     parts including the bracket characters -- omitting the brackets from the

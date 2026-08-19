@@ -21,7 +21,7 @@ from ..colors import ROLE_BAD, ROLE_GOOD, ROLE_WARN, color_text, role_text
 from ..tui import _ansi_truncate, _coverage_bar, format_duration, make_progress_bar
 from .context import DashboardContext
 from .panels import live_gamd_envelope
-from .ranking import BAD, OK, WARN, WindowStatus, rank_windows
+from .ranking import BAD, DEAD_ACCEPTANCE, OK, WARN, WindowStatus, rank_windows
 
 FULL_SPINE_LINES = 10
 COMPACT_SPINE_LINES = 5
@@ -29,7 +29,6 @@ COMPACT_SPINE_LINES = 5
 _DENSITY_GLYPHS = " ▁▂▃▄▅▆▇█"
 _ASCII_GLYPHS = " .:-=+*#%"
 _K0_SATURATED = 0.999
-_DEAD_PAIR_ACCEPTANCE = 0.02
 
 
 def bucket_strip(
@@ -147,7 +146,10 @@ def _gamd_line(ctx: DashboardContext) -> str:
 
 
 def _alert_line(ranked: Sequence[WindowStatus]) -> str:
-    alerts = [f"w{s.window:02d} " + ", ".join(s.reasons) for s in ranked
+    # Each entry leads with its own status word (not just the reason text) so
+    # BAD/WARN survive here as literal text too, the same as SATURATED/ok do
+    # on the gamd line -- status is never colour-only anywhere on the spine.
+    alerts = [f"w{s.window:02d} {s.status} " + ", ".join(s.reasons) for s in ranked
               if s.status in {BAD, WARN}][:2]
     if not alerts:
         return "alert " + color_text("none", "dim")
@@ -172,7 +174,7 @@ def spine_lines(ctx: DashboardContext, lines_budget: int) -> tuple[str, ...]:
     cells = max(8, width - 60)
     win_strip = bucket_strip(counts, statuses, cells=cells, glyphs=ctx.glyphs)
     accept = [ctx.acceptance_pairs.get((w, w + 1), float("nan")) for w in range(ctx.n_windows - 1)]
-    pair_status = [BAD if (math.isfinite(a) and a < _DEAD_PAIR_ACCEPTANCE) else OK for a in accept]
+    pair_status = [BAD if (math.isfinite(a) and a < DEAD_ACCEPTANCE) else OK for a in accept]
     exch_strip = bucket_strip(accept, pair_status, cells=cells, glyphs=ctx.glyphs)
     finite_acc = [a for a in accept if math.isfinite(a)]
 
