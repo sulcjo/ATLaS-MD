@@ -1095,6 +1095,20 @@ def test_acceptance_by_pair_reads_the_real_nested_payload_shape():
     assert set(pairs) == {(0, 1), (1, 2), (2, 3)}   # run-level totals are not pairs
 
 
+def test_roundtrip_state_snapshot_survives_in_place_mutation(tmp_path):
+    """`_update_history` mutates these per-replica dicts in place all run."""
+    logger = DistanceLogger(tmp_path, argparse.Namespace(), no_file_persistence=True)
+    logger.roundtrip_state[0] = {"side": "low", "roundtrips": 1, "min": 0, "max": 3}
+    ctx = build_context(
+        logger=logger, rows=_rows(), phase="p", step=1, total_steps=2, summary={},
+        dashboard_info={"centers_a": [4.0], "n_windows": 1},
+        sidecar=SidecarSnapshot(), term_w=100, term_h=30, now=1.0,
+        view="progress", glyphs="unicode",
+    )
+    logger.roundtrip_state[0]["roundtrips"] = 99
+    assert ctx.roundtrip_state[0]["roundtrips"] == 1
+
+
 def test_exchange_stats_snapshot_survives_in_place_mutation_of_the_source():
     """production.py mutates one long-lived exchange_stats dict for the whole
     run, so a shallow copy would let the render thread see a torn read."""
@@ -1350,6 +1364,7 @@ class DashboardContext:
     boost_history_all: tuple[float, ...]
     window_trace_by_replica: Mapping[int, tuple[int, ...]]
     exchange_stats: Mapping[str, Any]
+    roundtrip_state: Mapping[int, Mapping[str, Any]]
     acceptance_pairs: Mapping[tuple[int, int], float]
     acceptance_windows: Mapping[int, float]
     overlap_pairs: Mapping[tuple[int, int], float]
@@ -1497,6 +1512,13 @@ def build_context(
             for k, v in (getattr(logger, "window_trace_by_replica", {}) or {}).items()
         },
         exchange_stats=_copy_exchange_stats(info.get("exchange_stats")),
+        # One level deep, for the same reason as exchange_stats: `_update_history`
+        # mutates these dicts in place all run (gareus/logger.py:525-537).
+        roundtrip_state={
+            int(k): dict(v) for k, v in
+            (getattr(logger, "roundtrip_state", {}) or {}).items()
+            if isinstance(v, Mapping)
+        },
         acceptance_pairs=pairs,
         acceptance_windows=acceptance_by_window(pairs, n_windows),
         overlap_pairs=overlap_by_pair(hist_windows, centers),
@@ -1573,6 +1595,12 @@ per-view panel lists:
 | `exchange_panel` | `exchange` | `_render_exchange_acceptance` (`:680`) | 4 | 10 | 2 | 1.15 |
 | `pull_panel` | `pull` | `_render_pull_map` (`:771`) | 4 | 10 | 3 | 1.0 |
 | `replica_table_panel` | `replicas` | `_render_replica_table` (`:974`) | 4 | 16 | 2 | 1.5 |
+
+`replica_table_panel`'s round-trip and span columns come from `ctx.roundtrip_state`, an
+exact lifetime counter. Do **not** approximate them from `window_trace_by_replica`: that
+deque is capped at 200 transitions, so the approximation is exact on a short run and
+silently undercounts on a long one — the worst failure shape, since it looks right
+in every test.
 | `window_table_panel` | `windows` | new, from `statuses` + `ctx` | 4 | 16 | 1 | 1.0 |
 | `window_detail_panel` | `detail-w<NN>` | new, from `ctx` + selected window | 6 | 11 | 1 | 1.0 |
 
@@ -1707,6 +1735,27 @@ def test_window_table_panel_puts_the_worst_window_first(tmp_path):
     body = [l for l in lines if l.strip().startswith("w")]
     assert body[0].split()[0] == "w02"
     assert BAD in body[0]
+
+
+def test_window_detail_panel_reads_the_trace_of_the_replica_in_that_window(tmp_path):
+    """The trace map is replica-keyed, so a fixture where replica != window is
+    the only shape that can catch indexing it by window index."""
+    args = argparse.Namespace(timestep_fs=2.0, temperature_k=300.0)
+    logger = DistanceLogger(tmp_path, args, no_file_persistence=True)
+    logger.window_trace_by_replica[7] = [2, 3, 2]      # replica 7 sits in window 2
+    logger.window_trace_by_replica[2] = [9, 9, 9]      # decoy: replica 2's own trail
+    rows = [{"replica": 7, "window": 2, "center_A": 5.10, "k_kcal_mol_A2": 2.5,
+             "cv_A": 5.15, "umbrella_bias_kcal_mol": 0.0, "umbrella_pull_kcal_mol_A": 0.0}]
+    ctx = build_context(
+        logger=logger, rows=rows, phase="gareus_production", step=1, total_steps=10,
+        summary={}, dashboard_info={"centers_a": list(CENTERS), "n_windows": 4,
+                                   "k_list": [2.5] * 4},
+        sidecar=SidecarSnapshot(), term_w=140, term_h=45, now=1000.0,
+        view="windows", glyphs="unicode",
+    )
+    text = strip_ansi("\n".join(window_detail_panel(ctx, 2).lines))
+    assert "r07" in text
+    assert "w09" not in text          # replica 2's decoy trail must not appear
 
 
 def test_window_detail_panel_names_the_window_and_its_restraint(tmp_path):
@@ -1851,7 +1900,11 @@ def boost_envelope_panel(ctx: DashboardContext) -> Panel:
     """
     group = live_gamd_envelope(ctx.sidecar.gamd)
     boosts = [b for b in ctx.boost_history_all if math.isfinite(b)]
-    if not group and not boosts:
+    # Key on the envelope alone: no calibration payload means no GaMD run. Also
+    # requiring `not boosts` would suppress this line for a run that has boost
+    # samples but no readable calibration, which is the shape a plain-umbrella
+    # fixture actually produces. Task 7's `_gamd_line` guards identically.
+    if not group:
         return panel("boost", "GaMD boost envelope",
                      [color_text("no GaMD boost (plain umbrella run)", "dim")],
                      min_lines=5, want_lines=11, priority=1)
@@ -1859,7 +1912,7 @@ def boost_envelope_panel(ctx: DashboardContext) -> Panel:
     lines: list[str] = []
     if boosts:
         shape = boost_anharmonicity(boosts)
-        score = float(shape.get("anharmonicity_score", float("nan")))
+        score = float(shape.get("score", float("nan")))   # key is "score", not "anharmonicity_score"
         role = ROLE_BAD if score > 1.5 else (ROLE_WARN if score > 1.0 else ROLE_GOOD)
         lines.append(
             f"  boost {np.mean(boosts):.2f} ± {np.std(boosts):.2f} kcal/mol   "
@@ -1970,9 +2023,17 @@ def window_detail_panel(ctx: DashboardContext, window: int) -> Panel:
             other = b if a == w else a
             label = "DEAD" if math.isfinite(rate) and rate < 0.02 else OK
             lines.append(f"  exchange    w{other:02d} {rate:5.2f}  " + label)
-    trace = ctx.window_trace_by_replica.get(w, ())
+    # `window_trace_by_replica` is keyed by REPLICA (gareus/logger.py:520), so it
+    # must be indexed by whichever replica currently occupies this window -- not
+    # by the window index. Every fixture built replica == window, which is why no
+    # test could tell the two apart; on a real run after the first swap, indexing
+    # by window shows a different replica's trail.
+    replica = next((int(r["replica"]) for r in ctx.rows
+                    if int(r.get("window", -1)) == w), None)
+    trace = ctx.window_trace_by_replica.get(replica, ()) if replica is not None else ()
     if trace:
-        lines.append(f"  occupancy   windows visited: {', '.join(f'w{t:02d}' for t in trace[-6:])}")
+        lines.append(f"  occupancy   replica r{replica:02d}, windows visited: "
+                     + ", ".join(f"w{t:02d}" for t in trace[-6:]))
     return panel(f"detail-w{w:02d}", f"w{w:02d} detail", lines,
                  min_lines=6, want_lines=11, priority=1)
 ```
