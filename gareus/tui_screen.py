@@ -14,8 +14,23 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Sequence
 
+from .tui import (
+    ABSOLUTE_MIN_PANEL_WIDTH,
+    MIN_PANEL_WIDTH,
+    _join_columns,
+    _panel_lines,
+    _weighted_panel_widths,
+    dashboard_row_gap,
+)
+
 # Top border, title, separator, bottom border -- see gareus.tui._panel_lines.
 PANEL_CHROME_LINES = 4
+
+FULL_SPINE_LINES = 10
+COMPACT_SPINE_LINES = 5
+FOOTER_LINES = 1
+_FULL_SPINE_MIN_USABLE = 27   # a 10-line spine past this point is >36% of the screen
+_COMPACT_SPINE_MIN_USABLE = 19
 
 
 @dataclass(frozen=True)
@@ -129,11 +144,51 @@ def trim_panel(panel: Panel, body_lines: int) -> Panel:
     return replace(panel, lines=tuple(panel.lines[:keep]) + (tail,))
 
 
+def frame_tiers(term_h: int) -> tuple[int, int]:
+    """Split the terminal height into ``(spine_lines, body_budget)``.
+
+    One line is reserved to match ``gareus.tui._safe_tui_frame_text``'s own
+    reserve, and one more for the footer. Below 20 rows the view body is
+    dropped entirely and only the spine renders.
+    """
+    usable = max(1, int(term_h) - 1)
+    if usable >= _FULL_SPINE_MIN_USABLE:
+        return FULL_SPINE_LINES, max(0, usable - FULL_SPINE_LINES - FOOTER_LINES)
+    if usable >= _COMPACT_SPINE_MIN_USABLE:
+        return COMPACT_SPINE_LINES, max(0, usable - COMPACT_SPINE_LINES - FOOTER_LINES)
+    return usable, 0
+
+
+def compose_rows(
+    allocated: Sequence[tuple[Row, int]], term_w: int, gap: int | None = None
+) -> tuple[str, ...]:
+    """Render allocated rows to text lines, stacking when too narrow for columns."""
+    gap_v = dashboard_row_gap(term_w) if gap is None else int(gap)
+    usable = max(40, int(term_w) - 2)
+    out: list[str] = []
+    for row, body in allocated:
+        panels = [trim_panel(p, body) for p in row.panels]
+        n = len(panels)
+        min_w = max(ABSOLUTE_MIN_PANEL_WIDTH, MIN_PANEL_WIDTH)
+        if n > 1 and usable < n * min_w + (n - 1) * gap_v:
+            for p in panels:
+                out.extend(_panel_lines(p.title, list(p.lines), usable))
+            continue
+        widths = _weighted_panel_widths(
+            [p.weight for p in panels], term_w=term_w, gap=gap_v, min_panel_width=min_w
+        )
+        cols = [_panel_lines(p.title, list(p.lines), w) for p, w in zip(panels, widths)]
+        out.extend(_join_columns(cols, gap=gap_v))
+    return tuple(out)
+
+
 __all__ = [
     "PANEL_CHROME_LINES",
     "Panel",
     "Row",
     "allocate_rows",
+    "compose_rows",
+    "frame_tiers",
     "row_min",
     "row_priority",
     "row_want",

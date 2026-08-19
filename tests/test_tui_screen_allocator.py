@@ -1,10 +1,13 @@
 import pytest
 
+from gareus.tui import strip_ansi_len
 from gareus.tui_screen import (
     PANEL_CHROME_LINES,
     Panel,
     Row,
     allocate_rows,
+    compose_rows,
+    frame_tiers,
     row_min,
     row_want,
     trim_panel,
@@ -106,3 +109,56 @@ def test_trim_panel_composes_severity_tail_with_both_bad_and_warn():
     # Hidden statuses (from index 2) = (WARN, BAD, WARN, ok, ok)
     # BAD count = 1, WARN count = 2
     assert trimmed.lines[-1] == "+5 more (1 bad, 2 warn)"
+
+
+def test_frame_tiers_gives_the_full_spine_on_a_tall_terminal():
+    spine, body = frame_tiers(55)
+    assert spine == 10
+    assert body == 55 - 1 - 10 - 1
+
+
+def test_frame_tiers_keeps_the_full_spine_down_to_a_28_line_terminal():
+    assert frame_tiers(28)[0] == 10
+    assert frame_tiers(40)[0] == 10
+
+
+def test_frame_tiers_switches_to_the_compact_spine_between_20_and_27_lines():
+    assert frame_tiers(27)[0] == 5
+    assert frame_tiers(20)[0] == 5
+
+
+def test_frame_tiers_returns_a_spine_only_frame_below_20_lines():
+    spine, body = frame_tiers(18)
+    assert body == 0
+    assert spine == 17
+
+
+def test_compose_rows_lays_two_panels_side_by_side_within_the_terminal_width():
+    row = Row(panels=(
+        Panel(key="a", title="left", lines=("l1", "l2"), min_lines=2, want_lines=2, weight=2.4),
+        Panel(key="b", title="right", lines=("r1", "r2"), min_lines=2, want_lines=2, weight=0.9),
+    ))
+    out = compose_rows([(row, 2)], term_w=160)
+    assert all(strip_ansi_len(line) <= 160 - 2 for line in out)
+    assert len(out) == 2 + PANEL_CHROME_LINES
+    joined = "\n".join(out)
+    assert "left" in joined and "right" in joined
+
+
+def test_compose_rows_stacks_panels_vertically_on_a_narrow_terminal():
+    row = Row(panels=(
+        Panel(key="a", title="left", lines=("l1",), min_lines=1, want_lines=1),
+        Panel(key="b", title="right", lines=("r1",), min_lines=1, want_lines=1),
+    ))
+    out = compose_rows([(row, 1)], term_w=50)
+    # Two independently boxed panels, one above the other.
+    assert len(out) == 2 * (1 + PANEL_CHROME_LINES)
+    assert all(strip_ansi_len(line) <= 50 - 2 for line in out)
+
+
+def test_compose_rows_trims_panel_content_to_its_allocation():
+    row = Row(panels=(Panel(key="a", title="t", lines=tuple(f"line{i}" for i in range(9)),
+                            min_lines=1, want_lines=9),))
+    out = compose_rows([(row, 3)], term_w=120)
+    assert len(out) == 3 + PANEL_CHROME_LINES
+    assert "… 7 more" in "\n".join(out)
