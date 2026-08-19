@@ -299,7 +299,17 @@ WINDOWS   sorted worst-first   auto-selected w17   [j/k] move  [s] sort  [f] fil
 └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Panels: `windows — worst first` (1, min 4, want 16), `<win> detail` (1, min 6, want 11).
+Panels, in three rows: `windows — worst first` (priority 1, min 4, want 16); then the
+**CV + potential-energy maps row** carried over from today's dashboard — `per-window CV
+distributions` (priority 2, min 6, want 18, weight 2.4) beside `potential energy
+histograms` (priority 3, min 4, want 10, weight 0.9); then `<win> detail` (priority 1,
+min 6, want 11).
+
+The CV/PE row keeps today's `[2.4, 0.9]` weights and its `pe_bar_width = pe_panel_w - 24`
+arithmetic verbatim, so the 160×40 width pinned by
+`tests/test_dashboard_scaling_integration.py::test_pe_histogram_bar_width_pinned_at_160x40`
+is unchanged. It sits at priority 2-3 so a short terminal drops it before the ranked table
+or the detail panel — the two panels that answer "which window, and why".
 
 Selection: keys `j`/`k` when a tty is present; otherwise the **worst-ranked window is
 auto-selected**, so a headless log always shows the problem window expanded.
