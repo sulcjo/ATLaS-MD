@@ -5,6 +5,7 @@ from gareus.dashboard.ranking import (
     OK,
     WARN,
     Hysteresis,
+    WindowStatus,
     rank_windows,
     restraint_sigma,
 )
@@ -69,6 +70,39 @@ def test_low_but_not_dead_acceptance_is_a_warning():
 def test_ties_break_by_window_index_so_order_is_stable():
     statuses = _rank(delta_by_window={0: 3.0, 1: 0.0, 2: 3.0, 3: 0.0})
     assert [s.window for s in statuses[:2]] == [0, 2]
+
+
+def test_tie_break_survives_an_input_that_is_not_already_in_window_order():
+    """`rank_windows` happens to build its list in window order, so a stable
+    sort would produce the right answer even with the tie-break key removed.
+    Exercise the ordering rule directly on a scrambled list, so the key itself
+    is pinned rather than the construction order that currently masks it."""
+    scrambled = [
+        WindowStatus(window=3, severity=20, status=BAD, reasons=("pinned",)),
+        WindowStatus(window=1, severity=20, status=BAD, reasons=("pinned",)),
+        WindowStatus(window=2, severity=40, status=BAD, reasons=("dead",)),
+        WindowStatus(window=0, severity=20, status=BAD, reasons=("pinned",)),
+    ]
+    ordered = sorted(scrambled, key=lambda s: (-s.severity, s.window))
+    assert [s.window for s in ordered] == [2, 0, 1, 3]
+
+
+def test_a_none_measurement_is_treated_as_missing_not_as_a_crash():
+    """One `None` must not take down the ranking pass for every window."""
+    statuses = _rank(
+        acceptance_by_window={0: None, 1: 0.30, 2: 0.30, 3: 0.30},
+        delta_by_window={0: None, 1: 0.0, 2: 0.0, 3: 0.0},
+        overlap_by_pair={(0, 1): None, (1, 2): 0.45, (2, 3): 0.45},
+    )
+    assert len(statuses) == 4
+    assert {s.status for s in statuses} == {OK}
+
+
+def test_a_non_positive_temperature_yields_no_pinning_rather_than_raising():
+    assert math.isinf(restraint_sigma(2.5, 0.0))
+    assert math.isinf(restraint_sigma(2.5, -300.0))
+    statuses = _rank(temperature_k=0.0, delta_by_window={0: 99.0, 1: 0.0, 2: 0.0, 3: 0.0})
+    assert statuses[0].status == OK
 
 
 def test_hysteresis_keeps_a_recovered_key_for_the_configured_frames():
