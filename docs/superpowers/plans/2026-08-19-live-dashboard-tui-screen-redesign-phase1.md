@@ -2065,6 +2065,23 @@ git commit -m "refactor(dashboard): port content panels onto DashboardContext"
 - Consumes: Task 5's `DashboardContext`; Task 4's `rank_windows`/`BAD`/`WARN`; `gareus.tui.make_progress_bar`, `format_duration`, `_ansi_truncate`, `_coverage_bar` (moved there in Task 6 Step 0).
 - Produces: `bucket_strip(values: Sequence[float], statuses: Sequence[str], cells: int, glyphs: str = "unicode") -> str`; `spine_lines(ctx: DashboardContext, lines_budget: int) -> tuple[str, ...]` returning exactly `min(lines_budget, 10)` lines; `FULL_SPINE_LINES = 10`; `COMPACT_SPINE_LINES = 5`.
 
+**Three requirements the first implementation of this spine got wrong**, recorded so a
+re-run does not repeat them:
+
+1. **Count the bracket characters in the width budget.** `_run_line` and `_pool_line` wrap
+   their bar in `[` and `]`. Sizing the elastic middle without those two columns puts every
+   populated line two columns over budget, rescued only by the frame's ellipsis truncation —
+   which silently eats the end of the right-hand summary instead.
+2. **Actually apply the half-cell offset between the window and pair strips.** The stated
+   trick is that pair *i* sits *between* windows *i* and *i+1* so a dead pair reads as a
+   seam. Rendering both strips at the same column offset loses the whole effect while
+   looking superficially correct.
+3. **Import the dead-exchange threshold from `ranking`; do not redeclare it.** The strip's
+   dead-pair marking and `rank_windows`' dead-exchange rule must agree by construction, or
+   they drift silently. Also ensure `WARN` reaches the frame as literal text somewhere in
+   the spine — a later test asserts every status word survives ANSI stripping, and a spine
+   that can only emit `BAD` and `ok` fails it.
+
 `bucket_strip` is the load-bearing piece: one glyph per window works to ~120 windows, and
 real runs in this repo reach 364. Past that, cells aggregate — **height is the bucket mean,
 status is the bucket's worst** — so a bad window is coarsened in position but never hidden.
@@ -2253,12 +2270,20 @@ def _statuses_by_window(ctx: DashboardContext) -> list[str]:
 
 
 def _verdict(ctx: DashboardContext) -> str:
-    issues = int(ctx.decision.get("issue_count", 0) or 0)
-    status = str(ctx.decision.get("status", "") or "").upper()
-    if status.startswith("BAD") or status.startswith("FAIL"):
-        return role_text(f"✗ BAD {issues}", ROLE_BAD)
-    if issues:
-        return role_text(f"⚠ CAUTION {issues}", ROLE_WARN)
+    """Top-level health, read from the same decision state the run itself uses.
+
+    `DistanceLogger._dashboard_decision_state` returns
+    ``{"health", "issues", "reasons", "actions"}`` -- there is no ``"status"``
+    and no ``"issue_count"``. Reading those instead misses on every key, so the
+    spine's most prominent element renders "OK" for every run regardless of what
+    `ctx.decision` holds. Verified by calling the method directly.
+    """
+    issues = list(ctx.decision.get("issues", []) or [])
+    health = str(ctx.decision.get("health", "OK") or "OK").upper()
+    if health == "BAD":
+        return role_text(f"✗ BAD {len(issues)}", ROLE_BAD)
+    if health == "WATCH" or issues:
+        return role_text(f"⚠ CAUTION {len(issues)}", ROLE_WARN)
     return role_text("✓ OK", ROLE_GOOD)
 
 
@@ -2369,8 +2394,12 @@ def spine_lines(ctx: DashboardContext, lines_budget: int) -> tuple[str, ...]:
         chosen = [lines[0], lines[1], lines[2],
                   next((l for l in lines if l.startswith("win   ")), ""),
                   lines[-1]][:budget]
-    while len(chosen) < min(budget, FULL_SPINE_LINES):
-        chosen.append("")
+    # No blank padding. There are nine real line-kinds (eight for a 1D run, which
+    # has no CV2 line), because the design mockup's tenth line is the view-tab and
+    # clock divider that `render_screen` renders as the footer. Padding to the full
+    # reservation wastes one or two rows as blanks in exactly the place this
+    # redesign exists to reclaim; `render_screen` hands the unused reservation to
+    # the view body instead.
     return tuple(_ansi_truncate(l, width) for l in chosen)
 
 
@@ -3058,6 +3087,14 @@ def test_resolve_view_falls_back_to_progress_for_an_unknown_name(tmp_path):
     assert resolve_view(_ctx(tmp_path), "nonsense") == "progress"
 
 
+def test_render_screen_gives_unused_spine_lines_to_the_view(tmp_path):
+    """A 1D run's spine needs eight of its ten reserved lines; the rest must
+    become view content rather than blank rows."""
+    lines = strip_ansi(render_screen(_ctx(tmp_path, term_w=140, term_h=45))).splitlines()
+    assert [l for l in lines if not l.strip()] == []
+    assert len(lines) <= 44
+
+
 def test_render_screen_never_exceeds_the_terminal_height_or_width(tmp_path):
     out = render_screen(_ctx(tmp_path, term_w=140, term_h=45))
     lines = strip_ansi(out).splitlines()
@@ -3180,6 +3217,10 @@ def render_screen(ctx: DashboardContext) -> str:
     """Full frame as one string, guaranteed to fit `ctx.term_h - 1` lines."""
     spine_budget, body_budget = frame_tiers(ctx.term_h)
     spine = spine_lines(ctx, spine_budget)
+    # Hand any unused spine reservation to the view: the spine has nine real
+    # line-kinds (eight for 1D), so a full-tier frame reclaims one or two rows
+    # here instead of rendering them blank.
+    body_budget += max(0, spine_budget - len(spine))
     if body_budget <= 0:
         return "\n".join(spine)
     view = resolve_view(ctx, ctx.view)
