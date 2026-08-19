@@ -112,6 +112,14 @@ prices each row by the layout that width will actually produce. Without that, a 
 that is both narrow and short renders more lines than were budgeted, which is the exact
 failure this design exists to remove.
 
+The row's allocation is a single number, and composition spends it according to the layout
+it chooses. Side by side, every panel is a column of the same height, so each gets the whole
+allocation. Stacked, the panels are consecutive blocks that each carry their own borders, so
+the allocation is **split** across them: `n` panels sharing a row allocated `B` body lines
+have `B + 4 - 4n` body lines to divide between them. Applying `B` to each panel instead —
+the natural mistake, since one scalar arrives per row — renders the row `n` times too tall
+and silently voids the guarantee.
+
 ### 5.3 Severity-ranked truncation
 
 Every list panel carries a rank key. Truncation keeps the *worst* k entries; the tail line
