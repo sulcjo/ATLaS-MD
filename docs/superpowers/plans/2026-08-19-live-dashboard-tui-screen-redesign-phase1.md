@@ -1084,10 +1084,23 @@ def test_acceptance_by_window_takes_the_worst_neighbour_of_each_window():
 
 
 def test_overlap_by_pair_is_high_for_identical_and_low_for_disjoint_histories():
-    history = {0: (1.0, 1.1, 1.2), 1: (1.0, 1.1, 1.2), 2: (9.0, 9.1, 9.2)}
+    # Six samples per window, not three: `gareus.math_helpers._hist_overlap`
+    # returns nan below five finite samples per side (math_helpers.py:41), so a
+    # three-sample fixture yields no pairs at all and the assertions cannot run.
+    near = tuple(1.0 + 0.02 * i for i in range(6))
+    far = tuple(9.0 + 0.02 * i for i in range(6))
+    history = {0: near, 1: near, 2: far}
     ov = overlap_by_pair(history, centers_a=(1.0, 1.1, 9.0))
     assert ov[(0, 1)] > 0.9
     assert ov[(1, 2)] < 0.1
+
+
+def test_overlap_by_pair_omits_pairs_that_do_not_have_enough_samples_yet():
+    """Early frames must yield no pair at all rather than a fabricated value:
+    an absent pair reads as "unknown" downstream, while a 0.0 would rank as a
+    dead pair and invent a failure on every run's first frames."""
+    history = {0: (1.0, 1.1), 1: (1.0, 1.1)}
+    assert overlap_by_pair(history, centers_a=(1.0, 1.1)) == {}
 
 
 def test_delta_by_window_is_the_signed_distance_from_the_restraint_centre():
