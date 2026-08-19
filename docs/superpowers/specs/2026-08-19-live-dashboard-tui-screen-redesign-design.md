@@ -104,6 +104,14 @@ Each panel declares `(min_lines, want_lines, priority)`. Allocation:
 The frame therefore fits exactly. This inverts today's control flow: the screen tells
 panels their budget instead of panels rendering blind.
 
+**Pricing must match rendering.** A row of side-by-side panels shares one set of border
+lines, so it costs `max(panel body lines) + 4`. But when the terminal is too narrow for
+columns the panels stack vertically, and each then carries its *own* borders — the same row
+costs `sum(panel body lines) + 4n`. The allocator is therefore given the terminal width and
+prices each row by the layout that width will actually produce. Without that, a terminal
+that is both narrow and short renders more lines than were budgeted, which is the exact
+failure this design exists to remove.
+
 ### 5.3 Severity-ranked truncation
 
 Every list panel carries a rank key. Truncation keeps the *worst* k entries; the tail line
@@ -424,9 +432,13 @@ class Panel:
     line_statuses: tuple[str, ...] = ()   # one severity label per line, for the tail
 
 def allocate(
-    panels: Sequence[Panel], budget: int
+    panels: Sequence[Panel], budget: int, term_w: int | None = None
 ) -> tuple[tuple[Panel, ...], tuple[str, ...]]:
-    """Trim panels to fit `budget` lines; return them plus dropped panel names."""
+    """Trim panels to fit `budget` lines; return them plus dropped panel names.
+
+    `term_w` prices each row by the layout that width will actually produce:
+    stacked rows carry per-panel borders, side-by-side rows share one set.
+    """
 
 def build(ctx: DashboardContext) -> tuple[Row, ...]:
     """Each view module implements this. Pure function of a frozen snapshot."""

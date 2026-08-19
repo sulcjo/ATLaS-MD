@@ -3349,7 +3349,11 @@ from gareus.dashboard.sidecar import SidecarSnapshot
 from gareus.logger import DistanceLogger
 from gareus.tui import strip_ansi, strip_ansi_len
 
-WIDTHS = (70, 80, 100, 120, 140, 200, 400)
+# 40 and 55 are deliberate: below ~62 columns a two-panel row can no longer sit
+# side by side and takes the vertical stacking path instead. A matrix that starts
+# at 70 never exercises stacking at all, which is where both of Task 2's verified
+# width/height defects lived.
+WIDTHS = (40, 55, 70, 80, 100, 120, 140, 200, 400)
 HEIGHTS = (18, 20, 24, 35, 45, 55, 80)
 VIEWS = ("progress", "physics", "windows")
 N_WINDOWS = 25
