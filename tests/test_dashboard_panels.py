@@ -109,6 +109,26 @@ def test_window_detail_panel_reads_the_trace_of_the_replica_in_that_window(tmp_p
     assert "w09" not in text          # replica 2's decoy trail must not appear
 
 
+def test_window_detail_panel_skips_occupancy_when_the_row_has_no_replica_key(tmp_path):
+    """A row that matches the window filter but lacks a "replica" key must not
+    raise -- replica_table_panel already degrades gracefully the same way via
+    `r.get("replica", 0)`, and this lookup should match that convention."""
+    args = argparse.Namespace(timestep_fs=2.0, temperature_k=300.0)
+    logger = DistanceLogger(tmp_path, args, no_file_persistence=True)
+    logger.window_trace_by_replica[7] = [2, 3, 2]
+    rows = [{"window": 2, "center_A": 5.10, "k_kcal_mol_A2": 2.5,
+             "cv_A": 5.15, "umbrella_bias_kcal_mol": 0.0, "umbrella_pull_kcal_mol_A": 0.0}]
+    ctx = build_context(
+        logger=logger, rows=rows, phase="gareus_production", step=1, total_steps=10,
+        summary={}, dashboard_info={"centers_a": list(CENTERS), "n_windows": 4,
+                                   "k_list": [2.5] * 4},
+        sidecar=SidecarSnapshot(), term_w=140, term_h=45, now=1000.0,
+        view="windows", glyphs="unicode",
+    )
+    text = strip_ansi("\n".join(window_detail_panel(ctx, 2).lines))
+    assert "occupancy" not in text
+
+
 def test_window_detail_panel_names_the_window_and_its_restraint(tmp_path):
     ctx = _ctx(tmp_path)
     text = strip_ansi("\n".join(window_detail_panel(ctx, 2).lines))
