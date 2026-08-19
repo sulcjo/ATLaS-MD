@@ -35,8 +35,14 @@ from .ranking import BAD, DEAD_ACCEPTANCE, OK, WARN, WindowStatus, rank_windows
 FULL_SPINE_LINES = 10
 COMPACT_SPINE_LINES = 5
 
-_DENSITY_GLYPHS = " ▁▂▃▄▅▆▇█"
-_ASCII_GLYPHS = " .:-=+*#%"
+# No leading space in either ramp. A bucket that HAS a value must never render
+# as blank: the lowest bucket is the starved window, which is the whole reason
+# the strip exists. `gareus/tui.py`'s own `_hist3d_cell` takes the same
+# position, rendering a dim "·" rather than a space for its zero level.
+_DENSITY_GLYPHS = "▁▂▃▄▅▆▇█"
+_ASCII_GLYPHS = ".:-=+*#%"
+_BAD_GLYPH = "X"
+_WARN_GLYPH = "!"
 _K0_SATURATED = 0.999
 
 
@@ -58,18 +64,31 @@ def bucket_strip(
     finite = [v for v in vals if math.isfinite(v)]
     hi = max(finite) if finite else 1.0
     lo = min(finite) if finite else 0.0
-    span = (hi - lo) or 1.0
+    span = hi - lo
+    mid = (len(ramp) - 1) // 2
     out: list[str] = []
     for i in range(n_cells):
         chunk = vals[edges[i]:edges[i + 1]] or [lo]
         chunk_status = [str(statuses[j]) for j in range(edges[i], edges[i + 1])
                         if j < len(statuses)]
-        level = int(round((float(np.mean(chunk)) - lo) / span * (len(ramp) - 1)))
+        if span <= 0.0:
+            # Every window equally sampled -- the healthy, common case. A
+            # relative ramp would put the whole strip at its lowest level, so
+            # render a uniform mid-height instead: "even" is the honest
+            # reading, and a strip that disappears when nothing is wrong
+            # trains the eye to ignore it.
+            level = mid
+        else:
+            level = int(round((float(np.mean(chunk)) - lo) / span * (len(ramp) - 1)))
         glyph = ramp[max(0, min(len(ramp) - 1, level))]
+        # Status wins over density in BOTH glyph modes. Status is never carried
+        # by colour alone, and a red "lowest level" glyph is indistinguishable
+        # from a healthy low one once ANSI is stripped for a log file -- for a
+        # flagged cell, knowing it is bad matters more than its exact height.
         if BAD in chunk_status:
-            out.append(role_text("X" if glyphs == "ascii" else glyph, ROLE_BAD))
+            out.append(role_text(_BAD_GLYPH, ROLE_BAD))
         elif WARN in chunk_status:
-            out.append(role_text("!" if glyphs == "ascii" else glyph, ROLE_WARN))
+            out.append(role_text(_WARN_GLYPH, ROLE_WARN))
         else:
             out.append(glyph)
     return "".join(out)

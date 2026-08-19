@@ -40,8 +40,28 @@ def test_bucket_strip_aggregates_when_there_are_more_values_than_cells():
 def test_bucket_strip_keeps_a_bad_window_visible_after_bucketing():
     statuses = ["ok"] * 364
     statuses[200] = "BAD"
-    strip = bucket_strip([1.0] * 364, statuses, cells=100, glyphs="ascii")
-    assert "X" in strip                     # ascii mode encodes status in the glyph
+    for mode in ("ascii", "unicode"):
+        strip = strip_ansi(bucket_strip([1.0] * 364, statuses, cells=100, glyphs=mode))
+        assert "X" in strip, f"{mode}: a bad bucket must survive ANSI stripping"
+
+
+def test_bucket_strip_never_renders_a_present_value_as_blank():
+    """The lowest bucket is the starved window -- the whole point of the strip."""
+    varied = strip_ansi(bucket_strip([1.0, 3.0, 9.0, 4.0], ["ok"] * 4, cells=4))
+    assert " " not in varied
+    uniform = strip_ansi(bucket_strip([60.0] * 8, ["ok"] * 8, cells=8))
+    assert " " not in uniform
+    assert len(set(uniform)) == 1           # equal sampling reads as an even strip
+
+
+def test_bucket_strip_marks_a_dead_pair_rather_than_leaving_a_gap():
+    """A dead pair sits at the bottom of the acceptance range, so a ramp starting
+    at a space would render the single most important cell as nothing."""
+    rates = [0.30, 0.31, 0.0, 0.29]
+    statuses = ["ok", "ok", "BAD", "ok"]
+    strip = strip_ansi(bucket_strip(rates, statuses, cells=4))
+    assert strip[2] == "X"
+    assert " " not in strip
 
 
 def test_bucket_strip_handles_an_empty_input():
