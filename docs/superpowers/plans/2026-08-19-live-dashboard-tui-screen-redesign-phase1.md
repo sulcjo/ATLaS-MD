@@ -811,6 +811,39 @@ def test_ties_break_by_window_index_so_order_is_stable():
     assert [s.window for s in statuses[:2]] == [0, 2]
 
 
+def test_tie_break_survives_an_input_that_is_not_already_in_window_order():
+    """`rank_windows` happens to build its list in window order, so a stable
+    sort would produce the right answer even with the tie-break key removed.
+    Exercise the ordering rule directly on a scrambled list, so the key itself
+    is pinned rather than the construction order that currently masks it."""
+    scrambled = [
+        WindowStatus(window=3, severity=20, status=BAD, reasons=("pinned",)),
+        WindowStatus(window=1, severity=20, status=BAD, reasons=("pinned",)),
+        WindowStatus(window=2, severity=40, status=BAD, reasons=("dead",)),
+        WindowStatus(window=0, severity=20, status=BAD, reasons=("pinned",)),
+    ]
+    ordered = sorted(scrambled, key=lambda s: (-s.severity, s.window))
+    assert [s.window for s in ordered] == [2, 0, 1, 3]
+
+
+def test_a_none_measurement_is_treated_as_missing_not_as_a_crash():
+    """One `None` must not take down the ranking pass for every window."""
+    statuses = _rank(
+        acceptance_by_window={0: None, 1: 0.30, 2: 0.30, 3: 0.30},
+        delta_by_window={0: None, 1: 0.0, 2: 0.0, 3: 0.0},
+        overlap_by_pair={(0, 1): None, (1, 2): 0.45, (2, 3): 0.45},
+    )
+    assert len(statuses) == 4
+    assert {s.status for s in statuses} == {OK}
+
+
+def test_a_non_positive_temperature_yields_no_pinning_rather_than_raising():
+    assert math.isinf(restraint_sigma(2.5, 0.0))
+    assert math.isinf(restraint_sigma(2.5, -300.0))
+    statuses = _rank(temperature_k=0.0, delta_by_window={0: 99.0, 1: 0.0, 2: 0.0, 3: 0.0})
+    assert statuses[0].status == OK
+
+
 def test_hysteresis_keeps_a_recovered_key_for_the_configured_frames():
     h = Hysteresis(frames=3)
     assert h.update(["w17"]) == frozenset({"w17"})
@@ -876,22 +909,45 @@ class WindowStatus:
     reasons: tuple[str, ...] = ()
 
 
+def _as_float(value: object, default: float) -> float:
+    """Coerce a measurement to float, treating anything unusable as missing.
+
+    Callers hand these maps in from live sampling, and "not measured yet" gets
+    encoded as `None` at least as often as `nan`. Guarding only against `nan`
+    means one `None` raises `TypeError` and takes down the ranking pass for
+    *every* window, not just the one with the bad value.
+    """
+    try:
+        out = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return float(default)
+    return out
+
+
 def restraint_sigma(k_kcal_per_a2: float, temperature_k: float) -> float:
     """Gaussian width of a harmonic umbrella, in the CV's own units.
 
     ``sigma = sqrt(k_B T / k)`` with ``k`` converted from kcal/mol/A^2 to
-    kJ/mol/A^2 so it divides a kJ/mol thermal energy.
+    kJ/mol/A^2 so it divides a kJ/mol thermal energy. Anything unusable -- a
+    non-positive or non-finite ``k``, a non-positive temperature -- yields
+    ``inf``, which makes the pinned-window comparison unsatisfiable rather than
+    raising or flagging spuriously.
     """
-    k = float(k_kcal_per_a2) * KJ_PER_KCAL
+    k = _as_float(k_kcal_per_a2, float("nan")) * KJ_PER_KCAL
+    temperature = _as_float(temperature_k, float("nan"))
     if not math.isfinite(k) or k <= 0.0:
         return math.inf
-    return math.sqrt(K_B_KJ_PER_MOL_K * float(temperature_k) / k)
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        return math.inf
+    return math.sqrt(K_B_KJ_PER_MOL_K * temperature / k)
 
 
 def rank_windows(
     *,
     n_windows: int,
-    centers_a: Sequence[float],
+    centers_a: Sequence[float],   # accepted but unused today; a later phase's
+                                  # reason strings will quote the centre
+
     k_list: Sequence[float],
     acceptance_by_window: Mapping[int, float],
     overlap_by_pair: Mapping[tuple[int, int], float],
@@ -900,16 +956,20 @@ def rank_windows(
 ) -> tuple[WindowStatus, ...]:
     """Rank windows worst-first. Ties break by window index for stability."""
     low_overlap: dict[int, float] = {}
-    for (a, b), ov in overlap_by_pair.items():
+    for (a, b), raw_ov in overlap_by_pair.items():
+        ov = _as_float(raw_ov, float("nan"))
         if math.isfinite(ov) and ov < DEAD_OVERLAP:
             for w in (a, b):
                 low_overlap[w] = min(low_overlap.get(w, math.inf), float(ov))
 
     out: list[WindowStatus] = []
     for w in range(int(n_windows)):
-        acc = float(acceptance_by_window.get(w, float("nan")))
-        delta = abs(float(delta_by_window.get(w, 0.0)))
-        k = float(k_list[w]) if w < len(k_list) else float("nan")
+        acc = _as_float(acceptance_by_window.get(w), float("nan"))
+        # `nan`, not 0.0: a missing delta is unmeasured, and defaulting it to a
+        # valid "exactly on target" reading is the same fabricated-zero-deviation
+        # mistake this codebase already had to fix once in bias reconstruction.
+        delta = abs(_as_float(delta_by_window.get(w), float("nan")))
+        k = _as_float(k_list[w], float("nan")) if w < len(k_list) else float("nan")
         sigma = restraint_sigma(k, temperature_k)
 
         if math.isfinite(acc) and acc < DEAD_ACCEPTANCE:
@@ -955,7 +1015,7 @@ __all__ = [
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `python -m pytest tests/test_dashboard_ranking.py -v`
-Expected: 12 passed
+Expected: 13 passed
 
 - [ ] **Step 5: Commit**
 
