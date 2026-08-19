@@ -184,6 +184,42 @@ def _torsion_angle_rad_from_positions(positions_nm: np.ndarray, a: int, b: int, 
     return float(np.arctan2(y, x))
 
 
+def boost_anharmonicity(values: list[float]) -> dict:
+    """Rolling Gaussianity/anharmonicity score for GaMD boost samples.
+
+    GaMD cumulant reweighting assumes the boost distribution is close to
+    Gaussian. This cheap live score combines standardized skewness and excess
+    kurtosis: 0 is ideal Gaussian-like, >~0.5 is suspicious, >~1 is ugly.
+    """
+    arr = np.asarray([float(v) for v in values if math.isfinite(float(v))], dtype=float)
+    n = int(arr.size)
+    if n < 8:
+        return {"n": n, "mean": float("nan"), "sd": float("nan"), "skew": float("nan"), "excess_kurtosis": float("nan"), "score": float("nan")}
+    mean = float(np.mean(arr))
+    sd = float(np.std(arr))
+    if not math.isfinite(sd) or sd <= 1.0e-12:
+        # A constant/flat boost trace is not a non-Gaussian distribution; it is
+        # simply not informative for cumulant diagnostics.  Do not report the
+        # old hard-coded 1.5 BAD-looking score for zero-variance or unavailable
+        # boost data.
+        return {"n": n, "mean": mean, "sd": sd, "skew": float("nan"), "excess_kurtosis": float("nan"), "score": float("nan")}
+    z = (arr - mean) / sd
+    skew = float(np.mean(z ** 3))
+    excess = float(np.mean(z ** 4) - 3.0)
+    score = float(math.sqrt(skew * skew + 0.25 * excess * excess))
+    return {"n": n, "mean": mean, "sd": sd, "skew": skew, "excess_kurtosis": excess, "score": score}
+
+
+def anharmonicity_label(score: float) -> tuple[str, str]:
+    if not math.isfinite(float(score)):
+        return "n/a", "dim"
+    if score < 0.5:
+        return "OK", "green"
+    if score < 1.0:
+        return "WARN", "yellow"
+    return "BAD", "red"
+
+
 __all__ = [
     "_hist_overlap",
     "_adaptive_hist_overlap",
@@ -191,4 +227,6 @@ __all__ = [
     "_batch_torsion_angles_rad",
     "_mean_torsion_score_from_angles",
     "_torsion_angle_rad_from_positions",
+    "boost_anharmonicity",
+    "anharmonicity_label",
 ]

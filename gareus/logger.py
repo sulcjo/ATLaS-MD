@@ -27,7 +27,6 @@ from .progress import GuiProgressSink
 from .tui import (
     _ansi_pad,
     _ansi_truncate,
-    _ascii_position,
     _dashboard_density,
     _dashboard_full_width_panel,
     _dashboard_weighted_row,
@@ -58,7 +57,8 @@ from .cv import (
     secondary_cv_mode,
 )
 from .windows import build_explicit_2d_neighbor_edges
-from .math_helpers import _hist_overlap
+from .math_helpers import _hist_overlap, anharmonicity_label, boost_anharmonicity
+from .tui import _coverage_bar, _mini_bar, _sparkline
 
 def _epoch_label_inline(adaptive: dict) -> str:
     """Short colored epoch/pilot/final label for header line 1."""
@@ -118,81 +118,6 @@ def _compact_epoch_context(adaptive: dict) -> str:
         return color_text("prev:", "dim") + " ".join(parts)
 
     return ""
-
-
-def _sparkline(values: list[float], width: int = 18) -> str:
-    vals = [float(v) for v in values if math.isfinite(float(v))]
-    if not vals:
-        return "·" * max(1, width)
-    vals = vals[-max(1, width):]
-    lo, hi = min(vals), max(vals)
-    chars = "▁▂▃▄▅▆▇█"
-    if hi <= lo:
-        return color_text("▄" * len(vals), "dim")
-    return "".join(chars[max(0, min(len(chars) - 1, int((v - lo) / (hi - lo) * (len(chars) - 1))))] for v in vals)
-
-
-def _mini_bar(frac: float, width: int = 10) -> str:
-    frac = max(0.0, min(1.0, float(frac) if math.isfinite(float(frac)) else 0.0))
-    n = int(round(frac * width))
-    return color_text("█" * n, "green") + color_text("░" * (width - n), "dim")
-
-
-def _coverage_bar(values: list[float], lo: float, hi: float, width: int = 48) -> str:
-    if hi <= lo or not values:
-        return " " * width
-    counts = [0] * width
-    for v in values:
-        if not math.isfinite(float(v)):
-            continue
-        idx = _ascii_position(float(v), lo, hi, width)
-        counts[idx] += 1
-    mx = max(counts) if counts else 0
-    chars = " ░▒▓█"
-    out = []
-    for c in counts:
-        if mx <= 0 or c <= 0:
-            out.append(color_text("·", "dim"))
-        else:
-            lvl = max(1, min(4, int(math.ceil(c / mx * 4))))
-            out.append(chars[lvl])
-    return "".join(out)
-
-
-def boost_anharmonicity(values: list[float]) -> dict:
-    """Rolling Gaussianity/anharmonicity score for GaMD boost samples.
-
-    GaMD cumulant reweighting assumes the boost distribution is close to
-    Gaussian. This cheap live score combines standardized skewness and excess
-    kurtosis: 0 is ideal Gaussian-like, >~0.5 is suspicious, >~1 is ugly.
-    """
-    arr = np.asarray([float(v) for v in values if math.isfinite(float(v))], dtype=float)
-    n = int(arr.size)
-    if n < 8:
-        return {"n": n, "mean": float("nan"), "sd": float("nan"), "skew": float("nan"), "excess_kurtosis": float("nan"), "score": float("nan")}
-    mean = float(np.mean(arr))
-    sd = float(np.std(arr))
-    if not math.isfinite(sd) or sd <= 1.0e-12:
-        # A constant/flat boost trace is not a non-Gaussian distribution; it is
-        # simply not informative for cumulant diagnostics.  Do not report the
-        # old hard-coded 1.5 BAD-looking score for zero-variance or unavailable
-        # boost data.
-        return {"n": n, "mean": mean, "sd": sd, "skew": float("nan"), "excess_kurtosis": float("nan"), "score": float("nan")}
-    z = (arr - mean) / sd
-    skew = float(np.mean(z ** 3))
-    excess = float(np.mean(z ** 4) - 3.0)
-    score = float(math.sqrt(skew * skew + 0.25 * excess * excess))
-    return {"n": n, "mean": mean, "sd": sd, "skew": skew, "excess_kurtosis": excess, "score": score}
-
-
-def anharmonicity_label(score: float) -> tuple[str, str]:
-    if not math.isfinite(float(score)):
-        return "n/a", "dim"
-    if score < 0.5:
-        return "OK", "green"
-    if score < 1.0:
-        return "WARN", "yellow"
-    return "BAD", "red"
 
 
 def is_gamd_production_phase(phase: str) -> bool:
