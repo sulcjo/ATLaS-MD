@@ -12,9 +12,11 @@ see §17 for what it delivered and where this design supersedes it.
 ## 1. Problem
 
 The live dashboard produces far more content than the terminal can display, and the
-overflow is discarded by position rather than by importance. Measured by rendering the
-real frame with realistic synthetic data (25 windows, populated histories) at fixed
-terminal sizes:
+overflow is discarded by position rather than by importance. Measured by driving the real
+`DistanceLogger._render_dashboard` with synthetic-but-realistic data — 25 windows,
+populated per-window CV histories, a full neighbour exchange table — at fixed terminal
+sizes. Reproduce with `python tests/manual_render_dashboard_frame.py`; that harness is also
+the intended fixture for the fit property test in §14.1:
 
 | Terminal | Content lines produced | Lines displayable | Silently discarded |
 |---|---|---|---|
@@ -142,6 +144,14 @@ New flag `--tui-view auto|progress|physics|windows`, default `auto`.
   keypress.
 
 ## 6. The spine (10 lines)
+
+**On the numbers in this spec's mockups**: values are real `chignolin_5` measurements
+wherever §9's data audit marks the source as *exists* (pool ledger `7500/15000 ns` and its
+per-segment durations, `sigma0 12.552`, `sigmaV 11.039`, `k0 1.00`, `cv2 tica-linear`
+switched after epoch 0, 29 states). Everything sourced from a row §9 marks as *new* is
+illustrative and shaped to be plausible — per-window `σΔV`, per-CV2-row sample share,
+exchange-stall percentage, GPU-day conversion, and the `w17`/`w18` failure narrative.
+Layout geometry (line counts, column widths) is measured in all cases.
 
 Measured at 140 cols: max line 121 of a 138-col budget, leaving slack that the elastic
 middles consume on wider terminals.
