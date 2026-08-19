@@ -4,6 +4,7 @@ import math
 
 from gareus.dashboard.context import (
     DashboardContext,
+    _copy_exchange_stats,
     acceptance_by_pair,
     acceptance_by_window,
     build_context,
@@ -28,6 +29,39 @@ def test_acceptance_by_pair_converts_attempt_counts_to_rates():
     assert math.isnan(pairs[(1, 2)])            # no attempts yet is unknown, not zero
 
 
+def test_acceptance_by_pair_reads_the_real_nested_payload_shape():
+    """The shape gareus/production.py actually builds: per-pair counters under
+    "pairs", beside run-level totals. Reading the top level returns nothing,
+    which downstream is indistinguishable from "no exchanges attempted"."""
+    real = {
+        "attempts": 120, "accepted": 40, "mode": "neighbor",
+        "gibbs_choices": 0, "gibbs_moves": 0, "gibbs_stays": 0,
+        "pairs": {"0-1": {"attempts": 40, "accepted": 12},
+                  "1-2": {"attempts": 40, "accepted": 0},
+                  "2-3": {"attempts": 0, "accepted": 0}},
+        "jump_bins": {"1": {"attempts": 5, "accepted": 2}},
+    }
+    pairs = acceptance_by_pair(real)
+    assert pairs[(0, 1)] == 0.3
+    assert pairs[(1, 2)] == 0.0                 # tried and always rejected: a real dead pair
+    assert math.isnan(pairs[(2, 3)])            # never attempted: unknown
+    assert set(pairs) == {(0, 1), (1, 2), (2, 3)}   # run-level totals are not pairs
+
+
+def test_exchange_stats_snapshot_survives_in_place_mutation_of_the_source():
+    """production.py mutates one long-lived exchange_stats dict for the whole
+    run, so a shallow copy would let the render thread see a torn read."""
+    live = {"attempts": 1, "accepted": 0, "pairs": {"0-1": {"attempts": 1, "accepted": 0}}}
+    copied = _copy_exchange_stats(live)
+    live["pairs"]["0-1"]["attempts"] = 99
+    live["pairs"]["0-1"]["accepted"] = 99
+    live["pairs"]["1-2"] = {"attempts": 7, "accepted": 7}
+    live["attempts"] = 99
+    assert copied["pairs"]["0-1"] == {"attempts": 1, "accepted": 0}
+    assert "1-2" not in copied["pairs"]
+    assert copied["attempts"] == 1
+
+
 def test_acceptance_by_window_takes_the_worst_neighbour_of_each_window():
     pairs = {(0, 1): 0.40, (1, 2): 0.05}
     per_window = acceptance_by_window(pairs, n_windows=3)
@@ -37,12 +71,23 @@ def test_acceptance_by_window_takes_the_worst_neighbour_of_each_window():
 
 
 def test_overlap_by_pair_is_high_for_identical_and_low_for_disjoint_histories():
-    history = {0: (1.0, 1.05, 1.1, 1.15, 1.2, 1.25),
-               1: (1.0, 1.05, 1.1, 1.15, 1.2, 1.25),
-               2: (8.5, 8.55, 8.6, 8.65, 8.7, 8.75)}
+    # Six samples per window, not three: `gareus.math_helpers._hist_overlap`
+    # returns nan below five finite samples per side (math_helpers.py:41), so a
+    # three-sample fixture yields no pairs at all and the assertions cannot run.
+    near = tuple(1.0 + 0.02 * i for i in range(6))
+    far = tuple(9.0 + 0.02 * i for i in range(6))
+    history = {0: near, 1: near, 2: far}
     ov = overlap_by_pair(history, centers_a=(1.0, 1.1, 9.0))
     assert ov[(0, 1)] > 0.9
     assert ov[(1, 2)] < 0.1
+
+
+def test_overlap_by_pair_omits_pairs_that_do_not_have_enough_samples_yet():
+    """Early frames must yield no pair at all rather than a fabricated value:
+    an absent pair reads as "unknown" downstream, while a 0.0 would rank as a
+    dead pair and invent a failure on every run's first frames."""
+    history = {0: (1.0, 1.1), 1: (1.0, 1.1)}
+    assert overlap_by_pair(history, centers_a=(1.0, 1.1)) == {}
 
 
 def test_delta_by_window_is_the_signed_distance_from_the_restraint_centre():
