@@ -24,8 +24,12 @@ class Panel:
 
     ``priority`` is ordinal with 1 as the most important; rows are dropped from
     the least important end when the budget cannot hold every minimum.
-    ``tail`` lets a caller supply a severity-aware truncation notice
-    ("+9 more (2 warn, 1 bad)") instead of the generic count.
+    ``line_statuses`` is a parallel array of severity labels, one per line
+    (empty string for a header or a line with no severity). The allocator later
+    calls ``trim_panel`` to cut content to fit the budget; that function composes
+    a severity-aware truncation notice ("+9 more (1 bad, 2 warn)") from the labels
+    of the lines it hides, since a panel cannot know in advance how many lines
+    the allocator will hide.
     """
 
     key: str
@@ -94,7 +98,7 @@ def _composition_tail(hidden_statuses: Sequence[str], hidden: int) -> str:
     """Describe a truncated tail by severity, not just by count.
 
     "+9 more" tells a reader nothing about whether the tail mattered;
-    "+9 more (2 warn, 1 bad)" tells them to widen the terminal.
+    "+9 more (1 bad, 2 warn)" tells them to widen the terminal.
     """
     labels = [str(s).upper() for s in hidden_statuses]
     bad = labels.count("BAD")

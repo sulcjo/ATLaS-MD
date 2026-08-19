@@ -95,3 +95,14 @@ def test_trim_panel_says_all_ok_when_nothing_hidden_is_flagged():
 def test_trim_panel_is_a_noop_when_content_already_fits():
     panel = _panel("a", 3, 1, 3)
     assert trim_panel(panel, 9) is panel
+
+
+def test_trim_panel_composes_severity_tail_with_both_bad_and_warn():
+    statuses = ("", "BAD", "WARN", "BAD", "WARN", "ok", "ok")
+    panel = Panel(key="a", title="a", lines=tuple(f"l{i}" for i in range(7)),
+                  min_lines=1, want_lines=7, line_statuses=tuple(statuses))
+    trimmed = trim_panel(panel, 3)
+    # Keep = max(0, 3 - 1) = 2, hidden = 5
+    # Hidden statuses (from index 2) = (WARN, BAD, WARN, ok, ok)
+    # BAD count = 1, WARN count = 2
+    assert trimmed.lines[-1] == "+5 more (1 bad, 2 warn)"
