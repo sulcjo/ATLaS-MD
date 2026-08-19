@@ -1034,7 +1034,7 @@ git commit -m "feat(dashboard): add severity ranking, tail summaries and hystere
 
 **Interfaces:**
 - Consumes: Task 3's `SidecarSnapshot`; `gareus.math_helpers._hist_overlap`.
-- Produces: `DashboardContext` (frozen dataclass, fields below); `build_context(*, logger, rows, phase, step, total_steps, summary, dashboard_info, sidecar, term_w, term_h, now, view, glyphs) -> DashboardContext`; `acceptance_by_pair(exchange_stats) -> dict[tuple[int, int], float]`; `acceptance_by_window(pairs, n_windows) -> dict[int, float]`; `overlap_by_pair(history_by_window, centers_a) -> dict[tuple[int, int], float]`; `delta_by_window(rows) -> dict[int, float]`.
+- Produces: `DashboardContext` (frozen dataclass, fields below); `build_context(*, logger, rows, phase, step, total_steps, summary, dashboard_info, sidecar, term_w, term_h, now, view, glyphs) -> DashboardContext`; `acceptance_by_pair(exchange_stats) -> dict[tuple[int, int], float]` (reads the real nested `"pairs"` sub-mapping, falling back to a flat mapping); `_copy_exchange_stats(source) -> dict`; `acceptance_by_window(pairs, n_windows) -> dict[int, float]`; `overlap_by_pair(history_by_window, centers_a) -> dict[tuple[int, int], float]`; `delta_by_window(rows) -> dict[int, float]`.
 
 Every field is a `tuple`/`Mapping` copy, never a live logger deque — views run on the
 render thread and must not observe mid-flight mutation. `decision` carries the existing
@@ -1051,6 +1051,7 @@ import math
 
 from gareus.dashboard.context import (
     DashboardContext,
+    _copy_exchange_stats,
     acceptance_by_pair,
     acceptance_by_window,
     build_context,
@@ -1073,6 +1074,39 @@ def test_acceptance_by_pair_converts_attempt_counts_to_rates():
                                 "1-2": {"attempts": 0, "accepted": 0}})
     assert pairs[(0, 1)] == 0.2
     assert math.isnan(pairs[(1, 2)])            # no attempts yet is unknown, not zero
+
+
+def test_acceptance_by_pair_reads_the_real_nested_payload_shape():
+    """The shape gareus/production.py actually builds: per-pair counters under
+    "pairs", beside run-level totals. Reading the top level returns nothing,
+    which downstream is indistinguishable from "no exchanges attempted"."""
+    real = {
+        "attempts": 120, "accepted": 40, "mode": "neighbor",
+        "gibbs_choices": 0, "gibbs_moves": 0, "gibbs_stays": 0,
+        "pairs": {"0-1": {"attempts": 40, "accepted": 12},
+                  "1-2": {"attempts": 40, "accepted": 0},
+                  "2-3": {"attempts": 0, "accepted": 0}},
+        "jump_bins": {"1": {"attempts": 5, "accepted": 2}},
+    }
+    pairs = acceptance_by_pair(real)
+    assert pairs[(0, 1)] == 0.3
+    assert pairs[(1, 2)] == 0.0                 # tried and always rejected: a real dead pair
+    assert math.isnan(pairs[(2, 3)])            # never attempted: unknown
+    assert set(pairs) == {(0, 1), (1, 2), (2, 3)}   # run-level totals are not pairs
+
+
+def test_exchange_stats_snapshot_survives_in_place_mutation_of_the_source():
+    """production.py mutates one long-lived exchange_stats dict for the whole
+    run, so a shallow copy would let the render thread see a torn read."""
+    live = {"attempts": 1, "accepted": 0, "pairs": {"0-1": {"attempts": 1, "accepted": 0}}}
+    copied = _copy_exchange_stats(live)
+    live["pairs"]["0-1"]["attempts"] = 99
+    live["pairs"]["0-1"]["accepted"] = 99
+    live["pairs"]["1-2"] = {"attempts": 7, "accepted": 7}
+    live["attempts"] = 99
+    assert copied["pairs"]["0-1"] == {"attempts": 1, "accepted": 0}
+    assert "1-2" not in copied["pairs"]
+    assert copied["attempts"] == 1
 
 
 def test_acceptance_by_window_takes_the_worst_neighbour_of_each_window():
@@ -1190,18 +1224,40 @@ DEFAULT_TEMPERATURE_K = 300.0
 
 
 def acceptance_by_pair(exchange_stats: Mapping[str, Any]) -> dict[tuple[int, int], float]:
-    """``{"0-1": {"attempts": n, "accepted": m}}`` -> ``{(0, 1): m / n}``.
+    """Per-neighbour-pair acceptance rate, keyed by ``(i, j)``.
+
+    The real payload nests per-pair counters under ``"pairs"`` alongside
+    run-level totals::
+
+        {"attempts": 120, "accepted": 40, "mode": "neighbor",
+         "pairs": {"0-1": {"attempts": 40, "accepted": 12}, ...},
+         "jump_bins": {...}}
+
+    Reading the top level instead returns nothing on real runs -- and nothing is
+    indistinguishable from "no exchanges attempted", which would leave every
+    window unranked, the exchange strip permanently empty, and the union-find
+    connectivity check reporting every window as its own component, i.e. a false
+    claim of total MBAR disconnection on a perfectly healthy run.
+    ``gareus/production.py``'s own reader takes the same ``"pairs"`` sub-mapping.
+
+    A flat mapping is still accepted, so a hand-built fixture or any future
+    flat producer keeps working.
 
     Zero attempts yields NaN, not 0.0: "not tried yet" and "tried and always
     rejected" must not rank the same.
     """
+    payload = exchange_stats or {}
+    nested = payload.get("pairs")
+    source = nested if isinstance(nested, Mapping) else payload
     out: dict[tuple[int, int], float] = {}
-    for key, stats in (exchange_stats or {}).items():
+    for key, stats in source.items():
+        if not isinstance(stats, Mapping):
+            continue
         try:
             a_str, b_str = str(key).split("-")[:2]
             a, b = int(a_str), int(b_str)
-            attempts = float((stats or {}).get("attempts", 0) or 0)
-            accepted = float((stats or {}).get("accepted", 0) or 0)
+            attempts = float(stats.get("attempts", 0) or 0)
+            accepted = float(stats.get("accepted", 0) or 0)
         except Exception:
             continue
         out[(a, b)] = (accepted / attempts) if attempts > 0 else float("nan")
@@ -1314,6 +1370,26 @@ def _tuple_map(source: Mapping[int, Any]) -> dict[int, tuple[float, ...]]:
     return {int(k): tuple(float(x) for x in v) for k, v in (source or {}).items()}
 
 
+def _copy_exchange_stats(source: Any) -> dict[str, Any]:
+    """Copy the exchange payload one level deeper than a plain ``dict()``.
+
+    ``gareus/production.py`` keeps ONE long-lived ``exchange_stats`` dict and
+    mutates it in place for the whole run -- ``setdefault(pair, {...})`` then
+    incrementing ``attempts``/``accepted`` (production.py:4914-4922). A shallow
+    copy leaves those per-pair counters aliased to live state, so the render
+    thread can read ``attempts`` after an increment but ``accepted`` before its
+    own -- a torn read that reports an acceptance rate above 1.0.
+    """
+    payload = dict(source or {})
+    for key in ("pairs", "jump_bins", "pair_metadata"):
+        nested = payload.get(key)
+        if isinstance(nested, Mapping):
+            payload[key] = {
+                k: (dict(v) if isinstance(v, Mapping) else v) for k, v in nested.items()
+            }
+    return payload
+
+
 def _resolve_temperature(args: Any, sidecar: SidecarSnapshot) -> float:
     for value in (getattr(args, "temperature_k", None),
                   (sidecar.gamd or {}).get("temperature_K")):
@@ -1420,7 +1496,7 @@ def build_context(
             int(k): tuple(int(x) for x in v)
             for k, v in (getattr(logger, "window_trace_by_replica", {}) or {}).items()
         },
-        exchange_stats=dict(info.get("exchange_stats", {}) or {}),
+        exchange_stats=_copy_exchange_stats(info.get("exchange_stats")),
         acceptance_pairs=pairs,
         acceptance_windows=acceptance_by_window(pairs, n_windows),
         overlap_pairs=overlap_by_pair(hist_windows, centers),
