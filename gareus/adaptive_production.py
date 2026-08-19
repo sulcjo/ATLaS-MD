@@ -4351,6 +4351,23 @@ def _assert_epoch_has_samples(
         raise RuntimeError(" ".join(parts))
 
 
+def _segment_checkpoint_prod_done(seg_dir: Path) -> Optional[int]:
+    """Return a segment's already-checkpointed production step count, or None if unavailable.
+
+    Lazy-imports checkpoint_manifest_path from .production (not at module level)
+    because production.py -> adaptive_production.py is an existing import chain;
+    importing it back here at module scope would make it circular.
+    """
+    from .production import checkpoint_manifest_path
+    manifest = read_json_file(checkpoint_manifest_path(seg_dir), None)
+    if not isinstance(manifest, dict):
+        return None
+    try:
+        return int(manifest.get("prod_done", 0))
+    except (TypeError, ValueError):
+        return None
+
+
 def run_scheduled_adaptive_epoch(
     args: Any,
     epoch_dir: Path,
@@ -4468,6 +4485,41 @@ def run_scheduled_adaptive_epoch(
             })
             return seg_dir
         seg_args.gamd_production_steps = int(actual_steps)
+        # runtime_pool.consume() below must be charged the NEW steps this call
+        # actually computes (delta since the last checkpoint), not the call's
+        # full target - the checkpoint's own prod_done already reflects any
+        # real progress from earlier invocations, including ones whose target
+        # was smaller (an earlier restart, more pool remaining) or larger (a
+        # later restart, less pool remaining, clip_steps returned less) than
+        # this one.  Charging the full target every time double/triple/N-charges
+        # the same real work on every restart that resumes an unfinished or
+        # already-finished segment; for a segment with no next phase to advance
+        # into (e.g. "final") that repeats indefinitely and silently drains the
+        # campaign's MD-time budget on pure overhead - confirmed on chignolin_6,
+        # where this drained ~8960 of 10000ns before the wrapper's pool-exhausted
+        # check finally stopped the self-chain.
+        _prior_prod_done = int(_segment_checkpoint_prod_done(seg_dir) or 0) if seg_args.resume else 0
+        _delta_steps = actual_steps - _prior_prod_done
+        if _delta_steps <= 0:
+            # Already at or past this call's target - resuming would do zero
+            # new MD steps.  Skip the run entirely (saves a no-op replica
+            # reconstruction) rather than just charging zero, since there is
+            # nothing left for run_gareus_callable to usefully do here.
+            print(
+                f"      scheduled segment {name}: already complete "
+                f"({_prior_prod_done}/{actual_steps} steps checkpointed); skipping resume, no pool charge"
+            )
+            segment_summaries.append({
+                "segment": name,
+                "dir": str(seg_dir),
+                "windows_csv": str(windows_csv),
+                "state_ids": [int(x) for x in state_ids],
+                "steps": int(actual_steps),
+                "requested_steps": int(requested_steps),
+                "already_complete": True,
+                "seed_bank": seed_report or {},
+            })
+            return seg_dir
         print(f"      scheduled segment {name}: {len(state_ids)} state(s), {actual_steps} steps")
         run_gareus_callable(seg_args, seg_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
         if _graceful_shutdown.is_set():
@@ -4487,7 +4539,7 @@ def run_scheduled_adaptive_epoch(
                 label=f"{epoch_dir.name}/{name}",
                 kind="scheduled_final" if "final" in str(epoch_dir) else "scheduled_epoch",
                 n_states=len(state_ids),
-                steps=int(actual_steps),
+                steps=int(_delta_steps),
                 path=seg_dir,
             )
         segment_summaries.append({
@@ -5253,10 +5305,18 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
         )
 
     # If extending a completed run, skip final phase if it already has sample data.
+    # _run_dir_has_samples(adaptive_dir / "final") alone would never be True for
+    # the default scheduled_final_segments=True case: a segmented final phase's
+    # samples live in final/baseline/, final/topup_*/, not directly in final/
+    # itself, so use the same flat-or-segmented lookup _sample_sources_from_run_root
+    # already uses elsewhere for this exact directory (see collect_final_combined_
+    # diagnostics and its union-MBAR-inputs equivalent) - otherwise this check can
+    # never fire, and every self-chain restart re-enters and re-runs the final
+    # phase's already-complete segments indefinitely.
     _final_already_done = (
         resume_requested
         and _is_adaptive_production_completed(adaptive_dir)
-        and _run_dir_has_samples(adaptive_dir / "final")
+        and bool(_sample_sources_from_run_root("final", adaptive_dir / "final"))
     )
     if _final_already_done:
         print("[extend] Final phase already complete; skipping to extension rounds.")
