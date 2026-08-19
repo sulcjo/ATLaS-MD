@@ -2031,7 +2031,20 @@ def generate_us_starting_states_by_pulling(
         max_drop_fraction = float(getattr(args, "us_auto_drop_max_fraction", 1.0 / 3.0) or (1.0 / 3.0))
         drop_fraction = n_bad / float(nwin)
         _phase_info = getattr(args, "_adaptive_phase_info", {}) or {}
-        _topup_auto_allow = bool(_phase_info.get("is_topup"))
+        # This fallback's whole premise is "a topup always re-seeds an already-
+        # established window" - confirmed FALSE in general: pool exhaustion can
+        # zero out baseline's clip_steps allowance for a large state batch while
+        # a smaller topup subset still affords nonzero steps in the SAME round
+        # (adaptive_production.py's run_segment, clip_steps divides remaining
+        # budget by n_states), so a state that just entered the active set this
+        # round (tica_coverage/split) can have its first-ever real production
+        # happen inside a topup segment with no prior baseline sampling at all.
+        # adaptive_production.py tracks exactly this via
+        # states_without_baseline_this_round; if this segment includes ANY such
+        # state, do not auto-allow - fall through to the strict raise, since the
+        # premise this fallback depends on does not hold for this segment.
+        _topup_has_unestablished_state = bool(_phase_info.get("states_without_baseline_this_round"))
+        _topup_auto_allow = bool(_phase_info.get("is_topup")) and not _topup_has_unestablished_state
         if auto_drop and drop_fraction <= max_drop_fraction:
             # Some windows never converge on the secondary CV no matter how hard they
             # are pulled (kinetic trapping / no path from the available seed, not a
@@ -2072,6 +2085,13 @@ def generate_us_starting_states_by_pulling(
                 if auto_drop
                 else "pass --us-auto-drop-bad-windows to automatically drop them and continue, or"
             )
+            if _topup_has_unestablished_state:
+                _reason += (
+                    " (topup auto-allow was NOT applied here despite this being a topup segment: it "
+                    "includes at least one state with no completed baseline sampling this round - "
+                    "states_without_baseline_this_round in _adaptive_phase_info - so this would be that "
+                    "state's first-ever real production, not a re-seed of an established window.)"
+                )
             raise RuntimeError(
                 f"US starting-structure quality gate: {n_bad}/{nwin} windows are 'bad' "
                 "(starting structure far enough from its production umbrella center that the "

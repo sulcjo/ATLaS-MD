@@ -393,12 +393,51 @@ def collect_artifact_hashes(out_dir: Path, *, hash_limit_mb: float = _DEFAULT_HA
     }
 
 
+def _warn_on_provenance_drift(existing: dict[str, Any], out_dir: Path, args: Any) -> None:
+    """Compare this resume's freshly-computed provenance hashes against the
+    ones the manifest already recorded, and warn (never raise or block) on a
+    mismatch.
+
+    The hashes have been captured for reproducibility since this manifest's
+    inception, but nothing ever compared them again after the first write -
+    so code/dependency/input drift between two invocations of the SAME
+    campaign (a fix deployed mid-campaign, an environment update between
+    SLURM restarts) was invisible even though the data to detect it already
+    existed. This is deliberately warn-only: a version bump between restarts
+    is not automatically wrong, and this check must never turn a legitimate
+    resume into a hard failure.
+    """
+    try:
+        old_source = existing.get("package_source")
+        new_source = _package_source_hash()
+        if isinstance(old_source, dict) and isinstance(new_source, dict) and old_source != new_source:
+            print(
+                f"WARNING: provenance drift detected resuming {out_dir}: package_source hash "
+                f"differs from the run manifest recorded at start (code changed between restarts "
+                f"of this campaign - old={old_source.get('hash', old_source)!r} "
+                f"new={new_source.get('hash', new_source)!r})."
+            )
+        old_inputs = existing.get("input_files")
+        new_inputs = _input_file_hashes(args)
+        if isinstance(old_inputs, dict) and isinstance(new_inputs, dict) and old_inputs != new_inputs:
+            changed = sorted(set(old_inputs) | set(new_inputs))
+            changed = [k for k in changed if old_inputs.get(k) != new_inputs.get(k)]
+            print(
+                f"WARNING: provenance drift detected resuming {out_dir}: input_files hash(es) "
+                f"differ from the run manifest recorded at start for: {changed}."
+            )
+    except Exception as exc:
+        print(f"WARNING: provenance drift check failed (non-fatal, resume continues): {exc}")
+
+
 def initialize_run_manifest(args: Any, out_dir: Path, argv: Optional[Iterable[str]] = None) -> dict[str, Any]:
     """Create/update the start-of-run provenance manifest."""
     out_dir = Path(out_dir)
     arg_list = list(_argv_as_list(argv) if _argv_as_list is not None else (sys.argv[1:] if argv is None else list(argv)))  # type: ignore[misc]
     existing = _read_manifest(out_dir)
     resume = bool(getattr(args, "resume", False))
+    if resume and existing:
+        _warn_on_provenance_drift(existing, out_dir, args)
     run_id = existing.get("run_id") if resume and existing.get("run_id") else str(uuid.uuid4())
     start_time = existing.get("start_time_utc") if resume and existing.get("start_time_utc") else _utc_now()
     command_line = _shell_join([sys.executable, "-m", "gareus"] + [str(x) for x in arg_list]) if _shell_join is not None else " ".join([sys.executable, "-m", "gareus"] + [str(x) for x in arg_list])  # type: ignore[misc]

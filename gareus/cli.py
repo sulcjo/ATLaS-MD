@@ -8,6 +8,7 @@ import csv
 import json
 import math
 import os
+import shutil
 import warnings
 from pathlib import Path
 from typing import Iterable, Optional
@@ -498,6 +499,9 @@ def _add_gamd_args(p: argparse.ArgumentParser) -> None:
                    action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--randomize-replica-velocities", action="store_true")
     p.add_argument("--checkpoint-interval", type=int, default=50000)
+    p.add_argument("--strict-gamd-restore", action="store_true", default=False,
+                   help="Abort a resume if GaMD integrator globals fail to restore cleanly from "
+                        "checkpoint, instead of only warning and continuing with degraded/reset boost state.")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--extend", action="store_true", default=False,
                    help="Extend a completed run instead of resuming an interrupted one.")
@@ -1536,6 +1540,28 @@ def main(argv: Optional[Iterable[str]] = None):
         args.out = str(out_dir)
         _main_dir.mkdir(parents=True, exist_ok=True)
         print(f"[scratchdir] I/O → {out_dir}  (synced to {_main_dir} at each checkpoint)")
+        # Reverse (main->scratch) hydration: a SLURM restart can land on a fresh
+        # node whose local scratch is empty even though prior campaign progress
+        # is still safe in the persistent main directory. If scratch is missing
+        # the resume marker (01_solvated_start.pdb; see checkpoints.py) that the
+        # resume/extend code paths below check for, and main has it, pull main's
+        # content into scratch first. Only ever copies into an empty/marker-less
+        # scratch dir, so it never clobbers newer in-progress scratch state.
+        _scratch_resolved = out_dir.resolve()
+        _main_resolved = _main_dir.resolve()
+        _scratchdir_nested = (
+            _scratch_resolved == _main_resolved
+            or _main_resolved in _scratch_resolved.parents
+            or _scratch_resolved in _main_resolved.parents
+        )
+        if _scratchdir_nested:
+            print(f"WARNING [scratchdir hydrate]: scratch ({out_dir}) and main ({_main_dir}) are nested; skipping hydration")
+        elif not (out_dir / "01_solvated_start.pdb").exists() and (_main_dir / "01_solvated_start.pdb").exists():
+            print(f"[scratchdir] hydrating scratch from existing campaign progress: {_main_dir} → {out_dir}")
+            try:
+                shutil.copytree(str(_main_dir), str(out_dir), dirs_exist_ok=True, copy_function=shutil.copy2)
+            except Exception as exc:
+                print(f"WARNING [scratchdir hydrate]: {_main_dir} → {out_dir} failed: {exc}")
     else:
         out_dir.mkdir(parents=True, exist_ok=True)
     configure_color(args.color)

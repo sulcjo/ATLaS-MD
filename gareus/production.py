@@ -27,7 +27,7 @@ from typing import Any, Optional
 
 import numpy as np
 
-from .io import BufferedCsvDictWriter, write_json, read_json_file, _json_ready
+from .io import BufferedCsvDictWriter, write_json, read_json_file, _json_ready, acquire_run_lock
 from .logger import DistanceLogger, is_gamd_production_phase
 from .store import ParquetSampleWriter, ParquetExchangeWriter, SegmentRegistry, WindowSnapshot, parse_gamd_boost_components, finalize_segment
 from .progress import GuiProgressSink, release_openmm_contexts
@@ -2698,7 +2698,8 @@ def save_production_checkpoint(out_dir: Path, sims: list, assignments: list[int]
                                parity: int, attempt: int, next_exchange: int, next_log: int, exchange_stats: dict, rng,
                                centers_a=None, k_list=None, cv_atom1=None, cv_atom2=None, cv_label=None, calib_steps=None,
                                secondary_cv_metadata=None, secondary_cv_centers=None, secondary_cv_k_kcal_list=None,
-                               primary_cv_metadata=None) -> None:
+                               primary_cv_metadata=None, openmm_version: Optional[str] = None,
+                               platform_name: Optional[str] = None) -> None:
     """Write restart checkpoints for all production replicas.
 
     The OpenMM binary checkpoint is platform/version specific but it is the most
@@ -2730,10 +2731,14 @@ def save_production_checkpoint(out_dir: Path, sims: list, assignments: list[int]
         replica_integrator_globals_all.append(_json_ready(g))
         replica_integrator_global_counts.append(int(len(g)))
         rel = f"replica_{r:03d}.chk"
-        (chk_dir / rel).write_bytes(sim.context.createCheckpoint())
+        tmp_chk = chk_dir / f"{rel}.tmp"
+        tmp_chk.write_bytes(sim.context.createCheckpoint())
+        tmp_chk.replace(chk_dir / rel)
         replica_files.append(rel)
     manifest = {
         "schema": "gareus_production_checkpoint_v1",
+        "openmm_version": str(openmm_version) if openmm_version is not None else None,
+        "platform_name": str(platform_name) if platform_name is not None else None,
         "created_unix_time": time.time(),
         "prod_done": int(prod_done),
         "absolute_step": int(absolute_step),
@@ -2771,9 +2776,10 @@ def save_production_checkpoint(out_dir: Path, sims: list, assignments: list[int]
         manifest["secondary_cv_centers"] = [float(x) for x in secondary_cv_centers]
     if secondary_cv_k_kcal_list is not None:
         manifest["secondary_cv_k_kcal_mol"] = [float(x) for x in secondary_cv_k_kcal_list]
-    tmp = chk_dir / "production_checkpoint_manifest.tmp"
+    manifest_path = checkpoint_manifest_path(out_dir)
+    tmp = chk_dir / f"{manifest_path.name}.tmp.{os.getpid()}"
     tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
-    tmp.replace(checkpoint_manifest_path(out_dir))
+    tmp.replace(manifest_path)
 
 def sync_scratch_to_main(scratch_dir: Path, main_dir: Path) -> None:
     """Copy everything from scratchdir to maindir (called at each checkpoint).
@@ -2793,12 +2799,20 @@ def sync_scratch_to_main(scratch_dir: Path, main_dir: Path) -> None:
     except Exception as exc:
         print(f"WARNING [scratchdir sync]: {scratch_dir} → {main_dir} failed: {exc}")
 
-def load_production_checkpoint(out_dir: Path, sims: list, centers_nm, ks_kj_nm2, rng, secondary_centers=None, secondary_ks_kj=None) -> Optional[dict]:
+def load_production_checkpoint(out_dir: Path, sims: list, centers_nm, ks_kj_nm2, rng, secondary_centers=None, secondary_ks_kj=None,
+                               openmm_version: Optional[str] = None, platform_name: Optional[str] = None,
+                               strict_gamd_restore: bool = False) -> Optional[dict]:
     """Load a production checkpoint manifest and all replica checkpoints if available."""
     manifest_path = checkpoint_manifest_path(out_dir)
     if not manifest_path.exists():
         return None
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_openmm_version = manifest.get("openmm_version")
+    if openmm_version is not None and manifest_openmm_version is not None and str(manifest_openmm_version) != str(openmm_version):
+        print(f"WARNING: checkpoint manifest was written with OpenMM {manifest_openmm_version}, but this run is using OpenMM {openmm_version}; a version bump is not automatically incompatible, but resume state should be checked carefully.")
+    manifest_platform_name = manifest.get("platform_name")
+    if platform_name is not None and manifest_platform_name is not None and str(manifest_platform_name) != str(platform_name):
+        print(f"WARNING: checkpoint manifest was written on platform '{manifest_platform_name}', but this run is using platform '{platform_name}'; resume state should be checked carefully.")
     files = manifest.get("replica_checkpoint_files", [])
     if len(files) != len(sims):
         raise RuntimeError(f"Checkpoint replica count mismatch: manifest has {len(files)} files, current run has {len(sims)} replicas")
@@ -2818,6 +2832,11 @@ def load_production_checkpoint(out_dir: Path, sims: list, centers_nm, ks_kj_nm2,
     gamd_restore_report = _restore_gamd_integrator_globals_after_checkpoint(Path(out_dir), sims, manifest)
     manifest["resume_gamd_integrator_restore_report"] = gamd_restore_report
     if not bool(gamd_restore_report.get("ok", False)):
+        if strict_gamd_restore:
+            raise RuntimeError(
+                f"GaMD integrator-global restore was incomplete after checkpoint load (source={gamd_restore_report.get('source')}); "
+                "aborting because --strict-gamd-restore is set. See resume_gamd_integrator_restore_report.json for details."
+            )
         try:
             post_load_globals = [all_integrator_globals(sim.integrator) for sim in sims]
             changed = 0
@@ -3646,6 +3665,7 @@ def _augment_seed_bank_with_campaign_search(
 
 def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equil_state, progress: Optional[GuiProgressSink] = None):
     _register_graceful_shutdown()
+    acquire_run_lock(out_dir)
     platform, props = platform_and_properties(openmm, args.platform, args.precision, args.device_index, args.cpu_threads, args=args)
     setup_platform, setup_props = setup_platform_and_properties(openmm, args)
     if not (Path(out_dir) / "run_manifest.json").exists():
@@ -5211,9 +5231,15 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 adaptive_phase_info["epoch_total"] = _et if _et == "?" else int(_et)
 
         if bool(getattr(args, "resume", False)):
-            manifest = load_production_checkpoint(out_dir, sims, centers_nm, ks_kj_nm2, rng, secondary_cv_centers, secondary_cv_ks_kj)
+            manifest = load_production_checkpoint(
+                out_dir, sims, centers_nm, ks_kj_nm2, rng, secondary_cv_centers, secondary_cv_ks_kj,
+                openmm_version=str(getattr(getattr(openmm, "version", None), "version", None)),
+                platform_name=str(platform.getName()),
+                strict_gamd_restore=bool(getattr(args, "strict_gamd_restore", False)),
+            )
             if manifest is not None:
                 assignments[:] = [int(x) for x in manifest.get("assignments", assignments)]
+                dashboard_info["gamd_integrator_restore_ok"] = bool(manifest.get("resume_gamd_integrator_restore_report", {}).get("ok", False))
                 _refresh_replica_of_window()
                 prod_done = int(manifest.get("prod_done", 0))
                 attempt = int(manifest.get("attempt", 0))
@@ -5297,7 +5323,12 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     secondary_cv_centers=secondary_cv_centers,
                     secondary_cv_k_kcal_list=secondary_cv_k_kcal_list,
                     primary_cv_metadata=_json_ready(primary_cv_def),
+                    openmm_version=str(getattr(getattr(openmm, "version", None), "version", None)),
+                    platform_name=str(platform.getName()),
                 )
+                _scratch_main = getattr(args, "_main_dir", None)
+                if _scratch_main:
+                    sync_scratch_to_main(out_dir, Path(_scratch_main))
                 break
             target = prod_total
             if next_exchange > prod_done:
@@ -5373,6 +5404,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     secondary_cv_centers=secondary_cv_centers,
                     secondary_cv_k_kcal_list=secondary_cv_k_kcal_list,
                     primary_cv_metadata=_json_ready(primary_cv_def),
+                    openmm_version=str(getattr(getattr(openmm, "version", None), "version", None)),
+                    platform_name=str(platform.getName()),
                 )
                 _scratch_main = getattr(args, "_main_dir", None)
                 if _scratch_main:
