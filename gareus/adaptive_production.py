@@ -4351,6 +4351,23 @@ def _assert_epoch_has_samples(
         raise RuntimeError(" ".join(parts))
 
 
+def _segment_checkpoint_prod_done(seg_dir: Path) -> Optional[int]:
+    """Return a segment's already-checkpointed production step count, or None if unavailable.
+
+    Lazy-imports checkpoint_manifest_path from .production (not at module level)
+    because production.py -> adaptive_production.py is an existing import chain;
+    importing it back here at module scope would make it circular.
+    """
+    from .production import checkpoint_manifest_path
+    manifest = read_json_file(checkpoint_manifest_path(seg_dir), None)
+    if not isinstance(manifest, dict):
+        return None
+    try:
+        return int(manifest.get("prod_done", 0))
+    except (TypeError, ValueError):
+        return None
+
+
 def run_scheduled_adaptive_epoch(
     args: Any,
     epoch_dir: Path,
@@ -4468,6 +4485,34 @@ def run_scheduled_adaptive_epoch(
             })
             return seg_dir
         seg_args.gamd_production_steps = int(actual_steps)
+        if seg_args.resume:
+            _prior_prod_done = _segment_checkpoint_prod_done(seg_dir)
+            if _prior_prod_done is not None and _prior_prod_done >= actual_steps:
+                # Segment already reached this call's target production step
+                # count in a previous self-chain restart - resuming would do
+                # zero new MD steps.  Skip the run entirely rather than paying
+                # for a no-op replica reconstruction and (worse) charging the
+                # runtime pool the segment's full nominal cost again: without
+                # this guard, every restart that lands on an already-finished
+                # segment (e.g. a "final" phase segment with no next phase to
+                # advance into) re-charges runtime_pool.consume() below for
+                # steps that were never actually recomputed, silently
+                # draining the campaign's MD-time budget on pure overhead.
+                print(
+                    f"      scheduled segment {name}: already complete "
+                    f"({_prior_prod_done}/{actual_steps} steps checkpointed); skipping resume, no pool charge"
+                )
+                segment_summaries.append({
+                    "segment": name,
+                    "dir": str(seg_dir),
+                    "windows_csv": str(windows_csv),
+                    "state_ids": [int(x) for x in state_ids],
+                    "steps": int(actual_steps),
+                    "requested_steps": int(requested_steps),
+                    "already_complete": True,
+                    "seed_bank": seed_report or {},
+                })
+                return seg_dir
         print(f"      scheduled segment {name}: {len(state_ids)} state(s), {actual_steps} steps")
         run_gareus_callable(seg_args, seg_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
         if _graceful_shutdown.is_set():
