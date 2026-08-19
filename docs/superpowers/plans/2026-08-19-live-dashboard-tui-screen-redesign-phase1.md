@@ -2466,7 +2466,7 @@ git commit -m "feat(dashboard): add the ten-line spine with bucketed window stri
 
 **Interfaces:**
 - Consumes: Task 1's `Panel`/`Row`; Task 6's `panel`; Task 5's `DashboardContext`.
-- Produces: `build(ctx: DashboardContext) -> tuple[Row, ...]`; `timeline_panel(ctx) -> Panel`; `projection_panel(ctx) -> Panel`; `throughput_panel(ctx) -> Panel`; `collapse_extension_rounds(events: Sequence[Mapping]) -> tuple[tuple[str, float, int, str], ...]`.
+- Produces: `build(ctx: DashboardContext) -> tuple[Row, ...]`; `timeline_panel(ctx) -> Panel`; `projection_panel(ctx) -> Panel`; `throughput_panel(ctx) -> Panel`; `collapse_extension_rounds(events: Sequence[Mapping]) -> tuple[tuple[str, int, float, int, bool], ...]`.
 
 The timeline is the pool ledger's `events[]`, chronological. Repeated
 `epoch_NNN/baseline` entries are the quality-gate extension rounds; they collapse into
@@ -2491,14 +2491,19 @@ CENTERS = tuple(4.0 + 0.55 * i for i in range(6))
 # assertion could ever satisfy.
 NOW = 1_700_000_000.0
 
+# Shaped like the real ledger: the three extension-loop segments interleave
+# rather than repeating consecutively (epoch_001/baseline appears 3x here,
+# separated by the two final/* segments each time).
 POOL = {
     "total_ns": 15000.0, "used_ns": 7500.0, "remaining_ns": 7500.0, "timestep_fs": 4.0,
     "events": [
         {"label": "epoch_000", "kind": "adaptive_epoch", "consumed_ns": 1875.0, "n_states": 27},
-        {"label": "final/baseline", "kind": "scheduled_final", "consumed_ns": 14.5, "n_states": 29},
         {"label": "epoch_001/baseline", "kind": "scheduled_epoch", "consumed_ns": 1391.7, "n_states": 29},
+        {"label": "final/baseline", "kind": "scheduled_final", "consumed_ns": 14.5, "n_states": 29},
         {"label": "epoch_001/baseline", "kind": "scheduled_epoch", "consumed_ns": 1029.3, "n_states": 29},
+        {"label": "final/baseline", "kind": "scheduled_final", "consumed_ns": 14.5, "n_states": 29},
         {"label": "epoch_001/baseline", "kind": "scheduled_epoch", "consumed_ns": 757.5, "n_states": 29},
+        {"label": "final/topup_001_375000", "kind": "scheduled_final", "consumed_ns": 43.5, "n_states": 29},
     ],
 }
 GAMD = {"joint_envelope": {"Dihedral": {"sigma0_kj_mol": 12.552, "sigmaV_kj_mol": 11.039, "k0": 1.0}}}
@@ -2537,11 +2542,32 @@ def test_progress_view_lists_pool_events_chronologically(tmp_path):
     assert "1875" in text
 
 
-def test_progress_view_collapses_repeated_extension_rounds(tmp_path):
+def test_progress_view_groups_repeated_segments_into_one_row_each(tmp_path):
+    """Mirrors the real ledger's shape: repeats interleave rather than run
+    consecutively, so grouping by label is what keeps the panel readable."""
     rows = view_progress.build(_ctx(tmp_path, sidecar=SidecarSnapshot(pool=POOL)))
     text = _text(rows)
-    assert "ext round" in text
-    assert text.count("epoch_001/baseline") == 1        # first occurrence only
+    assert text.count("epoch_001/baseline") == 1        # one row, not three
+    assert "x3" in text                                 # with its occurrence count
+    assert "3178" in text or "3178.5" in text           # and its summed ns
+
+
+def test_collapse_extension_rounds_matches_the_real_ledger_shape():
+    """The chignolin_5 ledger: 27 events, 6 labels, three of them 8x interleaved."""
+    events = []
+    for _ in range(8):
+        events.append({"label": "epoch_001/baseline", "consumed_ns": 100.0, "n_states": 29})
+        events.append({"label": "final/baseline", "consumed_ns": 14.5, "n_states": 29})
+        events.append({"label": "final/topup_001_375000", "consumed_ns": 43.5, "n_states": 29})
+    events.insert(0, {"label": "epoch_000", "consumed_ns": 1875.0, "n_states": 27})
+    grouped = view_progress.collapse_extension_rounds(events)
+    assert len(grouped) == 4                            # four distinct labels here
+    labels = [row[0] for row in grouped]
+    assert labels[0] == "epoch_000"                     # first-appearance order
+    by_label = {row[0]: row for row in grouped}
+    assert by_label["epoch_001/baseline"][1] == 8       # occurrences
+    assert by_label["epoch_001/baseline"][2] == 800.0   # summed ns
+    assert by_label["final/topup_001_375000"][4] is True    # holds the final event
 
 
 def test_progress_view_explains_a_missing_pool_ledger(tmp_path):
@@ -2592,23 +2618,43 @@ _SECONDS_PER_DAY = 86400.0
 
 def collapse_extension_rounds(
     events: Sequence[Mapping[str, object]]
-) -> tuple[tuple[str, float, int, str], ...]:
-    """Collapse repeated same-label segments into ``↳ ext round N`` rows.
+) -> tuple[tuple[str, int, float, int, bool], ...]:
+    """Group ledger events by segment label, in first-appearance order.
 
-    A quality-gate extension loop re-invokes the same segment with a shrinking
-    remaining gap, so the ledger holds several `epoch_001/baseline` entries. The
-    first keeps its name; later ones are numbered.
+    Returns ``(label, occurrences, total_ns, n_states, is_current)`` per label.
+
+    Why grouping rather than a chronological list with the repeats renamed: on a
+    real ledger the quality-gate extension loop does not repeat one segment
+    consecutively, it cycles through several. The chignolin_5 ledger holds 27
+    events over just 6 distinct labels -- ``epoch_001/baseline``,
+    ``final/baseline`` and ``final/topup_001_375000`` each appear 8 times,
+    interleaved. Numbering repeats in place would put "round 5" of one segment
+    directly under a different segment's row, and 27 rows in a 12-line panel
+    means 16 of them get trimmed away regardless.
+
+    Grouped, the same ledger is 6 rows that fit, and they answer the question the
+    panel exists for -- where the MD budget actually went. Chronology is not lost
+    entirely: the group holding the final event is marked current.
     """
-    seen: dict[str, int] = {}
-    out: list[tuple[str, float, int, str]] = []
+    order: list[str] = []
+    counts: dict[str, int] = {}
+    totals: dict[str, float] = {}
+    states: dict[str, int] = {}
+    last_label = ""
     for event in events:
         label = str(event.get("label", "") or "")
-        consumed = float(event.get("consumed_ns", 0.0) or 0.0)
-        states = int(event.get("n_states", 0) or 0)
-        seen[label] = seen.get(label, 0) + 1
-        display = label if seen[label] == 1 else f" ↳ ext round {seen[label]}"
-        out.append((display, consumed, states, str(event.get("kind", "") or "")))
-    return tuple(out)
+        if label not in counts:
+            order.append(label)
+            counts[label] = 0
+            totals[label] = 0.0
+        counts[label] += 1
+        totals[label] += float(event.get("consumed_ns", 0.0) or 0.0)
+        states[label] = int(event.get("n_states", 0) or 0)
+        last_label = label
+    return tuple(
+        (label, counts[label], totals[label], states[label], label == last_label)
+        for label in order
+    )
 
 
 def _ledger_age(ctx: DashboardContext) -> str:
@@ -2629,13 +2675,15 @@ def timeline_panel(ctx: DashboardContext) -> Panel:
                                  "(non-adaptive run, or first epoch still open)", "dim")],
                      min_lines=1, want_lines=2, priority=1)
     rows = collapse_extension_rounds(events)
-    peak = max((ns for _l, ns, _s, _k in rows), default=1.0) or 1.0
-    bar_w = max(10, (ctx.term_w - 2) - 60)
+    peak = max((ns for _l, _n, ns, _s, _c in rows), default=1.0) or 1.0
+    bar_w = max(10, (ctx.term_w - 2) - 64)
     lines = []
-    for label, consumed, states, _kind in rows:
-        filled = int(round(bar_w * consumed / peak))
-        lines.append(f" {label:<22.22} " + "█" * filled + " " * (bar_w - filled)
-                     + f" {consumed:9.1f} ns  {states:2d} st  ✓ done")
+    for label, occurrences, consumed, states, is_current in rows:
+        filled = int(round(bar_w * consumed / peak)) if peak > 0 else 0
+        shown = f"{label} x{occurrences}" if occurrences > 1 else label
+        mark = "▶ running" if is_current else "✓ done"
+        lines.append(f" {shown:<26.26} " + "█" * filled + " " * (bar_w - filled)
+                     + f" {consumed:9.1f} ns  {states:2d} st  {mark}")
     remaining = float(pool.get("remaining_ns", 0.0) or 0.0)
     if remaining > 0:
         lines.append(f" {'final (reserve)':<22.22} " + "░" * bar_w
