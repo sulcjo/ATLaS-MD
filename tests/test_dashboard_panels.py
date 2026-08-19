@@ -88,6 +88,27 @@ def test_window_table_panel_puts_the_worst_window_first(tmp_path):
     assert BAD in body[0]
 
 
+def test_window_detail_panel_reads_the_trace_of_the_replica_in_that_window(tmp_path):
+    """The trace map is replica-keyed, so a fixture where replica != window is
+    the only shape that can catch indexing it by window index."""
+    args = argparse.Namespace(timestep_fs=2.0, temperature_k=300.0)
+    logger = DistanceLogger(tmp_path, args, no_file_persistence=True)
+    logger.window_trace_by_replica[7] = [2, 3, 2]      # replica 7 sits in window 2
+    logger.window_trace_by_replica[2] = [9, 9, 9]      # decoy: replica 2's own trail
+    rows = [{"replica": 7, "window": 2, "center_A": 5.10, "k_kcal_mol_A2": 2.5,
+             "cv_A": 5.15, "umbrella_bias_kcal_mol": 0.0, "umbrella_pull_kcal_mol_A": 0.0}]
+    ctx = build_context(
+        logger=logger, rows=rows, phase="gareus_production", step=1, total_steps=10,
+        summary={}, dashboard_info={"centers_a": list(CENTERS), "n_windows": 4,
+                                   "k_list": [2.5] * 4},
+        sidecar=SidecarSnapshot(), term_w=140, term_h=45, now=1000.0,
+        view="windows", glyphs="unicode",
+    )
+    text = strip_ansi("\n".join(window_detail_panel(ctx, 2).lines))
+    assert "r07" in text
+    assert "w09" not in text          # replica 2's decoy trail must not appear
+
+
 def test_window_detail_panel_names_the_window_and_its_restraint(tmp_path):
     ctx = _ctx(tmp_path)
     text = strip_ansi("\n".join(window_detail_panel(ctx, 2).lines))

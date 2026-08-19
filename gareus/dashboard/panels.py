@@ -415,43 +415,17 @@ def pull_panel(ctx: DashboardContext) -> Panel:
     return panel("pull", "umbrella pull field", lines, min_lines=4, want_lines=10, priority=3, weight=1.0)
 
 
-def _span_and_roundtrips(trace: Sequence[int], n_windows: int) -> tuple[int, int]:
-    """Coverage span and round-trip count derived from a replica's window trace.
-
-    ``DashboardContext`` has no field for ``DistanceLogger.roundtrip_state`` (an
-    unbounded lifetime counter keyed by low/high-window side transitions); this
-    recomputes the same transition count from the bounded (last-200 entries,
-    de-duplicated) ``window_trace_by_replica`` the context does carry. For a
-    replica with more than roughly 200 real window transitions this undercounts
-    the lifetime total -- an acceptable trade for a live view, which is more
-    concerned with recent behaviour than an exact all-time count anyway.
-    """
-    if not trace:
-        return 0, 0
-    low_win, high_win = 0, max(0, int(n_windows) - 1)
-    span = max(trace) - min(trace)
-    roundtrips = 0
-    side = None
-    if high_win > 0:
-        for w in trace:
-            if w == low_win:
-                if side == "high":
-                    roundtrips += 1
-                side = "low"
-            elif w == high_win:
-                if side == "low":
-                    roundtrips += 1
-                side = "high"
-    return int(span), int(roundtrips)
-
-
 def replica_table_panel(ctx: DashboardContext, ncols: int = 1) -> Panel:
     """All-replica table: health, CV/delta, PE, boost, sparkline, window trail.
 
     Phase 1 drops the original method's optional 2D CV2 column: it needed
     per-replica secondary-CV history, which ``ctx`` only carries per-window
-    (``secondary_history_by_window``), not per-replica. Round-trip/span is not a
-    straight substitution either -- see ``_span_and_roundtrips``.
+    (``secondary_history_by_window``), not per-replica. Round-trip/span comes
+    straight from ``ctx.roundtrip_state`` (added to ``DashboardContext``
+    specifically for this), the same lifetime `min`/`max`/`roundtrips` counter
+    ``self.roundtrip_state`` was -- not an approximation from the bounded
+    (200-entry) ``window_trace_by_replica``, which would silently undercount a
+    long-running replica's real lifetime total.
     """
     if not ctx.rows:
         return panel("replicas", "replica table",
@@ -482,7 +456,9 @@ def replica_table_panel(ctx: DashboardContext, ncols: int = 1) -> Panel:
         cv_stuck = len(recent10) >= 10 and math.isfinite(recent_span) and recent_span < 0.05
 
         tr = list(ctx.window_trace_by_replica.get(rep, ()))
-        span_val, trips = _span_and_roundtrips(tr, ctx.n_windows)
+        rt = ctx.roundtrip_state.get(rep, {})
+        span_val = int(rt.get("max", 0)) - int(rt.get("min", 0))
+        trips = int(rt.get("roundtrips", 0))
         win_stuck = len(set(tr[-5:])) <= 1 and len(tr) >= 5
         trail = "→".join(f"w{x:02d}" for x in tr[-4:])
 
@@ -559,9 +535,17 @@ def window_detail_panel(ctx: DashboardContext, window: int) -> Panel:
             other = b if a == w else a
             label = "DEAD" if math.isfinite(rate) and rate < 0.02 else OK
             lines.append(f"  exchange    w{other:02d} {rate:5.2f}  " + label)
-    trace = ctx.window_trace_by_replica.get(w, ())
+    # `window_trace_by_replica` is keyed by REPLICA (gareus/logger.py:520), so it
+    # must be indexed by whichever replica currently occupies this window -- not
+    # by the window index. Every fixture built replica == window, which is why no
+    # test could tell the two apart; on a real run after the first swap, indexing
+    # by window shows a different replica's trail.
+    replica = next((int(r["replica"]) for r in ctx.rows
+                    if int(r.get("window", -1)) == w), None)
+    trace = ctx.window_trace_by_replica.get(replica, ()) if replica is not None else ()
     if trace:
-        lines.append(f"  occupancy   windows visited: {', '.join(f'w{t:02d}' for t in trace[-6:])}")
+        lines.append(f"  occupancy   replica r{replica:02d}, windows visited: "
+                     + ", ".join(f"w{t:02d}" for t in trace[-6:]))
     return panel(f"detail-w{w:02d}", f"w{w:02d} detail", lines,
                  min_lines=6, want_lines=11, priority=1)
 

@@ -48,6 +48,20 @@ def test_acceptance_by_pair_reads_the_real_nested_payload_shape():
     assert set(pairs) == {(0, 1), (1, 2), (2, 3)}   # run-level totals are not pairs
 
 
+def test_roundtrip_state_snapshot_survives_in_place_mutation(tmp_path):
+    """`_update_history` mutates these per-replica dicts in place all run."""
+    logger = DistanceLogger(tmp_path, argparse.Namespace(), no_file_persistence=True)
+    logger.roundtrip_state[0] = {"side": "low", "roundtrips": 1, "min": 0, "max": 3}
+    ctx = build_context(
+        logger=logger, rows=_rows(), phase="p", step=1, total_steps=2, summary={},
+        dashboard_info={"centers_a": [4.0], "n_windows": 1},
+        sidecar=SidecarSnapshot(), term_w=100, term_h=30, now=1.0,
+        view="progress", glyphs="unicode",
+    )
+    logger.roundtrip_state[0]["roundtrips"] = 99
+    assert ctx.roundtrip_state[0]["roundtrips"] == 1
+
+
 def test_exchange_stats_snapshot_survives_in_place_mutation_of_the_source():
     """production.py mutates one long-lived exchange_stats dict for the whole
     run, so a shallow copy would let the render thread see a torn read."""

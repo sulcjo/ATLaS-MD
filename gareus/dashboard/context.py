@@ -145,6 +145,7 @@ class DashboardContext:
     boost_history_all: tuple[float, ...]
     window_trace_by_replica: Mapping[int, tuple[int, ...]]
     exchange_stats: Mapping[str, Any]
+    roundtrip_state: Mapping[int, Mapping[str, Any]]
     acceptance_pairs: Mapping[tuple[int, int], float]
     acceptance_windows: Mapping[int, float]
     overlap_pairs: Mapping[tuple[int, int], float]
@@ -292,6 +293,13 @@ def build_context(
             for k, v in (getattr(logger, "window_trace_by_replica", {}) or {}).items()
         },
         exchange_stats=_copy_exchange_stats(info.get("exchange_stats")),
+        # One level deep, for the same reason as exchange_stats: `_update_history`
+        # mutates these dicts in place all run (gareus/logger.py:525-537).
+        roundtrip_state={
+            int(k): dict(v) for k, v in
+            (getattr(logger, "roundtrip_state", {}) or {}).items()
+            if isinstance(v, Mapping)
+        },
         acceptance_pairs=pairs,
         acceptance_windows=acceptance_by_window(pairs, n_windows),
         overlap_pairs=overlap_by_pair(hist_windows, centers),
