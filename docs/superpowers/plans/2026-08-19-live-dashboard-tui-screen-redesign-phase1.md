@@ -2028,8 +2028,11 @@ def window_detail_panel(ctx: DashboardContext, window: int) -> Panel:
     # by the window index. Every fixture built replica == window, which is why no
     # test could tell the two apart; on a real run after the first swap, indexing
     # by window shows a different replica's trail.
+    # Both key reads are defensive: `replica_table_panel` in this same file already
+    # reads the field as `r.get("replica", 0)`, and a row that matches the window
+    # but lacks a replica key should omit the line, not raise mid-frame.
     replica = next((int(r["replica"]) for r in ctx.rows
-                    if int(r.get("window", -1)) == w), None)
+                    if int(r.get("window", -1)) == w and r.get("replica") is not None), None)
     trace = ctx.window_trace_by_replica.get(replica, ()) if replica is not None else ()
     if trace:
         lines.append(f"  occupancy   replica r{replica:02d}, windows visited: "
