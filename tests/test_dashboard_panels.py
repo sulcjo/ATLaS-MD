@@ -1,0 +1,96 @@
+import argparse
+
+import pytest
+
+from gareus.dashboard.context import build_context
+from gareus.dashboard.panels import (
+    boost_envelope_panel,
+    overlap_panel,
+    panel,
+    window_detail_panel,
+    window_table_panel,
+)
+from gareus.dashboard.ranking import BAD, rank_windows
+from gareus.dashboard.sidecar import SidecarSnapshot
+from gareus.logger import DistanceLogger
+from gareus.tui import strip_ansi
+
+CENTERS = (4.0, 4.55, 5.10, 5.65)
+
+
+def _ctx(tmp_path, *, sidecar=None, histories=True, exchange=True):
+    args = argparse.Namespace(timestep_fs=2.0, temperature_k=300.0)
+    logger = DistanceLogger(tmp_path, args, no_file_persistence=True)
+    if histories:
+        for w, c in enumerate(CENTERS):
+            logger.history_by_window[w] = [c + 0.1 * (i % 5 - 2) for i in range(60)]
+        logger.boost_history_all = [2.0 + 0.5 * (i % 7) for i in range(200)]
+    stats = {f"{i}-{i+1}": {"attempts": 40, "accepted": 12} for i in range(3)} if exchange else {}
+    rows = [{"replica": w, "window": w, "center_A": c, "k_kcal_mol_A2": 2.5,
+             "cv_A": c + 0.05, "umbrella_bias_kcal_mol": 0.01,
+             "umbrella_pull_kcal_mol_A": 0.1} for w, c in enumerate(CENTERS)]
+    return build_context(
+        logger=logger, rows=rows, phase="gareus_production", step=10, total_steps=100,
+        summary={}, dashboard_info={"centers_a": list(CENTERS), "n_windows": 4,
+                                    "k_list": [2.5] * 4, "exchange_stats": stats,
+                                    "primary_cv_label": "contacts", "primary_cv_units": "A"},
+        sidecar=sidecar or SidecarSnapshot(), term_w=140, term_h=45, now=1000.0,
+        view="physics", glyphs="unicode",
+    )
+
+
+def test_panel_helper_builds_a_frozen_panel_with_the_given_budget():
+    p = panel("k", "title", ["a", "b"], min_lines=1, want_lines=4, priority=2, weight=1.5)
+    assert (p.key, p.title, p.lines, p.min_lines, p.want_lines, p.priority, p.weight) == (
+        "k", "title", ("a", "b"), 1, 4, 2, 1.5)
+
+
+def test_overlap_panel_lists_pairs_worst_first_with_a_severity_tail(tmp_path):
+    ctx = _ctx(tmp_path)
+    p = overlap_panel(ctx)
+    text = strip_ansi("\n".join(p.lines))
+    assert "w00-w01" in text
+    values = [float(line.split()[1]) for line in strip_ansi("\n".join(p.lines)).splitlines()
+              if line.strip().startswith("w")]
+    assert values == sorted(values)                 # ascending overlap == worst first
+    assert p.priority == 1 and p.min_lines == 5
+
+
+def test_overlap_panel_states_that_it_has_no_samples_yet(tmp_path):
+    p = overlap_panel(_ctx(tmp_path, histories=False))
+    assert "insufficient samples" in strip_ansi("\n".join(p.lines))
+
+
+def test_boost_envelope_panel_reports_sigma_target_and_k0_saturation(tmp_path):
+    sidecar = SidecarSnapshot(gamd={"joint_envelope": {"Dihedral": {
+        "sigma0_kj_mol": 12.552, "sigmaV_kj_mol": 11.039, "k0": 1.0}}})
+    text = strip_ansi("\n".join(boost_envelope_panel(_ctx(tmp_path, sidecar=sidecar)).lines))
+    assert "11.04" in text and "12.55" in text
+    assert "SATURATED" in text                      # k0 at its ceiling, stated as text
+
+
+def test_boost_envelope_panel_says_so_when_the_run_has_no_gamd(tmp_path):
+    text = strip_ansi("\n".join(boost_envelope_panel(_ctx(tmp_path)).lines))
+    assert "no GaMD" in text
+
+
+def test_window_table_panel_puts_the_worst_window_first(tmp_path):
+    ctx = _ctx(tmp_path)
+    statuses = rank_windows(
+        n_windows=ctx.n_windows, centers_a=ctx.centers_a, k_list=ctx.k_list,
+        acceptance_by_window={0: 0.30, 1: 0.30, 2: 0.001, 3: 0.30},
+        overlap_by_pair=ctx.overlap_pairs, delta_by_window=ctx.deltas,
+        temperature_k=ctx.temperature_k,
+    )
+    lines = strip_ansi("\n".join(window_table_panel(ctx, statuses).lines)).splitlines()
+    body = [l for l in lines if l.strip().startswith("w")]
+    assert body[0].split()[0] == "w02"
+    assert BAD in body[0]
+
+
+def test_window_detail_panel_names_the_window_and_its_restraint(tmp_path):
+    ctx = _ctx(tmp_path)
+    text = strip_ansi("\n".join(window_detail_panel(ctx, 2).lines))
+    assert "5.10" in text                           # its centre
+    assert "2.5" in text                            # its k
+    assert "w03" in text or "w01" in text           # its exchange partners
