@@ -125,15 +125,9 @@ def allocate_rows(
     if not kept:
         return (), tuple(dropped)
 
-    # Compute body lines based on stacking layout
-    body: dict[int, int] = {}
-    for i, r in enumerate(kept):
-        if term_w is not None and _would_stack_on_narrow_terminal(r, term_w):
-            # Stacked: each panel gets its own border set
-            body[i] = sum(p.min_lines for p in r.panels)
-        else:
-            # Side-by-side: panels share one border set
-            body[i] = max((p.min_lines for p in r.panels), default=1)
+    # Compute body lines: row_min includes chrome, so subtract it.
+    # Works for both stacking and side-by-side since row_min accounts for layout.
+    body = {i: row_min(r, term_w) - PANEL_CHROME_LINES for i, r in enumerate(kept)}
 
     spare = int(budget) - sum(row_min(r, term_w) for r in kept)
     for i in sorted(range(len(kept)), key=lambda i: (row_priority(kept[i]), i)):
