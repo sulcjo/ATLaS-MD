@@ -56,7 +56,10 @@ def _read_json(path: Path, errors: list[str]) -> tuple[Optional[dict], Optional[
             return None, None
         mtime = path.stat().st_mtime
         payload = json.loads(path.read_text())
-        return (payload if isinstance(payload, dict) else None), mtime
+        if not isinstance(payload, dict):
+            errors.append(f"{path.name}: not a JSON object")
+            return None, None
+        return payload, mtime
     except Exception as exc:                      # unreadable is a display state
         errors.append(f"{path.name}: {type(exc).__name__}")
         return None, None
