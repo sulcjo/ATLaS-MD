@@ -1469,10 +1469,12 @@ def _append_seed_bank_row(seed_bank_dir: Path, row: Dict[str, Any]) -> None:
     ]
     existing = _read_csv_dicts_local(csv_path)
     existing.append(row)
-    with csv_path.open("w", newline="") as handle:
+    tmp_path = csv_path.with_suffix(csv_path.suffix + f".tmp.{os.getpid()}")
+    with tmp_path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(existing)
+    tmp_path.replace(csv_path)
 
 
 def search_campaign_for_near_frame(

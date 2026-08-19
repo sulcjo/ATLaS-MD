@@ -10,6 +10,7 @@ Replaces CSV/NPZ output with a columnar format:
 from __future__ import annotations
 
 import json
+import os
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -75,7 +76,14 @@ class ParquetSampleWriter:
 
         self._chunk_idx += 1
         chunk_path = self._out_dir / f"chunk_{self._chunk_idx:06d}.parquet"
-        tmp_path = chunk_path.with_suffix(".parquet.tmp")
+        # Per-PID tmp names avoid a real collision between two concurrent
+        # writers, but orphan a tmp file forever if THIS process gets killed
+        # mid-write.  Sweep any stale tmp for this exact chunk index left by a
+        # prior killed attempt before writing our own - self-healing on the
+        # next successful flush rather than accumulating forever.
+        for stale in self._out_dir.glob(f"{chunk_path.name}.tmp.*"):
+            stale.unlink(missing_ok=True)
+        tmp_path = chunk_path.with_name(f"{chunk_path.name}.tmp.{os.getpid()}")
         pq.write_table(tbl, tmp_path, compression="zstd", compression_level=3)
         tmp_path.rename(chunk_path)
 
@@ -97,7 +105,9 @@ class ParquetSampleWriter:
         import pyarrow.parquet as pq
         tbl = ds.dataset(chunks, format="parquet").to_table()
         tbl = tbl.sort_by([("step", "ascending"), ("replica", "ascending")])
-        tmp = self._out_dir / "data.parquet.tmp"
+        for stale in self._out_dir.glob("data.parquet.tmp.*"):
+            stale.unlink(missing_ok=True)
+        tmp = self._out_dir / f"data.parquet.tmp.{os.getpid()}"
         pq.write_table(tbl, tmp, compression="zstd", compression_level=3)
         tmp.rename(self._out_dir / "data.parquet")
         for c in chunks:
@@ -154,7 +164,14 @@ class ParquetExchangeWriter:
 
         self._chunk_idx += 1
         chunk_path = self._out_dir / f"chunk_{self._chunk_idx:06d}.parquet"
-        tmp_path = chunk_path.with_suffix(".parquet.tmp")
+        # Per-PID tmp names avoid a real collision between two concurrent
+        # writers, but orphan a tmp file forever if THIS process gets killed
+        # mid-write.  Sweep any stale tmp for this exact chunk index left by a
+        # prior killed attempt before writing our own - self-healing on the
+        # next successful flush rather than accumulating forever.
+        for stale in self._out_dir.glob(f"{chunk_path.name}.tmp.*"):
+            stale.unlink(missing_ok=True)
+        tmp_path = chunk_path.with_name(f"{chunk_path.name}.tmp.{os.getpid()}")
         pq.write_table(tbl, tmp_path, compression="zstd", compression_level=3)
         tmp_path.rename(chunk_path)
 
@@ -176,7 +193,9 @@ class ParquetExchangeWriter:
         import pyarrow.parquet as pq
         tbl = ds.dataset(chunks, format="parquet").to_table()
         tbl = tbl.sort_by([("step", "ascending")])
-        tmp = self._out_dir / "data.parquet.tmp"
+        for stale in self._out_dir.glob("data.parquet.tmp.*"):
+            stale.unlink(missing_ok=True)
+        tmp = self._out_dir / f"data.parquet.tmp.{os.getpid()}"
         pq.write_table(tbl, tmp, compression="zstd", compression_level=3)
         tmp.rename(self._out_dir / "data.parquet")
         for c in chunks:
@@ -201,7 +220,9 @@ class SegmentRegistry:
         return f"seg_{len(self._segments) + 1:03d}"
 
     def _save(self) -> None:
-        self._path.write_text(json.dumps(self._segments, indent=2), encoding="utf-8")
+        tmp = self._path.with_name(f"{self._path.name}.tmp.{os.getpid()}")
+        tmp.write_text(json.dumps(self._segments, indent=2), encoding="utf-8")
+        tmp.replace(self._path)
 
     def open_segment(self, run_id: str, parent_id: Optional[str], round_id: int) -> str:
         seg_id = self._next_id()
@@ -329,9 +350,10 @@ class WindowSnapshot:
             "cv2_type": cv2_type,
             "windows": windows,
         }
-        (self._win_dir / f"{segment_id}.json").write_text(
-            json.dumps(payload, indent=2), encoding="utf-8"
-        )
+        target = self._win_dir / f"{segment_id}.json"
+        tmp = target.with_name(f"{target.name}.tmp.{os.getpid()}")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.replace(target)
 
     def load(self, segment_id: str) -> Dict[str, Any]:
         return json.loads(

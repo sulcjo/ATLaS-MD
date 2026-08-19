@@ -113,7 +113,9 @@ def test_parquet_writer_no_tmp_files_after_close(tmp_path):
     writer.write_sample(0, 0, 0, 0.1, -1.0, -100.0, 1.0, 0.5, 0.5)
     writer.close()
 
-    assert not list((tmp_path / "seg").glob("*.tmp"))
+    # tmp names are now per-PID (`*.tmp.<pid>`) to avoid colliding with a
+    # concurrent writer, so the leak check must match that suffix pattern.
+    assert not list((tmp_path / "seg").glob("*.tmp.*"))
 
 
 # --- SegmentRegistry ---

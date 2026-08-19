@@ -36,8 +36,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 
 from .checkpoints import production_checkpoint_available
-from .io import write_json, read_json_file, resolve_run_temperature_k, _json_ready
+from .io import write_json, read_json_file, resolve_run_temperature_k, _json_ready, acquire_run_lock
 from .lifecycle import _graceful_shutdown
+from .store import SegmentRegistry
 # Real-frame seed extraction lives in tica.py (a dependency-free leaf module)
 # so seeding.py can also use it for campaign-wide seed search without a
 # circular import - seeding.py -> production.py -> adaptive_production.py is
@@ -522,7 +523,15 @@ class WindowStateRegistry:
 
     @classmethod
     def load(cls, directory: Path) -> "WindowStateRegistry":
-        return cls.load_json(Path(directory) / "state_registry.json")
+        path = Path(directory) / "state_registry.json"
+        reg = cls.load_json(path)
+        if path.exists() and not reg.all_states():
+            print(
+                f"WARNING: state registry file {path} exists but parsed to zero states "
+                "(empty or corrupt file) -- this is not the same as a fresh campaign with "
+                "no registry file yet; check the file if this is unexpected."
+            )
+        return reg
 
     # ---- window table writers --------------------------------------------
 
@@ -3654,6 +3663,32 @@ def write_epoch_schedule_files(epoch_dir: Path, schedule: Sequence[Dict[str, Any
     return {"csv": str(csv_path), "json": str(json_path), "md": str(md_path)}
 
 
+def _load_existing_epoch_schedule(round_dir: Path, *, prefix: str = "epoch_schedule") -> Optional[List[Dict[str, Any]]]:
+    """Reload a schedule already written by ``write_epoch_schedule_files`` for this round, if any.
+
+    On resume, a previously-interrupted epoch/final round must reuse its own
+    already-written schedule verbatim rather than calling
+    ``build_adaptive_epoch_schedule`` again: a fresh build scores against the
+    *current* (dwindling) pool budget and diagnostics snapshot, which can change
+    the set/ordering of top-up step sizes and therefore the ``topup_{idx:03d}_*``
+    directory names run_scheduled_adaptive_epoch derives from them, even though
+    those directories may already contain real, checkpointed sampling under the
+    old names. Reusing the persisted rows keeps segment naming stable across
+    restarts. Returns ``None`` when no schedule file exists yet for this round
+    (a genuinely new round, which should still be built fresh).
+    """
+    path = Path(round_dir) / f"{prefix}.json"
+    if not path.exists():
+        return None
+    payload = read_json_file(path, None)
+    if not isinstance(payload, dict):
+        return None
+    rows = payload.get("rows")
+    if not isinstance(rows, list) or not rows:
+        return None
+    return rows
+
+
 def _quantized_extra_steps(value: int, quantum: int = 1000) -> int:
     value = max(0, int(value))
     quantum = max(1, int(quantum))
@@ -3974,9 +4009,19 @@ def _load_or_initialize_runtime_pool(adaptive_dir: Path, args: Any, policy: Adap
             warnings=list(old.get("warnings", []) or []),
         )
         if fresh.enabled and abs(float(pool.total_ns) - float(fresh.total_ns)) > 1.0e-9:
-            pool.warnings.append(
-                f"resume requested with total pool {fresh.total_ns:.6g} ns, but persisted ledger has {pool.total_ns:.6g} ns; using persisted value"
-            )
+            if float(fresh.total_ns) > float(pool.total_ns):
+                print(
+                    f"    Adaptive-production runtime pool budget raised on resume/extend: "
+                    f"{pool.total_ns:.6g} ns -> {fresh.total_ns:.6g} ns"
+                )
+                pool.warnings.append(
+                    f"resume/extend raised total pool budget from {pool.total_ns:.6g} ns to {fresh.total_ns:.6g} ns"
+                )
+                pool.total_ns = float(fresh.total_ns)
+            else:
+                pool.warnings.append(
+                    f"resume requested with total pool {fresh.total_ns:.6g} ns, but persisted ledger has {pool.total_ns:.6g} ns; using persisted value"
+                )
         if abs(float(pool.timestep_fs) - float(fresh.timestep_fs)) > 1.0e-9:
             pool.warnings.append(
                 f"resume timestep {fresh.timestep_fs:.6g} fs differs from persisted pool timestep {pool.timestep_fs:.6g} fs; using persisted value for accounting"
@@ -4400,6 +4445,16 @@ def run_scheduled_adaptive_epoch(
     segment_summaries: List[Dict[str, Any]] = []
     resume_requested = _arg_bool(args, "adaptive_production_resume", False)
     _seg_call_counter: List[int] = [0]
+    # States whose baseline segment this round was skipped outright (pool
+    # exhaustion zeroed a large baseline's clip_steps allowance while a much
+    # smaller topup subset could still afford nonzero steps in the SAME
+    # round) - a state in here has had NO real production this round despite
+    # being active, so a topup segment covering it is that state's first-ever
+    # real sampling this round, not a re-seed of an already-established
+    # window. Consulted by seeding.py's topup-scoped auto-allow-bad-windows
+    # fallback via _adaptive_phase_info, since that fallback's whole premise
+    # depends on the window already being established.
+    _baseline_skipped_state_ids: set = set()
 
     def run_segment(name: str, state_ids: Sequence[int], steps: int) -> Path:
         seg_dir = epoch_dir / name
@@ -4435,6 +4490,7 @@ def run_scheduled_adaptive_epoch(
             "segment_name": name,
             "is_topup": name.startswith("topup"),
             "topup_index": int(name.split("_")[1]) if name.startswith("topup") and "_" in name[6:] else 0,
+            "states_without_baseline_this_round": sorted(_baseline_skipped_state_ids.intersection(int(x) for x in state_ids)),
         })
         seed_report = None
         if current_seed_bank is not None and Path(current_seed_bank).exists():
@@ -4473,6 +4529,8 @@ def run_scheduled_adaptive_epoch(
                 )
         if actual_steps <= 0:
             print(f"      scheduled segment {name}: skipped because adaptive MD pool is exhausted")
+            if name == "baseline":
+                _baseline_skipped_state_ids.update(int(x) for x in state_ids)
             segment_summaries.append({
                 "segment": name,
                 "dir": str(seg_dir),
@@ -4509,6 +4567,28 @@ def run_scheduled_adaptive_epoch(
                 f"      scheduled segment {name}: already complete "
                 f"({_prior_prod_done}/{actual_steps} steps checkpointed); skipping resume, no pool charge"
             )
+            # run_gareus_callable is never invoked on this fast path, so the normal
+            # end-of-run reseal (finalize_segment(), called from run_gareus's own
+            # `finally` block) never runs either. The checkpoint read above proves
+            # a prior invocation's production loop reached this same target, but it
+            # cannot prove that process reached a *terminal* checkpoint write versus
+            # being killed at some earlier interior checkpoint boundary -- actual_steps
+            # can legitimately shrink on a later restart (pool budget dwindling), so
+            # a checkpoint that looked "at target" here may sit at a non-terminal
+            # checkpoint relative to what an earlier restart originally requested.
+            # Sealing as "complete" would let phantom rows past that checkpoint slip
+            # into MBAR unfiltered; seal as "interrupted" instead, matching every
+            # other resume-time reseal path in this codebase, so downstream analysis
+            # correctly truncates to the checkpoint boundary rather than trusting data
+            # that was never actually written.
+            _seg_registry_check = SegmentRegistry(seg_dir)
+            _latest_seg_entry = _seg_registry_check.get_latest_segment()
+            if _latest_seg_entry is not None and _latest_seg_entry.get("status") == "running":
+                from .production import checkpoint_manifest_path
+                _seg_manifest = read_json_file(checkpoint_manifest_path(seg_dir), {}) or {}
+                _seg_end_step = int(_seg_manifest.get("absolute_step", _prior_prod_done) or _prior_prod_done)
+                _seg_registry_check.seal_segment(_latest_seg_entry["segment_id"], absolute_end_step=_seg_end_step, status="interrupted")
+                print(f"      scheduled segment {name}: resealed stale 'running' segment registry entry -> 'interrupted'")
             segment_summaries.append({
                 "segment": name,
                 "dir": str(seg_dir),
@@ -4779,6 +4859,12 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
     out_dir = Path(out_dir)
     adaptive_dir = out_dir / "adaptive_production"
     adaptive_dir.mkdir(parents=True, exist_ok=True)
+    # run_gareus (production.py) locks each individual segment's own out_dir,
+    # but two whole adaptive-production invocations against the SAME campaign
+    # (a stale self-chain job that never actually exited, or a manual duplicate
+    # resubmission) could otherwise race for a while before either one reaches
+    # a locked segment directory - lock the campaign root itself too.
+    acquire_run_lock(adaptive_dir)
     policy = policy_from_args(args)
     max_epochs = max(1, _arg_int(args, "adaptive_production_epochs", 3))
     # Epoch 0 also bootstraps the tICA model and (when enabled) the shared GaMD
@@ -4838,6 +4924,12 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
     current_windows_csv: Optional[Path] = Path(str(args.windows_2d_csv)) if getattr(args, "windows_2d_csv", None) else None
     epoch_summaries: List[Dict[str, Any]] = []
     start_epoch = 0
+    # Extension rounds already recorded as done by a *previous* invocation (e.g. an
+    # earlier --extend call), read once here -- before this run's own writes to
+    # summary_path start overwriting it -- exactly like epoch_summaries/start_epoch
+    # above. Used to make frozen-final extension-round numbering resume-safe instead
+    # of always restarting at final_extension_001.
+    prior_extension_summaries: List[Dict[str, Any]] = []
     previous_diagnostics: Optional[Dict[str, Any]] = None
 
     summary_path = adaptive_dir / "adaptive_production_driver_summary.json"
@@ -4847,6 +4939,7 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
         old_summary = read_json_file(summary_path, {}) if summary_path.exists() else {}
         epoch_summaries = list(old_summary.get("epoch_summaries", []) or []) if isinstance(old_summary, dict) else []
         start_epoch = int(old_summary.get("epochs_completed", len(epoch_summaries)) or len(epoch_summaries)) if isinstance(old_summary, dict) else len(epoch_summaries)
+        prior_extension_summaries = list(old_summary.get("final_extension_summaries", []) or []) if isinstance(old_summary, dict) else []
         current_windows_csv = adaptive_dir / f"windows_epoch_{start_epoch:03d}.csv"
         if not current_windows_csv.exists():
             current_windows_csv = adaptive_dir / "resume_active_windows.csv"
@@ -4884,6 +4977,25 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                         f"from epoch {_es['epoch']} summary"
                     )
                 break
+
+        # Restore previous_diagnostics from the most recently completed epoch's
+        # diagnostics_json. Without this, the first genuinely new epoch/final
+        # round built after a restart (i.e. one with no existing schedule file
+        # for _load_existing_epoch_schedule to reuse) would score every state
+        # against previous_diagnostics=None, which build_adaptive_epoch_schedule
+        # treats as "no_samples_yet" for every state -- discarding real sampling
+        # history the campaign already has.
+        if epoch_summaries:
+            _last_diag_path = epoch_summaries[-1].get("diagnostics_json")
+            _restored_diag = read_json_file(Path(_last_diag_path), None) if _last_diag_path else None
+            if isinstance(_restored_diag, dict):
+                previous_diagnostics = _restored_diag
+                print(f"    Adaptive-production resume: restored diagnostics from {_last_diag_path}")
+            else:
+                print(
+                    f"    Adaptive-production resume: WARNING: prior diagnostics file {_last_diag_path} "
+                    "not found or unreadable; next new schedule will score states as no_samples_yet"
+                )
         context_reuse_readiness = evaluate_context_reuse_readiness(args, adaptive_dir, registry=registry)
 
     # Warn when tica_epochs_per_cycle is set but observation collection is disabled:
@@ -4924,14 +5036,22 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             schedule_policy = _policy_with_pool_step_budget(
                 registry, policy, runtime_pool, default_steps=epoch_default_steps, final=False
             )
-            schedule = build_adaptive_epoch_schedule(
-                registry,
-                previous_diagnostics,
-                schedule_policy,
-                epoch=epoch,
-                default_steps=epoch_default_steps,
-                final=False,
-            )
+            schedule = _load_existing_epoch_schedule(epoch_dir) if resume_requested else None
+            if schedule is not None:
+                print(
+                    f"    Adaptive-production scheduled epoch {epoch + 1}/{max_epochs}: "
+                    f"reusing existing schedule from {epoch_dir / 'epoch_schedule.json'} "
+                    "(resume-stable segment naming)"
+                )
+            else:
+                schedule = build_adaptive_epoch_schedule(
+                    registry,
+                    previous_diagnostics,
+                    schedule_policy,
+                    epoch=epoch,
+                    default_steps=epoch_default_steps,
+                    final=False,
+                )
             print(
                 f"    Adaptive-production scheduled epoch {epoch + 1}/{max_epochs}: "
                 f"{len(schedule)} active states -> {epoch_dir}"
@@ -4962,7 +5082,7 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                     "schema_version": "adaptive_production_driver_summary_v1",
                     "status": "interrupted_after_checkpoint",
                     "interrupted_segment": str(epoch_dir),
-                    "epochs_completed": int(start_epoch + len(epoch_summaries)),
+                    "epochs_completed": int(len(epoch_summaries)),
                     "epoch_summaries": _json_ready(epoch_summaries),
                     "scheduled_epoch": _json_ready(scheduled_summary),
                 }
@@ -5053,7 +5173,7 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                     "schema_version": "adaptive_production_driver_summary_v1",
                     "status": "interrupted_after_checkpoint",
                     "interrupted_segment": str(epoch_dir),
-                    "epochs_completed": int(start_epoch + len(epoch_summaries)),
+                    "epochs_completed": int(len(epoch_summaries)),
                     "epoch_summaries": _json_ready(epoch_summaries),
                 }
                 write_json(summary_path, payload)
@@ -5246,6 +5366,23 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             print(f"WARNING: _maybe_recalibrate_gamd_boost failed for epoch {epoch}: {_gamd_recal_exc}")
             gamd_recal_report = {"status": "error", "error": str(_gamd_recal_exc)}
 
+        # Surface segments that the runtime pool forced to zero steps this epoch
+        # (recorded per-segment as skipped_by_runtime_pool in run_scheduled_adaptive_epoch)
+        # so silent baseline-only sampling is visible at the epoch level instead of
+        # only buried inside the segmented scheduled_epoch payload.
+        _segments_skipped_by_pool = [
+            {"segment": s.get("segment"), "state_ids": s.get("state_ids", [])}
+            for s in (scheduled_summary or {}).get("segments", [])
+            if s.get("skipped_by_runtime_pool")
+        ]
+        if _segments_skipped_by_pool:
+            print(
+                f"WARNING: adaptive-production MD pool exhaustion skipped "
+                f"{len(_segments_skipped_by_pool)} scheduled segment(s) in epoch {epoch}, reducing "
+                f"this epoch to baseline-only sampling for the affected states: "
+                + ", ".join(f"{s['segment']} (states {s['state_ids']})" for s in _segments_skipped_by_pool)
+            )
+
         summary = {
             "epoch": int(epoch),
             "epoch_dir": str(epoch_dir),
@@ -5257,6 +5394,7 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             "convergence_gate": convergence_gate or {},
             "seed_bank": seed_bank_report or {},
             "scheduled_epoch": scheduled_summary or {},
+            "segments_skipped_by_pool": _segments_skipped_by_pool,
             "next_windows_csv": str(next_csv),
             "registry": registry_paths,
             "runtime_pool": runtime_pool.to_dict(),
@@ -5341,15 +5479,27 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             final_schedule_policy = _policy_with_pool_step_budget(
                 registry, policy, runtime_pool, default_steps=final_steps, final=True
             )
-            final_schedule = build_adaptive_epoch_schedule(
-                registry,
-                previous_diagnostics,
-                final_schedule_policy,
-                epoch=max_epochs,
-                default_steps=final_steps,
-                final=True,
-            )
-            final_schedule_files = write_epoch_schedule_files(final_dir, final_schedule, prefix="final_state_schedule")
+            final_schedule = _load_existing_epoch_schedule(final_dir, prefix="final_state_schedule") if resume_requested else None
+            if final_schedule is not None:
+                print(
+                    f"    Adaptive-production final phase: reusing existing schedule from "
+                    f"{final_dir / 'final_state_schedule.json'} (resume-stable segment naming)"
+                )
+                final_schedule_files = {
+                    "csv": str(final_dir / "final_state_schedule.csv"),
+                    "json": str(final_dir / "final_state_schedule.json"),
+                    "md": str(final_dir / "final_state_schedule.md"),
+                }
+            else:
+                final_schedule = build_adaptive_epoch_schedule(
+                    registry,
+                    previous_diagnostics,
+                    final_schedule_policy,
+                    epoch=max_epochs,
+                    default_steps=final_steps,
+                    final=True,
+                )
+                final_schedule_files = write_epoch_schedule_files(final_dir, final_schedule, prefix="final_state_schedule")
 
         final_seed_bank = None
         final_scheduled_summary = None
@@ -5440,7 +5590,7 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                     "schema_version": "adaptive_production_driver_summary_v1",
                     "status": "interrupted_after_checkpoint",
                     "interrupted_segment": str(final_dir),
-                    "epochs_completed": int(start_epoch + len(epoch_summaries)),
+                    "epochs_completed": int(len(epoch_summaries)),
                     "epoch_summaries": _json_ready(epoch_summaries),
                 }
                 write_json(summary_path, payload)
@@ -5470,14 +5620,20 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
     # Optional frozen-final extension rounds.  These do not change the active
     # window set; they simply add more final-phase samples when the quality gate
     # says the frozen phase is under-sampled.
-    extension_summaries: List[Dict[str, Any]] = []
+    # Seed from any extension rounds a *previous* invocation already recorded
+    # (see prior_extension_summaries above) so the round index/directory naming
+    # below continues where that invocation left off instead of restarting at
+    # final_extension_001 and colliding with already-completed round directories.
+    extension_summaries: List[Dict[str, Any]] = list(prior_extension_summaries)
+    start_ext_round = len(prior_extension_summaries)
     final_diag = collect_final_combined_diagnostics(adaptive_dir, registry, policy=policy)
     quality_gate = evaluate_adaptive_quality_gate(
         adaptive_dir, registry, final_diag, policy=policy, output_prefix="adaptive_quality_gate_pre_union"
     )
     ext_rounds = max(0, int(policy.final_quality_extension_rounds or 0))
     ext_steps = int(policy.final_quality_extension_steps or final_steps)
-    for ext_index in range(ext_rounds):
+    ext_round_total = start_ext_round + ext_rounds
+    for ext_index in range(start_ext_round, ext_round_total):
         if not quality_gate_fixable_by_more_final_sampling(quality_gate):
             break
         ext_dir = adaptive_dir / f"final_extension_{ext_index + 1:03d}"
@@ -5501,7 +5657,7 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
         ext_args.adaptive_feedback_final_production = False
         ext_args.resume = bool(resume_requested and production_checkpoint_available(ext_dir))
         if ext_args.resume:
-            print(f"    Adaptive-production frozen final extension {ext_index + 1}/{ext_rounds}: checkpoint manifest found; resuming from {ext_dir}")
+            print(f"    Adaptive-production frozen final extension {ext_index + 1}/{ext_round_total}: checkpoint manifest found; resuming from {ext_dir}")
         if _arg_bool(args, "adaptive_production_trajectories", True) is False:
             ext_args.traj_interval = 0
             ext_args.traj_format = "none"
@@ -5516,31 +5672,48 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             else:
                 ext_args.seed_conformers_dir = Path(current_seed_bank)
         registry.write_epoch_window_map(ext_dir / "epoch_window_map.csv")
-        print(
-            f"    Adaptive-production frozen final extension {ext_index + 1}/{ext_rounds}: "
-            f"{actual_ext_steps} steps -> {ext_dir}"
-        )
-        _write_tica_version_marker(ext_dir, ext_args)
-        run_gareus(ext_args, ext_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
-        if _graceful_shutdown.is_set():
+        # Delta-charge the runtime pool for extension rounds the same way
+        # run_segment() does for scheduled topup segments (see
+        # _segment_checkpoint_prod_done docstring / its use above): a resumed
+        # round's checkpoint may already carry real progress from an earlier
+        # invocation (an earlier restart, or an earlier --extend call reusing
+        # this exact round directory), so charging actual_ext_steps in full on
+        # every resume would double/triple-charge the same MD steps against the
+        # campaign pool. Skip run_gareus entirely (and charge nothing) once the
+        # checkpoint has already reached this round's target.
+        _prior_ext_prod_done = int(_segment_checkpoint_prod_done(ext_dir) or 0) if ext_args.resume else 0
+        if _prior_ext_prod_done >= actual_ext_steps:
+            print(
+                f"    Adaptive-production frozen final extension {ext_index + 1}/{ext_round_total}: "
+                f"already complete ({_prior_ext_prod_done}/{actual_ext_steps} steps checkpointed); "
+                "skipping run, no pool charge"
+            )
+        else:
+            print(
+                f"    Adaptive-production frozen final extension {ext_index + 1}/{ext_round_total}: "
+                f"{actual_ext_steps} steps -> {ext_dir}"
+            )
+            _write_tica_version_marker(ext_dir, ext_args)
+            run_gareus(ext_args, ext_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
+            if _graceful_shutdown.is_set():
+                _write_runtime_pool_reports(adaptive_dir, runtime_pool)
+                payload = {
+                    "schema_version": "adaptive_production_driver_summary_v1",
+                    "status": "interrupted_after_checkpoint",
+                    "interrupted_segment": str(ext_dir),
+                    "epochs_completed": int(len(epoch_summaries)),
+                    "epoch_summaries": _json_ready(epoch_summaries),
+                }
+                write_json(summary_path, payload)
+                return payload
+            runtime_pool.consume(
+                label=f"final_extension_{ext_index + 1:03d}",
+                kind="final_extension",
+                n_states=max(1, len(registry.active_states())),
+                steps=int(actual_ext_steps - _prior_ext_prod_done),
+                path=ext_dir,
+            )
             _write_runtime_pool_reports(adaptive_dir, runtime_pool)
-            payload = {
-                "schema_version": "adaptive_production_driver_summary_v1",
-                "status": "interrupted_after_checkpoint",
-                "interrupted_segment": str(ext_dir),
-                "epochs_completed": int(start_epoch + len(epoch_summaries)),
-                "epoch_summaries": _json_ready(epoch_summaries),
-            }
-            write_json(summary_path, payload)
-            return payload
-        runtime_pool.consume(
-            label=f"final_extension_{ext_index + 1:03d}",
-            kind="final_extension",
-            n_states=max(1, len(registry.active_states())),
-            steps=int(actual_ext_steps),
-            path=ext_dir,
-        )
-        _write_runtime_pool_reports(adaptive_dir, runtime_pool)
         ext_diag = collect_segmented_epoch_diagnostics(ext_dir, registry, policy)
         final_diag = collect_final_combined_diagnostics(adaptive_dir, registry, policy=policy)
         quality_gate = evaluate_adaptive_quality_gate(
