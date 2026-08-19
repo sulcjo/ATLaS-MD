@@ -64,7 +64,15 @@
 
 **Interfaces:**
 - Consumes: `gareus.tui.MIN_PANEL_WIDTH` (int, 30).
-- Produces: `Panel` (frozen dataclass: `key: str`, `title: str`, `lines: tuple[str, ...]`, `min_lines: int = 1`, `want_lines: int = 1`, `priority: int = 5`, `weight: float = 1.0`, `tail: str = ""`); `Row` (frozen dataclass: `panels: tuple[Panel, ...]`); `PANEL_CHROME_LINES: int = 4`; `row_priority(row) -> int`; `row_min(row) -> int`; `row_want(row) -> int`; `allocate_rows(rows: Sequence[Row], budget: int) -> tuple[tuple[tuple[Row, int], ...], tuple[str, ...]]`; `trim_panel(panel: Panel, body_lines: int) -> Panel`. Lower `priority` number means more important.
+- Produces: `Panel` (frozen dataclass: `key: str`, `title: str`, `lines: tuple[str, ...]`, `min_lines: int = 1`, `want_lines: int = 1`, `priority: int = 5`, `weight: float = 1.0`, `line_statuses: tuple[str, ...] = ()`); `Row` (frozen dataclass: `panels: tuple[Panel, ...]`); `PANEL_CHROME_LINES: int = 4`; `row_priority(row) -> int`; `row_min(row) -> int`; `row_want(row) -> int`; `allocate_rows(rows: Sequence[Row], budget: int) -> tuple[tuple[tuple[Row, int], ...], tuple[str, ...]]`; `trim_panel(panel: Panel, body_lines: int) -> Panel`. Lower `priority` number means more important.
+
+**Why `line_statuses` rather than a `tail` string.** A panel cannot know how many of its
+lines the allocator will hide — that is decided later, from the budget. So the severity
+composition spec §5.3 requires ("+9 more (2 warn, 1 bad)") has to be computed at trim time
+from the hidden slice. `line_statuses` is a parallel array of plain status labels, one per
+line (empty string for a header or a line with no severity). `trim_panel` counts `"BAD"` and
+`"WARN"` in the hidden slice. The labels are opaque strings here, so `tui_screen` stays
+domain-free.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -148,11 +156,20 @@ def test_trim_panel_keeps_the_worst_first_lines_and_appends_a_generated_tail():
     assert trimmed.lines[-1] == "… 7 more"
 
 
-def test_trim_panel_prefers_a_caller_supplied_severity_tail():
-    panel = Panel(key="a", title="a", lines=tuple("x" * 10), min_lines=1,
-                  want_lines=10, tail="+7 more (2 warn, 1 bad)")
-    trimmed = trim_panel(panel, 4)
-    assert trimmed.lines[-1] == "+7 more (2 warn, 1 bad)"
+def test_trim_panel_reports_the_severity_composition_of_what_it_hid():
+    statuses = ["", "BAD", "WARN", "WARN", "ok", "ok", "ok"]
+    panel = Panel(key="a", title="a", lines=tuple(f"l{i}" for i in range(7)),
+                  min_lines=1, want_lines=7, line_statuses=tuple(statuses))
+    trimmed = trim_panel(panel, 3)
+    # Keeps l0, l1; hides l2..l6 -> one WARN kept, one WARN + one BAD... hidden slice is
+    # statuses[2:] = WARN, WARN, ok, ok, ok
+    assert trimmed.lines[-1] == "+5 more (2 warn)"
+
+
+def test_trim_panel_says_all_ok_when_nothing_hidden_is_flagged():
+    panel = Panel(key="a", title="a", lines=tuple(f"l{i}" for i in range(6)),
+                  min_lines=1, want_lines=6, line_statuses=("",) + ("ok",) * 5)
+    assert trim_panel(panel, 3).lines[-1] == "+4 more (all ok)"
 
 
 def test_trim_panel_is_a_noop_when_content_already_fits():
@@ -206,7 +223,7 @@ class Panel:
     want_lines: int = 1
     priority: int = 5
     weight: float = 1.0
-    tail: str = ""
+    line_statuses: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -261,18 +278,38 @@ def allocate_rows(
     return tuple((r, body[i]) for i, r in enumerate(kept)), tuple(dropped)
 
 
+def _composition_tail(hidden_statuses: Sequence[str], hidden: int) -> str:
+    """Describe a truncated tail by severity, not just by count.
+
+    "+9 more" tells a reader nothing about whether the tail mattered;
+    "+9 more (2 warn, 1 bad)" tells them to widen the terminal.
+    """
+    labels = [str(s).upper() for s in hidden_statuses]
+    bad = labels.count("BAD")
+    warn = labels.count("WARN")
+    if not labels:
+        return f"… {hidden} more"
+    if not bad and not warn:
+        return f"+{hidden} more (all ok)"
+    parts = [f"{bad} bad"] if bad else []
+    if warn:
+        parts.append(f"{warn} warn")
+    return f"+{hidden} more ({', '.join(parts)})"
+
+
 def trim_panel(panel: Panel, body_lines: int) -> Panel:
     """Cut a panel's content to ``body_lines``, keeping the first (worst) lines.
 
     Panel content arrives already ranked worst-first, so a positional cut here
-    is a severity cut. The last kept line becomes the truncation notice.
+    is a severity cut. The last kept line becomes the truncation notice, whose
+    wording depends on what was hidden.
     """
     limit = max(0, int(body_lines))
     if len(panel.lines) <= limit:
         return panel
     keep = max(0, limit - 1)
     hidden = len(panel.lines) - keep
-    tail = panel.tail or f"… {hidden} more"
+    tail = _composition_tail(panel.line_statuses[keep:], hidden)
     return replace(panel, lines=tuple(panel.lines[:keep]) + (tail,))
 
 
@@ -1374,7 +1411,7 @@ git commit -m "feat(dashboard): add frozen DashboardContext snapshot"
 
 **Interfaces:**
 - Consumes: Task 1's `Panel`; Task 4's `rank_windows`, `tail_summary`, `restraint_sigma`, `OK`/`WARN`/`BAD`; Task 5's `DashboardContext`.
-- Produces: `panel(key, title, lines, *, min_lines, want_lines, priority, weight=1.0, tail="") -> Panel`; `overlap_panel(ctx) -> Panel`; `boost_envelope_panel(ctx) -> Panel`; `cv_map_panel(ctx, bar_width) -> Panel`; `pe_map_panel(ctx, bar_width) -> Panel`; `exchange_panel(ctx) -> Panel`; `pull_panel(ctx) -> Panel`; `replica_table_panel(ctx, ncols) -> Panel`; `window_table_panel(ctx, statuses) -> Panel`; `window_detail_panel(ctx, window) -> Panel`.
+- Produces: `panel(key, title, lines, *, min_lines, want_lines, priority, weight=1.0, line_statuses=()) -> Panel`; `overlap_panel(ctx) -> Panel`; `boost_envelope_panel(ctx) -> Panel`; `cv_map_panel(ctx, bar_width) -> Panel`; `pe_map_panel(ctx, bar_width) -> Panel`; `exchange_panel(ctx) -> Panel`; `pull_panel(ctx) -> Panel`; `replica_table_panel(ctx, ncols) -> Panel`; `window_table_panel(ctx, statuses) -> Panel`; `window_detail_panel(ctx, window) -> Panel`.
 
 **Port rule.** Each source method returns `list[str]` whose first element is its own title
 line, which `_render_dashboard` strips with `[1:]`. Ported functions drop the title line
@@ -1596,11 +1633,12 @@ def panel(
     want_lines: int,
     priority: int,
     weight: float = 1.0,
-    tail: str = "",
+    line_statuses: Iterable[str] = (),
 ) -> Panel:
     return Panel(
         key=key, title=title, lines=tuple(str(x) for x in lines), min_lines=int(min_lines),
-        want_lines=int(want_lines), priority=int(priority), weight=float(weight), tail=tail,
+        want_lines=int(want_lines), priority=int(priority), weight=float(weight),
+        line_statuses=tuple(str(s) for s in line_statuses),
     )
 
 
@@ -1617,6 +1655,7 @@ def overlap_panel(ctx: DashboardContext) -> Panel:
                      [color_text("insufficient samples", "dim")],
                      min_lines=5, want_lines=12, priority=1, weight=1.3)
     lines = [color_text("pair        overlap   target 0.30", "white", bold=True)]
+    statuses = [""]                      # the header line carries no severity
     for (a, b), ov in pairs:
         if ov < DEAD_OVERLAP:
             role, label = ROLE_BAD, "DEAD  → MBAR graph breaks" if ov < 0.05 else "BAD"
@@ -1628,8 +1667,10 @@ def overlap_panel(ctx: DashboardContext) -> Panel:
             f"  w{a:02d}-w{b:02d}   {ov:6.2f}   {_mini_bar(ov / 0.5, 10)}  "
             + role_text(label, role)
         )
+        statuses.append(BAD if ov < DEAD_OVERLAP else (WARN if ov < 0.30 else OK))
     return panel("overlap", "neighbour overlap — worst first", lines,
-                 min_lines=5, want_lines=12, priority=1, weight=1.3)
+                 min_lines=5, want_lines=12, priority=1, weight=1.3,
+                 line_statuses=statuses)
 
 
 def boost_envelope_panel(ctx: DashboardContext) -> Panel:
@@ -1717,6 +1758,7 @@ def window_table_panel(ctx: DashboardContext, statuses: Sequence[WindowStatus]) 
     header = color_text(
         "win   cv1 ctr   cv2 ctr    accL   accR   |Δ|max   status", "white", bold=True)
     lines = [header]
+    line_statuses = [""]                 # the header line carries no severity
     for s in statuses:
         w = s.window
         centre = ctx.centers_a[w] if w < len(ctx.centers_a) else float("nan")
@@ -1730,8 +1772,9 @@ def window_table_panel(ctx: DashboardContext, statuses: Sequence[WindowStatus]) 
             f"{delta:6.2f}   " + role_text(s.status, role)
             + ("  " + ", ".join(s.reasons) if s.reasons else "")
         )
+        line_statuses.append(s.status)
     return panel("windows", "windows — worst first", lines, min_lines=4, want_lines=16,
-                 priority=1, tail=tail_summary(statuses[max(0, len(statuses) - 1):]))
+                 priority=1, line_statuses=line_statuses)
 
 
 def window_detail_panel(ctx: DashboardContext, window: int) -> Panel:
@@ -2134,6 +2177,11 @@ from gareus.logger import DistanceLogger
 from gareus.tui import strip_ansi
 
 CENTERS = tuple(4.0 + 0.55 * i for i in range(6))
+# A fixed wall clock six hours after the segment started. Without an explicit
+# `eta_start_wall` the context would measure elapsed time against the logger's real
+# `start_wall`, giving elapsed_s == 0 and a NaN throughput -- which no projection
+# assertion could ever satisfy.
+NOW = 1_700_000_000.0
 
 POOL = {
     "total_ns": 15000.0, "used_ns": 7500.0, "remaining_ns": 7500.0, "timestep_fs": 4.0,
@@ -2163,8 +2211,9 @@ def _ctx(tmp_path, *, view="progress", sidecar=None, exchange=None, n=6, term_w=
         total_steps=4_000_000, summary={}, dashboard_info={
             "centers_a": list(CENTERS[:n]), "n_windows": n, "k_list": [2.5] * n,
             "exchange_stats": stats, "primary_cv_label": "contacts",
-            "primary_cv_units": "A", "primary_k_units": "kcal/mol/A^2"},
-        sidecar=sidecar or SidecarSnapshot(), term_w=term_w, term_h=term_h, now=5000.0,
+            "primary_cv_units": "A", "primary_k_units": "kcal/mol/A^2",
+            "eta_start_wall": NOW - 6 * 3600.0},
+        sidecar=sidecar or SidecarSnapshot(), term_w=term_w, term_h=term_h, now=NOW,
         view=view, glyphs="unicode",
     )
 
@@ -3290,7 +3339,7 @@ git commit -m "feat(cli): promote seven hardcoded TUI knobs to real flags"
 **Files:**
 - Create: `tests/test_dashboard_frame_fit.py`
 - Create: `tests/golden/dashboard/` (three `.txt` snapshots, generated in Step 3)
-- Modify: `tests/manual_render_dashboard_frame.py` (report the post-fix zero-loss result)
+- Run only (already updated in Task 12): `tests/manual_render_dashboard_frame.py`
 
 **Interfaces:**
 - Consumes: everything above.
@@ -3350,7 +3399,8 @@ def _ctx(tmp_path, term_w, term_h, view, *, is_2d=False, n=N_WINDOWS, rich=True)
             "primary_cv_label": "nonlocal contacts", "primary_cv_units": "A",
             "primary_k_units": "kcal/mol/A^2",
             "adaptive_phase": {"epoch_index": 1, "epoch_total": 2,
-                               "segment_name": "epoch_001/topup_002"}}
+                               "segment_name": "epoch_001/topup_002"},
+            "eta_start_wall": 1_700_000_000.0 - 6 * 3600.0}
     if is_2d:
         targets = [-2.0, -1.0, 0.0, 1.0, 2.0]
         info["secondary_cv_centers"] = [targets[i % len(targets)] for i in range(n)]
@@ -3448,8 +3498,12 @@ one is expected, per CLAUDE.md.
 
 - [ ] **Step 6: Commit**
 
+`.gitignore` line 31 ignores `*.txt`, so the golden snapshots need `-f` — the same
+precedent this repo already uses for `docs/**/*.md`:
+
 ```bash
-git add tests/test_dashboard_frame_fit.py tests/golden/dashboard tests/manual_render_dashboard_frame.py
+git add tests/test_dashboard_frame_fit.py
+git add -f tests/golden/dashboard
 git commit -m "test(dashboard): assert frames fit every terminal size, add golden frames"
 ```
 
