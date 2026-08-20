@@ -1723,6 +1723,21 @@ def test_boost_envelope_panel_says_so_when_the_run_has_no_gamd(tmp_path):
     assert "no GaMD" in text
 
 
+def test_window_table_panel_never_prints_a_literal_nan(tmp_path):
+    """`nan` means "not measured"; printing it puts a token in a numeric column
+    that reads as data. A 1D run has no cv2 column at all, and the first window
+    has no left neighbour, so both are absences rather than measurements."""
+    ctx = _ctx(tmp_path)
+    statuses = rank_windows(
+        n_windows=ctx.n_windows, centers_a=ctx.centers_a, k_list=ctx.k_list,
+        acceptance_by_window=ctx.acceptance_windows, overlap_by_pair=ctx.overlap_pairs,
+        delta_by_window=ctx.deltas, temperature_k=ctx.temperature_k)
+    text = strip_ansi("\n".join(window_table_panel(ctx, statuses).lines))
+    assert "nan" not in text
+    assert "cv2 ctr" not in text           # 1D run: column dropped, not filled
+    assert "—" in text                     # w00 has no left neighbour
+
+
 def test_window_table_panel_puts_the_worst_window_first(tmp_path):
     ctx = _ctx(tmp_path)
     statuses = rank_windows(
@@ -1982,21 +1997,42 @@ Then port, in this order, following the table and the substitution rule: `pe_map
 ```python
 def window_table_panel(ctx: DashboardContext, statuses: Sequence[WindowStatus]) -> Panel:
     """One row per window, worst first, with a severity-composition tail."""
+    def _num(value: float, width: int, places: int) -> str:
+        """Render a measurement, or an em dash if there is nothing to render.
+
+        A literal `nan` in a table cell is this design's own rule broken in the
+        display layer: `nan` means "not measured", and printing it puts a token
+        in a numeric column that reads as data. Boundary windows genuinely have
+        no left or right neighbour, so their acceptance is absent rather than bad.
+        """
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return "—".rjust(width)
+        return f"{v:{width}.{places}f}" if math.isfinite(v) else "—".rjust(width)
+
+    # A 1D run has no secondary CV at all, so the column is dropped rather than
+    # filled with placeholders down its whole length.
+    show_cv2 = bool(ctx.secondary_centers)
+    cv2_head = "  cv2 ctr " if show_cv2 else ""
     header = color_text(
-        "win   cv1 ctr   cv2 ctr    accL   accR   |Δ|max   status", "white", bold=True)
+        f"win   cv1 ctr {cv2_head}   accL   accR   |Δ|max   status", "white", bold=True)
     lines = [header]
     line_statuses = [""]                 # the header line carries no severity
     for s in statuses:
         w = s.window
         centre = ctx.centers_a[w] if w < len(ctx.centers_a) else float("nan")
-        sec = ctx.secondary_centers[w] if w < len(ctx.secondary_centers) else float("nan")
-        acc_l = ctx.acceptance_pairs.get((w - 1, w), float("nan"))
-        acc_r = ctx.acceptance_pairs.get((w, w + 1), float("nan"))
-        delta = abs(float(ctx.deltas.get(w, float("nan"))))
         role = {BAD: ROLE_BAD, WARN: ROLE_WARN}.get(s.status, ROLE_GOOD)
+        cv2_cell = ""
+        if show_cv2:
+            sec = ctx.secondary_centers[w] if w < len(ctx.secondary_centers) else float("nan")
+            cv2_cell = "  " + _num(sec, 8, 2) + " "
         lines.append(
-            f"  w{w:02d}  {centre:8.2f}  {sec:8.2f}   {acc_l:5.2f}  {acc_r:5.2f}   "
-            f"{delta:6.2f}   " + role_text(s.status, role)
+            f"  w{w:02d}  {_num(centre, 8, 2)} {cv2_cell}  "
+            f"{_num(ctx.acceptance_pairs.get((w - 1, w), float('nan')), 5, 2)}  "
+            f"{_num(ctx.acceptance_pairs.get((w, w + 1), float('nan')), 5, 2)}   "
+            f"{_num(abs(float(ctx.deltas.get(w, float('nan')))), 6, 2)}   "
+            + role_text(s.status, role)
             + ("  " + ", ".join(s.reasons) if s.reasons else "")
         )
         line_statuses.append(s.status)
@@ -3430,7 +3466,7 @@ from typing import Callable, Mapping, Sequence
 from ..colors import ROLE_SECTION, color_text, role_text
 from ..math_helpers import boost_anharmonicity
 from ..tui import _ansi_truncate
-from ..tui_screen import allocate_rows, compose_rows, frame_tiers
+from ..tui_screen import FOOTER_LINES, allocate_rows, compose_rows, frame_tiers
 from . import view_physics, view_progress, view_windows
 from .context import DashboardContext
 from .ranking import BAD, rank_windows
@@ -3509,13 +3545,21 @@ def render_screen(ctx: DashboardContext) -> str:
     spine = spine_lines(ctx, spine_budget)
     # Hand any unused spine reservation to the view: the spine has nine real
     # line-kinds (eight for 1D), so a full-tier frame reclaims one or two rows
-    # here instead of rendering them blank.
-    body_budget += max(0, spine_budget - len(spine))
+    # here instead of rendering them blank. Cap the reclaim at what the frame can
+    # actually hold -- without the ceiling this overflows by one line at
+    # term_h=18, where the spine-only tier leaves no room for a body at all.
+    usable = max(1, int(ctx.term_h) - 1)
+    reclaimable = max(0, usable - len(spine) - FOOTER_LINES - body_budget)
+    body_budget += min(max(0, spine_budget - len(spine)), reclaimable)
     if body_budget <= 0:
         return "\n".join(spine)
     view = resolve_view(ctx, ctx.view)
     rows = VIEWS[view](ctx)
-    allocated, dropped = allocate_rows(rows, body_budget)
+    # Same term_w to BOTH calls. The allocator prices a row by whether that width
+    # makes its panels stack, so allocating without it and composing at a stacking
+    # width renders a row priced at 7 lines as 14 -- measured at 31 lines into a
+    # 29-line budget before this was passed through.
+    allocated, dropped = allocate_rows(rows, body_budget, ctx.term_w)
     body = compose_rows(allocated, ctx.term_w)
     return "\n".join((*spine, *body, footer_line(ctx, dropped, view)))
 
