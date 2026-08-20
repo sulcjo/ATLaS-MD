@@ -1,6 +1,6 @@
 import argparse
 
-from gareus.dashboard import view_progress
+from gareus.dashboard import view_physics, view_progress
 from gareus.dashboard.context import build_context
 from gareus.dashboard.sidecar import SidecarSnapshot
 from gareus.logger import DistanceLogger
@@ -130,3 +130,83 @@ def test_progress_view_returns_rows_of_panels(tmp_path):
     rows = view_progress.build(_ctx(tmp_path, sidecar=SidecarSnapshot(pool=POOL)))
     assert rows and all(row.panels for row in rows)
     assert {p.key for row in rows for p in row.panels} >= {"timeline", "projection", "throughput"}
+
+
+from gareus.dashboard.view_physics import connected_components
+
+
+def test_connected_components_returns_one_set_for_a_fully_coupled_chain():
+    pairs = {(i, i + 1): 0.30 for i in range(5)}
+    comps = connected_components(6, pairs)
+    assert len(comps) == 1 and comps[0] == frozenset(range(6))
+
+
+def test_connected_components_splits_at_a_dead_pair():
+    pairs = {(0, 1): 0.30, (1, 2): 0.001, (2, 3): 0.30}
+    comps = connected_components(4, pairs)
+    assert sorted(len(c) for c in comps) == [2, 2]
+
+
+def test_connected_components_treats_unattempted_pairs_as_unlinked():
+    pairs = {(0, 1): float("nan")}
+    assert len(connected_components(2, pairs)) == 2
+
+
+def test_connectivity_verdict_holds_judgement_before_any_exchange_is_attempted(tmp_path):
+    """Zero attempts is the state of every run's first frames. Announcing
+    "1/6 connected" there would be a false claim of total MBAR disconnection,
+    and would pin the auto view to PHYSICS until exchanges accumulate."""
+    ctx = _ctx(tmp_path, view="physics", exchange={
+        f"{i}-{i+1}": {"attempts": 0, "accepted": 0} for i in range(5)})
+    state, _largest, measured = view_physics.connectivity_verdict(ctx)
+    assert state == "unmeasured"
+    assert measured == 0
+    text = _text(view_physics.build(ctx))
+    assert "not yet measurable" in text
+    assert "connected" not in text.split("not yet measurable")[0].splitlines()[-1]
+
+
+def test_connectivity_verdict_reports_coverage_when_only_some_pairs_are_measured(tmp_path):
+    ctx = _ctx(tmp_path, view="physics", exchange={
+        "0-1": {"attempts": 40, "accepted": 12},
+        "1-2": {"attempts": 0, "accepted": 0},
+        "2-3": {"attempts": 0, "accepted": 0},
+        "3-4": {"attempts": 0, "accepted": 0},
+        "4-5": {"attempts": 0, "accepted": 0}})
+    state, _largest, measured = view_physics.connectivity_verdict(ctx)
+    assert state == "partial"
+    assert measured == 1
+    assert "holding judgement" in _text(view_physics.build(ctx))
+
+
+def test_connectivity_verdict_asserts_a_split_only_once_every_pair_is_measured(tmp_path):
+    ctx = _ctx(tmp_path, view="physics", exchange={
+        "0-1": {"attempts": 40, "accepted": 12}, "1-2": {"attempts": 40, "accepted": 0},
+        "2-3": {"attempts": 40, "accepted": 12}, "3-4": {"attempts": 40, "accepted": 12},
+        "4-5": {"attempts": 40, "accepted": 12}})
+    state, largest, measured = view_physics.connectivity_verdict(ctx)
+    assert state == "split"
+    assert measured == 5
+    assert largest == 4
+
+
+def test_physics_view_reports_connectivity_and_names_isolated_windows(tmp_path):
+    ctx = _ctx(tmp_path, view="physics", exchange={
+        "0-1": {"attempts": 40, "accepted": 12}, "1-2": {"attempts": 40, "accepted": 0},
+        "2-3": {"attempts": 40, "accepted": 12}, "3-4": {"attempts": 40, "accepted": 12},
+        "4-5": {"attempts": 40, "accepted": 12}})
+    text = _text(view_physics.build(ctx))
+    assert "connected" in text
+    assert "w02" in text or "w01" in text
+
+
+def test_physics_view_compares_restraint_sigma_with_window_spacing(tmp_path):
+    text = _text(view_physics.build(_ctx(tmp_path, view="physics")))
+    assert "spacing" in text
+    assert "σ" in text or "sigma" in text
+
+
+def test_physics_view_includes_overlap_and_boost_panels(tmp_path):
+    rows = view_physics.build(_ctx(tmp_path, view="physics",
+                                   sidecar=SidecarSnapshot(gamd=GAMD)))
+    assert {p.key for row in rows for p in row.panels} >= {"overlap", "boost"}
