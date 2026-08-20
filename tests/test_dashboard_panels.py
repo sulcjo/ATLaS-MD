@@ -1,4 +1,5 @@
 import argparse
+import dataclasses
 
 import pytest
 
@@ -69,6 +70,20 @@ def test_boost_envelope_panel_reports_sigma_target_and_k0_saturation(tmp_path):
     text = strip_ansi("\n".join(boost_envelope_panel(_ctx(tmp_path, sidecar=sidecar)).lines))
     assert "11.04" in text and "12.55" in text
     assert "SATURATED" in text                      # k0 at its ceiling, stated as text
+
+
+def test_boost_envelope_panel_does_not_call_an_unmeasurable_score_healthy(tmp_path):
+    """`nan > 1.0` is False, so a naive threshold chain reports "could not be
+    computed" as OK -- in the panel whose job is flagging a bad boost."""
+    ctx = _ctx(tmp_path, sidecar=SidecarSnapshot(gamd={"joint_envelope": {"Dihedral": {
+        "sigma0_kj_mol": 12.552, "sigmaV_kj_mol": float("nan"), "k0": float("nan")}}}))
+    # One sample: a variance-free input makes skew/kurtosis and the score undefined.
+    ctx = dataclasses.replace(ctx, boost_history_all=(2.4,))
+    text = strip_ansi("\n".join(boost_envelope_panel(ctx).lines))
+    assert "nan" not in text
+    assert "not measurable" in text or "not reported" in text
+    anharm_line = next(l for l in text.splitlines() if "anharmonicity" in l)
+    assert " ok" not in anharm_line.lower()
 
 
 def test_boost_envelope_panel_says_so_when_the_run_has_no_gamd(tmp_path):
