@@ -8,6 +8,7 @@ fit, so the loss was invisible.
 import argparse
 import os
 import random
+import re
 
 import pytest
 
@@ -25,6 +26,22 @@ WIDTHS = (40, 55, 70, 80, 100, 120, 140, 200, 400)
 HEIGHTS = (18, 20, 24, 35, 45, 55, 80)
 VIEWS = ("progress", "physics", "windows")
 N_WINDOWS = 25
+
+# The footer's wall-clock (`gareus/dashboard/screen.py`'s
+# `time.strftime("%H:%M:%S", time.localtime(ctx.now_wall))`) is deliberately
+# local-time for the real live dashboard -- but that makes it the one cell in
+# an otherwise-fully-deterministic frame that depends on the host machine's
+# timezone, not on any of this test's own inputs. Confirmed real: the golden
+# files generated on this machine (UTC+1) read "23:13:20"; regenerating under
+# `TZ=UTC` gives "22:13:20" for the identical `now=1_700_000_000.0` input.
+# Normalized out before writing/comparing so the snapshot is portable across
+# machines/CI regardless of timezone, without changing the production footer
+# (which should stay local-time -- that's a display choice, not a bug).
+_CLOCK_RE = re.compile(r"\b\d{2}:\d{2}:\d{2}\b")
+
+
+def _normalize_clock(text: str) -> str:
+    return _CLOCK_RE.sub("00:00:00", text)
 
 POOL = {"total_ns": 15000.0, "used_ns": 7500.0, "remaining_ns": 7500.0,
         "events": [{"label": f"seg_{i}", "kind": "scheduled_epoch",
@@ -142,7 +159,7 @@ def test_golden_frame_matches_the_committed_snapshot(view):
     import tempfile
     golden = pathlib.Path(__file__).parent / "golden" / "dashboard" / f"{view}_140x45.txt"
     run_dir = pathlib.Path(tempfile.gettempdir()) / "gareus_dashboard_golden_fixture"
-    actual = strip_ansi(render_screen(_ctx(run_dir, 140, 45, view)))
+    actual = _normalize_clock(strip_ansi(render_screen(_ctx(run_dir, 140, 45, view))))
     if os.environ.get("GAREUS_UPDATE_GOLDEN") == "1":
         golden.parent.mkdir(parents=True, exist_ok=True)
         golden.write_text(actual)

@@ -35,4 +35,4 @@ alert w17 BAD dead exchange 0.000   |   w18 BAD dead exchange 0.000
 │ graph 18/25 connected   isolated: w18, w19, w20, w21, w22, w23, w24                                                                    │
 │ → union MBAR drops 7 states unless a bridge is added                                                                                   │
 └────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-──── [1] progress   [2] PHYSICS   [3] windows   23:13:20
+──── [1] progress   [2] PHYSICS   [3] windows   00:00:00

@@ -39,4 +39,4 @@ alert w17 BAD dead exchange 0.000   |   w18 BAD dead exchange 0.000
 │  exchange    w16  0.30  ok                                                                                                             │
 │  exchange    w18  0.00  DEAD                                                                                                           │
 └────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-──── [1] progress   [2] physics   [3] WINDOWS   23:13:20
+──── [1] progress   [2] physics   [3] WINDOWS   00:00:00

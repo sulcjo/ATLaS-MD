@@ -30,4 +30,4 @@ alert w17 BAD dead exchange 0.000   |   w18 BAD dead exchange 0.000
 │ this segment    eta 12h04m                                      │   │ step            12450000 / 37500000                              │
 │ elapsed         6h00m                                           │   │ sim time        49.8 ns/rep                                      │
 └─────────────────────────────────────────────────────────────────┘   └──────────────────────────────────────────────────────────────────┘
-──── [1] PROGRESS   [2] physics   [3] windows   23:13:20
+──── [1] PROGRESS   [2] physics   [3] windows   00:00:00
