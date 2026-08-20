@@ -521,7 +521,10 @@ def _add_output_args(p: argparse.ArgumentParser) -> None:
                         "to another view only while a problem is present (dead exchange "
                         "pair, disconnected state graph, high boost anharmonicity).")
     p.add_argument("--tui-glyphs", choices=["auto", "unicode", "ascii"], default="auto",
-                   help="Glyph set for density strips and panel borders. 'auto' picks "
+                   help="Glyph set for the dashboard's window/exchange density "
+                        "strips (gareus/dashboard/spine.py's bucket_strip). Does "
+                        "not affect panel borders, which are always unicode box "
+                        "characters regardless of this setting. 'auto' picks "
                         "unicode on a UTF-8 stdout, ascii otherwise.")
     p.add_argument("--color", choices=["auto", "always", "never"], default="auto",
                    help="ANSI colour output. 'auto' enables it when stdout is a TTY.")
