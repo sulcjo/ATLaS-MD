@@ -1,11 +1,17 @@
 import argparse
 import dataclasses
+import re
 
 from gareus.dashboard import view_physics, view_progress, view_windows
 from gareus.dashboard.context import build_context
 from gareus.dashboard.sidecar import SidecarSnapshot
 from gareus.logger import DistanceLogger
 from gareus.tui import strip_ansi
+
+# Matches the potential-energy histogram bar's "kJ |<bar>|" suffix -- see
+# tests/test_dashboard_scaling_integration.py's identical pattern, which pins
+# the same glyph set against the legacy `logger._render_dashboard` path.
+_PE_BAR_RE = re.compile(r"kJ \|([ ·░▒▓█●]+)\|")
 
 CENTERS = tuple(4.0 + 0.55 * i for i in range(6))
 # A fixed wall clock six hours after the segment started. Without an explicit
@@ -331,3 +337,45 @@ def test_windows_view_keeps_the_historical_cv_pe_weights(tmp_path):
     rows = view_windows.build(_ctx(tmp_path, view="windows"))
     by_key = {p.key: p for row in rows for p in row.panels}
     assert (by_key["cv_map"].weight, by_key["pe_map"].weight) == (2.4, 0.9)
+
+
+def test_windows_view_map_bar_widths_match_the_pinned_pe_arithmetic(tmp_path):
+    """`tests/test_dashboard_scaling_integration.py::
+    test_pe_histogram_bar_width_pinned_at_160x40` pins the historical PE-bar
+    arithmetic through the legacy `logger._render_dashboard` path and
+    `_weighted_panel_widths` directly -- neither one ever reaches this view's
+    own `_map_bar_widths`, so nothing else in the suite catches a regression in
+    this view's own bar-width plumbing. Pin it here too.
+    """
+    from gareus.dashboard.view_windows import _map_bar_widths
+    ctx = _ctx(tmp_path, view="windows", term_w=160)
+    _cv_bar_w, pe_bar_w = _map_bar_widths(ctx)
+    assert pe_bar_w == 18
+
+
+def test_windows_view_pe_map_renders_a_bar_at_the_pinned_width(tmp_path):
+    """Companion, end-to-end: seeds real PE history and confirms the bar
+    `pe_map_panel` actually renders through `view_windows.build` is 18 columns
+    wide at 160 columns, not just that the width arithmetic alone says so."""
+    ctx = dataclasses.replace(
+        _ctx(tmp_path, view="windows", term_w=160),
+        pe_history_by_replica={w: tuple(100.0 + w + i for i in range(20)) for w in range(6)},
+    )
+    text = _text(view_windows.build(ctx))
+    matches = _PE_BAR_RE.findall(text)
+    assert matches, "expected a rendered 'kJ |<bar>|' PE histogram bar"
+    assert len(matches[0]) == 18
+
+
+def test_windows_view_drops_the_maps_row_before_table_or_detail_on_a_short_terminal(tmp_path):
+    """Measures the allocator against this view's real three rows, rather than
+    inferring the drop order from priority numbers alone."""
+    from gareus.tui_screen import allocate_rows, row_min
+
+    rows = view_windows.build(_ctx(tmp_path, view="windows"))
+    table_row, maps_row, detail_row = rows
+    budget = row_min(table_row) + row_min(detail_row)
+    allocated, dropped = allocate_rows(rows, budget=budget)
+    assert set(dropped) == {p.key for p in maps_row.panels}
+    kept_keys = {p.key for row, _body in allocated for p in row.panels}
+    assert kept_keys == {p.key for p in table_row.panels} | {p.key for p in detail_row.panels}
