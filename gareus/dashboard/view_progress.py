@@ -13,9 +13,8 @@ from ..colors import color_text
 from ..tui import format_duration
 from ..tui_screen import Panel, Row
 from .context import DashboardContext
-from .panels import panel
-
-_SECONDS_PER_DAY = 86400.0
+from .panels import _num, panel
+from .spine import _ns_per_day
 
 
 def collapse_extension_rounds(
@@ -44,6 +43,10 @@ def collapse_extension_rounds(
     states: dict[str, int] = {}
     last_label = ""
     for event in events:
+        # A wrong-shaped sidecar (e.g. a stray non-dict entry in "events") must
+        # not raise -- partial/malformed JSON is a display state, not a crash.
+        if not isinstance(event, Mapping):
+            continue
         label = str(event.get("label", "") or "")
         if label not in counts:
             order.append(label)
@@ -114,14 +117,14 @@ def timeline_panel(ctx: DashboardContext) -> Panel:
         lines.append(f" {_fit_label('final (reserve)', label_w):<{label_w}} "
                      + "░" * bar_w
                      + f" {remaining:9.1f} ns       ○ scheduled")
+    # `want_lines` must never fall below `min_lines=6`: a short `lines` (e.g. a
+    # single unavailable-ledger message, or very few real events) made
+    # `min(12, len(lines))` land below 6, handing the allocator a row whose
+    # `want - min` "room" (gareus/tui_screen.py's `allocate_rows`) went
+    # negative -- clamp so the panel never claims to want less than its own
+    # declared minimum.
     return panel("timeline", "campaign timeline" + _ledger_age(ctx), lines,
-                 min_lines=6, want_lines=min(12, len(lines)), priority=1)
-
-
-def _ns_per_day(ctx: DashboardContext) -> float:
-    if ctx.timestep_fs <= 0.0 or ctx.elapsed_s <= 0.0:
-        return float("nan")
-    return ctx.display_step * ctx.timestep_fs / 1.0e6 / ctx.elapsed_s * _SECONDS_PER_DAY
+                 min_lines=6, want_lines=max(6, min(12, len(lines))), priority=1)
 
 
 def projection_panel(ctx: DashboardContext) -> Panel:
@@ -129,7 +132,13 @@ def projection_panel(ctx: DashboardContext) -> Panel:
     remaining = float(pool.get("remaining_ns", 0.0) or 0.0)
     ns_day = _ns_per_day(ctx)
     aggregate = ns_day * ctx.n_replicas if math.isfinite(ns_day) else float("nan")
-    lines = [f" perf now        {ns_day:.0f} ns/day/rep   ({aggregate:.0f} aggregate)"]
+    # `_ns_per_day` is nan whenever timestep_fs/elapsed_s aren't measurable yet
+    # (e.g. a real logger built before the first frame has any wall-clock
+    # elapsed) -- a bare `{ns_day:.0f}` printed the literal token "nan" here,
+    # inconsistently with the very next branch below, which already has its
+    # own correct not-yet-measured wording.
+    lines = [f" perf now        {_num(ns_day, 0, 0)} ns/day/rep   "
+             f"({_num(aggregate, 0, 0)} aggregate)"]
     if remaining > 0 and math.isfinite(aggregate) and aggregate > 0:
         lines.append(f" pool remaining  {remaining:.0f} ns = "
                      f"{remaining / aggregate:.1f} GPU-days at this rate")

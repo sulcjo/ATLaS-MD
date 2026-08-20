@@ -12,7 +12,14 @@ from typing import Sequence
 from ..tui import _weighted_panel_widths, dashboard_row_gap
 from ..tui_screen import Row
 from .context import DashboardContext
-from .panels import cv_map_panel, pe_map_panel, window_detail_panel, window_table_panel
+from .panels import (
+    cv_map_panel,
+    pe_map_panel,
+    pull_panel,
+    replica_table_panel,
+    window_detail_panel,
+    window_table_panel,
+)
 from .ranking import OK, WindowStatus, rank_windows
 
 CV_WEIGHT = 2.4
@@ -46,6 +53,14 @@ def build(ctx: DashboardContext) -> tuple[Row, ...]:
         Row(panels=(window_table_panel(ctx, statuses),)),
         Row(panels=(cv_map_panel(ctx, cv_bar_w), pe_map_panel(ctx, pe_bar_w))),
         Row(panels=(window_detail_panel(ctx, select_window(ctx, statuses)),)),
+        # I3: `pull_panel`/`replica_table_panel` (gareus/dashboard/panels.py) had
+        # no consumer -- the old dashboard showed the umbrella-pull field and the
+        # full replica table, the new frame silently dropped both. Both panels
+        # are priority 3 here (replica_table_panel's own declared priority
+        # bumped from 2 to 3 to match), one tier below the cv/pe maps row
+        # (priority 2), so on a short terminal this row is the first thing
+        # dropped -- before the ranked table, the maps, or the detail panel.
+        Row(panels=(pull_panel(ctx), replica_table_panel(ctx))),
     )
 
 

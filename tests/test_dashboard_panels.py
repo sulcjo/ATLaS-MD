@@ -1,8 +1,6 @@
 import argparse
 import dataclasses
 
-import pytest
-
 from gareus.dashboard.context import build_context
 from gareus.dashboard.panels import (
     boost_envelope_panel,
@@ -162,12 +160,13 @@ def test_window_table_panel_puts_the_worst_window_first(tmp_path):
         temperature_k=ctx.temperature_k,
     )
     lines = strip_ansi("\n".join(window_table_panel(ctx, statuses).lines)).splitlines()
-    # Body rows are indented two spaces ("  w00  ..."); the header is flush-left
-    # ("win   cv1 ctr ..."). A plain `.strip().startswith("w")` can no longer
-    # tell them apart now that the header reads "win" instead of "#win" (see
-    # task-11 fix report: the leading "#" was a hack to dodge exactly this
-    # collision, removed because it read as a stray typo in a rendered frame).
-    body = [l for l in lines if l.startswith("  w")]
+    # Body rows are "  w00  ..." (digits after "w"); the header is now also
+    # 2-space indented ("  win   cv1 ctr ...", aligned to sit over the body
+    # columns it labels -- see the alignment fix this test was updated for), so
+    # a bare `l.startswith("  w")` can no longer tell them apart (both start
+    # "  w": "win" and a real "w00"). Require a digit right after "w" instead --
+    # "win"'s next character is "i", never a digit.
+    body = [l for l in lines if l.startswith("  w") and len(l) > 3 and l[3].isdigit()]
     assert body[0].split()[0] == "w02"
     assert BAD in body[0]
 

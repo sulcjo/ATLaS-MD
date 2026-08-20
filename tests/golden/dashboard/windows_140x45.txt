@@ -9,7 +9,7 @@ alert w17 BAD dead exchange 0.000   |   w18 BAD dead exchange 0.000
 ┌────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │windows — worst first                                                                                                                   │
 ├────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
-│win   cv1 ctr    accL   accR   |Δ|max   status                                                                                          │
+│  win   cv1 ctr    accL   accR   |Δ|max   status                                                                                        │
 │  w17     13.35    0.30   0.00     0.05   BAD  dead exchange 0.000                                                                      │
 │  w18     13.90    0.00   0.30     0.05   BAD  dead exchange 0.000                                                                      │
 │  w00      4.00       —   0.30     0.05   ok                                                                                            │
@@ -24,7 +24,7 @@ alert w17 BAD dead exchange 0.000   |   w18 BAD dead exchange 0.000
 ┌────────────────────────────────────────────────────────────────────────────────────────────────┐   ┌───────────────────────────────────┐
 │per-window CV distributions                                                                     │   │potential energy histograms        │
 ├────────────────────────────────────────────────────────────────────────────────────────────────┤   ├───────────────────────────────────┤
-│| range   1.64 A ..  19.13 A  min   4.05  mean  10.65  max  17.25  k  2.500 kcal/mol/A^2        │   │  PE range -31500 to -31461 kJ/mol…│
+│range   1.64 A ..  19.13 A  min   4.05  mean  10.65  max  17.25  k  2.500 kcal/mol/A^2          │   │  PE range -31500 to -31461 kJ/mol…│
 │legend: ● current nonlocal contacts colored by replica id, │ umbrella center, ◉ overlap, shaded…│   │  r00    -31500 kJ |●▓▓▓▓▓▓▓▓▓▓▓█| │
 │rep win      cv_A  center       k     bias     pull   delta  window-CV distribution             │   │  r01    -31500 kJ |●▓▓▓▓▓▓▓▓▓▓▓█| │
 │r00 w00      4.05    4.00   2.500     0.01   +0.100   +0.05  [··▂◉▄·····················] nw=60 │   │  r02    -31500 kJ |●▓▓▓▓▓▓▓▓▓▓▓█| │
@@ -39,4 +39,4 @@ alert w17 BAD dead exchange 0.000   |   w18 BAD dead exchange 0.000
 │  exchange    w16  0.30  ok                                                                                                             │
 │  exchange    w18  0.00  DEAD                                                                                                           │
 └────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-──── [1] progress   [2] physics   [3] WINDOWS   00:00:00
+──── [1] progress   [2] physics   [3] WINDOWS   dropped: pull, replicas   00:00:00

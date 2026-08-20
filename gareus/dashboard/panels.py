@@ -211,6 +211,19 @@ def cv_map_panel(ctx: DashboardContext, bar_width: int) -> Panel:
     lines = block.splitlines()
     if len(lines) > 4:
         lines = lines[3:]                 # drop its own border/title/separator
+        # `render_distance_ascii`'s own header is 4 chrome lines (blank, title
+        # rule, phase/step, range/min/mean/max/k) before its real content
+        # (legend, table header, rows) -- the slice above only drops the first
+        # 3, leaving that fourth "| range ..." line's own leading "| " prefix
+        # in the panel body. Rendered inside this panel's own border, that
+        # became a visible stray "│|" (this panel's real border immediately
+        # followed by the leftover chrome prefix, see
+        # tests/golden/dashboard/windows_140x45.txt before this fix). The line's
+        # content (min/mean/max/k range) is genuinely useful and not shown
+        # anywhere else, so strip the stray prefix rather than dropping the
+        # whole line.
+        if lines and lines[0].startswith("| "):
+            lines[0] = lines[0][2:]
     return panel("cv_map", "per-window CV distributions",
                  lines or [color_text("no samples yet", "dim")],
                  min_lines=6, want_lines=18, priority=2, weight=2.4)
@@ -442,7 +455,7 @@ def replica_table_panel(ctx: DashboardContext, ncols: int = 1) -> Panel:
     if not ctx.rows:
         return panel("replicas", "replica table",
                      [color_text("no replica data", "dim")],
-                     min_lines=4, want_lines=16, priority=2, weight=1.5)
+                     min_lines=4, want_lines=16, priority=3, weight=1.5)
     mode = _cv_fmt_mode(ctx)
     max_span = max(0, ctx.n_windows - 1)
     rep_lines: list[str] = []
@@ -498,7 +511,7 @@ def replica_table_panel(ctx: DashboardContext, ncols: int = 1) -> Panel:
         rep_lines = list(_join_columns(columns, gap=3))
 
     return panel("replicas", "replica table", rep_lines,
-                 min_lines=4, want_lines=16, priority=2, weight=1.5)
+                 min_lines=4, want_lines=16, priority=3, weight=1.5)
 
 
 def _num(value: object, width: int, places: int) -> str:
@@ -533,8 +546,15 @@ def window_table_panel(ctx: DashboardContext, statuses: Sequence[WindowStatus]) 
     # worse than no column at all.
     show_cv2 = len(ctx.secondary_centers) == int(ctx.n_windows) and bool(ctx.secondary_centers)
     cv2_head = "  cv2 ctr " if show_cv2 else ""
+    # The 2-space lead matches body rows' own "  w00  ..." indent (below) so
+    # "cv1 ctr"/"accL"/"accR"/"|Δ|max"/"status" sit over their actual columns
+    # instead of two columns to the left of them. Body rows are still
+    # distinguishable from this header without relying on that indent alone --
+    # see the digit check callers use (e.g.
+    # tests/test_dashboard_panels.py::test_window_table_panel_puts_the_worst_window_first),
+    # since "win" and a real "w00" both now start "  w".
     header = color_text(
-        f"win   cv1 ctr {cv2_head}   accL   accR   |Δ|max   status", "white", bold=True)
+        f"  win   cv1 ctr {cv2_head}   accL   accR   |Δ|max   status", "white", bold=True)
     lines = [header]
     line_statuses = [""]                 # the header line carries no severity
     for s in statuses:

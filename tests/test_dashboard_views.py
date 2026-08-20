@@ -112,6 +112,23 @@ def test_progress_view_projects_remaining_budget_in_gpu_days(tmp_path):
     assert "GPU-day" in text
 
 
+def test_projection_panel_never_prints_a_literal_nan_perf_value(tmp_path):
+    """I1: `_ns_per_day` returns nan whenever `timestep_fs` isn't measurable yet
+    (real trigger: `tests/test_dashboard_screen.py`'s
+    `test_logger_reuses_one_sidecar_cache_across_frames` builds a logger from a
+    bare `argparse.Namespace()`, which has no `timestep_fs` attribute at all).
+    A bare `{ns_day:.0f}` used to print the literal token "nan" in the
+    "perf now" line, inconsistently with the very next branch, which already
+    had its own correct not-yet-measured wording -- the inconsistency was
+    internal to this one function.
+    """
+    ctx = dataclasses.replace(_ctx(tmp_path, sidecar=SidecarSnapshot(pool=POOL)), timestep_fs=0.0)
+    text = _text(view_progress.build(ctx))
+    line = next(l for l in text.splitlines() if l.strip().startswith("perf now"))
+    assert "nan" not in line
+    assert "—" in line
+
+
 def test_timeline_labels_never_silently_cut_a_step_count(tmp_path):
     """`epoch_001/topup_001_3388000` truncated to `...338800` reads as a real
     step count and is wrong; two segments can also collide on the same cut."""
@@ -259,21 +276,61 @@ def test_physics_view_compares_restraint_sigma_with_window_spacing(tmp_path):
     assert "σ" in text or "sigma" in text
 
 
+def test_sigma_panel_never_prints_a_literal_nan_or_inf_for_k_median_or_sigma(tmp_path):
+    """I1: `restraint_sigma` (gareus/dashboard/ranking.py) returns `inf`, not
+    nan, when `k` is non-positive -- `{sigma:.2f}` printed the literal token
+    "inf" in that case, and an all-non-finite `k_list` made `k_median` itself
+    print "nan". Both are absences, not zero-width restraints.
+    """
+    ctx = dataclasses.replace(_ctx(tmp_path, view="physics"), k_list=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
+    text = _text(view_physics.build(ctx))
+    line = next(l for l in text.splitlines() if l.strip().startswith("k median"))
+    assert "nan" not in line
+    assert "inf" not in line
+    assert "—" in line
+
+
 def test_physics_view_includes_overlap_and_boost_panels(tmp_path):
     rows = view_physics.build(_ctx(tmp_path, view="physics",
                                    sidecar=SidecarSnapshot(gamd=GAMD)))
     assert {p.key for row in rows for p in row.panels} >= {"overlap", "boost"}
 
 
+def test_physics_view_includes_the_exchange_panel(tmp_path):
+    """I3: `exchange_panel` had no consumer -- the old dashboard showed it, the
+    new frame silently dropped it."""
+    rows = view_physics.build(_ctx(tmp_path, view="physics"))
+    assert "exchange" in {p.key for row in rows for p in row.panels}
+
+
+def test_windows_view_includes_pull_and_replica_table_panels(tmp_path):
+    """I3: `pull_panel`/`replica_table_panel` had no consumer -- the old
+    dashboard showed the umbrella-pull field and the full replica table, the
+    new frame silently dropped both."""
+    rows = view_windows.build(_ctx(tmp_path, view="windows"))
+    assert {"pull", "replicas"} <= {p.key for row in rows for p in row.panels}
+
+
 def test_sigma_panel_reports_no_overlap_data_rather_than_zero_overlap(tmp_path):
     """`ctx.overlap_pairs` is legitimately empty for a run's first few samples per
     window (`_hist_overlap` needs >=5 finite samples per side). Empty must render
     as "no data yet", never a fabricated "0.00" overlap -- the same false-alarm
-    class the connectivity verdict machinery exists to avoid."""
+    class the connectivity verdict machinery exists to avoid.
+
+    Asserting only that "0.00" is absent does not actually catch that: the
+    unmeasured median is nan, and a bare `{obs_median:.2f}` prints the literal
+    token "nan" (which also does not contain "0.00") -- so this test used to
+    pass while the panel silently broke this project's own "nan is not data"
+    rule. Assert the real positive: no "nan" token, and an explicit not-measured
+    marker (the shared `_num` em dash) in its place.
+    """
     ctx = dataclasses.replace(_ctx(tmp_path, view="physics"), overlap_pairs={})
     text = _text(view_physics.build(ctx))
     after = text.split("observed median overlap")[1]
-    assert "0.00" not in after.splitlines()[0]
+    line = after.splitlines()[0]
+    assert "0.00" not in line
+    assert "nan" not in line
+    assert "—" in line
 
 
 from gareus.dashboard.ranking import OK as _OK
@@ -370,14 +427,37 @@ def test_windows_view_pe_map_renders_a_bar_at_the_pinned_width(tmp_path):
 
 
 def test_windows_view_drops_the_maps_row_before_table_or_detail_on_a_short_terminal(tmp_path):
-    """Measures the allocator against this view's real three rows, rather than
-    inferring the drop order from priority numbers alone."""
+    """Measures the allocator against this view's real rows, rather than
+    inferring the drop order from priority numbers alone.
+
+    I3 added a fourth row (pull_panel/replica_table_panel, priority 3 -- one
+    tier below the maps row's priority 2), so a budget tight enough to drop the
+    maps row drops the lower-priority extras row too.
+    """
     from gareus.tui_screen import allocate_rows, row_min
 
     rows = view_windows.build(_ctx(tmp_path, view="windows"))
-    table_row, maps_row, detail_row = rows
+    table_row, maps_row, detail_row, extras_row = rows
     budget = row_min(table_row) + row_min(detail_row)
     allocated, dropped = allocate_rows(rows, budget=budget)
-    assert set(dropped) == {p.key for p in maps_row.panels}
+    assert set(dropped) == ({p.key for p in maps_row.panels} | {p.key for p in extras_row.panels})
     kept_keys = {p.key for row, _body in allocated for p in row.panels}
     assert kept_keys == {p.key for p in table_row.panels} | {p.key for p in detail_row.panels}
+
+
+def test_windows_view_drops_the_extras_row_before_the_maps_row_on_a_medium_terminal(tmp_path):
+    """I3: pull_panel/replica_table_panel are priority 3, strictly below the
+    maps row's priority 2 -- they must be the very first thing dropped, not
+    merely dropped together with the maps row. Measured against the allocator
+    directly, not inferred from the priority numbers alone.
+    """
+    from gareus.tui_screen import allocate_rows, row_min
+
+    rows = view_windows.build(_ctx(tmp_path, view="windows"))
+    table_row, maps_row, detail_row, extras_row = rows
+    budget = row_min(table_row) + row_min(maps_row) + row_min(detail_row)
+    allocated, dropped = allocate_rows(rows, budget=budget)
+    assert set(dropped) == {p.key for p in extras_row.panels}
+    kept_keys = {p.key for row, _body in allocated for p in row.panels}
+    assert kept_keys == ({p.key for p in table_row.panels} | {p.key for p in maps_row.panels}
+                         | {p.key for p in detail_row.panels})

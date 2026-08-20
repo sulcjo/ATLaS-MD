@@ -15,7 +15,7 @@ import numpy as np
 from ..colors import ROLE_BAD, ROLE_GOOD, ROLE_WARN, color_text, role_text
 from ..tui_screen import Panel, Row
 from .context import DashboardContext
-from .panels import boost_envelope_panel, overlap_panel, panel
+from .panels import _num, boost_envelope_panel, exchange_panel, overlap_panel, panel
 from .ranking import DEAD_ACCEPTANCE, OK, restraint_sigma
 
 TARGET_OVERLAP = 0.30
@@ -74,10 +74,16 @@ def sigma_spacing_panel(ctx: DashboardContext) -> Panel:
         verdict = role_text(f"k likely too soft (σ/spacing {ratio:.2f})", ROLE_WARN)
     else:
         verdict = role_text(f"σ/spacing {ratio:.2f} {OK}", ROLE_GOOD)
+    # `_num` renders an em dash rather than a literal "nan"/"inf" token: k_median
+    # is nan when ctx.k_list itself holds no finite value, and sigma is inf
+    # whenever restraint_sigma's own guard rejects a non-positive/non-finite k
+    # or temperature (gareus/dashboard/ranking.py) -- neither is a real
+    # measurement, and printing either would put a non-numeric token in a
+    # numeric column.
     return panel("sigma", "σ-vs-spacing check", [
-        f" k median {k_median:.2f} {ctx.primary_k_units} → σ {sigma:.2f} "
-        f"{ctx.primary_cv_units}   spacing {median_spacing:.2f}",
-        f" observed median overlap {obs_median:.2f}   target {TARGET_OVERLAP:.2f}",
+        f" k median {_num(k_median, 0, 2)} {ctx.primary_k_units} → σ {_num(sigma, 0, 2)} "
+        f"{ctx.primary_cv_units}   spacing {_num(median_spacing, 0, 2)}",
+        f" observed median overlap {_num(obs_median, 0, 2)}   target {TARGET_OVERLAP:.2f}",
         " " + verdict,
     ], min_lines=3, want_lines=3, priority=2)
 
@@ -168,6 +174,12 @@ def build(ctx: DashboardContext) -> tuple[Row, ...]:
     return (
         Row(panels=(overlap_panel(ctx), boost_envelope_panel(ctx))),
         Row(panels=(sigma_spacing_panel(ctx),)),
+        # I3: `exchange_panel` (gareus/dashboard/panels.py) had no consumer --
+        # the old dashboard showed it, the new frame silently dropped it. The
+        # spine's own exchange strip only ever carries the mean/min/dead-pair
+        # summary; the per-pair/jump-distance detail this panel adds is real
+        # content that was missing from every frame, not a duplicate of it.
+        Row(panels=(exchange_panel(ctx),)),
         Row(panels=(connectivity_panel(ctx),)),
     )
 
