@@ -3284,6 +3284,7 @@ any BAD-ranked window or dead pair → `windows`; disconnected graph or anharmon
 ```python
 # tests/test_dashboard_screen.py
 import argparse
+import random
 
 from gareus.dashboard.context import build_context
 from gareus.dashboard.screen import (
@@ -3297,12 +3298,22 @@ from gareus.logger import DistanceLogger
 from gareus.tui import strip_ansi, strip_ansi_len
 
 CENTERS = tuple(4.0 + 0.55 * i for i in range(8))
+_RNG = random.Random(11)
 
 
 def _ctx(tmp_path, *, view="auto", term_w=140, term_h=45, exchange=None, sidecar=None):
     logger = DistanceLogger(tmp_path, argparse.Namespace(timestep_fs=4.0), no_file_persistence=True)
     for w in range(8):
-        logger.history_by_window[w] = [CENTERS[w] + 0.1 * (i % 5 - 2) for i in range(40)]
+        # A HEALTHY fixture, built deliberately. Windows sit 0.55 A apart and the
+        # restraint's own width at k=2.5, 300 K is sigma = 0.488 A, so samples must
+        # spread at roughly that scale for neighbours to overlap the way umbrella
+        # sampling intends. The obvious narrow ramp spans only 0.2 A, which yields
+        # histogram overlap of EXACTLY 0.0 on every pair and ranks all eight windows
+        # BAD -- so `auto` promotes away from PROGRESS and the healthy-run tests below
+        # fail while looking like defects in the promotion logic. Measured with this
+        # seed and spread: overlap 0.35-0.62, every window ok.
+        logger.history_by_window[w] = [CENTERS[w] + _RNG.gauss(0.0, 0.35)
+                                      for _ in range(40)]
     rows = [{"replica": w, "window": w, "center_A": CENTERS[w], "k_kcal_mol_A2": 2.5,
              "cv_A": CENTERS[w] + 0.05, "umbrella_bias_kcal_mol": 0.0,
              "umbrella_pull_kcal_mol_A": 0.0} for w in range(8)]
@@ -3893,6 +3904,7 @@ fit, so the loss was invisible.
 
 import argparse
 import os
+import random
 
 import pytest
 
@@ -3906,6 +3918,7 @@ from gareus.tui import strip_ansi, strip_ansi_len
 # side by side and takes the vertical stacking path instead. A matrix that starts
 # at 70 never exercises stacking at all, which is where both of Task 2's verified
 # width/height defects lived.
+_RNG = random.Random(17)
 WIDTHS = (40, 55, 70, 80, 100, 120, 140, 200, 400)
 HEIGHTS = (18, 20, 24, 35, 45, 55, 80)
 VIEWS = ("progress", "physics", "windows")
@@ -3924,7 +3937,13 @@ def _ctx(tmp_path, term_w, term_h, view, *, is_2d=False, n=N_WINDOWS, rich=True)
                             no_file_persistence=True)
     if rich:
         for w in range(n):
-            logger.history_by_window[w] = [centers[w] + 0.1 * (i % 5 - 2) for i in range(60)]
+            # Spread at roughly the restraint's own width (sigma = 0.488 A for k=2.5 at
+            # 300 K, windows 0.55 A apart) so neighbours genuinely overlap. A narrow
+            # ramp gives overlap 0.0 everywhere and ranks every window BAD, which would
+            # make the golden frames a picture of a broken run by accident rather than
+            # by choice. Seeded, so the frames stay reproducible.
+            logger.history_by_window[w] = [centers[w] + _RNG.gauss(0.0, 0.35)
+                                          for _ in range(60)]
             logger.potential_history_by_replica[w] = [-31500.0 + i for i in range(40)]
             logger.secondary_history_by_window[w] = [0.1 * (i % 7) - 0.3 for i in range(40)]
         logger.boost_history_all = [2.0 + 0.5 * (i % 7) for i in range(300)]
@@ -3932,9 +3951,15 @@ def _ctx(tmp_path, term_w, term_h, view, *, is_2d=False, n=N_WINDOWS, rich=True)
              "cv_A": centers[w] + 0.05, "umbrella_bias_kcal_mol": 0.01,
              "umbrella_pull_kcal_mol_A": 0.1, "potential_kj_mol": -31500.0,
              "gamd_boost_total_kcal_mol": 2.4} for w in range(n)]
+    # Nested "pairs" shape, as gareus/production.py actually writes it, and with
+    # ONE deliberate dead pair so the golden frames show a flagged state too -- a
+    # reference frame in which nothing is ever wrong cannot show whether the alarm
+    # path renders at all.
+    pair_stats = {f"{i}-{i+1}": {"attempts": 40, "accepted": (0 if i == 17 else 12)}
+                  for i in range(n - 1)}
     info = {"centers_a": centers, "n_windows": n, "k_list": [2.5] * n,
-            "exchange_stats": {f"{i}-{i+1}": {"attempts": 40, "accepted": 12}
-                               for i in range(n - 1)},
+            "exchange_stats": {"attempts": 40 * (n - 1), "accepted": 12 * (n - 2),
+                               "mode": "neighbor", "pairs": pair_stats},
             "primary_cv_label": "nonlocal contacts", "primary_cv_units": "A",
             "primary_k_units": "kcal/mol/A^2",
             "adaptive_phase": {"epoch_index": 1, "epoch_total": 2,
