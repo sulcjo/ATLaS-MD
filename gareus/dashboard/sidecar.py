@@ -31,6 +31,13 @@ class SidecarSnapshot:
     quality_gate: Optional[dict] = None
     seeding_quality: Optional[dict] = None
     errors: tuple[str, ...] = field(default=())
+    # The resolved run root (`SidecarCache.run_root`, from `find_run_root`) --
+    # carried onto the snapshot so `gareus/dashboard/context.py`'s `build_context`
+    # can name the spine's identity line after the real run, not the segment
+    # directory `DistanceLogger` was actually constructed with. `None` for a
+    # hand-built snapshot (most tests, and any caller that never went through
+    # `SidecarCache.snapshot`) -- callers must fall back to `out_dir` themselves.
+    run_root: Optional[Path] = None
 
 
 def find_run_root(out_dir: Path) -> Path:
@@ -95,6 +102,7 @@ class SidecarCache:
         self._snapshot = SidecarSnapshot(
             pool=pool, pool_mtime=pool_mtime, gamd=gamd, gamd_mtime=gamd_mtime,
             quality_gate=gate, seeding_quality=seeding, errors=tuple(errors),
+            run_root=self.run_root,
         )
         self._last_read_wall = float(now)
         return self._snapshot

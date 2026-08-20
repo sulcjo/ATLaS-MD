@@ -250,10 +250,27 @@ def build_context(
             str(phase), info,
         )
     except Exception:
-        decision = {}
+        # An absence must not read as the best case. `_dashboard_decision_state`
+        # always returns `{"health", "issues", "reasons", "actions"}` with
+        # `health` one of "OK"/"WATCH"/"BAD" -- falling back to a bare `{}` here
+        # made `_verdict`'s (gareus/dashboard/spine.py) own `.get("health", "OK")`
+        # default silently render a swallowed failure as "✓ OK" in green. The
+        # explicit "UNAVAILABLE" sentinel here is never returned by a real,
+        # successful call, so `_verdict` can render it as its own distinct,
+        # muted "verdict unavailable" state instead.
+        decision = {"health": "UNAVAILABLE", "issues": [], "reasons": [], "actions": []}
 
+    # `logger.out_dir` is the *segment* directory DistanceLogger was actually
+    # constructed with -- on a real adaptive run that is e.g.
+    # ".../adaptive_production/epoch_001/baseline", whose basename
+    # ("baseline") is not the run's identity and duplicates `segment_name` two
+    # fields later. `sidecar.run_root` (populated by `SidecarCache.snapshot`
+    # from `find_run_root`) already resolves the true run directory; fall back
+    # to `out_dir` only when no sidecar/run_root is available (most unit-test
+    # fixtures, and any caller that built `SidecarSnapshot` by hand).
+    run_root_name = str(getattr(sidecar.run_root, "name", "") or "")
     return DashboardContext(
-        run_label=str(getattr(logger.out_dir, "name", "") or ""),
+        run_label=run_root_name or str(getattr(logger.out_dir, "name", "") or ""),
         phase=str(phase),
         segment_name=str(adaptive.get("segment_name", "") or ""),
         epoch_index=adaptive.get("epoch_index"),

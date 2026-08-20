@@ -148,11 +148,15 @@ def test_golden_frame_matches_the_committed_snapshot(view):
     """Layout drift must be a deliberate, reviewed diff.
 
     Uses a fixed run directory name, not `tempfile.TemporaryDirectory()` --
-    `build_context` renders `logger.out_dir.name` verbatim into the spine's
-    identity line (`gareus/dashboard/context.py`'s `run_label` ->
-    `gareus/dashboard/spine.py`'s identity line), so a randomly-suffixed tmp
-    dir bakes a non-reproducible token straight into the golden text and the
-    snapshot can never match on a second run. Nothing needs to exist on disk
+    `build_context` renders a run identity verbatim into the spine's identity
+    line (`gareus/dashboard/context.py`'s `run_label` ->
+    `gareus/dashboard/spine.py`'s identity line). `run_label` prefers
+    `sidecar.run_root.name` and falls back to `logger.out_dir.name` only when
+    no run root was resolved (I5) -- this fixture passes a hand-built
+    `SidecarSnapshot()` with no `run_root`, so it still takes the `out_dir.name`
+    fallback path, but a randomly-suffixed tmp dir would still bake a
+    non-reproducible token straight into the golden text either way, and the
+    snapshot could never match on a second run. Nothing needs to exist on disk
     here (`no_file_persistence=True`, and `sidecar` is passed in directly), so
     a fixed path that is never created is sufficient and avoids that trap.
     """

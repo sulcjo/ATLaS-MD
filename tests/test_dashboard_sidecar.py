@@ -50,6 +50,22 @@ def test_snapshot_reads_pool_and_gamd_payloads(tmp_path):
     assert snap.errors == ()
 
 
+def test_snapshot_carries_the_resolved_run_root(tmp_path):
+    """I5: `gareus/dashboard/context.py`'s `build_context` needs the resolved
+    run root (not just the segment `DistanceLogger` was constructed with) to
+    name the spine's identity line after the real run."""
+    root, segment = _make_run(tmp_path)
+    snap = SidecarCache(segment).snapshot(now=1000.0)
+    assert snap.run_root == root
+
+
+def test_snapshot_run_root_falls_back_to_the_given_directory_when_not_a_real_run(tmp_path):
+    lonely = tmp_path / "not_a_run"
+    lonely.mkdir()
+    snap = SidecarCache(lonely).snapshot(now=1.0)
+    assert snap.run_root == lonely
+
+
 def test_snapshot_is_cached_until_the_min_interval_elapses(tmp_path):
     root, segment = _make_run(tmp_path)
     cache = SidecarCache(segment, min_interval_s=5.0)

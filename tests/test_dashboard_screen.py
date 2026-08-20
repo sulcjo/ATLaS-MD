@@ -1,5 +1,6 @@
 import argparse
 import collections
+import dataclasses
 import os
 import random
 import shutil
@@ -16,10 +17,17 @@ from gareus.logger import DistanceLogger
 from gareus.tui import strip_ansi, strip_ansi_len
 
 CENTERS = tuple(4.0 + 0.55 * i for i in range(8))
-_RNG = random.Random(11)
 
 
 def _ctx(tmp_path, *, view="auto", term_w=140, term_h=45, exchange=None, sidecar=None):
+    # Fresh RNG per call (not a module-level advancing generator): a shared
+    # module-level `random.Random` makes the noise stream depend on how many
+    # other tests/parametrize cases already called `_ctx()`/`_rich_physics_ctx()`
+    # in this process before it, i.e. on test execution order/selection rather
+    # than on this call's own inputs alone -- the same anti-pattern
+    # tests/test_dashboard_frame_fit.py's own `_ctx` fixture documents and
+    # avoids (see its identical comment).
+    rng = random.Random(11)
     logger = DistanceLogger(tmp_path, argparse.Namespace(timestep_fs=4.0), no_file_persistence=True)
     for w in range(8):
         # A HEALTHY fixture, built deliberately. Windows sit 0.55 A apart and the
@@ -30,7 +38,7 @@ def _ctx(tmp_path, *, view="auto", term_w=140, term_h=45, exchange=None, sidecar
         # BAD -- so `auto` promotes away from PROGRESS and the healthy-run tests below
         # fail while looking like defects in the promotion logic. Measured with this
         # seed and spread: overlap 0.35-0.62, every window ok.
-        logger.history_by_window[w] = [CENTERS[w] + _RNG.gauss(0.0, 0.35)
+        logger.history_by_window[w] = [CENTERS[w] + rng.gauss(0.0, 0.35)
                                       for _ in range(40)]
     rows = [{"replica": w, "window": w, "center_A": CENTERS[w], "k_kcal_mol_A2": 2.5,
              "cv_A": CENTERS[w] + 0.05, "umbrella_bias_kcal_mol": 0.0,
@@ -87,6 +95,28 @@ def test_auto_promotes_to_physics_on_a_proven_split(tmp_path):
 
 def test_resolve_view_falls_back_to_progress_for_an_unknown_name(tmp_path):
     assert resolve_view(_ctx(tmp_path), "nonsense") == "progress"
+
+
+def test_resolve_view_promotes_to_physics_on_high_boost_anharmonicity(tmp_path):
+    """C1: `boost_anharmonicity` (gareus/math_helpers.py) returns its score under
+    the key "score", not "anharmonicity_score" -- that other key name belongs to
+    an unrelated post-hoc MBAR-analysis computation. Reading the wrong key here
+    made this promotion rule permanently unreachable: `.get("anharmonicity_score",
+    nan)` always fell through to nan, `math.isfinite(nan)` is always False, and
+    no run's boost distribution -- however non-Gaussian -- could ever promote the
+    auto view to PHYSICS through this branch, including this project's own
+    documented real failure mode (chignolin GaMD boost anharmonicity 1.74).
+
+    A cubed-half-normal boost trace is genuinely, strongly non-Gaussian (score
+    order 10-30, verified directly against `boost_anharmonicity`), not merely a
+    hand-picked number that happens to clear the >1.0 threshold on paper.
+    """
+    rng = random.Random(3)
+    boosts = tuple(abs(rng.gauss(0.0, 1.0)) ** 3 for _ in range(200))
+    ctx = dataclasses.replace(_ctx(tmp_path), boost_history_all=boosts)
+    reasons = promotion_reasons(ctx)
+    assert any("anharmonicity" in r for r in reasons), reasons
+    assert resolve_view(ctx, "auto") == "physics"
 
 
 def test_render_screen_gives_unused_spine_lines_to_the_view(tmp_path):
@@ -157,11 +187,12 @@ def _rich_physics_ctx(tmp_path, term_w, term_h, n=25):
     lines against a much larger min_lines budget) that an allocator mispricing
     a row's cost never surfaces as a visible overflow, masking the defect
     below entirely."""
+    rng = random.Random(11)          # fresh per call -- see `_ctx`'s own note above
     centers = [4.0 + 0.55 * i for i in range(n)]
     logger = DistanceLogger(tmp_path, argparse.Namespace(timestep_fs=4.0),
                             no_file_persistence=True)
     for w in range(n):
-        logger.history_by_window[w] = [centers[w] + _RNG.gauss(0.0, 0.35) for _ in range(60)]
+        logger.history_by_window[w] = [centers[w] + rng.gauss(0.0, 0.35) for _ in range(60)]
     logger.boost_history_all = [2.0 + 0.5 * (i % 7) for i in range(300)]
     rows = [{"replica": w, "window": w, "center_A": centers[w], "k_kcal_mol_A2": 2.5,
              "cv_A": centers[w] + 0.05, "umbrella_bias_kcal_mol": 0.0,
@@ -223,3 +254,38 @@ def test_logger_reuses_one_sidecar_cache_across_frames(tmp_path, monkeypatch):
     first = logger._sidecar
     logger._render_screen_frame([], "p", 1, 2, {}, {"centers_a": [], "n_windows": 0})
     assert logger._sidecar is first
+
+
+def test_do_render_failure_is_caught_and_warned_once_not_silently_dropped(tmp_path, monkeypatch, capsys):
+    """I2 render-thread guard: `_do_render` (gareus/logger.py) runs on the
+    render executor's single worker thread, and nothing ever calls
+    `.result()`/`.exception()` on the Future `log()` submits -- so an unhandled
+    exception inside it used to vanish silently into the thread pool. The
+    dashboard frame would simply stop appearing, forever, retried every render
+    interval, with zero diagnostic that anything was even wrong. Confirmed
+    real by forcing `_render_screen_frame` itself to raise.
+    """
+    logger = DistanceLogger(tmp_path, argparse.Namespace(timestep_fs=2.0),
+                            no_file_persistence=True)
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("boom: render failed")
+
+    monkeypatch.setattr(logger, "_render_screen_frame", _boom)
+    rows = [{"replica": w, "window": w, "center_A": CENTERS[w], "k_kcal_mol_A2": 2.5,
+             "cv_A": CENTERS[w] + 0.05} for w in range(8)]
+    info = {"centers_a": list(CENTERS), "n_windows": 8, "k_list": [2.5] * 8}
+
+    logger.log(rows, "gareus_production", 1, 10, dashboard_info=info)
+    assert logger._pending_render is not None
+    logger._pending_render.result(timeout=5)          # wait for the worker thread
+    err = capsys.readouterr().err
+    assert "boom" in err
+    assert logger._render_error_warned is True
+
+    # One-shot: a second render failure this run must not print a second warning.
+    logger.log(rows, "gareus_production", 2, 10, dashboard_info=info)
+    logger._pending_render.result(timeout=5)
+    err2 = capsys.readouterr().err
+    assert err2 == ""
+    logger.close()

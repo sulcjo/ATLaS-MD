@@ -54,7 +54,17 @@ def promotion_reasons(ctx: DashboardContext) -> tuple[str, ...]:
         reasons.append(f"physics: graph {largest}/{ctx.n_windows} connected")
     boosts = [b for b in ctx.boost_history_all if math.isfinite(b)]
     if boosts:
-        score = float(boost_anharmonicity(boosts).get("anharmonicity_score", float("nan")))
+        # `boost_anharmonicity` (gareus/math_helpers.py) returns the score under
+        # the key "score", not "anharmonicity_score" -- that other key name
+        # belongs to the unrelated post-hoc MBAR-analysis anharmonicity
+        # computation in gareus/mbar_analysis/pmf.py. Reading the wrong key here
+        # made this rule permanently unreachable: `.get("anharmonicity_score", nan)`
+        # always fell through to nan, so `math.isfinite(score)` was always False
+        # and no run's boost distribution -- however non-Gaussian -- could ever
+        # promote the auto view to PHYSICS through this branch. See
+        # gareus/dashboard/panels.py's `boost_envelope_panel`, which reads the
+        # correct key and carries the same warning.
+        score = float(boost_anharmonicity(boosts).get("score", float("nan")))
         if math.isfinite(score) and score > ANHARMONICITY_PROMOTE:
             reasons.append(f"physics: anharmonicity {score:.2f}")
     return tuple(reasons)

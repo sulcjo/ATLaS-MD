@@ -150,6 +150,45 @@ def test_build_context_marks_a_2d_run_and_records_its_secondary_cv_type(tmp_path
     assert ctx.topology_label == "sparse explicit 2D"
 
 
+def test_run_label_uses_the_resolved_run_root_not_the_segment_basename(tmp_path):
+    """I5: DistanceLogger is constructed with the *segment* directory, so
+    `logger.out_dir.name` is e.g. "baseline" on a real adaptive run --
+    duplicating `segment_name` two fields later and losing the run's own
+    identity, which is the whole point of that cell in a tailed batch log.
+    `ctx.sidecar.run_root` (set by `SidecarCache.snapshot`, via `find_run_root`)
+    already resolves the true run directory; use its name instead.
+    """
+    root = tmp_path / "chignolin_5"
+    segment = root / "adaptive_production" / "epoch_001" / "baseline"
+    segment.mkdir(parents=True)
+    logger = DistanceLogger(segment, argparse.Namespace(timestep_fs=2.0), no_file_persistence=True)
+    sidecar = logger._sidecar.snapshot(now=1000.0)
+    ctx = build_context(
+        logger=logger, rows=_rows(), phase="gareus_production", step=1, total_steps=10,
+        summary={}, dashboard_info={"centers_a": [4.0], "n_windows": 1,
+                                    "adaptive_phase": {"segment_name": "baseline"}},
+        sidecar=sidecar, term_w=140, term_h=45, now=1000.0,
+        view="progress", glyphs="unicode",
+    )
+    assert ctx.run_label == "chignolin_5"
+    assert ctx.segment_name == "baseline"
+    assert ctx.run_label != ctx.segment_name
+
+
+def test_run_label_falls_back_to_out_dir_when_no_sidecar_run_root_is_set(tmp_path):
+    """Most fixtures (and any caller with a hand-built `SidecarSnapshot()`) carry
+    no `run_root` -- must still resolve to something sensible, not an empty
+    string."""
+    logger = DistanceLogger(tmp_path, argparse.Namespace(timestep_fs=2.0), no_file_persistence=True)
+    ctx = build_context(
+        logger=logger, rows=_rows(), phase="p", step=1, total_steps=2, summary={},
+        dashboard_info={"centers_a": [4.0], "n_windows": 1},
+        sidecar=SidecarSnapshot(), term_w=100, term_h=30, now=1.0,
+        view="progress", glyphs="unicode",
+    )
+    assert ctx.run_label == tmp_path.name
+
+
 def test_build_context_prefers_the_sidecar_temperature_when_args_lack_one(tmp_path):
     logger = DistanceLogger(tmp_path, argparse.Namespace(), no_file_persistence=True)
     ctx = build_context(

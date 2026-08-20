@@ -119,6 +119,22 @@ def test_spine_shows_the_pool_budget_when_the_sidecar_has_it(tmp_path):
     assert "7500" in text and "15000" in text
 
 
+def test_pool_line_never_prints_a_literal_nan_perf_value(tmp_path):
+    """I1: the shared `_ctx` fixture passes no `eta_start_wall`, so elapsed_s is
+    measured against the real wall clock and comes out 0 for a `now` this far in
+    the past -- `_ns_per_day` is nan whenever that happens (real trigger: a
+    logger whose first frame renders before any wall time has elapsed). A bare
+    `{ns_day:.0f}` used to print the literal token "nan" in the pool line's own
+    perf field, in a run that otherwise has real, populated pool data.
+    """
+    sidecar = SidecarSnapshot(pool={"total_ns": 15000.0, "used_ns": 7500.0,
+                                    "remaining_ns": 7500.0, "events": []})
+    lines = [strip_ansi(l) for l in spine_lines(_ctx(tmp_path, sidecar=sidecar), FULL_SPINE_LINES)]
+    pool_line = next(l for l in lines if l.startswith("pool"))
+    assert "nan" not in pool_line
+    assert "perf —" in pool_line
+
+
 def test_spine_says_the_pool_is_unavailable_rather_than_faking_a_bar(tmp_path):
     text = strip_ansi("\n".join(spine_lines(_ctx(tmp_path), FULL_SPINE_LINES)))
     assert "pool" in text and "unavailable" in text
@@ -129,6 +145,20 @@ def test_spine_reports_gamd_saturation_as_text_not_only_colour(tmp_path):
         "sigma0_kj_mol": 12.552, "sigmaV_kj_mol": 11.039, "k0": 1.0}}})
     text = strip_ansi("\n".join(spine_lines(_ctx(tmp_path, sidecar=sidecar), FULL_SPINE_LINES)))
     assert "SATURATED" in text
+
+
+def test_gamd_line_reports_missing_k0_as_unreported_not_ok(tmp_path):
+    """I1: an absent/unmeasured k0 must not fall into the `>= _K0_SATURATED`
+    comparison -- `nan >= 0.999` is False in Python, so the old bare threshold
+    chain silently classified "not reported" as healthy ("k0 nan ok" in green),
+    the same bug class `boost_envelope_panel` already guards against.
+    """
+    sidecar = SidecarSnapshot(gamd={"joint_envelope": {"Dihedral": {}}})
+    text = strip_ansi("\n".join(spine_lines(_ctx(tmp_path, sidecar=sidecar), FULL_SPINE_LINES)))
+    gamd_line = next(l for l in text.splitlines() if l.startswith("gamd"))
+    assert "nan" not in gamd_line
+    assert "k0 — not reported" in gamd_line
+    assert "SATURATED" not in gamd_line
 
 
 def test_compact_spine_returns_five_lines_and_keeps_verdict_and_progress(tmp_path):
@@ -195,6 +225,39 @@ def test_verdict_reflects_actual_decision_health_not_hardcoded_ok(tmp_path):
     """
     text = strip_ansi("\n".join(spine_lines(_ctx(tmp_path), FULL_SPINE_LINES)))
     assert "BAD" in text
+
+
+def test_verdict_reads_as_unavailable_not_ok_when_the_decision_call_raises(tmp_path, monkeypatch):
+    """I2: a swallowed exception in `_dashboard_decision_state` must not render
+    as the healthiest possible value. `build_context`'s own `except Exception`
+    used to fall back to a bare `{}`, and `_verdict`'s `.get("health", "OK")`
+    default then rendered a green "✓ OK" for a run whose health could not even
+    be assessed -- an absence read as the best case, not as an absence.
+    """
+    logger = DistanceLogger(tmp_path, argparse.Namespace(timestep_fs=2.0), no_file_persistence=True)
+    for w in range(25):
+        logger.history_by_window[w] = [CENTERS[w] + 0.1 * (i % 5 - 2) for i in range(50)]
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("boom: decision state unavailable")
+
+    monkeypatch.setattr(logger, "_dashboard_decision_state", _boom)
+    rows = [{"replica": w, "window": w, "center_A": CENTERS[w], "k_kcal_mol_A2": 2.5,
+             "cv_A": CENTERS[w] + 0.05} for w in range(25)]
+    ctx = build_context(
+        logger=logger, rows=rows, phase="gareus_production", step=12_450_000,
+        total_steps=37_500_000, summary={}, dashboard_info={
+            "centers_a": list(CENTERS[:25]), "n_windows": 25, "k_list": [2.5] * 25,
+            "exchange_stats": {f"{i}-{i+1}": {"attempts": 40, "accepted": 12}
+                               for i in range(24)},
+            "primary_cv_label": "contacts", "primary_cv_units": "A"},
+        sidecar=SidecarSnapshot(), term_w=140, term_h=45, now=1000.0,
+        view="progress", glyphs="unicode",
+    )
+    assert ctx.decision.get("health") == "UNAVAILABLE"
+    text = strip_ansi("\n".join(spine_lines(ctx, FULL_SPINE_LINES)))
+    assert "OK" not in text
+    assert "unavailable" in text.lower()
 
 
 def test_win_and_exchange_strips_are_offset_by_one_column(tmp_path):

@@ -115,6 +115,7 @@ class DistanceLogger:
         self._production_cv_history_reset_done = False
         self._render_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
         self._pending_render: Optional[concurrent.futures.Future] = None
+        self._render_error_warned = False
         self.csv_handle = None
         self.csv_writer = None
         self.jsonl_handle = None
@@ -1715,11 +1716,31 @@ class DistanceLogger:
                         dict(summary), dict(dashboard_info) if dashboard_info else None,
                     )
                     def _do_render(snap):
-                        rows_s, phase_s, step_s, total_s, summary_s, info_s = snap
-                        block = self._render_screen_frame(rows_s, phase_s, step_s, total_s,
-                                                          summary_s, info_s)
-                        if block:
-                            write_tui_frame(block, self.args)
+                        # This closure runs on the single-worker render
+                        # executor: an unhandled exception here vanishes into
+                        # the submitted Future (nothing ever calls
+                        # `.result()`/`.exception()` on `self._pending_render`),
+                        # so the frame would silently stop appearing -- forever,
+                        # retried every render interval -- with no diagnostic at
+                        # all. Warn once per run (not once per frame, which
+                        # would flood stderr at the same cadence as the render
+                        # loop) and keep going; simulation must never depend on
+                        # the dashboard succeeding.
+                        try:
+                            rows_s, phase_s, step_s, total_s, summary_s, info_s = snap
+                            block = self._render_screen_frame(rows_s, phase_s, step_s, total_s,
+                                                              summary_s, info_s)
+                            if block:
+                                write_tui_frame(block, self.args)
+                        except Exception as exc:
+                            if not self._render_error_warned:
+                                self._render_error_warned = True
+                                print(
+                                    f"[gareus] dashboard render failed ({type(exc).__name__}: "
+                                    f"{exc}); further render failures this run will not be "
+                                    "printed again.",
+                                    file=sys.stderr,
+                                )
                     self._pending_render = self._render_executor.submit(_do_render, _snap)
             elif self.ascii_mode != "none":
                 block = render_distance_ascii(

@@ -29,7 +29,7 @@ import numpy as np
 from ..colors import ROLE_BAD, ROLE_GOOD, ROLE_WARN, color_text, role_text
 from ..tui import _ansi_truncate, _coverage_bar, format_duration, make_progress_bar
 from .context import DashboardContext
-from .panels import live_gamd_envelope
+from .panels import _num, live_gamd_envelope
 from .ranking import BAD, DEAD_ACCEPTANCE, OK, WARN, WindowStatus, rank_windows
 
 FULL_SPINE_LINES = 10
@@ -125,9 +125,19 @@ def _verdict(ctx: DashboardContext) -> str:
     `{"health", "issues", "reasons", "actions"}` -- there is no `"status"` or
     `"issue_count"` key. Reading those instead would always miss, silently
     rendering every run "OK" regardless of what `ctx.decision` actually holds.
+
+    `build_context` records `"health": "UNAVAILABLE"` when the call to
+    `_dashboard_decision_state` itself raised (its own `except Exception` used
+    to fall back to a bare `{}`, and `.get("health", "OK")`'s default then made
+    a swallowed failure render as the healthiest possible value -- ``✓ OK`` in
+    green, for a run whose health could not even be assessed). An absence must
+    not read as the best case: render it as its own muted, explicit state
+    instead of silently taking the OK branch.
     """
     issues = list(ctx.decision.get("issues", []) or [])
     health = str(ctx.decision.get("health", "OK") or "OK").upper()
+    if health == "UNAVAILABLE":
+        return color_text("? verdict unavailable", "dim")
     if health == "BAD":
         return role_text(f"✗ BAD {len(issues)}", ROLE_BAD)
     if health == "WATCH" or issues:
@@ -153,8 +163,12 @@ def _pool_line(ctx: DashboardContext, width: int) -> str:
     # measured against exactly what gets printed -- not just the label/summary
     # text either side of them (that omission previously left every populated
     # pool line 2 columns over budget, rescued only by truncation at render time).
+    # `_ns_per_day` returns nan whenever `timestep_fs`/`elapsed_s` aren't
+    # measurable yet (e.g. a fixture built from a bare `argparse.Namespace()`
+    # with no `timestep_fs`) -- a bare `{ns_day:.0f}` printed the literal token
+    # "nan" here instead of reading as "not measured".
     prefix = "pool  ["
-    suffix = f"]  {used:.0f}/{total:.0f} ns   perf {ns_day:.0f} ns/d/rep"
+    suffix = f"]  {used:.0f}/{total:.0f} ns   perf {_num(ns_day, 0, 0)} ns/d/rep"
     bar_w = max(12, width - len(prefix) - len(suffix))
     return prefix + make_progress_bar(used / total, bar_w) + suffix
 
@@ -179,9 +193,19 @@ def _gamd_line(ctx: DashboardContext) -> str:
     sigma_0 = float(group.get("sigma0_kj_mol", float("nan")))
     k0 = float(group.get("k0", float("nan")))
     pct = (100.0 * sigma_v / sigma_0) if sigma_0 else float("nan")
-    k0_txt = role_text("SATURATED", ROLE_BAD) if k0 >= _K0_SATURATED else role_text(OK, ROLE_GOOD)
-    return (f"gamd  σΔV {sigma_v:.2f} / σ0 {sigma_0:.2f} kJ ({pct:.0f}%)   "
-            f"k0 {k0:.2f} {k0_txt}")
+    # An absent/unmeasured k0 must not fall into the `>= _K0_SATURATED`
+    # comparison: `nan >= 0.999` is False in Python, so a bare threshold chain
+    # silently classified "not reported" as healthy ("k0 nan ok" in green) --
+    # the exact bug class `boost_envelope_panel` (gareus/dashboard/panels.py)
+    # already guards against. Mirror that guard here.
+    if math.isfinite(k0):
+        k0_label = "SATURATED" if k0 >= _K0_SATURATED else OK
+        role = ROLE_BAD if k0 >= _K0_SATURATED else ROLE_GOOD
+        k0_part = f"k0 {_num(k0, 0, 2)} " + role_text(k0_label, role)
+    else:
+        k0_part = "k0 " + color_text("— not reported", "dim")
+    return (f"gamd  σΔV {_num(sigma_v, 0, 2)} / σ0 {_num(sigma_0, 0, 2)} kJ "
+            f"({_num(pct, 0, 0)}%)   " + k0_part)
 
 
 def _alert_line(ranked: Sequence[WindowStatus]) -> str:
