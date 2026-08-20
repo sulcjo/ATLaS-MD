@@ -1667,7 +1667,7 @@ from gareus.tui import strip_ansi
 CENTERS = (4.0, 4.55, 5.10, 5.65)
 
 
-def _ctx(tmp_path, *, sidecar=None, histories=True, exchange=True):
+def _ctx(tmp_path, *, sidecar=None, histories=True, exchange=True, secondary=None):
     args = argparse.Namespace(timestep_fs=2.0, temperature_k=300.0)
     logger = DistanceLogger(tmp_path, args, no_file_persistence=True)
     if histories:
@@ -1682,7 +1682,9 @@ def _ctx(tmp_path, *, sidecar=None, histories=True, exchange=True):
         logger=logger, rows=rows, phase="gareus_production", step=10, total_steps=100,
         summary={}, dashboard_info={"centers_a": list(CENTERS), "n_windows": 4,
                                     "k_list": [2.5] * 4, "exchange_stats": stats,
-                                    "primary_cv_label": "contacts", "primary_cv_units": "A"},
+                                    "primary_cv_label": "contacts", "primary_cv_units": "A",
+                                    **({"secondary_cv_centers": list(secondary)}
+                                       if secondary is not None else {})},
         sidecar=sidecar or SidecarSnapshot(), term_w=140, term_h=45, now=1000.0,
         view="physics", glyphs="unicode",
     )
@@ -1736,6 +1738,53 @@ def test_window_table_panel_never_prints_a_literal_nan(tmp_path):
     assert "nan" not in text
     assert "cv2 ctr" not in text           # 1D run: column dropped, not filled
     assert "—" in text                     # w00 has no left neighbour
+
+
+def test_window_table_panel_shows_the_cv2_column_for_a_fully_populated_2d_run(tmp_path):
+    """The conditional branch this guard added needs its own coverage, and the
+    column must carry real numbers rather than collapse to dashes."""
+    ctx = _ctx(tmp_path, secondary=[-2.0, -1.0, 0.0, 1.0])
+    statuses = rank_windows(
+        n_windows=ctx.n_windows, centers_a=ctx.centers_a, k_list=ctx.k_list,
+        acceptance_by_window=ctx.acceptance_windows, overlap_by_pair=ctx.overlap_pairs,
+        delta_by_window=ctx.deltas, temperature_k=ctx.temperature_k)
+    text = strip_ansi("\n".join(window_table_panel(ctx, statuses).lines))
+    assert "cv2 ctr" in text
+    assert "-2.00" in text and "1.00" in text        # real values, not all dashes
+    assert "nan" not in text
+
+
+def test_window_table_panel_drops_the_cv2_column_when_only_some_windows_have_one(tmp_path):
+    """A short secondary list would otherwise put an earlier window's centre on a
+    later window's row -- plausible-looking data attributed to the wrong window."""
+    ctx = _ctx(tmp_path, secondary=[-2.0, -1.0])      # 2 centres, 4 windows
+    statuses = rank_windows(
+        n_windows=ctx.n_windows, centers_a=ctx.centers_a, k_list=ctx.k_list,
+        acceptance_by_window=ctx.acceptance_windows, overlap_by_pair=ctx.overlap_pairs,
+        delta_by_window=ctx.deltas, temperature_k=ctx.temperature_k)
+    text = strip_ansi("\n".join(window_table_panel(ctx, statuses).lines))
+    assert "cv2 ctr" not in text
+
+
+def test_window_table_panel_still_prints_real_measurements(tmp_path):
+    """Guards the inverse regression: a `_num` that em-dashed everything would
+    satisfy every "no nan" assertion in this file."""
+    ctx = _ctx(tmp_path)
+    statuses = rank_windows(
+        n_windows=ctx.n_windows, centers_a=ctx.centers_a, k_list=ctx.k_list,
+        acceptance_by_window=ctx.acceptance_windows, overlap_by_pair=ctx.overlap_pairs,
+        delta_by_window=ctx.deltas, temperature_k=ctx.temperature_k)
+    text = strip_ansi("\n".join(window_table_panel(ctx, statuses).lines))
+    assert "4.00" in text                               # w00's centre
+    assert text.count("—") < text.count(".")            # dashes are the exception
+
+
+def test_window_detail_panel_never_prints_a_literal_nan_before_any_samples(tmp_path):
+    """Reachable at the start of every run: no samples yet means no mean."""
+    ctx = _ctx(tmp_path, histories=False)
+    text = strip_ansi("\n".join(window_detail_panel(ctx, 0).lines))
+    assert "nan" not in text
+    assert "—" in text
 
 
 def test_window_table_panel_puts_the_worst_window_first(tmp_path):
@@ -1995,25 +2044,37 @@ Then port, in this order, following the table and the substitution rule: `pe_map
 `exchange_panel`, `pull_panel`, `replica_table_panel`, and write the two new ones:
 
 ```python
+def _num(value: object, width: int, places: int) -> str:
+    """Render a measurement, or an em dash if there is nothing to render.
+
+    A literal `nan` in a numeric field is this design's own rule broken in the
+    display layer: `nan` means "not measured", and printing it puts a token in a
+    numeric column that reads as data. Boundary windows genuinely have no left or
+    right neighbour, and a window at run start has no samples yet -- both are
+    absences, not zeroes. Shared by the table and the detail panel so the two
+    cannot diverge.
+
+    ``width`` of 0 means "no padding", for use inside prose lines.
+    """
+    try:
+        v = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return "—".rjust(width)
+    if not math.isfinite(v):
+        return "—".rjust(width)
+    return f"{v:{width}.{places}f}" if width else f"{v:.{places}f}"
+
+
 def window_table_panel(ctx: DashboardContext, statuses: Sequence[WindowStatus]) -> Panel:
     """One row per window, worst first, with a severity-composition tail."""
-    def _num(value: float, width: int, places: int) -> str:
-        """Render a measurement, or an em dash if there is nothing to render.
-
-        A literal `nan` in a table cell is this design's own rule broken in the
-        display layer: `nan` means "not measured", and printing it puts a token
-        in a numeric column that reads as data. Boundary windows genuinely have
-        no left or right neighbour, so their acceptance is absent rather than bad.
-        """
-        try:
-            v = float(value)
-        except (TypeError, ValueError):
-            return "—".rjust(width)
-        return f"{v:{width}.{places}f}" if math.isfinite(v) else "—".rjust(width)
-
     # A 1D run has no secondary CV at all, so the column is dropped rather than
-    # filled with placeholders down its whole length.
-    show_cv2 = bool(ctx.secondary_centers)
+    # filled with placeholders down its whole length. Full population is required,
+    # not merely non-empty: `build_context` filters blank/"nan" entries per element,
+    # so a partially-populated list yields a tuple SHORTER than n_windows, and a
+    # positional read would then display an earlier window's centre on a later
+    # window's row -- right-looking data attributed to the wrong window, which is
+    # worse than no column at all.
+    show_cv2 = len(ctx.secondary_centers) == int(ctx.n_windows) and bool(ctx.secondary_centers)
     cv2_head = "  cv2 ctr " if show_cv2 else ""
     header = color_text(
         f"win   cv1 ctr {cv2_head}   accL   accR   |Δ|max   status", "white", bold=True)
@@ -2048,11 +2109,16 @@ def window_detail_panel(ctx: DashboardContext, window: int) -> Panel:
     sigma = restraint_sigma(k, ctx.temperature_k)
     samples = ctx.cv_history_by_window.get(w, ())
     mean_cv = float(np.mean(samples)) if samples else float("nan")
+    # Same guard as the table: a window with no samples yet has an unmeasured mean,
+    # and `{mean_cv:.2f}` would print the token "nan" into a numeric field. This is
+    # reachable at the start of every run, before the first samples land.
     lines = [
-        f"  restraint   cv1 {centre:.2f} {ctx.primary_cv_units}  "
-        f"k {k:.2f} {ctx.primary_k_units}   σ {sigma:.2f}",
-        f"  sampled     n {len(samples)} in history   mean {mean_cv:.2f}   "
-        f"Δ {mean_cv - centre:+.2f}",
+        f"  restraint   cv1 {_num(centre, 0, 2).strip()} {ctx.primary_cv_units}  "
+        f"k {_num(k, 0, 2).strip()} {ctx.primary_k_units}   "
+        f"σ {_num(sigma, 0, 2).strip()}",
+        f"  sampled     n {len(samples)} in history   "
+        f"mean {_num(mean_cv, 0, 2).strip()}   "
+        f"Δ {_num(mean_cv - centre, 0, 2).strip()}",
     ]
     for (a, b), rate in sorted(ctx.acceptance_pairs.items()):
         if w in (a, b):
