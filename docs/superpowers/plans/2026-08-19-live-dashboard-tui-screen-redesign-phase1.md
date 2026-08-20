@@ -1648,6 +1648,7 @@ git commit -m "refactor(tui): move shared glyph and anharmonicity helpers out of
 ```python
 # tests/test_dashboard_panels.py
 import argparse
+import dataclasses
 
 import pytest
 
@@ -1718,6 +1719,20 @@ def test_boost_envelope_panel_reports_sigma_target_and_k0_saturation(tmp_path):
     text = strip_ansi("\n".join(boost_envelope_panel(_ctx(tmp_path, sidecar=sidecar)).lines))
     assert "11.04" in text and "12.55" in text
     assert "SATURATED" in text                      # k0 at its ceiling, stated as text
+
+
+def test_boost_envelope_panel_does_not_call_an_unmeasurable_score_healthy(tmp_path):
+    """`nan > 1.0` is False, so a naive threshold chain reports "could not be
+    computed" as OK -- in the panel whose job is flagging a bad boost."""
+    ctx = _ctx(tmp_path, sidecar=SidecarSnapshot(gamd={"joint_envelope": {"Dihedral": {
+        "sigma0_kj_mol": 12.552, "sigmaV_kj_mol": float("nan"), "k0": float("nan")}}}))
+    # One sample: a variance-free input makes skew/kurtosis and the score undefined.
+    ctx = dataclasses.replace(ctx, boost_history_all=(2.4,))
+    text = strip_ansi("\n".join(boost_envelope_panel(ctx).lines))
+    assert "nan" not in text
+    assert "not measurable" in text or "not reported" in text
+    anharm_line = next(l for l in text.splitlines() if "anharmonicity" in l)
+    assert " ok" not in anharm_line.lower()
 
 
 def test_boost_envelope_panel_says_so_when_the_run_has_no_gamd(tmp_path):
@@ -1977,29 +1992,41 @@ def boost_envelope_panel(ctx: DashboardContext) -> Panel:
     if boosts:
         shape = boost_anharmonicity(boosts)
         score = float(shape.get("score", float("nan")))   # key is "score", not "anharmonicity_score"
-        role = ROLE_BAD if score > 1.5 else (ROLE_WARN if score > 1.0 else ROLE_GOOD)
         lines.append(
-            f"  boost {np.mean(boosts):.2f} ± {np.std(boosts):.2f} kcal/mol   "
-            f"skew {shape.get('skew', float('nan')):+.2f}  "
-            f"kurt {shape.get('excess_kurtosis', float('nan')):+.2f}"
+            f"  boost {_num(np.mean(boosts), 0, 2)} ± {_num(np.std(boosts), 0, 2)} kcal/mol   "
+            f"skew {_num(shape.get('skew'), 0, 2)}  "
+            f"kurt {_num(shape.get('excess_kurtosis'), 0, 2)}"
         )
-        lines.append("  anharmonicity " + role_text(
-            f"{score:.2f} " + ("HIGH" if score > 1.0 else OK), role))
+        # An unmeasurable score must NOT read as healthy. `nan > 1.0` is False in
+        # Python, so a naive threshold chain silently classifies "could not be
+        # computed" as OK -- in the panel whose whole job is flagging a bad boost.
+        # Fail loud about the absence instead of quietly reporting good news.
+        if not math.isfinite(score):
+            lines.append("  anharmonicity " + color_text("— not measurable yet", "dim"))
+        else:
+            role = ROLE_BAD if score > 1.5 else (ROLE_WARN if score > 1.0 else ROLE_GOOD)
+            lines.append("  anharmonicity " + role_text(
+                f"{score:.2f} " + ("HIGH" if score > 1.0 else OK), role))
     if group:
         sigma_v = float(group.get("sigmaV_kj_mol", float("nan")))
         sigma_0 = float(group.get("sigma0_kj_mol", float("nan")))
         k0 = float(group.get("k0", float("nan")))
         pct = (100.0 * sigma_v / sigma_0) if sigma_0 else float("nan")
-        lines.append(f"  σΔV {sigma_v:.2f} / σ0 {sigma_0:.2f} kJ  ({pct:.0f}%)")
+        lines.append(f"  σΔV {_num(sigma_v, 0, 2)} / σ0 {_num(sigma_0, 0, 2)} kJ  "
+                     f"({_num(pct, 0, 0)}%)")
         if math.isfinite(k0):
             k0_label = "SATURATED at ceiling" if k0 >= _K0_SATURATED else OK
             role = ROLE_BAD if k0 >= _K0_SATURATED else ROLE_GOOD
-            lines.append(f"  k0 {k0:.2f}  " + role_text(k0_label, role))
+            lines.append(f"  k0 {_num(k0, 0, 2)}  " + role_text(k0_label, role))
+        else:
+            # Same reasoning as the score: absent is not healthy.
+            lines.append("  k0 " + color_text("— not reported", "dim"))
         epoch = group.get("recalibrated_from_epoch")
         if epoch is not None:
             before = float(group.get("sigmaV_before_kj_mol", float("nan")))
             lines.append(
-                f"  recalibrated after epoch {epoch}: σΔV {before:.2f} → {sigma_v:.2f} kJ"
+                f"  recalibrated after epoch {epoch}: "
+                f"σΔV {_num(before, 0, 2)} → {_num(sigma_v, 0, 2)} kJ"
             )
     return panel("boost", "GaMD boost envelope", lines,
                  min_lines=5, want_lines=11, priority=1)
