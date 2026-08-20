@@ -489,25 +489,37 @@ def replica_table_panel(ctx: DashboardContext, ncols: int = 1) -> Panel:
                  min_lines=4, want_lines=16, priority=2, weight=1.5)
 
 
+def _num(value: object, width: int, places: int) -> str:
+    """Render a measurement, or an em dash if there is nothing to render.
+
+    A literal `nan` in a numeric field is this design's own rule broken in the
+    display layer: `nan` means "not measured", and printing it puts a token in a
+    numeric column that reads as data. Boundary windows genuinely have no left or
+    right neighbour, and a window at run start has no samples yet -- both are
+    absences, not zeroes. Shared by the table and the detail panel so the two
+    cannot diverge.
+
+    ``width`` of 0 means "no padding", for use inside prose lines.
+    """
+    try:
+        v = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return "—".rjust(width)
+    if not math.isfinite(v):
+        return "—".rjust(width)
+    return f"{v:{width}.{places}f}" if width else f"{v:.{places}f}"
+
+
 def window_table_panel(ctx: DashboardContext, statuses: Sequence[WindowStatus]) -> Panel:
     """One row per window, worst first, with a severity-composition tail."""
-    def _num(value: float, width: int, places: int) -> str:
-        """Render a measurement, or an em dash if there is nothing to render.
-
-        A literal `nan` in a table cell is this design's own rule broken in the
-        display layer: `nan` means "not measured", and printing it puts a token
-        in a numeric column that reads as data. Boundary windows genuinely have
-        no left or right neighbour, so their acceptance is absent rather than bad.
-        """
-        try:
-            v = float(value)
-        except (TypeError, ValueError):
-            return "—".rjust(width)
-        return f"{v:{width}.{places}f}" if math.isfinite(v) else "—".rjust(width)
-
     # A 1D run has no secondary CV at all, so the column is dropped rather than
-    # filled with placeholders down its whole length.
-    show_cv2 = bool(ctx.secondary_centers)
+    # filled with placeholders down its whole length. Full population is required,
+    # not merely non-empty: `build_context` filters blank/"nan" entries per element,
+    # so a partially-populated list yields a tuple SHORTER than n_windows, and a
+    # positional read would then display an earlier window's centre on a later
+    # window's row -- right-looking data attributed to the wrong window, which is
+    # worse than no column at all.
+    show_cv2 = len(ctx.secondary_centers) == int(ctx.n_windows) and bool(ctx.secondary_centers)
     cv2_head = "  cv2 ctr " if show_cv2 else ""
     header = color_text(
         f"win   cv1 ctr {cv2_head}   accL   accR   |Δ|max   status", "white", bold=True)
@@ -520,7 +532,11 @@ def window_table_panel(ctx: DashboardContext, statuses: Sequence[WindowStatus]) 
         cv2_cell = ""
         if show_cv2:
             sec = ctx.secondary_centers[w] if w < len(ctx.secondary_centers) else float("nan")
-            cv2_cell = "  " + _num(sec, 8, 2) + " "
+            # No leading/trailing padding here: the outer f-string below already
+            # supplies exactly one space on each side of {cv2_cell} (the space
+            # before it, and the two spaces after it before accL) -- adding more
+            # here just duplicated that gap.
+            cv2_cell = _num(sec, 8, 2)
         lines.append(
             f"  w{w:02d}  {_num(centre, 8, 2)} {cv2_cell}  "
             f"{_num(ctx.acceptance_pairs.get((w - 1, w), float('nan')), 5, 2)}  "
@@ -542,17 +558,25 @@ def window_detail_panel(ctx: DashboardContext, window: int) -> Panel:
     sigma = restraint_sigma(k, ctx.temperature_k)
     samples = ctx.cv_history_by_window.get(w, ())
     mean_cv = float(np.mean(samples)) if samples else float("nan")
+    # Same guard as the table: a window with no samples yet has an unmeasured mean,
+    # and `{mean_cv:.2f}` would print the token "nan" into a numeric field. This is
+    # reachable at the start of every run, before the first samples land.
     lines = [
-        f"  restraint   cv1 {centre:.2f} {ctx.primary_cv_units}  "
-        f"k {k:.2f} {ctx.primary_k_units}   σ {sigma:.2f}",
-        f"  sampled     n {len(samples)} in history   mean {mean_cv:.2f}   "
-        f"Δ {mean_cv - centre:+.2f}",
+        f"  restraint   cv1 {_num(centre, 0, 2).strip()} {ctx.primary_cv_units}  "
+        f"k {_num(k, 0, 2).strip()} {ctx.primary_k_units}   "
+        f"σ {_num(sigma, 0, 2).strip()}",
+        f"  sampled     n {len(samples)} in history   "
+        f"mean {_num(mean_cv, 0, 2).strip()}   "
+        f"Δ {_num(mean_cv - centre, 0, 2).strip()}",
     ]
     for (a, b), rate in sorted(ctx.acceptance_pairs.items()):
         if w in (a, b):
             other = b if a == w else a
             label = "DEAD" if math.isfinite(rate) and rate < 0.02 else OK
-            lines.append(f"  exchange    w{other:02d} {rate:5.2f}  " + label)
+            # Same bug class as above, found while auditing this function: an
+            # unattempted pair (attempts=0) has rate=NaN, and the old bare
+            # `{rate:5.2f}` printed the literal token "nan" here too.
+            lines.append(f"  exchange    w{other:02d} {_num(rate, 5, 2)}  " + label)
     # `window_trace_by_replica` is keyed by REPLICA (gareus/logger.py:520), so it
     # must be indexed by whichever replica currently occupies this window -- not
     # by the window index. Every fixture built replica == window, which is why no

@@ -18,7 +18,7 @@ from gareus.tui import strip_ansi
 CENTERS = (4.0, 4.55, 5.10, 5.65)
 
 
-def _ctx(tmp_path, *, sidecar=None, histories=True, exchange=True):
+def _ctx(tmp_path, *, sidecar=None, histories=True, exchange=True, secondary=None):
     args = argparse.Namespace(timestep_fs=2.0, temperature_k=300.0)
     logger = DistanceLogger(tmp_path, args, no_file_persistence=True)
     if histories:
@@ -33,7 +33,9 @@ def _ctx(tmp_path, *, sidecar=None, histories=True, exchange=True):
         logger=logger, rows=rows, phase="gareus_production", step=10, total_steps=100,
         summary={}, dashboard_info={"centers_a": list(CENTERS), "n_windows": 4,
                                     "k_list": [2.5] * 4, "exchange_stats": stats,
-                                    "primary_cv_label": "contacts", "primary_cv_units": "A"},
+                                    "primary_cv_label": "contacts", "primary_cv_units": "A",
+                                    **({"secondary_cv_centers": list(secondary)}
+                                       if secondary is not None else {})},
         sidecar=sidecar or SidecarSnapshot(), term_w=140, term_h=45, now=1000.0,
         view="physics", glyphs="unicode",
     )
@@ -87,6 +89,53 @@ def test_window_table_panel_never_prints_a_literal_nan(tmp_path):
     assert "nan" not in text
     assert "cv2 ctr" not in text           # 1D run: column dropped, not filled
     assert "—" in text                     # w00 has no left neighbour
+
+
+def test_window_table_panel_shows_the_cv2_column_for_a_fully_populated_2d_run(tmp_path):
+    """The conditional branch this guard added needs its own coverage, and the
+    column must carry real numbers rather than collapse to dashes."""
+    ctx = _ctx(tmp_path, secondary=[-2.0, -1.0, 0.0, 1.0])
+    statuses = rank_windows(
+        n_windows=ctx.n_windows, centers_a=ctx.centers_a, k_list=ctx.k_list,
+        acceptance_by_window=ctx.acceptance_windows, overlap_by_pair=ctx.overlap_pairs,
+        delta_by_window=ctx.deltas, temperature_k=ctx.temperature_k)
+    text = strip_ansi("\n".join(window_table_panel(ctx, statuses).lines))
+    assert "cv2 ctr" in text
+    assert "-2.00" in text and "1.00" in text        # real values, not all dashes
+    assert "nan" not in text
+
+
+def test_window_table_panel_drops_the_cv2_column_when_only_some_windows_have_one(tmp_path):
+    """A short secondary list would otherwise put an earlier window's centre on a
+    later window's row -- plausible-looking data attributed to the wrong window."""
+    ctx = _ctx(tmp_path, secondary=[-2.0, -1.0])      # 2 centres, 4 windows
+    statuses = rank_windows(
+        n_windows=ctx.n_windows, centers_a=ctx.centers_a, k_list=ctx.k_list,
+        acceptance_by_window=ctx.acceptance_windows, overlap_by_pair=ctx.overlap_pairs,
+        delta_by_window=ctx.deltas, temperature_k=ctx.temperature_k)
+    text = strip_ansi("\n".join(window_table_panel(ctx, statuses).lines))
+    assert "cv2 ctr" not in text
+
+
+def test_window_table_panel_still_prints_real_measurements(tmp_path):
+    """Guards the inverse regression: a `_num` that em-dashed everything would
+    satisfy every "no nan" assertion in this file."""
+    ctx = _ctx(tmp_path)
+    statuses = rank_windows(
+        n_windows=ctx.n_windows, centers_a=ctx.centers_a, k_list=ctx.k_list,
+        acceptance_by_window=ctx.acceptance_windows, overlap_by_pair=ctx.overlap_pairs,
+        delta_by_window=ctx.deltas, temperature_k=ctx.temperature_k)
+    text = strip_ansi("\n".join(window_table_panel(ctx, statuses).lines))
+    assert "4.00" in text                               # w00's centre
+    assert text.count("—") < text.count(".")            # dashes are the exception
+
+
+def test_window_detail_panel_never_prints_a_literal_nan_before_any_samples(tmp_path):
+    """Reachable at the start of every run: no samples yet means no mean."""
+    ctx = _ctx(tmp_path, histories=False)
+    text = strip_ansi("\n".join(window_detail_panel(ctx, 0).lines))
+    assert "nan" not in text
+    assert "—" in text
 
 
 def test_window_table_panel_puts_the_worst_window_first(tmp_path):
