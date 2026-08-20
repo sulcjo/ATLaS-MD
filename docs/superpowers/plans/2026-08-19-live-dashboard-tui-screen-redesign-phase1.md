@@ -2809,7 +2809,7 @@ git commit -m "feat(dashboard): add PROGRESS view with pool-ledger timeline"
 
 **Interfaces:**
 - Consumes: Task 6's `overlap_panel`, `boost_envelope_panel`, `panel`; Task 4's `restraint_sigma`.
-- Produces: `build(ctx) -> tuple[Row, ...]`; `connected_components(n_windows: int, acceptance_pairs: Mapping[tuple[int, int], float], min_acceptance: float = 0.02) -> tuple[frozenset[int], ...]`; `sigma_spacing_panel(ctx) -> Panel`; `connectivity_panel(ctx) -> Panel`.
+- Produces: `build(ctx) -> tuple[Row, ...]`; `connected_components(n_windows: int, acceptance_pairs: Mapping[tuple[int, int], float], min_acceptance: float = 0.02) -> tuple[frozenset[int], ...]`; `connectivity_verdict(ctx) -> tuple[str, int, int]`; `sigma_spacing_panel(ctx) -> Panel`; `connectivity_panel(ctx) -> Panel`.
 
 Two new analyses, both O(K): union-find connectivity (MBAR disconnection as a live
 verdict) and the σ-vs-spacing check (`σ = sqrt(k_B T / k)` against real window spacing, so
@@ -2837,6 +2837,44 @@ def test_connected_components_splits_at_a_dead_pair():
 def test_connected_components_treats_unattempted_pairs_as_unlinked():
     pairs = {(0, 1): float("nan")}
     assert len(connected_components(2, pairs)) == 2
+
+
+def test_connectivity_verdict_holds_judgement_before_any_exchange_is_attempted(tmp_path):
+    """Zero attempts is the state of every run's first frames. Announcing
+    "1/6 connected" there would be a false claim of total MBAR disconnection,
+    and would pin the auto view to PHYSICS until exchanges accumulate."""
+    ctx = _ctx(tmp_path, view="physics", exchange={
+        f"{i}-{i+1}": {"attempts": 0, "accepted": 0} for i in range(5)})
+    state, _largest, measured = view_physics.connectivity_verdict(ctx)
+    assert state == "unmeasured"
+    assert measured == 0
+    text = _text(view_physics.build(ctx))
+    assert "not yet measurable" in text
+    assert "connected" not in text.split("not yet measurable")[0].splitlines()[-1]
+
+
+def test_connectivity_verdict_reports_coverage_when_only_some_pairs_are_measured(tmp_path):
+    ctx = _ctx(tmp_path, view="physics", exchange={
+        "0-1": {"attempts": 40, "accepted": 12},
+        "1-2": {"attempts": 0, "accepted": 0},
+        "2-3": {"attempts": 0, "accepted": 0},
+        "3-4": {"attempts": 0, "accepted": 0},
+        "4-5": {"attempts": 0, "accepted": 0}})
+    state, _largest, measured = view_physics.connectivity_verdict(ctx)
+    assert state == "partial"
+    assert measured == 1
+    assert "holding judgement" in _text(view_physics.build(ctx))
+
+
+def test_connectivity_verdict_asserts_a_split_only_once_every_pair_is_measured(tmp_path):
+    ctx = _ctx(tmp_path, view="physics", exchange={
+        "0-1": {"attempts": 40, "accepted": 12}, "1-2": {"attempts": 40, "accepted": 0},
+        "2-3": {"attempts": 40, "accepted": 12}, "3-4": {"attempts": 40, "accepted": 12},
+        "4-5": {"attempts": 40, "accepted": 12}})
+    state, largest, measured = view_physics.connectivity_verdict(ctx)
+    assert state == "split"
+    assert measured == 5
+    assert largest == 4
 
 
 def test_physics_view_reports_connectivity_and_names_isolated_windows(tmp_path):
@@ -2954,15 +2992,53 @@ def sigma_spacing_panel(ctx: DashboardContext) -> Panel:
     ], min_lines=3, want_lines=3, priority=2)
 
 
-def connectivity_panel(ctx: DashboardContext) -> Panel:
-    """MBAR readiness: is the state graph one piece?"""
+def connectivity_verdict(ctx: DashboardContext) -> tuple[str, int, int]:
+    """``(state, largest_component, pairs_measured)`` for the state graph.
+
+    ``state`` is ``"unmeasured"``, ``"partial"``, ``"connected"`` or ``"split"``.
+
+    Why this is not simply "count the components": an unattempted pair carries a
+    `nan` rate, and an unlinked pair is indistinguishable from a disconnected one
+    by topology alone. On a run's first frames NO pair has been attempted, so a
+    naive count finds every window in its own component and would announce
+    "1/29 connected" -- a confident claim of total MBAR disconnection on a
+    perfectly healthy run, which would also promote the auto view to PHYSICS and
+    keep it there until exchanges accumulate.
+
+    So the verdict holds judgement until the evidence exists: no measured pair at
+    all is ``unmeasured``; some but not all measured is ``partial`` (report the
+    coverage, do not claim a split); only with every pair measured is a split
+    asserted.
+    """
+    total_pairs = max(0, int(ctx.n_windows) - 1)
+    measured = sum(1 for r in ctx.acceptance_pairs.values() if math.isfinite(r))
     comps = connected_components(ctx.n_windows, ctx.acceptance_pairs)
     largest = len(comps[0]) if comps else 0
+    if measured == 0:
+        return "unmeasured", largest, measured
+    if measured < total_pairs:
+        return "partial", largest, measured
+    if largest >= int(ctx.n_windows) and ctx.n_windows > 0:
+        return "connected", largest, measured
+    return "split", largest, measured
+
+
+def connectivity_panel(ctx: DashboardContext) -> Panel:
+    """MBAR readiness: is the state graph one piece?"""
+    state, largest, measured = connectivity_verdict(ctx)
+    total_pairs = max(0, int(ctx.n_windows) - 1)
+    comps = connected_components(ctx.n_windows, ctx.acceptance_pairs)
     lines = []
     if ctx.secondary_cv_type:
         lines.append(f" cv2 {ctx.secondary_cv_type}   "
                      f"{len(set(round(x, 4) for x in ctx.secondary_centers))} rows")
-    if largest >= ctx.n_windows and ctx.n_windows > 0:
+    if state == "unmeasured":
+        lines.append(" graph " + color_text("no exchange attempts yet — connectivity "
+                                            "not yet measurable", "dim"))
+    elif state == "partial":
+        lines.append(" graph " + color_text(
+            f"{measured}/{total_pairs} pairs measured — holding judgement", "dim"))
+    elif state == "connected":
         lines.append(" graph " + role_text(f"{largest}/{ctx.n_windows} connected {OK}", ROLE_GOOD))
     else:
         isolated = sorted(w for comp in comps[1:] for w in comp)
