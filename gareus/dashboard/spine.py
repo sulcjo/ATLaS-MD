@@ -191,7 +191,13 @@ def spine_lines(ctx: DashboardContext, lines_budget: int) -> tuple[str, ...]:
     else the 5-line compact tier) -- it is not a target length the return
     value is padded to reach.
     """
-    width = max(40, ctx.term_w - 2)
+    # `width` also sizes the final `_ansi_truncate` safety net below, so it must
+    # never exceed the terminal's real budget -- a floor of 40 here let spine
+    # lines run up to 40 columns even on a narrower terminal (any ctx.term_w
+    # < 42), overflowing render_screen's own "<= term_w - 2" contract. Every
+    # bar/cell width derived from `width` below already has its own floor
+    # (8, 12, ...), so this outer variable needs none beyond avoiding <= 0.
+    width = max(1, ctx.term_w - 2)
     ranked = _ranked_windows(ctx)
     statuses = _statuses_by_window(ranked, ctx.n_windows)
     counts = [float(len(ctx.cv_history_by_window.get(w, ()))) for w in range(ctx.n_windows)]
