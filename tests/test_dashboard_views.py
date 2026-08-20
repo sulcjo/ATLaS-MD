@@ -103,6 +103,29 @@ def test_progress_view_projects_remaining_budget_in_gpu_days(tmp_path):
     assert "GPU-day" in text
 
 
+def test_timeline_labels_never_silently_cut_a_step_count(tmp_path):
+    """`epoch_001/topup_001_3388000` truncated to `...338800` reads as a real
+    step count and is wrong; two segments can also collide on the same cut."""
+    from gareus.dashboard.view_progress import _fit_label
+    assert _fit_label("epoch_001/topup_001_3388000", 26) == "epoch_001/topup_001"
+    assert _fit_label("epoch_001/topup_002_8178000", 26) == "epoch_001/topup_002"
+    assert _fit_label("epoch_000", 26) == "epoch_000"
+    long_non_numeric = "a" * 40
+    assert _fit_label(long_non_numeric, 26).endswith("…")
+    assert len(_fit_label(long_non_numeric, 26)) <= 26
+
+
+def test_timeline_reserve_row_aligns_with_the_rows_above_it(tmp_path):
+    """The panel exists so bar lengths can be compared by eye."""
+    rows = view_progress.build(_ctx(tmp_path, sidecar=SidecarSnapshot(pool=POOL)))
+    body = [strip_ansi(l) for row in rows for p in row.panels for l in p.lines]
+    bars = [l.index("█") for l in body if "█" in l]
+    reserves = [l.index("░") for l in body if "░" in l]
+    assert bars and reserves
+    assert len(set(bars)) == 1                  # every segment bar starts alike
+    assert reserves[0] == bars[0]               # and the reserve starts there too
+
+
 def test_progress_view_returns_rows_of_panels(tmp_path):
     rows = view_progress.build(_ctx(tmp_path, sidecar=SidecarSnapshot(pool=POOL)))
     assert rows and all(row.panels for row in rows)
