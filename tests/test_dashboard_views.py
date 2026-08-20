@@ -1,4 +1,5 @@
 import argparse
+import dataclasses
 
 from gareus.dashboard import view_physics, view_progress
 from gareus.dashboard.context import build_context
@@ -210,3 +211,14 @@ def test_physics_view_includes_overlap_and_boost_panels(tmp_path):
     rows = view_physics.build(_ctx(tmp_path, view="physics",
                                    sidecar=SidecarSnapshot(gamd=GAMD)))
     assert {p.key for row in rows for p in row.panels} >= {"overlap", "boost"}
+
+
+def test_sigma_panel_reports_no_overlap_data_rather_than_zero_overlap(tmp_path):
+    """`ctx.overlap_pairs` is legitimately empty for a run's first few samples per
+    window (`_hist_overlap` needs >=5 finite samples per side). Empty must render
+    as "no data yet", never a fabricated "0.00" overlap -- the same false-alarm
+    class the connectivity verdict machinery exists to avoid."""
+    ctx = dataclasses.replace(_ctx(tmp_path, view="physics"), overlap_pairs={})
+    text = _text(view_physics.build(ctx))
+    after = text.split("observed median overlap")[1]
+    assert "0.00" not in after.splitlines()[0]
