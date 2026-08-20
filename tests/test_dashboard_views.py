@@ -148,8 +148,28 @@ def test_connected_components_splits_at_a_dead_pair():
     assert sorted(len(c) for c in comps) == [2, 2]
 
 
-def test_connected_components_treats_unattempted_pairs_as_unlinked():
+def test_connected_components_does_not_link_windows_over_an_unattempted_pair():
+    """An unattempted pair carries a NaN rate and must never read as a link.
+
+    This does not, by itself, prove the implementation's `math.isfinite` guard is
+    what excludes it: `nan >= threshold` is already `False` under Python's own
+    float-comparison semantics for any real threshold, so no test built purely
+    from a NaN input can discriminate whether that guard is even present. The
+    guard's presence is proven separately, below, with a non-finite value (`inf`)
+    that WOULD pass the bare `>=` comparison. What this test still pins is real
+    and worth keeping regardless of mechanism: an unattempted pair must never
+    silently become a link.
+    """
     pairs = {(0, 1): float("nan")}
+    assert len(connected_components(2, pairs)) == 2
+
+
+def test_connected_components_ignores_a_non_finite_rate_even_when_it_would_pass_the_threshold():
+    """Unlike NaN, `inf` DOES pass a bare `rate >= threshold` comparison
+    (`inf >= 0.02` is `True`), so this is the case that actually requires the
+    `math.isfinite` guard to be present: without it, a corrupt/infinite rate
+    would incorrectly link two windows."""
+    pairs = {(0, 1): float("inf")}
     assert len(connected_components(2, pairs)) == 2
 
 
@@ -180,7 +200,31 @@ def test_connectivity_verdict_reports_coverage_when_only_some_pairs_are_measured
     assert "holding judgement" in _text(view_physics.build(ctx))
 
 
-def test_connectivity_verdict_asserts_a_split_only_once_every_pair_is_measured(tmp_path):
+def test_connectivity_verdict_is_connected_on_a_spanning_set_whatever_the_mode(tmp_path):
+    """A spanning set proves connectivity. There is no fixed expected pair count:
+    --exchange-mode offers neighbor, random-pair, all-pair-sweep and gibbs-walk,
+    so counting measured pairs against n-1 would assert a verdict after 5 of 15
+    pairs on a 6-window all-pair run."""
+    ctx = _ctx(tmp_path, view="physics", exchange={
+        f"{i}-{i+1}": {"attempts": 40, "accepted": 12} for i in range(5)})
+    state, largest, _measured = view_physics.connectivity_verdict(ctx)
+    assert state == "connected"
+    assert largest == 6
+
+
+def test_connectivity_verdict_holds_judgement_while_a_window_is_untried(tmp_path):
+    """Non-neighbour modes measure arbitrary pairs, so a window with no measured
+    pair yet must read as missing evidence, not as an isolated state."""
+    ctx = _ctx(tmp_path, view="physics", exchange={
+        "0-3": {"attempts": 40, "accepted": 12},
+        "1-4": {"attempts": 40, "accepted": 9}})
+    state, _largest, measured = view_physics.connectivity_verdict(ctx)
+    assert state == "partial"
+    assert measured == 2
+    assert "not yet tried" in _text(view_physics.build(ctx))
+
+
+def test_connectivity_verdict_asserts_a_split_only_once_every_window_is_tried(tmp_path):
     ctx = _ctx(tmp_path, view="physics", exchange={
         "0-1": {"attempts": 40, "accepted": 12}, "1-2": {"attempts": 40, "accepted": 0},
         "2-3": {"attempts": 40, "accepted": 12}, "3-4": {"attempts": 40, "accepted": 12},
@@ -188,7 +232,7 @@ def test_connectivity_verdict_asserts_a_split_only_once_every_pair_is_measured(t
     state, largest, measured = view_physics.connectivity_verdict(ctx)
     assert state == "split"
     assert measured == 5
-    assert largest == 4
+    assert largest == 4       # {0,1} and {2,3,4,5}: every window tried, still in pieces
 
 
 def test_physics_view_reports_connectivity_and_names_isolated_windows(tmp_path):

@@ -87,36 +87,52 @@ def connectivity_verdict(ctx: DashboardContext) -> tuple[str, int, int]:
 
     ``state`` is ``"unmeasured"``, ``"partial"``, ``"connected"`` or ``"split"``.
 
-    Why this is not simply "count the components": an unattempted pair carries a
-    `nan` rate, and an unlinked pair is indistinguishable from a disconnected one
-    by topology alone. On a run's first frames NO pair has been attempted, so a
-    naive count finds every window in its own component and would announce
-    "1/29 connected" -- a confident claim of total MBAR disconnection on a
-    perfectly healthy run, which would also promote the auto view to PHYSICS and
-    keep it there until exchanges accumulate.
+    Why this is not simply "count the components": by topology alone an unlinked
+    pair is indistinguishable from a disconnected one. On a run's first frames no
+    pair has been attempted at all, so a naive count finds every window in its own
+    component and would announce "1/29 connected" -- a confident claim of total
+    MBAR disconnection on a perfectly healthy run, which would also promote the
+    auto view to PHYSICS and hold it there until exchanges accumulate.
 
-    So the verdict holds judgement until the evidence exists: no measured pair at
-    all is ``unmeasured``; some but not all measured is ``partial`` (report the
-    coverage, do not claim a split); only with every pair measured is a split
-    asserted.
+    Why the test is topological rather than a census of expected pairs: there is no
+    fixed expected pair count. ``--exchange-mode`` offers ``neighbor``,
+    ``random-pair``, ``all-pair-sweep`` and ``gibbs-walk`` (`gareus/cli.py:486`), so
+    the pair space is ``n-1`` only for the neighbour chain and ``n(n-1)/2`` for the
+    others. And a pair is registered only when it is first attempted
+    (`gareus/production.py:4914` setdefaults then immediately increments), so
+    unattempted pairs are absent from the payload rather than present with zero
+    attempts. Counting measured pairs against an assumed total therefore both
+    under- and over-counts depending on mode -- for a 6-window all-pair run it
+    would assert a verdict after 5 of 15 pairs.
+
+    So the rule uses only what topology can actually prove:
+
+    * measured edges span every window -> ``connected``. A spanning set proves
+      connectivity no matter how many pairs exist or were tried.
+    * no measured pair at all -> ``unmeasured``.
+    * some window has no measured pair -> ``partial``: that window simply has not
+      been tried, so a split cannot be distinguished from missing evidence.
+    * every window has been tried and the graph is still in pieces -> ``split``.
     """
-    total_pairs = max(0, int(ctx.n_windows) - 1)
-    measured = sum(1 for r in ctx.acceptance_pairs.values() if math.isfinite(r))
-    comps = connected_components(ctx.n_windows, ctx.acceptance_pairs)
+    n_windows = int(ctx.n_windows)
+    finite = {pair: r for pair, r in ctx.acceptance_pairs.items() if math.isfinite(r)}
+    measured = len(finite)
+    comps = connected_components(n_windows, ctx.acceptance_pairs)
     largest = len(comps[0]) if comps else 0
+    if n_windows > 0 and largest >= n_windows:
+        return "connected", largest, measured
     if measured == 0:
         return "unmeasured", largest, measured
-    if measured < total_pairs:
+    touched = {w for pair in finite for w in pair if 0 <= w < n_windows}
+    if len(touched) < n_windows:
         return "partial", largest, measured
-    if largest >= int(ctx.n_windows) and ctx.n_windows > 0:
-        return "connected", largest, measured
     return "split", largest, measured
 
 
 def connectivity_panel(ctx: DashboardContext) -> Panel:
     """MBAR readiness: is the state graph one piece?"""
     state, largest, measured = connectivity_verdict(ctx)
-    total_pairs = max(0, int(ctx.n_windows) - 1)
+    n_windows = int(ctx.n_windows)
     comps = connected_components(ctx.n_windows, ctx.acceptance_pairs)
     lines = []
     if ctx.secondary_cv_type:
@@ -126,8 +142,12 @@ def connectivity_panel(ctx: DashboardContext) -> Panel:
         lines.append(" graph " + color_text("no exchange attempts yet — connectivity "
                                             "not yet measurable", "dim"))
     elif state == "partial":
+        untried = n_windows - len({w for pair, r in ctx.acceptance_pairs.items()
+                                   if math.isfinite(r) for w in pair
+                                   if 0 <= w < n_windows})
         lines.append(" graph " + color_text(
-            f"{measured}/{total_pairs} pairs measured — holding judgement", "dim"))
+            f"{measured} pairs measured, {untried} windows not yet tried — "
+            f"holding judgement", "dim"))
     elif state == "connected":
         lines.append(" graph " + role_text(f"{largest}/{ctx.n_windows} connected {OK}", ROLE_GOOD))
     else:
