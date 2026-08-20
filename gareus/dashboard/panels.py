@@ -491,24 +491,42 @@ def replica_table_panel(ctx: DashboardContext, ncols: int = 1) -> Panel:
 
 def window_table_panel(ctx: DashboardContext, statuses: Sequence[WindowStatus]) -> Panel:
     """One row per window, worst first, with a severity-composition tail."""
-    # Leading "#", not "win": a header starting with "w" would collide with
-    # `str.startswith("w")`-based body-row filters (see overlap_panel's own
-    # "pair ..." header, which sidesteps this the same way).
+    def _num(value: float, width: int, places: int) -> str:
+        """Render a measurement, or an em dash if there is nothing to render.
+
+        A literal `nan` in a table cell is this design's own rule broken in the
+        display layer: `nan` means "not measured", and printing it puts a token
+        in a numeric column that reads as data. Boundary windows genuinely have
+        no left or right neighbour, so their acceptance is absent rather than bad.
+        """
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return "—".rjust(width)
+        return f"{v:{width}.{places}f}" if math.isfinite(v) else "—".rjust(width)
+
+    # A 1D run has no secondary CV at all, so the column is dropped rather than
+    # filled with placeholders down its whole length.
+    show_cv2 = bool(ctx.secondary_centers)
+    cv2_head = "  cv2 ctr " if show_cv2 else ""
     header = color_text(
-        "#win  cv1 ctr   cv2 ctr    accL   accR   |Δ|max   status", "white", bold=True)
+        f"win   cv1 ctr {cv2_head}   accL   accR   |Δ|max   status", "white", bold=True)
     lines = [header]
     line_statuses = [""]                 # the header line carries no severity
     for s in statuses:
         w = s.window
         centre = ctx.centers_a[w] if w < len(ctx.centers_a) else float("nan")
-        sec = ctx.secondary_centers[w] if w < len(ctx.secondary_centers) else float("nan")
-        acc_l = ctx.acceptance_pairs.get((w - 1, w), float("nan"))
-        acc_r = ctx.acceptance_pairs.get((w, w + 1), float("nan"))
-        delta = abs(float(ctx.deltas.get(w, float("nan"))))
         role = {BAD: ROLE_BAD, WARN: ROLE_WARN}.get(s.status, ROLE_GOOD)
+        cv2_cell = ""
+        if show_cv2:
+            sec = ctx.secondary_centers[w] if w < len(ctx.secondary_centers) else float("nan")
+            cv2_cell = "  " + _num(sec, 8, 2) + " "
         lines.append(
-            f"  w{w:02d}  {centre:8.2f}  {sec:8.2f}   {acc_l:5.2f}  {acc_r:5.2f}   "
-            f"{delta:6.2f}   " + role_text(s.status, role)
+            f"  w{w:02d}  {_num(centre, 8, 2)} {cv2_cell}  "
+            f"{_num(ctx.acceptance_pairs.get((w - 1, w), float('nan')), 5, 2)}  "
+            f"{_num(ctx.acceptance_pairs.get((w, w + 1), float('nan')), 5, 2)}   "
+            f"{_num(abs(float(ctx.deltas.get(w, float('nan')))), 6, 2)}   "
+            + role_text(s.status, role)
             + ("  " + ", ".join(s.reasons) if s.reasons else "")
         )
         line_statuses.append(s.status)

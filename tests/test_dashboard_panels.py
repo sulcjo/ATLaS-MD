@@ -74,6 +74,21 @@ def test_boost_envelope_panel_says_so_when_the_run_has_no_gamd(tmp_path):
     assert "no GaMD" in text
 
 
+def test_window_table_panel_never_prints_a_literal_nan(tmp_path):
+    """`nan` means "not measured"; printing it puts a token in a numeric column
+    that reads as data. A 1D run has no cv2 column at all, and the first window
+    has no left neighbour, so both are absences rather than measurements."""
+    ctx = _ctx(tmp_path)
+    statuses = rank_windows(
+        n_windows=ctx.n_windows, centers_a=ctx.centers_a, k_list=ctx.k_list,
+        acceptance_by_window=ctx.acceptance_windows, overlap_by_pair=ctx.overlap_pairs,
+        delta_by_window=ctx.deltas, temperature_k=ctx.temperature_k)
+    text = strip_ansi("\n".join(window_table_panel(ctx, statuses).lines))
+    assert "nan" not in text
+    assert "cv2 ctr" not in text           # 1D run: column dropped, not filled
+    assert "—" in text                     # w00 has no left neighbour
+
+
 def test_window_table_panel_puts_the_worst_window_first(tmp_path):
     ctx = _ctx(tmp_path)
     statuses = rank_windows(
@@ -83,7 +98,12 @@ def test_window_table_panel_puts_the_worst_window_first(tmp_path):
         temperature_k=ctx.temperature_k,
     )
     lines = strip_ansi("\n".join(window_table_panel(ctx, statuses).lines)).splitlines()
-    body = [l for l in lines if l.strip().startswith("w")]
+    # Body rows are indented two spaces ("  w00  ..."); the header is flush-left
+    # ("win   cv1 ctr ..."). A plain `.strip().startswith("w")` can no longer
+    # tell them apart now that the header reads "win" instead of "#win" (see
+    # task-11 fix report: the leading "#" was a hack to dodge exactly this
+    # collision, removed because it read as a stray typo in a rendered frame).
+    body = [l for l in lines if l.startswith("  w")]
     assert body[0].split()[0] == "w02"
     assert BAD in body[0]
 
