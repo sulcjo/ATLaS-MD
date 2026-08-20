@@ -68,6 +68,30 @@ def test_bucket_strip_handles_an_empty_input():
     assert bucket_strip([], [], cells=20) == ""
 
 
+def test_bucket_strip_survives_every_value_being_nan():
+    """Reproduces a real crash found wiring the screen into DistanceLogger: the
+    exchange strip on a brand-new run (zero exchange attempts yet) is built from
+    `acceptance_by_pair`, which returns NaN -- never 0.0 -- for every untried
+    pair (see its docstring: 'not tried yet' must not rank the same as 'tried
+    and always rejected'). `hi`/`lo` default to 1.0/0.0 when nothing is finite,
+    which made `span` look positive even though there was nothing real to place
+    on it, and `int(round(nan))` from averaging an all-NaN bucket raised
+    ValueError outright -- i.e. the live dashboard would have crashed on its
+    very first frame, before a single exchange had been attempted."""
+    nan = float("nan")
+    strip = bucket_strip([nan, nan, nan, nan], ["ok"] * 4, cells=4)
+    assert strip_ansi_len(strip) == 4
+
+
+def test_bucket_strip_survives_a_partially_nan_series():
+    """Same bug, narrower trigger: only some buckets are entirely NaN while the
+    strip as a whole has real finite values elsewhere (a run partway through
+    filling in its exchange pairs one at a time)."""
+    nan = float("nan")
+    strip = bucket_strip([0.30, nan, nan, 0.29], ["ok"] * 4, cells=4)
+    assert strip_ansi_len(strip) == 4
+
+
 def test_spine_lines_returns_the_real_1d_line_count_with_no_blank_padding(tmp_path):
     """Nine line-kinds exist in the full tier; a 1D run (no CV2 line) has
     eight, all real content. `spine_lines` no longer pads the return value up

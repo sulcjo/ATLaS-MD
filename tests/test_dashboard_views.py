@@ -10,7 +10,9 @@ from gareus.tui import strip_ansi
 
 # Matches the potential-energy histogram bar's "kJ |<bar>|" suffix -- see
 # tests/test_dashboard_scaling_integration.py's identical pattern, which pins
-# the same glyph set against the legacy `logger._render_dashboard` path.
+# the same glyph set against `logger._render_screen_frame`'s WINDOWS view
+# (`_render_dashboard`, which this once described, is gone -- removed once
+# the screen engine was wired in).
 _PE_BAR_RE = re.compile(r"kJ \|([ ·░▒▓█●]+)\|")
 
 CENTERS = tuple(4.0 + 0.55 * i for i in range(6))
@@ -342,7 +344,7 @@ def test_windows_view_keeps_the_historical_cv_pe_weights(tmp_path):
 def test_windows_view_map_bar_widths_match_the_pinned_pe_arithmetic(tmp_path):
     """`tests/test_dashboard_scaling_integration.py::
     test_pe_histogram_bar_width_pinned_at_160x40` pins the historical PE-bar
-    arithmetic through the legacy `logger._render_dashboard` path and
+    arithmetic through `logger._render_screen_frame`'s WINDOWS view and
     `_weighted_panel_widths` directly -- neither one ever reaches this view's
     own `_map_bar_widths`, so nothing else in the suite catches a regression in
     this view's own bar-width plumbing. Pin it here too.

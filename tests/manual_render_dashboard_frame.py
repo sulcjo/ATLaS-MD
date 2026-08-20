@@ -5,7 +5,7 @@ Not collected by pytest (no ``test_`` prefix): this is the harness behind the
 evidence table in ``docs/superpowers/specs/2026-08-19-live-dashboard-tui-screen-redesign-design.md``
 (section 1), and the intended fixture for that design's fit property test.
 
-It drives the real ``DistanceLogger._render_dashboard`` with synthetic-but-realistic
+It drives the real ``DistanceLogger._render_screen_frame`` with synthetic-but-realistic
 data — 25 windows, populated per-window CV histories, a full neighbour exchange
 table — then compares the produced line count against what the terminal could
 actually display (``term_h - 1``, matching ``_safe_tui_frame_text``'s own reserve).
@@ -112,14 +112,11 @@ def render_frame(term_w: int, term_h: int, is_2d: bool, out_dir: Path) -> str:
         for row in rows:
             row["secondary_cv"] = targets[row["window"] % len(targets)] + rng.gauss(0.0, 0.3)
 
+    logger.tui_view = "windows"          # densest view, closest to the old single frame
     _force_terminal_size(term_w, term_h)
-    return logger._render_dashboard(
-        rows,
-        phase="gareus_production",
-        step=info["display_step"],
-        total_steps=info["display_total_steps"],
-        summary=logger.summarize(rows),
-        dashboard_info=info,
+    return logger._render_screen_frame(
+        rows, "gareus_production", info["display_step"],
+        info["display_total_steps"], logger.summarize(rows), info,
     )
 
 

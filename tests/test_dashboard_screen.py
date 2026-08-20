@@ -1,5 +1,8 @@
 import argparse
+import collections
+import os
 import random
+import shutil
 
 from gareus.dashboard.context import build_context
 from gareus.dashboard.screen import (
@@ -189,3 +192,34 @@ def test_render_screen_prices_a_stacking_row_consistently_with_compose_rows(tmp_
     lines = strip_ansi(render_screen(ctx)).splitlines()
     assert len(lines) <= 30 - 1, len(lines)
     assert all(strip_ansi_len(l) <= 45 - 2 for l in lines)
+
+
+# --- Task 12: DistanceLogger wired to the screen engine ---
+
+def test_logger_render_screen_frame_fits_and_names_the_phase(tmp_path, monkeypatch):
+    logger = DistanceLogger(tmp_path, argparse.Namespace(timestep_fs=4.0),
+                            no_file_persistence=True)
+    for w in range(8):
+        logger.history_by_window[w] = collections.deque(
+            [CENTERS[w] + 0.05 * (i % 5) for i in range(30)])
+    monkeypatch.setattr("shutil.get_terminal_size",
+                        lambda fallback=None: os.terminal_size((160, 40)))
+    rows = [{"replica": w, "window": w, "center_A": CENTERS[w], "k_kcal_mol_A2": 2.5,
+             "cv_A": CENTERS[w] + 0.05} for w in range(8)]
+    frame = logger._render_screen_frame(
+        rows, "gareus_production", 100, 1000, {},
+        {"centers_a": list(CENTERS), "n_windows": 8, "k_list": [2.5] * 8},
+    )
+    lines = strip_ansi(frame).splitlines()
+    assert len(lines) <= 39
+    assert all(strip_ansi_len(l) <= 158 for l in lines)
+    assert "gareus_production" in strip_ansi(frame)
+
+
+def test_logger_reuses_one_sidecar_cache_across_frames(tmp_path, monkeypatch):
+    logger = DistanceLogger(tmp_path, argparse.Namespace(), no_file_persistence=True)
+    monkeypatch.setattr("shutil.get_terminal_size",
+                        lambda fallback=None: os.terminal_size((120, 40)))
+    first = logger._sidecar
+    logger._render_screen_frame([], "p", 1, 2, {}, {"centers_a": [], "n_windows": 0})
+    assert logger._sidecar is first

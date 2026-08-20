@@ -71,7 +71,18 @@ def bucket_strip(
         chunk = vals[edges[i]:edges[i + 1]] or [lo]
         chunk_status = [str(statuses[j]) for j in range(edges[i], edges[i + 1])
                         if j < len(statuses)]
-        if span <= 0.0:
+        chunk_finite = [v for v in chunk if math.isfinite(v)]
+        # Two distinct reasons a bucket gets the uniform mid-height instead of a
+        # measured one: every real value across the whole strip is equal (span
+        # <= 0.0, the healthy common case -- see below), or this particular
+        # bucket has no finite value of its own to average at all -- e.g. the
+        # exchange strip before a single pair has been attempted, where every
+        # entry is NaN (`acceptance_by_pair` returns NaN for "not tried",
+        # never 0.0 -- see its docstring). `hi`/`lo` default to 1.0/0.0 when
+        # nothing anywhere is finite, so `span` alone can look positive even
+        # though there is nothing real to place on it; averaging an all-NaN
+        # chunk against that fake span crashed `int(round(nan))` outright.
+        if span <= 0.0 or not chunk_finite:
             # Every window equally sampled -- the healthy, common case. A
             # relative ramp would put the whole strip at its lowest level, so
             # render a uniform mid-height instead: "even" is the honest
@@ -79,7 +90,7 @@ def bucket_strip(
             # trains the eye to ignore it.
             level = mid
         else:
-            level = int(round((float(np.mean(chunk)) - lo) / span * (len(ramp) - 1)))
+            level = int(round((float(np.mean(chunk_finite)) - lo) / span * (len(ramp) - 1)))
         glyph = ramp[max(0, min(len(ramp) - 1, level))]
         # Status wins over density in BOTH glyph modes. Status is never carried
         # by colour alone, and a red "lowest level" glyph is indistinguishable

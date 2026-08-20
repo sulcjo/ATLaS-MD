@@ -15,6 +15,7 @@ import concurrent.futures
 import csv
 import math
 import shutil
+import sys
 import time
 from pathlib import Path
 from typing import Optional
@@ -26,98 +27,27 @@ from .io import BufferedCsvDictWriter, BufferedJsonlWriter
 from .progress import GuiProgressSink
 from .tui import (
     _ansi_pad,
-    _ansi_truncate,
-    _dashboard_density,
-    _dashboard_full_width_panel,
-    _dashboard_weighted_row,
-    _join_columns,
-    _panel_lines,
-    _weighted_panel_widths,
-    dashboard_body_budget,
-    dashboard_row_gap,
-    format_duration,
-    make_progress_bar,
     render_distance_ascii,
     replica_fg256,
     replica_marker,
     strip_ansi,
     strip_ansi_len,
     write_tui_frame,
-    ABSOLUTE_MIN_PANEL_WIDTH,
-    MIN_PANEL_WIDTH,
 )
+from .dashboard.context import build_context
+from .dashboard.screen import render_screen
+from .dashboard.sidecar import SidecarCache
 from .cv import (
     format_primary_cv_value,
     format_primary_delta_value,
-    primary_cv_is_contacts,
     primary_cv_label,
-    primary_cv_mode,
     primary_cv_units,
     primary_k_units,
     secondary_cv_mode,
 )
 from .windows import build_explicit_2d_neighbor_edges
 from .math_helpers import _hist_overlap, anharmonicity_label, boost_anharmonicity
-from .tui import _coverage_bar, _mini_bar, _sparkline
-
-def _epoch_label_inline(adaptive: dict) -> str:
-    """Short colored epoch/pilot/final label for header line 1."""
-    if not adaptive:
-        return ""
-    if adaptive.get("is_pilot"):
-        return color_text(f"PILOT {adaptive.get('round','?')}/{adaptive.get('rounds','?')}", "yellow", bold=True)
-    if adaptive.get("is_final"):
-        return color_text("FINAL", "green", bold=True)
-    if adaptive.get("is_adaptive_epoch"):
-        ei = int(adaptive.get("epoch_index", 0)) + 1
-        et = adaptive.get("epoch_total", "?")
-        seg = " topup" if adaptive.get("is_topup") else ""
-        return color_text(f"EPOCH {ei}/{et}{seg}", "magenta", bold=True)
-    return ""
-
-
-def _compact_epoch_context(adaptive: dict) -> str:
-    """Prev-round/epoch convergence summary for header line 3."""
-    if not adaptive:
-        return ""
-
-    def _fmt_round(r: dict) -> str:
-        rn = r.get("round", "?")
-        conv = r.get("converged", False)
-        sym = "✓" if conv else "·"
-        col = "green" if conv else "yellow"
-        nw = r.get("n_windows", "?")
-        ov = r.get("overlap_mean", float("nan"))
-        try:
-            ov_f = float(ov)
-        except Exception:
-            ov_f = float("nan")
-        ov_txt = f" ov:{100*ov_f:.0f}%" if math.isfinite(ov_f) else ""
-        return color_text(f"r{rn}:{sym}", col) + f"({nw}w{ov_txt})"
-
-    def _fmt_epoch(ep: dict) -> str:
-        en = int(ep.get("epoch", 0)) + 1
-        stop = ep.get("stop_adaptive", False)
-        ni = int(ep.get("n_issues", 0))
-        sym = "✓" if stop else ("!" if ni > 0 else "·")
-        col = "green" if stop else ("yellow" if ni > 0 else "dim")
-        return color_text(f"e{en}:{sym}", col) + f"({ni}iss)"
-
-    if adaptive.get("is_pilot") or adaptive.get("is_final"):
-        prev = list(adaptive.get("prev_rounds", []) or [])
-        if not prev:
-            return ""
-        parts = [_fmt_round(r) for r in prev[-5:]]
-        return color_text("prev:", "dim") + " ".join(parts)
-
-    if adaptive.get("is_adaptive_epoch"):
-        prev = list(adaptive.get("prev_epochs", []) or [])
-        if not prev:
-            return ""
-        parts = [_fmt_epoch(ep) for ep in prev[-5:]]
-        return color_text("prev:", "dim") + " ".join(parts)
-
-    return ""
+from .tui import _sparkline
 
 
 def is_gamd_production_phase(phase: str) -> bool:
@@ -141,6 +71,14 @@ def _short_status(ok: bool, label: str) -> str:
     return color_text(label, "green" if ok else "red", bold=not ok)
 
 
+def _resolve_glyphs(mode: str) -> str:
+    """Box-drawing/block glyphs, or an ASCII ramp for terminals that mangle them."""
+    if mode in {"unicode", "ascii"}:
+        return mode
+    encoding = str(getattr(sys.stdout, "encoding", "") or "").lower()
+    return "unicode" if "utf" in encoding else "ascii"
+
+
 class DistanceLogger:
     def __init__(self, out_dir: Path, args, progress: Optional[GuiProgressSink] = None, no_file_persistence: bool = False):
         self.out_dir = Path(out_dir)
@@ -157,6 +95,9 @@ class DistanceLogger:
         self.dashboard_heavy_panels_every = max(1, int(getattr(args, "dashboard_heavy_panels_every", 1) or 1))
         self._last_dashboard_render_wall = 0.0
         self._dashboard_render_count = 0
+        self._sidecar = SidecarCache(self.out_dir)
+        self.tui_view = str(getattr(args, "tui_view", "auto") or "auto").lower()
+        self.tui_glyphs = _resolve_glyphs(str(getattr(args, "tui_glyphs", "auto") or "auto"))
         self.start_wall = time.time()
         self.last_rows: list[dict] = []
         self.last_summary: dict = {}
@@ -556,214 +497,6 @@ class DistanceLogger:
             lines.append(f"  {name:<18} {size_kb:8.1f} kB  last {age:4.0f}s")
         return lines
 
-    def _render_potential_energy_map(self, rows: list[dict], width: Optional[int] = None) -> list[str]:
-        """Render per-replica potential-energy histograms beside the CV map."""
-        lines = [color_text("potential energy histograms", "cyan", bold=True)]
-        width = max(10, int(width or 24))
-        all_vals = []
-        for vals in self.potential_history_by_replica.values():
-            all_vals.extend([float(v) for v in vals if math.isfinite(float(v))])
-        if not all_vals:
-            lines.append(color_text("  PE unavailable/not sampled yet", "dim"))
-            return lines
-        lo = float(np.nanpercentile(np.asarray(all_vals, dtype=float), 2.0))
-        hi = float(np.nanpercentile(np.asarray(all_vals, dtype=float), 98.0))
-        if not math.isfinite(lo) or not math.isfinite(hi) or hi <= lo:
-            lo = float(np.nanmin(all_vals))
-            hi = float(np.nanmax(all_vals))
-        if hi <= lo:
-            hi = lo + 1.0
-        lines.append(color_text(f"  PE range {lo:.0f} to {hi:.0f} kJ/mol; shaded history, ● current", "dim"))
-        max_reps = max(1, min(len(rows), int(getattr(self.args, "distance_ascii_max_replicas", 32) or 32)))
-        for r in rows[:max_reps]:
-            rep = int(r.get("replica", 0))
-            try:
-                pe = float(r.get("potential_kj_mol", "nan"))
-            except Exception:
-                pe = float("nan")
-            hist = self.potential_history_by_replica.get(rep, [])
-            if hist:
-                counts, _edges = np.histogram(np.asarray(hist, dtype=float), bins=width, range=(lo, hi))
-                mx = max(1, int(np.nanmax(counts)))
-                chars = [" ", "·", "░", "▒", "▓", "█"]
-                bar = "".join(chars[min(len(chars)-1, int(round(c / mx * (len(chars)-1))))] for c in counts)
-            else:
-                bar = "·" * width
-            if math.isfinite(pe):
-                pos = int(round((pe - lo) / (hi - lo) * (width - 1)))
-                pos = max(0, min(width - 1, pos))
-                marker = replica_marker("●", rep, bg256=236, bold=True)
-                bar = bar[:pos] + marker + bar[pos+1:]
-                pe_txt = f"{pe:9.0f}"
-            else:
-                pe_txt = "      n/a"
-            lines.append(f"  {replica_marker(f'r{rep:02d}', rep)} {pe_txt} kJ |{bar}|")
-        if len(rows) > max_reps:
-            lines.append(color_text(f"  … {len(rows)-max_reps} more replicas", "dim"))
-        return lines
-
-    def _render_exchange_acceptance(self, exchange_stats: dict, n_windows: int) -> list[str]:
-        lines = [color_text("exchange / window-walk diagnostics", "cyan", bold=True)]
-        if not isinstance(exchange_stats, dict):
-            lines.append("  no exchange attempts yet")
-            return lines
-        mode = str(exchange_stats.get("mode", "neighbor"))
-        attempts = int(exchange_stats.get("attempts", 0) or 0)
-        accepted = int(exchange_stats.get("accepted", 0) or 0)
-        if attempts <= 0 and int(exchange_stats.get("gibbs_choices", 0) or 0) <= 0:
-            lines.append(f"  mode {mode}; no exchange attempts yet")
-            return lines
-
-        if attempts > 0:
-            frac_total = accepted / max(1, attempts)
-            col = "green" if frac_total >= 0.20 else ("yellow" if frac_total >= 0.08 else "red")
-            lines.append(f"  mode {mode:<14} total {100*frac_total:5.1f}% {_mini_bar(frac_total, 10)} {accepted}/{attempts} {color_text('OK' if frac_total >= 0.08 else 'LOW', col, bold=frac_total < 0.08)}")
-        if mode == "gibbs-walk" or int(exchange_stats.get("gibbs_choices", 0) or 0) > 0:
-            choices = int(exchange_stats.get("gibbs_choices", 0) or 0)
-            moves = int(exchange_stats.get("gibbs_moves", 0) or 0)
-            stays = int(exchange_stats.get("gibbs_stays", 0) or 0)
-            move_frac = moves / max(1, choices)
-            lines.append(f"  Gibbs choices: moves {moves}/{choices} ({100*move_frac:4.1f}%), stays {stays}; p shown in exchanges.csv is heat-bath choice prob")
-
-        jumps = exchange_stats.get("jump_bins", {}) or {}
-        if jumps:
-            lines.append(color_text("  by window jump distance", "white", bold=True))
-            def _jump_sort_key(item):
-                key, _ = item
-                try:
-                    return int(str(key).replace("dw", ""))
-                except Exception:
-                    return 999
-            for key, st in sorted(jumps.items(), key=_jump_sort_key)[:6]:
-                att = int(st.get("attempts", 0) or 0)
-                acc = int(st.get("accepted", 0) or 0)
-                if att <= 0:
-                    continue
-                frac = acc / max(1, att)
-                col = "green" if frac >= 0.20 else ("yellow" if frac >= 0.08 else "red")
-                label = str(key).replace("dw", "Δw=")
-                lines.append(f"  {label:<6} {100*frac:5.1f}% {_mini_bar(frac, 10)} {acc}/{att} {color_text('LOW' if frac < 0.08 else 'OK', col, bold=frac < 0.08)}")
-
-        pairs = exchange_stats.get("pairs", {}) or {}
-        if pairs:
-            if mode == "neighbor":
-                # In neighbor mode, show the adjacent window ladder explicitly.
-                for a in range(max(0, n_windows - 1)):
-                    key = f"{a}-{a+1}"
-                    st = pairs.get(key, {"attempts": 0, "accepted": 0})
-                    att = int(st.get("attempts", 0) or 0)
-                    acc = int(st.get("accepted", 0) or 0)
-                    if att == 0:
-                        lines.append(f"  w{a:02d}-w{a+1:02d}   --   {color_text('not tried', 'dim')}")
-                    else:
-                        frac = acc / max(1, att)
-                        col = "green" if frac >= 0.20 else ("yellow" if frac >= 0.08 else "red")
-                        lines.append(f"  w{a:02d}-w{a+1:02d} {100*frac:5.1f}% {_mini_bar(frac, 10)} {acc}/{att} {color_text('BAD' if frac < 0.08 else 'OK', col, bold=frac < 0.08)}")
-            else:
-                # For long-jump modes there may be many pairs. Show the busiest pairs only.
-                lines.append(color_text("  busiest specific window pairs", "white", bold=True))
-                items = sorted(pairs.items(), key=lambda kv: int(kv[1].get("attempts", 0) or 0), reverse=True)
-                for key, st in items[:6]:
-                    att = int(st.get("attempts", 0) or 0)
-                    acc = int(st.get("accepted", 0) or 0)
-                    if att <= 0:
-                        continue
-                    frac = acc / max(1, att)
-                    col = "green" if frac >= 0.20 else ("yellow" if frac >= 0.08 else "red")
-                    lines.append(f"  w{key:<5} {100*frac:5.1f}% {_mini_bar(frac, 10)} {acc}/{att} {color_text('LOW' if frac < 0.08 else 'OK', col, bold=frac < 0.08)}")
-        return lines
-
-    def _render_overlap(self, centers_a: list[float]) -> list[str]:
-        lines = [color_text("window histogram overlap", "cyan", bold=True)]
-        if not centers_a:
-            lines.append("  no centers")
-            return lines
-        lo = min(centers_a)
-        hi = max(centers_a)
-        if hi <= lo:
-            hi = lo + 1.0
-        any_line = False
-        for a in range(len(centers_a) - 1):
-            ov = _hist_overlap(self.history_by_window.get(a, []), self.history_by_window.get(a + 1, []), lo, hi)
-            if math.isfinite(ov):
-                col = "green" if ov >= 0.35 else ("yellow" if ov >= 0.12 else "red")
-                lines.append(f"  w{a:02d}-w{a+1:02d} {ov:5.2f} {_mini_bar(ov, 10)} {color_text('disconnected' if ov < 0.12 else 'ok', col, bold=ov < 0.12)}")
-                any_line = True
-        if not any_line:
-            lines.append("  insufficient samples")
-        return lines
-
-    def _render_pull_map(self, rows: list[dict], n_windows: int) -> list[str]:
-        """Render umbrella restoring force as fixed-height visual gauges.
-
-        Positive pull = umbrella wants to extend the CV; negative pull = compact.
-        Keep every window on exactly one short line so the dashboard panel never
-        wraps or changes height because one pull entry became too long. ANSI
-        truncation is then handled only by the panel formatter.
-        """
-        lines = [color_text("umbrella pull field", "cyan", bold=True)]
-        by_w: dict[int, list[float]] = {}
-        for r in rows:
-            try:
-                by_w.setdefault(int(r["window"]), []).append(float(r.get("umbrella_pull_kcal_mol_A", 0.0)))
-            except Exception:
-                continue
-
-        finite_vals = [abs(float(v)) for vals in by_w.values() for v in vals if math.isfinite(float(v))]
-        # Use a robust scale so one angry replica does not turn the whole map
-        # into a row of saturated arrows.  The unit is derivative of the primary
-        # umbrella with respect to the selected primary CV.
-        contact_mode = primary_cv_is_contacts(self.args)
-        pull_units = "kcal/mol/CV" if contact_mode else "kcal/mol/A"
-        left_label = "lower" if contact_mode else "compact"
-        right_label = "higher" if contact_mode else "extend"
-        scale = max(0.5, float(np.nanpercentile(finite_vals, 90)) if finite_vals else 1.0)
-        half = 7
-        empty_l = " " * half
-        empty_r = " " * half
-        header = f"  {'win':>3} {left_label:>{half}}│{right_label:<{half}}  pull {pull_units}"
-        lines.append(color_text(header, "white", bold=True))
-
-        for w in range(int(n_windows)):
-            vals = by_w.get(w, [])
-            vals = [float(v) for v in vals if math.isfinite(float(v))]
-            if not vals:
-                lines.append(color_text(f"  w{w:02d} {empty_l}│{empty_r}     no sample", "dim"))
-                continue
-
-            p = float(np.nanmean(vals))
-            frac = min(1.0, abs(p) / scale) if scale > 0 else 0.0
-            n = max(1 if abs(p) > 0.02 else 0, int(round(frac * half)))
-            if abs(p) < 0.02:
-                left = " " * half
-                right = " " * half
-                col = "green"
-                label = "neutral"
-            elif p < 0.0:
-                # Negative pull means the umbrella wants a smaller primary CV.
-                left_raw = ("<" * n).rjust(half)
-                left = color_text(left_raw, "yellow" if abs(p) < 2.0 else "red", bold=abs(p) >= 2.0)
-                right = " " * half
-                col = "yellow" if abs(p) < 2.0 else "red"
-                label = left_label
-            else:
-                left = " " * half
-                right_raw = (">" * n).ljust(half)
-                right = color_text(right_raw, "yellow" if abs(p) < 2.0 else "red", bold=abs(p) >= 2.0)
-                col = "yellow" if abs(p) < 2.0 else "red"
-                label = right_label
-
-            if abs(p) < 0.5:
-                col = "green"
-            elif abs(p) < 2.0:
-                col = "yellow"
-            else:
-                col = "red"
-            lines.append(f"  w{w:02d} {left}│{right} {p:+7.3f} {color_text(label, col, bold=abs(p) >= 2.0)}")
-
-        lines.append(color_text(f"  scale: full bar ≈ {scale:.2f} {pull_units}; sign from k(center-CV)", "dim"))
-        return lines
-
     def _boost_anharmonicity_summary(self, phase: str) -> dict:
         if not is_gamd_production_phase(phase):
             return {
@@ -779,49 +512,6 @@ class DistanceLogger:
             "gamd_boost_excess_kurtosis": stats["excess_kurtosis"],
             "gamd_boost_anharmonicity_n": int(stats["n"]),
         }
-
-    def _render_gamd_boost(self, rows: list[dict], summary: dict, phase: str) -> list[str]:
-        lines = [color_text("GaMD boost diagnostics", "cyan", bold=True)]
-        if "gamd_boost_mean_kcal_mol" not in summary:
-            lines.append("  boost values unavailable/not yet active")
-            return lines
-        mean = summary.get("gamd_boost_mean_kcal_mol", float("nan"))
-        sd = summary.get("gamd_boost_sd_kcal_mol", float("nan"))
-        mx = summary.get("gamd_boost_max_kcal_mol", float("nan"))
-        col = "green" if sd < 4.0 else ("yellow" if sd < 6.0 else "red")
-        lines.append(f"  all reps mean {mean:7.2f}  sd {color_text(f'{sd:6.2f}', col, bold=sd>=6.0)}  max {mx:7.2f} kcal/mol")
-        if is_gamd_production_phase(phase):
-            an = boost_anharmonicity(self.boost_history_all)
-            lab, lab_col = anharmonicity_label(an["score"])
-            if math.isfinite(float(an["score"])):
-                lines.append(
-                    "  anharm "
-                    + color_text(f"{an['score']:5.2f}", lab_col, bold=lab_col in {'yellow','red'})
-                    + f" {color_text(lab, lab_col, bold=lab_col!='green')}"
-                    + f"  skew {an['skew']:6.2f}  excess kurt {an['excess_kurtosis']:6.2f}  n={int(an['n'])}"
-                )
-            else:
-                lines.append(color_text(f"  anharm n/a; need variable finite production boosts (n={int(an['n'])})", "dim"))
-        else:
-            lines.append(color_text("  anharm score paused until GaMD/GaREUS production", "dim"))
-        for r in rows:
-            b = r.get("gamd_boost_total_kcal_mol", "")
-            try:
-                rep = int(r['replica'])
-                bf = float(b)
-                if is_gamd_production_phase(phase):
-                    pr = boost_anharmonicity(self.boost_history_by_replica.get(rep, []))
-                    plab, pcol = anharmonicity_label(pr["score"])
-                    if math.isfinite(float(pr["score"])):
-                        score_txt = color_text(f"{pr['score']:4.2f}", pcol, bold=pcol != 'green')
-                    else:
-                        score_txt = color_text(" n/a", "dim")
-                    lines.append(f"  {replica_marker(f'r{rep:02d}', rep)} w{int(r['window']):02d} boost {bf:7.2f} kcal/mol  anh {score_txt} {color_text(plab, pcol)}")
-                else:
-                    lines.append(f"  {replica_marker(f'r{rep:02d}', rep)} w{int(r['window']):02d} boost {bf:7.2f} kcal/mol")
-            except Exception:
-                pass
-        return lines
 
     def _render_pmf_preview(self, centers_a: list[float], width: Optional[int] = None) -> list[str]:
         """Render a compact horizontal rough raw-PMF preview."""
@@ -895,101 +585,6 @@ class DistanceLogger:
             trtxt = "→".join(f"w{x:02d}" for x in tr[-6:])
             lines.append(f"  r{r:02d} {trtxt:<34} span {span:2d}/{max(0,n_windows-1):2d}  trips {int(rt.get('roundtrips',0)):2d} {color_text('STUCK' if stuck else 'OK', 'red' if stuck else 'green', bold=stuck)}")
         return lines
-
-    def _render_replica_table(self, rows: list[dict], phase: str, n_windows: int, ncols: int = 1, info: Optional[dict] = None, is_2d_run: bool = False) -> list[str]:
-        """All-replica table combining health, boost and diffusion data, optionally multi-column."""
-        if not rows:
-            return [color_text("no replica data", "dim")]
-        max_span = max(0, n_windows - 1)
-        _info = info or {}
-        centers_a_inner = [float(x) for x in _info.get("centers_a", [])]
-        sec_targets_inner = [float(x) for x in _info.get("secondary_cv_centers", []) if str(x) not in {"", "None", "nan"}]
-        lo_inner = min(centers_a_inner) if centers_a_inner else 0.0
-        hi_inner = max(centers_a_inner) if centers_a_inner else 1.0
-        sec_lo_inner = min(sec_targets_inner) if sec_targets_inner else -1.0
-        sec_hi_inner = max(sec_targets_inner) if sec_targets_inner else 1.0
-        rep_lines: list[str] = []
-        for r in sorted(rows, key=lambda x: int(x.get("replica", 0))):
-            rep = int(r.get("replica", 0))
-            win = int(r.get("window", 0))
-            cv = float(r.get("cv_A", float("nan")))
-            center = float(r.get("center_A", float("nan")))
-            delta = cv - center if math.isfinite(cv) and math.isfinite(center) else float("nan")
-            pe = r.get("potential_kj_mol", float("nan"))
-            try:
-                pe = float(pe)
-            except Exception:
-                pe = float("nan")
-            b_kcal = r.get("gamd_boost_total_kcal_mol", float("nan"))
-            try:
-                b_kcal = float(b_kcal)
-            except Exception:
-                b_kcal = float("nan")
-
-            h = self.history_by_replica.get(rep, [])
-            spark = _sparkline(list(h)[-20:], 10) if h else " " * 10
-            recent10 = list(h)[-10:]
-            recent_span = (max(recent10) - min(recent10)) if len(recent10) >= 2 else float("nan")
-            cv_stuck = len(recent10) >= 10 and math.isfinite(recent_span) and recent_span < 0.05
-
-            tr = self.window_trace_by_replica.get(rep, [])
-            rt = self.roundtrip_state.get(rep, {})
-            span_val = int(rt.get("max", 0)) - int(rt.get("min", 0))
-            trips = int(rt.get("roundtrips", 0))
-            win_stuck = len(set(tr[-5:])) <= 1 and len(tr) >= 5
-            trail = "→".join(f"w{x:02d}" for x in tr[-4:])
-
-            if not math.isfinite(pe) and not math.isfinite(cv):
-                status, scol = "BAD", "red"
-            elif win_stuck or cv_stuck:
-                status, scol = "STUCK", "yellow"
-            else:
-                status, scol = "OK", "green"
-
-            cv_str = (format_primary_cv_value(cv, self.args, precision=3).rjust(9) if math.isfinite(cv) else "      n/a")
-            delta_str = ("Δ" + format_primary_delta_value(delta, self.args, precision=3).rjust(7)) if math.isfinite(delta) else "Δ   n/a"
-            pe_str = f"{pe:8.1f}kJ" if math.isfinite(pe) else "     n/akJ"
-            b_str = f"b{b_kcal:5.2f}kc" if math.isfinite(b_kcal) else "b  n/akc"
-            status_txt = color_text(status, scol, bold=scol != "green")
-            rep_txt = replica_marker(f"r{rep:02d}", rep)
-
-            if is_2d_run:
-                try:
-                    cv2_val = float(r.get("secondary_cv", "nan"))
-                    cv2_str = f"CV2{cv2_val:+5.2f}" if math.isfinite(cv2_val) else "CV2   n/a"
-                except Exception:
-                    cv2_str = "CV2   n/a"
-                h2 = list(self.secondary_history_by_replica.get(rep, []))
-                h1 = list(h)[-len(h2):] if h2 else []
-                cells_2d: set = set()
-                for v1, v2 in zip(h1, h2):
-                    try:
-                        if math.isfinite(float(v1)) and math.isfinite(float(v2)):
-                            bi = int((float(v1) - lo_inner) / max(1e-9, hi_inner - lo_inner) * 8)
-                            bj = int((float(v2) - sec_lo_inner) / max(1e-9, sec_hi_inner - sec_lo_inner) * 8)
-                            cells_2d.add((max(0, min(7, bi)), max(0, min(7, bj))))
-                    except Exception:
-                        pass
-                cells_str = f"{len(cells_2d):2d}c"
-                extra = f"  {cv2_str}  {cells_str}"
-            else:
-                extra = ""
-
-            cov_pct = int(100 * span_val / max_span) if max_span > 0 else 0
-            line = (
-                f"  {rep_txt} w{win:02d}  {cv_str}  {delta_str}  {pe_str}  {b_str}"
-                f"  {spark}  {trail:<12}  {cov_pct:3d}%  {trips:2d}t{extra}  {status_txt}"
-            )
-            rep_lines.append(line)
-
-        if ncols <= 1 or len(rep_lines) <= 1:
-            return rep_lines
-
-        per_col = math.ceil(len(rep_lines) / ncols)
-        columns: list[list[str]] = []
-        for c in range(ncols):
-            columns.append(rep_lines[c * per_col : (c + 1) * per_col])
-        return _join_columns(columns, gap=3)
 
     def _render_sparklines(self) -> list[str]:
         lines = [color_text("CV sparklines", "cyan", bold=True)]
@@ -2000,580 +1595,25 @@ class DistanceLogger:
             "actions": actions[:4],
         }
 
-    def _render_dashboard_decision_panel(self, decision: dict, term_w: int) -> list[str]:
-        """Render an always-on health/action panel for the dashboard."""
-        health = str((decision or {}).get("health", "OK")).upper()
-        color = "green" if health == "OK" else "yellow" if health == "WATCH" else "red"
-        issues = (decision or {}).get("issues", []) or []
-        reasons = (decision or {}).get("reasons", []) or []
-        actions = (decision or {}).get("actions", []) or []
-        issue_count = len(issues)
-        icon = "OK" if health == "OK" else "!!" if health == "WATCH" else "XX"
-        body = [
-            color_text(f"{icon} RUN HEALTH: {health}", color, bold=True) + f"  active issues: {issue_count}",
-            color_text("meaning:", "dim") + " OK=keep sampling, WATCH=monitor/likely adaptive repair, BAD=inspect before trusting output",
-        ]
-        if reasons:
-            for r in reasons[:3]:
-                body.append("reason: " + str(r))
-        else:
-            body.append("reason: major live diagnostics look coherent")
-        if actions:
-            for a in actions[:3]:
-                body.append("action: " + str(a))
-        else:
-            body.append("action: continue monitoring")
-        return _dashboard_full_width_panel(
-            "Run decision",
-            "health + recommended action",
-            body,
-            term_w=term_w,
-            max_body_lines=8,
-        )
+    def _render_screen_frame(
+        self, rows: list[dict], phase: str, step: int, total_steps: Optional[int],
+        summary: dict, dashboard_info: Optional[dict],
+    ) -> str:
+        """Build one dashboard frame through the screen engine.
 
-    def _dashboard_phase_explanation_lines(self, phase: str, adaptive: dict, display_step: int, display_total: Optional[int]) -> list[str]:
-        """Short plain-language explanation of the current dashboard phase."""
-        phase_l = str(phase or "").lower()
-        lines: list[str] = []
-        if adaptive and adaptive.get("is_pilot"):
-            round_txt = f"round {adaptive.get('round', '?')}/{adaptive.get('rounds', '?')}"
-            lines.append(
-                color_text("NOW ", "cyan", bold=True)
-                + color_text("adaptive pilot", "yellow", bold=True)
-                + f" {round_txt} — diagnostic sampling, frames discarded after window tuning"
-            )
-        elif adaptive and adaptive.get("is_final"):
-            lines.append(
-                color_text("NOW ", "cyan", bold=True)
-                + color_text("final production", "green", bold=True)
-                + " — MBAR/PMF samples"
-            )
-        elif "calibration" in phase_l:
-            lines.append(
-                color_text("NOW ", "cyan", bold=True)
-                + color_text("GaMD calibration", "yellow", bold=True)
-                + " — collecting PE statistics for boost"
-            )
-        elif "production" in phase_l or "gareus" in phase_l:
-            lines.append(
-                color_text("NOW ", "cyan", bold=True)
-                + color_text("GaREUS production", "green", bold=True)
-                + " — replicas sampling biased windows"
-            )
-        else:
-            lines.append(
-                color_text("NOW ", "cyan", bold=True)
-                + f"phase {color_text(str(phase), 'white', bold=True)}"
-            )
-        if display_total:
-            lines.append(
-                color_text("PROGRESS ", "cyan", bold=True)
-                + f"{int(display_step)}/{int(display_total)} steps this segment"
-            )
-        return lines
-
-    def _render_compact_decision_inline(self, decision: dict, term_w: int) -> list[str]:
-        """2-line inline health + action summary replacing the bordered decision box."""
-        health = str((decision or {}).get("health", "OK")).upper()
-        color = "green" if health == "OK" else "yellow" if health == "WATCH" else "red"
-        icon = "OK" if health == "OK" else "!!" if health == "WATCH" else "XX"
-        issues = (decision or {}).get("issues", []) or []
-        reasons = (decision or {}).get("reasons", []) or []
-        actions = (decision or {}).get("actions", []) or []
-        top_reason = reasons[0] if reasons else "diagnostics OK"
-        top_action = actions[0] if actions else "continue"
-        line1 = (
-            color_text(f"{icon} {health}", color, bold=True)
-            + f"  {len(issues)} issues  reason: {top_reason}"
-        )
-        line2 = color_text("action: ", "dim") + top_action
-        if len(reasons) > 1:
-            line2 += color_text(f"  (+{len(reasons)-1} more)", "dim")
-        return [_ansi_truncate(line1, term_w - 2), _ansi_truncate(line2, term_w - 2)]
-
-    def _render_dashboard_context_panel(
-        self,
-        rows: list[dict],
-        phase: str,
-        display_step: int,
-        display_total: Optional[int],
-        summary: dict,
-        info: dict,
-        decision: dict,
-        centers_a: list[float],
-        exchange_stats: dict,
-        term_w: int,
-    ) -> list[str]:
-        """Render a compact explanation panel for humans staring at the TUI."""
-        adaptive = info.get("adaptive_phase") or {}
-        body: list[str] = []
-        body.extend(self._dashboard_phase_explanation_lines(phase, adaptive, display_step, display_total))
-
-        primary_ctx = {
-            "primary_cv": info.get("primary_cv", primary_cv_mode(self.args)),
-            "primary_cv_label": info.get("primary_cv_label", primary_cv_label(self.args)),
-            "primary_cv_units": info.get("primary_cv_units", primary_cv_units(self.args)),
-            "contact_normalize": getattr(self.args, "contact_normalize", True),
-        }
-        plabel = str(info.get("primary_cv_label", primary_cv_label(primary_ctx)))
-        mean_cv = float(summary.get("cv_mean_A", float("nan")))
-        min_cv = float(summary.get("cv_min_A", float("nan")))
-        max_cv = float(summary.get("cv_max_A", float("nan")))
-        center_lo = min(centers_a) if centers_a else float("nan")
-        center_hi = max(centers_a) if centers_a else float("nan")
-        cv_triplet = (
-            f"{format_primary_cv_value(min_cv, primary_ctx, 3)}.."
-            f"{format_primary_cv_value(max_cv, primary_ctx, 3)}; "
-            f"mean {format_primary_cv_value(mean_cv, primary_ctx, 3)}"
-        )
-        center_txt = (
-            f"targets {format_primary_cv_value(center_lo, primary_ctx, 3)}.."
-            f"{format_primary_cv_value(center_hi, primary_ctx, 3)}"
-            if centers_a else "targets n/a"
-        )
-        if primary_cv_is_contacts(primary_ctx):
-            scheme = str(getattr(self.args, "contact_scheme", "atom-pairs"))
-            atom_sel = str(getattr(self.args, "contact_atom_selection", "heavy"))
-            body.append(
-                color_text("CV1 ", "magenta", bold=True)
-                + color_text(plabel, "cyan", bold=True)
-                + f" ({scheme},{atom_sel})  {cv_triplet}  {center_txt}"
-            )
-        else:
-            body.append(
-                color_text("CV1 ", "magenta", bold=True)
-                + color_text(plabel, "cyan", bold=True)
-                + f"  {cv_triplet}  {center_txt}"
-            )
-
-        sec_centers = [float(x) for x in info.get("secondary_cv_centers", []) if str(x) not in {"", "None", "nan"}]
-        if sec_centers:
-            mode_name = str((info.get("secondary_cv", {}) or {}).get("mode", getattr(self.args, "secondary_cv", "secondary")))
-            body.append(
-                color_text("CV2 ", "magenta", bold=True)
-                + color_text(mode_name, "cyan", bold=True)
-                + f"  targets {min(sec_centers):+.2f}..{max(sec_centers):+.2f}"
-            )
-
-        vals = []
-        for hist in self.history_by_replica.values():
-            vals.extend(hist)
-        if centers_a and len(vals) >= 5:
-            target_span = max(1.0e-12, float(max(centers_a) - min(centers_a)))
-            sample_span = max(vals) - min(vals)
-            ratio = max(0.0, min(1.5, sample_span / target_span))
-            cov_col = "green" if ratio >= 0.65 else "yellow" if ratio >= 0.35 else "red"
-            body.append(
-                color_text("COVERAGE ", "magenta", bold=True)
-                + color_text(f"sampled {100.0*ratio:.0f}%", cov_col, bold=cov_col != "green")
-                + f" of target CV1 span"
-            )
-
-        if isinstance(exchange_stats, dict):
-            mode = str(exchange_stats.get("mode", "neighbor"))
-            attempts = int(exchange_stats.get("attempts", 0) or 0)
-            accepted = int(exchange_stats.get("accepted", 0) or 0)
-            if attempts > 0:
-                frac = accepted / max(1, attempts)
-                ex_col = "green" if frac >= 0.20 else "yellow" if frac >= 0.08 else "red"
-                body.append(
-                    color_text("EXCHANGE ", "magenta", bold=True)
-                    + f"mode {mode}; "
-                    + color_text(f"{100.0*frac:.1f}%", ex_col, bold=ex_col != "green")
-                    + f" accepted ({accepted}/{attempts})"
-                )
-            else:
-                body.append(
-                    color_text("EXCHANGE ", "magenta", bold=True)
-                    + f"mode {mode}; no attempts yet"
-                )
-
-        health = str((decision or {}).get("health", "OK")).upper()
-        hcol = "green" if health == "OK" else "yellow" if health == "WATCH" else "red"
-        body.append(
-            color_text("LEGEND ", "magenta", bold=True)
-            + color_text("green", "green", bold=True) + "=OK  "
-            + color_text("yellow", "yellow", bold=True) + "=watch  "
-            + color_text("red", "red", bold=True) + "=fix  health="
-            + color_text(health, hcol, bold=True)
-        )
-        return _dashboard_full_width_panel(
-            "What is happening",
-            "short interpretation guide",
-            body,
-            term_w=term_w,
-            max_body_lines=9,
-        )
-
-    def _render_compact_header(
-        self,
-        phase: str,
-        frac: float,
-        elapsed: float,
-        eta: Optional[float],
-        perf_txt: str,
-        display_step: int,
-        display_total: Optional[int],
-        summary: dict,
-        info: dict,
-        adaptive: dict,
-        primary_label: str,
-        primary_units: str,
-        unit_suffix: str,
-        primary_k_units_text: str,
-        is_2d_run: bool,
-        n_windows: int,
-        n_secondary_targets: int,
-        topology_label: str,
-        density: str,
-        term_w: int,
-        term_h: int,
-        centers_a: list[float],
-        eta_start_wall: float,
-    ) -> list[str]:
-        """Compact 3-line (or 4-line with pilot/epoch banner) header."""
-        # Deliberate keep: unlike the histogram/coverage panels this rework
-        # uncapped elsewhere (cv_bar_width, pe_bar_width, cov2_w, cov_w), the
-        # progress bar stays capped at 36 columns. It shares its header line
-        # with other running text rather than owning a data-density panel, so
-        # an ultrawide bar would look odd rather than add useful resolution.
-        # Out of scope for the terminal-size-scaling rework.
-        pbar = make_progress_bar(frac, min(36, max(18, term_w // 5)))
-        epoch_label = _epoch_label_inline(adaptive)
-
-        # Workflow-total % (segment % is already shown via frac).
-        wf_frac_txt = ""
-        try:
-            if adaptive.get("is_pilot") or adaptive.get("is_final"):
-                wf_done = float(adaptive.get("workflow_done_before", 0.0)) + float(display_step)
-                wf_total = float(adaptive.get("workflow_total_steps", 0.0))
-                if wf_total > 0:
-                    wf_frac = max(0.0, min(1.0, wf_done / wf_total))
-                    wf_frac_txt = color_text("  total", "dim") + f" {100*wf_frac:.0f}%"
-            elif adaptive.get("is_adaptive_epoch"):
-                ei = int(adaptive.get("epoch_index", 0))
-                et = adaptive.get("epoch_total", None)
-                if et is not None and et != "?" and int(et) > 0:
-                    wf_frac = max(0.0, min(1.0, (ei + frac) / int(et)))
-                    wf_frac_txt = color_text("  total", "dim") + f" {100*wf_frac:.0f}%"
-        except Exception:
-            pass
-
-        line1 = (
-            color_text("GaREUS", "magenta", bold=True)
-            + (f"  {epoch_label}" if epoch_label else "")
-            + f"  {phase}  [{pbar}]  {display_step}/{display_total or '?'}  {100*frac:5.1f}%"
-            + wf_frac_txt
-            + f"  wall {format_duration(elapsed)}  eta {format_duration(eta)}"
-            + perf_txt
-        )
-
-        cv1_part = (
-            f"{primary_label} {summary.get('cv_min_A', float('nan')):6.2f}–"
-            f"{summary.get('cv_max_A', float('nan')):6.2f}{unit_suffix}"
-            f"  mean {summary.get('cv_mean_A', float('nan')):6.2f}{unit_suffix}"
-            f"  k {summary.get('k_min_kcal_mol_A2', float('nan')):.3g}–"
-            f"{summary.get('k_max_kcal_mol_A2', float('nan')):.3g} {primary_k_units_text}"
-        )
-        if is_2d_run and "secondary_cv_mean" in summary:
-            cv2_part = (
-                f"  │  CV2 {summary.get('secondary_cv_min', float('nan')):+6.2f}–"
-                f"{summary.get('secondary_cv_max', float('nan')):+6.2f}"
-                f" mean {summary.get('secondary_cv_mean', float('nan')):+6.2f}"
-            )
-        else:
-            cv2_part = ""
-        topo_part = (
-            color_text("  │  win", "dim") + f" {n_windows}"
-            + color_text("  topo", "dim") + f" {topology_label}"
-            + color_text(f"  {density} {term_w}×{term_h}", "dim")
-        )
-        line2 = cv1_part + cv2_part + topo_part
-
-        lo = min(centers_a) if centers_a else float(summary.get("cv_min_A", 0.0))
-        hi = max(centers_a) if centers_a else float(summary.get("cv_max_A", 1.0))
-        vals_flat: list[float] = []
-        for h in self.history_by_replica.values():
-            vals_flat.extend(h)
-        cov_w = max(12, term_w // 3)
-        cov_bar = _coverage_bar(vals_flat, lo, hi, cov_w)
-        prev_ctx = _compact_epoch_context(adaptive)
-        line3 = (
-            color_text("cov", "dim")
-            + f" {lo:.2f}–{hi:.2f}{unit_suffix} |{cov_bar}|"
-            + (f"  {prev_ctx}" if prev_ctx else "")
-        )
-
-        if adaptive.get("is_pilot"):
-            banner = style_text(
-                f"  PILOT round {adaptive.get('round','?')}/{adaptive.get('rounds','?')}"
-                f"  overlap target {float(adaptive.get('target_overlap', 0.30)):.2f}"
-                f"  final target {adaptive.get('final_steps','?')} steps  DATA DISCARDED AFTER DIAGNOSTICS  ",
-                color="red", bold=True, bg256=52,
-            )
-            return [banner, line1, line2, line3]
-        if adaptive.get("is_final"):
-            final_note = color_text(
-                "FINAL CLEAN PRODUCTION after adaptive-feedback pilots — use this directory for MBAR/PMF",
-                "green", bold=True,
-            )
-            return [final_note, line1, line2, line3]
-        return [line1, line2, line3]
-
-    def _render_dashboard(self, rows: list[dict], phase: str, step: int, total_steps: Optional[int], summary: dict, dashboard_info: Optional[dict]) -> str:
-        info = dashboard_info or {}
-        panel_mode = str(info.get("dashboard_panels", self.dashboard_panels) or self.dashboard_panels).lower()
-        heavy_panels = bool(info.get("render_heavy_panels", True))
-        centers_a = [float(x) for x in info.get("centers_a", [])]
-        n_windows = int(info.get("n_windows", len(centers_a) or (max([int(r['window']) for r in rows]) + 1 if rows else 0)))
-        exchange_stats = info.get("exchange_stats", {})
-
-        # The MD sample step is absolute for analysis, but progress/ETA should be
-        # based on the current production segment.  In article-A shared-GaMD runs
-        # the calibration/setup has already happened before the dashboard appears;
-        # including those setup steps in the denominator made pilot/adaptive ETA
-        # look much better than reality.
-        display_step = int(info.get("display_step", step) or 0)
-        display_total = info.get("display_total_steps", total_steps)
-        display_total = int(display_total) if display_total is not None else None
-        frac = (float(display_step) / float(display_total)) if display_total else 0.0
-        frac = max(0.0, min(1.0, frac))
-
-        eta_start_wall = float(info.get("eta_start_wall", self.start_wall) or self.start_wall)
-        elapsed = max(0.0, time.time() - eta_start_wall)
-        eta = (elapsed * (1.0 - frac) / frac) if frac > 0.0 and display_total else None
-        timestep_fs = float(getattr(self.args, "timestep_fs", 0.0) or 0.0)
-        nrep = max(1, len(rows))
-        sim_time_ns = (float(display_step) * timestep_fs / 1.0e6) if timestep_fs > 0 else float("nan")
-        ns_day = (sim_time_ns / elapsed * 86400.0) if elapsed > 0 and math.isfinite(sim_time_ns) else float("nan")
-        agg_ns_day = ns_day * nrep if math.isfinite(ns_day) else float("nan")
-        progress_bar = make_progress_bar(frac, min(42, max(20, int(getattr(self.args, "progress_bar_width", 36) or 36))))
-        perf_txt = f"  sim {sim_time_ns:.3g} ns/rep  perf {ns_day:.2g} ns/day/rep  {agg_ns_day:.2g} aggregate" if math.isfinite(ns_day) else ""
+        Same signature as the removed `_render_dashboard` so `log()`'s render-thread
+        offload is untouched.
+        """
         term_size = shutil.get_terminal_size((160, 40))
-        term_w = int(term_size.columns or 160)
-        term_h = int(term_size.lines or 40)
-        density = _dashboard_density(self.args, term_w=term_w, term_h=term_h)
-        compact_dashboard = density == "compact"
-        usable_w = max(40, term_w - 2)
-
-        primary_label = str(info.get("primary_cv_label", primary_cv_label(self.args)))
-        primary_units = str(info.get("primary_cv_units", primary_cv_units(self.args)))
-        primary_k_units_text = str(info.get("primary_k_units", primary_k_units(self.args)))
-        unit_suffix = "" if primary_units in {"", "dimensionless"} else f" {primary_units}"
-        adaptive = info.get("adaptive_phase") or {}
-        sec_meta = info.get("secondary_cv", {}) or {}
-        n_secondary_targets = len([x for x in info.get("secondary_cv_centers", []) if str(x) not in {"", "None", "nan"}])
-        explicit_2d = bool(sec_meta.get("explicit_2d_windows", info.get("explicit_2d", False)))
-        rectangular_2d = bool(sec_meta.get("grid", info.get("rectangular_2d", False))) if explicit_2d else bool(n_secondary_targets > 1 and n_windows == max(1, len(set(round(float(x), 4) for x in centers_a))) * max(1, n_secondary_targets))
-        sparse_2d = bool(explicit_2d and not rectangular_2d)
-        topology_label = "sparse explicit 2D" if sparse_2d else "rectangular 2D" if n_secondary_targets > 1 else "1D/secondary-fixed"
-        is_2d_run = n_secondary_targets > 1 or explicit_2d
-        header = self._render_compact_header(
-            phase, frac, elapsed, eta, perf_txt, display_step, display_total,
-            summary, info, adaptive, primary_label, primary_units, unit_suffix,
-            primary_k_units_text, is_2d_run, n_windows, n_secondary_targets,
-            topology_label, density, term_w, term_h, centers_a, eta_start_wall,
+        now = time.time()
+        ctx = build_context(
+            logger=self, rows=rows, phase=phase, step=step, total_steps=total_steps,
+            summary=summary, dashboard_info=dashboard_info,
+            sidecar=self._sidecar.snapshot(now),
+            term_w=int(term_size.columns or 160), term_h=int(term_size.lines or 40),
+            now=now, view=self.tui_view, glyphs=self.tui_glyphs,
         )
-        header = [_ansi_truncate(line, usable_w) for line in header]
-        decision = self._dashboard_decision_state(rows, exchange_stats, centers_a, summary, phase, info)
-
-        # Row 1 uses asymmetric side-by-side panels: a wide CV map plus a
-        # narrower potential-energy map.  Keeping PE beside CV makes it easy to
-        # notice a replica whose coordinate looks fine while its energy is doing
-        # modern art.
-        usable_w = max(40, term_w - 2)
-        row_gap = dashboard_row_gap(term_w)
-        min_panel_w = max(
-            ABSOLUTE_MIN_PANEL_WIDTH,
-            int(getattr(self.args, "dashboard_min_panel_width", MIN_PANEL_WIDTH) or MIN_PANEL_WIDTH),
-        )
-        wide_threshold = int(getattr(self.args, "dashboard_wide_threshold", 120) or 120)
-        if usable_w < 105:
-            cv_panel_w = pe_panel_w = usable_w
-        else:
-            cv_panel_w, pe_panel_w = _weighted_panel_widths(
-                [2.4, 0.9], term_w=term_w, gap=row_gap, min_panel_width=min_panel_w
-            )
-        # -72 (not the naive -62 "text prefix" width) leaves room for the
-        # hist3d row's closing "] nw=<n>" suffix after the bar (measured: 62
-        # chars of prefix + bracket, then "] nw=<n>" after the bar content —
-        # ~68 chars of fixed overhead at typical single/double-digit sample
-        # counts) so `_panel_lines` doesn't ellipsis-truncate the closing
-        # bracket off a bar sized right up to the panel's edge.
-        cv_bar_width = max(24, cv_panel_w - 72)
-        pe_bar_width = max(10, pe_panel_w - 24)
-        row1_max = dashboard_body_budget(term_h, 18 / 40, floor=10)
-        row23_max = dashboard_body_budget(term_h, 12 / 40, floor=8)
-        row4_max = dashboard_body_budget(term_h, 14 / 40, floor=8)
-
-        hist_lines = []
-        if self.ascii_mode != "none" and not is_2d_run:
-            hist_lines = render_distance_ascii(
-                rows, phase=phase, step=step, total_steps=total_steps,
-                width=cv_bar_width, max_replicas=self.ascii_max_replicas,
-                mode=self.ascii_mode,
-                history_by_replica=self.history_by_replica,
-                history_by_window=self.history_by_window,
-                histogram_source="window",
-                primary_label=str(info.get("primary_cv_label", "terminal distance")),
-                primary_units=str(info.get("primary_cv_units", "A")),
-                primary_k_unit_label=str(info.get("primary_k_units", "kcal/mol/A^2")),
-            ).splitlines()
-            # The histogram block already contains its own big title; remove the
-            # very top border/title lines when embedded as a panel to save space.
-            if len(hist_lines) > 4:
-                hist_lines = hist_lines[3:]
-
-        sections = []
-        sections.extend(header)
-        sections.append("")
-        sections.extend(self._render_compact_decision_inline(decision, term_w=term_w))
-        if is_2d_run:
-            sec_vals: list[float] = []
-            for _h in self.secondary_history_by_replica.values():
-                sec_vals.extend(_h)
-            sec_targets = [float(x) for x in info.get("secondary_cv_centers", []) if str(x) not in {"", "None", "nan"}]
-            if sec_vals and sec_targets:
-                sec_lo_cov, sec_hi_cov = min(sec_targets), max(sec_targets)
-                cov2_w = max(12, term_w // 3)
-                sections.append(
-                    color_text("CV2 cov", "dim")
-                    + f" {sec_lo_cov:+.2f}–{sec_hi_cov:+.2f} |{_coverage_bar(sec_vals, sec_lo_cov, sec_hi_cov, cov2_w)}|"
-                )
-        sections.append("")
-        if panel_mode == "minimal":
-            # Keep the live TUI cheap: header + explanation + decision + compact CV map.
-            if self.ascii_mode != "none":
-                sections.extend(_dashboard_full_width_panel(
-                    "CV map",
-                    "minimal live dashboard",
-                    hist_lines or [color_text("disabled", "dim")],
-                    term_w=term_w,
-                    max_body_lines=row1_max,
-                ))
-            return "\n".join(sections)
-
-        topology_lines = self._render_2d_sparse_topology_map(rows, info, exchange_stats, width=usable_w) if heavy_panels else []
-        if topology_lines:
-            sections.extend(_dashboard_full_width_panel(
-                "2D topology",
-                "windows + 2D graph-edge overlap/exchange",
-                topology_lines[1:],
-                term_w=term_w,
-                max_body_lines=dashboard_body_budget(term_h, 18 / 40, floor=10),
-            ))
-            sections.append("")
-
-        if not is_2d_run:
-            sections.extend(_dashboard_weighted_row(
-                "CV + potential-energy maps",
-                [
-                    ("per-window CV distributions", hist_lines or [color_text("disabled", "dim")], 2.4),
-                    ("potential energy histograms", self._render_potential_energy_map(rows, width=pe_bar_width)[1:], 0.9),
-                ],
-                term_w=term_w,
-                gap=row_gap,
-                max_panel_body_lines=max(row1_max, int(getattr(self.args, "distance_ascii_max_replicas", 32) or 32) + 4),
-                min_panel_width=min_panel_w,
-            ))
-            sections.append("")
-
-        wide_terminal = (term_w >= wide_threshold) and not compact_dashboard
-        diff2d_w = max(50, (usable_w - row_gap) * 56 // 100) if wide_terminal else usable_w
-        map2d_w = max(44, usable_w - diff2d_w - row_gap) if wide_terminal else usable_w
-
-        diff2d_lines = self._render_2d_diffusion_map(rows, info, width=diff2d_w) if heavy_panels else []
-        map2d_lines = self._render_2d_replica_map(rows, info, width=map2d_w) if heavy_panels else []
-
-        n_sec = len(self._unique_axis_values([float(x) for x in info.get("secondary_cv_centers", []) if str(x) not in {"", "None", "nan"}], ndigits=4))
-        map2d_max_body = max(10, n_sec + 8)
-
-        if wide_terminal and diff2d_lines and map2d_lines:
-            diff_panel = _panel_lines(
-                f"log-density: {primary_label} × secondary-CV  (░▒▓█ = increasing density)",
-                diff2d_lines[1:],
-                diff2d_w,
-                max_body_lines=dashboard_body_budget(term_h, 22 / 40, floor=14),
-            )
-            map_panel = _panel_lines(
-                f"{primary_label} × secondary-CV replica grid",
-                map2d_lines[1:],
-                map2d_w,
-                max_body_lines=max(map2d_max_body, 14 if compact_dashboard else 22),
-            )
-            sections.append(color_text("2D landscape", "magenta", bold=True))
-            sections.extend(_join_columns([diff_panel, map_panel], gap=row_gap))
-            sections.append("")
-        else:
-            if diff2d_lines:
-                sections.extend(_dashboard_full_width_panel(
-                    "2D sampling diffusion",
-                    f"log-density: {primary_label} × secondary-CV  (░▒▓█ = increasing sample density)",
-                    diff2d_lines[1:],
-                    term_w=term_w,
-                    max_body_lines=dashboard_body_budget(term_h, 22 / 40, floor=14),
-                ))
-                sections.append("")
-            if map2d_lines:
-                sections.extend(_dashboard_full_width_panel(
-                    "2D replica mapping",
-                    f"{str(info.get('primary_cv_label', 'primary CV'))} × secondary-CV grid",
-                    map2d_lines[1:],
-                    term_w=term_w,
-                    max_body_lines=min(map2d_max_body, 14) if compact_dashboard else map2d_max_body,
-                ))
-                sections.append("")
-
-        # Coupling + boost diagnostics merged into one row.
-        # In 2D mode, graph-edge histogram overlap lives in the topology panel; 1D overlap shown only for 1D runs.
-        two_d_dashboard_mode = bool(topology_lines)
-        coupling_panels = [
-            ("exchange acceptance", self._render_exchange_acceptance(exchange_stats, n_windows)[1:], 1.15),
-            ("umbrella pull", self._render_pull_map(rows, n_windows)[1:], 1.00),
-            ("GaMD boost", self._render_gamd_boost(rows, summary, phase)[1:], 1.00),
-        ]
-        if not two_d_dashboard_mode:
-            coupling_panels.insert(1, ("histogram overlap", self._render_overlap(centers_a)[1:], 0.85))
-        sections.extend(_dashboard_weighted_row(
-            "diagnostics: coupling + boost",
-            coupling_panels,
-            term_w=term_w,
-            gap=row_gap,
-            max_panel_body_lines=row23_max,
-            min_panel_width=min_panel_w,
-        ))
-        sections.append("")
-
-        # All-replica table: measure natural line width at ncols=1, compute how many columns fit.
-        single_table = self._render_replica_table(rows, phase, n_windows, ncols=1, info=info, is_2d_run=is_2d_run)
-        line_w = max((strip_ansi_len(l) for l in single_table), default=78) if single_table else 78
-        inner_avail = usable_w - 2
-        ncols_rep = max(1, (inner_avail + 3) // (line_w + 3))
-        rep_table = (
-            single_table if ncols_rep <= 1
-            else self._render_replica_table(rows, phase, n_windows, ncols=ncols_rep, info=info, is_2d_run=is_2d_run)
-        )
-        # Only expand row height beyond row4_max in non-compact mode so compact
-        # dashboards don't grow past the terminal.
-        if compact_dashboard:
-            row4_max_body = row4_max
-        else:
-            row4_max_body = max(row4_max, math.ceil(len(rows) / max(1, ncols_rep)) + 1)
-        row4_panels = [("replica motion + health", rep_table)]
-        rec_lines = self._render_recommendations(exchange_stats, centers_a, summary)
-        if rec_lines:
-            row4_panels.append(("recommendations", rec_lines[1:]))
-        weighted_row4 = [(name, body, 1.5 if name == "replica motion + health" else 1.0) for name, body in row4_panels]
-        sections.extend(_dashboard_weighted_row(
-            "motion + recommendations",
-            weighted_row4,
-            term_w=term_w,
-            gap=row_gap,
-            max_panel_body_lines=row4_max_body,
-            min_panel_width=min_panel_w,
-        ))
-
-        return "\n".join(sections)
+        return render_screen(ctx)
 
     def log(self, rows: list[dict], phase: str, step: int, total_steps: Optional[int] = None, dashboard_info: Optional[dict] = None) -> dict:
         if not rows:
@@ -2676,7 +1716,8 @@ class DistanceLogger:
                     )
                     def _do_render(snap):
                         rows_s, phase_s, step_s, total_s, summary_s, info_s = snap
-                        block = self._render_dashboard(rows_s, phase_s, step_s, total_s, summary_s, info_s)
+                        block = self._render_screen_frame(rows_s, phase_s, step_s, total_s,
+                                                          summary_s, info_s)
                         if block:
                             write_tui_frame(block, self.args)
                     self._pending_render = self._render_executor.submit(_do_render, _snap)
