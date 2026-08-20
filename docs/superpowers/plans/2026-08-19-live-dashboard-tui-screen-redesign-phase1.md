@@ -3347,6 +3347,26 @@ def test_resolve_view_promotes_to_windows_when_a_pair_is_dead(tmp_path):
     assert any("dead" in r for r in promotion_reasons(ctx))
 
 
+def test_auto_does_not_promote_before_any_exchange_is_attempted(tmp_path):
+    """Every run starts here. Without a measured pair, every window is its own
+    component, so a naive connectivity check would promote to PHYSICS on frame one
+    and stay there until exchanges accumulate."""
+    ctx = _ctx(tmp_path, exchange={})
+    assert resolve_view(ctx, "auto") == "progress"
+    assert not any("graph" in r for r in promotion_reasons(ctx))
+
+
+def test_auto_promotes_to_physics_on_a_proven_split(tmp_path):
+    """Every window tried, graph still in pieces -- the one case that justifies
+    taking over the screen."""
+    ctx = _ctx(tmp_path, exchange={
+        "0-1": {"attempts": 40, "accepted": 12}, "1-2": {"attempts": 40, "accepted": 0},
+        "2-3": {"attempts": 40, "accepted": 12}, "3-4": {"attempts": 40, "accepted": 12},
+        "4-5": {"attempts": 40, "accepted": 12}, "5-6": {"attempts": 40, "accepted": 12},
+        "6-7": {"attempts": 40, "accepted": 12}})
+    assert any("graph" in r for r in promotion_reasons(ctx))
+
+
 def test_resolve_view_falls_back_to_progress_for_an_unknown_name(tmp_path):
     assert resolve_view(_ctx(tmp_path), "nonsense") == "progress"
 
@@ -3415,7 +3435,7 @@ from . import view_physics, view_progress, view_windows
 from .context import DashboardContext
 from .ranking import BAD, rank_windows
 from .spine import spine_lines
-from .view_physics import connected_components
+from .view_physics import connectivity_verdict
 
 VIEWS: Mapping[str, Callable[[DashboardContext], tuple]] = {
     "progress": view_progress.build,
@@ -3438,9 +3458,15 @@ def promotion_reasons(ctx: DashboardContext) -> tuple[str, ...]:
         if status.status == BAD:
             reasons.append(f"windows: w{status.window:02d} " + ", ".join(status.reasons))
             break
-    comps = connected_components(ctx.n_windows, ctx.acceptance_pairs)
-    if comps and len(comps[0]) < ctx.n_windows:
-        reasons.append(f"physics: graph {len(comps[0])}/{ctx.n_windows} connected")
+    # Promote on a PROVEN split only. `connected_components` alone cannot tell a
+    # disconnected graph from an unmeasured one, so checking `largest < n_windows`
+    # here would fire on every run's first frames -- before any exchange has been
+    # attempted every window is its own component -- and pin `auto` to PHYSICS
+    # until exchanges accumulate. That is the exact false alarm `connectivity_verdict`
+    # exists to prevent; the promotion path has to honour it too.
+    graph_state, largest, _measured = connectivity_verdict(ctx)
+    if graph_state == "split":
+        reasons.append(f"physics: graph {largest}/{ctx.n_windows} connected")
     boosts = [b for b in ctx.boost_history_all if math.isfinite(b)]
     if boosts:
         score = float(boost_anharmonicity(boosts).get("anharmonicity_score", float("nan")))
