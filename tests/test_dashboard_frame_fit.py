@@ -43,6 +43,7 @@ _CLOCK_RE = re.compile(r"\b\d{2}:\d{2}:\d{2}\b")
 def _normalize_clock(text: str) -> str:
     return _CLOCK_RE.sub("00:00:00", text)
 
+
 POOL = {"total_ns": 15000.0, "used_ns": 7500.0, "remaining_ns": 7500.0,
         "events": [{"label": f"seg_{i}", "kind": "scheduled_epoch",
                     "consumed_ns": 100.0 * (i + 1), "n_states": 29} for i in range(12)]}
