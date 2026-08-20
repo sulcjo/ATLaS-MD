@@ -1,5 +1,3 @@
-import pytest
-
 from gareus.tui import strip_ansi_len
 from gareus.tui_screen import (
     PANEL_CHROME_LINES,

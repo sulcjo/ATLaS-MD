@@ -41,6 +41,13 @@ CASES = (
 
 
 def _rows(rng: random.Random) -> list[dict]:
+    # Field names must match what the dashboard panels actually read
+    # (gareus/dashboard/panels.py's `pe_map_panel`/`replica_table_panel`):
+    # "potential_kj_mol" and "gamd_boost_total_kcal_mol" -- not the
+    # "potential_energy_kj"/"gamd_boost_total_kj"/"gamd_boost_dihedral_kj" this
+    # harness previously invented, which no consumer reads. That silently
+    # dropped PE and boost content from every "synthetic-but-realistic" frame
+    # this harness produces, understating the real fit/loss numbers.
     return [
         {
             "replica": i,
@@ -48,9 +55,8 @@ def _rows(rng: random.Random) -> list[dict]:
             "center_A": CENTERS[i],
             "k_kcal_mol_A2": 2.5,
             "cv_A": CENTERS[i] + rng.gauss(0.0, 0.35),
-            "potential_energy_kj": -31500.0 + rng.gauss(0.0, 120.0),
-            "gamd_boost_total_kj": max(0.0, rng.gauss(10.0, 8.0)),
-            "gamd_boost_dihedral_kj": max(0.0, rng.gauss(10.0, 8.0)),
+            "potential_kj_mol": -31500.0 + rng.gauss(0.0, 120.0),
+            "gamd_boost_total_kcal_mol": max(0.0, rng.gauss(10.0, 8.0)),
         }
         for i in range(N_WINDOWS)
     ]
@@ -88,7 +94,12 @@ def render_frame(term_w: int, term_h: int, is_2d: bool, out_dir: Path) -> str:
         samples = [CENTERS[i] + rng.gauss(0.0, 0.4) for _ in range(HISTORY_PER_WINDOW)]
         logger.history_by_window[i] = samples
         logger.history_by_replica[i] = list(samples)
-        logger.secondary_history_by_replica[i] = [rng.gauss(0.0, 1.2) for _ in range(200)]
+        # `gareus/dashboard/context.py`'s `build_context` reads
+        # `secondary_history_by_window` (keyed by window), not
+        # `secondary_history_by_replica` -- seeding the replica-keyed deque
+        # here made every CV2-facing panel/coverage bar in the 2D case see no
+        # samples at all, regardless of how much data this harness generated.
+        logger.secondary_history_by_window[i] = [rng.gauss(0.0, 1.2) for _ in range(200)]
 
     info = {
         "centers_a": CENTERS,
