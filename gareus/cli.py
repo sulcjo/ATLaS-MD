@@ -515,6 +515,28 @@ def _add_output_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--progress-mode", choices=["none", "console", "jsonl", "both"], default="console")
     p.add_argument("--tui-mode", choices=["dashboard", "interactive", "line", "none"],
                    default="dashboard")
+    p.add_argument("--tui-view", choices=["auto", "progress", "physics", "windows"],
+                   default="auto",
+                   help="Which dashboard view to show. 'auto' shows PROGRESS and switches "
+                        "to another view only while a problem is present (dead exchange "
+                        "pair, disconnected state graph, high boost anharmonicity).")
+    p.add_argument("--tui-glyphs", choices=["auto", "unicode", "ascii"], default="auto",
+                   help="Glyph set for the dashboard's window/exchange density "
+                        "strips (gareus/dashboard/spine.py's bucket_strip). Does "
+                        "not affect panel borders, which are always unicode box "
+                        "characters regardless of this setting. 'auto' picks "
+                        "unicode on a UTF-8 stdout, ascii otherwise.")
+    p.add_argument("--color", choices=["auto", "always", "never"], default="auto",
+                   help="ANSI colour output. 'auto' enables it when stdout is a TTY.")
+    p.add_argument("--tui-clear-mode", choices=["always", "never"], default="always",
+                   help="Whether full-frame TUI redraws clear the visible terminal. "
+                        "'never' appends frames instead (log-style).")
+    p.add_argument("--distance-ascii-max-replicas", type=int, default=32,
+                   help="Maximum replica rows drawn in the per-window CV distribution "
+                        "panel (default 32).")
+    p.add_argument("--dashboard-render-interval-sec", type=float, default=0.0,
+                   help="Minimum wall seconds between dashboard repaints (0 = every "
+                        "logging step).")
     p.add_argument("--distance-output-mode", choices=["none", "csv", "jsonl", "both"],
                    default="none")
     p.add_argument("--distance-output-interval", type=int, default=1000)
@@ -1052,16 +1074,13 @@ def _shim_adaptive_production(args: argparse.Namespace) -> None:
 
 def _shim_output(args: argparse.Namespace) -> None:
     """Output/logging/progress schema-v2 -> legacy attr names."""
-    args.color = "auto"
     args.progress_jsonl = "progress.jsonl"
     args.progress_update_interval_sec = 0.25
     args.progress_bar_width = 36
-    args.tui_clear_mode = "always"
     args.dashboard_density = "auto"
     args.dashboard_wide_threshold = 132
     args.dashboard_min_panel_width = 30
     args.dashboard_max_height = 0
-    args.dashboard_render_interval_sec = 0.0
     args.dashboard_panels = "normal"
     args.dashboard_heavy_panels_every = 1
     args.distance_csv = "distances.csv"
@@ -1069,7 +1088,6 @@ def _shim_output(args: argparse.Namespace) -> None:
     args.no_distance_gui_events = False
     args.distance_ascii_mode = "hist3d"
     args.distance_ascii_width = 54
-    args.distance_ascii_max_replicas = 32
     args.distance_history_limit = 4000
     # flush_every_log is a real, documented user flag (default False: "rely on
     # --parquet-flush-rows threshold instead", see --flush-every-log's own help text) —

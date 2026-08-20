@@ -13,13 +13,15 @@ from gareus.tui import _weighted_panel_widths, strip_ansi
 # umbrella-center/current-value/overlap.
 _BAR_RE = re.compile(r"\[([·▁▂▃▄▅▆▇█ │◉●]+)\]")
 
-# Matches the header's "cov <lo>-<hi> |<bar>|" coverage-bar line — see
-# gareus/logger.py's `_coverage_bar` glyph set (" ░▒▓█" plus "·" for empty bins).
-_COV_BAR_RE = re.compile(r"^cov .*?\|([ ░▒▓█·]+)\|", re.MULTILINE)
+# Matches the spine's "cv1 <lo> |<bar>| <hi>" coverage-bar line — see
+# gareus/dashboard/spine.py's `spine_lines`, which uses `_coverage_bar`'s glyph
+# set (" ░▒▓█" plus "·" for empty bins). Accepts the historical "cov" prefix
+# too, in case a fixture/log predating the screen-engine rework is replayed.
+_COV_BAR_RE = re.compile(r"^(?:cov|cv1) .*?\|([ ░▒▓█·]+)\|", re.MULTILINE)
 
 # Matches the potential-energy histogram bar's "kJ |<bar>|" suffix — see
-# gareus/logger.py's `_render_potential_energy_map`, which uses the glyph set
-# " ·░▒▓█" plus the "●" current-value marker.
+# gareus/dashboard/panels.py's `pe_map_panel` (rendered by the WINDOWS view),
+# which uses the glyph set " ·░▒▓█" plus the "●" current-value marker.
 _PE_BAR_RE = re.compile(r"kJ \|([ ·░▒▓█●]+)\|")
 
 
@@ -42,7 +44,8 @@ def _render_at(monkeypatch, logger, term_w, term_h):
     monkeypatch.setattr(
         "shutil.get_terminal_size", lambda fallback=None: os.terminal_size((term_w, term_h))
     )
-    return logger._render_dashboard(
+    logger.tui_view = "windows"          # the view that owns the CV and PE map panels
+    return logger._render_screen_frame(
         _sample_rows(), phase="production", step=100, total_steps=1000,
         summary={}, dashboard_info={"centers_a": [0.0, 1.0, 2.0, 3.0], "n_windows": 4},
     )
@@ -67,11 +70,23 @@ def test_cv_histogram_bar_grows_past_old_ceiling_on_large_terminal(tmp_path, mon
 
 def test_cv1_coverage_bar_grows_past_old_ceiling_on_large_terminal(tmp_path, monkeypatch):
     # Same bug class as the CV histogram bar above, in a different, always-
-    # rendered header line: `_render_compact_header`'s CV1 coverage bar
-    # (`cov_w`) was independently capped at 48 columns regardless of terminal
-    # width, unrelated to and missed by the earlier `cov2_w` fix (which only
-    # covers the 2D-run secondary-CV coverage line).
+    # rendered header line: the CV1 coverage bar (now `gareus/dashboard/spine.py`'s
+    # `spine_lines`, previously `_render_compact_header`'s `cov_w`) was
+    # independently capped at 48 columns regardless of terminal width, unrelated
+    # to and missed by the earlier `cov2_w` fix (which only covers the 2D-run
+    # secondary-CV coverage line).
     logger = _make_logger(tmp_path)
+    # `spine_lines` renders the cv1 bar from accumulated `history_by_window`
+    # (matching `_render_screen_frame`'s own not-populated-by-raw-`rows`
+    # behavior -- see the identical seeding note on the PE test below); with no
+    # history at all it prints "no samples yet" instead of a bar, same as the
+    # old `_render_compact_header` did with an empty `history_by_replica`
+    # (`_coverage_bar` degrades to `" " * width` rather than omitting the line,
+    # so the old test passed without seeding -- the new "no samples yet" text
+    # is a deliberate improvement, but it means this test needs real history
+    # now to have any bar at all to measure).
+    for w in range(4):
+        logger.history_by_window[w] = collections.deque([float(w) + 0.05 * (i % 5) for i in range(20)])
     out = strip_ansi(_render_at(monkeypatch, logger, 500, 60))
     matches = _COV_BAR_RE.findall(out)
     assert matches, "expected a 'cov ...|...|' coverage bar line in dashboard output"
@@ -104,11 +119,11 @@ def test_pe_histogram_bar_width_pinned_at_160x40(tmp_path, monkeypatch):
     # future change to the weight/offset arithmetic is a deliberate, visible
     # test change instead of silent drift.
     logger = _make_logger(tmp_path)
-    # `_render_dashboard` doesn't itself populate potential-energy history
+    # `_render_screen_frame` doesn't itself populate potential-energy history
     # (that happens in `_update_history`, called by the public logging
-    # entrypoint, not exercised by this test's direct `_render_dashboard`
-    # call) -- seed it directly so `_render_potential_energy_map` renders
-    # real histogram bars instead of its "PE unavailable" early-return.
+    # entrypoint, not exercised by this test's direct `_render_screen_frame`
+    # call) -- seed it directly so `gareus/dashboard/panels.py`'s `pe_map_panel`
+    # renders real histogram bars instead of its "PE unavailable" early-return.
     for rep in range(4):
         logger.potential_history_by_replica[rep] = collections.deque(
             [100.0 + rep + i for i in range(20)], maxlen=logger.history_limit
@@ -122,8 +137,9 @@ def test_pe_histogram_bar_width_pinned_at_160x40(tmp_path, monkeypatch):
 
 def test_pe_bar_width_arithmetic_pinned_at_160x40():
     # Narrowly-scoped companion to the rendered-output test above: mirrors
-    # the exact arithmetic in `gareus/logger.py`'s `_render_dashboard` (weight
-    # split then `pe_bar_width = max(10, pe_panel_w - 24)`) directly, so this
+    # the exact arithmetic now in `gareus/dashboard/view_windows.py`'s
+    # `_map_bar_widths` (weight split then `pe_bar_width = max(10, pe_panel_w - 24)`,
+    # ported unchanged from the removed `_render_dashboard`) directly, so this
     # still catches a silent width change even if the rendered-text format
     # around the bar changes for unrelated reasons.
     _cv_panel_w, pe_panel_w = _weighted_panel_widths(

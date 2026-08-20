@@ -38,6 +38,9 @@ __all__ = [
     "MIN_PANEL_WIDTH",
     "ABSOLUTE_MIN_PANEL_WIDTH",
     "dashboard_row_gap",
+    "_sparkline",
+    "_mini_bar",
+    "_coverage_bar",
 ]
 
 
@@ -453,6 +456,45 @@ def _ascii_position(value: float, lo: float, hi: float, width: int) -> int:
     if frac >= 1.0:
         return width_int - 1
     return max(0, min(width_int - 1, int(math.floor(frac * width_int))))
+
+
+def _sparkline(values: list[float], width: int = 18) -> str:
+    vals = [float(v) for v in values if math.isfinite(float(v))]
+    if not vals:
+        return "·" * max(1, width)
+    vals = vals[-max(1, width):]
+    lo, hi = min(vals), max(vals)
+    chars = "▁▂▃▄▅▆▇█"
+    if hi <= lo:
+        return color_text("▄" * len(vals), "dim")
+    return "".join(chars[max(0, min(len(chars) - 1, int((v - lo) / (hi - lo) * (len(chars) - 1))))] for v in vals)
+
+
+def _mini_bar(frac: float, width: int = 10) -> str:
+    frac = max(0.0, min(1.0, float(frac) if math.isfinite(float(frac)) else 0.0))
+    n = int(round(frac * width))
+    return color_text("█" * n, "green") + color_text("░" * (width - n), "dim")
+
+
+def _coverage_bar(values: list[float], lo: float, hi: float, width: int = 48) -> str:
+    if hi <= lo or not values:
+        return " " * width
+    counts = [0] * width
+    for v in values:
+        if not math.isfinite(float(v)):
+            continue
+        idx = _ascii_position(float(v), lo, hi, width)
+        counts[idx] += 1
+    mx = max(counts) if counts else 0
+    chars = " ░▒▓█"
+    out = []
+    for c in counts:
+        if mx <= 0 or c <= 0:
+            out.append(color_text("·", "dim"))
+        else:
+            lvl = max(1, min(4, int(math.ceil(c / mx * 4))))
+            out.append(chars[lvl])
+    return "".join(out)
 
 
 def _hist3d_cell(level: int) -> str:
