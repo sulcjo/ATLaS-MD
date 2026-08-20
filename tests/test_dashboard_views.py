@@ -1,7 +1,7 @@
 import argparse
 import dataclasses
 
-from gareus.dashboard import view_physics, view_progress
+from gareus.dashboard import view_physics, view_progress, view_windows
 from gareus.dashboard.context import build_context
 from gareus.dashboard.sidecar import SidecarSnapshot
 from gareus.logger import DistanceLogger
@@ -266,3 +266,68 @@ def test_sigma_panel_reports_no_overlap_data_rather_than_zero_overlap(tmp_path):
     text = _text(view_physics.build(ctx))
     after = text.split("observed median overlap")[1]
     assert "0.00" not in after.splitlines()[0]
+
+
+from gareus.dashboard.ranking import OK as _OK
+from gareus.dashboard.ranking import WindowStatus as _WindowStatus
+from gareus.dashboard.ranking import rank_windows as _rank
+from gareus.dashboard.view_windows import select_window
+
+
+def _statuses(ctx, acceptance):
+    return _rank(n_windows=ctx.n_windows, centers_a=ctx.centers_a, k_list=ctx.k_list,
+                 acceptance_by_window=acceptance, overlap_by_pair=ctx.overlap_pairs,
+                 delta_by_window=ctx.deltas, temperature_k=ctx.temperature_k)
+
+
+def test_select_window_picks_the_worst_ranked_window(tmp_path):
+    ctx = _ctx(tmp_path, view="windows")
+    statuses = _statuses(ctx, {0: 0.30, 1: 0.30, 2: 0.001, 3: 0.30, 4: 0.30, 5: 0.30})
+    assert select_window(ctx, statuses) == 2
+
+
+def test_select_window_falls_back_to_window_zero_when_all_are_healthy(tmp_path):
+    ctx = _ctx(tmp_path, view="windows")
+    statuses = _statuses(ctx, {w: 0.30 for w in range(6)})
+    assert select_window(ctx, statuses) == 0
+
+
+def test_select_window_true_fallback_line_fires_when_every_status_is_actually_ok(tmp_path):
+    """Companion to the test above: that one's shared `_ctx` fixture builds
+    non-overlapping per-window histories on purpose (window spacing 0.55A vs. a
+    +/-0.2A sample range per window -- see CENTERS/`_ctx` at the top of this
+    file), so `ctx.overlap_pairs` there is 0.0 for every neighbour pair. That
+    makes `rank_windows` mark *every* window BAD via the dead-overlap branch
+    even with all-healthy acceptance, and window 0 wins `select_window`'s loop
+    on the first (worst-ranked, tie-broken-by-index) iteration -- never
+    reaching this function's actual `statuses[0].window` fallback line at all.
+    A broken fallback line would not fail that test. This one builds genuinely
+    all-OK statuses directly, bypassing rank_windows/`_ctx` overlap entirely, so
+    the fallback line itself is what is pinned.
+    """
+    ctx = _ctx(tmp_path, view="windows")
+    statuses = tuple(_WindowStatus(w, 0, _OK, ()) for w in range(6))
+    assert select_window(ctx, statuses) == 0
+
+
+def test_windows_view_orders_rows_table_then_maps_then_detail(tmp_path):
+    rows = view_windows.build(_ctx(tmp_path, view="windows"))
+    keys = [tuple(p.key for p in row.panels) for row in rows]
+    assert keys[0] == ("windows",)
+    assert keys[1] == ("cv_map", "pe_map")
+    assert keys[2][0].startswith("detail-w")
+
+
+def test_windows_view_gives_the_maps_row_lower_priority_than_table_and_detail(tmp_path):
+    rows = view_windows.build(_ctx(tmp_path, view="windows"))
+    by_key = {p.key: p for row in rows for p in row.panels}
+    assert by_key["windows"].priority == 1
+    assert by_key["cv_map"].priority == 2
+    assert by_key["pe_map"].priority == 3
+    assert min(p.priority for p in rows[2].panels) == 1
+
+
+def test_windows_view_keeps_the_historical_cv_pe_weights(tmp_path):
+    rows = view_windows.build(_ctx(tmp_path, view="windows"))
+    by_key = {p.key: p for row in rows for p in row.panels}
+    assert (by_key["cv_map"].weight, by_key["pe_map"].weight) == (2.4, 0.9)
