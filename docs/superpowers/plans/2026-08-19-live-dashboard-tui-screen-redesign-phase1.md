@@ -2581,6 +2581,29 @@ def test_progress_view_projects_remaining_budget_in_gpu_days(tmp_path):
     assert "GPU-day" in text
 
 
+def test_timeline_labels_never_silently_cut_a_step_count(tmp_path):
+    """`epoch_001/topup_001_3388000` truncated to `...338800` reads as a real
+    step count and is wrong; two segments can also collide on the same cut."""
+    from gareus.dashboard.view_progress import _fit_label
+    assert _fit_label("epoch_001/topup_001_3388000", 26) == "epoch_001/topup_001"
+    assert _fit_label("epoch_001/topup_002_8178000", 26) == "epoch_001/topup_002"
+    assert _fit_label("epoch_000", 26) == "epoch_000"
+    long_non_numeric = "a" * 40
+    assert _fit_label(long_non_numeric, 26).endswith("…")
+    assert len(_fit_label(long_non_numeric, 26)) <= 26
+
+
+def test_timeline_reserve_row_aligns_with_the_rows_above_it(tmp_path):
+    """The panel exists so bar lengths can be compared by eye."""
+    rows = view_progress.build(_ctx(tmp_path, sidecar=SidecarSnapshot(pool=POOL)))
+    body = [strip_ansi(l) for row in rows for p in row.panels for l in p.lines]
+    bars = [l.index("█") for l in body if "█" in l]
+    reserves = [l.index("░") for l in body if "░" in l]
+    assert bars and reserves
+    assert len(set(bars)) == 1                  # every segment bar starts alike
+    assert reserves[0] == bars[0]               # and the reserve starts there too
+
+
 def test_progress_view_returns_rows_of_panels(tmp_path):
     rows = view_progress.build(_ctx(tmp_path, sidecar=SidecarSnapshot(pool=POOL)))
     assert rows and all(row.panels for row in rows)
@@ -2666,6 +2689,24 @@ def _ledger_age(ctx: DashboardContext) -> str:
     return f" (ledger {format_duration(age_s)} old)"
 
 
+def _fit_label(label: str, width: int) -> str:
+    """Shorten a segment label without inventing a plausible-looking one.
+
+    A plain `f"{label:<26.26}"` cuts mid-number, turning
+    `epoch_001/topup_001_3388000` into `epoch_001/topup_001_338800` -- a step
+    count that reads as complete and is wrong, and which two different segments
+    can collide on. Drop the trailing step-count suffix first, since it is the
+    least informative part of the name, and only then ellipsize.
+    """
+    text = str(label)
+    if len(text) <= width:
+        return text
+    head, sep, tail = text.rpartition("_")
+    if sep and tail.isdigit() and len(head) <= width:
+        return head
+    return text[: max(1, width - 1)] + "…"
+
+
 def timeline_panel(ctx: DashboardContext) -> Panel:
     pool = ctx.sidecar.pool or {}
     events = pool.get("events") or []
@@ -2676,18 +2717,24 @@ def timeline_panel(ctx: DashboardContext) -> Panel:
                      min_lines=1, want_lines=2, priority=1)
     rows = collapse_extension_rounds(events)
     peak = max((ns for _l, _n, ns, _s, _c in rows), default=1.0) or 1.0
+    label_w = 26
     bar_w = max(10, (ctx.term_w - 2) - 64)
     lines = []
     for label, occurrences, consumed, states, is_current in rows:
         filled = int(round(bar_w * consumed / peak)) if peak > 0 else 0
         shown = f"{label} x{occurrences}" if occurrences > 1 else label
         mark = "▶ running" if is_current else "✓ done"
-        lines.append(f" {shown:<26.26} " + "█" * filled + " " * (bar_w - filled)
+        lines.append(f" {_fit_label(shown, label_w):<{label_w}} "
+                     + "█" * filled + " " * (bar_w - filled)
                      + f" {consumed:9.1f} ns  {states:2d} st  {mark}")
     remaining = float(pool.get("remaining_ns", 0.0) or 0.0)
     if remaining > 0:
-        lines.append(f" {'final (reserve)':<22.22} " + "░" * bar_w
-                     + f" {remaining:9.1f} ns          ○ scheduled")
+        # Same label field width as the rows above: this panel exists so bar
+        # lengths can be compared by eye, and a reserve bar starting four columns
+        # left of the others defeats that.
+        lines.append(f" {_fit_label('final (reserve)', label_w):<{label_w}} "
+                     + "░" * bar_w
+                     + f" {remaining:9.1f} ns       ○ scheduled")
     return panel("timeline", "campaign timeline" + _ledger_age(ctx), lines,
                  min_lines=6, want_lines=min(12, len(lines)), priority=1)
 
