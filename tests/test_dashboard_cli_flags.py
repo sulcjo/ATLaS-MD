@@ -17,7 +17,6 @@ def _parse(extra):
     ("tui_glyphs", "auto"),
     ("color", "auto"),
     ("tui_clear_mode", "always"),
-    ("dashboard_density", "auto"),
     ("distance_ascii_max_replicas", 32),
     ("dashboard_render_interval_sec", 0.0),
 ])
@@ -30,7 +29,6 @@ def test_promoted_flag_defaults_match_the_previously_hardcoded_values(attr, defa
     ("--tui-glyphs", "tui_glyphs", "ascii", "ascii"),
     ("--color", "color", "never", "never"),
     ("--tui-clear-mode", "tui_clear_mode", "never", "never"),
-    ("--dashboard-density", "dashboard_density", "compact", "compact"),
     ("--distance-ascii-max-replicas", "distance_ascii_max_replicas", "64", 64),
     ("--dashboard-render-interval-sec", "dashboard_render_interval_sec", "2.5", 2.5),
 ])
@@ -42,7 +40,7 @@ def test_promoted_flag_survives_the_compat_shims(flag, attr, value, expected):
 def test_shim_no_longer_assigns_the_promoted_names():
     import inspect
     source = inspect.getsource(cli._shim_output)
-    for name in ("args.color", "args.tui_clear_mode", "args.dashboard_density",
+    for name in ("args.color", "args.tui_clear_mode",
                  "args.distance_ascii_max_replicas", "args.dashboard_render_interval_sec"):
         assert name not in source, f"{name} is still clobbered by _shim_output"
 
@@ -52,6 +50,25 @@ def test_shim_still_assigns_the_knobs_that_stayed_internal():
     source = inspect.getsource(cli._shim_output)
     assert "args.distance_history_limit" in source
     assert "args.dashboard_min_panel_width" in source
+    # Deliberately NOT promoted: nothing consumes it, so a flag would do nothing.
+    assert "args.dashboard_density" in source
+
+
+def test_no_promoted_flag_is_left_without_a_consumer():
+    """A flag that parses and does nothing is the defect this task closes."""
+    import subprocess
+    for attr, consumer in (
+        ("color", "configure_color"),
+        ("tui_clear_mode", "tui_clear_enabled"),
+        ("distance_ascii_max_replicas", "ascii_max_replicas"),
+        ("dashboard_render_interval_sec", "dashboard_render_interval_sec"),
+        ("tui_view", "tui_view"),
+        ("tui_glyphs", "tui_glyphs"),
+    ):
+        hits = subprocess.run(
+            ["grep", "-rl", consumer, "gareus/"], capture_output=True, text=True).stdout
+        non_cli = [f for f in hits.splitlines() if not f.endswith("cli.py")]
+        assert non_cli, f"--{attr.replace('_', '-')} has no consumer outside cli.py"
 
 
 def test_repeated_parse_args_does_not_drift_a_promoted_default():

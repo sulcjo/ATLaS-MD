@@ -528,9 +528,6 @@ def _add_output_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--tui-clear-mode", choices=["always", "never"], default="always",
                    help="Whether full-frame TUI redraws clear the visible terminal. "
                         "'never' appends frames instead (log-style).")
-    p.add_argument("--dashboard-density", choices=["auto", "compact", "normal", "full"],
-                   default="auto",
-                   help="Panel density hint. 'auto' derives it from terminal size.")
     p.add_argument("--distance-ascii-max-replicas", type=int, default=32,
                    help="Maximum replica rows drawn in the per-window CV distribution "
                         "panel (default 32).")
@@ -1077,6 +1074,7 @@ def _shim_output(args: argparse.Namespace) -> None:
     args.progress_jsonl = "progress.jsonl"
     args.progress_update_interval_sec = 0.25
     args.progress_bar_width = 36
+    args.dashboard_density = "auto"
     args.dashboard_wide_threshold = 132
     args.dashboard_min_panel_width = 30
     args.dashboard_max_height = 0
