@@ -5,6 +5,7 @@ __pycache__/
 .agents/
 .claude/
 _local_docs/
+site/
 query_gpt.py
 check_gareus_pbc_mindist.py
 
@@ -29,6 +30,8 @@ gareus_adaptive_production_v*/
 *.tar.gz
 *.txt
 *.md
+!docs/atlas-md/
+!docs/atlas-md/**
 
 illustrate_seedbank.png
 poincare_map.py

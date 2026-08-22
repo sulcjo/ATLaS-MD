@@ -2,6 +2,19 @@
 
 OpenMM explicit-solvent Amber14/PME peptide umbrella-sampling workflow with optional HMR-GaMD, REUS, adaptive window feedback, epoch-based adaptive production, and post-hoc MBAR/PMF outputs.
 
+## Documentation
+
+ATLAS-MD is project manual: installation, tutorials, workflow and scientific-analysis guidance, command/config/output reference, operations, and developer notes.
+
+Published manual: [sulcjo.github.io/2026_peptide_sampler](https://sulcjo.github.io/2026_peptide_sampler/)
+
+```bash
+python -m pip install -e ".[docs]"
+python -m mkdocs serve
+```
+
+Build static documentation with `python -m mkdocs build --strict`.
+
 ## Install
 
 ```bash

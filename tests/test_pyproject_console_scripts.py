@@ -15,6 +15,11 @@ def test_gareus_analyze_console_script_is_registered():
     assert scripts["gareus-analyze"] == "gareus.mbar_analysis.cli:main"
 
 
+def test_gareus_analyze_delegate_module_is_packaged():
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+    assert "analyze_gareus_mbar" in data["tool"]["setuptools"]["py-modules"]
+
+
 def test_existing_console_scripts_are_unchanged():
     data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
     scripts = data["project"]["scripts"]

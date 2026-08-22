@@ -1,0 +1,61 @@
+site_name: ATLAS-MD
+site_description: GaREUS peptide sampling manual
+site_url: https://sulcjo.github.io/2026_peptide_sampler/
+repo_name: GAREUS peptide sampler
+docs_dir: docs/atlas-md
+theme:
+  name: material
+  language: en
+  features:
+    - navigation.sections
+    - navigation.path
+    - navigation.top
+    - content.code.copy
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.highlight
+  - toc:
+      permalink: true
+nav:
+  - ATLAS-MD: index.md
+  - Start:
+      - Installation: start/installation.md
+      - Quickstart: start/quickstart.md
+      - Glossary: start/glossary.md
+  - User guide:
+      - System setup: guide/system-setup.md
+      - Collective variables: guide/collective-variables.md
+      - Umbrella windows and REUS: guide/windows-and-exchange.md
+      - GaMD: guide/gamd.md
+      - Adaptive workflows: guide/adaptive-workflows.md
+      - GENPEPT seeding: guide/genpept-seeding.md
+      - Resume and restart: guide/resume.md
+  - Analysis:
+      - Analysis workflow: analysis/overview.md
+      - PMF validity: analysis/pmf-validity.md
+      - PMF health field guide: analysis/pmf-health-field-guide.md
+      - Synthetic adaptive harness: analysis/synthetic-harness.md
+      - Energy decomposition: analysis/energy-decomposition.md
+  - Reference:
+      - Command-line programs: reference/cli.md
+      - Configuration: reference/configuration.md
+      - Output artifacts: reference/output-artifacts.md
+      - Python API: reference/python-api.md
+  - Tutorials:
+      - First CMD run: tutorials/first-cmd-run.md
+      - Seeded 2D Chignolin: tutorials/chignolin-2d.md
+      - Adaptive tICA handoff: tutorials/adaptive-tica.md
+      - Reproducible fixtures: tutorials/reproducible-fixtures.md
+  - Operations:
+      - Progress and dashboard: operations/dashboard.md
+      - Scratch and reproducibility: operations/reproducibility.md
+      - Troubleshooting: operations/troubleshooting.md
+  - Developer:
+      - Architecture: developer/architecture.md
+      - Testing and contributing: developer/contributing.md
