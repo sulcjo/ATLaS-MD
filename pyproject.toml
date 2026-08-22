@@ -24,6 +24,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+docs = ["mkdocs>=1.5", "mkdocs-material>=9.5", "pymdown-extensions>=10.0"]
 config = ["PyYAML>=6"]
 openmm = [
   "openmm>=8",
@@ -54,7 +55,7 @@ gareus-consolidate-traj = "gareus.traj_consolidate:main"
 gareus-analyze = "gareus.mbar_analysis.cli:main"
 
 [tool.setuptools]
-py-modules = ["gareus_peptide", "GENPEPT", "config_profiles"]
+py-modules = ["gareus_peptide", "GENPEPT", "config_profiles", "analyze_gareus_mbar"]
 
 [tool.setuptools.packages.find]
 where = ["."]
