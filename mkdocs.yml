@@ -50,6 +50,7 @@ nav:
   - Tutorials:
       - First CMD run: tutorials/first-cmd-run.md
       - Seeded 2D Chignolin: tutorials/chignolin-2d.md
+      - GENPEPT Chignolin case study: tutorials/genpept-chignolin-case-study.md
       - Adaptive tICA handoff: tutorials/adaptive-tica.md
       - Reproducible fixtures: tutorials/reproducible-fixtures.md
   - Operations:

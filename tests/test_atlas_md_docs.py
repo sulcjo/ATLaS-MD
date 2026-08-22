@@ -24,6 +24,7 @@ REQUIRED_PAGES = {
     "reference/configuration.md",
     "reference/output-artifacts.md",
     "tutorials/chignolin-2d.md",
+    "tutorials/genpept-chignolin-case-study.md",
     "tutorials/reproducible-fixtures.md",
     "operations/reproducibility.md",
     "operations/troubleshooting.md",
@@ -82,3 +83,44 @@ def test_atlas_md_has_a_schema_accurate_pmf_field_guide_and_tested_fixtures() ->
         assert key in guide
     assert "gareus-test-run --dry-run" in fixtures
     assert "python -m gareus.synth" in fixtures
+
+
+def test_genpept_chignolin_case_study_has_pipeline_evidence_and_limits() -> None:
+    page = (DOCS / "tutorials" / "genpept-chignolin-case-study.md").read_text(
+        encoding="utf-8"
+    )
+    config = CONFIG.read_text(encoding="utf-8")
+    assets = DOCS / "assets" / "genpept-chignolin"
+
+    assert "GENPEPT Chignolin case study" in config
+    assert "not an equilibrium free-energy surface" in page
+    for stage in (
+        "Ramachandran-state generation",
+        "implicit minimization",
+        "basin hopping",
+        "ANM/NMA expansion",
+        "PCA-frontier expansion",
+        "final survivor selection",
+        "GAREUS handoff",
+    ):
+        assert stage.lower() in page.lower()
+    for control in (
+        "run02_raw_generation_only",
+        "run03_bh_only",
+        "run04_nma_only",
+        "run05_minimal_full",
+        "run06_pca_frontier_control",
+        "run07_reasonable_all_methods",
+        "chignolin_genpept_r7",
+    ):
+        assert control in page
+    for figure in (
+        "run07-space-score-growth.png",
+        "run07-pca-area-growth.png",
+        "r7-stage-source-composition.png",
+        "r7-end-to-end-pseudo-fes.png",
+    ):
+        assert (assets / figure).is_file(), figure
+    assert "Atomistic explicit minimization: disabled" in page
+    assert "Optional explicit minimization" not in page
+    assert "BH enabled: NMA expands BH minima" in page

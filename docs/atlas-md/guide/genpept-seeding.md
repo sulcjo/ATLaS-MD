@@ -9,3 +9,6 @@ gareus --config examples/chignolin_2d_distance_with_genpept.yaml \
 ```
 
 GAREUS scores survivors against active CV1/CV2 windows. Inspect `us_starting_structures/seed_selection_report.*`; broad seed diversity does not guarantee each restrained 2D target has support.
+
+For complete method rationale, historical Chignolin controls, output-file guide,
+and stage figures, read [GENPEPT Chignolin case study](../tutorials/genpept-chignolin-case-study.md).
