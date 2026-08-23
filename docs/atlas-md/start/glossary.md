@@ -13,3 +13,5 @@
 **ESS** — effective sample size. Raw frame count can be large while weighted ESS is small.
 
 **Frozen final production** — sampling after adaptive placement stops; preferred source for final inference.
+
+See [symbols and references](symbols-and-citations.md) for notation and theory sources.

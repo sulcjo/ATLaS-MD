@@ -31,7 +31,12 @@ flowchart TD
 4. **Neighbor graph:** identify weak or missing edges; add bridge windows where needed.
 5. **GaMD reweighting:** inspect boost/cumulant diagnostics, not only PMF curve smoothness.
 6. **Frozen final sampling:** favor fresh final sampling after adaptive topology stops changing.
+7. **Uncertainty:** use block bootstrap where available; individual-frame resampling ignores MD correlation.
 
 ## Recovery
 
 Add bridge windows, tighten off-target secondary restraints or adjust force constants, then collect fresh frozen-final data. Do not hide zero-sample diagnostics by pruning reports; solver population filtering does not create physical overlap.
+
+## Estimator identity
+
+Report `umbrella_only`, `gamd_exponential`, `gamd_cumulant2`, or `gamd_cumulant3` exactly as written by analysis. They answer different numerical estimators of same target distribution. Cumulant-2 is default with usable GaMD boost; it is not direct exponential reweighting. Keep alternate estimator outputs and boost diagnostics with result. See [reweighting and estimators](reweighting.md).

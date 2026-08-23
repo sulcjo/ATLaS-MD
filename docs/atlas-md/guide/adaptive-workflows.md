@@ -10,6 +10,12 @@ gareus --seq CLN025 --window-mode adaptive-production \
 
 `--md-budget-ns` is aggregate pool across states/replicas. `--ap-final-pool-fraction` reserves pool for frozen final sampling.
 
+## Decision policy and limits
+
+Adaptive production ranks states for added allocation from measured evidence: low sample count, weak graph edges, frontier exposure, and high boost variability. It can add/move bridge states, extend undersampled states, and retire only redundant non-critical states after minimum samples while preserving graph connectivity. These are deterministic policy actions, not proof that scientific target has converged.
+
+Default target overlap is 0.30; retirement redundancy target is 0.45. These are operational defaults, not universal free-energy acceptance thresholds. Final inference should prefer fresh final-pool samples after registry stops changing. Epoch samples are excluded from post-hoc MBAR unless `--ap-include-epoch-samples` is deliberately set and nonstationarity is justified.
+
 ## Epoch state machine
 
 ```mermaid

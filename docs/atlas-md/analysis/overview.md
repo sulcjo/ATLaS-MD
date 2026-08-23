@@ -10,6 +10,8 @@ Typical sequence:
 4. Read health report, coverage, overlap, weighted ESS, GaMD diagnostics.
 5. Only then compare PMFs or quote free-energy differences.
 
+Analysis has two layers. MBAR removes every configured umbrella restraint through reduced-bias matrix `u_nk`. GaMD runs then apply boost reweighting. Preserve estimator and input-population labels: a PMF is not defined solely by its plotted CV. Read [reweighting and estimators](reweighting.md) before selecting output.
+
 Sample-query APIs can reconstruct arrays without a prewritten NPZ:
 
 ```python

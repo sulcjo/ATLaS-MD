@@ -7,11 +7,14 @@ Use it in order:
 1. [Install](start/installation.md) dependencies.
 2. Run [quickstart](start/quickstart.md) with conventional MD (CMD).
 3. Choose [collective variables](guide/collective-variables.md) and [windows](guide/windows-and-exchange.md).
-4. Run analysis and apply [PMF validity](analysis/pmf-validity.md) gates before interpreting free energies.
+4. Read [physical/statistical foundations](guide/foundations.md) and [reweighting](analysis/reweighting.md).
+5. Run analysis and apply [PMF validity](analysis/pmf-validity.md) gates before interpreting free energies.
 
 ## Scope
 
 GAREUS is research software. It writes reproducibility artifacts and diagnostics; it does not make free-energy estimates valid by itself. Validate sampling, overlap, and reweighting for every scientific conclusion.
+
+`F(z) = -kBT ln P(z) + C` defines reported PMFs. `C` is arbitrary; only differences within compatible analyses have physical meaning. Umbrella MBAR removes restraint bias, then GaMD runs need separate boost correction. Both operations require sampled support.
 
 ## Workflow map
 

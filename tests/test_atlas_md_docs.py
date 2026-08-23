@@ -16,8 +16,12 @@ REQUIRED_PAGES = {
     "start/installation.md",
     "start/quickstart.md",
     "guide/collective-variables.md",
+    "guide/foundations.md",
+    "guide/gamd-calibration.md",
     "guide/adaptive-workflows.md",
     "analysis/pmf-validity.md",
+    "analysis/reweighting.md",
+    "analysis/validation-workflow.md",
     "analysis/pmf-health-field-guide.md",
     "analysis/synthetic-harness.md",
     "reference/cli.md",
@@ -27,8 +31,10 @@ REQUIRED_PAGES = {
     "tutorials/genpept-chignolin-case-study.md",
     "tutorials/reproducible-fixtures.md",
     "operations/reproducibility.md",
+    "operations/reporting-checklist.md",
     "operations/troubleshooting.md",
     "developer/architecture.md",
+    "start/symbols-and-citations.md",
 }
 
 
@@ -37,6 +43,8 @@ def test_atlas_md_has_mkdocs_configuration_and_required_pages() -> None:
     config = CONFIG.read_text(encoding="utf-8")
     assert "site_name: ATLAS-MD" in config
     assert "docs_dir: docs/atlas-md" in config
+    assert "pymdownx.arithmatex" in config
+    assert "assets/mathjax.js" in config
     missing = sorted(page for page in REQUIRED_PAGES if not (DOCS / page).is_file())
     assert not missing, f"Missing ATLAS-MD pages: {missing}"
 

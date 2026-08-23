@@ -20,24 +20,34 @@ markdown_extensions:
           class: mermaid
           format: !!python/name:pymdownx.superfences.fence_code_format
   - pymdownx.highlight
+  - pymdownx.arithmatex:
+      generic: true
   - toc:
       permalink: true
+extra_javascript:
+  - assets/mathjax.js
+  - https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js
 nav:
   - ATLAS-MD: index.md
   - Start:
       - Installation: start/installation.md
       - Quickstart: start/quickstart.md
       - Glossary: start/glossary.md
+      - Symbols and references: start/symbols-and-citations.md
   - User guide:
       - System setup: guide/system-setup.md
       - Collective variables: guide/collective-variables.md
+      - Physical and statistical foundations: guide/foundations.md
       - Umbrella windows and REUS: guide/windows-and-exchange.md
       - GaMD: guide/gamd.md
+      - GaMD calibration: guide/gamd-calibration.md
       - Adaptive workflows: guide/adaptive-workflows.md
       - GENPEPT seeding: guide/genpept-seeding.md
       - Resume and restart: guide/resume.md
   - Analysis:
       - Analysis workflow: analysis/overview.md
+      - Reweighting and estimators: analysis/reweighting.md
+      - Validation workflow: analysis/validation-workflow.md
       - PMF validity: analysis/pmf-validity.md
       - PMF health field guide: analysis/pmf-health-field-guide.md
       - Synthetic adaptive harness: analysis/synthetic-harness.md
@@ -56,6 +66,7 @@ nav:
   - Operations:
       - Progress and dashboard: operations/dashboard.md
       - Scratch and reproducibility: operations/reproducibility.md
+      - Scientific reporting checklist: operations/reporting-checklist.md
       - Troubleshooting: operations/troubleshooting.md
   - Developer:
       - Architecture: developer/architecture.md
