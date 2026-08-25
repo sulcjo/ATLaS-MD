@@ -24,6 +24,12 @@ from typing import Any, Optional
 import numpy as np
 
 from gareus.mbar_analysis.data import Data
+# Imported DIRECTLY, not resolved through _bridge(): make_overlap_bins reads no
+# parse_args()-mutated global, and _bridge() has a known branch-order defect
+# (see CLAUDE.md) that can hand back a second, never-parse_args()'d script copy.
+# analyze_gareus_mbar.py's own solvers import list does not re-export this name
+# either, so _agm.make_overlap_bins does not exist.
+from gareus.mbar_analysis.solvers import make_overlap_bins
 
 
 def _bridge() -> Any:
@@ -604,6 +610,561 @@ def _window_moments(a):
     anharmonicity = float(np.sqrt(skew**2 + 0.25 * kurt**2))
     return skew, kurt, anharmonicity
 
+# ===========================================================================
+# Mapping-sanity diagnostics (added 2026-08-25)
+#
+# All four of the helpers below came out of one root-cause investigation:
+# docs/chignolin_6_low_ess_root_cause.md. On that real run
+# --us-auto-drop-bad-windows pruned bad umbrella windows post-pull and
+# gareus/production.py renumbered the survivors 0..N-1, but each phase's
+# epoch_window_map.csv -- written earlier by the registry as an IDENTITY map
+# over all 27 nominally-active states -- was never rewritten. ~1.8M samples
+# (15% of the campaign) were therefore attributed to the WRONG umbrella state:
+# one state was scored against a sign-flipped secondary centre (2,012 kT of
+# fabricated bias), one was never sampled at all (a phantom duplicate of its
+# neighbour), and one pooled three different Hamiltonians. The pipeline
+# produced a complete, plausible-looking PMF and not a single existing check
+# fired.
+#
+# Nothing here changes a PMF number. These are detectors for that failure
+# class, which the analysis was structurally blind to.
+# ===========================================================================
+
+# Source of truth for these column spellings is gareus/mbar_analysis/loaders.py's
+# own secondary-CV lookup inside load_csv (the sec_centers/sec_ks pair). They are
+# duplicated rather than imported so this module stays importable on its own
+# (test_pmf_module_is_importable_standalone) without dragging in the loader chain
+# (DuckDB/Parquet) that only the loaders themselves need. If a loader grows a new
+# spelling, add it in BOTH places.
+_SECONDARY_CENTER_KEYS = ('secondary_cv_center', 'secondary_center', 'secondary',
+                          'ss0', 'secondary_cv_target')
+_SECONDARY_K_KEYS = ('secondary_cv_k_kcal_mol', 'secondary_k_kcal_mol',
+                     'secondary_cv_k_kcal', 'ss_k_kcal_mol', 'secondary_k')
+
+# Self-bias warning thresholds, in kT.
+#
+# u_nk is ALREADY reduced -- every loader multiplies its harmonic sum by
+# beta*KJ_PER_KCAL before storing it (loaders.py's `scale`, loaders_adaptive.py's
+# same) -- so u_nk[n, k] is a dimensionless kT and these numbers are directly
+# comparable with the table in the root-cause doc's section 3.
+#
+# A correctly-mapped harmonic restraint puts its own samples at 0.5 kT per
+# restrained degree of freedom by equipartition, i.e. ~1 kT for the 2-DOF
+# (primary + secondary) restraints this pipeline uses; the reduced self-bias is
+# then Exp(1)-distributed, median ln2 = 0.69, p90 2.30. The real run's 24 healthy
+# states measured 0.5-1.4 kT median and 1.7-4.9 kT p90. The three corrupted ones
+# measured 63.6 / 1.1 / 132.9 median and 80.7 / 652.8 / 221.8 p90 -- more than an
+# order of magnitude clear of the healthy band, which is why loose thresholds are
+# enough and why they do not need per-run tuning. 10 kT sits ~2x above the worst
+# healthy p90; the separate 50 kT p90 trigger exists for the pooled-Hamiltonian
+# shape (that run's state 22), whose median is textbook because only a minority
+# tail of its slot is fabricated.
+SELF_BIAS_MEDIAN_WARN_KT = 10.0
+SELF_BIAS_P90_WARN_KT = 50.0
+
+# Fraction of samples that must carry a finite secondary CV before the JOINT
+# (cv1, cv2) overlap matrix is allowed to be the reported, health-gating one.
+#
+# A run can legitimately have cv2 null for a large block of its samples -- a
+# mid-campaign secondary-CV regime switch (torsion-pca -> tica-linear) leaves an
+# early epoch with a different projection or none at all. The joint matrix
+# computed on a minority of the population looks exactly as authoritative as the
+# marginal one while describing a different population, so below this fraction it
+# is treated as diagnostic-only: the marginal matrix is reported instead and the
+# reason is stated in a warning. Between this and _WARN, the joint matrix is used
+# but flagged. Thresholds named per overlap_matrix()'s own docstring guidance.
+OVERLAP_CV2_MIN_RETAINED_FRACTION = 0.50
+OVERLAP_CV2_WARN_RETAINED_FRACTION = 0.95
+
+# Names for the two overlap spaces. Stamped into pmf_summary.json
+# (``overlap_space`` / ``joint_overlap['space']``) and into the header comment
+# of each overlap matrix CSV, so a number on disk always says which space it
+# is in. Before this existed, a joint number and a marginal number were
+# indistinguishable once written out, which made two runs analysed either side
+# of a code change silently incomparable.
+OVERLAP_SPACE_MARGINAL = 'cv1_marginal'
+OVERLAP_SPACE_JOINT = 'cv1_cv2_joint'
+
+
+def _secondary_window_params(meta: dict, K: int) -> tuple:
+    """``(secondary_center, secondary_k)``, length K, from the loader's own
+    per-window row list (``meta['umbrella_window_rows']``).
+
+    Every loader that builds a ``Data`` stashes its window table there, but they
+    disagree on the column spelling (union-Parquet's registry rows use
+    ``secondary_center``/``secondary_k``; load_csv's umbrella_windows.csv and the
+    multi-round augmentation path use ``secondary_cv_center``/
+    ``secondary_cv_k_kcal_mol``), hence the alias tuples above.
+
+    Absent, blank, unparseable or missing rows yield NaN rather than 0.0 -- the
+    caller must be able to tell "this window has no secondary restraint" from
+    "this window is restrained at 0.0", and a 0.0 default would silently claim
+    the latter. (Note ``loaders.py`` itself defaults secondary_k to 0.0 for its
+    own bias-matrix construction, where 0.0 correctly means "no term"; here the
+    value is displayed to an operator, so absence must stay visibly absent.)
+
+    Known gap, not fixable from this module: ``loaders_adaptive.py``'s
+    ``load_epoch_csv_adaptive`` writes ``umbrella_window_rows`` with only
+    ``center_A``/``k_kcal_mol_A2``, discarding the ``sec_centers``/``sec_ks`` it
+    computed locally -- runs loaded through that legacy epoch-CSV path get blank
+    secondary columns here even though the values existed.
+    """
+    rows = (meta or {}).get('umbrella_window_rows') or []
+    c2 = np.full(int(K), np.nan)
+    k2 = np.full(int(K), np.nan)
+    for k in range(min(int(K), len(rows))):
+        row = rows[k] if isinstance(rows[k], dict) else {}
+        for dest, keys in ((c2, _SECONDARY_CENTER_KEYS), (k2, _SECONDARY_K_KEYS)):
+            for key in keys:
+                raw = row.get(key, '')
+                if raw in (None, '', 'nan', 'None'):
+                    continue
+                try:
+                    dest[k] = float(raw)
+                except (TypeError, ValueError):
+                    pass
+                break
+    return c2, k2
+
+
+def self_bias_diagnostics(u_nk: np.ndarray, window: np.ndarray, K: int) -> dict:
+    """Per-state distribution of each state's OWN samples' bias in its OWN
+    restraint -- the diagonal ``u_nk[n, window[n]]``, grouped by state.
+
+    This is the cheapest possible test of the sample-to-state mapping, and the
+    one check that would have caught the whole chignolin_6 root cause on its own
+    (see the module comment above and SELF_BIAS_MEDIAN_WARN_KT for the real
+    numbers). Physically it must be ~1 kT for a 2-DOF harmonic regardless of the
+    CV, the window spacing, the temperature or the system -- there is no run for
+    which 60 kT is a legitimate value, so a violation is unambiguous.
+
+    Deliberately NOT a complete detector, and the caller must say so: a
+    mis-mapping between two *nearby* windows stays under threshold. On the real
+    run, state 20 was a pure phantom (every one of its 861,547 samples actually
+    belonged to state 21) yet measured a benign 3.4 kT median / 6.7 kT p90,
+    because those two states' secondary centres were only ~5-6 kT apart. Absence
+    of this warning is therefore not proof the mapping is right.
+
+    Returns a dict of length-K arrays: ``n`` (finite own-bias samples per state),
+    ``median_kT``, ``p90_kT``, ``max_kT``, ``frac_above_100_kT``. Every
+    statistic is NaN for a state with no samples (matching
+    ``_window_cv_mean_std``'s convention, so the CSV writer blanks it the same
+    way).
+    """
+    u_nk = np.asarray(u_nk)
+    window = np.asarray(window, dtype=np.int64)
+    K = int(K)
+    n_k = np.zeros(K, dtype=np.int64)
+    med = np.full(K, np.nan); p90 = np.full(K, np.nan)
+    mx = np.full(K, np.nan); frac100 = np.full(K, np.nan)
+    if window.size == 0 or K <= 0 or u_nk.ndim != 2 or u_nk.shape[1] < K:
+        return {'n': n_k, 'median_kT': med, 'p90_kT': p90, 'max_kT': mx,
+                'frac_above_100_kT': frac100}
+    rows = np.flatnonzero((window >= 0) & (window < K))
+    if rows.size:
+        u_self = np.asarray(u_nk[rows, window[rows]], dtype=np.float64)
+        # A non-finite own-bias entry is an already-excluded sample (clean()
+        # drops rows with any non-finite u_nk, but a subset Data or a
+        # partially-reconstructed matrix can still carry them). Dropping them
+        # here rather than letting np.median propagate NaN matters: a single NaN
+        # would otherwise silence this check for that whole state.
+        keep = np.isfinite(u_self)
+        rows = rows[keep]; u_self = u_self[keep]
+    if rows.size:
+        # One stable sort, then contiguous per-state slices. The obvious
+        # alternative (``u_self[window[rows] == k]`` inside a loop over K) is the
+        # O(N*K) boolean-mask-per-window pattern _window_cv_mean_std was
+        # extracted to eliminate, and this runs on every analysis over the full
+        # multi-million-row population. np.median/np.percentile have no
+        # by-group form, so the per-state loop over slices stays.
+        w_rows = window[rows]
+        order = np.argsort(w_rows, kind='stable')
+        w_sorted = w_rows[order]
+        u_sorted = u_self[order]
+        bounds = np.searchsorted(w_sorted, np.arange(K + 1))
+        for k in range(K):
+            a, b = int(bounds[k]), int(bounds[k + 1])
+            if b <= a:
+                continue
+            blk = u_sorted[a:b]
+            n_k[k] = blk.size
+            med[k] = float(np.median(blk))
+            p90[k] = float(np.percentile(blk, 90.0))
+            mx[k] = float(np.max(blk))
+            frac100[k] = float(np.count_nonzero(blk > 100.0) / blk.size)
+    return {'n': n_k, 'median_kT': med, 'p90_kT': p90, 'max_kT': mx,
+            'frac_above_100_kT': frac100}
+
+
+def self_bias_warning_lines(sb: dict, warning_prefix: str = '',
+                            median_thr: float = SELF_BIAS_MEDIAN_WARN_KT,
+                            p90_thr: float = SELF_BIAS_P90_WARN_KT) -> list:
+    """HIGH-severity warning text (zero or one line) for self_bias_diagnostics.
+
+    One line listing every offending state rather than one line per state, so
+    gareus_report.py's de-duplicator does not collapse a 3-state failure into a
+    single representative and hide which states they were.
+
+    The wording is load-bearing in two ways: gareus_report.py's ``_WARN_RULES``
+    matches "Implausible self-bias" to classify this HIGH (an unmatched warning
+    silently defaults to MEDIUM), and it names the mapping explicitly rather
+    than describing a symptom -- the whole point is that an operator reading it
+    goes and checks epoch_window_map.csv instead of blaming the sampling.
+    """
+    med = np.asarray(sb.get('median_kT'), dtype=np.float64).ravel()
+    p90 = np.asarray(sb.get('p90_kT'), dtype=np.float64).ravel()
+    bad = [k for k in range(med.size)
+           if (np.isfinite(med[k]) and med[k] > median_thr)
+           or (k < p90.size and np.isfinite(p90[k]) and p90[k] > p90_thr)]
+    if not bad:
+        return []
+    detail = ', '.join(
+        f'state {k} (median {med[k]:.1f} kT, p90 {p90[k]:.1f} kT)' for k in bad)
+    return [
+        f'{warning_prefix}Implausible self-bias in {len(bad)} umbrella state(s): {detail}. '
+        f'A correctly-mapped harmonic restraint puts its own samples at ~1 kT '
+        f'(trigger: median >{median_thr:.0f} kT or p90 >{p90_thr:.0f} kT), so the '
+        f'sample-to-state mapping or the window parameters for those states are WRONG '
+        f'and the PMF from them is not trustworthy. Check each phase\'s '
+        f'epoch_window_map.csv against the window table the sampler actually ran '
+        f'(umbrella_explicit_windows.csv). See docs/chignolin_6_low_ess_root_cause.md.']
+
+
+def cv_space_neighbor_overlap(O: np.ndarray, centers: np.ndarray, k_kcal: np.ndarray,
+                              centers2: np.ndarray, k2: np.ndarray, kbt_kcal: float,
+                              n_k: Optional[np.ndarray] = None) -> list:
+    """Each populated state's overlap with its nearest neighbour in RESTRAINT
+    CENTRE space, rather than with the state that happens to sit beside it in
+    the index ordering.
+
+    Why: the chignolin_6 health check reported "worst 0.013 (pair 23-24); target
+    >=0.30", which sent the investigation at state 24 -- an innocent, well-
+    overlapped late-born bridge window that merely happened to be indexed next
+    to 23. States 23 and 24 are nowhere near each other in CV space. Index
+    adjacency is only meaningful for a 1D monotone ladder; the moment states are
+    added adaptively, or a second CV exists, the index order is bookkeeping.
+
+    Distance is measured in units of the states' own restraint widths
+    (sigma ~ sqrt(kT/k), averaged over the pair per axis) and combined in
+    quadrature, NOT as a raw Euclidean distance on the centres. Raw Euclidean
+    would be dominated by whichever axis has the larger numeric range -- on the
+    real run the primary contact CV spanned 0->0.176 while the secondary spanned
+    ~3.8, so a raw metric would have been a pure CV2 nearest-neighbour search by
+    accident rather than by design. Sigma units are also what the root-cause
+    doc's "healthy umbrella overlap wants spacing/sigma ~1-1.5" language means.
+
+    Axes are dropped, not defaulted, when they carry no restraint: a state pair
+    where either side has a non-finite secondary centre or a non-positive
+    secondary k contributes 0 to the secondary term, since an unrestrained axis
+    says nothing about how far apart two windows were driven. With no usable
+    secondary restraint anywhere this reduces to a primary-only nearest
+    neighbour, which for a monotone 1D ladder reproduces index adjacency exactly.
+
+    States with zero samples are excluded as both source and neighbour: their
+    overlap row is identically zero, so including them would peg the reported
+    worst-overlap at 0.000 for a condition the dedicated zero-sample-window
+    check already reports, drowning out any real overlap problem.
+
+    Ties resolve to the lowest index so the reported pair is stable across
+    re-runs (the real run has near-coincident states, where ties are routine).
+
+    Returns ``[{'window': i, 'neighbor': j, 'overlap': float,
+    'centre_distance_sigma': float}, ...]`` in ascending window order, empty if
+    fewer than two states are eligible.
+    """
+    O = np.asarray(O, dtype=np.float64)
+    K = int(O.shape[0]) if O.ndim == 2 else 0
+    if K < 2:
+        return []
+    c1 = np.asarray(centers, dtype=np.float64).ravel()
+    kk1 = np.asarray(k_kcal, dtype=np.float64).ravel()
+    c2 = np.asarray(centers2, dtype=np.float64).ravel() if centers2 is not None else np.full(K, np.nan)
+    kk2 = np.asarray(k2, dtype=np.float64).ravel() if k2 is not None else np.full(K, np.nan)
+    for name, arr in (('c1', c1), ('kk1', kk1), ('c2', c2), ('kk2', kk2)):
+        if arr.size < K:
+            pad = np.full(K, np.nan); pad[:arr.size] = arr
+            if name == 'c1': c1 = pad
+            elif name == 'kk1': kk1 = pad
+            elif name == 'c2': c2 = pad
+            else: kk2 = pad
+
+    def _sigma(k_arr):
+        """sqrt(kT/k) per state, with a single shared fallback width where k is
+        unusable -- a missing force constant must not make a state infinitely
+        far from (or infinitely close to) everything else."""
+        with np.errstate(divide='ignore', invalid='ignore'):
+            s = np.sqrt(float(kbt_kcal) / np.asarray(k_arr, dtype=np.float64))
+        ok = np.isfinite(s) & (s > 0.0)
+        if not np.all(ok):
+            s = s.copy()
+            s[~ok] = float(np.median(s[ok])) if np.any(ok) else 1.0
+        return s
+
+    s1 = _sigma(kk1)
+    has_secondary = np.isfinite(c2) & np.isfinite(kk2) & (kk2 > 0.0)
+    s2 = _sigma(np.where(has_secondary, kk2, np.nan))
+
+    eligible = np.isfinite(c1)
+    if n_k is not None:
+        nk = np.asarray(n_k).ravel()
+        if nk.size >= K:
+            eligible = eligible & (nk[:K] > 0)
+    idx = np.flatnonzero(eligible)
+    if idx.size < 2:
+        return []
+
+    # Pairwise sigma-scaled centre distance, restricted to eligible states.
+    ci = c1[idx]; si = s1[idx]
+    d1 = np.abs(ci[:, None] - ci[None, :]) / (0.5 * (si[:, None] + si[None, :]))
+    both2 = has_secondary[idx][:, None] & has_secondary[idx][None, :]
+    if np.any(both2):
+        cj = c2[idx]; sj = s2[idx]
+        with np.errstate(invalid='ignore'):
+            d2 = np.abs(cj[:, None] - cj[None, :]) / (0.5 * (sj[:, None] + sj[None, :]))
+        d2 = np.where(both2 & np.isfinite(d2), d2, 0.0)
+    else:
+        d2 = np.zeros_like(d1)
+    dist = np.sqrt(d1 ** 2 + d2 ** 2)
+    np.fill_diagonal(dist, np.inf)
+
+    rows = []
+    for a, i in enumerate(idx):
+        b = int(np.argmin(dist[a]))          # first minimum -> lowest index on ties
+        j = int(idx[b])
+        rows.append({'window': int(i), 'neighbor': j, 'overlap': float(O[i, j]),
+                     'centre_distance_sigma': float(dist[a, b])})
+    return rows
+
+
+def overlap_components(O: np.ndarray, thr: float,
+                       n_k: Optional[np.ndarray] = None) -> dict:
+    """Connected components of the umbrella-overlap GRAPH: one edge wherever
+    ``O[i, j] >= thr``.
+
+    Why a graph and not another worst-pair number. Every overlap diagnostic
+    above this one is pairwise -- worst index-adjacent pair, worst CV-space
+    nearest-neighbour pair -- and no pairwise statistic can express the failure
+    that actually happened on chignolin_6. MBAR determines free energies only up
+    to one additive constant PER CONNECTED COMPONENT: two sets of states that
+    never exchange samples share no information, so the offset between them is
+    unconstrained by the data and the solver settles it arbitrarily. That run's
+    posterior put 94% of its weight on a single state for exactly this reason
+    (docs/chignolin_6_low_ess_root_cause.md, section 1). A set can be split in
+    two while EVERY graded pair clears the threshold -- two well-overlapped
+    pairs that do not touch each other is enough -- so this has to be measured
+    on the whole matrix, not inferred from the pairing.
+
+    Related but distinct from the nearest-neighbour pairing above: a
+    nearest-neighbour pairing over K states contributes at most K edges, so it
+    is a spanning forest at best and cannot certify bridging even in principle.
+    (Measured on the real run's 27-state matrix: 19 unique pairs. Counting
+    components of THAT graph is a property of the pairing construction, not of
+    the run -- 19 edges over 27 nodes must split into 8 pieces by arithmetic.
+    The number below is computed from the full matrix instead.)
+
+    ``thr`` is the caller's own per-space overlap target: the marginal matrix is
+    graded at ``--min-neighbor-overlap`` and the joint one at
+    ``--min-joint-neighbor-overlap``, since joint overlap is bounded above by
+    the marginal and neither space's connectivity implies the other's. On the
+    real run the CV1-marginal graph is FULLY CONNECTED at 0.30 while the joint
+    graph splits into 3 components at 0.09 -- i.e. computing this on the
+    always-available marginal matrix alone would re-commit, inside the fix, the
+    marginal blindness the fix exists for.
+
+    States with zero samples are excluded from the graph entirely (reported
+    under ``excluded_unsampled_states``): their overlap row is identically zero,
+    so each would be its own component and every run with one unsampled window
+    would trivially "disconnect" -- a condition the dedicated zero-sample-window
+    check already owns. Same convention and same rationale as
+    ``cv_space_neighbor_overlap``.
+
+    Non-finite entries are never edges (``nan >= thr`` is False), and the matrix
+    is symmetrised when tested (``O[i, j]`` or ``O[j, i]``) so an asymmetric
+    input cannot lose a real edge.
+
+    Returns ``{'threshold', 'n_states_graded', 'n_components', 'components',
+    'component_samples', 'excluded_unsampled_states',
+    'component_best_cross_overlap', 'worst_component_best_cross_overlap',
+    'most_isolated_component'}``. ``components`` is a
+    list of ascending state-id lists, ordered by lowest member, so the output is
+    stable across re-runs; ``component_samples`` is the matching total sample
+    count per component (empty when no ``n_k`` was supplied) -- that number is
+    what lets an operator tell small-N histogram deflation from a real physical
+    gap. ``n_components == 0`` means fewer than one state was eligible, i.e.
+    "nothing to grade", not "connected".
+
+    HOW BADLY split is measured too, not just whether. For each component,
+    ``component_best_cross_overlap`` gives its strongest overlap with anything
+    outside it -- its best escape route -- and
+    ``worst_component_best_cross_overlap`` is the smallest of those, belonging
+    to ``most_isolated_component`` (ties resolve to the lowest-indexed
+    component, the same determinism ``components``' own ordering has, so two
+    equally-isolated blocks name one of them stably rather than arbitrarily).
+    That distinguishes two very different
+    situations a bare component count reports identically: a block that shares
+    essentially no samples with anything, whose relative free energy is
+    undetermined outright (chignolin_6's isolated state 20 measures 0.0048 to
+    anything outside its own component, and 0.00075 to the main block), from a
+    block whose only link is a weak-but-real pair that merely misses the target
+    (its state 18 measures 0.0648 against a 0.09 target). The first is a hard
+    failure; the second is the pairwise CAUTION the overlap check already
+    reports, plus the sharper news that the weak pair is the ONLY bridge.
+
+    The MINIMUM over components is the grading number, deliberately, not the
+    maximum over cut edges: on the real run those differ and only the minimum is
+    right. Measured on that npz, its three components' best escape routes are
+    0.06481 / 0.06481 / 0.00480, so a max-over-cut-edges statistic reports
+    0.06481 and grades the whole split on state 18's weak-but-real link,
+    silently rescuing state 20 -- which shares essentially nothing with anything
+    -- from the FAIL it has earned. That is not hypothetical: the first version
+    of this code took the max and graded the real run CAUTION. The grading
+    itself lives in gareus_report._check_overlap_connectivity; this function
+    only measures.
+    """
+    O = np.asarray(O, dtype=np.float64)
+    K = int(O.shape[0]) if (O.ndim == 2 and O.shape[0] == O.shape[1]) else 0
+    thr = float(thr)
+    eligible = np.ones(K, dtype=bool)
+    excluded: list = []
+    nk = None
+    if n_k is not None:
+        arr = np.asarray(n_k).ravel()
+        if arr.size >= K:
+            nk = arr
+            eligible = arr[:K] > 0
+            excluded = [int(i) for i in np.flatnonzero(~eligible)]
+    idx = np.flatnonzero(eligible)
+    out = {'threshold': thr, 'n_states_graded': int(idx.size), 'n_components': 0,
+           'components': [], 'component_samples': [], 'excluded_unsampled_states': excluded,
+           'component_best_cross_overlap': [], 'worst_component_best_cross_overlap': None,
+           'most_isolated_component': None}
+    if idx.size == 0:
+        return out
+
+    parent = {int(i): int(i) for i in idx}
+
+    def _find(a: int) -> int:
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    if idx.size > 1:
+        with np.errstate(invalid='ignore'):
+            adj = np.isfinite(O) & (O >= thr)
+        sub = adj[np.ix_(idx, idx)]
+        sub = sub | sub.T
+        ii, jj = np.nonzero(np.triu(sub, 1))
+        for a, b in zip(ii, jj):
+            ra, rb = _find(int(idx[a])), _find(int(idx[b]))
+            if ra != rb:
+                parent[rb] = ra
+
+    groups: dict = {}
+    for i in idx:
+        groups.setdefault(_find(int(i)), []).append(int(i))
+    comps = sorted((sorted(v) for v in groups.values()), key=lambda c: c[0])
+    out['n_components'] = len(comps)
+    out['components'] = comps
+    if nk is not None:
+        out['component_samples'] = [int(sum(int(nk[x]) for x in c)) for c in comps]
+    if len(comps) > 1:
+        # Per-component best escape route, then the worst of them (see the
+        # docstring: the minimum over components, NOT the maximum over cut
+        # edges). Every one of these is below `thr` by construction -- that is
+        # what made it a split -- so what they add is HOW far below.
+        #
+        # Done as one O(K^2) masked reduction rather than a loop over component
+        # pairs, so a pathologically shattered K=364 geometry stays cheap. The
+        # matrix is symmetrised first, so an asymmetric input cannot lose a
+        # link. Non-finite entries are ignored, and a component with no finite
+        # cross entry at all stays None rather than becoming 0.0 -- absence must
+        # not read as a measured zero.
+        labels = np.full(K, -1, dtype=np.int64)
+        for ci, c in enumerate(comps):
+            labels[c] = ci
+        sub = O[np.ix_(idx, idx)]
+        sub = np.maximum(sub, sub.T)
+        lab = labels[idx]
+        cross = np.where(np.isfinite(sub) & (lab[:, None] != lab[None, :]), sub, -np.inf)
+        per_state_best = cross.max(axis=1)
+        per_component = []
+        for ci in range(len(comps)):
+            rows = per_state_best[lab == ci]
+            v = float(rows.max()) if rows.size else float('-inf')
+            per_component.append(v if np.isfinite(v) else None)
+        out['component_best_cross_overlap'] = per_component
+        finite = [v for v in per_component if v is not None]
+        if finite:
+            worst = min(finite)
+            out['worst_component_best_cross_overlap'] = worst
+            out['most_isolated_component'] = list(comps[per_component.index(worst)])
+    return out
+
+
+def overlap_component_text(conn: dict, max_components: int = 6,
+                           max_states: int = 8) -> str:
+    """``[18] (3,410 samples), [20] (6,030 samples), ...`` for one
+    ``overlap_components`` result.
+
+    Truncated on both axes because a genuinely shattered K=364 geometry would
+    otherwise render an unreadable multi-kilobyte warning line; the counts are
+    always published in full under ``overlap_connectivity`` in
+    pmf_summary.json.
+    """
+    comps = list(conn.get('components') or [])
+    samples = list(conn.get('component_samples') or [])
+    parts = []
+    for n, c in enumerate(comps[:int(max_components)]):
+        shown = ', '.join(str(x) for x in c[:int(max_states)])
+        if len(c) > int(max_states):
+            shown += f', ... +{len(c) - int(max_states)} more'
+        txt = f'[{shown}]'
+        if n < len(samples):
+            txt += f' ({samples[n]:,} samples)'
+        parts.append(txt)
+    if len(comps) > int(max_components):
+        parts.append(f'... +{len(comps) - int(max_components)} more components')
+    return ', '.join(parts)
+
+
+def overlap_connectivity_warning_lines(conn: dict, space_label: str,
+                                       warning_prefix: str = '') -> list:
+    """HIGH-severity warning text (zero or one line) for a split overlap graph.
+
+    Wording is load-bearing: gareus_report.py's ``_WARN_RULES`` matches
+    "overlap graph is DISCONNECTED" to classify this HIGH (an unmatched warning
+    silently defaults to MEDIUM, i.e. hidden from the terminal health block),
+    and the per-component sample counts are in the line itself because that is
+    the number that distinguishes small-N joint-histogram deflation from a real
+    physical gap.
+    """
+    if not conn.get('available', True):
+        return []
+    n = int(conn.get('n_components') or 0)
+    if n <= 1:
+        return []
+    best = conn.get('worst_component_best_cross_overlap')
+    iso = conn.get('most_isolated_component')
+    best_txt = ''
+    if best is not None:
+        iso_txt = (f' ({overlap_component_text({"components": [iso]})})'
+                   if iso else '')
+        best_txt = (f'The most isolated component{iso_txt} has at most '
+                    f'{float(best):.4f} overlap with anything outside it. ')
+    return [
+        f'{warning_prefix}Umbrella overlap graph is DISCONNECTED in the {space_label} space: '
+        f'{n} components at overlap >= {float(conn.get("threshold", 0.0)):.3f} -- '
+        f'{overlap_component_text(conn)}. {best_txt}MBAR fixes free energies only up to one '
+        f'additive constant per connected component, so every cross-component free-energy '
+        f'difference (the PMF span included) rests on nothing but that one link; on chignolin_6 '
+        f'the equivalent number was 0.0008 and it left f_k unconstrained, parking 94% of the '
+        f'posterior on a single state. No worst-pair overlap number can show this -- every graded '
+        f'pair can clear the threshold while the set stays split. Closing it needs bridging '
+        f'windows or softer restraints between the components, i.e. new sampling, not '
+        f're-analysis. See docs/chignolin_6_low_ess_root_cause.md.']
+
+
 def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.ndarray,
                                    kbt_kcal: float, out: Path, warnings: list,
                                    progress: Optional['Progress'], warning_prefix: str = '',
@@ -687,11 +1248,227 @@ def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.nd
         if _force_method in ('gamd_exponential', 'gamd_cumulant2', 'gamd_cumulant3') and not boost_ok:
             warnings.append(f'{warning_prefix}--selected-method {_force_method} requested but no usable GaMD boost; it equals umbrella-only here.')
         selected = _force_method
+    # --- window overlap ----------------------------------------------------
+    # FIX A5 (docs/chignolin_6_low_ess_root_cause.md, secondary finding #1):
+    # the overlap diagnostic was the primary-CV MARGINAL only. On that run 20 of
+    # 27 states shared just two primary centres and differed only in the
+    # secondary CV, where centre spacing / sigma was 2.6-9.3 -- essentially
+    # disjoint -- yet the marginal diagnostic reported 0.6-0.99 and the health
+    # check declared window overlap fine. It was structurally unable to see the
+    # axis that had failed.
+    #
+    # The joint (CV1, CV2) overlap therefore has to exist. It is published
+    # ALONGSIDE the marginal, never in place of it, and this is not tidiness:
+    #
+    #  * Every historical key/column/file keeps carrying the marginal number.
+    #    `neighbor_overlap`, `overlap_matrix.csv`, `overlap_matrix.png` and
+    #    window_diagnostics.csv's overlap_left/overlap_right have meant "CV1
+    #    marginal" for the whole life of this pipeline; silently switching the
+    #    *space* of an existing key makes two runs analysed either side of the
+    #    change incomparable with nothing on disk to tell them apart.
+    #  * Joint overlap is bounded above by the CV1 marginal (a refinement of the
+    #    histogram can only reduce sum_c min(p_c, q_c)) and deflates further at
+    #    small per-state N. So --min-neighbor-overlap 0.30, calibrated against
+    #    marginal numbers, is simply not a threshold for it: reusing it would
+    #    have flipped already-published 2D runs' PASS/CAUTION/FAIL verdicts on
+    #    data that had not changed. The joint number gets its own threshold
+    #    (see _joint_threshold below) and its own distinctly-worded warning.
+    #
+    # "Is this a 2D run" cannot be a `d.cv2 is None` test: Data.cv2 is
+    # non-Optional and is a NaN-filled column for a CV1-only run (CLAUDE.md,
+    # 2026-08-15). It also cannot be "does cv2 have finite values", since cv2 is
+    # sometimes recorded as a plain observable with no restraint on it at all --
+    # overlapping in an unbiased axis would report a gap the sampler was never
+    # asked to bridge. Both conditions must hold: real cv2 samples AND at least
+    # one window carrying a real secondary restraint.
+    _sec_centers, _sec_ks = _secondary_window_params(d.meta, K)
+    _n_total = int(d.cv.size)
+    _cv2_finite_frac = (float(np.count_nonzero(np.isfinite(d.cv2))) / _n_total) if _n_total else 0.0
+    _has_secondary_restraint = bool(np.any(np.isfinite(_sec_centers) & np.isfinite(_sec_ks) & (_sec_ks > 0.0)))
+    _is_2d_run = _cv2_finite_frac > 0.0 and _has_secondary_restraint
+
+    # The reported matrix: the CV1 marginal, via the untouched 4-argument call,
+    # so it is bit-identical to what every previous release produced.
     O = _agm.overlap_matrix(d.cv, d.window, bins, K)
+
+    # Should the joint matrix be built at all, and why not if not? The reason
+    # string is published (joint_overlap['reason']) rather than only warned
+    # about, so an absent joint number is never just an absence.
+    _joint_disabled = bool(getattr(args, 'no_joint_overlap', False))
+    _bins2 = None
+    _joint_reason = ''
+    if _joint_disabled:
+        _joint_reason = 'disabled by --no-joint-overlap'
+    elif not _is_2d_run:
+        _joint_reason = ('this run has no biased second axis: no window carries a finite positive '
+                         'secondary restraint constant, and/or no sample has a finite secondary CV')
+    elif _cv2_finite_frac < OVERLAP_CV2_MIN_RETAINED_FRACTION:
+        # Gate on the cv2-specific retention, not on overlap_matrix's combined
+        # retained_fraction: that number also drops samples outside the PRIMARY
+        # bin range, so it can fall below the threshold for reasons that have
+        # nothing to do with the secondary CV and skip the joint matrix for the
+        # wrong reason.
+        _joint_reason = (f'only {_cv2_finite_frac*100:.1f}% of samples carry a finite secondary CV '
+                         f'(below {OVERLAP_CV2_MIN_RETAINED_FRACTION*100:.0f}%), so a joint matrix '
+                         f'would describe a minority of the population while looking exactly as '
+                         f'authoritative as the marginal one')
+    else:
+        _bins2 = make_overlap_bins(d.cv2)
+        if _bins2 is None:
+            # make_overlap_bins returned None: fewer than two distinct finite
+            # cv2 values, i.e. a secondary axis with no information to overlap
+            # on.
+            _joint_reason = ('the secondary CV has fewer than two distinct finite values, so there '
+                             'is no secondary range to overlap in')
+
+    _ostats: dict = {}
+    O_joint = None
+    if _bins2 is not None:
+        O_joint = _agm.overlap_matrix(d.cv, d.window, bins, K, cv2=d.cv2, bins2=_bins2,
+                                      stats=_ostats)
+        if int(_ostats.get('dim', 1)) != 2:
+            # Defensive: overlap_matrix falls back to the marginal on a wholly
+            # non-finite cv2. The retention gate above already excludes that,
+            # but never publish a matrix under the joint label without the
+            # function itself confirming which space it computed.
+            O_joint = None
+            _joint_reason = 'overlap_matrix fell back to the CV1 marginal (no finite secondary-CV sample)'
+
+    # The joint threshold. Default: the marginal target applied independently on
+    # each axis (thr ** dim), i.e. "as well resolved on both axes as
+    # --min-neighbor-overlap asks for on one". 0.30 marginal corresponds to
+    # centre spacing ~2.1 sigma on a Gaussian pair, so 0.09 joint asks for that
+    # same per-axis quality in 2D -- a derived number, not the marginal number
+    # reused. Overridable outright with --min-joint-neighbor-overlap.
+    _marg_thr = float(getattr(args, 'min_neighbor_overlap', 0.30))
+    _joint_thr_override = getattr(args, 'min_joint_neighbor_overlap', None)
+    _joint_thr = (float(_joint_thr_override) if _joint_thr_override is not None
+                  else _marg_thr ** 2)
+
+    if _is_2d_run and O_joint is None and not _joint_disabled:
+        warnings.append(
+            f'{warning_prefix}Joint (CV1, CV2) window overlap was NOT computed: {_joint_reason}. '
+            f'The reported window overlap is the CV1 marginal, which CANNOT see a secondary-CV gap '
+            f'-- the exact blindness that let chignolin_6 report 0.6-0.99 overlap for essentially '
+            f'disjoint states. See docs/chignolin_6_low_ess_root_cause.md.')
+    elif _is_2d_run and _joint_disabled:
+        warnings.append(
+            f'{warning_prefix}Joint (CV1, CV2) window overlap is disabled by --no-joint-overlap; the '
+            f'reported overlap is the CV1 marginal, which cannot see a secondary-CV gap.')
+    elif O_joint is not None and _cv2_finite_frac < OVERLAP_CV2_WARN_RETAINED_FRACTION:
+        # Deliberately left to gareus_report's MEDIUM default: the joint number
+        # IS usable here (>= half the population), this is a caveat on its
+        # coverage, not a defect that biases the PMF.
+        warnings.append(
+            f'{warning_prefix}Joint (CV1, CV2) window overlap was computed from '
+            f'{_cv2_finite_frac*100:.1f}% of samples; the rest have no finite secondary CV (e.g. a '
+            f'mid-campaign secondary-CV regime switch) and are excluded, never binned as 0.0.')
+
+    n_k_local, _mean_per_window, _std_per_window = _window_cv_mean_std(d.window, d.cv, K)
+    _has_samples = n_k_local > 0
+
+    # Consecutive-index neighbour overlap, CV1 marginal. KEPT as-is (same key,
+    # same formula, same threshold, same wording): other code and every
+    # historical pmf_summary.json read it, and re-analysing an old run must not
+    # invent new warnings. It is no longer the headline number -- see the
+    # CV-space block below for why.
     neigh = [float(O[i, i + 1]) for i in range(K - 1)]
     bad = [i for i, x in enumerate(neigh) if x < args.min_neighbor_overlap]
     if bad:
         warnings.append(f'{warning_prefix}Weak neighbor CV overlap below %.2f for pairs: ' % args.min_neighbor_overlap + ', '.join(f'{i}-{i + 1} ({neigh[i]:.2f})' for i in bad))
+
+    # FIX A6: the same worst-overlap question asked of each state's true nearest
+    # neighbour in (primary, secondary) restraint-centre space. The index-order
+    # version above reported "worst 0.013 (pair 23-24)" on the real run and sent
+    # the investigation at state 24, which was innocent and well overlapped --
+    # 23 and 24 are simply adjacent in the index, not in CV space.
+    def _weak_pairs(rows, thr):
+        """Unique {(lo, hi): overlap} pairs below ``thr``, ascending by index."""
+        return sorted({(min(r['window'], r['neighbor']), max(r['window'], r['neighbor'])): r['overlap']
+                       for r in rows if r['overlap'] < thr}.items())
+
+    cv_neigh = cv_space_neighbor_overlap(O, d.centers, d.k_kcal, _sec_centers, _sec_ks,
+                                         kbt_kcal, n_k=n_k_local)
+    _cv_neigh_by_window = {int(r['window']): r for r in cv_neigh}
+    _cv_bad_pairs = _weak_pairs(cv_neigh, _marg_thr)
+    if _cv_bad_pairs:
+        warnings.append(
+            f'{warning_prefix}Weak CV-space nearest-neighbour overlap below '
+            f'%.2f (CV1 marginal) for pairs: ' % _marg_thr
+            + ', '.join(f'{i}-{j} ({x:.2f})' for (i, j), x in _cv_bad_pairs)
+            + '. These are nearest neighbours in restraint-centre space (sigma units), not index '
+              'neighbours; a weak pair here is a genuinely unbridged gap.')
+
+    # The joint block: same two pairings (index-adjacent and CV-space nearest
+    # neighbour) recomputed on the joint matrix, published under their own key
+    # and gated by their own threshold.
+    joint_info: dict = {'available': False, 'reason': _joint_reason,
+                        'space': OVERLAP_SPACE_JOINT, 'threshold': _joint_thr,
+                        'secondary_cv_finite_fraction': _cv2_finite_frac}
+    cv_neigh_joint: list = []
+    if O_joint is not None:
+        cv_neigh_joint = cv_space_neighbor_overlap(O_joint, d.centers, d.k_kcal, _sec_centers,
+                                                  _sec_ks, kbt_kcal, n_k=n_k_local)
+        _joint_bad_pairs = _weak_pairs(cv_neigh_joint, _joint_thr)
+        if _joint_bad_pairs:
+            warnings.append(
+                f'{warning_prefix}Weak joint (CV1, CV2) nearest-neighbour overlap below '
+                f'%.3f for pairs: ' % _joint_thr
+                + ', '.join(f'{i}-{j} ({x:.3f})' for (i, j), x in _joint_bad_pairs)
+                + f'. Measured in the full (CV1, CV2) histogram, so unlike the CV1-marginal number '
+                  f'this sees a secondary-CV gap; the target is --min-neighbor-overlap '
+                  f'({_marg_thr:.2f}) applied on both axes, NOT the marginal target itself.')
+        _worst_joint = min(cv_neigh_joint, key=lambda r: r['overlap']) if cv_neigh_joint else None
+        joint_info.update({
+            'available': True, 'reason': '', 'dim': int(_ostats.get('dim', 2)),
+            'neighbor_overlap': [float(O_joint[i, i + 1]) for i in range(K - 1)],
+            'cv_space_neighbor_overlap': cv_neigh_joint,
+            'worst_cv_space_pair': (dict(_worst_joint) if _worst_joint else None),
+            'weak_cv_space_pairs': [{'window': i, 'neighbor': j, 'overlap': float(x)}
+                                    for (i, j), x in _joint_bad_pairs],
+            'stats': dict(_ostats),
+            'files': {'overlap_matrix_joint_csv': str(out / 'overlap_matrix_joint.csv')},
+        })
+    _joint_by_window = {int(r['window']): r for r in cv_neigh_joint}
+
+    # ROUND-3 FINDING 1, deeper half: grade CONNECTIVITY, not only the worst
+    # pair. Every overlap number above this point is pairwise, and a pairwise
+    # statistic structurally cannot see the failure this whole investigation is
+    # about -- MBAR fixes free energies only up to one additive constant per
+    # connected component of the overlap graph, so a split set has undetermined
+    # offsets between its blocks no matter how good each graded pair looks. See
+    # overlap_components() for the full argument and for the real-run numbers.
+    #
+    # Computed in BOTH spaces, each against its own threshold, because neither
+    # implies the other: joint overlap is bounded above by the marginal, while
+    # the joint THRESHOLD (0.09 by default) is below the marginal one (0.30).
+    # On chignolin_6's real 27-state matrices the marginal graph is fully
+    # connected at 0.30 and the joint graph splits into 3 components at 0.09
+    # ([18] 3,410 samples | [20] 6,030 | the other 25 states 117,030), so a
+    # marginal-only connectivity check would be silent on the very run it was
+    # written for.
+    _conn_marginal = overlap_components(O, _marg_thr, n_k=n_k_local)
+    _conn_marginal.update({'space': OVERLAP_SPACE_MARGINAL, 'available': True, 'reason': ''})
+    if O_joint is not None:
+        _conn_joint = overlap_components(O_joint, _joint_thr, n_k=n_k_local)
+        _conn_joint.update({'space': OVERLAP_SPACE_JOINT, 'available': True, 'reason': ''})
+    else:
+        # Never hand back only the marginal's clean bill of health: an absent
+        # joint component count means the connectivity is blind on exactly the
+        # axis that failed on the real run, so it carries the reason with it
+        # (the same string joint_overlap['reason'] publishes) and
+        # gareus_report's check reports it as unknown rather than as connected.
+        _conn_joint = {'space': OVERLAP_SPACE_JOINT, 'available': False,
+                       'reason': (_joint_reason
+                                  or 'the joint (CV1, CV2) overlap matrix was not computed'),
+                       'threshold': _joint_thr, 'n_states_graded': 0, 'n_components': 0,
+                       'components': [], 'component_samples': [],
+                       'excluded_unsampled_states': []}
+    connectivity = {'marginal': _conn_marginal, 'joint': _conn_joint}
+    warnings.extend(overlap_connectivity_warning_lines(
+        _conn_marginal, 'CV1-marginal', warning_prefix))
+    warnings.extend(overlap_connectivity_warning_lines(
+        _conn_joint, 'joint (CV1, CV2)', warning_prefix))
     sel = pmfs[selected]
     finite = sel['pmf'][np.isfinite(sel['pmf'])]
     span = float(np.max(finite) - np.min(finite)) if finite.size else float('nan')
@@ -730,27 +1507,140 @@ def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.nd
     _agm.write_pmf(out / 'pmf_gamd_cumulant2.csv', cum_pmf, 'gamd_cumulant2', {'boost_mean_kj_mol': cdiag.get('boost_mean_kj', np.full(args.bins, np.nan)), 'boost_var_kj2_mol2': cdiag.get('boost_var_kj2', np.full(args.bins, np.nan))})
     _agm.write_pmf(out / 'pmf_gamd_cumulant3.csv', cum3_pmf, 'gamd_cumulant3', {'boost_mean_kj_mol': cdiag3.get('boost_mean_kj', np.full(args.bins, np.nan)), 'boost_var_kj2_mol2': cdiag3.get('boost_var_kj2', np.full(args.bins, np.nan))})
     _agm.write_all(out / 'pmf_all_methods.csv', pmfs)
-    with (out / 'overlap_matrix.csv').open('w', newline='') as f:
-        wr = csv.writer(f); wr.writerow(['window'] + list(range(K))); [wr.writerow([i] + [float(x) for x in O[i]]) for i in range(K)]
-    n_k_local, _mean_per_window, _std_per_window = _window_cv_mean_std(d.window, d.cv, K)
-    _has_samples = n_k_local > 0
+    # Both matrices carry a leading `#` comment line naming the space their
+    # numbers are in. This is the only thing on disk that distinguishes a
+    # CV1-marginal overlap from a joint one -- they are the same shape, the same
+    # scale and the same file name otherwise. Readers must therefore pass
+    # comment='#' (pandas) or rely on the default `#` skipping (np.loadtxt); the
+    # `window,0,1,...` header row itself is unchanged and still the second line.
+    def _write_overlap_csv(path: Path, mat, stamp: str):
+        with path.open('w', newline='') as f:
+            f.write(f'# {stamp}\n')
+            wr = csv.writer(f)
+            wr.writerow(['window'] + list(range(K)))
+            for i in range(K):
+                wr.writerow([i] + [float(x) for x in mat[i]])
+
+    _write_overlap_csv(
+        out / 'overlap_matrix.csv', O,
+        f'overlap space: CV1 marginal ({len(bins) - 1} primary bins); pairwise '
+        f'histogram-intersection overlap of the primary CV only. This CANNOT see a '
+        f'secondary-CV gap: for the joint (CV1, CV2) overlap see overlap_matrix_joint.csv '
+        f'(written only when this run has a biased second axis). '
+        f'docs/chignolin_6_low_ess_root_cause.md')
+    if O_joint is not None:
+        _write_overlap_csv(
+            out / 'overlap_matrix_joint.csv', O_joint,
+            f'overlap space: joint (CV1, CV2) 2D histogram '
+            f'({_ostats.get("n_bins_primary", len(bins) - 1)} x '
+            f'{_ostats.get("n_bins_secondary", 0)} bins), computed from '
+            f'{_cv2_finite_frac*100:.1f}% of samples (the rest have no finite secondary CV and are '
+            f'excluded, never binned as 0.0). Bounded above by the CV1 marginal in '
+            f'overlap_matrix.csv, so it is NOT comparable with --min-neighbor-overlap '
+            f'({_marg_thr:.2f}); its target is {_joint_thr:.3f}. '
+            f'docs/chignolin_6_low_ess_root_cause.md')
+    # FIX A4: per-state self-bias -- each state's own samples scored in its own
+    # restraint. See self_bias_diagnostics() for why ~1 kT is the only physical
+    # answer and why this is the one check that would have caught the whole
+    # chignolin_6 mis-mapping on its own.
+    self_bias = self_bias_diagnostics(d.u_nk, d.window, K)
+    warnings.extend(self_bias_warning_lines(self_bias, warning_prefix))
+
+    # FIX A12: observed per-window secondary CV. Computed over the cv2-FINITE
+    # rows only -- _window_cv_mean_std propagates NaN across a whole window if
+    # any sample in it is non-finite, which for a partially-null cv2 column
+    # (routine after a secondary-CV regime switch) would blank every window.
+    _cv2_finite_mask = np.isfinite(d.cv2)
+    _n_k_cv2, _cv2_mean_per_window, _cv2_std_per_window = _window_cv_mean_std(
+        d.window[_cv2_finite_mask], d.cv2[_cv2_finite_mask], K)
+    _has_cv2 = _n_k_cv2 > 0
+
+    def _f(arr, k, ok=True):
+        """CSV cell: the float, or '' for absent/non-finite (the writer's
+        existing convention -- never the string 'nan')."""
+        return float(arr[k]) if (ok and k < len(arr) and np.isfinite(arr[k])) else ''
+
     with (out / 'window_diagnostics.csv').open('w', newline='') as f:
-        wr = csv.DictWriter(f, fieldnames=['window', 'center_A', 'k_kcal_mol_A2', 'samples', 'cv_mean_A', 'cv_std_A', 'overlap_left', 'overlap_right']); wr.writeheader()
+        # New columns (2026-08-25): the SECONDARY restraint and its observed
+        # spread (A12 -- the axis that actually failed on chignolin_6 was
+        # completely invisible to the operator here), per-state self-bias (A4),
+        # and each window's CV-space nearest neighbour with that pair's overlap
+        # in BOTH spaces (A6).
+        #
+        # overlap_left/overlap_right keep their historical meaning exactly:
+        # index-adjacent, CV1 marginal. Every new overlap column names its own
+        # space instead, because marginal and joint overlaps are the same shape
+        # and scale and are otherwise indistinguishable once written out --
+        # cv_space_overlap_joint is blank for a run with no biased second axis
+        # (or with --no-joint-overlap).
+        wr = csv.DictWriter(f, fieldnames=[
+            'window', 'center_A', 'k_kcal_mol_A2', 'secondary_center', 'secondary_k_kcal_mol',
+            'samples', 'cv_mean_A', 'cv_std_A', 'cv2_mean', 'cv2_std',
+            'self_bias_median_kT', 'self_bias_p90_kT',
+            'overlap_left', 'overlap_right', 'cv_space_neighbor',
+            'cv_space_overlap_marginal', 'cv_space_overlap_joint'])
+        wr.writeheader()
         for k in range(K):
-            wr.writerow({'window': k, 'center_A': float(d.centers[k]) if k < d.centers.size and np.isfinite(d.centers[k]) else '', 'k_kcal_mol_A2': float(d.k_kcal[k]) if k < d.k_kcal.size and np.isfinite(d.k_kcal[k]) else '', 'samples': int(n_k_local[k]), 'cv_mean_A': float(_mean_per_window[k]) if _has_samples[k] else '', 'cv_std_A': float(_std_per_window[k]) if _has_samples[k] else '', 'overlap_left': float(O[k - 1, k]) if k > 0 else '', 'overlap_right': float(O[k, k + 1]) if k + 1 < K else ''})
+            _cvn = _cv_neigh_by_window.get(k)
+            wr.writerow({'window': k,
+                         'center_A': _f(d.centers, k),
+                         'k_kcal_mol_A2': _f(d.k_kcal, k),
+                         'secondary_center': _f(_sec_centers, k),
+                         'secondary_k_kcal_mol': _f(_sec_ks, k),
+                         'samples': int(n_k_local[k]),
+                         'cv_mean_A': _f(_mean_per_window, k, _has_samples[k]),
+                         'cv_std_A': _f(_std_per_window, k, _has_samples[k]),
+                         'cv2_mean': _f(_cv2_mean_per_window, k, _has_cv2[k]),
+                         'cv2_std': _f(_cv2_std_per_window, k, _has_cv2[k]),
+                         'self_bias_median_kT': _f(self_bias['median_kT'], k),
+                         'self_bias_p90_kT': _f(self_bias['p90_kT'], k),
+                         'overlap_left': float(O[k - 1, k]) if k > 0 else '',
+                         'overlap_right': float(O[k, k + 1]) if k + 1 < K else '',
+                         'cv_space_neighbor': _cvn['neighbor'] if _cvn else '',
+                         'cv_space_overlap_marginal': f"{_cvn['overlap']:.6f}" if _cvn else '',
+                         'cv_space_overlap_joint': (f"{_joint_by_window[k]['overlap']:.6f}"
+                                                    if k in _joint_by_window else '')})
     if progress is not None:
         progress.bar('analysis stages', 5, 6, 'plotting PNG outputs', force=True)
     _agm.plot_outputs(d, pmfs, selected, O, out, warnings, smooth_sigma=_agm._eff_smooth(args, 'pmf_smooth_sigma'), args=args)
     return {
         'pmfs': pmfs, 'selected': selected, 'boost_ok': boost_ok, 'boost': bs,
         'pmf_span_kcal_mol': span, 'pmf_minimum_cv_A': float(sel['cv_A'][minidx]) if minidx >= 0 else None,
+        # 'neighbor_overlap' and 'O' are the historical consecutive-INDEX array
+        # and matrix, both CV1-MARGINAL, unchanged in space, formula and
+        # threshold (see the overlap block above for why that continuity is
+        # load-bearing). 'overlap_space' stamps that fact into
+        # pmf_summary.json so it is never again inferable only from which
+        # commit the analysis ran at.
+        #
+        # 'cv_space_neighbor_overlap' is the marginal matrix re-paired by true
+        # CV-space adjacency; 'joint_overlap' carries the (CV1, CV2) numbers
+        # with their own threshold. gareus_report.build_health_verdict consumes
+        # both and takes the worse -- joint overlap is bounded above by the
+        # marginal, so neither implies the other.
+        #
+        # EVERY key below must be propagated into pmf_summary.json by
+        # analyze_gareus_mbar._report_summary_fields(); round 1 added them here
+        # and never edited analyze()'s summary literal, so the health verdict
+        # silently kept using the index-adjacency fallback on real runs.
         'neighbor_overlap': neigh, 'n_samples': N, 'O': O,
+        'overlap_space': OVERLAP_SPACE_MARGINAL,
+        'cv_space_neighbor_overlap': cv_neigh,
+        'self_bias': self_bias,
+        'joint_overlap': joint_info,
+        # Connectivity of the whole overlap graph, both spaces (see the
+        # overlap_components() call above). This is the only key here that
+        # can express "MBAR has no information linking these two blocks of
+        # states"; every other overlap key is pairwise and cannot.
+        'overlap_connectivity': connectivity,
+        'secondary_cv_finite_fraction': _cv2_finite_frac,
         'pmf_uncertainty_std': pmf_uncertainty_std,
         'files': {
             'pmf_unbiased_csv': str(out / 'pmf_unbiased.csv'), 'pmf_all_methods_csv': str(out / 'pmf_all_methods.csv'),
             'pmf_umbrella_only_csv': str(out / 'pmf_umbrella_only.csv'), 'pmf_gamd_exponential_csv': str(out / 'pmf_gamd_exponential.csv'),
             'pmf_gamd_cumulant2_csv': str(out / 'pmf_gamd_cumulant2.csv'), 'pmf_gamd_cumulant3_csv': str(out / 'pmf_gamd_cumulant3.csv'),
             'overlap_matrix_csv': str(out / 'overlap_matrix.csv'), 'window_diagnostics_csv': str(out / 'window_diagnostics.csv'),
+            **(joint_info.get('files') or {}),
         },
     }
 

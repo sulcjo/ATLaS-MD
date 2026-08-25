@@ -4688,6 +4688,51 @@ def _analyze_epoch_cv_exploration(prod_dir: Path, out: Path, meta: dict, warn: l
     return {'available': True, 'n_epochs': n, 'is_2d': is_2d, 'adaptive_dir': str(ap), 'files': generated}
 
 
+# Every field of a run_pmf_and_gamd_boost_report() result that has to reach
+# pmf_summary.json, in ONE place.
+#
+# This exists because of a real, shipped failure: the 2026-08-25 mapping-sanity
+# work added cv_space_neighbor_overlap / self_bias / joint_overlap to that
+# function's return value and never edited analyze()'s s={...} literal, so none
+# of it reached pmf_summary.json at all -- build_health_verdict fell straight
+# back to the index-adjacency branch the change existed to replace, on every
+# real run, while the new unit tests stayed green against hand-built dicts. A
+# literal beside a helper can go stale again; a helper that is the SOLE
+# constructor of these fields cannot, and it is also what keeps the main report
+# and the epoch_000 report publishing the same shape.
+#
+# Nothing here computes anything: it is a rename/select pass over values the
+# report already produced.
+def _report_summary_fields(report_info: dict) -> dict:
+    """The pmf_summary.json fields derived from one PMF/GaMD-boost report."""
+    return {
+        'selected_unbiased_method': report_info['selected'],
+        'pmf_span_kcal_mol': report_info['pmf_span_kcal_mol'],
+        'pmf_minimum_cv_A': report_info['pmf_minimum_cv_A'],
+        'boost': report_info['boost'],
+        # CV1-MARGINAL, consecutive-index -- unchanged in space, formula and
+        # threshold since long before the joint overlap existed, so historical
+        # runs stay comparable. 'overlap_space' stamps that into the summary.
+        'neighbor_overlap': report_info['neighbor_overlap'],
+        'overlap_space': report_info['overlap_space'],
+        # The same marginal matrix re-paired by true CV-space adjacency (index
+        # adjacency sent the chignolin_6 investigation at an innocent window),
+        # plus the joint (CV1, CV2) numbers under their own key and their own
+        # threshold, and the per-state self-bias that would have caught the
+        # whole root-cause bug on its own.
+        'cv_space_neighbor_overlap': report_info['cv_space_neighbor_overlap'],
+        'joint_overlap': report_info['joint_overlap'],
+        # Connectivity of the whole overlap graph in both spaces. Distinct in
+        # kind from every other overlap field here, which are all pairwise: a
+        # split overlap graph means MBAR never determined the free-energy
+        # offset between the blocks, and no worst-pair number can say that
+        # (gareus.mbar_analysis.pmf.overlap_components).
+        'overlap_connectivity': report_info['overlap_connectivity'],
+        'self_bias': report_info['self_bias'],
+        'secondary_cv_finite_fraction': report_info['secondary_cv_finite_fraction'],
+    }
+
+
 def analyze(d,args, progress: Optional[Progress] = None):
     out=d.out_dir; out.mkdir(parents=True,exist_ok=True); N,K=d.u_nk.shape; kbt_kj=1.0/d.beta; kbt_kcal=kbt_kj/KJ_PER_KCAL; warn=list(d.meta.get('load_notes',[]))
     if progress is not None: progress.step('analysis', f'loaded {N} samples across {K} windows from {d.source}')
@@ -4739,7 +4784,10 @@ def analyze(d,args, progress: Optional[Progress] = None):
     if progress is not None: progress.bar('analysis stages', 3, 6, 'overlap diagnostics', force=True)
     main_report_info=run_pmf_and_gamd_boost_report(d_main,args,logw_main,bins,kbt_kcal,out,warn,progress,precomputed_base_w=main_precomputed_base_w)
     pmfs=main_report_info['pmfs']; selected=main_report_info['selected']; boost_ok=main_report_info['boost_ok']
-    bs=main_report_info['boost']; O=main_report_info['O']; neigh=main_report_info['neighbor_overlap']
+    # 'neighbor_overlap' is no longer unpacked here: every field of this report
+    # that reaches pmf_summary.json now goes through _report_summary_fields()
+    # exactly once (see its comment), so there is no local copy to leave behind.
+    bs=main_report_info['boost']; O=main_report_info['O']
     span=main_report_info['pmf_span_kcal_mol']; sel=pmfs[selected]
 
     if progress is not None: progress.bar('analysis stages', 4, 6, 'writing CSV outputs', force=True)
@@ -4766,12 +4814,15 @@ def analyze(d,args, progress: Optional[Progress] = None):
     epoch_conv_info={}
     if d_main.meta.get('_epoch_source'):
         epoch_conv_info=run_epoch_pmf_convergence(d_main,args,bins,selected,sel,out,progress=progress,f_init_hint=m.get('f_k'))
-    s={'production_dir':str(d.prod_dir),'output_dir':str(out),'source':d.source,'n_samples':int(N),'n_windows':int(K),'temperature_K':float(d.temp),'beta_1_over_kj_mol':float(d.beta),'cv_min_A':float(np.nanmin(d.cv)),'cv_max_A':float(np.nanmax(d.cv)),'primary_cv_units':_primary_cv_units(d.meta),'primary_cv_axis_label':_primary_cv_axis_label(d.meta),'selected_unbiased_method':selected,'pmf_span_kcal_mol':span,'pmf_minimum_cv_A':main_report_info['pmf_minimum_cv_A'],'mbar':{'converged':bool(m['converged']),'iterations':int(m['iterations']),'max_delta':float(m['max_delta']),'backend':m.get('backend','unknown'),'threads':m.get('threads',None),'active_states':[int(x) for x in m['active']],'n_k':[int(x) for x in m['n_k']],'base_ess':float(ess(base_w))},'boost':bs,'neighbor_overlap':neigh,'warnings':warn,'files':{**main_report_info['files'],'summary_md':str(out/'pmf_summary.md'),'summary_json':str(out/'pmf_summary.json')}}
+    s={'production_dir':str(d.prod_dir),'output_dir':str(out),'source':d.source,'n_samples':int(N),'n_windows':int(K),'temperature_K':float(d.temp),'beta_1_over_kj_mol':float(d.beta),'cv_min_A':float(np.nanmin(d.cv)),'cv_max_A':float(np.nanmax(d.cv)),'primary_cv_units':_primary_cv_units(d.meta),'primary_cv_axis_label':_primary_cv_axis_label(d.meta),**_report_summary_fields(main_report_info),'mbar':{'converged':bool(m['converged']),'iterations':int(m['iterations']),'max_delta':float(m['max_delta']),'backend':m.get('backend','unknown'),'threads':m.get('threads',None),'active_states':[int(x) for x in m['active']],'n_k':[int(x) for x in m['n_k']],'base_ess':float(ess(base_w))},'warnings':warn,'files':{**main_report_info['files'],'summary_md':str(out/'pmf_summary.md'),'summary_json':str(out/'pmf_summary.json')}}
     if epoch0_report_info is not None:
+        # Same fields as the main block, from the same single source, so the two
+        # can never drift apart (and so a reader can compare the two regimes
+        # field by field). The health verdict still grades the MAIN report only,
+        # as it does for every other headline number here.
         s['epoch_000_report']={'available':True,'reason':'epoch_000 excluded from the main PMF/GaMD-boost report above; this covers epoch_000 only',
-                               'n_samples':epoch0_report_info['n_samples'],'selected_unbiased_method':epoch0_report_info['selected'],
-                               'pmf_span_kcal_mol':epoch0_report_info['pmf_span_kcal_mol'],'pmf_minimum_cv_A':epoch0_report_info['pmf_minimum_cv_A'],
-                               'boost':epoch0_report_info['boost'],'neighbor_overlap':epoch0_report_info['neighbor_overlap'],
+                               'n_samples':epoch0_report_info['n_samples'],
+                               **_report_summary_fields(epoch0_report_info),
                                'files':epoch0_report_info['files']}
         s['files'].update({f'epoch_000_{k}':v for k,v in epoch0_report_info['files'].items()})
     else:
@@ -4820,7 +4871,22 @@ def parse_args(argv=None):
     p.add_argument('--bins', type=int, default=60)
     p.add_argument('--cv-min', type=float, default=None)
     p.add_argument('--cv-max', type=float, default=None)
-    p.add_argument('--min-neighbor-overlap', type=float, default=0.30)
+    p.add_argument('--min-neighbor-overlap', type=float, default=0.30,
+                   help='Target window-overlap for the CV1-MARGINAL neighbour diagnostic (both the '
+                        'consecutive-index pairing and the CV-space nearest-neighbour pairing). '
+                        'Historical threshold, unchanged; see --min-joint-neighbor-overlap for the '
+                        'joint (CV1, CV2) target.')
+    p.add_argument('--min-joint-neighbor-overlap', type=float, default=None,
+                   help='Target overlap for the JOINT (CV1, CV2) neighbour diagnostic. Default: '
+                        '--min-neighbor-overlap squared (0.09), i.e. the same per-axis resolution '
+                        'asked of both axes. Joint overlap is bounded above by the CV1 marginal and '
+                        'deflates further at small per-state N, so --min-neighbor-overlap is NOT a '
+                        'valid threshold for it.')
+    p.add_argument('--no-joint-overlap', action='store_true',
+                   help='Do not compute the joint (CV1, CV2) window-overlap matrix; report and grade '
+                        'the CV1 marginal only (pre-2026-08-25 behaviour). The marginal cannot see a '
+                        'secondary-CV gap -- the blindness that hid the chignolin_6 mis-mapping for a '
+                        'whole campaign (docs/chignolin_6_low_ess_root_cause.md).')
     p.add_argument('--pmf-uncertainty', action='store_true', help='Compute per-bin statistical uncertainty (std, kcal/mol) for the selected/headline PMF via a fixed-f_k block bootstrap (blocks = one replica within one epoch/phase). Off by default: adds real compute cost (roughly n_boot resample-and-rebuild passes) with no MBAR re-solve.')
     p.add_argument('--pmf-uncertainty-n-boot', type=int, default=100, help='Number of block-bootstrap replicates for --pmf-uncertainty. Higher is more precise but slower; below ~20 the uncertainty-of-the-uncertainty is itself noisy.')
     p.add_argument('--pmf-uncertainty-seed', type=int, default=0, help='Seed for --pmf-uncertainty block resampling, for reproducible error bars across runs.')

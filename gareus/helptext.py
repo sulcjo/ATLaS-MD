@@ -1251,6 +1251,52 @@ friendly to MBAR/PMF workflows, while retaining enough metadata to diagnose bad
 window overlap before pretending the PMF is meaningful.  Science: proudly turning
 uncertainty into files with names.
 
+14. Stale window maps after --us-auto-drop-bad-windows
+------------------------------------------------------
+`--us-auto-drop-bad-windows` prunes umbrella windows after the pull stage and
+reindexes every window-indexed array around the survivors (0..N-1).  Each
+adaptive-production phase also writes an
+
+    adaptive_production/<phase>/epoch_window_map.csv
+
+that maps that phase's local window index to the persistent state_id.  That map
+is written from the state registry *before* the drop, and the drop is recorded
+only in the phase's own `gareus_metadata.json` -- so on affected runs the map
+still lists every state as if nothing had been pruned, and every local window
+index at or after the first dropped one names the wrong state.
+
+Consequence if trusted: samples are attributed to an umbrella state they were
+never restrained in, so their bias energies are fabricated (up to ~2000 kT per
+sample on the run this was found on), MBAR's base ESS collapses, and the PMF is
+worthless.  Full writeup, with the per-phase numbers:
+
+    docs/chignolin_6_low_ess_root_cause.md
+
+The MBAR analysis loader therefore checks every phase's map against how many
+windows that phase really ran (its own recorded post-drop window count, else the
+window indices its Parquet samples actually contain) and, on a mismatch:
+
+    repairs the map in memory   when the phase's surviving window table
+                                (umbrella_explicit_windows.csv) or its
+                                post-pull drop record identifies the phantom
+                                rows and the sampled CV2 values confirm the
+                                result -- a loud note goes into the run
+                                warnings and pmf_summary.json
+    refuses to load             otherwise (ValueError)
+
+A repair is in-memory only: the CSV on disk stays stale, and re-running the
+analysis re-does the repair.  Nothing needs re-simulating.
+
+Escape hatch:
+
+    GAREUS_ALLOW_STALE_WINDOW_MAP=1
+
+Set this only to inspect a damaged run.  It downgrades the refusal to a warning
+and loads the stale map as-is, which means the run is loaded with its samples
+attributed to the WRONG umbrella states: every free energy, PMF, and ESS
+derived from that load is invalid by construction, not merely uncertain.  It
+never suppresses a repair that was possible anyway.
+
 14. Analysis-driven CV suggestion report
 -----------------------------------------
 After a pilot or completed production run, `gareus-suggest-cvs` reads

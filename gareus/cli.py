@@ -345,6 +345,29 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                    help="Minimum saved sample rows per window in the final frozen production phase "
                         "(same unit as ap_min_samples_per_window).")
     p.add_argument("--ap-max-new-windows", type=int, default=4)
+    p.add_argument("--ap-bridge-multi-window", action=argparse.BooleanOptionalAction, default=True,
+                   help="Place as many evenly spaced bridge windows at a weak edge as the "
+                        "spacing/sigma geometry calls for (bounded by --ap-max-new-windows, and "
+                        "fair-shared round-robin across all weak edges worst-overlap-first), "
+                        "instead of exactly one midpoint. A single midpoint is useless when the "
+                        "two endpoints are many harmonic widths apart -- sigma = sqrt(kT/k) is "
+                        "small for a stiff window. Use --no-ap-bridge-multi-window for the "
+                        "historical one-midpoint-per-weak-edge allocation; the geometric "
+                        "requirement and any shortfall are recorded in the new state's reason "
+                        "either way.")
+    p.add_argument("--ap-bridge-healthy-spacing-sigma", type=float, default=1.5,
+                   help="Healthy umbrella centre spacing in units of the neighbouring window's "
+                        "own harmonic width sigma = sqrt(kT/k). Sets how many bridge windows a "
+                        "weak edge is judged to need: ceil(gap/(value*sigma_min)) - 1. Lower "
+                        "values demand denser bridging.")
+    p.add_argument("--ap-final-quality-extension-rounds", type=int, default=0,
+                   help="Extra frozen-final sampling rounds to run when the post-final quality "
+                        "gate says more final sampling would fix it. 0 (default) disables.")
+    p.add_argument("--ap-final-quality-extension-steps", type=int, default=0,
+                   help="Per-state steps for each --ap-final-quality-extension-rounds round. "
+                        "0 = reuse the final phase's own pool-independent per-state fallback "
+                        "(deliberately NOT the pool-derived final target: an extension round runs "
+                        "after the final phase already drew its share of the MD pool).")
     p.add_argument("--ap-retire-converged", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--ap-gamd-boost-sd-warn", type=float, default=6.0)
     p.add_argument("--ap-write-reports", action=argparse.BooleanOptionalAction, default=True)
@@ -1029,6 +1052,8 @@ def _shim_adaptive_production(args: argparse.Namespace) -> None:
         args.adaptive_production_retire_min_samples = args.ap_retire_min_samples
     args.adaptive_production_final_min_samples_per_state = args.ap_final_min_samples_per_window
     args.adaptive_production_max_new_windows_per_epoch = args.ap_max_new_windows
+    args.adaptive_production_bridge_multi_window = args.ap_bridge_multi_window
+    args.adaptive_production_bridge_healthy_spacing_sigma = args.ap_bridge_healthy_spacing_sigma
     args.adaptive_production_retire_converged = args.ap_retire_converged
     args.adaptive_production_max_gamd_boost_sd_kcal_mol = args.ap_gamd_boost_sd_warn
     args.adaptive_production_write_action_reports = args.ap_write_reports
@@ -1064,8 +1089,17 @@ def _shim_adaptive_production(args: argparse.Namespace) -> None:
     # final_min_samples_per_state is set earlier from ap_final_min_samples_per_window (default 100).
     args.adaptive_production_quality_min_primary_coverage_fraction = 0.25
     args.adaptive_production_quality_hard_fail = False
-    args.adaptive_production_final_quality_extension_rounds = 0
-    args.adaptive_production_final_quality_extension_steps = 0
+    # Previously hardcoded 0/0 with no flag reaching them on an initial run --
+    # the same dropped-knob pattern as --ap-epoch0-step-fraction before it got a
+    # flag. The extension loop itself was only ever reachable through a *second*
+    # invocation: `--extend --extend-mode frozen` overwrites both of these from
+    # --ap-extend-rounds/--ap-extend-steps in
+    # adaptive_production._resolve_and_apply_extend_mode, which cli.py calls at
+    # dispatch time (well after these shims), so that override still wins.
+    # Defaults are unchanged (0 rounds = the loop never runs), so wiring them
+    # changes nothing until an initial run actually asks for a round.
+    args.adaptive_production_final_quality_extension_rounds = args.ap_final_quality_extension_rounds
+    args.adaptive_production_final_quality_extension_steps = args.ap_final_quality_extension_steps
     # extend support
     args.extend = bool(getattr(args, "extend", False))
     args.extend_mode = str(getattr(args, "extend_mode", "auto"))

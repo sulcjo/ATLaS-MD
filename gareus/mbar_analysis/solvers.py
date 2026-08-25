@@ -833,23 +833,264 @@ def solve_mbar(u_nk, window, tol=1e-10, maxiter=10000, progress: Optional['Progr
     return {'f_k':fall,'n_k':nk,'active':active,'logw':lw,'converged':conv,'iterations':it,'max_delta':md,'backend':bname,'threads':None}
 
 
-def overlap_matrix(cv,window,bins,K):
-    """Window-window histogram overlap with vectorized histogram assembly."""
+# Default number of bins along the SECONDARY CV axis of the joint-space overlap
+# histogram, used by make_overlap_bins() below. Deliberately coarser than the
+# primary axis's --bins (default 60): histogram-intersection overlap is
+# systematically DEFLATED as the cell count grows relative to samples per state,
+# and the sparsest real umbrella states hold only ~9k samples (chignolin_6's
+# late-born bridge states 24/25/26: 8,960 / 10,750 / 8,958). Measured on two
+# genuinely coincident Gaussian states at N=9,000 each with 60 primary bins, the
+# reported overlap of a truly-identical pair falls 0.966 (20 secondary bins) ->
+# 0.949 (30) -> 0.945 (40) -> 0.921 (60) for a narrow secondary sigma, and
+# 0.928 -> 0.898 -> 0.885 -> 0.864 for a wide one. 30 keeps that self-inflicted
+# deflation under ~10% at the smallest real per-state N while still resolving a
+# secondary-CV gap of the size that went undetected on chignolin_6 (centre
+# spacing / sigma 2.6-9.3).
+OVERLAP_SECONDARY_BINS = 30
+
+# Peak-transient budget, in BYTES, for the 2D pairwise-min reduction (see
+# overlap_matrix). The naive np.minimum(H[:,None,:],H[None,:,:]) broadcast
+# materialises a K x K x n_cells float64 array, so the cost is driven by BOTH
+# the cell count and K -- and K is the term that varies by an order of
+# magnitude between this repo's real datasets (27 umbrella states on
+# chignolin_6, 364 on the 2D-rough thermodynamic-validity oracle).
+#
+# This was originally a cap on CELLS per chunk (8192), which is why it is
+# spelled in bytes now: in joint space n_cells = B * B2 = 60 * 30 = 1800, below
+# any sane cell cap, so the cap never engaged and the whole matrix was built in
+# one block no matter how large K was. At K = 364 that is
+# 364^2 * 1800 * 8 B = 1.91 GB of transient for a diagnostic, against 64 MB for
+# the primary-CV marginal path it replaced -- a ~30x peak-memory regression,
+# default-on for any 2D run, invisible at K = 27 (10.5 MB) which is all the
+# local test data has.
+#
+# 128 MiB is deliberately close to the marginal path's own unchunked worst case
+# at the largest real K (364^2 * 60 * 8 = 64 MB, itself unguarded and left
+# untouched here for bit-identity): this diagnostic should not become the
+# largest allocation in an analysis whose overall memory profile already needed
+# its own audit (CLAUDE.md, MBAR peak 3.3 GB -> 17.5 GB). Chunking is pure
+# accumulation, so a smaller budget costs only loop iterations, never accuracy.
+OVERLAP_CHUNK_BYTES = 128 * 1024 * 1024
+
+# Retained under its old name and value ONLY as an explicit per-call override
+# unit (overlap_matrix's max_cells_per_chunk), which the chunk-equivalence test
+# uses to force pathological chunk sizes. It is no longer the default guard --
+# see OVERLAP_CHUNK_BYTES for why a cell-sized cap could not bound anything.
+OVERLAP_CHUNK_CELLS = 8192
+
+
+def _overlap_chunk_cells(K: int, n_cells: int,
+                         max_bytes: int = OVERLAP_CHUNK_BYTES) -> int:
+    """Cells per chunk such that the K x K x cells float64 transient of the
+    pairwise-min reduction stays within ``max_bytes``.
+
+    Never returns less than 1 (a budget smaller than one full K x K plane must
+    still make progress rather than divide down to a zero step and hang), and
+    never more than ``n_cells`` (a single chunk, i.e. the unchunked expression,
+    which is what every small-K case gets: at K = 27 and 1800 joint cells the
+    whole transient is 10.5 MB, so this returns >= n_cells and the reduction is
+    exactly as fast as before this guard existed).
+    """
+    plane = max(1, int(K) * int(K) * 8)
+    step = int(max_bytes) // plane
+    return max(1, min(int(n_cells) if int(n_cells) > 0 else 1, step))
+
+
+def make_overlap_bins(values, nbins: int = OVERLAP_SECONDARY_BINS):
+    """Bin edges spanning the FINITE range of ``values``, or None if unusable.
+
+    NaN-safe companion to gareus.mbar_analysis.pmf.make_bins, for building the
+    ``bins2`` argument of overlap_matrix() from a secondary-CV column that may
+    be partly or entirely null. Differs from make_bins in exactly the two ways
+    that matter here: non-finite entries are dropped up front (rather than
+    relying on np.nanmin/np.nanmax, which warn and return NaN for an all-NaN
+    input -- Data.cv2 is non-Optional in this codebase and is NaN-filled for a
+    pure CV1-only run, so all-NaN is a routine input, not an error), and a
+    degenerate axis returns None so the caller can explicitly fall back to the
+    primary-CV marginal instead of binning against NaN edges.
+
+    Returns None when fewer than two DISTINCT finite values are present: a
+    single-valued secondary CV carries no information to overlap on.
+    """
+    v = np.asarray(values, dtype=np.float64).ravel()
+    v = v[np.isfinite(v)]
+    if v.size == 0:
+        return None
+    lo = float(v.min()); hi = float(v.max())
+    if not (hi > lo):
+        return None
+    pad = 0.02 * (hi - lo)
+    return np.linspace(lo - pad, hi + pad, int(nbins) + 1)
+
+
+def _pairwise_histogram_intersection(H, max_cells_per_chunk=None,
+                                    max_chunk_bytes: int = OVERLAP_CHUNK_BYTES):
+    """sum_c min(H[i,c], H[j,c]) for every window pair (i,j), accumulated over
+    chunks of the cell axis so the peak transient is bounded by
+    ``max_chunk_bytes`` rather than by K^2 * n_cells. See OVERLAP_CHUNK_BYTES.
+
+    ``max_cells_per_chunk`` is an explicit override in cells, bypassing the byte
+    budget entirely; it exists so a test can force a pathological chunk size and
+    prove chunking does not change the result. Leave it None in production so the
+    step is derived from K, which is the term the old cell-sized cap ignored.
+    """
+    K, C = H.shape
+    step = (max(1, int(max_cells_per_chunk)) if max_cells_per_chunk is not None
+            else _overlap_chunk_cells(K, C, max_chunk_bytes))
+    O = np.zeros((K, K), dtype=np.float64)
+    for start in range(0, C, step):
+        blk = H[:, start:start + step]
+        O += np.minimum(blk[:, None, :], blk[None, :, :]).sum(axis=2)
+    return O
+
+
+def overlap_matrix(cv, window, bins, K, cv2=None, bins2=None, stats=None,
+                   max_cells_per_chunk=None,
+                   max_chunk_bytes: int = OVERLAP_CHUNK_BYTES):
+    """Window-window histogram overlap with vectorized histogram assembly.
+
+    With ``cv2``/``bins2`` supplied the overlap is computed over the JOINT
+    (cv1, cv2) histogram; without them it is the primary-CV marginal exactly as
+    before (the 4-argument call is bit-identical to the pre-2026-08-25 code --
+    that path's expression is untouched below, not re-derived).
+
+    Why the joint form exists: on the real run chignolin_6 (see
+    docs/chignolin_6_low_ess_root_cause.md, secondary finding #1) 20 of 27
+    umbrella states shared just two primary-CV centres (0.0 and 0.0654) and
+    differed only in the secondary CV, where centre spacing / sigma was 2.6-9.3
+    -- i.e. essentially disjoint (healthy umbrella overlap wants ~1-1.5). The
+    marginal diagnostic reported 0.6-0.99 overlap for those pairs, so the run's
+    health check declared window overlap fine while being structurally unable to
+    see the axis that had actually failed.
+
+    Non-finite ``cv2`` handling -- an explicit choice, not a side effect of the
+    binning: a sample whose secondary CV is NaN/inf is EXCLUDED from the joint
+    histogram entirely. It is never placed in the bin containing 0.0, because a
+    null/masked cv2 must never be silently read as the value 0.0 in this
+    codebase (see CLAUDE.md's 2026-08-15 three-layer bias-fabrication chain,
+    where exactly that fabrication produced ~2000 kT of fake bias). The one
+    exception is the wholly-degenerate case: if NO sample has a finite cv2 (the
+    routine shape of a pure CV1-only run, whose Data.cv2 is an all-NaN column),
+    excluding everything would return an all-zero matrix and make a perfectly
+    healthy run look catastrophically un-overlapped -- so that case falls back
+    to the primary-CV marginal and says so via ``stats['fell_back_to_marginal']``.
+
+    ``stats``, if a dict is passed, is filled with 'dim' (1 or 2), 'n_total',
+    'n_used', 'n_excluded_nonfinite_cv2', 'retained_fraction',
+    'fell_back_to_marginal', 'n_bins_primary' and 'n_bins_secondary'.
+
+    Callers SHOULD pass ``stats`` and act on 'retained_fraction', because a run
+    can legitimately have cv2 null for a large block of its samples (e.g. a
+    mid-campaign secondary-CV regime switch, where an early epoch's cv2 is a
+    different projection or absent entirely) and the joint matrix is then
+    computed on a minority of the population while looking exactly as
+    authoritative as the marginal one. Named thresholds so this does not have to
+    be re-derived per call site: emit a warning below 0.95, and below 0.50 treat
+    the joint matrix as diagnostic-only -- do not gate a health verdict on it,
+    since more than half the campaign is missing from it.
+
+    Choosing ``bins2``: what matters is the secondary bin WIDTH relative to a
+    single state's own secondary-CV spread (sigma ~ sqrt(kT/k2), 0.04-0.12 on
+    chignolin_6), not the bin count as such -- ``bins2`` normally spans the whole
+    campaign's cv2 range (~3.8 there) while one state occupies a sliver of it.
+    Keep width/sigma <~ 2, which OVERLAP_SECONDARY_BINS achieves for that
+    geometry. Measured at N=9,000 per state on a 3.8-wide axis, 30 bins
+    (width/sigma 1.8) reproduces the analytic Gaussian overlap well and stays
+    monotone in centre separation (coincident 0.966, 1 sigma apart 0.682 vs
+    0.617 analytic, 2.6 sigma 0.212, 5 sigma 0.022); at 20 bins (width/sigma
+    2.7) the far tail stops discriminating -- 5 sigma apart still reports 0.121,
+    barely below the genuinely-weak 2.6 sigma case, i.e. a real gap starts
+    looking like a merely-thin one. Finer than 30 is safe but costs overlap to
+    sparsity deflation at small per-state N (see OVERLAP_SECONDARY_BINS).
+
+    Malformed input fails closed (ValueError) rather than degrading quietly: a
+    ``cv2`` whose shape does not match ``cv``, or a ``bins2`` with fewer than two
+    edges, is a caller bug, not a data condition.
+    """
     cv=np.asarray(cv,dtype=np.float64)
     window=np.asarray(window,dtype=np.int64)
     B=len(bins)-1
-    H=np.zeros((K,B),dtype=np.float64)
-    if cv.size and K>0 and B>0:
-        bi=np.searchsorted(bins,cv,side='right')-1
-        bi[cv==bins[-1]]=B-1
-        mask=(window>=0)&(window<K)&(bi>=0)&(bi<B)
-        if np.any(mask):
-            linear=window[mask]*B+bi[mask]
-            H=np.bincount(linear,minlength=K*B).reshape(K,B).astype(np.float64)
-            row_sums=H.sum(axis=1)
-            nz=row_sums>0
-            H[nz]/=row_sums[nz,None]
-    return np.minimum(H[:,None,:],H[None,:,:]).sum(axis=2)
+
+    use_2d = cv2 is not None and bins2 is not None
+    n_excluded_cv2 = 0
+    fell_back = False
+    B2 = 0
+    if use_2d:
+        cv2 = np.asarray(cv2, dtype=np.float64)
+        bins2 = np.asarray(bins2, dtype=np.float64)
+        if cv2.shape != cv.shape:
+            raise ValueError(
+                f"overlap_matrix: cv2 shape {cv2.shape} does not match cv shape {cv.shape}")
+        B2 = len(bins2) - 1
+        if B2 < 1:
+            raise ValueError(
+                f"overlap_matrix: bins2 must be an edges array with >= 2 entries, got {len(bins2)}")
+        finite_cv2 = np.isfinite(cv2)
+        if not finite_cv2.any():
+            # Wholly-degenerate secondary axis (CV1-only run) -- see docstring.
+            use_2d = False
+            fell_back = True
+            B2 = 0
+
+    if not use_2d:
+        # --- primary-CV marginal: verbatim pre-fix code path ---
+        H=np.zeros((K,B),dtype=np.float64)
+        n_used = 0
+        if cv.size and K>0 and B>0:
+            bi=np.searchsorted(bins,cv,side='right')-1
+            bi[cv==bins[-1]]=B-1
+            mask=(window>=0)&(window<K)&(bi>=0)&(bi<B)
+            n_used = int(np.count_nonzero(mask))
+            if np.any(mask):
+                linear=window[mask]*B+bi[mask]
+                H=np.bincount(linear,minlength=K*B).reshape(K,B).astype(np.float64)
+                row_sums=H.sum(axis=1)
+                nz=row_sums>0
+                H[nz]/=row_sums[nz,None]
+        O = np.minimum(H[:,None,:],H[None,:,:]).sum(axis=2)
+        dim = 1
+    else:
+        # --- joint (cv1, cv2) histogram ---
+        # Same bincount-over-a-linear-index idiom as the marginal path, with the
+        # cell index widened to (window, bi, bj) -> (window*B + bi)*B2 + bj.
+        # int64 throughout, so K * B * B2 has ample headroom.
+        H=np.zeros((K,B*B2),dtype=np.float64)
+        n_used = 0
+        if cv.size and K>0 and B>0:
+            bi=np.searchsorted(bins,cv,side='right')-1
+            bi[cv==bins[-1]]=B-1
+            bj=np.searchsorted(bins2,cv2,side='right')-1
+            bj[cv2==bins2[-1]]=B2-1
+            # np.isfinite(finite_cv2) is technically redundant with the bj range
+            # test -- searchsorted sorts NaN above every edge (bj == B2) and +/-inf
+            # outside the axis -- but it is stated explicitly so that "a null cv2
+            # is excluded, never binned as 0.0" is a visible, deliberate rule
+            # here rather than an emergent property of NumPy's NaN ordering.
+            mask=(window>=0)&(window<K)&(bi>=0)&(bi<B)&(bj>=0)&(bj<B2)&finite_cv2
+            n_used = int(np.count_nonzero(mask))
+            n_excluded_cv2 = int(np.count_nonzero(~finite_cv2))
+            if np.any(mask):
+                linear=(window[mask]*B+bi[mask])*B2+bj[mask]
+                H=np.bincount(linear,minlength=K*B*B2).reshape(K,B*B2).astype(np.float64)
+                row_sums=H.sum(axis=1)
+                nz=row_sums>0
+                H[nz]/=row_sums[nz,None]
+        O = _pairwise_histogram_intersection(H, max_cells_per_chunk, max_chunk_bytes)
+        dim = 2
+
+    if stats is not None:
+        n_total = int(cv.size)
+        stats.update({
+            'dim': dim,
+            'n_total': n_total,
+            'n_used': n_used,
+            'n_excluded_nonfinite_cv2': n_excluded_cv2,
+            'retained_fraction': (float(n_used) / n_total) if n_total else 0.0,
+            'fell_back_to_marginal': fell_back,
+            'n_bins_primary': int(B),
+            'n_bins_secondary': int(B2),
+        })
+    return O
 
 
 def _subset_logw_from_global_fk(d_subset: 'Data', f_k_global: np.ndarray) -> np.ndarray:
@@ -920,5 +1161,7 @@ __all__ = [
     "logsumexp", "logsumexp_axis1_finite", "logsumexp_axis0_finite",
     "norm_logw", "solve_mbar_numba", "solve_mbar_numba_anderson",
     "solve_mbar_sambar_warmstart", "solve_mbar_sambar", "solve_mbar_lbfgs",
-    "solve_mbar", "overlap_matrix", "_subset_logw_from_global_fk",
+    "solve_mbar", "overlap_matrix", "make_overlap_bins",
+    "OVERLAP_SECONDARY_BINS", "OVERLAP_CHUNK_BYTES", "OVERLAP_CHUNK_CELLS",
+    "_subset_logw_from_global_fk",
 ]

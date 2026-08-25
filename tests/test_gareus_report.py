@@ -261,3 +261,225 @@ def test_real_summaries_render_without_error(path):
     # both renderers must succeed
     assert gr.render_verdict_terminal(v, groups, use_color=False)
     assert gr.render_verdict_md(v, groups)
+
+
+# ----------------------------------------------------------------------------
+# overlap connectivity (round-3 review, deeper half of FINDING 1)
+#
+# MBAR fixes free energies only up to one additive constant PER CONNECTED
+# COMPONENT of the overlap graph. So a window set can have every graded pair
+# above threshold and still be split, with the offsets between the blocks fixed
+# by nothing in the data -- which is chignolin_6's actual failure (94% of its
+# posterior on one state). This is not gradable from any worst-pair number, so
+# it is its own check, fed by gareus.mbar_analysis.pmf.overlap_components via
+# s['overlap_connectivity'].
+# ----------------------------------------------------------------------------
+def _conn(marg_n=1, joint_n=1, joint_available=True):
+    return {
+        "marginal": {"space": "cv1_marginal", "available": True, "reason": "",
+                     "threshold": 0.30, "n_components": marg_n,
+                     "components": [[0, 1, 2]] if marg_n == 1 else [[0, 1], [2]],
+                     "component_samples": [300] if marg_n == 1 else [200, 100]},
+        "joint": ({"space": "cv1_cv2_joint", "available": True, "reason": "",
+                   "threshold": 0.09, "n_components": joint_n,
+                   "components": [[0, 1, 2]] if joint_n == 1 else [[0, 1], [2]],
+                   "component_samples": [300] if joint_n == 1 else [200, 100]}
+                  if joint_available else
+                  {"space": "cv1_cv2_joint", "available": False,
+                   "reason": "disabled by --no-joint-overlap", "threshold": 0.09,
+                   "n_components": 0, "components": [], "component_samples": []}),
+    }
+
+
+def test_verdict_connected_overlap_graph_is_pass():
+    s = _good_summary()
+    s["overlap_connectivity"] = _conn()
+    v = gr.build_health_verdict(s, 0.30)
+    c = next(c for c in v["checks"] if c["name"] == "Overlap connectivity")
+    assert c["status"] == "pass"
+    assert v["overall"] == "PASS"
+
+
+def test_verdict_split_overlap_graph_is_fail_and_names_the_components():
+    """The failure the whole check exists for: MBAR has no information linking
+    the blocks, so the offset between them is arbitrary."""
+    s = _good_summary()
+    s["overlap_connectivity"] = _conn(joint_n=2)
+    v = gr.build_health_verdict(s, 0.30)
+    c = next(c for c in v["checks"] if c["name"] == "Overlap connectivity")
+    assert c["status"] == "fail"
+    assert c["metric"] == 2
+    assert "[0,1]" in c["detail"] and "[2]" in c["detail"]
+    # The per-component sample counts are the number that separates small-N
+    # histogram deflation from a real physical gap, so they must be shown.
+    assert "200" in c["detail"] and "100" in c["detail"]
+    assert v["overall"] == "FAIL"
+
+
+def test_verdict_split_in_the_marginal_space_alone_is_still_a_fail():
+    """Neither space's connectivity implies the other's: joint overlap is
+    bounded above by the marginal while the joint THRESHOLD is below the
+    marginal one, so worse-of-both is the only safe combination."""
+    s = _good_summary()
+    s["overlap_connectivity"] = _conn(marg_n=3, joint_n=1)
+    v = gr.build_health_verdict(s, 0.30)
+    c = next(c for c in v["checks"] if c["name"] == "Overlap connectivity")
+    assert c["status"] == "fail"
+    assert "SPLIT into 3" in c["detail"]
+
+
+def test_verdict_unmeasured_joint_connectivity_says_so_rather_than_passing_quietly():
+    s = _good_summary()
+    s["overlap_connectivity"] = _conn(joint_available=False)
+    v = gr.build_health_verdict(s, 0.30)
+    c = next(c for c in v["checks"] if c["name"] == "Overlap connectivity")
+    assert "not measured" in c["detail"]
+    assert "no-joint-overlap" in c["detail"]
+    assert c["status"] == "pass"          # the marginal WAS measured and is connected
+
+
+def test_verdict_overlap_connectivity_is_na_for_a_summary_written_before_it_existed():
+    """This module's standing contract: never raise, never invent a status, for
+    an old or partial pmf_summary.json."""
+    for block in (None, {}, "nonsense", {"marginal": "junk"},
+                  {"marginal": {"available": True, "n_components": 0}}):
+        s = _good_summary()
+        if block is not None:
+            s["overlap_connectivity"] = block
+        v = gr.build_health_verdict(s, 0.30)
+        c = next(c for c in v["checks"] if c["name"] == "Overlap connectivity")
+        assert c["status"] == "na", (block, c)
+        assert v["overall"] == "PASS"      # an na check never moves the verdict
+
+
+def test_disconnected_overlap_graph_warning_is_triaged_high():
+    groups = gr.classify_warnings([
+        "Umbrella overlap graph is DISCONNECTED in the joint (CV1, CV2) space: 3 "
+        "components at overlap >= 0.090 -- [18] (3,410 samples), [20] (6,030 samples)."])
+    assert groups[0]["severity"] == "HIGH"
+
+
+def test_components_text_truncates_a_shattered_geometry():
+    """A K=364 oracle geometry must not render a multi-kilobyte terminal line;
+    the full lists stay in pmf_summary.json."""
+    block = {"available": True, "threshold": 0.09,
+             "n_components": 20,
+             "components": [list(range(i * 20, i * 20 + 20)) for i in range(20)],
+             "component_samples": [1000] * 20}
+    txt = gr._components_text(block)
+    assert len(txt) < 200, txt
+    assert "+16 more" in txt      # 20 components, 4 shown
+    assert "+14" in txt           # 20 states per component, 6 shown
+
+
+def test_render_includes_the_connectivity_row():
+    s = _good_summary()
+    s["overlap_connectivity"] = _conn(joint_n=2)
+    v = gr.build_health_verdict(s, 0.30)
+    assert "Overlap connectivity" in gr.render_verdict_terminal(v, [], use_color=False)
+    assert "Overlap connectivity" in "\n".join(gr.render_verdict_md(v, []))
+
+
+# ----------------------------------------------------------------------------
+# FINDING 1 (first half) -- the index-adjacent number is graded again
+# ----------------------------------------------------------------------------
+def test_verdict_index_adjacent_overlap_is_graded_even_when_cv_space_passes():
+    """A6 made the CV-space pairing REPLACE the index one, which turned the
+    index branch into dead code for every new analysis (the summary always
+    carries cv_space_neighbor_overlap). A broken ladder could then read PASS on
+    unchanged data."""
+    s = _good_summary()
+    s["cv_space_neighbor_overlap"] = [{"window": 0, "neighbor": 1, "overlap": 0.9},
+                                      {"window": 1, "neighbor": 0, "overlap": 0.9}]
+    s["neighbor_overlap"] = [0.5] * 4 + [0.01] + [0.5] * 4
+    v = gr.build_health_verdict(s, 0.30)
+    ov = next(c for c in v["checks"] if c["name"] == "Window overlap")
+    assert ov["status"] == "fail", ov
+    assert "index-adjacent" in ov["detail"]
+    assert "4-5" in ov["detail"]
+    assert v["overall"] == "FAIL"
+
+
+def test_verdict_both_pairings_appear_in_the_overlap_detail():
+    s = _good_summary()
+    s["cv_space_neighbor_overlap"] = [{"window": 0, "neighbor": 7, "overlap": 0.44}]
+    s["neighbor_overlap"] = [0.66] * 9
+    v = gr.build_health_verdict(s, 0.30)
+    ov = next(c for c in v["checks"] if c["name"] == "Window overlap")
+    assert ov["status"] == "pass"
+    assert "0.440" in ov["detail"] and "0.660" in ov["detail"]
+    assert "CV-space nearest" in ov["detail"] and "index-adjacent" in ov["detail"]
+
+
+def test_cv_space_worst_is_defined_exactly_once():
+    """FINDING 2: the A6 refactor left a first, dead definition of
+    _cv_space_worst above the one that delegates to _worst_of -- behaviourally
+    identical, so nothing broke, but the next reader of the very function
+    FINDING 1 asks to be changed would have been reading the dead copy."""
+    src = Path(gr.__file__).read_text()
+    assert src.count("def _cv_space_worst(") == 1
+    assert src.count("def _worst_of(") == 1
+    assert src.count("def _check_overlap(") == 1
+
+
+# ----------------------------------------------------------------------------
+# how BADLY split: a bare component count conflates two different failures
+# ----------------------------------------------------------------------------
+def _split_conn(best):
+    block = {"space": "cv1_cv2_joint", "available": True, "reason": "",
+             "threshold": 0.09, "n_components": 2,
+             "components": [[0, 1], [2]], "component_samples": [200, 100]}
+    if best is not None:
+        block["worst_component_best_cross_overlap"] = best
+        block["most_isolated_component"] = [2]
+    return {"marginal": {"available": True, "threshold": 0.30, "n_components": 1,
+                         "components": [[0, 1, 2]], "component_samples": [300]},
+            "joint": block}
+
+
+def test_a_split_with_essentially_no_cross_overlap_is_a_fail():
+    """chignolin_6's isolated state 20: 0.0048 to anything outside its own
+    component. That block's free energy relative to the rest genuinely is
+    undetermined."""
+    s = _good_summary()
+    s["overlap_connectivity"] = _split_conn(0.0008)
+    v = gr.build_health_verdict(s, 0.30)
+    c = next(c for c in v["checks"] if c["name"] == "Overlap connectivity")
+    assert c["status"] == "fail", c
+    assert "0.0008" in c["detail"]
+    assert "[2]" in c["detail"]
+
+
+def test_a_split_bridged_only_by_a_weak_but_real_pair_is_a_caution():
+    """chignolin_6's state 18: 0.065 against a 0.09 target -- below target, so
+    already a CAUTION on the pairwise check, but NOT a pair that carries no
+    information. Grading a bare component count FAIL would flip every run with
+    one slightly-under-target link into a FAIL on unchanged data, while claiming
+    in the detail text that its free energies are undetermined."""
+    s = _good_summary()
+    s["overlap_connectivity"] = _split_conn(0.065)
+    v = gr.build_health_verdict(s, 0.30)
+    c = next(c for c in v["checks"] if c["name"] == "Overlap connectivity")
+    assert c["status"] == "caution", c
+    assert "0.0650" in c["detail"]
+    assert v["overall"] == "CAUTION"
+
+
+def test_a_split_can_never_grade_pass_however_strong_the_reported_link():
+    """A split is a split: no summary value may talk this check up to pass."""
+    s = _good_summary()
+    s["overlap_connectivity"] = _split_conn(0.95)
+    v = gr.build_health_verdict(s, 0.30)
+    c = next(c for c in v["checks"] if c["name"] == "Overlap connectivity")
+    assert c["status"] == "caution", c
+
+
+def test_a_split_of_unknown_strength_fails():
+    """An older summary, or an all-non-finite cut: a split whose severity cannot
+    be measured is not evidence of a mild one."""
+    s = _good_summary()
+    s["overlap_connectivity"] = _split_conn(None)
+    v = gr.build_health_verdict(s, 0.30)
+    c = next(c for c in v["checks"] if c["name"] == "Overlap connectivity")
+    assert c["status"] == "fail", c
+    assert "isolation depth unknown" in c["detail"]
