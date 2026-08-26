@@ -32,6 +32,10 @@ gareus_adaptive_production_v*/
 *.md
 !docs/atlas-md/
 !docs/atlas-md/**
+# Root-cause writeups that the shipped code cites by path: every window-map and
+# self-bias warning ends with "See docs/chignolin_6_low_ess_root_cause.md", so the
+# document has to exist in the repository the operator is reading those warnings in.
+!docs/chignolin_6_low_ess_root_cause.md
 
 illustrate_seedbank.png
 poincare_map.py

@@ -372,6 +372,27 @@ class AdaptiveDecisionPolicy:
     # auditable from the registry CSV alone.
     bridge_healthy_spacing_sigma: float = 1.5
     bridge_multi_window: bool = True
+    # Recording the prediction was not enough: it never influenced WHICH edge
+    # got the budget.  Allocation was flat round-robin over weak edges, worst
+    # overlap first, so chignolin_6's edge 14-20 -- which needs 14 windows
+    # before the chain reaches even its softer endpoint -- always took a
+    # round-1 slot ahead of an edge whose SECOND bridge would have completed a
+    # real repair.  ``bridge_repairable_first`` serves the edges that can
+    # actually be reconnected within this epoch's budget first, each seeded
+    # with its own ``min_useful_bridges``, and only then hands what is left to
+    # the rest.  Set it False to restore the flat round-robin.
+    #
+    # ``bridge_skip_unreachable`` is the stronger policy: refuse an edge that
+    # cannot be reconnected this epoch instead of spending anything on it. It
+    # is OFF by default, and deliberately so -- an evenly spaced placement
+    # HALVES the gap, so a lone bridge on an unreachable edge is a bisection
+    # step (measured: 8 -> 4 -> 2 -> 1 bridges needed over successive epochs),
+    # and refusing it makes a run whose per-epoch budget is smaller than every
+    # weak edge's requirement add zero windows forever.  Turn it on to spend
+    # the whole budget on edges that finish this epoch, at the price of that
+    # stall.  Either way the edge is reported, never silently dropped.
+    bridge_repairable_first: bool = True
+    bridge_skip_unreachable: bool = False
 
 
 class WindowStateRegistry:
@@ -3783,6 +3804,26 @@ def _bridge_placement_prediction(
     intermediate windows' own sigmas are not known yet (their springs are
     interpolated from the endpoints), so the tighter endpoint is the honest
     conservative choice.
+
+    ``min_useful_bridges`` is the weaker, allocation-facing question: how many
+    evenly spaced windows it takes for the chain to reach *at least one* of the
+    two endpoints, i.e. ``min`` over the endpoints of
+    ``ceil(gap / (healthy * sigma_endpoint)) - 1``.  A chain hanging off one
+    endpoint is a partial repair the next epoch can extend from; a chain
+    hanging off neither is an island that reconnects nothing while still
+    costing a window slot and real MD.  It is always ``<= bridges_needed``
+    (reaching one endpoint cannot be harder than reaching both) and never
+    below 1.
+
+    Reachability is reduced PER ENDPOINT ACROSS ALL AXES, and only then
+    compared between the two endpoints -- never per axis first.  Taking
+    ``min(ratio_i, ratio_j)`` inside each axis and then the worst axis is the
+    obvious-looking reduction and it is wrong: an endpoint that is soft on the
+    primary axis and stiff on the secondary, paired with an endpoint that is
+    the mirror image, gives every axis one nearby endpoint while NEITHER
+    endpoint is actually within reach on both axes at once.  See
+    ``tests/test_bridge_placement_veto.py::
+    test_reachability_reduces_per_endpoint_over_all_axes_not_per_axis``.
     """
     kbt_kcal = _KB_KCAL_PER_MOL_K * float(temperature_K)
     healthy = max(1.0e-9, float(healthy_spacing_sigma))
@@ -3814,29 +3855,71 @@ def _bridge_placement_prediction(
             "midpoint_spacing_sigma_j": ratio_j,
             "worst_midpoint_spacing_sigma": max(ratio_i, ratio_j),
             "intervals_needed": max(1, int(math.ceil(gap / (healthy * sigma_min)))),
+            # How many sub-intervals this axis alone needs before the chain's
+            # outermost window is inside the healthy band of endpoint i (resp.
+            # j) specifically -- the per-endpoint input to min_useful_bridges.
+            "intervals_to_reach_i": max(1, int(math.ceil(gap / (healthy * sigma_i)))),
+            "intervals_to_reach_j": max(1, int(math.ceil(gap / (healthy * sigma_j)))),
         }
     if not axes:
         # Nothing measurable (e.g. a zero/absent spring on both axes): fall back
         # to the historical single midpoint rather than refuse to bridge.
+        # min_useful_bridges = 1 / reaches_either = True on purpose: the veto is
+        # evidence-based and fires only where the geometry PROVES a chain
+        # reaches neither endpoint.  An unmeasurable pair is not that proof, so
+        # it keeps the historical placement rather than being refused.
         return {
             "axes": {},
             "worst_axis": None,
             "worst_midpoint_spacing_sigma": float("nan"),
+            "worst_midpoint_spacing_sigma_i": float("nan"),
+            "worst_midpoint_spacing_sigma_j": float("nan"),
             "healthy_spacing_sigma": healthy,
             "single_bridge_sufficient": True,
+            "single_bridge_reaches_i": True,
+            "single_bridge_reaches_j": True,
+            "single_bridge_reaches_either": True,
             "bridges_needed": 1,
+            "min_useful_bridges": 1,
         }
     worst_axis = max(axes, key=lambda a: axes[a]["worst_midpoint_spacing_sigma"])
     worst_ratio = axes[worst_axis]["worst_midpoint_spacing_sigma"]
     intervals = max(int(a["intervals_needed"]) for a in axes.values())
+    # Per endpoint, worst axis first (see the docstring for why the transposed
+    # reduction is wrong), and only then the easier of the two endpoints.
+    worst_ratio_i = max(float(a["midpoint_spacing_sigma_i"]) for a in axes.values())
+    worst_ratio_j = max(float(a["midpoint_spacing_sigma_j"]) for a in axes.values())
+    reach_i = max(int(a["intervals_to_reach_i"]) for a in axes.values()) - 1
+    reach_j = max(int(a["intervals_to_reach_j"]) for a in axes.values()) - 1
     return {
         "axes": axes,
         "worst_axis": worst_axis,
         "worst_midpoint_spacing_sigma": worst_ratio,
+        "worst_midpoint_spacing_sigma_i": worst_ratio_i,
+        "worst_midpoint_spacing_sigma_j": worst_ratio_j,
         "healthy_spacing_sigma": healthy,
         "single_bridge_sufficient": bool(worst_ratio <= healthy),
+        "single_bridge_reaches_i": bool(worst_ratio_i <= healthy),
+        "single_bridge_reaches_j": bool(worst_ratio_j <= healthy),
+        "single_bridge_reaches_either": bool(min(worst_ratio_i, worst_ratio_j) <= healthy),
         "bridges_needed": max(1, intervals - 1),
+        "min_useful_bridges": max(1, min(reach_i, reach_j)),
     }
+
+
+def _finite_or_none(value: Any) -> Optional[float]:
+    """``float(value)`` when it is finite, else ``None``.
+
+    For numbers that go into a JSON artefact: ``write_json`` -> ``json.dumps``
+    keeps ``allow_nan`` on, so a NaN would be written as the bare token ``NaN``
+    -- readable by Python's own json, rejected by every strict parser (jq, any
+    browser, most other languages).  ``null`` says the same thing portably.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _interpolate_bridge_axis(c1: float, c2: float, frac: float) -> float:
@@ -3864,7 +3947,18 @@ def propose_actions_from_diagnostics(
     *,
     temperature_K: float = 298.0,
     secondary_k_max: Optional[float] = None,
+    bridge_plan_out: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Tuple]:
+    """Propose registry-changing actions from one epoch's diagnostics.
+
+    ``bridge_plan_out``, when given, is filled with one record per weak edge
+    considered for bridging -- what the geometry asked for, what the budget
+    allowed, what was actually placed, and why an edge got nothing.  The driver
+    threads it into ``write_epoch_action_report`` so an edge nothing could be
+    done about survives the epoch as a written artefact rather than only as a
+    log line that scrolls away.  It is appended to, never read, so a caller
+    that does not want it can leave it out.
+    """
     policy = policy or AdaptiveDecisionPolicy()
     actions: List[Tuple] = []
     state_rows = {int(r["state_id"]): r for r in diagnostics.get("states", [])}
@@ -3932,12 +4026,27 @@ def propose_actions_from_diagnostics(
             temperature_K=float(temperature_K),
             healthy_spacing_sigma=float(policy.bridge_healthy_spacing_sigma),
         )
+        # ``cap`` is the most windows this edge may ever receive;
+        # ``min_useful`` the fewest that make the placement reconnect anything
+        # at all (reach at least one endpoint -- see _bridge_placement_prediction).
+        # An edge is repairable *this epoch* only if that floor fits both.
+        cap = int(prediction["bridges_needed"]) if bool(policy.bridge_multi_window) else 1
+        min_useful = int(prediction["min_useful_bridges"])
         candidates.append({
             "edge": edge,
             "s1": s1,
             "s2": s2,
             "prediction": prediction,
             "needed": int(prediction["bridges_needed"]),
+            "cap": cap,
+            "min_useful": min_useful,
+            # Deliberately measured against the WHOLE budget, not what happens
+            # to be left when this edge is reached: the classification is then
+            # a property of the edge and the policy, identical in the log, in
+            # the plan record and in the allocation, rather than an artefact of
+            # iteration order.
+            "repairable_this_epoch": bool(min_useful <= cap and min_useful <= max_new),
+            "funded_repairable": False,
             "allocated": 0,
         })
 
@@ -3945,14 +4054,65 @@ def propose_actions_from_diagnostics(
     # deliberately leaves ``needed`` alone: the true geometric requirement still
     # goes into the new state's reason string and into the shortfall warning, so
     # turning the placement off never hides the diagnosis.
+    #
+    # Two phases, and the first one is the fix for "a hopeless edge always takes
+    # a round-1 slot ahead of a fixable edge's second bridge".  Flat round-robin
+    # is fair per EDGE but not per outcome: it funds a first window everywhere
+    # before a second window anywhere, so an edge that needs 14 windows before
+    # it reconnects anything outranks an edge that two windows would finish.
+    #
+    #   Phase 1 -- edges that can be reconnected within this epoch's budget,
+    #   CHEAPEST FIRST (fewest windows to reach an endpoint), each seeded with
+    #   its own min_useful_bridges.  An edge whose seed no longer fits because
+    #   earlier repairable edges already spent the budget falls through to
+    #   phase 2 rather than being half-funded.
+    #
+    #   Cheapest-first, not worst-overlap-first, and that ordering is
+    #   load-bearing: with a budget of 4, one overlap-0.02 edge needing 4
+    #   windows and three overlap-0.10..0.20 edges that ONE midpoint fully
+    #   repairs, worst-overlap-first spends the entire budget on the single
+    #   worst edge and starves three complete repairs -- the same
+    #   one-greedy-edge-eats-the-budget regression the flat round-robin was
+    #   introduced to fix, just moved into phase 1.  Every window costs the
+    #   same MD, so completing the most edges per epoch is what the budget
+    #   buys; the expensive edge still gets its bisection step from phase 2.
+    #   The sort is stable, so equally cheap edges keep the worst-overlap-first
+    #   order the candidate list already carries.
+    #   Phase 2 -- the historical flat round-robin, one window at a time, over
+    #   everything still under its cap.  This is what keeps an under-budgeted
+    #   run moving: an evenly spaced bridge halves the gap, so a lone window on
+    #   an unreachable edge is a bisection step (8 -> 4 -> 2 -> 1 over epochs),
+    #   not a wasted slot.  bridge_skip_unreachable=True excludes unfunded
+    #   edges from this phase, which is exactly the stall that keeps it opt-in.
+    #
+    # With bridge_repairable_first=False (and the veto off) phase 1 is skipped
+    # entirely and phase 2 alone reproduces the previous allocation exactly.
+    _skip_unreachable = bool(policy.bridge_skip_unreachable)
+    _seed_repairable = bool(policy.bridge_repairable_first) or _skip_unreachable
     _remaining_budget = max_new
+    if _seed_repairable:
+        for cand in sorted(candidates, key=lambda c: int(c["min_useful"])):
+            if not cand["repairable_this_epoch"]:
+                continue
+            _seed = int(cand["min_useful"])
+            if _seed <= _remaining_budget:
+                cand["allocated"] = _seed
+                cand["funded_repairable"] = True
+                _remaining_budget -= _seed
+            # An edge whose seed no longer fits gets nothing here and falls to
+            # phase 2 with the rest.  Its ``repairable_this_epoch`` is left
+            # TRUE: it really was repairable, the budget simply went to worse
+            # edges first, and overwriting the classification would make the
+            # plan record blame the geometry for a scheduling outcome.
+            # ``funded_repairable`` is the one that says what happened.
     while _remaining_budget > 0:
         _progressed = False
         for cand in candidates:
             if _remaining_budget <= 0:
                 break
-            cap = int(cand["needed"]) if bool(policy.bridge_multi_window) else 1
-            if int(cand["allocated"]) >= cap:
+            if _skip_unreachable and not cand["funded_repairable"]:
+                continue
+            if int(cand["allocated"]) >= int(cand["cap"]):
                 continue
             cand["allocated"] = int(cand["allocated"]) + 1
             _remaining_budget -= 1
@@ -3966,12 +4126,62 @@ def propose_actions_from_diagnostics(
         prediction = cand["prediction"]
         needed = int(cand["needed"])
         n_place = int(cand["allocated"])
+        min_useful = int(cand["min_useful"])
         prediction_note = (
             f"predicted worst midpoint spacing/sigma "
             f"{float(prediction['worst_midpoint_spacing_sigma']):.2f} on "
             f"{prediction['worst_axis']} vs healthy <= "
             f"{float(prediction['healthy_spacing_sigma']):.2f}"
         )
+        # The actionable half of the diagnosis: how many windows it would take
+        # before this edge reconnects anything at all, and the flag that buys
+        # them.  Without it an operator reads "under-bridged" every epoch with
+        # no way to tell a one-window-short edge from a hopeless one.
+        reach_note = (
+            f"needs >= {min_useful} window(s) before the chain reaches either "
+            f"endpoint; raise --ap-max-new-windows to >= {min_useful} (or lower "
+            f"--ap-bridge-healthy-spacing-sigma) to repair it in one epoch"
+        )
+        _bisection_only = 0 < n_place < min_useful
+        # Only an edge the geometry itself rules out gets the REFUSED wording.
+        # A repairable edge that simply lost the budget race is NOT refused --
+        # telling its operator to "raise --ap-max-new-windows to >= 3" on a run
+        # already configured for 4 is a wrong instruction, and the
+        # budget-contention branch below already says the right thing.
+        _refused = (n_place <= 0 and _skip_unreachable
+                    and not cand["funded_repairable"]
+                    and not cand["repairable_this_epoch"])
+
+        def _record(outcome: str, placed: int, note: str) -> None:
+            """One plan row per weak edge considered, placed or not."""
+            if bridge_plan_out is None:
+                return
+            bridge_plan_out.append({
+                "state_i": int(s1.state_id),
+                "state_j": int(s2.state_id),
+                "overlap": edge.get("overlap"),
+                "exchange_acceptance": edge.get("exchange_acceptance"),
+                "bridges_needed": needed,
+                "min_useful_bridges": min_useful,
+                "bridges_allocated": n_place,
+                "bridges_placed": int(placed),
+                "repairable_this_epoch": bool(cand["repairable_this_epoch"]),
+                "funded_repairable": bool(cand["funded_repairable"]),
+                "worst_axis": prediction.get("worst_axis"),
+                # None, not NaN: an unmeasurable geometry (no spring on either
+                # axis) leaves this non-finite, and write_json ultimately calls
+                # json.dumps with allow_nan left on, which emits a bare NaN
+                # token that no strict JSON parser will read back.
+                "worst_midpoint_spacing_sigma": _finite_or_none(
+                    prediction.get("worst_midpoint_spacing_sigma")),
+                "healthy_spacing_sigma": float(prediction["healthy_spacing_sigma"]),
+                "single_bridge_reaches_either": bool(
+                    prediction["single_bridge_reaches_either"]),
+                "max_new_windows_per_epoch": int(max_new),
+                "outcome": outcome,
+                "note": note,
+            })
+
         # shortfall is now derived from what was actually allocated, never from a
         # clamped-to-at-least-one count.  The previous version computed
         # n_place = max(1, min(needed, budget_left)), so an edge reached after
@@ -3980,15 +4190,39 @@ def propose_actions_from_diagnostics(
         # an edge nothing was even attempted on.
         shortfall = max(0, needed - n_place)
         if n_place <= 0:
-            logging.warning(
-                "adaptive-production: weak edge %s-%s needs %d bridge window(s) "
-                "(%s) but no bridge windows could be placed this epoch -- the "
-                "per-epoch budget (max_new_windows_per_epoch=%d) was spent on "
-                "worse edges; this edge is left unbridged and will resurface in "
-                "the next epoch's diagnostics",
-                s1.state_id, s2.state_id, needed, prediction_note, max_new,
-            )
+            if _refused:
+                logging.warning(
+                    "adaptive-production: weak edge %s-%s REFUSED, no bridge "
+                    "windows placed: %s (%s), and bridge_skip_unreachable is on "
+                    "so the budget (max_new_windows_per_epoch=%d) went to edges "
+                    "that can be reconnected this epoch instead; this edge stays "
+                    "weak and will resurface in the next epoch's diagnostics",
+                    s1.state_id, s2.state_id, reach_note, prediction_note, max_new,
+                )
+            else:
+                logging.warning(
+                    "adaptive-production: weak edge %s-%s needs %d bridge window(s) "
+                    "(%s) but no bridge windows could be placed this epoch -- the "
+                    "per-epoch budget (max_new_windows_per_epoch=%d) was spent on "
+                    "worse edges; this edge is left unbridged and will resurface in "
+                    "the next epoch's diagnostics. It %s",
+                    s1.state_id, s2.state_id, needed, prediction_note, max_new,
+                    reach_note,
+                )
+            _record("refused_unreachable" if _refused else "skipped_no_budget",
+                    0, reach_note)
             continue
+        if _bisection_only:
+            # Placed, but honest about what it is: the chain reaches neither
+            # endpoint yet.  It still halves the gap, so the next epoch's
+            # diagnostics see a strictly easier edge -- that bisection is the
+            # whole reason this is not refused outright by default.
+            logging.warning(
+                "adaptive-production: weak edge %s-%s cannot be reconnected "
+                "within this epoch's budget -- placing %d bisection step(s) "
+                "only (%s). It %s",
+                s1.state_id, s2.state_id, n_place, prediction_note, reach_note,
+            )
         if shortfall:
             # Placing fewer bridges than the geometry calls for still leaves a
             # disconnected edge; say so loudly and by how much rather than
@@ -4053,11 +4287,20 @@ def propose_actions_from_diagnostics(
             )
             if shortfall:
                 reason = f"{reason}; UNDER-BRIDGED by {shortfall}"
+            if _bisection_only:
+                reason = f"{reason}; BISECTION-ONLY ({reach_note})"
             if _k_warning:
                 logging.warning("adaptive-production: %s", _k_warning)
                 reason = f"{reason}; {_k_warning}"
             actions.append(("add", int(parent.state_id), params, reason))
             added += 1
+        # Outcome names the DECISION (what the allocation funded);
+        # bridges_placed reports what survived near-duplicate filtering and the
+        # global budget guard, so the two can be compared instead of one
+        # silently standing in for the other.
+        _record("bisection_step" if _bisection_only else "bridged",
+                placed_this_edge,
+                reach_note if _bisection_only else "reconnects at least one endpoint")
 
     # 2. Optionally retire clearly converged non-critical states.  Only reclaim
     # windows that are genuinely redundant (measured overlap >= redundant_overlap).
@@ -5687,6 +5930,10 @@ def policy_from_args(args: Any) -> AdaptiveDecisionPolicy:
             args, "adaptive_production_bridge_healthy_spacing_sigma", 1.5),
         bridge_multi_window=_arg_bool(
             args, "adaptive_production_bridge_multi_window", True),
+        bridge_repairable_first=_arg_bool(
+            args, "adaptive_production_bridge_repairable_first", True),
+        bridge_skip_unreachable=_arg_bool(
+            args, "adaptive_production_bridge_skip_unreachable", False),
         context_reuse=_arg_bool(args, "adaptive_production_context_reuse", False),
         context_reuse_require=_arg_bool(args, "adaptive_production_context_reuse_require", False),
         context_reuse_mode=str(getattr(args, "adaptive_production_context_reuse_mode", "off") or "off"),
@@ -6125,17 +6372,21 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             )
             diagnostics = collect_segmented_epoch_diagnostics(epoch_dir, registry, policy)
             _assert_epoch_has_samples(diagnostics, registry, epoch_dir, int(actual_epoch_steps))
+        bridge_plan: List[Dict[str, Any]] = []
         actions = propose_actions_from_diagnostics(
             registry, diagnostics, policy=policy,
             temperature_K=_args_temperature_k(args),
             # Read live, not from a loop-start snapshot: _apply_tica_cv2_switch
             # rewrites args.cv2_k_max mid-campaign. See _resolve_secondary_k_max.
             secondary_k_max=_resolve_secondary_k_max(args),
+            bridge_plan_out=bridge_plan,
         )
         action_report = None
         if _arg_bool(args, "adaptive_production_write_action_reports", True):
             try:
-                action_report = write_epoch_action_report(epoch_dir, epoch, registry, diagnostics, actions, policy)
+                action_report = write_epoch_action_report(
+                    epoch_dir, epoch, registry, diagnostics, actions, policy,
+                    bridge_plan=bridge_plan)
             except Exception as exc:
                 # Diagnostics reports are useful, but they must never invalidate
                 # a completed MD epoch. Keep going and record the failure in the
@@ -6841,8 +7092,16 @@ def write_epoch_action_report(
     diagnostics: Dict[str, Any],
     actions: Sequence[Tuple],
     policy: AdaptiveDecisionPolicy,
+    bridge_plan: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> Dict[str, str]:
-    """Write a human/audit-friendly report explaining one adaptive decision step."""
+    """Write a human/audit-friendly report explaining one adaptive decision step.
+
+    ``bridge_plan`` is ``propose_actions_from_diagnostics``'s own per-weak-edge
+    record (see its ``bridge_plan_out``).  It is threaded in rather than
+    recomputed here on purpose: recomputing the placement prediction in the
+    report writer would let the audit trail and the decision drift apart, which
+    is precisely how the original placement bug stayed invisible.
+    """
     epoch_dir = Path(epoch_dir)
     action_dicts = [_action_to_dict(a) for a in actions]
     state_rows = diagnostics.get("states", []) or []
@@ -6871,6 +7130,10 @@ def write_epoch_action_report(
         "n_state_diagnostics": int(len(state_rows)),
         "n_edge_diagnostics": int(len(edge_rows)),
         "weak_edges": _json_ready(weak_edges),
+        # One row per weak edge the bridge planner considered, including the
+        # ones it could place nothing for -- an unrepairable weak edge is a
+        # finding, not an absence.
+        "bridge_plan": _json_ready(list(bridge_plan or [])),
         "undersampled_states": _json_ready(undersampled),
         "actions": action_dicts,
         "action_counts": {
@@ -6923,6 +7186,22 @@ def _write_epoch_action_markdown(path: Path, report: Dict[str, Any]) -> None:
             lines.append(
                 f"| {edge.get('state_i')} | {edge.get('state_j')} | {edge.get('overlap')} | "
                 f"{edge.get('exchange_acceptance')} | {', '.join(edge.get('warnings', []) or [])} |"
+            )
+    plan = report.get("bridge_plan", []) or []
+    if plan:
+        lines.extend(["", "## Weak-edge bridge plan", ""])
+        lines.append("Outcome `bridged` reconnects at least one endpoint; "
+                     "`bisection_step` halves the gap for the next epoch; "
+                     "`skipped_no_budget` / `refused_unreachable` placed nothing.")
+        lines.append("")
+        lines.append("| edge | overlap | needed | min useful | allocated | placed | outcome | note |")
+        lines.append("|---|---:|---:|---:|---:|---:|---|---|")
+        for row in plan[:50]:
+            lines.append(
+                f"| {row.get('state_i')}-{row.get('state_j')} | {row.get('overlap')} | "
+                f"{row.get('bridges_needed')} | {row.get('min_useful_bridges')} | "
+                f"{row.get('bridges_allocated')} | {row.get('bridges_placed')} | "
+                f"{row.get('outcome')} | {row.get('note')} |"
             )
     lines.append("")
     Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")

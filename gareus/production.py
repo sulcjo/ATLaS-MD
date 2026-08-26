@@ -1700,6 +1700,10 @@ def _connected_components_count(n_nodes: int, edges: list[dict]) -> int:
 _EPOCH_WINDOW_MAP_NAME = "epoch_window_map.csv"
 _EPOCH_WINDOW_MAP_LEDGER_NAME = "epoch_window_map_rewrites.json"
 _EPOCH_WINDOW_MAP_LEDGER_SCHEMA = "gareus_epoch_window_map_rewrite_ledger_v1"
+# The ledger file carries two independent lists.  They are not one list, and
+# `_append_epoch_window_map_reorder_ledger` is where the reason lives.
+_EPOCH_WINDOW_MAP_LEDGER_APPLIED_KEY = "applied"
+_EPOCH_WINDOW_MAP_LEDGER_REORDERS_KEY = "reorders"
 
 
 def _int_or_none(value) -> Optional[int]:
@@ -1744,8 +1748,8 @@ def _write_epoch_window_map_rows(path: Path, fieldnames, rows) -> None:
         raise
 
 
-def _read_epoch_window_map_rewrite_ledger(out_dir: Path) -> list:
-    """Applied-rewrite ledger entries for this phase, oldest first.
+def _read_epoch_window_map_ledger_list(out_dir: Path, key: str) -> list:
+    """One of the ledger file's two entry lists, oldest first.
 
     A missing/damaged ledger reads as empty: the ledger only ever *adds* a
     refusal (it can never be the reason a needed rewrite happens), so losing it
@@ -1754,38 +1758,113 @@ def _read_epoch_window_map_rewrite_ledger(out_dir: Path) -> list:
     payload = read_json_file(Path(out_dir) / _EPOCH_WINDOW_MAP_LEDGER_NAME, None)
     if not isinstance(payload, dict):
         return []
-    applied = payload.get("applied")
-    return [e for e in applied if isinstance(e, dict)] if isinstance(applied, list) else []
+    entries = payload.get(key)
+    return [e for e in entries if isinstance(e, dict)] if isinstance(entries, list) else []
 
 
-def _append_epoch_window_map_rewrite_ledger(out_dir: Path, entry: dict) -> None:
-    """Append one applied-rewrite record next to the map it describes.
+def _read_epoch_window_map_rewrite_ledger(out_dir: Path) -> list:
+    """Applied-DROP ledger entries for this phase, oldest first.
+
+    Deliberately reads only ``applied`` and never ``reorders``: the idempotence
+    rule in `_epoch_window_map_rewrite_already_applied` is a statement about drop
+    sets, and a reorder has no drop set to key on.  See
+    `_append_epoch_window_map_reorder_ledger` for why the two lists are kept
+    apart rather than merged.
+    """
+    return _read_epoch_window_map_ledger_list(out_dir, _EPOCH_WINDOW_MAP_LEDGER_APPLIED_KEY)
+
+
+def _read_epoch_window_map_reorder_ledger(out_dir: Path) -> list:
+    """Applied-REORDER records for this phase, oldest first.
+
+    A pure log.  Nothing branches on it - see
+    `_append_epoch_window_map_reorder_ledger`.
+    """
+    return _read_epoch_window_map_ledger_list(out_dir, _EPOCH_WINDOW_MAP_LEDGER_REORDERS_KEY)
+
+
+def _append_epoch_window_map_ledger_entry(out_dir: Path, key: str, entry: dict) -> bool:
+    """Append one record to one of the ledger's two lists.  True when it landed.
+
+    Rewrites BOTH lists every time, not only the one being appended to: the file
+    is replaced wholesale by `write_json`, so an appender that rebuilt the payload
+    from its own list alone would silently delete the other one - which is exactly
+    how the reorder record (added after the drop record already existed) would go
+    missing on any phase that did both.
 
     Never raises: a phase that has already corrected its map must not die because
     the bookkeeping file could not be written (the map itself is the artifact that
-    matters; the ledger only guards against a *second* application).
+    matters; the drop list only guards against a *second* application).  Returns
+    whether the record actually reached disk, so a caller that reports "recorded"
+    in its own summary reports what happened rather than what it intended.
     """
     path = Path(out_dir) / _EPOCH_WINDOW_MAP_LEDGER_NAME
     try:
-        applied = _read_epoch_window_map_rewrite_ledger(out_dir)
-        applied.append(dict(entry))
+        lists = {
+            _EPOCH_WINDOW_MAP_LEDGER_APPLIED_KEY: _read_epoch_window_map_rewrite_ledger(out_dir),
+            _EPOCH_WINDOW_MAP_LEDGER_REORDERS_KEY: _read_epoch_window_map_reorder_ledger(out_dir),
+        }
+        lists[key].append(dict(entry))
         write_json(path, _json_ready({
             "schema": _EPOCH_WINDOW_MAP_LEDGER_SCHEMA,
             "description": (
-                "Every drop set already applied to this phase's epoch_window_map.csv, in order. "
-                "Each entry is keyed by (n_windows_before, dropped_window_indices) - the index space "
-                "the drop set was expressed in - plus the state_id sequence the rewrite produced. "
-                "A rewrite whose key is already present AND whose recorded surviving state_ids still "
-                "match the map on disk has already been applied and is refused."
+                "What has already been applied to this phase's epoch_window_map.csv, in order. "
+                "`applied` holds DROP SETS: each entry is keyed by (n_windows_before, "
+                "dropped_window_indices) - the index space the drop set was expressed in - plus "
+                "the state_id sequence the rewrite produced. A rewrite whose key is already "
+                "present AND whose recorded surviving state_ids still match the map on disk has "
+                "already been applied and is refused. `reorders` holds REORDERINGS onto the "
+                "surviving-window table, which remove no rows and so have no such key; they are a "
+                "record only and are never consulted to refuse anything."
             ),
             "map": str(Path(out_dir) / _EPOCH_WINDOW_MAP_NAME),
-            "applied": applied,
+            _EPOCH_WINDOW_MAP_LEDGER_APPLIED_KEY: lists[_EPOCH_WINDOW_MAP_LEDGER_APPLIED_KEY],
+            _EPOCH_WINDOW_MAP_LEDGER_REORDERS_KEY: lists[_EPOCH_WINDOW_MAP_LEDGER_REORDERS_KEY],
         }))
+        return True
     except Exception as exc:
         print(
             f"WARNING: could not record the epoch_window_map.csv rewrite in {path}: {exc}. "
             "The map itself was corrected; only the idempotence ledger is missing."
         )
+        return False
+
+
+def _append_epoch_window_map_rewrite_ledger(out_dir: Path, entry: dict) -> None:
+    """Append one applied-DROP record next to the map it describes."""
+    _append_epoch_window_map_ledger_entry(out_dir, _EPOCH_WINDOW_MAP_LEDGER_APPLIED_KEY, entry)
+
+
+def _append_epoch_window_map_reorder_ledger(out_dir: Path, entry: dict) -> bool:
+    """Append one applied-REORDER record.  True when it is on disk.
+
+    A separate list from ``applied``, and the separation is load-bearing rather
+    than tidiness.  `_epoch_window_map_rewrite_already_applied` refuses a request
+    whose ``source`` matches an entry's while the map still holds that entry's
+    ``surviving_state_ids``; a reorder entry written under source
+    ``surviving_window_table`` would therefore be able to refuse a later GENUINE
+    drop rewrite from that same source - a guard turning into the bug it guards
+    against.  The drop list's idempotence rule also rests on "a successful rewrite
+    always removes at least one row, so its key can never legitimately recur for
+    one map file", which a row-preserving reorder falsifies outright: two reorders
+    of one phase would write byte-identical entries.
+
+    Why record it at all, given a reorder is idempotent by projection: because
+    once it has run, the map and the window table AGREE and nothing in either
+    artifact says they ever did not.  The rows really were rewritten in place, and
+    every sample already logged for those windows was logged against the old
+    order, so an analysis produced before the reorder is invalid - which is the
+    one fact this record preserves and the artifacts alone cannot.  Until this
+    existed the only record was the summary `run_gareus` stores in the phase's
+    gareus_metadata.json, which a process killed between the map write and that
+    store never reaches: the map would be reordered on disk, the ledger empty, and
+    a resumed repair would return "consistent" with nothing anywhere saying a
+    reorder had happened.  The exposure that remains is one filesystem operation
+    wide (a kill between the map write and this append), not the whole remainder
+    of phase setup.
+    """
+    return _append_epoch_window_map_ledger_entry(
+        out_dir, _EPOCH_WINDOW_MAP_LEDGER_REORDERS_KEY, entry)
 
 
 def _epoch_window_map_rewrite_already_applied(
@@ -2148,6 +2227,151 @@ def _match_map_rows_to_surviving_windows(map_rows: list, surviving_centers: list
     return picked
 
 
+def _map_row_center_pairs(rows: list) -> list:
+    """``[(primary_center, secondary_center)]`` per epoch_window_map.csv row."""
+    return [(_first_map_float(r, "primary_center", "primary_cv_center", "distance_center_A"),
+             _first_map_float(r, "secondary_center", "secondary_cv_center")) for r in rows]
+
+
+def _has_duplicate_center_pairs(pairs) -> bool:
+    """True when two windows share a (primary, secondary) restraint centre.
+
+    Duplicate centres are legal - the explicit-2D loader deliberately keeps a
+    user's duplicated rows as separate thermodynamic states - but they make
+    centre matching ambiguous about WHICH of two identical rows a survivor is,
+    and picking the wrong one attaches the wrong state_id (the bias would be
+    identical; the MBAR state pooling would not).  Every caller must refuse to
+    infer rather than guess.
+    """
+    keyed = [(round(a, 9) if not math.isnan(a) else "nan", round(b, 9) if not math.isnan(b) else "nan")
+             for a, b in pairs]
+    return len(set(keyed)) != len(keyed)
+
+
+def _reorder_map_rows_onto_surviving_windows(rows: list, surviving_pairs: list) -> Optional[list]:
+    """`rows` REORDERED so that row *i* carries surviving window *i*'s restraint
+    centers, or None when the two artifacts do not list the same window set.
+
+    The non-order-preserving sibling of `_match_map_rows_to_surviving_windows`,
+    for the other defect.  That one is order-preserving because a drop renumbers
+    survivors without reordering them, so its answer is a subsequence; a
+    PERMUTATION (every window that really ran has a row, only the order is wrong)
+    fails it outright, since a greedy left-to-right scan cannot reach back past a
+    row it already consumed.
+
+    The matching rule itself is NOT reimplemented here: it is
+    `gareus/mbar_analysis/loaders_adaptive.py`'s
+    `_permute_map_rows_onto_window_table`, the same function the load-side guard
+    uses to decide the same question about the same two artifacts.  Two subtly
+    different answers to "is this a permutation" is exactly the drift that made
+    this a write-side/load-side divergence in the first place, so the write side
+    borrows the rule and contributes only what is genuinely its own: this file's
+    column-name aliasing (`primary_cv_center`/`distance_center_A`/
+    `secondary_cv_center`, which the load side's reader does not carry).  The
+    shadow rows below are that adapter - centers read here with the write side's
+    aliases, handed over under the two names the shared matcher reads, and mapped
+    back to the caller's real row objects by position.  A float's ``str()``
+    round-trips exactly in Python 3 and ``str(nan)`` reads back as NaN, so a
+    CV1-only phase's absent secondary axis survives the hand-off unchanged.
+
+    The import is function-local to keep production's module-import graph free of
+    the analysis subpackage (`loaders_adaptive` names this file in its own
+    docstrings; a module-level edge would invite a cycle).  It cannot fail in
+    practice - same distribution, and its own imports are a subset of the ones
+    this module already performs at import time - but the caller treats an
+    exception here as a refusal rather than letting it escape, because
+    `repair_epoch_window_map_from_surviving_windows` documents "Never raises" and
+    run_gareus calls it outside any try/except.
+    """
+    from .mbar_analysis.loaders_adaptive import _permute_map_rows_onto_window_table
+
+    shadow = [{"primary_center": str(c1), "secondary_center": str(c2), "_row_index": i}
+              for i, (c1, c2) in enumerate(_map_row_center_pairs(rows))]
+    picked = _permute_map_rows_onto_window_table(shadow, list(surviving_pairs))
+    if picked is None:
+        return None
+    return [rows[int(s["_row_index"])] for s in picked]
+
+
+def _select_map_rows_onto_surviving_windows(rows: list, surviving_pairs: list) -> tuple:
+    """``(picked, problem)`` - one map row per surviving window, in the TABLE's
+    order, when that assignment is forced; ``(None, phrase)`` when it is not.
+
+    For the compound stale map: MORE rows than the phase has windows AND those
+    windows listed in the wrong order.  `_match_map_rows_to_surviving_windows`
+    cannot see it (order-preserving, so a permutation defeats it) and
+    `_reorder_map_rows_onto_surviving_windows` cannot either (it requires every
+    map row to be consumed, so the extra rows defeat it), which is why the shape
+    used to come back from this file as ``skipped_centers_do_not_match``.
+
+    Same borrowing rule as `_reorder_map_rows_onto_surviving_windows`, for the
+    same reason: the matching itself is
+    `gareus/mbar_analysis/loaders_adaptive.py`'s
+    `_select_map_rows_onto_window_table`, so the two sides cannot answer "is this
+    map derivable, and to what" differently - the divergence this whole
+    write-side/load-side pairing exists to prevent.  What is genuinely local is
+    this file's column-name aliasing, handed over through the same shadow rows.
+
+    That matcher is FORCED rather than greedy - it refuses a window with two
+    candidate rows, and two windows sharing one - and the strictness matters more
+    here than in the equal-count reorder: with more rows than windows a candidate
+    may be a PHANTOM, a state this phase dropped and never sampled, so an
+    arbitrary pick can hand a real window's samples to a state that never ran.
+    That is the chignolin_6 failure itself, not a hypothetical.  The
+    duplicate-centre abstain upstream already refuses most of that ground; this
+    keeps the guarantee at the matcher rather than resting it on call ordering.
+    """
+    from .mbar_analysis.loaders_adaptive import _select_map_rows_onto_window_table
+
+    shadow = [{"primary_center": str(c1), "secondary_center": str(c2), "_row_index": i}
+              for i, (c1, c2) in enumerate(_map_row_center_pairs(rows))]
+    picked, problem = _select_map_rows_onto_window_table(shadow, list(surviving_pairs))
+    if picked is None:
+        return None, problem
+    return [rows[int(s["_row_index"])] for s in picked], None
+
+
+def _reorder_positional_problem(out_dir: Path, rows: list) -> Optional[str]:
+    """None when both records may be trusted POSITIONALLY, else a phrase saying
+    which one may not and why.
+
+    The gate that separates re-deriving a mapping from fabricating one, for
+    BOTH repairs that take their output order from the window table: the
+    equal-count reorder and the compound (longer AND out-of-order) selection.
+    (The name said "equal_count" while it was only used by the first; the check
+    itself never was equal-count-specific.)  Removing rows alone (the plain drop
+    repair) keeps the map's own order, so a mis-ordered record makes that matcher
+    refuse; taking the output order *from* the surviving-window table instead
+    means that if the table's rows are not this phase's local windows 0..N-1 by
+    position the rewritten map is wrong while looking right - the window sets
+    still match, so nothing downstream would notice.  Symmetrically, a sample's local window index is resolved through the
+    map's ``epoch_window`` VALUE, so position and value must agree there before
+    moving a row to a new position means anything.
+
+    Neither condition is producible by any current writer (`write_epoch_window_map`
+    enumerates, every rewrite path renumbers 0..N-1, and
+    `explicit_window_analysis_rows` writes ``window: int(i)`` over the surviving
+    windows in order) and neither occurs on any real phase on disk.  They are
+    checked because when they do not hold, which of the two orders is the
+    local-window order becomes an inference rather than a reading, and this repair
+    abstains rather than guesses.
+
+    The table side delegates to the load-side reader that already owns this rule
+    (`_read_phase_window_table`, which returns exactly such a phrase), for the same
+    no-second-implementation reason as `_reorder_map_rows_onto_surviving_windows`;
+    it reads the centers through the same column aliases in the same order as
+    `_phase_surviving_window_centers`, so the two never disagree about the table's
+    contents, only about whether its ordering may be trusted.
+    """
+    from .mbar_analysis.loaders_adaptive import _read_phase_window_table
+
+    numbering = [_int_or_none(r.get("epoch_window")) for r in rows]
+    if numbering != list(range(len(rows))):
+        return (f"the map's epoch_window column is not numbered 0..{len(rows) - 1} in file order "
+                f"({numbering[:8]}...), so its rows are not this phase's local windows by position")
+    return _read_phase_window_table(out_dir)[1]
+
+
 def repair_epoch_window_map_from_surviving_windows(
     out_dir: Path,
     source: str = "surviving_window_table",
@@ -2166,10 +2390,43 @@ def repair_epoch_window_map_from_surviving_windows(
     pull or the drop that would have corrected the map again.  Without this the
     drop-time rewrite contributes nothing at all to an interrupted phase.
 
-    Idempotent by construction: it acts only when the map holds MORE rows than the
-    phase has real windows, so a second call (or a call on a phase that never
-    dropped anything) is a no-op.  Returns None when there is no map or no
-    surviving-window table to work from, otherwise a status dict.  Never raises.
+    Two shapes of stale map are repaired, and they are different repairs:
+
+    * MORE rows than the phase has real windows - the drop case.  The phantom rows
+      are removed and the survivors renumbered 0..N-1 in their original order.
+      Destructive and non-idempotent, hence the ledger
+      (``epoch_window_map_rewrites.json``); see
+      `_epoch_window_map_rewrite_already_applied`.
+    * EQUALLY many rows listing exactly this phase's windows in the WRONG ORDER -
+      a permutation.  The rows are reordered onto the window table and renumbered;
+      nothing is added or removed.  Recorded in the ledger file's separate
+      ``reorders`` list, NOT in the ``applied`` drop list whose key is a drop set
+      in an index space that a reorder does not have (see
+      `_append_epoch_window_map_reorder_ledger`).  It needs no replay guard -
+      ordering rows into the table's order is a projection, so applying it twice
+      is applying it once, which a second call demonstrates by taking the
+      order-preserving branch and returning ``consistent`` without writing - but
+      it does need a record, because afterwards the two artifacts agree and
+      nothing else on disk says they once did not.  The returned summary spells
+      this out under ``ledger`` and is additionally stored in the phase's
+      ``gareus_metadata.json`` by the caller.
+  * MORE rows than real windows AND in the wrong order - the compound case.  The
+      rows that carry the real windows' centres are selected in the table's order
+      and renumbered, the rest are dropped, and because rows ARE removed this one
+      does take an ``applied`` ledger entry like any other drop.  Repaired only
+      when each real window has exactly one map row carrying its centres; see
+      `_select_map_rows_onto_surviving_windows`.
+
+    Every other equal-count outcome is a refusal, because the map cannot be
+    re-derived from what is on disk: a genuinely different window set of the same
+    size (``inconsistent_equal_count_centers_do_not_match`` - the one residual the
+    count check alone cannot see), duplicate restraint centers making the match
+    ambiguous, or a record whose own ordering cannot be trusted positionally
+    (``inconsistent_equal_count_reorder_not_positionally_verifiable``).  A phase
+    that never dropped or reordered anything is never touched at all.
+
+    Returns None when there is no map or no surviving-window table to work from,
+    otherwise a status dict.  Never raises.
     """
     out_dir = Path(out_dir)
     path = out_dir / _EPOCH_WINDOW_MAP_NAME
@@ -2186,7 +2443,188 @@ def repair_epoch_window_map_from_surviving_windows(
         return {"status": "skipped_unreadable", "path": str(path), "error": str(exc), "source": str(source)}
 
     if len(rows) == len(surviving):
-        return {"status": "consistent", "path": str(path), "n_windows": int(len(rows)), "source": str(source)}
+        # An agreeing row COUNT is not an agreeing window SET.  Two attempts at the
+        # same phase can drop equally many but different windows - attempt 1 drops
+        # window a, attempt 2 (after an interruption re-pulls) drops window b - and
+        # the map left behind by attempt 1 then has exactly the right number of rows
+        # while describing the wrong states from index min(a,b) onwards.  That is
+        # documented residual #1 of the drop-rewrite fix, and the matcher that
+        # settles it is already in this file and already called on the mismatch
+        # path, so checking here costs one extra scan over a handful of rows.
+        #
+        # Whether an equal-count map can be REPAIRED turns on which of two things
+        # went wrong, and telling them apart is the whole job of this branch: a
+        # different window set has no row at all for a window that really ran, so
+        # there is nothing to re-derive its state_id FROM and the honest outcome is
+        # a loud refusal; a permutation has every row and only the order wrong, so
+        # the mapping is read off the two artifacts and the map is reordered in
+        # place.  Either way the outcome is durable - the caller stores every
+        # outcome except a verified pass into the phase's gareus_metadata.json, see
+        # _epoch_window_map_repair_must_be_recorded - and the load-time guard in
+        # gareus/mbar_analysis/loaders_adaptive.py makes the same call, from the
+        # same evidence, for runs already on disk that this side can never reach.
+        surviving_pairs = list(surviving)
+        map_pairs_equal = _map_row_center_pairs(rows)
+        if _has_duplicate_center_pairs(surviving_pairs) or _has_duplicate_center_pairs(map_pairs_equal):
+            # Ambiguous by construction - see _has_duplicate_center_pairs.  Report
+            # the count agreement, but do not claim the centres were verified.
+            #
+            # Also what shields the reorder attempt below: the shared permutation
+            # matcher is a greedy first-unused-match, so it pairs two rows with
+            # identical centers arbitrarily and would attach one of them the
+            # other's state_id (identical bias, different MBAR state pooling).
+            # Delete this abstain and a duplicate-centre phase gets reordered on a
+            # coin flip - measured, not assumed.  Its position relative to the
+            # reorder attempt is not what matters, only that it wins.
+            return {"status": "consistent", "path": str(path), "n_windows": int(len(rows)),
+                    "source": str(source), "centers_verified": False,
+                    "centers_check": "skipped_duplicate_centers"}
+        if _match_map_rows_to_surviving_windows(rows, surviving_pairs) is not None:
+            return {"status": "consistent", "path": str(path), "n_windows": int(len(rows)),
+                    "source": str(source), "centers_verified": True}
+
+        # The map does not list this phase's windows in order.  Two very different
+        # things produce that, and until this revision both were reported as the
+        # first one - including the false explanation "two attempts at this phase
+        # dropped equally many but different windows":
+        #
+        #   * a genuinely DIFFERENT window set of the same size.  Some window that
+        #     really ran has no row at all, its state_id is recorded nowhere in
+        #     these two artifacts, and nothing can re-derive one.  Refused, below.
+        #   * a PERMUTATION - every window that really ran does have a row, only
+        #     at the wrong position.  Then the mapping is read off rather than
+        #     inferred: table row *i*'s centers are the restraint local window *i*
+        #     really ran under, so the state that belongs to its samples is the one
+        #     on the map row carrying those centers, wherever that row sits.
+        #
+        # The load-side guard (gareus/mbar_analysis/loaders_adaptive.py's
+        # `_consistent_map_membership_notes`) already draws that distinction and
+        # repairs the second case in memory from these same two files.  This side
+        # declining a repair the other side proves derivable was a straight
+        # divergence, so both now ask the same matcher the same question.
+        try:
+            reordered = _reorder_map_rows_onto_surviving_windows(rows, surviving_pairs)
+            positional_problem = (
+                None if reordered is None else _reorder_positional_problem(out_dir, rows)
+            )
+        except Exception as exc:
+            # "Never raises" is this function's contract and run_gareus calls it
+            # outside any try/except, so a failure of the one check that reaches
+            # into another module degrades to a recorded refusal rather than
+            # killing a production phase whose MD is fine.
+            print(
+                f"WARNING [{source}]: could not check {path} for a reordering of this phase's "
+                f"windows: {exc}. Leaving it untouched; if the map IS misordered this phase's "
+                "samples may be attributed to the wrong umbrella state - see "
+                "docs/chignolin_6_low_ess_root_cause.md."
+            )
+            return {"status": "skipped_reorder_check_failed", "path": str(path),
+                    "n_windows": int(len(rows)), "source": str(source),
+                    "centers_verified": False, "error": str(exc)}
+
+        if reordered is None:
+            print(
+                f"WARNING [{source}]: {path} has the right number of rows ({len(rows)}) for this phase's "
+                f"{len(surviving)} windows, but its rows do not contain those windows' restraint centers "
+                "in any order - so the map describes a DIFFERENT window set of the same size (two attempts "
+                "at this phase dropped equally many but different windows). At least one window that really "
+                "ran has no row in the map, so the map cannot be re-derived from itself and is left "
+                "untouched; this phase's samples may be attributed to the wrong umbrella state - see "
+                "docs/chignolin_6_low_ess_root_cause.md."
+            )
+            return {"status": "inconsistent_equal_count_centers_do_not_match", "path": str(path),
+                    "n_windows": int(len(rows)), "source": str(source), "centers_verified": False}
+
+        if positional_problem is not None:
+            print(
+                f"WARNING [{source}]: {path} lists the same window set as this phase's own post-drop "
+                f"window table but in a different order, and that reordering cannot be applied because "
+                f"{positional_problem}. Leaving the map untouched rather than guessing which of the two "
+                "orders is the local-window order; this phase's samples may be attributed to the wrong "
+                "umbrella state - see docs/chignolin_6_low_ess_root_cause.md."
+            )
+            return {"status": "inconsistent_equal_count_reorder_not_positionally_verifiable",
+                    "path": str(path), "n_windows": int(len(rows)), "source": str(source),
+                    "centers_verified": False, "positional_problem": str(positional_problem)}
+
+        state_ids_before = _epoch_window_map_state_ids(rows)
+        # How many rows physically changed position, counted from row identity
+        # rather than from state_id: a map holding the same state_id on two rows
+        # with different centers really would be reordered while `moved` below
+        # stays empty, and reporting "0 windows moved" for a rewrite that did
+        # happen is the same kind of untrue claim this branch exists to stop.
+        n_rows_moved = sum(1 for i, row in enumerate(reordered) if row is not rows[i])
+        renumbered = [dict(r) for r in reordered]
+        for new_idx, row in enumerate(renumbered):
+            row["epoch_window"] = int(new_idx)
+        state_ids_after = _epoch_window_map_state_ids(renumbered)
+        try:
+            _write_epoch_window_map_rows(path, fieldnames, renumbered)
+        except Exception as exc:
+            print(f"WARNING: failed to reorder {path} onto the surviving window table: {exc}")
+            return {"status": "error", "path": str(path), "error": str(exc), "source": str(source)}
+
+        moved = [{"epoch_window": int(i), "state_id_before": before, "state_id_after": after}
+                 for i, (before, after) in enumerate(zip(state_ids_before, state_ids_after))
+                 if before != after]
+        summary = {
+            "status": "rewritten_reordered",
+            "path": str(path),
+            "source": str(source),
+            "n_windows": int(len(rows)),
+            "centers_verified": True,
+            "n_rows_moved": int(n_rows_moved),
+            "moved_windows": moved,
+            "state_ids_before": state_ids_before,
+            "state_ids_after": state_ids_after,
+            # Deliberately no dropped_state_ids/dropped_window_indices: a reorder
+            # removes nothing, and an empty pair of those keys next to an
+            # unchanged row count is an invitation to answer "was this map
+            # rewritten?" by comparing counts - the proxy that let this defect
+            # sit unnoticed on the load side too.  The status and `moved_windows`
+            # answer it directly.
+        }
+        # Recorded in the ledger file's OWN list, next to the map it rewrote, and
+        # written here rather than left to the caller: run_gareus stores this
+        # summary in the phase's gareus_metadata.json only after returning, so a
+        # process killed in between used to leave the map reordered on disk with
+        # nothing anywhere saying so - and a resumed repair then answers
+        # "consistent", because by then the two artifacts agree.  See
+        # `_append_epoch_window_map_reorder_ledger` for why this must not go in
+        # the drop list, and why "idempotent, therefore no record needed" does
+        # not follow.
+        reorder_recorded = _append_epoch_window_map_reorder_ledger(out_dir, summary)
+        summary["ledger"] = {
+            "appended": bool(reorder_recorded),
+            "list": _EPOCH_WINDOW_MAP_LEDGER_REORDERS_KEY,
+            "reason": (
+                "epoch_window_map_rewrites.json's `applied` list records DROP SETS, keyed by "
+                "(n_windows_before, dropped_window_indices), and its idempotence rule rests on a "
+                "successful rewrite always removing at least one row so that key can never "
+                "legitimately recur for one map file. A reorder removes no rows, so it has no such "
+                "key, two reorders of one phase would write byte-identical entries, and an entry "
+                "under this source could refuse a later genuine drop rewrite from the same source. "
+                "It is therefore recorded in the separate `reorders` list, which nothing consults "
+                "to refuse anything. It needs no replay guard: ordering rows into the window "
+                "table's order is a projection, so applying it twice is applying it once - a "
+                "re-invocation finds the order-preserving matcher succeeding and returns "
+                "'consistent' without writing. run_gareus additionally stores this summary in the "
+                "phase's gareus_metadata.json, which is the record that is lost if the process dies "
+                "before it gets there."
+            ),
+        }
+        print(
+            f"WARNING [{source}]: {path} lists exactly the windows this phase runs but "
+            f"{n_rows_moved} of {len(rows)} sat at the wrong local window - the map is a PERMUTATION of "
+            f"the right rows, not a different window set, so the correct mapping was re-derived from "
+            f"umbrella_explicit_windows.csv by matching restraint centers and the map was REORDERED in "
+            f"place. Corrected local->state mapping: "
+            f"{', '.join(str(m['epoch_window']) + ': ' + str(m['state_id_before']) + '->' + str(m['state_id_after']) for m in moved)}. "
+            "Every sample already written for those windows was logged against the old order, so any "
+            "analysis of this phase from before this correction is invalid - see "
+            "docs/chignolin_6_low_ess_root_cause.md."
+        )
+        return summary
 
     if len(rows) < len(surviving):
         print(
@@ -2197,20 +2635,11 @@ def repair_epoch_window_map_from_surviving_windows(
         return {"status": "skipped_map_shorter_than_window_set", "path": str(path),
                 "n_map_rows": int(len(rows)), "n_windows": int(len(surviving)), "source": str(source)}
 
-    # Duplicate (primary, secondary) window centers are legal - the explicit-2D
-    # loader deliberately keeps a user's duplicated rows as separate thermodynamic
-    # states - but they make center matching ambiguous about WHICH of two
-    # identical rows survived, and picking the wrong one attaches the wrong
-    # state_id (the bias would be identical; the MBAR state pooling would not).
-    # Refuse rather than guess.
-    def _dup(pairs) -> bool:
-        keyed = [(round(a, 9) if not math.isnan(a) else "nan", round(b, 9) if not math.isnan(b) else "nan")
-                 for a, b in pairs]
-        return len(set(keyed)) != len(keyed)
-
-    map_pairs = [(_first_map_float(r, "primary_center", "primary_cv_center", "distance_center_A"),
-                  _first_map_float(r, "secondary_center", "secondary_cv_center")) for r in rows]
-    if _dup(surviving) or _dup(map_pairs):
+    # Duplicate (primary, secondary) window centers make center matching ambiguous
+    # about WHICH of two identical rows survived - refuse rather than guess.  See
+    # _has_duplicate_center_pairs for why they are legal in the first place.
+    map_pairs = _map_row_center_pairs(rows)
+    if _has_duplicate_center_pairs(surviving) or _has_duplicate_center_pairs(map_pairs):
         print(
             f"WARNING: {path} has {len(rows)} rows for {len(surviving)} real windows, but the window "
             "centers contain duplicates, so matching them cannot tell which of two identical rows "
@@ -2221,23 +2650,69 @@ def repair_epoch_window_map_from_surviving_windows(
                 "n_map_rows": int(len(rows)), "n_windows": int(len(surviving)), "source": str(source)}
 
     matched = _match_map_rows_to_surviving_windows(rows, surviving)
+    reordered_onto_table = False
     if matched is None:
-        print(
-            f"WARNING: {path} has {len(rows)} rows for {len(surviving)} real windows, but its rows do not "
-            "contain the surviving windows' restraint centers in order, so the correct local-window -> "
-            "state mapping cannot be re-derived. Leaving the map untouched; MBAR sample-to-state "
-            "attribution for this phase may be wrong - see docs/chignolin_6_low_ess_root_cause.md."
-        )
-        return {"status": "skipped_centers_do_not_match", "path": str(path),
-                "n_map_rows": int(len(rows)), "n_windows": int(len(surviving)), "source": str(source)}
+        # Not "the map is unusable" - only "the extra rows cannot simply be
+        # removed, because the rows that remain are also in the wrong order".
+        # The compound stale map: longer AND permuted.  It is derivable exactly
+        # when each surviving window has one and only one map row carrying its
+        # restraint centers, and refused otherwise, which is what
+        # `_select_map_rows_onto_surviving_windows` decides (and the load-side
+        # guard decides identically, from the same two files - checked by running
+        # both on one fixture, not argued).
+        try:
+            selected, select_problem = _select_map_rows_onto_surviving_windows(rows, surviving)
+            positional_problem = (
+                None if selected is None else _reorder_positional_problem(out_dir, rows)
+            )
+        except Exception as exc:
+            # Same contract as the equal-count reorder's own check: "Never raises"
+            # and run_gareus calls this outside any try/except, so a failure of
+            # the one check that reaches into another module degrades to a
+            # recorded refusal rather than killing a production phase.
+            print(
+                f"WARNING [{source}]: could not check {path} for a reordering of this phase's "
+                f"windows: {exc}. Leaving it untouched; if the map IS misordered this phase's "
+                "samples may be attributed to the wrong umbrella state - see "
+                "docs/chignolin_6_low_ess_root_cause.md."
+            )
+            return {"status": "skipped_reorder_check_failed", "path": str(path),
+                    "n_map_rows": int(len(rows)), "n_windows": int(len(surviving)),
+                    "source": str(source), "centers_verified": False, "error": str(exc)}
+        if selected is None:
+            print(
+                f"WARNING: {path} has {len(rows)} rows for {len(surviving)} real windows, but its rows do not "
+                "contain the surviving windows' restraint centers in order, and they cannot be matched onto "
+                f"those windows out of order either: {select_problem}. The correct local-window -> state "
+                "mapping therefore cannot be re-derived. Leaving the map untouched; MBAR sample-to-state "
+                "attribution for this phase may be wrong - see docs/chignolin_6_low_ess_root_cause.md."
+            )
+            return {"status": "skipped_centers_do_not_match", "path": str(path),
+                    "n_map_rows": int(len(rows)), "n_windows": int(len(surviving)),
+                    "source": str(source), "centers_verified": False,
+                    "select_problem": str(select_problem)}
+        if positional_problem is not None:
+            print(
+                f"WARNING [{source}]: {path} has more rows than this phase's {len(surviving)} windows and "
+                f"lists those windows out of order, and the correction cannot be applied because "
+                f"{positional_problem}. Leaving the map untouched rather than guessing which of the two "
+                "orders is the local-window order; this phase's samples may be attributed to the wrong "
+                "umbrella state - see docs/chignolin_6_low_ess_root_cause.md."
+            )
+            return {"status": "skipped_reorder_not_positionally_verifiable", "path": str(path),
+                    "n_map_rows": int(len(rows)), "n_windows": int(len(surviving)),
+                    "source": str(source), "centers_verified": False,
+                    "positional_problem": str(positional_problem)}
+        matched = selected
+        reordered_onto_table = True
 
-    kept_positions = []
-    j = 0
-    for row in matched:
-        while j < len(rows) and rows[j] is not row:
-            j += 1
-        kept_positions.append(j)
-        j += 1
+    # By row identity rather than by an order-assuming walk: `matched` is in the
+    # window TABLE's order, which for the compound case above is deliberately not
+    # the map's.  Every row object here came from one `csv.DictReader` pass, so
+    # `id()` identifies it uniquely; for the order-preserving case this returns
+    # exactly the positions the previous left-to-right pointer walk did.
+    position_of_row = {id(row): i for i, row in enumerate(rows)}
+    kept_positions = [position_of_row[id(row)] for row in matched]
     dropped_positions = [i for i in range(len(rows)) if i not in set(kept_positions)]
     dropped_state_ids = [_int_or_none(rows[i].get("state_id")) for i in dropped_positions]
 
@@ -2251,24 +2726,96 @@ def repair_epoch_window_map_from_surviving_windows(
         return {"status": "error", "path": str(path), "error": str(exc), "source": str(source)}
 
     summary = {
-        "status": "rewritten",
+        # A status a human reading gareus_metadata.json can act on: the compound
+        # case removed rows AND moved the ones it kept, and "rewritten" alone
+        # would say only the first half.
+        "status": "rewritten_reordered_and_pruned" if reordered_onto_table else "rewritten",
         "path": str(path),
         "source": str(source),
+        "reordered_onto_window_table": bool(reordered_onto_table),
         "n_windows_before": int(len(rows)),
         "n_windows_after": int(len(survivors)),
         "dropped_window_indices": dropped_positions,
         "dropped_state_ids": [s for s in dropped_state_ids if s is not None],
         "surviving_state_ids": _epoch_window_map_state_ids(survivors),
     }
+    if reordered_onto_table:
+        # Only for the compound case.  When the map's own row order is preserved
+        # (the plain drop repair), `dropped_window_indices` already says exactly
+        # which local windows shifted and by how much; a reordering has no such
+        # compact description, so the before/after mapping is spelled out.
+        summary["moved_windows"] = [
+            {"epoch_window": int(i), "state_id_before": _int_or_none(rows[i].get("state_id")),
+             "state_id_after": _int_or_none(row.get("state_id"))}
+            for i, row in enumerate(survivors)
+            if _int_or_none(rows[i].get("state_id")) != _int_or_none(row.get("state_id"))
+        ]
+    # An `applied` ledger entry either way: this branch REMOVES rows, so it has a
+    # real drop key (n_windows_before, dropped_window_indices) and the
+    # strictly-decreasing row count the idempotence rule rests on - unlike the
+    # equal-count reorder, which has neither and is recorded separately.
     _append_epoch_window_map_rewrite_ledger(out_dir, summary)
-    print(
-        f"WARNING [{source}]: {path} listed {len(rows)} windows but this phase runs {len(survivors)}; "
-        f"re-derived it from umbrella_explicit_windows.csv by matching restraint centers - dropped map "
-        f"rows {dropped_positions} (state_id {dropped_state_ids}), survivors renumbered "
-        f"0..{len(survivors) - 1} keeping their own state_id and centers. A stale map here would have "
-        "attributed this phase's samples to the wrong umbrella state."
-    )
+    if reordered_onto_table:
+        print(
+            f"WARNING [{source}]: {path} listed {len(rows)} windows for the {len(survivors)} this phase "
+            f"runs AND listed them in the wrong order - a compound stale map. Every real window had "
+            f"exactly one map row carrying its restraint centers, so the correct mapping was read off "
+            f"umbrella_explicit_windows.csv: dropped map rows {dropped_positions} (state_id "
+            f"{dropped_state_ids}), the rest REORDERED onto the window table and renumbered "
+            f"0..{len(survivors) - 1} keeping their own state_id and centers. Corrected local->state "
+            f"mapping: "
+            f"{', '.join(str(m['epoch_window']) + ': ' + str(m['state_id_before']) + '->' + str(m['state_id_after']) for m in summary['moved_windows'])}. "
+            "Every sample already written for those windows was logged against the old order, so any "
+            "analysis of this phase from before this correction is invalid - see "
+            "docs/chignolin_6_low_ess_root_cause.md."
+        )
+    else:
+        print(
+            f"WARNING [{source}]: {path} listed {len(rows)} windows but this phase runs {len(survivors)}; "
+            f"re-derived it from umbrella_explicit_windows.csv by matching restraint centers - dropped map "
+            f"rows {dropped_positions} (state_id {dropped_state_ids}), survivors renumbered "
+            f"0..{len(survivors) - 1} keeping their own state_id and centers. A stale map here would have "
+            "attributed this phase's samples to the wrong umbrella state."
+        )
     return summary
+
+
+def _epoch_window_map_repair_must_be_recorded(summary: Optional[dict]) -> bool:
+    """True when a `repair_epoch_window_map_from_surviving_windows` result belongs
+    in the phase's gareus_metadata.json.
+
+    Durable unless the map was actually VERIFIED against this phase's surviving
+    window table - not merely "not rewritten".  The two are different claims and
+    the difference is the whole point: the equal-count branch abstains (status
+    "consistent", `centers_verified` False, `centers_check`
+    "skipped_duplicate_centers") when duplicate restraint centers make the
+    membership check ambiguous, so it reports the row counts agreeing WITHOUT
+    having established that the map describes this phase's window set.  Keying the
+    record off `status != "consistent"` alone would drop exactly that case on the
+    floor, leaving an operator reading the metadata later unable to tell "centres
+    verified" from "centres unverifiable" - while every one of its siblings out of
+    that same branch (`rewritten_reordered`,
+    `inconsistent_equal_count_centers_do_not_match`,
+    `inconsistent_equal_count_reorder_not_positionally_verifiable`, and every
+    `skipped_*`) is on record.  A skip case must never be indistinguishable from a
+    pass.
+
+    Written as "anything but a verified pass" rather than a list of the statuses to
+    keep, so a future branch that returns "consistent" without verifying the
+    centres is durable by default instead of silently inheriting the old fate.
+
+    Not a warning and not a health signal: duplicate (primary, secondary) centers
+    are legal (the explicit-2D loader keeps a user's duplicated rows as separate
+    thermodynamic states), so a run that uses them records this on every phase.
+    Nothing consumes the key programmatically - it is forensic evidence for a human
+    reading the phase directory afterwards, which is the only place the question
+    "was this map ever actually checked?" can still be answered.
+    """
+    if not summary:
+        return False
+    if summary.get("status") != "consistent":
+        return True
+    return summary.get("centers_verified") is not True
 
 
 def drop_bad_us_windows_and_rebuild(
@@ -4532,7 +5079,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     _map_repair = repair_epoch_window_map_from_surviving_windows(
         out_dir, source="fast_resume_surviving_window_table" if fast_resume else "surviving_window_table",
     )
-    if _map_repair is not None and _map_repair.get("status") != "consistent":
+    if _epoch_window_map_repair_must_be_recorded(_map_repair):
         window_metadata = dict(window_metadata or {})
         window_metadata["epoch_window_map_repair_from_window_table"] = _map_repair
 

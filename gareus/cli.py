@@ -355,6 +355,24 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                         "historical one-midpoint-per-weak-edge allocation; the geometric "
                         "requirement and any shortfall are recorded in the new state's reason "
                         "either way.")
+    p.add_argument("--ap-bridge-repairable-first", action=argparse.BooleanOptionalAction, default=True,
+                   help="Give the per-epoch window budget to the weak edges that can actually "
+                        "be reconnected within it FIRST -- each seeded with the number of "
+                        "bridges it takes to reach an endpoint -- before any budget reaches an "
+                        "edge that cannot be reconnected this epoch. Without this an edge needing "
+                        "14 windows before it reconnects anything takes a round-1 slot ahead of "
+                        "an edge two windows would finish (chignolin_6's edge 14-20 did exactly "
+                        "that). Use --no-ap-bridge-repairable-first for the previous flat "
+                        "round-robin over weak edges.")
+    p.add_argument("--ap-bridge-skip-unreachable", action=argparse.BooleanOptionalAction, default=False,
+                   help="Refuse to place ANY window at a weak edge that cannot be reconnected "
+                        "within this epoch's budget, instead of spending leftover budget on it. "
+                        "OFF by default: an evenly spaced bridge halves the gap, so a lone window "
+                        "on such an edge is a bisection step (8 -> 4 -> 2 -> 1 bridges needed "
+                        "over successive epochs), and refusing it makes a run whose budget is "
+                        "smaller than every weak edge's requirement add zero windows forever. "
+                        "Either way the edge is reported in the log and in "
+                        "adaptive_epoch_actions.json's bridge_plan.")
     p.add_argument("--ap-bridge-healthy-spacing-sigma", type=float, default=1.5,
                    help="Healthy umbrella centre spacing in units of the neighbouring window's "
                         "own harmonic width sigma = sqrt(kT/k). Sets how many bridge windows a "
@@ -1054,6 +1072,8 @@ def _shim_adaptive_production(args: argparse.Namespace) -> None:
     args.adaptive_production_max_new_windows_per_epoch = args.ap_max_new_windows
     args.adaptive_production_bridge_multi_window = args.ap_bridge_multi_window
     args.adaptive_production_bridge_healthy_spacing_sigma = args.ap_bridge_healthy_spacing_sigma
+    args.adaptive_production_bridge_repairable_first = args.ap_bridge_repairable_first
+    args.adaptive_production_bridge_skip_unreachable = args.ap_bridge_skip_unreachable
     args.adaptive_production_retire_converged = args.ap_retire_converged
     args.adaptive_production_max_gamd_boost_sd_kcal_mol = args.ap_gamd_boost_sd_warn
     args.adaptive_production_write_action_reports = args.ap_write_reports

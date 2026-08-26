@@ -696,6 +696,12 @@ def _secondary_window_params(meta: dict, K: int) -> tuple:
     multi-round augmentation path use ``secondary_cv_center``/
     ``secondary_cv_k_kcal_mol``), hence the alias tuples above.
 
+    This is ONE snapshot of the window table, applied to every epoch: it is not
+    the per-epoch native window params the union loader reconstructs u_nk (and
+    therefore self_bias) from, and on a run that recentred its windows
+    mid-campaign the two legitimately differ. The columns this feeds are named
+    ``*_window_table`` for that reason; see the window_diagnostics.csv writer.
+
     Absent, blank, unparseable or missing rows yield NaN rather than 0.0 -- the
     caller must be able to tell "this window has no secondary restraint" from
     "this window is restrained at 0.0", and a 0.0 default would silently claim
@@ -1567,6 +1573,25 @@ def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.nd
         # and each window's CV-space nearest neighbour with that pair's overlap
         # in BOTH spaces (A6).
         #
+        # secondary_center_window_table / secondary_k_kcal_mol_window_table name
+        # their provenance in the header rather than leaving it to be guessed.
+        # They are the loader's own per-window table (_secondary_window_params
+        # -> meta['umbrella_window_rows']: the union-Parquet loader's
+        # final_registry_used_for_mbar.csv, load_csv's umbrella_windows.csv, and
+        # blank for the legacy epoch-CSV path), i.e. ONE snapshot applied to
+        # every epoch. self_bias_median_kT beside them is computed from each
+        # epoch's OWN native window params (loaders_union_parquet's per-epoch
+        # blocks), and cv2_mean/cv2_std are observed. On a run that recentred
+        # its windows mid-campaign -- the tICA CV2 switch overwrites
+        # primary/secondary centres in place, which is exactly what the
+        # 2026-08-04 per-epoch-bias fix exists for -- the snapshot columns and
+        # the observed/native ones legitimately disagree, and that disagreement
+        # is a recentring, NOT the mapping fault this table was added to expose.
+        # The historical center_A / k_kcal_mol_A2 columns come from the same
+        # snapshot (d.centers / d.k_kcal are built from those same rows) and
+        # keep their long-standing names for backward compatibility; only the
+        # new columns get to say so in the header.
+        #
         # overlap_left/overlap_right keep their historical meaning exactly:
         # index-adjacent, CV1 marginal. Every new overlap column names its own
         # space instead, because marginal and joint overlaps are the same shape
@@ -1574,7 +1599,8 @@ def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.nd
         # cv_space_overlap_joint is blank for a run with no biased second axis
         # (or with --no-joint-overlap).
         wr = csv.DictWriter(f, fieldnames=[
-            'window', 'center_A', 'k_kcal_mol_A2', 'secondary_center', 'secondary_k_kcal_mol',
+            'window', 'center_A', 'k_kcal_mol_A2',
+            'secondary_center_window_table', 'secondary_k_kcal_mol_window_table',
             'samples', 'cv_mean_A', 'cv_std_A', 'cv2_mean', 'cv2_std',
             'self_bias_median_kT', 'self_bias_p90_kT',
             'overlap_left', 'overlap_right', 'cv_space_neighbor',
@@ -1585,8 +1611,8 @@ def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.nd
             wr.writerow({'window': k,
                          'center_A': _f(d.centers, k),
                          'k_kcal_mol_A2': _f(d.k_kcal, k),
-                         'secondary_center': _f(_sec_centers, k),
-                         'secondary_k_kcal_mol': _f(_sec_ks, k),
+                         'secondary_center_window_table': _f(_sec_centers, k),
+                         'secondary_k_kcal_mol_window_table': _f(_sec_ks, k),
                          'samples': int(n_k_local[k]),
                          'cv_mean_A': _f(_mean_per_window, k, _has_samples[k]),
                          'cv_std_A': _f(_std_per_window, k, _has_samples[k]),

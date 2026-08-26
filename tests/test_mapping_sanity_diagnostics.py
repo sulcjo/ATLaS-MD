@@ -230,14 +230,14 @@ def test_window_diagnostics_exposes_secondary_centre_k_and_observed_cv2(tmp_path
         tmp_path, [], None)
     with (tmp_path / 'window_diagnostics.csv').open() as f:
         rdr = csv.DictReader(f)
-        assert 'secondary_center' in rdr.fieldnames
-        assert 'secondary_k_kcal_mol' in rdr.fieldnames
+        assert 'secondary_center_window_table' in rdr.fieldnames
+        assert 'secondary_k_kcal_mol_window_table' in rdr.fieldnames
         assert 'cv2_mean' in rdr.fieldnames
         assert 'cv2_std' in rdr.fieldnames
         rows = {int(r['window']): r for r in rdr}
     for k in range(3):
-        assert float(rows[k]['secondary_center']) == pytest.approx(centers2[k])
-        assert float(rows[k]['secondary_k_kcal_mol']) == pytest.approx(k2[k])
+        assert float(rows[k]['secondary_center_window_table']) == pytest.approx(centers2[k])
+        assert float(rows[k]['secondary_k_kcal_mol_window_table']) == pytest.approx(k2[k])
         assert float(rows[k]['cv2_mean']) == pytest.approx(centers2[k], abs=0.02)
         assert float(rows[k]['cv2_std']) == pytest.approx(np.sqrt(0.6 / k2[k]), rel=0.15)
 
@@ -254,9 +254,54 @@ def test_window_diagnostics_secondary_columns_are_blank_for_a_cv1_only_run(tmp_p
     with (tmp_path / 'window_diagnostics.csv').open() as f:
         rows = {int(r['window']): r for r in csv.DictReader(f)}
     for k in range(3):
-        assert rows[k]['secondary_center'] == ''
-        assert rows[k]['secondary_k_kcal_mol'] == ''
+        assert rows[k]['secondary_center_window_table'] == ''
+        assert rows[k]['secondary_k_kcal_mol_window_table'] == ''
         assert rows[k]['cv2_mean'] == '' and rows[k]['cv2_std'] == ''
+
+
+def test_the_secondary_columns_are_named_for_the_snapshot_they_come_from(tmp_path):
+    """M1: those two columns are ONE window-table snapshot; their neighbours are not.
+
+    ``_secondary_window_params`` reads ``meta['umbrella_window_rows']`` -- for
+    the union loader that is ``final_registry_used_for_mbar.csv``, i.e. a single
+    snapshot applied to every epoch. ``cv2_mean`` beside it is observed and
+    ``self_bias_median_kT`` is reconstructed from each epoch's OWN native
+    params, so on a run that recentred its windows mid-campaign (the tICA CV2
+    switch overwrites centres in place) the snapshot and the observed value
+    legitimately disagree -- in a table whose stated new purpose is mapping
+    sanity, where an unexplained disagreement reads as a mapping fault.
+
+    The header now says which is which, so this asserts the column named for
+    the snapshot really carries the snapshot rather than the observed value.
+    """
+    cv, cv2, win, centers, k_kcal, centers2, k2 = _clean_2d_run(n_per=900, seed=11)
+    d = _make_data(cv, cv2, win, centers, k_kcal, centers2, k2, out_dir=tmp_path)
+    # Recentre exactly the way the CV2 switch does: the window rows the analysis
+    # is handed no longer describe where these samples were collected.
+    recentred = np.asarray(centers2) + 0.75
+    for k, row in enumerate(d.meta['umbrella_window_rows']):
+        row['secondary_center'] = str(recentred[k])
+
+    pmfmod.run_pmf_and_gamd_boost_report(
+        d, _Args(), np.zeros(cv.size), np.linspace(-0.1, 0.3, 21), 0.6,
+        tmp_path, [], None)
+
+    with (tmp_path / 'window_diagnostics.csv').open() as f:
+        rdr = csv.DictReader(f)
+        fields = list(rdr.fieldnames)
+        rows = {int(r['window']): r for r in rdr}
+    # The provenance-free spelling is gone, not merely duplicated -- a reader
+    # cannot land on the ambiguous name any more.
+    assert 'secondary_center' not in fields
+    assert 'secondary_k_kcal_mol' not in fields
+    for k in range(3):
+        snapshot = float(rows[k]['secondary_center_window_table'])
+        observed = float(rows[k]['cv2_mean'])
+        assert snapshot == pytest.approx(recentred[k])
+        assert observed == pytest.approx(centers2[k], abs=0.02)
+        # Fixture check: the two really do disagree here, so the header is
+        # carrying real information rather than restating the same number.
+        assert abs(snapshot - observed) > 0.5
 
 
 def test_secondary_window_params_reads_every_loader_spelling():
@@ -1004,6 +1049,12 @@ def test_analyze_publishes_every_mapping_diagnostic_end_to_end(tmp_path):
     assert 'index-adjacent (windows' in ov['detail'], ov['detail']
     assert 'may not be neighbours in CV space' in ov['detail'], ov['detail']
     assert 'joint' in ov['detail'].lower(), ov['detail']
+    # M4: `metric` alone cannot say which space it was measured in, and the two
+    # carry different thresholds. The label has to survive the trip onto disk --
+    # a health block assembled field-by-field somewhere would drop it silently.
+    assert ov['metric_space'] == pmfmod.OVERLAP_SPACE_JOINT, ov
+    assert ov['metric'] == pytest.approx(
+        min(r['overlap'] for r in disk['joint_overlap']['cv_space_neighbor_overlap']))
     assert checks['Overlap connectivity']['status'] == 'pass', checks['Overlap connectivity']
     mp = checks['Sample-to-state mapping']
     assert mp['status'] == 'fail', mp
@@ -1356,3 +1407,66 @@ def test_the_reported_isolation_depth_is_the_one_the_verdict_grades(tmp_path):
     chk = gr._check_overlap_connectivity({'overlap_connectivity': conn})
     assert chk['status'] == 'fail'           # ~13 sigma apart: no information
     assert f'{best:.4f}' in chk['detail']
+
+
+# ===========================================================================
+# M4 -- a graded overlap number must say which space it was measured in
+# ===========================================================================
+# `metric` changed meaning when the joint matrix arrived: joint if present,
+# else the CV-space marginal, else index-adjacent. It is published in
+# pmf_summary.json's health block, and the two spaces are the same shape and
+# scale with different thresholds -- an external consumer grading `metric`
+# against --min-neighbor-overlap would silently misread a joint value as a
+# marginal one. Nothing in-repo consumes it, which is exactly why a drift here
+# would be invisible.
+def test_a_graded_overlap_metric_says_which_space_it_came_from():
+    joint = _summary(
+        cv_space_neighbor_overlap=[{'window': 0, 'neighbor': 1, 'overlap': 0.97}],
+        joint_overlap={'available': True, 'threshold': 0.09, 'dim': 2,
+                       'cv_space_neighbor_overlap': [
+                           {'window': 0, 'neighbor': 1, 'overlap': 0.02}]})
+    ov = next(c for c in gr.build_health_verdict(joint, 0.30)['checks']
+              if c['name'] == 'Window overlap')
+    # The joint number won, so the space must be the joint one -- 0.02 read as
+    # a marginal overlap is a catastrophe, read as a joint one it is merely bad.
+    assert ov['metric'] == pytest.approx(0.02)
+    assert ov['metric_space'] == gr.OVERLAP_SPACE_JOINT
+
+    marginal = _summary(
+        cv_space_neighbor_overlap=[{'window': 0, 'neighbor': 1, 'overlap': 0.42}],
+        joint_overlap={'available': False, 'reason': 'no secondary restraint'})
+    ov = next(c for c in gr.build_health_verdict(marginal, 0.30)['checks']
+              if c['name'] == 'Window overlap')
+    assert ov['metric'] == pytest.approx(0.42)
+    assert ov['metric_space'] == gr.OVERLAP_SPACE_MARGINAL
+
+
+def test_the_index_adjacent_fallback_metric_is_also_labelled():
+    """The oldest summary format: no CV-space list, no joint block at all."""
+    s = _summary()
+    s['neighbor_overlap'] = [0.5] * 8 + [0.11]
+    ov = next(c for c in gr.build_health_verdict(s, 0.30)['checks']
+              if c['name'] == 'Window overlap')
+    assert ov['metric'] == pytest.approx(0.11)
+    assert ov['metric_space'] == gr.OVERLAP_SPACE_MARGINAL
+
+
+def test_metric_space_uses_the_analysis_module_s_own_vocabulary():
+    """gareus_report duplicates these two strings to stay standalone-importable.
+
+    Duplication only stays safe while it is checked: if pmf.py ever renames a
+    space, a consumer comparing a check's ``metric_space`` with the summary's
+    own ``overlap_space`` would start silently matching nothing.
+    """
+    assert gr.OVERLAP_SPACE_MARGINAL == pmfmod.OVERLAP_SPACE_MARGINAL
+    assert gr.OVERLAP_SPACE_JOINT == pmfmod.OVERLAP_SPACE_JOINT
+    assert gr.OVERLAP_SPACE_MARGINAL != gr.OVERLAP_SPACE_JOINT
+
+
+def test_an_ungraded_overlap_check_carries_neither_metric_nor_space():
+    s = _summary()
+    s['neighbor_overlap'] = []
+    ov = next(c for c in gr.build_health_verdict(s, 0.30)['checks']
+              if c['name'] == 'Window overlap')
+    assert ov['status'] == 'na'
+    assert 'metric' not in ov and 'metric_space' not in ov

@@ -26,6 +26,11 @@ from .loaders_adaptive import (
     _find_adaptive_epoch_csv_sources, _has_epoch_csv_layout,
     load_epoch_csv_adaptive, load_union_npz,
     _find_gareus_round_dirs, _augment_with_adaptive_rounds,
+    _PHANTOM_EPOCH_WINDOW_BASE, _STALE_WINDOW_MAP_DOC,
+    _STALE_WINDOW_MAP_OVERRIDE_ENV, _phase_label,
+    _phase_recorded_window_count, _read_epoch_window_map_rows,
+    _validate_and_repair_epoch_window_map,
+    window_map_note_reports_a_fault, window_map_note_rewrote_rows,
 )
 from .loaders_union_parquet import load_parquet_adaptive_union
 
@@ -518,6 +523,352 @@ def prod_dir_of(path: Path) -> Path:
     )
 
 
+# ---------------------------------------------------------------------------
+# Stale `epoch_window_map.csv` guard -- shared entry points for the consumers
+# that are NOT the union-Parquet loader
+# ---------------------------------------------------------------------------
+#
+# `_validate_and_repair_epoch_window_map` (loaders_adaptive.py) is the single
+# implementation of the auto-drop staleness check; loaders_union_parquet.py
+# calls it per epoch. Three other consumers read the same file raw, so the
+# same mis-attribution bug (~15% of a real 12.1M-sample campaign, see
+# docs/chignolin_6_low_ess_root_cause.md) reached them untouched:
+#
+#   * compare_gareus_runs.py's `load_npz_adaptive_union` -- a parallel union
+#     implementation for legacy NPZ-only adaptive runs. It produces comparison
+#     PMF numbers, so it calls the guard directly and fails closed exactly
+#     like the Parquet loader does.
+#   * `load_union_npz` -- reads `adaptive_union_mbar.npz`, whose per-sample
+#     state attribution the *driver* baked in at run time from these same
+#     maps. It cannot be re-derived from the npz, so the only honest check is
+#     of the maps it was built from: `check_union_npz_window_map_provenance`.
+#   * plot_adaptive_diagnostics.py -- figures, not free energies. It gets
+#     `figure_epoch_window_map_rows`, which repairs where it can and annotates
+#     loudly where it cannot, instead of refusing to draw.
+#
+# These wrappers exist so those callers share one call into the guard and one
+# statement of the policy, rather than each growing its own variant.
+
+
+def _stale_window_map_override_enabled() -> bool:
+    """Whether ``GAREUS_ALLOW_STALE_WINDOW_MAP`` downgrades a refusal to a warning.
+
+    Read here rather than left to the guard because the union-npz check below
+    has to make ONE decision over many phases: with the override set the guard
+    stops raising and reports through its notes instead, so a wrapper that
+    treated "any note" as fatal would invert the override's documented job.
+    """
+    return os.environ.get(_STALE_WINDOW_MAP_OVERRIDE_ENV, '').strip().lower() in ('1', 'true', 'yes')
+
+
+def _row_epoch_window(row: dict) -> int:
+    """A map row's local window index, or -1 when it has no parsable one."""
+    try:
+        return int(row['epoch_window'])
+    except (KeyError, TypeError, ValueError):
+        return -1
+
+
+def _reachable_state_by_window(rows: list) -> dict:
+    """``{local_window: state_id}`` over the rows a sample can actually reach.
+
+    Phantom rows (a repair parks the dropped states' rows past
+    `_PHANTOM_EPOCH_WINDOW_BASE`) are excluded, so this is directly comparable
+    between a stale row list and its repair: same keys iff the repair moved
+    nothing.
+    """
+    out = {}
+    for r in rows:
+        ew = _row_epoch_window(r)
+        if 0 <= ew < _PHANTOM_EPOCH_WINDOW_BASE:
+            try:
+                out[ew] = int(r['state_id'])
+            except (KeyError, TypeError, ValueError):
+                continue
+    return out
+
+
+def figure_epoch_window_map_rows(phase_dir, wmap_rows: list,
+                                 window_ids=None, cv2=None) -> tuple:
+    """``(rows, note)`` for a *figure* consumer of one phase's window map.
+
+    Same guard, deliberately non-fatal policy: a diagnostic plotter that
+    refuses to draw when a run looks odd is useless exactly when it is
+    reached for, so an unrepairable map is still drawn -- from the stale rows
+    -- and the caller gets a note to print and to stamp on the figure. `note`
+    is None when the guard found nothing wrong with the map (the overwhelming
+    majority of phases) and, per the paragraph below, also when all it had to
+    report is that a cross-check could not run; the rows then come back
+    untouched. It is NOT None for anything the guard actually found.
+
+    Unlike the MBAR path, the returned rows are the SURVIVORS ONLY. A repair
+    keeps the dropped states' rows, parked at `_PHANTOM_EPOCH_WINDOW_BASE`+,
+    because MBAR still needs their epoch-native window params to back those
+    states' bias columns when it evaluates *other* epochs' samples against
+    them. A figure has no such consumer and would instead draw one window
+    ellipse per row -- re-adding the never-run windows the repair just took
+    out. Same returned list, two consumers wanting opposite halves of it.
+
+    A note saying only that a cross-check could NOT RUN comes back as `None`
+    here, deliberately, and this is the one consumer where that is right. The
+    plotter renders whatever it is handed under one fixed heading
+    (`plot_adaptive_diagnostics._annotate_map_warnings` stamps "STALE
+    epoch_window_map.csv" on the figure), so passing it a note about an absent
+    check would print a claim of staleness this guard did not make -- on a
+    figure, where there is no room for the qualification. The same note still
+    reaches the MBAR and run-summary consumers, whose surfaces carry its own
+    wording and its own severity.
+    """
+    try:
+        rows, notes = _validate_and_repair_epoch_window_map(
+            phase_dir, list(wmap_rows), window_ids=window_ids, cv2=cv2)
+    except ValueError as exc:
+        return list(wmap_rows), (
+            f'[stale window map] {exc} FIGURES BELOW ARE DRAWN FROM THE STALE MAP: every '
+            f'per-state sample count and window label for {_phase_label(phase_dir)} may belong '
+            f'to a different state.')
+    # Both decisions are taken on the note OBJECTS, before any copy of their
+    # text: `kind` does not survive an f-string, and a note that loses it grades
+    # as a fault (see WindowMapNote). Notes arrive one at a time today; the
+    # `any`/list forms are so a second one could never silently change which
+    # branch is taken.
+    faults = [n for n in notes if window_map_note_reports_a_fault(n)]
+    if not faults:
+        return list(rows), None
+    if not any(window_map_note_rewrote_rows(n) for n in notes):
+        # A detected fault the guard could not repair (or an override load): the
+        # rows are the map's own, unrenumbered, so there is no phantom half to
+        # take out and no contiguity to protect. Drawing them is what this
+        # consumer is for; the note says they may be wrong.
+        return list(rows), faults[0]
+    # The guard rewrote the list, so every row that belongs to a real local
+    # window carries a freshly renumbered 0..N-1 `epoch_window`. A row that
+    # still fails to parse (-1) is therefore one the repair could not place,
+    # and it must not travel into a frame whose index column is otherwise
+    # contiguous -- hence the lower bound as well as the phantom upper bound.
+    survivors = [r for r in rows
+                 if 0 <= _row_epoch_window(r) < _PHANTOM_EPOCH_WINDOW_BASE]
+    # The ONE returned note has to be the one that describes what happened to
+    # the returned rows, because that is the only thing the caller has left to
+    # ask: `plot_adaptive_diagnostics._phase_window_map` decides whether to
+    # follow the repair by testing `window_map_note_rewrote_rows` on it. Notes
+    # arrive one at a time today, so this picks the same object `faults[0]`
+    # does -- it is here for the same reason as the `any` above, so that a
+    # second note could never make the plotter draw the UNREPAIRED frame under
+    # a note that says REPAIRED IN MEMORY.
+    return survivors, next((n for n in faults if window_map_note_rewrote_rows(n)), faults[0])
+
+
+def _union_npz_phase_dirs_with_maps(ap_dir: Path) -> list:
+    """The phase dirs whose ``epoch_window_map.csv`` the driver read when it
+    built ``adaptive_union_mbar.npz``.
+
+    Mirrors `_epoch_sample_sources` (gareus/adaptive_production.py): the union
+    builder walks ``final`` and ``final_extension_NNN`` -- plus every
+    ``epoch_NNN`` when it was built with ``include_epochs`` -- taking each run
+    root and its ``baseline``/``topup_*`` children, and resolves every sample's
+    state through that directory's own map. ``adaptive_union_mbar.json``
+    records which epoch policy was used, so a stale numbered epoch does not
+    condemn an npz that never read it; the policy defaults to the inclusive
+    (checks more) side when the json is missing or silent. Pilot run roots can
+    live outside `ap_dir` entirely and are not covered here.
+    """
+    ap_dir = Path(ap_dir)
+    include_epochs = bool(rjson(ap_dir / 'adaptive_union_mbar.json', {}).get('include_epochs', True))
+    roots = []
+    if include_epochs:
+        roots.extend(sorted(ap_dir.glob('epoch_[0-9][0-9][0-9]')))
+    roots.append(ap_dir / 'final')
+    roots.extend(sorted(ap_dir.glob('final_extension_[0-9][0-9][0-9]')))
+    out = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for cand in [root] + sorted(c for c in root.iterdir()
+                                    if c.is_dir() and (c.name == 'baseline'
+                                                       or c.name.startswith('topup_'))):
+            if (cand / 'epoch_window_map.csv').exists():
+                out.append(cand)
+    return out
+
+
+def check_union_npz_window_map_provenance(ap_dir: Path) -> list:
+    """Notes on whether ``adaptive_union_mbar.npz``'s state attribution is sound.
+
+    The npz stores `sampled_state_ids` -- the mapping already applied -- and
+    not the local window indices it was applied to, so nothing about the
+    mapping can be recomputed, let alone repaired, from the npz itself. What
+    *can* be checked is the evidence the driver used: each phase's own
+    `epoch_window_map.csv`, run through the same guard the Parquet loader
+    uses. A phase the guard would repair or refuse is a phase whose map was
+    stale while the driver was reading it, so the npz's baked-in attribution
+    for that phase's samples is wrong on disk.
+
+    Returns notes for the caller to print and to carry into the run summary:
+
+    * ``[]`` -- every phase map checked out. Untouched behaviour.
+    * an ``[unverified window map]`` note -- some or all of the phases record
+      nothing about how many windows they really ran, so the check has nothing
+      to compare against there. Reported rather than passed over silently:
+      "not checkable" and "checked, fine" are different claims, and this
+      artifact predates the guard entirely.
+    * any ``[window map check] Could not cross-check ...`` note the guard
+      produced, passed straight through. Same principle one level down: the
+      phase's row count checked out and its *membership* could not be
+      cross-checked, which is neither a clean bill of health nor a fault. This
+      used to land in the stale bucket below and RAISE -- refusing to load a
+      healthy run on the strength of an absent check, the exact inversion the
+      note kinds exist to prevent (see `window_map_note_reports_a_fault`).
+    Raises ValueError on any stale map, because the npz cannot be repaired the
+    way per-epoch Parquet can -- re-analysing from the epoch data is the fix.
+    ``GAREUS_ALLOW_STALE_WINDOW_MAP=1`` downgrades that to a note (inspection
+    only; the free energies are then wrong by construction).
+
+    A stale map does not always mis-attribute samples: when the phantom rows
+    all sit *past* the phase's last real window, local indices 0..N-1 name the
+    same states before and after the repair (real case: RUNS/chignolin_5's
+    final/baseline -- 30 rows for 29 windows, the single phantom row last).
+    That is reported, because the severity differs, but it is NOT an exemption.
+    It is reported only for a phase the guard actually REPAIRED, since it is a
+    statement about the repair: a detected fault the guard could not repair has
+    no "after" to compare against, and the message says that instead.
+    The reason is the half of the damage this check cannot see: a window
+    dropped post-pull was never retired from the state registry either, and
+    `build_union_state_mbar_inputs` builds a column over every registry state
+    marked usable -- so the never-run window can still have entered the solve
+    as its own state, with an N_k this function has no way to attribute to a
+    phase. Passing such an npz on the strength of a check that does not cover
+    that would be exactly the silent-wrong-number trade this guard exists to
+    refuse.
+    """
+    ap_dir = Path(ap_dir)
+    override = _stale_window_map_override_enabled()
+    phase_dirs = _union_npz_phase_dirs_with_maps(ap_dir)
+    stale: list = []
+    verified: list = []
+    unverifiable: list = []
+    could_not_check: list = []
+    for phase_dir in phase_dirs:
+        rows = _read_epoch_window_map_rows(phase_dir)
+        if not rows:
+            unverifiable.append(_phase_label(phase_dir))
+            continue
+        try:
+            # No `window_ids`/`cv2`: the npz pools every phase's samples into
+            # one flat array with the local indices already resolved away, so
+            # this phase's own sample columns are not recoverable here. The
+            # row-count check against the phase's recorded window count still
+            # has teeth -- 126 of the 152 real phase maps in this repo's RUNS/
+            # tree carry that record.
+            repaired, notes = _validate_and_repair_epoch_window_map(phase_dir, rows)
+        except ValueError as exc:
+            stale.append(f'{_phase_label(phase_dir)}: {exc}')
+            continue
+        # On the note objects, before anything copies their text -- `kind` does
+        # not survive an f-string, and the `stale.append` below makes exactly
+        # such a copy.
+        faults = [n for n in notes if window_map_note_reports_a_fault(n)]
+        if not faults:
+            could_not_check.extend(notes)
+            if _phase_recorded_window_count(phase_dir) is None:
+                unverifiable.append(_phase_label(phase_dir))
+            else:
+                verified.append(_phase_label(phase_dir))
+            continue
+        # Stale on disk, which is what the driver read. Fatal either way; the
+        # qualifier below only sizes the damage in the message.
+        #
+        # Sizing it is a claim about a REPAIR, so it may only be made when
+        # there was one -- and that is a structural question the note answers
+        # directly. Both of the things that used to answer it here were proxies
+        # for it, and both were wrong in the same direction:
+        #
+        #   * `before == after`. For a fault the guard detects but cannot
+        #     repair (MAP_NOTE_FAULT_UNREPAIRED -- an equal-count map listing a
+        #     genuinely different window set) it hands back the caller's own
+        #     rows, so of course they name the same states: the comparison is
+        #     true VACUOUSLY, and the message then told the operator that this
+        #     phase's "per-sample attribution is unaffected" when its mapping
+        #     is not known at all. A reassuring sentence inside a refusal is the
+        #     worst possible place for one.
+        #   * `not override`. The override is consulted only on the refusal
+        #     path (`_fail`); BOTH repair paths -- the row-count
+        #     survivors+phantoms rebuild and the equal-count permutation
+        #     reorder -- run regardless of it, because it never suppresses a
+        #     repair that is possible. So it withheld a qualifier that was true
+        #     on a repairable phase read under the override.
+        #
+        # Taken on the note OBJECTS, before `stale.append` makes the first copy
+        # of their text: `kind` does not survive an f-string. These are the
+        # guard's own objects, uncopied, so the kind is always there; the
+        # unlabelled fallback is a safety net that grades as not-rewritten,
+        # which declines to size the damage rather than mis-sizing it.
+        rewrote = any(window_map_note_rewrote_rows(n) for n in notes)
+        if not rewrote:
+            qualifier = (' (no corrected mapping could be derived for this phase, so which of its '
+                         'local windows name the wrong state -- and how many samples that moves -- '
+                         'cannot be sized from these artifacts)')
+        else:
+            # `after` is non-empty for every repair the guard makes (survivors
+            # are renumbered from 0), but it is spelled out rather than relied
+            # on: an empty mapping would make `all()` vacuously true and put
+            # back exactly the false reassurance this branch exists to remove.
+            before = _reachable_state_by_window(rows)
+            after = _reachable_state_by_window(repaired)
+            unshifted = bool(after) and all(before.get(ew) == sid for ew, sid in after.items())
+            qualifier = ''
+            if unshifted:
+                qualifier = (' (this phase\'s own local windows name the same states before and '
+                             'after the repair, so its per-sample attribution is unaffected -- but '
+                             'a window dropped post-pull was never retired from the state registry '
+                             'either, so the never-run window may still have entered the npz\'s '
+                             'solve as its own state, which cannot be checked from the maps)')
+        stale.append(f'{_phase_label(phase_dir)}: {faults[0]}{qualifier}')
+
+    if stale:
+        detail = (
+            f'adaptive_union_mbar.npz in {ap_dir} was built in-run by the driver, which resolved '
+            f'every sample\'s umbrella state through each phase\'s own epoch_window_map.csv. '
+            f'{len(stale)} of those {len(phase_dirs)} map(s) is/are stale (the '
+            f'`--us-auto-drop-bad-windows` renumbering bug): {" | ".join(stale)}')
+        remedy = (
+            'The npz stores only the already-resolved sampled_state_ids, not the local window '
+            'indices they came from, so this CANNOT be repaired in memory the way the per-epoch '
+            'Parquet/CSV path is -- re-analyse from the epoch data instead. '
+            f'See {_STALE_WINDOW_MAP_DOC}.')
+        if override:
+            return [f'[stale window map] {detail}. Loaded anyway because '
+                    f'{_STALE_WINDOW_MAP_OVERRIDE_ENV} is set: these phases\' samples are '
+                    f'attributed to the wrong umbrella states and every free energy derived from '
+                    f'them is invalid. {remedy}']
+        raise ValueError(
+            f'{detail}. Loading it would report free energies built on samples attributed to the '
+            f'wrong umbrella states -- refusing to load. {remedy} Set '
+            f'{_STALE_WINDOW_MAP_OVERRIDE_ENV}=1 to load the mis-attributed npz regardless '
+            f'(for inspection only).')
+
+    notes = []
+    if unverifiable:
+        shown = unverifiable[:4]
+        listed = ', '.join(shown)
+        if len(unverifiable) > len(shown):
+            listed += f' (+{len(unverifiable) - len(shown)} more)'
+        notes.append(
+            f'[unverified window map] adaptive_union_mbar.npz\'s per-sample state attribution '
+            f'was baked in at run time from {len(phase_dirs)} phase window map(s); '
+            f'{len(unverifiable)} of them record nothing about how many windows the phase '
+            f'really ran ({listed}), so whether the `--us-auto-drop-bad-windows` staleness bug '
+            f'affected this artifact cannot be checked'
+            + (f' ({len(verified)} other phase(s) did check out). ' if verified else '. ')
+            + f'If this run used that flag, treat these numbers as unverified and re-analyse '
+              f'from the per-epoch data, which is checked and repaired in memory. '
+              f'See {_STALE_WINDOW_MAP_DOC}.')
+    # Verbatim, not summarised: each already names its phase and says exactly
+    # what could not be compared against what.
+    notes.extend(could_not_check)
+    return notes
+
+
 def load_data(inp: Path, out: Optional[Path], source: str = 'auto', no_augment: bool = False,
               n_threads: int = 0, n_workers: int = 4,
               epoch_ids: Optional[set[int]] = None) -> Data:
@@ -536,7 +887,19 @@ def load_data(inp: Path, out: Optional[Path], source: str = 'auto', no_augment: 
                 raise ValueError(
                     '--epoch requires per-epoch Parquet or CSV inputs; '
                     'adaptive_union_mbar.npz cannot be subset safely.')
+            # The npz's local-window -> state mapping was applied by the driver
+            # while the run was live and is not recoverable from the file, so
+            # unlike the Parquet path there is nothing here to repair. Check
+            # the maps it was built from instead: refuse on a provably stale
+            # one, say so when provenance cannot be established, stay silent
+            # otherwise. Notes also ride into meta['load_notes'] so they reach
+            # pmf_summary.json rather than only the terminal.
+            prov_notes = check_union_npz_window_map_provenance(prod)
             d = load_union_npz(prod)
+            for _n in prov_notes:
+                print(f'    {_n}')
+            if prov_notes:
+                d.meta['load_notes'] = list(d.meta.get('load_notes') or []) + prov_notes
         elif _has_epoch_csv_layout(prod, epoch_ids=epoch_ids):
             d = load_epoch_csv_adaptive(prod, epoch_ids=epoch_ids)
         else:

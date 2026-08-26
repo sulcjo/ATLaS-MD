@@ -7,11 +7,14 @@ These lock the *presentation* contract of the analysis result health block:
 - render helpers that never crash on partial/old-format summaries.
 """
 import json
+import sys
 from pathlib import Path
 
 import pytest
 
 import gareus_report as gr
+
+_TESTS_DIR = Path(__file__).resolve().parent
 
 
 # ----------------------------------------------------------------------------
@@ -483,3 +486,132 @@ def test_a_split_of_unknown_strength_fails():
     c = next(c for c in v["checks"] if c["name"] == "Overlap connectivity")
     assert c["status"] == "fail", c
     assert "isolation depth unknown" in c["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Triage of the equal-count window-map membership note
+# ---------------------------------------------------------------------------
+# These feed _severity_of the note text the LOADER really produces, not a
+# hand-written copy of it.  The note and the rule that grades it live in
+# different files (gareus/mbar_analysis/loaders_adaptive.py and this one) with
+# nothing but a regex holding them together, and that pair silently drifting
+# apart -- a reworded note falling through to the MEDIUM default -- is exactly
+# how the bug this branch exists for stayed invisible for a whole campaign.  A
+# fixture string could not catch it; only the real one can.
+if str(_TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_TESTS_DIR))
+
+from test_equal_count_map_fingerprint import (            # noqa: E402
+    _check_notes, _ladder, _phase, _samples, _write_window_table)
+
+
+def _real_membership_note(tmp_path) -> str:
+    """The real '[window map check]' note for a map that lists a genuinely
+    DIFFERENT window set of the same size.
+
+    Two attempts at one phase dropped equally many but different windows:
+    attempt 1 (whose map survived) dropped ladder entry 2, attempt 2 (which
+    actually ran) dropped entry 5. Six rows either way -- which is what hides
+    this from every count-based check -- but entry 5 really ran and has no row
+    in the map at all, so its state_id is recorded nowhere and nothing can
+    re-derive the mapping. That is what makes this the UNREPAIRABLE fault the
+    three tests below grade, and it is the same fixture shape as
+    `test_equal_count_map_fingerprint`'s own
+    `test_an_equal_count_map_describing_a_shifted_window_set_is_flagged`.
+
+    Deliberately NOT an adjacent-window exchange, which is what this helper
+    used to build: an exchange is a PERMUTATION -- same window set, wrong order
+    -- and the loader now repairs one in memory and returns a `[stale window
+    map]` repair note instead of the `[window map check]` fault note. Staging
+    the defect with a permutation therefore stopped staging a membership fault
+    at all, which is exactly the drift these tests exist to catch, one file
+    over.
+    """
+    ladder = _ladder(7)
+    real = ladder[:5] + ladder[6:]           # attempt 2 dropped ladder entry 5
+    phase, rows = _phase(tmp_path, ladder[:2] + ladder[3:], real)   # attempt 1 dropped entry 2
+    ids, cv2 = _samples(real)
+    notes = _check_notes(_run_loader(phase, rows, ids, cv2))
+    assert len(notes) == 1, notes
+    return notes[0]
+
+
+def _real_could_not_check_note(tmp_path) -> str:
+    """The real sibling note: the check could not run at all."""
+    centers = _ladder(5)
+    phase, rows = _phase(tmp_path, centers)
+    _write_window_table(phase / "umbrella_explicit_windows.csv", centers[:4])
+    ids, cv2 = _samples(centers)
+    notes = _check_notes(_run_loader(phase, rows, ids, cv2))
+    assert len(notes) == 1, notes
+    return notes[0]
+
+
+def _run_loader(phase, rows, ids, cv2):
+    from gareus.mbar_analysis.loaders_adaptive import _validate_and_repair_epoch_window_map
+    return _validate_and_repair_epoch_window_map(phase, rows, window_ids=ids, cv2=cv2)[1]
+
+
+def test_the_real_membership_note_is_triaged_high(tmp_path):
+    """The headline failure mode of this branch: samples attributed to the wrong
+    umbrella state.  It must not fall through to the MEDIUM default, which is
+    where an unmatched warning goes and where nobody looks."""
+    note = _real_membership_note(tmp_path)
+
+    assert gr._severity_of(note) == "HIGH", note
+
+
+def test_the_real_could_not_cross_check_note_is_graded_below_a_detected_fault(tmp_path):
+    """Its deliberate twin.  Same tag, weaker fact: the check did not run, which
+    is not the same as the check finding something -- so it must NOT be graded
+    with the note above, and the rule that says so must be the one matching it
+    (first match wins, and the broad tag rule would otherwise swallow it)."""
+    note = _real_could_not_check_note(tmp_path)
+
+    assert gr._severity_of(note) == "MEDIUM", note
+    assert gr._severity_of(note) != gr._severity_of(_real_membership_note(tmp_path))
+
+
+def test_the_real_membership_note_fails_the_mapping_check(tmp_path):
+    """A HIGH warning alone can still sit inside a PASS verdict -- the gap this
+    check row exists to close.  Self-bias is deliberately healthy here: two
+    attempts that drop equally many but different windows leave every sample on
+    a restraint one ladder step from its own, so every per-state energy stays
+    plausible and the mapping defect never reaches the self-bias numbers.  The
+    warning has to carry the verdict on its own."""
+    s = _good_summary()
+    s["warnings"] = [_real_membership_note(tmp_path)]
+    s["self_bias"] = {"median_kT": [1.0, 1.1, 0.9], "p90_kT": [2.0, 2.1, 1.9]}
+
+    v = gr.build_health_verdict(s, 0.30)
+
+    c = next(c for c in v["checks"] if c["name"] == "Sample-to-state mapping")
+    assert c["status"] == "fail", c
+    assert "DIFFERENT window set of the same size" in c["detail"]
+    assert v["overall"] == "FAIL"
+
+
+def test_the_real_could_not_cross_check_note_does_not_fail_the_mapping_check(tmp_path):
+    """Non-firing twin of the test above, and the whole point of separating the
+    two notes: an absent check must not be reported as a detected fault."""
+    s = _good_summary()
+    s["warnings"] = [_real_could_not_check_note(tmp_path)]
+    s["self_bias"] = {"median_kT": [1.0, 1.1, 0.9], "p90_kT": [2.0, 2.1, 1.9]}
+
+    v = gr.build_health_verdict(s, 0.30)
+
+    c = next(c for c in v["checks"] if c["name"] == "Sample-to-state mapping")
+    assert c["status"] == "pass", c
+    assert "DIFFERENT window set" not in c["detail"]
+
+
+def test_a_clean_phase_contributes_no_note_to_triage_at_all(tmp_path):
+    """The base rate that makes the two tests above worth anything: the note
+    only exists when the two artifacts really disagree.  Measured on real data
+    -- 117 of 117 adaptive-production phases under RUNS/ whose row count agrees
+    also agree row for row, and none of them emits this note."""
+    centers = _ladder(5)
+    phase, rows = _phase(tmp_path, centers)
+    ids, cv2 = _samples(centers)
+
+    assert _run_loader(phase, rows, ids, cv2) == []

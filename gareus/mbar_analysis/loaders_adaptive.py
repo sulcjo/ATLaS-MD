@@ -161,6 +161,95 @@ def _find_gareus_round_dirs(run_dir: Path) -> list:
 _STALE_WINDOW_MAP_DOC = 'docs/chignolin_6_low_ess_root_cause.md'
 _STALE_WINDOW_MAP_OVERRIDE_ENV = 'GAREUS_ALLOW_STALE_WINDOW_MAP'
 
+# What a note from this guard actually REPORTS, as a value rather than as a
+# phrase a consumer has to recognise in the text.
+#
+# `_validate_and_repair_epoch_window_map` returns `(rows, notes)`, and for a
+# while "notes is non-empty" meant exactly one thing: the map was stale. It no
+# longer does -- the equal-row-count branch can now report that a *check could
+# not run* on a phase whose map is not known to be wrong at all. Two consumers
+# in gareus/mbar_analysis/loaders.py had keyed off the old meaning, so the
+# weakest thing this guard can say ("I could not cross-check this") was
+# reaching `check_union_npz_window_map_provenance`'s stale bucket and raising
+# -- refusing to load a run on the strength of an absent check, which inverts
+# the severity the note itself is graded at (gareus_report.py deliberately
+# triages the "Could not cross-check" wording one band BELOW a detected fault).
+#
+# Hence these kinds. They are carried on the note object itself, so a consumer
+# branches on `window_map_note_reports_a_fault(note)` rather than on a regex
+# over prose that is rewritten every time the diagnosis improves -- prose
+# coupling is how the drift happened in the first place. `WindowMapNote` is a
+# `str` subclass, so every existing consumer (printing, `meta['load_notes']`,
+# JSON-serialising into pmf_summary.json's warnings, gareus_report.py's own
+# regex triage of that JSON) keeps working untouched and unaware.
+#
+# The kind does NOT survive `str()`/f-string interpolation of a note, which is
+# why every branch below must be taken on the note object itself, before any
+# copy of its text is made. A note that reaches a consumer without a kind
+# (a plain str built elsewhere, a copy) grades as MAP_NOTE_UNKNOWN, which is
+# treated as a fault: an unlabelled note falls back to the old, stricter
+# meaning rather than to the permissive one.
+MAP_NOTE_REPAIRED = 'repaired'                 # rows rewritten; the map on disk is wrong
+MAP_NOTE_STALE_LOADED = 'stale_loaded'         # map is wrong and was loaded anyway (override)
+MAP_NOTE_FAULT_UNREPAIRED = 'fault_unrepaired'  # fault detected, rows unchanged, not derivable
+MAP_NOTE_UNCHECKED = 'unchecked'               # a check could not run; nothing detected
+MAP_NOTE_UNKNOWN = 'unknown'                   # unlabelled note; treated as a fault
+
+
+class WindowMapNote(str):
+    """A window-map note that also says, structurally, what kind of thing it is.
+
+    Behaves as its own text everywhere (see the kinds above for why that
+    matters); `note.kind` is the machine-readable half. Deliberately not a
+    dataclass or a tuple: the notes travel through half a dozen consumers that
+    print them, extend lists with them and JSON-serialise them, and none of
+    those may need changing to add a distinction only two of them care about.
+    """
+
+    # `kind` MUST keep a default, and the default must be the fail-closed one.
+    # `copy`, `copy.deepcopy` and `pickle` all rebuild a str subclass through
+    # `str.__reduce_ex__`, which calls `cls.__new__(cls, text)` -- the text
+    # alone, from str's own `__getnewargs__` -- and only then restores the
+    # instance `__dict__` (where `kind` really travels). With `kind` required
+    # that call raises `TypeError`, so a note saying merely "I could not check
+    # this phase" would abort any caller that copies the metadata dict it rides
+    # in: a guard whose warnings can crash their carrier is worse than the drift
+    # it was added to fix. Pinned by
+    # tests/test_stale_map_other_consumers.py::
+    # test_a_window_map_note_survives_being_copied_and_pickled.
+    def __new__(cls, text: str, kind: str = MAP_NOTE_UNKNOWN):
+        obj = super().__new__(cls, text)
+        obj.kind = kind
+        return obj
+
+
+def window_map_note_kind(note) -> str:
+    """The note's kind, or `MAP_NOTE_UNKNOWN` for a note that carries none."""
+    return getattr(note, 'kind', MAP_NOTE_UNKNOWN)
+
+
+def window_map_note_reports_a_fault(note) -> bool:
+    """True when the note says this phase's map does NOT describe the mapping
+    the phase really used -- repaired, loaded-stale-anyway, or detected and not
+    repairable.
+
+    False only for `MAP_NOTE_UNCHECKED`: a check that could not run is not a
+    detected fault, and a consumer that treats it as one refuses healthy runs.
+    Anything unlabelled counts as a fault, so the failure mode of a note that
+    loses its kind is over-strictness, never a silently accepted bad mapping.
+    """
+    return window_map_note_kind(note) != MAP_NOTE_UNCHECKED
+
+
+def window_map_note_rewrote_rows(note) -> bool:
+    """True when the guard actually rebuilt the row list that came back with it.
+
+    The distinction a consumer needs before it does anything positional with
+    the returned rows: only after a repair are they renumbered 0..N-1 with the
+    dropped states' rows parked at `_PHANTOM_EPOCH_WINDOW_BASE`.
+    """
+    return window_map_note_kind(note) == MAP_NOTE_REPAIRED
+
 # Where a repaired map parks the rows of states that this phase dropped.
 #
 # The repair has to satisfy two consumers of the SAME returned row list, which
@@ -373,9 +462,26 @@ def _row_float(row: dict, *keys) -> float:
     return float('nan')
 
 
-def _phase_real_window_centers(phase_dir) -> Optional[list]:
-    """``[(primary_center, secondary_center)]`` per *real* local window, from the
-    phase's own ``umbrella_explicit_windows.csv``, or None if it has none.
+def _row_int(row: dict, key: str) -> Optional[int]:
+    """`row[key]` as an int, or None when it is missing or unparseable."""
+    try:
+        return int(row[key])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _read_phase_window_table(phase_dir) -> tuple:
+    """``(centers, problem)`` from the phase's own ``umbrella_explicit_windows.csv``.
+
+    `centers` is ``[(primary_center, secondary_center)]`` per *real* local
+    window; `problem` is a phrase describing why the table cannot be used
+    positionally. Exactly one of the two is ever set, and the three outcomes
+    are deliberately distinct:
+
+    * ``(None, None)`` -- the phase has no such table at all. Not a check that
+      failed: a plain 1D ladder or a legacy layout never wrote one.
+    * ``(None, "...")`` -- the table exists but cannot be lined up by position.
+    * ``([...], None)`` -- usable.
 
     This is the window table the sampler actually ran: it is rewritten after
     the post-pull auto-drop (`gareus/production.py` calls
@@ -385,20 +491,89 @@ def _phase_real_window_centers(phase_dir) -> Optional[list]:
     strictly better evidence than the drop record (which only says which
     pre-drop indices went away, and which several real runs on disk either
     never wrote or wrote incompletely).
+
+    Everything that consumes these centres consumes them POSITIONALLY -- row
+    *i* is local window *i* -- so the table's own ``window`` column is checked
+    to be numbered 0..N-1 in file order rather than discarded, which is the
+    same guard the map's ``epoch_window`` column already gets on the other side
+    of the same comparison. `explicit_window_analysis_rows`
+    (`gareus/production.py`) enumerates the surviving windows in order and
+    writes ``window: int(i)``, so this holds for every table any current writer
+    produces and for all 291 tables under RUNS/ (audited: every one has the
+    column, every one is 0..N-1 in file order). A writer that ever sorted the
+    table differently while keeping the column would otherwise have every
+    consumer here compare the wrong pairs, silently, on every phase. Sorting by
+    the column instead of refusing is deliberately NOT done: which of the two
+    orders is the local-window order would then be an inference, and this guard
+    abstains rather than guesses. A table with no ``window`` column at all
+    (nothing contradicts file order) is still trusted, as it always was.
     """
     path = Path(phase_dir) / 'umbrella_explicit_windows.csv'
     if not path.exists():
-        return None
+        return None, None
     with path.open(newline='') as f:
         rows = list(csv.DictReader(f))
     if not rows:
-        return None
+        return None, None
+    if 'window' in rows[0]:
+        numbering = [_row_int(r, 'window') for r in rows]
+        if numbering != list(range(len(rows))):
+            return None, (f"the table's own `window` column is not numbered 0..{len(rows) - 1} "
+                          f"in file order ({numbering[:8]}...), so its rows are not this phase's "
+                          f"local windows 0..N-1 by position")
     return [(_row_float(r, 'primary_center', 'distance_center_A'),
-             _row_float(r, 'secondary_cv_center', 'secondary_center')) for r in rows]
+             _row_float(r, 'secondary_cv_center', 'secondary_center')) for r in rows], None
+
+
+def _phase_real_window_centers(phase_dir) -> Optional[list]:
+    """The phase's real per-window centres, or None when there is no usable table.
+
+    The repair path's view of `_read_phase_window_table`: it has no way to
+    report a problem, and must not match against a table it cannot line up by
+    position, so an unusable table and an absent one both come back None (the
+    repair then falls through to the drop record, and failing closed from
+    there is that path's documented policy). The membership check calls
+    `_read_phase_window_table` directly, because for it the difference between
+    the two is the difference between silence and a note.
+    """
+    return _read_phase_window_table(phase_dir)[0]
+
+
+# How close two restraint centres must be to be the same centre. Both sides are
+# the same in-memory float written into two CSVs by the same process, so this
+# only has to absorb text round-tripping -- it stays orders of magnitude below
+# the closest two real windows of one phase ever come. Measured over the exact
+# tables this check reads (`_find_adaptive_epoch_dirs` + `_read_phase_window_table`,
+# 126 sample-holding phases under RUNS/): the smallest nonzero max-axis
+# separation between two windows of a phase is 4.21e-4
+# (chignolin_quicktest/final/baseline, windows 1-2) and the smallest CV2-only
+# gap is 6.21e-5 (chignolin_5/epoch_001/baseline) -- 420x and 62x this
+# tolerance. An earlier revision of this comment quoted ~0.02 and 0.006, which
+# were 14x and 320x too loose; the margin is ample either way, and the
+# tolerance is unchanged. Both ratios above are against the BARE constant; the
+# comparison `_centers_close` performs is relative (`tol + tol*max(|a|, |b|)`),
+# under which the same two separations are 363x and 43.5x -- see
+# `_permute_map_rows_onto_window_table`, whose exactness premise is stated in
+# that form because that is the number its correctness actually rests on.
+_CENTER_MATCH_TOL = 1e-6
+
+
+def _centers_close(a: float, b: float, tol: float = _CENTER_MATCH_TOL) -> bool:
+    """True when two restraint centres are the same number, to within text
+    round-tripping (see `_CENTER_MATCH_TOL`).
+
+    NaN equals NaN here on purpose: a CV1-only phase has no secondary centre on
+    either side, and "absent in both records" is agreement, not disagreement.
+    Hoisted to module level so the repair matcher below and the membership check
+    that shares its evidence can never drift apart on what "same centre" means.
+    """
+    if math.isnan(a) and math.isnan(b):
+        return True
+    return abs(a - b) <= tol + tol * max(abs(a), abs(b))
 
 
 def _match_map_rows_to_real_windows(map_rows: list, real_centers: list,
-                                    tol: float = 1e-6) -> Optional[list]:
+                                    tol: float = _CENTER_MATCH_TOL) -> Optional[list]:
     """The subsequence of `map_rows` whose centres are the real windows', in
     order -- i.e. the map with its phantom rows removed. None if any real
     window has no match left, which means these two artifacts do not describe
@@ -407,15 +582,27 @@ def _match_map_rows_to_real_windows(map_rows: list, real_centers: list,
     Order-preserving on purpose: the auto-drop renumbers the survivors without
     reordering them, so the correct answer is always a subsequence, and
     matching greedily left-to-right can never "reach back" past a window it
-    already consumed. Centres come from the same in-memory floats written to
-    both CSVs, so the tolerance only has to absorb text round-tripping -- it is
-    orders of magnitude below any real window spacing (the tightest CV2 gap on
-    the runs this was built against is ~0.02).
+    already consumed.
+
+    GREEDY, therefore not a verdict on its own. It takes the first row whose
+    centres match, so on a map LONGER than the window set it will happily
+    consume a phantom row -- one for a state the phase dropped and never sampled
+    -- that duplicates a real window's centres and sits earlier in the map, and
+    report success. `_validate_and_repair_epoch_window_map` consequently no
+    longer asks this function whether a longer map is derivable: it asks
+    `_select_map_rows_onto_window_table`, which refuses ambiguity, and uses this
+    one only to answer the separate, purely descriptive question "and is that
+    forced selection sitting in the map's own row order?". Whoever restores this
+    as a decider restores the bug.
+
+    Still a decider where the ambiguity cannot mean a phantom: the equal-count
+    membership check (`_consistent_map_membership_notes`) has as many rows as
+    windows, so every candidate row is a real window of the phase -- see
+    `_select_map_rows_onto_window_table`'s two bullets for why that changes the
+    answer rather than merely the odds.
     """
     def _close(a: float, b: float) -> bool:
-        if math.isnan(a) and math.isnan(b):
-            return True
-        return abs(a - b) <= tol + tol * max(abs(a), abs(b))
+        return _centers_close(a, b, tol)
 
     picked = []
     j = 0
@@ -432,22 +619,177 @@ def _match_map_rows_to_real_windows(map_rows: list, real_centers: list,
     return picked
 
 
-def _renumber_epoch_window_rows(rows: list, start: int = 0) -> list:
-    """Copy of `rows` with ``epoch_window`` renumbered ``start..start+N-1`` in order.
+def _permute_map_rows_onto_window_table(map_rows: list, real_centers: list,
+                                        tol: float = _CENTER_MATCH_TOL) -> Optional[list]:
+    """`map_rows` REORDERED so that row *i* carries local window *i*'s real
+    restraint centres, or None when the two artifacts do not list the same
+    window set.
 
-    With the default `start=0` this is exactly what the writer would have
-    produced had it enumerated the phase's surviving windows instead of the
-    registry's active states. Everything else on the row (state_id,
-    primary/secondary centre, any k columns) is carried through untouched, and
-    the inputs are never mutated. `start` is used to park the *dropped* rows
-    out of band -- see `_PHANTOM_EPOCH_WINDOW_BASE`.
+    The sibling of `_match_map_rows_to_real_windows`, for the other defect. That
+    one is order-preserving because the auto-drop renumbers survivors without
+    reordering them, so its answer is a subsequence. This one exists for the
+    case where every window that really ran *does* have a row and only the
+    order is wrong -- a permutation, which a subsequence match rejects outright
+    (it cannot reach back past a row it already consumed).
+
+    Returning a list here is what makes the equal-count membership defect
+    repairable at all: local window *i*'s samples were generated at the table's
+    row *i* centres, so the state_id that belongs to them is the one on the map
+    row carrying those centres, whatever position that row is sitting at.
+
+    Greedy, first-unused-match, which is exact whenever no two windows of one
+    phase are within `tol` of each other on BOTH axes -- the predicate this
+    matcher actually asks, and the one the margin below is measured against.
+
+    Re-measured over all 291 usable window tables under RUNS/ (the set
+    `_read_phase_window_table` accepts), against the EFFECTIVE relative
+    tolerance `_centers_close` applies -- `tol + tol*max(|a|, |b|)`, not the
+    bare constant: zero confusable pairs, and the closest two windows of one
+    phase ever come to being confusable is 363x that effective tolerance
+    (chignolin_quicktest/final/baseline windows 1-2: identical primary centre,
+    4.21e-4 apart on secondary against an effective 1.16e-6). That 363x -- 2.6
+    orders of magnitude, not four -- is the real margin under this premise. The
+    tightest SINGLE-axis margin over the same tables is much smaller, 43.5x
+    (chignolin_5/epoch_001/baseline windows 13 and 20, 6.21e-5 apart on
+    secondary against an effective 1.43e-6), but that pair is separated by
+    95,000x on its primary axis and so is nowhere near confusable here; a
+    single-axis number is simply not what this premise rests on. An earlier
+    revision of this docstring claimed "four orders of magnitude on every real
+    phase" and pointed at `_CENTER_MATCH_TOL`, whose own comment quotes 420x
+    and 62x against the bare constant. The substance held; the number did not.
+
+    Two rows with *identical* centres are genuinely interchangeable here and
+    either choice yields the same restraint columns; see the note text for that
+    limit -- and see `_select_map_rows_onto_window_table`, which refuses that
+    ambiguity outright instead of resolving it greedily, for why the two
+    matchers answer it differently.
+    """
+    unused = list(range(len(map_rows)))
+    picked = []
+    for c1, c2 in real_centers:
+        for pos, j in enumerate(unused):
+            r = map_rows[j]
+            if (_centers_close(_row_float(r, 'primary_center'), c1, tol)
+                    and _centers_close(_row_float(r, 'secondary_center'), c2, tol)):
+                picked.append(r)
+                unused.pop(pos)
+                break
+        else:
+            return None
+    return picked if not unused else None
+
+
+def _select_map_rows_onto_window_table(map_rows: list, real_centers: list,
+                                       tol: float = _CENTER_MATCH_TOL) -> tuple:
+    """``(picked, problem)`` -- one map row per real window, IN THE TABLE'S
+    ORDER, when that assignment is FORCED by the two artifacts; ``(None,
+    phrase)`` when it is not.
+
+    The third matcher, and the single gate on EVERY map longer than the window
+    set -- in the map's own row order or not. It was introduced for the compound
+    defect neither sibling above covers (a map that is BOTH longer than the
+    window set AND lists it out of order): `_match_map_rows_to_real_windows`
+    cannot see that one (order-preserving, so a permutation defeats it) and
+    `_permute_map_rows_onto_window_table` cannot either (it requires every map
+    row to be consumed, so extra rows defeat it). Before this existed the
+    compound case fell through both and landed on the drop-record fallback,
+    which removes rows by state_id and never looks at a centre -- so it kept the
+    map's own contradicted row order and the result came back labelled a
+    successful repair. A wrong mapping announced as REPAIRED is the worst
+    outcome this module can produce.
+
+    Then it turned out the IN-ORDER half of the same defect was still wide open,
+    for the same reason one step along: the order-preserving matcher was
+    answering that half by itself, greedily, so a phantom row duplicating a real
+    window's centres and sitting earlier in the map got consumed for that window
+    and the wrong mapping came back labelled REPAIRED with no reordering
+    involved at all. Hence "every longer map" above. Whether the surviving rows
+    happen to be in order is a question about WHICH repair happened, not about
+    whether one is derivable, and the two must not be answered by the same
+    call.
+
+    FORCED, not greedy, and that is the whole difference from the sibling this
+    one is otherwise a generalisation of. Two candidate rows for one window are
+    resolved arbitrarily by a greedy first-unused-match, and the two cases are
+    not equally survivable:
+
+    * equal-count (`_permute_map_rows_onto_window_table`): both candidates are
+      real windows OF THIS PHASE. They carry identical restraint centres, hence
+      identical bias columns, so picking the wrong one mis-pools two sampled
+      states and changes nothing else. Documented as that matcher's blind spot,
+      measured at zero incidence on disk.
+    * here: the map is longer than the window set, so a candidate may be a
+      PHANTOM -- a row for a state this phase dropped and never sampled. Picking
+      that one hands a real window's samples to a state that never ran, which is
+      precisely the chignolin_6 failure (state 20, a phantom duplicate of 21,
+      given 861,547 samples and its own f_k).
+
+    So a window with two candidates, or two windows sharing one, is refused
+    rather than resolved. Both refusals return a phrase naming the window and
+    the state_ids involved, because the caller's whole job on that path is to
+    say what it could not derive and why.
+
+    Leftover map rows are the phase's phantoms and are returned to the caller's
+    complement logic untouched -- deleting them re-creates the stale-registry
+    bias bug for those states' MBAR columns (see `_PHANTOM_EPOCH_WINDOW_BASE`).
+    """
+    picked_idx = []
+    claimed = {}
+    for i, (c1, c2) in enumerate(real_centers):
+        hits = [j for j, r in enumerate(map_rows)
+                if _centers_close(_row_float(r, 'primary_center'), c1, tol)
+                and _centers_close(_row_float(r, 'secondary_center'), c2, tol)]
+        if not hits:
+            return None, (f'local window {i} really ran at (primary {c1:.4f}, secondary {c2:.4f}) '
+                          f'and no row of the map carries those centres in any position, so its '
+                          f'state_id is recorded nowhere in these two artifacts and nothing can '
+                          f'invent one')
+        if len(hits) > 1:
+            return None, (f'local window {i}\'s centres (primary {c1:.4f}, secondary {c2:.4f}) '
+                          f'match {len(hits)} map rows (state_id '
+                          f'{[_row_state_id(map_rows[j]) for j in hits]}), and with more rows than '
+                          f'windows one of them may be a dropped state that never ran, so which '
+                          f'state_id belongs to this window\'s samples is not derivable')
+        j = hits[0]
+        if j in claimed:
+            return None, (f'local windows {claimed[j]} and {i} both ran at (primary {c1:.4f}, '
+                          f'secondary {c2:.4f}) and the map holds a single row with those centres '
+                          f'(state_id {_row_state_id(map_rows[j])}), so the two cannot be told '
+                          f'apart and only one of them could be given a state_id')
+        claimed[j] = i
+        picked_idx.append(j)
+    return [map_rows[j] for j in picked_idx], None
+
+
+def _renumber_rows_in_order(rows: list, start: int = 0) -> list:
+    """Copy of `rows` with ``epoch_window`` renumbered ``start..start+N-1`` in
+    exactly the order given.
+
+    Everything else on the row (state_id, primary/secondary centre, any k
+    columns) is carried through untouched, and the inputs are never mutated.
+    Split out from `_renumber_epoch_window_rows` because the permutation repair
+    has already *chosen* the row order (the phase's own window table's) and
+    re-sorting by the stale ``epoch_window`` values would put back precisely
+    the order it just corrected.
     """
     out = []
-    for i, r in enumerate(_sorted_map_rows(rows)):
+    for i, r in enumerate(rows):
         new = dict(r)
         new['epoch_window'] = str(start + i)
         out.append(new)
     return out
+
+
+def _renumber_epoch_window_rows(rows: list, start: int = 0) -> list:
+    """Copy of `rows` with ``epoch_window`` renumbered ``start..start+N-1``, in
+    ascending existing-``epoch_window`` order.
+
+    With the default `start=0` this is exactly what the writer would have
+    produced had it enumerated the phase's surviving windows instead of the
+    registry's active states. `start` is used to park the *dropped* rows out of
+    band -- see `_PHANTOM_EPOCH_WINDOW_BASE`.
+    """
+    return _renumber_rows_in_order(_sorted_map_rows(rows), start)
 
 
 def _per_window_cv2_means(window_ids, cv2) -> dict:
@@ -496,14 +838,325 @@ def _map_cv2_fingerprint_deviation(map_rows: list, cv2_means: dict) -> Optional[
     return float(np.mean(devs)) if devs else None
 
 
+def _map_rows_disagreeing_with_window_table(map_rows: list, real_centers: list) -> list:
+    """``[(local_window, (map_c1, map_c2), (real_c1, real_c2))]`` for every local
+    window whose map row does NOT carry the restraint centres this phase really
+    ran that window at. Empty when the two artifacts agree row for row.
+
+    This is the membership check the row-count check cannot do. Both artifacts
+    are written by the process that runs the phase, from the same post-drop
+    in-memory window arrays (`gareus/production.py` rewrites
+    ``umbrella_explicit_windows.csv`` immediately after the post-pull auto-drop
+    and only then rewrites the map), so on a healthy phase they agree exactly,
+    row for row -- measured on every adaptive-production phase holding samples
+    under RUNS/: 117 of 117 phases whose row COUNT agrees also agree elementwise,
+    0 disagree. Which is exactly why a disagreement is evidence rather than a
+    heuristic: it is not a physical statistic with a tail, it is one of the
+    phase's own two records of what it ran contradicting the other.
+
+    Caller must pass equal-length inputs whose map rows are numbered 0..N-1
+    (this compares local window *i* against map row *i* against table row *i*;
+    the table's row order IS the post-drop local window order -- checked, not
+    assumed, against the table's own ``window`` column by
+    `_read_phase_window_table`). Both hold for
+    every map any current writer produces -- the driver enumerates the registry,
+    and every rewrite path renumbers the survivors -- and for all 152 maps under
+    RUNS/; the caller checks rather than assumes, because comparing by position
+    when the *consumer* resolves a sample by ``epoch_window`` value would let a
+    non-contiguous map pass a check the samples then fail.
+
+    What this cannot see, stated so it is not mistaken for a proof: two windows
+    whose (primary, secondary) centres are *identical* can be exchanged without
+    changing either artifact. Their restraint columns would be identical too, so
+    the bias matrix is unharmed, but their samples would be pooled under each
+    other's state_id. Nothing here claims to catch that -- and neither does any
+    test on the sampled CVs, for the same reason.
+    """
+    bad = []
+    for i, (c1, c2) in enumerate(real_centers):
+        if i >= len(map_rows):
+            break
+        r = map_rows[i]
+        m1 = _row_float(r, 'primary_center')
+        m2 = _row_float(r, 'secondary_center')
+        if not (_centers_close(m1, c1) and _centers_close(m2, c2)):
+            bad.append((i, (m1, m2), (c1, c2)))
+    return bad
+
+
+def _map_cv2_corroboration(bad: list, cv2_means: dict) -> str:
+    """One sentence of sampled-CV2 evidence for windows the centre check already
+    flagged, or '' when there is no usable sampled cv2 for any of them.
+
+    Deliberately reachable ONLY after `_map_rows_disagreeing_with_window_table`
+    has found a disagreement, and deliberately not a firing rule of its own. An
+    earlier revision of this check *was* a firing rule -- a per-window bar on
+    |<cv2> - assigned centre| in units of that window's restraint width
+    sqrt(kT/k2) -- and it does not survive contact with real data: sweeping the
+    shipped implementation over every adaptive-production phase holding samples
+    under RUNS/ (125 phases, 1,409 correctly-mapped windows) put 160 of those
+    windows (11%) over its 3.0-sigma bar, firing on 47 phases that the
+    deterministic centre comparison above finds nothing wrong with. Real
+    umbrella windows sit systematically off their CV2 centre -- the pull of the
+    underlying free energy, -(dG/dcv2)/k2, measured at a median 0.78 and a
+    maximum 9.04 restraint widths on those runs -- while the CV2 centres
+    themselves can be a small fraction of that apart (a 2D grid's windows differ
+    mainly in CV1: chignolin_5's final/baseline has two windows at an identical
+    secondary centre and five more within 0.02 of each other, against a typical
+    0.1-0.7 offset). No statistic on the sampled cv2 mean, absolute or
+    nearest-centre, can separate those two populations, and one that tries
+    trains the operator to ignore the warning that matters.
+
+    As corroboration it costs nothing and is worth quoting: the operator gets
+    the two candidate centres and the number the samples actually produced,
+    which is what tells them WHICH of the two artifacts to believe.
+    """
+    bits = []
+    nearer_table = comparable = 0
+    for ew, (_m1, m2), (_c1, c2) in bad:
+        mu = cv2_means.get(ew)
+        if mu is None or not math.isfinite(mu) or not (math.isfinite(m2) and math.isfinite(c2)):
+            continue
+        d_map, d_tab = abs(mu - m2), abs(mu - c2)
+        comparable += 1
+        if d_tab < d_map:
+            nearer_table += 1
+        if len(bits) < 5:
+            bits.append(f'local window {ew} <cv2>={mu:.4f} (|cv2 - map centre| {d_map:.4f} vs '
+                        f'|cv2 - table centre| {d_tab:.4f})')
+    if not comparable:
+        return ''
+    return (f' Sampled CV2 for the affected windows: {"; ".join(bits)}; the samples are nearer the '
+            f'window table\'s centre in {nearer_table} of {comparable} comparable window(s). '
+            f'(Corroboration only -- a real window sits systematically off its own CV2 centre, up '
+            f'to 9 restraint widths on healthy runs on disk, so the sampled mean cannot settle the '
+            f'mapping by itself and is never what raised this note.)')
+
+
+def _unchecked_membership_note(label: str, reason: str) -> WindowMapNote:
+    """The "I could not run the membership check" note, in one place.
+
+    Three different obstacles produce it (the two artifacts disagree about how
+    many windows ran; either side's index column is not 0..N-1 in file order),
+    and they must all say the same thing about their own weight: the row-count
+    check passed, this one did not run, and that is NOT a detected fault.
+    gareus_report.py grades this wording one band below a real membership
+    failure, and `MAP_NOTE_UNCHECKED` says the same thing structurally to the
+    consumers that must not treat it as one.
+    """
+    return WindowMapNote(
+        f'[window map check] Could not cross-check the local-window -> state mapping of '
+        f'adaptive-production phase {label} against its own surviving-window table: {reason}. '
+        f'The row-count check (against this phase\'s recorded window count) passed; the '
+        f'membership check did not run -- which is not the same as finding nothing wrong. '
+        f'See {_STALE_WINDOW_MAP_DOC}.',
+        MAP_NOTE_UNCHECKED)
+
+
+# What the two membership notes below say about their own blind spots. Both
+# limits are real and neither is closed by anything in this module:
+#
+#   * two windows whose (primary, secondary) centres are IDENTICAL are
+#     interchangeable in both artifacts -- exchanging them changes neither, so
+#     no comparison of centres can see it and the repair cannot tell which of
+#     the two rows a given table row is. Their restraint columns are identical
+#     so the bias matrix is unharmed, but their samples would be pooled under
+#     each other's state_id. Zero incidence measured: no pair of windows shares
+#     a full (primary, secondary) centre in any of the 291 window tables under
+#     RUNS/.
+#   * a row that keeps its centres and carries the wrong STATE_ID is invisible
+#     here for the same reason -- the check compares centres, and both records
+#     would still agree on those. The write-side check
+#     (`repair_epoch_window_map_from_surviving_windows`, gareus/production.py)
+#     compares the same two artifacts and is blind to it too.
+#
+# Stated in the note rather than only in this comment because the note is what
+# an operator reads while deciding whether to trust a run.
+_MEMBERSHIP_CHECK_SCOPE = (
+    ' Verified here: each local window\'s (primary, secondary) restraint centre against the '
+    'phase\'s own surviving-window table. NOT verified, and not closed by anything else either: '
+    'two windows whose restraint centres are IDENTICAL are interchangeable in both records, so '
+    'neither this check nor the repair can tell them apart; and a row that keeps its centres but '
+    'carries the wrong state_id is invisible to a centre comparison, here and at write time.')
+
+
+def _consistent_map_membership_notes(phase_dir, map_rows: list, cv2_means: dict) -> tuple:
+    """``(rows, notes)`` for a map whose row COUNT agrees but whose *membership*
+    may not. `rows` is None whenever nothing was rewritten.
+
+    Returns `(None, [])` for the overwhelming majority of phases (the map lists
+    exactly the windows the phase ran, in order). Otherwise one of three things
+    happened, and the note says which:
+
+    * the map lists the right windows in the WRONG ORDER -- a permutation. The
+      correct mapping is derivable (see below), so the rows are rebuilt and a
+      loud repair note comes back.
+    * the map lists a genuinely DIFFERENT window set of the same size -- some
+      window that really ran has no row at all. Nothing can re-derive its
+      state_id, so the map is loaded unchanged with a loud warning.
+    * a check could not run. Quieter note, and structurally not a fault.
+
+    The evidence is the phase's own post-drop surviving-window table, compared
+    row for row against the map (see
+    `_map_rows_disagreeing_with_window_table`). That is the same comparison
+    `gareus/production.py`'s `repair_epoch_window_map_from_surviving_windows`
+    makes at write time, and that function's own comment names this file as
+    where the analysis-side call belongs: the write-side check only ever runs in
+    a process that (re)runs the phase, so it cannot protect an analysis of a run
+    already on disk, which is every run this branch exists to rescue.
+
+    Why a permutation is repairable and a different window set is not: local
+    window *i*'s samples were generated at the centres the table records for
+    row *i*, so the state_id that belongs to them is the one on the map row
+    carrying those centres. When every table row has such a map row, that is a
+    complete mapping and no inference is involved -- it is read off the same
+    order-preserving centre match this check already performs to detect the
+    problem, just without the order constraint. When a window that really ran
+    has NO row in the map, its state_id is simply not recorded anywhere in
+    these two artifacts, and no amount of matching invents it. (An earlier
+    revision declined to repair either case and told the reader that a
+    permutation was "a DIFFERENT window set" with "no row at all for a window
+    that really ran" -- both false for a permutation, which is exactly the case
+    this check was built to catch.)
+
+    The repair is NOT gated on the sampled-CV2 fingerprint, deliberately. The
+    fingerprint is quoted as evidence and never as a firing rule, for the
+    reason `_map_cv2_corroboration` documents at length: real umbrella windows
+    sit systematically off their own CV2 centre by up to 9 restraint widths,
+    heterogeneously between neighbours, so `dev_after > dev_before` happens for
+    a genuine permutation and a veto on it would decline a correct repair while
+    asserting a physics claim that is not true. Which way it moves is not
+    even a weak signal: on a fixture whose samples sit exactly on their own
+    centres it collapses to zero under the repair, and on real data (where a
+    window's mean CV2 is dragged off its centre by the underlying free energy)
+    it can move the other way for the same correct reordering.
+
+    Phases with no surviving-window table at all return `(None, [])` silently:
+    such a phase never recorded what it ran (a plain 1D ladder, a legacy
+    layout), so this is not a check that failed but a check that does not
+    apply, and announcing a non-check once per such phase would be noise. Every
+    pre-existing loader fixture in this repo has exactly that shape. A table
+    that EXISTS but cannot be lined up by position is a different matter and
+    does produce a note.
+    """
+    label = _phase_label(phase_dir)
+    real_centers, table_problem = _read_phase_window_table(phase_dir)
+    if real_centers is None:
+        if table_problem is None:
+            return None, []
+        return None, [_unchecked_membership_note(label, table_problem)]
+    if len(real_centers) != len(map_rows):
+        # Unreachable on every real phase measured (125 of 125 have a window
+        # table whose length equals this phase's authoritative window count, so
+        # on this branch -- where that count already equals the map's row count
+        # -- the table's length does too). Kept because if it ever does happen
+        # the phase's own two records disagree about how many windows it ran,
+        # which is not something to pass over in silence.
+        return None, [_unchecked_membership_note(
+            label, f'the table lists {len(real_centers)} window(s) while the map lists '
+                   f'{len(map_rows)}, so the two cannot be compared row for row')]
+    numbering = [_row_int(r, 'epoch_window') for r in map_rows]
+    if numbering != list(range(len(map_rows))):
+        # Not producible by any current writer (the driver enumerates, every
+        # rewrite path renumbers 0..N-1) and not seen on any of the 152 maps
+        # under RUNS/. Refuse to compare by position rather than quietly compare
+        # the wrong pairs: a sample's local window index is resolved through the
+        # `epoch_window` VALUE downstream, so position and value must agree
+        # before a positional comparison means anything.
+        return None, [_unchecked_membership_note(
+            label, f'the map\'s epoch_window column is not numbered 0..{len(map_rows) - 1} '
+                   f'({numbering[:8]}...), so its rows cannot be lined up with the table\'s '
+                   f'by position')]
+    bad = _map_rows_disagreeing_with_window_table(map_rows, real_centers)
+    if not bad:
+        return None, []
+    worst = '; '.join(
+        f'local window {ew}: map says (primary {m1:.4f}, secondary {m2:.4f}), the window table says '
+        f'(primary {c1:.4f}, secondary {c2:.4f})'
+        for ew, (m1, m2), (c1, c2) in bad[:5])
+    more = f' (+{len(bad) - 5} more)' if len(bad) > 5 else ''
+
+    reordered = _permute_map_rows_onto_window_table(map_rows, real_centers)
+    if reordered is None:
+        # Some window that really ran has no row in the map at all: the
+        # signature of two attempts at this phase dropping equally many but
+        # different windows (an interrupted phase re-pulled with a different
+        # auto-drop verdict), which is the one residual the row-count check
+        # cannot see. Warn rather than refuse: the artifacts do not say which
+        # of the two is stale, refusing would make such a run permanently
+        # unloadable, and a note is anything but quiet -- it carries into
+        # meta['load_notes'], is printed by the union loader the moment it is
+        # produced, lands in pmf_summary.json's warnings, is triaged HIGH by
+        # gareus_report.py and FAILs that report's sample-to-state mapping
+        # check.
+        return None, [WindowMapNote(
+            f'[window map check] epoch_window_map.csv for adaptive-production phase {label} has '
+            f'the right NUMBER of rows ({len(map_rows)}) for the windows this phase ran, but '
+            f'{len(bad)} of them carry a different restraint centre than the phase\'s own '
+            f'post-drop window table (umbrella_explicit_windows.csv) records for that local '
+            f'window: {worst}{more}. At least one window that really ran has NO row in the map, '
+            f'so this is not a reordering: the map describes a DIFFERENT window set of the same '
+            f'size. The map is loaded unchanged, because a window with no row has no recorded '
+            f'state_id anywhere in these two artifacts and nothing can re-derive one. This '
+            f'phase\'s samples may therefore be attributed to the wrong umbrella state -- treat '
+            f'every free energy derived from them as invalid until the mapping is confirmed by '
+            f'hand.{_map_cv2_corroboration(bad, cv2_means)}{_MEMBERSHIP_CHECK_SCOPE} '
+            f'See {_STALE_WINDOW_MAP_DOC}.',
+            MAP_NOTE_FAULT_UNREPAIRED)]
+
+    repaired = _renumber_rows_in_order(reordered)
+    shifted = [f'{i}->{_row_state_id(r)}' for i, r in enumerate(repaired)
+               if _row_state_id(r) != _row_state_id(map_rows[i])]
+    dev_before = _map_cv2_fingerprint_deviation(map_rows, cv2_means)
+    dev_after = _map_cv2_fingerprint_deviation(repaired, cv2_means)
+    if dev_before is not None and dev_after is not None:
+        evidence = (f' Sampled-cv2 fingerprint across the reordering: mean |cv2 - '
+                    f'secondary_center| {dev_before:.4f} -> {dev_after:.4f} (evidence, not the '
+                    f'reason: real windows sit systematically off their own CV2 centre -- up to 9 '
+                    f'restraint widths on healthy runs on disk, and by different amounts between '
+                    f'neighbours -- so this number can move either way for a genuine reordering '
+                    f'and never decides one).')
+    else:
+        evidence = (' No sampled cv2 was available to cross-check the reordering against '
+                    '(CV1-only phase, or no secondary centres in the map).')
+    return repaired, [WindowMapNote(
+        f'[stale window map] epoch_window_map.csv for adaptive-production phase {label} has the '
+        f'right NUMBER of rows ({len(map_rows)}) for the windows this phase ran and lists exactly '
+        f'the windows its own post-drop window table (umbrella_explicit_windows.csv) records, but '
+        f'{len(bad)} of them sit at the wrong local window: {worst}{more}. The map is therefore a '
+        f'PERMUTATION of the right rows -- every window that really ran does have a row, only the '
+        f'order is wrong -- so the correct mapping IS derivable and was REPAIRED IN MEMORY by '
+        f'matching each map row onto the table row carrying the same restraint centres. '
+        f'Corrected local->state mapping for the {len(shifted)} moved window(s): '
+        f'{", ".join(shifted)}. Every sample in those windows was previously attributed to the '
+        f'wrong umbrella state, so any earlier analysis of this phase is invalid.{evidence} The '
+        f'run data on disk is unchanged and still stale.{_MEMBERSHIP_CHECK_SCOPE} '
+        f'See {_STALE_WINDOW_MAP_DOC}.',
+        MAP_NOTE_REPAIRED)]
+
+
 def _validate_and_repair_epoch_window_map(phase_dir, wmap_rows: list,
                                           window_ids=None, cv2=None) -> tuple:
     """``(rows, notes)`` for one adaptive-production phase's window map.
 
-    Returns `wmap_rows` unchanged (and no notes) when the map's row count
-    agrees with how many windows the phase really ran -- the overwhelming
-    majority of phases, including every phase of every run that never used
-    `--us-auto-drop-bad-windows`.
+    Returns `wmap_rows` unchanged when the map's row count agrees with how many
+    windows the phase really ran -- the overwhelming majority of phases,
+    including every phase of every run that never used
+    `--us-auto-drop-bad-windows`. That path is still not free of notes, and can
+    itself repair: an agreeing row count does not prove agreeing *membership*,
+    so the map's own restraint centres are compared row for row against the
+    phase's post-drop surviving-window table, which yields a repair when the
+    map lists the right windows in the wrong order, a warning when it lists a
+    genuinely different window set of the same size, and a quieter note when
+    that comparison could not be made at all (see
+    `_consistent_map_membership_notes`). Clean phases return no notes.
+
+    Every note carries a `kind` (see `WindowMapNote` and the MAP_NOTE_*
+    constants): a non-empty `notes` is NOT a boolean for "the map was stale",
+    and a consumer that treats it as one refuses runs whose map is not known to
+    be wrong at all. Branch on `window_map_note_reports_a_fault` /
+    `window_map_note_rewrote_rows`, on the note object itself, before any
+    f-string copy of its text.
 
     On a mismatch the map is stale (see this section's header comment) and the
     phantom rows are identified from whichever of two independent records the
@@ -512,10 +1165,20 @@ def _validate_and_repair_epoch_window_map(phase_dir, wmap_rows: list,
     1. the phase's own surviving window table (``umbrella_explicit_windows.csv``),
        matched onto the map by restraint centre -- this is what actually ran, and
        it is the only source that covers a phase whose drop record is missing or
-       does not account for the whole gap (both occur on real runs on disk);
-    2. failing that, the post-pull ``dropped_post_pull_bad_windows`` record --
-       the phase's own, or an inherited sibling sub-run's -- applied by state_id
-       and accepted only if the surviving row count reconciles.
+       does not account for the whole gap (both occur on real runs on disk).
+       Accepted only when every real window has exactly one map row carrying its
+       centres, so the mapping is READ OFF rather than inferred -- in the map's
+       own row order, or (for a map that also lists its windows out of order) in
+       the table's, one gate for both, because with more rows than windows an
+       ambiguous candidate can be a state the phase dropped and never sampled
+       (see `_select_map_rows_onto_window_table`). If that does not hold, this
+       fails closed WITHOUT trying source 2: a record that identifies rows by
+       position in this same map can neither restore an order that map has
+       already contradicted nor break a tie between two of its own rows;
+    2. failing that -- i.e. only when there is no usable table to contradict
+       anything -- the post-pull ``dropped_post_pull_bad_windows`` record -- the
+       phase's own, or an inherited sibling sub-run's -- applied by state_id and
+       accepted only if the surviving row count reconciles.
 
     A successful repair rebuilds the map the way the writer should have written
     it (survivors renumbered 0..N-1, original state_ids and centres kept) and
@@ -560,7 +1223,23 @@ def _validate_and_repair_epoch_window_map(phase_dir, wmap_rows: list,
                     if recorded is not None else 'the distinct window_id values in its Parquet samples')
 
     if n_map == n_true and (observed is None or observed <= n_map):
-        return list(wmap_rows), []
+        # The count agrees, but agreeing on the count is not the same as
+        # agreeing on the membership. Cross-check the map's own restraint
+        # centres, row for row, against the phase's post-drop surviving-window
+        # table, which is the other record of what this phase really ran (see
+        # _consistent_map_membership_notes: it repairs a pure reordering, warns
+        # without repairing when a window that ran has no row at all, and says
+        # so quietly when a check could not run).
+        #
+        # `list(wmap_rows)` -- the caller's own rows, in their own order -- is
+        # returned untouched whenever nothing was rewritten, exactly as before:
+        # the healthy path must stay byte-identical, and `rows` above is a
+        # re-sorted copy made only so the checks can rely on an order.
+        membership_rows, membership_notes = _consistent_map_membership_notes(
+            phase_dir, rows, cv2_means)
+        if membership_rows is None:
+            return list(wmap_rows), membership_notes
+        return membership_rows, membership_notes
 
     detail = (f'epoch_window_map.csv for adaptive-production phase {label} lists {n_map} '
               f'window(s) but the phase physically ran {n_true} ({count_source})')
@@ -574,11 +1253,12 @@ def _validate_and_repair_epoch_window_map(phase_dir, wmap_rows: list,
                f'refusing to load. Set {_STALE_WINDOW_MAP_OVERRIDE_ENV}=1 to load with the '
                f'stale map regardless (for inspection only).')
         if os.environ.get(_STALE_WINDOW_MAP_OVERRIDE_ENV, '').strip().lower() in ('1', 'true', 'yes'):
-            return list(wmap_rows), [
+            return list(wmap_rows), [WindowMapNote(
                 f'[stale window map] {detail}. {reason} Loaded with the STALE map anyway because '
                 f'{_STALE_WINDOW_MAP_OVERRIDE_ENV} is set: this phase\'s samples are attributed to '
                 f'the wrong umbrella states and every free energy derived from them is invalid. '
-                f'See {_STALE_WINDOW_MAP_DOC}.']
+                f'See {_STALE_WINDOW_MAP_DOC}.',
+                MAP_NOTE_STALE_LOADED)]
         raise ValueError(msg)
 
     # Preferred repair source: the phase's own surviving window table, matched
@@ -586,8 +1266,9 @@ def _validate_and_repair_epoch_window_map(phase_dir, wmap_rows: list,
     # _phase_real_window_centers). Only trusted when its length agrees with the
     # phase's real window count, otherwise it is itself stale/partial.
     #
-    # `kept_rows` is the subsequence of `rows` belonging to windows that really
-    # ran; `phantom_src_rows` is everything else. Both halves are needed: only
+    # `kept_rows` is the rows of `rows` belonging to windows that really ran, in
+    # the order the repair will use them (a subsequence of `rows` unless the map
+    # also lists its windows out of order); `phantom_src_rows` is everything else. Both halves are needed: only
     # the first may appear in the local-index lookup, and both must survive
     # into the returned list so the state-keyed native-params parser still sees
     # the dropped states' epoch-native window params (see
@@ -597,10 +1278,114 @@ def _validate_and_repair_epoch_window_map(phase_dir, wmap_rows: list,
     repair_src = ''
     real_centers = _phase_real_window_centers(phase_dir)
     if real_centers is not None and len(real_centers) == n_true:
-        matched = _match_map_rows_to_real_windows(rows, real_centers)
-        if matched is not None:
-            kept_rows = matched
-            repair_src = 'its own surviving window table (umbrella_explicit_windows.csv)'
+        # ONE gate decides whether these two artifacts FORCE a local-window ->
+        # state_id assignment at all, and it is asked BEFORE the map's row order
+        # is looked at: `_select_map_rows_onto_window_table`, which requires each
+        # real window to have exactly one map row carrying its restraint centres
+        # and refuses anything less. The row order is consulted afterwards, and
+        # only to say WHICH repair happened -- never to decide whether one is
+        # derivable.
+        #
+        # That order used to be the other way round: the order-preserving greedy
+        # matcher answered first and the forced one was reached only as its
+        # fallback (for a map that is both longer than the window set AND lists
+        # it out of order). Which left greedy deciding the ambiguous IN-ORDER
+        # case alone, and greedy is precisely what must not decide it:
+        # `_match_map_rows_to_real_windows` takes the first row whose centres
+        # match, so a PHANTOM row -- one for a state this phase dropped and never
+        # sampled -- carrying a real window's centres and sitting earlier in the
+        # map is consumed for that window, the remaining windows still match, and
+        # the wrong mapping comes back labelled REPAIRED. Three real windows,
+        # four map rows, the phantom first: measured on a fixture, not argued (see
+        # tests/test_equal_count_map_fingerprint.py::test_the_loader_refuses_an_
+        # in_order_longer_map_whose_first_row_is_an_ambiguous_phantom). A wrong
+        # mapping announced as REPAIRED is the worst outcome this module can
+        # produce, and it was reachable on both orderings while only one of them
+        # was guarded.
+        #
+        # So the refusal is SHARED rather than duplicated: two subtly different
+        # answers to "is this ambiguous" on the two orderings of one defect is
+        # the drift these paired checks exist to remove. The equal-count path is
+        # deliberately NOT routed through here and is not made stricter: with as
+        # many rows as windows every candidate is a real window OF THIS PHASE
+        # carrying identical restraint columns, so an arbitrary pick mis-pools two
+        # sampled states and changes nothing else, whereas here it can hand a real
+        # window's samples to a state that never ran. That asymmetry is stated at
+        # length in `_select_map_rows_onto_window_table`'s own two bullets.
+        #
+        # The write side reaches the same verdict from the same two files
+        # (`repair_epoch_window_map_from_surviving_windows`,
+        # gareus/production.py), which is checked by running BOTH on
+        # byte-identical copies of one phase directory and comparing the mappings
+        # element for element, rather than argued about -- see
+        # tests/test_equal_count_map_fingerprint.py::
+        # test_both_sides_derive_the_same_mapping_for_a_compound_map and its two
+        # refusal twins. A previous round asserted that agreement by reading the
+        # two implementations and was wrong.
+        #
+        # Free on real data, measured rather than assumed: over all 152 maps under
+        # RUNS/, each of the 8 phases that needs this repair has its selection
+        # FORCED, and the rows the forced matcher picks are the identical row
+        # objects the greedy one picked -- 8 repaired / 0 refused, before and
+        # after, with byte-identical notes.
+        selected, problem = _select_map_rows_onto_window_table(rows, real_centers)
+        # Diagnosis, never the verdict: are the rows the real windows match sitting
+        # in the map's own row order? A plain drop -- the shape of every affected
+        # phase on disk -- says yes, the compound defect says no. Asked of the map
+        # as it is, so it is answerable on the refusal path too, where all it
+        # decides is which of the two refusals below describes its own evidence
+        # truthfully.
+        in_order = _match_map_rows_to_real_windows(rows, real_centers) is not None
+        if selected is None:
+            # Two refusals, because they have different evidence and a refusal
+            # that misdescribes its own evidence is this same failure shape one
+            # step removed: out of order, the window table has contradicted the
+            # map's row order; in order, the order agrees and it is the tie that
+            # cannot be broken.
+            #
+            # The drop record is not consulted as a fallback from either. Out of
+            # order the reason is that it says nothing about centres, so applying
+            # it would preserve exactly the row order the table has just
+            # contradicted and hand that back under a REPAIRED note. In order it
+            # would in principle name which of two duplicate-centre rows is the
+            # phantom -- but it identifies rows by POSITION IN THIS VERY MAP (and
+            # may be inherited from a sibling sub-run; see
+            # `_dropped_state_ids_for_phase`) and is only ever count-checked, so
+            # leaning on it to break a centre tie is deciding by fiat, i.e. the
+            # repair-on-a-guess this guard exists not to publish. The write side
+            # abstains on the same input for the same reason
+            # (`_has_duplicate_center_pairs`, gareus/production.py, which refuses
+            # before its own in-order matcher runs), so refusing here keeps the
+            # two sides agreeing on this input class instead of opening a new gap.
+            if in_order:
+                return _fail(
+                    f"Its own surviving window table (umbrella_explicit_windows.csv) records the "
+                    f"{n_true} window(s) it really ran, and the map's rows do carry those windows' "
+                    f"restraint centres in order -- but that reading does not settle WHICH rows the "
+                    f"extra ones are: {problem}. With more rows than windows an extra row can be a "
+                    f"state this phase dropped and never sampled, so taking the first row whose "
+                    f"centres match would risk attributing a real window's samples to a state that "
+                    f"never ran. The drop record is deliberately not used as a fallback either -- it "
+                    f"identifies rows by position in this same map and cannot say which of two rows "
+                    f"carrying one window's centres is the phantom.")
+            return _fail(
+                f"Its own surviving window table (umbrella_explicit_windows.csv) records the "
+                f"{n_true} window(s) it really ran, and the map's rows do not carry those "
+                f"windows' restraint centres in order, so the extra rows cannot simply be "
+                f"removed. Neither can the mapping be read off out of order: {problem}. The "
+                f"drop record is deliberately not used as a fallback once the window table "
+                f"has contradicted the map's row order -- it says nothing about centres, so "
+                f"it would preserve exactly the order in question.")
+        kept_rows = selected
+        # The in-order wording is unchanged, deliberately: it is what every
+        # affected phase on disk produces, and its note must stay byte-identical
+        # across this change.
+        repair_src = ('its own surviving window table (umbrella_explicit_windows.csv)'
+                      if in_order else
+                      'its own surviving window table (umbrella_explicit_windows.csv), matched '
+                      'onto the map OUT OF ORDER: the map both lists more windows than ran and '
+                      'lists them in the wrong order, and every real window had exactly one '
+                      'map row carrying its restraint centres')
 
     # Fallback: the post-pull drop record (this phase's own, or an inherited
     # sibling's), applied by state_id and accepted only if the surviving row
@@ -629,7 +1414,19 @@ def _validate_and_repair_epoch_window_map(phase_dir, wmap_rows: list,
     # complement must be taken over the actual row objects the matcher picked.
     kept_ids = {id(r) for r in kept_rows}
     phantom_src_rows = [r for r in rows if id(r) not in kept_ids]
-    survivors = _renumber_epoch_window_rows(kept_rows)
+    # `_renumber_rows_in_order`, NOT `_renumber_epoch_window_rows`: the order
+    # `kept_rows` is already in is the answer, and re-sorting by the stale
+    # `epoch_window` values would put back precisely the order the compound
+    # matcher just corrected. A provable no-op wherever the chosen rows ARE a
+    # subsequence of `rows` -- which `_sorted_map_rows` has already put in
+    # ascending `epoch_window` order, so re-sorting a subsequence of it is the
+    # identity: the drop-record fallback by construction (a filter over `rows`),
+    # and the window-table selection exactly in the `in_order` case above, which
+    # is the shape of every affected phase on disk. The phantoms keep the sorting
+    # version: their order is unobservable (they are
+    # parked out of band where no sample can reach them) and their own
+    # `epoch_window` values are the only order they have.
+    survivors = _renumber_rows_in_order(kept_rows)
     phantoms = _renumber_epoch_window_rows(phantom_src_rows, start=_PHANTOM_EPOCH_WINDOW_BASE)
 
     # Post-repair coverage: a sample pointing past the *surviving* windows
@@ -645,6 +1442,15 @@ def _validate_and_repair_epoch_window_map(phase_dir, wmap_rows: list,
     # _map_cv2_fingerprint_deviation): a correct mapping puts each window's
     # samples on their own restraint centre. Only the survivors carry real
     # local indices, so only they can be compared against sampled cv2.
+    #
+    # Note this veto is a firing rule on THIS path, unlike the equal-count
+    # membership path where the same number is quoted as evidence only (a real
+    # window sits systematically off its own CV2 centre, by different amounts
+    # between neighbours, so the deviation can rise for a genuine reordering).
+    # The consequence is deliberate and one-directional: a correct compound
+    # repair whose fingerprint happens to worsen is REFUSED rather than
+    # published. That costs an operator one `GAREUS_ALLOW_STALE_WINDOW_MAP=1`
+    # inspection run; the opposite error costs a wrong free energy.
     dev_before = _map_cv2_fingerprint_deviation(rows, cv2_means)
     dev_after = _map_cv2_fingerprint_deviation(survivors, cv2_means)
     if dev_before is not None and dev_after is not None and dev_after > dev_before:
@@ -688,11 +1494,13 @@ def _validate_and_repair_epoch_window_map(phase_dir, wmap_rows: list,
                         f'are kept out of the local-window lookup but retained as rows, so their '
                         f'epoch-native window params still back their MBAR bias columns instead of '
                         f'falling back to the (possibly recentered) final registry.')
-    note = (f'[stale window map] {detail} -- `--us-auto-drop-bad-windows` dropped windows post-pull '
-            f'and renumbered the survivors 0..{n_true - 1}, but this map was never rewritten. '
-            f'REPAIRED IN MEMORY from {repair_src}; {impact}'
-            f'{evidence}{phantom_note} The run data on disk is unchanged and still stale; see '
-            f'{_STALE_WINDOW_MAP_DOC}.')
+    note = WindowMapNote(
+        f'[stale window map] {detail} -- `--us-auto-drop-bad-windows` dropped windows post-pull '
+        f'and renumbered the survivors 0..{n_true - 1}, but this map was never rewritten. '
+        f'REPAIRED IN MEMORY from {repair_src}; {impact}'
+        f'{evidence}{phantom_note} The run data on disk is unchanged and still stale; see '
+        f'{_STALE_WINDOW_MAP_DOC}.',
+        MAP_NOTE_REPAIRED)
     return survivors + phantoms, [note]
 
 

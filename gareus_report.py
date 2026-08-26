@@ -51,6 +51,17 @@ OVERLAP_FAIL_FRACTION = 0.5   # heuristic: worst < 0.5*target overlap == broken 
 # both axes, i.e. ``min_neighbor_overlap ** 2``.
 JOINT_OVERLAP_THRESHOLD_EXPONENT = 2
 
+# Names for the two overlap spaces, published as `metric_space` beside each
+# check's `metric`. MIRRORS gareus.mbar_analysis.pmf.OVERLAP_SPACE_MARGINAL /
+# _JOINT -- pmf.py is the source of truth (it stamps the same strings into
+# pmf_summary.json's `overlap_space` and each overlap CSV's header), and these
+# are duplicated rather than imported for the same reason SELF_BIAS_* above is:
+# this module must keep working standalone against an old pmf_summary.json.
+# Same vocabulary on purpose, so a consumer can compare a check's metric_space
+# with the summary's own overlap_space without a translation table.
+OVERLAP_SPACE_MARGINAL = "cv1_marginal"
+OVERLAP_SPACE_JOINT = "cv1_cv2_joint"
+
 # Per-state self-bias (each state's own samples scored in its own restraint),
 # in kT. MIRRORS gareus.mbar_analysis.pmf.SELF_BIAS_MEDIAN_WARN_KT /
 # _P90_WARN_KT -- pmf.py is the source of truth; these are duplicated rather
@@ -335,18 +346,21 @@ def _check_overlap(s: dict, thr: float) -> dict:
 
     st = NA
     metric = None
+    # Set in the same statement as `metric`, never separately: the whole point
+    # of this sibling is that it cannot disagree with which number won.
+    metric_space = None
     parts: list[str] = []
     if cv_worst is not None:
         worst, i, j = cv_worst
         st = _worse(st, _status_for_overlap(worst, thr))
-        metric = worst
+        metric, metric_space = worst, OVERLAP_SPACE_MARGINAL
         parts.append(f"worst {worst:.3f} CV1-marginal (windows {i}-{j}, CV-space nearest "
                      f"neighbours)")
     if iworst is not None:
         worst, i, j = iworst
         st = _worse(st, _status_for_overlap(worst, thr))
         if metric is None:
-            metric = worst
+            metric, metric_space = worst, OVERLAP_SPACE_MARGINAL
         # Spelled out deliberately: the old wording ("pair 23-24") reads as a
         # physical adjacency claim it cannot support, which is exactly what
         # misdirected the chignolin_6 investigation. It is still graded (see
@@ -379,7 +393,7 @@ def _check_overlap(s: dict, thr: float) -> dict:
                    f"neighbours{marg_txt}); target ≥{jthr:.3f} (= {thr:.2f} per axis)")
         detail = f"{jdetail}; {detail}" if detail else jdetail
         st = _worse(st, jst)
-        metric = jw
+        metric, metric_space = jw, OVERLAP_SPACE_JOINT
     out = {"name": "Window overlap", "status": st, "detail": detail}
     if metric is not None:
         # Convention when several numbers are graded: `metric` is the JOINT one
@@ -389,7 +403,16 @@ def _check_overlap(s: dict, thr: float) -> dict:
         # Every number is always spelled out in `detail`; nothing in the repo
         # consumes `metric` programmatically today, so it stays a single scalar
         # rather than growing into a per-space dict.
+        #
+        # But WHICH of those three won is not inferable from the scalar, and the
+        # two spaces are the same shape and scale with different thresholds:
+        # 0.20 is a healthy joint overlap and a failing marginal one. An
+        # external consumer grading `metric` against --min-neighbor-overlap
+        # (a marginal-calibrated threshold, see JOINT_OVERLAP_THRESHOLD_EXPONENT)
+        # would silently misread a joint value as a marginal one, so every
+        # `metric` now ships the space it was measured in beside it.
         out["metric"] = metric
+        out["metric_space"] = metric_space
     return out
 
 
@@ -551,13 +574,20 @@ _STALE_MAP_OVERRIDE_RX = re.compile(
     r"\[stale window map\][^\n]*(Loaded with the STALE map anyway|"
     r"GAREUS_ALLOW_STALE_WINDOW_MAP is set)", re.I)
 _STALE_MAP_ANY_RX = re.compile(r"\[stale window map\]", re.I)
+# The equal-count membership failure: the map has the right NUMBER of rows but
+# lists a different window set than the phase's own surviving-window table.
+# Matched on the note's own claim rather than on its tag, so the sibling
+# "could not cross-check" note (same tag, weaker fact) can never reach the FAIL
+# below -- a check that did not run is not a detected fault.
+_MAP_MEMBERSHIP_RX = re.compile(
+    r"\[window map check\][^\n]*DIFFERENT window set of the same size", re.I)
 
 
 def _check_mapping(s: dict) -> dict:
     """Is each sample attributed to the umbrella state it was actually generated
     in? The check the chignolin_6 campaign did not have.
 
-    Two independent inputs, in order of authority:
+    Three independent inputs, in order of authority:
 
     1. The stale-``epoch_window_map.csv`` loader guard's own notes. The
        ``GAREUS_ALLOW_STALE_WINDOW_MAP`` escape hatch loads a run whose samples
@@ -565,6 +595,15 @@ def _check_mapping(s: dict) -> dict:
        that produced nothing but a MEDIUM-by-default warning, so the resulting
        pmf_summary.json could read PASS. An operator who forgets the variable is
        exported must not be able to publish such a run as healthy.
+
+    1b. The equal-count *membership* note from the same guard, which fires when
+       a phase's map and its own post-drop surviving-window table describe
+       different window sets of the same size. Deterministic bookkeeping (the
+       two artifacts are written from the same in-memory arrays by the process
+       that runs the phase), so it is graded with the escape hatch rather than
+       with the physical diagnostics below -- but the note itself cannot say
+       WHICH of the two records is stale, and the detail text does not pretend
+       otherwise.
 
     2. ``s['self_bias']`` -- each state's own samples scored in its own restraint
        (``gareus.mbar_analysis.pmf.self_bias_diagnostics``). ~1 kT is the only
@@ -588,6 +627,13 @@ def _check_mapping(s: dict) -> dict:
                     "detail": ("loaded with a STALE epoch_window_map.csv because "
                                "GAREUS_ALLOW_STALE_WINDOW_MAP is set: samples are attributed to "
                                "the wrong umbrella states and every free energy here is invalid")}
+    for w in warns:
+        if _MAP_MEMBERSHIP_RX.search(w):
+            return {"name": name, "status": FAIL,
+                    "detail": ("a phase's epoch_window_map.csv lists a DIFFERENT window set of the "
+                               "same size than the phase's own surviving-window table: one of the "
+                               "two records is stale and the artifacts do not say which, so that "
+                               "phase's samples may be attributed to the wrong umbrella states")}
     repaired = any(_STALE_MAP_ANY_RX.search(w) for w in warns)
 
     sb = s.get("self_bias")
@@ -740,6 +786,16 @@ _WARN_RULES: list[tuple[re.Pattern, str]] = [
     # defaults to MEDIUM, which would bury the one warning that says the PMF is
     # attributing samples to the wrong umbrella state.
     (re.compile(r"[Ii]mplausible self-bias", re.I), "HIGH"),
+    # The equal-count membership check (loaders_adaptive.py's
+    # _consistent_map_membership_notes). Its "could not run" variant must be
+    # matched FIRST and graded lower on purpose: an absent check is not a
+    # detected fault, and grading the two the same would teach an operator to
+    # read the loud one as routine. Neither variant defaults to MEDIUM by
+    # accident any more -- the loud one says a phase's own two records of which
+    # windows it ran contradict each other, which is this branch's headline
+    # failure mode and is backed by a hard FAIL in _check_mapping.
+    (re.compile(r"\[window map check\][^\n]*Could not cross-check", re.I), "MEDIUM"),
+    (re.compile(r"\[window map check\]", re.I), "HIGH"),
     (re.compile(r"[Ww]eak CV-space nearest-neighbour overlap", re.I), "HIGH"),
     (re.compile(r"[Ww]eak joint \(CV1, CV2\) nearest-neighbour overlap", re.I), "HIGH"),
     # A split overlap graph: MBAR never determined the offset between the

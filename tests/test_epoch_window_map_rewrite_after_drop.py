@@ -21,6 +21,7 @@ The two fixture specs below are the real chignolin_6 phases, verbatim:
 from __future__ import annotations
 
 import csv
+import functools
 from pathlib import Path
 
 import numpy as np
@@ -413,6 +414,26 @@ def _ledger(tmp_path: Path) -> list[dict]:
     if not path.exists():
         return []
     return json.loads(path.read_text())["applied"]
+
+
+def _read_epoch_window_map_rows_via_production(phase: Path):
+    """`(fieldnames, rows)` through production's own map reader."""
+    from gareus.production import _read_epoch_window_map_rows
+
+    return _read_epoch_window_map_rows(phase / "epoch_window_map.csv")
+
+
+def _reorder_ledger(tmp_path: Path) -> list[dict]:
+    """The ledger file's REORDER list, through the reader production itself uses.
+
+    Read with the real function rather than by indexing the JSON, so a test can
+    never agree with a payload the shipped reader would reject (the reader
+    tolerates a missing/damaged file by design, and that tolerance is exactly
+    what a hand-rolled `json.loads(...)["reorders"]` here would hide).
+    """
+    from gareus.production import _read_epoch_window_map_reorder_ledger
+
+    return _read_epoch_window_map_reorder_ledger(tmp_path)
 
 
 def test_unreachable_filter_fixes_epoch_001_topup_004(tmp_path):
@@ -1523,6 +1544,12 @@ def test_the_pull_and_drop_block_precedes_the_first_sample_segment():
     writer_at = _first_stmt_index("ParquetSampleWriter(")
 
     assert repair_at < open_at < writer_at
+    assert repair_at < drop_at, (
+        "the map repair must precede the post-pull drop: the drop's indices are "
+        "positions in `centers_a`, i.e. in the window table's order, so on a map "
+        "whose rows are a permutation of that order the repair is what makes the "
+        "drop land on the rows it names -- see "
+        "test_a_reorder_makes_a_following_drop_time_rewrite_land_on_the_right_rows")
     assert drop_at < open_at, (
         "the post-pull window drop must precede SegmentRegistry.open_segment; "
         "_phase_holds_samples_logged_against_its_window_map's 'running' exclusion "
@@ -1597,3 +1624,1078 @@ def test_the_resume_guards_message_reports_the_row_count_without_diagnosing_it(t
     assert "active registry state" not in out, (
         "the message must not name expected_rows as the registry's active-state "
         "count -- run_segment hands it a scheduled subset instead")
+
+
+# ---------------------------------------------------------------------------
+# Review round 5 -- the two write sites that do NOT go through the funnel had
+# no behavioural coverage at all, and the structural test could not tell a
+# correct conditional from an inverted one.
+#
+# Four of the six driver map writes go through `_write_phase_window_map`, which
+# owns both vetoes and has behavioural tests above.  The other two hand the
+# vetoes' answer to a *window-table* writer as a keyword instead:
+#
+#   run_segment, nested in run_scheduled_adaptive_epoch:
+#       write_state_subset_window_csv(..., map_path=None if _seg_map_preserved
+#                                                    else _seg_map_path)
+#   run_adaptive_production_auto_loop, its `if not _final_already_done` block:
+#       registry.write_active_window_csv(..., map_path=None if _final_map_preserved
+#                                                      else _final_map_path)
+#
+# Both are named here (and in the tests below) by enclosing function plus the
+# distinguishing local, never by line number: this section originally pointed at
+# them as ":5315" and ":6444" and gareus/adaptive_production.py grew ~240 lines
+# within that same round, so those pointers landed in unrelated code almost
+# immediately.  A rename or a move now breaks
+# test_the_two_keyword_write_sites_are_named_by_something_that_cannot_rot rather
+# than silently rotting the only map from a test to the site it covers.
+#
+# For those two, "the veto is called" and "its answer is used the right way
+# round" are separate claims.  Round 5 inverted both to `path if preserved else
+# None` and the entire map-rewrite suite still passed -- neither site was ever
+# executed by a test (every loop-driving test set allocation_scheduler False, and
+# `_StopAfterDrop` fires in the epoch loop long before the final phase), and the
+# structural test only checked that *a* conditional gated on `_map_preserved` was
+# present, which an inversion satisfies.
+#
+# The inverted behaviour is not a loud failure.  With `map_path=None` on a fresh
+# phase, `write_state_subset_window_csv` writes the window table and no map;
+# `_find_adaptive_epoch_dirs` then falls back to the PARENT's map -- a map over a
+# different, larger state set -- or drops the segment from the analysis outright.
+# That is the chignolin_6 mis-attribution class re-created at the load-bearing
+# sites, which is why these drive the real loop rather than re-deriving the
+# conditional in the test.
+#
+# Each site is covered by a matched pair, so an inversion at either one fails on
+# its own rather than only as part of the pair:
+#
+#   preserved (phase already holds samples) -> the map on disk must survive byte
+#                                              for byte
+#   fresh     (nothing on disk)             -> the phase must get its own map
+#
+# In both preserved halves the round-2 resume guard is provably silent (the
+# checkpoint is torn, so `production_checkpoint_available` is False), so what is
+# demonstrated is the samples veto's answer being used, not the resume guard's.
+# ---------------------------------------------------------------------------
+
+
+def _drive_capturing_the_phase_map_at_run_gareus(monkeypatch, args, out):
+    """Drive the real loop; read the map of whichever phase dir reaches run_gareus.
+
+    Everything the driver decides about that phase's map has already happened by
+    the time the fake fires -- both write sites under test run strictly before
+    their phase's `run_gareus` call -- so this reads the decision, not a
+    reconstruction of it.  Returns the phase directory, whether it has an
+    `epoch_window_map.csv` by then, and that file's raw bytes and decoded
+    (epoch_window, state_id) pairs.
+    """
+    import gareus.adaptive_production as ap
+    import gareus.production as prod
+
+    captured = {}
+
+    def _fake_run_gareus(_args, run_dir, *rest, **kw):
+        run_dir = Path(run_dir)
+        map_path = run_dir / "epoch_window_map.csv"
+        captured["dir"] = run_dir
+        captured["exists"] = map_path.exists()
+        captured["bytes"] = map_path.read_bytes() if map_path.exists() else None
+        captured["pairs"] = _pairs(map_path) if map_path.exists() else None
+        raise _StopAfterDrop()
+
+    monkeypatch.setattr(prod, "run_gareus", _fake_run_gareus)
+    with pytest.raises(_StopAfterDrop):
+        ap.run_adaptive_production_auto_loop(args, out, None, None, None, None, None, None)
+    assert "dir" in captured, "the drive never reached run_gareus at all"
+    return captured
+
+
+def _scheduled_epoch_campaign(tmp_path, *, segment_already_sampled: bool):
+    """The round-3 campaign, re-pointed at the SCHEDULED (baseline+topup) layout.
+
+    `allocation_scheduler=True` sends epoch 1 through `run_scheduled_adaptive_epoch`,
+    whose `run_segment` writes each sub-run's own map -- the `_seg_map_preserved`
+    site.  The phase under test is therefore `epoch_001/baseline`, not `epoch_001`
+    itself.
+    """
+    args, out, epoch_dir = _five_state_resumed_campaign(tmp_path)
+    args.adaptive_production_allocation_scheduler = True
+    seg_dir = epoch_dir / "baseline"
+    if segment_already_sampled:
+        # Attempt 1 of THIS segment: it compacted its own map, flushed samples
+        # against it, then died leaving a checkpoint too torn to resume from.
+        seg_dir.mkdir(parents=True, exist_ok=True)
+        (seg_dir / "epoch_window_map.csv").write_text(
+            _LOOP_MAP_5_STATE_COMPACTED, encoding="utf-8")
+        _seal_samples_segment(seg_dir, status="interrupted")
+        _torn_production_checkpoint(seg_dir)
+    return args, out, seg_dir
+
+
+def _frozen_final_campaign(tmp_path, *, phase_already_sampled: bool):
+    """The same campaign, arranged so the drive lands on the frozen final phase.
+
+    `_StopAfterDrop` fires inside the epoch loop on every other loop-driving test,
+    so the final phase's write site is never reached.  The campaign's driver
+    summary records one completed epoch, so `start_epoch` is 1; setting
+    `adaptive_production_epochs = 1` makes `range(1, 1)` empty and the loop is
+    skipped outright, putting the final phase first in line.
+
+    The final phase is forced flat (unsegmented): with the scheduled final path
+    active the map under test would be a `run_segment` sub-run's, i.e. the
+    `_seg_map_preserved` site again rather than `_final_map_preserved`.
+    """
+    args, out, _epoch_dir = _five_state_resumed_campaign(tmp_path)
+    args.adaptive_production_epochs = 1
+    args.adaptive_production_final_allocation_scheduler = False
+    args.adaptive_production_scheduled_final_segments = False
+    final_dir = out / "adaptive_production" / "final"
+    if phase_already_sampled:
+        final_dir.mkdir(parents=True, exist_ok=True)
+        (final_dir / "epoch_window_map.csv").write_text(
+            _LOOP_MAP_5_STATE_COMPACTED, encoding="utf-8")
+        _seal_samples_segment(final_dir, status="interrupted")
+        _torn_production_checkpoint(final_dir)
+    return args, out, final_dir
+
+
+def test_a_scheduled_segment_holding_samples_keeps_its_map(tmp_path, monkeypatch):
+    """`run_segment`/`_seg_map_preserved`, preserved half -- driven through the
+    real scheduled epoch.
+
+    `epoch_001/baseline` already holds attempt 1's samples logged against attempt
+    1's compacted 3-row map.  The identity map the registry would write covers a
+    different, larger state set, so writing it re-attributes every one of those
+    rows.  The bytes on disk must be exactly what they were.
+    """
+    import gareus.adaptive_production as ap
+
+    args, out, seg_dir = _scheduled_epoch_campaign(tmp_path, segment_already_sampled=True)
+    before = (seg_dir / "epoch_window_map.csv").read_bytes()
+    # Pin the premise: the round-2 resume guard cannot be what preserves this, so
+    # the assertions below are about the samples veto's answer being used.
+    assert ap.production_checkpoint_available(seg_dir) is False
+
+    captured = _drive_capturing_the_phase_map_at_run_gareus(monkeypatch, args, out)
+
+    assert captured["dir"] == seg_dir, (
+        "the drive must reach the scheduled sub-run, not some other phase")
+    assert captured["pairs"] == [(0, 0), (1, 2), (2, 4)], (
+        "the samples' own map was replaced -- every row is now attributed to a "
+        f"different state (map is {captured['pairs']})")
+    assert captured["bytes"] == before
+
+
+def test_a_fresh_scheduled_segment_is_given_its_own_map(tmp_path, monkeypatch):
+    """`run_segment`/`_seg_map_preserved`, fresh half -- the claim an inverted
+    conditional breaks silently.
+
+    Nothing on disk for this sub-run, so there is no record to protect and the
+    registry's identity map must be written.  Without it `_find_adaptive_epoch_dirs`
+    falls back to the parent `epoch_001/epoch_window_map.csv`, which here is
+    attempt 1's 3-row compaction over a different state set -- asserted below to
+    be genuinely different, so the fallback really would mis-attribute rather than
+    coincidentally agree.
+    """
+    args, out, seg_dir = _scheduled_epoch_campaign(tmp_path, segment_already_sampled=False)
+    parent_pairs = _pairs(seg_dir.parent / "epoch_window_map.csv")
+
+    captured = _drive_capturing_the_phase_map_at_run_gareus(monkeypatch, args, out)
+
+    assert captured["dir"] == seg_dir
+    assert captured["exists"] is True, (
+        "a fresh scheduled sub-run got no map of its own; the loader would fall "
+        f"back to the parent's {parent_pairs}, which covers a different state set")
+    assert captured["pairs"] == [(0, 0), (1, 1), (2, 2), (3, 3), (4, 4)]
+    assert captured["pairs"] != parent_pairs
+
+
+def test_a_frozen_final_phase_holding_samples_keeps_its_map(tmp_path, monkeypatch):
+    """`_final_map_preserved` (the frozen final phase), preserved half -- the site
+    no loop-driving test had ever reached.
+
+    Same on-disk state as the scheduled-segment case, one phase kind over.  Note
+    this site hands the resume guard `resume_requested` un-gated by
+    `production_checkpoint_available` (unlike `run_segment`'s `_seg_will_resume`),
+    so the torn checkpoint is what keeps the guard silent here -- pinned below,
+    together with the frozen-final skip guard, whose "already done" branch would
+    let the drive pass this test without the write site ever executing.
+    """
+    import gareus.adaptive_production as ap
+
+    args, out, final_dir = _frozen_final_campaign(tmp_path, phase_already_sampled=True)
+    before = (final_dir / "epoch_window_map.csv").read_bytes()
+    assert ap.production_checkpoint_available(final_dir) is False
+    assert ap._is_adaptive_production_completed(out / "adaptive_production") is False, (
+        "the final phase must actually be entered, not skipped as already done")
+
+    captured = _drive_capturing_the_phase_map_at_run_gareus(monkeypatch, args, out)
+
+    assert captured["dir"] == final_dir, (
+        "the drive must reach the frozen final phase, not stop in the epoch loop")
+    assert captured["pairs"] == [(0, 0), (1, 2), (2, 4)], (
+        "the final phase's samples were re-attributed by a fresh identity map "
+        f"(map is {captured['pairs']})")
+    assert captured["bytes"] == before
+
+
+def test_a_fresh_frozen_final_phase_is_given_its_own_map(tmp_path, monkeypatch):
+    """`_final_map_preserved` (the frozen final phase), fresh half.
+
+    Nothing on disk under `final/`, so the registry's identity map must be
+    written.  `final/` has no parent phase map to fall back to at all, so an
+    inverted conditional here does not mis-attribute the phase -- it drops it
+    from the analysis entirely.
+    """
+    args, out, final_dir = _frozen_final_campaign(tmp_path, phase_already_sampled=False)
+
+    captured = _drive_capturing_the_phase_map_at_run_gareus(monkeypatch, args, out)
+
+    assert captured["dir"] == final_dir
+    assert captured["exists"] is True, (
+        "the frozen final phase got no window map; with no parent map to fall "
+        "back to, the whole phase drops out of the analysis")
+    assert captured["pairs"] == [(0, 0), (1, 1), (2, 2), (3, 3), (4, 4)]
+
+
+def test_the_two_keyword_write_sites_are_named_by_something_that_cannot_rot():
+    """Anti-rot pin for the four docstrings above.
+
+    Those four tests are the only map from a test to the write site it drives, and
+    the sites are genuinely hard to find by grep: neither calls
+    `_write_phase_window_map`, both hand the vetoes' answer to a *window-table*
+    writer as a `map_path=` keyword instead.  The names the docstrings use must
+    therefore keep resolving -- so this asserts each enclosing function still holds
+    exactly one `map_path=` keyword gated on its own `_*_map_preserved` local.
+
+    Fails on a rename or on the conditional being restructured, which is the point:
+    a stale pointer here costs a future reader the whole trail, and a line number
+    (what these docstrings used to carry) cannot be checked at all.
+    """
+    import ast
+    import inspect
+
+    import gareus.adaptive_production as ap
+
+    tree = ast.parse(inspect.getsource(ap))
+
+    def _scope(name, within=None):
+        root = within if within is not None else tree
+        matches = [n for n in ast.walk(root)
+                   if isinstance(n, ast.FunctionDef) and n.name == name]
+        assert len(matches) == 1, f"expected exactly one {name}, found {len(matches)}"
+        return matches[0]
+
+    scheduled_epoch = _scope("run_scheduled_adaptive_epoch")
+    sites = {
+        "_seg_map_preserved": _scope("run_segment", within=scheduled_epoch),
+        "_final_map_preserved": _scope("run_adaptive_production_auto_loop"),
+    }
+    for local, scope in sites.items():
+        gated = [kw for kw in ast.walk(scope)
+                 if isinstance(kw, ast.keyword) and kw.arg == "map_path"
+                 and local in ast.unparse(kw.value)]
+        assert len(gated) == 1, (
+            f"{scope.name} no longer has exactly one `map_path=` keyword gated on "
+            f"`{local}` (found {len(gated)}); the docstrings above point at it by "
+            "that name and must be updated with it")
+
+
+# ---------------------------------------------------------------------------
+# Review round 5, second finding -- the repair result that never reached disk.
+#
+# run_gareus persists repair_epoch_window_map_from_surviving_windows' verdict into
+# the phase's gareus_metadata.json, which is the only place an operator can later
+# ask "was this phase's window map ever actually checked against the windows it
+# really ran?".  The guard used to be `status != "consistent"`, which is not the
+# same question: the equal-count branch abstains with status "consistent" plus
+# `centers_verified` False when duplicate restraint centres make the membership
+# check ambiguous, so the ONE outcome that means "unverifiable" was the one dropped
+# on the floor -- while both of its siblings (the equal-count mismatch and every
+# skipped_*) were durable.  Read afterwards, an abstaining phase was
+# indistinguishable from a verified one.
+#
+# The parametrisation below runs the REAL repair function over a fixture for every
+# outcome it can reach from on-disk state, and evaluates run_gareus' OWN `if` test
+# (lifted from its source and compiled, with `_map_repair` bound) against what the
+# real function returned.  So neither half is re-derived in the test: an inverted
+# or stale condition fails, and so does a repair branch that stops reporting
+# `centers_verified`.  Expected values are written per case as literals.
+#
+# Deliberately not a warning: duplicate (primary, secondary) centres are legal --
+# the explicit-2D loader keeps a user's duplicated rows as separate thermodynamic
+# states -- so a run built that way records this on every phase.  Nothing consumes
+# the key programmatically (grep: gareus/production.py writes it, nothing reads
+# it), so making it durable cannot escalate a healthy run's health verdict; it only
+# stops the metadata from claiming more than the check established.
+# ---------------------------------------------------------------------------
+
+
+@functools.lru_cache(maxsize=1)
+def _run_gareus_map_repair_guard():
+    """run_gareus' own `if` test for persisting the repair result, compiled.
+
+    Selected by the assignment in the guard's DIRECT body rather than by a substring
+    over the whole subtree: `ast.walk` yields enclosing nodes first, so a future
+    outer `if` wrapped around this block would otherwise be picked up instead and
+    the test would silently start evaluating a condition that does not depend on
+    `_map_repair` at all.
+    """
+    import ast
+    import inspect
+
+    import gareus.production as prod
+
+    key = "epoch_window_map_repair_from_window_table"
+    fn = next(n for n in ast.walk(ast.parse(inspect.getsource(prod)))
+              if isinstance(n, ast.FunctionDef) and n.name == "run_gareus")
+    guards = [n for n in ast.walk(fn)
+              if isinstance(n, ast.If) and any(key in ast.unparse(stmt) for stmt in n.body)]
+    assert len(guards) == 1, (
+        f"expected exactly one guard writing {key} into window_metadata, found {len(guards)}")
+    return compile(ast.Expression(guards[0].test), "<run_gareus>", "eval")
+
+
+def _run_gareus_would_record(summary):
+    """True when run_gareus would put `summary` into the phase's gareus_metadata."""
+    import gareus.production as prod
+
+    return bool(eval(_run_gareus_map_repair_guard(), vars(prod), {"_map_repair": summary}))
+
+
+def _ladder_centers(n: int) -> list[tuple[float, float]]:
+    return [_identity_map_centers(i) for i in range(n)]
+
+
+def _map_from_centers(path: Path, centers: list[tuple[float, float]]) -> None:
+    _write_map(
+        path,
+        [{"epoch_window": i, "state_id": i, "primary_center": c1, "secondary_center": c2}
+         for i, (c1, c2) in enumerate(centers)],
+        REAL_RUN_FIELDS,
+    )
+
+
+def _phase_rewritten(tmp_path: Path) -> None:
+    """More map rows than real windows, matching centres: the ordinary repair."""
+    _identity_map(tmp_path / "epoch_window_map.csv", 6)
+    _survivor_table(tmp_path / "umbrella_explicit_windows.csv",
+                    [_identity_map_centers(i) for i in (0, 1, 3, 4, 5)])
+
+
+def _phase_verified(tmp_path: Path) -> None:
+    """The overwhelming majority: map and window table agree, centres check out."""
+    _identity_map(tmp_path / "epoch_window_map.csv", 6)
+    _survivor_table(tmp_path / "umbrella_explicit_windows.csv", _ladder_centers(6))
+
+
+def _phase_equal_count_duplicate_centers(tmp_path: Path) -> None:
+    """Counts agree, but two windows share a restraint centre, so which of the two
+    identical rows a survivor is cannot be established.  The abstain case."""
+    centers = [(0.1, -1.0), (0.1, -1.0), (0.2, 1.0)]
+    _map_from_centers(tmp_path / "epoch_window_map.csv", centers)
+    _survivor_table(tmp_path / "umbrella_explicit_windows.csv", centers)
+
+
+def _phase_equal_count_different_window_set(tmp_path: Path) -> None:
+    """Two attempts dropped equally many but different windows (residual #1)."""
+    ladder = _ladder_centers(7)
+    _map_from_centers(tmp_path / "epoch_window_map.csv", ladder[:3] + ladder[4:])
+    _survivor_table(tmp_path / "umbrella_explicit_windows.csv", ladder[:5] + ladder[6:])
+
+
+def _phase_equal_count_permutation(tmp_path: Path) -> None:
+    """Same window set, wrong order (residual #1's benign twin): derivable, so it
+    is repaired in place rather than refused."""
+    _permuted_phase(tmp_path, [4, 0, 1, 2, 3])
+
+
+def _phase_equal_count_reorder_not_positionally_verifiable(tmp_path: Path) -> None:
+    """A permutation whose window table is not in local-window order, so which of
+    the two orders is the local-window order cannot be read off either record."""
+    _permuted_phase(tmp_path, [4, 0, 1, 2, 3], table_file_order=[0, 2, 1, 3, 4])
+
+
+def _phase_map_shorter_than_window_set(tmp_path: Path) -> None:
+    _identity_map(tmp_path / "epoch_window_map.csv", 2)
+    _survivor_table(tmp_path / "umbrella_explicit_windows.csv", _ladder_centers(4))
+
+
+def _phase_longer_map_duplicate_centers(tmp_path: Path) -> None:
+    _map_from_centers(tmp_path / "epoch_window_map.csv",
+                      [(0.1, -1.0), (0.1, -1.0), (0.2, 1.0)])
+    _survivor_table(tmp_path / "umbrella_explicit_windows.csv", [(0.1, -1.0), (0.2, 1.0)])
+
+
+def _phase_centers_do_not_match(tmp_path: Path) -> None:
+    """Recentered between the interrupted attempt and the resume (tICA CV2)."""
+    _identity_map(tmp_path / "epoch_window_map.csv", 6)
+    _survivor_table(tmp_path / "umbrella_explicit_windows.csv",
+                    [(0.05 * i, 9.0 + i) for i in (0, 1, 3)])
+
+
+def _phase_unreadable_map(tmp_path: Path) -> None:
+    """A map path that exists but cannot be parsed (here: a directory)."""
+    (tmp_path / "epoch_window_map.csv").mkdir()
+    _survivor_table(tmp_path / "umbrella_explicit_windows.csv", _ladder_centers(3))
+
+
+def _phase_without_a_window_table(tmp_path: Path) -> None:
+    """Nothing to check against: the repair returns None, not a status."""
+    _identity_map(tmp_path / "epoch_window_map.csv", 3)
+
+
+@pytest.mark.parametrize("build, expected_status, expected_recorded", [
+    (_phase_rewritten, "rewritten", True),
+    (_phase_verified, "consistent", False),
+    (_phase_equal_count_duplicate_centers, "consistent", True),
+    (_phase_equal_count_different_window_set, "inconsistent_equal_count_centers_do_not_match", True),
+    (_phase_equal_count_permutation, "rewritten_reordered", True),
+    (_phase_equal_count_reorder_not_positionally_verifiable,
+     "inconsistent_equal_count_reorder_not_positionally_verifiable", True),
+    (_phase_map_shorter_than_window_set, "skipped_map_shorter_than_window_set", True),
+    (_phase_longer_map_duplicate_centers, "skipped_duplicate_centers", True),
+    (_phase_centers_do_not_match, "skipped_centers_do_not_match", True),
+    (_phase_unreadable_map, "skipped_unreadable", True),
+    (_phase_without_a_window_table, None, False),
+], ids=lambda v: getattr(v, "__name__", v))
+def test_every_repair_outcome_except_a_verified_pass_is_recorded(
+        tmp_path, build, expected_status, expected_recorded):
+    """Exhaustive over the outcomes the real repair can reach from on-disk state.
+
+    The bar is "was the map VERIFIED against this phase's window set", not "was the
+    map left alone" -- the abstain case is left alone precisely because it could not
+    be verified, and that is what has to survive into the metadata.  The single
+    False here is the one outcome that really did establish the map is right; a
+    condition that also drops the abstain (the round-5 defect) fails on the
+    duplicate-centres case, and one that records everything fails on the verified
+    case, which is the cry-wolf direction.
+    """
+    build(tmp_path)
+
+    summary = repair_epoch_window_map_from_surviving_windows(tmp_path)
+
+    assert (summary or {}).get("status") == expected_status
+    assert _run_gareus_would_record(summary) is expected_recorded
+
+
+def test_the_abstain_says_on_the_record_that_it_could_not_verify(tmp_path):
+    """Durability is only half of it: what lands in the metadata has to answer the
+    question.  `status: consistent` alone reads as a pass, so the record must carry
+    the two fields that distinguish an abstain from a verification -- otherwise an
+    operator reading the phase directory learns nothing from its being there."""
+    _phase_equal_count_duplicate_centers(tmp_path)
+
+    summary = repair_epoch_window_map_from_surviving_windows(tmp_path)
+
+    assert summary["centers_verified"] is False
+    assert summary["centers_check"] == "skipped_duplicate_centers"
+    assert _run_gareus_would_record(summary) is True
+
+
+# ---------------------------------------------------------------------------
+# The equal-count PERMUTATION: same window set, wrong order.
+#
+# Write-side/load-side divergence closed here.  Both sides compare the phase's
+# epoch_window_map.csv against the phase's own post-drop
+# umbrella_explicit_windows.csv, and both used to settle the equal-count case
+# with the ORDER-PRESERVING subsequence matcher alone.  A permutation fails that
+# matcher (it cannot reach back past a row it already consumed), so the write
+# side reported `inconsistent_equal_count_centers_do_not_match` and printed "the
+# map describes a DIFFERENT window set of the same size" -- of a map whose window
+# set is in fact identical, and whose correct local->state mapping the load side
+# (gareus/mbar_analysis/loaders_adaptive.py's `_consistent_map_membership_notes`)
+# now derives from exactly these two artifacts and repairs in memory.
+#
+# Why a permutation is derivable and a different window set is not: local window
+# *i*'s samples were generated at the centres the table records for row *i*, so
+# the state_id that belongs to them is the one on the map row carrying those
+# centres, whatever position that row sits at.  When every table row has such a
+# map row that is a complete mapping, read off rather than inferred.  When a
+# window that really ran has NO row, its state_id is not recorded anywhere in
+# these two artifacts and no amount of matching invents it -- that case stays
+# refused, which is the direction that matters.
+#
+# These drive the real `repair_epoch_window_map_from_surviving_windows` and
+# assert the FILE it leaves behind, not just its status: a status-only assertion
+# would pass for an implementation that reordered the rows wrongly.
+# ---------------------------------------------------------------------------
+
+# state_ids deliberately not 0..N-1 so a reorder that "worked" by rebuilding an
+# identity map instead of moving the real rows cannot pass.
+_PERMUTED_STATE_IDS = [20, 21, 22, 23, 24]
+
+
+def _permuted_phase(tmp_path: Path, order: list[int], *,
+                    table_file_order: list[int] | None = None) -> Path:
+    """A phase whose map lists exactly the windows its table lists, in `order`.
+
+    `order[j]` is the local window whose row sits at map position *j*, so
+    `order == [0, 1, 2, 3, 4]` is a healthy phase and any other permutation is
+    the defect.  Every row keeps its own state_id and centres; only where the row
+    sits changes -- which is precisely what a map written from a registry whose
+    active-state order is not the window-array order looks like.
+
+    `table_file_order` writes the surviving-window table's rows in that file
+    order while each keeps its own ``window`` value, i.e. what a writer that ever
+    sorted that table by something other than window index would produce.
+    """
+    centers = _ladder_centers(len(_PERMUTED_STATE_IDS))
+    _write_map(
+        tmp_path / "epoch_window_map.csv",
+        [{"epoch_window": j, "state_id": _PERMUTED_STATE_IDS[w],
+          "primary_center": centers[w][0], "secondary_center": centers[w][1]}
+         for j, w in enumerate(order)],
+        REAL_RUN_FIELDS,
+    )
+    path = tmp_path / "umbrella_explicit_windows.csv"
+    if table_file_order is None:
+        _survivor_table(path, centers)
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", newline="") as handle:
+            writer = csv.DictWriter(
+                handle, fieldnames=["window", "distance_center_A", "primary_center",
+                                    "secondary_cv_center"])
+            writer.writeheader()
+            for w in table_file_order:
+                writer.writerow({"window": w, "distance_center_A": centers[w][0],
+                                 "primary_center": centers[w][0],
+                                 "secondary_cv_center": centers[w][1]})
+    return tmp_path
+
+
+def _map_centers(path: Path) -> list[tuple[float, float]]:
+    return [(float(r["primary_center"]), float(r["secondary_center"])) for r in _read_map(path)]
+
+
+@pytest.mark.parametrize("order", [
+    [4, 0, 1, 2, 3],           # rotation by one
+    [0, 2, 1, 3, 4],           # adjacent swap
+    [4, 3, 2, 1, 0],           # reversal
+    [2, 0, 1, 4, 3],           # two disjoint cycles
+], ids=["rotation", "adjacent_swap", "reversal", "two_cycles"])
+def test_repair_reorders_a_permuted_map_onto_the_window_table(tmp_path, order):
+    """The map lists exactly the windows this phase ran, at the wrong positions.
+
+    The correct mapping is read off the two artifacts: table row *i*'s centres
+    name the restraint local window *i* really ran under, and the map row
+    carrying those centres names the state that belongs to it.  What is asserted
+    is the resulting FILE -- row *i*'s centres equal table row *i*'s centres, the
+    state_ids are the same multiset (no row invented, none lost), and
+    epoch_window is 0..N-1 -- because a status alone cannot tell a correct
+    reordering from a wrong one.
+    """
+    _permuted_phase(tmp_path, order)
+    table = _ladder_centers(len(order))
+
+    summary = repair_epoch_window_map_from_surviving_windows(tmp_path)
+
+    assert summary["status"] == "rewritten_reordered"
+    path = tmp_path / "epoch_window_map.csv"
+    assert _map_centers(path) == table
+    assert _pairs(path) == [(i, s) for i, s in enumerate(_PERMUTED_STATE_IDS)]
+    assert sorted(s for _, s in _pairs(path)) == sorted(_PERMUTED_STATE_IDS)
+
+
+def test_the_reorder_no_longer_claims_a_different_window_set(tmp_path, capsys):
+    """The misdiagnosis this closes, head on.
+
+    A permutation used to print "the map describes a DIFFERENT window set of the
+    same size (two attempts at this phase dropped equally many but different
+    windows)" -- a false claim about a map whose window set is identical, and a
+    false claim about why.  That sentence must not appear for a permutation; it
+    is still the right sentence for a genuinely different set, which
+    tests/test_equal_count_map_fingerprint.py pins on its own fixture.
+    """
+    _permuted_phase(tmp_path, [4, 0, 1, 2, 3])
+
+    repair_epoch_window_map_from_surviving_windows(tmp_path)
+
+    out = capsys.readouterr().out
+    assert "DIFFERENT window set" not in out
+    assert "PERMUTATION" in out
+    assert "REORDERED" in out
+
+
+def test_a_reorder_is_invisible_to_a_row_count_comparison(tmp_path):
+    """The proxy that made this a divergence in the first place.
+
+    A reorder returns the same NUMBER of rows in a different order, so every
+    "did anything change?" test written as a row-count (or before/after length)
+    comparison reports "nothing happened" while the map was in fact rewritten.
+    The summary therefore carries no `dropped_state_ids`/`dropped_window_indices`
+    at all -- fields whose emptiness would invite exactly that inference -- and
+    answers the question by status plus the moved windows themselves.
+    """
+    _permuted_phase(tmp_path, [2, 0, 1, 4, 3])
+    before = len(_read_map(tmp_path / "epoch_window_map.csv"))
+
+    summary = repair_epoch_window_map_from_surviving_windows(tmp_path)
+
+    assert len(_read_map(tmp_path / "epoch_window_map.csv")) == before  # the proxy sees nothing
+    assert "dropped_state_ids" not in summary
+    assert "dropped_window_indices" not in summary
+    assert summary["status"] == "rewritten_reordered"
+    assert summary["n_rows_moved"] == 5
+    assert summary["moved_windows"] == [
+        {"epoch_window": 0, "state_id_before": 22, "state_id_after": 20},
+        {"epoch_window": 1, "state_id_before": 20, "state_id_after": 21},
+        {"epoch_window": 2, "state_id_before": 21, "state_id_after": 22},
+        {"epoch_window": 3, "state_id_before": 24, "state_id_after": 23},
+        {"epoch_window": 4, "state_id_before": 23, "state_id_after": 24},
+    ]
+
+
+def test_a_cv1_only_phase_reorders_on_its_primary_axis_alone(tmp_path):
+    """A plain 1D ladder has no secondary centre in either record, and the two
+    sides must agree that "absent in both" is agreement rather than a mismatch.
+
+    This is the one place the shared matcher is reached through an adapter: the
+    write side reads centres with its own column aliases and hands them over as
+    text, so a CV1-only phase's secondary axis makes the whole trip as NaN.
+    NaN != NaN under ordinary float comparison, so a matcher (or an adapter) that
+    got this wrong would refuse every 1D phase outright -- a healthy-run refusal,
+    the failure mode that is its own kind of bug.
+    """
+    centers = [(0.05 * i, float("nan")) for i in range(5)]
+    _write_map(
+        tmp_path / "epoch_window_map.csv",
+        [{"epoch_window": j, "state_id": 10 + w, "primary_center": centers[w][0],
+          "secondary_center": ""}
+         for j, w in enumerate([4, 0, 1, 2, 3])],
+        REAL_RUN_FIELDS,
+    )
+    _survivor_table(tmp_path / "umbrella_explicit_windows.csv", [(c1, "") for c1, _ in centers])
+
+    summary = repair_epoch_window_map_from_surviving_windows(tmp_path)
+
+    assert summary["status"] == "rewritten_reordered"
+    assert _pairs(tmp_path / "epoch_window_map.csv") == [(i, 10 + i) for i in range(5)]
+    rows = _read_map(tmp_path / "epoch_window_map.csv")
+    assert [float(r["primary_center"]) for r in rows] == [c1 for c1, _ in centers]
+    assert all(r["secondary_center"] == "" for r in rows)  # the axis stays absent
+
+
+def test_the_rows_moved_count_is_not_a_restatement_of_the_state_id_changes(tmp_path):
+    """`n_rows_moved` counts rows that physically changed position; `moved_windows`
+    reports which local window changed STATE.  They are not the same number, and
+    conflating them would make a real rewrite announce itself as "0 windows
+    moved".
+
+    The fixture is the case that separates them: a map carrying one state_id on
+    two rows with different centres (corrupt, but the map is data on disk and the
+    warning has to stay true whatever it holds).  Reordering by centre still moves
+    those rows and still writes the file, while no local window's state_id
+    changes -- so the state-level record is legitimately empty and the row-level
+    count is not.
+    """
+    centers = _ladder_centers(4)
+    _write_map(
+        tmp_path / "epoch_window_map.csv",
+        [{"epoch_window": j, "state_id": 30 + (w // 2), "primary_center": centers[w][0],
+          "secondary_center": centers[w][1]}
+         for j, w in enumerate([1, 0, 3, 2])],
+        REAL_RUN_FIELDS,
+    )
+    _survivor_table(tmp_path / "umbrella_explicit_windows.csv", centers)
+
+    summary = repair_epoch_window_map_from_surviving_windows(tmp_path)
+
+    assert summary["status"] == "rewritten_reordered"
+    assert summary["moved_windows"] == []          # no local window changed state
+    assert summary["n_rows_moved"] == 4            # every row still changed place
+    assert _map_centers(tmp_path / "epoch_window_map.csv") == centers
+
+
+def test_reordering_is_idempotent_by_projection_and_stays_out_of_the_drop_ledger(tmp_path):
+    """How a reorder interacts with `epoch_window_map_rewrites.json`'s DROP list:
+    it does not touch it, and that separation is load-bearing.
+
+    The `applied` list's entries are drop sets, keyed by `(n_windows_before,
+    dropped_window_indices)`, and its idempotence rule rests on "a successful
+    rewrite always removes at least one row, so that pair can never legitimately
+    recur for one map file".  A reorder removes no rows, so it has no such key,
+    and two reorders of one phase (the driver overwrites the map between attempts
+    and it is permuted again) would produce byte-identical entries -- an entry
+    shape that falsifies the invariant the whole branch rests on.
+
+    It needs no replay guard either, and that is a stronger property than the
+    ledger's rather than a weaker one: ordering rows into the table's order is a
+    PROJECTION, so applying it twice is applying it once.  Asserted on the real
+    function -- the second call finds the order-preserving matcher succeeding and
+    returns `consistent`, having written nothing.
+
+    What it DOES need is a record, which now lives in the file's separate
+    `reorders` list -- see
+    `test_a_reorder_is_recorded_on_disk_before_the_caller_can_store_anything`.
+    This test's earlier revision asserted `not LEDGER.exists()`, i.e. that a
+    reorder left no durable trace at all; that was the defect, not the contract.
+    """
+    _permuted_phase(tmp_path, [4, 0, 1, 2, 3])
+
+    first = repair_epoch_window_map_from_surviving_windows(tmp_path)
+    after_reorder = (tmp_path / "epoch_window_map.csv").read_bytes()
+    second = repair_epoch_window_map_from_surviving_windows(tmp_path)
+
+    assert first["status"] == "rewritten_reordered"
+    assert second["status"] == "consistent"
+    assert second["centers_verified"] is True
+    assert (tmp_path / "epoch_window_map.csv").read_bytes() == after_reorder
+    # The drop list stays empty through both calls: no drop key was invented for
+    # a rewrite that removed no rows.
+    assert _ledger(tmp_path) == []
+    # And the projection really is one: the second call added no second record.
+    assert len(_reorder_ledger(tmp_path)) == 1
+
+
+def test_a_reorder_is_recorded_on_disk_before_the_caller_can_store_anything(tmp_path):
+    """The durable record of a reorder, in the only place that survives the
+    process dying immediately after the map is rewritten.
+
+    `run_gareus` stores the repair summary in the phase's gareus_metadata.json
+    only after `repair_epoch_window_map_from_surviving_windows` returns.  A
+    process killed in between leaves the map reordered on disk with the metadata
+    channel empty -- and a resumed repair then finds the two artifacts agreeing
+    and answers `consistent`, which `_epoch_window_map_repair_must_be_recorded`
+    correctly declines to record.  Nothing anywhere would say a reorder happened,
+    even though every sample already written for those windows was logged against
+    the old order.
+
+    Simulated exactly that way: the summary is deliberately NOT handed to the
+    metadata channel, and the resume is the real function called a second time.
+    """
+    _permuted_phase(tmp_path, [4, 0, 1, 2, 3])
+
+    summary = repair_epoch_window_map_from_surviving_windows(tmp_path)
+    # ... and here the process dies: nothing calls _run_gareus_would_record's
+    # branch, so window_metadata never receives `summary`.
+    resumed = repair_epoch_window_map_from_surviving_windows(tmp_path)
+
+    assert summary["status"] == "rewritten_reordered"
+    assert summary["ledger"]["appended"] is True
+    assert summary["ledger"]["list"] == "reorders"
+    # The metadata channel really is empty on the resume -- the gap this closes.
+    assert resumed["status"] == "consistent"
+    assert _run_gareus_would_record(resumed) is False
+    # The ledger file is the record that remains, and it says what moved.
+    records = _reorder_ledger(tmp_path)
+    assert len(records) == 1
+    assert records[0]["status"] == "rewritten_reordered"
+    assert records[0]["state_ids_before"] == [24, 20, 21, 22, 23]
+    assert records[0]["state_ids_after"] == [20, 21, 22, 23, 24]
+    assert records[0]["moved_windows"][0] == {
+        "epoch_window": 0, "state_id_before": 24, "state_id_after": 20}
+
+
+def test_the_reorder_record_is_kept_off_the_drop_list_refusal_path(tmp_path):
+    """Why the record goes in `reorders` and not in `applied`, measured on the
+    refusal path itself rather than asserted about it.
+
+    `_epoch_window_map_rewrite_already_applied` refuses a request whose `source`
+    matches an entry's while the map still holds that entry's
+    `surviving_state_ids`.  Put a reorder record in `applied` under source
+    `surviving_window_table` and, the moment it carries that key, it refuses a
+    later GENUINE drop rewrite from that same source: the ledger, whose entire
+    purpose is to stop a map being wrongly compacted, becomes the reason a needed
+    compaction never happens.
+
+    Honest about how far away that is today: the reorder summary records
+    `state_ids_before`/`state_ids_after`, not `surviving_state_ids`, so an entry
+    misfiled into `applied` right now would be skipped by that matcher for a
+    reason having nothing to do with the separation.  ONE key -- an obvious one to
+    add when spelling out what a rewrite left behind -- closes that distance, and
+    the second half below drives the real matcher with exactly that entry to show
+    the refusal is real.  The first half is the outcome guard: whatever else
+    changes, a later genuine drop from the same source must still be applied.
+    """
+    from gareus.production import (
+        _append_epoch_window_map_ledger_entry,
+        _epoch_window_map_rewrite_already_applied,
+        _epoch_window_map_state_ids,
+    )
+
+    _permuted_phase(tmp_path, [4, 0, 1, 2, 3])
+    reorder = repair_epoch_window_map_from_surviving_windows(tmp_path)
+    assert reorder["status"] == "rewritten_reordered"
+
+    later_drop = rewrite_epoch_window_map_after_drop(
+        tmp_path, [1], 5, source="surviving_window_table")
+
+    assert later_drop["status"] == "rewritten"
+    assert later_drop["dropped_state_ids"] == [21]
+    assert _pairs(tmp_path / "epoch_window_map.csv") == [(0, 20), (1, 22), (2, 23), (3, 24)]
+
+    # The hazard the separation avoids, measured: the same reorder record filed
+    # into `applied` with the one key it is missing does match, and the matcher
+    # hands back a refusal for a drop that has not been applied at all.
+    hazard = tmp_path / "hazard"
+    _permuted_phase(hazard, [4, 0, 1, 2, 3])
+    hazard_reorder = repair_epoch_window_map_from_surviving_windows(hazard)
+    misfiled = dict(hazard_reorder)
+    misfiled["surviving_state_ids"] = misfiled["state_ids_after"]
+    _append_epoch_window_map_ledger_entry(hazard, "applied", misfiled)
+    _fields, hazard_rows = _read_epoch_window_map_rows_via_production(hazard)
+
+    refusal = _epoch_window_map_rewrite_already_applied(
+        hazard, [1], 5, _epoch_window_map_state_ids(hazard_rows), "surviving_window_table")
+
+    assert refusal is not None
+    assert refusal["status"] == "rewritten_reordered"
+
+    # ...and with the record where it actually goes, that same lookup on the same
+    # shape of phase finds nothing to refuse with.  A third directory, because the
+    # first one has since taken a real drop from that source and its ledger
+    # entry -- a genuine replay guard -- would answer this lookup correctly.
+    clean = tmp_path / "clean"
+    _permuted_phase(clean, [4, 0, 1, 2, 3])
+    repair_epoch_window_map_from_surviving_windows(clean)
+    _fields2, clean_rows = _read_epoch_window_map_rows_via_production(clean)
+    assert _epoch_window_map_rewrite_already_applied(
+        clean, [1], 5, _epoch_window_map_state_ids(clean_rows),
+        "surviving_window_table") is None
+
+
+def test_a_later_drop_rewrite_does_not_erase_the_reorder_record(tmp_path):
+    """Both lists live in one file that is replaced wholesale on every append, so
+    an appender that rebuilt the payload from its own list alone would delete the
+    other one.  A phase that reorders and then drops must end up with both."""
+    _permuted_phase(tmp_path, [4, 0, 1, 2, 3])
+    repair_epoch_window_map_from_surviving_windows(tmp_path)
+
+    rewrite_epoch_window_map_after_drop(tmp_path, [1], 5, source="post_pull_auto_drop")
+
+    assert len(_reorder_ledger(tmp_path)) == 1
+    assert len(_ledger(tmp_path)) == 1
+    assert _ledger(tmp_path)[0]["source"] == "post_pull_auto_drop"
+
+
+def test_a_reorder_is_recorded_in_the_phase_metadata(tmp_path):
+    """The second, non-durable channel, unchanged: run_gareus stores any
+    non-`consistent` repair verdict in the phase's gareus_metadata.json.  Kept
+    because the ledger record above is a floor, not a replacement -- the metadata
+    copy is what an operator reading the phase directory sees first."""
+    _permuted_phase(tmp_path, [4, 0, 1, 2, 3])
+
+    summary = repair_epoch_window_map_from_surviving_windows(tmp_path)
+
+    assert summary["status"] == "rewritten_reordered"
+    assert _run_gareus_would_record(summary) is True
+
+
+def test_repair_still_refuses_a_genuinely_different_window_set_of_equal_size(tmp_path, capsys):
+    """The direction that must not move.  Attempt 1 dropped window 1, attempt 2
+    dropped window 3, so the counts agree and the membership does not: window 3
+    really ran and has no row in the map at all, its state_id is recorded nowhere
+    in these two artifacts, and reordering cannot invent one.  Refuse, loudly,
+    and leave the file alone."""
+    centers = _ladder_centers(5)
+    _map_from_centers(tmp_path / "epoch_window_map.csv", centers[:1] + centers[2:])
+    _survivor_table(tmp_path / "umbrella_explicit_windows.csv", centers[:3] + centers[4:])
+    original = (tmp_path / "epoch_window_map.csv").read_bytes()
+
+    summary = repair_epoch_window_map_from_surviving_windows(tmp_path)
+
+    assert summary["status"] == "inconsistent_equal_count_centers_do_not_match"
+    assert summary["centers_verified"] is False
+    assert (tmp_path / "epoch_window_map.csv").read_bytes() == original
+    assert "DIFFERENT window set of the same size" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("wrecked", [
+    ("one_centre_wrecked", 9.75),
+    ("near_miss_at_1000x_tolerance", None),
+], ids=lambda v: v[0] if isinstance(v, tuple) else v)
+def test_a_permutation_with_a_centre_that_does_not_match_is_refused(tmp_path, wrecked):
+    """Adversarial: a map that is *nearly* a permutation must not be reordered.
+
+    Either one row's centre is grossly wrong (a recentered state, e.g. the tICA
+    CV2 recentering between an interrupted attempt and its resume) or it is off
+    by 1000x the 1e-6 centre-match tolerance -- still four orders below the
+    closest two real windows of any phase on disk ever come, so accepting it
+    would mean the tolerance, not the evidence, decided the mapping.
+    """
+    label, wrecked_center = wrecked
+    centers = _ladder_centers(5)
+    order = [4, 0, 1, 2, 3]
+    rows = [{"epoch_window": j, "state_id": _PERMUTED_STATE_IDS[w],
+             "primary_center": centers[w][0], "secondary_center": centers[w][1]}
+            for j, w in enumerate(order)]
+    if wrecked_center is None:
+        rows[0]["secondary_center"] = centers[4][1] + 1e-3
+    else:
+        rows[0]["secondary_center"] = wrecked_center
+    _write_map(tmp_path / "epoch_window_map.csv", rows, REAL_RUN_FIELDS)
+    _survivor_table(tmp_path / "umbrella_explicit_windows.csv", centers)
+    original = (tmp_path / "epoch_window_map.csv").read_bytes()
+
+    summary = repair_epoch_window_map_from_surviving_windows(tmp_path)
+
+    assert summary["status"] == "inconsistent_equal_count_centers_do_not_match"
+    assert (tmp_path / "epoch_window_map.csv").read_bytes() == original
+
+
+def test_a_permutation_whose_window_table_is_not_in_local_window_order_is_refused(tmp_path, capsys):
+    """The gate that keeps this from "repairing" a map into a wrong answer.
+
+    The existing subsequence repair only ever REMOVES rows and keeps the map's
+    own order, so a mis-ordered table makes it refuse.  A reorder takes its
+    output order FROM the table -- so if the table's rows are not this phase's
+    local windows 0..N-1 by position, the reordered map is wrong while looking
+    right, because the sets still match.  The table's own `window` column is the
+    only thing that contradicts file order, so a table that carries it and
+    disagrees with it must stop the reorder.  Its own status and message: folding
+    this into the different-window-set refusal would print a second false claim
+    in place of the one being removed.
+    """
+    _permuted_phase(tmp_path, [4, 0, 1, 2, 3], table_file_order=[0, 2, 1, 3, 4])
+    original = (tmp_path / "epoch_window_map.csv").read_bytes()
+
+    summary = repair_epoch_window_map_from_surviving_windows(tmp_path)
+
+    assert summary["status"] == "inconsistent_equal_count_reorder_not_positionally_verifiable"
+    assert "window` column is not numbered" in summary["positional_problem"]
+    assert (tmp_path / "epoch_window_map.csv").read_bytes() == original
+    out = capsys.readouterr().out
+    assert "DIFFERENT window set" not in out
+    assert "same window set" in out
+
+
+def test_a_permutation_whose_map_is_not_numbered_0_to_n_minus_1_is_refused(tmp_path):
+    """The same gate on the other record.  A sample's local window index is
+    resolved through the `epoch_window` VALUE downstream, so position and value
+    have to agree before a positional reordering means anything -- and if they do
+    not, which of the two orders is the local-window order is an inference, not a
+    reading.  Abstain rather than guess."""
+    _permuted_phase(tmp_path, [4, 0, 1, 2, 3])
+    rows = _read_map(tmp_path / "epoch_window_map.csv")
+    for i, row in enumerate(rows):
+        row["epoch_window"] = 10 + i
+    _write_map(tmp_path / "epoch_window_map.csv", rows, REAL_RUN_FIELDS)
+    original = (tmp_path / "epoch_window_map.csv").read_bytes()
+
+    summary = repair_epoch_window_map_from_surviving_windows(tmp_path)
+
+    assert summary["status"] == "inconsistent_equal_count_reorder_not_positionally_verifiable"
+    assert "epoch_window column is not numbered" in summary["positional_problem"]
+    assert (tmp_path / "epoch_window_map.csv").read_bytes() == original
+
+
+def test_duplicate_centres_never_reach_a_written_reorder(tmp_path):
+    """Duplicate restraint centres must never produce a reordered map.
+
+    The shared permutation matcher is a greedy first-unused-match: two rows with
+    identical (primary, secondary) centres are interchangeable to it and it pairs
+    them arbitrarily, which would attach one of them the other's state_id (the
+    bias is identical, so nothing downstream would look wrong; the MBAR state
+    pooling is not).  The duplicate-centres abstain is what shields it, and this
+    fixture is a genuine permutation that the matcher WOULD happily reorder --
+    verified by deleting the abstain from an isolated copy of the source, which
+    turns this phase into `rewritten_reordered`.
+
+    What is pinned is the outcome, not the abstain's position in the branch:
+    moving it after the reorder attempt (but still before the write) was measured
+    to leave every observable identical, so a test claiming to pin the ordering
+    would have been claiming teeth it does not have.
+    """
+    centers = [(0.1, -1.0), (0.1, -1.0), (0.2, 1.0), (0.3, 2.0)]
+    _map_from_centers(tmp_path / "epoch_window_map.csv",
+                      [centers[0], centers[1], centers[3], centers[2]])
+    _survivor_table(tmp_path / "umbrella_explicit_windows.csv", centers)
+    original = (tmp_path / "epoch_window_map.csv").read_bytes()
+
+    summary = repair_epoch_window_map_from_surviving_windows(tmp_path)
+
+    assert summary["status"] == "consistent"
+    assert summary["centers_verified"] is False
+    assert summary["centers_check"] == "skipped_duplicate_centers"
+    assert (tmp_path / "epoch_window_map.csv").read_bytes() == original
+
+
+def test_a_failing_reorder_check_never_raises_out_of_the_repair(tmp_path, monkeypatch, capsys):
+    """`repair_epoch_window_map_from_surviving_windows` documents "Never raises",
+    and run_gareus calls it outside any try/except: an exception here kills a
+    production phase whose MD is otherwise fine.  The reorder check is the one
+    part of it that reaches into another module, so its failure has to degrade to
+    a recorded refusal rather than propagate."""
+    import gareus.production as prod
+
+    _permuted_phase(tmp_path, [4, 0, 1, 2, 3])
+    original = (tmp_path / "epoch_window_map.csv").read_bytes()
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("simulated import/read failure")
+
+    monkeypatch.setattr(prod, "_reorder_map_rows_onto_surviving_windows", _boom)
+
+    summary = repair_epoch_window_map_from_surviving_windows(tmp_path)
+
+    assert summary["status"] == "skipped_reorder_check_failed"
+    assert "simulated import/read failure" in summary["error"]
+    assert (tmp_path / "epoch_window_map.csv").read_bytes() == original
+    assert _run_gareus_would_record(summary) is True
+    assert "simulated import/read failure" in capsys.readouterr().out
+
+
+def test_the_write_side_and_the_load_side_agree_on_what_a_permutation_is(tmp_path):
+    """The divergence itself, asserted rather than described.
+
+    Two answers to "is this a permutation" is the drift that produced this
+    finding, so the write side calls the load side's own matcher rather than
+    carrying a second copy of the rule.  Both shapes are checked: a permutation
+    that both must accept, and a genuinely different window set that both must
+    refuse -- run through the real load-side function, not a re-derivation.
+    """
+    from gareus.mbar_analysis.loaders_adaptive import _permute_map_rows_onto_window_table
+
+    centers = _ladder_centers(5)
+    _permuted_phase(tmp_path, [4, 0, 1, 2, 3])
+    rows = _read_map(tmp_path / "epoch_window_map.csv")
+
+    assert _permute_map_rows_onto_window_table(rows, centers) is not None
+    assert repair_epoch_window_map_from_surviving_windows(tmp_path)["status"] == "rewritten_reordered"
+
+    other = tmp_path / "different_set"
+    _map_from_centers(other / "epoch_window_map.csv", centers[:1] + centers[2:])
+    _survivor_table(other / "umbrella_explicit_windows.csv", centers[:3] + centers[4:])
+    other_rows = _read_map(other / "epoch_window_map.csv")
+
+    assert _permute_map_rows_onto_window_table(other_rows, centers[:3] + centers[4:]) is None
+    assert (repair_epoch_window_map_from_surviving_windows(other)["status"]
+            == "inconsistent_equal_count_centers_do_not_match")
+
+
+def test_a_reorder_makes_a_following_drop_time_rewrite_land_on_the_right_rows(tmp_path):
+    """Composition, in run_gareus's real order: the map repair runs before the
+    post-pull auto-drop (pinned by
+    test_the_pull_and_drop_block_precedes_the_first_sample_segment, which reads
+    that order out of the source), and that drop's indices are positions in
+    `centers_a` -- i.e. in the window table's order, the very order the reorder
+    installs.  So on a permuted map the reorder is what makes the drop land on
+    the rows it names; without it the drop silently compacts the wrong states.
+
+    Both halves run the real functions.  The same structural test also pins what
+    makes changing a local->state mapping safe at all: it happens before any
+    sample segment is opened, never after samples were logged against the old
+    order.
+    """
+    _permuted_phase(tmp_path, [2, 0, 1, 4, 3])
+    assert repair_epoch_window_map_from_surviving_windows(tmp_path)["status"] == "rewritten_reordered"
+
+    after_repair = rewrite_epoch_window_map_after_drop(
+        tmp_path, [1], 5, source="post_pull_auto_drop")
+
+    assert after_repair["status"] == "rewritten"
+    assert after_repair["dropped_state_ids"] == [21]
+    assert _pairs(tmp_path / "epoch_window_map.csv") == [(0, 20), (1, 22), (2, 23), (3, 24)]
+
+    # The same drop applied to the same phase's UNREPAIRED map removes a
+    # different state and leaves the survivors in the wrong order: it is the
+    # reorder above, not the drop, that makes local window 1 mean state 21.
+    unrepaired = tmp_path / "unrepaired"
+    _permuted_phase(unrepaired, [2, 0, 1, 4, 3])
+    without_repair = rewrite_epoch_window_map_after_drop(
+        unrepaired, [1], 5, source="post_pull_auto_drop")
+
+    assert without_repair["dropped_state_ids"] == [20]
+    assert _pairs(unrepaired / "epoch_window_map.csv") == [(0, 22), (1, 21), (2, 24), (3, 23)]

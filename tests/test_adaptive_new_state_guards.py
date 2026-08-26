@@ -1049,6 +1049,7 @@ def test_every_driver_map_write_goes_through_the_resume_guard():
     assert map_locals, "expected at least one hoisted epoch_window_map.csv path local"
 
     bare = []
+    guarded_map_writes = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -1057,13 +1058,81 @@ def test_every_driver_map_write_goes_through_the_resume_guard():
                 continue
             rendered = ast.unparse(kw.value)
             names = {n.id for n in ast.walk(kw.value) if isinstance(n, ast.Name)}
-            if "epoch_window_map.csv" not in rendered and not (names & map_locals):
+            # Anchor on the GUARD local as well as the map local.  Keying only on
+            # "does this value mention a phase map path" makes the check blind to
+            # exactly the mutation that mentions none: `map_path=None if
+            # _seg_map_preserved else None` names no map path, so it fell through
+            # this pre-filter untouched and was never handed to the branch checks
+            # below (verified -- it did, before this clause was added).  A
+            # `map_path=` whose value consults `*_map_preserved` at all is by
+            # construction one of the two non-funnel phase-map write sites,
+            # whether or not it still names the file.
+            guard_names = {n for n in names if n.endswith("_map_preserved")}
+            if ("epoch_window_map.csv" not in rendered
+                    and not (names & map_locals)
+                    and not guard_names):
                 continue
+            # Pin the BRANCHES, not merely the presence of a conditional.
+            #
+            # This clause used to accept any `IfExp` whose test ended in
+            # `_map_preserved`, which is a shape check, not a behaviour check:
+            # an inverted conditional has exactly that shape.  Review round 5
+            # demonstrated it by inverting both sites to
+            # `path if preserved else None` -- the whole map-rewrite suite still
+            # passed, and the resulting bug is silent sample loss (no map is
+            # written for a fresh phase, so _find_adaptive_epoch_dirs falls back
+            # to the parent's map over a larger state set, or drops the segment
+            # from the analysis entirely).
+            #
+            # Three distinct mutations reach this keyword, and they need three
+            # distinct clauses -- tightening only the one that motivated the
+            # round leaves the other two accepted:
+            #
+            #   `path if preserved else None`      -> caught by `body is None`
+            #   `None if preserved else None`      -> caught by `orelse` having
+            #                                         to name a real map local
+            #   `None if not preserved else path`  -> caught by rejecting a
+            #                                         UnaryOp in the test; note
+            #                                         `ast.unparse(...)` of
+            #                                         `not _seg_map_preserved`
+            #                                         still ENDS in
+            #                                         `_map_preserved`, so the
+            #                                         endswith clause alone
+            #                                         accepts the inversion.
+            #
+            # Read the accepted shape as the invariant it encodes: preserved =>
+            # hand the writer no map at all; not preserved => hand it this
+            # phase's own map path.  Anything else is not that invariant.
+            #
+            # Note the style constraint this imposes, deliberately: the else-branch
+            # must be a HOISTED map-path local (`_seg_map_path`), not an inline path
+            # expression.  Spelling it `else seg_dir / "epoch_window_map.csv"` is
+            # semantically identical but parses as a BinOp, so it is rejected here
+            # and reported as unguarded.  That is fail-closed on purpose -- pinning
+            # `orelse` to a known map local is what makes `None if preserved else
+            # None` detectable -- but hoist the path into a local first rather than
+            # loosening this clause if a new site needs one.
             if (isinstance(kw.value, ast.IfExp)
-                    and ast.unparse(kw.value.test).endswith("_map_preserved")):
+                    and ast.unparse(kw.value.test).endswith("_map_preserved")
+                    and not any(isinstance(n, ast.UnaryOp)
+                                for n in ast.walk(kw.value.test))
+                    and isinstance(kw.value.body, ast.Constant)
+                    and kw.value.body.value is None
+                    and isinstance(kw.value.orelse, ast.Name)
+                    and kw.value.orelse.id in map_locals):
+                guarded_map_writes.append(rendered)
                 continue
             bare.append(f"{rendered} in {ast.unparse(node)}")
     assert bare == [], f"unguarded phase map_path= writes: {bare}"
+    # A floor, not just a shape check.  The two mutations that silence a site by
+    # replacing its whole value (`map_path=None`, and `map_path=None if preserved
+    # else None` once the pre-filter above stops ignoring it) leave nothing for
+    # the branch checks to reject -- the site simply stops being a phase-map
+    # write.  Counting the surviving guarded conditionals is what notices a site
+    # going missing rather than going wrong.
+    assert len(guarded_map_writes) >= 2, (
+        "expected both non-funnel phase-map write sites (run_segment's scheduled "
+        f"sub-run and the frozen final phase) to survive; found {guarded_map_writes}")
     assert len(
         [n for n in ast.walk(tree)
          if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
