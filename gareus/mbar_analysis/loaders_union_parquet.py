@@ -19,8 +19,11 @@ from typing import Optional
 import numpy as np
 
 from gareus.units import K_B_KJ_PER_MOL_K
-from .data import Data, clean, infer_temp_beta, rjson, _fill_masked_nan
-from .loaders_adaptive import _find_adaptive_epoch_dirs, _vectorized_map_lookup, _vectorized_map_index
+from .data import (Data, clean, infer_temp_beta, rjson, _fill_masked_nan,
+                   _epoch_run_manifest_secondary_cv_type)
+from .loaders_adaptive import (_find_adaptive_epoch_dirs, _phase_label,
+                               _validate_and_repair_epoch_window_map,
+                               _vectorized_map_lookup, _vectorized_map_index)
 
 
 def _is_usable_for_mbar(row: dict) -> bool:
@@ -64,11 +67,81 @@ def _load_epoch_task(epoch_dir: Path, wmap_path: Path, n_threads: int) -> tuple:
     from analyze_gareus_mbar import _parse_epoch_window_map_native_params
     with wmap_path.open(newline='') as f:
         wmap_rows = list(csv.DictReader(f))
+    samples = load_samples(epoch_dir, n_threads=n_threads)
+    # The map's row count used to be trusted blindly. It can be STALE: an
+    # `--us-auto-drop-bad-windows` phase renumbers its surviving windows
+    # 0..N-1 without ever rewriting the map the registry already wrote over
+    # all *active* states, so every local index at or after the first dropped
+    # one resolves to the wrong state (~15% of a real 12.1M-sample campaign,
+    # docs/chignolin_6_low_ess_root_cause.md). Repair it in memory where the
+    # phase's own drop record allows, fail closed where it does not -- and do
+    # it *before* wmap/native_params are derived, so both follow the repaired
+    # rows. Note the samples must already be loaded above: the row-count check
+    # that needs no metadata at all compares against the window_id values the
+    # Parquet data actually contains.
+    wmap_rows, wmap_notes = _validate_and_repair_epoch_window_map(
+        epoch_dir, wmap_rows,
+        window_ids=samples.get('window_id') if samples else None,
+        cv2=_fill_masked_nan(samples.get('cv2')) if samples else None)
     wmap = {int(r['epoch_window']): int(r['state_id']) for r in wmap_rows}
     native_params = _parse_epoch_window_map_native_params(wmap_rows)
-    samples = load_samples(epoch_dir, n_threads=n_threads)
     ep_meta = rjson(epoch_dir / 'umbrella_pymbar_metadata.json', {})
-    return samples, wmap, ep_meta, native_params
+    return samples, wmap, ep_meta, native_params, wmap_notes
+
+
+def _secondary_cv_regime_change_note(epoch_dirs: list, sample_counts: Optional[list] = None) -> Optional[str]:
+    """Warn when the secondary CV was *redefined* part-way through a campaign.
+
+    Each epoch/phase records the secondary-CV mode it actually ran under in
+    its own ``run_manifest.json`` (``resolved_args.secondary_cv``). Two
+    different modes -- e.g. ``torsion-pca`` for epoch 0 and ``tica-linear``
+    from the tICA CV2 auto-switch onwards -- are different linear projections
+    of the same raw torsion features, i.e. genuinely different order
+    parameters, not a recentering of one coordinate. The per-epoch native
+    window params keep each epoch's own ``u_nk`` internally consistent (the
+    2026-08-04 fix), but state *k* is then not one Hamiltonian across the
+    switch, which is formally invalid for the single pooled MBAR solve that
+    spans both.
+
+    Returns None for the overwhelming majority of runs (one regime, or no
+    readable manifests). This only reports; restructuring MBAR itself is a
+    much larger question. CV2-*facing plots* are already split per regime by
+    ``_secondary_cv_epoch_regime_masks``; nothing surfaced the MBAR-side
+    implication before. Deliberately reads only each phase dir's own manifest
+    (no parent fallback), exactly like that sibling function, so the two can
+    never disagree about how many regimes a run has.
+    """
+    regimes: dict = {}
+    for i, ed in enumerate(epoch_dirs):
+        regime = _epoch_run_manifest_secondary_cv_type(Path(ed))
+        if not regime:
+            continue
+        entry = regimes.setdefault(regime, {'phases': [], 'samples': 0})
+        entry['phases'].append(_phase_label(ed))
+        if sample_counts is not None and i < len(sample_counts):
+            entry['samples'] += int(sample_counts[i])
+    if len(regimes) < 2:
+        return None
+    # Reported in first-appearance order, which is the epoch-dir discovery
+    # order (sorted, hence chronological for the epoch_NNN/final layout).
+    parts = []
+    for regime, e in regimes.items():
+        # A late-epoch regime can span a dozen topup sub-runs; list a few and
+        # count the rest so the warning stays readable in pmf_summary.json.
+        shown = e['phases'][:4]
+        phases = ', '.join(shown)
+        if len(e['phases']) > len(shown):
+            phases += f' (+{len(e["phases"]) - len(shown)} more)'
+        parts.append(f'{regime!r} ({phases}; {e["samples"]:,} samples)')
+    return ('[cv2 regime change] The secondary CV was redefined mid-campaign: '
+            + ' then '.join(parts)
+            + ', per each phase\'s own run_manifest.json (resolved_args.secondary_cv). '
+              'Bias energies use each epoch\'s own native window params, so u_nk is internally '
+              'consistent *within* each regime -- but state k is NOT one Hamiltonian across the '
+              'switch, so this single pooled MBAR solve is formally invalid across the regime '
+              'boundary: treat cross-regime free-energy differences, and any pooled CV2-facing '
+              'number, as unvalidated. CV2-facing plots are already split per regime; the MBAR '
+              'solve itself is not.')
 
 
 def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_workers: int = 4,
@@ -160,11 +233,20 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
             [(ed, wp, _threads_per_conn) for ed, wp in epoch_dirs],
         ))
 
+    # Any phase whose stale window map had to be repaired in memory says so
+    # here (an unrepairable one raised inside the worker instead). Printed
+    # immediately *and* carried into meta['load_notes'], which analyze()
+    # folds into pmf_summary.json's warnings -- a silent repair would be as
+    # misleading as the bug it fixes.
+    load_notes = [n for _s, _w, _m, _prm, _notes in epoch_loaded for n in _notes]
+    for _n in load_notes:
+        print(f'    {_n}')
+
     # Resolve beta once, up front, using the same fallback order as before (first
     # epoch whose metadata yields it, else a top-level adaptive_dir inference).
     # Must be fixed *before* any per-epoch bias block is built below, since every
     # block needs the same beta.
-    for (samples, _wmap, ep_meta, _native_params), (epoch_dir, _) in zip(epoch_loaded, epoch_dirs):
+    for (samples, _wmap, ep_meta, _native_params, _notes), (epoch_dir, _) in zip(epoch_loaded, epoch_dirs):
         if math.isfinite(beta):
             break
         if not samples or 'cv1' not in samples or len(samples['cv1']) == 0:
@@ -174,7 +256,9 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
     if not math.isfinite(beta):
         _, beta = infer_temp_beta(adaptive_dir, meta)
 
-    for (samples, wmap, ep_meta, native_params), (epoch_dir, _) in zip(epoch_loaded, epoch_dirs):
+    per_dir_valid_counts = [0] * len(epoch_dirs)
+    for _ei, ((samples, wmap, ep_meta, native_params, _notes), (epoch_dir, _)) in enumerate(
+            zip(epoch_loaded, epoch_dirs)):
         if not samples or 'cv1' not in samples or len(samples['cv1']) == 0:
             continue
         raw_w = samples['window_id'].astype(np.int32)
@@ -226,6 +310,7 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
         pot_raw = samples.get('potential')
         all_potential.append(_fill_masked_nan(pot_raw[valid]) if pot_raw is not None else np.full(valid.sum(), np.nan))
         all_epoch_src.append(np.full(int(valid.sum()), len(all_cv) - 1, dtype=np.int32))
+        per_dir_valid_counts[_ei] = int(valid.sum())
         # Bias energies for THIS epoch's samples must use the window params that
         # were actually in effect during this epoch (native_params), not whatever
         # a state's row in the live/final registry says today — that snapshot can
@@ -273,7 +358,16 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
 
     temp = 1.0 / (K_B_KJ_PER_MOL_K * beta)
 
+    # Mid-campaign secondary-CV redefinition: reported, not corrected (see
+    # _secondary_cv_regime_change_note).
+    _regime_note = _secondary_cv_regime_change_note([ed for ed, _ in epoch_dirs], per_dir_valid_counts)
+    if _regime_note:
+        print(f'    {_regime_note}')
+        load_notes = load_notes + [_regime_note]
+
     meta_out = dict(meta)
+    if load_notes:
+        meta_out['load_notes'] = list(meta.get('load_notes') or []) + load_notes
     meta_out.update({'temperature_K': temp, 'beta_1_over_kJ_mol': beta,
                      'adaptive_union_states': K, 'adaptive_union_epochs': len(epoch_dirs),
                      'umbrella_window_rows': list(reg_rows),

@@ -32,6 +32,17 @@ from typing import Optional
 
 import numpy as np
 
+# The stale-`epoch_window_map.csv` guard, imported from the package rather
+# than re-implemented here. `load_npz_adaptive_union` below is a second,
+# parallel union-MBAR implementation, so it inherits the same auto-drop
+# mis-attribution bug as the Parquet loader and must fail closed the same way
+# (docs/chignolin_6_low_ess_root_cause.md). Imported via
+# gareus.mbar_analysis.loaders -- the module that owns the shared entry points
+# for every non-Parquet consumer of that file -- so this script has one import
+# surface for the whole guard family.
+from gareus.mbar_analysis.loaders import (_validate_and_repair_epoch_window_map,
+                                          check_union_npz_window_map_provenance)
+
 # ---------------------------------------------------------------------------
 # Import key pieces from analyze_gareus_mbar.py (same repo root)
 # ---------------------------------------------------------------------------
@@ -157,29 +168,13 @@ def load_npz_adaptive_union(adaptive_dir: Path) -> agm.Data:
     all_cv = []; all_cv2 = []; all_window = []; all_step = []
     all_replica = []; all_boost = []; all_potential = []
     beta = float('nan')
+    load_notes: list[str] = []
     meta: dict = agm.rjson(adaptive_dir.parent / 'run_manifest.json', {})
 
     for npz_dir, wmap_path in epoch_dirs:
-        with wmap_path.open(newline='') as f:
-            wmap = {int(r['epoch_window']): int(r['state_id']) for r in csv.DictReader(f)}
-
         arr, _ = agm._load_merged_arrays(npz_dir)
         if not arr or 'cv_A' not in arr.files:
             continue
-
-        ep_meta = agm.rjson(npz_dir / 'umbrella_pymbar_metadata.json', {})
-        if not math.isfinite(beta):
-            b = float(ep_meta.get('beta_1_over_kJ_mol') or 0.0)
-            beta = b if b > 0 else agm.infer_temp_beta(npz_dir, ep_meta)[1]
-
-        raw_w = np.asarray(arr['window'], dtype=np.int32)
-        remapped = np.array([wmap.get(int(w), -1) for w in raw_w], dtype=np.int32)
-        valid = remapped >= 0
-        if not np.any(valid):
-            continue
-
-        cv = np.asarray(arr['cv_A'], dtype=np.float64)[valid]
-        all_cv.append(cv)
 
         def _get_first(*keys):
             for key in keys:
@@ -188,9 +183,49 @@ def load_npz_adaptive_union(adaptive_dir: Path) -> agm.Data:
                     return v
             return None
 
+        ep_meta = agm.rjson(npz_dir / 'umbrella_pymbar_metadata.json', {})
+        if not math.isfinite(beta):
+            b = float(ep_meta.get('beta_1_over_kJ_mol') or 0.0)
+            beta = b if b > 0 else agm.infer_temp_beta(npz_dir, ep_meta)[1]
+
+        raw_w = np.asarray(arr['window'], dtype=np.int32)
         cv2_raw = _get_first('cv2_A', 'secondary_cv')
-        all_cv2.append(np.asarray(cv2_raw, dtype=np.float64)[valid]
-                       if cv2_raw is not None else np.full(int(valid.sum()), np.nan))
+        cv2_full = np.asarray(cv2_raw, dtype=np.float64) if cv2_raw is not None else None
+
+        # The map used to be trusted verbatim. It can be STALE: an
+        # `--us-auto-drop-bad-windows` phase renumbers its surviving windows
+        # 0..N-1 without rewriting the identity map the registry already wrote
+        # over all *active* states, so every local index at or after the first
+        # dropped one resolves to the wrong state. Validate/repair before the
+        # lookup is built, and fail closed when neither is possible -- this
+        # loader feeds comparison PMFs, so a silently shifted mapping here is
+        # exactly as damaging as it is on the Parquet path.
+        #
+        # `npz_dir`, not `wmap_path.parent`: _find_npz_epoch_dirs falls back to
+        # the parent epoch's map for a nested sub-run, but the metadata saying
+        # what actually ran (and the drop record) belongs to the sub-run whose
+        # samples these are. That inherited-map shape is precisely the case the
+        # guard was built for (chignolin_6's epoch_001/topup_004: 3 map rows,
+        # 2 real windows, drop record inherited from a sibling baseline).
+        with wmap_path.open(newline='') as f:
+            wmap_rows = list(csv.DictReader(f))
+        wmap_rows, wmap_notes = _validate_and_repair_epoch_window_map(
+            npz_dir, wmap_rows, window_ids=raw_w, cv2=cv2_full)
+        for _n in wmap_notes:
+            print(f'    {_n}')
+        load_notes.extend(wmap_notes)
+        wmap = {int(r['epoch_window']): int(r['state_id']) for r in wmap_rows}
+
+        remapped = np.array([wmap.get(int(w), -1) for w in raw_w], dtype=np.int32)
+        valid = remapped >= 0
+        if not np.any(valid):
+            continue
+
+        cv = np.asarray(arr['cv_A'], dtype=np.float64)[valid]
+        all_cv.append(cv)
+
+        all_cv2.append(cv2_full[valid]
+                       if cv2_full is not None else np.full(int(valid.sum()), np.nan))
 
         all_window.append(np.array([state_id_to_k[int(s)] for s in remapped[valid]], dtype=np.int32))
         step_arr = arr.get('step')
@@ -241,6 +276,8 @@ def load_npz_adaptive_union(adaptive_dir: Path) -> agm.Data:
         'primary_cv_units': ep_meta.get('primary_cv_units', ''),
         'umbrella_window_rows': list(reg_rows),
     })
+    if load_notes:
+        meta_out['load_notes'] = list(meta.get('load_notes') or []) + load_notes
     return agm.clean(agm.Data(
         prod_dir=adaptive_dir, out_dir=adaptive_dir / 'pmf_analysis',
         cv=cv, cv2=cv2, rg_A=np.full(cv.shape, np.nan),
@@ -263,6 +300,13 @@ def load_run(path: str) -> agm.Data:
         if (prod / 'final_registry_used_for_mbar.csv').exists():
             return agm.load_parquet_adaptive_union(prod)
         if (prod / 'adaptive_union_mbar.npz').exists():
+            # Same provenance check load_data does on this branch: the npz's
+            # state attribution was baked in by the driver from the phase
+            # window maps and cannot be repaired from the npz, so the maps it
+            # was built from are checked instead (refuses on a stale one,
+            # warns when provenance cannot be established, silent otherwise).
+            for _n in check_union_npz_window_map_provenance(prod):
+                print(f'    {_n}')
             return agm.load_union_npz(prod)
         if (prod / 'analysis_arrays.npz').exists() or (prod / 'analysis_chunks_manifest.json').exists():
             return agm.load_npz(prod)

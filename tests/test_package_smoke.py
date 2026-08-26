@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 
@@ -51,9 +52,23 @@ def test_python_m_gareus_heavy_help() -> None:
     assert "Post-hoc intra/inter peptide energy analysis" in result.stdout
     assert "Exact MD methodology, start to finish" in result.stdout
     assert "OpenMM explicit-solvent Amber14 PME peptide CMD/GaMD/REUS" in result.stdout
-    assert "0.14 Adaptive-production mode" in result.stdout
-    assert "0.16 Potential-energy handling and later decomposition" in result.stdout
-    assert "13. Adaptive production and global runtime pool" in result.stdout
+    # Encyclopedia topic numbers are assigned sequentially at render time by
+    # `_parse_encyclopedia` (gareus/helptext.py) from the prose's own headings,
+    # precisely so the TOC can never drift out of sync with the text.  Pinning
+    # a literal number here ("0.14 Adaptive-production mode") therefore
+    # asserted an implementation detail that any unrelated heading edit is
+    # *designed* to change - it was stale and red.  Match "<some number>. Title"
+    # instead: immune to renumbering, but still proves the auto-TOC actually
+    # rendered that heading as a numbered, jumpable topic rather than merely
+    # that the words appear somewhere in the output.
+    for topic_title in (
+        "Adaptive-production mode",
+        "Potential-energy handling and later decomposition",
+        "Adaptive production and global runtime pool",
+    ):
+        assert re.search(rf"\d+\.\s+{re.escape(topic_title)}", result.stdout), (
+            f"no numbered encyclopedia topic for {topic_title!r} in -hh output"
+        )
     assert "E_ij = k_e q_i q_j / r_ij" in result.stdout
     assert "gareus-energy-decompose -hh" in result.stdout
     assert "Provenance and reproducibility manifest" in result.stdout
@@ -684,11 +699,102 @@ def test_contact_cv_uses_tanh_stable_switch() -> None:
 
 
 def test_production_threadpool_import_is_py314_safe() -> None:
+    """`gareus.production` must hold a real, working ThreadPoolExecutor class.
+
+    The hazard this guards is the aliased-submodule import form,
+    ``import concurrent.futures as concurrent`` followed by
+    ``concurrent.futures.ThreadPoolExecutor(...)``: the alias binds the
+    *submodule*, not the ``concurrent`` package, so the attribute path is
+    dead - verified on this interpreter (3.14) it raises
+    ``AttributeError: module 'concurrent.futures' has no attribute
+    'futures'``, and it does so lazily, at first thread-pool construction,
+    i.e. only once a real production run is already several minutes in.
+
+    Asserted as the actual property (the name is bound eagerly at import
+    time and is the genuine class, and a pool built from it really runs a
+    task) rather than as a source literal.  The two negative greps below are
+    kept only as a cheap tripwire for the specific broken spelling; they are
+    not the property, and this test would still fail correctly if the import
+    regressed in some new way they do not match.
+    """
+    import concurrent.futures
     import inspect
+
     import gareus.production as production
+
+    # Eagerly bound at module level by `from concurrent.futures import
+    # ThreadPoolExecutor`, and the genuine stdlib class - not a shim, and not
+    # an attribute lookup deferred to run time.
+    assert production.ThreadPoolExecutor is concurrent.futures.ThreadPoolExecutor
+
+    # ... and a pool built the way production builds them actually executes.
+    with production.ThreadPoolExecutor(max_workers=1) as pool:
+        assert pool.submit(lambda x: x + 1, 41).result(timeout=30) == 42
 
     src = inspect.getsource(production)
     assert "import concurrent.futures as concurrent" not in src
     assert "concurrent.futures.ThreadPoolExecutor" not in src
-    assert "from concurrent.futures import ThreadPoolExecutor" in src
-    assert "ThreadPoolExecutor(max_workers=nrep)" in src
+
+    # The only production consumer of that name is _ReplicaAffinityExecutor,
+    # which builds one single-worker pool per replica.  Assert the link here so
+    # a future refactor cannot satisfy the import property above while the
+    # replica pools are built from something else entirely.  The affinity
+    # invariant itself (each replica pinned to one OS thread for the lifetime of
+    # the executor) is covered by tests/test_replica_affinity_executor.py, which
+    # asserts on observed threading.get_ident() values rather than on
+    # construction arguments.
+    affinity_pool = production._ReplicaAffinityExecutor(2)
+    try:
+        assert len(affinity_pool._pools) == 2
+        for _p in affinity_pool._pools:
+            assert isinstance(_p, concurrent.futures.ThreadPoolExecutor)
+            assert _p._max_workers == 1
+        assert affinity_pool.submit(1, lambda: 7).result(timeout=30) == 7
+    finally:
+        affinity_pool.shutdown(wait=True)
+
+
+def test_documented_quiet_pytest_invocation_still_prints_its_count_line() -> None:
+    """`python -m pytest -q tests/` must still report "N passed" at the end.
+
+    ``[tool.pytest.ini_options] addopts`` is *prepended* to the command line,
+    so any ``-q`` living there compounds with the ``-q`` in this repo's own
+    documented invocation: ``-q`` is a counting flag, and ``-qq`` suppresses
+    pytest's final count line entirely.  That produced runs which printed
+    bare ``FAILED`` lines and then nothing at all - indistinguishable, to a
+    human or to a verification agent reading the tail of the output, from a
+    suite that aborted mid-run.  Hence: no quiet flag in ``addopts``.
+
+    Checked end-to-end (a real nested pytest run against this repo's real
+    config via ``-c``, since the effect only exists once argparse has merged
+    addopts with the CLI) rather than by grepping pyproject.toml for a
+    literal, so any future way of re-introducing compounding verbosity flags
+    is caught too.
+    """
+    import re
+    import tempfile
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    with tempfile.TemporaryDirectory() as tmp:
+        probe = Path(tmp) / "test_addopts_probe.py"
+        probe.write_text("def test_trivially_passes():\n    assert True\n")
+        result = subprocess.run(
+            [
+                sys.executable, "-m", "pytest",
+                "-c", str(root / "pyproject.toml"),
+                "-q",
+                "-p", "no:cacheprovider",
+                str(probe),
+            ],
+            check=False,
+            text=True,
+            cwd=tmp,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+    assert result.returncode == 0, result.stdout
+    assert re.search(r"\d+ passed", result.stdout), (
+        "pytest printed no count line - addopts is probably re-introducing a "
+        f"quiet flag that compounds with the documented -q:\n{result.stdout}"
+    )

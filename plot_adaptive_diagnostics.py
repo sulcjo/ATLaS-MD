@@ -25,6 +25,13 @@ import matplotlib.colors as mcolors
 import numpy as np
 import pandas as pd
 
+# The stale-`epoch_window_map.csv` guard, from the package that owns the shared
+# entry points for it -- see the section header below. The predicate comes from
+# the module that defines the note kinds it reads, not from `loaders`, which
+# only re-exports it.
+from gareus.mbar_analysis.loaders import figure_epoch_window_map_rows
+from gareus.mbar_analysis.loaders_adaptive import window_map_note_rewrote_rows
+
 KB_KCAL = 1.987204e-3  # kcal mol⁻¹ K⁻¹
 TEMP_K   = 300.0
 
@@ -63,6 +70,147 @@ def _load_parquet_samples(samples_dir: Path, stride: int = 1) -> pd.DataFrame:
         return pd.DataFrame(columns=["cv1", "cv2", "window_id"])
 
 
+# ── stale window-map guard (shared with the MBAR loaders) ─────────────────────
+#
+# `epoch_window_map.csv` maps a phase's local window_id -> global state_id, and
+# it can be STALE: `--us-auto-drop-bad-windows` prunes windows post-pull and
+# renumbers the survivors 0..N-1, but the identity map the registry had already
+# written over all *active* states was never rewritten, so every local index at
+# or after the first dropped one names the wrong state
+# (docs/chignolin_6_low_ess_root_cause.md). Every per-state figure here reads
+# that file, so an affected run's sample counts and window ellipses were
+# silently drawn against the wrong states -- in the one tool an operator
+# reaches for when a run looks odd.
+#
+# Same guard as the MBAR loaders, deliberately different severity: this is a
+# figure tool, so an unrepairable map is still drawn (from the stale rows) with
+# a loud stderr warning and a red stamp on the figure, rather than refusing.
+# The MBAR path fails closed instead, because there a wrong number is published
+# as a free energy.
+#
+# Metadata-only check on purpose: the guard's other input, this phase's own
+# sampled window_ids, would mean a full unstrided Parquet read (multi-GB on a
+# real run) here at discovery time, and a *strided* read would undercount the
+# window indices and manufacture false alarms. A phase that records no window
+# count is therefore reported as unchecked rather than treated as healthy.
+
+def _phase_window_map(phase_dir: Path) -> tuple[pd.DataFrame, str | None]:
+    """``(wmap, warning)`` for one phase, validated/repaired by the shared guard.
+
+    `warning` is None for the overwhelming majority of phases, and then `wmap`
+    is exactly what `_rcsv` returned -- same rows, same dtypes, untouched. On a
+    repairable stale map the frame comes back holding the windows the phase
+    really ran, in the order it really ran them, with `epoch_window` renumbered
+    0..N-1: a drop repair takes the never-run windows' rows out, and a
+    permutation repair takes nothing out and reorders instead, so the row count
+    alone says nothing about whether a repair happened (see the branch below).
+    On an unrepairable one the frame comes back as-is with a warning saying so.
+    """
+    path = phase_dir / "epoch_window_map.csv"
+    df = _rcsv(path)
+    if df.empty:
+        return df, None
+    with path.open(newline="") as f:
+        rows = list(_csv.DictReader(f))
+    survivors, note = figure_epoch_window_map_rows(phase_dir, rows)
+    if note is None:
+        return df, None
+    print(f"  [STALE MAP] {note}", file=sys.stderr)
+    if not window_map_note_rewrote_rows(note):
+        # The guard detected something but did not rewrite the rows (an
+        # unrepairable fault, or a refusal loaded under
+        # GAREUS_ALLOW_STALE_WINDOW_MAP): `survivors` is the map's own row list,
+        # so the figures get the original frame plus the warning stamp.
+        #
+        # Asked of the note, not inferred from `len(survivors) == len(rows)`,
+        # which is what stood here. That row-count proxy answered this question
+        # correctly only while the only possible repair was REMOVING never-run
+        # windows. A permutation repair -- same window set, wrong order -- has
+        # nothing to remove, so the counts agree, this branch fired, and the
+        # plotter returned the unrepaired frame under a note reading "REPAIRED
+        # IN MEMORY": every per-state count and window label in the figure then
+        # named a different state than its own caption claimed. Taken on the
+        # note OBJECT, before anything copies its text: `kind` does not survive
+        # an f-string, and a note that has lost it grades as not-rewritten,
+        # which lands back on this (conservative) branch.
+        return df, note
+    # Re-select the *typed* frame's rows for the survivors, in the repaired
+    # order, instead of rebuilding one from the guard's string rows, so every
+    # downstream `float(row[...])` sees the same dtypes it always did. state_id
+    # keys the join because it is the one field the repair never rewrites --
+    # only ever which local window it sits at.
+    #
+    # That join is only sound while state_id really is unique per map row, so
+    # the uniqueness is CHECKED here rather than assumed from the writers. It
+    # holds on every real map (audited: all 152 epoch_window_map.csv files under
+    # RUNS/), and every current writer enumerates distinct registry states -- but
+    # a `pos` dict built last-wins over a duplicated state_id collapses silently:
+    # every lookup below would still succeed, `len(keep) != len(survivors)` would
+    # still pass, and `df.iloc[keep]` would hand the figures a frame with one row
+    # duplicated and another dropped. A wrong frame that passes the guard is the
+    # one outcome this whole file's guard exists to prevent, so the guard checks
+    # the property it depends on, not a proxy for it.
+    sid_col = next((c for c in df.columns if "state_id" in c.lower()), None)
+    if sid_col is None:
+        return df, note
+    pos = {}
+    duplicated = []
+    for i, v in enumerate(df[sid_col].tolist()):
+        try:
+            sid = int(v)
+        except (TypeError, ValueError):
+            continue
+        if sid in pos:
+            duplicated.append(sid)
+            continue
+        pos[sid] = i
+    if duplicated:
+        return df, (note + f" (this phase's map carries state_id {sorted(set(duplicated))} on more "
+                           f"than one row, so the repaired rows cannot be matched back onto the "
+                           f"CSV's own columns unambiguously; the figures fall back to the STALE "
+                           f"map.)")
+    keep = []
+    for r in survivors:
+        try:
+            keep.append(pos[int(r["state_id"])])
+        except (KeyError, TypeError, ValueError):
+            continue
+    # Two nets, deliberately: the length check catches a survivor with no row in
+    # the frame, and the distinctness check catches two survivors resolving to
+    # one row. The second is the corruption shape itself rather than a symptom of
+    # it, and it costs one set() over a handful of rows.
+    if len(keep) != len(survivors) or len(set(keep)) != len(keep):
+        return df, (note + " (the repaired rows could not be matched back onto the CSV's own "
+                           "columns, so the figures fall back to the STALE map.)")
+    out = df.iloc[keep].copy()
+    out["epoch_window"] = list(range(len(out)))
+    return out.reset_index(drop=True), note
+
+
+def _phase_map_notes(phases: list[dict]) -> list[str]:
+    """Every stale-map warning collected during phase discovery, in order."""
+    return [ph["wmap_note"] for ph in phases if ph.get("wmap_note")]
+
+
+def _annotate_map_warnings(fig, notes: list[str]) -> None:
+    """Stamp stale-window-map warnings onto a figure.
+
+    A figure that is quietly mislabelled is worse than an ugly one: whatever
+    the guard could not silently fix has to travel with the picture, not just
+    with the terminal it was generated in.
+    """
+    if not notes:
+        return
+    uniq = list(dict.fromkeys(notes))
+    shown = [n if len(n) <= 240 else n[:239] + "…" for n in uniq[:3]]
+    if len(uniq) > len(shown):
+        shown.append(f"(+{len(uniq) - len(shown)} further phase(s) affected)")
+    fig.text(0.005, 0.001,
+             "STALE epoch_window_map.csv — per-state counts/labels in this figure are affected:\n"
+             + "\n".join(shown),
+             ha="left", va="bottom", fontsize=6, color="crimson", wrap=True)
+
+
 # ── phase discovery ───────────────────────────────────────────────────────────
 
 def _discover_subrun_phases(base_dir: Path, label_prefix: str) -> list[dict]:
@@ -98,11 +246,13 @@ def _discover_subrun_phases(base_dir: Path, label_prefix: str) -> list[dict]:
             ns = step * 4e-6
             suffix = f"Topup {topup_i}" if topup_i > 1 or len(subs) > 2 else "Topup"
             lbl = f"{label_prefix} {suffix}\n+{ns:.1f} ns"
+        wmap, wmap_note = _phase_window_map(sub)
         phases.append({
             "name": f"{base_dir.name}/{sub.name}",
             "label": lbl,
             "path": sub,
-            "wmap": _rcsv(sub / "epoch_window_map.csv"),
+            "wmap": wmap,
+            "wmap_note": wmap_note,
             "step": step,
         })
     return phases
@@ -147,11 +297,13 @@ def discover_phases(ap_dir: Path) -> list[dict]:
             n = i
         if (ep / "samples").is_dir():
             lbl = f"Epoch {n}\n(initial)" if i == 0 else f"Epoch {n}"
+            wmap, wmap_note = _phase_window_map(ep)
             phases.append({
                 "name": ep.name,
                 "label": lbl,
                 "path": ep,
-                "wmap": _rcsv(ep / "epoch_window_map.csv"),
+                "wmap": wmap,
+                "wmap_note": wmap_note,
                 "step": 0,
             })
         else:
@@ -308,6 +460,7 @@ def fig_phase_coverage(phases: list[dict], state_reg: pd.DataFrame,
     fig.colorbar(sm, ax=axes_flat[:n], shrink=0.6, label="Strided sample count per bin")
     fig.suptitle("Phase-space Coverage: each Epoch/Topup Phase\n"
                  "(dashed ellipses = ±1σ harmonic width)", fontsize=11)
+    _annotate_map_warnings(fig, _phase_map_notes(phases))
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  saved {out_path}")
@@ -434,6 +587,7 @@ def fig_window_layout(state_reg: pd.DataFrame, phases: list[dict],
     fig.colorbar(im, ax=ax_heat, label="Samples (log)", shrink=0.5)
 
     fig.suptitle("GAREUS: Window Layout & Sample Distribution", fontsize=12)
+    _annotate_map_warnings(fig, _phase_map_notes(phases))
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  saved {out_path}")
@@ -559,6 +713,7 @@ def fig_topup_timeline(state_reg: pd.DataFrame, phases: list[dict],
                                  fontsize=5.5, color="white" if v > 0.5 else "black")
 
     fig.suptitle("GAREUS: Topup Timeline, Allocation & Window Overlap", fontsize=12)
+    _annotate_map_warnings(fig, _phase_map_notes(phases))
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  saved {out_path}")
@@ -618,6 +773,7 @@ def fig_topup_targeting(ap_dir: Path, state_reg: pd.DataFrame, out_path: Path) -
     part_mat = np.zeros((K, T_part))
     samp_mat = np.zeros((K, T_samp), dtype=np.int64)
     samp_xlabels = []
+    map_notes: list[str] = []
 
     for ti, entry in enumerate(topup_entries):
         for sid in entry["present"]:
@@ -632,7 +788,9 @@ def fig_topup_targeting(ap_dir: Path, state_reg: pd.DataFrame, out_path: Path) -
         if not sp.is_dir():
             continue
         df = _load_parquet_samples(sp, stride=1)
-        wmap = _rcsv(sub / "epoch_window_map.csv")
+        wmap, wmap_note = _phase_window_map(sub)
+        if wmap_note:
+            map_notes.append(wmap_note)
         ew2sid = _wmap_to_sid(wmap)
         for ew, sid in ew2sid.items():
             if sid in sid_idx:
@@ -683,6 +841,7 @@ def fig_topup_targeting(ap_dir: Path, state_reg: pd.DataFrame, out_path: Path) -
     fig.colorbar(im2, ax=ax_samp, label="Samples (log scale)", shrink=0.8)
 
     fig.suptitle("GAREUS: Topup Window Targeting & Sample Accumulation", fontsize=12)
+    _annotate_map_warnings(fig, map_notes)
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  saved {out_path}")

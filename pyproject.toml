@@ -64,4 +64,10 @@ include = ["gareus*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-addopts = "-q"
+# Deliberately no `addopts = "-q"` here.  addopts is *prepended* to the real
+# command line, and -q is a counting flag: it compounded with the -q in this
+# repo's own documented invocation (`python -m pytest -q tests/`) to give -qq,
+# which suppresses pytest's final "N failed, M passed" count line completely.
+# Runs then ended with bare FAILED lines and nothing after them, which reads
+# like a suite that aborted rather than one that finished with failures.
+# Pass -q on the command line when you want quiet output.

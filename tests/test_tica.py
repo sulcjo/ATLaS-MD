@@ -819,7 +819,8 @@ class TestLoadEpochDihedralObs:
             epoch_dir = Path(tmp) / "epoch_000"
             self._write_obs(epoch_dir, 0, 50, 12, seed=1)
             self._write_obs(epoch_dir, 1, 30, 12, seed=2)
-            X, wids, pcv, scv, seg_lengths = load_epoch_dihedral_obs(epoch_dir)
+            (X, wids, pcv, scv, seg_lengths,
+             steps, replica_ids) = load_epoch_dihedral_obs(epoch_dir)
             assert X.shape == (80, 12)
             assert wids.shape == (80,)
             # Old obs files without primary_cv → NaN filled
@@ -830,6 +831,20 @@ class TestLoadEpochDihedralObs:
             # Segment lengths track per-file frame counts, in glob-sorted order
             np.testing.assert_array_equal(seg_lengths, [50, 30])
             assert int(seg_lengths.sum()) == 80
+            # `steps` is each frame's step number within its *own* replica's
+            # continuous MD history, so it restarts at 0 for every source file
+            # rather than running monotonically across the concatenation.
+            np.testing.assert_array_equal(
+                steps, np.concatenate([np.arange(50), np.arange(30)])
+            )
+            # `replica_ids` comes from each source file's own name
+            # (dihedral_obs_<replica_id>.npz), NOT from `window` - the two
+            # differ the moment REUS exchanges anything, and only replica_ids
+            # identifies which replica_trajectories/replica_NNN.xtc a frame
+            # belongs to.
+            np.testing.assert_array_equal(
+                replica_ids, np.concatenate([np.zeros(50), np.ones(30)])
+            )
 
     def test_loads_with_cv_arrays(self):
         """Obs files that include primary_cv/secondary_cv are loaded correctly."""
@@ -840,18 +855,57 @@ class TestLoadEpochDihedralObs:
             tica_dir.mkdir(parents=True)
             pcv = rng.random(40)
             scv = rng.random(40)
+            step_numbers = np.arange(40, dtype=np.int64) * 500
             np.savez_compressed(
-                tica_dir / "dihedral_obs_000.npz",
+                tica_dir / "dihedral_obs_003.npz",
                 features=rng.standard_normal((40, 8)),
-                steps=np.arange(40, dtype=np.int64),
+                steps=step_numbers,
                 window=np.zeros(40, dtype=np.int64),
                 primary_cv=pcv,
                 secondary_cv=scv,
             )
-            X, wids, pcv_out, scv_out, seg_lengths = load_epoch_dihedral_obs(epoch_dir)
+            (X, wids, pcv_out, scv_out, seg_lengths,
+             steps, replica_ids) = load_epoch_dihedral_obs(epoch_dir)
             np.testing.assert_allclose(pcv_out, pcv)
             np.testing.assert_allclose(scv_out, scv)
             np.testing.assert_array_equal(seg_lengths, [40])
+            # Recorded step numbers are passed through verbatim - not
+            # re-derived as a 0..n-1 frame index (they are spaced by the obs
+            # recording interval, here 500 steps).
+            np.testing.assert_array_equal(steps, step_numbers)
+            # Replica id is parsed off the filename's numeric suffix, so a
+            # single-file epoch from replica 3 reports 3, not 0.
+            np.testing.assert_array_equal(replica_ids, np.full(40, 3))
+
+    def test_missing_steps_and_unparseable_replica_id_fall_back_to_minus_one(self):
+        """Old/odd obs files must degrade to -1 sentinels, not raise.
+
+        Kept in its own epoch dir: adding a non-numerically-suffixed file to
+        one of the epochs above would change the glob-sorted concatenation
+        order and shift every per-frame assertion there.
+        """
+        rng = np.random.default_rng(11)
+        with tempfile.TemporaryDirectory() as tmp:
+            epoch_dir = Path(tmp) / "epoch_000"
+            tica_dir = epoch_dir / "tica_obs"
+            tica_dir.mkdir(parents=True)
+            np.savez_compressed(
+                tica_dir / "dihedral_obs_legacy.npz",
+                features=rng.standard_normal((12, 6)),
+                window=np.zeros(12, dtype=np.int64),
+            )
+            (X, wids, pcv, scv, seg_lengths,
+             steps, replica_ids) = load_epoch_dihedral_obs(epoch_dir)
+            assert X.shape == (12, 6)
+            np.testing.assert_array_equal(seg_lengths, [12])
+            # No `steps` array in the file at all → -1 sentinel, integer dtype
+            # (a NaN float fill would silently poison any int comparison
+            # downstream).
+            np.testing.assert_array_equal(steps, np.full(12, -1))
+            assert steps.dtype.kind == "i"
+            # No numeric suffix on the filename → -1 sentinel, same idea.
+            np.testing.assert_array_equal(replica_ids, np.full(12, -1))
+            assert replica_ids.dtype.kind == "i"
 
     def test_raises_on_missing(self):
         with tempfile.TemporaryDirectory() as tmp:

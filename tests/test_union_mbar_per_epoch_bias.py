@@ -29,6 +29,7 @@ given epoch's snapshot (states created in a later epoch).
 from __future__ import annotations
 
 import csv
+import json
 import math
 from pathlib import Path
 
@@ -277,6 +278,88 @@ def test_union_falls_back_to_global_row_for_state_absent_from_epoch_snapshot(tmp
     d1 = data.cv - 0.5
     expected_col1 = data.beta * 4.184 * 0.5 * 20.0 * d1 * d1
     np.testing.assert_allclose(data.u_nk[:, 1], expected_col1)
+
+
+# --- A dropped state's row must NOT lose its per-epoch native params --------
+#
+# `--us-auto-drop-bad-windows` prunes umbrella windows post-pull and
+# `gareus/production.py` renumbers the survivors 0..N-1, but the phase's own
+# `epoch_window_map.csv` is never rewritten, so the loader has to compact it in
+# memory (`_validate_and_repair_epoch_window_map`,
+# `gareus/mbar_analysis/loaders_adaptive.py`,
+# docs/chignolin_6_low_ess_root_cause.md).
+#
+# The trap that repair walks into: `_load_epoch_task` derives BOTH the local
+# window -> state lookup AND `_parse_epoch_window_map_native_params` from the
+# same row list. Removing a dropped state's row therefore removes that state's
+# epoch-native window params too -- and MBAR still evaluates a bias column for
+# it (cross-terms against every other epoch's samples), so the column silently
+# falls back to the final-registry row. That is the same stale-snapshot bug the
+# per-epoch fix at the top of this file exists to prevent, re-created for
+# exactly the states that were dropped.
+#
+# It is a live hazard specifically for the flat `epoch_NNN/epoch_window_map.csv`
+# maps written by `registry.write_epoch_window_map`: those carry primary_k and
+# secondary_k as well as both centres, and they really do differ from the
+# registry in every row (chignolin_6/epoch_000: secondary_center -2.1337 in the
+# map vs -0.9058 in the registry, 20/20 rows; chignolin_5/epoch_000 27/27). The
+# sub-run baseline/topup maps only have the two centre columns, which is why
+# nothing currently on disk *happens* to show the damage.
+
+def test_dropped_state_keeps_its_epoch_native_params_after_map_repair(tmp_path):
+    """State 1's window was dropped post-pull, so it vanishes from the local
+    window lookup -- but its own epoch_000 centre AND k must still drive its
+    u_nk column, not the (later-recentered) registry row.
+    """
+    adaptive_dir = tmp_path / "adaptive_production"
+    adaptive_dir.mkdir(parents=True)
+
+    # State 0 is the one window that really ran; the samples sit on its centres.
+    _write_epoch(adaptive_dir / "epoch_000", cv1_val=0.0, cv2_val=0.0,
+                 n_samples=6, secondary_center=0.0, secondary_k=5.0)
+    epoch = adaptive_dir / "epoch_000"
+
+    # ... but the map the registry wrote still lists both states, identity-mapped,
+    # with the params each really had while epoch_000 ran.
+    native_c2, native_k2 = -2.0, 8.0
+    native_c1, native_k1 = 0.5, 20.0
+    (epoch / "epoch_window_map.csv").write_text(
+        "epoch_window,state_id,primary_center,primary_k,secondary_center,secondary_k\n"
+        "0,0,0.0,44.3,0.0,5.0\n"
+        f"1,1,{native_c1},{native_k1},{native_c2},{native_k2}\n",
+        encoding="utf-8",
+    )
+    (epoch / "gareus_metadata.json").write_text(
+        json.dumps({"window_metadata": {"dropped_post_pull_bad_windows": [1]}}),
+        encoding="utf-8")
+
+    # The live registry has since recentered/re-stiffened state 1 (the tICA CV2
+    # switch overwrites secondary_center in place, and the adaptive k update can
+    # move secondary_k) -- these are the values that must NOT be used.
+    stale_c2, stale_k2 = 2.0, 30.0
+    _write_registry(adaptive_dir, [
+        {"state_id": 0, "primary_center": 0.0, "primary_k": 44.3,
+         "secondary_center": 0.0, "secondary_k": 5.0},
+        {"state_id": 1, "primary_center": native_c1, "primary_k": native_k1,
+         "secondary_center": stale_c2, "secondary_k": stale_k2},
+    ])
+
+    data = load_parquet_adaptive_union(adaptive_dir)
+
+    assert data.cv.size == 6
+    # Nothing may be attributed to state 1: its window never ran.
+    assert set(np.asarray(data.window, dtype=np.int64).tolist()) == {0}
+    assert data.u_nk.shape[1] == 2
+
+    d1 = data.cv - native_c1
+    d2 = data.cv2 - native_c2
+    expected = data.beta * 4.184 * 0.5 * (native_k1 * d1 * d1 + native_k2 * d2 * d2)
+    stale_d2 = data.cv2 - stale_c2
+    stale_expected = data.beta * 4.184 * 0.5 * (native_k1 * d1 * d1
+                                                + stale_k2 * stale_d2 * stale_d2)
+    # Sanity: the two candidates are far apart, so this test has teeth.
+    assert abs(float(expected[0] - stale_expected[0])) > 10.0
+    np.testing.assert_allclose(data.u_nk[:, 1], expected, rtol=1e-9, atol=1e-9)
 
 
 # --- Burnin filter must slice boost_dih alongside every other per-sample array --
