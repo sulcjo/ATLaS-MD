@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional, Sequence
 
 from ..math_helpers import _hist_overlap
+from .ranking import MIN_ATTEMPTS_FOR_DEAD
 from .sidecar import SidecarSnapshot
 
 DEFAULT_TEMPERATURE_K = 300.0
@@ -59,13 +60,63 @@ def acceptance_by_pair(exchange_stats: Mapping[str, Any]) -> dict[tuple[int, int
     return out
 
 
+def attempts_by_pair(exchange_stats: Mapping[str, Any]) -> dict[tuple[int, int], float]:
+    """Per-pair exchange attempt counts, keyed like ``acceptance_by_pair``.
+
+    Kept separate from the rates so the displayed acceptance stays exactly what
+    was measured; the counts only gate whether a rate is allowed to *condemn* a
+    window (see ``acceptance_by_window``).
+    """
+    payload = exchange_stats or {}
+    nested = payload.get("pairs")
+    source = nested if isinstance(nested, Mapping) else payload
+    out: dict[tuple[int, int], float] = {}
+    for key, stats in source.items():
+        if not isinstance(stats, Mapping):
+            continue
+        try:
+            a_str, b_str = str(key).split("-")[:2]
+            out[(int(a_str), int(b_str))] = float(stats.get("attempts", 0) or 0)
+        except Exception:
+            continue
+    return out
+
+
 def acceptance_by_window(
-    pairs: Mapping[tuple[int, int], float], n_windows: int
+    pairs: Mapping[tuple[int, int], float],
+    n_windows: int,
+    attempts: Optional[Mapping[Any, Any]] = None,
+    min_attempts: int = MIN_ATTEMPTS_FOR_DEAD,
 ) -> dict[int, float]:
-    """Each window inherits the worst finite acceptance among its own pairs."""
+    """Each window inherits the worst *sufficiently measured* acceptance.
+
+    ``attempts`` takes the raw ``exchange_stats`` payload (or an
+    already-extracted ``{(i, j): attempts}`` mapping). Pairs with fewer than
+    ``min_attempts`` attempts are skipped rather than ranked: a pair tried once
+    and rejected reads 0.0, which is finite and below ``DEAD_ACCEPTANCE``, so
+    without this it condemns both its windows on a single coin flip. Skipping
+    only removes a pair from the *worst-of* comparison -- a window whose other
+    pairs are well measured still inherits those, and a window left with no
+    measured pair at all simply goes unranked (NaN), which the ranker already
+    treats as "unmeasured" rather than "dead".
+
+    Passing no counts keeps the original behaviour, so existing callers and
+    hand-built fixtures are unaffected.
+    """
+    counts: Mapping[tuple[int, int], float] = {}
+    if attempts is not None:
+        # Accept either the raw exchange_stats payload or a prepared mapping.
+        keys = list(attempts.keys())
+        if keys and isinstance(keys[0], tuple):
+            counts = attempts                    # type: ignore[assignment]
+        else:
+            counts = attempts_by_pair(attempts)
+
     out: dict[int, float] = {}
     for (a, b), rate in pairs.items():
         if not math.isfinite(rate):
+            continue
+        if counts and float(counts.get((a, b), 0.0)) < float(min_attempts):
             continue
         for w in (a, b):
             if 0 <= w < int(n_windows):
@@ -318,7 +369,8 @@ def build_context(
             if isinstance(v, Mapping)
         },
         acceptance_pairs=pairs,
-        acceptance_windows=acceptance_by_window(pairs, n_windows),
+        acceptance_windows=acceptance_by_window(
+            pairs, n_windows, attempts=info.get("exchange_stats")),
         overlap_pairs=overlap_by_pair(hist_windows, centers),
         deltas=delta_by_window(rows),
         decision=dict(decision or {}),
@@ -335,5 +387,6 @@ def build_context(
 
 __all__ = [
     "DEFAULT_TEMPERATURE_K", "DashboardContext", "acceptance_by_pair",
-    "acceptance_by_window", "build_context", "delta_by_window", "overlap_by_pair",
+    "acceptance_by_window", "attempts_by_pair", "build_context", "delta_by_window",
+    "overlap_by_pair",
 ]

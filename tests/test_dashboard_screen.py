@@ -44,7 +44,7 @@ def _ctx(tmp_path, *, view="auto", term_w=140, term_h=45, exchange=None, sidecar
              "cv_A": CENTERS[w] + 0.05, "umbrella_bias_kcal_mol": 0.0,
              "umbrella_pull_kcal_mol_A": 0.0} for w in range(8)]
     stats = exchange if exchange is not None else {
-        f"{i}-{i+1}": {"attempts": 40, "accepted": 12} for i in range(7)}
+        f"{i}-{i+1}": {"attempts": 400, "accepted": 120} for i in range(7)}
     return build_context(
         logger=logger, rows=rows, phase="gareus_production", step=100, total_steps=1000,
         summary={}, dashboard_info={"centers_a": list(CENTERS), "n_windows": 8,
@@ -66,8 +66,8 @@ def test_resolve_view_defaults_to_progress_on_a_healthy_run(tmp_path):
 
 
 def test_resolve_view_promotes_to_windows_when_a_pair_is_dead(tmp_path):
-    ctx = _ctx(tmp_path, exchange={"0-1": {"attempts": 40, "accepted": 0},
-                                   **{f"{i}-{i+1}": {"attempts": 40, "accepted": 12}
+    ctx = _ctx(tmp_path, exchange={"0-1": {"attempts": 400, "accepted": 0},
+                                   **{f"{i}-{i+1}": {"attempts": 400, "accepted": 120}
                                       for i in range(1, 7)}})
     assert resolve_view(ctx, "auto") == "windows"
     assert any("dead" in r for r in promotion_reasons(ctx))
@@ -86,10 +86,10 @@ def test_auto_promotes_to_physics_on_a_proven_split(tmp_path):
     """Every window tried, graph still in pieces -- the one case that justifies
     taking over the screen."""
     ctx = _ctx(tmp_path, exchange={
-        "0-1": {"attempts": 40, "accepted": 12}, "1-2": {"attempts": 40, "accepted": 0},
-        "2-3": {"attempts": 40, "accepted": 12}, "3-4": {"attempts": 40, "accepted": 12},
-        "4-5": {"attempts": 40, "accepted": 12}, "5-6": {"attempts": 40, "accepted": 12},
-        "6-7": {"attempts": 40, "accepted": 12}})
+        "0-1": {"attempts": 400, "accepted": 120}, "1-2": {"attempts": 400, "accepted": 0},
+        "2-3": {"attempts": 400, "accepted": 120}, "3-4": {"attempts": 400, "accepted": 120},
+        "4-5": {"attempts": 400, "accepted": 120}, "5-6": {"attempts": 400, "accepted": 120},
+        "6-7": {"attempts": 400, "accepted": 120}})
     assert any("graph" in r for r in promotion_reasons(ctx))
 
 
@@ -197,7 +197,7 @@ def _rich_physics_ctx(tmp_path, term_w, term_h, n=25):
     rows = [{"replica": w, "window": w, "center_A": centers[w], "k_kcal_mol_A2": 2.5,
              "cv_A": centers[w] + 0.05, "umbrella_bias_kcal_mol": 0.0,
              "umbrella_pull_kcal_mol_A": 0.0} for w in range(n)]
-    stats = {f"{i}-{i+1}": {"attempts": 40, "accepted": 12} for i in range(n - 1)}
+    stats = {f"{i}-{i+1}": {"attempts": 400, "accepted": 120} for i in range(n - 1)}
     info = {"centers_a": centers, "n_windows": n, "k_list": [2.5] * n,
             "exchange_stats": {"mode": "neighbor", "pairs": stats},
             "primary_cv_label": "contacts", "primary_cv_units": "A",

@@ -82,6 +82,28 @@ class SidecarCache:
         self._last_read_wall = float("-inf")
         self._snapshot = SidecarSnapshot()
 
+    def _gamd_candidates(self) -> list[Path]:
+        """Every place a run actually leaves the shared-GaMD globals.
+
+        Adaptive production exports the campaign-wide setup to
+        ``<run>/adaptive_production/global_shared_gamd_setup/`` (see that
+        directory's own ``shared_gamd_export_manifest.json``), while a worker
+        also keeps its own copy beside its output. Reading only
+        ``<run>/global_shared_gamd_setup/`` finds neither: on a real run that
+        directory exists but is EMPTY, so the panel reported "no GaMD boost
+        (plain umbrella run)" for a campaign whose integrator was demonstrably
+        boosting -- twice mistaken for dead physics by an operator watching a
+        live run. Order is most-canonical first; first readable file wins.
+        """
+        name = _GAMD_REL.name
+        return [
+            self.run_root / _GAMD_REL,
+            self.run_root / "adaptive_production" / _GAMD_REL,
+            self.out_dir / name,
+            self.out_dir / "setup" / name,
+            self.out_dir.parent / name,
+        ]
+
     def _seeding_candidates(self) -> list[Path]:
         bases = [self.out_dir, self.out_dir.parent]
         return [base / sub / _SEEDING_NAME
@@ -92,7 +114,11 @@ class SidecarCache:
             return self._snapshot
         errors: list[str] = []
         pool, pool_mtime = _read_json(self.run_root / _POOL_REL, errors)
-        gamd, gamd_mtime = _read_json(self.run_root / _GAMD_REL, errors)
+        gamd, gamd_mtime = None, None
+        for candidate in self._gamd_candidates():
+            gamd, gamd_mtime = _read_json(candidate, errors)
+            if gamd is not None:
+                break
         gate, _gate_mtime = _read_json(self.run_root / _GATE_REL, errors)
         seeding = None
         for candidate in self._seeding_candidates():

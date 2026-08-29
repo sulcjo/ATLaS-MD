@@ -19,6 +19,21 @@ WARN = "WARN"
 BAD = "BAD"
 
 DEAD_ACCEPTANCE = 0.02
+
+# How many attempts a pair needs before a zero acceptance is allowed to condemn
+# its windows. Derived, not chosen: by the rule of three, observing 0 successes
+# in n trials puts the 95% upper bound on the true rate at 3/n, so n = 3/
+# DEAD_ACCEPTANCE is the point where "never accepted" first means "really below
+# the dead threshold" rather than "we have barely looked".
+#
+# Without this, a sparse 2D exchange graph condemns most of its own windows: on
+# a real 32-window run (chignolin_6, 2026-08-29) 16 of 140 pairs had
+# `attempts: 1, accepted: 0` -- long-range edges the Gibbs walk proposed once
+# and rejected once -- and because `acceptance_by_window` takes each window's
+# WORST pair, that single 0.0 flagged 15 of 32 windows `BAD dead exchange
+# 0.000` while global acceptance was 3858/4428 = 0.871. Same class as the
+# fabricated-zero the `delta` reading below is already guarded against.
+MIN_ATTEMPTS_FOR_DEAD = math.ceil(3.0 / DEAD_ACCEPTANCE)
 LOW_ACCEPTANCE = 0.15
 DEAD_OVERLAP = 0.10
 PINNED_SIGMA_MULTIPLE = 2.0

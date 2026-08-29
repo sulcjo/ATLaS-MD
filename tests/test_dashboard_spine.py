@@ -19,7 +19,7 @@ def _ctx(tmp_path, *, term_w=140, term_h=45, sidecar=None, n=25):
         logger=logger, rows=rows, phase="gareus_production", step=12_450_000,
         total_steps=37_500_000, summary={}, dashboard_info={
             "centers_a": list(CENTERS[:n]), "n_windows": n, "k_list": [2.5] * n,
-            "exchange_stats": {f"{i}-{i+1}": {"attempts": 40, "accepted": 12}
+            "exchange_stats": {f"{i}-{i+1}": {"attempts": 400, "accepted": 120}
                                for i in range(n - 1)},
             "primary_cv_label": "contacts", "primary_cv_units": "A",
             "adaptive_phase": {"epoch_index": 1, "epoch_total": 2,
@@ -189,7 +189,7 @@ def test_spine_lines_returns_the_real_2d_line_count_with_no_blank_padding(tmp_pa
         logger.secondary_history_by_window[w] = [sec_centers[w] + 0.02 * (i % 5 - 2) for i in range(30)]
     rows = [{"replica": w, "window": w, "center_A": centers[w], "k_kcal_mol_A2": 2.5,
              "cv_A": centers[w] + 0.01} for w in range(n)]
-    exchange_stats = {f"{i}-{i+1}": {"attempts": 40, "accepted": 12} for i in range(n - 1)}
+    exchange_stats = {f"{i}-{i+1}": {"attempts": 400, "accepted": 120} for i in range(n - 1)}
     ctx = build_context(
         logger=logger, rows=rows, phase="gareus_production", step=1000, total_steps=100000,
         summary={}, dashboard_info={
@@ -248,7 +248,7 @@ def test_verdict_reads_as_unavailable_not_ok_when_the_decision_call_raises(tmp_p
         logger=logger, rows=rows, phase="gareus_production", step=12_450_000,
         total_steps=37_500_000, summary={}, dashboard_info={
             "centers_a": list(CENTERS[:25]), "n_windows": 25, "k_list": [2.5] * 25,
-            "exchange_stats": {f"{i}-{i+1}": {"attempts": 40, "accepted": 12}
+            "exchange_stats": {f"{i}-{i+1}": {"attempts": 400, "accepted": 120}
                                for i in range(24)},
             "primary_cv_label": "contacts", "primary_cv_units": "A"},
         sidecar=SidecarSnapshot(), term_w=140, term_h=45, now=1000.0,
@@ -271,7 +271,7 @@ def test_win_and_exchange_strips_are_offset_by_one_column(tmp_path):
     glyph rather than a blank " " level -- a uniform strip would make an
     un-shifted prefix indistinguishable from a shifted one by pure coincidence.
     """
-    accepted = [20 if i == 0 else (2 if i % 2 == 0 else 38) for i in range(24)]
+    accepted = [200 if i == 0 else (20 if i % 2 == 0 else 380) for i in range(24)]
     logger = DistanceLogger(tmp_path, argparse.Namespace(timestep_fs=2.0), no_file_persistence=True)
     for w in range(25):
         logger.history_by_window[w] = [CENTERS[w] + 0.1 * (i % 5 - 2) for i in range(50)]
@@ -281,7 +281,7 @@ def test_win_and_exchange_strips_are_offset_by_one_column(tmp_path):
         logger=logger, rows=rows, phase="gareus_production", step=12_450_000,
         total_steps=37_500_000, summary={}, dashboard_info={
             "centers_a": list(CENTERS[:25]), "n_windows": 25, "k_list": [2.5] * 25,
-            "exchange_stats": {f"{i}-{i+1}": {"attempts": 40, "accepted": accepted[i]}
+            "exchange_stats": {f"{i}-{i+1}": {"attempts": 400, "accepted": accepted[i]}
                                for i in range(24)},
             "primary_cv_label": "contacts", "primary_cv_units": "A",
             "adaptive_phase": {"epoch_index": 1, "epoch_total": 2,
@@ -320,8 +320,8 @@ def test_alert_line_carries_the_literal_status_word_not_just_the_reason(tmp_path
         logger.history_by_window[w] = [centers[w] + 0.15 * (i % 5 - 2) for i in range(50)]
     rows = [{"replica": w, "window": w, "center_A": centers[w], "k_kcal_mol_A2": 2.5,
              "cv_A": centers[w] + 0.01} for w in range(n)]
-    exchange_stats = {f"{i}-{i+1}": {"attempts": 40, "accepted": 20} for i in range(n - 1)}
-    exchange_stats["0-1"] = {"attempts": 40, "accepted": 5}   # 0.125: WARN, not dead
+    exchange_stats = {f"{i}-{i+1}": {"attempts": 400, "accepted": 200} for i in range(n - 1)}
+    exchange_stats["0-1"] = {"attempts": 400, "accepted": 50}   # 0.125: WARN, not dead
     ctx = build_context(
         logger=logger, rows=rows, phase="gareus_production", step=1000, total_steps=100000,
         summary={}, dashboard_info={
