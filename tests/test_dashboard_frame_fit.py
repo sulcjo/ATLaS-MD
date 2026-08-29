@@ -83,10 +83,10 @@ def _ctx(tmp_path, term_w, term_h, view, *, is_2d=False, n=N_WINDOWS, rich=True)
     # ONE deliberate dead pair so the golden frames show a flagged state too -- a
     # reference frame in which nothing is ever wrong cannot show whether the alarm
     # path renders at all.
-    pair_stats = {f"{i}-{i+1}": {"attempts": 40, "accepted": (0 if i == 17 else 12)}
+    pair_stats = {f"{i}-{i+1}": {"attempts": 400, "accepted": (0 if i == 17 else 120)}
                   for i in range(n - 1)}
     info = {"centers_a": centers, "n_windows": n, "k_list": [2.5] * n,
-            "exchange_stats": {"attempts": 40 * (n - 1), "accepted": 12 * (n - 2),
+            "exchange_stats": {"attempts": 400 * (n - 1), "accepted": 120 * (n - 2),
                                "mode": "neighbor", "pairs": pair_stats},
             "primary_cv_label": "nonlocal contacts", "primary_cv_units": "A",
             "primary_k_units": "kcal/mol/A^2",
