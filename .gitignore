@@ -36,6 +36,7 @@ gareus_adaptive_production_v*/
 # self-bias warning ends with "See docs/chignolin_6_low_ess_root_cause.md", so the
 # document has to exist in the repository the operator is reading those warnings in.
 !docs/chignolin_6_low_ess_root_cause.md
+!docs/atlas_md_boltzmann_validation.md
 
 illustrate_seedbank.png
 poincare_map.py
