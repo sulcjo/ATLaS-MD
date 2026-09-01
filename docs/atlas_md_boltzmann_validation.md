@@ -38,7 +38,7 @@ Layer A decomposes into five links:
 | L1 | The exchange kernel is π-invariant | **Proven exactly** on finite bias matrices (Tier 1); broken for `gibbs-walk` alone when CV2 is NaN |
 | L2 | ΔV does not read the umbrella, so it cancels from the acceptance | Proven from the installed integrator; **unguarded** for 4 boost types |
 | L3 | Within-state dynamics are Boltzmann for the biased+boosted potential | Untested with an analytic FES (Tier 3, planned) |
-| L4 | Recorded parameters equal applied parameters, per phase | Sound; **measured** on both CV axes to ~2–3% (Tier 2) |
+| L4 | Recorded parameters equal applied parameters, per phase | Sound; **measured** on both CV axes, consistent with exact agreement, bounded by the test's ~2.4% resolution (Tier 2) |
 | L5 | No non-equilibrium interventions | One is armed but has not fired; one NaN path can bias `gibbs-walk` |
 
 ---
@@ -429,7 +429,9 @@ That systematic appears in none of the intervals above and is larger than all of
 ### What Tier 2 is entitled to claim
 
 > In `epoch_000`, the recorded **(c2, k2)** secondary-restraint parameters agree with the applied
-> ones to within roughly 2–3%, and the **(c1, k1)** contact restraint — tested with a pairing the
+> ones: the fitted deviations are ≤2% and are not distinguishable from zero, so the real statement
+> is agreement bounded by the test's own ~2.4% resolution rather than a measured 2% discrepancy. The
+> **(c1, k1)** contact restraint — tested with a pairing the
 > original script never constructed — is likewise consistent with its recorded values. The window→
 > parameter join is verified for this phase. The C1 boost-cancellation premise holds by construction
 > (`lower-dihedral` boosts only `PeriodicTorsionForce`/`CMAPTorsionForce`; both restraints are
