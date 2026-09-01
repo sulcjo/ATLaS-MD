@@ -186,34 +186,60 @@ def main(argv=None) -> int:
     pooled = _row("pooled", bdv)
     lab, _ = anharmonicity_label(pooled["anh"])
 
-    # CE2: what matters is the SPREAD across CV bins of the neglected terms,
-    # since a PMF is defined only up to a constant. Build the cumulant-expansion
-    # PMF correction per bin at orders 2, 3 and 4 and report how much the CURVE
-    # moves when the next term is added -- that increment, not the absolute size
-    # of any single cumulant, is the error CE2 imposes on the PMF.
+    # CE2 truncation error per CV bin, by three estimators that disagree in an
+    # informative way. What matters is the SPREAD ACROSS BINS, since a PMF is
+    # defined only up to a constant -- a uniform error cancels, a bin-dependent
+    # one changes the PMF's shape.
+    #
+    #   empirical   ln(mean(e^X)) - CE2, model-free but needs the very exponential
+    #               average whose variance is infinite when a > 0.25
+    #   parametric  the closed form for the fitted noncentral chi-square,
+    #               lam*a/(1-2a) - 0.5*ln(1-2a) - CE2. Exact FOR THAT FAMILY, but
+    #               (a, lam) come from two moments only, and distributions sharing
+    #               two moments can have arbitrarily different ln<e^X>. A
+    #               sensitivity analysis, not a bound.
+    #   third       the directly measured 3rd-order term. A floor, not the tail.
+    #
+    # An earlier version summed a geometric tail at ratio 2a and reported the
+    # result as if it were the answer. That is wrong: 2a governs successive terms
+    # WITHIN a bin at fixed (a, lam), not the spread ACROSS bins. When a varies
+    # between bins the n*a^(n-1) sensitivity makes the spread ratio behave like
+    # 2a(n+1)/n -- about 1.0 at n=3->4, not 0.754 -- and the measured spreads
+    # (0.23 then 0.38) confirm the extrapolation fails.
     edges = np.linspace(np.nanmin(cv1), np.nanmax(cv1), int(args.bins) + 1)
     which = np.clip(np.digitize(cv1, edges) - 1, 0, int(args.bins) - 1)
-    curves = {2: [], 3: [], 4: []}
+    emp, par, third, ess_frac = [], [], [], []
     for b in range(int(args.bins)):
-        m = which == b
-        if int(m.sum()) < 5000:
+        msk = which == b
+        if int(msk.sum()) < 5000:
             continue
-        y = bdv[m]
+        y = bdv[msk]
         x = y - y.mean()
         m2 = float(np.mean(x ** 2))
-        m3 = float(np.mean(x ** 3))
-        m4 = float(np.mean(x ** 4))
-        k1, k2, k3 = float(y.mean()), m2, m3
-        k4 = m4 - 3.0 * m2 * m2
-        curves[2].append(kT_kcal * (k1 + k2 / 2.0))
-        curves[3].append(kT_kcal * (k1 + k2 / 2.0 + k3 / 6.0))
-        curves[4].append(kT_kcal * (k1 + k2 / 2.0 + k3 / 6.0 + k4 / 24.0))
+        ce2 = float(y.mean()) + m2 / 2.0
+        third.append(kT_kcal * float(np.mean(x ** 3)) / 6.0)
+        # empirical, in logs so the exponential does not overflow
+        mx = float(y.max())
+        lse = mx + math.log(float(np.exp(y - mx).sum()))
+        ln_mean = lse - math.log(y.size)
+        emp.append(kT_kcal * (ln_mean - ce2))
+        # how many of this bin's samples the exponential average actually uses
+        lse2 = 2.0 * mx + math.log(float(np.exp(2.0 * (y - mx)).sum()))
+        ess_frac.append(math.exp(2.0 * lse - lse2) / y.size)
+        # parametric
+        a_b = _chi2_scale(y)
+        if math.isfinite(a_b) and 0.0 < a_b < 0.5:
+            lam_b = float(y.mean()) / a_b - 1.0
+            exact = lam_b * a_b / (1.0 - 2.0 * a_b) - 0.5 * math.log(1.0 - 2.0 * a_b)
+            par.append(kT_kcal * (exact - ce2))
+
     def _spread(v):
         return (max(v) - min(v)) if len(v) > 1 else float("nan")
-    spread = _spread([c3 - c2 for c2, c3 in zip(curves[2], curves[3])])
-    spread4 = _spread([c4 - c3 for c3, c4 in zip(curves[3], curves[4])])
-    n_bins_used = len(curves[2])
-
+    spread = _spread(third)
+    spread_emp = _spread(emp)
+    spread_par = _spread(par)
+    worst_ess = min(ess_frac) if ess_frac else float("nan")
+    n_bins_used = len(third)
     print("VERDICT, per estimator -- they fail for different reasons")
     print()
     print(f"  exponential  a = {pooled['a']:.3f}")
@@ -228,44 +254,50 @@ def main(argv=None) -> int:
     print()
     print(f"  CE2          anharmonicity = {pooled['anh']:.3f} -> {lab}"
           f"   (b*sigma = {pooled['bsig']:.2f}, informational only)")
-    print(f"    over {n_bins_used} CV1 bins, adding the next cumulant moves the PMF")
-    print(f"    correction curve by  CE2->CE3 {spread:.2f}  CE3->CE4 {spread4:.2f} kcal/mol")
-    print(f"    (peak-to-peak across bins, against a {CE2_SPREAD_BAR_KCAL:.1f} kcal/mol bar)")
     print("    CE2 is exact for a Gaussian boost at ANY width, so b*sigma alone")
     print("    condemns nothing; only non-Gaussianity does. And only the spread")
     print("    across the CV matters -- a uniform offset cancels from a PMF.")
-    # For X ~ a*chi'^2_1(lam) the cumulants are exactly
-    #     kappa_n = a^n * 2^(n-1) * (n-1)! * (1 + n*lam),
-    # so successive terms kappa_n/n! shrink by a ratio tending to 2a. The series
-    # therefore converges iff a < 0.5 -- the same bound as a finite E[w], which
-    # is not a coincidence: the cumulant series IS the log-MGF at t = 1. Summing
-    # the geometric tail turns the measured third-order term into an estimate of
-    # everything CE2 throws away, not just the first thing it throws away.
-    ratio = 2.0 * pooled["a"]
-    if 0.0 < ratio < 1.0:
-        tail = spread / (1.0 - ratio)
-        print(f"    successive cumulant terms shrink by ~{ratio:.3f} per order "
-              f"(exactly 2a for this family),")
-        print(f"    so the FULL neglected tail is about {tail:.2f} kcal/mol of "
-              f"CV-dependent distortion")
-        print(f"    against the {CE2_SPREAD_BAR_KCAL:.1f} kcal/mol bar -- "
-              f"{'inside it' if tail < CE2_SPREAD_BAR_KCAL else 'over it'}, "
-              "but only just, either way.")
+    print()
+    print(f"    truncation error, spread across {n_bins_used} CV1 bins (kcal/mol):")
+    print(f"      3rd-order term only   {spread:7.2f}   a floor, not the tail")
+    print(f"      parametric (chi^2)    {spread_par:7.2f}   exact for the FITTED FAMILY only")
+    print(f"      empirical             {spread_emp:7.2f}   model-free, but see below")
+    print(f"    worst-bin exponential-average ESS: {100.0 * worst_ess:.4f}% of that bin's samples")
+    if pooled["a"] >= EXP_VAR_FINITE_A:
+        print()
+        print("    VERDICT: NOT RESOLVED. The empirical column needs the same")
+        print("    exp(+beta*dV) average whose variance is infinite at this a, so it is")
+        print("    not a measurement -- it is one draw from a distribution with no")
+        print("    finite spread. The parametric column is a sensitivity analysis: two")
+        print("    moments fix CE2 but do not constrain the higher cumulants, and")
+        print("    distributions sharing two moments can have arbitrarily different")
+        print("    ln<e^X>. The honest statement is that CE2's truncation error on this")
+        print(f"    run is unresolved, with a measured FLOOR of {spread:.2f} kcal/mol.")
+        print(f"    (Against a {CE2_SPREAD_BAR_KCAL:.1f} kcal/mol accuracy target -- a chosen")
+        print("    convention, not a derived threshold.)")
     else:
-        print(f"    ratio 2a = {ratio:.3f} >= 1: the cumulant series does not "
-              "converge; CE2 has no truncation guarantee.")
+        agree = abs(spread_emp - spread_par)
+        print(f"    empirical and parametric agree to {agree:.2f} kcal/mol; "
+              f"exponential weights have finite variance, so the empirical column stands.")
     print()
     _report_boost_setting(args.run_dir, pooled["a"])
     return 0
 
 
 def _report_boost_setting(run_dir: str, a: float) -> None:
-    """The boost width is a knob, so say which way to turn it.
+    """The boost width is a knob, so say which way to turn it -- past the clip.
 
-    a ~ var(beta*dV) / (4*mean(beta*dV)) whenever the variance is small against
-    the squared mean, and both moments scale with the boost strength, so `a` is
-    roughly LINEAR in it. That makes the required change a simple ratio rather
-    than a search.
+    dV = k0*(Vmax-V)^2 / (2*(Vmax-Vmin)) is pointwise proportional to k0, so
+    mean(beta*dV) ~ k0 and var(beta*dV) ~ k0^2, and since
+    a ~ var/(4*mean) whenever the variance is small against the squared mean,
+    **a is linear in k0**.
+
+    But k0 = min(1, k0') and k0' is proportional to sigma0. When k0' > 1 the
+    boost is CLIPPED: lowering sigma0 does nothing at all until k0' drops below
+    1. An earlier version of this function ignored that and recommended
+    sigma0p * (target_a / a) directly -- which, on this run, lands at 1.66
+    kcal/mol where k0' is still 1.17 and the boost is completely unchanged.
+    The scaling only starts at the clip boundary sigma0 = sigma0p / k0'.
     """
     import json
 
@@ -281,15 +313,25 @@ def _report_boost_setting(run_dir: str, a: float) -> None:
     s0 = d.get("sigma0p_kcal_mol")
     print(f"  BOOST SETTING ({d.get('gamd_boost_type')}, from {os.path.relpath(cands[0], run_dir)})")
     print(f"    sigma0p = {s0} kcal/mol,  k0 = {k0},  k0' = {k0p}")
-    if k0 is not None and k0p is not None and k0p > 1.0:
-        print(f"    k0 is CLIPPED at 1.0 (k0' = {k0p:.3f}), so the run is at maximum")
-        print(f"    boost and the requested sigma0 is not what is being applied.")
-        if s0:
-            print(f"    Lowering sigma0p to ~{s0 / k0p:.2f} kcal/mol would un-clip it and")
-            print("    return control of the boost width to the setting.")
-    if a > EXP_VAR_FINITE_A and s0:
-        print(f"    For a < {EXP_VAR_FINITE_A} (finite weight variance), a is ~linear in")
-        print(f"    boost strength, so roughly sigma0p <= {s0 * EXP_VAR_FINITE_A / a:.2f} kcal/mol.")
+    if not (k0 and k0p and s0):
+        return
+    if k0p > 1.0:
+        clip = s0 / k0p
+        print(f"    k0 is CLIPPED at 1.0 (k0' = {k0p:.3f}): the run is at maximum boost")
+        print(f"    and the requested sigma0 is NOT what is being applied. Every value")
+        print(f"    of sigma0p between {clip:.2f} and {s0} kcal/mol gives the IDENTICAL")
+        print("    boost -- lowering it within that range changes nothing.")
+    else:
+        clip = float(s0)
+    if a > EXP_VAR_FINITE_A:
+        need = clip * (EXP_VAR_FINITE_A / a)
+        print(f"    To reach a < {EXP_VAR_FINITE_A} (finite weight variance): a is linear in k0,")
+        print(f"    and k0 only starts falling below sigma0p = {clip:.2f}, so")
+        print(f"    sigma0p ~ {need:.2f} kcal/mol -- NOT {s0 * EXP_VAR_FINITE_A / a:.2f}, which")
+        print("    is the answer you get by ignoring the clip.")
+        print("    Caveat: this assumes Vmax/Vmin/sigmaV are unchanged by the new")
+        print("    setting. They are re-measured at calibration, so treat it as a")
+        print("    starting point and re-run this audit on the result.")
 
 
 if __name__ == "__main__":

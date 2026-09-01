@@ -272,16 +272,24 @@ def _pool(fits: list[Fit]) -> dict:
     re = float((ws * y).sum() / ws.sum())
     re_se = float(math.sqrt(1.0 / ws.sum()))
     i2 = max(0.0, (Q - df) / Q) * 100.0 if Q > 0 else 0.0
-    # survival function of chi2_df without scipy
-    try:
-        from math import erfc
-        # Wilson-Hilferty normal approximation, adequate at these df
-        z = ((Q / df) ** (1.0 / 3.0) - (1.0 - 2.0 / (9 * df))) / math.sqrt(2.0 / (9 * df))
-        p = 0.5 * erfc(z / math.sqrt(2.0))
-    except Exception:
-        p = float("nan")
+    # Exact chi-square survival, not the Wilson-Hilferty normal approximation.
+    # WH is fine for screening but these p-values are reported and are compared
+    # against a threshold, which is exactly where the approximation should not
+    # be trusted. scipy is already a declared dependency of this project.
+    from scipy.stats import chi2 as _chi2
+    p = float(_chi2.sf(Q, df))
+
+    # Hartung-Knapp adjustment. Plain DerSimonian-Laird treats tau^2 as known and
+    # is anti-conservative with a modest number of studies; HK rescales by the
+    # weighted residual spread and uses a t reference, which is the standard fix
+    # at these counts (24-28 pairs). Reported alongside DL rather than instead of
+    # it, so the effect of the choice is visible.
+    hk_se = float("nan")
+    if len(ok) > 1:
+        q_hk = float((ws * (y - re) ** 2).sum() / (len(ok) - 1))
+        hk_se = float(math.sqrt(max(q_hk, 1.0) / ws.sum()))
     return {"n": len(ok), "fe": fe, "fe_se": fe_se, "re": re, "re_se": re_se,
-            "Q": Q, "df": df, "p": p, "i2": i2, "tau2": tau2}
+            "hk_se": hk_se, "Q": Q, "df": df, "p": p, "i2": i2, "tau2": tau2}
 
 
 def _pairings(wins: dict[int, Win]) -> dict[str, list[tuple[int, int]]]:
@@ -359,7 +367,11 @@ def _report_axis(name, what, fits, temp):
           f"   {'(INVALID, see above)' if p['p'] < 0.05 else ''}")
     zre = (p["re"] - NULL_SLOPE) / p["re_se"]
     print(f"  random effects {p['re']:+.5f} +/- {p['re_se']:.5f}"
-          f"   z vs -1 = {zre:+.2f}   <-- headline")
+          f"   z vs -1 = {zre:+.2f}   (DerSimonian-Laird)")
+    if math.isfinite(p.get("hk_se", float("nan"))):
+        zhk = (p["re"] - NULL_SLOPE) / p["hk_se"]
+        print(f"  + Hartung-Knapp {p['re']:+.5f} +/- {p['hk_se']:.5f}"
+              f"   t vs -1 = {zhk:+.2f}   <-- headline (DL is anti-conservative here)")
     print(f"  per-pair gate  |z| > {bonf:.2f} (Bonferroni, {FWER:.0%} family-wise over "
           f"{len(ok)} tests)")
     print(f"  VERDICT        {len(ok) - n_rej}/{len(ok)} pairs consistent with Boltzmann "

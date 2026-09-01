@@ -23,12 +23,13 @@ answer.
 | | Statement | Status |
 |---|---|---|
 | **Layer A — the sampler** | Samples labelled state *k* are Boltzmann for state *k*'s **biased** Hamiltonian | **The subject of this report. Passes, with one stated exception.** |
-| **Layer B — the estimator** | The **unbiased** PMF can be recovered from those biased+boosted samples | **Split verdict: exponential reweighting fails structurally; CE2 is borderline and tunable. See Tier 0.** |
+| **Layer B — the estimator** | The **unbiased** PMF can be recovered from those biased+boosted samples | **Split verdict: exponential reweighting fails structurally; CE2's error is *unresolved* on this run. See Tier 0.** |
 
-A pipeline can be perfectly correct at Layer A and useless at Layer B. ATLaS-MD is close to that,
-but not quite: the exponential estimator is unusable at the current boost width, while CE2's
-truncation error is ≈0.95 kcal/mol — right at the bar, and reducible by retuning σ0p. An earlier
-draft of this report claimed both were fatally broken; that was wrong, and the correction is in
+A pipeline can be perfectly correct at Layer A and useless at Layer B, and that is roughly where
+ATLaS-MD sits at the current boost width: the exponential estimator has infinite weight variance, and
+CE2's truncation error cannot be measured because the diagnostic needs the same divergent average.
+Both are consequences of one tunable setting. An earlier draft claimed both were fatally broken for a
+reason that was wrong; a later one over-corrected and called CE2 adequate. Neither holds — see
 Tier 0.
 
 Layer A decomposes into five links:
@@ -107,70 +108,94 @@ This is a structural verdict, not a sampling-quality complaint — and it is the
 draft's "ESS = 1.7 of 13.7 million" headline was meaningless rather than alarming. That number was
 never converging to anything.
 
-### CE2 — borderline, not condemned
+### CE2 — not condemned, but **not resolved either**
 
-The earlier draft asserted a validity domain of βσ_ΔV ≲ 1 and declared the run 5× outside it. That
+The first draft asserted a validity domain of βσ_ΔV ≲ 1 and declared the run 5× outside it. That
 criterion was invented, and it is wrong in principle: **CE2 is exact for a Gaussian ΔV at any
 width**, because all cumulants above the second vanish. Width alone condemns nothing. What matters
 is non-Gaussianity — which this repo already measures, in `gareus.math_helpers.boost_anharmonicity`,
 labelled OK/WARN/BAD at 0.5/1.0.
 
-**Measured: anharmonicity = 0.607 → WARN**, not BAD, uniformly 0.583–0.622 across states.
+**Measured: anharmonicity = 0.606 → WARN**, not BAD, uniformly 0.583–0.622 across states.
 
-And because a PMF is defined only up to a constant, a truncation error uniform across the CV does
-not matter. The reportable quantity is the *spread across CV bins*. Over 11 CV1 bins:
+Because a PMF is defined only up to a constant, the reportable quantity is the **spread across CV
+bins** of the neglected terms — a uniform error cancels, a bin-dependent one changes the PMF's shape.
+Three estimators, over 11 CV1 bins:
 
-```
-adding the 3rd cumulant moves the PMF correction curve by  0.23 kcal/mol peak-to-peak
-adding the 4th                                             0.38 kcal/mol
-```
+| estimator | spread (kcal/mol) | what it is |
+|---|---|---|
+| 3rd-order term only | **0.23** | directly measured. A floor, not the tail. |
+| parametric (noncentral χ²) | **1.78** | closed form `λa/(1−2a) − ½ln(1−2a)` minus CE2, exact **for the fitted family only** |
+| empirical | **2.98** | model-free `ln⟨e^X⟩ − CE2`, but see below |
 
-For this distribution family the cumulants are exactly `κₙ = aⁿ·2ⁿ⁻¹·(n−1)!·(1+nλ)`, so successive
-terms `κₙ/n!` shrink by a ratio tending to **2a = 0.754**. Summing the geometric tail turns the
-measured third-order term into an estimate of *everything* CE2 discards:
+**Verdict: NOT RESOLVED.** The empirical column needs the very `exp(+βΔV)` average whose variance is
+infinite at `a = 0.377`, so it is not a measurement — it is one draw from a distribution with no
+finite spread. Worst-bin exponential-average ESS is **0.0001%** of that bin's samples. The parametric
+column is a sensitivity analysis, not a bound: two moments fix CE2 but do not constrain the higher
+cumulants, and distributions sharing two moments can have arbitrarily different `ln⟨e^X⟩`.
 
-> **≈ 0.95 kcal/mol of CV-dependent distortion**, against a 1 kcal/mol bar.
+> This is demonstrated rather than argued, on synthetic data where the answer is known
+> (`tests/test_gamd_reweighting_feasibility_math.py`). Drawing 2M samples from an *exact* noncentral
+> χ² with these parameters, the closed form gives **34.42** and the Monte-Carlo estimate gives
+> **22.24**, differing between seeds. At `a = 0.05` the same code reproduces the closed form to
+> better than 0.05. The empirical estimator's failure here is a property of `a`, not of the data.
 
-**Two caveats on that number, because it is load-bearing for the reversal above.**
+#### Correction to the previous correction
 
-*The geometric sum assumes the ratio 2a governs the CV-bin **spread**, not just the magnitude of
-`κₙ/n!`.* The only direct evidence on that assumption contradicts it: the measured CE2→CE3 spread is
-0.23 and CE3→CE4 is 0.38, a ratio of ~1.65, not 0.754. The most likely explanation is that
-fourth-moment estimates per bin are noise-dominated, but that is a hypothesis and the data do not
-settle it. **The defensible floor is the directly measured third-order term, 0.23 kcal/mol**; 0.95 is
-an extrapolation, and if the spread ratio really exceeds 1 the tail is not estimable from these
-moments at all.
+The version of this report committed earlier today reported **≈0.95 kcal/mol**, obtained by summing
+a geometric tail at ratio `2a = 0.754` from the measured third-order term. That was wrong, and the
+report's own data contradicted it: the measured 4th-order spread (0.38) exceeds the 3rd (0.23), a
+ratio of 1.65, not 0.754.
 
-*The 1 kcal/mol bar is a chosen convention*, not a derived threshold — it is the accuracy target for
-this kind of PMF work, stated as such. After criticising the earlier draft for inventing a βσ ≲ 1
-criterion, it would be inconsistent to let a second unsourced number read as though it were derived.
+`2a` governs successive terms **within a bin at fixed (a, λ)**. It does not govern the spread
+*across* bins, where `a` and `λ` themselves vary — the `n·a^(n−1)` sensitivity makes the spread ratio
+behave like `2a(n+1)/n`, about **1.0** at n=3→4. So the extrapolation was not merely unjustified, it
+was biased low. The honest range is 0.23 (measured floor) to ~3 (unreliable), and the two non-floor
+estimators both sit **above** the 1 kcal/mol target rather than below it.
 
-That the series converges iff `a < 0.5` — the same bound as a finite `E[w]` — is not a coincidence:
-the cumulant series **is** the log-MGF at `t = 1`. The exponential estimator and CE2 are not
-independent fallbacks; they share one failure boundary, and only the variance bound (0.25) separates
-them.
+So: the first draft's *reason* for condemning CE2 was wrong, and this report's first correction
+over-rehabilitated it. CE2 is not shown to be broken; it is **not shown to be adequate either**, and
+on this run it cannot be, because the diagnostic needs the same divergent average the exponential
+estimator does.
 
-### The boost width is a setting, and it is currently pinned
+The **1 kcal/mol bar is a chosen convention** — the accuracy target for this kind of PMF work, stated
+as such. After criticising the first draft for inventing a βσ ≲ 1 criterion, a second unsourced
+threshold should not read as derived.
+
+### The boost width is a setting — but the obvious way to turn it does nothing
 
 ```
 lower-dihedral,  sigma0p = 2.5 kcal/mol,  k0 = 1.0,  k0' = 1.766
 ```
 
-`k0` is **clipped at its 1.0 ceiling**, so the run is at maximum boost and the requested σ0 is not
-what is being applied. Two independent routes give the same fix:
+`k0 = min(1, k0')` and `k0'` is proportional to σ0, so **`k0` is clipped at its ceiling**. Two
+consequences, the second of which I got wrong in the earlier version:
 
-- lowering σ0p to **≈ 1.42** kcal/mol un-clips `k0` and returns control of the width to the setting;
-- `a ≈ var(βΔV)/(4·mean(βΔV))` when the variance is small against the squared mean, and both moments
-  scale with boost strength, so `a` is roughly linear in it — reaching `a < 0.25` needs
-  **σ0p ≲ 1.66** kcal/mol.
+1. The applied boost is **smaller** than the setting requests, not larger — the clip is protective.
+   Measured σ_ΔV = 8.90 kJ/mol against a configured σ0 = 10.46 kJ/mol. GaMD's own σ0 criterion is
+   satisfied; the problem is that the target itself is too wide for reweighting.
+2. **Every value of σ0p between 1.42 and 2.5 kcal/mol produces the identical boost.** Lowering it
+   within that range changes nothing at all, because `k0'` stays above 1 and `k0` stays pinned.
 
-**Consequence, corrected.** The earlier draft concluded "Layer B is not fixable by running longer;
-any target requiring ≲1 kcal/mol needs GaMD off." The first clause stands and is now on firmer
-ground — `a = 0.377 > 0.25` means the exponential estimator's variance is infinite, so no amount of
-sampling helps. The second does not follow. CE2's truncation error on *this* run is ~0.95 kcal/mol
-of CV-dependent distortion, not the disqualifying failure claimed, and it is a **tunable** quantity:
-σ0p ≈ 1.4–1.7 kcal/mol would move both estimators inside their bounds. The correct recommendation is
-to retune the boost, not to abandon it.
+> **Correction.** The earlier version recommended σ0p ≲ **1.66** kcal/mol, obtained by scaling
+> 2.5 × (0.25/0.377) since `a` is linear in boost strength. `a` *is* linear in `k0` — ΔV is pointwise
+> proportional to `k0`, so mean ∝ k0 and variance ∝ k0², giving `a ≈ var/(4·mean) ∝ k0`. But at
+> σ0p = 1.66 the clip is still active (`k0'` = 1.17 > 1) and **nothing changes**. The scaling only
+> begins at the clip boundary σ0p = 2.5/1.766 = 1.42.
+>
+> Corrected target: `k0` must fall to 0.25/0.377 = 0.663, and it only starts falling below 1.42, so
+> **σ0p ≈ 0.94 kcal/mol**. Confirmed independently.
+
+Caveat: this assumes `Vmax`/`Vmin`/`σV` are unchanged by the new setting. They are re-measured at
+calibration, so treat 0.94 as a starting point and re-run this audit on the result.
+
+**Consequence.** The first draft concluded "Layer B is not fixable by running longer; any target
+requiring ≲1 kcal/mol needs GaMD off." The first clause stands and is now on firmer ground —
+`a = 0.377 > 0.25` means the exponential estimator's weight variance is infinite, so no amount of
+sampling helps. The second clause is still not established, but not for the reason the first
+correction gave: CE2's error is **unresolved**, not shown to be small. What *is* actionable is that
+the boost width is a setting, and σ0p ≈ 0.94 kcal/mol would move the exponential estimator inside its
+finite-variance bound and make CE2's own error measurable for the first time.
 
 This section no longer claims to reproduce the ala-dipeptide `gamd_cumulant2` +18 kcal/mol result.
 That was a different system at different settings, and the mechanism there was not established by
@@ -334,6 +359,17 @@ true full-trace g ratio is ~11×, not the ~2.6× measured off truncated heads, b
 bootstrap shows the slope is far less sensitive to slow drift than the CV mean, so ×11 would
 over-correct. The g probe is retained as a **warning that every interval is a lower bound**, and is
 no longer applied as a correction.
+
+Two further refinements, both of which turned out not to change the conclusions — which is worth
+recording, since an unchecked approximation that happens to be adequate is indistinguishable from one
+that is not:
+
+- **Hartung–Knapp** is reported alongside DerSimonian–Laird. Plain DL treats τ² as known and is
+  anti-conservative at these counts (24–28 pairs). HK moves the CV2 interval from ±0.01188 to
+  ±0.01212 and leaves CV1 unchanged, so DL was adequate here.
+- **Exact χ² survival** replaced the Wilson–Hilferty normal approximation for the heterogeneity
+  p-values, because those are reported and compared against a threshold. It moves CV2's p from
+  0.0023 to 0.0022 — both far below 0.05, so the "use random effects" call is unaffected.
 
 ### Result on `chignolin_6/epoch_000`
 
@@ -517,9 +553,10 @@ Ordered by how much they could hurt.
 7. **The GaMD boost is pinned at its ceiling.** `k0 = 1.0` against a `k0' = 1.766`, so the requested
    σ0p = 2.5 kcal/mol is not what is being applied and the run sits at maximum boost. This is the
    direct cause of the Layer B verdict in Tier 0, and unlike the rest of this list it is a *config*
-   fix, not a code fix: σ0p ≈ 1.4–1.7 kcal/mol un-clips `k0` and brings both reweighting estimators
-   inside their validity bounds. Not changed here, because it alters the physics of future runs and
-   breaks comparability with past ones — that is a decision, not a bug fix.
+   fix, not a code fix: **σ0p ≈ 0.94 kcal/mol**. Note that anything between 1.42 and 2.5 is inert —
+   the clip keeps `k0` at 1.0 — so a half-measure here would look like a change and do nothing. Not
+   changed here, because it alters the physics of future runs and breaks comparability with past
+   ones — that is a decision, not a bug fix.
 8. **`tica_cv_version.txt` is absent from every scheduled segment**, so the driver's union-MBAR pool
    is in practice `final` + extensions only — safe by accident for epoch_000 (genuinely different
    CV2), over-conservative for epoch_001.
@@ -560,12 +597,14 @@ than the quoted errors sits underneath all of them.
 Boltzmann distribution (Tier 3), and that the whole stack reproduces a known free-energy surface end
 to end (Tier 4).
 
-**Layer B, corrected.** Exponential reweighting is structurally unusable at this boost width —
-a = 0.377 > 0.25, infinite weight variance, and no amount of sampling changes that. CE2 is **not**
-established as broken: its neglected tail is ≈0.95 kcal/mol of CV-dependent distortion, right at the
-1 kcal/mol bar. And the boost width is a **setting**, currently pinned at `k0 = 1.0` against a
-`k0' = 1.766`; σ0p ≈ 1.4–1.7 kcal/mol would bring both estimators inside their bounds. The earlier
-draft's "no amount of sampling changes it, GaMD must be off" overstated the second half.
+**Layer B.** Exponential reweighting is structurally unusable at this boost width — a = 0.377 >
+0.25, infinite weight variance, no amount of sampling changes that. CE2 is neither vindicated nor
+condemned: its truncation error is **unresolved**, with a measured floor of 0.23 kcal/mol and two
+higher estimators (1.78 parametric, 2.98 empirical) that are respectively model-dependent and
+unreliable — the empirical one because it needs the same divergent average. The boost width is a
+**setting**, pinned at `k0 = 1.0` against `k0' = 1.766`; **σ0p ≈ 0.94 kcal/mol** (not the 1.4–1.7 an
+earlier version of this report gave — that range is still inside the clip and changes nothing) would
+put the exponential estimator inside its bound and make CE2's error measurable at all.
 
 ---
 
@@ -584,6 +623,21 @@ The corrected Tier 2 numbers independently reproduce the verifier's to three dec
 including the two specific rejecting pairs and the cross-axis temperature split. Two defects in
 shipped code (`gareus/mbar_subsample.py`'s head truncation, and the gibbs branch's untestability)
 were found only because the verification was adversarial rather than confirmatory.
+
+**A second review pass** then cross-checked the derivations with an independent model and by direct
+numerical simulation. It found two more errors, both in the *corrected* version:
+
+| finding | status |
+|---|---|
+| geometric tail at ratio 2a extrapolates a within-bin ratio onto an across-bin spread | **refuted**; the report's own 4th-order datum (ratio 1.65) already contradicted it |
+| σ0p ≲ 1.66 kcal/mol recommendation ignores the `k0` clip and would change nothing | **refuted**; corrected to ≈0.94 |
+
+Verified unchanged on that pass: the moment-matching for `a`, the MGF radius `1/(2a)` and the
+0.5/0.25 bounds, the cumulant formula and its `2a` ratio, the logistic slope of exactly −1 and its
+insensitivity to `n_k ≠ n_l`, the claim that pairs sharing `(c1,k1)` carry no CV1 information, the
+DerSimonian–Laird algebra, the Bonferroni critical value, and every unit conversion. The chi-square
+results are now pinned by `tests/test_gamd_reweighting_feasibility_math.py` against draws from a
+known distribution rather than taken on trust.
 
 ---
 
