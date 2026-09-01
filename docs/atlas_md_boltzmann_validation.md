@@ -110,13 +110,45 @@ Analytic check on existing data, zero compute.
 > (15,375,316 raw rows). Earlier figures in the git history of this file were computed before that
 > and are superseded, not contradicted. Abandoned `*_CRASHED*` phases are now excluded by the audit.
 
-On the current snapshot: **13,187,613 samples across 37 states**, after mapping each row's
-phase-local `window_id` through its own phase's `epoch_window_map.csv` and de-duplicating (14.2%
-dropped as exact duplicates from the known un-consolidated-`chunk_*.parquet` leftover).
+On the current snapshot: **13,537,316 samples across 37 states**, after mapping each row's
+phase-local `window_id` through its own phase's `epoch_window_map.csv` and de-duplicating (12.0%
+dropped). **The headline verdict below rests on the 11,974,788 post-recalibration samples**, not on
+this pooled figure — see the regime split immediately following.
 
 > An earlier version of this section pooled on raw `window_id` and reported 36 windows. That is the
-> same defect the 2026-08-25 window-map work exists to fix — `window_id` is phase-local, and 3 of
-> the 6 phases have a non-identity map. Every number below is from the corrected version.
+> same defect the 2026-08-25 window-map work exists to fix — `window_id` is phase-local, and **4 of
+> the 6 phases** have a non-identity map (`topup_001` 6 rows, `topup_002` 10, `topup_003` 1,
+> `final/baseline` 4). Zero rows carry a `window_id` absent from their phase's map, and the audit now
+> warns rather than dropping such rows silently.
+
+#### The de-duplication key needed a phase term, and the drop is not all duplicates
+
+`step` is **phase-local, not campaign-absolute** — every phase of this run begins at step 460,100.
+A de-duplication key of `(state, replica, step)` therefore merges genuinely distinct samples taken in
+different phases. Measured: **349,703 collisions**, concentrated in the phase added most recently,
+which is exactly the pattern that made the drop look implausible in the first place. The key now
+carries a phase index.
+
+That was found by asking a question the audit could not answer as written: it printed the drop as
+"exact duplicates from the known un-consolidated `chunk_*.parquet` leftover", which was an asserted
+cause, not a measured one. Per phase, de-duplicated within the phase:
+
+| phase | raw | kept | dropped |
+|---|---|---|---|
+| epoch_000 | 1,562,528 | 1,562,528 | 0% |
+| epoch_001/baseline | 2,833,380 | 2,734,380 | 3.5% |
+| epoch_001/topup_001 | 4,329,600 | 3,977,600 | 8.1% |
+| epoch_001/topup_002 | 4,222,000 | 3,742,000 | 11.4% |
+| epoch_001/topup_003 | 713,020 | 580,020 | 18.7% |
+| **final/baseline** | 1,714,788 | 940,788 | **45.1%** |
+
+So the duplication is real, but it is **far worse in `final/baseline` than the ~24% CLAUDE.md records
+for the worst phase previously seen** — 45% of that phase's rows are exact duplicates of another row
+in the same phase. That is a data-integrity finding about the run, not about this audit, and it is
+worth a look at `ParquetSampleWriter._consolidate` for that phase.
+
+Correcting the key changed the accounting (13,187,613 → 13,537,316) and **no verdict**: `a` stays
+0.369, anharmonicity 0.601, and the CE2 columns move by ≤0.03 kcal/mol.
 
 ### The two GaMD regimes must not be pooled
 
@@ -129,8 +161,8 @@ one `a`:
 | regime | n | ⟨βΔV⟩ | βσ | anharmonicity | a |
 |---|---|---|---|---|---|
 | epoch_000 (pre-recal) | 1,562,528 | 7.50 | 3.37 | 0.699 | **0.388** |
-| epoch_001+final (post-recal) | 11,625,085 | 8.82 | 3.57 | 0.601 | **0.369** |
-| pooled *(not valid)* | 13,187,613 | 8.66 | 3.57 | 0.606 | 0.377 |
+| epoch_001+final (post-recal) | 11,974,788 | 8.82 | 3.57 | 0.601 | **0.369** |
+| pooled *(not valid)* | 13,537,316 | 8.66 | 3.57 | 0.606 | 0.377 |
 
 The regimes really do differ, and pooling inflates `a` mechanically — `a ≈ var/(4·mean)` and a
 between-regime mean offset adds to the variance. The headline below uses the **post-recalibration**
@@ -174,8 +206,8 @@ Three estimators, over 11 CV1 bins:
 | estimator | spread (kcal/mol) | what it is |
 |---|---|---|
 | 3rd-order term only | **0.23** | directly measured. A floor, not the tail. |
-| parametric (noncentral χ²) | **1.37** | closed form `λa/(1−2a) − ½ln(1−2a)` minus CE2, exact **for the fitted family only** |
-| empirical | **3.03** | model-free `ln⟨e^X⟩ − CE2`, but see below |
+| parametric (noncentral χ²) | **1.35** | closed form `λa/(1−2a) − ½ln(1−2a)` minus CE2, exact **for the fitted family only** |
+| empirical | **3.00** | model-free `ln⟨e^X⟩ − CE2`, but see below |
 
 **Verdict: NOT RESOLVED.** The empirical column needs the very `exp(+βΔV)` average whose variance is
 infinite at `a = 0.369`, so it is not a measurement — it is one draw from a distribution with no
@@ -710,7 +742,7 @@ to end (Tier 4).
 **Layer B.** Exponential reweighting is structurally unusable at this boost width — a = 0.369 >
 0.25, infinite weight variance, no amount of sampling changes that. CE2 is neither vindicated nor
 condemned: its truncation error is **unresolved**, with a measured floor of 0.23 kcal/mol and two
-higher estimators (1.37 parametric, 3.03 empirical) that are respectively model-dependent and
+higher estimators (1.35 parametric, 3.00 empirical) that are respectively model-dependent and
 unreliable — the empirical one because it needs the same divergent average. The boost width is a
 **setting**, pinned at `k0 = 1.0` against `k0' = 1.694`; **σ0p ≈ 1.00 kcal/mol** (not the 1.4–1.7 an
 earlier version of this report gave — that range is still inside the clip and changes nothing) would
@@ -743,6 +775,8 @@ numerical simulation. It found two more errors, both in the *corrected* version:
 | σ0p ≲ 1.66 kcal/mol recommendation ignores the `k0` clip and would change nothing | **refuted**; corrected to ≈1.00 |
 | `k0'` read positionally from the first glob hit — the diagnostic pilot, not production | **refuted**; 1.766 → 1.694, selection made explicit |
 | Tier 0 pooled the pre- and post-recalibration GaMD regimes into one `a` | **refuted**; split, `a` = 0.388 vs 0.369, verdict unchanged |
+| de-duplication key omitted a phase term, and `step` is phase-local | **refuted**; 349,703 cross-phase collisions, key fixed, verdict unchanged |
+| the dropped-row count was attributed to duplicates without measurement | **refuted**; measured per phase — real, but 45% in `final/baseline` vs the ~24% on record |
 
 Verified unchanged on that pass: the moment-matching for `a`, the MGF radius `1/(2a)` and the
 0.5/0.25 bounds, the cumulant formula and its `2a` ratio, the logistic slope of exactly −1 and its

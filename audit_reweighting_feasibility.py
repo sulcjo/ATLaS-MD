@@ -113,7 +113,7 @@ def _load(run_dir: str):
 
     con = duckdb.connect()
     sids, cvs, dvs, keys, regs = [], [], [], [], []
-    for phase in _phase_dirs(run_dir):
+    for phase_idx, phase in enumerate(_phase_dirs(run_dir)):
         with open(os.path.join(phase, "epoch_window_map.csv")) as fh:
             amap = {int(r["epoch_window"]): int(r["state_id"]) for r in csv.DictReader(fh)}
         files = sorted(glob.glob(os.path.join(phase, "samples", "seg_*", "*.parquet")))
@@ -126,6 +126,10 @@ def _load(run_dir: str):
         w = np.asarray(t["window_id"]).astype(np.int64)
         mapped = np.array([amap.get(int(x), -1) for x in w], dtype=np.int64)
         ok = mapped >= 0
+        if int((~ok).sum()):
+            print(f"  WARNING {int((~ok).sum()):,} rows in {os.path.relpath(phase, run_dir)} have a "
+                  "window_id absent from that phase's own map; dropped. See "
+                  "docs/chignolin_6_low_ess_root_cause.md")
         sids.append(mapped[ok])
         cvs.append(np.asarray(t["cv1"]).astype(float)[ok])
         dvs.append(np.asarray(t["gamd_boost_total"]).astype(float)[ok])
@@ -135,13 +139,20 @@ def _load(run_dir: str):
         is_e0 = os.path.basename(phase) == "epoch_000" or os.sep + "epoch_000" + os.sep in phase
         regs.append(np.full(int(ok.sum()), 0 if is_e0 else 1, dtype=np.int8))
         # Packed into one int64 so the de-duplication is a single sort rather
-        # than a lexsort over 12M rows. step < 2^31 and replica < 2^6 are
-        # asserted, so the packing is injective.
+        # than a lexsort over 13M rows.
+        #
+        # The PHASE INDEX is part of the key, and must be: `step` is
+        # phase-local, not campaign-absolute. Every phase of this run starts at
+        # step 460,100, so a key of (state, replica, step) alone silently merges
+        # genuinely distinct samples from different phases. Measured before this
+        # was fixed: 349,703 collisions, concentrated in the phase that was added
+        # last. Same failure as treating a phase-local `window_id` as a state id.
         rep = np.asarray(t["replica"]).astype(np.int64)[ok]
         stp = np.asarray(t["step"]).astype(np.int64)[ok]
-        if rep.size and (rep.max() >= 1 << 6 or stp.max() >= 1 << 31 or mapped[ok].max() >= 1 << 16):
+        if rep.size and (rep.max() >= 1 << 6 or stp.max() >= 1 << 31
+                         or mapped[ok].max() >= 1 << 6 or phase_idx >= 1 << 6):
             raise SystemExit("key packing would overflow; widen the shifts")
-        keys.append((mapped[ok] << 37) | (rep << 31) | stp)
+        keys.append((phase_idx << 43) | (mapped[ok] << 37) | (rep << 31) | stp)
 
     if not sids:
         raise SystemExit(f"no mapped samples under {run_dir}")
