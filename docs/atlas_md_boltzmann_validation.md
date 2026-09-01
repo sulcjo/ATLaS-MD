@@ -143,9 +143,21 @@ cause, not a measured one. Per phase, de-duplicated within the phase:
 | **final/baseline** | 1,714,788 | 940,788 | **45.1%** |
 
 So the duplication is real, but it is **far worse in `final/baseline` than the ~24% CLAUDE.md records
-for the worst phase previously seen** — 45% of that phase's rows are exact duplicates of another row
-in the same phase. That is a data-integrity finding about the run, not about this audit, and it is
-worth a look at `ParquetSampleWriter._consolidate` for that phase.
+for the worst phase previously seen** — 45% of that phase's rows duplicate another row in the same
+phase. That is a data-integrity finding about the run, not about this audit.
+
+**Verified, not assumed** — the obvious failure mode would be that these rows are *not* really
+duplicates and de-duplicating them silently discards real samples. Measured directly on the phase's
+own Parquet: max duplicate group size is **2** (774,000 pairs plus 166,788 singletons), and all
+774,000 pairs are **bit-identical** across every value column (`cv1`, `cv2`, `potential`,
+`gamd_boost_total`, `gamd_boost_dihedral` — zero rows differ). Every pair is one row from a
+`chunk_*.parquet` and one from `data.parquet`, and `data.parquet` (940,788 rows) is a **strict
+superset** of the 44 chunk files (774,000 rows). So the de-duplication loses nothing, and the cause
+is exactly the known un-consolidated-chunk leftover — `ParquetSampleWriter._consolidate` did not
+delete the chunks for that phase.
+
+(Incidental confirmation from the same query: `gamd_boost_nonbonded` is NULL in 100% of rows, which
+is what `lower-dihedral` should produce — only the torsion group is boosted.)
 
 Correcting the key changed the accounting (13,187,613 → 13,537,316) and **no verdict**: `a` stays
 0.369, anharmonicity 0.601, and the CE2 columns move by ≤0.03 kcal/mol.
