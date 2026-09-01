@@ -266,3 +266,22 @@ Root-caused from a user report that `RUNS/chignolin_6`'s MBAR base ESS was 0.74%
 - Parser smoke: `--cv2 torsion-pca`, `--contact-bias-strength 0.15`, `analyze_gareus_mbar.py --no-torsion-pca-scree`, `--torsion-pca-scree-epoch 0`
 - Help smoke: `python -m gareus -h` and `python -m gareus -hh`, `-hh list`, `-hh 8`, `-hh torsion`; `gareus.energy_decomposition.build_arg_parser().parse_args(['-hh', ...])`; `python GENPEPT.py -h`
 - `git diff --check`
+
+## opencode — local free worker
+
+A second agent (opencode CLI) can be dispatched from your shell for token-cheap labor:
+
+    opencode run "<task>" [--continue]
+
+It runs non-interactively in this repo and its stdout lands in your context. It reads
+AGENTS.md (subordinate worker role) and this file. Use it for:
+
+- Full/targeted test runs and re-running analyses on RUNS/ data (10+ min jobs — tell it
+  to launch and poll, don't block your own turn on a full suite)
+- Independent re-measurement of numbers you just wrote into reports (the adversarial
+  verification pattern, with a fresh context that didn't write the original claim)
+- Grep-style stale-claim audits, argparse-default checks
+- Process monitoring, watching RUNS/ for new artifacts
+
+It never commits and won't touch files you're actively editing. Prefer dispatching it
+over doing measurement drudgery yourself — it's local and free.
