@@ -472,6 +472,46 @@ more than ~2% from −1. **Which specific pairs reject changes with the head** (
 4000; w16-w24 and w30-w31 at 8000), which is itself evidence that the per-pair rejections are
 autocorrelation artefacts rather than localised defects.
 
+### Coverage across phases — and a limit on what the contact axis can be tested on
+
+Tier 2 was originally run only on `epoch_000`. Given the Tier 0 finding that `epoch_000` is a
+different GaMD regime from every later phase, and that the main PMF report *excludes* it, that is the
+wrong phase to draw a conclusion from on its own. Re-run on `epoch_001/baseline`
+(post-recalibration, 33 windows, identity map, 0 centre mismatches):
+
+| | epoch_000 (pre-recal) | epoch_001/baseline (post-recal) |
+|---|---|---|
+| CV2 axis, random effects | −0.99227 ± 0.01188 | **−0.98965 ± 0.01327** |
+| Hartung–Knapp | ±0.01212 (t = +0.64) | ±0.01621 (t = +0.64) |
+| pairs consistent | 27/28 | 25/28 |
+| implied temperature | 302.3 K | 303.1 K |
+| median g | 53.2 | 13.7 |
+| g convergence (per head doubling) | ×4.0 | ×1.9 |
+| **CV1 axis** | 23/24 pairs, −1.01548 | **no pairs constructible** |
+
+The secondary restraint agrees closely across the two regimes (302.3 K vs 303.1 K), and the later
+phase is better conditioned — `g` is a quarter the size and much closer to converged. So the
+sampler claim is not an artefact of the one phase it was first measured on.
+
+**But the contact axis cannot be tested after epoch_000, and this is structural.** A CV1-axis pair
+requires two windows sharing `(c2, k2)` *exactly* while differing in `c1`. Measured:
+
+```
+epoch_000            32 windows,  4 distinct c1,  8 distinct c2   -> 32 windows share a c2 (4x8 grid)
+epoch_001/baseline   33 windows,  5 distinct c1, 33 distinct c2   ->  0
+final/baseline       36 windows,  8 distinct c1, 36 distinct c2   ->  0
+```
+
+After the tICA CV2 recentering every window gets its own secondary centre, so the rectangular grid
+that makes an isolated CV1 test possible exists only in `epoch_000`. The alternative — pairing
+windows whose `c2` merely *nearly* matches — would reintroduce exactly the contamination this
+pairing was rebuilt to remove, so the audit reports "no pairs" rather than an approximate answer.
+
+**Consequence for the claim:** the contact restraint is verified on `epoch_000` only, which is 12% of
+the samples and the regime the main PMF excludes. The secondary restraint is verified on both. This
+is a real coverage gap, not a caveat — closing it would need a phase that keeps some CV2 degeneracy,
+which the current adaptive scheme never produces.
+
 ### The under-resolved `g` cuts *in favour* of the null, not against it
 
 Worth stating plainly, because "every interval is a lower bound" reads as a hedge and here it is the
@@ -653,7 +693,12 @@ and reads the live `assignments` array, pinned structurally against six mutation
 
 **On real production data**, both restraint axes are consistent with their recorded parameters —
 23/24 pairs on the contact CV and 27/28 on the secondary at 5% family-wise error, random-effects
-pooled slopes of −1.015 ± 0.012 and −0.992 ± 0.012 against an exact null of −1. The two axes
+pooled slopes of −1.015 ± 0.012 and −0.992 ± 0.012 against an exact null of −1. The secondary
+restraint reproduces on the post-recalibration phase too (−0.990 ± 0.013, 303.1 K against 302.3 K),
+so it is not an artefact of one phase. **The contact restraint is verified on `epoch_000` only** —
+after the tICA recentering every window has a unique CV2 centre, so no pair can isolate CV1, and
+`epoch_000` is both 12% of the samples and the regime the main PMF excludes. That is a coverage gap,
+not a caveat. The two axes
 disagree by ~0.02–0.04 in slope — suggestive of a non-global effect, since a temperature error is one
 scalar — but its significance is head-dependent (z between −1.35 and −2.18) and is not established. Every interval is a lower bound, and a time-stratification systematic 2.7–3.6× larger
 than the quoted errors sits underneath all of them.
