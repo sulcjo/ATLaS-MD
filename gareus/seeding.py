@@ -49,6 +49,69 @@ from .system_setup import (
 from .units import kj_nm2_to_kcal_a2
 
 
+STARTING_PE_WARN_Z = 8.0
+STARTING_PE_BAD_Z = 50.0
+
+
+def classify_starting_potential_energy(pe, pe_med, pe_mad, *,
+                                       warn_z=STARTING_PE_WARN_Z,
+                                       bad_z=STARTING_PE_BAD_Z):
+    """Severity of one umbrella start's potential energy.
+
+    Returns ``(robust_z, status, message)``; ``robust_z`` is the two-sided
+    magnitude (or ``""`` when the spread is not measurable), ``status`` is
+    ``None`` / ``"warn"`` / ``"bad"``.
+
+    Extracted from the quality loop so it is unit-testable without an OpenMM
+    context, in the same spirit as the other pure helpers here.
+
+    Why a `bad` tier exists at all: this branch used to cap at `warn` for ANY
+    magnitude, so `--us-auto-drop-bad-windows` could not drop a start that was
+    physically impossible. Real incident (chignolin_6 final phase, 2026-09-01):
+    windows 5 and 6 began production at +2.51e17 kJ/mol against a -267,632
+    median (MAD 1,831), were labelled `warn`, and NaN'd 200 steps in -- killing
+    all 36 replicas and ending the campaign, while window 32, which had the most
+    NEGATIVE (most stable) energy of the 37 starts, was the one dropped.
+
+    Only UPWARD deviation is a hazard: an unusually low potential energy is an
+    unusually stable start, and must never be droppable however far out it sits.
+    The warn tier deliberately keeps the historical two-sided ``|z| > warn_z`` so
+    no warning that used to appear disappears; only the new bad tier is
+    one-sided. The sign and finiteness checks do not depend on the spread being
+    measurable, because a positive total potential energy for a solvated system
+    is a clash whatever the rest of the set looks like.
+    """
+    try:
+        pe = float(pe)
+    except (TypeError, ValueError):
+        pe = float("nan")
+    have_spread = (math.isfinite(pe_med) and math.isfinite(pe_mad)
+                   and pe_mad > 1.0e-6)
+    robust_z = ""
+    if math.isfinite(pe) and have_spread:
+        robust_z = float(abs(pe - pe_med) / (1.4826 * pe_mad))
+
+    if not math.isfinite(pe):
+        return "", "bad", ("starting potential energy is not finite "
+                           f"({pe!r}); the start is unusable")
+    if pe > 0.0:
+        return robust_z, "bad", (
+            f"starting potential energy is positive ({pe:.3g} kJ/mol) -- the "
+            "start is clashing and will NaN production")
+    if not have_spread:
+        return robust_z, None, None
+
+    signed_z = (pe - pe_med) / (1.4826 * pe_mad)
+    if signed_z > bad_z:
+        return robust_z, "bad", (
+            f"potential energy robust-z {robust_z:.1f} ABOVE the other starts "
+            "-- the start is badly strained and will likely NaN production")
+    if robust_z > warn_z:
+        return robust_z, "warn", (
+            f"potential energy robust-z {robust_z:.1f} relative to other starts")
+    return robust_z, None, None
+
+
 def _safe_max_finite(rows, key) -> float:
     """Max of ``rows[*][key]`` over finite numeric values; NaN if none.
 
@@ -1918,15 +1981,20 @@ def generate_us_starting_states_by_pulling(
             warnings.append(f"production umbrella bias at start is {prod_bias_kcal:.2f} kcal/mol")
             status = "warn"
         pe = float(r.get("potential_kj_mol", float("nan")))
-        if math.isfinite(pe) and math.isfinite(pe_med) and math.isfinite(pe_mad) and pe_mad > 1.0e-6:
-            robust_z = abs(pe - pe_med) / (1.4826 * pe_mad)
-            r["potential_robust_z"] = float(robust_z)
-            if robust_z > 8.0:
-                warnings.append(f"potential energy robust-z {robust_z:.1f} relative to other starts")
-                if status != "bad":
-                    status = "warn"
-        else:
-            r["potential_robust_z"] = ""
+        pe_z, pe_status, pe_message = classify_starting_potential_energy(
+            pe, pe_med, pe_mad,
+            warn_z=float(getattr(args, "us_start_pe_warn_z", STARTING_PE_WARN_Z)
+                         or STARTING_PE_WARN_Z),
+            bad_z=float(getattr(args, "us_start_pe_bad_z", STARTING_PE_BAD_Z)
+                        or STARTING_PE_BAD_Z),
+        )
+        r["potential_robust_z"] = pe_z
+        if pe_message:
+            warnings.append(pe_message)
+        if pe_status == "bad":
+            status = "bad"
+        elif pe_status == "warn" and status != "bad":
+            status = "warn"
         sec_bias = _scalar_to_float(r.get("production_secondary_cv_bias_kcal_mol", None))
         sec_delta = _scalar_to_float(r.get("secondary_cv_delta", None))
         total_bias_kcal = float(prod_bias_kcal) + (float(sec_bias) if sec_bias is not None and math.isfinite(float(sec_bias)) else 0.0)
