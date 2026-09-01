@@ -508,8 +508,8 @@ two paragraphs below.
 and reads the live `assignments` array, pinned structurally against six mutations.
 
 **On real production data**, both restraint axes are consistent with their recorded parameters —
-22/24 pairs on the contact CV and 26/28 on the secondary at 5% family-wise error, random-effects
-pooled slopes of −1.017 ± 0.012 and −0.980 ± 0.011 against an exact null of −1. The two axes
+23/24 pairs on the contact CV and 27/28 on the secondary at 5% family-wise error, random-effects
+pooled slopes of −1.015 ± 0.012 and −0.992 ± 0.012 against an exact null of −1. The two axes
 disagree by ~0.02–0.04 in slope — suggestive of a non-global effect, since a temperature error is one
 scalar — but its significance is head-dependent (z between −1.35 and −2.18) and is not established. Every interval is a lower bound, and a time-stratification systematic 1.7–2.4× larger
 than the quoted errors sits underneath all of them.
