@@ -516,6 +516,48 @@ more than ~2% from −1. **Which specific pairs reject changes with the head** (
 4000; w16-w24 and w30-w31 at 8000), which is itself evidence that the per-pair rejections are
 autocorrelation artefacts rather than localised defects.
 
+### The pairs are not independent — and that makes the intervals conservative, not optimistic
+
+DerSimonian–Laird assumes independent studies. These pairs are **not** independent: they are
+adjacent along an axis, so `(w0,w1)` and `(w1,w2)` share window `w1` and all of its samples. Nothing
+in the pooling models that, and it was flagged as an open assumption rather than checked.
+
+Checked now, by simulation against a known answer — a chain of K = 29 windows on a 1D surface, exact
+Boltzmann samples, the shipped `_logistic_slope` and `_pool`, 4000 realisations, comparing the
+*empirical* scatter of the pooled slope against the SE the code reports:
+
+| quantity | K=8 | K=29 | K=29 tight overlap | K=29 loose |
+|---|---|---|---|---|
+| corr(adjacent slopes) | −0.17 | **−0.32** | −0.38 | −0.23 |
+| corr at lag 2 | ≈0 | ≈0 | ≈0 | ≈0 |
+| empirical SD ÷ reported SE | 0.76 | **0.65** | 0.52 | 0.78 |
+| Cochran Q false-positive rate at α=0.05 | 0.063 | 0.066 | 0.077 | 0.059 |
+| 95% CI coverage of −1 | 0.988 | 0.996 | 1.000 | 0.985 |
+| per-pair Bonferroni FWER | 0.047 | 0.044 | 0.051 | 0.050 |
+
+**The correlation is negative, which I had assumed would go the other way.** The mechanism is
+specific: the shared window is the label-1 group in one pair and the label-0 group in the next, so a
+sampling fluctuation that steepens one fit flattens its neighbour. Negative covariance makes the true
+variance of a weighted mean *smaller* than the independence formula gives, and DL then absorbs the
+residual dispersion into τ² on top. Both effects push the same way.
+
+Consequences, all favourable:
+
+- **The reported pooled SEs are too wide by roughly 1.3–1.9×**, so every interval is conservative and
+  the CI coverage measured 0.985–1.000 against a nominal 0.95.
+- **Consistency with −1 is therefore safer than reported**, not shakier: at the real z ≈ +0.65,
+  tightening the SE by 1.5× still leaves it insignificant, and the dependence biases the test toward
+  *failing to reject* in the first place.
+- **Bonferroni survives the dependence** — measured family-wise error 0.044–0.051 against a nominal
+  0.05 — so 27/28 stands.
+- **Cochran Q is mildly anti-conservative** (FPR 0.06–0.08 rather than 0.05), but the real rejection
+  is Q = 52.7 at p ≈ 2e-3, far beyond what a ~1.3× p-value distortion could manufacture. The "use
+  random effects" call stands.
+- The one claim that is *understated* is the power: at 1.3–1.9× narrower true intervals the test
+  resolves a mis-scaling nearer **1.3–1.9%** than the 2.4% quoted. The 2.4% figure is kept as the
+  conservative bound, since the inflation factor is setup-dependent and was not measured on the real
+  geometry.
+
 ### Coverage across phases — and a limit on what the contact axis can be tested on
 
 Tier 2 was originally run only on `epoch_000`. Given the Tier 0 finding that `epoch_000` is a

@@ -58,6 +58,16 @@ I^2 ~ 67% at a 4000-frame head -- so the fixed-effect interval is invalid howeve
 the per-pair SEs were computed. DerSimonian-Laird random effects is reported as
 the headline and the fixed-effect number is shown only for comparison.
 
+The pairs are also not independent -- adjacent pairs share a window -- which DL
+does not model. Simulated against a known answer (K=29 chain, 4000 realisations):
+the induced correlation is NEGATIVE, -0.17 to -0.38, because the shared window is
+the label-1 group in one pair and label-0 in the next, so a fluctuation that
+steepens one fit flattens its neighbour. Negative covariance shrinks the true
+variance of the weighted mean, so the SEs reported here are too WIDE by roughly
+1.3-1.9x. Measured 95% CI coverage 0.985-1.000, Bonferroni FWER 0.044-0.051. The
+intervals are conservative and the dependence biases toward failing to reject, so
+a pass is a stronger result than it looks.
+
 An earlier version instead widened the fixed-effect CI by the observed
 instability in `g`. That reasoning was wrong twice over: the true full-trace g
 ratio is ~11x, not the ~2.6x it measured off truncated heads, and a joint block
