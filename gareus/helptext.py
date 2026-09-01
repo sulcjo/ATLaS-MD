@@ -138,6 +138,13 @@ Common flags
     --windows-a A ...                   Manual distance centers in Angstrom (--window-mode manual).
     --seed-conformers-dir DIR           Use GENPEPT survivors for CV-aware window starts.
     --seed-selection-mode MODE          auto/active-cv, primary, or legacy distance seed scoring.
+    --us-auto-drop-bad-windows          Drop windows whose pulled start is graded `bad` before production.
+                                        The dropped state contributes NO samples to MBAR, so check
+                                        us_starting_structure_quality.json when windows go missing.
+    --us-start-primary-bad-bias-kcal V  Primary-CV start bias above which a window is `bad` (default 5.0).
+    --us-2d-start-secondary-bad-bias-kcal V
+                                        Secondary-CV equivalent (default 5.0). Raise both when good
+                                        windows are dropped for a merely strained start; see `-hh quality`.
 
     --box-shape SHAPE                   Solvent box shape: dodecahedron (default), cube, octahedron.
     --padding-nm NM                     Solvent padding around the peptide.
@@ -1110,6 +1117,59 @@ console/live-histogram display (`--live-hist`, `--hist-every`,
 `--no-clear-screen`, `--no-color`).  GAREUS uses the package dashboard
 (`--tui-mode`, `--progress-mode`).  The data link is the seed directory,
 especially `final_survivor_seeds.csv`.
+
+Starting-structure quality, and which windows get dropped
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+After pulling, every window's start is scored against the *production* umbrella
+it will actually run under, and written to:
+
+    us_starting_structures/us_starting_structure_quality.csv
+    us_starting_structures/us_starting_structure_quality.json
+
+Each row gets `quality_status` = ok / warn / bad, plus `quality_warnings`.  This
+matters because `--us-auto-drop-bad-windows` DROPS every `bad` window before
+production: the status is not advisory, it decides the window set that reaches
+MBAR.  A dropped window is retired from the registry and its state contributes
+no samples.
+
+Four thresholds decide `bad` vs `warn` on the start's umbrella bias:
+
+    --us-start-primary-bad-bias-kcal FLOAT       (default 5.0)
+    --us-start-primary-warn-bias-kcal FLOAT      (default 1.0)
+    --us-2d-start-secondary-bad-bias-kcal FLOAT  (default 5.0)
+    --us-2d-start-secondary-warn-bias-kcal FLOAT (default 1.0)
+
+Units are kcal/mol of umbrella bias at the starting structure; 1 kcal/mol is
+roughly 1.7 kT at 300 K.  Raise the `bad` bars when good windows are being
+dropped for a start that is merely strained: a bias of a few kT is routinely
+relaxed within picoseconds once dynamics begin, provided the target is actually
+reachable.
+
+Two other things set `bad`, and neither is governed by those flags:
+
+    * a non-finite or POSITIVE starting potential energy -- always `bad`,
+      whatever the thresholds, because a positive total potential for a solvated
+      system is a clash that will NaN production;
+    * `--us-start-pe-bad-z` / `--us-start-pe-warn-z`, a robust-z on the starting
+      potential energy relative to the other windows' starts.  Only UPWARD
+      deviation can be `bad`: an unusually LOW potential energy is an unusually
+      stable start and is never droppable.
+
+Worked example (chignolin_6, 2026-09-01).  A final phase dropped windows 15 and
+32 at start biases of 6.67 and 6.77 kcal/mol -- about 11 kT -- while their
+potential energies were entirely healthy (robust-z 0.26 and 0.18).  Window 32
+was a bridge window a previous epoch had added specifically to repair a weak
+overlap edge, so dropping it recreated the coverage hole the bridge existed to
+close, and the quality gate then demanded more sampling.  Re-running with
+
+    --us-start-primary-bad-bias-kcal 15.0 --us-2d-start-secondary-bad-bias-kcal 15.0
+
+kept all 37 windows with zero drops, while a genuinely unreachable start seen
+earlier in the same campaign (39.5 kcal/mol) still classified `bad`.
+
+If windows are disappearing between phases, read that JSON's `n_bad` first and
+the `dropped_post_pull_bad_windows` key in the phase's `gareus_metadata.json`
+second; see also topic 14 on the window-map bookkeeping that a drop triggers.
 
 9. GaMD setup and production
 ----------------------------
