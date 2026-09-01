@@ -189,10 +189,17 @@ def _gamd_line(ctx: DashboardContext) -> str:
     group = live_gamd_envelope(ctx.sidecar.gamd)
     if not group:
         return "gamd  " + color_text("no GaMD boost (plain umbrella run)", "dim")
+    # sigmaV is the spread of the boosted POTENTIAL, not of the boost. sigma0 is
+    # a cap on sigma_dV. Labelling sigmaV as "σΔV" and printing sigmaV/sigma0 as
+    # a percentage therefore compared two different quantities and read as a
+    # target violation: a real run showed "σΔV 16.61 / σ0 10.46 (159%)" while the
+    # boost's actual spread, measured from 12M samples, was 8.90 kJ/mol -- 85% of
+    # sigma0, i.e. comfortably inside it. The percentage is dropped rather than
+    # corrected because sigma_dV is not available here, and k0 already carries
+    # the information that matters: sigma0 binds only while k0 < 1.
     sigma_v = float(group.get("sigmaV_kj_mol", float("nan")))
     sigma_0 = float(group.get("sigma0_kj_mol", float("nan")))
     k0 = float(group.get("k0", float("nan")))
-    pct = (100.0 * sigma_v / sigma_0) if sigma_0 else float("nan")
     # An absent/unmeasured k0 must not fall into the `>= _K0_SATURATED`
     # comparison: `nan >= 0.999` is False in Python, so a bare threshold chain
     # silently classified "not reported" as healthy ("k0 nan ok" in green) --
@@ -204,8 +211,10 @@ def _gamd_line(ctx: DashboardContext) -> str:
         k0_part = f"k0 {_num(k0, 0, 2)} " + role_text(k0_label, role)
     else:
         k0_part = "k0 " + color_text("— not reported", "dim")
-    return (f"gamd  σΔV {_num(sigma_v, 0, 2)} / σ0 {_num(sigma_0, 0, 2)} kJ "
-            f"({_num(pct, 0, 0)}%)   " + k0_part)
+    saturated = math.isfinite(k0) and k0 >= _K0_SATURATED
+    note = "  " + color_text("σ0 not binding", "dim") if saturated else ""
+    return (f"gamd  σV {_num(sigma_v, 0, 2)} / σ0 {_num(sigma_0, 0, 2)} kJ   "
+            + k0_part + note)
 
 
 def _alert_line(ranked: Sequence[WindowStatus]) -> str:

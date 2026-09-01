@@ -169,12 +169,13 @@ def boost_envelope_panel(ctx: DashboardContext) -> Panel:
             lines.append("  anharmonicity " + role_text(
                 f"{score:.2f} " + ("HIGH" if score > 1.0 else OK), role))
     if group:
+        # See the note in gareus/dashboard/spine.py's _gamd_line: sigmaV is the
+        # spread of the boosted POTENTIAL, sigma0 a cap on the spread of the
+        # BOOST. Their ratio is not a target-compliance figure.
         sigma_v = float(group.get("sigmaV_kj_mol", float("nan")))
         sigma_0 = float(group.get("sigma0_kj_mol", float("nan")))
         k0 = float(group.get("k0", float("nan")))
-        pct = (100.0 * sigma_v / sigma_0) if sigma_0 else float("nan")
-        lines.append(f"  σΔV {_num(sigma_v, 0, 2)} / σ0 {_num(sigma_0, 0, 2)} kJ  "
-                     f"({_num(pct, 0, 0)}%)")
+        lines.append(f"  σV {_num(sigma_v, 0, 2)} / σ0 {_num(sigma_0, 0, 2)} kJ")
         if math.isfinite(k0):
             k0_label = "SATURATED at ceiling" if k0 >= _K0_SATURATED else OK
             role = ROLE_BAD if k0 >= _K0_SATURATED else ROLE_GOOD
