@@ -400,6 +400,23 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
 
 
 def _add_us_args(p: argparse.ArgumentParser) -> None:
+    # A `bad` start is DROPPED when --us-auto-drop-bad-windows is on, so these
+    # four thresholds decide which windows survive into production. Defaults are
+    # the historical hardcoded values, so behaviour is unchanged unless set.
+    p.add_argument("--us-start-primary-bad-bias-kcal", type=float, default=5.0,
+                   help="Primary-CV umbrella bias at a pulled start above which the "
+                        "window is BAD (and dropped with --us-auto-drop-bad-windows). "
+                        "Default 5.0 kcal/mol (~8 kT). Raise it when good windows are "
+                        "being dropped for a strained but relaxable start.")
+    p.add_argument("--us-start-primary-warn-bias-kcal", type=float, default=1.0,
+                   help="Primary-CV start bias above which the window is only WARNed "
+                        "about. Default 1.0 kcal/mol.")
+    p.add_argument("--us-2d-start-secondary-bad-bias-kcal", type=float, default=5.0,
+                   help="Secondary-CV equivalent of --us-start-primary-bad-bias-kcal. "
+                        "Default 5.0 kcal/mol.")
+    p.add_argument("--us-2d-start-secondary-warn-bias-kcal", type=float, default=1.0,
+                   help="Secondary-CV equivalent of --us-start-primary-warn-bias-kcal. "
+                        "Default 1.0 kcal/mol.")
     p.add_argument("--us-starting-structure-mode",
                    choices=["pull", "npt", "equilibrated", "same", "none"], default="pull")
     p.add_argument("--us-pull-steps-per-window", type=int, default=5000)
@@ -945,8 +962,10 @@ def _shim_us_pulling(args: argparse.Namespace) -> None:
     args.contact_us_pull_minimize_first_ramp = True
     args.us_2d_start_minimize_each_ramp = False
     args.us_2d_start_secondary_warn_delta = 0.35
-    args.us_2d_start_secondary_warn_bias_kcal = 1.0
-    args.us_2d_start_secondary_bad_bias_kcal = 5.0
+    # us_2d_start_secondary_{warn,bad}_bias_kcal are real argparse flags now.
+    # They used to be assigned here unconditionally, which silently clobbered any
+    # value the caller passed -- the same dropped-knob pattern as
+    # --ap-epoch0-step-fraction before it got a flag.
 
 
 def _shim_windows(args: argparse.Namespace) -> None:

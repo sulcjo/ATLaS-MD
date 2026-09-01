@@ -53,6 +53,37 @@ STARTING_PE_WARN_Z = 8.0
 STARTING_PE_BAD_Z = 50.0
 
 
+def classify_starting_umbrella_bias(bias_kcal, *, warn_kcal, bad_kcal):
+    """Severity of one umbrella start's bias energy. Returns ``(status, message)``.
+
+    ``status`` is ``None`` / ``"warn"`` / ``"bad"``; a non-finite bias returns
+    ``None`` so the caller skips it exactly as the inline checks used to.
+
+    Extracted so the thresholds are testable and, more importantly, so the same
+    rule governs the primary and secondary CV instead of one bare literal and one
+    shim-assigned attribute.
+
+    Why the thresholds must be settable: a `bad` start is DROPPED when
+    ``--us-auto-drop-bad-windows`` is on. On chignolin_6 (2026-09-01) the final
+    phase dropped windows 15 and 32 at 6.67 and 6.77 kcal/mol -- roughly 11 kT,
+    strained but routinely relaxed in picoseconds -- while their potential
+    energies were healthy (robust-z 0.26 and 0.18). Window 32 was the bridge
+    window the previous epoch had added to repair weak edge 5-32, so dropping it
+    recreated the very coverage hole the bridge existed to close.
+    """
+    try:
+        b = float(bias_kcal)
+    except (TypeError, ValueError):
+        return None, ""
+    if not math.isfinite(b):
+        return None, ""
+    if b > float(bad_kcal):
+        return "bad", f"umbrella bias at start is {b:.2f} kcal/mol"
+    if b > float(warn_kcal):
+        return "warn", f"umbrella bias at start is {b:.2f} kcal/mol"
+    return None, ""
+
+
 def classify_starting_potential_energy(pe, pe_med, pe_mad, *,
                                        warn_z=STARTING_PE_WARN_Z,
                                        bad_z=STARTING_PE_BAD_Z):
@@ -1974,11 +2005,16 @@ def generate_us_starting_states_by_pulling(
         elif math.isfinite(abs_delta) and abs_delta > warn_delta:
             warnings.append(f"start is {abs_delta:.3g} {delta_units} from target center")
             status = "warn"
-        if math.isfinite(prod_bias_kcal) and prod_bias_kcal > 5.0:
-            warnings.append(f"production umbrella bias at start is {prod_bias_kcal:.2f} kcal/mol")
+        _pb_status, _pb_msg = classify_starting_umbrella_bias(
+            prod_bias_kcal,
+            warn_kcal=float(getattr(args, "us_start_primary_warn_bias_kcal", 1.0) or 1.0),
+            bad_kcal=float(getattr(args, "us_start_primary_bad_bias_kcal", 5.0) or 5.0),
+        )
+        if _pb_status == "bad":
+            warnings.append(f"production {_pb_msg}")
             status = "bad"
-        elif math.isfinite(prod_bias_kcal) and prod_bias_kcal > 1.0 and status == "ok":
-            warnings.append(f"production umbrella bias at start is {prod_bias_kcal:.2f} kcal/mol")
+        elif _pb_status == "warn" and status == "ok":
+            warnings.append(f"production {_pb_msg}")
             status = "warn"
         pe = float(r.get("potential_kj_mol", float("nan")))
         pe_z, pe_status, pe_message = classify_starting_potential_energy(
@@ -2002,11 +2038,16 @@ def generate_us_starting_states_by_pulling(
             warnings.append(f"secondary CV start is {float(sec_delta):+.3f} from target")
             if status == "ok":
                 status = "warn"
-        if sec_bias is not None and math.isfinite(float(sec_bias)) and float(sec_bias) > float(getattr(args, "us_2d_start_secondary_bad_bias_kcal", 5.0) or 5.0):
-            warnings.append(f"secondary CV umbrella bias at start is {float(sec_bias):.2f} kcal/mol")
+        _sb_status, _sb_msg = classify_starting_umbrella_bias(
+            sec_bias if sec_bias is not None else float("nan"),
+            warn_kcal=float(getattr(args, "us_2d_start_secondary_warn_bias_kcal", 1.0) or 1.0),
+            bad_kcal=float(getattr(args, "us_2d_start_secondary_bad_bias_kcal", 5.0) or 5.0),
+        )
+        if _sb_status == "bad":
+            warnings.append(f"secondary CV {_sb_msg}")
             status = "bad"
-        elif sec_bias is not None and math.isfinite(float(sec_bias)) and float(sec_bias) > float(getattr(args, "us_2d_start_secondary_warn_bias_kcal", 1.0) or 1.0) and status == "ok":
-            warnings.append(f"secondary CV umbrella bias at start is {float(sec_bias):.2f} kcal/mol")
+        elif _sb_status == "warn" and status == "ok":
+            warnings.append(f"secondary CV {_sb_msg}")
             status = "warn"
         r["production_k_kcal_mol_A2"] = float(prod_k_kcal_a2)
         r["production_umbrella_bias_kcal_mol"] = float(prod_bias_kcal)
