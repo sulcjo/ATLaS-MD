@@ -1171,6 +1171,33 @@ If windows are disappearing between phases, read that JSON's `n_bad` first and
 the `dropped_post_pull_bad_windows` key in the phase's `gareus_metadata.json`
 second; see also topic 14 on the window-map bookkeeping that a drop triggers.
 
+Retiring a phase so the analysis ignores it
+...........................................
+Dropping a window is a driver-side action.  Retiring a whole PHASE -- an attempt
+you abandoned, archived, or replaced -- is an analysis-side one, and the two are
+easy to confuse when a run has been restarted.
+
+The audits skip any phase whose path has a component that starts with `_`, or
+that contains `_CRASHED`, `_archived`, `_old`, `_bak` or `_backup`.  So the safe
+way to set an attempt aside is to rename it:
+
+    adaptive_production/final          -> adaptive_production/final_old
+    adaptive_production/final          -> adaptive_production/_archived_final_<date>
+
+Both are ignored.  Renaming is what the driver itself does when it abandons a
+phase, which is where the `_CRASHED_<date>` suffix comes from.
+
+Two practical points.  The check is on the NAME, not on how deeply the directory
+is nested, so moving an attempt somewhere out of the way is not on its own
+enough to hide it -- an in-place `final_old/baseline/` sits exactly where a live
+phase would and is excluded because of its name.  And archive BETWEEN chained
+jobs, never during one: a running job holds Parquet writers open on its phase
+directory, a rename leaves those writers pointed at the moved path, and the next
+segment boundary then fails outright rather than degrading (observed 2026-09-01:
+a job archived out from under itself died with FileNotFoundError on a
+`chunk_*.parquet.tmp`).  Stop the chain first -- and note that with a healthy
+resubmission chain, `scancel` alone is a RESTART, not a stop.
+
 9. GaMD setup and production
 ----------------------------
 GaMD setup uses the selected `--gamd-boost-type` and sigma controls:
