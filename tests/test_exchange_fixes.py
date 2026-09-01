@@ -1,8 +1,18 @@
 """
-Tests for exchange kernel and sampling correctness fixes.
+Tests for sampling-correctness fixes that need no OpenMM.
+
+The N1 gibbs-walk section that used to live here was deleted on 2026-09-01.
+It reimplemented the kernel inside the test file and asserted a design
+("force_accept=True; no additional Metropolis step") that production had
+already replaced with an MH-corrected kernel -- so it passed against code
+that no longer existed, which reads as coverage while providing none.
+The real thing now lives in tests/test_exchange_kernel_exact.py, which
+drives the shipped functions.
+
+What remains here is still reimplementation-based and should be treated as
+documentation of the F6 / N4 / F5 fixes rather than as coverage of them.
 
 Covers:
-  N1 – Gibbs-walk heat-bath weights (no OpenMM required)
   F6 – NaN secondary-CV bias matrix guard
   N4 – Segment RNG seed uniqueness
   F5 – NaN secondary seed penalty in seeding.py
@@ -15,107 +25,6 @@ import types
 
 import numpy as np
 import pytest
-
-
-# ---------------------------------------------------------------------------
-# N1: Gibbs-walk heat-bath kernel leaves π invariant
-# ---------------------------------------------------------------------------
-
-def _build_gibbs_transition_matrix(U: np.ndarray, beta: float) -> np.ndarray:
-    """
-    Reproduce the fixed gibbs-walk selection as a K×K transition matrix.
-
-    T[i, j] = probability that window i selects window j.
-    Uses the same logic as production.py after the N1 fix:
-      log_weights = clip(-beta * delta, -745, None)   # no upper bound
-      weights     = softmax(log_weights)
-      force_accept=True (heat-bath; no additional Metropolis step)
-    """
-    K = len(U)
-    T = np.zeros((K, K))
-    for i in range(K):
-        # Each window treats every other as a potential swap partner.
-        # delta[j] = U[j] + U[i] - U[i] - U[j] simplified to single-site:
-        # for the replica-exchange toy model delta[j] = U[j] - U[i]
-        # (swap replica i to window j means energy changes by U[j]-U[i])
-        delta = U - U[i]           # shape (K,)
-        log_w = np.clip(-beta * delta, -745.0, None)  # FIXED: no upper bound
-        log_w -= np.max(log_w)
-        w = np.exp(log_w)
-        T[i] = w / w.sum()
-    return T
-
-
-def test_gibbs_walk_stationary_distribution():
-    """
-    The Gibbs-walk kernel must leave π(i) ∝ exp(-β·U_i) invariant.
-    Checks max|π·T − π| < 1e-12.
-    """
-    rng = np.random.default_rng(0)
-    U = rng.uniform(0.5, 3.0, size=6)
-    beta = 1.0
-    T = _build_gibbs_transition_matrix(U, beta)
-    pi = np.exp(-beta * U)
-    pi /= pi.sum()
-    residual = np.max(np.abs(pi @ T - pi))
-    assert residual < 1e-12, f"stationary-distribution residual = {residual:.2e} (should be < 1e-12)"
-
-
-def test_gibbs_walk_detailed_balance():
-    """
-    Heat-bath satisfies detailed balance: π_i · T_ij = π_j · T_ji for all i,j.
-    """
-    rng = np.random.default_rng(1)
-    U = rng.uniform(0.5, 3.0, size=5)
-    beta = 1.0
-    T = _build_gibbs_transition_matrix(U, beta)
-    pi = np.exp(-beta * U); pi /= pi.sum()
-    violations = np.max(np.abs(pi[:, None] * T - pi[None, :] * T.T))
-    assert violations < 1e-12, f"detailed balance violated: {violations:.2e}"
-
-
-def test_gibbs_walk_old_clip_was_wrong():
-    """
-    Regression: the OLD upper-clip (a_max=0.0) produces a WRONG stationary
-    distribution.  Confirms the bug was real, not a false positive.
-    """
-    def _old_kernel(U, beta):
-        K = len(U)
-        T = np.zeros((K, K))
-        for i in range(K):
-            delta = U - U[i]
-            log_w = np.clip(-beta * delta, -745.0, 0.0)  # OLD: wrong upper bound
-            log_w -= np.max(log_w)
-            w = np.exp(log_w); T[i] = w / w.sum()
-        return T
-
-    U = np.array([1.0, 2.0, 3.0, 0.5])
-    beta = 1.0
-    T_old = _old_kernel(U, beta)
-    pi = np.exp(-beta * U); pi /= pi.sum()
-    residual_old = np.max(np.abs(pi @ T_old - pi))
-    assert residual_old > 1e-3, (
-        f"old kernel unexpectedly satisfies detailed balance ({residual_old:.2e}); "
-        "test is not discriminating"
-    )
-
-
-def test_gibbs_walk_favourable_swaps_get_higher_weight():
-    """
-    For Δ < 0 (favourable swap), the fixed kernel assigns weight > 1 in log space.
-    The old kernel clipped these to 0, giving them the same weight as staying.
-    """
-    beta = 1.0
-    U = np.array([2.0, 0.5])   # window 0 at high energy, window 1 at low energy
-    delta = U[1] - U[0]        # = -1.5 < 0 (swap from 0→1 is favourable)
-
-    # fixed
-    lw_fixed = float(np.clip(-beta * delta, -745.0, None))
-    # old
-    lw_old   = float(np.clip(-beta * delta, -745.0, 0.0))
-
-    assert lw_fixed > 0.0, "fixed kernel: favourable swap should have log_weight > 0"
-    assert lw_old == 0.0,  "old kernel: favourable swap was incorrectly clamped to 0"
 
 
 # ---------------------------------------------------------------------------

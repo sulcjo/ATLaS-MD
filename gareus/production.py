@@ -23,7 +23,7 @@ import os
 import shutil
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 import numpy as np
 
@@ -805,6 +805,80 @@ def _exchange_probability(delta_kj: float, beta: float) -> float:
     if x < -745.0:
         return 0.0
     return float(math.exp(x))
+
+
+class SwapOutcome(NamedTuple):
+    """What one attempted window swap did. Returned by :func:`apply_window_swap`."""
+    replica_i: int
+    replica_j: int
+    delta_kj: float
+    pacc: float
+    accepted: bool
+
+
+def apply_window_swap(
+    bias_matrix_kj,
+    beta: float,
+    assignments,
+    replica_of_window,
+    wi: int,
+    wj: int,
+    uniform: Optional[float],
+    *,
+    p_override: Optional[float] = None,
+    force_accept: bool = False,
+) -> "Optional[SwapOutcome]":
+    """Decide and apply one umbrella-window swap; the pure core of the REUS move.
+
+    Extracted from ``run_gareus``'s closure so the exchange kernel can be driven
+    from a test against a known target distribution. Everything here is pure
+    NumPy/arithmetic: ``assignments`` and ``replica_of_window`` are mutated in
+    place exactly as production does, and the caller applies the side effects
+    (``set_window`` on the two contexts, the Parquet journal entry) from the
+    returned outcome.
+
+    Returns ``None`` when there is nothing to attempt -- same window, either
+    window unheld, or both held by the same replica -- so the caller can leave
+    its attempt counter alone.
+
+    The move swaps *state labels*, never configurations, which is why the
+    unbiased potential and the GaMD boost cancel exactly from ``delta`` and only
+    the umbrella biases appear: ``x_i`` and ``x_j`` are untouched, so
+    ``U0(x_i)+U0(x_j)`` and ``dV(x_i)+dV(x_j)`` are identical before and after.
+
+    ``uniform`` is the already-drawn ``rng.random()``. It is a parameter rather
+    than an rng handle so that the kernel is deterministic under test, and so
+    the caller can preserve production's short-circuit: ``force_accept`` must
+    not consume a random number, or every downstream RNG stream shifts.
+    """
+    wi = int(wi)
+    wj = int(wj)
+    if wi == wj:
+        return None
+    n_win = int(replica_of_window.size)
+    if not (0 <= wi < n_win and 0 <= wj < n_win):
+        return None
+    i = int(replica_of_window[wi])
+    j = int(replica_of_window[wj])
+    if i < 0 or j < 0 or i == j:
+        return None
+    # bias_matrix_kj[window, replica] = U_window(x_replica)
+    old_e = float(bias_matrix_kj[wi, i] + bias_matrix_kj[wj, j])
+    new_e = float(bias_matrix_kj[wj, i] + bias_matrix_kj[wi, j])
+    delta = float(new_e - old_e)
+    pacc = float(p_override) if p_override is not None else _exchange_probability(delta, beta)
+    pacc = max(0.0, min(1.0, pacc)) if math.isfinite(pacc) else 0.0
+    if force_accept:
+        accepted = True
+    else:
+        accepted = bool(float(uniform) < pacc) if uniform is not None else False
+    if accepted:
+        assignments[i], assignments[j] = assignments[j], assignments[i]
+        replica_of_window[int(assignments[i])] = int(i)
+        replica_of_window[int(assignments[j])] = int(j)
+    return SwapOutcome(i, j, delta, pacc, accepted)
+
+
 
 
 def load_resume_run_definition(out_dir: Path, topology, args, manifest: Optional[dict] = None) -> dict:
@@ -6197,22 +6271,20 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             wj = int(wj)
             if wi == wj:
                 return attempt
-            i = _replica_holding_window(wi)
-            j = _replica_holding_window(wj)
-            if i is None or j is None or i == j:
+            # Decision + bookkeeping live in the module-level kernel so a test can
+            # drive them; the side effects below stay here. `force_accept` must not
+            # consume a random number -- production short-circuited `rng.random()`
+            # away, and drawing one anyway would shift every later RNG stream.
+            outcome = apply_window_swap(
+                bias_matrix_kj, beta, assignments, replica_of_window, wi, wj,
+                None if force_accept else rng.random(),
+                p_override=p_override, force_accept=force_accept,
+            )
+            if outcome is None:
                 return attempt
-            # bias_matrix_kj[window, replica] = U_window(x_replica)
-            old_e = float(bias_matrix_kj[wi, i] + bias_matrix_kj[wj, j])
-            new_e = float(bias_matrix_kj[wj, i] + bias_matrix_kj[wi, j])
-            delta = float(new_e - old_e)
-            pacc = float(p_override) if p_override is not None else _exchange_probability(delta, beta)
-            pacc = max(0.0, min(1.0, pacc)) if math.isfinite(pacc) else 0.0
-            accepted = bool(force_accept) or (rng.random() < pacc)
-            _record_exchange_stats(wi, wj, accepted)
-            if accepted:
-                assignments[i], assignments[j] = assignments[j], assignments[i]
-                replica_of_window[int(assignments[i])] = int(i)
-                replica_of_window[int(assignments[j])] = int(j)
+            i, j = outcome.replica_i, outcome.replica_j
+            _record_exchange_stats(wi, wj, outcome.accepted)
+            if outcome.accepted:
                 set_window(sims[i].context, centers_nm, ks_kj_nm2, assignments[i], secondary_cv_centers, secondary_cv_ks_kj)
                 set_window(sims[j].context, centers_nm, ks_kj_nm2, assignments[j], secondary_cv_centers, secondary_cv_ks_kj)
             parquet_exchange_writer.write_exchange(
@@ -6221,8 +6293,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 replica_j=int(j),
                 window_i=int(wi),
                 window_j=int(wj),
-                delta_e=float(delta),
-                accepted=bool(accepted),
+                delta_e=float(outcome.delta_kj),
+                accepted=bool(outcome.accepted),
             )
             return attempt + 1
 
