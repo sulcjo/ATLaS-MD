@@ -53,9 +53,32 @@ every mid-run Hamiltonian change.
 (`production.py:6403-6404` calls `set_window`, which touches OpenMM global context parameters and
 nothing else — no `setPositions`, no velocity rescaling). Because configurations never move between
 contexts, `U₀(x_i)+U₀(x_j)` and `ΔV(x_i)+ΔV(x_j)` appear identically on both sides of the acceptance
-ratio and cancel **exactly** — true even if the boost were per-replica. The provenance note at `:5772`
-("shared GaMD terms cancel") reaches the right conclusion by the wrong route: the shared envelope is
-not what makes exchange valid. It matters for MBAR state well-posedness, a different claim.
+ratio and cancel **exactly**, leaving
+
+```
+Δ = β[ u_wj(x_i) + u_wi(x_j) − u_wi(x_i) − u_wj(x_j) ]
+```
+
+Kinetic terms cancel (momenta unchanged, same T and masses) and so do the NPT `pV` and
+volume-measure terms (the volume is unchanged and p, T are the same for every replica).
+
+**Two conditions this rests on, stated precisely** — an earlier phrasing here said the cancellation
+holds "even if the boost were per-replica", which is true but ambiguous in the way that matters:
+
+1. The boost must be keyed to the **coordinate slot**, not to the state label. In this driver each
+   replica owns its own `Simulation`, context and GaMD integrator, and a swap moves neither
+   coordinates nor integrators — so `ΔV(x_i)` is computed by the same integrator on the same
+   coordinates before and after, and cancels. A hypothetical *per-window-label* boost would **not**
+   cancel, and the acceptance ratio would need the ΔV terms written out explicitly.
+2. The boost must not read the umbrella force group. If it did, changing the label would change the
+   boosted energy and the cancellation would fail. This holds for the default and for this run's
+   `lower-dihedral` (group 2 = `PeriodicTorsionForce`/`CMAPTorsionForce`, while both restraints are
+   `CustomCVForce` in unboosted group 0), and **fails for 4 of the 11 selectable boost types** — see
+   defect 3.
+
+The provenance note at `:5772` ("shared GaMD terms cancel") reaches the right conclusion by the wrong
+route: the shared envelope is not what makes exchange valid. It matters for MBAR state
+well-posedness, a different claim.
 
 **The cancellation premise is proven from the installed integrator**, not inferred.
 `gamd/stage_integrator.py:748-769` dispatches on `BoostMethod`: `GROUPS` builds ΔV from
@@ -133,6 +156,13 @@ infinite at `a = 0.377`, so it is not a measurement — it is one draw from a di
 finite spread. Worst-bin exponential-average ESS is **0.0001%** of that bin's samples. The parametric
 column is a sensitivity analysis, not a bound: two moments fix CE2 but do not constrain the higher
 cumulants, and distributions sharing two moments can have arbitrarily different `ln⟨e^X⟩`.
+
+The fitted family is a good description of the real data — on `epoch_000`
+(a = 0.388, λ = 18.3) it predicts skew 0.685 against a measured 0.647 and excess kurtosis 0.629
+against 0.533. **That does not make the parametric column conservative**, though it is tempting to
+read it that way: the MGF weights the tail exponentially, so a distribution with a lighter-looking
+bulk and smaller third and fourth cumulants can still have a *larger* `ln⟨e^X⟩` deficit. Matching two
+moments, or even four, bounds nothing here.
 
 > This is demonstrated rather than argued, on synthetic data where the answer is known
 > (`tests/test_gamd_reweighting_feasibility_math.py`). Drawing 2M samples from an *exact* noncentral
