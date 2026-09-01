@@ -33,31 +33,60 @@ is perfectly pi-invariant -- see the irreducibility test at the end), nothing
 about whether the bias matrix handed to the kernel is itself right, and nothing
 about sample labelling.
 
-Mutation battery, re-run 2026-09-01 after the gibbs kernel was rewritten to
-drive production instead of mirroring it. Each mutation applied to the shipped
-file, tests run, file restored. Counts are over the 16 tests in this file plus
+Mutation battery. Each mutation applied to the shipped file, tests run, file
+restored. Counts are over the 20 tests in this file plus
 `tests/test_sample_before_exchange_ordering.py`.
 
-    CAUGHT  force_accept in place of the pair-swap MH test        5 failed
-    CAUGHT  beta doubled in the Metropolis probability            5 failed
-    CAUGHT  old_e / new_e swapped                                 6 failed
-    CAUGHT  replica_of_window update omitted                      8 failed
-    CAUGHT  gibbs reverse proposal vs PRE-swap holders            4 failed
-    CAUGHT  gibbs q_forward / q_reverse swapped                   4 failed
-    CAUGHT  gibbs call site force_accept instead of p_override    1 failed
-    passes  only one window pair ever offered                     by design
+HARMFUL mutations -- all caught:
 
-The last is a control, not a miss. Invariance is a per-move property, so it is
-blind to *which* moves are offered -- restricting the pair list cannot break it.
-Ergodicity is what that would break, and the irreducibility test at the end is
-what guards it.
+    force_accept in place of the pair-swap MH test              5 failed
+    beta doubled in the Metropolis probability                  5 failed
+    old_e / new_e swapped                                       6 failed
+    replica_of_window update omitted                            8 failed
+    gibbs reverse proposal against PRE-swap holders             4 failed
+    gibbs q_forward / q_reverse swapped                         4 failed
+    gibbs call site force_accept instead of p_override          1 failed
+    holders_after missing `holders_after[wi] = target_rep`      4 failed
+    q_forward/q_reverse swapped in the returned GibbsProposal   5 failed
 
-Two of these previously passed. The gibbs mutations (reverse-proposal holders,
-q swap) passed because this file used to re-implement the proposal sequence
-inline: the test was self-consistent and production-blind. The call-site
-force_accept mutation passes even now against this file alone -- the numeric
-kernel cannot see a substitution made *between* the two functions it drives --
-and is caught by an AST pin in the ordering test file instead.
+HARMLESS mutations -- these SHOULD pass, and do. Each was checked to be
+semantically inert rather than assumed to be:
+
+    only one window pair ever offered
+        Invariance is a per-move property, blind to which moves are offered.
+        Restricting the pair list breaks ergodicity, which the irreducibility
+        test guards, not balance.
+    the two replica_of_window writes reordered
+        They target `assignments[i]` and `assignments[j]`, which differ whenever
+        the swap is attempted at all, so the writes are independent.
+    the `pacc = max(0, min(1, pacc))` clamp removed
+        Provably unreachable: both producers of pacc are bounded to [0,1] and
+        finite on every path -- `_exchange_probability` returns 0.0 for
+        non-finite input, 1.0 for delta <= 0, else exp(x) with x < 0; and
+        `_gibbs_mh_acceptance_probability` likewise. The clamp is defensive
+        redundancy, and no production caller supplies p_override from elsewhere.
+    gibbs iterating `order[:-1]` instead of `order`
+        `order` is reshuffled every sweep, so this drops a uniformly random
+        replica. Every remaining move is still a valid MH move (balance holds),
+        and each replica is still attempted with probability (n-1)/n per sweep
+        (ergodicity holds). An efficiency change, not a correctness one.
+
+One mutation was caught that SHOULD NOT have been, and the test was loosened
+rather than left over-sensitive:
+
+    `uniform < pacc` -> `uniform <= pacc`     was 4 failed, now passes
+        Measure-zero for a real draw: rng.random() returns [0,1) and so never
+        equals a pacc of 1.0. The old probe passed exactly 1.0 to read pacc
+        without accepting, which made it sensitive to the boundary convention.
+        It now passes 1.5, which can never be accepted under either comparison.
+        Reporting a physically irrelevant edit as a correctness break would
+        overstate what this battery proves.
+
+Historical note: the gibbs mutations above previously PASSED, because this file
+re-implemented the proposal sequence inline -- self-consistent and
+production-blind. The call-site force_accept mutation still passes against this
+file alone (the numeric kernel cannot see a substitution made between the two
+functions it drives) and is caught by an AST pin in the ordering test file.
 
 """
 from __future__ import annotations
@@ -115,10 +144,17 @@ def _pair_kernel(states, bias, wi, wj, beta=BETA) -> np.ndarray:
     index = {s: i for i, s in enumerate(states)}
     P = np.zeros((len(states), len(states)))
     for a, s in enumerate(states):
-        # uniform=1.0 can never satisfy `uniform < pacc` (pacc <= 1), so this
-        # reads pacc out of the real kernel without mutating anything.
+        # A uniform strictly ABOVE 1 can never be accepted, whether the kernel
+        # tests `uniform < pacc` or `uniform <= pacc`, so this reads pacc out of
+        # the real kernel without mutating anything.
+        #
+        # It used to probe with exactly 1.0, which made the test fail if `<` were
+        # changed to `<=` -- a difference that is measure-zero for a real
+        # rng.random() draw (which returns [0,1) and so never equals a pacc of
+        # 1.0 anyway). That was an over-constraint: the test would have reported
+        # a physically irrelevant edit as a correctness break.
         asg, row = _arrays(s)
-        peek = apply_window_swap(bias, beta, asg, row, wi, wj, 1.0)
+        peek = apply_window_swap(bias, beta, asg, row, wi, wj, 1.5)
         assert peek is not None and not peek.accepted
         assert tuple(asg) == s, "a rejected swap must not mutate the assignment"
         pacc = peek.pacc
@@ -281,7 +317,7 @@ def test_the_reported_acceptance_matches_metropolis_by_hand():
     n = 3
     bias = _bias(n)
     asg, row = _arrays((0, 1, 2))
-    out = apply_window_swap(bias, BETA, asg, row, 0, 1, 1.0)
+    out = apply_window_swap(bias, BETA, asg, row, 0, 1, 1.5)   # >1: never accepted
     delta = (bias[1, 0] + bias[0, 1]) - (bias[0, 0] + bias[1, 1])
     assert out.delta_kj == pytest.approx(delta, rel=1e-12)
     assert out.pacc == pytest.approx(min(1.0, math.exp(-BETA * delta)), rel=1e-12)
