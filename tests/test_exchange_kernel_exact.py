@@ -68,6 +68,7 @@ import math
 import numpy as np
 import pytest
 
+import gareus.production as production
 from gareus.production import (
     apply_window_swap,
     gibbs_propose_one_replica,
@@ -306,3 +307,133 @@ def test_force_accept_does_not_consume_a_random_number():
     out = apply_window_swap(bias, BETA, asg, row, 0, 1, None, force_accept=True)
     assert out is not None and out.accepted
     assert tuple(asg) == (1, 0, 2)
+
+
+class _CountingChoice:
+    """Records how many times the gibbs proposal asked for a random draw."""
+
+    def __init__(self, index: int = 0):
+        self.calls = 0
+        self.index = index
+
+    def __call__(self, k, probs):
+        self.calls += 1
+        return min(int(self.index), int(k) - 1)
+
+
+def _proposal_with_counted_draws(bias, state, rep, index=0):
+    asg, row = _arrays(state)
+    ch = _CountingChoice(index)
+    prop = gibbs_propose_one_replica(bias, BETA, asg, row, rep, ch)
+    return prop, ch.calls
+
+
+def test_the_gibbs_proposal_consumes_exactly_one_draw_and_only_when_it_can_choose():
+    """Draw accounting, pinned per branch.
+
+    Extracting a decision out of a closure is exactly where an RNG stream gets
+    shifted: one extra or one missing draw desynchronises every later decision
+    in the run, and NOTHING else in this file would notice -- the transition
+    matrices are built from scripted choices, and the mutation battery and the
+    full suite both pass regardless of draw count.
+
+    This is not hypothetical. The sibling extraction in this same refactor
+    (`apply_window_swap`) shipped a first version that drew a uniform on the
+    un-attemptable path where the original closure had returned early. It was
+    caught by counting, not by reading.
+
+    Production called `rng.choice` once, after the empty-candidate guard. So:
+    0 draws when there are no candidates, exactly 1 otherwise -- whether the
+    proposal lands on the current window (a "stay") or on a different one.
+    """
+    n = 4
+    bias = _bias(n)
+    state = (0, 1, 2, 3)
+
+    # a real proposal: exactly one draw, whichever candidate is selected
+    for index in range(n):
+        prop, calls = _proposal_with_counted_draws(bias, state, rep=1, index=index)
+        assert calls == 1, (
+            f"candidate {index} consumed {calls} draws, not 1 -- the RNG stream "
+            "has shifted relative to the closure this was extracted from"
+        )
+        assert not prop.no_candidates
+
+    # the stay branch must not consume a second draw on its early return
+    stays = [
+        _proposal_with_counted_draws(bias, state, rep=r, index=i)
+        for r in range(n) for i in range(n)
+    ]
+    assert any(p.stayed for p, _ in stays), "no candidate set offered the current window"
+    for p, calls in stays:
+        assert calls == 1, f"stayed={p.stayed} consumed {calls} draws, not 1"
+
+
+def test_the_gibbs_proposal_consumes_no_draw_when_there_are_no_candidates():
+    """The no-candidate short-circuit must return before asking for randomness.
+
+    Production's `if valid_windows.size <= 0 ... continue` fired before
+    `rng.choice`, so this path must cost zero draws.
+
+    Reaching it took some finding, and the finding is worth recording: **an
+    all-NaN bias matrix does NOT empty the candidate list.** The proposal forces
+    the stay candidate's delta to exactly 0.0 (`delta[stay_idx] = 0.0`) before
+    the finite-mask is applied, so as long as the replica holds a window there is
+    always at least one finite candidate. The list empties only when NO window
+    has a holder at all.
+
+    That matters beyond this test: the `gibbs_all_nan_skips` counter cannot be
+    incremented by NaN bias values, despite its name. A non-zero value there
+    would mean an empty holder table, not a NaN CV.
+    """
+    n = 3
+    bias = _bias(n)
+    asg = np.array([0, 1, 2], dtype=np.int64)
+    row = np.full(n, -1, dtype=np.int64)      # no window has a holder
+    ch = _CountingChoice()
+    prop = gibbs_propose_one_replica(bias, BETA, asg, row, 0, ch)
+    assert prop.no_candidates, "an unheld window table should offer no candidates"
+    assert ch.calls == 0, (
+        f"consumed {ch.calls} draws on the no-candidate path; production returned "
+        "before drawing, so every later decision in the run would shift"
+    )
+
+
+def test_an_all_nan_bias_row_still_offers_the_stay_candidate():
+    """Pins the surprise above, because a future change could quietly alter it.
+
+    If the stay candidate ever stopped being force-zeroed, an all-NaN row would
+    start emptying the candidate list, `gibbs-walk` would begin skipping
+    replicas, and the only visible symptom would be a counter whose name already
+    suggests the wrong cause.
+    """
+    n = 3
+    prop, calls = _proposal_with_counted_draws(np.full((n, n), np.nan), (0, 1, 2), rep=0)
+    assert not prop.no_candidates
+    assert prop.stayed, "the only finite candidate should be the current window"
+    assert calls == 1
+
+
+def test_apply_window_swap_draws_nothing_on_a_swap_it_cannot_attempt():
+    """The sibling property, for the extraction that actually got this wrong.
+
+    `swap_candidate_replicas` is checked BEFORE the uniform is drawn, so the
+    caller's `None if force_accept else rng.random()` is never evaluated for an
+    un-attemptable pair -- matching the original closure, which returned early.
+    """
+    n = 3
+    bias = _bias(n)
+    asg, row = _arrays((0, 1, 2))
+
+    drawn = []
+
+    def _rng_random():
+        drawn.append(1)
+        return 0.5
+
+    # same-window, out-of-range, and unheld-window: all must short-circuit
+    for wi, wj in ((1, 1), (0, 99)):
+        if production.swap_candidate_replicas(row, wi, wj) is None:
+            continue
+        apply_window_swap(bias, BETA, asg, row, wi, wj, _rng_random())
+    assert not drawn, "a uniform was consumed for a swap that cannot be attempted"

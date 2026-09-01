@@ -129,8 +129,21 @@ For this distribution family the cumulants are exactly `κₙ = aⁿ·2ⁿ⁻¹�
 terms `κₙ/n!` shrink by a ratio tending to **2a = 0.754**. Summing the geometric tail turns the
 measured third-order term into an estimate of *everything* CE2 discards:
 
-> **≈ 0.95 kcal/mol of CV-dependent distortion**, against a 1 kcal/mol bar. Inside it — but only
-> just, either way.
+> **≈ 0.95 kcal/mol of CV-dependent distortion**, against a 1 kcal/mol bar.
+
+**Two caveats on that number, because it is load-bearing for the reversal above.**
+
+*The geometric sum assumes the ratio 2a governs the CV-bin **spread**, not just the magnitude of
+`κₙ/n!`.* The only direct evidence on that assumption contradicts it: the measured CE2→CE3 spread is
+0.23 and CE3→CE4 is 0.38, a ratio of ~1.65, not 0.754. The most likely explanation is that
+fourth-moment estimates per bin are noise-dominated, but that is a hypothesis and the data do not
+settle it. **The defensible floor is the directly measured third-order term, 0.23 kcal/mol**; 0.95 is
+an extrapolation, and if the spread ratio really exceeds 1 the tail is not estimable from these
+moments at all.
+
+*The 1 kcal/mol bar is a chosen convention*, not a derived threshold — it is the accuracy target for
+this kind of PMF work, stated as such. After criticising the earlier draft for inventing a βσ ≲ 1
+criterion, it would be inconsistent to let a second unsourced number read as though it were derived.
 
 That the series converges iff `a < 0.5` — the same bound as a finite `E[w]` — is not a coincidence:
 the cumulant series **is** the log-MGF at `t = 1`. The exponential estimator and CE2 are not
@@ -358,6 +371,25 @@ more than ~2% from −1. **Which specific pairs reject changes with the head** (
 4000; w16-w24 and w30-w31 at 8000), which is itself evidence that the per-pair rejections are
 autocorrelation artefacts rather than localised defects.
 
+### The under-resolved `g` cuts *in favour* of the null, not against it
+
+Worth stating plainly, because "every interval is a lower bound" reads as a hedge and here it is the
+opposite.
+
+`g` is under-resolved by roughly ×4 per head doubling. An under-resolved `g` means n_eff is
+overstated, so the standard errors are too **narrow**, so the test rejects the null too **often**.
+Passing under too-narrow errors is therefore a *stronger* result than passing under correct ones —
+the analysis is handicapped against itself and the null survives anyway.
+
+The two-head comparison demonstrates it directly rather than by argument: better `g` → wider SEs →
+z fell from +1.77 to +0.65 on CV2, and rejections went 26/28 → 27/28. Every step toward a more honest
+autocorrelation estimate moved the result *toward* consistency with −1.
+
+**One caveat that keeps this from being a clean a fortiori.** The point estimate moved too
+(−0.980 → −0.992), not just the interval, so this is not purely an SE effect — better thinning also
+changed which frames enter the fit. The direction of travel is still favourable, but it is evidence,
+not a proof by monotonicity.
+
 **The `|z| > 6` gate was invented and far too lax.** At 28 simultaneous tests the 5% family-wise
 Bonferroni critical value is |z| = 3.12, not 6. Under the original head-4000 configuration the honest
 count is **26/28**, exactly as the verifier found, and it names the same two pairs.
@@ -402,9 +434,10 @@ That systematic appears in none of the intervals above and is larger than all of
 > parameter join is verified for this phase. The C1 boost-cancellation premise holds by construction
 > (`lower-dihedral` boosts only `PeriodicTorsionForce`/`CMAPTorsionForce`; both restraints are
 > `CustomCVForce` in unboosted group 0) and the recorded ΔV does not contradict it. The test resolves
-> a mis-scaling of recorded k or β of about **1.7%** at best, and every interval is a lower bound: at
-> g ≈ 255 frames the 19.5 ns trace holds ~190 independent samples per window against a folding time
-> orders of magnitude longer.
+> a mis-scaling of recorded k or β of about **2.4%** at best — 2σ against the random-effects SE of
+> ~0.012 this analysis actually defends — and every interval is a lower bound: at g ≈ 255 frames the
+> 19.5 ns trace holds ~190 independent samples per window against a folding time orders of magnitude
+> longer.
 
 Not "the sampler passes within 1.8% of the exact null."
 
@@ -463,7 +496,14 @@ Ordered by how much they could hurt.
    different bias rows — `_current_exchange_arrays` (`:6462-6464`) lacks the `np.isfinite` mask `sample()`
    applies at `:6115` — so `q_forward` and `q_reverse` can be normalised over different candidate sets,
    breaking the MH correction. The other three modes fail closed and merely freeze; the one in
-   production is the one that biases. A `gibbs_all_nan_skips` counter exists, implying NaNs occur.
+   production is the one that biases. **Correction to an earlier draft of this list:** I cited the
+   `gibbs_all_nan_skips` counter as evidence that NaNs occur. That inference is wrong — the proposal
+   forces the stay candidate's delta to exactly 0.0 before the finite-mask is applied, so as long as
+   the replica holds a window there is always one finite candidate and an all-NaN bias row can never
+   empty the list. That counter fires only on an entirely unheld window table, which is a different
+   condition. The defect itself is unaffected: a NaN removes *other* candidates from the forward and
+   reverse sets asymmetrically, which is what breaks the MH correction. Both facts are now pinned by
+   tests.
 3. **Four C1-unsafe boost types are selectable with no guard**, and
    `examples/chignolin_2d_distance_with_genpept.yaml:136` still sets `gamd_boost_type: lower-dual`.
 4. **`gibbs_move_fraction` counts proposals, not accepted moves** (`gibbs_moves` incremented at
@@ -511,7 +551,7 @@ and reads the live `assignments` array, pinned structurally against six mutation
 23/24 pairs on the contact CV and 27/28 on the secondary at 5% family-wise error, random-effects
 pooled slopes of −1.015 ± 0.012 and −0.992 ± 0.012 against an exact null of −1. The two axes
 disagree by ~0.02–0.04 in slope — suggestive of a non-global effect, since a temperature error is one
-scalar — but its significance is head-dependent (z between −1.35 and −2.18) and is not established. Every interval is a lower bound, and a time-stratification systematic 1.7–2.4× larger
+scalar — but its significance is head-dependent (z between −1.35 and −2.18) and is not established. Every interval is a lower bound, and a time-stratification systematic 2.7–3.6× larger
 than the quoted errors sits underneath all of them.
 
 **Not yet proven.** That the within-state dynamics under a *live GaMD boost* sample the biased

@@ -52,10 +52,11 @@ pooled "effective temperature" number can express.
 POOLING
 -------
 Fixed-effect inverse-variance pooling assumes every pair estimates the same
-slope. Cochran's Q tests that, and on real data it is rejected at p ~ 1e-07
-(I^2 ~ 67%), so the fixed-effect interval is invalid however the per-pair SEs
-were computed. DerSimonian-Laird random effects is reported as the headline and
-the fixed-effect number is shown only for comparison.
+slope. Cochran's Q tests that, and on real data it is rejected on both axes --
+p ~ 2e-03, I^2 ~ 50% at the shipped 8000-frame detection head, and p ~ 1e-06,
+I^2 ~ 67% at a 4000-frame head -- so the fixed-effect interval is invalid however
+the per-pair SEs were computed. DerSimonian-Laird random effects is reported as
+the headline and the fixed-effect number is shown only for comparison.
 
 An earlier version instead widened the fixed-effect CI by the observed
 instability in `g`. That reasoning was wrong twice over: the true full-trace g
@@ -67,7 +68,12 @@ Heterogeneity, not autocorrelation, is what invalidates the pooling.
 Detects: applied k or centre differing from the recorded one (slope scales as
 k_applied/k_recorded); a wrong temperature (slope scales as beta_app/beta_rec);
 windows that never equilibrated; and a boost type whose dV does not cancel.
-Measured power on real data: ~1.7% on a mis-scaling of recorded k or beta.
+
+Measured power on real data: with the random-effects SEs this script actually
+reports (~0.012), 2-sigma detection needs |slope + 1| > ~0.024, i.e. it resolves
+a mis-scaling of recorded k or beta of about 2.4% and no better. (A ~1.7% figure
+derived from a tighter SE is quoted in some notes; it corresponds to a narrower
+interval than this script defends.)
 
 Blind to: GaMD *reweighting* error, MBAR solver error, Jacobian handling, and
 any non-Boltzmann behaviour in coordinates orthogonal to (cv1, cv2). It is a
