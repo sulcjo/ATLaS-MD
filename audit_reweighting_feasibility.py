@@ -71,13 +71,36 @@ EXP_MEAN_FINITE_A = 0.50
 CE2_SPREAD_BAR_KCAL = 1.0
 
 
+RETIRED_MARKERS = ("_CRASHED", "_archived", "_old", "_bak", "_backup")
+
+
+def _is_retired(rel: str) -> bool:
+    """A phase directory that has been set aside and must not be pooled.
+
+    Matches a leading underscore on any path component, or a retirement marker
+    anywhere in it. Deliberately name-based: the alternative is to rely on where
+    someone happened to put the directory, which is luck rather than a rule.
+
+    Concretely, an archive nested one level deeper than a phase
+    (`adaptive_production/_archived_final_.../final/baseline/samples`) is already
+    invisible to the globs below, but an IN-PLACE archive
+    (`adaptive_production/final_old/baseline/samples`) sits exactly where a live
+    phase sits and would be pooled silently -- adding a dead run's samples to a
+    feasibility statistic with no message. That is the failure mode this whole
+    audit exists to catch, so it should not depend on directory depth.
+    """
+    return any(part.startswith("_") or any(m in part for m in RETIRED_MARKERS)
+               for part in rel.replace(os.sep, "/").split("/"))
+
+
 def _phase_dirs(run_dir: str) -> list[str]:
-    """Every phase with both samples and its own window map, crashed ones excluded.
+    """Every phase with both samples and its own window map, retired ones excluded.
 
     A phase the driver abandoned is renamed with a ``_CRASHED_<date>`` suffix and
     a fresh one takes its place. Its samples are a partial, aborted segment and
     do not belong in a feasibility statistic -- on the run this was written
-    against the crashed remnant held 72 rows against 1.7M in its replacement.
+    against, the crashed remnant held 72 rows against 1.7M in its replacement.
+    Hand-archived phases are excluded on the same grounds.
     """
     out, skipped = [], []
     for pat in ("*/samples", "*/*/samples"):
@@ -85,7 +108,8 @@ def _phase_dirs(run_dir: str) -> list[str]:
             d = os.path.dirname(p)
             if not os.path.isfile(os.path.join(d, "epoch_window_map.csv")):
                 continue
-            if "_CRASHED" in d:
+            rel = os.path.relpath(d, os.path.join(run_dir, "adaptive_production"))
+            if _is_retired(rel):
                 skipped.append(os.path.relpath(d, run_dir))
                 continue
             out.append(d)
