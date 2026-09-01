@@ -5699,6 +5699,29 @@ def run_scheduled_adaptive_epoch(
         print(f"      scheduled segment {name}: {len(state_ids)} state(s), {actual_steps} steps")
         run_gareus_callable(seg_args, seg_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
         if _graceful_shutdown.is_set():
+            # Charge the pool for what actually ran before returning. Returning
+            # straight out left an interrupted segment's MD unbooked, so the
+            # ledger reported budget that had already been spent and a resumed
+            # campaign would allocate against a figure that is too large.
+            # Observed on RUNS/chignolin_6: an interrupted final burned ~376 ns
+            # while the pool still claimed 8999 of 10000 ns remaining and carried
+            # no `final` event at all.
+            #
+            # Prefer the checkpoint's own progress over the planned delta; fall
+            # back to the planned delta when no checkpoint was written, which
+            # over-charges rather than under-charges -- the safe direction for a
+            # budget, since under-charging is the defect being fixed.
+            _int_done = int(_segment_checkpoint_prod_done(seg_dir) or 0)
+            _int_ran = max(0, _int_done - _prior_prod_done) if _int_done else int(_delta_steps)
+            _int_event = None
+            if runtime_pool is not None and _int_ran > 0:
+                _int_event = runtime_pool.consume(
+                    label=f"{epoch_dir.name}/{name}",
+                    kind="scheduled_final" if "final" in str(epoch_dir) else "scheduled_epoch",
+                    n_states=len(state_ids),
+                    steps=int(_int_ran),
+                    path=seg_dir,
+                )
             segment_summaries.append({
                 "segment": name,
                 "dir": str(seg_dir),
@@ -5707,6 +5730,7 @@ def run_scheduled_adaptive_epoch(
                 "steps": int(actual_steps),
                 "requested_steps": int(requested_steps),
                 "interrupted_after_checkpoint": True,
+                "runtime_pool_event": _int_event or {},
                 "seed_bank": seed_report or {},
             })
             return seg_dir
@@ -6778,6 +6802,26 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                 pool_reserve_ns=0.0,
             )
             final_scheduled_summary = result.get("summary", {})
+            # The scheduled final was the only one of the three phase-running
+            # sites that ignored this. The epoch loop and the non-scheduled final
+            # both return here; without it a campaign cut short mid-final fell
+            # through the quality gate and the union-MBAR build to the
+            # unconditional "completed" at the end of this function. On
+            # RUNS/chignolin_6 that reported a completed campaign for a final
+            # phase that had run 17% of its schedule and left one state with zero
+            # samples, while the quality gate underneath said needs_more_sampling.
+            if _graceful_shutdown.is_set():
+                _write_runtime_pool_reports(adaptive_dir, runtime_pool)
+                payload = {
+                    "schema_version": "adaptive_production_driver_summary_v1",
+                    "status": "interrupted_after_checkpoint",
+                    "interrupted_segment": str(final_dir),
+                    "epochs_completed": int(len(epoch_summaries)),
+                    "epoch_summaries": _json_ready(epoch_summaries),
+                    "scheduled_final": _json_ready(final_scheduled_summary),
+                }
+                write_json(summary_path, payload)
+                return payload
             if bool(policy.propagate_seed_bank):
                 seg_dirs = [Path(s.get("dir")) for s in final_scheduled_summary.get("segments", []) if s.get("dir")]
                 final_seed_bank = write_seed_bank_from_run_dirs(
