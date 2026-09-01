@@ -30,8 +30,20 @@ Lumping them, as an earlier version of this script did, gets both wrong.
     combined), labelled OK/WARN/BAD at 0.5/1.0.
 
     And because a PMF is defined only up to a constant, a truncation error that
-    is uniform across the CV does not matter. The reportable quantity is the
-    *spread across CV bins* of the neglected third-order term, in kcal/mol.
+    is uniform across the CV does not matter -- the reportable quantity is the
+    *spread across CV bins*, which is what changes a PMF's shape.
+
+    That spread is reported by three estimators which are allowed to disagree,
+    because on a wide boost they do: the measured third-order term (a floor, not
+    the tail), a closed-form value for the fitted noncentral chi-square (exact
+    for that family only -- two moments do not constrain the higher cumulants),
+    and the model-free empirical average. The empirical one needs the very
+    exp(+beta*dV) average whose variance is infinite once a > 0.25, so when that
+    holds the verdict is NOT RESOLVED rather than any single number.
+
+    An earlier version summed a geometric tail at ratio 2a from the third-order
+    term. That is wrong: 2a governs successive terms WITHIN a bin at fixed
+    (a, lambda), not the spread ACROSS bins where both vary.
 
 Usage:
     python audit_reweighting_feasibility.py RUNS/chignolin_6 [--bins 12]
@@ -60,12 +72,25 @@ CE2_SPREAD_BAR_KCAL = 1.0
 
 
 def _phase_dirs(run_dir: str) -> list[str]:
-    out = []
+    """Every phase with both samples and its own window map, crashed ones excluded.
+
+    A phase the driver abandoned is renamed with a ``_CRASHED_<date>`` suffix and
+    a fresh one takes its place. Its samples are a partial, aborted segment and
+    do not belong in a feasibility statistic -- on the run this was written
+    against the crashed remnant held 72 rows against 1.7M in its replacement.
+    """
+    out, skipped = [], []
     for pat in ("*/samples", "*/*/samples"):
         for p in sorted(glob.glob(os.path.join(run_dir, "adaptive_production", pat))):
             d = os.path.dirname(p)
-            if os.path.isfile(os.path.join(d, "epoch_window_map.csv")):
-                out.append(d)
+            if not os.path.isfile(os.path.join(d, "epoch_window_map.csv")):
+                continue
+            if "_CRASHED" in d:
+                skipped.append(os.path.relpath(d, run_dir))
+                continue
+            out.append(d)
+    if skipped:
+        print(f"  note: skipping {len(skipped)} abandoned phase(s): {', '.join(skipped)}")
     return out
 
 
@@ -87,7 +112,7 @@ def _load(run_dir: str):
     import duckdb
 
     con = duckdb.connect()
-    sids, cvs, dvs, keys = [], [], [], []
+    sids, cvs, dvs, keys, regs = [], [], [], [], []
     for phase in _phase_dirs(run_dir):
         with open(os.path.join(phase, "epoch_window_map.csv")) as fh:
             amap = {int(r["epoch_window"]): int(r["state_id"]) for r in csv.DictReader(fh)}
@@ -104,6 +129,11 @@ def _load(run_dir: str):
         sids.append(mapped[ok])
         cvs.append(np.asarray(t["cv1"]).astype(float)[ok])
         dvs.append(np.asarray(t["gamd_boost_total"]).astype(float)[ok])
+        # epoch_000 ran under the PRE-recalibration GaMD envelope; every later
+        # phase ran under the recalibrated one. Same split the shipped pipeline
+        # applies (`_epoch_zero_split_masks` in analyze_gareus_mbar.py).
+        is_e0 = os.path.basename(phase) == "epoch_000" or os.sep + "epoch_000" + os.sep in phase
+        regs.append(np.full(int(ok.sum()), 0 if is_e0 else 1, dtype=np.int8))
         # Packed into one int64 so the de-duplication is a single sort rather
         # than a lexsort over 12M rows. step < 2^31 and replica < 2^6 are
         # asserted, so the packing is injective.
@@ -118,11 +148,12 @@ def _load(run_dir: str):
     sid = np.concatenate(sids)
     cv1 = np.concatenate(cvs)
     dv = np.concatenate(dvs)
+    reg = np.concatenate(regs)
     key = np.concatenate(keys)
     _u, first = np.unique(key, return_index=True)
     first.sort()
     n_raw = sid.size
-    return sid[first], cv1[first], dv[first], n_raw
+    return sid[first], cv1[first], dv[first], reg[first], n_raw
 
 
 def _chi2_scale(bdv: np.ndarray) -> float:
@@ -157,7 +188,7 @@ def main(argv=None) -> int:
 
     beta = 1.0 / (_R_KJ * float(args.temp))
     kT_kcal = _R_KJ * float(args.temp) * _KCAL_PER_KJ
-    sid, cv1, dv_kj, n_raw = _load(args.run_dir)
+    sid, cv1, dv_kj, regime, n_raw = _load(args.run_dir)
     bdv = beta * dv_kj
 
     print(f"run          {args.run_dir}")
@@ -165,6 +196,29 @@ def main(argv=None) -> int:
           f"({n_raw:,} raw, {100.0 * (n_raw - bdv.size) / max(1, n_raw):.1f}% dropped)")
     print(f"states       {len(set(sid.tolist()))} distinct state_ids")
     print()
+
+    # The two GaMD regimes are not comparable and must not be pooled into one
+    # `a`. The shared-envelope recalibration fires at most once, so epoch_000 ran
+    # under a different boost envelope from every later phase -- the pipeline
+    # already splits its own PMF and boost report on exactly this
+    # (`epoch_000_separate/`). Pooling also inflates `a` mechanically, since
+    # a ~ var/(4*mean) and a between-regime mean offset adds to the variance.
+    n_e0 = int((regime == 0).sum())
+    if n_e0 and n_e0 < bdv.size:
+        print("BOOST REGIMES (epoch_000 ran pre-recalibration; the rest, post-)")
+        print(f"  {'':<22} {'n':>12} {'<bdV>':>8} {'b*sig':>8} {'anharm':>8} {'a':>8}")
+        for lbl, msk in (("epoch_000 (pre-recal)", regime == 0),
+                         ("epoch_001+final (post)", regime == 1),
+                         ("pooled (NOT valid)", np.ones_like(regime, dtype=bool))):
+            r = _row(lbl, bdv[msk])
+            print(f"  {lbl:<22} {r['n']:>12,} {r['mean']:>8.2f} {r['bsig']:>8.2f} "
+                  f"{r['anh']:>8.3f} {r['a']:>8.3f}")
+        print("  The last row is shown only to expose the pooling artefact; the")
+        print("  headline verdict below uses the POST-recalibration samples, which")
+        print("  are the ones the main PMF report covers.")
+        print()
+        keep = regime == 1
+        sid, cv1, bdv = sid[keep], cv1[keep], bdv[keep]
 
     per_state = [_row(f"s{s:02d}", bdv[sid == s]) for s in sorted(set(sid.tolist()))]
     real = [r for r in per_state if r["n"] >= 1000]
@@ -235,6 +289,14 @@ def main(argv=None) -> int:
 
     def _spread(v):
         return (max(v) - min(v)) if len(v) > 1 else float("nan")
+    if not (len(third) == len(emp) == len(par)):
+        # Never tabulate spreads computed over different bin sets. `par` skips a
+        # bin whose fitted `a` leaves the valid range, and silently comparing a
+        # 10-bin spread against an 11-bin one is the same "dropped with no
+        # message" defect this audit exists to catch.
+        print(f"  WARNING estimator bin counts differ (3rd={len(third)} "
+              f"parametric={len(par)} empirical={len(emp)}); spreads below are NOT "
+              "comparable. A bin's fitted `a` left the valid range 0 < a < 0.5.")
     spread = _spread(third)
     spread_emp = _spread(emp)
     spread_par = _spread(par)
@@ -284,6 +346,39 @@ def main(argv=None) -> int:
     return 0
 
 
+
+def _production_gamd_setup(run_dir: str):
+    """The GaMD setup that governed PRODUCTION, chosen explicitly.
+
+    An earlier version took ``sorted(glob(...))[0]``, which is positional and
+    therefore picks whatever sorts first. On a real run that is
+    ``adaptive_feedback_round_01/`` -- the short diagnostic pilot, which
+    calibrates against its own sampling and reports a DIFFERENT k0'
+    (1.766 there against 1.694 in every production phase). Since the clip
+    boundary is sigma0p/k0', reading the pilot moves the recommendation.
+
+    Same failure shape as reading a phase-local ``window_id`` as if it were a
+    state id: a plausible artifact that is not the right one. Selection is now
+    by explicit preference, and the pilot is only used if nothing else exists.
+    """
+    root = os.path.join(run_dir, "adaptive_production")
+    preferred = os.path.join(root, "global_shared_gamd_setup", "shared_gamd_setup_globals.json")
+    if os.path.isfile(preferred):
+        return preferred
+    prod = [f for f in sorted(glob.glob(os.path.join(root, "**", "shared_gamd_setup_globals.json"),
+                                        recursive=True))
+            if "CRASHED" not in f]
+    if prod:
+        return prod[0]
+    any_ = sorted(glob.glob(os.path.join(run_dir, "**", "shared_gamd_setup_globals.json"),
+                            recursive=True))
+    if any_:
+        print(f"  WARNING falling back to {os.path.relpath(any_[0], run_dir)} -- this may be an "
+              "adaptive-feedback pilot, whose calibration differs from production.")
+        return any_[0]
+    return None
+
+
 def _report_boost_setting(run_dir: str, a: float) -> None:
     """The boost width is a knob, so say which way to turn it -- past the clip.
 
@@ -301,12 +396,12 @@ def _report_boost_setting(run_dir: str, a: float) -> None:
     """
     import json
 
-    cands = sorted(glob.glob(os.path.join(run_dir, "**", "shared_gamd_setup_globals.json"),
-                             recursive=True))
-    if not cands:
+    path = _production_gamd_setup(run_dir)
+    if path is None:
         print("  NOTE no shared_gamd_setup_globals.json found; cannot report k0.")
         return
-    d = json.load(open(cands[0]))
+    cands = [path]
+    d = json.load(open(path))
     g = d.get("interesting_globals") or {}
     k0 = next((v for k, v in g.items() if k.startswith("k0_")), None)
     k0p = next((v for k, v in g.items() if k.startswith("k0prime_")), None)

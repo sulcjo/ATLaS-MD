@@ -102,16 +102,42 @@ that phase's own directory: restraint centres in `epoch_window_map.csv`; the com
 
 ## Tier 0 — can GaMD reweighting work at all? (`audit_reweighting_feasibility.py`)
 
-Analytic check on existing data, zero compute. On `RUNS/chignolin_6`: 12,366,509 samples across
-**37 states**, after mapping each row's phase-local `window_id` through its own phase's
-`epoch_window_map.csv` and de-duplicating (13,660,600 raw; 9.5% dropped as exact duplicates from the
-known un-consolidated-`chunk_*.parquet` leftover).
+Analytic check on existing data, zero compute.
+
+> **Data snapshot.** `RUNS/chignolin_6` is rsynced from the cluster and grew during this analysis:
+> `final/baseline` went from 72 rows to 1,714,788, and the abandoned `final` arrived renamed
+> `final_CRASHED_20260901`. All Tier 0 numbers below are from the post-rsync snapshot
+> (15,375,316 raw rows). Earlier figures in the git history of this file were computed before that
+> and are superseded, not contradicted. Abandoned `*_CRASHED*` phases are now excluded by the audit.
+
+On the current snapshot: **13,187,613 samples across 37 states**, after mapping each row's
+phase-local `window_id` through its own phase's `epoch_window_map.csv` and de-duplicating (14.2%
+dropped as exact duplicates from the known un-consolidated-`chunk_*.parquet` leftover).
 
 > An earlier version of this section pooled on raw `window_id` and reported 36 windows. That is the
 > same defect the 2026-08-25 window-map work exists to fix — `window_id` is phase-local, and 3 of
 > the 6 phases have a non-identity map. Every number below is from the corrected version.
 
-The two estimators fail for **different reasons** and the earlier draft conflated them.
+### The two GaMD regimes must not be pooled
+
+The shared-envelope recalibration fires **at most once**, so `epoch_000` ran under the
+pre-recalibration boost and every later phase under the recalibrated one. This repo already treats
+them as incomparable — `analyze_gareus_mbar.py` splits its own PMF and boost report on exactly this
+(`_epoch_zero_split_masks`, `epoch_000_separate/`). An earlier version of this audit pooled them into
+one `a`:
+
+| regime | n | ⟨βΔV⟩ | βσ | anharmonicity | a |
+|---|---|---|---|---|---|
+| epoch_000 (pre-recal) | 1,562,528 | 7.50 | 3.37 | 0.699 | **0.388** |
+| epoch_001+final (post-recal) | 11,625,085 | 8.82 | 3.57 | 0.601 | **0.369** |
+| pooled *(not valid)* | 13,187,613 | 8.66 | 3.57 | 0.606 | 0.377 |
+
+The regimes really do differ, and pooling inflates `a` mechanically — `a ≈ var/(4·mean)` and a
+between-regime mean offset adds to the variance. The headline below uses the **post-recalibration**
+samples, which are the ones the main PMF report covers. The exponential verdict is unchanged either
+way (both regimes sit far above 0.25), so this corrects the number without changing the conclusion.
+
+The two estimators fail for **different reasons**The two estimators fail for **different reasons** and the earlier draft conflated them.
 
 ### Exponential reweighting — structurally unusable
 
@@ -124,7 +150,7 @@ degree of freedom, βΔV ~ a·χ′²₁(λ). Moment-matching gives `a = m − �
 | a < 0.50 | `E[w]` finite — the estimator is defined |
 | a < 0.25 | `E[w²]` finite — it has finite variance |
 
-**Measured: a = 0.377**, and 0.367–0.383 in every one of the 33 states with ≥1000 samples. So the
+**Measured: a = 0.369** on the post-recalibration samples (0.388 for epoch_000), and 0.367–0.383 in every state with ≥1000 samples. So the
 importance weights have **infinite variance**: Kish ESS has no finite limit, does not grow with N,
 and any single ESS figure quoted for it is an artefact of which extreme frame happened to be drawn.
 This is a structural verdict, not a sampling-quality complaint — and it is the reason the earlier
@@ -139,7 +165,7 @@ width**, because all cumulants above the second vanish. Width alone condemns not
 is non-Gaussianity — which this repo already measures, in `gareus.math_helpers.boost_anharmonicity`,
 labelled OK/WARN/BAD at 0.5/1.0.
 
-**Measured: anharmonicity = 0.606 → WARN**, not BAD, uniformly 0.583–0.622 across states.
+**Measured: anharmonicity = 0.601 → WARN**, not BAD (epoch_000, under the other envelope, gives 0.699 — also WARN).
 
 Because a PMF is defined only up to a constant, the reportable quantity is the **spread across CV
 bins** of the neglected terms — a uniform error cancels, a bin-dependent one changes the PMF's shape.
@@ -148,11 +174,11 @@ Three estimators, over 11 CV1 bins:
 | estimator | spread (kcal/mol) | what it is |
 |---|---|---|
 | 3rd-order term only | **0.23** | directly measured. A floor, not the tail. |
-| parametric (noncentral χ²) | **1.78** | closed form `λa/(1−2a) − ½ln(1−2a)` minus CE2, exact **for the fitted family only** |
-| empirical | **2.98** | model-free `ln⟨e^X⟩ − CE2`, but see below |
+| parametric (noncentral χ²) | **1.37** | closed form `λa/(1−2a) − ½ln(1−2a)` minus CE2, exact **for the fitted family only** |
+| empirical | **3.03** | model-free `ln⟨e^X⟩ − CE2`, but see below |
 
 **Verdict: NOT RESOLVED.** The empirical column needs the very `exp(+βΔV)` average whose variance is
-infinite at `a = 0.377`, so it is not a measurement — it is one draw from a distribution with no
+infinite at `a = 0.369`, so it is not a measurement — it is one draw from a distribution with no
 finite spread. Worst-bin exponential-average ESS is **0.0001%** of that bin's samples. The parametric
 column is a sensitivity analysis, not a bound: two moments fix CE2 but do not constrain the higher
 cumulants, and distributions sharing two moments can have arbitrarily different `ln⟨e^X⟩`.
@@ -195,7 +221,8 @@ threshold should not read as derived.
 ### The boost width is a setting — but the obvious way to turn it does nothing
 
 ```
-lower-dihedral,  sigma0p = 2.5 kcal/mol,  k0 = 1.0,  k0' = 1.766
+lower-dihedral,  sigma0p = 2.5 kcal/mol,  k0 = 1.0,  k0' = 1.694
+(from adaptive_production/global_shared_gamd_setup/ -- the production calibration)
 ```
 
 `k0 = min(1, k0')` and `k0'` is proportional to σ0, so **`k0` is clipped at its ceiling**. Two
@@ -204,27 +231,35 @@ consequences, the second of which I got wrong in the earlier version:
 1. The applied boost is **smaller** than the setting requests, not larger — the clip is protective.
    Measured σ_ΔV = 8.90 kJ/mol against a configured σ0 = 10.46 kJ/mol. GaMD's own σ0 criterion is
    satisfied; the problem is that the target itself is too wide for reweighting.
-2. **Every value of σ0p between 1.42 and 2.5 kcal/mol produces the identical boost.** Lowering it
+2. **Every value of σ0p between 1.48 and 2.5 kcal/mol produces the identical boost.** Lowering it
    within that range changes nothing at all, because `k0'` stays above 1 and `k0` stays pinned.
 
-> **Correction.** The earlier version recommended σ0p ≲ **1.66** kcal/mol, obtained by scaling
-> 2.5 × (0.25/0.377) since `a` is linear in boost strength. `a` *is* linear in `k0` — ΔV is pointwise
-> proportional to `k0`, so mean ∝ k0 and variance ∝ k0², giving `a ≈ var/(4·mean) ∝ k0`. But at
-> σ0p = 1.66 the clip is still active (`k0'` = 1.17 > 1) and **nothing changes**. The scaling only
-> begins at the clip boundary σ0p = 2.5/1.766 = 1.42.
+> **Two corrections here, made in sequence.**
 >
-> Corrected target: `k0` must fall to 0.25/0.377 = 0.663, and it only starts falling below 1.42, so
-> **σ0p ≈ 0.94 kcal/mol**. Confirmed independently.
+> *First*, the recommendation σ0p ≲ **1.66** kcal/mol came from scaling 2.5 × (0.25/0.377) because
+> `a` is linear in boost strength. `a` *is* linear in `k0` — ΔV is pointwise proportional to `k0`, so
+> mean ∝ k0 and variance ∝ k0², giving `a ≈ var/(4·mean) ∝ k0`. But at σ0p = 1.66 the clip is still
+> active and **nothing changes**. Scaling only begins at the clip boundary.
+>
+> *Second*, the `k0'` used to locate that boundary was read from the wrong file. The audit took
+> `sorted(glob(...))[0]`, which is positional, and `adaptive_feedback_round_01/` sorts first — the
+> short **diagnostic pilot**, which calibrates against its own sampling and reports `k0' = 1.766`.
+> Every production phase reports **1.694**. Same failure shape as reading a phase-local `window_id`
+> as a state id: a plausible artifact that is not the right one. Selection is now explicit, and the
+> pilot is used only if nothing else exists.
+>
+> Corrected: clip boundary = 2.5/1.694 = **1.48**; `k0` must fall to 0.25/0.369 = 0.678; so
+> **σ0p ≈ 1.00 kcal/mol**.
 
 Caveat: this assumes `Vmax`/`Vmin`/`σV` are unchanged by the new setting. They are re-measured at
-calibration, so treat 0.94 as a starting point and re-run this audit on the result.
+calibration, so treat 1.00 as a starting point and re-run this audit on the result.
 
 **Consequence.** The first draft concluded "Layer B is not fixable by running longer; any target
 requiring ≲1 kcal/mol needs GaMD off." The first clause stands and is now on firmer ground —
-`a = 0.377 > 0.25` means the exponential estimator's weight variance is infinite, so no amount of
+`a = 0.369 > 0.25` means the exponential estimator's weight variance is infinite, so no amount of
 sampling helps. The second clause is still not established, but not for the reason the first
 correction gave: CE2's error is **unresolved**, not shown to be small. What *is* actionable is that
-the boost width is a setting, and σ0p ≈ 0.94 kcal/mol would move the exponential estimator inside its
+the boost width is a setting, and σ0p ≈ 1.00 kcal/mol would move the exponential estimator inside its
 finite-variance bound and make CE2's own error measurable for the first time.
 
 This section no longer claims to reproduce the ala-dipeptide `gamd_cumulant2` +18 kcal/mol result.
@@ -580,10 +615,10 @@ Ordered by how much they could hurt.
    reconstruct bias energies straight across a CV2 coordinate change without noticing.
 6. **Exchange RNG re-seeded identically per segment**, correlating the decision stream across
    segments. Bears on effective sample size, not on per-move balance.
-7. **The GaMD boost is pinned at its ceiling.** `k0 = 1.0` against a `k0' = 1.766`, so the requested
+7. **The GaMD boost is pinned at its ceiling.** `k0 = 1.0` against a `k0' = 1.694`, so the requested
    σ0p = 2.5 kcal/mol is not what is being applied and the run sits at maximum boost. This is the
    direct cause of the Layer B verdict in Tier 0, and unlike the rest of this list it is a *config*
-   fix, not a code fix: **σ0p ≈ 0.94 kcal/mol**. Note that anything between 1.42 and 2.5 is inert —
+   fix, not a code fix: **σ0p ≈ 1.00 kcal/mol**. Note that anything between 1.48 and 2.5 is inert —
    the clip keeps `k0` at 1.0 — so a half-measure here would look like a change and do nothing. Not
    changed here, because it alters the physics of future runs and breaks comparability with past
    ones — that is a decision, not a bug fix.
@@ -627,12 +662,12 @@ than the quoted errors sits underneath all of them.
 Boltzmann distribution (Tier 3), and that the whole stack reproduces a known free-energy surface end
 to end (Tier 4).
 
-**Layer B.** Exponential reweighting is structurally unusable at this boost width — a = 0.377 >
+**Layer B.** Exponential reweighting is structurally unusable at this boost width — a = 0.369 >
 0.25, infinite weight variance, no amount of sampling changes that. CE2 is neither vindicated nor
 condemned: its truncation error is **unresolved**, with a measured floor of 0.23 kcal/mol and two
-higher estimators (1.78 parametric, 2.98 empirical) that are respectively model-dependent and
+higher estimators (1.37 parametric, 3.03 empirical) that are respectively model-dependent and
 unreliable — the empirical one because it needs the same divergent average. The boost width is a
-**setting**, pinned at `k0 = 1.0` against `k0' = 1.766`; **σ0p ≈ 0.94 kcal/mol** (not the 1.4–1.7 an
+**setting**, pinned at `k0 = 1.0` against `k0' = 1.694`; **σ0p ≈ 1.00 kcal/mol** (not the 1.4–1.7 an
 earlier version of this report gave — that range is still inside the clip and changes nothing) would
 put the exponential estimator inside its bound and make CE2's error measurable at all.
 
@@ -660,7 +695,9 @@ numerical simulation. It found two more errors, both in the *corrected* version:
 | finding | status |
 |---|---|
 | geometric tail at ratio 2a extrapolates a within-bin ratio onto an across-bin spread | **refuted**; the report's own 4th-order datum (ratio 1.65) already contradicted it |
-| σ0p ≲ 1.66 kcal/mol recommendation ignores the `k0` clip and would change nothing | **refuted**; corrected to ≈0.94 |
+| σ0p ≲ 1.66 kcal/mol recommendation ignores the `k0` clip and would change nothing | **refuted**; corrected to ≈1.00 |
+| `k0'` read positionally from the first glob hit — the diagnostic pilot, not production | **refuted**; 1.766 → 1.694, selection made explicit |
+| Tier 0 pooled the pre- and post-recalibration GaMD regimes into one `a` | **refuted**; split, `a` = 0.388 vs 0.369, verdict unchanged |
 
 Verified unchanged on that pass: the moment-matching for `a`, the MGF radius `1/(2a)` and the
 0.5/0.25 bounds, the cumulant formula and its `2a` ratio, the logistic slope of exactly −1 and its
