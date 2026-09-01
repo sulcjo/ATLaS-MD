@@ -33,26 +33,32 @@ is perfectly pi-invariant -- see the irreducibility test at the end), nothing
 about whether the bias matrix handed to the kernel is itself right, and nothing
 about sample labelling.
 
-Mutation battery run against these tests (2026-09-01), each applied to an
-isolated copy of the tree and reverted afterwards:
+Mutation battery, re-run 2026-09-01 after the gibbs kernel was rewritten to
+drive production instead of mirroring it. Each mutation applied to the shipped
+file, tests run, file restored. Counts are over the 16 tests in this file plus
+`tests/test_sample_before_exchange_ordering.py`.
 
-    CAUGHT  force_accept in place of the MH correction        4 failed
-    CAUGHT  beta doubled in the Metropolis probability        5 failed
-    CAUGHT  beta sign flipped                                 5 failed
-    CAUGHT  replica_of_window update omitted                  4 failed
-    CAUGHT  old_e / new_e swapped                             5 failed
-    passes  only one window pair ever offered                 by design
-    passes  old upper clip a_max=0.0 in the gibbs proposal    by design
+    CAUGHT  force_accept in place of the pair-swap MH test        5 failed
+    CAUGHT  beta doubled in the Metropolis probability            5 failed
+    CAUGHT  old_e / new_e swapped                                 6 failed
+    CAUGHT  replica_of_window update omitted                      8 failed
+    CAUGHT  gibbs reverse proposal vs PRE-swap holders            4 failed
+    CAUGHT  gibbs q_forward / q_reverse swapped                   4 failed
+    CAUGHT  gibbs call site force_accept instead of p_override    1 failed
+    passes  only one window pair ever offered                     by design
 
-The last two are controls, not misses. Invariance is a per-move property, so it
-is blind to *which* moves are offered -- restricting the pair list cannot break
-it. And Metropolis-Hastings is valid for ANY proposal distribution as long as
-the correction uses the matching forward and reverse probabilities, which it
-does (`q_reverse` comes from the same function evaluated against the post-swap
-holders). Clipping the heat-bath weights therefore changes efficiency, not
-correctness. The historical bug this clip came from (prior audit, N1) was the
-clip *combined with* force-accept, and the force_accept mutation above is what
-catches that.
+The last is a control, not a miss. Invariance is a per-move property, so it is
+blind to *which* moves are offered -- restricting the pair list cannot break it.
+Ergodicity is what that would break, and the irreducibility test at the end is
+what guards it.
+
+Two of these previously passed. The gibbs mutations (reverse-proposal holders,
+q swap) passed because this file used to re-implement the proposal sequence
+inline: the test was self-consistent and production-blind. The call-site
+force_accept mutation passes even now against this file alone -- the numeric
+kernel cannot see a substitution made *between* the two functions it drives --
+and is caught by an AST pin in the ordering test file instead.
+
 """
 from __future__ import annotations
 
@@ -63,9 +69,8 @@ import numpy as np
 import pytest
 
 from gareus.production import (
-    _gibbs_mh_acceptance_probability,
-    _gibbs_window_proposal_distribution,
     apply_window_swap,
+    gibbs_propose_one_replica,
 )
 
 BETA = 0.4009  # mol/kJ, ~300 K
@@ -134,49 +139,60 @@ def _pair_kernel(states, bias, wi, wj, beta=BETA) -> np.ndarray:
 def _gibbs_kernel(states, bias, rep, beta=BETA) -> np.ndarray:
     """Transition matrix of the shipped single-replica gibbs move.
 
-    Mirrors the composition in run_gareus's `gibbs-walk` branch exactly: real
-    heat-bath proposal, real reverse proposal against the post-swap holders,
-    real MH correction, real swap application.
+    Every number here comes out of `gibbs_propose_one_replica` and
+    `apply_window_swap` -- the same two functions run_gareus's `gibbs-walk`
+    branch calls. An earlier version of this helper re-implemented the
+    proposal / reverse-proposal / MH-correction sequence inline, which made the
+    test self-consistent and production-blind: three separate defects injected
+    into the production branch passed all 15 assertions, because the test never
+    executed the mutated code. The `choose` callback is the ONLY thing supplied
+    locally, and only because it stands in for the RNG.
     """
     index = {s: i for i, s in enumerate(states)}
     P = np.zeros((len(states), len(states)))
     for a, s in enumerate(states):
-        asg, row = _arrays(s)
-        wi = int(asg[rep])
-        prop = _gibbs_window_proposal_distribution(
-            beta=beta, bias_matrix_kj=bias, replica_index=rep,
-            current_window=wi, replica_of_window=row,
-        )
-        wins, probs, deltas = prop["windows"], prop["probabilities"], prop["deltas_kj"]
-        for c in range(int(wins.size)):
-            wj = int(wins[c])
-            q_fwd = float(probs[c])
+        # Enumerate every candidate the real proposal offers, weighting each
+        # branch by the q_forward the real proposal assigned it.
+        asg0, row0 = _arrays(s)
+        n_cand_seen = {}
+
+        def _count(k, probs, _store=n_cand_seen):
+            _store["k"] = int(k)
+            _store["p"] = np.asarray(probs, dtype=float).copy()
+            return 0
+
+        gibbs_propose_one_replica(bias, beta, asg0, row0, rep, _count)
+        assert tuple(asg0) == s, "proposing must not mutate the assignment"
+        if not n_cand_seen:
+            P[a, a] += 1.0
+            continue
+
+        for c in range(n_cand_seen["k"]):
+            asg, row = _arrays(s)
+            prop = gibbs_propose_one_replica(
+                bias, beta, asg, row, rep, lambda k, p, _c=c: _c
+            )
+            q_fwd = float(prop.q_forward)
             if q_fwd <= 0.0:
                 continue
-            if wj == wi:                      # the stay candidate: no MH test
+            if prop.stayed or prop.no_candidates:
                 P[a, a] += q_fwd
                 continue
-            holders_after = row.astype(np.int64, copy=True)
-            target_rep = int(holders_after[wj])
-            holders_after[wi] = target_rep
-            holders_after[wj] = rep
-            rev = _gibbs_window_proposal_distribution(
-                beta=beta, bias_matrix_kj=bias, replica_index=rep,
-                current_window=wj, replica_of_window=holders_after,
+            got = apply_window_swap(
+                bias, beta, asg, row, prop.current_window, prop.proposed_window,
+                0.0, p_override=prop.pacc,
             )
-            ridx = np.where(rev["windows"] == wi)[0]
-            q_rev = float(rev["probabilities"][int(ridx[0])]) if ridx.size else 0.0
-            pacc = _gibbs_mh_acceptance_probability(
-                delta_kj=float(deltas[c]), beta=beta, q_forward=q_fwd, q_reverse=q_rev,
-            )
-            asg2, row2 = _arrays(s)
-            got = apply_window_swap(bias, beta, asg2, row2, wi, wj, 0.0, p_override=pacc)
             if got is None:
                 P[a, a] += q_fwd
                 continue
-            moved = tuple(int(x) for x in asg2)
-            P[a, index[moved]] += q_fwd * pacc
-            P[a, a] += q_fwd * (1.0 - pacc)
+            moved = tuple(int(x) for x in asg)
+            if got.accepted:
+                for w, r in enumerate(row):
+                    assert moved[int(r)] == w, "replica_of_window desynced from assignments"
+            # got.pacc, not prop.pacc: read the acceptance back out of the
+            # applying function, so a caller that ignored p_override is visible.
+            P[a, index[moved]] += q_fwd * got.pacc
+            P[a, a] += q_fwd * (1.0 - got.pacc)
     return P
 
 

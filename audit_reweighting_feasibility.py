@@ -1,34 +1,45 @@
 #!/usr/bin/env python3
-"""Tier 0 of the Boltzmann-validation programme: can GaMD reweighting work at all?
+"""Tier 0: which GaMD reweighting estimator, if any, can work on this run?
 
-This is an *analytic* feasibility check on data you already have. It answers, per
-window and per CV1 bin, whether the boost distribution is inside the domain where
-each reweighting estimator is defensible -- before any compute is spent on a
-validation campaign.
+An analytic feasibility check on data you already have. It answers, per umbrella
+state, whether the boost distribution is inside the domain where each estimator
+is defensible -- before any compute is spent.
 
-Three readouts, in increasing order of how badly they fail:
+The two estimators fail for *different* reasons and must be judged separately.
+Lumping them, as an earlier version of this script did, gets both wrong.
 
-``beta*sigma_dV``
-    The cumulant expansion truncated at second order (CE2) carries a leading
-    error ~ beta^3*kappa_3/6, so it is defensible only for beta*sigma_dV <~ 1.
-    Past that the expansion is not perturbative and CE2 is not "approximate",
-    it is unbounded.
+**Exponential reweighting** (weights exp(+beta*dV)).
+    For a lower-bound GaMD boost, dV = 0.5*k*(E-V)^2, so beta*dV is a scaled
+    noncentral chi-square with one degree of freedom: beta*dV ~ a * chi'^2_1(lam).
+    Matching moments gives a = m - sqrt(m^2 - v/2) for mean m and variance v.
+    The MGF E[exp(t*X)] exists only for t < 1/(2a), so
 
-``ESS`` of the exp(+beta*dV) reweighting weights
-    The exponential estimator is exact in principle and useless in practice once
-    a handful of frames carry all the weight. Computed PER WINDOW: the pooled
-    figure reads ~0 spuriously because it mixes states whose free energies differ.
+        a < 0.50  =>  E[w]  is finite   (the estimator is defined)
+        a < 0.25  =>  E[w^2] is finite  (it has finite variance)
 
-``c1/c2/c3`` cumulant spread
-    The established divergence sentinel. If c3 is not small against c2, the
-    truncation is not converging and CE2's own error estimate is meaningless.
+    Above a = 0.25 the importance weights have infinite variance: Kish ESS has
+    no finite limit, does not grow with N, and any single number quoted for it
+    is an artefact of which extreme frame happened to be drawn. That is a
+    structural verdict, not a sampling-quality complaint.
+
+**Cumulant expansion to second order (CE2).**
+    CE2 is *exact* for a Gaussian dV at any width -- all cumulants above the
+    second vanish -- so a threshold on beta*sigma alone is meaningless. What
+    matters is non-Gaussianity, which this repo already measures:
+    ``gareus.math_helpers.boost_anharmonicity`` (skew and excess kurtosis
+    combined), labelled OK/WARN/BAD at 0.5/1.0.
+
+    And because a PMF is defined only up to a constant, a truncation error that
+    is uniform across the CV does not matter. The reportable quantity is the
+    *spread across CV bins* of the neglected third-order term, in kcal/mol.
 
 Usage:
-    python audit_reweighting_feasibility.py RUNS/chignolin_6 [--bins 12] [--temp 300]
+    python audit_reweighting_feasibility.py RUNS/chignolin_6 [--bins 12]
 """
 from __future__ import annotations
 
 import argparse
+import csv
 import glob
 import math
 import os
@@ -36,149 +47,249 @@ import sys
 
 import numpy as np
 
-# kJ/mol/K -- matches gareus.units
+from gareus.math_helpers import anharmonicity_label, boost_anharmonicity
+
 _R_KJ = 0.008314462618
-_KJ_PER_KCAL = 4.184
+_KCAL_PER_KJ = 1.0 / 4.184
 
-# CE2 is a perturbative expansion in beta*dV; past ~1 it is not small.
-CE2_VALID_BETA_SIGMA = 1.0
-# Below this fraction the exponential estimator is carried by too few frames.
-ESS_FRACTION_FLOOR = 0.01
+# Finite weight variance for the exponential estimator (see module docstring).
+EXP_VAR_FINITE_A = 0.25
+EXP_MEAN_FINITE_A = 0.50
+# A PMF is defined up to a constant, so this is a spread across bins, not a level.
+CE2_SPREAD_BAR_KCAL = 1.0
 
 
-def _ess(logw: np.ndarray) -> float:
-    """Kish effective sample size from log-weights, overflow-safe.
+def _phase_dirs(run_dir: str) -> list[str]:
+    out = []
+    for pat in ("*/samples", "*/*/samples"):
+        for p in sorted(glob.glob(os.path.join(run_dir, "adaptive_production", pat))):
+            d = os.path.dirname(p)
+            if os.path.isfile(os.path.join(d, "epoch_window_map.csv")):
+                out.append(d)
+    return out
 
-    Mirrors gareus.math_helpers.ess but takes logs, because exp(+beta*dV) with
-    beta*dV ~ 5 overflows float64 long before the weights themselves matter.
+
+def _load(run_dir: str):
+    """(state_id, cv1, beta_dV) pooled over phases, mapped and de-duplicated.
+
+    Two things an earlier version of this script got wrong, both of which this
+    codebase has been bitten by before:
+
+    * ``window_id`` in the Parquet is a **phase-local** index. Pooling on it
+      merges different physical states under one label -- exactly the bug the
+      2026-08-25 window-map work exists to fix. Every row is mapped through its
+      own phase's ``epoch_window_map.csv``.
+    * Four segment directories hold a consolidated ``data.parquet`` *and*
+      un-deleted ``chunk_*.parquet`` covering the same steps (the known
+      ``_consolidate`` leftover), inflating N by ~8%. Rows are de-duplicated on
+      (state, step, replica).
     """
-    finite = logw[np.isfinite(logw)]
-    if finite.size == 0:
-        return 0.0
-    m = float(finite.max())
-    w = np.exp(finite - m)
-    s1 = float(w.sum())
-    s2 = float((w * w).sum())
-    return (s1 * s1 / s2) if s2 > 0.0 else 0.0
-
-
-def _load(run_dir: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """(window_id, cv1, gamd_boost_total_kj) pooled over every phase."""
     import duckdb
 
-    pats = [
-        os.path.join(run_dir, "adaptive_production", "*", "samples", "seg_*", "*.parquet"),
-        os.path.join(run_dir, "adaptive_production", "*", "*", "samples", "seg_*", "*.parquet"),
-    ]
-    files: list[str] = []
-    for p in pats:
-        files.extend(sorted(glob.glob(p)))
-    if not files:
-        raise SystemExit(f"no sample parquet found under {run_dir}")
     con = duckdb.connect()
-    q = (
-        "select window_id, cv1, gamd_boost_total from read_parquet(%r) "
-        "where gamd_boost_total is not null" % files
-    )
-    tbl = con.execute(q).fetchnumpy()
-    return (
-        np.asarray(tbl["window_id"]).astype(np.int32),
-        np.asarray(tbl["cv1"]).astype(np.float64),
-        np.asarray(tbl["gamd_boost_total"]).astype(np.float64),
-    )
+    sids, cvs, dvs, keys = [], [], [], []
+    for phase in _phase_dirs(run_dir):
+        with open(os.path.join(phase, "epoch_window_map.csv")) as fh:
+            amap = {int(r["epoch_window"]): int(r["state_id"]) for r in csv.DictReader(fh)}
+        files = sorted(glob.glob(os.path.join(phase, "samples", "seg_*", "*.parquet")))
+        if not files:
+            continue
+        t = con.execute(
+            "select window_id, replica, step, cv1, gamd_boost_total from read_parquet(%r) "
+            "where gamd_boost_total is not null" % files
+        ).fetchnumpy()
+        w = np.asarray(t["window_id"]).astype(np.int64)
+        mapped = np.array([amap.get(int(x), -1) for x in w], dtype=np.int64)
+        ok = mapped >= 0
+        sids.append(mapped[ok])
+        cvs.append(np.asarray(t["cv1"]).astype(float)[ok])
+        dvs.append(np.asarray(t["gamd_boost_total"]).astype(float)[ok])
+        # Packed into one int64 so the de-duplication is a single sort rather
+        # than a lexsort over 12M rows. step < 2^31 and replica < 2^6 are
+        # asserted, so the packing is injective.
+        rep = np.asarray(t["replica"]).astype(np.int64)[ok]
+        stp = np.asarray(t["step"]).astype(np.int64)[ok]
+        if rep.size and (rep.max() >= 1 << 6 or stp.max() >= 1 << 31 or mapped[ok].max() >= 1 << 16):
+            raise SystemExit("key packing would overflow; widen the shifts")
+        keys.append((mapped[ok] << 37) | (rep << 31) | stp)
+
+    if not sids:
+        raise SystemExit(f"no mapped samples under {run_dir}")
+    sid = np.concatenate(sids)
+    cv1 = np.concatenate(cvs)
+    dv = np.concatenate(dvs)
+    key = np.concatenate(keys)
+    _u, first = np.unique(key, return_index=True)
+    first.sort()
+    n_raw = sid.size
+    return sid[first], cv1[first], dv[first], n_raw
 
 
-def _row(label: str, bdv: np.ndarray) -> dict:
+def _chi2_scale(bdv: np.ndarray) -> float:
+    """Fitted `a` in beta*dV ~ a * chi'^2_1(lam), by moment matching."""
+    m = float(np.mean(bdv))
+    v = float(np.var(bdv, ddof=1))
+    disc = m * m - v / 2.0
+    if disc < 0.0 or m <= 0.0:
+        return float("nan")
+    return m - math.sqrt(disc)
+
+
+def _row(label, bdv):
     n = int(bdv.size)
-    mean = float(bdv.mean())
-    sd = float(bdv.std(ddof=1)) if n > 1 else float("nan")
-    # Central moments -> cumulants. c1=mean, c2=variance, c3=third central moment.
-    d = bdv - mean
-    c2 = float((d * d).mean())
-    c3 = float((d * d * d).mean())
-    ess = _ess(bdv)  # weights are exp(+beta*dV), so log-weights ARE beta*dV
+    an = boost_anharmonicity(list(bdv)) if n >= 8 else {"score": float("nan")}
     return {
-        "label": label,
-        "n": n,
-        "mean": mean,
-        "beta_sigma": sd,
-        "c2": c2,
-        "c3": c3,
-        # |c3| / c2^{3/2} is the standardised skew; the CE2 truncation error is
-        # governed by c3, so this is the ratio that says whether truncating helps.
-        "skew": (c3 / (c2 ** 1.5)) if c2 > 0 else float("nan"),
-        "ess": ess,
-        "ess_frac": (ess / n) if n else 0.0,
+        "label": label, "n": n,
+        "mean": float(np.mean(bdv)),
+        "bsig": float(np.std(bdv, ddof=1)) if n > 1 else float("nan"),
+        "anh": float(an.get("score", float("nan"))),
+        "a": _chi2_scale(bdv) if n > 8 else float("nan"),
     }
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("run_dir")
-    ap.add_argument("--temp", type=float, default=300.0, help="temperature in K")
-    ap.add_argument("--bins", type=int, default=12, help="CV1 bins for the per-bin table")
+    ap.add_argument("--temp", type=float, default=300.0)
+    ap.add_argument("--bins", type=int, default=12)
     args = ap.parse_args(argv)
 
     beta = 1.0 / (_R_KJ * float(args.temp))
-    win, cv1, dv_kj = _load(args.run_dir)
+    kT_kcal = _R_KJ * float(args.temp) * _KCAL_PER_KJ
+    sid, cv1, dv_kj, n_raw = _load(args.run_dir)
     bdv = beta * dv_kj
 
     print(f"run          {args.run_dir}")
-    print(f"temperature  {args.temp} K   (beta = {beta:.5f} mol/kJ)")
-    print(f"samples      {bdv.size:,} with a finite boost")
-    print()
-    print(f"CE2 is defensible for beta*sigma_dV <~ {CE2_VALID_BETA_SIGMA}; "
-          f"exp-reweighting needs ESS/N >~ {ESS_FRACTION_FLOOR:.0%}")
+    print(f"samples      {bdv.size:,} after mapping to state_id and de-duplicating "
+          f"({n_raw:,} raw, {100.0 * (n_raw - bdv.size) / max(1, n_raw):.1f}% dropped)")
+    print(f"states       {len(set(sid.tolist()))} distinct state_ids")
     print()
 
-    overall = _row("ALL POOLED", bdv)
-    per_window = [_row(f"w{w:02d}", bdv[win == w]) for w in np.unique(win)]
+    per_state = [_row(f"s{s:02d}", bdv[sid == s]) for s in sorted(set(sid.tolist()))]
+    real = [r for r in per_state if r["n"] >= 1000]
 
+    print("PER STATE (states with >=1000 samples)")
+    print(f"  {'':<8} {'n':>10} {'<bdV>':>8} {'b*sig':>8} {'anharm':>8} {'label':>6} "
+          f"{'a':>7}  exponential")
+    for r in real:
+        lab, _ = anharmonicity_label(r["anh"])
+        exp_ok = ("finite var" if r["a"] < EXP_VAR_FINITE_A else
+                  "INF VARIANCE" if r["a"] < EXP_MEAN_FINITE_A else "DIVERGENT")
+        print(f"  {r['label']:<8} {r['n']:>10,} {r['mean']:>8.2f} {r['bsig']:>8.2f} "
+              f"{r['anh']:>8.3f} {lab:>6} {r['a']:>7.3f}  {exp_ok}")
+    if len(per_state) != len(real):
+        skipped = [r["label"] for r in per_state if r["n"] < 1000]
+        print(f"  ({len(skipped)} state(s) with <1000 samples omitted: {', '.join(skipped)})")
+    print()
+
+    pooled = _row("pooled", bdv)
+    lab, _ = anharmonicity_label(pooled["anh"])
+
+    # CE2: what matters is the SPREAD across CV bins of the neglected terms,
+    # since a PMF is defined only up to a constant. Build the cumulant-expansion
+    # PMF correction per bin at orders 2, 3 and 4 and report how much the CURVE
+    # moves when the next term is added -- that increment, not the absolute size
+    # of any single cumulant, is the error CE2 imposes on the PMF.
     edges = np.linspace(np.nanmin(cv1), np.nanmax(cv1), int(args.bins) + 1)
-    idx = np.clip(np.digitize(cv1, edges) - 1, 0, int(args.bins) - 1)
-    per_bin = []
+    which = np.clip(np.digitize(cv1, edges) - 1, 0, int(args.bins) - 1)
+    curves = {2: [], 3: [], 4: []}
     for b in range(int(args.bins)):
-        m = idx == b
-        if int(m.sum()) >= 100:
-            per_bin.append(_row(f"[{edges[b]:.3f},{edges[b+1]:.3f})", bdv[m]))
+        m = which == b
+        if int(m.sum()) < 5000:
+            continue
+        y = bdv[m]
+        x = y - y.mean()
+        m2 = float(np.mean(x ** 2))
+        m3 = float(np.mean(x ** 3))
+        m4 = float(np.mean(x ** 4))
+        k1, k2, k3 = float(y.mean()), m2, m3
+        k4 = m4 - 3.0 * m2 * m2
+        curves[2].append(kT_kcal * (k1 + k2 / 2.0))
+        curves[3].append(kT_kcal * (k1 + k2 / 2.0 + k3 / 6.0))
+        curves[4].append(kT_kcal * (k1 + k2 / 2.0 + k3 / 6.0 + k4 / 24.0))
+    def _spread(v):
+        return (max(v) - min(v)) if len(v) > 1 else float("nan")
+    spread = _spread([c3 - c2 for c2, c3 in zip(curves[2], curves[3])])
+    spread4 = _spread([c4 - c3 for c3, c4 in zip(curves[3], curves[4])])
+    n_bins_used = len(curves[2])
 
-    def table(title: str, rows: list[dict]) -> None:
-        print(title)
-        print(f"  {'':<22} {'n':>10} {'<bdV>':>9} {'b*sigma':>9} {'skew':>7} "
-              f"{'ESS':>10} {'ESS/N':>8}  verdict")
-        for r in rows:
-            bad_ce2 = r["beta_sigma"] > CE2_VALID_BETA_SIGMA
-            bad_exp = r["ess_frac"] < ESS_FRACTION_FLOOR
-            verdict = ("CE2 invalid" if bad_ce2 else "CE2 ok") + \
-                      ("; exp dead" if bad_exp else "; exp ok")
-            print(f"  {r['label']:<22} {r['n']:>10,} {r['mean']:>9.2f} "
-                  f"{r['beta_sigma']:>9.2f} {r['skew']:>7.2f} "
-                  f"{r['ess']:>10.1f} {r['ess_frac']:>8.2%}  {verdict}")
-        print()
-
-    table("PER WINDOW", per_window)
-    table(f"PER CV1 BIN ({len(per_bin)} populated)", per_bin)
-    table("POOLED (for reference only -- mixes states, reads low spuriously)",
-          [overall])
-
-    n_ce2_bad = sum(1 for r in per_window if r["beta_sigma"] > CE2_VALID_BETA_SIGMA)
-    n_exp_bad = sum(1 for r in per_window if r["ess_frac"] < ESS_FRACTION_FLOOR)
-    worst = max(per_window, key=lambda r: r["beta_sigma"])
-    print("VERDICT")
-    print(f"  windows where CE2 is outside its validity domain : "
-          f"{n_ce2_bad}/{len(per_window)}")
-    print(f"  windows where exp-reweighting has ESS/N < {ESS_FRACTION_FLOOR:.0%}      : "
-          f"{n_exp_bad}/{len(per_window)}")
-    print(f"  worst beta*sigma_dV                              : "
-          f"{worst['beta_sigma']:.2f}  ({worst['label']}), "
-          f"i.e. {worst['beta_sigma'] / CE2_VALID_BETA_SIGMA:.1f}x the CE2 domain")
-    if n_ce2_bad or n_exp_bad:
-        print()
-        print("  => No GaMD reweighting estimator on this data is trustworthy at the")
-        print("     ~1 kcal/mol level. This is a property of the boost width, not of")
-        print("     sampling length: more frames do not shrink beta*sigma_dV.")
+    print("VERDICT, per estimator -- they fail for different reasons")
+    print()
+    print(f"  exponential  a = {pooled['a']:.3f}")
+    if pooled["a"] >= EXP_VAR_FINITE_A:
+        print(f"    a >= {EXP_VAR_FINITE_A}: the importance weights have INFINITE VARIANCE.")
+        print("    Kish ESS has no finite limit and does not grow with N, so any single")
+        print("    ESS figure is an artefact of which extreme frame was drawn.")
+        print(f"    (E[w] itself is {'finite' if pooled['a'] < EXP_MEAN_FINITE_A else 'DIVERGENT'};"
+              f" the estimator is {'defined but unusable' if pooled['a'] < EXP_MEAN_FINITE_A else 'undefined'}.)")
+    else:
+        print("    finite weight variance: usable.")
+    print()
+    print(f"  CE2          anharmonicity = {pooled['anh']:.3f} -> {lab}"
+          f"   (b*sigma = {pooled['bsig']:.2f}, informational only)")
+    print(f"    over {n_bins_used} CV1 bins, adding the next cumulant moves the PMF")
+    print(f"    correction curve by  CE2->CE3 {spread:.2f}  CE3->CE4 {spread4:.2f} kcal/mol")
+    print(f"    (peak-to-peak across bins, against a {CE2_SPREAD_BAR_KCAL:.1f} kcal/mol bar)")
+    print("    CE2 is exact for a Gaussian boost at ANY width, so b*sigma alone")
+    print("    condemns nothing; only non-Gaussianity does. And only the spread")
+    print("    across the CV matters -- a uniform offset cancels from a PMF.")
+    # For X ~ a*chi'^2_1(lam) the cumulants are exactly
+    #     kappa_n = a^n * 2^(n-1) * (n-1)! * (1 + n*lam),
+    # so successive terms kappa_n/n! shrink by a ratio tending to 2a. The series
+    # therefore converges iff a < 0.5 -- the same bound as a finite E[w], which
+    # is not a coincidence: the cumulant series IS the log-MGF at t = 1. Summing
+    # the geometric tail turns the measured third-order term into an estimate of
+    # everything CE2 throws away, not just the first thing it throws away.
+    ratio = 2.0 * pooled["a"]
+    if 0.0 < ratio < 1.0:
+        tail = spread / (1.0 - ratio)
+        print(f"    successive cumulant terms shrink by ~{ratio:.3f} per order "
+              f"(exactly 2a for this family),")
+        print(f"    so the FULL neglected tail is about {tail:.2f} kcal/mol of "
+              f"CV-dependent distortion")
+        print(f"    against the {CE2_SPREAD_BAR_KCAL:.1f} kcal/mol bar -- "
+              f"{'inside it' if tail < CE2_SPREAD_BAR_KCAL else 'over it'}, "
+              "but only just, either way.")
+    else:
+        print(f"    ratio 2a = {ratio:.3f} >= 1: the cumulant series does not "
+              "converge; CE2 has no truncation guarantee.")
+    print()
+    _report_boost_setting(args.run_dir, pooled["a"])
     return 0
+
+
+def _report_boost_setting(run_dir: str, a: float) -> None:
+    """The boost width is a knob, so say which way to turn it.
+
+    a ~ var(beta*dV) / (4*mean(beta*dV)) whenever the variance is small against
+    the squared mean, and both moments scale with the boost strength, so `a` is
+    roughly LINEAR in it. That makes the required change a simple ratio rather
+    than a search.
+    """
+    import json
+
+    cands = sorted(glob.glob(os.path.join(run_dir, "**", "shared_gamd_setup_globals.json"),
+                             recursive=True))
+    if not cands:
+        print("  NOTE no shared_gamd_setup_globals.json found; cannot report k0.")
+        return
+    d = json.load(open(cands[0]))
+    g = d.get("interesting_globals") or {}
+    k0 = next((v for k, v in g.items() if k.startswith("k0_")), None)
+    k0p = next((v for k, v in g.items() if k.startswith("k0prime_")), None)
+    s0 = d.get("sigma0p_kcal_mol")
+    print(f"  BOOST SETTING ({d.get('gamd_boost_type')}, from {os.path.relpath(cands[0], run_dir)})")
+    print(f"    sigma0p = {s0} kcal/mol,  k0 = {k0},  k0' = {k0p}")
+    if k0 is not None and k0p is not None and k0p > 1.0:
+        print(f"    k0 is CLIPPED at 1.0 (k0' = {k0p:.3f}), so the run is at maximum")
+        print(f"    boost and the requested sigma0 is not what is being applied.")
+        if s0:
+            print(f"    Lowering sigma0p to ~{s0 / k0p:.2f} kcal/mol would un-clip it and")
+            print("    return control of the boost width to the setting.")
+    if a > EXP_VAR_FINITE_A and s0:
+        print(f"    For a < {EXP_VAR_FINITE_A} (finite weight variance), a is ~linear in")
+        print(f"    boost strength, so roughly sigma0p <= {s0 * EXP_VAR_FINITE_A / a:.2f} kcal/mol.")
 
 
 if __name__ == "__main__":

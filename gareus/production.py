@@ -807,6 +807,32 @@ def _exchange_probability(delta_kj: float, beta: float) -> float:
     return float(math.exp(x))
 
 
+def swap_candidate_replicas(replica_of_window, wi: int, wj: int):
+    """``(i, j)`` for an attemptable swap, else ``None``.
+
+    Split out of :func:`apply_window_swap` so a caller can decide whether the
+    move is attemptable *before* drawing a random number. Production's original
+    closure returned early on these cases without touching the rng, and any
+    extra draw here shifts every downstream random stream -- the same hazard
+    ``force_accept`` is guarded against.
+    """
+    try:
+        wi = int(wi)
+        wj = int(wj)
+    except (TypeError, ValueError):
+        return None
+    if wi == wj:
+        return None
+    n_win = int(replica_of_window.size)
+    if not (0 <= wi < n_win and 0 <= wj < n_win):
+        return None
+    i = int(replica_of_window[wi])
+    j = int(replica_of_window[wj])
+    if i < 0 or j < 0 or i == j:
+        return None
+    return i, j
+
+
 class SwapOutcome(NamedTuple):
     """What one attempted window swap did. Returned by :func:`apply_window_swap`."""
     replica_i: int
@@ -851,17 +877,12 @@ def apply_window_swap(
     the caller can preserve production's short-circuit: ``force_accept`` must
     not consume a random number, or every downstream RNG stream shifts.
     """
+    pair = swap_candidate_replicas(replica_of_window, wi, wj)
+    if pair is None:
+        return None
+    i, j = pair
     wi = int(wi)
     wj = int(wj)
-    if wi == wj:
-        return None
-    n_win = int(replica_of_window.size)
-    if not (0 <= wi < n_win and 0 <= wj < n_win):
-        return None
-    i = int(replica_of_window[wi])
-    j = int(replica_of_window[wj])
-    if i < 0 or j < 0 or i == j:
-        return None
     # bias_matrix_kj[window, replica] = U_window(x_replica)
     old_e = float(bias_matrix_kj[wi, i] + bias_matrix_kj[wj, j])
     new_e = float(bias_matrix_kj[wj, i] + bias_matrix_kj[wi, j])
@@ -877,6 +898,95 @@ def apply_window_swap(
         replica_of_window[int(assignments[i])] = int(i)
         replica_of_window[int(assignments[j])] = int(j)
     return SwapOutcome(i, j, delta, pacc, accepted)
+
+
+class GibbsProposal(NamedTuple):
+    """One replica's heat-bath proposal and its Metropolis-Hastings correction.
+
+    ``pacc`` is what the caller must hand to :func:`apply_window_swap` as
+    ``p_override``. It is NOT 1.0: the heat-bath proposal is nonuniform, so
+    accepting a selected move unconditionally biases the permutation chain.
+    """
+    current_window: int
+    proposed_window: int
+    delta_kj: float
+    q_forward: float
+    q_reverse: float
+    pacc: float
+    stayed: bool          # the proposal selected the current window
+    no_candidates: bool   # every candidate was NaN-masked out
+
+
+def gibbs_propose_one_replica(
+    bias_matrix_kj,
+    beta: float,
+    assignments,
+    replica_of_window,
+    replica_index: int,
+    choose,
+) -> "GibbsProposal":
+    """Decide one `gibbs-walk` move: propose, reverse-propose, MH-correct.
+
+    Split out of ``run_gareus``'s exchange closure so the exact-enumeration
+    tests drive *this* code rather than a copy of it. A hand-written mirror of
+    these six steps in a test proves only that the mirror is self-consistent --
+    it cannot see a defect introduced on the production side.
+
+    ``choose(n_candidates, probabilities) -> index`` is the sampling step,
+    injected so the caller supplies the RNG and a test can enumerate every
+    branch deterministically. Production passes ``rng.choice``.
+
+    The reverse proposal is evaluated against ``holders_after`` -- the holder
+    table as it *would* be post-swap -- because MH requires the reverse
+    probability from the destination state, not the current one. Getting this
+    wrong is the classic heat-bath-with-MH bug and it is silent: the chain
+    still runs, it just no longer targets pi.
+    """
+    rep = int(replica_index)
+    wi = int(assignments[rep])
+    proposal = _gibbs_window_proposal_distribution(
+        beta=float(beta),
+        bias_matrix_kj=bias_matrix_kj,
+        replica_index=rep,
+        current_window=wi,
+        replica_of_window=replica_of_window,
+    )
+    valid_windows = proposal["windows"]
+    probs = proposal["probabilities"]
+    deltas = proposal["deltas_kj"]
+    if valid_windows.size <= 0 or probs.size <= 0:
+        return GibbsProposal(wi, wi, 0.0, 0.0, 0.0, 0.0, False, True)
+
+    choice_index = int(choose(int(valid_windows.size), probs))
+    wj = int(valid_windows[choice_index])
+    q_forward = float(probs[choice_index])
+    if wj == wi:
+        return GibbsProposal(wi, wi, 0.0, q_forward, 0.0, 0.0, True, False)
+
+    holders_after = np.asarray(replica_of_window).astype(np.int64, copy=True)
+    target_rep = int(holders_after[wj])
+    holders_after[wi] = target_rep
+    holders_after[wj] = rep
+    reverse = _gibbs_window_proposal_distribution(
+        beta=float(beta),
+        bias_matrix_kj=bias_matrix_kj,
+        replica_index=rep,
+        current_window=wj,
+        replica_of_window=holders_after,
+    )
+    rev_windows = reverse["windows"]
+    rev_probs = reverse["probabilities"]
+    rev_idx = np.where(rev_windows == wi)[0]
+    q_reverse = float(rev_probs[int(rev_idx[0])]) if rev_idx.size else 0.0
+    pacc = _gibbs_mh_acceptance_probability(
+        delta_kj=float(deltas[choice_index]),
+        beta=float(beta),
+        q_forward=q_forward,
+        q_reverse=q_reverse,
+    )
+    return GibbsProposal(
+        wi, wj, float(deltas[choice_index]), q_forward, q_reverse, float(pacc), False, False
+    )
 
 
 
@@ -6275,6 +6385,11 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             # drive them; the side effects below stay here. `force_accept` must not
             # consume a random number -- production short-circuited `rng.random()`
             # away, and drawing one anyway would shift every later RNG stream.
+            # Check attemptability BEFORE drawing: the original closure returned
+            # early on these cases without consuming a random number, and an
+            # extra draw shifts every downstream stream.
+            if swap_candidate_replicas(replica_of_window, wi, wj) is None:
+                return attempt
             outcome = apply_window_swap(
                 bias_matrix_kj, beta, assignments, replica_of_window, wi, wj,
                 None if force_accept else rng.random(),
@@ -6444,51 +6559,26 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     order = order[:limit]
                 for rep in order:
                     rep = int(rep)
-                    wi = int(assignments[rep])
-                    proposal = _gibbs_window_proposal_distribution(
-                        beta=float(beta),
-                        bias_matrix_kj=bias_matrix_kj,
-                        replica_index=rep,
-                        current_window=wi,
-                        replica_of_window=replica_of_window,
+                    prop = gibbs_propose_one_replica(
+                        bias_matrix_kj, float(beta), assignments, replica_of_window,
+                        rep, lambda k, p: int(rng.choice(k, p=p)),
                     )
-                    valid_windows = proposal["windows"]
-                    probs = proposal["probabilities"]
-                    deltas = proposal["deltas_kj"]
-                    if valid_windows.size <= 0 or probs.size <= 0:
+                    if prop.no_candidates:
                         exchange_stats["gibbs_all_nan_skips"] = exchange_stats.get("gibbs_all_nan_skips", 0) + 1
                         continue
-                    choice_index = int(rng.choice(valid_windows.size, p=probs))
-                    wj = int(valid_windows[choice_index])
                     exchange_stats["gibbs_choices"] = int(exchange_stats.get("gibbs_choices", 0) or 0) + 1
-                    if wj == wi:
+                    if prop.stayed:
                         exchange_stats["gibbs_stays"] = int(exchange_stats.get("gibbs_stays", 0) or 0) + 1
                         continue
+                    # Counted here, before the MH test, so this is a count of
+                    # PROPOSED moves. `gibbs_move_fraction` derived from it is a
+                    # proposal rate, not an acceptance rate.
                     exchange_stats["gibbs_moves"] = int(exchange_stats.get("gibbs_moves", 0) or 0) + 1
-                    q_forward = float(probs[choice_index])
-                    holders_after = replica_of_window.astype(np.int64, copy=True)
-                    target_rep = int(holders_after[wj])
-                    holders_after[wi] = target_rep
-                    holders_after[wj] = rep
-                    reverse = _gibbs_window_proposal_distribution(
-                        beta=float(beta),
-                        bias_matrix_kj=bias_matrix_kj,
-                        replica_index=rep,
-                        current_window=wj,
-                        replica_of_window=holders_after,
-                    )
-                    rev_windows = reverse["windows"]
-                    rev_probs = reverse["probabilities"]
-                    rev_idx = np.where(rev_windows == wi)[0]
-                    q_reverse = float(rev_probs[int(rev_idx[0])]) if rev_idx.size else 0.0
-                    pacc = _gibbs_mh_acceptance_probability(
-                        delta_kj=float(deltas[choice_index]),
-                        beta=float(beta),
-                        q_forward=q_forward,
-                        q_reverse=q_reverse,
-                    )
                     exchange_stats["gibbs_mh_corrected"] = True
-                    attempt = _attempt_window_swap(wi, wj, primary_values, bias_matrix_kj, absolute_step, attempt, p_override=pacc)
+                    attempt = _attempt_window_swap(
+                        prop.current_window, prop.proposed_window, primary_values,
+                        bias_matrix_kj, absolute_step, attempt, p_override=prop.pacc,
+                    )
                 parquet_exchange_writer.flush() if bool(getattr(args, "flush_every_log", True)) else None
                 return parity, attempt
 
