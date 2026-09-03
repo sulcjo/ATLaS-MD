@@ -1,0 +1,123 @@
+schema_version: '2.0'
+description: >
+  Chignolin (GYDPETGTWG) GENPEPT seed generation, expressed with the
+  length-invariant contact bias. A worked example of porting a config off
+  contact_bias_strength; the parameters otherwise mirror the local
+  RUNS/chignolin.yaml that produced the r7 reference run.
+
+  Run with:  python GENPEPT.py --config examples/chignolin_genpept_contact_bias_sigma.yaml
+
+# ---------------------------------------------------------------------------
+# Why this file exists
+#
+# The r7 reference config (RUNS/chignolin.yaml, local and untracked) uses
+# `contact_bias_strength: 0.15`. That knob measures a
+# conformer's shortfall against a COMBINATORIAL maximum, m(m+1)/2 with
+# m = n_residues - 1 - contact_min_sep. That bound grows as O(n^2) while the
+# contact counts a peptide actually reaches grow far slower, so the same number
+# means something different on every sequence length:
+#
+#     10-mer (this file)  reference 21, reached 24  -> gentle suppression
+#     25-mer (CB1 ICL3)   reference 231, mean 28    -> acceptance 1.4e-7
+#
+# On a 25-mer that value rejects essentially every proposal. Rejected proposals
+# are discarded rather than retried and `n` is a trial count rather than a
+# target, so the run builds all its conformers, keeps none, and produces an
+# empty seed bank hours later. GENPEPT now refuses to start in that case.
+#
+# `contact_bias_sigma` measures the same shortfall in standard deviations of
+# THIS sequence's own contact-count distribution, referenced to its 95th
+# percentile. Both are measured at startup from a deterministic subsample of
+# the run's own conformers, so the number transfers between sequences.
+#
+# ---------------------------------------------------------------------------
+# Calibration measured for this exact config (2,000-conformer subsample):
+#
+#     contact_count  mean 6.0 +/- 5.3, p95 17
+#     -> reference 17.0, scale 5.3      (legacy combinatorial reference: 21)
+#
+#     sigma   acceptance   p95:p5 enrichment
+#      0.50       39.7%            5.0x
+#      0.75       27.6%           11.0x
+#      1.00       20.6%           24.6x     <- used here
+#      1.25       16.3%           54.8x
+#      2.00       10.4%          604.7x
+#
+# Mapping from the old knob: both forms are exponential-linear in contact
+# count, so the SELECTIVITY SLOPE matches at
+#
+#     sigma ~= contact_bias_strength * scale
+#
+# For this config that is 0.15 * 5.3 ~= 0.8, which gives 11x enrichment against
+# the ~13x the legacy setting produced. Acceptance still differs (27.6% vs
+# 15.3%) because the reference moves from 21 to 17 -- the legacy reference sits
+# above what the peptide reaches, so it suppresses everything a little harder.
+#
+# sigma = 1.0 is used below rather than 0.8 because it is the portable default:
+# it gives 20.6% acceptance here and 21.6% on a 25-mer, with ~25x and ~20x
+# enrichment respectively. Choose 0.8 instead if the goal is to match this
+# peptide's previous ensemble rather than to run a comparable setting across
+# sequences.
+#
+# To reproduce the published r7 run byte-for-byte, use RUNS/chignolin.yaml
+# as-is.
+# The legacy knob is unchanged and still supported; the two are mutually
+# exclusive and setting both is an error.
+# ---------------------------------------------------------------------------
+
+genpept:
+  seq: "GYDPETGTWG"
+  out: "chignolin_genpept_sigma"   # relative to this config file
+  clean: false
+  two_stage: true
+  implicit_only: true
+  n: 500000
+  n_candidate_seeds: 5000
+  n_final_seeds: 2500
+  jobs: 16
+  min_jobs: 1
+  generation_backend: full
+  rama_sampling: stratified
+  initial_diversity_features: mixed
+  diversity_bank_preset: broad
+
+  # The change. Was: contact_bias_strength: 0.15
+  contact_bias_sigma: 1.0
+
+  preselection_bin_quota: 6
+  preselection_rg_bin_A: 1.0
+  preselection_e2e_bin_A: 1.0
+  preselection_contact_bin: 2
+  preselection_include_bank: true
+  adaptive_min: true
+  implicit_max_iterations: 300
+  adaptive_min_chunk_iterations: 25
+  adaptive_min_energy_tol: 0.05
+  adaptive_min_force_tol: 500.0
+  adaptive_min_stall_rounds: 2
+  basin_hop: true
+  bh_parent_seeds: 120
+  bh_steps: 3
+  bh_md_steps: 350
+  bh_temperature: 675.0
+  bh_friction: 5.0
+  bh_timestep: 0.0035
+  bh_hmr_mass: 3.014
+  bh_initial_min_iterations: 200
+  bh_min_iterations: 150
+  bh_restart_from_parent: true
+  nma_expand: true
+  nma_modes: 2
+  nma_amplitudes: "0.75,1.35"
+  nma_cutoff: 12.0
+  explore_loop: true
+  explore_rounds: 5
+  explore_proposals: 50000
+  explore_keep: 250
+  explore_bins: 45
+  explore_target_max_count: 0
+  explore_pca_padding: 0.15
+  explore_frontier_only: true
+  explore_allow_outside: true
+  explore_max_kept_per_bin: 4
+  explore_bh: false
