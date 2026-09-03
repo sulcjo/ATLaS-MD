@@ -425,6 +425,12 @@ class GenConfig:
     diversity_bank_preset: str = "off"
     diversity_bank_wide_angle_sd: float = 45.0
     contact_bias_strength: float = 0.0
+    # Length-invariant alternative to contact_bias_strength. Non-zero selects the
+    # z-score bias; ref/scale are calibrated once in main and passed in, so no
+    # worker recomputes them.
+    contact_bias_sigma: float = 0.0
+    contact_bias_ref: float = 0.0
+    contact_bias_scale: float = 0.0
 
 
 @dataclass
@@ -1757,23 +1763,178 @@ def _contact_bias_max_ccount(n_residues: int, min_sep: int) -> int:
     return m * (m + 1) // 2
 
 
+CONTACT_BIAS_CALIBRATION_SAMPLE = 2000
+
+
+def contact_bias_sample_ccounts(cfg, n_sample: int = CONTACT_BIAS_CALIBRATION_SAMPLE):
+    """Contact counts of a deterministic subsample of the run's own conformers.
+
+    Generation is reproducible from (seq, seed, n_requested, conformer_idx), so
+    evenly spaced indices over the requested range can be rebuilt here, before
+    any worker starts, without a pilot phase or an extra user-facing knob. Only
+    the cheap Ca trace is built -- this is a few seconds even for the largest
+    runs.
+    """
+    seq = str(cfg.seq)
+    n_requested = max(1, int(cfg.n_requested))
+    n_sample = max(1, min(int(n_sample), n_requested))
+    step = max(1, n_requested // n_sample)
+    counts = []
+    for idx in range(0, n_requested, step):
+        if len(counts) >= n_sample:
+            break
+        rng = np.random.default_rng(int(cfg.seed) + int(idx))
+        bank = select_diversity_bank(cfg, int(idx))
+        _states, phis, psis = sample_states_and_angles(
+            seq,
+            cfg.angle_sd_deg,
+            rng,
+            rama_sampling=cfg.rama_sampling,
+            conformer_idx=int(idx),
+            n_requested=n_requested,
+            base_seed=int(cfg.seed),
+            bank=bank,
+        )
+        ca = fast_ca_coords_from_angles(seq, phis, psis)
+        if len(ca) < 2 or not np.isfinite(ca).all():
+            continue
+        _cvec, ccount = contact_vector_from_coords(ca, cfg.contact_cutoff_A, cfg.contact_min_sep)
+        counts.append(int(ccount))
+    return np.asarray(counts, dtype=np.float64)
+
+
+def contact_bias_calibration(cfg, n_sample: int = CONTACT_BIAS_CALIBRATION_SAMPLE):
+    """(ref, scale) for the z-score bias, measured on what this peptide can do.
+
+    ref is the 95th percentile of observed contact_count and scale its standard
+    deviation, so `sigma` means "standard deviations of shortfall below a
+    near-best conformer", which is comparable across sequence lengths. Contrast
+    _contact_bias_max_ccount, whose combinatorial bound grows as O(n^2) while
+    reachable contact counts grow far slower -- see the note there.
+    """
+    counts = contact_bias_sample_ccounts(cfg, n_sample=n_sample)
+    if counts.size == 0:
+        return 0.0, 1.0
+    ref = float(np.percentile(counts, 95))
+    scale = float(counts.std())
+    if not np.isfinite(scale) or scale <= 0.0:
+        scale = 1.0
+    return ref, scale
+
+
+def contact_bias_accept_prob(cfg, ccount: float) -> float:
+    """Acceptance probability for one conformer under whichever bias is set."""
+    sigma = float(getattr(cfg, "contact_bias_sigma", 0.0) or 0.0)
+    if sigma != 0.0:
+        scale = float(getattr(cfg, "contact_bias_scale", 0.0) or 0.0) or 1.0
+        ref = float(getattr(cfg, "contact_bias_ref", 0.0) or 0.0)
+        exponent = sigma * (float(ccount) - ref) / scale
+    else:
+        strength = float(getattr(cfg, "contact_bias_strength", 0.0) or 0.0)
+        if strength == 0.0:
+            return 1.0
+        ref = (
+            _contact_bias_max_ccount(len(str(cfg.seq)), int(cfg.contact_min_sep))
+            if strength > 0.0
+            else 0
+        )
+        exponent = strength * (float(ccount) - ref)
+    return min(1.0, math.exp(max(-50.0, min(50.0, exponent))))
+
+
+def contact_bias_preflight(cfg, n_candidate_seeds: int, n_trials: int):
+    """Refuse to start a run whose bias would not leave enough conformers.
+
+    The failure this prevents is silent and expensive: a contact_bias_strength
+    carried over from a shorter peptide can drive acceptance to ~1e-7, and
+    because rejected proposals are discarded rather than retried and `n` is a
+    trial count rather than a target, the run builds every conformer, keeps
+    none, and hands an empty set to candidate selection hours later.
+
+    Returns a dict of measured quantities for logging. Raises SystemExit when
+    the expected yield falls below n_candidate_seeds.
+    """
+    sigma = float(getattr(cfg, "contact_bias_sigma", 0.0) or 0.0)
+    strength = float(getattr(cfg, "contact_bias_strength", 0.0) or 0.0)
+    if sigma == 0.0 and strength == 0.0:
+        return None
+
+    counts = contact_bias_sample_ccounts(cfg)
+    if counts.size == 0:
+        return None
+    probs = np.array([contact_bias_accept_prob(cfg, c) for c in counts], dtype=np.float64)
+    accept_fraction = float(probs.mean())
+    expected = accept_fraction * float(n_trials)
+
+    info = {
+        "mode": "sigma" if sigma != 0.0 else "strength",
+        "value": sigma if sigma != 0.0 else strength,
+        "sample_size": int(counts.size),
+        "ccount_mean": float(counts.mean()),
+        "ccount_sd": float(counts.std()),
+        "ccount_p95": float(np.percentile(counts, 95)),
+        "ref": float(getattr(cfg, "contact_bias_ref", 0.0) or 0.0) if sigma != 0.0
+               else float(_contact_bias_max_ccount(len(str(cfg.seq)), int(cfg.contact_min_sep))),
+        "accept_fraction": accept_fraction,
+        "expected_conformers": expected,
+    }
+    if expected >= float(n_candidate_seeds):
+        return info
+
+    # Suggest the sigma that would land at a comfortable 20% acceptance.
+    ref95 = float(np.percentile(counts, 95))
+    scale = float(counts.std()) or 1.0
+    suggestion = None
+    for trial in np.arange(0.1, 5.01, 0.05):
+        frac = float(np.mean(np.minimum(1.0, np.exp(np.clip(trial * (counts - ref95) / scale, -50, 50)))))
+        if frac <= 0.20:
+            suggestion = round(float(trial), 2)
+            break
+
+    raise SystemExit(
+        "GENPEPT: contact bias would reject almost everything -- refusing to start.\n"
+        f"  sequence            : {len(str(cfg.seq))} residues, min_sep {int(cfg.contact_min_sep)}\n"
+        f"  measured contacts   : mean {info['ccount_mean']:.1f} +/- {info['ccount_sd']:.1f}, "
+        f"p95 {info['ccount_p95']:.0f} (from {info['sample_size']} sampled conformers)\n"
+        f"  bias                : contact_bias_{info['mode']} = {info['value']}, reference {info['ref']:.0f}\n"
+        f"  expected acceptance : {accept_fraction:.3e} -> ~{expected:,.0f} conformers "
+        f"from {n_trials:,} trials, against n_candidate_seeds = {n_candidate_seeds:,}\n"
+        "\n"
+        "  contact_bias_strength is measured against a combinatorial maximum that grows\n"
+        "  as O(n^2) while reachable contact counts do not, so a value tuned on a shorter\n"
+        "  peptide is far too strong here. Use contact_bias_sigma instead: it is measured\n"
+        "  in standard deviations of this peptide's own contact-count distribution and\n"
+        "  means the same thing at any chain length.\n"
+        + (f"    contact_bias_sigma: {suggestion}   # ~20% acceptance on this sequence\n"
+           if suggestion is not None else "")
+        + "  Set the bias to 0 to disable it."
+    )
+
+
 def _contact_bias_accept(rng, cfg, ccount: int) -> bool:
     """Metropolis-style soft acceptance biasing generation toward higher contact_count.
 
-    accept_prob = min(1, exp(strength * (ccount - ref))), where ref is the
-    combinatorial max contact_count for this sequence/min-sep when strength > 0
-    (so the highest-contact conformer is always accepted and lower-contact ones
-    are progressively suppressed), or 0 when strength < 0 (mirrored: favors fewer
-    contacts). strength == 0.0 (default) disables the bias entirely (always
-    accept), preserving prior behavior by default.
+    Two parameterisations, mutually exclusive:
+
+    `contact_bias_sigma` (preferred) -- accept_prob = min(1, exp(sigma *
+    (ccount - ref) / scale)) with ref and scale measured from this run's own
+    conformers. sigma is "standard deviations of shortfall that cost a factor
+    of e", which means the same thing on a 10-mer and a 25-mer. sigma = 1.0 is
+    ~21% acceptance and ~20x p95:p5 enrichment on both.
+
+    `contact_bias_strength` (legacy) -- accept_prob = min(1, exp(strength *
+    (ccount - ref))) against the combinatorial maximum. Preserved unchanged for
+    reproducing existing runs, but it is NOT portable across sequence lengths:
+    the reference grows as O(n^2) while reachable contact counts do not, so a
+    value tuned on a short peptide rejects essentially everything on a longer
+    one. Guarded at startup by contact_bias_preflight.
+
+    Either at 0.0 (the default) disables the bias entirely.
     """
-    strength = float(getattr(cfg, "contact_bias_strength", 0.0))
-    if strength == 0.0:
+    prob = contact_bias_accept_prob(cfg, ccount)
+    if prob >= 1.0:
         return True
-    ref = _contact_bias_max_ccount(len(str(cfg.seq)), int(cfg.contact_min_sep)) if strength > 0.0 else 0
-    exponent = max(-50.0, min(50.0, strength * (float(ccount) - ref)))
-    accept_prob = min(1.0, math.exp(exponent))
-    return bool(rng.random() < accept_prob)
+    return bool(rng.random() < prob)
 
 
 def generate_one(task):
@@ -2497,10 +2658,27 @@ def generate_candidates(args):
         write_pdbs=bool(args.keep_all_pdbs),
         rama_sampling=str(getattr(args, "rama_sampling", "stratified")),
         generation_backend=generation_backend,
+        contact_bias_sigma=float(getattr(args, "contact_bias_sigma", 0.0) or 0.0),
         diversity_bank_preset=str(getattr(args, "diversity_bank_preset", "off")),
         diversity_bank_wide_angle_sd=float(getattr(args, "diversity_bank_wide_angle_sd", 45.0)),
         contact_bias_strength=float(getattr(args, "contact_bias_strength", 0.0)),
     )
+    # Calibrate the z-score bias against this sequence's own conformers, then refuse
+    # to start if whichever bias is set would not leave enough of them. Done before
+    # generation_config.json is written so the measured reference is recorded too.
+    if float(getattr(cfg, "contact_bias_sigma", 0.0) or 0.0) != 0.0:
+        cfg.contact_bias_ref, cfg.contact_bias_scale = contact_bias_calibration(cfg)
+    _bias_info = contact_bias_preflight(
+        cfg,
+        max(1, int(getattr(args, "n_candidate_seeds", 0) or 0)),
+        int(args.n),
+    )
+    if _bias_info:
+        ui_message(
+            "Contact bias: {mode}={value} | measured contacts {ccount_mean:.1f} "
+            "+/- {ccount_sd:.1f} (p95 {ccount_p95:.0f}) | reference {ref:.0f} | "
+            "expected acceptance {accept_fraction:.1%} (~{expected_conformers:,.0f} conformers)".format(**_bias_info)
+        )
     (out_dir / "generation_config.json").write_text(json.dumps(asdict(cfg), indent=2))
     require_generation_imports()
 
@@ -7251,6 +7429,13 @@ def parse_args(argv=None):
                    help="Generate conformers from multiple Ramachandran-prior banks before global diversity selection. 'broad/turbo' covers generic alpha/beta/turn/left/wide banks; 'chignolin' biases toward hairpin/turn-rich banks.")
     p.add_argument("--diversity-bank-wide-angle-sd", type=float, default=45.0,
                    help="Angle SD used by the wide_random diversity bank.")
+    p.add_argument("--contact-bias-sigma", type=float, default=0.0,
+                   help="Length-invariant contact bias, in standard deviations of this "
+                        "sequence's own contact-count distribution (reference = its 95th "
+                        "percentile, both measured at startup). sigma=1.0 is ~21%% acceptance "
+                        "and ~20x p95:p5 enrichment on a 10-mer and a 25-mer alike. Prefer "
+                        "this over --contact-bias-strength, which is not portable across "
+                        "sequence lengths. Mutually exclusive with it.")
     p.add_argument("--contact-bias-strength", type=float, default=0.0,
                    help="Metropolis-style soft acceptance bias during generation, applied per "
                         "conformer against contact_count. Positive values favor more contacts "
@@ -7499,6 +7684,13 @@ def parse_args(argv=None):
     args = p.parse_args(argv_list)
     args.config_compat_messages = list(_CONFIG_COMPAT_MESSAGES)
     args.config_compat_report = dict(_CONFIG_COMPAT_REPORT)
+    if float(getattr(args, "contact_bias_sigma", 0.0) or 0.0) != 0.0 and \
+            float(getattr(args, "contact_bias_strength", 0.0) or 0.0) != 0.0:
+        p.error(
+            "--contact-bias-sigma and --contact-bias-strength are mutually exclusive "
+            "(they are different parameterisations of the same bias). Use "
+            "--contact-bias-sigma unless you are reproducing an existing run."
+        )
     if args.seq in (None, ""):
         p.error("--seq is required unless provided by --config")
     if args.out in (None, ""):
