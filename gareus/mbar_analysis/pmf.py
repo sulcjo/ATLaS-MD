@@ -1671,6 +1671,50 @@ def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.nd
     }
 
 
+def _regime_independent_logw(d_regime: 'Data', args, _agm) -> tuple:
+    """Solve MBAR for ONE secondary-CV regime, using only that regime's rows.
+
+    Returns ``(logw, source)``, or ``(None, reason)`` when the regime has no
+    usable estimator.
+
+    Why a fresh solve rather than reweighting the regime out of the pooled
+    ``f_k``: across a CV2 regime change the pooled solve is not a single
+    Hamiltonian. Every row block is evaluated against its own regime's cv2,
+    so a state's column mixes two different bias definitions, and states
+    created after the switch have no meaningful value at all on pre-switch
+    rows. ``f_k`` from that solve is therefore not a property of one
+    Hamiltonian's population, which is precisely the assumption
+    ``_subset_logw_from_global_fk`` documents and relies on.
+
+    Solving per regime fixes more than ``f_k``. Because every backend takes
+    ``active = where(n_k > 0)``, restricting the ROWS to one regime also
+    drops the COLUMNS of states that hold no samples there -- so states
+    created after the switch leave the denominator entirely instead of
+    contributing a value for a state that never existed on these rows.
+    Partitioning rows prunes columns; the pooled solve cannot do that.
+
+    A regime is only ~6% of samples in the motivating run, so a solve that
+    does not converge is a real outcome, not a theoretical one. It is
+    reported as unavailable; callers must not substitute the pooled f_k.
+    """
+    try:
+        mb = _agm.solve_mbar(
+            d_regime.u_nk, d_regime.window,
+            tol=float(getattr(args, 'mbar_tol', 1e-10)),
+            backend=getattr(args, 'mbar_backend', 'auto'),
+            threads=getattr(args, 'mbar_threads', 0),
+            progress=None,
+        )
+    except Exception as exc:  # a thin regime can fail outright
+        return None, f'unavailable:solve_failed:{type(exc).__name__}'
+    if not mb.get('converged'):
+        return None, f"unavailable:not_converged:max_delta={float(mb.get('max_delta', float('nan'))):.3e}"
+    logw = np.asarray(mb['logw'], dtype=np.float64)
+    if not np.any(np.isfinite(logw)):
+        return None, 'unavailable:no_finite_logw'
+    return logw, 'per_regime_solve'
+
+
 def run_secondary_cv_analyses(d: 'Data', args, base_logw: np.ndarray, selected: str,
                                boost_ok: bool, kbt_kcal: float, out: Path,
                                warnings: list, progress: Optional['Progress'],
@@ -1681,15 +1725,29 @@ def run_secondary_cv_analyses(d: 'Data', args, base_logw: np.ndarray, selected: 
     case) are entirely unaffected: this degrades to the plain unmodified
     calls, writing to the same paths as before.
 
-    ``f_k_global`` should be the GLOBAL MBAR solve's ``f_k`` (``m['f_k']``)
-    when available. When multiple regimes exist, each regime's own logw is
-    recomputed from ``f_k_global`` and that regime's own per-state sample
-    counts (``_subset_logw_from_global_fk``) rather than naively slicing
-    ``base_logw`` to the regime's mask and renormalizing -- the naive slice
-    only corrects for the regime's overall size, not for different states
-    losing different *fractions* of their samples to the regime split. When
-    ``f_k_global`` is not supplied (e.g. older/direct callers), this falls
-    back to the previous naive mask-and-renormalize behavior.
+    When multiple regimes exist, each regime gets its OWN independent MBAR
+    solve over only its own rows (``_regime_independent_logw``). Neither
+    ``f_k_global`` nor ``base_logw`` is used to build a regime's weights.
+
+    This replaces reweighting each regime out of the pooled ``f_k``. That
+    approach fixed the binning axis but not the estimator: across a CV2
+    regime change the pooled solve splices two Hamiltonians into every
+    column, so its ``f_k`` is not the whole-population property that
+    ``_subset_logw_from_global_fk`` assumes, and the non-dominant regime's
+    PMF came out as one regime's ``f_k`` applied to the other regime's
+    ``u_nk``. On the motivating run the two CV2 definitions correlate at
+    only +0.16 on identical frames (max deviation 4.375 over n=152,576
+    stored feature rows), so that substitution is a near-orthogonal
+    coordinate rather than a small bias.
+
+    ``f_k_global`` is retained in the signature for callers that still pass
+    it, and is deliberately unused: there is no correct way to derive a
+    regime's weights from a cross-regime solve. A regime whose own solve
+    does not converge is reported unavailable rather than falling back.
+
+    Every returned info dict carries ``secondary_cv_logw_source``, so a
+    downstream consumer can tell a regime-internal estimate from an absent
+    one without inferring it from the file layout.
 
     Returns ``(secondary_cv_pmf_info, cv1_cv2_fes_info)`` for the *dominant*
     regime (or the only regime, if there's just one) -- same shape/keys
@@ -1718,16 +1776,31 @@ def run_secondary_cv_analyses(d: 'Data', args, base_logw: np.ndarray, selected: 
             _regime_secondary_cv = regime
         regime_meta = dict(d.meta); regime_meta['secondary_cv'] = _regime_secondary_cv
         d_regime = _agm._masked_data(d, mask, meta_override=regime_meta)
-        if f_k_global is not None:
-            base_logw_regime = _agm._subset_logw_from_global_fk(d_regime, f_k_global)
-        else:
-            base_logw_regime = np.asarray(base_logw, dtype=np.float64)[mask]
+        base_logw_regime, logw_source = _regime_independent_logw(d_regime, args, _agm)
         regime_out = out if is_dominant else out / f'secondary_cv_regime_{_agm._regime_slug(regime)}'
-        regime_out.mkdir(parents=True, exist_ok=True)
-        pmf_info = analyze_secondary_cv_pmf(d_regime, args, base_logw_regime, selected, boost_ok, kbt_kcal, regime_out, warnings, progress)
-        fes_info = (_agm.analyze_cv1_cv2_2d_fes(d_regime, args, base_logw_regime, selected, boost_ok, kbt_kcal, regime_out, warnings, progress)
-                    if isinstance(pmf_info, dict) and pmf_info.get('available')
-                    else {'available': False, 'reason': 'Secondary CV PMF unavailable'})
+        if base_logw_regime is None:
+            # No usable estimator for this regime. Emit NOTHING rather than
+            # falling back to the pooled f_k: across a regime change that
+            # fallback is the defect this function exists to avoid, and a
+            # silently wrong curve is worse than an absent one.
+            reason = (f'No regime-internal MBAR estimator for secondary-CV regime '
+                      f'{regime!r} ({logw_source}); refusing to reweight it with the '
+                      f'pooled f_k, whose state free energies are not valid across a '
+                      f'CV2 regime change.')
+            warnings.append(reason)
+            pmf_info = {'available': False, 'reason': reason,
+                        'secondary_cv_logw_source': logw_source}
+            fes_info = {'available': False, 'reason': reason,
+                        'secondary_cv_logw_source': logw_source}
+        else:
+            regime_out.mkdir(parents=True, exist_ok=True)
+            pmf_info = analyze_secondary_cv_pmf(d_regime, args, base_logw_regime, selected, boost_ok, kbt_kcal, regime_out, warnings, progress)
+            fes_info = (_agm.analyze_cv1_cv2_2d_fes(d_regime, args, base_logw_regime, selected, boost_ok, kbt_kcal, regime_out, warnings, progress)
+                        if isinstance(pmf_info, dict) and pmf_info.get('available')
+                        else {'available': False, 'reason': 'Secondary CV PMF unavailable'})
+            for _info in (pmf_info, fes_info):
+                if isinstance(_info, dict):
+                    _info['secondary_cv_logw_source'] = logw_source
         # Store shallow copies in the breakdown, not the live dicts -- the
         # dominant regime's own pmf_info/fes_info get a 'regime_breakdown' key
         # added to them below, and aliasing the same object here would nest
@@ -1735,6 +1808,7 @@ def run_secondary_cv_analyses(d: 'Data', args, base_logw: np.ndarray, selected: 
         # rejects; caught by an actual end-to-end run against chignolin_5).
         breakdown[regime] = {
             'is_dominant': is_dominant, 'n_samples': int(np.count_nonzero(mask)),
+            'secondary_cv_logw_source': logw_source,
             'secondary_cv_pmf': dict(pmf_info) if isinstance(pmf_info, dict) else pmf_info,
             'cv1_cv2_2d_fes': dict(fes_info) if isinstance(fes_info, dict) else fes_info,
         }
