@@ -387,10 +387,19 @@ def _secondary_cv_epoch_regime_masks(d: 'Data', warnings: Optional[list] = None)
     recentering of one coordinate -- they are different linear projections of
     the same raw torsion features, i.e. genuinely different order parameters.
     Pooling their raw cv2 values into one axis for a combined PMF/2D-FES
-    conflates two different physical quantities. This does *not* affect
-    MBAR's f_k/weights themselves (those are already correct after the
-    per-epoch-native bias fix in ``load_parquet_adaptive_union``) -- only
-    which samples' cv2 values get binned together for CV2-facing plots.
+    conflates two different physical quantities.
+
+    This mask used to be described as affecting only which samples' cv2
+    values get binned together, on the grounds that the per-epoch-native bias
+    fix in ``load_parquet_adaptive_union`` already made f_k correct. That was
+    wrong, and the weights are affected too. The per-epoch-native fix makes
+    each epoch's u_nk internally consistent, but it does not make state k one
+    Hamiltonian ACROSS the switch: each row block is evaluated against its own
+    regime's cv2, so a column mixes two bias definitions, and states created
+    after the switch have no meaningful value on pre-switch rows. The pooled
+    f_k is therefore not the whole-population property a subset reweight
+    assumes. ``pmf.run_secondary_cv_analyses`` accordingly solves each regime
+    independently rather than reweighting it out of the pooled f_k.
 
     Returns ``None`` when there is only one regime (the overwhelming
     majority of runs) -- callers should fall back to the existing
