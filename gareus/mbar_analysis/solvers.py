@@ -1144,11 +1144,17 @@ def _subset_logw_from_global_fk(d_subset: 'Data', f_k_global: np.ndarray) -> np.
         # f_k_global.size rather than from u_nk.shape as in the solve_mbar*
         # backends below -- the two are not structurally guaranteed equal at
         # this call site the way they are there.)
-        tmp = log_n[None, :] + f_active[None, :] - u_nk
+        full_columns = True
     else:
-        tmp = log_n[None, :] + f_active[None, :] - u_nk[:, active]
-    ld = logsumexp_axis1_finite(tmp)
-    logw_s = -ld
+        full_columns = False
+    row_terms = log_n[None, :] + f_active[None, :]
+    N = u_nk.shape[0]
+    logw_s = np.empty(N, dtype=np.float64)
+    chunk = max(1, (1 << 22) // max(1, active.size))
+    for start in range(0, N, chunk):
+        stop = min(start + chunk, N)
+        block = u_nk[start:stop] if full_columns else u_nk[start:stop, active]
+        logw_s[start:stop] = -logsumexp_axis1_finite(row_terms - block)
     logw_s -= logsumexp(logw_s)
     return logw_s
 

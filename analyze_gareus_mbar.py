@@ -719,15 +719,57 @@ def _get_convergence_mbar_cache(args) -> dict:
     prefix sample mask. MBAR weights depend only on u_nk/window plus that mask,
     not on which scalar observable is histogrammed, so those solves can be
     safely reused within one analysis run.
+
+    The cache is BOUNDED (see _BoundedMbarCache / --convergence-mbar-cache-max-mb):
+    every prefix mask is unique, so at high --convergence-timepoints each entry
+    retains a per-sample logw array (hundreds of MB each on tens-of-millions-
+    of-samples runs) and an unbounded dict grows past available RAM before the
+    loop finishes.
     """
     cache = getattr(args, '_convergence_mbar_cache', None)
     if cache is None:
-        cache = {}
+        try:
+            max_mb = int(getattr(args, 'convergence_mbar_cache_max_mb', 4096))
+        except Exception:
+            max_mb = 4096
+        cache = _BoundedMbarCache(max_mb * 1024 * 1024) if max_mb > 0 else {}
         try:
             setattr(args, '_convergence_mbar_cache', cache)
         except Exception:
             return {}
     return cache
+
+
+class _BoundedMbarCache(dict):
+    """Insertion-ordered dict of solve_mbar result dicts with a byte budget.
+
+    Only the per-sample 'logw' member is sizeable (f_k/n_k are O(K)); the
+    budget tracks logw bytes and evicts oldest-first. Evicted entries are
+    simply re-solved on a later miss -- slower, numerically identical.
+    """
+
+    def __init__(self, max_bytes: int):
+        super().__init__()
+        self._max_bytes = int(max(0, max_bytes))
+        self._bytes = 0
+
+    def __setitem__(self, key, value):
+        mb = value if isinstance(value, dict) else {}
+        lw = mb.get('logw')
+        cost = int(np.asarray(lw).nbytes) if lw is not None else 0
+        if key in self:
+            old = self[key]
+            old_lw = old.get('logw') if isinstance(old, dict) else None
+            self._bytes -= int(np.asarray(old_lw).nbytes) if old_lw is not None else 0
+            del self[key]
+        while self._bytes > 0 and self._bytes + cost > self._max_bytes:
+            oldest = next(iter(self))
+            old = self[oldest]
+            old_lw = old.get('logw') if isinstance(old, dict) else None
+            self._bytes -= int(np.asarray(old_lw).nbytes) if old_lw is not None else 0
+            del self[oldest]
+        self._bytes += cost
+        super().__setitem__(key, value)
 
 
 def _convergence_mask_digest(mask: np.ndarray) -> str:
@@ -4772,6 +4814,7 @@ def analyze(d,args, progress: Optional[Progress] = None):
         out_epoch0=out/'epoch_000_separate'; out_epoch0.mkdir(parents=True,exist_ok=True)
         logw_epoch0=_subset_logw_from_global_fk(d_epoch0,m['f_k'])
         epoch0_report_info=run_pmf_and_gamd_boost_report(d_epoch0,args,logw_epoch0,bins,kbt_kcal,out_epoch0,warn,progress,warning_prefix='[epoch_000 report] ')
+        del d_epoch0, logw_epoch0
         d_main=_masked_data(d,mask_rest); logw_main=_subset_logw_from_global_fk(d_main,m['f_k'])
         main_precomputed_base_w=None
     else:
@@ -4988,6 +5031,7 @@ def parse_args(argv=None):
     p.add_argument('--no-extra-pmfs', action='store_true', help='Disable phi/psi, Ramachandran, SASA, secondary-structure, and internal-contact PMFs. Convenience alias for --extra-pmf-from-trajectories never.')
     p.add_argument('--no-convergence', action='store_true', help='Skip prefix PMF convergence testing for all scalar observables.')
     p.add_argument('--no-convergence-mbar-cache', action='store_true', help='Disable the in-memory cache that reuses identical prefix MBAR solves across scalar convergence analyses.')
+    p.add_argument('--convergence-mbar-cache-max-mb', type=int, default=4096, help='Total MBAR logw bytes (MB) the in-memory prefix-MBAR cache may retain before oldest entries are evicted; 0 removes the bound.')
     p.add_argument('--basin-min-depth-kcal', type=float, default=0.3, help='Minimum PMF depth (kcal/mol) for a local minimum to count as a distinct basin in basin-population tracking.')
     p.add_argument('--no-basin-tracking', action='store_true', help='Disable basin population tracking during main CV convergence analysis.')
     p.add_argument('--skip-first-n-frames', type=int, default=0, metavar='N', help='Discard the first N samples from each replica (sorted by production step) before analysis. Useful for equilibration burn-in. Default 0 (keep all).')
