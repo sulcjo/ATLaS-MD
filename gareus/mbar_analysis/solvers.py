@@ -81,6 +81,15 @@ SAMBAR_POLISH_BACKEND = 'numba-anderson'
 # susceptibility to ill‑conditioning.  See solve_mbar_numba_anderson().
 MBAR_ANDERSON_HISTORY = 5
 
+# Row-block size, in matrix ELEMENTS, for the logw reduction in
+# logw_from_fk().  The reduction is row-independent, so blocking changes
+# nothing but peak memory: the alternative is one (N, K) float64 temporary,
+# which is what used to exhaust RAM on tens-of-millions-of-samples runs.
+# Row count per block is this divided by the active-state count, so the
+# temporary stays ~32 MB regardless of K.  Tests monkeypatch this down to
+# force the multi-block path on small inputs.
+SUBSET_LOGW_CHUNK_ELEMENTS = 1 << 22
+
 
 def logsumexp(a,axis=None):
     """Small dependency-free logsumexp.
@@ -1125,32 +1134,66 @@ def _subset_logw_from_global_fk(d_subset: 'Data', f_k_global: np.ndarray) -> np.
     reduces to f_k_global's own logw exactly (same N_k, same f_k, same u_nk
     used to derive it in the first place).
     """
-    K = int(f_k_global.size)
-    u_nk = np.asarray(d_subset.u_nk, dtype=np.float64)
-    window = np.asarray(d_subset.window, dtype=np.int64)
-    f_k_global = np.asarray(f_k_global, dtype=np.float64)
-    n_k_subset = np.bincount(window[(window >= 0) & (window < K)], minlength=K).astype(np.float64)
-    active = np.where((n_k_subset > 0) & np.isfinite(f_k_global[:K]))[0]
+    return logw_from_fk(d_subset.u_nk, d_subset.window, f_k_global)
+
+
+def logw_from_fk(u_nk, window, f_k) -> np.ndarray:
+    """Normalized per-sample MBAR log-weights for ``f_k`` and ``window``.
+
+        logw[n] = -logsumexp_k( log(N_k[k]) + f_k[k] - u_nk[n, k] )
+
+    then shifted so ``logsumexp(logw) == 0``.  ``N_k`` is derived from
+    ``window``, so this is always the log-weight set implied by *these* rows
+    together with *these* state free energies -- the caller owns the question
+    of whether that pairing is meaningful.
+
+    Two distinct callers, and the distinction matters:
+
+    * ``_subset_logw_from_global_fk`` pairs a SUBSET's rows with a global
+      ``f_k``.  That is deliberately an approximation, justified in that
+      function's own docstring.
+    * Reconstructing the log-weights a ``solve_mbar`` backend already
+      returned, from the ``f_k`` it converged on and the same rows it was
+      given.  That is exact, not an approximation: every backend computes
+      its returned ``logw`` by precisely this expression (``lw = -ld``, then
+      ``lw -= logsumexp(lw)``), so the only differences are floating-point
+      reduction order.  Inactive states carry a non-finite ``f_k`` (backends
+      return ``np.nan`` outside ``active``) and drop out of the sum, which
+      reproduces the backend's own active set.
+
+    States are dropped from the denominator (equivalent to ``log(0) = -inf``)
+    when they hold no samples in ``window``, or when their ``f_k`` is
+    non-finite.
+    """
+    f_k = np.asarray(f_k, dtype=np.float64)
+    K = int(f_k.size)
+    u_nk = np.asarray(u_nk, dtype=np.float64)
+    window = np.asarray(window, dtype=np.int64)
+    n_k = np.bincount(window[(window >= 0) & (window < K)], minlength=K).astype(np.float64)
+    active = np.where((n_k > 0) & np.isfinite(f_k[:K]))[0]
     if active.size == 0:
         return np.full(u_nk.shape[0], -np.inf, dtype=np.float64)
-    log_n = np.log(n_k_subset[active])
-    f_active = f_k_global[active]
+    log_n = np.log(n_k[active])
+    f_active = f_k[active]
     if active.size == K and u_nk.shape[1] == K:
         # active is every column 0..K-1 (a size-K subset of the size-K
         # np.where domain must BE the whole domain) AND u_nk has exactly K
         # columns, so u_nk[:, active] would just be a full copy of u_nk
         # itself. Skip the copy. (Guarding on u_nk.shape[1] too, not just
-        # active.size==K, matters here specifically because K comes from
-        # f_k_global.size rather than from u_nk.shape as in the solve_mbar*
-        # backends below -- the two are not structurally guaranteed equal at
-        # this call site the way they are there.)
+        # active.size==K, matters because K comes from f_k.size rather than
+        # from u_nk.shape as in the solve_mbar* backends above -- the two are
+        # not structurally guaranteed equal for every caller the way they are
+        # there.)
         full_columns = True
     else:
         full_columns = False
     row_terms = log_n[None, :] + f_active[None, :]
     N = u_nk.shape[0]
     logw_s = np.empty(N, dtype=np.float64)
-    chunk = max(1, (1 << 22) // max(1, active.size))
+    # Blocked so the (stop-start, K) temporary stays bounded; logsumexp
+    # reduces with a PER-ROW maximum, so the blocked result is identical to
+    # the one-shot expression rather than merely close.
+    chunk = max(1, int(SUBSET_LOGW_CHUNK_ELEMENTS) // max(1, active.size))
     for start in range(0, N, chunk):
         stop = min(start + chunk, N)
         block = u_nk[start:stop] if full_columns else u_nk[start:stop, active]
@@ -1169,5 +1212,6 @@ __all__ = [
     "solve_mbar_sambar_warmstart", "solve_mbar_sambar", "solve_mbar_lbfgs",
     "solve_mbar", "overlap_matrix", "make_overlap_bins",
     "OVERLAP_SECONDARY_BINS", "OVERLAP_CHUNK_BYTES", "OVERLAP_CHUNK_CELLS",
+    "SUBSET_LOGW_CHUNK_ELEMENTS", "logw_from_fk",
     "_subset_logw_from_global_fk",
 ]

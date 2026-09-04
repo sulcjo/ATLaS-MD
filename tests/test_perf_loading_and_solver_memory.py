@@ -209,6 +209,128 @@ def test_subset_logw_from_global_fk_extra_u_nk_columns_not_shortcut():
 
 
 # ---------------------------------------------------------------------------
+# Fix 5 -- logw_from_fk() blocks its reduction instead of materializing one
+# (N, K) float64 temporary, and the prefix-MBAR cache stores f_k instead of
+# the O(N) logw array and rebuilds it on a hit.
+# ---------------------------------------------------------------------------
+
+_SOLVERS = agm._mbar_solvers
+
+
+@pytest.mark.parametrize("drop_window", [None, 3])
+def test_logw_from_fk_blocked_matches_one_shot(monkeypatch, drop_window):
+    """Blocking the reduction must be EXACT, not merely close.
+
+    logsumexp_axis1_finite reduces with a per-row maximum, so row blocks are
+    independent and the result cannot depend on where the boundaries fall.
+    The default chunk (~4M elements / K) is far larger than any unit-test
+    problem, so the shipped constant would run the loop exactly once and
+    never exercise the multi-block path -- hence the monkeypatch.
+
+    drop_window=None keeps every window populated (active.size == K, the
+    u_nk-identity fast path); drop_window=3 empties one, forcing the
+    u_nk[:, active] fancy-index path.
+    """
+    window, u_nk = _all_active_problem()
+    if drop_window is not None:
+        keep = window != drop_window
+        window, u_nk = window[keep], u_nk[keep]
+    res = agm.solve_mbar(u_nk, window, backend="anderson", tol=1e-12, maxiter=20000)
+    f_k = res["f_k"]
+
+    K = int(f_k.size)
+    n_k = np.bincount(window[(window >= 0) & (window < K)], minlength=K)
+    n_active = int(np.count_nonzero((n_k > 0) & np.isfinite(f_k[:K])))
+    assert (n_active == K) == (drop_window is None)
+
+    # One block: chunk >= N.
+    monkeypatch.setattr(_SOLVERS, "SUBSET_LOGW_CHUNK_ELEMENTS", n_active * (u_nk.shape[0] + 1))
+    one_shot = _SOLVERS.logw_from_fk(u_nk, window, f_k)
+
+    # Many blocks: 8 rows each, so the loop runs O(N/8) times.
+    monkeypatch.setattr(_SOLVERS, "SUBSET_LOGW_CHUNK_ELEMENTS", n_active * 8)
+    blocked = _SOLVERS.logw_from_fk(u_nk, window, f_k)
+
+    assert u_nk.shape[0] > 8, "problem too small to exercise multiple blocks"
+    np.testing.assert_array_equal(blocked, one_shot)
+
+
+@pytest.mark.parametrize(
+    "backend,bitwise",
+    [
+        ("lbfgs", True),
+        ("anderson", True),
+        ("numpy", True),
+        ("numba", False),
+        ("numba-anderson", False),
+    ],
+)
+def test_logw_from_fk_reproduces_backend_logw(backend, bitwise):
+    """The premise of the slim cache: a backend's returned logw is recoverable
+    from the f_k it converged on, so only f_k needs caching.
+
+    Every backend computes logw as -logsumexp_k(log N_k + f_k - u_nk) then
+    normalizes, so the pure-numpy backends agree bitwise. The numba kernels
+    are fastmath and accumulate the denominator scalar-wise, giving a
+    different reduction order; measured deviation is ~3.6e-15 (a couple of
+    ULP on logw values of order log(N)), so the tolerance below leaves about
+    six orders of margin rather than being tuned to the observation.
+    """
+    if backend.startswith("numba") and not agm.NUMBA_AVAILABLE:
+        pytest.skip("numba not available")
+    window, u_nk = _all_active_problem()
+    res = agm.solve_mbar(u_nk, window, backend=backend, tol=1e-12, maxiter=20000)
+    assert res["converged"]
+
+    rebuilt = _SOLVERS.logw_from_fk(u_nk, window, res["f_k"])
+    native = np.asarray(res["logw"], dtype=np.float64)
+    if bitwise:
+        np.testing.assert_array_equal(rebuilt, native)
+    else:
+        np.testing.assert_allclose(rebuilt, native, rtol=0.0, atol=1e-9)
+
+
+def test_slim_mbar_entry_drops_logw_and_rehydrates():
+    """A cache entry must carry no O(N) array, and rehydrating one must
+    restore a result equivalent to the original solve."""
+    window, u_nk = _all_active_problem()
+    mb = agm.solve_mbar(u_nk, window, backend="anderson", tol=1e-12, maxiter=20000)
+
+    slim = agm._slim_mbar_entry(mb)
+    assert "logw" not in slim
+    assert set(slim) == set(mb) - {"logw"}
+    n_samples = u_nk.shape[0]
+    biggest = max(np.asarray(v).size for v in slim.values() if isinstance(v, np.ndarray))
+    assert biggest < n_samples, "cache entry still holds a per-sample array"
+
+    rehydrated = agm._rehydrate_mbar_entry(slim, u_nk, window)
+    np.testing.assert_array_equal(rehydrated["logw"], mb["logw"])
+    np.testing.assert_array_equal(rehydrated["f_k"], mb["f_k"])
+    assert rehydrated["converged"] == mb["converged"]
+    # The slim entry must not be mutated by rehydration -- it stays cached and
+    # gets rehydrated again on the next observable's pass over this prefix.
+    assert "logw" not in slim
+
+
+def test_convergence_mbar_cache_is_unbounded_and_flag_is_inert():
+    """The byte-budget machinery is gone: entries are O(K), so the cache is a
+    plain dict and --convergence-mbar-cache-max-mb no longer does anything.
+    The flag is still accepted so existing command lines keep working."""
+    class _Args:
+        pass
+
+    args = _Args()
+    args.convergence_mbar_cache_max_mb = 1  # would have bounded to 1 MB before
+    cache = agm._get_convergence_mbar_cache(args)
+    assert type(cache) is dict
+    # Same object on every call within one run (it hangs off args).
+    assert agm._get_convergence_mbar_cache(args) is cache
+
+    parsed = agm.parse_args(["--convergence-mbar-cache-max-mb", "7", "x"])
+    assert parsed.convergence_mbar_cache_max_mb == 7
+
+
+# ---------------------------------------------------------------------------
 # Fix 1b -- clean()'s all-finite fast path.
 # ---------------------------------------------------------------------------
 
