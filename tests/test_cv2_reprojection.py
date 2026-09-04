@@ -336,3 +336,103 @@ def test_per_regime_block_rejects_unknown_regime_and_bad_length():
     with pytest.raises(ValueError, match="state_regimes has"):
         _reconstruct_union_bias_block_per_regime(
             cv, {"a": cv2}, beta, pc, pk, sc, sk, ["a", "a"])
+
+
+# --- loader wiring ----------------------------------------------------------
+
+from gareus.mbar_analysis.cv2_reprojection import CV2_REPROJECTION_FILENAME  # noqa: E402
+from gareus.mbar_analysis.loaders_union_parquet import (  # noqa: E402
+    _load_cv2_reprojection,
+    _per_regime_bias_block,
+)
+
+
+def _write_reproj_table(tmp_path, steps, columns):
+    """Write a cv2_reprojected.parquet the way reproject_cv2.py does."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    data = {'steps': pa.array(np.asarray(steps, dtype=np.int64))}
+    for name, vals in columns.items():
+        data[f'cv2_{name}'] = pa.array(np.asarray(vals, dtype=np.float64))
+    pq.write_table(pa.table(data), str(tmp_path / CV2_REPROJECTION_FILENAME))
+
+
+def test_load_cv2_reprojection_absent_is_none(tmp_path):
+    """The table is an optional side-car; a run without one must load normally."""
+    assert _load_cv2_reprojection(tmp_path) is None
+
+
+def test_load_cv2_reprojection_unreadable_is_none(tmp_path):
+    """Unreadable is treated as missing rather than aborting the analysis."""
+    (tmp_path / CV2_REPROJECTION_FILENAME).write_text('not a parquet file')
+    assert _load_cv2_reprojection(tmp_path) is None
+
+
+def test_load_cv2_reprojection_reads_columns_and_drops_nonfinite(tmp_path):
+    """NaN rows are frames whose foreign cv2 was never recoverable; they must
+    not enter the table's step index as if they had a value."""
+    _write_reproj_table(tmp_path, [10, 20, 30],
+                        {'torsion-pca': [1.0, np.nan, 3.0],
+                         'tica-linear': [4.0, 5.0, 6.0]})
+    got = _load_cv2_reprojection(tmp_path)
+    assert set(got) == {'torsion-pca', 'tica-linear'}
+    np.testing.assert_array_equal(got['torsion-pca']['steps'], [10, 30])
+    np.testing.assert_allclose(got['torsion-pca']['cv2'], [1.0, 3.0])
+    np.testing.assert_array_equal(got['tica-linear']['steps'], [10, 20, 30])
+
+
+def test_per_regime_block_prefers_recorded_cv2_for_the_epochs_own_regime(tmp_path):
+    """The epoch's own regime uses the cv2 recorded while those frames ran --
+    exact for every row -- rather than a reprojection that only covers the
+    rows whose step was recoverable."""
+    rng = np.random.default_rng(20)
+    n, K, beta = 12, 2, 0.4
+    cv, pc, pk, sc, sk = _bias_inputs(rng, n, K)
+    steps = np.arange(n, dtype=np.int64) * 100
+    recorded = rng.normal(size=n)
+    foreign = rng.normal(size=n)
+    reproj = {'other': {'steps': steps, 'cv2': foreign},
+              # A deliberately WRONG value for the own regime: if the block
+              # used the table here instead of the recorded array, the
+              # comparison below would fail.
+              'own': {'steps': steps, 'cv2': recorded + 100.0}}
+
+    block, cov = _per_regime_bias_block(cv, steps, beta, pc, pk, sc, sk,
+                                         ['own', 'other'], reproj, recorded, 'own')
+    assert block is not None
+    assert cov == {'own': 1.0, 'other': 1.0}
+    expected = _reconstruct_union_bias_block_per_regime(
+        cv, {'own': recorded, 'other': foreign}, beta, pc, pk, sc, sk, ['own', 'other'])
+    np.testing.assert_array_equal(block, expected)
+
+
+def test_per_regime_block_reports_partial_foreign_coverage(tmp_path):
+    """Only ~10% of sample rows have a recoverable foreign cv2 on the
+    motivating run, so coverage must be reported, not assumed to be 1.0."""
+    rng = np.random.default_rng(21)
+    n, K, beta = 10, 2, 0.4
+    cv, pc, pk, sc, sk = _bias_inputs(rng, n, K)
+    steps = np.arange(n, dtype=np.int64) * 100
+    recorded = rng.normal(size=n)
+    reproj = {'other': {'steps': steps[:4], 'cv2': rng.normal(size=4)}}
+
+    block, cov = _per_regime_bias_block(cv, steps, beta, pc, pk, sc, sk,
+                                         ['own', 'other'], reproj, recorded, 'own')
+    assert block is not None
+    assert cov['other'] == pytest.approx(0.4)
+    # Uncovered rows stay NaN in the foreign column so clean() drops them.
+    assert np.isfinite(block[:4, 1]).all()
+    assert not np.isfinite(block[4:, 1]).any()
+    assert np.isfinite(block[:, 0]).all()
+
+
+def test_per_regime_block_declines_when_a_regime_is_missing(tmp_path):
+    """Rather than filling a needed regime with guesses, decline and let the
+    caller keep the existing single-cv2 behaviour."""
+    rng = np.random.default_rng(22)
+    n, K, beta = 8, 2, 0.4
+    cv, pc, pk, sc, sk = _bias_inputs(rng, n, K)
+    steps = np.arange(n, dtype=np.int64) * 100
+    block, cov = _per_regime_bias_block(cv, steps, beta, pc, pk, sc, sk,
+                                         ['own', 'absent'], {}, rng.normal(size=n), 'own')
+    assert block is None and cov == {}
