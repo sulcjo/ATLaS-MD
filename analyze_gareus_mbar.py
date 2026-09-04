@@ -4765,8 +4765,28 @@ def _report_summary_fields(report_info: dict) -> dict:
     }
 
 
-def analyze(d,args, progress: Optional[Progress] = None):
-    out=d.out_dir; out.mkdir(parents=True,exist_ok=True); N,K=d.u_nk.shape; kbt_kj=1.0/d.beta; kbt_kcal=kbt_kj/KJ_PER_KCAL; warn=list(d.meta.get('load_notes',[]))
+def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None, *,
+                          regime: Optional[str] = None, run_convergence: bool = True,
+                          convergence_skip_reason: str = ''):
+    """The full analysis suite for ONE self-consistent population.
+
+    Everything downstream of the MBAR solve, for a set of samples that is a
+    single Hamiltonian: the solve itself, the PMF/GaMD-boost report, every
+    observable analysis, convergence, and the written summary. Writes into the
+    given ``out`` rather than ``d.out_dir``, so a caller can produce one
+    complete output tree per population.
+
+    ``analyze`` calls this once per secondary-CV regime when a run redefined
+    its CV2 mid-campaign, and exactly once (with ``out=d.out_dir``) otherwise
+    -- the single-regime path is unchanged, which is the overwhelming majority
+    of runs.
+
+    ``run_convergence=False`` skips the prefix-PMF convergence stages
+    outright; the summary then records WHY they are absent rather than
+    omitting the keys, so a consumer never has to guess whether a missing
+    convergence block means "deliberately skipped" or "crashed".
+    """
+    out=Path(out); out.mkdir(parents=True,exist_ok=True); N,K=d.u_nk.shape; kbt_kj=1.0/d.beta; kbt_kcal=kbt_kj/KJ_PER_KCAL; warn=list(d.meta.get('load_notes',[]))
     if progress is not None: progress.step('analysis', f'loaded {N} samples across {K} windows from {d.source}')
     m=solve_mbar(d.u_nk,d.window, tol=float(getattr(args,'mbar_tol',1e-10)), progress=progress, backend=getattr(args,'mbar_backend','auto'), threads=getattr(args,'mbar_threads',0)); base_w=norm_logw(m['logw'])
     if progress is not None: progress.bar('analysis stages', 1, 6, 'MBAR solved', force=True)
@@ -4843,11 +4863,29 @@ def analyze(d,args, progress: Optional[Progress] = None):
     # (confirmed: this propagated into gareus_report.py's top-level
     # PASS/CAUTION/FAIL verdict for every multi-epoch adaptive-production
     # run). When no split exists, d_main is d itself, so this is unchanged.
-    conv_info=run_pmf_convergence(d_main,args,bins,selected,sel,out,progress=progress,f_init_hint=m.get('f_k'))
-    epoch_conv_info={}
-    if d_main.meta.get('_epoch_source'):
-        epoch_conv_info=run_epoch_pmf_convergence(d_main,args,bins,selected,sel,out,progress=progress,f_init_hint=m.get('f_k'))
-    s={'production_dir':str(d.prod_dir),'output_dir':str(out),'source':d.source,'n_samples':int(N),'n_windows':int(K),'temperature_K':float(d.temp),'beta_1_over_kj_mol':float(d.beta),'cv_min_A':float(np.nanmin(d.cv)),'cv_max_A':float(np.nanmax(d.cv)),'primary_cv_units':_primary_cv_units(d.meta),'primary_cv_axis_label':_primary_cv_axis_label(d.meta),**_report_summary_fields(main_report_info),'mbar':{'converged':bool(m['converged']),'iterations':int(m['iterations']),'max_delta':float(m['max_delta']),'backend':m.get('backend','unknown'),'threads':m.get('threads',None),'active_states':[int(x) for x in m['active']],'n_k':[int(x) for x in m['n_k']],'base_ess':float(ess(base_w))},'warnings':warn,'files':{**main_report_info['files'],'summary_md':str(out/'pmf_summary.md'),'summary_json':str(out/'pmf_summary.json')}}
+    if run_convergence:
+        conv_info=run_pmf_convergence(d_main,args,bins,selected,sel,out,progress=progress,f_init_hint=m.get('f_k'))
+        epoch_conv_info={}
+        if d_main.meta.get('_epoch_source'):
+            epoch_conv_info=run_epoch_pmf_convergence(d_main,args,bins,selected,sel,out,progress=progress,f_init_hint=m.get('f_k'))
+    else:
+        # Skipped, not empty-produced: an absent convergence block must say why.
+        # A thin population's prefix solves are unreliable (each prefix is a
+        # fraction of an already-small sample set) and cost a full MBAR solve
+        # per timepoint per observable, so this is off by default for any
+        # regime that is not the dominant one.
+        _skip = {'enabled': False, 'skipped': True,
+                 'reason': convergence_skip_reason or 'convergence not requested for this population'}
+        conv_info=dict(_skip)
+        epoch_conv_info=dict(_skip)
+    s={'production_dir':str(d.prod_dir),'output_dir':str(out),'source':d.source,
+       # Which population this summary describes. None for a normal
+       # single-regime run; the regime name when a run redefined its CV2
+       # mid-campaign and each regime was analysed separately. Present so a
+       # reader cannot mistake one regime's numbers -- possibly a small
+       # minority of the run's samples -- for the whole run's.
+       'secondary_cv_regime':regime,
+       'n_samples':int(N),'n_windows':int(K),'temperature_K':float(d.temp),'beta_1_over_kj_mol':float(d.beta),'cv_min_A':float(np.nanmin(d.cv)),'cv_max_A':float(np.nanmax(d.cv)),'primary_cv_units':_primary_cv_units(d.meta),'primary_cv_axis_label':_primary_cv_axis_label(d.meta),**_report_summary_fields(main_report_info),'mbar':{'converged':bool(m['converged']),'iterations':int(m['iterations']),'max_delta':float(m['max_delta']),'backend':m.get('backend','unknown'),'threads':m.get('threads',None),'active_states':[int(x) for x in m['active']],'n_k':[int(x) for x in m['n_k']],'base_ess':float(ess(base_w))},'warnings':warn,'files':{**main_report_info['files'],'summary_md':str(out/'pmf_summary.md'),'summary_json':str(out/'pmf_summary.json')}}
     if epoch0_report_info is not None:
         # Same fields as the main block, from the same single source, so the two
         # can never drift apart (and so a reader can compare the two regimes
@@ -4892,6 +4930,127 @@ def analyze(d,args, progress: Optional[Progress] = None):
     wjson(out/'pmf_summary.json',s); summary_md(out/'pmf_summary.md',s)
     if progress is not None: progress.bar('analysis stages', 6, 6, 'summary written', force=True)
     return s
+
+
+def analyze(d, args, progress: Optional[Progress] = None):
+    """Analyse a run, splitting it per secondary-CV regime when it has more than one.
+
+    A run that redefined its CV2 mid-campaign (the tICA auto-switch) is not
+    one MBAR problem. Each row block is evaluated against its own regime's
+    cv2, so a state's column mixes two bias definitions, and states created
+    after the switch have no meaningful value on pre-switch rows. A single
+    pooled solve over both is therefore not a solve of any Hamiltonian.
+
+    So each regime is analysed as its own population: its own MBAR solve from
+    scratch, its own state set (every backend takes ``active = where(n_k>0)``,
+    so restricting the rows also drops the columns of states absent from that
+    regime), and its own complete output tree. Nothing is reweighted across
+    the boundary.
+
+    Regimes are detected automatically from each phase's own
+    ``run_manifest.json`` (``resolved_args.secondary_cv``), via
+    ``_secondary_cv_epoch_regime_masks`` -- the same source the CV2-facing
+    split already used, so the two can never disagree about how many regimes
+    a run has. No flag, no directory renaming, no second invocation.
+
+    Layout follows the convention the CV2 split established: the DOMINANT
+    regime (the one containing the last phase) writes to the top-level output
+    directory, so existing paths keep working, and every other regime writes
+    to ``<out>/regime_<slug>/``. The returned summary is the dominant
+    regime's, carrying ``secondary_cv_regime`` and a ``regime_analyses`` index
+    of all of them.
+
+    Convergence runs for the dominant regime only, unless
+    ``--convergence-all-regimes`` is given. A non-dominant regime is typically
+    a small minority of the run (~6% for the motivating run's epoch_000), and
+    prefix convergence there both costs a full MBAR solve per timepoint per
+    observable and reports on prefixes of an already-thin sample set.
+
+    A side effect worth naming: within a per-regime population the epoch_000
+    sub-split (``_epoch_zero_split_masks``) no longer straddles a regime
+    boundary -- the pre-switch regime IS epoch_000, and the post-switch one
+    contains none of it -- so the pooled-f_k reweight that split used to
+    perform across the boundary simply does not arise here.
+    """
+    regimes = _secondary_cv_epoch_regime_masks(d, warnings=None)
+    if not regimes or len(regimes) < 2:
+        # The overwhelming majority of runs: one population, unchanged.
+        return _analyze_population(d, args, d.out_dir, progress)
+
+    out_root = Path(d.out_dir)
+    all_regimes = bool(getattr(args, 'convergence_all_regimes', False))
+    summaries: dict = {}
+    dominant_summary = None
+    for regime, (mask, is_dominant) in regimes.items():
+        n_regime = int(np.count_nonzero(mask))
+        regime_out = out_root if is_dominant else out_root / f'regime_{_regime_slug(regime)}'
+        _orig = d.meta.get('secondary_cv')
+        if isinstance(_orig, dict):
+            _regime_cv = dict(_orig); _regime_cv['mode'] = regime
+        else:
+            _regime_cv = regime
+        regime_meta = dict(d.meta); regime_meta['secondary_cv'] = _regime_cv
+        d_regime = _masked_data(d, mask, meta_override=regime_meta)
+        # Also retarget the Data's own out_dir, so any path derived from it
+        # rather than from the `out` argument still lands in this regime's tree.
+        d_regime.out_dir = regime_out
+        run_conv = bool(is_dominant or all_regimes)
+        skip_reason = ('' if run_conv else
+                       f'non-dominant secondary-CV regime {regime!r} '
+                       f'({n_regime} samples); pass --convergence-all-regimes to include it')
+        print(f'  [cv2 regime] analysing {regime!r} ({n_regime:,} samples, '
+              f'{"dominant" if is_dominant else "non-dominant"}) -> {regime_out}'
+              f'{"" if run_conv else "; convergence skipped"}')
+        s_regime = _analyze_population(d_regime, args, regime_out, progress,
+                                        regime=regime, run_convergence=run_conv,
+                                        convergence_skip_reason=skip_reason)
+        summaries[regime] = {
+            'is_dominant': bool(is_dominant),
+            'n_samples': n_regime,
+            'output_dir': str(regime_out),
+            'summary_json': str(regime_out / 'pmf_summary.json'),
+            'convergence_ran': run_conv,
+            'mbar_converged': bool(((s_regime or {}).get('mbar') or {}).get('converged', False)),
+        }
+        if is_dominant:
+            dominant_summary = s_regime
+    if dominant_summary is None:
+        # No regime was marked dominant (should not happen: the mask builder
+        # always marks the last phase's regime). Return the largest rather
+        # than nothing, and say so.
+        _biggest = max(summaries, key=lambda r: summaries[r]['n_samples'], default=None)
+        return {'available': False,
+                'reason': 'no dominant secondary-CV regime was identified',
+                'regime_analyses': summaries,
+                'secondary_cv_regime': _biggest}
+    dominant_summary['regime_analyses'] = summaries
+    dominant_summary.setdefault('warnings', []).append(
+        f'[cv2 regime split] This run redefined its secondary CV mid-campaign, so it was '
+        f'analysed as {len(summaries)} independent populations, each with its own MBAR solve '
+        f'and its own output tree: '
+        + '; '.join(f'{r} ({v["n_samples"]:,} samples -> {v["output_dir"]})'
+                    for r, v in summaries.items())
+        + '. THIS summary describes only the dominant regime '
+        f'({dominant_summary.get("secondary_cv_regime")!r}, '
+        f'{dominant_summary.get("n_samples", 0):,} samples). Free energies are not comparable '
+        'across regimes: each population is separately normalised, so compare ensemble-level '
+        'quantities (e.g. the two CV1 PMFs) rather than f_k.')
+    # Re-write the dominant summary so the index and the warning it just
+    # gained are actually on disk, not only in the returned dict.
+    _dom_out = Path(dominant_summary.get('output_dir') or out_root)
+    try:
+        wjson(_dom_out/'pmf_summary.json', dominant_summary)
+        summary_md(_dom_out/'pmf_summary.md', dominant_summary)
+    except Exception as _rewrite_exc:
+        # Same discipline as the health-verdict block inside
+        # _analyze_population: every regime's analysis has already completed
+        # and written its own summary by this point, so a failure to re-render
+        # the dominant one with the cross-regime index must not discard the
+        # work. Report it as a warning and return the summary anyway.
+        dominant_summary.setdefault('warnings', []).append(
+            f'[cv2 regime split] could not rewrite the dominant summary with the '
+            f'regime index: {type(_rewrite_exc).__name__}: {_rewrite_exc}')
+    return dominant_summary
 
 def parse_args(argv=None):
     p=argparse.ArgumentParser(description='GaREUS MBAR/PMF analysis. By default, this runs the full analysis suite: main CV PMF, convergence plots, Rg, distance-Rg 2D FES, PCA1-PCA2 FES, phi/psi/Ramachandran, SASA, secondary-structure fractions, and internal-contact PMFs whenever trajectories/topology are available.', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -5020,6 +5179,7 @@ def parse_args(argv=None):
     p.add_argument('--no-pca-fes', action='store_true', help='Disable PCA1-vs-PCA2 2D FES. Convenience alias for --pca-fes-from-trajectories never.')
     p.add_argument('--no-extra-pmfs', action='store_true', help='Disable phi/psi, Ramachandran, SASA, secondary-structure, and internal-contact PMFs. Convenience alias for --extra-pmf-from-trajectories never.')
     p.add_argument('--no-convergence', action='store_true', help='Skip prefix PMF convergence testing for all scalar observables.')
+    p.add_argument('--convergence-all-regimes', action='store_true', help='When a run redefined its secondary CV mid-campaign and is analysed as one population per regime, also run prefix-PMF convergence for the NON-dominant regimes. Off by default: a non-dominant regime is usually a small minority of the run, so its prefixes are thin, and convergence costs a full MBAR solve per timepoint per observable.')
     p.add_argument('--no-convergence-mbar-cache', action='store_true', help='Disable the in-memory cache that reuses identical prefix MBAR solves across scalar convergence analyses.')
     p.add_argument('--convergence-mbar-cache-max-mb', type=int, default=4096, help='DEPRECATED, accepted and ignored. The prefix-MBAR cache no longer retains per-sample logw arrays (it caches f_k and rebuilds logw on demand), so its footprint is O(K) per entry and needs no byte budget. Kept so existing command lines keep working; will be removed in a later release.')
     p.add_argument('--basin-min-depth-kcal', type=float, default=0.3, help='Minimum PMF depth (kcal/mol) for a local minimum to count as a distinct basin in basin-population tracking.')

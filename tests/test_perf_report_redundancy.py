@@ -210,9 +210,15 @@ def test_analyze_call_site_recomputes_for_split_reuses_for_no_split():
     Uses source-position ordering rather than exact-text matching so it
     survives incidental reformatting while still enforcing the control-flow
     contract.
+
+    Reads ``_analyze_population``, not ``analyze``: the single-population
+    analysis (which is where this contract lives) was extracted out of
+    ``analyze`` when the latter became the per-secondary-CV-regime
+    orchestrator. The contract itself is unchanged -- only the function
+    holding it moved.
     """
     import inspect
-    src = inspect.getsource(A.analyze)
+    src = inspect.getsource(A._analyze_population)
 
     pos_if = src.find("if epoch0_split is not None:")
     pos_none_assign = src.find("main_precomputed_base_w=None")
