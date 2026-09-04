@@ -24,6 +24,7 @@ them (see Plan A3's Global Constraints CORRECTION).
 from __future__ import annotations
 
 import math
+from typing import Sequence
 
 import numpy as np
 
@@ -41,6 +42,7 @@ __all__ = [
     "_parse_epoch_window_map_native_params",
     "_epoch_bias_param_vectors",
     "_reconstruct_union_bias_block",
+    "_reconstruct_union_bias_block_per_regime",
 ]
 
 
@@ -144,3 +146,51 @@ def _reconstruct_union_bias_block(cv: np.ndarray, cv2: np.ndarray, beta: float,
         for k in range(len(primary_centers))
     ]
     return query.reconstruct_bias_matrix(cv, cv2, windows, beta)
+
+
+def _reconstruct_union_bias_block_per_regime(cv: np.ndarray, cv2_by_regime: dict, beta: float,
+                                              primary_centers: np.ndarray, primary_ks: np.ndarray,
+                                              sec_centers: np.ndarray, sec_ks: np.ndarray,
+                                              state_regimes: Sequence[str]) -> np.ndarray:
+    """Like ``_reconstruct_union_bias_block``, but each COLUMN gets the cv2 of
+    the regime its own secondary params were written for.
+
+    ``u_nk[n, k]`` must be the reduced bias state ``k`` would apply to frame
+    ``n``. When a run changes its CV2 definition mid-campaign, state ``k``'s
+    ``secondary_center``/``secondary_k`` are expressed in ONE definition, so
+    evaluating them against a cv2 computed in the other definition does not
+    describe any Hamiltonian -- and the two definitions are near-orthogonal in
+    practice, so it is not a small error either.
+
+    Passing every regime's cv2 for every row (see ``cv2_reprojection``) lets
+    each column be evaluated in its own definition, which is what makes the
+    pooled solve a single well-defined problem rather than a splice.
+
+    ``state_regimes[k]`` names the regime for column ``k``; every name must be
+    a key of ``cv2_by_regime``. Rows where a needed cv2 is NaN (no frame at
+    that step, so the foreign CV2 was never recoverable) propagate NaN, which
+    the downstream clean() step drops -- silently biasing them to zero would be
+    worse than losing them.
+    """
+    K = len(primary_centers)
+    if len(state_regimes) != K:
+        raise ValueError(f'state_regimes has {len(state_regimes)} entries but there '
+                         f'are {K} states')
+    missing = sorted({r for r in state_regimes} - set(cv2_by_regime))
+    if missing:
+        raise ValueError(f'no cv2 supplied for regime(s) {missing}; '
+                         f'have {sorted(cv2_by_regime)}')
+    cv = np.asarray(cv, dtype=np.float64)
+    out = np.empty((cv.size, K), dtype=np.float64)
+    regimes = np.asarray(list(state_regimes), dtype=object)
+    for regime in dict.fromkeys(state_regimes):  # stable order, deduplicated
+        cols = np.where(regimes == regime)[0]
+        windows = [
+            {"center1": primary_centers[k], "k1": primary_ks[k],
+             "center2": sec_centers[k], "k2": sec_ks[k]}
+            for k in cols
+        ]
+        block = query.reconstruct_bias_matrix(
+            cv, np.asarray(cv2_by_regime[regime], dtype=np.float64), windows, beta)
+        out[:, cols] = block
+    return out
