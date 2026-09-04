@@ -24,6 +24,8 @@ from .data import (Data, clean, infer_temp_beta, rjson, _fill_masked_nan,
 from .loaders_adaptive import (_find_adaptive_epoch_dirs, _phase_label,
                                _validate_and_repair_epoch_window_map,
                                _vectorized_map_lookup, _vectorized_map_index)
+from .bias import _reconstruct_union_bias_block_per_regime
+from .cv2_reprojection import CV2_REPROJECTION_FILENAME, join_on_step
 
 
 def _is_usable_for_mbar(row: dict) -> bool:
@@ -144,6 +146,76 @@ def _secondary_cv_regime_change_note(epoch_dirs: list, sample_counts: Optional[l
               'solve itself is not.')
 
 
+def _load_cv2_reprojection(adaptive_dir: Path) -> Optional[dict]:
+    """Read ``cv2_reprojected.parquet`` if a run has one.
+
+    Written by ``reproject_cv2.py``; absent unless somebody generated it. It
+    holds, per regime, the value that regime's CV2 definition takes on each
+    stored frame -- which is what lets every u_nk column be evaluated in its
+    own definition instead of whichever one happened to be in effect when the
+    row was recorded.
+
+    Returns ``{regime: {'steps': int64[], 'cv2': float64[]}}``, or None when
+    the file is missing or unreadable. Unreadable is treated as missing: the
+    caller falls back to the single-cv2 path and warns, which is strictly
+    better than aborting an analysis over an optional side-car.
+    """
+    path = Path(adaptive_dir) / CV2_REPROJECTION_FILENAME
+    if not path.is_file():
+        return None
+    try:
+        import pyarrow.parquet as pq
+        table = pq.read_table(str(path))
+    except Exception:
+        return None
+    names = list(table.schema.names)
+    if 'steps' not in names:
+        return None
+    steps = np.asarray(table['steps'], dtype=np.int64)
+    out: dict = {}
+    for name in names:
+        if not name.startswith('cv2_'):
+            continue
+        vals = np.asarray(table[name], dtype=np.float64)
+        finite = np.isfinite(vals)
+        out[name[len('cv2_'):]] = {'steps': steps[finite], 'cv2': vals[finite]}
+    return out or None
+
+
+def _per_regime_bias_block(cv_epoch, step_epoch, beta, pc_e, pk_e, sc_e, sk_e,
+                            state_regimes, reproj: dict, cv2_epoch, epoch_regime: str):
+    """One epoch-block's u_nk with each column in its own CV2 definition.
+
+    Returns ``(block, coverage)``, or ``(None, {})`` when the table cannot
+    supply every regime this block's columns need -- in which case the caller
+    keeps the existing single-cv2 behaviour rather than silently filling gaps.
+
+    The epoch's OWN regime does not come from the table: ``cv2_epoch`` is the
+    value that was actually recorded while these frames ran, so it is exact
+    for every row, whereas the table only covers rows whose step was
+    recoverable. Using the recorded values where they exist keeps coverage as
+    high as possible and avoids a needless round-trip through a reprojection
+    of a CV we already have.
+    """
+    needed = list(dict.fromkeys(state_regimes))
+    cv2_by_regime: dict = {}
+    coverage: dict = {}
+    for regime in needed:
+        if regime and regime == epoch_regime:
+            cv2_by_regime[regime] = np.asarray(cv2_epoch, dtype=np.float64)
+            coverage[regime] = 1.0
+            continue
+        entry = reproj.get(regime)
+        if entry is None:
+            return None, {}
+        vals, matched = join_on_step(step_epoch, entry['steps'], entry['cv2'])
+        cv2_by_regime[regime] = vals
+        coverage[regime] = float(matched.mean()) if matched.size else 0.0
+    block = _reconstruct_union_bias_block_per_regime(
+        cv_epoch, cv2_by_regime, beta, pc_e, pk_e, sc_e, sk_e, state_regimes)
+    return block, coverage
+
+
 def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_workers: int = 4,
                                 epoch_ids: Optional[set[int]] = None) -> Data:
     """Load MBAR inputs from adaptive-production Parquet epoch data.
@@ -257,6 +329,15 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
         _, beta = infer_temp_beta(adaptive_dir, meta)
 
     per_dir_valid_counts = [0] * len(epoch_dirs)
+    # Optional side-car giving every regime's CV2 for every recoverable frame
+    # (reproject_cv2.py). Present only if somebody generated it; when absent
+    # the pooled u_nk keeps its existing per-epoch-native cv2, which across a
+    # CV2 regime change is a splice -- warned about below.
+    _reproj = _load_cv2_reprojection(adaptive_dir)
+    _reproj_coverage: dict = {}
+    _final_regime = (_epoch_run_manifest_secondary_cv_type(Path(epoch_dirs[-1][0]))
+                     if epoch_dirs else '') or ''
+
     for _ei, ((samples, wmap, ep_meta, native_params, _notes), (epoch_dir, _)) in enumerate(
             zip(epoch_loaded, epoch_dirs)):
         if not samples or 'cv1' not in samples or len(samples['cv1']) == 0:
@@ -282,7 +363,8 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
         # int16 (Data.window's on-disk source is uint16; downstream consumers
         # already defensively re-cast to int64 before use -- see CLAUDE.md/audit).
         all_window.append(_vectorized_map_index(remapped[valid], state_id_to_k, dtype=np.int16))
-        all_step.append(samples['step'][valid].astype(np.int64, copy=False))
+        step_epoch = samples['step'][valid].astype(np.int64, copy=False)
+        all_step.append(step_epoch)
         # NOTE: intentionally NOT applying the filter-then-cast reorder here --
         # the `else` branch already builds an array sized to valid.sum() (not
         # the full epoch length), and rebasing it on `[valid]` after slicing
@@ -318,7 +400,27 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
         # auto-switch overwrites secondary_center in place; see CLAUDE.md).
         pc_e, pk_e, sc_e, sk_e = _epoch_bias_param_vectors(
             native_params, state_ids, primary_centers, primary_ks, sec_centers, sec_ks)
-        all_unk_blocks.append(_reconstruct_union_bias_block(cv_epoch, cv2_epoch, beta, pc_e, pk_e, sc_e, sk_e))
+        block = None
+        if _reproj is not None:
+            # Every column evaluated in the CV2 definition its own secondary
+            # params were written for. The attribution follows directly from
+            # how _epoch_bias_param_vectors just chose them: a state this
+            # epoch's own snapshot covers took THIS epoch's params, so this
+            # epoch's regime; any other state fell back to the final registry,
+            # whose secondary params are whatever the last regime left there.
+            _epoch_regime = _epoch_run_manifest_secondary_cv_type(Path(epoch_dir)) or ''
+            _state_regimes = [
+                (_epoch_regime if int(sid) in native_params else _final_regime)
+                for sid in state_ids
+            ]
+            block, _cov = _per_regime_bias_block(
+                cv_epoch, step_epoch, beta, pc_e, pk_e, sc_e, sk_e,
+                _state_regimes, _reproj, cv2_epoch, _epoch_regime)
+            if block is not None:
+                _reproj_coverage[str(epoch_dir)] = _cov
+        if block is None:
+            block = _reconstruct_union_bias_block(cv_epoch, cv2_epoch, beta, pc_e, pk_e, sc_e, sk_e)
+        all_unk_blocks.append(block)
 
     if not all_cv:
         raise ValueError(f'No valid samples after window remapping in {adaptive_dir}')
@@ -362,8 +464,31 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
     # _secondary_cv_regime_change_note).
     _regime_note = _secondary_cv_regime_change_note([ed for ed, _ in epoch_dirs], per_dir_valid_counts)
     if _regime_note:
+        if _reproj is None:
+            _regime_note += (' No cv2 reprojection table is present, so every column here is '
+                             f'still evaluated against whichever CV2 definition was in effect '
+                             f'when each row was recorded. Generate one with '
+                             f'`python reproject_cv2.py {adaptive_dir}` to make every column '
+                             f'evaluable in its own definition.')
         print(f'    {_regime_note}')
         load_notes = load_notes + [_regime_note]
+
+    if _reproj is not None:
+        # Say plainly which columns became evaluable and how much of each epoch
+        # the table could actually cover: a pooled solve is only as valid as the
+        # rows whose foreign cv2 was recoverable, and the rest are NaN.
+        _cov_bits = []
+        for _ed, _cov in _reproj_coverage.items():
+            _cov_bits.append(f'{_phase_label(Path(_ed))}: '
+                             + ', '.join(f'{r}={100 * c:.1f}%' for r, c in sorted(_cov.items())))
+        _reproj_note = ('[cv2 reprojection] Using ' + str(Path(adaptive_dir) / CV2_REPROJECTION_FILENAME)
+                        + f' with regimes {sorted(_reproj)}: each u_nk column is evaluated in the '
+                          'CV2 definition its own secondary params were written for, so the pooled '
+                          'solve is one Hamiltonian rather than a splice. Per-phase coverage of the '
+                          'FOREIGN regime(s) -- rows outside it are NaN and get dropped: '
+                        + ('; '.join(_cov_bits) if _cov_bits else 'none'))
+        print(f'    {_reproj_note}')
+        load_notes = load_notes + [_reproj_note]
 
     meta_out = dict(meta)
     if load_notes:
