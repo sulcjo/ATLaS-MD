@@ -174,12 +174,32 @@ def test_corrected_subset_logw_matches_global_logw_when_subset_is_everything():
     np.testing.assert_allclose(recomputed, m_global["logw"], atol=1e-9)
 
 
-# --- Bug 1: run_secondary_cv_analyses threads f_k_global into the corrected
-# per-regime reweight instead of naively masking base_logw ------------------
+# --- Bug 1 (SUPERSEDED): run_secondary_cv_analyses used to reweight each
+# regime out of the pooled f_k (_subset_logw_from_global_fk). That fixed the
+# binning axis but not the estimator: across a CV2 regime change the pooled
+# solve splices two Hamiltonians into every column, so its f_k is not the
+# whole-population property that reweight assumes. Each regime now gets its
+# own independent solve and f_k_global is deliberately unused. The tests
+# below assert the replacement behaviour.
+#
+# The _subset_logw_from_global_fk tests above remain valid: they exercise the
+# function itself on a subset of ONE Hamiltonian, which is what it is for.
+# ---------------------------------------------------------------------------
 
-def _two_regime_data(rng, centers, k_spring, beta, counts_regime0, counts_regime1, tmp_path):
+def _two_regime_data(rng, centers, k_spring, beta, counts_regime0, counts_regime1, tmp_path,
+                      centers_regime1=None):
+    """Two epochs with different ``secondary_cv`` modes in their manifests.
+
+    ``centers_regime1`` makes the split a REAL regime change rather than only
+    a metadata one: the same window ids get different restraint centres after
+    the switch, so the pooled u_nk splices two Hamiltonians into every column
+    -- which is the situation on the motivating run (shared states keep their
+    primary params but every secondary centre moves). Left as None, both
+    regimes share one Hamiltonian and the pooled f_k is legitimately valid.
+    """
     d0 = _harmonic_windows_data(rng, centers, k_spring, beta, counts_regime0, step_offset=0)
-    d1 = _harmonic_windows_data(rng, centers, k_spring, beta, counts_regime1, step_offset=d0.cv.size)
+    d1 = _harmonic_windows_data(rng, centers if centers_regime1 is None else centers_regime1,
+                                 k_spring, beta, counts_regime1, step_offset=d0.cv.size)
     N0, N1 = d0.cv.size, d1.cv.size
     cv = np.concatenate([d0.cv, d1.cv])
     cv2 = rng.normal(0, 1, N0 + N1)
@@ -215,58 +235,124 @@ def _test_args():
     return args
 
 
-def test_run_secondary_cv_analyses_uses_corrected_reweight_when_f_k_global_given(tmp_path):
+def _capture_regime_calls(d, args, base_logw, out, **kw):
+    """Run run_secondary_cv_analyses, capturing (d_regime, logw) per regime."""
+    import gareus.mbar_analysis.pmf as pmfmod
+    real_analyze = pmfmod.analyze_secondary_cv_pmf
+    seen: list[tuple] = []
+
+    def _spy(d_regime, args_, logw_arg, *a, **kwargs):
+        seen.append((d_regime, np.array(logw_arg, dtype=np.float64)))
+        return real_analyze(d_regime, args_, logw_arg, *a, **kwargs)
+
+    pmfmod.analyze_secondary_cv_pmf = _spy
+    try:
+        result = run_secondary_cv_analyses(d, args, base_logw, "umbrella_only", False, 0.6,
+                                            out, kw.pop('warnings', []), None, **kw)
+    finally:
+        pmfmod.analyze_secondary_cv_pmf = real_analyze
+    return seen, result
+
+
+def test_each_regime_logw_is_its_own_independent_solve(tmp_path):
+    """Each regime's weights must come from a solve over that regime's rows
+    alone -- not from the pooled f_k, whose state free energies are not a
+    single Hamiltonian's property once the CV2 definition changes."""
     rng = np.random.default_rng(11)
     centers = [0.0, 3.0]
     k_spring = [45.0, 45.0]
     beta = 0.4
-    # torsion-pca (epoch_000, non-dominant): heavily window-0.
-    # tica-linear (epoch_001, dominant): balanced.
+    # A genuine regime change: the same window ids are restrained to different
+    # centres after the switch, so the pooled u_nk is two spliced Hamiltonians.
     d = _two_regime_data(rng, centers, k_spring, beta,
-                          counts_regime0=[350, 50], counts_regime1=[200, 200], tmp_path=tmp_path)
+                          counts_regime0=[350, 50], counts_regime1=[200, 200], tmp_path=tmp_path,
+                          centers_regime1=[1.5, 4.5])
 
     m_global = solve_mbar(d.u_nk, d.window, backend="numpy", tol=1e-12, maxiter=20000)
     assert m_global["converged"]
 
-    captured_naive: list[np.ndarray] = []
-    captured_corrected: list[np.ndarray] = []
+    seen, _ = _capture_regime_calls(d, _test_args(), m_global["logw"], tmp_path / "out_a")
+    assert len(seen) == 2
 
+    for d_regime, logw_used in seen:
+        own = solve_mbar(d_regime.u_nk, d_regime.window, backend="auto",
+                         tol=float(getattr(_test_args(), 'mbar_tol', 1e-10)))
+        assert own["converged"]
+        np.testing.assert_allclose(logw_used, own["logw"], rtol=0, atol=1e-9)
+
+    # Deliberately NOT asserted here: that this differs numerically from the
+    # pooled-f_k reweight. logw is invariant to f_k + const, so on a two-window
+    # fixture there is a single free difference f_1 - f_0 and the pooled value
+    # can legitimately coincide with each regime's own. How far the pooled f_k
+    # is distorted is a property of the run's data, not of this code, so
+    # asserting a gap here would only measure how hard the fixture was tuned
+    # to produce one. The invariant that defines this change is the equality
+    # above; f_k_global's irrelevance is pinned separately below.
+
+
+def test_f_k_global_no_longer_influences_regime_logw(tmp_path):
+    """f_k_global is retained in the signature but deliberately unused: there
+    is no correct way to derive a regime's weights from a cross-regime solve."""
+    rng = np.random.default_rng(11)
+    centers = [0.0, 3.0]
+    k_spring = [45.0, 45.0]
+    beta = 0.4
+    d = _two_regime_data(rng, centers, k_spring, beta,
+                          counts_regime0=[350, 50], counts_regime1=[200, 200], tmp_path=tmp_path)
+    m_global = solve_mbar(d.u_nk, d.window, backend="numpy", tol=1e-12, maxiter=20000)
+
+    without, _ = _capture_regime_calls(d, _test_args(), m_global["logw"], tmp_path / "out_b")
+    with_fk, _ = _capture_regime_calls(d, _test_args(), m_global["logw"], tmp_path / "out_c",
+                                        f_k_global=m_global["f_k"])
+    assert len(without) == len(with_fk) == 2
+    for (_, a), (_, b) in zip(without, with_fk):
+        np.testing.assert_array_equal(a, b)
+
+
+def test_regime_provenance_is_recorded(tmp_path):
+    rng = np.random.default_rng(11)
+    d = _two_regime_data(rng, [0.0, 3.0], [45.0, 45.0], 0.4,
+                          counts_regime0=[350, 50], counts_regime1=[200, 200], tmp_path=tmp_path)
+    m_global = solve_mbar(d.u_nk, d.window, backend="numpy", tol=1e-12, maxiter=20000)
+    _, (pmf_info, _fes_info) = _capture_regime_calls(d, _test_args(), m_global["logw"],
+                                                      tmp_path / "out_d")
+    assert pmf_info.get('secondary_cv_logw_source') == 'per_regime_solve'
+    breakdown = pmf_info.get('regime_breakdown') or {}
+    assert breakdown, "expected a regime breakdown for a two-regime run"
+    for regime, entry in breakdown.items():
+        assert entry['secondary_cv_logw_source'] == 'per_regime_solve', regime
+
+
+def test_non_converging_regime_emits_nothing_rather_than_pooled_fk(tmp_path, monkeypatch):
+    """A regime is a small minority of samples, so its own solve can fail to
+    converge. That must yield an ABSENT result, never a pooled-f_k fallback:
+    a silently wrong curve is worse than a missing one."""
     import gareus.mbar_analysis.pmf as pmfmod
-    real_analyze = pmfmod.analyze_secondary_cv_pmf
+    rng = np.random.default_rng(11)
+    d = _two_regime_data(rng, [0.0, 3.0], [45.0, 45.0], 0.4,
+                          counts_regime0=[350, 50], counts_regime1=[200, 200], tmp_path=tmp_path)
+    m_global = solve_mbar(d.u_nk, d.window, backend="numpy", tol=1e-12, maxiter=20000)
 
-    def _spy(sink):
-        def _inner(d_regime, args, logw_arg, *a, **kw):
-            sink.append(np.array(logw_arg, dtype=np.float64))
-            return real_analyze(d_regime, args, logw_arg, *a, **kw)
-        return _inner
+    _agm = pmfmod._bridge()
+    real_solve = _agm.solve_mbar
 
-    args = _test_args()
+    def _never_converges(u_nk, window, **kw):
+        out = dict(real_solve(u_nk, window, **kw))
+        out['converged'] = False
+        out['max_delta'] = 1.234e-3
+        return out
 
-    pmfmod.analyze_secondary_cv_pmf = _spy(captured_naive)
-    try:
-        run_secondary_cv_analyses(d, args, m_global["logw"], "umbrella_only", False, 0.6,
-                                   tmp_path / "naive_out", [], None)
-    finally:
-        pmfmod.analyze_secondary_cv_pmf = real_analyze
+    monkeypatch.setattr(_agm, 'solve_mbar', _never_converges)
+    warnings: list[str] = []
+    seen, (pmf_info, fes_info) = _capture_regime_calls(
+        d, _test_args(), m_global["logw"], tmp_path / "out_e", warnings=warnings)
 
-    pmfmod.analyze_secondary_cv_pmf = _spy(captured_corrected)
-    try:
-        run_secondary_cv_analyses(d, args, m_global["logw"], "umbrella_only", False, 0.6,
-                                   tmp_path / "corrected_out", [], None, f_k_global=m_global["f_k"])
-    finally:
-        pmfmod.analyze_secondary_cv_pmf = real_analyze
-
-    assert len(captured_naive) == 2
-    assert len(captured_corrected) == 2
-
-    # The window-imbalanced (torsion-pca) regime's logw must actually change
-    # once f_k_global is threaded through -- proves the corrected path is
-    # really being exercised, not silently falling back to the naive slice.
-    diffs = [
-        not np.allclose(naive, corrected, atol=1e-8)
-        for naive, corrected in zip(captured_naive, captured_corrected)
-    ]
-    assert any(diffs), "expected at least one regime's logw to change when f_k_global is supplied"
+    # analyze_secondary_cv_pmf must never be reached for a regime with no estimator.
+    assert seen == [], "a regime with no usable estimator still produced a PMF"
+    assert pmf_info.get('available') is False
+    assert str(pmf_info.get('secondary_cv_logw_source', '')).startswith('unavailable:not_converged')
+    assert fes_info.get('available') is False
+    assert any('refusing to reweight' in w for w in warnings), warnings
 
 
 # --- Bug 2: convergence checks must use the same population as the reference
