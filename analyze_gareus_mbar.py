@@ -43,6 +43,7 @@ from gareus.mbar_analysis.solvers import (
     norm_logw, solve_mbar_numba, solve_mbar_numba_anderson,
     solve_mbar_sambar_warmstart, solve_mbar_sambar, solve_mbar_lbfgs,
     solve_mbar, overlap_matrix, _subset_logw_from_global_fk,
+    logw_from_fk,
 )
 import gareus.mbar_analysis.solvers as _mbar_solvers
 from gareus.mbar_analysis.data import (
@@ -720,19 +721,20 @@ def _get_convergence_mbar_cache(args) -> dict:
     not on which scalar observable is histogrammed, so those solves can be
     safely reused within one analysis run.
 
-    The cache is BOUNDED (see _BoundedMbarCache / --convergence-mbar-cache-max-mb):
-    every prefix mask is unique, so at high --convergence-timepoints each entry
-    retains a per-sample logw array (hundreds of MB each on tens-of-millions-
-    of-samples runs) and an unbounded dict grows past available RAM before the
-    loop finishes.
+    Entries are SLIM: everything solve_mbar returned except the per-sample
+    'logw' array (see _slim_mbar_entry). That array is the only O(N) member
+    -- hundreds of MB each on tens-of-millions-of-samples runs, and since
+    every prefix mask is unique, caching it grew the dict past available RAM
+    before the convergence loop finished. It is also the only member that is
+    cheaply DERIVABLE: reconstructing logw from the cached f_k costs a single
+    logsumexp pass (logw_from_fk), whereas obtaining f_k in the first place
+    costs the whole self-consistent iteration. Caching the expensive
+    irreducible result rather than the large derivable one keeps the hit rate
+    at ~100% with an O(K) footprint, so no eviction policy is needed.
     """
     cache = getattr(args, '_convergence_mbar_cache', None)
     if cache is None:
-        try:
-            max_mb = int(getattr(args, 'convergence_mbar_cache_max_mb', 4096))
-        except Exception:
-            max_mb = 4096
-        cache = _BoundedMbarCache(max_mb * 1024 * 1024) if max_mb > 0 else {}
+        cache = {}
         try:
             setattr(args, '_convergence_mbar_cache', cache)
         except Exception:
@@ -740,36 +742,21 @@ def _get_convergence_mbar_cache(args) -> dict:
     return cache
 
 
-class _BoundedMbarCache(dict):
-    """Insertion-ordered dict of solve_mbar result dicts with a byte budget.
+def _slim_mbar_entry(mb: dict) -> dict:
+    """Drop the O(N) 'logw' member; keep the O(K) and scalar ones."""
+    return {k: v for k, v in mb.items() if k != 'logw'}
 
-    Only the per-sample 'logw' member is sizeable (f_k/n_k are O(K)); the
-    budget tracks logw bytes and evicts oldest-first. Evicted entries are
-    simply re-solved on a later miss -- slower, numerically identical.
+
+def _rehydrate_mbar_entry(slim: dict, u_nk, window) -> dict:
+    """Rebuild a full solve_mbar result from a slim cache entry.
+
+    Exact, not approximate: the backends derive their returned 'logw' from
+    the converged f_k by this same expression, so the only differences are
+    floating-point reduction order (the numba backend is fastmath and
+    accumulates the denominator scalar-wise, so it can disagree in the last
+    bits; every other backend agrees exactly).
     """
-
-    def __init__(self, max_bytes: int):
-        super().__init__()
-        self._max_bytes = int(max(0, max_bytes))
-        self._bytes = 0
-
-    def __setitem__(self, key, value):
-        mb = value if isinstance(value, dict) else {}
-        lw = mb.get('logw')
-        cost = int(np.asarray(lw).nbytes) if lw is not None else 0
-        if key in self:
-            old = self[key]
-            old_lw = old.get('logw') if isinstance(old, dict) else None
-            self._bytes -= int(np.asarray(old_lw).nbytes) if old_lw is not None else 0
-            del self[key]
-        while self._bytes > 0 and self._bytes + cost > self._max_bytes:
-            oldest = next(iter(self))
-            old = self[oldest]
-            old_lw = old.get('logw') if isinstance(old, dict) else None
-            self._bytes -= int(np.asarray(old_lw).nbytes) if old_lw is not None else 0
-            del self[oldest]
-        self._bytes += cost
-        super().__setitem__(key, value)
+    return dict(slim, logw=logw_from_fk(u_nk, window, slim['f_k']))
 
 
 def _convergence_mask_digest(mask: np.ndarray) -> str:
@@ -946,7 +933,10 @@ def run_observable_pmf_convergence(
                 cache_key=_convergence_mbar_cache_key(d,args,mask,int(ck),conv_backend,conv_mbar_maxiter,
                                                        conv_sambar_epochs,conv_sambar_batch,conv_sambar_patience,
                                                        conv_sambar_seed,conv_sambar_lr,conv_sambar_delta,conv_sambar_polish)
-                mb=mbar_cache.get(cache_key)
+                _slim=mbar_cache.get(cache_key)
+                # Cache entries carry no logw (see _get_convergence_mbar_cache);
+                # rebuild it from the cached f_k for these same rows.
+                mb=_rehydrate_mbar_entry(_slim,sub_u,sub_w) if _slim is not None else None
                 cache_hit=mb is not None
             else:
                 mb=None
@@ -960,7 +950,7 @@ def run_observable_pmf_convergence(
                               sambar_delta_f_max=conv_sambar_delta,
                               sambar_polish_backend=conv_sambar_polish)
                 if cache_enabled and cache_key is not None:
-                    mbar_cache[cache_key]=mb
+                    mbar_cache[cache_key]=_slim_mbar_entry(mb)
                     mbar_cache_misses+=1
             else:
                 mbar_cache_hits+=1
@@ -5031,7 +5021,7 @@ def parse_args(argv=None):
     p.add_argument('--no-extra-pmfs', action='store_true', help='Disable phi/psi, Ramachandran, SASA, secondary-structure, and internal-contact PMFs. Convenience alias for --extra-pmf-from-trajectories never.')
     p.add_argument('--no-convergence', action='store_true', help='Skip prefix PMF convergence testing for all scalar observables.')
     p.add_argument('--no-convergence-mbar-cache', action='store_true', help='Disable the in-memory cache that reuses identical prefix MBAR solves across scalar convergence analyses.')
-    p.add_argument('--convergence-mbar-cache-max-mb', type=int, default=4096, help='Total MBAR logw bytes (MB) the in-memory prefix-MBAR cache may retain before oldest entries are evicted; 0 removes the bound.')
+    p.add_argument('--convergence-mbar-cache-max-mb', type=int, default=4096, help='DEPRECATED, accepted and ignored. The prefix-MBAR cache no longer retains per-sample logw arrays (it caches f_k and rebuilds logw on demand), so its footprint is O(K) per entry and needs no byte budget. Kept so existing command lines keep working; will be removed in a later release.')
     p.add_argument('--basin-min-depth-kcal', type=float, default=0.3, help='Minimum PMF depth (kcal/mol) for a local minimum to count as a distinct basin in basin-population tracking.')
     p.add_argument('--no-basin-tracking', action='store_true', help='Disable basin population tracking during main CV convergence analysis.')
     p.add_argument('--skip-first-n-frames', type=int, default=0, metavar='N', help='Discard the first N samples from each replica (sorted by production step) before analysis. Useful for equilibration burn-in. Default 0 (keep all).')
