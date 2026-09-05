@@ -1435,16 +1435,21 @@ def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.nd
         exp_w = _agm.norm_logw(logw + d.beta * d.boost_kj)
         exp_pmf = pmf_from_weights(d.cv, exp_w, bins, kbt_kcal)
         (cum_pmf, cdiag), (cum3_pmf, cdiag3) = _cumulant_expansion_both(d.cv, base_w, d.boost_kj, bins, d.beta, kbt_kcal, smooth_logfac_sigma=_agm._eff_smooth(args, 'gamd_smooth_sigma'))
-        # Only default to a cumulant PMF if the expansion actually converges
-        # on THIS boost distribution. When it does not, the truncation error is
-        # the size of the terms kept, and both cumulant curves are meaningless
-        # -- so fall back rather than publish a tidy-looking wrong number.
+        # CE2 remains the selected estimator; the convergence check is
+        # REPORTED, not acted on.
+        #
+        # Not acted on because the alternatives are worse, not because the
+        # diagnostic is cosmetic. Exponential reweighting is formally exact but
+        # its ESS falls off like exp(-(beta*sigma)^2): at the boost width that
+        # triggers this warning (beta*sigma ~ 3.6) that is ~1e-6 of N -- of
+        # order a hundred effective samples out of tens of millions, which
+        # estimates nothing. umbrella_only is well defined but discards the
+        # GaMD correction outright. So a non-converging series does not mean
+        # "use something else"; it means the truncation error is real and must
+        # be quoted alongside the curve.
         _cum_verdict = cumulant_series_verdict(cdiag3, counts=cum3_pmf.get('counts'))
         selected = 'gamd_cumulant2'
         if not _cum_verdict['converging']:
-            _ess_exp = _agm.ess(exp_w)
-            _exp_ok = (_ess_exp / max(1, int(np.size(exp_w)))) >= 0.05
-            selected = 'gamd_exponential' if _exp_ok else 'umbrella_only'
             warnings.append(
                 f"{warning_prefix}GaMD cumulant expansion is NOT converging on this boost "
                 f"(typical terms: 1st {_cum_verdict['term1_kT']:.2f} kT, 2nd "
