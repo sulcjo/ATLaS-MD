@@ -129,7 +129,7 @@ def test_term_magnitudes_are_reported_and_scale_as_predicted():
     # does not gate on it.
     assert v['ratio_2_over_1'] == pytest.approx(BETA * sigma**2 / (2.0 * 22.0), rel=0.05)
     assert v['beta_sigma'] == pytest.approx(BETA * sigma, rel=0.05)
-    assert v['basis'] == 'ratio_3_over_2'
+    assert v['basis'].startswith('ratio_3_over_2')
     # a Gaussian has kappa3 = 0, so the third term must be negligible
     assert v['term3_kT'] < 0.05 * v['term2_kT']
 
@@ -210,3 +210,73 @@ def test_requested_smoothing_does_not_launder_undefined_bins():
     others = np.delete(lf, 12)
     assert np.isfinite(others).sum() >= others.size - 1, (
         'NaN leaked into neighbours through the smoothing filter')
+
+
+# --- board conditions: 4th cumulant, between-bin scatter, robust reference ---
+
+def test_a_symmetric_heavy_tailed_boost_is_caught_by_the_fourth_order():
+    """term3/term2 alone is necessary but not sufficient. A SYMMETRIC boost has
+    kappa3 = 0 by symmetry, so a third-order-only gate would pass it however
+    heavy its tails; the fourth order is what catches that."""
+    rng = np.random.default_rng(17)
+    n, nbins = 300_000, 41
+    cv = rng.uniform(0.0, 1.0, n)
+    bins = np.linspace(0.0, 1.0, nbins)
+    # symmetric, heavy-tailed: a Gaussian mixture with the same mean
+    comp = rng.random(n) < 0.5
+    boost = np.where(comp, rng.normal(22.0, 2.0, n), rng.normal(22.0, 14.0, n))
+    w = np.full(n, 1.0 / n)
+    pmf, d = _cumulant_expansion(cv, w, boost, bins, BETA, KBT_KCAL,
+                                 order=3, smooth_logfac_sigma=0.0)
+    v = cumulant_series_verdict(d, counts=pmf['counts'])
+    assert abs(v['ratio_3_over_2']) < 0.5, 'fixture should be symmetric (kappa3 ~ 0)'
+    assert v['ratio_4_over_2'] > 0.5, 'fixture should have heavy tails (kappa4 large)'
+    assert v['converging'] is False, 'the 4th-order term must veto this'
+
+
+def test_between_bin_scatter_of_the_neglected_term_is_reported():
+    """A neglected term that is large but CONSTANT across CV cancels in a
+    free-energy DIFFERENCE; its variation does not. Reporting only the
+    magnitude would invite the false claim that a big term is harmless."""
+    rng = np.random.default_rng(19)
+    n, nbins = 200_000, 41
+    cv = rng.uniform(0.0, 1.0, n)
+    bins = np.linspace(0.0, 1.0, nbins)
+    boost = rng.gamma(2.0, 6.0, n)
+    w = np.full(n, 1.0 / n)
+    pmf, d = _cumulant_expansion(cv, w, boost, bins, BETA, KBT_KCAL,
+                                 order=3, smooth_logfac_sigma=0.0)
+    v = cumulant_series_verdict(d, counts=pmf['counts'])
+    for k in ('term1_between_bin_kT', 'term3_between_bin_kT', 'term4_between_bin_kT'):
+        assert k in v and np.isfinite(v[k]), k
+    # boost is CV-independent here, so the scatter must be far below the magnitude
+    assert v['term3_between_bin_kT'] < 0.2 * abs(v['term3_kT'])
+
+
+def test_robust_reference_ignores_a_reweighting_outlier():
+    """One bin with a wild correction must not become the zero of the curve."""
+    from gareus.mbar_analysis.pmf import robust_pmf_reference
+    F = np.array([1.0, 0.8, 0.5, 0.9, 1.2, -3.0, 1.1])   # bin 5 is the outlier
+    logfac = np.array([0.1, 0.12, 0.09, 0.11, 0.10, 9.0, 0.10])
+    counts = np.full(F.size, 1000.0)
+    idx, info = robust_pmf_reference(F, logfac=logfac, counts=counts)
+    assert idx == 2, 'reference should be the lowest NON-outlier bin'
+    assert info['plain_minimum_bin'] == 5
+    assert info['differs_from_plain_minimum'] is True
+    assert info['n_outliers_excluded'] == 1
+
+
+def test_robust_reference_is_the_plain_minimum_when_nothing_is_anomalous():
+    from gareus.mbar_analysis.pmf import robust_pmf_reference
+    F = np.array([1.0, 0.8, 0.5, 0.9, 1.2])
+    logfac = np.array([0.1, 0.12, 0.09, 0.11, 0.10])
+    idx, info = robust_pmf_reference(F, logfac=logfac, counts=np.full(5, 100.0))
+    assert idx == 2 and info['differs_from_plain_minimum'] is False
+
+
+def test_robust_reference_never_picks_an_empty_bin():
+    from gareus.mbar_analysis.pmf import robust_pmf_reference
+    F = np.array([1.0, 0.8, -5.0, 0.9])
+    counts = np.array([1000.0, 1000.0, 0.0, 1000.0])
+    idx, _info = robust_pmf_reference(F, logfac=np.full(4, 0.1), counts=counts)
+    assert idx == 1, 'a zero-count bin must never be the reference'
