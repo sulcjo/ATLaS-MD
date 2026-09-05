@@ -76,6 +76,21 @@ __all__ = [
 # Consumed by the loader when building a regime-complete u_nk.
 CV2_REPROJECTION_FILENAME = "cv2_reprojected.parquet"
 
+# Minimum fraction of a block's rows for which a FOREIGN regime's cv2 must be
+# recoverable before the reprojection may be used for that block.
+#
+# A row whose foreign cv2 is missing gets NaN in those u_nk columns, and clean()
+# drops any row with a non-finite u_nk. So using a sparse table does not degrade
+# the pooled solve gracefully -- it DELETES the uncovered samples. Observed on
+# the motivating run: a table built from stored features only covered 9.8% of
+# the pre-switch epoch, and using it silently discarded 90.2% of that regime
+# (1,562,528 rows -> 152,576).
+#
+# Below this fraction the reprojection is declined and the caller keeps every
+# sample under the documented (spliced) per-epoch-native cv2 instead. A splice
+# that is reported is better than a silent 90% data loss.
+CV2_REPROJECTION_MIN_COVERAGE = 0.99
+
 # A projection that reproduces a stored CV to worse than this is not the model
 # that produced it. Machine-precision agreement is what a correct model, a
 # correct projection and correct atom indexing produce together (measured
