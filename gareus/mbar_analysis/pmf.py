@@ -178,10 +178,17 @@ def cumulant_series_verdict(diag3: dict, counts=None) -> dict:
     # its shape, while a wide one is only safe if it happens to be Gaussian --
     # which is exactly what cannot be verified without kappa3. Callers that
     # have order-3 diagnostics (the report path does) never take this branch.
+    t4=_typ('cumulant_term4_kT')
+    r42 = t4/t2 if (np.isfinite(t2) and t2>0) else float('nan')
+    # term3/term2 alone is necessary but NOT sufficient: an odd cumulant can
+    # vanish by symmetry while the even ones keep growing, so a symmetric-but-
+    # heavy-tailed boost would pass a third-order test and still diverge.
+    # Require the fourth order to be controlled too, when it is available.
     if np.isfinite(r32):
-        converging = bool(r32 <= CUMULANT_CONVERGENCE_MAX_RATIO)
-        basis = 'ratio_3_over_2'
-        governing = r32
+        checks=[r32]+([r42] if np.isfinite(r42) else [])
+        converging = bool(all(r <= CUMULANT_CONVERGENCE_MAX_RATIO for r in checks))
+        basis = 'ratio_3_over_2 and ratio_4_over_2' if np.isfinite(r42) else 'ratio_3_over_2'
+        governing = max(checks)
     elif np.isfinite(t2) and t2 > 0:
         beta_sigma = float(np.sqrt(2.0*t2))
         converging = bool(beta_sigma <= 1.0)
@@ -189,8 +196,26 @@ def cumulant_series_verdict(diag3: dict, counts=None) -> dict:
         governing = beta_sigma
     else:
         converging, basis, governing = False, 'no usable terms', float('nan')
-    return {'term1_kT':t1,'term2_kT':t2,'term3_kT':t3,
-            'ratio_2_over_1':r21,'ratio_3_over_2':r32,
+    # Between-bin scatter of the neglected term. This is what actually governs
+    # whether the truncation error cancels in a free-energy DIFFERENCE: a
+    # neglected term that is large but CONSTANT across CV cancels exactly when
+    # two bins are subtracted, while its variation does not. Reporting only the
+    # magnitude would invite the (false) claim that a big term is harmless
+    # because it is "uniform".
+    def _scatter(key):
+        v=diag3.get(key)
+        if v is None: return float('nan')
+        v=np.asarray(v,dtype=np.float64)
+        w=np.ones_like(v) if counts is None else np.asarray(counts,dtype=np.float64)
+        m=np.isfinite(v)&np.isfinite(w)&(w>0)
+        if m.sum()<2: return float('nan')
+        mu=np.average(v[m],weights=w[m])
+        return float(np.sqrt(np.average((v[m]-mu)**2,weights=w[m])))
+    return {'term1_kT':t1,'term2_kT':t2,'term3_kT':t3,'term4_kT':t4,
+            'term1_between_bin_kT':_scatter('cumulant_term1_kT'),
+            'term3_between_bin_kT':_scatter('cumulant_term3_kT'),
+            'term4_between_bin_kT':_scatter('cumulant_term4_kT'),
+            'ratio_2_over_1':r21,'ratio_3_over_2':r32,'ratio_4_over_2':r42,
             'beta_sigma':float(np.sqrt(2.0*t2)) if (np.isfinite(t2) and t2>0) else float('nan'),
             'basis':basis,'max_ratio':governing,
             'threshold':CUMULANT_CONVERGENCE_MAX_RATIO,
@@ -234,6 +259,63 @@ def _cumulant_shared_stats(cv,base_w,boost,bins):
             'nz':nz,'mean':mean,'var':var,'idx':idx,'w':w,'x':x,'dx':dx,'sw':sw}
 
 
+def robust_pmf_reference(F, logfac=None, counts=None, mad_k: float = 4.0):
+    """Index of the bin the PMF should be zeroed at, and why.
+
+    ``F -= F.min()`` makes the single lowest bin the reference for every other
+    value. That is fine when the minimum is a real basin and catastrophic when
+    it is a reweighting outlier: on the motivating run one bin's GaMD
+    correction sat ~28 sigma (autocorrelation-corrected) above its neighbours',
+    took ten times their probability, became the minimum, and thereby shifted
+    the whole curve -- moving the reported free-energy minimum by a full bin
+    relative to the unweighted umbrella estimate.
+
+    So the reference is taken over bins that are not reweighting outliers:
+    those whose ``logfac`` lies within ``mad_k`` median-absolute-deviations of
+    the median. MAD rather than a standard deviation precisely because the
+    contaminating bins are the ones we must not let set the scale. Bins with no
+    samples are never eligible.
+
+    Excluding a bin from being the REFERENCE does not remove it from the PMF --
+    its value is still reported, and still relative to the same zero. This
+    chooses where zero sits; it does not smooth, mask or reweight anything.
+
+    Returns ``(index, info)``; ``index`` is None when nothing is eligible, in
+    which case the caller should fall back to the plain minimum.
+    """
+    F=np.asarray(F,dtype=np.float64)
+    ok=np.isfinite(F)
+    if counts is not None:
+        ok&=np.asarray(counts,dtype=np.float64)>0
+    info={'mad_k':float(mad_k),'n_finite':int(np.count_nonzero(np.isfinite(F)))}
+    if not np.any(ok):
+        info['reason']='no finite bins'
+        return None, info
+    eligible=ok.copy()
+    if logfac is not None:
+        lf=np.asarray(logfac,dtype=np.float64)
+        m=np.isfinite(lf)&ok
+        if np.count_nonzero(m)>=3:
+            med=float(np.median(lf[m]))
+            mad=float(np.median(np.abs(lf[m]-med)))
+            if mad>0:
+                dev=np.full(lf.shape,np.inf); dev[m]=np.abs(lf[m]-med)/(1.4826*mad)
+                eligible=ok&(dev<=mad_k)
+                info.update({'logfac_median':med,'logfac_mad':mad,
+                             'n_outliers_excluded':int(np.count_nonzero(ok&~eligible))})
+    if not np.any(eligible):
+        info['reason']='every bin is a reweighting outlier; using plain minimum'
+        return int(np.nanargmin(np.where(ok,F,np.inf))), info
+    idx=int(np.nanargmin(np.where(eligible,F,np.inf)))
+    plain=int(np.nanargmin(np.where(ok,F,np.inf)))
+    info['reference_bin']=idx
+    info['plain_minimum_bin']=plain
+    info['differs_from_plain_minimum']=bool(idx!=plain)
+    if idx!=plain:
+        info['shift_kcal_mol']=float(F[idx]-F[plain])
+    return idx, info
+
+
 def _cumulant_from_shared(shared,beta,kbt_kcal,order,smooth_logfac_sigma=0.0):
     """Finish an order-2 or order-3 cumulant PMF from `_cumulant_shared_stats`
     output. order=2 keeps the mean+variance terms (Gaussian/CE2
@@ -247,6 +329,7 @@ def _cumulant_from_shared(shared,beta,kbt_kcal,order,smooth_logfac_sigma=0.0):
     B=shared['B']; nz=shared['nz']; mean=shared['mean']; var=shared['var']
     p0=shared['p0']; counts=shared['counts']; centers=shared['centers']
     kappa3=np.full(B,np.nan,dtype=np.float64)
+    kappa4=np.full(B,np.nan,dtype=np.float64)
     logfac=np.zeros(B,dtype=np.float64)
     if np.any(nz):
         logfac[nz]=beta*mean[nz]+0.5*beta*beta*var[nz]
@@ -255,6 +338,15 @@ def _cumulant_from_shared(shared,beta,kbt_kcal,order,smooth_logfac_sigma=0.0):
             sdx3=np.bincount(idx,weights=w*dx*dx*dx,minlength=B).astype(np.float64)
             kappa3[nz]=sdx3[nz]/sw[nz]
             logfac[nz]+=(beta**3/6.0)*kappa3[nz]
+            # Fourth cumulant, for the convergence diagnostic only -- it is NOT
+            # added to logfac (that would be a CE4 estimator, which this code
+            # does not offer). term3/term2 alone is necessary but not
+            # sufficient: an odd cumulant can vanish by symmetry while the even
+            # ones keep growing, so a series can look convergent at third order
+            # and still diverge. kappa4 = m4 - 3*var^2 (excess kurtosis form).
+            sdx4=np.bincount(idx,weights=w*dx*dx*dx*dx,minlength=B).astype(np.float64)
+            m4=np.full(B,np.nan); m4[nz]=sdx4[nz]/sw[nz]
+            kappa4[nz]=m4[nz]-3.0*var[nz]*var[nz]
     # A bin with real weighted samples (p0>0) but zero samples with a finite
     # boost has an UNKNOWN GaMD correction -- flag NaN rather than silently
     # falling back to logfac=0 (which would look like "no correction needed"
@@ -269,13 +361,15 @@ def _cumulant_from_shared(shared,beta,kbt_kcal,order,smooth_logfac_sigma=0.0):
     # meaningful when successive terms SHRINK; when they do not, the truncation
     # error exceeds the term retained and the result is not an approximation of
     # anything.
-    t1=np.full(B,np.nan); t2=np.full(B,np.nan); t3=np.full(B,np.nan)
+    t1=np.full(B,np.nan); t2=np.full(B,np.nan); t3=np.full(B,np.nan); t4=np.full(B,np.nan)
     if np.any(nz):
         t1[nz]=beta*mean[nz]
         t2[nz]=0.5*beta*beta*var[nz]
         if order==3 and np.any(np.isfinite(kappa3)):
             fin=nz&np.isfinite(kappa3)
             t3[fin]=(beta**3/6.0)*kappa3[fin]
+            fin4=nz&np.isfinite(kappa4)
+            t4[fin4]=(beta**4/24.0)*kappa4[fin4]
     lf_finite=logfac[np.isfinite(logfac)]
     lf_scatter=float(np.std(np.diff(lf_finite))) if lf_finite.size>2 else 0.0
     sigma_req=float(smooth_logfac_sigma or 0.0)
@@ -296,9 +390,14 @@ def _cumulant_from_shared(shared,beta,kbt_kcal,order,smooth_logfac_sigma=0.0):
     if ps>0: p/=ps
     with np.errstate(divide='ignore',invalid='ignore'):
         F=-kbt_kcal*np.log(p)
-    mask=np.isfinite(F)
-    if np.any(mask): F-=np.nanmin(F[mask])
+    ref_idx, ref_info = robust_pmf_reference(F, logfac=logfac, counts=counts)
+    if ref_idx is not None:
+        F=F-F[ref_idx]
+    else:
+        mask=np.isfinite(F)
+        if np.any(mask): F-=np.nanmin(F[mask])
     return {'cv_A':centers.copy(),'prob':p,'pmf':F,'counts':counts.astype(int)}, {
+        'pmf_reference':ref_info,
         'boost_mean_kj':mean.copy(),'boost_var_kj2':var.copy(),'boost_kappa3_kj3':kappa3,
         'log_reweight_factor':logfac,
         # Provenance for the reweighting factor, so a consumer can tell a
@@ -306,7 +405,9 @@ def _cumulant_from_shared(shared,beta,kbt_kcal,order,smooth_logfac_sigma=0.0):
         # re-deriving it from the boost moments.
         'logfac_scatter_kT':lf_scatter,
         'logfac_smooth_sigma_requested':sigma_req,
+        'boost_kappa4_kj4':kappa4,
         'cumulant_term1_kT':t1,'cumulant_term2_kT':t2,'cumulant_term3_kT':t3,
+        'cumulant_term4_kT':t4,
     }
 
 
@@ -1347,18 +1448,28 @@ def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.nd
             warnings.append(
                 f"{warning_prefix}GaMD cumulant expansion is NOT converging on this boost "
                 f"(typical terms: 1st {_cum_verdict['term1_kT']:.2f} kT, 2nd "
-                f"{_cum_verdict['term2_kT']:.2f} kT, 3rd {_cum_verdict['term3_kT']:.2f} kT; "
-                f"largest successive ratio {_cum_verdict['max_ratio']:.2f} > "
-                f"{_cum_verdict['threshold']:.2f}). The truncation error is comparable to the "
-                f"terms retained, so neither gamd_cumulant2 nor gamd_cumulant3 estimates the "
-                f"unbiased free energy here; both are still written for inspection but are NOT "
-                f"selected. Falling back to {selected!r} "
-                + (f"(exponential reweighting is formally exact; its ESS is {_ess_exp:.0f}/"
-                   f"{int(np.size(exp_w))})" if _exp_ok else
-                   f"(exponential reweighting was also rejected: ESS {_ess_exp:.0f}/"
-                   f"{int(np.size(exp_w))} is too low, so the GaMD boost cannot be removed "
-                   f"reliably at this width and the curve is NOT unbiased)")
-                + ". A boost this wide needs a narrower GaMD envelope, not a higher cumulant order.")
+                f"{_cum_verdict['term2_kT']:.2f} kT, 3rd {_cum_verdict['term3_kT']:.2f} kT, 4th "
+                f"{_cum_verdict['term4_kT']:.2f} kT; term3/term2 = {_cum_verdict['ratio_3_over_2']:.2f}, "
+                f"term4/term2 = {_cum_verdict['ratio_4_over_2']:.2f}, threshold "
+                f"{_cum_verdict['threshold']:.2f}; beta*sigma = {_cum_verdict['beta_sigma']:.2f}). "
+                f"The boost is too non-Gaussian for the truncation: the first neglected term is "
+                f"comparable to those kept, so gamd_cumulant2 carries a systematic error of order "
+                f"{_cum_verdict['term3_kT']:.1f} kT on ABSOLUTE free energies, and gamd_cumulant3 "
+                f"is not a refinement of it. CE2 is still selected -- exponential reweighting's ESS "
+                f"falls off like exp(-(beta*sigma)^2) and is useless at this width, and "
+                f"umbrella_only discards the GaMD correction entirely. "
+                f"Free-energy DIFFERENCES are better determined than absolute values, but NOT "
+                f"exactly: only the bin-INDEPENDENT part of a neglected term cancels on "
+                f"subtraction. The residuals that survive are the between-bin scatters -- 1st "
+                f"{_cum_verdict['term1_between_bin_kT']:.2f} kT, 3rd "
+                f"{_cum_verdict['term3_between_bin_kT']:.2f} kT, 4th "
+                f"{_cum_verdict['term4_between_bin_kT']:.2f} kT -- so quote differences with at "
+                f"least that uncertainty, and note these are computed per bin from correlated "
+                f"samples, so their effective sample size is well below the raw counts. "
+                f"beta*sigma = {_cum_verdict['beta_sigma']:.2f} is outside the regime where "
+                f"second-order cumulant reweighting is validated; for quantitative PMF work rerun "
+                f"with a narrower GaMD envelope (beta*sigma <~ 2), which fixes this at the source "
+                f"rather than at a higher cumulant order.")
         # A bin can have real samples (counts>0) but zero with a finite GaMD
         # boost -- e.g. a whole segment/epoch missing gamd_boost_total_kj_mol
         # dominating that CV bin. _cumulant_expansion flags this NaN rather
