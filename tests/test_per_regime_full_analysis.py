@@ -224,7 +224,13 @@ def test_dominant_summary_indexes_every_regime_and_warns_about_its_scope(tmp_pat
     warning = ' '.join(out['warnings'])
     assert 'redefined its secondary CV' in warning
     assert 'only the dominant regime' in warning
-    assert 'not comparable' in warning
+    # Cross-regime comparability guidance must be actionable, not just a
+    # prohibition: name the alignment convention, refuse naive combination,
+    # and require ESS-aware uncertainty.
+    assert 'NOT comparable' in warning
+    assert 'align both CV1 PMFs' in warning
+    assert 'inverse-variance combine' in warning
+    assert 'block bootstrap by window' in warning
 
 
 # --- end to end -------------------------------------------------------------
