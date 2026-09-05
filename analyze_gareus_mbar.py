@@ -5032,9 +5032,17 @@ def analyze(d, args, progress: Optional[Progress] = None):
                     for r, v in summaries.items())
         + '. THIS summary describes only the dominant regime '
         f'({dominant_summary.get("secondary_cv_regime")!r}, '
-        f'{dominant_summary.get("n_samples", 0):,} samples). Free energies are not comparable '
-        'across regimes: each population is separately normalised, so compare ensemble-level '
-        'quantities (e.g. the two CV1 PMFs) rather than f_k.')
+        f'{dominant_summary.get("n_samples", 0):,} samples). Free energies are NOT comparable '
+        'across regimes as written: each population is separately normalised, so its f_k carry '
+        'independent additive constants and mean nothing across the boundary. Compare '
+        'ensemble-level quantities instead, and only after fixing the constant explicitly -- '
+        'align both CV1 PMFs to a common convention (e.g. set F=0 at the same reference CV1 bin, '
+        'or at each curve\'s own minimum ONLY if both minima sit in the same basin) before '
+        'differencing them. Do not inverse-variance combine the two curves: the alignment '
+        'constant is itself estimated, which correlates the aligned curves, and any systematic '
+        'disagreement between them is evidence of bias that averaging would hide rather than '
+        'cancel. Quote a difference only with ESS-aware uncertainty (block bootstrap by window, '
+        'g = 1 + 2*tau), since the per-regime sample counts here are very unequal.')
     # Re-write the dominant summary so the index and the warning it just
     # gained are actually on disk, not only in the returned dict.
     _dom_out = Path(dominant_summary.get('output_dir') or out_root)

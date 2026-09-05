@@ -117,6 +117,86 @@ def pmf_from_weights(cv,w,bins,kbt_kcal):
     if np.any(mask): F-=np.nanmin(F[mask])
     return {'cv_A':0.5*(edges[:-1]+edges[1:]),'prob':prob,'pmf':F,'counts':counts.astype(int)}
 
+# A truncated cumulant expansion approximates ln<exp(beta*dV)> by its first
+# few cumulants. That is only meaningful if successive terms SHRINK. The ratio
+# below is the largest |next term| / |previous term| still treated as a
+# converging series; above it the truncation error is comparable to (or larger
+# than) the term retained, so the "correction" is not an approximation of
+# anything and the estimator must not be used.
+#
+# For a Gaussian boost of width sigma the terms scale as (beta*sigma)^n/n!, so
+# the ratio is ~beta*sigma/n: the series only converges usefully while the
+# boost is at most a couple of kT wide. Measured on a real 29M-sample
+# chignolin run with beta*sigma = 3.57, the terms were 8.81, 6.38 and 9.57 kT
+# -- flat, not shrinking -- while the shipped default silently selected the
+# 2nd-order result.
+CUMULANT_CONVERGENCE_MAX_RATIO = 0.5
+
+
+def cumulant_series_verdict(diag3: dict, counts=None) -> dict:
+    """Is the cumulant expansion converging on this data?
+
+    Takes the ORDER-3 diagnostics (which carry all three term magnitudes) and
+    returns the typical size of each term in kT plus a boolean verdict. Bins
+    are weighted by sample count so that a handful of near-empty bins cannot
+    condemn (or rescue) an otherwise well-behaved run.
+
+    A verdict of False does not mean the PMF is slightly off. It means the
+    truncation error is the same size as the terms kept, so neither the 2nd-
+    nor the 3rd-order curve estimates the unbiased free energy.
+    """
+    def _typ(key):
+        v=np.asarray(diag3.get(key), dtype=np.float64) if diag3.get(key) is not None else None
+        if v is None or v.size==0:
+            return float('nan')
+        w=np.ones_like(v) if counts is None else np.asarray(counts,dtype=np.float64)
+        m=np.isfinite(v)&np.isfinite(w)&(w>0)
+        if not np.any(m):
+            return float('nan')
+        return float(np.average(np.abs(v[m]), weights=w[m]))
+    t1,t2,t3=_typ('cumulant_term1_kT'),_typ('cumulant_term2_kT'),_typ('cumulant_term3_kT')
+    r21 = t2/t1 if (np.isfinite(t1) and t1>0) else float('nan')
+    r32 = t3/t2 if (np.isfinite(t2) and t2>0) else float('nan')
+    # The verdict rests on term3/term2, NOT on term2/term1.
+    #
+    # term1 = beta*<dV> is the MEAN boost. A GaMD envelope can sit at any
+    # offset, and a constant offset shifts every bin's log-weight equally,
+    # cancelling in the PMF -- it changes no free-energy difference. Including
+    # it would let a large boost mean make the ratio look healthy no matter how
+    # badly the expansion behaves. The terms that shape the PMF are the central
+    # cumulants from order 2 up, and those scale as (beta*sigma)^n/n!.
+    #
+    # Width alone does NOT disqualify the expansion: for a Gaussian dV every
+    # cumulant above the second is exactly zero, so the series terminates at
+    # order 2 and CE2 is exact however wide the boost. It is non-Gaussianity
+    # that breaks the truncation, which is precisely what term3/term2 measures.
+    #
+    # With only order-2 diagnostics kappa3 is unavailable, so Gaussianity
+    # cannot be checked at all. There the fallback is deliberately
+    # conservative and keys on the width (term2 = 0.5*(beta*sigma)^2, so
+    # beta*sigma = sqrt(2*term2)): a narrow boost cannot go far wrong whatever
+    # its shape, while a wide one is only safe if it happens to be Gaussian --
+    # which is exactly what cannot be verified without kappa3. Callers that
+    # have order-3 diagnostics (the report path does) never take this branch.
+    if np.isfinite(r32):
+        converging = bool(r32 <= CUMULANT_CONVERGENCE_MAX_RATIO)
+        basis = 'ratio_3_over_2'
+        governing = r32
+    elif np.isfinite(t2) and t2 > 0:
+        beta_sigma = float(np.sqrt(2.0*t2))
+        converging = bool(beta_sigma <= 1.0)
+        basis = 'beta_sigma (no third cumulant available)'
+        governing = beta_sigma
+    else:
+        converging, basis, governing = False, 'no usable terms', float('nan')
+    return {'term1_kT':t1,'term2_kT':t2,'term3_kT':t3,
+            'ratio_2_over_1':r21,'ratio_3_over_2':r32,
+            'beta_sigma':float(np.sqrt(2.0*t2)) if (np.isfinite(t2) and t2>0) else float('nan'),
+            'basis':basis,'max_ratio':governing,
+            'threshold':CUMULANT_CONVERGENCE_MAX_RATIO,
+            'converging':converging}
+
+
 def _cumulant_shared_stats(cv,base_w,boost,bins):
     """The O(N) work shared by the order-2 and order-3 cumulant expansions:
     histogram/bin-edges, per-bin unweighted counts, bin-index assignment,
@@ -183,10 +263,32 @@ def _cumulant_from_shared(shared,beta,kbt_kcal,order,smooth_logfac_sigma=0.0):
     # matching the existing "no samples" -> F=inf -> excluded-by-isfinite
     # convention used throughout this file.
     logfac[(~nz)&(p0>0)]=np.nan
-    if smooth_logfac_sigma and float(smooth_logfac_sigma) > 0:
+    # Per-order cumulant term magnitudes, kept for the convergence check that
+    # decides whether this estimator may be used at all (see
+    # `cumulant_series_verdict`). A truncated cumulant expansion is only
+    # meaningful when successive terms SHRINK; when they do not, the truncation
+    # error exceeds the term retained and the result is not an approximation of
+    # anything.
+    t1=np.full(B,np.nan); t2=np.full(B,np.nan); t3=np.full(B,np.nan)
+    if np.any(nz):
+        t1[nz]=beta*mean[nz]
+        t2[nz]=0.5*beta*beta*var[nz]
+        if order==3 and np.any(np.isfinite(kappa3)):
+            fin=nz&np.isfinite(kappa3)
+            t3[fin]=(beta**3/6.0)*kappa3[fin]
+    lf_finite=logfac[np.isfinite(logfac)]
+    lf_scatter=float(np.std(np.diff(lf_finite))) if lf_finite.size>2 else 0.0
+    sigma_req=float(smooth_logfac_sigma or 0.0)
+    if sigma_req>0:
         try:
             from scipy.ndimage import gaussian_filter1d
-            logfac=gaussian_filter1d(logfac,sigma=float(smooth_logfac_sigma),mode='nearest')
+            finite=np.isfinite(logfac)
+            if np.any(finite):
+                # Interpolate across undefined bins before filtering: running a
+                # Gaussian filter over NaN would spread it across the array.
+                filled=np.interp(np.arange(B),np.arange(B)[finite],logfac[finite])
+                sm=gaussian_filter1d(filled,sigma=sigma_req,mode='nearest')
+                logfac=np.where(finite,sm,np.nan)
         except Exception:
             pass
     p=p0*np.exp(np.clip(logfac,-700,700))
@@ -196,7 +298,16 @@ def _cumulant_from_shared(shared,beta,kbt_kcal,order,smooth_logfac_sigma=0.0):
         F=-kbt_kcal*np.log(p)
     mask=np.isfinite(F)
     if np.any(mask): F-=np.nanmin(F[mask])
-    return {'cv_A':centers.copy(),'prob':p,'pmf':F,'counts':counts.astype(int)}, {'boost_mean_kj':mean.copy(),'boost_var_kj2':var.copy(),'boost_kappa3_kj3':kappa3,'log_reweight_factor':logfac}
+    return {'cv_A':centers.copy(),'prob':p,'pmf':F,'counts':counts.astype(int)}, {
+        'boost_mean_kj':mean.copy(),'boost_var_kj2':var.copy(),'boost_kappa3_kj3':kappa3,
+        'log_reweight_factor':logfac,
+        # Provenance for the reweighting factor, so a consumer can tell a
+        # trustworthy cumulant PMF from a noise-dominated one without
+        # re-deriving it from the boost moments.
+        'logfac_scatter_kT':lf_scatter,
+        'logfac_smooth_sigma_requested':sigma_req,
+        'cumulant_term1_kT':t1,'cumulant_term2_kT':t2,'cumulant_term3_kT':t3,
+    }
 
 
 def _cumulant_expansion(cv,base_w,boost,bins,beta,kbt_kcal,order=2,smooth_logfac_sigma=0.0):
@@ -1223,7 +1334,31 @@ def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.nd
         exp_w = _agm.norm_logw(logw + d.beta * d.boost_kj)
         exp_pmf = pmf_from_weights(d.cv, exp_w, bins, kbt_kcal)
         (cum_pmf, cdiag), (cum3_pmf, cdiag3) = _cumulant_expansion_both(d.cv, base_w, d.boost_kj, bins, d.beta, kbt_kcal, smooth_logfac_sigma=_agm._eff_smooth(args, 'gamd_smooth_sigma'))
+        # Only default to a cumulant PMF if the expansion actually converges
+        # on THIS boost distribution. When it does not, the truncation error is
+        # the size of the terms kept, and both cumulant curves are meaningless
+        # -- so fall back rather than publish a tidy-looking wrong number.
+        _cum_verdict = cumulant_series_verdict(cdiag3, counts=cum3_pmf.get('counts'))
         selected = 'gamd_cumulant2'
+        if not _cum_verdict['converging']:
+            _ess_exp = _agm.ess(exp_w)
+            _exp_ok = (_ess_exp / max(1, int(np.size(exp_w)))) >= 0.05
+            selected = 'gamd_exponential' if _exp_ok else 'umbrella_only'
+            warnings.append(
+                f"{warning_prefix}GaMD cumulant expansion is NOT converging on this boost "
+                f"(typical terms: 1st {_cum_verdict['term1_kT']:.2f} kT, 2nd "
+                f"{_cum_verdict['term2_kT']:.2f} kT, 3rd {_cum_verdict['term3_kT']:.2f} kT; "
+                f"largest successive ratio {_cum_verdict['max_ratio']:.2f} > "
+                f"{_cum_verdict['threshold']:.2f}). The truncation error is comparable to the "
+                f"terms retained, so neither gamd_cumulant2 nor gamd_cumulant3 estimates the "
+                f"unbiased free energy here; both are still written for inspection but are NOT "
+                f"selected. Falling back to {selected!r} "
+                + (f"(exponential reweighting is formally exact; its ESS is {_ess_exp:.0f}/"
+                   f"{int(np.size(exp_w))})" if _exp_ok else
+                   f"(exponential reweighting was also rejected: ESS {_ess_exp:.0f}/"
+                   f"{int(np.size(exp_w))} is too low, so the GaMD boost cannot be removed "
+                   f"reliably at this width and the curve is NOT unbiased)")
+                + ". A boost this wide needs a narrower GaMD envelope, not a higher cumulant order.")
         # A bin can have real samples (counts>0) but zero with a finite GaMD
         # boost -- e.g. a whole segment/epoch missing gamd_boost_total_kj_mol
         # dominating that CV bin. _cumulant_expansion flags this NaN rather
@@ -1235,6 +1370,25 @@ def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.nd
         nan_bins3 = np.isnan(cdiag3['log_reweight_factor']) & (np.asarray(cum3_pmf['counts']) > 0)
         if np.any(nan_bins3):
             warnings.append(f"{warning_prefix}GaMD cumulant3 correction is undefined (NaN) for {int(np.sum(nan_bins3))} CV bin(s) with samples but no finite boost values; those pmf_gamd_cumulant3 bins are NaN.")
+        # The reweighting factor's own bin-to-bin noise, reported but NOT
+        # smoothed away. p = p0*exp(logfac), so a scatter of s means adjacent
+        # bins' probabilities differ by e^s from estimator noise alone, and a
+        # single excursion can make a bin the PMF minimum and re-reference the
+        # whole curve. Smoothing it is available (--gamd-smooth-sigma) but is
+        # deliberately not automatic: where the scatter is real structure
+        # rather than noise, smoothing erases signal, and where the cumulant
+        # series is not converging (checked above) a smooth curve is a tidier
+        # wrong answer, not a better one.
+        _sc = float(cdiag.get('logfac_scatter_kT', 0.0) or 0.0)
+        if _sc > 0.35 and not float(cdiag.get('logfac_smooth_sigma_requested', 0.0) or 0.0):
+            warnings.append(
+                f"{warning_prefix}GaMD cumulant reweighting factor has a bin-to-bin scatter of "
+                f"{_sc:.2f} kT, so adjacent bins' probabilities carry up to "
+                f"e^{_sc:.2f}={np.exp(_sc):.1f}x of estimator noise; a single excursion can place "
+                f"the PMF minimum on a fluctuation and re-reference the curve. Check whether the "
+                f"excursions are statistically significant (compare each bin's variance against "
+                f"its neighbours' using its own sample count) before trusting or smoothing them: "
+                f"--gamd-smooth-sigma exists but will erase real structure if the variation is real.")
         e = _agm.ess(exp_w)
         if e / max(1, N) < 0.05:
             warnings.append(f'{warning_prefix}GaMD exponential reweighting ESS is very low: {e:.1f}/{N}')
@@ -1686,12 +1840,15 @@ def _regime_independent_logw(d_regime: 'Data', args, _agm) -> tuple:
     Hamiltonian's population, which is precisely the assumption
     ``_subset_logw_from_global_fk`` documents and relies on.
 
-    Solving per regime fixes more than ``f_k``. Because every backend takes
-    ``active = where(n_k > 0)``, restricting the ROWS to one regime also
-    drops the COLUMNS of states that hold no samples there -- so states
-    created after the switch leave the denominator entirely instead of
-    contributing a value for a state that never existed on these rows.
-    Partitioning rows prunes columns; the pooled solve cannot do that.
+    Restricting the ROWS to one regime also drops the COLUMNS of states that
+    hold no samples there, because ``active = where(n_k > 0)`` -- so states
+    created after the switch leave the denominator instead of contributing a
+    value for a state that never existed on these rows. That column dropping
+    is standard MBAR behaviour, not something this function adds: pymbar omits
+    zero-sample states from the linear system too. The correctness gain here
+    is the CONSISTENT ``u_nk`` evaluation (every row and column in one CV2
+    definition); the pruning is a welcome consequence of partitioning, not the
+    reason it is right.
 
     A regime is only ~6% of samples in the motivating run, so a solve that
     does not converge is a real outcome, not a theoretical one. It is
@@ -1735,10 +1892,13 @@ def run_secondary_cv_analyses(d: 'Data', args, base_logw: np.ndarray, selected: 
     column, so its ``f_k`` is not the whole-population property that
     ``_subset_logw_from_global_fk`` assumes, and the non-dominant regime's
     PMF came out as one regime's ``f_k`` applied to the other regime's
-    ``u_nk``. On the motivating run the two CV2 definitions correlate at
-    only +0.16 on identical frames (max deviation 4.375 over n=152,576
-    stored feature rows), so that substitution is a near-orthogonal
-    coordinate rather than a small bias.
+    ``u_nk``. On the motivating run the two CV2 definitions' weight vectors
+    have cosine similarity 0.141 (81.9 degrees apart) in the shared 36-dim
+    torsion feature space, so the substitution replaces the coordinate with a
+    nearly orthogonal one rather than perturbing it. (A Pearson r of +0.158
+    between the two scalar CVs was quoted previously; that measures linear
+    association of CV VALUES, not the geometry of the projections, and is the
+    wrong statistic for this claim even though it lands on a similar number.)
 
     ``f_k_global`` is retained in the signature for callers that still pass
     it, and is deliberately unused: there is no correct way to derive a

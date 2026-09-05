@@ -159,8 +159,9 @@ def _reconstruct_union_bias_block_per_regime(cv: np.ndarray, cv2_by_regime: dict
     ``n``. When a run changes its CV2 definition mid-campaign, state ``k``'s
     ``secondary_center``/``secondary_k`` are expressed in ONE definition, so
     evaluating them against a cv2 computed in the other definition does not
-    describe any Hamiltonian -- and the two definitions are near-orthogonal in
-    practice, so it is not a small error either.
+    describe any Hamiltonian -- and the two definitions' weight vectors are
+    near-orthogonal in practice (cosine similarity 0.141, 81.9 degrees, on the
+    motivating run), so it is not a small error either.
 
     Passing every regime's cv2 for every row (see ``cv2_reprojection``) lets
     each column be evaluated in its own definition, which is what makes the

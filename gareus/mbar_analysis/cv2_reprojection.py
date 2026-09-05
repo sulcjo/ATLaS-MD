@@ -43,8 +43,9 @@ only ~10% of sample rows have a feature row (``tica_obs_interval = 5``).
 
 Joins here are therefore always on an EXACT ``step`` match, and unmatched
 rows are dropped and counted. Nothing is interpolated: the two CV2
-definitions correlate at only ~+0.16 on identical frames, so interpolating
-one from neighbouring frames of the other has no justification. Coverage is
+definitions' weight vectors are 81.9 degrees apart (cosine similarity
+0.141) in the shared 36-dim torsion feature space, so interpolating one from
+neighbouring frames of the other has no justification. Coverage is
 reported so a caller can see what fraction of rows a pooled solve could
 actually use.
 """
