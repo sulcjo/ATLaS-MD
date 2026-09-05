@@ -406,24 +406,46 @@ def test_per_regime_block_prefers_recorded_cv2_for_the_epochs_own_regime(tmp_pat
     np.testing.assert_array_equal(block, expected)
 
 
-def test_per_regime_block_reports_partial_foreign_coverage(tmp_path):
-    """Only ~10% of sample rows have a recoverable foreign cv2 on the
-    motivating run, so coverage must be reported, not assumed to be 1.0."""
+def test_per_regime_block_declines_on_partial_foreign_coverage(tmp_path):
+    """Partial coverage must be DECLINED, not used.
+
+    An uncovered row gets NaN in that regime's u_nk columns and is then dropped
+    by clean(), so a sparse table does not blur the pooled solve -- it deletes
+    the samples. On the motivating run a table built from stored features alone
+    covered 9.8% of the pre-switch epoch, and using it discarded 90.2% of that
+    regime (1,562,528 rows -> 152,576) with no error.
+
+    This test previously asserted the opposite (that 40% coverage was accepted
+    and merely reported). That assertion enshrined the data loss.
+    """
     rng = np.random.default_rng(21)
     n, K, beta = 10, 2, 0.4
     cv, pc, pk, sc, sk = _bias_inputs(rng, n, K)
     steps = np.arange(n, dtype=np.int64) * 100
     recorded = rng.normal(size=n)
-    reproj = {'other': {'steps': steps[:4], 'cv2': rng.normal(size=4)}}
+    reproj = {'other': {'steps': steps[:4], 'cv2': rng.normal(size=4)}}   # 40%
 
-    block, cov = _per_regime_bias_block(cv, steps, beta, pc, pk, sc, sk,
+    block, info = _per_regime_bias_block(cv, steps, beta, pc, pk, sc, sk,
                                          ['own', 'other'], reproj, recorded, 'own')
+    assert block is None, 'partial coverage must be declined'
+    assert info['declined_regime'] == 'other'
+    assert info['declined_coverage'] == pytest.approx(0.4)
+    assert info['would_drop'] == 6 and info['rows'] == n
+
+
+def test_per_regime_block_accepts_full_foreign_coverage(tmp_path):
+    """Full coverage is the case the reprojection exists for."""
+    rng = np.random.default_rng(22)
+    n, K, beta = 12, 2, 0.4
+    cv, pc, pk, sc, sk = _bias_inputs(rng, n, K)
+    steps = np.arange(n, dtype=np.int64) * 100
+    recorded = rng.normal(size=n)
+    reproj = {'other': {'steps': steps, 'cv2': rng.normal(size=n)}}
+    block, cov = _per_regime_bias_block(cv, steps, beta, pc, pk, sc, sk,
+                                        ['own', 'other'], reproj, recorded, 'own')
     assert block is not None
-    assert cov['other'] == pytest.approx(0.4)
-    # Uncovered rows stay NaN in the foreign column so clean() drops them.
-    assert np.isfinite(block[:4, 1]).all()
-    assert not np.isfinite(block[4:, 1]).any()
-    assert np.isfinite(block[:, 0]).all()
+    assert cov['other'] == pytest.approx(1.0) and cov['own'] == 1.0
+    assert np.isfinite(block).all()
 
 
 def test_per_regime_block_declines_when_a_regime_is_missing(tmp_path):

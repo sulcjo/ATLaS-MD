@@ -25,7 +25,8 @@ from .loaders_adaptive import (_find_adaptive_epoch_dirs, _phase_label,
                                _validate_and_repair_epoch_window_map,
                                _vectorized_map_lookup, _vectorized_map_index)
 from .bias import _reconstruct_union_bias_block_per_regime
-from .cv2_reprojection import CV2_REPROJECTION_FILENAME, join_on_step
+from .cv2_reprojection import (CV2_REPROJECTION_FILENAME,
+                               CV2_REPROJECTION_MIN_COVERAGE, join_on_step)
 
 
 def _is_usable_for_mbar(row: dict) -> bool:
@@ -209,8 +210,18 @@ def _per_regime_bias_block(cv_epoch, step_epoch, beta, pc_e, pk_e, sc_e, sk_e,
         if entry is None:
             return None, {}
         vals, matched = join_on_step(step_epoch, entry['steps'], entry['cv2'])
+        cov = float(matched.mean()) if matched.size else 0.0
+        if cov < CV2_REPROJECTION_MIN_COVERAGE:
+            # Decline rather than degrade. An uncovered row gets NaN in this
+            # regime's u_nk columns and is then DROPPED by clean(), so a sparse
+            # table does not blur the result -- it deletes the samples. Keeping
+            # every sample under the reported splice beats losing most of a regime.
+            return None, {'declined_regime': regime, 'declined_coverage': cov,
+                          'required': CV2_REPROJECTION_MIN_COVERAGE,
+                          'rows': int(matched.size),
+                          'would_drop': int(matched.size - int(matched.sum()))}
         cv2_by_regime[regime] = vals
-        coverage[regime] = float(matched.mean()) if matched.size else 0.0
+        coverage[regime] = cov
     block = _reconstruct_union_bias_block_per_regime(
         cv_epoch, cv2_by_regime, beta, pc_e, pk_e, sc_e, sk_e, state_regimes)
     return block, coverage
@@ -335,6 +346,7 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
     # CV2 regime change is a splice -- warned about below.
     _reproj = _load_cv2_reprojection(adaptive_dir)
     _reproj_coverage: dict = {}
+    _reproj_declined: dict = {}
     _final_regime = (_epoch_run_manifest_secondary_cv_type(Path(epoch_dirs[-1][0]))
                      if epoch_dirs else '') or ''
 
@@ -418,6 +430,8 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
                 _state_regimes, _reproj, cv2_epoch, _epoch_regime)
             if block is not None:
                 _reproj_coverage[str(epoch_dir)] = _cov
+            elif _cov.get('declined_regime'):
+                _reproj_declined[str(epoch_dir)] = _cov
         if block is None:
             block = _reconstruct_union_bias_block(cv_epoch, cv2_epoch, beta, pc_e, pk_e, sc_e, sk_e)
         all_unk_blocks.append(block)
@@ -473,7 +487,23 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
         print(f'    {_regime_note}')
         load_notes = load_notes + [_regime_note]
 
-    if _reproj is not None:
+    if _reproj_declined:
+        _bits = [f"{_phase_label(Path(_ed))}: {_c['declined_regime']} coverage "
+                 f"{100*_c['declined_coverage']:.1f}% (would drop {_c['would_drop']:,} of "
+                 f"{_c['rows']:,} rows)" for _ed, _c in _reproj_declined.items()]
+        _dec_note = ('[cv2 reprojection] DECLINED for ' + '; '.join(_bits)
+                     + f". A foreign regime's cv2 must be recoverable for at least "
+                       f"{100*CV2_REPROJECTION_MIN_COVERAGE:.0f}% of a phase's rows before the "
+                       f"reprojection may be used: an uncovered row gets NaN in that regime's "
+                       f"u_nk columns and is then DROPPED, so a sparse table does not blur the "
+                       f"pooled solve -- it deletes samples. Every sample is kept instead, under "
+                       f"each epoch's own native cv2, which across a regime change is the "
+                       f"splice reported above. To use the reprojection, rebuild the table with "
+                       f"full coverage (reproject_cv2.py --trajectories).")
+        print(f'    {_dec_note}')
+        load_notes = load_notes + [_dec_note]
+
+    if _reproj is not None and not _reproj_declined:
         # Say plainly which columns became evaluable and how much of each epoch
         # the table could actually cover: a pooled solve is only as valid as the
         # rows whose foreign cv2 was recoverable, and the rest are NaN.
