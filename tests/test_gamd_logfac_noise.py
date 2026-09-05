@@ -280,3 +280,26 @@ def test_robust_reference_never_picks_an_empty_bin():
     counts = np.array([1000.0, 1000.0, 0.0, 1000.0])
     idx, _info = robust_pmf_reference(F, logfac=np.full(4, 0.1), counts=counts)
     assert idx == 1, 'a zero-count bin must never be the reference'
+
+
+def test_a_non_converging_series_does_not_change_the_selected_method():
+    """The verdict is REPORTED, not acted on.
+
+    Falling back would be worse, not better: exponential reweighting's ESS goes
+    like exp(-(beta*sigma)^2) -- ~1e-6 of N at the width that triggers this --
+    and umbrella_only discards the GaMD correction outright. So a
+    non-converging series means the truncation error must be quoted with the
+    curve, not that a different estimator should be substituted.
+
+    This is a regression guard: an earlier revision DID switch estimator here,
+    and the switch reached main because the revert was left uncommitted.
+    """
+    import inspect
+    from gareus.mbar_analysis import pmf as pmfmod
+    src = inspect.getsource(pmfmod.run_pmf_and_gamd_boost_report)
+    head, _, _ = src.partition('_force_method')     # ignore --selected-method
+    assert "selected = 'gamd_cumulant2'" in head
+    assert "selected = 'gamd_exponential'" not in head, (
+        'a non-converging verdict must not switch the estimator')
+    # umbrella_only remains reachable only for the no-usable-boost branch
+    assert head.count("selected = 'umbrella_only'") <= 1
