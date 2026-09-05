@@ -1668,8 +1668,26 @@ def analyze_distance_rg_2d_fes(d: Data, args, base_logw: np.ndarray, selected: s
         span=float(np.nanmax(chosen_fes['pmf'][finite]) - np.nanmin(chosen_fes['pmf'][finite]))
     else:
         min_cv=min_rg=span=float('nan')
+    _sp_unconv=int(_sp_stats.get('unconverged',0))
+    _sp_frames=int(_sp_stats.get('frames',0))
+    if _sp_unconv:
+        _frac=_sp_unconv/max(1,_sp_frames)
+        warnings.append(
+            f'PCA superposition: mdtraj could not converge a rotation for {_sp_unconv} of '
+            f'{_sp_frames:,} superposed frames ({_frac:.2e}); those frames were left UNALIGNED '
+            f'(the QCP kernel returns the identity rotation). At this rate the PCA basis and its '
+            f'projection are unaffected, but the count is reported so a rising rate -- which would '
+            f'mean genuinely malformed coordinates -- is visible rather than being two lines of '
+            f'stderr that look identical whatever the magnitude.')
+    if _sp_stats.get('uncounted_calls'):
+        warnings.append(
+            f"PCA superposition: {_sp_stats['uncounted_calls']} chunk(s) could not be monitored for "
+            f'unconverged rotations because stderr had no file descriptor to capture; the reported '
+            f'unconverged count is a lower bound for those chunks.')
     info={
         'available': True,
+        'superpose_unconverged_frames': _sp_unconv,
+        'superpose_frames': _sp_frames,
         'selected_unbiased_method': chosen,
         'n_samples': int(np.count_nonzero(mask)),
         'cv_bins': int(len(xbins)-1),
@@ -1769,12 +1787,90 @@ def _load_pca_reference(md, plan: list[dict], top_path: Path, selection: str):
             continue
     raise RuntimeError(f'Could not load a reference frame for PCA: {last_exc}')
 
-def _aligned_flattened_coords_A(chunk, atoms: np.ndarray, ref, pre_sliced: bool = False):
+_SUPERPOSE_UNCONVERGED_MARKER = 'UNCONVERGED ROTATION MATRIX'
+
+
+def _superpose_counting_unconverged(sub, ref, stats: Optional[dict] = None) -> None:
+    """``sub.superpose(ref, frame=0)``, counting the frames it could not rotate.
+
+    mdtraj's Theobald/QCP kernel solves for the optimal rotation by a Newton
+    iteration on the largest eigenvalue. On rare configurations that iteration
+    does not converge; the C code prints
+
+        theobald_rmsd.cpp UNCONVERGED ROTATION MATRIX. RETURNING IDENTITY
+
+    to stderr and returns the IDENTITY rotation, so those frames are left
+    UNALIGNED while every other frame is superposed. Nothing is raised and
+    nothing is returned to say it happened, so the affected frames are mixed
+    silently into whatever is computed downstream -- here the PCA basis and its
+    projection.
+
+    Measured on a real 29M-sample chignolin run the rate was 2 frames against
+    100,000 fit frames and 15,930,096 projected frames, about 1e-7: far too few
+    to move a PCA basis. The defect is therefore not the numerics but the
+    invisibility of the rate. A genuinely broken trajectory would produce the
+    same two lines of scrollback as this benign case, and no count would reach
+    the summary either way.
+
+    The message is counted rather than suppressed. Any other stderr written
+    during the call is passed through untouched: swallowing unrelated
+    diagnostics in order to count this one would trade a small blind spot for a
+    larger one.
+    """
+    if stats is None:
+        sub.superpose(ref, frame=0)
+        return
+    stats['frames'] = int(stats.get('frames', 0)) + int(sub.n_frames)
+    # Capture file descriptor 2, NOT sys.stderr.fileno(). The message comes
+    # from C, which writes to the process's stderr fd directly and never
+    # consults sys.stderr -- so under any redirection (pytest capture, a
+    # caller that replaced sys.stderr) those two are different fds and
+    # capturing the Python one would silently count nothing.
+    fd = 2
+    try:
+        saved = os.dup(fd)
+    except OSError:
+        # No usable stderr fd to duplicate. Superpose normally and record that
+        # this call went uncounted, rather than reporting a zero that only
+        # means "not measured".
+        sub.superpose(ref, frame=0)
+        stats['uncounted_calls'] = int(stats.get('uncounted_calls', 0)) + 1
+        return
+    import tempfile
+    try:
+        with tempfile.TemporaryFile(mode='w+b') as tf:
+            os.dup2(tf.fileno(), fd)
+            try:
+                sub.superpose(ref, frame=0)
+            finally:
+                os.dup2(saved, fd)
+            tf.seek(0)
+            captured = tf.read().decode('utf-8', 'replace')
+    finally:
+        os.close(saved)
+    if not captured:
+        return
+    hits = captured.count(_SUPERPOSE_UNCONVERGED_MARKER)
+    if hits:
+        stats['unconverged'] = int(stats.get('unconverged', 0)) + hits
+        captured = '\n'.join(ln for ln in captured.splitlines()
+                             if _SUPERPOSE_UNCONVERGED_MARKER not in ln)
+        captured = captured + '\n' if captured else ''
+    if captured:
+        os.write(fd, captured.encode('utf-8', 'replace'))
+
+
+def _aligned_flattened_coords_A(chunk, atoms: np.ndarray, ref, pre_sliced: bool = False,
+                                 stats: Optional[dict] = None):
     sub=chunk if pre_sliced else chunk.atom_slice(atoms)
-    sub.superpose(ref, frame=0)
+    _superpose_counting_unconverged(sub, ref, stats)
     return sub.xyz.reshape((sub.n_frames, -1)).astype(np.float64, copy=False)*10.0
 
 def _fit_and_project_pca_from_trajectories(d: Data, args, out: Path, progress: Optional[Progress], warnings: list[str]) -> dict:
+    # Counts frames mdtraj's QCP kernel could not rotate; see
+    # _superpose_counting_unconverged. Shared by the fit and project passes so
+    # the reported rate covers every frame this analysis superposed.
+    _sp_stats: dict = {}
     mode=str(getattr(args,'pca_fes_from_trajectories','auto') or 'auto').lower()
     if mode == 'never':
         return {'available':False,'reason':'disabled by --pca-fes-from-trajectories never'}
@@ -1850,7 +1946,7 @@ def _fit_and_project_pca_from_trajectories(d: Data, args, out: Path, progress: O
                 if local is not None and local.size:
                     keep=np.where((global_frames % fit_stride) == 0)[0]
                     if keep.size:
-                        coords_all=_aligned_flattened_coords_A(chunk, atoms, ref, pre_sliced=True)
+                        coords_all=_aligned_flattened_coords_A(chunk, atoms, ref, pre_sliced=True, stats=_sp_stats)
                         coords=coords_all[local[keep]]
                         need=max_fit-fit_count
                         fit_blocks.append(coords[:need].copy())
@@ -1890,7 +1986,7 @@ def _fit_and_project_pca_from_trajectories(d: Data, args, out: Path, progress: O
             for chunk in md.iterload(str(item.get('traj', item['dcd'])), top=_pca_top, chunk=chunk_size, atom_indices=atoms):
                 local, sample_idx, _global_frames = _chunk_local_frame_selection(frame_indices, sample_indices, frame0, chunk.n_frames)
                 if local is not None and local.size:
-                    coords_all=_aligned_flattened_coords_A(chunk, atoms, ref, pre_sliced=True)
+                    coords_all=_aligned_flattened_coords_A(chunk, atoms, ref, pre_sliced=True, stats=_sp_stats)
                     scores=(coords_all[local]-mean)@components.T
                     pca1[sample_idx]=scores[:,0].astype(np.float32)
                     pca2[sample_idx]=scores[:,1].astype(np.float32)
