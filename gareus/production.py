@@ -1684,7 +1684,7 @@ def make_gamd_integrator(system, args, unit):
         pass
     return integrator, result
 
-def window_assignment_rows(centers_a: np.ndarray, k_list: list[float], temperature_k: float, secondary_centers=None, secondary_k_list=None, args=None) -> list[dict]:
+def window_assignment_rows(centers_a: np.ndarray, k_list: list[float], temperature_k: float, secondary_centers=None, secondary_k_list=None, args=None, gamd_lambdas=None) -> list[dict]:
     """Return an explicit table of umbrella centers and force constants.
 
     Legacy distance-named columns are preserved. In nonlocal-contact mode they are
@@ -1722,6 +1722,7 @@ def window_assignment_rows(centers_a: np.ndarray, k_list: list[float], temperatu
             "secondary_cv_center": "",
             "secondary_cv_k_kcal_mol": "",
             "secondary_cv_k_kj_mol": "",
+            "gamd_lambda": float(gamd_lambdas[i]) if gamd_lambdas is not None else 0.0,
         }
         if ss_centers is not None and ss_k_arr is not None and i < len(ss_centers) and i < len(ss_k_arr):
             row.update({
@@ -1741,6 +1742,7 @@ def write_window_assignment_csv(path: Path, rows: list[dict]) -> None:
         "primary_k_units", "primary_openmm_k", "primary_openmm_k_units",
         "primary_harmonic_sigma", "legacy_primary_cv_column_names",
         "secondary_cv_center", "secondary_cv_k_kcal_mol", "secondary_cv_k_kj_mol",
+        "gamd_lambda",
     ]
     with path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
@@ -5191,6 +5193,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         bootstrap_torsion_summary = _ensure_bootstrap_torsion_cv_ready(args, out_dir, topology, primary_cv_def)
         if getattr(args, "windows_2d_csv", None):
             centers_a, k_list, secondary_cv_centers, secondary_cv_k_kcal_list, secondary_cv_metadata, window_metadata = load_explicit_2d_window_csv(args, Path(args.windows_2d_csv))
+            args.state_gamd_lambdas = list(secondary_cv_metadata.get("gamd_lambdas") or [0.0] * len(centers_a))
             # Captured BEFORE the filter: it returns only the survivors, and the
             # map correction below needs the index space the drop was expressed in.
             _n_windows_before_reachability_filter = int(len(centers_a))
@@ -5244,7 +5247,20 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         "primary_openmm_k_units": primary_openmm_k_units(args),
         "primary_cv_definition": _json_ready(primary_cv_def),
     })
-    window_rows = window_assignment_rows(centers_a, k_list, args.temperature_k, secondary_cv_centers, secondary_cv_k_kcal_list, args=args)
+    # Re-derive args.state_gamd_lambdas from the (possibly reachability-filtered
+    # and reindexed) normalized_rows rather than trusting the value set right
+    # after load_explicit_2d_window_csv: filter_explicit_2d_windows_by_seed_reachability
+    # can drop and renumber rows, and each surviving normalized_row already
+    # carries its own correct "gamd_lambda", so this stays aligned with
+    # centers_a/k_list no matter which branch (explicit-2D, choose_windows,
+    # or fast-resume) produced them.
+    _normalized_rows_for_lambda = window_metadata.get("normalized_rows") or []
+    if _normalized_rows_for_lambda and len(_normalized_rows_for_lambda) == len(centers_a) and all("gamd_lambda" in r for r in _normalized_rows_for_lambda):
+        args.state_gamd_lambdas = [float(r.get("gamd_lambda", 0.0) or 0.0) for r in _normalized_rows_for_lambda]
+    else:
+        _existing_lambdas = list(getattr(args, "state_gamd_lambdas", None) or [])
+        args.state_gamd_lambdas = _existing_lambdas if len(_existing_lambdas) == len(centers_a) else [0.0] * len(centers_a)
+    window_rows = window_assignment_rows(centers_a, k_list, args.temperature_k, secondary_cv_centers, secondary_cv_k_kcal_list, args=args, gamd_lambdas=args.state_gamd_lambdas)
     write_window_assignment_csv(out_dir / "umbrella_windows.csv", window_rows)
     print_window_assignment_table(window_rows)
     graph_summary = None
@@ -5310,7 +5326,18 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             secondary_cv_centers = np.asarray(secondary_cv_centers, dtype=float)[:_max_replicas]
         if secondary_cv_k_kcal_list is not None:
             secondary_cv_k_kcal_list = list(secondary_cv_k_kcal_list)[:_max_replicas]
+        if getattr(args, "state_gamd_lambdas", None) is not None:
+            args.state_gamd_lambdas = list(args.state_gamd_lambdas)[:_max_replicas]
         nrep = _max_replicas
+
+    # The rung dimension: one gamd_lambda per surviving state, aligned with
+    # centers_a/k_list/nrep above (including any --max-replicas truncation).
+    state_lambdas = np.asarray(getattr(args, "state_gamd_lambdas", None) or [0.0] * nrep, dtype=float)
+    if state_lambdas.size != nrep:
+        raise ValueError(f"state_gamd_lambdas has {state_lambdas.size} entries for {nrep} states")
+    ladder_active = bool(np.any(state_lambdas > 0.0))
+    if ladder_active and not is_pep_gamd(args):
+        raise ValueError("a gamd_lambda ladder requires --gamd-boost-type pep-gamd-lower-dual")
 
     # Resolve per-replica CPU threads now that nrep is known.
     # --cpu-budget distributes total cores evenly; --max-cpu-per-replica caps the result.

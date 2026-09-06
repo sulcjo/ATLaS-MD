@@ -151,6 +151,7 @@ class WindowState:
     secondary_k: Optional[float] = None
     gamd_sigma0p: Optional[float] = None
     gamd_sigma0d: Optional[float] = None
+    gamd_lambda: float = 0.0
     active: bool = True
     created_epoch: int = 0
     retired_epoch: Optional[int] = None
@@ -183,6 +184,8 @@ class WindowState:
                 data[key] = None
             else:
                 data[key] = float(val)
+        lam = data.get("gamd_lambda")
+        data["gamd_lambda"] = 0.0 if lam in ("", "None", None) else float(lam)
         for key in ("created_epoch", "burnin_steps"):
             data[key] = int(data.get(key, 0) or 0)
         if data.get("retired_epoch") in ("", "None", None):
@@ -413,6 +416,7 @@ class WindowStateRegistry:
         secondary_k: Optional[float] = None,
         gamd_sigma0p: Optional[float] = None,
         gamd_sigma0d: Optional[float] = None,
+        gamd_lambda: float = 0.0,
         parent_state_id: Optional[int] = None,
         epoch: int = 0,
         source: str = "adaptive",
@@ -431,6 +435,7 @@ class WindowStateRegistry:
             secondary_k=None if secondary_k is None else float(secondary_k),
             gamd_sigma0p=None if gamd_sigma0p is None else float(gamd_sigma0p),
             gamd_sigma0d=None if gamd_sigma0d is None else float(gamd_sigma0d),
+            gamd_lambda=0.0 if gamd_lambda is None else float(gamd_lambda),
             active=True,
             created_epoch=int(epoch),
             parent_state_id=parent_state_id,
@@ -689,12 +694,14 @@ def registry_from_window_csv(path: Path, epoch: int = 0, source: str = "window_c
             k = 0.0
         secondary = _float_or_none(_csv_first(row, ["secondary_cv_center", "secondary_center", "ss0"]))
         secondary_k = _float_or_none(_csv_first(row, ["secondary_cv_k_kcal_mol", "secondary_k", "ss_k"]))
+        gamd_lambda = _float_or_none(_csv_first(row, ["gamd_lambda"])) or 0.0
         state_id_raw = _csv_first(row, ["state_id"], None)
         state = reg.add_state(
             primary_center=primary,
             primary_k=k,
             secondary_center=secondary,
             secondary_k=secondary_k,
+            gamd_lambda=gamd_lambda,
             epoch=epoch,
             source=source,
             reason=f"seeded from {path.name}",
