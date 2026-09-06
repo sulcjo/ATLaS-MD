@@ -232,3 +232,19 @@ def test_assemble_bias_matrices_kcal_kj_invariant_holds_with_boost():
     assert np.allclose(bias_kj, 4.184 * bias_kcal, atol=1e-12)
     umbrella_kj = 4.184 * (distance_bias_kcal + ss_bias_kcal)
     assert np.allclose(bias_kj, umbrella_kj + boost_bias_kj, atol=1e-12)
+
+
+def test_parquet_sample_writer_stores_raw_channel_energies_and_lambda():
+    import pyarrow.parquet as pq
+    from gareus.store import ParquetSampleWriter
+    d = pathlib.Path(tempfile.mkdtemp())
+    w = ParquetSampleWriter(d, flush_rows=10)
+    w.write_sample(step=1, replica=0, window_id=0, cv1=0.1, cv2=None, potential=-5.0,
+                   boost_total=1.0, boost_dihedral=0.5, boost_nonbonded=0.0,
+                   v_pep=12.5, v_dih=3.25, gamd_lambda=0.5)
+    w.write_sample(step=2, replica=0, window_id=0, cv1=0.1, cv2=None, potential=-5.0,
+                   boost_total=0.0, boost_dihedral=0.0, boost_nonbonded=0.0)   # defaults: NaN, NaN, 0.0
+    w.flush()
+    t = pq.read_table(sorted(d.glob("chunk_*.parquet"))[0]).to_pydict()
+    assert t["v_pep_kj_mol"][0] == 12.5 and t["v_dih_kj_mol"][0] == 3.25 and t["gamd_lambda"][0] == 0.5
+    assert np.isnan(t["v_pep_kj_mol"][1]) and t["gamd_lambda"][1] == 0.0

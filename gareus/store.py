@@ -41,6 +41,9 @@ class ParquetSampleWriter:
         boost_total: float,
         boost_dihedral: float,
         boost_nonbonded: float,
+        v_pep: float = float("nan"),
+        v_dih: float = float("nan"),
+        gamd_lambda: float = 0.0,
     ) -> None:
         b = self._buf
         b["step"].append(step)
@@ -52,6 +55,9 @@ class ParquetSampleWriter:
         b["gamd_boost_total"].append(boost_total)
         b["gamd_boost_dihedral"].append(boost_dihedral)
         b["gamd_boost_nonbonded"].append(boost_nonbonded)
+        b["v_pep_kj_mol"].append(v_pep)
+        b["v_dih_kj_mol"].append(v_dih)
+        b["gamd_lambda"].append(gamd_lambda)
         if len(b["step"]) >= self._flush_rows:
             self.flush()
 
@@ -72,6 +78,9 @@ class ParquetSampleWriter:
             "gamd_boost_total":    pa.array(b["gamd_boost_total"],    type=pa.float32()),
             "gamd_boost_dihedral": pa.array(b["gamd_boost_dihedral"], type=pa.float32()),
             "gamd_boost_nonbonded":pa.array(b["gamd_boost_nonbonded"],type=pa.float32()),
+            "v_pep_kj_mol":        pa.array(b["v_pep_kj_mol"],        type=pa.float32()),
+            "v_dih_kj_mol":        pa.array(b["v_dih_kj_mol"],        type=pa.float32()),
+            "gamd_lambda":         pa.array(b["gamd_lambda"],         type=pa.float32()),
         })
 
         self._chunk_idx += 1

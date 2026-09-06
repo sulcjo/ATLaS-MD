@@ -138,6 +138,11 @@ class DistanceLogger:
                 "umbrella_bias_mean_kcal_mol", "umbrella_bias_max_kcal_mol",
                 "gamd_boost_mean_kcal_mol", "gamd_boost_sd_kcal_mol", "gamd_boost_max_kcal_mol",
                 "gamd_boost_anharmonicity_score", "gamd_boost_skew", "gamd_boost_excess_kurtosis", "gamd_boost_anharmonicity_n",
+                # Appended at the END, never inserted mid-list: on --resume, append=True
+                # skips writeheader() (io.py) so a run resumed under an OLD header would
+                # have every later column shifted by one if a name were inserted earlier.
+                "sampled_umbrella_bias_kj", "sampled_boost_bias_kj",
+                "v_pep_kj_mol", "v_dih_kj_mol", "gamd_lambda",
             ], append=append_csv, flush_rows=int(getattr(args, "csv_flush_rows", 1000) or 1000), extrasaction="ignore")
             self.csv_handle = self.csv_writer
         if self.mode in {"jsonl", "both"}:
@@ -1642,6 +1647,8 @@ class DistanceLogger:
                     "primary_umbrella_bias_kcal_mol",
                     "secondary_cv", "secondary_cv_center", "secondary_cv_k_kcal_mol",
                     "distance_umbrella_bias_kcal_mol", "secondary_cv_bias_kcal_mol",
+                    "sampled_umbrella_bias_kj", "sampled_boost_bias_kj",
+                    "v_pep_kj_mol", "v_dih_kj_mol", "gamd_lambda",
                 ):
                     if key in row and row[key] not in (None, ""):
                         try:

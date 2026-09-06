@@ -3569,6 +3569,9 @@ class AnalysisArrayWriter:
         self.k_kcal_mol_A2: list[float] = []
         self.potential_kj_mol: list[float] = []
         self.gamd_boost_total_kj_mol: list[float] = []
+        self.v_pep_kj_mol: list[float] = []
+        self.v_dih_kj_mol: list[float] = []
+        self.gamd_lambda: list[float] = []
         self.distance_umbrella_bias_kcal_mol: list[float] = []
         self.secondary_cv_bias_kcal_mol: list[float] = []
         self.umbrella_bias_kcal_mol: list[float] = []
@@ -3616,6 +3619,9 @@ class AnalysisArrayWriter:
         except Exception:
             boost = float("nan")
         self.gamd_boost_total_kj_mol.append(boost)
+        self.v_pep_kj_mol.append(float(row.get("v_pep_kj_mol", np.nan)))
+        self.v_dih_kj_mol.append(float(row.get("v_dih_kj_mol", np.nan)))
+        self.gamd_lambda.append(float(row.get("gamd_lambda", 0.0)))
         self.distance_umbrella_bias_kcal_mol.append(float(row.get("distance_umbrella_bias_kcal_mol", np.nan)))
         self.secondary_cv_bias_kcal_mol.append(float(row.get("secondary_cv_bias_kcal_mol", np.nan)))
         self.umbrella_bias_kcal_mol.append(float(row.get("umbrella_bias_kcal_mol", np.nan)))
@@ -3657,6 +3663,9 @@ class AnalysisArrayWriter:
             "k_kcal_mol_A2": np.asarray(self.k_kcal_mol_A2, dtype=np.float64),
             "potential_kj_mol": np.asarray(self.potential_kj_mol, dtype=np.float64),
             "gamd_boost_total_kj_mol": np.asarray(self.gamd_boost_total_kj_mol, dtype=np.float64),
+            "v_pep_kj_mol": np.asarray(self.v_pep_kj_mol, dtype=np.float64),
+            "v_dih_kj_mol": np.asarray(self.v_dih_kj_mol, dtype=np.float64),
+            "gamd_lambda": np.asarray(self.gamd_lambda, dtype=np.float64),
             "distance_umbrella_bias_kcal_mol": np.asarray(self.distance_umbrella_bias_kcal_mol, dtype=np.float64),
             "secondary_cv_bias_kcal_mol": np.asarray(self.secondary_cv_bias_kcal_mol, dtype=np.float64),
             "umbrella_bias_kcal_mol": np.asarray(self.umbrella_bias_kcal_mol, dtype=np.float64),
@@ -6032,6 +6041,9 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             "gamd_boost_components_kj_mol_json": "component boost potentials from gamd-openmm native get_boost_potentials(), kJ/mol",
             "sampled_umbrella_bias_kj": "umbrella-only component (primary + secondary CV) of the sampled window's bias, kJ/mol; excludes the λ-ladder Pep-GaMD boost even when umbrella_bias_kj_mol/umbrella_bias_kcal_mol carry it",
             "sampled_boost_bias_kj": "Pep-GaMD boost of this replica's configuration under its own assigned window's λ, kJ/mol; zero on every run where the λ-ladder is not active",
+            "v_pep_kj_mol": "raw peptide-dihedral+nonbonded channel energy (gamd-openmm 'total potential energy of the boosted group') at this replica's configuration, kJ/mol; NaN when the λ-ladder is not active",
+            "v_dih_kj_mol": "raw peptide-dihedral-only channel energy at this replica's configuration, kJ/mol; NaN when the λ-ladder is not active",
+            "gamd_lambda": "the λ-ladder boost strength of the state/window this sample was assigned to; 0.0 on every run where the λ-ladder is not active, and identically 0.0 on λ=0 rungs even when the ladder is active",
         },
     }
     write_json(out_dir / "umbrella_pymbar_metadata.json", pymbar_metadata)
@@ -6347,6 +6359,9 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     "secondary_cv_k_kcal_mol": float(ss_k_arr[w]) if math.isfinite(float(ss_k_arr[w])) else "",
                     "distance_umbrella_bias_kcal_mol": float(all_distance_bias_kcal[w]),
                     "secondary_cv_bias_kcal_mol": float(all_ss_bias_kcal[w]),
+                    "v_pep_kj_mol": float(v_pep_kj[r]) if pep_env is not None else float("nan"),
+                    "v_dih_kj_mol": float(v_dih_kj[r]) if pep_env is not None else float("nan"),
+                    "gamd_lambda": float(state_lambdas[w]),
                     "umbrella_bias_kcal_mol": sampled_bias_kcal,
                     "umbrella_bias_kj_mol": sampled_bias_kj,
                     "sampled_umbrella_bias_kj": sampled_umbrella_bias_kj,
@@ -6407,6 +6422,9 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                         boost_total=_boost_total,
                         boost_dihedral=_boost_dihe,
                         boost_nonbonded=_boost_nonb,
+                        v_pep=float(v_pep_kj[r]) if pep_env is not None else float("nan"),
+                        v_dih=float(v_dih_kj[r]) if pep_env is not None else float("nan"),
+                        gamd_lambda=float(state_lambdas[w]),
                     )
                 rows.append(row)
             if is_prod and bool(getattr(args, "flush_every_log", False)):
