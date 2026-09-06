@@ -305,6 +305,7 @@ def _tica_covariance_matrices(
     epsilon: float = 1e-10,
     weights: Optional[np.ndarray] = None,
     segments: Optional[np.ndarray] = None,
+    center: str = "global",
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     """Build the C(0)/C(tau) lagged-covariance pair shared by every tICA fit.
 
@@ -312,10 +313,43 @@ def _tica_covariance_matrices(
     (analysis-only) fitters can never diverge in how C(0)/C(tau) are
     estimated — only in how many eigenpairs each one keeps afterward.
 
+    Parameters
+    ----------
+    center : {'global', 'per_segment'}
+        Which mean to remove before forming the covariances.
+
+        ``'global'`` (default) removes one mean from the whole array, which is
+        right for an unbiased trajectory.
+
+        ``'per_segment'`` removes each segment's own mean. Use this when the
+        segments are restrained windows. There, the spread BETWEEN segments is
+        the restraint rather than motion: a coordinate that is constant inside
+        every segment and only differs from window to window has a lagged
+        autocorrelation of ~1 at any lag, and since tICA maximises exactly that,
+        a global mean makes it return the restraint as the slowest mode. The
+        symptom is an implied timescale that grows with lag instead of
+        converging, because lambda stays pinned near 1.
+
+        Note this is a fit-time choice only. The returned ``mean`` is the global
+        mean either way, so the projection stays a pure function of the features
+        and does not depend on which segment a frame came from.
+
+        Necessary but not sufficient. Measured on chignolin_6 (132k frames, 666
+        restrained segments), global centring gave lambda pinned at 0.987-0.994
+        for every lag and an implied timescale sweeping 12.6 -> 124.9 ns (9.9x);
+        per-segment centring made lambda actually decay (0.909 -> 0.600) and cut
+        the timescale to 0.84 -> 3.13 ns, but that is still a 3.7x drift rather
+        than a converged, lag-independent number. Residual between-window
+        structure survives the subtraction. Where a converged MBAR solve exists,
+        pass ``weights`` as well: the reweighted estimator corrects the biased
+        ensemble properly, and per-segment centring is the cheap fallback for
+        when it does not (e.g. mid-campaign, before any solve is available).
+
     Returns
     -------
     C0, Ctau : np.ndarray, shape (d, d)
     mean : np.ndarray, shape (d,)
+        Always the global (optionally weighted) mean, whatever ``center`` is.
     d : int
         Feature dimensionality.
 
@@ -326,6 +360,10 @@ def _tica_covariance_matrices(
         segment has more than ``lag`` frames (zero valid within-segment
         lagged pairs).
     """
+    if center not in ("global", "per_segment"):
+        raise ValueError(
+            f"center must be 'global' or 'per_segment', got {center!r}"
+        )
     if int(lag) <= 0:
         raise ValueError(f"lag must be a positive integer, got {lag!r}")
     lag = int(lag)
@@ -361,11 +399,27 @@ def _tica_covariance_matrices(
     else:
         w = None
 
+    starts = np.concatenate([[0], np.cumsum(lengths)[:-1]]).astype(np.int64)
+    ends = np.cumsum(lengths).astype(np.int64)
+
+    def _demean(A: np.ndarray, mu: np.ndarray) -> np.ndarray:
+        """Remove either the one global mean or each segment's own mean."""
+        if center == "global":
+            return A - mu
+        out = A - mu
+        for s0, e0 in zip(starts, ends):
+            if e0 > s0:
+                out[s0:e0] -= out[s0:e0].mean(axis=0)
+        return out
+
     if w is None:
         # Standard unweighted tICA
         mean = X.mean(axis=0)
-        Xc = X - mean
-        C0 = (Xc.T @ Xc) / (n - 1)
+        Xc = _demean(X, mean)
+        # per-segment centring removes len(lengths) means rather than one, so
+        # the unbiased denominator loses that many degrees of freedom
+        ddof = 1 if center == "global" else max(int(len(lengths)), 1)
+        C0 = (Xc.T @ Xc) / max(n - ddof, 1)
         C0 += epsilon * np.eye(d)
         Xl = Xc[left]
         Xr = Xc[right]
@@ -375,7 +429,7 @@ def _tica_covariance_matrices(
         # Reweighted tICA: symmetric estimator with pair weights
         # (Nüske et al. 2017 / standard MBAR-reweighted TICA form)
         mean = w @ X  # weighted mean, shape (d,)
-        Xc = X - mean
+        Xc = _demean(X, mean)
         Xl = Xc[left]
         Xr = Xc[right]
         # Arithmetic-mean pair weights: each pair (t, t+lag) gets
@@ -423,6 +477,7 @@ def compute_tica(
     epsilon: float = 1e-10,
     weights: Optional[np.ndarray] = None,
     segments: Optional[np.ndarray] = None,
+    center: str = "global",
 ) -> TICAResult:
     """Fit a tICA model to feature matrix X and return the slowest mode.
 
@@ -459,6 +514,11 @@ def compute_tica(
         length <= lag contributes zero pairs. When ``None`` (default), the
         whole array is treated as a single segment, reproducing the
         previous (pre-fix) behaviour exactly.
+    center : {'global', 'per_segment'}
+        Mean removed before forming the covariances. Use ``'per_segment'`` when
+        the segments are restrained umbrella windows, so that the spread between
+        window centres is not mistaken for slow motion. See
+        ``_tica_covariance_matrices``.
 
     Returns
     -------
@@ -474,7 +534,8 @@ def compute_tica(
     """
     lag = int(lag)
     C0, Ctau, mean, d = _tica_covariance_matrices(
-        X, lag, epsilon=epsilon, weights=weights, segments=segments
+        X, lag, epsilon=epsilon, weights=weights, segments=segments,
+        center=center,
     )
 
     eigenvalues, eigenvectors = _tica_generalized_eigh(C0, Ctau, d, n_keep=1)
@@ -519,6 +580,7 @@ def compute_tica_components(
     epsilon: float = 1e-10,
     weights: Optional[np.ndarray] = None,
     segments: Optional[np.ndarray] = None,
+    center: str = "global",
 ) -> List[TICAResult]:
     """Fit tICA and return the top ``n_components`` modes, not just tIC1.
 
@@ -536,7 +598,8 @@ def compute_tica_components(
     """
     lag = int(lag)
     C0, Ctau, mean, d = _tica_covariance_matrices(
-        X, lag, epsilon=epsilon, weights=weights, segments=segments
+        X, lag, epsilon=epsilon, weights=weights, segments=segments,
+        center=center,
     )
     n_components = max(1, min(int(n_components), d))
     eigenvalues, eigenvectors = _tica_generalized_eigh(C0, Ctau, d, n_keep=n_components)
@@ -585,6 +648,7 @@ def compute_tica_combined(
     epsilon: float = 1e-10,
     weights: Optional[np.ndarray] = None,
     segments: Optional[np.ndarray] = None,
+    center: str = "global",
 ) -> TICAResult:
     """Fit tICA and combine the top ``n_components`` modes into one CV2 direction.
 
@@ -630,10 +694,12 @@ def compute_tica_combined(
             epsilon=epsilon,
             weights=weights,
             segments=segments,
+            center=center,
         )
 
     C0, Ctau, mean, d = _tica_covariance_matrices(
-        X, lag, epsilon=epsilon, weights=weights, segments=segments
+        X, lag, epsilon=epsilon, weights=weights, segments=segments,
+        center=center,
     )
     if int(n_components) > d:
         raise ValueError(f"n_components must be in 1..{d}, got {n_components}")
