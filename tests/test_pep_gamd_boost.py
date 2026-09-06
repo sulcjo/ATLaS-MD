@@ -196,8 +196,13 @@ def _partitioned_system(zero_aux: bool = False):
 
 
 def _one_step_positions(system, integ, positions, openmm, unit, seed=7, stage_globals=None):
+    """Positions after ONE integrated step. gamd-openmm's very first step of a fresh
+    Context moves nothing, so warm up one step, re-seat the start state, then step."""
     integ.setRandomNumberSeed(seed)
     ctx = openmm.Context(system, integ, openmm.Platform.getPlatformByName("Reference"))
+    ctx.setPositions(positions)
+    ctx.setVelocitiesToTemperature(300.0 * unit.kelvin, seed)
+    integ.step(1)
     ctx.setPositions(positions)
     ctx.setVelocitiesToTemperature(300.0 * unit.kelvin, seed)
     if stage_globals:
@@ -206,6 +211,11 @@ def _one_step_positions(system, integ, positions, openmm, unit, seed=7, stage_gl
     integ.step(1)
     pos = ctx.getState(getPositions=True).getPositions(asNumpy=True).value_in_unit(unit.nanometer)
     return np.array(pos, dtype=float)
+
+
+def _assert_moved(p_after, positions, unit):
+    x0 = np.array(positions.value_in_unit(unit.nanometer), dtype=float)
+    assert np.max(np.abs(p_after - x0)) > 1e-6, "the measured step did not move any atom; the comparison would be vacuous"
 
 
 def test_integrator_total_channel_reads_peptide_essential_energy_not_bare_energy():
@@ -233,6 +243,7 @@ def test_integrator_cmd_stage_does_not_apply_the_auxiliary_force():
     kw = _gamd_kwargs(unit)
     p_real = _one_step_positions(sys_real, pep_gamd.PepGaMDLowerDualIntegrator(pep_gamd.DIHEDRAL_GROUP, **kw), fx["positions"], openmm, unit)
     p_zero = _one_step_positions(sys_zero, pep_gamd.PepGaMDLowerDualIntegrator(pep_gamd.DIHEDRAL_GROUP, **kw), fx["positions"], openmm, unit)
+    _assert_moved(p_real, fx["positions"], unit)
     assert np.max(np.abs(p_real - p_zero)) < 1e-9
 
 
@@ -250,6 +261,7 @@ def test_integrator_boost_stage_with_zero_k0_reduces_to_physical_forces():
             "Vmax_Dihedral": 1e6, "Vmin_Dihedral": -1e6, "threshold_energy_Dihedral": 1e6}
     p_real = _one_step_positions(sys_real, pep_gamd.PepGaMDLowerDualIntegrator(pep_gamd.DIHEDRAL_GROUP, **kw), fx["positions"], openmm, unit, stage_globals=prod)
     p_zero = _one_step_positions(sys_zero, pep_gamd.PepGaMDLowerDualIntegrator(pep_gamd.DIHEDRAL_GROUP, **kw), fx["positions"], openmm, unit, stage_globals=prod)
+    _assert_moved(p_real, fx["positions"], unit)
     assert np.max(np.abs(p_real - p_zero)) < 1e-9
 
 

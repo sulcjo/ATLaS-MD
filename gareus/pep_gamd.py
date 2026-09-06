@@ -17,7 +17,8 @@ from __future__ import annotations
 
 from typing import Iterable
 
-PEP_GAMD_BOOST_TYPE = "pep-gamd-lower-dual"
+PEP_GAMD_PREFIX = "pep-gamd-"
+PEP_GAMD_BOOST_TYPE = PEP_GAMD_PREFIX + "lower-dual"
 AUX_FORCE_NAME = "PepGaMDWaterOnlyNonbonded"
 
 PHYSICAL_NONBONDED_GROUP = 0
@@ -262,13 +263,24 @@ def physical_potential_energy_kj(context, system, unit) -> float:
     return float(context.getState(getEnergy=True, groups=groups).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole))
 
 
-def boost_target_energy_kj(context, integrator, gid, unit) -> float:
-    """Energy of one GaMD boost target, by the integrator's own definition of it."""
+def total_energy_groups_for_args(args) -> tuple[frozenset, frozenset]:
+    """The Total channel's (plus, minus) groups as a property of the boost type.
+
+    The cMD-kind recon steps a plain Langevin integrator on an already-partitioned
+    system, so the stepping integrator cannot be the source of this definition.
+    """
+    if is_pep_gamd(args):
+        return frozenset(PHYSICAL_GROUPS), frozenset({AUX_NONBONDED_GROUP})
+    return frozenset(range(32)), frozenset()
+
+
+def boost_target_energy_kj(context, gid, unit, *, total_groups) -> float:
+    """Energy of one GaMD boost target; ``total_groups`` = (plus, minus) for the Total channel."""
     def _e(groups):
         return float(context.getState(getEnergy=True, groups=set(groups)).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole))
     if gid is not None:
         return _e({int(gid)})
-    plus, minus = total_energy_groups(integrator)
+    plus, minus = total_groups
     e = _e(plus)
     if minus:
         e -= _e(minus)

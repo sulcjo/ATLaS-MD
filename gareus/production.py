@@ -1604,6 +1604,7 @@ from .pep_gamd import (
     physical_energy_groups_for_args,
     physical_potential_energy_kj,
     prepare_pep_gamd_args,
+    total_energy_groups_for_args,
     AUX_NONBONDED_GROUP as _PEP_GAMD_AUX_GROUP,
 )
 
@@ -4553,11 +4554,13 @@ def run_multiwindow_gamd_recon(
             for i in range(nwin)
         ]
 
+        _recon_total_groups = total_energy_groups_for_args(args)
+
         def _recon_chunk(item):
             i, sim_i = item
             sim_i.step(int(chunk))
             for name, gid in targets_per_window[i]:
-                pe_kj = boost_target_energy_kj(sim_i.context, sim_i.integrator, gid, unit)
+                pe_kj = boost_target_energy_kj(sim_i.context, gid, unit, total_groups=_recon_total_groups)
                 accumulators_by_window[i][name].update(pe_kj)
             return i
 
@@ -6110,7 +6113,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                         if sf is not None else float("nan")
                     )
                     if read_sample_potential:
-                        state = ctx.getState(getEnergy=True, enforcePeriodicBox=True)
+                        state = ctx.getState(getEnergy=True, enforcePeriodicBox=True,
+                                             groups=physical_energy_groups_for_args(args))
                         pe = float(state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole))
                     else:
                         pe = float("nan")
@@ -6209,7 +6213,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 if is_prod and _gamd_recal_active:
                     try:
                         for _gname, _gid in _gamd_recal_targets:
-                            _gpe = boost_target_energy_kj(sim.context, sim.integrator, _gid, unit)
+                            _gpe = boost_target_energy_kj(sim.context, _gid, unit, total_groups=total_energy_groups_for_args(args))
                             _gamd_recal_accumulators[_gname].setdefault(w, _WelfordAccumulator()).update(_gpe)
                     except Exception as _gamd_recal_sample_exc:
                         # Best-effort measurement only: a failure here must never take

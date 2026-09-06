@@ -25,9 +25,9 @@ def test_boost_target_energy_follows_stock_integrator_definition_all_groups():
     s, e = _three_group_system(openmm, unit)
     ctx = openmm.Context(s, openmm.VerletIntegrator(0.001 * unit.picoseconds), openmm.Platform.getPlatformByName("Reference"))
     ctx.setPositions([[0, 0, 0], [0.2, 0, 0]])
-    stock = types.SimpleNamespace()  # no TOTAL_ENERGY_* attributes -> bare energy
-    assert abs(pep_gamd.boost_target_energy_kj(ctx, stock, None, unit) - sum(e.values())) < 1e-9
-    assert abs(pep_gamd.boost_target_energy_kj(ctx, stock, 2, unit) - e[2]) < 1e-9
+    stock = pep_gamd.total_energy_groups(types.SimpleNamespace())  # no TOTAL_ENERGY_* attributes -> bare energy
+    assert abs(pep_gamd.boost_target_energy_kj(ctx, None, unit, total_groups=stock) - sum(e.values())) < 1e-9
+    assert abs(pep_gamd.boost_target_energy_kj(ctx, 2, unit, total_groups=stock) - e[2]) < 1e-9
 
 
 def test_boost_target_energy_follows_pep_gamd_definition_e0_minus_e1_plus_e2():
@@ -36,9 +36,9 @@ def test_boost_target_energy_follows_pep_gamd_definition_e0_minus_e1_plus_e2():
     s, e = _three_group_system(openmm, unit)
     ctx = openmm.Context(s, openmm.VerletIntegrator(0.001 * unit.picoseconds), openmm.Platform.getPlatformByName("Reference"))
     ctx.setPositions([[0, 0, 0], [0.2, 0, 0]])
-    pep = types.SimpleNamespace(TOTAL_ENERGY_PLUS_GROUPS={0, 2}, TOTAL_ENERGY_MINUS_GROUPS={1})
-    assert abs(pep_gamd.boost_target_energy_kj(ctx, pep, None, unit) - (e[0] - e[1] + e[2])) < 1e-9
-    assert abs(pep_gamd.boost_target_energy_kj(ctx, pep, 2, unit) - e[2]) < 1e-9
+    pep = pep_gamd.total_energy_groups(types.SimpleNamespace(TOTAL_ENERGY_PLUS_GROUPS={0, 2}, TOTAL_ENERGY_MINUS_GROUPS={1}))
+    assert abs(pep_gamd.boost_target_energy_kj(ctx, None, unit, total_groups=pep) - (e[0] - e[1] + e[2])) < 1e-9
+    assert abs(pep_gamd.boost_target_energy_kj(ctx, 2, unit, total_groups=pep) - e[2]) < 1e-9
 
 
 def test_physical_potential_excludes_only_the_auxiliary_group_when_present():
@@ -130,3 +130,70 @@ def test_prepare_pep_gamd_args_records_peptide_atoms_from_topology():
     other = types.SimpleNamespace(gamd_boost_type="lower-dihedral")
     pep_gamd.prepare_pep_gamd_args(other, fx["topology"])
     assert not hasattr(other, "pep_gamd_peptide_atoms")
+
+
+def test_total_energy_groups_derive_from_the_boost_type_not_the_stepping_integrator():
+    """The cMD-kind recon steps a plain Langevin integrator on a partitioned system;
+    the Total channel's definition is a property of the boost type, so it must come
+    from args, never from whichever integrator happens to be stepping."""
+    from gareus import pep_gamd
+    openmm, _app, unit = import_openmm()
+    plus, minus = pep_gamd.total_energy_groups_for_args(types.SimpleNamespace(gamd_boost_type=pep_gamd.PEP_GAMD_BOOST_TYPE))
+    assert (set(plus), set(minus)) == ({0, 2}, {1})
+    plus, minus = pep_gamd.total_energy_groups_for_args(types.SimpleNamespace(gamd_boost_type="lower-dual"))
+    assert (set(plus), set(minus)) == (set(range(32)), set())
+    s, e = _three_group_system(openmm, unit)
+    plain = openmm.LangevinMiddleIntegrator(300.0, 1.0, 0.002)
+    ctx = openmm.Context(s, plain, openmm.Platform.getPlatformByName("Reference"))
+    ctx.setPositions([[0, 0, 0], [0.2, 0, 0]])
+    groups = pep_gamd.total_energy_groups_for_args(types.SimpleNamespace(gamd_boost_type=pep_gamd.PEP_GAMD_BOOST_TYPE))
+    assert abs(pep_gamd.boost_target_energy_kj(ctx, None, unit, total_groups=groups) - (e[0] - e[1] + e[2])) < 1e-9
+
+
+def test_calibration_dispatch_accepts_the_pep_gamd_boost_type():
+    """threshold_and_k0 dispatches lower/upper by string prefix; 'pep-gamd-lower-dual'
+    must resolve to the lower-bound formula, identically to 'lower-dual'."""
+    from gareus import pep_gamd
+    from gareus.gamd_calibration import PooledEnvelope, compute_group_calibration
+    env = PooledEnvelope(group="Total", vmax=120.0, vmin=-80.0, vavg=10.0, sigmav=12.0, n_total=1000, n_windows=4)
+    ref = compute_group_calibration("lower-dual", env, 6.0 * 4.184)
+    got = compute_group_calibration(pep_gamd.PEP_GAMD_BOOST_TYPE, env, 6.0 * 4.184)
+    assert (got.k0, got.k, got.threshold_energy, got.boosted) == (ref.k0, ref.k, ref.threshold_energy, ref.boosted)
+    assert got.boosted and 0.0 < got.k0 <= 1.0
+
+
+def test_integrator_boosted_force_algebra_at_scaling_below_one():
+    """0 K, no constraints, v0 = 0: x1 - x0 = dt*fscale*F_applied/m exactly, with
+    F_applied = (F0 - F1)*FSF_T + F2*FSF_T*FSF_D + F1 + F31. Exercises FSF < 1,
+    where the auxiliary/physical cancellation is nontrivial."""
+    from gareus import pep_gamd
+    openmm, _app, unit = import_openmm()
+    s, _e = _three_group_system(openmm, unit)
+    integ = pep_gamd.PepGaMDLowerDualIntegrator(
+        2, dt=0.001 * unit.picoseconds, ntcmdprep=2, ntcmd=4, ntebprep=2, nteb=4, nstlim=100, ntave=2,
+        sigma0p=6.0 * unit.kilocalories_per_mole, sigma0d=6.0 * unit.kilocalories_per_mole,
+        collision_rate=1.0 / unit.picoseconds, temperature=0.0 * unit.kelvin)
+    ctx = openmm.Context(s, integ, openmm.Platform.getPlatformByName("Reference"))
+    x0 = np.array([[0.0, 0.0, 0.0], [0.2, 0.0, 0.0]])
+    ctx.setPositions(x0)
+    ctx.setVelocities(np.zeros((2, 3)))
+    integ.step(1)  # gamd-openmm's first step of a fresh Context moves nothing; warm up, then re-seat
+    ctx.setPositions(x0)
+    ctx.setVelocities(np.zeros((2, 3)))
+    F = {g: np.array(ctx.getState(getForces=True, groups={g}).getForces(asNumpy=True).value_in_unit(unit.kilojoule_per_mole / unit.nanometer))
+         for g in (0, 1, 2, 31)}
+    for k, v in {"stepCount": 50, "stage": 5, "k0_Total": 0.5, "k0_Dihedral": 0.5,
+                 "Vmax_Total": 50.0, "Vmin_Total": -50.0, "threshold_energy_Total": 50.0,
+                 "Vmax_Dihedral": 50.0, "Vmin_Dihedral": -50.0, "threshold_energy_Dihedral": 50.0}.items():
+        integ.setGlobalVariableByName(k, v)
+    integ.step(1)
+    T = integ.getGlobalVariableByName("ForceScalingFactor_Total")
+    D = integ.getGlobalVariableByName("ForceScalingFactor_Dihedral")
+    assert 0.0 < T < 0.999 and 0.0 < D < 0.999, (T, D)
+    fscale = integ.getGlobalVariableByName("fscale")
+    dt = 0.001
+    m = 1.0
+    F_applied = (F[0] - F[1]) * T + F[2] * T * D + F[1] + F[31]
+    x1 = np.array(ctx.getState(getPositions=True).getPositions(asNumpy=True).value_in_unit(unit.nanometer))
+    assert np.max(np.abs(x1 - x0)) > 1e-6, "no motion: the step measured nothing"
+    assert np.max(np.abs((x1 - x0) - dt * fscale * F_applied / m)) < 1e-9
