@@ -222,6 +222,67 @@ def cumulant_series_verdict(diag3: dict, counts=None) -> dict:
             'converging':converging}
 
 
+# Exponential reweighting of the MBAR umbrella weights is not an approximation.
+# This package calibrates ONE shared GaMD setup per campaign, so dV is the same
+# function of configuration for every state: reweighting by exp(beta*dV) is
+# algebraically identical to putting dV in the reduced potential and adding an
+# unbiased target state at u=0, because a per-row constant cancels from the f_k
+# solve and survives only in the target weight. gamd_exponential IS the exact
+# estimator; CE2 is the approximation to it.
+#
+# What makes CE2 preferable on a WIDE boost is variance, not correctness: the
+# exact estimator's ESS falls off like exp(-(beta*sigma)^2). At chignolin_6's
+# beta*sigma = 3.57 that is 3.0e-6 of N, which estimates nothing. At the
+# sigma0 = 1.0 kcal/mol rebuild, beta*sigma = 1.43 and ESS/N = 0.13, where
+# taking CE2's truncation bias buys nothing.
+#
+# The fraction matches the pre-existing low-ESS warning threshold in
+# run_pmf_and_gamd_boost_report, so a run can never be told its ESS is fine and
+# still be handed the biased estimator. The absolute floor exists because a
+# healthy FRACTION of a tiny sample is still a tiny sample.
+EXACT_REWEIGHT_MIN_ESS_FRACTION = 0.05
+EXACT_REWEIGHT_MIN_ESS = 100.0
+
+
+def select_unbiased_method(exp_ess, n_samples,
+                           min_ess_fraction=EXACT_REWEIGHT_MIN_ESS_FRACTION,
+                           min_ess=EXACT_REWEIGHT_MIN_ESS):
+    """Choose between the exact estimator and the second-order cumulant one.
+
+    Returns ``(method, reason)`` where ``method`` is ``'gamd_exponential'`` or
+    ``'gamd_cumulant2'``.
+
+    Gated on the EXPONENTIAL estimator's own effective sample size, deliberately
+    not on the cumulant series' convergence verdict. An earlier revision switched
+    estimator when the cumulant series failed to converge and was reverted,
+    correctly: that condition fires precisely when the boost is wide, which is
+    precisely when the exponential estimator is worthless. Gating on the exact
+    estimator's own ESS means the switch can only happen when the exact answer is
+    actually affordable.
+    """
+    try:
+        ess = float(exp_ess)
+        n = int(n_samples)
+    except (TypeError, ValueError):
+        return 'gamd_cumulant2', 'exponential ESS unavailable; CE2 selected'
+    if n <= 0:
+        return 'gamd_cumulant2', 'no samples; CE2 selected'
+    if not np.isfinite(ess) or ess < 0.0:
+        return 'gamd_cumulant2', f'exponential ESS is not finite ({exp_ess!r}); CE2 selected'
+    frac = ess / float(n)
+    if frac >= float(min_ess_fraction) and ess >= float(min_ess):
+        return ('gamd_exponential',
+                f'exponential reweighting is exact and affordable here '
+                f'(ESS {ess:.1f}/{n} = {frac:.3f} >= {float(min_ess_fraction):.3f} '
+                f'and >= {float(min_ess):.0f}); selected over CE2, which carries a '
+                f'truncation bias')
+    return ('gamd_cumulant2',
+            f'exponential reweighting is exact but unaffordable here '
+            f'(ESS {ess:.1f}/{n} = {frac:.3g}; need fraction >= '
+            f'{float(min_ess_fraction):.3f} and count >= {float(min_ess):.0f}), '
+            f'so CE2 is selected despite its truncation bias')
+
+
 def _cumulant_shared_stats(cv,base_w,boost,bins):
     """The O(N) work shared by the order-2 and order-3 cumulant expansions:
     histogram/bin-edges, per-bin unweighted counts, bin-index assignment,
@@ -1448,8 +1509,12 @@ def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.nd
         # "use something else"; it means the truncation error is real and must
         # be quoted alongside the curve.
         _cum_verdict = cumulant_series_verdict(cdiag3, counts=cum3_pmf.get('counts'))
-        selected = 'gamd_cumulant2'
-        if not _cum_verdict['converging']:
+        # computed here rather than further down because the estimator choice
+        # depends on it
+        e = _agm.ess(exp_w)
+        selected, _sel_reason = select_unbiased_method(e, N)
+        warnings.append(f'{warning_prefix}Unbiased estimator: {_sel_reason}.')
+        if not _cum_verdict['converging'] and selected == 'gamd_cumulant2':
             warnings.append(
                 f"{warning_prefix}GaMD cumulant expansion is NOT converging on this boost "
                 f"(typical terms: 1st {_cum_verdict['term1_kT']:.2f} kT, 2nd "
@@ -1505,8 +1570,7 @@ def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.nd
                 f"excursions are statistically significant (compare each bin's variance against "
                 f"its neighbours' using its own sample count) before trusting or smoothing them: "
                 f"--gamd-smooth-sigma exists but will erase real structure if the variation is real.")
-        e = _agm.ess(exp_w)
-        if e / max(1, N) < 0.05:
+        if e / max(1, N) < EXACT_REWEIGHT_MIN_ESS_FRACTION:
             warnings.append(f'{warning_prefix}GaMD exponential reweighting ESS is very low: {e:.1f}/{N}')
         if bs.get('std_kcal_mol', 0) > 6.0:
             warnings.append(f"{warning_prefix}GaMD boost std is large ({bs['std_kcal_mol']:.2f} kcal/mol); cumulant reweighting may be unreliable")
