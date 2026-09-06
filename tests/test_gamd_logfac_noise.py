@@ -293,13 +293,30 @@ def test_a_non_converging_series_does_not_change_the_selected_method():
 
     This is a regression guard: an earlier revision DID switch estimator here,
     and the switch reached main because the revert was left uncommitted.
+
+    The invariant is about the TRIGGER, not about CE2 being selected forever.
+    Selection is now gated on the exponential estimator's own effective sample
+    size, which can only fire when the exact estimator is affordable -- the
+    opposite condition to a non-converging series, which fires when the boost is
+    wide and the exponential estimator is worthless. So this asserts what the
+    guard always meant: the cumulant verdict does not reach the decision.
     """
     import inspect
     from gareus.mbar_analysis import pmf as pmfmod
+
+    # the decision function cannot consult the verdict: it is never given one
+    params = set(inspect.signature(pmfmod.select_unbiased_method).parameters)
+    assert not (params & {'verdict', 'cumulant_verdict', 'converging', 'cdiag',
+                          'diag', 'series'}), (
+        f'estimator selection must not depend on the cumulant verdict, got {params}')
+
+    # at the width that triggers a non-converging verdict, CE2 must still win
+    n = 940_788
+    assert pmfmod.select_unbiased_method(3.0e-6 * n, n)[0] == 'gamd_cumulant2'
+    # and no verdict can rescue the exact estimator: a hopeless ESS never selects it
+    assert pmfmod.select_unbiased_method(0.0, n)[0] == 'gamd_cumulant2'
+
     src = inspect.getsource(pmfmod.run_pmf_and_gamd_boost_report)
     head, _, _ = src.partition('_force_method')     # ignore --selected-method
-    assert "selected = 'gamd_cumulant2'" in head
-    assert "selected = 'gamd_exponential'" not in head, (
-        'a non-converging verdict must not switch the estimator')
     # umbrella_only remains reachable only for the no-usable-boost branch
     assert head.count("selected = 'umbrella_only'") <= 1
