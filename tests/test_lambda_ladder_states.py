@@ -118,3 +118,81 @@ def test_state_registry_csv_carries_gamd_lambda():
     with csv_path.open(newline="") as f:
         rows = list(_csv.DictReader(f))
     assert float(rows[0]["gamd_lambda"]) == 0.6
+
+
+def test_state_subset_window_csv_round_trip_carries_gamd_lambda():
+    """write_state_subset_window_csv feeds seg_args.windows_2d_csv for an
+    adaptive-production scheduled segment (structural twin of
+    write_active_window_csv); its output must round-trip through
+    load_explicit_2d_window_csv without zeroing lambda."""
+    from gareus.adaptive_production import WindowStateRegistry, write_state_subset_window_csv
+    from gareus.windows import load_explicit_2d_window_csv
+
+    reg = WindowStateRegistry()
+    s0 = reg.add_state(primary_center=0.1, primary_k=100.0, gamd_lambda=0.0)
+    s1 = reg.add_state(primary_center=0.2, primary_k=100.0, gamd_lambda=0.5)
+    s2 = reg.add_state(primary_center=0.3, primary_k=100.0, gamd_lambda=1.0)
+
+    d = pathlib.Path(tempfile.mkdtemp())
+    csv_path = d / "state_subset_windows.csv"
+    write_state_subset_window_csv(reg, csv_path, [s0.state_id, s1.state_id, s2.state_id])
+
+    centers, ks, sec_c, sec_k, meta, *_rest = load_explicit_2d_window_csv(_args(), csv_path)
+    assert list(meta["gamd_lambdas"]) == [0.0, 0.5, 1.0]
+
+
+def test_post_pull_drop_rewrites_umbrella_windows_csv_with_surviving_lambdas():
+    """drop_bad_us_windows_and_rebuild rewrites umbrella_windows.csv (load-bearing
+    for the legacy MBAR loader, not diagnostic); the surviving states' lambda
+    must not be zeroed by that rewrite."""
+    import types, csv as _csv
+    from gareus.production import drop_bad_us_windows_and_rebuild
+
+    d = pathlib.Path(tempfile.mkdtemp())
+    args = types.SimpleNamespace(temperature_k=300.0)
+    centers_a = [0.1, 0.2, 0.3, 0.4]
+    k_list = [100.0, 100.0, 100.0, 100.0]
+    centers_nm = np.array(centers_a)
+    ks_kj_nm2 = np.array(k_list)
+    window_metadata = {
+        "normalized_rows": [
+            {"window": 0, "gamd_lambda": 0.0},
+            {"window": 1, "gamd_lambda": 0.3},
+            {"window": 2, "gamd_lambda": 0.6},
+            {"window": 3, "gamd_lambda": 0.9},
+        ],
+    }
+    drop_bad_us_windows_and_rebuild(
+        d, [1],
+        centers_a, k_list, centers_nm, ks_kj_nm2,
+        None, None, None,
+        [None] * 4, [None] * 4,
+        {}, window_metadata, args,
+    )
+    csv_path = d / "umbrella_windows.csv"
+    with csv_path.open(newline="") as f:
+        rows = list(_csv.DictReader(f))
+    assert [float(r["gamd_lambda"]) for r in rows] == [0.0, 0.6, 0.9]
+
+
+def test_derive_state_gamd_lambdas_helper():
+    from gareus.production import _derive_state_gamd_lambdas
+
+    # normalized_rows present, aligned, every row carries gamd_lambda -> use them.
+    wm = {"normalized_rows": [{"gamd_lambda": 0.1}, {"gamd_lambda": 0.2}]}
+    assert _derive_state_gamd_lambdas(wm, 2) == [0.1, 0.2]
+
+    # normalized_rows missing gamd_lambda on some row -> fall back to existing if aligned.
+    wm2 = {"normalized_rows": [{"gamd_lambda": 0.1}, {"window": 1}]}
+    assert _derive_state_gamd_lambdas(wm2, 2, existing=[0.4, 0.5]) == [0.4, 0.5]
+
+    # normalized_rows absent entirely, no usable existing -> zeros.
+    assert _derive_state_gamd_lambdas({}, 3) == [0.0, 0.0, 0.0]
+
+    # normalized_rows length mismatch (stale/unrenumbered) -> ignore it, fall back.
+    wm3 = {"normalized_rows": [{"gamd_lambda": 0.7}]}
+    assert _derive_state_gamd_lambdas(wm3, 2, existing=[0.2, 0.3]) == [0.2, 0.3]
+    assert _derive_state_gamd_lambdas(wm3, 2, existing=None) == [0.0, 0.0]
+
+    # existing wrong length is never trusted either -> zeros.
+    assert _derive_state_gamd_lambdas(None, 2, existing=[0.9]) == [0.0, 0.0]

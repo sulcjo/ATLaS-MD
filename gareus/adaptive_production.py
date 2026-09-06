@@ -4512,12 +4512,14 @@ def write_state_subset_window_csv(
             "reason": str(state.reason),
             "usable_for_mbar": int(bool(state.usable_for_mbar)),
             "burnin_steps": int(state.burnin_steps),
+            "gamd_lambda": float(state.gamd_lambda),
         })
     fieldnames = [
         "epoch_window", "state_id", "primary_cv_center", "primary_cv_k_kcal",
         "distance_center_A", "distance_k_kcal_mol_A2", "secondary_cv_center",
         "secondary_cv_k_kcal_mol", "window_type", "patch_lifecycle", "parent_state_id",
         "created_epoch", "source", "reason", "usable_for_mbar", "burnin_steps",
+        "gamd_lambda",
     ]
     with path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")

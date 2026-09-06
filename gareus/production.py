@@ -1733,6 +1733,32 @@ def window_assignment_rows(centers_a: np.ndarray, k_list: list[float], temperatu
         rows.append(row)
     return rows
 
+def _derive_state_gamd_lambdas(window_metadata: Optional[dict], n: int, existing=None) -> list[float]:
+    """Derive one gamd_lambda per surviving window, filter/drop-safe.
+
+    ``window_metadata["normalized_rows"]`` is the source of truth whenever it is
+    usable: present, aligned to exactly ``n`` surviving windows, and every row
+    carries its own ``gamd_lambda``. Reindexing operations that drop/reorder
+    windows (filter_explicit_2d_windows_by_seed_reachability,
+    drop_bad_us_windows_and_rebuild's _resubscript_normalized_rows) already
+    subset+renumber normalized_rows correctly, so reading gamd_lambda back out
+    of it here is safe across any such reindex.
+
+    ``existing`` is used ONLY when normalized_rows cannot be trusted, and ONLY
+    if it is already exactly length ``n`` -- a caller must not pass a
+    pre-reindex value across a filter/drop boundary where the alignment cannot
+    be verified from here; pass ``existing=None`` at any such call site.
+
+    Zeros (ladder inactive) is the fallback of last resort, never a guess.
+    """
+    rows = (window_metadata or {}).get("normalized_rows") or []
+    if rows and len(rows) == int(n) and all("gamd_lambda" in r for r in rows):
+        return [float(r.get("gamd_lambda", 0.0) or 0.0) for r in rows]
+    existing_list = list(existing or [])
+    if len(existing_list) == int(n):
+        return existing_list
+    return [0.0] * int(n)
+
 def write_window_assignment_csv(path: Path, rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
@@ -3185,9 +3211,17 @@ def drop_bad_us_windows_and_rebuild(
             out_dir, new_centers_a, new_secondary_cv_centers, args=args, prefix="explicit_2d_neighbor_graph"
         )
 
+    # window_metadata was just resubscripted above (_resubscript_normalized_rows),
+    # so its normalized_rows already carry each surviving window's own gamd_lambda,
+    # correctly reindexed by this function's own (possibly connectivity-restored)
+    # keep set. Without this, the rewritten umbrella_windows.csv would silently
+    # zero every state's lambda -- and that file is load-bearing (the legacy MBAR
+    # loader reconstructs biases from it), not merely diagnostic.
+    new_gamd_lambdas = _derive_state_gamd_lambdas(window_metadata, len(new_centers_a), existing=None)
     window_rows = window_assignment_rows(
         new_centers_a, new_k_list, args.temperature_k,
         new_secondary_cv_centers, new_secondary_cv_k_kcal_list, args=args,
+        gamd_lambdas=new_gamd_lambdas,
     )
     write_window_assignment_csv(out_dir / "umbrella_windows.csv", window_rows)
     try:
@@ -5254,12 +5288,9 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     # carries its own correct "gamd_lambda", so this stays aligned with
     # centers_a/k_list no matter which branch (explicit-2D, choose_windows,
     # or fast-resume) produced them.
-    _normalized_rows_for_lambda = window_metadata.get("normalized_rows") or []
-    if _normalized_rows_for_lambda and len(_normalized_rows_for_lambda) == len(centers_a) and all("gamd_lambda" in r for r in _normalized_rows_for_lambda):
-        args.state_gamd_lambdas = [float(r.get("gamd_lambda", 0.0) or 0.0) for r in _normalized_rows_for_lambda]
-    else:
-        _existing_lambdas = list(getattr(args, "state_gamd_lambdas", None) or [])
-        args.state_gamd_lambdas = _existing_lambdas if len(_existing_lambdas) == len(centers_a) else [0.0] * len(centers_a)
+    args.state_gamd_lambdas = _derive_state_gamd_lambdas(
+        window_metadata, len(centers_a), existing=getattr(args, "state_gamd_lambdas", None)
+    )
     window_rows = window_assignment_rows(centers_a, k_list, args.temperature_k, secondary_cv_centers, secondary_cv_k_kcal_list, args=args, gamd_lambdas=args.state_gamd_lambdas)
     write_window_assignment_csv(out_dir / "umbrella_windows.csv", window_rows)
     print_window_assignment_table(window_rows)
@@ -5466,11 +5497,9 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             # subsets+renumbers window_metadata["normalized_rows"] using its own
             # (possibly connectivity-restored) keep set via _resubscript_normalized_rows
             # -- re-derive from that rather than guessing the keep set here.
-            _normalized_rows_post_drop = (window_metadata or {}).get("normalized_rows") or []
-            if _normalized_rows_post_drop and len(_normalized_rows_post_drop) == len(centers_a) and all("gamd_lambda" in r for r in _normalized_rows_post_drop):
-                args.state_gamd_lambdas = [float(r.get("gamd_lambda", 0.0) or 0.0) for r in _normalized_rows_post_drop]
-            else:
-                args.state_gamd_lambdas = [0.0] * len(centers_a)
+            # existing=None deliberately: the pre-drop args.state_gamd_lambdas is not
+            # safe to reuse across an arbitrary (non-suffix) index drop.
+            args.state_gamd_lambdas = _derive_state_gamd_lambdas(window_metadata, len(centers_a), existing=None)
             state_lambdas = np.asarray(args.state_gamd_lambdas, dtype=float)
             if state_lambdas.size != nrep:
                 raise ValueError(f"state_gamd_lambdas has {state_lambdas.size} entries for {nrep} states after US auto-drop")
