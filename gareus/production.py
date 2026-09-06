@@ -1615,6 +1615,42 @@ from .pep_gamd import (
 )
 
 
+def assemble_bias_matrices(distance_bias_kcal, ss_bias_kcal, boost_bias_kj):
+    """Combine the umbrella components and the Pep-GaMD boost into one (kcal, kj) pair.
+
+    Both unit matrices carry the SAME quantity -- umbrella + boost -- so the
+    invariant ``bias_kj == 4.184 * bias_kcal`` holds regardless of whether the
+    λ-ladder is active. ``boost_bias_kj`` is all-zero when it is not, so this
+    is a no-op reduction to the pre-ladder umbrella-only matrix in that case.
+    Pulled out to module level so both assembly sites in ``run_gareus`` (the
+    log/sample path and ``_current_exchange_arrays``) share one definition and
+    so it is directly testable without a live OpenMM Context.
+    """
+    distance_bias_kcal = np.asarray(distance_bias_kcal, dtype=np.float64)
+    ss_bias_kcal = np.asarray(ss_bias_kcal, dtype=np.float64)
+    boost_bias_kj = np.asarray(boost_bias_kj, dtype=np.float64)
+    boost_bias_kcal = boost_bias_kj / 4.184
+    bias_kcal = distance_bias_kcal + ss_bias_kcal + boost_bias_kcal
+    bias_kj = 4.184 * bias_kcal
+    return bias_kcal, bias_kj
+
+
+def _fetch_v_pep_v_dih(ctx, pep_env, unit) -> tuple[float, float]:
+    """Read (V_pep, V_dih) in kJ/mol for the Pep-GaMD boost from a live Context.
+
+    Returns ``(nan, nan)`` without touching the Context when ``pep_env`` is
+    None (the λ-ladder is not active), matching every call site's prior
+    inline guard. Shared by both fetch closures' both branches in
+    ``run_gareus`` (log/sample and exchange, fast-CV and non-fast).
+    """
+    if pep_env is None:
+        return float("nan"), float("nan")
+    v_pep = peptide_essential_energy_kj(ctx, unit)
+    v_dih = (ctx.getState(getEnergy=True, groups={DIHEDRAL_GROUP}).getPotentialEnergy()
+             .value_in_unit(unit.kilojoule_per_mole))
+    return v_pep, v_dih
+
+
 def gamd_enabled(args) -> bool:
     """Return True when production should use gamd-openmm integrators."""
     return production_run_mode(args) in {"gamd", "hmr-gamd"}
@@ -5994,6 +6030,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             "gamd_boost_total_kj_mol": "GaMD boost estimate. Preferred source is gamd-openmm integrator.get_boost_potentials(); fallback is named CustomIntegrator globals.",
             "gamd_boost_source": "get_boost_potentials, integrator_globals, or unavailable",
             "gamd_boost_components_kj_mol_json": "component boost potentials from gamd-openmm native get_boost_potentials(), kJ/mol",
+            "sampled_umbrella_bias_kj": "umbrella-only component (primary + secondary CV) of the sampled window's bias, kJ/mol; excludes the λ-ladder Pep-GaMD boost even when umbrella_bias_kj_mol/umbrella_bias_kcal_mol carry it",
+            "sampled_boost_bias_kj": "Pep-GaMD boost of this replica's configuration under its own assigned window's λ, kJ/mol; zero on every run where the λ-ladder is not active",
         },
     }
     write_json(out_dir / "umbrella_pymbar_metadata.json", pymbar_metadata)
@@ -6231,17 +6269,13 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                         pe = float(state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole))
                     else:
                         pe = float("nan")
-                    v_pep = peptide_essential_energy_kj(ctx, unit) if pep_env is not None else float("nan")
-                    v_dih = (ctx.getState(getEnergy=True, groups={DIHEDRAL_GROUP}).getPotentialEnergy()
-                             .value_in_unit(unit.kilojoule_per_mole)) if pep_env is not None else float("nan")
+                    v_pep, v_dih = _fetch_v_pep_v_dih(ctx, pep_env, unit)
                     return r, cv, ss, pe, v_pep, v_dih
                 cv, ss, pe = primary_secondary_and_potential_from_state(
                     sim.context, primary_cv_def, args, unit, secondary_cv_metadata,
                     read_potential_energy=read_sample_potential,
                 )
-                v_pep = peptide_essential_energy_kj(sim.context, unit) if pep_env is not None else float("nan")
-                v_dih = (sim.context.getState(getEnergy=True, groups={DIHEDRAL_GROUP}).getPotentialEnergy()
-                         .value_in_unit(unit.kilojoule_per_mole)) if pep_env is not None else float("nan")
+                v_pep, v_dih = _fetch_v_pep_v_dih(sim.context, pep_env, unit)
                 return r, cv, ss, pe, v_pep, v_dih
 
             for r, cv, ss, pe, v_pep, v_dih in _sim_pool.map(_fetch_state, enumerate(sims)):
@@ -6263,10 +6297,11 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 ss_centers_arr = ss_centers_arr_global
                 ss_k_arr = ss_k_kcal_arr_global
                 ss_bias_matrix_kcal = np.zeros_like(distance_bias_matrix_kcal)
-            bias_matrix_kcal = distance_bias_matrix_kcal + ss_bias_matrix_kcal
             boost_bias_matrix_kj = (pep_gamd_boost_matrix_kj(v_pep_kj, v_dih_kj, state_lambdas, pep_env)
                                     if pep_env is not None else np.zeros((nrep, nrep)))
-            bias_matrix_kj = 4.184 * bias_matrix_kcal + boost_bias_matrix_kj
+            bias_matrix_kcal, bias_matrix_kj = assemble_bias_matrices(
+                distance_bias_matrix_kcal, ss_bias_matrix_kcal, boost_bias_matrix_kj
+            )
             reduced_bias_matrix = float(beta) * bias_matrix_kj
             observable_cache["step"] = int(step)
             observable_cache["primary_values"] = primary_values
@@ -6289,6 +6324,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 all_ss_bias_kcal = ss_bias_matrix_kcal[:, r]
                 sampled_bias_kcal = float(all_bias_kcal[w])
                 sampled_bias_kj = float(all_bias_kj[w])
+                sampled_umbrella_bias_kj = float(4.184 * (all_distance_bias_kcal[w] + all_ss_bias_kcal[w]))
+                sampled_boost_bias_kj = float(boost_bias_matrix_kj[w, r])
                 row = {
                     "step": int(step),
                     "phase": phase,
@@ -6312,6 +6349,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     "secondary_cv_bias_kcal_mol": float(all_ss_bias_kcal[w]),
                     "umbrella_bias_kcal_mol": sampled_bias_kcal,
                     "umbrella_bias_kj_mol": sampled_bias_kj,
+                    "sampled_umbrella_bias_kj": sampled_umbrella_bias_kj,
+                    "sampled_boost_bias_kj": sampled_boost_bias_kj,
                     "umbrella_reduced_bias": float(all_reduced_bias[w]),
                     "umbrella_restoring_force_kcal_mol_per_A": k_kcal_a2 * (center_a - cv_a),
                     "potential_kj_mol": float(potentials_kj[r]),
@@ -6605,17 +6644,13 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                         _ss_scalar_from_sub_cv_values(sf.getCollectiveVariableValues(ctx), secondary_cv_metadata)
                         if sf is not None and _ss_enabled else float("nan")
                     )
-                    v_pep = peptide_essential_energy_kj(ctx, unit) if pep_env is not None else float("nan")
-                    v_dih = (ctx.getState(getEnergy=True, groups={DIHEDRAL_GROUP}).getPotentialEnergy()
-                             .value_in_unit(unit.kilojoule_per_mole)) if pep_env is not None else float("nan")
+                    v_pep, v_dih = _fetch_v_pep_v_dih(ctx, pep_env, unit)
                 else:
                     state = sim.context.getState(getPositions=True, enforcePeriodicBox=True)
                     pos = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
                     cv = primary_cv_value_from_positions_nm(pos, primary_cv_def, args)
                     ss = secondary_structure_score_from_positions_nm(pos, secondary_cv_metadata) if _ss_enabled else float("nan")
-                    v_pep = peptide_essential_energy_kj(sim.context, unit) if pep_env is not None else float("nan")
-                    v_dih = (sim.context.getState(getEnergy=True, groups={DIHEDRAL_GROUP}).getPotentialEnergy()
-                             .value_in_unit(unit.kilojoule_per_mole)) if pep_env is not None else float("nan")
+                    v_pep, v_dih = _fetch_v_pep_v_dih(sim.context, pep_env, unit)
                 return r, cv, ss, v_pep, v_dih
 
             for r, cv, ss, v_pep, v_dih in _sim_pool.map(_fetch_exchange_state, enumerate(sims)):
@@ -6624,13 +6659,15 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 v_pep_kj[r] = v_pep
                 v_dih_kj[r] = v_dih
             dprimary = primary_values[np.newaxis, :] - centers_a_arr[:, np.newaxis]
-            bias_matrix_kj = 4.184 * 0.5 * k_arr[:, np.newaxis] * dprimary * dprimary
+            distance_bias_kcal = 0.5 * k_arr[:, np.newaxis] * dprimary * dprimary
             if secondary_cv_centers is not None and secondary_cv_ks_kj is not None and ss_ks_kj_arr_global is not None:
                 dss = ss_values[np.newaxis, :] - ss_centers_arr_global[:, np.newaxis]
-                bias_matrix_kj = bias_matrix_kj + 0.5 * ss_ks_kj_arr_global[:, np.newaxis] * dss * dss
+                ss_bias_kcal = (0.5 * ss_ks_kj_arr_global[:, np.newaxis] * dss * dss) / 4.184
+            else:
+                ss_bias_kcal = np.zeros_like(distance_bias_kcal)
             boost_bias_matrix_kj = (pep_gamd_boost_matrix_kj(v_pep_kj, v_dih_kj, state_lambdas, pep_env)
                                     if pep_env is not None else np.zeros((nrep, nrep)))
-            bias_matrix_kj = bias_matrix_kj + boost_bias_matrix_kj
+            _, bias_matrix_kj = assemble_bias_matrices(distance_bias_kcal, ss_bias_kcal, boost_bias_matrix_kj)
             return primary_values, bias_matrix_kj
 
         def _candidate_delta_for_window_swap(wi: int, wj: int, bias_matrix_kj: np.ndarray) -> Optional[float]:

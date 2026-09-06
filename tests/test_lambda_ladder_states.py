@@ -219,3 +219,16 @@ def test_boost_matrix_term_is_zero_for_a_pure_umbrella_ladder():
     env = PepGamdEnvelope(50.0, -50.0, 50.0, 0.8, 50.0, -50.0, 50.0, 0.6)
     M = pep_gamd_boost_matrix_kj(np.array([1.0, 2.0]), np.array([1.0, 2.0]), np.zeros(4), env)
     assert M.shape == (4, 2) and np.all(M == 0.0)
+
+
+def test_assemble_bias_matrices_kcal_kj_invariant_holds_with_boost():
+    """bias_kj == 4.184 * bias_kcal must hold even when the λ-ladder boost is
+    nonzero -- both unit columns must carry the SAME quantity (umbrella + boost)."""
+    from gareus.production import assemble_bias_matrices
+    distance_bias_kcal = np.array([[1.0, 2.0], [3.0, 4.0]])
+    ss_bias_kcal = np.zeros((2, 2))
+    boost_bias_kj = np.array([[0.0, 5.0], [10.0, 0.0]])
+    bias_kcal, bias_kj = assemble_bias_matrices(distance_bias_kcal, ss_bias_kcal, boost_bias_kj)
+    assert np.allclose(bias_kj, 4.184 * bias_kcal, atol=1e-12)
+    umbrella_kj = 4.184 * (distance_bias_kcal + ss_bias_kcal)
+    assert np.allclose(bias_kj, umbrella_kj + boost_bias_kj, atol=1e-12)
