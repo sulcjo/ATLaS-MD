@@ -5460,6 +5460,24 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 explicit_window_table_summary = _drop_table_summary
             nrep = len(centers_nm)
 
+            # The post-pull auto-drop can remove/restore arbitrary (non-suffix)
+            # indices, so state_lambdas computed before this point is stale and
+            # potentially misaligned. drop_bad_us_windows_and_rebuild already
+            # subsets+renumbers window_metadata["normalized_rows"] using its own
+            # (possibly connectivity-restored) keep set via _resubscript_normalized_rows
+            # -- re-derive from that rather than guessing the keep set here.
+            _normalized_rows_post_drop = (window_metadata or {}).get("normalized_rows") or []
+            if _normalized_rows_post_drop and len(_normalized_rows_post_drop) == len(centers_a) and all("gamd_lambda" in r for r in _normalized_rows_post_drop):
+                args.state_gamd_lambdas = [float(r.get("gamd_lambda", 0.0) or 0.0) for r in _normalized_rows_post_drop]
+            else:
+                args.state_gamd_lambdas = [0.0] * len(centers_a)
+            state_lambdas = np.asarray(args.state_gamd_lambdas, dtype=float)
+            if state_lambdas.size != nrep:
+                raise ValueError(f"state_gamd_lambdas has {state_lambdas.size} entries for {nrep} states after US auto-drop")
+            ladder_active = bool(np.any(state_lambdas > 0.0))
+            if ladder_active and not is_pep_gamd(args):
+                raise ValueError("a gamd_lambda ladder requires --gamd-boost-type pep-gamd-lower-dual")
+
         if use_gamd:
             reusable_gamd = load_reusable_shared_gamd_setup(args, out_dir)
             if reusable_gamd is not None:

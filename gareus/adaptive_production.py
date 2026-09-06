@@ -545,7 +545,7 @@ class WindowStateRegistry:
         fieldnames = [
             "state_id", "active", "created_epoch", "retired_epoch", "parent_state_id",
             "primary_center", "primary_k", "secondary_center", "secondary_k",
-            "gamd_sigma0p", "gamd_sigma0d", "source", "reason", "usable_for_mbar", "burnin_steps",
+            "gamd_sigma0p", "gamd_sigma0d", "gamd_lambda", "source", "reason", "usable_for_mbar", "burnin_steps",
         ]
         with path.open("w", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
@@ -602,6 +602,7 @@ class WindowStateRegistry:
             "distance_center_A", "distance_k_kcal_mol_A2", "secondary_cv_center",
             "secondary_cv_k_kcal_mol", "window_type", "patch_lifecycle", "parent_state_id",
             "created_epoch", "source", "reason", "usable_for_mbar", "burnin_steps",
+            "gamd_lambda",
         ]
         rows = []
         for i, state in enumerate(active):
@@ -622,6 +623,7 @@ class WindowStateRegistry:
                 "reason": str(state.reason),
                 "usable_for_mbar": int(bool(state.usable_for_mbar)),
                 "burnin_steps": int(state.burnin_steps),
+                "gamd_lambda": float(state.gamd_lambda),
             }
             if has_secondary and state.secondary_center is None:
                 raise RuntimeError("active registry mixes 1D and 2D states; cannot write one explicit 2D table")

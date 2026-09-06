@@ -82,3 +82,39 @@ def test_registry_from_window_csv_carries_gamd_lambda():
     reg = registry_from_window_csv(p)
     states = sorted(reg.all_states(), key=lambda s: s.state_id)
     assert [s.gamd_lambda for s in states] == [0.0, 0.4, 0.9]
+
+
+def test_active_window_csv_round_trip_carries_gamd_lambda():
+    """The per-epoch active-window CSV (write_active_window_csv) is what the adaptive
+    driver feeds back in as the next epoch's --windows-2d-csv (via load_explicit_2d_window_csv).
+    A state's gamd_lambda set at epoch N must not collapse to zero at epoch N+1."""
+    from gareus.adaptive_production import WindowStateRegistry
+    from gareus.windows import load_explicit_2d_window_csv
+
+    reg = WindowStateRegistry()
+    reg.add_state(primary_center=0.1, primary_k=100.0, gamd_lambda=0.0)
+    reg.add_state(primary_center=0.2, primary_k=100.0, gamd_lambda=0.4)
+    reg.add_state(primary_center=0.3, primary_k=100.0, gamd_lambda=0.9)
+
+    d = pathlib.Path(tempfile.mkdtemp())
+    csv_path = d / "windows_epoch_001.csv"
+    reg.write_active_window_csv(csv_path)
+
+    centers, ks, sec_c, sec_k, meta, *_rest = load_explicit_2d_window_csv(_args(), csv_path)
+    assert list(meta["gamd_lambdas"]) == [0.0, 0.4, 0.9]
+
+
+def test_state_registry_csv_carries_gamd_lambda():
+    """state_registry.csv (write_state_csv) is a diagnostic dump of the full registry;
+    it must not silently drop gamd_lambda either."""
+    from gareus.adaptive_production import WindowStateRegistry
+    import csv as _csv
+
+    reg = WindowStateRegistry()
+    reg.add_state(primary_center=0.1, primary_k=100.0, gamd_lambda=0.6)
+    d = pathlib.Path(tempfile.mkdtemp())
+    csv_path = d / "state_registry.csv"
+    reg.write_state_csv(csv_path)
+    with csv_path.open(newline="") as f:
+        rows = list(_csv.DictReader(f))
+    assert float(rows[0]["gamd_lambda"]) == 0.6
