@@ -71,3 +71,36 @@ def test_closed_form_matches_the_integrator_at_lambda_one_and_half():
         got = integ.getGlobalVariableByName("BoostPotential_Total") + integ.getGlobalVariableByName("BoostPotential_Dihedral")
         want = pep_gamd.pep_gamd_boost_kj(v_pep, v_dih, lam, env)
         assert abs(got - want) < 1e-3, (lam, got, want)
+
+
+def test_set_replica_lambda_scales_both_k0_globals():
+    from gareus import pep_gamd
+    openmm, _app, unit = import_openmm()
+    fx = solvated_dipeptide(); system = _fresh_system()
+    pep_gamd.ensure_pep_gamd_partition(system, fx["peptide"])
+    integ = pep_gamd.PepGaMDLowerDualIntegrator(
+        pep_gamd.DIHEDRAL_GROUP, dt=0.002 * unit.picoseconds, ntcmdprep=2, ntcmd=4, ntebprep=2, nteb=4, nstlim=100, ntave=2,
+        sigma0p=6.0 * unit.kilocalories_per_mole, sigma0d=6.0 * unit.kilocalories_per_mole,
+        collision_rate=1.0 / unit.picoseconds, temperature=300.0 * unit.kelvin)
+    ctx = openmm.Context(system, integ, openmm.Platform.getPlatformByName("Reference"))
+    k0max = {"Total": 0.8, "Dihedral": 0.6}
+    pep_gamd.set_replica_lambda(integ, 0.25, k0max)
+    assert abs(integ.getGlobalVariableByName("k0_Total") - 0.2) < 1e-12
+    assert abs(integ.getGlobalVariableByName("k0_Dihedral") - 0.15) < 1e-12
+    pep_gamd.set_replica_lambda(integ, 0.0, k0max)
+    assert integ.getGlobalVariableByName("k0_Total") == 0.0 and integ.getGlobalVariableByName("k0_Dihedral") == 0.0
+
+
+def test_k0max_from_globals_reads_both_channels():
+    from gareus.pep_gamd import k0max_from_globals
+    assert k0max_from_globals({"k0_Total": 0.8, "k0_Dihedral": 0.6, "Vmax_Total": 1.0}) == {"Total": 0.8, "Dihedral": 0.6}
+
+
+def test_set_replica_lambda_rejects_out_of_range():
+    from gareus import pep_gamd
+    try:
+        pep_gamd.set_replica_lambda(types.SimpleNamespace(setGlobalVariableByName=lambda *a: None), 1.2, {"Total": 1.0, "Dihedral": 1.0})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("λ > 1 must be rejected")

@@ -379,3 +379,16 @@ def pep_gamd_boost_matrix_kj(v_pep_kj, v_dih_kj, lambdas, env: PepGamdEnvelope) 
     """(n_states, n_samples): boost of each sample's configuration under each state's λ."""
     v_pep = _np.asarray(v_pep_kj, dtype=float); v_dih = _np.asarray(v_dih_kj, dtype=float)
     return _np.vstack([_np.asarray(pep_gamd_boost_kj(v_pep, v_dih, float(l), env), dtype=float) for l in lambdas])
+
+
+def k0max_from_globals(shared_globals: dict) -> dict:
+    return {"Total": float(shared_globals["k0_Total"]), "Dihedral": float(shared_globals["k0_Dihedral"])}
+
+
+def set_replica_lambda(integrator, lam: float, k0max: dict) -> None:
+    """Put a replica on rung λ: k0_c = λ·k0max_c for both channels. Nothing else differs between rungs."""
+    lam = float(lam)
+    if not (0.0 <= lam <= 1.0):
+        raise ValueError(f"gamd_lambda={lam} must lie in [0, 1]")
+    integrator.setGlobalVariableByName("k0_Total", lam * float(k0max["Total"]))
+    integrator.setGlobalVariableByName("k0_Dihedral", lam * float(k0max["Dihedral"]))

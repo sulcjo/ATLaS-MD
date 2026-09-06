@@ -1601,9 +1601,11 @@ from .pep_gamd import (
     build_pep_gamd_integrator,
     find_aux_force as _find_pep_gamd_aux_force,
     is_pep_gamd,
+    k0max_from_globals,
     physical_energy_groups_for_args,
     physical_potential_energy_kj,
     prepare_pep_gamd_args,
+    set_replica_lambda,
     total_energy_groups_for_args,
     AUX_NONBONDED_GROUP as _PEP_GAMD_AUX_GROUP,
 )
@@ -4290,8 +4292,15 @@ def sync_scratch_to_main(scratch_dir: Path, main_dir: Path) -> None:
 
 def load_production_checkpoint(out_dir: Path, sims: list, centers_nm, ks_kj_nm2, rng, secondary_centers=None, secondary_ks_kj=None,
                                openmm_version: Optional[str] = None, platform_name: Optional[str] = None,
-                               strict_gamd_restore: bool = False) -> Optional[dict]:
+                               strict_gamd_restore: bool = False,
+                               state_lambdas=None, k0max_by_channel: Optional[dict] = None) -> Optional[dict]:
     """Load a production checkpoint manifest and all replica checkpoints if available."""
+    if (state_lambdas is None) != (k0max_by_channel is None):
+        raise ValueError(
+            "load_production_checkpoint: state_lambdas and k0max_by_channel must be supplied "
+            "together or not at all -- one without the other silently loses the λ-ladder "
+            "re-derivation this resume path exists to guarantee."
+        )
     manifest_path = checkpoint_manifest_path(out_dir)
     if not manifest_path.exists():
         return None
@@ -4346,6 +4355,14 @@ def load_production_checkpoint(out_dir: Path, sims: list, centers_nm, ks_kj_nm2,
         raise RuntimeError("Checkpoint assignment count does not match replica count")
     for r, sim in enumerate(sims):
         set_window(sim.context, centers_nm, ks_kj_nm2, int(assignments[r]), secondary_centers, secondary_ks_kj)
+        # The GaMD-integrator-globals restore above is best-effort (see the
+        # comments above): when it is incomplete, k0_Total/k0_Dihedral are still
+        # whatever _build_context_i set from this replica's BUILD-time index, not
+        # necessarily its RESUMED window assignment. Re-derive k0 from the
+        # restored assignment unconditionally so a partial restore can never
+        # leave a replica's boost strength mismatched with its window.
+        if k0max_by_channel is not None:
+            set_replica_lambda(sim.integrator, float(state_lambdas[int(assignments[r])]), k0max_by_channel)
     try:
         if manifest.get("rng_state") is not None:
             rng.bit_generator.state = manifest["rng_state"]
@@ -5580,6 +5597,13 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         # otherwise fail at clCreateContext(-6) even before the first replica.
         release_openmm_contexts()
 
+    # The λ-ladder rung dimension: k0max_by_channel is the top-rung (λ=1) k0 for
+    # each boost channel, read once from the shared calibrated globals. Only
+    # non-None when the ladder is actually active on a Pep-GaMD run -- every other
+    # run mode (plain GaMD, no ladder, non-pep-gamd) leaves every replica's k0 at
+    # the shared globals, exactly as before this feature existed.
+    k0max_by_channel = k0max_from_globals(shared_gamd_globals_all) if (use_gamd and ladder_active) else None
+
     # _ReplicaAffinityExecutor lives at module scope (see its docstring) so the
     # per-replica thread-affinity invariant it exists to enforce can be unit
     # tested directly; it was function-local here, which left that invariant -
@@ -5692,6 +5716,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 if shared_gamd_globals_all:
                     copied, copied_skipped = set_integrator_globals_from_dict(integrator_i, shared_gamd_globals_all)
                     skipped.update({k: v for k, v in copied_skipped.items() if k not in skipped})
+                if k0max_by_channel is not None:
+                    set_replica_lambda(integrator_i, float(state_lambdas[i]), k0max_by_channel)
             if not fast_resume:
                 sim_i.context.setPeriodicBoxVectors(*box)
                 start_pos = window_start_positions[i] if i < len(window_start_positions) and window_start_positions[i] is not None else pos
@@ -6500,6 +6526,9 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             if outcome.accepted:
                 set_window(sims[i].context, centers_nm, ks_kj_nm2, assignments[i], secondary_cv_centers, secondary_cv_ks_kj)
                 set_window(sims[j].context, centers_nm, ks_kj_nm2, assignments[j], secondary_cv_centers, secondary_cv_ks_kj)
+                if k0max_by_channel is not None:
+                    set_replica_lambda(sims[i].integrator, float(state_lambdas[assignments[i]]), k0max_by_channel)
+                    set_replica_lambda(sims[j].integrator, float(state_lambdas[assignments[j]]), k0max_by_channel)
             parquet_exchange_writer.write_exchange(
                 step=int(absolute_step),
                 replica_i=int(i),
@@ -6756,6 +6785,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 openmm_version=str(getattr(getattr(openmm, "version", None), "version", None)),
                 platform_name=str(platform.getName()),
                 strict_gamd_restore=bool(getattr(args, "strict_gamd_restore", False)),
+                state_lambdas=state_lambdas, k0max_by_channel=k0max_by_channel,
             )
             if manifest is not None:
                 assignments[:] = [int(x) for x in manifest.get("assignments", assignments)]
