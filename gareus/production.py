@@ -6581,7 +6581,11 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             # (contacts primary + CustomCVForce secondary) this reads cached scalars
             # via getCollectiveVariableValues() — no positions DMA at all.  The
             # full U[window, replica] umbrella matrix is then built in NumPy for all
-            # swap/Gibbs candidates.  Potential energies are not needed here.
+            # swap/Gibbs candidates.  Potential energies are not needed here -- except
+            # when the λ-ladder is active (pep_env is not None), which adds three
+            # getState(getEnergy=True, ...) reads per replica per exchange attempt
+            # (peptide_essential_energy_kj's two group reads plus the dihedral group)
+            # to price the Pep-GaMD boost under every candidate state's λ.
             primary_values = np.empty(nrep, dtype=np.float64)
             ss_values = np.full(nrep, np.nan, dtype=np.float64)
             v_pep_kj = np.empty(nrep, dtype=np.float64)
