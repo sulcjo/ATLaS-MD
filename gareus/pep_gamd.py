@@ -392,3 +392,26 @@ def set_replica_lambda(integrator, lam: float, k0max: dict) -> None:
         raise ValueError(f"gamd_lambda={lam} must lie in [0, 1]")
     integrator.setGlobalVariableByName("k0_Total", lam * float(k0max["Total"]))
     integrator.setGlobalVariableByName("k0_Dihedral", lam * float(k0max["Dihedral"]))
+
+
+def set_replica_lambda_for_window(integrator, window_index, state_lambdas, k0max_by_channel) -> None:
+    """Apply the rung λ for `window_index` to `integrator`, or no-op if the ladder is inactive.
+
+    k0max_by_channel is None on every run that does not have the λ-ladder active
+    (plain GaMD, conventional MD, or GaMD without a ladder -- the common case);
+    on those runs state_lambdas is still an unconditionally-populated array, and
+    this must be a silent no-op, not an error. Only when the ladder IS active
+    (k0max_by_channel is not None) is a per-window λ required; state_lambdas is
+    None in that combination only as a real misconfiguration, so that's the one
+    case this raises on. One helper, one invariant, used at every call site that
+    (re)applies a replica's window assignment so the guard can't be forgotten or
+    mismatched at any individual site.
+    """
+    if k0max_by_channel is None:
+        return
+    if state_lambdas is None:
+        raise ValueError(
+            "set_replica_lambda_for_window: the λ-ladder is active (k0max_by_channel is set) "
+            "but state_lambdas is None -- no per-window λ was supplied."
+        )
+    set_replica_lambda(integrator, float(state_lambdas[int(window_index)]), k0max_by_channel)

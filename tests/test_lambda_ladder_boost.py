@@ -104,3 +104,37 @@ def test_set_replica_lambda_rejects_out_of_range():
         pass
     else:
         raise AssertionError("λ > 1 must be rejected")
+
+
+def test_set_replica_lambda_for_window_is_a_noop_when_ladder_inactive():
+    """The common case: k0max_by_channel is None (no ladder), but state_lambdas is still
+    an unconditionally-populated real array. Must not raise and must not touch k0_*."""
+    from gareus.pep_gamd import set_replica_lambda_for_window
+    calls = []
+    integ = types.SimpleNamespace(setGlobalVariableByName=lambda k, v: calls.append((k, v)))
+    state_lambdas = np.array([0.0, 0.5, 1.0])
+    set_replica_lambda_for_window(integ, 1, state_lambdas, None)
+    assert calls == []
+
+
+def test_set_replica_lambda_for_window_sets_k0_for_the_given_window():
+    from gareus.pep_gamd import set_replica_lambda_for_window
+    calls = {}
+    integ = types.SimpleNamespace(setGlobalVariableByName=lambda k, v: calls.__setitem__(k, v))
+    state_lambdas = np.array([0.0, 0.5, 1.0])
+    k0max = {"Total": 0.8, "Dihedral": 0.6}
+    set_replica_lambda_for_window(integ, 2, state_lambdas, k0max)
+    assert abs(calls["k0_Total"] - 0.8) < 1e-12
+    assert abs(calls["k0_Dihedral"] - 0.6) < 1e-12
+
+
+def test_set_replica_lambda_for_window_raises_when_ladder_active_but_lambdas_missing():
+    """The real misconfiguration: the ladder is active but no per-window λ was supplied."""
+    from gareus.pep_gamd import set_replica_lambda_for_window
+    integ = types.SimpleNamespace(setGlobalVariableByName=lambda *a: None)
+    try:
+        set_replica_lambda_for_window(integ, 0, None, {"Total": 1.0, "Dihedral": 1.0})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("k0max_by_channel set with state_lambdas=None must raise")

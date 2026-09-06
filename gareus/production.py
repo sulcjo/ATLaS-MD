@@ -1605,7 +1605,7 @@ from .pep_gamd import (
     physical_energy_groups_for_args,
     physical_potential_energy_kj,
     prepare_pep_gamd_args,
-    set_replica_lambda,
+    set_replica_lambda_for_window,
     total_energy_groups_for_args,
     AUX_NONBONDED_GROUP as _PEP_GAMD_AUX_GROUP,
 )
@@ -4294,13 +4294,16 @@ def load_production_checkpoint(out_dir: Path, sims: list, centers_nm, ks_kj_nm2,
                                openmm_version: Optional[str] = None, platform_name: Optional[str] = None,
                                strict_gamd_restore: bool = False,
                                state_lambdas=None, k0max_by_channel: Optional[dict] = None) -> Optional[dict]:
-    """Load a production checkpoint manifest and all replica checkpoints if available."""
-    if (state_lambdas is None) != (k0max_by_channel is None):
-        raise ValueError(
-            "load_production_checkpoint: state_lambdas and k0max_by_channel must be supplied "
-            "together or not at all -- one without the other silently loses the λ-ladder "
-            "re-derivation this resume path exists to guarantee."
-        )
+    """Load a production checkpoint manifest and all replica checkpoints if available.
+
+    state_lambdas/k0max_by_channel need not both be given: k0max_by_channel is None
+    on every run that does not have the λ-ladder active (plain GaMD, conventional
+    MD, or GaMD without a ladder -- the common case), while state_lambdas is an
+    unconditionally-populated array regardless of run mode. Only the combination
+    of an active ladder (k0max_by_channel is not None) with no per-window λ
+    (state_lambdas is None) is a real misconfiguration; see
+    set_replica_lambda_for_window, which enforces exactly that and nothing more.
+    """
     manifest_path = checkpoint_manifest_path(out_dir)
     if not manifest_path.exists():
         return None
@@ -4360,9 +4363,9 @@ def load_production_checkpoint(out_dir: Path, sims: list, centers_nm, ks_kj_nm2,
         # whatever _build_context_i set from this replica's BUILD-time index, not
         # necessarily its RESUMED window assignment. Re-derive k0 from the
         # restored assignment unconditionally so a partial restore can never
-        # leave a replica's boost strength mismatched with its window.
-        if k0max_by_channel is not None:
-            set_replica_lambda(sim.integrator, float(state_lambdas[int(assignments[r])]), k0max_by_channel)
+        # leave a replica's boost strength mismatched with its window. No-ops
+        # when the ladder is inactive (k0max_by_channel is None).
+        set_replica_lambda_for_window(sim.integrator, assignments[r], state_lambdas, k0max_by_channel)
     try:
         if manifest.get("rng_state") is not None:
             rng.bit_generator.state = manifest["rng_state"]
@@ -5716,8 +5719,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 if shared_gamd_globals_all:
                     copied, copied_skipped = set_integrator_globals_from_dict(integrator_i, shared_gamd_globals_all)
                     skipped.update({k: v for k, v in copied_skipped.items() if k not in skipped})
-                if k0max_by_channel is not None:
-                    set_replica_lambda(integrator_i, float(state_lambdas[i]), k0max_by_channel)
+                set_replica_lambda_for_window(integrator_i, i, state_lambdas, k0max_by_channel)
             if not fast_resume:
                 sim_i.context.setPeriodicBoxVectors(*box)
                 start_pos = window_start_positions[i] if i < len(window_start_positions) and window_start_positions[i] is not None else pos
@@ -6526,9 +6528,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             if outcome.accepted:
                 set_window(sims[i].context, centers_nm, ks_kj_nm2, assignments[i], secondary_cv_centers, secondary_cv_ks_kj)
                 set_window(sims[j].context, centers_nm, ks_kj_nm2, assignments[j], secondary_cv_centers, secondary_cv_ks_kj)
-                if k0max_by_channel is not None:
-                    set_replica_lambda(sims[i].integrator, float(state_lambdas[assignments[i]]), k0max_by_channel)
-                    set_replica_lambda(sims[j].integrator, float(state_lambdas[assignments[j]]), k0max_by_channel)
+                set_replica_lambda_for_window(sims[i].integrator, assignments[i], state_lambdas, k0max_by_channel)
+                set_replica_lambda_for_window(sims[j].integrator, assignments[j], state_lambdas, k0max_by_channel)
             parquet_exchange_writer.write_exchange(
                 step=int(absolute_step),
                 replica_i=int(i),
