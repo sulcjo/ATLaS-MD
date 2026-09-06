@@ -75,7 +75,7 @@ Everything the tICA route needed it for, minus tICA: the boost envelope calibrat
 
 ### 3.1 Definition
 
-For the lower-bound formula `threshold_energy = Vmax` **independent of k0**, and `k = k0/(Vmax−Vmin)` (`gareus/gamd_calibration.py:116-133`, reproducing gamd-openmm). So with a frozen envelope every rung's boost is a scalar rescale of one reference:
+For the lower-bound formula `threshold_energy = Vmax` **independent of k0**, and `k = k0/(Vmax−Vmin)` (`gareus/gamd_calibration.py:116-133`, reproducing gamd-openmm). So with a frozen envelope each channel's boost is a scalar rescale of one reference; because the dual boost is *dependent* (the dihedral boost enters the Total square), the total boost under λ is the closed form `pep_gamd_boost_kj(v_pep, v_dih, λ, envelope)`, reconstructible exactly from the two stored raw energies:
 
 ```
 ΔV_c,k(x) = λ_k · ΔV_c,max(x),   ΔV_c,max(x) = ½ · k0_max/(Vmax_c − Vmin_c) · (Vmax_c − V_c(x))²  for V_c < Vmax_c, else 0

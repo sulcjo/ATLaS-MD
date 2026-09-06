@@ -327,3 +327,55 @@ def build_pep_gamd_integrator(system, args, unit) -> list:
         temperature=float(args.temperature_k) * unit.kelvin,
     )
     return [AUX_NONBONDED_GROUP, DIHEDRAL_GROUP, integrator]
+
+
+from dataclasses import dataclass
+import json as _json
+import numpy as _np
+
+
+@dataclass(frozen=True)
+class PepGamdEnvelope:
+    """Frozen per-channel GaMD envelope; k0max_* is the top rung (λ = 1)."""
+    vmax_total: float; vmin_total: float; threshold_total: float; k0max_total: float
+    vmax_dih: float;   vmin_dih: float;   threshold_dih: float;   k0max_dih: float
+
+    @classmethod
+    def from_integrator_globals(cls, g: dict) -> "PepGamdEnvelope":
+        f = lambda k: float(g[k])
+        return cls(f("Vmax_Total"), f("Vmin_Total"), f("threshold_energy_Total"), f("k0_Total"),
+                   f("Vmax_Dihedral"), f("Vmin_Dihedral"), f("threshold_energy_Dihedral"), f("k0_Dihedral"))
+
+    @classmethod
+    def from_json(cls, path) -> "PepGamdEnvelope":
+        doc = _json.loads(open(path).read())
+        for cand in (doc, doc.get("globals"), doc.get("integrator_globals"), doc.get("shared_gamd_globals_all")):
+            if isinstance(cand, dict) and "k0_Total" in cand:
+                return cls.from_integrator_globals(cand)
+        raise KeyError(f"{path}: no dict with k0_Total/Vmax_Total/... found")
+
+
+def _channel_boost(v, e, vmax, vmin, k0):
+    v = _np.asarray(v, dtype=float)
+    rng = vmax - vmin
+    scale = _np.maximum(_np.maximum(abs(e), _np.abs(v)), 1.0)
+    b = 0.5 * k0 * (e - v) ** 2 / rng
+    b = _np.where(_np.abs(rng) <= 0.001 * scale, 0.0, b)
+    return _np.where((b + v) < e, b, 0.0)
+
+
+def pep_gamd_boost_kj(v_pep_kj, v_dih_kj, lam, env: PepGamdEnvelope):
+    """gamd-openmm's dependent dual boost under rung λ: dihedral first, then Total with the
+    dihedral boost added to the Total energy before the square (stage_integrator
+    _add_dihedral_boost_to_total_energy)."""
+    lam = float(lam)
+    b_dih = _channel_boost(v_dih_kj, env.threshold_dih, env.vmax_dih, env.vmin_dih, lam * env.k0max_dih)
+    b_tot = _channel_boost(_np.asarray(v_pep_kj, dtype=float) + b_dih, env.threshold_total, env.vmax_total, env.vmin_total, lam * env.k0max_total)
+    out = b_dih + b_tot
+    return float(out) if out.ndim == 0 else out
+
+
+def pep_gamd_boost_matrix_kj(v_pep_kj, v_dih_kj, lambdas, env: PepGamdEnvelope) -> _np.ndarray:
+    """(n_states, n_samples): boost of each sample's configuration under each state's λ."""
+    v_pep = _np.asarray(v_pep_kj, dtype=float); v_dih = _np.asarray(v_dih_kj, dtype=float)
+    return _np.vstack([_np.asarray(pep_gamd_boost_kj(v_pep, v_dih, float(l), env), dtype=float) for l in lambdas])
