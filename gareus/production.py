@@ -588,6 +588,7 @@ def primary_secondary_and_potential_from_state(
         getPositions=True,
         getEnergy=bool(read_potential_energy),
         enforcePeriodicBox=True,
+        groups=physical_energy_groups_for_args(args),
     )
     pos = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
     primary_value = primary_cv_value_from_positions_nm(pos, primary_cv_def, args)
@@ -1595,13 +1596,29 @@ def production_run_mode(args) -> str:
     return mode
 
 
+from .pep_gamd import (
+    boost_target_energy_kj,
+    build_pep_gamd_integrator,
+    find_aux_force as _find_pep_gamd_aux_force,
+    is_pep_gamd,
+    physical_energy_groups_for_args,
+    physical_potential_energy_kj,
+    prepare_pep_gamd_args,
+    AUX_NONBONDED_GROUP as _PEP_GAMD_AUX_GROUP,
+)
+
+
 def gamd_enabled(args) -> bool:
     """Return True when production should use gamd-openmm integrators."""
     return production_run_mode(args) in {"gamd", "hmr-gamd"}
 
 
-def make_cmd_integrator(openmm, args, unit):
-    """Create a plain conventional-MD LangevinMiddleIntegrator."""
+def make_cmd_integrator(openmm, args, unit, system=None):
+    """Create a plain conventional-MD LangevinMiddleIntegrator.
+
+    A plain integrator applies every force group, so if `system` carries the Pep-GaMD
+    auxiliary water-only force it must be excluded here or water-water is counted twice.
+    """
     integrator = openmm.LangevinMiddleIntegrator(
         float(args.temperature_k) * unit.kelvin,
         float(args.friction_per_ps) / unit.picosecond,
@@ -1611,6 +1628,8 @@ def make_cmd_integrator(openmm, args, unit):
         integrator.setRandomNumberSeed(int(args.seed))
     except Exception:
         pass
+    if system is not None and _find_pep_gamd_aux_force(system)[1] is not None:
+        integrator.setIntegrationForceGroups(set(range(32)) - {_PEP_GAMD_AUX_GROUP})
     return integrator, {
         "mode": production_run_mode(args),
         "description": "Conventional HMR Langevin MD production integrator; gamd-openmm disabled." if production_run_mode(args) == "hmr-cmd" else "Conventional Langevin MD production integrator; gamd-openmm disabled.",
@@ -1624,35 +1643,38 @@ def make_production_integrator(openmm, system, args, unit):
     """Create the production integrator selected by --run-mode."""
     if gamd_enabled(args):
         return make_gamd_integrator(system, args, unit)
-    return make_cmd_integrator(openmm, args, unit)
+    return make_cmd_integrator(openmm, args, unit, system=system)
 
 
 def make_gamd_integrator(system, args, unit):
-    GamdIntegratorFactory = import_gamd_factory()
-    factory = GamdIntegratorFactory()
-    total_steps = (
-        args.gamd_cmd_prep_steps
-        + args.gamd_cmd_steps
-        + args.gamd_equil_prep_steps
-        + args.gamd_equil_steps
-        + args.gamd_production_steps
-    )
-    sigma0p = args.sigma0p_kcal_mol * unit.kilocalories_per_mole
-    sigma0d = args.sigma0d_kcal_mol * unit.kilocalories_per_mole
-    result = factory.get_integrator(
-        args.gamd_boost_type,
-        system,
-        args.temperature_k * unit.kelvin,
-        args.timestep_fs * unit.femtosecond,
-        args.gamd_cmd_prep_steps,
-        args.gamd_cmd_steps,
-        args.gamd_equil_prep_steps,
-        args.gamd_equil_steps,
-        total_steps,
-        args.gamd_averaging_window,
-        sigma0p=sigma0p,
-        sigma0d=sigma0d,
-    )
+    if is_pep_gamd(args):
+        result = build_pep_gamd_integrator(system, args, unit)
+    else:
+        GamdIntegratorFactory = import_gamd_factory()
+        factory = GamdIntegratorFactory()
+        total_steps = (
+            args.gamd_cmd_prep_steps
+            + args.gamd_cmd_steps
+            + args.gamd_equil_prep_steps
+            + args.gamd_equil_steps
+            + args.gamd_production_steps
+        )
+        sigma0p = args.sigma0p_kcal_mol * unit.kilocalories_per_mole
+        sigma0d = args.sigma0d_kcal_mol * unit.kilocalories_per_mole
+        result = factory.get_integrator(
+            args.gamd_boost_type,
+            system,
+            args.temperature_k * unit.kelvin,
+            args.timestep_fs * unit.femtosecond,
+            args.gamd_cmd_prep_steps,
+            args.gamd_cmd_steps,
+            args.gamd_equil_prep_steps,
+            args.gamd_equil_steps,
+            total_steps,
+            args.gamd_averaging_window,
+            sigma0p=sigma0p,
+            sigma0d=sigma0d,
+        )
     integrator = result[2]
     integrator.setRandomNumberSeed(args.seed)
     try:
@@ -4498,7 +4520,7 @@ def run_multiwindow_gamd_recon(
         if integrator_kind == "gamd":
             step_integrator, _ = make_gamd_integrator(system_i, args, unit)
         else:
-            step_integrator, _ = make_cmd_integrator(openmm, args, unit)
+            step_integrator, _ = make_cmd_integrator(openmm, args, unit, system=system_i)
         props_i = replica_platform_properties(platform, props, args, i)
         sim_i = app.Simulation(topology, system_i, step_integrator, platform, props_i)
         if integrator_kind == "gamd" and seed_globals:
@@ -4535,9 +4557,7 @@ def run_multiwindow_gamd_recon(
             i, sim_i = item
             sim_i.step(int(chunk))
             for name, gid in targets_per_window[i]:
-                groups = {gid} if gid is not None else set(range(32))
-                state = sim_i.context.getState(getEnergy=True, groups=groups)
-                pe_kj = float(state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole))
+                pe_kj = boost_target_energy_kj(sim_i.context, sim_i.integrator, gid, unit)
                 accumulators_by_window[i][name].update(pe_kj)
             return i
 
@@ -4716,7 +4736,7 @@ def apply_joint_envelope_gamd_calibration(
         _check_sim.context.setVelocitiesToTemperature(args.temperature_k * unit.kelvin, args.seed + 909)
         set_window(_check_sim.context, centers_nm, ks_kj_nm2, 0, secondary_cv_centers, secondary_cv_ks_kj)
         _check_sim.step(50)
-        _check_pe = float(_check_sim.context.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole))
+        _check_pe = physical_potential_energy_kj(_check_sim.context, _check_system, unit)
         if not math.isfinite(_check_pe):
             raise RuntimeError(
                 f"Joint-envelope GaMD calibration produced a non-finite potential energy "
@@ -5312,6 +5332,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         include_barostat=production_include_barostat,
         barostat_frequency=production_barostat_frequency,
     )
+    prepare_pep_gamd_args(args, topology)
     add_primary_umbrella_force(openmm, base_system, primary_cv_def, args, args.umbrella_force_group)
     secondary_cv_force_info = add_secondary_structure_cv_force(
         openmm, base_system, topology, args, force_group=int(getattr(args, "secondary_cv_force_group", 29))
@@ -6188,9 +6209,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 if is_prod and _gamd_recal_active:
                     try:
                         for _gname, _gid in _gamd_recal_targets:
-                            _groups = {_gid} if _gid is not None else set(range(32))
-                            _gstate = sim.context.getState(getEnergy=True, groups=_groups)
-                            _gpe = float(_gstate.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole))
+                            _gpe = boost_target_energy_kj(sim.context, sim.integrator, _gid, unit)
                             _gamd_recal_accumulators[_gname].setdefault(w, _WelfordAccumulator()).update(_gpe)
                     except Exception as _gamd_recal_sample_exc:
                         # Best-effort measurement only: a failure here must never take
@@ -6267,7 +6286,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     "state_read_ok": False,
                 }
                 try:
-                    st = sim.context.getState(getPositions=True, getEnergy=True, enforcePeriodicBox=True)
+                    st = sim.context.getState(getPositions=True, getEnergy=True, enforcePeriodicBox=True,
+                                              groups=physical_energy_groups_for_args(args))
                     row["state_read_ok"] = True
                     try:
                         pos_nm = st.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
