@@ -196,3 +196,26 @@ def test_derive_state_gamd_lambdas_helper():
 
     # existing wrong length is never trusted either -> zeros.
     assert _derive_state_gamd_lambdas(None, 2, existing=[0.9]) == [0.0, 0.0]
+
+
+def test_exchange_delta_between_rungs_is_the_boost_difference():
+    """Two states with identical umbrellas, λ=0 and λ=1, holding replicas 0 and 1.
+    Swapping them costs exactly boost(x0;λ=1) - boost(x1;λ=1) (the λ=0 terms are zero)."""
+    from gareus.production import apply_window_swap
+    from gareus.pep_gamd import pep_gamd_boost_matrix_kj, PepGamdEnvelope
+    env = PepGamdEnvelope(50.0, -50.0, 50.0, 0.8, 50.0, -50.0, 50.0, 0.6)
+    lambdas = np.array([0.0, 1.0]); v_pep = np.array([10.0, 30.0]); v_dih = np.array([5.0, 7.0])
+    umbrella_kj = np.zeros((2, 2))
+    bias = umbrella_kj + pep_gamd_boost_matrix_kj(v_pep, v_dih, lambdas, env)
+    assignments = np.array([0, 1]); replica_of_window = np.array([0, 1])
+    out = apply_window_swap(bias, 1.0 / 2.494, assignments, replica_of_window, 0, 1, None, force_accept=True)
+    expected = float(bias[1, 0] + bias[0, 1] - bias[0, 0] - bias[1, 1])
+    assert abs(out.delta_kj - expected) < 1e-12
+    assert out.accepted and list(assignments) == [1, 0]
+
+
+def test_boost_matrix_term_is_zero_for_a_pure_umbrella_ladder():
+    from gareus.pep_gamd import pep_gamd_boost_matrix_kj, PepGamdEnvelope
+    env = PepGamdEnvelope(50.0, -50.0, 50.0, 0.8, 50.0, -50.0, 50.0, 0.6)
+    M = pep_gamd_boost_matrix_kj(np.array([1.0, 2.0]), np.array([1.0, 2.0]), np.zeros(4), env)
+    assert M.shape == (4, 2) and np.all(M == 0.0)

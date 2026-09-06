@@ -1602,12 +1602,16 @@ from .pep_gamd import (
     find_aux_force as _find_pep_gamd_aux_force,
     is_pep_gamd,
     k0max_from_globals,
+    pep_gamd_boost_matrix_kj,
+    peptide_essential_energy_kj,
     physical_energy_groups_for_args,
     physical_potential_energy_kj,
     prepare_pep_gamd_args,
     set_replica_lambda_for_window,
     total_energy_groups_for_args,
     AUX_NONBONDED_GROUP as _PEP_GAMD_AUX_GROUP,
+    DIHEDRAL_GROUP,
+    PepGamdEnvelope,
 )
 
 
@@ -5606,6 +5610,11 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     # run mode (plain GaMD, no ladder, non-pep-gamd) leaves every replica's k0 at
     # the shared globals, exactly as before this feature existed.
     k0max_by_channel = k0max_from_globals(shared_gamd_globals_all) if (use_gamd and ladder_active) else None
+    # The per-state boost envelope, built once from the same calibrated globals
+    # every replica's k0max is drawn from above. None whenever the ladder is not
+    # active, in which case the exchange bias matrix carries no boost term at all
+    # (an all-zero contribution) and every other run mode is unaffected.
+    pep_env = PepGamdEnvelope.from_integrator_globals(shared_gamd_globals_all) if (use_gamd and ladder_active) else None
 
     # _ReplicaAffinityExecutor lives at module scope (see its docstring) so the
     # per-replica thread-affinity invariant it exists to enforce can be unit
@@ -6200,6 +6209,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             primary_values = np.empty(nrep, dtype=np.float64)
             ss_values = np.full(nrep, np.nan, dtype=np.float64)
             potentials_kj = np.empty(nrep, dtype=np.float64)
+            v_pep_kj = np.empty(nrep, dtype=np.float64)
+            v_dih_kj = np.empty(nrep, dtype=np.float64)
 
             def _fetch_state(r_sim):
                 r, sim = r_sim
@@ -6220,14 +6231,22 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                         pe = float(state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole))
                     else:
                         pe = float("nan")
-                    return r, cv, ss, pe
-                return r, *primary_secondary_and_potential_from_state(
+                    v_pep = peptide_essential_energy_kj(ctx, unit) if pep_env is not None else float("nan")
+                    v_dih = (ctx.getState(getEnergy=True, groups={DIHEDRAL_GROUP}).getPotentialEnergy()
+                             .value_in_unit(unit.kilojoule_per_mole)) if pep_env is not None else float("nan")
+                    return r, cv, ss, pe, v_pep, v_dih
+                cv, ss, pe = primary_secondary_and_potential_from_state(
                     sim.context, primary_cv_def, args, unit, secondary_cv_metadata,
                     read_potential_energy=read_sample_potential,
                 )
+                v_pep = peptide_essential_energy_kj(sim.context, unit) if pep_env is not None else float("nan")
+                v_dih = (sim.context.getState(getEnergy=True, groups={DIHEDRAL_GROUP}).getPotentialEnergy()
+                         .value_in_unit(unit.kilojoule_per_mole)) if pep_env is not None else float("nan")
+                return r, cv, ss, pe, v_pep, v_dih
 
-            for r, cv, ss, pe in _sim_pool.map(_fetch_state, enumerate(sims)):
+            for r, cv, ss, pe, v_pep, v_dih in _sim_pool.map(_fetch_state, enumerate(sims)):
                 primary_values[r], ss_values[r], potentials_kj[r] = cv, ss, pe
+                v_pep_kj[r], v_dih_kj[r] = v_pep, v_dih
             primary_delta_matrix = primary_values[np.newaxis, :] - centers_a_arr[:, np.newaxis]
             distance_bias_matrix_kcal = 0.5 * k_arr[:, np.newaxis] * primary_delta_matrix * primary_delta_matrix
             if secondary_cv_centers is not None and secondary_cv_k_kcal_list is not None:
@@ -6245,12 +6264,17 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 ss_k_arr = ss_k_kcal_arr_global
                 ss_bias_matrix_kcal = np.zeros_like(distance_bias_matrix_kcal)
             bias_matrix_kcal = distance_bias_matrix_kcal + ss_bias_matrix_kcal
-            bias_matrix_kj = 4.184 * bias_matrix_kcal
+            boost_bias_matrix_kj = (pep_gamd_boost_matrix_kj(v_pep_kj, v_dih_kj, state_lambdas, pep_env)
+                                    if pep_env is not None else np.zeros((nrep, nrep)))
+            bias_matrix_kj = 4.184 * bias_matrix_kcal + boost_bias_matrix_kj
             reduced_bias_matrix = float(beta) * bias_matrix_kj
             observable_cache["step"] = int(step)
             observable_cache["primary_values"] = primary_values
             observable_cache["cvs_nm"] = (primary_values / 10.0) if is_distance_primary else primary_values
             observable_cache["bias_matrix_kj"] = bias_matrix_kj
+            observable_cache["v_pep_kj"] = v_pep_kj
+            observable_cache["v_dih_kj"] = v_dih_kj
+            observable_cache["boost_bias_matrix_kj"] = boost_bias_matrix_kj
             if is_prod:
                 ensure_sample_writer()
             for r, sim in enumerate(sims):
@@ -6560,6 +6584,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             # swap/Gibbs candidates.  Potential energies are not needed here.
             primary_values = np.empty(nrep, dtype=np.float64)
             ss_values = np.full(nrep, np.nan, dtype=np.float64)
+            v_pep_kj = np.empty(nrep, dtype=np.float64)
+            v_dih_kj = np.empty(nrep, dtype=np.float64)
             _ss_enabled = bool((secondary_cv_metadata or {}).get("enabled"))
 
             def _fetch_exchange_state(r_sim):
@@ -6575,21 +6601,32 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                         _ss_scalar_from_sub_cv_values(sf.getCollectiveVariableValues(ctx), secondary_cv_metadata)
                         if sf is not None and _ss_enabled else float("nan")
                     )
+                    v_pep = peptide_essential_energy_kj(ctx, unit) if pep_env is not None else float("nan")
+                    v_dih = (ctx.getState(getEnergy=True, groups={DIHEDRAL_GROUP}).getPotentialEnergy()
+                             .value_in_unit(unit.kilojoule_per_mole)) if pep_env is not None else float("nan")
                 else:
                     state = sim.context.getState(getPositions=True, enforcePeriodicBox=True)
                     pos = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
                     cv = primary_cv_value_from_positions_nm(pos, primary_cv_def, args)
                     ss = secondary_structure_score_from_positions_nm(pos, secondary_cv_metadata) if _ss_enabled else float("nan")
-                return r, cv, ss
+                    v_pep = peptide_essential_energy_kj(sim.context, unit) if pep_env is not None else float("nan")
+                    v_dih = (sim.context.getState(getEnergy=True, groups={DIHEDRAL_GROUP}).getPotentialEnergy()
+                             .value_in_unit(unit.kilojoule_per_mole)) if pep_env is not None else float("nan")
+                return r, cv, ss, v_pep, v_dih
 
-            for r, cv, ss in _sim_pool.map(_fetch_exchange_state, enumerate(sims)):
+            for r, cv, ss, v_pep, v_dih in _sim_pool.map(_fetch_exchange_state, enumerate(sims)):
                 primary_values[r] = cv
                 ss_values[r] = ss
+                v_pep_kj[r] = v_pep
+                v_dih_kj[r] = v_dih
             dprimary = primary_values[np.newaxis, :] - centers_a_arr[:, np.newaxis]
             bias_matrix_kj = 4.184 * 0.5 * k_arr[:, np.newaxis] * dprimary * dprimary
             if secondary_cv_centers is not None and secondary_cv_ks_kj is not None and ss_ks_kj_arr_global is not None:
                 dss = ss_values[np.newaxis, :] - ss_centers_arr_global[:, np.newaxis]
                 bias_matrix_kj = bias_matrix_kj + 0.5 * ss_ks_kj_arr_global[:, np.newaxis] * dss * dss
+            boost_bias_matrix_kj = (pep_gamd_boost_matrix_kj(v_pep_kj, v_dih_kj, state_lambdas, pep_env)
+                                    if pep_env is not None else np.zeros((nrep, nrep)))
+            bias_matrix_kj = bias_matrix_kj + boost_bias_matrix_kj
             return primary_values, bias_matrix_kj
 
         def _candidate_delta_for_window_swap(wi: int, wj: int, bias_matrix_kj: np.ndarray) -> Optional[float]:
