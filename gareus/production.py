@@ -1812,6 +1812,46 @@ def window_assignment_rows(centers_a: np.ndarray, k_list: list[float], temperatu
         rows.append(row)
     return rows
 
+def _warn_if_ladder_was_zeroed(previous, new, where: str) -> bool:
+    """Loudly warn when a previously non-zero λ-ladder re-derives to all zeros.
+
+    Both post-drop re-derives pass ``existing=None`` on purpose (a pre-drop
+    vector is not safe to reuse across an arbitrary, non-suffix index drop),
+    and ``_derive_state_gamd_lambdas``' own fallback-of-last-resort is all
+    zeros. On a cold resume (``--resume`` with no replica checkpoints) the
+    window metadata that carried the rungs may not be reconstructible, so a
+    restored ladder can be silently flattened -- and ``_persist_state_gamd_lambdas``
+    then writes the zeros back into run_manifest.json, destroying the record
+    of what the campaign was.
+
+    The run stays SELF-consistent afterwards (every state is λ=0, i.e. plain
+    umbrella), so this is a warning, not an error -- but it silently changes
+    what the run is, which must never be invisible. 2026-09-07 final review,
+    I3; the full fix (restoring the ladder rather than re-deriving it) has its
+    own ticket. Returns True when it warned.
+    """
+    def _vals(x):
+        if x is None:
+            return []
+        try:
+            return [float(v or 0.0) for v in x]
+        except (TypeError, ValueError):
+            return []
+    prev = _vals(previous)
+    now = _vals(new)
+    if not any(v > 0.0 for v in prev) or any(v > 0.0 for v in now):
+        return False
+    print(
+        f"WARNING: λ-ladder LOST at {where}: {sum(1 for v in prev if v > 0.0)} of "
+        f"{len(prev)} states carried gamd_lambda > 0 before this re-derive and NONE "
+        f"do after it. The run continues as plain umbrella sampling (self-consistent, "
+        f"but no longer a ladder), and run_manifest.json will record the zeros. This "
+        f"is the known cold-resume/auto-drop re-derive gap -- verify the ladder before "
+        f"trusting any PMF from this run."
+    )
+    return True
+
+
 def _derive_state_gamd_lambdas(window_metadata: Optional[dict], n: int, existing=None) -> list[float]:
     """Derive one gamd_lambda per surviving window, filter/drop-safe.
 
@@ -3380,6 +3420,8 @@ def drop_bad_us_windows_and_rebuild(
     # zero every state's lambda -- and that file is load-bearing (the legacy MBAR
     # loader reconstructs biases from it), not merely diagnostic.
     new_gamd_lambdas = _derive_state_gamd_lambdas(window_metadata, len(new_centers_a), existing=None)
+    _warn_if_ladder_was_zeroed(getattr(args, "state_gamd_lambdas", None), new_gamd_lambdas,
+                               "post-pull US auto-drop window-table rewrite")
     window_rows = window_assignment_rows(
         new_centers_a, new_k_list, args.temperature_k,
         new_secondary_cv_centers, new_secondary_cv_k_kcal_list, args=args,
@@ -5734,7 +5776,10 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             # -- re-derive from that rather than guessing the keep set here.
             # existing=None deliberately: the pre-drop args.state_gamd_lambdas is not
             # safe to reuse across an arbitrary (non-suffix) index drop.
+            _prev_state_gamd_lambdas = getattr(args, "state_gamd_lambdas", None)
             args.state_gamd_lambdas = _derive_state_gamd_lambdas(window_metadata, len(centers_a), existing=None)
+            _warn_if_ladder_was_zeroed(_prev_state_gamd_lambdas, args.state_gamd_lambdas,
+                                       "post-pull US auto-drop state_gamd_lambdas re-derive")
             # Re-patch: see _persist_state_gamd_lambdas' docstring -- the manifest
             # must reflect this post-drop, re-derived value, not whatever an
             # earlier call (initial derive, or --max-replicas truncation) wrote.
@@ -6209,12 +6254,14 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         "samples_columns_for_mbar": {
             "cv_A": f"sampled primary CV ({primary_cv_label(args)}) in {primary_cv_units(args)}; legacy column name",
             "window": "thermodynamic umbrella state assigned to the replica at this sample",
-            "umbrella_bias_all_windows_kcal_mol_json": "optional list of U_i(r_n) for all umbrella windows i, kcal/mol; written only with --write-full-bias-csv-vectors",
-            "umbrella_bias_all_windows_kj_mol_json": "optional list of U_i(r_n) for all umbrella windows i, kJ/mol; written only with --write-full-bias-csv-vectors",
-            "umbrella_reduced_bias_all_windows_json": "optional list of beta*U_i(r_n), dimensionless; written only with --write-full-bias-csv-vectors",
+            "umbrella_bias_all_windows_kcal_mol_json": "optional list of the TOTAL bias of sample r_n under every state i, kcal/mol: the umbrella term U_i(r_n) PLUS, on a λ-ladder run, state i's own Pep-GaMD boost of this configuration (assemble_bias_matrices folds the boost in). Umbrella-only on every non-ladder run. Written only with --write-full-bias-csv-vectors",
+            "umbrella_bias_all_windows_kj_mol_json": "same total (umbrella + λ-ladder boost) per state i, kJ/mol; written only with --write-full-bias-csv-vectors",
+            "umbrella_reduced_bias_all_windows_json": "same total reduced by beta, dimensionless -- beta*(U_i(r_n) + boost_i(r_n)); this is the u_nk row MBAR consumes. Written only with --write-full-bias-csv-vectors",
             "gamd_boost_total_kj_mol": "GaMD boost estimate. Preferred source is gamd-openmm integrator.get_boost_potentials(); fallback is named CustomIntegrator globals.",
             "gamd_boost_source": "get_boost_potentials, integrator_globals, or unavailable",
             "gamd_boost_components_kj_mol_json": "component boost potentials from gamd-openmm native get_boost_potentials(), kJ/mol",
+            "umbrella_bias_kcal_mol": "TOTAL bias of this sample under its OWN assigned state, kcal/mol: the umbrella term plus, on a λ-ladder run, that state's Pep-GaMD boost of this configuration. Umbrella-only on every non-ladder run; see sampled_umbrella_bias_kj for the umbrella term alone",
+            "umbrella_bias_kj_mol": "the same own-state total in kJ/mol",
             "sampled_umbrella_bias_kj": "umbrella-only component (primary + secondary CV) of the sampled window's bias, kJ/mol; excludes the λ-ladder Pep-GaMD boost even when umbrella_bias_kj_mol/umbrella_bias_kcal_mol carry it",
             "sampled_boost_bias_kj": "Pep-GaMD boost of this replica's configuration under its own assigned window's λ, kJ/mol; zero on every run where the λ-ladder is not active",
             "v_pep_kj_mol": "raw peptide-dihedral+nonbonded channel energy (gamd-openmm 'total potential energy of the boosted group') at this replica's configuration, kJ/mol; NaN when the λ-ladder is not active",

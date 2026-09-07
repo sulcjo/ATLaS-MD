@@ -379,3 +379,49 @@ def test_resume_reload_must_run_before_derive_or_its_fallback_masks_the_manifest
     args_new_order.state_gamd_lambdas = _derive_state_gamd_lambdas(
         window_metadata, n, existing=getattr(args_new_order, "state_gamd_lambdas", None))
     assert args_new_order.state_gamd_lambdas == [0.0, 0.5, 1.0]
+
+
+# --- Final-review fix wave, I3: a silently flattened ladder must be loud. ----
+
+def test_warn_if_ladder_was_zeroed_fires_when_a_ladder_flattens():
+    """I3. Both post-drop re-derives pass existing=None on purpose, and
+    _derive_state_gamd_lambdas' fallback-of-last-resort is all zeros -- so on
+    a cold resume a restored ladder can be flattened and
+    _persist_state_gamd_lambdas then writes the zeros into run_manifest.json.
+    The run stays self-consistent (plain umbrella), so this is a warning, not
+    an error -- but it must never be silent."""
+    import io
+    import contextlib
+    from gareus.production import _warn_if_ladder_was_zeroed
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        warned = _warn_if_ladder_was_zeroed([0.0, 0.5, 1.0], [0.0, 0.0, 0.0], "unit test")
+    out = buf.getvalue()
+    assert warned is True
+    assert "λ-ladder LOST" in out
+    assert "unit test" in out
+    assert "2 of 3" in out
+
+
+def test_warn_if_ladder_was_zeroed_is_silent_on_every_other_transition():
+    """Must not fire for a run that never had a ladder, for one that keeps
+    it, or for one that only shrinks -- otherwise the warning is noise and
+    stops being read."""
+    import io
+    import contextlib
+    from gareus.production import _warn_if_ladder_was_zeroed
+
+    cases = [
+        ([0.0, 0.0], [0.0, 0.0]),          # never a ladder
+        ([0.0, 1.0], [0.0, 1.0]),          # ladder preserved
+        ([0.5, 1.0], [1.0]),               # ladder shrunk by a window drop
+        (None, [0.0, 0.0]),                # no previous value at all
+        ([0.0, 1.0], [0.0, 0.5]),          # rungs changed but still a ladder
+    ]
+    for previous, new in cases:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            warned = _warn_if_ladder_was_zeroed(previous, new, "unit test")
+        assert warned is False, (previous, new)
+        assert buf.getvalue() == "", (previous, new, buf.getvalue())

@@ -160,9 +160,17 @@ def test_sample_state_reader_can_skip_potential_energy() -> None:
             raise AssertionError("potential energy should not be requested")
 
     class Context:
-        def getState(self, getPositions=False, getEnergy=False, enforcePeriodicBox=False):
+        # `groups=` is load-bearing: production.primary_secondary_and_potential_from_state
+        # always passes physical_energy_groups_for_args(args) so a GaMD run reads the
+        # PHYSICAL potential, not the boosted one. A fake without the parameter made
+        # this test pass only on the base branch and fail against real production.
+        def getState(self, getPositions=False, getEnergy=False, enforcePeriodicBox=False,
+                     groups=None, **kwargs):
             assert getPositions is True
             assert getEnergy is False
+            # Pin that the real call site still SUPPLIES it -- a default-only
+            # parameter would let the regression back in silently.
+            assert groups is not None, "production must pass an explicit energy-group mask"
             return State(getEnergy)
 
     unit = SimpleNamespace(nanometer=object(), kilojoule_per_mole=object())
