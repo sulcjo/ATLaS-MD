@@ -5427,6 +5427,18 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     args.state_gamd_lambdas = _derive_state_gamd_lambdas(
         window_metadata, len(centers_a), existing=getattr(args, "state_gamd_lambdas", None)
     )
+    # initialize_run_manifest() (cli.py, before minimize_and_npt_equilibrate/
+    # run_gareus are ever called) runs _method_settings(args) long before
+    # args.state_gamd_lambdas exists as an attribute at all -- that dict
+    # comprehension is `{k: getattr(args, k, None) for k in keys if
+    # hasattr(args, k)}`, so a not-yet-set attribute is silently OMITTED, not
+    # written as null. finalize_run_manifest() never recomputes
+    # method_settings either (it only patches status/end_time/artifact
+    # hashes), so without this patch "state_gamd_lambdas" never appears in
+    # run_manifest.json on ANY run -- silently defeating
+    # _reload_state_gamd_lambdas_on_resume's manifest read on every --resume.
+    # Patch it in now that the final, post-reachability-filter value is known.
+    update_run_manifest(out_dir, {"method_settings": {"state_gamd_lambdas": list(args.state_gamd_lambdas)}})
     window_rows = window_assignment_rows(centers_a, k_list, args.temperature_k, secondary_cv_centers, secondary_cv_k_kcal_list, args=args, gamd_lambdas=args.state_gamd_lambdas)
     write_window_assignment_csv(out_dir / "umbrella_windows.csv", window_rows)
     print_window_assignment_table(window_rows)
