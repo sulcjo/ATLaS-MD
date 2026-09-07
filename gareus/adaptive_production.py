@@ -1971,9 +1971,18 @@ def _annotate_edge_warnings(edge: EdgeDiagnostics, policy: AdaptiveDecisionPolic
     never raised for one -- acceptance is still recorded, just not judged.
     """
     if str(edge.edge_type) == "rung":
-        if edge.mbar_overlap is None or float(edge.mbar_overlap) < float(policy.min_rung_overlap):
-            if "low_rung_overlap" not in edge.warnings:
-                edge.warnings.append("low_rung_overlap")
+        # "not measured" and "measured and too low" are different states and are
+        # named differently: O_ij only exists where a union MBAR solve has run,
+        # and calling an unmeasured rung edge weak would let a gate fail a
+        # ladder for the absence of a number rather than for a bad one.
+        if edge.mbar_overlap is None:
+            warning = "rung_overlap_unavailable"
+        elif float(edge.mbar_overlap) < float(policy.min_rung_overlap):
+            warning = "low_rung_overlap"
+        else:
+            return edge
+        if warning not in edge.warnings:
+            edge.warnings.append(warning)
         return edge
     if edge.overlap is None or float(edge.overlap) < float(policy.target_overlap):
         if "low_or_missing_overlap" not in edge.warnings:
@@ -3918,10 +3927,19 @@ def _weak_rung_edge_reason(
     sj = registry.get_state(int(edge.get("state_j", -1)))
     lam_i = "?" if si is None else f"{float(si.gamd_lambda or 0.0):g}"
     lam_j = "?" if sj is None else f"{float(sj.gamd_lambda or 0.0):g}"
-    measured = "missing" if overlap is None else f"{float(overlap):.4f}"
+    pair = (f"lambda={lam_i} and lambda={lam_j} "
+            f"(states {edge.get('state_i')}-{edge.get('state_j')})")
+    if overlap is None:
+        # NOT a failure.  This gate runs before the union MBAR inputs exist
+        # (the pre-union pass and every extension round), so a rung edge is
+        # simply unscored there.  Failing on it would make
+        # quality_gate_fixable_by_more_final_sampling true on every ladder
+        # campaign and spend final_quality_extension_rounds of MD chasing a
+        # number more sampling cannot produce.  The post-union gate is the one
+        # that has O_ij and judges it.
+        return f"rung edge between {pair} was not scored: no union MBAR state overlap available"
     return (
-        f"weak lambda-ladder rung edge between lambda={lam_i} and lambda={lam_j} "
-        f"(states {edge.get('state_i')}-{edge.get('state_j')}): mbar_overlap={measured} "
+        f"weak lambda-ladder rung edge between {pair}: mbar_overlap={float(overlap):.4f} "
         f"< min_rung_overlap={float(policy.min_rung_overlap):g}"
     )
 
@@ -4000,10 +4018,15 @@ def evaluate_adaptive_quality_gate(
         if str(edge.get("edge_type")) == "rung":
             # A rung edge carries no CV histogram (overlap is None by
             # construction) and its acceptance is inflated by gibbs-walk, so it
-            # is judged on the MBAR state overlap alone -- but a weak one is a
-            # gate failure exactly like a weak CV edge.
+            # is judged on the MBAR state overlap alone -- but a MEASURED weak
+            # one is a gate failure exactly like a weak CV edge, while an
+            # unscored one is only a warning (see _weak_rung_edge_reason).
             reason = _weak_rung_edge_reason(edge, registry, policy)
-            if reason is not None:
+            if reason is None:
+                continue
+            if edge.get("mbar_overlap") is None:
+                warnings.append(reason)
+            else:
                 weak_edges.append(edge)
                 weak_rung_edges.append(reason)
             continue

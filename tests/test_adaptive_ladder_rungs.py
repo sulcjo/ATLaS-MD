@@ -487,3 +487,44 @@ def test_no_ladder_state_is_ever_proposed_for_retirement():
     # carries its centre's rungs
     reps = {int(s.state_id) for s in reg.active_states() if s.gamd_lambda == 0.0}
     assert _graph_articulation_states(reg) == reps
+
+
+def test_an_unscored_rung_edge_warns_but_does_not_demand_more_sampling():
+    """The pre-union gate and every extension round run BEFORE the union MBAR
+    inputs exist, so their rung edges carry no O_ij.  Treating "not measured"
+    as "weak" would make quality_gate_fixable_by_more_final_sampling true on
+    every ladder campaign and burn final_quality_extension_rounds of MD chasing
+    a number more sampling cannot produce."""
+    from gareus.adaptive_production import quality_gate_fixable_by_more_final_sampling
+
+    reg = _ladder_registry(centers=(0.05,), rungs=(0.0, 0.5))
+    ids = sorted(int(s.state_id) for s in reg.active_states())
+    pol = AdaptiveDecisionPolicy(final_min_samples_per_state=10)
+    final_diag = {
+        "n_sample_rows": 2000,
+        "states": [_state_row(sid, sample_count=1000) for sid in ids],
+        "edges": [{"state_i": ids[0], "state_j": ids[1], "edge_type": "rung",
+                   "overlap": None, "mbar_overlap": None,
+                   "exchange_acceptance": 0.93, "warnings": ["rung_overlap_unavailable"]}],
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = evaluate_adaptive_quality_gate(Path(tmp), reg, final_diag, pol)
+    assert not gate.get("weak_edges"), gate.get("weak_edges")
+    assert gate.get("status") == "warning", gate.get("status")
+    assert any("not scored" in w for w in gate.get("warnings", [])), gate.get("warnings")
+    assert quality_gate_fixable_by_more_final_sampling(gate) is False
+
+
+def test_edge_warnings_name_unmeasured_and_weak_rung_edges_differently():
+    from gareus.adaptive_production import EdgeDiagnostics
+
+    pol = AdaptiveDecisionPolicy()
+    unscored = EdgeDiagnostics(state_i=0, state_j=1, window_i=0, window_j=1,
+                               edge_type="rung", overlap=None, mbar_overlap=None)
+    weak = EdgeDiagnostics(state_i=0, state_j=1, window_i=0, window_j=1,
+                           edge_type="rung", overlap=None, mbar_overlap=0.05)
+    healthy = EdgeDiagnostics(state_i=0, state_j=1, window_i=0, window_j=1,
+                              edge_type="rung", overlap=None, mbar_overlap=0.30)
+    assert _rung_edge_warnings(unscored, pol) == ["rung_overlap_unavailable"]
+    assert _rung_edge_warnings(weak, pol) == ["low_rung_overlap"]
+    assert _rung_edge_warnings(healthy, pol) == []
