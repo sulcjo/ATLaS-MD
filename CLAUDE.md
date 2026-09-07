@@ -351,6 +351,29 @@ the swarm, never hand-edit the envelope.
   boost-potential extension below Vmin would fix this but is a **method change** this stage
   does not adopt on its own — it is an open user decision, not something to silently apply.
 
+**Adaptive production under the lambda-ladder (`gareus/adaptive_production.py`, 2026-09-07).**
+Every state an action adds is now replicated onto every active rung
+(`WindowStateRegistry.rung_lambdas()`; `max_new_windows_per_epoch` counts **centres**, not
+states), and rung pairs get their own `"rung"` edges scored in ENERGY space — a CV
+histogram cannot see a rung gap, since two rungs at one centre overlap ~1 by construction,
+and gibbs-walk inflates their exchange acceptance to 91-95% against a true pairwise overlap
+of 0.24-0.30. The metric is the symmetric MBAR state overlap `sqrt(O_ij*O_ji)` from
+`gareus.mbar_analysis.ladder.mbar_state_overlap` (`O = diag(N) @ S` is asymmetric once the
+two states hold different sample counts; the geometric mean equals `O_ij` when they are
+equal, so the S3 pilot calibration 0.298/0.250/0.240/0.273 and the 0.15/0.25 thresholds
+stand). Two accepted limitations:
+
+- **A rung gap is caught at campaign end, not mid-campaign.** `add_rung` is proposed only
+  from the post-union diagnostics; the per-epoch/segment diagnostics run before
+  `build_union_state_mbar_inputs` and carry no rung O_ij, so their rung edges are warned
+  `rung_overlap_unavailable` and skipped by the proposer (an unscored rung edge is never
+  treated as a weak one — that would make the pre-union gate demand more sampling on every
+  ladder run). Feeding the epoch loop a per-epoch union solve is what would change this.
+- **`retire_converged` is inert under an active ladder.** Every centre representative
+  carries its own rungs and is therefore an articulation point of the rung-aware graph, so
+  it can never be retired; a non-representative rung state earns no CV-overlap credit and
+  never becomes a candidate. No windows are reclaimed in a ladder campaign.
+
 ## Verification
 
 - `pytest -q tests/test_bootstrap_torsion_cv.py tests/test_tica_cv_mode.py tests/test_genpept_contact_bias.py tests/test_gamd_boost_default.py tests/test_ap_epoch0_step_fraction.py tests/test_plot_adaptive_diagnostics.py tests/test_union_mbar_per_epoch_bias.py tests/test_secondary_cv_regime_split.py tests/test_epoch0_pmf_gamd_split.py tests/test_merged_traj_dir_multi_resume.py`
