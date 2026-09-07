@@ -2151,6 +2151,21 @@ def _augment_with_adaptive_rounds(d: Data, run_dir: Path) -> Data:
     v_dih_all = np.concatenate(
         [_energies(getattr(d, 'v_dih_kj', None), d.cv.size)] + [r['v_dih_kj_mol'] for r in round_data])
 
+    # Consistency check on the per-round window->union mapping, using the λ the
+    # chunks recorded PER SAMPLE against the λ of the union state that sample
+    # was mapped onto. A mismatch means a round's samples landed on the wrong
+    # rung -- silently the worst possible outcome, since the resulting u_nk is
+    # well-formed and simply wrong.
+    _lam_mismatch = 0
+    for r in round_data:
+        _assigned = state_lambdas_union[r['window_union']]
+        _own = np.asarray(r['gamd_lambda'], dtype=np.float64)
+        _lam_mismatch += int(np.count_nonzero(np.isfinite(_own) & (np.abs(_own - _assigned) > 1e-9)))
+    if _lam_mismatch:
+        print(f'WARNING: {_lam_mismatch} adaptive-round sample(s) carry a gamd_lambda that '
+              f'differs from the union state they were mapped onto; the round->union window '
+              f'map and the sampled rungs disagree.')
+
     n_round_samples = sum(r['cv_A'].size for r in round_data)
     meta = dict(d.meta)
     meta['load_notes'] = list(meta.get('load_notes') or []) + [
@@ -2166,6 +2181,8 @@ def _augment_with_adaptive_rounds(d: Data, run_dir: Path) -> Data:
         for w in union_windows
     ]
     meta['adaptive_round_dirs'] = [str(r) for r in round_dirs]
+    if _lam_mismatch:
+        meta['gamd_ladder_round_lambda_mismatches'] = int(_lam_mismatch)
 
     from .ladder import apply_ladder_boost_to_u, load_pep_gamd_envelope
     _envelope = load_pep_gamd_envelope(run_dir) if np.any(state_lambdas_union > 0.0) else None

@@ -604,7 +604,10 @@ def load_parquet(prod: Path) -> Data:
         with wcsv.open(newline='') as f:
             rows = list(csv.DictReader(f))
     meta['umbrella_window_rows'] = rows
-    meta['parquet_windows']      = windows
+    # windows_for_nk, not `windows`: it carries the RESOLVED per-state λ
+    # (snapshot value, or the nanmedian fallback), so nothing downstream can
+    # re-derive a different ladder from this record than the one u_nk used.
+    meta['parquet_windows']      = windows_for_nk
 
     _boost_dih_arg = boost_dih if np.any(np.isfinite(boost_dih)) else None
     return clean(Data(

@@ -1167,3 +1167,34 @@ def test_load_epoch_csv_adaptive_keys_states_on_gamd_lambda(tmp_path):
     assert d.u_nk.shape[1] == 2, d.u_nk.shape
     assert sorted(np.asarray(d.state_lambdas).tolist()) == [0.0, 1.0]
     assert d.meta.get("gamd_ladder") is True
+
+
+def test_export_analysis_arrays_npz_survives_a_ladder_snapshot(tmp_path):
+    """I2 follow-on: export_analysis_arrays_npz is the SECOND caller that
+    reconstructs from the window snapshot. Once snapshot_window_rows writes
+    gamd_lambda, it hits the same query.py:395-400 ValueError load_parquet
+    did -- and it is a public entry point (see gareus/helptext.py), not only
+    an internal one. It must pass the raw energies through and emit the same
+    total bias MBAR consumes, not an umbrella-only matrix."""
+    from gareus.query import export_analysis_arrays_npz
+    from gareus.pep_gamd import pep_gamd_boost_kj
+
+    prod = tmp_path / "final_production"
+    windows = [{"window_id": 0, "center1": 5.0, "k1": 10.0, "gamd_lambda": 0.0},
+               {"window_id": 1, "center1": 5.0, "k1": 10.0, "gamd_lambda": 1.0}]
+    env = _parquet_ladder_run(prod, windows, [0.0, 1.0, 0.0, 1.0])
+
+    beta = 1.0 / (8.314462618e-3 * 300.0)
+    out = export_analysis_arrays_npz(prod, beta)
+    with np.load(out, allow_pickle=False) as f:
+        nk = np.asarray(f["umbrella_reduced_bias_nk"], dtype=float)
+        v_pep = np.asarray(f["v_pep_kj_mol"], dtype=float) if "v_pep_kj_mol" in f.files else None
+
+    assert nk.shape[1] == 2
+    if v_pep is None:
+        v_pep = np.array([10.0 + i for i in range(nk.shape[0])])
+    v_dih = np.array([3.0 + 0.5 * i for i in range(nk.shape[0])])
+    expected = np.array([beta * pep_gamd_boost_kj(vp, vd, 1.0, env)
+                         for vp, vd in zip(v_pep, v_dih)])
+    assert np.any(expected > 0.0)
+    assert np.allclose(nk[:, 1] - nk[:, 0], expected), (nk[:, 1] - nk[:, 0], expected)

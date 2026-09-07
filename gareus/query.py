@@ -441,6 +441,24 @@ def export_analysis_arrays_npz(
     else:
         cv2 = None
 
+    # λ-ladder plumbing: window snapshots carry gamd_lambda since
+    # production.snapshot_window_rows, and reconstruct_bias_matrix REFUSES a
+    # λ>0 window without the raw channel energies + envelope. Supply them from
+    # the samples themselves (both columns are written for every parquet
+    # sample) so the legacy npz carries the same total bias MBAR uses rather
+    # than an umbrella-only matrix -- or a ValueError.
+    def _energy_col(name):
+        raw = samples.get(name)
+        if raw is None:
+            return None
+        arr = np.ma.filled(np.ma.asarray(raw).astype(np.float64), np.nan)
+        return np.asarray(arr, dtype=np.float64)
+
+    v_pep_all = _energy_col("v_pep_kj_mol")
+    v_dih_all = _energy_col("v_dih_kj_mol")
+    from .mbar_analysis.ladder import load_pep_gamd_envelope
+    envelope = load_pep_gamd_envelope(run_dir)
+
     seg_raw = samples.get("segment_id")
     if seg_raw is not None:
         seg_ids = np.asarray(seg_raw).astype(str)
@@ -460,13 +478,18 @@ def export_analysis_arrays_npz(
                     "use segment-specific or union-state analysis."
                 )
             mask = seg_ids == str(seg_id)
-            nk[mask, :] = reconstruct_bias_matrix(cv_A[mask], cv2[mask] if cv2 is not None else None, seg_windows, beta)
+            nk[mask, :] = reconstruct_bias_matrix(
+                cv_A[mask], cv2[mask] if cv2 is not None else None, seg_windows, beta,
+                v_pep=v_pep_all[mask] if v_pep_all is not None else None,
+                v_dih=v_dih_all[mask] if v_dih_all is not None else None,
+                envelope=envelope)
         windows = first_windows
     else:
         windows = load_windows(run_dir)
         if not windows:
             raise ValueError(f"No window snapshot found in {run_dir}/windows/")
-        nk = reconstruct_bias_matrix(cv_A, cv2, windows, beta)
+        nk = reconstruct_bias_matrix(cv_A, cv2, windows, beta,
+                                     v_pep=v_pep_all, v_dih=v_dih_all, envelope=envelope)
 
     save_kwargs: dict = {
         "cv_A": cv_A,
