@@ -348,8 +348,20 @@ class PepGamdEnvelope:
 
     @classmethod
     def from_json(cls, path) -> "PepGamdEnvelope":
+        """Load from ``shared_gamd_setup_globals.json``.
+
+        Every writer in ``production.py`` (the joint-envelope calibration path,
+        the disabled/plain-MD path, and the worker-reuse path) nests the real
+        CustomIntegrator globals under the top-level key ``"all_globals"``
+        (with ``"interesting_globals"`` as a smaller, non-authoritative
+        subset written alongside it) -- never under ``"globals"``,
+        ``"integrator_globals"``, or ``"shared_gamd_globals_all"``. Probe the
+        real key first; the others are kept harmlessly in case some other
+        caller ever nests it differently.
+        """
         doc = _json.loads(open(path).read())
-        for cand in (doc, doc.get("globals"), doc.get("integrator_globals"), doc.get("shared_gamd_globals_all")):
+        for cand in (doc, doc.get("all_globals"), doc.get("interesting_globals"),
+                     doc.get("globals"), doc.get("integrator_globals"), doc.get("shared_gamd_globals_all")):
             if isinstance(cand, dict) and "k0_Total" in cand:
                 return cls.from_integrator_globals(cand)
         raise KeyError(f"{path}: no dict with k0_Total/Vmax_Total/... found")

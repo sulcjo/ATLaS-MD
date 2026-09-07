@@ -34,6 +34,62 @@ def test_boost_matrix_shape_and_rows():
     assert np.isclose(M[2, 1], pep_gamd_boost_kj(20.0, 6.0, 1.0, env))
 
 
+def test_envelope_from_json_reads_the_real_production_shape(tmp_path):
+    """2026-09-07 review, Critical 2: every write_json(out_dir / 'shared_gamd_setup_globals.json',
+    {...}) call in production.py nests the real CustomIntegrator globals under
+    the top-level key "all_globals" (with "interesting_globals" a smaller,
+    non-authoritative subset written alongside it) -- never under "globals",
+    "integrator_globals", or "shared_gamd_globals_all". Build a JSON in that
+    exact shape (payload structure copied from the write_json call at
+    production.py:4791-4816) and confirm from_json finds it."""
+    import json
+    from gareus.pep_gamd import PepGamdEnvelope
+
+    all_globals = {
+        "Vmax_Total": 50.0, "Vmin_Total": -50.0, "threshold_energy_Total": 50.0, "k0_Total": 0.8,
+        "Vmax_Dihedral": 40.0, "Vmin_Dihedral": -40.0, "threshold_energy_Dihedral": 40.0, "k0_Dihedral": 0.6,
+        "stepCount": 12345, "stage": 5,  # extra integrator globals a real dump also carries
+    }
+    payload = {
+        "mode": "joint_envelope_gamd_calibration",
+        "description": "Vmax/Vmin/Vavg/sigmaV/k0/threshold_energy were calibrated in two stages...",
+        "calibration_steps": 1000,
+        "temperature_K": 300.0,
+        "gamd_boost_type": "pep-gamd-lower-dual",
+        "sigma0p_kcal_mol": 6.0,
+        "sigma0d_kcal_mol": 6.0,
+        "interesting_globals": {"Vmax_Total": 50.0, "k0_Total": 0.8},
+        "all_globals": all_globals,
+    }
+    path = tmp_path / "shared_gamd_setup_globals.json"
+    path.write_text(json.dumps(payload))
+
+    env = PepGamdEnvelope.from_json(path)
+    assert (env.vmax_total, env.vmin_total, env.threshold_total, env.k0max_total) == (50.0, -50.0, 50.0, 0.8)
+    assert (env.vmax_dih, env.vmin_dih, env.threshold_dih, env.k0max_dih) == (40.0, -40.0, 40.0, 0.6)
+
+
+def test_envelope_from_json_disabled_run_shape(tmp_path):
+    """The disabled/plain-MD writer (production.py's `write_json(out_dir /
+    "shared_gamd_setup_globals.json", {"mode": f"disabled_{run_mode}", ...,
+    "all_globals": {}, "interesting_globals": {}})`) has an EMPTY all_globals
+    (no k0_Total) -- from_json must still raise KeyError, not silently
+    fabricate an envelope."""
+    import json
+    import pytest
+    from gareus.pep_gamd import PepGamdEnvelope
+
+    path = tmp_path / "shared_gamd_setup_globals.json"
+    path.write_text(json.dumps({
+        "mode": "disabled_hmr-cmd", "description": "GaMD disabled.",
+        "calibration_steps": 0, "run_mode": "hmr-cmd",
+        "temperature_K": 300.0, "timestep_fs": 2.0, "friction_per_ps": 1.0,
+        "all_globals": {}, "interesting_globals": {},
+    }))
+    with pytest.raises(KeyError):
+        PepGamdEnvelope.from_json(path)
+
+
 def test_envelope_from_integrator_globals_roundtrip():
     from gareus.pep_gamd import PepGamdEnvelope
     g = {"Vmax_Total": 50.0, "Vmin_Total": -50.0, "threshold_energy_Total": 50.0, "k0_Total": 0.8,
