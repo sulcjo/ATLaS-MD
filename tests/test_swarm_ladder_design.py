@@ -78,6 +78,27 @@ def test_window_sigma_against_coverage_range_matches_measured_numbers():
     assert math.isclose(window_sigma_cv(800.0, 300.0), 0.027, abs_tol=0.002)
 
 
+def test_n_resolvable_windows_matches_measured_r7_coverage():
+    """r7's coverage_range=0.069 at k_max=1200, 300 K resolves only 2 windows, not spec S2's 16 ceiling."""
+    from gareus.swarm.ladder_design import n_resolvable_windows
+    n = n_resolvable_windows(0.069, 300.0)
+    assert n == 2
+    # a wider range resolves proportionally more
+    assert n_resolvable_windows(0.69, 300.0) == 20
+
+
+def test_fsf_floor_per_rung_handles_dihedral_only_envelope():
+    """has_total=False (dihedral-only envelope): Total is not applicable, warn is driven by Dihedral."""
+    from gareus.swarm.ladder_design import fsf_floor_per_rung
+    import types
+    env = types.SimpleNamespace(k0max_total=0.6, k0max_dih=1.0, has_total=False)
+    r = fsf_floor_per_rung([0.0, 0.5, 1.0], env, warn_threshold=0.5)
+    assert r["Total"] is None
+    assert math.isclose(r["Dihedral"][-1], 0.0)
+    assert r["top_rung_floor_total"] is None
+    assert r["warn"] is True  # driven by the Dihedral channel's top-rung floor (0.0 < 0.5)
+
+
 def test_curvature_positive_in_a_well_and_zero_where_empty():
     from gareus.swarm.ladder_design import cv1_curvature_kcal
     cv1 = np.random.default_rng(4).normal(0.5, 0.05, 50000)      # Gaussian well: F'' = kT/σ² > 0

@@ -108,16 +108,28 @@ def fsf_floor_per_rung(lambdas, env: PepGamdEnvelope, *, warn_threshold: float =
     floor is 1 - lambda*k0max. Pep-GaMD leaves water-water at full strength, so a floor near 0 lets the
     solvent collapse into the peptide unopposed (S3 attempts 6-7: NaN coordinates at k0_Total = 1). The
     plan does NOT clamp the FSF here -- that would be a method change and is left as a user decision.
+
+    A dihedral-only envelope (``env.has_total is False``, per the optional field noted in this task's
+    brief) has no meaningful Total channel: ``Total``/``top_rung_floor_total`` are reported as ``None``
+    and ``warn`` is driven off the Dihedral channel's top-rung floor instead.
     """
     lam = [float(x) for x in lambdas]
-    tot = [1.0 - l * float(env.k0max_total) for l in lam]
+    has_total = bool(getattr(env, "has_total", True))
     dih = [1.0 - l * float(env.k0max_dih) for l in lam]
-    top = tot[-1] if tot else 1.0
+    top_dih = dih[-1] if dih else 1.0
+    if has_total:
+        tot = [1.0 - l * float(env.k0max_total) for l in lam]
+        top_tot = tot[-1] if tot else 1.0
+        warn = bool(top_tot < float(warn_threshold))
+    else:
+        tot = None
+        top_tot = None
+        warn = bool(top_dih < float(warn_threshold))
     return {
         "Total": tot,
         "Dihedral": dih,
-        "top_rung_floor_total": float(top),
-        "warn": bool(top < float(warn_threshold)),
+        "top_rung_floor_total": top_tot,
+        "warn": warn,
         "warn_threshold": float(warn_threshold),
         "note": "FSF floor = 1 - lambda*k0max at V = Vmin (unclamped lower-bound formula); "
                 "a floor near 0 on the top rung is the NaN mechanism seen in S3 attempts 6-7",
@@ -127,6 +139,19 @@ def fsf_floor_per_rung(lambdas, env: PepGamdEnvelope, *, warn_threshold: float =
 def window_sigma_cv(k_kcal: float, temperature_k: float) -> float:
     """sigma_w = sqrt(kT/k) in CV units; at 300 K, k=250 -> 0.049, k=800 -> 0.027 (r7's ~0.07-wide range)."""
     return math.sqrt(R_KCAL_MOL_K * float(temperature_k) / float(k_kcal))
+
+
+def n_resolvable_windows(coverage_range: float, temperature_k: float, *,
+                          k_max_kcal: float = 1200.0, overlap_sigma: float = 1.5) -> int:
+    """floor(coverage_range / (overlap_sigma * sigma_w(k_max))): the true window-count ceiling.
+
+    Spec S2's "16 centres" is only reachable when the accessible CV1 range is wide enough to hold 16
+    non-overlapping windows at the stiffest allowed force constant. With r7's measured coverage
+    (~0.069) and k_max=1200 kcal/mol/CV^2 at 300 K, this resolves to 2, not 16 -- the plan writes
+    min(requested_n_windows, n_resolvable_windows(...)) and records why.
+    """
+    sigma_w_min = window_sigma_cv(float(k_max_kcal), float(temperature_k))
+    return int(math.floor(float(coverage_range) / (float(overlap_sigma) * sigma_w_min)))
 
 
 def cv1_centers_from_samples(cv1, n_windows: int = 16, lo_q: float = 0.005, hi_q: float = 0.995, *,
