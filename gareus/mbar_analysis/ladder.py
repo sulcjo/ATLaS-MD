@@ -117,18 +117,22 @@ def apply_ladder_boost_to_u(
         meta["gamd_ladder_samples_without_raw_energies"] = 0
         return u_nk
 
-    v_pep = np.asarray(v_pep, dtype=np.float64)
-    v_dih = np.asarray(v_dih, dtype=np.float64)
-    missing = ~np.isfinite(v_pep) | ~np.isfinite(v_dih)
-    if missing.all():
-        raise ValueError(
-            "some state carries gamd_lambda > 0 but no sample has a finite v_pep/v_dih "
-            "pair; the λ-ladder cannot be reweighted without the raw channel energies"
-        )
     if envelope is None:
         raise ValueError(
             "some state carries gamd_lambda > 0 but no frozen GaMD envelope was "
             "found/supplied; v_pep/v_dih cannot be reweighted under the ladder without it"
+        )
+    v_pep = np.asarray(v_pep, dtype=np.float64)
+    v_dih = np.asarray(v_dih, dtype=np.float64)
+    # A single dihedral boost (envelope.has_total False) has no Total channel: v_pep is
+    # NaN by construction there and is not "missing data" -- only v_dih must be finite.
+    needs_pep = bool(getattr(envelope, "has_total", True))
+    missing = ~np.isfinite(v_dih) | (~np.isfinite(v_pep) if needs_pep else np.zeros(v_dih.shape, dtype=bool))
+    if missing.all():
+        raise ValueError(
+            "some state carries gamd_lambda > 0 but no sample has a finite "
+            + ("v_pep/v_dih pair" if needs_pep else "v_dih value")
+            + "; the λ-ladder cannot be reweighted without the raw channel energies"
         )
 
     from gareus.pep_gamd import pep_gamd_boost_matrix_kj
