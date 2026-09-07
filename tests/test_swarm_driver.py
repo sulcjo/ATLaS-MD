@@ -1,4 +1,4 @@
-import json, pathlib, tempfile, types
+import csv, json, pathlib, tempfile, types
 
 
 def test_parse_member_range_half_open_and_default_all():
@@ -102,3 +102,93 @@ def test_load_frozen_edges_requires_round0_meta_and_returns_persisted_edges():
     edges = {"cv1": [0.0, 0.5, 1.0], "rg": [0.0, 1.0], "e2e": [0.0, 3.0]}
     (rd / "plan_meta.json").write_text(json.dumps({"edges": edges}))
     assert _load_frozen_edges(out) == edges
+
+
+def test_resolve_conformer_resolves_by_seed_pdb_even_when_list_order_is_swapped():
+    """The reloaded library can be re-sorted/grown relative to when plan.csv was
+    written (frozen envelope: later rounds only add seeds) -- a bare positional
+    seed_id index would silently grab the wrong entry here; resolution must go
+    through the recorded seed_pdb path instead."""
+    from gareus.swarm.seed_library import _resolve_conformer
+    # plan-time order was [a, b] (seed_00000 -> a, seed_00001 -> b); the reloaded
+    # library has swapped/grown to [b, a] -- seed_00000's positional index 0 would
+    # now wrongly resolve to "b" if identity weren't checked.
+    library = [{"pdb_path": "/b.pdb"}, {"pdb_path": "/a.pdb"}]
+    library_by_path = {e["pdb_path"]: e for e in library}
+    row = {"member_id": 3, "seed_id": "seed_00000", "seed_pdb": "/a.pdb"}
+    resolved = _resolve_conformer(row, library, library_by_path)
+    assert resolved is library[1] and resolved["pdb_path"] == "/a.pdb"
+
+
+def test_resolve_conformer_raises_naming_both_paths_on_mismatch():
+    from gareus.swarm.seed_library import _resolve_conformer
+    library = [{"pdb_path": "/x.pdb"}, {"pdb_path": "/y.pdb"}]
+    library_by_path = {e["pdb_path"]: e for e in library}
+    # seed_pdb matches nothing by path; the positional fallback (seed_id index 0)
+    # points at a different path ("/x.pdb") -- both must be named in the error.
+    row = {"member_id": 9, "seed_id": "seed_00000", "seed_pdb": "/gone.pdb"}
+    try:
+        _resolve_conformer(row, library, library_by_path)
+    except ValueError as e:
+        msg = str(e)
+        assert "/gone.pdb" in msg and "/x.pdb" in msg
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def _write_production_frames_csv(csv_path, rows):
+    with pathlib.Path(csv_path).open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["pdb_path", "cv1", "rg_nm", "e2e_nm"])
+        w.writeheader()
+        for row in rows:
+            w.writerow(row)
+
+
+def _fake_seed_pdb(d):
+    pdb = pathlib.Path(d) / "seed.pdb"
+    pdb.write_text("ATOM      1  CA  GLY A   1       0.000   0.000   0.000  1.00  0.00           C\nEND\n")
+    return pdb
+
+
+def test_load_production_frame_library_raises_on_empty_field_naming_file_row_column():
+    from gareus.swarm.seed_library import _load_production_frame_library
+    d = pathlib.Path(tempfile.mkdtemp())
+    pdb = _fake_seed_pdb(d)
+    csv_path = d / "frames.csv"
+    _write_production_frames_csv(csv_path, [{"pdb_path": str(pdb), "cv1": "", "rg_nm": "0.5", "e2e_nm": "1.0"}])
+    try:
+        _load_production_frame_library(csv_path)
+    except ValueError as e:
+        msg = str(e)
+        assert str(csv_path) in msg and "row 0" in msg and "'cv1'" in msg
+    else:
+        raise AssertionError("expected ValueError on an empty required field")
+
+
+def test_load_production_frame_library_raises_on_garbage_field_naming_file_row_column():
+    from gareus.swarm.seed_library import _load_production_frame_library
+    d = pathlib.Path(tempfile.mkdtemp())
+    pdb = _fake_seed_pdb(d)
+    csv_path = d / "frames.csv"
+    _write_production_frames_csv(
+        csv_path, [{"pdb_path": str(pdb), "cv1": "not-a-number", "rg_nm": "0.5", "e2e_nm": "1.0"}],
+    )
+    try:
+        _load_production_frame_library(csv_path)
+    except ValueError as e:
+        msg = str(e)
+        assert str(csv_path) in msg and "row 0" in msg and "'cv1'" in msg and "not-a-number" in msg
+    else:
+        raise AssertionError("expected ValueError on a non-numeric required field")
+
+
+def test_load_production_frame_library_accepts_valid_rows():
+    from gareus.swarm.seed_library import _load_production_frame_library
+    d = pathlib.Path(tempfile.mkdtemp())
+    pdb = _fake_seed_pdb(d)
+    csv_path = d / "frames.csv"
+    _write_production_frames_csv(csv_path, [{"pdb_path": str(pdb), "cv1": "0.05", "rg_nm": "0.5", "e2e_nm": "1.0"}])
+    library = _load_production_frame_library(csv_path)
+    assert len(library) == 1
+    assert library[0]["primary_cv_value"] == 0.05
+    assert library[0]["validated_rg_nm"] == 0.5 and library[0]["validated_e2e_nm"] == 1.0

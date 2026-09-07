@@ -11,6 +11,10 @@ Ab initio (global constraint): every member starts from a grafted seed. The
 stage refuses to run at all without ``--seed-conformers-dir`` pointing at a
 readable ``final_survivor_seeds.csv`` -- a contact-CV start from the extended
 chain cannot be pulled into coverage (S3 pilot finding).
+
+Seed-library loading, per-row CSV validation and per-member conformer
+identity resolution live in ``gareus.swarm.seed_library`` (split out to keep
+this module under the line-count cap).
 """
 from __future__ import annotations
 
@@ -22,9 +26,8 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from gareus.cv import find_atom_in_residue, peptide_residues, prepare_primary_cv_definition
+from gareus.cv import prepare_primary_cv_definition
 from gareus.imports import import_openmm
-from gareus.seeding import _read_pdb_conformer_atoms, load_genpept_conformer_library
 from gareus.system_setup import (
     create_system,
     make_forcefield,
@@ -33,6 +36,11 @@ from gareus.system_setup import (
     write_state_pdb,
 )
 from gareus.swarm.members import member_done, run_member
+from gareus.swarm.seed_library import (
+    _ca_indices_in_seed,
+    _load_seed_library_for_round,
+    _resolve_conformer,
+)
 from gareus.swarm.stratify import (
     SeedDescriptor,
     _bin_index,
@@ -98,67 +106,6 @@ def stratify_with_frozen_edges(seeds: List[SeedDescriptor], edges: Dict[str, lis
         key = (_bin_index(s.cv1, e_cv1), _bin_index(s.rg_nm, e_rg), _bin_index(s.e2e_nm, e_e2e))
         cells.setdefault(key, []).append(s)
     return dict(sorted(cells.items()))
-
-
-def _ca_indices_in_seed(library: List[dict], topology) -> Optional[List[int]]:
-    """Topology CA indices mapped through a library entry's own atom map.
-
-    GENPEPT survivor conformers share one atom-naming convention, so the first
-    entry whose map covers every peptide CA is representative for the whole
-    library. Falls back to ``None`` (every atom) when no entry's map is
-    complete -- e.g. a CA-trace-only seed where "every atom" already is the CA
-    trace (``describe_seeds`` docstring).
-    """
-    ca_topology = [find_atom_in_residue(res, "CA") for res in peptide_residues(topology)]
-    for entry in library:
-        atom_map = entry.get("topology_to_conformer_atom_index") or {}
-        if atom_map and all(idx in atom_map for idx in ca_topology):
-            return [int(atom_map[idx]) for idx in ca_topology]
-    return None
-
-
-def _load_production_frame_library(csv_path) -> List[dict]:
-    """Round >= 1 seed source: ``pdb_path,cv1,rg_nm,e2e_nm`` rows (S5 re-seeding).
-
-    Each row's PDB is a solute-only frame written by a previous swarm member
-    (``write_solute_only_pdb``), so its atom count/order already match the
-    peptide topology exactly -- an empty ``topology_to_conformer_atom_index``
-    triggers ``graft_conformer_into_context``'s wholesale (Kabsch-aligned)
-    path, no name-mapping needed.
-    """
-    library: List[dict] = []
-    with Path(csv_path).open(newline="") as f:
-        for row in csv.DictReader(f):
-            pos_nm, _atoms = _read_pdb_conformer_atoms(row["pdb_path"])
-            cv1 = float(row.get("cv1", "nan") or "nan")
-            library.append({
-                "pdb_path": row["pdb_path"],
-                "positions_nm": pos_nm,
-                "topology_to_conformer_atom_index": {},
-                "source_row": dict(row),
-                "cv_A": cv1,
-                "primary_cv_value": cv1,
-                "primary_cv_units": "",
-                "secondary_cv_value": float("nan"),
-            })
-    return library
-
-
-def _load_seed_library_for_round(args, round_index: int, *, topology, primary_cv_def) -> List[dict]:
-    if round_index <= 0:
-        return load_genpept_conformer_library(
-            Path(args.seed_conformers_dir), primary_cv_def=primary_cv_def, args=args, topology=topology,
-        )
-    seed_source = str(getattr(args, "swarm_seed_source", "genpept") or "genpept")
-    if seed_source != "production-frames":
-        raise SystemExit(f"--swarm-round {round_index} (>= 1) needs --swarm-seed-source production-frames")
-    csv_path = getattr(args, "swarm_production_seed_csv", None)
-    if not csv_path or not Path(csv_path).exists():
-        raise SystemExit(
-            f"--swarm-round {round_index} needs --swarm-production-seed-csv PATH "
-            "(existing CSV with columns pdb_path,cv1,rg_nm,e2e_nm)"
-        )
-    return _load_production_frame_library(csv_path)
 
 
 def _load_frozen_edges(out_dir) -> Dict[str, list]:
@@ -231,12 +178,15 @@ def build_or_load_plan(args, out_dir, round_index: int, *, topology, contact_pai
             "e2e": quantile_edges(np.array([s.e2e_nm for s in seeds]), bins[2]).tolist(),
         }
     else:
+        # cv1/rg_nm/e2e_nm were already validated (finite, non-empty) by
+        # _validate_production_frame_row when the library was loaded -- no
+        # re-parsing of raw CSV strings here.
         seeds = [
             SeedDescriptor(
-                seed_id=f"seed_{i:05d}", pdb_path=str(entry.get("pdb_path", "")),
-                cv1=float((entry.get("source_row") or {}).get("cv1", "nan") or "nan"),
-                rg_nm=float((entry.get("source_row") or {}).get("rg_nm", "nan") or "nan"),
-                e2e_nm=float((entry.get("source_row") or {}).get("e2e_nm", "nan") or "nan"),
+                seed_id=f"seed_{i:05d}", pdb_path=str(entry["pdb_path"]),
+                cv1=float(entry["primary_cv_value"]),
+                rg_nm=float(entry["validated_rg_nm"]),
+                e2e_nm=float(entry["validated_e2e_nm"]),
             )
             for i, entry in enumerate(library)
         ]
@@ -294,6 +244,15 @@ def ensure_system(args, out_dir, progress) -> dict:
 
 
 def run_swarm_stage(args, out_dir, progress=None) -> dict:
+    """Build/reload the system, build/load one round's plan, and run its members.
+
+    ``--swarm-member-range`` shards the round: this call only iterates its own
+    shard, so the returned ``failed_in_range``/``missing_in_range`` (and
+    ``status_counts``) describe only the members attempted *by this call*, not
+    the whole round -- pooling across shards to answer "is the round done" is
+    Task 8's job (``analyze_swarm_stage`` reads every member directory under
+    the round, regardless of which shard produced it).
+    """
     out_dir = Path(out_dir)
     seed_conformers_dir = getattr(args, "seed_conformers_dir", None)
     if not seed_conformers_dir or not (Path(seed_conformers_dir) / "final_survivor_seeds.csv").exists():
@@ -319,8 +278,8 @@ def run_swarm_stage(args, out_dir, progress=None) -> dict:
 
     status_counts: Dict[str, int] = {}
     n_run = n_skipped_resume = 0
-    failed_members: List[int] = []      # done.json exists, status != "ok" (graft/MD failure)
-    missing_members: List[int] = []     # attempted this call but done.json still absent afterwards
+    failed_in_range: List[int] = []     # done.json exists, status != "ok" (graft/MD failure) -- this shard only
+    missing_in_range: List[int] = []    # attempted this call but done.json still absent afterwards -- this shard only
     for i in member_range:
         row = rows[i]
         member_id = int(row["member_id"])
@@ -332,24 +291,10 @@ def run_swarm_stage(args, out_dir, progress=None) -> dict:
             status = str(done.get("status", "ok"))
             status_counts[status] = status_counts.get(status, 0) + 1
             if status != "ok":
-                failed_members.append(member_id)
+                failed_in_range.append(member_id)
             continue
 
-        # Resolve by the plan's own recorded path first -- the library re-sorts by
-        # primary_cv_value and can grow across rounds/resumes (frozen envelope: later
-        # rounds only add seeds), so a bare positional seed_index can silently point
-        # at a different conformer than the one plan.csv actually recorded.
-        conformer = library_by_path.get(str(row["seed_pdb"]))
-        if conformer is None:
-            seed_index = int(str(row["seed_id"]).split("_")[1])
-            if 0 <= seed_index < len(library) and str(library[seed_index].get("pdb_path", "")) == str(row["seed_pdb"]):
-                conformer = library[seed_index]
-        if conformer is None:
-            raise ValueError(
-                f"swarm member {member_id}: plan seed_pdb {row['seed_pdb']!r} (seed_id {row['seed_id']!r}) "
-                f"is not resolvable in a library of {len(library)} entries -- the seed library changed "
-                "since plan.csv was written, or the plan/library pairing is otherwise broken"
-            )
+        conformer = _resolve_conformer(row, library, library_by_path)
 
         done = run_member(
             args, row, member_dir,
@@ -361,9 +306,9 @@ def run_swarm_stage(args, out_dir, progress=None) -> dict:
         status = str(done.get("status", "ok"))
         status_counts[status] = status_counts.get(status, 0) + 1
         if not member_done(member_dir):
-            missing_members.append(member_id)
+            missing_in_range.append(member_id)
         elif status != "ok":
-            failed_members.append(member_id)
+            failed_in_range.append(member_id)
 
         print(
             f"member {member_id:04d}/{len(rows):04d} cell {row['cell_id']} seed {row['seed_id']} "
@@ -381,9 +326,9 @@ def run_swarm_stage(args, out_dir, progress=None) -> dict:
         "round": round_index,
         "n_members": len(rows),
         "n_run": n_run,
-        "failed_members": failed_members,
+        "failed_in_range": failed_in_range,
         "n_skipped_resume": n_skipped_resume,
         "status_counts": status_counts,
-        "missing_members": missing_members,
+        "missing_in_range": missing_in_range,
         "plan_meta": meta,
     }
