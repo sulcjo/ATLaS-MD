@@ -53,3 +53,38 @@ def test_swarm_all_flags_are_known_config_dests():
     }
     missing = expected - known
     assert not missing, f"missing argparse dests: {sorted(missing)}"
+
+
+def test_helptext_has_a_swarm_stage_section():
+    """Task 11's helptext section 18 renders as a real, jumpable encyclopedia topic.
+    Matched by title text with a "<some number>." prefix, not a pinned literal number
+    (gareus.helptext._parse_encyclopedia assigns topic numbers sequentially at render
+    time from whatever headings are present, immune to unrelated heading edits -- see
+    test_package_smoke.py's test_python_m_gareus_heavy_help for the same convention)."""
+    import re
+    from gareus.cli import build_gareus_parser
+    from gareus.helptext import heavy_help_text
+    text = heavy_help_text(build_gareus_parser())
+    assert re.search(r"\d+\.\s+Unbiased swarm stage \(S0/S1\)", text)
+    assert "--windows-2d-csv swarm/analysis/windows_lambda_ladder.csv" in text
+    assert "--seed-conformers-dir swarm/analysis/seed_bank" in text
+    assert "--shared-gamd-setup-dir swarm/analysis/shared_gamd_setup" in text
+    assert "No native reference or folded-state label is used anywhere in this stage." in text
+    # gates + extension rule
+    for gate_name in ("coverage", "envelope_stability", "ladder_ess", "graft"):
+        assert gate_name in text
+    # pilot comparison tolerance
+    assert "<= 25%" in text
+    assert "[0.7, 1.4]" in text
+
+
+def test_helptext_swarm_section_topic_lookup_renders_body():
+    """`-hh <topic>` (keyword form) reaches the section body, not just the TOC entry --
+    the controller's binding check ("python -m gareus -hh 18 ... renders it") verified
+    via the keyword form since the encyclopedia's topic *numbers* are position-derived
+    (see test above) and not stable across unrelated heading edits."""
+    from gareus.cli import build_gareus_parser
+    from gareus.helptext import heavy_help_text
+    text = heavy_help_text(build_gareus_parser(), topic="Unbiased swarm stage")
+    assert "ab initio exploration stage" in text
+    assert "frozen Pep-GaMD" in text

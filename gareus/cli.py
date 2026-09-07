@@ -1817,6 +1817,8 @@ def main(argv: Optional[Iterable[str]] = None):
             result = compare_envelopes(out_dir / "swarm" / "analysis" / "shared_gamd_setup" / "shared_gamd_setup_globals.json", Path(pilot))
             write_json(out_dir / "swarm" / "analysis" / "pilot_comparison.json", result)
             _print_keys = ("status", "freeze_allowed", "reasons", "groups")
+        _swarm_manifest_status = "completed" if str(result.get("status", "")) in ("ok", "pass") else "failed"
+        finalize_run_manifest(args, out_dir, status=_swarm_manifest_status)
         print(json.dumps({k: v for k, v in result.items() if k in _print_keys}, indent=2, default=str))
         return
 

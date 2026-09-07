@@ -8,10 +8,13 @@ platform, no PME-context calls on CPU).
 """
 import csv
 import json
+import os
 import pathlib
 import tempfile
 import time
 import types
+
+import pytest
 
 
 def test_run_member_loop_writes_expected_frames_and_seed_pdbs():
@@ -196,3 +199,145 @@ def test_run_loop_recording_failure_returns_success_when_nothing_raises():
     )
     assert result["failed"] is False
     assert result["loop_summary"]["n_frames"] == 2
+
+
+@pytest.mark.slow
+def test_tiny_real_swarm_member_moves_atoms_and_writes_trace_frames_and_done_slow():
+    """Task 11 SLOW e2e: run one real swarm member end to end through ``run_member`` --
+    graft, minimize, thermalize, unbiased Langevin MD, per-frame trace, seed-frame PDBs,
+    ``last_frame.pdb``, ``done.json`` -- on the repo's cached GA-dipeptide-in-TIP3P fixture
+    (``tests/pep_gamd_fixture.py``), CPU platform (no ``getPMEParametersInContext`` call
+    anywhere here -- the Pep-GaMD partition pins PME analytically already).
+
+    The "seed conformer" is a second, genuinely different GA backbone (phi=-120,
+    psi=130 vs the fixture's phi=-60, psi=-45), built and protonated the exact same way
+    the fixture builds its own peptide (build_peptide_pdb -> Modeller.addHydrogens with
+    the same forcefield/pH) so it has the same atom count and per-atom name order and
+    takes graft_conformer_into_context's real "wholesale" code path (Kabsch-align on Ca,
+    overwrite, minimize clashes, re-thermalize) rather than a no-op identity graft --
+    the atom-name-order match is asserted, not assumed. No native reference or
+    folded-state label is used anywhere (ab initio, per global-constraints.md): the two
+    backbones are just two arbitrary (phi, psi) choices, not a folded/native structure.
+
+    Guarded (never runs under the fixture-free fallback runner unless explicitly asked):
+    the repo's ``slow`` marker (pyproject.toml) lets a real pytest deselect this with
+    ``-m "not slow"``; GAREUS_RUN_SLOW=1 is this repo's own opt-in convention (see
+    tests/test_package_smoke.py's ``test_tiny_lambda_ladder_run_completes_end_to_end_slow``
+    for the same pattern) for the fixture-free fallback, which ignores markers entirely.
+    """
+    if os.environ.get("GAREUS_RUN_SLOW") != "1":
+        return
+    import numpy as np
+
+    from pep_gamd_fixture import solvated_dipeptide
+    from gareus.imports import import_openmm
+    from gareus.cv import build_nonlocal_contact_pairs
+    from gareus.swarm.members import run_member, TRACE_COLUMNS
+    from gareus.system_setup import build_peptide_pdb, make_forcefield
+
+    fx = solvated_dipeptide()  # cached: GA dipeptide, 2.4 nm TIP3P box, briefly minimized
+    openmm, app, unit = import_openmm()
+
+    args = types.SimpleNamespace(
+        nonbonded_cutoff_nm=0.9, ewald_error_tolerance=0.0005, hmr=False, hydrogen_mass_amu=0.0,
+        temperature_k=300.0, friction_per_ps=1.0, timestep_fs=2.0, run_mode="cmd", seed=1234,
+        contact_atom_selection="heavy", contact_scheme="residue-balanced", contact_min_sequence_separation=1,
+        contact_r0_a=4.5, contact_beta_a_inv=6.0, contact_normalize=True, contact_pair_warning_threshold=5000,
+        swarm_seed_ns=0.002, swarm_equil_ps=0.4, swarm_output_interval_ps=0.2,
+        swarm_seed_frame_interval_ps=0.4, swarm_graft_minimize_iters=200,
+    )
+    # 2 fs timestep: 0.4 ps equil = 200 discarded steps; 2 ps production at 0.2 ps/frame =
+    # 100 steps/frame x 10 frames; seed-frame export every 0.4 ps = every 2nd frame.
+    # 200 minimize iterations: a genuinely different conformer has real clashes after
+    # grafting into the solvated box, unlike a self-graft's no-op overlap.
+
+    base_system_xml = openmm.XmlSerializer.serialize(fx["system"])  # fresh copy per member, no partition yet
+    platform = openmm.Platform.getPlatformByName("CPU")
+    props = {}
+
+    scratch_integrator = openmm.VerletIntegrator(0.001 * unit.picoseconds)
+    scratch_ctx = openmm.Context(
+        openmm.XmlSerializer.deserialize(base_system_xml), scratch_integrator, platform, props,
+    )
+    scratch_ctx.setPositions(fx["positions"])
+    equil_state = scratch_ctx.getState(getPositions=True)
+    del scratch_ctx, scratch_integrator
+
+    pep_idx = list(fx["peptide"])  # ascending atom indices, same order run_member's graft expects
+
+    # A second, differently-folded GA conformer (phi=-120, psi=130 vs the fixture's
+    # phi=-60, psi=-45) built and protonated the exact same way the fixture builds its own
+    # peptide, so the "wholesale" graft path (same atom count, no name map) is real, not
+    # a self-graft identity no-op. No native reference or folded-state label -- both
+    # backbones are arbitrary (phi, psi) choices.
+    seed_dir = pathlib.Path(tempfile.mkdtemp())
+    seed_pdb_path = build_peptide_pdb("GA", seed_dir / "seed.pdb", phi_deg=-120.0, psi_deg=130.0)
+    seed_raw = app.PDBFile(str(seed_pdb_path))
+    ff = make_forcefield(app, "tip3p")
+    seed_modeller = app.Modeller(seed_raw.topology, seed_raw.positions)
+    seed_modeller.addHydrogens(ff, pH=7.0)
+
+    fixture_pep_names = [a.name for a in fx["topology"].atoms() if a.index in set(pep_idx)]
+    seed_names = [a.name for a in seed_modeller.topology.atoms()]
+    assert seed_names == fixture_pep_names, (
+        "seed conformer atom names/order do not match the real topology's peptide atoms "
+        "-- the wholesale graft path (same atom count, no index map) requires this"
+    )
+
+    seed_pos_nm = np.asarray(seed_modeller.positions.value_in_unit(unit.nanometer))
+    conformer = {"positions_nm": seed_pos_nm, "pdb_path": str(seed_pdb_path)}
+
+    contact_pairs = build_nonlocal_contact_pairs(fx["topology"], args)
+
+    tmp = pathlib.Path(tempfile.mkdtemp())
+    member_dir = tmp / "member_0000"
+
+    t0 = time.time()
+    done = run_member(
+        args, {"velocity_seed": 777, "member_id": 0}, member_dir,
+        openmm=openmm, app=app, unit=unit, topology=fx["topology"], base_system_xml=base_system_xml,
+        equil_state=equil_state, conformer=conformer, platform=platform, props=props,
+        contact_pairs=contact_pairs, progress=None,
+    )
+    wall_s = time.time() - t0
+    print(f"test_tiny_real_swarm_member ... wall_s={wall_s:.1f}")
+    assert wall_s < 120.0
+
+    assert done["status"] == "ok", done
+    assert (member_dir / "done.json").exists()
+    reloaded_done = json.loads((member_dir / "done.json").read_text())
+    assert reloaded_done["status"] == "ok"
+
+    # The graft actually did something (a real wholesale graft, not a no-op self-graft).
+    graft = done["graft"]
+    assert graft["graft_mode"] == "wholesale"
+    assert graft["n_grafted_atoms"] == len(pep_idx)
+    assert np.isfinite(graft["ca_rmsd_A"])
+
+    trace_rows = list(csv.DictReader((member_dir / "trace.csv").open()))
+    assert trace_rows, "trace.csv has no rows"
+    assert list(trace_rows[0].keys()) == TRACE_COLUMNS
+    for row in trace_rows:
+        assert np.isfinite(float(row["v_pep_kj"]))
+        assert np.isfinite(float(row["v_dih_kj"]))
+
+    frame_files = sorted((member_dir / "frames").glob("frame_*.pdb"))
+    assert frame_files, "no seed-frame PDBs were written"
+    last_frame_path = member_dir / "last_frame.pdb"
+    assert last_frame_path.exists()
+
+    def _positions_nm(pdb_path):
+        return np.asarray(
+            app.PDBFile(str(pdb_path)).getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+        )
+
+    # frames/frame_*.pdb are peptide-only (write_solute_only_pdb); last_frame.pdb is the
+    # full system (write_state_pdb, peptide + water) -- restrict it to the same peptide
+    # atoms (ascending, same order as the solute-only PDBs) for a like-for-like compare.
+    first_positions = _positions_nm(frame_files[0])
+    last_positions_full = _positions_nm(last_frame_path)
+    last_positions = last_positions_full[pep_idx, :]
+    assert first_positions.shape == last_positions.shape
+    assert not np.allclose(first_positions, last_positions, atol=1e-6), (
+        "atoms did not move between the first written frame and the last frame"
+    )
