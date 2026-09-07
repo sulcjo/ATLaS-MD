@@ -772,9 +772,15 @@ def _check_ladder_crosscheck(s: dict) -> dict:
     tol = _num(lcc.get("tolerance_kcal"))
     nbins = lcc.get("n_bins_compared")
     if status == "fail":
-        detail = (f"λ=0-only PMF disagrees with the full-ladder PMF by {diff:.3f} kcal/mol "
-                  f"(tolerance {tol:.3f})" if diff is not None and tol is not None
-                  else "λ=0-only PMF disagrees with the full-ladder PMF")
+        if diff is not None and tol is not None:
+            detail = (f"λ=0-only PMF disagrees with the full-ladder PMF by {diff:.3f} kcal/mol "
+                      f"(tolerance {tol:.3f})")
+        else:
+            # A "fail" with no max_abs_diff_kcal is the CONTRADICTION case (see
+            # crosscheck.ladder_crosscheck): no comparison was made at all, so
+            # do not claim the two PMFs disagreed -- report what happened.
+            detail = lcc.get("reason") or ("λ-ladder asserted but the per-state λ is unavailable "
+                                           "-- cross-check impossible")
         return {"name": name, "status": FAIL, "detail": detail}
     if status == "pass":
         detail = (f"agrees within {diff:.3f} kcal/mol (tolerance {tol:.3f}"

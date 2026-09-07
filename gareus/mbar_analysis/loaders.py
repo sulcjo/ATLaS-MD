@@ -424,13 +424,17 @@ def load_csv(prod: Path, load_notes: Optional[list[str]] = None) -> Data:
     if centers.size==0: centers=np.arange(u.shape[1],dtype=float)
     if ks.size==0: ks=np.full(u.shape[1],np.nan)
     meta['umbrella_window_rows']=rows
-    # Per-state (per-window) λ, derived from the per-sample gamd_lambda column
-    # by grouping on the sample's own window index -- umbrella_windows.csv (the
-    # `rows` above) does not itself carry gamd_lambda, mirroring load_parquet's
-    # windows/<segment>.json gap. Every replica sampling a given window under
-    # an active ladder is assigned that window's own fixed rung, so nanmedian
-    # per group is a robust reduction; a window with no finite samples (or no
-    # samples at all) defaults to 0.0, the documented "ladder inactive" value.
+    # Per-state (per-window) λ. PREFERRED source: umbrella_windows.csv's own
+    # gamd_lambda column (the `rows` above), which window_assignment_rows has
+    # written since the ladder landed. FALLBACK, for window tables predating
+    # that column only: derive it from the per-sample gamd_lambda column by
+    # grouping on the sample's own window index -- every replica sampling a
+    # given window under an active ladder is assigned that window's own fixed
+    # rung, so nanmedian per group is a robust reduction, but a window with no
+    # finite samples (or no samples at all) reads 0.0, the documented "ladder
+    # inactive" value, which is exactly why the written column wins when there
+    # is one. Which source was used is recorded in
+    # meta['gamd_ladder_state_lambda_source'].
     K=int(u.shape[1])
     state_lambdas=np.zeros(K,dtype=np.float64)
     _row_lams=[r.get('gamd_lambda') for r in rows] if len(rows)==K else []

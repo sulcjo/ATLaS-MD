@@ -139,13 +139,18 @@ def ladder_crosscheck(d: Any, f_k_global: np.ndarray, bins, kbt_kcal: float,
     # _check_ladder_crosscheck dispatches on the three literals and grades
     # anything else -- 'skipped' included -- NA, which does not move `overall`.
     if bool((getattr(d, "meta", None) or {}).get("gamd_ladder")) and not np.any(lambdas > 0.0):
+        # No comparison is made, so nothing that describes one is reported:
+        # no max_abs_diff_kcal, no PMFs, and n_lambda0_samples 0 -- the λ=0
+        # population is UNKNOWN here (which states are λ=0 is precisely what
+        # was lost), not "all of them".
         return {
             "status": "fail",
-            "reason": ("meta['gamd_ladder'] is asserted but state_lambdas carries no λ > 0 "
-                       f"({'absent' if getattr(d, 'state_lambdas', None) is None else 'all zero'}) -- "
-                       "the loader lost the per-state ladder rungs, so the λ=0-only subset would be "
-                       "the whole population and the cross-check would be vacuous"),
-            "n_lambda0_samples": int(np.asarray(d.window).size),
+            "reason": ("λ-ladder asserted (meta['gamd_ladder']) but the per-state λ is "
+                       f"unavailable: state_lambdas is "
+                       f"{'absent' if getattr(d, 'state_lambdas', None) is None else 'all zero'}. "
+                       "The loader lost the per-state ladder rungs, so the λ=0 population cannot "
+                       "be identified and the cross-check is impossible -- not passed, not skipped"),
+            "n_lambda0_samples": 0,
             "tolerance_kcal": tol_kcal,
             "tolerance_source": "fixed_default",
             "n_bins_compared": 0,

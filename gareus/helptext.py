@@ -237,6 +237,13 @@ Post-hoc analysis
     samples = load_samples(run_dir)           # dict of numpy arrays
     windows = load_windows(run_dir)           # list of window dicts
     nk = reconstruct_bias_matrix(samples['cv1'], samples['cv2'], windows, beta)
+    # On a lambda-ladder run (any window with gamd_lambda > 0) this call REFUSES
+    # to reconstruct without the raw channel energies and the frozen envelope:
+    #   from gareus.mbar_analysis.ladder import load_pep_gamd_envelope
+    #   nk = reconstruct_bias_matrix(samples['cv1'], samples['cv2'], windows, beta,
+    #                                v_pep=samples['v_pep_kj_mol'],
+    #                                v_dih=samples['v_dih_kj_mol'],
+    #                                envelope=load_pep_gamd_envelope(run_dir))
 
 Inter-epoch tICA secondary-CV update (YAML)
 --------------------------------------------
@@ -989,6 +996,13 @@ Multi-restart runs are queried across all segments transparently:
     samples = load_samples(run_dir)           # unions all seg_001, seg_002, ...
     windows = load_windows(run_dir)           # latest segment window set
     nk = reconstruct_bias_matrix(samples['cv1'], samples['cv2'], windows, beta)
+    # On a lambda-ladder run (any window with gamd_lambda > 0) this call REFUSES
+    # to reconstruct without the raw channel energies and the frozen envelope:
+    #   from gareus.mbar_analysis.ladder import load_pep_gamd_envelope
+    #   nk = reconstruct_bias_matrix(samples['cv1'], samples['cv2'], windows, beta,
+    #                                v_pep=samples['v_pep_kj_mol'],
+    #                                v_dih=samples['v_dih_kj_mol'],
+    #                                envelope=load_pep_gamd_envelope(run_dir))
 
 0.16 Potential-energy handling and later decomposition
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

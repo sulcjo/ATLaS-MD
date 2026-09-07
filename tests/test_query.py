@@ -430,3 +430,110 @@ def test_validate_readiness_no_npz_error_when_parquet_present(tmp_path):
     npz_errors = [e for e in result.get("errors", []) if "analysis_arrays.npz missing" in e]
     assert npz_errors == [], f"Got unexpected NPZ errors: {npz_errors}"
     assert result.get("n_samples", 0) == 40
+
+
+# --- export_analysis_arrays_npz: lambda-ladder envelope resolution ----------
+# Regression pair for the collateral defect the fix wave introduced and then
+# fixed: the envelope must be resolved ONLY when the loaded snapshot actually
+# carries a lambda>0 window.
+
+def _ladder_globals_payload(env):
+    return {"all_globals": {
+        "Vmax_Total": env.vmax_total, "Vmin_Total": env.vmin_total,
+        "threshold_energy_Total": env.threshold_total, "k0_Total": env.k0max_total,
+        "Vmax_Dihedral": env.vmax_dih, "Vmin_Dihedral": env.vmin_dih,
+        "threshold_energy_Dihedral": env.threshold_dih, "k0_Dihedral": env.k0max_dih}}
+
+
+def _write_ladder_segment(prod, lambdas, with_globals):
+    """Parquet run whose window snapshot carries `lambdas` and whose samples
+    carry real v_pep/v_dih. `with_globals` is the JSON payload to write as
+    shared_gamd_setup_globals.json, or None to write no file at all."""
+    from gareus.store import ParquetSampleWriter, SegmentRegistry, WindowSnapshot
+
+    prod.mkdir(parents=True, exist_ok=True)
+    windows = [{"window_id": i, "center1": 5.0, "k1": 10.0, "gamd_lambda": float(lam)}
+               for i, lam in enumerate(lambdas)]
+    reg = SegmentRegistry(prod)
+    seg_id = reg.open_segment("run_001", None, 1)
+    WindowSnapshot(prod).snapshot(seg_id, windows, cv1_type="distance", cv2_type=None)
+
+    writer = ParquetSampleWriter(prod / "samples" / seg_id, flush_rows=1000)
+    for i in range(6):
+        writer.write_sample(i * 10, 0, i % len(windows), 5.0 + 0.01 * i, None,
+                            -100.0, 1.0, 0.6, 0.4,
+                            v_pep=10.0 + i, v_dih=3.0 + 0.5 * i,
+                            gamd_lambda=float(lambdas[i % len(lambdas)]))
+    writer.close()
+    reg.close_segment(seg_id, end_step=60)
+    (prod / "run_args.json").write_text(json.dumps({"temperature_k": 300.0}))
+    if with_globals is not None:
+        (prod / "shared_gamd_setup_globals.json").write_text(json.dumps(with_globals))
+    return windows
+
+
+def test_export_npz_non_gamd_run_with_empty_globals_still_exports(tmp_path):
+    """A GaMD-DISABLED run still writes shared_gamd_setup_globals.json, with
+    an EMPTY "all_globals" dict (gareus/production.py's disabled-run writer),
+    and PepGamdEnvelope.from_json raises KeyError when no nested dict holds
+    k0_Total. Resolving the envelope unconditionally therefore broke every
+    plain non-GaMD parquet run -- and gareus/analysis.py wraps this call in
+    `except Exception: pass`, so the auto-generation path degraded silently to
+    'analysis_arrays.npz still absent'."""
+    from gareus.query import export_analysis_arrays_npz
+
+    prod = tmp_path / "final_production"
+    _write_ladder_segment(prod, [0.0, 0.0], with_globals={
+        "mode": "disabled_cmd", "all_globals": {}, "interesting_globals": {}})
+
+    beta = 1.0 / (8.314462618e-3 * 300.0)
+    out = export_analysis_arrays_npz(prod, beta)
+    assert out.exists()
+    with np.load(out, allow_pickle=False) as data:
+        nk = np.asarray(data["umbrella_reduced_bias_nk"], dtype=float)
+    assert nk.shape[1] == 2
+    # Both windows share centre/k and neither carries a rung, so the two
+    # columns are the pure-umbrella bias and identical.
+    assert np.allclose(nk[:, 0], nk[:, 1])
+
+
+def test_export_npz_ladder_run_applies_the_boost(tmp_path):
+    """The other half: with a real lambda>0 rung and a valid envelope, the
+    boost must actually be applied -- the guard must not have turned into
+    'never resolve the envelope'."""
+    from gareus.query import export_analysis_arrays_npz
+    from gareus.pep_gamd import PepGamdEnvelope, pep_gamd_boost_kj
+
+    env = PepGamdEnvelope(50.0, -50.0, 50.0, 0.8, 50.0, -50.0, 50.0, 0.6)
+    prod = tmp_path / "final_production"
+    _write_ladder_segment(prod, [0.0, 1.0], with_globals=_ladder_globals_payload(env))
+
+    beta = 1.0 / (8.314462618e-3 * 300.0)
+    out = export_analysis_arrays_npz(prod, beta)
+    with np.load(out, allow_pickle=False) as data:
+        nk = np.asarray(data["umbrella_reduced_bias_nk"], dtype=float)
+
+    v_pep = np.array([10.0 + i for i in range(nk.shape[0])])
+    v_dih = np.array([3.0 + 0.5 * i for i in range(nk.shape[0])])
+    expected = np.array([beta * pep_gamd_boost_kj(vp, vd, 1.0, env)
+                         for vp, vd in zip(v_pep, v_dih)])
+    assert np.any(expected > 0.0), expected
+    assert np.allclose(nk[:, 1] - nk[:, 0], expected), (nk[:, 1] - nk[:, 0], expected)
+
+
+def test_export_npz_ladder_run_without_an_envelope_still_raises(tmp_path):
+    """The guard must NOT have become a bare try/except: on a real ladder run
+    a missing envelope has to surface, not silently produce an umbrella-only
+    matrix."""
+    from gareus.query import export_analysis_arrays_npz
+
+    prod = tmp_path / "final_production"
+    _write_ladder_segment(prod, [0.0, 1.0], with_globals=None)
+
+    beta = 1.0 / (8.314462618e-3 * 300.0)
+    try:
+        export_analysis_arrays_npz(prod, beta)
+    except ValueError as exc:
+        assert "v_pep" in str(exc) or "envelope" in str(exc), str(exc)
+    else:
+        raise AssertionError("a lambda>0 run with no envelope must not export silently")

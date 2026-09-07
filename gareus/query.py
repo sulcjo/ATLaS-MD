@@ -456,8 +456,25 @@ def export_analysis_arrays_npz(
 
     v_pep_all = _energy_col("v_pep_kj_mol")
     v_dih_all = _energy_col("v_dih_kj_mol")
-    from .mbar_analysis.ladder import load_pep_gamd_envelope
-    envelope = load_pep_gamd_envelope(run_dir)
+
+    # Resolve the envelope ONLY when the snapshot actually carries a rung,
+    # mirroring every other call site. A GaMD-DISABLED run still writes
+    # shared_gamd_setup_globals.json, with "all_globals": {} (production.py's
+    # disabled-run writer), and PepGamdEnvelope.from_json raises KeyError when
+    # no nested dict holds k0_Total -- so resolving unconditionally broke every
+    # plain non-GaMD parquet run. Deliberately NOT a bare try/except: on a real
+    # ladder run a missing/degenerate envelope must still surface, and
+    # gareus/analysis.py wraps this whole call in `except Exception: pass`, so
+    # anything swallowed here degrades silently to "analysis_arrays.npz absent".
+    _envelope_cache: list = []
+
+    def _envelope_for(windows):
+        if not any(float(w.get("gamd_lambda", 0.0) or 0.0) > 0.0 for w in windows):
+            return None
+        if not _envelope_cache:
+            from .mbar_analysis.ladder import load_pep_gamd_envelope
+            _envelope_cache.append(load_pep_gamd_envelope(run_dir))
+        return _envelope_cache[0]
 
     seg_raw = samples.get("segment_id")
     if seg_raw is not None:
@@ -482,14 +499,15 @@ def export_analysis_arrays_npz(
                 cv_A[mask], cv2[mask] if cv2 is not None else None, seg_windows, beta,
                 v_pep=v_pep_all[mask] if v_pep_all is not None else None,
                 v_dih=v_dih_all[mask] if v_dih_all is not None else None,
-                envelope=envelope)
+                envelope=_envelope_for(seg_windows))
         windows = first_windows
     else:
         windows = load_windows(run_dir)
         if not windows:
             raise ValueError(f"No window snapshot found in {run_dir}/windows/")
         nk = reconstruct_bias_matrix(cv_A, cv2, windows, beta,
-                                     v_pep=v_pep_all, v_dih=v_dih_all, envelope=envelope)
+                                     v_pep=v_pep_all, v_dih=v_dih_all,
+                                     envelope=_envelope_for(windows))
 
     save_kwargs: dict = {
         "cv_A": cv_A,
