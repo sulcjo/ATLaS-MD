@@ -94,11 +94,21 @@ def apply_ladder_boost_to_u(
       guard falls through to 0.0) -- in every state column with
       ``gamd_lambda > 0``. This is exclusion-by-propagation, the same
       convention ``gareus.query.reconstruct_bias_matrix``'s docstring
-      describes for a missing ``cv2`` under a secondary-restrained window;
-      ``clean()`` (``gareus/mbar_analysis/data.py``) then drops those
-      (sample, state) rows for the affected states downstream.
+      describes for a missing ``cv2`` under a secondary-restrained window.
+
+      Because ``u_nk`` is a dense matrix (no ragged per-state exclusion is
+      representable), ``clean()`` (``gareus/mbar_analysis/data.py``, which
+      masks on ``np.all(np.isfinite(d.u_nk), axis=1)``) does not merely drop
+      the affected states for that sample -- it drops the WHOLE sample from
+      the MBAR solve, from every state including any ``gamd_lambda == 0``
+      one. This is weight-correct (``window``/``u_nk`` are sliced together,
+      and every solver recomputes ``n_k`` from the post-``clean`` ``window``
+      array via ``np.bincount``), just coarser than per-state exclusion:
+      a sample that lacked raw energies contributes to the solve nowhere at
+      all, not only at the rungs it couldn't be reweighted to.
       ``meta["gamd_ladder_samples_without_raw_energies"]`` records how many
-      samples were affected.
+      samples were affected -- equivalently, how many samples this eventually
+      costs the solve once ``clean()`` runs.
     """
     state_lambdas = np.asarray(state_lambdas, dtype=np.float64)
     lam_active = state_lambdas > 0.0
