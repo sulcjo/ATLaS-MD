@@ -846,6 +846,50 @@ def _validate_gamd_args(args: argparse.Namespace) -> None:
         )
 
 
+_GAMD_STAGE_STEP_ATTRS = (
+    "gamd_cmd_steps",
+    "gamd_equil_steps",
+    "gamd_multiwindow_recon_cmd_steps",
+    "gamd_multiwindow_recon_steps",
+)
+
+
+def validate_gamd_stage_multiples(args: argparse.Namespace) -> None:
+    """Reject stage lengths gamd-openmm will refuse, before any MD is run.
+
+    gamd-openmm's stage integrator raises ``ntcmd must be greater than and a
+    multiple of ntave`` (and the same for ``nteb``) only when the integrator is
+    built -- after system build, seeding and the umbrella pull.  Every GaMD
+    stage length here (initial cMD, equilibration, and the recon cMD/boosted
+    stages that build their own integrators) must be >= the averaging window
+    and a multiple of it.  A stage of 0 steps is disabled and skipped.
+    """
+    ntave = int(getattr(args, "gamd_averaging_window", 0) or 0)
+    if ntave <= 0:
+        raise ValueError(f"gamd_averaging_window must be a positive integer (got {ntave}).")
+    for attr in _GAMD_STAGE_STEP_ATTRS:
+        steps = int(getattr(args, attr, 0) or 0)
+        if steps == 0:
+            continue
+        if steps < ntave or steps % ntave != 0:
+            raise ValueError(
+                f"{attr}={steps} must be >= and a multiple of gamd_averaging_window={ntave} "
+                "(gamd-openmm: 'ntcmd must be greater than and a multiple of ntave'). "
+                f"Choose an averaging window that divides every GaMD stage, e.g. {attr}={steps} "
+                f"with gamd_averaging_window={_largest_common_window(args)}."
+            )
+
+
+def _largest_common_window(args: argparse.Namespace) -> int:
+    import math
+    g = 0
+    for attr in _GAMD_STAGE_STEP_ATTRS:
+        steps = int(getattr(args, attr, 0) or 0)
+        if steps > 0:
+            g = math.gcd(g, steps)
+    return g or int(getattr(args, "gamd_averaging_window", 0) or 0)
+
+
 def _shim_cv(args: argparse.Namespace) -> None:
     """CV2 (secondary CV) schema-v2 -> legacy attr names."""
     args.secondary_cv = args.cv2
@@ -1334,6 +1378,7 @@ def parse_args(argv: Optional[Iterable[str]] = None):
     args.contact_scheme = contact_scheme(args)
     _validate_contact_args(args)
     _validate_gamd_args(args)
+    validate_gamd_stage_multiples(args)
 
     return args
 
