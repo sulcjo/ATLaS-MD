@@ -30,6 +30,28 @@ from .store import SegmentRegistry
 from .units import KJ_PER_KCAL
 
 
+def _missing_column_placeholder(reference, length: int):
+    """Build a fully-masked stand-in for a column absent from one segment.
+
+    A production campaign can span a schema change (e.g. a new sample column
+    added mid-campaign, such as v_pep_kj_mol/gamd_lambda) -- an older segment's
+    Parquet files simply lack the column, so it is absent from that segment's
+    dict entirely (not merely null-valued). Masked here rather than fabricating
+    a real-looking value (0, "", etc.), mirroring how DuckDB itself represents
+    a real SQL NULL and how downstream consumers already expect to unmask it
+    (see gareus/mbar_analysis/data.py's _fill_masked_nan).
+    """
+    ref = np.ma.asarray(reference)
+    dtype = ref.dtype
+    if np.issubdtype(dtype, np.floating):
+        data = np.full(length, np.nan, dtype=dtype)
+    elif np.issubdtype(dtype, np.integer) or np.issubdtype(dtype, np.bool_):
+        data = np.zeros(length, dtype=dtype)
+    else:
+        data = np.full(length, None, dtype=object)
+    return np.ma.array(data, mask=np.ones(length, dtype=bool))
+
+
 def _concat_numpy_dicts(results: list) -> dict:
     """Concatenate a list of numpy column-dicts into one, sorted by (step, replica).
 
@@ -46,14 +68,52 @@ def _concat_numpy_dicts(results: list) -> dict:
     actually returned as masked; plain columns keep the cheaper np.concatenate
     (avoids allocating a mask array for step/window_id/replica/segment_id on
     the multi-million-row hot path).
+
+    The key set is the UNION of keys across all segments, not just the first
+    segment's keys: a campaign resumed across a schema change (a new sample
+    column, e.g. the lambda-ladder's v_pep_kj_mol/v_dih_kj_mol/gamd_lambda)
+    mixes older segments that lack the column with newer ones that have it.
+    Taking only results[0]'s keys either silently dropped the new column
+    (older-segment-first, the typical oldest-first order out of segments.json)
+    or crashed with a bare KeyError (newer-segment-first) -- neither is
+    acceptable. A segment missing a key present elsewhere gets a fully-masked
+    placeholder of its own length instead, so the column is present end-to-end
+    and every row from the segment that lacks it reads as NaN/null, never a
+    fabricated real value.
     """
     non_empty = [r for r in results if r and "step" in r and len(r["step"]) > 0]
     if not non_empty:
         return {}
-    keys = list(non_empty[0].keys())
+
+    # Every column actually present in a segment must share that segment's
+    # sample count (the 'step' column's length) -- a mismatch means a real
+    # write/read bug produced ragged columns within one segment, which must
+    # fail loudly rather than propagate into a corrupted concatenation.
+    for r in non_empty:
+        seg_len = len(r["step"])
+        for k, v in r.items():
+            if len(v) != seg_len:
+                raise ValueError(
+                    f"segment column {k!r} has length {len(v)}, expected {seg_len} "
+                    "(inferred from 'step'); ragged columns within one segment"
+                )
+
+    keys: list = []
+    seen: set = set()
+    first_col_for_key: dict = {}
+    for r in non_empty:
+        for k, v in r.items():
+            if k not in seen:
+                seen.add(k)
+                keys.append(k)
+                first_col_for_key[k] = v
+
     combined = {}
     for k in keys:
-        cols = [r[k] for r in non_empty]
+        cols = [
+            r[k] if k in r else _missing_column_placeholder(first_col_for_key[k], len(r["step"]))
+            for r in non_empty
+        ]
         if any(np.ma.isMaskedArray(c) for c in cols):
             combined[k] = np.ma.concatenate(cols)
         else:
