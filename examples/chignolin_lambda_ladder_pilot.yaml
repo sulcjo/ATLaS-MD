@@ -1,0 +1,134 @@
+schema_version: '1.0'
+description: >-
+  Chignolin (GYDPETGTWG) lambda-ladder pilot: 1 CV1 (contacts) window
+  replicated at 5 Pep-GaMD boost strengths (gamd_lambda in
+  {0.0, 0.1, 0.25, 0.5, 1.0}), a small real-scale exercise of the
+  (window, rung) state grid described in `gareus -hh` section 13 before
+  committing to a full multi-window ladder campaign.
+
+  Run with:  gareus --config examples/chignolin_lambda_ladder_pilot.yaml
+
+# ---------------------------------------------------------------------------
+# Why this file exists
+#
+# Tasks 1-9 built the full lambda-ladder chain (gamd_lambda column on the
+# explicit window table -> per-state lambda -> per-rung k0 globals ->
+# boosted exchange bias matrix -> per-sample v_pep/v_dih/gamd_lambda ->
+# MBAR ladder term -> lambda=0-only vs full-ladder PMF cross-check ->
+# provenance/--resume reload) but nothing had yet run the whole chain in one
+# process. This config is the first real (non-toy) exercise of that chain:
+# one umbrella window (a single contacts CV1 center) replicated across the
+# rung dimension only, so exchange walks 5 states that differ ONLY in boost
+# strength -- the simplest non-degenerate ladder.
+#
+# Explicit window table: examples/chignolin_lambda_ladder_pilot_windows.csv
+#   window,primary_cv_mode,primary_cv_center,primary_cv_k_kcal,gamd_lambda
+#   0,contacts,0.25,800,0.0
+#   1,contacts,0.25,800,0.1
+#   2,contacts,0.25,800,0.25
+#   3,contacts,0.25,800,0.5
+#   4,contacts,0.25,800,1.0
+#
+# `--windows-2d-csv` (here: `windows.windows_2d_csv`) is consumed unconditionally
+# whenever it is set, independent of `--window-mode` (gareus/production.py,
+# the `if getattr(args, "windows_2d_csv", None):` branch runs for every
+# window_mode except the adaptive-feedback/adaptive-production/double-adaptive
+# drivers, which never reach this file at all -- see gareus/cli.py's
+# window_mode dispatch). `window_mode: manual` below is set for clarity, not
+# because the explicit-CSV branch requires it.
+#
+# `contact_adaptive_max_k_kcal` (an internal attribute, not a real argparse
+# destination -- see gareus/cli.py's `_shim_cv1_legacy_names`) is derived from
+# the schema-v2 `cv1_k_max` and set to 1200 below. It has NO effect on this
+# particular run: every row of the explicit window table supplies its own
+# primary_cv_k_kcal (800), and that adaptive ceiling is only read by
+# choose_windows()'s adaptive contact-k assignment and by Delaunay placement,
+# neither of which runs on the explicit-2D-CSV path. Kept here anyway per the
+# task brief, as a documented ceiling for anyone who edits the CSV later to
+# omit k on a new row.
+#
+# `contact_atom_selection: heavy` is already the CLI default; set explicitly
+# here for self-documentation.
+#
+# All calibration/pull budgets below are pilot-scaled (roughly 10x smaller
+# than a full production campaign such as examples/chignolin_fulltreatment2.yaml)
+# -- this is a plumbing/scale pilot, not yet a publication-quality free energy
+# estimate. production_steps=500000 at timestep_fs=4.0 is 2 ns per replica;
+# with 5 replicas (rungs) that is 10 ns aggregate MD, hence md_budget_ns: 10.0
+# below (informational only for this window_mode -- md_budget_ns only feeds
+# adaptive_production_total_md_pool_ns, read exclusively by the
+# adaptive-production driver, which this manual-window run never enters).
+# ---------------------------------------------------------------------------
+
+sequence:
+  seq: GYDPETGTWG
+
+output:
+  out: chignolin_lambda_ladder_pilot/
+  traj_format: xtc
+  traj_solute_only: true
+  sample_potential_energy: true
+  traj_interval: 2500
+  report_interval: 2500
+  distance_output_interval: 250
+  checkpoint_interval: 25000
+
+platform:
+  platform: CUDA
+  setup_platform: CUDA
+  setup_cpu_threads: 8
+
+simulation:
+  run_mode: hmr-gamd
+  timestep_fs: 4.0
+  nvt_warmup_timestep_fs: 0.5
+  npt_ramp_timestep_fs: 1.0
+  box_shape: dodecahedron
+  padding_nm: 1.0
+  water_model: tip3p
+  ionic_strength_molar: 0.15
+  temperature_k: 300.0
+  production_ensemble: npt
+
+cvs:
+  cv1: contacts
+  cv2: none
+
+contact_cv:
+  contact_atom_selection: heavy
+  # Documented ceiling only; not exercised by this run -- see header comment.
+  cv1_k_max: 1200.0
+
+windows:
+  window_mode: manual
+  windows_2d_csv: examples/chignolin_lambda_ladder_pilot_windows.csv
+
+gamd:
+  gamd_boost_type: pep-gamd-lower-dual
+  production_steps: 500000
+  sigma0p: 6.0
+  sigma0d: 6.0
+  gamd_cmd_steps: 25000
+  equil_steps: 25000
+  gamd_multiwindow_recon_cmd_steps: 5000
+  gamd_multiwindow_recon_steps: 10000
+  gamd_recon_boosted_iters: 2
+  gamd_recon_boosted_tol: 0.05
+  gamd_averaging_window: 2000
+
+exchange:
+  exchange_mode: gibbs-walk
+  exchange_interval: 400
+
+starting_structures:
+  us_pull_ramp_stages: 3
+  us_pull_steps_per_window: 5000
+  us_pull_timestep_fs: 2.0
+  us_pull_k: 50.0
+
+# Total aggregate MD across the 5-rung ladder (2 ns/replica x 5 replicas).
+# Informational only for window_mode: manual -- see header comment.
+md_budget_ns: 10.0
+
+tui:
+  tui_mode: interactive
