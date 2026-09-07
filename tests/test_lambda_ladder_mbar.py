@@ -437,3 +437,94 @@ def test_load_npz_leaves_u_untouched_when_ladder_arrays_absent(tmp_path):
     d = load_npz(tmp_path)
     np.testing.assert_array_equal(d.u_nk, u_umbrella)
     assert 'gamd_ladder' not in d.meta
+
+
+# --- Task 7: lambda=0-only vs full-ladder PMF cross-check -------------------
+# The lambda=0 rungs are plain umbrella sampling; their PMF, computed with the
+# global f_k but only their own samples (subset N_k against the shared f_k --
+# see _subset_logw_from_global_fk), must agree with the full-ladder PMF
+# within error. This is the spec's quoting gate for whether the ladder
+# boost's reweighting is right.
+
+def test_ladder_crosscheck_agrees_when_lambda_zero_samples_are_representative():
+    """Synthetic Data: identical (all-zero) bias in both states, so lambda=0
+    and lambda=1 samples are draws from the same distribution -- the
+    lambda=0-only PMF and the full-ladder PMF must coincide within noise."""
+    from gareus.mbar_analysis.crosscheck import ladder_crosscheck
+    from gareus.mbar_analysis.data import Data
+
+    rng = np.random.default_rng(0)
+    n = 4000
+    cv = rng.normal(0.3, 0.05, n)
+    window = np.repeat([0, 1], n // 2)
+    u_nk = np.zeros((n, 2))
+    beta = 1.0 / 2.494
+    d = Data.__new__(Data)                     # minimal construction -- see data.py:92-117
+    d.cv, d.window, d.u_nk, d.beta = cv, window, u_nk, beta
+    d.state_lambdas = np.array([0.0, 1.0])
+    d.meta = {"gamd_ladder": True}
+    f_k = np.zeros(2)
+
+    out = ladder_crosscheck(d, f_k, bins=20, kbt_kcal=0.596)
+    assert out["status"] == "pass"
+    assert out["max_abs_diff_kcal"] < 0.15
+    assert out["n_lambda0_samples"] == n // 2
+
+
+def test_ladder_crosscheck_skips_without_lambda_zero_states():
+    from gareus.mbar_analysis.crosscheck import ladder_crosscheck
+    from gareus.mbar_analysis.data import Data
+
+    d = Data.__new__(Data)
+    d.cv = np.zeros(10)
+    d.window = np.zeros(10, int)
+    d.u_nk = np.zeros((10, 1))
+    d.beta = 0.4
+    d.state_lambdas = np.array([1.0])
+    d.meta = {"gamd_ladder": True}
+
+    out = ladder_crosscheck(d, np.zeros(1), bins=5, kbt_kcal=0.596)
+    assert out["status"] == "skipped"
+    assert out["n_lambda0_samples"] == 0
+
+
+def test_ladder_crosscheck_fails_when_the_tolerance_is_zero():
+    """Exercises the 'fail' branch directly: the SAME representative data
+    as the 'agrees' test above still has some nonzero counting noise
+    (max_abs_diff_kcal > 0), so an artificially zero tolerance must flip
+    the verdict to 'fail' while leaving every summary key populated."""
+    from gareus.mbar_analysis.crosscheck import ladder_crosscheck
+    from gareus.mbar_analysis.data import Data
+
+    rng = np.random.default_rng(0)
+    n = 4000
+    cv = rng.normal(0.3, 0.05, n)
+    window = np.repeat([0, 1], n // 2)
+    u_nk = np.zeros((n, 2))
+    beta = 1.0 / 2.494
+    d = Data.__new__(Data)
+    d.cv, d.window, d.u_nk, d.beta = cv, window, u_nk, beta
+    d.state_lambdas = np.array([0.0, 1.0])
+    d.meta = {"gamd_ladder": True}
+    f_k = np.zeros(2)
+
+    out = ladder_crosscheck(d, f_k, bins=20, kbt_kcal=0.596, tol_kcal=0.0)
+    assert out["status"] == "fail"
+    assert out["max_abs_diff_kcal"] > 0.0
+    assert out["n_lambda0_samples"] == n // 2
+    assert out["tolerance_kcal"] == 0.0
+    assert out["n_bins_compared"] > 0
+
+
+def test_ladder_crosscheck_failure_warning_is_triaged_critical():
+    """gareus_report.py's _WARN_RULES must classify the exact warning text
+    analyze_gareus_mbar.py emits on a failed cross-check as CRITICAL -- the
+    binding constraint that a 'fail' surfaces as a report warning."""
+    import gareus_report as gr
+
+    groups = gr.classify_warnings([
+        "λ-ladder cross-check FAILED: λ=0-only PMF disagrees with the full-ladder "
+        "PMF by 1.234 kcal/mol (tolerance 0.500), over 2000 λ=0 samples -- the "
+        "ladder boost reweighting embedded in u_nk does not reproduce plain "
+        "umbrella sampling on its own rungs; every PMF from this run is suspect."])
+    assert groups[0]["severity"] == "CRITICAL"

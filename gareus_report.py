@@ -779,6 +779,12 @@ _WARN_RULES: list[tuple[re.Pattern, str]] = [
     # verdict either.
     (re.compile(r"\[stale window map\][^\n]*(Loaded with the STALE map anyway|"
                 r"GAREUS_ALLOW_STALE_WINDOW_MAP is set)", re.I), "CRITICAL"),
+    # The lambda-ladder quoting gate failed: the lambda=0-only PMF (plain
+    # umbrella sampling, reweighted with the shared global f_k) disagrees
+    # with the full-ladder PMF outside tolerance. That is the built-in check
+    # that the ladder boost's MBAR reweighting is right at all -- a failure
+    # here means every PMF from this run may be wrong, not just this one.
+    (re.compile(r"λ-ladder cross-check FAILED", re.I), "CRITICAL"),
     # HIGH: quality concern that biases the PMF
     (re.compile(r"[Ww]eak neighbor CV overlap", re.I), "HIGH"),
     # Mapping-sanity detectors added 2026-08-25 (see
