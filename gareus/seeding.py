@@ -587,6 +587,35 @@ def detect_seed_scoring_degradations(
     return degradations
 
 
+def _resolve_survivor_pdb_path(raw: str, seed_conformers_dir: Path) -> Optional[Path]:
+    """Return the first existing location of a GENPEPT ``survivor_pdb_path``.
+
+    GENPEPT bakes paths at generation time, relative to ITS cwd (the parent of
+    the output directory: ``<out>/final_implicit_survivor_seeds/x.pdb``) or
+    absolute.  Neither survives a different cwd or a moved run tree, so try in
+    order: the path as written; under ``seed_conformers_dir``; under its parent
+    (the GENPEPT cwd); and the tail after the seed-dir name re-rooted under
+    ``seed_conformers_dir`` (moved/renamed trees, absolute or relative).
+    ``None`` when nothing exists.
+    """
+    pdb_path = Path(raw)
+    if not raw:
+        return None
+    seed_dir = Path(seed_conformers_dir)
+    candidates = [pdb_path]
+    if not pdb_path.is_absolute():
+        candidates.append(seed_dir / pdb_path)
+        candidates.append(seed_dir.parent / pdb_path)
+    parts = pdb_path.parts
+    if seed_dir.name in parts:
+        idx = len(parts) - 1 - parts[::-1].index(seed_dir.name)
+        candidates.append(seed_dir.joinpath(*parts[idx + 1 :]))
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def load_genpept_conformer_library(
     seed_conformers_dir: Path,
     cv_atom1: Optional[int] = None,
@@ -637,26 +666,8 @@ def load_genpept_conformer_library(
     library = []
     skipped = 0
     for row in rows:
-        pdb_path = Path(row.get("survivor_pdb_path", ""))
-        if not pdb_path.exists():
-            if pdb_path.is_absolute():
-                # Paths are baked in at GENPEPT-generation time. If the run
-                # tree was since moved/renamed (e.g. RUNS/runs3 -> RUNS/runs_rdy),
-                # the baked path is stale but its tail still starts at the
-                # genpept output directory itself, so re-root the tail under
-                # the current seed_conformers_dir.
-                seed_dir_name = Path(seed_conformers_dir).name
-                parts = pdb_path.parts
-                if seed_dir_name in parts:
-                    idx = len(parts) - 1 - parts[::-1].index(seed_dir_name)
-                    candidate = Path(seed_conformers_dir).joinpath(*parts[idx + 1 :])
-                    if candidate.exists():
-                        pdb_path = candidate
-            else:
-                candidate = Path(seed_conformers_dir) / pdb_path
-                if candidate.exists():
-                    pdb_path = candidate
-        if not pdb_path.exists():
+        pdb_path = _resolve_survivor_pdb_path(row.get("survivor_pdb_path", ""), seed_conformers_dir)
+        if pdb_path is None:
             skipped += 1
             continue
         try:
