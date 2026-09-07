@@ -614,6 +614,64 @@ def _add_output_args(p: argparse.ArgumentParser) -> None:
                    action=argparse.BooleanOptionalAction, default=True)
 
 
+def _add_swarm_args(p: argparse.ArgumentParser) -> None:
+    """Unbiased swarm stage: seed stratification, per-cell replicate MD, envelope/ladder
+    analysis, seed-bank export, and swarm-vs-pilot envelope comparison (gareus/swarm/)."""
+    p.add_argument("--swarm-stage", choices=["off", "run", "analyze", "compare"], default="off",
+                   help="Enter the unbiased swarm stage instead of the production chain. "
+                        "'run' executes (a shard of) one round's members; 'analyze' pools "
+                        "member traces into the envelope/ladder/gates/seed bank; 'compare' "
+                        "checks the frozen swarm envelope against an S3 pilot's globals JSON.")
+    p.add_argument("--swarm-seed-ns", type=float, default=1.0,
+                   help="Unbiased production length per swarm member, in ns (user decision; "
+                        "do not change the default).")
+    p.add_argument("--swarm-replicates-per-cell", type=int, default=3,
+                   help="Velocity replicates per occupied stratification cell (R).")
+    p.add_argument("--swarm-budget-ns", type=float, default=None,
+                   help="When set, derives R = floor(budget / (cells * swarm_seed_ns)) and "
+                        "overrides --swarm-replicates-per-cell (the derivation is printed).")
+    p.add_argument("--swarm-bins", type=str, default="4,3,3",
+                   help="Comma-separated cell counts on heavy-CV1 x Rg x end-to-end distance "
+                        "(quantile edges from the seed library, never a fixed [0,1] grid).")
+    p.add_argument("--swarm-equil-ps", type=float, default=100.0,
+                   help="Discarded-by-construction equilibration per member, in ps.")
+    p.add_argument("--swarm-output-interval-ps", type=float, default=2.0,
+                   help="Per-member trace cadence, in ps (spec section 5).")
+    p.add_argument("--swarm-seed-frame-interval-ps", type=float, default=20.0,
+                   help="PDB frame cadence for seed export, in ps.")
+    p.add_argument("--swarm-member-range", type=str, default=None,
+                   help="'a:b' half-open shard of the round's member list; None = all members.")
+    p.add_argument("--swarm-round", type=int, default=0,
+                   help="Round index; round >= 1 requires --swarm-seed-source production-frames.")
+    p.add_argument("--swarm-seed-source", choices=["genpept", "production-frames"], default="genpept")
+    p.add_argument("--swarm-production-seed-csv", type=Path, default=None,
+                   help="CSV with columns pdb_path,cv1,rg_nm,e2e_nm for later-round seeding.")
+    p.add_argument("--swarm-n-windows", type=int, default=16,
+                   help="Number of CV1 window centres for the lambda ladder.")
+    p.add_argument("--swarm-overlap-sigma", type=float, default=1.5,
+                   help="Window width target = spacing / overlap_sigma.")
+    p.add_argument("--swarm-target-beta-sigma", type=float, default=1.0,
+                   help="Rung acceptance control: target delta-lambda * beta * sigma_V.")
+    p.add_argument("--swarm-min-rungs", type=int, default=3)
+    p.add_argument("--swarm-max-rungs", type=int, default=12)
+    p.add_argument("--swarm-ess-floor", type=int, default=50,
+                   help="Reweighting ESS below which a ladder rung is 'extrapolated'.")
+    p.add_argument("--swarm-seeds-per-window", type=int, default=3)
+    p.add_argument("--swarm-discard-block-frames", type=int, default=25,
+                   help="V-trace block size for the discard detector.")
+    p.add_argument("--swarm-min-discard-ps", type=float, default=0.0,
+                   help="Floor on the pooled discard, in ps.")
+    p.add_argument("--swarm-fsf-floor-warn", type=float, default=0.5,
+                   help="Warn when the top rung's FSF floor (1 - lambda*k0max at Vmin) is "
+                        "below this (S3 attempts 6-7 NaN mechanism).")
+    p.add_argument("--swarm-pilot-globals", type=Path, default=None,
+                   help="Pilot shared_gamd_setup_globals.json for --swarm-stage compare.")
+    p.add_argument("--shared-gamd-setup-dir", type=str, default=None,
+                   help="Reuse a previously calibrated GaMD envelope directory (e.g. the "
+                        "swarm stage's shared_gamd_setup) instead of recalibrating from a "
+                        "short cMD/recon. Read by production.load_reusable_shared_gamd_setup.")
+
+
 def _add_tica_args(p: argparse.ArgumentParser) -> None:
     """Args for inter-epoch tICA CVaux (all default to OFF; only active when tica_obs_interval > 0)."""
     p.add_argument("--tica-obs-interval", type=int, default=0,
@@ -1104,7 +1162,17 @@ def _shim_gamd(args: argparse.Namespace) -> None:
     args.production_safe_chunk_steps = 0
     args.production_nan_diagnostics = True
     args.shared_gamd_copy_strict = False
-    args.shared_gamd_setup_dir = ""
+    # --shared-gamd-setup-dir is a public flag (dest shared_gamd_setup_dir, already
+    # read by production.load_reusable_shared_gamd_setup, and by the
+    # str(getattr(..., "") or "").strip() checks in this module and
+    # adaptive_production.py/adaptive_feedback.py -- all of which treat None and ""
+    # identically). Only default it here when the attribute is genuinely absent (a
+    # hand-built argparse.Namespace predating this flag); a real parse_args() call
+    # always has the attribute (None if not supplied, the string value if it was),
+    # so an explicitly supplied value -- and the parsed-but-unset None -- both
+    # survive this shim untouched.
+    if not hasattr(args, "shared_gamd_setup_dir"):
+        args.shared_gamd_setup_dir = ""
     args.shared_gamd_export_dir = ""
 
 
@@ -1328,6 +1396,7 @@ def build_gareus_parser() -> argparse.ArgumentParser:
     _add_gamd_args(p)
     _add_output_args(p)
     _add_platform_args(p)
+    _add_swarm_args(p)
     _add_tica_args(p)
     return p
 
@@ -1358,6 +1427,7 @@ def parse_args(argv: Optional[Iterable[str]] = None):
     _add_gamd_args(p)
     _add_output_args(p)
     _add_platform_args(p)
+    _add_swarm_args(p)
     _add_tica_args(p)
 
     if pre_args.write_config_template:
@@ -1720,6 +1790,35 @@ def main(argv: Optional[Iterable[str]] = None):
     else:
         write_json(out_dir / "run_args.json", public_args)
     initialize_run_manifest(args, out_dir, argv=argv_list)
+
+    _swarm_stage = str(getattr(args, "swarm_stage", "off") or "off")
+    if _swarm_stage != "off":
+        from gareus.swarm.driver import run_swarm_stage
+        from gareus.swarm.analyze import analyze_swarm_stage
+        from gareus.swarm.compare_pilot import compare_envelopes
+        progress = GuiProgressSink(out_dir, args)
+        if _swarm_stage == "run":
+            result = run_swarm_stage(args, out_dir, progress)
+            _print_keys = ("status", "round", "n_members", "n_run", "n_skipped_resume",
+                           "failed_in_range", "missing_in_range", "status_counts")
+        elif _swarm_stage == "analyze":
+            result = analyze_swarm_stage(out_dir, args)
+            # "reasons" is top-level only on the ladder-design ValueError early-return;
+            # the common gate-fail path nests it under result["gate"]["reasons"] instead
+            # -- surface it either way so a failed run prints something actionable.
+            if "reasons" not in result:
+                result = {**result, "reasons": result.get("gate", {}).get("reasons", [])}
+            _print_keys = ("status", "n_members", "n_ok_members", "missing_members",
+                           "failed_members", "discard_frames", "warnings", "reasons")
+        else:
+            pilot = getattr(args, "swarm_pilot_globals", None)
+            if not pilot:
+                raise SystemExit("--swarm-stage compare needs --swarm-pilot-globals PATH")
+            result = compare_envelopes(out_dir / "swarm" / "analysis" / "shared_gamd_setup" / "shared_gamd_setup_globals.json", Path(pilot))
+            write_json(out_dir / "swarm" / "analysis" / "pilot_comparison.json", result)
+            _print_keys = ("status", "freeze_allowed", "reasons", "groups")
+        print(json.dumps({k: v for k, v in result.items() if k in _print_keys}, indent=2, default=str))
+        return
 
     # Resolve --extend mode BEFORE the dispatch chain so that extend_mode='regular'
     # can set args.resume=True and fall through to the elif resume: branch below.
