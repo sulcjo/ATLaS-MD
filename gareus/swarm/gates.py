@@ -68,6 +68,9 @@ def envelope_stability_gate(
     - sigmav relative difference
     - |Vmax_a - Vmax_b| and |Vmin_a - Vmin_b| in units of pooled sigmav
 
+    A gate that cannot be evaluated (empty half, pooling error) FAILS CLOSED: appends a reason
+    and returns ok=False.
+
     Args:
         traces: Dict[member_id, {"v_pep_kj": array, "v_dih_kj": array}]
         discard: frames to discard before pooling
@@ -88,14 +91,20 @@ def envelope_stability_gate(
         ("Total", (odd_members, even_members)),
         ("Dihedral", (odd_members, even_members)),
     ]:
+        # Check if either half is empty (fail-closed)
         if not odd_traces or not even_traces:
+            reasons.append(
+                f"{grp_name}: cannot evaluate stability (odd half has {len(odd_traces)} members, "
+                f"even half has {len(even_traces)} members)"
+            )
             continue
 
+        # Try to pool both halves (fail-closed on pooling error)
         try:
             env_odd = pool_member_envelopes(odd_traces, discard)[grp_name]
             env_even = pool_member_envelopes(even_traces, discard)[grp_name]
-        except (ValueError, KeyError):
-            # No valid data for this group
+        except (ValueError, KeyError) as exc:
+            reasons.append(f"{grp_name}: pooling failed: {exc}")
             continue
 
         # Compare sigma relative difference
@@ -158,11 +167,11 @@ def ladder_ess_gate(ladder: dict, *, ess_floor: int = 50) -> dict:
 
 
 def graft_gate(done_summaries: list[dict], *, max_fallback_fraction: float = 0.10) -> dict:
-    """Fraction of members with graft_failed status must be < max_fallback_fraction.
+    """Fraction of members with status != "ok" must be <= max_fallback_fraction.
 
     Args:
         done_summaries: list of done.json dicts, each with a "status" field
-        max_fallback_fraction: maximum fraction of members allowed to have failed grafts
+        max_fallback_fraction: maximum fraction of members allowed to fail (graft or MD)
 
     Returns:
         dict with keys "ok" (bool), "reasons" (list of str), and counts: n_graft_failed, n_md_failed, failed_fraction
@@ -181,10 +190,12 @@ def graft_gate(done_summaries: list[dict], *, max_fallback_fraction: float = 0.1
             n_md_failed += 1
 
     failed_fraction = (n_graft_failed + n_md_failed) / n_total if n_total > 0 else 0.0
-    graft_fraction = n_graft_failed / n_total if n_total > 0 else 0.0
 
-    if graft_fraction > max_fallback_fraction:
-        reasons.append(f"graft failure fraction {graft_fraction:.3f} > {max_fallback_fraction:.3f} ({n_graft_failed} out of {n_total})")
+    if failed_fraction > max_fallback_fraction:
+        reasons.append(
+            f"member failure fraction {failed_fraction:.3f} > {max_fallback_fraction:.3f} "
+            f"({n_graft_failed} graft_failed, {n_md_failed} md_failed out of {n_total})"
+        )
 
     ok = len(reasons) == 0
     return {
@@ -254,17 +265,19 @@ def extension_plan(plan_meta: dict, gate: dict) -> dict:
     """Determine how many extra replicates to run based on gate failures.
 
     Rules:
-    - Stability/ESS failure: double R (extra_replicates_per_cell), capped at 4×
+    - Stability/ESS failure: double R (extra_replicates_per_cell)
     - Coverage failure: +1
+    - Cap at 4× base_replicates_per_cell (or 4× current_r if base not present)
 
     Args:
-        plan_meta: dict with key "replicates_per_cell"
+        plan_meta: dict with keys "replicates_per_cell" and optional "base_replicates_per_cell"
         gate: dict returned by evaluate_gates with keys "status", "gates"
 
     Returns:
         dict with keys "extra_replicates_per_cell" (int) and "reason" (str)
     """
     current_r = plan_meta.get("replicates_per_cell", 1)
+    base_r = plan_meta.get("base_replicates_per_cell", current_r)
     gates = gate.get("gates", {})
 
     extra = 0
@@ -284,8 +297,8 @@ def extension_plan(plan_meta: dict, gate: dict) -> dict:
         extra += 1
         reasons.append("coverage failed")
 
-    # Cap at 4× total
-    max_r = 4 * current_r
+    # Cap at 4× base_replicates_per_cell
+    max_r = 4 * int(base_r)
     if current_r + extra > max_r:
         extra = max_r - current_r
 
