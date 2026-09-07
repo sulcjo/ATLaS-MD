@@ -299,3 +299,46 @@ def test_reload_state_gamd_lambdas_is_a_noop_when_not_resuming():
     args = types.SimpleNamespace(resume=False, state_gamd_lambdas=None)
     _reload_state_gamd_lambdas_on_resume(args, d)
     assert args.state_gamd_lambdas is None
+
+
+def test_resume_reload_must_run_before_derive_or_its_fallback_masks_the_manifest():
+    """Review fix (Critical): production.py's real sequence calls
+    _reload_state_gamd_lambdas_on_resume BEFORE _derive_state_gamd_lambdas, never
+    after. _derive_state_gamd_lambdas's own fallback-of-last-resort is
+    [0.0] * n -- a non-empty (hence truthy) list -- so a reload call placed
+    AFTER it always finds args.state_gamd_lambdas already "set" and never reads
+    the manifest at all: that was the shipped (broken) ordering the review
+    caught, since real runs never present the reload with the None/empty value
+    every earlier Part-B unit test used.
+
+    Exercises both orders directly against the two production functions (no
+    fixture, no subagent) to prove the ordering -- not the guard's truthiness
+    check, which must NOT special-case an all-zero list (see the kept negative
+    test above; an explicit all-zero ladder is a legitimate disabled state) --
+    is what makes the difference."""
+    from gareus.production import _reload_state_gamd_lambdas_on_resume, _derive_state_gamd_lambdas
+    d = pathlib.Path(tempfile.mkdtemp())
+    (d / "run_manifest.json").write_text(
+        json.dumps({"method_settings": {"state_gamd_lambdas": [0.0, 0.5, 1.0]}}), encoding="utf-8")
+    window_metadata = {}  # no usable normalized_rows: derive must fall back to `existing`
+    n = 3
+
+    # Old (broken) order: _derive_state_gamd_lambdas first, with no existing
+    # value to fall back on -> its own last-resort fallback, [0.0] * n. THEN
+    # the reload -- whose guard sees that non-empty fallback and (correctly,
+    # per its own contract) leaves it alone. The manifest is never consulted.
+    args_old_order = types.SimpleNamespace(resume=True)
+    args_old_order.state_gamd_lambdas = _derive_state_gamd_lambdas(window_metadata, n, existing=None)
+    assert args_old_order.state_gamd_lambdas == [0.0, 0.0, 0.0]
+    _reload_state_gamd_lambdas_on_resume(args_old_order, d)
+    assert args_old_order.state_gamd_lambdas == [0.0, 0.0, 0.0]  # bug: manifest never read
+
+    # New (fixed) order, as production.py now sequences it: reload first
+    # (args.state_gamd_lambdas is genuinely unset at this point on the
+    # fast-resume/choose_windows paths, so the reload fires), THEN derive,
+    # whose existing= now carries whatever the reload restored.
+    args_new_order = types.SimpleNamespace(resume=True)
+    _reload_state_gamd_lambdas_on_resume(args_new_order, d)
+    args_new_order.state_gamd_lambdas = _derive_state_gamd_lambdas(
+        window_metadata, n, existing=getattr(args_new_order, "state_gamd_lambdas", None))
+    assert args_new_order.state_gamd_lambdas == [0.0, 0.5, 1.0]

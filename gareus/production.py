@@ -1806,7 +1806,7 @@ def _reload_state_gamd_lambdas_on_resume(args, out_dir: Path) -> None:
 
     Controller ruling (Task 2's implementer found this and deferred it to
     Task 9): ``--resume`` never persisted ``args.state_gamd_lambdas`` across a
-    restart on its own. ``_derive_state_gamd_lambdas`` above is only as good
+    restart on its own. ``_derive_state_gamd_lambdas`` below is only as good
     as the window_metadata it is handed on the resumed path, and nothing
     upstream guarantees that still carries a per-row ``gamd_lambda`` after a
     restart (an older run directory, or a checkpoint manifest's
@@ -1821,10 +1821,28 @@ def _reload_state_gamd_lambdas_on_resume(args, out_dir: Path) -> None:
     campaign start (``initialize_run_manifest``) and never overwritten by a
     resume's ``update_run_manifest`` patches.
 
+    CALL ORDER IS LOAD-BEARING: this must run BEFORE ``_derive_state_gamd_lambdas``,
+    never after. A review caught this call sitting after
+    ``_derive_state_gamd_lambdas`` in an earlier revision, which made it dead
+    code on every real run: that function's own fallback-of-last-resort is
+    ``[0.0] * n``, a non-empty (hence truthy) list, so by the time a
+    post-derive reload call inspected ``args.state_gamd_lambdas`` it always
+    looked already-populated and the manifest was never read. Called BEFORE
+    ``_derive_state_gamd_lambdas`` (its real call site, in ``run_gareus``),
+    this only ever observes ``args.state_gamd_lambdas`` in its true
+    pre-derivation state: unset on the fast-resume/choose_windows paths, or
+    already populated straight from the window table on the explicit-2D path
+    (which this function correctly leaves alone) -- either way,
+    ``_derive_state_gamd_lambdas``'s own ``existing=`` parameter then
+    naturally receives whatever this function restored.
+
     A no-op unless ``args.resume`` is set and ``args.state_gamd_lambdas`` is
-    still unset/empty -- an already-populated ladder (from
-    ``_derive_state_gamd_lambdas`` succeeding, or a caller that set it
-    explicitly) is never overridden.
+    still unset/empty at the point it is called -- an already-populated
+    ladder (from an explicit window table, or a caller that set it
+    explicitly) is never overridden. This is a plain truthiness check, not a
+    content check: an all-zero ``args.state_gamd_lambdas`` set by a caller is
+    a legitimate disabled ladder and must never be treated as "unset" and
+    silently replaced.
     """
     if not bool(getattr(args, "resume", False)):
         return
@@ -5385,6 +5403,20 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         "primary_openmm_k_units": primary_openmm_k_units(args),
         "primary_cv_definition": _json_ready(primary_cv_def),
     })
+    # Controller ruling (Task 9, Part B; corrected after review): reload a
+    # frozen ladder from run_manifest.json BEFORE _derive_state_gamd_lambdas
+    # runs, not after. _derive_state_gamd_lambdas's own fallback-of-last-resort
+    # is [0.0] * n -- a non-empty (hence truthy) list -- so calling the reload
+    # afterward meant its unset-guard always saw an already-"set" value and
+    # never actually read the manifest on any real run (the bug a review
+    # caught: the reload was dead code in practice). Placed here, the reload
+    # only ever sees args.state_gamd_lambdas in its true pre-derivation state
+    # (unset on the fast-resume/choose_windows paths; already populated from
+    # the window table on the explicit-2D path, which the reload correctly
+    # leaves alone), so _derive_state_gamd_lambdas's `existing=` below
+    # naturally receives whatever the reload restored.
+    _reload_state_gamd_lambdas_on_resume(args, out_dir)
+
     # Re-derive args.state_gamd_lambdas from the (possibly reachability-filtered
     # and reindexed) normalized_rows rather than trusting the value set right
     # after load_explicit_2d_window_csv: filter_explicit_2d_windows_by_seed_reachability
@@ -5447,14 +5479,6 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     ks_kj_nm2 = np.asarray([primary_k_to_openmm_value(k, args) for k in k_list], dtype=float)
     secondary_cv_ks_kj = np.asarray([kcal_to_kj(k) for k in secondary_cv_k_kcal_list], dtype=float) if secondary_cv_k_kcal_list is not None else None
     nrep = len(centers_nm)
-
-    # Controller ruling (Task 9, Part B): a --resume that could not re-derive
-    # the ladder from window_metadata above must not fall through to a
-    # silent all-λ=0 campaign. Reload from the frozen run_manifest.json
-    # before state_lambdas is derived below (and before any --max-replicas
-    # truncation, so the reloaded ladder is truncated consistently with a
-    # fresh run's).
-    _reload_state_gamd_lambdas_on_resume(args, out_dir)
 
     _max_replicas = int(getattr(args, "max_replicas", 0) or 0)
     if _max_replicas > 0 and nrep > _max_replicas:

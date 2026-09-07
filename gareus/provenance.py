@@ -292,6 +292,11 @@ def _method_settings(args: Any) -> dict[str, Any]:
         _pep_gamd = bool(is_pep_gamd(args))
     except Exception:
         _pep_gamd = False
+    # Records the adaptive-production campaign-export convention only;
+    # gareus.mbar_analysis.ladder.load_pep_gamd_envelope(run_dir) also accepts
+    # the bare single-run filename ("shared_gamd_setup_globals.json" directly
+    # under run_dir, no "global_shared_gamd_setup/" prefix) as a fallback, so
+    # this field is a hint for where to look first, not the only valid path.
     settings["pep_gamd_envelope_path"] = (
         "global_shared_gamd_setup/shared_gamd_setup_globals.json" if _pep_gamd else None
     )

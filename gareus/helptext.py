@@ -759,10 +759,11 @@ Vmax on both channels, independent of λ, so this is the only place per-rung
 state lives.
 
 Reconstructing u_ik for every (i, k) from every sample requires each sample to
-carry, not just the boost realized at ITS OWN sampling rung: for a λ=0 sample
-the realized boost is identically zero and does not recover the envelope
-terms at all. Every stored sample therefore carries the raw channel energies
-and its own rung, as columns v_pep_kj_mol, v_dih_kj_mol, gamd_lambda, next to
+carry the raw channel energies, not just the boost realized at its own
+sampling rung: for a λ=0 sample the realized boost is identically zero and
+does not recover the envelope terms at all. Every stored sample therefore
+carries the raw channel energies and its own rung, as columns
+v_pep_kj_mol, v_dih_kj_mol, gamd_lambda, next to
 cv1/cv2/potential_kj_mol. An explicit --windows-2d-csv window table carries the
 per-window rung the same way, as a gamd_lambda column (defaults to 0.0 --
 plain umbrella -- when the column is absent, never inferred).
