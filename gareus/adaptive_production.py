@@ -265,9 +265,19 @@ class EdgeDiagnostics:
     edge_type: str = "geometry"
     normalized_distance: Optional[float] = None
     overlap: Optional[float] = None
-    # Energy-space overlap (MBAR O_ij).  Set for ``edge_type == "rung"`` edges,
-    # whose CV-histogram ``overlap`` is ~1 by construction and is therefore
-    # left None rather than recorded as if it meant something.
+    # Energy-space overlap for ``edge_type == "rung"`` edges, whose CV-histogram
+    # ``overlap`` is ~1 by construction and is therefore left None rather than
+    # recorded as if it meant something.
+    #
+    # The value is the SYMMETRIC MBAR state overlap ``sqrt(O_ij * O_ji)``
+    # (= ``S_ij * sqrt(N_i * N_j)``), not a raw matrix entry: ``mbar_state_overlap``
+    # returns ``O = diag(N) @ S``, so ``O_ij != O_ji`` whenever the two states
+    # hold different sample counts -- which adaptive extension makes normal --
+    # and the raw entry would make the metric depend on the states' id order.
+    # It equals ``O_ij`` when ``N_i == N_j``, so the S3 pilot calibration and
+    # the ``min_rung_overlap`` / ``target_rung_overlap`` thresholds are
+    # unchanged.  ``None`` means "not scored" (no union MBAR solve was
+    # available), which is warned but never counted as a weak rung edge.
     mbar_overlap: Optional[float] = None
     exchange_attempts: int = 0
     exchange_accepted: int = 0
@@ -301,6 +311,23 @@ class AdaptiveDecisionPolicy:
     target_rung_overlap: float = 0.25
     # Rungs are added one at a time: a new rung is created at EVERY active
     # centre, so one rung costs as much MD as one whole umbrella row.
+    #
+    # Two accepted limitations of the rung machinery, stated here because this
+    # is the knob an operator reads first:
+    #
+    # (i)  ``add_rung`` is proposed only from the POST-UNION diagnostics. The
+    #      per-epoch/segment diagnostics carry no rung O_ij (they run before
+    #      build_union_state_mbar_inputs and nothing passes them a
+    #      ``rung_mbar_overlap`` mapping), so their rung edges are warned
+    #      ``rung_overlap_unavailable`` and skipped by the proposer. A rung gap
+    #      is therefore caught at CAMPAIGN END by the quality gate, not repaired
+    #      mid-campaign; feeding the epoch loop a per-epoch union solve is what
+    #      would change that.
+    # (ii) Under an active ladder ``retire_converged`` is inert: every centre
+    #      representative carries its own rungs, so it is an articulation point
+    #      of the rung-aware graph and can never be retired, while a
+    #      non-representative rung state earns no CV-overlap credit and never
+    #      becomes a candidate. Windows are not reclaimed in a ladder campaign.
     max_new_rungs_per_epoch: int = 1
     min_samples_for_add: int = 50
     min_samples_for_retire: int = 200
@@ -3676,9 +3703,32 @@ def rung_mbar_overlap_from_union(
     out: Dict[Tuple[int, int], float] = {}
     for a, b in rung_pairs:
         ia, ib = idx_of.get(int(a)), idx_of.get(int(b))
-        if ia is not None and ib is not None and math.isfinite(float(overlap[ia, ib])):
-            out[(int(min(a, b)), int(max(a, b)))] = float(overlap[ia, ib])
+        if ia is None or ib is None:
+            continue
+        value = _symmetric_state_overlap(overlap, ia, ib)
+        if value is not None:
+            out[(int(min(a, b)), int(max(a, b)))] = value
     return out
+
+
+def _symmetric_state_overlap(overlap: np.ndarray, i: int, j: int) -> Optional[float]:
+    """The per-edge rung metric: ``sqrt(O_ij * O_ji)``.
+
+    ``mbar_state_overlap`` returns ``O = diag(N) @ S`` with ``S`` symmetric, so
+    ``O_ij != O_ji`` whenever ``N_i != N_j`` -- and adaptive extension makes
+    unequal per-state sample counts the normal case, not the exception.  The raw
+    ``O[i, j]`` would make an edge's gate metric depend on which of its two
+    states happens to hold the lower state id, which is unrelated to anything
+    physical.  The geometric mean is the symmetric combination,
+    ``S_ij * sqrt(N_i * N_j)``, and it equals ``O_ij`` exactly when
+    ``N_i == N_j`` -- so the S3 pilot calibration and the 0.15 / 0.25 thresholds
+    carry over unchanged.
+    """
+    a = float(overlap[i, j])
+    b = float(overlap[j, i])
+    if not (math.isfinite(a) and math.isfinite(b)) or a < 0.0 or b < 0.0:
+        return None
+    return math.sqrt(a * b)
 
 
 def _write_matrix_csv(path: Path, matrix: np.ndarray, state_ids: np.ndarray) -> None:

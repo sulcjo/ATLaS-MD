@@ -88,3 +88,35 @@ a repo hook rejects any Bash command containing the literal name of the Python t
 is `opencode run "…"` — try it once with a 10-minute timeout; if it prints nothing and does not launch, use the
 fixture-free fallback recipe from `.superpowers/sdd/2026-09-07-swarm-stage/global-constraints.md` at the repo root
 and say so in the report. Keep new functions under ~50 lines; do not reformat unrelated code.
+
+## Implementation notes (2026-09-07, commits 59cb8f8..)
+
+- **O_ij source.** The spec's pointer to "the union MBAR solve … around L2660" names
+  `_compute_mbar_weights_for_tica`, which is the tICA reweighting block: opt-in
+  (`tica_obs_interval <= 0` returns immediately), run only on selected epochs, over a
+  different frame subset (dihedral obs), and wrapped in `except: return uniform`. It
+  cannot supply a rung diagnostic for the registry states. The implementation uses the
+  union NPZ written by `build_union_state_mbar_inputs` — the only matrix carrying every
+  state's reduced potential with the ladder boost already folded in
+  (`apply_ladder_boost_to_u`) — via `rung_mbar_overlap_from_union`.
+- **The per-edge metric is symmetric.** `mbar_state_overlap` returns `O = diag(N) @ S`, so
+  `O_ij != O_ji` whenever `N_i != N_j`, and adaptive extension makes unequal per-state
+  sample counts normal. A raw `O[i, j]` would make the gate value depend on which of the
+  edge's two states holds the lower state id, so rung edges store
+  `sqrt(O_ij * O_ji) = S_ij * sqrt(N_i * N_j)` (`_symmetric_state_overlap`). It equals
+  `O_ij` when `N_i == N_j`, so the calibration above and the 0.15 / 0.25 thresholds are
+  unchanged.
+- **"Not scored" is not "weak".** `evaluate_adaptive_quality_gate` runs three times per
+  campaign and only the post-union pass can have O_ij. An unscored rung edge is warned
+  (`rung_overlap_unavailable`) and never counted as weak; failing on it would make
+  `quality_gate_fixable_by_more_final_sampling` true on every ladder run and spend
+  `final_quality_extension_rounds` of MD chasing a number more sampling cannot produce.
+- **Accepted limitation 1 — a rung gap is caught at campaign end.** `add_rung` is proposed
+  only from the post-union diagnostics: `collect_segmented_epoch_diagnostics` (the path
+  feeding `propose_actions` in the real driver) passes no `rung_mbar_overlap`, so its rung
+  edges arrive unscored and `_propose_rung_actions` declines to act on a missing
+  measurement. A per-epoch union solve is what would move the repair in-loop.
+- **Accepted limitation 2 — `retire_converged` is inert under an active ladder.** Every
+  centre representative carries its own rungs and is therefore an articulation point of
+  the rung-aware graph; non-representative rung states earn no CV-overlap credit. Both
+  guards are pinned by `test_no_ladder_state_is_ever_proposed_for_retirement`.

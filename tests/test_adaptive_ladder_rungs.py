@@ -528,3 +528,67 @@ def test_edge_warnings_name_unmeasured_and_weak_rung_edges_differently():
     assert _rung_edge_warnings(unscored, pol) == ["rung_overlap_unavailable"]
     assert _rung_edge_warnings(weak, pol) == ["low_rung_overlap"]
     assert _rung_edge_warnings(healthy, pol) == []
+
+
+# ---------------------------------------------------------------------------
+# The per-edge rung metric is symmetric under unequal N_k
+# ---------------------------------------------------------------------------
+
+
+def _solve_overlap(u_nk, window):
+    from gareus.mbar_analysis.solvers import solve_mbar
+
+    n_k = np.bincount(window, minlength=u_nk.shape[1]).astype(np.int64)
+    f_k = np.asarray(solve_mbar(u_nk, window, tol=1e-12, maxiter=20000)["f_k"], dtype=float)
+    return mbar_state_overlap(u_nk, f_k, n_k)
+
+
+def test_symmetric_state_overlap_is_order_independent_under_unequal_n():
+    """O = diag(N) @ S, so O_ij != O_ji once the two states hold different
+    sample counts -- which adaptive extension makes normal.  The per-edge gate
+    metric must not depend on which state holds the lower id."""
+    from gareus.adaptive_production import _symmetric_state_overlap
+
+    rng = np.random.default_rng(7)
+    centers = np.array([0.0, 1.0])
+    n_k = np.array([300, 300], dtype=np.int64)
+    x = np.concatenate([rng.normal(c, 1.0, size=int(n)) for c, n in zip(centers, n_k)])
+    window = np.concatenate([np.full(int(n), k) for k, n in enumerate(n_k)]).astype(int)
+    u_nk = 0.5 * (x[:, None] - centers[None, :]) ** 2
+
+    equal = _solve_overlap(u_nk, window)
+    # equal N: the symmetric metric IS the raw matrix entry
+    assert math.isclose(_symmetric_state_overlap(equal, 0, 1), float(equal[0, 1]), rel_tol=1e-9)
+    assert math.isclose(float(equal[0, 1]), float(equal[1, 0]), rel_tol=1e-6)
+
+    # now duplicate state 0's rows so N_0 = 2 * N_1
+    dup = window == 0
+    u2 = np.concatenate([u_nk, u_nk[dup]], axis=0)
+    w2 = np.concatenate([window, window[dup]])
+    unequal = _solve_overlap(u2, w2)
+    assert not math.isclose(float(unequal[0, 1]), float(unequal[1, 0]), rel_tol=1e-3), (
+        "test is vacuous: the matrix did not become asymmetric")
+    fwd = _symmetric_state_overlap(unequal, 0, 1)
+    rev = _symmetric_state_overlap(unequal, 1, 0)
+    assert math.isclose(fwd, rev, rel_tol=1e-12), (fwd, rev)
+    # geometric mean, i.e. S_ij * sqrt(N_i N_j)
+    assert math.isclose(fwd, math.sqrt(float(unequal[0, 1]) * float(unequal[1, 0])), rel_tol=1e-12)
+    assert min(unequal[0, 1], unequal[1, 0]) <= fwd <= max(unequal[0, 1], unequal[1, 0])
+
+
+def test_symmetric_metric_reproduces_the_pilot_numbers():
+    """Equal N_k in the pilot, so the symmetric metric must land on the same
+    calibration the raw adjacent entries do."""
+    from gareus.adaptive_production import _symmetric_state_overlap
+    from gareus.mbar_analysis.solvers import solve_mbar
+
+    with np.load(FIXTURE_NPZ, allow_pickle=False) as data:
+        u_nk = np.asarray(data["umbrella_reduced_bias_nk"], dtype=float)
+        window = np.asarray(data["window"], dtype=int)
+    n_k = np.bincount(window, minlength=u_nk.shape[1]).astype(np.int64)
+    f_k = np.asarray(solve_mbar(u_nk, window, tol=1e-10, maxiter=10000)["f_k"], dtype=float)
+    o = mbar_state_overlap(u_nk, f_k, n_k)
+    for i, want in enumerate(PILOT_ADJACENT_OVERLAP):
+        got = _symmetric_state_overlap(o, i, i + 1)
+        assert abs(got - want) <= 0.01, (i, got, want)
+        assert math.isclose(got, float(o[i, i + 1]), rel_tol=1e-9), "equal N: must equal O_ij"
