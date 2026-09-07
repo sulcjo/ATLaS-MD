@@ -1968,7 +1968,8 @@ def _load_round_raw(round_dir: Path) -> Optional[dict]:
     """Load per-sample arrays from all NPZ chunks in a round dir."""
     chunks_dir = round_dir / 'analysis_chunks'
     bufs: dict = {k: [] for k in ('cv_A', 'secondary_cv', 'step', 'replica', 'window',
-                                   'gamd_boost_total_kj_mol', 'potential_kj_mol')}
+                                   'gamd_boost_total_kj_mol', 'potential_kj_mol',
+                                   'v_pep_kj_mol', 'v_dih_kj_mol', 'gamd_lambda')}
     for chunk_path in sorted(chunks_dir.glob('chunk_*.npz')):
         try:
             with np.load(chunk_path, allow_pickle=False) as f:
@@ -1992,11 +1993,38 @@ def _load_round_raw(round_dir: Path) -> Optional[dict]:
                 else:
                     bufs['gamd_boost_total_kj_mol'].append(np.full(n, np.nan))
                 bufs['potential_kj_mol'].append(np.asarray(f['potential_kj_mol'], float) if 'potential_kj_mol' in f.files else np.full(n, np.nan))
+                # λ-ladder columns (production.py's ChunkWriter has written all
+                # three since the ladder landed). Absent on older chunks: NaN
+                # raw energies propagate as "this sample cannot be reweighted"
+                # through apply_ladder_boost_to_u, and λ defaults to 0.0, the
+                # documented "ladder inactive" value.
+                bufs['v_pep_kj_mol'].append(np.asarray(f['v_pep_kj_mol'], float) if 'v_pep_kj_mol' in f.files else np.full(n, np.nan))
+                bufs['v_dih_kj_mol'].append(np.asarray(f['v_dih_kj_mol'], float) if 'v_dih_kj_mol' in f.files else np.full(n, np.nan))
+                bufs['gamd_lambda'].append(np.asarray(f['gamd_lambda'], float) if 'gamd_lambda' in f.files else np.zeros(n))
         except Exception:
             pass
     if not bufs['cv_A']:
         return None
     return {k: np.concatenate(v) for k, v in bufs.items()}
+
+
+def _win_float(row: dict, keys: tuple, default: float = 0.0) -> float:
+    """First parseable float among ``keys`` in a umbrella_windows.csv row.
+
+    window_assignment_rows writes an EMPTY STRING (not 0) for every secondary
+    column on a 1D run, and float('') raises -- which used to make the whole
+    multi-round augmentation path unreachable for exactly the 1D runs the
+    λ-ladder is used on.
+    """
+    for k in keys:
+        v = row.get(k)
+        if v is None or v == '':
+            continue
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            continue
+    return float(default)
 
 
 def _build_union_window_table(all_dirs: list, tol: float = 5e-4) -> list:
@@ -2012,15 +2040,23 @@ def _build_union_window_table(all_dirs: list, tol: float = 5e-4) -> list:
             continue
         _, _, rows = read_windows(wcsv)
         for row in rows:
-            pc = float(row.get('primary_center', row.get('center_A', 0)))
-            sc = float(row.get('secondary_cv_center', 0))
-            pk = float(row.get('primary_k', row.get('k_kcal_mol_A2', 0)))
-            sk = float(row.get('secondary_cv_k_kcal_mol', 0))
-            key = (round(pc / tol), round(sc / tol))
+            pc = _win_float(row, ('primary_center', 'center_A'), 0.0)
+            sc = _win_float(row, ('secondary_cv_center',), 0.0)
+            pk = _win_float(row, ('primary_k', 'k_kcal_mol_A2'), 0.0)
+            sk = _win_float(row, ('secondary_cv_k_kcal_mol',), 0.0)
+            # λ is part of a thermodynamic state's IDENTITY, not a property of
+            # its umbrella restraint: two rungs of one window share centre and
+            # k and differ only in gamd_lambda. Keying without it merged them
+            # into a single union state, erasing the ladder from the state
+            # definition itself (2026-09-07 final review, C3).
+            lam = _win_float(row, ('gamd_lambda',), 0.0)
+            key = (round(pc / tol), round(sc / tol), round(lam, 8))
             if key not in seen:
                 seen[key] = {'primary_center': pc, 'secondary_cv_center': sc,
-                             'primary_k_kcal': pk, 'secondary_k_kcal': sk}
-    return sorted(seen.values(), key=lambda w: (w['primary_center'], w['secondary_cv_center']))
+                             'primary_k_kcal': pk, 'secondary_k_kcal': sk,
+                             'gamd_lambda': lam}
+    return sorted(seen.values(),
+                  key=lambda w: (w['primary_center'], w['secondary_cv_center'], w['gamd_lambda']))
 
 
 def _round_window_to_union_map(round_dir: Path, union_windows: list, tol: float = 5e-4) -> dict:
@@ -2029,10 +2065,13 @@ def _round_window_to_union_map(round_dir: Path, union_windows: list, tol: float 
     mapping: dict = {}
     for row in rows:
         w_local = int(float(row.get('window', 0)))
-        pc = float(row.get('primary_center', row.get('center_A', 0)))
-        sc = float(row.get('secondary_cv_center', 0))
+        pc = _win_float(row, ('primary_center', 'center_A'), 0.0)
+        sc = _win_float(row, ('secondary_cv_center',), 0.0)
+        lam = _win_float(row, ('gamd_lambda',), 0.0)
         for k_union, uw in enumerate(union_windows):
-            if abs(uw['primary_center'] - pc) < tol and abs(uw['secondary_cv_center'] - sc) < tol:
+            if (abs(uw['primary_center'] - pc) < tol
+                    and abs(uw['secondary_cv_center'] - sc) < tol
+                    and abs(float(uw.get('gamd_lambda', 0.0)) - lam) <= 1e-9):
                 mapping[w_local] = k_union
                 break
     return mapping
@@ -2042,7 +2081,12 @@ def _augment_with_adaptive_rounds(d: Data, run_dir: Path) -> Data:
     """Combine final_production Data with samples from adaptive_feedback_round_* dirs.
 
     Builds the union window set across all rounds, recomputes u_nk analytically
-    for every sample, and returns a new Data with all samples concatenated.
+    for every sample, re-applies the λ-ladder boost (the analytic rebuild is
+    pure umbrella), and returns a new Data with all samples concatenated.
+
+    A union state's identity is (primary_center, secondary_cv_center,
+    gamd_lambda): two rungs of one window differ only in λ, so λ must be part
+    of the dedup key or the ladder is erased from the state set itself.
     """
     round_dirs = _find_gareus_round_dirs(run_dir)
     if not round_dirs:
@@ -2090,10 +2134,23 @@ def _augment_with_adaptive_rounds(d: Data, run_dir: Path) -> Data:
     pot_parts += [r['potential_kj_mol'] for r in round_data]
     pot_all = np.concatenate(pot_parts)
 
+    # _compute_u_nk_analytical rebuilds a PURE-UMBRELLA matrix (its window
+    # dicts only ever carry center1/k1/center2/k2), so under an active ladder
+    # the boost is discarded from every column. Re-add it here, through the
+    # one shared helper -- 2026-09-07 final review, C3.
     u_all = _compute_u_nk_analytical(cv1_all, cv2_all, union_windows, d.beta)
 
     centers_union = np.array([w['primary_center'] for w in union_windows], float)
     ks_union = np.array([w['primary_k_kcal'] for w in union_windows], float)
+    state_lambdas_union = np.array([float(w.get('gamd_lambda', 0.0) or 0.0) for w in union_windows], float)
+
+    def _energies(arr, n):
+        return np.asarray(arr, dtype=np.float64) if arr is not None and np.size(arr) == n else np.full(n, np.nan)
+
+    v_pep_all = np.concatenate(
+        [_energies(getattr(d, 'v_pep_kj', None), d.cv.size)] + [r['v_pep_kj_mol'] for r in round_data])
+    v_dih_all = np.concatenate(
+        [_energies(getattr(d, 'v_dih_kj', None), d.cv.size)] + [r['v_dih_kj_mol'] for r in round_data])
 
     n_round_samples = sum(r['cv_A'].size for r in round_data)
     meta = dict(d.meta)
@@ -2111,6 +2168,14 @@ def _augment_with_adaptive_rounds(d: Data, run_dir: Path) -> Data:
     ]
     meta['adaptive_round_dirs'] = [str(r) for r in round_dirs]
 
+    from .ladder import apply_ladder_boost_to_u, load_pep_gamd_envelope
+    _envelope = load_pep_gamd_envelope(run_dir) if np.any(state_lambdas_union > 0.0) else None
+    # Fail loud rather than quietly returning an umbrella-only PMF: the helper
+    # raises (naming v_pep) when a rung is active but no sample has finite raw
+    # channel energies, or when no frozen envelope could be found.
+    u_all = apply_ladder_boost_to_u(
+        u_all, v_pep_all, v_dih_all, state_lambdas_union, _envelope, d.beta, meta)
+
     return clean(Data(
         d.prod_dir, d.out_dir,
         cv1_all, cv2_all, rg_all, win_all, rep_all, step_all,
@@ -2118,4 +2183,6 @@ def _augment_with_adaptive_rounds(d: Data, run_dir: Path) -> Data:
         d.beta, d.temp, boost_all, pot_all,
         d.source + f'+{len(round_dirs)}rounds',
         meta,
+        v_pep_kj=v_pep_all, v_dih_kj=v_dih_all,
+        state_lambdas=state_lambdas_union,
     ))

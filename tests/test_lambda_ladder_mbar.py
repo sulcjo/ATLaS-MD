@@ -856,3 +856,156 @@ def test_load_union_npz_without_ladder_arrays_still_loads(tmp_path):
     assert d.u_nk.shape[1] == 3
     assert d.state_lambdas is None or not np.any(np.asarray(d.state_lambdas) > 0.0)
     assert not d.meta.get("gamd_ladder")
+
+
+# --- Final-review fix wave, C3: _augment_with_adaptive_rounds rebuilds u_nk
+# analytically (pure umbrella) and must re-apply the ladder boost afterwards.
+
+def _write_windows_csv(d, rows):
+    import csv as _csv
+    d.mkdir(parents=True, exist_ok=True)
+    fields = ["window", "center_A", "k_kcal_mol_A2", "primary_center", "primary_k",
+              "secondary_cv_center", "secondary_cv_k_kcal_mol", "gamd_lambda"]
+    with (d / "umbrella_windows.csv").open("w", newline="") as fh:
+        w = _csv.DictWriter(fh, fieldnames=fields)
+        w.writeheader()
+        w.writerows(rows)
+
+
+def _win_row(i, center, k, lam):
+    return {"window": i, "center_A": center, "k_kcal_mol_A2": k,
+            "primary_center": center, "primary_k": k,
+            "secondary_cv_center": "", "secondary_cv_k_kcal_mol": "",
+            "gamd_lambda": lam}
+
+
+def _write_round_chunk(round_dir, cv, window, lam, v_pep, v_dih):
+    chunks = round_dir / "analysis_chunks"
+    chunks.mkdir(parents=True, exist_ok=True)
+    n = len(cv)
+    np.savez_compressed(
+        chunks / "chunk_000000.npz",
+        cv_A=np.asarray(cv, float),
+        secondary_cv=np.full(n, np.nan),
+        step=np.arange(n, dtype=np.int64),
+        replica=np.zeros(n, dtype=np.int32),
+        window=np.asarray(window, dtype=np.int32),
+        gamd_boost_total_kj_mol=np.zeros(n),
+        potential_kj_mol=np.full(n, np.nan),
+        v_pep_kj_mol=np.asarray(v_pep, float),
+        v_dih_kj_mol=np.asarray(v_dih, float),
+        gamd_lambda=np.asarray(lam, float),
+    )
+
+
+def _ladder_run_with_rounds(tmp_path):
+    """A run_dir with final_production/ + one adaptive_feedback_round_1/,
+    both carrying a λ=0 and a λ=1 rung at the SAME umbrella centre."""
+    from gareus.mbar_analysis.data import Data
+    from gareus.pep_gamd import PepGamdEnvelope
+    import json
+
+    run = tmp_path / "run"
+    prod = run / "final_production"
+    rnd = run / "adaptive_feedback_round_1"
+    rows = [_win_row(0, 5.0, 10.0, 0.0), _win_row(1, 5.0, 10.0, 1.0)]
+    _write_windows_csv(prod, rows)
+    _write_windows_csv(rnd, rows)
+
+    env = PepGamdEnvelope(50.0, -50.0, 50.0, 0.8, 50.0, -50.0, 50.0, 0.6)
+    run.mkdir(parents=True, exist_ok=True)
+    (run / "shared_gamd_setup_globals.json").write_text(json.dumps({"all_globals": {
+        "Vmax_Total": env.vmax_total, "Vmin_Total": env.vmin_total,
+        "threshold_energy_Total": env.threshold_total, "k0_Total": env.k0max_total,
+        "Vmax_Dihedral": env.vmax_dih, "Vmin_Dihedral": env.vmin_dih,
+        "threshold_energy_Dihedral": env.threshold_dih, "k0_Dihedral": env.k0max_dih}}))
+
+    _write_round_chunk(rnd, cv=[5.1, 5.2, 4.9, 5.05],
+                       window=[0, 1, 0, 1], lam=[0.0, 1.0, 0.0, 1.0],
+                       v_pep=[10.0, 11.0, 12.0, 13.0], v_dih=[3.0, 3.5, 4.0, 4.5])
+
+    n = 4
+    d = Data.__new__(Data)
+    d.prod_dir = prod
+    d.out_dir = prod / "pmf_analysis"
+    d.cv = np.array([5.0, 5.15, 4.95, 5.2])
+    d.cv2 = np.full(n, np.nan)
+    d.rg_A = np.full(n, np.nan)
+    d.window = np.array([0, 1, 0, 1])
+    d.replica = np.zeros(n, int)
+    d.step = np.arange(n)
+    d.u_nk = np.zeros((n, 2))
+    d.centers = np.array([5.0, 5.0])
+    d.k_kcal = np.array([10.0, 10.0])
+    d.beta = 1.0 / 2.494
+    d.temp = 300.0
+    d.boost_kj = np.zeros(n)
+    d.potential_kj = np.full(n, np.nan)
+    d.source = str(prod)
+    d.meta = {"gamd_ladder": True}
+    d.boost_dih_kj = None
+    d.v_pep_kj = np.array([20.0, 21.0, 22.0, 23.0])
+    d.v_dih_kj = np.array([5.0, 5.5, 6.0, 6.5])
+    d.state_lambdas = np.array([0.0, 1.0])
+    return run, d, env
+
+
+def test_augment_with_rounds_keeps_lambda_rungs_as_distinct_union_states(tmp_path):
+    """C3 regression. _build_union_window_table deduplicated on
+    (primary_center, secondary_cv_center) only, so two rungs of the SAME
+    window at different λ collapsed into one union state -- the ladder was
+    erased from the state definition itself, not just from u_nk."""
+    from gareus.mbar_analysis.loaders_adaptive import _augment_with_adaptive_rounds
+
+    run, d, _env = _ladder_run_with_rounds(tmp_path)
+    out = _augment_with_adaptive_rounds(d, run)
+
+    assert out.u_nk.shape[1] == 2, out.u_nk.shape
+    assert out.state_lambdas is not None
+    assert sorted(np.asarray(out.state_lambdas).tolist()) == [0.0, 1.0]
+
+
+def test_augment_with_rounds_re_applies_the_ladder_boost(tmp_path):
+    """C3 regression, the real defect: u_all came from
+    _compute_u_nk_analytical (pure umbrella, window dicts with no
+    gamd_lambda), so the boost was discarded from every column while
+    meta['gamd_ladder'] survived -- a wrong PMF AND (before C1) a vacuous
+    cross-check PASS. The λ=1 column must now differ from the pure-umbrella
+    reconstruction by exactly beta*pep_gamd_boost_kj per sample."""
+    from gareus.mbar_analysis.loaders_adaptive import _augment_with_adaptive_rounds
+    from gareus.pep_gamd import pep_gamd_boost_kj
+
+    run, d, env = _ladder_run_with_rounds(tmp_path)
+    out = _augment_with_adaptive_rounds(d, run)
+
+    lam = np.asarray(out.state_lambdas)
+    k1 = int(np.where(lam == 1.0)[0][0])
+    k0 = int(np.where(lam == 0.0)[0][0])
+    # Both union states share centre 5.0 / k 10.0, so their pure-umbrella
+    # columns are identical -- the whole difference is the boost.
+    expected = np.array([out.beta * pep_gamd_boost_kj(vp, vd, 1.0, env)
+                         for vp, vd in zip(out.v_pep_kj, out.v_dih_kj)])
+    assert np.any(expected > 0.0), expected
+    assert np.allclose(out.u_nk[:, k1] - out.u_nk[:, k0], expected), (
+        out.u_nk[:, k1] - out.u_nk[:, k0], expected)
+    assert out.meta.get("gamd_ladder") is True
+
+
+def test_augment_with_rounds_is_unchanged_for_a_non_ladder_run(tmp_path):
+    """The guard must not perturb the ordinary (no-λ) multi-round path."""
+    from gareus.mbar_analysis.loaders_adaptive import _augment_with_adaptive_rounds
+
+    run, d, _env = _ladder_run_with_rounds(tmp_path)
+    # Re-write both window tables with a single λ=0 window and clear the flag.
+    for sub in ("final_production", "adaptive_feedback_round_1"):
+        _write_windows_csv(run / sub, [_win_row(0, 5.0, 10.0, 0.0)])
+    _write_round_chunk(run / "adaptive_feedback_round_1", cv=[5.1, 5.2],
+                       window=[0, 0], lam=[0.0, 0.0],
+                       v_pep=[np.nan, np.nan], v_dih=[np.nan, np.nan])
+    d.meta = {}
+    d.state_lambdas = np.array([0.0, 0.0])
+    d.window = np.zeros(4, int)
+
+    out = _augment_with_adaptive_rounds(d, run)
+    assert out.u_nk.shape[1] == 1
+    assert not out.meta.get("gamd_ladder")
