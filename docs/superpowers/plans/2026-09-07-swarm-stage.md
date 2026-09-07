@@ -15,6 +15,7 @@
 - **Ab initio exploration.** No native or folded reference structure anywhere in this plan: no RMSD-to-native, no "folded fraction", no folded seeding, no folded-state scoring. Seeds are scored on exploration + reweightability quantities only (heavy-CV1, Rg, end-to-end distance, energies). A reviewer must reject any task output that introduces a reference structure.
 - **Seeds** come from a GENPEPT seed library directory holding `final_survivor_seeds.csv` (the only file `gareus.seeding.load_genpept_conformer_library` reads; column `survivor_pdb_path`). For chignolin this is the r7 library (1,970 rows). The path is deployment-specific and is passed as `--seed-conformers-dir`; never hard-code it. Describe r7 from its own `GENPEPT_turbo_summary.json` in provenance, never from `chignolin.yaml` (spec §11).
 - **Seed library = hard prerequisite of every start (S3 pilot finding, 2026-09-07).** A contact-fraction CV1 window cannot be started from the built extended chain: two pilot attempts failed the US start-quality gate (5/5 windows bad, CV1 stuck at 0.01–0.03 vs target 0.25, even with pull k=250 and 50 000 steps × 5 ramps) because every residue pair sits beyond the contact switching distance and the pull force has ~zero gradient. Therefore: (a) every swarm member launches from a stratified seed grafted into the equilibrated box — **never** from the extended chain; a failed graft is a **failed member** (recorded, excluded from the envelope, counted by the graft gate), not a fallback to the chain; (b) the stage refuses to run without `--seed-conformers-dir` pointing at a readable `final_survivor_seeds.csv`; (c) every artefact that feeds a `windows_2d_csv` production run must carry the seed-selection path with it — `--seed-conformers-dir` (cli.py:471), `--seed-selection-mode {auto,active-cv,primary,distance}` (cli.py:473), `--seed-max-reuse-per-conformer` (cli.py:477), `--us-seed-preflight-max-score` (cli.py:478), plus the campaign pull settings chignolin_7 uses (`us_pull_steps_per_window 150000`, `us_pull_timestep_fs 3.0`, `us_pull_k 300`, `us_pull_ramp_stages 10`). The explicit-CSV production path reads seeds through `generate_us_starting_states_by_pulling(args, …)` → `graft_conformer_into_context` (seeding.py:1031, :1686), so these are run flags, not CSV columns; Task 8 writes them as a sidecar next to the windows CSV and Task 12 quotes them.
+- **Measured library coverage (S3 pilot attempt 4, 2026-09-07, r7's 1,970 survivors):** heavy-atom nonlocal contact fraction spans **~0 to 0.069** (the library maximum; the best seed for a 0.25 target scored 0.069); CA `contact_count` min 0 / q10 2 / q50 7 / q90 14 / max 21; `rg_nm` min 0.43 / q50 0.572 / max 0.957; `end_to_end_nm` min 0.40 / q50 1.25 / max 3.03. A restrained pull **cannot** move this CV: from a 0.069 seed, 450 ps at k = 300 kcal/mol/CV² drifted *down* to 0.045–0.065 (the per-atom gradient of a fraction over thousands of pairs is negligible). Consequences bound into this plan: cell edges on every axis are the library's **own quantiles**, never a fixed [0,1] grid (a `4,3,3` spec on a fixed grid would leave the upper CV1 bins empty); CV1 window centres must lie inside library coverage — the plan asserts `max(centres) ≤ q99(library CV1)`; k is judged against the **coverage range**, not [0,1] (k = 250 → σ_w = 0.049, half the whole accessible range; k = 800 → σ_w = 0.027, both at 300 K). None of this uses a native reference.
 - **Stratification descriptors come from the seed library itself.** Verified against `GENPEPT.py`: survivor rows inherit the candidate `ConformerRecord` fields, so `final_survivor_seeds.csv` carries `rg_nm`, `end_to_end_nm` (nm, not Å) and `contact_count` (a raw CA-pair **count**, not the heavy-atom contact fraction). There is **no heavy-atom contact-fraction column**; heavy-CV1 must be computed per seed with `nonlocal_contact_cv_from_positions_nm` under `contact_atom_selection: heavy`. `rg_nm`/`end_to_end_nm` are read from the CSV when present and cross-checked against the values recomputed from the seed PDB (a |Δ| > 0.05 nm on either is reported per seed and the recomputed value wins).
 - **Stratification** is on heavy-CV1 × Rg × end-to-end (E2E) cells with **equal quota per occupied cell**. Seed time is **1 ns per swarm member** (`--swarm-seed-ns`, default 1.0; the value is a user decision, expose it but do not change the default). Budget = **cells × R × seed_ns**; the member count is derived from the budget, never typed by hand. Distinct seeds first, velocity replicates only after a cell's distinct seeds are exhausted.
 - **The swarm runs unbiased**: no umbrella force, boost off, the Pep-GaMD auxiliary water-only force **present** (so `V_pep = energy0 − energy1 + energy2` is the very quantity production will boost) and excluded from integration (`make_cmd_integrator(openmm, args, unit, system=system)` does this).
@@ -185,6 +186,20 @@ def test_describe_seeds_uses_contact_cv_and_ca_geometry():
     args = types.SimpleNamespace(contact_r0_a=4.5, contact_beta_a_inv=6.0, contact_normalize=True)
     d = describe_seeds(lib, [0, 1, 2, 3], [(0, 3, 1.0)], args)
     assert len(d) == 1 and d[0].cv1 < 0.05 and math.isclose(d[0].e2e_nm, 1.14, rel_tol=1e-9)
+
+
+def test_stratify_uses_library_quantiles_so_a_narrow_cv1_range_fills_every_bin():
+    """r7 measured: heavy-CV1 spans ~0-0.069. A fixed [0,1] grid would leave the upper CV1 bins empty."""
+    from gareus.swarm.stratify import SeedDescriptor, stratify_cells, quantile_edges
+    rng = np.random.default_rng(5)
+    seeds = [SeedDescriptor(f"s{i}", f"/x/{i}.pdb", float(rng.uniform(0.0, 0.069)), float(rng.uniform(0.43, 0.957)),
+                            float(rng.uniform(0.40, 3.03))) for i in range(400)]
+    cells = stratify_cells(seeds, (4, 3, 3))
+    cv1_bins_used = {k[0] for k in cells}
+    assert cv1_bins_used == {0, 1, 2, 3}                                  # all four CV1 bins occupied
+    edges = quantile_edges(np.array([s.cv1 for s in seeds]), 4)
+    assert edges[-1] <= 0.069 + 1e-9 and edges[0] >= 0.0                # edges live inside the library's own range
+    assert min(len(v) for v in cells.values()) >= 1
 
 
 def test_describe_seeds_crosschecks_library_rg_e2e_columns_and_recomputed_wins():
@@ -548,15 +563,19 @@ def write_envelope_setup_dir(setup_dir: Path, envelopes: Dict[str, PooledEnvelop
   def deltav_max_kj(v_pep_kj, v_dih_kj, env) -> np.ndarray                                  # boost at λ = 1 per frame
   def design_lambda_ladder(deltav_kj, temperature_k, *, target_beta_sigma=1.0, min_rungs=3, max_rungs=12, ess_floor=50) -> dict
       # {"lambdas": [...], "sigma_kj_per_rung": [...], "ess_per_rung": [...], "extrapolated_from_rung": int|None, "target_beta_sigma": float}
-  def cv1_centers_from_samples(cv1, n_windows=16, lo_q=0.005, hi_q=0.995) -> np.ndarray
-  def cv1_curvature_kcal(cv1, centers, temperature_k, *, n_hist=60, smooth_bins=2) -> np.ndarray   # F'' in kcal/mol/CV² at each centre; 0 where p is empty
-  def cv1_force_constants_from_curvature(centers, curvature_kcal, temperature_k, *, overlap_sigma=1.5, k_min_kcal=5.0, k_max_kcal=1200.0) -> list[float]
+  def cv1_centers_from_samples(cv1, n_windows=16, lo_q=0.005, hi_q=0.995, *, library_cv1=None, library_q=0.99) -> np.ndarray
+      # raises ValueError if max(centres) > quantile(library_cv1, library_q): a window a pull cannot reach must never be written
+  def cv1_curvature_kcal(cv1, centers, temperature_k, *, n_hist=60, smooth_bins=2) -> np.ndarray   # F'' in kcal/mol/CV² at each centre; 0 where p is empty; histogram range = [min(cv1), max(cv1)], NOT [0,1]
+  def cv1_force_constants_from_curvature(centers, curvature_kcal, temperature_k, *, overlap_sigma=1.5, k_min_kcal=5.0, k_max_kcal=1200.0, coverage_range=None, warnings_out=None) -> list[float]
+  def window_sigma_cv(k_kcal, temperature_k) -> float                    # σ_w = sqrt(kT/k); reported per window as a fraction of coverage_range
   def write_ladder_windows_csv(path, centers, ks_kcal, lambdas) -> Path      # header: window,primary_cv_mode,primary_cv_center,primary_cv_k_kcal,gamd_lambda
   ```
 
 **Physics (write these formulas into the module docstring):** for the lower-bound boost `ΔV_λ(x) = λ·ΔV_max(x)` (the threshold `E = Vmax` does not depend on k0), so the reduced-potential difference between adjacent rungs is `β·Δλ·ΔV_max(x)`. Adjacent-rung acceptance is controlled by `Δλ·β·σ_λ(ΔV_max)`, where σ_λ is the standard deviation of ΔV_max **under the ensemble at rung λ**. The swarm samples λ = 0 only; σ_λ is estimated by reweighting swarm frames with `w ∝ exp(−β λ ΔV_max)` (exact given overlap; the effective sample size `ESS = (Σw)²/Σw²` says how far that can be trusted). The ladder is grown from λ = 0: `Δλ_k = target / (β σ_{λ_k})`, `λ_{k+1} = min(1, λ_k + Δλ_k)`, until 1 — this yields the geometric-like widening of spec §3.5 from the data rather than by assumption. Rungs beyond the first with `ESS < ess_floor` are marked `extrapolated_from_rung`; S3 must confirm them.
 
 For k(CV1): with an umbrella `k` on top of a free-energy curvature `F''`, the window's CV1 width is `σ_w² = kT / (k + F'')`. Target `σ_w = spacing / overlap_sigma` (spec S2 row: 1.5σ on CV1) → `k = kT/σ_w² − F''`, clamped to `[k_min, k_max]`. Where the swarm histogram is empty at a centre, `F'' = 0` and the spacing-only k results (same formula as `gareus.windows.adaptive_contact_force_constants_kcal`).
+
+**Coverage, not [0,1] (measured on r7, 2026-09-07).** The accessible heavy-CV1 range of the seed library is ~0–0.069 and a restrained pull cannot move the CV (450 ps at k = 300 from a 0.069 seed drifted *down* to 0.045–0.065). Every quantity here is therefore evaluated against the **coverage range** `[min, max]` of the swarm's CV1 samples (and the library's), never against [0,1]: the histogram in `cv1_curvature_kcal` spans `[min(cv1), max(cv1)]`; `cv1_centers_from_samples` must **raise** if `max(centres)` exceeds the library's q99 of CV1; and `cv1_force_constants_from_curvature` reports `σ_w = sqrt(kT/k)` per window as a fraction of `coverage_range` — for orientation at 300 K, k = 250 → σ_w = 0.049 (half of a 0.07-wide range), k = 800 → σ_w = 0.027. Windows whose σ_w exceeds 0.5 × coverage_range are flagged in `ladder_design.json["k_warnings"]` (the whole range is then one window). Spec S2's "16 centres" is a ceiling: with a 0.07-wide range and 1.5σ overlap the plan writes `min(16, n_resolvable)` centres where `n_resolvable = floor(coverage_range / (1.5·σ_w(k_max)))`, and records the reason.
 
 - [ ] **Step 1: Failing tests**
 
@@ -607,6 +626,27 @@ def test_cv1_centers_span_observed_range_with_n_windows():
     from gareus.swarm.ladder_design import cv1_centers_from_samples
     c = cv1_centers_from_samples(np.random.default_rng(3).beta(2, 5, 20000), n_windows=16)
     assert c.shape == (16,) and 0.0 <= c[0] < c[-1] <= 1.0 and np.all(np.diff(c) > 0)
+
+
+def test_cv1_centers_refuse_to_exceed_library_q99():
+    """r7 measured max heavy-CV1 = 0.069; a centre a pull cannot reach must never be written."""
+    from gareus.swarm.ladder_design import cv1_centers_from_samples
+    lib = np.random.default_rng(6).uniform(0.0, 0.069, 1970)
+    swarm = np.random.default_rng(7).uniform(0.0, 0.065, 20000)
+    c = cv1_centers_from_samples(swarm, n_windows=8, library_cv1=lib)
+    assert c[-1] <= np.quantile(lib, 0.99)
+    try:
+        cv1_centers_from_samples(np.random.default_rng(8).uniform(0.0, 0.30, 20000), n_windows=8, library_cv1=lib)
+    except ValueError as e:
+        assert "q99" in str(e) or "library" in str(e)
+    else:
+        raise AssertionError("centres beyond library coverage must raise")
+
+
+def test_window_sigma_against_coverage_range_matches_measured_numbers():
+    from gareus.swarm.ladder_design import window_sigma_cv
+    assert math.isclose(window_sigma_cv(250.0, 300.0), 0.049, abs_tol=0.002)
+    assert math.isclose(window_sigma_cv(800.0, 300.0), 0.027, abs_tol=0.002)
 
 
 def test_curvature_positive_in_a_well_and_zero_where_empty():
@@ -723,19 +763,34 @@ def design_lambda_ladder(deltav_kj, temperature_k: float, *, target_beta_sigma: 
             "beta_sigma_lambda0": beta * sigmas[0], "n_samples": int(dv.size)}
 
 
-def cv1_centers_from_samples(cv1, n_windows: int = 16, lo_q: float = 0.005, hi_q: float = 0.995) -> np.ndarray:
+def window_sigma_cv(k_kcal: float, temperature_k: float) -> float:
+    """σ_w = sqrt(kT/k) in CV units; 300 K: k=250 → 0.049, k=800 → 0.027 (half / ~40 % of r7's 0.07 range)."""
+    return math.sqrt(R_KCAL_MOL_K * float(temperature_k) / float(k_kcal))
+
+
+def cv1_centers_from_samples(cv1, n_windows: int = 16, lo_q: float = 0.005, hi_q: float = 0.995, *,
+                             library_cv1=None, library_q: float = 0.99) -> np.ndarray:
+    """Centres inside the OBSERVED coverage. No [0,1] assumption: r7's heavy-CV1 tops out at 0.069 and a
+    restrained pull cannot move the CV, so a centre beyond the library's q99 is unreachable → ValueError."""
     v = np.asarray(cv1, dtype=float); v = v[np.isfinite(v)]
     lo, hi = float(np.quantile(v, lo_q)), float(np.quantile(v, hi_q))
     lo = max(0.0, lo); hi = min(1.0, hi)
-    if hi - lo < 0.05:
-        hi = min(1.0, lo + 0.10)
-    return np.linspace(lo, hi, int(n_windows))
+    if hi <= lo:
+        raise ValueError("degenerate CV1 coverage")
+    centres = np.linspace(lo, hi, int(n_windows))
+    if library_cv1 is not None:
+        lib = np.asarray(library_cv1, dtype=float); lib = lib[np.isfinite(lib)]
+        cap = float(np.quantile(lib, library_q))
+        if centres.max() > cap + 1e-12:
+            raise ValueError(f"max CV1 centre {centres.max():.4f} exceeds the seed library q{int(library_q*100)} = {cap:.4f}; "
+                             "a pull cannot reach it — lower --swarm-n-windows or extend the swarm")
+    return centres
 
 
 def cv1_curvature_kcal(cv1, centers, temperature_k: float, *, n_hist: int = 60, smooth_bins: int = 2) -> np.ndarray:
     v = np.asarray(cv1, dtype=float); v = v[np.isfinite(v)]
     kT = R_KCAL_MOL_K * float(temperature_k)
-    hist, edges = np.histogram(v, bins=int(n_hist), range=(0.0, 1.0))
+    hist, edges = np.histogram(v, bins=int(n_hist), range=(float(v.min()), float(v.max()) + 1e-12))   # coverage range, not [0,1]
     p = hist.astype(float)
     if smooth_bins > 0:
         kern = np.exp(-0.5 * (np.arange(-3 * smooth_bins, 3 * smooth_bins + 1) / smooth_bins) ** 2); kern /= kern.sum()
@@ -752,7 +807,10 @@ def cv1_curvature_kcal(cv1, centers, temperature_k: float, *, n_hist: int = 60, 
 
 
 def cv1_force_constants_from_curvature(centers, curvature_kcal, temperature_k: float, *, overlap_sigma: float = 1.5,
-                                       k_min_kcal: float = 5.0, k_max_kcal: float = 1200.0) -> List[float]:
+                                       k_min_kcal: float = 5.0, k_max_kcal: float = 1200.0, coverage_range: Optional[float] = None,
+                                       warnings_out: Optional[list] = None) -> List[float]:
+    """k from spacing and curvature. σ_w is judged against coverage_range (the observed CV1 span, e.g. 0.07 for r7),
+    never against [0,1]; a window whose σ_w exceeds half the range is appended to warnings_out."""
     c = np.asarray(centers, dtype=float); f2 = np.asarray(curvature_kcal, dtype=float)
     kT = R_KCAL_MOL_K * float(temperature_k)
     if c.size < 2:
@@ -761,10 +819,17 @@ def cv1_force_constants_from_curvature(centers, curvature_kcal, temperature_k: f
     if c.size > 2:
         local[1:-1] = 0.5 * (sp[:-1] + sp[1:])
     ks = []
-    for spacing, curv in zip(local, f2):
+    for i, (spacing, curv) in enumerate(zip(local, f2)):
         sigma_w = max(1e-5, float(spacing) / float(overlap_sigma))
         k = kT / sigma_w ** 2 - (float(curv) if math.isfinite(curv) else 0.0)
-        ks.append(float(min(float(k_max_kcal), max(float(k_min_kcal), k))))
+        k_cl = float(min(float(k_max_kcal), max(float(k_min_kcal), k)))
+        ks.append(k_cl)
+        if coverage_range and warnings_out is not None:
+            sw = window_sigma_cv(k_cl, temperature_k)
+            if sw > 0.5 * float(coverage_range):
+                warnings_out.append({"window": i, "center": float(c[i]), "k_kcal": k_cl, "sigma_w": sw,
+                                     "sigma_w_over_range": sw / float(coverage_range),
+                                     "note": "window width exceeds half the accessible CV1 range"})
     return ks
 
 
@@ -1375,6 +1440,11 @@ def test_tiny_real_swarm_two_members_produce_traces_and_envelope():
 **Type consistency.** `SeedDescriptor(seed_id, pdb_path, cv1, rg_nm, e2e_nm)` used identically in Tasks 1, 6. `plan_members` row keys match `plan.csv` header in Task 6/8. `TRACE_COLUMNS` from Task 5 is the header Task 8's fake writes. `pool_member_envelopes(traces, discard)` takes `{member_id: {"v_pep_kj","v_dih_kj"}}` in Tasks 2, 7, 8. `design_lambda_ladder` return keys (`lambdas, sigma_kj_per_rung, ess_per_rung, extrapolated_from_rung`) are the ones Task 7's `ladder_ess_gate` reads. `write_ladder_windows_csv(path, centers, ks_kcal, lambdas)` header equals the one `load_explicit_2d_window_csv` parses (verified in Task 3's test). Envelope JSON keys match `PepGamdEnvelope.from_integrator_globals` (`Vmax_Total … k0_Dihedral`) and `load_reusable_shared_gamd_setup` (`all_globals`, `interesting_globals`).
 
 **Seed prerequisite (coordinator constraint, S3 pilot 2026-09-07).** No task starts MD from the extended chain: Task 5 fails the member on graft fallback, Task 6 refuses to run without the library, Task 7 gates the failure fraction, Task 8 excludes failed members and ships `ladder_run_args.yaml` with the seed flags, Tasks 10/12 carry them into the example config and the hand-off. Descriptors: heavy-CV1 computed (no fraction column exists in the library — verified in `GENPEPT.py`), `rg_nm`/`end_to_end_nm` read and cross-checked (Task 1).
+
+**Coverage constraint (coordinator, S3 pilot attempt 4).** Task 1's edges are quantiles of the library's own descriptors (new test: a 0–0.069 CV1 range fills all four bins). Task 3: histogram over the coverage range, `cv1_centers_from_samples` raises above the library q99, `window_sigma_cv` reproduces k=250 → 0.049 / k=800 → 0.027, σ_w > ½ range is flagged in `ladder_design.json["k_warnings"]`, and the 16-centre count is a ceiling reduced to what the range can resolve. Task 8 must pass the library CV1 array (from round 0's `plan.csv` seeds) into `cv1_centers_from_samples` and copy `k_warnings` into `swarm_report.json`.
+
+**Known issues to list in the hand-off (not fixed here):**
+- The graft summary's `CV_after` column prints ~10 (a distance in Å) for a contacts CV: the post-minimise CV is evaluated through the distance fallback (see the `primary_cv_is_contacts(args) and primary_cv_mode(row_rel_primary) == "distance"` guard in `gareus/seeding.py`). It is a reporting defect only; the swarm trace computes CV1 itself and is unaffected. Task 12's hand-off doc carries this note.
 
 **Spec gaps the plan could not resolve (left as open items, not guessed):**
 1. Production's application of a physics-only `all_globals` dict (Task 2 Step 4 verifies and, if needed, patches) — the spec assumes the envelope "is copied to every replica" without saying which keys.
