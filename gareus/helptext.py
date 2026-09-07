@@ -1840,6 +1840,88 @@ The tica: section name is cosmetic.  _flatten_config_mapping descends any nested
 dict, so tica_* keys may appear under any section heading.  tica_state_file is
 written by the adaptive loop; starting from a previous model requires setting it
 explicitly to the path of the saved TICAResult JSON.
+
+18. Unbiased swarm stage (S0/S1)
+----------------------------------
+Before the umbrella/GaMD production chain, --swarm-stage run|analyze|compare runs
+a separate, ab initio exploration stage (gareus/swarm/): many short, unbiased,
+per-cell-replicate trajectories, gated and pooled into the frozen Pep-GaMD
+envelope and CV1 window ladder that production then reuses instead of
+recalibrating from a short cMD/recon.
+
+What runs
+~~~~~~~~~
+Each swarm member is unbiased: no umbrella restraint, GaMD boost switched off.
+The Pep-GaMD auxiliary water-only force is still added to the system (the same
+partition production uses) so V_pep = energy0 - energy1 + energy2 is measured
+throughout, but that force is excluded from integration
+(gareus.production.make_cmd_integrator) -- a plain LangevinMiddleIntegrator steps
+every member. Every member is grafted from a stratified GENPEPT seed (heavy-CV1 x
+Rg x end-to-end-distance cells, equal quota per occupied cell, velocity replicates
+after distinct seeds are exhausted); a failed graft is a failed member, never a
+fallback to the built extended chain -- a contact-CV window cannot be started from
+there (S3 pilot finding: every residue pair sits beyond the contact switching
+distance).
+
+What it produces
+~~~~~~~~~~~~~~~~~
+--swarm-stage run writes swarm/round_NNN/member_NNNN/{trace.csv,last_frame.pdb,
+done.json} (plus periodic frames/frame_*.pdb seed candidates), one round at a
+time, sharded by --swarm-member-range and resumable via done.json.
+--swarm-stage analyze pools every member's trace.csv into swarm/analysis/:
+
+    envelope_discard.json                          per-block discard diagnostic
+    shared_gamd_setup/shared_gamd_setup_globals.json frozen Pep-GaMD envelope (Total + Dihedral)
+    ladder_design.json                              CV1 lambda-ladder design (rungs, ESS, FSF floors)
+    windows_lambda_ladder.csv                        the full windows x rungs cross product
+    ladder_run_args.yaml                             the campaign pull-settings sidecar (S3 anchor)
+    seed_bank/final_survivor_seeds.csv + *.pdb        per-window seed frames for S2
+    swarm_gate.json, swarm_report.json               gate results and the stage summary
+
+The envelope is fitted once from round 0 and never recalibrated; later rounds only
+add seeds and out-of-envelope diagnostics against the frozen round-0 fit.
+
+Three consumer flags hand this stage's output to S2/S4 production:
+
+    --windows-2d-csv swarm/analysis/windows_lambda_ladder.csv   the CV1 x lambda window table
+    --seed-conformers-dir swarm/analysis/seed_bank              per-window seed frames for pulling
+    --shared-gamd-setup-dir swarm/analysis/shared_gamd_setup     reuse the frozen envelope; skips
+                                                                  production's own cMD/recon calibration
+
+Gates and the extension rule
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+--swarm-stage analyze evaluates four gates before writing the windows CSV:
+
+    coverage             every stratification cell has >=1 done member; >=90% of all
+                          planned members are done
+    envelope_stability    odd- vs even-member-id halves agree on sigma_V (<=10% relative)
+                          and on Vmax/Vmin (<=1 sigma_V) per channel (Total, Dihedral)
+    ladder_ess             no rung is ESS-extrapolated; every rung's ESS >= --swarm-ess-floor
+    graft                  fraction of members with status != "ok" (graft_failed or
+                          md_failed) <= 10%
+
+A failed gate withholds windows_lambda_ladder.csv and ladder_run_args.yaml (a
+re-analysis first deletes any stale copies of both) -- every other artifact,
+including swarm_gate.json's per-gate reasons, is still written so the failure and
+the extension plan are visible. Gate failure never falls through to production;
+it stays inside the swarm stage: extension_plan doubles the per-cell replicate
+count on an envelope_stability or ladder_ess failure, adds +1 on a coverage
+failure, caps the total at 4x the base replicate count, and analyze is re-run
+after the extra members complete.
+
+Pilot comparison
+~~~~~~~~~~~~~~~~~
+--swarm-stage compare --swarm-pilot-globals <S3 pilot's shared_gamd_setup_globals.json>
+checks the frozen swarm envelope against an earlier S3 pilot's, per channel
+(Total, Dihedral): relative sigma_V difference <= 25%, |Vmax/Vmin swarm - pilot|
+<= 2 sigma_V(pilot), and k0max_swarm / k0max_pilot inside [0.7, 1.4]. This is a
+plausibility check, not an identity test -- the pilot's envelope came from one
+boosted umbrella window and the swarm's is unbiased, so the two sample different
+ensembles on purpose. The swarm envelope stays authoritative for the campaign; a
+"fail" means inspect which channel disagrees and extend the swarm, never
+hand-edit the envelope. Writes swarm/analysis/pilot_comparison.json.
+
+No native reference or folded-state label is used anywhere in this stage.
 """
 
 

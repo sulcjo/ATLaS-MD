@@ -278,6 +278,16 @@ def _method_settings(args: Any) -> dict[str, Any]:
         "gamd_boost_type", "sigma0p_kcal_mol", "sigma0d_kcal_mol", "gamd_production_steps",
         "exchange_mode", "exchange_interval", "traj_format", "sample_potential_energy",
         "flush_every_log", "analysis_array_dtype", "state_gamd_lambdas",
+        # Unbiased swarm stage (gareus/swarm/): every --swarm-* argparse dest plus the
+        # public --shared-gamd-setup-dir flag it shares with production's envelope reuse
+        # path (global-constraints.md's binding anchor -- these are ab initio, no native
+        # reference of any kind is recorded here or anywhere else in this stage).
+        "swarm_stage", "swarm_seed_ns", "swarm_replicates_per_cell", "swarm_budget_ns",
+        "swarm_bins", "swarm_equil_ps", "swarm_output_interval_ps", "swarm_seed_frame_interval_ps",
+        "swarm_member_range", "swarm_round", "swarm_seed_source", "swarm_production_seed_csv",
+        "swarm_n_windows", "swarm_overlap_sigma", "swarm_target_beta_sigma", "swarm_min_rungs",
+        "swarm_max_rungs", "swarm_ess_floor", "swarm_seeds_per_window", "swarm_discard_block_frames",
+        "swarm_min_discard_ps", "swarm_fsf_floor_warn", "swarm_pilot_globals", "shared_gamd_setup_dir",
     ]
     settings = {k: getattr(args, k, None) for k in keys if hasattr(args, k)}
     # The λ-ladder is frozen for the whole campaign (spec §3.1), so its
@@ -344,6 +354,13 @@ def _input_file_hashes(args: Any) -> dict[str, Any]:
             p = seed_path / name
             if p.exists():
                 candidates[f"seed_conformers_{name}"] = p
+        # r7 (and any other GENPEPT seed library) is described from its own summary
+        # file, never from the campaign YAML (global-constraints.md's binding anchor):
+        # record its hash here so provenance can attribute the library that was
+        # actually read, not a stale spec-file description of it.
+        summary_p = seed_path / "GENPEPT_turbo_summary.json"
+        if summary_p.exists():
+            candidates["seed_conformers_GENPEPT_turbo_summary.json"] = summary_p
     return {name: sha256_file(path) if path is not None and path.is_file() else {"path": str(path), "exists": bool(path and path.exists()), "is_directory": bool(path and path.is_dir())} for name, path in candidates.items()}
 
 
@@ -366,6 +383,17 @@ def _key_artifact_paths(out_dir: Path) -> dict[str, Path]:
         "final_report_json": out_dir / "final_report.json",
         "output_layout_json": out_dir / "output_layout.json",
         "checkpoint_manifest_json": out_dir / "checkpoints" / "production_checkpoint_manifest.json",
+        # Unbiased swarm stage (gareus/swarm/analyze.py's real output paths):
+        # the frozen envelope, the CV1 lambda ladder and its run-args sidecar, the
+        # exported seed bank, and the stage's own report -- gated, so a failed gate
+        # withholds windows_lambda_ladder_csv (analyze.py deletes stale copies too).
+        "swarm_shared_gamd_setup_globals_json": out_dir / "swarm" / "analysis" / "shared_gamd_setup" / "shared_gamd_setup_globals.json",
+        "swarm_windows_lambda_ladder_csv": out_dir / "swarm" / "analysis" / "windows_lambda_ladder.csv",
+        "swarm_ladder_run_args_yaml": out_dir / "swarm" / "analysis" / "ladder_run_args.yaml",
+        "swarm_seed_bank_final_survivor_seeds_csv": out_dir / "swarm" / "analysis" / "seed_bank" / "final_survivor_seeds.csv",
+        "swarm_report_json": out_dir / "swarm" / "analysis" / "swarm_report.json",
+        "swarm_ladder_design_json": out_dir / "swarm" / "analysis" / "ladder_design.json",
+        "swarm_gate_json": out_dir / "swarm" / "analysis" / "swarm_gate.json",
     }
 
 

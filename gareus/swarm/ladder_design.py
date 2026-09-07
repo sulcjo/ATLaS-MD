@@ -1,0 +1,266 @@
+"""S1 -> S2 design inputs, all from the unbiased swarm (spec Sec.2 S1 products (2)(3)(4), Sec.3.5, Sec.8 item 8).
+
+lambda rungs: DeltaV_lambda(x) = lambda * DeltaV_max(x) for the lower-bound boost, so adjacent-rung
+acceptance is set by Delta_lambda * beta * sigma_lambda(DeltaV_max). sigma_lambda is estimated from
+the lambda=0 swarm by reweighting w ~ exp(-beta*lambda*DeltaV_max); ESS = (sum w)^2 / sum(w^2) bounds
+how far that estimate can be trusted. Grow the ladder from 0 with Delta_lambda = target/(beta*sigma_lambda)
+until 1.
+
+k(CV1): sigma_w^2 = kT/(k + F'') with sigma_w = spacing/overlap_sigma -> k = kT/sigma_w^2 - F'',
+clamped to [k_min, k_max].
+
+Coverage, not [0,1] (measured on r7, 2026-09-07): the accessible heavy-CV1 range of the seed library
+is ~0-0.069 and a restrained pull cannot move the CV. Every quantity here is evaluated against the
+observed coverage range of the swarm's/library's CV1 samples, never against a fixed [0,1] grid.
+"""
+from __future__ import annotations
+
+import csv
+import math
+from pathlib import Path
+from typing import List, Optional
+
+import numpy as np
+
+from gareus.pep_gamd import PepGamdEnvelope, pep_gamd_boost_kj
+
+R_KJ_MOL_K = 0.008314462618
+R_KCAL_MOL_K = 0.0019872041
+
+
+def deltav_max_kj(v_pep_kj, v_dih_kj, env: PepGamdEnvelope) -> np.ndarray:
+    """The boost each frame would receive at rung lambda = 1 (the top of the ladder)."""
+    return np.asarray(pep_gamd_boost_kj(np.asarray(v_pep_kj, dtype=float), np.asarray(v_dih_kj, dtype=float), 1.0, env), dtype=float)
+
+
+def _reweighted_sigma_and_ess(dv: np.ndarray, beta: float, lam: float) -> tuple[float, float]:
+    """Reweight lambda=0 swarm frames to the ensemble at rung lambda via w ~ exp(-beta*lambda*dv)."""
+    logw = -beta * lam * dv
+    logw = logw - logw.max()
+    w = np.exp(logw)
+    w = w / w.sum()
+    mean = float((w * dv).sum())
+    var = float((w * (dv - mean) ** 2).sum())
+    ess = float(1.0 / (w ** 2).sum())
+    return math.sqrt(max(var, 0.0)), ess
+
+
+def design_lambda_ladder(deltav_kj, temperature_k: float, *, target_beta_sigma: float = 1.0,
+                          min_rungs: int = 3, max_rungs: int = 12, ess_floor: int = 50) -> dict:
+    """Grow lambda from 0 to 1 with adjacent-rung spacing set by target_beta_sigma * (beta*sigma_lambda)^-1.
+
+    sigma_lambda(DeltaV_max) is the reweighted standard deviation of DeltaV_max under the ensemble at
+    rung lambda (reweighting swarm frames sampled at lambda=0). Rungs whose reweighted ESS falls below
+    ess_floor are flagged via extrapolated_from_rung: everything from that rung on is extrapolated
+    beyond what the lambda=0 swarm can support and must be confirmed by the S3 stage.
+    """
+    dv = np.asarray(deltav_kj, dtype=float)
+    dv = dv[np.isfinite(dv)]
+    if dv.size < 2:
+        raise ValueError("need at least two finite DeltaV_max samples")
+    beta = 1.0 / (R_KJ_MOL_K * float(temperature_k))
+
+    lambdas: list[float] = [0.0]
+    while lambdas[-1] < 1.0 and len(lambdas) < int(max_rungs):
+        lam = lambdas[-1]
+        sig, _ess = _reweighted_sigma_and_ess(dv, beta, lam)
+        step = float(target_beta_sigma) / (beta * sig) if sig > 0 else 1.0
+        lambdas.append(min(1.0, lam + step))
+    if lambdas[-1] < 1.0:
+        # max_rungs reached before lambda=1: force the top rung so production always has one.
+        lambdas[-1] = 1.0
+
+    while len(lambdas) < int(min_rungs):
+        # Too few rungs for the floor: bisect the currently-widest gap.
+        gaps = np.diff(lambdas)
+        i = int(np.argmax(gaps))
+        lambdas.insert(i + 1, 0.5 * (lambdas[i] + lambdas[i + 1]))
+
+    sigmas: list[float] = []
+    esss: list[float] = []
+    for lam in lambdas:
+        sig, ess = _reweighted_sigma_and_ess(dv, beta, lam)
+        sigmas.append(sig)
+        esss.append(ess)
+
+    extrapolated: Optional[int] = None
+    for i, ess in enumerate(esss):
+        if i > 0 and ess < ess_floor:
+            extrapolated = i
+            break
+
+    return {
+        "lambdas": [float(x) for x in lambdas],
+        "sigma_kj_per_rung": [float(x) for x in sigmas],
+        "ess_per_rung": [float(x) for x in esss],
+        "extrapolated_from_rung": extrapolated,
+        "target_beta_sigma": float(target_beta_sigma),
+        "beta_sigma_lambda0": float(beta * sigmas[0]),
+        "n_samples": int(dv.size),
+    }
+
+
+def fsf_floor_per_rung(lambdas, env: PepGamdEnvelope, *, warn_threshold: float = 0.5) -> dict:
+    """ForceScalingFactor at V = Vmin for each rung.
+
+    gamd-openmm's lower-bound FSF is 1 - k0*(E - V)/(Vmax - Vmin) (gamd/langevin/base_integrator.py:395),
+    unclamped: at V = Vmin this is 1 - k0. Under the ladder, k0 = lambda * k0max per channel, so the
+    floor is 1 - lambda*k0max. Pep-GaMD leaves water-water at full strength, so a floor near 0 lets the
+    solvent collapse into the peptide unopposed (S3 attempts 6-7: NaN coordinates at k0_Total = 1). The
+    plan does NOT clamp the FSF here -- that would be a method change and is left as a user decision.
+
+    A dihedral-only envelope (``env.has_total is False``, per the optional field noted in this task's
+    brief) has no meaningful Total channel: ``Total``/``top_rung_floor_total`` are reported as ``None``
+    and ``warn`` is driven off the Dihedral channel's top-rung floor instead.
+    """
+    lam = [float(x) for x in lambdas]
+    has_total = bool(getattr(env, "has_total", True))
+    dih = [1.0 - l * float(env.k0max_dih) for l in lam]
+    top_dih = dih[-1] if dih else 1.0
+    if has_total:
+        tot = [1.0 - l * float(env.k0max_total) for l in lam]
+        top_tot = tot[-1] if tot else 1.0
+        warn = bool(top_tot < float(warn_threshold))
+    else:
+        tot = None
+        top_tot = None
+        warn = bool(top_dih < float(warn_threshold))
+    return {
+        "Total": tot,
+        "Dihedral": dih,
+        "top_rung_floor_total": top_tot,
+        "warn": warn,
+        "warn_threshold": float(warn_threshold),
+        "note": "FSF floor = 1 - lambda*k0max at V = Vmin (unclamped lower-bound formula); "
+                "a floor near 0 on the top rung is the NaN mechanism seen in S3 attempts 6-7",
+    }
+
+
+def window_sigma_cv(k_kcal: float, temperature_k: float) -> float:
+    """sigma_w = sqrt(kT/k) in CV units; at 300 K, k=250 -> 0.049, k=800 -> 0.027 (r7's ~0.07-wide range)."""
+    return math.sqrt(R_KCAL_MOL_K * float(temperature_k) / float(k_kcal))
+
+
+def n_resolvable_windows(coverage_range: float, temperature_k: float, *,
+                          k_max_kcal: float = 1200.0, overlap_sigma: float = 1.5) -> int:
+    """floor(coverage_range / (overlap_sigma * sigma_w(k_max))): the true window-count ceiling.
+
+    Spec S2's "16 centres" is only reachable when the accessible CV1 range is wide enough to hold 16
+    non-overlapping windows at the stiffest allowed force constant. With r7's measured coverage
+    (~0.069) and k_max=1200 kcal/mol/CV^2 at 300 K, this resolves to 2, not 16 -- the plan writes
+    min(requested_n_windows, n_resolvable_windows(...)) and records why.
+    """
+    sigma_w_min = window_sigma_cv(float(k_max_kcal), float(temperature_k))
+    return int(math.floor(float(coverage_range) / (float(overlap_sigma) * sigma_w_min)))
+
+
+def cv1_centers_from_samples(cv1, n_windows: int = 16, lo_q: float = 0.005, hi_q: float = 0.995, *,
+                              library_cv1=None, library_q: float = 0.99) -> np.ndarray:
+    """Centres spanning the swarm's OBSERVED CV1 coverage, never a fixed [0,1] grid.
+
+    r7's heavy-CV1 tops out at ~0.069 and a restrained pull cannot move the CV (450 ps at k=300 from a
+    0.069 seed drifted down to 0.045-0.065), so a centre beyond the seed library's q99 is a window a
+    pull could never reach -- this raises rather than silently writing an unreachable window.
+    """
+    v = np.asarray(cv1, dtype=float)
+    v = v[np.isfinite(v)]
+    lo, hi = float(np.quantile(v, lo_q)), float(np.quantile(v, hi_q))
+    lo = max(0.0, lo)
+    hi = min(1.0, hi)
+    if hi <= lo:
+        raise ValueError("degenerate CV1 coverage: quantile range collapsed to a point")
+    centres = np.linspace(lo, hi, int(n_windows))
+    if library_cv1 is not None:
+        lib = np.asarray(library_cv1, dtype=float)
+        lib = lib[np.isfinite(lib)]
+        cap = float(np.quantile(lib, library_q))
+        if centres.max() > cap + 1e-12:
+            raise ValueError(
+                f"max CV1 centre {centres.max():.4f} exceeds the seed library q{int(library_q * 100)} = {cap:.4f}; "
+                "a pull cannot reach it -- lower --swarm-n-windows or extend the swarm"
+            )
+    return centres
+
+
+def cv1_curvature_kcal(cv1, centers, temperature_k: float, *, n_hist: int = 60, smooth_bins: int = 2) -> np.ndarray:
+    """F'' in kcal/mol/CV^2 at each centre, from a smoothed histogram spanning [min(cv1), max(cv1)]
+    (the observed coverage range, NOT [0,1]). 0 where the histogram is empty at a centre."""
+    v = np.asarray(cv1, dtype=float)
+    v = v[np.isfinite(v)]
+    kT = R_KCAL_MOL_K * float(temperature_k)
+    hist, edges = np.histogram(v, bins=int(n_hist), range=(float(v.min()), float(v.max()) + 1e-12))
+    p = hist.astype(float)
+    if smooth_bins > 0:
+        kern = np.exp(-0.5 * (np.arange(-3 * smooth_bins, 3 * smooth_bins + 1) / smooth_bins) ** 2)
+        kern = kern / kern.sum()
+        p = np.convolve(p, kern, mode="same")
+    mid = 0.5 * (edges[:-1] + edges[1:])
+    h = mid[1] - mid[0]
+    with np.errstate(divide="ignore"):
+        F = np.where(p > 0, -kT * np.log(np.where(p > 0, p, 1.0)), np.nan)
+    F2 = np.full_like(F, np.nan)
+    F2[1:-1] = (F[2:] - 2 * F[1:-1] + F[:-2]) / h ** 2
+    out = np.zeros(len(centers), dtype=float)
+    for i, c in enumerate(centers):
+        if c < edges[0] or c > edges[-1]:
+            continue  # centre lies outside the observed swarm coverage: no data, F'' = 0
+        j = int(np.clip(np.searchsorted(mid, c), 1, len(mid) - 2))
+        out[i] = F2[j] if np.isfinite(F2[j]) else 0.0
+    return out
+
+
+def cv1_force_constants_from_curvature(centers, curvature_kcal, temperature_k: float, *, overlap_sigma: float = 1.5,
+                                        k_min_kcal: float = 5.0, k_max_kcal: float = 1200.0,
+                                        coverage_range: Optional[float] = None,
+                                        warnings_out: Optional[list] = None) -> List[float]:
+    """k from local spacing and curvature: k = kT/sigma_w^2 - F'', clamped to [k_min, k_max].
+
+    sigma_w is judged against coverage_range (the swarm's observed CV1 span, e.g. ~0.07 for r7), never
+    against [0,1]. A window whose sigma_w exceeds half the coverage range (the whole range is then
+    effectively one window) is appended to warnings_out when both coverage_range and warnings_out are
+    given -- callers write these into ladder_design.json["k_warnings"].
+    """
+    c = np.asarray(centers, dtype=float)
+    f2 = np.asarray(curvature_kcal, dtype=float)
+    kT = R_KCAL_MOL_K * float(temperature_k)
+    if c.size < 2:
+        return [float(k_max_kcal)]
+    sp = np.diff(c)
+    local = np.empty_like(c)
+    local[0] = sp[0]
+    local[-1] = sp[-1]
+    if c.size > 2:
+        local[1:-1] = 0.5 * (sp[:-1] + sp[1:])
+    ks: list[float] = []
+    for i, (spacing, curv) in enumerate(zip(local, f2)):
+        sigma_w = max(1e-5, float(spacing) / float(overlap_sigma))
+        k = kT / sigma_w ** 2 - (float(curv) if math.isfinite(curv) else 0.0)
+        k_cl = float(min(float(k_max_kcal), max(float(k_min_kcal), k)))
+        ks.append(k_cl)
+        if coverage_range and warnings_out is not None:
+            sw = window_sigma_cv(k_cl, temperature_k)
+            if sw > 0.5 * float(coverage_range):
+                warnings_out.append({
+                    "window": i,
+                    "center": float(c[i]),
+                    "k_kcal": k_cl,
+                    "sigma_w": sw,
+                    "sigma_w_over_range": sw / float(coverage_range),
+                    "note": "window width exceeds half the accessible CV1 range",
+                })
+    return ks
+
+
+def write_ladder_windows_csv(path, centers, ks_kcal, lambdas) -> Path:
+    """Full cross product of CV1 centres x lambda rungs (never truncate the exchange graph)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["window", "primary_cv_mode", "primary_cv_center", "primary_cv_k_kcal", "gamd_lambda"])
+        n = 0
+        for c, k in zip(centers, ks_kcal):
+            for lam in lambdas:
+                w.writerow([n, "contacts", f"{float(c):.6f}", f"{float(k):.4f}", f"{float(lam):.6f}"])
+                n += 1
+    return path

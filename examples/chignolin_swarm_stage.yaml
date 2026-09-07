@@ -1,0 +1,132 @@
+schema_version: '1.0'
+description: >-
+  Chignolin (GYDPETGTWG) unbiased swarm stage (S1): stratified GENPEPT seeds ->
+  N unbiased 1 ns members, one per (heavy-CV1 x Rg x end-to-end) cell x
+  replicate -> pooled envelope + lambda-ladder design + seed bank for the
+  production stage (gareus -hh section 18).
+
+  Run with (cwd = the PARENT of the GENPEPT seed directory, see
+  starting_structures below):
+    gareus --config examples/chignolin_swarm_stage.yaml \
+      --seed-conformers-dir <genpept_out_dir> --swarm-stage run
+  then, once every planned member's round_000/member_NNNN/done.json exists:
+    gareus --config examples/chignolin_swarm_stage.yaml \
+      --seed-conformers-dir <genpept_out_dir> --swarm-stage analyze
+
+# ---------------------------------------------------------------------------
+# Why this file exists
+#
+# Tasks 1-9 built the swarm stage itself (stratify -> members -> driver ->
+# envelope -> ladder_design -> seeds -> gates -> analyze -> compare_pilot) but
+# none of it was reachable from the CLI. This config is the first real
+# (non-toy) --swarm-stage run/analyze exercise: it stratifies the r7 GENPEPT
+# seed library on heavy-CV1 x Rg x end-to-end distance, runs
+# swarm_bins = "4,3,3" (<= 36 occupied cells) x swarm_replicates_per_cell = 3
+# unbiased 1 ns members, then pools the traces into the frozen envelope,
+# lambda ladder, gates and seed bank that examples/chignolin_lambda_ladder_pilot.yaml's
+# successor production run will consume via --shared-gamd-setup-dir.
+#
+# --seed-conformers-dir is deployment-specific and is NEVER hard-coded here:
+# pass it on the command line (see the header run recipe above), or set
+# seed_conformers_dir under starting_structures in a local, untracked config.
+# The swarm stage refuses to start (gareus/swarm/driver.py:run_swarm_stage)
+# without a readable final_survivor_seeds.csv under that directory -- a
+# contact-CV start from the built extended chain is impossible: two pilot
+# attempts failed the US start-quality gate 5/5 windows because every residue
+# pair sits beyond the contact switching distance and the pull force has
+# ~zero gradient there (S3 pilot finding, 2026-09-07). Every swarm member
+# therefore launches from a stratified library seed grafted into the
+# equilibrated box; a failed graft is a failed member (excluded from the
+# envelope, counted by the graft gate), never a fallback to the chain.
+#
+# Budget = cells x swarm_replicates_per_cell x swarm_seed_ns is printed at
+# plan time by gareus/swarm/driver.py (cells come from the occupied
+# stratification cells actually found in the library, not from
+# swarm_bins alone -- an empty cell contributes no members). With
+# swarm_bins = "4,3,3" (36 nominal cells) x 3 replicates x 1 ns that is at
+# most 108 ns aggregate unbiased MD for this round; occupied-cell count is
+# usually lower since the library does not fill every corner of the
+# heavy-CV1 x Rg x E2E grid.
+#
+# No native reference structure is used anywhere in this stage: seeds are
+# scored on exploration + reweightability quantities only (heavy-CV1, Rg,
+# end-to-end distance, energies). There is no RMSD-to-native, no folded
+# fraction, and no folded-state seeding or scoring at any point in the swarm
+# stage or in this config.
+#
+# The shared gamd/simulation/platform/cvs/contact_cv blocks below mirror
+# examples/chignolin_lambda_ladder_pilot.yaml so the swarm's unbiased Pep-GaMD
+# auxiliary force (V_pep = energy0 - energy1 + energy2) matches the boost
+# machinery production will later switch on against the frozen envelope.
+# gamd_averaging_window = 2500 divides both gamd_cmd_steps and equil_steps
+# below unlike the 2000 that failed pilot attempt 5 (gamd-openmm requires
+# ntcmd/nteb to be integer multiples of the averaging window).
+# ---------------------------------------------------------------------------
+
+sequence:
+  seq: GYDPETGTWG
+
+output:
+  out: chignolin_swarm_stage/
+  traj_format: xtc
+  traj_solute_only: true
+  sample_potential_energy: true
+  traj_interval: 2500
+  report_interval: 2500
+  distance_output_interval: 250
+  checkpoint_interval: 25000
+
+platform:
+  platform: CUDA
+  setup_platform: CUDA
+  setup_cpu_threads: 8
+
+simulation:
+  run_mode: hmr-gamd
+  timestep_fs: 4.0
+  nvt_warmup_timestep_fs: 0.5
+  npt_ramp_timestep_fs: 1.0
+  box_shape: dodecahedron
+  padding_nm: 1.0
+  water_model: tip3p
+  ionic_strength_molar: 0.15
+  temperature_k: 300.0
+  production_ensemble: npt
+
+cvs:
+  cv1: contacts
+  cv2: none
+
+contact_cv:
+  contact_atom_selection: heavy
+  cv1_k_max: 1200.0
+
+gamd:
+  gamd_boost_type: pep-gamd-lower-dual
+  sigma0p: 6.0
+  sigma0d: 6.0
+  gamd_averaging_window: 2500
+
+starting_structures:
+  # A GENPEPT seed library is a hard prerequisite of every swarm member
+  # (global-constraints.md): pass --seed-conformers-dir <dir> on the command
+  # line (see the header run recipe). NOT set here -- the r7 seed library
+  # path is deployment-specific, and a contact-CV start from the built
+  # extended chain is impossible (S3 pilot finding, 2026-09-07): every
+  # residue pair sits beyond the contact switching distance, so a restrained
+  # pull from the extended chain has ~zero gradient on this CV.
+  seed_selection_mode: active-cv
+  seed_max_reuse_per_conformer: 0
+  us_seed_preflight_max_score: 1.2
+
+swarm:
+  swarm_stage: run
+  swarm_replicates_per_cell: 3
+  swarm_bins: "4,3,3"
+  swarm_seed_ns: 1.0
+  swarm_equil_ps: 100
+  swarm_output_interval_ps: 2.0
+  swarm_n_windows: 16
+
+tui:
+  tui_mode: none  # batch runs (SLURM); use 'interactive' at a terminal

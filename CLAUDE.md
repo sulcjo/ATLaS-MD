@@ -278,6 +278,79 @@ Root-caused from a user report that `RUNS/chignolin_6`'s MBAR base ESS was 0.74%
 - Suite: 2001 passed at first merge-readiness -> **2147 passed, 1 skipped, 0 failed**, including all 15 real-MD thermodynamic-validity oracle items.
 - Tests: 6 new files (`test_epoch_window_map_rewrite_after_drop.py` 58, `test_mapping_sanity_diagnostics.py` 66, `test_adaptive_new_state_guards.py` 46, `test_stale_epoch_window_map_guard.py` 37, `test_overlap_matrix_2d.py` 19, `test_replica_affinity_executor.py` 5) plus 5 extended. Full suite 2001 passed, 1 skipped, 0 failed — including all 15 real-MD thermodynamic-validity oracle items. Baseline was 6 failed / 1865 passed; those 6 were pre-existing and are also repaired here (`pyproject.toml`'s `addopts = "-q"` removed — it combined with a CLI `-q` to suppress the summary count line entirely; stale assertions in `test_package_smoke.py`, drifted arity in `test_tica.py`, and `test_validation_script_manifests.py`'s dependence on untracked `RUNS/` artifacts).
 
+## Swarm stage (`--swarm-stage run|analyze|compare`, `gareus/swarm/`) — ab initio pre-production exploration
+
+Before the umbrella/GaMD production chain, the swarm stage runs many short, **unbiased**
+(boost off, no umbrella) per-cell-replicate trajectories grafted from a stratified GENPEPT
+seed library, then pools them into a frozen Pep-GaMD envelope and CV1 lambda-ladder that
+production reuses instead of recalibrating from a short cMD/recon. **No native or
+folded-state reference of any kind is used anywhere in this stage** — seeds are scored
+and stratified purely on heavy-CV1, Rg, end-to-end distance and the swarm's own measured
+energies.
+
+**Directory layout** (all under `--out`):
+
+```
+<out>/swarm/
+  system/                 topology.pdb, equil_state.xml, base_system.xml (built once, reused/resumed)
+  round_000/
+    plan.csv, plan_meta.json         deterministic member plan (frozen bin edges after round 0)
+    member_0000/ trace.csv, last_frame.pdb, done.json, frames/frame_*.pdb
+    ...
+  analysis/
+    envelope_discard.json
+    shared_gamd_setup/shared_gamd_setup_globals.json    frozen envelope (Total + Dihedral channels)
+    ladder_design.json, windows_lambda_ladder.csv, ladder_run_args.yaml
+    seed_bank/final_survivor_seeds.csv + *.pdb
+    swarm_gate.json, swarm_report.json, pilot_comparison.json (compare only)
+```
+
+**Frozen-envelope rule.** The Pep-GaMD envelope (Vmax/Vmin/sigma_V/threshold/k0max, both
+channels) is fitted **once**, from round 0's pooled unbiased traces, and never
+recalibrated. Later rounds (`--swarm-round >= 1`, seeded from production frames instead of
+the GENPEPT library) only add seeds and out-of-envelope diagnostics against that same
+frozen fit — re-running `analyze` never re-derives a different envelope.
+
+**A failed gate withholds the windows CSV.** `--swarm-stage analyze` runs four gates
+(`coverage`, `envelope_stability`, `ladder_ess`, `graft`) before writing
+`windows_lambda_ladder.csv`/`ladder_run_args.yaml`; on any gate failure both files are
+withheld (S2 must never see a ladder built on an unstable or under-covered swarm) while
+every other artifact — including `swarm_gate.json`'s per-gate reasons — is still written
+so the failure and `extension_plan`'s recommended replicate bump are visible. **A
+re-analysis first deletes any stale copies of both files** (`analyze.py` unlinks them
+before deciding whether to rewrite), so a windows CSV surviving from a *previous* analyze
+run is never silently left in place after a later gate failure. Gate failure is confined
+to the swarm stage — it never falls through to production.
+
+**S3-comparison freeze criterion** (`--swarm-stage compare --swarm-pilot-globals <path>`):
+per channel (Total, Dihedral), relative sigma_V difference <= **25%**, |Vmax/Vmin(swarm) -
+Vmax/Vmin(pilot)| <= **2 sigma_V(pilot)**, and k0max(swarm)/k0max(pilot) inside **[0.7,
+1.4]**. This is a plausibility check, not an identity test (the pilot's envelope came from
+one boosted umbrella window, the swarm's is unbiased) — the swarm envelope stays
+authoritative for the campaign; a "fail" means inspect which channel disagrees and extend
+the swarm, never hand-edit the envelope.
+
+**Measured facts that bound what this stage can promise (r7 library, S3 pilot attempt 4,
+2026-09-07):**
+
+- **r7's heavy-atom nonlocal-contact CV1 coverage is ~0 to 0.069** (the library's own
+  maximum survivor score) against a 0.25 target used by earlier US attempts — this is why
+  a restrained pull from a library seed cannot reach a 0.25 target either (a fraction over
+  thousands of pairs has ~zero per-atom gradient near the library's ceiling).
+- **Only ~2 CV1 windows are resolvable at k_max = 1200 kcal/mol/CV^2**, not the requested
+  16 (`gareus.swarm.ladder_design.n_resolvable_windows`: floor(coverage_range / (overlap_sigma
+  * sigma_w(k_max))) = floor(0.069 / (1.5 * sigma_w(1200))) = 2 at 300 K). The plan writes
+  `min(requested_n_windows, n_resolvable_windows(...))` and records why — asking for 16
+  windows over a 0.069-wide coverage range does not make 16 resolvable windows exist.
+- **Pep-GaMD's lower-bound FSF is unclamped and went negative at k0 = 1** in two independent
+  S3 pilot attempts (attempts 6-7), both within a few thousand steps of the boost switching
+  on, both crashing with `Particle coordinate is NaN`. Every ladder rung with lambda < 1
+  therefore gets an FSF-floor value (`1 - lambda*k0max` at Vmin) reported in
+  `ladder_design.json["fsf_floor_per_rung"]`, with a warning when the top rung's floor is
+  below `--swarm-fsf-floor-warn` (default 0.5). Clamping FSF at zero with a matching linear
+  boost-potential extension below Vmin would fix this but is a **method change** this stage
+  does not adopt on its own — it is an open user decision, not something to silently apply.
+
 ## Verification
 
 - `pytest -q tests/test_bootstrap_torsion_cv.py tests/test_tica_cv_mode.py tests/test_genpept_contact_bias.py tests/test_gamd_boost_default.py tests/test_ap_epoch0_step_fraction.py tests/test_plot_adaptive_diagnostics.py tests/test_union_mbar_per_epoch_bias.py tests/test_secondary_cv_regime_split.py tests/test_epoch0_pmf_gamd_split.py tests/test_merged_traj_dir_multi_resume.py`
