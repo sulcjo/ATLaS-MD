@@ -1601,6 +1601,7 @@ from .pep_gamd import (
     build_pep_gamd_integrator,
     find_aux_force as _find_pep_gamd_aux_force,
     is_pep_gamd,
+    ladder_supports_boost_type,
     k0max_from_globals,
     pep_gamd_boost_matrix_kj,
     peptide_essential_energy_kj,
@@ -1645,9 +1646,15 @@ def _fetch_v_pep_v_dih(ctx, pep_env, unit) -> tuple[float, float]:
     """
     if pep_env is None:
         return float("nan"), float("nan")
-    v_pep = peptide_essential_energy_kj(ctx, unit)
+    # gamd-openmm's factory puts PeriodicTorsion/CMAPTorsion forces in group 2 for every
+    # stock boost type (integrator_factory.set_dihedral_group), the same id as
+    # DIHEDRAL_GROUP in the Pep-GaMD partition, so this read is valid on both paths.
     v_dih = (ctx.getState(getEnergy=True, groups={DIHEDRAL_GROUP}).getPotentialEnergy()
              .value_in_unit(unit.kilojoule_per_mole))
+    if not getattr(pep_env, "has_total", True):
+        # single dihedral boost: no Total channel, no auxiliary force to read
+        return float("nan"), v_dih
+    v_pep = peptide_essential_energy_kj(ctx, unit)
     return v_pep, v_dih
 
 
@@ -5644,8 +5651,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     if state_lambdas.size != nrep:
         raise ValueError(f"state_gamd_lambdas has {state_lambdas.size} entries for {nrep} states")
     ladder_active = bool(np.any(state_lambdas > 0.0))
-    if ladder_active and not is_pep_gamd(args):
-        raise ValueError("a gamd_lambda ladder requires --gamd-boost-type pep-gamd-lower-dual")
+    if ladder_active and not ladder_supports_boost_type(args):
+        raise ValueError("a gamd_lambda ladder requires --gamd-boost-type pep-gamd-lower-dual or lower-dihedral")
 
     # Resolve per-replica CPU threads now that nrep is known.
     # --cpu-budget distributes total cores evenly; --max-cpu-per-replica caps the result.
@@ -5788,8 +5795,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             if state_lambdas.size != nrep:
                 raise ValueError(f"state_gamd_lambdas has {state_lambdas.size} entries for {nrep} states after US auto-drop")
             ladder_active = bool(np.any(state_lambdas > 0.0))
-            if ladder_active and not is_pep_gamd(args):
-                raise ValueError("a gamd_lambda ladder requires --gamd-boost-type pep-gamd-lower-dual")
+            if ladder_active and not ladder_supports_boost_type(args):
+                raise ValueError("a gamd_lambda ladder requires --gamd-boost-type pep-gamd-lower-dual or lower-dihedral")
 
         if use_gamd:
             reusable_gamd = load_reusable_shared_gamd_setup(args, out_dir)

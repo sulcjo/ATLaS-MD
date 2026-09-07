@@ -236,6 +236,18 @@ def is_pep_gamd(args) -> bool:
     return str(getattr(args, "gamd_boost_type", "") or "") == PEP_GAMD_BOOST_TYPE
 
 
+# Boost types the λ-ladder can scale per rung: the dependent dual Pep-GaMD boost
+# (k0_Total and k0_Dihedral) and the stock single dihedral boost (k0_Dihedral only,
+# no auxiliary force, 1x cost). Both use the lower-bound threshold E = Vmax, which
+# is what pep_gamd_boost_kj reproduces in closed form; upper-bound variants use a
+# different threshold rule and are deliberately excluded.
+LADDER_BOOST_TYPES = frozenset({PEP_GAMD_BOOST_TYPE, "lower-dihedral"})
+
+
+def ladder_supports_boost_type(args) -> bool:
+    return str(getattr(args, "gamd_boost_type", "") or "") in LADDER_BOOST_TYPES
+
+
 def prepare_pep_gamd_args(args, topology) -> None:
     """Record the peptide atom set on args while a topology is in hand.
 
@@ -339,12 +351,19 @@ class PepGamdEnvelope:
     """Frozen per-channel GaMD envelope; k0max_* is the top rung (λ = 1)."""
     vmax_total: float; vmin_total: float; threshold_total: float; k0max_total: float
     vmax_dih: float;   vmin_dih: float;   threshold_dih: float;   k0max_dih: float
+    # False for a single dihedral boost (stock ``lower-dihedral``): the globals carry no
+    # ``*_Total`` entries, the Total channel contributes nothing, and v_pep is not needed.
+    has_total: bool = True
 
     @classmethod
     def from_integrator_globals(cls, g: dict) -> "PepGamdEnvelope":
         f = lambda k: float(g[k])
-        return cls(f("Vmax_Total"), f("Vmin_Total"), f("threshold_energy_Total"), f("k0_Total"),
-                   f("Vmax_Dihedral"), f("Vmin_Dihedral"), f("threshold_energy_Dihedral"), f("k0_Dihedral"))
+        if "k0_Total" in g:
+            return cls(f("Vmax_Total"), f("Vmin_Total"), f("threshold_energy_Total"), f("k0_Total"),
+                       f("Vmax_Dihedral"), f("Vmin_Dihedral"), f("threshold_energy_Dihedral"), f("k0_Dihedral"))
+        return cls(0.0, 0.0, 0.0, 0.0,
+                   f("Vmax_Dihedral"), f("Vmin_Dihedral"), f("threshold_energy_Dihedral"), f("k0_Dihedral"),
+                   has_total=False)
 
     @classmethod
     def from_json(cls, path) -> "PepGamdEnvelope":
@@ -362,9 +381,9 @@ class PepGamdEnvelope:
         doc = _json.loads(open(path).read())
         for cand in (doc, doc.get("all_globals"), doc.get("interesting_globals"),
                      doc.get("globals"), doc.get("integrator_globals"), doc.get("shared_gamd_globals_all")):
-            if isinstance(cand, dict) and "k0_Total" in cand:
+            if isinstance(cand, dict) and "k0_Dihedral" in cand:
                 return cls.from_integrator_globals(cand)
-        raise KeyError(f"{path}: no dict with k0_Total/Vmax_Total/... found")
+        raise KeyError(f"{path}: no dict with k0_Dihedral/Vmax_Dihedral/... found")
 
 
 def _channel_boost(v, e, vmax, vmin, k0):
@@ -382,6 +401,11 @@ def pep_gamd_boost_kj(v_pep_kj, v_dih_kj, lam, env: PepGamdEnvelope):
     _add_dihedral_boost_to_total_energy)."""
     lam = float(lam)
     b_dih = _channel_boost(v_dih_kj, env.threshold_dih, env.vmax_dih, env.vmin_dih, lam * env.k0max_dih)
+    if not env.has_total:
+        # Single dihedral boost: no Total channel exists, v_pep is ignored (it is NaN
+        # on such runs by construction, see production._fetch_v_pep_v_dih).
+        out = _np.asarray(b_dih, dtype=float)
+        return float(out) if out.ndim == 0 else out
     b_tot = _channel_boost(_np.asarray(v_pep_kj, dtype=float) + b_dih, env.threshold_total, env.vmax_total, env.vmin_total, lam * env.k0max_total)
     out = b_dih + b_tot
     return float(out) if out.ndim == 0 else out
@@ -394,16 +418,24 @@ def pep_gamd_boost_matrix_kj(v_pep_kj, v_dih_kj, lambdas, env: PepGamdEnvelope) 
 
 
 def k0max_from_globals(shared_globals: dict) -> dict:
-    return {"Total": float(shared_globals["k0_Total"]), "Dihedral": float(shared_globals["k0_Dihedral"])}
+    """Top-rung k0 per channel; ``Total`` is 0.0 for a single dihedral boost (no such global)."""
+    return {"Total": float(shared_globals.get("k0_Total", 0.0)), "Dihedral": float(shared_globals["k0_Dihedral"])}
 
 
 def set_replica_lambda(integrator, lam: float, k0max: dict) -> None:
-    """Put a replica on rung λ: k0_c = λ·k0max_c for both channels. Nothing else differs between rungs."""
+    """Put a replica on rung λ: k0_c = λ·k0max_c for every channel the integrator has. Nothing else differs between rungs."""
     lam = float(lam)
     if not (0.0 <= lam <= 1.0):
         raise ValueError(f"gamd_lambda={lam} must lie in [0, 1]")
-    integrator.setGlobalVariableByName("k0_Total", lam * float(k0max["Total"]))
+    try:
+        names = {str(integrator.getGlobalVariableName(i)) for i in range(int(integrator.getNumGlobalVariables()))}
+    except AttributeError:
+        names = None  # minimal test doubles expose only setGlobalVariableByName: keep the two-channel behaviour
     integrator.setGlobalVariableByName("k0_Dihedral", lam * float(k0max["Dihedral"]))
+    if names is None or "k0_Total" in names:
+        integrator.setGlobalVariableByName("k0_Total", lam * float(k0max.get("Total", 0.0)))
+    elif float(k0max.get("Total", 0.0)) != 0.0:
+        raise ValueError("k0max['Total'] is non-zero but the integrator has no k0_Total global (single dihedral boost?)")
 
 
 def set_replica_lambda_for_window(integrator, window_index, state_lambdas, k0max_by_channel) -> None:
