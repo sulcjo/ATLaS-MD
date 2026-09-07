@@ -16,6 +16,7 @@
 - **Seeds** come from a GENPEPT seed library directory holding `final_survivor_seeds.csv` (the only file `gareus.seeding.load_genpept_conformer_library` reads; column `survivor_pdb_path`). For chignolin this is the r7 library (1,970 rows). The path is deployment-specific and is passed as `--seed-conformers-dir`; never hard-code it. Describe r7 from its own `GENPEPT_turbo_summary.json` in provenance, never from `chignolin.yaml` (spec §11).
 - **Seed library = hard prerequisite of every start (S3 pilot finding, 2026-09-07).** A contact-fraction CV1 window cannot be started from the built extended chain: two pilot attempts failed the US start-quality gate (5/5 windows bad, CV1 stuck at 0.01–0.03 vs target 0.25, even with pull k=250 and 50 000 steps × 5 ramps) because every residue pair sits beyond the contact switching distance and the pull force has ~zero gradient. Therefore: (a) every swarm member launches from a stratified seed grafted into the equilibrated box — **never** from the extended chain; a failed graft is a **failed member** (recorded, excluded from the envelope, counted by the graft gate), not a fallback to the chain; (b) the stage refuses to run without `--seed-conformers-dir` pointing at a readable `final_survivor_seeds.csv`; (c) every artefact that feeds a `windows_2d_csv` production run must carry the seed-selection path with it — `--seed-conformers-dir` (cli.py:471), `--seed-selection-mode {auto,active-cv,primary,distance}` (cli.py:473), `--seed-max-reuse-per-conformer` (cli.py:477), `--us-seed-preflight-max-score` (cli.py:478), plus the campaign pull settings chignolin_7 uses (`us_pull_steps_per_window 150000`, `us_pull_timestep_fs 3.0`, `us_pull_k 300`, `us_pull_ramp_stages 10`). The explicit-CSV production path reads seeds through `generate_us_starting_states_by_pulling(args, …)` → `graft_conformer_into_context` (seeding.py:1031, :1686), so these are run flags, not CSV columns; Task 8 writes them as a sidecar next to the windows CSV and Task 12 quotes them.
 - **Measured library coverage (S3 pilot attempt 4, 2026-09-07, r7's 1,970 survivors):** heavy-atom nonlocal contact fraction spans **~0 to 0.069** (the library maximum; the best seed for a 0.25 target scored 0.069); CA `contact_count` min 0 / q10 2 / q50 7 / q90 14 / max 21; `rg_nm` min 0.43 / q50 0.572 / max 0.957; `end_to_end_nm` min 0.40 / q50 1.25 / max 3.03. A restrained pull **cannot** move this CV: from a 0.069 seed, 450 ps at k = 300 kcal/mol/CV² drifted *down* to 0.045–0.065 (the per-atom gradient of a fraction over thousands of pairs is negligible). Consequences bound into this plan: cell edges on every axis are the library's **own quantiles**, never a fixed [0,1] grid (a `4,3,3` spec on a fixed grid would leave the upper CV1 bins empty); CV1 window centres must lie inside library coverage — the plan asserts `max(centres) ≤ q99(library CV1)`; k is judged against the **coverage range**, not [0,1] (k = 250 → σ_w = 0.049, half the whole accessible range; k = 800 → σ_w = 0.027, both at 300 K). None of this uses a native reference.
+- **Vmin is the fragile point of the λ = 1 envelope (S3 pilot attempts 6–7, 2026-09-07).** gamd-openmm's lower-bound `ForceScalingFactor = 1 − k0·(E − V)/(Vmax − Vmin)` (`gamd/langevin/base_integrator.py:395`) is **unclamped**: 0 at V = Vmin, negative below. Pep-GaMD scales only peptide–water and peptide-internal forces while water–water stays at full strength, so near Vmin the solvent is pushed into the peptide unopposed, V_pep plunges (attempt 6: `Vmin_Total = −3402 kJ/mol` against `Vavg = −2295`, σ_V = 41.5 kJ/mol = 9.9 kcal/mol — that was the collapse), FSF turns negative and the run dies with `Particle coordinate is NaN`. Both NaNs occurred at `k0_Total = 1` (sigma0 = 6 kcal/mol → k0′ = 4.66, capped to 1) within a few thousand steps of the boost switching on — once in the 60k-step shared setup (stage 3, ~step 29 750), once in the boosted recon — after a cMD of only 25 000 steps (100 ps at 4 fs). Consequences bound into this plan: (1) every rung with λ < 1 has an FSF floor of `1 − λ·k0max` at V = Vmin; Task 3 reports that floor per rung in `ladder_design.json["fsf_floor_per_rung"]` and warns when the top rung's floor is below `--swarm-fsf-floor-warn` (default **0.5**); (2) the cMD that sets Vmin must be **ns-scale, not 100 ps** — it is a budget line (L40S: 410 ns/day on the 19k-atom box → 2 ns ≈ 7 min), and the envelope that production consumes is seeded by the **swarm's** unbiased σ_V and Vmin (Task 2, tail-pooled over N members × 1 ns), never by a short cMD; production must be pointed at the swarm setup dir and its own cMD/recon must not overwrite it (Task 2 Step 4 verifies the consumer path skips calibration when `--shared-gamd-setup-dir` is given); (3) **clamping FSF at zero with a matching linear extension of the boost potential below Vmin is a METHOD change** — the plan does not adopt it; it is listed as a user decision in the open items. Attempt 8 (2 ns cMD + 2 ns equilibration, k0 = 1) is running to test whether a realistic Vmin alone suffices; **do not assume its result.** Ab-initio constraint unchanged.
 - **Stratification descriptors come from the seed library itself.** Verified against `GENPEPT.py`: survivor rows inherit the candidate `ConformerRecord` fields, so `final_survivor_seeds.csv` carries `rg_nm`, `end_to_end_nm` (nm, not Å) and `contact_count` (a raw CA-pair **count**, not the heavy-atom contact fraction). There is **no heavy-atom contact-fraction column**; heavy-CV1 must be computed per seed with `nonlocal_contact_cv_from_positions_nm` under `contact_atom_selection: heavy`. `rg_nm`/`end_to_end_nm` are read from the CSV when present and cross-checked against the values recomputed from the seed PDB (a |Δ| > 0.05 nm on either is reported per seed and the recomputed value wins).
 - **Stratification** is on heavy-CV1 × Rg × end-to-end (E2E) cells with **equal quota per occupied cell**. Seed time is **1 ns per swarm member** (`--swarm-seed-ns`, default 1.0; the value is a user decision, expose it but do not change the default). Budget = **cells × R × seed_ns**; the member count is derived from the budget, never typed by hand. Distinct seeds first, velocity replicates only after a cell's distinct seeds are exhausted.
 - **The swarm runs unbiased**: no umbrella force, boost off, the Pep-GaMD auxiliary water-only force **present** (so `V_pep = energy0 − energy1 + energy2` is the very quantity production will boost) and excluded from integration (`make_cmd_integrator(openmm, args, unit, system=system)` does this).
@@ -568,6 +569,8 @@ def write_envelope_setup_dir(setup_dir: Path, envelopes: Dict[str, PooledEnvelop
   def cv1_curvature_kcal(cv1, centers, temperature_k, *, n_hist=60, smooth_bins=2) -> np.ndarray   # F'' in kcal/mol/CV² at each centre; 0 where p is empty; histogram range = [min(cv1), max(cv1)], NOT [0,1]
   def cv1_force_constants_from_curvature(centers, curvature_kcal, temperature_k, *, overlap_sigma=1.5, k_min_kcal=5.0, k_max_kcal=1200.0, coverage_range=None, warnings_out=None) -> list[float]
   def window_sigma_cv(k_kcal, temperature_k) -> float                    # σ_w = sqrt(kT/k); reported per window as a fraction of coverage_range
+  def fsf_floor_per_rung(lambdas, env, *, warn_threshold=0.5) -> dict      # {"Total": [1 − λ·k0max_total ...], "Dihedral": [...], "top_rung_floor_total": float, "warn": bool, "warn_threshold": float}
+      # the FSF at V = Vmin for each rung (unclamped lower-bound formula, base_integrator.py:395); warn when the top rung's Total floor < threshold
   def write_ladder_windows_csv(path, centers, ks_kcal, lambdas) -> Path      # header: window,primary_cv_mode,primary_cv_center,primary_cv_k_kcal,gamd_lambda
   ```
 
@@ -641,6 +644,18 @@ def test_cv1_centers_refuse_to_exceed_library_q99():
         assert "q99" in str(e) or "library" in str(e)
     else:
         raise AssertionError("centres beyond library coverage must raise")
+
+
+def test_fsf_floor_per_rung_reports_and_warns_on_top_rung():
+    """Attempts 6-7: at k0_Total = 1 the unclamped FSF reaches 0 at Vmin and the run NaNs. Floor = 1 − λ·k0max."""
+    from gareus.swarm.ladder_design import fsf_floor_per_rung
+    from gareus.pep_gamd import PepGamdEnvelope
+    env_k1 = PepGamdEnvelope(100.0, -100.0, 100.0, 1.0, 50.0, 0.0, 50.0, 0.4)
+    r = fsf_floor_per_rung([0.0, 0.25, 0.5, 1.0], env_k1, warn_threshold=0.5)
+    assert r["Total"] == [1.0, 0.75, 0.5, 0.0] and math.isclose(r["Dihedral"][-1], 0.6)
+    assert r["top_rung_floor_total"] == 0.0 and r["warn"] is True and r["warn_threshold"] == 0.5
+    env_k04 = PepGamdEnvelope(100.0, -100.0, 100.0, 0.4, 50.0, 0.0, 50.0, 0.4)
+    assert fsf_floor_per_rung([0.0, 1.0], env_k04, warn_threshold=0.5)["warn"] is False
 
 
 def test_window_sigma_against_coverage_range_matches_measured_numbers():
@@ -761,6 +776,22 @@ def design_lambda_ladder(deltav_kj, temperature_k: float, *, target_beta_sigma: 
     return {"lambdas": [float(x) for x in lambdas], "sigma_kj_per_rung": sigmas, "ess_per_rung": esss,
             "extrapolated_from_rung": extrapolated, "target_beta_sigma": float(target_beta_sigma),
             "beta_sigma_lambda0": beta * sigmas[0], "n_samples": int(dv.size)}
+
+
+def fsf_floor_per_rung(lambdas, env: PepGamdEnvelope, *, warn_threshold: float = 0.5) -> dict:
+    """ForceScalingFactor at V = Vmin for each rung: gamd-openmm's lower-bound FSF is
+    1 − k0·(E − V)/(Vmax − Vmin), unclamped (base_integrator.py:395) → at V = Vmin it equals 1 − k0.
+    Under the ladder k0 = λ·k0max, so the floor is 1 − λ·k0max. Pep-GaMD leaves water–water at full
+    strength, so a floor near 0 lets solvent collapse into the peptide (S3 attempts 6–7: NaN at k0 = 1).
+    The plan does NOT clamp the FSF — that would be a method change and is a user decision."""
+    lam = [float(x) for x in lambdas]
+    tot = [1.0 - l * float(env.k0max_total) for l in lam]
+    dih = [1.0 - l * float(env.k0max_dih) for l in lam]
+    top = tot[-1] if tot else 1.0
+    return {"Total": tot, "Dihedral": dih, "top_rung_floor_total": top,
+            "warn": bool(top < float(warn_threshold)), "warn_threshold": float(warn_threshold),
+            "note": "FSF floor = 1 - lambda*k0max at V = Vmin (unclamped lower-bound formula); "
+                    "a floor near 0 on the top rung is the NaN mechanism seen in S3 attempts 6-7"}
 
 
 def window_sigma_cv(k_kcal: float, temperature_k: float) -> float:
@@ -1316,6 +1347,7 @@ def test_compare_passes_within_tolerance_and_fails_outside():
 | `--swarm-seeds-per-window` | 3 | |
 | `--swarm-discard-block-frames` | 25 | V-trace block for the discard detector |
 | `--swarm-min-discard-ps` | 0.0 | floor on the discard |
+| `--swarm-fsf-floor-warn` | 0.5 | warn when the top rung's FSF floor `1 − k0max_Total` at Vmin is below this (S3 attempts 6–7 NaN mechanism) |
 | `--swarm-pilot-globals` | None | pilot `shared_gamd_setup_globals.json` for `compare` |
 | `--shared-gamd-setup-dir` | None | **public** flag for production: reuse an envelope directory (dest `shared_gamd_setup_dir`, already read by `production.load_reusable_shared_gamd_setup`) |
 
@@ -1425,6 +1457,7 @@ def test_tiny_real_swarm_two_members_produce_traces_and_envelope():
   2. `… --swarm-stage analyze` → read `swarm_report.json`; on `fail`, `… --swarm-stage run --swarm-replicates-per-cell <R + extra>` then analyze again (extension loop, confined to S1).
   3. `… --swarm-stage compare --swarm-pilot-globals <S3 pilot>/shared_gamd_setup_globals.json` → `freeze_allowed` must be true.
   4. Production: `gareus --config <campaign>.yaml --config <run>/swarm/analysis/ladder_run_args.yaml` (or the equivalent flags: `--windows-2d-csv <run>/swarm/analysis/windows_lambda_ladder.csv --seed-conformers-dir <run>/swarm/analysis/seed_bank --seed-selection-mode active-cv --us-seed-preflight-max-score 1.2 --shared-gamd-setup-dir <run>/swarm/analysis/shared_gamd_setup` plus the chignolin_7 pull settings) with `gamd_boost_type: pep-gamd-lower-dual`, `exchange_mode: gibbs-walk`. State in the doc that **every window start goes through the seed graft + pull** (cli.py:471/473/477/478) — a `windows_2d_csv` run without `--seed-conformers-dir` will fail the US start-quality gate on every contact window (S3 pilot, 2026-09-07). If `--config` cannot be repeated, merge the sidecar into the campaign YAML by hand and say so.
+  4b. **cMD / Vmin budget line (S3 attempts 6–7):** the production run's own `gamd_cmd_steps` must be ns-scale — write `gamd_cmd_steps: 500000` (2 ns at 4 fs; ≈ 7 min at the measured 410 ns/day on an L40S for the 19k-atom box) into the campaign YAML as an explicit budget item, and state that the envelope actually used comes from `--shared-gamd-setup-dir` (swarm, unbiased, N × 1 ns) so the cMD is a safety check, not the source of Vmin. Quote `ladder_design.json["fsf_floor_per_rung"]` in the hand-off and refuse to launch the campaign while `warn` is true unless the user has decided otherwise.
   5. Later rounds for S5 re-seeding: `--swarm-round 1 --swarm-seed-source production-frames --swarm-production-seed-csv <frames.csv>`; the envelope is **not** refitted.
   State explicitly which spec numbers each output replaces (§3.5 M and spacing ← `ladder_design.json`; §12 items 1–3 ← `ladder_design.json`, `plan_meta.json`, `envelope_discard.json`).
 - [ ] Commit — `docs(swarm): hand-off command sequence from swarm outputs to the ladder campaign`.
@@ -1443,6 +1476,8 @@ def test_tiny_real_swarm_two_members_produce_traces_and_envelope():
 
 **Coverage constraint (coordinator, S3 pilot attempt 4).** Task 1's edges are quantiles of the library's own descriptors (new test: a 0–0.069 CV1 range fills all four bins). Task 3: histogram over the coverage range, `cv1_centers_from_samples` raises above the library q99, `window_sigma_cv` reproduces k=250 → 0.049 / k=800 → 0.027, σ_w > ½ range is flagged in `ladder_design.json["k_warnings"]`, and the 16-centre count is a ceiling reduced to what the range can resolve. Task 8 must pass the library CV1 array (from round 0's `plan.csv` seeds) into `cv1_centers_from_samples` and copy `k_warnings` into `swarm_report.json`.
 
+**Vmin / FSF constraint (coordinator, S3 attempts 6–7).** Task 3 adds `fsf_floor_per_rung` (+ test) and Task 10 the `--swarm-fsf-floor-warn` flag (default 0.5); Task 8 must write `ladder_design.json["fsf_floor_per_rung"]` and copy `warn` into `swarm_report.json`; Task 2 Step 4 must also confirm that a run given `--shared-gamd-setup-dir` skips its own envelope calibration (otherwise a 100 ps cMD would silently replace the swarm's Vmin); Task 12 carries the ns-scale cMD budget line. Not adopted: clamping FSF at 0 with a linear boost extension below Vmin — a method change, listed below as a user decision.
+
 **Known issues to list in the hand-off (not fixed here):**
 - The graft summary's `CV_after` column prints ~10 (a distance in Å) for a contacts CV: the post-minimise CV is evaluated through the distance fallback (see the `primary_cv_is_contacts(args) and primary_cv_mode(row_rel_primary) == "distance"` guard in `gareus/seeding.py`). It is a reporting defect only; the swarm trace computes CV1 itself and is unaffected. Task 12's hand-off doc carries this note.
 
@@ -1450,3 +1485,4 @@ def test_tiny_real_swarm_two_members_produce_traces_and_envelope():
 1. Production's application of a physics-only `all_globals` dict (Task 2 Step 4 verifies and, if needed, patches) — the spec assumes the envelope "is copied to every replica" without saying which keys.
 2. The spec does not say how many seed frames per window S2 needs; `--swarm-seeds-per-window 3` is a default to be confirmed by the S3 pilot's seeding behaviour.
 3. The spec's S3→S4 acceptance gate (≥ 0.2 per λ edge) is measured by the pilot, not the swarm; `--swarm-target-beta-sigma 1.0` is the design knob that should reproduce it, and only the pilot can confirm.
+4. **User decision, not made here:** whether to clamp gamd-openmm's lower-bound FSF at zero (with a matching linear extension of the boost potential below Vmin) to remove the NaN mechanism at k0 = 1. It changes the method (the boost potential is no longer the stock GaMD form below Vmin, and reweighting must use the modified form). Alternatives that are not method changes: a lower `sigma0p` so k0max_Total < 1 (raises the top-rung floor), or a ns-scale cMD/swarm Vmin. S3 attempt 8 (2 ns cMD + 2 ns equilibration, k0 = 1) is the running test of the latter; its result is not assumed anywhere in this plan.
