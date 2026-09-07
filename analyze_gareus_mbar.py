@@ -1670,26 +1670,8 @@ def analyze_distance_rg_2d_fes(d: Data, args, base_logw: np.ndarray, selected: s
         span=float(np.nanmax(chosen_fes['pmf'][finite]) - np.nanmin(chosen_fes['pmf'][finite]))
     else:
         min_cv=min_rg=span=float('nan')
-    _sp_unconv=int(_sp_stats.get('unconverged',0))
-    _sp_frames=int(_sp_stats.get('frames',0))
-    if _sp_unconv:
-        _frac=_sp_unconv/max(1,_sp_frames)
-        warnings.append(
-            f'PCA superposition: mdtraj could not converge a rotation for {_sp_unconv} of '
-            f'{_sp_frames:,} superposed frames ({_frac:.2e}); those frames were left UNALIGNED '
-            f'(the QCP kernel returns the identity rotation). At this rate the PCA basis and its '
-            f'projection are unaffected, but the count is reported so a rising rate -- which would '
-            f'mean genuinely malformed coordinates -- is visible rather than being two lines of '
-            f'stderr that look identical whatever the magnitude.')
-    if _sp_stats.get('uncounted_calls'):
-        warnings.append(
-            f"PCA superposition: {_sp_stats['uncounted_calls']} chunk(s) could not be monitored for "
-            f'unconverged rotations because stderr had no file descriptor to capture; the reported '
-            f'unconverged count is a lower bound for those chunks.')
     info={
         'available': True,
-        'superpose_unconverged_frames': _sp_unconv,
-        'superpose_frames': _sp_frames,
         'selected_unbiased_method': chosen,
         'n_samples': int(np.count_nonzero(mask)),
         'cv_bins': int(len(xbins)-1),
@@ -2000,6 +1982,22 @@ def _fit_and_project_pca_from_trajectories(d: Data, args, out: Path, progress: O
             warnings.append(f'PCA projection failed for replica {item["replica"]} ({item.get("traj", item.get("dcd"))}): {exc}')
     if progress is not None:
         progress.bar('PCA project pass', 1, 1, f'assigned {assigned}/{d.cv.size} samples', force=True)
+    _sp_unconv=int(_sp_stats.get('unconverged',0))
+    _sp_frames=int(_sp_stats.get('frames',0))
+    if _sp_unconv:
+        _frac=_sp_unconv/max(1,_sp_frames)
+        warnings.append(
+            f'PCA superposition: mdtraj could not converge a rotation for {_sp_unconv} of '
+            f'{_sp_frames:,} superposed frames ({_frac:.2e}); those frames were left UNALIGNED '
+            f'(the QCP kernel returns the identity rotation). At this rate the PCA basis and its '
+            f'projection are unaffected, but the count is reported so a rising rate -- which would '
+            f'mean genuinely malformed coordinates -- is visible rather than being two lines of '
+            f'stderr that look identical whatever the magnitude.')
+    if _sp_stats.get('uncounted_calls'):
+        warnings.append(
+            f"PCA superposition: {_sp_stats['uncounted_calls']} chunk(s) could not be monitored for "
+            f'unconverged rotations because stderr had no file descriptor to capture; the reported '
+            f'unconverged count is a lower bound for those chunks.')
     info={
         'available': True,
         'source': 'trajectory_reconstruction',
@@ -2014,6 +2012,8 @@ def _fit_and_project_pca_from_trajectories(d: Data, args, out: Path, progress: O
         'n_projected_samples': int(np.count_nonzero(np.isfinite(pca1)&np.isfinite(pca2))),
         'explained_variance_ratio_pc1': float(evr[0]) if evr.size>0 else float('nan'),
         'explained_variance_ratio_pc2': float(evr[1]) if evr.size>1 else float('nan'),
+        'superpose_unconverged_frames': int(_sp_unconv),
+        'superpose_frames': int(_sp_frames),
         'pca1': pca1.astype(np.float64),
         'pca2': pca2.astype(np.float64),
     }
