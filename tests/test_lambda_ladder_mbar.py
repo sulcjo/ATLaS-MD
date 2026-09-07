@@ -35,6 +35,33 @@ def test_reconstruct_bias_matrix_refuses_lambda_states_without_energies():
         raise AssertionError("a lambda>0 state without raw energies cannot be reweighted and must fail loudly")
 
 
+def test_reconstruct_bias_matrix_propagates_nan_for_missing_energies():
+    """2026-09-07 round-2 review, item A: reconstruct_bias_matrix now routes
+    the ladder term through apply_ladder_boost_to_u, so a sample with a
+    non-finite v_pep/v_dih must get NaN only in gamd_lambda>0 columns --
+    never a silently fabricated 0.0 boost (the pre-fix behaviour of
+    pep_gamd_boost_matrix_kj's own _channel_boost on a NaN input) -- and the
+    gamd_lambda=0 column must stay genuinely zero-boost, untouched."""
+    from gareus.query import reconstruct_bias_matrix
+    from gareus.pep_gamd import PepGamdEnvelope, pep_gamd_boost_kj
+    env = PepGamdEnvelope(50.0, -50.0, 50.0, 0.8, 50.0, -50.0, 50.0, 0.6)
+    windows = [{"center1": 0.1, "k1": 100.0, "gamd_lambda": 0.0}, {"center1": 0.1, "k1": 100.0, "gamd_lambda": 1.0}]
+    cv = np.array([0.1, 0.2])
+    v_pep = np.array([10.0, np.nan])   # sample 1 missing its raw energy
+    v_dih = np.array([5.0, 7.0])
+    beta = 1.0 / 2.494
+    u = reconstruct_bias_matrix(cv, None, windows, beta, v_pep=v_pep, v_dih=v_dih, envelope=env)
+    u0 = reconstruct_bias_matrix(cv, None, [windows[0]], beta)  # pure-umbrella baseline, same center1/k1
+    # Sample 0 (finite energies): both columns finite, lambda=1 column carries the closed-form boost.
+    assert np.isfinite(u[0, 0]) and np.isfinite(u[0, 1])
+    assert np.isclose(u[0, 1] - u0[0, 0], beta * pep_gamd_boost_kj(10.0, 5.0, 1.0, env))
+    # Sample 1 (missing v_pep): lambda=0 column stays finite and equal to
+    # the umbrella baseline (boost is unconditionally 0 there, never NaN);
+    # lambda=1 column is NaN, not a fabricated 0.0.
+    assert np.isclose(u[1, 0], u0[1, 0])
+    assert np.isnan(u[1, 1])
+
+
 def test_ladder_selects_the_exact_umbrella_only_path():
     from gareus.mbar_analysis.pmf import select_unbiased_method
     method, reason = select_unbiased_method(exp_ess=1.0, n_samples=10, gamd_ladder=True)

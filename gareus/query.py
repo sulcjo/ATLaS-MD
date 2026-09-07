@@ -381,6 +381,14 @@ def reconstruct_bias_matrix(
 
     u = beta * nk
 
+    # The ladder term is added by gareus.mbar_analysis.ladder.apply_ladder_boost_to_u
+    # -- the ONE place it is ever added (2026-09-07 review, R4) -- so its
+    # missing-energy guard and NaN-propagation (a sample with a non-finite
+    # v_pep/v_dih gets NaN, not a silently fabricated 0.0 boost, in every
+    # gamd_lambda > 0 column) apply here too. The explicit "not supplied at
+    # all" check below stays: the helper itself expects real arrays (an
+    # np.asarray(None, dtype=float64) would raise the wrong exception type),
+    # so this is the one guard that must run before calling it.
     lambdas = np.asarray([float(w.get("gamd_lambda", 0.0) or 0.0) for w in windows], dtype=float)
     if np.any(lambdas > 0.0):
         if v_pep is None or v_dih is None or envelope is None:
@@ -388,8 +396,8 @@ def reconstruct_bias_matrix(
                 "windows carry gamd_lambda > 0 but v_pep/v_dih/envelope were not supplied; "
                 "the ladder cannot be reweighted without the raw channel energies"
             )
-        from .pep_gamd import pep_gamd_boost_matrix_kj
-        u = u + float(beta) * pep_gamd_boost_matrix_kj(v_pep, v_dih, lambdas, envelope).T
+        from .mbar_analysis.ladder import apply_ladder_boost_to_u
+        u = apply_ladder_boost_to_u(u, v_pep, v_dih, lambdas, envelope, beta, {})
     return u
 
 
