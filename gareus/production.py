@@ -1854,6 +1854,36 @@ def _reload_state_gamd_lambdas_on_resume(args, out_dir: Path) -> None:
     if lambdas:
         args.state_gamd_lambdas = [float(x) for x in lambdas]
 
+def _persist_state_gamd_lambdas(args, out_dir: Path) -> None:
+    """Patch the CURRENT args.state_gamd_lambdas into run_manifest.json's
+    method_settings, overwriting any earlier snapshot written by a previous
+    call.
+
+    Review finding: the first cut of this patch was a single call placed
+    right after the initial _derive_state_gamd_lambdas() in run_gareus, but
+    args.state_gamd_lambdas is mutated TWICE afterwards on some runs --
+    the --max-replicas truncation (`args.state_gamd_lambdas =
+    list(args.state_gamd_lambdas)[:_max_replicas]`) and the post-pull US
+    auto-drop re-derive (`args.state_gamd_lambdas =
+    _derive_state_gamd_lambdas(window_metadata, len(centers_a),
+    existing=None)`) -- and neither re-patched the manifest. Persisting the
+    PRE-truncation/PRE-drop value is exactly what
+    _derive_state_gamd_lambdas' own docstring warns a caller never to do
+    with `existing=` across a filter/drop boundary, because
+    _reload_state_gamd_lambdas_on_resume feeds this same manifest field
+    back in as `existing=` on the next --resume: a stale, wrong-length
+    snapshot there either falls back to _derive_state_gamd_lambdas' own
+    [0.0]*n (silently disabling the ladder) or, worse, if the post-drop
+    count happens to match, resumes with a misaligned per-state λ.
+
+    Call this again at EVERY point in run_gareus that reassigns
+    args.state_gamd_lambdas, not just once after the initial derive --
+    the last call before production starts is what ends up in the
+    manifest, so it must be the call closest to (after) the final
+    mutation, not the first available opportunity.
+    """
+    update_run_manifest(out_dir, {"method_settings": {"state_gamd_lambdas": list(getattr(args, "state_gamd_lambdas", None) or [])}})
+
 def write_window_assignment_csv(path: Path, rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
@@ -5448,8 +5478,12 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     # hashes), so without this patch "state_gamd_lambdas" never appears in
     # run_manifest.json on ANY run -- silently defeating
     # _reload_state_gamd_lambdas_on_resume's manifest read on every --resume.
-    # Patch it in now that the final, post-reachability-filter value is known.
-    update_run_manifest(out_dir, {"method_settings": {"state_gamd_lambdas": list(args.state_gamd_lambdas)}})
+    # Patch it in now that this stage's value is known -- NOT the final word,
+    # though: --max-replicas truncation and the post-pull US auto-drop
+    # re-derive (further below) can still reassign args.state_gamd_lambdas,
+    # each of which re-calls _persist_state_gamd_lambdas so the manifest
+    # always reflects the LAST mutation, not this first one.
+    _persist_state_gamd_lambdas(args, out_dir)
     window_rows = window_assignment_rows(centers_a, k_list, args.temperature_k, secondary_cv_centers, secondary_cv_k_kcal_list, args=args, gamd_lambdas=args.state_gamd_lambdas)
     write_window_assignment_csv(out_dir / "umbrella_windows.csv", window_rows)
     print_window_assignment_table(window_rows)
@@ -5518,6 +5552,11 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             secondary_cv_k_kcal_list = list(secondary_cv_k_kcal_list)[:_max_replicas]
         if getattr(args, "state_gamd_lambdas", None) is not None:
             args.state_gamd_lambdas = list(args.state_gamd_lambdas)[:_max_replicas]
+            # Re-patch: the manifest snapshot written earlier (right after the
+            # initial derive) is now stale-length -- see _persist_state_gamd_lambdas'
+            # docstring for why persisting a pre-truncation value would corrupt
+            # a later --resume.
+            _persist_state_gamd_lambdas(args, out_dir)
         nrep = _max_replicas
 
     # The rung dimension: one gamd_lambda per surviving state, aligned with
@@ -5659,6 +5698,10 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             # existing=None deliberately: the pre-drop args.state_gamd_lambdas is not
             # safe to reuse across an arbitrary (non-suffix) index drop.
             args.state_gamd_lambdas = _derive_state_gamd_lambdas(window_metadata, len(centers_a), existing=None)
+            # Re-patch: see _persist_state_gamd_lambdas' docstring -- the manifest
+            # must reflect this post-drop, re-derived value, not whatever an
+            # earlier call (initial derive, or --max-replicas truncation) wrote.
+            _persist_state_gamd_lambdas(args, out_dir)
             state_lambdas = np.asarray(args.state_gamd_lambdas, dtype=float)
             if state_lambdas.size != nrep:
                 raise ValueError(f"state_gamd_lambdas has {state_lambdas.size} entries for {nrep} states after US auto-drop")

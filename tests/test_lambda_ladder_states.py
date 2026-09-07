@@ -268,6 +268,43 @@ def test_manifest_envelope_path_is_none_for_a_non_ladder_run():
     assert ms["state_gamd_lambdas"] is None
 
 
+def test_persist_state_gamd_lambdas_reflects_the_latest_mutation_not_the_first():
+    """Task 10 review finding: run_gareus mutates args.state_gamd_lambdas up to
+    three times (initial derive, --max-replicas truncation, post-pull US
+    auto-drop re-derive) -- the manifest patch must be re-called at EVERY
+    mutation site, so the persisted value always tracks the LAST one, not
+    whichever happened to run first. Persisting a stale, pre-mutation
+    snapshot is exactly what _derive_state_gamd_lambdas' own docstring warns
+    a caller never to do with `existing=` across a filter/drop boundary --
+    and _reload_state_gamd_lambdas_on_resume feeds this same manifest field
+    back in as `existing=` on the next --resume, so a stale snapshot there
+    either silently disables the ladder ([0.0]*n fallback) or, worse, resumes
+    with a misaligned per-state lambda if the post-drop count happens to
+    match by coincidence."""
+    from gareus.production import _persist_state_gamd_lambdas, _reload_state_gamd_lambdas_on_resume
+    d = pathlib.Path(tempfile.mkdtemp())
+
+    # (a) First persist call (e.g. right after the initial derive).
+    args = types.SimpleNamespace(state_gamd_lambdas=[0.0, 0.5, 1.0])
+    _persist_state_gamd_lambdas(args, d)
+    manifest = json.loads((d / "run_manifest.json").read_text())
+    assert manifest["method_settings"]["state_gamd_lambdas"] == [0.0, 0.5, 1.0]
+
+    # (b) A later mutation (e.g. --max-replicas truncation, or the post-pull
+    # US auto-drop re-derive) followed by a second persist call.
+    args.state_gamd_lambdas = [0.0, 1.0]
+    _persist_state_gamd_lambdas(args, d)
+
+    # (c) The manifest must carry the LATEST value, not the first one --
+    manifest = json.loads((d / "run_manifest.json").read_text())
+    assert manifest["method_settings"]["state_gamd_lambdas"] == [0.0, 1.0]
+
+    # -- and a --resume on fresh args must read back exactly that.
+    resume_args = types.SimpleNamespace(resume=True, state_gamd_lambdas=None)
+    _reload_state_gamd_lambdas_on_resume(resume_args, d)
+    assert resume_args.state_gamd_lambdas == [0.0, 1.0]
+
+
 def test_reload_state_gamd_lambdas_restores_from_manifest_on_resume():
     """Task 9 Part B: --resume with an unset ladder reloads it from
     run_manifest.json's method_settings (written once by Part A at campaign
