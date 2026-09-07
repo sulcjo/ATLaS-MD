@@ -1,4 +1,4 @@
-import csv, io, types, tempfile, pathlib
+import csv, io, json, types, tempfile, pathlib
 import numpy as np
 
 
@@ -248,3 +248,54 @@ def test_parquet_sample_writer_stores_raw_channel_energies_and_lambda():
     t = pq.read_table(sorted(d.glob("chunk_*.parquet"))[0]).to_pydict()
     assert t["v_pep_kj_mol"][0] == 12.5 and t["v_dih_kj_mol"][0] == 3.25 and t["gamd_lambda"][0] == 0.5
     assert np.isnan(t["v_pep_kj_mol"][1]) and t["gamd_lambda"][1] == 0.0
+
+
+def test_manifest_records_state_lambdas():
+    """Task 9 Part A: state_gamd_lambdas and pep_gamd_envelope_path travel next
+    to gamd_boost_type in the run_manifest.json method_settings block."""
+    from gareus.provenance import _method_settings
+    args = types.SimpleNamespace(state_gamd_lambdas=[0.0, 0.5, 1.0], gamd_boost_type="pep-gamd-lower-dual")
+    ms = _method_settings(args)
+    assert ms["state_gamd_lambdas"] == [0.0, 0.5, 1.0]
+    assert ms["pep_gamd_envelope_path"] == "global_shared_gamd_setup/shared_gamd_setup_globals.json"
+
+
+def test_manifest_envelope_path_is_none_for_a_non_ladder_run():
+    from gareus.provenance import _method_settings
+    args = types.SimpleNamespace(state_gamd_lambdas=None, gamd_boost_type="dihedral")
+    ms = _method_settings(args)
+    assert ms["pep_gamd_envelope_path"] is None
+    assert ms["state_gamd_lambdas"] is None
+
+
+def test_reload_state_gamd_lambdas_restores_from_manifest_on_resume():
+    """Task 9 Part B: --resume with an unset ladder reloads it from
+    run_manifest.json's method_settings (written once by Part A at campaign
+    start), instead of silently defaulting every replica to lambda=0."""
+    from gareus.production import _reload_state_gamd_lambdas_on_resume
+    d = pathlib.Path(tempfile.mkdtemp())
+    (d / "run_manifest.json").write_text(
+        json.dumps({"method_settings": {"state_gamd_lambdas": [0.0, 0.5, 1.0]}}), encoding="utf-8")
+    args = types.SimpleNamespace(resume=True, state_gamd_lambdas=None)
+    _reload_state_gamd_lambdas_on_resume(args, d)
+    assert args.state_gamd_lambdas == [0.0, 0.5, 1.0]
+
+
+def test_reload_state_gamd_lambdas_does_not_override_an_already_set_ladder():
+    from gareus.production import _reload_state_gamd_lambdas_on_resume
+    d = pathlib.Path(tempfile.mkdtemp())
+    (d / "run_manifest.json").write_text(
+        json.dumps({"method_settings": {"state_gamd_lambdas": [0.9, 0.9, 0.9]}}), encoding="utf-8")
+    args = types.SimpleNamespace(resume=True, state_gamd_lambdas=[0.2, 0.4])
+    _reload_state_gamd_lambdas_on_resume(args, d)
+    assert args.state_gamd_lambdas == [0.2, 0.4]
+
+
+def test_reload_state_gamd_lambdas_is_a_noop_when_not_resuming():
+    from gareus.production import _reload_state_gamd_lambdas_on_resume
+    d = pathlib.Path(tempfile.mkdtemp())
+    (d / "run_manifest.json").write_text(
+        json.dumps({"method_settings": {"state_gamd_lambdas": [0.9, 0.9, 0.9]}}), encoding="utf-8")
+    args = types.SimpleNamespace(resume=False, state_gamd_lambdas=None)
+    _reload_state_gamd_lambdas_on_resume(args, d)
+    assert args.state_gamd_lambdas is None

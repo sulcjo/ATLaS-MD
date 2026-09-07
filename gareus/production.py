@@ -1801,6 +1801,41 @@ def _derive_state_gamd_lambdas(window_metadata: Optional[dict], n: int, existing
         return existing_list
     return [0.0] * int(n)
 
+def _reload_state_gamd_lambdas_on_resume(args, out_dir: Path) -> None:
+    """Restore the frozen λ-ladder from run_manifest.json on ``--resume``.
+
+    Controller ruling (Task 2's implementer found this and deferred it to
+    Task 9): ``--resume`` never persisted ``args.state_gamd_lambdas`` across a
+    restart on its own. ``_derive_state_gamd_lambdas`` above is only as good
+    as the window_metadata it is handed on the resumed path, and nothing
+    upstream guarantees that still carries a per-row ``gamd_lambda`` after a
+    restart (an older run directory, or a checkpoint manifest's
+    window_metadata predating the rung dimension). Left uncorrected,
+    ``args.state_gamd_lambdas`` would come out unset/empty and every replica
+    would silently run at λ=0 -- silently, because an all-zero ladder is also
+    the valid "ladder disabled" state, so nothing downstream would complain.
+    Spec §3.6 requires the ladder to stay frozen for the whole campaign,
+    which includes surviving a restart, so it is read back from wherever it
+    was first frozen: ``run_manifest.json``'s ``method_settings`` (see
+    ``gareus/provenance.py:_method_settings``), which is written once at
+    campaign start (``initialize_run_manifest``) and never overwritten by a
+    resume's ``update_run_manifest`` patches.
+
+    A no-op unless ``args.resume`` is set and ``args.state_gamd_lambdas`` is
+    still unset/empty -- an already-populated ladder (from
+    ``_derive_state_gamd_lambdas`` succeeding, or a caller that set it
+    explicitly) is never overridden.
+    """
+    if not bool(getattr(args, "resume", False)):
+        return
+    if getattr(args, "state_gamd_lambdas", None):
+        return
+    manifest = read_json_file(Path(out_dir) / "run_manifest.json", {}) or {}
+    method_settings = (manifest or {}).get("method_settings", {}) or {}
+    lambdas = method_settings.get("state_gamd_lambdas")
+    if lambdas:
+        args.state_gamd_lambdas = [float(x) for x in lambdas]
+
 def write_window_assignment_csv(path: Path, rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
@@ -5412,6 +5447,14 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     ks_kj_nm2 = np.asarray([primary_k_to_openmm_value(k, args) for k in k_list], dtype=float)
     secondary_cv_ks_kj = np.asarray([kcal_to_kj(k) for k in secondary_cv_k_kcal_list], dtype=float) if secondary_cv_k_kcal_list is not None else None
     nrep = len(centers_nm)
+
+    # Controller ruling (Task 9, Part B): a --resume that could not re-derive
+    # the ladder from window_metadata above must not fall through to a
+    # silent all-λ=0 campaign. Reload from the frozen run_manifest.json
+    # before state_lambdas is derived below (and before any --max-replicas
+    # truncation, so the reloaded ladder is truncated consistently with a
+    # fresh run's).
+    _reload_state_gamd_lambdas_on_resume(args, out_dir)
 
     _max_replicas = int(getattr(args, "max_replicas", 0) or 0)
     if _max_replicas > 0 and nrep > _max_replicas:
