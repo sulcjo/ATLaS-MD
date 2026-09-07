@@ -633,3 +633,96 @@ def test_ladder_crosscheck_is_sensitive_to_the_forbidden_naive_reweight():
         diff_returned_vs_naive = ((F_lam0 - F_lam0[both_returned].min())
                                   - (F_naive - F_naive[both_returned].min()))
     assert float(np.max(np.abs(diff_returned_vs_naive[both_returned]))) > 1.0
+
+
+# --- Final-review fix wave, C1: "gamd_ladder asserted but no λ in
+# state_lambdas" is a contradiction, not a pass. -----------------------------
+
+def _contradiction_data(state_lambdas):
+    """Minimal Data whose meta claims an active ladder while state_lambdas
+    carries no λ > 0 -- exactly what every loader that forgets to pass
+    state_lambdas through produces (C2/C3)."""
+    from gareus.mbar_analysis.data import Data
+
+    rng = np.random.default_rng(0)
+    n = 4000
+    d = Data.__new__(Data)
+    d.cv = rng.normal(0.3, 0.05, n)
+    d.window = np.repeat([0, 1], n // 2)
+    d.u_nk = np.zeros((n, 2))
+    d.beta = 1.0 / 2.494
+    d.state_lambdas = state_lambdas
+    d.meta = {"gamd_ladder": True}
+    return d
+
+
+def test_ladder_crosscheck_missing_state_lambdas_is_not_a_vacuous_pass():
+    """C1 regression. With meta['gamd_ladder'] True and state_lambdas None,
+    the old code substituted np.zeros(K): EVERY column read λ=0, so the
+    "λ=0-only subset" was the whole population, the two PMFs were
+    bit-identical, and the gate returned status 'pass' with
+    max_abs_diff_kcal == 0.0 -- a vacuous PASS that hid C2 and C3.
+
+    Asserts on `status` (not on max_abs_diff_kcal, which reads a
+    perfectly innocent 0.0 in the broken case), and that the status is one
+    gareus_report._check_ladder_crosscheck grades FAIL -- 'skipped' would
+    grade NA and would not block."""
+    from gareus.mbar_analysis.crosscheck import ladder_crosscheck
+    import gareus_report as gr
+
+    d = _contradiction_data(None)
+    out = ladder_crosscheck(d, np.zeros(2), bins=20, kbt_kcal=0.596)
+    assert out["status"] != "pass", out
+    assert out["status"] == "fail", out
+    assert "state_lambdas" in out.get("reason", "")
+    graded = gr._check_ladder_crosscheck({"ladder_crosscheck": out})
+    assert graded["status"] == gr.FAIL, graded
+
+
+def test_ladder_crosscheck_all_zero_state_lambdas_under_active_ladder_fails():
+    """Same contradiction reached the other way: state_lambdas present but
+    all-zero. apply_ladder_boost_to_u only ever sets meta['gamd_ladder']
+    True when some λ > 0, so an all-zero vector alongside that flag means a
+    loader dropped the ladder on the floor."""
+    from gareus.mbar_analysis.crosscheck import ladder_crosscheck
+
+    d = _contradiction_data(np.zeros(2))
+    out = ladder_crosscheck(d, np.zeros(2), bins=20, kbt_kcal=0.596)
+    assert out["status"] == "fail", out
+    # No comparison was made, so the contradiction return deliberately carries
+    # no max_abs_diff_kcal -- a 0.0 there is precisely the vacuous number the
+    # broken code reported, and must not be reproduced by the fix.
+    assert "max_abs_diff_kcal" not in out, out
+
+
+def test_ladder_crosscheck_contradiction_guard_ignores_non_ladder_runs():
+    """A plain umbrella run has meta['gamd_ladder'] False (or absent) and
+    all-zero/absent state_lambdas -- that is not a contradiction, and must
+    still reach the ordinary 'no λ=0 states'/comparison logic rather than
+    the new FAIL."""
+    from gareus.mbar_analysis.crosscheck import ladder_crosscheck
+
+    d = _contradiction_data(None)
+    d.meta = {"gamd_ladder": False}
+    out = ladder_crosscheck(d, np.zeros(2), bins=20, kbt_kcal=0.596)
+    assert out["status"] == "pass", out
+
+    d2 = _contradiction_data(None)
+    d2.meta = {}
+    out2 = ladder_crosscheck(d2, np.zeros(2), bins=20, kbt_kcal=0.596)
+    assert out2["status"] == "pass", out2
+
+
+def test_ladder_crosscheck_contradiction_warning_text_is_triaged_critical():
+    """C1, second half: analyze_gareus_mbar.py emits a DIFFERENT warning
+    string for the contradiction 'fail' (it has no max_abs_diff_kcal to
+    quote). That string must still be triaged CRITICAL by gareus_report's
+    _WARN_RULES -- the rule keys on the "λ-ladder cross-check FAILED"
+    prefix, which the contradiction text keeps."""
+    import gareus_report as gr
+
+    groups = gr.classify_warnings([
+        "λ-ladder cross-check FAILED: meta['gamd_ladder'] is asserted but state_lambdas "
+        "carries no λ > 0 (absent) -- the loader lost the per-state ladder rungs -- the "
+        "cross-check could not be made at all, so no PMF from this run is certified."])
+    assert groups[0]["severity"] == "CRITICAL"

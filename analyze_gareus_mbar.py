@@ -4910,18 +4910,28 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
         # to the CSV/PNG below instead, never into the summary itself.
         ladder_crosscheck_summary={k:_lcc[k] for k in ('status','max_abs_diff_kcal','n_lambda0_samples','tolerance_kcal','tolerance_source','n_bins_compared','count_gate_fell_back') if k in _lcc}
         if 'reason' in _lcc: ladder_crosscheck_summary['reason']=_lcc['reason']
-        if _lcc['status'] in ('pass','fail'):
+        # The CONTRADICTION 'fail' (meta['gamd_ladder'] asserted while
+        # state_lambdas carries no λ>0 -- see crosscheck.ladder_crosscheck)
+        # returns before any PMF is built, so it carries neither pmf_full/
+        # pmf_lambda0 nor max_abs_diff_kcal. Key the CSV/PNG and the numeric
+        # warning text on those keys being PRESENT, not on status alone.
+        _lcc_has_pmfs='pmf_full' in _lcc and 'pmf_lambda0' in _lcc
+        if _lcc['status'] in ('pass','fail') and _lcc_has_pmfs:
             write_all(out/'pmf_ladder_crosscheck.csv',
                       {'full_ladder':_lcc['pmf_full'],'lambda0_only':_lcc['pmf_lambda0']})
             png=plot_ladder_crosscheck(_lcc,out,_primary_cv_axis_label(d.meta))
             ladder_crosscheck_summary['files']={'pmf_ladder_crosscheck_csv':str(out/'pmf_ladder_crosscheck.csv')}
             if png: ladder_crosscheck_summary['files']['pmf_ladder_crosscheck_png']=png
         if _lcc['status']=='fail':
-            warn.append(f"λ-ladder cross-check FAILED: λ=0-only PMF disagrees with the full-ladder PMF by "
-                        f"{_lcc['max_abs_diff_kcal']:.3f} kcal/mol (tolerance {_lcc['tolerance_kcal']:.3f}), over "
-                        f"{_lcc['n_lambda0_samples']} λ=0 samples -- the ladder boost reweighting embedded in "
-                        f"u_nk does not reproduce plain umbrella sampling on its own rungs; every PMF from this "
-                        f"run is suspect.")
+            if 'max_abs_diff_kcal' in _lcc:
+                warn.append(f"λ-ladder cross-check FAILED: λ=0-only PMF disagrees with the full-ladder PMF by "
+                            f"{_lcc['max_abs_diff_kcal']:.3f} kcal/mol (tolerance {_lcc['tolerance_kcal']:.3f}), over "
+                            f"{_lcc['n_lambda0_samples']} λ=0 samples -- the ladder boost reweighting embedded in "
+                            f"u_nk does not reproduce plain umbrella sampling on its own rungs; every PMF from this "
+                            f"run is suspect.")
+            else:
+                warn.append(f"λ-ladder cross-check FAILED: {_lcc.get('reason','contradictory ladder metadata')} -- "
+                            f"the cross-check could not be made at all, so no PMF from this run is certified.")
 
     # Never pool epoch_000 into the main PMF/GaMD-boost report: it runs under
     # a different GaMD envelope (the shared-envelope recalibration fires from

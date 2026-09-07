@@ -98,7 +98,15 @@ def ladder_crosscheck(d: Any, f_k_global: np.ndarray, bins, kbt_kcal: float,
 
     Returns
     -------
-    dict with ``status`` in {"pass", "fail", "skipped"}. ``"skipped"``
+    dict with ``status`` in {"pass", "fail", "skipped"}. ``"fail"`` covers
+    two distinct things: the ordinary out-of-tolerance disagreement, and the
+    CONTRADICTION case -- ``meta['gamd_ladder']`` asserted while
+    ``state_lambdas`` holds no λ > 0 (absent, or all-zero), which means a
+    loader dropped the ladder and the comparison would be vacuous. The
+    contradiction return carries a ``reason`` and NO ``max_abs_diff_kcal``/
+    ``pmf_full``/``pmf_lambda0`` (no comparison was made), so any consumer
+    formatting those must key on their presence, not on ``status``.
+    ``"skipped"``
     covers three distinct reasons (see ``reason``): no state carries
     lambda == 0.0; one does but holds zero samples; or fewer than
     ``MIN_BINS_FOR_VERDICT`` bins survived the comparison gate (too sparse
@@ -117,6 +125,32 @@ def ladder_crosscheck(d: Any, f_k_global: np.ndarray, bins, kbt_kcal: float,
     if lambdas is None:
         lambdas = np.zeros(d.u_nk.shape[1])
     lambdas = np.asarray(lambdas, dtype=float)
+
+    # CONTRADICTION GUARD (2026-09-07 final review, C1). `meta['gamd_ladder']`
+    # is only ever set True by apply_ladder_boost_to_u, and only when some
+    # state carries gamd_lambda > 0 -- so "ladder asserted" and "no λ > 0 in
+    # state_lambdas" cannot both be true of the same correctly-loaded run.
+    # When they are, a loader dropped state_lambdas on the way to Data (the
+    # C2/C3 defects). Without this guard every column then reads λ = 0, the
+    # "λ=0-only subset" IS the full population, the two PMFs are bit-identical
+    # and the gate returns status 'pass' with max_abs_diff_kcal == 0.0 -- a
+    # vacuous PASS that certifies exactly the runs whose ladder was lost.
+    # Graded 'fail', not a new status string and not 'skipped': gareus_report's
+    # _check_ladder_crosscheck dispatches on the three literals and grades
+    # anything else -- 'skipped' included -- NA, which does not move `overall`.
+    if bool((getattr(d, "meta", None) or {}).get("gamd_ladder")) and not np.any(lambdas > 0.0):
+        return {
+            "status": "fail",
+            "reason": ("meta['gamd_ladder'] is asserted but state_lambdas carries no λ > 0 "
+                       f"({'absent' if getattr(d, 'state_lambdas', None) is None else 'all zero'}) -- "
+                       "the loader lost the per-state ladder rungs, so the λ=0-only subset would be "
+                       "the whole population and the cross-check would be vacuous"),
+            "n_lambda0_samples": int(np.asarray(d.window).size),
+            "tolerance_kcal": tol_kcal,
+            "tolerance_source": "fixed_default",
+            "n_bins_compared": 0,
+        }
+
     lam0_states = np.where(lambdas == 0.0)[0]
     if lam0_states.size == 0:
         return {"status": "skipped", "reason": "no λ=0 states in state_lambdas",
