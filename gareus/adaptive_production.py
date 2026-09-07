@@ -1459,6 +1459,9 @@ def _read_sample_dicts(run_dir: Path) -> List[Dict[str, Any]]:
                     "gamd_boost_total_kcal_mol": (float(boost_kj) / 4.184) if boost_kj != "" else "",
                     "beta_1_over_kJ_mol": "" if beta is None else float(beta),
                     "segment_id": _value_at(data, "segment_id", i, ""),
+                    "v_pep_kj_mol": _blank_if_nonfinite(_value_at(data, "v_pep_kj_mol", i, "")),
+                    "v_dih_kj_mol": _blank_if_nonfinite(_value_at(data, "v_dih_kj_mol", i, "")),
+                    "gamd_lambda": _blank_if_nonfinite(_value_at(data, "gamd_lambda", i, "")),
                 }
                 rows.append(row)
             return rows
@@ -3046,6 +3049,8 @@ def build_union_state_mbar_inputs(
             sec = _float_or_none(row.get("secondary_cv"))
             beta = _float_or_none(row.get("beta_1_over_kJ_mol"))
             boost_kj = _float_or_none(row.get("gamd_boost_total_kj_mol"))
+            v_pep = _float_or_none(row.get("v_pep_kj_mol"))
+            v_dih = _float_or_none(row.get("v_dih_kj_mol"))
             step = _float_or_none(row.get("step"))
             sample_rows.append({
                 "source": source_label,
@@ -3057,6 +3062,8 @@ def build_union_state_mbar_inputs(
                 "secondary_cv": "" if sec is None else float(sec),
                 "beta_1_over_kJ_mol": "" if beta is None else float(beta),
                 "gamd_boost_total_kj_mol": "" if boost_kj is None else float(boost_kj),
+                "v_pep_kj_mol": "" if v_pep is None else float(v_pep),
+                "v_dih_kj_mol": "" if v_dih is None else float(v_dih),
                 "usable_for_mbar": int(source_label.startswith("final") or include_epochs),
             })
 
@@ -3091,6 +3098,12 @@ def build_union_state_mbar_inputs(
     ], dtype=np.float64)
     beta_finite = beta_values[np.isfinite(beta_values)]
     beta = float(beta_finite[0]) if beta_finite.size else float("nan")
+    v_pep_values = np.asarray([
+        np.nan if r.get("v_pep_kj_mol", "") == "" else float(r["v_pep_kj_mol"]) for r in sample_rows
+    ], dtype=np.float64)
+    v_dih_values = np.asarray([
+        np.nan if r.get("v_dih_kj_mol", "") == "" else float(r["v_dih_kj_mol"]) for r in sample_rows
+    ], dtype=np.float64)
 
     primary_delta = cv_values[:, np.newaxis] - primary_centers[np.newaxis, :]
     primary_bias_kcal = 0.5 * primary_k[np.newaxis, :] * primary_delta * primary_delta
@@ -3104,10 +3117,43 @@ def build_union_state_mbar_inputs(
         secondary_bias_kcal[secondary_mask] = 0.5 * secondary_k_mat[secondary_mask] * dsec[secondary_mask] * dsec[secondary_mask]
     umbrella_bias_kcal = primary_bias_kcal + secondary_bias_kcal
     umbrella_bias_kj = 4.184 * umbrella_bias_kcal
+
+    # λ-ladder boost term: a closed form of each sample's own stored raw
+    # channel energies (v_pep, v_dih) evaluated under every state's own
+    # gamd_lambda. Zero (not merely small) whenever no registry state carries
+    # a nonzero rung -- the common case (plain umbrella/REUS, plain GaMD) is
+    # untouched. When a rung IS active, missing raw energies must fail loudly
+    # rather than silently reweight without the term (see reconstruct_bias_matrix's
+    # docstring for the same invariant on the loader path).
+    state_lambdas = np.asarray([float(getattr(s, "gamd_lambda", 0.0) or 0.0) for s in states], dtype=np.float64)
+    gamd_boost_kj_nk = np.zeros_like(umbrella_bias_kj)
+    if np.any(state_lambdas > 0.0):
+        if not np.any(np.isfinite(v_pep_values)):
+            raise ValueError(
+                "registry states carry gamd_lambda > 0 but no sample row has a finite v_pep_kj_mol; "
+                "the λ-ladder cannot be reweighted without the raw channel energies"
+            )
+        if not np.any(np.isfinite(v_dih_values)):
+            raise ValueError(
+                "registry states carry gamd_lambda > 0 but no sample row has a finite v_dih_kj_mol "
+                "(v_pep_kj_mol is present); the λ-ladder cannot be reweighted without the raw channel energies"
+            )
+        from .pep_gamd import PepGamdEnvelope, pep_gamd_boost_matrix_kj  # noqa: PLC0415
+        envelope_path = adaptive_dir / "global_shared_gamd_setup" / "shared_gamd_setup_globals.json"
+        if not envelope_path.exists():
+            raise ValueError(
+                f"registry states carry gamd_lambda > 0 but the frozen GaMD envelope "
+                f"{envelope_path} does not exist; v_pep/v_dih cannot be reweighted under the "
+                f"ladder without it"
+            )
+        envelope = PepGamdEnvelope.from_json(envelope_path)
+        gamd_boost_kj_nk = pep_gamd_boost_matrix_kj(v_pep_values, v_dih_values, state_lambdas, envelope).T
+    total_bias_kj = umbrella_bias_kj + gamd_boost_kj_nk
+
     if math.isfinite(beta):
-        umbrella_reduced_bias_nk = float(beta) * umbrella_bias_kj
+        umbrella_reduced_bias_nk = float(beta) * total_bias_kj
     else:
-        umbrella_reduced_bias_nk = np.full_like(umbrella_bias_kj, np.nan)
+        umbrella_reduced_bias_nk = np.full_like(total_bias_kj, np.nan)
 
     id_to_index = {int(sid): i for i, sid in enumerate(state_ids.tolist())}
     sampled_state_ids = np.asarray([int(r["sampled_state_id"]) for r in sample_rows], dtype=np.int64)
@@ -3121,7 +3167,8 @@ def build_union_state_mbar_inputs(
     with csv_path.open("w", newline="") as handle:
         fieldnames = [
             "source", "source_dir", "step", "sampled_epoch_window", "sampled_state_id",
-            "cv_A", "secondary_cv", "beta_1_over_kJ_mol", "gamd_boost_total_kj_mol", "usable_for_mbar",
+            "cv_A", "secondary_cv", "beta_1_over_kJ_mol", "gamd_boost_total_kj_mol",
+            "v_pep_kj_mol", "v_dih_kj_mol", "usable_for_mbar",
         ]
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
@@ -3142,6 +3189,10 @@ def build_union_state_mbar_inputs(
         umbrella_bias_kj_mol_nk=umbrella_bias_kj,
         umbrella_reduced_bias_nk=umbrella_reduced_bias_nk,
         N_k=n_k,
+        gamd_boost_kj_nk=gamd_boost_kj_nk,
+        state_lambdas=state_lambdas,
+        v_pep_kj_mol=v_pep_values,
+        v_dih_kj_mol=v_dih_values,
     )
     meta = {
         "schema_version": "adaptive_union_mbar_inputs_v1",
@@ -3157,6 +3208,7 @@ def build_union_state_mbar_inputs(
         "matrix_shape_convention": "sample-major [n_samples, n_states]; transpose to u_kn if PyMBAR expects [K,N]",
         "note": "Biases are reconstructed post-hoc from scalar CV traces against the union of registry states. Final-only samples are the conservative default.",
         "subsample_counts_per_state": _subsample_counts,
+        "gamd_ladder": bool(np.any(state_lambdas > 0.0)),
     }
     json_path = out_prefix.with_suffix(".json")
     write_json(json_path, _json_ready(meta))

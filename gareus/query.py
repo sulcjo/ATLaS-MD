@@ -315,6 +315,10 @@ def reconstruct_bias_matrix(
     cv2: Optional[np.ndarray],
     windows: list,
     beta: float,
+    *,
+    v_pep: Optional[np.ndarray] = None,
+    v_dih: Optional[np.ndarray] = None,
+    envelope=None,
 ) -> np.ndarray:
     """Reconstruct umbrella_reduced_bias_nk analytically.
 
@@ -331,16 +335,33 @@ def reconstruct_bias_matrix(
     not a bug: fabricating a zero deviation would silently claim the sample
     was on-target for a coordinate that was never actually measured.
 
+    A window carrying a "gamd_lambda" key with value > 0 is a lambda-ladder
+    rung: its reduced bias additionally includes
+    ``beta * pep_gamd_boost_kj(v_pep, v_dih, gamd_lambda, envelope)``, the
+    closed-form Pep-GaMD boost of each sample's own raw channel energies
+    evaluated under that rung's lambda. This requires ``v_pep``, ``v_dih``,
+    and ``envelope`` -- a ladder rung cannot be reweighted without the raw
+    energies it was measured with, so any window with gamd_lambda > 0 while
+    one of the three is missing raises ValueError rather than silently
+    falling back to the umbrella-only bias for that state.
+
     Parameters
     ----------
     cv_A : (N,) array of primary CV values
     cv2  : (N,) array of secondary CV values, or None for 1D runs
-    windows : list of window dicts with center1, k1 (and optionally center2, k2)
+    windows : list of window dicts with center1, k1 (and optionally center2,
+        k2, gamd_lambda)
     beta : 1/(kB*T) in mol/kJ (e.g. 1 / (8.314462618e-3 * T_K))
+    v_pep : (N,) array of raw peptide-channel energies, kJ/mol -- required
+        when any window carries gamd_lambda > 0
+    v_dih : (N,) array of raw dihedral-channel energies, kJ/mol -- required
+        when any window carries gamd_lambda > 0
+    envelope : frozen PepGamdEnvelope -- required when any window carries
+        gamd_lambda > 0
 
     Returns
     -------
-    nk : (N, K) float64 array of dimensionless reduced umbrella biases
+    nk : (N, K) float64 array of dimensionless reduced umbrella+ladder biases
     """
     cv_A = np.asarray(cv_A, dtype=np.float64)
     N = len(cv_A)
@@ -358,7 +379,18 @@ def reconstruct_bias_matrix(
                 d2 = cv2_arr - c2
                 nk[:, k] += KJ_PER_KCAL * 0.5 * k2 * d2 * d2
 
-    return beta * nk
+    u = beta * nk
+
+    lambdas = np.asarray([float(w.get("gamd_lambda", 0.0) or 0.0) for w in windows], dtype=float)
+    if np.any(lambdas > 0.0):
+        if v_pep is None or v_dih is None or envelope is None:
+            raise ValueError(
+                "windows carry gamd_lambda > 0 but v_pep/v_dih/envelope were not supplied; "
+                "the ladder cannot be reweighted without the raw channel energies"
+            )
+        from .pep_gamd import pep_gamd_boost_matrix_kj
+        u = u + float(beta) * pep_gamd_boost_matrix_kj(v_pep, v_dih, lambdas, envelope).T
+    return u
 
 
 def export_analysis_arrays_npz(
