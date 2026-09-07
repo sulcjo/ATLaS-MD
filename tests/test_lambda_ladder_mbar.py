@@ -1009,3 +1009,161 @@ def test_augment_with_rounds_is_unchanged_for_a_non_ladder_run(tmp_path):
     out = _augment_with_adaptive_rounds(d, run)
     assert out.u_nk.shape[1] == 1
     assert not out.meta.get("gamd_ladder")
+
+
+# --- Final-review fix wave, I2/I1: the WRITER emits per-window gamd_lambda,
+# and every loader prefers the written value over the nanmedian inference.
+
+def test_snapshot_window_rows_carry_gamd_lambda():
+    """I2 root cause: production.py's per-segment window snapshot emitted
+    window_id/center1/k1/center2/k2 and no gamd_lambda, which is why three
+    separate loaders had to INFER each state's rung by nanmedian over its
+    samples' own gamd_lambda column."""
+    from gareus.production import snapshot_window_rows
+
+    rows = snapshot_window_rows([0.0, 1.0], [10.0, 20.0], None, None, [0.0, 1.0])
+    assert [r["gamd_lambda"] for r in rows] == [0.0, 1.0]
+    assert [r["window_id"] for r in rows] == [0, 1]
+    assert "center2" not in rows[0]
+
+    rows2d = snapshot_window_rows([0.0], [10.0], [2.0], [5.0], None)
+    assert rows2d[0]["gamd_lambda"] == 0.0
+    assert rows2d[0]["center2"] == 2.0 and rows2d[0]["k2"] == 5.0
+
+
+def _parquet_ladder_run(prod, windows, lam_per_sample, with_envelope=True):
+    """A minimal Parquet run: 2 windows sharing one umbrella centre, samples
+    carrying real v_pep/v_dih, plus the frozen envelope next to it."""
+    import json
+    from gareus.store import ParquetSampleWriter, SegmentRegistry, WindowSnapshot
+    from gareus.pep_gamd import PepGamdEnvelope
+
+    prod.mkdir(parents=True, exist_ok=True)
+    reg = SegmentRegistry(prod)
+    seg_id = reg.open_segment("run_001", None, 1)
+    WindowSnapshot(prod).snapshot(seg_id, windows, cv1_type="distance", cv2_type=None)
+
+    writer = ParquetSampleWriter(prod / "samples" / seg_id, flush_rows=1000)
+    for i, lam in enumerate(lam_per_sample):
+        writer.write_sample(i * 10, 0, i % len(windows), 5.0 + 0.01 * i, None,
+                            -100.0, 1.0, 0.6, 0.4,
+                            v_pep=10.0 + i, v_dih=3.0 + 0.5 * i, gamd_lambda=lam)
+    writer.close()
+    reg.close_segment(seg_id, end_step=10 * len(lam_per_sample))
+
+    (prod / "run_args.json").write_text(json.dumps({"temperature_k": 300.0}))
+    env = PepGamdEnvelope(50.0, -50.0, 50.0, 0.8, 50.0, -50.0, 50.0, 0.6)
+    if with_envelope:
+        (prod / "shared_gamd_setup_globals.json").write_text(json.dumps({"all_globals": {
+            "Vmax_Total": env.vmax_total, "Vmin_Total": env.vmin_total,
+            "threshold_energy_Total": env.threshold_total, "k0_Total": env.k0max_total,
+            "Vmax_Dihedral": env.vmax_dih, "Vmin_Dihedral": env.vmin_dih,
+            "threshold_energy_Dihedral": env.threshold_dih, "k0_Dihedral": env.k0max_dih}}))
+    return env
+
+
+def test_load_parquet_uses_the_written_gamd_lambda_and_does_not_raise(tmp_path):
+    """I2: with gamd_lambda in the snapshot, load_parquet must (a) still
+    load -- gareus.query.reconstruct_bias_matrix raises on a λ>0 window
+    unless v_pep/v_dih/envelope are passed in, which is the trap adding the
+    column opens -- and (b) take state_lambdas straight from the snapshot,
+    with the boost applied exactly ONCE."""
+    from gareus.mbar_analysis.loaders import load_parquet
+    from gareus.pep_gamd import pep_gamd_boost_kj
+
+    prod = tmp_path / "final_production"
+    windows = [{"window_id": 0, "center1": 5.0, "k1": 10.0, "gamd_lambda": 0.0},
+               {"window_id": 1, "center1": 5.0, "k1": 10.0, "gamd_lambda": 1.0}]
+    env = _parquet_ladder_run(prod, windows, [0.0, 1.0, 0.0, 1.0, 0.0, 1.0])
+
+    d = load_parquet(prod)
+
+    assert np.allclose(d.state_lambdas, [0.0, 1.0])
+    assert d.meta.get("gamd_ladder") is True
+    assert d.meta.get("gamd_ladder_state_lambda_source") == "window_snapshot"
+    expected = np.array([d.beta * pep_gamd_boost_kj(vp, vd, 1.0, env)
+                         for vp, vd in zip(d.v_pep_kj, d.v_dih_kj)])
+    assert np.any(expected > 0.0), expected
+    # Both windows share centre/k, so their umbrella columns are identical and
+    # the whole column difference is exactly one boost -- not two.
+    assert np.allclose(d.u_nk[:, 1] - d.u_nk[:, 0], expected), (d.u_nk[:, 1] - d.u_nk[:, 0], expected)
+
+
+def test_load_parquet_falls_back_to_nanmedian_for_pre_column_snapshots(tmp_path):
+    """I2: a snapshot written before gamd_lambda existed carries no such key;
+    the per-sample nanmedian inference must still recover each window's rung,
+    and must record that it did so in meta."""
+    from gareus.mbar_analysis.loaders import load_parquet
+
+    prod = tmp_path / "final_production"
+    windows = [{"window_id": 0, "center1": 5.0, "k1": 10.0},
+               {"window_id": 1, "center1": 5.0, "k1": 10.0}]      # no gamd_lambda key
+    _parquet_ladder_run(prod, windows, [0.0, 1.0, 0.0, 1.0, 0.0, 1.0])
+
+    d = load_parquet(prod)
+
+    assert np.allclose(d.state_lambdas, [0.0, 1.0])
+    assert d.meta.get("gamd_ladder") is True
+    assert d.meta.get("gamd_ladder_state_lambda_source") == "per_sample_nanmedian_fallback"
+
+
+def test_load_parquet_non_ladder_run_is_untouched(tmp_path):
+    from gareus.mbar_analysis.loaders import load_parquet
+
+    prod = tmp_path / "final_production"
+    windows = [{"window_id": 0, "center1": 5.0, "k1": 10.0, "gamd_lambda": 0.0},
+               {"window_id": 1, "center1": 5.5, "k1": 10.0, "gamd_lambda": 0.0}]
+    _parquet_ladder_run(prod, windows, [0.0] * 6, with_envelope=False)
+
+    d = load_parquet(prod)
+    assert not np.any(np.asarray(d.state_lambdas) > 0.0)
+    assert d.meta.get("gamd_ladder") is False
+
+
+def test_load_epoch_csv_adaptive_keys_states_on_gamd_lambda(tmp_path):
+    """I1: _row_state_key was (center1, k1, center2, k2) with no
+    gamd_lambda, so every rung of one window merged into ONE state and λ was
+    then a nanmedian over a mixture of rungs."""
+    import csv as _csv
+    import json
+    from gareus.mbar_analysis.loaders_adaptive import load_epoch_csv_adaptive
+    from gareus.pep_gamd import PepGamdEnvelope
+
+    root = tmp_path / "run"
+    ap = root / "adaptive_production"
+    epoch = ap / "epoch_000" / "baseline"
+    epoch.mkdir(parents=True, exist_ok=True)
+    env = PepGamdEnvelope(50.0, -50.0, 50.0, 0.8, 50.0, -50.0, 50.0, 0.6)
+    (ap / "shared_gamd_setup_globals.json").write_text(json.dumps({"all_globals": {
+        "Vmax_Total": env.vmax_total, "Vmin_Total": env.vmin_total,
+        "threshold_energy_Total": env.threshold_total, "k0_Total": env.k0max_total,
+        "Vmax_Dihedral": env.vmax_dih, "Vmin_Dihedral": env.vmin_dih,
+        "threshold_energy_Dihedral": env.threshold_dih, "k0_Dihedral": env.k0max_dih}}))
+
+    # secondary_cv_center is written as a real 0.0 rather than left blank: on a
+    # blank, _row_state_key's _fkey falls back to a FRESH float('nan') per call,
+    # and a NaN key element is not equal to itself, so the second pass raises
+    # KeyError. That is a pre-existing defect of this (dormant, legacy-CSV-only)
+    # loader, unrelated to I1 and deliberately not fixed in this wave.
+    fields = ["cv_A", "secondary_cv", "secondary_cv_center", "step", "replica", "window",
+              "center_A", "k_kcal_mol_A2", "beta_1_over_kJ_mol", "gamd_boost_total_kj_mol",
+              "potential_kj_mol", "v_pep_kj_mol", "v_dih_kj_mol", "gamd_lambda"]
+    with (epoch / "samples.csv").open("w", newline="") as fh:
+        w = _csv.DictWriter(fh, fieldnames=fields)
+        w.writeheader()
+        for i in range(8):
+            lam = 0.0 if i % 2 == 0 else 1.0
+            w.writerow({"cv_A": 5.0 + 0.01 * i, "secondary_cv": "",
+                        "secondary_cv_center": 0.0, "step": i * 10,
+                        "replica": 0, "window": i % 2, "center_A": 5.0,
+                        "k_kcal_mol_A2": 10.0, "beta_1_over_kJ_mol": 1.0 / 2.494,
+                        "gamd_boost_total_kj_mol": 0.0, "potential_kj_mol": -100.0,
+                        "v_pep_kj_mol": 10.0 + i, "v_dih_kj_mol": 3.0 + 0.5 * i,
+                        "gamd_lambda": lam})
+
+    d = load_epoch_csv_adaptive(ap)
+
+    # Same centre and k for both rungs: without λ in the key this is ONE state.
+    assert d.u_nk.shape[1] == 2, d.u_nk.shape
+    assert sorted(np.asarray(d.state_lambdas).tolist()) == [0.0, 1.0]
+    assert d.meta.get("gamd_ladder") is True

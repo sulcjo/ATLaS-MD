@@ -1726,6 +1726,43 @@ def make_gamd_integrator(system, args, unit):
         pass
     return integrator, result
 
+def snapshot_window_rows(centers_a, k_list, secondary_centers, secondary_k_list,
+                         gamd_lambdas=None, n=None) -> list[dict]:
+    """Per-segment window snapshot rows (windows/<segment_id>.json).
+
+    Carries ``gamd_lambda`` per window. Without it every MBAR loader reading a
+    snapshot had to INFER each state's rung by nanmedian over that window's own
+    samples' ``gamd_lambda`` column -- an inference that is only as good as the
+    sample set (a never-sampled window silently reads 0.0, i.e. "no ladder")
+    and that merges nothing when the true λ is right there in the writer.
+    2026-09-07 final review, I2.
+
+    Note the downstream contract this creates: ``gareus.query.reconstruct_bias_matrix``
+    refuses a window with ``gamd_lambda > 0`` unless ``v_pep``/``v_dih``/``envelope``
+    are supplied, so every caller reconstructing from these rows must pass them.
+    """
+    count = int(n) if n is not None else len(list(centers_a))
+    rows = []
+    for wi in range(count):
+        row = {
+            "window_id": int(wi),
+            "center1": float(centers_a[wi]),
+            "k1": float(k_list[wi]),
+        }
+        if secondary_centers is not None and secondary_k_list is not None:
+            row["center2"] = float(secondary_centers[wi])
+            row["k2"] = float(secondary_k_list[wi])
+        lam = 0.0
+        if gamd_lambdas is not None and wi < len(gamd_lambdas):
+            try:
+                lam = float(gamd_lambdas[wi] or 0.0)
+            except (TypeError, ValueError):
+                lam = 0.0
+        row["gamd_lambda"] = lam
+        rows.append(row)
+    return rows
+
+
 def window_assignment_rows(centers_a: np.ndarray, k_list: list[float], temperature_k: float, secondary_centers=None, secondary_k_list=None, args=None, gamd_lambdas=None) -> list[dict]:
     """Return an explicit table of umbrella centers and force constants.
 
@@ -6197,16 +6234,10 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     _parent_was_running = bool(_parent_seg and _parent_seg.get("status") == "running")
     _round_id = int(getattr(args, "adaptive_feedback_round", 1))
     _seg_id = _seg_registry.open_segment(_run_id, _parent_seg_id, _round_id)
-    _win_snapshot_windows = [
-        {
-            "window_id": int(wi),
-            "center1": float(centers_a[wi]),
-            "k1": float(k_list[wi]),
-            **({"center2": float(secondary_cv_centers[wi]), "k2": float(secondary_cv_k_kcal_list[wi])}
-               if secondary_cv_centers is not None and secondary_cv_k_kcal_list is not None else {}),
-        }
-        for wi in range(nrep)
-    ]
+    _win_snapshot_windows = snapshot_window_rows(
+        centers_a[:nrep], k_list[:nrep], secondary_cv_centers, secondary_cv_k_kcal_list,
+        getattr(args, "state_gamd_lambdas", None), n=nrep,
+    )
     _cv2_type = (secondary_cv_metadata or {}).get("mode") if secondary_cv_centers is not None else None
     WindowSnapshot(out_dir).snapshot(_seg_id, _win_snapshot_windows, cv1_type=primary_cv_mode(args), cv2_type=_cv2_type)
     parquet_sample_writer = ParquetSampleWriter(

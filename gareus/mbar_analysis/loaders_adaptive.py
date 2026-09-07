@@ -1705,7 +1705,14 @@ def load_epoch_csv_adaptive(ap: Path, epoch_ids: Optional[set[int]] = None) -> D
         kp = _fkey(row.get('primary_cv_k', row.get('k_kcal_mol_A2', row.get('k', ''))), 0.0)
         cs = _fkey(row.get('secondary_cv_center', ''), float('nan'))
         ks_ = _fkey(row.get('secondary_cv_k_kcal_mol', row.get('secondary_cv_k_kcal', '')), 0.0)
-        return (cp, kp, cs, ks_)
+        # λ is part of a thermodynamic state's identity: two rungs of one
+        # window share centre and k and differ only here. Without it every
+        # rung merged into ONE state and λ was then a nanmedian over a
+        # MIXTURE of rungs (2026-09-07 final review, I1). Defaults to 0.0,
+        # never NaN -- a NaN key element is not equal to itself, so it would
+        # fragment one state into one-per-row.
+        lam = _fkey(row.get('gamd_lambda', ''), 0.0)
+        return (cp, kp, cs, ks_, lam)
 
     for row in all_rows:
         key = _row_state_key(row)
@@ -1718,13 +1725,14 @@ def load_epoch_csv_adaptive(ap: Path, epoch_ids: Optional[set[int]] = None) -> D
     k_kcal = np.asarray([s[1] for s in state_list], dtype=np.float64)
     sec_centers = np.asarray([s[2] for s in state_list], dtype=np.float64)
     sec_ks = np.asarray([s[3] for s in state_list], dtype=np.float64)
+    state_lambdas_from_key = np.asarray([s[4] for s in state_list], dtype=np.float64)
     has_secondary = np.any(np.isfinite(sec_centers) & (sec_ks != 0.0))
 
     # Extract sample arrays
     cv_list, cv2_list, rg_list, win_list, rep_list, step_list, boost_list, pot_list = [], [], [], [], [], [], [], []
     beta_sample = []
     src_idx_list = []
-    v_pep_list, v_dih_list, lam_list = [], [], []
+    v_pep_list, v_dih_list = [], []
     for row in all_rows:
         cv_val = row.get('cv_A', row.get('primary_cv_value', ''))
         try:
@@ -1752,8 +1760,6 @@ def load_epoch_csv_adaptive(ap: Path, epoch_ids: Optional[set[int]] = None) -> D
         except Exception: v_pep_list.append(float('nan'))
         try: v_dih_list.append(float(row.get('v_dih_kj_mol', '') or 'nan'))
         except Exception: v_dih_list.append(float('nan'))
-        try: lam_list.append(float(row.get('gamd_lambda', '') or 0.0))
-        except Exception: lam_list.append(float('nan'))
 
     cv = np.asarray(cv_list, dtype=np.float64)
     cv2 = np.asarray(cv2_list, dtype=np.float64)
@@ -1765,7 +1771,6 @@ def load_epoch_csv_adaptive(ap: Path, epoch_ids: Optional[set[int]] = None) -> D
     pot = np.asarray(pot_list, dtype=np.float64)
     v_pep = np.asarray(v_pep_list, dtype=np.float64)
     v_dih = np.asarray(v_dih_list, dtype=np.float64)
-    lam_sample = np.asarray(lam_list, dtype=np.float64)
     beta_arr = np.asarray(beta_sample, dtype=np.float64)
     finite_betas = beta_arr[np.isfinite(beta_arr)]
     if finite_betas.size:
@@ -1783,18 +1788,12 @@ def load_epoch_csv_adaptive(ap: Path, epoch_ids: Optional[set[int]] = None) -> D
             total = total + 0.5 * float(sec_ks[k]) * (cv2 - float(sec_centers[k])) ** 2
         u_nk[:, k] = scale * total
 
-    # lambda-ladder: per-merged-state rung, derived from the per-sample
-    # gamd_lambda column by grouping on this loader's own merged window
-    # index (no registry/window-snapshot here carries a per-state
-    # gamd_lambda -- same derivation as gareus.mbar_analysis.loaders'
-    # load_csv/load_parquet). A no-op through apply_ladder_boost_to_u when
-    # no state carries gamd_lambda > 0.
-    state_lambdas = np.zeros(K, dtype=np.float64)
-    if np.any(np.isfinite(lam_sample)):
-        for k in range(K):
-            grp = lam_sample[(window == k) & np.isfinite(lam_sample)]
-            if grp.size:
-                state_lambdas[k] = float(np.nanmedian(grp))
+    # lambda-ladder: each merged state now carries its rung IN ITS KEY (see
+    # _row_state_key), so this is the exact per-state λ, not a nanmedian over
+    # a mixture. A no-op through apply_ladder_boost_to_u when no state carries
+    # gamd_lambda > 0.
+    state_lambdas = state_lambdas_from_key
+    meta['gamd_ladder_state_lambda_source'] = 'row_state_key'
     from .ladder import apply_ladder_boost_to_u, load_pep_gamd_envelope
     _envelope = load_pep_gamd_envelope(ap) if np.any(state_lambdas > 0.0) else None
     u_nk = apply_ladder_boost_to_u(u_nk, v_pep, v_dih, state_lambdas, _envelope, beta, meta)

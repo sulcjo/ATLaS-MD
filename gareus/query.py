@@ -319,6 +319,7 @@ def reconstruct_bias_matrix(
     v_pep: Optional[np.ndarray] = None,
     v_dih: Optional[np.ndarray] = None,
     envelope=None,
+    meta: Optional[dict] = None,
 ) -> np.ndarray:
     """Reconstruct umbrella_reduced_bias_nk analytically.
 
@@ -334,6 +335,11 @@ def reconstruct_bias_matrix(
     clean() and every other bias-reconstruction site in this codebase uses),
     not a bug: fabricating a zero deviation would silently claim the sample
     was on-target for a coordinate that was never actually measured.
+
+    ``meta``, when given, receives the shared ladder helper's own bookkeeping
+    (``gamd_ladder``, ``gamd_ladder_samples_without_raw_energies``) so a caller
+    reconstructing through this function does not have to add the term itself
+    a second time just to get those keys populated.
 
     A window carrying a "gamd_lambda" key with value > 0 is a lambda-ladder
     rung: its reduced bias additionally includes
@@ -390,15 +396,18 @@ def reconstruct_bias_matrix(
     # np.asarray(None, dtype=float64) would raise the wrong exception type),
     # so this is the one guard that must run before calling it.
     lambdas = np.asarray([float(w.get("gamd_lambda", 0.0) or 0.0) for w in windows], dtype=float)
-    if np.any(lambdas > 0.0):
-        if v_pep is None or v_dih is None or envelope is None:
-            raise ValueError(
-                "windows carry gamd_lambda > 0 but v_pep/v_dih/envelope were not supplied; "
-                "the ladder cannot be reweighted without the raw channel energies"
-            )
-        from .mbar_analysis.ladder import apply_ladder_boost_to_u
-        u = apply_ladder_boost_to_u(u, v_pep, v_dih, lambdas, envelope, beta, {})
-    return u
+    if np.any(lambdas > 0.0) and (v_pep is None or v_dih is None or envelope is None):
+        raise ValueError(
+            "windows carry gamd_lambda > 0 but v_pep/v_dih/envelope were not supplied; "
+            "the ladder cannot be reweighted without the raw channel energies"
+        )
+    # Called unconditionally so `meta` gets the uniform contract every other
+    # caller of the helper already has (gamd_ladder True/False plus the
+    # missing-raw-energy count). With no active rung it returns `u` untouched
+    # without ever looking at v_pep/v_dih, so a None is harmless there.
+    from .mbar_analysis.ladder import apply_ladder_boost_to_u
+    return apply_ladder_boost_to_u(u, v_pep, v_dih, lambdas, envelope, beta,
+                                   meta if meta is not None else {})
 
 
 def export_analysis_arrays_npz(

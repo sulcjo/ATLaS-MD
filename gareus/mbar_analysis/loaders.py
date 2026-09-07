@@ -433,11 +433,21 @@ def load_csv(prod: Path, load_notes: Optional[list[str]] = None) -> Data:
     # samples at all) defaults to 0.0, the documented "ladder inactive" value.
     K=int(u.shape[1])
     state_lambdas=np.zeros(K,dtype=np.float64)
-    if np.any(np.isfinite(lam)):
+    _row_lams=[r.get('gamd_lambda') for r in rows] if len(rows)==K else []
+    if any(v not in (None,'') for v in _row_lams):
+        # PREFERRED: umbrella_windows.csv's own per-window gamd_lambda column
+        # (window_assignment_rows has written it since the ladder landed).
+        for k in range(K):
+            try: state_lambdas[k]=float(_row_lams[k] or 0.0)
+            except (TypeError,ValueError): state_lambdas[k]=0.0
+        meta['gamd_ladder_state_lambda_source']='umbrella_windows_csv'
+    elif np.any(np.isfinite(lam)):
+        # FALLBACK, for window tables predating that column only.
         for k in range(K):
             grp=lam[(win==k)&np.isfinite(lam)]
             if grp.size:
                 state_lambdas[k]=float(np.nanmedian(grp))
+        meta['gamd_ladder_state_lambda_source']='per_sample_nanmedian_fallback'
     if used_stored_vectors:
         # R1 fix (2026-09-07 review, Critical 1): `u` here came straight from
         # samples.csv's per-window bias vectors (umbrella_reduced_bias_all_windows_json
@@ -546,37 +556,47 @@ def load_parquet(prod: Path) -> Data:
 
     centers = np.array([float(w['center1']) for w in windows])
     k_kcal  = np.array([float(w['k1'])      for w in windows])
-    # Per-state (per-window) λ: windows/<segment>.json does not itself carry
-    # a "gamd_lambda" key today, so it is derived from the per-sample column
-    # by grouping on window_id -- every replica sampling a given window under
-    # an active ladder is assigned that window's own fixed rung, so the
-    # per-window values are constant modulo NaN noise; nanmedian is robust to
-    # the rare stale/missing row. A window with zero matching finite samples
-    # (e.g. never sampled) defaults to 0.0, matching the "ladder inactive"
-    # convention documented on Data.state_lambdas.
+    # Per-state (per-window) λ. PREFERRED source: the window snapshot's own
+    # "gamd_lambda" key, written by production.snapshot_window_rows. FALLBACK
+    # (snapshots predating that column only): derive it from the per-sample
+    # gamd_lambda column by grouping on window_id -- every replica sampling a
+    # given window under an active ladder is assigned that window's own fixed
+    # rung, so nanmedian is a robust reduction, but a never-sampled window
+    # silently reads 0.0 ("ladder inactive"), which is exactly why the written
+    # value wins when there is one. Recorded in meta, not silent.
     state_lambdas = np.zeros(len(windows), dtype=np.float64)
-    if np.any(np.isfinite(lambda_sample)):
+    snapshot_has_lambda = any(w.get('gamd_lambda') is not None for w in windows)
+    if snapshot_has_lambda:
+        for i, w in enumerate(windows):
+            try:
+                state_lambdas[i] = float(w.get('gamd_lambda') or 0.0)
+            except (TypeError, ValueError):
+                state_lambdas[i] = 0.0
+        meta['gamd_ladder_state_lambda_source'] = 'window_snapshot'
+    elif np.any(np.isfinite(lambda_sample)):
         window_i64 = window.astype(np.int64)
         for i, w in enumerate(windows):
-            explicit = w.get('gamd_lambda')
-            if explicit is not None:
-                state_lambdas[i] = float(explicit)
-                continue
             wid = int(w.get('window_id', i))
             grp = lambda_sample[(window_i64 == wid) & np.isfinite(lambda_sample)]
             if grp.size:
                 state_lambdas[i] = float(np.nanmedian(grp))
+        meta['gamd_ladder_state_lambda_source'] = 'per_sample_nanmedian_fallback'
+        if np.any(state_lambdas > 0.0):
+            meta.setdefault('load_notes', []).append(
+                'windows/<segment>.json predates the gamd_lambda column; each state\'s λ was '
+                'inferred by nanmedian over its own samples (a never-sampled window reads 0.0).')
 
-    # Reconstruct the pure-umbrella N×K dimensionless reduced-bias matrix
-    # (windows/<segment>.json never carries a "gamd_lambda" key, so this is
-    # never anything but umbrella-only), then add the ladder term through
-    # the one shared helper every MBAR loader/builder uses -- it is a no-op
-    # when no derived state carries a nonzero rung.
+    # Reconstruct the N×K dimensionless reduced-bias matrix. The ladder term is
+    # added INSIDE reconstruct_bias_matrix (which delegates to the one shared
+    # helper) by handing it window dicts carrying the resolved λ -- adding it
+    # again here would double-count it. `meta` is threaded through so the
+    # helper's gamd_ladder bookkeeping lands on this Data either way.
     cv2_for_nk = _fill_masked_nan(cv2_raw) if cv2_raw is not None else None
-    u_nk = reconstruct_bias_matrix(cv, cv2_for_nk, windows, beta)
-    from .ladder import apply_ladder_boost_to_u, load_pep_gamd_envelope
+    from .ladder import load_pep_gamd_envelope
     envelope = load_pep_gamd_envelope(prod) if np.any(state_lambdas > 0.0) else None
-    u_nk = apply_ladder_boost_to_u(u_nk, v_pep, v_dih, state_lambdas, envelope, beta, meta)
+    windows_for_nk = [dict(w, gamd_lambda=float(state_lambdas[i])) for i, w in enumerate(windows)]
+    u_nk = reconstruct_bias_matrix(cv, cv2_for_nk, windows_for_nk, beta,
+                                   v_pep=v_pep, v_dih=v_dih, envelope=envelope, meta=meta)
 
     rows = []
     wcsv = prod / 'umbrella_windows.csv'
