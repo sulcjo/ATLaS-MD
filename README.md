@@ -1,4 +1,4 @@
-# GAREUS peptide sampler
+# ATLaS-MD
 
 OpenMM explicit-solvent Amber14/PME peptide umbrella-sampling workflow with optional HMR-GaMD, REUS, adaptive window feedback, epoch-based adaptive production, and post-hoc MBAR/PMF outputs.
 
