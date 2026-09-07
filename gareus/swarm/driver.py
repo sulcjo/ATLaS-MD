@@ -215,6 +215,12 @@ def build_or_load_plan(args, out_dir, round_index: int, *, topology, contact_pai
     library = _load_seed_library_for_round(args, round_index, topology=topology, primary_cv_def=primary_cv_def)
 
     if round_index == 0:
+        if not contact_pairs:
+            raise SystemExit(
+                "--swarm-stage needs a nonlocal-contacts primary CV (contact_pairs is empty); "
+                "heavy-CV1 is the swarm's stratification coordinate and a distance-mode CV "
+                "cannot stratify it"
+            )
         ca_indices_in_seed = _ca_indices_in_seed(library, topology)
         dropped: list = []
         seeds = describe_seeds(library, ca_indices_in_seed, contact_pairs, args, dropped_out=dropped)
@@ -307,12 +313,14 @@ def run_swarm_stage(args, out_dir, progress=None) -> dict:
 
     rows, meta = build_or_load_plan(args, out_dir, round_index, topology=topology, contact_pairs=contact_pairs)
     library = _load_seed_library_for_round(args, round_index, topology=topology, primary_cv_def=primary_cv_def)
+    library_by_path = {str(entry.get("pdb_path", "")): entry for entry in library}
 
     member_range = parse_member_range(getattr(args, "swarm_member_range", None), len(rows))
 
     status_counts: Dict[str, int] = {}
     n_run = n_skipped_resume = 0
-    missing_members: List[int] = []
+    failed_members: List[int] = []      # done.json exists, status != "ok" (graft/MD failure)
+    missing_members: List[int] = []     # attempted this call but done.json still absent afterwards
     for i in member_range:
         row = rows[i]
         member_id = int(row["member_id"])
@@ -323,15 +331,25 @@ def run_swarm_stage(args, out_dir, progress=None) -> dict:
             done = json.loads((member_dir / "done.json").read_text())
             status = str(done.get("status", "ok"))
             status_counts[status] = status_counts.get(status, 0) + 1
+            if status != "ok":
+                failed_members.append(member_id)
             continue
 
-        seed_index = int(str(row["seed_id"]).split("_")[1])
-        if not (0 <= seed_index < len(library)):
+        # Resolve by the plan's own recorded path first -- the library re-sorts by
+        # primary_cv_value and can grow across rounds/resumes (frozen envelope: later
+        # rounds only add seeds), so a bare positional seed_index can silently point
+        # at a different conformer than the one plan.csv actually recorded.
+        conformer = library_by_path.get(str(row["seed_pdb"]))
+        if conformer is None:
+            seed_index = int(str(row["seed_id"]).split("_")[1])
+            if 0 <= seed_index < len(library) and str(library[seed_index].get("pdb_path", "")) == str(row["seed_pdb"]):
+                conformer = library[seed_index]
+        if conformer is None:
             raise ValueError(
-                f"swarm member {member_id}: seed_id {row['seed_id']!r} has no matching "
-                f"conformer in a library of {len(library)} entries (plan/library mismatch)"
+                f"swarm member {member_id}: plan seed_pdb {row['seed_pdb']!r} (seed_id {row['seed_id']!r}) "
+                f"is not resolvable in a library of {len(library)} entries -- the seed library changed "
+                "since plan.csv was written, or the plan/library pairing is otherwise broken"
             )
-        conformer = library[seed_index]
 
         done = run_member(
             args, row, member_dir,
@@ -342,8 +360,10 @@ def run_swarm_stage(args, out_dir, progress=None) -> dict:
         n_run += 1
         status = str(done.get("status", "ok"))
         status_counts[status] = status_counts.get(status, 0) + 1
-        if status != "ok" or not member_done(member_dir):
+        if not member_done(member_dir):
             missing_members.append(member_id)
+        elif status != "ok":
+            failed_members.append(member_id)
 
         print(
             f"member {member_id:04d}/{len(rows):04d} cell {row['cell_id']} seed {row['seed_id']} "
@@ -361,6 +381,7 @@ def run_swarm_stage(args, out_dir, progress=None) -> dict:
         "round": round_index,
         "n_members": len(rows),
         "n_run": n_run,
+        "failed_members": failed_members,
         "n_skipped_resume": n_skipped_resume,
         "status_counts": status_counts,
         "missing_members": missing_members,
