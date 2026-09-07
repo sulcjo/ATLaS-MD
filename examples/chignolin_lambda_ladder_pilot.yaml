@@ -2,11 +2,12 @@ schema_version: '1.0'
 description: >-
   Chignolin (GYDPETGTWG) lambda-ladder pilot: 1 CV1 (contacts) window
   replicated at 5 Pep-GaMD boost strengths (gamd_lambda in
-  {0.0, 0.1, 0.25, 0.5, 1.0}), a small real-scale exercise of the
+  {0.0, 0.1, 0.25, 0.5, 1.0}) at contacts CV1 = 0.06, a small real-scale exercise of the
   (window, rung) state grid described in `gareus -hh` section 13 before
   committing to a full multi-window ladder campaign.
 
-  Run with:  gareus --config examples/chignolin_lambda_ladder_pilot.yaml
+  Run with (cwd = the PARENT of the GENPEPT seed directory, see starting_structures):
+    gareus --config examples/chignolin_lambda_ladder_pilot.yaml --seed-conformers-dir <genpept_out_dir>
 
 # ---------------------------------------------------------------------------
 # Why this file exists
@@ -21,13 +22,19 @@ description: >-
 # rung dimension only, so exchange walks 5 states that differ ONLY in boost
 # strength -- the simplest non-degenerate ladder.
 #
+# Window centre 0.06 (not 0.25): the GENPEPT r7 library spans heavy-atom nonlocal contact
+# fraction ~0-0.07 (best seed for a 0.25 target scored 0.069, the library maximum), and a
+# restrained pull cannot raise this CV (450 ps at k=300 drifted 0.069 -> 0.05). Centres must lie
+# inside seed coverage; k=800 (sigma 0.027 at 300 K) confines within that ~0.1-wide range where
+# k=250 (sigma 0.049) cannot. Pilot attempt 4, 2026-09-07.
+#
 # Explicit window table: examples/chignolin_lambda_ladder_pilot_windows.csv
 #   window,primary_cv_mode,primary_cv_center,primary_cv_k_kcal,gamd_lambda
-#   0,contacts,0.25,800,0.0
-#   1,contacts,0.25,800,0.1
-#   2,contacts,0.25,800,0.25
-#   3,contacts,0.25,800,0.5
-#   4,contacts,0.25,800,1.0
+#   0,contacts,0.06,800,0.0
+#   1,contacts,0.06,800,0.1
+#   2,contacts,0.06,800,0.25
+#   3,contacts,0.06,800,0.5
+#   4,contacts,0.06,800,1.0
 #
 # `--windows-2d-csv` (here: `windows.windows_2d_csv`) is consumed unconditionally
 # whenever it is set, independent of `--window-mode` (gareus/production.py,
@@ -114,21 +121,30 @@ gamd:
   gamd_multiwindow_recon_steps: 10000
   gamd_recon_boosted_iters: 2
   gamd_recon_boosted_tol: 0.05
-  gamd_averaging_window: 2000
+  # gamd-openmm requires gamd_cmd_steps, equil_steps and both recon stages to be >= and a
+  # multiple of the averaging window; 2000 does not divide 25000 or 5000 (pilot attempt 5).
+  gamd_averaging_window: 2500
 
 exchange:
   exchange_mode: gibbs-walk
   exchange_interval: 400
 
 starting_structures:
-  us_pull_ramp_stages: 3
-  us_pull_steps_per_window: 5000
-  us_pull_timestep_fs: 2.0
-  us_pull_k: 50.0
+  # A GENPEPT seed library is REQUIRED (pass --seed-conformers-dir <dir>, or set
+  # seed_conformers_dir here). A heavy-atom contact-fraction CV has ~zero gradient from the
+  # built extended chain, so no pull budget can create the starting structures: pilot attempts
+  # 1-2 (2026-09-07) failed the start-quality gate 5/5 with k up to 250 and 50000 steps. The
+  # library's survivor_pdb_path entries are relative to the GENPEPT cwd, so run from that parent
+  # directory (or use a gareus build that re-roots them). Pull settings = chignolin_7 campaign.
+  seed_selection_mode: auto
+  us_pull_ramp_stages: 10
+  us_pull_steps_per_window: 150000
+  us_pull_timestep_fs: 3.0
+  us_pull_k: 300.0
 
 # Total aggregate MD across the 5-rung ladder (2 ns/replica x 5 replicas).
 # Informational only for window_mode: manual -- see header comment.
 md_budget_ns: 10.0
 
 tui:
-  tui_mode: interactive
+  tui_mode: none  # batch runs (SLURM); use 'interactive' at a terminal
