@@ -64,6 +64,7 @@ include = ["gareus*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = ["slow: real MD, minutes-long"]
 # Deliberately no `addopts = "-q"` here.  addopts is *prepended* to the real
 # command line, and -q is a counting flag: it compounded with the -q in this
 # repo's own documented invocation (`python -m pytest -q tests/`) to give -qq,
