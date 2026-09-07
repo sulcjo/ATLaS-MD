@@ -4259,10 +4259,21 @@ def write_final_run_report(out_dir: Path, args, centers_a, k_list, exchange_stat
     (out_dir / "final_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return report_payload
 
-def compare_gamd_global_sets(reference: dict[str, float], current: dict[str, float], rtol: float = 1.0e-10, atol: float = 1.0e-10) -> dict:
-    """Compare CustomIntegrator globals after copying a shared GaMD setup."""
-    ref = reference or {}
-    cur = current or {}
+def compare_gamd_global_sets(reference: dict[str, float], current: dict[str, float], rtol: float = 1.0e-10, atol: float = 1.0e-10,
+                              ignore_names: frozenset = frozenset()) -> dict:
+    """Compare CustomIntegrator globals after copying a shared GaMD setup.
+
+    ``ignore_names`` drops globals from ref AND cur before any of missing/
+    extra/mismatch is computed, so an intentionally-rescaled global (the
+    lambda-ladder's k0_Total/k0_Dihedral -- see the call site in run_gareus,
+    which passes {"k0_Total", "k0_Dihedral"} whenever the ladder is active)
+    never shows up as a false "copied-global problem": every replica whose
+    window lambda != 1 is SUPPOSED to differ from the raw shared-setup
+    (lambda=1) reference here, by design (set_replica_lambda_for_window runs
+    right after this same shared-globals copy), not because the copy failed.
+    """
+    ref = {k: v for k, v in (reference or {}).items() if k not in ignore_names}
+    cur = {k: v for k, v in (current or {}).items() if k not in ignore_names}
     missing = sorted([k for k in ref if k not in cur])
     extra = sorted([k for k in cur if k not in ref])
     mismatches = []
@@ -5966,8 +5977,14 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         write_json(out_dir / "replica_shared_gamd_copy_report.json", copy_report_payload)
         print("    Shared GaMD copy sanity: skipped for checkpoint resume; integrator state will be loaded from checkpoint.")
     else:
+        # See compare_gamd_global_sets' ignore_names docstring: k0_Total/k0_Dihedral
+        # are rescaled per-rung by set_replica_lambda_for_window right after this
+        # same shared-globals copy, so they must be excluded from the comparison
+        # whenever the ladder is active -- otherwise every replica assigned a
+        # window with lambda != 1 reports a false copied-global "mismatch".
+        _copy_sanity_ignore = frozenset({"k0_Total", "k0_Dihedral"}) if ladder_active else frozenset()
         for i, sim in enumerate(sims):
-            cmp = compare_gamd_global_sets(shared_gamd_globals_all, all_integrator_globals(sim.integrator))
+            cmp = compare_gamd_global_sets(shared_gamd_globals_all, all_integrator_globals(sim.integrator), ignore_names=_copy_sanity_ignore)
             row = {"replica": int(i), **cmp}
             copy_sanity_rows.append(row)
             copy_problem_count += int(cmp.get("missing_count", 0)) + int(cmp.get("mismatch_count", 0)) + int(replica_gamd_copy_report[i].get("skipped_count", 0))

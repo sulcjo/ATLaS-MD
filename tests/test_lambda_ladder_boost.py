@@ -194,3 +194,43 @@ def test_set_replica_lambda_for_window_raises_when_ladder_active_but_lambdas_mis
         pass
     else:
         raise AssertionError("k0max_by_channel set with state_lambdas=None must raise")
+
+
+def test_compare_gamd_global_sets_ignore_names_drops_intentional_ladder_rescale():
+    """Regression: found by the Task 10 tiny end-to-end run. Every replica whose
+    window λ != 1 is SUPPOSED to carry k0_Total/k0_Dihedral rescaled away from
+    the raw shared-setup (λ=1) reference by set_replica_lambda_for_window --
+    that is the entire point of the ladder, not a copy failure. Before this
+    fix, gareus/production.py's per-replica shared-GaMD copy sanity check
+    (compare_gamd_global_sets) had no way to exclude those two globals, so it
+    flagged a false "copied-global problem" (mismatch_count=2,
+    replica_shared_gamd_copy_report.json ok=false) on every λ<1 rung of every
+    real ladder run."""
+    from gareus.production import compare_gamd_global_sets
+
+    reference = {"k0_Total": 1.0, "k0_Dihedral": 1.0, "Vmax_Total": 50.0}
+    current_lambda_zero = {"k0_Total": 0.0, "k0_Dihedral": 0.0, "Vmax_Total": 50.0}
+
+    # Without ignore_names: both k0 globals are (correctly) reported as mismatches.
+    cmp_plain = compare_gamd_global_sets(reference, current_lambda_zero)
+    assert cmp_plain["mismatch_count"] == 2
+    assert {m["name"] for m in cmp_plain["mismatches"]} == {"k0_Total", "k0_Dihedral"}
+
+    # With ignore_names={"k0_Total", "k0_Dihedral"}: the ladder's intentional
+    # rescale is excluded entirely, leaving zero problems for an otherwise
+    # faithful copy.
+    cmp_ladder = compare_gamd_global_sets(
+        reference, current_lambda_zero, ignore_names=frozenset({"k0_Total", "k0_Dihedral"})
+    )
+    assert cmp_ladder["mismatch_count"] == 0
+    assert cmp_ladder["missing_count"] == 0
+    assert cmp_ladder["extra_count"] == 0
+
+    # A REAL copy failure on an unrelated global must still be caught even
+    # when the ladder-specific names are ignored.
+    current_real_failure = {"k0_Total": 0.0, "k0_Dihedral": 0.0, "Vmax_Total": 0.0}
+    cmp_real_failure = compare_gamd_global_sets(
+        reference, current_real_failure, ignore_names=frozenset({"k0_Total", "k0_Dihedral"})
+    )
+    assert cmp_real_failure["mismatch_count"] == 1
+    assert cmp_real_failure["mismatches"][0]["name"] == "Vmax_Total"
