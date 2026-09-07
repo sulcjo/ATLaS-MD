@@ -52,6 +52,12 @@ _ANALYSIS_VECTOR_KEYS = {
     'temperature_K', 'temperature_k', 'beta_1_over_kJ_mol',
     'beta_1_over_kj_mol', 'beta',
     'umbrella_reduced_bias_nk', 'umbrella_reduced_bias_kn',
+    # lambda-ladder raw channel energies + rung (Task 5's AnalysisArrayWriter
+    # schema; see gareus/mbar_analysis/loaders.py's load_npz, item C of the
+    # 2026-09-07 round-2 review) -- without these, _append_npz_arrays' own
+    # allowlist filter silently drops the columns before load_npz ever sees
+    # them, making the wiring there permanently unreachable.
+    'v_pep_kj_mol', 'v_dih_kj_mol', 'gamd_lambda',
 }
 
 
@@ -265,7 +271,37 @@ def load_npz(prod: Path) -> Data:
     for name in ('potential_kj_mol','potential_energy_kj_mol'):
         if name in arr.files: pot=np.asarray(arr[name],float); break
     meta['umbrella_window_rows']=rows
-    return clean(Data(prod,prod/'pmf_analysis',cv,cv2,rg,window,replica,step,u,centers,ks,beta,temp,boost,pot,str(prod/'analysis_arrays.npz'),meta))
+
+    # λ-ladder (2026-09-07 round-2 review, item C): analysis_arrays.npz can
+    # carry v_pep_kj_mol/v_dih_kj_mol/gamd_lambda per sample (Task 5), but u
+    # above is always plain umbrella -- it comes straight from a stored
+    # umbrella_reduced_bias_nk/kn array built against boost-free window
+    # snapshots (gareus/query.py's export path), never through
+    # reconstruct_bias_matrix. Wire it through the same shared helper every
+    # other loader uses, exactly like load_csv/load_parquet: derive a
+    # per-window state_lambdas from the per-sample column, and only if some
+    # state is actually active, load the envelope and add the term. If the
+    # three arrays aren't all present, `u` is left untouched and
+    # meta['gamd_ladder'] is never set -- a pre-ladder npz (or one written
+    # before this schema existed) must see zero behavior change.
+    v_pep_kj = None; v_dih_kj = None; state_lambdas = None
+    if 'v_pep_kj_mol' in arr.files and 'v_dih_kj_mol' in arr.files and 'gamd_lambda' in arr.files:
+        v_pep_kj = np.asarray(arr['v_pep_kj_mol'], dtype=np.float64)
+        v_dih_kj = np.asarray(arr['v_dih_kj_mol'], dtype=np.float64)
+        lam_sample = np.asarray(arr['gamd_lambda'], dtype=np.float64)
+        state_lambdas = np.zeros(u.shape[1], dtype=np.float64)
+        if np.any(np.isfinite(lam_sample)):
+            for k in range(u.shape[1]):
+                grp = lam_sample[(window == k) & np.isfinite(lam_sample)]
+                if grp.size:
+                    state_lambdas[k] = float(np.nanmedian(grp))
+        if np.any(state_lambdas > 0.0):
+            from .ladder import apply_ladder_boost_to_u, load_pep_gamd_envelope
+            envelope = load_pep_gamd_envelope(prod)
+            u = apply_ladder_boost_to_u(u, v_pep_kj, v_dih_kj, state_lambdas, envelope, beta, meta)
+
+    return clean(Data(prod,prod/'pmf_analysis',cv,cv2,rg,window,replica,step,u,centers,ks,beta,temp,boost,pot,str(prod/'analysis_arrays.npz'),meta,
+                       v_pep_kj=v_pep_kj,v_dih_kj=v_dih_kj,state_lambdas=state_lambdas))
 
 
 def _csv_row_count_fast(path: Path) -> int:

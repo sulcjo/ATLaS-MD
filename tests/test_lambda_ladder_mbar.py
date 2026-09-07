@@ -353,3 +353,87 @@ def test_load_parquet_adaptive_union_embeds_ladder_boost_and_sets_flag(tmp_path)
     u_umbrella = reconstruct_bias_matrix(data.cv, None, windows_plain, data.beta)
     assert np.allclose(data.u_nk[:, 0], u_umbrella[:, 0])
     assert not np.allclose(data.u_nk[:, 1], u_umbrella[:, 1])
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-07 round-2 review, item C: load_npz (analysis_arrays.npz route)
+# is a sixth u-building path -- must be wired the same way when the npz
+# carries the ladder columns (Task 5), and must be a true no-op otherwise.
+# ---------------------------------------------------------------------------
+
+def test_load_npz_embeds_ladder_boost_when_arrays_present(tmp_path):
+    import json
+    from gareus.mbar_analysis.loaders import load_npz
+    from gareus.pep_gamd import PepGamdEnvelope, pep_gamd_boost_kj
+
+    from gareus.units import K_B_KJ_PER_MOL_K
+    env = PepGamdEnvelope(50.0, -50.0, 50.0, 0.8, 50.0, -50.0, 50.0, 0.6)
+    beta = 1.0 / (K_B_KJ_PER_MOL_K * 300.0)   # must match analysis_arrays_metadata.json's temperature_K below
+    centers = [0.0, 0.5]; ks = [10.0, 10.0]
+    cv = np.array([0.0, 0.5])
+    window = np.array([0, 1], dtype=int)
+    v_pep = np.array([10.0, 12.0]); v_dih = np.array([5.0, 5.5])
+    lam_sample = np.array([0.0, 1.0])   # window 0 -> lambda 0, window 1 -> lambda 1
+    umbrella_kcal = np.array([
+        0.5 * ks[0] * (cv[0] - centers[0]) ** 2,
+        0.5 * ks[1] * (cv[1] - centers[1]) ** 2,
+    ])
+    u_umbrella_reduced = beta * 4.184 * np.vstack([
+        np.array([umbrella_kcal[0], 0.5 * ks[1] * (cv[0] - centers[1]) ** 2]),
+        np.array([0.5 * ks[0] * (cv[1] - centers[0]) ** 2, umbrella_kcal[1]]),
+    ])
+    np.savez(
+        tmp_path / 'analysis_arrays.npz',
+        cv_A=cv, window=window, replica=np.zeros(2, int), step=np.arange(2),
+        umbrella_reduced_bias_nk=u_umbrella_reduced,
+        v_pep_kj_mol=v_pep, v_dih_kj_mol=v_dih, gamd_lambda=lam_sample,
+    )
+    import csv as _csv
+    with (tmp_path / 'umbrella_windows.csv').open('w', newline='') as f:
+        w = _csv.DictWriter(f, fieldnames=['center_A', 'k_kcal_mol_A2'])
+        w.writeheader()
+        for c, k in zip(centers, ks):
+            w.writerow({'center_A': c, 'k_kcal_mol_A2': k})
+    (tmp_path / 'analysis_arrays_metadata.json').write_text(json.dumps({'temperature_K': 300.0}))
+    (tmp_path / 'shared_gamd_setup_globals.json').write_text(json.dumps({
+        'all_globals': {'k0_Total': 0.8, 'Vmax_Total': 50.0, 'Vmin_Total': -50.0, 'threshold_energy_Total': 50.0,
+                         'k0_Dihedral': 0.6, 'Vmax_Dihedral': 50.0, 'Vmin_Dihedral': -50.0, 'threshold_energy_Dihedral': 50.0}
+    }))
+
+    d = load_npz(tmp_path)
+    assert d.meta.get('gamd_ladder') is True
+    assert np.isfinite(d.u_nk).all()
+    # column 0 (lambda=0) untouched; column 1 (lambda=1) carries the boost.
+    np.testing.assert_allclose(d.u_nk[:, 0], u_umbrella_reduced[:, 0])
+    expected_col1 = u_umbrella_reduced[:, 1] + beta * np.array([
+        pep_gamd_boost_kj(v_pep[0], v_dih[0], 1.0, env),
+        pep_gamd_boost_kj(v_pep[1], v_dih[1], 1.0, env),
+    ])
+    np.testing.assert_allclose(d.u_nk[:, 1], expected_col1)
+
+
+def test_load_npz_leaves_u_untouched_when_ladder_arrays_absent(tmp_path):
+    """No v_pep_kj_mol/v_dih_kj_mol/gamd_lambda in the npz (the pre-ladder,
+    and current real-world, case) -> u must be exactly the stored array and
+    meta['gamd_ladder'] must never be set."""
+    from gareus.mbar_analysis.loaders import load_npz
+
+    u_umbrella = np.array([[1.0, 2.0], [3.0, 4.0]])
+    np.savez(
+        tmp_path / 'analysis_arrays.npz',
+        cv_A=np.array([0.0, 0.5]), window=np.array([0, 1], dtype=int),
+        replica=np.zeros(2, int), step=np.arange(2),
+        umbrella_reduced_bias_nk=u_umbrella,
+    )
+    import csv as _csv
+    with (tmp_path / 'umbrella_windows.csv').open('w', newline='') as f:
+        w = _csv.DictWriter(f, fieldnames=['center_A', 'k_kcal_mol_A2'])
+        w.writeheader()
+        w.writerow({'center_A': 0.0, 'k_kcal_mol_A2': 10.0})
+        w.writerow({'center_A': 0.5, 'k_kcal_mol_A2': 10.0})
+    import json
+    (tmp_path / 'analysis_arrays_metadata.json').write_text(json.dumps({'temperature_K': 300.0}))
+
+    d = load_npz(tmp_path)
+    np.testing.assert_array_equal(d.u_nk, u_umbrella)
+    assert 'gamd_ladder' not in d.meta
