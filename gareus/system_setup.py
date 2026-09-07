@@ -55,6 +55,7 @@ __all__ = [
     "add_position_restraints",
     "make_trajectory_reporter",
     "write_solute_only_topology_pdb",
+    "write_solute_only_pdb",
     "write_state_pdb",
     "run_steps_safely",
     "minimize_and_npt_equilibrate",
@@ -682,22 +683,32 @@ def make_trajectory_reporter(app, base_path: Path, interval: int, args, atom_sub
     raise ValueError(f"Unsupported --traj-format {fmt!r}; use dcd, xtc, or none")
 
 
-def write_solute_only_topology_pdb(out_dir: Path, app, topology, positions, solute_indices) -> Path:
-    """Write ``solute_only.pdb`` containing only ``solute_indices`` (ascending).
+def write_solute_only_pdb(path: Path, app, topology, positions, solute_indices) -> Path:
+    """Write a PDB at ``path`` containing only ``solute_indices`` (ascending).
 
-    Companion topology for ``--traj-solute-only`` trajectories: deleting every
-    non-solute atom preserves the kept atoms in ascending topology order, which
-    matches the reporter's ``atomSubset`` output exactly, so mdtraj can load the
-    trimmed trajectory against this PDB.
+    Deleting every non-solute atom preserves the kept atoms in ascending topology
+    order, which matches an ``atomSubset``-restricted reporter's output exactly, so
+    a trimmed trajectory (or a peptide-only seed-bank frame) can be read against
+    this PDB as its topology.
     """
     keep = {int(i) for i in solute_indices}
     modeller = app.Modeller(topology, positions)
     to_delete = [a for a in topology.atoms() if int(a.index) not in keep]
     modeller.delete(to_delete)
-    path = Path(out_dir) / "solute_only.pdb"
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as handle:
         app.PDBFile.writeFile(modeller.topology, modeller.positions, handle, keepIds=True)
     return path
+
+
+def write_solute_only_topology_pdb(out_dir: Path, app, topology, positions, solute_indices) -> Path:
+    """Write ``<out_dir>/solute_only.pdb`` containing only ``solute_indices`` (ascending).
+
+    Companion topology for ``--traj-solute-only`` trajectories. Thin wrapper over
+    :func:`write_solute_only_pdb` that fixes the conventional filename.
+    """
+    return write_solute_only_pdb(Path(out_dir) / "solute_only.pdb", app, topology, positions, solute_indices)
 
 
 def write_state_pdb(path: Path, app, topology, positions):

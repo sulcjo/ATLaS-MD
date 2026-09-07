@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
@@ -33,7 +34,7 @@ from gareus.cv import (
     peptide_residues,
     solute_atom_indices,
 )
-from gareus.system_setup import run_steps_safely, write_state_pdb
+from gareus.system_setup import run_steps_safely, write_solute_only_pdb, write_state_pdb
 
 TRACE_COLUMNS = ["frame", "t_ps", "cv1", "rg_nm", "e2e_nm", "v_pep_kj", "v_dih_kj", "potential_kj"]
 
@@ -123,16 +124,81 @@ def _terminal_ca_atoms(topology) -> tuple[int, int]:
     return find_atom_in_residue(residues[0], "CA"), find_atom_in_residue(residues[-1], "CA")
 
 
-def _write_peptide_only_pdb(path: Path, app, topology, positions, peptide_indices) -> None:
-    """Write a peptide-atom-only PDB (GENPEPT-seed-compatible: no water/ions)."""
-    keep = {int(i) for i in peptide_indices}
-    modeller = app.Modeller(topology, positions)
-    to_delete = [a for a in topology.atoms() if int(a.index) not in keep]
-    modeller.delete(to_delete)
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w") as handle:
-        app.PDBFile.writeFile(modeller.topology, modeller.positions, handle, keepIds=True)
+def _count_trace_rows(trace_path: Path) -> int:
+    """Number of data rows already flushed to ``trace_path`` (0 if it doesn't exist)."""
+    trace_path = Path(trace_path)
+    if not trace_path.exists():
+        return 0
+    with trace_path.open() as f:
+        return sum(1 for _ in csv.DictReader(f))
+
+
+_CRASH_STEP_RE_TEMPLATE = r"^CRASH_{label}_before_nan_step_(\d+)\.pdb$"
+
+
+def _latest_crash_pdb(member_dir: Path, label: str) -> Optional[Path]:
+    """The highest-step ``CRASH_<label>_before_nan_step_<n>.pdb`` under ``member_dir``, if any.
+
+    ``run_steps_safely`` (gareus.system_setup) writes this file with the last finite
+    coordinates before a crash; picking the highest step number is robust even if more
+    than one such file were ever present (filenames are not zero-padded, so a lexical
+    sort is not numerically correct).
+    """
+    pattern = re.compile(_CRASH_STEP_RE_TEMPLATE.format(label=re.escape(label)))
+    best, best_step = None, -1
+    for p in Path(member_dir).glob(f"CRASH_{label}_before_nan_step_*.pdb"):
+        m = pattern.match(p.name)
+        if m and int(m.group(1)) > best_step:
+            best, best_step = p, int(m.group(1))
+    return best
+
+
+def _run_loop_recording_failure(
+    *,
+    n_equil_steps: int,
+    n_prod_steps: int,
+    steps_per_frame: int,
+    seed_frame_every: int,
+    step_fn: Callable[[int], Any],
+    measure_fn: Callable[[], dict],
+    write_frame_fn: Callable[[int], Any],
+    trace_path: Path,
+    timestep_ps: float,
+    member_dir: Path,
+    member_id,
+    crash_label: str,
+    t0: float,
+) -> dict:
+    """Run ``run_member_loop``; a mid-loop exception is a failed member, never re-raised.
+
+    Returns ``{"failed": False, "loop_summary": ...}`` on success or
+    ``{"failed": True, "done": ...}`` (a ready-to-write ``done.json`` payload with
+    ``status: "md_failed"``) on any ``Exception`` from ``step_fn``/``measure_fn``/
+    ``write_frame_fn`` (e.g. ``run_steps_safely`` raising on a NaN coordinate).
+    """
+    try:
+        loop_summary = run_member_loop(
+            n_equil_steps=n_equil_steps, n_prod_steps=n_prod_steps, steps_per_frame=steps_per_frame,
+            seed_frame_every=seed_frame_every, step_fn=step_fn, measure_fn=measure_fn,
+            write_frame_fn=write_frame_fn, trace_path=trace_path, timestep_ps=timestep_ps,
+        )
+    except Exception as exc:
+        frames_written = _count_trace_rows(trace_path)
+        crash_pdb = _latest_crash_pdb(member_dir, crash_label)
+        done = {
+            "member_id": member_id,
+            "n_frames": frames_written,
+            "graft_fallback": False,
+            "status": "md_failed",
+            "error": repr(exc),
+            "frames_written": frames_written,
+            "crash_pdb": str(crash_pdb) if crash_pdb else None,
+            "wall_s": time.time() - t0,
+            "ns_per_day": 0.0,
+        }
+        print(f"WARNING: swarm member {member_id} failed mid-MD ({frames_written} frames written): {exc!r}")
+        return {"failed": True, "done": done}
+    return {"failed": False, "loop_summary": loop_summary}
 
 
 def run_member(
@@ -232,13 +298,20 @@ def run_member(
     def write_frame_fn(i):
         state = sim.context.getState(getPositions=True, enforcePeriodicBox=True)
         frame_path = member_dir / "frames" / f"frame_{i:05d}.pdb"
-        _write_peptide_only_pdb(frame_path, app, topology, state.getPositions(), peptide_atoms)
+        write_solute_only_pdb(frame_path, app, topology, state.getPositions(), peptide_atoms)
 
-    loop_summary = run_member_loop(
+    result = _run_loop_recording_failure(
         n_equil_steps=n_equil_steps, n_prod_steps=n_prod_steps, steps_per_frame=steps_per_frame,
         seed_frame_every=seed_frame_every, step_fn=step_fn, measure_fn=measure_fn,
         write_frame_fn=write_frame_fn, trace_path=member_dir / "trace.csv", timestep_ps=timestep_ps,
+        member_dir=member_dir, member_id=member_row.get("member_id"), crash_label="swarm", t0=t0,
     )
+    if result["failed"]:
+        done = result["done"]
+        with (member_dir / "done.json").open("w") as f:
+            json.dump(done, f, indent=2)
+        return done
+    loop_summary = result["loop_summary"]
 
     final_state = sim.context.getState(getPositions=True, enforcePeriodicBox=True)
     write_state_pdb(member_dir / "last_frame.pdb", app, topology, final_state.getPositions())

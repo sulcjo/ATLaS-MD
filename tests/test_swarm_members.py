@@ -7,8 +7,10 @@ without any MD, and ``measure_frame`` is exercised on a tiny real OpenMM system 
 platform, no PME-context calls on CPU).
 """
 import csv
+import json
 import pathlib
 import tempfile
+import time
 import types
 
 
@@ -88,7 +90,6 @@ def test_member_done_false_when_no_done_json():
 
 
 def test_member_done_true_when_done_json_parses():
-    import json
     from gareus.swarm.members import member_done
     tmp = pathlib.Path(tempfile.mkdtemp())
     (tmp / "done.json").write_text(json.dumps({"member_id": 0, "n_frames": 5}))
@@ -115,3 +116,83 @@ def test_run_member_raises_without_a_seed_conformer():
         assert "seed conformer" in str(exc)
     else:
         raise AssertionError("expected ValueError when conformer is None")
+
+
+def test_run_loop_recording_failure_writes_md_failed_done_and_never_raises():
+    """A mid-loop exception (e.g. run_steps_safely raising on a NaN coordinate) is a failed
+    member, not an uncaught exception: recorded with frames_written == the number of trace
+    rows already flushed before the crash, never re-raised."""
+    from gareus.swarm.members import _run_loop_recording_failure
+    tmp = pathlib.Path(tempfile.mkdtemp())
+    calls = {"n": 0}
+
+    def step_fn(n):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise RuntimeError("Particle coordinate is NaN")
+
+    def measure_fn():
+        return {"cv1": 0.1, "rg_nm": 0.5, "e2e_nm": 0.9, "v_pep_kj": -10.0, "v_dih_kj": 5.0, "potential_kj": -100.0}
+
+    result = _run_loop_recording_failure(
+        n_equil_steps=0, n_prod_steps=500, steps_per_frame=100, seed_frame_every=1,
+        step_fn=step_fn, measure_fn=measure_fn, write_frame_fn=lambda i: None,
+        trace_path=tmp / "trace.csv", timestep_ps=0.004,
+        member_dir=tmp, member_id=7, crash_label="swarm", t0=time.time(),
+    )
+    assert result["failed"] is True
+    done = result["done"]
+    assert done["status"] == "md_failed"
+    assert "NaN" in done["error"]
+    assert done["frames_written"] == 2
+    assert done["n_frames"] == 2
+    assert done["member_id"] == 7
+    assert done["graft_fallback"] is False
+    assert done["crash_pdb"] is None  # no CRASH_*.pdb was left behind by this fake step_fn
+
+    # done.json round-trips exactly as run_member would write/read it.
+    done_path = tmp / "done.json"
+    with done_path.open("w") as f:
+        json.dump(done, f)
+    with done_path.open() as f:
+        reloaded = json.load(f)
+    assert reloaded["status"] == "md_failed"
+    assert reloaded["frames_written"] == 2
+
+    from gareus.swarm.members import member_done
+    assert member_done(tmp) is True
+
+
+def test_run_loop_recording_failure_picks_the_highest_step_crash_pdb():
+    """CRASH_<label>_before_nan_step_<n>.pdb filenames are not zero-padded, so the highest
+    step number must be picked numerically, not by a lexical sort/glob order."""
+    from gareus.swarm.members import _run_loop_recording_failure
+    tmp = pathlib.Path(tempfile.mkdtemp())
+    (tmp / "CRASH_swarm_before_nan_step_20.pdb").write_text("REMARK fake\n")
+    (tmp / "CRASH_swarm_before_nan_step_100.pdb").write_text("REMARK fake\n")
+
+    def step_fn(n):
+        raise RuntimeError("Particle coordinate is NaN")
+
+    result = _run_loop_recording_failure(
+        n_equil_steps=0, n_prod_steps=100, steps_per_frame=100, seed_frame_every=1,
+        step_fn=step_fn, measure_fn=lambda: {}, write_frame_fn=lambda i: None,
+        trace_path=tmp / "trace.csv", timestep_ps=0.004,
+        member_dir=tmp, member_id=1, crash_label="swarm", t0=time.time(),
+    )
+    assert result["done"]["crash_pdb"] == str(tmp / "CRASH_swarm_before_nan_step_100.pdb")
+
+
+def test_run_loop_recording_failure_returns_success_when_nothing_raises():
+    from gareus.swarm.members import _run_loop_recording_failure
+    tmp = pathlib.Path(tempfile.mkdtemp())
+    result = _run_loop_recording_failure(
+        n_equil_steps=0, n_prod_steps=200, steps_per_frame=100, seed_frame_every=1,
+        step_fn=lambda n: None,
+        measure_fn=lambda: {"cv1": 0.0, "rg_nm": 0.0, "e2e_nm": 0.0, "v_pep_kj": 0.0, "v_dih_kj": 0.0, "potential_kj": 0.0},
+        write_frame_fn=lambda i: None,
+        trace_path=tmp / "trace.csv", timestep_ps=0.004,
+        member_dir=tmp, member_id=3, crash_label="swarm", t0=time.time(),
+    )
+    assert result["failed"] is False
+    assert result["loop_summary"]["n_frames"] == 2
