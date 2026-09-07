@@ -34,3 +34,68 @@ def test_export_seed_bank_writes_rows_load_genpept_library_can_read():
     assert len(rows) == len(sel[0]) and all(pathlib.Path(r["survivor_pdb_path"]).exists() for r in rows)
     assert all(r["source_label"] == "swarm_round_000" for r in rows)
     assert all(r["secondary_cv_value"] == "" for r in rows) and all(float(r["primary_cv_value"]) >= 0 for r in rows)
+
+
+def test_source_run_dir_uses_member_dir_grandparent_when_frames_subdir():
+    import csv as _csv
+    from gareus.swarm.seeds import export_seed_bank
+    tmp = pathlib.Path(tempfile.mkdtemp())
+    member_dir = tmp / "member_0003" / "frames"
+    member_dir.mkdir(parents=True)
+    pdb = member_dir / "frame_00010.pdb"
+    pdb.write_text("ATOM      1  CA  GLY A   1       0.000   0.000   0.000  1.00  0.00           C\nEND\n")
+    sel = {0: [{"member_id": 3, "frame": 10, "cv1": 0.05, "pdb_path": str(pdb)}]}
+    bank = export_seed_bank(tmp / "seed_bank", sel, [0.05], round_index=0)
+    rows = list(_csv.DictReader((bank / "final_survivor_seeds.csv").open()))
+    assert len(rows) == 1
+    assert pathlib.Path(rows[0]["source_run_dir"]).name == "member_0003"
+
+
+def test_source_run_dir_uses_explicit_member_dir_verbatim():
+    import csv as _csv
+    from gareus.swarm.seeds import export_seed_bank
+    tmp = pathlib.Path(tempfile.mkdtemp())
+    frames_dir = tmp / "somewhere" / "frames"
+    frames_dir.mkdir(parents=True)
+    pdb = frames_dir / "frame_00007.pdb"
+    pdb.write_text("ATOM      1  CA  GLY A   1       0.000   0.000   0.000  1.00  0.00           C\nEND\n")
+    explicit_dir = tmp / "explicit_member_dir"
+    sel = {0: [{"member_id": 2, "frame": 7, "cv1": 0.05, "pdb_path": str(pdb), "member_dir": str(explicit_dir)}]}
+    bank = export_seed_bank(tmp / "seed_bank", sel, [0.05], round_index=0)
+    rows = list(_csv.DictReader((bank / "final_survivor_seeds.csv").open()))
+    assert rows[0]["source_run_dir"] == str(explicit_dir)
+
+
+def test_export_seed_bank_skips_missing_frame_pdb_and_records_it():
+    import csv as _csv, json as _json
+    from gareus.swarm.seeds import export_seed_bank
+    tmp = pathlib.Path(tempfile.mkdtemp())
+    ok_pdb = tmp / "ok.pdb"
+    ok_pdb.write_text("ATOM      1  CA  GLY A   1       0.000   0.000   0.000  1.00  0.00           C\nEND\n")
+    missing_pdb = tmp / "does_not_exist.pdb"
+    sel = {
+        0: [
+            {"member_id": 0, "frame": 10, "cv1": 0.05, "pdb_path": str(ok_pdb)},
+            {"member_id": 1, "frame": 10, "cv1": 0.06, "pdb_path": str(missing_pdb)},
+        ]
+    }
+    bank = export_seed_bank(tmp / "seed_bank", sel, [0.05], round_index=0)
+    rows = list(_csv.DictReader((bank / "final_survivor_seeds.csv").open()))
+    assert len(rows) == 1
+    summary = _json.loads((bank / "selection.json").read_text())
+    assert len(summary["skipped"]) == 1
+    assert summary["skipped"][0]["member_id"] == 1
+    assert summary["skipped"][0]["frame"] == 10
+    assert summary["skipped"][0]["pdb_path"] == str(missing_pdb)
+
+
+def test_export_seed_bank_records_empty_frames_for_windows_with_no_candidates():
+    import json as _json
+    from gareus.swarm.seeds import export_seed_bank
+    tmp = pathlib.Path(tempfile.mkdtemp())
+    pdb = tmp / "only.pdb"
+    pdb.write_text("ATOM      1  CA  GLY A   1       0.000   0.000   0.000  1.00  0.00           C\nEND\n")
+    sel = {0: [{"member_id": 0, "frame": 10, "cv1": 0.05, "pdb_path": str(pdb)}]}
+    bank = export_seed_bank(tmp / "seed_bank", sel, [0.05, 0.9], round_index=0)
+    summary = _json.loads((bank / "selection.json").read_text())
+    assert summary["1"] == {"centre": 0.9, "frames": []}

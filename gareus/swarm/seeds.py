@@ -52,6 +52,22 @@ def select_window_seed_frames(
     return selection
 
 
+def _member_dir_for_frame(fr: Dict[str, Any]) -> Path:
+    """Best-effort member/run directory for a seed frame.
+
+    Prefers an explicit ``member_dir`` key (Task 8 populates this from the plan). Falls
+    back to the frame PDB's grandparent when it lives under a ``frames/`` subdir (Task
+    5's ``member_NNNN/frames/frame_XXXXX.pdb`` layout), otherwise the PDB's own parent.
+    """
+    member_dir = fr.get("member_dir")
+    if member_dir:
+        return Path(member_dir)
+    pdb_parent = Path(fr["pdb_path"]).parent
+    if pdb_parent.name == "frames":
+        return pdb_parent.parent
+    return pdb_parent
+
+
 def export_seed_bank(
     seed_bank_dir: Path,
     selection: Dict[int, List[Dict[str, Any]]],
@@ -61,15 +77,20 @@ def export_seed_bank(
 ) -> Path:
     """Copy selected frame PDBs into ``seed_bank_dir`` and append seed-bank rows.
 
-    Returns ``seed_bank_dir``. Also writes ``selection.json`` (window -> centre, and
-    the chosen frames' member/frame/cv1/|delta cv1|) alongside the CSV.
+    Returns ``seed_bank_dir``. Also writes ``selection.json`` (window -> centre, chosen
+    frames' member/frame/cv1/|delta cv1|, and any skipped frames) alongside the CSV.
+    Every window index in ``centers`` gets an entry, even with zero chosen frames, so
+    downstream gates can tell "no candidates" from "no such window". A frame whose PDB
+    cannot be copied (missing/unreadable) is skipped, recorded, and does not abort the
+    export of the remaining frames.
     """
     seed_bank_dir = Path(seed_bank_dir).resolve()
     seed_bank_dir.mkdir(parents=True, exist_ok=True)
 
     selection_summary: Dict[str, Any] = {}
-    for window_idx, frames in selection.items():
-        centre = centers[window_idx]
+    skipped: List[Dict[str, Any]] = []
+    for window_idx, centre in enumerate(centers):
+        frames = selection.get(window_idx, [])
         chosen_summary = []
         for fr in frames:
             member_id = fr["member_id"]
@@ -77,13 +98,26 @@ def export_seed_bank(
             cv1 = fr["cv1"]
             seed_name = f"w{window_idx:02d}_m{member_id:04d}_f{frame_no:05d}"
             dest_pdb = seed_bank_dir / f"{seed_name}.pdb"
-            shutil.copyfile(fr["pdb_path"], dest_pdb)
+            try:
+                shutil.copyfile(fr["pdb_path"], dest_pdb)
+            except OSError as exc:
+                print(f"WARNING: swarm.export_seed_bank: skipped {fr['pdb_path']} ({exc})")
+                skipped.append(
+                    {
+                        "window": window_idx,
+                        "member_id": member_id,
+                        "frame": frame_no,
+                        "pdb_path": fr["pdb_path"],
+                        "reason": str(exc),
+                    }
+                )
+                continue
 
             source_pdb_path = Path(fr["pdb_path"])
             row = {
                 "seed_name": seed_name,
                 "survivor_pdb_path": str(dest_pdb),
-                "source_run_dir": str(source_pdb_path.parent),
+                "source_run_dir": str(_member_dir_for_frame(fr)),
                 "source_pdb_path": str(source_pdb_path),
                 "source_label": f"swarm_round_{round_index:03d}",
                 "source_state_id": window_idx,
@@ -104,6 +138,6 @@ def export_seed_bank(
         selection_summary[str(window_idx)] = {"centre": centre, "frames": chosen_summary}
 
     with (seed_bank_dir / "selection.json").open("w") as handle:
-        json.dump(selection_summary, handle, indent=2)
+        json.dump({**selection_summary, "skipped": skipped}, handle, indent=2)
 
     return seed_bank_dir
