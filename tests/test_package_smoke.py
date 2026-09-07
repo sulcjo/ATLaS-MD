@@ -502,6 +502,47 @@ def test_combined_genpept_gareus_config_parses(tmp_path) -> None:
     assert sargs.basin_hop is True
 
 
+def test_contacts_manual_window_mode_accepts_explicit_windows_2d_csv_without_contact_centers() -> None:
+    """Regression for a validation gap found while wiring the lambda-ladder pilot
+    config (examples/chignolin_lambda_ladder_pilot.yaml): --cv1 contacts +
+    --window-mode manual used to unconditionally require --contact-centers, even
+    though the --windows-2d-csv explicit-window path never reads contact_centers
+    at all (production.py bypasses choose_windows()/adaptive_contact_centers()
+    entirely whenever windows_2d_csv is set). The check predates the
+    lambda-ladder work (introduced for --primary-cv nonlocal-contacts, then
+    carried over unchanged when generic contact --windows-2d-csv support was
+    added in f939a8d), but blocked the first real end-to-end exercise of the
+    ladder chain, which needs exactly this combination."""
+    import tempfile
+    from pathlib import Path
+
+    from gareus.cli import parse_args
+
+    tmp_path = Path(tempfile.mkdtemp())
+    windows_csv = tmp_path / "windows.csv"
+    windows_csv.write_text(
+        "window,primary_cv_mode,primary_cv_center,primary_cv_k_kcal,gamd_lambda\n"
+        "0,contacts,0.25,800,0.0\n"
+        "1,contacts,0.25,800,1.0\n"
+    )
+    args = parse_args([
+        "--seq", "GA",
+        "--cv1", "contacts",
+        "--window-mode", "manual",
+        "--windows-2d-csv", str(windows_csv),
+    ])
+    assert args.primary_cv == "nonlocal-contacts"
+    assert str(args.windows_2d_csv) == str(windows_csv)
+
+    # Without --windows-2d-csv (and without --contact-centers), the same
+    # combination must still raise -- this only relaxes the explicit-table case.
+    try:
+        parse_args(["--seq", "GA", "--cv1", "contacts", "--window-mode", "manual"])
+        raise AssertionError("expected ValueError for contacts+manual with no window source")
+    except ValueError as exc:
+        assert "requires --contact-centers" in str(exc)
+
+
 def test_combined_genpept_gareus_config_documented_in_heavy_help() -> None:
     result = _run_cli("-hh")
     assert result.returncode == 0
