@@ -464,16 +464,15 @@ def _write_box_audit(
     # --- margin and warning ---------------------------------------------
     padding_nm = float(args.padding_nm)
     minimum_margin_nm = float(box_nm / 2.0 - float(max(actual_extent_nm)) / 2.0)
-    pbc_self_contact_warning = bool(
-        sequence_contour_estimate_nm > box_nm / 2.0 - padding_nm
-    )
+    cutoff_nm = float(getattr(args, "nonbonded_cutoff_nm", 1.0) or 1.0)
+    min_image_gap_nm = float(box_nm - sequence_contour_estimate_nm)
+    pbc_self_contact_warning = bool(min_image_gap_nm < cutoff_nm)
     if pbc_self_contact_warning:
         warning_message = (
-            f"PBC warning: sequence contour estimate "
-            f"{sequence_contour_estimate_nm:.2f} nm > box half-size minus padding "
-            f"{box_nm / 2.0 - padding_nm:.2f} nm. "
-            "Peptide may self-contact through periodic boundary during "
-            "extended conformations."
+            f"PBC warning: min-image gap {min_image_gap_nm:.2f} nm "
+            f"(box {box_nm:.2f} − contour {sequence_contour_estimate_nm:.2f}) "
+            f"is below the nonbonded cutoff {cutoff_nm:.2f} nm; "
+            "the peptide can interact with its own image."
         )
     else:
         warning_message = None
@@ -485,6 +484,8 @@ def _write_box_audit(
         "box_size_nm": float(box_nm),
         "padding_nm": padding_nm,
         "minimum_margin_nm": minimum_margin_nm,
+        "min_image_gap_nm": min_image_gap_nm,
+        "nonbonded_cutoff_nm": cutoff_nm,
         "pbc_self_contact_warning": pbc_self_contact_warning,
         "warning_message": warning_message,
     }
