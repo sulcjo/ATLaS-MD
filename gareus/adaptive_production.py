@@ -2202,6 +2202,15 @@ def _non_neighbor_redundant_pairs(
             key = (si, sj)
             if key in existing_pairs:
                 continue
+            # Two rungs at ONE centre are not a collapse: their CV overlap is
+            # ~1 by construction, so every non-adjacent rung pair (which has no
+            # "rung" edge to exclude it above) would otherwise be reported as a
+            # redundant collapse and put a non_neighbor_redundant warning on
+            # every ladder state.
+            st_a, st_b = registry.get_state(si), registry.get_state(sj)
+            if (st_a is not None and st_b is not None
+                    and _centre_group_key(st_a, policy) == _centre_group_key(st_b, policy)):
+                continue
             wi = state_to_window.get(si)
             wj = state_to_window.get(sj)
             if wi is None or wj is None:
@@ -4742,6 +4751,14 @@ def propose_actions_from_diagnostics(
         bad_touching = set()
         state_max_overlap: Dict[int, float] = {}
         for edge in edge_rows:
+            if str(edge.get("edge_type")) == "rung":
+                # Judged in energy space, and its CV overlap is None by
+                # construction.  Left in this loop it would mark BOTH endpoints
+                # of every rung edge as bad_touching and so silently disable
+                # retire_converged for the whole ladder.  Rung states are
+                # already safe from retirement: they gain no CV overlap credit,
+                # so state_max_overlap never reaches redundant_overlap for them.
+                continue
             ov = edge.get("overlap")
             if ov is None or float(ov) < float(policy.target_overlap):
                 bad_touching.add(int(edge["state_i"])); bad_touching.add(int(edge["state_j"]))

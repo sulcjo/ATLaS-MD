@@ -433,3 +433,57 @@ def test_segmented_collector_keeps_rung_edges_in_energy_space():
     for e in rung:
         assert e.get("overlap") is None, f"rung edge must not carry a CV histogram: {e}"
         assert "low_or_missing_overlap" not in (e.get("warnings") or []), e
+
+
+# ---------------------------------------------------------------------------
+# Rung states must not be mistaken for collapsed / redundant windows
+# ---------------------------------------------------------------------------
+
+
+def test_non_adjacent_rungs_are_not_reported_as_a_redundant_collapse():
+    """Only ADJACENT rungs get a "rung" edge, so a 3-rung centre's (0, 1) pair
+    is not a geometry neighbour -- and its CV overlap is 1.0.  Without an
+    explicit same-centre exclusion every ladder state would be tagged
+    non_neighbor_redundant, which is the input the retirement pass reads."""
+    from gareus.adaptive_production import _non_neighbor_redundant_pairs
+
+    reg = _ladder_registry(centers=(0.05,), rungs=(0.0, 0.5, 1.0))
+    pol = AdaptiveDecisionPolicy()
+    active = reg.active_states()
+    window_map = {i: int(s.state_id) for i, s in enumerate(active)}
+    values = {i: np.linspace(0.04, 0.06, 200) for i in range(len(active))}
+    alerts = _non_neighbor_redundant_pairs(
+        reg, window_map, values, build_geometry_edges(reg, pol), pol,
+    )
+    assert alerts == [], alerts
+
+
+def test_no_ladder_state_is_ever_proposed_for_retirement():
+    """Under an active ladder the retirement pass must not dismantle the cross
+    product.  Two independent guards hold: a non-representative rung state
+    gains no CV-overlap credit, so it never becomes a retire candidate; and a
+    representative carries its own rungs, so dropping it would orphan them and
+    ``_graph_articulation_states`` rules it out.  A rung edge is also excluded
+    from the pass's CV weak-edge test -- its ``overlap`` is None by
+    construction, which read as a weak edge would mark BOTH endpoints
+    ``bad_touching`` and disable ``retire_converged`` for the whole run."""
+    from gareus.adaptive_production import _graph_articulation_states
+
+    reg = _ladder_registry(centers=(0.05, 0.10, 0.15), rungs=(0.0, 0.5))
+    pol = AdaptiveDecisionPolicy(min_samples_for_retire=10, min_active_states=0,
+                                 redundant_overlap=0.45, target_overlap=0.30)
+    edges = build_geometry_edges(reg, pol)
+    assert sum(1 for e in edges if e[2] == "rung") == 3, edges
+    rows = [{"state_i": a, "state_j": b, "edge_type": t,
+             "overlap": None if t == "rung" else 0.90,
+             "mbar_overlap": 0.30 if t == "rung" else None,
+             "exchange_acceptance": None, "warnings": []}
+            for a, b, t, _nd in edges]
+    diag = {"states": [_state_row(int(s.state_id), sample_count=1000) for s in reg.active_states()],
+            "edges": rows, "non_neighbor_redundancies": []}
+    actions = propose_actions_from_diagnostics(reg, diag, pol)
+    assert not [a for a in actions if str(a[0]) == "retire"], actions
+    # every representative is an articulation point precisely because it
+    # carries its centre's rungs
+    reps = {int(s.state_id) for s in reg.active_states() if s.gamd_lambda == 0.0}
+    assert _graph_articulation_states(reg) == reps
