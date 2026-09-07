@@ -3118,37 +3118,24 @@ def build_union_state_mbar_inputs(
     umbrella_bias_kcal = primary_bias_kcal + secondary_bias_kcal
     umbrella_bias_kj = 4.184 * umbrella_bias_kcal
 
-    # λ-ladder boost term: a closed form of each sample's own stored raw
-    # channel energies (v_pep, v_dih) evaluated under every state's own
-    # gamd_lambda. Zero (not merely small) whenever no registry state carries
-    # a nonzero rung -- the common case (plain umbrella/REUS, plain GaMD) is
-    # untouched. When a rung IS active, missing raw energies must fail loudly
-    # rather than silently reweight without the term (see reconstruct_bias_matrix's
-    # docstring for the same invariant on the loader path).
+    # λ-ladder boost term: added by the one shared helper every MBAR
+    # loader/builder uses (gareus.mbar_analysis.ladder.apply_ladder_boost_to_u),
+    # so the missing-energy guard, the NaN-propagation for samples lacking
+    # raw energies, and the envelope-file resolution are identical here and
+    # in gareus/mbar_analysis/loaders.py's load_csv/load_parquet. Called with
+    # beta=1.0 (not the real beta) because umbrella_bias_kj is still in
+    # kJ/mol, not yet reduced -- the real beta is applied below, once, to the
+    # boosted kJ/mol total; this also means gamd_boost_kj_nk (the audit
+    # array) is recovered as a plain subtraction instead of a second
+    # boost-matrix computation.
     state_lambdas = np.asarray([float(getattr(s, "gamd_lambda", 0.0) or 0.0) for s in states], dtype=np.float64)
-    gamd_boost_kj_nk = np.zeros_like(umbrella_bias_kj)
-    if np.any(state_lambdas > 0.0):
-        if not np.any(np.isfinite(v_pep_values)):
-            raise ValueError(
-                "registry states carry gamd_lambda > 0 but no sample row has a finite v_pep_kj_mol; "
-                "the λ-ladder cannot be reweighted without the raw channel energies"
-            )
-        if not np.any(np.isfinite(v_dih_values)):
-            raise ValueError(
-                "registry states carry gamd_lambda > 0 but no sample row has a finite v_dih_kj_mol "
-                "(v_pep_kj_mol is present); the λ-ladder cannot be reweighted without the raw channel energies"
-            )
-        from .pep_gamd import PepGamdEnvelope, pep_gamd_boost_matrix_kj  # noqa: PLC0415
-        envelope_path = adaptive_dir / "global_shared_gamd_setup" / "shared_gamd_setup_globals.json"
-        if not envelope_path.exists():
-            raise ValueError(
-                f"registry states carry gamd_lambda > 0 but the frozen GaMD envelope "
-                f"{envelope_path} does not exist; v_pep/v_dih cannot be reweighted under the "
-                f"ladder without it"
-            )
-        envelope = PepGamdEnvelope.from_json(envelope_path)
-        gamd_boost_kj_nk = pep_gamd_boost_matrix_kj(v_pep_values, v_dih_values, state_lambdas, envelope).T
-    total_bias_kj = umbrella_bias_kj + gamd_boost_kj_nk
+    from .mbar_analysis.ladder import apply_ladder_boost_to_u, load_pep_gamd_envelope
+    envelope = load_pep_gamd_envelope(adaptive_dir) if np.any(state_lambdas > 0.0) else None
+    _ladder_meta: Dict[str, Any] = {}
+    total_bias_kj = apply_ladder_boost_to_u(
+        umbrella_bias_kj, v_pep_values, v_dih_values, state_lambdas, envelope, 1.0, _ladder_meta
+    )
+    gamd_boost_kj_nk = total_bias_kj - umbrella_bias_kj
 
     if math.isfinite(beta):
         umbrella_reduced_bias_nk = float(beta) * total_bias_kj
@@ -3208,8 +3195,8 @@ def build_union_state_mbar_inputs(
         "matrix_shape_convention": "sample-major [n_samples, n_states]; transpose to u_kn if PyMBAR expects [K,N]",
         "note": "Biases are reconstructed post-hoc from scalar CV traces against the union of registry states. Final-only samples are the conservative default.",
         "subsample_counts_per_state": _subsample_counts,
-        "gamd_ladder": bool(np.any(state_lambdas > 0.0)),
     }
+    meta.update(_ladder_meta)
     json_path = out_prefix.with_suffix(".json")
     write_json(json_path, _json_ready(meta))
     return meta

@@ -1724,6 +1724,7 @@ def load_epoch_csv_adaptive(ap: Path, epoch_ids: Optional[set[int]] = None) -> D
     cv_list, cv2_list, rg_list, win_list, rep_list, step_list, boost_list, pot_list = [], [], [], [], [], [], [], []
     beta_sample = []
     src_idx_list = []
+    v_pep_list, v_dih_list, lam_list = [], [], []
     for row in all_rows:
         cv_val = row.get('cv_A', row.get('primary_cv_value', ''))
         try:
@@ -1747,6 +1748,12 @@ def load_epoch_csv_adaptive(ap: Path, epoch_ids: Optional[set[int]] = None) -> D
         try: beta_sample.append(float(row.get('beta_1_over_kJ_mol', '') or 'nan'))
         except Exception: beta_sample.append(float('nan'))
         src_idx_list.append(int(row.get('_src_idx', 0)))
+        try: v_pep_list.append(float(row.get('v_pep_kj_mol', '') or 'nan'))
+        except Exception: v_pep_list.append(float('nan'))
+        try: v_dih_list.append(float(row.get('v_dih_kj_mol', '') or 'nan'))
+        except Exception: v_dih_list.append(float('nan'))
+        try: lam_list.append(float(row.get('gamd_lambda', '') or 0.0))
+        except Exception: lam_list.append(float('nan'))
 
     cv = np.asarray(cv_list, dtype=np.float64)
     cv2 = np.asarray(cv2_list, dtype=np.float64)
@@ -1756,6 +1763,9 @@ def load_epoch_csv_adaptive(ap: Path, epoch_ids: Optional[set[int]] = None) -> D
     step = np.asarray(step_list, dtype=int)
     boost = np.asarray(boost_list, dtype=np.float64)
     pot = np.asarray(pot_list, dtype=np.float64)
+    v_pep = np.asarray(v_pep_list, dtype=np.float64)
+    v_dih = np.asarray(v_dih_list, dtype=np.float64)
+    lam_sample = np.asarray(lam_list, dtype=np.float64)
     beta_arr = np.asarray(beta_sample, dtype=np.float64)
     finite_betas = beta_arr[np.isfinite(beta_arr)]
     if finite_betas.size:
@@ -1773,6 +1783,22 @@ def load_epoch_csv_adaptive(ap: Path, epoch_ids: Optional[set[int]] = None) -> D
             total = total + 0.5 * float(sec_ks[k]) * (cv2 - float(sec_centers[k])) ** 2
         u_nk[:, k] = scale * total
 
+    # lambda-ladder: per-merged-state rung, derived from the per-sample
+    # gamd_lambda column by grouping on this loader's own merged window
+    # index (no registry/window-snapshot here carries a per-state
+    # gamd_lambda -- same derivation as gareus.mbar_analysis.loaders'
+    # load_csv/load_parquet). A no-op through apply_ladder_boost_to_u when
+    # no state carries gamd_lambda > 0.
+    state_lambdas = np.zeros(K, dtype=np.float64)
+    if np.any(np.isfinite(lam_sample)):
+        for k in range(K):
+            grp = lam_sample[(window == k) & np.isfinite(lam_sample)]
+            if grp.size:
+                state_lambdas[k] = float(np.nanmedian(grp))
+    from .ladder import apply_ladder_boost_to_u, load_pep_gamd_envelope
+    _envelope = load_pep_gamd_envelope(ap) if np.any(state_lambdas > 0.0) else None
+    u_nk = apply_ladder_boost_to_u(u_nk, v_pep, v_dih, state_lambdas, _envelope, beta, meta)
+
     meta['load_notes'] = [f'Loaded {cv.size} samples from {len(sources)} epoch CSV sources; union {K} windows.']
     meta['umbrella_window_rows'] = [
         {'center_A': str(centers[i]), 'k_kcal_mol_A2': str(k_kcal[i])} for i in range(K)
@@ -1780,7 +1806,8 @@ def load_epoch_csv_adaptive(ap: Path, epoch_ids: Optional[set[int]] = None) -> D
     meta['adaptive_epoch_run_dirs'] = [str(s) for s in sources]
     meta['_epoch_source'] = src_idx_list
     src_str = f'{sources[0]}/samples.csv ... {sources[-1]}/samples.csv'
-    return clean(Data(root, root / 'pmf_analysis', cv, cv2, rg, window, replica, step, u_nk, centers, k_kcal, beta, temp, boost, pot, src_str, meta))
+    return clean(Data(root, root / 'pmf_analysis', cv, cv2, rg, window, replica, step, u_nk, centers, k_kcal, beta, temp, boost, pot, src_str, meta,
+                       v_pep_kj=v_pep, v_dih_kj=v_dih, state_lambdas=state_lambdas))
 
 
 def load_union_npz(ap_dir: Path) -> Data:

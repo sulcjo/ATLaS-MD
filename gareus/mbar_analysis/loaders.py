@@ -361,7 +361,8 @@ def load_csv(prod: Path, load_notes: Optional[list[str]] = None) -> Data:
                         if row.get(key): vec=[beta*x for x in jvec(row[key])]; break
                 urows.append(vec)
     cv=np.asarray(cv,float); cv2=np.asarray(cv2,float); rg=np.asarray(rg,float); win=np.asarray(win,int); rep=np.asarray(rep,int); step=np.asarray(step,int); boost=np.asarray(boost,float); boost_dih=np.asarray(boost_dih,float); pot=np.asarray(pot,float); vpep=np.asarray(vpep,float); vdih=np.asarray(vdih,float); lam=np.asarray(lam,float)
-    if any(len(v)>0 for v in urows):
+    used_stored_vectors = any(len(v)>0 for v in urows)
+    if used_stored_vectors:
         K=max(len(v) for v in urows); u=np.full((len(urows),K),np.nan)
         for i,v in enumerate(urows):
             if v: u[i,:len(v)]=np.asarray(v,float)
@@ -401,38 +402,31 @@ def load_csv(prod: Path, load_notes: Optional[list[str]] = None) -> Data:
             grp=lam[(win==k)&np.isfinite(lam)]
             if grp.size:
                 state_lambdas[k]=float(np.nanmedian(grp))
-    # `u` above (either branch) is pure umbrella -- the ladder boost is never
-    # embedded in the stored per-sample vectors or in the analytic
-    # reconstruction, so it must be added here explicitly, under the same
-    # "never silently reweight without the term" invariant as
-    # reconstruct_bias_matrix/build_union_state_mbar_inputs (see their
-    # docstrings): reporting meta['gamd_ladder']=True while `u` secretly
-    # omitted the term would make select_unbiased_method skip the GaMD
-    # correction and silently discard real physics.
-    if np.any(state_lambdas>0.0):
-        if not np.any(np.isfinite(vpep)):
-            raise ValueError(
-                f'{prod}: windows carry gamd_lambda > 0 (derived from the per-sample gamd_lambda '
-                f'column) but no sample has a finite v_pep_kj_mol; the λ-ladder cannot be '
-                f'reweighted without the raw channel energies'
-            )
-        if not np.any(np.isfinite(vdih)):
-            raise ValueError(
-                f'{prod}: windows carry gamd_lambda > 0 but no sample has a finite v_dih_kj_mol '
-                f'(v_pep_kj_mol is present); the λ-ladder cannot be reweighted without the raw '
-                f'channel energies'
-            )
-        envelope_path=prod/'shared_gamd_setup_globals.json'
-        if not envelope_path.exists():
-            raise ValueError(
-                f'{prod}: windows carry gamd_lambda > 0 but the frozen GaMD envelope '
-                f'{envelope_path} does not exist; v_pep/v_dih cannot be reweighted under the '
-                f'ladder without it'
-            )
-        from gareus.pep_gamd import PepGamdEnvelope, pep_gamd_boost_matrix_kj
-        envelope=PepGamdEnvelope.from_json(envelope_path)
-        u = u + beta*pep_gamd_boost_matrix_kj(vpep, vdih, state_lambdas, envelope).T
-    meta['gamd_ladder']=bool(np.any(state_lambdas>0.0))
+    if used_stored_vectors:
+        # R1 fix (2026-09-07 review, Critical 1): `u` here came straight from
+        # samples.csv's per-window bias vectors (umbrella_reduced_bias_all_windows_json
+        # / umbrella_bias_all_windows_kj_mol_json), which are slices of
+        # production.py's bias_matrix_kj/bias_matrix_kcal/reduced_bias_matrix
+        # -- and assemble_bias_matrices (production.py) already folds the
+        # ladder boost into those (bias_kcal = distance + ss + boost/4.184)
+        # for any run where the ladder was active. Adding the term again here
+        # would double-count it (u -> beta*(umbrella + 2*boost)); for a run
+        # where the ladder was never active every state_lambda is 0 and the
+        # (correctly skipped) term would have been zero anyway. So this
+        # branch only ever REPORTS whether the ladder was active -- it never
+        # touches `u`.
+        meta['gamd_ladder'] = bool(np.any(state_lambdas > 0.0))
+        meta['gamd_ladder_samples_without_raw_energies'] = (
+            int(np.count_nonzero(~np.isfinite(vpep) | ~np.isfinite(vdih)))
+            if np.any(state_lambdas > 0.0) else 0
+        )
+    else:
+        # The analytic reconstruction above is pure umbrella; here (only) the
+        # ladder boost must be added explicitly, through the one shared
+        # helper every MBAR loader/builder uses.
+        from .ladder import apply_ladder_boost_to_u, load_pep_gamd_envelope
+        envelope = load_pep_gamd_envelope(prod) if np.any(state_lambdas > 0.0) else None
+        u = apply_ladder_boost_to_u(u, vpep, vdih, state_lambdas, envelope, beta, meta)
     _boost_dih_arg = boost_dih if np.any(np.isfinite(boost_dih)) else None
     return clean(Data(prod,prod/'pmf_analysis',cv,cv2,rg,win,rep,step,u,centers,ks,beta,temp,boost,pot,str(prod/'samples.csv'),meta,boost_dih_kj=_boost_dih_arg,v_pep_kj=vpep,v_dih_kj=vdih,state_lambdas=state_lambdas))
 
@@ -537,42 +531,16 @@ def load_parquet(prod: Path) -> Data:
             if grp.size:
                 state_lambdas[i] = float(np.nanmedian(grp))
 
-    # Reconstruct full N×K dimensionless reduced-bias matrix. When any derived
-    # state carries a nonzero rung, the ladder boost must actually be embedded
-    # here -- reporting meta['gamd_ladder']=True while u_nk secretly omitted
-    # the term would make select_unbiased_method skip the GaMD correction
-    # entirely (see its docstring) and silently discard real physics, so this
-    # loader is held to the same "never silently reweight without the term"
-    # invariant as reconstruct_bias_matrix itself (see its docstring) and
-    # build_union_state_mbar_inputs.
+    # Reconstruct the pure-umbrella N×K dimensionless reduced-bias matrix
+    # (windows/<segment>.json never carries a "gamd_lambda" key, so this is
+    # never anything but umbrella-only), then add the ladder term through
+    # the one shared helper every MBAR loader/builder uses -- it is a no-op
+    # when no derived state carries a nonzero rung.
     cv2_for_nk = _fill_masked_nan(cv2_raw) if cv2_raw is not None else None
-    windows_for_nk = windows
-    if np.any(state_lambdas > 0.0):
-        if not np.any(np.isfinite(v_pep)):
-            raise ValueError(
-                f'{prod}: windows carry gamd_lambda > 0 (derived from the per-sample gamd_lambda '
-                f'column) but no sample has a finite v_pep_kj_mol; the λ-ladder cannot be '
-                f'reweighted without the raw channel energies'
-            )
-        if not np.any(np.isfinite(v_dih)):
-            raise ValueError(
-                f'{prod}: windows carry gamd_lambda > 0 but no sample has a finite v_dih_kj_mol '
-                f'(v_pep_kj_mol is present); the λ-ladder cannot be reweighted without the raw '
-                f'channel energies'
-            )
-        envelope_path = prod / 'shared_gamd_setup_globals.json'
-        if not envelope_path.exists():
-            raise ValueError(
-                f'{prod}: windows carry gamd_lambda > 0 but the frozen GaMD envelope '
-                f'{envelope_path} does not exist; v_pep/v_dih cannot be reweighted under the '
-                f'ladder without it'
-            )
-        from gareus.pep_gamd import PepGamdEnvelope
-        envelope = PepGamdEnvelope.from_json(envelope_path)
-        windows_for_nk = [dict(w, gamd_lambda=float(state_lambdas[i])) for i, w in enumerate(windows)]
-        u_nk = reconstruct_bias_matrix(cv, cv2_for_nk, windows_for_nk, beta, v_pep=v_pep, v_dih=v_dih, envelope=envelope)
-    else:
-        u_nk = reconstruct_bias_matrix(cv, cv2_for_nk, windows_for_nk, beta)
+    u_nk = reconstruct_bias_matrix(cv, cv2_for_nk, windows, beta)
+    from .ladder import apply_ladder_boost_to_u, load_pep_gamd_envelope
+    envelope = load_pep_gamd_envelope(prod) if np.any(state_lambdas > 0.0) else None
+    u_nk = apply_ladder_boost_to_u(u_nk, v_pep, v_dih, state_lambdas, envelope, beta, meta)
 
     rows = []
     wcsv = prod / 'umbrella_windows.csv'
@@ -581,7 +549,6 @@ def load_parquet(prod: Path) -> Data:
             rows = list(csv.DictReader(f))
     meta['umbrella_window_rows'] = rows
     meta['parquet_windows']      = windows
-    meta['gamd_ladder']          = bool(np.any(state_lambdas > 0.0))
 
     _boost_dih_arg = boost_dih if np.any(np.isfinite(boost_dih)) else None
     return clean(Data(
