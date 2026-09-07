@@ -146,6 +146,41 @@ def _withhold_ladder_artifacts(an: Path) -> None:
     (an / "ladder_run_args.yaml").unlink(missing_ok=True)
 
 
+def _library_cv1_for_round0(rd0: Path, plan_meta: dict, warnings: List[str]) -> np.ndarray:
+    """The real per-seed heavy-CV1 sample for the "centre must lie inside library
+    coverage" cap, read from round 0's ``seed_descriptors.csv`` (written by
+    ``driver._write_seed_descriptors``). Falls back to ``plan_meta["edges"]["cv1"]``
+    (bin *boundaries*, not the raw sample -- ``quantile_edges`` pads the top edge to
+    ``max(v) + 1e-12``, so a quantile of the edges alone resolves close to the
+    library's max rather than its q99, understating the cap's strictness) only when
+    the descriptors file is missing, and records why in ``warnings`` when it does.
+    """
+    path = rd0 / "seed_descriptors.csv"
+    if path.exists():
+        with path.open(newline="") as f:
+            vals = [float(row["cv1"]) for row in csv.DictReader(f)]
+        if vals:
+            return np.asarray(vals, dtype=float)
+    warnings.append(
+        f"{path} not found (or empty); the library-CV1 coverage cap fell back to "
+        "plan_meta['edges']['cv1'] bin edges, which resolves close to the library's "
+        "max rather than its true q99 -- looser than the intended cap"
+    )
+    return np.asarray(plan_meta.get("edges", {}).get("cv1", [0.0, 1.0]), dtype=float)
+
+
+def _measured_budget_ns(done_summaries: Dict[int, dict], ok_member_ids: List[int], output_interval_ps: float) -> float:
+    """Sum of each ok member's actually-written production time (``n_frames`` steps of
+    ``output_interval_ps`` each), not the planned ``seed_ns`` per member -- a member that
+    completes fewer frames than planned (e.g. resumed mid-way) must not be counted as a
+    full ``seed_ns`` of budget consumed."""
+    total_ps = 0.0
+    for m in ok_member_ids:
+        n_frames = float(done_summaries.get(m, {}).get("n_frames", 0) or 0)
+        total_ps += n_frames * output_interval_ps
+    return total_ps / 1000.0
+
+
 def _load_frozen_envelope_and_ladder(an: Path) -> Tuple[PepGamdEnvelope, dict]:
     setup_path = an / "shared_gamd_setup" / "shared_gamd_setup_globals.json"
     ladder_path = an / "ladder_design.json"
@@ -204,16 +239,19 @@ def analyze_swarm_stage(out_dir, args) -> dict:
     ns_values = [float(d.get("ns_per_day", 0.0)) for m, d in done_summaries.items() if m in ok_member_ids]
     ns_per_day_median = float(np.median(ns_values)) if ns_values else 0.0
     seed_ns = float(plan_meta.get("seed_ns", 0.0))
-    budget_ns_done = seed_ns * len(ok_member_ids)
+    budget_ns_planned = seed_ns * len(ok_member_ids)
+    budget_ns_done = _measured_budget_ns(done_summaries, ok_member_ids, output_interval_ps)
 
     seeds_per_window = int(getattr(args, "swarm_seeds_per_window", 3))
     temperature_k = float(args.temperature_k)
+    warnings: List[str] = []
 
     report: Dict[str, Any] = {
         "round": round_index, "n_members": len(rows), "n_ok_members": len(ok_member_ids),
         "missing_members": missing_members, "graft_failed_members": graft_failed_members,
         "failed_members": failed_members, "ns_per_day_median": ns_per_day_median,
-        "budget_ns_done": budget_ns_done, "discard_frames": discard,
+        "budget_ns_done": budget_ns_done, "budget_ns_planned": budget_ns_planned,
+        "discard_frames": discard, "warnings": warnings,
     }
 
     if round_index == 0:
@@ -232,13 +270,28 @@ def analyze_swarm_stage(out_dir, args) -> dict:
         v_dih = _pool(ok_traces, "v_dih_kj", discard)
         cv1_all = _pool(ok_traces, "cv1", discard)
         coverage_range = float(cv1_all.max() - cv1_all.min())
-        library_cv1 = np.asarray(plan_meta.get("edges", {}).get("cv1", [0.0, 1.0]), dtype=float)
+        library_cv1 = _library_cv1_for_round0(rd, plan_meta, warnings)
 
         k_max = float(getattr(args, "contact_adaptive_max_k_kcal", 1200.0))
         k_min = float(getattr(args, "contact_adaptive_min_k_kcal", 5.0))
         overlap_sigma = float(getattr(args, "swarm_overlap_sigma", 1.5))
         n_win = min(int(args.swarm_n_windows), n_resolvable_windows(coverage_range, temperature_k, k_max_kcal=k_max, overlap_sigma=overlap_sigma))
-        centers = cv1_centers_from_samples(cv1_all, n_windows=n_win, library_cv1=library_cv1, library_q=0.99)
+        try:
+            centers = cv1_centers_from_samples(cv1_all, n_windows=n_win, library_cv1=library_cv1, library_q=0.99)
+        except ValueError as exc:
+            # A window centre beyond the library's real coverage is unreachable by a
+            # restrained pull (global constraint) -- this is a hard ladder-design
+            # failure, not a soft gate the swarm could pass by extending replicates.
+            # No ladder/gate/seed bank can be built without centres; the failure is
+            # still recorded (not raised) so the report and the already-written
+            # envelope/discard artefacts survive for the controller to inspect.
+            report.update({
+                "status": "fail", "reasons": [f"ladder design: {exc}"],
+                "envelope": _envelope_summary(env, an / "shared_gamd_setup"),
+            })
+            _withhold_ladder_artifacts(an)
+            write_json(an / "swarm_report.json", report)
+            return report
         curvature = cv1_curvature_kcal(cv1_all, centers, temperature_k)
         k_warnings: List[dict] = []
         ks = cv1_force_constants_from_curvature(centers, curvature, temperature_k, overlap_sigma=overlap_sigma,

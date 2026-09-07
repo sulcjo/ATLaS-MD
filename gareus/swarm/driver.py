@@ -128,6 +128,24 @@ def _write_plan(rd: Path, rows: List[dict], meta: dict) -> None:
     (rd / "plan_meta.json").write_text(json.dumps(meta, indent=2))
 
 
+SEED_DESCRIPTOR_COLUMNS = ["seed_id", "pdb_path", "cv1", "rg_nm", "e2e_nm"]
+
+
+def _write_seed_descriptors(rd: Path, seeds: List[SeedDescriptor]) -> None:
+    """Round 0's per-seed heavy-CV1/Rg/E2E descriptors, one row per library seed in
+    ``describe_seeds``'s own (deterministic) order. Analysis reads this back as the
+    *real* library CV1 sample for the "centre must lie inside library coverage" cap
+    (``cv1_centers_from_samples``'s ``library_cv1``) -- ``plan_meta["edges"]["cv1"]``
+    is only bin *boundaries* and understates the cap's strictness (controller review,
+    round 1 fix)."""
+    rd.mkdir(parents=True, exist_ok=True)
+    with (rd / "seed_descriptors.csv").open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=SEED_DESCRIPTOR_COLUMNS)
+        w.writeheader()
+        for s in seeds:
+            w.writerow({"seed_id": s.seed_id, "pdb_path": s.pdb_path, "cv1": s.cv1, "rg_nm": s.rg_nm, "e2e_nm": s.e2e_nm})
+
+
 _INT_PLAN_FIELDS = ("member_id", "cell_cv1", "cell_rg", "cell_e2e", "replicate", "velocity_seed")
 
 
@@ -171,6 +189,7 @@ def build_or_load_plan(args, out_dir, round_index: int, *, topology, contact_pai
         ca_indices_in_seed = _ca_indices_in_seed(library, topology)
         dropped: list = []
         seeds = describe_seeds(library, ca_indices_in_seed, contact_pairs, args, dropped_out=dropped)
+        _write_seed_descriptors(rd, seeds)
         cells = stratify_cells(seeds, bins)
         edges = {
             "cv1": quantile_edges(np.array([s.cv1 for s in seeds]), bins[0]).tolist(),

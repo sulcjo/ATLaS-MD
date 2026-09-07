@@ -17,6 +17,31 @@ def test_round_dirs_and_latest_round_index():
     assert round_dir(out, 1).name == "round_001"
 
 
+def test_write_seed_descriptors_csv_has_right_header_and_row_count():
+    """No MD, no topology: a fake library described as plain SeedDescriptors, matching
+    the pattern test_later_round_reuses_round0_bin_edges already uses below."""
+    from gareus.swarm.driver import round_dir, _write_seed_descriptors, SEED_DESCRIPTOR_COLUMNS
+    from gareus.swarm.stratify import SeedDescriptor
+    out = pathlib.Path(tempfile.mkdtemp())
+    rd = round_dir(out, 0)
+    seeds = [
+        SeedDescriptor("seed_00000", "/a.pdb", 0.01, 0.50, 1.00),
+        SeedDescriptor("seed_00001", "/b.pdb", 0.05, 0.55, 1.10),
+        SeedDescriptor("seed_00002", "/c.pdb", 0.03, 0.60, 1.20),
+    ]
+    _write_seed_descriptors(rd, seeds)
+    with (rd / "seed_descriptors.csv").open(newline="") as f:
+        r = csv.reader(f)
+        header = next(r)
+        data_rows = list(r)
+    assert header == SEED_DESCRIPTOR_COLUMNS
+    assert len(data_rows) == 3
+    with (rd / "seed_descriptors.csv").open(newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert [r["seed_id"] for r in rows] == ["seed_00000", "seed_00001", "seed_00002"]
+    assert float(rows[1]["cv1"]) == 0.05 and float(rows[2]["rg_nm"]) == 0.60
+
+
 def test_later_round_reuses_round0_bin_edges():
     from gareus.swarm.driver import stratify_with_frozen_edges
     from gareus.swarm.stratify import SeedDescriptor
