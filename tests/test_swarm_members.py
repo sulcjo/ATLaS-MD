@@ -8,7 +8,6 @@ platform, no PME-context calls on CPU).
 """
 import csv
 import json
-import os
 import pathlib
 import tempfile
 import time
@@ -219,14 +218,12 @@ def test_tiny_real_swarm_member_moves_atoms_and_writes_trace_frames_and_done_slo
     folded-state label is used anywhere (ab initio, per global-constraints.md): the two
     backbones are just two arbitrary (phi, psi) choices, not a folded/native structure.
 
-    Guarded (never runs under the fixture-free fallback runner unless explicitly asked):
-    the repo's ``slow`` marker (pyproject.toml) lets a real pytest deselect this with
-    ``-m "not slow"``; GAREUS_RUN_SLOW=1 is this repo's own opt-in convention (see
-    tests/test_package_smoke.py's ``test_tiny_lambda_ladder_run_completes_end_to_end_slow``
-    for the same pattern) for the fixture-free fallback, which ignores markers entirely.
+    Marked with the repo's ``slow`` marker (pyproject.toml) so a real pytest run can
+    deselect it with ``-m "not slow"``; runs unconditionally otherwise (the fixture-free
+    fallback runner ignores markers entirely and just calls the function, same as
+    ``tests/test_package_smoke.py``'s ``test_tiny_lambda_ladder_run_completes_end_to_end_slow``)
+    -- there is no env-var gate, so every run of this file actually executes the MD.
     """
-    if os.environ.get("GAREUS_RUN_SLOW") != "1":
-        return
     import numpy as np
 
     from pep_gamd_fixture import solvated_dipeptide
@@ -337,7 +334,12 @@ def test_tiny_real_swarm_member_moves_atoms_and_writes_trace_frames_and_done_slo
     first_positions = _positions_nm(frame_files[0])
     last_positions_full = _positions_nm(last_frame_path)
     last_positions = last_positions_full[pep_idx, :]
-    assert first_positions.shape == last_positions.shape
-    assert not np.allclose(first_positions, last_positions, atol=1e-6), (
-        "atoms did not move between the first written frame and the last frame"
+    assert first_positions.shape == last_positions.shape, (
+        "first seed-frame PDB and the peptide subset of last_frame.pdb have different atom counts"
+    )
+    max_disp_nm = float(np.max(np.linalg.norm(last_positions - first_positions, axis=1)))
+    print(f"test_tiny_real_swarm_member ... max_disp_nm={max_disp_nm:.4f}")
+    assert max_disp_nm > 1e-3, (
+        f"atoms did not move between the first written frame and the last frame "
+        f"(max per-atom displacement {max_disp_nm:.6f} nm <= 1e-3 nm threshold)"
     )
