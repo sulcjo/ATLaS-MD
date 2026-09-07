@@ -48,6 +48,15 @@ def _fresh_system():
     return deserialize_system(openmm, solvated_dipeptide()["system"])
 
 
+def tiny_solvated_system():
+    """A fresh (unpartitioned) copy of the cached GA-dipeptide-in-TIP3P system, plus its
+    topology/positions, for tests that need real OpenMM energies on a tiny system."""
+    openmm, app, unit = import_openmm()
+    fx = solvated_dipeptide()
+    system = _fresh_system()
+    return openmm, app, unit, fx["topology"], system, fx["positions"]
+
+
 def _nonbonded(system, openmm):
     return [f for f in system.getForces() if isinstance(f, openmm.NonbondedForce)]
 
