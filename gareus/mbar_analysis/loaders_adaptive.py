@@ -1818,12 +1818,43 @@ def load_union_npz(ap_dir: Path) -> Data:
     with np.load(npz_path, allow_pickle=False) as f:
         cv = np.asarray(f['cv_A'], dtype=np.float64)
         cv2 = np.asarray(f['secondary_cv'], dtype=np.float64)
-        window = np.asarray(f['sampled_state_ids'], dtype=int)
+        sampled_state_ids = np.asarray(f['sampled_state_ids'], dtype=np.int64)
         u_nk = np.asarray(f['umbrella_reduced_bias_nk'], dtype=np.float64)
         centers = np.asarray(f['primary_centers'], dtype=np.float64)
         k_kcal = np.asarray(f['primary_k'], dtype=np.float64)
+        # state_ids is the u_nk COLUMN ORDER (build_union_state_mbar_inputs,
+        # adaptive_production.py:3164-3201): column i belongs to state
+        # state_ids[i]. sampled_state_ids holds raw ids, which coincide with
+        # column indices only while the registry is contiguous 0..K-1 --
+        # state retirement leaves gaps, and `window` is used directly as a
+        # u_nk column index AND as every solver's np.bincount grouping key.
+        state_ids = (np.asarray(f['state_ids'], dtype=np.int64)
+                     if 'state_ids' in f.files else np.arange(u_nk.shape[1], dtype=np.int64))
+        # λ-ladder arrays, absent on any npz written before they existed.
+        state_lambdas = (np.asarray(f['state_lambdas'], dtype=np.float64)
+                         if 'state_lambdas' in f.files else None)
+        v_pep = (np.asarray(f['v_pep_kj_mol'], dtype=np.float64)
+                 if 'v_pep_kj_mol' in f.files else None)
+        v_dih = (np.asarray(f['v_dih_kj_mol'], dtype=np.float64)
+                 if 'v_dih_kj_mol' in f.files else None)
+    _id_to_col = {int(sid): i for i, sid in enumerate(state_ids.tolist())}
+    # A sampled id with no column (impossible from the current builder, which
+    # derives both from the same registry) would silently alias column 0, so
+    # map explicitly and refuse rather than guess.
+    _missing_ids = sorted({int(s) for s in sampled_state_ids.tolist()} - set(_id_to_col))
+    if _missing_ids:
+        raise ValueError(
+            f'{npz_path.name}: sampled_state_ids reference state ids {_missing_ids} that are '
+            f'absent from state_ids, so they have no u_nk column'
+        )
+    window = np.asarray([_id_to_col[int(s)] for s in sampled_state_ids.tolist()], dtype=int)
     rg = np.full(cv.shape, np.nan, dtype=np.float64)
-    replica = window.copy()
+    # Unchanged from before the id->column remap: the per-sample "replica"
+    # label here has always been the raw state id (there is no hardware
+    # replica column in the npz), overwritten below from the companion
+    # samples.csv when one exists. Deliberately NOT switched to the column
+    # index -- the raw id is the stable cross-epoch label.
+    replica = sampled_state_ids.astype(int, copy=True)
     step = np.arange(cv.size, dtype=int)
     boost_kj = np.zeros(cv.size, dtype=np.float64)
     meta: dict = {}
@@ -1917,7 +1948,20 @@ def load_union_npz(ap_dir: Path) -> Data:
     # Populate adaptive_epoch_run_dirs so _prepare_adaptive_merged_traj_dir can find trajectories.
     if run_dirs:
         meta['adaptive_epoch_run_dirs'] = [str(d) for d in run_dirs]
-    return clean(Data(root, root / 'pmf_analysis', cv, cv2, rg, window, replica, step, u_nk, centers, k_kcal, beta, temp, boost_kj, None, str(npz_path), meta))
+    # u_nk here is umbrella_reduced_bias_nk, which build_union_state_mbar_inputs
+    # produced by running apply_ladder_boost_to_u BEFORE reducing by beta -- the
+    # ladder term is already in it. This loader therefore only PASSES THROUGH
+    # state_lambdas/v_pep/v_dih (applying the boost again would double-count it),
+    # and reports the flag the cross-check's contradiction guard reads.
+    if state_lambdas is not None and state_lambdas.size == u_nk.shape[1]:
+        meta['gamd_ladder'] = bool(np.any(state_lambdas > 0.0))
+        if meta['gamd_ladder'] and v_pep is not None and v_dih is not None:
+            meta['gamd_ladder_samples_without_raw_energies'] = int(
+                np.count_nonzero(~np.isfinite(v_pep) | ~np.isfinite(v_dih)))
+    else:
+        state_lambdas = None
+    return clean(Data(root, root / 'pmf_analysis', cv, cv2, rg, window, replica, step, u_nk, centers, k_kcal, beta, temp, boost_kj, None, str(npz_path), meta,
+                      v_pep_kj=v_pep, v_dih_kj=v_dih, state_lambdas=state_lambdas))
 
 
 def _load_round_raw(round_dir: Path) -> Optional[dict]:

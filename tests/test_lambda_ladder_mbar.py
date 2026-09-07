@@ -726,3 +726,133 @@ def test_ladder_crosscheck_contradiction_warning_text_is_triaged_critical():
         "carries no λ > 0 (absent) -- the loader lost the per-state ladder rungs -- the "
         "cross-check could not be made at all, so no PMF from this run is certified."])
     assert groups[0]["severity"] == "CRITICAL"
+
+
+# --- Final-review fix wave, C2: load_union_npz must carry state_lambdas /
+# v_pep / v_dih through, and must map raw state ids to u_nk column indices.
+
+def _write_union_npz(ap_dir, state_ids, state_lambdas, sampled_state_ids,
+                     with_ladder_arrays=True):
+    """Minimal adaptive_union_mbar.{npz,json} pair in the exact schema
+    build_union_state_mbar_inputs writes (adaptive_production.py:3164-3201)."""
+    import json
+
+    ap_dir.mkdir(parents=True, exist_ok=True)
+    state_ids = np.asarray(state_ids, dtype=np.int64)
+    sampled_state_ids = np.asarray(sampled_state_ids, dtype=np.int64)
+    K = state_ids.size
+    n = sampled_state_ids.size
+    id_to_index = {int(s): i for i, s in enumerate(state_ids.tolist())}
+    n_k = np.zeros(K, dtype=np.int64)
+    for sid in sampled_state_ids:
+        n_k[id_to_index[int(sid)]] += 1
+    rng = np.random.default_rng(3)
+    cv = rng.normal(5.0, 0.5, n)
+    arrays = dict(
+        state_ids=state_ids,
+        sampled_state_ids=sampled_state_ids,
+        cv_A=cv,
+        secondary_cv=np.full(n, np.nan),
+        primary_centers=np.linspace(4.0, 6.0, K),
+        primary_k=np.full(K, 10.0),
+        secondary_centers=np.full(K, np.nan),
+        secondary_k=np.zeros(K),
+        umbrella_bias_kcal_mol_nk=np.zeros((n, K)),
+        umbrella_bias_kj_mol_nk=np.zeros((n, K)),
+        # Already carries the ladder boost: build_union_state_mbar_inputs runs
+        # apply_ladder_boost_to_u BEFORE reducing by beta, so a loader that
+        # added the term a second time would double-count it.
+        umbrella_reduced_bias_nk=np.tile(np.arange(K, dtype=float), (n, 1)),
+        N_k=n_k,
+        gamd_boost_kj_nk=np.zeros((n, K)),
+    )
+    if with_ladder_arrays:
+        arrays.update(
+            state_lambdas=np.asarray(state_lambdas, dtype=np.float64),
+            v_pep_kj_mol=np.full(n, 12.5),
+            v_dih_kj_mol=np.full(n, 3.25),
+        )
+    np.savez_compressed(ap_dir / "adaptive_union_mbar.npz", **arrays)
+    (ap_dir / "adaptive_union_mbar.json").write_text(json.dumps({
+        "schema_version": "adaptive_union_mbar_inputs_v1",
+        "beta_1_over_kJ_mol": 1.0 / 2.494,
+        "state_ids": [int(x) for x in state_ids.tolist()],
+        "N_k": [int(x) for x in n_k.tolist()],
+        "gamd_ladder": bool(np.any(np.asarray(state_lambdas) > 0.0)),
+    }))
+    return n_k
+
+
+def test_load_union_npz_maps_noncontiguous_state_ids_to_column_indices(tmp_path):
+    """C2 regression. `window` is used directly as a u_nk COLUMN index and as
+    the grouping key for every solver's np.bincount-derived N_k, but
+    load_union_npz assigned it the RAW `sampled_state_ids`. Those coincide
+    with column indices only when the ids are contiguous 0..K-1 -- state
+    retirement leaves gaps, and then every sample is attributed to the wrong
+    state (or out of range entirely)."""
+    from gareus.mbar_analysis.loaders_adaptive import load_union_npz
+
+    ap = tmp_path / "adaptive_production"
+    state_ids = [0, 3, 7]                      # NON-contiguous: state 1,2,4.. retired
+    lambdas = [0.0, 0.5, 1.0]
+    sampled = [0, 0, 0, 3, 3, 7, 7, 7, 7, 0, 3, 7]
+    n_k = _write_union_npz(ap, state_ids, lambdas, sampled)
+
+    d = load_union_npz(ap)
+
+    assert d.u_nk.shape[1] == 3
+    assert d.window.max() < d.u_nk.shape[1], d.window
+    # The discriminating assertion: the per-state counts the loader's own
+    # `window` implies must equal the N_k the builder wrote next to the matrix.
+    assert np.array_equal(np.bincount(d.window, minlength=3), n_k), (np.bincount(d.window, minlength=3), n_k)
+
+
+def test_load_union_npz_carries_state_lambdas_and_raw_energies(tmp_path):
+    """C2 regression, second half: without state_lambdas on Data the
+    λ-ladder cross-check reads every column as λ=0 and passes vacuously
+    (C1). v_pep/v_dih must arrive too -- they are what any downstream
+    re-reweighting needs."""
+    from gareus.mbar_analysis.loaders_adaptive import load_union_npz
+
+    ap = tmp_path / "adaptive_production"
+    _write_union_npz(ap, [0, 3, 7], [0.0, 0.5, 1.0], [0, 3, 7, 0, 3, 7])
+
+    d = load_union_npz(ap)
+
+    assert d.state_lambdas is not None
+    assert np.allclose(d.state_lambdas, [0.0, 0.5, 1.0])
+    assert d.v_pep_kj is not None and np.allclose(d.v_pep_kj, 12.5)
+    assert d.v_dih_kj is not None and np.allclose(d.v_dih_kj, 3.25)
+    assert d.meta.get("gamd_ladder") is True
+
+
+def test_load_union_npz_does_not_re_add_the_boost(tmp_path):
+    """The npz's umbrella_reduced_bias_nk ALREADY contains the ladder term
+    (build_union_state_mbar_inputs calls apply_ladder_boost_to_u before
+    reducing by beta). load_union_npz must pass state_lambdas through
+    WITHOUT applying the boost a second time."""
+    from gareus.mbar_analysis.loaders_adaptive import load_union_npz
+
+    ap = tmp_path / "adaptive_production"
+    _write_union_npz(ap, [0, 3, 7], [0.0, 0.5, 1.0], [0, 3, 7, 0, 3, 7])
+    with np.load(ap / "adaptive_union_mbar.npz") as f:
+        expected = np.asarray(f["umbrella_reduced_bias_nk"], dtype=float)
+
+    d = load_union_npz(ap)
+    assert np.allclose(d.u_nk, expected)
+
+
+def test_load_union_npz_without_ladder_arrays_still_loads(tmp_path):
+    """An npz written before the ladder columns existed has no
+    state_lambdas/v_pep/v_dih -- it must still load, with all-zero lambdas
+    and no ladder flag, rather than raising."""
+    from gareus.mbar_analysis.loaders_adaptive import load_union_npz
+
+    ap = tmp_path / "adaptive_production"
+    _write_union_npz(ap, [0, 1, 2], [0.0, 0.0, 0.0], [0, 1, 2, 0, 1, 2],
+                     with_ladder_arrays=False)
+
+    d = load_union_npz(ap)
+    assert d.u_nk.shape[1] == 3
+    assert d.state_lambdas is None or not np.any(np.asarray(d.state_lambdas) > 0.0)
+    assert not d.meta.get("gamd_ladder")
