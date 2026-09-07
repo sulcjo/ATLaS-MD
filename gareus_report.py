@@ -156,6 +156,7 @@ def build_health_verdict(s: dict, min_neighbor_overlap: float = 0.30) -> dict:
     checks.append(_check_mapping(s))
     checks.append(_check_gamd(s))
     checks.append(_check_pmf_convergence(s))
+    checks.append(_check_ladder_crosscheck(s))
 
     worst = NA
     for c in checks:
@@ -751,6 +752,38 @@ def _check_pmf_convergence(s: dict) -> dict:
         return {"name": name, "status": PASS, "detail": f"converged by JS/RMSE tail test{tail_txt}"}
     return {"name": name, "status": CAUTION,
             "detail": f"NOT converged by JS/RMSE tail test{tail_txt}"}
+
+
+def _check_ladder_crosscheck(s: dict) -> dict:
+    """Hard-FAIL companion to the "λ-ladder cross-check FAILED" CRITICAL
+    warning (see _WARN_RULES below) -- same convention this file already
+    uses for the stale-window-map escape hatch and the split overlap graph:
+    a CRITICAL warning must be backed by a dedicated check that can move
+    `overall`, not left to sit inside an otherwise-PASS verdict. `"skipped"`
+    (no λ=0 states, or too few comparable bins) and an absent block (not a
+    ladder run at all) both grade NA -- neither is a detected fault.
+    """
+    name = "λ-ladder cross-check"
+    lcc = s.get("ladder_crosscheck")
+    if not isinstance(lcc, dict) or "status" not in lcc:
+        return {"name": name, "status": NA, "detail": "not a λ-ladder run"}
+    status = lcc.get("status")
+    diff = _num(lcc.get("max_abs_diff_kcal"))
+    tol = _num(lcc.get("tolerance_kcal"))
+    nbins = lcc.get("n_bins_compared")
+    if status == "fail":
+        detail = (f"λ=0-only PMF disagrees with the full-ladder PMF by {diff:.3f} kcal/mol "
+                  f"(tolerance {tol:.3f})" if diff is not None and tol is not None
+                  else "λ=0-only PMF disagrees with the full-ladder PMF")
+        return {"name": name, "status": FAIL, "detail": detail}
+    if status == "pass":
+        detail = (f"agrees within {diff:.3f} kcal/mol (tolerance {tol:.3f}"
+                  + (f", {nbins} bins compared" if nbins is not None else "") + ")"
+                  if diff is not None and tol is not None else "agrees")
+        return {"name": name, "status": PASS, "detail": detail}
+    if status == "skipped":
+        return {"name": name, "status": NA, "detail": lcc.get("reason", "skipped")}
+    return {"name": name, "status": NA, "detail": f"unrecognized ladder_crosscheck status {status!r}"}
 
 
 # ===========================================================================

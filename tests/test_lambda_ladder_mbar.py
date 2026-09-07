@@ -469,6 +469,7 @@ def test_ladder_crosscheck_agrees_when_lambda_zero_samples_are_representative():
     assert out["status"] == "pass"
     assert out["max_abs_diff_kcal"] < 0.15
     assert out["n_lambda0_samples"] == n // 2
+    assert out["tolerance_source"] == "fixed_default"
 
 
 def test_ladder_crosscheck_skips_without_lambda_zero_states():
@@ -528,3 +529,107 @@ def test_ladder_crosscheck_failure_warning_is_triaged_critical():
         "ladder boost reweighting embedded in u_nk does not reproduce plain "
         "umbrella sampling on its own rungs; every PMF from this run is suspect."])
     assert groups[0]["severity"] == "CRITICAL"
+
+
+# --- Review fix round 1 (Critical 1 / Important 2): vacuous-pass guard and a
+# discriminating (non-degenerate) test that can actually detect the forbidden
+# naive masked-renormalize computation. ------------------------------------
+
+def test_ladder_crosscheck_a_single_surviving_bin_is_not_a_vacuous_pass():
+    """Critical-1 regression: with exactly ONE bin (bins=1), that bin IS the
+    alignment reference (F_full[both].min() == F_full[that bin]), so the old
+    code produced diff==0 identically -- 'pass' at ANY tolerance, including
+    tol_kcal=0.0, with nothing but n_bins_compared==1 to betray it. The fix
+    (MIN_BINS_FOR_VERDICT) must report 'skipped', never 'pass', when too few
+    bins survive to make the comparison meaningful."""
+    from gareus.mbar_analysis.crosscheck import ladder_crosscheck
+    from gareus.mbar_analysis.data import Data
+
+    rng = np.random.default_rng(0)
+    n = 4000
+    cv = rng.normal(0.3, 0.05, n)
+    window = np.repeat([0, 1], n // 2)
+    u_nk = np.zeros((n, 2))
+    beta = 1.0 / 2.494
+    d = Data.__new__(Data)
+    d.cv, d.window, d.u_nk, d.beta = cv, window, u_nk, beta
+    d.state_lambdas = np.array([0.0, 1.0])
+    d.meta = {"gamd_ladder": True}
+    f_k = np.zeros(2)
+
+    out = ladder_crosscheck(d, f_k, bins=1, kbt_kcal=0.596, tol_kcal=0.0)
+    assert out["status"] != "pass"
+    assert out["status"] == "skipped"
+    assert out["n_bins_compared"] == 1
+
+
+def test_ladder_crosscheck_is_sensitive_to_the_forbidden_naive_reweight():
+    """Important-2 regression: tests using an all-zero u_nk (degenerate --
+    naive masked-renormalize and the correct _subset_logw_from_global_fk
+    are algebraically identical there) cannot detect a regression that
+    swapped the forbidden computation back into ladder_crosscheck. This one
+    uses a REAL, non-degenerate multi-window harmonic-umbrella Data (the
+    same _harmonic_windows_data builder validated in
+    test_masked_logw_subset_pmf.py) with two λ=0 windows at different
+    centres plus one λ>0 window elsewhere and a real MBAR-solved f_k.
+
+    Asserts (a) the real ladder_crosscheck (using the correct subset
+    reweight) passes with a small max_abs_diff_kcal, and (b) an
+    independently-computed FORBIDDEN alternative -- masking the GLOBAL logw
+    at the λ=0 rows and renormalizing, instead of recomputing the
+    denominator with the subset's own N_k -- gives a materially (>10x)
+    larger disagreement. This is the discriminator: if a future edit
+    swapped the forbidden computation into ladder_crosscheck, (a) would
+    fail because the reported max_abs_diff_kcal would jump to roughly the
+    naive value asserted in (b).
+    """
+    from test_masked_logw_subset_pmf import _harmonic_windows_data
+    from gareus.mbar_analysis.crosscheck import ladder_crosscheck
+    from gareus.mbar_analysis.solvers import solve_mbar, norm_logw
+    from gareus.mbar_analysis.pmf import make_bins, pmf_from_weights
+    import analyze_gareus_mbar as A
+
+    rng = np.random.default_rng(7)
+    centers = [0.0, 1.5, 3.0]
+    k_spring = [40.0, 40.0, 40.0]
+    beta = 0.4
+    d = _harmonic_windows_data(rng, centers, k_spring, beta,
+                               counts_per_window=[3000, 3000, 3000])
+    d.state_lambdas = np.array([0.0, 0.0, 1.0])   # windows 0,1 lambda=0; window 2 the boosted rung
+    d.meta["gamd_ladder"] = True
+
+    m = solve_mbar(d.u_nk, d.window, backend="numpy", tol=1e-12, maxiter=20000)
+    assert m["converged"]
+    bins = make_bins(d.cv, 30, None, None)
+    kbt_kcal = (1.0 / beta) / A.KJ_PER_KCAL
+
+    out = ladder_crosscheck(d, m["f_k"], bins, kbt_kcal)
+    assert out["status"] == "pass"
+    assert out["max_abs_diff_kcal"] < 0.1
+
+    # Forbidden alternative, computed independently (not by monkeypatching
+    # ladder_crosscheck): mask the GLOBAL logw at the lambda=0 rows and
+    # renormalize -- the naive approach _subset_logw_from_global_fk exists
+    # to replace.
+    mask = np.isin(d.window, [0, 1])
+    naive_w = norm_logw(m["logw"][mask])
+    pmf_naive = pmf_from_weights(d.cv[mask], naive_w, bins, kbt_kcal)
+    F_full = np.asarray(out["pmf_full"]["pmf"])
+    F_naive = np.asarray(pmf_naive["pmf"])
+    both = np.isfinite(F_full) & np.isfinite(F_naive)
+    diff_naive = (F_full - F_full[both].min()) - (F_naive - F_naive[both].min())
+    max_abs_naive = float(np.max(np.abs(diff_naive[both])))
+    assert max_abs_naive > 1.0
+    assert max_abs_naive > 10 * out["max_abs_diff_kcal"]
+
+    # Pin the RETURNED pmf_lambda0 itself against the naive curve (not just
+    # the reported max_abs_diff_kcal against pmf_full) -- a regression that
+    # swapped the forbidden computation into ladder_crosscheck could in
+    # principle change pmf_lambda0 while some other bookkeeping kept
+    # max_abs_diff_kcal looking small; this closes that gap directly.
+    F_lam0 = np.asarray(out["pmf_lambda0"]["pmf"])
+    both_returned = np.isfinite(F_lam0) & np.isfinite(F_naive)
+    with np.errstate(invalid="ignore"):
+        diff_returned_vs_naive = ((F_lam0 - F_lam0[both_returned].min())
+                                  - (F_naive - F_naive[both_returned].min()))
+    assert float(np.max(np.abs(diff_returned_vs_naive[both_returned]))) > 1.0

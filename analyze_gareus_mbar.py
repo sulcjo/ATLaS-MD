@@ -4908,7 +4908,7 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
         # Slim, JSON-safe view for pmf_summary.json -- the two full PMF
         # dicts (_lcc['pmf_full']/['pmf_lambda0']) carry numpy arrays and go
         # to the CSV/PNG below instead, never into the summary itself.
-        ladder_crosscheck_summary={k:_lcc[k] for k in ('status','max_abs_diff_kcal','n_lambda0_samples','tolerance_kcal','n_bins_compared','count_gate_fell_back') if k in _lcc}
+        ladder_crosscheck_summary={k:_lcc[k] for k in ('status','max_abs_diff_kcal','n_lambda0_samples','tolerance_kcal','tolerance_source','n_bins_compared','count_gate_fell_back') if k in _lcc}
         if 'reason' in _lcc: ladder_crosscheck_summary['reason']=_lcc['reason']
         if _lcc['status'] in ('pass','fail'):
             write_all(out/'pmf_ladder_crosscheck.csv',
