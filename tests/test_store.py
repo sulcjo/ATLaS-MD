@@ -37,6 +37,7 @@ def test_parquet_writer_correct_columns(tmp_path):
     assert set(table.column_names) == {
         "step", "replica", "window_id", "cv1", "cv2",
         "potential", "gamd_boost_total", "gamd_boost_dihedral", "gamd_boost_nonbonded",
+        "v_pep_kj_mol", "v_dih_kj_mol", "gamd_lambda",
     }
 
 

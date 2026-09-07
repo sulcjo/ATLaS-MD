@@ -52,6 +52,12 @@ _ANALYSIS_VECTOR_KEYS = {
     'temperature_K', 'temperature_k', 'beta_1_over_kJ_mol',
     'beta_1_over_kj_mol', 'beta',
     'umbrella_reduced_bias_nk', 'umbrella_reduced_bias_kn',
+    # lambda-ladder raw channel energies + rung (Task 5's AnalysisArrayWriter
+    # schema; see gareus/mbar_analysis/loaders.py's load_npz, item C of the
+    # 2026-09-07 round-2 review) -- without these, _append_npz_arrays' own
+    # allowlist filter silently drops the columns before load_npz ever sees
+    # them, making the wiring there permanently unreachable.
+    'v_pep_kj_mol', 'v_dih_kj_mol', 'gamd_lambda',
 }
 
 
@@ -265,7 +271,37 @@ def load_npz(prod: Path) -> Data:
     for name in ('potential_kj_mol','potential_energy_kj_mol'):
         if name in arr.files: pot=np.asarray(arr[name],float); break
     meta['umbrella_window_rows']=rows
-    return clean(Data(prod,prod/'pmf_analysis',cv,cv2,rg,window,replica,step,u,centers,ks,beta,temp,boost,pot,str(prod/'analysis_arrays.npz'),meta))
+
+    # λ-ladder (2026-09-07 round-2 review, item C): analysis_arrays.npz can
+    # carry v_pep_kj_mol/v_dih_kj_mol/gamd_lambda per sample (Task 5), but u
+    # above is always plain umbrella -- it comes straight from a stored
+    # umbrella_reduced_bias_nk/kn array built against boost-free window
+    # snapshots (gareus/query.py's export path), never through
+    # reconstruct_bias_matrix. Wire it through the same shared helper every
+    # other loader uses, exactly like load_csv/load_parquet: derive a
+    # per-window state_lambdas from the per-sample column, and only if some
+    # state is actually active, load the envelope and add the term. If the
+    # three arrays aren't all present, `u` is left untouched and
+    # meta['gamd_ladder'] is never set -- a pre-ladder npz (or one written
+    # before this schema existed) must see zero behavior change.
+    v_pep_kj = None; v_dih_kj = None; state_lambdas = None
+    if 'v_pep_kj_mol' in arr.files and 'v_dih_kj_mol' in arr.files and 'gamd_lambda' in arr.files:
+        v_pep_kj = np.asarray(arr['v_pep_kj_mol'], dtype=np.float64)
+        v_dih_kj = np.asarray(arr['v_dih_kj_mol'], dtype=np.float64)
+        lam_sample = np.asarray(arr['gamd_lambda'], dtype=np.float64)
+        state_lambdas = np.zeros(u.shape[1], dtype=np.float64)
+        if np.any(np.isfinite(lam_sample)):
+            for k in range(u.shape[1]):
+                grp = lam_sample[(window == k) & np.isfinite(lam_sample)]
+                if grp.size:
+                    state_lambdas[k] = float(np.nanmedian(grp))
+        if np.any(state_lambdas > 0.0):
+            from .ladder import apply_ladder_boost_to_u, load_pep_gamd_envelope
+            envelope = load_pep_gamd_envelope(prod)
+            u = apply_ladder_boost_to_u(u, v_pep_kj, v_dih_kj, state_lambdas, envelope, beta, meta)
+
+    return clean(Data(prod,prod/'pmf_analysis',cv,cv2,rg,window,replica,step,u,centers,ks,beta,temp,boost,pot,str(prod/'analysis_arrays.npz'),meta,
+                       v_pep_kj=v_pep_kj,v_dih_kj=v_dih_kj,state_lambdas=state_lambdas))
 
 
 def _csv_row_count_fast(path: Path) -> int:
@@ -317,7 +353,7 @@ def load_csv(prod: Path, load_notes: Optional[list[str]] = None) -> Data:
         meta.setdefault('load_notes', []).extend(load_notes)
     centers,ks,rows=read_windows(prod/'umbrella_windows.csv')
     temp,beta=infer_temp_beta(prod,meta,None)
-    cv=[]; cv2=[]; rg=[]; win=[]; rep=[]; step=[]; boost=[]; boost_dih=[]; pot=[]; urows=[]
+    cv=[]; cv2=[]; rg=[]; win=[]; rep=[]; step=[]; boost=[]; boost_dih=[]; pot=[]; urows=[]; vpep=[]; vdih=[]; lam=[]
     vector_keys = (
         'umbrella_reduced_bias_all_windows_json', 'umbrella_reduced_bias_all_windows',
         'umbrella_bias_all_windows_kj_mol_json', 'umbrella_bias_all_windows_kj_mol',
@@ -346,6 +382,12 @@ def load_csv(prod: Path, load_notes: Optional[list[str]] = None) -> Data:
             else: boost_dih.append(float('nan'))
             try: pot.append(float(row.get('potential_kj_mol','')))
             except Exception: pot.append(float('nan'))
+            try: vpep.append(float(row.get('v_pep_kj_mol','')))
+            except Exception: vpep.append(float('nan'))
+            try: vdih.append(float(row.get('v_dih_kj_mol','')))
+            except Exception: vdih.append(float('nan'))
+            try: lam.append(float(row.get('gamd_lambda','') or 0.0))
+            except Exception: lam.append(float('nan'))
             if has_vectors:
                 vec=[]
                 for key in ('umbrella_reduced_bias_all_windows_json','umbrella_reduced_bias_all_windows'):
@@ -354,8 +396,9 @@ def load_csv(prod: Path, load_notes: Optional[list[str]] = None) -> Data:
                     for key in ('umbrella_bias_all_windows_kj_mol_json','umbrella_bias_all_windows_kj_mol'):
                         if row.get(key): vec=[beta*x for x in jvec(row[key])]; break
                 urows.append(vec)
-    cv=np.asarray(cv,float); cv2=np.asarray(cv2,float); rg=np.asarray(rg,float); win=np.asarray(win,int); rep=np.asarray(rep,int); step=np.asarray(step,int); boost=np.asarray(boost,float); boost_dih=np.asarray(boost_dih,float); pot=np.asarray(pot,float)
-    if any(len(v)>0 for v in urows):
+    cv=np.asarray(cv,float); cv2=np.asarray(cv2,float); rg=np.asarray(rg,float); win=np.asarray(win,int); rep=np.asarray(rep,int); step=np.asarray(step,int); boost=np.asarray(boost,float); boost_dih=np.asarray(boost_dih,float); pot=np.asarray(pot,float); vpep=np.asarray(vpep,float); vdih=np.asarray(vdih,float); lam=np.asarray(lam,float)
+    used_stored_vectors = any(len(v)>0 for v in urows)
+    if used_stored_vectors:
         K=max(len(v) for v in urows); u=np.full((len(urows),K),np.nan)
         for i,v in enumerate(urows):
             if v: u[i,:len(v)]=np.asarray(v,float)
@@ -381,8 +424,61 @@ def load_csv(prod: Path, load_notes: Optional[list[str]] = None) -> Data:
     if centers.size==0: centers=np.arange(u.shape[1],dtype=float)
     if ks.size==0: ks=np.full(u.shape[1],np.nan)
     meta['umbrella_window_rows']=rows
+    # Per-state (per-window) λ. PREFERRED source: umbrella_windows.csv's own
+    # gamd_lambda column (the `rows` above), which window_assignment_rows has
+    # written since the ladder landed. FALLBACK, for window tables predating
+    # that column only: derive it from the per-sample gamd_lambda column by
+    # grouping on the sample's own window index -- every replica sampling a
+    # given window under an active ladder is assigned that window's own fixed
+    # rung, so nanmedian per group is a robust reduction, but a window with no
+    # finite samples (or no samples at all) reads 0.0, the documented "ladder
+    # inactive" value, which is exactly why the written column wins when there
+    # is one. Which source was used is recorded in
+    # meta['gamd_ladder_state_lambda_source'].
+    K=int(u.shape[1])
+    state_lambdas=np.zeros(K,dtype=np.float64)
+    _row_lams=[r.get('gamd_lambda') for r in rows] if len(rows)==K else []
+    if any(v not in (None,'') for v in _row_lams):
+        # PREFERRED: umbrella_windows.csv's own per-window gamd_lambda column
+        # (window_assignment_rows has written it since the ladder landed).
+        for k in range(K):
+            try: state_lambdas[k]=float(_row_lams[k] or 0.0)
+            except (TypeError,ValueError): state_lambdas[k]=0.0
+        meta['gamd_ladder_state_lambda_source']='umbrella_windows_csv'
+    elif np.any(np.isfinite(lam)):
+        # FALLBACK, for window tables predating that column only.
+        for k in range(K):
+            grp=lam[(win==k)&np.isfinite(lam)]
+            if grp.size:
+                state_lambdas[k]=float(np.nanmedian(grp))
+        meta['gamd_ladder_state_lambda_source']='per_sample_nanmedian_fallback'
+    if used_stored_vectors:
+        # R1 fix (2026-09-07 review, Critical 1): `u` here came straight from
+        # samples.csv's per-window bias vectors (umbrella_reduced_bias_all_windows_json
+        # / umbrella_bias_all_windows_kj_mol_json), which are slices of
+        # production.py's bias_matrix_kj/bias_matrix_kcal/reduced_bias_matrix
+        # -- and assemble_bias_matrices (production.py) already folds the
+        # ladder boost into those (bias_kcal = distance + ss + boost/4.184)
+        # for any run where the ladder was active. Adding the term again here
+        # would double-count it (u -> beta*(umbrella + 2*boost)); for a run
+        # where the ladder was never active every state_lambda is 0 and the
+        # (correctly skipped) term would have been zero anyway. So this
+        # branch only ever REPORTS whether the ladder was active -- it never
+        # touches `u`.
+        meta['gamd_ladder'] = bool(np.any(state_lambdas > 0.0))
+        meta['gamd_ladder_samples_without_raw_energies'] = (
+            int(np.count_nonzero(~np.isfinite(vpep) | ~np.isfinite(vdih)))
+            if np.any(state_lambdas > 0.0) else 0
+        )
+    else:
+        # The analytic reconstruction above is pure umbrella; here (only) the
+        # ladder boost must be added explicitly, through the one shared
+        # helper every MBAR loader/builder uses.
+        from .ladder import apply_ladder_boost_to_u, load_pep_gamd_envelope
+        envelope = load_pep_gamd_envelope(prod) if np.any(state_lambdas > 0.0) else None
+        u = apply_ladder_boost_to_u(u, vpep, vdih, state_lambdas, envelope, beta, meta)
     _boost_dih_arg = boost_dih if np.any(np.isfinite(boost_dih)) else None
-    return clean(Data(prod,prod/'pmf_analysis',cv,cv2,rg,win,rep,step,u,centers,ks,beta,temp,boost,pot,str(prod/'samples.csv'),meta,boost_dih_kj=_boost_dih_arg))
+    return clean(Data(prod,prod/'pmf_analysis',cv,cv2,rg,win,rep,step,u,centers,ks,beta,temp,boost,pot,str(prod/'samples.csv'),meta,boost_dih_kj=_boost_dih_arg,v_pep_kj=vpep,v_dih_kj=vdih,state_lambdas=state_lambdas))
 
 
 def _parquet_sample_count(prod: Path) -> int:
@@ -452,13 +548,59 @@ def load_parquet(prod: Path) -> Data:
     boost_dih      = _fill_masked_nan(boost_dih_raw) if boost_dih_raw is not None else np.full(cv.shape, np.nan)
     pot_raw  = samples.get('potential')
     potential= _fill_masked_nan(pot_raw) if pot_raw is not None else None
-
-    # Reconstruct full N×K dimensionless reduced-bias matrix
-    cv2_for_nk = _fill_masked_nan(cv2_raw) if cv2_raw is not None else None
-    u_nk = reconstruct_bias_matrix(cv, cv2_for_nk, windows, beta)
+    # λ-ladder columns: real SQL NULLs on any segment predating the schema
+    # addition, or on a run where the ladder was never active -- same
+    # _fill_masked_nan treatment as gamd_boost_total/gamd_boost_dihedral above.
+    v_pep_raw = samples.get('v_pep_kj_mol')
+    v_pep     = _fill_masked_nan(v_pep_raw) if v_pep_raw is not None else np.full(cv.shape, np.nan)
+    v_dih_raw = samples.get('v_dih_kj_mol')
+    v_dih     = _fill_masked_nan(v_dih_raw) if v_dih_raw is not None else np.full(cv.shape, np.nan)
+    lambda_raw    = samples.get('gamd_lambda')
+    lambda_sample = _fill_masked_nan(lambda_raw) if lambda_raw is not None else np.full(cv.shape, np.nan)
 
     centers = np.array([float(w['center1']) for w in windows])
     k_kcal  = np.array([float(w['k1'])      for w in windows])
+    # Per-state (per-window) λ. PREFERRED source: the window snapshot's own
+    # "gamd_lambda" key, written by production.snapshot_window_rows. FALLBACK
+    # (snapshots predating that column only): derive it from the per-sample
+    # gamd_lambda column by grouping on window_id -- every replica sampling a
+    # given window under an active ladder is assigned that window's own fixed
+    # rung, so nanmedian is a robust reduction, but a never-sampled window
+    # silently reads 0.0 ("ladder inactive"), which is exactly why the written
+    # value wins when there is one. Recorded in meta, not silent.
+    state_lambdas = np.zeros(len(windows), dtype=np.float64)
+    snapshot_has_lambda = any(w.get('gamd_lambda') is not None for w in windows)
+    if snapshot_has_lambda:
+        for i, w in enumerate(windows):
+            try:
+                state_lambdas[i] = float(w.get('gamd_lambda') or 0.0)
+            except (TypeError, ValueError):
+                state_lambdas[i] = 0.0
+        meta['gamd_ladder_state_lambda_source'] = 'window_snapshot'
+    elif np.any(np.isfinite(lambda_sample)):
+        window_i64 = window.astype(np.int64)
+        for i, w in enumerate(windows):
+            wid = int(w.get('window_id', i))
+            grp = lambda_sample[(window_i64 == wid) & np.isfinite(lambda_sample)]
+            if grp.size:
+                state_lambdas[i] = float(np.nanmedian(grp))
+        meta['gamd_ladder_state_lambda_source'] = 'per_sample_nanmedian_fallback'
+        if np.any(state_lambdas > 0.0):
+            meta.setdefault('load_notes', []).append(
+                'windows/<segment>.json predates the gamd_lambda column; each state\'s λ was '
+                'inferred by nanmedian over its own samples (a never-sampled window reads 0.0).')
+
+    # Reconstruct the N×K dimensionless reduced-bias matrix. The ladder term is
+    # added INSIDE reconstruct_bias_matrix (which delegates to the one shared
+    # helper) by handing it window dicts carrying the resolved λ -- adding it
+    # again here would double-count it. `meta` is threaded through so the
+    # helper's gamd_ladder bookkeeping lands on this Data either way.
+    cv2_for_nk = _fill_masked_nan(cv2_raw) if cv2_raw is not None else None
+    from .ladder import load_pep_gamd_envelope
+    envelope = load_pep_gamd_envelope(prod) if np.any(state_lambdas > 0.0) else None
+    windows_for_nk = [dict(w, gamd_lambda=float(state_lambdas[i])) for i, w in enumerate(windows)]
+    u_nk = reconstruct_bias_matrix(cv, cv2_for_nk, windows_for_nk, beta,
+                                   v_pep=v_pep, v_dih=v_dih, envelope=envelope, meta=meta)
 
     rows = []
     wcsv = prod / 'umbrella_windows.csv'
@@ -466,7 +608,10 @@ def load_parquet(prod: Path) -> Data:
         with wcsv.open(newline='') as f:
             rows = list(csv.DictReader(f))
     meta['umbrella_window_rows'] = rows
-    meta['parquet_windows']      = windows
+    # windows_for_nk, not `windows`: it carries the RESOLVED per-state λ
+    # (snapshot value, or the nanmedian fallback), so nothing downstream can
+    # re-derive a different ladder from this record than the one u_nk used.
+    meta['parquet_windows']      = windows_for_nk
 
     _boost_dih_arg = boost_dih if np.any(np.isfinite(boost_dih)) else None
     return clean(Data(
@@ -477,6 +622,7 @@ def load_parquet(prod: Path) -> Data:
         beta=beta, temp=temp, boost_kj=boost, potential_kj=potential,
         source=str(prod / 'samples'), meta=meta,
         boost_dih_kj=_boost_dih_arg,
+        v_pep_kj=v_pep, v_dih_kj=v_dih, state_lambdas=state_lambdas,
     ))
 
 

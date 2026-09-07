@@ -246,11 +246,13 @@ EXACT_REWEIGHT_MIN_ESS = 100.0
 
 def select_unbiased_method(exp_ess, n_samples,
                            min_ess_fraction=EXACT_REWEIGHT_MIN_ESS_FRACTION,
-                           min_ess=EXACT_REWEIGHT_MIN_ESS):
+                           min_ess=EXACT_REWEIGHT_MIN_ESS, *,
+                           gamd_ladder: bool = False):
     """Choose between the exact estimator and the second-order cumulant one.
 
     Returns ``(method, reason)`` where ``method`` is ``'gamd_exponential'`` or
-    ``'gamd_cumulant2'``.
+    ``'gamd_cumulant2'`` -- or, when ``gamd_ladder`` is true, unconditionally
+    ``'umbrella_only'``.
 
     Gated on the EXPONENTIAL estimator's own effective sample size, deliberately
     not on the cumulant series' convergence verdict. An earlier revision switched
@@ -259,7 +261,16 @@ def select_unbiased_method(exp_ess, n_samples,
     precisely when the exponential estimator is worthless. Gating on the exact
     estimator's own ESS means the switch can only happen when the exact answer is
     actually affordable.
+
+    ``gamd_ladder=True`` means the sample's own ``u_nk`` already carries the
+    closed-form Pep-GaMD boost for every state (see ``reconstruct_bias_matrix``
+    and ``build_union_state_mbar_inputs``), so MBAR's own reweighting is exact
+    and neither the exponential-reweighting nor the cumulant-expansion
+    approximation is needed or wanted -- 'umbrella_only' here means "no
+    additional correction on top of u_nk", not "the boost was discarded".
     """
+    if gamd_ladder:
+        return 'umbrella_only', 'λ ladder: boost is inside u_nk, MBAR is exact; no cumulant'
     try:
         ess = float(exp_ess)
         n = int(n_samples)
@@ -1512,7 +1523,7 @@ def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.nd
         # computed here rather than further down because the estimator choice
         # depends on it
         e = _agm.ess(exp_w)
-        selected, _sel_reason = select_unbiased_method(e, N)
+        selected, _sel_reason = select_unbiased_method(e, N, gamd_ladder=bool(d.meta.get("gamd_ladder", False)))
         warnings.append(f'{warning_prefix}Unbiased estimator: {_sel_reason}.')
         if not _cum_verdict['converging'] and selected == 'gamd_cumulant2':
             warnings.append(

@@ -291,6 +291,10 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
     primary_ks     = np.array([float(r['primary_k'])      for r in reg_rows])
     sec_centers    = np.array([float(r['secondary_center']) if r.get('secondary_center', '') not in ('', 'None', 'nan') else np.nan for r in reg_rows])
     sec_ks         = np.array([float(r['secondary_k'])      if r.get('secondary_k', '')      not in ('', 'None', 'nan') else 0.0   for r in reg_rows])
+    # lambda-ladder rung per state, from state_registry.csv's own gamd_lambda
+    # column (WindowStateRegistry.write_state_csv) -- 0.0 (ladder inactive)
+    # when the column is absent (older registry snapshot) or blank.
+    state_lambdas  = np.array([float(r.get('gamd_lambda', 0.0) or 0.0) for r in reg_rows], dtype=np.float64)
 
     epoch_dirs = _find_adaptive_epoch_dirs(adaptive_dir, epoch_ids=epoch_ids)
     if not epoch_dirs:
@@ -299,6 +303,7 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
 
     all_cv = []; all_cv2 = []; all_window = []; all_step = []
     all_replica = []; all_boost = []; all_boost_dih = []; all_potential = []; all_epoch_src = []
+    all_v_pep = []; all_v_dih = []
     all_unk_blocks = []
     beta = float('nan')
     meta: dict = rjson(adaptive_dir.parent / 'run_manifest.json', {})
@@ -401,6 +406,13 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
         all_boost.append(_fill_masked_nan(boost_raw[valid]) if boost_raw is not None else np.full(valid.sum(), np.nan))
         boost_dih_raw = samples.get('gamd_boost_dihedral')
         all_boost_dih.append(_fill_masked_nan(boost_dih_raw[valid]) if boost_dih_raw is not None else np.full(valid.sum(), np.nan))
+        # Same masked-null hazard/fix as boost/boost_dih above: lambda-ladder
+        # raw channel energies are real SQL NULLs on any run/segment where
+        # the ladder is not active or predates the schema addition.
+        v_pep_raw = samples.get('v_pep_kj_mol')
+        all_v_pep.append(_fill_masked_nan(v_pep_raw[valid]) if v_pep_raw is not None else np.full(valid.sum(), np.nan))
+        v_dih_raw = samples.get('v_dih_kj_mol')
+        all_v_dih.append(_fill_masked_nan(v_dih_raw[valid]) if v_dih_raw is not None else np.full(valid.sum(), np.nan))
         pot_raw = samples.get('potential')
         all_potential.append(_fill_masked_nan(pot_raw[valid]) if pot_raw is not None else np.full(valid.sum(), np.nan))
         all_epoch_src.append(np.full(int(valid.sum()), len(all_cv) - 1, dtype=np.int32))
@@ -450,6 +462,8 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
     replica = np.concatenate(all_replica); del all_replica
     boost     = np.concatenate(all_boost);     del all_boost
     boost_dih = np.concatenate(all_boost_dih); del all_boost_dih
+    v_pep   = np.concatenate(all_v_pep); del all_v_pep
+    v_dih   = np.concatenate(all_v_dih); del all_v_dih
     pot_arr = np.concatenate(all_potential); del all_potential
     potential = pot_arr if np.any(np.isfinite(pot_arr)) else None
     u_nk    = np.concatenate(all_unk_blocks, axis=0); del all_unk_blocks
@@ -467,12 +481,25 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
         cv = cv[keep]; cv2 = cv2[keep]; window = window[keep]
         step = step[keep]; replica = replica[keep]; boost = boost[keep]
         boost_dih = boost_dih[keep]
+        v_pep = v_pep[keep]; v_dih = v_dih[keep]
         epoch_src = epoch_src[keep]
         pot_arr = pot_arr[keep]
         potential = pot_arr if np.any(np.isfinite(pot_arr)) else None
         u_nk = u_nk[keep]
 
     temp = 1.0 / (K_B_KJ_PER_MOL_K * beta)
+
+    # lambda-ladder boost: fold each active state's own closed-form Pep-GaMD
+    # boost into u_nk itself (see gareus.mbar_analysis.ladder) so MBAR's own
+    # reweighting is exact and the downstream cumulant/exponential GaMD
+    # correction (run_pmf_and_gamd_boost_report) is skipped rather than
+    # double-applied on top of an already-exact u_nk. A no-op (returns u_nk
+    # unchanged, sets meta['gamd_ladder']=False) on every run/registry where
+    # no state carries gamd_lambda > 0.
+    from .ladder import apply_ladder_boost_to_u, load_pep_gamd_envelope
+    _ladder_envelope = load_pep_gamd_envelope(adaptive_dir) if np.any(state_lambdas > 0.0) else None
+    _ladder_meta: dict = {}
+    u_nk = apply_ladder_boost_to_u(u_nk, v_pep, v_dih, state_lambdas, _ladder_envelope, beta, _ladder_meta)
 
     # Mid-campaign secondary-CV redefinition: reported, not corrected (see
     # _secondary_cv_regime_change_note).
@@ -528,6 +555,7 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
                      'umbrella_window_rows': list(reg_rows),
                      '_epoch_source': epoch_src.tolist(),
                      'adaptive_epoch_run_dirs': [str(ed) for ed, _ in epoch_dirs]})
+    meta_out.update(_ladder_meta)
 
     _boost_dih_arg = boost_dih if np.any(np.isfinite(boost_dih)) else None
     return clean(Data(
@@ -538,4 +566,5 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
         beta=beta, temp=temp, boost_kj=boost, potential_kj=potential,
         source=str(registry_csv), meta=meta_out,
         boost_dih_kj=_boost_dih_arg,
+        v_pep_kj=v_pep, v_dih_kj=v_dih, state_lambdas=state_lambdas,
     ))

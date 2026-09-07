@@ -237,6 +237,13 @@ Post-hoc analysis
     samples = load_samples(run_dir)           # dict of numpy arrays
     windows = load_windows(run_dir)           # list of window dicts
     nk = reconstruct_bias_matrix(samples['cv1'], samples['cv2'], windows, beta)
+    # On a lambda-ladder run (any window with gamd_lambda > 0) this call REFUSES
+    # to reconstruct without the raw channel energies and the frozen envelope:
+    #   from gareus.mbar_analysis.ladder import load_pep_gamd_envelope
+    #   nk = reconstruct_bias_matrix(samples['cv1'], samples['cv2'], windows, beta,
+    #                                v_pep=samples['v_pep_kj_mol'],
+    #                                v_dih=samples['v_dih_kj_mol'],
+    #                                envelope=load_pep_gamd_envelope(run_dir))
 
 Inter-epoch tICA secondary-CV update (YAML)
 --------------------------------------------
@@ -725,6 +732,65 @@ Invariants the code enforces:
 The stored gamd_boost_total_kj_mol column is then the peptide boost, not a
 system-total boost; provenance records the boost type.
 
+λ ladder over Pep-GaMD boost strength
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A "state" for a λ-ladder campaign is (window, rung): every umbrella window
+(--windows-a / --windows-2d-csv center+k) is replicated at a small set of boost
+strengths λ_k in [0, 1], so replica exchange walks a 2D (window x rung) grid,
+never a window-only chain. λ=0 is plain umbrella (boost off); λ=1 runs the
+Pep-GaMD envelope at full strength (--sigma0p/--sigma0d). Every state's reduced
+potential is
+
+    u_ik(x) = β [ V(x) + λ_k · boost(v_pep(x), v_dih(x); envelope) + w_i(CV1(x)) ]
+
+``boost(...)`` is `pep_gamd_boost_kj` / `pep_gamd_boost_matrix_kj`
+(gareus/pep_gamd.py): the dependent dual boost is NOT a pure per-channel
+rescale of a single reference boost -- the dihedral channel's boost enters the
+Total channel's own square term, so the combined two-channel boost at an
+arbitrary λ is a closed form evaluated from the two *stored raw* channel
+energies, not an interpolation between two measured boost values.
+
+Frozen-envelope rule: the (Vmax, Vmin, k0_max) envelope for each channel is
+calibrated once (the shared GaMD setup stage, §0.10) and never recalibrated
+for the rest of the campaign, on any rung, even if production frames fall
+outside [Vmin, Vmax] on some replica -- that only degrades acceleration on
+that frame (boost saturates off), it does not invalidate u_ik, because u_ik is
+reconstructed from the frozen envelope plus the frame's own stored energies,
+never from a live re-measurement. Recalibrating mid-campaign would silently
+change what every already-collected sample's u_ik means.
+
+Per replica, only two GaMD globals move with λ: k0_Total = λ_k * k0_Total,max
+and k0_Dihedral = λ_k * k0_Dihedral,max (set_replica_lambda /
+set_replica_lambda_for_window, gareus/pep_gamd.py); threshold_energy stays
+Vmax on both channels, independent of λ, so this is the only place per-rung
+state lives.
+
+Reconstructing u_ik for every (i, k) from every sample requires each sample to
+carry the raw channel energies, not just the boost realized at its own
+sampling rung: for a λ=0 sample the realized boost is identically zero and
+does not recover the envelope terms at all. Every stored sample therefore
+carries the raw channel energies and its own rung, as columns
+v_pep_kj_mol, v_dih_kj_mol, gamd_lambda, next to
+cv1/cv2/potential_kj_mol. An explicit --windows-2d-csv window table carries the
+per-window rung the same way, as a gamd_lambda column (defaults to 0.0 --
+plain umbrella -- when the column is absent, never inferred).
+
+Quoting gate: before any F(CV1) from a λ-ladder campaign is quoted, the λ=0-only
+PMF (built from just the λ=0 rungs' samples, still reweighted through the
+global f_k) must agree with the full-ladder PMF within (bootstrap) error --
+disagreement means the boost term folded into u_nk
+(gareus.mbar_analysis.ladder.apply_ladder_boost_to_u) is reweighting wrong, not
+just noisy. This is written to pmf_analysis/pmf_ladder_crosscheck.csv/.png and
+pmf_summary.json["ladder_crosscheck"], and gareus_report.py's
+_check_ladder_crosscheck turns a failed cross-check into a hard FAIL on the
+overall verdict, not a warning buried inside an otherwise-PASS report.
+
+Because u_nk already carries the closed-form boost for every state,
+select_unbiased_method (gareus/mbar_analysis/pmf.py) unconditionally returns
+'umbrella_only' for a λ-ladder run: MBAR's own reweighting is exact here, and
+neither the exponential-reweighting nor the cumulant2-expansion GaMD
+approximation is needed or applicable on top of it.
+
 0.11 Replica construction
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 The number of production replicas equals the number of umbrella windows.  Each
@@ -930,6 +996,13 @@ Multi-restart runs are queried across all segments transparently:
     samples = load_samples(run_dir)           # unions all seg_001, seg_002, ...
     windows = load_windows(run_dir)           # latest segment window set
     nk = reconstruct_bias_matrix(samples['cv1'], samples['cv2'], windows, beta)
+    # On a lambda-ladder run (any window with gamd_lambda > 0) this call REFUSES
+    # to reconstruct without the raw channel energies and the frozen envelope:
+    #   from gareus.mbar_analysis.ladder import load_pep_gamd_envelope
+    #   nk = reconstruct_bias_matrix(samples['cv1'], samples['cv2'], windows, beta,
+    #                                v_pep=samples['v_pep_kj_mol'],
+    #                                v_dih=samples['v_dih_kj_mol'],
+    #                                envelope=load_pep_gamd_envelope(run_dir))
 
 0.16 Potential-energy handling and later decomposition
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

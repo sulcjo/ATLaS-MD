@@ -1195,6 +1195,7 @@ def load_explicit_2d_window_csv(args, path: Path) -> tuple[np.ndarray, list[floa
     k_list = []
     secondary_centers = []
     secondary_k_list = []
+    gamd_lambdas: list[float] = []
     normalized_rows = []
     seen = set()
     duplicate_count = 0
@@ -1279,6 +1280,11 @@ def load_explicit_2d_window_csv(args, path: Path) -> tuple[np.ndarray, list[floa
         if has_secondary:
             secondary_centers.append(float(sec))
             secondary_k_list.append(float(sec_k))
+        lam_raw = row.get("gamd_lambda", "")
+        lam = 0.0 if lam_raw in ("", None) else float(lam_raw)
+        if not (0.0 <= lam <= 1.0):
+            raise ValueError(f"--windows-2d-csv row {offset}: gamd_lambda={lam} must lie in [0, 1]")
+        gamd_lambdas.append(lam)
         primary_mode = primary_cv_mode(args) if hasattr(args, "primary_cv") else "distance"
         normalized_rows.append({
             "window": int(idx),
@@ -1292,6 +1298,7 @@ def load_explicit_2d_window_csv(args, path: Path) -> tuple[np.ndarray, list[floa
             "secondary_cv_k_kcal_mol": "" if sec_k is None else float(sec_k),
             "window_type": wtype,
             "source_row": int(offset),
+            "gamd_lambda": float(lam),
         })
 
     if any_secondary and not all_secondary:
@@ -1323,6 +1330,7 @@ def load_explicit_2d_window_csv(args, path: Path) -> tuple[np.ndarray, list[floa
         "window_type_counts": type_counts,
         "duplicate_center_pairs": int(duplicate_count),
         "normalized_rows": normalized_rows,
+        "gamd_lambdas": [float(x) for x in gamd_lambdas],
         "note": "Explicit 2D window table loaded without rectangular cross-product expansion; neighbor exchange uses a geometry graph when --exchange-mode neighbor.",
     }
     if any_secondary:
@@ -1339,6 +1347,7 @@ def load_explicit_2d_window_csv(args, path: Path) -> tuple[np.ndarray, list[floa
         "n_secondary_centers": int(len(secondary_unique)),
         "rectangular_grid": bool(rectangular),
         "normalized_rows": normalized_rows,
+        "gamd_lambdas": [float(x) for x in gamd_lambdas],
         "duplicate_center_pairs": int(duplicate_count),
     }
     sec_arr = np.asarray(secondary_centers, dtype=float) if any_secondary else None

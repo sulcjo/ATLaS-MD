@@ -5,6 +5,8 @@ import re
 import subprocess
 import sys
 
+import pytest
+
 
 def _run_cli(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
@@ -158,9 +160,17 @@ def test_sample_state_reader_can_skip_potential_energy() -> None:
             raise AssertionError("potential energy should not be requested")
 
     class Context:
-        def getState(self, getPositions=False, getEnergy=False, enforcePeriodicBox=False):
+        # `groups=` is load-bearing: production.primary_secondary_and_potential_from_state
+        # always passes physical_energy_groups_for_args(args) so a GaMD run reads the
+        # PHYSICAL potential, not the boosted one. A fake without the parameter made
+        # this test pass only on the base branch and fail against real production.
+        def getState(self, getPositions=False, getEnergy=False, enforcePeriodicBox=False,
+                     groups=None, **kwargs):
             assert getPositions is True
             assert getEnergy is False
+            # Pin that the real call site still SUPPLIES it -- a default-only
+            # parameter would let the regression back in silently.
+            assert groups is not None, "production must pass an explicit energy-group mask"
             return State(getEnergy)
 
     unit = SimpleNamespace(nanometer=object(), kilojoule_per_mole=object())
@@ -461,6 +471,181 @@ def test_tiny_integration_is_documented_in_help() -> None:
     assert "tiny_integration_test_report.json" in result.stdout
 
 
+@pytest.mark.slow
+def test_tiny_lambda_ladder_run_completes_end_to_end_slow() -> None:
+    """SLOW: the first real (non-dry-run) execution of the lambda-ladder chain
+    in one process. A GA-dipeptide variant of gareus.integration_test's tiny
+    real workflow (see build_tiny_run_argv), with one CV1 (distance) window
+    replicated at 2 rungs (gamd_lambda in {0.0, 1.0}) instead of the plain
+    2-window chain the dry-run tests above only print. Requires OpenMM,
+    PeptideBuilder and gamd-openmm. Marked via the standard pytest ``slow``
+    marker (registered in pyproject.toml's [tool.pytest.ini_options]
+    markers list) so a real pytest run can deselect it with
+    ``-m "not slow"``; the fixture-free fallback runner used elsewhere in
+    this repo ignores markers entirely and just calls the function, same
+    as every other GaMD test here (tests/pep_gamd_fixture.py,
+    tests/test_pep_gamd_boost.py already run real OpenMM builds
+    unconditionally with no marker). Expect low-single-digit minutes on CPU.
+    """
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    import numpy as np
+    import pyarrow.dataset as ds
+
+    from gareus.core import main as gareus_main
+    from gareus.mbar_analysis.ladder import load_pep_gamd_envelope
+    from gareus.pep_gamd import PepGamdEnvelope
+
+    tmp_path = Path(tempfile.mkdtemp())
+    try:
+        out_dir = tmp_path / "tiny_ladder"
+        windows_csv = tmp_path / "windows.csv"
+        windows_csv.write_text(
+            "window,primary_cv_mode,primary_cv_center,primary_cv_k_kcal,gamd_lambda\n"
+            "0,distance,4.0,1.0,0.0\n"
+            "1,distance,4.0,1.0,1.0\n"
+        )
+
+        argv = [
+            "--seq", "GA",
+            "--out", str(out_dir),
+            "--seed", "2026",
+            "--platform", "CPU",
+            "--setup-platform", "CPU",
+            "--box-shape", "dodecahedron",
+            "--padding-nm", "0.55",
+            "--ionic-strength-molar", "0.0",
+            "--temperature-k", "300.0",
+            "--production-ensemble", "npt",
+            "--run-mode", "gamd",
+            "--timestep-fs", "0.5",
+            "--friction-per-ps", "5.0",
+            "--minimize-iterations", "5",
+            "--nvt-warmup-steps", "2",
+            "--nvt-warmup-timestep-fs", "0.25",
+            "--npt-ramp-steps", "2",
+            "--npt-ramp-timestep-fs", "0.25",
+            "--npt-steps", "4",
+            "--window-mode", "manual",
+            "--windows-2d-csv", str(windows_csv),
+            "--us-starting-structure-mode", "pull",
+            "--us-pull-steps-per-window", "2",
+            "--us-pull-timestep-fs", "0.25",
+            "--us-pull-minimize-iterations", "1",
+            "--gamd-boost-type", "pep-gamd-lower-dual",
+            "--gamd-cmd-steps", "100",
+            "--equil-steps", "100",
+            "--gamd-averaging-window", "50",
+            "--gamd-multiwindow-recon-prep-steps", "1",
+            "--gamd-multiwindow-recon-cmd-steps", "2",
+            "--gamd-multiwindow-recon-steps", "2",
+            "--gamd-recon-boosted-iters", "1",
+            "--gamd-recon-boosted-tol", "0.05",
+            "--gamd-multiwindow-recon-report-interval", "1",
+            "--exchange-mode", "gibbs-walk",
+            "--exchange-interval", "200",
+            "--report-interval", "100",
+            "--distance-output-interval", "100",
+            "--distance-output-mode", "csv",
+            "--sample-potential-energy",
+            "--production-steps", "2000",
+            "--traj-format", "none",
+            "--checkpoint-interval", "0",
+            "--progress-mode", "none",
+            "--tui-mode", "none",
+        ]
+
+        gareus_main(argv)
+
+        # -- run completed and left the expected core artifacts --
+        assert (out_dir / "run_manifest.json").exists()
+        assert (out_dir / "umbrella_windows.csv").exists()
+
+        # -- sample Parquet: v_pep_kj_mol finite everywhere, gamd_lambda in {0,1} --
+        samples_dir = out_dir / "samples"
+        assert samples_dir.exists(), f"no samples/ directory under {out_dir}"
+        sample_table = ds.dataset(str(samples_dir), format="parquet").to_table()
+        n_rows = sample_table.num_rows
+        assert n_rows > 0, "no sample rows were written"
+        v_pep = sample_table.column("v_pep_kj_mol").to_pylist()
+        assert all(v is not None and v == v and abs(v) != float("inf") for v in v_pep), (
+            f"v_pep_kj_mol has non-finite/NaN entries: {v_pep}"
+        )
+        v_pep_arr = np.asarray(v_pep, dtype=float)
+        assert np.nanstd(v_pep_arr) > 0.0, (
+            f"v_pep_kj_mol is constant across all {len(v_pep)} samples (stuck/stale column): {v_pep}"
+        )
+        gamd_lambdas_seen = set(sample_table.column("gamd_lambda").to_pylist())
+        assert gamd_lambdas_seen <= {0.0, 1.0}, f"unexpected gamd_lambda values: {gamd_lambdas_seen}"
+        assert gamd_lambdas_seen == {0.0, 1.0}, f"expected both rungs sampled, got: {gamd_lambdas_seen}"
+
+        # -- exchange Parquet: at least one attempted swap --
+        exchanges_dir = out_dir / "exchanges"
+        assert exchanges_dir.exists(), f"no exchanges/ directory under {out_dir}"
+        exchange_table = ds.dataset(str(exchanges_dir), format="parquet").to_table()
+        assert exchange_table.num_rows >= 1, "no exchange attempts were recorded"
+
+        # -- run_manifest.json: state_gamd_lambdas == [0.0, 1.0] --
+        manifest = json.loads((out_dir / "run_manifest.json").read_text())
+        method_settings = manifest.get("method_settings", {})
+        assert method_settings.get("state_gamd_lambdas") == [0.0, 1.0], (
+            f"state_gamd_lambdas = {method_settings.get('state_gamd_lambdas')!r}"
+        )
+
+        # -- shared GaMD envelope: PepGamdEnvelope.from_json loads it, via the
+        # canonical two-location loader (single-production-run convention writes
+        # the bare filename directly under out_dir; see gareus/mbar_analysis/
+        # ladder.py's load_pep_gamd_envelope and gareus/production.py's
+        # write_json(out_dir / "shared_gamd_setup_globals.json", ...)). --
+        envelope = load_pep_gamd_envelope(out_dir)
+        assert envelope is not None, "no shared_gamd_setup_globals.json found (bare or nested)"
+        for candidate in (
+            out_dir / "shared_gamd_setup_globals.json",
+            out_dir / "global_shared_gamd_setup" / "shared_gamd_setup_globals.json",
+        ):
+            if candidate.exists():
+                envelope_path = candidate
+                break
+        else:
+            raise AssertionError("shared_gamd_setup_globals.json missing from both known locations")
+        envelope_direct = PepGamdEnvelope.from_json(envelope_path)
+        assert envelope_direct.k0max_total is not None and envelope_direct.k0max_dih is not None
+
+        # -- MBAR/PMF post-processing: ladder_crosscheck must not be "fail", and
+        # both lambda states must actually be present (a "skipped: no lambda=0
+        # states" would mean the ladder machinery never engaged) --
+        import analyze_gareus_mbar as agm
+
+        analyze_rc = agm.main([str(out_dir), "--no-adaptive-diag", "--no-rg"])
+        assert analyze_rc == 0, f"analyze_gareus_mbar.main returned {analyze_rc}"
+        summary_candidates = list(out_dir.rglob("pmf_summary.json"))
+        assert summary_candidates, f"pmf_summary.json not written anywhere under {out_dir}"
+        summary_path = summary_candidates[0]
+        summary = json.loads(summary_path.read_text())
+        lcc = summary.get("ladder_crosscheck")
+        assert isinstance(lcc, dict) and "status" in lcc, f"no ladder_crosscheck block in pmf_summary.json: {summary.keys()}"
+        assert lcc["status"] != "fail", f"ladder cross-check FAILED: {lcc}"
+        if lcc["status"] == "skipped":
+            # gareus/mbar_analysis/crosscheck.py's ladder_crosscheck() reports
+            # n_lambda0_samples=0 for BOTH "no λ=0 states in state_lambdas" and "λ=0
+            # state(s) declared but hold zero samples" -- the two skip reasons that
+            # mean the ladder machinery never actually engaged (not acceptable
+            # here). A positive n_lambda0_samples with "skipped" instead means the
+            # bin-count gate fell back (too few bins for a verdict on this tiny
+            # run's handful of samples) -- an acceptable, data-volume-driven skip,
+            # not a wrong-reason one. Check the structured field, not the
+            # human-readable "reason" text: that text legitimately contains the
+            # substring "λ=0" in the too-few-bins message too (e.g. "full/λ=0
+            # pair"), so string-matching on it cannot distinguish the two cases.
+            assert int(lcc.get("n_lambda0_samples", 0)) > 0, (
+                f"ladder cross-check skipped with zero λ=0 samples (ladder never engaged): {lcc}"
+            )
+    finally:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+
+
 def test_combined_genpept_gareus_config_parses(tmp_path) -> None:
     cfg = tmp_path / "combined.yaml"
     cfg.write_text(
@@ -500,6 +685,47 @@ def test_combined_genpept_gareus_config_parses(tmp_path) -> None:
     assert sargs.n_final_seeds == 32
     assert sargs.two_stage is True
     assert sargs.basin_hop is True
+
+
+def test_contacts_manual_window_mode_accepts_explicit_windows_2d_csv_without_contact_centers() -> None:
+    """Regression for a validation gap found while wiring the lambda-ladder pilot
+    config (examples/chignolin_lambda_ladder_pilot.yaml): --cv1 contacts +
+    --window-mode manual used to unconditionally require --contact-centers, even
+    though the --windows-2d-csv explicit-window path never reads contact_centers
+    at all (production.py bypasses choose_windows()/adaptive_contact_centers()
+    entirely whenever windows_2d_csv is set). The check predates the
+    lambda-ladder work (introduced for --primary-cv nonlocal-contacts, then
+    carried over unchanged when generic contact --windows-2d-csv support was
+    added in f939a8d), but blocked the first real end-to-end exercise of the
+    ladder chain, which needs exactly this combination."""
+    import tempfile
+    from pathlib import Path
+
+    from gareus.cli import parse_args
+
+    tmp_path = Path(tempfile.mkdtemp())
+    windows_csv = tmp_path / "windows.csv"
+    windows_csv.write_text(
+        "window,primary_cv_mode,primary_cv_center,primary_cv_k_kcal,gamd_lambda\n"
+        "0,contacts,0.25,800,0.0\n"
+        "1,contacts,0.25,800,1.0\n"
+    )
+    args = parse_args([
+        "--seq", "GA",
+        "--cv1", "contacts",
+        "--window-mode", "manual",
+        "--windows-2d-csv", str(windows_csv),
+    ])
+    assert args.primary_cv == "nonlocal-contacts"
+    assert str(args.windows_2d_csv) == str(windows_csv)
+
+    # Without --windows-2d-csv (and without --contact-centers), the same
+    # combination must still raise -- this only relaxes the explicit-table case.
+    try:
+        parse_args(["--seq", "GA", "--cv1", "contacts", "--window-mode", "manual"])
+        raise AssertionError("expected ValueError for contacts+manual with no window source")
+    except ValueError as exc:
+        assert "requires --contact-centers" in str(exc)
 
 
 def test_combined_genpept_gareus_config_documented_in_heavy_help() -> None:

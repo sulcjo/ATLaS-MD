@@ -1601,12 +1601,54 @@ from .pep_gamd import (
     build_pep_gamd_integrator,
     find_aux_force as _find_pep_gamd_aux_force,
     is_pep_gamd,
+    k0max_from_globals,
+    pep_gamd_boost_matrix_kj,
+    peptide_essential_energy_kj,
     physical_energy_groups_for_args,
     physical_potential_energy_kj,
     prepare_pep_gamd_args,
+    set_replica_lambda_for_window,
     total_energy_groups_for_args,
     AUX_NONBONDED_GROUP as _PEP_GAMD_AUX_GROUP,
+    DIHEDRAL_GROUP,
+    PepGamdEnvelope,
 )
+
+
+def assemble_bias_matrices(distance_bias_kcal, ss_bias_kcal, boost_bias_kj):
+    """Combine the umbrella components and the Pep-GaMD boost into one (kcal, kj) pair.
+
+    Both unit matrices carry the SAME quantity -- umbrella + boost -- so the
+    invariant ``bias_kj == 4.184 * bias_kcal`` holds regardless of whether the
+    λ-ladder is active. ``boost_bias_kj`` is all-zero when it is not, so this
+    is a no-op reduction to the pre-ladder umbrella-only matrix in that case.
+    Pulled out to module level so both assembly sites in ``run_gareus`` (the
+    log/sample path and ``_current_exchange_arrays``) share one definition and
+    so it is directly testable without a live OpenMM Context.
+    """
+    distance_bias_kcal = np.asarray(distance_bias_kcal, dtype=np.float64)
+    ss_bias_kcal = np.asarray(ss_bias_kcal, dtype=np.float64)
+    boost_bias_kj = np.asarray(boost_bias_kj, dtype=np.float64)
+    boost_bias_kcal = boost_bias_kj / 4.184
+    bias_kcal = distance_bias_kcal + ss_bias_kcal + boost_bias_kcal
+    bias_kj = 4.184 * bias_kcal
+    return bias_kcal, bias_kj
+
+
+def _fetch_v_pep_v_dih(ctx, pep_env, unit) -> tuple[float, float]:
+    """Read (V_pep, V_dih) in kJ/mol for the Pep-GaMD boost from a live Context.
+
+    Returns ``(nan, nan)`` without touching the Context when ``pep_env`` is
+    None (the λ-ladder is not active), matching every call site's prior
+    inline guard. Shared by both fetch closures' both branches in
+    ``run_gareus`` (log/sample and exchange, fast-CV and non-fast).
+    """
+    if pep_env is None:
+        return float("nan"), float("nan")
+    v_pep = peptide_essential_energy_kj(ctx, unit)
+    v_dih = (ctx.getState(getEnergy=True, groups={DIHEDRAL_GROUP}).getPotentialEnergy()
+             .value_in_unit(unit.kilojoule_per_mole))
+    return v_pep, v_dih
 
 
 def gamd_enabled(args) -> bool:
@@ -1684,7 +1726,44 @@ def make_gamd_integrator(system, args, unit):
         pass
     return integrator, result
 
-def window_assignment_rows(centers_a: np.ndarray, k_list: list[float], temperature_k: float, secondary_centers=None, secondary_k_list=None, args=None) -> list[dict]:
+def snapshot_window_rows(centers_a, k_list, secondary_centers, secondary_k_list,
+                         gamd_lambdas=None, n=None) -> list[dict]:
+    """Per-segment window snapshot rows (windows/<segment_id>.json).
+
+    Carries ``gamd_lambda`` per window. Without it every MBAR loader reading a
+    snapshot had to INFER each state's rung by nanmedian over that window's own
+    samples' ``gamd_lambda`` column -- an inference that is only as good as the
+    sample set (a never-sampled window silently reads 0.0, i.e. "no ladder")
+    and that merges nothing when the true λ is right there in the writer.
+    2026-09-07 final review, I2.
+
+    Note the downstream contract this creates: ``gareus.query.reconstruct_bias_matrix``
+    refuses a window with ``gamd_lambda > 0`` unless ``v_pep``/``v_dih``/``envelope``
+    are supplied, so every caller reconstructing from these rows must pass them.
+    """
+    count = int(n) if n is not None else len(list(centers_a))
+    rows = []
+    for wi in range(count):
+        row = {
+            "window_id": int(wi),
+            "center1": float(centers_a[wi]),
+            "k1": float(k_list[wi]),
+        }
+        if secondary_centers is not None and secondary_k_list is not None:
+            row["center2"] = float(secondary_centers[wi])
+            row["k2"] = float(secondary_k_list[wi])
+        lam = 0.0
+        if gamd_lambdas is not None and wi < len(gamd_lambdas):
+            try:
+                lam = float(gamd_lambdas[wi] or 0.0)
+            except (TypeError, ValueError):
+                lam = 0.0
+        row["gamd_lambda"] = lam
+        rows.append(row)
+    return rows
+
+
+def window_assignment_rows(centers_a: np.ndarray, k_list: list[float], temperature_k: float, secondary_centers=None, secondary_k_list=None, args=None, gamd_lambdas=None) -> list[dict]:
     """Return an explicit table of umbrella centers and force constants.
 
     Legacy distance-named columns are preserved. In nonlocal-contact mode they are
@@ -1722,6 +1801,7 @@ def window_assignment_rows(centers_a: np.ndarray, k_list: list[float], temperatu
             "secondary_cv_center": "",
             "secondary_cv_k_kcal_mol": "",
             "secondary_cv_k_kj_mol": "",
+            "gamd_lambda": float(gamd_lambdas[i]) if gamd_lambdas is not None else 0.0,
         }
         if ss_centers is not None and ss_k_arr is not None and i < len(ss_centers) and i < len(ss_k_arr):
             row.update({
@@ -1732,6 +1812,155 @@ def window_assignment_rows(centers_a: np.ndarray, k_list: list[float], temperatu
         rows.append(row)
     return rows
 
+def _warn_if_ladder_was_zeroed(previous, new, where: str) -> bool:
+    """Loudly warn when a previously non-zero λ-ladder re-derives to all zeros.
+
+    Both post-drop re-derives pass ``existing=None`` on purpose (a pre-drop
+    vector is not safe to reuse across an arbitrary, non-suffix index drop),
+    and ``_derive_state_gamd_lambdas``' own fallback-of-last-resort is all
+    zeros. On a cold resume (``--resume`` with no replica checkpoints) the
+    window metadata that carried the rungs may not be reconstructible, so a
+    restored ladder can be silently flattened -- and ``_persist_state_gamd_lambdas``
+    then writes the zeros back into run_manifest.json, destroying the record
+    of what the campaign was.
+
+    The run stays SELF-consistent afterwards (every state is λ=0, i.e. plain
+    umbrella), so this is a warning, not an error -- but it silently changes
+    what the run is, which must never be invisible. 2026-09-07 final review,
+    I3; the full fix (restoring the ladder rather than re-deriving it) has its
+    own ticket. Returns True when it warned.
+    """
+    def _vals(x):
+        if x is None:
+            return []
+        try:
+            return [float(v or 0.0) for v in x]
+        except (TypeError, ValueError):
+            return []
+    prev = _vals(previous)
+    now = _vals(new)
+    if not any(v > 0.0 for v in prev) or any(v > 0.0 for v in now):
+        return False
+    print(
+        f"WARNING: λ-ladder LOST at {where}: {sum(1 for v in prev if v > 0.0)} of "
+        f"{len(prev)} states carried gamd_lambda > 0 before this re-derive and NONE "
+        f"do after it. The run continues as plain umbrella sampling (self-consistent, "
+        f"but no longer a ladder), and run_manifest.json will record the zeros. This "
+        f"is the known cold-resume/auto-drop re-derive gap -- verify the ladder before "
+        f"trusting any PMF from this run."
+    )
+    return True
+
+
+def _derive_state_gamd_lambdas(window_metadata: Optional[dict], n: int, existing=None) -> list[float]:
+    """Derive one gamd_lambda per surviving window, filter/drop-safe.
+
+    ``window_metadata["normalized_rows"]`` is the source of truth whenever it is
+    usable: present, aligned to exactly ``n`` surviving windows, and every row
+    carries its own ``gamd_lambda``. Reindexing operations that drop/reorder
+    windows (filter_explicit_2d_windows_by_seed_reachability,
+    drop_bad_us_windows_and_rebuild's _resubscript_normalized_rows) already
+    subset+renumber normalized_rows correctly, so reading gamd_lambda back out
+    of it here is safe across any such reindex.
+
+    ``existing`` is used ONLY when normalized_rows cannot be trusted, and ONLY
+    if it is already exactly length ``n`` -- a caller must not pass a
+    pre-reindex value across a filter/drop boundary where the alignment cannot
+    be verified from here; pass ``existing=None`` at any such call site.
+
+    Zeros (ladder inactive) is the fallback of last resort, never a guess.
+    """
+    rows = (window_metadata or {}).get("normalized_rows") or []
+    if rows and len(rows) == int(n) and all("gamd_lambda" in r for r in rows):
+        return [float(r.get("gamd_lambda", 0.0) or 0.0) for r in rows]
+    existing_list = list(existing or [])
+    if len(existing_list) == int(n):
+        return existing_list
+    return [0.0] * int(n)
+
+def _reload_state_gamd_lambdas_on_resume(args, out_dir: Path) -> None:
+    """Restore the frozen λ-ladder from run_manifest.json on ``--resume``.
+
+    Controller ruling (Task 2's implementer found this and deferred it to
+    Task 9): ``--resume`` never persisted ``args.state_gamd_lambdas`` across a
+    restart on its own. ``_derive_state_gamd_lambdas`` below is only as good
+    as the window_metadata it is handed on the resumed path, and nothing
+    upstream guarantees that still carries a per-row ``gamd_lambda`` after a
+    restart (an older run directory, or a checkpoint manifest's
+    window_metadata predating the rung dimension). Left uncorrected,
+    ``args.state_gamd_lambdas`` would come out unset/empty and every replica
+    would silently run at λ=0 -- silently, because an all-zero ladder is also
+    the valid "ladder disabled" state, so nothing downstream would complain.
+    Spec §3.6 requires the ladder to stay frozen for the whole campaign,
+    which includes surviving a restart, so it is read back from wherever it
+    was first frozen: ``run_manifest.json``'s ``method_settings`` (see
+    ``gareus/provenance.py:_method_settings``), which is written once at
+    campaign start (``initialize_run_manifest``) and never overwritten by a
+    resume's ``update_run_manifest`` patches.
+
+    CALL ORDER IS LOAD-BEARING: this must run BEFORE ``_derive_state_gamd_lambdas``,
+    never after. A review caught this call sitting after
+    ``_derive_state_gamd_lambdas`` in an earlier revision, which made it dead
+    code on every real run: that function's own fallback-of-last-resort is
+    ``[0.0] * n``, a non-empty (hence truthy) list, so by the time a
+    post-derive reload call inspected ``args.state_gamd_lambdas`` it always
+    looked already-populated and the manifest was never read. Called BEFORE
+    ``_derive_state_gamd_lambdas`` (its real call site, in ``run_gareus``),
+    this only ever observes ``args.state_gamd_lambdas`` in its true
+    pre-derivation state: unset on the fast-resume/choose_windows paths, or
+    already populated straight from the window table on the explicit-2D path
+    (which this function correctly leaves alone) -- either way,
+    ``_derive_state_gamd_lambdas``'s own ``existing=`` parameter then
+    naturally receives whatever this function restored.
+
+    A no-op unless ``args.resume`` is set and ``args.state_gamd_lambdas`` is
+    still unset/empty at the point it is called -- an already-populated
+    ladder (from an explicit window table, or a caller that set it
+    explicitly) is never overridden. This is a plain truthiness check, not a
+    content check: an all-zero ``args.state_gamd_lambdas`` set by a caller is
+    a legitimate disabled ladder and must never be treated as "unset" and
+    silently replaced.
+    """
+    if not bool(getattr(args, "resume", False)):
+        return
+    if getattr(args, "state_gamd_lambdas", None):
+        return
+    manifest = read_json_file(Path(out_dir) / "run_manifest.json", {}) or {}
+    method_settings = (manifest or {}).get("method_settings", {}) or {}
+    lambdas = method_settings.get("state_gamd_lambdas")
+    if lambdas:
+        args.state_gamd_lambdas = [float(x) for x in lambdas]
+
+def _persist_state_gamd_lambdas(args, out_dir: Path) -> None:
+    """Patch the CURRENT args.state_gamd_lambdas into run_manifest.json's
+    method_settings, overwriting any earlier snapshot written by a previous
+    call.
+
+    Review finding: the first cut of this patch was a single call placed
+    right after the initial _derive_state_gamd_lambdas() in run_gareus, but
+    args.state_gamd_lambdas is mutated TWICE afterwards on some runs --
+    the --max-replicas truncation (`args.state_gamd_lambdas =
+    list(args.state_gamd_lambdas)[:_max_replicas]`) and the post-pull US
+    auto-drop re-derive (`args.state_gamd_lambdas =
+    _derive_state_gamd_lambdas(window_metadata, len(centers_a),
+    existing=None)`) -- and neither re-patched the manifest. Persisting the
+    PRE-truncation/PRE-drop value is exactly what
+    _derive_state_gamd_lambdas' own docstring warns a caller never to do
+    with `existing=` across a filter/drop boundary, because
+    _reload_state_gamd_lambdas_on_resume feeds this same manifest field
+    back in as `existing=` on the next --resume: a stale, wrong-length
+    snapshot there either falls back to _derive_state_gamd_lambdas' own
+    [0.0]*n (silently disabling the ladder) or, worse, if the post-drop
+    count happens to match, resumes with a misaligned per-state λ.
+
+    Call this again at EVERY point in run_gareus that reassigns
+    args.state_gamd_lambdas, not just once after the initial derive --
+    the last call before production starts is what ends up in the
+    manifest, so it must be the call closest to (after) the final
+    mutation, not the first available opportunity.
+    """
+    update_run_manifest(out_dir, {"method_settings": {"state_gamd_lambdas": list(getattr(args, "state_gamd_lambdas", None) or [])}})
+
 def write_window_assignment_csv(path: Path, rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
@@ -1741,6 +1970,7 @@ def write_window_assignment_csv(path: Path, rows: list[dict]) -> None:
         "primary_k_units", "primary_openmm_k", "primary_openmm_k_units",
         "primary_harmonic_sigma", "legacy_primary_cv_column_names",
         "secondary_cv_center", "secondary_cv_k_kcal_mol", "secondary_cv_k_kj_mol",
+        "gamd_lambda",
     ]
     with path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
@@ -3183,9 +3413,19 @@ def drop_bad_us_windows_and_rebuild(
             out_dir, new_centers_a, new_secondary_cv_centers, args=args, prefix="explicit_2d_neighbor_graph"
         )
 
+    # window_metadata was just resubscripted above (_resubscript_normalized_rows),
+    # so its normalized_rows already carry each surviving window's own gamd_lambda,
+    # correctly reindexed by this function's own (possibly connectivity-restored)
+    # keep set. Without this, the rewritten umbrella_windows.csv would silently
+    # zero every state's lambda -- and that file is load-bearing (the legacy MBAR
+    # loader reconstructs biases from it), not merely diagnostic.
+    new_gamd_lambdas = _derive_state_gamd_lambdas(window_metadata, len(new_centers_a), existing=None)
+    _warn_if_ladder_was_zeroed(getattr(args, "state_gamd_lambdas", None), new_gamd_lambdas,
+                               "post-pull US auto-drop window-table rewrite")
     window_rows = window_assignment_rows(
         new_centers_a, new_k_list, args.temperature_k,
         new_secondary_cv_centers, new_secondary_cv_k_kcal_list, args=args,
+        gamd_lambdas=new_gamd_lambdas,
     )
     write_window_assignment_csv(out_dir / "umbrella_windows.csv", window_rows)
     try:
@@ -3491,6 +3731,9 @@ class AnalysisArrayWriter:
         self.k_kcal_mol_A2: list[float] = []
         self.potential_kj_mol: list[float] = []
         self.gamd_boost_total_kj_mol: list[float] = []
+        self.v_pep_kj_mol: list[float] = []
+        self.v_dih_kj_mol: list[float] = []
+        self.gamd_lambda: list[float] = []
         self.distance_umbrella_bias_kcal_mol: list[float] = []
         self.secondary_cv_bias_kcal_mol: list[float] = []
         self.umbrella_bias_kcal_mol: list[float] = []
@@ -3538,6 +3781,9 @@ class AnalysisArrayWriter:
         except Exception:
             boost = float("nan")
         self.gamd_boost_total_kj_mol.append(boost)
+        self.v_pep_kj_mol.append(float(row.get("v_pep_kj_mol", np.nan)))
+        self.v_dih_kj_mol.append(float(row.get("v_dih_kj_mol", np.nan)))
+        self.gamd_lambda.append(float(row.get("gamd_lambda", 0.0)))
         self.distance_umbrella_bias_kcal_mol.append(float(row.get("distance_umbrella_bias_kcal_mol", np.nan)))
         self.secondary_cv_bias_kcal_mol.append(float(row.get("secondary_cv_bias_kcal_mol", np.nan)))
         self.umbrella_bias_kcal_mol.append(float(row.get("umbrella_bias_kcal_mol", np.nan)))
@@ -3579,6 +3825,9 @@ class AnalysisArrayWriter:
             "k_kcal_mol_A2": np.asarray(self.k_kcal_mol_A2, dtype=np.float64),
             "potential_kj_mol": np.asarray(self.potential_kj_mol, dtype=np.float64),
             "gamd_boost_total_kj_mol": np.asarray(self.gamd_boost_total_kj_mol, dtype=np.float64),
+            "v_pep_kj_mol": np.asarray(self.v_pep_kj_mol, dtype=np.float64),
+            "v_dih_kj_mol": np.asarray(self.v_dih_kj_mol, dtype=np.float64),
+            "gamd_lambda": np.asarray(self.gamd_lambda, dtype=np.float64),
             "distance_umbrella_bias_kcal_mol": np.asarray(self.distance_umbrella_bias_kcal_mol, dtype=np.float64),
             "secondary_cv_bias_kcal_mol": np.asarray(self.secondary_cv_bias_kcal_mol, dtype=np.float64),
             "umbrella_bias_kcal_mol": np.asarray(self.umbrella_bias_kcal_mol, dtype=np.float64),
@@ -4119,10 +4368,21 @@ def write_final_run_report(out_dir: Path, args, centers_a, k_list, exchange_stat
     (out_dir / "final_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return report_payload
 
-def compare_gamd_global_sets(reference: dict[str, float], current: dict[str, float], rtol: float = 1.0e-10, atol: float = 1.0e-10) -> dict:
-    """Compare CustomIntegrator globals after copying a shared GaMD setup."""
-    ref = reference or {}
-    cur = current or {}
+def compare_gamd_global_sets(reference: dict[str, float], current: dict[str, float], rtol: float = 1.0e-10, atol: float = 1.0e-10,
+                              ignore_names: frozenset = frozenset()) -> dict:
+    """Compare CustomIntegrator globals after copying a shared GaMD setup.
+
+    ``ignore_names`` drops globals from ref AND cur before any of missing/
+    extra/mismatch is computed, so an intentionally-rescaled global (the
+    lambda-ladder's k0_Total/k0_Dihedral -- see the call site in run_gareus,
+    which passes {"k0_Total", "k0_Dihedral"} whenever the ladder is active)
+    never shows up as a false "copied-global problem": every replica whose
+    window lambda != 1 is SUPPOSED to differ from the raw shared-setup
+    (lambda=1) reference here, by design (set_replica_lambda_for_window runs
+    right after this same shared-globals copy), not because the copy failed.
+    """
+    ref = {k: v for k, v in (reference or {}).items() if k not in ignore_names}
+    cur = {k: v for k, v in (current or {}).items() if k not in ignore_names}
     missing = sorted([k for k in ref if k not in cur])
     extra = sorted([k for k in cur if k not in ref])
     mismatches = []
@@ -4254,8 +4514,18 @@ def sync_scratch_to_main(scratch_dir: Path, main_dir: Path) -> None:
 
 def load_production_checkpoint(out_dir: Path, sims: list, centers_nm, ks_kj_nm2, rng, secondary_centers=None, secondary_ks_kj=None,
                                openmm_version: Optional[str] = None, platform_name: Optional[str] = None,
-                               strict_gamd_restore: bool = False) -> Optional[dict]:
-    """Load a production checkpoint manifest and all replica checkpoints if available."""
+                               strict_gamd_restore: bool = False,
+                               state_lambdas=None, k0max_by_channel: Optional[dict] = None) -> Optional[dict]:
+    """Load a production checkpoint manifest and all replica checkpoints if available.
+
+    state_lambdas/k0max_by_channel need not both be given: k0max_by_channel is None
+    on every run that does not have the λ-ladder active (plain GaMD, conventional
+    MD, or GaMD without a ladder -- the common case), while state_lambdas is an
+    unconditionally-populated array regardless of run mode. Only the combination
+    of an active ladder (k0max_by_channel is not None) with no per-window λ
+    (state_lambdas is None) is a real misconfiguration; see
+    set_replica_lambda_for_window, which enforces exactly that and nothing more.
+    """
     manifest_path = checkpoint_manifest_path(out_dir)
     if not manifest_path.exists():
         return None
@@ -4310,6 +4580,14 @@ def load_production_checkpoint(out_dir: Path, sims: list, centers_nm, ks_kj_nm2,
         raise RuntimeError("Checkpoint assignment count does not match replica count")
     for r, sim in enumerate(sims):
         set_window(sim.context, centers_nm, ks_kj_nm2, int(assignments[r]), secondary_centers, secondary_ks_kj)
+        # The GaMD-integrator-globals restore above is best-effort (see the
+        # comments above): when it is incomplete, k0_Total/k0_Dihedral are still
+        # whatever _build_context_i set from this replica's BUILD-time index, not
+        # necessarily its RESUMED window assignment. Re-derive k0 from the
+        # restored assignment unconditionally so a partial restore can never
+        # leave a replica's boost strength mismatched with its window. No-ops
+        # when the ladder is inactive (k0max_by_channel is None).
+        set_replica_lambda_for_window(sim.integrator, assignments[r], state_lambdas, k0max_by_channel)
     try:
         if manifest.get("rng_state") is not None:
             rng.bit_generator.state = manifest["rng_state"]
@@ -5191,6 +5469,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         bootstrap_torsion_summary = _ensure_bootstrap_torsion_cv_ready(args, out_dir, topology, primary_cv_def)
         if getattr(args, "windows_2d_csv", None):
             centers_a, k_list, secondary_cv_centers, secondary_cv_k_kcal_list, secondary_cv_metadata, window_metadata = load_explicit_2d_window_csv(args, Path(args.windows_2d_csv))
+            args.state_gamd_lambdas = list(secondary_cv_metadata.get("gamd_lambdas") or [0.0] * len(centers_a))
             # Captured BEFORE the filter: it returns only the survivors, and the
             # map correction below needs the index space the drop was expressed in.
             _n_windows_before_reachability_filter = int(len(centers_a))
@@ -5244,7 +5523,47 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         "primary_openmm_k_units": primary_openmm_k_units(args),
         "primary_cv_definition": _json_ready(primary_cv_def),
     })
-    window_rows = window_assignment_rows(centers_a, k_list, args.temperature_k, secondary_cv_centers, secondary_cv_k_kcal_list, args=args)
+    # Controller ruling (Task 9, Part B; corrected after review): reload a
+    # frozen ladder from run_manifest.json BEFORE _derive_state_gamd_lambdas
+    # runs, not after. _derive_state_gamd_lambdas's own fallback-of-last-resort
+    # is [0.0] * n -- a non-empty (hence truthy) list -- so calling the reload
+    # afterward meant its unset-guard always saw an already-"set" value and
+    # never actually read the manifest on any real run (the bug a review
+    # caught: the reload was dead code in practice). Placed here, the reload
+    # only ever sees args.state_gamd_lambdas in its true pre-derivation state
+    # (unset on the fast-resume/choose_windows paths; already populated from
+    # the window table on the explicit-2D path, which the reload correctly
+    # leaves alone), so _derive_state_gamd_lambdas's `existing=` below
+    # naturally receives whatever the reload restored.
+    _reload_state_gamd_lambdas_on_resume(args, out_dir)
+
+    # Re-derive args.state_gamd_lambdas from the (possibly reachability-filtered
+    # and reindexed) normalized_rows rather than trusting the value set right
+    # after load_explicit_2d_window_csv: filter_explicit_2d_windows_by_seed_reachability
+    # can drop and renumber rows, and each surviving normalized_row already
+    # carries its own correct "gamd_lambda", so this stays aligned with
+    # centers_a/k_list no matter which branch (explicit-2D, choose_windows,
+    # or fast-resume) produced them.
+    args.state_gamd_lambdas = _derive_state_gamd_lambdas(
+        window_metadata, len(centers_a), existing=getattr(args, "state_gamd_lambdas", None)
+    )
+    # initialize_run_manifest() (cli.py, before minimize_and_npt_equilibrate/
+    # run_gareus are ever called) runs _method_settings(args) long before
+    # args.state_gamd_lambdas exists as an attribute at all -- that dict
+    # comprehension is `{k: getattr(args, k, None) for k in keys if
+    # hasattr(args, k)}`, so a not-yet-set attribute is silently OMITTED, not
+    # written as null. finalize_run_manifest() never recomputes
+    # method_settings either (it only patches status/end_time/artifact
+    # hashes), so without this patch "state_gamd_lambdas" never appears in
+    # run_manifest.json on ANY run -- silently defeating
+    # _reload_state_gamd_lambdas_on_resume's manifest read on every --resume.
+    # Patch it in now that this stage's value is known -- NOT the final word,
+    # though: --max-replicas truncation and the post-pull US auto-drop
+    # re-derive (further below) can still reassign args.state_gamd_lambdas,
+    # each of which re-calls _persist_state_gamd_lambdas so the manifest
+    # always reflects the LAST mutation, not this first one.
+    _persist_state_gamd_lambdas(args, out_dir)
+    window_rows = window_assignment_rows(centers_a, k_list, args.temperature_k, secondary_cv_centers, secondary_cv_k_kcal_list, args=args, gamd_lambdas=args.state_gamd_lambdas)
     write_window_assignment_csv(out_dir / "umbrella_windows.csv", window_rows)
     print_window_assignment_table(window_rows)
     graph_summary = None
@@ -5310,7 +5629,23 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             secondary_cv_centers = np.asarray(secondary_cv_centers, dtype=float)[:_max_replicas]
         if secondary_cv_k_kcal_list is not None:
             secondary_cv_k_kcal_list = list(secondary_cv_k_kcal_list)[:_max_replicas]
+        if getattr(args, "state_gamd_lambdas", None) is not None:
+            args.state_gamd_lambdas = list(args.state_gamd_lambdas)[:_max_replicas]
+            # Re-patch: the manifest snapshot written earlier (right after the
+            # initial derive) is now stale-length -- see _persist_state_gamd_lambdas'
+            # docstring for why persisting a pre-truncation value would corrupt
+            # a later --resume.
+            _persist_state_gamd_lambdas(args, out_dir)
         nrep = _max_replicas
+
+    # The rung dimension: one gamd_lambda per surviving state, aligned with
+    # centers_a/k_list/nrep above (including any --max-replicas truncation).
+    state_lambdas = np.asarray(getattr(args, "state_gamd_lambdas", None) or [0.0] * nrep, dtype=float)
+    if state_lambdas.size != nrep:
+        raise ValueError(f"state_gamd_lambdas has {state_lambdas.size} entries for {nrep} states")
+    ladder_active = bool(np.any(state_lambdas > 0.0))
+    if ladder_active and not is_pep_gamd(args):
+        raise ValueError("a gamd_lambda ladder requires --gamd-boost-type pep-gamd-lower-dual")
 
     # Resolve per-replica CPU threads now that nrep is known.
     # --cpu-budget distributes total cores evenly; --max-cpu-per-replica caps the result.
@@ -5433,6 +5768,29 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 explicit_window_table_summary = _drop_table_summary
             nrep = len(centers_nm)
 
+            # The post-pull auto-drop can remove/restore arbitrary (non-suffix)
+            # indices, so state_lambdas computed before this point is stale and
+            # potentially misaligned. drop_bad_us_windows_and_rebuild already
+            # subsets+renumbers window_metadata["normalized_rows"] using its own
+            # (possibly connectivity-restored) keep set via _resubscript_normalized_rows
+            # -- re-derive from that rather than guessing the keep set here.
+            # existing=None deliberately: the pre-drop args.state_gamd_lambdas is not
+            # safe to reuse across an arbitrary (non-suffix) index drop.
+            _prev_state_gamd_lambdas = getattr(args, "state_gamd_lambdas", None)
+            args.state_gamd_lambdas = _derive_state_gamd_lambdas(window_metadata, len(centers_a), existing=None)
+            _warn_if_ladder_was_zeroed(_prev_state_gamd_lambdas, args.state_gamd_lambdas,
+                                       "post-pull US auto-drop state_gamd_lambdas re-derive")
+            # Re-patch: see _persist_state_gamd_lambdas' docstring -- the manifest
+            # must reflect this post-drop, re-derived value, not whatever an
+            # earlier call (initial derive, or --max-replicas truncation) wrote.
+            _persist_state_gamd_lambdas(args, out_dir)
+            state_lambdas = np.asarray(args.state_gamd_lambdas, dtype=float)
+            if state_lambdas.size != nrep:
+                raise ValueError(f"state_gamd_lambdas has {state_lambdas.size} entries for {nrep} states after US auto-drop")
+            ladder_active = bool(np.any(state_lambdas > 0.0))
+            if ladder_active and not is_pep_gamd(args):
+                raise ValueError("a gamd_lambda ladder requires --gamd-boost-type pep-gamd-lower-dual")
+
         if use_gamd:
             reusable_gamd = load_reusable_shared_gamd_setup(args, out_dir)
             if reusable_gamd is not None:
@@ -5505,6 +5863,18 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         # burst of production replica Context creation.  OpenCL in particular may
         # otherwise fail at clCreateContext(-6) even before the first replica.
         release_openmm_contexts()
+
+    # The λ-ladder rung dimension: k0max_by_channel is the top-rung (λ=1) k0 for
+    # each boost channel, read once from the shared calibrated globals. Only
+    # non-None when the ladder is actually active on a Pep-GaMD run -- every other
+    # run mode (plain GaMD, no ladder, non-pep-gamd) leaves every replica's k0 at
+    # the shared globals, exactly as before this feature existed.
+    k0max_by_channel = k0max_from_globals(shared_gamd_globals_all) if (use_gamd and ladder_active) else None
+    # The per-state boost envelope, built once from the same calibrated globals
+    # every replica's k0max is drawn from above. None whenever the ladder is not
+    # active, in which case the exchange bias matrix carries no boost term at all
+    # (an all-zero contribution) and every other run mode is unaffected.
+    pep_env = PepGamdEnvelope.from_integrator_globals(shared_gamd_globals_all) if (use_gamd and ladder_active) else None
 
     # _ReplicaAffinityExecutor lives at module scope (see its docstring) so the
     # per-replica thread-affinity invariant it exists to enforce can be unit
@@ -5618,6 +5988,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 if shared_gamd_globals_all:
                     copied, copied_skipped = set_integrator_globals_from_dict(integrator_i, shared_gamd_globals_all)
                     skipped.update({k: v for k, v in copied_skipped.items() if k not in skipped})
+                set_replica_lambda_for_window(integrator_i, i, state_lambdas, k0max_by_channel)
             if not fast_resume:
                 sim_i.context.setPeriodicBoxVectors(*box)
                 start_pos = window_start_positions[i] if i < len(window_start_positions) and window_start_positions[i] is not None else pos
@@ -5731,8 +6102,14 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         write_json(out_dir / "replica_shared_gamd_copy_report.json", copy_report_payload)
         print("    Shared GaMD copy sanity: skipped for checkpoint resume; integrator state will be loaded from checkpoint.")
     else:
+        # See compare_gamd_global_sets' ignore_names docstring: k0_Total/k0_Dihedral
+        # are rescaled per-rung by set_replica_lambda_for_window right after this
+        # same shared-globals copy, so they must be excluded from the comparison
+        # whenever the ladder is active -- otherwise every replica assigned a
+        # window with lambda != 1 reports a false copied-global "mismatch".
+        _copy_sanity_ignore = frozenset({"k0_Total", "k0_Dihedral"}) if ladder_active else frozenset()
         for i, sim in enumerate(sims):
-            cmp = compare_gamd_global_sets(shared_gamd_globals_all, all_integrator_globals(sim.integrator))
+            cmp = compare_gamd_global_sets(shared_gamd_globals_all, all_integrator_globals(sim.integrator), ignore_names=_copy_sanity_ignore)
             row = {"replica": int(i), **cmp}
             copy_sanity_rows.append(row)
             copy_problem_count += int(cmp.get("missing_count", 0)) + int(cmp.get("mismatch_count", 0)) + int(replica_gamd_copy_report[i].get("skipped_count", 0))
@@ -5877,12 +6254,19 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         "samples_columns_for_mbar": {
             "cv_A": f"sampled primary CV ({primary_cv_label(args)}) in {primary_cv_units(args)}; legacy column name",
             "window": "thermodynamic umbrella state assigned to the replica at this sample",
-            "umbrella_bias_all_windows_kcal_mol_json": "optional list of U_i(r_n) for all umbrella windows i, kcal/mol; written only with --write-full-bias-csv-vectors",
-            "umbrella_bias_all_windows_kj_mol_json": "optional list of U_i(r_n) for all umbrella windows i, kJ/mol; written only with --write-full-bias-csv-vectors",
-            "umbrella_reduced_bias_all_windows_json": "optional list of beta*U_i(r_n), dimensionless; written only with --write-full-bias-csv-vectors",
+            "umbrella_bias_all_windows_kcal_mol_json": "optional list of the TOTAL bias of sample r_n under every state i, kcal/mol: the umbrella term U_i(r_n) PLUS, on a λ-ladder run, state i's own Pep-GaMD boost of this configuration (assemble_bias_matrices folds the boost in). Umbrella-only on every non-ladder run. Written only with --write-full-bias-csv-vectors",
+            "umbrella_bias_all_windows_kj_mol_json": "same total (umbrella + λ-ladder boost) per state i, kJ/mol; written only with --write-full-bias-csv-vectors",
+            "umbrella_reduced_bias_all_windows_json": "same total reduced by beta, dimensionless -- beta*(U_i(r_n) + boost_i(r_n)); this is the u_nk row MBAR consumes. Written only with --write-full-bias-csv-vectors",
             "gamd_boost_total_kj_mol": "GaMD boost estimate. Preferred source is gamd-openmm integrator.get_boost_potentials(); fallback is named CustomIntegrator globals.",
             "gamd_boost_source": "get_boost_potentials, integrator_globals, or unavailable",
             "gamd_boost_components_kj_mol_json": "component boost potentials from gamd-openmm native get_boost_potentials(), kJ/mol",
+            "umbrella_bias_kcal_mol": "TOTAL bias of this sample under its OWN assigned state, kcal/mol: the umbrella term plus, on a λ-ladder run, that state's Pep-GaMD boost of this configuration. Umbrella-only on every non-ladder run; see sampled_umbrella_bias_kj for the umbrella term alone",
+            "umbrella_bias_kj_mol": "the same own-state total in kJ/mol",
+            "sampled_umbrella_bias_kj": "umbrella-only component (primary + secondary CV) of the sampled window's bias, kJ/mol; excludes the λ-ladder Pep-GaMD boost even when umbrella_bias_kj_mol/umbrella_bias_kcal_mol carry it",
+            "sampled_boost_bias_kj": "Pep-GaMD boost of this replica's configuration under its own assigned window's λ, kJ/mol; zero on every run where the λ-ladder is not active",
+            "v_pep_kj_mol": "raw peptide-dihedral+nonbonded channel energy (gamd-openmm 'total potential energy of the boosted group') at this replica's configuration, kJ/mol; NaN when the λ-ladder is not active",
+            "v_dih_kj_mol": "raw peptide-dihedral-only channel energy at this replica's configuration, kJ/mol; NaN when the λ-ladder is not active",
+            "gamd_lambda": "the λ-ladder boost strength of the state/window this sample was assigned to; 0.0 on every run where the λ-ladder is not active, and identically 0.0 on λ=0 rungs even when the ladder is active",
         },
     }
     write_json(out_dir / "umbrella_pymbar_metadata.json", pymbar_metadata)
@@ -5897,16 +6281,10 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     _parent_was_running = bool(_parent_seg and _parent_seg.get("status") == "running")
     _round_id = int(getattr(args, "adaptive_feedback_round", 1))
     _seg_id = _seg_registry.open_segment(_run_id, _parent_seg_id, _round_id)
-    _win_snapshot_windows = [
-        {
-            "window_id": int(wi),
-            "center1": float(centers_a[wi]),
-            "k1": float(k_list[wi]),
-            **({"center2": float(secondary_cv_centers[wi]), "k2": float(secondary_cv_k_kcal_list[wi])}
-               if secondary_cv_centers is not None and secondary_cv_k_kcal_list is not None else {}),
-        }
-        for wi in range(nrep)
-    ]
+    _win_snapshot_windows = snapshot_window_rows(
+        centers_a[:nrep], k_list[:nrep], secondary_cv_centers, secondary_cv_k_kcal_list,
+        getattr(args, "state_gamd_lambdas", None), n=nrep,
+    )
     _cv2_type = (secondary_cv_metadata or {}).get("mode") if secondary_cv_centers is not None else None
     WindowSnapshot(out_dir).snapshot(_seg_id, _win_snapshot_windows, cv1_type=primary_cv_mode(args), cv2_type=_cv2_type)
     parquet_sample_writer = ParquetSampleWriter(
@@ -6098,6 +6476,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             primary_values = np.empty(nrep, dtype=np.float64)
             ss_values = np.full(nrep, np.nan, dtype=np.float64)
             potentials_kj = np.empty(nrep, dtype=np.float64)
+            v_pep_kj = np.empty(nrep, dtype=np.float64)
+            v_dih_kj = np.empty(nrep, dtype=np.float64)
 
             def _fetch_state(r_sim):
                 r, sim = r_sim
@@ -6118,14 +6498,18 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                         pe = float(state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole))
                     else:
                         pe = float("nan")
-                    return r, cv, ss, pe
-                return r, *primary_secondary_and_potential_from_state(
+                    v_pep, v_dih = _fetch_v_pep_v_dih(ctx, pep_env, unit)
+                    return r, cv, ss, pe, v_pep, v_dih
+                cv, ss, pe = primary_secondary_and_potential_from_state(
                     sim.context, primary_cv_def, args, unit, secondary_cv_metadata,
                     read_potential_energy=read_sample_potential,
                 )
+                v_pep, v_dih = _fetch_v_pep_v_dih(sim.context, pep_env, unit)
+                return r, cv, ss, pe, v_pep, v_dih
 
-            for r, cv, ss, pe in _sim_pool.map(_fetch_state, enumerate(sims)):
+            for r, cv, ss, pe, v_pep, v_dih in _sim_pool.map(_fetch_state, enumerate(sims)):
                 primary_values[r], ss_values[r], potentials_kj[r] = cv, ss, pe
+                v_pep_kj[r], v_dih_kj[r] = v_pep, v_dih
             primary_delta_matrix = primary_values[np.newaxis, :] - centers_a_arr[:, np.newaxis]
             distance_bias_matrix_kcal = 0.5 * k_arr[:, np.newaxis] * primary_delta_matrix * primary_delta_matrix
             if secondary_cv_centers is not None and secondary_cv_k_kcal_list is not None:
@@ -6142,13 +6526,19 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 ss_centers_arr = ss_centers_arr_global
                 ss_k_arr = ss_k_kcal_arr_global
                 ss_bias_matrix_kcal = np.zeros_like(distance_bias_matrix_kcal)
-            bias_matrix_kcal = distance_bias_matrix_kcal + ss_bias_matrix_kcal
-            bias_matrix_kj = 4.184 * bias_matrix_kcal
+            boost_bias_matrix_kj = (pep_gamd_boost_matrix_kj(v_pep_kj, v_dih_kj, state_lambdas, pep_env)
+                                    if pep_env is not None else np.zeros((nrep, nrep)))
+            bias_matrix_kcal, bias_matrix_kj = assemble_bias_matrices(
+                distance_bias_matrix_kcal, ss_bias_matrix_kcal, boost_bias_matrix_kj
+            )
             reduced_bias_matrix = float(beta) * bias_matrix_kj
             observable_cache["step"] = int(step)
             observable_cache["primary_values"] = primary_values
             observable_cache["cvs_nm"] = (primary_values / 10.0) if is_distance_primary else primary_values
             observable_cache["bias_matrix_kj"] = bias_matrix_kj
+            observable_cache["v_pep_kj"] = v_pep_kj
+            observable_cache["v_dih_kj"] = v_dih_kj
+            observable_cache["boost_bias_matrix_kj"] = boost_bias_matrix_kj
             if is_prod:
                 ensure_sample_writer()
             for r, sim in enumerate(sims):
@@ -6163,6 +6553,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 all_ss_bias_kcal = ss_bias_matrix_kcal[:, r]
                 sampled_bias_kcal = float(all_bias_kcal[w])
                 sampled_bias_kj = float(all_bias_kj[w])
+                sampled_umbrella_bias_kj = float(4.184 * (all_distance_bias_kcal[w] + all_ss_bias_kcal[w]))
+                sampled_boost_bias_kj = float(boost_bias_matrix_kj[w, r])
                 row = {
                     "step": int(step),
                     "phase": phase,
@@ -6184,8 +6576,13 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     "secondary_cv_k_kcal_mol": float(ss_k_arr[w]) if math.isfinite(float(ss_k_arr[w])) else "",
                     "distance_umbrella_bias_kcal_mol": float(all_distance_bias_kcal[w]),
                     "secondary_cv_bias_kcal_mol": float(all_ss_bias_kcal[w]),
+                    "v_pep_kj_mol": float(v_pep_kj[r]) if pep_env is not None else float("nan"),
+                    "v_dih_kj_mol": float(v_dih_kj[r]) if pep_env is not None else float("nan"),
+                    "gamd_lambda": float(state_lambdas[w]),
                     "umbrella_bias_kcal_mol": sampled_bias_kcal,
                     "umbrella_bias_kj_mol": sampled_bias_kj,
+                    "sampled_umbrella_bias_kj": sampled_umbrella_bias_kj,
+                    "sampled_boost_bias_kj": sampled_boost_bias_kj,
                     "umbrella_reduced_bias": float(all_reduced_bias[w]),
                     "umbrella_restoring_force_kcal_mol_per_A": k_kcal_a2 * (center_a - cv_a),
                     "potential_kj_mol": float(potentials_kj[r]),
@@ -6242,6 +6639,9 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                         boost_total=_boost_total,
                         boost_dihedral=_boost_dihe,
                         boost_nonbonded=_boost_nonb,
+                        v_pep=float(v_pep_kj[r]) if pep_env is not None else float("nan"),
+                        v_dih=float(v_dih_kj[r]) if pep_env is not None else float("nan"),
+                        gamd_lambda=float(state_lambdas[w]),
                     )
                 rows.append(row)
             if is_prod and bool(getattr(args, "flush_every_log", False)):
@@ -6426,6 +6826,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             if outcome.accepted:
                 set_window(sims[i].context, centers_nm, ks_kj_nm2, assignments[i], secondary_cv_centers, secondary_cv_ks_kj)
                 set_window(sims[j].context, centers_nm, ks_kj_nm2, assignments[j], secondary_cv_centers, secondary_cv_ks_kj)
+                set_replica_lambda_for_window(sims[i].integrator, assignments[i], state_lambdas, k0max_by_channel)
+                set_replica_lambda_for_window(sims[j].integrator, assignments[j], state_lambdas, k0max_by_channel)
             parquet_exchange_writer.write_exchange(
                 step=int(absolute_step),
                 replica_i=int(i),
@@ -6453,9 +6855,15 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             # (contacts primary + CustomCVForce secondary) this reads cached scalars
             # via getCollectiveVariableValues() — no positions DMA at all.  The
             # full U[window, replica] umbrella matrix is then built in NumPy for all
-            # swap/Gibbs candidates.  Potential energies are not needed here.
+            # swap/Gibbs candidates.  Potential energies are not needed here -- except
+            # when the λ-ladder is active (pep_env is not None), which adds three
+            # getState(getEnergy=True, ...) reads per replica per exchange attempt
+            # (peptide_essential_energy_kj's two group reads plus the dihedral group)
+            # to price the Pep-GaMD boost under every candidate state's λ.
             primary_values = np.empty(nrep, dtype=np.float64)
             ss_values = np.full(nrep, np.nan, dtype=np.float64)
+            v_pep_kj = np.empty(nrep, dtype=np.float64)
+            v_dih_kj = np.empty(nrep, dtype=np.float64)
             _ss_enabled = bool((secondary_cv_metadata or {}).get("enabled"))
 
             def _fetch_exchange_state(r_sim):
@@ -6471,21 +6879,30 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                         _ss_scalar_from_sub_cv_values(sf.getCollectiveVariableValues(ctx), secondary_cv_metadata)
                         if sf is not None and _ss_enabled else float("nan")
                     )
+                    v_pep, v_dih = _fetch_v_pep_v_dih(ctx, pep_env, unit)
                 else:
                     state = sim.context.getState(getPositions=True, enforcePeriodicBox=True)
                     pos = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
                     cv = primary_cv_value_from_positions_nm(pos, primary_cv_def, args)
                     ss = secondary_structure_score_from_positions_nm(pos, secondary_cv_metadata) if _ss_enabled else float("nan")
-                return r, cv, ss
+                    v_pep, v_dih = _fetch_v_pep_v_dih(sim.context, pep_env, unit)
+                return r, cv, ss, v_pep, v_dih
 
-            for r, cv, ss in _sim_pool.map(_fetch_exchange_state, enumerate(sims)):
+            for r, cv, ss, v_pep, v_dih in _sim_pool.map(_fetch_exchange_state, enumerate(sims)):
                 primary_values[r] = cv
                 ss_values[r] = ss
+                v_pep_kj[r] = v_pep
+                v_dih_kj[r] = v_dih
             dprimary = primary_values[np.newaxis, :] - centers_a_arr[:, np.newaxis]
-            bias_matrix_kj = 4.184 * 0.5 * k_arr[:, np.newaxis] * dprimary * dprimary
+            distance_bias_kcal = 0.5 * k_arr[:, np.newaxis] * dprimary * dprimary
             if secondary_cv_centers is not None and secondary_cv_ks_kj is not None and ss_ks_kj_arr_global is not None:
                 dss = ss_values[np.newaxis, :] - ss_centers_arr_global[:, np.newaxis]
-                bias_matrix_kj = bias_matrix_kj + 0.5 * ss_ks_kj_arr_global[:, np.newaxis] * dss * dss
+                ss_bias_kcal = (0.5 * ss_ks_kj_arr_global[:, np.newaxis] * dss * dss) / 4.184
+            else:
+                ss_bias_kcal = np.zeros_like(distance_bias_kcal)
+            boost_bias_matrix_kj = (pep_gamd_boost_matrix_kj(v_pep_kj, v_dih_kj, state_lambdas, pep_env)
+                                    if pep_env is not None else np.zeros((nrep, nrep)))
+            _, bias_matrix_kj = assemble_bias_matrices(distance_bias_kcal, ss_bias_kcal, boost_bias_matrix_kj)
             return primary_values, bias_matrix_kj
 
         def _candidate_delta_for_window_swap(wi: int, wj: int, bias_matrix_kj: np.ndarray) -> Optional[float]:
@@ -6682,6 +7099,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 openmm_version=str(getattr(getattr(openmm, "version", None), "version", None)),
                 platform_name=str(platform.getName()),
                 strict_gamd_restore=bool(getattr(args, "strict_gamd_restore", False)),
+                state_lambdas=state_lambdas, k0max_by_channel=k0max_by_channel,
             )
             if manifest is not None:
                 assignments[:] = [int(x) for x in manifest.get("assignments", assignments)]

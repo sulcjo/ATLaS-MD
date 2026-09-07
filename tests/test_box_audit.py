@@ -40,6 +40,7 @@ class TestAuditFields:
         pos_nm = _make_pos_nm((2.0, 1.5, 1.0))
         ca_pos_nm = _make_ca_pos_nm(10)
         args = _make_args(padding_nm=1.0, seq="GYDPETGTWG")
+        args.nonbonded_cutoff_nm = 1.0
         box_nm = 6.0
         contour_nm = 4.0
 
@@ -52,6 +53,8 @@ class TestAuditFields:
             "box_size_nm",
             "padding_nm",
             "minimum_margin_nm",
+            "min_image_gap_nm",
+            "nonbonded_cutoff_nm",
             "pbc_self_contact_warning",
             "warning_message",
         }
@@ -160,13 +163,14 @@ class TestPbcSelfContactWarning:
         """Box easily large enough: no warning expected.
 
         seq = "GYDPETGTWG" (10 res) → contour = 3.82 nm
-        box_nm = 10.0, padding = 1.0
-        threshold = 10.0/2 - 1.0 = 4.0 nm
-        3.82 < 4.0 → no warning
+        box_nm = 10.0, cutoff = 1.0 nm
+        min_image_gap = 10.0 - 3.82 = 6.18 nm
+        6.18 >= 1.0 → no warning
         """
         pos_nm = _make_pos_nm()
         ca_pos_nm = _make_ca_pos_nm(10)
         args = _make_args(padding_nm=1.0, seq="GYDPETGTWG")
+        args.nonbonded_cutoff_nm = 1.0
         result = _write_box_audit(tmp_path, pos_nm, ca_pos_nm, 4.0, 10.0, args)
 
         assert result["pbc_self_contact_warning"] is False
@@ -176,13 +180,14 @@ class TestPbcSelfContactWarning:
         """Box too small for the sequence: warning expected.
 
         seq = "GYDPETGTWG" (10 res) → contour = 3.82 nm
-        box_nm = 6.0, padding = 1.0
-        threshold = 6.0/2 - 1.0 = 2.0 nm
-        3.82 > 2.0 → warning
+        box_nm = 6.0, cutoff = 2.5 nm (large enough to trigger warning)
+        min_image_gap = 6.0 - 3.82 = 2.18 nm
+        2.18 < 2.5 → warning
         """
         pos_nm = _make_pos_nm()
         ca_pos_nm = _make_ca_pos_nm(10)
         args = _make_args(padding_nm=1.0, seq="GYDPETGTWG")
+        args.nonbonded_cutoff_nm = 2.5
         result = _write_box_audit(tmp_path, pos_nm, ca_pos_nm, 4.0, 6.0, args)
 
         assert result["pbc_self_contact_warning"] is True
@@ -190,24 +195,26 @@ class TestPbcSelfContactWarning:
         assert "PBC warning" in result["warning_message"]
 
     def test_warning_message_contains_numeric_context(self, tmp_path):
-        """Warning message must include both contour and threshold values."""
+        """Warning message must include gap and cutoff values."""
         pos_nm = _make_pos_nm()
         ca_pos_nm = _make_ca_pos_nm(10)
         args = _make_args(padding_nm=1.0, seq="GYDPETGTWG")
+        args.nonbonded_cutoff_nm = 2.5
         result = _write_box_audit(tmp_path, pos_nm, ca_pos_nm, 4.0, 6.0, args)
 
         msg = result["warning_message"]
-        assert "3.82" in msg   # contour estimate
-        assert "2.00" in msg   # threshold = 6.0/2 - 1.0
+        assert "2.18" in msg or "2.2" in msg   # min_image_gap = 6.0 - 3.82
+        assert "2.5" in msg or "2.50" in msg   # cutoff
 
     def test_warning_boundary_exactly_equal_is_false(self, tmp_path):
-        """When contour == threshold exactly, no warning (strict >)."""
-        # contour = 3.82, threshold must equal 3.82 → box/2 - padding = 3.82
-        # → box = 2*(3.82 + 1.0) = 9.64
+        """When gap == cutoff exactly, no warning (strict <)."""
+        # contour = 3.82, gap must equal cutoff for boundary case
+        # gap = box - contour = 3.82, so box = 7.64, cutoff = 3.82
         pos_nm = _make_pos_nm()
         ca_pos_nm = _make_ca_pos_nm(10)
         args = _make_args(padding_nm=1.0, seq="GYDPETGTWG")
-        box_nm = 2.0 * (3.82 + 1.0)  # = 9.64
+        args.nonbonded_cutoff_nm = 3.82
+        box_nm = 7.64
         result = _write_box_audit(tmp_path, pos_nm, ca_pos_nm, 4.0, box_nm, args)
 
         assert result["pbc_self_contact_warning"] is False
@@ -228,9 +235,10 @@ class TestPbcSelfContactWarning:
         # Box sized from compact extent: ~1.5 + 0.40 + 2*1.0 = 3.9 nm
         box_nm = 3.9
         args = _make_args(padding_nm=1.0, seq="GYDPETGTWG")
+        args.nonbonded_cutoff_nm = 1.0
 
         result = _write_box_audit(tmp_path, pos_nm, ca_pos_nm, 1.9, box_nm, args)
 
-        # threshold = 3.9/2 - 1.0 = 0.95; contour 3.82 >> 0.95 → warning
+        # gap = 3.9 - 3.82 = 0.08 nm; cutoff = 1.0 nm → warning
         assert result["pbc_self_contact_warning"] is True
         assert result["sequence_contour_estimate_nm"] == pytest.approx(3.82)

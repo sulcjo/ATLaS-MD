@@ -277,9 +277,30 @@ def _method_settings(args: Any) -> dict[str, Any]:
         "window_mode", "secondary_cv", "secondary_cv_centers",
         "gamd_boost_type", "sigma0p_kcal_mol", "sigma0d_kcal_mol", "gamd_production_steps",
         "exchange_mode", "exchange_interval", "traj_format", "sample_potential_energy",
-        "flush_every_log", "analysis_array_dtype",
+        "flush_every_log", "analysis_array_dtype", "state_gamd_lambdas",
     ]
-    return {k: getattr(args, k, None) for k in keys if hasattr(args, k)}
+    settings = {k: getattr(args, k, None) for k in keys if hasattr(args, k)}
+    # The λ-ladder is frozen for the whole campaign (spec §3.1), so its
+    # per-state lambdas and the envelope it was calibrated against both
+    # belong in the immutable run manifest, next to gamd_boost_type above.
+    # This is also what Part B's --resume reload
+    # (production._reload_state_gamd_lambdas_on_resume) reads
+    # state_gamd_lambdas back from when args.state_gamd_lambdas does not
+    # survive the restart.
+    try:
+        from .pep_gamd import is_pep_gamd
+        _pep_gamd = bool(is_pep_gamd(args))
+    except Exception:
+        _pep_gamd = False
+    # Records the adaptive-production campaign-export convention only;
+    # gareus.mbar_analysis.ladder.load_pep_gamd_envelope(run_dir) also accepts
+    # the bare single-run filename ("shared_gamd_setup_globals.json" directly
+    # under run_dir, no "global_shared_gamd_setup/" prefix) as a fallback, so
+    # this field is a hint for where to look first, not the only valid path.
+    settings["pep_gamd_envelope_path"] = (
+        "global_shared_gamd_setup/shared_gamd_setup_globals.json" if _pep_gamd else None
+    )
+    return settings
 
 
 def _forcefield_settings(args: Any) -> dict[str, Any]:

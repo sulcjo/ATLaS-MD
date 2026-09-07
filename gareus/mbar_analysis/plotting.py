@@ -492,3 +492,50 @@ def plot_outputs(d,pmfs,selected,O,out,warnings,smooth_sigma=0.0,args=None):
     counts=np.bincount(d.window[(d.window>=0)&(d.window<d.u_nk.shape[1])],minlength=d.u_nk.shape[1]); fig,ax=plt.subplots(figsize=(8,4)); ax.bar(np.arange(counts.size),counts,color=ps.BAR_COLOR); ps.style_line_axes(ax,xlabel='window',ylabel='samples',title='Samples per umbrella window',legend=False); fig.tight_layout(); fig.savefig(out/'window_sample_counts.png',dpi=200); plt.close(fig)
     fig,ax=plt.subplots(figsize=(6,5)); im=ax.imshow(O,origin='lower',vmin=0,vmax=1,aspect='auto'); ax.set_xlabel('window'); ax.set_ylabel('window'); ax.set_title('CV histogram overlap'); fig.colorbar(im,ax=ax,label='overlap'); fig.tight_layout(); fig.savefig(out/'overlap_matrix.png',dpi=200); plt.close(fig)
     plot_gamd_boost(d, out, warnings)
+
+
+def plot_ladder_crosscheck(cross: dict, out: Path, cv_label: str = 'CV') -> Optional[str]:
+    """Two-curve overlay for the lambda-ladder quoting gate: the full-ladder
+    PMF (every sample, global f_k) against the lambda=0-only PMF (same
+    global f_k, only the plain-umbrella rungs' own samples -- see
+    gareus.mbar_analysis.crosscheck.ladder_crosscheck). Only called when
+    that check actually ran (status 'pass' or 'fail', never 'skipped').
+
+    The lambda=0 curve reuses plotstyle's 'umbrella_only' colour -- it IS a
+    plain umbrella PMF -- so it reads as the same "honest unbiased
+    reference" hue used everywhere else in this report; the full-ladder
+    curve gets the other strong, already-registered hue ('gamd_cumulant2')
+    so the two are distinguishable under the same colourblind-safe palette
+    without inventing a third fixed slot for a curve pair that only ever
+    appears in this one plot.
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except Exception:
+        return None
+    pmf_full = cross.get('pmf_full') or {}
+    pmf_lam0 = cross.get('pmf_lambda0') or {}
+    if not pmf_full or not pmf_lam0:
+        return None
+    fig, ax = plt.subplots(figsize=(8, 5))
+    full_color, _ = ps.method_style('gamd_cumulant2')
+    lam0_color, _ = ps.method_style('umbrella_only')
+    F = np.asarray(pmf_full['pmf'], dtype=float); mF = np.isfinite(F)
+    L = np.asarray(pmf_lam0['pmf'], dtype=float); mL = np.isfinite(L)
+    if np.any(mF):
+        ax.plot(np.asarray(pmf_full['cv_A'])[mF], F[mF], color=full_color,
+                linewidth=2.6, label='full ladder (all samples)')
+    if np.any(mL):
+        ax.plot(np.asarray(pmf_lam0['cv_A'])[mL], L[mL], color=lam0_color,
+                linewidth=2.2, linestyle='--', label='λ=0 only (umbrella)')
+    status = cross.get('status', 'unknown')
+    diff = cross.get('max_abs_diff_kcal'); tol = cross.get('tolerance_kcal')
+    title = f'λ-ladder cross-check: {status}'
+    if diff is not None and tol is not None:
+        title += f' (max |Δ| {diff:.2f} / tol {tol:.2f} kcal/mol)'
+    ps.style_line_axes(ax, xlabel=cv_label, ylabel='PMF (kcal/mol, shifted)', title=title)
+    fig.tight_layout()
+    path = out / 'pmf_ladder_crosscheck.png'
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+    return str(path)

@@ -45,6 +45,7 @@ from gareus.mbar_analysis.solvers import (
     solve_mbar, overlap_matrix, _subset_logw_from_global_fk,
     logw_from_fk,
 )
+from gareus.mbar_analysis.crosscheck import ladder_crosscheck
 import gareus.mbar_analysis.solvers as _mbar_solvers
 from gareus.mbar_analysis.data import (
     Data, rjson, wjson, read_windows, jvec, infer_temp_beta,
@@ -494,6 +495,7 @@ from gareus.mbar_analysis.plotting import (
     _plot_2d_fes_multirange, plot_2d_fes, plot_cv1_cv2_2d_fes, plot_pca_2d_fes,
     _per_window_gamd_boost_stats, plot_gamd_boost, plot_outputs,
     plot_rg_outputs, _OPT_IN_GAMD_METHODS, _want_gamd_method, _visible_pmfs,
+    plot_ladder_crosscheck,
 )
 
 
@@ -4893,6 +4895,44 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
     if progress is not None: progress.bar('analysis stages', 2, 6, 'building PMFs', force=True)
     logw=np.asarray(m['logw'],dtype=np.float64)
 
+    # lambda-ladder quoting gate: the lambda=0 rungs are plain umbrella
+    # sampling, so their PMF -- built with the SAME global f_k just solved
+    # above but only their own samples' N_k (never a naive masked-logw
+    # renormalize, see _subset_logw_from_global_fk) -- must agree with the
+    # full-ladder PMF built from every sample. Runs against the FULL `d`
+    # (not d_main below): the epoch_000/rest split is a GaMD-envelope-
+    # recalibration axis, orthogonal to which states carry lambda=0.
+    ladder_crosscheck_summary={'status':'skipped','reason':'gamd_ladder not active for this run','n_lambda0_samples':0}
+    if d.meta.get('gamd_ladder'):
+        _lcc=ladder_crosscheck(d,m['f_k'],bins,kbt_kcal)
+        # Slim, JSON-safe view for pmf_summary.json -- the two full PMF
+        # dicts (_lcc['pmf_full']/['pmf_lambda0']) carry numpy arrays and go
+        # to the CSV/PNG below instead, never into the summary itself.
+        ladder_crosscheck_summary={k:_lcc[k] for k in ('status','max_abs_diff_kcal','n_lambda0_samples','tolerance_kcal','tolerance_source','n_bins_compared','count_gate_fell_back') if k in _lcc}
+        if 'reason' in _lcc: ladder_crosscheck_summary['reason']=_lcc['reason']
+        # The CONTRADICTION 'fail' (meta['gamd_ladder'] asserted while
+        # state_lambdas carries no λ>0 -- see crosscheck.ladder_crosscheck)
+        # returns before any PMF is built, so it carries neither pmf_full/
+        # pmf_lambda0 nor max_abs_diff_kcal. Key the CSV/PNG and the numeric
+        # warning text on those keys being PRESENT, not on status alone.
+        _lcc_has_pmfs='pmf_full' in _lcc and 'pmf_lambda0' in _lcc
+        if _lcc['status'] in ('pass','fail') and _lcc_has_pmfs:
+            write_all(out/'pmf_ladder_crosscheck.csv',
+                      {'full_ladder':_lcc['pmf_full'],'lambda0_only':_lcc['pmf_lambda0']})
+            png=plot_ladder_crosscheck(_lcc,out,_primary_cv_axis_label(d.meta))
+            ladder_crosscheck_summary['files']={'pmf_ladder_crosscheck_csv':str(out/'pmf_ladder_crosscheck.csv')}
+            if png: ladder_crosscheck_summary['files']['pmf_ladder_crosscheck_png']=png
+        if _lcc['status']=='fail':
+            if 'max_abs_diff_kcal' in _lcc:
+                warn.append(f"λ-ladder cross-check FAILED: λ=0-only PMF disagrees with the full-ladder PMF by "
+                            f"{_lcc['max_abs_diff_kcal']:.3f} kcal/mol (tolerance {_lcc['tolerance_kcal']:.3f}), over "
+                            f"{_lcc['n_lambda0_samples']} λ=0 samples -- the ladder boost reweighting embedded in "
+                            f"u_nk does not reproduce plain umbrella sampling on its own rungs; every PMF from this "
+                            f"run is suspect.")
+            else:
+                warn.append(f"λ-ladder cross-check FAILED: {_lcc.get('reason','contradictory ladder metadata')} -- "
+                            f"the cross-check could not be made at all, so no PMF from this run is certified.")
+
     # Never pool epoch_000 into the main PMF/GaMD-boost report: it runs under
     # a different GaMD envelope (the shared-envelope recalibration fires from
     # epoch 0's own sampling and at most once, gareus/adaptive_production.py's
@@ -4994,6 +5034,7 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
         s['files'].update({f'epoch_000_{k}':v for k,v in epoch0_report_info['files'].items()})
     else:
         s['epoch_000_report']={'available':False,'reason':'no epoch_000/rest split available (single-epoch run or non-adaptive-production source)'}
+    s['ladder_crosscheck']=ladder_crosscheck_summary
     s['rg']=rg_info
     s['distance_rg_2d_fes']=fes2d_info
     s['pca_2d_fes']=pca2d_info
@@ -5010,7 +5051,8 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
     s['convergence']=conv_info
     for _info in (rg_info,fes2d_info,pca2d_info,extra_obs_info,chignolin_fes_info,
                   poincare_info,poincare_torsions_info,secondary_cv_pmf_info,
-                  cv1_cv2_fes_info,epoch_cv_info,tica_epoch_info,torsion_pca_scree_info,conv_info):
+                  cv1_cv2_fes_info,epoch_cv_info,tica_epoch_info,torsion_pca_scree_info,conv_info,
+                  ladder_crosscheck_summary):
         if isinstance(_info,dict) and _info.get('files'):
             s['files'].update(_info['files'])
     # Presentation-only result-health verdict + warning triage (derived from the

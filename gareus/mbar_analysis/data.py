@@ -108,6 +108,13 @@ class Data:
     source: str
     meta: dict[str,Any]
     boost_dih_kj: Optional[np.ndarray] = None  # dihedral-only component of GaMD boost
+    # λ-ladder raw channel energies (per sample) and per-state rungs -- see
+    # gareus.pep_gamd.pep_gamd_boost_kj/pep_gamd_boost_matrix_kj. NaN-filled /
+    # zero-filled (never a live MaskedArray) on any run where the ladder is
+    # not active; meta["gamd_ladder"] is the authoritative "is it active" flag.
+    v_pep_kj: Optional[np.ndarray] = None
+    v_dih_kj: Optional[np.ndarray] = None
+    state_lambdas: Optional[np.ndarray] = None
 
 
 def infer_temp_beta(prod: Path, meta: dict, arrays=None):
@@ -183,11 +190,17 @@ def clean(d: Data) -> Data:
         # only depends on whether the array's own length already matches the
         # sample count) and must still run regardless of this fast path.
         if d.boost_dih_kj is not None and d.boost_dih_kj.size!=mask.size: d.boost_dih_kj=None
+        if d.v_pep_kj is not None and d.v_pep_kj.size!=mask.size: d.v_pep_kj=None
+        if d.v_dih_kj is not None and d.v_dih_kj.size!=mask.size: d.v_dih_kj=None
         return d
     d.cv=d.cv[mask]; d.cv2=d.cv2[mask]; d.rg_A=d.rg_A[mask]; d.window=d.window[mask]; d.replica=d.replica[mask]; d.step=d.step[mask]; d.u_nk=d.u_nk[mask]; d.boost_kj=d.boost_kj[mask]
     if d.potential_kj is not None and d.potential_kj.size==mask.size: d.potential_kj=d.potential_kj[mask]
     if d.boost_dih_kj is not None and d.boost_dih_kj.size==mask.size: d.boost_dih_kj=d.boost_dih_kj[mask]
     elif d.boost_dih_kj is not None: d.boost_dih_kj=None
+    if d.v_pep_kj is not None and d.v_pep_kj.size==mask.size: d.v_pep_kj=d.v_pep_kj[mask]
+    elif d.v_pep_kj is not None: d.v_pep_kj=None
+    if d.v_dih_kj is not None and d.v_dih_kj.size==mask.size: d.v_dih_kj=d.v_dih_kj[mask]
+    elif d.v_dih_kj is not None: d.v_dih_kj=None
     _filter_epoch_source(d, mask)
     return d
 
@@ -218,6 +231,8 @@ def _masked_data(d: 'Data', mask: np.ndarray, meta_override: Optional[dict] = No
         potential_kj=_sl(d.potential_kj),
         source=d.source, meta=meta_out,
         boost_dih_kj=_sl(d.boost_dih_kj),
+        v_pep_kj=_sl(d.v_pep_kj), v_dih_kj=_sl(d.v_dih_kj),
+        state_lambdas=d.state_lambdas,
     )
 
 

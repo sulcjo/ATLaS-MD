@@ -1705,7 +1705,14 @@ def load_epoch_csv_adaptive(ap: Path, epoch_ids: Optional[set[int]] = None) -> D
         kp = _fkey(row.get('primary_cv_k', row.get('k_kcal_mol_A2', row.get('k', ''))), 0.0)
         cs = _fkey(row.get('secondary_cv_center', ''), float('nan'))
         ks_ = _fkey(row.get('secondary_cv_k_kcal_mol', row.get('secondary_cv_k_kcal', '')), 0.0)
-        return (cp, kp, cs, ks_)
+        # λ is part of a thermodynamic state's identity: two rungs of one
+        # window share centre and k and differ only here. Without it every
+        # rung merged into ONE state and λ was then a nanmedian over a
+        # MIXTURE of rungs (2026-09-07 final review, I1). Defaults to 0.0,
+        # never NaN -- a NaN key element is not equal to itself, so it would
+        # fragment one state into one-per-row.
+        lam = _fkey(row.get('gamd_lambda', ''), 0.0)
+        return (cp, kp, cs, ks_, lam)
 
     for row in all_rows:
         key = _row_state_key(row)
@@ -1718,12 +1725,14 @@ def load_epoch_csv_adaptive(ap: Path, epoch_ids: Optional[set[int]] = None) -> D
     k_kcal = np.asarray([s[1] for s in state_list], dtype=np.float64)
     sec_centers = np.asarray([s[2] for s in state_list], dtype=np.float64)
     sec_ks = np.asarray([s[3] for s in state_list], dtype=np.float64)
+    state_lambdas_from_key = np.asarray([s[4] for s in state_list], dtype=np.float64)
     has_secondary = np.any(np.isfinite(sec_centers) & (sec_ks != 0.0))
 
     # Extract sample arrays
     cv_list, cv2_list, rg_list, win_list, rep_list, step_list, boost_list, pot_list = [], [], [], [], [], [], [], []
     beta_sample = []
     src_idx_list = []
+    v_pep_list, v_dih_list = [], []
     for row in all_rows:
         cv_val = row.get('cv_A', row.get('primary_cv_value', ''))
         try:
@@ -1747,6 +1756,10 @@ def load_epoch_csv_adaptive(ap: Path, epoch_ids: Optional[set[int]] = None) -> D
         try: beta_sample.append(float(row.get('beta_1_over_kJ_mol', '') or 'nan'))
         except Exception: beta_sample.append(float('nan'))
         src_idx_list.append(int(row.get('_src_idx', 0)))
+        try: v_pep_list.append(float(row.get('v_pep_kj_mol', '') or 'nan'))
+        except Exception: v_pep_list.append(float('nan'))
+        try: v_dih_list.append(float(row.get('v_dih_kj_mol', '') or 'nan'))
+        except Exception: v_dih_list.append(float('nan'))
 
     cv = np.asarray(cv_list, dtype=np.float64)
     cv2 = np.asarray(cv2_list, dtype=np.float64)
@@ -1756,6 +1769,8 @@ def load_epoch_csv_adaptive(ap: Path, epoch_ids: Optional[set[int]] = None) -> D
     step = np.asarray(step_list, dtype=int)
     boost = np.asarray(boost_list, dtype=np.float64)
     pot = np.asarray(pot_list, dtype=np.float64)
+    v_pep = np.asarray(v_pep_list, dtype=np.float64)
+    v_dih = np.asarray(v_dih_list, dtype=np.float64)
     beta_arr = np.asarray(beta_sample, dtype=np.float64)
     finite_betas = beta_arr[np.isfinite(beta_arr)]
     if finite_betas.size:
@@ -1773,6 +1788,16 @@ def load_epoch_csv_adaptive(ap: Path, epoch_ids: Optional[set[int]] = None) -> D
             total = total + 0.5 * float(sec_ks[k]) * (cv2 - float(sec_centers[k])) ** 2
         u_nk[:, k] = scale * total
 
+    # lambda-ladder: each merged state now carries its rung IN ITS KEY (see
+    # _row_state_key), so this is the exact per-state λ, not a nanmedian over
+    # a mixture. A no-op through apply_ladder_boost_to_u when no state carries
+    # gamd_lambda > 0.
+    state_lambdas = state_lambdas_from_key
+    meta['gamd_ladder_state_lambda_source'] = 'row_state_key'
+    from .ladder import apply_ladder_boost_to_u, load_pep_gamd_envelope
+    _envelope = load_pep_gamd_envelope(ap) if np.any(state_lambdas > 0.0) else None
+    u_nk = apply_ladder_boost_to_u(u_nk, v_pep, v_dih, state_lambdas, _envelope, beta, meta)
+
     meta['load_notes'] = [f'Loaded {cv.size} samples from {len(sources)} epoch CSV sources; union {K} windows.']
     meta['umbrella_window_rows'] = [
         {'center_A': str(centers[i]), 'k_kcal_mol_A2': str(k_kcal[i])} for i in range(K)
@@ -1780,7 +1805,8 @@ def load_epoch_csv_adaptive(ap: Path, epoch_ids: Optional[set[int]] = None) -> D
     meta['adaptive_epoch_run_dirs'] = [str(s) for s in sources]
     meta['_epoch_source'] = src_idx_list
     src_str = f'{sources[0]}/samples.csv ... {sources[-1]}/samples.csv'
-    return clean(Data(root, root / 'pmf_analysis', cv, cv2, rg, window, replica, step, u_nk, centers, k_kcal, beta, temp, boost, pot, src_str, meta))
+    return clean(Data(root, root / 'pmf_analysis', cv, cv2, rg, window, replica, step, u_nk, centers, k_kcal, beta, temp, boost, pot, src_str, meta,
+                       v_pep_kj=v_pep, v_dih_kj=v_dih, state_lambdas=state_lambdas))
 
 
 def load_union_npz(ap_dir: Path) -> Data:
@@ -1791,12 +1817,43 @@ def load_union_npz(ap_dir: Path) -> Data:
     with np.load(npz_path, allow_pickle=False) as f:
         cv = np.asarray(f['cv_A'], dtype=np.float64)
         cv2 = np.asarray(f['secondary_cv'], dtype=np.float64)
-        window = np.asarray(f['sampled_state_ids'], dtype=int)
+        sampled_state_ids = np.asarray(f['sampled_state_ids'], dtype=np.int64)
         u_nk = np.asarray(f['umbrella_reduced_bias_nk'], dtype=np.float64)
         centers = np.asarray(f['primary_centers'], dtype=np.float64)
         k_kcal = np.asarray(f['primary_k'], dtype=np.float64)
+        # state_ids is the u_nk COLUMN ORDER (build_union_state_mbar_inputs,
+        # adaptive_production.py:3164-3201): column i belongs to state
+        # state_ids[i]. sampled_state_ids holds raw ids, which coincide with
+        # column indices only while the registry is contiguous 0..K-1 --
+        # state retirement leaves gaps, and `window` is used directly as a
+        # u_nk column index AND as every solver's np.bincount grouping key.
+        state_ids = (np.asarray(f['state_ids'], dtype=np.int64)
+                     if 'state_ids' in f.files else np.arange(u_nk.shape[1], dtype=np.int64))
+        # λ-ladder arrays, absent on any npz written before they existed.
+        state_lambdas = (np.asarray(f['state_lambdas'], dtype=np.float64)
+                         if 'state_lambdas' in f.files else None)
+        v_pep = (np.asarray(f['v_pep_kj_mol'], dtype=np.float64)
+                 if 'v_pep_kj_mol' in f.files else None)
+        v_dih = (np.asarray(f['v_dih_kj_mol'], dtype=np.float64)
+                 if 'v_dih_kj_mol' in f.files else None)
+    _id_to_col = {int(sid): i for i, sid in enumerate(state_ids.tolist())}
+    # A sampled id with no column (impossible from the current builder, which
+    # derives both from the same registry) would silently alias column 0, so
+    # map explicitly and refuse rather than guess.
+    _missing_ids = sorted({int(s) for s in sampled_state_ids.tolist()} - set(_id_to_col))
+    if _missing_ids:
+        raise ValueError(
+            f'{npz_path.name}: sampled_state_ids reference state ids {_missing_ids} that are '
+            f'absent from state_ids, so they have no u_nk column'
+        )
+    window = np.asarray([_id_to_col[int(s)] for s in sampled_state_ids.tolist()], dtype=int)
     rg = np.full(cv.shape, np.nan, dtype=np.float64)
-    replica = window.copy()
+    # Unchanged from before the id->column remap: the per-sample "replica"
+    # label here has always been the raw state id (there is no hardware
+    # replica column in the npz), overwritten below from the companion
+    # samples.csv when one exists. Deliberately NOT switched to the column
+    # index -- the raw id is the stable cross-epoch label.
+    replica = sampled_state_ids.astype(int, copy=True)
     step = np.arange(cv.size, dtype=int)
     boost_kj = np.zeros(cv.size, dtype=np.float64)
     meta: dict = {}
@@ -1890,14 +1947,28 @@ def load_union_npz(ap_dir: Path) -> Data:
     # Populate adaptive_epoch_run_dirs so _prepare_adaptive_merged_traj_dir can find trajectories.
     if run_dirs:
         meta['adaptive_epoch_run_dirs'] = [str(d) for d in run_dirs]
-    return clean(Data(root, root / 'pmf_analysis', cv, cv2, rg, window, replica, step, u_nk, centers, k_kcal, beta, temp, boost_kj, None, str(npz_path), meta))
+    # u_nk here is umbrella_reduced_bias_nk, which build_union_state_mbar_inputs
+    # produced by running apply_ladder_boost_to_u BEFORE reducing by beta -- the
+    # ladder term is already in it. This loader therefore only PASSES THROUGH
+    # state_lambdas/v_pep/v_dih (applying the boost again would double-count it),
+    # and reports the flag the cross-check's contradiction guard reads.
+    if state_lambdas is not None and state_lambdas.size == u_nk.shape[1]:
+        meta['gamd_ladder'] = bool(np.any(state_lambdas > 0.0))
+        if meta['gamd_ladder'] and v_pep is not None and v_dih is not None:
+            meta['gamd_ladder_samples_without_raw_energies'] = int(
+                np.count_nonzero(~np.isfinite(v_pep) | ~np.isfinite(v_dih)))
+    else:
+        state_lambdas = None
+    return clean(Data(root, root / 'pmf_analysis', cv, cv2, rg, window, replica, step, u_nk, centers, k_kcal, beta, temp, boost_kj, None, str(npz_path), meta,
+                      v_pep_kj=v_pep, v_dih_kj=v_dih, state_lambdas=state_lambdas))
 
 
 def _load_round_raw(round_dir: Path) -> Optional[dict]:
     """Load per-sample arrays from all NPZ chunks in a round dir."""
     chunks_dir = round_dir / 'analysis_chunks'
     bufs: dict = {k: [] for k in ('cv_A', 'secondary_cv', 'step', 'replica', 'window',
-                                   'gamd_boost_total_kj_mol', 'potential_kj_mol')}
+                                   'gamd_boost_total_kj_mol', 'potential_kj_mol',
+                                   'v_pep_kj_mol', 'v_dih_kj_mol', 'gamd_lambda')}
     for chunk_path in sorted(chunks_dir.glob('chunk_*.npz')):
         try:
             with np.load(chunk_path, allow_pickle=False) as f:
@@ -1921,11 +1992,38 @@ def _load_round_raw(round_dir: Path) -> Optional[dict]:
                 else:
                     bufs['gamd_boost_total_kj_mol'].append(np.full(n, np.nan))
                 bufs['potential_kj_mol'].append(np.asarray(f['potential_kj_mol'], float) if 'potential_kj_mol' in f.files else np.full(n, np.nan))
+                # λ-ladder columns (production.py's ChunkWriter has written all
+                # three since the ladder landed). Absent on older chunks: NaN
+                # raw energies propagate as "this sample cannot be reweighted"
+                # through apply_ladder_boost_to_u, and λ defaults to 0.0, the
+                # documented "ladder inactive" value.
+                bufs['v_pep_kj_mol'].append(np.asarray(f['v_pep_kj_mol'], float) if 'v_pep_kj_mol' in f.files else np.full(n, np.nan))
+                bufs['v_dih_kj_mol'].append(np.asarray(f['v_dih_kj_mol'], float) if 'v_dih_kj_mol' in f.files else np.full(n, np.nan))
+                bufs['gamd_lambda'].append(np.asarray(f['gamd_lambda'], float) if 'gamd_lambda' in f.files else np.zeros(n))
         except Exception:
             pass
     if not bufs['cv_A']:
         return None
     return {k: np.concatenate(v) for k, v in bufs.items()}
+
+
+def _win_float(row: dict, keys: tuple, default: float = 0.0) -> float:
+    """First parseable float among ``keys`` in a umbrella_windows.csv row.
+
+    window_assignment_rows writes an EMPTY STRING (not 0) for every secondary
+    column on a 1D run, and float('') raises -- which used to make the whole
+    multi-round augmentation path unreachable for exactly the 1D runs the
+    λ-ladder is used on.
+    """
+    for k in keys:
+        v = row.get(k)
+        if v is None or v == '':
+            continue
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            continue
+    return float(default)
 
 
 def _build_union_window_table(all_dirs: list, tol: float = 5e-4) -> list:
@@ -1941,15 +2039,23 @@ def _build_union_window_table(all_dirs: list, tol: float = 5e-4) -> list:
             continue
         _, _, rows = read_windows(wcsv)
         for row in rows:
-            pc = float(row.get('primary_center', row.get('center_A', 0)))
-            sc = float(row.get('secondary_cv_center', 0))
-            pk = float(row.get('primary_k', row.get('k_kcal_mol_A2', 0)))
-            sk = float(row.get('secondary_cv_k_kcal_mol', 0))
-            key = (round(pc / tol), round(sc / tol))
+            pc = _win_float(row, ('primary_center', 'center_A'), 0.0)
+            sc = _win_float(row, ('secondary_cv_center',), 0.0)
+            pk = _win_float(row, ('primary_k', 'k_kcal_mol_A2'), 0.0)
+            sk = _win_float(row, ('secondary_cv_k_kcal_mol',), 0.0)
+            # λ is part of a thermodynamic state's IDENTITY, not a property of
+            # its umbrella restraint: two rungs of one window share centre and
+            # k and differ only in gamd_lambda. Keying without it merged them
+            # into a single union state, erasing the ladder from the state
+            # definition itself (2026-09-07 final review, C3).
+            lam = _win_float(row, ('gamd_lambda',), 0.0)
+            key = (round(pc / tol), round(sc / tol), round(lam, 8))
             if key not in seen:
                 seen[key] = {'primary_center': pc, 'secondary_cv_center': sc,
-                             'primary_k_kcal': pk, 'secondary_k_kcal': sk}
-    return sorted(seen.values(), key=lambda w: (w['primary_center'], w['secondary_cv_center']))
+                             'primary_k_kcal': pk, 'secondary_k_kcal': sk,
+                             'gamd_lambda': lam}
+    return sorted(seen.values(),
+                  key=lambda w: (w['primary_center'], w['secondary_cv_center'], w['gamd_lambda']))
 
 
 def _round_window_to_union_map(round_dir: Path, union_windows: list, tol: float = 5e-4) -> dict:
@@ -1958,10 +2064,13 @@ def _round_window_to_union_map(round_dir: Path, union_windows: list, tol: float 
     mapping: dict = {}
     for row in rows:
         w_local = int(float(row.get('window', 0)))
-        pc = float(row.get('primary_center', row.get('center_A', 0)))
-        sc = float(row.get('secondary_cv_center', 0))
+        pc = _win_float(row, ('primary_center', 'center_A'), 0.0)
+        sc = _win_float(row, ('secondary_cv_center',), 0.0)
+        lam = _win_float(row, ('gamd_lambda',), 0.0)
         for k_union, uw in enumerate(union_windows):
-            if abs(uw['primary_center'] - pc) < tol and abs(uw['secondary_cv_center'] - sc) < tol:
+            if (abs(uw['primary_center'] - pc) < tol
+                    and abs(uw['secondary_cv_center'] - sc) < tol
+                    and abs(float(uw.get('gamd_lambda', 0.0)) - lam) <= 1e-9):
                 mapping[w_local] = k_union
                 break
     return mapping
@@ -1971,7 +2080,12 @@ def _augment_with_adaptive_rounds(d: Data, run_dir: Path) -> Data:
     """Combine final_production Data with samples from adaptive_feedback_round_* dirs.
 
     Builds the union window set across all rounds, recomputes u_nk analytically
-    for every sample, and returns a new Data with all samples concatenated.
+    for every sample, re-applies the λ-ladder boost (the analytic rebuild is
+    pure umbrella), and returns a new Data with all samples concatenated.
+
+    A union state's identity is (primary_center, secondary_cv_center,
+    gamd_lambda): two rungs of one window differ only in λ, so λ must be part
+    of the dedup key or the ladder is erased from the state set itself.
     """
     round_dirs = _find_gareus_round_dirs(run_dir)
     if not round_dirs:
@@ -2019,10 +2133,38 @@ def _augment_with_adaptive_rounds(d: Data, run_dir: Path) -> Data:
     pot_parts += [r['potential_kj_mol'] for r in round_data]
     pot_all = np.concatenate(pot_parts)
 
+    # _compute_u_nk_analytical rebuilds a PURE-UMBRELLA matrix (its window
+    # dicts only ever carry center1/k1/center2/k2), so under an active ladder
+    # the boost is discarded from every column. Re-add it here, through the
+    # one shared helper -- 2026-09-07 final review, C3.
     u_all = _compute_u_nk_analytical(cv1_all, cv2_all, union_windows, d.beta)
 
     centers_union = np.array([w['primary_center'] for w in union_windows], float)
     ks_union = np.array([w['primary_k_kcal'] for w in union_windows], float)
+    state_lambdas_union = np.array([float(w.get('gamd_lambda', 0.0) or 0.0) for w in union_windows], float)
+
+    def _energies(arr, n):
+        return np.asarray(arr, dtype=np.float64) if arr is not None and np.size(arr) == n else np.full(n, np.nan)
+
+    v_pep_all = np.concatenate(
+        [_energies(getattr(d, 'v_pep_kj', None), d.cv.size)] + [r['v_pep_kj_mol'] for r in round_data])
+    v_dih_all = np.concatenate(
+        [_energies(getattr(d, 'v_dih_kj', None), d.cv.size)] + [r['v_dih_kj_mol'] for r in round_data])
+
+    # Consistency check on the per-round window->union mapping, using the λ the
+    # chunks recorded PER SAMPLE against the λ of the union state that sample
+    # was mapped onto. A mismatch means a round's samples landed on the wrong
+    # rung -- silently the worst possible outcome, since the resulting u_nk is
+    # well-formed and simply wrong.
+    _lam_mismatch = 0
+    for r in round_data:
+        _assigned = state_lambdas_union[r['window_union']]
+        _own = np.asarray(r['gamd_lambda'], dtype=np.float64)
+        _lam_mismatch += int(np.count_nonzero(np.isfinite(_own) & (np.abs(_own - _assigned) > 1e-9)))
+    if _lam_mismatch:
+        print(f'WARNING: {_lam_mismatch} adaptive-round sample(s) carry a gamd_lambda that '
+              f'differs from the union state they were mapped onto; the round->union window '
+              f'map and the sampled rungs disagree.')
 
     n_round_samples = sum(r['cv_A'].size for r in round_data)
     meta = dict(d.meta)
@@ -2039,6 +2181,16 @@ def _augment_with_adaptive_rounds(d: Data, run_dir: Path) -> Data:
         for w in union_windows
     ]
     meta['adaptive_round_dirs'] = [str(r) for r in round_dirs]
+    if _lam_mismatch:
+        meta['gamd_ladder_round_lambda_mismatches'] = int(_lam_mismatch)
+
+    from .ladder import apply_ladder_boost_to_u, load_pep_gamd_envelope
+    _envelope = load_pep_gamd_envelope(run_dir) if np.any(state_lambdas_union > 0.0) else None
+    # Fail loud rather than quietly returning an umbrella-only PMF: the helper
+    # raises (naming v_pep) when a rung is active but no sample has finite raw
+    # channel energies, or when no frozen envelope could be found.
+    u_all = apply_ladder_boost_to_u(
+        u_all, v_pep_all, v_dih_all, state_lambdas_union, _envelope, d.beta, meta)
 
     return clean(Data(
         d.prod_dir, d.out_dir,
@@ -2047,4 +2199,6 @@ def _augment_with_adaptive_rounds(d: Data, run_dir: Path) -> Data:
         d.beta, d.temp, boost_all, pot_all,
         d.source + f'+{len(round_dirs)}rounds',
         meta,
+        v_pep_kj=v_pep_all, v_dih_kj=v_dih_all,
+        state_lambdas=state_lambdas_union,
     ))

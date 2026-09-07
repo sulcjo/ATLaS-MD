@@ -327,3 +327,103 @@ def build_pep_gamd_integrator(system, args, unit) -> list:
         temperature=float(args.temperature_k) * unit.kelvin,
     )
     return [AUX_NONBONDED_GROUP, DIHEDRAL_GROUP, integrator]
+
+
+from dataclasses import dataclass
+import json as _json
+import numpy as _np
+
+
+@dataclass(frozen=True)
+class PepGamdEnvelope:
+    """Frozen per-channel GaMD envelope; k0max_* is the top rung (λ = 1)."""
+    vmax_total: float; vmin_total: float; threshold_total: float; k0max_total: float
+    vmax_dih: float;   vmin_dih: float;   threshold_dih: float;   k0max_dih: float
+
+    @classmethod
+    def from_integrator_globals(cls, g: dict) -> "PepGamdEnvelope":
+        f = lambda k: float(g[k])
+        return cls(f("Vmax_Total"), f("Vmin_Total"), f("threshold_energy_Total"), f("k0_Total"),
+                   f("Vmax_Dihedral"), f("Vmin_Dihedral"), f("threshold_energy_Dihedral"), f("k0_Dihedral"))
+
+    @classmethod
+    def from_json(cls, path) -> "PepGamdEnvelope":
+        """Load from ``shared_gamd_setup_globals.json``.
+
+        Every writer in ``production.py`` (the joint-envelope calibration path,
+        the disabled/plain-MD path, and the worker-reuse path) nests the real
+        CustomIntegrator globals under the top-level key ``"all_globals"``
+        (with ``"interesting_globals"`` as a smaller, non-authoritative
+        subset written alongside it) -- never under ``"globals"``,
+        ``"integrator_globals"``, or ``"shared_gamd_globals_all"``. Probe the
+        real key first; the others are kept harmlessly in case some other
+        caller ever nests it differently.
+        """
+        doc = _json.loads(open(path).read())
+        for cand in (doc, doc.get("all_globals"), doc.get("interesting_globals"),
+                     doc.get("globals"), doc.get("integrator_globals"), doc.get("shared_gamd_globals_all")):
+            if isinstance(cand, dict) and "k0_Total" in cand:
+                return cls.from_integrator_globals(cand)
+        raise KeyError(f"{path}: no dict with k0_Total/Vmax_Total/... found")
+
+
+def _channel_boost(v, e, vmax, vmin, k0):
+    v = _np.asarray(v, dtype=float)
+    rng = vmax - vmin
+    scale = _np.maximum(_np.maximum(abs(e), _np.abs(v)), 1.0)
+    b = 0.5 * k0 * (e - v) ** 2 / rng
+    b = _np.where(_np.abs(rng) <= 0.001 * scale, 0.0, b)
+    return _np.where((b + v) < e, b, 0.0)
+
+
+def pep_gamd_boost_kj(v_pep_kj, v_dih_kj, lam, env: PepGamdEnvelope):
+    """gamd-openmm's dependent dual boost under rung λ: dihedral first, then Total with the
+    dihedral boost added to the Total energy before the square (stage_integrator
+    _add_dihedral_boost_to_total_energy)."""
+    lam = float(lam)
+    b_dih = _channel_boost(v_dih_kj, env.threshold_dih, env.vmax_dih, env.vmin_dih, lam * env.k0max_dih)
+    b_tot = _channel_boost(_np.asarray(v_pep_kj, dtype=float) + b_dih, env.threshold_total, env.vmax_total, env.vmin_total, lam * env.k0max_total)
+    out = b_dih + b_tot
+    return float(out) if out.ndim == 0 else out
+
+
+def pep_gamd_boost_matrix_kj(v_pep_kj, v_dih_kj, lambdas, env: PepGamdEnvelope) -> _np.ndarray:
+    """(n_states, n_samples): boost of each sample's configuration under each state's λ."""
+    v_pep = _np.asarray(v_pep_kj, dtype=float); v_dih = _np.asarray(v_dih_kj, dtype=float)
+    return _np.vstack([_np.asarray(pep_gamd_boost_kj(v_pep, v_dih, float(l), env), dtype=float) for l in lambdas])
+
+
+def k0max_from_globals(shared_globals: dict) -> dict:
+    return {"Total": float(shared_globals["k0_Total"]), "Dihedral": float(shared_globals["k0_Dihedral"])}
+
+
+def set_replica_lambda(integrator, lam: float, k0max: dict) -> None:
+    """Put a replica on rung λ: k0_c = λ·k0max_c for both channels. Nothing else differs between rungs."""
+    lam = float(lam)
+    if not (0.0 <= lam <= 1.0):
+        raise ValueError(f"gamd_lambda={lam} must lie in [0, 1]")
+    integrator.setGlobalVariableByName("k0_Total", lam * float(k0max["Total"]))
+    integrator.setGlobalVariableByName("k0_Dihedral", lam * float(k0max["Dihedral"]))
+
+
+def set_replica_lambda_for_window(integrator, window_index, state_lambdas, k0max_by_channel) -> None:
+    """Apply the rung λ for `window_index` to `integrator`, or no-op if the ladder is inactive.
+
+    k0max_by_channel is None on every run that does not have the λ-ladder active
+    (plain GaMD, conventional MD, or GaMD without a ladder -- the common case);
+    on those runs state_lambdas is still an unconditionally-populated array, and
+    this must be a silent no-op, not an error. Only when the ladder IS active
+    (k0max_by_channel is not None) is a per-window λ required; state_lambdas is
+    None in that combination only as a real misconfiguration, so that's the one
+    case this raises on. One helper, one invariant, used at every call site that
+    (re)applies a replica's window assignment so the guard can't be forgotten or
+    mismatched at any individual site.
+    """
+    if k0max_by_channel is None:
+        return
+    if state_lambdas is None:
+        raise ValueError(
+            "set_replica_lambda_for_window: the λ-ladder is active (k0max_by_channel is set) "
+            "but state_lambdas is None -- no per-window λ was supplied."
+        )
+    set_replica_lambda(integrator, float(state_lambdas[int(window_index)]), k0max_by_channel)

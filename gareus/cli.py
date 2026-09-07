@@ -811,9 +811,10 @@ def _validate_contact_args(args: argparse.Namespace) -> None:
         not bool(getattr(args, "resume", False))
         and not bool(getattr(args, "self_test_primary_cv_force", False))
         and str(getattr(args, "window_mode", "manual")) == "manual"
+        and not getattr(args, "windows_2d_csv", None)
         and (getattr(args, "contact_centers", None) is None or len(args.contact_centers) == 0)
     ):
-        raise ValueError("contacts + --window-mode manual requires --contact-centers")
+        raise ValueError("contacts + --window-mode manual requires --contact-centers or --windows-2d-csv")
 
 
 # The upstream `gamd` package's integrator_factory.get_integrator only forwards

@@ -30,6 +30,28 @@ from .store import SegmentRegistry
 from .units import KJ_PER_KCAL
 
 
+def _missing_column_placeholder(reference, length: int):
+    """Build a fully-masked stand-in for a column absent from one segment.
+
+    A production campaign can span a schema change (e.g. a new sample column
+    added mid-campaign, such as v_pep_kj_mol/gamd_lambda) -- an older segment's
+    Parquet files simply lack the column, so it is absent from that segment's
+    dict entirely (not merely null-valued). Masked here rather than fabricating
+    a real-looking value (0, "", etc.), mirroring how DuckDB itself represents
+    a real SQL NULL and how downstream consumers already expect to unmask it
+    (see gareus/mbar_analysis/data.py's _fill_masked_nan).
+    """
+    ref = np.ma.asarray(reference)
+    dtype = ref.dtype
+    if np.issubdtype(dtype, np.floating):
+        data = np.full(length, np.nan, dtype=dtype)
+    elif np.issubdtype(dtype, np.integer) or np.issubdtype(dtype, np.bool_):
+        data = np.zeros(length, dtype=dtype)
+    else:
+        data = np.full(length, None, dtype=object)
+    return np.ma.array(data, mask=np.ones(length, dtype=bool))
+
+
 def _concat_numpy_dicts(results: list) -> dict:
     """Concatenate a list of numpy column-dicts into one, sorted by (step, replica).
 
@@ -46,14 +68,52 @@ def _concat_numpy_dicts(results: list) -> dict:
     actually returned as masked; plain columns keep the cheaper np.concatenate
     (avoids allocating a mask array for step/window_id/replica/segment_id on
     the multi-million-row hot path).
+
+    The key set is the UNION of keys across all segments, not just the first
+    segment's keys: a campaign resumed across a schema change (a new sample
+    column, e.g. the lambda-ladder's v_pep_kj_mol/v_dih_kj_mol/gamd_lambda)
+    mixes older segments that lack the column with newer ones that have it.
+    Taking only results[0]'s keys either silently dropped the new column
+    (older-segment-first, the typical oldest-first order out of segments.json)
+    or crashed with a bare KeyError (newer-segment-first) -- neither is
+    acceptable. A segment missing a key present elsewhere gets a fully-masked
+    placeholder of its own length instead, so the column is present end-to-end
+    and every row from the segment that lacks it reads as NaN/null, never a
+    fabricated real value.
     """
     non_empty = [r for r in results if r and "step" in r and len(r["step"]) > 0]
     if not non_empty:
         return {}
-    keys = list(non_empty[0].keys())
+
+    # Every column actually present in a segment must share that segment's
+    # sample count (the 'step' column's length) -- a mismatch means a real
+    # write/read bug produced ragged columns within one segment, which must
+    # fail loudly rather than propagate into a corrupted concatenation.
+    for r in non_empty:
+        seg_len = len(r["step"])
+        for k, v in r.items():
+            if len(v) != seg_len:
+                raise ValueError(
+                    f"segment column {k!r} has length {len(v)}, expected {seg_len} "
+                    "(inferred from 'step'); ragged columns within one segment"
+                )
+
+    keys: list = []
+    seen: set = set()
+    first_col_for_key: dict = {}
+    for r in non_empty:
+        for k, v in r.items():
+            if k not in seen:
+                seen.add(k)
+                keys.append(k)
+                first_col_for_key[k] = v
+
     combined = {}
     for k in keys:
-        cols = [r[k] for r in non_empty]
+        cols = [
+            r[k] if k in r else _missing_column_placeholder(first_col_for_key[k], len(r["step"]))
+            for r in non_empty
+        ]
         if any(np.ma.isMaskedArray(c) for c in cols):
             combined[k] = np.ma.concatenate(cols)
         else:
@@ -255,6 +315,11 @@ def reconstruct_bias_matrix(
     cv2: Optional[np.ndarray],
     windows: list,
     beta: float,
+    *,
+    v_pep: Optional[np.ndarray] = None,
+    v_dih: Optional[np.ndarray] = None,
+    envelope=None,
+    meta: Optional[dict] = None,
 ) -> np.ndarray:
     """Reconstruct umbrella_reduced_bias_nk analytically.
 
@@ -271,16 +336,38 @@ def reconstruct_bias_matrix(
     not a bug: fabricating a zero deviation would silently claim the sample
     was on-target for a coordinate that was never actually measured.
 
+    ``meta``, when given, receives the shared ladder helper's own bookkeeping
+    (``gamd_ladder``, ``gamd_ladder_samples_without_raw_energies``) so a caller
+    reconstructing through this function does not have to add the term itself
+    a second time just to get those keys populated.
+
+    A window carrying a "gamd_lambda" key with value > 0 is a lambda-ladder
+    rung: its reduced bias additionally includes
+    ``beta * pep_gamd_boost_kj(v_pep, v_dih, gamd_lambda, envelope)``, the
+    closed-form Pep-GaMD boost of each sample's own raw channel energies
+    evaluated under that rung's lambda. This requires ``v_pep``, ``v_dih``,
+    and ``envelope`` -- a ladder rung cannot be reweighted without the raw
+    energies it was measured with, so any window with gamd_lambda > 0 while
+    one of the three is missing raises ValueError rather than silently
+    falling back to the umbrella-only bias for that state.
+
     Parameters
     ----------
     cv_A : (N,) array of primary CV values
     cv2  : (N,) array of secondary CV values, or None for 1D runs
-    windows : list of window dicts with center1, k1 (and optionally center2, k2)
+    windows : list of window dicts with center1, k1 (and optionally center2,
+        k2, gamd_lambda)
     beta : 1/(kB*T) in mol/kJ (e.g. 1 / (8.314462618e-3 * T_K))
+    v_pep : (N,) array of raw peptide-channel energies, kJ/mol -- required
+        when any window carries gamd_lambda > 0
+    v_dih : (N,) array of raw dihedral-channel energies, kJ/mol -- required
+        when any window carries gamd_lambda > 0
+    envelope : frozen PepGamdEnvelope -- required when any window carries
+        gamd_lambda > 0
 
     Returns
     -------
-    nk : (N, K) float64 array of dimensionless reduced umbrella biases
+    nk : (N, K) float64 array of dimensionless reduced umbrella+ladder biases
     """
     cv_A = np.asarray(cv_A, dtype=np.float64)
     N = len(cv_A)
@@ -298,7 +385,29 @@ def reconstruct_bias_matrix(
                 d2 = cv2_arr - c2
                 nk[:, k] += KJ_PER_KCAL * 0.5 * k2 * d2 * d2
 
-    return beta * nk
+    u = beta * nk
+
+    # The ladder term is added by gareus.mbar_analysis.ladder.apply_ladder_boost_to_u
+    # -- the ONE place it is ever added (2026-09-07 review, R4) -- so its
+    # missing-energy guard and NaN-propagation (a sample with a non-finite
+    # v_pep/v_dih gets NaN, not a silently fabricated 0.0 boost, in every
+    # gamd_lambda > 0 column) apply here too. The explicit "not supplied at
+    # all" check below stays: the helper itself expects real arrays (an
+    # np.asarray(None, dtype=float64) would raise the wrong exception type),
+    # so this is the one guard that must run before calling it.
+    lambdas = np.asarray([float(w.get("gamd_lambda", 0.0) or 0.0) for w in windows], dtype=float)
+    if np.any(lambdas > 0.0) and (v_pep is None or v_dih is None or envelope is None):
+        raise ValueError(
+            "windows carry gamd_lambda > 0 but v_pep/v_dih/envelope were not supplied; "
+            "the ladder cannot be reweighted without the raw channel energies"
+        )
+    # Called unconditionally so `meta` gets the uniform contract every other
+    # caller of the helper already has (gamd_ladder True/False plus the
+    # missing-raw-energy count). With no active rung it returns `u` untouched
+    # without ever looking at v_pep/v_dih, so a None is harmless there.
+    from .mbar_analysis.ladder import apply_ladder_boost_to_u
+    return apply_ladder_boost_to_u(u, v_pep, v_dih, lambdas, envelope, beta,
+                                   meta if meta is not None else {})
 
 
 def export_analysis_arrays_npz(
@@ -332,6 +441,41 @@ def export_analysis_arrays_npz(
     else:
         cv2 = None
 
+    # λ-ladder plumbing: window snapshots carry gamd_lambda since
+    # production.snapshot_window_rows, and reconstruct_bias_matrix REFUSES a
+    # λ>0 window without the raw channel energies + envelope. Supply them from
+    # the samples themselves (both columns are written for every parquet
+    # sample) so the legacy npz carries the same total bias MBAR uses rather
+    # than an umbrella-only matrix -- or a ValueError.
+    def _energy_col(name):
+        raw = samples.get(name)
+        if raw is None:
+            return None
+        arr = np.ma.filled(np.ma.asarray(raw).astype(np.float64), np.nan)
+        return np.asarray(arr, dtype=np.float64)
+
+    v_pep_all = _energy_col("v_pep_kj_mol")
+    v_dih_all = _energy_col("v_dih_kj_mol")
+
+    # Resolve the envelope ONLY when the snapshot actually carries a rung,
+    # mirroring every other call site. A GaMD-DISABLED run still writes
+    # shared_gamd_setup_globals.json, with "all_globals": {} (production.py's
+    # disabled-run writer), and PepGamdEnvelope.from_json raises KeyError when
+    # no nested dict holds k0_Total -- so resolving unconditionally broke every
+    # plain non-GaMD parquet run. Deliberately NOT a bare try/except: on a real
+    # ladder run a missing/degenerate envelope must still surface, and
+    # gareus/analysis.py wraps this whole call in `except Exception: pass`, so
+    # anything swallowed here degrades silently to "analysis_arrays.npz absent".
+    _envelope_cache: list = []
+
+    def _envelope_for(windows):
+        if not any(float(w.get("gamd_lambda", 0.0) or 0.0) > 0.0 for w in windows):
+            return None
+        if not _envelope_cache:
+            from .mbar_analysis.ladder import load_pep_gamd_envelope
+            _envelope_cache.append(load_pep_gamd_envelope(run_dir))
+        return _envelope_cache[0]
+
     seg_raw = samples.get("segment_id")
     if seg_raw is not None:
         seg_ids = np.asarray(seg_raw).astype(str)
@@ -351,13 +495,19 @@ def export_analysis_arrays_npz(
                     "use segment-specific or union-state analysis."
                 )
             mask = seg_ids == str(seg_id)
-            nk[mask, :] = reconstruct_bias_matrix(cv_A[mask], cv2[mask] if cv2 is not None else None, seg_windows, beta)
+            nk[mask, :] = reconstruct_bias_matrix(
+                cv_A[mask], cv2[mask] if cv2 is not None else None, seg_windows, beta,
+                v_pep=v_pep_all[mask] if v_pep_all is not None else None,
+                v_dih=v_dih_all[mask] if v_dih_all is not None else None,
+                envelope=_envelope_for(seg_windows))
         windows = first_windows
     else:
         windows = load_windows(run_dir)
         if not windows:
             raise ValueError(f"No window snapshot found in {run_dir}/windows/")
-        nk = reconstruct_bias_matrix(cv_A, cv2, windows, beta)
+        nk = reconstruct_bias_matrix(cv_A, cv2, windows, beta,
+                                     v_pep=v_pep_all, v_dih=v_dih_all,
+                                     envelope=_envelope_for(windows))
 
     save_kwargs: dict = {
         "cv_A": cv_A,

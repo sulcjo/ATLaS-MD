@@ -151,6 +151,7 @@ class WindowState:
     secondary_k: Optional[float] = None
     gamd_sigma0p: Optional[float] = None
     gamd_sigma0d: Optional[float] = None
+    gamd_lambda: float = 0.0
     active: bool = True
     created_epoch: int = 0
     retired_epoch: Optional[int] = None
@@ -183,6 +184,8 @@ class WindowState:
                 data[key] = None
             else:
                 data[key] = float(val)
+        lam = data.get("gamd_lambda")
+        data["gamd_lambda"] = 0.0 if lam in ("", "None", None) else float(lam)
         for key in ("created_epoch", "burnin_steps"):
             data[key] = int(data.get(key, 0) or 0)
         if data.get("retired_epoch") in ("", "None", None):
@@ -413,6 +416,7 @@ class WindowStateRegistry:
         secondary_k: Optional[float] = None,
         gamd_sigma0p: Optional[float] = None,
         gamd_sigma0d: Optional[float] = None,
+        gamd_lambda: float = 0.0,
         parent_state_id: Optional[int] = None,
         epoch: int = 0,
         source: str = "adaptive",
@@ -431,6 +435,7 @@ class WindowStateRegistry:
             secondary_k=None if secondary_k is None else float(secondary_k),
             gamd_sigma0p=None if gamd_sigma0p is None else float(gamd_sigma0p),
             gamd_sigma0d=None if gamd_sigma0d is None else float(gamd_sigma0d),
+            gamd_lambda=0.0 if gamd_lambda is None else float(gamd_lambda),
             active=True,
             created_epoch=int(epoch),
             parent_state_id=parent_state_id,
@@ -540,7 +545,7 @@ class WindowStateRegistry:
         fieldnames = [
             "state_id", "active", "created_epoch", "retired_epoch", "parent_state_id",
             "primary_center", "primary_k", "secondary_center", "secondary_k",
-            "gamd_sigma0p", "gamd_sigma0d", "source", "reason", "usable_for_mbar", "burnin_steps",
+            "gamd_sigma0p", "gamd_sigma0d", "gamd_lambda", "source", "reason", "usable_for_mbar", "burnin_steps",
         ]
         with path.open("w", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
@@ -597,6 +602,7 @@ class WindowStateRegistry:
             "distance_center_A", "distance_k_kcal_mol_A2", "secondary_cv_center",
             "secondary_cv_k_kcal_mol", "window_type", "patch_lifecycle", "parent_state_id",
             "created_epoch", "source", "reason", "usable_for_mbar", "burnin_steps",
+            "gamd_lambda",
         ]
         rows = []
         for i, state in enumerate(active):
@@ -617,6 +623,7 @@ class WindowStateRegistry:
                 "reason": str(state.reason),
                 "usable_for_mbar": int(bool(state.usable_for_mbar)),
                 "burnin_steps": int(state.burnin_steps),
+                "gamd_lambda": float(state.gamd_lambda),
             }
             if has_secondary and state.secondary_center is None:
                 raise RuntimeError("active registry mixes 1D and 2D states; cannot write one explicit 2D table")
@@ -689,12 +696,14 @@ def registry_from_window_csv(path: Path, epoch: int = 0, source: str = "window_c
             k = 0.0
         secondary = _float_or_none(_csv_first(row, ["secondary_cv_center", "secondary_center", "ss0"]))
         secondary_k = _float_or_none(_csv_first(row, ["secondary_cv_k_kcal_mol", "secondary_k", "ss_k"]))
+        gamd_lambda = _float_or_none(_csv_first(row, ["gamd_lambda"])) or 0.0
         state_id_raw = _csv_first(row, ["state_id"], None)
         state = reg.add_state(
             primary_center=primary,
             primary_k=k,
             secondary_center=secondary,
             secondary_k=secondary_k,
+            gamd_lambda=gamd_lambda,
             epoch=epoch,
             source=source,
             reason=f"seeded from {path.name}",
@@ -1450,6 +1459,9 @@ def _read_sample_dicts(run_dir: Path) -> List[Dict[str, Any]]:
                     "gamd_boost_total_kcal_mol": (float(boost_kj) / 4.184) if boost_kj != "" else "",
                     "beta_1_over_kJ_mol": "" if beta is None else float(beta),
                     "segment_id": _value_at(data, "segment_id", i, ""),
+                    "v_pep_kj_mol": _blank_if_nonfinite(_value_at(data, "v_pep_kj_mol", i, "")),
+                    "v_dih_kj_mol": _blank_if_nonfinite(_value_at(data, "v_dih_kj_mol", i, "")),
+                    "gamd_lambda": _blank_if_nonfinite(_value_at(data, "gamd_lambda", i, "")),
                 }
                 rows.append(row)
             return rows
@@ -2817,6 +2829,47 @@ def _maybe_update_tica_cvaux(epoch: int, epoch_dir: Path, adaptive_dir: Path, ar
     }
 
 
+def _active_gamd_lambda_ladder(args, epoch_dir) -> Optional[str]:
+    """Return a short description of the active λ-ladder, or None.
+
+    Two independent sources, because neither alone is complete: ``args`` holds
+    the ladder on a plain production run, while an adaptive campaign's real λ
+    per state lives in ``state_registry.csv`` (``StateRegistry.write_state_csv``)
+    next to the epoch dirs.
+    """
+    lams = getattr(args, "state_gamd_lambdas", None)
+    if lams is not None:
+        try:
+            vals = [float(x or 0.0) for x in lams]
+        except (TypeError, ValueError):
+            vals = []
+        if any(v > 0.0 for v in vals):
+            return f"args.state_gamd_lambdas has {sum(1 for v in vals if v > 0.0)} rung(s) with λ > 0"
+
+    seen: set = set()
+    for base in (Path(epoch_dir), *Path(epoch_dir).parents):
+        if base in seen:
+            continue
+        seen.add(base)
+        for name in ("state_registry.csv", "final_registry_used_for_mbar.csv"):
+            path = base / name
+            if not path.exists():
+                continue
+            try:
+                with path.open(newline="") as handle:
+                    for row in csv.DictReader(handle):
+                        raw = row.get("gamd_lambda")
+                        if raw in (None, "", "None"):
+                            continue
+                        if float(raw) > 0.0:
+                            return f"{path.name} carries a state with λ = {float(raw)}"
+            except Exception:
+                continue
+        if base.name == "adaptive_production":
+            break
+    return None
+
+
 def _maybe_recalibrate_gamd_boost(
     epoch: int,
     epoch_dir: Path,
@@ -2839,10 +2892,21 @@ def _maybe_recalibrate_gamd_boost(
     Fires at most once (only ``epoch == 0``), is a no-op if GaMD/shared-envelope
     is disabled, and degrades to a no-op (not an error) if no stats files were
     written (e.g. epoch 0 was itself resumed from a checkpoint that predates
-    this feature). Reweighting validity does not depend on which envelope was
-    active for a given frame (per-frame delta-V is recorded), so recalibrating
-    is efficiency/variance-only -- exactly like the existing shared-envelope
-    reuse policy, just recalibrated from real data instead of frozen forever.
+    this feature).
+
+    HARD NO-OP UNDER A λ-LADDER (``{"status": "skipped_lambda_ladder"}``).
+    Without a ladder, recalibrating is efficiency/variance-only: each frame's
+    own delta-V is recorded, so which envelope produced it does not change what
+    that frame reweights to. That reasoning DOES NOT survive the ladder. MBAR's
+    ladder term is recomputed post-hoc from raw channel energies under ONE
+    envelope (``mbar_analysis.ladder.load_pep_gamd_envelope`` resolves exactly
+    one ``shared_gamd_setup_globals.json`` per campaign), so overwriting it
+    after epoch 0 makes every epoch-0 sample get reweighted with epoch 1's
+    envelope. Worse, λ is defined as a fraction of ``k0max``: change k0max and
+    the same λ no longer denotes the same thermodynamic state across epochs,
+    which is the state identity every rung's ``u_nk`` column rests on. Spec
+    §3.6 and the Global Constraint "Envelope is frozen ... never recalibrate
+    mid-campaign" say the same thing. 2026-09-07 final review, C4.
     """
     if int(epoch) != 0:
         return {}
@@ -2852,6 +2916,16 @@ def _maybe_recalibrate_gamd_boost(
         return {}
     if "gamd" not in str(getattr(args, "run_mode", "") or "").lower():
         return {}
+
+    # Before the stats scan on purpose: a ladder run that happened to write no
+    # stats would otherwise report "skipped_no_stats" and hide the real reason.
+    _ladder = _active_gamd_lambda_ladder(args, epoch_dir)
+    if _ladder:
+        return {"status": "skipped_lambda_ladder", "epoch": int(epoch),
+                "reason": ("a λ-ladder is active (%s); the campaign-shared GaMD envelope is "
+                           "frozen for the whole campaign because MBAR reweights every epoch's "
+                           "samples under ONE envelope and λ is defined relative to k0max"
+                           % _ladder)}
 
     stat_files = sorted(Path(epoch_dir).rglob("gamd_production_envelope_stats.json"))
     if not stat_files:
@@ -3037,6 +3111,8 @@ def build_union_state_mbar_inputs(
             sec = _float_or_none(row.get("secondary_cv"))
             beta = _float_or_none(row.get("beta_1_over_kJ_mol"))
             boost_kj = _float_or_none(row.get("gamd_boost_total_kj_mol"))
+            v_pep = _float_or_none(row.get("v_pep_kj_mol"))
+            v_dih = _float_or_none(row.get("v_dih_kj_mol"))
             step = _float_or_none(row.get("step"))
             sample_rows.append({
                 "source": source_label,
@@ -3048,6 +3124,8 @@ def build_union_state_mbar_inputs(
                 "secondary_cv": "" if sec is None else float(sec),
                 "beta_1_over_kJ_mol": "" if beta is None else float(beta),
                 "gamd_boost_total_kj_mol": "" if boost_kj is None else float(boost_kj),
+                "v_pep_kj_mol": "" if v_pep is None else float(v_pep),
+                "v_dih_kj_mol": "" if v_dih is None else float(v_dih),
                 "usable_for_mbar": int(source_label.startswith("final") or include_epochs),
             })
 
@@ -3082,6 +3160,12 @@ def build_union_state_mbar_inputs(
     ], dtype=np.float64)
     beta_finite = beta_values[np.isfinite(beta_values)]
     beta = float(beta_finite[0]) if beta_finite.size else float("nan")
+    v_pep_values = np.asarray([
+        np.nan if r.get("v_pep_kj_mol", "") == "" else float(r["v_pep_kj_mol"]) for r in sample_rows
+    ], dtype=np.float64)
+    v_dih_values = np.asarray([
+        np.nan if r.get("v_dih_kj_mol", "") == "" else float(r["v_dih_kj_mol"]) for r in sample_rows
+    ], dtype=np.float64)
 
     primary_delta = cv_values[:, np.newaxis] - primary_centers[np.newaxis, :]
     primary_bias_kcal = 0.5 * primary_k[np.newaxis, :] * primary_delta * primary_delta
@@ -3095,10 +3179,30 @@ def build_union_state_mbar_inputs(
         secondary_bias_kcal[secondary_mask] = 0.5 * secondary_k_mat[secondary_mask] * dsec[secondary_mask] * dsec[secondary_mask]
     umbrella_bias_kcal = primary_bias_kcal + secondary_bias_kcal
     umbrella_bias_kj = 4.184 * umbrella_bias_kcal
+
+    # λ-ladder boost term: added by the one shared helper every MBAR
+    # loader/builder uses (gareus.mbar_analysis.ladder.apply_ladder_boost_to_u),
+    # so the missing-energy guard, the NaN-propagation for samples lacking
+    # raw energies, and the envelope-file resolution are identical here and
+    # in gareus/mbar_analysis/loaders.py's load_csv/load_parquet. Called with
+    # beta=1.0 (not the real beta) because umbrella_bias_kj is still in
+    # kJ/mol, not yet reduced -- the real beta is applied below, once, to the
+    # boosted kJ/mol total; this also means gamd_boost_kj_nk (the audit
+    # array) is recovered as a plain subtraction instead of a second
+    # boost-matrix computation.
+    state_lambdas = np.asarray([float(getattr(s, "gamd_lambda", 0.0) or 0.0) for s in states], dtype=np.float64)
+    from .mbar_analysis.ladder import apply_ladder_boost_to_u, load_pep_gamd_envelope
+    envelope = load_pep_gamd_envelope(adaptive_dir) if np.any(state_lambdas > 0.0) else None
+    _ladder_meta: Dict[str, Any] = {}
+    total_bias_kj = apply_ladder_boost_to_u(
+        umbrella_bias_kj, v_pep_values, v_dih_values, state_lambdas, envelope, 1.0, _ladder_meta
+    )
+    gamd_boost_kj_nk = total_bias_kj - umbrella_bias_kj
+
     if math.isfinite(beta):
-        umbrella_reduced_bias_nk = float(beta) * umbrella_bias_kj
+        umbrella_reduced_bias_nk = float(beta) * total_bias_kj
     else:
-        umbrella_reduced_bias_nk = np.full_like(umbrella_bias_kj, np.nan)
+        umbrella_reduced_bias_nk = np.full_like(total_bias_kj, np.nan)
 
     id_to_index = {int(sid): i for i, sid in enumerate(state_ids.tolist())}
     sampled_state_ids = np.asarray([int(r["sampled_state_id"]) for r in sample_rows], dtype=np.int64)
@@ -3112,7 +3216,8 @@ def build_union_state_mbar_inputs(
     with csv_path.open("w", newline="") as handle:
         fieldnames = [
             "source", "source_dir", "step", "sampled_epoch_window", "sampled_state_id",
-            "cv_A", "secondary_cv", "beta_1_over_kJ_mol", "gamd_boost_total_kj_mol", "usable_for_mbar",
+            "cv_A", "secondary_cv", "beta_1_over_kJ_mol", "gamd_boost_total_kj_mol",
+            "v_pep_kj_mol", "v_dih_kj_mol", "usable_for_mbar",
         ]
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
@@ -3133,6 +3238,10 @@ def build_union_state_mbar_inputs(
         umbrella_bias_kj_mol_nk=umbrella_bias_kj,
         umbrella_reduced_bias_nk=umbrella_reduced_bias_nk,
         N_k=n_k,
+        gamd_boost_kj_nk=gamd_boost_kj_nk,
+        state_lambdas=state_lambdas,
+        v_pep_kj_mol=v_pep_values,
+        v_dih_kj_mol=v_dih_values,
     )
     meta = {
         "schema_version": "adaptive_union_mbar_inputs_v1",
@@ -3149,6 +3258,7 @@ def build_union_state_mbar_inputs(
         "note": "Biases are reconstructed post-hoc from scalar CV traces against the union of registry states. Final-only samples are the conservative default.",
         "subsample_counts_per_state": _subsample_counts,
     }
+    meta.update(_ladder_meta)
     json_path = out_prefix.with_suffix(".json")
     write_json(json_path, _json_ready(meta))
     return meta
@@ -4503,12 +4613,14 @@ def write_state_subset_window_csv(
             "reason": str(state.reason),
             "usable_for_mbar": int(bool(state.usable_for_mbar)),
             "burnin_steps": int(state.burnin_steps),
+            "gamd_lambda": float(state.gamd_lambda),
         })
     fieldnames = [
         "epoch_window", "state_id", "primary_cv_center", "primary_cv_k_kcal",
         "distance_center_A", "distance_k_kcal_mol_A2", "secondary_cv_center",
         "secondary_cv_k_kcal_mol", "window_type", "patch_lifecycle", "parent_state_id",
         "created_epoch", "source", "reason", "usable_for_mbar", "burnin_steps",
+        "gamd_lambda",
     ]
     with path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")

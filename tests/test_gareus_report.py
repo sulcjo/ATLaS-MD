@@ -156,6 +156,54 @@ def test_verdict_robust_to_empty_summary():
 
 
 # ----------------------------------------------------------------------------
+# lambda-ladder cross-check (Task 7 review fix, Important-3): a "fail" here
+# must hard-fail `overall`, following the stale-window-map/split-overlap-graph
+# convention -- a CRITICAL warning backed by a dedicated check, never left to
+# sit inside an otherwise-PASS verdict. "skipped"/absent must not move it.
+# ----------------------------------------------------------------------------
+
+def test_verdict_ladder_crosscheck_fail_fails_overall():
+    s = _good_summary()
+    s["ladder_crosscheck"] = {"status": "fail", "max_abs_diff_kcal": 1.234,
+                               "tolerance_kcal": 0.5, "n_bins_compared": 14}
+    v = gr.build_health_verdict(s, 0.30)
+    lcc = next(c for c in v["checks"] if "ladder" in c["name"].lower())
+    assert lcc["status"] == "fail"
+    assert v["overall"] == "FAIL"
+
+
+def test_verdict_ladder_crosscheck_pass_does_not_affect_overall():
+    s = _good_summary()
+    s["ladder_crosscheck"] = {"status": "pass", "max_abs_diff_kcal": 0.05,
+                               "tolerance_kcal": 0.5, "n_bins_compared": 14}
+    v = gr.build_health_verdict(s, 0.30)
+    lcc = next(c for c in v["checks"] if "ladder" in c["name"].lower())
+    assert lcc["status"] == "pass"
+    assert v["overall"] == "PASS"
+
+
+def test_verdict_ladder_crosscheck_skipped_does_not_affect_overall():
+    s = _good_summary()
+    s["ladder_crosscheck"] = {"status": "skipped", "reason": "no λ=0 states in state_lambdas"}
+    v = gr.build_health_verdict(s, 0.30)
+    lcc = next(c for c in v["checks"] if "ladder" in c["name"].lower())
+    assert lcc["status"] == "na"
+    assert v["overall"] == "PASS"
+
+
+def test_verdict_ladder_crosscheck_absent_is_na_and_does_not_affect_overall():
+    """A non-ladder run has no ladder_crosscheck key at all -- must grade NA,
+    not be mistaken for a defect. This is also exercised implicitly by
+    test_verdict_all_good_is_pass (_good_summary() carries no such key)."""
+    s = _good_summary()
+    assert "ladder_crosscheck" not in s
+    v = gr.build_health_verdict(s, 0.30)
+    lcc = next(c for c in v["checks"] if "ladder" in c["name"].lower())
+    assert lcc["status"] == "na"
+    assert v["overall"] == "PASS"
+
+
+# ----------------------------------------------------------------------------
 # classify_warnings — severity + dedup
 # ----------------------------------------------------------------------------
 def test_classify_warnings_severity_mapping():

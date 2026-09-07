@@ -1,0 +1,427 @@
+import csv, io, json, types, tempfile, pathlib
+import numpy as np
+
+
+def test_window_state_carries_gamd_lambda_and_roundtrips():
+    from gareus.adaptive_production import WindowState
+    s = WindowState(state_id=3, primary_center=0.2, primary_k=500.0, gamd_lambda=0.25)
+    d = s.to_dict()
+    assert d["gamd_lambda"] == 0.25
+    assert WindowState.from_dict(d).gamd_lambda == 0.25
+    assert WindowState.from_dict({"state_id": 1, "primary_center": 0.1, "primary_k": 1.0}).gamd_lambda == 0.0
+    assert WindowState.from_dict({"state_id": 1, "primary_center": 0.1, "primary_k": 1.0, "gamd_lambda": ""}).gamd_lambda == 0.0
+
+
+def _write_csv(rows, header):
+    d = pathlib.Path(tempfile.mkdtemp()); p = d / "windows.csv"
+    with p.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=header); w.writeheader(); [w.writerow(r) for r in rows]
+    return p
+
+
+def _args():
+    return types.SimpleNamespace(primary_cv="contacts", secondary_cv="none",
+                                 explicit_2d_primary_center_column="primary_cv_center",
+                                 explicit_2d_primary_k_column="primary_cv_k_kcal",
+                                 explicit_2d_secondary_center_column="secondary_cv_center",
+                                 explicit_2d_secondary_k_column="secondary_cv_k_kcal_mol",
+                                 explicit_2d_primary_cv_mode_column="primary_cv_mode",
+                                 explicit_2d_secondary_cv_mode_column="secondary_cv_mode",
+                                 explicit_2d_window_schema="generic")
+
+
+def test_explicit_csv_parses_gamd_lambda_column():
+    from gareus.windows import load_explicit_2d_window_csv
+    p = _write_csv([{"primary_cv_center": 0.1, "primary_cv_k_kcal": 100, "gamd_lambda": 0.0},
+                    {"primary_cv_center": 0.1, "primary_cv_k_kcal": 100, "gamd_lambda": 0.5},
+                    {"primary_cv_center": 0.3, "primary_cv_k_kcal": 100, "gamd_lambda": 1.0}],
+                   ["primary_cv_center", "primary_cv_k_kcal", "gamd_lambda"])
+    centers, ks, sec_c, sec_k, meta, *_rest = load_explicit_2d_window_csv(_args(), p)
+    assert list(meta["gamd_lambdas"]) == [0.0, 0.5, 1.0]
+    assert [r["gamd_lambda"] for r in meta["normalized_rows"]] == [0.0, 0.5, 1.0]
+    assert len(centers) == 3
+
+
+def test_explicit_csv_without_gamd_lambda_defaults_to_zero():
+    from gareus.windows import load_explicit_2d_window_csv
+    p = _write_csv([{"primary_cv_center": 0.1, "primary_cv_k_kcal": 100}], ["primary_cv_center", "primary_cv_k_kcal"])
+    _c, _k, _sc, _sk, meta, *_rest = load_explicit_2d_window_csv(_args(), p)
+    assert list(meta["gamd_lambdas"]) == [0.0]
+
+
+def test_explicit_csv_rejects_lambda_outside_unit_interval():
+    from gareus.windows import load_explicit_2d_window_csv
+    p = _write_csv([{"primary_cv_center": 0.1, "primary_cv_k_kcal": 100, "gamd_lambda": 1.5}],
+                   ["primary_cv_center", "primary_cv_k_kcal", "gamd_lambda"])
+    try:
+        load_explicit_2d_window_csv(_args(), p)
+    except ValueError as exc:
+        assert "gamd_lambda" in str(exc)
+    else:
+        raise AssertionError("λ outside [0, 1] must be rejected")
+
+
+def test_window_assignment_rows_write_gamd_lambda():
+    from gareus.production import window_assignment_rows
+    rows = window_assignment_rows(np.array([0.1, 0.1]), [100.0, 100.0], 300.0, gamd_lambdas=[0.0, 1.0])
+    assert [r["gamd_lambda"] for r in rows] == [0.0, 1.0]
+    rows = window_assignment_rows(np.array([0.1]), [100.0], 300.0)
+    assert rows[0]["gamd_lambda"] == 0.0
+
+
+def test_registry_from_window_csv_carries_gamd_lambda():
+    """Build the registry the way production does: window_assignment_rows ->
+    write_window_assignment_csv (umbrella_windows.csv) -> registry_from_window_csv."""
+    from gareus.production import window_assignment_rows, write_window_assignment_csv
+    from gareus.adaptive_production import registry_from_window_csv
+
+    rows = window_assignment_rows(np.array([0.1, 0.2, 0.3]), [100.0, 100.0, 100.0], 300.0,
+                                   gamd_lambdas=[0.0, 0.4, 0.9])
+    d = pathlib.Path(tempfile.mkdtemp()); p = d / "umbrella_windows.csv"
+    write_window_assignment_csv(p, rows)
+    reg = registry_from_window_csv(p)
+    states = sorted(reg.all_states(), key=lambda s: s.state_id)
+    assert [s.gamd_lambda for s in states] == [0.0, 0.4, 0.9]
+
+
+def test_active_window_csv_round_trip_carries_gamd_lambda():
+    """The per-epoch active-window CSV (write_active_window_csv) is what the adaptive
+    driver feeds back in as the next epoch's --windows-2d-csv (via load_explicit_2d_window_csv).
+    A state's gamd_lambda set at epoch N must not collapse to zero at epoch N+1."""
+    from gareus.adaptive_production import WindowStateRegistry
+    from gareus.windows import load_explicit_2d_window_csv
+
+    reg = WindowStateRegistry()
+    reg.add_state(primary_center=0.1, primary_k=100.0, gamd_lambda=0.0)
+    reg.add_state(primary_center=0.2, primary_k=100.0, gamd_lambda=0.4)
+    reg.add_state(primary_center=0.3, primary_k=100.0, gamd_lambda=0.9)
+
+    d = pathlib.Path(tempfile.mkdtemp())
+    csv_path = d / "windows_epoch_001.csv"
+    reg.write_active_window_csv(csv_path)
+
+    centers, ks, sec_c, sec_k, meta, *_rest = load_explicit_2d_window_csv(_args(), csv_path)
+    assert list(meta["gamd_lambdas"]) == [0.0, 0.4, 0.9]
+
+
+def test_state_registry_csv_carries_gamd_lambda():
+    """state_registry.csv (write_state_csv) is a diagnostic dump of the full registry;
+    it must not silently drop gamd_lambda either."""
+    from gareus.adaptive_production import WindowStateRegistry
+    import csv as _csv
+
+    reg = WindowStateRegistry()
+    reg.add_state(primary_center=0.1, primary_k=100.0, gamd_lambda=0.6)
+    d = pathlib.Path(tempfile.mkdtemp())
+    csv_path = d / "state_registry.csv"
+    reg.write_state_csv(csv_path)
+    with csv_path.open(newline="") as f:
+        rows = list(_csv.DictReader(f))
+    assert float(rows[0]["gamd_lambda"]) == 0.6
+
+
+def test_state_subset_window_csv_round_trip_carries_gamd_lambda():
+    """write_state_subset_window_csv feeds seg_args.windows_2d_csv for an
+    adaptive-production scheduled segment (structural twin of
+    write_active_window_csv); its output must round-trip through
+    load_explicit_2d_window_csv without zeroing lambda."""
+    from gareus.adaptive_production import WindowStateRegistry, write_state_subset_window_csv
+    from gareus.windows import load_explicit_2d_window_csv
+
+    reg = WindowStateRegistry()
+    s0 = reg.add_state(primary_center=0.1, primary_k=100.0, gamd_lambda=0.0)
+    s1 = reg.add_state(primary_center=0.2, primary_k=100.0, gamd_lambda=0.5)
+    s2 = reg.add_state(primary_center=0.3, primary_k=100.0, gamd_lambda=1.0)
+
+    d = pathlib.Path(tempfile.mkdtemp())
+    csv_path = d / "state_subset_windows.csv"
+    write_state_subset_window_csv(reg, csv_path, [s0.state_id, s1.state_id, s2.state_id])
+
+    centers, ks, sec_c, sec_k, meta, *_rest = load_explicit_2d_window_csv(_args(), csv_path)
+    assert list(meta["gamd_lambdas"]) == [0.0, 0.5, 1.0]
+
+
+def test_post_pull_drop_rewrites_umbrella_windows_csv_with_surviving_lambdas():
+    """drop_bad_us_windows_and_rebuild rewrites umbrella_windows.csv (load-bearing
+    for the legacy MBAR loader, not diagnostic); the surviving states' lambda
+    must not be zeroed by that rewrite."""
+    import types, csv as _csv
+    from gareus.production import drop_bad_us_windows_and_rebuild
+
+    d = pathlib.Path(tempfile.mkdtemp())
+    args = types.SimpleNamespace(temperature_k=300.0)
+    centers_a = [0.1, 0.2, 0.3, 0.4]
+    k_list = [100.0, 100.0, 100.0, 100.0]
+    centers_nm = np.array(centers_a)
+    ks_kj_nm2 = np.array(k_list)
+    window_metadata = {
+        "normalized_rows": [
+            {"window": 0, "gamd_lambda": 0.0},
+            {"window": 1, "gamd_lambda": 0.3},
+            {"window": 2, "gamd_lambda": 0.6},
+            {"window": 3, "gamd_lambda": 0.9},
+        ],
+    }
+    drop_bad_us_windows_and_rebuild(
+        d, [1],
+        centers_a, k_list, centers_nm, ks_kj_nm2,
+        None, None, None,
+        [None] * 4, [None] * 4,
+        {}, window_metadata, args,
+    )
+    csv_path = d / "umbrella_windows.csv"
+    with csv_path.open(newline="") as f:
+        rows = list(_csv.DictReader(f))
+    assert [float(r["gamd_lambda"]) for r in rows] == [0.0, 0.6, 0.9]
+
+
+def test_derive_state_gamd_lambdas_helper():
+    from gareus.production import _derive_state_gamd_lambdas
+
+    # normalized_rows present, aligned, every row carries gamd_lambda -> use them.
+    wm = {"normalized_rows": [{"gamd_lambda": 0.1}, {"gamd_lambda": 0.2}]}
+    assert _derive_state_gamd_lambdas(wm, 2) == [0.1, 0.2]
+
+    # normalized_rows missing gamd_lambda on some row -> fall back to existing if aligned.
+    wm2 = {"normalized_rows": [{"gamd_lambda": 0.1}, {"window": 1}]}
+    assert _derive_state_gamd_lambdas(wm2, 2, existing=[0.4, 0.5]) == [0.4, 0.5]
+
+    # normalized_rows absent entirely, no usable existing -> zeros.
+    assert _derive_state_gamd_lambdas({}, 3) == [0.0, 0.0, 0.0]
+
+    # normalized_rows length mismatch (stale/unrenumbered) -> ignore it, fall back.
+    wm3 = {"normalized_rows": [{"gamd_lambda": 0.7}]}
+    assert _derive_state_gamd_lambdas(wm3, 2, existing=[0.2, 0.3]) == [0.2, 0.3]
+    assert _derive_state_gamd_lambdas(wm3, 2, existing=None) == [0.0, 0.0]
+
+    # existing wrong length is never trusted either -> zeros.
+    assert _derive_state_gamd_lambdas(None, 2, existing=[0.9]) == [0.0, 0.0]
+
+
+def test_exchange_delta_between_rungs_is_the_boost_difference():
+    """Two states with identical umbrellas, λ=0 and λ=1, holding replicas 0 and 1.
+    Swapping them costs exactly boost(x0;λ=1) - boost(x1;λ=1) (the λ=0 terms are zero)."""
+    from gareus.production import apply_window_swap
+    from gareus.pep_gamd import pep_gamd_boost_matrix_kj, PepGamdEnvelope
+    env = PepGamdEnvelope(50.0, -50.0, 50.0, 0.8, 50.0, -50.0, 50.0, 0.6)
+    lambdas = np.array([0.0, 1.0]); v_pep = np.array([10.0, 30.0]); v_dih = np.array([5.0, 7.0])
+    umbrella_kj = np.zeros((2, 2))
+    bias = umbrella_kj + pep_gamd_boost_matrix_kj(v_pep, v_dih, lambdas, env)
+    assignments = np.array([0, 1]); replica_of_window = np.array([0, 1])
+    out = apply_window_swap(bias, 1.0 / 2.494, assignments, replica_of_window, 0, 1, None, force_accept=True)
+    expected = float(bias[1, 0] + bias[0, 1] - bias[0, 0] - bias[1, 1])
+    assert abs(out.delta_kj - expected) < 1e-12
+    assert out.accepted and list(assignments) == [1, 0]
+
+
+def test_boost_matrix_term_is_zero_for_a_pure_umbrella_ladder():
+    from gareus.pep_gamd import pep_gamd_boost_matrix_kj, PepGamdEnvelope
+    env = PepGamdEnvelope(50.0, -50.0, 50.0, 0.8, 50.0, -50.0, 50.0, 0.6)
+    M = pep_gamd_boost_matrix_kj(np.array([1.0, 2.0]), np.array([1.0, 2.0]), np.zeros(4), env)
+    assert M.shape == (4, 2) and np.all(M == 0.0)
+
+
+def test_assemble_bias_matrices_kcal_kj_invariant_holds_with_boost():
+    """bias_kj == 4.184 * bias_kcal must hold even when the λ-ladder boost is
+    nonzero -- both unit columns must carry the SAME quantity (umbrella + boost)."""
+    from gareus.production import assemble_bias_matrices
+    distance_bias_kcal = np.array([[1.0, 2.0], [3.0, 4.0]])
+    ss_bias_kcal = np.zeros((2, 2))
+    boost_bias_kj = np.array([[0.0, 5.0], [10.0, 0.0]])
+    bias_kcal, bias_kj = assemble_bias_matrices(distance_bias_kcal, ss_bias_kcal, boost_bias_kj)
+    assert np.allclose(bias_kj, 4.184 * bias_kcal, atol=1e-12)
+    umbrella_kj = 4.184 * (distance_bias_kcal + ss_bias_kcal)
+    assert np.allclose(bias_kj, umbrella_kj + boost_bias_kj, atol=1e-12)
+
+
+def test_parquet_sample_writer_stores_raw_channel_energies_and_lambda():
+    import pyarrow.parquet as pq
+    from gareus.store import ParquetSampleWriter
+    d = pathlib.Path(tempfile.mkdtemp())
+    w = ParquetSampleWriter(d, flush_rows=10)
+    w.write_sample(step=1, replica=0, window_id=0, cv1=0.1, cv2=None, potential=-5.0,
+                   boost_total=1.0, boost_dihedral=0.5, boost_nonbonded=0.0,
+                   v_pep=12.5, v_dih=3.25, gamd_lambda=0.5)
+    w.write_sample(step=2, replica=0, window_id=0, cv1=0.1, cv2=None, potential=-5.0,
+                   boost_total=0.0, boost_dihedral=0.0, boost_nonbonded=0.0)   # defaults: NaN, NaN, 0.0
+    w.flush()
+    t = pq.read_table(sorted(d.glob("chunk_*.parquet"))[0]).to_pydict()
+    assert t["v_pep_kj_mol"][0] == 12.5 and t["v_dih_kj_mol"][0] == 3.25 and t["gamd_lambda"][0] == 0.5
+    assert np.isnan(t["v_pep_kj_mol"][1]) and t["gamd_lambda"][1] == 0.0
+
+
+def test_manifest_records_state_lambdas():
+    """Task 9 Part A: state_gamd_lambdas and pep_gamd_envelope_path travel next
+    to gamd_boost_type in the run_manifest.json method_settings block."""
+    from gareus.provenance import _method_settings
+    args = types.SimpleNamespace(state_gamd_lambdas=[0.0, 0.5, 1.0], gamd_boost_type="pep-gamd-lower-dual")
+    ms = _method_settings(args)
+    assert ms["state_gamd_lambdas"] == [0.0, 0.5, 1.0]
+    assert ms["pep_gamd_envelope_path"] == "global_shared_gamd_setup/shared_gamd_setup_globals.json"
+
+
+def test_manifest_envelope_path_is_none_for_a_non_ladder_run():
+    from gareus.provenance import _method_settings
+    args = types.SimpleNamespace(state_gamd_lambdas=None, gamd_boost_type="dihedral")
+    ms = _method_settings(args)
+    assert ms["pep_gamd_envelope_path"] is None
+    assert ms["state_gamd_lambdas"] is None
+
+
+def test_persist_state_gamd_lambdas_reflects_the_latest_mutation_not_the_first():
+    """Task 10 review finding: run_gareus mutates args.state_gamd_lambdas up to
+    three times (initial derive, --max-replicas truncation, post-pull US
+    auto-drop re-derive) -- the manifest patch must be re-called at EVERY
+    mutation site, so the persisted value always tracks the LAST one, not
+    whichever happened to run first. Persisting a stale, pre-mutation
+    snapshot is exactly what _derive_state_gamd_lambdas' own docstring warns
+    a caller never to do with `existing=` across a filter/drop boundary --
+    and _reload_state_gamd_lambdas_on_resume feeds this same manifest field
+    back in as `existing=` on the next --resume, so a stale snapshot there
+    either silently disables the ladder ([0.0]*n fallback) or, worse, resumes
+    with a misaligned per-state lambda if the post-drop count happens to
+    match by coincidence."""
+    from gareus.production import _persist_state_gamd_lambdas, _reload_state_gamd_lambdas_on_resume
+    d = pathlib.Path(tempfile.mkdtemp())
+
+    # (a) First persist call (e.g. right after the initial derive).
+    args = types.SimpleNamespace(state_gamd_lambdas=[0.0, 0.5, 1.0])
+    _persist_state_gamd_lambdas(args, d)
+    manifest = json.loads((d / "run_manifest.json").read_text())
+    assert manifest["method_settings"]["state_gamd_lambdas"] == [0.0, 0.5, 1.0]
+
+    # (b) A later mutation (e.g. --max-replicas truncation, or the post-pull
+    # US auto-drop re-derive) followed by a second persist call.
+    args.state_gamd_lambdas = [0.0, 1.0]
+    _persist_state_gamd_lambdas(args, d)
+
+    # (c) The manifest must carry the LATEST value, not the first one --
+    manifest = json.loads((d / "run_manifest.json").read_text())
+    assert manifest["method_settings"]["state_gamd_lambdas"] == [0.0, 1.0]
+
+    # -- and a --resume on fresh args must read back exactly that.
+    resume_args = types.SimpleNamespace(resume=True, state_gamd_lambdas=None)
+    _reload_state_gamd_lambdas_on_resume(resume_args, d)
+    assert resume_args.state_gamd_lambdas == [0.0, 1.0]
+
+
+def test_reload_state_gamd_lambdas_restores_from_manifest_on_resume():
+    """Task 9 Part B: --resume with an unset ladder reloads it from
+    run_manifest.json's method_settings (written once by Part A at campaign
+    start), instead of silently defaulting every replica to lambda=0."""
+    from gareus.production import _reload_state_gamd_lambdas_on_resume
+    d = pathlib.Path(tempfile.mkdtemp())
+    (d / "run_manifest.json").write_text(
+        json.dumps({"method_settings": {"state_gamd_lambdas": [0.0, 0.5, 1.0]}}), encoding="utf-8")
+    args = types.SimpleNamespace(resume=True, state_gamd_lambdas=None)
+    _reload_state_gamd_lambdas_on_resume(args, d)
+    assert args.state_gamd_lambdas == [0.0, 0.5, 1.0]
+
+
+def test_reload_state_gamd_lambdas_does_not_override_an_already_set_ladder():
+    from gareus.production import _reload_state_gamd_lambdas_on_resume
+    d = pathlib.Path(tempfile.mkdtemp())
+    (d / "run_manifest.json").write_text(
+        json.dumps({"method_settings": {"state_gamd_lambdas": [0.9, 0.9, 0.9]}}), encoding="utf-8")
+    args = types.SimpleNamespace(resume=True, state_gamd_lambdas=[0.2, 0.4])
+    _reload_state_gamd_lambdas_on_resume(args, d)
+    assert args.state_gamd_lambdas == [0.2, 0.4]
+
+
+def test_reload_state_gamd_lambdas_is_a_noop_when_not_resuming():
+    from gareus.production import _reload_state_gamd_lambdas_on_resume
+    d = pathlib.Path(tempfile.mkdtemp())
+    (d / "run_manifest.json").write_text(
+        json.dumps({"method_settings": {"state_gamd_lambdas": [0.9, 0.9, 0.9]}}), encoding="utf-8")
+    args = types.SimpleNamespace(resume=False, state_gamd_lambdas=None)
+    _reload_state_gamd_lambdas_on_resume(args, d)
+    assert args.state_gamd_lambdas is None
+
+
+def test_resume_reload_must_run_before_derive_or_its_fallback_masks_the_manifest():
+    """Review fix (Critical): production.py's real sequence calls
+    _reload_state_gamd_lambdas_on_resume BEFORE _derive_state_gamd_lambdas, never
+    after. _derive_state_gamd_lambdas's own fallback-of-last-resort is
+    [0.0] * n -- a non-empty (hence truthy) list -- so a reload call placed
+    AFTER it always finds args.state_gamd_lambdas already "set" and never reads
+    the manifest at all: that was the shipped (broken) ordering the review
+    caught, since real runs never present the reload with the None/empty value
+    every earlier Part-B unit test used.
+
+    Exercises both orders directly against the two production functions (no
+    fixture, no subagent) to prove the ordering -- not the guard's truthiness
+    check, which must NOT special-case an all-zero list (see the kept negative
+    test above; an explicit all-zero ladder is a legitimate disabled state) --
+    is what makes the difference."""
+    from gareus.production import _reload_state_gamd_lambdas_on_resume, _derive_state_gamd_lambdas
+    d = pathlib.Path(tempfile.mkdtemp())
+    (d / "run_manifest.json").write_text(
+        json.dumps({"method_settings": {"state_gamd_lambdas": [0.0, 0.5, 1.0]}}), encoding="utf-8")
+    window_metadata = {}  # no usable normalized_rows: derive must fall back to `existing`
+    n = 3
+
+    # Old (broken) order: _derive_state_gamd_lambdas first, with no existing
+    # value to fall back on -> its own last-resort fallback, [0.0] * n. THEN
+    # the reload -- whose guard sees that non-empty fallback and (correctly,
+    # per its own contract) leaves it alone. The manifest is never consulted.
+    args_old_order = types.SimpleNamespace(resume=True)
+    args_old_order.state_gamd_lambdas = _derive_state_gamd_lambdas(window_metadata, n, existing=None)
+    assert args_old_order.state_gamd_lambdas == [0.0, 0.0, 0.0]
+    _reload_state_gamd_lambdas_on_resume(args_old_order, d)
+    assert args_old_order.state_gamd_lambdas == [0.0, 0.0, 0.0]  # bug: manifest never read
+
+    # New (fixed) order, as production.py now sequences it: reload first
+    # (args.state_gamd_lambdas is genuinely unset at this point on the
+    # fast-resume/choose_windows paths, so the reload fires), THEN derive,
+    # whose existing= now carries whatever the reload restored.
+    args_new_order = types.SimpleNamespace(resume=True)
+    _reload_state_gamd_lambdas_on_resume(args_new_order, d)
+    args_new_order.state_gamd_lambdas = _derive_state_gamd_lambdas(
+        window_metadata, n, existing=getattr(args_new_order, "state_gamd_lambdas", None))
+    assert args_new_order.state_gamd_lambdas == [0.0, 0.5, 1.0]
+
+
+# --- Final-review fix wave, I3: a silently flattened ladder must be loud. ----
+
+def test_warn_if_ladder_was_zeroed_fires_when_a_ladder_flattens():
+    """I3. Both post-drop re-derives pass existing=None on purpose, and
+    _derive_state_gamd_lambdas' fallback-of-last-resort is all zeros -- so on
+    a cold resume a restored ladder can be flattened and
+    _persist_state_gamd_lambdas then writes the zeros into run_manifest.json.
+    The run stays self-consistent (plain umbrella), so this is a warning, not
+    an error -- but it must never be silent."""
+    import io
+    import contextlib
+    from gareus.production import _warn_if_ladder_was_zeroed
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        warned = _warn_if_ladder_was_zeroed([0.0, 0.5, 1.0], [0.0, 0.0, 0.0], "unit test")
+    out = buf.getvalue()
+    assert warned is True
+    assert "λ-ladder LOST" in out
+    assert "unit test" in out
+    assert "2 of 3" in out
+
+
+def test_warn_if_ladder_was_zeroed_is_silent_on_every_other_transition():
+    """Must not fire for a run that never had a ladder, for one that keeps
+    it, or for one that only shrinks -- otherwise the warning is noise and
+    stops being read."""
+    import io
+    import contextlib
+    from gareus.production import _warn_if_ladder_was_zeroed
+
+    cases = [
+        ([0.0, 0.0], [0.0, 0.0]),          # never a ladder
+        ([0.0, 1.0], [0.0, 1.0]),          # ladder preserved
+        ([0.5, 1.0], [1.0]),               # ladder shrunk by a window drop
+        (None, [0.0, 0.0]),                # no previous value at all
+        ([0.0, 1.0], [0.0, 0.5]),          # rungs changed but still a ladder
+    ]
+    for previous, new in cases:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            warned = _warn_if_ladder_was_zeroed(previous, new, "unit test")
+        assert warned is False, (previous, new)
+        assert buf.getvalue() == "", (previous, new, buf.getvalue())
