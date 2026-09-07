@@ -687,6 +687,44 @@ Relevant outputs include:
     shared_gamd_setup_final.pdb
     replica_shared_gamd_copy_report.json
 
+Pep-GaMD: boosting only the peptide (--gamd-boost-type pep-gamd-lower-dual)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Every stock gamd-openmm dual boost reads the Total channel from bare ``energy``
+(all 32 force groups, so the umbrella and secondary CV are inside the boost
+statistics -- audit finding C1) and its velocity update applies only ``f0`` and
+the dihedral group's force, so a force moved to another group is dropped, not
+merely unboosted. ``pep-gamd-lower-dual`` is a gareus-owned integrator that
+boosts the peptide essential potential instead:
+
+    V_pep = V_bonded(pep) + V_nb(pep-pep) + V_nb(pep-water)      (water-water excluded)
+
+PME reciprocal space cannot be partitioned by atom subset, so the partition is by
+subtraction: an auxiliary water-only NonbondedForce (peptide charges/epsilon and
+peptide exceptions zeroed, PME parameters pinned to the same values) lives in
+force group 1, and
+
+    Total channel    = energy0 - energy1 + energy2
+    Dihedral channel = energy2
+    applied force    = (f0 - f1)*FSF_Total + f2*FSF_Total*FSF_Dihedral + f1 + (f - f0 - f1 - f2)
+
+so water-water and every non-physical group (umbrella 31, secondary CV 29) are
+applied unscaled and excluded from every boost statistic. Costs one extra PME
+evaluation per step.
+
+Invariants the code enforces:
+
+    * the auxiliary force exists only in Systems handed to the Pep-GaMD integrator
+      (added inside make_gamd_integrator); a plain Langevin integrator built for
+      such a System excludes group 1 via setIntegrationForceGroups, otherwise
+      water-water would be counted twice;
+    * any Custom* force parked in groups 0..2 is rejected at build time;
+    * recorded potential energies exclude group 1 (it is a measuring instrument,
+      not physics), and recon/recalibration measure the Total channel by the
+      integrator's own definition.
+
+The stored gamd_boost_total_kj_mol column is then the peptide boost, not a
+system-total boost; provenance records the boost type.
+
 0.11 Replica construction
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 The number of production replicas equals the number of umbrella windows.  Each

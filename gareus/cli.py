@@ -509,6 +509,7 @@ def _add_gamd_args(p: argparse.ArgumentParser) -> None:
         "gamd-cmd-base", "lower-total", "upper-total", "lower-dihedral", "upper-dihedral",
         "lower-dual", "upper-dual", "lower-nonbonded", "upper-nonbonded",
         "lower-dual-nonbonded-dihedral", "upper-dual-nonbonded-dihedral",
+        "pep-gamd-lower-dual",
     ])
     p.add_argument("--gamd-reuse-context-checkpoint", action=argparse.BooleanOptionalAction, default=False,
                    help="When reusing a shared GaMD setup exported by an earlier adaptive-production epoch, "
