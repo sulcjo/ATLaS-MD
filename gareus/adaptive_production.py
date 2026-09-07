@@ -265,6 +265,10 @@ class EdgeDiagnostics:
     edge_type: str = "geometry"
     normalized_distance: Optional[float] = None
     overlap: Optional[float] = None
+    # Energy-space overlap (MBAR O_ij).  Set for ``edge_type == "rung"`` edges,
+    # whose CV-histogram ``overlap`` is ~1 by construction and is therefore
+    # left None rather than recorded as if it meant something.
+    mbar_overlap: Optional[float] = None
     exchange_attempts: int = 0
     exchange_accepted: int = 0
     exchange_acceptance: Optional[float] = None
@@ -286,6 +290,18 @@ class AdaptiveDecisionPolicy:
 
     target_overlap: float = 0.30
     min_exchange_acceptance: float = 0.08
+    # λ-ladder rung edges are scored in ENERGY space (MBAR O_ij), never by CV
+    # histogram.  Calibration (S3 pilot attempt 8, sigma0 = 6, rungs
+    # 0/.1/.25/.5/1): adjacent-rung O_ij came out 0.298 / 0.250 / 0.240 /
+    # 0.273, so 0.25 is a realistic target and 0.15 a floor that a healthy
+    # ladder clears with margin.  Exchange acceptance is NOT usable here: under
+    # gibbs-walk the heat-bath choice inflated the same ladder's per-pair
+    # acceptance to 91-95 % against a true pairwise overlap of 0.24-0.30.
+    min_rung_overlap: float = 0.15
+    target_rung_overlap: float = 0.25
+    # Rungs are added one at a time: a new rung is created at EVERY active
+    # centre, so one rung costs as much MD as one whole umbrella row.
+    max_new_rungs_per_epoch: int = 1
     min_samples_for_add: int = 50
     min_samples_for_retire: int = 200
     max_new_windows_per_epoch: int = 4
@@ -492,9 +508,40 @@ class WindowStateRegistry:
     def next_state_id(self) -> int:
         return int(self._next_state_id)
 
-    def has_near_duplicate(self, primary: float, secondary: Optional[float], policy: AdaptiveDecisionPolicy) -> bool:
+    def rung_lambdas(self) -> List[float]:
+        """Sorted distinct ``gamd_lambda`` over ACTIVE states.
+
+        This is the λ-ladder as it currently stands.  ``[0.0]`` (or ``[]`` for
+        an empty registry) means the ladder is inactive, and every rung-aware
+        path below must then reduce to its pre-ladder behaviour exactly.
+        """
+        seen: List[float] = []
+        for state in self.active_states():
+            lam = float(state.gamd_lambda or 0.0)
+            if not any(abs(lam - v) <= 1.0e-9 for v in seen):
+                seen.append(lam)
+        return sorted(seen)
+
+    def has_near_duplicate(
+        self,
+        primary: float,
+        secondary: Optional[float],
+        policy: AdaptiveDecisionPolicy,
+        gamd_lambda: float = 0.0,
+    ) -> bool:
+        """Is there already a state at this centre *on this rung*?
+
+        Under a λ-ladder one umbrella centre legitimately exists once per rung,
+        so a centre match alone is not a duplicate -- the rung must match too,
+        or replicating a centre across rungs would be rejected as duplication
+        of itself.  ``gamd_lambda`` defaults to 0.0, which reproduces the old
+        behaviour exactly for a registry with no ladder (every state at λ = 0).
+        """
+        lam = float(gamd_lambda or 0.0)
         for state in self.all_states():
             if abs(float(state.primary_center) - float(primary)) > float(policy.duplicate_primary_tol):
+                continue
+            if abs(float(state.gamd_lambda or 0.0) - lam) > 1.0e-9:
                 continue
             if state.secondary_center is None and secondary is None:
                 return True
@@ -1914,16 +1961,130 @@ def _load_epoch_window_map(epoch_dir: Path, fallback_registry: WindowStateRegist
     return {i: int(s.state_id) for i, s in enumerate(fallback_registry.active_states())}
 
 
-def build_geometry_edges(registry: WindowStateRegistry) -> List[Tuple[int, int, str, Optional[float]]]:
+def _annotate_edge_warnings(edge: EdgeDiagnostics, policy: AdaptiveDecisionPolicy) -> EdgeDiagnostics:
+    """Attach the standard warnings to one edge, in place.
+
+    A rung edge is judged ONLY on ``mbar_overlap``: its CV histogram overlap is
+    ~1 by construction, and its exchange acceptance is inflated by gibbs-walk's
+    heat-bath choice (91-95 % measured against a true pairwise overlap of
+    0.24-0.30 in the S3 pilot), so ``low_exchange_acceptance`` is deliberately
+    never raised for one -- acceptance is still recorded, just not judged.
+    """
+    if str(edge.edge_type) == "rung":
+        if edge.mbar_overlap is None or float(edge.mbar_overlap) < float(policy.min_rung_overlap):
+            if "low_rung_overlap" not in edge.warnings:
+                edge.warnings.append("low_rung_overlap")
+        return edge
+    if edge.overlap is None or float(edge.overlap) < float(policy.target_overlap):
+        if "low_or_missing_overlap" not in edge.warnings:
+            edge.warnings.append("low_or_missing_overlap")
+    if (int(edge.exchange_attempts) > 0 and edge.exchange_acceptance is not None
+            and float(edge.exchange_acceptance) < float(policy.min_exchange_acceptance)):
+        if "low_exchange_acceptance" not in edge.warnings:
+            edge.warnings.append("low_exchange_acceptance")
+    return edge
+
+
+def _build_edge_diagnostics(
+    geometry_edges: Sequence[Tuple[int, int, str, Optional[float]]],
+    policy: AdaptiveDecisionPolicy,
+    state_to_window: Dict[int, int],
+    by_window_values: Dict[int, Any],
+    pair_stats: Dict[Tuple[int, int], Tuple[int, int]],
+    mbar_overlap: Optional[Dict[Tuple[int, int], float]] = None,
+) -> List[EdgeDiagnostics]:
+    """One ``EdgeDiagnostics`` per edge -- the single copy of what used to be
+    two identical loops (epoch diagnostics and final combined diagnostics)."""
+    mbar_overlap = mbar_overlap or {}
+    rows: List[EdgeDiagnostics] = []
+    for si, sj, etype, nd in geometry_edges:
+        wi = state_to_window.get(int(si), -1)
+        wj = state_to_window.get(int(sj), -1)
+        is_rung = str(etype) == "rung"
+        overlap = None
+        if not is_rung and wi >= 0 and wj >= 0:
+            overlap = _hist_overlap(
+                np.asarray(by_window_values.get(wi, []), dtype=float),
+                np.asarray(by_window_values.get(wj, []), dtype=float),
+            )
+        key = (int(min(si, sj)), int(max(si, sj)))
+        attempts, accepted = pair_stats.get(key, (0, 0))
+        edge = EdgeDiagnostics(
+            state_i=int(si),
+            state_j=int(sj),
+            window_i=int(wi),
+            window_j=int(wj),
+            edge_type=str(etype),
+            normalized_distance=nd,
+            overlap=overlap,
+            mbar_overlap=(mbar_overlap.get(key) if is_rung else None),
+            exchange_attempts=int(attempts),
+            exchange_accepted=int(accepted),
+            exchange_acceptance=(float(accepted) / float(attempts)) if attempts > 0 else None,
+        )
+        rows.append(_annotate_edge_warnings(edge, policy))
+    return rows
+
+
+def _centre_group_key(state: WindowState, policy: AdaptiveDecisionPolicy) -> Tuple[int, Optional[int]]:
+    """Quantised (primary, secondary) centre, at the duplicate tolerances.
+
+    Two states sharing this key are the same umbrella window on different rungs
+    of the λ-ladder -- the pair whose CV-histogram overlap is ~1 by
+    construction and therefore says nothing about their phase-space overlap.
+    """
+    p_tol = max(float(policy.duplicate_primary_tol), 1.0e-12)
+    s_tol = max(float(policy.duplicate_secondary_tol), 1.0e-12)
+    p_key = int(round(float(state.primary_center) / p_tol))
+    s_key = None if state.secondary_center is None else int(round(float(state.secondary_center) / s_tol))
+    return (p_key, s_key)
+
+
+def _representative_rung(registry: WindowStateRegistry) -> float:
+    """The λ a per-centre *proposal* is deduplicated against.
+
+    Same rule ``build_geometry_edges`` uses to pick a centre group's
+    representative: λ = 0 when the ladder has it (always, in practice), else
+    the lowest active rung.  A proposal names a CENTRE; ``apply_actions``
+    replicates it onto every rung, so asking "does this centre already exist on
+    the representative rung?" is the same question as "does this centre already
+    exist?".
+    """
+    rungs = registry.rung_lambdas()
+    if not rungs:
+        return 0.0
+    return 0.0 if any(abs(v) <= 1.0e-9 for v in rungs) else float(rungs[0])
+
+
+def build_geometry_edges(
+    registry: WindowStateRegistry,
+    policy: Optional[AdaptiveDecisionPolicy] = None,
+) -> List[Tuple[int, int, str, Optional[float]]]:
     """Build a light geometry graph between active states.
 
     For 1D states, this is a simple sorted nearest-neighbor chain.  For 2D
     states, use immediate row/column-like nearest neighbors plus one nearest
     Euclidean neighbor per state to keep sparse patches connected.
+
+    Under an active λ-ladder (some state carries ``gamd_lambda > 0``) states
+    are first grouped by centre: adjacent rungs within one group get a
+    ``("rung", delta_lambda)`` edge, and the geometry chain/nearest-2D edges
+    are built over ONE representative per group (the λ = 0 member if present,
+    else the lowest rung).  Cross-centre edges are therefore not multiplied by
+    the number of rungs, and a same-centre pair never appears as a geometry
+    edge -- its CV overlap would be ~1 whatever the boost spacing.  With the
+    ladder inactive the grouping is skipped entirely and the result is
+    byte-for-byte what it always was.
     """
     active = registry.active_states()
     if len(active) <= 1:
         return []
+    policy = policy or AdaptiveDecisionPolicy()
+    rung_edges: List[Tuple[int, int, str, Optional[float]]] = []
+    if any(float(s.gamd_lambda or 0.0) > 0.0 for s in active):
+        active, rung_edges = _split_rung_groups(active, policy)
+        if len(active) <= 1:
+            return rung_edges
     has_secondary = any(s.secondary_center is not None for s in active)
     primary = np.asarray([s.primary_center for s in active], dtype=float)
     secondary = np.asarray([0.0 if s.secondary_center is None else s.secondary_center for s in active], dtype=float)
@@ -1949,7 +2110,33 @@ def build_geometry_edges(registry: WindowStateRegistry) -> List[Tuple[int, int, 
             j = int(np.argmin(dist))
             if math.isfinite(float(dist[j])):
                 add(i, j, "nearest_2d", float(dist[j]))
-    return list(edges.values())
+    return rung_edges + list(edges.values())
+
+
+def _split_rung_groups(
+    active: List[WindowState],
+    policy: AdaptiveDecisionPolicy,
+) -> Tuple[List[WindowState], List[Tuple[int, int, str, Optional[float]]]]:
+    """Split active states into (one representative per centre, rung edges)."""
+    groups: Dict[Tuple[int, Optional[int]], List[WindowState]] = {}
+    for state in active:
+        groups.setdefault(_centre_group_key(state, policy), []).append(state)
+    representatives: List[WindowState] = []
+    rung_edges: List[Tuple[int, int, str, Optional[float]]] = []
+    for _key, members in groups.items():
+        members = sorted(members, key=lambda s: (float(s.gamd_lambda or 0.0), int(s.state_id)))
+        for lo, hi in zip(members[:-1], members[1:]):
+            delta = float(hi.gamd_lambda or 0.0) - float(lo.gamd_lambda or 0.0)
+            if delta <= 1.0e-12:
+                # Two states at one centre AND one rung: a duplicate, not a
+                # rung pair.  A zero-delta "rung" edge would be meaningless.
+                continue
+            a, b = sorted((int(lo.state_id), int(hi.state_id)))
+            rung_edges.append((a, b, "rung", delta))
+        zeros = [s for s in members if abs(float(s.gamd_lambda or 0.0)) <= 1.0e-9]
+        representatives.append(zeros[0] if zeros else members[0])
+    representatives.sort(key=lambda s: int(s.state_id))
+    return representatives, rung_edges
 
 
 def _positive_scale(values: np.ndarray) -> float:
@@ -2039,7 +2226,13 @@ def _non_neighbor_redundant_pairs(
     return alerts
 
 
-def collect_epoch_diagnostics(epoch_dir: Path, registry: WindowStateRegistry, policy: Optional[AdaptiveDecisionPolicy] = None) -> Dict[str, Any]:
+def collect_epoch_diagnostics(
+    epoch_dir: Path,
+    registry: WindowStateRegistry,
+    policy: Optional[AdaptiveDecisionPolicy] = None,
+    *,
+    rung_mbar_overlap: Optional[Dict[Tuple[int, int], float]] = None,
+) -> Dict[str, Any]:
     """Collect simple per-state and per-edge diagnostics from one epoch output."""
     epoch_dir = Path(epoch_dir)
     policy = policy or AdaptiveDecisionPolicy()
@@ -2119,33 +2312,11 @@ def collect_epoch_diagnostics(epoch_dir: Path, registry: WindowStateRegistry, po
         pair_stats[key] = (attempts, accepted)
 
     state_to_window = {sid: w for w, sid in window_map.items()}
-    geometry_edges = build_geometry_edges(registry)
-    edge_rows: List[EdgeDiagnostics] = []
-    for si, sj, etype, nd in geometry_edges:
-        wi = state_to_window.get(int(si), -1)
-        wj = state_to_window.get(int(sj), -1)
-        overlap = None
-        if wi >= 0 and wj >= 0:
-            overlap = _hist_overlap(by_window_values.get(wi, np.asarray([])), by_window_values.get(wj, np.asarray([])))
-        attempts, accepted = pair_stats.get(tuple(sorted((int(si), int(sj)))), (0, 0))
-        acceptance = (float(accepted) / float(attempts)) if attempts > 0 else None
-        edge = EdgeDiagnostics(
-            state_i=int(si),
-            state_j=int(sj),
-            window_i=int(wi),
-            window_j=int(wj),
-            edge_type=str(etype),
-            normalized_distance=nd,
-            overlap=overlap,
-            exchange_attempts=int(attempts),
-            exchange_accepted=int(accepted),
-            exchange_acceptance=acceptance,
-        )
-        if overlap is None or overlap < float(policy.target_overlap):
-            edge.warnings.append("low_or_missing_overlap")
-        if attempts > 0 and acceptance is not None and acceptance < float(policy.min_exchange_acceptance):
-            edge.warnings.append("low_exchange_acceptance")
-        edge_rows.append(edge)
+    geometry_edges = build_geometry_edges(registry, policy)
+    edge_rows = _build_edge_diagnostics(
+        geometry_edges, policy, state_to_window, by_window_values, pair_stats,
+        mbar_overlap=rung_mbar_overlap,
+    )
 
     non_neighbor_redundancies = _non_neighbor_redundant_pairs(
         registry, window_map, by_window_values, geometry_edges, policy
@@ -2476,7 +2647,13 @@ def _propose_tica_coverage_actions(
             population = int(mask.sum())
             target_primary = float(np.median(uncovered_primary[mask]))
             target_secondary = float(np.median(uncovered_values[mask]))
-            if registry.has_near_duplicate(target_primary, target_secondary, policy):
+            # A coverage add names a CENTRE; apply_actions replicates it onto
+            # every rung, so ask whether the centre already exists on the rung
+            # build_geometry_edges would represent it by.
+            if registry.has_near_duplicate(
+                target_primary, target_secondary, policy,
+                gamd_lambda=_representative_rung(registry),
+            ):
                 continue
             # Select a parent using harmonic distance in both umbrella dimensions.
             distances = []
@@ -3436,6 +3613,56 @@ def run_union_mbar_analysis(
     return payload
 
 
+def rung_mbar_overlap_from_union(
+    adaptive_dir: Path,
+    union_meta: Dict[str, Any],
+    registry: WindowStateRegistry,
+    policy: Optional[AdaptiveDecisionPolicy] = None,
+) -> Dict[Tuple[int, int], float]:
+    """MBAR state overlap ``O_ij`` for every rung edge, from the union inputs.
+
+    The union NPZ is the only place that carries every state's reduced
+    potential for every sample WITH the λ-ladder boost already folded in (see
+    ``build_union_state_mbar_inputs`` -> ``apply_ladder_boost_to_u``), so it is
+    the only honest source for an energy-space rung diagnostic.  Returns an
+    empty mapping -- never raises -- when there is no ladder, no NPZ, or the
+    solve fails; a missing ``mbar_overlap`` then reads as a weak rung edge,
+    which is the conservative direction.
+    """
+    policy = policy or AdaptiveDecisionPolicy()
+    rung_pairs = [(a, b) for a, b, etype, _nd in build_geometry_edges(registry, policy) if etype == "rung"]
+    if not rung_pairs:
+        return {}
+    try:
+        npz_path = _npz_path_from_union_meta(Path(adaptive_dir), union_meta, "adaptive_union_mbar")
+        if not npz_path.exists():
+            return {}
+        with np.load(npz_path, allow_pickle=False) as data:
+            u_nk = np.asarray(data["umbrella_reduced_bias_nk"], dtype=float)
+            state_ids = np.asarray(data["state_ids"], dtype=np.int64)
+            sampled = np.asarray(data["sampled_state_ids"], dtype=np.int64)
+        idx_of = {int(sid): i for i, sid in enumerate(state_ids.tolist())}
+        window = np.asarray([idx_of.get(int(s), -1) for s in sampled], dtype=np.int64)
+        keep = (window >= 0) & np.isfinite(u_nk).all(axis=1)
+        u_nk, window = u_nk[keep], window[keep]
+        if u_nk.shape[0] <= 0:
+            return {}
+        n_k = np.bincount(window, minlength=u_nk.shape[1]).astype(np.int64)
+        from .mbar_analysis.solvers import solve_mbar  # noqa: PLC0415
+        from .mbar_analysis.ladder import mbar_state_overlap  # noqa: PLC0415
+        f_k = np.asarray(solve_mbar(u_nk, window)["f_k"], dtype=float)
+        overlap = mbar_state_overlap(u_nk, f_k, n_k)
+    except Exception as exc:
+        logging.warning("adaptive-production: rung MBAR overlap unavailable (%s)", exc)
+        return {}
+    out: Dict[Tuple[int, int], float] = {}
+    for a, b in rung_pairs:
+        ia, ib = idx_of.get(int(a)), idx_of.get(int(b))
+        if ia is not None and ib is not None and math.isfinite(float(overlap[ia, ib])):
+            out[(int(min(a, b)), int(max(a, b)))] = float(overlap[ia, ib])
+    return out
+
+
 def _write_matrix_csv(path: Path, matrix: np.ndarray, state_ids: np.ndarray) -> None:
     matrix = np.asarray(matrix, dtype=float)
     with Path(path).open("w", newline="") as handle:
@@ -3533,7 +3760,13 @@ def _final_sample_dirs(adaptive_dir: Path) -> List[Tuple[str, Path]]:
     return out
 
 
-def collect_final_combined_diagnostics(adaptive_dir: Path, registry: WindowStateRegistry, policy: Optional[AdaptiveDecisionPolicy] = None) -> Dict[str, Any]:
+def collect_final_combined_diagnostics(
+    adaptive_dir: Path,
+    registry: WindowStateRegistry,
+    policy: Optional[AdaptiveDecisionPolicy] = None,
+    *,
+    rung_mbar_overlap: Optional[Dict[Tuple[int, int], float]] = None,
+) -> Dict[str, Any]:
     """Collect diagnostics over the frozen final phase plus final extensions.
 
     Each final segment is run with the same frozen active window table, but it
@@ -3639,28 +3872,10 @@ def collect_final_combined_diagnostics(adaptive_dir: Path, registry: WindowState
             diag.warnings.append("high_gamd_boost_sd")
         state_rows.append(diag)
 
-    edge_rows: List[EdgeDiagnostics] = []
-    for si, sj, etype, nd in build_geometry_edges(registry):
-        wi = canonical_state_to_window.get(int(si), -1)
-        wj = canonical_state_to_window.get(int(sj), -1)
-        overlap = None
-        if wi >= 0 and wj >= 0:
-            overlap = _hist_overlap(
-                np.asarray(by_window_values.get(wi, []), dtype=float),
-                np.asarray(by_window_values.get(wj, []), dtype=float),
-            )
-        attempts, accepted = pair_stats.get(tuple(sorted((int(si), int(sj)))), (0, 0))
-        acceptance = (float(accepted) / float(attempts)) if attempts > 0 else None
-        edge = EdgeDiagnostics(
-            state_i=int(si), state_j=int(sj), window_i=int(wi), window_j=int(wj),
-            edge_type=str(etype), normalized_distance=nd, overlap=overlap,
-            exchange_attempts=int(attempts), exchange_accepted=int(accepted), exchange_acceptance=acceptance,
-        )
-        if overlap is None or overlap < float(policy.target_overlap):
-            edge.warnings.append("low_or_missing_overlap")
-        if attempts > 0 and acceptance is not None and acceptance < float(policy.min_exchange_acceptance):
-            edge.warnings.append("low_exchange_acceptance")
-        edge_rows.append(edge)
+    edge_rows = _build_edge_diagnostics(
+        build_geometry_edges(registry, policy), policy, canonical_state_to_window,
+        by_window_values, pair_stats, mbar_overlap=rung_mbar_overlap,
+    )
 
     payload = {
         "schema_version": "adaptive_production_final_combined_diagnostics_v1",
@@ -3675,6 +3890,31 @@ def collect_final_combined_diagnostics(adaptive_dir: Path, registry: WindowState
     }
     write_json(adaptive_dir / "adaptive_final_combined_diagnostics.json", payload)
     return payload
+
+
+def _weak_rung_edge_reason(
+    edge: Dict[str, Any],
+    registry: WindowStateRegistry,
+    policy: AdaptiveDecisionPolicy,
+) -> Optional[str]:
+    """Gate reason for one rung edge, or None when the rung edge is healthy.
+
+    Names both λ values and the measured O_ij, so the gate report says which
+    rung pair failed without a reader having to join it back to the registry.
+    """
+    overlap = edge.get("mbar_overlap")
+    if overlap is not None and float(overlap) >= float(policy.min_rung_overlap):
+        return None
+    si = registry.get_state(int(edge.get("state_i", -1)))
+    sj = registry.get_state(int(edge.get("state_j", -1)))
+    lam_i = "?" if si is None else f"{float(si.gamd_lambda or 0.0):g}"
+    lam_j = "?" if sj is None else f"{float(sj.gamd_lambda or 0.0):g}"
+    measured = "missing" if overlap is None else f"{float(overlap):.4f}"
+    return (
+        f"weak lambda-ladder rung edge between lambda={lam_i} and lambda={lam_j} "
+        f"(states {edge.get('state_i')}-{edge.get('state_j')}): mbar_overlap={measured} "
+        f"< min_rung_overlap={float(policy.min_rung_overlap):g}"
+    )
 
 
 def evaluate_adaptive_quality_gate(
@@ -3746,7 +3986,18 @@ def evaluate_adaptive_quality_gate(
         )
 
     weak_edges = []
+    weak_rung_edges = []
     for edge in final_diagnostics.get("edges", []) or []:
+        if str(edge.get("edge_type")) == "rung":
+            # A rung edge carries no CV histogram (overlap is None by
+            # construction) and its acceptance is inflated by gibbs-walk, so it
+            # is judged on the MBAR state overlap alone -- but a weak one is a
+            # gate failure exactly like a weak CV edge.
+            reason = _weak_rung_edge_reason(edge, registry, policy)
+            if reason is not None:
+                weak_edges.append(edge)
+                weak_rung_edges.append(reason)
+            continue
         overlap = edge.get("overlap")
         acc = edge.get("exchange_acceptance")
         weak = overlap is None or float(overlap) < float(policy.target_overlap)
@@ -3757,6 +4008,12 @@ def evaluate_adaptive_quality_gate(
     if weak_edges:
         needs_more_sampling.append(f"{len(weak_edges)} final edge(s) are below overlap/exchange thresholds")
         recommendations.append("Add bridge windows in another adaptive epoch or extend final sampling if the weak edges are sample-limited.")
+    for reason in weak_rung_edges:
+        needs_more_sampling.append(reason)
+        recommendations.append(
+            "Insert a lambda-ladder rung between the reported lambdas (adaptive add_rung) "
+            "or extend sampling; the frozen GaMD envelope is NOT recalibrated by adding a rung."
+        )
 
     coverage_fraction = None
     if union_analysis:
@@ -4050,6 +4307,58 @@ def _interpolate_bridge_axis(c1: float, c2: float, frac: float) -> float:
     return float(c1) + float(frac) * (float(c2) - float(c1))
 
 
+def _propose_rung_actions(
+    registry: WindowStateRegistry,
+    edge_rows: Sequence[Dict[str, Any]],
+    policy: AdaptiveDecisionPolicy,
+) -> List[Tuple]:
+    """``("add_rung", lambda_mid, reason)`` for each too-weak rung edge.
+
+    Weakest first, capped at ``policy.max_new_rungs_per_epoch``, because
+    ``apply_actions`` creates the new rung at EVERY active centre -- one rung
+    is a whole extra umbrella row of MD.
+
+    Deliberately NOT gated on ``min_samples_for_add`` the way the CV-bridge
+    pass is: O_ij already comes out of an MBAR solve over the union samples,
+    which is only solvable when the states carry samples at all, so a separate
+    per-state count threshold would be a second, weaker version of the same
+    check.  The asymmetry with the CV pass is intentional.
+    """
+    weak: List[Tuple[float, float, float, float]] = []
+    for edge in edge_rows:
+        if str(edge.get("edge_type")) != "rung":
+            continue
+        overlap = edge.get("mbar_overlap")
+        if overlap is None or float(overlap) >= float(policy.min_rung_overlap):
+            continue
+        si = registry.get_state(int(edge.get("state_i", -1)))
+        sj = registry.get_state(int(edge.get("state_j", -1)))
+        if si is None or sj is None:
+            continue
+        lam_i = float(si.gamd_lambda or 0.0)
+        lam_j = float(sj.gamd_lambda or 0.0)
+        if abs(lam_j - lam_i) <= 1.0e-12:
+            continue
+        weak.append((float(overlap), lam_i, lam_j, 0.5 * (lam_i + lam_j)))
+    weak.sort(key=lambda row: row[0])
+    max_new = max(0, int(policy.max_new_rungs_per_epoch))
+    actions: List[Tuple] = []
+    for overlap, lam_i, lam_j, lam_mid in weak[:max_new]:
+        actions.append((
+            "add_rung", float(lam_mid),
+            f"weak rung edge lambda={lam_i:g}-{lam_j:g}: mbar_overlap={overlap:.4f} "
+            f"< min_rung_overlap={float(policy.min_rung_overlap):g} "
+            f"(target {float(policy.target_rung_overlap):g})",
+        ))
+    if len(weak) > max_new:
+        logging.warning(
+            "adaptive-production: %d weak rung edge(s) but max_new_rungs_per_epoch=%d; "
+            "the rest stay weak and resurface in the next epoch's diagnostics",
+            len(weak), max_new,
+        )
+    return actions
+
+
 def propose_actions_from_diagnostics(
     registry: WindowStateRegistry,
     diagnostics: Dict[str, Any],
@@ -4080,6 +4389,12 @@ def propose_actions_from_diagnostics(
     added = 0
     weak_edges = []
     for edge in edge_rows:
+        if str(edge.get("edge_type")) == "rung":
+            # A rung edge joins two states at ONE centre: there is no CV
+            # midpoint to bridge, and its CV overlap is None by construction
+            # (which the test below would otherwise read as "weak").  Rung
+            # gaps are repaired by add_rung, in the pass after this one.
+            continue
         overlap = edge.get("overlap")
         acc = edge.get("exchange_acceptance")
         weak = (overlap is None or float(overlap) < float(policy.target_overlap))
@@ -4372,7 +4687,12 @@ def propose_actions_from_diagnostics(
             # next to. frac == 0.5 resolves to s1, keeping the historical
             # single-midpoint parent unchanged.
             parent = s1 if frac <= 0.5 else s2
-            if registry.has_near_duplicate(primary, secondary, policy):
+            # A bridge names a CENTRE; apply_actions replicates it onto every
+            # rung, so the duplicate question is asked on the representative
+            # rung (the same one build_geometry_edges wired this edge between).
+            if registry.has_near_duplicate(
+                primary, secondary, policy, gamd_lambda=_representative_rung(registry),
+            ):
                 # A slot freed by a near-duplicate skip is deliberately *not*
                 # handed back to another edge: the allocation above is what the
                 # warnings above were emitted against, and silently topping up a
@@ -4411,6 +4731,9 @@ def propose_actions_from_diagnostics(
         _record("bisection_step" if _bisection_only else "bridged",
                 placed_this_edge,
                 reach_note if _bisection_only else "reconnects at least one endpoint")
+
+    # 1b. Add a rung where the LADDER, not the CV chain, is broken.
+    actions.extend(_propose_rung_actions(registry, edge_rows, policy))
 
     # 2. Optionally retire clearly converged non-critical states.  Only reclaim
     # windows that are genuinely redundant (measured overlap >= redundant_overlap).
@@ -5394,6 +5717,8 @@ def collect_segmented_epoch_diagnostics(epoch_dir: Path, registry: WindowStateRe
 
         # --- Compute per-segment per-edge overlap (0.0 for degenerate segments) ---
         for si, sj, _etype, _nd in geometry_edges:
+            if str(_etype) == "rung":
+                continue  # scored in energy space; its CV overlap is ~1 by construction
             key = (int(min(si, sj)), int(max(si, sj)))
             a = np.asarray(seg_cv_by_state.get(int(si), []), dtype=float)
             b = np.asarray(seg_cv_by_state.get(int(sj), []), dtype=float)
@@ -5442,6 +5767,13 @@ def collect_segmented_epoch_diagnostics(epoch_dir: Path, registry: WindowStateRe
             })
             acc["exchange_attempts"] += int(edge.get("exchange_attempts", 0) or 0)
             acc["exchange_accepted"] += int(edge.get("exchange_accepted", 0) or 0)
+            # A rung edge's score lives in energy space and is a property of
+            # the union MBAR solve, not of this segment: carry it through the
+            # merge rather than letting the pooled-histogram override below
+            # replace it with a CV overlap of ~1.
+            if edge.get("mbar_overlap") is not None:
+                acc["mbar_overlap"] = float(edge.get("mbar_overlap"))
+            acc.setdefault("mbar_overlap", None)
             # Do NOT union per-segment warnings here: low_or_missing_overlap is
             # re-derived from the pooled overlap below.  Union only non-overlap warnings.
             for w in edge.get("warnings", []) or []:
@@ -5463,6 +5795,24 @@ def collect_segmented_epoch_diagnostics(epoch_dir: Path, registry: WindowStateRe
         acc["exchange_attempts"] = attempts
         acc["exchange_accepted"] = accepted
         acc["exchange_acceptance"] = (accepted / float(attempts)) if attempts > 0 else None
+
+        if str(acc.get("edge_type")) == "rung":
+            # Two rungs at ONE centre: the pooled CV histogram would come out
+            # ~1 whatever the boost spacing (this is the whole reason rung
+            # edges exist), so it is not computed, and the nonstationary check
+            # -- which compares pooled against per-segment CV overlap -- has
+            # nothing to compare.  Only the energy-space overlap is judged.
+            acc["overlap"] = None
+            acc["segment_min_overlap"] = None
+            acc["warnings"] = [w for w in acc.get("warnings", []) if w != "low_rung_overlap"]
+            _rung_edge = EdgeDiagnostics(
+                state_i=si, state_j=sj, window_i=int(acc.get("window_i", -1)),
+                window_j=int(acc.get("window_j", -1)), edge_type="rung",
+                mbar_overlap=acc.get("mbar_overlap"), warnings=list(acc["warnings"]),
+            )
+            acc["warnings"] = _annotate_edge_warnings(_rung_edge, policy).warnings
+            edges.append(dict(acc))
+            continue
 
         # Pooled overlap — computed once from all segments' raw cv_A data.
         pooled_overlap = _hist_overlap(
@@ -5944,6 +6294,75 @@ class AdaptiveProductionController:
         if self.registry_dir is not None:
             self.registry.save(self.registry_dir)
 
+    def _add_centre_on_every_rung(
+        self,
+        epoch: int,
+        params: Sequence[Any],
+        *,
+        parent: Optional[int],
+        source: str,
+        reason: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> List[WindowState]:
+        """Create one state per active rung for a single new umbrella centre.
+
+        An action names a CENTRE, never a state: the windows × rungs cross
+        product is what the ladder run actually samples, so a centre that
+        existed only at λ = 0 would never be boosted and would break the
+        product.  ``policy.max_new_windows_per_epoch`` therefore counts
+        CENTRES, not states -- one centre under a five-rung ladder costs five
+        states, and the budget is spent per centre.
+
+        With the ladder inactive (every active state at λ = 0, or an empty
+        registry) this creates exactly one state with the reason string
+        untouched: byte-for-byte the pre-ladder behaviour.
+        """
+        rungs = [lam for lam in self.registry.rung_lambdas() if lam > 0.0]
+        lambdas = self.registry.rung_lambdas() if rungs else [0.0]
+        created: List[WindowState] = []
+        for lam in lambdas:
+            state_reason = str(reason) if not rungs else f"{reason}; rung lambda={float(lam)}"
+            created.append(self.registry.add_state(
+                primary_center=params[0], primary_k=params[1],
+                secondary_center=params[2] if len(params) > 2 else None,
+                secondary_k=params[3] if len(params) > 3 else None,
+                gamd_lambda=float(lam),
+                parent_state_id=None if parent is None else int(parent),
+                epoch=int(epoch) + 1, source=str(source), reason=state_reason,
+                metadata=dict(metadata or {}),
+            ))
+        return created
+
+    def _add_rung_at_every_centre(self, epoch: int, lambda_new: float, reason: str) -> List[WindowState]:
+        """Create one state at ``lambda_new`` for every active umbrella centre.
+
+        Rungs are never moved or removed, and the frozen GaMD envelope is
+        untouched (adding a rung does not recalibrate): a new rung is purely an
+        extra column of the cross product, whose k0 scaling follows through
+        ``state_gamd_lambdas`` exactly as the existing rungs' does.
+        """
+        policy = AdaptiveDecisionPolicy()
+        lam = float(lambda_new)
+        groups: Dict[Tuple[int, Optional[int]], List[WindowState]] = {}
+        for state in self.registry.active_states():
+            groups.setdefault(_centre_group_key(state, policy), []).append(state)
+        created: List[WindowState] = []
+        for _key, members in sorted(groups.items()):
+            members = sorted(members, key=lambda s: (float(s.gamd_lambda or 0.0), int(s.state_id)))
+            zeros = [s for s in members if abs(float(s.gamd_lambda or 0.0)) <= 1.0e-9]
+            rep = zeros[0] if zeros else members[0]
+            if any(abs(float(s.gamd_lambda or 0.0) - lam) <= 1.0e-9 for s in members):
+                continue
+            created.append(self.registry.add_state(
+                primary_center=rep.primary_center, primary_k=rep.primary_k,
+                secondary_center=rep.secondary_center, secondary_k=rep.secondary_k,
+                gamd_sigma0p=rep.gamd_sigma0p, gamd_sigma0d=rep.gamd_sigma0d,
+                gamd_lambda=lam, parent_state_id=int(rep.state_id),
+                epoch=int(epoch) + 1, source="adaptive_production_rung",
+                reason=f"{reason}; rung lambda={lam}",
+            ))
+        return created
+
     def apply_actions(self, epoch: int, actions: Sequence[Tuple]) -> None:
         for action in actions:
             kind = str(action[0])
@@ -5955,22 +6374,18 @@ class AdaptiveProductionController:
                 self.registry.record_extend(int(state_id), int(epoch) + 1, str(reason))
             elif kind == "add":
                 _, parent, params, reason = action
-                self.registry.add_state(
-                    primary_center=params[0], primary_k=params[1],
-                    secondary_center=params[2] if len(params) > 2 else None,
-                    secondary_k=params[3] if len(params) > 3 else None,
-                    parent_state_id=None if parent is None else int(parent),
-                    epoch=int(epoch) + 1, source="adaptive_production", reason=str(reason),
+                self._add_centre_on_every_rung(
+                    epoch, params, parent=parent,
+                    source="adaptive_production", reason=str(reason),
                 )
+            elif kind == "add_rung":
+                _, lambda_new, reason = action
+                self._add_rung_at_every_centre(epoch, float(lambda_new), str(reason))
             elif kind == "tica_coverage_add":
                 _, parent, params, reason, metadata = action
-                self.registry.add_state(
-                    primary_center=params[0], primary_k=params[1],
-                    secondary_center=params[2] if len(params) > 2 else None,
-                    secondary_k=params[3] if len(params) > 3 else None,
-                    parent_state_id=None if parent is None else int(parent),
-                    epoch=int(epoch) + 1, source="tica_coverage", reason=str(reason),
-                    metadata=dict(metadata),
+                self._add_centre_on_every_rung(
+                    epoch, params, parent=parent, source="tica_coverage",
+                    reason=str(reason), metadata=dict(metadata),
                 )
             elif kind == "split":
                 # No producer emits "split" today (grep: only "add",
@@ -5979,15 +6394,20 @@ class AdaptiveProductionController:
                 # secondary_k through _clamp_secondary_k the way the other two
                 # new-state paths do -- this applier has no access to the live
                 # cv2_k_max, so the clamp cannot be enforced from here.
+                #
+                # Under a ladder the children are replicated onto every rung
+                # like any other insertion.  The RETIREMENT is deliberately
+                # left as-is (only the named parent state, not its siblings at
+                # the other rungs): the spec covers insertion only, and no
+                # producer emits "split" today, so a future producer must
+                # decide whether splitting a centre retires the whole centre.
                 _, parent, children_params, reason = action
                 self.registry.retire_state(int(parent), int(epoch) + 1, f"split: {reason}")
                 for child in children_params:
-                    self.registry.add_state(
-                        primary_center=child[0], primary_k=child[1],
-                        secondary_center=child[2] if len(child) > 2 else None,
-                        secondary_k=child[3] if len(child) > 3 else None,
-                        parent_state_id=int(parent), epoch=int(epoch) + 1,
-                        source="adaptive_production_split", reason=f"split child: {reason}",
+                    self._add_centre_on_every_rung(
+                        epoch, child, parent=int(parent),
+                        source="adaptive_production_split",
+                        reason=f"split child: {reason}",
                     )
             else:
                 raise ValueError(f"unknown adaptive-production action {kind!r}")
@@ -7185,6 +7605,20 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             except Exception as exc:
                 print(f"WARNING: adaptive-production union MBAR analysis failed: {exc}")
                 union_analysis = {"error": str(exc)}
+
+    # λ-ladder rung edges are scored in energy space, and the union NPZ (built
+    # just above) is the only place that carries the ladder-boosted reduced
+    # potentials.  The first pass of collect_final_combined_diagnostics ran
+    # BEFORE it existed, so its rung edges had no O_ij; recollect now so the
+    # gate below judges the ladder on measured overlap rather than on a
+    # missing value.  A run with no ladder gets an empty mapping and the
+    # recollect reproduces the first pass exactly.
+    if isinstance(union_inputs, dict) and not union_inputs.get("error"):
+        _rung_overlap = rung_mbar_overlap_from_union(adaptive_dir, union_inputs, registry, policy)
+        if _rung_overlap:
+            final_diag = collect_final_combined_diagnostics(
+                adaptive_dir, registry, policy=policy, rung_mbar_overlap=_rung_overlap,
+            )
 
     # Re-run the quality gate with union-analysis context now available.
     quality_gate = evaluate_adaptive_quality_gate(

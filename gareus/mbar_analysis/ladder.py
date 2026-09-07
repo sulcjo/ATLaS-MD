@@ -145,3 +145,55 @@ def apply_ladder_boost_to_u(
     meta["gamd_ladder"] = True
     meta["gamd_ladder_samples_without_raw_energies"] = n_missing
     return np.asarray(u_nk, dtype=np.float64) + float(beta) * boost_kj_nk
+
+
+def mbar_state_overlap(u_nk: np.ndarray, f_k: np.ndarray, n_k: np.ndarray) -> np.ndarray:
+    """MBAR state-overlap matrix ``O_ij`` for a solved set of states.
+
+    ``W_nk = exp(f_k - u_nk) / sum_l N_l exp(f_l - u_nl)`` (evaluated by
+    log-sum-exp, so a large ``u_nk`` cannot overflow), then
+
+        ``O_ij = sum_n N_i W_ni W_nj``.
+
+    This is the diagnostic the λ-ladder needs and a CV histogram cannot give:
+    two rungs at one umbrella centre have CV overlap ~1 *by construction*
+    whatever their boost spacing, so only the reduced potentials can say
+    whether the rungs actually share phase space.
+
+    Conventions, deliberately:
+
+    - ``O = diag(N) @ S`` with ``S`` symmetric, so ``O_ij * N_j == O_ji * N_i``
+      exactly, identical states give ``O_ij = N_i / (N_i + N_j)``, and the
+      COLUMNS sum to 1 exactly (``sum_i N_i W_ni W_nj = sum_n W_nj = 1``).
+      Rows sum to 1 only when every ``N_k`` is equal -- which is the usual
+      ladder case and the case the S3 pilot calibration was measured in.
+    - This differs from ``pymbar.MBAR.compute_overlap``, whose code
+      (``self.N_k * (W.T @ W)``) broadcasts ``N_k`` over the COLUMNS and so
+      returns ``N_j * S_ij`` despite its own docstring describing ``N_i``.
+      Do not "fix" this to match pymbar: the properties above are what the
+      rung diagnostics and their tests are written against.
+    - ``O`` is invariant under a constant shift of ``f_k`` (the shift cancels
+      between numerator and denominator), so any solver's gauge -- including
+      ``solve_mbar``'s ``f_k[0] = 0`` -- is fine.
+
+    ``u_nk`` is ``(n_samples, n_states)``, ``f_k`` and ``n_k`` are
+    ``(n_states,)``.  States with ``N_k == 0`` contribute nothing to the
+    denominator and get an all-zero row.
+    """
+    u_nk = np.asarray(u_nk, dtype=np.float64)
+    f_k = np.asarray(f_k, dtype=np.float64).reshape(-1)
+    n_k = np.asarray(n_k, dtype=np.float64).reshape(-1)
+    if u_nk.ndim != 2 or u_nk.shape[1] != f_k.size or f_k.size != n_k.size:
+        raise ValueError(
+            f"mbar_state_overlap shape mismatch: u_nk {u_nk.shape}, f_k {f_k.shape}, n_k {n_k.shape}"
+        )
+    with np.errstate(divide="ignore"):
+        log_n_k = np.where(n_k > 0.0, np.log(np.maximum(n_k, 1.0e-300)), -np.inf)
+    # log W_nk = (f_k - u_nk) - logsumexp_l(log N_l + f_l - u_nl)
+    log_num = f_k[None, :] - u_nk
+    shifted = log_n_k[None, :] + log_num
+    max_l = np.max(np.where(np.isfinite(shifted), shifted, -np.inf), axis=1, keepdims=True)
+    max_l = np.where(np.isfinite(max_l), max_l, 0.0)
+    log_denom = max_l + np.log(np.sum(np.exp(shifted - max_l), axis=1, keepdims=True))
+    w_nk = np.exp(log_num - log_denom)
+    return n_k[:, None] * (w_nk.T @ w_nk)
