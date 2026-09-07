@@ -603,7 +603,9 @@ def test_load_parquet_narrows_window_replica_dtype(tmp_path, monkeypatch):
         {"center1": 0.5, "k1": 20.0},
     ]
 
-    def fake_reconstruct_bias_matrix(cv, cv2, windows, beta):
+    # **kwargs absorbs the ladder plumbing load_parquet now passes through
+    # (v_pep/v_dih/envelope/meta) -- this double is about dtypes, not biases.
+    def fake_reconstruct_bias_matrix(cv, cv2, windows, beta, **kwargs):
         u = np.zeros((cv.size, len(windows)))
         for j, w in enumerate(windows):
             diff = cv - w["center1"]
