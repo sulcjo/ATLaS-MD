@@ -101,6 +101,75 @@ class TestMaybeRecalibrateGamdBoostGating:
         assert report["status"] == "skipped_no_matching_groups"
 
 
+class TestMaybeRecalibrateGamdBoostLadderGuard:
+    """Final-review fix wave, C4. Recalibrating the campaign-shared envelope
+    after epoch 0 overwrites Vmax/Vmin/k0/threshold for every later epoch.
+    Under a λ-ladder that is not merely an efficiency choice: MBAR applies ONE
+    envelope (load_pep_gamd_envelope) to every sample, so epoch-0 samples get
+    reweighted under epoch-1's envelope, and because k0max changes, λ stops
+    denoting the same thermodynamic state across epochs. Must no-op."""
+
+    def _ready_epoch(self, tmp_path):
+        """An epoch dir + shared envelope that WOULD recalibrate successfully,
+        so a 'skipped_lambda_ladder' can only come from the ladder guard."""
+        epoch_dir = tmp_path / "epoch_000"
+        _write_stats_file(epoch_dir / "gamd_production_envelope_stats.json", {
+            "Total": [{"group": "Total", "window": 0, "vmax": 100.0, "vmin": -200.0,
+                       "mean": -50.0, "var": 1600.0, "n": 500}],
+        })
+        shared_dir = tmp_path / "shared_gamd"
+        _write_shared_globals(shared_dir / "shared_gamd_setup_globals.json", {
+            "sigma0_Total": 6.0, "k0_Total": 0.5, "Vmax_Total": 100.0,
+            "Vmin_Total": -200.0, "threshold_energy_Total": 100.0,
+        })
+        return epoch_dir, shared_dir
+
+    def test_recalibration_runs_without_a_ladder(self, tmp_path):
+        """Control: the same fixture with no λ must NOT be skipped by the
+        ladder guard -- otherwise the guard would be vacuous."""
+        epoch_dir, shared_dir = self._ready_epoch(tmp_path)
+        report = _maybe_recalibrate_gamd_boost(
+            0, epoch_dir, _args(state_gamd_lambdas=[0.0, 0.0]), shared_dir)
+        assert report.get("status") != "skipped_lambda_ladder", report
+
+    def test_noop_when_args_state_gamd_lambdas_has_a_rung(self, tmp_path):
+        epoch_dir, shared_dir = self._ready_epoch(tmp_path)
+        report = _maybe_recalibrate_gamd_boost(
+            0, epoch_dir, _args(state_gamd_lambdas=[0.0, 0.5, 1.0]), shared_dir)
+        assert report["status"] == "skipped_lambda_ladder", report
+
+    def test_noop_when_the_state_registry_carries_a_rung(self, tmp_path):
+        """The adaptive campaign's λ lives in state_registry.csv, not
+        necessarily on args -- the guard must read it too."""
+        import csv as _csv
+        epoch_dir, shared_dir = self._ready_epoch(tmp_path)
+        with (tmp_path / "state_registry.csv").open("w", newline="") as fh:
+            w = _csv.DictWriter(fh, fieldnames=["state_id", "gamd_lambda"])
+            w.writeheader()
+            w.writerow({"state_id": 0, "gamd_lambda": 0.0})
+            w.writerow({"state_id": 1, "gamd_lambda": 1.0})
+        report = _maybe_recalibrate_gamd_boost(0, epoch_dir, _args(), shared_dir)
+        assert report["status"] == "skipped_lambda_ladder", report
+
+    def test_guard_precedes_the_stats_scan(self, tmp_path):
+        """The ladder verdict must not depend on whether epoch 0 happened to
+        write stats files -- otherwise a ladder run reports
+        'skipped_no_stats' and the real reason is invisible."""
+        epoch_dir = tmp_path / "epoch_000"
+        epoch_dir.mkdir()
+        report = _maybe_recalibrate_gamd_boost(
+            0, epoch_dir, _args(state_gamd_lambdas=[1.0]), tmp_path / "shared")
+        assert report["status"] == "skipped_lambda_ladder", report
+
+    def test_docstring_no_longer_claims_envelope_independent_reweighting(self):
+        """The docstring asserted 'Reweighting validity does not depend on
+        which envelope was active for a given frame' -- false under a ladder,
+        and the sentence that justified the whole feature."""
+        doc = _maybe_recalibrate_gamd_boost.__doc__ or ""
+        assert "does not depend on which envelope was active" not in doc
+        assert "ladder" in doc.lower()
+
+
 class TestMaybeRecalibrateGamdBoostHappyPath:
     def _window_stats_payload(self):
         # Two "workers" (baseline + a topup segment) each contribute one window's

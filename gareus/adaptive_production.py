@@ -2829,6 +2829,47 @@ def _maybe_update_tica_cvaux(epoch: int, epoch_dir: Path, adaptive_dir: Path, ar
     }
 
 
+def _active_gamd_lambda_ladder(args, epoch_dir) -> Optional[str]:
+    """Return a short description of the active λ-ladder, or None.
+
+    Two independent sources, because neither alone is complete: ``args`` holds
+    the ladder on a plain production run, while an adaptive campaign's real λ
+    per state lives in ``state_registry.csv`` (``StateRegistry.write_state_csv``)
+    next to the epoch dirs.
+    """
+    lams = getattr(args, "state_gamd_lambdas", None)
+    if lams is not None:
+        try:
+            vals = [float(x or 0.0) for x in lams]
+        except (TypeError, ValueError):
+            vals = []
+        if any(v > 0.0 for v in vals):
+            return f"args.state_gamd_lambdas has {sum(1 for v in vals if v > 0.0)} rung(s) with λ > 0"
+
+    seen: set = set()
+    for base in (Path(epoch_dir), *Path(epoch_dir).parents):
+        if base in seen:
+            continue
+        seen.add(base)
+        for name in ("state_registry.csv", "final_registry_used_for_mbar.csv"):
+            path = base / name
+            if not path.exists():
+                continue
+            try:
+                with path.open(newline="") as handle:
+                    for row in csv.DictReader(handle):
+                        raw = row.get("gamd_lambda")
+                        if raw in (None, "", "None"):
+                            continue
+                        if float(raw) > 0.0:
+                            return f"{path.name} carries a state with λ = {float(raw)}"
+            except Exception:
+                continue
+        if base.name == "adaptive_production":
+            break
+    return None
+
+
 def _maybe_recalibrate_gamd_boost(
     epoch: int,
     epoch_dir: Path,
@@ -2851,10 +2892,21 @@ def _maybe_recalibrate_gamd_boost(
     Fires at most once (only ``epoch == 0``), is a no-op if GaMD/shared-envelope
     is disabled, and degrades to a no-op (not an error) if no stats files were
     written (e.g. epoch 0 was itself resumed from a checkpoint that predates
-    this feature). Reweighting validity does not depend on which envelope was
-    active for a given frame (per-frame delta-V is recorded), so recalibrating
-    is efficiency/variance-only -- exactly like the existing shared-envelope
-    reuse policy, just recalibrated from real data instead of frozen forever.
+    this feature).
+
+    HARD NO-OP UNDER A λ-LADDER (``{"status": "skipped_lambda_ladder"}``).
+    Without a ladder, recalibrating is efficiency/variance-only: each frame's
+    own delta-V is recorded, so which envelope produced it does not change what
+    that frame reweights to. That reasoning DOES NOT survive the ladder. MBAR's
+    ladder term is recomputed post-hoc from raw channel energies under ONE
+    envelope (``mbar_analysis.ladder.load_pep_gamd_envelope`` resolves exactly
+    one ``shared_gamd_setup_globals.json`` per campaign), so overwriting it
+    after epoch 0 makes every epoch-0 sample get reweighted with epoch 1's
+    envelope. Worse, λ is defined as a fraction of ``k0max``: change k0max and
+    the same λ no longer denotes the same thermodynamic state across epochs,
+    which is the state identity every rung's ``u_nk`` column rests on. Spec
+    §3.6 and the Global Constraint "Envelope is frozen ... never recalibrate
+    mid-campaign" say the same thing. 2026-09-07 final review, C4.
     """
     if int(epoch) != 0:
         return {}
@@ -2864,6 +2916,16 @@ def _maybe_recalibrate_gamd_boost(
         return {}
     if "gamd" not in str(getattr(args, "run_mode", "") or "").lower():
         return {}
+
+    # Before the stats scan on purpose: a ladder run that happened to write no
+    # stats would otherwise report "skipped_no_stats" and hide the real reason.
+    _ladder = _active_gamd_lambda_ladder(args, epoch_dir)
+    if _ladder:
+        return {"status": "skipped_lambda_ladder", "epoch": int(epoch),
+                "reason": ("a λ-ladder is active (%s); the campaign-shared GaMD envelope is "
+                           "frozen for the whole campaign because MBAR reweights every epoch's "
+                           "samples under ONE envelope and λ is defined relative to k0max"
+                           % _ladder)}
 
     stat_files = sorted(Path(epoch_dir).rglob("gamd_production_envelope_stats.json"))
     if not stat_files:
