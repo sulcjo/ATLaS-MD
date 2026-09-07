@@ -121,8 +121,8 @@ gamd:
   gamd_multiwindow_recon_steps: 10000
   gamd_recon_boosted_iters: 2
   gamd_recon_boosted_tol: 0.05
-  # gamd-openmm requires gamd_cmd_steps, equil_steps and both recon stages to be >= and a
-  # multiple of the averaging window; 2000 does not divide 25000 or 5000 (pilot attempt 5).
+  # gamd-openmm requires gamd_cmd_steps (ntcmd) and equil_steps (nteb) to be >= and a multiple
+  # of the averaging window; 2000 does not divide 25000 (pilot attempt 5). Recon stages are free.
   gamd_averaging_window: 2500
 
 exchange:

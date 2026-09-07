@@ -846,11 +846,13 @@ def _validate_gamd_args(args: argparse.Namespace) -> None:
         )
 
 
+# Only the gamd-openmm stage-integrator CONSTRUCTOR arguments (ntcmd, nteb) are
+# constrained by ntave.  The recon stages step an integrator that already exists
+# (plain cMD, or the GaMD integrator seeded with copied globals) for an arbitrary
+# number of steps and are deliberately not listed here.
 _GAMD_STAGE_STEP_ATTRS = (
     "gamd_cmd_steps",
     "gamd_equil_steps",
-    "gamd_multiwindow_recon_cmd_steps",
-    "gamd_multiwindow_recon_steps",
 )
 
 
@@ -859,10 +861,9 @@ def validate_gamd_stage_multiples(args: argparse.Namespace) -> None:
 
     gamd-openmm's stage integrator raises ``ntcmd must be greater than and a
     multiple of ntave`` (and the same for ``nteb``) only when the integrator is
-    built -- after system build, seeding and the umbrella pull.  Every GaMD
-    stage length here (initial cMD, equilibration, and the recon cMD/boosted
-    stages that build their own integrators) must be >= the averaging window
-    and a multiple of it.  A stage of 0 steps is disabled and skipped.
+    built -- after system build, seeding and the umbrella pull.  The initial cMD
+    (ntcmd) and boosted-equilibration (nteb) lengths must be >= the averaging
+    window and a multiple of it.  A stage of 0 steps is disabled and skipped.
     """
     ntave = int(getattr(args, "gamd_averaging_window", 0) or 0)
     if ntave <= 0:
