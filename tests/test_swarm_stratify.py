@@ -104,3 +104,23 @@ def test_describe_seeds_crosschecks_library_rg_e2e_columns_and_recomputed_wins()
     d = describe_seeds(lib, [0, 1, 2, 3], [(0, 3, 1.0)], args, mismatches=mism)
     assert len(mism) == 1 and mism[0]["column"] == "rg_nm"
     assert not math.isclose(d[0].rg_nm, 0.9, abs_tol=0.05)          # recomputed value, not the CSV's
+
+
+def test_describe_seeds_reports_dropped_seeds_with_reason_and_keeps_survivors():
+    from gareus.swarm.stratify import describe_seeds
+    bad_pos = np.array([[0.0, 0, 0], [0.38, 0, 0], [0.76, 0, 0], [1.14, 0, 0]])          # only 4 atoms
+    good_pos = np.array([[0.0, 0, 0], [0.38, 0, 0], [0.76, 0, 0], [1.14, 0, 0],
+                          [1.52, 0, 0], [1.90, 0, 0]])                                    # 6 atoms
+    lib = [
+        {"pdb_path": "/x/bad.pdb", "positions_nm": bad_pos, "primary_cv_value": float("nan")},
+        {"pdb_path": "/x/good.pdb", "positions_nm": good_pos, "primary_cv_value": float("nan")},
+    ]
+    args = types.SimpleNamespace(contact_r0_a=4.5, contact_beta_a_inv=6.0, contact_normalize=True)
+    # contact pair references atom index 5: out of bounds for bad_pos (4 atoms), valid for good_pos (6 atoms)
+    dropped = []
+    d = describe_seeds(lib, [0, 1, 2, 3], [(0, 5, 1.0)], args, dropped_out=dropped)
+    assert len(d) == 1 and d[0].pdb_path == "/x/good.pdb"           # surviving seed unaffected
+    assert len(dropped) == 1
+    seed_id, reason = dropped[0]
+    assert seed_id == "seed_00000"
+    assert "Error" in reason
