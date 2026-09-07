@@ -14,6 +14,8 @@
 
 - **Ab initio exploration.** No native or folded reference structure anywhere in this plan: no RMSD-to-native, no "folded fraction", no folded seeding, no folded-state scoring. Seeds are scored on exploration + reweightability quantities only (heavy-CV1, Rg, end-to-end distance, energies). A reviewer must reject any task output that introduces a reference structure.
 - **Seeds** come from a GENPEPT seed library directory holding `final_survivor_seeds.csv` (the only file `gareus.seeding.load_genpept_conformer_library` reads; column `survivor_pdb_path`). For chignolin this is the r7 library (1,970 rows). The path is deployment-specific and is passed as `--seed-conformers-dir`; never hard-code it. Describe r7 from its own `GENPEPT_turbo_summary.json` in provenance, never from `chignolin.yaml` (spec §11).
+- **Seed library = hard prerequisite of every start (S3 pilot finding, 2026-09-07).** A contact-fraction CV1 window cannot be started from the built extended chain: two pilot attempts failed the US start-quality gate (5/5 windows bad, CV1 stuck at 0.01–0.03 vs target 0.25, even with pull k=250 and 50 000 steps × 5 ramps) because every residue pair sits beyond the contact switching distance and the pull force has ~zero gradient. Therefore: (a) every swarm member launches from a stratified seed grafted into the equilibrated box — **never** from the extended chain; a failed graft is a **failed member** (recorded, excluded from the envelope, counted by the graft gate), not a fallback to the chain; (b) the stage refuses to run without `--seed-conformers-dir` pointing at a readable `final_survivor_seeds.csv`; (c) every artefact that feeds a `windows_2d_csv` production run must carry the seed-selection path with it — `--seed-conformers-dir` (cli.py:471), `--seed-selection-mode {auto,active-cv,primary,distance}` (cli.py:473), `--seed-max-reuse-per-conformer` (cli.py:477), `--us-seed-preflight-max-score` (cli.py:478), plus the campaign pull settings chignolin_7 uses (`us_pull_steps_per_window 150000`, `us_pull_timestep_fs 3.0`, `us_pull_k 300`, `us_pull_ramp_stages 10`). The explicit-CSV production path reads seeds through `generate_us_starting_states_by_pulling(args, …)` → `graft_conformer_into_context` (seeding.py:1031, :1686), so these are run flags, not CSV columns; Task 8 writes them as a sidecar next to the windows CSV and Task 12 quotes them.
+- **Stratification descriptors come from the seed library itself.** Verified against `GENPEPT.py`: survivor rows inherit the candidate `ConformerRecord` fields, so `final_survivor_seeds.csv` carries `rg_nm`, `end_to_end_nm` (nm, not Å) and `contact_count` (a raw CA-pair **count**, not the heavy-atom contact fraction). There is **no heavy-atom contact-fraction column**; heavy-CV1 must be computed per seed with `nonlocal_contact_cv_from_positions_nm` under `contact_atom_selection: heavy`. `rg_nm`/`end_to_end_nm` are read from the CSV when present and cross-checked against the values recomputed from the seed PDB (a |Δ| > 0.05 nm on either is reported per seed and the recomputed value wins).
 - **Stratification** is on heavy-CV1 × Rg × end-to-end (E2E) cells with **equal quota per occupied cell**. Seed time is **1 ns per swarm member** (`--swarm-seed-ns`, default 1.0; the value is a user decision, expose it but do not change the default). Budget = **cells × R × seed_ns**; the member count is derived from the budget, never typed by hand. Distinct seeds first, velocity replicates only after a cell's distinct seeds are exhausted.
 - **The swarm runs unbiased**: no umbrella force, boost off, the Pep-GaMD auxiliary water-only force **present** (so `V_pep = energy0 − energy1 + energy2` is the very quantity production will boost) and excluded from integration (`make_cmd_integrator(openmm, args, unit, system=system)` does this).
 - **Frozen envelope.** The envelope is fitted once, from the first swarm round, and never recalibrated. Later rounds only add seeds and diagnostics. The envelope covers both channels: Total (= V_pep) and Dihedral (force group 2).
@@ -183,6 +185,18 @@ def test_describe_seeds_uses_contact_cv_and_ca_geometry():
     args = types.SimpleNamespace(contact_r0_a=4.5, contact_beta_a_inv=6.0, contact_normalize=True)
     d = describe_seeds(lib, [0, 1, 2, 3], [(0, 3, 1.0)], args)
     assert len(d) == 1 and d[0].cv1 < 0.05 and math.isclose(d[0].e2e_nm, 1.14, rel_tol=1e-9)
+
+
+def test_describe_seeds_crosschecks_library_rg_e2e_columns_and_recomputed_wins():
+    from gareus.swarm.stratify import describe_seeds
+    pos = np.array([[0.0, 0, 0], [0.38, 0, 0], [0.76, 0, 0], [1.14, 0, 0]])
+    lib = [{"pdb_path": "/x/a.pdb", "positions_nm": pos, "primary_cv_value": float("nan"),
+            "source_row": {"rg_nm": "0.9", "end_to_end_nm": "1.14", "contact_count": "3"}}]     # rg_nm disagrees by > 0.05 nm
+    args = types.SimpleNamespace(contact_r0_a=4.5, contact_beta_a_inv=6.0, contact_normalize=True)
+    mism = []
+    d = describe_seeds(lib, [0, 1, 2, 3], [(0, 3, 1.0)], args, mismatches=mism)
+    assert len(mism) == 1 and mism[0]["column"] == "rg_nm"
+    assert not math.isclose(d[0].rg_nm, 0.9, abs_tol=0.05)          # recomputed value, not the CSV's
 ```
 
 - [ ] **Step 2: Run to verify RED** (fallback recipe from Global Constraints, file `tests/test_swarm_stratify.py`). Expected: every test FAILs with `ModuleNotFoundError: gareus.swarm`.
@@ -222,11 +236,20 @@ def rg_and_e2e_nm(ca_positions_nm: np.ndarray) -> tuple[float, float]:
     return rg, e2e
 
 
-def describe_seeds(library: List[dict], ca_indices_in_seed: Optional[List[int]], contact_pairs, args) -> List[SeedDescriptor]:
+CSV_RG_KEY, CSV_E2E_KEY = "rg_nm", "end_to_end_nm"     # GENPEPT ConformerRecord fields inherited by final_survivor_seeds.csv
+CROSSCHECK_TOL_NM = 0.05
+
+
+def describe_seeds(library: List[dict], ca_indices_in_seed: Optional[List[int]], contact_pairs, args,
+                   mismatches: Optional[List[dict]] = None) -> List[SeedDescriptor]:
     """One descriptor per library entry; entries whose geometry cannot be evaluated are dropped.
 
-    ``ca_indices_in_seed`` are indices into ``entry["positions_nm"]`` (seed-atom numbering).
-    When None, every atom is used for Rg/E2E (backbone-only seeds).
+    heavy-CV1 is ALWAYS computed here (the library has a raw CA ``contact_count`` but no
+    heavy-atom contact-fraction column). Rg/E2E are recomputed from the seed PDB and compared
+    with the library's own ``rg_nm``/``end_to_end_nm`` when those columns exist
+    (``entry["source_row"]``); a |Δ| > CROSSCHECK_TOL_NM is appended to ``mismatches`` and the
+    recomputed value wins. ``ca_indices_in_seed`` are indices into ``entry["positions_nm"]``
+    (seed-atom numbering); None -> every atom (backbone-only seeds).
     """
     from gareus.cv import nonlocal_contact_cv_from_positions_nm
     out: List[SeedDescriptor] = []
@@ -242,6 +265,14 @@ def describe_seeds(library: List[dict], ca_indices_in_seed: Optional[List[int]],
         rg, e2e = rg_and_e2e_nm(ca)
         if not (math.isfinite(cv1) and math.isfinite(rg) and math.isfinite(e2e)):
             continue
+        src = entry.get("source_row") or {}
+        for key, mine in ((CSV_RG_KEY, rg), (CSV_E2E_KEY, e2e)):
+            try:
+                theirs = float(src.get(key, "nan"))
+            except (TypeError, ValueError):
+                theirs = float("nan")
+            if math.isfinite(theirs) and abs(theirs - mine) > CROSSCHECK_TOL_NM and mismatches is not None:
+                mismatches.append({"seed_index": i, "pdb_path": str(entry.get("pdb_path", "")), "column": key, "csv": theirs, "recomputed": mine})
         out.append(SeedDescriptor(seed_id=f"seed_{i:05d}", pdb_path=str(entry.get("pdb_path", "")), cv1=cv1, rg_nm=rg, e2e_nm=e2e))
     return out
 
@@ -834,7 +865,7 @@ def test_export_seed_bank_writes_rows_load_genpept_library_can_read():
   def run_member(args, member_row: dict, member_dir: Path, *, openmm, app, unit, topology, base_system_xml: str, equil_state, conformer: dict | None, platform, props, contact_pairs, progress=None) -> dict
   def member_done(member_dir: Path) -> bool           # done.json exists and parses
   ```
-  `run_member`: deserialise `base_system_xml` (a fresh System per member so the barostat/aux force state is clean), `ensure_pep_gamd_partition(system, solute_atom_indices(topology))`, `integrator, _ = make_cmd_integrator(openmm, args, unit, system=system)` with `args.seed` temporarily set to `member_row["velocity_seed"]`, `sim = app.Simulation(topology, system, integrator, platform, props)`, set positions/box from `equil_state`, graft `conformer` if given (fallback → record `graft_fallback=True` and continue from the equilibrated coordinates — the member still counts, but Task 7's gate reports the fallback count), `setVelocitiesToTemperature(T, velocity_seed)`, then `run_member_loop` with `step_fn = lambda n: run_steps_safely(sim, n, "swarm", member_dir, app, topology, unit, ...)`. Equilibration length `--swarm-equil-ps` (default 100 ps) is **discarded by construction** and never enters the trace; the trace covers only the `--swarm-seed-ns` production part, at `--swarm-output-interval-ps` (default 2.0). Writes `trace.csv`, `frames/frame_XXXXX.pdb` (peptide atoms only) every `--swarm-seed-frame-interval-ps` (default 20), `last_frame.pdb`, `done.json` (`{"member_id", "n_frames", "graft_fallback", "wall_s", "ns_per_day"}`).
+  `run_member`: deserialise `base_system_xml` (a fresh System per member so the barostat/aux force state is clean), `ensure_pep_gamd_partition(system, solute_atom_indices(topology))`, `integrator, _ = make_cmd_integrator(openmm, args, unit, system=system)` with `args.seed` temporarily set to `member_row["velocity_seed"]`, `sim = app.Simulation(topology, system, integrator, platform, props)`, set positions/box from `equil_state` (the box and water only — the peptide coordinates are replaced by the graft), graft `conformer` (**required**, never None in practice: `run_member` raises `ValueError("swarm member needs a seed conformer")` when it is None). If `graft_conformer_into_context` returns `{"fallback": True, ...}` the member **fails**: write `done.json` with `{"status": "graft_failed", "graft_fallback_reason": ...}`, write no trace, return — the extended-chain coordinates are never simulated (Global Constraints, seed prerequisite). Otherwise `setVelocitiesToTemperature(T, velocity_seed)`, then `run_member_loop` with `step_fn = lambda n: run_steps_safely(sim, n, "swarm", member_dir, app, topology, unit, ...)`. Equilibration length `--swarm-equil-ps` (default 100 ps) is **discarded by construction** and never enters the trace; the trace covers only the `--swarm-seed-ns` production part, at `--swarm-output-interval-ps` (default 2.0). Writes `trace.csv`, `frames/frame_XXXXX.pdb` (peptide atoms only) every `--swarm-seed-frame-interval-ps` (default 20), `last_frame.pdb`, `done.json` (`{"member_id", "n_frames", "graft_fallback", "wall_s", "ns_per_day"}`).
 
 - [ ] **Step 1: Failing tests** — the bookkeeping loop with fakes, plus the measured-row contract:
 
@@ -941,7 +972,7 @@ def run_member_loop(*, n_equil_steps: int, n_prod_steps: int, steps_per_frame: i
   def build_or_load_plan(args, out_dir, round_index, *, topology, contact_pairs) -> tuple[list[dict], dict]   # plan.csv + plan_meta.json, deterministic
   def run_swarm_stage(args, out_dir, progress=None) -> dict
   ```
-  Behaviour: `ensure_system` writes `topology.pdb` (`write_state_pdb` of the equilibrated positions, full system), `equil_state.xml` (`XmlSerializer.serialize(final_state)`), `base_system.xml` (serialised System **without** the aux force — the partition is added per member). On reload it uses `app.PDBFile(topology.pdb)` for topology and deserialises the state/system; it never re-solvates. Round 0 seeds come from `--seed-conformers-dir`; a later round (`--swarm-round N`, N ≥ 1, `--swarm-seed-source production-frames --swarm-production-seed-csv PATH`) takes rows `pdb_path,cv1,rg_nm,e2e_nm` from that CSV and stratifies them with the **same bin edges as round 0** (persist edges in `round_000/plan_meta.json`; later rounds read them — the coordinate is frozen after the first swarm, spec decision). Members whose `done.json` exists are skipped (resume). `--swarm-member-range a:b` runs a shard; the analysis (Task 8) pools whatever is done and reports missing members.
+  Behaviour: `run_swarm_stage` first resolves `args.seed_conformers_dir`; if it is unset or `<dir>/final_survivor_seeds.csv` is missing it raises `SystemExit("--swarm-stage run needs --seed-conformers-dir <GENPEPT library> (final_survivor_seeds.csv); a contact-CV start from the extended chain is not possible")` before any MD (unit-test this with a fake args object). `ensure_system` writes `topology.pdb` (`write_state_pdb` of the equilibrated positions, full system), `equil_state.xml` (`XmlSerializer.serialize(final_state)`), `base_system.xml` (serialised System **without** the aux force — the partition is added per member). On reload it uses `app.PDBFile(topology.pdb)` for topology and deserialises the state/system; it never re-solvates. Round 0 seeds come from `--seed-conformers-dir`; a later round (`--swarm-round N`, N ≥ 1, `--swarm-seed-source production-frames --swarm-production-seed-csv PATH`) takes rows `pdb_path,cv1,rg_nm,e2e_nm` from that CSV and stratifies them with the **same bin edges as round 0** (persist edges in `round_000/plan_meta.json`; later rounds read them — the coordinate is frozen after the first swarm, spec decision). Members whose `done.json` exists are skipped (resume). `--swarm-member-range a:b` runs a shard; the analysis (Task 8) pools whatever is done and reports missing members.
 
 - [ ] **Step 1: Failing tests** (bookkeeping only):
 
@@ -993,7 +1024,7 @@ def test_later_round_reuses_round0_bin_edges():
   def coverage_gate(plan_rows, done_ids: set[int], *, min_done_fraction=0.9) -> dict     # every cell has ≥1 done member; ≥ fraction of members done
   def envelope_stability_gate(traces, discard, *, sigma_rel_tol=0.10, extrema_sigma_tol=1.0) -> dict   # odd vs even member halves
   def ladder_ess_gate(ladder: dict, *, ess_floor=50) -> dict                             # no extrapolated rung
-  def graft_gate(done_summaries: list[dict], *, max_fallback_fraction=0.10) -> dict
+  def graft_gate(done_summaries: list[dict], *, max_fallback_fraction=0.10) -> dict   # fraction of members with status "graft_failed"; those members never ran (no extended-chain fallback exists)
   def evaluate_gates(...) -> dict     # {"status": "pass"|"fail", "gates": {...}, "reasons": [...]}
   def extension_plan(plan_meta: dict, gate: dict) -> dict     # {"extra_replicates_per_cell": int, "reason": str} — doubles R (cap 4×) on stability/ESS failure, +1 on coverage failure
   ```
@@ -1050,7 +1081,26 @@ def test_ladder_ess_gate_and_extension_plan():
 
 **Interfaces:**
 - Consumes: Tasks 2–4, 6, 7; `gareus.pep_gamd.PepGamdEnvelope.from_json`.
-- Produces: `analyze_swarm_stage(out_dir, args) -> dict` writing under `swarm/analysis/`: `envelope_discard.json` (per-member discard, pooled discard, frames→ps), `shared_gamd_setup/shared_gamd_setup_globals.json` (**only for round 0**; later rounds read the frozen one and add `out_of_envelope_fraction` per channel to the report), `ladder_design.json` (Task 3 output + centres + curvature + k list + `n_states = n_windows × n_rungs`), `windows_lambda_ladder.csv`, `seed_bank/`, `swarm_gate.json`, `swarm_report.json` (everything above summarised + `missing_members` + `ns_per_day` median + `budget_ns_done`). On gate `fail`, still writes every artefact, sets `report["status"]="fail"` and `report["extension"]` from `extension_plan`, and **does not** write `windows_lambda_ladder.csv` (a failed gate must not hand S2 a ladder).
+- Produces: `analyze_swarm_stage(out_dir, args) -> dict` writing under `swarm/analysis/`: `envelope_discard.json` (per-member discard, pooled discard, frames→ps), `shared_gamd_setup/shared_gamd_setup_globals.json` (**only for round 0**; later rounds read the frozen one and add `out_of_envelope_fraction` per channel to the report), `ladder_design.json` (Task 3 output + centres + curvature + k list + `n_states = n_windows × n_rungs`), `windows_lambda_ladder.csv`, **`ladder_run_args.yaml`** (the seed-selection sidecar, see below), `seed_bank/`, `swarm_gate.json`, `swarm_report.json` (everything above summarised + `missing_members` + `graft_failed_members` + `ns_per_day` median + `budget_ns_done`). Members whose `done.json` has `status == "graft_failed"` contribute nothing to the envelope, seeds or ladder and are counted for Task 7's `graft_gate`. On gate `fail`, still writes every artefact, sets `report["status"]="fail"` and `report["extension"]` from `extension_plan`, and **does not** write `windows_lambda_ladder.csv` or `ladder_run_args.yaml` (a failed gate must not hand S2 a ladder).
+- `ladder_run_args.yaml` (written with `gareus.config._write_yaml_or_json`) is the production `starting_structures` + `windows` + `gamd` fragment a `windows_2d_csv` run must consume, so the seed path travels with the CSV:
+  ```yaml
+  windows:
+    window_mode: manual
+    windows_2d_csv: <abs path>/swarm/analysis/windows_lambda_ladder.csv
+  starting_structures:
+    seed_conformers_dir: <abs path>/swarm/analysis/seed_bank      # swarm seeds (round 0) — cli.py:471
+    seed_selection_mode: active-cv                                  # cli.py:473
+    seed_max_reuse_per_conformer: 0                                 # cli.py:477
+    us_seed_preflight_max_score: 1.2                                # cli.py:478
+    us_pull_steps_per_window: 150000                                # chignolin_7 campaign values
+    us_pull_timestep_fs: 3.0
+    us_pull_k: 300.0
+    us_pull_ramp_stages: 10
+  gamd:
+    gamd_boost_type: pep-gamd-lower-dual
+    shared_gamd_setup_dir: <abs path>/swarm/analysis/shared_gamd_setup
+  ```
+  The dests above must be verified against `gareus/cli.py` (grep each `us_pull_*` dest before writing; use the real names). Test: `test_analyze_writes_ladder_run_args_sidecar_with_seed_path` asserts the YAML loads (`gareus.config._load_config_file`) and `starting_structures.seed_conformers_dir` points at the exported seed bank.
 
 - [ ] **Step 1: Failing test** with synthetic member directories:
 
@@ -1097,8 +1147,12 @@ def test_analyze_writes_every_artifact_and_passes_on_clean_data():
     rep = analyze_swarm_stage(out, _args())
     an = out / "swarm" / "analysis"
     for name in ("envelope_discard.json", "shared_gamd_setup/shared_gamd_setup_globals.json", "ladder_design.json",
-                 "windows_lambda_ladder.csv", "seed_bank/final_survivor_seeds.csv", "swarm_gate.json", "swarm_report.json"):
+                 "windows_lambda_ladder.csv", "ladder_run_args.yaml", "seed_bank/final_survivor_seeds.csv", "swarm_gate.json", "swarm_report.json"):
         assert (an / name).exists(), name
+    from gareus.config import _load_config_file
+    side = _load_config_file(an / "ladder_run_args.yaml")
+    assert side["starting_structures"]["seed_conformers_dir"] == str((an / "seed_bank").resolve())
+    assert side["starting_structures"]["seed_selection_mode"] == "active-cv" and side["gamd"]["gamd_boost_type"] == "pep-gamd-lower-dual"
     assert rep["status"] == "pass"
     env = PepGamdEnvelope.from_json(an / "shared_gamd_setup/shared_gamd_setup_globals.json")
     assert env.vmax_total > env.vmin_total
@@ -1240,7 +1294,7 @@ def test_swarm_example_config_flattens_into_swarm_dests():
     assert a.swarm_stage == "run" and a.seq == "GYDPETGTWG" and a.gamd_boost_type == "pep-gamd-lower-dual"
 ```
 
-- [ ] **Step 2: RED. Step 3: Implement** flags + dispatch + the example YAML (copy the structure of `examples/chignolin_lambda_ladder_pilot.yaml`: same `sequence/output/platform/simulation/cvs/contact_cv` blocks, `gamd: {gamd_boost_type: pep-gamd-lower-dual, sigma0p: 6.0, sigma0d: 6.0}`, a `swarm:` section with `swarm_stage: run, swarm_replicates_per_cell: 3, swarm_bins: "4,3,3", swarm_seed_ns: 1.0, swarm_equil_ps: 100, swarm_output_interval_ps: 2.0, swarm_n_windows: 16`; a header comment stating the r7 seed dir must be passed as `--seed-conformers-dir` on the command line (deployment-specific), and that budget = cells × R × 1 ns is printed at plan time). The header must also say: **no native reference is used anywhere in this stage.**
+- [ ] **Step 2: RED. Step 3: Implement** flags + dispatch + the example YAML (copy the structure of `examples/chignolin_lambda_ladder_pilot.yaml`: same `sequence/output/platform/simulation/cvs/contact_cv` blocks, `gamd: {gamd_boost_type: pep-gamd-lower-dual, sigma0p: 6.0, sigma0d: 6.0}`, a `swarm:` section with `swarm_stage: run, swarm_replicates_per_cell: 3, swarm_bins: "4,3,3", swarm_seed_ns: 1.0, swarm_equil_ps: 100, swarm_output_interval_ps: 2.0, swarm_n_windows: 16`; a `starting_structures:` section with `seed_selection_mode: active-cv`, `seed_max_reuse_per_conformer: 0`, `us_seed_preflight_max_score: 1.2` and **no** `seed_conformers_dir` value (the header comment states the r7 seed dir is deployment-specific and must be passed as `--seed-conformers-dir` on the command line; the stage refuses to start without it, and a contact-CV start from the extended chain is impossible — S3 pilot finding 2026-09-07); the header also states that budget = cells × R × 1 ns is printed at plan time. The header must also say: **no native reference is used anywhere in this stage.**
 - [ ] **Step 4: GREEN. Step 5: Commit** — `feat(swarm): --swarm-stage run|analyze|compare, swarm flags, public --shared-gamd-setup-dir, chignolin example`.
 
 ---
@@ -1305,7 +1359,7 @@ def test_tiny_real_swarm_two_members_produce_traces_and_envelope():
   1. `gareus --config examples/chignolin_swarm_stage.yaml --seed-conformers-dir <r7 dir> --out <run>/` (round 0; print of `n_cells, R, n_members, budget_ns`).
   2. `… --swarm-stage analyze` → read `swarm_report.json`; on `fail`, `… --swarm-stage run --swarm-replicates-per-cell <R + extra>` then analyze again (extension loop, confined to S1).
   3. `… --swarm-stage compare --swarm-pilot-globals <S3 pilot>/shared_gamd_setup_globals.json` → `freeze_allowed` must be true.
-  4. Production: `gareus --config <campaign>.yaml --windows-2d-csv <run>/swarm/analysis/windows_lambda_ladder.csv --seed-conformers-dir <run>/swarm/analysis/seed_bank --shared-gamd-setup-dir <run>/swarm/analysis/shared_gamd_setup` with `gamd_boost_type: pep-gamd-lower-dual`, `exchange_mode: gibbs-walk`.
+  4. Production: `gareus --config <campaign>.yaml --config <run>/swarm/analysis/ladder_run_args.yaml` (or the equivalent flags: `--windows-2d-csv <run>/swarm/analysis/windows_lambda_ladder.csv --seed-conformers-dir <run>/swarm/analysis/seed_bank --seed-selection-mode active-cv --us-seed-preflight-max-score 1.2 --shared-gamd-setup-dir <run>/swarm/analysis/shared_gamd_setup` plus the chignolin_7 pull settings) with `gamd_boost_type: pep-gamd-lower-dual`, `exchange_mode: gibbs-walk`. State in the doc that **every window start goes through the seed graft + pull** (cli.py:471/473/477/478) — a `windows_2d_csv` run without `--seed-conformers-dir` will fail the US start-quality gate on every contact window (S3 pilot, 2026-09-07). If `--config` cannot be repeated, merge the sidecar into the campaign YAML by hand and say so.
   5. Later rounds for S5 re-seeding: `--swarm-round 1 --swarm-seed-source production-frames --swarm-production-seed-csv <frames.csv>`; the envelope is **not** refitted.
   State explicitly which spec numbers each output replaces (§3.5 M and spacing ← `ladder_design.json`; §12 items 1–3 ← `ladder_design.json`, `plan_meta.json`, `envelope_discard.json`).
 - [ ] Commit — `docs(swarm): hand-off command sequence from swarm outputs to the ladder campaign`.
@@ -1319,6 +1373,8 @@ def test_tiny_real_swarm_two_members_produce_traces_and_envelope():
 **Placeholders.** Task 11's slow test has one `...` that the step text fills in explicitly (two `build_peptide_pdb` calls + a two-row CSV). Task 5's third test names a fixture helper to grep for and says what to do if it is absent. No TBD/TODO.
 
 **Type consistency.** `SeedDescriptor(seed_id, pdb_path, cv1, rg_nm, e2e_nm)` used identically in Tasks 1, 6. `plan_members` row keys match `plan.csv` header in Task 6/8. `TRACE_COLUMNS` from Task 5 is the header Task 8's fake writes. `pool_member_envelopes(traces, discard)` takes `{member_id: {"v_pep_kj","v_dih_kj"}}` in Tasks 2, 7, 8. `design_lambda_ladder` return keys (`lambdas, sigma_kj_per_rung, ess_per_rung, extrapolated_from_rung`) are the ones Task 7's `ladder_ess_gate` reads. `write_ladder_windows_csv(path, centers, ks_kcal, lambdas)` header equals the one `load_explicit_2d_window_csv` parses (verified in Task 3's test). Envelope JSON keys match `PepGamdEnvelope.from_integrator_globals` (`Vmax_Total … k0_Dihedral`) and `load_reusable_shared_gamd_setup` (`all_globals`, `interesting_globals`).
+
+**Seed prerequisite (coordinator constraint, S3 pilot 2026-09-07).** No task starts MD from the extended chain: Task 5 fails the member on graft fallback, Task 6 refuses to run without the library, Task 7 gates the failure fraction, Task 8 excludes failed members and ships `ladder_run_args.yaml` with the seed flags, Tasks 10/12 carry them into the example config and the hand-off. Descriptors: heavy-CV1 computed (no fraction column exists in the library — verified in `GENPEPT.py`), `rg_nm`/`end_to_end_nm` read and cross-checked (Task 1).
 
 **Spec gaps the plan could not resolve (left as open items, not guessed):**
 1. Production's application of a physics-only `all_globals` dict (Task 2 Step 4 verifies and, if needed, patches) — the spec assumes the envelope "is copied to every replica" without saying which keys.
