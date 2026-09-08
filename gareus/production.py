@@ -1597,12 +1597,16 @@ def production_run_mode(args) -> str:
 
 
 from .pep_gamd import (
+    aux_force_groups_present as _pep_gamd_aux_groups_present,
     boost_target_energy_kj,
     build_pep_gamd_integrator,
     find_aux_force as _find_pep_gamd_aux_force,
     is_pep_gamd,
+    pep_gamd_variant,
+    peptide_internal_energy_kj,
     ladder_supports_boost_type,
     k0max_from_globals,
+    LADDER_BOOST_TYPES,
     pep_gamd_boost_matrix_kj,
     peptide_essential_energy_kj,
     physical_energy_groups_for_args,
@@ -1636,8 +1640,15 @@ def assemble_bias_matrices(distance_bias_kcal, ss_bias_kcal, boost_bias_kj):
     return bias_kcal, bias_kj
 
 
-def _fetch_v_pep_v_dih(ctx, pep_env, unit) -> tuple[float, float]:
-    """Read (V_pep, V_dih) in kJ/mol for the Pep-GaMD boost from a live Context.
+def _fetch_v_pep_v_dih(ctx, pep_env, unit, args=None) -> tuple[float, float]:
+    """Read (V_total, V_dih) in kJ/mol for the Pep-GaMD boost from a live Context.
+
+    The Total channel depends on the Pep-GaMD variant selected by
+    ``--gamd-boost-type``: ``pep-gamd-lower-dual`` boosts the peptide ESSENTIAL
+    energy ``E0 - E1 + E2`` (peptide-water included), ``pep-gamd-internal-lower-dual``
+    the peptide-INTERNAL energy ``E3 + E2`` (no peptide-water term at all). Both are
+    stored in the same ``v_pep_kj_mol`` sample column; ``run_manifest.method_settings``
+    records ``pep_gamd_variant`` so the analysis knows which one it is reading.
 
     Returns ``(nan, nan)`` without touching the Context when ``pep_env`` is
     None (the λ-ladder is not active), matching every call site's prior
@@ -1654,6 +1665,10 @@ def _fetch_v_pep_v_dih(ctx, pep_env, unit) -> tuple[float, float]:
     if not getattr(pep_env, "has_total", True):
         # single dihedral boost: no Total channel, no auxiliary force to read
         return float("nan"), v_dih
+    if args is not None and pep_gamd_variant(args) == "internal":
+        # E3 + E2 in ONE getState read: the internal variant is cheaper than the
+        # essential one, which needs two (physical groups, then the auxiliary group).
+        return peptide_internal_energy_kj(ctx, unit), v_dih
     v_pep = peptide_essential_energy_kj(ctx, unit)
     return v_pep, v_dih
 
@@ -1666,8 +1681,9 @@ def gamd_enabled(args) -> bool:
 def make_cmd_integrator(openmm, args, unit, system=None):
     """Create a plain conventional-MD LangevinMiddleIntegrator.
 
-    A plain integrator applies every force group, so if `system` carries the Pep-GaMD
-    auxiliary water-only force it must be excluded here or water-water is counted twice.
+    A plain integrator applies every force group, so every Pep-GaMD auxiliary force
+    `system` carries (water-only in group 1, peptide-only in group 3) must be excluded
+    here or its energy is counted twice.
     """
     integrator = openmm.LangevinMiddleIntegrator(
         float(args.temperature_k) * unit.kelvin,
@@ -1678,8 +1694,9 @@ def make_cmd_integrator(openmm, args, unit, system=None):
         integrator.setRandomNumberSeed(int(args.seed))
     except Exception:
         pass
-    if system is not None and _find_pep_gamd_aux_force(system)[1] is not None:
-        integrator.setIntegrationForceGroups(set(range(32)) - {_PEP_GAMD_AUX_GROUP})
+    aux_groups = _pep_gamd_aux_groups_present(system) if system is not None else set()
+    if aux_groups:
+        integrator.setIntegrationForceGroups(set(range(32)) - aux_groups)
     return integrator, {
         "mode": production_run_mode(args),
         "description": "Conventional HMR Langevin MD production integrator; gamd-openmm disabled." if production_run_mode(args) == "hmr-cmd" else "Conventional Langevin MD production integrator; gamd-openmm disabled.",
@@ -5652,7 +5669,9 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         raise ValueError(f"state_gamd_lambdas has {state_lambdas.size} entries for {nrep} states")
     ladder_active = bool(np.any(state_lambdas > 0.0))
     if ladder_active and not ladder_supports_boost_type(args):
-        raise ValueError("a gamd_lambda ladder requires --gamd-boost-type pep-gamd-lower-dual or lower-dihedral")
+        raise ValueError(
+                "a gamd_lambda ladder requires --gamd-boost-type "
+                f"{' or '.join(sorted(LADDER_BOOST_TYPES))}")
 
     # Resolve per-replica CPU threads now that nrep is known.
     # --cpu-budget distributes total cores evenly; --max-cpu-per-replica caps the result.
@@ -5796,7 +5815,9 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 raise ValueError(f"state_gamd_lambdas has {state_lambdas.size} entries for {nrep} states after US auto-drop")
             ladder_active = bool(np.any(state_lambdas > 0.0))
             if ladder_active and not ladder_supports_boost_type(args):
-                raise ValueError("a gamd_lambda ladder requires --gamd-boost-type pep-gamd-lower-dual or lower-dihedral")
+                raise ValueError(
+                    "a gamd_lambda ladder requires --gamd-boost-type "
+                    f"{' or '.join(sorted(LADDER_BOOST_TYPES))}")
 
         if use_gamd:
             reusable_gamd = load_reusable_shared_gamd_setup(args, out_dir)
@@ -6505,13 +6526,13 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                         pe = float(state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole))
                     else:
                         pe = float("nan")
-                    v_pep, v_dih = _fetch_v_pep_v_dih(ctx, pep_env, unit)
+                    v_pep, v_dih = _fetch_v_pep_v_dih(ctx, pep_env, unit, args)
                     return r, cv, ss, pe, v_pep, v_dih
                 cv, ss, pe = primary_secondary_and_potential_from_state(
                     sim.context, primary_cv_def, args, unit, secondary_cv_metadata,
                     read_potential_energy=read_sample_potential,
                 )
-                v_pep, v_dih = _fetch_v_pep_v_dih(sim.context, pep_env, unit)
+                v_pep, v_dih = _fetch_v_pep_v_dih(sim.context, pep_env, unit, args)
                 return r, cv, ss, pe, v_pep, v_dih
 
             for r, cv, ss, pe, v_pep, v_dih in _sim_pool.map(_fetch_state, enumerate(sims)):
@@ -6886,13 +6907,13 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                         _ss_scalar_from_sub_cv_values(sf.getCollectiveVariableValues(ctx), secondary_cv_metadata)
                         if sf is not None and _ss_enabled else float("nan")
                     )
-                    v_pep, v_dih = _fetch_v_pep_v_dih(ctx, pep_env, unit)
+                    v_pep, v_dih = _fetch_v_pep_v_dih(ctx, pep_env, unit, args)
                 else:
                     state = sim.context.getState(getPositions=True, enforcePeriodicBox=True)
                     pos = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
                     cv = primary_cv_value_from_positions_nm(pos, primary_cv_def, args)
                     ss = secondary_structure_score_from_positions_nm(pos, secondary_cv_metadata) if _ss_enabled else float("nan")
-                    v_pep, v_dih = _fetch_v_pep_v_dih(sim.context, pep_env, unit)
+                    v_pep, v_dih = _fetch_v_pep_v_dih(sim.context, pep_env, unit, args)
                 return r, cv, ss, v_pep, v_dih
 
             for r, cv, ss, v_pep, v_dih in _sim_pool.map(_fetch_exchange_state, enumerate(sims)):

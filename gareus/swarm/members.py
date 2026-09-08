@@ -23,6 +23,7 @@ import numpy as np
 from gareus.pep_gamd import (
     DIHEDRAL_GROUP,
     ensure_pep_gamd_partition,
+    pep_gamd_variant,
     peptide_essential_energy_kj,
     physical_potential_energy_kj,
 )
@@ -234,6 +235,18 @@ def run_member(
 
     system = openmm.XmlSerializer.deserialize(base_system_xml)  # fresh System per member
     peptide_atoms = solute_atom_indices(topology)
+    # The swarm builds the water-only partition and traces v_pep = E0 - E1 + E2. The
+    # peptide-internal variant boosts a different energy (E3 + E2) on a different scale,
+    # so an envelope fitted here would be silently wrong for it. Refuse rather than
+    # produce one; supporting the internal variant in the swarm is separate work.
+    if pep_gamd_variant(args) == "internal":
+        raise ValueError(
+            "the unbiased swarm stage only fits the peptide-ESSENTIAL Pep-GaMD envelope "
+            "(V_pep = E0 - E1 + E2); --gamd-boost-type "
+            f"{getattr(args, 'gamd_boost_type', '')} boosts V_int = E3 + E2, which needs "
+            "its own envelope. Run the swarm with pep-gamd-lower-dual, or calibrate the "
+            "internal envelope outside the swarm stage."
+        )
     ensure_pep_gamd_partition(system, peptide_atoms)
 
     velocity_seed = int(member_row["velocity_seed"])

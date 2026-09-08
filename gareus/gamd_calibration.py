@@ -157,9 +157,13 @@ def upper_bound_threshold_and_k0(envelope: PooledEnvelope, sigma0: float) -> Thr
 def threshold_and_k0(boost_type: str, envelope: PooledEnvelope, sigma0: float) -> ThresholdResult:
     """Dispatch to the lower- or upper-bound formula by --gamd-boost-type prefix."""
     normalized = str(boost_type or "").strip().lower()
-    from .pep_gamd import PEP_GAMD_PREFIX
+    from .pep_gamd import PEP_GAMD_INTERNAL_INFIX, PEP_GAMD_PREFIX
     if normalized.startswith(PEP_GAMD_PREFIX):
         normalized = normalized[len(PEP_GAMD_PREFIX):]
+        # "internal-lower-dual" -> "lower-dual": the variant changes WHICH energy is
+        # boosted, never the threshold rule, so both resolve to the lower-bound formula.
+        if normalized.startswith(PEP_GAMD_INTERNAL_INFIX):
+            normalized = normalized[len(PEP_GAMD_INTERNAL_INFIX):]
     if normalized.startswith("lower"):
         return lower_bound_threshold_and_k0(envelope, sigma0)
     if normalized.startswith("upper"):
