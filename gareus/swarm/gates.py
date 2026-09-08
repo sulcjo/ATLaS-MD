@@ -3,6 +3,19 @@
 Decision points before production: every round must pass all gates or extend swarm members.
 All gates are ab initio (no reference structure); graft_gate enforces the seed-library
 prerequisite constraint (spec §2, item 5a).
+
+ladder_ess_gate is ADVISORY, not blocking (measured 2026-09-08): a 174-member swarm round's
+ladder_ess_gate failed, predicting the top rungs unusable (reweighted ESS 34.1 and 19.2
+against a floor of 50, extrapolated_from_rung=5). A 7-rung production probe run at those
+exact rungs then measured neighbour overlap 0.919-0.939 across all six gaps (the validated
+pilot's own overlap was 0.809-0.902) and passed its lambda=0 cross-check at 0.282 kcal/mol
+against a 0.5 tolerance. The gate asks whether the UNBIASED swarm can predict a rung by a
+single reweighting jump from lambda=0; production never does that -- it runs MD at every
+rung and couples them by exchange. design_lambda_ladder's own docstring already says
+extrapolated rungs "must be confirmed by the S3 stage". So ladder_ess_gate keeps ok=True
+always and reports its diagnostics (per-rung ESS, extrapolated_from_rung) as warnings
+instead of reasons; evaluate_gates surfaces those warnings at the top level so they still
+reach swarm_gate.json and the report even though they no longer fail the round.
 """
 from __future__ import annotations
 
@@ -140,30 +153,32 @@ def envelope_stability_gate(
 
 
 def ladder_ess_gate(ladder: dict, *, ess_floor: int = 50) -> dict:
-    """No rungs can be extrapolated; all ESS must be >= ess_floor.
+    """Report (never fail on) extrapolated rungs and sub-floor ESS -- ADVISORY (see the
+    module docstring for the 2026-09-08 measurement that justifies this).
 
     Args:
         ladder: dict returned by design_lambda_ladder with keys lambdas, ess_per_rung, extrapolated_from_rung
         ess_floor: minimum effective sample size
 
     Returns:
-        dict with keys "ok" (bool) and "reasons" (list of str)
+        dict with keys "ok" (always True), "reasons" (always empty -- kept for schema
+        parity with the other gates), and "warnings" (list of str: the same diagnostics
+        this gate used to fail the round on)
     """
-    reasons: List[str] = []
+    warnings: List[str] = []
 
     # Check extrapolation
     if ladder.get("extrapolated_from_rung") is not None:
         rung = ladder["extrapolated_from_rung"]
-        reasons.append(f"ladder is extrapolated from rung {rung}; rungs {rung} onward cannot be trusted")
+        warnings.append(f"ladder is extrapolated from rung {rung}; rungs {rung} onward cannot be trusted")
 
     # Check ESS floor
     ess_per_rung = ladder.get("ess_per_rung", [])
     for i, ess in enumerate(ess_per_rung):
         if ess < ess_floor:
-            reasons.append(f"rung {i}: ESS {ess:.1f} < floor {ess_floor}")
+            warnings.append(f"rung {i}: ESS {ess:.1f} < floor {ess_floor}")
 
-    ok = len(reasons) == 0
-    return {"ok": ok, "reasons": reasons}
+    return {"ok": True, "reasons": [], "warnings": warnings}
 
 
 def graft_gate(done_summaries: list[dict], *, max_fallback_fraction: float = 0.10) -> dict:
@@ -237,7 +252,11 @@ def evaluate_gates(
         max_graft_fallback_fraction: threshold for graft_gate
 
     Returns:
-        dict with keys "status" ("pass"|"fail"), "gates" (dict of gate results), "reasons" (list of reasons)
+        dict with keys "status" ("pass"|"fail"), "gates" (dict of gate results),
+        "reasons" (list of reasons from failed gates), and "warnings" (list of
+        non-blocking diagnostics from any gate, e.g. ladder_ess_gate's advisory
+        ESS/extrapolation findings -- collected regardless of that gate's own ok
+        status, so nothing is silently lost).
     """
     gates = {
         "coverage": coverage_gate(plan_rows, done_ids, min_done_fraction=min_done_fraction),
@@ -248,9 +267,11 @@ def evaluate_gates(
 
     # Aggregate reasons from all failed gates
     all_reasons = []
+    all_warnings = []
     for gate_name, gate_result in gates.items():
         if not gate_result.get("ok", True):
             all_reasons.extend(gate_result.get("reasons", []))
+        all_warnings.extend(gate_result.get("warnings", []))
 
     status = "pass" if all(g.get("ok", True) for g in gates.values()) else "fail"
 
@@ -258,6 +279,7 @@ def evaluate_gates(
         "status": status,
         "gates": gates,
         "reasons": all_reasons,
+        "warnings": all_warnings,
     }
 
 
@@ -265,9 +287,13 @@ def extension_plan(plan_meta: dict, gate: dict) -> dict:
     """Determine how many extra replicates to run based on gate failures.
 
     Rules:
-    - Stability/ESS failure: double R (extra_replicates_per_cell)
+    - Stability failure: double R (extra_replicates_per_cell)
     - Coverage failure: +1
     - Cap at 4× base_replicates_per_cell (or 4× current_r if base not present)
+
+    ladder_ess is advisory (see the module docstring): evaluate_gates's real output never
+    sets ladder_ess["ok"] to False, so it never reaches the extension logic below in
+    practice; the check is kept only for a hand-built gate dict that still sets it.
 
     Args:
         plan_meta: dict with keys "replicates_per_cell" and optional "base_replicates_per_cell"

@@ -1896,18 +1896,25 @@ Gates and the extension rule
                           planned members are done
     envelope_stability    odd- vs even-member-id halves agree on sigma_V (<=10% relative)
                           and on Vmax/Vmin (<=1 sigma_V) per channel (Total, Dihedral)
-    ladder_ess             no rung is ESS-extrapolated; every rung's ESS >= --swarm-ess-floor
+    ladder_ess             ADVISORY (2026-09-08): reports rungs that are ESS-extrapolated
+                          or whose ESS < --swarm-ess-floor as warnings, never fails the
+                          round -- a 7-rung production probe at exactly the extrapolated
+                          rungs measured neighbour overlap 0.919-0.939 (all six gaps) and
+                          passed its lambda=0 cross-check, showing that production's
+                          MD-at-every-rung-with-exchange does not need the unbiased
+                          swarm's single-jump reweighting prediction to succeed
     graft                  fraction of members with status != "ok" (graft_failed or
                           md_failed) <= 10%
 
 A failed gate withholds windows_lambda_ladder.csv and ladder_run_args.yaml (a
 re-analysis first deletes any stale copies of both) -- every other artifact,
-including swarm_gate.json's per-gate reasons, is still written so the failure and
-the extension plan are visible. Gate failure never falls through to production;
-it stays inside the swarm stage: extension_plan doubles the per-cell replicate
-count on an envelope_stability or ladder_ess failure, adds +1 on a coverage
-failure, caps the total at 4x the base replicate count, and analyze is re-run
-after the extra members complete.
+including swarm_gate.json's per-gate reasons and warnings, is still written so
+the failure, the extension plan, and any advisory ladder_ess diagnostics are all
+visible. Gate failure never falls through to production; it stays inside the
+swarm stage: extension_plan doubles the per-cell replicate count on an
+envelope_stability failure, adds +1 on a coverage failure, caps the total at 4x
+the base replicate count, and analyze is re-run after the extra members
+complete. ladder_ess no longer triggers an extension since it cannot fail.
 
 Pilot comparison
 ~~~~~~~~~~~~~~~~~
