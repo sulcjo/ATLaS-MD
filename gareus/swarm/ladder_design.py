@@ -154,6 +154,12 @@ def n_resolvable_windows(coverage_range: float, temperature_k: float, *,
     return int(math.floor(float(coverage_range) / (float(overlap_sigma) * sigma_w_min)))
 
 
+# Upper-bound probing walks DOWN the observed seed values. A real swarm pools tens of
+# thousands of frames, so probing every unique value is O(n_seeds^2) work for a bound that
+# a few hundred evenly-spaced observed candidates locate just as well.
+MAX_UPPER_BOUND_PROBES = 256
+
+
 def probe_centre_seed_support(centres, seed_cv1) -> np.ndarray:
     """|cv1_seed - centre| of the nearest available seed, one entry per centre."""
     c = np.asarray(centres, dtype=float)
@@ -211,6 +217,11 @@ def autotune_cv1_upper_bound(cv1, seed_cv1, *, n_windows: int, lo_q: float = 0.0
         }
 
     candidates = sorted({float(x) for x in seeds if lo < x <= hi_initial}, reverse=True)
+    if len(candidates) > MAX_UPPER_BOUND_PROBES:
+        # Subsample the OBSERVED values (never a synthetic grid): evenly spaced indices keep
+        # the walk descending and bounded, and always retain the highest candidate.
+        idx = np.unique(np.linspace(0, len(candidates) - 1, MAX_UPPER_BOUND_PROBES).astype(int))
+        candidates = [candidates[i] for i in idx]
     for candidate_hi in candidates:
         centres, gaps = _probe(candidate_hi)
         n_probes += 1

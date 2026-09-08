@@ -282,12 +282,16 @@ def analyze_swarm_stage(out_dir, args) -> dict:
         max_seed_gap_sigma = float(getattr(args, "swarm_max_seed_gap_sigma", 0.5))
         n_win = min(int(args.swarm_n_windows), n_resolvable_windows(coverage_range, temperature_k, k_max_kcal=k_max, overlap_sigma=overlap_sigma))
         probe_out: Dict[str, Any] = {}
+        # The probe pool is the EXPORTED frames (those with a written PDB) past the discard --
+        # exactly what select_window_seed_frames draws from below. The trace is ~10x denser
+        # (every trace row vs one PDB per swarm_seed_frame_interval_ps), so probing the trace
+        # would "support" a centre with a frame no window could ever start from.
+        seed_pool_cv1 = np.asarray(
+            [float(fr["cv1"]) for fr in frame_candidates if int(fr["frame"]) >= discard], dtype=float
+        )
         try:
-            # seed_cv1=cv1_all: the post-discard pooled swarm frames ARE the seed-bank
-            # candidate pool select_window_seed_frames draws from below, so the probe
-            # checks centres against the pool that will actually start the windows.
             centers = cv1_centers_from_samples(
-                cv1_all, n_windows=n_win, seed_cv1=cv1_all, temperature_k=temperature_k,
+                cv1_all, n_windows=n_win, seed_cv1=seed_pool_cv1, temperature_k=temperature_k,
                 k_max_kcal=k_max, max_seed_gap_sigma=max_seed_gap_sigma, probe_out=probe_out,
             )
         except ValueError as exc:
@@ -299,7 +303,7 @@ def analyze_swarm_stage(out_dir, args) -> dict:
             report.update({
                 "status": "fail", "reasons": [f"ladder design: {exc}"],
                 "envelope": _envelope_summary(env, an / "shared_gamd_setup"),
-                "ladder_design": {"library_q99": library_q99},
+                "ladder_design": {"library_q99": library_q99, "n_seed_pool": int(seed_pool_cv1.size)},
             })
             _withhold_ladder_artifacts(an)
             write_json(an / "swarm_report.json", report)
@@ -322,7 +326,7 @@ def analyze_swarm_stage(out_dir, args) -> dict:
             "autotuned": bool(probe_out.get("autotuned")),
             "hi": float(probe_out["hi"]), "hi_initial": float(probe_out["hi_initial"]),
             "tol": float(probe_out["tol"]), "max_nearest_seed_gap": max_nearest_seed_gap,
-            "n_probes": int(probe_out.get("n_probes", 0)),
+            "n_probes": int(probe_out.get("n_probes", 0)), "n_seed_pool": int(seed_pool_cv1.size),
         }
         ladder_design = dict(ladder)
         ladder_design.update({

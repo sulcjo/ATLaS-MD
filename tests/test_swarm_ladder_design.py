@@ -227,3 +227,30 @@ def test_windows_csv_is_full_cross_product_and_loads_with_core_reader():
     assert len(rows) == 9 and rows[0].keys() >= {"window", "primary_cv_mode", "primary_cv_center", "primary_cv_k_kcal", "gamd_lambda"}
     centers, ks, _sc, _sk, meta, *_ = load_explicit_2d_window_csv(_args(), p)
     assert len(centers) == 9 and sorted(set(meta["gamd_lambdas"])) == [0.0, 0.5, 1.0]
+
+
+def test_upper_bound_probe_count_is_bounded_on_a_dense_seed_pool():
+    """The walk down observed seed values must not scale with the pool size: a dense pool
+    whose top is unsupported used to probe once per unique seed value (22k+ on a real run)."""
+    from gareus.swarm.ladder_design import autotune_cv1_upper_bound, MAX_UPPER_BOUND_PROBES
+    rng = np.random.default_rng(0)
+    # Dense support up to 0.30, then a bare gap to a lone outlier that drags hi above it.
+    seeds = np.concatenate([rng.uniform(0.0, 0.30, 20000), np.array([0.90])])
+    cv1 = np.concatenate([seeds, np.full(400, 0.95)])  # q99.5 lands in the empty band
+    out = autotune_cv1_upper_bound(cv1, seeds, n_windows=8, temperature_k=300.0,
+                                   k_max_kcal=1200.0, max_seed_gap_sigma=0.05)
+    assert out["autotuned"] is True
+    assert out["hi"] < out["hi_initial"]
+    assert out["n_probes"] <= MAX_UPPER_BOUND_PROBES + 1
+    assert float(np.max(out["nearest_seed_gap"])) <= out["tol"]
+
+
+def test_upper_bound_candidates_are_still_observed_seed_values():
+    """Bounding the probe count must subsample the observed seeds, never invent a grid."""
+    from gareus.swarm.ladder_design import autotune_cv1_upper_bound
+    seeds = np.concatenate([np.linspace(0.0, 0.20, 500), np.array([0.80])])
+    cv1 = np.concatenate([seeds, np.full(50, 0.85)])
+    out = autotune_cv1_upper_bound(cv1, seeds, n_windows=4, temperature_k=300.0,
+                                   k_max_kcal=1200.0, max_seed_gap_sigma=0.05)
+    assert out["autotuned"] is True
+    assert np.min(np.abs(seeds - out["hi"])) < 1e-12

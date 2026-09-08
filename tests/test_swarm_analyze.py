@@ -186,3 +186,22 @@ def test_analyze_round1_reuses_frozen_envelope_and_ladder_and_reports_out_of_env
     assert "out_of_envelope_fraction" in rep1
     assert rep1["out_of_envelope_fraction"]["Total"] is not None
     assert rep1["out_of_envelope_fraction"]["Dihedral"] is not None
+
+
+def test_probe_pool_is_the_exported_frame_set_not_every_trace_row():
+    """Only frames with a written PDB can seed a window (select_window_seed_frames draws from
+    frame_candidates), so the upper-bound probe must be measured against that pool, not the
+    10x denser trace."""
+    from gareus.swarm.analyze import analyze_swarm_stage
+    from gareus.pep_gamd import PepGamdEnvelope
+    out = pathlib.Path(tempfile.mkdtemp())
+    rd = _fake_round(out)
+    n_exported = 0
+    for md in sorted((rd).glob("member_*")):
+        n_exported += len(list((md / "frames").glob("*.pdb")))
+    args = _args()
+    res = analyze_swarm_stage(out, args)
+    probe = res.get("ladder_design", {})
+    assert "n_seed_pool" in probe, "the probe must report the pool it measured"
+    # Post-discard subset of the exported PDB frames, never the full trace.
+    assert 0 < probe["n_seed_pool"] <= n_exported
