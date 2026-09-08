@@ -298,10 +298,16 @@ def _method_settings(args: Any) -> dict[str, Any]:
     # state_gamd_lambdas back from when args.state_gamd_lambdas does not
     # survive the restart.
     try:
-        from .pep_gamd import is_pep_gamd
-        _pep_gamd = bool(is_pep_gamd(args))
+        from .pep_gamd import pep_gamd_variant
+        _variant = pep_gamd_variant(args)
     except Exception:
-        _pep_gamd = False
+        _variant = None
+    _pep_gamd = _variant is not None
+    # Which energy the v_pep_kj_mol sample column holds: "essential" =
+    # E0 - E1 + E2 (peptide-water included), "internal" = E3 + E2 (peptide-internal
+    # nonbonded + dihedrals only). None on every non-Pep-GaMD run. The two are
+    # different energy scales, so an envelope fitted for one is NOT valid for the other.
+    settings["pep_gamd_variant"] = _variant
     # Records the adaptive-production campaign-export convention only;
     # gareus.mbar_analysis.ladder.load_pep_gamd_envelope(run_dir) also accepts
     # the bare single-run filename ("shared_gamd_setup_globals.json" directly

@@ -724,13 +724,38 @@ Invariants the code enforces:
       (added inside make_gamd_integrator); a plain Langevin integrator built for
       such a System excludes group 1 via setIntegrationForceGroups, otherwise
       water-water would be counted twice;
-    * any Custom* force parked in groups 0..2 is rejected at build time;
+    * any Custom* force parked in groups 0..3 is rejected at build time;
     * recorded potential energies exclude group 1 (it is a measuring instrument,
       not physics), and recon/recalibration measure the Total channel by the
       integrator's own definition.
 
 The stored gamd_boost_total_kj_mol column is then the peptide boost, not a
 system-total boost; provenance records the boost type.
+
+Peptide-internal variant (--gamd-boost-type pep-gamd-internal-lower-dual)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+``pep-gamd-internal-lower-dual`` boosts only what the peptide feels from itself
+-- the peptide-internal nonbonded energy plus the peptide dihedrals,
+``V_int = energy3 + energy2`` -- measured by a peptide-only auxiliary
+NonbondedForce (every NON-peptide charge/epsilon zeroed, same pinned PME
+parameters) in force group 3; the water-only force of group 1 is not built at
+all. The applied force is
+
+    f_applied = (f - f3)*1 + f3*FSF_Total + f2*(FSF_Total*FSF_Dihedral - 1)
+
+with ``f`` the physical force over every integrated group (0, 2, 29, 31; never 1
+or 3), so at unit scaling factors it collapses exactly onto conventional MD.
+
+Why it exists: the boosted channel contains no peptide-water term, so no value of
+k0 can scale down the forces holding the solvent off the peptide -- the collapse
+mode that made k0 = 1 unstable for ``pep-gamd-lower-dual`` at 4 fs with HMR
+cannot occur, and the boost strength is limited by sampling, not by stability.
+What it does NOT accelerate: desolvation barriers (no peptide-water term is
+boosted) and peptide bond/angle terms (they stay in the unboosted group 0), so
+V_int is a smaller, differently-scaled energy than V_pep and needs its own
+envelope -- an envelope calibrated for one variant is not valid for the other.
+The stored v_pep_kj_mol column holds V_int on such a run; provenance records
+``pep_gamd_variant`` ("essential" or "internal") so the analysis knows which.
 
 λ ladder over Pep-GaMD boost strength
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

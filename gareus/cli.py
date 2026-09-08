@@ -509,7 +509,7 @@ def _add_gamd_args(p: argparse.ArgumentParser) -> None:
         "gamd-cmd-base", "lower-total", "upper-total", "lower-dihedral", "upper-dihedral",
         "lower-dual", "upper-dual", "lower-nonbonded", "upper-nonbonded",
         "lower-dual-nonbonded-dihedral", "upper-dual-nonbonded-dihedral",
-        "pep-gamd-lower-dual",
+        "pep-gamd-lower-dual", "pep-gamd-internal-lower-dual",
     ])
     p.add_argument("--gamd-reuse-context-checkpoint", action=argparse.BooleanOptionalAction, default=False,
                    help="When reusing a shared GaMD setup exported by an earlier adaptive-production epoch, "
@@ -881,6 +881,9 @@ def _validate_contact_args(args: argparse.Namespace) -> None:
 # from sigma0p (see create_lower_dihedral_boost_integrator etc. in
 # gamd/integrator_factory.py, which accept a single `sigma0` positional filled
 # from sigma0p) and silently ignores sigma0d.
+# Both Pep-GaMD variants (pep-gamd-lower-dual, pep-gamd-internal-lower-dual) are
+# dual-boost: gareus' own integrators take sigma0p for the Total channel and sigma0d
+# for the Dihedral channel, so neither belongs in this set.
 _SINGLE_BOOST_GAMD_TYPES = frozenset({
     "gamd-cmd-base", "lower-total", "upper-total",
     "lower-dihedral", "upper-dihedral",
