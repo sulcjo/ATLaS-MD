@@ -134,10 +134,10 @@ SEED_DESCRIPTOR_COLUMNS = ["seed_id", "pdb_path", "cv1", "rg_nm", "e2e_nm"]
 def _write_seed_descriptors(rd: Path, seeds: List[SeedDescriptor]) -> None:
     """Round 0's per-seed heavy-CV1/Rg/E2E descriptors, one row per library seed in
     ``describe_seeds``'s own (deterministic) order. Analysis reads this back as the
-    *real* library CV1 sample for the "centre must lie inside library coverage" cap
-    (``cv1_centers_from_samples``'s ``library_cv1``) -- ``plan_meta["edges"]["cv1"]``
-    is only bin *boundaries* and understates the cap's strictness (controller review,
-    round 1 fix)."""
+    *real* library CV1 sample for ``_library_cv1_for_round0``'s reported diagnostic
+    (``report["ladder_design"]["library_q99"]``, no longer a ladder-design veto as of
+    the 2026-09-08 fix) -- ``plan_meta["edges"]["cv1"]`` is only bin *boundaries* and
+    understates its q99 (controller review, round 1 fix)."""
     rd.mkdir(parents=True, exist_ok=True)
     with (rd / "seed_descriptors.csv").open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=SEED_DESCRIPTOR_COLUMNS)
