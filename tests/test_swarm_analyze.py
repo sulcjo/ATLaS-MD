@@ -74,7 +74,9 @@ def test_analyze_ladder_ess_warnings_no_longer_block_the_round_and_windows_csv_i
     cross-check justification). A round that would previously have failed solely on
     ladder ESS (every rung below an artificially-raised floor) now passes, and its
     per-rung ESS / extrapolated_from_rung diagnostics survive as warnings in both
-    swarm_gate.json on disk and the in-memory report, so nothing is silently lost."""
+    swarm_gate.json on disk and the in-memory report -- both the flat report["warnings"]
+    (what cli.py's --swarm-stage analyze console printout actually surfaces) and the
+    nested report["gate"]["warnings"] -- so nothing is silently lost."""
     from gareus.swarm.analyze import analyze_swarm_stage
     out = pathlib.Path(tempfile.mkdtemp()); _fake_round(out)
     args = _args()
@@ -92,6 +94,7 @@ def test_analyze_ladder_ess_warnings_no_longer_block_the_round_and_windows_csv_i
 
     assert rep["gate"]["gates"]["ladder_ess"]["ok"] is True
     assert len(rep["gate"]["warnings"]) > 0
+    assert any("ESS" in w for w in rep["warnings"])
 
 
 def test_analyze_rerun_removes_stale_ladder_artifacts_when_gate_flips_to_fail():
