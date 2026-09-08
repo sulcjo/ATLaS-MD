@@ -50,9 +50,50 @@ def test_swarm_all_flags_are_known_config_dests():
         "swarm_n_windows", "swarm_overlap_sigma", "swarm_target_beta_sigma", "swarm_min_rungs",
         "swarm_max_rungs", "swarm_ess_floor", "swarm_seeds_per_window", "swarm_discard_block_frames",
         "swarm_min_discard_ps", "swarm_fsf_floor_warn", "swarm_pilot_globals", "shared_gamd_setup_dir",
+        "swarm_graft_minimize_iters", "swarm_max_seed_gap_sigma",
     }
     missing = expected - known
     assert not missing, f"missing argparse dests: {sorted(missing)}"
+
+
+def test_swarm_graft_minimize_iters_and_max_seed_gap_sigma_flags_parse_with_defaults():
+    """Neither flag existed before this fix -- --swarm-graft-minimize-iters was unreachable
+    from config or command line (members.py's getattr fell straight to the module constant),
+    and --swarm-max-seed-gap-sigma is new for the autotuned CV1 upper-bound probe tolerance."""
+    from gareus.cli import parse_args
+    a = parse_args(["--seq", "GYDPETGTWG", "--out", "/tmp/x"])
+    assert a.swarm_graft_minimize_iters == 500
+    assert a.swarm_max_seed_gap_sigma == 0.5
+
+
+def test_swarm_graft_minimize_iters_and_max_seed_gap_sigma_override_from_cli():
+    from gareus.cli import parse_args
+    a = parse_args([
+        "--seq", "GYDPETGTWG", "--out", "/tmp/x",
+        "--swarm-graft-minimize-iters", "750", "--swarm-max-seed-gap-sigma", "0.25",
+    ])
+    assert a.swarm_graft_minimize_iters == 750
+    assert a.swarm_max_seed_gap_sigma == 0.25
+
+
+def test_swarm_graft_minimize_iters_and_max_seed_gap_sigma_settable_from_swarm_yaml_section():
+    """Schema-v2 config loading is dest-name based, not section-name based (config.py's
+    _flatten_config_mapping ignores nesting), so a ``swarm:`` YAML section reaches these
+    dests automatically once the flags exist -- verified here, no extra plumbing needed."""
+    import pathlib
+    import tempfile
+    from gareus.cli import parse_args
+    cfg = pathlib.Path(tempfile.mkdtemp()) / "cfg.yaml"
+    cfg.write_text(
+        "seq: GYDPETGTWG\n"
+        "out: /tmp/x\n"
+        "swarm:\n"
+        "  swarm_graft_minimize_iters: 800\n"
+        "  swarm_max_seed_gap_sigma: 0.3\n"
+    )
+    a = parse_args(["--config", str(cfg)])
+    assert a.swarm_graft_minimize_iters == 800
+    assert a.swarm_max_seed_gap_sigma == 0.3
 
 
 def test_helptext_has_a_swarm_stage_section():

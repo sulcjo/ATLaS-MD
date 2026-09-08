@@ -639,6 +639,11 @@ def _add_swarm_args(p: argparse.ArgumentParser) -> None:
                    help="Per-member trace cadence, in ps (spec section 5).")
     p.add_argument("--swarm-seed-frame-interval-ps", type=float, default=20.0,
                    help="PDB frame cadence for seed export, in ps.")
+    p.add_argument("--swarm-graft-minimize-iters", type=int, default=500,
+                   help="minimizeEnergy(maxIterations=...) for the graft relaxation before "
+                        "swarm-member equilibration (measured 2026-09-08: 100 iterations left "
+                        "18/99 members NaN 0-3s into equilibration; the umbrella-seeding graft "
+                        "caller already uses 1000 via --us-pull-minimize-iterations).")
     p.add_argument("--swarm-member-range", type=str, default=None,
                    help="'a:b' half-open shard of the round's member list; None = all members.")
     p.add_argument("--swarm-round", type=int, default=0,
@@ -664,6 +669,11 @@ def _add_swarm_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--swarm-fsf-floor-warn", type=float, default=0.5,
                    help="Warn when the top rung's FSF floor (1 - lambda*k0max at Vmin) is "
                         "below this (S3 attempts 6-7 NaN mechanism).")
+    p.add_argument("--swarm-max-seed-gap-sigma", type=float, default=0.5,
+                   help="Tolerance for the autotuned CV1 upper-bound probe (ladder_design."
+                        "autotune_cv1_upper_bound): tol = this * window_sigma_cv(k_max, T), "
+                        "the tightest window the design may use, so a seed inside tol is "
+                        "on-centre for every window at least that soft.")
     p.add_argument("--swarm-pilot-globals", type=Path, default=None,
                    help="Pilot shared_gamd_setup_globals.json for --swarm-stage compare.")
     p.add_argument("--shared-gamd-setup-dir", type=str, default=None,
