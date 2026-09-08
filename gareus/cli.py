@@ -661,6 +661,28 @@ def _add_swarm_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--swarm-max-rungs", type=int, default=12)
     p.add_argument("--swarm-ess-floor", type=int, default=50,
                    help="Reweighting ESS below which a ladder rung is 'extrapolated'.")
+    p.add_argument("--swarm-stability-sigma-rel-tol", type=float, default=0.10,
+                   help="envelope_stability_gate: maximum allowed relative difference in "
+                        "sigma_V between odd/even member halves. Failing this gate means "
+                        "the pooled envelope is not yet reproducible across independent "
+                        "member subsets -- the round's ladder/seed-bank artifacts are "
+                        "withheld until it passes.")
+    p.add_argument("--swarm-stability-extrema-sigma-tol", type=float, default=1.0,
+                   help="envelope_stability_gate: maximum allowed |Vmax/Vmin| difference "
+                        "between odd/even member halves, in units of pooled sigma_V. "
+                        "Failing this gate means the pooled envelope is not yet "
+                        "reproducible across independent member subsets -- the round's "
+                        "ladder/seed-bank artifacts are withheld until it passes.")
+    p.add_argument("--swarm-min-done-fraction", type=float, default=0.9,
+                   help="coverage_gate: minimum fraction of all planned members that must "
+                        "be done (every stratification cell must also have >=1 done "
+                        "member). Failing this gate means the round is too incomplete to "
+                        "pool -- extension_plan adds +1 replicate per cell.")
+    p.add_argument("--swarm-max-graft-fallback-fraction", type=float, default=0.10,
+                   help="graft_gate: maximum fraction of members allowed to end "
+                        "graft_failed or md_failed. Failing this gate means too many "
+                        "members never reached a usable trace to trust the pooled "
+                        "envelope/ladder.")
     p.add_argument("--swarm-seeds-per-window", type=int, default=3)
     p.add_argument("--swarm-discard-block-frames", type=int, default=25,
                    help="V-trace block size for the discard detector.")

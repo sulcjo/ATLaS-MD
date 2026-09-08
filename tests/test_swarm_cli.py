@@ -51,6 +51,8 @@ def test_swarm_all_flags_are_known_config_dests():
         "swarm_max_rungs", "swarm_ess_floor", "swarm_seeds_per_window", "swarm_discard_block_frames",
         "swarm_min_discard_ps", "swarm_fsf_floor_warn", "swarm_pilot_globals", "shared_gamd_setup_dir",
         "swarm_graft_minimize_iters", "swarm_max_seed_gap_sigma",
+        "swarm_stability_sigma_rel_tol", "swarm_stability_extrema_sigma_tol",
+        "swarm_min_done_fraction", "swarm_max_graft_fallback_fraction",
     }
     missing = expected - known
     assert not missing, f"missing argparse dests: {sorted(missing)}"
@@ -94,6 +96,80 @@ def test_swarm_graft_minimize_iters_and_max_seed_gap_sigma_settable_from_swarm_y
     a = parse_args(["--config", str(cfg)])
     assert a.swarm_graft_minimize_iters == 800
     assert a.swarm_max_seed_gap_sigma == 0.3
+
+
+def test_swarm_gate_tolerance_flags_parse_with_documented_defaults():
+    """analyze.py's evaluate_gates(...) call reads these four thresholds via
+    getattr(args, "<dest>", <default>) -- until this fix, three of them had no
+    argparse flag at all (same latent-bug class as swarm_graft_minimize_iters
+    before its fix), so they were unreachable from the CLI or the schema-v2
+    swarm: YAML section and silently stuck at their getattr default forever.
+    swarm_ess_floor already had a flag and is untouched here."""
+    from gareus.cli import parse_args
+    a = parse_args(["--seq", "GYDPETGTWG", "--out", "/tmp/x"])
+    assert a.swarm_stability_sigma_rel_tol == 0.10
+    assert a.swarm_stability_extrema_sigma_tol == 1.0
+    assert a.swarm_min_done_fraction == 0.9
+    assert a.swarm_max_graft_fallback_fraction == 0.10
+
+
+def test_swarm_gate_tolerance_flags_override_from_cli():
+    from gareus.cli import parse_args
+    a = parse_args([
+        "--seq", "GYDPETGTWG", "--out", "/tmp/x",
+        "--swarm-stability-sigma-rel-tol", "0.2",
+        "--swarm-stability-extrema-sigma-tol", "1.5",
+        "--swarm-min-done-fraction", "0.8",
+        "--swarm-max-graft-fallback-fraction", "0.15",
+    ])
+    assert a.swarm_stability_sigma_rel_tol == 0.2
+    assert a.swarm_stability_extrema_sigma_tol == 1.5
+    assert a.swarm_min_done_fraction == 0.8
+    assert a.swarm_max_graft_fallback_fraction == 0.15
+
+
+def test_swarm_gate_tolerance_flags_settable_from_swarm_yaml_section():
+    """Schema-v2 config loading is dest-name based (config.py's _flatten_config_mapping
+    ignores nesting), so a swarm: YAML section reaches these dests automatically once
+    the flags exist -- verified here, no extra plumbing needed."""
+    import pathlib
+    import tempfile
+    from gareus.cli import parse_args
+    cfg = pathlib.Path(tempfile.mkdtemp()) / "cfg.yaml"
+    cfg.write_text(
+        "seq: GYDPETGTWG\n"
+        "out: /tmp/x\n"
+        "swarm:\n"
+        "  swarm_stability_sigma_rel_tol: 0.25\n"
+        "  swarm_stability_extrema_sigma_tol: 2.0\n"
+        "  swarm_min_done_fraction: 0.75\n"
+        "  swarm_max_graft_fallback_fraction: 0.2\n"
+    )
+    a = parse_args(["--config", str(cfg)])
+    assert a.swarm_stability_sigma_rel_tol == 0.25
+    assert a.swarm_stability_extrema_sigma_tol == 2.0
+    assert a.swarm_min_done_fraction == 0.75
+    assert a.swarm_max_graft_fallback_fraction == 0.2
+
+
+def test_chignolin_swarm_stage_example_carries_the_validated_contact_cv_block():
+    """Measured 2026-09-08 on 1500 real swarm frames: the CLI-default contact CV
+    (r0=4.5 A, beta=6.0 /A) gives median 0.008, IQR 0.017, entropy 0.037, only 2
+    resolvable windows (every k clamped to k_min). heavy atom-pairs, sequence
+    separation >= 4, r0=12 A, beta=3.0 /A gives median 0.558, IQR 0.334, entropy
+    0.907, span 0.065-0.905, and 25 resolvable windows at cv1_k_max=1200 -- this
+    is the definition the example must pin explicitly (CLI defaults are not
+    enough), because any production config used with the swarm's handoff must
+    carry an IDENTICAL contact_cv block."""
+    from gareus.cli import parse_args
+    a = parse_args(["--config", "examples/chignolin_swarm_stage.yaml"])
+    assert a.contact_scheme == "atom-pairs"
+    assert a.contact_atom_selection == "heavy"
+    assert a.contact_min_sequence_separation == 4
+    assert a.contact_r0_a == 12.0
+    assert a.contact_beta_a_inv == 3.0
+    assert a.contact_normalize is True
+    assert a.cv1_k_max == 1200.0
 
 
 def test_helptext_has_a_swarm_stage_section():

@@ -98,7 +98,24 @@ cvs:
   cv2: none
 
 contact_cv:
+  # Measured 2026-09-08 on 1500 real swarm frames: the CLI-default contact CV (r0=4.5 A,
+  # beta=6.0 /A) gives median 0.008, IQR 0.017, occupancy entropy 0.037 and leaves only 2
+  # resolvable windows, with every force constant clamped to the k_min floor -- unusable
+  # for a lambda ladder. This definition -- heavy atom-pairs, sequence separation >= 4,
+  # r0=12 A, beta=3.0 /A -- gives median 0.558, IQR 0.334, entropy 0.907, span
+  # 0.065-0.905, and 25 resolvable windows at cv1_k_max=1200 with force constants in the
+  # hundreds. (r0=12/beta=1.5 was close: entropy 0.895, 24 windows. r0=10/beta=3: entropy
+  # 0.861, 21 windows.)
+  #
+  # Any production config used with a swarm handoff (--shared-gamd-setup-dir and/or
+  # --windows-2d-csv from this stage's output) MUST carry an IDENTICAL contact_cv block,
+  # because the ladder windows below are defined on this CV.
+  contact_scheme: atom-pairs
   contact_atom_selection: heavy
+  contact_min_sequence_separation: 4
+  contact_r0_a: 12.0
+  contact_beta_a_inv: 3.0
+  contact_normalize: true
   cv1_k_max: 1200.0
 
 gamd:
