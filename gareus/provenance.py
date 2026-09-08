@@ -289,6 +289,8 @@ def _method_settings(args: Any) -> dict[str, Any]:
         "swarm_min_rungs", "swarm_max_rungs", "swarm_ess_floor", "swarm_seeds_per_window",
         "swarm_discard_block_frames", "swarm_min_discard_ps", "swarm_fsf_floor_warn",
         "swarm_max_seed_gap_sigma", "swarm_pilot_globals", "shared_gamd_setup_dir",
+        "swarm_stability_sigma_rel_tol", "swarm_stability_extrema_sigma_tol",
+        "swarm_min_done_fraction", "swarm_max_graft_fallback_fraction",
     ]
     settings = {k: getattr(args, k, None) for k in keys if hasattr(args, k)}
     # The λ-ladder is frozen for the whole campaign (spec §3.1), so its

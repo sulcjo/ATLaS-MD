@@ -347,6 +347,12 @@ def analyze_swarm_stage(out_dir, args) -> dict:
             max_graft_fallback_fraction=float(getattr(args, "swarm_max_graft_fallback_fraction", 0.10)),
         )
         write_json(an / "swarm_gate.json", gate)
+        # Also fold gate warnings (e.g. ladder_ess_gate's advisory ESS/extrapolation
+        # findings) into the flat report["warnings"] list: cli.py's --swarm-stage
+        # analyze console printout surfaces result["warnings"] directly, never
+        # result["gate"]["warnings"], so a warning left only nested under "gate"
+        # would never reach the operator's terminal.
+        warnings.extend(gate.get("warnings", []))
 
         selection = select_window_seed_frames(frame_candidates, centers, per_window=seeds_per_window, discard_frames=discard)
         seed_bank_dir = an / "seed_bank"

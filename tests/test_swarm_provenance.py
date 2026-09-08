@@ -42,6 +42,23 @@ def test_method_settings_record_every_swarm_argparse_dest():
     assert not missing, f"missing from _method_settings: {sorted(missing)}"
 
 
+def test_method_settings_record_the_four_new_gate_tolerance_dests():
+    """2026-09-08 fix: swarm_stability_sigma_rel_tol, swarm_stability_extrema_sigma_tol,
+    swarm_min_done_fraction, and swarm_max_graft_fallback_fraction gained argparse flags
+    (they were previously unreachable getattr-only defaults). The cross-check test above
+    already covers this generically once these are real argparse dests, but this test
+    pins the four names explicitly against a hand-built namespace."""
+    from gareus.provenance import _method_settings
+    a = types.SimpleNamespace(
+        swarm_stability_sigma_rel_tol=0.10, swarm_stability_extrema_sigma_tol=1.0,
+        swarm_min_done_fraction=0.9, swarm_max_graft_fallback_fraction=0.10,
+    )
+    ms = _method_settings(a)
+    for k in ("swarm_stability_sigma_rel_tol", "swarm_stability_extrema_sigma_tol",
+              "swarm_min_done_fraction", "swarm_max_graft_fallback_fraction"):
+        assert k in ms
+
+
 def test_key_artifact_paths_include_swarm_analysis_artifacts():
     """The controller's ruling named 5 paths as a floor ("_key_artifact_paths must
     include" them), not a ceiling -- ladder_design.json and swarm_gate.json are both

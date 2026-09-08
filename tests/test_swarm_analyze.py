@@ -68,6 +68,35 @@ def test_analyze_fails_gate_and_withholds_windows_csv_on_shifted_halves():
     assert not (out / "swarm" / "analysis" / "windows_lambda_ladder.csv").exists()
 
 
+def test_analyze_ladder_ess_warnings_no_longer_block_the_round_and_windows_csv_is_written():
+    """UPDATED 2026-09-08: ladder_ess_gate is now advisory (item 2 of the reintegration --
+    see gareus/swarm/gates.py's module comment for the measured overlap/lambda=0
+    cross-check justification). A round that would previously have failed solely on
+    ladder ESS (every rung below an artificially-raised floor) now passes, and its
+    per-rung ESS / extrapolated_from_rung diagnostics survive as warnings in both
+    swarm_gate.json on disk and the in-memory report -- both the flat report["warnings"]
+    (what cli.py's --swarm-stage analyze console printout actually surfaces) and the
+    nested report["gate"]["warnings"] -- so nothing is silently lost."""
+    from gareus.swarm.analyze import analyze_swarm_stage
+    out = pathlib.Path(tempfile.mkdtemp()); _fake_round(out)
+    args = _args()
+    args.swarm_ess_floor = 100000  # forces every rung below the floor -> extrapolation
+    rep = analyze_swarm_stage(out, args)
+    an = out / "swarm" / "analysis"
+    assert rep["status"] == "pass"
+    assert (an / "windows_lambda_ladder.csv").exists()
+
+    gate_json = json.load((an / "swarm_gate.json").open())
+    assert gate_json["status"] == "pass"
+    assert gate_json["gates"]["ladder_ess"]["ok"] is True
+    assert len(gate_json["warnings"]) > 0
+    assert any("ESS" in w for w in gate_json["warnings"])
+
+    assert rep["gate"]["gates"]["ladder_ess"]["ok"] is True
+    assert len(rep["gate"]["warnings"]) > 0
+    assert any("ESS" in w for w in rep["warnings"])
+
+
 def test_analyze_rerun_removes_stale_ladder_artifacts_when_gate_flips_to_fail():
     from gareus.swarm.analyze import analyze_swarm_stage
     out = pathlib.Path(tempfile.mkdtemp()); rd = _fake_round(out)
