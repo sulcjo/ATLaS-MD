@@ -38,7 +38,9 @@ from gareus.system_setup import run_steps_safely, write_solute_only_pdb, write_s
 
 TRACE_COLUMNS = ["frame", "t_ps", "cv1", "rg_nm", "e2e_nm", "v_pep_kj", "v_dih_kj", "potential_kj"]
 
-_DEFAULT_GRAFT_MINIMIZE_ITERS = 100
+_DEFAULT_GRAFT_MINIMIZE_ITERS = 500  # measured 2026-09-08: 100 left 18/99 real swarm members
+# NaN 0-3s into equilibration; the umbrella-seeding graft caller already uses 1000
+# (--us-pull-minimize-iterations) for the same graft_conformer_into_context call.
 
 
 def measure_frame(context, system, unit, positions_nm, contact_pairs, ca_indices, args) -> Dict[str, float]:

@@ -45,19 +45,103 @@ def test_cv1_centers_span_observed_range_with_n_windows():
     assert c.shape == (16,) and 0.0 <= c[0] < c[-1] <= 1.0 and np.all(np.diff(c) > 0)
 
 
-def test_cv1_centers_refuse_to_exceed_library_q99():
-    """r7 measured max heavy-CV1 = 0.069; a centre a pull cannot reach must never be written."""
+def test_cv1_centers_no_longer_enforces_a_library_quantile_veto():
+    """REPLACES the retired test_cv1_centers_refuse_to_exceed_library_q99 (2026-09-08 fix):
+    round-0 windows are seeded from the swarm's OWN frames, never pulled from the GENPEPT
+    library, so capping centres against a library q99 was checking the wrong pool -- and it
+    was inert anyway (centres = linspace(lo, hi, n) always ends at hi, so n_windows could
+    never lower the top centre). library_cv1/library_q are removed from the signature
+    entirely; a swarm whose top exceeds a library-like array's q99 must return centres,
+    never raise."""
     from gareus.swarm.ladder_design import cv1_centers_from_samples
-    lib = np.random.default_rng(6).uniform(0.0, 0.069, 1970)
-    swarm = np.random.default_rng(7).uniform(0.0, 0.065, 20000)
-    c = cv1_centers_from_samples(swarm, n_windows=8, library_cv1=lib)
-    assert c[-1] <= np.quantile(lib, 0.99)
+    lib = np.random.default_rng(6).uniform(0.0, 0.069, 1970)  # kept only to document the old cap value
+    swarm = np.random.default_rng(8).uniform(0.0, 0.30, 20000)  # this used to raise against lib's q99
+    c = cv1_centers_from_samples(swarm, n_windows=8)
+    assert c.shape == (8,)
+    assert c[-1] > np.quantile(lib, 0.99)
     try:
-        cv1_centers_from_samples(np.random.default_rng(8).uniform(0.0, 0.30, 20000), n_windows=8, library_cv1=lib)
-    except ValueError as e:
-        assert "q99" in str(e) or "library" in str(e)
+        cv1_centers_from_samples(swarm, n_windows=8, library_cv1=lib)
+    except TypeError:
+        pass
     else:
-        raise AssertionError("centres beyond library coverage must raise")
+        raise AssertionError("library_cv1/library_q must be removed from the signature entirely")
+
+
+def test_probe_centre_seed_support_returns_nearest_distance_per_centre():
+    from gareus.swarm.ladder_design import probe_centre_seed_support
+    centres = np.array([0.0, 0.5, 1.0])
+    seed_cv1 = np.array([0.05, 0.4, 0.6, 1.2])
+    gaps = probe_centre_seed_support(centres, seed_cv1)
+    # hand-computed: nearest to 0.0 is 0.05 (0.05); nearest to 0.5 is 0.4 or 0.6 (0.1);
+    # nearest to 1.0 is 1.2 (0.2)
+    assert np.allclose(gaps, [0.05, 0.1, 0.2])
+
+
+def test_autotune_cv1_upper_bound_accepts_hi_unchanged_when_seeds_are_dense_to_the_top():
+    """The explicit regression for the real 2026-09-08 run: the swarm's own observed CV1
+    spans 0..0.06 (its own frames ARE the seed-bank candidate pool), and a library-like
+    array topping out at 0.042 (the OLD veto's cap, no longer even passed in) must not
+    lower the bound or raise -- seed_cv1 dense across the whole quantile range means the
+    initial hi is accepted on the first probe."""
+    from gareus.swarm.ladder_design import autotune_cv1_upper_bound
+    rng = np.random.default_rng(10)
+    cv1 = rng.uniform(0.0, 0.06, 20000)
+    seed_cv1 = rng.uniform(0.0, 0.06, 20000)  # the swarm's own frames, dense to the top
+    library_like_cap = 0.042  # the old q99 cap value -- not passed to the new function at all
+    result = autotune_cv1_upper_bound(cv1, seed_cv1, n_windows=8)
+    assert result["autotuned"] is False
+    assert math.isclose(result["hi"], result["hi_initial"])
+    assert result["hi"] > library_like_cap  # NOT lowered to (or below) the old cap
+    assert result["n_probes"] == 1
+    assert np.max(result["nearest_seed_gap"]) <= result["tol"]
+
+
+def test_autotune_cv1_upper_bound_walks_down_to_the_highest_supported_seed():
+    """Seeds absent above 0.6: hi must drop to the highest seed-supported candidate
+    (autofound from the observed seed values, never a fixed grid) and every centre in the
+    accepted result is within tol."""
+    from gareus.swarm.ladder_design import autotune_cv1_upper_bound
+    cv1 = np.array([0.0, 0.3, 0.6, 0.9])
+    seed_cv1 = np.concatenate([np.arange(0.0, 0.6 + 1e-9, 0.01), [0.6]])
+    result = autotune_cv1_upper_bound(
+        cv1, seed_cv1, n_windows=2, lo_q=0.0, hi_q=1.0, max_seed_gap_sigma=0.5,
+    )
+    assert result["autotuned"] is True
+    assert math.isclose(result["hi_initial"], 0.9)
+    assert math.isclose(result["hi"], 0.6, abs_tol=1e-9)
+    assert result["hi"] < result["hi_initial"]
+    assert np.max(result["nearest_seed_gap"]) <= result["tol"] + 1e-9
+    assert result["n_probes"] >= 2
+
+
+def test_autotune_cv1_upper_bound_raises_with_measured_gap_and_tol_when_nothing_is_supported():
+    """No seed anywhere near the observed CV1 range -- every candidate (there are none to
+    walk down to, since all seeds sit above hi_initial) leaves centres unsupported."""
+    from gareus.swarm.ladder_design import autotune_cv1_upper_bound, window_sigma_cv
+    cv1 = np.linspace(0.0, 1.0, 200)
+    seed_cv1 = np.array([5.0, 6.0])  # far outside [lo, hi_initial]
+    try:
+        autotune_cv1_upper_bound(cv1, seed_cv1, n_windows=4)
+    except ValueError as exc:
+        msg = str(exc)
+        tol = 0.5 * window_sigma_cv(1200.0, 300.0)
+        assert "gap" in msg.lower()
+        assert f"{tol:.4f}" in msg
+    else:
+        raise AssertionError("no supported candidate anywhere must raise ValueError")
+
+
+def test_cv1_centers_from_samples_delegates_to_autotune_when_seed_cv1_given():
+    from gareus.swarm.ladder_design import cv1_centers_from_samples
+    rng = np.random.default_rng(11)
+    swarm = rng.uniform(0.0, 0.06, 20000)
+    seed = rng.uniform(0.0, 0.06, 20000)  # the swarm's own frames as the seed pool
+    probe_out: dict = {}
+    c = cv1_centers_from_samples(swarm, n_windows=8, seed_cv1=seed, probe_out=probe_out)
+    assert c.shape == (8,)
+    assert probe_out["autotuned"] is False
+    assert math.isclose(probe_out["hi"], probe_out["hi_initial"])
+    assert np.allclose(c, probe_out["centres"])
 
 
 def test_fsf_floor_per_rung_reports_and_warns_on_top_rung():
@@ -143,3 +227,30 @@ def test_windows_csv_is_full_cross_product_and_loads_with_core_reader():
     assert len(rows) == 9 and rows[0].keys() >= {"window", "primary_cv_mode", "primary_cv_center", "primary_cv_k_kcal", "gamd_lambda"}
     centers, ks, _sc, _sk, meta, *_ = load_explicit_2d_window_csv(_args(), p)
     assert len(centers) == 9 and sorted(set(meta["gamd_lambdas"])) == [0.0, 0.5, 1.0]
+
+
+def test_upper_bound_probe_count_is_bounded_on_a_dense_seed_pool():
+    """The walk down observed seed values must not scale with the pool size: a dense pool
+    whose top is unsupported used to probe once per unique seed value (22k+ on a real run)."""
+    from gareus.swarm.ladder_design import autotune_cv1_upper_bound, MAX_UPPER_BOUND_PROBES
+    rng = np.random.default_rng(0)
+    # Dense support up to 0.30, then a bare gap to a lone outlier that drags hi above it.
+    seeds = np.concatenate([rng.uniform(0.0, 0.30, 20000), np.array([0.90])])
+    cv1 = np.concatenate([seeds, np.full(400, 0.95)])  # q99.5 lands in the empty band
+    out = autotune_cv1_upper_bound(cv1, seeds, n_windows=8, temperature_k=300.0,
+                                   k_max_kcal=1200.0, max_seed_gap_sigma=0.05)
+    assert out["autotuned"] is True
+    assert out["hi"] < out["hi_initial"]
+    assert out["n_probes"] <= MAX_UPPER_BOUND_PROBES + 1
+    assert float(np.max(out["nearest_seed_gap"])) <= out["tol"]
+
+
+def test_upper_bound_candidates_are_still_observed_seed_values():
+    """Bounding the probe count must subsample the observed seeds, never invent a grid."""
+    from gareus.swarm.ladder_design import autotune_cv1_upper_bound
+    seeds = np.concatenate([np.linspace(0.0, 0.20, 500), np.array([0.80])])
+    cv1 = np.concatenate([seeds, np.full(50, 0.85)])
+    out = autotune_cv1_upper_bound(cv1, seeds, n_windows=4, temperature_k=300.0,
+                                   k_max_kcal=1200.0, max_seed_gap_sigma=0.05)
+    assert out["autotuned"] is True
+    assert np.min(np.abs(seeds - out["hi"])) < 1e-12

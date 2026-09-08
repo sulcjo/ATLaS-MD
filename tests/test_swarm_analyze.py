@@ -51,6 +51,13 @@ def test_analyze_writes_every_artifact_and_passes_on_clean_data():
     ld = json.load((an / "ladder_design.json").open())
     assert ld["n_states"] == 8 * len(ld["lambdas"]) and ld["lambdas"][0] == 0.0 and ld["lambdas"][-1] == 1.0
     assert len(list(csv.DictReader((an / "windows_lambda_ladder.csv").open()))) == ld["n_states"]
+    # probe metadata (autotuned CV1 upper bound) is recorded in the report, keyed by
+    # "ladder_design" -- library_q99 survives as a reported diagnostic only (no
+    # seed_descriptors.csv here, so it falls back to plan_meta's edges).
+    probe = rep["ladder_design"]
+    assert set(probe) >= {"library_q99", "autotuned", "hi", "hi_initial", "tol", "max_nearest_seed_gap"}
+    assert probe["hi"] <= probe["hi_initial"] + 1e-9
+    assert probe["max_nearest_seed_gap"] <= probe["tol"] + 1e-9
 
 
 def test_analyze_fails_gate_and_withholds_windows_csv_on_shifted_halves():
@@ -97,23 +104,33 @@ def _write_seed_descriptors_csv(rd, cv1_values):
             w.writerow({"seed_id": f"seed_{i:05d}", "pdb_path": "/x", "cv1": cv1, "rg_nm": 0.5, "e2e_nm": 1.0})
 
 
-def test_analyze_uses_seed_descriptors_csv_cap_and_records_failure_when_centres_exceed_it():
+def test_analyze_succeeds_and_records_probe_metadata_when_swarm_exceeds_the_library_q99():
+    """UPDATED 2026-09-08 (was test_analyze_uses_seed_descriptors_csv_cap_and_records_failure_when_centres_exceed_it,
+    which asserted the OLD library-quantil veto's failure): the seed_descriptors.csv library
+    is now only a reported diagnostic, never a veto. A narrow library (mimicking r7's real
+    ~0-0.069 coverage) whose q99 sits far below the swarm's own observed CV1 samples (beta(2,4),
+    reaching up toward ~0.9) must NOT fail the round any more -- the swarm's own pooled frames
+    are the seed-bank candidate pool the autotuned probe checks against, and they are dense
+    across their own quantile range by construction, so the ladder is built and the CSV is
+    written. The library's q99 and the probe metadata are both recorded in the report."""
     from gareus.swarm.analyze import analyze_swarm_stage
     out = pathlib.Path(tempfile.mkdtemp()); rd = _fake_round(out)
-    # A narrow library (mimicking r7's real ~0-0.069 coverage) whose q99 sits far below
-    # the swarm's own observed CV1 samples (beta(2,4), reaching up toward ~0.9) -- the
-    # cap must reject the ladder design rather than silently writing an unreachable
-    # window, and the failure must be RECORDED (report written, no exception escapes).
     _write_seed_descriptors_csv(rd, [0.001 * i for i in range(50)])
     rep = analyze_swarm_stage(out, _args())
     an = out / "swarm" / "analysis"
-    assert rep["status"] == "fail"
-    assert any("exceeds" in r and "q99" in r for r in rep["reasons"])
-    assert not (an / "ladder_design.json").exists()
-    assert not (an / "windows_lambda_ladder.csv").exists()
+    assert rep["status"] == "pass"
+    assert (an / "ladder_design.json").exists()
+    assert (an / "windows_lambda_ladder.csv").exists()
     assert (an / "envelope_discard.json").exists()
     assert (an / "shared_gamd_setup" / "shared_gamd_setup_globals.json").exists()
     assert (an / "swarm_report.json").exists()
+
+    ld = rep["ladder_design"]
+    assert ld["library_q99"] is not None and ld["library_q99"] < 0.05  # the narrow library, reported only
+    assert isinstance(ld["autotuned"], bool)
+    assert ld["hi"] <= ld["hi_initial"] + 1e-9
+    assert ld["tol"] > 0.0
+    assert ld["max_nearest_seed_gap"] <= ld["tol"] + 1e-9
 
 
 def test_analyze_falls_back_to_edges_and_warns_when_seed_descriptors_csv_missing():
@@ -169,3 +186,22 @@ def test_analyze_round1_reuses_frozen_envelope_and_ladder_and_reports_out_of_env
     assert "out_of_envelope_fraction" in rep1
     assert rep1["out_of_envelope_fraction"]["Total"] is not None
     assert rep1["out_of_envelope_fraction"]["Dihedral"] is not None
+
+
+def test_probe_pool_is_the_exported_frame_set_not_every_trace_row():
+    """Only frames with a written PDB can seed a window (select_window_seed_frames draws from
+    frame_candidates), so the upper-bound probe must be measured against that pool, not the
+    10x denser trace."""
+    from gareus.swarm.analyze import analyze_swarm_stage
+    from gareus.pep_gamd import PepGamdEnvelope
+    out = pathlib.Path(tempfile.mkdtemp())
+    rd = _fake_round(out)
+    n_exported = 0
+    for md in sorted((rd).glob("member_*")):
+        n_exported += len(list((md / "frames").glob("*.pdb")))
+    args = _args()
+    res = analyze_swarm_stage(out, args)
+    probe = res.get("ladder_design", {})
+    assert "n_seed_pool" in probe, "the probe must report the pool it measured"
+    # Post-discard subset of the exported PDB frames, never the full trace.
+    assert 0 < probe["n_seed_pool"] <= n_exported

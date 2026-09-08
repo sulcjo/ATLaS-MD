@@ -105,6 +105,63 @@ def test_member_done_false_when_done_json_unparseable():
     assert member_done(tmp) is False
 
 
+def test_default_graft_minimize_iters_is_500():
+    """100 iterations (the old default) left 18/99 real swarm members NaN 0-3s into
+    equilibration (2026-09-08); the umbrella-seeding graft caller already uses 1000 via
+    --us-pull-minimize-iterations. This is the smaller of the two fixes in this task."""
+    from gareus.swarm.members import _DEFAULT_GRAFT_MINIMIZE_ITERS
+    assert _DEFAULT_GRAFT_MINIMIZE_ITERS == 500
+
+
+def test_run_member_passes_graft_minimize_iters_through_to_the_graft_call():
+    """run_member must read args.swarm_graft_minimize_iters (falling back to the module
+    default when the attribute is absent) and forward it verbatim to
+    graft_conformer_into_context -- the value used to be unreachable from config or the
+    command line because gareus/cli.py had no matching flag at all. Every other OpenMM/MD
+    call this function makes before the graft is mocked out; the graft itself is made to
+    report a fallback so run_member returns immediately afterwards without needing any
+    further MD/stepping infrastructure."""
+    from unittest.mock import MagicMock, patch
+    from gareus.swarm import members as members_mod
+
+    def _run_member_with_args(args):
+        captured = {}
+
+        def fake_graft(sim, topology, conformer, cv_atom1, cv_atom2, temperature_k, unit,
+                       minimize_iters=None, seed=None):
+            captured["minimize_iters"] = minimize_iters
+            return {"fallback": True, "fallback_reason": "short-circuited for the unit test"}
+
+        openmm = MagicMock()
+        app = MagicMock()
+        unit = MagicMock()
+        equil_state = MagicMock()
+        equil_state.getPeriodicBoxVectors.return_value = (1.0, 2.0, 3.0)
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        member_dir = tmp / "member_0000"
+
+        with patch.object(members_mod, "solute_atom_indices", return_value=[0, 1, 2]), \
+             patch.object(members_mod, "ensure_pep_gamd_partition"), \
+             patch.object(members_mod, "make_cmd_integrator", return_value=(MagicMock(), None)), \
+             patch.object(members_mod, "_terminal_ca_atoms", return_value=(0, 1)), \
+             patch.object(members_mod, "graft_conformer_into_context", side_effect=fake_graft):
+            done = members_mod.run_member(
+                args, {"velocity_seed": 5, "member_id": 0}, member_dir,
+                openmm=openmm, app=app, unit=unit, topology=object(),
+                base_system_xml="<System/>", equil_state=equil_state,
+                conformer={"positions_nm": None, "pdb_path": "x"},
+                platform=None, props=None, contact_pairs=[],
+            )
+        assert done["status"] == "graft_failed"
+        return captured["minimize_iters"]
+
+    default_args = types.SimpleNamespace(temperature_k=300.0)
+    assert _run_member_with_args(default_args) == 500
+
+    overridden_args = types.SimpleNamespace(temperature_k=300.0, swarm_graft_minimize_iters=777)
+    assert _run_member_with_args(overridden_args) == 777
+
+
 def test_run_member_raises_without_a_seed_conformer():
     from gareus.swarm.members import run_member
     tmp = pathlib.Path(tempfile.mkdtemp())

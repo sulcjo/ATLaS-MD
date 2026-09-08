@@ -154,32 +154,133 @@ def n_resolvable_windows(coverage_range: float, temperature_k: float, *,
     return int(math.floor(float(coverage_range) / (float(overlap_sigma) * sigma_w_min)))
 
 
-def cv1_centers_from_samples(cv1, n_windows: int = 16, lo_q: float = 0.005, hi_q: float = 0.995, *,
-                              library_cv1=None, library_q: float = 0.99) -> np.ndarray:
-    """Centres spanning the swarm's OBSERVED CV1 coverage, never a fixed [0,1] grid.
+# Upper-bound probing walks DOWN the observed seed values. A real swarm pools tens of
+# thousands of frames, so probing every unique value is O(n_seeds^2) work for a bound that
+# a few hundred evenly-spaced observed candidates locate just as well.
+MAX_UPPER_BOUND_PROBES = 256
 
-    r7's heavy-CV1 tops out at ~0.069 and a restrained pull cannot move the CV (450 ps at k=300 from a
-    0.069 seed drifted down to 0.045-0.065), so a centre beyond the seed library's q99 is a window a
-    pull could never reach -- this raises rather than silently writing an unreachable window.
+
+def probe_centre_seed_support(centres, seed_cv1) -> np.ndarray:
+    """|cv1_seed - centre| of the nearest available seed, one entry per centre."""
+    c = np.asarray(centres, dtype=float)
+    s = np.asarray(seed_cv1, dtype=float)
+    s = s[np.isfinite(s)]
+    if s.size == 0:
+        return np.full(c.shape, np.inf)
+    return np.min(np.abs(s[None, :] - c[:, None]), axis=1)
+
+
+def autotune_cv1_upper_bound(cv1, seed_cv1, *, n_windows: int, lo_q: float = 0.005,
+                             hi_q: float = 0.995, temperature_k: float = 300.0,
+                             k_max_kcal: float = 1200.0,
+                             max_seed_gap_sigma: float = 0.5) -> dict:
+    """Highest upper bound whose every centre has a seed within tolerance.
+
+    tol = max_seed_gap_sigma * window_sigma_cv(k_max_kcal, temperature_k) (the tightest window
+    the design may use, so a seed inside tol is on-centre for every window at least that soft).
+
+    Start from hi = quantile(cv1, hi_q). Probe the centres it implies. If every centre is supported,
+    accept it unchanged. Otherwise walk DOWN the observed seed values (descending unique seed_cv1
+    at or below the initial hi -- autofound from data, never a fixed grid) and accept the FIRST
+    (highest) candidate whose centres are all supported. Raise ValueError only when no candidate is
+    supported, and put the measured worst gap and the tolerance in the message.
+
+    Returns {"lo", "hi", "hi_initial", "centres", "nearest_seed_gap", "tol",
+             "autotuned": bool, "n_probes": int}.
     """
     v = np.asarray(cv1, dtype=float)
     v = v[np.isfinite(v)]
+    seeds = np.asarray(seed_cv1, dtype=float)
+    seeds = seeds[np.isfinite(seeds)]
+
+    lo = max(0.0, float(np.quantile(v, lo_q)))
+    hi_initial = min(1.0, float(np.quantile(v, hi_q)))
+    if hi_initial <= lo:
+        raise ValueError("degenerate CV1 coverage: quantile range collapsed to a point")
+
+    tol = float(max_seed_gap_sigma) * window_sigma_cv(float(k_max_kcal), float(temperature_k))
+
+    def _probe(hi_candidate: float):
+        centres = np.linspace(lo, hi_candidate, int(n_windows))
+        return centres, probe_centre_seed_support(centres, seeds)
+
+    centres, gaps = _probe(hi_initial)
+    n_probes = 1
+    best_hi, best_centres, best_gaps = hi_initial, centres, gaps
+    best_worst_gap = float(np.max(gaps)) if gaps.size else float("inf")
+
+    if best_worst_gap <= tol:
+        return {
+            "lo": lo, "hi": hi_initial, "hi_initial": hi_initial,
+            "centres": centres, "nearest_seed_gap": gaps, "tol": tol,
+            "autotuned": False, "n_probes": n_probes,
+        }
+
+    candidates = sorted({float(x) for x in seeds if lo < x <= hi_initial}, reverse=True)
+    if len(candidates) > MAX_UPPER_BOUND_PROBES:
+        # Subsample the OBSERVED values (never a synthetic grid): evenly spaced indices keep
+        # the walk descending and bounded, and always retain the highest candidate.
+        idx = np.unique(np.linspace(0, len(candidates) - 1, MAX_UPPER_BOUND_PROBES).astype(int))
+        candidates = [candidates[i] for i in idx]
+    for candidate_hi in candidates:
+        centres, gaps = _probe(candidate_hi)
+        n_probes += 1
+        worst_gap = float(np.max(gaps)) if gaps.size else float("inf")
+        if worst_gap < best_worst_gap:
+            best_hi, best_centres, best_gaps, best_worst_gap = candidate_hi, centres, gaps, worst_gap
+        if worst_gap <= tol:
+            return {
+                "lo": lo, "hi": candidate_hi, "hi_initial": hi_initial,
+                "centres": centres, "nearest_seed_gap": gaps, "tol": tol,
+                "autotuned": True, "n_probes": n_probes,
+            }
+
+    raise ValueError(
+        f"no CV1 upper bound has seed support within tol={tol:.4f}: the best candidate probed "
+        f"(hi={best_hi:.4f}, out of {n_probes} probed) still has a worst-case nearest-seed gap "
+        f"of {best_worst_gap:.4f} > tol={tol:.4f} -- extend the swarm or widen "
+        "--swarm-max-seed-gap-sigma"
+    )
+
+
+def cv1_centers_from_samples(cv1, n_windows: int = 16, lo_q: float = 0.005, hi_q: float = 0.995, *,
+                              seed_cv1=None, temperature_k: float = 300.0, k_max_kcal: float = 1200.0,
+                              max_seed_gap_sigma: float = 0.5, probe_out: Optional[dict] = None) -> np.ndarray:
+    """Centres spanning the swarm's OBSERVED CV1 coverage, never a fixed [0,1] grid.
+
+    The static library-quantile veto that used to live here (library_cv1/library_q, raising
+    when a centre exceeded the GENPEPT library's q99) is REMOVED -- measured on a real
+    99-member swarm run (2026-09-08) it was checking the wrong pool and its own advice was
+    inert:
+      - Round-0 windows are seeded from the swarm's OWN frames (select_window_seed_frames ->
+        seed bank, seed_selection_mode: active-cv), never pulled from the GENPEPT library.
+      - Every proposed centre -- including the one that tripped the old veto at 0.0595 --
+        had 3 distinct-member swarm frames within 3e-4 of it, so a pull restrained to that
+        centre had real support the library-based cap could not see.
+      - centres = np.linspace(lo, hi, n) always ends at hi, so lowering n_windows can never
+        lower the top centre (n = 2..16 all gave the identical top centre); "lower
+        --swarm-n-windows" was never actionable advice.
+    The replacement (autotune_cv1_upper_bound, wired in via seed_cv1) probes the SAME seed
+    pool the windows will actually start from and only lowers hi when a centre genuinely has
+    no nearby seed.
+    """
+    v = np.asarray(cv1, dtype=float)
+    v = v[np.isfinite(v)]
+    if seed_cv1 is not None:
+        result = autotune_cv1_upper_bound(
+            v, seed_cv1, n_windows=n_windows, lo_q=lo_q, hi_q=hi_q, temperature_k=temperature_k,
+            k_max_kcal=k_max_kcal, max_seed_gap_sigma=max_seed_gap_sigma,
+        )
+        if probe_out is not None:
+            probe_out.update(result)
+        return np.asarray(result["centres"], dtype=float)
+
     lo, hi = float(np.quantile(v, lo_q)), float(np.quantile(v, hi_q))
     lo = max(0.0, lo)
     hi = min(1.0, hi)
     if hi <= lo:
         raise ValueError("degenerate CV1 coverage: quantile range collapsed to a point")
-    centres = np.linspace(lo, hi, int(n_windows))
-    if library_cv1 is not None:
-        lib = np.asarray(library_cv1, dtype=float)
-        lib = lib[np.isfinite(lib)]
-        cap = float(np.quantile(lib, library_q))
-        if centres.max() > cap + 1e-12:
-            raise ValueError(
-                f"max CV1 centre {centres.max():.4f} exceeds the seed library q{int(library_q * 100)} = {cap:.4f}; "
-                "a pull cannot reach it -- lower --swarm-n-windows or extend the swarm"
-            )
-    return centres
+    return np.linspace(lo, hi, int(n_windows))
 
 
 def cv1_curvature_kcal(cv1, centers, temperature_k: float, *, n_hist: int = 60, smooth_bins: int = 2) -> np.ndarray:

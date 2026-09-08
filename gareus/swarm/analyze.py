@@ -270,24 +270,40 @@ def analyze_swarm_stage(out_dir, args) -> dict:
         v_dih = _pool(ok_traces, "v_dih_kj", discard)
         cv1_all = _pool(ok_traces, "cv1", discard)
         coverage_range = float(cv1_all.max() - cv1_all.min())
+        # Reported diagnostic only (2026-09-08 fix) -- round-0 windows seed from the swarm's
+        # OWN frames (seed_cv1=cv1_all below), never from the GENPEPT library, so this no
+        # longer gates the round; its q99 still travels with the report for provenance.
         library_cv1 = _library_cv1_for_round0(rd, plan_meta, warnings)
+        library_q99 = float(np.quantile(library_cv1, 0.99)) if library_cv1.size else None
 
         k_max = float(getattr(args, "contact_adaptive_max_k_kcal", 1200.0))
         k_min = float(getattr(args, "contact_adaptive_min_k_kcal", 5.0))
         overlap_sigma = float(getattr(args, "swarm_overlap_sigma", 1.5))
+        max_seed_gap_sigma = float(getattr(args, "swarm_max_seed_gap_sigma", 0.5))
         n_win = min(int(args.swarm_n_windows), n_resolvable_windows(coverage_range, temperature_k, k_max_kcal=k_max, overlap_sigma=overlap_sigma))
+        probe_out: Dict[str, Any] = {}
+        # The probe pool is the EXPORTED frames (those with a written PDB) past the discard --
+        # exactly what select_window_seed_frames draws from below. The trace is ~10x denser
+        # (every trace row vs one PDB per swarm_seed_frame_interval_ps), so probing the trace
+        # would "support" a centre with a frame no window could ever start from.
+        seed_pool_cv1 = np.asarray(
+            [float(fr["cv1"]) for fr in frame_candidates if int(fr["frame"]) >= discard], dtype=float
+        )
         try:
-            centers = cv1_centers_from_samples(cv1_all, n_windows=n_win, library_cv1=library_cv1, library_q=0.99)
+            centers = cv1_centers_from_samples(
+                cv1_all, n_windows=n_win, seed_cv1=seed_pool_cv1, temperature_k=temperature_k,
+                k_max_kcal=k_max, max_seed_gap_sigma=max_seed_gap_sigma, probe_out=probe_out,
+            )
         except ValueError as exc:
-            # A window centre beyond the library's real coverage is unreachable by a
-            # restrained pull (global constraint) -- this is a hard ladder-design
-            # failure, not a soft gate the swarm could pass by extending replicates.
-            # No ladder/gate/seed bank can be built without centres; the failure is
-            # still recorded (not raised) so the report and the already-written
-            # envelope/discard artefacts survive for the controller to inspect.
+            # The autotuned probe found no CV1 upper bound anywhere with seed support --
+            # this is a hard ladder-design failure, not a soft gate the swarm could pass by
+            # extending replicates. No ladder/gate/seed bank can be built without centres;
+            # the failure is still recorded (not raised) so the report and the already-
+            # written envelope/discard artefacts survive for the controller to inspect.
             report.update({
                 "status": "fail", "reasons": [f"ladder design: {exc}"],
                 "envelope": _envelope_summary(env, an / "shared_gamd_setup"),
+                "ladder_design": {"library_q99": library_q99, "n_seed_pool": int(seed_pool_cv1.size)},
             })
             _withhold_ladder_artifacts(an)
             write_json(an / "swarm_report.json", report)
@@ -305,12 +321,20 @@ def analyze_swarm_stage(out_dir, args) -> dict:
             ess_floor=int(getattr(args, "swarm_ess_floor", 50)),
         )
         fsf = fsf_floor_per_rung(ladder["lambdas"], env, warn_threshold=float(getattr(args, "swarm_fsf_floor_warn", 0.5)))
+        max_nearest_seed_gap = float(np.max(probe_out["nearest_seed_gap"])) if len(probe_out.get("nearest_seed_gap", [])) else None
+        cv1_upper_bound_probe = {
+            "autotuned": bool(probe_out.get("autotuned")),
+            "hi": float(probe_out["hi"]), "hi_initial": float(probe_out["hi_initial"]),
+            "tol": float(probe_out["tol"]), "max_nearest_seed_gap": max_nearest_seed_gap,
+            "n_probes": int(probe_out.get("n_probes", 0)), "n_seed_pool": int(seed_pool_cv1.size),
+        }
         ladder_design = dict(ladder)
         ladder_design.update({
             "centers": [float(c) for c in centers], "curvature_kcal": [float(c) for c in curvature],
             "k_kcal": [float(k) for k in ks], "window_sigma_cv": [window_sigma_cv(k, temperature_k) for k in ks],
             "k_warnings": k_warnings, "fsf_floor_per_rung": fsf, "n_windows": int(n_win),
             "n_states": int(n_win) * len(ladder["lambdas"]), "coverage_range": coverage_range,
+            "library_q99": library_q99, "cv1_upper_bound_probe": cv1_upper_bound_probe,
         })
         write_json(an / "ladder_design.json", ladder_design)
 
@@ -332,6 +356,7 @@ def analyze_swarm_stage(out_dir, args) -> dict:
             "status": gate["status"], "gate": gate, "n_windows": int(n_win), "n_states": ladder_design["n_states"],
             "envelope": _envelope_summary(env, an / "shared_gamd_setup"),
             "fsf_warn": fsf["warn"], "n_k_warnings": len(k_warnings),
+            "ladder_design": {"library_q99": library_q99, **cv1_upper_bound_probe},
         })
         if gate["status"] == "pass":
             windows_csv = write_ladder_windows_csv(an / "windows_lambda_ladder.csv", centers, ks, ladder["lambdas"])
