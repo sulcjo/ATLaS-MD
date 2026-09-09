@@ -259,3 +259,32 @@ def epoch0_seed_bank_if_present(out_dir) -> Path:
     """
     bank = epoch0_seed_bank(out_dir)
     return bank if bank.exists() else None
+
+
+#: The swarm's own precondition (see run_swarm_stage): members are grafted from a
+#: GENPEPT library, and the library is identified by this index.
+SEED_LIBRARY_INDEX = "final_survivor_seeds.csv"
+
+
+def epoch0_is_available(args) -> bool:
+    """Whether this campaign has a swarm to run at all.
+
+    "No window table was handed in" is not sufficient to conclude "run a swarm":
+    plenty of adaptive-production runs legitimately start without one and take
+    their states from a registry, an epoch directory, or a resume. Engaging the
+    swarm for those turns a working run into a SystemExit about a missing seed
+    library.
+
+    So the test is the swarm's own precondition, checked before it is called
+    rather than raised from inside it: a seed library with a non-empty index. A
+    seed bank exported by a previous campaign has no index and correctly does not
+    qualify.
+    """
+    raw = getattr(args, "seed_conformers_dir", None)
+    if not raw:
+        return False
+    index = Path(str(raw)) / SEED_LIBRARY_INDEX
+    try:
+        return index.is_file() and index.stat().st_size > 0
+    except OSError:
+        return False

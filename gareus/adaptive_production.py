@@ -6603,6 +6603,9 @@ def _epoch_loop_missing_convergence(epoch: int, max_epochs: int, gate_converged:
     return bool(epoch + 1 >= max_epochs and not gate_converged and require_convergence_before_final)
 
 
+from gareus.swarm.epoch0 import epoch0_is_available
+
+
 def _charge_swarm_to_pool(runtime_pool, ns: float, path) -> None:
     """Bill epoch 0's unbiased sampling to the same budget as every other epoch.
 
@@ -6728,7 +6731,18 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
     # off disk is cheap and idempotent, so this runs on every job in the chain --
     # a finished swarm returns its ladder immediately, a half-finished one
     # continues, and a failed one raises instead of producing a partial ladder.
-    if current_windows_csv is None:
+    # Three conditions, all necessary. No window table means the state space has
+    # not been designed yet -- but that is also true of runs that never wanted a
+    # swarm and take their states from a registry, an epoch dir or a resume, so
+    # a seed library must actually be configured (epoch0_is_available checks the
+    # swarm's own precondition rather than letting it raise from inside). And an
+    # existing state_registry.json means epochs have already run, so epoch 0 is
+    # behind us whatever else is on disk.
+    if (
+        current_windows_csv is None
+        and epoch0_is_available(args)
+        and not (adaptive_dir / "state_registry.json").exists()
+    ):
         current_windows_csv = _epoch0_swarm_window_table(
             args, out_dir, adaptive_dir, runtime_pool, progress)
         # seed_conformers_dir means the GENPEPT library while the swarm is
