@@ -156,3 +156,88 @@ def epoch0_status(out_dir, round_index: int = 0) -> Dict[str, Any]:
     else:
         status.update(state="members_complete", next_action=EPOCH0_ANALYZE)
     return status
+
+
+class Epoch0GateFailure(RuntimeError):
+    """The swarm round cannot hand off, so the campaign must not continue.
+
+    Raised rather than returned because there is no useful degraded mode: every
+    later epoch samples the ladder this round was supposed to design.
+    """
+
+
+#: Each pass performs one action and re-derives the state, so a cold start needs
+#: two (run members, then analyse) and a resume needs one. The bound exists only
+#: so a state that fails to advance stops instead of spinning.
+_MAX_EPOCH0_PASSES = 4
+
+
+def run_or_resume_epoch0(
+    args,
+    out_dir,
+    *,
+    progress=None,
+    run_members=None,
+    analyze=None,
+    charge_ns=None,
+    round_index: int = None,
+) -> Path:
+    """Drive epoch 0 to completion and return the ladder production will sample.
+
+    Safe to call at the start of every job in the chain: the work already done
+    is read off the disk, so a finished swarm costs nothing and a half-finished
+    one continues from where it stopped. ``run_members`` and ``analyze`` are
+    injectable so the decisions can be tested without running MD.
+
+    ``charge_ns`` is called at most once per campaign, with the nanoseconds the
+    swarm consumed. It fires on the pass that completes the round and never on a
+    resume, because by then the marker already records the cost.
+    """
+    out_dir = Path(out_dir)
+    if round_index is None:
+        round_index = int(getattr(args, "swarm_round", 0) or 0)
+    if run_members is None:
+        from gareus.swarm.driver import run_swarm_stage as run_members
+    if analyze is None:
+        from gareus.swarm.analyze import analyze_swarm_stage as analyze
+
+    ladder = analysis_dir(out_dir) / "windows_lambda_ladder.csv"
+
+    for _ in range(_MAX_EPOCH0_PASSES):
+        status = epoch0_status(out_dir, round_index)
+        action = status["next_action"]
+
+        if action == EPOCH0_STOP:
+            raise Epoch0GateFailure(
+                "swarm epoch 0 gate failed: " + "; ".join(status["reasons"] or ["no reason recorded"])
+            )
+
+        if action == EPOCH0_PROCEED:
+            return ladder
+
+        if action == EPOCH0_RUN_MEMBERS:
+            # Resumable in its own right: members with a done.json are skipped
+            # inside the driver, so this both starts and continues a round.
+            run_members(args, out_dir, progress)
+            continue
+
+        report = analyze(out_dir, args) or {}
+        if str(report.get("status", "")) not in ("ok", "pass"):
+            raise Epoch0GateFailure(
+                "swarm epoch 0 analysis did not pass: "
+                + str(report.get("status", "unknown"))
+                + (("; " + "; ".join(str(r) for r in report.get("reasons", []))) if report.get("reasons") else "")
+            )
+
+        settled = epoch0_status(out_dir, round_index)
+        ns = float(settled["n_done"]) * float(getattr(args, "swarm_seed_ns", 1.0) or 0.0)
+        # Marker last, and only now: analyze has written the artefacts it names.
+        mark_epoch0_complete(out_dir, n_members=settled["n_done"], ns_charged=ns)
+        if charge_ns is not None:
+            charge_ns(ns)
+        return ladder
+
+    raise RuntimeError(
+        f"swarm epoch 0 did not reach a terminal state in {_MAX_EPOCH0_PASSES} passes "
+        f"(last state {epoch0_status(out_dir, round_index)['state']!r})"
+    )
