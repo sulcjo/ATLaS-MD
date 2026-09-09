@@ -644,6 +644,11 @@ def _add_swarm_args(p: argparse.ArgumentParser) -> None:
                         "swarm-member equilibration (measured 2026-09-08: 100 iterations left "
                         "18/99 members NaN 0-3s into equilibration; the umbrella-seeding graft "
                         "caller already uses 1000 via --us-pull-minimize-iterations).")
+    p.add_argument("--swarm-member-workers", default="auto",
+                   help="Swarm members to run concurrently. 'auto' (default) uses one per "
+                        "--device-index token on a GPU platform and 1 otherwise. Members are "
+                        "independent, so this is what replaces sharding the round across "
+                        "several SLURM jobs.")
     p.add_argument("--swarm-member-range", type=str, default=None,
                    help="'a:b' half-open shard of the round's member list; None = all members.")
     p.add_argument("--swarm-round", type=int, default=0,
