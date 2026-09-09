@@ -142,6 +142,12 @@ def _withhold_ladder_artifacts(an: Path) -> None:
     """A gate that used to pass (a prior analysis run) but now fails must not leave a stale
     ``windows_lambda_ladder.csv``/``ladder_run_args.yaml`` for S2 to pick up -- these are
     removed, not merely skipped, on every fail path."""
+    # Both files go, and only on a fail path. This is deliberate deletion, not a
+    # write-ordering concern: production preflights on the ladder's presence, so a
+    # ladder left behind by an earlier passing analysis would let a run start on an
+    # envelope the current gate rejects. (The happy path never deletes --
+    # write_ladder_windows_csv stages and renames, so a passing re-analysis replaces
+    # the ladder atomically and it is never momentarily absent.)
     (an / "windows_lambda_ladder.csv").unlink(missing_ok=True)
     (an / "ladder_run_args.yaml").unlink(missing_ok=True)
 

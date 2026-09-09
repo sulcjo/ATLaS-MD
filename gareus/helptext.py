@@ -1926,7 +1926,6 @@ plausibility check, not an identity test -- the pilot's envelope came from one
 boosted umbrella window and the swarm's is unbiased, so the two sample different
 ensembles on purpose. The swarm envelope stays authoritative for the campaign; a
 "fail" means inspect which channel disagrees and extend the swarm, never
-hand-edit the envelope. Writes swarm/analysis/pilot_comparison.json.
 
 No native reference or folded-state label is used anywhere in this stage.
 """

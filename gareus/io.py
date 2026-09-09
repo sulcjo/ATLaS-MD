@@ -14,6 +14,7 @@ import json
 import csv
 import math
 import os
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -37,20 +38,80 @@ class _NumpyEncoder(json.JSONEncoder):
         return super().default(o)
 
 
+def _staging_path(path: Path) -> Path:
+    """Create an empty staging file beside ``path`` and return it.
+
+    The name is unique per call and carries the writing process's pid, so a
+    stray file names its own author. Uniqueness is the point: a shared
+    ``<name>.tmp`` is NOT safe when several writers touch one path at once,
+    because each rename lands on a temp file another writer is still filling.
+    That is how swarm shard 3 died on ``run_args.json.tmp`` (job 2374840),
+    and threads within one process share a pid, so the pid alone is not
+    enough either -- ``mkstemp`` supplies the rest.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(dir=str(path.parent), prefix=f"{path.name}.tmp.{os.getpid()}.")
+    os.close(fd)
+    return Path(name)
+
+
+def _persist(tmp: Path, path: Path) -> None:
+    """Rename a fully written staging file onto its final path."""
+    tmp.replace(path)
+
+
 def write_json(path: Path, payload: Any) -> None:
-    """Write a JSON payload to a file.
+    """Write a JSON payload to a file, atomically.
 
     The directory is created if necessary and NumPy types are converted
-    transparently via :class:`_NumpyEncoder`. The write is atomic: the
-    payload is written to a temporary file in the same directory and then
-    renamed onto the final path, so a process killed mid-write cannot leave
-    a torn/partial file behind.
+    transparently via :class:`_NumpyEncoder`. The payload is serialised
+    first, then written to a unique staging file and renamed onto the final
+    path, so a process killed mid-write leaves the previous file intact and
+    concurrent writers cannot collide. On any failure the staging file is
+    removed rather than left behind.
     """
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True, cls=_NumpyEncoder), encoding="utf-8")
-    tmp.replace(path)
+    # Serialise before creating anything on disk: an unserialisable payload
+    # must not leave a staging file for someone else to trip over.
+    text = json.dumps(payload, indent=2, sort_keys=True, cls=_NumpyEncoder)
+    tmp = _staging_path(path)
+    try:
+        with tmp.open("w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        _persist(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def write_csv_atomic(path: Path, header: Iterable[Any], rows: Iterable[Iterable[Any]]) -> Path:
+    """Write a header + rows to ``path`` atomically, creating parents as needed.
+
+    Used for the files a resumed run reads back as fact -- the swarm round's
+    ``plan.csv`` and the ladder's ``windows_lambda_ladder.csv``. Both are
+    read by a later job in the chain and both are silently wrong if truncated:
+    a short plan runs fewer members than were designed, and a short ladder
+    yields fewer production states, in neither case with an error. ``rows``
+    may be a generator; if it raises part-way the staging file is discarded
+    and the previous contents of ``path`` survive untouched.
+    """
+    path = Path(path)
+    tmp = _staging_path(path)
+    try:
+        with tmp.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(list(header))
+            for row in rows:
+                w.writerow(list(row))
+            f.flush()
+            os.fsync(f.fileno())
+        _persist(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return path
 
 
 def read_json_file(path: Path, default: Optional[Any] = None) -> Any:

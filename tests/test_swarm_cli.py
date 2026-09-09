@@ -49,7 +49,7 @@ def test_swarm_all_flags_are_known_config_dests():
         "swarm_member_range", "swarm_round", "swarm_seed_source", "swarm_production_seed_csv",
         "swarm_n_windows", "swarm_overlap_sigma", "swarm_target_beta_sigma", "swarm_min_rungs",
         "swarm_max_rungs", "swarm_ess_floor", "swarm_seeds_per_window", "swarm_discard_block_frames",
-        "swarm_min_discard_ps", "swarm_fsf_floor_warn", "swarm_pilot_globals", "shared_gamd_setup_dir",
+        "swarm_min_discard_ps", "swarm_fsf_floor_warn", "shared_gamd_setup_dir",
         "swarm_graft_minimize_iters", "swarm_max_seed_gap_sigma",
         "swarm_stability_sigma_rel_tol", "swarm_stability_extrema_sigma_tol",
         "swarm_min_done_fraction", "swarm_max_graft_fallback_fraction",

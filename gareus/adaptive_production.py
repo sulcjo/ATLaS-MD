@@ -6603,6 +6603,44 @@ def _epoch_loop_missing_convergence(epoch: int, max_epochs: int, gate_converged:
     return bool(epoch + 1 >= max_epochs and not gate_converged and require_convergence_before_final)
 
 
+from gareus.swarm.epoch0 import epoch0_is_available
+
+
+def _charge_swarm_to_pool(runtime_pool, ns: float, path) -> None:
+    """Bill epoch 0's unbiased sampling to the same budget as every other epoch.
+
+    ``consume`` derives nanoseconds from ``n_states * steps * timestep_fs``, so
+    the count is inverted here against the pool's own timestep: the swarm is one
+    aggregate block of MD, not a per-state segment, and what has to be exact is
+    the nanoseconds it removes from the budget.
+    """
+    if runtime_pool is None or ns <= 0.0:
+        return
+    steps = int(round(float(ns) * 1.0e6 / max(1.0e-9, float(runtime_pool.timestep_fs))))
+    runtime_pool.consume(
+        label="epoch_000_swarm", kind="swarm_epoch0",
+        n_states=1, steps=steps, path=path,
+    )
+
+
+def _epoch0_swarm_window_table(args, out_dir, adaptive_dir, runtime_pool, progress):
+    """Run (or resume, or skip) the unbiased swarm and return the ladder it designed.
+
+    This is what makes the campaign one self-contained run: with no window table
+    handed in, the state space does not exist yet at startup, and epoch 0 is the
+    phase that creates it. Called on every job in the chain -- a completed swarm
+    returns its ladder without running anything.
+    """
+    from gareus.swarm.epoch0 import run_or_resume_epoch0
+
+    ladder = run_or_resume_epoch0(
+        args, out_dir, progress=progress,
+        charge_ns=lambda ns: _charge_swarm_to_pool(runtime_pool, ns, adaptive_dir),
+    )
+    print(f"    Epoch 0 (unbiased swarm): window table {ladder}")
+    return ladder
+
+
 def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, forcefield, topology, equil_state, progress=None) -> Dict[str, Any]:
     """Run adaptive production by calling the existing GAREUS worker per epoch.
 
@@ -6687,6 +6725,36 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
     # of always restarting at final_extension_001.
     prior_extension_summaries: List[Dict[str, Any]] = []
     previous_diagnostics: Optional[Dict[str, Any]] = None
+
+    # No window table handed in means the state space has not been designed yet:
+    # epoch 0 is the unbiased swarm that designs it. Reading the swarm's progress
+    # off disk is cheap and idempotent, so this runs on every job in the chain --
+    # a finished swarm returns its ladder immediately, a half-finished one
+    # continues, and a failed one raises instead of producing a partial ladder.
+    # Three conditions, all necessary. No window table means the state space has
+    # not been designed yet -- but that is also true of runs that never wanted a
+    # swarm and take their states from a registry, an epoch dir or a resume, so
+    # a seed library must actually be configured (epoch0_is_available checks the
+    # swarm's own precondition rather than letting it raise from inside). And an
+    # existing state_registry.json means epochs have already run, so epoch 0 is
+    # behind us whatever else is on disk.
+    if (
+        current_windows_csv is None
+        and epoch0_is_available(args)
+        and not (adaptive_dir / "state_registry.json").exists()
+    ):
+        current_windows_csv = _epoch0_swarm_window_table(
+            args, out_dir, adaptive_dir, runtime_pool, progress)
+        # seed_conformers_dir means the GENPEPT library while the swarm is
+        # grafting its members, and the swarm's own export once it has finished.
+        # Switch to the export here, or every umbrella window would be seeded
+        # from generic library conformers instead of structures the swarm
+        # actually visited in that window.
+        from gareus.swarm.epoch0 import epoch0_seed_bank_if_present
+        _swarm_bank = epoch0_seed_bank_if_present(out_dir)
+        if _swarm_bank is not None:
+            current_seed_bank = _swarm_bank
+            print(f"    Epoch 0: umbrella seeding uses the swarm seed bank {_swarm_bank}")
 
     summary_path = adaptive_dir / "adaptive_production_driver_summary.json"
     registry_path = adaptive_dir / "state_registry.json"

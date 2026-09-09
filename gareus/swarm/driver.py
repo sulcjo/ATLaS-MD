@@ -21,7 +21,12 @@ from __future__ import annotations
 import csv
 import json
 import re
+import concurrent.futures
+import copy
+import threading
 from pathlib import Path
+
+from gareus.io import read_json_file, write_csv_atomic, write_json
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -119,13 +124,21 @@ def _load_frozen_edges(out_dir) -> Dict[str, list]:
 
 
 def _write_plan(rd: Path, rows: List[dict], meta: dict) -> None:
+    """Persist one round's member plan, all-or-nothing.
+
+    ``plan.csv`` is the round's definition of how many members exist; every
+    later job in the chain reads it back verbatim rather than re-deriving it.
+    A truncated plan is therefore not a crash but a silently smaller round, so
+    the CSV is staged and renamed. ``plan_meta.json`` is written last and acts
+    as the completion marker that ``build_or_load_plan`` gates on.
+    """
     rd.mkdir(parents=True, exist_ok=True)
-    with (rd / "plan.csv").open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=PLAN_COLUMNS)
-        w.writeheader()
-        for row in rows:
-            w.writerow({k: row.get(k, "") for k in PLAN_COLUMNS})
-    (rd / "plan_meta.json").write_text(json.dumps(meta, indent=2))
+    write_csv_atomic(
+        rd / "plan.csv",
+        PLAN_COLUMNS,
+        ([row.get(k, "") for k in PLAN_COLUMNS] for row in rows),
+    )
+    write_json(rd / "plan_meta.json", meta)
 
 
 SEED_DESCRIPTOR_COLUMNS = ["seed_id", "pdb_path", "cv1", "rg_nm", "e2e_nm"]
@@ -295,40 +308,30 @@ def run_swarm_stage(args, out_dir, progress=None) -> dict:
 
     member_range = parse_member_range(getattr(args, "swarm_member_range", None), len(rows))
 
-    status_counts: Dict[str, int] = {}
-    n_run = n_skipped_resume = 0
-    failed_in_range: List[int] = []     # done.json exists, status != "ok" (graft/MD failure) -- this shard only
-    missing_in_range: List[int] = []    # attempted this call but done.json still absent afterwards -- this shard only
-    for i in member_range:
-        row = rows[i]
+    n_workers, device_tokens = resolve_member_workers(args)
+    missing_in_range: List[int] = []
+    _missing_lock = threading.Lock()
+
+    def _run_one(worker_args, row, member_dir, device):
         member_id = int(row["member_id"])
-        member_dir = rd / f"member_{member_id:04d}"
-
-        if member_done(member_dir):
-            n_skipped_resume += 1
-            done = json.loads((member_dir / "done.json").read_text())
-            status = str(done.get("status", "ok"))
-            status_counts[status] = status_counts.get(status, 0) + 1
-            if status != "ok":
-                failed_in_range.append(member_id)
-            continue
-
         conformer = _resolve_conformer(row, library, library_by_path)
-
+        # Each worker pins its own accelerator; the property key differs by
+        # platform, so set whichever one this platform actually published.
+        props = dict(sysinfo["props"] or {})
+        for key in ("CudaDeviceIndex", "DeviceIndex", "OpenCLDeviceIndex"):
+            if key in props:
+                props[key] = str(device)
+                break
         done = run_member(
-            args, row, member_dir,
+            worker_args, row, member_dir,
             openmm=sysinfo["openmm"], app=sysinfo["app"], unit=sysinfo["unit"], topology=topology,
             base_system_xml=sysinfo["base_system_xml"], equil_state=sysinfo["equil_state"], conformer=conformer,
-            platform=sysinfo["platform"], props=sysinfo["props"], contact_pairs=contact_pairs, progress=progress,
+            platform=sysinfo["platform"], props=props, contact_pairs=contact_pairs, progress=progress,
         )
-        n_run += 1
         status = str(done.get("status", "ok"))
-        status_counts[status] = status_counts.get(status, 0) + 1
         if not member_done(member_dir):
-            missing_in_range.append(member_id)
-        elif status != "ok":
-            failed_in_range.append(member_id)
-
+            with _missing_lock:
+                missing_in_range.append(member_id)
         print(
             f"member {member_id:04d}/{len(rows):04d} cell {row['cell_id']} seed {row['seed_id']} "
             f"rep {row['replicate']} status {status} {float(done.get('ns_per_day', 0.0)):.0f} ns/day"
@@ -339,6 +342,17 @@ def run_swarm_stage(args, out_dir, progress=None) -> dict:
                 "n_members": len(rows), "cell_id": row["cell_id"], "seed_id": row["seed_id"],
                 "status": status, "ns_per_day": float(done.get("ns_per_day", 0.0)),
             })
+        return done
+
+    if n_workers > 1:
+        print(f"    swarm: {n_workers} concurrent members over devices {', '.join(device_tokens)}")
+    tally = execute_members(args, rows, member_range, rd, _run_one,
+                            n_workers=n_workers, device_tokens=device_tokens)
+    n_run = tally["n_run"]
+    n_skipped_resume = tally["n_skipped_resume"]
+    failed_in_range = tally["failed_in_range"]
+    status_counts = tally["status_counts"]
+    missing_in_range = sorted(set(missing_in_range))
 
     return {
         "status": "ok",
@@ -350,4 +364,121 @@ def run_swarm_stage(args, out_dir, progress=None) -> dict:
         "status_counts": status_counts,
         "missing_in_range": missing_in_range,
         "plan_meta": meta,
+    }
+
+
+#: Platforms where separate workers land on separate accelerators. Everything
+#: else shares one device and gains nothing from concurrency here.
+_GPU_PLATFORM_NAMES = frozenset({"CUDA", "HIP", "OpenCL"})
+
+
+def resolve_member_workers(args) -> Tuple[int, List[str]]:
+    """How many members to run at once, and which devices to spread them over.
+
+    "auto" means one worker per device token, matching what --us-pull-workers
+    already does for umbrella seeding. An unparseable value falls back to serial
+    rather than raising: a bad worker count should slow a campaign down, never
+    stop one that is otherwise ready to run.
+    """
+    dev_str = str(getattr(args, "device_index", "") or "")
+    device_tokens = [x.strip() for x in dev_str.split(",") if x.strip()] or ["0"]
+    platform_name = str(getattr(args, "setup_platform", "") or getattr(args, "platform", "") or "")
+    raw = str(getattr(args, "swarm_member_workers", "auto") or "auto").lower().strip()
+    if raw in {"auto", "0", ""}:
+        n_workers = len(device_tokens) if platform_name in _GPU_PLATFORM_NAMES else 1
+    else:
+        try:
+            n_workers = max(1, int(raw))
+        except (TypeError, ValueError):
+            n_workers = 1
+    return n_workers, device_tokens
+
+
+def execute_members(args, rows, member_range, rd, run_one, *, n_workers: int = 1,
+                    device_tokens: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Run one round's outstanding members, concurrently when asked to.
+
+    Members are independent by construction -- each grafts its own seed and
+    writes its own directory -- so the only shared state that matters is ``args``.
+    run_member sets ``args.seed`` to the member's velocity seed and restores it
+    afterwards, which is safe serially and a race as soon as two members overlap:
+    they would sample each other's seeds and the round would stop being
+    reproducible. Each worker therefore gets its own shallow copy.
+
+    A member that raises is recorded and the round continues. Members legitimately
+    blow up (a graft that will not relax, a NaN), and losing the other 173 to one
+    bad conformer would be a far worse outcome than an incomplete round the gate
+    can judge on its merits.
+    """
+    rd = Path(rd)
+    device_tokens = list(device_tokens or ["0"])
+    n_workers = max(1, int(n_workers))
+
+    status_counts: Dict[str, int] = {}
+    n_run = n_skipped_resume = 0
+    failed_in_range: List[int] = []
+    missing_in_range: List[int] = []
+
+    pending: List[Tuple[int, dict, Path]] = []
+    for i in member_range:
+        row = rows[i]
+        member_id = int(row["member_id"])
+        member_dir = rd / f"member_{member_id:04d}"
+        if member_done(member_dir):
+            n_skipped_resume += 1
+            done = read_json_file(member_dir / "done.json", {}) or {}
+            status = str(done.get("status", "ok"))
+            status_counts[status] = status_counts.get(status, 0) + 1
+            if status != "ok":
+                failed_in_range.append(member_id)
+            continue
+        pending.append((member_id, row, member_dir))
+
+    results: Dict[int, Any] = {}
+    errors: Dict[int, BaseException] = {}
+
+    def _one(slot: int, member_id: int, row: dict, member_dir: Path):
+        worker_args = copy.copy(args)
+        device = device_tokens[slot % len(device_tokens)]
+        return run_one(worker_args, row, member_dir, device)
+
+    if n_workers == 1 or len(pending) <= 1:
+        for slot, (member_id, row, member_dir) in enumerate(pending):
+            try:
+                results[member_id] = _one(slot, member_id, row, member_dir)
+            except BaseException as exc:      # noqa: BLE001 - recorded, not swallowed
+                errors[member_id] = exc
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futures = {
+                pool.submit(_one, slot, member_id, row, member_dir): member_id
+                for slot, (member_id, row, member_dir) in enumerate(pending)
+            }
+            for future in concurrent.futures.as_completed(futures):
+                member_id = futures[future]
+                try:
+                    results[member_id] = future.result()
+                except BaseException as exc:  # noqa: BLE001 - recorded, not swallowed
+                    errors[member_id] = exc
+
+    for member_id, _row, member_dir in pending:
+        if member_id in errors:
+            failed_in_range.append(member_id)
+            status_counts["error"] = status_counts.get("error", 0) + 1
+            print(f"WARNING: swarm member {member_id} raised: {errors[member_id]}")
+            continue
+        n_run += 1
+        done = results.get(member_id) or {}
+        status = str(done.get("status", "ok"))
+        status_counts[status] = status_counts.get(status, 0) + 1
+        if status != "ok":
+            failed_in_range.append(member_id)
+
+    return {
+        "n_run": n_run,
+        "n_skipped_resume": n_skipped_resume,
+        "failed_in_range": sorted(set(failed_in_range)),
+        "missing_in_range": sorted(set(missing_in_range)),
+        "status_counts": status_counts,
+        "n_workers": n_workers,
     }
