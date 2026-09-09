@@ -22,6 +22,8 @@ import csv
 import json
 import re
 from pathlib import Path
+
+from gareus.io import write_csv_atomic, write_json
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -119,13 +121,21 @@ def _load_frozen_edges(out_dir) -> Dict[str, list]:
 
 
 def _write_plan(rd: Path, rows: List[dict], meta: dict) -> None:
+    """Persist one round's member plan, all-or-nothing.
+
+    ``plan.csv`` is the round's definition of how many members exist; every
+    later job in the chain reads it back verbatim rather than re-deriving it.
+    A truncated plan is therefore not a crash but a silently smaller round, so
+    the CSV is staged and renamed. ``plan_meta.json`` is written last and acts
+    as the completion marker that ``build_or_load_plan`` gates on.
+    """
     rd.mkdir(parents=True, exist_ok=True)
-    with (rd / "plan.csv").open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=PLAN_COLUMNS)
-        w.writeheader()
-        for row in rows:
-            w.writerow({k: row.get(k, "") for k in PLAN_COLUMNS})
-    (rd / "plan_meta.json").write_text(json.dumps(meta, indent=2))
+    write_csv_atomic(
+        rd / "plan.csv",
+        PLAN_COLUMNS,
+        ([row.get(k, "") for k in PLAN_COLUMNS] for row in rows),
+    )
+    write_json(rd / "plan_meta.json", meta)
 
 
 SEED_DESCRIPTOR_COLUMNS = ["seed_id", "pdb_path", "cv1", "rg_nm", "e2e_nm"]

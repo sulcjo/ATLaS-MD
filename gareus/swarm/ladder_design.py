@@ -16,6 +16,8 @@ observed coverage range of the swarm's/library's CV1 samples, never against a fi
 from __future__ import annotations
 
 import csv
+
+from gareus.io import write_csv_atomic
 import math
 from pathlib import Path
 from typing import List, Optional
@@ -355,13 +357,21 @@ def cv1_force_constants_from_curvature(centers, curvature_kcal, temperature_k: f
 def write_ladder_windows_csv(path, centers, ks_kcal, lambdas) -> Path:
     """Full cross product of CV1 centres x lambda rungs (never truncate the exchange graph)."""
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["window", "primary_cv_mode", "primary_cv_center", "primary_cv_k_kcal", "gamd_lambda"])
+    lambdas = list(lambdas)
+
+    def _rows():
         n = 0
         for c, k in zip(centers, ks_kcal):
             for lam in lambdas:
-                w.writerow([n, "contacts", f"{float(c):.6f}", f"{float(k):.4f}", f"{float(lam):.6f}"])
+                yield [n, "contacts", f"{float(c):.6f}", f"{float(k):.4f}", f"{float(lam):.6f}"]
                 n += 1
-    return path
+
+    # Staged and renamed: this file IS the production state space, and a
+    # truncated copy silently yields fewer (window, rung) states rather than
+    # an error. The rename also means the previous ladder stays readable
+    # right up to the instant the new one replaces it.
+    return write_csv_atomic(
+        path,
+        ["window", "primary_cv_mode", "primary_cv_center", "primary_cv_k_kcal", "gamd_lambda"],
+        _rows(),
+    )
