@@ -241,3 +241,21 @@ def run_or_resume_epoch0(
         f"swarm epoch 0 did not reach a terminal state in {_MAX_EPOCH0_PASSES} passes "
         f"(last state {epoch0_status(out_dir, round_index)['state']!r})"
     )
+
+
+def epoch0_seed_bank(out_dir) -> Path:
+    """Where epoch 0 exports the per-window seed bank."""
+    return analysis_dir(out_dir) / "seed_bank"
+
+
+def epoch0_seed_bank_if_present(out_dir) -> Path:
+    """The swarm's seed bank, or None when the swarm has not exported one yet.
+
+    ``seed_conformers_dir`` carries two different meanings across one campaign:
+    the GENPEPT library the swarm grafts its members from, and the bank the swarm
+    exports for the umbrella windows. Production must switch to the latter once
+    epoch 0 has produced it -- otherwise every window would be seeded from generic
+    library conformers instead of structures the swarm actually visited there.
+    """
+    bank = epoch0_seed_bank(out_dir)
+    return bank if bank.exists() else None

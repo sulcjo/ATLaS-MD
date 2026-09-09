@@ -124,5 +124,33 @@ class Epoch0OrchestrationTests(unittest.TestCase):
         self.assertEqual(charged, [10.0])
 
 
+
+class Epoch0SeedBankTests(unittest.TestCase):
+    """After epoch 0, production must seed from the swarm's bank, not the library.
+
+    `seed_conformers_dir` means two different things across one campaign: the
+    GENPEPT library the swarm grafts from, and the seed bank the swarm produces
+    for the umbrella windows. Production reading the library instead would seed
+    every window from generic library conformers rather than from structures the
+    swarm actually visited in that window.
+    """
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.out = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_points_at_the_bank_the_swarm_produced(self):
+        from gareus.swarm.epoch0 import epoch0_seed_bank
+        bank = epoch0_seed_bank(self.out)
+        self.assertEqual(bank.name, "seed_bank")
+        self.assertEqual(bank.parent.name, "analysis")
+
+    def test_is_none_until_the_bank_exists(self):
+        from gareus.swarm.epoch0 import epoch0_seed_bank_if_present
+        self.assertIsNone(epoch0_seed_bank_if_present(self.out))
+        (self.out / "swarm" / "analysis" / "seed_bank").mkdir(parents=True)
+        self.assertIsNotNone(epoch0_seed_bank_if_present(self.out))
+
 if __name__ == "__main__":
     unittest.main()

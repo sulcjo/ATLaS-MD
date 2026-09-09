@@ -6731,6 +6731,16 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
     if current_windows_csv is None:
         current_windows_csv = _epoch0_swarm_window_table(
             args, out_dir, adaptive_dir, runtime_pool, progress)
+        # seed_conformers_dir means the GENPEPT library while the swarm is
+        # grafting its members, and the swarm's own export once it has finished.
+        # Switch to the export here, or every umbrella window would be seeded
+        # from generic library conformers instead of structures the swarm
+        # actually visited in that window.
+        from gareus.swarm.epoch0 import epoch0_seed_bank_if_present
+        _swarm_bank = epoch0_seed_bank_if_present(out_dir)
+        if _swarm_bank is not None:
+            current_seed_bank = _swarm_bank
+            print(f"    Epoch 0: umbrella seeding uses the swarm seed bank {_swarm_bank}")
 
     summary_path = adaptive_dir / "adaptive_production_driver_summary.json"
     registry_path = adaptive_dir / "state_registry.json"
