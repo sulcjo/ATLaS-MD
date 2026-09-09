@@ -288,7 +288,7 @@ def _method_settings(args: Any) -> dict[str, Any]:
         "swarm_production_seed_csv", "swarm_n_windows", "swarm_overlap_sigma", "swarm_target_beta_sigma",
         "swarm_min_rungs", "swarm_max_rungs", "swarm_ess_floor", "swarm_seeds_per_window",
         "swarm_discard_block_frames", "swarm_min_discard_ps", "swarm_fsf_floor_warn",
-        "swarm_max_seed_gap_sigma", "swarm_pilot_globals", "shared_gamd_setup_dir",
+        "swarm_max_seed_gap_sigma", "shared_gamd_setup_dir",
         "swarm_stability_sigma_rel_tol", "swarm_stability_extrema_sigma_tol",
         "swarm_min_done_fraction", "swarm_max_graft_fallback_fraction",
     ]

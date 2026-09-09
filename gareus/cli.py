@@ -617,7 +617,7 @@ def _add_output_args(p: argparse.ArgumentParser) -> None:
 def _add_swarm_args(p: argparse.ArgumentParser) -> None:
     """Unbiased swarm stage: seed stratification, per-cell replicate MD, envelope/ladder
     analysis, seed-bank export, and swarm-vs-pilot envelope comparison (gareus/swarm/)."""
-    p.add_argument("--swarm-stage", choices=["off", "run", "analyze", "compare"], default="off",
+    p.add_argument("--swarm-stage", choices=["off", "run", "analyze"], default="off",
                    help="Enter the unbiased swarm stage instead of the production chain. "
                         "'run' executes (a shard of) one round's members; 'analyze' pools "
                         "member traces into the envelope/ladder/gates/seed bank; 'compare' "
@@ -696,8 +696,7 @@ def _add_swarm_args(p: argparse.ArgumentParser) -> None:
                         "autotune_cv1_upper_bound): tol = this * window_sigma_cv(k_max, T), "
                         "the tightest window the design may use, so a seed inside tol is "
                         "on-centre for every window at least that soft.")
-    p.add_argument("--swarm-pilot-globals", type=Path, default=None,
-                   help="Pilot shared_gamd_setup_globals.json for --swarm-stage compare.")
+
     p.add_argument("--shared-gamd-setup-dir", type=str, default=None,
                    help="Reuse a previously calibrated GaMD envelope directory (e.g. the "
                         "swarm stage's shared_gamd_setup) instead of recalibrating from a "
@@ -1827,7 +1826,6 @@ def main(argv: Optional[Iterable[str]] = None):
     if _swarm_stage != "off":
         from gareus.swarm.driver import run_swarm_stage
         from gareus.swarm.analyze import analyze_swarm_stage
-        from gareus.swarm.compare_pilot import compare_envelopes
         progress = GuiProgressSink(out_dir, args)
         if _swarm_stage == "run":
             result = run_swarm_stage(args, out_dir, progress)
@@ -1842,13 +1840,6 @@ def main(argv: Optional[Iterable[str]] = None):
                 result = {**result, "reasons": result.get("gate", {}).get("reasons", [])}
             _print_keys = ("status", "n_members", "n_ok_members", "missing_members",
                            "failed_members", "discard_frames", "warnings", "reasons")
-        else:
-            pilot = getattr(args, "swarm_pilot_globals", None)
-            if not pilot:
-                raise SystemExit("--swarm-stage compare needs --swarm-pilot-globals PATH")
-            result = compare_envelopes(out_dir / "swarm" / "analysis" / "shared_gamd_setup" / "shared_gamd_setup_globals.json", Path(pilot))
-            write_json(out_dir / "swarm" / "analysis" / "pilot_comparison.json", result)
-            _print_keys = ("status", "freeze_allowed", "reasons", "groups")
         _swarm_manifest_status = "completed" if str(result.get("status", "")) in ("ok", "pass") else "failed"
         finalize_run_manifest(args, out_dir, status=_swarm_manifest_status)
         print(json.dumps({k: v for k, v in result.items() if k in _print_keys}, indent=2, default=str))
