@@ -1,0 +1,92 @@
+# RUN 07: reasonable all-methods combined run
+# Purpose: Practical integrated run using broad generation + BH + NMA + adaptive PCA frontier exploration.
+# This is not the largest run. It is meant as a sane production/test setting that combines all useful modes
+# without turning NMA/PCA into a probe apocalypse.
+
+genpept:
+  # Basic run identity
+  seq: "GYDPETGTWG"
+  out: "chignolin_genpept_run07_reasonable_all_methods"
+  clean: true
+
+  # Main workflow
+  two_stage: true
+  implicit_only: true
+
+  # Initial Ramachandran generation / candidate selection
+  # Moderate-large base map; later stages expand the frontier.
+  n: 150000
+  n_candidate_seeds: 1800
+  n_final_seeds: 1400
+
+  generation_backend: fast
+  rama_sampling: stratified
+  initial_diversity_features: mixed
+  diversity_bank_preset: broad
+
+  # Cheap coarse quota filter before expensive clustering/minimization
+  preselection_bin_quota: 3
+  preselection_rg_bin_A: 1.0
+  preselection_e2e_bin_A: 1.0
+  preselection_contact_bin: 2
+  preselection_include_bank: true
+
+  # Implicit minimization
+  adaptive_min: true
+  implicit_max_iterations: 300
+  adaptive_min_chunk_iterations: 25
+  adaptive_min_energy_tol: 0.05
+  adaptive_min_force_tol: 500.0
+  adaptive_min_stall_rounds: 2
+
+  # Basin hopping / MC local basin search
+  # Enough parents to seed diverse local jumps, but not so many that NMA explodes downstream.
+  basin_hop: true
+  bh_parent_seeds: 120
+  bh_steps: 3
+  bh_md_steps: 350
+  bh_temperature: 675.0
+  bh_friction: 5.0
+  bh_timestep: 0.0035
+  bh_hmr_mass: 3.014
+  bh_initial_min_iterations: 200
+  bh_min_iterations: 150
+  bh_restart_from_parent: true
+
+  # ANM/NMA collective expansion
+  # NMA expands from basin_hop_minima when BH is enabled.
+  # Approximate probes: 120 parents * (1 parent + 3 hops) * 2 modes * 2 amplitudes * 2 signs = 3840.
+  nma_expand: true
+  nma_modes: 2
+  nma_amplitudes: "0.75,1.35"
+  nma_cutoff: 12.0
+
+  # Adaptive PCA frontier exploration
+  # Archive-aware cheap proposal/minimization stage to fill sparse PCA/contact-shape frontier regions
+  # after the BH/NMA-expanded pool has been built.
+  explore_loop: true
+  explore_rounds: 1
+  explore_proposals: 50000
+  explore_keep: 250
+  explore_bins: 45
+  explore_target_max_count: 0
+  explore_pca_padding: 0.15
+  explore_frontier_only: true
+  explore_allow_outside: true
+  explore_max_kept_per_bin: 4
+  explore_bh: false
+
+  # OpenMM / runtime
+  ff: amber14
+  water: tip3pfb
+  ph: 7.0
+  temperature: 300.0
+  platform: OpenCL        # change to CUDA, auto, or CPU if needed
+  precision: mixed
+  min_jobs: 1             # keep 1 for one GPU
+  jobs: 8
+  cpu_threads: 4
+
+  # Output / UI niceties
+  live_hist: true
+  turbo_summary: true

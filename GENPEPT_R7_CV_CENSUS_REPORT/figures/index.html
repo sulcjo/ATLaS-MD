@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>GENPEPT r7 CV census — figures</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 2em; background: #fafafa; color: #222; }
+  h1 { font-size: 1.3em; }
+  fig { margin: 2em 0; background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 1em; }
+  img { max-width: 100%; display: block; margin: 0.5em auto; }
+  figcaption { font-size: 0.95em; color: #555; }
+  .path { font-family: monospace; font-size: 0.8em; color: #999; }
+</style>
+</head>
+<body>
+<h1>GENPEPT r7 seed bank — CV census figures</h1>
+<p><b>Full compiled report: <a href="../GENPEPT_R7_CV_CAMPAIGN_REPORT.html">GENPEPT_R7_CV_CAMPAIGN_REPORT.html</a></b></p>
+<p>Dataset: 1,970 survivors, 298 CVs. Report: <a href="../README.md">README.md</a> ·
+   tables: <a href="../report_tables.txt">report_tables.txt</a> ·
+   CV2 note: <a href="../CV2_DEEPDIVE.md">CV2_DEEPDIVE.md</a></p>
+
+<figure>
+  <img src="genpept_r7_cv_histograms.png" alt="CV histograms">
+  <figcaption><b>1. Representative CV distributions</b> — 28 panels; titles carry median / IQR / normalized entropy. Top-left block: contact CVs incl. legacy (collapsed, top-left) vs new winners.</figcaption>
+  <div class="path">figures/genpept_r7_cv_histograms.png</div>
+</figure>
+
+<figure>
+  <img src="genpept_r7_cv_corr.png" alt="CV correlation heatmap">
+  <figcaption><b>2. Clustered |Pearson r| redundancy map</b> — representative CVs; bright blocks = redundant groups (resbal vs atom-pairs; Rg vs contacts).</figcaption>
+  <div class="path">figures/genpept_r7_cv_corr.png</div>
+</figure>
+
+<figure>
+  <img src="genpept_r7_cv_2dmaps.png" alt="CV 2D scatter maps">
+  <figcaption><b>3. CV1 × CV2 scatters</b> — contact CV1 vs residual torsion PC1 (color Rg); contact vs plain torsion PC1 (color d(Y2–W9)); Rg vs hairpin closure ratio (color contact CV1).</figcaption>
+  <div class="path">figures/genpept_r7_cv_2dmaps.png</div>
+</figure>
+
+<figure>
+  <img src="cv2_loadings.png" alt="CV2 loadings">
+  <figcaption><b>4. Residual-PC1 loadings + spectrum</b> — the axis is the PETGT turn / strand ψ flip (cos ψ P4, W9, D3…); flat EVR spectrum (PC1 ≈ 9.7%).</figcaption>
+  <div class="path">figures/cv2_loadings.png</div>
+</figure>
+
+<figure>
+  <img src="cv2_diffusion_content.png" alt="CV2 diffusion content">
+  <figcaption><b>5. Diffusion content (Hess C₁)</b> — bank plain/residual PC1 projections sit at C₁ ≈ 0.07 (red line = 0.5 diffusion criterion); trace-own PC1 median 0.39. Bank axes are diversity coordinates, not slow-motion coordinates.</figcaption>
+  <div class="path">figures/cv2_diffusion_content.png</div>
+</figure>
+
+<figure>
+  <img src="cv2_joint_maps.png" alt="CV2 joint maps">
+  <figcaption><b>6. CV1 × CV2 16×8 joint maps</b> — log₁₀ counts; titles give occupancy (94–100%) and per-CV1-bin CV2 IQR. Grid placement for the window campaign is well-founded.</figcaption>
+  <div class="path">figures/cv2_joint_maps.png</div>
+</figure>
+
+
+<h1>v2 figures (new CV winners: backbone-heavy / CA-only, r&#8320;=10 &#197;)</h1>
+<p>Same layouts as the previous PC tests, regenerated for the census-winning definitions. Scripts: <code>scripts/genpept_r7v2_figures.py</code>, <code>scripts/genpept_r7v2_morph.py</code>.</p>
+
+<figure>
+  <img src="r7v2_contact_beta_pseudofes.png" alt="beta pseudofes v2">
+  <figcaption><b>7. &#946;-scan pseudo-FES</b> — heavy r&#8320;12 vs backbone-heavy r&#8320;10 vs CA-only r&#8320;10; spread-vs-&#946; panels.</figcaption>
+  <div class="path">figures/r7v2_contact_beta_pseudofes.png</div>
+</figure>
+<figure>
+  <img src="r7v2_combo_map_bb_beta3.png" alt="combo bb">
+  <figcaption><b>8. Combo map: backbone-heavy &#946;=3</b> — sep &#215; midpoint grid over the Rg/E2E pseudo-FES base.</figcaption>
+  <div class="path">figures/r7v2_combo_map_bb_beta3.png</div>
+</figure>
+<figure>
+  <img src="r7v2_combo_map_ca_beta3.png" alt="combo ca">
+  <figcaption><b>9. Combo map: CA-only &#946;=3</b></figcaption>
+  <div class="path">figures/r7v2_combo_map_ca_beta3.png</div>
+</figure>
+<figure>
+  <img src="r7v2_midpoint_scan_bb_r4.png" alt="midpoints bb">
+  <figcaption><b>10. Midpoint &#215; &#946; scan, backbone-heavy r&#8805;4</b> — r&#8320; 6–12 &#197;.</figcaption>
+  <div class="path">figures/r7v2_midpoint_scan_bb_r4.png</div>
+</figure>
+<figure>
+  <img src="r7v2_midpoint_scan_ca_r4.png" alt="midpoints ca">
+  <figcaption><b>11. Midpoint &#215; &#946; scan, CA-only r&#8805;4</b></figcaption>
+  <div class="path">figures/r7v2_midpoint_scan_ca_r4.png</div>
+</figure>
+<figure>
+  <img src="r7v2_pseudofes_cv_bb_beta3_r0_10_r4.png" alt="winner map bb">
+  <figcaption><b>12. pseudo-FES colored by winner CV1 (bb, r&#8320;10, &#946;3)</b></figcaption>
+  <div class="path">figures/r7v2_pseudofes_cv_bb_beta3_r0_10_r4.png</div>
+</figure>
+<figure>
+  <img src="r7v2_pseudofes_cv_ca_beta3_r0_10_r4.png" alt="winner map ca">
+  <figcaption><b>13. pseudo-FES colored by candidate CV1 (CA-only, r&#8320;10, &#946;3)</b></figcaption>
+  <div class="path">figures/r7v2_pseudofes_cv_ca_beta3_r0_10_r4.png</div>
+</figure>
+<figure>
+  <img src="r7v2_pseudofes_residual_torsion_pca_cv2.png" alt="res pca map">
+  <figcaption><b>14. pseudo-FES colored by residual torsion-PCA CV2 (component=5, residualized on bb r&#8320;10)</b></figcaption>
+  <div class="path">figures/r7v2_pseudofes_residual_torsion_pca_cv2.png</div>
+</figure>
+<figure>
+  <video controls muted width="70%"><source src="r7v2_residual_torsion_cv2_geometric_morph.mp4" type="video/mp4"></video>
+  <figcaption><b>15. Geometric morph along residual-PC1 CV2 at constant CV1 &#8776; 0.49</b> (seeds 73 &#8594; 1259, CV2 −2.00 &#8594; +1.98; aligned interpolation, not MD). Trajectory PDB and parameters alongside.</figcaption>
+  <div class="path">figures/r7v2_residual_torsion_cv2_geometric_morph.mp4 (+ .pdb, .json, _preview.png)</div>
+</figure>
+
+
+<h1>advanced analyses (dmap / TwoNN / Fourier / turn axis)</h1>
+
+<figure>
+  <img src="cv_diffmap_spectra_maps.png" alt="dmap">
+  <figcaption><b>16. Diffusion maps on the bank</b> — spectra and &#968;1&#215;&#968;2 colored by contact CV1 / residual torsion PC1 (two metrics: torsion space, CA-dRMSD).</figcaption>
+  <div class="path">figures/cv_diffmap_spectra_maps.png</div>
+</figure>
+<figure>
+  <img src="cv_twonn_id.png" alt="twonn">
+  <figcaption><b>17. TwoNN intrinsic dimension</b> — d &#8776; 3.6 (torsion) / 4.6 (CA-dRMSD): the bank manifold is ~4-dimensional, a single 2-D CV pair cannot hold it.</figcaption>
+  <div class="path">figures/cv_twonn_id.png</div>
+</figure>
+<figure>
+  <img src="cv_fourier_harmonics_corrmatrix.png" alt="fourier">
+  <figcaption><b>18. Circular Fourier harmonics (R1..R4) + Fisher-Lee circular correlation matrix</b> — interior &#968; torsions are bimodal (low R1, high R2); strongest couplings are intra-residue &#966;-&#968;.</figcaption>
+  <div class="path">figures/cv_fourier_harmonics_corrmatrix.png</div>
+</figure>
+<figure>
+  <img src="cv_fourier_winding.png" alt="winding">
+  <figcaption><b>19. Winding along ordered coordinates</b> — no significant hidden periodic pumps above the permutation null.</figcaption>
+  <div class="path">figures/cv_fourier_winding.png</div>
+</figure>
+<figure>
+  <img src="cv2_turn_axis.png" alt="turn axis">
+  <figcaption><b>20. The physical turn axis</b> — Ramachandran per residue colored by residual CV2; &#968;(flank residues) flips &#946;-extended (+140&#176;) &#8594; curl (&#8722;10&#176;) across the axis, matched at constant CV1.</figcaption>
+  <div class="path">figures/cv2_turn_axis.png</div>
+</figure>
+
+
+<figure>
+  <img src="cv_orthogonal_pairs_top.png" alt="orthogonal pairs">
+  <figcaption><b>21. Top alternative orthogonal CV1×CV2 pairs</b> — scored on |r|, joint occupancy, conditional CV2 spread; negative controls sink to zero.</figcaption>
+  <div class="path">figures/cv_orthogonal_pairs_top.png</div>
+</figure>
+
+
+<figure>
+  <img src="cv_dynamics_cv1_validation.png" alt="dynamics validation">
+  <figcaption><b>22. CV1 candidates on solvated MD</b> — pooled coverage vs bank, per-replica decorrelation times.</figcaption>
+  <div class="path">figures/cv_dynamics_cv1_validation.png</div>
+</figure>
+<figure>
+  <img src="cv_steerability.png" alt="steerability">
+  <figcaption><b>23. Steering force |∂CV/∂x| across each CV's own range</b> — legacy def shows a genuine gradient dead-zone.</figcaption>
+  <div class="path">figures/cv_steerability.png</div>
+</figure>
+<figure>
+  <img src="cv_mi_states_energy.png" alt="mi states energy">
+  <figcaption><b>24. MI table, 6-state curl ladder, full-bank GBn2 components vs CV2</b></figcaption>
+  <div class="path">figures/cv_mi_states_energy.png</div>
+</figure>
+
+
+<figure>
+  <img src="cv2_plain_pc2.png" alt="plain PC2">
+  <figcaption><b>25. Designated CV2 scalar: plain torsion PC2</b> — loadings, joint map vs CV1, diffusion C&#8321; on epoch-0 traces.</figcaption>
+  <div class="path">figures/cv2_plain_pc2.png</div>
+</figure>
+
+</body>
+</html>

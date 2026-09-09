@@ -1,0 +1,14 @@
+{
+  "low_index": 73,
+  "high_index": 1259,
+  "cv1_target": 0.48136026224286865,
+  "cv1_band": 0.035,
+  "low_cv1": 0.509492991717248,
+  "high_cv1": 0.4861810404877118,
+  "low_cv2": -1.9982560697483982,
+  "high_cv2": 1.975418530207966,
+  "frames": 96,
+  "fps": 24,
+  "trajectory_pdb": "/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/GENPEPT_R7_CV_CENSUS_REPORT/figures/r7v2_residual_torsion_cv2_geometric_morph.pdb",
+  "note": "rigidly aligned Cartesian geometric interpolation; not MD"
+}
