@@ -12,6 +12,7 @@ envelope-file resolution.
 """
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any, Optional
 
@@ -224,3 +225,30 @@ def mbar_state_overlap(u_nk: np.ndarray, f_k: np.ndarray, n_k: np.ndarray) -> np
     log_denom = max_l + np.log(np.sum(np.exp(shifted - max_l), axis=1, keepdims=True))
     w_nk = np.exp(log_num - log_denom)
     return n_k[:, None] * (w_nk.T @ w_nk)
+
+
+def symmetric_state_overlap(overlap: np.ndarray, i: int, j: int) -> Optional[float]:
+    """The per-edge overlap metric ``sqrt(O_ij * O_ji)``.
+
+    ``mbar_state_overlap`` above returns ``O = diag(N) @ S`` with ``S``
+    symmetric, so ``O_ij != O_ji`` whenever ``N_i != N_j`` -- and unequal
+    per-state sample counts are the normal case under adaptive extension, not
+    the exception. The raw ``O[i, j]`` would make an edge's overlap depend on
+    which of its two states happens to come first in the pair, which is
+    unrelated to anything physical. The geometric mean is the symmetric
+    combination, ``S_ij * sqrt(N_i * N_j)``, and it equals ``O_ij`` exactly
+    when ``N_i == N_j``.
+
+    Shared home for the convention: ``gareus.adaptive_production`` has its own
+    ``_symmetric_state_overlap`` with the same formula and the same reasoning
+    (see ``gareus/adaptive_production.py:3697-3725``), predating this one and
+    not refactored here to avoid an import-cycle risk (``adaptive_production``
+    already imports this module). Any *new* caller of ``mbar_state_overlap``
+    -- e.g. ``gareus.mbar_analysis.ladder_overlap`` -- should call this
+    function rather than hand-roll a third copy.
+    """
+    a = float(overlap[i, j])
+    b = float(overlap[j, i])
+    if not (math.isfinite(a) and math.isfinite(b)) or a < 0.0 or b < 0.0:
+        return None
+    return math.sqrt(a * b)
