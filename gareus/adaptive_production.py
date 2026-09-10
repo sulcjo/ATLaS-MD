@@ -5245,6 +5245,30 @@ class AdaptiveRuntimePool:
     used_ns: float = 0.0
     events: List[Dict[str, Any]] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
+    ledger_dir: Optional[Path] = None
+
+    def bind_ledger(self, adaptive_dir: Optional[Path]) -> "AdaptiveRuntimePool":
+        """Persist every future charge the moment it is made.
+
+        Without this the ledger only reached disk at coarse boundaries (end of a
+        scheduled epoch, or a graceful shutdown), so a hard kill -- SIGSEGV /
+        SIGABRT, i.e. the exit 139/134 seen repeatedly on the chignolin_7 chain --
+        discarded every charge accrued since the last flush.  The resumed run then
+        took ``run_segment``'s "already complete ... no pool charge" fast path, so
+        the lost charge was never re-booked: ``used_ns`` drifted permanently low,
+        once per crash, and the campaign kept allocating against a budget that had
+        already been spent.  Flushing on charge narrows that window from a whole
+        epoch to a single segment; ``reconcile_runtime_pool_with_delivered_md``
+        closes what remains.
+        """
+        self.ledger_dir = None if adaptive_dir is None else Path(adaptive_dir)
+        return self
+
+    def flush(self) -> None:
+        """Write the ledger now, if one is bound.  No-op for detached pools."""
+        if self.ledger_dir is None:
+            return
+        _write_runtime_pool_reports(self.ledger_dir, self)
 
     @property
     def enabled(self) -> bool:
@@ -5298,6 +5322,9 @@ class AdaptiveRuntimePool:
             msg = f"adaptive-production MD pool exceeded: used {self.used_ns:.6g} ns > total {self.total_ns:.6g} ns"
             if msg not in self.warnings:
                 self.warnings.append(msg)
+        # Persist immediately: a charge that lives only in memory is lost to any
+        # hard kill, and the resume fast path never re-books it.  See bind_ledger.
+        self.flush()
         return event
 
     def to_dict(self) -> Dict[str, Any]:
@@ -5477,6 +5504,154 @@ def _write_runtime_pool_reports(adaptive_dir: Path, pool: AdaptiveRuntimePool) -
 
 
 
+def _stage_n_states(stage_dir: Path) -> int:
+    """How many states a stage ran, from the window map it wrote at setup.
+
+    Every stage -- adaptive epoch, scheduled baseline, and each top-up -- writes
+    ``epoch_window_map.csv`` with one row per state.  It is the only per-stage
+    record of width that exists before the stage finishes, which matters because
+    the stages needing reconciliation are exactly the ones that never got to
+    write a ledger event carrying ``n_states``.
+    """
+    path = Path(stage_dir) / "epoch_window_map.csv"
+    if not path.exists():
+        return 0
+    try:
+        with path.open("r", encoding="utf-8", newline="") as fh:
+            return max(0, sum(1 for _ in csv.DictReader(fh)))
+    except OSError:
+        return 0
+
+
+def stage_delivered_md_steps(adaptive_dir: Path) -> Dict[str, Tuple[int, int]]:
+    """Map every stage's ledger label to the MD it actually delivered.
+
+    Returns ``{label: (prod_done, n_states)}``.  The label is the stage directory
+    relative to ``adaptive_dir`` (``epoch_000``, ``epoch_001/baseline``,
+    ``epoch_001/topup_001_1539000``), which is exactly the label ``run_segment``
+    charges under -- ``f"{epoch_dir.name}/{name}"``.
+
+    Ground truth is the checkpoint manifest's ``prod_done``, deliberately not the
+    segment registry's ``start_step``/``end_step``.  Those are absolute and carry
+    the campaign's ~1.01e6 equilibration offset, and the first segment of every
+    stage has ``start_step: null``, so differencing them invites exactly the kind
+    of frame mismatch that produces plausible-looking garbage.  ``prod_done`` is
+    already segment-local production steps, in the same frame the charging code
+    uses, so no offset arithmetic is needed at all.
+    """
+    adaptive_dir = Path(adaptive_dir)
+    delivered: Dict[str, Tuple[int, int]] = {}
+    if not adaptive_dir.is_dir():
+        return delivered
+    for manifest in sorted(adaptive_dir.glob("**/checkpoints/production_checkpoint_manifest.json")):
+        stage_dir = manifest.parent.parent
+        try:
+            label = stage_dir.relative_to(adaptive_dir).as_posix()
+        except ValueError:
+            continue
+        prod_done = _segment_checkpoint_prod_done(stage_dir)
+        if not prod_done or int(prod_done) <= 0:
+            continue
+        n_states = _stage_n_states(stage_dir)
+        if n_states <= 0:
+            continue
+        delivered[label] = (int(prod_done), int(n_states))
+    return delivered
+
+
+def reconcile_runtime_pool_with_delivered_md(
+    adaptive_dir: Path,
+    pool: "AdaptiveRuntimePool",
+    *,
+    apply: bool = True,
+) -> Dict[str, Any]:
+    """Re-book MD that ran but never reached the ledger, and report drift.
+
+    A hard kill between a checkpoint write and a ledger flush leaves delivered MD
+    uncharged, and ``run_segment``'s "already complete ... no pool charge" resume
+    path guarantees the loss is permanent: the resumed process does zero new steps,
+    so it has nothing to charge.  This walks the stages on disk, compares what each
+    one actually delivered against what the ledger claims for it, and books the
+    difference as an explicit ``reconciliation`` event.
+
+    Idempotent by construction: after applying, claimed == delivered for every
+    stage, so a second call finds nothing.
+
+    Only ever raises ``used_ns``.  A ledger claiming MORE than the checkpoints
+    delivered is the opposite defect (double-charging) and is recorded as a
+    warning instead -- a budget that silently shrinks its own usage is not
+    auditable, and guessing wrong in that direction hands back time that was
+    really spent.
+    """
+    adaptive_dir = Path(adaptive_dir)
+    delivered = stage_delivered_md_steps(adaptive_dir)
+
+    claimed: Dict[str, int] = {}
+    for event in pool.events:
+        label = str(event.get("label", ""))
+        try:
+            claimed[label] = claimed.get(label, 0) + int(event.get("steps_per_state", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+
+    stages: List[Dict[str, Any]] = []
+    overcharged: List[str] = []
+    recovered_ns = 0.0
+    for label in sorted(delivered):
+        prod_done, n_states = delivered[label]
+        claimed_steps = int(claimed.get(label, 0))
+        missing = prod_done - claimed_steps
+        row = {
+            "label": label,
+            "n_states": int(n_states),
+            "delivered_steps": int(prod_done),
+            "claimed_steps": claimed_steps,
+            "missing_steps": int(max(0, missing)),
+            "missing_ns": float(pool.segment_ns(n_states, max(0, missing))),
+        }
+        if missing < 0:
+            overcharged.append(label)
+            row["overcharged_steps"] = int(-missing)
+            msg = (
+                f"runtime-pool overcharge on {label}: ledger claims {claimed_steps} steps/state "
+                f"but checkpoint delivered {prod_done}; used_ns left unchanged"
+            )
+            if msg not in pool.warnings:
+                pool.warnings.append(msg)
+        elif missing > 0:
+            recovered_ns += row["missing_ns"]
+        stages.append(row)
+
+    applied = False
+    if apply:
+        for row in stages:
+            if row["missing_steps"] <= 0:
+                continue
+            pool.consume(
+                label=row["label"],
+                kind="reconciliation",
+                n_states=row["n_states"],
+                steps=row["missing_steps"],
+                path=adaptive_dir / row["label"],
+            )
+            applied = True
+        if overcharged and not applied:
+            # Warnings changed even though no charge did; make that durable too.
+            pool.flush()
+
+    report = {
+        "schema_version": "adaptive_runtime_pool_reconcile_v1",
+        "adaptive_dir": str(adaptive_dir),
+        "applied": bool(apply),
+        "recovered_ns": float(recovered_ns),
+        "overcharged_stages": overcharged,
+        "stages": stages,
+        "used_ns_after": float(pool.used_ns),
+    }
+    write_json(adaptive_dir / "adaptive_runtime_pool_reconcile.json", _json_ready(report))
+    return report
+
+
 def _adaptive_runtime_pool_from_dict(cls, payload: Dict[str, Any]) -> "AdaptiveRuntimePool":
     """Build a runtime-pool object from a persisted report payload."""
     pool = cls(
@@ -5542,6 +5717,32 @@ def _adaptive_runtime_pool_validate(adaptive_dir: Path, pool: "AdaptiveRuntimePo
         errors.append(f"pool.used_ns={pool.used_ns:.9g} does not match sum(events)={summed:.9g}")
     if pool.enabled and float(pool.used_ns) > float(pool.total_ns) + 1.0e-8:
         warnings.append(f"pool used_ns={pool.used_ns:.9g} exceeds total_ns={pool.total_ns:.9g}")
+    # Cross-check the ledger against the MD that actually ran.  Every check above
+    # is internal -- events sum to used_ns, paths exist -- and all of them passed
+    # on chignolin_7 while 247.59 ns of delivered MD was missing from the ledger.
+    # An internally consistent ledger can still be wrong about reality; this is
+    # the only check here that can catch that.
+    unbooked_stages: Dict[str, float] = {}
+    unbooked_ns = 0.0
+    overcharged_stages: List[str] = []
+    claimed_steps_by_label: Dict[str, int] = {}
+    for row in event_rows:
+        claimed_steps_by_label[row["label"]] = claimed_steps_by_label.get(row["label"], 0) + int(row["steps_per_state"])
+    for stage_label, (prod_done, n_states) in stage_delivered_md_steps(adaptive_dir).items():
+        drift = int(prod_done) - int(claimed_steps_by_label.get(stage_label, 0))
+        if drift > 0:
+            ns = float(pool.segment_ns(n_states, drift))
+            unbooked_stages[stage_label] = ns
+            unbooked_ns += ns
+        elif drift < 0:
+            overcharged_stages.append(stage_label)
+    if unbooked_stages:
+        warnings.append(
+            f"ledger understates delivered MD by {unbooked_ns:.6g} ns across "
+            f"{len(unbooked_stages)} stage(s): {', '.join(sorted(unbooked_stages))}"
+        )
+    for stage_label in overcharged_stages:
+        warnings.append(f"ledger overstates delivered MD for stage {stage_label}")
     status = "ok"
     if warnings:
         status = "warning"
@@ -5559,6 +5760,9 @@ def _adaptive_runtime_pool_validate(adaptive_dir: Path, pool: "AdaptiveRuntimePo
         "summed_event_ns": float(summed),
         "remaining_ns": None if not pool.enabled else float(pool.remaining_ns()),
         "n_events": int(len(events)),
+        "unbooked_md_ns": float(unbooked_ns),
+        "unbooked_stages": {k: float(v) for k, v in sorted(unbooked_stages.items())},
+        "overcharged_stages": sorted(overcharged_stages),
         "errors": errors,
         "warnings": warnings,
         "events": event_rows,
@@ -5571,6 +5775,7 @@ def _adaptive_runtime_pool_validate(adaptive_dir: Path, pool: "AdaptiveRuntimePo
         f"Events: **{len(events)}**",
         f"Used ns: **{float(pool.used_ns):.6g}**",
         f"Summed event ns: **{summed:.6g}**",
+        f"Unbooked delivered MD: **{unbooked_ns:.6g} ns**",
         f"Remaining ns: **{payload.get('remaining_ns')}**",
         "",
     ]
@@ -5618,10 +5823,22 @@ def _load_or_initialize_runtime_pool(adaptive_dir: Path, args: Any, policy: Adap
             pool.warnings.append(
                 f"resume timestep {fresh.timestep_fs:.6g} fs differs from persisted pool timestep {pool.timestep_fs:.6g} fs; using persisted value for accounting"
             )
+        # Re-book MD that ran but never reached the ledger.  This is the resumed
+        # process itself, which owns the pool, so there is no writer to race; and
+        # it must happen before the first allocation of this run, or the epoch
+        # gets sized against a budget figure that has already been spent.
+        reconciliation = reconcile_runtime_pool_with_delivered_md(adaptive_dir, pool, apply=True)
+        if reconciliation.get("recovered_ns", 0.0) > 0.0:
+            print(
+                f"    Adaptive-production runtime pool reconciled: re-booked "
+                f"{reconciliation['recovered_ns']:.6g} ns of delivered MD that was lost "
+                f"to an ungraceful exit ({len(reconciliation.get('overcharged_stages') or [])} overcharged stage(s))"
+            )
         validation = _adaptive_runtime_pool_validate(adaptive_dir, pool, label="adaptive_runtime_pool_resume")
     else:
         pool = fresh
         validation = _adaptive_runtime_pool_validate(adaptive_dir, pool, label="adaptive_runtime_pool_initial")
+    pool.bind_ledger(adaptive_dir)
     _write_runtime_pool_reports(adaptive_dir, pool)
     return pool, validation
 
