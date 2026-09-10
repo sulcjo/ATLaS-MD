@@ -36,7 +36,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 
 from .checkpoints import production_checkpoint_available
-from .io import write_json, read_json_file, resolve_run_temperature_k, _json_ready, acquire_run_lock
+from .io import write_json, write_text_atomic, read_json_file, resolve_run_temperature_k, _json_ready, acquire_run_lock
 from .lifecycle import _graceful_shutdown
 from .store import SegmentRegistry
 # Real-frame seed extraction lives in tica.py (a dependency-free leaf module)
@@ -5499,7 +5499,7 @@ def _write_runtime_pool_reports(adaptive_dir: Path, pool: AdaptiveRuntimePool) -
         lines.extend(["", "## Warnings", ""])
         for w in payload.get("warnings") or []:
             lines.append(f"- {w}")
-    md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    write_text_atomic(md_path, "\n".join(lines) + "\n")
     return {"json": str(json_path), "md": str(md_path)}
 
 

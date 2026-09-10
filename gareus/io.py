@@ -86,6 +86,29 @@ def write_json(path: Path, payload: Any) -> None:
         raise
 
 
+def write_text_atomic(path: Path, text: str) -> Path:
+    """Write ``text`` to ``path`` atomically, creating parents as needed.
+
+    The Markdown twin of :func:`write_json`, for reports rewritten often enough
+    that a kill mid-write is a realistic outcome -- the runtime-pool ledger's
+    ``.md`` is now rewritten on every single charge. A truncated report is not
+    read back by code, but it is what a human reaches for first when auditing a
+    campaign's budget, so it must never be half a file.
+    """
+    path = Path(path)
+    tmp = _staging_path(path)
+    try:
+        with tmp.open("w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        _persist(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return path
+
+
 def write_csv_atomic(path: Path, header: Iterable[Any], rows: Iterable[Iterable[Any]]) -> Path:
     """Write a header + rows to ``path`` atomically, creating parents as needed.
 
