@@ -2330,12 +2330,33 @@ def _finalize_acc_2d(acc: dict, d: Data, kbt_kcal: float, smooth_logfac_sigma: f
     return {'umbrella_only':umbrella,'gamd_exponential':exp_pmf,'gamd_cumulant2':cum_pmf,'gamd_cumulant3':cum3_pmf},{'boost_mean_kj':mean,'boost_var_kj2':var,'boost_kappa3_kj3':kappa3,'log_reweight_factor':logfac}
 
 
-def _choose_method(selected: str, boost_ok: bool) -> str:
-    if boost_ok and selected in {'gamd_exponential','gamd_cumulant2','gamd_cumulant3'}:
-        return selected
-    if boost_ok and selected not in {'umbrella_only','gamd_exponential','gamd_cumulant2','gamd_cumulant3'}:
-        return 'gamd_cumulant2'
-    return 'umbrella_only'
+# Mirrors the {'umbrella_only','gamd_exponential','gamd_cumulant2','gamd_cumulant3'}
+# candidate set _choose_method has always used -- 'umbrella_only' is a valid
+# selectable value here (unlike the six sites that route through
+# choose_site_method's default 3-method _GAMD_METHODS), so it cannot reuse
+# that constant unmodified.
+_CHOOSE_METHOD_CANDIDATES = frozenset({'umbrella_only', 'gamd_exponential', 'gamd_cumulant2', 'gamd_cumulant3'})
+
+
+def _choose_method(selected: str, boost_ok: bool, excluded: frozenset = frozenset()) -> str:
+    """Pick the unbiasing method for contact FESs/torsions/Ramachandran/scalar
+    observables (the one selection site not already routed through
+    ``choose_site_method`` -- whole-branch review, IMPORTANT 1).
+
+    With ``excluded == frozenset()`` (the default, and what a non-ladder run
+    passes) this reproduces the original raw-ternary behaviour exactly:
+    ``selected if selected in {4 candidates} else 'gamd_cumulant2'`` when
+    ``boost_ok``, else always ``'umbrella_only'``. Under an active ladder,
+    ``excluded`` is ``ladder_excluded_methods(True)`` (the 3 cumulant/
+    exponential methods), which -- via ``choose_site_method`` -- forces this
+    site to agree with the six already-converted call sites instead of
+    reporting a cumulant method while they report ``'umbrella_only'``.
+    """
+    if not boost_ok:
+        return 'umbrella_only'
+    return choose_site_method(selected, excluded, candidates=_CHOOSE_METHOD_CANDIDATES,
+                               fallback='gamd_cumulant2')
+
 
 def _wrap_degrees(rad_values: np.ndarray) -> np.ndarray:
     deg=np.degrees(np.asarray(rad_values,dtype=np.float64))
@@ -2571,7 +2592,7 @@ def analyze_extra_observable_pmfs(d: Data, args, base_logw: np.ndarray, selected
                       if extra_atom_indices is not None else 'full system (atom pre-selection unavailable)')
         progress.step('extra PMFs', f'topology {top_path}; chunk={chunk_size}; atoms={_atom_note}; SASA selection={sasa_selection!r}')
 
-    selected_method=_choose_method(selected,boost_ok)
+    selected_method=_choose_method(selected,boost_ok,ladder_excluded_methods(bool(d.meta.get('gamd_ladder', False))))
     base_w_full=norm_logw(np.asarray(base_logw,dtype=np.float64))
     if boost_ok:
         exp_w_full=norm_logw(np.asarray(base_logw,dtype=np.float64)+d.beta*np.asarray(d.boost_kj,dtype=np.float64))
@@ -5090,26 +5111,37 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
     # try/except so a bug here degrades to a missing diagnostic, never to
     # discarding the health verdict just built above (see .superpowers/sdd/
     # 2026-09-10-gareus-analyze-ladder/task-5-brief.md, Task 5).
+    #
+    # Whole-branch review, IMPORTANT 3: the checks appended below used to sit
+    # after build_health_verdict had already computed s['health']['overall'],
+    # so a fresh '✗ FAIL Overlap across CV1' row could render underneath
+    # 'RESULT HEALTH: PASS' -- the exact defect this branch exists to remove.
+    # overall is recomputed from the FULL checks list at the end of this
+    # block, via gareus_report.overall_from_checks (the same worst-status
+    # rule build_health_verdict itself uses), inside the gamd_ladder gate so
+    # a non-ladder run's health verdict is byte-for-byte unaffected.
     if d.meta.get('gamd_ladder'):
         try:
-            from gareus_report import PASS, CAUTION, FAIL, NA, OVERLAP_FAIL_FRACTION
+            from gareus_report import overall_from_checks
             from gareus.mbar_analysis.ladder import mbar_state_overlap
-            from gareus.mbar_analysis.ladder_overlap import ladder_overlap_by_axis
+            from gareus.mbar_analysis.ladder_overlap import ladder_overlap_by_axis, ladder_overlap_health_checks
             _ov=mbar_state_overlap(d.u_nk, m['f_k'], m['n_k'])
-            _lo=ladder_overlap_by_axis(_ov, d.state_lambdas, d.centers)
-            s['ladder_overlap']=_lo
             _thr=float(getattr(args,'min_neighbor_overlap',0.30))
-            for _axis_key,_label in (('lambda_direction','Overlap along λ'),
-                                      ('cv1_direction','Overlap across CV1')):
-                _ax=_lo[_axis_key]
-                if _ax['worst'] is None:
-                    _status,_detail=NA,'no adjacent pairs on this axis'
-                else:
-                    _w=_ax['worst']; _a,_b=_ax['worst_pair']
-                    _status=FAIL if _w<OVERLAP_FAIL_FRACTION*_thr else (CAUTION if _w<_thr else PASS)
-                    _detail=f"worst {_w:.3f} (states {_a}-{_b})"
-                s.setdefault('health',{}).setdefault('checks',[]).append(
-                    {'name':_label,'status':_status,'detail':_detail})
+            _lo,_lo_warnings=ladder_overlap_by_axis(_ov, d.state_lambdas, d.centers, thr=_thr, n_k=m['n_k'])
+            s['ladder_overlap']=_lo
+            for _w in _lo_warnings:
+                s.setdefault('warnings',[]).append(_w)
+            s.setdefault('health',{}).setdefault('checks',[]).extend(
+                ladder_overlap_health_checks(_lo,_thr))
+            # Skip the recompute when build_health_verdict itself already
+            # failed (s['health']['error'] set, from the try/except a few
+            # lines above): overall is already 'UNKNOWN' for a reason, and
+            # recomputing from only the 4 ladder rows just added could turn
+            # a crashed verdict into a false PASS. build_health_verdict is
+            # documented never to raise, so this is defensive only.
+            if (isinstance(s.get('health'),dict) and isinstance(s['health'].get('checks'),list)
+                    and not s['health'].get('error')):
+                s['health']['overall']=overall_from_checks(s['health']['checks'])
         except Exception as _lo_exc:
             s.setdefault('warnings',[]).append(f"ladder-overlap axis report failed: {_lo_exc}")
     # Per-rung GaMD boost/reweighting diagnostics: Miao's cumulant-reweighting
