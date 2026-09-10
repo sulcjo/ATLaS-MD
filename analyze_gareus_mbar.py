@@ -5112,6 +5112,27 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
                     {'name':_label,'status':_status,'detail':_detail})
         except Exception as _lo_exc:
             s.setdefault('warnings',[]).append(f"ladder-overlap axis report failed: {_lo_exc}")
+    # Per-rung GaMD boost/reweighting diagnostics: Miao's cumulant-reweighting
+    # criterion (anharmonicity < 0.01) is a per-STATE statement, and a ladder
+    # run's states span very different mean boosts (lambda=0 is unboosted
+    # umbrella, lambda=1 carries the full boost) -- pooling them into one
+    # mean/std (the existing 'boost' block above, from run_pmf_and_gamd_boost_
+    # report/boost_stats) mixes rungs and hides exactly the number that says
+    # whether cumulant reweighting is trustworthy per rung. Own try/except so
+    # a bug here degrades to a missing diagnostic, never the health verdict
+    # already built above (same pattern as the ladder_overlap block).
+    if d.meta.get('gamd_ladder'):
+        try:
+            from gareus.mbar_analysis.boost_report import boost_report_rows
+            _lam_per_sample = (
+                d.state_lambdas[np.asarray(d.window, dtype=np.int64)]
+                if d.state_lambdas is not None else np.array([], dtype=np.float64)
+            )
+            _dv_kcal = np.asarray(d.boost_kj, dtype=np.float64) / KJ_PER_KCAL
+            s['gamd_boost_by_rung'] = boost_report_rows(_dv_kcal, _lam_per_sample, kbt_kcal)
+        except Exception as _br_exc:
+            s.setdefault('warnings',[]).append(f"gamd boost/rung report failed: {_br_exc}")
+            s['gamd_boost_by_rung'] = []
     wjson(out/'pmf_summary.json',s); summary_md(out/'pmf_summary.md',s)
     if progress is not None: progress.bar('analysis stages', 6, 6, 'summary written', force=True)
     return s
