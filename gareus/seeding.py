@@ -1590,12 +1590,29 @@ def generate_us_starting_states_by_pulling(
             components["reuse_count_after_selection"] = int(seed_usage_counts[key])
             return conf, _format_seed_component_dict(components)
 
+    # Snapshot the equilibrated reference ONCE, before any worker touches it.
+    # equil_state is a SWIG State shared by every seeding worker, and reading it
+    # (getPositions/getVelocities/getPeriodicBoxVectors) marshals the same C++
+    # vectors into fresh Python objects on each call. Doing that from 28 threads
+    # at once corrupts the heap: observed as `free(): invalid pointer` and as
+    # SIGSEGV, both inside Vec3.__deepcopy__ under concurrent setPositions.
+    # Reading once here leaves the workers touching already-materialised data,
+    # and asNumpy avoids rebuilding a 19k-element Vec3 list per window as well.
+    # The race is timing-dependent, so it hid for as long as each Context carried
+    # a core-count-sized CPU thread pool that kept the workers apart.
+    _equil_box_snapshot = equil_state.getPeriodicBoxVectors()
+    _equil_pos_snapshot = equil_state.getPositions(asNumpy=True)
+    try:
+        _equil_vel_snapshot = equil_state.getVelocities(asNumpy=True)
+    except Exception:
+        _equil_vel_snapshot = None
+
     def _reset_sim_to_equil(s, seed_offset: int = 4242) -> None:
-        s.context.setPeriodicBoxVectors(*equil_state.getPeriodicBoxVectors())
-        s.context.setPositions(equil_state.getPositions())
-        try:
-            s.context.setVelocities(equil_state.getVelocities())
-        except Exception:
+        s.context.setPeriodicBoxVectors(*_equil_box_snapshot)
+        s.context.setPositions(_equil_pos_snapshot)
+        if _equil_vel_snapshot is not None:
+            s.context.setVelocities(_equil_vel_snapshot)
+        else:
             s.context.setVelocitiesToTemperature(float(args.temperature_k) * unit.kelvin, int(args.seed) + seed_offset)
 
     def _unpulled_window_row(w: int, device_idx: str, seed_offset: int, note: str):
