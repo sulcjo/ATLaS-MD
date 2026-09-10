@@ -1227,6 +1227,7 @@ def explicit_window_analysis_rows(
     secondary_cv_k_kcal_list=None,
     secondary_cv_metadata: Optional[dict] = None,
     window_metadata: Optional[dict] = None,
+    gamd_lambdas=None,
 ) -> list[dict]:
     """Return one explicit analysis metadata row per thermodynamic state.
 
@@ -1238,6 +1239,15 @@ def explicit_window_analysis_rows(
     centers = np.asarray(centers_a, dtype=float)
     k_arr = np.asarray(k_list, dtype=float)
     n = int(len(centers))
+    lam_arr = (
+        np.zeros(n, dtype=float)
+        if gamd_lambdas is None
+        else np.asarray(gamd_lambdas, dtype=float)
+    )
+    if lam_arr.size != n:
+        raise ValueError(
+            f"gamd_lambdas has {lam_arr.size} entries but there are {n} windows"
+        )
     sec = np.asarray(secondary_cv_centers, dtype=float) if secondary_cv_centers is not None else None
     sec_k = np.asarray(secondary_cv_k_kcal_list, dtype=float) if secondary_cv_k_kcal_list is not None else None
     meta = secondary_cv_metadata or {}
@@ -1270,6 +1280,7 @@ def explicit_window_analysis_rows(
         sk = float(sec_k[i]) if sec_k is not None and i < len(sec_k) and math.isfinite(float(sec_k[i])) else float("nan")
         rows.append({
             "window": int(i),
+            "gamd_lambda": float(lam_arr[i]),
             "distance_center_A": float(centers[i]),
             "distance_center_nm": "" if contact_mode else float(centers[i]) * 0.1,
             "distance_k_kcal_mol_A2": float(k_arr[i]),
@@ -2044,6 +2055,7 @@ def write_explicit_window_analysis_files(
     secondary_cv_metadata: Optional[dict] = None,
     window_metadata: Optional[dict] = None,
     neighbor_graph_summary: Optional[dict] = None,
+    gamd_lambdas=None,
 ) -> dict:
     """Write sparse-safe explicit window metadata files for MBAR/reweighting."""
     out_dir = Path(out_dir)
@@ -2051,11 +2063,12 @@ def write_explicit_window_analysis_files(
         centers_a, k_list, secondary_cv_centers, secondary_cv_k_kcal_list,
         secondary_cv_metadata=secondary_cv_metadata,
         window_metadata=window_metadata,
+        gamd_lambdas=gamd_lambdas,
     )
     csv_path = out_dir / "umbrella_explicit_windows.csv"
     json_path = out_dir / "umbrella_explicit_windows.json"
     fieldnames = [
-        "window", "distance_center_A", "distance_center_nm", "distance_k_kcal_mol_A2", "distance_k_kj_mol_nm2",
+        "window", "gamd_lambda", "distance_center_A", "distance_center_nm", "distance_k_kcal_mol_A2", "distance_k_kj_mol_nm2",
         "primary_cv", "primary_cv_label", "primary_cv_units", "primary_center", "primary_k",
         "primary_k_units", "primary_openmm_k", "primary_openmm_k_units",
         "secondary_cv_center", "secondary_cv_k_kcal_mol", "secondary_cv_k_kj_mol", "secondary_cv_mode",
@@ -3441,6 +3454,7 @@ def drop_bad_us_windows_and_rebuild(
             secondary_cv_metadata=secondary_cv_metadata,
             window_metadata=window_metadata,
             neighbor_graph_summary=graph_summary,
+            gamd_lambdas=new_gamd_lambdas,
         )
     except Exception as exc:
         explicit_window_table_summary = {}
@@ -5591,6 +5605,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             secondary_cv_metadata=secondary_cv_metadata,
             window_metadata=window_metadata,
             neighbor_graph_summary=graph_summary,
+            gamd_lambdas=args.state_gamd_lambdas,
         )
         window_metadata = dict(window_metadata or {})
         window_metadata["explicit_window_table"] = explicit_window_table_summary

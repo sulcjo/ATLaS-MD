@@ -28,6 +28,7 @@ from gareus.mbar_analysis.pmf import (
     run_pmf_and_gamd_boost_report,
     run_secondary_cv_analyses, analyze_secondary_cv_pmf,
 )
+from gareus.mbar_analysis.estimators import ladder_excluded_methods, choose_site_method
 from gareus.mbar_analysis.bias import (
     _compute_u_nk_analytical,
     _parse_epoch_window_map_native_params,
@@ -1582,7 +1583,7 @@ def analyze_rg(d: Data, args, m: dict, base_w: np.ndarray, selected: str, boost_
         exp_w=norm_logw(exp_logw)
         exp_pmf=pmf_from_weights(rg_sel,exp_w,bins,kbt_kcal)
         (cum_pmf,cdiag),(cum3_pmf,cdiag3)=_cumulant_expansion_both(rg_sel,base_w_rg,boost_sel,bins,d.beta,kbt_kcal,smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
-        rg_selected=selected if selected in {'gamd_exponential','gamd_cumulant2','gamd_cumulant3'} else 'gamd_cumulant2'
+        rg_selected=choose_site_method(selected, ladder_excluded_methods(bool(d.meta.get('gamd_ladder', False))))
     else:
         exp_w=base_w_rg
         exp_pmf=umbrella; cum_pmf=umbrella; cum3_pmf=umbrella; cdiag={'boost_mean_kj':np.full(len(bins)-1,np.nan),'boost_var_kj2':np.full(len(bins)-1,np.nan)}; cdiag3=cdiag; rg_selected='umbrella_only'
@@ -1640,7 +1641,7 @@ def analyze_distance_rg_2d_fes(d: Data, args, base_logw: np.ndarray, selected: s
         exp_w=norm_logw(exp_logw)
         fes_exp=pmf2d_from_weights(cv_sel, rg_sel, exp_w, xbins, ybins, kbt_kcal)
         (fes_cum, cdiag), (fes_cum3, cdiag3) = _cumulant_expansion_2d_both(cv_sel, rg_sel, base_w, boost_sel, xbins, ybins, d.beta, kbt_kcal, smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
-        chosen = selected if selected in {'gamd_exponential','gamd_cumulant2','gamd_cumulant3'} else 'gamd_cumulant2'
+        chosen = choose_site_method(selected, ladder_excluded_methods(bool(d.meta.get('gamd_ladder', False))))
     else:
         fes_exp=fes_umbrella
         fes_cum=fes_umbrella
@@ -2052,7 +2053,7 @@ def analyze_pca_2d_fes(d: Data, args, base_logw: np.ndarray, selected: str, boos
         exp_w=norm_logw(base_logw_sel+d.beta*boost_sel)
         fes_exp=pmf2d_from_weights(x,y,exp_w,xbins,ybins,kbt_kcal)
         (fes_cum,_cdiag),(fes_cum3,_cdiag3)=_cumulant_expansion_2d_both(x,y,base_w,boost_sel,xbins,ybins,d.beta,kbt_kcal,smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
-        chosen=selected if selected in {'gamd_exponential','gamd_cumulant2','gamd_cumulant3'} else 'gamd_cumulant2'
+        chosen=choose_site_method(selected, ladder_excluded_methods(bool(d.meta.get('gamd_ladder', False))))
     else:
         fes_exp=fes_umbrella
         fes_cum=fes_umbrella
@@ -2329,12 +2330,33 @@ def _finalize_acc_2d(acc: dict, d: Data, kbt_kcal: float, smooth_logfac_sigma: f
     return {'umbrella_only':umbrella,'gamd_exponential':exp_pmf,'gamd_cumulant2':cum_pmf,'gamd_cumulant3':cum3_pmf},{'boost_mean_kj':mean,'boost_var_kj2':var,'boost_kappa3_kj3':kappa3,'log_reweight_factor':logfac}
 
 
-def _choose_method(selected: str, boost_ok: bool) -> str:
-    if boost_ok and selected in {'gamd_exponential','gamd_cumulant2','gamd_cumulant3'}:
-        return selected
-    if boost_ok and selected not in {'umbrella_only','gamd_exponential','gamd_cumulant2','gamd_cumulant3'}:
-        return 'gamd_cumulant2'
-    return 'umbrella_only'
+# Mirrors the {'umbrella_only','gamd_exponential','gamd_cumulant2','gamd_cumulant3'}
+# candidate set _choose_method has always used -- 'umbrella_only' is a valid
+# selectable value here (unlike the six sites that route through
+# choose_site_method's default 3-method _GAMD_METHODS), so it cannot reuse
+# that constant unmodified.
+_CHOOSE_METHOD_CANDIDATES = frozenset({'umbrella_only', 'gamd_exponential', 'gamd_cumulant2', 'gamd_cumulant3'})
+
+
+def _choose_method(selected: str, boost_ok: bool, excluded: frozenset = frozenset()) -> str:
+    """Pick the unbiasing method for contact FESs/torsions/Ramachandran/scalar
+    observables (the one selection site not already routed through
+    ``choose_site_method`` -- whole-branch review, IMPORTANT 1).
+
+    With ``excluded == frozenset()`` (the default, and what a non-ladder run
+    passes) this reproduces the original raw-ternary behaviour exactly:
+    ``selected if selected in {4 candidates} else 'gamd_cumulant2'`` when
+    ``boost_ok``, else always ``'umbrella_only'``. Under an active ladder,
+    ``excluded`` is ``ladder_excluded_methods(True)`` (the 3 cumulant/
+    exponential methods), which -- via ``choose_site_method`` -- forces this
+    site to agree with the six already-converted call sites instead of
+    reporting a cumulant method while they report ``'umbrella_only'``.
+    """
+    if not boost_ok:
+        return 'umbrella_only'
+    return choose_site_method(selected, excluded, candidates=_CHOOSE_METHOD_CANDIDATES,
+                               fallback='gamd_cumulant2')
+
 
 def _wrap_degrees(rad_values: np.ndarray) -> np.ndarray:
     deg=np.degrees(np.asarray(rad_values,dtype=np.float64))
@@ -2570,7 +2592,7 @@ def analyze_extra_observable_pmfs(d: Data, args, base_logw: np.ndarray, selected
                       if extra_atom_indices is not None else 'full system (atom pre-selection unavailable)')
         progress.step('extra PMFs', f'topology {top_path}; chunk={chunk_size}; atoms={_atom_note}; SASA selection={sasa_selection!r}')
 
-    selected_method=_choose_method(selected,boost_ok)
+    selected_method=_choose_method(selected,boost_ok,ladder_excluded_methods(bool(d.meta.get('gamd_ladder', False))))
     base_w_full=norm_logw(np.asarray(base_logw,dtype=np.float64))
     if boost_ok:
         exp_w_full=norm_logw(np.asarray(base_logw,dtype=np.float64)+d.beta*np.asarray(d.boost_kj,dtype=np.float64))
@@ -3110,7 +3132,7 @@ def analyze_cv1_cv2_2d_fes(d: Data, args, base_logw: np.ndarray, selected: str, 
         exp_w=norm_logw(exp_logw)
         fes_exp=pmf2d_from_weights(cv_sel, cv2_sel, exp_w, xbins, ybins, kbt_kcal)
         (fes_cum,cdiag),(fes_cum3,cdiag3)=_cumulant_expansion_2d_both(cv_sel, cv2_sel, base_w, boost_sel, xbins, ybins, d.beta, kbt_kcal, smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
-        chosen=selected if selected in {'gamd_exponential','gamd_cumulant2','gamd_cumulant3'} else 'gamd_cumulant2'
+        chosen=choose_site_method(selected, ladder_excluded_methods(bool(d.meta.get('gamd_ladder', False))))
     else:
         fes_exp=fes_umbrella; fes_cum=fes_umbrella; fes_cum3=fes_umbrella
         cdiag={'boost_mean_kj':np.full((len(xbins)-1,len(ybins)-1),np.nan),'boost_var_kj2':np.full((len(xbins)-1,len(ybins)-1),np.nan)}
@@ -4090,7 +4112,7 @@ def analyze_chignolin_fes(d, args, base_logw: np.ndarray, selected: str, boost_o
         exp_w = norm_logw(logw_sel + d.beta * boost_sel)
         fes_exp = pmf2d_from_weights(x_sel, y_sel, exp_w, xbins, ybins, kbt_kcal)
         (fes_cum, _), (fes_cum3, _) = _cumulant_expansion_2d_both(x_sel, y_sel, base_w, boost_sel, xbins, ybins, d.beta, kbt_kcal, smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
-        chosen = selected if selected in {"gamd_exponential", "gamd_cumulant2", "gamd_cumulant3"} else "gamd_cumulant2"
+        chosen = choose_site_method(selected, ladder_excluded_methods(bool(d.meta.get("gamd_ladder", False))))
     else:
         fes_exp = fes_cum = fes_cum3 = fes_umbrella
         chosen = "umbrella_only"
@@ -4863,6 +4885,25 @@ def _report_summary_fields(report_info: dict) -> dict:
     }
 
 
+_CROSSCHECK_SUMMARY_KEYS = (
+    'status', 'max_abs_diff_kcal', 'n_lambda0_samples', 'tolerance_kcal',
+    'tolerance_source', 'n_bins_compared', 'count_gate_fell_back', 'reason',
+)
+
+
+def _crosscheck_summary_fields(lcc: dict) -> dict:
+    """JSON-safe view of a ladder cross-check result.
+
+    n_bins_compared is always present: crosscheck.py returns "skipped" below
+    three bins precisely because a one-bin comparison is vacuous (that bin is
+    the alignment reference, so its diff is identically zero and would read
+    "pass" at any tolerance). A status without a bin count hides that.
+    """
+    out = {k: lcc[k] for k in _CROSSCHECK_SUMMARY_KEYS if k in lcc}
+    out.setdefault('n_bins_compared', 0)
+    return out
+
+
 def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None, *,
                           regime: Optional[str] = None, run_convergence: bool = True,
                           convergence_skip_reason: str = ''):
@@ -4902,14 +4943,13 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
     # full-ladder PMF built from every sample. Runs against the FULL `d`
     # (not d_main below): the epoch_000/rest split is a GaMD-envelope-
     # recalibration axis, orthogonal to which states carry lambda=0.
-    ladder_crosscheck_summary={'status':'skipped','reason':'gamd_ladder not active for this run','n_lambda0_samples':0}
+    ladder_crosscheck_summary={'status':'skipped','reason':'gamd_ladder not active for this run','n_lambda0_samples':0,'n_bins_compared':0}
     if d.meta.get('gamd_ladder'):
         _lcc=ladder_crosscheck(d,m['f_k'],bins,kbt_kcal)
         # Slim, JSON-safe view for pmf_summary.json -- the two full PMF
         # dicts (_lcc['pmf_full']/['pmf_lambda0']) carry numpy arrays and go
         # to the CSV/PNG below instead, never into the summary itself.
-        ladder_crosscheck_summary={k:_lcc[k] for k in ('status','max_abs_diff_kcal','n_lambda0_samples','tolerance_kcal','tolerance_source','n_bins_compared','count_gate_fell_back') if k in _lcc}
-        if 'reason' in _lcc: ladder_crosscheck_summary['reason']=_lcc['reason']
+        ladder_crosscheck_summary=_crosscheck_summary_fields(_lcc)
         # The CONTRADICTION 'fail' (meta['gamd_ladder'] asserted while
         # state_lambdas carries no λ>0 -- see crosscheck.ladder_crosscheck)
         # returns before any PMF is built, so it carries neither pmf_full/
@@ -5065,6 +5105,67 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
     except Exception as _hv_exc:
         s['health']={'overall':'UNKNOWN','checks':[],'error':str(_hv_exc)}
         s.setdefault('warnings_grouped',[])
+    # A ladder run is 2-D even with cv2 "none": states differ by CV1 centre AND
+    # by rung, and the CV1-marginal 'Window overlap' check above only ever
+    # sees one of those axes. Report both directions separately -- own
+    # try/except so a bug here degrades to a missing diagnostic, never to
+    # discarding the health verdict just built above (see .superpowers/sdd/
+    # 2026-09-10-gareus-analyze-ladder/task-5-brief.md, Task 5).
+    #
+    # Whole-branch review, IMPORTANT 3: the checks appended below used to sit
+    # after build_health_verdict had already computed s['health']['overall'],
+    # so a fresh '✗ FAIL Overlap across CV1' row could render underneath
+    # 'RESULT HEALTH: PASS' -- the exact defect this branch exists to remove.
+    # overall is recomputed from the FULL checks list at the end of this
+    # block, via gareus_report.overall_from_checks (the same worst-status
+    # rule build_health_verdict itself uses), inside the gamd_ladder gate so
+    # a non-ladder run's health verdict is byte-for-byte unaffected.
+    if d.meta.get('gamd_ladder'):
+        try:
+            from gareus_report import overall_from_checks
+            from gareus.mbar_analysis.ladder import mbar_state_overlap
+            from gareus.mbar_analysis.ladder_overlap import ladder_overlap_by_axis, ladder_overlap_health_checks
+            _ov=mbar_state_overlap(d.u_nk, m['f_k'], m['n_k'])
+            _thr=float(getattr(args,'min_neighbor_overlap',0.30))
+            _lo,_lo_warnings=ladder_overlap_by_axis(_ov, d.state_lambdas, d.centers, thr=_thr, n_k=m['n_k'])
+            s['ladder_overlap']=_lo
+            for _w in _lo_warnings:
+                s.setdefault('warnings',[]).append(_w)
+            s.setdefault('health',{}).setdefault('checks',[]).extend(
+                ladder_overlap_health_checks(_lo,_thr))
+            # Skip the recompute when build_health_verdict itself already
+            # failed (s['health']['error'] set, from the try/except a few
+            # lines above): overall is already 'UNKNOWN' for a reason, and
+            # recomputing from only the 4 ladder rows just added could turn
+            # a crashed verdict into a false PASS. build_health_verdict is
+            # documented never to raise, so this is defensive only.
+            if (isinstance(s.get('health'),dict) and isinstance(s['health'].get('checks'),list)
+                    and not s['health'].get('error')):
+                s['health']['overall']=overall_from_checks(s['health']['checks'])
+        except Exception as _lo_exc:
+            s.setdefault('warnings',[]).append(f"ladder-overlap axis report failed: {_lo_exc}")
+    # Per-rung GaMD boost/reweighting diagnostics: Miao's cumulant-reweighting
+    # criterion (anharmonicity < 0.01) is a per-STATE statement, and a ladder
+    # run's states span very different mean boosts (lambda=0 is unboosted
+    # umbrella, lambda=1 carries the full boost) -- pooling them into one
+    # mean/std (the existing 'boost' block above, from run_pmf_and_gamd_boost_
+    # report/boost_stats) mixes rungs and hides exactly the number that says
+    # whether cumulant reweighting is trustworthy per rung. All real logic
+    # (including the gamd_ladder gate and the <2-distinct-rungs warning)
+    # lives in the standalone, directly-unit-tested
+    # gareus.mbar_analysis.boost_report.gamd_boost_by_rung_report -- this
+    # call site is just wiring, in its own try/except so a bug here degrades
+    # to a missing diagnostic, never the health verdict already built above
+    # (same pattern as the ladder_overlap block).
+    try:
+        from gareus.mbar_analysis.boost_report import gamd_boost_by_rung_report
+        _rung_rows, _rung_warnings = gamd_boost_by_rung_report(d, kbt_kcal)
+        if _rung_rows is not None:
+            s['gamd_boost_by_rung'] = _rung_rows
+        for _w in _rung_warnings:
+            s.setdefault('warnings',[]).append(_w)
+    except Exception as _br_exc:
+        s.setdefault('warnings',[]).append(f"gamd boost/rung report failed: {_br_exc}")
     wjson(out/'pmf_summary.json',s); summary_md(out/'pmf_summary.md',s)
     if progress is not None: progress.bar('analysis stages', 6, 6, 'summary written', force=True)
     return s

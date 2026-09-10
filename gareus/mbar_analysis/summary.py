@@ -56,6 +56,21 @@ def summary_md(path,s):
     if b.get('available'):
         lines += [f"Boost mean/std: **{b['mean_kcal_mol']:.3f} / {b['std_kcal_mol']:.3f} kcal/mol**",f"Boost range: **{b['min_kcal_mol']:.3f} - {b['max_kcal_mol']:.3f} kcal/mol**",f"Anharmonicity score: **{b.get('anharmonicity_score')}**",f"Boost exponential ESS fraction: **{b.get('boost_reweight_ess_fraction',0):.3f}**"]
     else: lines.append('No finite variable GaMD boosts found; PMF is umbrella-only unbiased.')
+    by_rung=s.get('gamd_boost_by_rung')
+    if by_rung:
+        # Pooling across rungs (the block above) hides exactly the number
+        # that decides whether a boost can be reweighted at all: Miao's
+        # cumulant-reweighting criterion (anharmonicity < 0.01) applies PER
+        # STATE, and lambda=0 (plain umbrella) vs lambda=1 (full boost) have
+        # very different mean/sd by construction.
+        lines += ['', '### Per-rung boost/reweighting diagnostics', '',
+                  '| λ | n | ⟨ΔV⟩ kcal/mol | σ_ΔV kcal/mol | ⟨ΔV⟩ kT | anharmonicity | skew |',
+                  '|---:|---:|---:|---:|---:|---:|---:|']
+        for r in by_rung:
+            lines.append(
+                f"| {r['lambda']:.3f} | {int(r['n'])} | {r['mean_dv_kcal']:.3f} | "
+                f"{r['sd_dv_kcal']:.3f} | {r['mean_dv_kt']:.3f} | {r['anharm_nats']:.3f} | {r['skew']:.3f} |"
+            )
     rg=s.get('rg',{}) or {}
     lines += ['', '## Radius of gyration diagnostics', '']
     if rg.get('available'):

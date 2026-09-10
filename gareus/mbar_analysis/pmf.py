@@ -30,6 +30,7 @@ from gareus.mbar_analysis.data import Data
 # analyze_gareus_mbar.py's own solvers import list does not re-export this name
 # either, so _agm.make_overlap_bins does not exist.
 from gareus.mbar_analysis.solvers import make_overlap_bins
+from gareus.mbar_analysis.estimators import ladder_excluded_methods, choose_site_method
 
 
 def _bridge() -> Any:
@@ -2191,7 +2192,7 @@ def analyze_secondary_cv_pmf(d: Data, args, base_logw: np.ndarray, selected: str
         exp_w=_agm.norm_logw(base_logw_sel + d.beta*boost_sel)
         exp_pmf=pmf_from_weights(cv2_sel, exp_w, bins, kbt_kcal)
         (cum_pmf,cdiag),(cum3_pmf,cdiag3)=_cumulant_expansion_both(cv2_sel, base_w, boost_sel, bins, d.beta, kbt_kcal, smooth_logfac_sigma=_agm._eff_smooth(args,'gamd_smooth_sigma'))
-        chosen=selected if selected in {'gamd_exponential','gamd_cumulant2','gamd_cumulant3'} else 'gamd_cumulant2'
+        chosen=choose_site_method(selected, ladder_excluded_methods(bool(d.meta.get('gamd_ladder', False))))
     else:
         exp_pmf=umbrella; cum_pmf=umbrella; cum3_pmf=umbrella
         cdiag={'boost_mean_kj':np.full(len(bins)-1,np.nan),'boost_var_kj2':np.full(len(bins)-1,np.nan)}

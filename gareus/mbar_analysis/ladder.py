@@ -12,6 +12,7 @@ envelope-file resolution.
 """
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any, Optional
 
@@ -147,6 +148,33 @@ def apply_ladder_boost_to_u(
     return np.asarray(u_nk, dtype=np.float64) + float(beta) * boost_kj_nk
 
 
+def assert_lambda_sources_agree(state_lambdas, per_sample_lambda) -> None:
+    """Raise when the registry says "no ladder" but the samples disagree.
+
+    state_registry.csv is the only λ source the union loader reads. When it is
+    all-zero the ladder boost is never folded into u_nk and MBAR is told 112
+    states differ only by umbrella bias -- which is wrong, not merely noisy, and
+    today produces a confident PASS. The per-sample gamd_lambda column is an
+    independent witness; if it shows more than one rung, the registry is stale.
+    """
+    state_lambdas = np.asarray(state_lambdas, dtype=np.float64)
+    if np.any(state_lambdas > 0.0) or per_sample_lambda is None:
+        return
+    per_sample = np.asarray(per_sample_lambda, dtype=np.float64)
+    finite = per_sample[np.isfinite(per_sample)]
+    if finite.size == 0:
+        return
+    distinct = np.unique(np.round(finite, 6))
+    if distinct.size > 1 or float(distinct.max()) > 0.0:
+        raise ValueError(
+            "λ-ladder inconsistency: every state in state_registry.csv reads "
+            f"gamd_lambda=0, but the samples carry {distinct.size} distinct rung(s) "
+            f"up to λ={float(distinct.max()):.4f}. Analysing this run would silently "
+            "treat a boosted ensemble as unboosted. Re-write the registry from a "
+            "window table that carries gamd_lambda (see Task 1)."
+        )
+
+
 def mbar_state_overlap(u_nk: np.ndarray, f_k: np.ndarray, n_k: np.ndarray) -> np.ndarray:
     """MBAR state-overlap matrix ``O_ij`` for a solved set of states.
 
@@ -197,3 +225,35 @@ def mbar_state_overlap(u_nk: np.ndarray, f_k: np.ndarray, n_k: np.ndarray) -> np
     log_denom = max_l + np.log(np.sum(np.exp(shifted - max_l), axis=1, keepdims=True))
     w_nk = np.exp(log_num - log_denom)
     return n_k[:, None] * (w_nk.T @ w_nk)
+
+
+def symmetric_state_overlap(overlap: np.ndarray, i: int, j: int) -> Optional[float]:
+    """The per-edge overlap metric ``sqrt(O_ij * O_ji)``.
+
+    ``mbar_state_overlap`` above returns ``O = diag(N) @ S`` with ``S``
+    symmetric, so ``O_ij != O_ji`` whenever ``N_i != N_j`` -- and unequal
+    per-state sample counts are the normal case under adaptive extension, not
+    the exception. The raw ``O[i, j]`` would make an edge's overlap depend on
+    which of its two states happens to come first in the pair, which is
+    unrelated to anything physical. The geometric mean is the symmetric
+    combination, ``S_ij * sqrt(N_i * N_j)``, and it equals ``O_ij`` exactly
+    when ``N_i == N_j``.
+
+    Shared home for the convention: ``gareus.adaptive_production`` has its own
+    ``_symmetric_state_overlap`` with the same formula and the same reasoning
+    (see ``gareus/adaptive_production.py:3697-3725``), predating this one and
+    not de-duplicated here. There is no import-cycle risk in doing so --
+    ``adaptive_production`` already imports FROM this module
+    (``gareus/adaptive_production.py:3416,3697``) and this module imports
+    nothing from ``adaptive_production``, so ``adaptive_production``'s copy
+    could safely be replaced with an import of this function; that
+    de-duplication was simply out of scope for the task that added this
+    function and has not been done. Any *new* caller of
+    ``mbar_state_overlap`` -- e.g. ``gareus.mbar_analysis.ladder_overlap`` --
+    should call this function rather than hand-roll a third copy.
+    """
+    a = float(overlap[i, j])
+    b = float(overlap[j, i])
+    if not (math.isfinite(a) and math.isfinite(b)) or a < 0.0 or b < 0.0:
+        return None
+    return math.sqrt(a * b)
