@@ -4864,6 +4864,25 @@ def _report_summary_fields(report_info: dict) -> dict:
     }
 
 
+_CROSSCHECK_SUMMARY_KEYS = (
+    'status', 'max_abs_diff_kcal', 'n_lambda0_samples', 'tolerance_kcal',
+    'tolerance_source', 'n_bins_compared', 'count_gate_fell_back', 'reason',
+)
+
+
+def _crosscheck_summary_fields(lcc: dict) -> dict:
+    """JSON-safe view of a ladder cross-check result.
+
+    n_bins_compared is always present: crosscheck.py returns "skipped" below
+    three bins precisely because a one-bin comparison is vacuous (that bin is
+    the alignment reference, so its diff is identically zero and would read
+    "pass" at any tolerance). A status without a bin count hides that.
+    """
+    out = {k: lcc[k] for k in _CROSSCHECK_SUMMARY_KEYS if k in lcc}
+    out.setdefault('n_bins_compared', 0)
+    return out
+
+
 def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None, *,
                           regime: Optional[str] = None, run_convergence: bool = True,
                           convergence_skip_reason: str = ''):
@@ -4903,14 +4922,13 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
     # full-ladder PMF built from every sample. Runs against the FULL `d`
     # (not d_main below): the epoch_000/rest split is a GaMD-envelope-
     # recalibration axis, orthogonal to which states carry lambda=0.
-    ladder_crosscheck_summary={'status':'skipped','reason':'gamd_ladder not active for this run','n_lambda0_samples':0}
+    ladder_crosscheck_summary={'status':'skipped','reason':'gamd_ladder not active for this run','n_lambda0_samples':0,'n_bins_compared':0}
     if d.meta.get('gamd_ladder'):
         _lcc=ladder_crosscheck(d,m['f_k'],bins,kbt_kcal)
         # Slim, JSON-safe view for pmf_summary.json -- the two full PMF
         # dicts (_lcc['pmf_full']/['pmf_lambda0']) carry numpy arrays and go
         # to the CSV/PNG below instead, never into the summary itself.
-        ladder_crosscheck_summary={k:_lcc[k] for k in ('status','max_abs_diff_kcal','n_lambda0_samples','tolerance_kcal','tolerance_source','n_bins_compared','count_gate_fell_back') if k in _lcc}
-        if 'reason' in _lcc: ladder_crosscheck_summary['reason']=_lcc['reason']
+        ladder_crosscheck_summary=_crosscheck_summary_fields(_lcc)
         # The CONTRADICTION 'fail' (meta['gamd_ladder'] asserted while
         # state_lambdas carries no λ>0 -- see crosscheck.ladder_crosscheck)
         # returns before any PMF is built, so it carries neither pmf_full/
