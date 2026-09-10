@@ -28,6 +28,7 @@ from gareus.mbar_analysis.pmf import (
     run_pmf_and_gamd_boost_report,
     run_secondary_cv_analyses, analyze_secondary_cv_pmf,
 )
+from gareus.mbar_analysis.estimators import ladder_excluded_methods, choose_site_method
 from gareus.mbar_analysis.bias import (
     _compute_u_nk_analytical,
     _parse_epoch_window_map_native_params,
@@ -1582,7 +1583,7 @@ def analyze_rg(d: Data, args, m: dict, base_w: np.ndarray, selected: str, boost_
         exp_w=norm_logw(exp_logw)
         exp_pmf=pmf_from_weights(rg_sel,exp_w,bins,kbt_kcal)
         (cum_pmf,cdiag),(cum3_pmf,cdiag3)=_cumulant_expansion_both(rg_sel,base_w_rg,boost_sel,bins,d.beta,kbt_kcal,smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
-        rg_selected=selected if selected in {'gamd_exponential','gamd_cumulant2','gamd_cumulant3'} else 'gamd_cumulant2'
+        rg_selected=choose_site_method(selected, ladder_excluded_methods(bool(d.meta.get('gamd_ladder', False))))
     else:
         exp_w=base_w_rg
         exp_pmf=umbrella; cum_pmf=umbrella; cum3_pmf=umbrella; cdiag={'boost_mean_kj':np.full(len(bins)-1,np.nan),'boost_var_kj2':np.full(len(bins)-1,np.nan)}; cdiag3=cdiag; rg_selected='umbrella_only'
@@ -1640,7 +1641,7 @@ def analyze_distance_rg_2d_fes(d: Data, args, base_logw: np.ndarray, selected: s
         exp_w=norm_logw(exp_logw)
         fes_exp=pmf2d_from_weights(cv_sel, rg_sel, exp_w, xbins, ybins, kbt_kcal)
         (fes_cum, cdiag), (fes_cum3, cdiag3) = _cumulant_expansion_2d_both(cv_sel, rg_sel, base_w, boost_sel, xbins, ybins, d.beta, kbt_kcal, smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
-        chosen = selected if selected in {'gamd_exponential','gamd_cumulant2','gamd_cumulant3'} else 'gamd_cumulant2'
+        chosen = choose_site_method(selected, ladder_excluded_methods(bool(d.meta.get('gamd_ladder', False))))
     else:
         fes_exp=fes_umbrella
         fes_cum=fes_umbrella
@@ -2052,7 +2053,7 @@ def analyze_pca_2d_fes(d: Data, args, base_logw: np.ndarray, selected: str, boos
         exp_w=norm_logw(base_logw_sel+d.beta*boost_sel)
         fes_exp=pmf2d_from_weights(x,y,exp_w,xbins,ybins,kbt_kcal)
         (fes_cum,_cdiag),(fes_cum3,_cdiag3)=_cumulant_expansion_2d_both(x,y,base_w,boost_sel,xbins,ybins,d.beta,kbt_kcal,smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
-        chosen=selected if selected in {'gamd_exponential','gamd_cumulant2','gamd_cumulant3'} else 'gamd_cumulant2'
+        chosen=choose_site_method(selected, ladder_excluded_methods(bool(d.meta.get('gamd_ladder', False))))
     else:
         fes_exp=fes_umbrella
         fes_cum=fes_umbrella
@@ -3110,7 +3111,7 @@ def analyze_cv1_cv2_2d_fes(d: Data, args, base_logw: np.ndarray, selected: str, 
         exp_w=norm_logw(exp_logw)
         fes_exp=pmf2d_from_weights(cv_sel, cv2_sel, exp_w, xbins, ybins, kbt_kcal)
         (fes_cum,cdiag),(fes_cum3,cdiag3)=_cumulant_expansion_2d_both(cv_sel, cv2_sel, base_w, boost_sel, xbins, ybins, d.beta, kbt_kcal, smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
-        chosen=selected if selected in {'gamd_exponential','gamd_cumulant2','gamd_cumulant3'} else 'gamd_cumulant2'
+        chosen=choose_site_method(selected, ladder_excluded_methods(bool(d.meta.get('gamd_ladder', False))))
     else:
         fes_exp=fes_umbrella; fes_cum=fes_umbrella; fes_cum3=fes_umbrella
         cdiag={'boost_mean_kj':np.full((len(xbins)-1,len(ybins)-1),np.nan),'boost_var_kj2':np.full((len(xbins)-1,len(ybins)-1),np.nan)}
@@ -4090,7 +4091,7 @@ def analyze_chignolin_fes(d, args, base_logw: np.ndarray, selected: str, boost_o
         exp_w = norm_logw(logw_sel + d.beta * boost_sel)
         fes_exp = pmf2d_from_weights(x_sel, y_sel, exp_w, xbins, ybins, kbt_kcal)
         (fes_cum, _), (fes_cum3, _) = _cumulant_expansion_2d_both(x_sel, y_sel, base_w, boost_sel, xbins, ybins, d.beta, kbt_kcal, smooth_logfac_sigma=_eff_smooth(args,'gamd_smooth_sigma'))
-        chosen = selected if selected in {"gamd_exponential", "gamd_cumulant2", "gamd_cumulant3"} else "gamd_cumulant2"
+        chosen = choose_site_method(selected, ladder_excluded_methods(bool(d.meta.get("gamd_ladder", False))))
     else:
         fes_exp = fes_cum = fes_cum3 = fes_umbrella
         chosen = "umbrella_only"

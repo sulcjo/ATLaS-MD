@@ -30,6 +30,7 @@ from gareus.mbar_analysis.data import Data
 # analyze_gareus_mbar.py's own solvers import list does not re-export this name
 # either, so _agm.make_overlap_bins does not exist.
 from gareus.mbar_analysis.solvers import make_overlap_bins
+from gareus.mbar_analysis.estimators import ladder_excluded_methods, choose_site_method
 
 
 def _bridge() -> Any:
@@ -1596,9 +1597,17 @@ def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.nd
         pmfs.update(extra_pmfs)
     _force_method = str(getattr(args, 'selected_method', 'auto') or 'auto')
     if _force_method != 'auto' and _force_method in pmfs:
-        if _force_method in ('gamd_exponential', 'gamd_cumulant2', 'gamd_cumulant3') and not boost_ok:
-            warnings.append(f'{warning_prefix}--selected-method {_force_method} requested but no usable GaMD boost; it equals umbrella-only here.')
-        selected = _force_method
+        _ladder_excluded_force = ladder_excluded_methods(bool(d.meta.get('gamd_ladder', False)))
+        if _force_method in _ladder_excluded_force:
+            # A genuine refusal, not a warning-and-proceed: honouring this would
+            # let --selected-method reintroduce the exact double-count this
+            # module exists to prevent, on a run where the boost is already
+            # exact in u_nk.
+            warnings.append(f'{warning_prefix}--selected-method {_force_method} refused: this is a λ-ladder run and the boost is already exact in u_nk, so {_force_method} would remove it a second time; umbrella_only remains selected.')
+        else:
+            if _force_method in ('gamd_exponential', 'gamd_cumulant2', 'gamd_cumulant3') and not boost_ok:
+                warnings.append(f'{warning_prefix}--selected-method {_force_method} requested but no usable GaMD boost; it equals umbrella-only here.')
+            selected = _force_method
     # --- window overlap ----------------------------------------------------
     # FIX A5 (docs/chignolin_6_low_ess_root_cause.md, secondary finding #1):
     # the overlap diagnostic was the primary-CV MARGINAL only. On that run 20 of
@@ -2191,7 +2200,7 @@ def analyze_secondary_cv_pmf(d: Data, args, base_logw: np.ndarray, selected: str
         exp_w=_agm.norm_logw(base_logw_sel + d.beta*boost_sel)
         exp_pmf=pmf_from_weights(cv2_sel, exp_w, bins, kbt_kcal)
         (cum_pmf,cdiag),(cum3_pmf,cdiag3)=_cumulant_expansion_both(cv2_sel, base_w, boost_sel, bins, d.beta, kbt_kcal, smooth_logfac_sigma=_agm._eff_smooth(args,'gamd_smooth_sigma'))
-        chosen=selected if selected in {'gamd_exponential','gamd_cumulant2','gamd_cumulant3'} else 'gamd_cumulant2'
+        chosen=choose_site_method(selected, ladder_excluded_methods(bool(d.meta.get('gamd_ladder', False))))
     else:
         exp_pmf=umbrella; cum_pmf=umbrella; cum3_pmf=umbrella
         cdiag={'boost_mean_kj':np.full(len(bins)-1,np.nan),'boost_var_kj2':np.full(len(bins)-1,np.nan)}
