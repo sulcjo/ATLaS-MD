@@ -122,6 +122,24 @@ def _worse(a: str, b: str) -> str:
     return a if _STATUS_RANK.get(a, 0) >= _STATUS_RANK.get(b, 0) else b
 
 
+def overall_from_checks(checks) -> str:
+    """Derive the overall PASS/CAUTION/FAIL/UNKNOWN verdict from a list of
+    check dicts, via the exact worst-status rule ``build_health_verdict``
+    itself uses.
+
+    Shared so a caller that appends checks AFTER ``build_health_verdict`` has
+    already run (e.g. analyze_gareus_mbar.py's ladder-axis health rows, added
+    once the ladder overlap matrix is available) can recompute ``overall``
+    without reimplementing the severity ordering -- and so ``overall`` can
+    never again read PASS while a FAIL row sits underneath it in the same
+    checks list (the whole-branch-review defect this function fixes).
+    """
+    worst = NA
+    for c in checks or []:
+        worst = _worse(worst, (c or {}).get("status", NA))
+    return _OVERALL[_STATUS_RANK[worst]]
+
+
 def _human_count(n: Optional[float]) -> str:
     if n is None:
         return "?"
@@ -158,10 +176,7 @@ def build_health_verdict(s: dict, min_neighbor_overlap: float = 0.30) -> dict:
     checks.append(_check_pmf_convergence(s))
     checks.append(_check_ladder_crosscheck(s))
 
-    worst = NA
-    for c in checks:
-        worst = _worse(worst, c["status"])
-    overall = _OVERALL[_STATUS_RANK[worst]]
+    overall = overall_from_checks(checks)
 
     return {
         "overall": overall,
