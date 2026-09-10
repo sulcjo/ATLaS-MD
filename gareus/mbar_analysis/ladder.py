@@ -147,6 +147,33 @@ def apply_ladder_boost_to_u(
     return np.asarray(u_nk, dtype=np.float64) + float(beta) * boost_kj_nk
 
 
+def assert_lambda_sources_agree(state_lambdas, per_sample_lambda) -> None:
+    """Raise when the registry says "no ladder" but the samples disagree.
+
+    state_registry.csv is the only λ source the union loader reads. When it is
+    all-zero the ladder boost is never folded into u_nk and MBAR is told 112
+    states differ only by umbrella bias -- which is wrong, not merely noisy, and
+    today produces a confident PASS. The per-sample gamd_lambda column is an
+    independent witness; if it shows more than one rung, the registry is stale.
+    """
+    state_lambdas = np.asarray(state_lambdas, dtype=np.float64)
+    if np.any(state_lambdas > 0.0) or per_sample_lambda is None:
+        return
+    per_sample = np.asarray(per_sample_lambda, dtype=np.float64)
+    finite = per_sample[np.isfinite(per_sample)]
+    if finite.size == 0:
+        return
+    distinct = np.unique(np.round(finite, 6))
+    if distinct.size > 1 or float(distinct.max()) > 0.0:
+        raise ValueError(
+            "λ-ladder inconsistency: every state in state_registry.csv reads "
+            f"gamd_lambda=0, but the samples carry {distinct.size} distinct rung(s) "
+            f"up to λ={float(distinct.max()):.4f}. Analysing this run would silently "
+            "treat a boosted ensemble as unboosted. Re-write the registry from a "
+            "window table that carries gamd_lambda (see Task 1)."
+        )
+
+
 def mbar_state_overlap(u_nk: np.ndarray, f_k: np.ndarray, n_k: np.ndarray) -> np.ndarray:
     """MBAR state-overlap matrix ``O_ij`` for a solved set of states.
 

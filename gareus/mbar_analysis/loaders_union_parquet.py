@@ -304,6 +304,7 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
     all_cv = []; all_cv2 = []; all_window = []; all_step = []
     all_replica = []; all_boost = []; all_boost_dih = []; all_potential = []; all_epoch_src = []
     all_v_pep = []; all_v_dih = []
+    all_gamd_lambda_sample = []
     all_unk_blocks = []
     beta = float('nan')
     meta: dict = rjson(adaptive_dir.parent / 'run_manifest.json', {})
@@ -413,6 +414,13 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
         all_v_pep.append(_fill_masked_nan(v_pep_raw[valid]) if v_pep_raw is not None else np.full(valid.sum(), np.nan))
         v_dih_raw = samples.get('v_dih_kj_mol')
         all_v_dih.append(_fill_masked_nan(v_dih_raw[valid]) if v_dih_raw is not None else np.full(valid.sum(), np.nan))
+        # Per-sample gamd_lambda (production.snapshot_window_rows / gareus/store.py) is
+        # this loop's independent witness against state_registry.csv's own gamd_lambda
+        # column (state_lambdas, built above from the registry) -- see
+        # assert_lambda_sources_agree, called once below after this is concatenated.
+        # Same masked-null hazard/fix as boost/v_pep/v_dih above.
+        lam_sample_raw = samples.get('gamd_lambda')
+        all_gamd_lambda_sample.append(_fill_masked_nan(lam_sample_raw[valid]) if lam_sample_raw is not None else np.full(valid.sum(), np.nan))
         pot_raw = samples.get('potential')
         all_potential.append(_fill_masked_nan(pot_raw[valid]) if pot_raw is not None else np.full(valid.sum(), np.nan))
         all_epoch_src.append(np.full(int(valid.sum()), len(all_cv) - 1, dtype=np.int32))
@@ -464,9 +472,18 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
     boost_dih = np.concatenate(all_boost_dih); del all_boost_dih
     v_pep   = np.concatenate(all_v_pep); del all_v_pep
     v_dih   = np.concatenate(all_v_dih); del all_v_dih
+    gamd_lambda_sample = np.concatenate(all_gamd_lambda_sample); del all_gamd_lambda_sample
     pot_arr = np.concatenate(all_potential); del all_potential
     potential = pot_arr if np.any(np.isfinite(pot_arr)) else None
     u_nk    = np.concatenate(all_unk_blocks, axis=0); del all_unk_blocks
+
+    # state_registry.csv (state_lambdas, built above) and the per-sample
+    # gamd_lambda column just concatenated here are two independent sources for
+    # the same quantity. A stale/regenerated registry that reads all-zero while
+    # the samples plainly carry active rungs must fail loud here, not silently
+    # skip the ladder boost below and report a confident PASS.
+    from .ladder import assert_lambda_sources_agree
+    assert_lambda_sources_agree(state_lambdas, gamd_lambda_sample)
 
     epoch_src = np.concatenate(all_epoch_src) if all_epoch_src else np.zeros(len(cv), dtype=np.int32)
     del all_epoch_src
