@@ -1597,17 +1597,9 @@ def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.nd
         pmfs.update(extra_pmfs)
     _force_method = str(getattr(args, 'selected_method', 'auto') or 'auto')
     if _force_method != 'auto' and _force_method in pmfs:
-        _ladder_excluded_force = ladder_excluded_methods(bool(d.meta.get('gamd_ladder', False)))
-        if _force_method in _ladder_excluded_force:
-            # A genuine refusal, not a warning-and-proceed: honouring this would
-            # let --selected-method reintroduce the exact double-count this
-            # module exists to prevent, on a run where the boost is already
-            # exact in u_nk.
-            warnings.append(f'{warning_prefix}--selected-method {_force_method} refused: this is a λ-ladder run and the boost is already exact in u_nk, so {_force_method} would remove it a second time; umbrella_only remains selected.')
-        else:
-            if _force_method in ('gamd_exponential', 'gamd_cumulant2', 'gamd_cumulant3') and not boost_ok:
-                warnings.append(f'{warning_prefix}--selected-method {_force_method} requested but no usable GaMD boost; it equals umbrella-only here.')
-            selected = _force_method
+        if _force_method in ('gamd_exponential', 'gamd_cumulant2', 'gamd_cumulant3') and not boost_ok:
+            warnings.append(f'{warning_prefix}--selected-method {_force_method} requested but no usable GaMD boost; it equals umbrella-only here.')
+        selected = _force_method
     # --- window overlap ----------------------------------------------------
     # FIX A5 (docs/chignolin_6_low_ess_root_cause.md, secondary finding #1):
     # the overlap diagnostic was the primary-CV MARGINAL only. On that run 20 of
