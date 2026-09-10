@@ -2055,6 +2055,7 @@ def write_explicit_window_analysis_files(
     secondary_cv_metadata: Optional[dict] = None,
     window_metadata: Optional[dict] = None,
     neighbor_graph_summary: Optional[dict] = None,
+    gamd_lambdas=None,
 ) -> dict:
     """Write sparse-safe explicit window metadata files for MBAR/reweighting."""
     out_dir = Path(out_dir)
@@ -2062,6 +2063,7 @@ def write_explicit_window_analysis_files(
         centers_a, k_list, secondary_cv_centers, secondary_cv_k_kcal_list,
         secondary_cv_metadata=secondary_cv_metadata,
         window_metadata=window_metadata,
+        gamd_lambdas=gamd_lambdas,
     )
     csv_path = out_dir / "umbrella_explicit_windows.csv"
     json_path = out_dir / "umbrella_explicit_windows.json"
@@ -3452,6 +3454,7 @@ def drop_bad_us_windows_and_rebuild(
             secondary_cv_metadata=secondary_cv_metadata,
             window_metadata=window_metadata,
             neighbor_graph_summary=graph_summary,
+            gamd_lambdas=new_gamd_lambdas,
         )
     except Exception as exc:
         explicit_window_table_summary = {}
@@ -5602,6 +5605,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             secondary_cv_metadata=secondary_cv_metadata,
             window_metadata=window_metadata,
             neighbor_graph_summary=graph_summary,
+            gamd_lambdas=args.state_gamd_lambdas,
         )
         window_metadata = dict(window_metadata or {})
         window_metadata["explicit_window_table"] = explicit_window_table_summary
