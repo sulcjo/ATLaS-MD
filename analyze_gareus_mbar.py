@@ -5084,6 +5084,34 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
     except Exception as _hv_exc:
         s['health']={'overall':'UNKNOWN','checks':[],'error':str(_hv_exc)}
         s.setdefault('warnings_grouped',[])
+    # A ladder run is 2-D even with cv2 "none": states differ by CV1 centre AND
+    # by rung, and the CV1-marginal 'Window overlap' check above only ever
+    # sees one of those axes. Report both directions separately -- own
+    # try/except so a bug here degrades to a missing diagnostic, never to
+    # discarding the health verdict just built above (see .superpowers/sdd/
+    # 2026-09-10-gareus-analyze-ladder/task-5-brief.md, Task 5).
+    if d.meta.get('gamd_ladder'):
+        try:
+            from gareus_report import PASS, CAUTION, FAIL, NA, OVERLAP_FAIL_FRACTION
+            from gareus.mbar_analysis.ladder import mbar_state_overlap
+            from gareus.mbar_analysis.ladder_overlap import ladder_overlap_by_axis
+            _ov=mbar_state_overlap(d.u_nk, m['f_k'], m['n_k'])
+            _lo=ladder_overlap_by_axis(_ov, d.state_lambdas, d.centers)
+            s['ladder_overlap']=_lo
+            _thr=float(getattr(args,'min_neighbor_overlap',0.30))
+            for _axis_key,_label in (('lambda_direction','Overlap along λ'),
+                                      ('cv1_direction','Overlap across CV1')):
+                _ax=_lo[_axis_key]
+                if _ax['worst'] is None:
+                    _status,_detail=NA,'no adjacent pairs on this axis'
+                else:
+                    _w=_ax['worst']; _a,_b=_ax['worst_pair']
+                    _status=FAIL if _w<OVERLAP_FAIL_FRACTION*_thr else (CAUTION if _w<_thr else PASS)
+                    _detail=f"worst {_w:.3f} (states {_a}-{_b})"
+                s.setdefault('health',{}).setdefault('checks',[]).append(
+                    {'name':_label,'status':_status,'detail':_detail})
+        except Exception as _lo_exc:
+            s.setdefault('warnings',[]).append(f"ladder-overlap axis report failed: {_lo_exc}")
     wjson(out/'pmf_summary.json',s); summary_md(out/'pmf_summary.md',s)
     if progress is not None: progress.bar('analysis stages', 6, 6, 'summary written', force=True)
     return s
