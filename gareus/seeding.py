@@ -37,6 +37,28 @@ from .cv import (
     secondary_structure_score_from_positions_nm,
 )
 from .io import _json_ready, write_json
+
+
+# OpenMM's LocalEnergyMinimizer is not thread-safe. Seeding runs
+# --us-pull-workers Contexts concurrently (28 in the chignolin_7 campaign), and
+# minimising from several of them at once corrupts the heap -- observed as
+# `free(): invalid pointer` with every worker thread inside openmm.minimize,
+# under graft_conformer_into_context (job 2379581). The hazard is old; it stayed
+# hidden while each Context carried a core-count-sized CPU thread pool whose
+# oversubscription kept the workers apart, and appeared as soon as that pool was
+# capped so 112 recon Contexts would fit.
+#
+# Every minimisation in this module therefore goes through one process-wide
+# lock. Only the minimiser is serialised: the MD, the pulling and the state I/O
+# stay concurrent, and minimisation is a small share of a window's seeding cost.
+_MINIMIZE_LOCK = threading.Lock()
+
+
+def _minimize_energy(sim, **kwargs) -> None:
+    """Serialised ``sim.minimizeEnergy(**kwargs)``; see _MINIMIZE_LOCK."""
+    with _MINIMIZE_LOCK:
+        sim.minimizeEnergy(**kwargs)
+
 from .progress import GuiProgressSink
 from .state import _scalar_to_float, cv_distance_from_positions_nm, cv_distance_nm, cv_distance_and_potential_from_state
 from .system_setup import (
@@ -1008,7 +1030,7 @@ def graft_conformer_into_context(
                 ca_abs_arr = np.array([], dtype=int)
                 ca_aligned_nm = None
         sim.context.setPositions(new_full_pos * unit.nanometer)
-        sim.minimizeEnergy(maxIterations=minimize_iters)
+        _minimize_energy(sim, maxIterations=minimize_iters)
         min_state = sim.context.getState(getPositions=True, enforcePeriodicBox=True)
         min_pos_nm = min_state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
         if np.isnan(min_pos_nm).any():
@@ -1343,9 +1365,9 @@ def generate_us_starting_states_by_pulling(
             sim.context.setParameter("k", float(k_stage))
             if idx == 0 and minimize_iters > 0 and bool(getattr(args, "contact_us_pull_minimize_first_ramp", True)):
                 try:
-                    sim.minimizeEnergy(maxIterations=max(1, minimize_iters))
+                    _minimize_energy(sim, maxIterations=max(1, minimize_iters))
                 except TypeError:
-                    sim.minimizeEnergy()
+                    _minimize_energy(sim)
             run_steps_safely(
                 sim, int(nstage), label,
                 out_dir, app, topology, unit,
@@ -1391,9 +1413,9 @@ def generate_us_starting_states_by_pulling(
             _set_secondary_restraint_for_window(sim, w, hold_scale if staged_2d_relax else 1.0)
         if minimize_iters > 0:
             try:
-                sim.minimizeEnergy(maxIterations=minimize_iters)
+                _minimize_energy(sim, maxIterations=minimize_iters)
             except TypeError:
-                sim.minimizeEnergy()
+                _minimize_energy(sim)
         progress_base = int(sum(1 for x in positions_by_window if x is not None) * max(1, pull_steps))
         if effective_pull_steps > 0:
             if staged_2d_relax:
@@ -1424,9 +1446,9 @@ def generate_us_starting_states_by_pulling(
                     _set_secondary_restraint_for_window(sim, w, scale * pull_k_scale)
                     if minimize_iters > 0 and bool(getattr(args, "us_2d_start_minimize_each_ramp", False)):
                         try:
-                            sim.minimizeEnergy(maxIterations=max(1, minimize_iters // max(1, secondary_ramp_stages)))
+                            _minimize_energy(sim, maxIterations=max(1, minimize_iters // max(1, secondary_ramp_stages)))
                         except TypeError:
-                            sim.minimizeEnergy()
+                            _minimize_energy(sim)
                     run_steps_safely(
                         sim, int(nstage), "us_starting_pull_secondary_ramp",
                         out_dir, app, topology, unit,
