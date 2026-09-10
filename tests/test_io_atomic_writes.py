@@ -18,7 +18,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
-from gareus.io import write_csv_atomic, write_json
+from gareus.io import write_csv_atomic, write_json, write_text_atomic
 
 
 class WriteJsonAtomicityTests(unittest.TestCase):
@@ -111,6 +111,55 @@ class WriteCsvAtomicTests(unittest.TestCase):
             self.assertEqual(body[0], "window")
             self.assertIn(len(body) - 1, payloads,
                           f"partial file: {len(body) - 1} data rows")
+
+
+class WriteTextAtomicTests(unittest.TestCase):
+    """The runtime-pool ledger's Markdown twin is now rewritten on every charge.
+
+    It is a human-readable report rather than something the code parses back, but
+    it is written beside the JSON on every single consume(), so a kill mid-write
+    must leave the previous report intact rather than a truncated one.
+    """
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_writes_content_and_creates_parents(self):
+        target = self.root / "nested" / "report.md"
+        write_text_atomic(target, "# Report\n")
+        self.assertEqual(target.read_text(), "# Report\n")
+
+    def test_leaves_no_temporary_file_behind(self):
+        target = self.root / "report.md"
+        write_text_atomic(target, "body")
+        self.assertEqual([p.name for p in self.root.iterdir()], ["report.md"])
+
+    def test_failure_mid_write_leaves_previous_content_intact(self):
+        target = self.root / "report.md"
+        write_text_atomic(target, "original")
+
+        with mock.patch("gareus.io._persist", side_effect=RuntimeError("killed mid-write")):
+            with self.assertRaises(RuntimeError):
+                write_text_atomic(target, "replacement")
+
+        self.assertEqual(target.read_text(), "original")
+        strays = [p.name for p in self.root.iterdir() if p.name != "report.md"]
+        self.assertEqual(strays, [], f"temporary files left behind: {strays}")
+
+    def test_concurrent_writers_never_yield_a_partial_file(self):
+        target = self.root / "report.md"
+        payloads = {n: ("x" * n) for n in (50, 400, 1200)}
+
+        def write(n):
+            write_text_atomic(target, payloads[n])
+
+        for _ in range(12):
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                list(pool.map(write, payloads))
+            self.assertIn(len(target.read_text()), payloads,
+                          "partial file observed")
 
 
 if __name__ == "__main__":
