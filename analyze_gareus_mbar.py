@@ -5118,21 +5118,22 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
     # umbrella, lambda=1 carries the full boost) -- pooling them into one
     # mean/std (the existing 'boost' block above, from run_pmf_and_gamd_boost_
     # report/boost_stats) mixes rungs and hides exactly the number that says
-    # whether cumulant reweighting is trustworthy per rung. Own try/except so
-    # a bug here degrades to a missing diagnostic, never the health verdict
-    # already built above (same pattern as the ladder_overlap block).
-    if d.meta.get('gamd_ladder'):
-        try:
-            from gareus.mbar_analysis.boost_report import boost_report_rows
-            _lam_per_sample = (
-                d.state_lambdas[np.asarray(d.window, dtype=np.int64)]
-                if d.state_lambdas is not None else np.array([], dtype=np.float64)
-            )
-            _dv_kcal = np.asarray(d.boost_kj, dtype=np.float64) / KJ_PER_KCAL
-            s['gamd_boost_by_rung'] = boost_report_rows(_dv_kcal, _lam_per_sample, kbt_kcal)
-        except Exception as _br_exc:
-            s.setdefault('warnings',[]).append(f"gamd boost/rung report failed: {_br_exc}")
-            s['gamd_boost_by_rung'] = []
+    # whether cumulant reweighting is trustworthy per rung. All real logic
+    # (including the gamd_ladder gate and the <2-distinct-rungs warning)
+    # lives in the standalone, directly-unit-tested
+    # gareus.mbar_analysis.boost_report.gamd_boost_by_rung_report -- this
+    # call site is just wiring, in its own try/except so a bug here degrades
+    # to a missing diagnostic, never the health verdict already built above
+    # (same pattern as the ladder_overlap block).
+    try:
+        from gareus.mbar_analysis.boost_report import gamd_boost_by_rung_report
+        _rung_rows, _rung_warnings = gamd_boost_by_rung_report(d, kbt_kcal)
+        if _rung_rows is not None:
+            s['gamd_boost_by_rung'] = _rung_rows
+        for _w in _rung_warnings:
+            s.setdefault('warnings',[]).append(_w)
+    except Exception as _br_exc:
+        s.setdefault('warnings',[]).append(f"gamd boost/rung report failed: {_br_exc}")
     wjson(out/'pmf_summary.json',s); summary_md(out/'pmf_summary.md',s)
     if progress is not None: progress.bar('analysis stages', 6, 6, 'summary written', force=True)
     return s
