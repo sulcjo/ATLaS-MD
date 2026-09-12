@@ -46,16 +46,29 @@ __all__ = [
 ]
 
 
+def _strict_window(primary_center, primary_k, secondary_center, secondary_k):
+    """Translate union-loader inactive sentinels at strict-core boundary."""
+    try:
+        secondary_center = float(secondary_center)
+        secondary_k = float(secondary_k)
+    except (TypeError, ValueError):
+        secondary_center, secondary_k = 0.0, 0.0
+    if (not math.isfinite(secondary_center)
+            or not math.isfinite(secondary_k)
+            or secondary_k <= 0.0):
+        secondary_center, secondary_k = 0.0, 0.0
+    return {
+        "center1": primary_center, "k1": primary_k,
+        "center2": secondary_center, "k2": secondary_k,
+    }
+
+
 def _compute_u_nk_analytical(cv1: np.ndarray, cv2: np.ndarray,
                               union_windows: list, beta: float) -> np.ndarray:
     """Compute N×K_union reduced bias matrix analytically from CV values."""
-    windows = [
-        {
-            "center1": w["primary_center"], "k1": w["primary_k_kcal"],
-            "center2": w["secondary_cv_center"], "k2": w["secondary_k_kcal"],
-        }
-        for w in union_windows
-    ]
+    windows = [_strict_window(w["primary_center"], w["primary_k_kcal"],
+                              w["secondary_cv_center"], w["secondary_k_kcal"])
+               for w in union_windows]
     return query.reconstruct_bias_matrix(cv1, cv2, windows, beta)
 
 
@@ -140,11 +153,9 @@ def _reconstruct_union_bias_block(cv: np.ndarray, cv2: np.ndarray, beta: float,
     is negligible next to the O(N*K) numpy arithmetic reconstruct_bias_matrix
     itself performs.
     """
-    windows = [
-        {"center1": primary_centers[k], "k1": primary_ks[k],
-         "center2": sec_centers[k], "k2": sec_ks[k]}
-        for k in range(len(primary_centers))
-    ]
+    windows = [_strict_window(primary_centers[k], primary_ks[k],
+                              sec_centers[k], sec_ks[k])
+               for k in range(len(primary_centers))]
     return query.reconstruct_bias_matrix(cv, cv2, windows, beta)
 
 

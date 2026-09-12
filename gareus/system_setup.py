@@ -867,8 +867,9 @@ def prepare_solvated_system(args, out_dir: Path):
         f"padding={args.padding_nm:.2f} nm → boxSize={_box_nm:.2f} nm"
     )
 
+    from .correctness.periodic_box import solvent_construction_model
     solvent_kwargs = {
-        "model": args.water_model,
+        "model": solvent_construction_model(args.water_model),
         "boxSize": openmm.Vec3(_box_nm, _box_nm, _box_nm) * unit.nanometer,
         "ionicStrength": args.ionic_strength_molar * unit.molar,
         "neutralize": True,

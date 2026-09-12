@@ -869,16 +869,17 @@ def _fake_production_checkpoint(phase_dir, n_replicas: int = 3) -> None:
     a phase resumes, so it is the one the map-preservation guard has to agree
     with.  Equal file sizes clear its median-outlier torn-write check.
     """
-    import json
+    from gareus.correctness.checkpoint_store import publish_generation
 
-    chk = phase_dir / "checkpoints"
-    chk.mkdir(parents=True, exist_ok=True)
-    names = [f"replica_{i:03d}.chk" for i in range(n_replicas)]
-    for name in names:
-        (chk / name).write_bytes(b"x" * 4096)
-    (chk / "production_checkpoint_manifest.json").write_text(
-        json.dumps({"replica_checkpoint_files": names, "prod_done": 1_000_000}),
-        encoding="utf-8",
+    publish_generation(
+        phase_dir,
+        [b"x" * 4096 for _ in range(n_replicas)],
+        {
+            "assignments": list(range(n_replicas)), "prod_done": 1_000_000,
+            "absolute_step": 1_000_000, "parity": 0, "attempt": 0,
+            "next_exchange": 1_000_000, "next_log": 1_000_000,
+            "exchange_stats": {}, "rng_bit_generator": "PCG64", "rng_state": {},
+        },
     )
 
 

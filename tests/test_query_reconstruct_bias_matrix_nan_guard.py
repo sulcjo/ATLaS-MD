@@ -38,17 +38,13 @@ from gareus.query import reconstruct_bias_matrix
 # --- window-side guard: a window with no REAL secondary restraint must
 #     never poison or wrongly restrain, regardless of what the keys hold ---
 
-def test_nan_k2_produces_finite_cv1_only_bias():
+def test_nan_k2_is_rejected_as_malformed_definition():
     cv1 = np.array([0.0, 1.0, 2.0])
     cv2 = np.array([5.0, -3.0, np.nan])  # secondary values irrelevant/unmeasured
     windows = [{"center1": 0.0, "k1": 10.0, "center2": -1.0, "k2": np.nan}]
 
-    nk = reconstruct_bias_matrix(cv1, cv2, windows, beta=0.4)
-
-    assert np.all(np.isfinite(nk))
-    d1 = cv1 - 0.0
-    expected = 0.4 * 4.184 * 0.5 * 10.0 * d1 ** 2
-    np.testing.assert_allclose(nk[:, 0], expected)
+    with pytest.raises(ValueError, match="k2 must be finite"):
+        reconstruct_bias_matrix(cv1, cv2, windows, beta=0.4)
 
 
 def test_zero_k2_produces_finite_cv1_only_bias():
@@ -64,20 +60,16 @@ def test_zero_k2_produces_finite_cv1_only_bias():
     np.testing.assert_allclose(nk[:, 0], expected)
 
 
-def test_negative_k2_produces_finite_cv1_only_bias():
+def test_negative_k2_is_rejected_as_malformed_definition():
     cv1 = np.array([0.0, 1.0])
     cv2 = np.array([2.0, -2.0])
     windows = [{"center1": 0.0, "k1": 10.0, "center2": 0.0, "k2": -5.0}]
 
-    nk = reconstruct_bias_matrix(cv1, cv2, windows, beta=0.4)
-
-    assert np.all(np.isfinite(nk))
-    d1 = cv1 - 0.0
-    expected = 0.4 * 4.184 * 0.5 * 10.0 * d1 ** 2
-    np.testing.assert_allclose(nk[:, 0], expected)
+    with pytest.raises(ValueError, match="k2 must be >= 0"):
+        reconstruct_bias_matrix(cv1, cv2, windows, beta=0.4)
 
 
-def test_nan_center2_with_positive_finite_k2_produces_finite_cv1_only_bias():
+def test_nan_center2_is_rejected_as_malformed_definition():
     """Deliberate edge case: a real, positive k2 but a NaN/missing center is
     the OPPOSITE half of the guard from the k2 checks above -- both isfinite
     checks are required, neither alone is sufficient.
@@ -86,12 +78,8 @@ def test_nan_center2_with_positive_finite_k2_produces_finite_cv1_only_bias():
     cv2 = np.array([5.0, -3.0])  # finite -- would previously NaN-poison via c2-NaN
     windows = [{"center1": 0.0, "k1": 10.0, "center2": np.nan, "k2": 11.87}]
 
-    nk = reconstruct_bias_matrix(cv1, cv2, windows, beta=0.4)
-
-    assert np.all(np.isfinite(nk))
-    d1 = cv1 - 0.0
-    expected = 0.4 * 4.184 * 0.5 * 10.0 * d1 ** 2
-    np.testing.assert_allclose(nk[:, 0], expected)
+    with pytest.raises(ValueError, match="center2 must be finite"):
+        reconstruct_bias_matrix(cv1, cv2, windows, beta=0.4)
 
 
 # --- positive control: a real secondary restraint must still apply ---------
@@ -137,7 +125,7 @@ def test_all_nan_cv2_under_restrained_window_yields_all_nan_column():
     assert np.all(np.isnan(nk[:, 0]))
 
 
-def test_mixed_windows_one_restrained_one_not_isolated_correctly():
+def test_mixed_windows_with_malformed_definition_are_rejected():
     """A no-restraint window's NaN k2 must not affect another window's
     column in the same call (regression against a cross-window broadcast bug)."""
     cv1 = np.array([0.0, 1.0])
@@ -147,18 +135,8 @@ def test_mixed_windows_one_restrained_one_not_isolated_correctly():
         {"center1": 0.5, "k1": 20.0, "center2": 1.0, "k2": 5.0},
     ]
 
-    nk = reconstruct_bias_matrix(cv1, cv2, windows, beta=0.4)
-
-    assert np.all(np.isfinite(nk))
-    d1_0 = cv1 - 0.0
-    expected_col0 = 0.4 * 4.184 * 0.5 * 10.0 * d1_0 ** 2
-    np.testing.assert_allclose(nk[:, 0], expected_col0)
-
-    d1_1 = cv1 - 0.5
-    d2_1 = cv2 - 1.0
-    expected_col1 = (0.4 * 4.184 * 0.5 * 20.0 * d1_1 ** 2
-                     + 0.4 * 4.184 * 0.5 * 5.0 * d2_1 ** 2)
-    np.testing.assert_allclose(nk[:, 1], expected_col1)
+    with pytest.raises(ValueError, match="k2 must be finite"):
+        reconstruct_bias_matrix(cv1, cv2, windows, beta=0.4)
 
 
 def test_1d_window_with_no_center2_k2_keys_at_all_is_unaffected():

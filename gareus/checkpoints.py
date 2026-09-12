@@ -55,35 +55,9 @@ def find_resume_equil_state_path(out_dir: Path) -> Optional[Path]:
 
 
 def production_checkpoint_available(out_dir: Path) -> bool:
-    manifest = read_json_file(checkpoint_manifest_path(out_dir), None)
-    if not isinstance(manifest, dict):
-        return False
-    files = manifest.get("replica_checkpoint_files", [])
-    if not files:
-        return False
-    chk_dir = checkpoint_manifest_path(out_dir).parent
-    sizes: list[int] = []
-    for f in files:
-        try:
-            size = (chk_dir / str(f)).stat().st_size
-        except OSError:
-            return False
-        if size < MIN_CHECKPOINT_BYTES:
-            return False
-        sizes.append(size)
-    # A torn/truncated write from a mid-checkpoint kill (SIGKILL, disk-full)
-    # typically lands well above the absolute floor above -- a real OpenMM
-    # checkpoint is ~1e5-1e6 bytes, so a file cut at 30-70% of its true size
-    # clears MIN_CHECKPOINT_BYTES easily.  Every replica's checkpoint is
-    # written in the same pass with the same system/integrator, so their
-    # sizes should be close to each other; flag any outlier well below the
-    # group's own median as a likely torn write rather than trusting it.
-    if len(sizes) > 1:
-        median_size = sorted(sizes)[len(sizes) // 2]
-        min_plausible = median_size * 0.5
-        if any(size < min_plausible for size in sizes):
-            return False
-    return True
+    """False means absent, not corrupt. Legacy v1 requires explicit migration."""
+    from .correctness.checkpoint_store import require_available
+    return require_available(out_dir)
 
 
 def load_existing_openmm_setup_for_resume(args, out_dir: Path, require_equil_state: bool = False):

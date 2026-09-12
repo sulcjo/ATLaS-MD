@@ -4602,6 +4602,7 @@ def save_production_checkpoint(out_dir: Path, sims: list, assignments: list[int]
     chk_dir = Path(out_dir) / "checkpoints"
     chk_dir.mkdir(parents=True, exist_ok=True)
     replica_files = []
+    replica_payloads = []
     replica_integrator_globals_all = []
     replica_integrator_global_counts = []
     npt_controller_states: list = []
@@ -4611,14 +4612,10 @@ def save_production_checkpoint(out_dir: Path, sims: list, assignments: list[int]
         own worker thread; returns (relpath, globals, n_state)."""
         sim = sims[r]
         driver = drivers[r] if drivers is not None and r < len(drivers) else None
-        try:
-            g = all_integrator_globals(sim.integrator)
-        except Exception:
-            g = {}
+        from .correctness.repo_adapters import checkpoint_globals
+        g = checkpoint_globals(sim.integrator, all_integrator_globals)
         rel = f"replica_{r:03d}.chk"
-        tmp_chk = chk_dir / f"{rel}.tmp"
-        tmp_chk.write_bytes(sim.context.createCheckpoint())
-        tmp_chk.replace(chk_dir / rel)
+        replica_payloads.append(sim.context.createCheckpoint())
         n_state = None
         if driver is not None and getattr(driver, "controller", None) is not None:
             n_state = _json_ready(driver.controller.state_dict())
@@ -4685,28 +4682,17 @@ def save_production_checkpoint(out_dir: Path, sims: list, assignments: list[int]
         manifest["secondary_cv_centers"] = [float(x) for x in secondary_cv_centers]
     if secondary_cv_k_kcal_list is not None:
         manifest["secondary_cv_k_kcal_mol"] = [float(x) for x in secondary_cv_k_kcal_list]
-    manifest_path = checkpoint_manifest_path(out_dir)
-    tmp = chk_dir / f"{manifest_path.name}.tmp.{os.getpid()}"
-    tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
-    tmp.replace(manifest_path)
+    from .correctness.checkpoint_store import publish_generation
+    publish_generation(out_dir, replica_payloads, manifest)
 
 def sync_scratch_to_main(scratch_dir: Path, main_dir: Path) -> None:
-    """Copy everything from scratchdir to maindir (called at each checkpoint).
+    """Checkpoint-safe quiescent copy; mutable sample files are individually atomic.
 
-    Uses shutil.copytree with dirs_exist_ok so repeated calls are safe.
-    Errors are printed as warnings; a failed sync does not abort the run.
+    This is not yet a generation-index transaction across all Parquet output.
+    Any failure remains visible instead of claiming a successful backup.
     """
-    scratch_dir = Path(scratch_dir)
-    main_dir = Path(main_dir)
-    if scratch_dir.resolve() == main_dir.resolve():
-        return
-    if not scratch_dir.exists():
-        return
-    main_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        shutil.copytree(str(scratch_dir), str(main_dir), dirs_exist_ok=True, copy_function=shutil.copy2)
-    except Exception as exc:
-        print(f"WARNING [scratchdir sync]: {scratch_dir} → {main_dir} failed: {exc}")
+    from .correctness.repo_adapters import sync_run_tree_quiescent
+    sync_run_tree_quiescent(scratch_dir, main_dir)
 
 def _validate_npt_checkpoint_compatibility(out_dir: Path, manifest: dict, npt_runtime: NptRunContext, sims: list) -> Optional[str]:
     """Validate backend/adapter/T/P/topology before accepting a checkpoint.
@@ -4839,10 +4825,14 @@ def load_production_checkpoint(out_dir: Path, sims: list, centers_nm, ks_kj_nm2,
     and random stream is restored from the manifest's per-replica
     ``state_dict()`` -- restoring never attempts an extra move.
     """
+    from .correctness.checkpoint_store import read_validated_generation
+    from .correctness.repo_adapters import validate_rng_restore
     manifest_path = checkpoint_manifest_path(out_dir)
-    if not manifest_path.exists():
+    _generation = read_validated_generation(out_dir)
+    if _generation is None:
         return None
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest = dict(_generation.manifest)
+    validate_rng_restore(manifest, rng)
     manifest_openmm_version = manifest.get("openmm_version")
     if openmm_version is not None and manifest_openmm_version is not None and str(manifest_openmm_version) != str(openmm_version):
         print(f"WARNING: checkpoint manifest was written with OpenMM {manifest_openmm_version}, but this run is using OpenMM {openmm_version}; a version bump is not automatically incompatible, but resume state should be checked carefully.")
@@ -4866,7 +4856,8 @@ def load_production_checkpoint(out_dir: Path, sims: list, centers_nm, ks_kj_nm2,
 
     def _load_replica(r: int):
         sim = sims[r]
-        data = (chk_dir / files[r]).read_bytes()
+        # Load the exact bytes already validated before any Context was changed.
+        data = _generation.replica_payloads[r]
         sim.context.loadCheckpoint(data)
         controller = None
         if npt_runtime is not None and npt_runtime.needs_controller:
@@ -5835,6 +5826,8 @@ def _augment_seed_bank_with_campaign_search(
 
 
 def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equil_state, progress: Optional[GuiProgressSink] = None):
+    from .correctness.sampling_policy import require_rescue_disabled_in_current_driver
+    require_rescue_disabled_in_current_driver(args)
     _register_graceful_shutdown()
     acquire_run_lock(out_dir)
     platform, props = platform_and_properties(openmm, args.platform, args.precision, args.device_index, args.cpu_threads, args=args)
@@ -6916,12 +6909,9 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     # the contact switching function gradient is ~0 and the umbrella provides no actual force).
     # After _stuck_max_intervals consecutive exchange intervals below _stuck_threshold, copy
     # positions from the nearest non-stuck replica and reinitialise velocities.
-    _stuck_reseed_flag = getattr(args, "cv1_stuck_reseed", None)
-    _stuck_enabled = bool(_stuck_reseed_flag) if _stuck_reseed_flag is not None else primary_cv_is_contacts(args)
-    # Disable rescue in final production by default (non-equilibrium intervention).
-    _is_final_production = bool(getattr(args, "adaptive_feedback_final_production", False))
-    if _is_final_production and not bool(getattr(args, "rescue_in_final_production", False)):
-        _stuck_enabled = False
+    # Conservative guard: exploratory rescue needs separate policy/ledger wiring.
+    # No contact-CV default or final-production override may mutate configurations.
+    _stuck_enabled = False
     _stuck_threshold = float(getattr(args, "cv1_stuck_threshold", 0.03) or 0.03)
     _stuck_max_intervals = int(getattr(args, "cv1_stuck_detect_intervals", 500) or 500)
     _stuck_counter = np.zeros(nrep, dtype=int)
