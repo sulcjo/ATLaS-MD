@@ -211,6 +211,10 @@ class DashboardContext:
     sidecar: SidecarSnapshot = field(default_factory=SidecarSnapshot)
     view: str = "progress"
     glyphs: str = "unicode"
+    # `final` is the terminal scheduled stage: it has no position in the epoch
+    # sequence, so it carries this flag instead of an epoch_index. Defaulted so
+    # every existing construction site keeps working unchanged.
+    is_final_stage: bool = False
 
 
 def _tuple_map(source: Mapping[int, Any]) -> dict[int, tuple[float, ...]]:
@@ -326,6 +330,7 @@ def build_context(
         segment_name=str(adaptive.get("segment_name", "") or ""),
         epoch_index=adaptive.get("epoch_index"),
         epoch_total=adaptive.get("epoch_total"),
+        is_final_stage=bool(adaptive.get("is_final_stage", False)),
         step=int(step),
         total_steps=int(total_steps) if total_steps is not None else None,
         display_step=display_step,
