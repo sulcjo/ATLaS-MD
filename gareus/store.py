@@ -15,6 +15,16 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .parquet_manifest import (
+    ParquetManifestError,
+    _fsync_dir,
+    _fsync_file,
+    append_file_to_manifest,
+    file_record,
+    load_manifest,
+    replace_files_in_manifest,
+)
+
 
 class ParquetSampleWriter:
     """Buffers per-step sample data and flushes to Parquet chunks.
@@ -28,7 +38,10 @@ class ParquetSampleWriter:
         self._out_dir.mkdir(parents=True, exist_ok=True)
         self._flush_rows = max(1, flush_rows)
         self._buf: Dict[str, list] = defaultdict(list)
-        self._chunk_idx = 0
+        self._manifest = load_manifest(self._out_dir, expected_kind="samples")
+        if self._manifest is None and list(self._out_dir.glob("*.parquet")):
+            raise ParquetManifestError(f"cannot append to legacy Parquet segment without manifest: {self._out_dir}")
+        self._chunk_idx = (self._manifest["next_chunk_index"] - 1) if self._manifest else 0
 
     def write_sample(
         self,
@@ -95,6 +108,20 @@ class ParquetSampleWriter:
         tmp_path = chunk_path.with_name(f"{chunk_path.name}.tmp.{os.getpid()}")
         pq.write_table(tbl, tmp_path, compression="zstd", compression_level=3)
         tmp_path.rename(chunk_path)
+        _fsync_file(chunk_path)
+        _fsync_dir(self._out_dir)
+        record = file_record(
+            chunk_path,
+            rows=tbl.num_rows,
+            first_step=min(b["step"]),
+            last_step=max(b["step"]),
+        )
+        self._manifest = append_file_to_manifest(
+            self._out_dir,
+            kind="samples",
+            record=record,
+            next_chunk_index=self._chunk_idx + 1,
+        )
 
         for lst in b.values():
             lst.clear()
@@ -104,23 +131,32 @@ class ParquetSampleWriter:
         self._consolidate()
 
     def _consolidate(self) -> None:
-        """Merge all chunk_*.parquet into data.parquet then remove chunks."""
-        chunks = sorted(self._out_dir.glob("chunk_*.parquet"))
-        if len(chunks) <= 1:
-            if len(chunks) == 1:
-                chunks[0].rename(self._out_dir / "data.parquet")
+        """Publish compacted Parquet through manifest switch, then collect sources."""
+        manifest = load_manifest(self._out_dir, expected_kind="samples")
+        if manifest is None or not any(str(r["path"]).startswith("chunk_") for r in manifest["files"]):
             return
+        source_records = list(manifest["files"])
+        chunks = [self._out_dir / r["path"] for r in source_records]
         import pyarrow.dataset as ds
         import pyarrow.parquet as pq
         tbl = ds.dataset(chunks, format="parquet").to_table()
         tbl = tbl.sort_by([("step", "ascending"), ("replica", "ascending")])
-        for stale in self._out_dir.glob("data.parquet.tmp.*"):
-            stale.unlink(missing_ok=True)
-        tmp = self._out_dir / f"data.parquet.tmp.{os.getpid()}"
+        has_compact = any(str(r["path"]).startswith("data") for r in source_records)
+        name = f"data_{manifest['generation'] + 1:06d}.parquet" if has_compact else "data.parquet"
+        output = self._out_dir / name
+        tmp = output.with_name(f"{output.name}.tmp.{os.getpid()}")
         pq.write_table(tbl, tmp, compression="zstd", compression_level=3)
-        tmp.rename(self._out_dir / "data.parquet")
-        for c in chunks:
-            c.unlink(missing_ok=True)
+        _fsync_file(tmp)
+        tmp.rename(output)
+        _fsync_file(output)
+        _fsync_dir(self._out_dir)
+        record = file_record(output, rows=tbl.num_rows, first_step=int(tbl["step"][0].as_py()), last_step=int(tbl["step"][-1].as_py()))
+        self._manifest = replace_files_in_manifest(
+            self._out_dir, kind="samples", records=[record], next_chunk_index=self._chunk_idx + 1
+        )
+        for source in chunks:
+            source.unlink(missing_ok=True)
+        _fsync_dir(self._out_dir)
 
 
 class ParquetExchangeWriter:
@@ -131,7 +167,10 @@ class ParquetExchangeWriter:
         self._out_dir.mkdir(parents=True, exist_ok=True)
         self._flush_rows = max(1, flush_rows)
         self._buf: Dict[str, list] = defaultdict(list)
-        self._chunk_idx = 0
+        self._manifest = load_manifest(self._out_dir, expected_kind="exchanges")
+        if self._manifest is None and list(self._out_dir.glob("*.parquet")):
+            raise ParquetManifestError(f"cannot append to legacy Parquet segment without manifest: {self._out_dir}")
+        self._chunk_idx = (self._manifest["next_chunk_index"] - 1) if self._manifest else 0
 
     def write_exchange(
         self,
@@ -183,6 +222,20 @@ class ParquetExchangeWriter:
         tmp_path = chunk_path.with_name(f"{chunk_path.name}.tmp.{os.getpid()}")
         pq.write_table(tbl, tmp_path, compression="zstd", compression_level=3)
         tmp_path.rename(chunk_path)
+        _fsync_file(chunk_path)
+        _fsync_dir(self._out_dir)
+        record = file_record(
+            chunk_path,
+            rows=tbl.num_rows,
+            first_step=min(b["step"]),
+            last_step=max(b["step"]),
+        )
+        self._manifest = append_file_to_manifest(
+            self._out_dir,
+            kind="exchanges",
+            record=record,
+            next_chunk_index=self._chunk_idx + 1,
+        )
 
         for lst in b.values():
             lst.clear()
@@ -192,23 +245,32 @@ class ParquetExchangeWriter:
         self._consolidate()
 
     def _consolidate(self) -> None:
-        """Merge all chunk_*.parquet into data.parquet then remove chunks."""
-        chunks = sorted(self._out_dir.glob("chunk_*.parquet"))
-        if len(chunks) <= 1:
-            if len(chunks) == 1:
-                chunks[0].rename(self._out_dir / "data.parquet")
+        """Publish compacted Parquet through manifest switch, then collect sources."""
+        manifest = load_manifest(self._out_dir, expected_kind="exchanges")
+        if manifest is None or not any(str(r["path"]).startswith("chunk_") for r in manifest["files"]):
             return
+        source_records = list(manifest["files"])
+        chunks = [self._out_dir / r["path"] for r in source_records]
         import pyarrow.dataset as ds
         import pyarrow.parquet as pq
         tbl = ds.dataset(chunks, format="parquet").to_table()
         tbl = tbl.sort_by([("step", "ascending")])
-        for stale in self._out_dir.glob("data.parquet.tmp.*"):
-            stale.unlink(missing_ok=True)
-        tmp = self._out_dir / f"data.parquet.tmp.{os.getpid()}"
+        has_compact = any(str(r["path"]).startswith("data") for r in source_records)
+        name = f"data_{manifest['generation'] + 1:06d}.parquet" if has_compact else "data.parquet"
+        output = self._out_dir / name
+        tmp = output.with_name(f"{output.name}.tmp.{os.getpid()}")
         pq.write_table(tbl, tmp, compression="zstd", compression_level=3)
-        tmp.rename(self._out_dir / "data.parquet")
-        for c in chunks:
-            c.unlink(missing_ok=True)
+        _fsync_file(tmp)
+        tmp.rename(output)
+        _fsync_file(output)
+        _fsync_dir(self._out_dir)
+        record = file_record(output, rows=tbl.num_rows, first_step=int(tbl["step"][0].as_py()), last_step=int(tbl["step"][-1].as_py()))
+        self._manifest = replace_files_in_manifest(
+            self._out_dir, kind="exchanges", records=[record], next_chunk_index=self._chunk_idx + 1
+        )
+        for source in chunks:
+            source.unlink(missing_ok=True)
+        _fsync_dir(self._out_dir)
 
 
 class SegmentRegistry:

@@ -33,7 +33,7 @@ def test_parquet_writer_correct_columns(tmp_path):
     writer.flush()
     writer.close()
 
-    table = pq.read_table(tmp_path / "seg")
+    table = pq.read_table(tmp_path / "seg" / "data.parquet")
     assert set(table.column_names) == {
         "step", "replica", "window_id", "cv1", "cv2",
         "potential", "gamd_boost_total", "gamd_boost_dihedral", "gamd_boost_nonbonded",
@@ -50,7 +50,7 @@ def test_parquet_writer_roundtrip_values(tmp_path):
     writer.flush()
     writer.close()
 
-    tbl = pq.read_table(tmp_path / "seg")
+    tbl = pq.read_table(tmp_path / "seg" / "data.parquet")
     row = {col: tbl[col][0].as_py() for col in tbl.column_names}
     assert row["step"] == 500
     assert row["replica"] == 1
@@ -103,7 +103,7 @@ def test_parquet_writer_null_cv2(tmp_path):
     writer.flush()
     writer.close()
 
-    tbl = pq.read_table(tmp_path / "seg")
+    tbl = pq.read_table(tmp_path / "seg" / "data.parquet")
     assert tbl["cv2"][0].as_py() is None
 
 
@@ -405,7 +405,7 @@ def test_parquet_writer_null_boost_fields(tmp_path):
     writer.flush()
     writer.close()
 
-    tbl = pq.read_table(tmp_path / "seg")
+    tbl = pq.read_table(tmp_path / "seg" / "data.parquet")
     row = {col: tbl[col][0].as_py() for col in tbl.column_names}
     assert row["gamd_boost_total"] is None
     assert row["gamd_boost_dihedral"] is None

@@ -27,6 +27,7 @@ import numpy as np
 
 from .io import read_json_file
 from .store import SegmentRegistry
+from .parquet_manifest import committed_files
 from .units import KJ_PER_KCAL
 
 
@@ -135,11 +136,16 @@ def _result_len(result: dict) -> int:
 
 def _group_parquet_files_by_segment(data_dir: Path, allowed_segments: Optional[set[str]] = None) -> dict[str, list[str]]:
     groups: dict[str, list[str]] = {}
-    for path in sorted(Path(data_dir).glob("**/*.parquet")):
-        seg_id = str(path.parent.name)
+    kind = Path(data_dir).name
+    for segment_dir in sorted(p for p in Path(data_dir).iterdir() if p.is_dir()):
+        seg_id = str(segment_dir.name)
         if allowed_segments is not None and seg_id not in allowed_segments:
             continue
-        groups.setdefault(seg_id, []).append(str(path))
+        files = committed_files(segment_dir, expected_kind=kind)
+        if files is None:
+            files = [str(p) for p in sorted(segment_dir.glob("*.parquet"))]
+        if files:
+            groups[seg_id] = files
     return groups
 
 
@@ -204,7 +210,9 @@ def _load_segmented_parquet(
             seg_dir = data_dir / seg_id
             if not seg_dir.exists():
                 continue
-            files = sorted(str(f) for f in seg_dir.glob("*.parquet"))
+            files = committed_files(seg_dir, expected_kind=dirname)
+            if files is None:
+                files = sorted(str(f) for f in seg_dir.glob("*.parquet"))
             if not files:
                 continue
             status = str(seg.get("status", "running"))

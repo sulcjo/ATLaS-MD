@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import os
+import tempfile
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -52,22 +53,14 @@ def _sha256(path: Path, chunk_size: int = 1024 * 1024) -> str:
 
 
 def _fsync_file(path: Path) -> None:
-    try:
-        with Path(path).open("rb") as fh:
-            os.fsync(fh.fileno())
-    except OSError:
-        pass
+    with Path(path).open("rb") as fh:
+        os.fsync(fh.fileno())
 
 
 def _fsync_dir(path: Path) -> None:
-    try:
-        fd = os.open(str(Path(path)), os.O_RDONLY)
-    except OSError:
-        return
+    fd = os.open(str(Path(path)), os.O_RDONLY)
     try:
         os.fsync(fd)
-    except OSError:
-        pass
     finally:
         os.close(fd)
 
@@ -210,11 +203,19 @@ def publish_manifest(segment_dir: Path, manifest: dict[str, Any]) -> dict[str, A
     # Validate referenced files and metadata before making this generation visible.
     normalized = validate_manifest(segment_dir, manifest, expected_kind=str(manifest.get("kind", "")), verify_hashes=False)
     path = manifest_path(segment_dir)
-    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
-    tmp.write_text(json.dumps(normalized, indent=2, sort_keys=True), encoding="utf-8")
-    _fsync_file(tmp)
-    os.replace(tmp, path)
-    _fsync_dir(segment_dir)
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{path.name}.tmp.", dir=str(segment_dir))
+    tmp = Path(tmp_name)
+    try:
+        payload = json.dumps(normalized, indent=2, sort_keys=True).encode("utf-8")
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        _fsync_dir(segment_dir)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
     return normalized
 
 
