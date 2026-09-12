@@ -43,6 +43,9 @@ from .system_setup import (
     make_trajectory_reporter,
     write_solute_only_topology_pdb,
     write_state_pdb,
+    resolve_barostat_ownership,
+    preflight_barostat_ownership,
+    _production_barostat_frequency,
 )
 from .seeding import (
     generate_us_starting_states_by_pulling,
@@ -1625,6 +1628,51 @@ from .pep_gamd import (
     DIHEDRAL_GROUP,
     PepGamdEnvelope,
 )
+from .npt_driver import (
+    NPT_CHECKPOINT_PHASE_NOTE,
+    NPT_REPORT_PHASE_NOTE,
+    NptRunContext,
+    ReplicaStepDriver,
+    npt_seed_check_run,
+    npt_seed_recon_window,
+    npt_seed_replica,
+    npt_seed_shared_setup,
+)
+
+
+def _resolve_npt_adapter(args):
+    """Locate the stage-aware effective-potential (U*) adapter for this run.
+
+    The adapter implementations are package 2's half of the NPT correction
+    (``gareus/pep_gamd.py``: the stage-aware separation of physical energy,
+    auxiliary energy and boost inputs).  This single seam is how package B
+    consumes it: when the biased-MC backend is resolved, the adapter factory
+    must exist or the run fails here -- loudly, never by silently falling
+    back to the wrong acceptance energy.  Tests patch this one function.
+    """
+    from . import pep_gamd
+    factory = getattr(pep_gamd, "build_effective_potential_adapter", None)
+    if factory is None:
+        raise RuntimeError(
+            "The biased-MC NPT backend requires the stage-aware effective-potential "
+            "adapter from gareus/pep_gamd.py (NPT correction package 2), which is not "
+            "present in this build. Refusing to run boosted NPT rather than accept "
+            "volume moves against the wrong energy; use --production-ensemble nvt or "
+            "a conventional (cmd) run mode until the adapter lands."
+        )
+    return factory(args)
+
+
+def _production_barostat_description(args) -> str:
+    """Human-readable description of the production pressure algorithm actually in force."""
+    ensemble = str(getattr(args, "production_ensemble", "npt"))
+    if ensemble != "npt":
+        return "none"
+    backend = str(getattr(args, "npt_barostat_backend", "auto") or "auto")
+    if backend == "biased_mc":
+        freq = _production_barostat_frequency(args)
+        return f"gareus BiasedMCBarostatController (biased Metropolis, every {freq} steps)"
+    return "OpenMM MonteCarloBarostat"
 
 
 def assemble_bias_matrices(distance_bias_kcal, ss_bias_kcal, boost_bias_kj):
@@ -4457,7 +4505,8 @@ def save_production_checkpoint(out_dir: Path, sims: list, assignments: list[int]
                                centers_a=None, k_list=None, cv_atom1=None, cv_atom2=None, cv_label=None, calib_steps=None,
                                secondary_cv_metadata=None, secondary_cv_centers=None, secondary_cv_k_kcal_list=None,
                                primary_cv_metadata=None, openmm_version: Optional[str] = None,
-                               platform_name: Optional[str] = None) -> None:
+                               platform_name: Optional[str] = None,
+                               drivers: Optional[list] = None, pool=None, npt_runtime: Optional[NptRunContext] = None) -> None:
     """Write restart checkpoints for all production replicas.
 
     The OpenMM binary checkpoint is platform/version specific but it is the most
@@ -4471,28 +4520,50 @@ def save_production_checkpoint(out_dir: Path, sims: list, assignments: list[int]
     resume path explicitly restores those globals after Context.loadCheckpoint().
     This makes GaMD boost continuation inspectable instead of relying on a black
     box checkpoint assumption.
+
+    NPT correction: when ``drivers``/``pool``/``npt_runtime`` are supplied, each
+    replica's binary checkpoint AND its volume-controller ``state_dict()`` are
+    captured together on the replica's own context-owning worker thread (closing
+    the checkpoint-save affinity hole), and the manifest carries the per-replica
+    NPT block (backend, adapter ids, T/P, frequency, fixed width, counters,
+    last/next due step, RNG algorithm/state, molecule-partition fingerprint and
+    controller schema version -- everything ``state_dict()`` contains).  The
+    manifest write is the atomic commit point for the whole set.
     """
     chk_dir = Path(out_dir) / "checkpoints"
     chk_dir.mkdir(parents=True, exist_ok=True)
     replica_files = []
     replica_integrator_globals_all = []
     replica_integrator_global_counts = []
-    for r, sim in enumerate(sims):
-        # Snapshot GaMD/CustomIntegrator globals at the same production state as
-        # the checkpoint.  This is intentionally independent of samples.csv and
-        # --write-gamd-globals-json, because restart correctness must not depend
-        # on verbose sample logging being enabled.
+    npt_controller_states: list = []
+
+    def _checkpoint_replica(r: int):
+        """Capture one replica's binary checkpoint + controller state on its
+        own worker thread; returns (relpath, globals, n_state)."""
+        sim = sims[r]
+        driver = drivers[r] if drivers is not None and r < len(drivers) else None
         try:
             g = all_integrator_globals(sim.integrator)
         except Exception:
             g = {}
-        replica_integrator_globals_all.append(_json_ready(g))
-        replica_integrator_global_counts.append(int(len(g)))
         rel = f"replica_{r:03d}.chk"
         tmp_chk = chk_dir / f"{rel}.tmp"
         tmp_chk.write_bytes(sim.context.createCheckpoint())
         tmp_chk.replace(chk_dir / rel)
+        n_state = None
+        if driver is not None and getattr(driver, "controller", None) is not None:
+            n_state = _json_ready(driver.controller.state_dict())
+        return rel, g, n_state
+
+    for r, sim in enumerate(sims):
+        if pool is not None:
+            rel, g, n_state = pool.submit(r, _checkpoint_replica, r).result()
+        else:
+            rel, g, n_state = _checkpoint_replica(r)
         replica_files.append(rel)
+        replica_integrator_globals_all.append(_json_ready(g))
+        replica_integrator_global_counts.append(int(len(g)))
+        npt_controller_states.append(n_state)
     manifest = {
         "schema": "gareus_production_checkpoint_v1",
         "openmm_version": str(openmm_version) if openmm_version is not None else None,
@@ -4514,6 +4585,17 @@ def save_production_checkpoint(out_dir: Path, sims: list, assignments: list[int]
         "integrator_globals_restore_note": "On resume, these CustomIntegrator globals are explicitly restored after Context.loadCheckpoint() so GaMD boost state does not depend only on opaque binary checkpoint behavior.",
         "note": "Resume requires the same OpenMM version/platform/system/topology and compatible command-line settings.",
     }
+    if npt_runtime is not None and drivers is not None:
+        has_controllers = any(state is not None for state in npt_controller_states)
+        if npt_runtime.backend == "biased_mc" and not has_controllers:
+            raise RuntimeError(
+                "biased_mc NPT checkpoint requested but no replica carries a volume "
+                "controller; refusing to write a checkpoint that cannot be resumed"
+            )
+        manifest["npt"] = npt_runtime.manifest_block(
+            controllers=npt_controller_states,
+            n_atoms=[int(sim.system.getNumParticles()) for sim in sims],
+        )
     if centers_a is not None:
         manifest["windows_A"] = [float(x) for x in centers_a]
     if k_list is not None:
@@ -4557,10 +4639,113 @@ def sync_scratch_to_main(scratch_dir: Path, main_dir: Path) -> None:
     except Exception as exc:
         print(f"WARNING [scratchdir sync]: {scratch_dir} → {main_dir} failed: {exc}")
 
+def _validate_npt_checkpoint_compatibility(out_dir: Path, manifest: dict, npt_runtime: NptRunContext, sims: list) -> Optional[str]:
+    """Validate backend/adapter/T/P/topology before accepting a checkpoint.
+
+    Returns ``"restored"``, ``"fresh_init"`` or ``None`` (nothing to do).
+    Raises ``RuntimeError`` for every incompatible combination, including the
+    legacy boosted-NPT checkpoint case: removing the native barostat from the
+    application-controlled System changes the System itself, so binary
+    compatibility with a pre-correction boosted-NPT checkpoint is explicitly
+    NOT promised (spec section 8).
+    """
+    npt_block = manifest.get("npt")
+    current = npt_runtime.backend
+    if current == "none":
+        return None
+    if npt_block is None:
+        # Legacy manifest (pre-correction).  Whether resuming is meaningful
+        # depends on what the legacy run actually was; gareus_metadata.json
+        # recorded it.
+        meta_path = Path(out_dir) / "gareus_metadata.json"
+        meta = read_json_file(meta_path, None) if meta_path.exists() else None
+        if not isinstance(meta, dict):
+            raise RuntimeError(
+                "Cannot verify NPT compatibility of the production checkpoint: "
+                f"{meta_path} is missing or unreadable, and the checkpoint manifest "
+                "predates the NPT correction (no 'npt' block). Refusing to resume "
+                "rather than guess who owned volume moves."
+            )
+        legacy_ensemble = str(meta.get("production_ensemble", "") or "").lower()
+        legacy_gamd = bool(meta.get("gamd_enabled", False))
+        if current == "biased_mc" and legacy_ensemble == "npt" and legacy_gamd:
+            raise RuntimeError(
+                "This production checkpoint is a LEGACY boosted-NPT checkpoint from "
+                "before the NPT correction: its System carried a native "
+                "MonteCarloBarostat whose acceptance energy omitted the GaMD boost "
+                "and included the Pep-GaMD auxiliary force. Removing that barostat "
+                "changes the System, so the binary Context checkpoint is NOT "
+                "compatible with the corrected biased-MC backend and no exact "
+                "continuation exists. Start a new run (a fresh segment with an "
+                "explicitly identified equilibration), or use the separately "
+                "requested migration to extract positions/velocities/box under the "
+                "legacy System. Historical frames must not be relabeled as "
+                "corrected samples."
+            )
+        if current == "biased_mc" and legacy_ensemble == "nvt":
+            print(
+                "    [npt] Resuming a legacy NVT checkpoint under the biased-MC NPT "
+                "backend: the physical System is unchanged, so the binary "
+                "checkpoint is loadable, but there is no volume-move schedule or "
+                "RNG stream to restore -- initializing fresh controllers from the "
+                "resumed step. This is a new-segment ensemble change (NVT -> NPT), "
+                "not an exact continuation."
+            )
+            return "fresh_init"
+        if current == "biased_mc":
+            raise RuntimeError(
+                f"Legacy checkpoint has no NPT block and gareus_metadata.json reports "
+                f"ensemble={legacy_ensemble!r}, gamd_enabled={legacy_gamd}; cannot "
+                "resume it under the biased-MC NPT backend."
+            )
+        return None
+    # Current-generation manifest: the stored block must match this run.
+    stored_backend = str(npt_block.get("backend", ""))
+    if stored_backend != current:
+        raise RuntimeError(
+            f"Checkpoint was written with npt backend {stored_backend!r} but this run "
+            f"resolved {current!r}: removing (or adding) the native barostat changes "
+            "the System, so the binary checkpoints are not compatible. Start a new "
+            "run or re-select the same backend."
+        )
+    if current != "biased_mc":
+        return None
+    controllers = npt_block.get("controllers") or []
+    if len(controllers) != len(sims) or any(c is None for c in controllers):
+        raise RuntimeError(
+            "biased_mc checkpoint manifest does not carry a volume-controller state "
+            "for every replica; cannot restore the exact schedule and random stream"
+        )
+    adapter_ids = list(npt_block.get("adapter_ids") or [])
+    this_adapter_id = str(getattr(npt_runtime.adapter, "adapter_id", ""))
+    for i, stored_id in enumerate(adapter_ids):
+        if str(stored_id) != this_adapter_id:
+            raise RuntimeError(
+                f"Checkpoint adapter id {stored_id!r} (replica {i}) does not match "
+                f"this run's effective-potential adapter {this_adapter_id!r}: the "
+                "volume-move acceptance energy would silently change meaning."
+            )
+    if abs(float(npt_block.get("temperature_k", 0.0)) - float(npt_runtime.ownership.temperature_k)) > 1e-6:
+        raise RuntimeError("Checkpoint temperature does not match this run's temperature")
+    if abs(float(npt_block.get("pressure_bar", 0.0)) - float(npt_runtime.ownership.pressure_bar)) > 1e-6:
+        raise RuntimeError("Checkpoint pressure does not match this run's pressure")
+    stored_atoms = npt_block.get("n_atoms") or []
+    for r, sim in enumerate(sims):
+        if r < len(stored_atoms) and int(stored_atoms[r]) != int(sim.system.getNumParticles()):
+            raise RuntimeError(
+                f"Checkpoint topology has {stored_atoms[r]} particles for replica "
+                f"{r} but this run's System has {sim.system.getNumParticles()}"
+            )
+    return "restored"
+
+
 def load_production_checkpoint(out_dir: Path, sims: list, centers_nm, ks_kj_nm2, rng, secondary_centers=None, secondary_ks_kj=None,
                                openmm_version: Optional[str] = None, platform_name: Optional[str] = None,
                                strict_gamd_restore: bool = False,
-                               state_lambdas=None, k0max_by_channel: Optional[dict] = None) -> Optional[dict]:
+                               state_lambdas=None, k0max_by_channel: Optional[dict] = None,
+                               drivers: Optional[list] = None, pool=None,
+                               npt_runtime: Optional[NptRunContext] = None,
+                               args=None) -> Optional[dict]:
     """Load a production checkpoint manifest and all replica checkpoints if available.
 
     state_lambdas/k0max_by_channel need not both be given: k0max_by_channel is None
@@ -4570,6 +4755,13 @@ def load_production_checkpoint(out_dir: Path, sims: list, centers_nm, ks_kj_nm2,
     of an active ladder (k0max_by_channel is not None) with no per-window λ
     (state_lambdas is None) is a real misconfiguration; see
     set_replica_lambda_for_window, which enforces exactly that and nothing more.
+
+    NPT correction: with ``drivers``/``pool``/``npt_runtime`` the binary
+    checkpoints load on each replica's own worker thread (closing the
+    checkpoint-load affinity hole), the volume-controller compatibility is
+    validated BEFORE anything is loaded, and each controller's exact schedule
+    and random stream is restored from the manifest's per-replica
+    ``state_dict()`` -- restoring never attempts an extra move.
     """
     manifest_path = checkpoint_manifest_path(out_dir)
     if not manifest_path.exists():
@@ -4584,6 +4776,9 @@ def load_production_checkpoint(out_dir: Path, sims: list, centers_nm, ks_kj_nm2,
     files = manifest.get("replica_checkpoint_files", [])
     if len(files) != len(sims):
         raise RuntimeError(f"Checkpoint replica count mismatch: manifest has {len(files)} files, current run has {len(sims)} replicas")
+    npt_resume_mode = None
+    if npt_runtime is not None:
+        npt_resume_mode = _validate_npt_checkpoint_compatibility(out_dir, manifest, npt_runtime, sims)
     chk_dir = manifest_path.parent
     pre_load_globals = []
     for sim in sims:
@@ -4591,9 +4786,31 @@ def load_production_checkpoint(out_dir: Path, sims: list, centers_nm, ks_kj_nm2,
             pre_load_globals.append(all_integrator_globals(sim.integrator))
         except Exception:
             pre_load_globals.append({})
-    for r, sim in enumerate(sims):
+    npt_block = manifest.get("npt") or {}
+
+    def _load_replica(r: int):
+        sim = sims[r]
         data = (chk_dir / files[r]).read_bytes()
         sim.context.loadCheckpoint(data)
+        controller = None
+        if npt_runtime is not None and npt_runtime.needs_controller:
+            if npt_resume_mode == "restored":
+                controller = npt_runtime.restore_controller(
+                    sim.context, npt_block.get("controllers")[r]
+                )
+            elif npt_resume_mode == "fresh_init":
+                controller = npt_runtime.initialize_controller(
+                    sim.context, seed=npt_seed_replica(args, r)
+                )
+        if controller is not None and drivers is not None and r < len(drivers):
+            drivers[r].controller = controller
+        return r
+
+    for r, sim in enumerate(sims):
+        if pool is not None:
+            pool.submit(r, _load_replica, r).result()
+        else:
+            _load_replica(r)
     # Do not rely only on the opaque OpenMM binary checkpoint for gamd-openmm
     # CustomIntegrator globals.  New manifests store them explicitly; old
     # manifests may recover them from exact-step gamd_globals_json if available.
@@ -4623,7 +4840,9 @@ def load_production_checkpoint(out_dir: Path, sims: list, centers_nm, ks_kj_nm2,
     assignments = [int(x) for x in manifest.get("assignments", list(range(len(sims))))]
     if len(assignments) != len(sims):
         raise RuntimeError("Checkpoint assignment count does not match replica count")
-    for r, sim in enumerate(sims):
+
+    def _apply_assignment(r: int):
+        sim = sims[r]
         set_window(sim.context, centers_nm, ks_kj_nm2, int(assignments[r]), secondary_centers, secondary_ks_kj)
         # The GaMD-integrator-globals restore above is best-effort (see the
         # comments above): when it is incomplete, k0_Total/k0_Dihedral are still
@@ -4633,6 +4852,13 @@ def load_production_checkpoint(out_dir: Path, sims: list, centers_nm, ks_kj_nm2,
         # leave a replica's boost strength mismatched with its window. No-ops
         # when the ladder is inactive (k0max_by_channel is None).
         set_replica_lambda_for_window(sim.integrator, assignments[r], state_lambdas, k0max_by_channel)
+        return r
+
+    for r, sim in enumerate(sims):
+        if pool is not None:
+            pool.submit(r, _apply_assignment, r).result()
+        else:
+            _apply_assignment(r)
     try:
         if manifest.get("rng_state") is not None:
             rng.bit_generator.state = manifest["rng_state"]
@@ -4694,23 +4920,61 @@ def restore_exchange_stats_from_csv_if_needed(out_dir: Path, args, exchange_stat
     return {"restored": True, "rows": int(rows_read), "source": str(path)}
 
 def run_production_probe(args, out_dir: Path, sims: list, assignments: list[int], centers_nm, ks_kj_nm2,
-                         primary_cv_def: dict, cv_atom1: int, cv_atom2: int, unit, reference_gamd_globals: dict[str, float]) -> dict:
+                         primary_cv_def: dict, cv_atom1: int, cv_atom2: int, unit, reference_gamd_globals: dict[str, float],
+                         *, drivers: Optional[list] = None, pool=None,
+                         npt_runtime: Optional[NptRunContext] = None) -> dict:
     """Run and roll back a tiny production probe to catch NaNs before the long run.
 
     Context checkpoints are restored afterwards, so the probe does not consume
     production time and does not affect the first production sample.
+
+    NPT correction: the probe advances the SAME driver machinery as production
+    (volume moves included, on each replica's own worker thread when ``pool``
+    is given -- closing the probe affinity hole), with reports suppressed
+    because the probe states are transient and get rolled back.  Any volume
+    controllers also roll back to their pre-probe state via
+    ``state_dict()``/``restore()`` so the probe consumes neither schedule nor
+    random stream.
+
+    The probe's potential energy is read over the PHYSICAL force groups
+    (``physical_energy_groups_for_args``): a raw Context potential under a
+    Pep-GaMD partition includes the auxiliary water-only force and must never
+    be presented as physical energy.
     """
     nsteps = int(getattr(args, "production_probe_steps", 0) or 0)
     report = {"enabled": nsteps > 0, "steps": nsteps, "replicas": []}
     if nsteps <= 0:
         write_json(Path(out_dir) / "production_probe_report.json", report)
         return report
-    saved = [sim.context.createCheckpoint() for sim in sims]
+
+    def _submit(r: int, fn, *a, **kw):
+        return pool.submit(r, fn, *a, **kw) if pool is not None else None
+
+    def _run(r: int, fn, *a, **kw):
+        fut = _submit(r, fn, *a, **kw)
+        return fut.result() if fut is not None else fn(*a, **kw)
+
+    def _capture_controller_state(driver):
+        return driver.controller.state_dict() if driver.controller is not None else None
+
+    saved = [_run(r, sim.context.createCheckpoint) for r, sim in enumerate(sims)]
+    saved_controllers = [
+        _run(r, _capture_controller_state, driver)
+        for r, driver in enumerate(drivers or [])
+    ]
     failures = []
     try:
-        for r, sim in enumerate(sims):
-            sim.step(nsteps)
-            state = sim.context.getState(getPositions=True, getEnergy=True, enforcePeriodicBox=True)
+        def _probe_one(item):
+            r, sim = item
+            driver = drivers[r] if drivers is not None and r < len(drivers) else None
+            if driver is not None:
+                # advance() with reports=False: transient probe states must not
+                # emit trajectory frames (the context is rolled back below).
+                driver.advance(nsteps, reports=False)
+            else:
+                sim.step(nsteps)
+            state = sim.context.getState(getPositions=True, getEnergy=True, enforcePeriodicBox=True,
+                                         groups=physical_energy_groups_for_args(args))
             pos_nm = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
             cv_value = primary_cv_value_from_positions_nm(pos_nm, primary_cv_def, args)
             pe_kj = float(state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole))
@@ -4723,6 +4987,7 @@ def run_production_probe(args, out_dir: Path, sims: list, assignments: list[int]
                 "primary_cv": primary_cv_mode(args),
                 "primary_cv_units": primary_cv_units(args),
                 "potential_kj_mol": float(pe_kj),
+                "potential_source": "physical_force_groups",
                 "gamd_boost_total_kj_mol": float(boost_kj) if boost_kj is not None and math.isfinite(float(boost_kj)) else None,
                 "gamd_boost_source": str(boost_source),
                 "gamd_boost_components_kj_mol": boost_components,
@@ -4731,6 +4996,14 @@ def run_production_probe(args, out_dir: Path, sims: list, assignments: list[int]
                 "finite_boost_or_unavailable": bool(boost_kj is None or math.isfinite(float(boost_kj))),
             }
             row["ok"] = bool(row["finite_cv"] and row["finite_potential"] and row["finite_boost_or_unavailable"])
+            return row
+
+        items = list(enumerate(sims))
+        if pool is not None:
+            rows = [pool.submit(r, _probe_one, item).result() for r, item in enumerate(items)]
+        else:
+            rows = [_probe_one(item) for item in items]
+        for row in rows:
             if not row["ok"]:
                 failures.append(row)
             report["replicas"].append(row)
@@ -4738,10 +5011,18 @@ def run_production_probe(args, out_dir: Path, sims: list, assignments: list[int]
         failures.append({"exception": str(exc)})
         report["exception"] = str(exc)
     finally:
-        for sim, checkpoint in zip(sims, saved):
-            sim.context.loadCheckpoint(checkpoint)
         for r, sim in enumerate(sims):
-            set_window(sim.context, centers_nm, ks_kj_nm2, int(assignments[r]))
+            _run(r, sim.context.loadCheckpoint, saved[r])
+        for r, sim in enumerate(sims):
+            _run(r, set_window, sim.context, centers_nm, ks_kj_nm2, int(assignments[r]))
+        # Roll the volume controllers back to their pre-probe state so the
+        # probe consumed neither schedule nor random stream.
+        if drivers is not None and npt_runtime is not None and npt_runtime.needs_controller:
+            for r, driver in enumerate(drivers):
+                if r < len(saved_controllers) and saved_controllers[r] is not None:
+                    driver.controller = _run(
+                        r, npt_runtime.restore_controller, sims[r].context, saved_controllers[r]
+                    )
     report["ok"] = len(failures) == 0
     report["failures"] = failures
     write_json(Path(out_dir) / "production_probe_report.json", report)
@@ -4788,6 +5069,7 @@ def run_multiwindow_gamd_recon(
     recon_steps: Optional[int] = None,
     prep_steps: Optional[int] = None,
     phase_label: str = "gamd_multiwindow_recon",
+    npt_runtime: Optional[NptRunContext] = None,
 ) -> dict[str, "PooledEnvelope"]:
     """Recon every initial/pilot window's boost-group potential energy under its
     own umbrella bias, then pool per boost-group across all windows.
@@ -4864,13 +5146,28 @@ def run_multiwindow_gamd_recon(
         integrators.append(step_integrator)
         targets_per_window.append(targets)
 
+    # NPT correction: each calibration window gets its OWN volume controller
+    # with an INDEPENDENT random stream (spec section 6: never clone a
+    # calibration RNG stream into every replica -- and the production
+    # replicas' streams are separate from these again).  Construction stays
+    # on this thread exactly like the Contexts above (existing recon
+    # discipline); stepping fans out per window below.
+    drivers: list = []
+    for i in range(nwin):
+        controller_i = None
+        if npt_runtime is not None and npt_runtime.needs_controller:
+            controller_i = npt_runtime.initialize_controller(
+                sims[i].context, seed=npt_seed_recon_window(args, i)
+            )
+        drivers.append(ReplicaStepDriver(sims[i], controller=controller_i, label=f"recon_window_{i}"))
+
     # Parallel prep + recon across windows, mirroring the production step_all()
     # fan-out: OpenMM releases the GIL during context.step()/getState(), so one
     # thread per window genuinely runs concurrently across GPUs/devices.
     recon_pool = ThreadPoolExecutor(max_workers=nwin)
     try:
         if prep_steps > 0:
-            list(recon_pool.map(lambda sim_i: sim_i.step(int(prep_steps)), sims))
+            list(recon_pool.map(lambda driver_i: driver_i.advance(int(prep_steps)), drivers))
 
         accumulators_by_window = [
             {name: WelfordAccumulator() for name, _gid in targets_per_window[i]}
@@ -4880,8 +5177,9 @@ def run_multiwindow_gamd_recon(
         _recon_total_groups = total_energy_groups_for_args(args)
 
         def _recon_chunk(item):
-            i, sim_i = item
-            sim_i.step(int(chunk))
+            i, driver_i = item
+            driver_i.advance(int(chunk))
+            sim_i = driver_i.sim
             for name, gid in targets_per_window[i]:
                 pe_kj = boost_target_energy_kj(sim_i.context, gid, unit, total_groups=_recon_total_groups)
                 accumulators_by_window[i][name].update(pe_kj)
@@ -4890,7 +5188,7 @@ def run_multiwindow_gamd_recon(
         done = 0
         while done < recon_steps:
             chunk = min(report_interval, recon_steps - done)
-            list(recon_pool.map(_recon_chunk, enumerate(sims)))
+            list(recon_pool.map(_recon_chunk, enumerate(drivers)))
             done += int(chunk)
             if progress is not None:
                 progress.progress(
@@ -4917,6 +5215,7 @@ def apply_joint_envelope_gamd_calibration(
     window_start_positions, window_start_velocities, equil_state,
     shared_gamd_globals_all, shared_gamd_globals_interesting, calib_steps,
     progress: Optional[GuiProgressSink] = None,
+    npt_runtime: Optional[NptRunContext] = None,
 ) -> tuple[dict[str, float], dict[str, float]]:
     """Recon every initial window, pool per boost-group, and overwrite the
     physics globals in the shared-setup globals dicts before export.
@@ -4953,6 +5252,7 @@ def apply_joint_envelope_gamd_calibration(
         window_start_positions, window_start_velocities, equil_state,
         integrator_kind="cmd", recon_steps=cmd_seed_steps,
         phase_label="gamd_recon_cmd_seed", progress=progress,
+        npt_runtime=npt_runtime,
     )
     for name in group_names:
         if name not in seed_envelopes:
@@ -4972,6 +5272,7 @@ def apply_joint_envelope_gamd_calibration(
             window_start_positions, window_start_velocities, equil_state,
             integrator_kind="gamd", seed_globals=seed_g, recon_steps=boosted_steps,
             phase_label="gamd_recon_boosted", progress=progress,
+            npt_runtime=npt_runtime,
         )
 
     if boosted_iters > 0:
@@ -5061,7 +5362,15 @@ def apply_joint_envelope_gamd_calibration(
         _check_sim.context.setPositions(equil_state.getPositions())
         _check_sim.context.setVelocitiesToTemperature(args.temperature_k * unit.kelvin, args.seed + 909)
         set_window(_check_sim.context, centers_nm, ks_kj_nm2, 0, secondary_cv_centers, secondary_cv_ks_kj)
-        _check_sim.step(50)
+        _check_controller = None
+        if npt_runtime is not None and npt_runtime.needs_controller:
+            _check_controller = npt_runtime.initialize_controller(
+                _check_sim.context, seed=npt_seed_check_run(args)
+            )
+        _check_driver = ReplicaStepDriver(
+            _check_sim, controller=_check_controller, label="gamd_calibration_check"
+        )
+        _check_driver.advance(50)
         _check_pe = physical_potential_energy_kj(_check_sim.context, _check_system, unit)
         if not math.isfinite(_check_pe):
             raise RuntimeError(
@@ -5086,6 +5395,7 @@ def run_shared_gamd_setup_article_a(
     platform,
     props,
     progress: Optional[GuiProgressSink] = None,
+    npt_runtime: Optional[NptRunContext] = None,
 ) -> tuple[dict[str, float], dict[str, float], int, bytes | None]:
     """Run one article-style shared GaMD calibration/equilibration.
 
@@ -5130,6 +5440,15 @@ def run_shared_gamd_setup_article_a(
     except Exception:
         pass
 
+    shared_controller = None
+    if npt_runtime is not None and npt_runtime.needs_controller:
+        shared_controller = npt_runtime.initialize_controller(
+            shared_sim.context, seed=npt_seed_shared_setup(args)
+        )
+    shared_driver = ReplicaStepDriver(
+        shared_sim, controller=shared_controller, label="shared_gamd_setup"
+    )
+
     chunk_default = int(getattr(args, "distance_output_interval", 0) or 0)
     if chunk_default <= 0:
         chunk_default = int(getattr(args, "report_interval", 1000) or 1000)
@@ -5152,7 +5471,7 @@ def run_shared_gamd_setup_article_a(
     done = 0
     while done < calib_steps:
         chunk = min(chunk_default, calib_steps - done)
-        shared_sim.step(int(chunk))
+        shared_driver.advance(int(chunk))
         done += int(chunk)
         if progress is not None:
             progress.progress(
@@ -5200,7 +5519,7 @@ def run_shared_gamd_setup_article_a(
         "temperature_K": float(args.temperature_k),
         "pressure_bar": float(getattr(args, "pressure_bar", 1.0)),
         "production_ensemble": str(getattr(args, "production_ensemble", "npt")),
-        "production_barostat": "OpenMM MonteCarloBarostat" if str(getattr(args, "production_ensemble", "npt")) == "npt" else "none",
+        "production_barostat": _production_barostat_description(args),
         "production_barostat_frequency": int(getattr(args, "production_barostat_frequency", 0) or getattr(args, "barostat_frequency", 100)),
         "timestep_fs": float(args.timestep_fs),
         "gamd_boost_type": str(args.gamd_boost_type),
@@ -5705,8 +6024,19 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     production_ensemble = str(getattr(args, "production_ensemble", "npt") or "npt").lower()
     if production_ensemble not in {"npt", "nvt"}:
         raise ValueError(f"Unsupported --production-ensemble {production_ensemble!r}; use npt or nvt")
-    production_include_barostat = production_ensemble == "npt"
-    production_barostat_frequency = int(getattr(args, "production_barostat_frequency", 0) or getattr(args, "barostat_frequency", 100))
+
+    # NPT correction (spec section 5): barostat ownership is decided BEFORE the
+    # base System is built, so a biased_mc run never creates a Context over a
+    # System that still carries the native MonteCarloBarostat.  The ownership
+    # object is the single source of truth for every downstream construction
+    # site (recon windows, shared GaMD setup, production replicas, probe).
+    barostat_ownership = resolve_barostat_ownership(
+        args, ensemble=production_ensemble,
+        run_mode=str(getattr(args, "run_mode", "cmd") or "cmd"),
+        boost_type=str(getattr(args, "gamd_boost_type", "") or ""),
+    )
+    production_include_barostat = barostat_ownership.include_native_barostat
+    production_barostat_frequency = barostat_ownership.barostat_frequency
 
     # Base production system for GaREUS. Default production is now NPT with
     # OpenMM's MonteCarloBarostat; --production-ensemble nvt preserves the old
@@ -5727,6 +6057,18 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             f"    Secondary CV enabled: {secondary_cv_metadata.get('label', 'secondary structure')} "
             f"with {secondary_cv_metadata.get('n_phi_torsions', 0)} phi and {secondary_cv_metadata.get('n_psi_torsions', 0)} psi torsions"
         )
+
+    # NPT correction: the physical preflight runs on the fully-assembled
+    # application-controlled System (umbrella + secondary CV forces included),
+    # before the first Context is created from it.  Also yields the ownership
+    # report recorded into the run manifest below.
+    barostat_preflight = preflight_barostat_ownership(base_system, barostat_ownership)
+
+    # NPT correction (spec section 5): the effective-potential adapter is the
+    # one cross-package seam to package 2; it only needs to exist when the
+    # biased-MC controller will evaluate volume-move acceptance energies.
+    npt_adapter = _resolve_npt_adapter(args) if barostat_ownership.backend == "biased_mc" else None
+    npt_runtime = NptRunContext(ownership=barostat_ownership, adapter=npt_adapter)
 
     # GaMD production-envelope recalibration: adaptive-production's epoch 0 already
     # runs real GaMD-boosted sampling to bootstrap tICA, so it is also the cheapest
@@ -5873,7 +6215,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     gamd_start_state = equil_state
                     print("    GaMD shared setup: compact window unavailable, falling back to NPT-equilibrated structure")
                 shared_gamd_globals_all, shared_gamd_globals_interesting, calib_steps, shared_gamd_context_checkpoint = run_shared_gamd_setup_article_a(
-                    args, out_dir, openmm, app, unit, topology, base_system, gamd_start_state, setup_platform, setup_props, progress=progress
+                    args, out_dir, openmm, app, unit, topology, base_system, gamd_start_state, setup_platform, setup_props, progress=progress,
+                    npt_runtime=npt_runtime,
                 )
                 shared_gamd_globals_all, shared_gamd_globals_interesting = apply_joint_envelope_gamd_calibration(
                     args, openmm, app, unit, topology, base_system, setup_platform, setup_props,
@@ -5881,6 +6224,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     window_start_positions, window_start_velocities, equil_state,
                     shared_gamd_globals_all, shared_gamd_globals_interesting, calib_steps,
                     progress=progress,
+                    npt_runtime=npt_runtime,
                 )
                 exported = export_shared_gamd_setup_if_requested(args, out_dir)
                 if exported:
@@ -5929,6 +6273,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     _sim_pool = _ReplicaAffinityExecutor(nrep)
 
     sims = []
+    drivers: list = []
     assignments = list(range(nrep))
     traj_dir = out_dir / "replica_trajectories"
     # Adaptive-feedback pilots are diagnostic and short-lived.  Unless the user
@@ -6045,9 +6390,19 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 else:
                     sim_i.context.setVelocities(start_vel)
                 set_window(sim_i.context, centers_nm, ks_kj_nm2, i, secondary_cv_centers, secondary_cv_ks_kj)
-            return sim_i, loaded_checkpoint, copied, skipped
+            controller_i = None
+            if npt_runtime is not None and npt_runtime.needs_controller and not fast_resume:
+                # NPT correction: the biased-MC volume controller is initialized
+                # on this replica's own worker, with an INDEPENDENT random
+                # stream (spec section 6: never clone one controller seed
+                # into every replica).  fast_resume restores it from the
+                # checkpoint instead (load_production_checkpoint).
+                controller_i = npt_runtime.initialize_controller(
+                    sim_i.context, seed=npt_seed_replica(args, i)
+                )
+            return sim_i, loaded_checkpoint, copied, skipped, controller_i
 
-        sim_i, loaded_shared_gamd_checkpoint, copied_globals, skipped_globals = _sim_pool.submit(i, _build_context_i).result()
+        sim_i, loaded_shared_gamd_checkpoint, copied_globals, skipped_globals, controller_i = _sim_pool.submit(i, _build_context_i).result()
         replica_gamd_copy_report.append({
             "replica": int(i),
             "copied_count": int(len(copied_globals)),
@@ -6057,11 +6412,27 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             "loaded_from_context_checkpoint": bool(fast_resume),
             "loaded_from_shared_gamd_setup_checkpoint": bool(loaded_shared_gamd_checkpoint),
         })
+        # NPT correction: every replica steps through a ReplicaStepDriver.  The
+        # driver owns the ordering integrate -> finish due volume move ->
+        # report; the reporters therefore live on the driver, never on
+        # sim.reporters (Simulation.step would otherwise fire them on the
+        # pre-move state and again inside the driver, duplicating frames).
+        # on_volume_move clears the CV cache after EVERY attempted move
+        # (accepted or rejected: even a rejection rescales coordinates and
+        # invalidates cached CustomCVForce values) -- late-binding closure;
+        # observable_cache is assigned before the first advance() runs.
+        def _on_volume_move(_result, _i=i):
+            observable_cache.clear()
+
+        driver_i = npt_runtime.make_driver(
+            sim_i, controller=controller_i, on_volume_move=_on_volume_move, label=f"replica_{i:03d}"
+        )
         if effective_traj_interval > 0 and not bool(getattr(args, "resume", False)):
             reporter = make_trajectory_reporter(app, traj_dir / f"replica_{i:03d}", effective_traj_interval, args, atom_subset=traj_atom_subset)
             if reporter is not None:
-                sim_i.reporters.append(reporter)
+                driver_i.register_reporter(reporter)
         sims.append(sim_i)
+        drivers.append(driver_i)
         if progress is not None:
             progress.progress("replica_construction", i + 1, nrep, message=f"built replica {i + 1}/{nrep}")
 
@@ -6206,9 +6577,13 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         "hmr": bool(getattr(args, "hmr", False)),
         "hydrogen_mass_amu": float(getattr(args, "hydrogen_mass_amu", 0.0) or 0.0),
         "production_ensemble": production_ensemble,
-        "production_barostat": "OpenMM MonteCarloBarostat" if production_include_barostat else "none",
+        "production_barostat": _production_barostat_description(args),
         "production_pressure_bar": float(getattr(args, "pressure_bar", 1.0)),
         "production_barostat_frequency": int(production_barostat_frequency) if production_include_barostat else 0,
+        "npt_backend": barostat_ownership.backend,
+        "npt_barostat_requested": barostat_ownership.requested,
+        "barostat_volume_step_fraction": float(barostat_ownership.volume_step_fraction),
+        "barostat_preflight": barostat_preflight,
         "gamd_setup_mode": "article_a_single_equilibrated_shared_gamd" if use_gamd else f"disabled_{run_mode}",
         "shared_gamd_calibration_steps": int(calib_steps),
         "shared_gamd_globals_json": str(out_dir / "shared_gamd_setup_globals.json"),
@@ -6241,8 +6616,9 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         "temperature_K": float(args.temperature_k),
         "pressure_bar": float(getattr(args, "pressure_bar", 1.0)),
         "production_ensemble": production_ensemble,
-        "production_barostat": "OpenMM MonteCarloBarostat" if production_include_barostat else "none",
+        "production_barostat": _production_barostat_description(args),
         "production_barostat_frequency": int(production_barostat_frequency) if production_include_barostat else 0,
+        "npt_backend": barostat_ownership.backend,
         "run_mode": run_mode,
         "gamd_enabled": bool(use_gamd),
         "hmr": bool(getattr(args, "hmr", False)),
@@ -6255,6 +6631,11 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         "primary_sample_column": "cv_A",
         "primary_center_column": "center_A",
         "primary_k_column": "k_kcal_mol_A2",
+        "energy_column_semantics": {
+            "potential_kj_mol": "physical force groups only (excludes the Pep-GaMD auxiliary water-only force and the boost); read via getState(groups=physical_energy_groups_for_args)",
+            "v_pep_kj_mol": "Pep-GaMD peptide boost-target energy (Total channel), physical groups minus the water-only auxiliary group",
+            "v_dih_kj_mol": "Pep-GaMD dihedral-channel boost-target energy",
+        },
         "legacy_primary_cv_column_names": True,
         "cv_label": cv_label,
         "cv_atom1_index": int(cv_atom1),
@@ -6793,19 +7174,19 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             safe_chunk = int(getattr(args, "production_safe_chunk_steps", 0) or 0)
 
             def _step_item(item):
-                _idx, _sim, _n = item
-                _sim.step(int(_n))
+                _idx, _driver, _n = item
+                _driver.advance(int(_n))
                 return int(_idx)
 
             completed = 0
             try:
                 if safe_chunk <= 0 or safe_chunk >= nsteps:
-                    list(_sim_pool.map(_step_item, [(i, s, nsteps) for i, s in enumerate(sims)]))
+                    list(_sim_pool.map(_step_item, [(i, d, nsteps) for i, d in enumerate(drivers)]))
                 else:
                     remaining = nsteps
                     while remaining > 0:
                         sub = min(int(safe_chunk), int(remaining))
-                        list(_sim_pool.map(_step_item, [(i, s, sub) for i, s in enumerate(sims)]))
+                        list(_sim_pool.map(_step_item, [(i, d, sub) for i, d in enumerate(drivers)]))
                         completed += sub
                         remaining -= sub
             except Exception as exc:
@@ -6870,10 +7251,17 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             i, j = outcome.replica_i, outcome.replica_j
             _record_exchange_stats(wi, wj, outcome.accepted)
             if outcome.accepted:
-                set_window(sims[i].context, centers_nm, ks_kj_nm2, assignments[i], secondary_cv_centers, secondary_cv_ks_kj)
-                set_window(sims[j].context, centers_nm, ks_kj_nm2, assignments[j], secondary_cv_centers, secondary_cv_ks_kj)
-                set_replica_lambda_for_window(sims[i].integrator, assignments[i], state_lambdas, k0max_by_channel)
-                set_replica_lambda_for_window(sims[j].integrator, assignments[j], state_lambdas, k0max_by_channel)
+                # NPT correction: the umbrella-parameter writes run on each
+                # replica's own worker (same affinity rule as stepping), and an
+                # accepted swap re-labels replicas so the cached CV/bias
+                # observables are stale until the next sample().
+                def _apply_swap_to_replica(replica_index: int):
+                    set_window(sims[replica_index].context, centers_nm, ks_kj_nm2, assignments[replica_index], secondary_cv_centers, secondary_cv_ks_kj)
+                    set_replica_lambda_for_window(sims[replica_index].integrator, assignments[replica_index], state_lambdas, k0max_by_channel)
+
+                _sim_pool.submit(i, _apply_swap_to_replica, i).result()
+                _sim_pool.submit(j, _apply_swap_to_replica, j).result()
+                observable_cache.clear()
             parquet_exchange_writer.write_exchange(
                 step=int(absolute_step),
                 replica_i=int(i),
@@ -7142,6 +7530,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 platform_name=str(platform.getName()),
                 strict_gamd_restore=bool(getattr(args, "strict_gamd_restore", False)),
                 state_lambdas=state_lambdas, k0max_by_channel=k0max_by_channel,
+                drivers=drivers, pool=_sim_pool, npt_runtime=npt_runtime, args=args,
             )
             if manifest is not None:
                 assignments[:] = [int(x) for x in manifest.get("assignments", assignments)]
@@ -7176,10 +7565,10 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     print(f"    TUI/dashboard history not restored: {resume_tui_report.get('reason', 'unknown reason')}")
                 print(f"    Resumed GaREUS production from checkpoint at production step {prod_done}/{prod_total}; attempt {attempt}")
                 if effective_traj_interval > 0:
-                    for i, sim in enumerate(sims):
+                    for i, driver in enumerate(drivers):
                         reporter = make_trajectory_reporter(app, traj_dir / f"replica_{i:03d}_resume_from_{prod_done:09d}", effective_traj_interval, args, atom_subset=traj_atom_subset)
                         if reporter is not None:
-                            sim.reporters.append(reporter)
+                            driver.register_reporter(reporter)
                 # Seal the previous crashed segment: rows beyond the checkpoint
                 # step have wrong window_id labels (exchange state was rolled back)
                 # and must be excluded from MBAR analysis.
@@ -7198,17 +7587,18 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 if _parent_was_running and _parent_seg_id is not None:
                     _seg_registry.seal_segment(_parent_seg_id, absolute_end_step=-1, status="abandoned")
                 if effective_traj_interval > 0:
-                    for i, sim in enumerate(sims):
+                    for i, driver in enumerate(drivers):
                         reporter = make_trajectory_reporter(app, traj_dir / f"replica_{i:03d}_resume_fresh_{int(time.time())}", effective_traj_interval, args, atom_subset=traj_atom_subset)
                         if reporter is not None:
-                            sim.reporters.append(reporter)
+                            driver.register_reporter(reporter)
         elif _parent_was_running and _parent_seg_id is not None:
             # Fresh start (no --resume) while a previous segment is still marked
             # running: the prior run was abandoned without a checkpoint.
             _seg_registry.seal_segment(_parent_seg_id, absolute_end_step=-1, status="abandoned")
 
         if prod_done <= 0:
-            run_production_probe(args, out_dir, sims, assignments, centers_nm, ks_kj_nm2, primary_cv_def, cv_atom1, cv_atom2, unit, shared_gamd_globals_all)
+            run_production_probe(args, out_dir, sims, assignments, centers_nm, ks_kj_nm2, primary_cv_def, cv_atom1, cv_atom2, unit, shared_gamd_globals_all,
+                                 drivers=drivers, pool=_sim_pool, npt_runtime=npt_runtime)
 
         checkpoint_interval = int(getattr(args, "checkpoint_interval", 0) or 0)
         next_checkpoint = prod_done + checkpoint_interval if checkpoint_interval > 0 else prod_total + 1
@@ -7231,6 +7621,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     primary_cv_metadata=_json_ready(primary_cv_def),
                     openmm_version=str(getattr(getattr(openmm, "version", None), "version", None)),
                     platform_name=str(platform.getName()),
+                    drivers=drivers, pool=_sim_pool, npt_runtime=npt_runtime,
                 )
                 _scratch_main = getattr(args, "_main_dir", None)
                 if _scratch_main:
@@ -7280,14 +7671,25 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                                 _dists[_r] = 1e9
                                 _src = int(np.argmin(_dists))
                                 if float(_pv[_src]) > _stuck_threshold:
-                                    _src_state = sims[_src].context.getState(
+                                    # NPT correction: the read and the two writes
+                                    # each run on that replica's own worker (the
+                                    # same affinity rule as stepping), and the
+                                    # rescue invalidates the CV cache like any
+                                    # other out-of-band coordinate change.
+                                    _src_state = _sim_pool.submit(_src, lambda: sims[_src].context.getState(
                                         getPositions=True, enforcePeriodicBox=True
-                                    )
-                                    sims[_r].context.setPositions(_src_state.getPositions())
-                                    sims[_r].context.setVelocitiesToTemperature(
-                                        float(args.temperature_k) * unit.kelvin,
-                                        int(args.seed) + _r + int(absolute_step % 99991),
-                                    )
+                                    )).result()
+                                    _src_pos = _src_state.getPositions()
+
+                                    def _rescue_positions(_pos=_src_pos, _r=_r):
+                                        sims[_r].context.setPositions(_pos)
+                                        sims[_r].context.setVelocitiesToTemperature(
+                                            float(args.temperature_k) * unit.kelvin,
+                                            int(args.seed) + _r + int(absolute_step % 99991),
+                                        )
+
+                                    _sim_pool.submit(_r, _rescue_positions).result()
+                                    observable_cache.clear()
                                     _stuck_counter[_r] = 0
                                     _stuck_rescue_total += 1
                                     print(
@@ -7312,6 +7714,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     primary_cv_metadata=_json_ready(primary_cv_def),
                     openmm_version=str(getattr(getattr(openmm, "version", None), "version", None)),
                     platform_name=str(platform.getName()),
+                    drivers=drivers, pool=_sim_pool, npt_runtime=npt_runtime,
                 )
                 _scratch_main = getattr(args, "_main_dir", None)
                 if _scratch_main:

@@ -619,12 +619,33 @@ def resolve_barostat_ownership(args, *, ensemble: str, run_mode: Optional[str] =
         # The frozen contract owns the auto/native/biased_mc dispatch, including
         # the loud failures for explicit-native-with-boost and unsupported
         # boosted modes (never a silent ensemble downgrade).
-        backend = npt.resolve_npt_backend(
-            ensemble=ensemble,
-            requested=requested,
-            run_mode=mode,
-            boost_type=boost,
-        )
+        try:
+            backend = npt.resolve_npt_backend(
+                ensemble=ensemble,
+                requested=requested,
+                run_mode=mode,
+                boost_type=boost,
+            )
+        except NotImplementedError:
+            # Interim state while the NPT correction's package 1 (the biased-MC
+            # controller itself) has not landed: the contract stub raises.  Per
+            # the spec this configuration maps to the application-controlled
+            # biased-MC backend, which does not exist yet -- and silently
+            # keeping the native barostat would preserve exactly the known-
+            # wrong acceptance energy the correction exists to remove.  Fail
+            # loudly with an actionable message instead.
+            raise RuntimeError(
+                f"The requested run (ensemble={ensemble!r}, run_mode={mode!r}, "
+                f"boost_type={boost!r}, npt_barostat_backend={requested!r}) resolves to "
+                "the application-controlled biased-MC NPT backend, whose controller "
+                "is not implemented in this build (gareus/npt.py raises "
+                "NotImplementedError: NPT correction package 1). Running it with the "
+                "native MonteCarloBarostat would sample the wrong volume distribution "
+                "(acceptance energy omits the boost and includes the Pep-GaMD auxiliary "
+                "force), so this is refused rather than silently downgraded. Use "
+                "--production-ensemble nvt, a conventional (cmd/hmr-cmd) run mode, or "
+                "land NPT correction package 1 before running boosted NPT production."
+            ) from None
         if backend not in {"none", "native", "biased_mc"}:
             raise RuntimeError(
                 f"gareus.npt.resolve_npt_backend returned an unknown backend {backend!r}"
