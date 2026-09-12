@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+title: ATLaS-MD
+message: >-
+  If you use ATLaS-MD in research, please cite the software repository and the
+  relevant methodological publications associated with your workflow.
+type: software
+authors:
+  - family-names: Šulc
+    given-names: Josef
+repository-code: https://github.com/sulcjo/ATLaS-MD
+url: https://sulcjo.github.io/2026_peptide_sampler/
+version: 0.7
+date-released: 2026-09-12
+license: LicenseRef-Proprietary-Research-Internal
+keywords:
+  - molecular dynamics
+  - OpenMM
+  - replica exchange
+  - umbrella sampling
+  - Gaussian accelerated molecular dynamics
+  - MBAR
+  - peptide sampling
+  - computational chemistry
