@@ -15,20 +15,154 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .parquet_manifest import (
+    ParquetManifestError,
+    append_file_to_manifest,
+    file_record,
+    load_manifest,
+    replace_files_in_manifest,
+)
 
-class ParquetSampleWriter:
-    """Buffers per-step sample data and flushes to Parquet chunks.
 
-    Each flush produces one atomic chunk_XXXXXX.parquet via tmp→rename,
-    so partial flushes on crash leave no corrupt files.
-    """
+def _fsync_path(path: Path) -> None:
+    """Best-effort fsync for a newly written Parquet file."""
+    try:
+        with Path(path).open("rb") as fh:
+            os.fsync(fh.fileno())
+    except OSError:
+        pass
+
+
+class _ManifestParquetWriter:
+    """Shared crash-safe file publication for sample/exchange writers."""
+
+    kind: str
+    sort_columns: tuple[tuple[str, str], ...]
+
+    def _init_manifest_state(self) -> None:
+        manifest = load_manifest(self._out_dir, expected_kind=self.kind, verify_hashes=False)
+        if manifest is None:
+            # A writer must never append blindly to a legacy segment: that was
+            # the route by which a consolidated data.parquet later acquired a
+            # second overlapping chunk set. Legacy directories stay readable,
+            # but require an explicit repair/migration before further writes.
+            legacy = sorted(self._out_dir.glob("*.parquet"))
+            if legacy:
+                raise ParquetManifestError(
+                    f"refusing to append to legacy {self.kind} segment {self._out_dir}: "
+                    f"found {len(legacy)} Parquet file(s) but no parquet_manifest.json"
+                )
+            self._chunk_idx = 0
+            return
+        self._chunk_idx = int(manifest["next_chunk_index"]) - 1
+
+    def _publish_table(self, tbl) -> Path:
+        import pyarrow.parquet as pq
+
+        self._chunk_idx += 1
+        chunk_path = self._out_dir / f"chunk_{self._chunk_idx:06d}.parquet"
+        if chunk_path.exists():
+            raise ParquetManifestError(
+                f"refusing to overwrite committed/unclassified Parquet file {chunk_path}"
+            )
+        for stale in self._out_dir.glob(f"{chunk_path.name}.tmp.*"):
+            stale.unlink(missing_ok=True)
+        tmp_path = chunk_path.with_name(f"{chunk_path.name}.tmp.{os.getpid()}")
+        pq.write_table(tbl, tmp_path, compression="zstd", compression_level=3)
+        _fsync_path(tmp_path)
+        os.replace(tmp_path, chunk_path)
+        _fsync_path(chunk_path)
+
+        steps = tbl.column("step") if "step" in tbl.column_names else None
+        first_step = int(steps[0].as_py()) if steps is not None and len(steps) else None
+        last_step = int(steps[-1].as_py()) if steps is not None and len(steps) else None
+        record = file_record(
+            chunk_path,
+            rows=int(tbl.num_rows),
+            first_step=first_step,
+            last_step=last_step,
+        )
+        # The manifest is published last. A kill between the Parquet rename
+        # and this replace leaves an orphan file, not a scientifically visible
+        # committed file for manifest-aware readers.
+        append_file_to_manifest(
+            self._out_dir,
+            kind=self.kind,
+            record=record,
+            next_chunk_index=self._chunk_idx + 1,
+        )
+        return chunk_path
+
+    def _consolidate(self) -> None:
+        """Transactionally compact the currently committed file set.
+
+        Old files are not removed until the new compact file has been written,
+        validated and made authoritative by an atomic manifest replacement.
+        A crash during best-effort cleanup therefore leaves harmless unreferenced
+        Parquet files rather than two logical copies of the same rows.
+        """
+        import pyarrow.dataset as ds
+        import pyarrow.parquet as pq
+
+        manifest = load_manifest(self._out_dir, expected_kind=self.kind, verify_hashes=True)
+        if manifest is None or len(manifest["files"]) <= 1:
+            return
+        old_paths = [self._out_dir / rec["path"] for rec in manifest["files"]]
+        table = ds.dataset([str(p) for p in old_paths], format="parquet").to_table()
+        if self.sort_columns:
+            table = table.sort_by(list(self.sort_columns))
+        if int(table.num_rows) != int(manifest["n_rows"]):
+            raise ParquetManifestError(
+                f"refusing to compact {self.kind} segment {self._out_dir}: "
+                f"read {table.num_rows} rows, manifest declares {manifest['n_rows']}"
+            )
+
+        compact_name = f"compact_{int(manifest['generation']) + 1:06d}.parquet"
+        compact_path = self._out_dir / compact_name
+        if compact_path.exists():
+            raise ParquetManifestError(f"compaction destination already exists: {compact_path}")
+        tmp = compact_path.with_name(f"{compact_path.name}.tmp.{os.getpid()}")
+        pq.write_table(table, tmp, compression="zstd", compression_level=3)
+        _fsync_path(tmp)
+        os.replace(tmp, compact_path)
+        _fsync_path(compact_path)
+
+        steps = table.column("step") if "step" in table.column_names else None
+        record = file_record(
+            compact_path,
+            rows=int(table.num_rows),
+            first_step=int(steps[0].as_py()) if steps is not None and len(steps) else None,
+            last_step=int(steps[-1].as_py()) if steps is not None and len(steps) else None,
+        )
+        replace_files_in_manifest(
+            self._out_dir,
+            kind=self.kind,
+            records=[record],
+            next_chunk_index=self._chunk_idx + 1,
+        )
+
+        # Cleanup is deliberately after the manifest switch. Failures here are
+        # safe: readers ignore any old file no longer referenced by the manifest.
+        for path in old_paths:
+            if path != compact_path:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+
+class ParquetSampleWriter(_ManifestParquetWriter):
+    """Buffers per-step sample data and publishes immutable Parquet chunks."""
+
+    kind = "samples"
+    sort_columns = (("step", "ascending"), ("replica", "ascending"))
 
     def __init__(self, out_dir: Path, flush_rows: int = 5000) -> None:
         self._out_dir = Path(out_dir)
         self._out_dir.mkdir(parents=True, exist_ok=True)
         self._flush_rows = max(1, flush_rows)
         self._buf: Dict[str, list] = defaultdict(list)
-        self._chunk_idx = 0
+        self._init_manifest_state()
 
     def write_sample(
         self,
@@ -65,7 +199,6 @@ class ParquetSampleWriter:
         if not self._buf["step"]:
             return
         import pyarrow as pa
-        import pyarrow.parquet as pq
 
         b = self._buf
         tbl = pa.table({
@@ -82,56 +215,27 @@ class ParquetSampleWriter:
             "v_dih_kj_mol":        pa.array(b["v_dih_kj_mol"],        type=pa.float32()),
             "gamd_lambda":         pa.array(b["gamd_lambda"],         type=pa.float32()),
         })
-
-        self._chunk_idx += 1
-        chunk_path = self._out_dir / f"chunk_{self._chunk_idx:06d}.parquet"
-        # Per-PID tmp names avoid a real collision between two concurrent
-        # writers, but orphan a tmp file forever if THIS process gets killed
-        # mid-write.  Sweep any stale tmp for this exact chunk index left by a
-        # prior killed attempt before writing our own - self-healing on the
-        # next successful flush rather than accumulating forever.
-        for stale in self._out_dir.glob(f"{chunk_path.name}.tmp.*"):
-            stale.unlink(missing_ok=True)
-        tmp_path = chunk_path.with_name(f"{chunk_path.name}.tmp.{os.getpid()}")
-        pq.write_table(tbl, tmp_path, compression="zstd", compression_level=3)
-        tmp_path.rename(chunk_path)
-
-        for lst in b.values():
-            lst.clear()
+        self._publish_table(tbl)
+        for values in b.values():
+            values.clear()
 
     def close(self) -> None:
         self.flush()
         self._consolidate()
 
-    def _consolidate(self) -> None:
-        """Merge all chunk_*.parquet into data.parquet then remove chunks."""
-        chunks = sorted(self._out_dir.glob("chunk_*.parquet"))
-        if len(chunks) <= 1:
-            if len(chunks) == 1:
-                chunks[0].rename(self._out_dir / "data.parquet")
-            return
-        import pyarrow.dataset as ds
-        import pyarrow.parquet as pq
-        tbl = ds.dataset(chunks, format="parquet").to_table()
-        tbl = tbl.sort_by([("step", "ascending"), ("replica", "ascending")])
-        for stale in self._out_dir.glob("data.parquet.tmp.*"):
-            stale.unlink(missing_ok=True)
-        tmp = self._out_dir / f"data.parquet.tmp.{os.getpid()}"
-        pq.write_table(tbl, tmp, compression="zstd", compression_level=3)
-        tmp.rename(self._out_dir / "data.parquet")
-        for c in chunks:
-            c.unlink(missing_ok=True)
 
+class ParquetExchangeWriter(_ManifestParquetWriter):
+    """Buffers exchange events and publishes immutable Parquet chunks."""
 
-class ParquetExchangeWriter:
-    """Buffers exchange events and flushes to Parquet chunks."""
+    kind = "exchanges"
+    sort_columns = (("step", "ascending"),)
 
     def __init__(self, out_dir: Path, flush_rows: int = 1000) -> None:
         self._out_dir = Path(out_dir)
         self._out_dir.mkdir(parents=True, exist_ok=True)
         self._flush_rows = max(1, flush_rows)
         self._buf: Dict[str, list] = defaultdict(list)
-        self._chunk_idx = 0
+        self._init_manifest_state()
 
     def write_exchange(
         self,
@@ -158,7 +262,6 @@ class ParquetExchangeWriter:
         if not self._buf["step"]:
             return
         import pyarrow as pa
-        import pyarrow.parquet as pq
 
         b = self._buf
         tbl = pa.table({
@@ -170,45 +273,13 @@ class ParquetExchangeWriter:
             "delta_e":   pa.array(b["delta_e"],   type=pa.float32()),
             "accepted":  pa.array(b["accepted"],  type=pa.bool_()),
         })
-
-        self._chunk_idx += 1
-        chunk_path = self._out_dir / f"chunk_{self._chunk_idx:06d}.parquet"
-        # Per-PID tmp names avoid a real collision between two concurrent
-        # writers, but orphan a tmp file forever if THIS process gets killed
-        # mid-write.  Sweep any stale tmp for this exact chunk index left by a
-        # prior killed attempt before writing our own - self-healing on the
-        # next successful flush rather than accumulating forever.
-        for stale in self._out_dir.glob(f"{chunk_path.name}.tmp.*"):
-            stale.unlink(missing_ok=True)
-        tmp_path = chunk_path.with_name(f"{chunk_path.name}.tmp.{os.getpid()}")
-        pq.write_table(tbl, tmp_path, compression="zstd", compression_level=3)
-        tmp_path.rename(chunk_path)
-
-        for lst in b.values():
-            lst.clear()
+        self._publish_table(tbl)
+        for values in b.values():
+            values.clear()
 
     def close(self) -> None:
         self.flush()
         self._consolidate()
-
-    def _consolidate(self) -> None:
-        """Merge all chunk_*.parquet into data.parquet then remove chunks."""
-        chunks = sorted(self._out_dir.glob("chunk_*.parquet"))
-        if len(chunks) <= 1:
-            if len(chunks) == 1:
-                chunks[0].rename(self._out_dir / "data.parquet")
-            return
-        import pyarrow.dataset as ds
-        import pyarrow.parquet as pq
-        tbl = ds.dataset(chunks, format="parquet").to_table()
-        tbl = tbl.sort_by([("step", "ascending")])
-        for stale in self._out_dir.glob("data.parquet.tmp.*"):
-            stale.unlink(missing_ok=True)
-        tmp = self._out_dir / f"data.parquet.tmp.{os.getpid()}"
-        pq.write_table(tbl, tmp, compression="zstd", compression_level=3)
-        tmp.rename(self._out_dir / "data.parquet")
-        for c in chunks:
-            c.unlink(missing_ok=True)
 
 
 class SegmentRegistry:
@@ -311,23 +382,6 @@ def finalize_segment(
     without exception *and* all parquet writers flushed and closed without
     error.  Any other outcome seals the segment as ``"interrupted"`` so the
     next resume knows to pick up from the last valid checkpoint.
-
-    Parameters
-    ----------
-    registry:
-        The :class:`SegmentRegistry` for the current run.
-    seg_id:
-        Segment ID to finalize.
-    completed_cleanly:
-        ``True`` iff the production loop ran to completion (``prod_done >=
-        prod_total``) without raising an exception.
-    writers_ok:
-        ``True`` iff all parquet writer flush/close calls succeeded.
-    end_step:
-        ``calib_steps + prod_done`` — the absolute step boundary recorded in
-        the registry entry.  For interrupted segments this is the *last known
-        step*; phantom frames beyond a checkpoint boundary are filtered by the
-        resume-time safety net.
     """
     if completed_cleanly and writers_ok:
         registry.close_segment(seg_id, end_step=end_step)
@@ -336,11 +390,7 @@ def finalize_segment(
 
 
 class WindowSnapshot:
-    """Writes a per-segment window definition snapshot.
-
-    Windows can change between adaptive feedback rounds, so each segment
-    records its own window set in windows/<segment_id>.json.
-    """
+    """Writes a per-segment window definition snapshot."""
 
     def __init__(self, run_dir: Path) -> None:
         self._win_dir = Path(run_dir) / "windows"
@@ -374,14 +424,7 @@ def parse_gamd_boost_components(
     boost_total: Optional[float],
     boost_components: Dict[str, float],
 ) -> tuple:
-    """Extract (total, dihedral, nonbonded) from a GaMD boost components dict.
-
-    Component key names vary by gamd-openmm version. Uses name heuristics:
-    - dihedral: key contains "dihedral" or "torsion"
-    - nonbonded: key contains "nonbond", "lj", "vdw", or "elec"
-    - two unnamed components: assign sorted-key order (first=dihedral, second=nonbonded)
-    - one or zero components: dihedral=None, nonbonded=None
-    """
+    """Extract (total, dihedral, nonbonded) from a GaMD boost components dict."""
     if not boost_components:
         return boost_total, None, None
 
