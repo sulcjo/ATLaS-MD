@@ -256,6 +256,35 @@ def publish_manifest(segment_dir: Path, manifest: dict[str, Any]) -> dict[str, A
     return normalized
 
 
+def _legacy_committed_files(segment_dir: Path) -> list[str]:
+    """Read-only compatibility for pre-manifest segments.
+
+    Chunks-only and data.parquet-only layouts are unambiguous.  A mixture of a
+    consolidated representation with chunks is exactly the historical duplicate
+    failure mode and must not be silently concatenated.
+    """
+    segment_dir = Path(segment_dir)
+    files = sorted(segment_dir.glob("*.parquet"))
+    names = {p.name for p in files}
+    has_chunks = any(name.startswith("chunk_") for name in names)
+    consolidated = [
+        name for name in names
+        if name == "data.parquet" or name.startswith("compact_")
+    ]
+    if has_chunks and consolidated:
+        raise ParquetManifestError(
+            f"ambiguous legacy Parquet segment {segment_dir}: contains chunk files and "
+            f"consolidated file(s) {sorted(consolidated)}. Refusing to double-read; "
+            "repair/migrate the segment to parquet_manifest.json first."
+        )
+    if len(consolidated) > 1:
+        raise ParquetManifestError(
+            f"ambiguous legacy Parquet segment {segment_dir}: multiple consolidated "
+            f"representations {sorted(consolidated)}"
+        )
+    return [str(path) for path in files]
+
+
 def committed_files(
     segment_dir: Path,
     *,
@@ -268,7 +297,7 @@ def committed_files(
         verify_hashes=verify_hashes,
     )
     if manifest is None:
-        return None
+        return _legacy_committed_files(Path(segment_dir))
     return [str(Path(segment_dir) / rec["path"]) for rec in manifest["files"]]
 
 
