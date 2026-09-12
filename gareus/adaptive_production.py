@@ -31,7 +31,7 @@ import logging
 import math
 import re
 import shutil
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Collection, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -350,6 +350,12 @@ class AdaptiveDecisionPolicy:
     max_state_steps: int = 0
     new_state_steps: int = 0
     frontier_bonus: float = 1.5
+    # An articulation point is only informative when it is rare. On a path-shaped
+    # exchange graph (a lambda ladder) EVERY interior state is one, so the bonus
+    # fires for n-2 of n states regardless of the run data and simply penalises
+    # the two endpoints. Above this fraction the term is treated as carrying no
+    # information and is skipped. 1.0 restores the unguarded behaviour.
+    articulation_degenerate_fraction: float = 0.80
     weak_edge_bonus: float = 3.0
     low_sample_bonus: float = 2.0
     high_boost_bonus: float = 1.0
@@ -4935,6 +4941,31 @@ def propose_actions_from_diagnostics(
     return actions
 
 
+def _articulation_is_degenerate(
+    articulation: Collection[int],
+    active: Collection[Any],
+    fraction: float = 0.80,
+) -> bool:
+    """True when the articulation set is too large to discriminate.
+
+    `frontier_bonus` is meant to protect states that hold the MBAR overlap graph
+    together. That is a real signal when bridges are rare. On a path graph it is
+    not a signal at all: every interior node is an articulation point, so the
+    term fires for n-2 of n states before any data exists.
+
+    Measured on chignolin_7 (112 states): 110 of 112 scored the bonus every epoch,
+    and the two chain-end states took a ~36% smaller top-up purely for ending the
+    chain (extra 1,539,102 vs 2,407,082 steps in epoch_001). In epoch_002 those
+    endpoints had *fewer* samples than the interior (9,345 vs 12,817), so the one
+    term that does track run data ranked them higher -- and was overridden anyway.
+    """
+    n_active = len(active)
+    n_art = len(articulation)
+    if n_active <= 0 or n_art <= 0:
+        return False
+    return (n_art / float(n_active)) >= float(fraction)
+
+
 def _graph_articulation_states(registry: WindowStateRegistry) -> set[int]:
     active_ids = registry.active_state_ids()
     if len(active_ids) <= 2:
@@ -5116,6 +5147,8 @@ def build_adaptive_epoch_schedule(
     state_rows = _state_rows_by_id(diagnostics)
     weak_counts = _weak_edge_touch_counts(diagnostics, policy)
     articulation = _graph_articulation_states(registry)
+    articulation_degenerate = _articulation_is_degenerate(
+        articulation, active, float(policy.articulation_degenerate_fraction))
     scored: List[Dict[str, Any]] = []
     for state in active:
         sid = int(state.state_id)
@@ -5134,7 +5167,7 @@ def build_adaptive_epoch_schedule(
         if sid in weak_counts:
             score += float(policy.weak_edge_bonus) * float(weak_counts[sid])
             reasons.append(f"touches_{weak_counts[sid]}_weak_edge(s)")
-        if sid in articulation:
+        if sid in articulation and not articulation_degenerate:
             score += float(policy.frontier_bonus)
             reasons.append("graph_bridge_state")
         if int(state.created_epoch) >= int(epoch):
@@ -6812,6 +6845,16 @@ def policy_from_args(args: Any) -> AdaptiveDecisionPolicy:
         scheduled_final_segments=_arg_bool(args, "adaptive_production_scheduled_final_segments", True),
         convergence_min_samples_per_state=_arg_int(args, "adaptive_production_convergence_min_samples_per_state", 50),
         convergence_max_weak_edges=_arg_int(args, "adaptive_production_convergence_max_weak_edges", 0),
+        # Allocation-score weights. Previously hardcoded dataclass defaults with
+        # no way to retune the scheduler short of editing source; the defaults
+        # here reproduce those values exactly, so plumbing them changes nothing
+        # for a config that does not set them.
+        frontier_bonus=_arg_float(args, "adaptive_production_frontier_bonus", 1.5),
+        weak_edge_bonus=_arg_float(args, "adaptive_production_weak_edge_bonus", 3.0),
+        low_sample_bonus=_arg_float(args, "adaptive_production_low_sample_bonus", 2.0),
+        high_boost_bonus=_arg_float(args, "adaptive_production_high_boost_bonus", 1.0),
+        articulation_degenerate_fraction=_arg_float(
+            args, "adaptive_production_articulation_degenerate_fraction", 0.80),
         convergence_allow_extend_actions=_arg_bool(args, "adaptive_production_convergence_allow_extend_actions", True),
         require_convergence_before_final=_arg_bool(args, "adaptive_production_require_convergence_before_final", False),
         total_md_pool_ns=_arg_float(args, "adaptive_production_total_md_pool_ns", 0.0),
