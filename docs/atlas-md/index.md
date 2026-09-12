@@ -1,37 +1,49 @@
-# ATLAS-MD
+<p align="center">
+  <img src="assets/atlas-md-logo.svg" alt="ATLaS-MD" width="720">
+</p>
 
-ATLAS-MD is manual for GAREUS: explicit-solvent peptide molecular dynamics with umbrella sampling, replica exchange (REUS), optional Gaussian accelerated MD (GaMD), adaptive window placement, and MBAR/PMF analysis.
+<p align="center"><strong>Adaptive Thermodynamic Landscape Sampling for molecular dynamics</strong></p>
 
-Use it in order:
+ATLaS-MD is an OpenMM-based peptide sampling framework for explicit-solvent umbrella sampling, replica exchange, optional Gaussian accelerated MD (GaMD/Pep-GaMD), adaptive state placement, and MBAR/PMF analysis.
+
+It is research software built around an explicit scientific contract: sampled Hamiltonians are state-defined, exchange kernels are independently validated, adaptive phases retain their own provenance, and estimator validity is kept separate from sampler correctness.
+
+<p align="center">
+  <img src="assets/workflow.svg" alt="ATLaS-MD workflow" width="100%">
+</p>
+
+## Start here
 
 1. [Install](start/installation.md) dependencies.
-2. Run [quickstart](start/quickstart.md) with conventional MD (CMD).
-3. Choose [collective variables](guide/collective-variables.md) and [windows](guide/windows-and-exchange.md).
-4. Run analysis and apply [PMF validity](analysis/pmf-validity.md) gates before interpreting free energies.
+2. Run the [quickstart](start/quickstart.md) with conventional MD.
+3. Choose [collective variables](guide/collective-variables.md) and [umbrella/exchange states](guide/windows-and-exchange.md).
+4. Read the [thermodynamic target and detailed-balance contract](guide/thermodynamic-validity.md) before modifying sampler logic.
+5. Apply the [PMF validity](analysis/pmf-validity.md) gates before interpreting free energies.
 
-## Scope
+## What ATLaS-MD combines
 
-GAREUS is research software. It writes reproducibility artifacts and diagnostics; it does not make free-energy estimates valid by itself. Validate sampling, overlap, and reweighting for every scientific conclusion.
+| Layer | Purpose |
+| --- | --- |
+| System setup | Explicit-solvent OpenMM peptide systems, equilibration, HMR options |
+| State construction | 1D/2D umbrella states, adaptive placement, sparse state layouts |
+| Acceleration | GaMD / Pep-GaMD and optional state-dependent lambda ladders |
+| Exchange | Neighbor, random-pair, all-pair and MH-corrected Gibbs-walk kernels |
+| Production | NVT or supported boosted-NPT workflows with checkpoint/resume |
+| Storage | Phase-local state maps, Parquet samples, exchange ledgers, manifests |
+| Inference | MBAR/PMF analysis, overlap/ESS diagnostics and validity gates |
 
-## Workflow map
+## Scientific scope
 
-```mermaid
-flowchart LR
-    A[Sequence or input PDB] --> B[System setup and equilibration]
-    B --> C[CV definition and umbrella windows]
-    C --> D[CMD or GaMD production]
-    D <--> E[Replica exchange]
-    D --> F{Adaptive mode?}
-    F -- yes --> G[Feedback or epoch decisions]
-    G --> C
-    F -- no / frozen final --> H[Samples, windows, exchanges]
-    H --> I[MBAR and PMF diagnostics]
-    I --> J{Coverage, overlap, ESS, reweighting pass?}
-    J -- yes --> K[Scientific interpretation]
-    J -- no --> C
-```
+ATLaS-MD writes reproducibility artifacts and diagnostics; it does not make a free-energy estimate valid merely by completing a run. Validate sampling, overlap, effective sample size, reweighting stability, and estimator assumptions for every scientific conclusion.
 
-Adaptive placement changes sampling plan. Freeze final layout before final inference whenever workflow supports it.
+The code distinguishes:
+
+- the **intended target distribution**;
+- **transition-kernel correctness** for exchange and supported NPT moves;
+- **finite-timestep propagation accuracy**;
+- **post-hoc estimator/reweighting validity**.
+
+Those are related, but they are not interchangeable claims.
 
 ## Command map
 
@@ -44,4 +56,4 @@ Adaptive placement changes sampling plan. Freeze final layout before final infer
 | `gareus-energy-decompose` | Coordinate-based energy decomposition |
 | `gareus-test-run` | Dependency checks and tiny end-to-end workflow |
 
-See [command reference](reference/cli.md) for exact surfaces.
+See the [command reference](reference/cli.md) for the exact interface.
