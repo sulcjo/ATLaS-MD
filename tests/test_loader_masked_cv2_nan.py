@@ -253,7 +253,7 @@ def test_load_parquet_masks_null_cv2_as_nan_not_zero(tmp_path):
     cv2_buggy = raw_samples["cv2"].astype(np.float64)  # the old, buggy line
     assert np.all(np.ma.getdata(cv2_buggy)[null_rows] == 0.0)
     u_nk_buggy = reconstruct_bias_matrix(cv1, cv2_buggy, restrained_windows, beta)
-    assert np.all(np.isfinite(u_nk_buggy[null_rows, 0]))
+    assert np.all(np.isnan(u_nk_buggy[null_rows, 0]))
 
 
 def test_load_parquet_excludes_null_cv2_sample_when_window_secondary_restrains(tmp_path):
@@ -397,7 +397,7 @@ def test_load_parquet_adaptive_union_masks_null_cv2_as_nan_not_zero(tmp_path):
     cv2_buggy = raw_samples["cv2"].astype(np.float64)  # the old, buggy line
     assert np.all(np.ma.getdata(cv2_buggy)[null_rows] == 0.0)
     u_nk_buggy = _reconstruct_union_bias_block(cv1, cv2_buggy, beta, pc, pk, sc, sk)
-    assert np.all(np.isfinite(u_nk_buggy[null_rows, 0]))
+    assert np.all(np.isnan(u_nk_buggy[null_rows, 0]))
 
 
 # --- Fix round 1: gamd_boost_total/gamd_boost_dihedral regression ----------

@@ -505,6 +505,10 @@ def test_mutation_is_caught(real_md_2d_windows, label, transform, analog, expect
     else:
         windows = transform(windows)
 
+    if beta <= 0:
+        with pytest.raises(ValueError, match="beta"):
+            _recover_2d(d["cv1"], d["cv2"], d["window"], windows, beta)
+        return
     result = _recover_2d(d["cv1"], d["cv2"], d["window"], windows, beta)
 
     if result["avg"] is None:

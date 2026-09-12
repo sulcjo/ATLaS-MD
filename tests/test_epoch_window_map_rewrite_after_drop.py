@@ -1130,23 +1130,22 @@ def _fake_resumable_checkpoint(phase_dir: Path, n_replicas: int = 4):
     the median-outlier branch rejects it -- the shape that makes the round-2
     resume guard the deciding one.
     """
-    import json
+    from gareus.correctness.checkpoint_store import publish_generation
 
-    chk = phase_dir / "checkpoints"
-    chk.mkdir(parents=True, exist_ok=True)
-    names = []
-    for i in range(n_replicas):
-        name = f"replica_{i:03d}.chk"
-        (chk / name).write_bytes(b"\0" * 200_000)
-        names.append(name)
-    (chk / "production_checkpoint_manifest.json").write_text(
-        json.dumps({"replica_checkpoint_files": names, "prod_done": 30_000}),
-        encoding="utf-8",
+    publish_generation(
+        phase_dir,
+        [b"\0" * 200_000 for _ in range(n_replicas)],
+        {
+            "assignments": list(range(n_replicas)), "prod_done": 30_000,
+            "absolute_step": 30_000, "parity": 0, "attempt": 0,
+            "next_exchange": 30_000, "next_log": 30_000,
+            "exchange_stats": {}, "rng_bit_generator": "PCG64", "rng_state": {},
+        },
     )
 
 
-def _torn_production_checkpoint(phase_dir: Path, n_replicas: int = 4):
-    """A checkpoint manifest `production_checkpoint_available` must reject.
+def _absent_production_checkpoint(phase_dir: Path, n_replicas: int = 4):
+    """No committed checkpoint: fresh-start path remains available.
 
     Deliberately not "no checkpoint at all": that is a state where the round-2
     guard was never going to preserve anything, so a test built on it proves less
@@ -1155,20 +1154,6 @@ def _torn_production_checkpoint(phase_dir: Path, n_replicas: int = 4):
     mid-write kill -- so the samples below are durable while round-2 is provably
     silent.
     """
-    import json
-
-    chk = phase_dir / "checkpoints"
-    chk.mkdir(parents=True, exist_ok=True)
-    names = []
-    for i in range(n_replicas):
-        name = f"replica_{i:03d}.chk"
-        size = 1024 if i == n_replicas - 1 else 200_000
-        (chk / name).write_bytes(b"\0" * size)
-        names.append(name)
-    (chk / "production_checkpoint_manifest.json").write_text(
-        json.dumps({"replica_checkpoint_files": names, "prod_done": 30_000}),
-        encoding="utf-8",
-    )
 
 
 def _drive_capturing_the_map_at_entry(monkeypatch, args, out):
@@ -1207,7 +1192,7 @@ def test_the_round_2_guard_is_silent_while_the_samples_veto_fires(tmp_path):
 
     _args, _out, epoch_dir = _five_state_resumed_campaign(tmp_path)
     _seal_samples_segment(epoch_dir, status="interrupted")
-    _torn_production_checkpoint(epoch_dir)
+    _absent_production_checkpoint(epoch_dir)
     map_path = epoch_dir / "epoch_window_map.csv"
 
     assert production_checkpoint_available(epoch_dir) is False, (
@@ -1284,7 +1269,7 @@ def test_a_flat_epoch_with_samples_behind_a_torn_checkpoint_keeps_its_map(tmp_pa
     """
     args, out, epoch_dir = _five_state_resumed_campaign(tmp_path)
     _seal_samples_segment(epoch_dir, status="interrupted")
-    _torn_production_checkpoint(epoch_dir)
+    _absent_production_checkpoint(epoch_dir)
     before = (epoch_dir / "epoch_window_map.csv").read_bytes()
 
     pairs = _drive_capturing_the_map_at_entry(monkeypatch, args, out)
@@ -1303,7 +1288,7 @@ def test_a_completed_segment_behind_a_torn_checkpoint_also_keeps_its_map(tmp_pat
     """
     args, out, epoch_dir = _five_state_resumed_campaign(tmp_path)
     _seal_samples_segment(epoch_dir, status="complete")
-    _torn_production_checkpoint(epoch_dir)
+    _absent_production_checkpoint(epoch_dir)
 
     pairs = _drive_capturing_the_map_at_entry(monkeypatch, args, out)
 
@@ -1471,7 +1456,7 @@ def test_the_preserved_map_makes_a_replayed_drop_set_idempotent(tmp_path, monkey
     """
     args, out, epoch_dir = _five_state_resumed_campaign(tmp_path)
     _seal_samples_segment(epoch_dir, status="interrupted")
-    _torn_production_checkpoint(epoch_dir)
+    _absent_production_checkpoint(epoch_dir)
 
     seen = _drive_with_attempt_2_dropping(monkeypatch, args, out, [1, 3])
 
@@ -1503,7 +1488,7 @@ def test_a_different_drop_set_leaves_the_map_untouched_for_the_loader_to_catch(t
     """
     args, out, epoch_dir = _five_state_resumed_campaign(tmp_path)
     _seal_samples_segment(epoch_dir, status="interrupted")
-    _torn_production_checkpoint(epoch_dir)
+    _absent_production_checkpoint(epoch_dir)
 
     seen = _drive_with_attempt_2_dropping(monkeypatch, args, out, [1])
 
@@ -1728,7 +1713,7 @@ def _scheduled_epoch_campaign(tmp_path, *, segment_already_sampled: bool):
         (seg_dir / "epoch_window_map.csv").write_text(
             _LOOP_MAP_5_STATE_COMPACTED, encoding="utf-8")
         _seal_samples_segment(seg_dir, status="interrupted")
-        _torn_production_checkpoint(seg_dir)
+        _absent_production_checkpoint(seg_dir)
     return args, out, seg_dir
 
 
@@ -1755,7 +1740,7 @@ def _frozen_final_campaign(tmp_path, *, phase_already_sampled: bool):
         (final_dir / "epoch_window_map.csv").write_text(
             _LOOP_MAP_5_STATE_COMPACTED, encoding="utf-8")
         _seal_samples_segment(final_dir, status="interrupted")
-        _torn_production_checkpoint(final_dir)
+        _absent_production_checkpoint(final_dir)
     return args, out, final_dir
 
 

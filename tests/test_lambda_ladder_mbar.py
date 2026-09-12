@@ -30,7 +30,7 @@ def test_reconstruct_bias_matrix_refuses_lambda_states_without_energies():
     try:
         reconstruct_bias_matrix(np.array([0.1]), None, windows, 0.4)
     except ValueError as exc:
-        assert "v_pep" in str(exc)
+        assert "frozen envelope" in str(exc)
     else:
         raise AssertionError("a lambda>0 state without raw energies cannot be reweighted and must fail loudly")
 

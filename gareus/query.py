@@ -321,93 +321,14 @@ def reconstruct_bias_matrix(
     envelope=None,
     meta: Optional[dict] = None,
 ) -> np.ndarray:
-    """Reconstruct umbrella_reduced_bias_nk analytically.
+    """Strict reduced umbrella-plus-ladder bias; missing required coordinates raise.
 
-    A window is "secondary-restrained" iff it has both a "center2" and "k2"
-    key AND those values are finite with k2 > 0 -- such a window's CV2 term
-    is included only when that holds; otherwise the CV2 term is omitted
-    entirely (a 1D run, or an unrestrained 2D state, gets a purely-CV1 bias
-    regardless of what cv2 holds for its samples).
-
-    For a secondary-restrained window, a sample whose own cv2 value is not
-    finite gets NaN for that (sample, window) entry -- this is intentional
-    exclusion-by-propagation (the same convention analyze_gareus_mbar.py's
-    clean() and every other bias-reconstruction site in this codebase uses),
-    not a bug: fabricating a zero deviation would silently claim the sample
-    was on-target for a coordinate that was never actually measured.
-
-    ``meta``, when given, receives the shared ladder helper's own bookkeeping
-    (``gamd_ladder``, ``gamd_ladder_samples_without_raw_energies``) so a caller
-    reconstructing through this function does not have to add the term itself
-    a second time just to get those keys populated.
-
-    A window carrying a "gamd_lambda" key with value > 0 is a lambda-ladder
-    rung: its reduced bias additionally includes
-    ``beta * pep_gamd_boost_kj(v_pep, v_dih, gamd_lambda, envelope)``, the
-    closed-form Pep-GaMD boost of each sample's own raw channel energies
-    evaluated under that rung's lambda. This requires ``v_pep``, ``v_dih``,
-    and ``envelope`` -- a ladder rung cannot be reweighted without the raw
-    energies it was measured with, so any window with gamd_lambda > 0 while
-    one of the three is missing raises ValueError rather than silently
-    falling back to the umbrella-only bias for that state.
-
-    Parameters
-    ----------
-    cv_A : (N,) array of primary CV values
-    cv2  : (N,) array of secondary CV values, or None for 1D runs
-    windows : list of window dicts with center1, k1 (and optionally center2,
-        k2, gamd_lambda)
-    beta : 1/(kB*T) in mol/kJ (e.g. 1 / (8.314462618e-3 * T_K))
-    v_pep : (N,) array of raw peptide-channel energies, kJ/mol -- required
-        when any window carries gamd_lambda > 0
-    v_dih : (N,) array of raw dihedral-channel energies, kJ/mol -- required
-        when any window carries gamd_lambda > 0
-    envelope : frozen PepGamdEnvelope -- required when any window carries
-        gamd_lambda > 0
-
-    Returns
-    -------
-    nk : (N, K) float64 array of dimensionless reduced umbrella+ladder biases
+    k1/k2 stay in kcal/mol per squared CV unit. beta stays in mol/kJ.
+    The existing ladder helper remains the only boost implementation.
     """
-    cv_A = np.asarray(cv_A, dtype=np.float64)
-    N = len(cv_A)
-    K = len(windows)
-    nk = np.zeros((N, K), dtype=np.float64)
-    cv2_arr = np.asarray(cv2, dtype=np.float64) if cv2 is not None else None
-
-    for k, w in enumerate(windows):
-        d1 = cv_A - float(w["center1"])
-        nk[:, k] = KJ_PER_KCAL * 0.5 * float(w["k1"]) * d1 * d1  # kcal -> kJ
-        if cv2_arr is not None and "center2" in w and "k2" in w:
-            k2 = float(w["k2"])
-            c2 = float(w["center2"])
-            if math.isfinite(c2) and math.isfinite(k2) and k2 > 0.0:
-                d2 = cv2_arr - c2
-                nk[:, k] += KJ_PER_KCAL * 0.5 * k2 * d2 * d2
-
-    u = beta * nk
-
-    # The ladder term is added by gareus.mbar_analysis.ladder.apply_ladder_boost_to_u
-    # -- the ONE place it is ever added (2026-09-07 review, R4) -- so its
-    # missing-energy guard and NaN-propagation (a sample with a non-finite
-    # v_pep/v_dih gets NaN, not a silently fabricated 0.0 boost, in every
-    # gamd_lambda > 0 column) apply here too. The explicit "not supplied at
-    # all" check below stays: the helper itself expects real arrays (an
-    # np.asarray(None, dtype=float64) would raise the wrong exception type),
-    # so this is the one guard that must run before calling it.
-    lambdas = np.asarray([float(w.get("gamd_lambda", 0.0) or 0.0) for w in windows], dtype=float)
-    if np.any(lambdas > 0.0) and (v_pep is None or v_dih is None or envelope is None):
-        raise ValueError(
-            "windows carry gamd_lambda > 0 but v_pep/v_dih/envelope were not supplied; "
-            "the ladder cannot be reweighted without the raw channel energies"
-        )
-    # Called unconditionally so `meta` gets the uniform contract every other
-    # caller of the helper already has (gamd_ladder True/False plus the
-    # missing-raw-energy count). With no active rung it returns `u` untouched
-    # without ever looking at v_pep/v_dih, so a None is harmless there.
-    from .mbar_analysis.ladder import apply_ladder_boost_to_u
-    return apply_ladder_boost_to_u(u, v_pep, v_dih, lambdas, envelope, beta,
-                                   meta if meta is not None else {})
+    from .correctness.bias import reconstruct_bias_matrix as _strict_bias
+    return _strict_bias(cv_A, cv2, windows, beta,
+                        v_pep=v_pep, v_dih=v_dih, envelope=envelope, meta=meta)
 
 
 def export_analysis_arrays_npz(
