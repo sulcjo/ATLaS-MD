@@ -60,7 +60,11 @@ def _add_core_args(p: argparse.ArgumentParser) -> None:
 
 
 def _add_system_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--water-model", choices=["tip3p", "tip3pfb", "spce", "tip4pew"], default="tip3p")
+    p.add_argument("--forcefield", choices=["ff14SB", "ff19SB"], default="ff14SB",
+                   help="Protein force field. ff19SB requires OPC water.")
+    p.add_argument("--water-model", choices=["tip3p", "tip3pfb", "spce", "tip4pew", "opc"], default="tip3p")
+    p.add_argument("--allow-forcefield-water-mismatch", action="store_true",
+                   help="Permit a force field/water pairing its parameterization does not support.")
     p.add_argument("--box-shape", choices=["dodecahedron", "cube", "octahedron"], default="dodecahedron")
     p.add_argument("--padding-nm", type=float, default=1.0)
     p.add_argument("--ionic-strength-molar", type=float, default=0.15)

@@ -7,7 +7,7 @@ from typing import Optional
 
 from .io import read_json_file
 from .imports import import_openmm
-from .system_setup import make_forcefield
+from .system_setup import make_forcefield_from_args
 from .production import checkpoint_manifest_path
 
 __all__ = [
@@ -104,7 +104,7 @@ def load_existing_openmm_setup_for_resume(args, out_dir: Path, require_equil_sta
     if not solvated_pdb.exists():
         return None
     openmm, app, unit = import_openmm()
-    forcefield = make_forcefield(app, args.water_model)
+    forcefield = make_forcefield_from_args(app, args)
     pdb = app.PDBFile(str(solvated_pdb))
     state = None
     state_path = equilibration_state_xml_path(out_dir)

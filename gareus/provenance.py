@@ -317,15 +317,19 @@ def _method_settings(args: Any) -> dict[str, Any]:
 
 
 def _forcefield_settings(args: Any) -> dict[str, Any]:
-    water_xml = {
-        "tip3p": "amber14/tip3p.xml",
-        "tip3pfb": "amber14/tip3pfb.xml",
-        "spce": "amber14/spce.xml",
-        "tip4pew": "amber14/tip4pew.xml",
-    }.get(str(getattr(args, "water_model", "tip3p") or "tip3p"), None)
+    # Derived, never duplicated: this dict used to carry its own copy of the
+    # water map, so updating system_setup alone made the provenance record
+    # disagree with what actually ran.
+    from .system_setup import forcefield_selection_from_args, forcefield_xml_paths
+    _ff, _water, _allow = forcefield_selection_from_args(args)
+    try:
+        _xml = forcefield_xml_paths(_ff, _water, allow_mismatch=True)
+    except ValueError:
+        _xml = []
     return {
-        "forcefield_xml": [x for x in ["amber14-all.xml", water_xml] if x],
-        "water_model": getattr(args, "water_model", None),
+        "forcefield_xml": _xml,
+        "forcefield": _ff,
+        "water_model": getattr(args, "water_model", None) or "tip3p",
         "nonbonded_method": "PME",
         "constraints": "HBonds",
         "rigid_water": True,
