@@ -22,7 +22,7 @@ under either window's own glyph.
 from __future__ import annotations
 
 import math
-from typing import Sequence
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -138,11 +138,20 @@ def _verdict(ctx: DashboardContext) -> str:
     health = str(ctx.decision.get("health", "OK") or "OK").upper()
     if health == "UNAVAILABLE":
         return color_text("? verdict unavailable", "dim")
+    # The count is of run-health issues, never of windows. Unlabelled, `BAD 3`
+    # sat directly above a window table listing 4 BAD windows and read as a
+    # contradictory count of the same thing; naming the unit removes the
+    # collision while keeping the health word, which is genuinely the health.
     if health == "BAD":
-        return role_text(f"✗ BAD {len(issues)}", ROLE_BAD)
+        return role_text(f"✗ BAD {_issue_count(issues)}", ROLE_BAD)
     if health == "WATCH" or issues:
-        return role_text(f"⚠ CAUTION {len(issues)}", ROLE_WARN)
+        return role_text(f"⚠ CAUTION {_issue_count(issues)}", ROLE_WARN)
     return role_text("✓ OK", ROLE_GOOD)
+
+
+def _issue_count(issues: Sequence[Any]) -> str:
+    n = len(issues)
+    return f"{n} issue" if n == 1 else f"{n} issues"
 
 
 def _ns_per_day(ctx: DashboardContext) -> float:
@@ -246,8 +255,14 @@ def spine_lines(ctx: DashboardContext, lines_budget: int) -> tuple[str, ...]:
     statuses = _statuses_by_window(ranked, ctx.n_windows)
     counts = [float(len(ctx.cv_history_by_window.get(w, ()))) for w in range(ctx.n_windows)]
     epoch = ""
-    if ctx.epoch_index is not None:
-        epoch = f"ep {ctx.epoch_index}/{ctx.epoch_total}  "
+    if ctx.is_final_stage:
+        # The terminal stage has no epoch index. Naming it is the whole point:
+        # it used to borrow a fabricated 0 and render `ep 0/?` with every epoch
+        # already complete. See adaptive_production.stage_phase_identity.
+        epoch = "final  "
+    elif ctx.epoch_index is not None:
+        total = ctx.epoch_total
+        epoch = f"ep {ctx.epoch_index}/{total}  " if total is not None else f"ep {ctx.epoch_index}  "
     identity = (f"GaREUS  {ctx.run_label}   {ctx.phase}  {epoch}{ctx.segment_name}   "
                 f"{ctx.n_windows} win  {ctx.topology_label}")
     if ctx.secondary_cv_type:

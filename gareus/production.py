@@ -4425,6 +4425,30 @@ def compare_gamd_global_sets(reference: dict[str, float], current: dict[str, flo
         "mismatches_truncated": max(0, len(mismatches) - 50),
     }
 
+def merge_adaptive_phase_info(base: dict, api: dict) -> dict:
+    """Merge a segment's `_adaptive_phase_info` into the dashboard phase dict.
+
+    Only keys the producer actually supplied are carried across.  The previous
+    merge read `int(_api.get("epoch_index", 0))` unconditionally, so a stage
+    that legitimately has no epoch index -- the terminal `final` stage -- had a
+    plausible-looking `0` stamped onto it, and the header announced epoch 0 of a
+    run with three epochs behind it.  An absent key must stay absent rather than
+    acquire a default that reads as a measurement.
+
+    Returns a new dict; `base` is never mutated.
+    """
+    merged = dict(base or {})
+    for key in ("epoch_index", "epoch_total", "is_final_stage"):
+        if key in (api or {}):
+            merged[key] = api[key]
+    if merged.get("is_final_stage"):
+        # A final stage has no position in the epoch sequence; drop anything a
+        # caller may have pre-seeded so the renderer cannot read a stale index.
+        merged.pop("epoch_index", None)
+        merged.pop("epoch_total", None)
+    return merged
+
+
 def checkpoint_manifest_path(out_dir: Path) -> Path:
     return Path(out_dir) / "checkpoints" / "production_checkpoint_manifest.json"
 
@@ -7100,20 +7124,16 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         _api = getattr(args, "_adaptive_phase_info", {}) or {}
         if _api:
             if adaptive_phase_info is None:
-                adaptive_phase_info = {
+                adaptive_phase_info = merge_adaptive_phase_info({
                     "is_adaptive_epoch": True,
-                    "epoch_index": int(_api.get("epoch_index", 0)),
-                    "epoch_total": _api.get("epoch_total", 1) if _api.get("epoch_total", 1) == "?" else int(_api.get("epoch_total", 1)),
                     "segment_name": str(_api.get("segment_name", "")),
                     "is_topup": bool(_api.get("is_topup", False)),
                     "topup_index": int(_api.get("topup_index", 0)),
                     "prev_epochs": list(_api.get("prev_epochs", [])),
-                }
+                }, _api)
                 dashboard_info["adaptive_phase"] = adaptive_phase_info
             else:
-                adaptive_phase_info["epoch_index"] = int(_api.get("epoch_index", 0))
-                _et = _api.get("epoch_total", 1)
-                adaptive_phase_info["epoch_total"] = _et if _et == "?" else int(_et)
+                adaptive_phase_info.update(merge_adaptive_phase_info(adaptive_phase_info, _api))
 
         if bool(getattr(args, "resume", False)):
             manifest = load_production_checkpoint(

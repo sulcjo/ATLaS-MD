@@ -6249,6 +6249,36 @@ def _segment_checkpoint_prod_done(seg_dir: Path) -> Optional[int]:
         return None
 
 
+def stage_phase_identity(epoch_dir_name: str, max_epochs: Optional[int] = None) -> Dict[str, Any]:
+    """Identify a scheduled stage for the TUI header.
+
+    ``run_segment`` serves both the numbered adaptive epochs (``epoch_000``,
+    ``epoch_001``, ...) and the terminal ``final`` stage, so the stage's own
+    directory name is the only thing that distinguishes them.
+
+    A numbered epoch returns its index and the run's configured length.  Any
+    other stage name -- ``final`` above all -- returns ``is_final_stage`` and
+    **no index at all**, because it does not have one.  The previous parse
+    wrapped ``int(name.rsplit("_", 1)[-1])`` in a bare ``except`` that fell
+    back to ``0``, so the terminal stage rendered ``ep 0/?`` while three epochs
+    were complete: an inapplicable value dressed up as a measured one.  That is
+    the same mistake ``gareus/dashboard/ranking.py`` documents for deltas
+    (``nan``, not ``0.0``), and the fix is the same -- omit, never default.
+    """
+    name = str(epoch_dir_name or "")
+    index: Optional[int] = None
+    if name.startswith("epoch_"):
+        suffix = name.rsplit("_", 1)[-1]
+        if suffix.isdigit():
+            index = int(suffix)
+    if index is None:
+        return {"is_final_stage": True}
+    ident: Dict[str, Any] = {"epoch_index": index, "is_final_stage": False}
+    if max_epochs is not None:
+        ident["epoch_total"] = int(max_epochs)
+    return ident
+
+
 def run_scheduled_adaptive_epoch(
     args: Any,
     epoch_dir: Path,
@@ -6267,6 +6297,7 @@ def run_scheduled_adaptive_epoch(
     policy: Optional[AdaptiveDecisionPolicy] = None,
     runtime_pool: Optional[AdaptiveRuntimePool] = None,
     pool_reserve_ns: float = 0.0,
+    max_epochs: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Run one allocated epoch as all-state baseline plus top-up subset segments."""
     epoch_dir = Path(epoch_dir)
@@ -6337,12 +6368,11 @@ def run_scheduled_adaptive_epoch(
         seg_args.resume = _seg_will_resume
         if seg_args.resume:
             print(f"      scheduled segment {name}: checkpoint manifest found; resuming from {seg_dir}")
-        # Derive epoch index from directory name for TUI epoch/topup display.
-        _epoch_dir_name = epoch_dir.name  # e.g. "epoch_001"
-        try:
-            _epoch_idx = int(_epoch_dir_name.rsplit("_", 1)[-1])
-        except Exception:
-            _epoch_idx = 0
+        # Stage identity for the TUI header.  `final` is not an epoch and gets
+        # no index -- see stage_phase_identity() for why a default of 0 here
+        # made the terminal stage render as `ep 0/?`.
+        _stage_ident = stage_phase_identity(epoch_dir.name, max_epochs)
+        _epoch_idx = int(_stage_ident.get("epoch_index", 0))
         # Offset seed per segment so each segment gets fresh exchange-RNG and
         # thermostat streams.  Without this every segment replays identical
         # random sequences (N4: re-correlated RNG across segments).
@@ -6350,8 +6380,7 @@ def run_scheduled_adaptive_epoch(
         _seg_call_counter[0] += 1
         setattr(seg_args, "_adaptive_phase_info", {
             "is_adaptive_epoch": True,
-            "epoch_index": _epoch_idx,
-            "epoch_total": "?",
+            **_stage_ident,
             "segment_name": name,
             "is_topup": name.startswith("topup"),
             "topup_index": int(name.split("_")[1]) if name.startswith("topup") and "_" in name[6:] else 0,
@@ -7114,6 +7143,7 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                 policy=schedule_policy,
                 runtime_pool=runtime_pool,
                 pool_reserve_ns=_runtime_pool_final_reserve_ns(runtime_pool, policy, final=False),
+                max_epochs=max_epochs,
             )
             diagnostics = result["diagnostics"]
             scheduled_summary = result["summary"]
@@ -7707,6 +7737,7 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                 policy=final_schedule_policy if 'final_schedule_policy' in locals() else policy,
                 runtime_pool=runtime_pool,
                 pool_reserve_ns=0.0,
+                max_epochs=max_epochs,
             )
             final_scheduled_summary = result.get("summary", {})
             # The scheduled final was the only one of the three phase-running

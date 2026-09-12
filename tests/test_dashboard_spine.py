@@ -346,3 +346,63 @@ def test_run_and_pool_bars_fit_without_needing_ellipsis_truncation(tmp_path):
                                     "remaining_ns": 7500.0, "events": []})
     lines = spine_lines(_ctx(tmp_path, sidecar=sidecar), FULL_SPINE_LINES)
     assert not any(strip_ansi(l).endswith("…") for l in lines)
+
+
+# --- stage identity in the header -------------------------------------------
+# The terminal `final` stage used to render `ep 0/?`: the producer's bare
+# `except` mapped an unparseable directory name to a valid-looking index 0,
+# and `epoch_total` was a hardcoded "?". Three epochs were complete at the
+# time, so the header stated the opposite of the truth.
+
+def _phase_ctx(tmp_path, adaptive_phase, *, n=25, term_w=140):
+    logger = DistanceLogger(tmp_path, argparse.Namespace(timestep_fs=2.0), no_file_persistence=True)
+    for w in range(n):
+        logger.history_by_window[w] = [CENTERS[w] + 0.1 * (i % 5 - 2) for i in range(50)]
+    rows = [{"replica": w, "window": w, "center_A": CENTERS[w], "k_kcal_mol_A2": 2.5,
+             "cv_A": CENTERS[w] + 0.05} for w in range(n)]
+    return build_context(
+        logger=logger, rows=rows, phase="gareus_production", step=12_450_000,
+        total_steps=37_500_000, summary={}, dashboard_info={
+            "centers_a": list(CENTERS[:n]), "n_windows": n, "k_list": [2.5] * n,
+            "exchange_stats": {f"{i}-{i+1}": {"attempts": 400, "accepted": 120}
+                               for i in range(n - 1)},
+            "primary_cv_label": "contacts", "primary_cv_units": "A",
+            "adaptive_phase": adaptive_phase},
+        sidecar=SidecarSnapshot(), term_w=term_w, term_h=45, now=1000.0,
+        view="progress", glyphs="unicode",
+    )
+
+
+def test_final_stage_header_never_claims_epoch_zero(tmp_path):
+    ctx = _phase_ctx(tmp_path, {"is_final_stage": True, "segment_name": "topup_002_6910000"})
+    text = strip_ansi("\n".join(spine_lines(ctx, FULL_SPINE_LINES)))
+    assert "ep 0" not in text, "the final stage is not epoch 0"
+    assert "0/?" not in text
+    assert "final" in text, "the terminal stage must name itself"
+
+
+def test_topup_inside_a_real_epoch_names_the_run_length(tmp_path):
+    ctx = _phase_ctx(tmp_path, {"epoch_index": 1, "epoch_total": 3,
+                                "segment_name": "topup_002_2407000"})
+    text = strip_ansi("\n".join(spine_lines(ctx, FULL_SPINE_LINES)))
+    assert "ep 1/3" in text
+    assert "1/?" not in text, "max_epochs is known and must be threaded through"
+
+
+def test_epoch_zero_still_renders_as_epoch_zero(tmp_path):
+    """The fix must not overcorrect a genuine first epoch into the final stage."""
+    ctx = _phase_ctx(tmp_path, {"epoch_index": 0, "epoch_total": 3, "segment_name": "baseline"})
+    text = strip_ansi("\n".join(spine_lines(ctx, FULL_SPINE_LINES)))
+    assert "ep 0/3" in text
+
+
+def test_run_health_badge_names_its_unit_so_it_cannot_read_as_a_window_count(tmp_path):
+    """`✗ BAD 3` sat directly above a window table listing 4 BAD windows, and
+    read as a contradictory count of the same thing. The badge counts run-health
+    issues from `_dashboard_decision_state` (replica finiteness, stuck traces,
+    pool, connectivity) -- never windows. Naming the unit removes the collision;
+    the health word itself stays, since that IS the run's health.
+    """
+    ctx = _phase_ctx(tmp_path, {"epoch_index": 1, "epoch_total": 3, "segment_name": "baseline"})
+    text = strip_ansi("\n".join(spine_lines(ctx, FULL_SPINE_LINES)))
+    assert "issue" in text, "the badge must say what it is counting"
