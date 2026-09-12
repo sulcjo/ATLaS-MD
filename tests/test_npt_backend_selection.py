@@ -79,6 +79,15 @@ class TestResolveNptBackend:
             resolve_npt_backend(ensemble="npt", requested="auto", run_mode="remd", boost_type="")
 
 
+def test_supported_biased_mc_boost_types_stay_in_sync_with_the_ladder():
+    """npt.SUPPORTED_BIASED_MC_BOOST_TYPES and pep_gamd.LADDER_BOOST_TYPES are
+    two literals for one concept; drift would silently drop or add NPT support."""
+    from gareus.npt import SUPPORTED_BIASED_MC_BOOST_TYPES
+    from gareus.pep_gamd import LADDER_BOOST_TYPES
+
+    assert SUPPORTED_BIASED_MC_BOOST_TYPES == LADDER_BOOST_TYPES
+
+
 class TestCountNativeBarostats:
     def _system(self, openmm):
         system = openmm.System()

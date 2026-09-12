@@ -207,6 +207,34 @@ def test_accepted_expansion_translates_molecules_about_their_centroids():
         assert np.max(np.abs(d1 - d0)) < 1e-12
 
 
+def test_triclinic_box_is_scaled_isotropically():
+    adapter = VolumeStubAdapter()
+    system = _rigid_molecule_system()
+    integ = openmm.VerletIntegrator(0.001 * unit.picoseconds)
+    ctx = openmm.Context(system, integ, openmm.Platform.getPlatformByName("Reference"))
+    ctx.setPositions(_positions(system, np.random.default_rng(7)))
+    triclinic = (openmm.Vec3(2.0, 0.0, 0.0), openmm.Vec3(0.4, 1.9, 0.0),
+                 openmm.Vec3(0.2, 0.3, 1.8))
+    ctx.setPeriodicBoxVectors(*triclinic)
+    ctrl = BiasedMCBarostatController.initialize(
+        ctx, adapter, pressure_bar=0.0, temperature_k=300.0,
+        frequency_steps=10, volume_step_fraction=0.05, seed=3)
+    pos0, box0 = _snapshot_state(ctx)
+    v0 = abs(np.linalg.det(box0))
+    res = None
+    for step in range(10, 400, 10):
+        res = ctrl.attempt_due(step)
+        if res.accepted and res.proposed_volume_nm3 > res.old_volume_nm3:
+            break
+    assert res is not None and res.accepted
+    _pos1, box1 = _snapshot_state(ctx)
+    s = (res.proposed_volume_nm3 / v0) ** (1.0 / 3.0)
+    assert np.allclose(box1, s * box0, rtol=0, atol=1e-12), (
+        "every component of the triclinic box must scale by the same factor"
+    )
+    assert abs(np.linalg.det(box1)) == pytest.approx(res.proposed_volume_nm3, rel=1e-9)
+
+
 def test_one_snapshot_per_trial_used_for_both_endpoints():
     adapter = VolumeStubAdapter(physical=lambda v: 3.0 * v)
     ctx, ctrl = _make_controller(_rigid_molecule_system(), adapter)
