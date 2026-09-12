@@ -162,7 +162,7 @@ def _add_cv_args(p: argparse.ArgumentParser) -> None:
                    default="fixed")
     p.add_argument("--cv2-k-min", type=float, default=0.0,
                    help="Min adaptive CV2 k. 0 = no lower clamp.")
-    p.add_argument("--cv2-k-max", type=float, default=500.0,
+    p.add_argument("--cv2-k-max", type=float, default=1000.0,
                    help="Max adaptive CV2 k.")
     p.add_argument("--cv2-adaptive-overlap-sigma", type=float, default=0.0,
                    help="Overlap-sigma for spacing-derived CV2 k. 0 = reuse cv1 value.")
@@ -1035,7 +1035,7 @@ def _shim_cv1_legacy_names(args: argparse.Namespace) -> None:
     args.contact_adaptive_target_spacing = _cv1_spacing if _cv1_spacing > 0 else 0.15
     args.contact_adaptive_default_k_kcal = _cv1_k_def if _cv1_k_def > 0 else 25.0
     args.contact_adaptive_min_k_kcal = _cv1_k_min if _cv1_k_min > 0 else 5.0
-    args.contact_adaptive_max_k_kcal = _cv1_k_max if _cv1_k_max > 0 else 120.0
+    args.contact_adaptive_max_k_kcal = _cv1_k_max if _cv1_k_max > 0 else 1000.0
     args.contact_adaptive_k_mode = _cv1_k_mode
     args.contact_adaptive_overlap_sigma = _cv1_sigma
     # boundary pull replaces old autocalibration — no compat shims needed
