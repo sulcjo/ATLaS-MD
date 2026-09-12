@@ -2,167 +2,358 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>GENPEPT r7 CV census — figures</title>
+<title>GENPEPT r7 → rep3 CV campaign — master figure index</title>
 <style>
-  body { font-family: system-ui, sans-serif; margin: 2em; background: #fafafa; color: #222; }
-  h1 { font-size: 1.3em; }
-  fig { margin: 2em 0; background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 1em; }
-  img { max-width: 100%; display: block; margin: 0.5em auto; }
-  figcaption { font-size: 0.95em; color: #555; }
-  .path { font-family: monospace; font-size: 0.8em; color: #999; }
+  body { font-family: system-ui, sans-serif; margin: 0; background: #f6f6f4; color: #1d1d1b; }
+  main { max-width: 1120px; margin: 0 auto; background: #fff; padding: 2em 2.6em 4em; box-shadow: 0 0 16px #ddd; }
+  h1 { font-size: 1.45em; margin-bottom: .2em; }
+  h2 { border-bottom: 2px solid #2c5f8a; color: #2c5f8a; margin-top: 2em; font-size: 1.15em; }
+  .lede { color: #555; max-width: 1000px; }
+  figure { margin: 1.6em 0; background: #fbfbfb; border: 1px solid #ddd; border-radius: 6px; padding: .9em; }
+  img { max-width: 100%; display: block; margin: 0 auto; }
+  figcaption { font-size: .9em; color: #333; margin-top: .5em; }
+  .why { display: block; color: #666; font-size: .82em; margin-top: .3em; }
+  .path { font-family: ui-monospace, monospace; font-size: .75em; color: #999; margin-top: .4em; display: block; }
+  a { color: #2c5f8a; }
+  .toc { background: #eef3f7; border: 1px solid #d5e0e8; border-radius: 6px; padding: .8em 1.2em; font-size: .92em; }
+  .toc ol { margin: .3em 0 0 1.2em; padding: 0; }
+  video { max-width: 70%; display: block; margin: 0 auto; }
 </style>
 </head>
 <body>
-<h1>GENPEPT r7 seed bank — CV census figures</h1>
-<p><b>Full compiled report: <a href="../GENPEPT_R7_CV_CAMPAIGN_REPORT.html">GENPEPT_R7_CV_CAMPAIGN_REPORT.html</a></b></p>
-<p>Dataset: 1,970 survivors, 298 CVs. Report: <a href="../README.md">README.md</a> ·
-   tables: <a href="../report_tables.txt">report_tables.txt</a> ·
-   CV2 note: <a href="../CV2_DEEPDIVE.md">CV2_DEEPDIVE.md</a></p>
+<main>
+<h1>GENPEPT r7 → rep3 CV campaign — master figure index</h1>
+<p class="lede">Every panel below shows data from one of the four seed banks measured this campaign:
+<strong>r7</strong> (1,970 survivors, seed 12345), <strong>rep2</strong> (1,984, seed 54321, identical params),
+<strong>rep3_massive</strong> (10,019, seed 777001, 5× scaled), or chignolin_6's production MD.
+The compiled, fully-narrated report with all tables is
+<a href="../GENPEPT_R7_CV_CAMPAIGN_REPORT.html"><strong>GENPEPT_R7_CV_CAMPAIGN_REPORT.html</strong></a>.
+Final verdict: <code>CV1 = backbone-heavy (N,CA,C,O) logistic contacts, r₀=10 Å, sep≥4, β=3, atom-pairs, normalized</code>;
+<code>CV2 = plain torsion PC2 of this bank, persisted as eigenvector data</code>.</p>
+
+<div class="toc"><b>Sections</b>
+<ol>
+<li><a href="#census">The 298-CV census on r7</a></li>
+<li><a href="#cv2">CV2 deep dive: PCA, residualization, diffusion content</a></li>
+<li><a href="#v2">v2 pseudo-FES map family on the new CV winners</a></li>
+<li><a href="#math">Manifold mathematics: diffusion maps, TwoNN, Fourier</a></li>
+<li><a href="#turn">The physical turn axis</a></li>
+<li><a href="#pairs">Alternative orthogonal pairs (60 scored)</a></li>
+<li><a href="#dynamics">Decision dynamics + rigor pack</a></li>
+<li><a href="#therm">Residual motion in context: mechanism &amp; thermodynamics</a></li>
+<li><a href="#rep2">Bank-to-bank reproducibility (rep2)</a></li>
+<li><a href="#rep3">rep3_massive: ≥10,000 seeds — pseudo-FES, folded state, full battery</a></li>
+<li><a href="#energy">GBn2 energy-term behavior on the landscapes</a></li>
+<li><a href="#morph">Structure animations</a></li>
+</ol></div>
+
+<h2 id="census">1. The 298-CV census on r7</h2>
+<p class="lede">Every contact-CV parameterization (5 atom selections × seps 2/3/4 × 14 (r₀,β) sets, residue-balanced,
+rational switches, strand packing) plus 100+ geometric/torsion/SASA/reference descriptors, scored by spread,
+normalized entropy, bimodality, BC, and resolvable windows at the campaign k ceiling. Winner: bb r₀=10. The legacy
+default (r₀=4.5, β=6) is verifiably degenerate. Redundancy: residue-balanced = atom-pairs; Rg = contacts; H-bond
+counters dead on implicit banks. <em>Note: genpept_r7_cv_* figures use the full extended census.</em></p>
+
+<figure><img src="genpept_r7_cv_histograms.png"></figure>
+<figcaption><b>Census distributions</b> — 28 representative CVs with median/IQR/entropy titles.
+<span class="why">Read: legacy def collapsed near 0 (first row) vs champion shapes with wide mid-range support.</span></figcaption>
+
+<figure><img src="genpept_r7_cv_corr.png"></figure>
+<figcaption><b>Clustered redundancy map</b> — clustered |Pearson r| of representative CVs.
+<span class="why">Read: bright blocks are the same coordinate measured twice (resbal vs atom-pairs; Rg vs mid-r₀ contacts).</span></figcaption>
+
+<figure><img src="genpept_r7_cv_2dmaps.png"></figure>
+<figcaption><b>CV1 × CV2 scatters</b> — contact CV1 vs residual torsion PC1 (color Rg); contact vs plain torsion PC1 (color d(Y2–W9)); Rg vs hairpin closure.
+<span class="why">Read: whether candidate pairs carry independent information at all, before any window grid was placed.</span></figcaption>
+
+<h2 id="cv2">2. CV2 deep dive: PCA, residualization, diffusion content</h2>
+<p class="lede">Bank torsion PCA (canonical interleaved sin/cos), residualization against CV1, loadings, and two
+honesty checks: the axes are <em>non-diffusive</em> on real dynamics (Hess C₁ ≈ 0.07) and do not transfer across banks.
+The residual axis is the physically interpretable one (turn/strand-ψ flip); plain PC2 became the adopted scalar for
+robustness reasons.</p>
+
+<figure><img src="cv2_loadings.png"></figure>
+<figcaption><b>Residual-PC1 loadings</b> — top torsion coefficients (PETGT turn / strand ψ region) and the flat EVR spectrum.</figcaption>
+
+<figure><img src="cv2_diffusion_content.png"></figure>
+<figcaption><b>Diffusion content (Hess C₁)</b> — bank axes on 32 epoch-0 traces: no diffusive component (C₁ ≈ 0.07, &lt;0.5 criterion).
+<span class="why">Meaning: these CVs spread the window grid, they are not slow-motion coordinates; slow CV2 must come from dynamics (tICA).</span></figcaption>
+
+<figure><img src="cv2_joint_maps.png"></figure>
+<figcaption><b>16×8 joint maps</b> — bank + chignolin_6 ensemble joint coverage of candidate CV1 × CV2 grids: 94–100% occupied.</figcaption>
+
+<h2 id="v2">3. v2 pseudo-FES map family on the new winners</h2>
+<p class="lede">The earlier parameter-test layouts, regenerated for the champion definitions (backbone-heavy and
+CA-only at r₀=10 Å). Grey contours are the bank seed-density pseudo-FES (search density — not equilibrium).</p>
+
+<figure><img src="r7v2_contact_beta_pseudofes.png"></figure>
+<figcaption><b>β-scan pseudo-FES</b> — heavy r₀12 vs bb r₀10 vs CA r₀10; spread-vs-β panels (β saturates past ~3).</figcaption>
+
+<figure><img src="r7v2_combo_map_bb_beta3.png"></figure>
+<figcaption><b>Combo map — backbone-heavy</b> — sep × midpoint grid on the Rg/E2E base map.</figcaption>
+
+<figure><img src="r7v2_combo_map_ca_beta3.png"></figure>
+<figcaption><b>Combo map — CA-only</b> — same grid; CA's balance at r₀=10–12 is what makes it the cheap co-champion.</figcaption>
+
+<figure><img src="r7v2_pseudofes_cv_bb_beta3_r0_10_r4.png"></figure>
+<figcaption><b>The winner CV1 on the bank map</b> — backbone-heavy r₀10 β3: determines window placement vs Rg/E2E coverage.</figcaption>
+
+<figure><img src="r7v2_pseudofes_cv_ca_beta3_r0_10_r4.png"></figure>
+<figcaption><b>CA-variant <span class="why">(cheap variant of the same map).</span></b></figcaption>
+
+<figure><img src="r7v2_pseudofes_residual_torsion_pca_cv2.png"></figure>
+<figcaption><b>Residual torsion-PCA CV2</b> — the orthogonal register-flip coordinate over the same map.</figcaption>
+
+<figure><img src="r7v2_midpoint_scan_bb_r4.png"></figure>
+<figcaption><b>Midpoint × β scan, backbone-heavy (r≥4)</b> — the entropy plateau at r₀ 8–12 Å; saturation at 14 Å.</figcaption>
+
+<figure><img src="r7v2_midpoint_scan_ca_r4.png"></figure>
+<figcaption><b>Same scan, CA-only.</b></figcaption>
+
+<h2 id="math">4. Manifold mathematics: diffusion maps, TwoNN, Fourier</h2>
+<p class="lede">Nonlinear machinery instead of hand-picked distances: diffusion-map spectra on two metrics,
+intrinsic dimension (TwoNN), circular Fourier harmonics per torsion, winding signal scan with a permutation null,
+and Fisher–Lee circular correlations. Findings: CV1 = the bank's first diffusion coordinate (LASSO R² 0.985);
+the manifold is ~4-D; interior ψ are bimodal (the curl); no other periodic signals.</p>
+
+<figure><img src="cv_diffmap_spectra_maps.png"></figure>
+<figcaption><b>Diffusion-map spectra + ψ₁×ψ₂ maps</b> — first manifold coordinate = CV1 family on both metrics.</figcaption>
+
+<figure><img src="cv_twonn_id.png"></figure>
+<figcaption><b>TwoNN intrinsic dimension</b> — d ≈ 3.6 (torsion) / 4.6 (CA-dRMSD): a 2-D grid is a cover, not a parameterization.</figcaption>
+
+<figure><img src="cv_fourier_harmonics_corrmatrix.png"></figure>
+<figcaption><b>Circular Fourier harmonics (R1–R4) + Fisher–Lee correlations</b> — the ψ-bimodality signal; intra-residue φ–ψ dominates.</figcaption>
+
+<figure><img src="cv_fourier_winding.png"></figure>
+<figcaption><b>Winding along ordered coordinates</b> — nothing above the permutation-null line: no hidden periodic pumps.</figcaption>
+
+<h2 id="turn">5. The physical turn axis</h2>
+<figure><img src="cv2_turn_axis.png"></figure>
+<figcaption><b>Per-residue Ramachandran colored by residual CV2 + rotations</b> — the axis is a strand-flank curl
+(ψ Y2/P4/E5/T6/T8/W9 flip −63..−163°, D3 pinned) at matched compaction, tightening the turn.</figcaption>
+
+<h2 id="pairs">6. Alternative orthogonal pairs (60 scored)</h2>
+<figure><img src="cv_orthogonal_pairs_top.png"></figure>
+<figcaption><b>Top alternative CV1 × CV2 pairs</b> — independence, occupancy, conditional spread; negative controls sink to zero.
+<span class="why">Verdict: champion stands (bb r₀10 × residual PC1); plain torsion PC2 = robust fallback (now the adopted one).</span></figcaption>
+
+<h2 id="dynamics">7. Decision dynamics + rigor pack</h2>
+<p class="lede">Bank-side results needed the three gates: production-frame coverage transfer, gradient steerability,
+and bootstrap/provenance bookkeeping. All three pass for the winners; the legacy def fails gate 2 (gradient dead-zone).</p>
+
+<figure><img src="cv_dynamics_cv1_validation.png"></figure>
+<figcaption><b>CV1 candidates on solvated MD</b> — pooled coverage vs bank (0.92 intact), per-replica decorrelation τ₁/₂ ≈ 0.2 ns.</figcaption>
+
+<figure><img src="cv_steerability.png"></figure>
+<figcaption><b>Steering force |∂CV/∂x|</b> — winners non-degenerate across their own range; legacy def has a real dead-zone (7.7% of its own band).</figcaption>
+
+<figure><img src="cv_mi_states_energy.png"></figure>
+<figcaption><b>MI table + 6-state curl ladder + full-bank GBn2 components</b> — MI excess ≤ 0.12 for clean CV2s;
+the "continuous" curl is actually a discrete 6-state ladder from all-extended to all-curled.</figcaption>
+
+<figure><img src="cv_fourier_winding_traces.png"></figure>
+<figcaption><b>Top winding traces</b> — the strongest candidates under the null scan; none significant.</figcaption>
+
+<h2 id="therm">8. The residual motion, in mechanism + thermodynamic context</h2>
+<figure><img src="cv2_thermo_dssp_energy.png"></figure>
+<figcaption><b>4-panel context</b> — DSSP along the axis (all-coil → helix nuclei at curled end, no DSSP strand),
+GBn2 flat-total-with-compensated-components decomposition (echoing published native≈misfolded near-degeneracy),
+solvation trends. Matches the literature's turn-driven folding mechanism (Enemark; Sobieraj–Setny on CLN025;
+Maruyama's T6–T8 π-turn; Amado's Y2–W9).</figcaption>
+
+<h2 id="rep2">9. Bank-to-bank reproducibility (rep2)</h2>
+<figure><img src="cv_rep2_comparison.png"></figure>
+<figcaption><b>r7 vs rep2 headline CVs</b> — identical rankings and window ceilings; small median shifts only.</figcaption>
+
+<figure><img src="cv_rep2_axis_agreement.png"></figure>
+<figcaption><b>Axis agreement between independent banks</b> — PC1 transfers (|cos| 0.965); PC2 (0.523) and residual (0.453) do not.</figcaption>
+
+<figure><img src="cv_rep2_common_axis.png"></figure>
+<figcaption><b>Common-axis projections + 6-state ladder textures</b> — states reproduce to ~15° per torsion; composition nearly identical.</figcaption>
+
+<figure><img src="cv_rep2_stage_counts.png"></figure>
+<figcaption><b>Pipeline stage counts</b> — same funnel on both banks (99.8% implicit success; 472 vs 480 BH minima; 1,970 vs 1,984 survivors).</figcaption>
+
+<h2 id="rep3">10. rep3_massive: ≥10,000 seeds</h2>
+<p class="lede">A 5× scaled bank (800k proposals; config seed 777001) to test everything at density:
+same funnel at scale, full pseudo-FES suite, a native-reference (1UAO) proximity audit, and the complete campaign battery re-run.</p>
+
+<figure><img src="cv_rep3massive_pseudofes.png"></figure>
+<figcaption><b>rep3 pseudo-FES maps</b> — CV1×PC2, Rg×E2E, CV1×PC1 on 10,019 seeds (search-density FES).</figcaption>
+
+<figure><img src="cv_rep3_massive_folded_proximity.png"></figure>
+<figcaption><b>rep3 folded-state audit</b> — RMSD to the 1UAO ensemble (best 1.16 Å), native-pair FES with the ensemble marked, near-native seeds in the working CV space.</figcaption>
+
+<figure><img src="cv_r7_folded_proximity.png"></figure>
+<figcaption><b>r7 folded-state audit (same panels)</b> — best 1.64 Å; proximity gradient scales with bank size.</figcaption>
+
+<figure><img src="cv_rep3_histograms.png"></figure>
+<figcaption><b>rep3: 30 head CV distributions</b> — the 298-CV census shapes at 10k density.</figcaption>
+
+<figure><img src="cv_rep3_joint_maps.png"></figure>
+<figcaption><b>rep3: CV1×CV2 joint maps</b> — window-grid feasibility with conditional spread intact.</figcaption>
+
+<figure><img src="cv_rep3_corr.png"></figure>
+<figcaption><b>rep3 redundancy map (top 55)</b> — clustered |r|; same redundancy structure as r7.</figcaption>
+
+<figure><img src="cv_rep3_advanced.png"></figure>
+<figcaption><b>rep3 advanced battery</b> — KDE macro-states, harmonics, dmap spectra, MI, axis stability
+(half-bank median |cos| up to 0.998/0.994/0.943 min — at 10k density even the residual axis becomes robust), decomposition.</figcaption>
+
+<figure><img src="cv_rep3_energy_vs_cv2.png"></figure>
+<figcaption><b>rep3: group-corrected GBn2 decomposition vs CV2</b> — bond/angle/torsion/nonbonded/GB vs register flip.</figcaption>
+
+<h2 id="energy">11. GBn2 energy-term behavior on the landscapes</h2>
+<figure><img src="cv_rep3_energy_term_maps.png"></figure>
+<figcaption><b>Per-term mean-value maps</b> — 3 coordinate pairs × 6 terms: compaction is a packing-vs-solvation trade
+(nonbonded −140 vs GB +95 kJ/mol per CV unit, total only −20); CV2's flip is flat on every term.</figcaption>
+
+<figure><img src="cv_rep3_energy_term_trends.png"></figure>
+<figcaption><b>Per-term trend curves with SEM</b> — slopes with bootstrap CIs along CV1 / CV2 / Rg / E2E.</figcaption>
+
+<figure><img src="cv_rep3_energy_compensation.png"></figure>
+<figcaption><b>Compensation + state composition + near-native signature</b> — partial-term correlations; the fold registers
+as architectural rigidity (+6 angle/+6 torsion strain, permutation p ≤ 0.036) partially canceled by packing, not an energy well.</figcaption>
+
+<h2 id="morph">12. Structure animations along the orthogonal CV2 candidates</h2>
+<p class="lede">96-frame geometric morphs (backbone-aligned, smoothstep interpolation) between the low and high
+extremes of each candidate axis, constrained to ±0.02–0.035 of the median compaction (bb r₀10 β3) — so the panel
+shows motion along the candidate at ~constant CV1. Interpolation between bank seeds — not molecular dynamics.
+Populated-density realism: the original curl morph stays within kNN density for ~86% of frames.</p>
 
 <figure>
-  <img src="genpept_r7_cv_histograms.png" alt="CV histograms">
-  <figcaption><b>1. Representative CV distributions</b> — 28 panels; titles carry median / IQR / normalized entropy. Top-left block: contact CVs incl. legacy (collapsed, top-left) vs new winners.</figcaption>
-  <div class="path">figures/genpept_r7_cv_histograms.png</div>
+<video controls muted src="r7v2_residual_torsion_cv2_geometric_morph.mp4"></video>
+<figcaption><b>Residual torsion CV2 (original champion)</b> — seeds 73 → 1259, CV2 −2.00 → +1.98 at CV1 ≈ 0.49.
+<span class="path">figures/r7v2_residual_torsion_cv2_geometric_morph.{mp4,pdb,json} (+ geodesic path PDB)</span></figcaption>
 </figure>
 
 <figure>
-  <img src="genpept_r7_cv_corr.png" alt="CV correlation heatmap">
-  <figcaption><b>2. Clustered |Pearson r| redundancy map</b> — representative CVs; bright blocks = redundant groups (resbal vs atom-pairs; Rg vs contacts).</figcaption>
-  <div class="path">figures/genpept_r7_cv_corr.png</div>
+<video controls muted src="r7v2_morph_torpca_pc2.mp4"></video>
+<figcaption><b>Plain torsion PC2 — the adopted CV2 scalar</b> — register/curl flip including the D3 anchor
+(unlike the residual axis, which pins it); orthogonal without residualization.
+<span class="path">figures/r7v2_morph_torpca_pc2.{mp4,pdb,_preview.png}</span></figcaption>
 </figure>
 
 <figure>
-  <img src="genpept_r7_cv_2dmaps.png" alt="CV 2D scatter maps">
-  <figcaption><b>3. CV1 × CV2 scatters</b> — contact CV1 vs residual torsion PC1 (color Rg); contact vs plain torsion PC1 (color d(Y2–W9)); Rg vs hairpin closure ratio (color contact CV1).</figcaption>
-  <div class="path">figures/genpept_r7_cv_2dmaps.png</div>
+<video controls muted src="r7v2_morph_acylindricity.mp4"></video>
+<figcaption><b>Acylindricity (pure shape CV2)</b> — ends symmetric around touching: a rod → globule shape readout,
+entirely torsion-free.</figcaption>
 </figure>
 
 <figure>
-  <img src="cv2_loadings.png" alt="CV2 loadings">
-  <figcaption><b>4. Residual-PC1 loadings + spectrum</b> — the axis is the PETGT turn / strand ψ flip (cos ψ P4, W9, D3…); flat EVR spectrum (PC1 ≈ 9.7%).</figcaption>
-  <div class="path">figures/cv2_loadings.png</div>
+<video controls muted src="r7v2_morph_chirality_ca.mp4"></video>
+<figcaption><b>Hairpin handedness (chirality)</b> — signed volume of the CA scaffold: a true left ↔ right
+hairpin flip (−675.7 → +647.1 mÅ³); an orientation, not a compaction, coordinate.</figcaption>
 </figure>
 
 <figure>
-  <img src="cv2_diffusion_content.png" alt="CV2 diffusion content">
-  <figcaption><b>5. Diffusion content (Hess C₁)</b> — bank plain/residual PC1 projections sit at C₁ ≈ 0.07 (red line = 0.5 diffusion criterion); trace-own PC1 median 0.39. Bank axes are diversity coordinates, not slow-motion coordinates.</figcaption>
-  <div class="path">figures/cv2_diffusion_content.png</div>
+<video controls muted src="r7v2_morph_hairpin_closure_ratio.mp4"></video>
+<figcaption><b>Hairpin closure ratio d(Y2–W9)/d(G1–G10)</b> — 0.58 → 1.83: strand-to-strand opening vs overall
+extension; the most-independent geometric axis vs contact CVs from the pair table.</figcaption>
+</figure>
+
+<h2 id="pipeline-now">13. What GENPEPT is doing now — pipeline and thermodynamic layer</h2>
+
+<figure>
+<img src="genpept_pipeline_now.png" alt="GENPEPT pipeline diagram">
+<figcaption><b>The current pipeline</b> — stages (blue), the six universal tunings T1–T6 wired at their
+points (orange), and the production funnel counts of the rep4 run (green):
+800k proposals → 12,000 candidates → 11,935 implicit minima → 1,132 BH minima (+9,536 NMA) → 9,745 survivors.
+<span class="why">Every number re-derived during the adversarial audit; see the
+"genpept-now" section of the compiled report.</span>
+<span class="path">GENPEPT_R7_CV_CENSUS_REPORT/figures/genpept_pipeline_now.png</span></figcaption>
 </figure>
 
 <figure>
-  <img src="cv2_joint_maps.png" alt="CV2 joint maps">
-  <figcaption><b>6. CV1 × CV2 16×8 joint maps</b> — log₁₀ counts; titles give occupancy (94–100%) and per-CV1-bin CV2 IQR. Grid placement for the window campaign is well-founded.</figcaption>
-  <div class="path">figures/cv2_joint_maps.png</div>
+<img src="genpept_thermo_layer.png" alt="thermodynamic measurement layer">
+<figcaption><b>The thermodynamic measurement layer</b> — post-processing on the bank, no pipeline change:
+T1-weight de-biasing → Boltzmann + basin-multiplicity weighting → a starting FES for window
+initialization, with a consensus second solvent model bounding the systematic.
+<span class="why">THERMO_STARTING_FES.md · THERMO_CONSENSUS_MODEL.md · GUIDED_EXPANSION.md.</span>
+<span class="path">GENPEPT_R7_CV_CENSUS_REPORT/figures/genpept_thermo_layer.png</span></figcaption>
 </figure>
 
-
-<h1>v2 figures (new CV winners: backbone-heavy / CA-only, r&#8320;=10 &#197;)</h1>
-<p>Same layouts as the previous PC tests, regenerated for the census-winning definitions. Scripts: <code>scripts/genpept_r7v2_figures.py</code>, <code>scripts/genpept_r7v2_morph.py</code>.</p>
-
 <figure>
-  <img src="r7v2_contact_beta_pseudofes.png" alt="beta pseudofes v2">
-  <figcaption><b>7. &#946;-scan pseudo-FES</b> — heavy r&#8320;12 vs backbone-heavy r&#8320;10 vs CA-only r&#8320;10; spread-vs-&#946; panels.</figcaption>
-  <div class="path">figures/r7v2_contact_beta_pseudofes.png</div>
-</figure>
-<figure>
-  <img src="r7v2_combo_map_bb_beta3.png" alt="combo bb">
-  <figcaption><b>8. Combo map: backbone-heavy &#946;=3</b> — sep &#215; midpoint grid over the Rg/E2E pseudo-FES base.</figcaption>
-  <div class="path">figures/r7v2_combo_map_bb_beta3.png</div>
-</figure>
-<figure>
-  <img src="r7v2_combo_map_ca_beta3.png" alt="combo ca">
-  <figcaption><b>9. Combo map: CA-only &#946;=3</b></figcaption>
-  <div class="path">figures/r7v2_combo_map_ca_beta3.png</div>
-</figure>
-<figure>
-  <img src="r7v2_midpoint_scan_bb_r4.png" alt="midpoints bb">
-  <figcaption><b>10. Midpoint &#215; &#946; scan, backbone-heavy r&#8805;4</b> — r&#8320; 6–12 &#197;.</figcaption>
-  <div class="path">figures/r7v2_midpoint_scan_bb_r4.png</div>
-</figure>
-<figure>
-  <img src="r7v2_midpoint_scan_ca_r4.png" alt="midpoints ca">
-  <figcaption><b>11. Midpoint &#215; &#946; scan, CA-only r&#8805;4</b></figcaption>
-  <div class="path">figures/r7v2_midpoint_scan_ca_r4.png</div>
-</figure>
-<figure>
-  <img src="r7v2_pseudofes_cv_bb_beta3_r0_10_r4.png" alt="winner map bb">
-  <figcaption><b>12. pseudo-FES colored by winner CV1 (bb, r&#8320;10, &#946;3)</b></figcaption>
-  <div class="path">figures/r7v2_pseudofes_cv_bb_beta3_r0_10_r4.png</div>
-</figure>
-<figure>
-  <img src="r7v2_pseudofes_cv_ca_beta3_r0_10_r4.png" alt="winner map ca">
-  <figcaption><b>13. pseudo-FES colored by candidate CV1 (CA-only, r&#8320;10, &#946;3)</b></figcaption>
-  <div class="path">figures/r7v2_pseudofes_cv_ca_beta3_r0_10_r4.png</div>
-</figure>
-<figure>
-  <img src="r7v2_pseudofes_residual_torsion_pca_cv2.png" alt="res pca map">
-  <figcaption><b>14. pseudo-FES colored by residual torsion-PCA CV2 (component=5, residualized on bb r&#8320;10)</b></figcaption>
-  <div class="path">figures/r7v2_pseudofes_residual_torsion_pca_cv2.png</div>
-</figure>
-<figure>
-  <video controls muted width="70%"><source src="r7v2_residual_torsion_cv2_geometric_morph.mp4" type="video/mp4"></video>
-  <figcaption><b>15. Geometric morph along residual-PC1 CV2 at constant CV1 &#8776; 0.49</b> (seeds 73 &#8594; 1259, CV2 −2.00 &#8594; +1.98; aligned interpolation, not MD). Trajectory PDB and parameters alongside.</figcaption>
-  <div class="path">figures/r7v2_residual_torsion_cv2_geometric_morph.mp4 (+ .pdb, .json, _preview.png)</div>
+<img src="cv_rep4_fes_starting.png" alt="rep4 starting FES">
+<figcaption><b>The rep4 starting FES</b> — CV1 (bb contact fraction) × torsion PC1 under three weightings:
+raw search density, de-biased (1/w_CU), and thermodynamic (de-bias × Boltzmann). Red stars = the 31
+native-envelope seeds. The Boltzmann step deepens the landscape from ~1.7 to ~21 kcal and leaves the
+native-envelope region at ~7.6 kcal — the folded register is <em>not</em> a low-free-energy basin under
+GBn2, matching the campaign's minimizer-reach diagnosis.
+<span class="why">FES_STARTING.md · weights from the recorded T1 acceptance table + GBn2 minimized energies.</span>
+<span class="path">GENPEPT_R7_CV_CENSUS_REPORT/figures/cv_rep4_fes_starting.png</span></figcaption>
 </figure>
 
-
-<h1>advanced analyses (dmap / TwoNN / Fourier / turn axis)</h1>
-
 <figure>
-  <img src="cv_diffmap_spectra_maps.png" alt="dmap">
-  <figcaption><b>16. Diffusion maps on the bank</b> — spectra and &#968;1&#215;&#968;2 colored by contact CV1 / residual torsion PC1 (two metrics: torsion space, CA-dRMSD).</figcaption>
-  <div class="path">figures/cv_diffmap_spectra_maps.png</div>
-</figure>
-<figure>
-  <img src="cv_twonn_id.png" alt="twonn">
-  <figcaption><b>17. TwoNN intrinsic dimension</b> — d &#8776; 3.6 (torsion) / 4.6 (CA-dRMSD): the bank manifold is ~4-dimensional, a single 2-D CV pair cannot hold it.</figcaption>
-  <div class="path">figures/cv_twonn_id.png</div>
-</figure>
-<figure>
-  <img src="cv_fourier_harmonics_corrmatrix.png" alt="fourier">
-  <figcaption><b>18. Circular Fourier harmonics (R1..R4) + Fisher-Lee circular correlation matrix</b> — interior &#968; torsions are bimodal (low R1, high R2); strongest couplings are intra-residue &#966;-&#968;.</figcaption>
-  <div class="path">figures/cv_fourier_harmonics_corrmatrix.png</div>
-</figure>
-<figure>
-  <img src="cv_fourier_winding.png" alt="winding">
-  <figcaption><b>19. Winding along ordered coordinates</b> — no significant hidden periodic pumps above the permutation null.</figcaption>
-  <div class="path">figures/cv_fourier_winding.png</div>
-</figure>
-<figure>
-  <img src="cv2_turn_axis.png" alt="turn axis">
-  <figcaption><b>20. The physical turn axis</b> — Ramachandran per residue colored by residual CV2; &#968;(flank residues) flips &#946;-extended (+140&#176;) &#8594; curl (&#8722;10&#176;) across the axis, matched at constant CV1.</figcaption>
-  <div class="path">figures/cv2_turn_axis.png</div>
+<img src="cv_rep4_fes_starting_1d.png" alt="rep4 starting FES 1D profile">
+<figcaption><b>1-D profile along CV1</b> — raw vs thermodynamic F(CV1), and the per-bin shift:
+thermodynamics raises high-energy bins by up to ~20 kcal/mol while leaving the deep bins nearly
+untouched (min shift −0.3).
+<span class="path">GENPEPT_R7_CV_CENSUS_REPORT/figures/cv_rep4_fes_starting_1d.png</span></figcaption>
 </figure>
 
-
 <figure>
-  <img src="cv_orthogonal_pairs_top.png" alt="orthogonal pairs">
-  <figcaption><b>21. Top alternative orthogonal CV1×CV2 pairs</b> — scored on |r|, joint occupancy, conditional CV2 spread; negative controls sink to zero.</figcaption>
-  <div class="path">figures/cv_orthogonal_pairs_top.png</div>
+<img src="cv_rep4_fes_heavy_rg.png" alt="heavy contacts x Rg starting FES">
+<figcaption><b>Starting FES on heavy contacts × Rg</b> — the earlier swarm-side parameterization
+(all-heavy, r₀=12 Å, β=3) against heavy-atom Rg, under the three weightings (raw / de-biased /
+thermodynamic). Red stars = native-envelope seeds (median Rg 5.68 A, median heavy CV1 0.857 —
+they sit in the compact, contact-rich corner of the thermo map).
+<span class="why">FES_HEAVY_RG.md.</span>
+<span class="path">GENPEPT_R7_CV_CENSUS_REPORT/figures/cv_rep4_fes_heavy_rg.png</span></figcaption>
 </figure>
 
+<figure>
+<img src="cv_rep4_fes_heavy_rg_1d.png" alt="heavy-CV1 x Rg 1D profiles">
+<figcaption><b>1-D profiles along heavy CV1 and Rg</b> — raw vs thermodynamic:
+the Boltzmann weighting deepens both marginals to ~21 kcal and places the thermo minimum at
+heavy CV1 ≈ 0.78 / Rg ≈ 5.8 A — compact, contact-rich conformers, as GBn2 sees them.
+<span class="path">GENPEPT_R7_CV_CENSUS_REPORT/figures/cv_rep4_fes_heavy_rg_1d.png</span></figcaption>
+</figure>
 
 <figure>
-  <img src="cv_dynamics_cv1_validation.png" alt="dynamics validation">
-  <figcaption><b>22. CV1 candidates on solvated MD</b> — pooled coverage vs bank, per-replica decorrelation times.</figcaption>
-  <div class="path">figures/cv_dynamics_cv1_validation.png</div>
+<img src="cv_rep4_closest_to_native.png" alt="closest rep4 seeds overlaid on folded chignolin">
+<figcaption><b>Closest bank seeds vs folded chignolin (all-atom)</b> — the top 6 rep4 survivors by min
+CA-RMSD to the 18-model 1UAO ensemble, each CA-aligned onto its closest native model and overlaid
+fully atomistically: native heavy atoms as red spheres/sticks, seed as blue sticks (45% transparent).
+Best 1.18 A (model 8), through 1.43 A — near-native hairpin geometry is in the bank; what the
+envelope census showed is that it is a thin tail, not a stabilized basin.
+<span class="why">CLOSEST_SEEDS.md.</span>
+<span class="path">GENPEPT_R7_CV_CENSUS_REPORT/figures/cv_rep4_closest_to_native.png</span></figcaption>
 </figure>
+
 <figure>
-  <img src="cv_steerability.png" alt="steerability">
-  <figcaption><b>23. Steering force |∂CV/∂x| across each CV's own range</b> — legacy def shows a genuine gradient dead-zone.</figcaption>
-  <div class="path">figures/cv_steerability.png</div>
+<img src="cv_rep5_fes_heavy_rg.png" alt="rep5 T7 starting FES">
+<figcaption><b>rep5 (T7) starting FES — heavy contacts × Rg</b> — the T7 bank under the three
+weightings. The 39 native-envelope seeds (red stars) reach 4.1 kcal on the thermo map, materially
+closer to the minimum than rep4's envelope position; thermo minimum tightens to CV1 0.77 / Rg 5.69 A.
+<span class="why">FES_STARTING_REP5.md.</span>
+<span class="path">GENPEPT_R7_CV_CENSUS_REPORT/figures/cv_rep5_fes_heavy_rg.png</span></figcaption>
 </figure>
+
 <figure>
-  <img src="cv_mi_states_energy.png" alt="mi states energy">
-  <figcaption><b>24. MI table, 6-state curl ladder, full-bank GBn2 components vs CV2</b></figcaption>
-  <div class="path">figures/cv_mi_states_energy.png</div>
+<img src="cv_rep5_fes_vs_rep4.png" alt="rep4 vs rep5 FES comparison">
+<figcaption><b>rep4 vs rep5 (T7) thermo comparison</b> — 1-D profiles along heavy CV1 and Rg, and the
+bin-wise thermo-FES difference (red stars = envelope seeds; the ±15 kcal extremes live in the sparse
+tails, the dense region shifts little).
+<span class="path">GENPEPT_R7_CV_CENSUS_REPORT/figures/cv_rep5_fes_vs_rep4.png</span></figcaption>
+</figure>
+
+</main>
+
+<figure>
+  <img src="cv_rep3_solvation_axis.png" alt="solvation axis">
+  <figcaption><b>40. Solvation as a CV axis</b> — gb_solvation (electrostatic) is nearly orthogonal to every other axis
+  (|&rho;| &le; 0.27, 100% joint-grid occupancy with CV1); native 1UAO sits at the bank's gb median;
+  SASA total is just compaction; near-native seeds carry no gb well.</figcaption>
+  <div class="path">figures/cv_rep3_solvation_axis.png</div>
 </figure>
 
 
 <figure>
-  <img src="cv2_plain_pc2.png" alt="plain PC2">
-  <figcaption><b>25. Designated CV2 scalar: plain torsion PC2</b> — loadings, joint map vs CV1, diffusion C&#8321; on epoch-0 traces.</figcaption>
-  <div class="path">figures/cv2_plain_pc2.png</div>
+  <img src="cv_rep4_vs_rep3.png" alt="rep4 vs rep3">
+  <figcaption><b>41. rep4 (6 tuning mechanisms implemented) vs rep3 (legacy bias)</b> — CVs, SASA, mirror, RMSD: process fixed, folded yield unchanged.</figcaption>
+  <div class="path">figures/cv_rep4_vs_rep3.png</div>
 </figure>
 
 </body>

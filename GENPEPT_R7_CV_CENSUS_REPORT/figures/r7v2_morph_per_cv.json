@@ -1,0 +1,34 @@
+{
+ "torpca_pc2": {
+  "low_index": 123,
+  "high_index": 1219,
+  "cv1_low": 0.4965268969535827,
+  "cv1_high": 0.4679359197616577,
+  "axis_low": -2.425014,
+  "axis_high": 2.2663486
+ },
+ "acylindricity": {
+  "low_index": 780,
+  "high_index": 677,
+  "cv1_low": 0.489839643239975,
+  "cv1_high": 0.4998778402805328,
+  "axis_low": 0.0010149180889129,
+  "axis_high": 0.1389963030815124
+ },
+ "chirality_ca": {
+  "low_index": 1192,
+  "high_index": 123,
+  "cv1_low": 0.4538208246231079,
+  "cv1_high": 0.4965268969535827,
+  "axis_low": -675.6870727539062,
+  "axis_high": 647.0819091796875
+ },
+ "hairpin_closure_ratio": {
+  "low_index": 32,
+  "high_index": 703,
+  "cv1_low": 0.5151205658912659,
+  "cv1_high": 0.4929133951663971,
+  "axis_low": 0.5762046216559812,
+  "axis_high": 1.8309007355871856
+ }
+}

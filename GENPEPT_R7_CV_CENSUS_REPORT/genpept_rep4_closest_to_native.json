@@ -1,0 +1,59 @@
+{
+ "n_seeds": 9745,
+ "top": [
+  {
+   "k": 0,
+   "seed_pdb": "/tmp/opencode/overlay_seeds/seed_0.pdb",
+   "native_pdb": "/tmp/opencode/overlay_seeds/native_0.pdb",
+   "rmsd": 0.78615403175354,
+   "model_1uao": 9,
+   "seed": "survivor_6532_basin_6885_candidate_4445_gencluster_416_conf_139572.pdb",
+   "out_png": "/tmp/opencode/overlay_seeds/panel_0.png"
+  },
+  {
+   "k": 1,
+   "seed_pdb": "/tmp/opencode/overlay_seeds/seed_1.pdb",
+   "native_pdb": "/tmp/opencode/overlay_seeds/native_1.pdb",
+   "rmsd": 1.138397216796875,
+   "model_1uao": 11,
+   "seed": "survivor_4252_basin_4432_candidate_1226_gencluster_1226_conf_038529.pdb",
+   "out_png": "/tmp/opencode/overlay_seeds/panel_1.png"
+  },
+  {
+   "k": 2,
+   "seed_pdb": "/tmp/opencode/overlay_seeds/seed_2.pdb",
+   "native_pdb": "/tmp/opencode/overlay_seeds/native_2.pdb",
+   "rmsd": 1.1769057512283325,
+   "model_1uao": 3,
+   "seed": "survivor_6113_basin_6433_candidate_532_gencluster_532_conf_404038.pdb",
+   "out_png": "/tmp/opencode/overlay_seeds/panel_2.png"
+  },
+  {
+   "k": 3,
+   "seed_pdb": "/tmp/opencode/overlay_seeds/seed_3.pdb",
+   "native_pdb": "/tmp/opencode/overlay_seeds/native_3.pdb",
+   "rmsd": 1.2422473430633545,
+   "model_1uao": 18,
+   "seed": "survivor_6012_basin_6326_explore_r01_hit_0065_conf_133762.pdb",
+   "out_png": "/tmp/opencode/overlay_seeds/panel_3.png"
+  },
+  {
+   "k": 4,
+   "seed_pdb": "/tmp/opencode/overlay_seeds/seed_4.pdb",
+   "native_pdb": "/tmp/opencode/overlay_seeds/native_4.pdb",
+   "rmsd": 1.291086196899414,
+   "model_1uao": 18,
+   "seed": "survivor_1544_basin_1600_candidate_4448_gencluster_419_conf_397204.pdb",
+   "out_png": "/tmp/opencode/overlay_seeds/panel_4.png"
+  },
+  {
+   "k": 5,
+   "seed_pdb": "/tmp/opencode/overlay_seeds/seed_5.pdb",
+   "native_pdb": "/tmp/opencode/overlay_seeds/native_5.pdb",
+   "rmsd": 1.356026530265808,
+   "model_1uao": 13,
+   "seed": "survivor_4453_basin_4643_candidate_5050_gencluster_1038_conf_424237.pdb",
+   "out_png": "/tmp/opencode/overlay_seeds/panel_5.png"
+  }
+ ]
+}

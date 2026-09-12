@@ -2,12 +2,13 @@ from pathlib import Path
 import sys
 
 import numpy as np
+import pytest
 
 
 VALIDATION_ROOT = Path(__file__).resolve().parents[1] / "RUNS" / "validation"
 sys.path.insert(0, str(VALIDATION_ROOT))
 
-from common import peptide_validation as pv
+pv = pytest.importorskip("common.peptide_validation", reason="RUNS/validation is a local gitignored artifact")
 
 
 def test_basin_masks_contacts_use_folded_and_unfolded_thresholds():

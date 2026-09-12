@@ -1,0 +1,18 @@
+{
+ "n_rep5": 9886,
+ "n_rep4": 9745,
+ "T_K": 300.0,
+ "spearman_raw_vs_thermo_rep5": 0.717316686124852,
+ "thermo_min_at_CVh": 0.7718344926834106,
+ "thermo_min_at_Rg_A": 5.6945976591949545,
+ "thermo_range_CVh_kcal": 21.98808334969987,
+ "thermo_range_Rg_kcal": 21.555935261334294,
+ "dF_map_min_max_kcal": [
+  -15.103621650167693,
+  11.84833770043457
+ ],
+ "n_envelope_rep5": 39,
+ "envelope_median_rg_A": 5.76429750528599,
+ "envelope_median_heavy_cv1": 0.8395700454711914,
+ "envelope_min_F_kcal": 4.131487963561991
+}

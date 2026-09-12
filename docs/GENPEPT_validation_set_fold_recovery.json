@@ -1,0 +1,242 @@
+[
+ {
+  "peptide": "TRPZIP2",
+  "ref": "1le1",
+  "n": 9661,
+  "n_native_c45": 174,
+  "n_native_c55": 461,
+  "best_q45": 0.19,
+  "best_q55": 0.275,
+  "best_rmsd_A": 2.34,
+  "rmsd_q45_of_bestrmsd": 0.029,
+  "n_q55_ge_050": 0,
+  "n_q55_ge_040": 0,
+  "E_min": -431.0,
+  "top3": [
+   {
+    "rank": 1,
+    "seed": "survivor_2227_basin_2289_explore_r02_hit_0069_conf_105392_implicit_min",
+    "q55": 0.275,
+    "q45": 0.19,
+    "rmsd_A": 2.57,
+    "gap_kcal": 19.4
+   },
+   {
+    "rank": 2,
+    "seed": "survivor_3777_basin_3886_candidate_1242_gencluster_1242_conf_123674_implicit_min",
+    "q55": 0.215,
+    "q45": 0.103,
+    "rmsd_A": 4.74,
+    "gap_kcal": 8.4
+   },
+   {
+    "rank": 3,
+    "seed": "survivor_2121_basin_2181_candidate_7044_gencluster_1304_conf_630956_implicit_min",
+    "q55": 0.195,
+    "q45": 0.132,
+    "rmsd_A": 3.43,
+    "gap_kcal": 22.9
+   }
+  ]
+ },
+ {
+  "peptide": "GPM12",
+  "ref": "2e4e",
+  "n": 9513,
+  "n_native_c45": 95,
+  "n_native_c55": 248,
+  "best_q45": 0.263,
+  "best_q55": 0.411,
+  "best_rmsd_A": 1.66,
+  "rmsd_q45_of_bestrmsd": 0.126,
+  "n_q55_ge_050": 0,
+  "n_q55_ge_040": 1,
+  "E_min": -336.0,
+  "top3": [
+   {
+    "rank": 1,
+    "seed": "survivor_4100_basin_4227_candidate_8549_gencluster_573_conf_246653_implicit_min",
+    "q55": 0.411,
+    "q45": 0.263,
+    "rmsd_A": 2.54,
+    "gap_kcal": 7.8
+   },
+   {
+    "rank": 2,
+    "seed": "survivor_4405_basin_4545_explore_r03_hit_0064_conf_044529_implicit_min",
+    "q55": 0.347,
+    "q45": 0.158,
+    "rmsd_A": 4.13,
+    "gap_kcal": 11.4
+   },
+   {
+    "rank": 3,
+    "seed": "survivor_2424_basin_2492_candidate_9295_gencluster_1369_conf_212536_implicit_min",
+    "q55": 0.339,
+    "q45": 0.2,
+    "rmsd_A": 2.39,
+    "gap_kcal": 9.7
+   }
+  ]
+ },
+ {
+  "peptide": "RETROTRPCAGE",
+  "ref": "2luf",
+  "n": 9675,
+  "n_native_c45": 319,
+  "n_native_c55": 770,
+  "best_q45": 0.235,
+  "best_q55": 0.29,
+  "best_rmsd_A": 3.08,
+  "rmsd_q45_of_bestrmsd": 0.16,
+  "n_q55_ge_050": 0,
+  "n_q55_ge_040": 0,
+  "E_min": -638.0,
+  "top3": [
+   {
+    "rank": 1,
+    "seed": "survivor_7339_basin_7718_candidate_218_gencluster_218_conf_756841_implicit_min",
+    "q55": 0.29,
+    "q45": 0.179,
+    "rmsd_A": 6.49,
+    "gap_kcal": 24.7
+   },
+   {
+    "rank": 2,
+    "seed": "survivor_6623_basin_6854_candidate_5163_gencluster_5163_conf_224187_implicit_min",
+    "q55": 0.283,
+    "q45": 0.235,
+    "rmsd_A": 6.47,
+    "gap_kcal": 8.9
+   },
+   {
+    "rank": 3,
+    "seed": "survivor_1224_basin_1253_candidate_11286_gencluster_1162_conf_615822_implicit_min",
+    "q55": 0.278,
+    "q45": 0.207,
+    "rmsd_A": 5.0,
+    "gap_kcal": 19.4
+   }
+  ]
+ },
+ {
+  "peptide": "TC16bP12W",
+  "ref": "2m7d",
+  "n": 9222,
+  "n_native_c45": 278,
+  "n_native_c55": 706,
+  "best_q45": 0.245,
+  "best_q55": 0.245,
+  "best_rmsd_A": 3.09,
+  "rmsd_q45_of_bestrmsd": 0.086,
+  "n_q55_ge_050": 0,
+  "n_q55_ge_040": 0,
+  "E_min": -553.0,
+  "top3": [
+   {
+    "rank": 1,
+    "seed": "survivor_1100_basin_1143_bh_candidate_2243_gencluster_2243_conf_328632_implicit_min_hop_001",
+    "q55": 0.245,
+    "q45": 0.212,
+    "rmsd_A": 6.29,
+    "gap_kcal": 0.0
+   },
+   {
+    "rank": 2,
+    "seed": "survivor_3729_basin_3881_candidate_6428_gencluster_6428_conf_363352_implicit_min",
+    "q55": 0.244,
+    "q45": 0.14,
+    "rmsd_A": 7.81,
+    "gap_kcal": 10.0
+   },
+   {
+    "rank": 3,
+    "seed": "survivor_7743_basin_8563_candidate_824_gencluster_824_conf_106204_implicit_min",
+    "q55": 0.242,
+    "q45": 0.245,
+    "rmsd_A": 9.0,
+    "gap_kcal": 5.9
+   }
+  ]
+ },
+ {
+  "peptide": "CLN025",
+  "ref": "2rvd",
+  "n": 9891,
+  "n_native_c45": 78,
+  "n_native_c55": 233,
+  "best_q45": 0.205,
+  "best_q55": 0.369,
+  "best_rmsd_A": 1.01,
+  "rmsd_q45_of_bestrmsd": 0.064,
+  "n_q55_ge_050": 0,
+  "n_q55_ge_040": 0,
+  "E_min": -409.0,
+  "top3": [
+   {
+    "rank": 1,
+    "seed": "survivor_1064_basin_1089_candidate_618_gencluster_618_conf_657765_implicit_min",
+    "q55": 0.369,
+    "q45": 0.167,
+    "rmsd_A": 3.1,
+    "gap_kcal": 32.3
+   },
+   {
+    "rank": 2,
+    "seed": "survivor_3506_basin_3584_candidate_4254_gencluster_590_conf_303326_implicit_min",
+    "q55": 0.309,
+    "q45": 0.154,
+    "rmsd_A": 2.05,
+    "gap_kcal": 30.6
+   },
+   {
+    "rank": 3,
+    "seed": "survivor_1995_basin_2035_candidate_811_gencluster_811_conf_367127_implicit_min",
+    "q55": 0.305,
+    "q45": 0.09,
+    "rmsd_A": 2.73,
+    "gap_kcal": 27.9
+   }
+  ]
+ },
+ {
+  "peptide": "NLYIQWLKDGGPSSGRPPPS",
+  "ref": "1l2y",
+  "n": 9511,
+  "n_native_c45": 236,
+  "n_native_c55": 633,
+  "best_q45": 0.267,
+  "best_q55": 0.308,
+  "best_rmsd_A": 2.87,
+  "rmsd_q45_of_bestrmsd": 0.089,
+  "n_q55_ge_050": 0,
+  "n_q55_ge_040": 0,
+  "E_min": -619.0,
+  "top3": [
+   {
+    "rank": 1,
+    "seed": "survivor_2882_basin_3006_candidate_4534_gencluster_4534_conf_555874_implicit_min",
+    "q55": 0.308,
+    "q45": 0.267,
+    "rmsd_A": 6.18,
+    "gap_kcal": 28.4
+   },
+   {
+    "rank": 2,
+    "seed": "survivor_5862_basin_6218_candidate_7212_gencluster_7212_conf_162379_implicit_min",
+    "q55": 0.288,
+    "q45": 0.254,
+    "rmsd_A": 6.27,
+    "gap_kcal": 20.9
+   },
+   {
+    "rank": 3,
+    "seed": "survivor_468_basin_500_candidate_864_gencluster_864_conf_264276_implicit_min",
+    "q55": 0.284,
+    "q45": 0.225,
+    "rmsd_A": 7.56,
+    "gap_kcal": 8.1
+   }
+  ]
+ }
+]

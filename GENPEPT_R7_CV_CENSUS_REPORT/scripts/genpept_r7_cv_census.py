@@ -197,6 +197,7 @@ def main():
                 nn, mm = job["nm"]
                 x = d / r0
                 v = (1.0 - np.power(x, nn)) / (1.0 - np.power(x, mm))
+                v = np.where(np.abs(x - 1.0) < 1e-9, nn / mm, v)
                 cname = f"{job['base']}_r0{r0:g}"
                 cols[cname][fi] = v.mean()
                 continue

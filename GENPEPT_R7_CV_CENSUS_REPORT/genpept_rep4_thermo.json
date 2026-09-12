@@ -1,0 +1,32 @@
+{
+ "n_survivors": 9745,
+ "kT_kcal": 2.49433878544597,
+ "frac_in_cu_support": 1.0,
+ "w_cu_range": [
+  0.16750160278863008,
+  8.0
+ ],
+ "map_agreement": {
+  "spearman_raw_vs_proposal": 0.8929747411147638,
+  "spearman_raw_vs_thermo": 0.6746215752615584,
+  "spearman_proposal_vs_thermo": 0.7075966822036127
+ },
+ "f_rg_shift": {
+  "compact_bins_lt6A_mean_dF_kcal": 14.440107597791739,
+  "mid_6_7A_mean_dF_kcal": 41.46808968453767,
+  "extended_gt7A_mean_dF_kcal": 69.35479473628371
+ },
+ "basins": {
+  "n_basins": 9745,
+  "total_minima": 22378,
+  "g_range": [
+   1,
+   14
+  ],
+  "g_median": 2.0,
+  "top20_overlap_Emean_vs_F": 11,
+  "top20_overlap_Emin_vs_F": 11,
+  "multiplicity_term_kTlogg_kcal_median": 1.7289438964931925,
+  "multiplicity_term_kTlogg_kcal_p95": 4.4692551382856225
+ }
+}

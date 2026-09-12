@@ -431,6 +431,12 @@ class GenConfig:
     contact_bias_sigma: float = 0.0
     contact_bias_ref: float = 0.0
     contact_bias_scale: float = 0.0
+    cu_enabled: bool = False
+    cu_alpha: float = 0.5
+    cu_max_weight_ratio: float = 8.0
+    cu_table_json: str = ""
+    ttt_enabled: bool = False
+    ttt_fraction: float = 0.35
 
 
 @dataclass
@@ -445,6 +451,7 @@ class ConformerRecord:
     contact_count: int
     clash_count: int
     bank_name: str = "default"
+    tt_source: str = ""
 
 
 @dataclass
@@ -1752,6 +1759,7 @@ def materialize_conformer_from_record(
         ccount,
         clashes,
         str(getattr(rec, "bank_name", "default") or "default"),
+        str(getattr(rec, "tt_source", "") or ""),
     )
     desc = np.array([rg, e2e, float(ccount)], dtype=np.float32)
     return full_rec, cvec, desc
@@ -1937,6 +1945,463 @@ def _contact_bias_accept(rng, cfg, ccount: int) -> bool:
     return bool(rng.random() < prob)
 
 
+# ---------------------------------------------------------------------------
+# Universal coverage tunings (T1-T6; spec docs/superpowers/specs/
+# 2026-09-09-genpept-universal-coverage-tunings-design.md). All mechanisms are
+# ab initio (bank-internal statistics only) and sequence-agnostic.
+
+
+# --- T1: coverage-uniformization acceptance -----------------------------------
+
+CU_FEATURE_NAMES = ("rg_A", "end_to_end_A", "contact_count")
+CU_DEFAULT_N_BINS = 24
+
+
+def _cu_histogram_table(counts_2d: np.ndarray, floor: float, alpha: float, rmax: float):
+    """(normalized target density estimator, per-cell accept weight)."""
+    counts = counts_2d.astype(np.float64)
+    total = max(1.0, float(counts.sum()))
+    p_hat = counts / total
+    support = p_hat > 0
+    n_support = max(1, int(support.sum()))
+    u = np.full_like(p_hat, floor, dtype=np.float64)
+    u[support] = 1.0 / float(n_support)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        w = (u / np.maximum(p_hat, 1e-300)) ** float(alpha)
+    w = np.where(np.isfinite(w), w, float(rmax))
+    w = np.clip(w, 0.0, float(rmax))
+    return u, p_hat, w
+
+
+def coverage_warmup_table(cfg, args, out_dir: Path):
+    """Estimate proposal-space (rg, e2e, contact_count) density via the cheap CA
+    reconstruction on a deterministic subsample, then freeze per-cell accept weights.
+
+    Faithful determinism note: the spec's rolling update is approximated by a single
+    calibration pass BEFORE generation (same pattern as contact_bias_calibration):
+    reproducible from (seq, seed, n_requested), zero inter-worker communication.
+    """
+    n_sample = int(getattr(args, "cu_warmup_samples", 4000) or 4000)
+    n_bins = int(getattr(args, "cu_n_bins", CU_DEFAULT_N_BINS) or CU_DEFAULT_N_BINS)
+    seq = str(cfg.seq)
+    n_requested = max(1, int(cfg.n_requested))
+    n_sample = max(1, min(n_sample, n_requested))
+    step = max(1, n_requested // n_sample)
+    feats = []
+    for idx in range(0, n_requested, step):
+        if len(feats) >= n_sample:
+            break
+        rng = np.random.default_rng(int(cfg.seed) + int(idx))
+        bank = select_diversity_bank(cfg, int(idx))
+        _states, phis, psis = sample_states_and_angles(
+            seq, cfg.angle_sd_deg, rng,
+            rama_sampling=cfg.rama_sampling,
+            conformer_idx=int(idx),
+            n_requested=n_requested,
+            base_seed=int(cfg.seed),
+            bank=bank,
+        )
+        ca = fast_ca_coords_from_angles(seq, phis, psis)
+        if len(ca) < 2 or not np.isfinite(ca).all():
+            continue
+        rg = radius_of_gyration(ca)
+        e2e = float(np.linalg.norm(ca[-1] - ca[0]))
+        _cvec, ccount = contact_vector_from_coords(ca, cfg.contact_cutoff_A, cfg.contact_min_sep)
+        feats.append((rg, e2e, float(ccount)))
+    if len(feats) < 50:
+        return ""
+    feats = np.asarray(feats, dtype=np.float64)
+    edges = []
+    for k in range(3):
+        edges.append(np.quantile(feats[:, k], np.linspace(0.0, 1.0, n_bins + 1)))
+    H, _ = np.histogramdd(feats, bins=edges)
+    alpha = float(getattr(args, "cu_alpha", 0.5) or 0.5)
+    rmax = float(getattr(args, "cu_max_weight_ratio", 8.0) or 8.0)
+    floor = 1e-3
+    u, p_hat, w = _cu_histogram_table(H, floor, alpha, rmax)
+    table = {
+        "algorithm": "freeze-after-calibration (single warmup; spec's rolling update)",
+        "features": list(CU_FEATURE_NAMES),
+        "n_sample": int(len(feats)),
+        "alpha": alpha,
+        "max_weight_ratio": rmax,
+        "floor": floor,
+        "edges": [list(map(float, e)) for e in edges],
+        "weights": w.tolist(),
+        "support_fraction": float((H > 0).mean()),
+    }
+    return json.dumps(table)
+
+
+def _coverage_accept_prob(cfg, rg: float, e2e: float, ccount: float) -> float:
+    table_json = str(getattr(cfg, "cu_table_json", "") or "")
+    if not table_json:
+        return 1.0
+    try:
+        table = json.loads(table_json)
+        edges = table["edges"]
+        weights = table["weights"]
+    except (ValueError, TypeError, KeyError):
+        return 1.0
+    idxs = []
+    for k, (v, e) in enumerate(zip((rg, e2e, float(ccount)), edges)):
+        j = int(np.searchsorted(e, float(v), side="right")) - 1
+        j = max(0, min(len(e) - 2, j))
+        idxs.append(j)
+    return float(weights[idxs[0]][idxs[1]][idxs[2]])
+
+
+def _coverage_accept(rng, cfg, rg: float, e2e: float, ccount: float) -> bool:
+    if not bool(getattr(cfg, "cu_enabled", False)):
+        return True
+    prob = _coverage_accept_prob(cfg, rg, e2e, ccount)
+    if prob >= 1.0:
+        return True
+    return bool(rng.random() < prob)
+
+
+# --- T2: basin-driven BH parents ----------------------------------------
+
+def _union_find_clusters(X: np.ndarray, threshold: float) -> np.ndarray:
+    """Single-linkage clusters over a k-NN union graph (no scipy dependency)."""
+    n = len(X)
+    if n == 0:
+        return np.zeros(0, dtype=int)
+    if n == 1:
+        return np.array([0])
+    k = min(10, n - 1)
+    parent = list(range(n))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    stride = max(1, n // 4000)
+    xs = X[::stride]
+    D = np.sqrt(((xs[:, None, :] - xs[None, :, :]) ** 2).sum(axis=-1))
+    for ii in range(len(xs)):
+        nbrs = np.argsort(D[ii])[1:k + 1]
+        for j in nbrs:
+            jj = int(j)
+            if D[ii, jj] <= threshold:
+                union(ii, jj)
+    labels = {}
+    out = np.zeros(len(xs), dtype=int)
+    for i in range(len(xs)):
+        r = find(i)
+        if r not in labels:
+            labels[r] = len(labels)
+        out[i] = labels[r]
+    # reassign stride subset labels back to all points by nearest-strided-neighbor
+    if stride > 1:
+        all_lab = np.zeros(n, dtype=int)
+        for i in range(n):
+            j = min(i // stride, len(xs) - 1)
+            all_lab[i] = int(out[j])
+        return all_lab
+    return out
+
+
+def _cluster_feature_matrix(rows_desc: np.ndarray) -> np.ndarray:
+    X = np.asarray(rows_desc, dtype=np.float64)
+    scale = np.median(np.abs(X - np.median(X, axis=0)), axis=0) + 0.05
+    return X / scale
+
+
+def basin_driven_parent_selection(args, valid: list[Path], desc_rows: np.ndarray, feature_rows: list[dict]):
+    """Allocate bh_parent_seeds across geometric basins as n_basin**gamma, one medoid each.
+
+    See spec T2; the replacee of the plain farthest-first selection when enabled.
+    """
+    n_parent = int(getattr(args, "bh_parent_seeds", 0) or 0)
+    gamma = float(getattr(args, "bdp_gamma", 0.25) if getattr(args, "bdp_gamma", None) is not None else 0.25)
+    max_per = int(getattr(args, "bdp_max_parents_per_basin", 6) or 6)
+    X = _cluster_feature_matrix(desc_rows)
+    kth = min(15, len(X) - 1)
+    if kth <= 0:
+        return list(valid), []
+    D = np.sqrt(((X[:, None, :] - X[None, :, :]) ** 2).sum(axis=-1))
+    srt = np.sort(D, axis=1)[:, kth]
+    thr = float(np.median(srt)) * 1.5
+    labels = _union_find_clusters(X, thr)
+    uniq, counts = np.unique(labels, return_counts=True)
+    order = np.argsort(-counts)
+    alloc = np.zeros(len(uniq), dtype=int)
+    for pos in order:
+        alloc[pos] = max(1, int(round(n_parent * (counts[pos] ** gamma) / float(np.sum(counts ** gamma)))))
+        alloc[pos] = min(alloc[pos], max_per, int(counts[pos]))
+    alloc = np.minimum(alloc, counts)
+    while alloc.sum() > n_parent and alloc.sum() > len(uniq):
+        j = int(np.argmax(alloc))
+        alloc[j] -= 1
+    selected, rows = [], []
+    rng_local = np.random.default_rng(int(getattr(args, "seed", 0)))
+    rank = 0
+    for ci in range(len(uniq)):
+        take = int(alloc[ci])
+        if take <= 0:
+            continue
+        members = np.where(labels == uniq[ci])[0]
+        centroid = X[members].mean(axis=0)
+        d = np.sqrt(((X[members] - centroid) ** 2).sum(axis=-1))
+        order_m = members[np.argsort(d, kind="mergesort")]
+        for m_i, m in enumerate(order_m[:take]):
+            selected.append(valid[int(m)])
+            row = dict(feature_rows[int(m)])
+            row["bh_parent_rank"] = rank
+            row["bh_parent_cluster"] = int(uniq[ci])
+            row["basin_size"] = int(counts[ci])
+            rows.append(row)
+            rank += 1
+    _ = rng_local  # kept for future tie-breaking; selection is deterministic
+    return selected, rows
+
+
+# --- T3: universal turn-type tiling -------------------------------------------
+
+# Windows are (phi_lo, phi_hi, psi_lo, psi_hi) in degrees for the two central
+# residues (i+1, i+2) of a 4-residue turn. Bins are broad-band structures drawn
+# from standard turn classifications (BETA_TURN_TYPES_UNIVERSAL_V1); the library
+# is reported in the run record so values stay regenerable.
+UNIVERSAL_BETA_TURN_TYPES = {
+    "beta_I":        {"a1": (-100.0, -40.0, -40.0, 10.0), "a2": (-110.0, -60.0, -25.0, 15.0)},
+    "beta_I_prime":  {"a1": (45.0, 75.0, 10.0, 45.0),    "a2": (65.0, 100.0, -15.0, 15.0)},
+    "beta_II":       {"a1": (-90.0, -60.0, 100.0, 140.0), "a2": (70.0, 100.0, -15.0, 15.0)},
+    "beta_II_prime": {"a1": (-90.0, -60.0, 100.0, 140.0), "a2": (-90.0, -60.0, -40.0, -10.0)},
+    "asx_gly":       {"a1": (-90.0, -40.0, 100.0, 140.0), "a2": None, "requires_gly": True},
+}
+TTT_DEFAULT_FRACTION = 0.35
+
+
+def _tt_draw_type_windows(seq_len: int, n_pairs: int, rng) -> list:
+    return [rng.choice(list(UNIVERSAL_BETA_TURN_TYPES)) if rng.random() < TTT_DEFAULT_FRACTION else None
+            for _ in range(n_pairs)]
+
+
+def apply_turn_type_tiling(seq, phis, psis, rng, fraction: float = TTT_DEFAULT_FRACTION, angle_sd_deg: float = 20.0):
+    """Overlay universal turn-type windows onto a fraction of consecutive residue pairs.
+
+    Operates on (phis, psis) lists produced by sample_states_and_angles: pairs
+    (residue i+1, i+2) in chain order; for each pair, with probability `fraction`,
+    draw a turn type and resample that pair's (phi, psi) uniformedly from its
+    windows, keeping a small gaussian blur of angle_sd/4. Asx-Gly types require a
+    glycine at position i+2; incompatible draws fall back to beta_I.
+
+    Returns (phis, psis, notes) with per-pair overlay records for the sidecar CSV.
+    """
+    seq = str(seq)
+    phis = list(phis)
+    psis = list(psis)
+    n_pairs = max(0, len(phis) - 1)
+    notes = []
+    for i in range(n_pairs):
+        if rng.random() >= float(fraction):
+            continue
+        types = list(UNIVERSAL_BETA_TURN_TYPES)
+        t = types[int(rng.integers(0, len(types)))] if hasattr(rng, "integers") else rng.choice(types)
+        spec = UNIVERSAL_BETA_TURN_TYPES[t]
+        r2_idx = i + 2  # psi index of residue i+2 (0-based phis/psis)
+        if spec.get("requires_gly") and (r2_idx >= len(seq) or seq[r2_idx] != "G"):
+            t = "beta_I"
+            spec = UNIVERSAL_BETA_TURN_TYPES[t]
+        sd = max(4.0, float(angle_sd_deg) / 4.0)
+        for slot, pos in (("a1", i), ("a2", i + 1)):
+            window = spec.get(slot)
+            if window is None:
+                continue
+            if pos >= len(phis):
+                continue
+            phi_lo, phi_hi, psi_lo, psi_hi = window
+            phis[pos] = wrap_degrees(float(rng.uniform(phi_lo, phi_hi) + rng.normal(0.0, sd / 3.0)))
+            psis[pos] = wrap_degrees(float(rng.uniform(psi_lo, psi_hi) + rng.normal(0.0, sd / 3.0)))
+        notes.append({"pair": i, "type": t})
+    return phis, psis, notes
+
+
+# --- T4: bank-adaptive register threshold --------------------------------------
+
+def adaptive_register_tau(pooled_distances: np.ndarray, guard=(2.5, 6.0), fallback: float = 3.8,
+                          n_bins: int = 120):
+    """Deepest valley of the pooled nonlocal backbone N-O distance histogram.
+
+    Universal: derives tau from whatever distribution the bank's minimizer produced.
+    """
+    d = np.asarray(pooled_distances, dtype=float)
+    d = d[(d >= guard[0]) & (d <= guard[1])]
+    if d.size < 200:
+        return float(fallback), False, {}
+    hist, edges = np.histogram(d, bins=int(n_bins), range=tuple(guard))
+    kern = np.exp(-0.5 * ((np.arange(-3, 4)) / 1.5) ** 2)
+    kern = kern / kern.sum()
+    sm = np.convolve(hist.astype(float), kern, mode="same")
+    peak = int(np.argmax(sm[: len(sm) // 3]) )
+    seg = sm[peak:]
+    if len(seg) < 3:
+        return float(fallback), False, {}
+    vpos = int(np.argmin(seg))
+    val_i = peak + vpos
+    if not (0 < vpos < len(seg) - 1):
+        return float(fallback), False, {}
+    tau = float(0.5 * (edges[val_i] + edges[val_i + 1]))
+    meta = {
+        "tau_a": tau,
+        "guard": [float(guard[0]), float(guard[1])],
+        "n_distances": int(d.size),
+        "peak_bin": int(peak),
+        "valley_rel_depth": float(1.0 - sm[val_i] / max(1.0, sm[peak])),
+    }
+    return tau, True, meta
+
+
+# --- T5: mirror-balance survivor stratification --------------------------------
+
+def _pdb_ca_backbone_positions(path: Path):
+    """Dependency-free CA coordinate reader (chain order) for chirality/SASA-free hooks."""
+    cas = []
+    res_key = None
+    for line in open(path):
+        if not line.startswith("ATOM"):
+            if line.startswith("ENDMDL"):
+                break
+            continue
+        name = line[12:16].strip()
+        if name != "CA":
+            continue
+        key = (line[21].strip(), line[22:26].strip())
+        x = float(line[30:38])
+        y = float(line[38:46])
+        z = float(line[46:54])
+        cas.append((key, np.array([x, y, z], dtype=float)))
+        res_key = key
+    return cas
+
+
+def _pdb_backbone_no_pair_distances(path: Path, min_sep: int = 2):
+    """All backbone N(i)..O(j) distances with |i-j| >= min_sep, without OpenMM dependency."""
+    res_vec = []
+    prev_key = None
+    cur = {"N": None, "O": None}
+    for line in open(path):
+        if not line.startswith("ATOM"):
+            if line.startswith("ENDMDL"):
+                break
+            continue
+        name = line[12:16].strip()
+        if name not in ("N", "O"):
+            continue
+        key = (line[21].strip(), line[22:26].strip())
+        if key != prev_key:
+            if prev_key is not None and cur["N"] is not None and cur["O"] is not None:
+                res_vec.append((cur["N"], cur["O"]))
+            cur = {"N": None, "O": None}
+            prev_key = key
+        xyz = np.array([float(line[30:38]), float(line[38:46]), float(line[46:54])])
+        if name == "N":
+            cur["N"] = xyz
+        else:
+            cur["O"] = xyz
+    if prev_key is not None and cur["N"] is not None and cur["O"] is not None:
+        res_vec.append((cur["N"], cur["O"]))
+    out = []
+    m = len(res_vec)
+    for i in range(m):
+        for j in range(m):
+            if abs(i - j) < int(min_sep):
+                continue
+            for a, b in ((res_vec[i][0], res_vec[j][1]), (res_vec[j][0], res_vec[i][1])):
+                out.append(float(np.linalg.norm(a - b)))
+    return out
+
+
+def chirality_sign_from_pdb(path: Path):
+    cas = _pdb_ca_backbone_positions(path)
+    if len(cas) < 4:
+        return None
+    i = [0, len(cas) // 3, (2 * len(cas)) // 3, len(cas) - 1]
+    p = [cas[j][1] for j in i]
+    v1, v2, v3 = p[1] - p[0], p[2] - p[0], p[3] - p[0]
+    det = float(np.linalg.det(np.stack([v1, v2, v3], axis=0)))
+    if not np.isfinite(det):
+        return None
+    return 1 if det >= 0.0 else -1
+
+
+def _rebalance_by_predicate(selected_rows, available_rows, class_of, tolerance: float,
+                            badness_key: str = "implicit_badness"):
+    """Rebalance final selection between two classes by swapping worst-ranked majority
+    members for best-ranked minority members until |frac - 0.5| <= tolerance/2.
+
+    Both inputs are lists of per-candidate dicts; selected_rows preserves its order
+    (badness-ascending ranking). Returns (selected_rows_out, info).
+    """
+    def maj_frac(rows):
+        if not rows:
+            return 0.0
+        return sum(1 for r in rows if class_of(r) == "major") / len(rows)
+
+    sel = list(selected_rows)
+    minority_pool = sorted((r for r in available_rows if class_of(r) == "minor"),
+                           key=lambda r: float(r.get(badness_key, 0.0)))
+    chosen_keys = {str(r.get("seed_name") or r.get("survivor_pdb_path") or id(r)) for r in sel}
+    info = {"swaps": 0, "frac_major_before": maj_frac(sel)}
+    while abs(maj_frac(sel) - 0.5) > 0.5 * float(tolerance) and minority_pool:
+        rep = minority_pool.pop(0)
+        rep_key = str(rep.get("seed_name") or rep.get("survivor_pdb_path") or id(rep))
+        if rep_key in chosen_keys:
+            continue
+        drop_idx = None
+        drop_bad = -float("inf")
+        for i, r in enumerate(sel):
+            if class_of(r) != "major":
+                continue
+            b = float(r.get(badness_key, 0.0))
+            if b >= drop_bad:
+                drop_bad = b
+                drop_idx = i
+        if drop_idx is None:
+            break
+        old = sel[drop_idx]
+        rep_row = dict(rep)
+        rep_row["survivor_rank"] = old.get("survivor_rank", drop_idx)
+        sel[drop_idx] = rep_row
+        chosen_keys.discard(str(old.get("seed_name") or old.get("survivor_pdb_path") or id(old)))
+        chosen_keys.add(rep_key)
+        info["swaps"] += 1
+    info["frac_major_after"] = maj_frac(sel)
+    return sel, info
+
+
+# --- T6: SASA lower-tail preservation -------------------------------------------
+
+def sasa_nm2_from_pdb(path: Path):
+    try:
+        import mdtraj  # noqa: WPS433 -- optional dependency, guarded
+        t = mdtraj.load(str(path))
+        return float(mdtraj.shrake_rupley(t, mode="residue").sum())
+    except Exception:
+        return None
+
+
+def _generation_acceptance_fn(cfg, rng, rg: float, e2e: float, ccount: float):
+    """Route one candidate through coverage-uniformization (T1) or the legacy bias.
+
+    Mutual-exclusion rule: contact_bias_sigma/strength + coverage-uniformization are
+    both rejectable by the same caller; argparse-side validation prevents the combo
+    from being set; a run landing here with both sees CU win and is warned in the
+    run record.
+    """
+    if bool(getattr(cfg, "cu_enabled", False)) and str(getattr(cfg, "cu_table_json", "") or ""):
+        return _coverage_accept(rng, cfg, rg, e2e, ccount)
+    return _contact_bias_accept(rng, cfg, ccount)
+
+
 def generate_one(task):
     seq, idx, out_conf_dir, cfg_dict, worker_seed = task
     cfg = GenConfig(**cfg_dict)
@@ -1955,6 +2420,15 @@ def generate_one(task):
             base_seed=int(cfg.seed),
             bank=bank,
         )
+        tt_source = ""
+        if bool(getattr(cfg, "ttt_enabled", False)):
+            phis, psis, ttt_notes = apply_turn_type_tiling(
+                seq, phis, psis, rng,
+                fraction=float(getattr(cfg, "ttt_fraction", 0.35) or 0.35),
+                angle_sd_deg=float(cfg.angle_sd_deg or 20.0),
+            )
+            if ttt_notes:
+                tt_source = ";".join(f"{n['type']}@{n['pair']}" for n in ttt_notes)
 
         backend = str(getattr(cfg, "generation_backend", "full") or "full").strip().lower()
         if backend == "fast" and not cfg.write_pdbs:
@@ -1965,8 +2439,8 @@ def generate_one(task):
             rg = radius_of_gyration(ca)
             e2e = float(np.linalg.norm(ca[-1] - ca[0]))
             cvec, ccount = contact_vector_from_coords(ca, cfg.contact_cutoff_A, cfg.contact_min_sep)
-            if not _contact_bias_accept(rng, cfg, ccount):
-                return None, None, "ContactBiasReject: below contact-count acceptance threshold"
+            if not _generation_acceptance_fn(cfg, rng, rg, e2e, ccount):
+                return None, None, "CoverageAcceptReject: below coverage/bias acceptance threshold"
             rec = ConformerRecord(
                 idx,
                 "",
@@ -1978,6 +2452,7 @@ def generate_one(task):
                 ccount,
                 -1,
                 bank_name,
+                tt_source,
             )
             desc = np.array([rg, e2e, float(ccount)], dtype=np.float32)
             return rec, cvec, desc
@@ -1995,8 +2470,8 @@ def generate_one(task):
         rg = radius_of_gyration(ca)
         e2e = float(np.linalg.norm(ca[-1] - ca[0]))
         cvec, ccount = contact_vector_from_coords(ca, cfg.contact_cutoff_A, cfg.contact_min_sep)
-        if not _contact_bias_accept(rng, cfg, ccount):
-            return None, None, "ContactBiasReject: below contact-count acceptance threshold"
+        if not _generation_acceptance_fn(cfg, rng, rg, e2e, ccount):
+            return None, None, "CoverageAcceptReject: below coverage/bias acceptance threshold"
 
         pdb_path = Path(out_conf_dir) / f"conf_{idx:06d}.pdb"
         if cfg.write_pdbs:
@@ -2013,6 +2488,7 @@ def generate_one(task):
             ccount,
             clashes,
             bank_name,
+            tt_source,
         )
         desc = np.array([rg, e2e, float(ccount)], dtype=np.float32)
         return rec, cvec, desc
@@ -2663,6 +3139,25 @@ def generate_candidates(args):
         diversity_bank_wide_angle_sd=float(getattr(args, "diversity_bank_wide_angle_sd", 45.0)),
         contact_bias_strength=float(getattr(args, "contact_bias_strength", 0.0)),
     )
+    cfg.cu_enabled = bool(getattr(args, "coverage_uniformization", False))
+    cfg.cu_alpha = float(getattr(args, "cu_alpha", 0.5) or 0.5)
+    cfg.cu_max_weight_ratio = float(getattr(args, "cu_max_weight_ratio", 8.0) or 8.0)
+    cfg.ttt_enabled = bool(getattr(args, "turn_type_tiling", False))
+    cfg.ttt_fraction = float(getattr(args, "ttt_fraction", 0.35) or 0.35)
+    if cfg.cu_enabled and (float(getattr(cfg, "contact_bias_sigma", 0.0) or 0.0) != 0.0
+                           or float(getattr(cfg, "contact_bias_strength", 0.0) or 0.0) != 0.0):
+        raise SystemExit(
+            "--coverage-uniformization is mutually exclusive with --contact-bias-strength/sigma "
+            "(both steer generation-time acceptance; pick one)."
+        )
+    if cfg.cu_enabled:
+        ui_message("Coverage-uniformization enabled: fitting the proposal-space density table "
+                   f"from {int(getattr(args, 'cu_warmup_samples', 4000) or 4000)} deterministic warmup conformers.")
+        cfg.cu_table_json = coverage_warmup_table(cfg, args, out_dir)
+        if not cfg.cu_table_json:
+            ui_message("WARNING: coverage warmup produced too few valid conformers; CU falls back to uniform acceptance.")
+        else:
+            (out_dir / "coverage_uniformization.json").write_text(cfg.cu_table_json)
     # Calibrate the z-score bias against this sequence's own conformers, then refuse
     # to start if whichever bias is set would not leave enough of them. Done before
     # generation_config.json is written so the measured reference is recorded too.
@@ -3894,6 +4389,7 @@ class HopRecord:
     minimization_iterations_used: int = 0
     minimization_rounds: int = 0
     minimization_stop_reason: str = ""
+    t7_pairs: int = 0
 
 
 def stable_parent_seed(base_seed: int, parent: str) -> int:
@@ -3916,12 +4412,43 @@ class ReusableBasinHopper:
         self.ca_idx = []
         self.context_builds = 0
         self.context_reuses = 0
+        self._t7_pair_key = None
 
     def _prepare_modeller(self, pdb_path: Path):
         pdb = self.app.PDBFile(str(pdb_path))
         modeller = self.app.Modeller(pdb.topology, pdb.positions)
         modeller.addHydrogens(self.ff, pH=self.cfg.ph)
         return modeller
+
+    def _t7_select_pairs(self, topology, positions, bh: dict):
+        unit = self.unit
+        if hasattr(positions, "value_in_unit"):
+            pos_nm = np.asarray(positions.value_in_unit(unit.nanometer))
+        else:
+            pos_nm = np.asarray(positions)
+        n_of, o_of = {}, {}
+        for atom in topology.atoms():
+            if atom.residue.name in {"HOH", "WAT", "SOL"}:
+                continue
+            if atom.name == "N" and atom.residue.index not in n_of:
+                n_of[atom.residue.index] = atom.index
+            elif atom.name == "O" and atom.residue.index not in o_of:
+                o_of[atom.residue.index] = atom.index
+        capture_nm = float(bh.get("t7_capture_a", 6.0) or 0.0) / 10.0
+        wall_nm = float(bh.get("t7_wall_a", 3.8) or 3.8) / 10.0
+        cand = []
+        for ri, n_idx in n_of.items():
+            for rj, o_idx in o_of.items():
+                if abs(ri - rj) < 3:
+                    continue
+                d = float(np.linalg.norm(pos_nm[n_idx] - pos_nm[o_idx]))
+                if d < capture_nm:
+                    cand.append((d, int(n_idx), int(o_idx)))
+        cand.sort()
+        max_pairs = int(bh.get("t7_max_pairs", 0) or 0)
+        if max_pairs > 0:
+            cand = cand[:max_pairs]
+        return [(n_idx, o_idx, wall_nm) for _, n_idx, o_idx in cand]
 
     def _bh_integrator_signature(self, bh: dict):
         return (
@@ -3933,7 +4460,7 @@ class ReusableBasinHopper:
             float(bh.get("constraint_tolerance", 1.0e-5) or 0.0),
         )
 
-    def _build_context(self, modeller, bh: dict):
+    def _build_context(self, modeller, bh: dict, t7_pairs=None):
         hmr_mass = float(bh.get("hmr_mass_amu", 0.0) or 0.0)
         force_hbonds = bool(bh.get("hmr_auto_constraints", True)) and hmr_mass > 0.0
         system = create_implicit_system(
@@ -3945,6 +4472,13 @@ class ReusableBasinHopper:
             hydrogen_mass_amu=hmr_mass,
             force_hbonds=force_hbonds,
         )
+        if t7_pairs:
+            t7_force = self.openmm.CustomBondForce("k_t7 * (max(0, r - rw))^2")
+            t7_force.addGlobalParameter("k_t7", 0.0)
+            t7_force.addPerBondParameter("rw")
+            for a, b, rw in t7_pairs:
+                t7_force.addBond(int(a), int(b), [float(rw)])
+            system.addForce(t7_force)
         integrator = self.openmm.LangevinMiddleIntegrator(
             float(bh["temperature"]) * self.unit.kelvin,
             float(bh["friction"]) / self.unit.picosecond,
@@ -3956,14 +4490,18 @@ class ReusableBasinHopper:
         self.simulation = make_platform_simulation(self.openmm, self.app, modeller.topology, system, integrator, self.cfg)
         self.signature = topology_signature(modeller.topology)
         self.integrator_signature = self._bh_integrator_signature(bh)
+        self.integrator_signature = self._bh_integrator_signature(bh)
         self.ca_idx = peptide_ca_indices(modeller.topology)
         self.context_builds += 1
 
-    def _ensure_context(self, modeller, bh: dict):
+    def _ensure_context(self, modeller, bh: dict, t7_pairs=None):
         sig = topology_signature(modeller.topology)
         integ_sig = self._bh_integrator_signature(bh)
-        if self.simulation is None or sig != self.signature or integ_sig != self.integrator_signature:
-            self._build_context(modeller, bh)
+        pair_key = tuple((a, b) for a, b, _ in t7_pairs) if t7_pairs else None
+        if (self.simulation is None or sig != self.signature or integ_sig != self.integrator_signature
+                or pair_key != self._t7_pair_key):
+            self._build_context(modeller, bh, t7_pairs)
+            self._t7_pair_key = pair_key
         else:
             self.context_reuses += 1
 
@@ -3985,6 +4523,19 @@ class ReusableBasinHopper:
                 unit, simulation, self.cfg, max_iterations=int(bh["initial_min_iterations"])
             )
             rng = np.random.default_rng(stable_parent_seed(int(bh["seed"]), parent))
+
+            t7_pairs = []
+            if bool(bh.get("t7", False)):
+                t7_pairs = self._t7_select_pairs(modeller.topology, min0_positions, bh)
+                if t7_pairs:
+                    self._ensure_context(modeller, bh, t7_pairs)
+                    simulation = self.simulation
+                    simulation.context.setPositions(min0_positions)
+                if self.simulation is not None:
+                    try:
+                        self.simulation.context.setParameter("k_t7", 0.0)
+                    except Exception:
+                        pass
 
             include_parent = bool(bh.get("include_parent", True))
             hop_offset = int(bh.get("hop_offset", 1))
@@ -4012,7 +4563,11 @@ class ReusableBasinHopper:
                             float(bh["temperature"]) * unit.kelvin,
                             int(rng.integers(0, 2**31 - 1)),
                         )
+                        if t7_pairs:
+                            simulation.context.setParameter("k_t7", float(bh.get("t7_k", 1000.0) or 0.0))
                         simulation.step(int(bh["md_steps"]))
+                        if t7_pairs:
+                            simulation.context.setParameter("k_t7", 0.0)
 
                         e_before = state_energy(unit, simulation)
                         e_after, max_force, positions, iters_used, min_rounds, stop_reason = minimize_energy_with_optional_adaptive(
@@ -4042,6 +4597,7 @@ class ReusableBasinHopper:
                         minimization_iterations_used=int(iters_used),
                         minimization_rounds=int(min_rounds),
                         minimization_stop_reason=str(stop_reason),
+                        t7_pairs=len(t7_pairs),
                     ))
                     remember_pdb_geometry(
                         out_pdb,
@@ -4132,6 +4688,8 @@ def select_basin_hop_parent_pdbs(args, pdbs: list[Path]):
         rows.append({"pdb_path": str(p), "rg_A": rg_A, "end_to_end_A": e2e_A, "contact_count": ccount})
     if len(valid) <= n_parent:
         return valid, rows
+    if bool(getattr(args, "basin_driven_parents", False)):
+        return basin_driven_parent_selection(args, valid, np.vstack(descs), rows)
     X = build_feature_matrix(np.vstack(contacts), np.vstack(descs))
     selected_idx, labels = select_by_minibatch_or_farthest(X, n_parent, args.cluster_method, None)
     selected = []
@@ -4355,6 +4913,11 @@ def run_basin_hopping(
         "seed": args.seed,
         "include_parent": True,
         "hop_offset": 1,
+        "t7": bool(getattr(args, "restraint_forming_kicks", False)),
+        "t7_wall_a": float(getattr(args, "t7_wall_a", 3.8) or 3.8),
+        "t7_k": float(getattr(args, "t7_k", 1000.0) or 1000.0),
+        "t7_capture_a": float(getattr(args, "t7_capture_a", 6.0) or 6.0),
+        "t7_max_pairs": int(getattr(args, "t7_max_pairs", 0) or 0),
     }
     config_path = (Path(args.out) / "basin_hop_config.json") if hop_csv.name == "basin_hop_minima.csv" else hop_csv.with_name(hop_csv.stem + "_config.json")
     config_path.write_text(json.dumps({**asdict(cfg), **base_bh, "smart_search": bool(getattr(args, "smart_search", True)), "seed_dir": str(seed_dir), "out_dir": str(out_dir), "hop_csv": str(hop_csv)}, indent=2))
@@ -5593,6 +6156,102 @@ def select_implicit_survivors(args, implicit_results: list[MinResult]):
     n_final = min(args.n_final_seeds, len(viable_rows))
     selected_idx, basin_labels = select_by_minibatch_or_farthest(X_basin, n_final, args.cluster_method, badness)
 
+    swaps_json = {}
+    if bool(getattr(args, "mirror_balance", False)):
+        sel_signs = []
+        pool_signs = []
+        for r in viable_rows:
+            pool_signs.append(chirality_sign_from_pdb(Path(r["output_pdb"])) or 0)
+        for i in list(selected_idx):
+            sel_signs.append(pool_signs[int(i)])
+
+        def _frac_pos(signs):
+            pos = sum(1 for s in signs if s == 1)
+            return pos / max(1, len(signs))
+        tolerance = float(getattr(args, "mb_tolerance", 0.2) or 0.2)
+        unselected = [i for i in range(len(viable_rows)) if i not in set(int(x) for x in selected_idx)]
+        unselected.sort(key=lambda i: float(badness[i]))
+        swaps = 0
+        sel_list = [int(x) for x in selected_idx]
+        while abs(_frac_pos(sel_signs) - 0.5) > tolerance / 2.0:
+            want = -1 if _frac_pos(sel_signs) > 0.5 else 1
+            pick = None
+            for cand_i in unselected:
+                if pool_signs[cand_i] == want:
+                    pick = cand_i
+                    break
+            if pick is None:
+                break
+            drop = None
+            for pos in range(len(sel_list) - 1, -1, -1):
+                sgn = pool_signs[sel_list[pos]]
+                if (want == 1 and sgn == -1) or (want == -1 and sgn == 1):
+                    drop = pos
+                    break
+            if drop is None:
+                break
+            sel_signs[drop] = pool_signs[pick]
+            sel_list[drop] = pick
+            unselected.remove(pick)
+            swaps += 1
+        selected_idx = np.asarray(sel_list, dtype=int)
+        swaps_json["mirror_balance"] = {
+            "frac_positive_sign_final": float(_frac_pos(sel_signs)),
+            "tolerance": float(tolerance),
+            "swaps": int(swaps),
+        }
+
+    if bool(getattr(args, "sasa_lower_tail", False)):
+        max_ratio = float(getattr(args, "slt_max_ratio", 1.1) or 1.1)
+        floor_q = float(getattr(args, "slt_floor_quantile", 0.05) or 0.05)
+        sasa_pool = []
+        for r in viable_rows:
+            v = sasa_nm2_from_pdb(Path(r["output_pdb"]))
+            sasa_pool.append(v if v is not None and np.isfinite(v) else np.nan)
+        sasa_pool = np.asarray(sasa_pool, dtype=float)
+        finite_pool = np.isfinite(sasa_pool)
+        if finite_pool.sum() >= 50:
+            floor = float(np.nanquantile(sasa_pool, floor_q))
+            sel_list = [int(x) for x in selected_idx]
+            unselected = [i for i in range(len(viable_rows)) if i not in set(sel_list) and np.isfinite(sasa_pool[i])]
+            unselected.sort(key=lambda i: float(badness[i]))
+            swaps_sasa = 0
+            def _q05(vals):
+                return float(np.quantile(vals, floor_q)) if vals else float("inf")
+            while _q05([sasa_pool[i] for i in sel_list]) > floor * max_ratio:
+                pick = None
+                for cand_i in unselected:
+                    if sasa_pool[cand_i] <= floor * max_ratio:
+                        pick = cand_i
+                        break
+                if pick is None:
+                    break
+                drop = None
+                worst_comp = -float("inf")
+                for pos in range(len(sel_list) - 1, -1, -1):
+                    b = float(badness[sel_list[pos]])
+                    if sasa_pool[sel_list[pos]] > floor * max_ratio and b >= worst_comp:
+                        worst_comp = b
+                        drop = pos
+                if drop is None:
+                    break
+                sel_list[drop] = pick
+                unselected.remove(pick)
+                swaps_sasa += 1
+            selected_idx = np.asarray(sel_list, dtype=int)
+            swaps_json["sasa_lower_tail"] = {
+                "viable_pool_q_sasa_nm2": floor,
+                "floor_quantile": floor_q,
+                "max_ratio": max_ratio,
+                "swaps": int(swaps_sasa),
+                "final_q_sasa_nm2": _q05([sasa_pool[i] for i in sel_list]),
+            }
+        else:
+            swaps_json["sasa_lower_tail"] = {"skipped": "fewer than 50 SASA-computable viable candidates"}
+
+    if swaps_json:
+        (out_dir / "selection_balancing.json").write_text(json.dumps(swaps_json, indent=2))
+
     final_rows = []
     for rank, idx in enumerate(selected_idx):
         src = Path(viable_rows[int(idx)]["output_pdb"])
@@ -5601,6 +6260,37 @@ def select_implicit_survivors(args, implicit_results: list[MinResult]):
         row = dict(viable_rows[int(idx)])
         row.update({"survivor_rank": rank, "implicit_basin_id": int(basin_labels[idx]), "implicit_badness": float(badness[idx]), "survivor_pdb_path": str(dst)})
         final_rows.append(row)
+
+    if bool(getattr(args, "adaptive_register_threshold", False)):
+        fallback = float(getattr(args, "art_fallback_a", 3.8) or 3.8)
+        sample_max = 600
+        pooled = []
+        per_seed_counts = []
+        sample_rows = final_rows[:sample_max]
+        for row in sample_rows:
+            dists = _pdb_backbone_no_pair_distances(Path(row["survivor_pdb_path"]), min_sep=2)
+            per_seed_counts.append(len(dists))
+            if dists:
+                pooled.extend(dists)
+        tau, ok_tau, meta = adaptive_register_tau(np.asarray(pooled, dtype=float),
+                                                  guard=(2.5, 6.0), fallback=fallback)
+        per_seed_tau = tau if ok_tau else fallback
+        for row in final_rows:
+            dists = _pdb_backbone_no_pair_distances(Path(row["survivor_pdb_path"]), min_sep=2)
+            if dists:
+                frac = float(np.mean(np.asarray(dists) < per_seed_tau))
+            else:
+                frac = float("nan")
+            row["register_fraction"] = frac
+        art_doc = {
+            "tau_a": float(per_seed_tau),
+            "valley_detected": bool(ok_tau),
+            "fallback_a": fallback,
+            "meta": meta,
+            "n_survivors_histogrammed": int(len(sample_rows)),
+            "n_distances": int(len(pooled)),
+        }
+        (out_dir / "adaptive_register_threshold.json").write_text(json.dumps(art_doc, indent=2))
 
     viable_labeled = []
     for i, row in enumerate(viable_rows):
@@ -7446,6 +8136,63 @@ def parse_args(argv=None):
                         "(often well above what's actually reachable), so start small "
                         "(0.05-0.3): values near or above 1.0 can crush acceptance to near-zero "
                         "and exhaust --n before enough candidates are found.")
+    p.add_argument("--coverage-uniformization", action="store_true",
+                   help="T1: acceptance weighted toward sparse regions of the proposal-space "
+                        "(rg, e2e, contact_count) density estimated at startup from this run's "
+                        "own proposals, replacing the global contact bias. Mutually exclusive "
+                        "with --contact-bias-*. Spec T1.")
+    p.add_argument("--cu-alpha", type=float, default=0.5,
+                   help="Coverage-uniformization aggressiveness exponent (0=off, 1=full inverse weight). Default 0.5.")
+    p.add_argument("--cu-max-weight-ratio", type=float, default=8.0,
+                   help="Cap on per-candidate coverage-uniformization weight. Default 8.")
+    p.add_argument("--cu-warmup-samples", type=int, default=4000,
+                   help="Deterministic warmup proposals fitting the density table before generation. Default 4000.")
+    p.add_argument("--basin-driven-parents", action="store_true",
+                   help="T2: allocate BH parents across geometric basins as n_basin^gamma with "
+                        "per-basin medoid picks, so rare basins receive expansion budget. Spec T2.")
+    p.add_argument("--bdp-gamma", type=float, default=0.25,
+                   help="Basin-allocation exponent (0 = one parent per basin, 1 = count-proportional). Default 0.25.")
+    p.add_argument("--bdp-max-parents-per-basin", type=int, default=6)
+    p.add_argument("--turn-type-tiling", action="store_true",
+                   help="T3: with probability --ttt-fraction per residue pair, redraw its (phi,psi) "
+                        "from a universal beta-turn window library instead of the stratified pool; "
+                        "universal for any sequence. Spec T3.")
+    p.add_argument("--ttt-fraction", type=float, default=0.35,
+                   help="Fraction of consecutive residue pairs receiving a universal turn-type overlay. Default 0.35.")
+    p.add_argument("--adaptive-register-threshold", action="store_true",
+                   help="T4: derive the register (backbone N-O) threshold from the bank's own "
+                        "distance-distribution valley instead of a fixed cutoff; recorded to "
+                        "adaptive_register_threshold.json and register_fraction column. Spec T4.")
+    p.add_argument("--art-fallback-a", type=float, default=3.8,
+                   help="Fallback register threshold if no bimodal valley exists. Default 3.8 A.")
+    p.add_argument("--mirror-balance", action="store_true",
+                   help="T5: stratify final survivors by backbone-scaffold chirality sign so no "
+                        "hand exceeds --mb-tolerance imbalance. The mechanism uses no "
+                        "experimental folded hand (universal). Spec T5.")
+    p.add_argument("--mb-tolerance", type=float, default=0.2,
+                   help="Max allowed |frac(+) - frac(-)| imbalance of survivor chirality signs. Default 0.2.")
+    p.add_argument("--sasa-lower-tail", action="store_true",
+                   help="T6: preserve the tight-packing tail of the candidate pool through final "
+                        "selection: survivor lower-quantile SASA must lie within --slt-max-ratio "
+                        "of the viable pool's. Spec T6.")
+    p.add_argument("--slt-max-ratio", type=float, default=1.1,
+                   help="Max allowed ratio of final-survivor to viable-pool lower SASA quantile. Default 1.1.")
+    p.add_argument("--slt-floor-quantile", type=float, default=0.05,
+                   help="SASA quantile used as the tightness floor reference. Default 0.05.")
+    p.add_argument("--slt-sharpness-nm", type=float, default=0.3)
+    p.add_argument("--restraint-forming-kicks", action="store_true",
+                   help="T7: during BH MD kicks, hold backbone N-O pairs (|i-j|>=3, any sequence) "
+                        "that lie near the minimized parent inside a flat-bottom upper wall, then "
+                        "release the restraint before re-minimization. Targets the minimizer-reach "
+                        "deficit diagnosed in the rep4 campaign. Spec T7 candidate.")
+    p.add_argument("--t7-wall-a", type=float, default=3.8,
+                   help="T7 flat-bottom upper wall for restrained N-O pairs (A). Default 3.8.")
+    p.add_argument("--t7-k", type=float, default=1000.0,
+                   help="T7 flat-bottom force constant (kJ/mol/nm^2). Default 1000.")
+    p.add_argument("--t7-capture-a", type=float, default=6.0,
+                   help="T7 capture radius: parent N-O pairs closer than this are restrained (A). Default 6.0.")
+    p.add_argument("--t7-max-pairs", type=int, default=0,
+                   help="T7 cap on restrained pairs per parent, nearest first (0 = no cap). Default 0.")
     p.add_argument("--preselection-bin-quota", type=int, default=0,
                    help="If >0, keep at most this many generated conformers per coarse Rg/E2E/contact-count/bin before clustering. Cheaply removes duplicate shapes.")
     p.add_argument("--preselection-rg-bin-A", type=float, default=1.0)
