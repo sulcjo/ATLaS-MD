@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 180" role="img" aria-labelledby="title desc">
+  <title id="title">ATLaS-MD logo</title>
+  <desc id="desc">Stylized free-energy landscape with connected thermodynamic states beside the ATLaS-MD wordmark.</desc>
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#58a6ff"/>
+      <stop offset="1" stop-color="#a371f7"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(20 20)">
+    <path d="M8 116 C36 98 48 42 82 52 C111 60 111 116 144 108 C168 102 174 60 202 66 C229 72 233 102 260 92" fill="none" stroke="url(#g)" stroke-width="8" stroke-linecap="round"/>
+    <g fill="#0d1117" stroke="url(#g)" stroke-width="6">
+      <circle cx="40" cy="90" r="11"/><circle cx="82" cy="52" r="11"/><circle cx="123" cy="91" r="11"/><circle cx="168" cy="86" r="11"/><circle cx="202" cy="66" r="11"/><circle cx="244" cy="92" r="11"/>
+    </g>
+    <g stroke="#8b949e" stroke-width="3" opacity=".75">
+      <path d="M50 84 L72 59"/><path d="M92 59 L115 83"/><path d="M133 90 L157 87"/><path d="M178 80 L192 71"/><path d="M212 72 L234 87"/>
+    </g>
+  </g>
+  <text x="310" y="88" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="64" font-weight="760" fill="#e6edf3">ATLaS-MD</text>
+  <text x="314" y="126" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="21" letter-spacing="1.1" fill="#8b949e">ADAPTIVE THERMODYNAMIC LANDSCAPE SAMPLING</text>
+</svg>
