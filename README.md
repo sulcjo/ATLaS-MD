@@ -1,32 +1,43 @@
-# ATLaS-MD
+<p align="center">
+  <img src="docs/atlas-md/assets/atlas-md-logo.svg" alt="ATLaS-MD" width="720">
+</p>
 
-**Adaptive Thermodynamic Landscape Sampling for molecular dynamics**
+<p align="center">
+  <a href="https://github.com/sulcjo/ATLaS-MD/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/sulcjo/ATLaS-MD/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/sulcjo/ATLaS-MD/actions/workflows/deploy-atlas-md.yml"><img alt="Docs" src="https://github.com/sulcjo/ATLaS-MD/actions/workflows/deploy-atlas-md.yml/badge.svg"></a>
+  <img alt="Python" src="https://img.shields.io/badge/python-%E2%89%A53.10-3776AB?logo=python&logoColor=white">
+  <img alt="OpenMM" src="https://img.shields.io/badge/OpenMM-%E2%89%A58-5C6BC0">
+  <img alt="Release" src="https://img.shields.io/badge/release-v0.7-2ea44f">
+  <img alt="Research software" src="https://img.shields.io/badge/status-research%20software-6f42c1">
+</p>
+
+<p align="center">
+  <strong>Adaptive Thermodynamic Landscape Sampling for molecular dynamics</strong>
+</p>
 
 ATLaS-MD is an OpenMM-based peptide sampling framework for explicit-solvent umbrella sampling, replica exchange, GaMD/Pep-GaMD acceleration, adaptive state placement, and MBAR-ready analysis.
 
 It is designed for workflows where the sampling protocol itself is part of the scientific method: state definitions are explicit, exchange kernels are tested against their target distribution, adaptive phases are tracked separately, and production data are written with enough provenance to reconstruct the sampled Hamiltonians later.
 
-> **Current release:** `v0.7`  
-> **Python:** `>=3.10`  
-> **OpenMM:** `>=8`
+<p align="center">
+  <img src="docs/atlas-md/assets/workflow.svg" alt="ATLaS-MD scientific workflow" width="100%">
+</p>
 
 ## Why ATLaS-MD
-
-ATLaS-MD combines several enhanced-sampling layers in one reproducible workflow:
 
 | Capability | What it provides |
 |---|---|
 | **Umbrella sampling / REUS** | 1D and 2D biased state ensembles with explicit cross-state energy evaluation |
 | **GaMD / Pep-GaMD** | Optional accelerated dynamics, including state-dependent lambda ladders |
 | **Adaptive windows** | Pilot-driven refinement, sparse 2D layouts, Delaunay feedback, and epoch-based production |
-| **NVT / NPT production** | Conventional OpenMM dynamics plus corrected application-controlled NPT moves for supported boosted Hamiltonians |
+| **NVT / NPT production** | Conventional OpenMM dynamics plus application-controlled NPT moves for supported boosted Hamiltonians |
 | **GENPEPT seeding** | Conformer generation and CV-aware starting-state selection |
 | **MBAR-ready storage** | Per-sample CVs, energies, state mappings, exchange records, and phase-local Hamiltonian metadata |
 | **Reproducibility** | Checkpoints, manifests, source/input hashes, segment tracking, and restart-safe output layout |
 
 ## Scientific contract
 
-ATLaS-MD treats thermodynamic correctness as an explicit part of the implementation.
+ATLaS-MD treats thermodynamic correctness as part of the implementation rather than an afterthought.
 
 The intended state Hamiltonian is
 
@@ -40,13 +51,13 @@ W_k(x,V)
 \Delta V_k(x,V),
 \]
 
-with replica exchange evaluated by cross-pricing the state-dependent terms under the candidate thermodynamic states.
+with replica exchange evaluated by cross-pricing state-dependent terms under the candidate thermodynamic states.
 
 Elementary exchange moves are constructed to satisfy detailed balance with respect to the intended extended ensemble. Sequential exchange sweeps preserve the same stationary distribution, although a complete sweep need not itself be reversible.
 
-For boosted NPT, ATLaS-MD does not rely on OpenMM's native barostat acceptance energy when that energy would omit the integrator-applied GaMD boost or include auxiliary bookkeeping forces. Supported boosted modes instead use an application-controlled Metropolis volume move against the effective potential actually being propagated.
+For boosted NPT, supported modes use an application-controlled Metropolis volume move against the effective potential actually being propagated rather than assuming the native OpenMM barostat sees integrator-applied GaMD terms.
 
-See **[Thermodynamic target and detailed-balance contract](docs/atlas-md/guide/thermodynamic-validity.md)** for the derivation, assumptions, validation scope, and remaining limitations.
+Read the full **[thermodynamic target and detailed-balance contract](docs/atlas-md/guide/thermodynamic-validity.md)** for the derivation, assumptions, validation scope, and remaining limitations.
 
 ## Quick start
 
@@ -56,7 +67,7 @@ Install the full local stack:
 pip install -e ".[all]"
 ```
 
-`gamd-openmm` is an external dependency and is required only for `gamd` / `hmr-gamd` runs.
+`gamd-openmm` is an external dependency required only for `gamd` / `hmr-gamd` runs.
 
 Run a minimal peptide workflow:
 
@@ -64,7 +75,7 @@ Run a minimal peptide workflow:
 gareus --seq CLN025 --out run_cln025
 ```
 
-Write an editable configuration first:
+Or start from a version-controlled configuration:
 
 ```bash
 gareus --write-config-template chignolin.yaml
@@ -94,38 +105,7 @@ gareus \
   --out run_adaptive
 ```
 
-## Workflow
-
-```text
-sequence / seeds
-      |
-      v
-system construction + equilibration
-      |
-      v
-CV definition + state construction
-      |
-      v
-umbrella / GaMD / lambda state ensemble
-      |
-      v
-REUS / Gibbs-walk exchange
-      |
-      +--> adaptive feedback / new epoch
-      |
-      v
-frozen production
-      |
-      v
-Parquet samples + exchange ledger
-      |
-      v
-MBAR / PMF / diagnostics
-```
-
-Adaptive pilot and production epochs are intentionally tracked as distinct thermodynamic phases rather than silently pooled.
-
-## Main run modes
+## Sampling modes
 
 ### Conventional MD
 
@@ -182,7 +162,7 @@ GENPEPT survivors are scored in the active CV space and audited under `us_starti
 
 ## Exchange modes
 
-ATLaS-MD currently supports:
+ATLaS-MD supports:
 
 - `neighbor` — nearest-neighbor REUS/HREX exchange;
 - `random-pair` — randomly scheduled symmetric pair exchanges;
@@ -193,7 +173,7 @@ The exact finite-state validation suite checks detailed balance for elementary e
 
 ## Output model
 
-The production output is designed to remain analyzable after adaptive changes, restart events, and long runs.
+Production output remains analyzable across adaptive changes, restart events, and long runs.
 
 ```text
 run/
@@ -212,7 +192,7 @@ run/
 └── final_run_report.md
 ```
 
-Important design rule: **state identity is explicit and phase-local**. Analysis should not infer thermodynamic state solely from a replica index or raw local window number.
+**State identity is explicit and phase-local.** Analysis should not infer thermodynamic state solely from replica index or a raw local window number.
 
 ## Analysis
 
@@ -248,27 +228,19 @@ gareus-energy-decompose --run-dir run_cln025 --out energy_decomposition.csv
 
 ## Resume and long runs
 
-ATLaS-MD supports production and epoch-level restart:
-
 ```bash
 gareus --config chignolin.yaml --resume
 ```
 
 Resume state includes exchange assignments, RNG state, production counters, segment provenance, and supported NPT-controller state. Interrupted output segments are sealed so rows beyond the last valid checkpoint are not silently reused as equilibrium data.
 
-## Validation and testing
+## Validation
 
-Fast test suite:
+Fast checks:
 
 ```bash
 pytest
-```
-
-Basic package checks:
-
-```bash
-python -m py_compile gareus/*.py gareus_peptide.py GENPEPT.py
-python -m gareus --help
+python -m mkdocs build --strict
 ```
 
 Real workflow smoke test:
@@ -278,36 +250,13 @@ gareus-test-run --check-deps --skip-if-missing
 gareus-test-run --out tiny_real_test --force
 ```
 
-The validation suite includes checks for:
+The validation suite includes checks for exact exchange-kernel detailed balance, Gibbs proposal/reverse-proposal correctness, lambda-ladder boost cross-evaluation, NPT acceptance algebra and molecular Jacobians, GaMD/Pep-GaMD force-group wiring, checkpoint/resume consistency, and state/window-map provenance.
 
-- exact exchange-kernel detailed balance on finite state spaces;
-- Gibbs proposal/reverse-proposal correctness;
-- lambda-ladder boost cross-evaluation;
-- NPT acceptance algebra and molecular Jacobians;
-- GaMD/Pep-GaMD force-group wiring;
-- checkpoint and resume consistency;
-- state/window-map provenance.
-
-Finite-timestep propagation is not claimed to be mathematically exact. See the thermodynamic contract for the distinction between an exact transition-kernel statement and numerical sampling accuracy.
+Finite-timestep propagation is not claimed to be mathematically exact. The thermodynamic contract separates exact transition-kernel statements from numerical sampling accuracy and post-hoc estimator validity.
 
 ## Documentation
 
-The full manual covers installation, tutorials, workflow design, scientific assumptions, analysis, operations, and developer internals:
-
-**https://sulcjo.github.io/2026_peptide_sampler/**
-
-Build it locally with:
-
-```bash
-pip install -e ".[docs]"
-python -m mkdocs serve
-```
-
-Strict static build:
-
-```bash
-python -m mkdocs build --strict
-```
+**[Full ATLaS-MD manual](https://sulcjo.github.io/2026_peptide_sampler/)**
 
 Useful entry points:
 
@@ -317,6 +266,13 @@ Useful entry points:
 - [Adaptive workflows](docs/atlas-md/guide/adaptive-workflows.md)
 - [PMF validity](docs/atlas-md/analysis/pmf-validity.md)
 - [Architecture](docs/atlas-md/developer/architecture.md)
+
+Build locally:
+
+```bash
+pip install -e ".[docs]"
+python -m mkdocs serve
+```
 
 ## Package architecture
 
@@ -335,9 +291,15 @@ Useful entry points:
 | `gareus/provenance.py` | Run manifests and reproducibility metadata |
 | `GENPEPT.py` | Conformer generation and seed-library construction |
 
-## Command reference
+## Contributing and citation
 
-Use the CLI as the source of truth for available options:
+Methodological changes are expected to state their target distribution or invariant and include an independent validation route. See **[CONTRIBUTING.md](CONTRIBUTING.md)** and the dedicated thermodynamic/methodological issue template.
+
+If ATLaS-MD contributes to published work, use the repository's **`CITATION.cff`** metadata and cite the relevant underlying methods used in the workflow.
+
+Release history is tracked in **[CHANGELOG.md](CHANGELOG.md)**.
+
+## Command reference
 
 ```bash
 gareus -h      # operational help
@@ -345,3 +307,7 @@ gareus -hh     # extended method / option reference
 ```
 
 For reproducible production work, prefer version-controlled YAML configuration over long shell commands.
+
+---
+
+ATLaS-MD is research software. A successful run is not, by itself, evidence of converged or statistically valid free-energy inference; coverage, overlap, effective sample size, reweighting stability, and estimator assumptions still need to be checked for every scientific conclusion.
