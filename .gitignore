@@ -37,6 +37,8 @@ gareus_adaptive_production_v*/
 # document has to exist in the repository the operator is reading those warnings in.
 !docs/chignolin_6_low_ess_root_cause.md
 !docs/atlas_md_boltzmann_validation.md
+# Package deliverable reports at the worktree root (NPT correction handoff).
+!NPT_PACKAGE_A_REPORT.md
 
 illustrate_seedbank.png
 poincare_map.py
