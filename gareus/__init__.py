@@ -10,6 +10,8 @@ into standalone modules at this stage.  Additional functions and
 classes will be migrated over time.
 """
 
+__version__ = "0.7"
+
 # Re‑export commonly used helpers for convenience
 from . import constants  # noqa: F401
 from . import units  # noqa: F401
@@ -40,6 +42,7 @@ from . import store  # noqa: F401
 from . import query  # noqa: F401
 
 __all__ = [
+    "__version__",
     "constants",
     "units",
     "colors",

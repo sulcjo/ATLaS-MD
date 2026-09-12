@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
+from . import __version__ as PACKAGE_VERSION
 from .colors import ROLE_BAD, role_text
 from .provenance import _dist_version, _optional_module_version
 
@@ -240,7 +241,7 @@ def _ckpt_row(out_dir: Path) -> Optional[str]:
 
 
 def _panel_rows(args: Any, out_dir: Path, resume: bool, mbar_version: Optional[str]) -> list[tuple[str, str]]:
-    version = _dist_version("gareus-peptide") or "dev"
+    version = PACKAGE_VERSION or _dist_version("gareus-peptide") or "dev"
     rows = [
         ("campaign", f"{Path(out_dir).name}   version  v{version}   date  {datetime.now().strftime('%Y-%m-%d')}"),
         ("hw", _hw_row(args)),
