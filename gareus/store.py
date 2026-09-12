@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -42,10 +43,6 @@ class _ManifestParquetWriter:
     def _init_manifest_state(self) -> None:
         manifest = load_manifest(self._out_dir, expected_kind=self.kind, verify_hashes=False)
         if manifest is None:
-            # A writer must never append blindly to a legacy segment: that was
-            # the route by which a consolidated data.parquet later acquired a
-            # second overlapping chunk set. Legacy directories stay readable,
-            # but require an explicit repair/migration before further writes.
             legacy = sorted(self._out_dir.glob("*.parquet"))
             if legacy:
                 raise ParquetManifestError(
@@ -82,9 +79,6 @@ class _ManifestParquetWriter:
             first_step=first_step,
             last_step=last_step,
         )
-        # The manifest is published last. A kill between the Parquet rename
-        # and this replace leaves an orphan file, not a scientifically visible
-        # committed file for manifest-aware readers.
         append_file_to_manifest(
             self._out_dir,
             kind=self.kind,
@@ -96,10 +90,9 @@ class _ManifestParquetWriter:
     def _consolidate(self) -> None:
         """Transactionally compact the currently committed file set.
 
-        Old files are not removed until the new compact file has been written,
-        validated and made authoritative by an atomic manifest replacement.
-        A crash during best-effort cleanup therefore leaves harmless unreferenced
-        Parquet files rather than two logical copies of the same rows.
+        Old files are removed only after an atomic manifest switch. The compact
+        filename is unique so a kill after its rename but before publication
+        leaves an ignorable orphan and a retry can proceed without manual cleanup.
         """
         import pyarrow.dataset as ds
         import pyarrow.parquet as pq
@@ -117,10 +110,11 @@ class _ManifestParquetWriter:
                 f"read {table.num_rows} rows, manifest declares {manifest['n_rows']}"
             )
 
-        compact_name = f"compact_{int(manifest['generation']) + 1:06d}.parquet"
+        compact_name = (
+            f"compact_{int(manifest['generation']) + 1:06d}_"
+            f"{uuid.uuid4().hex[:12]}.parquet"
+        )
         compact_path = self._out_dir / compact_name
-        if compact_path.exists():
-            raise ParquetManifestError(f"compaction destination already exists: {compact_path}")
         tmp = compact_path.with_name(f"{compact_path.name}.tmp.{os.getpid()}")
         pq.write_table(table, tmp, compression="zstd", compression_level=3)
         _fsync_path(tmp)
@@ -141,8 +135,6 @@ class _ManifestParquetWriter:
             next_chunk_index=self._chunk_idx + 1,
         )
 
-        # Cleanup is deliberately after the manifest switch. Failures here are
-        # safe: readers ignore any old file no longer referenced by the manifest.
         for path in old_paths:
             if path != compact_path:
                 try:
