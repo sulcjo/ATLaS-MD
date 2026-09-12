@@ -278,6 +278,10 @@ def _method_settings(args: Any) -> dict[str, Any]:
         "gamd_boost_type", "sigma0p_kcal_mol", "sigma0d_kcal_mol", "gamd_production_steps",
         "exchange_mode", "exchange_interval", "traj_format", "sample_potential_energy",
         "flush_every_log", "analysis_array_dtype", "state_gamd_lambdas",
+        # NPT correction (2026-09-12 design): the resolved backend and the
+        # fixed-width fraction are load-bearing for checkpoint compatibility --
+        # a resume must not silently change who owns volume moves.
+        "npt_barostat_backend", "barostat_volume_step_fraction",
         # Unbiased swarm stage (gareus/swarm/): every --swarm-* argparse dest plus the
         # public --shared-gamd-setup-dir flag it shares with production's envelope reuse
         # path (global-constraints.md's binding anchor -- these are ab initio, no native

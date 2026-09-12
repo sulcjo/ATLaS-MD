@@ -416,6 +416,12 @@ def _basic_chignolin_config() -> Dict[str, Any]:
             "forcefield": "ff14SB",
             "water_model": "tip3p",
             "ionic_strength_molar": 0.15,
+            # NPT correction: who owns volume moves under production NPT.
+            # auto keeps native for conventional MD and selects the
+            # application-controlled biased Monte Carlo for supported boosted
+            # modes; explicit native + boosted dynamics is refused.
+            "npt_barostat_backend": "auto",
+            "barostat_volume_step_fraction": 0.01,
         },
         "cvs": {
             "cv1": "contacts",

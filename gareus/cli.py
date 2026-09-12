@@ -72,6 +72,17 @@ def _add_system_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--pressure-bar", type=float, default=1.0)
     p.add_argument("--barostat-frequency", type=int, default=100)
     p.add_argument("--production-ensemble", choices=["npt", "nvt"], default="npt")
+    p.add_argument(
+        "--npt-barostat-backend", choices=["auto", "native", "biased_mc"], default="auto",
+        help="Who owns volume moves under NPT. auto: native barostat for conventional "
+             "MD, application-controlled biased Monte Carlo for supported boosted "
+             "modes (gareus.npt), loud failure otherwise. Explicit native with boosted "
+             "dynamics is refused. Ignored (must stay auto) under NVT.")
+    p.add_argument(
+        "--barostat-volume-step-fraction", type=float, default=0.01,
+        help="Biased-MC volume proposal half-width as a fraction of the replica's "
+             "STARTING volume, converted once to a fixed absolute width in nm^3 "
+             "(never a fraction of the current volume).")
     p.add_argument("--minimize-iterations", type=int, default=20000)
     p.add_argument("--npt-steps", type=int, default=100000)
     p.add_argument("--nvt-warmup-steps", type=int, default=20000)
@@ -944,6 +955,50 @@ def _validate_gamd_args(args: argparse.Namespace) -> None:
         )
 
 
+def _validate_npt_args(args: argparse.Namespace) -> None:
+    """Cross-validate the NPT-correction flags.
+
+    This is the early, argument-level half of the backend decision; the
+    authoritative dispatch (including every auto rule and unsupported-boost
+    failure) happens at system construction via
+    ``gareus.system_setup.resolve_barostat_ownership`` /
+    ``gareus.npt.resolve_npt_backend``.  What is checked here is what the raw
+    flags alone already contradict:
+
+    * an explicit backend under NVT (an NVT run has no volume controller);
+    * an explicit native backend with boosted dynamics (gamd/hmr-gamd run
+      modes) under NPT -- the known-wrong acceptance energy must fail, never
+      be silently preserved;
+    * a non-finite or non-positive volume-step fraction.
+    """
+    backend = str(getattr(args, "npt_barostat_backend", "auto") or "auto").strip().lower()
+    ensemble = str(getattr(args, "production_ensemble", "npt") or "npt").strip().lower()
+    raw_fraction = getattr(args, "barostat_volume_step_fraction", None)
+    # None/absent falls back to the default; an explicit 0 must NOT (it would
+    # otherwise be silently swallowed by the `or` fallback below).
+    fraction = float(raw_fraction) if raw_fraction is not None else 0.01
+    if not math.isfinite(fraction) or not 0.0 < fraction < 1.0:
+        raise ValueError(
+            f"--barostat-volume-step-fraction must be in (0, 1) (got {fraction!r})"
+        )
+    if backend == "auto":
+        return
+    if ensemble != "npt":
+        raise ValueError(
+            f"--npt-barostat-backend {backend!r} requires --production-ensemble npt; "
+            "an NVT run has no volume controller"
+        )
+    run_mode = str(getattr(args, "run_mode", "gamd") or "gamd").strip().lower()
+    if backend == "native" and run_mode in {"gamd", "hmr-gamd"}:
+        raise ValueError(
+            "--npt-barostat-backend native was requested with a boosted run mode "
+            f"(--run-mode {run_mode!r}): the native barostat's acceptance energy "
+            "excludes the boost and includes the Pep-GaMD auxiliary force, so it "
+            "samples the wrong volume distribution. Use the default (auto) or "
+            "biased_mc; native is only valid for conventional MD."
+        )
+
+
 # Only the gamd-openmm stage-integrator CONSTRUCTOR arguments (ntcmd, nteb) are
 # constrained by ntave.  The recon stages step an integrator that already exists
 # (plain cMD, or the GaMD integrator seeded with copied globals) for an arbitrary
@@ -1489,6 +1544,7 @@ def parse_args(argv: Optional[Iterable[str]] = None):
     args.contact_scheme = contact_scheme(args)
     _validate_contact_args(args)
     _validate_gamd_args(args)
+    _validate_npt_args(args)
     validate_gamd_stage_multiples(args)
 
     return args

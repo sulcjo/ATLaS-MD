@@ -63,6 +63,9 @@ __all__ = [
     "run_steps_safely",
     "minimize_and_npt_equilibrate",
     "_write_box_audit",
+    "BarostatOwnership",
+    "resolve_barostat_ownership",
+    "preflight_barostat_ownership",
 ]
 
 
@@ -479,6 +482,236 @@ def create_system(app, unit, forcefield, topology, args, include_barostat: bool,
         )
         system.addForce(barostat)
     return system
+
+
+# ---------------------------------------------------------------------------
+# Barostat ownership (NPT correction, spec sections 5-6)
+#
+# The decision of WHO owns volume sampling must be made BEFORE any Context is
+# created from a System: the application-controlled backend requires the native
+# MonteCarloBarostat to be absent from the System it drives, and the native
+# backend requires exactly one barostat and no application controller.
+# ---------------------------------------------------------------------------
+
+# Barostat families this correction explicitly does not support (spec section
+# 4: no anisotropic or membrane barostats; their proposal/Jacobian differs).
+# MonteCarloFlexibleBarostat (flexible constraints) and the RPMD variant are
+# excluded for the same reason: only the isotropic rigid-constraint
+# MonteCarloBarostat / biased-MC proposal has a verified Jacobian here.
+_UNSUPPORTED_BAROSTAT_FORCE_NAMES = (
+    "MonteCarloAnisotropicBarostat",
+    "MonteCarloMembraneBarostat",
+    "MonteCarloFlexibleBarostat",
+    "RPMDMonteCarloBarostat",
+)
+
+
+class BarostatOwnership:
+    """Resolved barostat ownership for one System-construction site.
+
+    ``backend`` is one of ``"none"`` (NVT: no volume controller of any kind),
+    ``"native"`` (the OpenMM MonteCarloBarostat stays in the System) or
+    ``"biased_mc"`` (the application-controlled
+    ``gareus.npt.BiasedMCBarostatController`` owns volume moves and the native
+    barostat must never be added to the System).
+    """
+
+    def __init__(
+        self,
+        backend: str,
+        *,
+        requested: str,
+        ensemble: str,
+        run_mode: str,
+        boost_type: str,
+        barostat_frequency: int,
+        pressure_bar: float,
+        temperature_k: float,
+        volume_step_fraction: float,
+    ):
+        self.backend = str(backend)
+        self.requested = str(requested)
+        self.ensemble = str(ensemble)
+        self.run_mode = str(run_mode)
+        self.boost_type = str(boost_type)
+        self.barostat_frequency = int(barostat_frequency)
+        self.pressure_bar = float(pressure_bar)
+        self.temperature_k = float(temperature_k)
+        self.volume_step_fraction = float(volume_step_fraction)
+
+    @property
+    def include_native_barostat(self) -> bool:
+        """What to pass as ``create_system(include_barostat=...)``.
+
+        Only ``native`` keeps the native barostat; ``biased_mc`` systems are
+        built without it from the start (removal before Context creation).
+        """
+        return self.backend == "native"
+
+    def describe(self) -> str:
+        return (
+            f"backend={self.backend} (requested={self.requested}, ensemble={self.ensemble}, "
+            f"run_mode={self.run_mode}, boost_type={self.boost_type or 'none'}), "
+            f"P={self.pressure_bar:g} bar, T={self.temperature_k:g} K, "
+            f"frequency={self.barostat_frequency} steps"
+            + (
+                f", volume_step_fraction={self.volume_step_fraction:g}"
+                if self.backend == "biased_mc"
+                else ""
+            )
+        )
+
+
+def _production_barostat_frequency(args) -> int:
+    """Existing production override semantics, unchanged by this correction.
+
+    ``--production-barostat-frequency`` (nonzero) wins over
+    ``--barostat-frequency``; both default to 100 today.
+    """
+    freq = int(getattr(args, "production_barostat_frequency", 0) or 0)
+    if freq <= 0:
+        freq = int(getattr(args, "barostat_frequency", 100) or 100)
+    if freq <= 0:
+        raise ValueError(
+            "barostat frequency must be a positive number of integration steps "
+            f"(got production_barostat_frequency={getattr(args, 'production_barostat_frequency', 0)!r}, "
+            f"barostat_frequency={getattr(args, 'barostat_frequency', 100)!r})"
+        )
+    return freq
+
+
+def resolve_barostat_ownership(args, *, ensemble: str, run_mode: Optional[str] = None, boost_type: Optional[str] = None) -> BarostatOwnership:
+    """Decide barostat ownership BEFORE any Context exists.
+
+    This is the single decision point shared by the production base system and
+    the swarm base system.  It delegates the actual backend choice to the
+    frozen ``gareus.npt.resolve_npt_backend`` contract, which fails loudly on
+    the two forbidden silent outcomes: explicit ``native`` with boosted
+    dynamics, and an unsupported boosted mode silently downgraded to NVT.
+
+    NVT never needs the resolver (there is no volume controller regardless of
+    backend); requesting an explicit backend together with NVT is a
+    contradiction and is rejected here.
+    """
+    from . import npt
+
+    requested = str(getattr(args, "npt_barostat_backend", "auto") or "auto").strip().lower()
+    if requested not in {"auto", "native", "biased_mc"}:
+        raise ValueError(
+            f"npt_barostat_backend must be auto, native or biased_mc (got {requested!r})"
+        )
+    ensemble = str(ensemble).strip().lower()
+    if ensemble not in {"npt", "nvt"}:
+        raise ValueError(f"ensemble must be npt or nvt (got {ensemble!r})")
+    mode = str(run_mode if run_mode is not None else getattr(args, "run_mode", "cmd") or "cmd")
+    boost = str(boost_type if boost_type is not None else getattr(args, "gamd_boost_type", "") or "")
+    fraction = float(getattr(args, "barostat_volume_step_fraction", 0.01) or 0.01)
+
+    if ensemble == "nvt":
+        if requested != "auto":
+            raise ValueError(
+                f"--npt-barostat-backend {requested!r} was requested together with "
+                "--production-ensemble nvt: an NVT run has no volume controller; "
+                "either drop the backend flag or select the npt ensemble"
+            )
+        backend = "none"
+    else:
+        # The frozen contract owns the auto/native/biased_mc dispatch, including
+        # the loud failures for explicit-native-with-boost and unsupported
+        # boosted modes (never a silent ensemble downgrade).
+        backend = npt.resolve_npt_backend(
+            ensemble=ensemble,
+            requested=requested,
+            run_mode=mode,
+            boost_type=boost,
+        )
+        if backend not in {"none", "native", "biased_mc"}:
+            raise RuntimeError(
+                f"gareus.npt.resolve_npt_backend returned an unknown backend {backend!r}"
+            )
+
+    ownership = BarostatOwnership(
+        backend,
+        requested=requested,
+        ensemble=ensemble,
+        run_mode=mode,
+        boost_type=boost,
+        barostat_frequency=_production_barostat_frequency(args) if backend != "none" else 0,
+        pressure_bar=float(getattr(args, "pressure_bar", 1.0)),
+        temperature_k=float(getattr(args, "temperature_k", 300.0)),
+        volume_step_fraction=fraction,
+    )
+    print(f"[npt] Barostat ownership resolved: {ownership.describe()}")
+    return ownership
+
+
+def preflight_barostat_ownership(system, ownership: BarostatOwnership) -> dict:
+    """Assert exactly one volume controller and run the physical preflight.
+
+    Called on the fully-assembled application-controlled System (all umbrella
+    and secondary-CV forces added), before the first Context is created from
+    it.  Checks:
+
+    * no unsupported barostat family (anisotropic/membrane) anywhere;
+    * ``native`` backend: exactly one MonteCarloBarostat-family force, and the
+      stepping integrator is conventional (boosted dynamics would make its
+      acceptance energy wrong -- resolve_npt_backend already refuses this, the
+      preflight is the belt to that braces);
+    * ``biased_mc`` backend: zero native barostats (the controller is the one
+      volume controller and is attached per replica later), a periodic box
+      (volume moves need it) and no immobile non-virtual-site particle (the
+      molecule-translation Jacobian cannot count it).
+    """
+    from . import npt
+
+    for i in range(system.getNumForces()):
+        name = system.getForce(i).__class__.__name__
+        if name in _UNSUPPORTED_BAROSTAT_FORCE_NAMES:
+            raise ValueError(
+                f"Force {i} is {name}: anisotropic/membrane barostats are not "
+                "supported by the NPT correction; use the isotropic "
+                "MonteCarloBarostat / biased-MC backends"
+            )
+    n_native = int(npt.count_native_barostats(system))
+    backend = str(ownership.backend)
+    if backend == "native":
+        if n_native != 1:
+            raise RuntimeError(
+                f"native barostat backend requires exactly one MonteCarloBarostat "
+                f"in the System, found {n_native}"
+            )
+        if str(ownership.run_mode) in {"gamd", "hmr-gamd"}:
+            raise RuntimeError(
+                "native barostat backend with boosted dynamics (run_mode="
+                f"{ownership.run_mode!r}) samples the wrong volume distribution: "
+                "the Context potential excludes the boost and includes the "
+                "Pep-GaMD auxiliary energy. Use the biased_mc backend."
+            )
+    elif n_native != 0:
+        raise RuntimeError(
+            f"{backend!r} barostat backend requires the native MonteCarloBarostat "
+            "to be removed from application-controlled Systems before Context "
+            f"creation; found {n_native}"
+        )
+    if backend == "biased_mc":
+        if not bool(system.usesPeriodicBoundaryConditions()):
+            raise RuntimeError("biased_mc NPT requires a periodic System")
+        openmm, _app, _unit = import_openmm()
+        for i in range(system.getNumParticles()):
+            mass = system.getParticleMass(i)
+            if float(mass.value_in_unit(_unit.dalton)) == 0.0 and not system.isVirtualSite(i):
+                raise RuntimeError(
+                    f"particle {i} is massless but not a virtual site: immobile "
+                    "particles break the volume-move molecule Jacobian"
+                )
+    return {
+        "backend": backend,
+        "native_barostats_in_system": n_native,
+        "pressure_bar": float(ownership.pressure_bar),
+        "temperature_k": float(ownership.temperature_k),
+        "barostat_frequency_steps": int(ownership.barostat_frequency),
+        "volume_step_fraction": float(ownership.volume_step_fraction),
+    }
 
 
 def _write_box_audit(

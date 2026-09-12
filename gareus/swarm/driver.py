@@ -35,6 +35,8 @@ from gareus.cv import prepare_primary_cv_definition
 from gareus.imports import import_openmm
 from gareus.system_setup import (
     create_system,
+    resolve_barostat_ownership,
+    preflight_barostat_ownership,
     make_forcefield_from_args,
     minimize_and_npt_equilibrate,
     setup_platform_and_properties,
@@ -264,7 +266,23 @@ def ensure_system(args, out_dir, progress) -> dict:
     openmm, app, unit, forcefield, topology, final_state = minimize_and_npt_equilibrate(args, out_dir, progress)
     write_state_pdb(topology_pdb, app, topology, final_state.getPositions())
     equil_state_xml.write_text(openmm.XmlSerializer.serialize(final_state), encoding="utf-8")
-    base_system = create_system(app, unit, forcefield, topology, args, include_barostat=True)
+    # NPT correction (spec section 5): barostat ownership is decided BEFORE the
+    # swarm base System is built.  Swarm members run UNBOOSTED conventional MD
+    # (make_cmd_integrator), so the resolver's native backend is correct here
+    # and the physical preflight guards the assembled system before any member
+    # Context exists.  base_system.xml then carries whatever ownership decided.
+    swarm_ownership = resolve_barostat_ownership(
+        args,
+        ensemble=str(getattr(args, "production_ensemble", "npt") or "npt"),
+        run_mode="cmd",
+        boost_type="",
+    )
+    base_system = create_system(
+        app, unit, forcefield, topology, args,
+        include_barostat=swarm_ownership.include_native_barostat,
+        barostat_frequency=swarm_ownership.barostat_frequency or None,
+    )
+    preflight_barostat_ownership(base_system, swarm_ownership)
     base_system_xml = openmm.XmlSerializer.serialize(base_system)
     base_system_xml_path.write_text(base_system_xml, encoding="utf-8")
     platform, props = setup_platform_and_properties(openmm, args)
