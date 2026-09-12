@@ -29,8 +29,10 @@ scheduler can be built independently. See
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Literal, Mapping, Protocol
+
+import numpy as np
 
 __all__ = [
     "BarostatBackend",
@@ -208,6 +210,311 @@ class EffectivePotentialAdapter(Protocol):
     def evaluate(self, context: Any, snapshot: object) -> EnergyBreakdown: ...
 
 
+# --------------------------------------------------------------------------- internals
+
+_CONTROLLER_SCHEMA_VERSION = 1
+
+
+def _unit():
+    import openmm.unit as unit
+
+    return unit
+
+
+def _box_matrix_nm(context) -> "np.ndarray":
+    """Current periodic box as a 3x3 matrix in nm (rows are the box vectors)."""
+    vectors = context.getState().getPeriodicBoxVectors()
+    if hasattr(vectors, "value_in_unit"):
+        vectors = vectors.value_in_unit(_unit().nanometer)
+    return np.array([[float(v[i]) for i in range(3)] for v in vectors], dtype=float)
+
+
+def _box_volume_nm3(box: "np.ndarray") -> float:
+    return float(abs(np.linalg.det(box)))
+
+
+def _finite(value: float) -> bool:
+    return isinstance(value, (int, float)) and math.isfinite(float(value))
+
+
+def _log_acceptance(
+    new_effective_kj_mol: float,
+    old_effective_kj_mol: float,
+    new_volume_nm3: float,
+    old_volume_nm3: float,
+    pressure_bar: float,
+    temperature_k: float,
+    n_mol: int,
+) -> float:
+    """log A for the isotropic molecular volume move (spec section 4).
+
+    logA = -beta [U*(x') - U*(x) + P (V' - V)] + N_mol log(V'/V), with beta = 1/(R T)
+    in molar units and 1 bar nm^3 = BAR_NM3_TO_KJ_PER_MOL kJ/mol. The Jacobian
+    counts translated molecules (ions included), and the symmetric-in-V proposal
+    carries no additional +1 exponent.
+    """
+    beta = 1.0 / (_R_KJ_PER_MOL_K * float(temperature_k))
+    pv_kj_mol = float(pressure_bar) * (float(new_volume_nm3) - float(old_volume_nm3)) * BAR_NM3_TO_KJ_PER_MOL
+    du_kj_mol = float(new_effective_kj_mol) - float(old_effective_kj_mol)
+    return -beta * (du_kj_mol + pv_kj_mol) + int(n_mol) * math.log(float(new_volume_nm3) / float(old_volume_nm3))
+
+
+def _molecule_fingerprint(molecules) -> str:
+    import hashlib
+    import json as _json
+
+    canonical = [[int(i) for i in sorted(m)] for m in sorted(molecules, key=lambda m: min(m))]
+    blob = _json.dumps(canonical, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _molecules_from_context(context) -> list[list[int]]:
+    molecules = [[int(i) for i in mol] for mol in context.getMolecules()]
+    seen: set[int] = set()
+    for mol in molecules:
+        for i in mol:
+            if i in seen:
+                raise ValueError(
+                    "unsupported molecule connectivity: particle "
+                    f"{i} appears in more than one molecule"
+                )
+            seen.add(i)
+    n_particles = context.getSystem().getNumParticles()
+    if seen and len(seen) != n_particles:
+        raise ValueError(
+            f"molecule partition covers {len(seen)} of {n_particles} particles; "
+            "refusing an unverified Jacobian"
+        )
+    return molecules
+
+
+def _max_nonbonded_cutoff_nm(context) -> float:
+    """Largest explicit cutoff among NonbondedForces, for the cheap geometry guard."""
+    import openmm as _openmm
+
+    worst = 0.0
+    system = context.getSystem()
+    for i in range(system.getNumForces()):
+        f = system.getForce(i)
+        if not isinstance(f, _openmm.NonbondedForce):
+            continue
+        if f.getNonbondedMethod() == _openmm.NonbondedForce.NoCutoff:
+            continue
+        worst = max(worst, float(f.getCutoffDistance().value_in_unit(_unit().nanometer)))
+    return worst
+
+
+def _min_face_height_nm(box: "np.ndarray") -> float:
+    """Smallest distance between opposite faces of the (possibly triclinic) box."""
+    a, b, c = box[0], box[1], box[2]
+    area_bc = float(np.linalg.norm(np.cross(b, c)))
+    area_ac = float(np.linalg.norm(np.cross(a, c)))
+    area_ab = float(np.linalg.norm(np.cross(a, b)))
+    volume = _box_volume_nm3(box)
+    return min(volume / area for area in (area_bc, area_ac, area_ab))
+
+
+class _ControllerCore:
+    """State shared by initialize/restore; the public class is a thin shell."""
+
+    def __init__(self, context, adapter, pressure_bar, temperature_k, frequency_steps,
+                 half_width_nm3, molecules, rng, counters, next_due_step, last_due_step,
+                 max_cutoff_nm):
+        self._context = context
+        self._adapter = adapter
+        self._pressure_bar = float(pressure_bar)
+        self._temperature_k = float(temperature_k)
+        self._frequency_steps = int(frequency_steps)
+        self._half_width_nm3 = float(half_width_nm3)
+        self._molecules = molecules
+        self._n_mol = len(molecules)
+        self._fingerprint = _molecule_fingerprint(molecules)
+        self._rng = rng
+        self._counters = counters
+        self._next_due_step = int(next_due_step)
+        self._last_due_step = int(last_due_step)
+        self._max_cutoff_nm = float(max_cutoff_nm)
+
+    # -- schedule ---------------------------------------------------------------
+
+    @property
+    def next_due_step(self) -> int:
+        return self._next_due_step
+
+    def steps_until_due(self, current_step: int) -> int:
+        return max(0, self._next_due_step - int(current_step))
+
+    # -- checkpoint --------------------------------------------------------------
+
+    def state_dict(self) -> dict[str, object]:
+        rng_state = self._rng.bit_generator.state
+        state = {
+            "state": {k: (int(v) if isinstance(v, int) else v) for k, v in rng_state["state"].items()},
+            "has_uint32": int(rng_state["has_uint32"]),
+            "uinteger": int(rng_state["uinteger"]),
+        }
+        return {
+            "schema_version": _CONTROLLER_SCHEMA_VERSION,
+            "backend": "biased_mc",
+            "adapter_id": str(self._adapter.adapter_id),
+            "pressure_bar": self._pressure_bar,
+            "temperature_k": self._temperature_k,
+            "frequency_steps": self._frequency_steps,
+            "half_width_nm3": self._half_width_nm3,
+            "n_molecules": self._n_mol,
+            "molecule_partition_fingerprint": self._fingerprint,
+            "rng": {"algorithm": "PCG64", **state},
+            "counters": dict(self._counters),
+            "last_due_step": self._last_due_step,
+            "next_due_step": self._next_due_step,
+        }
+
+    # -- transaction -------------------------------------------------------------
+
+    def _restore_positions(self, positions: "np.ndarray", box: "np.ndarray") -> None:
+        import openmm as _openmm
+
+        self._context.setPeriodicBoxVectors(*(_openmm.Vec3(*map(float, row)) for row in box))
+        self._context.setPositions(positions)
+
+    def _verify_restoration(self, positions: "np.ndarray", box: "np.ndarray") -> None:
+        pos_now, box_now = _read_positions_and_box(self._context)
+        if not (np.array_equal(pos_now, positions) and np.array_equal(box_now, box)):
+            raise RuntimeError(
+                "barostat trial restoration failed: the Context does not hold the "
+                "pre-trial positions/box after restore; this is fatal"
+            )
+
+    def attempt_due(self, current_step: int) -> VolumeMoveResult:
+        current_step = int(current_step)
+        if current_step < self._next_due_step:
+            raise ValueError(
+                f"volume move not due yet: current_step={current_step}, next_due_step={self._next_due_step}"
+            )
+        self._counters["attempted"] += 1
+
+        # 1. Snapshot target parameters and consume the trial's random draws.
+        integrator = self._context.getIntegrator()
+        snapshot = self._adapter.snapshot(self._context, integrator)
+        delta_raw = float(self._rng.uniform(-1.0, 1.0))
+        accept_draw = float(self._rng.uniform())
+
+        # 2. Current U* from fresh energies. This happens before any mutation,
+        #    so an unexpected error here needs no restoration, but must still
+        #    abort with context rather than passing silently.
+        try:
+            old = self._adapter.evaluate(self._context, snapshot)
+        except Exception as exc:
+            raise RuntimeError(
+                f"volume-move trial failed while evaluating the current U* at step "
+                f"{current_step}; the Context was not modified"
+            ) from exc
+        for name in ("physical_kj_mol", "bias_kj_mol", "boost_kj_mol",
+                     "auxiliary_kj_mol", "effective_kj_mol"):
+            if not _finite(getattr(old, name)):
+                raise RuntimeError(
+                    f"nonfinite old energy component {name}={getattr(old, name)!r}; aborting"
+                )
+        positions, box = _read_positions_and_box(self._context)
+        old_volume = _box_volume_nm3(box)
+
+        def _finish(accepted: bool, reason: str, log_a: float,
+                    proposed_volume: float, current: EnergyBreakdown) -> VolumeMoveResult:
+            self._last_due_step = current_step
+            self._next_due_step = current_step + self._frequency_steps
+            if accepted:
+                self._counters["accepted"] += 1
+            else:
+                self._counters["rejected"] += 1
+            return VolumeMoveResult(
+                step=current_step, accepted=accepted, reason=reason,
+                old_volume_nm3=old_volume, proposed_volume_nm3=proposed_volume,
+                log_acceptance=log_a, current_energy=current,
+            )
+
+        # 3. Propose. Cheap geometric invalidity rejects without redrawing and
+        #    without ever touching the Context.
+        delta = delta_raw * self._half_width_nm3
+        new_volume = old_volume + delta
+        s = float("nan")
+        if _finite(new_volume) and new_volume > 0.0:
+            s = (new_volume / old_volume) ** (1.0 / 3.0)
+        if not (_finite(s) and s > 0.0):
+            self._counters["invalid_geometry"] += 1
+            return _finish(False, "nonpositive_volume", -math.inf, new_volume, old)
+        if self._max_cutoff_nm > 0.0:
+            new_box = s * box
+            if _min_face_height_nm(new_box) < 2.0 * self._max_cutoff_nm:
+                self._counters["invalid_geometry"] += 1
+                return _finish(False, "cutoff_domain", -math.inf, new_volume, old)
+
+        # 4. Apply the proposal: scale the box, translate whole molecules about
+        #    their arithmetic centroids, refresh virtual sites.
+        new_positions = positions.copy()
+        scale_minus_one = s - 1.0
+        for mol in self._molecules:
+            center = positions[mol].mean(axis=0)
+            new_positions[mol] = positions[mol] + scale_minus_one * center
+
+        try:
+            self._restore_positions(new_positions, s * box)
+            self._context.computeVirtualSites()
+            new = self._adapter.evaluate(self._context, snapshot)
+            if not _finite(new.effective_kj_mol) or not _finite(new.boost_kj_mol):
+                self._restore_positions(positions, box)
+                self._verify_restoration(positions, box)
+                self._counters["nonfinite_trial_energy"] += 1
+                return _finish(False, "nonfinite_trial_energy", -math.inf, new_volume, old)
+
+            log_a = _log_acceptance(
+                new_effective_kj_mol=new.effective_kj_mol,
+                old_effective_kj_mol=old.effective_kj_mol,
+                new_volume_nm3=new_volume,
+                old_volume_nm3=old_volume,
+                pressure_bar=self._pressure_bar,
+                temperature_k=self._temperature_k,
+                n_mol=self._n_mol,
+            )
+            accept = accept_draw <= 0.0 or math.log(accept_draw) < min(0.0, log_a)
+        except Exception as exc:
+            self._restore_positions(positions, box)
+            self._verify_restoration(positions, box)
+            raise RuntimeError(
+                f"volume-move trial failed unexpectedly at step {current_step}; "
+                "the original state was restored before this error"
+            ) from exc
+
+        if accept:
+            return _finish(True, "accepted", log_a, new_volume, new)
+        self._restore_positions(positions, box)
+        self._verify_restoration(positions, box)
+        return _finish(False, "rejected", log_a, new_volume, old)
+
+
+def _read_positions_and_box(context):
+    st = context.getState(getPositions=True)
+    unit = _unit()
+    pos = np.array(st.getPositions(asNumpy=True).value_in_unit(unit.nanometer), dtype=float)
+    box = _box_matrix_nm(context)
+    return pos, box
+
+
+def _rng_from_state(payload: Mapping[str, object]):
+    from numpy.random import PCG64, Generator
+
+    if str(payload.get("algorithm", "")) != "PCG64":
+        raise ValueError(f"unsupported RNG algorithm {payload.get('algorithm')!r}")
+    state = {
+        "bit_generator": "PCG64",
+        "state": {k: int(v) for k, v in dict(payload["state"]).items()},
+        "has_uint32": int(payload.get("has_uint32", 0)),
+        "uinteger": int(payload.get("uinteger", 0)),
+    }
+    bg = PCG64()
+    bg.state = state
+    return Generator(bg)
+
+
 class BiasedMCBarostatController:
     """Per-replica isotropic Metropolis volume move against U*.
 
@@ -215,6 +522,9 @@ class BiasedMCBarostatController:
     updates calibration statistics, never rethermalizes velocities and never
     changes labels.
     """
+
+    def __init__(self, core: _ControllerCore):
+        self._core = core
 
     @classmethod
     def initialize(
@@ -231,7 +541,35 @@ class BiasedMCBarostatController:
         """``volume_step_fraction`` is converted once, against the *starting*
         volume, into a fixed absolute half-width in nm^3. It must not silently
         become a fraction of the current volume later in the run."""
-        raise NotImplementedError("package 1")
+        from numpy.random import PCG64, Generator
+
+        pressure_bar = float(pressure_bar)
+        temperature_k = float(temperature_k)
+        frequency_steps = int(frequency_steps)
+        volume_step_fraction = float(volume_step_fraction)
+        if not (_finite(pressure_bar) and pressure_bar >= 0.0):
+            raise ValueError(f"pressure_bar must be finite and non-negative; got {pressure_bar}")
+        if not (_finite(temperature_k) and temperature_k > 0.0):
+            raise ValueError(f"temperature_k must be finite and positive; got {temperature_k}")
+        if frequency_steps < 1:
+            raise ValueError(f"frequency_steps must be >= 1; got {frequency_steps}")
+        if not (_finite(volume_step_fraction) and volume_step_fraction > 0.0):
+            raise ValueError(f"volume_step_fraction must be finite and positive; got {volume_step_fraction}")
+
+        molecules = _molecules_from_context(context)
+        box = _box_matrix_nm(context)
+        volume = _box_volume_nm3(box)
+        if not (_finite(volume) and volume > 0.0):
+            raise ValueError(f"starting volume must be finite and positive; got {volume}")
+        half_width_nm3 = volume_step_fraction * volume
+        counters = {"attempted": 0, "accepted": 0, "rejected": 0,
+                   "invalid_geometry": 0, "nonfinite_trial_energy": 0}
+        core = _ControllerCore(
+            context, adapter, pressure_bar, temperature_k, frequency_steps,
+            half_width_nm3, molecules, Generator(PCG64(int(seed))), counters,
+            frequency_steps, 0, _max_nonbonded_cutoff_nm(context),
+        )
+        return cls(core)
 
     @classmethod
     def restore(
@@ -245,22 +583,65 @@ class BiasedMCBarostatController:
     ) -> "BiasedMCBarostatController":
         """Restore exact schedule and random stream. Must not attempt an extra
         move as a side effect of resuming."""
-        raise NotImplementedError("package 1")
+        state = dict(state)
+        if int(state.get("schema_version", -1)) != _CONTROLLER_SCHEMA_VERSION:
+            raise ValueError(
+                f"barostat controller schema version {state.get('schema_version')!r} "
+                f"is not the supported version {_CONTROLLER_SCHEMA_VERSION}"
+            )
+        if str(state.get("backend", "")) != "biased_mc":
+            raise ValueError(f"not a biased_mc controller state: backend={state.get('backend')!r}")
+        if str(state.get("adapter_id", "")) != str(adapter.adapter_id):
+            raise ValueError(
+                f"adapter mismatch: checkpoint has {state.get('adapter_id')!r}, "
+                f"live adapter is {adapter.adapter_id!r}"
+            )
+        pressure = float(state["pressure_bar"])
+        temperature = float(state["temperature_k"])
+        if abs(pressure - float(expected_pressure_bar)) > 1e-9 * max(1.0, abs(pressure)):
+            raise ValueError(
+                f"barostat checkpoint pressure {pressure} bar does not match the "
+                f"expected {expected_pressure_bar} bar"
+            )
+        if abs(temperature - float(expected_temperature_k)) > 1e-9 * max(1.0, abs(temperature)):
+            raise ValueError(
+                f"barostat checkpoint temperature {temperature} K does not match the "
+                f"expected {expected_temperature_k} K"
+            )
+        molecules = _molecules_from_context(context)
+        fingerprint = _molecule_fingerprint(molecules)
+        if fingerprint != str(state.get("molecule_partition_fingerprint")):
+            raise ValueError(
+                "molecule partition changed between checkpoint and resume "
+                f"({state.get('molecule_partition_fingerprint')!r} vs {fingerprint!r}); "
+                "refusing to continue with an unverified Jacobian"
+            )
+        counters = {k: int(v) for k, v in dict(state["counters"]).items()}
+        for key in ("attempted", "accepted", "rejected", "invalid_geometry",
+                    "nonfinite_trial_energy"):
+            counters.setdefault(key, 0)
+        core = _ControllerCore(
+            context, adapter, pressure, temperature, int(state["frequency_steps"]),
+            float(state["half_width_nm3"]), molecules, _rng_from_state(dict(state["rng"])),
+            counters, int(state["next_due_step"]), int(state.get("last_due_step", 0)),
+            _max_nonbonded_cutoff_nm(context),
+        )
+        return cls(core)
 
     @property
     def next_due_step(self) -> int:
-        raise NotImplementedError("package 1")
+        return self._core.next_due_step
 
     def steps_until_due(self, current_step: int) -> int:
-        raise NotImplementedError("package 1")
+        return self._core.steps_until_due(current_step)
 
     def attempt_due(self, current_step: int) -> VolumeMoveResult:
         """Run one trial transaction. Rejection consumes the random draws but
         leaves physical state, MD time and integration step count unchanged."""
-        raise NotImplementedError("package 1")
+        return self._core.attempt_due(current_step)
 
     def state_dict(self) -> dict[str, object]:
         """Serializable controller state for the checkpoint manifest: backend,
         molecule-partition fingerprint, RNG algorithm and state, fixed width,
         counters, last/next due step and schema version."""
-        raise NotImplementedError("package 1")
+        return self._core.state_dict()
