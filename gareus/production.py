@@ -1640,7 +1640,7 @@ from .npt_driver import (
 )
 
 
-def _resolve_npt_adapter(args):
+def _resolve_npt_adapter(args, system):
     """Locate the stage-aware effective-potential (U*) adapter for this run.
 
     The adapter implementations are package 2's half of the NPT correction
@@ -1651,16 +1651,85 @@ def _resolve_npt_adapter(args):
     back to the wrong acceptance energy.  Tests patch this one function.
     """
     from . import pep_gamd
-    factory = getattr(pep_gamd, "build_effective_potential_adapter", None)
+    factory = getattr(pep_gamd, "make_npt_target_adapter", None)
     if factory is None:
         raise RuntimeError(
             "The biased-MC NPT backend requires the stage-aware effective-potential "
-            "adapter from gareus/pep_gamd.py (NPT correction package 2), which is not "
+            "adapter from gareus/pep_gamd.py (NPT correction package 1), which is not "
             "present in this build. Refusing to run boosted NPT rather than accept "
             "volume moves against the wrong energy; use --production-ensemble nvt or "
             "a conventional (cmd) run mode until the adapter lands."
         )
-    return factory(args)
+    return _LazyNptAdapter(factory, args, system)
+
+
+class _LazyNptAdapter:
+    """Defers adapter construction until a real driving Context exists.
+
+    The seam is resolved once, run-wide, immediately after the base System is
+    built -- but ``make_npt_target_adapter`` validates the *integrator* (its
+    Total-channel group arithmetic, its group dict and its required globals)
+    and the *system's* Pep-GaMD partition, and at resolve time neither exists:
+    ``make_gamd_integrator`` adds the partition to each run stage's own
+    deserialized copy of the base System (shared setup, recon windows,
+    production replicas), never to the base System itself.  So the real
+    adapter is built on the first ``snapshot()``/``ensure_built()`` call, from
+    the System of the Context handed to that call, and cached.
+
+    Sharing one adapter across the run's contexts is safe: every context that
+    drives the volume controller is a deserialized copy of the same base
+    System passed through the same ``make_gamd_integrator`` partition, so the
+    force-group layout the constructor inspects is identical for all of them,
+    and ``snapshot``/``evaluate`` read the context and integrator handed to
+    them, never anything captured at construction.
+    """
+
+    def __init__(self, factory, args, system):
+        self._factory = factory
+        self._args = args
+        self._system = system
+        self._adapter = None
+
+    def _resolve(self, context, integrator):
+        if self._adapter is None:
+            # The System must be the one this Context was built from: it
+            # carries the Pep-GaMD partition, which the pre-partition base
+            # System frozen at resolve time never has.
+            system = None
+            get_system = getattr(context, "getSystem", None)
+            if get_system is not None:
+                system = get_system()
+            if system is None:
+                system = self._system
+            self._adapter = self._factory(system, integrator, self._args)
+        return self._adapter
+
+    def ensure_built(self, context, integrator=None):
+        """Build the real adapter now, if it has not been built yet.
+
+        The controller init/restore paths must see the real ``adapter_id``
+        (checkpoint compatibility and restore both compare it) before any
+        volume move has been attempted; this gives them a build point that
+        needs no snapshot semantics.
+        """
+        if integrator is None:
+            integrator = context.getIntegrator()
+        return self._resolve(context, integrator)
+
+    @property
+    def adapter_id(self) -> str:
+        return str(getattr(self._adapter, "adapter_id", "")) if self._adapter is not None else ""
+
+    def snapshot(self, context, integrator):
+        return self._resolve(context, integrator).snapshot(context, integrator)
+
+    def evaluate(self, context, snapshot):
+        if self._adapter is None:
+            raise RuntimeError(
+                "NPT adapter evaluate() called before snapshot(); the adapter is built "
+                "from the integrator handed to snapshot()"
+            )
+        return self._adapter.evaluate(context, snapshot)
 
 
 def _production_barostat_description(args) -> str:
@@ -4717,6 +4786,13 @@ def _validate_npt_checkpoint_compatibility(out_dir: Path, manifest: dict, npt_ru
             "for every replica; cannot restore the exact schedule and random stream"
         )
     adapter_ids = list(npt_block.get("adapter_ids") or [])
+    # Build the lazily-resolved adapter from a live replica Context before
+    # comparing ids: the stored ids are the real adapter's, and the lazy
+    # wrapper still holds its empty pre-build placeholder until a Context
+    # exists to build from.
+    _ensure = getattr(npt_runtime.adapter, "ensure_built", None)
+    if _ensure is not None and sims:
+        _ensure(sims[0].context)
     this_adapter_id = str(getattr(npt_runtime.adapter, "adapter_id", ""))
     for i, stored_id in enumerate(adapter_ids):
         if str(stored_id) != this_adapter_id:
@@ -6067,7 +6143,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     # NPT correction (spec section 5): the effective-potential adapter is the
     # one cross-package seam to package 2; it only needs to exist when the
     # biased-MC controller will evaluate volume-move acceptance energies.
-    npt_adapter = _resolve_npt_adapter(args) if barostat_ownership.backend == "biased_mc" else None
+    npt_adapter = _resolve_npt_adapter(args, base_system) if barostat_ownership.backend == "biased_mc" else None
     npt_runtime = NptRunContext(ownership=barostat_ownership, adapter=npt_adapter)
 
     # GaMD production-envelope recalibration: adaptive-production's epoch 0 already

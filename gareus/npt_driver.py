@@ -321,6 +321,13 @@ class NptRunContext:
                 "biased_mc NPT requires the stage-aware effective-potential adapter; "
                 "none was provided"
             )
+        # A lazily-resolved adapter (production._LazyNptAdapter) builds its
+        # real self here: the controller's state_dict must carry the real
+        # adapter_id from the very first checkpoint, not the empty pre-build
+        # placeholder.
+        _ensure = getattr(self.adapter, "ensure_built", None)
+        if _ensure is not None:
+            _ensure(context)
         return npt.BiasedMCBarostatController.initialize(
             context=context,
             adapter=self.adapter,
@@ -336,6 +343,11 @@ class NptRunContext:
             raise RuntimeError(
                 f"NptRunContext.restore_controller called for backend {self.backend!r}"
             )
+        # Build the lazily-resolved adapter before BiasedMCBarostatController
+        # .restore compares its adapter_id against the checkpoint's.
+        _ensure = getattr(self.adapter, "ensure_built", None)
+        if _ensure is not None:
+            _ensure(context)
         return npt.BiasedMCBarostatController.restore(
             context=context,
             adapter=self.adapter,

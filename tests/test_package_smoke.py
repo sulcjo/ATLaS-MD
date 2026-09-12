@@ -559,19 +559,18 @@ def test_tiny_lambda_ladder_run_completes_end_to_end_slow() -> None:
 
         # NPT correction staged state: this run is boosted GaMD under the NPT
         # ensemble, which resolves to the biased-MC backend.  Package 1 (the
-        # gareus/npt.py controller) has landed and resolves fine, but the run
-        # then needs the stage-aware effective-potential adapter from
-        # gareus/pep_gamd.py (NPT correction package 2) to evaluate volume-move
-        # acceptance energies.  Until that package lands, run_gareus fails
-        # loudly at the adapter seam (never silently keeping the known-wrong
-        # native-barostat acceptance energy).  Skip here -- the skip disappears
-        # by itself once package 2 implements the adapter factory.
+        # gareus/npt.py controller) has landed and resolves fine, and package
+        # A's half of the seam -- pep_gamd.make_npt_target_adapter -- now
+        # exists too, bridged lazily by production._resolve_npt_adapter, so
+        # the run composes end to end.  Skip only if the adapter factory is
+        # genuinely absent from this build (never silently keeping the
+        # known-wrong native-barostat acceptance energy).
         import gareus.pep_gamd as _pep_gamd
 
-        if not hasattr(_pep_gamd, "build_effective_potential_adapter"):
+        if not hasattr(_pep_gamd, "make_npt_target_adapter"):
             pytest.skip(
                 "boosted-NPT end-to-end run needs the stage-aware "
-                "effective-potential adapter (NPT correction package 2), "
+                "effective-potential adapter (pep_gamd.make_npt_target_adapter), "
                 "which is not implemented in this build"
             )
 

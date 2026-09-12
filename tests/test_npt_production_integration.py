@@ -824,11 +824,68 @@ def _resolver_args(boost_type):
     return args
 
 
-def test_adapter_seam_fails_loudly_while_package2_is_missing(monkeypatch):
-    # pep_gamd.build_effective_potential_adapter does not exist yet: the seam
-    # must refuse rather than run volume moves against the wrong energy.
+def test_adapter_seam_fails_loudly_while_adapter_factory_is_missing(monkeypatch):
+    # Without pep_gamd.make_npt_target_adapter there is no validated U* for
+    # volume moves: the seam must refuse rather than run them against the
+    # wrong energy.
     import gareus.pep_gamd as pep_gamd
-    monkeypatch.delattr(pep_gamd, "build_effective_potential_adapter", raising=False)
+    monkeypatch.delattr(pep_gamd, "make_npt_target_adapter")
     args = _make_args()
-    with pytest.raises(RuntimeError, match="package 2"):
-        production._resolve_npt_adapter(args)
+    with pytest.raises(RuntimeError, match="NPT correction package 1"):
+        production._resolve_npt_adapter(args, System())
+
+
+def test_resolve_npt_adapter_lazy_bridge_composes_with_real_pep_gamd_adapter():
+    """The A/B bridge, end to end: _resolve_npt_adapter hands back a lazy
+    wrapper whose first snapshot() builds and delegates to the REAL
+    pep_gamd adapter, and an unsupported boost type still raises loudly
+    through the wrapper rather than being silently deferred forever."""
+    import gareus.pep_gamd as pep_gamd
+    from pep_gamd_fixture import solvated_dipeptide, _fresh_system
+
+    fx = solvated_dipeptide()
+    system = _fresh_system()
+    pep_gamd.ensure_pep_gamd_partition(system, fx["peptide"])
+    integ = pep_gamd.PepGaMDLowerDualIntegrator(
+        pep_gamd.DIHEDRAL_GROUP,
+        dt=0.002 * unit.picoseconds, ntcmdprep=2, ntcmd=4, ntebprep=2, nteb=4,
+        nstlim=100, ntave=2,
+        sigma0p=6.0 * unit.kilocalories_per_mole,
+        sigma0d=6.0 * unit.kilocalories_per_mole,
+        collision_rate=1.0 / unit.picoseconds,
+        temperature=300.0 * unit.kelvin,
+    )
+    ctx = openmm.Context(system, integ, Platform.getPlatformByName("Reference"))
+    ctx.setPositions(fx["positions"])
+    integ.setRandomNumberSeed(7)
+    integ.step(1)  # fresh-Context warm-up (gamd-openmm's first step moves nothing)
+
+    # resolve before any integrator-side validation can run: the seam point
+    args = _make_args(run_mode="gamd", gamd_boost_type="pep-gamd-lower-dual")
+    lazy = production._resolve_npt_adapter(args, system)
+    assert isinstance(lazy, production._LazyNptAdapter)
+    assert lazy._adapter is None, "the real adapter must not be built at resolve time"
+    assert lazy.adapter_id == ""
+
+    # the first snapshot() builds the real adapter and delegates to it
+    snap = lazy.snapshot(ctx, integ)
+    assert lazy.adapter_id == "pep-gamd-lower-dual"
+    breakdown = lazy.evaluate(ctx, snap)
+    assert np.isfinite(breakdown.effective_kj_mol)
+    # the delegated adapter's own stage-aware contract holds: U* is the sum of
+    # its parts, and the boost channel is off in the cMD-prep stage
+    assert breakdown.effective_kj_mol == (
+        breakdown.physical_kj_mol + breakdown.bias_kj_mol + breakdown.boost_kj_mol)
+
+    # evaluate-before-snapshot on a fresh wrapper is loud, never silent
+    lazy_early = production._resolve_npt_adapter(args, system)
+    with pytest.raises(RuntimeError, match="called before snapshot"):
+        lazy_early.evaluate(ctx, None)
+
+    # an unsupported boost type surfaces its refusal through the lazy wrapper
+    # on the first snapshot -- it is not deferred past the failure point forever
+    args_bad = _make_args(run_mode="gamd", gamd_boost_type="upper-total")
+    lazy_bad = production._resolve_npt_adapter(args_bad, system)
+    assert lazy_bad._adapter is None
+    with pytest.raises(ValueError, match="no validated NPT target adapter"):
+        lazy_bad.snapshot(ctx, integ)

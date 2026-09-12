@@ -110,3 +110,69 @@ python -m pytest tests/test_npt_ownership.py tests/test_npt_cli_args.py \
 ```
 
 (The full-suite line above used the repo's standing exclusions; the single failure is the pre-existing `--seq` config-parse issue, unrelated to NPT.)
+
+## Post-merge addendum: the A/B seam did not compose as shipped — bridged 2026-09-12
+
+**The two packages did not compose as shipped.** Package B's seam
+(`production._resolve_npt_adapter`) called a factory that never existed:
+`pep_gamd.build_effective_potential_adapter(args)`. Package A had shipped
+`pep_gamd.make_npt_target_adapter(system, integrator, args)` — a per-context
+constructor that validates the *integrator* (Total-channel group arithmetic,
+group dict, required GaMD globals) and the *system's* Pep-GaMD partition. The
+two shapes are incompatible at the seam's resolve point: the seam resolves once,
+run-wide, immediately after the base System is built — where no integrator and
+no partitioned System exists yet.
+
+**The bridge.** `_resolve_npt_adapter(args, system)` now locates
+`make_npt_target_adapter` (still failing loudly if it is absent) and returns a
+`_LazyNptAdapter` that defers construction to the first `snapshot(context,
+integrator)` call. Two defects in the first cut of that bridge were found and
+fixed while verifying it end to end (the previously-skipped slow smoke test now
+runs for real):
+
+1. **The lazy wrapper froze the pre-partition base System.** Every context that
+   drives the volume controller (shared GaMD setup, recon windows, production
+   replicas) is built from its *own* `deserialize_system(base_system)` copy, and
+   `make_gamd_integrator` adds the Pep-GaMD partition to that copy — never to
+   `base_system` itself. Building the adapter from the frozen base System died
+   with "the system carries no PepGaMDWaterOnlyNonbonded auxiliary force".
+   Fixed: the adapter is built from the System of the Context handed to the
+   resolving call (`context.getSystem()`), which by construction carries the
+   partition; the base System is only a last-resort fallback.
+2. **The resume path compared `adapter_id` before any snapshot existed.**
+   `_validate_npt_checkpoint_compatibility` and
+   `BiasedMCBarostatController.restore` both compare the stored adapter id
+   against the live adapter's; a lazy wrapper still holds its empty pre-build
+   placeholder there, so every legitimate resume would fail loudly as an
+   "adapter mismatch". Fixed: `NptRunContext.initialize_controller` /
+   `restore_controller` (and the checkpoint-compatibility pre-pass) now call
+   the wrapper's `ensure_built(context)` before any id is read or compared, so
+   the real adapter — and its id — exists from the first controller onward.
+
+The stale one-argument seam test was updated to the two-argument seam (patching
+`make_npt_target_adapter` off and asserting the loud refusal, no weakened
+assertions), the smoke test's existence-keyed skip now targets the factory that
+actually shipped, and a focused bridge test
+(`test_resolve_npt_adapter_lazy_bridge_composes_with_real_pep_gamd_adapter`)
+proves the composition end to end: `_resolve_npt_adapter` returns the lazy
+wrapper, the first `snapshot()` builds and delegates to the real pep_gamd
+adapter (real `adapter_id`, finite `EnergyBreakdown`, effective = physical +
+bias + boost), `evaluate` before `snapshot` is loud, and an unsupported
+`gamd_boost_type` raises its refusal through the wrapper instead of being
+deferred forever.
+
+**Known residual (pre-existing, loud, unchanged by the bridge):** the cMD
+multiwindow recon (`run_multiwindow_gamd_recon(integrator_kind="cmd")`) drives
+plain-Langevin contexts that carry volume controllers; a volume move attempted
+there would hit the Pep-GaMD adapter's "exposes no 'stage' global" refusal.
+The smoke configuration (recon steps < barostat frequency) never reaches it,
+and it fails loudly rather than silently — left for a follow-up that decides
+the cMD-stage U* semantics, not silently patched here.
+
+Re-verification: `pytest tests/test_npt_production_integration.py
+tests/test_npt_backend_selection.py tests/test_npt_controller_mechanics.py
+tests/test_package_smoke.py` → 105 passed (including the now-unskipped slow
+end-to-end run); `pytest tests/test_npt_acceptance_math.py
+tests/test_npt_cli_args.py tests/test_npt_coupled_target.py
+tests/test_npt_driver_scheduling.py tests/test_npt_ownership.py
+tests/test_npt_pep_adapter_boost.py` → 63 passed.
