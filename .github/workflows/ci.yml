@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  fast-correctness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install test dependencies
+        run: python -m pip install -e ".[dev]"
+      - name: Exact exchange-kernel validation
+        run: python -m pytest -q tests/test_exchange_kernel_exact.py tests/test_gibbs_walk.py tests/test_exchange_fixes.py
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install documentation dependencies
+        run: python -m pip install -e ".[docs]"
+      - name: Strict documentation build
+        run: python -m mkdocs build --strict
