@@ -2,38 +2,46 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import pytest
 
 
-def test_parquet_writer_creates_chunk_on_flush(tmp_path):
-    import pyarrow.parquet as pq
+def _read_committed_table(segment_dir, kind="samples"):
+    import pyarrow.dataset as ds
+    from gareus.parquet_manifest import committed_files
+
+    files = committed_files(segment_dir, expected_kind=kind, verify_hashes=True)
+    assert files
+    return ds.dataset(files, format="parquet").to_table()
+
+
+def test_parquet_writer_creates_manifest_backed_file_on_flush(tmp_path):
+    from gareus.parquet_manifest import load_manifest
     from gareus.store import ParquetSampleWriter
 
-    writer = ParquetSampleWriter(tmp_path / "seg_001", flush_rows=5)
+    segment = tmp_path / "seg_001"
+    writer = ParquetSampleWriter(segment, flush_rows=5)
     for i in range(5):
         writer.write_sample(i * 100, 0, 0, 0.1 + i * 0.01, -1.0 + i * 0.1,
                             -100.0 - i, 1.0, 0.5, 0.5)
     writer.flush()
     writer.close()
 
-    # close() consolidates: no chunks remain, data.parquet holds all rows
-    assert not list((tmp_path / "seg_001").glob("chunk_*.parquet"))
-    assert (tmp_path / "seg_001" / "data.parquet").exists()
-    assert pq.read_table(tmp_path / "seg_001" / "data.parquet").num_rows == 5
+    manifest = load_manifest(segment, expected_kind="samples", verify_hashes=True)
+    assert manifest["n_rows"] == 5
+    assert len(manifest["files"]) == 1
+    assert _read_committed_table(segment).num_rows == 5
 
 
 def test_parquet_writer_correct_columns(tmp_path):
-    import pyarrow.parquet as pq
     from gareus.store import ParquetSampleWriter
 
-    writer = ParquetSampleWriter(tmp_path / "seg", flush_rows=100)
+    segment = tmp_path / "seg"
+    writer = ParquetSampleWriter(segment, flush_rows=100)
     writer.write_sample(1000, 0, 2, 0.15, -0.5, -98.3, 1.2, 0.6, 0.6)
-    writer.flush()
     writer.close()
 
-    table = pq.read_table(tmp_path / "seg")
+    table = _read_committed_table(segment)
     assert set(table.column_names) == {
         "step", "replica", "window_id", "cv1", "cv2",
         "potential", "gamd_boost_total", "gamd_boost_dihedral", "gamd_boost_nonbonded",
@@ -42,15 +50,14 @@ def test_parquet_writer_correct_columns(tmp_path):
 
 
 def test_parquet_writer_roundtrip_values(tmp_path):
-    import pyarrow.parquet as pq
     from gareus.store import ParquetSampleWriter
 
-    writer = ParquetSampleWriter(tmp_path / "seg", flush_rows=10)
+    segment = tmp_path / "seg"
+    writer = ParquetSampleWriter(segment, flush_rows=10)
     writer.write_sample(500, 1, 3, 0.25, -0.75, -105.0, 2.1, 1.0, 1.1)
-    writer.flush()
     writer.close()
 
-    tbl = pq.read_table(tmp_path / "seg")
+    tbl = _read_committed_table(segment)
     row = {col: tbl[col][0].as_py() for col in tbl.column_names}
     assert row["step"] == 500
     assert row["replica"] == 1
@@ -63,47 +70,44 @@ def test_parquet_writer_roundtrip_values(tmp_path):
     assert abs(row["gamd_boost_nonbonded"] - 1.1) < 1e-5
 
 
-def test_parquet_writer_multiple_chunks(tmp_path):
-    import pyarrow.parquet as pq
+def test_parquet_writer_multiple_chunks_compact_transactionally(tmp_path):
+    from gareus.parquet_manifest import load_manifest
     from gareus.store import ParquetSampleWriter
 
-    writer = ParquetSampleWriter(tmp_path / "seg", flush_rows=3)
+    segment = tmp_path / "seg"
+    writer = ParquetSampleWriter(segment, flush_rows=3)
     for i in range(9):
         writer.write_sample(i, 0, 0, 0.1, -1.0, -100.0, 1.0, 0.5, 0.5)
-    writer.flush()
     writer.close()
 
-    # close() consolidates all chunks → data.parquet
-    assert not list((tmp_path / "seg").glob("chunk_*.parquet"))
-    tbl = pq.read_table(tmp_path / "seg" / "data.parquet")
-    assert tbl.num_rows == 9
+    manifest = load_manifest(segment, expected_kind="samples", verify_hashes=True)
+    assert manifest["n_rows"] == 9
+    assert len(manifest["files"]) == 1
+    assert manifest["files"][0]["path"].startswith("compact_")
+    assert _read_committed_table(segment).num_rows == 9
 
 
 def test_parquet_writer_auto_flushes_at_threshold(tmp_path):
-    import pyarrow.parquet as pq
     from gareus.store import ParquetSampleWriter
 
-    writer = ParquetSampleWriter(tmp_path / "seg", flush_rows=4)
+    segment = tmp_path / "seg"
+    writer = ParquetSampleWriter(segment, flush_rows=4)
     for i in range(4):
         writer.write_sample(i, 0, 0, 0.1, -1.0, -100.0, 1.0, 0.5, 0.5)
-    # auto-flush triggered by 4th write; close() consolidates to data.parquet
     writer.close()
 
-    assert not list((tmp_path / "seg").glob("chunk_*.parquet"))
-    tbl = pq.read_table(tmp_path / "seg" / "data.parquet")
-    assert tbl.num_rows == 4
+    assert _read_committed_table(segment).num_rows == 4
 
 
 def test_parquet_writer_null_cv2(tmp_path):
-    import pyarrow.parquet as pq
     from gareus.store import ParquetSampleWriter
 
-    writer = ParquetSampleWriter(tmp_path / "seg", flush_rows=10)
+    segment = tmp_path / "seg"
+    writer = ParquetSampleWriter(segment, flush_rows=10)
     writer.write_sample(0, 0, 0, 0.1, None, -100.0, 1.0, 0.5, 0.5)
-    writer.flush()
     writer.close()
 
-    tbl = pq.read_table(tmp_path / "seg")
+    tbl = _read_committed_table(segment)
     assert tbl["cv2"][0].as_py() is None
 
 
@@ -114,9 +118,27 @@ def test_parquet_writer_no_tmp_files_after_close(tmp_path):
     writer.write_sample(0, 0, 0, 0.1, -1.0, -100.0, 1.0, 0.5, 0.5)
     writer.close()
 
-    # tmp names are now per-PID (`*.tmp.<pid>`) to avoid colliding with a
-    # concurrent writer, so the leak check must match that suffix pattern.
     assert not list((tmp_path / "seg").glob("*.tmp.*"))
+
+
+def test_parquet_writer_reopens_at_next_chunk_index(tmp_path):
+    from gareus.parquet_manifest import load_manifest
+    from gareus.store import ParquetSampleWriter
+
+    segment = tmp_path / "seg"
+    first = ParquetSampleWriter(segment, flush_rows=1)
+    first.write_sample(0, 0, 0, 0.1, None, -1.0, 0.0, 0.0, 0.0)
+    first.flush()
+    before = load_manifest(segment, expected_kind="samples")
+
+    second = ParquetSampleWriter(segment, flush_rows=1)
+    second.write_sample(1, 0, 0, 0.2, None, -1.0, 0.0, 0.0, 0.0)
+    second.flush()
+    after = load_manifest(segment, expected_kind="samples")
+
+    assert before["next_chunk_index"] == 2
+    assert after["next_chunk_index"] == 3
+    assert after["n_rows"] == 2
 
 
 # --- SegmentRegistry ---
@@ -373,7 +395,6 @@ def test_parse_boost_components_two_unnamed():
     comps = {"boost_0": 0.5, "boost_1": 1.0}
     total, dihe, nonb = parse_gamd_boost_components(1.5, comps)
     assert abs(total - 1.5) < 1e-5
-    # Two unnamed: assigned in sorted-key order
     assert dihe is not None
     assert nonb is not None
 
@@ -397,15 +418,14 @@ def test_parse_boost_components_single_component():
 
 
 def test_parquet_writer_null_boost_fields(tmp_path):
-    import pyarrow.parquet as pq
     from gareus.store import ParquetSampleWriter
 
-    writer = ParquetSampleWriter(tmp_path / "seg", flush_rows=10)
+    segment = tmp_path / "seg"
+    writer = ParquetSampleWriter(segment, flush_rows=10)
     writer.write_sample(0, 0, 0, 0.1, None, -100.0, None, None, None)
-    writer.flush()
     writer.close()
 
-    tbl = pq.read_table(tmp_path / "seg")
+    tbl = _read_committed_table(segment)
     row = {col: tbl[col][0].as_py() for col in tbl.column_names}
     assert row["gamd_boost_total"] is None
     assert row["gamd_boost_dihedral"] is None
@@ -436,7 +456,6 @@ def test_distance_logger_default_creates_files(tmp_path):
     args = argparse.Namespace()
     logger = DistanceLogger(tmp_path, args)
 
-    # Default mode="both" creates both files
     assert logger.csv_writer is not None
     assert logger.jsonl_handle is not None
     logger.close()
