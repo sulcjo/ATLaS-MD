@@ -28,7 +28,8 @@ scheduler can be built independently. See
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 from typing import Any, Literal, Mapping, Protocol
 
 __all__ = [
@@ -45,7 +46,123 @@ __all__ = [
 # 1 bar * nm^3 expressed in kJ/mol. Fixed by the spec; do not re-derive inline.
 BAR_NM3_TO_KJ_PER_MOL = 0.0602214076
 
+# Molar gas constant in kJ/(mol K) (CODATA 2018). beta = 1/(R T) with molar
+# energies throughout this module.
+_R_KJ_PER_MOL_K = 8.31446261815324e-3
+
 BarostatBackend = Literal["none", "native", "biased_mc"]
+
+# Boost types for which a validated U* target adapter exists (Package A):
+# the dependent dual Pep-GaMD boost and the stock single dihedral lower boost.
+# Kept in sync with gareus.pep_gamd.LADDER_BOOST_TYPES on purpose -- tests
+# assert the equality so drift fails loudly.
+SUPPORTED_BIASED_MC_BOOST_TYPES = frozenset({"pep-gamd-lower-dual", "lower-dihedral"})
+
+_ENSEMBLES = frozenset({"npt", "nvt"})
+_BACKEND_REQUESTS = frozenset({"auto", "native", "biased_mc"})
+_RUN_MODES = frozenset({"cmd", "hmr-cmd", "gamd", "hmr-gamd"})
+_BOOSTED_RUN_MODES = frozenset({"gamd", "hmr-gamd"})
+
+# MonteCarloBarostat-family force class names. Matched by name (not isinstance)
+# so a future OpenMM release adding another MonteCarlo*Barostat is still caught
+# by the "MonteCarlo...Barostat" prefix rule below.
+_NATIVE_BAROSTAT_CLASSES = frozenset({
+    "MonteCarloBarostat",
+    "MonteCarloAnisotropicBarostat",
+    "MonteCarloMembraneBarostat",
+    "MonteCarloFlexibleBarostat",
+})
+
+
+def _normalise(value: object) -> str:
+    return str(value or "").strip().lower()
+
+
+def _normalise_run_mode(value: object) -> str:
+    return _normalise(value).replace("_", "-")
+
+
+def resolve_npt_backend(
+    *,
+    ensemble: str,
+    requested: str,
+    run_mode: str,
+    boost_type: str,
+) -> BarostatBackend:
+    """Choose the volume controller, or fail loudly.
+
+    Explicit ``native`` with boosted dynamics must raise rather than preserve the
+    known mismatch, and an unsupported boosted mode must raise rather than
+    silently downgrade the requested ensemble to NVT.
+    """
+    ensemble_n = _normalise(ensemble)
+    requested_n = _normalise(requested)
+    run_mode_n = _normalise_run_mode(run_mode)
+    boost_type_n = _normalise(boost_type)
+    if ensemble_n not in _ENSEMBLES:
+        raise ValueError(f"unknown ensemble {ensemble!r}; expected one of npt/nvt")
+    if requested_n not in _BACKEND_REQUESTS:
+        raise ValueError(f"unknown npt_barostat_backend {requested!r}; expected one of auto/native/biased_mc")
+    if run_mode_n not in _RUN_MODES:
+        raise ValueError(f"unknown run_mode {run_mode!r}; expected one of cmd/hmr-cmd/gamd/hmr-gamd")
+
+    boosted = run_mode_n in _BOOSTED_RUN_MODES
+    if ensemble_n == "nvt":
+        if requested_n != "auto":
+            raise ValueError(
+                f"nvt ensemble cannot use npt_barostat_backend={requested_n!r}: "
+                "a volume controller contradicts the requested NVT ensemble"
+            )
+        return "none"
+
+    if requested_n == "native":
+        if boosted:
+            raise ValueError(
+                f"npt_barostat_backend=native is invalid for boosted run_mode={run_mode_n!r} "
+                f"(boost_type={boost_type_n!r}): the native MonteCarloBarostat accepts volume "
+                "moves with physical energy plus the auxiliary force and without the GaMD "
+                "boost, i.e. the wrong target distribution. Use biased_mc."
+            )
+        return "native"
+
+    if requested_n == "biased_mc":
+        # Explicit biased_mc is allowed with conventional MD too: it is the
+        # zero-boost reference comparison path.
+        return "biased_mc"
+
+    # auto
+    if boosted:
+        if not boost_type_n:
+            raise ValueError(
+                f"boosted run_mode={run_mode_n!r} carries no gamd_boost_type; "
+                "auto cannot pick a volume controller for it"
+            )
+        if boost_type_n not in SUPPORTED_BIASED_MC_BOOST_TYPES:
+            raise ValueError(
+                f"NPT is requested with boosted mode {boost_type_n!r}, which has no validated "
+                "target adapter for the application-controlled barostat (supported boost types: "
+                f"{sorted(SUPPORTED_BIASED_MC_BOOST_TYPES)}). Refusing to silently downgrade the "
+                "ensemble to NVT or to keep the incorrect native-barostat acceptance energy."
+            )
+        return "biased_mc"
+    return "native"
+
+
+def count_native_barostats(system: Any) -> int:
+    """Number of MonteCarloBarostat-family forces in ``system``.
+
+    Used to assert exactly one volume controller exists; the native barostat must
+    be removed from application-controlled Systems *before* Context creation.
+    """
+    n = 0
+    for i in range(system.getNumForces()):
+        f = system.getForce(i)
+        name = f.__class__.__name__
+        if name in _NATIVE_BAROSTAT_CLASSES or (
+            name.startswith("MonteCarlo") and "Barostat" in name
+        ):
+            n += 1
+    return n
 
 
 @dataclass(frozen=True)
@@ -89,31 +206,6 @@ class EffectivePotentialAdapter(Protocol):
     def snapshot(self, context: Any, integrator: Any) -> object: ...
 
     def evaluate(self, context: Any, snapshot: object) -> EnergyBreakdown: ...
-
-
-def resolve_npt_backend(
-    *,
-    ensemble: str,
-    requested: str,
-    run_mode: str,
-    boost_type: str,
-) -> BarostatBackend:
-    """Choose the volume controller, or fail loudly.
-
-    Explicit ``native`` with boosted dynamics must raise rather than preserve the
-    known mismatch, and an unsupported boosted mode must raise rather than
-    silently downgrade the requested ensemble to NVT.
-    """
-    raise NotImplementedError("package 1")
-
-
-def count_native_barostats(system: Any) -> int:
-    """Number of MonteCarloBarostat-family forces in ``system``.
-
-    Used to assert exactly one volume controller exists; the native barostat must
-    be removed from application-controlled Systems *before* Context creation.
-    """
-    raise NotImplementedError("package 1")
 
 
 class BiasedMCBarostatController:
