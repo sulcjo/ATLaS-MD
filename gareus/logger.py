@@ -1743,7 +1743,7 @@ class DistanceLogger:
                             if not self._render_error_warned:
                                 self._render_error_warned = True
                                 print(
-                                    f"[gareus] dashboard render failed ({type(exc).__name__}: "
+                                    f"[ATLaS-MD] dashboard render failed ({type(exc).__name__}: "
                                     f"{exc}); further render failures this run will not be "
                                     "printed again.",
                                     file=sys.stderr,

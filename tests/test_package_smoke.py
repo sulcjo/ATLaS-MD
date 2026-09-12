@@ -748,7 +748,7 @@ def test_contacts_manual_window_mode_accepts_explicit_windows_2d_csv_without_con
 def test_combined_genpept_gareus_config_documented_in_heavy_help() -> None:
     result = _run_cli("-hh")
     assert result.returncode == 0
-    assert "Combined GENPEPT -> GAREUS YAML" in result.stdout
+    assert "Combined GENPEPT -> ATLaS-MD YAML" in result.stdout
     assert "python GENPEPT.py --config" in result.stdout
     assert "not one linked TUI" in result.stdout
 
@@ -771,6 +771,58 @@ def test_seed_selection_options_parse() -> None:
     assert args.seed_selection_mode == "active-cv"
     assert abs(float(args.seed_cv2_weight) - 2.5) < 1.0e-12
     assert args.seed_max_reuse_per_conformer == 1
+
+
+def _banner_args():
+    from argparse import Namespace
+
+    return Namespace(
+        platform="CUDA", cpu_threads=8, forcefield="ff14SB", water_model="tip3p",
+        timestep_fs=4.0, run_mode="hmr-gamd", cv1="contacts", cv2="rama-map",
+        contact_beta_a_inv=6.0, contact_r0_a=4.5, cv1_range_min=0.0, cv1_range_max=0.6,
+        swarm_min_rungs=3, swarm_max_rungs=12, seed_conformers_dir="chignolin_genpept_seeds/",
+    )
+
+
+def test_startup_banner_panel_alignment_and_resume_rows(tmp_path) -> None:
+    from gareus.banner import banner_lines
+
+    (tmp_path / "adaptive_production" / "epoch_000").mkdir(parents=True)
+    (tmp_path / "adaptive_production" / "epoch_000" / "segments.json").write_text(
+        '[{"start_step": null, "end_step": 14573000, "status": "complete"}]\n', encoding="utf-8")
+    (tmp_path / "adaptive_feedback_driver_summary.json").write_text(
+        '{"rounds": [{"round": 0}, {"round": 1}]}\n', encoding="utf-8")
+    (tmp_path / "run_manifest.json").write_text(
+        json.dumps({
+            "start_time_utc": "2026-09-11T10:00:00+00:00",
+            "end_time_utc": "2026-09-11T15:12:30+00:00",
+        }), encoding="utf-8")
+
+    start = banner_lines(_banner_args(), tmp_path, resume=False, mbar_version="4.6.1")
+    resume = banner_lines(_banner_args(), tmp_path, resume=True, mbar_version=None)
+
+    for name, lines in (("start", start), ("resume", resume)):
+        assert all(len(line) <= 66 for line in lines), (name, max(len(l) for l in lines))
+        box = [line for line in lines if line.startswith(("+", "|"))]
+        assert box and all(len(line) == 66 for line in box), name
+        assert box[0] == "+" + "-" * 64 + "+" == box[-1]
+
+    joined_start = "\n".join(start)
+    joined_resume = "\n".join(resume)
+    assert "starting run" in joined_start
+    assert "resuming run" in joined_resume
+    assert "prev end" not in joined_start and "ckpt" not in joined_start
+    import datetime as _dt
+    _expected_end = _dt.datetime.fromisoformat("2026-09-11T15:12:30+00:00").astimezone().strftime("%Y-%m-%d %H:%M")
+    assert f"| prev end {_expected_end} (run 5 h 12 m)" in joined_resume
+    assert "| ckpt     epoch 1 / pilot round 2 / prod step 1.46e7" in joined_resume
+    assert "MISSING: pip install pymbar" in joined_resume
+    assert "MISSING" not in joined_start
+    assert "pymbar 4.6.1 ok" in joined_start
+    assert "github.com/sulcjo/ATLaS-MD" in joined_start
+    assert "heavy contacts, b0 6.0 1/A, midpoint 4.5 A, 0.0-0.6" in joined_start
+    assert "rama-map lambda-ladder, rungs 3-12" in joined_start
+    assert "HMR on (hmr-gamd)" in joined_start
 
 
 def test_cv_discovery_suggests_cv2_for_distance_only_run(tmp_path) -> None:

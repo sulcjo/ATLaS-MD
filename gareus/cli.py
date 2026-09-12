@@ -15,6 +15,7 @@ from typing import Iterable, Optional
 
 from .adaptive_feedback import run_adaptive_feedback_auto_loop
 from .adaptive_production import run_adaptive_production_auto_loop
+from .banner import print_startup_banner
 from .checkpoints import production_checkpoint_available, load_existing_openmm_setup_for_resume
 from .colors import configure_color
 from .config import (
@@ -502,7 +503,7 @@ def _add_seeding_args(p: argparse.ArgumentParser) -> None:
 
 def _add_genpept_prescan_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--genpept-prescan", action=argparse.BooleanOptionalAction, default=False,
-                   help="Enable GAREUS-side GENPEPT prescan.")
+                   help="Enable ATLaS-MD-side GENPEPT prescan.")
     p.add_argument("--genpept-prescan-dir", type=Path, default=None)
     p.add_argument("--genpept-prescan-stages", nargs="*", default=None)
     p.add_argument("--genpept-prescan-frontier-stages", nargs="*", default=None)
@@ -1510,7 +1511,7 @@ def parse_args(argv: Optional[Iterable[str]] = None):
         prog="gareus",
         add_help=False,
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        description="GAREUS peptide GaMD/REUS workflow. Use -h for help or -hh for method details.",
+        description="ATLaS-MD peptide GaMD/REUS workflow. Use -h for help or -hh for method details.",
     )
     _add_core_args(p)
     _add_system_args(p)
@@ -1879,6 +1880,10 @@ def main(argv: Optional[Iterable[str]] = None):
             print(json.dumps({"ok": True, "primary_cv": primary_cv_mode(args),
                               "note": "distance CV uses CustomBondForce; validated in smoke tests."}, indent=2, sort_keys=True))
             return
+    print_startup_banner(args, out_dir,
+                         resume=bool(getattr(args, "resume", False)
+                                     or getattr(args, "extend", False)
+                                     or getattr(args, "ap_resume", False)))
     _write_reproducibility_files(args, out_dir, argv=argv_list)
     public_args = {k: v for k, v in vars(args).items() if not str(k).startswith("_")}
     if bool(getattr(args, "resume", False)) and (out_dir / "run_args.json").exists():

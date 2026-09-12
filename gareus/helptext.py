@@ -45,8 +45,8 @@ __all__ = [
 
 
 _OVERVIEW = """
-GAREUS peptide workflow
-=======================
+ATLaS-MD peptide workflow
+=========================
 
 Run a peptide OpenMM workflow combining peptide setup, staged equilibration,
 umbrella sampling, optional GaMD calibration/production, replica exchange between
@@ -700,7 +700,7 @@ Every stock gamd-openmm dual boost reads the Total channel from bare ``energy``
 (all 32 force groups, so the umbrella and secondary CV are inside the boost
 statistics -- audit finding C1) and its velocity update applies only ``f0`` and
 the dihedral group's force, so a force moved to another group is dropped, not
-merely unboosted. ``pep-gamd-lower-dual`` is a gareus-owned integrator that
+merely unboosted. ``pep-gamd-lower-dual`` is an ATLaS-MD-owned integrator that
 boosts the peptide essential potential instead:
 
     V_pep = V_bonded(pep) + V_nb(pep-pep) + V_nb(pep-water)      (water-water excluded)
@@ -817,7 +817,7 @@ with optional:
     --traj-format xtc
     --traj-format none
 
-0.12 GaREUS production and exchange
+0.12 ATLaS-MD production and exchange
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Default exchange mode:
 
@@ -1043,7 +1043,7 @@ adds the exact whole-system unbiased OpenMM potential-energy scalar.
 
 1. Workflow map
 ---------------
-GAREUS is organized as a production peptide-sampling pipeline:
+ATLaS-MD is organized as a production peptide-sampling pipeline:
 
     sequence -> peptide build -> dodecahedral-box solvation/ions -> minimization -> staged NVT/NPT
     -> umbrella-window construction -> optional starting-structure pulling
@@ -1065,7 +1065,7 @@ active implementation code lives under `gareus/*`:
 
 2. Solvation and periodic box geometry
 --------------------------------------
-By default, GAREUS solvates with OpenMM Modeller.addSolvent using:
+By default, ATLaS-MD solvates with OpenMM Modeller.addSolvent using:
 
     boxShape = dodecahedron
 
@@ -1167,7 +1167,7 @@ but `torsion-pca` is a bootstrap PC fit from seed conformers whereas
 
 7. 2D and sparse windows
 ------------------------
-With multiple `--cv2-centers`, GAREUS normally creates a rectangular
+With multiple `--cv2-centers`, ATLaS-MD normally creates a rectangular
 cross-product of primary centers x secondary centers.  `--windows-2d-csv` can
 instead load an explicit per-window table, which supports sparse local patches
 from adaptive feedback.
@@ -1189,7 +1189,7 @@ relaxation can first relax the primary CV and then ramp the secondary CV.
 
 `--seed-conformers-dir` can point to a GENPEPT output directory containing
 `final_survivor_seeds.csv`.  The package then chooses nearby conformer seeds in
-the active GAREUS CV space before the normal CV-pull step.  In practical terms:
+the active ATLaS-MD CV space before the normal CV-pull step.  In practical terms:
 
     --cv1 distance                  scores survivor terminal distance vs window center
     --cv1 contacts                  scores survivor nonlocal-contact CV vs window center
@@ -1215,8 +1215,8 @@ active and can be evaluated on the GENPEPT survivor, add a scaled CV2 mismatch.
 behavior for reproducibility/debugging.  This improves initial coverage while
 leaving the production umbrella definitions unchanged.
 
-Combined GENPEPT -> GAREUS YAML files are supported.  Put GENPEPT settings in a
-top-level `conformer_generation`, `genpept`, or `seed_generation` block.  GAREUS
+Combined GENPEPT -> ATLaS-MD YAML files are supported.  Put GENPEPT settings in a
+top-level `conformer_generation`, `genpept`, or `seed_generation` block.  ATLaS-MD
 ignores those blocks when parsing its config, while `python GENPEPT.py --config`
 reads them.  A typical handoff is:
 
@@ -1225,7 +1225,7 @@ reads them.  A typical handoff is:
 
 The two terminal displays are not one linked TUI.  GENPEPT uses its own
 console/live-histogram display (`--live-hist`, `--hist-every`,
-`--no-clear-screen`, `--no-color`).  GAREUS uses the package dashboard
+`--no-clear-screen`, `--no-color`).  ATLaS-MD uses the package dashboard
 (`--tui-mode`, `--progress-mode`).  The data link is the seed directory,
 especially `final_survivor_seeds.csv`.
 
