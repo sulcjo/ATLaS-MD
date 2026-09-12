@@ -32,6 +32,7 @@ nav:
       - System setup: guide/system-setup.md
       - Collective variables: guide/collective-variables.md
       - Umbrella windows and REUS: guide/windows-and-exchange.md
+      - Thermodynamic validity: guide/thermodynamic-validity.md
       - GaMD: guide/gamd.md
       - Adaptive workflows: guide/adaptive-workflows.md
       - GENPEPT seeding: guide/genpept-seeding.md
