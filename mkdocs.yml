@@ -1,16 +1,33 @@
-site_name: ATLAS-MD
-site_description: GaREUS peptide sampling manual
+site_name: ATLaS-MD
+site_description: Adaptive Thermodynamic Landscape Sampling for molecular dynamics
 site_url: https://sulcjo.github.io/2026_peptide_sampler/
-repo_name: GAREUS peptide sampler
+repo_name: sulcjo/ATLaS-MD
+repo_url: https://github.com/sulcjo/ATLaS-MD
+edit_uri: edit/main/docs/atlas-md/
 docs_dir: docs/atlas-md
 theme:
   name: material
   language: en
+  logo: assets/atlas-md-logo.svg
+  favicon: assets/atlas-md-logo.svg
   features:
     - navigation.sections
     - navigation.path
     - navigation.top
+    - navigation.tabs
     - content.code.copy
+    - content.action.edit
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
 markdown_extensions:
   - admonition
   - pymdownx.details
@@ -20,10 +37,14 @@ markdown_extensions:
           class: mermaid
           format: !!python/name:pymdownx.superfences.fence_code_format
   - pymdownx.highlight
+  - pymdownx.arithmatex:
+      generic: true
   - toc:
       permalink: true
+extra_javascript:
+  - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
 nav:
-  - ATLAS-MD: index.md
+  - ATLaS-MD: index.md
   - Start:
       - Installation: start/installation.md
       - Quickstart: start/quickstart.md
