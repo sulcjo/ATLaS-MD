@@ -39,6 +39,7 @@ gareus_adaptive_production_v*/
 !docs/atlas_md_boltzmann_validation.md
 # Package deliverable reports at the worktree root (NPT correction handoff).
 !NPT_PACKAGE_A_REPORT.md
+!NPT_PACKAGE_B_REPORT.md
 
 illustrate_seedbank.png
 poincare_map.py
