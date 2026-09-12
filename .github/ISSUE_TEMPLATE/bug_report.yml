@@ -1,0 +1,51 @@
+name: Bug report
+description: Report a reproducible software defect in ATLaS-MD
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please include enough information to reproduce the problem. For thermodynamic or methodological concerns, use the dedicated template instead.
+  - type: input
+    id: version
+    attributes:
+      label: ATLaS-MD version / commit
+      placeholder: v0.7 or commit SHA
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      placeholder: CUDA / HIP / OpenCL / CPU / Reference; GPU model if relevant
+  - type: textarea
+    id: command
+    attributes:
+      label: Command or configuration
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: traceback
+    attributes:
+      label: Traceback / logs
+      render: text
+  - type: checkboxes
+    id: reproducible
+    attributes:
+      label: Reproducibility
+      options:
+        - label: I can reproduce this from a clean or resumed run and have removed sensitive/private data.
