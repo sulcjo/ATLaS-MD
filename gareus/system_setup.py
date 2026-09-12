@@ -49,6 +49,9 @@ __all__ = [
     "setup_platform_and_properties",
     "platform_summary",
     "make_forcefield",
+    "make_forcefield_from_args",
+    "forcefield_xml_paths",
+    "forcefield_selection_from_args",
     "create_system",
     "prepare_solvated_system",
     "make_langevin_integrator",
@@ -368,15 +371,84 @@ def platform_summary(platform, props: dict) -> str:
     return f"{name} {clean}" if clean else str(name)
 
 
-def make_forcefield(app, water_model: str):
-    """Construct an Amber14 force field with the selected water model."""
-    water_xml = {
-        "tip3p": "amber14/tip3p.xml",
-        "tip3pfb": "amber14/tip3pfb.xml",
-        "spce": "amber14/spce.xml",
-        "tip4pew": "amber14/tip4pew.xml",
-    }[water_model]
-    return app.ForceField("amber14-all.xml", water_xml)
+# Single source of truth for which XMLs a run loads. `provenance` reads this
+# too: the two used to carry duplicate water dicts, and updating one without the
+# other makes the provenance record disagree with what actually ran.
+FORCEFIELD_XML = {
+    "ff14SB": "amber14-all.xml",
+    "ff19SB": "amber19-all.xml",
+}
+
+# The amber14/ and amber19/ copies of every one of these files are byte-identical
+# in OpenMM 8.5.1, so the directory prefix is cosmetic; keeping the amber14/ paths
+# avoids churning the provenance record for zero numerical change.
+WATER_XML = {
+    "tip3p": "amber14/tip3p.xml",
+    "tip3pfb": "amber14/tip3pfb.xml",
+    "spce": "amber14/spce.xml",
+    "tip4pew": "amber14/tip4pew.xml",
+    "opc": "amber14/opc.xml",
+}
+
+# ff19SB was parameterized against OPC. Any other water is a known mismatch.
+_REQUIRED_WATER = {"ff19SB": "opc"}
+
+
+def forcefield_xml_paths(
+    forcefield: str = "ff14SB",
+    water_model: str = "tip3p",
+    *,
+    allow_mismatch: bool = False,
+) -> list[str]:
+    """Resolve (force field, water model) to the XML list OpenMM should load.
+
+    Raises rather than defaulting on an unknown name: a typo that silently
+    produced an amber14/TIP3P run would be invisible in the output and wrong in
+    the free energies.
+    """
+    ff = str(forcefield or "ff14SB")
+    water = str(water_model or "tip3p")
+    if ff not in FORCEFIELD_XML:
+        raise ValueError(
+            f"unknown forcefield {ff!r}; choose one of {sorted(FORCEFIELD_XML)}")
+    if water not in WATER_XML:
+        raise ValueError(
+            f"unknown water model {water!r}; choose one of {sorted(WATER_XML)}")
+    required = _REQUIRED_WATER.get(ff)
+    if required is not None and water != required and not allow_mismatch:
+        raise ValueError(
+            f"{ff} was parameterized against {required} water; refusing to pair it "
+            f"with {water!r}. Pass allow_mismatch=True "
+            f"(--allow-forcefield-water-mismatch) only if you intend this."
+        )
+    return [FORCEFIELD_XML[ff], WATER_XML[water]]
+
+
+def forcefield_selection_from_args(args) -> tuple[str, str, bool]:
+    """Read the selection off `args` so every construction site agrees.
+
+    `checkpoints.py` and `swarm/driver.py` build force fields independently of
+    the production path. If each carried its own default, a resume could rebuild
+    an ff19SB system as ff14SB without complaint -- invisible and unrecoverable.
+    """
+    return (
+        str(getattr(args, "forcefield", None) or "ff14SB"),
+        str(getattr(args, "water_model", None) or "tip3p"),
+        bool(getattr(args, "allow_forcefield_water_mismatch", False)),
+    )
+
+
+def make_forcefield(app, water_model: str = "tip3p", forcefield: str = "ff14SB",
+                    *, allow_mismatch: bool = False):
+    """Construct the force field for the selected protein FF and water model."""
+    return app.ForceField(*forcefield_xml_paths(
+        forcefield, water_model, allow_mismatch=allow_mismatch))
+
+
+def make_forcefield_from_args(app, args):
+    """Preferred entry point: one selection, used identically everywhere."""
+    ff, water, allow = forcefield_selection_from_args(args)
+    return make_forcefield(app, water, ff, allow_mismatch=allow)
 
 
 def create_system(app, unit, forcefield, topology, args, include_barostat: bool, barostat_frequency: Optional[int] = None):
@@ -513,7 +585,7 @@ def prepare_solvated_system(args, out_dir: Path):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    forcefield = make_forcefield(app, args.water_model)
+    forcefield = make_forcefield_from_args(app, args)
     input_pdb = resolve_input_pdb(args, base_dir=getattr(args, "config_base_dir", None))
     if input_pdb is not None:
         raw_pdb = out_dir / "00_input_structure.pdb"

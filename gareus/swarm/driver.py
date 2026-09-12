@@ -35,7 +35,7 @@ from gareus.cv import prepare_primary_cv_definition
 from gareus.imports import import_openmm
 from gareus.system_setup import (
     create_system,
-    make_forcefield,
+    make_forcefield_from_args,
     minimize_and_npt_equilibrate,
     setup_platform_and_properties,
     write_state_pdb,
@@ -249,7 +249,7 @@ def ensure_system(args, out_dir, progress) -> dict:
 
     if topology_pdb.exists() and equil_state_xml.exists() and base_system_xml_path.exists():
         openmm, app, unit = import_openmm()
-        forcefield = make_forcefield(app, args.water_model)
+        forcefield = make_forcefield_from_args(app, args)
         pdb = app.PDBFile(str(topology_pdb))
         equil_state = openmm.XmlSerializer.deserialize(equil_state_xml.read_text(encoding="utf-8"))
         base_system_xml = base_system_xml_path.read_text(encoding="utf-8")

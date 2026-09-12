@@ -413,6 +413,7 @@ def _basic_chignolin_config() -> Dict[str, Any]:
             "timestep_fs": 4.0,
             "box_shape": "dodecahedron",
             "padding_nm": 1.0,
+            "forcefield": "ff14SB",
             "water_model": "tip3p",
             "ionic_strength_molar": 0.15,
         },
