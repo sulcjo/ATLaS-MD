@@ -1,0 +1,58 @@
+name: Thermodynamic / methodological concern
+description: Report a concern about ensemble correctness, exchange, NPT, GaMD, reweighting, or estimator validity
+title: "[method] "
+labels: ["methodology"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ATLaS-MD separates sampler correctness, numerical propagation, and estimator/reweighting validity. Please identify which layer you are questioning.
+  - type: dropdown
+    id: layer
+    attributes:
+      label: Concern layer
+      options:
+        - Sampler / target distribution
+        - Replica exchange / proposal kernel
+        - NPT / volume move
+        - GaMD / Pep-GaMD propagation
+        - MBAR / reweighting / estimator
+        - Adaptive state placement / phase bookkeeping
+        - Checkpoint / resume
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      placeholder: v0.7 or commit SHA
+    validations:
+      required: true
+  - type: input
+    id: ensemble
+    attributes:
+      label: Ensemble and run mode
+      placeholder: NPT, hmr-gamd, pep-gamd-lower-dual, etc.
+  - type: input
+    id: exchange
+    attributes:
+      label: Exchange mode / state definition
+      placeholder: neighbor, gibbs-walk; CV1 x CV2 x lambda definition
+  - type: textarea
+    id: claim
+    attributes:
+      label: Suspected invalid assumption or equation
+      description: State the exact relation, cancellation, proposal symmetry, reduced potential, or statistical assumption you believe may be wrong.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence / minimal counterexample
+      description: Include equations, a tiny-system construction, test output, or a reproducible configuration when possible.
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected correction
+      description: If known, describe the target distribution or acceptance criterion you expect instead.
