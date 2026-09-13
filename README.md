@@ -41,17 +41,17 @@ ATLaS-MD treats thermodynamic correctness as part of the implementation rather t
 
 The intended state Hamiltonian is
 
-\[
+$$
 U_k^*(x,V)
 =
 U_{\mathrm{phys}}(x,V)
 +
 W_k(x,V)
 +
-\Delta V_k(x,V),
-\]
+\Delta V_k(x,V).
+$$
 
-with replica exchange evaluated by cross-pricing state-dependent terms under the candidate thermodynamic states.
+Replica exchange is evaluated by cross-pricing state-dependent terms under the candidate thermodynamic states.
 
 Elementary exchange moves are constructed to satisfy detailed balance with respect to the intended extended ensemble. Sequential exchange sweeps preserve the same stationary distribution, although a complete sweep need not itself be reversible.
 
