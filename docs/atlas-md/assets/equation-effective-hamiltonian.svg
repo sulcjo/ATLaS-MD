@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 190" role="img" aria-labelledby="title desc">
+  <title id="title">ATLaS-MD effective state Hamiltonian</title>
+  <desc id="desc">U star sub k of x and V equals physical potential plus state bias plus GaMD boost.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0d1117"/>
+      <stop offset="1" stop-color="#161b22"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="190" rx="24" fill="url(#bg)"/>
+  <text x="600" y="52" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700" fill="#8b949e">Effective state Hamiltonian</text>
+  <text x="600" y="124" text-anchor="middle" font-family="Cambria Math, STIX Two Math, Times New Roman, serif" font-size="46" fill="#e6edf3">
+    U<tspan baseline-shift="super" font-size="28">*</tspan><tspan baseline-shift="sub" font-size="28">k</tspan>(x,V)
+    = U<tspan baseline-shift="sub" font-size="28">phys</tspan>(x,V)
+    + W<tspan baseline-shift="sub" font-size="28">k</tspan>(x,V)
+    + ΔV<tspan baseline-shift="sub" font-size="28">k</tspan>(x,V)
+  </text>
+  <text x="600" y="161" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="17" fill="#8b949e">physical potential + explicit state bias + state-dependent GaMD/Pep-GaMD boost</text>
+</svg>
