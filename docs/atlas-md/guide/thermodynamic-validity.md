@@ -1,5 +1,23 @@
 # Thermodynamic target and detailed-balance contract
 
+> GitHub mobile may not render LaTeX reliably. The key equations are duplicated below as SVG cards for cross-platform readability; the full derivation that follows remains MathJax-native on the published documentation site.
+
+<p align="center">
+  <img src="../assets/equation-effective-hamiltonian.svg" alt="Effective state Hamiltonian" width="100%">
+</p>
+
+<p align="center">
+  <img src="../assets/equation-npt-acceptance.svg" alt="NPT volume-move acceptance" width="100%">
+</p>
+
+<p align="center">
+  <img src="../assets/equation-replica-exchange.svg" alt="Replica-exchange cross-evaluation" width="100%">
+</p>
+
+<p align="center">
+  <img src="../assets/equation-detailed-balance.svg" alt="Detailed balance and sweep invariance" width="100%">
+</p>
+
 ATLaS-MD is designed to preserve a well-defined extended ensemble of molecular configurations and thermodynamic-state assignments. This page states that target explicitly and separates three questions that are easy to conflate:
 
 1. **What distribution is intended?**
