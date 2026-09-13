@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1320 230" role="img" aria-labelledby="title desc">
+  <title id="title">ATLaS-MD detailed balance and sweep invariance</title>
+  <desc id="desc">Elementary exchange moves satisfy detailed balance while sequential compositions preserve the stationary distribution.</desc>
+  <rect width="1320" height="230" rx="24" fill="#0d1117"/>
+  <text x="660" y="48" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700" fill="#8b949e">Detailed balance vs. sweep invariance</text>
+  <text x="660" y="111" text-anchor="middle" font-family="Cambria Math, STIX Two Math, Times New Roman, serif" font-size="34" fill="#e6edf3">Π(σ) K<tspan baseline-shift="sub" font-size="22">ij</tspan>(σ→σ′) = Π(σ′) K<tspan baseline-shift="sub" font-size="22">ij</tspan>(σ′→σ)</text>
+  <text x="660" y="164" text-anchor="middle" font-family="Cambria Math, STIX Two Math, Times New Roman, serif" font-size="34" fill="#58a6ff">Π K<tspan baseline-shift="sub" font-size="22">1</tspan>K<tspan baseline-shift="sub" font-size="22">2</tspan>⋯K<tspan baseline-shift="sub" font-size="22">n</tspan> = Π</text>
+  <text x="660" y="205" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="16" fill="#8b949e">Elementary kernels are reversible; their ordered composition need only remain Π-invariant.</text>
+</svg>
