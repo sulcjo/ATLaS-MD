@@ -310,13 +310,29 @@ class NptRunContext:
     def needs_controller(self) -> bool:
         return self.backend == "biased_mc"
 
-    def initialize_controller(self, context, seed: int):
+    def initialize_controller(self, context, seed: int, adapter: Any = None):
+        """Build this context's volume controller.
+
+        ``adapter`` overrides the run-wide one for a context the shared adapter
+        does not describe. The multi-window GaMD reconnaissance path builds its
+        windows with ``make_cmd_integrator`` whenever ``integrator_kind`` is not
+        ``"gamd"``, and such a plain-Langevin context needs the conventional
+        zero-boost target rather than this run's Pep-GaMD one.
+
+        Pass a SEPARATE adapter instance, never the shared one reconfigured:
+        ``ensure_built`` below resolves and caches a lazy adapter, so resolving
+        the shared instance against an unboosted context would leave every
+        later boosted context holding a zero-boost acceptance energy that does
+        not match its propagated dynamics -- and silently, because the
+        dispatcher's own integrator guard would never be reached again.
+        """
         if not self.needs_controller:
             raise RuntimeError(
                 f"NptRunContext.initialize_controller called for backend {self.backend!r}; "
                 "only biased_mc runs own a BiasedMCBarostatController"
             )
-        if self.adapter is None:
+        adapter = self.adapter if adapter is None else adapter
+        if adapter is None:
             raise RuntimeError(
                 "biased_mc NPT requires the stage-aware effective-potential adapter; "
                 "none was provided"
@@ -325,12 +341,12 @@ class NptRunContext:
         # real self here: the controller's state_dict must carry the real
         # adapter_id from the very first checkpoint, not the empty pre-build
         # placeholder.
-        _ensure = getattr(self.adapter, "ensure_built", None)
+        _ensure = getattr(adapter, "ensure_built", None)
         if _ensure is not None:
             _ensure(context)
         return npt.BiasedMCBarostatController.initialize(
             context=context,
-            adapter=self.adapter,
+            adapter=adapter,
             pressure_bar=float(self.ownership.pressure_bar),
             temperature_k=float(self.ownership.temperature_k),
             frequency_steps=int(self.ownership.barostat_frequency),

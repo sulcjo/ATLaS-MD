@@ -132,6 +132,68 @@ def _make_runtime(backend="biased_mc", journal=None):
                          adapter=PhysicalEnergyAdapter(journal))
 
 
+class _NamedAdapter(PhysicalEnergyAdapter):
+    """A stub whose adapter_id says which one the controller actually got."""
+
+    def __init__(self, adapter_id):
+        super().__init__()
+        self.adapter_id = adapter_id
+
+
+# --------------------------------------------- per-context adapter override
+#
+# _LazyNptAdapter documents its sharing invariant as "every context that drives
+# the volume controller is a deserialized copy of the same base System passed
+# through the same make_gamd_integrator partition". The multi-window GaMD
+# reconnaissance path breaks it: with integrator_kind != "gamd" those windows
+# are built by make_cmd_integrator (a plain Langevin that excludes the aux
+# group), so the run-wide GaMD adapter does not describe them. chignolin_7 job
+# 2390041 died there -- "integrator LangevinMiddleIntegrator exposes no 'stage'
+# global". Such a window needs its OWN adapter, and giving it one must not
+# disturb the shared instance the boosted contexts rely on.
+
+
+def test_initialize_controller_uses_a_per_context_adapter_override():
+    runtime = _make_runtime()
+    sim = _make_sim()
+    override = _NamedAdapter("conventional")
+    ctrl = runtime.initialize_controller(sim.context, seed=3, adapter=override)
+    assert ctrl.state_dict()["adapter_id"] == "conventional"
+
+
+def test_initialize_controller_defaults_to_the_run_wide_adapter():
+    runtime = _make_runtime()
+    sim = _make_sim()
+    ctrl = runtime.initialize_controller(sim.context, seed=3)
+    assert ctrl.state_dict()["adapter_id"] == "physical_reference_v1"
+
+
+def test_an_overridden_context_does_not_poison_the_shared_adapter():
+    """The regression that would otherwise be silent: a cMD window initialised
+    FIRST must not leave the shared lazy adapter resolved to the zero-boost one,
+    which would hand every later boosted context an acceptance energy that does
+    not match its propagated dynamics."""
+    built = []
+
+    def factory(system, integrator, args):
+        built.append(str(getattr(args, "run_mode", "")))
+        return _NamedAdapter("conventional" if args.run_mode == "cmd" else "pep-gamd")
+
+    shared = production._LazyNptAdapter(
+        factory, SimpleNamespace(run_mode="gamd", gamd_boost_type="pep-gamd-lower-dual"), None)
+    runtime = NptRunContext(ownership=_make_ownership(), adapter=shared)
+
+    cmd_only = production._LazyNptAdapter(
+        factory, SimpleNamespace(run_mode="cmd", gamd_boost_type="pep-gamd-lower-dual"), None)
+    cmd_ctrl = runtime.initialize_controller(_make_sim().context, seed=1, adapter=cmd_only)
+    assert cmd_ctrl.state_dict()["adapter_id"] == "conventional"
+
+    gamd_ctrl = runtime.initialize_controller(_make_sim(seed=18).context, seed=2)
+    assert gamd_ctrl.state_dict()["adapter_id"] == "pep-gamd", (
+        "the shared adapter was poisoned by the cMD window")
+    assert built == ["cmd", "gamd"]
+
+
 def _make_sim(seed=17):
     system = System()
     for _ in range(4):

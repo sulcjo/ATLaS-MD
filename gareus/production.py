@@ -15,6 +15,7 @@ modules directly; it no longer reaches back into the historical monolith.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import copy
 import csv
 import itertools
 import json
@@ -5219,12 +5220,28 @@ def run_multiwindow_gamd_recon(
     # replicas' streams are separate from these again).  Construction stays
     # on this thread exactly like the Contexts above (existing recon
     # discipline); stepping fans out per window below.
+    # When these windows are conventional MD (integrator_kind != "gamd" above ->
+    # make_cmd_integrator, a plain Langevin that excludes the auxiliary group),
+    # the run-wide adapter does not describe them: it is built for this run's
+    # boost type and reads boost state a plain integrator does not carry. Give
+    # them their OWN adapter, resolved through the documented cmd route, and
+    # leave the shared instance untouched -- ensure_built() caches, so resolving
+    # the shared one here would hand every later boosted context a zero-boost
+    # acceptance energy.
+    recon_adapter = None
+    if npt_runtime is not None and npt_runtime.needs_controller and integrator_kind != "gamd":
+        cmd_args = copy.copy(args)
+        cmd_args.run_mode = "hmr-cmd" if "hmr" in str(
+            getattr(args, "run_mode", "") or "").lower() else "cmd"
+        recon_adapter = _resolve_npt_adapter(cmd_args, base_system)
+
     drivers: list = []
     for i in range(nwin):
         controller_i = None
         if npt_runtime is not None and npt_runtime.needs_controller:
             controller_i = npt_runtime.initialize_controller(
-                sims[i].context, seed=npt_seed_recon_window(args, i)
+                sims[i].context, seed=npt_seed_recon_window(args, i),
+                adapter=recon_adapter,
             )
         drivers.append(ReplicaStepDriver(sims[i], controller=controller_i, label=f"recon_window_{i}"))
 
