@@ -39,17 +39,9 @@ It is designed for workflows where the sampling protocol itself is part of the s
 
 ATLaS-MD treats thermodynamic correctness as part of the implementation rather than an afterthought.
 
-The intended state Hamiltonian is
-
-$$
-U_k^*(x,V)
-=
-U_{\mathrm{phys}}(x,V)
-+
-W_k(x,V)
-+
-\Delta V_k(x,V).
-$$
+<p align="center">
+  <img src="docs/atlas-md/assets/equation-effective-hamiltonian.svg" alt="Effective state Hamiltonian" width="100%">
+</p>
 
 Replica exchange is evaluated by cross-pricing state-dependent terms under the candidate thermodynamic states.
 
