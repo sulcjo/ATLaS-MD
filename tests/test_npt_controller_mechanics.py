@@ -19,6 +19,7 @@ from gareus.npt import (  # noqa: E402
     BAR_NM3_TO_KJ_PER_MOL,
     BiasedMCBarostatController,
     EnergyBreakdown,
+    _restoration_matches,
 )
 
 
@@ -174,6 +175,80 @@ def test_rejection_restores_positions_and_box_bitwise_and_consumes_draws():
     assert sd["counters"]["attempted"] == 10
     assert sd["counters"]["rejected"] == 10
     assert sd["counters"]["accepted"] == 0
+
+
+# ------------------------------------------------------- restoration tolerance
+#
+# The bitwise test above runs on Reference, where a set->get round trip IS
+# exact. CUDA is not, so the restoration guard cannot demand bitwise identity
+# there -- it aborted chignolin_7 (job 2389771) on the first rejected move.
+
+
+def _ulps(a, n):
+    """`a` moved `n` ULP toward +inf."""
+    out = np.array(a, dtype=float)
+    for _ in range(n):
+        out = np.nextafter(out, np.inf)
+    return out
+
+
+def test_restoration_accepts_last_bit_round_trip_noise():
+    """Measured on the 19008-atom chignolin_7 system (CUDA/mixed, 6.0 nm box):
+    303 atoms returned differing by up to 7.105e-15 nm -- 8 ULP of float64,
+    1.18e-15 relative. The box returned bitwise."""
+    expected = np.array([[6.0005, 1.0, 0.0], [0.0, 2.5, 3.0]])
+    noisy = _ulps(expected, 8)
+    assert np.abs(noisy - expected).max() < 1e-14, "test double must stay in the noise band"
+    assert _restoration_matches(noisy, expected)
+
+
+def test_restoration_rejects_an_unrestored_trial_state():
+    """A restore that did not take leaves the trial's scaled coordinates, which
+    differ by |s-1|*|r| -- twelve orders of magnitude above the noise band."""
+    expected = np.array([[6.0005, 1.0, 0.0], [0.0, 2.5, 3.0]])
+    s = 1.01 ** (1.0 / 3.0)
+    assert not _restoration_matches(expected * s, expected)
+
+
+@pytest.mark.parametrize("box_nm", [6.3, 20.0, 60.0])
+def test_restoration_rejects_a_single_displaced_atom(box_nm):
+    """The tolerance is relative, so it grows with the largest coordinate in the
+    array. A small displacement at a LARGE coordinate is the case that margin has
+    to cover -- this project also runs enlarged boxes (the 196k-atom bigbox
+    systems), where coordinates reach tens of nm."""
+    expected = np.zeros((64, 3))
+    expected[:, 0] = np.linspace(0.0, box_nm, 64)
+    actual = expected.copy()
+    actual[17, 1] += 1e-6          # 1 pm: far below any real move, far above the noise
+    assert not _restoration_matches(actual, expected)
+
+
+def test_restoration_rejects_empty_arrays():
+    assert not _restoration_matches(np.zeros((0, 3)), np.zeros((0, 3)))
+
+
+def test_restoration_rejects_shape_or_nonfinite_mismatch():
+    expected = np.zeros((4, 3))
+    assert not _restoration_matches(np.zeros((5, 3)), expected)
+    bad = expected.copy()
+    bad[0, 0] = np.nan
+    assert not _restoration_matches(bad, expected)
+
+
+def test_reject_path_survives_a_ulp_noisy_context_readback(monkeypatch):
+    """End-to-end reject path with a Context that never returns bitwise state."""
+    import gareus.npt as npt_mod
+    adapter = VolumeStubAdapter(physical=lambda v: 1e9 * (v - 8.0) ** 2)
+    ctx, ctrl = _make_controller(_rigid_molecule_system(), adapter, fraction=0.03)
+    real_read = npt_mod._read_positions_and_box
+
+    def noisy_read(context):
+        pos, box = real_read(context)
+        return _ulps(pos, 8), box
+
+    monkeypatch.setattr(npt_mod, "_read_positions_and_box", noisy_read)
+    res = ctrl.attempt_due(10)
+    assert not res.accepted
 
 
 def test_accepted_expansion_translates_molecules_about_their_centroids():

@@ -379,11 +379,45 @@ class _ControllerCore:
 
     def _verify_restoration(self, positions: "np.ndarray", box: "np.ndarray") -> None:
         pos_now, box_now = _read_positions_and_box(self._context)
-        if not (np.array_equal(pos_now, positions) and np.array_equal(box_now, box)):
+        if not (_restoration_matches(pos_now, positions)
+                and _restoration_matches(box_now, box)):
             raise RuntimeError(
                 "barostat trial restoration failed: the Context does not hold the "
                 "pre-trial positions/box after restore; this is fatal"
+                + self._restoration_diagnostics(pos_now, positions, box_now, box)
             )
+
+    def _restoration_diagnostics(self, pos_now, positions, box_now, box) -> str:
+        """Describe HOW far the restored state is from the snapshot.
+
+        The bare failure above cannot distinguish the two cases that matter:
+        a last-bit float round-trip difference (the comparison is too strict)
+        from a restore that genuinely did not take (deviation on the order of
+        the trial's scale factor, where tolerating it would bury a corrupted
+        state). Diagnostics only -- this does not change when we raise.
+        """
+        try:
+            dp = np.abs(np.asarray(pos_now) - np.asarray(positions))
+            db = np.abs(np.asarray(box_now) - np.asarray(box))
+            bad = np.unique(np.nonzero(dp > 0.0)[0])
+            try:
+                system = self._context.getSystem()
+                n_vsite = sum(1 for i in bad if system.isVirtualSite(int(i)))
+            except Exception:
+                n_vsite = -1
+            worst = int(np.unravel_index(int(np.argmax(dp)), dp.shape)[0]) if dp.size else -1
+            scale = float(np.max(np.abs(positions))) if positions.size else 0.0
+            return (
+                f" [diag: n_atoms={len(positions)} n_differing={len(bad)}"
+                f" n_differing_are_vsites={n_vsite}"
+                f" max_pos_dev_nm={dp.max() if dp.size else 0.0:.6e}"
+                f" max_box_dev_nm={db.max() if db.size else 0.0:.6e}"
+                f" worst_atom={worst} first_differing={bad[:8].tolist()}"
+                f" max_abs_coord_nm={scale:.4f}"
+                f" rel_dev={(dp.max() / scale) if scale else float('nan'):.3e}]"
+            )
+        except Exception as exc:  # diagnostics must never mask the real failure
+            return f" [diag unavailable: {type(exc).__name__}: {exc}]"
 
     def attempt_due(self, current_step: int) -> VolumeMoveResult:
         current_step = int(current_step)
@@ -489,6 +523,47 @@ class _ControllerCore:
         self._restore_positions(positions, box)
         self._verify_restoration(positions, box)
         return _finish(False, "rejected", log_a, new_volume, old)
+
+
+# Declared platform tolerance for the restore round-trip.
+#
+# Writing positions into an OpenMM Context and reading them back is bitwise
+# exact on Reference, but NOT on CUDA. Measured on the 19008-atom chignolin_7
+# production system (CUDA/mixed, 6.0 nm box, job 2389869): 303 atoms came back
+# differing by at most 7.105e-15 nm -- 8 ULP of float64, 1.18e-15 relative.
+# None were virtual sites and the box came back bitwise. Demanding
+# np.array_equal here aborted the campaign on its first rejected volume move.
+#
+# A restore that genuinely did not take leaves the trial's scaled coordinates,
+# off by |s-1|*|r|; at the 1% volume step used here that is ~3e-3 relative.
+# Twelve orders of magnitude separate the two. 1e-9 relative sits ~6 orders
+# above the float noise and ~6 orders below the smallest genuine failure, so it
+# cannot mask a corrupted state. It is relative, not absolute, so it stays
+# valid for the larger boxes used elsewhere in this project.
+#
+# This is the "within declared platform tolerances" of the NPT correction spec;
+# strict bitwise comparison remains correct on deterministic platforms and is
+# still asserted there by the Reference-platform tests.
+_RESTORE_REL_TOL = 1.0e-9
+
+
+def _restoration_matches(actual, expected, rel_tol: float = _RESTORE_REL_TOL) -> bool:
+    """True when a restored array matches its snapshot to the declared tolerance.
+
+    Shape changes and nonfinite values never match: those are corruption, not
+    round-trip noise.
+    """
+    a = np.asarray(actual, dtype=float)
+    e = np.asarray(expected, dtype=float)
+    if a.shape != e.shape:
+        return False
+    if not (np.all(np.isfinite(a)) and np.all(np.isfinite(e))):
+        return False
+    if e.size == 0:
+        # An empty readback is pathological, not a successful restore.
+        return False
+    scale = max(float(np.max(np.abs(e))), 1.0)
+    return bool(np.all(np.abs(a - e) <= rel_tol * scale))
 
 
 def _read_positions_and_box(context):
