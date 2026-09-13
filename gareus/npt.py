@@ -528,23 +528,37 @@ class _ControllerCore:
 # Declared platform tolerance for the restore round-trip.
 #
 # Writing positions into an OpenMM Context and reading them back is bitwise
-# exact on Reference, but NOT on CUDA. Measured on the 19008-atom chignolin_7
-# production system (CUDA/mixed, 6.0 nm box, job 2389869): 303 atoms came back
-# differing by at most 7.105e-15 nm -- 8 ULP of float64, 1.18e-15 relative.
-# None were virtual sites and the box came back bitwise. Demanding
-# np.array_equal here aborted the campaign on its first rejected volume move.
+# exact on Reference, but NOT on CUDA, which stores positions at single
+# precision (plus a correction term). The trial writes a float64-computed
+# array that is not representable in that storage, so the restored snapshot
+# can come back rounded at single-precision scale.
+#
+# The bound is the platform's, not an observation of one crash. Measured over
+# 257 trial/restore cycles of the real sequence on CUDA/mixed (job 2390033):
+# median deviation exactly 0, maximum 1.222e-7 relative = 1.03 * float32 eps,
+# and it does not grow with cycle count (second-half max 1.3e-15). So the
+# deviation is bounded by single-precision storage; 8 ULP of float32 leaves
+# ~8x headroom over the measured maximum.
 #
 # A restore that genuinely did not take leaves the trial's scaled coordinates,
-# off by |s-1|*|r|; at the 1% volume step used here that is ~3e-3 relative.
-# Twelve orders of magnitude separate the two. 1e-9 relative sits ~6 orders
-# above the float noise and ~6 orders below the smallest genuine failure, so it
-# cannot mask a corrupted state. It is relative, not absolute, so it stays
-# valid for the larger boxes used elsewhere in this project.
+# off by |s-1|*|r| -- ~3e-3 relative at the 1% volume step used here, which is
+# ~3500x above this tolerance. The guard therefore still catches a failed
+# restore while ignoring storage rounding. The tolerance is relative, not
+# absolute, so it stays valid for the enlarged boxes used elsewhere here.
+#
+# History: the first version of this guard used np.array_equal and aborted the
+# chignolin_7 campaign on its first rejected volume move (jobs 2389771,
+# 2389869). Commit 7900ff0 replaced it with 1e-9, calibrated on that
+# first-rejection measurement (8 ULP of float64) -- but a context on which no
+# volume move has ever been ACCEPTED is the special case, and 1e-9 was too
+# tight: job 2389986 reached states with accepted moves applied and failed at
+# 7.34e-8 relative. Do not recalibrate this from a single crash; the number
+# above comes from the distribution.
 #
 # This is the "within declared platform tolerances" of the NPT correction spec;
 # strict bitwise comparison remains correct on deterministic platforms and is
 # still asserted there by the Reference-platform tests.
-_RESTORE_REL_TOL = 1.0e-9
+_RESTORE_REL_TOL = 8.0 * float(np.finfo(np.float32).eps)   # ~9.54e-7
 
 
 def _restoration_matches(actual, expected, rel_tol: float = _RESTORE_REL_TOL) -> bool:

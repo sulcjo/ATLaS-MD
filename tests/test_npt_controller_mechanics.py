@@ -193,21 +193,43 @@ def _ulps(a, n):
 
 
 def test_restoration_accepts_last_bit_round_trip_noise():
-    """Measured on the 19008-atom chignolin_7 system (CUDA/mixed, 6.0 nm box):
-    303 atoms returned differing by up to 7.105e-15 nm -- 8 ULP of float64,
-    1.18e-15 relative. The box returned bitwise."""
+    """float64-scale noise: the first failure seen in production (job 2389869,
+    303 of 19008 atoms off by 7.105e-15 nm, 1.18e-15 relative)."""
     expected = np.array([[6.0005, 1.0, 0.0], [0.0, 2.5, 3.0]])
     noisy = _ulps(expected, 8)
     assert np.abs(noisy - expected).max() < 1e-14, "test double must stay in the noise band"
     assert _restoration_matches(noisy, expected)
 
 
+def test_restoration_accepts_single_precision_storage_rounding():
+    """CUDA stores positions at single precision, so a float64-computed trial
+    array can come back rounded at that scale. Measured maximum over 257
+    trial/restore cycles (job 2390033) was 1.03 * float32 eps; production hit
+    7.34e-8 relative (job 2389986). Both must pass."""
+    expected = np.array([[6.6935, 1.0, 0.25], [0.5, 2.5, 3.0]])
+    scale = float(np.max(np.abs(expected)))
+    for rel in (7.342e-8, 1.222e-7, 1.03 * np.finfo(np.float32).eps):
+        actual = expected.copy()
+        actual[0, 0] += rel * scale
+        assert _restoration_matches(actual, expected), f"must tolerate {rel:.3e} relative"
+
+
 def test_restoration_rejects_an_unrestored_trial_state():
     """A restore that did not take leaves the trial's scaled coordinates, which
-    differ by |s-1|*|r| -- twelve orders of magnitude above the noise band."""
+    differ by |s-1|*|r| -- ~3e-3 relative, ~3500x above the tolerance."""
     expected = np.array([[6.0005, 1.0, 0.0], [0.0, 2.5, 3.0]])
     s = 1.01 ** (1.0 / 3.0)
     assert not _restoration_matches(expected * s, expected)
+
+
+def test_restoration_tolerance_stays_between_the_noise_and_a_failed_restore():
+    """Pin the margins the declared tolerance claims, so a future edit that
+    widens it toward a real restore failure fails here first."""
+    from gareus.npt import _RESTORE_REL_TOL
+    eps32 = float(np.finfo(np.float32).eps)
+    assert _RESTORE_REL_TOL > 1.222e-7, "must clear the measured platform maximum"
+    assert _RESTORE_REL_TOL >= 4.0 * eps32, "keep headroom over single-precision storage"
+    assert _RESTORE_REL_TOL <= 1.0e-5, "must stay far below a genuine failed restore (~3e-3)"
 
 
 @pytest.mark.parametrize("box_nm", [6.3, 20.0, 60.0])
@@ -219,7 +241,7 @@ def test_restoration_rejects_a_single_displaced_atom(box_nm):
     expected = np.zeros((64, 3))
     expected[:, 0] = np.linspace(0.0, box_nm, 64)
     actual = expected.copy()
-    actual[17, 1] += 1e-6          # 1 pm: far below any real move, far above the noise
+    actual[17, 1] += 1e-3          # 1 pm: far below any real move, far above the noise
     assert not _restoration_matches(actual, expected)
 
 
