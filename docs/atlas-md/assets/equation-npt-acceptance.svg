@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1320 230" role="img" aria-labelledby="title desc">
+  <title id="title">ATLaS-MD NPT volume-move acceptance</title>
+  <desc id="desc">Log acceptance equals minus beta times effective-energy and pressure-volume change plus number of molecules times log volume ratio.</desc>
+  <rect width="1320" height="230" rx="24" fill="#0d1117"/>
+  <text x="660" y="50" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700" fill="#8b949e">NPT molecular volume-move acceptance</text>
+  <text x="660" y="121" text-anchor="middle" font-family="Cambria Math, STIX Two Math, Times New Roman, serif" font-size="38" fill="#e6edf3">
+    ln A = −β[U<tspan baseline-shift="super" font-size="24">*</tspan>(x′,V′) − U<tspan baseline-shift="super" font-size="24">*</tspan>(x,V) + P(V′−V)]
+  </text>
+  <text x="660" y="172" text-anchor="middle" font-family="Cambria Math, STIX Two Math, Times New Roman, serif" font-size="38" fill="#e6edf3">
+    + N<tspan baseline-shift="sub" font-size="24">mol</tspan> ln(V′/V),   β = 1/(RT)
+  </text>
+  <text x="660" y="208" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="16" fill="#8b949e">The logarithmic term is the rigid-molecule volume-scaling Jacobian.</text>
+</svg>
