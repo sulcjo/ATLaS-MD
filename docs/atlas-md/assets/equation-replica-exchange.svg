@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1380 250" role="img" aria-labelledby="title desc">
+  <title id="title">ATLaS-MD replica exchange acceptance</title>
+  <desc id="desc">Cross-state energy difference and Metropolis acceptance for replica exchange.</desc>
+  <rect width="1380" height="250" rx="24" fill="#0d1117"/>
+  <text x="690" y="48" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700" fill="#8b949e">Replica-exchange cross-evaluation</text>
+  <text x="690" y="112" text-anchor="middle" font-family="Cambria Math, STIX Two Math, Times New Roman, serif" font-size="32" fill="#e6edf3">
+    Δ = U<tspan baseline-shift="sub" font-size="21">j</tspan><tspan baseline-shift="super" font-size="21">*</tspan>(x<tspan baseline-shift="sub" font-size="21">a</tspan>,V<tspan baseline-shift="sub" font-size="21">a</tspan>) + U<tspan baseline-shift="sub" font-size="21">i</tspan><tspan baseline-shift="super" font-size="21">*</tspan>(x<tspan baseline-shift="sub" font-size="21">b</tspan>,V<tspan baseline-shift="sub" font-size="21">b</tspan>)
+  </text>
+  <text x="690" y="157" text-anchor="middle" font-family="Cambria Math, STIX Two Math, Times New Roman, serif" font-size="32" fill="#e6edf3">
+    − U<tspan baseline-shift="sub" font-size="21">i</tspan><tspan baseline-shift="super" font-size="21">*</tspan>(x<tspan baseline-shift="sub" font-size="21">a</tspan>,V<tspan baseline-shift="sub" font-size="21">a</tspan>) − U<tspan baseline-shift="sub" font-size="21">j</tspan><tspan baseline-shift="super" font-size="21">*</tspan>(x<tspan baseline-shift="sub" font-size="21">b</tspan>,V<tspan baseline-shift="sub" font-size="21">b</tspan>)
+  </text>
+  <text x="690" y="211" text-anchor="middle" font-family="Cambria Math, STIX Two Math, Times New Roman, serif" font-size="36" fill="#58a6ff">P<tspan baseline-shift="sub" font-size="23">acc</tspan> = min(1, exp(−βΔ))</text>
+</svg>
