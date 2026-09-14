@@ -396,6 +396,10 @@ class NptRunContext:
             state=state,
             expected_pressure_bar=float(self.ownership.pressure_bar),
             expected_temperature_k=float(self.ownership.temperature_k),
+            # The configured interval wins over the checkpoint's, so a change
+            # reaches a campaign that is already running. Pressure, temperature
+            # and the molecule partition are still validated, not overridden.
+            frequency_steps=int(self.ownership.barostat_frequency),
         )
 
     def make_driver(

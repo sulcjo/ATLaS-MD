@@ -249,6 +249,88 @@ def test_restoration_rejects_empty_arrays():
     assert not _restoration_matches(np.zeros((0, 3)), np.zeros((0, 3)))
 
 
+# --------------------------------------------- cost of verifying the restore
+#
+# Reading every restored coordinate back cost a SECOND full position download
+# per rejected move (78% of 407,360 attempts in chignolin_7), on top of the
+# snapshot read, and it dominated the run. The box is cheap to read and is
+# restored bitwise, so it is checked every time; the positions are checked on a
+# stride, which still bounds how long a systematic restore failure can hide.
+
+
+def _count_position_reads(monkeypatch):
+    import gareus.npt as npt_mod
+    calls = {"pos": 0}
+    real = npt_mod._read_positions_and_box
+
+    def counting(context):
+        calls["pos"] += 1
+        return real(context)
+
+    monkeypatch.setattr(npt_mod, "_read_positions_and_box", counting)
+    return calls
+
+
+def test_rejected_moves_do_not_read_positions_back_every_time(monkeypatch):
+    """One snapshot read per attempt; no second full read to verify."""
+    adapter = VolumeStubAdapter(physical=lambda v: 1e9 * (v - 8.0) ** 2)
+    ctx, ctrl = _make_controller(_rigid_molecule_system(), adapter, fraction=0.03)
+    calls = _count_position_reads(monkeypatch)
+    reasons = []
+    step = ctrl.next_due_step
+    for _ in range(20):
+        res = ctrl.attempt_due(step)
+        reasons.append(res.reason)
+        step = ctrl.next_due_step
+    # The cheap geometric rejects never touch the Context, so they would make
+    # this assertion pass for the wrong reason.
+    assert reasons.count("rejected") >= 15, (
+        f"this test needs the FULL reject path (restore + verify); got {set(reasons)}")
+    assert calls["pos"] <= len(reasons) + 2, (
+        f"{calls['pos']} position reads for {len(reasons)} attempts: the restore "
+        "verification is still downloading coordinates on every move")
+
+
+def test_a_box_that_fails_to_restore_is_still_caught_every_time(monkeypatch):
+    """The box is compared on EVERY restore, not on the stride."""
+    import gareus.npt as npt_mod
+    adapter = VolumeStubAdapter(physical=lambda v: 1e9 * (v - 8.0) ** 2)
+    ctx, ctrl = _make_controller(_rigid_molecule_system(), adapter, fraction=0.03)
+    real_restore = npt_mod._ControllerCore._restore_positions
+
+    def restore_with_a_bad_box(self, positions, box):
+        # Coordinates come back correctly; the box does not.
+        real_restore(self, positions, np.asarray(box) * 1.05)
+
+    monkeypatch.setattr(npt_mod._ControllerCore, "_restore_positions",
+                        restore_with_a_bad_box)
+    with pytest.raises(RuntimeError, match="pre-trial box"):
+        step = ctrl.next_due_step
+        for _ in range(4):
+            ctrl.attempt_due(step)
+            step = ctrl.next_due_step
+
+
+def test_a_systematic_position_restore_failure_is_caught_within_the_stride(monkeypatch):
+    import gareus.npt as npt_mod
+    adapter = VolumeStubAdapter(physical=lambda v: 1e9 * (v - 8.0) ** 2)
+    ctx, ctrl = _make_controller(_rigid_molecule_system(), adapter, fraction=0.03)
+    real_restore = npt_mod._ControllerCore._restore_positions
+
+    def broken_restore(self, positions, box):
+        # Box restores fine; coordinates come back displaced -- the case the
+        # stride check has to catch.
+        real_restore(self, positions * 1.02, box)
+
+    monkeypatch.setattr(npt_mod._ControllerCore, "_restore_positions", broken_restore)
+    stride = npt_mod._RESTORE_VERIFY_STRIDE
+    with pytest.raises(RuntimeError, match="restoration failed"):
+        step = 10
+        for _ in range(stride + 2):
+            ctrl.attempt_due(step)
+            step = ctrl.next_due_step
+
+
 def test_restoration_rejects_shape_or_nonfinite_mismatch():
     expected = np.zeros((4, 3))
     assert not _restoration_matches(np.zeros((5, 3)), expected)
@@ -456,6 +538,51 @@ def test_restore_resumes_the_exact_random_stream_and_schedule():
     assert [p[0] for p in rest] == [p[0] for p in full[10:]]
     assert [p[1] for p in rest] == [p[1] for p in full[10:]]
     assert [p[2] for p in rest] == [p[2] for p in full[10:]]
+
+
+# ------------------------------------------------- resume-time frequency change
+#
+# restore() took frequency_steps from the CHECKPOINT, so a configured change
+# could never reach a running campaign -- chignolin_7 ran at the argparse
+# default of 100 steps, a value inherited from when the barostat was OpenMM's
+# C++ MonteCarloBarostat (free, on-GPU). The Python biased-MC barostat costs a
+# position round trip plus ~6 GPU syncs per attempt, and profiling the live job
+# put 99.6% of wall time in attempt_due against 0.4% in integrator.step().
+
+
+def test_restore_keeps_the_checkpoint_frequency_by_default():
+    adapter = VolumeStubAdapter()
+    ctx, ctrl = _make_controller(_rigid_molecule_system(), adapter, frequency=10)
+    sd = json.loads(json.dumps(ctrl.state_dict()))
+    back = BiasedMCBarostatController.restore(
+        ctx, adapter, state=sd, expected_pressure_bar=0.0, expected_temperature_k=300.0)
+    assert back.state_dict()["frequency_steps"] == 10
+
+
+def test_restore_applies_an_explicit_frequency_override():
+    adapter = VolumeStubAdapter()
+    ctx, ctrl = _make_controller(_rigid_molecule_system(), adapter, frequency=10)
+    sd = json.loads(json.dumps(ctrl.state_dict()))
+    back = BiasedMCBarostatController.restore(
+        ctx, adapter, state=sd, expected_pressure_bar=0.0, expected_temperature_k=300.0,
+        frequency_steps=200)
+    assert back.state_dict()["frequency_steps"] == 200
+
+
+def test_frequency_override_reschedules_from_the_restored_step():
+    """The next move stays where the checkpoint left it; only the interval after
+    it changes, so a resume never skips or duplicates a due move."""
+    adapter = VolumeStubAdapter()
+    ctx, ctrl = _make_controller(_rigid_molecule_system(), adapter, frequency=10)
+    ctrl.attempt_due(ctrl.next_due_step)
+    sd = json.loads(json.dumps(ctrl.state_dict()))
+    due_before = int(sd["next_due_step"])
+    back = BiasedMCBarostatController.restore(
+        ctx, adapter, state=sd, expected_pressure_bar=0.0, expected_temperature_k=300.0,
+        frequency_steps=200)
+    assert back.next_due_step == due_before
+    back.attempt_due(back.next_due_step)
+    assert back.next_due_step == due_before + 200
 
 
 def test_restore_validates_pressure_temperature_and_partition():

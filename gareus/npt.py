@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Literal, Mapping, Protocol
+from typing import Any, Literal, Mapping, Optional, Protocol
 
 import numpy as np
 
@@ -331,6 +331,8 @@ class _ControllerCore:
         self._fingerprint = _molecule_fingerprint(molecules)
         self._rng = rng
         self._counters = counters
+        # Counts restores verified, for the strided full-coordinate check.
+        self._restore_checks = 0
         self._next_due_step = int(next_due_step)
         self._last_due_step = int(last_due_step)
         self._max_cutoff_nm = float(max_cutoff_nm)
@@ -378,12 +380,38 @@ class _ControllerCore:
         self._context.setPositions(positions)
 
     def _verify_restoration(self, positions: "np.ndarray", box: "np.ndarray") -> None:
-        pos_now, box_now = _read_positions_and_box(self._context)
-        if not (_restoration_matches(pos_now, positions)
-                and _restoration_matches(box_now, box)):
+        """Check that the Context really holds the pre-trial state again.
+
+        The box is read and compared every time: it is three vectors, it costs
+        no coordinate transfer, and it is the half that is restored bitwise.
+
+        The coordinates are checked on a stride. Reading them back is a full
+        download of every atom -- a SECOND one, on top of the snapshot this
+        trial already took -- and it landed on the reject path, which is where
+        ~78% of attempts go. Profiling the live chignolin_7 job put 99.6% of
+        wall time inside attempt_due against 0.4% in integrator.step(), with
+        every GPU idle, and this readback was the single largest frame. Checking
+        one restore in _RESTORE_VERIFY_STRIDE keeps the guard's purpose -- a
+        systematic restore failure cannot hide for more than that many moves --
+        at a small fraction of the cost. A one-off corruption that repairs
+        itself before the next strided check is not a failure mode any restore
+        has: setPositions either takes or it does not.
+        """
+        box_now = _box_matrix_nm(self._context)
+        if not _restoration_matches(box_now, box):
             raise RuntimeError(
                 "barostat trial restoration failed: the Context does not hold the "
-                "pre-trial positions/box after restore; this is fatal"
+                "pre-trial box after restore; this is fatal"
+                + self._restoration_diagnostics(None, None, box_now, box)
+            )
+        self._restore_checks += 1
+        if self._restore_checks % _RESTORE_VERIFY_STRIDE:
+            return
+        pos_now, _box = _read_positions_and_box(self._context)
+        if not _restoration_matches(pos_now, positions):
+            raise RuntimeError(
+                "barostat trial restoration failed: the Context does not hold the "
+                "pre-trial positions after restore; this is fatal"
                 + self._restoration_diagnostics(pos_now, positions, box_now, box)
             )
 
@@ -397,8 +425,12 @@ class _ControllerCore:
         state). Diagnostics only -- this does not change when we raise.
         """
         try:
-            dp = np.abs(np.asarray(pos_now) - np.asarray(positions))
             db = np.abs(np.asarray(box_now) - np.asarray(box))
+            if pos_now is None or positions is None:
+                # Box-only failure: no coordinates were read on this check.
+                return (f" [diag: positions not read on this check;"
+                        f" max_box_dev_nm={db.max() if db.size else 0.0:.6e}]")
+            dp = np.abs(np.asarray(pos_now) - np.asarray(positions))
             bad = np.unique(np.nonzero(dp > 0.0)[0])
             try:
                 system = self._context.getSystem()
@@ -560,6 +592,13 @@ class _ControllerCore:
 # still asserted there by the Reference-platform tests.
 _RESTORE_REL_TOL = 8.0 * float(np.finfo(np.float32).eps)   # ~9.54e-7
 
+# How often the restored COORDINATES are read back and compared. The box is
+# compared on every restore; coordinates cost a full download of every atom, so
+# they are checked one restore in this many. A restore either takes or it does
+# not, so a systematic failure shows up within one stride while the per-move
+# cost drops by that factor. See _verify_restoration.
+_RESTORE_VERIFY_STRIDE = 256
+
 
 def _restoration_matches(actual, expected, rel_tol: float = _RESTORE_REL_TOL) -> bool:
     """True when a restored array matches its snapshot to the declared tolerance.
@@ -669,9 +708,24 @@ class BiasedMCBarostatController:
         state: Mapping[str, object],
         expected_pressure_bar: float,
         expected_temperature_k: float,
+        frequency_steps: Optional[int] = None,
     ) -> "BiasedMCBarostatController":
         """Restore exact schedule and random stream. Must not attempt an extra
-        move as a side effect of resuming."""
+        move as a side effect of resuming.
+
+        ``frequency_steps`` deliberately overrides the checkpoint's attempt
+        interval. Without it the checkpoint's value is authoritative, which
+        means a configured change can never reach a campaign already running:
+        chignolin_7 spent 23 h at the argparse default of 100 steps, a value
+        inherited from OpenMM's on-GPU C++ barostat and far too frequent for
+        this Python one. Unlike pressure, temperature and the molecule
+        partition -- which must match or the Jacobian and the target
+        distribution are wrong -- the attempt interval does not bias the
+        sampled ensemble. Detailed balance holds per move at any interval; only
+        the rate at which the volume relaxes changes. The move already
+        scheduled is left where the checkpoint put it, so a resume neither
+        skips nor duplicates one; only the interval after it changes.
+        """
         state = dict(state)
         if int(state.get("schema_version", -1)) != _CONTROLLER_SCHEMA_VERSION:
             raise ValueError(
@@ -709,8 +763,18 @@ class BiasedMCBarostatController:
         for key in ("attempted", "accepted", "rejected", "invalid_geometry",
                     "nonfinite_trial_energy"):
             counters.setdefault(key, 0)
+        restored_frequency = int(state["frequency_steps"])
+        if frequency_steps is not None and int(frequency_steps) != restored_frequency:
+            if int(frequency_steps) <= 0:
+                raise ValueError(
+                    f"barostat frequency override must be positive, got {frequency_steps!r}"
+                )
+            print(f"[npt] barostat attempt interval changed on resume: "
+                  f"{restored_frequency} -> {int(frequency_steps)} steps "
+                  f"(next move stays at step {int(state['next_due_step'])})")
+            restored_frequency = int(frequency_steps)
         core = _ControllerCore(
-            context, adapter, pressure, temperature, int(state["frequency_steps"]),
+            context, adapter, pressure, temperature, restored_frequency,
             float(state["half_width_nm3"]), molecules, _rng_from_state(dict(state["rng"])),
             counters, int(state["next_due_step"]), int(state.get("last_due_step", 0)),
             _max_nonbonded_cutoff_nm(context),
