@@ -416,6 +416,20 @@ class _ControllerCore:
         self._next_due_step = int(next_due_step)
         self._last_due_step = int(last_due_step)
         self._max_cutoff_nm = float(max_cutoff_nm)
+        self._install_molecule_index_arrays(
+            context.getSystem().getNumParticles())
+
+    def _install_molecule_index_arrays(self, n_atoms: int) -> None:
+        """Derive the flat index arrays the vectorized volume move needs.
+
+        ``_mean_fallback_molecules`` lists the few molecules whose centroid must
+        keep the original ``mean`` call for the summation order to match; see
+        that function. For a normal solvated system it is empty or holds only
+        the solute.
+        """
+        self._mol_ids, self._mol_sizes = _molecule_index_arrays(
+            self._molecules, n_atoms)
+        self._mean_fallback = _mean_fallback_molecules(self._molecules)
 
     # -- schedule ---------------------------------------------------------------
 
@@ -596,11 +610,11 @@ class _ControllerCore:
 
         # 4. Apply the proposal: scale the box, translate whole molecules about
         #    their arithmetic centroids, refresh virtual sites.
-        new_positions = positions.copy()
         scale_minus_one = s - 1.0
-        for mol in self._molecules:
-            center = positions[mol].mean(axis=0)
-            new_positions[mol] = positions[mol] + scale_minus_one * center
+        new_positions = _scale_about_molecule_centroids(
+            positions, self._mol_ids, self._mol_sizes, scale_minus_one,
+            self._mean_fallback,
+        )
 
         try:
             self._restore_positions(new_positions, s * box)
