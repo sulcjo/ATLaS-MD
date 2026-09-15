@@ -29,6 +29,7 @@ scheduler can be built independently. See
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 from typing import Any, Literal, Mapping, Optional, Protocol
 
@@ -212,6 +213,11 @@ class EffectivePotentialAdapter(Protocol):
 
 # --------------------------------------------------------------------------- internals
 
+# Schema v1 readers MUST ignore keys they do not recognise. ``restore`` reads
+# named keys explicitly and never enumerates the mapping, so a writer may add
+# optional diagnostic keys -- "timings" is the first -- without a version bump
+# and without breaking a resume in either direction. Anything a reader must
+# *act* on still requires a bump.
 _CONTROLLER_SCHEMA_VERSION = 1
 
 
@@ -418,6 +424,7 @@ class _ControllerCore:
         self._max_cutoff_nm = float(max_cutoff_nm)
         self._install_molecule_index_arrays(
             context.getSystem().getNumParticles())
+        self._install_timings()
 
     def _install_molecule_index_arrays(self, n_atoms: int) -> None:
         """Derive the flat index arrays the vectorized volume move needs.
@@ -430,6 +437,19 @@ class _ControllerCore:
         self._mol_ids, self._mol_sizes = _molecule_index_arrays(
             self._molecules, n_atoms)
         self._mean_fallback = _mean_fallback_molecules(self._molecules)
+
+    def _install_timings(self) -> None:
+        """Per-phase wall-time accumulators for one attempt's transaction.
+
+        Diagnostics only. ``perf_counter`` costs tens of nanoseconds against
+        phases measured in milliseconds, so the instrument does not perturb what
+        it measures. Written into the checkpoint for the record but never
+        restored from it -- a per-job reset is what makes the rates readable.
+        """
+        self._timings = {
+            "read_s": 0.0, "scale_s": 0.0, "restore_s": 0.0,
+            "evaluate_s": 0.0, "verify_s": 0.0, "attempts": 0,
+        }
 
     # -- schedule ---------------------------------------------------------------
 
@@ -461,6 +481,7 @@ class _ControllerCore:
             "molecule_partition_fingerprint": self._fingerprint,
             "rng": {"algorithm": "PCG64", **state},
             "counters": dict(self._counters),
+            "timings": dict(self._timings),
             "last_due_step": self._last_due_step,
             "next_due_step": self._next_due_step,
         }
@@ -563,7 +584,9 @@ class _ControllerCore:
         #    so an unexpected error here needs no restoration, but must still
         #    abort with context rather than passing silently.
         try:
+            _t0 = time.perf_counter()
             old = self._adapter.evaluate(self._context, snapshot)
+            self._timings["evaluate_s"] += time.perf_counter() - _t0
         except Exception as exc:
             raise RuntimeError(
                 f"volume-move trial failed while evaluating the current U* at step "
@@ -575,7 +598,10 @@ class _ControllerCore:
                 raise RuntimeError(
                     f"nonfinite old energy component {name}={getattr(old, name)!r}; aborting"
                 )
+        _t0 = time.perf_counter()
         positions, box = _read_positions_and_box(self._context)
+        self._timings["read_s"] += time.perf_counter() - _t0
+        self._timings["attempts"] += 1
         old_volume = _box_volume_nm3(box)
 
         def _finish(accepted: bool, reason: str, log_a: float,
@@ -610,19 +636,29 @@ class _ControllerCore:
 
         # 4. Apply the proposal: scale the box, translate whole molecules about
         #    their arithmetic centroids, refresh virtual sites.
+        _t0 = time.perf_counter()
         scale_minus_one = s - 1.0
         new_positions = _scale_about_molecule_centroids(
             positions, self._mol_ids, self._mol_sizes, scale_minus_one,
             self._mean_fallback,
         )
+        self._timings["scale_s"] += time.perf_counter() - _t0
 
         try:
+            _t0 = time.perf_counter()
             self._restore_positions(new_positions, s * box)
             self._context.computeVirtualSites()
+            self._timings["restore_s"] += time.perf_counter() - _t0
+            _t0 = time.perf_counter()
             new = self._adapter.evaluate(self._context, snapshot)
+            self._timings["evaluate_s"] += time.perf_counter() - _t0
             if not _finite(new.effective_kj_mol) or not _finite(new.boost_kj_mol):
+                _t0 = time.perf_counter()
                 self._restore_positions(positions, box)
+                self._timings["restore_s"] += time.perf_counter() - _t0
+                _t0 = time.perf_counter()
                 self._verify_restoration(positions, box)
+                self._timings["verify_s"] += time.perf_counter() - _t0
                 self._counters["nonfinite_trial_energy"] += 1
                 return _finish(False, "nonfinite_trial_energy", -math.inf, new_volume, old)
 
@@ -637,8 +673,12 @@ class _ControllerCore:
             )
             accept = accept_draw <= 0.0 or math.log(accept_draw) < min(0.0, log_a)
         except Exception as exc:
+            _t0 = time.perf_counter()
             self._restore_positions(positions, box)
+            self._timings["restore_s"] += time.perf_counter() - _t0
+            _t0 = time.perf_counter()
             self._verify_restoration(positions, box)
+            self._timings["verify_s"] += time.perf_counter() - _t0
             raise RuntimeError(
                 f"volume-move trial failed unexpectedly at step {current_step}; "
                 "the original state was restored before this error"
@@ -646,8 +686,12 @@ class _ControllerCore:
 
         if accept:
             return _finish(True, "accepted", log_a, new_volume, new)
+        _t0 = time.perf_counter()
         self._restore_positions(positions, box)
+        self._timings["restore_s"] += time.perf_counter() - _t0
+        _t0 = time.perf_counter()
         self._verify_restoration(positions, box)
+        self._timings["verify_s"] += time.perf_counter() - _t0
         return _finish(False, "rejected", log_a, new_volume, old)
 
 
