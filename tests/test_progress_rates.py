@@ -46,9 +46,14 @@ def test_rates_use_only_steps_since_the_segment_started(tmp_path):
     last = captured[-1]
     assert last["segment_steps"] == 10_000
     assert last["sim_time_ns"] == pytest.approx(1_010_000 * 3.5 / 1e6)
-    # The bug reported step/elapsed; with ~0 elapsed that was astronomically
-    # large. The corrected rate is bounded by the segment actually run.
-    assert last["steps_per_s"] < 1_000_000_000
+    # Assert the identity the fix establishes, not a magnitude: the rate must be
+    # segment_steps/elapsed. A bound like "< 1e9" is machine-speed dependent --
+    # two calls microseconds apart legitimately give a huge rate, and that bound
+    # passed alone but failed inside the full suite.
+    assert last["steps_per_s"] == pytest.approx(
+        last["segment_steps"] / last["elapsed_s"], rel=1e-9)
+    # The defect being fixed used step_int, which is 101x larger here.
+    assert last["steps_per_s"] < 0.5 * last["step"] / last["elapsed_s"]
 
 
 def test_first_report_of_a_segment_omits_rates_rather_than_dividing_by_zero(tmp_path):
