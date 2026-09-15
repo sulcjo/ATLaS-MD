@@ -102,7 +102,36 @@ of one unmeasured quantity. Define it explicitly:
 
 The curve is steep and no point on it may be quoted as if measured.
 
-**Two independent estimates of p disagree, and the disagreement is the whole
+### MEASURED, 2026-09-16: p = 0.99, end-to-end 4.2x
+
+Harness job 2415561 on d099 (4x L40S, MPS, 21,384 atoms / 7,128 molecules —
+slightly larger than production, so if anything conservative). Old loop vs
+vectorized, both driven through the real controller:
+
+| threads | loop ms/move | vectorized ms/move | ratio | implied p | end-to-end |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 100.4 | 2.50 | 40.2x | 0.98 | 3.73x |
+| 8 | 1067.3 | 9.87 | 108.1x | 0.99 | 4.10x |
+| 32 | 7109.9 | 48.36 | 147.0x | 0.99 | 4.16x |
+| **64** | **15991.3** | **91.17** | **175.4x** | **0.99** | **4.19x** |
+
+**The cycle-arithmetic estimate below was wrong, and this is why.** It assumed
+the isolated 57.1 ms microbenchmark transfers to a contended runtime. It does
+not: per replica the loop costs 100 ms at 1 thread but **250 ms at 64** — 4.4x
+its isolated cost. That inflation *is* the GIL convoy, and it is what made
+cycle arithmetic read p ≈ 0.42 when the true value is ≈ 0.99.
+
+The measurement is robust to the harness's one known bias. Its `evaluate` is a
+plain PME energy rather than the full Pep-GaMD U*, so production's is dearer;
+but making it 2x/3x/5x dearer moves p only to 0.997/0.997/0.995 and the speedup
+to 4.23x/4.22x/4.20x. The loop so dominates that nothing else matters.
+
+**Expected stride is therefore ~816k steps/job, the top of the §2 table, not the
+~281k that p ≈ 0.42 predicted.**
+
+Historical note, kept because the reasoning matters more than the answer:
+
+**Two independent estimates of p disagreed, and the disagreement was the whole
 problem.**
 
 - **py-spy says p ≈ 1.0.** Of 631 worker-thread stack observations, 629 were

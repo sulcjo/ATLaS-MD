@@ -1,0 +1,35 @@
+[harness] python: /home/sulcjo/conda-envs/calc/bin/python
+[harness] numpy 1.24.2 | openmm 8.3.1
+0, NVIDIA L40S, 46068 MiB
+1, NVIDIA L40S, 46068 MiB
+2, NVIDIA L40S, 46068 MiB
+3, NVIDIA L40S, 46068 MiB
+[harness] code commit: c1c12a86cdc3e0a27252965c467f442b631ebff2  host: d099  job: 2415561
+
+building reference context on CUDA ...
+system: 21384 atoms, 7128 molecules, 4 GPU(s)
+
+  threads=  1 loop        wall   2.509s   100.369 ms per move per replica-set
+  threads=  1 vectorized  wall   0.062s     2.495 ms per move per replica-set
+      phases: evaluate_s= 25.5%  read_s= 16.8%  restore_s= 38.6%  scale_s= 17.2%  verify_s=  2.0%
+
+  threads=  8 loop        wall  26.682s  1067.293 ms per move per replica-set
+  threads=  8 vectorized  wall   0.247s     9.871 ms per move per replica-set
+      phases: evaluate_s= 19.0%  read_s= 20.9%  restore_s=  9.5%  scale_s= 50.0%  verify_s=  0.6%
+
+  threads= 32 loop        wall 177.746s  7109.857 ms per move per replica-set
+  threads= 32 vectorized  wall   1.209s    48.356 ms per move per replica-set
+      phases: evaluate_s= 15.6%  read_s= 17.9%  restore_s=  2.2%  scale_s= 64.1%  verify_s=  0.2%
+
+  threads= 64 loop        wall 399.782s  15991.297 ms per move per replica-set
+  threads= 64 vectorized  wall   2.279s    91.167 ms per move per replica-set
+      phases: evaluate_s= 13.0%  read_s= 18.8%  restore_s=  0.9%  scale_s= 67.3%  verify_s=  0.1%
+
+================================================================
+threads=  1  transform ratio   40.2x  implied p 0.98  implied end-to-end  3.73x
+threads=  8  transform ratio  108.1x  implied p 0.99  implied end-to-end  4.10x
+threads= 32  transform ratio  147.0x  implied p 0.99  implied end-to-end  4.16x
+threads= 64  transform ratio  175.4x  implied p 0.99  implied end-to-end  4.19x
+================================================================
+The threads=64 row is the one that predicts campaign speedup.
+[harness] done rc=0
