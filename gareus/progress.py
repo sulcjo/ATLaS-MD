@@ -79,6 +79,12 @@ class GuiProgressSink:
         self.start_wall = time.time()
         # Keep per‑phase start times so each phase displays its own ETA.
         self.phase_start: dict[str, float] = {}
+        # First step seen in this process for each phase. ``step`` is cumulative
+        # across a resumed chain while ``phase_start`` restarts every job, so any
+        # rate must be computed from the difference and not from ``step`` itself.
+        # Before this existed, chignolin_7 reported 5,293 ns/day against an
+        # actual ~283 -- high by the ratio of campaign age to job age.
+        self.baseline_step: dict[str, int] = {}
         self.last_console = 0.0
         self.last_json = 0.0
         self.handle: Optional[BufferedJsonlWriter] = None
@@ -147,15 +153,23 @@ class GuiProgressSink:
         self.phase_start.setdefault(phase, now)
         total = int(total_steps) if total_steps is not None else 0
         step_int = int(step)
+        self.baseline_step.setdefault(phase, step_int)
+        segment_steps = step_int - self.baseline_step[phase]
         frac = (float(step_int) / float(total)) if total > 0 else 0.0
         frac = max(0.0, min(1.0, frac))
         elapsed = now - self.phase_start[phase]
-        eta: Optional[float] = (elapsed * (1.0 - frac) / frac) if frac > 0.0 and total > 0 else None
+        # ETA from this segment's observed rate. Using ``frac`` of the whole run
+        # against a segment-local ``elapsed`` would assume this process produced
+        # every completed step, which after a resume it did not.
+        eta: Optional[float] = None
+        if segment_steps > 0 and elapsed > 0.0 and total > step_int:
+            eta = (total - step_int) * elapsed / segment_steps
 
         payload: dict[str, float | int | str | None] = {
             "event": "progress",
             "phase": phase,
             "step": step_int,
+            "segment_steps": segment_steps,
             "total_steps": total,
             "fraction": frac,
             "percent": 100.0 * frac,
@@ -170,13 +184,18 @@ class GuiProgressSink:
             payload["sim_time_ps"] = sim_time_ns * 1000.0
             payload["sim_time_ns"] = sim_time_ns
             payload["aggregate_sim_time_ns"] = aggregate_ns
-            if elapsed > 0 and sim_time_ns > 0:
-                payload["ns_per_day"] = sim_time_ns / elapsed * 86400.0
-                payload["aggregate_ns_per_day"] = aggregate_ns / elapsed * 86400.0
-                payload["wall_s_per_ns"] = elapsed / sim_time_ns
-                payload["wall_h_per_us"] = elapsed / sim_time_ns * 1000.0 / 3600.0
-                payload["wall_ms_per_step"] = elapsed / max(1, step_int) * 1000.0
-                payload["steps_per_s"] = step_int / elapsed
+            # Rates describe THIS process's segment; the cumulative totals above
+            # stay cumulative, because as totals they are correct.
+            if elapsed > 0 and segment_steps > 0:
+                segment_ns = segment_steps * float(timestep_fs) / 1.0e6
+                payload["ns_per_day"] = segment_ns / elapsed * 86400.0
+                payload["aggregate_ns_per_day"] = (
+                    segment_ns * max(1, int(n_replicas)) / elapsed * 86400.0
+                )
+                payload["wall_s_per_ns"] = elapsed / segment_ns
+                payload["wall_h_per_us"] = elapsed / segment_ns * 1000.0 / 3600.0
+                payload["wall_ms_per_step"] = elapsed / segment_steps * 1000.0
+                payload["steps_per_s"] = segment_steps / elapsed
         if extra:
             payload.update(extra)
 
