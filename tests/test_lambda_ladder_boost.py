@@ -108,7 +108,7 @@ def test_closed_form_matches_the_integrator_at_lambda_one_and_half():
         system = _fresh_system()
         pep_gamd.ensure_pep_gamd_partition(system, fx["peptide"])
         integ = pep_gamd.PepGaMDLowerDualIntegrator(
-            pep_gamd.DIHEDRAL_GROUP, dt=0.002 * unit.picoseconds, ntcmdprep=2, ntcmd=4, ntebprep=2, nteb=4,
+            pep_gamd.DIHEDRAL_GROUP, bias_force_groups=pep_gamd.pep_gamd_bias_force_groups(system), dt=0.002 * unit.picoseconds, ntcmdprep=2, ntcmd=4, ntebprep=2, nteb=4,
             nstlim=100, ntave=2, sigma0p=6.0 * unit.kilocalories_per_mole, sigma0d=6.0 * unit.kilocalories_per_mole,
             collision_rate=1.0 / unit.picoseconds, temperature=300.0 * unit.kelvin)
         ctx = openmm.Context(system, integ, openmm.Platform.getPlatformByName("Reference"))
@@ -135,7 +135,7 @@ def test_set_replica_lambda_scales_both_k0_globals():
     fx = solvated_dipeptide(); system = _fresh_system()
     pep_gamd.ensure_pep_gamd_partition(system, fx["peptide"])
     integ = pep_gamd.PepGaMDLowerDualIntegrator(
-        pep_gamd.DIHEDRAL_GROUP, dt=0.002 * unit.picoseconds, ntcmdprep=2, ntcmd=4, ntebprep=2, nteb=4, nstlim=100, ntave=2,
+        pep_gamd.DIHEDRAL_GROUP, bias_force_groups=pep_gamd.pep_gamd_bias_force_groups(system), dt=0.002 * unit.picoseconds, ntcmdprep=2, ntcmd=4, ntebprep=2, nteb=4, nstlim=100, ntave=2,
         sigma0p=6.0 * unit.kilocalories_per_mole, sigma0d=6.0 * unit.kilocalories_per_mole,
         collision_rate=1.0 / unit.picoseconds, temperature=300.0 * unit.kelvin)
     ctx = openmm.Context(system, integ, openmm.Platform.getPlatformByName("Reference"))

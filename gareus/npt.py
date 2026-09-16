@@ -227,12 +227,23 @@ def _unit():
     return unit
 
 
-def _box_matrix_nm(context) -> "np.ndarray":
-    """Current periodic box as a 3x3 matrix in nm (rows are the box vectors)."""
-    vectors = context.getState().getPeriodicBoxVectors()
+def _box_matrix_from_state(state) -> "np.ndarray":
+    """Periodic box of an already-fetched State, as a 3x3 matrix in nm.
+
+    Factored out so every box read -- whether it fetches its own State or
+    borrows one -- goes through the SAME conversion. That is what makes
+    ``_read_positions_and_box`` returning a borrowed box bit-identical to
+    ``_box_matrix_nm`` by construction rather than by argument.
+    """
+    vectors = state.getPeriodicBoxVectors()
     if hasattr(vectors, "value_in_unit"):
         vectors = vectors.value_in_unit(_unit().nanometer)
     return np.array([[float(v[i]) for i in range(3)] for v in vectors], dtype=float)
+
+
+def _box_matrix_nm(context) -> "np.ndarray":
+    """Current periodic box as a 3x3 matrix in nm (rows are the box vectors)."""
+    return _box_matrix_from_state(context.getState())
 
 
 def _box_volume_nm3(box: "np.ndarray") -> float:
@@ -758,11 +769,32 @@ def _restoration_matches(actual, expected, rel_tol: float = _RESTORE_REL_TOL) ->
 
 
 def _read_positions_and_box(context):
+    """Coordinates and box in nm, from ONE device round-trip.
+
+    This used to issue two: ``getState(getPositions=True)`` for the coordinates
+    and then ``_box_matrix_nm(context)``, which fetches a second State purely for
+    the box vectors. A State already carries its box, so the second call was a
+    full synchronisation for data the first had.
+
+    That matters more than the byte count suggests. Under 32 replicas sharing 4
+    GPUs through MPS, a getState is queue wait, not transfer: the measured cost
+    was 8.0 ms per attempt for ~240 KB (~30 MB/s, orders below PCIe). This is
+    also on the reject path, where ~78% of attempts go, and on the strided
+    restore check.
+
+    Values are unchanged: same State, same device data, and the box goes through
+    the same ``_box_matrix_from_state`` conversion as before.
+    """
     st = context.getState(getPositions=True)
-    unit = _unit()
-    pos = np.array(st.getPositions(asNumpy=True).value_in_unit(unit.nanometer), dtype=float)
-    box = _box_matrix_nm(context)
-    return pos, box
+    # np.array (not np.asarray) on purpose: this snapshot is what the restore
+    # path compares the Context against, so it must OWN its buffer. asNumpy
+    # returns an array the State may own, and value_in_unit need not copy when
+    # the unit already matches; asarray would then alias it. The copy is ~240 KB
+    # against the 8 ms synchronisation this function costs -- cheap insurance in
+    # a transaction that has already produced four correctness defects.
+    pos = np.array(
+        st.getPositions(asNumpy=True).value_in_unit(_unit().nanometer), dtype=float)
+    return pos, _box_matrix_from_state(st)
 
 
 def _rng_from_state(payload: Mapping[str, object]):

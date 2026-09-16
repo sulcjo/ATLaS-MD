@@ -53,6 +53,55 @@ def _physical_nonbonded(system, openmm):
     return found[0]
 
 
+def pep_gamd_bias_force_groups(system) -> tuple:
+    """Groups holding non-physical forces, as the COMPLEMENT of the boosted set.
+
+    ``assign_pep_gamd_force_groups`` puts physical forces in groups 0/2, the
+    auxiliary force in 1, and *refuses* to let anything else sit in 0..2. Every
+    remaining occupied group is therefore a bias group by construction, which is
+    what turns
+
+        sum(f_g for g in bias_groups) == f_all - f0 - f1 - f2
+
+    into an identity rather than an assumption. Deriving the set by ROLE would
+    not be safe: ``_npt_split_groups`` folds a group that mixes physical and bias
+    forces into *physical*, so a role-based list could silently omit a group and
+    drop its force from the equations of motion.
+
+    A group that happens to contribute no force (e.g. CMMotionRemover parked
+    outside 0..2) is harmless here -- reading it yields zeros and costs one cheap
+    evaluation -- so no allow-list is needed.
+    """
+    used = {int(system.getForce(i).getForceGroup()) for i in range(system.getNumForces())}
+    return tuple(sorted(used - {PHYSICAL_NONBONDED_GROUP, AUX_NONBONDED_GROUP, DIHEDRAL_GROUP}))
+
+
+def verify_pep_gamd_bias_force_groups(integrator, system) -> None:
+    """Check an integrator's declared bias groups against the system it drives.
+
+    The generator (``pep_gamd_bias_force_groups``) runs when the integrator is
+    built; this is the verifier half. They can disagree in one real way: a bias
+    force added to the system AFTER the integrator was constructed. The
+    integrator's group list is then stale and that force is silently absent from
+    the equations of motion -- no crash, no NaN, just a different potential.
+
+    Raising here converts that into a loud failure at the point where the
+    integrator and system are first known to belong together.
+    """
+    declared = getattr(integrator, "_pep_bias_groups", None)
+    if declared is None:
+        return  # not a Pep-GaMD integrator; nothing to check
+    actual = pep_gamd_bias_force_groups(system)
+    if tuple(declared) != tuple(actual):
+        raise ValueError(
+            "Pep-GaMD bias force groups disagree with the system: the integrator "
+            f"was built for {tuple(declared)!r} but the system now carries "
+            f"{actual!r}. A bias force added after the integrator was built would "
+            "be silently dropped from the equations of motion. Rebuild the "
+            "integrator with pep_gamd_bias_force_groups(system)."
+        )
+
+
 def assign_pep_gamd_force_groups(system) -> None:
     """Physical forces -> groups 0/2; refuse any other force parked in 0..2."""
     for i in range(system.getNumForces()):
@@ -165,14 +214,58 @@ def _build_integrator_class():
 
         Total channel:    V_pep = energy0 - energy1 + energy2 (physical minus water-only)
         Dihedral channel: energy<dihedral group>, unchanged
-        Applied force:    (f0 - f1)*FSF_T + f_dih*FSF_T*FSF_D + f1 + (f - f0 - f1 - f_dih)
+        Applied force:    (f0 - f1)*FSF_T + f_dih*FSF_T*FSF_D + f1 + sum(f_bias)
         so water-water (f1) and every non-physical group (umbrella, secondary CV) are
         applied unscaled, and the integrator's own cMD stages exclude the auxiliary force.
         One force group per computation step, as OpenMM's CustomIntegrator requires.
+
+        The bias term reads its groups DIRECTLY rather than recovering them as
+        ``f - f0 - f1 - f_dih``. Algebraically the two are the same sum, but the
+        subtraction form costs a full all-groups evaluation -- a second PME pass
+        over the whole system -- every step, purely to recover an umbrella bond
+        and a handful of torsions. Measured on a 21,384-atom box that is ~30% of
+        the MD step. It is also better conditioned: the subtraction recovers a
+        small restraint force by cancelling three PME-magnitude arrays.
         """
 
         TOTAL_ENERGY_PLUS_GROUPS = frozenset({PHYSICAL_NONBONDED_GROUP, DIHEDRAL_GROUP})
         TOTAL_ENERGY_MINUS_GROUPS = frozenset({AUX_NONBONDED_GROUP})
+
+        def __init__(self, *args, bias_force_groups=None, **kwargs):
+            # REQUIRED, deliberately. The applied force reads the bias groups
+            # directly instead of recovering them from an all-groups
+            # evaluation, so a caller that omits them would silently drop every
+            # umbrella / secondary-CV force from the equations of motion -- no
+            # crash, no NaN, just a different potential and biased sampling.
+            # Defaulting to () once let exactly that through, and only an
+            # existing force-algebra test caught it. Fail loudly instead.
+            if bias_force_groups is None:
+                raise ValueError(
+                    "PepGaMDLowerDualIntegrator requires bias_force_groups. The "
+                    "applied force reads bias groups directly, so omitting them "
+                    "would silently drop the umbrella and secondary-CV forces "
+                    "from the equations of motion. Pass "
+                    "pep_gamd_bias_force_groups(system); pass () only when the "
+                    "system genuinely carries no non-physical forces."
+                )
+            # Must precede super().__init__: the parent builds the computation
+            # steps during construction, and those steps read this list.
+            self._pep_bias_groups = tuple(int(g) for g in bias_force_groups)
+            super().__init__(*args, **kwargs)
+
+        def _bias_force_expression(self) -> str:
+            """Emit one read per bias group; return the expression summing them.
+
+            OpenMM allows a single force group per computation step, so each
+            group needs its own ``addComputePerDof``. "0" when the system has no
+            bias forces at all, which is a valid Pep-GaMD system.
+            """
+            names = []
+            for j, g in enumerate(self._pep_bias_groups):
+                name = f"PepFb{j}"
+                self.addComputePerDof(name, f"f{g}")
+                names.append(name)
+            return " + ".join(names) if names else "0"
 
         def _dihedral_group_id(self) -> int:
             (gid,) = [g for g, name in self.get_group_dict().items() if name == "Dihedral"]
@@ -180,8 +273,10 @@ def _build_integrator_class():
 
         def _add_common_variables(self):
             super()._add_common_variables()
-            for name in ("PepF0", "PepF1", "PepF2", "PepFall"):
+            for name in ("PepF0", "PepF1", "PepF2"):
                 self.addPerDofVariable(name, 0.0)
+            for j in range(len(self._pep_bias_groups)):
+                self.addPerDofVariable(f"PepFb{j}", 0.0)
             for name in ("PepE0", "PepE1", "PepE2"):
                 self.addGlobalVariable(name, 0.0)
 
@@ -196,10 +291,18 @@ def _build_integrator_class():
                                   "PepE0 - PepE1 + PepE2")
 
         def _add_conventional_md_update_step(self):
+            dih = self._dihedral_group_id()
             self.addComputePerDof("newx", "x")
-            self.addComputePerDof("PepFall", "f")
-            self.addComputePerDof("PepF1", f"f{AUX_NONBONDED_GROUP}")
-            self.addComputePerDof("v", "vscale*v + fscale*(PepFall - PepF1)/m + noisescale*gaussian/sqrt(m)")
+            self.addComputePerDof("PepF0", f"f{PHYSICAL_NONBONDED_GROUP}")
+            self.addComputePerDof("PepF2", f"f{dih}")
+            bias = self._bias_force_expression()
+            # (f - f1) is exactly f0 + f_dih + sum(f_bias) under the group
+            # partition, so the aux force stays excluded without evaluating
+            # every group (which would re-run both PME forces).
+            self.addComputePerDof(
+                "v",
+                "vscale*v + fscale*(PepF0 + PepF2 + ({b}))/m + noisescale*gaussian/sqrt(m)"
+                .format(b=bias))
             self.addComputePerDof("x", "x+dt*v")
             self.addConstrainPositions()
             self.addComputePerDof("v", "(x-newx)/dt")
@@ -213,11 +316,11 @@ def _build_integrator_class():
             self.addComputePerDof("PepF0", f"f{PHYSICAL_NONBONDED_GROUP}")
             self.addComputePerDof("PepF1", f"f{AUX_NONBONDED_GROUP}")
             self.addComputePerDof("PepF2", f"f{dih}")
-            self.addComputePerDof("PepFall", "f")
+            bias = self._bias_force_expression()
             self.addComputePerDof(
                 "v",
-                "v + fscale*((PepF0 - PepF1)*{t} + PepF2*{t}*{d} + PepF1 + (PepFall - PepF0 - PepF1 - PepF2))/m"
-                .format(t=fsf_t, d=fsf_d),
+                "v + fscale*((PepF0 - PepF1)*{t} + PepF2*{t}*{d} + PepF1 + ({b}))/m"
+                .format(t=fsf_t, d=fsf_d, b=bias),
             )
             self.addComputePerDof("x", "x+dt*v")
             self.addConstrainPositions()
@@ -320,6 +423,10 @@ def build_pep_gamd_integrator(system, args, unit) -> list:
             "call prepare_pep_gamd_args(args, topology) after the system is built"
         )
     ensure_pep_gamd_partition(system, atoms)
+    # After the partition, so the group layout is final and the complement is
+    # the true bias set. run_gareus adds the umbrella and secondary-CV forces
+    # before building the integrator (production.py:6136-6137 vs 6403).
+    bias_groups = pep_gamd_bias_force_groups(system)
     total_steps = (
         int(args.gamd_cmd_prep_steps) + int(args.gamd_cmd_steps)
         + int(args.gamd_equil_prep_steps) + int(args.gamd_equil_steps)
@@ -327,6 +434,7 @@ def build_pep_gamd_integrator(system, args, unit) -> list:
     )
     integrator = _integrator_class()(
         DIHEDRAL_GROUP,
+        bias_force_groups=bias_groups,
         dt=float(args.timestep_fs) * unit.femtosecond,
         ntcmdprep=int(args.gamd_cmd_prep_steps),
         ntcmd=int(args.gamd_cmd_steps),
@@ -673,6 +781,7 @@ class PepGamdLowerDualNptTargetAdapter:
                 raise ValueError(
                     f"Pep-GaMD NPT adapter: integrator lacks the global {name!r}"
                 )
+        verify_pep_gamd_bias_force_groups(integrator, system)
         physical, bias, aux_groups = _npt_split_groups(system)
         stray = sorted({
             g for _i, _cls, g, role in _npt_force_roles(system)
