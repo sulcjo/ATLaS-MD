@@ -29,8 +29,9 @@ scheduler can be built independently. See
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
-from typing import Any, Literal, Mapping, Protocol
+from typing import Any, Literal, Mapping, Optional, Protocol
 
 import numpy as np
 
@@ -212,6 +213,11 @@ class EffectivePotentialAdapter(Protocol):
 
 # --------------------------------------------------------------------------- internals
 
+# Schema v1 readers MUST ignore keys they do not recognise. ``restore`` reads
+# named keys explicitly and never enumerates the mapping, so a writer may add
+# optional diagnostic keys -- "timings" is the first -- without a version bump
+# and without breaking a resume in either direction. Anything a reader must
+# *act* on still requires a bump.
 _CONTROLLER_SCHEMA_VERSION = 1
 
 
@@ -288,6 +294,86 @@ def _molecules_from_context(context) -> list[list[int]]:
     return molecules
 
 
+# Molecules at least this large keep the original ``ndarray.mean`` call rather
+# than the vectorized accumulation. ``np.bincount`` sums sequentially while
+# ``ndarray.mean`` may reduce pairwise above a blocksize; the two agree for the
+# 1- and 3-atom molecules that dominate a solvated system, but only calling the
+# same function is identical *by construction*. A solvated peptide has one such
+# molecule, so the fallback costs nothing and removes the one case where
+# bit-identity would otherwise rest on observation alone.
+_MEAN_FALLBACK_MIN_ATOMS = 128
+
+
+def _molecule_index_arrays(molecules, n_atoms: int):
+    """Flat per-atom molecule ids and per-molecule atom counts.
+
+    Built once per controller. ``_molecules_from_context`` has already proven
+    the partition is total and non-overlapping, so every atom appears in
+    exactly one molecule and the ids are a complete labelling. Molecules may be
+    listed in any order and hold non-contiguous indices.
+    """
+    mol_ids = np.empty(int(n_atoms), dtype=np.int32)
+    mol_sizes = np.empty(len(molecules), dtype=np.float64)
+    for m, mol in enumerate(molecules):
+        mol_ids[mol] = m
+        mol_sizes[m] = float(len(mol))
+    return mol_ids, mol_sizes
+
+
+def _mean_fallback_molecules(molecules):
+    """Molecules whose centroid must keep the original ``ndarray.mean`` call.
+
+    Two conditions, both about reproducing the replaced code's summation order
+    exactly rather than approximately:
+
+    * **Size.** At or above ``_MEAN_FALLBACK_MIN_ATOMS``, ``ndarray.mean`` may
+      reduce pairwise while ``bincount`` accumulates sequentially.
+
+    * **Order.** ``bincount`` accumulates in ascending atom-index order, while
+      ``positions[mol].mean(axis=0)`` sums in the order ``mol`` lists its atoms.
+      For a molecule whose indices are not already ascending those are different
+      summation orders, and they differ in the last ulp -- measured up to
+      8.9e-16 on random partitions. Contiguity is irrelevant; only sortedness
+      is. A solvated system from ``getMolecules()`` is normally ascending, so
+      this list is normally empty, but the code accepts any partition and must
+      stay exact for all of them.
+
+    Returns ``[(molecule_index, atom_indices), ...]``.
+    """
+    out = []
+    for m, mol in enumerate(molecules):
+        if len(mol) >= _MEAN_FALLBACK_MIN_ATOMS:
+            out.append((m, mol))
+            continue
+        if any(b <= a for a, b in zip(mol, mol[1:])):
+            out.append((m, mol))
+    return out
+
+
+def _scale_about_molecule_centroids(positions, mol_ids, mol_sizes,
+                                    scale_minus_one: float, large_molecules=()):
+    """Translate every molecule by ``scale_minus_one`` times its centroid.
+
+    Internal geometry is untouched: every atom of a molecule receives the same
+    displacement. Replaces a per-molecule Python loop measured at 57.1 ms per
+    attempt for 6,303 molecules, against 0.314 ms here, producing the identical
+    array.
+
+    ``large_molecules`` is a sequence of ``(molecule_index, atom_indices)`` for
+    molecules at or above ``_MEAN_FALLBACK_MIN_ATOMS``; their centroids are
+    recomputed with the original ``mean`` call. ``positions`` is never mutated
+    -- the reject path hands that same array back to ``_restore_positions``.
+    """
+    n_mol = int(mol_sizes.shape[0])
+    sums = np.empty((n_mol, 3), dtype=np.float64)
+    for k in range(3):
+        sums[:, k] = np.bincount(mol_ids, weights=positions[:, k], minlength=n_mol)
+    centers = sums / mol_sizes[:, None]
+    for m, mol in large_molecules:
+        centers[m] = positions[mol].mean(axis=0)
+    return positions + scale_minus_one * centers[mol_ids]
+
+
 def _max_nonbonded_cutoff_nm(context) -> float:
     """Largest explicit cutoff among NonbondedForces, for the cheap geometry guard."""
     import openmm as _openmm
@@ -331,9 +417,39 @@ class _ControllerCore:
         self._fingerprint = _molecule_fingerprint(molecules)
         self._rng = rng
         self._counters = counters
+        # Counts restores verified, for the strided full-coordinate check.
+        self._restore_checks = 0
         self._next_due_step = int(next_due_step)
         self._last_due_step = int(last_due_step)
         self._max_cutoff_nm = float(max_cutoff_nm)
+        self._install_molecule_index_arrays(
+            context.getSystem().getNumParticles())
+        self._install_timings()
+
+    def _install_molecule_index_arrays(self, n_atoms: int) -> None:
+        """Derive the flat index arrays the vectorized volume move needs.
+
+        ``_mean_fallback_molecules`` lists the few molecules whose centroid must
+        keep the original ``mean`` call for the summation order to match; see
+        that function. For a normal solvated system it is empty or holds only
+        the solute.
+        """
+        self._mol_ids, self._mol_sizes = _molecule_index_arrays(
+            self._molecules, n_atoms)
+        self._mean_fallback = _mean_fallback_molecules(self._molecules)
+
+    def _install_timings(self) -> None:
+        """Per-phase wall-time accumulators for one attempt's transaction.
+
+        Diagnostics only. ``perf_counter`` costs tens of nanoseconds against
+        phases measured in milliseconds, so the instrument does not perturb what
+        it measures. Written into the checkpoint for the record but never
+        restored from it -- a per-job reset is what makes the rates readable.
+        """
+        self._timings = {
+            "read_s": 0.0, "scale_s": 0.0, "restore_s": 0.0,
+            "evaluate_s": 0.0, "verify_s": 0.0, "attempts": 0,
+        }
 
     # -- schedule ---------------------------------------------------------------
 
@@ -365,6 +481,7 @@ class _ControllerCore:
             "molecule_partition_fingerprint": self._fingerprint,
             "rng": {"algorithm": "PCG64", **state},
             "counters": dict(self._counters),
+            "timings": dict(self._timings),
             "last_due_step": self._last_due_step,
             "next_due_step": self._next_due_step,
         }
@@ -378,12 +495,76 @@ class _ControllerCore:
         self._context.setPositions(positions)
 
     def _verify_restoration(self, positions: "np.ndarray", box: "np.ndarray") -> None:
-        pos_now, box_now = _read_positions_and_box(self._context)
-        if not (np.array_equal(pos_now, positions) and np.array_equal(box_now, box)):
+        """Check that the Context really holds the pre-trial state again.
+
+        The box is read and compared every time: it is three vectors, it costs
+        no coordinate transfer, and it is the half that is restored bitwise.
+
+        The coordinates are checked on a stride. Reading them back is a full
+        download of every atom -- a SECOND one, on top of the snapshot this
+        trial already took -- and it landed on the reject path, which is where
+        ~78% of attempts go. Profiling the live chignolin_7 job put 99.6% of
+        wall time inside attempt_due against 0.4% in integrator.step(), with
+        every GPU idle, and this readback was the single largest frame. Checking
+        one restore in _RESTORE_VERIFY_STRIDE keeps the guard's purpose -- a
+        systematic restore failure cannot hide for more than that many moves --
+        at a small fraction of the cost. A one-off corruption that repairs
+        itself before the next strided check is not a failure mode any restore
+        has: setPositions either takes or it does not.
+        """
+        box_now = _box_matrix_nm(self._context)
+        if not _restoration_matches(box_now, box):
             raise RuntimeError(
                 "barostat trial restoration failed: the Context does not hold the "
-                "pre-trial positions/box after restore; this is fatal"
+                "pre-trial box after restore; this is fatal"
+                + self._restoration_diagnostics(None, None, box_now, box)
             )
+        self._restore_checks += 1
+        if self._restore_checks % _RESTORE_VERIFY_STRIDE:
+            return
+        pos_now, _box = _read_positions_and_box(self._context)
+        if not _restoration_matches(pos_now, positions):
+            raise RuntimeError(
+                "barostat trial restoration failed: the Context does not hold the "
+                "pre-trial positions after restore; this is fatal"
+                + self._restoration_diagnostics(pos_now, positions, box_now, box)
+            )
+
+    def _restoration_diagnostics(self, pos_now, positions, box_now, box) -> str:
+        """Describe HOW far the restored state is from the snapshot.
+
+        The bare failure above cannot distinguish the two cases that matter:
+        a last-bit float round-trip difference (the comparison is too strict)
+        from a restore that genuinely did not take (deviation on the order of
+        the trial's scale factor, where tolerating it would bury a corrupted
+        state). Diagnostics only -- this does not change when we raise.
+        """
+        try:
+            db = np.abs(np.asarray(box_now) - np.asarray(box))
+            if pos_now is None or positions is None:
+                # Box-only failure: no coordinates were read on this check.
+                return (f" [diag: positions not read on this check;"
+                        f" max_box_dev_nm={db.max() if db.size else 0.0:.6e}]")
+            dp = np.abs(np.asarray(pos_now) - np.asarray(positions))
+            bad = np.unique(np.nonzero(dp > 0.0)[0])
+            try:
+                system = self._context.getSystem()
+                n_vsite = sum(1 for i in bad if system.isVirtualSite(int(i)))
+            except Exception:
+                n_vsite = -1
+            worst = int(np.unravel_index(int(np.argmax(dp)), dp.shape)[0]) if dp.size else -1
+            scale = float(np.max(np.abs(positions))) if positions.size else 0.0
+            return (
+                f" [diag: n_atoms={len(positions)} n_differing={len(bad)}"
+                f" n_differing_are_vsites={n_vsite}"
+                f" max_pos_dev_nm={dp.max() if dp.size else 0.0:.6e}"
+                f" max_box_dev_nm={db.max() if db.size else 0.0:.6e}"
+                f" worst_atom={worst} first_differing={bad[:8].tolist()}"
+                f" max_abs_coord_nm={scale:.4f}"
+                f" rel_dev={(dp.max() / scale) if scale else float('nan'):.3e}]"
+            )
+        except Exception as exc:  # diagnostics must never mask the real failure
+            return f" [diag unavailable: {type(exc).__name__}: {exc}]"
 
     def attempt_due(self, current_step: int) -> VolumeMoveResult:
         current_step = int(current_step)
@@ -403,7 +584,9 @@ class _ControllerCore:
         #    so an unexpected error here needs no restoration, but must still
         #    abort with context rather than passing silently.
         try:
+            _t0 = time.perf_counter()
             old = self._adapter.evaluate(self._context, snapshot)
+            self._timings["evaluate_s"] += time.perf_counter() - _t0
         except Exception as exc:
             raise RuntimeError(
                 f"volume-move trial failed while evaluating the current U* at step "
@@ -415,7 +598,10 @@ class _ControllerCore:
                 raise RuntimeError(
                     f"nonfinite old energy component {name}={getattr(old, name)!r}; aborting"
                 )
+        _t0 = time.perf_counter()
         positions, box = _read_positions_and_box(self._context)
+        self._timings["read_s"] += time.perf_counter() - _t0
+        self._timings["attempts"] += 1
         old_volume = _box_volume_nm3(box)
 
         def _finish(accepted: bool, reason: str, log_a: float,
@@ -450,19 +636,29 @@ class _ControllerCore:
 
         # 4. Apply the proposal: scale the box, translate whole molecules about
         #    their arithmetic centroids, refresh virtual sites.
-        new_positions = positions.copy()
+        _t0 = time.perf_counter()
         scale_minus_one = s - 1.0
-        for mol in self._molecules:
-            center = positions[mol].mean(axis=0)
-            new_positions[mol] = positions[mol] + scale_minus_one * center
+        new_positions = _scale_about_molecule_centroids(
+            positions, self._mol_ids, self._mol_sizes, scale_minus_one,
+            self._mean_fallback,
+        )
+        self._timings["scale_s"] += time.perf_counter() - _t0
 
         try:
+            _t0 = time.perf_counter()
             self._restore_positions(new_positions, s * box)
             self._context.computeVirtualSites()
+            self._timings["restore_s"] += time.perf_counter() - _t0
+            _t0 = time.perf_counter()
             new = self._adapter.evaluate(self._context, snapshot)
+            self._timings["evaluate_s"] += time.perf_counter() - _t0
             if not _finite(new.effective_kj_mol) or not _finite(new.boost_kj_mol):
+                _t0 = time.perf_counter()
                 self._restore_positions(positions, box)
+                self._timings["restore_s"] += time.perf_counter() - _t0
+                _t0 = time.perf_counter()
                 self._verify_restoration(positions, box)
+                self._timings["verify_s"] += time.perf_counter() - _t0
                 self._counters["nonfinite_trial_energy"] += 1
                 return _finish(False, "nonfinite_trial_energy", -math.inf, new_volume, old)
 
@@ -477,8 +673,12 @@ class _ControllerCore:
             )
             accept = accept_draw <= 0.0 or math.log(accept_draw) < min(0.0, log_a)
         except Exception as exc:
+            _t0 = time.perf_counter()
             self._restore_positions(positions, box)
+            self._timings["restore_s"] += time.perf_counter() - _t0
+            _t0 = time.perf_counter()
             self._verify_restoration(positions, box)
+            self._timings["verify_s"] += time.perf_counter() - _t0
             raise RuntimeError(
                 f"volume-move trial failed unexpectedly at step {current_step}; "
                 "the original state was restored before this error"
@@ -486,9 +686,75 @@ class _ControllerCore:
 
         if accept:
             return _finish(True, "accepted", log_a, new_volume, new)
+        _t0 = time.perf_counter()
         self._restore_positions(positions, box)
+        self._timings["restore_s"] += time.perf_counter() - _t0
+        _t0 = time.perf_counter()
         self._verify_restoration(positions, box)
+        self._timings["verify_s"] += time.perf_counter() - _t0
         return _finish(False, "rejected", log_a, new_volume, old)
+
+
+# Declared platform tolerance for the restore round-trip.
+#
+# Writing positions into an OpenMM Context and reading them back is bitwise
+# exact on Reference, but NOT on CUDA, which stores positions at single
+# precision (plus a correction term). The trial writes a float64-computed
+# array that is not representable in that storage, so the restored snapshot
+# can come back rounded at single-precision scale.
+#
+# The bound is the platform's, not an observation of one crash. Measured over
+# 257 trial/restore cycles of the real sequence on CUDA/mixed (job 2390033):
+# median deviation exactly 0, maximum 1.222e-7 relative = 1.03 * float32 eps,
+# and it does not grow with cycle count (second-half max 1.3e-15). So the
+# deviation is bounded by single-precision storage; 8 ULP of float32 leaves
+# ~8x headroom over the measured maximum.
+#
+# A restore that genuinely did not take leaves the trial's scaled coordinates,
+# off by |s-1|*|r| -- ~3e-3 relative at the 1% volume step used here, which is
+# ~3500x above this tolerance. The guard therefore still catches a failed
+# restore while ignoring storage rounding. The tolerance is relative, not
+# absolute, so it stays valid for the enlarged boxes used elsewhere here.
+#
+# History: the first version of this guard used np.array_equal and aborted the
+# chignolin_7 campaign on its first rejected volume move (jobs 2389771,
+# 2389869). Commit 7900ff0 replaced it with 1e-9, calibrated on that
+# first-rejection measurement (8 ULP of float64) -- but a context on which no
+# volume move has ever been ACCEPTED is the special case, and 1e-9 was too
+# tight: job 2389986 reached states with accepted moves applied and failed at
+# 7.34e-8 relative. Do not recalibrate this from a single crash; the number
+# above comes from the distribution.
+#
+# This is the "within declared platform tolerances" of the NPT correction spec;
+# strict bitwise comparison remains correct on deterministic platforms and is
+# still asserted there by the Reference-platform tests.
+_RESTORE_REL_TOL = 8.0 * float(np.finfo(np.float32).eps)   # ~9.54e-7
+
+# How often the restored COORDINATES are read back and compared. The box is
+# compared on every restore; coordinates cost a full download of every atom, so
+# they are checked one restore in this many. A restore either takes or it does
+# not, so a systematic failure shows up within one stride while the per-move
+# cost drops by that factor. See _verify_restoration.
+_RESTORE_VERIFY_STRIDE = 256
+
+
+def _restoration_matches(actual, expected, rel_tol: float = _RESTORE_REL_TOL) -> bool:
+    """True when a restored array matches its snapshot to the declared tolerance.
+
+    Shape changes and nonfinite values never match: those are corruption, not
+    round-trip noise.
+    """
+    a = np.asarray(actual, dtype=float)
+    e = np.asarray(expected, dtype=float)
+    if a.shape != e.shape:
+        return False
+    if not (np.all(np.isfinite(a)) and np.all(np.isfinite(e))):
+        return False
+    if e.size == 0:
+        # An empty readback is pathological, not a successful restore.
+        return False
+    scale = max(float(np.max(np.abs(e))), 1.0)
+    return bool(np.all(np.abs(a - e) <= rel_tol * scale))
 
 
 def _read_positions_and_box(context):
@@ -580,9 +846,24 @@ class BiasedMCBarostatController:
         state: Mapping[str, object],
         expected_pressure_bar: float,
         expected_temperature_k: float,
+        frequency_steps: Optional[int] = None,
     ) -> "BiasedMCBarostatController":
         """Restore exact schedule and random stream. Must not attempt an extra
-        move as a side effect of resuming."""
+        move as a side effect of resuming.
+
+        ``frequency_steps`` deliberately overrides the checkpoint's attempt
+        interval. Without it the checkpoint's value is authoritative, which
+        means a configured change can never reach a campaign already running:
+        chignolin_7 spent 23 h at the argparse default of 100 steps, a value
+        inherited from OpenMM's on-GPU C++ barostat and far too frequent for
+        this Python one. Unlike pressure, temperature and the molecule
+        partition -- which must match or the Jacobian and the target
+        distribution are wrong -- the attempt interval does not bias the
+        sampled ensemble. Detailed balance holds per move at any interval; only
+        the rate at which the volume relaxes changes. The move already
+        scheduled is left where the checkpoint put it, so a resume neither
+        skips nor duplicates one; only the interval after it changes.
+        """
         state = dict(state)
         if int(state.get("schema_version", -1)) != _CONTROLLER_SCHEMA_VERSION:
             raise ValueError(
@@ -620,8 +901,18 @@ class BiasedMCBarostatController:
         for key in ("attempted", "accepted", "rejected", "invalid_geometry",
                     "nonfinite_trial_energy"):
             counters.setdefault(key, 0)
+        restored_frequency = int(state["frequency_steps"])
+        if frequency_steps is not None and int(frequency_steps) != restored_frequency:
+            if int(frequency_steps) <= 0:
+                raise ValueError(
+                    f"barostat frequency override must be positive, got {frequency_steps!r}"
+                )
+            print(f"[npt] barostat attempt interval changed on resume: "
+                  f"{restored_frequency} -> {int(frequency_steps)} steps "
+                  f"(next move stays at step {int(state['next_due_step'])})")
+            restored_frequency = int(frequency_steps)
         core = _ControllerCore(
-            context, adapter, pressure, temperature, int(state["frequency_steps"]),
+            context, adapter, pressure, temperature, restored_frequency,
             float(state["half_width_nm3"]), molecules, _rng_from_state(dict(state["rng"])),
             counters, int(state["next_due_step"]), int(state.get("last_due_step", 0)),
             _max_nonbonded_cutoff_nm(context),

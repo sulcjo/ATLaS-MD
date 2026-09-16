@@ -35,6 +35,7 @@ from openmm.app import DCDReporter, Simulation
 Vec3 = openmm.Vec3
 
 import gareus.npt as npt
+import gareus.npt_driver as npt_driver
 from gareus.npt_driver import ReplicaStepDriver
 
 DT_FS = 1.0
@@ -391,18 +392,87 @@ def test_disabled_controller_less_path_matches_plain_simulation_stepping(tmp_pat
 
 
 def test_unsupported_reporter_protocol_is_rejected_loudly(tmp_path):
+    """Genuinely undescribable reporters must still fail loudly rather than
+    silently stop producing frames. The legacy TUPLE protocol is NOT that case
+    -- see the mdtraj tests below."""
     sim = _make_sim(tmp_path)
 
-    class TupleReporter:
+    class OpaqueReporter:
         def describeNextReport(self, simulation):
-            return (250, False, True, False, False)  # pre-8.0 tuple form
+            return "every 250 steps"          # not a mapping, not a tuple
+
+        def report(self, simulation, state):
+            raise AssertionError("must not be called")
+
+    class ShortTupleReporter:
+        def describeNextReport(self, simulation):
+            return (250, False)               # too short to say what to include
 
         def report(self, simulation, state):
             raise AssertionError("must not be called")
 
     driver = ReplicaStepDriver(sim)
-    with pytest.raises(TypeError):
-        driver.register_reporter(TupleReporter())
+    for bad in (OpaqueReporter(), ShortTupleReporter()):
+        with pytest.raises(TypeError):
+            driver.register_reporter(bad)
+
+
+# ------------------------------------------------------ legacy tuple protocol
+#
+# mdtraj 1.10.1 -- current, and the reporter this project uses whenever a
+# trajectory needs an atomSubset (system_setup.py:971: "OpenMM's own reporters
+# do not" support it) -- describes itself with the legacy tuple, not OpenMM's
+# dict. _BaseReporter.describeNextReport returns
+#     (steps, positions, velocities, forces, energy, enforcePeriodicBox)
+# Rejecting that killed chignolin_7 job 2390511 at epoch-0 production setup:
+# "reporter <mdtraj...XTCReporter> describeNextReport() did not return the dict
+# form". The tuple carries exactly the flags _emit_report consumes, so it is
+# normalised rather than refused.
+
+
+def test_mdtraj_style_six_tuple_is_normalised(tmp_path):
+    sim = _make_sim(tmp_path)
+
+    class MdtrajStyleReporter:
+        def describeNextReport(self, simulation):
+            return (250, True, False, False, True, False)
+
+    desc = npt_driver.describe_reporter(MdtrajStyleReporter(), sim)
+    assert desc["steps"] == 250
+    assert desc["periodic"] is False
+    assert npt_driver._include_kwargs(desc["include"]) == {
+        "positions": True, "energy": True}
+
+
+def test_legacy_five_tuple_defers_periodic_to_the_system(tmp_path):
+    sim = _make_sim(tmp_path)
+
+    class FiveTupleReporter:
+        def describeNextReport(self, simulation):
+            return (100, False, True, False, False)
+
+    desc = npt_driver.describe_reporter(FiveTupleReporter(), sim)
+    assert desc["steps"] == 100
+    assert desc["periodic"] is None, "no periodic element -> _emit_report asks the System"
+    assert npt_driver._include_kwargs(desc["include"]) == {"velocities": True}
+
+
+def test_a_tuple_reporter_is_scheduled_and_actually_reports(tmp_path):
+    """End to end: registering a legacy-protocol reporter produces frames."""
+    sim = _make_sim(tmp_path)
+    seen = []
+
+    class TupleReporter:
+        def describeNextReport(self, simulation):
+            return (10, True, False, False, False, True)
+
+        def report(self, simulation, state):
+            seen.append(int(state.getTime().value_in_unit(unit.picoseconds) * 0 + len(seen)))
+
+    driver = ReplicaStepDriver(sim)
+    driver.register_reporter(TupleReporter())
+    driver.advance(30)
+    assert len(seen) >= 2, "a legacy-protocol reporter must actually receive report()"
 
 
 def test_controller_that_never_advances_its_schedule_fails_loudly(tmp_path):

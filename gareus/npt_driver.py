@@ -65,22 +65,48 @@ NPT_CHECKPOINT_PHASE_NOTE = (
 _STATE_INCLUDE_KEYS = ("positions", "velocities", "forces", "energy")
 
 
+# The legacy tuple protocol, still emitted by current third-party reporters:
+#     (steps, positions, velocities, forces, energy[, enforcePeriodicBox])
+# Its elements after ``steps`` map one-to-one onto the flags _emit_report needs.
+_LEGACY_TUPLE_INCLUDE = ("positions", "velocities", "forces", "energy")
+
+
 def describe_reporter(reporter, sim) -> dict:
     """Call the PUBLIC ``describeNextReport`` and normalize its description.
 
-    Raises ``TypeError`` for reporters still using the pre-8.0 tuple protocol:
-    only reporters describing themselves in the installed OpenMM's dict form
-    are supported by the driver, and an unsupported one must fail loudly
-    rather than silently stop producing frames.
+    Accepts the installed OpenMM's dict form and the legacy tuple form, which
+    is NOT merely a pre-8.0 relic: mdtraj 1.10.1 still describes itself with a
+    six-tuple, and this project uses mdtraj's DCD/XTC reporters whenever a
+    trajectory needs an ``atomSubset`` -- OpenMM's own reporters do not support
+    one (system_setup.py). Refusing the tuple aborted chignolin_7 (job 2390511)
+    at epoch-0 production setup. The tuple carries exactly the information this
+    driver consumes, so it is normalized rather than refused.
+
+    Anything that is neither form still raises ``TypeError``: a reporter this
+    driver cannot schedule must fail loudly rather than silently stop producing
+    frames.
     """
     desc = reporter.describeNextReport(sim)
-    if not isinstance(desc, dict) or "steps" not in desc:
-        raise TypeError(
-            f"reporter {reporter!r} describeNextReport() did not return the dict "
-            "form {steps, periodic, include} required by the NPT stepping driver; "
-            "it cannot be scheduled post-volume-move"
-        )
-    return desc
+    if isinstance(desc, dict):
+        if "steps" not in desc:
+            raise TypeError(
+                f"reporter {reporter!r} describeNextReport() returned a dict without "
+                "'steps'; the NPT stepping driver cannot schedule it post-volume-move"
+            )
+        return desc
+    if isinstance(desc, (tuple, list)) and len(desc) >= 5:
+        include = {name: bool(flag)
+                   for name, flag in zip(_LEGACY_TUPLE_INCLUDE, desc[1:5])}
+        # A five-element tuple says nothing about wrapping; leaving periodic
+        # None lets _emit_report fall back to the System's own PBC setting.
+        periodic = bool(desc[5]) if len(desc) >= 6 else None
+        return {"steps": int(desc[0]), "periodic": periodic, "include": include}
+    raise TypeError(
+        f"reporter {reporter!r} describeNextReport() returned neither the dict form "
+        "{steps, periodic, include} nor the legacy (steps, positions, velocities, "
+        "forces, energy[, periodic]) tuple required by the NPT stepping driver; "
+        "it cannot be scheduled post-volume-move"
+    )
 
 
 def _include_kwargs(include) -> dict:
@@ -310,13 +336,29 @@ class NptRunContext:
     def needs_controller(self) -> bool:
         return self.backend == "biased_mc"
 
-    def initialize_controller(self, context, seed: int):
+    def initialize_controller(self, context, seed: int, adapter: Any = None):
+        """Build this context's volume controller.
+
+        ``adapter`` overrides the run-wide one for a context the shared adapter
+        does not describe. The multi-window GaMD reconnaissance path builds its
+        windows with ``make_cmd_integrator`` whenever ``integrator_kind`` is not
+        ``"gamd"``, and such a plain-Langevin context needs the conventional
+        zero-boost target rather than this run's Pep-GaMD one.
+
+        Pass a SEPARATE adapter instance, never the shared one reconfigured:
+        ``ensure_built`` below resolves and caches a lazy adapter, so resolving
+        the shared instance against an unboosted context would leave every
+        later boosted context holding a zero-boost acceptance energy that does
+        not match its propagated dynamics -- and silently, because the
+        dispatcher's own integrator guard would never be reached again.
+        """
         if not self.needs_controller:
             raise RuntimeError(
                 f"NptRunContext.initialize_controller called for backend {self.backend!r}; "
                 "only biased_mc runs own a BiasedMCBarostatController"
             )
-        if self.adapter is None:
+        adapter = self.adapter if adapter is None else adapter
+        if adapter is None:
             raise RuntimeError(
                 "biased_mc NPT requires the stage-aware effective-potential adapter; "
                 "none was provided"
@@ -325,12 +367,12 @@ class NptRunContext:
         # real self here: the controller's state_dict must carry the real
         # adapter_id from the very first checkpoint, not the empty pre-build
         # placeholder.
-        _ensure = getattr(self.adapter, "ensure_built", None)
+        _ensure = getattr(adapter, "ensure_built", None)
         if _ensure is not None:
             _ensure(context)
         return npt.BiasedMCBarostatController.initialize(
             context=context,
-            adapter=self.adapter,
+            adapter=adapter,
             pressure_bar=float(self.ownership.pressure_bar),
             temperature_k=float(self.ownership.temperature_k),
             frequency_steps=int(self.ownership.barostat_frequency),
@@ -354,6 +396,10 @@ class NptRunContext:
             state=state,
             expected_pressure_bar=float(self.ownership.pressure_bar),
             expected_temperature_k=float(self.ownership.temperature_k),
+            # The configured interval wins over the checkpoint's, so a change
+            # reaches a campaign that is already running. Pressure, temperature
+            # and the molecule partition are still validated, not overridden.
+            frequency_steps=int(self.ownership.barostat_frequency),
         )
 
     def make_driver(

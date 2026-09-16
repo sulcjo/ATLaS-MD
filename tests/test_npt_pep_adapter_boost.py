@@ -82,6 +82,52 @@ def _make_pep_context(umbrella=False):
     return system, integ, ctx, fx
 
 
+# ------------------------------------------------- adapter dispatch per context
+#
+# The adapter must be chosen from the integrator actually driving THIS context,
+# not from the run-wide args. The multi-window GaMD reconnaissance path
+# (production.py: integrator_kind != "gamd" -> make_cmd_integrator) drives its
+# windows with a plain LangevinMiddleIntegrator while the run-wide args still
+# say run_mode=hmr-gamd / boost_type=pep-gamd-lower-dual. Dispatching on the
+# args there handed those contexts the Pep-GaMD adapter, which demands a 'stage'
+# global the plain integrator does not have, and killed chignolin_7 job 2390041
+# with "integrator LangevinMiddleIntegrator exposes no 'stage' global".
+
+
+def _plain_integrator():
+    return openmm.LangevinMiddleIntegrator(
+        300.0 * unit.kelvin, 1.0 / unit.picosecond, 0.002 * unit.picoseconds)
+
+
+def test_cmd_run_mode_reaches_the_conventional_adapter_with_zero_boost():
+    """The documented route for an unboosted context: run_mode=cmd. U* must match
+    the propagated dynamics -- no boost, auxiliary force excluded (that integrator
+    excludes the aux group too, see production.make_cmd_integrator)."""
+    system, _integ, ctx, _fx = _make_pep_context()
+    integ = _plain_integrator()
+    adapter = pep_gamd.make_npt_target_adapter(system, integ, _args(run_mode="cmd"))
+    assert adapter.adapter_id == "conventional"
+    breakdown = adapter.evaluate(ctx, adapter.snapshot(ctx, integ))
+    assert breakdown.boost_kj_mol == 0.0
+    assert breakdown.effective_kj_mol == pytest.approx(
+        breakdown.physical_kj_mol + breakdown.bias_kj_mol)
+
+
+def test_stage_integrator_context_still_gets_the_pep_gamd_adapter():
+    """The fix must not downgrade a genuinely boosted context."""
+    system, integ, _ctx, _fx = _make_pep_context()
+    adapter = pep_gamd.make_npt_target_adapter(system, integ, _args())
+    assert adapter.adapter_id != "conventional"
+    assert isinstance(adapter, pep_gamd.PepGamdLowerDualNptTargetAdapter)
+
+
+def test_unsupported_boost_type_still_raises_even_with_a_plain_integrator():
+    """The per-context fallback must not swallow an unvalidated boost type."""
+    with pytest.raises(ValueError, match="no validated NPT target adapter"):
+        pep_gamd.make_npt_target_adapter(
+            _fresh_system(), _plain_integrator(), _args(gamd_boost_type="upper-dual"))
+
+
 def _arm_channels(ctx, integ, *, k0_total, k0_dih, step_count=50,
                   theta_offset_dih=10.0, theta_offset_total=5.0,
                   vmax_pad=40.0, vmin_pad=20.0):
