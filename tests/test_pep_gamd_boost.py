@@ -222,7 +222,7 @@ def test_integrator_total_channel_reads_peptide_essential_energy_not_bare_energy
     from gareus import pep_gamd
     openmm, _app, unit = import_openmm()
     system, fx = _partitioned_system()
-    integ = pep_gamd.PepGaMDLowerDualIntegrator(pep_gamd.DIHEDRAL_GROUP, **_gamd_kwargs(unit))
+    integ = pep_gamd.PepGaMDLowerDualIntegrator(pep_gamd.DIHEDRAL_GROUP, bias_force_groups=pep_gamd.pep_gamd_bias_force_groups(system), **_gamd_kwargs(unit))
     ctx = openmm.Context(system, integ, openmm.Platform.getPlatformByName("Reference"))
     ctx.setPositions(fx["positions"])
     v_pep = pep_gamd.peptide_essential_energy_kj(ctx, unit)
@@ -241,8 +241,8 @@ def test_integrator_cmd_stage_does_not_apply_the_auxiliary_force():
     sys_real, fx = _partitioned_system(zero_aux=False)
     sys_zero, _ = _partitioned_system(zero_aux=True)
     kw = _gamd_kwargs(unit)
-    p_real = _one_step_positions(sys_real, pep_gamd.PepGaMDLowerDualIntegrator(pep_gamd.DIHEDRAL_GROUP, **kw), fx["positions"], openmm, unit)
-    p_zero = _one_step_positions(sys_zero, pep_gamd.PepGaMDLowerDualIntegrator(pep_gamd.DIHEDRAL_GROUP, **kw), fx["positions"], openmm, unit)
+    p_real = _one_step_positions(sys_real, pep_gamd.PepGaMDLowerDualIntegrator(pep_gamd.DIHEDRAL_GROUP, bias_force_groups=pep_gamd.pep_gamd_bias_force_groups(sys_real), **kw), fx["positions"], openmm, unit)
+    p_zero = _one_step_positions(sys_zero, pep_gamd.PepGaMDLowerDualIntegrator(pep_gamd.DIHEDRAL_GROUP, bias_force_groups=pep_gamd.pep_gamd_bias_force_groups(sys_zero), **kw), fx["positions"], openmm, unit)
     _assert_moved(p_real, fx["positions"], unit)
     assert np.max(np.abs(p_real - p_zero)) < 1e-9
 
@@ -259,8 +259,8 @@ def test_integrator_boost_stage_with_zero_k0_reduces_to_physical_forces():
     prod = {"stepCount": 50, "stage": 5, "k0_Total": 0.0, "k0_Dihedral": 0.0,
             "Vmax_Total": 1e6, "Vmin_Total": -1e6, "threshold_energy_Total": 1e6,
             "Vmax_Dihedral": 1e6, "Vmin_Dihedral": -1e6, "threshold_energy_Dihedral": 1e6}
-    p_real = _one_step_positions(sys_real, pep_gamd.PepGaMDLowerDualIntegrator(pep_gamd.DIHEDRAL_GROUP, **kw), fx["positions"], openmm, unit, stage_globals=prod)
-    p_zero = _one_step_positions(sys_zero, pep_gamd.PepGaMDLowerDualIntegrator(pep_gamd.DIHEDRAL_GROUP, **kw), fx["positions"], openmm, unit, stage_globals=prod)
+    p_real = _one_step_positions(sys_real, pep_gamd.PepGaMDLowerDualIntegrator(pep_gamd.DIHEDRAL_GROUP, bias_force_groups=pep_gamd.pep_gamd_bias_force_groups(sys_real), **kw), fx["positions"], openmm, unit, stage_globals=prod)
+    p_zero = _one_step_positions(sys_zero, pep_gamd.PepGaMDLowerDualIntegrator(pep_gamd.DIHEDRAL_GROUP, bias_force_groups=pep_gamd.pep_gamd_bias_force_groups(sys_zero), **kw), fx["positions"], openmm, unit, stage_globals=prod)
     _assert_moved(p_real, fx["positions"], unit)
     assert np.max(np.abs(p_real - p_zero)) < 1e-9
 
@@ -281,7 +281,7 @@ def test_integrator_statistics_are_blind_to_the_umbrella():
         umb.setForceGroup(31)
         system.addForce(umb)
         pep_gamd.ensure_pep_gamd_partition(system, fx["peptide"])
-        integ = pep_gamd.PepGaMDLowerDualIntegrator(pep_gamd.DIHEDRAL_GROUP, **_gamd_kwargs(unit))
+        integ = pep_gamd.PepGaMDLowerDualIntegrator(pep_gamd.DIHEDRAL_GROUP, bias_force_groups=pep_gamd.pep_gamd_bias_force_groups(system), **_gamd_kwargs(unit))
         ctx = openmm.Context(system, integ, openmm.Platform.getPlatformByName("Reference"))
         ctx.setPositions(fx["positions"])
         e_umb = ctx.getState(getEnergy=True, groups={31}).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)

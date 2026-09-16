@@ -170,7 +170,7 @@ def test_integrator_boosted_force_algebra_at_scaling_below_one():
     openmm, _app, unit = import_openmm()
     s, _e = _three_group_system(openmm, unit)
     integ = pep_gamd.PepGaMDLowerDualIntegrator(
-        2, dt=0.001 * unit.picoseconds, ntcmdprep=2, ntcmd=4, ntebprep=2, nteb=4, nstlim=100, ntave=2,
+        2, bias_force_groups=pep_gamd.pep_gamd_bias_force_groups(s), dt=0.001 * unit.picoseconds, ntcmdprep=2, ntcmd=4, ntebprep=2, nteb=4, nstlim=100, ntave=2,
         sigma0p=6.0 * unit.kilocalories_per_mole, sigma0d=6.0 * unit.kilocalories_per_mole,
         collision_rate=1.0 / unit.picoseconds, temperature=0.0 * unit.kelvin)
     ctx = openmm.Context(s, integ, openmm.Platform.getPlatformByName("Reference"))

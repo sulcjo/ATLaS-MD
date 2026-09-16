@@ -910,6 +910,7 @@ def test_resolve_npt_adapter_lazy_bridge_composes_with_real_pep_gamd_adapter():
     pep_gamd.ensure_pep_gamd_partition(system, fx["peptide"])
     integ = pep_gamd.PepGaMDLowerDualIntegrator(
         pep_gamd.DIHEDRAL_GROUP,
+        bias_force_groups=pep_gamd.pep_gamd_bias_force_groups(system),
         dt=0.002 * unit.picoseconds, ntcmdprep=2, ntcmd=4, ntebprep=2, nteb=4,
         nstlim=100, ntave=2,
         sigma0p=6.0 * unit.kilocalories_per_mole,

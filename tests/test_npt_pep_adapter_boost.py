@@ -74,7 +74,7 @@ def _make_pep_context(umbrella=False):
         system.addForce(f)
     pep_gamd.ensure_pep_gamd_partition(system, fx["peptide"])
     integ = pep_gamd.PepGaMDLowerDualIntegrator(
-        pep_gamd.DIHEDRAL_GROUP, **_gamd_kwargs(unit))
+        pep_gamd.DIHEDRAL_GROUP, bias_force_groups=pep_gamd.pep_gamd_bias_force_groups(system), **_gamd_kwargs(unit))
     ctx = openmm.Context(system, integ, openmm.Platform.getPlatformByName("Reference"))
     ctx.setPositions(fx["positions"])
     integ.setRandomNumberSeed(7)
