@@ -76,6 +76,32 @@ def pep_gamd_bias_force_groups(system) -> tuple:
     return tuple(sorted(used - {PHYSICAL_NONBONDED_GROUP, AUX_NONBONDED_GROUP, DIHEDRAL_GROUP}))
 
 
+def verify_pep_gamd_bias_force_groups(integrator, system) -> None:
+    """Check an integrator's declared bias groups against the system it drives.
+
+    The generator (``pep_gamd_bias_force_groups``) runs when the integrator is
+    built; this is the verifier half. They can disagree in one real way: a bias
+    force added to the system AFTER the integrator was constructed. The
+    integrator's group list is then stale and that force is silently absent from
+    the equations of motion -- no crash, no NaN, just a different potential.
+
+    Raising here converts that into a loud failure at the point where the
+    integrator and system are first known to belong together.
+    """
+    declared = getattr(integrator, "_pep_bias_groups", None)
+    if declared is None:
+        return  # not a Pep-GaMD integrator; nothing to check
+    actual = pep_gamd_bias_force_groups(system)
+    if tuple(declared) != tuple(actual):
+        raise ValueError(
+            "Pep-GaMD bias force groups disagree with the system: the integrator "
+            f"was built for {tuple(declared)!r} but the system now carries "
+            f"{actual!r}. A bias force added after the integrator was built would "
+            "be silently dropped from the equations of motion. Rebuild the "
+            "integrator with pep_gamd_bias_force_groups(system)."
+        )
+
+
 def assign_pep_gamd_force_groups(system) -> None:
     """Physical forces -> groups 0/2; refuse any other force parked in 0..2."""
     for i in range(system.getNumForces()):
@@ -755,6 +781,7 @@ class PepGamdLowerDualNptTargetAdapter:
                 raise ValueError(
                     f"Pep-GaMD NPT adapter: integrator lacks the global {name!r}"
                 )
+        verify_pep_gamd_bias_force_groups(integrator, system)
         physical, bias, aux_groups = _npt_split_groups(system)
         stray = sorted({
             g for _i, _cls, g, role in _npt_force_roles(system)

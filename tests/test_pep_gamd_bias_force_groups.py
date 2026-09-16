@@ -321,3 +321,69 @@ def test_omitting_bias_force_groups_raises_instead_of_dropping_forces():
     else:
         raise AssertionError(
             "omitting bias_force_groups must raise, not silently drop the bias forces")
+
+
+def test_verifier_catches_a_bias_force_added_after_the_integrator_was_built():
+    """The mismatch that a required argument alone does NOT prevent.
+
+    ``bias_force_groups=()`` is a legitimate value, so a stale or simply wrong
+    list passes construction and then integrates without those forces. The only
+    thing that catches it is comparing the declared list against the system the
+    integrator actually drives.
+    """
+    from gareus.pep_gamd import verify_pep_gamd_bias_force_groups
+    openmm, _unit, system, _positions, peptide = _partitioned_system(with_bias=False)
+    ig = _build_integrator(pep_gamd_bias_force_groups(system))  # correct: ()
+    verify_pep_gamd_bias_force_groups(ig, system)  # consistent -> silent
+
+    _add_bias_forces(openmm, system, peptide)  # umbrella arrives afterwards
+    try:
+        verify_pep_gamd_bias_force_groups(ig, system)
+    except ValueError as exc:
+        assert "bias force groups disagree" in str(exc).lower()
+    else:
+        raise AssertionError(
+            "a bias force added after the integrator was built must be caught, "
+            "not silently dropped from the equations of motion")
+
+
+def test_verifier_accepts_a_matching_declaration():
+    from gareus.pep_gamd import verify_pep_gamd_bias_force_groups
+    _openmm, _unit, system, _positions, _pep = _partitioned_system(with_bias=True)
+    ig = _build_integrator(pep_gamd_bias_force_groups(system))
+    verify_pep_gamd_bias_force_groups(ig, system)
+
+
+def test_verifier_ignores_integrators_that_are_not_pep_gamd():
+    """A plain Langevin has no declared groups; the check must not fire."""
+    from gareus.pep_gamd import verify_pep_gamd_bias_force_groups
+    openmm, _unit, system, _positions, _pep = _partitioned_system(with_bias=True)
+    _o, _a, unit = import_openmm()
+    plain = openmm.LangevinMiddleIntegrator(
+        300.0 * unit.kelvin, 1.0 / unit.picoseconds, 0.002 * unit.picoseconds)
+    verify_pep_gamd_bias_force_groups(plain, system)
+
+
+def test_conventional_md_stage_constructs_and_actually_steps():
+    """End-to-end cover for the rewritten cMD stage, not just its algebra.
+
+    The rewrite made ``_add_conventional_md_update_step`` call
+    ``_dihedral_group_id()``, which the original never did. If the group dict
+    were not populated when the parent builds the cMD steps, every cMD-stage run
+    would fail at construction. A fresh integrator starts with stepCount below
+    ntcmd, so simply stepping it exercises that path.
+    """
+    openmm, unit, system, positions, _pep = _partitioned_system(with_bias=True)
+    ig = _build_integrator(pep_gamd_bias_force_groups(system))
+    ctx = openmm.Context(system, ig, openmm.Platform.getPlatformByName("Reference"))
+    ctx.setPositions(positions)
+    ig.step(1)  # gamd-openmm's first step on a fresh Context moves nothing
+    x0 = np.array(ctx.getState(getPositions=True).getPositions(asNumpy=True)
+                  .value_in_unit(unit.nanometer))
+    assert ig.getGlobalVariableByName("stepCount") < 20, "expected a cMD stage"
+    ig.step(2)
+    x1 = np.array(ctx.getState(getPositions=True).getPositions(asNumpy=True)
+                  .value_in_unit(unit.nanometer))
+    del ctx
+    assert np.max(np.abs(x1 - x0)) > 1e-9, "cMD stage did not move any atom"
+    assert np.all(np.isfinite(x1)), "cMD stage produced non-finite coordinates"
