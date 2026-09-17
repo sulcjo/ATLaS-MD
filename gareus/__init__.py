@@ -10,7 +10,7 @@ into standalone modules at this stage.  Additional functions and
 classes will be migrated over time.
 """
 
-__version__ = "0.7"
+__version__ = "0.8"
 
 # Re‑export commonly used helpers for convenience
 from . import constants  # noqa: F401

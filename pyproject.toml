@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gareus-peptide"
-version = "0.7"
+version = "0.8"
 description = "Modular GaREUS/GaMD peptide simulation workflow with backward-compatible gareus_peptide shim."
 readme = "README.md"
 requires-python = ">=3.10"

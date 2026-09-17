@@ -787,7 +787,7 @@ def _banner_args():
 def test_official_package_version_is_v07() -> None:
     import gareus
 
-    assert gareus.__version__ == "0.7"
+    assert gareus.__version__ == "0.8"
 
 
 def test_startup_banner_panel_alignment_and_resume_rows(tmp_path) -> None:
