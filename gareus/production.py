@@ -1948,6 +1948,68 @@ def window_assignment_rows(centers_a: np.ndarray, k_list: list[float], temperatu
         rows.append(row)
     return rows
 
+CAMPAIGN_LADDER_REGISTRY_NAMES = ("state_registry.csv", "final_registry_used_for_mbar.csv")
+
+
+def campaign_ladder_registry_lambda(out_dir) -> Optional[tuple]:
+    """First ``(registry filename, λ)`` with λ > 0 at or above ``out_dir``, else None.
+
+    The λ-ladder is a property of the CAMPAIGN, but ``args.state_gamd_lambdas``
+    only ever describes the states handed to ONE sub-run. An adaptive top-up may
+    legitimately be given nothing but λ=0 states, and deciding "no ladder here"
+    from that subset is what produced chignolin_7's defect: the λ=0 replicas kept
+    the shared calibration's full ``k0`` instead of ``λ·k0max = 0`` and so ran
+    boosted, while their channel energies went unrecorded. The registry
+    (``StateRegistry.write_state_csv``) knows every state in the campaign, so ask
+    it instead.
+
+    The walk stops at ``adaptive_production/`` deliberately: several campaigns
+    commonly share one parent directory, and an unbounded walk would let one
+    campaign's ladder switch on another's boost recording.
+    """
+    base = Path(out_dir)
+    for candidate in (base, *base.parents):
+        for name in CAMPAIGN_LADDER_REGISTRY_NAMES:
+            path = candidate / name
+            if not path.exists():
+                continue
+            try:
+                with path.open(newline="") as handle:
+                    for row in csv.DictReader(handle):
+                        raw = row.get("gamd_lambda")
+                        if raw in (None, "", "None"):
+                            continue
+                        try:
+                            lam = float(raw)
+                        except (TypeError, ValueError):
+                            continue
+                        if lam > 0.0:
+                            return (path.name, lam)
+            except OSError:
+                continue
+        if candidate.name == "adaptive_production":
+            break
+    return None
+
+
+def resolve_ladder_active(state_lambdas, out_dir) -> bool:
+    """Is the λ-ladder active for this run?
+
+    True when this sub-run holds a boosted state itself (the original test), OR
+    when the campaign registry above it says the campaign runs a ladder. The
+    second clause is what keeps an all-λ=0 top-up on the ladder code path, so its
+    replicas get ``k0 = 0·k0max`` and its samples carry ``v_pep``/``v_dih``.
+
+    Deliberately NOT true for a plain umbrella/REUS or plain-GaMD campaign: the
+    ladder path makes every logged sample read two extra Context energies, which
+    would be pure cost for a boost that is identically zero.
+    """
+    lam_arr = np.asarray(state_lambdas, dtype=float)
+    if lam_arr.size and bool(np.any(lam_arr > 0.0)):
+        return True
+    return campaign_ladder_registry_lambda(out_dir) is not None
+
+
 def _warn_if_ladder_was_zeroed(previous, new, where: str) -> bool:
     """Loudly warn when a previously non-zero λ-ladder re-derives to all zeros.
 
@@ -6094,7 +6156,13 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     state_lambdas = np.asarray(getattr(args, "state_gamd_lambdas", None) or [0.0] * nrep, dtype=float)
     if state_lambdas.size != nrep:
         raise ValueError(f"state_gamd_lambdas has {state_lambdas.size} entries for {nrep} states")
-    ladder_active = bool(np.any(state_lambdas > 0.0))
+    # Campaign-scoped, not sub-run-scoped: see resolve_ladder_active.
+    ladder_active = resolve_ladder_active(state_lambdas, out_dir)
+    if ladder_active and not np.any(state_lambdas > 0.0):
+        _reg = campaign_ladder_registry_lambda(out_dir)
+        print(f"    λ-ladder: this sub-run holds only λ=0 states, but {_reg[0]} shows the "
+              f"campaign runs a ladder (λ up to {_reg[1]:g}); keeping the ladder path so these "
+              "replicas get k0 = 0 and their v_pep/v_dih are recorded")
     if ladder_active and not ladder_supports_boost_type(args):
         raise ValueError("a gamd_lambda ladder requires --gamd-boost-type pep-gamd-lower-dual or lower-dihedral")
 
@@ -6261,7 +6329,9 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             state_lambdas = np.asarray(args.state_gamd_lambdas, dtype=float)
             if state_lambdas.size != nrep:
                 raise ValueError(f"state_gamd_lambdas has {state_lambdas.size} entries for {nrep} states after US auto-drop")
-            ladder_active = bool(np.any(state_lambdas > 0.0))
+            # Campaign-scoped here too: an auto-drop can leave a run holding only
+            # λ=0 states, which must not silently demote it off the ladder path.
+            ladder_active = resolve_ladder_active(state_lambdas, out_dir)
             if ladder_active and not ladder_supports_boost_type(args):
                 raise ValueError("a gamd_lambda ladder requires --gamd-boost-type pep-gamd-lower-dual or lower-dihedral")
 
