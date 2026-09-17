@@ -32,7 +32,11 @@ def _loop_reference_for(molecules):
     such a reference would compare the new code against a *third*
     implementation rather than against the code being replaced.
     """
-    def impl(positions, mol_ids, mol_sizes, scale_minus_one, large=()):
+    def impl(positions, mol_ids, mol_sizes, scale_minus_one, large=(), runs=None):
+        # `runs` is the slice plan the production transform may receive; the
+        # loop reference deliberately ignores it, because the point of this
+        # test is to compare the transaction against the ORIGINAL per-molecule
+        # loop, whatever fast path the production code has grown.
         new_positions = positions.copy()
         for mol in molecules:
             center = positions[mol].mean(axis=0)

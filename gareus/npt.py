@@ -361,8 +361,89 @@ def _mean_fallback_molecules(molecules):
     return out
 
 
+def _uniform_run_plan(molecules):
+    """Maximal runs of equal-size, contiguous, ascending molecules.
+
+    A solvated system from ``getMolecules()`` decomposes into a handful of such
+    runs -- the solute, then the water block, then ions -- so the whole atom
+    array is usually covered by three or four of them.
+
+    Each run is ``(first_molecule, n_molecules, atoms_per_molecule,
+    first_atom)`` and describes a plain slice of ``positions``, which is what
+    lets the centroid sum and the expansion run as slices and large ufuncs
+    instead of ``bincount`` and a fancy-index gather -- both of which hold the
+    GIL for their whole duration.
+
+    Returns ``None`` unless the runs cover EVERY molecule and every atom. A
+    partial plan is deliberately refused: mixing the two paths would mean
+    reasoning about two summation orders at once, and this transform has
+    already produced one last-ulp defect from exactly that.
+    """
+    runs = []
+    i = 0
+    n_atoms_seen = 0
+    while i < len(molecules):
+        mol = molecules[i]
+        size = len(mol)
+        if list(mol) != list(range(mol[0], mol[0] + size)):
+            return None                      # not contiguous-ascending
+        first_mol, first_atom = i, mol[0]
+        expect = mol[0] + size
+        j = i
+        while j + 1 < len(molecules):
+            nxt = molecules[j + 1]
+            if len(nxt) != size or list(nxt) != list(range(expect, expect + size)):
+                break
+            expect += size
+            j += 1
+        n = j - i + 1
+        runs.append((first_mol, n, size, first_atom))
+        n_atoms_seen += n * size
+        i = j + 1
+    return runs if runs else None
+
+
+def _sums_from_runs(positions, runs, n_mol):
+    """Per-molecule coordinate sums, accumulated in ascending atom order.
+
+    ``acc += blk[:, j, :]`` is a large elementwise ufunc, so numpy releases the
+    GIL for it; the equivalent ``np.bincount`` call does not. The accumulation
+    order is identical -- ``((0 + a0) + a1) + a2`` for a 3-atom molecule, in
+    ascending atom index -- which is what keeps the result bit-identical.
+    """
+    sums = np.zeros((n_mol, 3), dtype=np.float64)
+    for first_mol, n, size, first_atom in runs:
+        blk = positions[first_atom:first_atom + n * size].reshape(n, size, 3)
+        acc = blk[:, 0, :].copy()
+        for j in range(1, size):
+            acc += blk[:, j, :]
+        sums[first_mol:first_mol + n] = acc
+    return sums
+
+
+def _expand_and_offset(positions, centers, runs, scale_minus_one):
+    """``positions + scale_minus_one * centers[mol_ids]`` without the gather.
+
+    Each run's centroids are broadcast straight into the output block, so the
+    GIL-holding fancy-index expansion disappears. The centroids are expanded
+    first and scaled afterwards, preserving the original operation order --
+    folding the scale into the centroid instead reassociates the arithmetic and
+    reintroduces a last-ulp difference (measured at 8.9e-16).
+    """
+    out = np.empty_like(positions)
+    for first_mol, n, size, first_atom in runs:
+        lo = first_atom
+        hi = first_atom + n * size
+        block_centers = centers[first_mol:first_mol + n]
+        out[lo:hi].reshape(n, size, 3)[...] = block_centers[:, None, :]
+    out *= scale_minus_one
+    out += positions
+    return out
+
+
 def _scale_about_molecule_centroids(positions, mol_ids, mol_sizes,
-                                    scale_minus_one: float, large_molecules=()):
+                                    scale_minus_one: float, large_molecules=(),
+                                    runs=None):
     """Translate every molecule by ``scale_minus_one`` times its centroid.
 
     Internal geometry is untouched: every atom of a molecule receives the same
@@ -376,12 +457,17 @@ def _scale_about_molecule_centroids(positions, mol_ids, mol_sizes,
     -- the reject path hands that same array back to ``_restore_positions``.
     """
     n_mol = int(mol_sizes.shape[0])
-    sums = np.empty((n_mol, 3), dtype=np.float64)
-    for k in range(3):
-        sums[:, k] = np.bincount(mol_ids, weights=positions[:, k], minlength=n_mol)
+    if runs is not None:
+        sums = _sums_from_runs(positions, runs, n_mol)
+    else:
+        sums = np.empty((n_mol, 3), dtype=np.float64)
+        for k in range(3):
+            sums[:, k] = np.bincount(mol_ids, weights=positions[:, k], minlength=n_mol)
     centers = sums / mol_sizes[:, None]
     for m, mol in large_molecules:
         centers[m] = positions[mol].mean(axis=0)
+    if runs is not None:
+        return _expand_and_offset(positions, centers, runs, scale_minus_one)
     return positions + scale_minus_one * centers[mol_ids]
 
 
@@ -448,6 +534,14 @@ class _ControllerCore:
         self._mol_ids, self._mol_sizes = _molecule_index_arrays(
             self._molecules, n_atoms)
         self._mean_fallback = _mean_fallback_molecules(self._molecules)
+        # Slice plan for the GIL-releasing transform. None for any layout the
+        # plan cannot cover totally, in which case the bincount path runs
+        # unchanged -- see _uniform_run_plan.
+        self._runs = _uniform_run_plan(self._molecules)
+        if self._runs is not None:
+            covered = sum(n * size for _fm, n, size, _fa in self._runs)
+            if covered != int(n_atoms):
+                self._runs = None
 
     def _install_timings(self) -> None:
         """Per-phase wall-time accumulators for one attempt's transaction.
@@ -651,7 +745,7 @@ class _ControllerCore:
         scale_minus_one = s - 1.0
         new_positions = _scale_about_molecule_centroids(
             positions, self._mol_ids, self._mol_sizes, scale_minus_one,
-            self._mean_fallback,
+            self._mean_fallback, self._runs,
         )
         self._timings["scale_s"] += time.perf_counter() - _t0
 
