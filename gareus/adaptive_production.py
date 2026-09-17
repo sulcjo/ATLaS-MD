@@ -3074,27 +3074,15 @@ def _active_gamd_lambda_ladder(args, epoch_dir) -> Optional[str]:
         if any(v > 0.0 for v in vals):
             return f"args.state_gamd_lambdas has {sum(1 for v in vals if v > 0.0)} rung(s) with λ > 0"
 
-    seen: set = set()
-    for base in (Path(epoch_dir), *Path(epoch_dir).parents):
-        if base in seen:
-            continue
-        seen.add(base)
-        for name in ("state_registry.csv", "final_registry_used_for_mbar.csv"):
-            path = base / name
-            if not path.exists():
-                continue
-            try:
-                with path.open(newline="") as handle:
-                    for row in csv.DictReader(handle):
-                        raw = row.get("gamd_lambda")
-                        if raw in (None, "", "None"):
-                            continue
-                        if float(raw) > 0.0:
-                            return f"{path.name} carries a state with λ = {float(raw)}"
-            except Exception:
-                continue
-        if base.name == "adaptive_production":
-            break
+    # One scan, one place. production.py makes the same registry lookup to decide
+    # ladder_active for a sub-run holding only λ=0 states; two copies of the walk
+    # would be free to drift apart, and it is exactly that decision this string
+    # describes. Imported lazily, like every other .production import here.
+    from .production import campaign_ladder_registry_lambda
+    found = campaign_ladder_registry_lambda(epoch_dir)
+    if found is not None:
+        name, lam = found
+        return f"{name} carries a state with λ = {lam}"
     return None
 
 
