@@ -135,3 +135,95 @@ def test_skip_first_n_frames_drops_earliest_steps_per_replica():
     assert out.cv.size == 4
     assert sorted(out.step[out.replica == 0]) == [1, 2]
     assert sorted(out.step[out.replica == 1]) == [1, 2]
+
+
+# --- per-sample array alignment across row filters -------------------------
+# Regression for the IndexError raised by _masked_data when --skip-first-n-frames
+# was combined with an epoch_000 split on a lambda-ladder run:
+#   "boolean index did not match indexed array along axis 0; size of axis is
+#    5124768 but size of corresponding boolean axis is 5124128"
+# _skip_first_n_frames and _apply_analysis_stride sliced every per-sample array
+# EXCEPT the ladder channel energies v_pep_kj/v_dih_kj, which were added later.
+
+
+def _mk_ladder_data(n=6, k=2, meta=None):
+    """A Data carrying the lambda-ladder per-sample channel energies, plus the
+    window-space state_lambdas that row filters must NOT touch."""
+    d = _mk_data(n=n, k=k, meta=meta)
+    d.potential_kj = np.arange(n, dtype=float) * -100.0
+    d.boost_dih_kj = np.arange(n, dtype=float) * 0.5
+    d.v_pep_kj = np.arange(n, dtype=float) + 10.0
+    d.v_dih_kj = np.arange(n, dtype=float) + 20.0
+    d.state_lambdas = np.linspace(0.0, 1.0, k)  # window-space, k entries, not n
+    return d
+
+
+def _per_sample_lengths(d):
+    return {
+        name: getattr(d, name).size
+        for name in ("cv", "cv2", "rg_A", "window", "replica", "step", "boost_kj",
+                     "potential_kj", "boost_dih_kj", "v_pep_kj", "v_dih_kj")
+        if getattr(d, name) is not None
+    }
+
+
+def test_skip_first_n_frames_slices_ladder_channel_energies():
+    d = _mk_ladder_data(n=6)
+    d.replica = np.array([0, 0, 0, 1, 1, 1])
+    d.step = np.array([0, 1, 2, 0, 1, 2])
+    out = _skip_first_n_frames(d, 1)
+    assert out.cv.size == 4
+    assert set(_per_sample_lengths(out).values()) == {4}
+    # The dropped rows are the step==0 sample of each replica: originals 0 and 3.
+    assert list(out.v_pep_kj) == [11.0, 12.0, 14.0, 15.0]
+    assert list(out.v_dih_kj) == [21.0, 22.0, 24.0, 25.0]
+
+
+def test_apply_analysis_stride_slices_ladder_channel_energies():
+    d = _mk_ladder_data(n=8)
+    d.replica = np.zeros(8, int)
+    d.step = np.arange(8)
+    out = _apply_analysis_stride(d, stride=2, offset=0)
+    assert out.cv.size == 4
+    assert set(_per_sample_lengths(out).values()) == {4}
+    assert list(out.v_pep_kj) == [10.0, 12.0, 14.0, 16.0]
+
+
+def test_skip_then_stride_then_masked_data_keeps_every_array_aligned():
+    """The exact failing pipeline: burn-in cut, then stride, then the
+    epoch_000 split's _masked_data on the result."""
+    d = _mk_ladder_data(n=12, meta={"_epoch_source": [0] * 6 + [1] * 6})
+    d.replica = np.array([0] * 6 + [1] * 6)
+    d.step = np.tile(np.arange(6), 2)
+    d = _skip_first_n_frames(d, 2)
+    assert set(_per_sample_lengths(d).values()) == {8}
+    d = _apply_analysis_stride(d, stride=2, offset=0)
+    assert set(_per_sample_lengths(d).values()) == {4}
+    mask = np.array([True, False, True, False])
+    out = _masked_data(d, mask)  # used to raise IndexError here
+    assert set(_per_sample_lengths(out).values()) == {2}
+    assert len(out.meta["_epoch_source"]) == 2
+
+
+def test_row_filters_leave_window_space_state_lambdas_untouched():
+    """state_lambdas is indexed by d.window, not by sample -- slicing it by a
+    sample mask would silently corrupt the ladder cross-check and boost report."""
+    d = _mk_ladder_data(n=6, k=2)
+    original = d.state_lambdas.copy()
+    d.replica = np.zeros(6, int)
+    d.step = np.arange(6)
+    out = _apply_analysis_stride(_skip_first_n_frames(d, 1), stride=2, offset=0)
+    assert np.array_equal(out.state_lambdas, original)
+    assert np.array_equal(out.centers, np.zeros(2))
+
+
+def test_row_filters_drop_mislength_optional_arrays_instead_of_leaving_them_stale():
+    """A per-sample array that cannot be aligned to the mask must become None,
+    never survive unsliced -- that is what produced the original misalignment."""
+    d = _mk_ladder_data(n=6)
+    d.replica = np.zeros(6, int)
+    d.step = np.arange(6)
+    d.v_pep_kj = np.arange(99, dtype=float)  # wrong length, cannot be aligned
+    out = _skip_first_n_frames(d, 1)
+    assert out.v_pep_kj is None
+    assert out.v_dih_kj.size == out.cv.size

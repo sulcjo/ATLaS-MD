@@ -176,6 +176,75 @@ def infer_temp_beta(prod: Path, meta: dict, arrays=None):
     return t, 1.0/(K_B_KJ_PER_MOL_K*t)
 
 
+# --- per-sample array registry ---------------------------------------------
+# Optional Data fields carrying exactly one entry per MBAR sample: every row
+# filter below MUST slice them in lockstep with d.cv. This tuple is the single
+# source of truth. The list used to be spelled out separately in clean(),
+# _skip_first_n_frames(), _apply_analysis_stride() and _masked_data(), and when
+# the lambda-ladder added v_pep_kj/v_dih_kj only two of those four were
+# updated -- so --skip-first-n-frames left them at the pre-cut length and the
+# epoch_000 split then raised "boolean index did not match indexed array".
+#
+# Deliberately EXCLUDES the window/state-space arrays (centers, k_kcal,
+# state_lambdas). state_lambdas is indexed by d.window, NOT by sample, so
+# row-slicing it would silently corrupt the ladder cross-check (crosscheck.py)
+# and the boost report (boost_report.py) with no error to warn anyone.
+_OPTIONAL_PER_SAMPLE_FIELDS = ('potential_kj', 'boost_dih_kj', 'v_pep_kj', 'v_dih_kj')
+# Required (never-None) per-sample fields. u_nk is checked separately: it is
+# 2-D (n_samples x K), so its sample count is shape[0], not size.
+_REQUIRED_PER_SAMPLE_FIELDS = ('cv', 'cv2', 'rg_A', 'window', 'replica', 'step', 'boost_kj')
+
+
+def _filter_optional_per_sample(d: 'Data', keep: np.ndarray) -> None:
+    """Row-slice every optional per-sample array of ``d`` by ``keep``, in place.
+
+    An array whose length does not match the mask cannot be aligned to the
+    samples at all, so it is dropped to None. Leaving a mis-length array
+    unsliced -- an ``if arr.size == keep.size:`` with no ``else`` -- is exactly
+    what produced the v_pep_kj/v_dih_kj misalignment this helper prevents.
+
+    An all-True mask only drops mis-length arrays and skips the slicing: NumPy
+    boolean indexing always copies, even when it keeps every element, and these
+    arrays run to millions of samples.
+    """
+    keep_all = bool(keep.all())
+    for name in _OPTIONAL_PER_SAMPLE_FIELDS:
+        arr = getattr(d, name)
+        if arr is None:
+            continue
+        if arr.size != keep.size:
+            setattr(d, name, None)
+        elif not keep_all:
+            setattr(d, name, arr[keep])
+
+
+def _assert_per_sample_alignment(d: 'Data', where: str) -> None:
+    """Raise if any per-sample array has drifted out of step with ``d.cv``.
+
+    A handful of length reads, and it is the check that catches the NEXT
+    per-sample field added without updating the row filters -- instead of that
+    field surfacing as an opaque IndexError deep inside a later subset split,
+    or (worse) never surfacing at all and silently misaligning a PMF.
+    """
+    n = int(d.cv.size)
+    bad = {}
+    for name in _REQUIRED_PER_SAMPLE_FIELDS + _OPTIONAL_PER_SAMPLE_FIELDS:
+        arr = getattr(d, name)
+        if arr is not None and int(arr.size) != n:
+            bad[name] = int(arr.size)
+    if d.u_nk is not None and int(d.u_nk.shape[0]) != n:
+        bad['u_nk'] = int(d.u_nk.shape[0])
+    src = d.meta.get('_epoch_source')
+    if src is not None and len(src) != n:
+        bad['meta["_epoch_source"]'] = len(src)
+    if bad:
+        detail = ', '.join(f'{k}={v}' for k, v in sorted(bad.items()))
+        raise ValueError(
+            f'{where}: per-sample arrays are out of step with cv (n={n}): {detail}. '
+            f'Every per-sample array must be row-filtered together -- see '
+            f'_OPTIONAL_PER_SAMPLE_FIELDS in gareus/mbar_analysis/data.py.')
+
+
 def clean(d: Data) -> Data:
     if d.u_nk.shape[0] != d.cv.size: raise ValueError('u_nk/sample count mismatch')
     if d.boost_kj.shape != d.cv.shape: d.boost_kj=np.full(d.cv.shape,np.nan)
@@ -185,22 +254,14 @@ def clean(d: Data) -> Data:
     if mask.all():
         # Nothing to filter: boolean fancy indexing always copies in NumPy,
         # even when the mask keeps every element, so skip the copies below
-        # entirely in the common (fully-finite) case. The boost_dih_kj shape
+        # entirely in the common (fully-finite) case. The optional-array shape
         # normalization just below is independent of sample finiteness (it
-        # only depends on whether the array's own length already matches the
+        # only depends on whether each array's own length already matches the
         # sample count) and must still run regardless of this fast path.
-        if d.boost_dih_kj is not None and d.boost_dih_kj.size!=mask.size: d.boost_dih_kj=None
-        if d.v_pep_kj is not None and d.v_pep_kj.size!=mask.size: d.v_pep_kj=None
-        if d.v_dih_kj is not None and d.v_dih_kj.size!=mask.size: d.v_dih_kj=None
+        _filter_optional_per_sample(d, mask)
         return d
     d.cv=d.cv[mask]; d.cv2=d.cv2[mask]; d.rg_A=d.rg_A[mask]; d.window=d.window[mask]; d.replica=d.replica[mask]; d.step=d.step[mask]; d.u_nk=d.u_nk[mask]; d.boost_kj=d.boost_kj[mask]
-    if d.potential_kj is not None and d.potential_kj.size==mask.size: d.potential_kj=d.potential_kj[mask]
-    if d.boost_dih_kj is not None and d.boost_dih_kj.size==mask.size: d.boost_dih_kj=d.boost_dih_kj[mask]
-    elif d.boost_dih_kj is not None: d.boost_dih_kj=None
-    if d.v_pep_kj is not None and d.v_pep_kj.size==mask.size: d.v_pep_kj=d.v_pep_kj[mask]
-    elif d.v_pep_kj is not None: d.v_pep_kj=None
-    if d.v_dih_kj is not None and d.v_dih_kj.size==mask.size: d.v_dih_kj=d.v_dih_kj[mask]
-    elif d.v_dih_kj is not None: d.v_dih_kj=None
+    _filter_optional_per_sample(d, mask)
     _filter_epoch_source(d, mask)
     return d
 
@@ -214,8 +275,12 @@ def _masked_data(d: 'Data', mask: np.ndarray, meta_override: Optional[dict] = No
     functions unmodified against a subset of samples (one secondary-CV regime,
     or the epoch_000/rest split, at a time).
     """
+    _assert_per_sample_alignment(d, '_masked_data input')
     def _sl(arr):
         return arr[mask] if arr is not None else None
+    # Driven off the registry rather than named one by one, so a per-sample
+    # field added later is sliced here without anyone remembering to.
+    optional = {name: _sl(getattr(d, name)) for name in _OPTIONAL_PER_SAMPLE_FIELDS}
     meta_out = dict(meta_override if meta_override is not None else d.meta)
     _epoch_src_meta = meta_out.get('_epoch_source')
     if _epoch_src_meta is not None and len(_epoch_src_meta) == mask.size:
@@ -228,11 +293,10 @@ def _masked_data(d: 'Data', mask: np.ndarray, meta_override: Optional[dict] = No
         centers=d.centers, k_kcal=d.k_kcal,
         beta=d.beta, temp=d.temp,
         boost_kj=_sl(d.boost_kj),
-        potential_kj=_sl(d.potential_kj),
         source=d.source, meta=meta_out,
-        boost_dih_kj=_sl(d.boost_dih_kj),
-        v_pep_kj=_sl(d.v_pep_kj), v_dih_kj=_sl(d.v_dih_kj),
+        # Window/state-space: shared with the original, never row-sliced.
         state_lambdas=d.state_lambdas,
+        **optional,
     )
 
 
@@ -284,11 +348,9 @@ def _skip_first_n_frames(d: Data, n: int) -> Data:
     d.cv=d.cv[keep]; d.cv2=d.cv2[keep]; d.rg_A=d.rg_A[keep]
     d.window=d.window[keep]; d.replica=d.replica[keep]; d.step=d.step[keep]
     d.u_nk=d.u_nk[keep]; d.boost_kj=d.boost_kj[keep]
-    if d.potential_kj is not None and d.potential_kj.size==keep.size:
-        d.potential_kj=d.potential_kj[keep]
-    if d.boost_dih_kj is not None and d.boost_dih_kj.size==keep.size:
-        d.boost_dih_kj=d.boost_dih_kj[keep]
+    _filter_optional_per_sample(d, keep)
     _filter_epoch_source(d, keep)
+    _assert_per_sample_alignment(d, '_skip_first_n_frames')
     return d
 
 
@@ -318,11 +380,9 @@ def _apply_analysis_stride(d: Data, stride: int, offset: int = 0) -> Data:
     d.cv=d.cv[keep]; d.cv2=d.cv2[keep]; d.rg_A=d.rg_A[keep]
     d.window=d.window[keep]; d.replica=d.replica[keep]; d.step=d.step[keep]
     d.u_nk=d.u_nk[keep]; d.boost_kj=d.boost_kj[keep]
-    if d.potential_kj is not None and d.potential_kj.size==keep.size:
-        d.potential_kj=d.potential_kj[keep]
-    if d.boost_dih_kj is not None and d.boost_dih_kj.size==keep.size:
-        d.boost_dih_kj=d.boost_dih_kj[keep]
+    _filter_optional_per_sample(d, keep)
     _filter_epoch_source(d, keep)
+    _assert_per_sample_alignment(d, '_apply_analysis_stride')
     d.meta.setdefault('load_notes',[]).append(f'Applied analysis stride {stride} with offset {offset}: kept {int(d.cv.size)}/{before} samples.')
     d.meta['analysis_stride']=int(stride)
     d.meta['analysis_stride_offset']=int(offset)
