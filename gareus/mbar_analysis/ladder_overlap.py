@@ -15,6 +15,31 @@ from gareus.mbar_analysis.pmf import overlap_components
 
 _TOL = 1.0e-9
 
+# Threshold for the SYMMETRISED MBAR STATE-OVERLAP metric this module grades --
+# NOT for a CV histogram-intersection overlap. The two are different quantities
+# on different scales and are not interchangeable: gareus.mbar_analysis.pmf
+# says so explicitly of overlap_matrix.csv vs --min-neighbor-overlap, and this
+# module used to default to that CV1-marginal target (0.30), against which no
+# pair of chignolin_7's 64 states cleared on either axis while the CV1-marginal
+# check on the same axis simultaneously passed at 0.491/connected.
+#
+# 0.15 is the project's own calibration for this metric, not a new number:
+# AdaptivePolicy.min_rung_overlap (gareus/adaptive_production.py) gates rung
+# edges at 0.15 with target_rung_overlap 0.25, calibrated on the S3 pilot's
+# measured adjacent-rung entries 0.298/0.250/0.240/0.273 (docs/superpowers/
+# specs/2026-09-07-adaptive-ladder-rungs-design.md:18, whose line 107 records
+# that symmetrising O_ij leaves that calibration valid). Using it here makes
+# the analysis report agree with the driver gate on the same measurement.
+#
+# Caveat, deliberately not encoded: that calibration is a RUNG calibration,
+# measured on a 1-D 5-state single-centre ladder. The cv1_direction rows reuse
+# it as the nearest calibration for the same metric -- far better than
+# borrowing a different metric's target, but still a reuse. It is also
+# conservative for a 2-D (centre x rung) grid, where each state shares its
+# unit column sum with up to 4 neighbours instead of 2, so healthy adjacent
+# overlaps are intrinsically lower than on the 1-D pilot ladder.
+LADDER_STATE_OVERLAP_MIN = 0.15
+
 _EMPTY_AXIS = {"pairs": [], "worst": None, "worst_pair": None, "n_pairs": 0,
                "n_components": 0, "connected": None, "expected_components": None}
 
@@ -86,7 +111,7 @@ def _axis_connectivity(K: int, pairs, group_values: np.ndarray,
 
 
 def ladder_overlap_by_axis(overlap, state_lambdas, centers,
-                            thr: float = 0.30, n_k=None):
+                            thr: float = LADDER_STATE_OVERLAP_MIN, n_k=None):
     """Split neighbour overlaps into the λ direction and the CV1 direction,
     and grade each axis' own bridging.
 

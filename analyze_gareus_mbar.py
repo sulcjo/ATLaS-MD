@@ -47,6 +47,13 @@ from gareus.mbar_analysis.solvers import (
     logw_from_fk,
 )
 from gareus.mbar_analysis.crosscheck import ladder_crosscheck
+# Single source for the ladder-axis state-overlap target: the argparse default,
+# the call site and ladder_overlap_by_axis's own default must not drift apart --
+# three independent literals is how the CV1-marginal 0.30 ended up grading a
+# state-overlap metric here in the first place.
+from gareus.mbar_analysis.ladder_overlap import (
+    LADDER_STATE_OVERLAP_MIN as _LADDER_STATE_OVERLAP_MIN,
+)
 import gareus.mbar_analysis.solvers as _mbar_solvers
 from gareus.mbar_analysis.data import (
     Data, rjson, wjson, read_windows, jvec, infer_temp_beta,
@@ -5251,7 +5258,10 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
             from gareus.mbar_analysis.ladder import mbar_state_overlap
             from gareus.mbar_analysis.ladder_overlap import ladder_overlap_by_axis, ladder_overlap_health_checks
             _ov=mbar_state_overlap(d.u_nk, m['f_k'], m['n_k'])
-            _thr=float(getattr(args,'min_neighbor_overlap',0.30))
+            # Deliberately NOT --min-neighbor-overlap: that grades CV
+            # histogram-intersection overlap, while this axis report grades
+            # symmetrised MBAR state overlap. See _LADDER_STATE_OVERLAP_MIN.
+            _thr=float(getattr(args,'min_ladder_state_overlap',_LADDER_STATE_OVERLAP_MIN))
             _lo,_lo_warnings=ladder_overlap_by_axis(_ov, d.state_lambdas, d.centers, thr=_thr, n_k=m['n_k'])
             s['ladder_overlap']=_lo
             for _w in _lo_warnings:
@@ -5446,6 +5456,18 @@ def parse_args(argv=None):
                         'asked of both axes. Joint overlap is bounded above by the CV1 marginal and '
                         'deflates further at small per-state N, so --min-neighbor-overlap is NOT a '
                         'valid threshold for it.')
+    p.add_argument('--min-ladder-state-overlap', type=float,
+                   default=_LADDER_STATE_OVERLAP_MIN, metavar='X',
+                   help='Target overlap for the lambda-ladder axis diagnostic, which grades the '
+                        'symmetrised MBAR STATE-overlap sqrt(O_ab*O_ba) -- a different quantity '
+                        'from the CV histogram overlap --min-neighbor-overlap targets, on a '
+                        'different scale, so that flag is not a valid threshold for it. Default '
+                        '%(default)s matches AdaptivePolicy.min_rung_overlap, the value the '
+                        'adaptive driver already gates rung edges at, calibrated on the S3 '
+                        "pilot's adjacent-rung entries 0.240-0.298. Note it is a RUNG calibration "
+                        'from a 1-D single-centre ladder: the CV1-direction rows reuse it, and it '
+                        'is conservative for a 2-D (centre x rung) grid where each state shares '
+                        'its unit column sum with up to 4 neighbours rather than 2.')
     p.add_argument('--no-joint-overlap', action='store_true',
                    help='Do not compute the joint (CV1, CV2) window-overlap matrix; report and grade '
                         'the CV1 marginal only (pre-2026-08-25 behaviour). The marginal cannot see a '
