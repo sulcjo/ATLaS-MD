@@ -4,6 +4,84 @@ All notable changes to ATLaS-MD are documented here.
 
 The project follows semantic-style release numbering where practical. Research-method changes that alter a sampled Hamiltonian, estimator, output contract, or thermodynamic assumption should be called out explicitly even when backwards compatibility is retained.
 
+## [0.8.1] — 2026-09-18
+
+Analysis-only release. No simulation, integrator, estimator or Hamiltonian code
+is touched, so no run needs redeploying and no previously produced PMF along a
+sampled CV changes. Every fix below is a defect in how results were *read back*,
+and three of the four shared one failure mode: a wrong-but-plausible fallback
+standing in for an unresolved value, with nothing signalling that resolution had
+failed.
+
+### Correctness
+
+- **`traj_interval` resolved from the run root, not from a silent default.**
+  `_read_traj_interval` searched only `d.prod_dir`, which for an adaptive run is
+  `<run>/adaptive_production`, while `traj_interval` is written one level up at
+  the run root. Nothing was found, so it returned its default of 50 against a
+  real value of 2500. The default is what made it silent: all five call sites
+  guarded with `if spf <= 0 or spf == 500`, where 500 is
+  `_read_traj_interval_from_epoch_dirs`'s fallback but 50 was
+  `_read_traj_interval`'s, so an unresolved value was indistinguishable from a
+  configured one and the epoch-dir fallback never ran. Downstream,
+  `_sample_to_segment_frame` accepts samples in
+  `[resume_start + spf, resume_start + n_frames*spf]`, so a 50x too-small `spf`
+  shortened that window 50x and the rest were dropped by a bare `continue`.
+  On chignolin_7: 103,664 of 5,124,128 samples assigned, 2.023% against 2.00%
+  predicted; after the fix 5,118,016 (99.88%), from 611,536 frames rather than
+  at most 103,664. Both functions now return 0 when unresolved, resolution
+  happens once in `_resolve_traj_interval(d, warnings)` which also reports its
+  source, and a test asserts no call site reimplements it.
+- **`gareus_report` declared in `py-modules`.** It is a root-level module, and
+  `packages.find` only matches `gareus*`, so it was never installed. The
+  installed `gareus-analyze` raised `ModuleNotFoundError` for every run started
+  from any working directory other than the project root. All three import sites
+  wrap the import in `try`/`except` and degrade to a warning, so runs still
+  exited 0 while silently producing no result-health verdict
+  (`health.overall` "UNKNOWN", `checks` empty), no warning triage
+  (`warnings_grouped` empty), no ladder-overlap axis report and no terminal
+  `RESULT HEALTH` banner.
+- **Row filters slice the lambda-ladder channel energies.**
+  `_skip_first_n_frames` and `_apply_analysis_stride` filtered every per-sample
+  array except `v_pep_kj` / `v_dih_kj`, which were added later and wired only
+  into `clean()` and `_masked_data()`. With `--skip-first-n-frames` on a ladder
+  run those two kept their pre-cut length and the epoch_000 split then raised
+  `IndexError: boolean index did not match indexed array`. Nothing downstream of
+  the loaders reads them per-sample, so the misalignment could only crash, never
+  bias a PMF. The field list now lives in one registry driving all four
+  functions, mis-length arrays are dropped rather than left unsliced, and
+  alignment is asserted at the end of each filter.
+
+### Output contract
+
+- **The ladder axes are graded at the state-overlap calibration.**
+  `ladder_overlap_by_axis` grades symmetrised MBAR state overlap
+  `sqrt(O_ab * O_ba)` but defaulted to 0.30 and was handed
+  `--min-neighbor-overlap`, a CV1-marginal histogram-intersection target — a
+  different quantity on a different scale. On chignolin_7 no pair cleared it on
+  either axis (0 of 48 lambda, 0 of 60 CV1), so both reported "split into 64
+  components" while the CV1-marginal check on the same axis passed at worst
+  0.491 / connected. New `--min-ladder-state-overlap`, defaulting to 0.15 =
+  `AdaptiveDecisionPolicy.min_rung_overlap`, the value the adaptive driver
+  already gates rung edges at, calibrated on the S3 pilot's adjacent-rung
+  entries 0.240-0.298. Health rows for these axes will change on re-analysis of
+  existing runs; the 0.15 figure is a rung calibration from a 1-D single-centre
+  ladder and the CV1-direction rows reuse it.
+- **New `Trajectory frame coverage` health row.** Warns and grades when
+  substantially fewer samples are assigned a frame than there are samples, so a
+  future mis-resolution surfaces in `RESULT HEALTH` rather than only in a
+  warning list — which is how the `traj_interval` defect stayed invisible.
+- **Trajectory-derived results produced before this release are superseded.**
+  Rg, PCA, the 2D FES, SASA and phi/psi were all built from the subset that
+  survived the `traj_interval` defect. Re-analysis is required for numbers
+  quoted from them; PMFs along a sampled CV are unaffected, as that path never
+  reads trajectories.
+
+### Known issues
+
+- The Parquet-source failure recorded under 0.8 is carried forward unchanged.
+  Nothing in this release touches that path and it was not re-checked.
+
 ## [0.8] — 2026-09-18
 
 ### Correctness
