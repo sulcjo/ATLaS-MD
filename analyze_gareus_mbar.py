@@ -181,12 +181,66 @@ def _adjusted_steps_for_merged_traj(d: Data, spf: int = 50) -> Optional[np.ndarr
 
 
 def _read_traj_interval_from_epoch_dirs(d: Data) -> int:
-    """Read traj_interval from epoch run dirs when prod_dir has no effective_config."""
+    """Read traj_interval from epoch run dirs, or 0 when none of them resolve.
+
+    Returns 0, not a plausible step count. This used to return 500, which is the
+    same defect as _read_traj_interval's old default of 50 one level up: an
+    unresolved value that a caller cannot distinguish from a configured one, so
+    the caller's own fallback can never fire. (It is also the literal 500 that
+    the five open-coded call-site guards tested for, while the function they
+    actually called defaulted to 50 -- the mismatch that cost chignolin_7 98% of
+    its coordinate data.)
+    """
     for run_dir in d.meta.get('adaptive_epoch_run_dirs', []):
         spf = _read_traj_interval(Path(run_dir))
         if spf > 0:
             return spf
-    return 500  # fallback default
+    return 0
+
+
+_TRAJ_INTERVAL_LAST_RESORT = 50
+# Fraction of the reachable frame/sample pairing below which coverage is treated
+# as a defect rather than as coarse trajectory saving. Deliberately well under 1.0:
+# rounding at segment boundaries and dropped wrong-ensemble phases cost a few percent
+# legitimately, while a mis-resolved steps_per_frame costs a FACTOR (50x on chignolin_7,
+# leaving 2%). 0.5 separates those two regimes without firing on healthy runs.
+TRAJ_COVERAGE_MIN_FRACTION = 0.5
+
+
+def _resolve_traj_interval(d: Data, warnings: Optional[list] = None) -> tuple:
+    """Resolve steps-per-trajectory-frame for ``d``, returning ``(spf, source)``.
+
+    THE single place this is decided. It used to be open-coded at five call
+    sites (Rg, PCA, extra observables, chignolin-FES, SASA), each repeating
+
+        spf = _read_traj_interval(d.prod_dir)
+        if spf <= 0 or spf == 500:        # <- wrong sentinel
+            spf = _read_traj_interval_from_epoch_dirs(d)
+
+    where 500 is ``_read_traj_interval_from_epoch_dirs``'s fallback but 50 was
+    ``_read_traj_interval``'s. An unresolved 50 passed the guard untouched, so
+    the epoch-dir fallback never ran and every coordinate-derived analysis
+    silently used 50 instead of chignolin_7's real 2500.
+
+    ``source`` names where the value came from so a wrong pickup is visible in
+    the log rather than silent -- the parent walk in ``_read_traj_interval`` can
+    in principle reach a shared RUNS/ directory, and adopting a neighbouring
+    run's interval would be just as wrong as the default was.
+    """
+    spf = _read_traj_interval(d.prod_dir)
+    if spf > 0:
+        return spf, 'run config (prod_dir or parents)'
+    spf = _read_traj_interval_from_epoch_dirs(d)
+    if spf > 0:
+        return spf, 'epoch run dirs'
+    msg = (f'traj_interval could not be resolved for {d.prod_dir} from the run config '
+           f'(searched it and two parent levels) or from any epoch run dir; falling back '
+           f'to {_TRAJ_INTERVAL_LAST_RESORT} steps/frame. Every trajectory-derived '
+           f'observable (Rg, PCA, 2D FES, SASA, phi/psi) maps samples to frames with '
+           f'this number -- if it is wrong they will silently lose most of their data.')
+    if warnings is not None:
+        warnings.append(msg)
+    return _TRAJ_INTERVAL_LAST_RESORT, 'LAST-RESORT DEFAULT (unresolved)'
 
 
 def _get_adaptive_epoch_traj_dirs(d: Data) -> list:
@@ -1237,7 +1291,36 @@ def _find_all_replica_trajectory_segments(traj_dir: Path, rep: int, args=None) -
 
 
 def _read_traj_interval(prod_dir: Path) -> int:
-    """Return traj_interval (simulation steps per trajectory frame) from effective_config, default 50."""
+    """Return traj_interval (simulation steps per trajectory frame), or 0 if unresolved.
+
+    Searches ``prod_dir`` shallowest-first, then one and two levels up -- the same
+    convention ``gareus.mbar_analysis.data.infer_temp_beta`` uses, and for the same
+    reason: ``d.prod_dir`` is ``<run>/adaptive_production`` while the config that
+    records ``traj_interval`` is written at the RUN ROOT, one level up. Without the
+    walk this returned its default for every adaptive run.
+
+    Returns 0 -- NOT a plausible-looking step count -- when nothing is found. The
+    previous default of 50 was indistinguishable from a real configured value, so
+    every caller's "did this resolve?" guard was unable to fire. On chignolin_7
+    (true traj_interval 2500) that silently shortened each segment's
+    sample-acceptance window by 50x and dropped 98% of the coordinate data from
+    Rg/PCA/chignolin-FES/SASA with no warning. Callers must treat <= 0 as
+    unresolved and fall back explicitly; use _resolve_traj_interval().
+    """
+    seen: set = set()
+    search_dirs = [Path(prod_dir), Path(prod_dir).parent, Path(prod_dir).parent.parent]
+    for d_ in search_dirs:
+        if str(d_) in seen:
+            continue
+        seen.add(str(d_))
+        spf = _read_traj_interval_one_dir(d_)
+        if spf > 0:
+            return spf
+    return 0
+
+
+def _read_traj_interval_one_dir(prod_dir: Path) -> int:
+    """traj_interval from the config files of exactly one directory, else 0."""
     for name in ('effective_config.json', 'run_args.json'):
         p = Path(prod_dir) / name
         if not p.exists():
@@ -1260,7 +1343,7 @@ def _read_traj_interval(prod_dir: Path) -> int:
                     return int(loc['traj_interval'])
         except Exception:
             pass
-    return 50
+    return 0
 
 
 def _sample_to_segment_frame(
@@ -1478,11 +1561,7 @@ def _compute_rg_from_trajectories(d: Data, args, progress: Optional[Progress], w
     allow_truncate=bool(getattr(args,'rg_allow_truncate',False))
     if progress is not None:
         progress.step('Rg trajectories', f'using topology {top_path}; selection {selection!r}')
-    spf=_read_traj_interval(d.prod_dir)
-    if spf <= 0 or spf == 500:
-        epoch_spf = _read_traj_interval_from_epoch_dirs(d)
-        if epoch_spf > 0:
-            spf = epoch_spf
+    spf, _spf_src = _resolve_traj_interval(d, warnings)
     use_adjusted = (traj_dir != d.prod_dir / 'replica_trajectories')
     adj_steps = _adjusted_steps_for_merged_traj(d, spf) if use_adjusted else None
     # Pre-load topology once — avoids re-parsing PDB on every md.load() call
@@ -1520,7 +1599,7 @@ def _compute_rg_from_trajectories(d: Data, args, progress: Optional[Progress], w
             return 0, local_warns
         order=idx[np.argsort(d.step[idx], kind='stable')]
         steps_for_align = adj_steps[order] if adj_steps is not None else d.step[order]
-        rep_assigned=0
+        rep_assigned=0; rep_frames=0
         for resume_start, seg_path in segs:
             try:
                 rg_nm, n_frames = _rg_from_segment_chunked(md, seg_path, top_topology, rg_atoms, selection, rg_chunk_size)
@@ -1528,16 +1607,17 @@ def _compute_rg_from_trajectories(d: Data, args, progress: Optional[Progress], w
             except Exception as exc:
                 local_warns.append(f'Rg trajectory reconstruction failed for replica {rep} ({seg_path}): {exc}')
                 continue
+            rep_frames+=int(n_frames)
             eff_resume_start=_base_segment_resume_start(resume_start, use_adjusted, steps_for_align, spf)
             mask, local_frames=_sample_to_segment_frame(steps_for_align, eff_resume_start, n_frames, spf)
             if not np.any(mask):
                 continue
             out[order[mask]]=rg[local_frames]
             rep_assigned+=int(np.sum(mask))
-        return rep_assigned, local_warns
+        return rep_assigned, local_warns, rep_frames
 
     n_workers=max(1, int(getattr(args,'traj_workers',4) or 4))
-    assigned=0
+    assigned=0; frames_seen=0
     if n_workers > 1 and len(reps) > 1:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         with ThreadPoolExecutor(max_workers=n_workers) as exe:
@@ -1547,19 +1627,54 @@ def _compute_rg_from_trajectories(d: Data, args, progress: Optional[Progress], w
                 if progress is not None:
                     progress.bar('Rg trajectories', ii, max(1,len(reps)), f'replica {rep}')
                 try:
-                    n_a, w=fut.result()
-                    assigned+=n_a; warnings.extend(w)
+                    n_a, w, n_f=fut.result()
+                    assigned+=n_a; frames_seen+=n_f; warnings.extend(w)
                 except Exception as exc:
                     warnings.append(f'Rg worker replica {rep} failed: {exc}')
     else:
         for ii,rep in enumerate(reps, start=1):
             if progress is not None:
                 progress.bar('Rg trajectories', ii, max(1,len(reps)), f'replica {rep}')
-            n_a, w=_rg_replica_worker(rep)
-            assigned+=n_a; warnings.extend(w)
+            n_a, w, n_f=_rg_replica_worker(rep)
+            assigned+=n_a; frames_seen+=n_f; warnings.extend(w)
 
     if progress is not None:
-        progress.bar('Rg trajectories', 1, 1, f'assigned {assigned}/{d.cv.size} samples', force=True)
+        progress.bar('Rg trajectories', 1, 1,
+                     f'assigned {assigned}/{d.cv.size} samples from {frames_seen} frames '
+                     f'(spf={spf}, {_spf_src})', force=True)
+
+    # Coverage invariant. A frame->sample mapping can legitimately assign fewer
+    # samples than there are samples (trajectories saved more coarsely than the
+    # analysis rows) OR fewer than there are frames (the reverse), so neither
+    # total alone is the expectation. What SHOULD hold is that the scarcer of
+    # the two is nearly exhausted: expected ~= min(n_samples, frames_seen).
+    #
+    # This is the check that was missing when chignolin_7 resolved spf=50
+    # instead of 2500: _sample_to_segment_frame simply returned an all-False
+    # mask for most segments and the loop `continue`d, so 98% of the coordinate
+    # data vanished with no warning, no failed run and a confident 2D FES built
+    # on 2% of the frames. Anything that makes spf wrong again -- a new
+    # directory layout, a renamed config key, a per-epoch override -- lands here
+    # instead of in a silent `continue`.
+    d.meta['_traj_frame_coverage'] = {
+        'assigned': int(assigned), 'n_samples': int(d.cv.size),
+        'frames_seen': int(frames_seen), 'steps_per_frame': int(spf),
+        'steps_per_frame_source': str(_spf_src),
+    }
+    expected = min(int(d.cv.size), int(frames_seen))
+    if expected > 0:
+        frac = float(assigned) / float(expected)
+        d.meta['_traj_frame_coverage']['fraction_of_expected'] = frac
+        if frac < TRAJ_COVERAGE_MIN_FRACTION:
+            warnings.append(
+                f'Trajectory frame coverage is only {frac:.1%} of what is reachable: assigned '
+                f'{assigned} samples against min(n_samples={d.cv.size}, frames={frames_seen})'
+                f'={expected}, using steps_per_frame={spf} from {_spf_src}. Every '
+                f'trajectory-derived observable (Rg, PCA, 2D FES, SASA, phi/psi) is built from '
+                f'that subset. The usual cause is a WRONG steps_per_frame: it shortens each '
+                f"segment's sample-acceptance window [resume_start+spf, resume_start+n_frames*spf] "
+                f'proportionally, so the fraction lost tracks the error in spf. Check '
+                f"traj_interval in the run config against {spf}.")
     if assigned <= 0:
         return None
     return out
@@ -1733,10 +1848,7 @@ def _trajectory_frame_count(md, traj_path: Path) -> Optional[int]:
 def _pca_replica_plan(d: Data, args, md, traj_dir: Path, warnings: list[str]) -> list[dict]:
     reps=sorted(set(int(x) for x in d.replica if np.isfinite(x)))
     plan=[]
-    spf=_read_traj_interval(d.prod_dir)
-    if spf <= 0 or spf == 500:
-        epoch_spf = _read_traj_interval_from_epoch_dirs(d)
-        if epoch_spf > 0: spf = epoch_spf
+    spf, _spf_src = _resolve_traj_interval(d, warnings)
     use_adj = (traj_dir != d.prod_dir / 'replica_trajectories')
     adj_steps_all = _adjusted_steps_for_merged_traj(d, spf) if use_adj else None
     for rep in reps:
@@ -2145,10 +2257,7 @@ def _find_extra_topology_path(prod: Path, args) -> Optional[Path]:
 def _extra_replica_plan(d: Data, args, md, traj_dir: Path, warnings: list[str]) -> list[dict]:
     reps=sorted(set(int(x) for x in d.replica if np.isfinite(x)))
     plan=[]
-    spf=_read_traj_interval(d.prod_dir)
-    if spf <= 0 or spf == 500:
-        epoch_spf = _read_traj_interval_from_epoch_dirs(d)
-        if epoch_spf > 0: spf = epoch_spf
+    spf, _spf_src = _resolve_traj_interval(d, warnings)
     use_adj = (traj_dir != d.prod_dir / 'replica_trajectories')
     adj_steps_all = _adjusted_steps_for_merged_traj(d, spf) if use_adj else None
     for rep in reps:
@@ -3052,11 +3161,7 @@ def _compute_chignolin_distances(d, args, progress, warnings: list):
     dist1_out = np.full(d.cv.shape, np.nan, dtype=np.float64)
     dist2_out = np.full(d.cv.shape, np.nan, dtype=np.float64)
     reps = sorted(set(int(x) for x in d.replica if np.isfinite(x)))
-    spf = _read_traj_interval(d.prod_dir)
-    if spf <= 0 or spf == 500:  # 500 is the fallback default — check epoch dirs too
-        epoch_spf = _read_traj_interval_from_epoch_dirs(d)
-        if epoch_spf > 0:
-            spf = epoch_spf
+    spf, _spf_src = _resolve_traj_interval(d, warnings)
     # Use epoch-offset-adjusted steps when trajectories come from merged dir
     use_adjusted = (traj_dir != d.prod_dir / 'replica_trajectories')
     adj_steps = _adjusted_steps_for_merged_traj(d, spf) if use_adjusted else None
@@ -3843,9 +3948,7 @@ def analyze_poincare_residue_torsions(d: Data, args, out: Path, poincare_info: d
         else:
             return {'available': False, 'reason': f'replica_trajectories directory not found at {traj_dir}'}
 
-    traj_interval = _read_traj_interval(d.prod_dir)
-    if traj_interval <= 0:
-        traj_interval = 50  # fallback
+    traj_interval, _spf_src = _resolve_traj_interval(d)
 
     # Load protein atom indices once from topology
     try:
@@ -5279,6 +5382,39 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
                 s['health']['overall']=overall_from_checks(s['health']['checks'])
         except Exception as _lo_exc:
             s.setdefault('warnings',[]).append(f"ladder-overlap axis report failed: {_lo_exc}")
+
+    # Trajectory frame coverage -> RESULT HEALTH. This is deliberately a health
+    # ROW, not just a warning: chignolin_7 lost 98% of its coordinate data to a
+    # mis-resolved steps_per_frame and the only trace was an absent one, so a
+    # degradation that reaches nothing but s['warnings'] is exactly the failure
+    # mode being closed here. Own try/except, and the overall verdict is
+    # recomputed from the full list so the banner cannot disagree with a row it
+    # is now showing (same contract as the ladder-overlap block above).
+    _cov = d.meta.get('_traj_frame_coverage')
+    if isinstance(_cov, dict) and _cov.get('fraction_of_expected') is not None:
+        try:
+            from gareus_report import overall_from_checks
+            _frac = float(_cov['fraction_of_expected'])
+            s['trajectory_frame_coverage'] = _cov
+            if _frac >= TRAJ_COVERAGE_MIN_FRACTION:
+                _st = 'pass'
+            elif _frac >= 0.5 * TRAJ_COVERAGE_MIN_FRACTION:
+                _st = 'caution'
+            else:
+                _st = 'fail'
+            s.setdefault('health',{}).setdefault('checks',[]).append({
+                'name': 'Trajectory frame coverage',
+                'status': _st,
+                'detail': (f"{_frac:.1%} of reachable pairs assigned "
+                           f"({_cov['assigned']}/{min(_cov['n_samples'], _cov['frames_seen'])}); "
+                           f"steps_per_frame={_cov['steps_per_frame']} from "
+                           f"{_cov['steps_per_frame_source']}"),
+            })
+            if (isinstance(s.get('health'),dict) and isinstance(s['health'].get('checks'),list)
+                    and not s['health'].get('error')):
+                s['health']['overall']=overall_from_checks(s['health']['checks'])
+        except Exception as _cov_exc:
+            s.setdefault('warnings',[]).append(f"trajectory-coverage health row failed: {_cov_exc}")
     # Per-rung GaMD boost/reweighting diagnostics: Miao's cumulant-reweighting
     # criterion (anharmonicity < 0.01) is a per-STATE statement, and a ladder
     # run's states span very different mean boosts (lambda=0 is unboosted
