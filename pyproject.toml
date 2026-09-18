@@ -55,7 +55,12 @@ gareus-consolidate-traj = "gareus.traj_consolidate:main"
 gareus-analyze = "gareus.mbar_analysis.cli:main"
 
 [tool.setuptools]
-py-modules = ["gareus_peptide", "GENPEPT", "config_profiles", "analyze_gareus_mbar"]
+# Root-level modules are not matched by packages.find (include = ["gareus*"]),
+# so every one that shipped code imports must be listed here or it will not be
+# installed -- see tests/test_packaging_root_modules.py. gareus_report was
+# missing, which silently disabled the health verdict, warning triage and
+# ladder-overlap report for any run started outside the project root.
+py-modules = ["gareus_peptide", "GENPEPT", "config_profiles", "analyze_gareus_mbar", "gareus_report"]
 
 [tool.setuptools.packages.find]
 where = ["."]
