@@ -1661,15 +1661,23 @@ def _compute_rg_from_trajectories(d: Data, args, progress: Optional[Progress], w
         'frames_seen': int(frames_seen), 'steps_per_frame': int(spf),
         'steps_per_frame_source': str(_spf_src),
     }
-    expected = min(int(d.cv.size), int(frames_seen))
+    # Expectation is n_samples, NOT min(n_samples, frames_seen): `assigned`
+    # counts SAMPLES and `frames_seen` counts FRAMES, and several samples
+    # legitimately share one frame whenever trajectories are saved more coarsely
+    # than analysis rows -- the normal case here (5.12M samples over 611,536
+    # frames = 8.4 samples/frame). Taking the min mixed the two units and
+    # reported 836.9% coverage on a healthy run. Every sample inside a segment's
+    # window is assigned its nearest frame, so the invariant is simply that
+    # nearly all samples get one.
+    expected = int(d.cv.size)
     if expected > 0:
         frac = float(assigned) / float(expected)
         d.meta['_traj_frame_coverage']['fraction_of_expected'] = frac
         if frac < TRAJ_COVERAGE_MIN_FRACTION:
             warnings.append(
-                f'Trajectory frame coverage is only {frac:.1%} of what is reachable: assigned '
-                f'{assigned} samples against min(n_samples={d.cv.size}, frames={frames_seen})'
-                f'={expected}, using steps_per_frame={spf} from {_spf_src}. Every '
+                f'Trajectory frame coverage is only {frac:.1%}: assigned {assigned} of '
+                f'{d.cv.size} samples (from {frames_seen} frames), '
+                f'using steps_per_frame={spf} from {_spf_src}. Every '
                 f'trajectory-derived observable (Rg, PCA, 2D FES, SASA, phi/psi) is built from '
                 f'that subset. The usual cause is a WRONG steps_per_frame: it shortens each '
                 f"segment's sample-acceptance window [resume_start+spf, resume_start+n_frames*spf] "
@@ -5405,8 +5413,9 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
             s.setdefault('health',{}).setdefault('checks',[]).append({
                 'name': 'Trajectory frame coverage',
                 'status': _st,
-                'detail': (f"{_frac:.1%} of reachable pairs assigned "
-                           f"({_cov['assigned']}/{min(_cov['n_samples'], _cov['frames_seen'])}); "
+                'detail': (f"{_frac:.1%} of samples assigned a frame "
+                           f"({_cov['assigned']}/{_cov['n_samples']}, from "
+                           f"{_cov['frames_seen']} frames); "
                            f"steps_per_frame={_cov['steps_per_frame']} from "
                            f"{_cov['steps_per_frame_source']}"),
             })
