@@ -1,0 +1,25 @@
+{
+ "n": 9745,
+ "anchor_gbn2_vs_stored_max_abs_kcal": 0.03713784465060144,
+ "E_gbn2_range_kcal": [
+  -403.90461868321444,
+  -223.87356305313057
+ ],
+ "E_obc2_range_kcal": [
+  -383.92401750147855,
+  -204.2116768884787
+ ],
+ "spearman_gbn2_vs_obc2": 0.9858111569688637,
+ "dE_model_range_kcal": [
+  12.50089522560529,
+  23.055452255416697
+ ],
+ "dE_model_std_kcal": 0.9814857118859265,
+ "rho_flankpsi_E_gbn2": 0.1209265625546368,
+ "rho_flankpsi_E_obc2": 0.14330315303738037,
+ "rho_cv1_E_gbn2": -0.18238376886299956,
+ "rho_cv1_E_obc2": -0.15259201887665205,
+ "frac_stable_both": 0.18296562339661365,
+ "frac_gbn2_stable_but_not_obc2": 0.01703437660338635,
+ "frac_obc2_stable_but_not_gbn2": 0.01703437660338635
+}

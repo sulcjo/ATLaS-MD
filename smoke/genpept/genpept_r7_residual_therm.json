@@ -1,0 +1,370 @@
+{
+ "anchor": {
+  "openmm_total": -1572.5707325935364,
+  "csv_minimized": -1572.6190187277675
+ },
+ "dssp_lo_top3": [
+  [
+   "CCCCCCCCCC",
+   188
+  ],
+  [
+   "CCCCCHHHCC",
+   3
+  ],
+  [
+   "CCCCECCECC",
+   2
+  ]
+ ],
+ "dssp_hi_top3": [
+  [
+   "CCCCCCCCCC",
+   68
+  ],
+  [
+   "CCHHHHCCCC",
+   20
+  ],
+  [
+   "CCCCCHHHHC",
+   17
+  ]
+ ],
+ "per_res_strand": [
+  {
+   "res": "G1",
+   "E_lo": 0.0,
+   "E_hi": 0.0
+  },
+  {
+   "res": "Y2",
+   "E_lo": 0.005076142131979695,
+   "E_hi": 0.0
+  },
+  {
+   "res": "D3",
+   "E_lo": 0.0,
+   "E_hi": 0.0
+  },
+  {
+   "res": "P4",
+   "E_lo": 0.0,
+   "E_hi": 0.0
+  },
+  {
+   "res": "E5",
+   "E_lo": 0.01015228426395939,
+   "E_hi": 0.0
+  },
+  {
+   "res": "T6",
+   "E_lo": 0.005076142131979695,
+   "E_hi": 0.0
+  },
+  {
+   "res": "G7",
+   "E_lo": 0.0,
+   "E_hi": 0.0
+  },
+  {
+   "res": "T8",
+   "E_lo": 0.015228426395939087,
+   "E_hi": 0.0
+  },
+  {
+   "res": "W9",
+   "E_lo": 0.005076142131979695,
+   "E_hi": 0.0
+  },
+  {
+   "res": "G10",
+   "E_lo": 0.0,
+   "E_hi": 0.0
+  }
+ ],
+ "band": [
+  {
+   "seed": "survivor_027_basin_028_candidate_1674_gencluster_1674_conf_194930_implicit_min",
+   "cv2": -2.4290616448870783,
+   "cv1": 0.4779383242130279,
+   "bond": 16.1648006439209,
+   "angle": 54.927825927734375,
+   "torsion": 376.94671630859375,
+   "nonbonded": -542.8922147750854,
+   "gb_solvation": -1498.1880702972412,
+   "total": -1593.0408728122711
+  },
+  {
+   "seed": "survivor_1021_basin_1038_nma_bh_candidate_2101_gencluster_2101_conf_074791_implicit_min_hop_001_mode01_p1.35A_implicit_min",
+   "cv2": -1.8792678248964672,
+   "cv1": 0.4965268969535827,
+   "bond": 16.723873138427734,
+   "angle": 68.95785522460938,
+   "torsion": 386.18670654296875,
+   "nonbonded": -501.63666343688965,
+   "gb_solvation": -1556.3157272338867,
+   "total": -1586.0835480690002
+  },
+  {
+   "seed": "survivor_1859_basin_1888_candidate_2719_gencluster_794_conf_081454_implicit_min",
+   "cv2": -1.1909829546843342,
+   "cv1": 0.4682231247425079,
+   "bond": 18.515281677246094,
+   "angle": 67.47415161132812,
+   "torsion": 364.37615966796875,
+   "nonbonded": -414.94746494293213,
+   "gb_solvation": -1616.2886409759521,
+   "total": -1580.8705179691315
+  },
+  {
+   "seed": "survivor_1765_basin_1794_candidate_2180_gencluster_082_conf_185073_implicit_min",
+   "cv2": -1.03976280283277,
+   "cv1": 0.4716920256614685,
+   "bond": 19.504684448242188,
+   "angle": 83.86112976074219,
+   "torsion": 356.0229797363281,
+   "nonbonded": -596.0267543792725,
+   "gb_solvation": -1489.8123168945312,
+   "total": -1626.4498434066772
+  },
+  {
+   "seed": "survivor_184_basin_188_candidate_1186_gencluster_1186_conf_076212_implicit_min",
+   "cv2": -0.8369636824090981,
+   "cv1": 0.4791038930416107,
+   "bond": 17.733644485473633,
+   "angle": 61.21702575683594,
+   "torsion": 358.787841796875,
+   "nonbonded": -511.745756149292,
+   "gb_solvation": -1532.1003551483154,
+   "total": -1606.108165025711
+  },
+  {
+   "seed": "survivor_399_basin_406_candidate_664_gencluster_664_conf_026775_implicit_min",
+   "cv2": -0.7178378143273642,
+   "cv1": 0.4649649262428283,
+   "bond": 20.35177230834961,
+   "angle": 80.19730377197266,
+   "torsion": 356.9547424316406,
+   "nonbonded": -475.18029403686523,
+   "gb_solvation": -1580.9114546775818,
+   "total": -1598.5875454992056
+  },
+  {
+   "seed": "survivor_860_basin_875_candidate_634_gencluster_634_conf_024833_implicit_min",
+   "cv2": -0.544107254166309,
+   "cv1": 0.4859853386878967,
+   "bond": 18.44148826599121,
+   "angle": 91.34556579589844,
+   "torsion": 405.158203125,
+   "nonbonded": -458.996337890625,
+   "gb_solvation": -1576.8271751403809,
+   "total": -1520.8783612549305
+  },
+  {
+   "seed": "survivor_1363_basin_1386_nma_bh_candidate_982_gencluster_982_conf_053435_implicit_min_hop_003_mode01_m0.75A_implicit_min",
+   "cv2": -0.3053546626647735,
+   "cv1": 0.4778312444686889,
+   "bond": 18.407976150512695,
+   "angle": 68.6386489868164,
+   "torsion": 376.26507568359375,
+   "nonbonded": -458.70782136917114,
+   "gb_solvation": -1566.60187625885,
+   "total": -1561.99827003479
+  },
+  {
+   "seed": "survivor_549_basin_559_nma_bh_candidate_2149_gencluster_045_conf_000812_implicit_min_hop_003_mode02_m0.75A_implicit_min",
+   "cv2": -0.1804089345752866,
+   "cv1": 0.4760008752346039,
+   "bond": 17.530900955200195,
+   "angle": 73.09529113769531,
+   "torsion": 373.2566223144531,
+   "nonbonded": -681.2893371582031,
+   "gb_solvation": -1393.4907732009888,
+   "total": -1610.8978414535522
+  },
+  {
+   "seed": "survivor_863_basin_878_nma_bh_candidate_768_gencluster_768_conf_013652_implicit_min_hop_002_mode01_p0.75A_implicit_min",
+   "cv2": -0.0450074175590411,
+   "cv1": 0.4894086718559265,
+   "bond": 18.584819793701172,
+   "angle": 72.78289794921875,
+   "torsion": 390.5830993652344,
+   "nonbonded": -675.7973031997681,
+   "gb_solvation": -1421.6453371047974,
+   "total": -1615.492445141077
+  },
+  {
+   "seed": "survivor_1349_basin_1372_nma_bh_candidate_1306_gencluster_1306_conf_001572_implicit_min_hop_000_mode02_p1.35A_implicit_min",
+   "cv2": 0.0653738772652428,
+   "cv1": 0.4617835581302643,
+   "bond": 18.136863708496094,
+   "angle": 69.83836364746094,
+   "torsion": 352.8232727050781,
+   "nonbonded": -538.7635364532471,
+   "gb_solvation": -1514.2897539138794,
+   "total": -1612.2546900510788
+  },
+  {
+   "seed": "survivor_1192_basin_1212_candidate_2930_gencluster_1049_conf_105172_implicit_min",
+   "cv2": 0.2055419168872408,
+   "cv1": 0.4762331545352936,
+   "bond": 17.496700286865234,
+   "angle": 67.98394012451172,
+   "torsion": 376.7847900390625,
+   "nonbonded": -526.0583381652832,
+   "gb_solvation": -1556.4542169570923,
+   "total": -1620.2472128868103
+  },
+  {
+   "seed": "survivor_305_basin_311_nma_bh_candidate_2799_gencluster_891_conf_103935_implicit_min_hop_003_mode02_m1.35A_implicit_min",
+   "cv2": 0.3288041630982393,
+   "cv1": 0.4799079895019531,
+   "bond": 18.03009796142578,
+   "angle": 67.83592987060547,
+   "torsion": 394.8076477050781,
+   "nonbonded": -143.985755443573,
+   "gb_solvation": -1898.7666983604431,
+   "total": -1562.0786551237106
+  },
+  {
+   "seed": "survivor_1291_basin_1312_candidate_769_gencluster_769_conf_173034_implicit_min",
+   "cv2": 0.4120620877392091,
+   "cv1": 0.4730008542537689,
+   "bond": 17.710607528686523,
+   "angle": 65.80343627929688,
+   "torsion": 374.61651611328125,
+   "nonbonded": -519.6044883728027,
+   "gb_solvation": -1570.6583833694458,
+   "total": -1632.1321539878845
+  },
+  {
+   "seed": "survivor_887_basin_902_candidate_997_gencluster_997_conf_006574_implicit_min",
+   "cv2": 0.4839760441160863,
+   "cv1": 0.4987832009792328,
+   "bond": 20.73090362548828,
+   "angle": 81.9423828125,
+   "torsion": 372.52667236328125,
+   "nonbonded": -529.0522785186768,
+   "gb_solvation": -1543.5924181938171,
+   "total": -1597.4445182085037
+  },
+  {
+   "seed": "survivor_185_basin_189_nma_bh_candidate_1992_gencluster_1992_conf_005930_implicit_min_hop_002_mode01_m0.75A_implicit_min",
+   "cv2": 0.5513699497615576,
+   "cv1": 0.4741619527339935,
+   "bond": 19.878555297851562,
+   "angle": 87.15402221679688,
+   "torsion": 377.1246643066406,
+   "nonbonded": -569.4275918006897,
+   "gb_solvation": -1505.717812538147,
+   "total": -1590.9887548834085
+  },
+  {
+   "seed": "survivor_1394_basin_1418_nma_bh_candidate_706_gencluster_706_conf_010197_implicit_min_hop_000_mode01_p0.75A_implicit_min",
+   "cv2": 0.642306963267582,
+   "cv1": 0.464265376329422,
+   "bond": 19.654207229614258,
+   "angle": 80.97254943847656,
+   "torsion": 364.4962158203125,
+   "nonbonded": -565.7676095962524,
+   "gb_solvation": -1495.1884727478027,
+   "total": -1595.8329995274544
+  },
+  {
+   "seed": "survivor_1575_basin_1602_candidate_1184_gencluster_1184_conf_055447_implicit_min",
+   "cv2": 0.7342132605544771,
+   "cv1": 0.4980080127716064,
+   "bond": 22.066940307617188,
+   "angle": 72.83763122558594,
+   "torsion": 352.478759765625,
+   "nonbonded": -470.59150314331055,
+   "gb_solvation": -1567.2371072769165,
+   "total": -1590.4455399811268
+  },
+  {
+   "seed": "survivor_1844_basin_1873_candidate_2867_gencluster_973_conf_126544_implicit_min",
+   "cv2": 0.9092280553618262,
+   "cv1": 0.4690779149532318,
+   "bond": 19.40027618408203,
+   "angle": 79.71895599365234,
+   "torsion": 365.82965087890625,
+   "nonbonded": -695.9176254272461,
+   "gb_solvation": -1411.7352962493896,
+   "total": -1642.7037601470947
+  },
+  {
+   "seed": "survivor_1259_basin_1280_candidate_751_gencluster_751_conf_067135_implicit_min",
+   "cv2": 1.0515452150368094,
+   "cv1": 0.4861810207366943,
+   "bond": 18.210315704345703,
+   "angle": 73.23783111572266,
+   "torsion": 395.13482666015625,
+   "nonbonded": -366.7638649940491,
+   "gb_solvation": -1673.669476032257,
+   "total": -1553.850797533989
+  },
+  {
+   "seed": "survivor_1698_basin_1726_nma_bh_candidate_1282_gencluster_1282_conf_013249_implicit_min_hop_003_mode02_p1.35A_implicit_min",
+   "cv2": 1.2174145406857135,
+   "cv1": 0.4853149652481079,
+   "bond": 20.281484603881836,
+   "angle": 77.95621490478516,
+   "torsion": 347.89617919921875,
+   "nonbonded": -415.91125869750977,
+   "gb_solvation": -1631.0331172943115,
+   "total": -1600.810422539711
+  },
+  {
+   "seed": "survivor_875_basin_890_candidate_1198_gencluster_1198_conf_013733_implicit_min",
+   "cv2": 1.339292737017892,
+   "cv1": 0.4698176681995392,
+   "bond": 19.749425888061523,
+   "angle": 84.01701354980469,
+   "torsion": 351.75030517578125,
+   "nonbonded": -218.75525856018066,
+   "gb_solvation": -1800.1674280166626,
+   "total": -1563.405739068985
+  },
+  {
+   "seed": "survivor_1881_basin_1910_candidate_1028_gencluster_1028_conf_063210_implicit_min",
+   "cv2": 1.4812879411192643,
+   "cv1": 0.4812384247779846,
+   "bond": 18.24497413635254,
+   "angle": 71.05984497070312,
+   "torsion": 376.12152099609375,
+   "nonbonded": -445.1675853729248,
+   "gb_solvation": -1602.1858282089233,
+   "total": -1581.9261184930801
+  },
+  {
+   "seed": "survivor_1900_basin_1930_candidate_1065_gencluster_1065_conf_007251_implicit_min",
+   "cv2": 2.2452720829852755,
+   "cv1": 0.4926635324954986,
+   "bond": 18.434560775756836,
+   "angle": 66.38352966308594,
+   "torsion": 355.26788330078125,
+   "nonbonded": -432.93274879455566,
+   "gb_solvation": -1634.873797416687,
+   "total": -1627.7208474874496
+  }
+ ],
+ "rho_cv2_energy": {
+  "bond": 0.3834782608695652,
+  "angle": 0.25652173913043474,
+  "torsion": -0.25999999999999995,
+  "nonbonded": 0.27652173913043476,
+  "gb_solvation": -0.37217391304347824,
+  "total": -0.05217391304347826
+ },
+ "rho_cv2_descriptors": {
+  "sasa_total": -0.20402180141151371,
+  "burial_y2": -0.20569630735556046,
+  "burial_w9": 0.01563014712797927,
+  "burial_d3": 0.22711463121757747,
+  "sasa_hydrophobic_frac": 0.275935580438116,
+  "rg_heavy": -0.030222460778423117
+ },
+ "rho_cv2_e_min": -0.31323683580599226,
+ "rho_cv2_e_drop": 0.05511415474102897
+}

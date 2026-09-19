@@ -1,0 +1,10 @@
+Does PC1 add anything on top of PC2?
+  CV1                          0.8591
+  CV1 + resPC2                 0.9230
+  CV1 + resPC1                 0.8607
+  CV1 + resPC1 + resPC2        0.9227   <- PC1 on top of PC2
+  CV1 + resPC2 + resPC6        0.9259
+  resPC1 + resPC2 (no CV1)     0.7921
+
+  variance ranking says PC1 > PC2 (EVR 0.111 vs 0.085);
+  discrimination says the opposite. Variance != relevance.

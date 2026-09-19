@@ -1,0 +1,14 @@
+{
+  "test_set_n": 496,
+  "decoy_P_within_1.0": 0.24686192468619245,
+  "decoy_sd": 0.04728218606365405,
+  "decoy_P_within_1.5": 0.5202405857740585,
+  "native_P_within_1.0_same_test_set": 0.004032258064516129,
+  "native_P_within_1.5_same_test_set": 0.02217741935483871,
+  "matched_ratio_1.0": 61.221757322175726,
+  "matched_ratio_1.5": 23.458120958539364,
+  "compact_conditioned_observed_rate": 0.006118970513039032,
+  "whole_archive_observed_rate": 0.0007865440464666022,
+  "supersedes": "the 324x figure, which divided a compact-conditioned null by a whole-archive observed rate",
+  "n_trials": 40
+}

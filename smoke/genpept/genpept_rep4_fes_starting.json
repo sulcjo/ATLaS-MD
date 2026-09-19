@@ -1,0 +1,12 @@
+{
+ "n": 9745,
+ "T_K": 300.0,
+ "spearman_raw_vs_thermo_CV1xPC1": 0.5257004906672114,
+ "dF_max_CV1_1d_kcal": 19.585389815671057,
+ "dF_min_CV1_1d_kcal": -0.2966827363295104,
+ "raw_range_kcal": 1.7403093493620199,
+ "thermo_range_kcal": 21.01492212503495,
+ "n_envelope_seeds": 31,
+ "envelope_F_thermo_kcal": 7.632668408895751,
+ "frac_w_thermo_top10pct_from_topE_quintile": 0.6668566813966664
+}

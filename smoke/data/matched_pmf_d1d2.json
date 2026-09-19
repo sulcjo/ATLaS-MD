@@ -1,0 +1,22 @@
+{
+  "grid": "published 30x30",
+  "d1_min_matched": 7.20560896396637,
+  "d2_min_matched": 8.376864782969157,
+  "d1_min_published": 7.206,
+  "d2_min_published": 8.377,
+  "n_in_matched_min_bin": 4165,
+  "F_matched_at_published_min": 0.0,
+  "F_published_at_matched_min": 0.0,
+  "max_abs_dF_shared_bins": 1.2509109279672708,
+  "median_abs_dF_shared_bins": 0.020502387113026543,
+  "d1_ci95": [
+    7.20560896396637,
+    18.118953824043274
+  ],
+  "d2_ci95": [
+    8.376864782969157,
+    14.831048425038656
+  ],
+  "F_at_native_cell_published": 4.086843855283201,
+  "F_at_native_cell_matched": 3.7009094620379446
+}

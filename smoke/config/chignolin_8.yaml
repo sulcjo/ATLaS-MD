@@ -1,0 +1,307 @@
+schema_version: '2.0'
+description: >-
+  Chignolin (GYDPETGTWG) lambda-ladder campaign (chignolin_8): CV1 heavy-atom
+  contacts umbrella windows x Pep-GaMD boost rungs (gamd_lambda), essential
+  Pep-GaMD lower-dual, sigma0 = 6 kcal/mol (k0_T self-limits ~0.27 at 4 fs HMR,
+  S3 pilot 2026-09-07), gibbs-walk exchange over the full (window, rung) state
+  set, rung-aware adaptive production. Ab initio: no native/folded reference
+  anywhere. Decision record: 2026-09-08 "essential pep-gamd with self-limiting
+  k0 and 4 fs is the way this time".
+
+# ---------------------------------------------------------------------------
+# Campaign layout: ONE config, ONE script, ONE run.
+#
+#   sbatch chignolin_7.sh   ->  python -m gareus --config chignolin.yaml
+#
+# There is no separate swarm config and no separate swarm launcher. The unbiased
+# swarm is epoch 0 of this run: it grafts members from the GENPEPT library, runs
+# them concurrently, measures the frozen Pep-GaMD envelope, designs the CV1 x
+# lambda ladder and exports a per-window seed bank -- all inside this out dir,
+# under swarm/. Epochs 1..N then sample the ladder it produced.
+#
+# Restarts during epoch 0 are expected, not exceptional: 174 members x 1 ns does
+# not fit one 4 h job. Every job in the chain re-derives from disk what is left
+# to do -- members with a done.json are skipped, a half-written plan or ladder
+# cannot be read back (both are staged and renamed), and epoch 0 counts as
+# finished only when its artefacts exist AND the gate passed. A recorded gate
+# failure stops the chain instead of being retried.
+#
+# Why epoch 0 has to come first: the adaptive-production driver derives its rung
+# set from the gamd_lambda column of the initial window table
+# (gareus/adaptive_production.py WindowStateRegistry.rung_lambdas) and only ADDS
+# rungs/centres on top (add_rung / _add_centre_on_every_rung). Round-0 placement
+# -- CV1 centres bounded by a probed seed-support walk, k from curvature, rungs
+# from the measured Delta-V_max -- is gareus/swarm/ladder_design.py's job, and
+# the frozen envelope every state shares comes from the same members.
+#
+# Differences from the chignolin_6 config this file replaces:
+#   * cv2: none  -- the lambda ladder replaces the torsion-PCA/tICA second CV
+#     (the chignolin_6 PCA->tICA switch is gone with it).
+#   * gamd_boost_type pep-gamd-lower-dual, sigma0 6 (was upper-dihedral 0.8).
+#   * window_mode adaptive-production with an explicit windows_2d_csv
+#     (was double-adaptive; frontier probing and the rung ladder are mutually
+#     exclusive code paths).
+#   * contact CV on the CLI defaults (heavy atom-pairs, r0 4.5 A, beta 6 /A,
+#     min separation 4) -- the S3 pilot windows/k and the swarm ladder design
+#     are calibrated on that definition; the old residue-balanced r0 8 A scheme
+#     would change the CV scale and invalidate both.
+#   * no --us-auto-drop-bad-windows: dropping one (window, rung) state would
+#     break the windows x rungs cross product; a bad start must raise.
+#
+# Known limitations of the rung-aware driver (spec 2026-09-07-adaptive-ladder-rungs):
+#   * add_rung is only proposed from post-union diagnostics (campaign end), and
+#     min_rung_overlap 0.15 / target_rung_overlap 0.25 / max_new_rungs_per_epoch 1
+#     are fixed dataclass defaults (not wired into policy_from_args).
+#   * retire_converged is inert under a ladder: windows are never reclaimed.
+#   * lambda = 0 cross-check tolerance fixed at 0.5 kcal/mol.
+#
+# gamd_averaging_window 2500 divides gamd_cmd_steps and equil_steps (gamd-openmm
+# requires ntcmd/nteb to be integer multiples of ntave; recon stages exempt).
+# ---------------------------------------------------------------------------
+
+sequence:
+  seq: GYDPETGTWG
+
+output:
+  out: /home/sulcjo/gareus/chignolin/chignolin_8
+  traj_format: xtc
+  traj_solute_only: true
+  sample_potential_energy: true
+  traj_interval: 250             # 2026-09-17: united with distance_output_interval.
+                                 # Was 2500 (10 ps). A sample without a matching frame
+                                 # cannot have v_pep/v_dih recomputed offline, which is
+                                 # what made the lambda=0 top-up loss unrecoverable in
+                                 # chignolin_7. Cost is ~10x trajectory bytes: the whole
+                                 # chignolin_7 campaign wrote 371 MB of trajectories
+                                 # against 133 GB of checkpoints, so ~3.7 GB total.
+  report_interval: 2500
+  distance_output_interval: 250  # 1 ps CV samples for MBAR
+  checkpoint_interval: 250000   # 2026-09-16: raised 10x. Cadence is step-based, so the ~10x barostat speedup had collapsed it to 1.6 min wall (169 MB per immutable generation, ~152 GB/day). Restores ~16 min; worst-case loss on a walltime kill is 16 min of a 3h51m job.
+  parquet_flush_rows: 50000
+
+platform:
+  platform: CUDA
+  setup_platform: CUDA
+  setup_cpu_threads: 10
+  setup_precision: mixed
+  cpu_budget: 192
+  max_cpu_per_replica: 4
+
+simulation:
+  run_mode: hmr-gamd
+  # 3.5 fs, NOT 4.0. Measured 2026-09-08 on this exact frozen envelope (k0_Total 0.380,
+  # boost ceiling 60.8 kcal/mol): the 4 fs probe (job 2375854) survived setup, equilibration
+  # and 1.056 ns of production, then a replica NaN-ed -- and the replica that died was the
+  # lambda=0 one, because gibbs-walk moved a configuration relaxed under softened peptide
+  # forces straight to the unboosted state and full forces returned in one step. The 3.5 fs
+  # probe (job 2375884), identical in every other respect, ran 2 ns x 7 rungs clean at
+  # 752 ns/day and passed its lambda=0 cross-check (0.282 kcal/mol vs 0.500 tolerance).
+  # Going back to 4 fs requires lowering sigma0p until k0_Total ~0.21 (the proven 33 kcal
+  # ceiling), which throws away the extra boost.
+  timestep_fs: 3.5
+  nvt_warmup_timestep_fs: 0.5
+  npt_ramp_timestep_fs: 1.0
+  box_shape: dodecahedron
+  padding_nm: 1.0
+  water_model: tip3p
+  ionic_strength_molar: 0.15
+  temperature_k: 300.0
+  production_ensemble: npt
+  # 2026-09-14: barostat attempt interval 100 -> 200 steps. The 100-step default was
+  # inherited from OpenMM's on-GPU C++ MonteCarloBarostat, where an attempt is free.
+  # The application-controlled biased-MC barostat runs in Python: a position round
+  # trip plus ~6 GPU syncs per attempt, x64 replicas through one GIL. py-spy on job
+  # 2395063 put 99.6% of wall time in attempt_due vs 0.4% in integrator.step(), with
+  # all four L40S sampling 0% busy. The interval does not bias the sampled ensemble
+  # (detailed balance holds per move); it only slows volume relaxation. Acceptance
+  # was 22.0% over 407,360 attempts, so volume sampling stays ample at 200.
+  barostat_frequency: 200
+
+cvs:
+  cv1: contacts
+  cv2: none
+
+contact_cv:
+  # CV1 definition chosen 2026-09-08 from a scan over (min separation, r0) at fixed beta,
+  # scored on spread and occupancy entropy over the r7 seed library and re-confirmed on this
+  # project's own swarm frames: r0 = 12 A, beta = 3 /A, heavy atoms, sequence separation >= 4.
+  # Measured on 1500 swarm frames: median 0.558, IQR 0.334, entropy 0.907, span 0.065-0.905.
+  # The previous r0 4.5 / beta 6.0 definition gave median 0.008, IQR 0.017, entropy 0.037 and
+  # left only 2 resolvable windows, with every force constant clamped to the k_min floor.
+  # At this definition 25 windows are resolvable at cv1_k_max 1200, so the force constants
+  # land in the hundreds. The production config MUST keep this block identical to the swarm's:
+  # the ladder windows are defined on this coordinate.
+  contact_scheme: atom-pairs
+  contact_atom_selection: heavy
+  contact_min_sequence_separation: 4
+  contact_r0_a: 12.0
+  contact_beta_a_inv: 3.0
+  contact_normalize: true
+  cv1_k_max: 1200.0
+windows:
+  window_mode: adaptive-production
+  # No windows_2d_csv on purpose. With no ladder handed in, the state space does
+  # not exist at startup: epoch 0 (the unbiased swarm) designs it, and the run
+  # picks it up from swarm/analysis/windows_lambda_ladder.csv inside this out dir.
+  # Supplying windows_2d_csv again would skip epoch 0 and use that table instead.
+  # 64 = 16 CV1 centres x 4 lambda rungs. MUST be >= the ladder CSV row count or states
+  # get capped. Was 64, written before the CV change raised the window count from 2 to 16.
+  max_replicas: 128
+
+gamd:
+  gamd_boost_type: pep-gamd-lower-dual
+  sigma0p: 6.0
+  sigma0d: 6.0
+  gamd_averaging_window: 2500
+  # No shared_gamd_setup_dir on purpose. The frozen envelope (Vmax/Vmin/Vavg/
+  # sigma_V of V_pep and V_dih) is measured by epoch 0 and written inside this
+  # out dir; only k0 scales with lambda and production never re-derives it.
+  # 2 ns cMD + 2 ns boosted equilibration per state (S3 pilot attempt 8: 100 ps
+  # cMD let V_pep cross Vmin -> FSF < 0 -> NaN at boost onset).
+  gamd_cmd_steps: 500000
+  equil_steps: 500000
+  # chignolin_8: the multiwindow recon goes to ns scale and stage 2 is switched
+  # back on.  In chignolin_7 these were 2000/5000/10000 with boosted_iters 0, so
+  # the envelope was pooled from 17.5 ps of cMD per window and the boosted
+  # self-consistency stage never ran at all -- the frozen boost was the UNBOOSTED
+  # one, which is exactly what stage 2 exists to prevent.  Measured consequence:
+  # mean boost 2.08 kcal/mol = 3.5 kT, sigma_dV 1.30 against a sigma0 of 6.0 that
+  # never became active, and ~1-25 folding events in 5.35 us of walker time
+  # (Satoh 2006 needed 159 from 180 ns of multicanonical MD).
+  #
+  # Re-enabling stage 2 is safe now BECAUSE of the length change.  The NaN that
+  # caused boosted_iters: 0 is the same failure documented above for the main
+  # stages -- too-short cMD lets V_pep cross Vmin, FSF goes negative, NaN at
+  # boost onset.  The main stages were moved to ~1.75 ns for that reason while
+  # the recon stayed at 17.5/35 ps, i.e. inside the regime the S3 pilot proved
+  # NaN-prone.  285000 x 3.5 fs = 997.5 ps puts the recon in the same safe regime.
+  # recon_report_interval is left at its default, which derives 200 diagnostic
+  # points per window per iteration at this length (chignolin_7 got 50).
+  gamd_multiwindow_recon_prep_steps: 100000    # was 2000   -> 350 ps discard
+  gamd_multiwindow_recon_cmd_steps: 285000     # was 5000   -> ~1 ns, stage 1 (boost OFF)
+  gamd_multiwindow_recon_steps: 285000         # was 10000  -> ~1 ns per stage-2 iteration
+  gamd_recon_boosted_iters: 4                  # was 0      -> stage 2 actually runs
+  gamd_recon_boosted_tol: 0.05
+  # Cost: (0.35 + 1.0) + 4 x (0.35 + 1.0) = 6.75 ns per window; 16 windows ~108 ns,
+  # 64 states ~431 ns, against md_budget_ns 6000.  Watch the sigmaV_trace in
+  # shared_gamd_setup_globals.json: if it does not settle within 4 iterations, or
+  # if the final mean boost is still ~2 kcal/mol, the envelope is not the limiter
+  # and the ladder/boost design needs revisiting before spending the pool.
+  # Fallback segment length only (pool-driven scheduling below): 5e6 steps = 20 ns.
+  production_steps: 5000000
+
+exchange:
+  exchange_mode: gibbs-walk   # full conditional over ALL (window, rung) states; never truncate the neighbour graph
+  exchange_interval: 400
+
+starting_structures:
+  # The GENPEPT library, NOT a seed bank. This key carries two meanings across one
+  # run: epoch 0 grafts its members from this library (it needs
+  # final_survivor_seeds.csv here), and once epoch 0 has exported its own
+  # per-window seed bank the run switches umbrella seeding over to that export
+  # automatically. A contact-CV pull from the built extended chain is impossible
+  # (S3 pilot), so every state still starts from a seed on its own centre.
+  seed_conformers_dir: /home/sulcjo/gareus/chignolin/chignolin_genpept_rep5_t7
+  seed_selection_mode: active-cv
+  seed_max_reuse_per_conformer: 0
+  us_seed_preflight_max_score: 1.2
+  us_pull_ramp_stages: 10
+  # 150000 steps x 3.0 fs = 450 ps per window was inherited from the pre-graft config and
+  # cost ~46 s of the measured ~70 s per seed. Both 2026-09-08 probes seeded EVERY window
+  # from a GENPEPT conformer (7/7 and 21/21, zero NPT-pull fallbacks) and landed within a
+  # few hundredths of centre, so the long pull buys nothing. 10000 x 3.0 fs = 30 ps is a
+  # short settle after the graft; the NPT-pull fallback path (no conformer) would need the
+  # old budget back.
+  us_pull_steps_per_window: 10000
+  us_pull_timestep_fs: 3.0
+  us_pull_k: 300.0
+
+swarm:
+  # Epoch 0. Formerly a separate config + launcher (chignolin_7_swarm.yaml/.sh)
+  # sharded over four SLURM jobs; it is now the first epoch of this run and its
+  # members run concurrently in-process instead of being split across jobs.
+  # Restartable at any instant: finished members are skipped on resume, and the
+  # epoch is only considered done once its artefacts exist and the gate passes.
+  swarm_seed_ns: 1.0
+  swarm_replicates_per_cell: 6
+  swarm_bins: "4,3,3"          # CV1 x Rg x end-to-end strata; seed DIVERSITY only, never a bias
+  swarm_equil_ps: 100.0
+  swarm_graft_minimize_iters: 500   # 100 left 18/99 members NaN within 3 s (2026-09-08); 500 -> 3/99
+  swarm_n_windows: 16               # CV1 centres; x 4 lambda rungs = 64 states
+  # Rung count (was an unpinned 7). design_lambda_ladder grows lambda from 0 with
+  # step = swarm_target_beta_sigma / (beta * sigma_lambda), forces a top rung at
+  # 1.0, then bisects the widest gap until min_rungs is met; min == max pins the
+  # count exactly. Pinning ALONE would leave a lopsided ladder (dense bottom, one
+  # forced leap to 1.0), so the spacing target is raised to match: the chignolin_7
+  # epoch_000 ladder was 7 rungs at the 1.0 default, and simulating that measured
+  # spacing puts 4 rungs at ~2.5 (natural ladder ~[0, 0.23, 0.62, 1.0]).
+  # Why 4 and not 7: in chignolin_7 epoch_000, ADJACENT-rung exchange acceptance
+  # never fell below 0.63 and reached 0.904 for 0.838<->1.000 -- far above the
+  # ~0.2-0.4 optimum, i.e. rungs were being paid for that bought almost no
+  # decorrelation. Measured skip-pair acceptances for this 4-rung spacing:
+  # 0.608 (0<->0.211), 0.540 (0.211<->0.560), 0.706 (0.560<->1.000).
+  swarm_min_rungs: 4
+  swarm_max_rungs: 4
+  swarm_target_beta_sigma: 2.5
+  # "auto" = one concurrent member per --device-index token (4 here). 174 members
+  # x 1 ns at ~118 ns/day per member is roughly 9 h at 4-wide, so the epoch spans
+  # 2-3 chained 4 h jobs and resumes cleanly. Raise this to go wider per GPU;
+  # concurrency at this width has NOT yet been measured on a real GPU.
+  swarm_member_workers: auto
+  # Raised from the 1.0 default 2026-09-08: the measured odd/even Vmin split was
+  # 1.248 sigma. Justification (kept from the retired swarm config): the flagged
+  # channel is Total, whose FSF floor is 0.620; the zero-margin Dihedral channel
+  # passed; and a 3.5 fs probe on this exact frozen envelope passed its lambda=0
+  # cross-check at 0.282 kcal/mol. More sampling does not fix it (1.408 -> 1.248)
+  # and shifts k0, invalidating the probe. Accepted residual: ~17% uncertainty in
+  # boost magnitude. Set back to 1.0 to restore the strict gate.
+  #
+  # 2026-09-13: raised 1.5 -> 2.0. Epoch 0 of chignolin_7 measured 1.915 sigma
+  # (odd Vmin -3567.7, even -3883.9 kJ/mol) and blocked jobs 2389161 / 2389586
+  # with Epoch0GateFailure. 2.0 is the value already validated by a hand run of
+  # `--swarm-stage analyze --swarm-stability-extrema-sigma-tol 2.0`; the CLI flag
+  # does not persist, so it has to live here (the submit script passes only
+  # --config). Confirm what actually ran via chignolin_7/effective_config.yaml.
+  #
+  # CAUTION, two open risks:
+  #  1. Vmin is an EXTREME-VALUE statistic, not a mean. An odd/even split compares
+  #     two draws of a minimum, and more sampling tends to find a DEEPER min. The
+  #     flagged value has ratcheted 1.408 -> 1.248 -> 1.915, so 2.0 may not hold
+  #     next epoch. If it breaches again, the fix is a different stability test,
+  #     not another tolerance bump.
+  #  2. This silences only the BLOCKING gate. The advisory ladder_ess warning
+  #     (rung 3 ESS 6.9 < floor 50, "rungs 3 onward cannot be trusted") is the
+  #     same undersampling showing up elsewhere and is NOT addressed by this edit.
+  swarm_stability_extrema_sigma_tol: 2.0
+
+adaptive_production:
+  # Aggregate MD pool across all states and epochs. S3 pilot: 825 ns/day
+  # aggregate for 5 states on one L40S; 4 L40S with ~15-30 states -> roughly
+  # 2.5-3 us/day, so 6 us is about 2-3 days of 4 h chained jobs.
+  md_budget_ns: 6000.0
+  ap_epochs: 3
+  target_overlap: 0.30
+  ap_final_pool_fraction: 0.5
+  ap_min_final_pool_ns: 2000.0
+  ap_min_samples: 20000
+  # Sampling cadence is distance_output_interval 250 steps x 3.5 fs = 0.875 ps per sample.
+  # Budget arithmetic: epoch 0 charges the pool too (174 members x 1 ns = ~174 ns,
+  # billed once as event "epoch_000_swarm" however many restarts it takes), leaving
+  # ~5826 ns. ap_final_pool_fraction 0.5 -> ~2913 ns for the final round / 64
+  # states = ~45.5 ns per state = ~52000 samples. At the previous 112 states this
+  # was ~26 ns = ~29700 samples and the 50000 floor (43.75 ns per state) was NOT
+  # reachable; cutting 7 rungs to 4 brings it back inside the budget, so 50000 is
+  # now a legitimate choice. Left at 30000 deliberately -- raise it only once the
+  # ladder CSV row count is confirmed, since the driver fights the pool if the
+  # floor cannot be met.
+  ap_min_samples_per_window: 30000
+  ap_max_new_windows: 4
+  ap_resume: true
+  ap_write_reports: true
+  ap_write_mbar_inputs: true
+  ap_run_mbar: true
+  ap_seed_bank: true
+  ap_seed_bank_max: 5
+
+tui:
+  tui_mode: auto

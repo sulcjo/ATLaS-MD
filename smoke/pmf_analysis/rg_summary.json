@@ -1,0 +1,95 @@
+{
+  "available": true,
+  "convergence": {
+    "basin_tracking": {
+      "basins": [
+        {
+          "basin_id": 0,
+          "center_cv_A": 6.594365058495252,
+          "left_cv_A": 5.052111104040872,
+          "min_F_kcal": 0.0,
+          "prominence_kcal": 2.703672784418184,
+          "right_cv_A": 10.642781688938001
+        }
+      ],
+      "enabled": true,
+      "files": {
+        "rg_basin_definitions_csv": "/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/rg_convergence/rg_basin_definitions.csv",
+        "rg_basin_map_png": "/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/rg_convergence/rg_basin_map.png",
+        "rg_basin_populations_csv": "/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/rg_convergence/rg_basin_populations.csv",
+        "rg_basin_populations_png": "/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/rg_convergence/rg_basin_populations.png"
+      },
+      "min_depth_kcal": 0.3,
+      "n_basins": 1
+    },
+    "enabled": true,
+    "files": {
+      "convergence_dir": "/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/rg_convergence",
+      "rg_basin_definitions_csv": "/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/rg_convergence/rg_basin_definitions.csv",
+      "rg_basin_map_png": "/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/rg_convergence/rg_basin_map.png",
+      "rg_basin_populations_csv": "/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/rg_convergence/rg_basin_populations.csv",
+      "rg_basin_populations_png": "/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/rg_convergence/rg_basin_populations.png",
+      "rg_convergence_plot_index": "/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/rg_convergence/plot_index.txt",
+      "rg_pmf_convergence_csv": "/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/rg_convergence/rg_pmf_convergence.csv",
+      "rg_pmf_convergence_report_md": "/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/rg_convergence/rg_pmf_convergence_report.md",
+      "rg_pmf_summary_csv": "/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/rg_convergence/rg_pmf_summary.csv"
+    },
+    "mbar_backend": "sambar",
+    "mbar_cache_hits": 0,
+    "mbar_cache_misses": 10,
+    "mbar_tolerance": 1e-06,
+    "metric": "rg",
+    "n_timepoints_analyzed": 10,
+    "n_timepoints_requested": 10,
+    "output_dir": "/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/rg_convergence",
+    "sambar_warmstart_epochs": 10,
+    "summary": {
+      "converged_bool": 1,
+      "first_frac_JS_lt_threshold": 0.2922245043645973,
+      "first_frac_RMSE_lt_threshold": 0.6873364058762383,
+      "first_frac_delta_JS_lt_threshold": 0.5278094355454808,
+      "first_frac_delta_RMSE_lt_threshold": 0.948620486680777,
+      "js_threshold": 0.01,
+      "last_eval_JS": 1.1733022422726066e-07,
+      "last_eval_RMSE_F_kcal_mol": 0.0010964115361296292,
+      "last_eval_delta_JS": 2.2594551505250875e-05,
+      "last_eval_delta_RMSE_F_kcal_mol": 0.01126477262633339,
+      "metric": "rg",
+      "n_checkpoints": 10,
+      "rmse_threshold_kcal_mol": 0.1,
+      "tail_median_JS": 0.00010548591395050612,
+      "tail_median_RMSE_F_kcal_mol": 0.030747549443816226,
+      "tail_median_delta_JS": 2.9601292820794406e-05,
+      "tail_median_delta_RMSE_F_kcal_mol": 0.02262575962231904,
+      "variant": "current"
+    },
+    "warnings": [
+      "Only one basin identified in final Radius of gyration PMF; population is trivially 1."
+    ]
+  },
+  "files": {
+    "convergence_dir": "/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/rg_convergence",
+    "rg_basin_definitions_csv": "/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/rg_convergence/rg_basin_definitions.csv",
+    "rg_basin_map_png": "/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/rg_convergence/rg_basin_map.png",
+    "rg_basin_populations_csv": "/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/rg_convergence/rg_basin_populations.csv",
+    "rg_basin_populations_png": "/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/rg_convergence/rg_basin_populations.png",
+    "rg_convergence_plot_index": "/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/rg_convergence/plot_index.txt",
+    "rg_pmf_all_methods_csv": "/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/rg_pmf_all_methods.csv",
+    "rg_pmf_convergence_csv": "/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/rg_convergence/rg_pmf_convergence.csv",
+    "rg_pmf_convergence_report_md": "/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/rg_convergence/rg_pmf_convergence_report.md",
+    "rg_pmf_plot_png": "/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/rg_pmf_all_methods.png",
+    "rg_pmf_summary_csv": "/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/rg_convergence/rg_pmf_summary.csv",
+    "rg_pmf_unbiased_csv": "/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/rg_pmf_unbiased.csv",
+    "rg_samples_with_weights_csv": "/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/rg_samples_with_weights.csv",
+    "rg_vs_cv_sampled_png": "/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/rg_vs_cv_sampled.png"
+  },
+  "mean_A": 6.984169025783588,
+  "n_samples": 5110208,
+  "pmf_minimum_rg_A": 6.594365058495252,
+  "pmf_span_kcal_mol": 4.545280829471716,
+  "rg_max_sample_A": 10.739172561091399,
+  "rg_min_sample_A": 4.955720231887473,
+  "selected_unbiased_method": "umbrella_only",
+  "source": "trajectory_reconstruction",
+  "std_A": 1.0282662026005993
+}

@@ -1,0 +1,15 @@
+d1/d2 FES on the PUBLISHED 30x30 grid
+  published (forward-filled, nominal 5,110,208 rows): d1=7.206  d2=8.377
+  matched rows (509,153 frames)          : d1=7.206  d2=8.377   (n=4165)
+
+  F(matched) at the PUBLISHED minimum bin: 0.000 kcal/mol  (n=4165)
+  F(published) at the MATCHED minimum bin: 0.000 kcal/mol  (n=41708)
+  over 406 well-populated shared bins: max |dF| = 1.251, median |dF| = 0.021 kcal/mol
+
+  at the NATIVE cell (d1~3.57, d2~6.73): F_published=4.09  F_matched=3.70 kcal/mol  (n_matched=12)
+
+  block bootstrap over 64 replicas, 300 resamples:
+    d1 95% CI [7.21, 18.12] A   native 2.84-4.22 -> OUTSIDE
+    d2 95% CI [8.38, 14.83] A   native 6.17-7.56 -> OUTSIDE
+
+wrote matched_pmf_d1d2.json

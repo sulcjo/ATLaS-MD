@@ -1,0 +1,174 @@
+{
+ "bootstrap": {
+  "c_bb_s4_r010_b3": {
+   "entropy": 0.978715515076252,
+   "ci95": [
+    0.9736126769607067,
+    0.9856349076585571
+   ],
+   "nw_k1200": 26,
+   "nw_ci95": [
+    26.0,
+    27.0
+   ]
+  },
+  "c_ca_s4_r010_b3": {
+   "entropy": 0.9759105486420168,
+   "ci95": [
+    0.9701360591929898,
+    0.9809324151038841
+   ],
+   "nw_k1200": 27,
+   "nw_ci95": [
+    26.0,
+    28.0
+   ]
+  },
+  "c_heavy_s4_r012_b3": {
+   "entropy": 0.9569877774537032,
+   "ci95": [
+    0.949057840731177,
+    0.9648090225766404
+   ],
+   "nw_k1200": 24,
+   "nw_ci95": [
+    24.0,
+    24.0
+   ]
+  },
+  "cresb_heavy_s4_r012_b3": {
+   "entropy": 0.9555992287465056,
+   "ci95": [
+    0.9471504910433504,
+    0.9606371435528852
+   ],
+   "nw_k1200": 24,
+   "nw_ci95": [
+    23.0,
+    24.0
+   ]
+  },
+  "torpca_pc1": {
+   "entropy": 0.9275509800631684,
+   "ci95": [
+    0.9202622478586995,
+    0.9373993437900604
+   ],
+   "nw_k1200": 140,
+   "nw_ci95": [
+    135.0,
+    146.025
+   ]
+  },
+  "restorpca_pc1": {
+   "entropy": 0.914928321892609,
+   "ci95": [
+    0.9084278665901835,
+    0.9384003226634482
+   ],
+   "nw_k1200": 129,
+   "nw_ci95": [
+    126.975,
+    133.0
+   ]
+  },
+  "trace_own_pc1_C1": {
+   "median": 0.38844990038125704,
+   "ci95": [
+    0.26850994062786354,
+    0.5515364878701312
+   ]
+  }
+ },
+ "geodesic": {
+  "len": 9,
+  "frac_edges_ok": 0.5,
+  "frac_line_ok": 0.8571428571428571,
+  "line_max_dist": 3.153220962792398,
+  "median_edge": 3.034113883972168,
+  "median_knn": 2.8720505237579346
+ },
+ "provenance": {
+  "initial": {
+   "n": 1014,
+   "cv1_mean": 0.42926953004212054,
+   "cv1_std": 0.23522448515270755,
+   "cv2_mean": -0.024401081367111964,
+   "cv2_std": 1.0326877754315134,
+   "frac_cv2_gt1": 0.1755424063116371,
+   "frac_cv2_lt-1": 0.1932938856015779
+  },
+  "BH": {
+   "n": 3,
+   "cv1_mean": 0.6762035489082336,
+   "cv1_std": 0.07502731501107622,
+   "cv2_mean": 0.2409672331066647,
+   "cv2_std": 1.0674415873821754,
+   "frac_cv2_gt1": 0.3333333333333333,
+   "frac_cv2_lt-1": 0.0
+  },
+  "NMA": {
+   "n": 793,
+   "cv1_mean": 0.47783105090979255,
+   "cv1_std": 0.22354828412840957,
+   "cv2_mean": 0.012786381775551019,
+   "cv2_std": 1.0694882363121507,
+   "frac_cv2_gt1": 0.2055485498108449,
+   "frac_cv2_lt-1": 0.19293820933165196
+  },
+  "PCA-frontier": {
+   "n": 160,
+   "cv1_mean": 0.7335049121407792,
+   "cv1_std": 0.19194925911826302,
+   "cv2_mean": 0.0867512128682471,
+   "cv2_std": 0.912881321366874,
+   "frac_cv2_gt1": 0.15625,
+   "frac_cv2_lt-1": 0.14375
+  }
+ },
+ "cis_omega": {
+  "omega D3-P4": 0.003045685279187817,
+  "omega P4-E5": 0.0
+ },
+ "tiling_k16": [
+  "survivor_1185_basin_1205_candidate_2472_gencluster_450_conf_157167_implicit_min",
+  "survivor_1633_basin_1660_nma_bh_candidate_2577_gencluster_598_conf_071976_implicit_min_hop_002_mode01_m0.75A_implicit_min",
+  "survivor_1871_basin_1900_candidate_2808_gencluster_900_conf_137777_implicit_min",
+  "survivor_1902_basin_1932_candidate_1354_gencluster_1354_conf_125315_implicit_min",
+  "survivor_1291_basin_1312_candidate_769_gencluster_769_conf_173034_implicit_min",
+  "survivor_1465_basin_1491_explore_r02_hit_0050_conf_029702_implicit_min",
+  "survivor_895_basin_910_candidate_2285_gencluster_206_conf_194679_implicit_min",
+  "survivor_1249_basin_1270_candidate_1105_gencluster_1105_conf_116483_implicit_min",
+  "survivor_177_basin_181_candidate_1027_gencluster_1027_conf_119043_implicit_min",
+  "survivor_1551_basin_1577_candidate_812_gencluster_812_conf_036050_implicit_min",
+  "survivor_122_basin_125_candidate_399_gencluster_399_conf_040161_implicit_min",
+  "survivor_1856_basin_1885_nma_bh_candidate_1920_gencluster_1920_conf_068917_implicit_min_hop_001_mode02_p1.35A_implicit_min",
+  "survivor_335_basin_341_nma_bh_candidate_2739_gencluster_819_conf_086560_implicit_min_hop_002_mode01_m1.35A_implicit_min",
+  "survivor_943_basin_958_candidate_903_gencluster_903_conf_000096_implicit_min",
+  "survivor_033_basin_034_nma_bh_candidate_2478_gencluster_456_conf_103120_implicit_min_hop_003_mode01_p1.35A_implicit_min",
+  "survivor_1707_basin_1735_nma_bh_candidate_2364_gencluster_303_conf_151536_implicit_min_hop_001_mode01_p0.75A_implicit_min"
+ ],
+ "contact_bias_audit": {
+  "candidates_mean_cc": 7.97,
+  "survivors_mean_cc": 7.64,
+  "reconstructed_unbiased_mean_cc": 4.79,
+  "frac_cc_ge": {
+   "5": [
+    0.679,
+    0.417
+   ],
+   "10": [
+    0.371,
+    0.133
+   ],
+   "15": [
+    0.128,
+    0.026
+   ],
+   "20": [
+    0.02,
+    0.002
+   ]
+  }
+ }
+}

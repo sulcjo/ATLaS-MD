@@ -1,0 +1,12 @@
+<stdin>:35: RuntimeWarning: invalid value encountered in scalar divide
+split by FILE: 736 vs 736 files -> 318,518 vs 293,018 frames
+
+fit A -> test B   (test frames 293,018)
+   RMSD<=1.5   held-out PC1 AUROC 0.9639   CV1 AUROC 0.8373   (positives 984)
+   Q>=0.70     held-out PC1 AUROC nan   CV1 AUROC nan   (positives 0)
+
+fit B -> test A   (test frames 318,518)
+   RMSD<=1.5   held-out PC1 AUROC 0.9799   CV1 AUROC 0.8636   (positives 3,945)
+   Q>=0.70     held-out PC1 AUROC 0.9966   CV1 AUROC 0.9225   (positives 173)
+
+In-sample reference (all frames): PC1 0.9777 / CV1 0.8591 at RMSD<=1.5

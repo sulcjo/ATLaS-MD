@@ -1,0 +1,80 @@
+labels: folded 4,929 | unfolded 229,064 | intermediate excluded 377,543
+
+rank   AUROC  dir  CV (all ab initio -- no native input)          note
+   1  1.0000    +  cartesian CA PC1                               
+   2  0.9971    +  CV1 nonlocal contacts (current CV1)            
+   3  0.9925    -  Rg (heavy)                                     
+   4  0.9301    +  nonlocal backbone H-bond count                 
+   5  0.9109    -  torsion plain PC1                              EVR 0.176
+   6  0.8664    -  torsion RESIDUAL-vs-CV1 PC2                    EVR 0.085
+   7  0.7836    +  torsion plain PC3                              EVR 0.074
+   8  0.6883    -  torsion plain PC5                              EVR 0.058
+   9  0.6557    -  beta-basin fraction                            
+  10  0.6481    -  torsion plain PC6                              EVR 0.047
+  11  0.6443    -  torsion plain PC2                              EVR 0.083
+  12  0.6011    +  torsion RESIDUAL-vs-CV1 PC6                    EVR 0.049
+  13  0.5922    -  cartesian CA PC2                               
+  14  0.5695    +  alpha-basin fraction                           
+  15  0.5664    -  torsion RESIDUAL-vs-CV1 PC5                    EVR 0.061
+  16  0.5638    +  torsion RESIDUAL-vs-CV1 PC4                    EVR 0.074
+  17  0.5580    +  torsion RESIDUAL-vs-CV1 PC1                    EVR 0.111
+  18  0.5160    -  torsion RESIDUAL-vs-CV1 PC3                    EVR 0.080
+  19  0.5064    -  torsion plain PC4                              EVR 0.067
+
+NOT ab initio, shown only as the ceiling:
+      0.9955       Q vs 1UAO native contact map
+
+Unsupervised default (largest-variance component, chosen without labels):
+   torsion plain PC1                  AUROC 0.9109
+   torsion RESIDUAL-vs-CV1 PC1        AUROC 0.5580
+   cartesian CA PC1                   AUROC 1.0000
+Supervised best overall: cartesian CA PC1 AUROC 1.0000
+WHY AUROC hit 1.0000 -- the two classes simply do not overlap on PC1:
+  folded   PC1 range +4.57 .. +13.20
+  unfolded PC1 range -15.07 .. +4.95
+  gap between classes: -0.39
+  PC1 is a linear function of superposed CA coords; the LABEL is an RMSD in
+  that same space, and the intermediate band (377,543 frames) was excluded.
+  So 1.0000 measures metric overlap, not folding insight.
+
+ AUROC folded-vs-REST  folded-vs-unfolded  CV
+(operating condition)         (saturates)
+               0.9777              1.0000  cartesian CA PC1 [circular w/ label]
+               0.8591              0.9971  CV1 nonlocal contacts
+               0.8384              0.9925  Rg (heavy)
+               0.7891              0.8664  torsion RESIDUAL-vs-CV1 PC2
+               0.7617              0.9301  nonlocal backbone H-bond count
+               0.7071              0.7836  torsion plain PC3
+               0.6784              0.9109  torsion plain PC1
+               0.5132              0.6557  beta-basin fraction
+               0.5119              0.5580  torsion RESIDUAL-vs-CV1 PC1
+
+                                           [ceiling, NOT ab initio]
+               0.9564                      Q vs 1UAO
+
+KEY: corr(CV1, folded label) is what the residualization removes.
+  point-biserial corr(CV1, folded) = +0.1109
+  corr(residual PC1, CV1)          = +0.0000
+Does the 2nd dimension add discriminating power on top of CV1?
+  CV1 alone                      AUROC 0.8591
+  residual PC2 alone             AUROC 0.7891   (corr with CV1 +0.0000)
+  CV1 + residual PC2 (LDA)       AUROC 0.9230
+  CV1 + residual PC1 (LDA)       AUROC 0.8607
+  CV1 + Rg (redundant pair, LDA) AUROC 0.8766
+  CV1 + nHB (LDA)                AUROC 0.8618
+
+Purity at fixed CV1 -- the degeneracy that motivated all this:
+  native CV1 window: 58,670 frames, 3.65% folded
+  + top quartile of residual PC2  : 14,668 frames, 0.00% folded
+  + top quartile of nHB           : 26,665 frames, 2.46% folded
+native CV1 window: 58,670 frames, 3.65% folded  <- the degeneracy
+
+conditioning                                           frames  % folded  enrich
+  residual torsion PC2: LOW quartile                   14,668    11.00%   3.02x
+  residual torsion PC2: HIGH quartile                  14,668     0.00%   0.00x
+  nonlocal backbone H-bond count: LOW quartile         21,667     3.62%   0.99x
+  nonlocal backbone H-bond count: HIGH quartile        26,665     2.46%   0.67x
+
+  CV1 window AND residual PC2 below q10              5,867     4.96%   1.36x
+  CV1 window AND residual PC2 below q25             14,668    11.00%   3.02x
+  CV1 window AND residual PC2 below q50             29,335     7.17%   1.97x

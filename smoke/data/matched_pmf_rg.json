@@ -1,0 +1,13 @@
+{
+  "rg_min_full_A": 6.571666666666667,
+  "rg_min_matched_A": 6.571666666666667,
+  "rg_min_published_A": 6.594,
+  "rg_min_matched_ci95": [
+    5.981666666666667,
+    6.965000000000001
+  ],
+  "max_abs_dF_kcal": 0.3001500960467016,
+  "n_matched": 511888,
+  "n_full": 5110208,
+  "bootstrap_n": 400
+}

@@ -1,0 +1,14 @@
+{
+  "n_scored": 429,
+  "rank_of_most_native_by_freeenergy": 424,
+  "most_native_pct": 44.36758893280632,
+  "ranks_of_native_basins": [
+    388,
+    408,
+    422,
+    424,
+    427
+  ],
+  "rank_by_geometric_score": 215,
+  "n_geometric": 429
+}

@@ -1,0 +1,64 @@
+{
+  "available": true,
+  "c_fold": 0.8172854304313659,
+  "c_unfold": 0.1357714205980301,
+  "files": {
+    "poincare_fold_crossings_csv": "/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/poincare_fold_crossings.csv",
+    "poincare_map_png": "/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/poincare_map.png",
+    "poincare_unfold_crossings_csv": "/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/poincare_unfold_crossings.csv"
+  },
+  "fold_peaks": [
+    {
+      "cv2": 0.8286012566851494,
+      "density": 22.3435301188573,
+      "nearest_basin": "left-\u03b1"
+    },
+    {
+      "cv2": 0.8425596160951414,
+      "density": 19.188791521105816,
+      "nearest_basin": "left-\u03b1"
+    },
+    {
+      "cv2": 0.8698418640328529,
+      "density": 6.20087634706959,
+      "nearest_basin": "left-\u03b1"
+    },
+    {
+      "cv2": 0.891096638588977,
+      "density": 3.081039489554156,
+      "nearest_basin": "left-\u03b1"
+    }
+  ],
+  "fold_recurrence_median_ns": 0.04479999999999999,
+  "fold_routes_summary": "2 routes: 'left-\u03b1' (CV2\u2248+0.83) and 'left-\u03b1' (CV2\u2248+0.84)",
+  "min_dwell_frames": 50,
+  "min_dwell_ps": 9.999999999999998,
+  "n_fold_crossings": 235,
+  "n_fold_return_pairs": 206,
+  "n_unfold_crossings": 55,
+  "n_unfold_return_pairs": 43,
+  "unfold_peaks": [
+    {
+      "cv2": 0.1222934526933315,
+      "density": 55.488854255264165,
+      "nearest_basin": "right-\u03b1"
+    },
+    {
+      "cv2": 0.13357094419741988,
+      "density": 37.69772484698661,
+      "nearest_basin": "right-\u03b1"
+    },
+    {
+      "cv2": 0.1297166116580479,
+      "density": 31.582367145433313,
+      "nearest_basin": "right-\u03b1"
+    },
+    {
+      "cv2": 0.11258624481639468,
+      "density": 23.520404073768848,
+      "nearest_basin": "right-\u03b1"
+    }
+  ],
+  "unfold_recurrence_median_ns": 0.06979999999999999,
+  "unfold_routes_summary": "1 route: 'right-\u03b1' (CV2\u2248+0.12)"
+}

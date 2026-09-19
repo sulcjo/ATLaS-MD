@@ -1,0 +1,9 @@
+{
+  "q_max": 0.931664764881134,
+  "n_q_ge_0.8": 33,
+  "n_q_ge_0.7": 173,
+  "n_strict_conjunction": 33,
+  "n_mid_conjunction": 173,
+  "q_median_compact": 0.17409732937812805,
+  "q_p99_compact": 0.4996393620967865
+}

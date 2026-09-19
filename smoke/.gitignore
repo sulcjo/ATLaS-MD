@@ -1,0 +1,10 @@
+# The repository root .gitignore excludes *.md, *.txt and *.pdb globally, and
+# several data directories entirely. smoke/ is a self-contained handoff package,
+# so those global exclusions are lifted here and nowhere else.
+#
+# Checked against the root file on 2026-09-19: the global patterns are
+# *.swp *.swo *.kate-swp *.pdb *.md *.txt *.tar.gz. Only the last four could
+# ever match content in this folder.
+!*.md
+!*.txt
+!*.pdb
