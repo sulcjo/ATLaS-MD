@@ -1,0 +1,21 @@
+{
+  "cartesian CA PC1": 0.9999999955715235,
+  "CV1 nonlocal contacts (current CV1)": 0.9971222138780277,
+  "Rg (heavy)": 0.9925216184229498,
+  "nonlocal backbone H-bond count": 0.9300884277482047,
+  "torsion plain PC1": 0.9108918084074974,
+  "torsion RESIDUAL-vs-CV1 PC2": 0.8663855264293356,
+  "torsion plain PC3": 0.7835518288732942,
+  "torsion plain PC5": 0.6883239149557637,
+  "beta-basin fraction": 0.6556645215268138,
+  "torsion plain PC6": 0.6481333746520821,
+  "torsion plain PC2": 0.644317315696745,
+  "torsion RESIDUAL-vs-CV1 PC6": 0.6011275338741786,
+  "cartesian CA PC2": 0.5921824647889884,
+  "alpha-basin fraction": 0.569531101463362,
+  "torsion RESIDUAL-vs-CV1 PC5": 0.5663782573508441,
+  "torsion RESIDUAL-vs-CV1 PC4": 0.5638077579001063,
+  "torsion RESIDUAL-vs-CV1 PC1": 0.5579917971790066,
+  "torsion RESIDUAL-vs-CV1 PC3": 0.5159616048464453,
+  "torsion plain PC4": 0.5064016152262274
+}

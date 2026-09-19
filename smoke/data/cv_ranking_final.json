@@ -1,0 +1,38 @@
+{
+  "cartesian CA PC1 [circular w/ label]": {
+    "folded_vs_rest": 0.9777103826056575,
+    "folded_vs_unfolded": 0.9999999955715235
+  },
+  "CV1 nonlocal contacts": {
+    "folded_vs_rest": 0.8590569673128476,
+    "folded_vs_unfolded": 0.9971222138780277
+  },
+  "Rg (heavy)": {
+    "folded_vs_rest": 0.8384087027496782,
+    "folded_vs_unfolded": 0.9925216184229498
+  },
+  "torsion RESIDUAL-vs-CV1 PC2": {
+    "folded_vs_rest": 0.7891265889128101,
+    "folded_vs_unfolded": 0.8663855264293356
+  },
+  "nonlocal backbone H-bond count": {
+    "folded_vs_rest": 0.7616717484018747,
+    "folded_vs_unfolded": 0.9300884277482047
+  },
+  "torsion plain PC3": {
+    "folded_vs_rest": 0.7070887155866005,
+    "folded_vs_unfolded": 0.7835518288732942
+  },
+  "torsion plain PC1": {
+    "folded_vs_rest": 0.6783826293687336,
+    "folded_vs_unfolded": 0.9108918084074974
+  },
+  "beta-basin fraction": {
+    "folded_vs_rest": 0.5132222967694492,
+    "folded_vs_unfolded": 0.6556645215268138
+  },
+  "torsion RESIDUAL-vs-CV1 PC1": {
+    "folded_vs_rest": 0.5119413671119714,
+    "folded_vs_unfolded": 0.5579917971790066
+  }
+}

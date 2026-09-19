@@ -1,0 +1,11 @@
+{
+  "n_trials": 30,
+  "decoy_contacts_median": 48,
+  "decoy_spread_median_A": 1.2550110220909119,
+  "decoy_P_q80": 0.03462939836126079,
+  "decoy_P_q80_sd": 0.02754975442291748,
+  "decoy_P_q70": 0.06011469509400156,
+  "native_P_q80_on_test": 0.0,
+  "native_P_q70_on_test": 0.0012973533990659055,
+  "note": "supersedes q_decoy_null.json, whose decoy sets were untightened (15-pair maps)"
+}

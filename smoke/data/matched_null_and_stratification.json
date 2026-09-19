@@ -1,0 +1,21 @@
+{
+  "matched_null_p_within_1.0_over_18_refs": 0.2547,
+  "sd": 0.047,
+  "matched_null_p_within_1.5_over_18_refs": 0.5131,
+  "n_trials": 40,
+  "observed_p_within_1.0_of_1UAO": 0.0007865,
+  "observed_p_within_1.5": 0.00806,
+  "native_basin_sparser_factor": "SUPERSEDED - see matched_null_corrected.json (61x on a matched test set)",
+  "note": "one-reference null (null_model_decorrelated.json) was NOT matched to the min-over-18 criterion and is superseded by this",
+  "segment_pct_native_in_cv1_window": {
+    "min": 0.0,
+    "max": 32.67,
+    "n_segments": 13,
+    "median_rmsd_range_A": [
+      1.7,
+      2.71
+    ]
+  },
+  "n_replicas_native_in_window": 24,
+  "n_segments_native_in_window": 9
+}

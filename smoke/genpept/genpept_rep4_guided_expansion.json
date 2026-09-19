@@ -1,0 +1,20 @@
+{
+ "control": {
+  "n": 30,
+  "rmsd_start_mean": 1.5744255304336547,
+  "rmsd_end_mean": 1.9819565057754516,
+  "rmsd_end_min": 1.2426273822784424,
+  "nreg_start_mean": 2.033333333333333,
+  "nreg_end_mean": 2.033333333333333,
+  "n_in_envelope": 4
+ },
+ "rewarded": {
+  "n": 30,
+  "rmsd_start_mean": 1.5744255304336547,
+  "rmsd_end_mean": 1.980828845500946,
+  "rmsd_end_min": 1.2426273822784424,
+  "nreg_start_mean": 2.033333333333333,
+  "nreg_end_mean": 2.033333333333333,
+  "n_in_envelope": 4
+ }
+}

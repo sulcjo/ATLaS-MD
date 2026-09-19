@@ -1,0 +1,4 @@
+# The repo root .gitignore excludes *.md and *.pdb globally, and RUNS/ entirely.
+# smoke/ is a self-contained handoff package, so those exclusions are lifted here.
+!*.md
+!*.pdb
