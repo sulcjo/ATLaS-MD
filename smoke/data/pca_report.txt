@@ -1,0 +1,52 @@
+frames 611,536 | PC1 -15.07..13.20 | PC2 -9.23..8.43
+1UAO (18 models): PC1 +10.365 +/- 0.710 [+8.83,+11.50]   PC2 -0.163 +/- 0.363 [-0.70,+0.68]
+
+densest sampled cell (unweighted): PC1 +9.20, PC2 +5.34  (1,300 frames)
+  NOTE: this is a SAMPLING density over a biased (umbrella + GaMD) ensemble.
+        It is NOT a free-energy surface and no minimum is claimed from it.
+
+native PCA box PC1 [+8.12,+12.21] PC2 [-1.06,+1.04]: 17,018 frames (2.783e-02 of the archive)
+
+DEGENERACY TEST ON PC1 (the analogue of the CV1 table)
+         PC1 bin    frames  rmsd min   median     max   %<1.5A  medianQ
+  [-15.0,-10.0)     9,475      4.74     5.53    6.45     0.00    0.000
+  [-10.0, -5.0)   116,235      3.42     4.89    6.22     0.00    0.000
+  [ -5.0, +0.0)   203,835      2.28     4.00    5.68     0.00    0.005
+  [ +0.0, +5.0)   152,420      1.29     3.01    4.64     0.00    0.103
+  [ +5.0, +8.0)    53,270      1.10     2.59    3.95     0.21    0.089
+  [ +8.0, +9.5)    34,069      0.89     2.35    3.35     1.06    0.079
+  [ +9.5,+11.0)    32,394      0.84     2.20    3.04     5.55    0.091
+  [+11.0,+14.0)     9,837      0.43     1.76    2.83    26.98    0.279
+
+HEAD-TO-HEAD: purity of the native window, PC1 vs CV1 vs the 2D PCA box
+  CV1 in native window [0.82,0.93)               58,670 frames    3.65% native  RMSD 0.43-4.27 A  medianQ 0.174
+  PC1 in native window (1D)                      73,894 frames    6.07% native  RMSD 0.43-3.35 A  medianQ 0.098
+  PC1 AND PC2 in the native box (2D)             17,018 frames   10.44% native  RMSD 0.43-3.35 A  medianQ 0.164
+  native PCA box AND native CV1 window            5,741 frames   10.45% native  RMSD 0.43-3.35 A  medianQ 0.258
+
+RMSD <= 1.0 A (481 frames): PC1 +11.88 +/- 0.54 [+9.02,+12.87]   PC2 -0.68 +/- 0.59 [-2.89,+1.84]
+   fraction inside the 1UAO PCA box: 60.5%
+
+Q >= 0.80 (33 frames): PC1 +12.02 +/- 0.19 [+11.66,+12.39]   PC2 -0.42 +/- 0.30 [-1.06,+0.26]
+   fraction inside the 1UAO PCA box: 84.8%
+
+RANKING POWER for 'is this frame native' (RMSD <= 1.5 A, 4,929 positives)
+coordinate                      AUROC
+  CV1 contact fraction           0.8591
+  PC1 (new, all frames)          0.9777
+  -|PC2|                         0.7132
+  -Rg                            0.8384
+  -dist to native in PC plane    0.9679
+  Q (native-referenced)          0.9564
+  (0.5 = no discrimination; Q is reference-based and shown as the ceiling)
+
+AUROC UNDER FOUR DEFINITIONS OF 'NATIVE'  (0.5 = no discrimination)
+coordinate                      RMSD <= 1.5 A (geometr  RMSD <= 1.0 A (geometr  Q >= 0.70 (contact-bas  Q >= 0.80 (contact-bas
+CV1 contact fraction                            0.8591                  0.9021                  0.9257                  0.9241
+PC1 (all frames)                                0.9777                  0.9951                  0.9980                  0.9977
+-Rg                                             0.8384                  0.9048                  0.9388                  0.9381
+-dist to 1UAO in PC plane                       0.9679                  0.9693                  0.9686                  0.9702
+positives                                        4,929                     481                     173                      33
+
+PC1 beats CV1 on every definition, including the contact-based ones that
+CV1 is built from -- so the advantage is not an artifact of scoring against RMSD.

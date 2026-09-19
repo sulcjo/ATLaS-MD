@@ -1,0 +1,30 @@
+77 heavy atoms, 1657 candidate pairs (|i-j| >= 3)
+test population: 7,708 compact frames from 496 files
+distance matrix (7708, 1657)
+
+decoy contact-map size: median 15 pairs (1UAO: 65)
+reference set                        P(Q>=0.80)   P(Q>=0.70)
+18 compact decoys from the run           0.4326       0.5286   (sd 0.0627, 25 trials)
+18 native NMR models (1UAO)              0.0000       0.0009
+
+No test frame reaches Q>=0.80 against 1UAO, while decoys are matched at 0.4326.
+
+61x RMSD ratio: it rests on ~2.0 native events in 496 test frames.
+  Poisson 95% CI on the event count: [0.24, 7.20]
+  -> ratio 95% CI approx [17x, 516x]  (point estimate 61x)
+cluster candidate pool: 496 frames (one per file)
+test population: 7,708 compact frames
+
+30 matched decoy sets
+  decoy contact-map size: median 48 pairs   (1UAO: 65)
+  decoy set internal spread: median max-RMSD 1.26 A   (1UAO: 1.37 A max)
+
+reference set                          P(Q>=0.80)   P(Q>=0.70)
+18 tight compact decoys from the run      0.03463      0.06011  (sd 0.02755)
+18 native NMR models (1UAO)               0.00000      0.00130
+
+On this compact test population no frame reaches Q>=0.80 against 1UAO (0/7708),
+while a matched decoy set is reached 3.46% of the time.
+Reading: Q is NOT hard to satisfy for an arbitrary tight reference either, so Q alone
+does not make 1UAO special -- what is special is that the 33 archive-wide Q>=0.80 frames
+ALSO satisfy backbone RMSD <= 1.0 A and the Tyr2/Trp9 cluster against that same reference.

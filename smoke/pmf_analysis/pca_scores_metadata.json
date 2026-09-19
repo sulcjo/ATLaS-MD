@@ -1,0 +1,20 @@
+{
+  "available": true,
+  "chunk_size": 1000,
+  "explained_variance_ratio_pc1": 0.3518370728491831,
+  "explained_variance_ratio_pc2": 0.12270042142080632,
+  "files": {
+    "pca_scores_npz": "/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/pca_scores.npz"
+  },
+  "fit_stride": 2,
+  "max_fit_frames": 100000,
+  "n_atoms": 10,
+  "n_fit_frames": 52048,
+  "n_projected_samples": 103664,
+  "reference_dcd": "/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/_merged_replica_trajectories/replica_000.xtc",
+  "selection": "protein and name CA",
+  "source": "trajectory_reconstruction",
+  "superpose_frames": 1024544,
+  "superpose_unconverged_frames": 0,
+  "topology": "/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/epoch_000/solute_only.pdb"
+}

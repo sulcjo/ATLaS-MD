@@ -1,0 +1,7 @@
+/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/rg_convergence/rg_js_rmse_vs_timepoints.png
+/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/rg_convergence/rg_delta_js_rmse_vs_timepoints.png
+/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/rg_convergence/rg_barrier_error_vs_timepoints.png
+/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/rg_convergence/rg_coverage_saturation_vs_timepoints.png
+/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/rg_convergence/rg_convergence_scorecard.png
+/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/rg_convergence/rg_milestone_timeline.png
+/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_7/adaptive_production/pmf_analysis/rg_convergence/rg_pmf_convergence_overlay.png

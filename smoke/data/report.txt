@@ -1,0 +1,259 @@
+frames = 611,536   failed files = 0   files = 1472
+
+NATIVE (1UAO, 18 NMR models) vs ENSEMBLE, on identical definitions
+metric         native mean+/-sd     native range   ens min   ens max  ens mean
+cv1              0.863+/-0.033     0.82-0.93        0.021     0.986     0.497
+rg               5.487+/-0.165     5.14-5.66        4.956    10.739     6.993
+d1               3.569+/-0.411     2.84-4.22        2.630    20.860    12.225
+d2               6.731+/-0.375     6.17-7.56        2.667    17.564    10.631
+yw               5.465+/-0.287     5.10-5.98        3.258    31.711    15.953
+q                0.897+/-0.042     0.81-0.96        0.000     0.932     0.070
+pca1            10.285+/-0.704     8.75-11.44     -14.889    13.315     0.106
+pca2            -1.162+/-0.409    -1.91--0.23      -9.609     8.251    -0.214
+
+BACKBONE RMSD (res 2-9, 32 atoms) TO NATIVE
+  min over 18 NMR models   min  0.435  p0.01  0.534  p1  1.564  median  3.666  max  6.449
+  vs model 1               min  0.540  p0.01  0.779  p1  1.875  median  3.953  max  6.942
+  CA res1-10 vs model 1    min  0.973  p0.01  1.284  p1  2.422  median  4.928  max  8.649
+  NMR-ensemble internal spread: mean 0.772, max 1.374 A  <- the resolution floor for 'native'
+
+HOW MANY FRAMES ARE NATIVE?  (thresholds fixed before counting)
+criterion                                               frames    fraction
+bb RMSD <= 1.0 A (inside NMR ensemble spread)              481   7.865e-04
+bb RMSD <= 1.5 A (strict native)                         4,929   8.060e-03
+bb RMSD <= 2.0 A (native-like)                          32,376   5.294e-02
+bb RMSD <= 2.5 A (loose)                               104,098   1.702e-01
+bb RMSD <= 3.0 A (very loose)                          200,842   3.284e-01
+Q >= 0.80 (native contact fraction)                         33   5.396e-05
+Q >= 0.70                                                  173   2.829e-04
+Q >= 0.60                                                  402   6.574e-04
+Tyr2/Trp9 cluster <= 6.0 A (native 5.5+/-0.3)           12,724   2.081e-02
+RMSD<=2.0 AND Q>=0.6 AND cluster<=7 A                      397   6.492e-04
+RMSD<=2.5 AND Q>=0.5                                       777   1.271e-03
+
+PRIOR CANDIDATE FILTER (d1<4.0 & d2<6.0 A) vs the native structure itself
+  frames passing: 350 (5.723e-04)
+  native d2 over 18 models: 6.17-7.56 A -> native itself FAILS d2<6.0
+  their bb RMSD to native: min 0.46, median 0.68 A; Q median 0.593
+
+NATIVE-WINDOW FILTER (each metric inside the NMR-model range, +/- 1 sd slack)
+  cv1   in [  0.79,  0.96]     85,350 frames  cumulative    85,350
+  rg    in [  4.98,  5.82]     98,516 frames  cumulative    80,191
+  d1    in [  2.42,  4.63]      2,460 frames  cumulative     1,642
+  d2    in [  5.79,  7.94]     82,724 frames  cumulative     1,152
+  yw    in [  4.81,  6.27]     13,460 frames  cumulative       304
+  surviving frames bb RMSD: min 0.44 median 1.08 A, Q median 0.456
+
+TOP 15 FRAMES BY BACKBONE RMSD TO NATIVE
+rank   rmsd      Q    cv1     rg     d1     d2   Y2W9    pca1    pca2  source
+   1   0.43  0.752  0.844   5.56   3.03   6.62   4.81   11.91   -2.17  replica_003_resume_from_30000000000.xtc:1010
+   2   0.44  0.717  0.828   5.63   3.24   6.56   4.92   11.79   -1.74  replica_003_resume_from_30000000000.xtc:1309
+   3   0.44  0.724  0.832   5.55   2.92   6.32   4.68   12.21   -1.97  replica_003_resume_from_30000000000.xtc:1011
+   4   0.44  0.693  0.847   5.53   3.12   6.49   4.57   11.74   -1.76  replica_003_resume_from_30000000000.xtc:1198
+   5   0.44  0.750  0.843   5.56   3.23   6.98   5.29   12.00   -1.79  replica_003_resume_from_30000000000.xtc:1149
+   6   0.45  0.830  0.829   5.52   2.87   6.65   4.58   12.15   -2.14  replica_003_resume_from_30000000000.xtc:1046
+   7   0.46  0.777  0.860   5.51   2.73   5.88   5.07   11.78   -1.71  replica_003_resume_from_30000000000.xtc:1132
+   8   0.47  0.666  0.813   5.71   3.04   6.58   5.81   11.98   -1.80  replica_003_resume_from_30000000000.xtc:1015
+   9   0.48  0.661  0.827   5.59   2.78   6.60   5.33   12.06   -2.01  replica_003_resume_from_30000000000.xtc:1216
+  10   0.48  0.710  0.843   5.51   3.07   5.96   4.64   12.26   -1.93  replica_003_resume_from_30003309750.xtc:1
+  11   0.48  0.835  0.836   5.53   3.01   6.51   4.80   11.62   -1.62  replica_003_resume_from_30000000000.xtc:1268
+  12   0.48  0.702  0.815   5.58   2.97   6.40   5.53   12.30   -2.06  replica_003_resume_from_30000000000.xtc:1052
+  13   0.48  0.932  0.845   5.53   2.96   6.19   4.93   11.75   -1.41  replica_003_resume_from_30000000000.xtc:1305
+  14   0.49  0.702  0.827   5.56   2.95   6.44   5.20   12.05   -2.00  replica_003_resume_from_30000000000.xtc:1105
+  15   0.49  0.699  0.837   5.57   3.01   6.36   4.56   11.55   -2.06  replica_003_resume_from_30000000000.xtc:1263
+
+WHERE THE PMF MINIMA SIT vs NATIVE (published production values)
+  cv1   PMF min    0.487   native    0.82-0.93     OUTSIDE  (-11.5 native sd)
+  rg    PMF min    6.594   native    5.14-5.66     OUTSIDE  (+6.7 native sd)
+  d1    PMF min    7.206   native    2.84-4.22     OUTSIDE  (+8.8 native sd)
+  d2    PMF min    8.377   native    6.17-7.56     OUTSIDE  (+4.4 native sd)
+  pca1  PMF min    1.439   native    8.75-11.44    OUTSIDE  (-12.6 native sd)
+  pca2  PMF min   -5.289   native   -1.91--0.23    OUTSIDE  (-10.1 native sd)
+
+=== bb RMSD <= 1.0 A : 481 frames ===
+  distinct replicas 5/64, distinct trajectory files 7/1472, distinct run segments 4
+  replicas: {3: 414, 30: 61, 11: 3, 13: 2, 15: 1}
+  segments: {'epoch_001/topup_002_3378000': 415, 'epoch_001/topup_003_4839000': 61, 'final/topup_003_12558000': 3, 'epoch_002/topup_003_4812000': 2}
+Traceback (most recent call last):
+  File [35m"/home/sulcjo/.claude/jobs/b27cb9c3/tmp/where.py"[0m, line [35m27[0m, in [35m<module>[0m
+    reps = collections.Counter(replica(files[i]) for i in sf[m])
+  File [35m"/usr/lib/python3.14/collections/__init__.py"[0m, line [35m614[0m, in [35m__init__[0m
+    [31mself.update[0m[1;31m(iterable, **kwds)[0m
+    [31m~~~~~~~~~~~[0m[1;31m^^^^^^^^^^^^^^^^^^[0m
+  File [35m"/usr/lib/python3.14/collections/__init__.py"[0m, line [35m709[0m, in [35mupdate[0m
+    [31m_count_elements[0m[1;31m(self, iterable)[0m
+    [31m~~~~~~~~~~~~~~~[0m[1;31m^^^^^^^^^^^^^^^^[0m
+  File [35m"/home/sulcjo/.claude/jobs/b27cb9c3/tmp/where.py"[0m, line [35m27[0m, in [35m<genexpr>[0m
+    reps = collections.Counter([31mreplica[0m[1;31m(files[i])[0m for i in sf[m])
+                               [31m~~~~~~~[0m[1;31m^^^^^^^^^^[0m
+  File [35m"/home/sulcjo/.claude/jobs/b27cb9c3/tmp/where.py"[0m, line [35m14[0m, in [35mreplica[0m
+    return int([1;31mre.search(r"replica_(\d+)_", path.split("/")[-1]).group[0m(1))
+               [1;31m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+[1;35mAttributeError[0m: [35m'NoneType' object has no attribute 'group'[0m
+
+=== bb RMSD <= 1.0 A : 481 frames ===
+  distinct replicas 5/64, distinct trajectory files 7/1472, distinct run segments 4
+  replicas: {3: 414, 30: 61, 11: 3, 13: 2, 15: 1}
+  segments: {'epoch_001/topup_002_3378000': 415, 'epoch_001/topup_003_4839000': 61, 'final/topup_003_12558000': 3, 'epoch_002/topup_003_4812000': 2}
+
+=== bb RMSD <= 1.5 A : 4,929 frames ===
+  distinct replicas 33/64, distinct trajectory files 67/1472, distinct run segments 11
+  replicas: {14: 1251, 3: 919, 30: 770, 31: 632, 15: 459, 11: 201, 13: 112, 10: 103}
+  segments: {'epoch_001/topup_002_3378000': 1611, 'epoch_001/topup_003_4839000': 1551, 'final/topup_001_6907000': 1226, 'adaptive_production/epoch_000': 170, 'epoch_002/topup_003_4812000': 118, 'epoch_002/baseline': 109}
+
+=== bb RMSD <= 2.0 A : 32,376 frames ===
+  distinct replicas 63/64, distinct trajectory files 354/1472, distinct run segments 13
+  replicas: {14: 3376, 8: 2789, 11: 2663, 5: 2024, 31: 1681, 30: 1322, 10: 1311, 0: 1166}
+  segments: {'epoch_001/topup_003_4839000': 5438, 'adaptive_production/epoch_000': 4969, 'epoch_001/topup_002_3378000': 4912, 'final/topup_002_8742000': 3947, 'final/topup_001_6907000': 3431, 'final/baseline': 2339}
+
+=== independent visits below 1.5 A (frames every 2500 steps = 5 ps) ===
+  529 visits, length frames: median 2, max 551, total 4929
+  visits in >1 file: 67 distinct files
+      551 frames (  2755 ps)  replica_003_resume_from_30000000000.xtc  frames 765-1322  best rmsd 0.43  best Q 0.932
+      195 frames (   975 ps)  replica_014_resume_from_100004021600.xtc  frames 176-377  best rmsd 1.08  best Q 0.517
+      188 frames (   940 ps)  replica_014_resume_from_100004021600.xtc  frames 749-955  best rmsd 1.15  best Q 0.489
+      148 frames (   740 ps)  replica_014_resume_from_100004021600.xtc  frames 380-539  best rmsd 1.19  best Q 0.518
+      134 frames (   670 ps)  replica_031_resume_from_40003412000.xtc  frames 0-133  best rmsd 1.03  best Q 0.324
+
+=== CV1 DEGENERACY: what does the biasing coordinate actually resolve? ===
+       CV1 bin    frames  rmsd min      p5  median     p95     max   %<1.5A
+  [0.00,0.20)    81,979      2.72    4.01    5.02    5.71    6.45     0.00
+  [0.20,0.40)   151,705      1.98    3.17    4.22    5.22    6.10     0.00
+  [0.40,0.60)   148,703      0.87    2.41    3.69    4.65    5.56     0.06
+  [0.60,0.75)   113,198      0.65    1.79    2.68    3.98    4.93     1.22
+  [0.75,0.82)    56,208      0.47    1.70    2.61    3.76    4.55     2.34
+  [0.82,0.93)    58,670      0.43    1.61    2.56    3.70    4.27     3.65
+  [0.93,1.00)     1,073      1.25    1.89    2.44    3.09    3.85     1.03
+
+In the native CV1 window [0.82,0.93]: 58,670 frames, backbone RMSD spans 0.43-4.27 A; only 3.65% are native.
+A single CV1 value is compatible with both the native fold and structures 4.3 A away -- the coordinate is degenerate, not blind.
+
+In the native Rg window [5.14,5.66] A: 61,521 frames, RMSD 0.43-4.53 A, 3.16% native
+null ensemble: 400 compact frames, CV1 in the native window [0.82,0.93]
+
+BACKBONE RMSD (res 2-9), compact frames only
+  compact-vs-compact (unrelated pairs, n=159,600):  min 0.21  p0.1 0.35  p1 0.58  median 2.89  max 4.62
+  same frames vs 1UAO (n=400):                   min 0.56  p1 1.13  median 2.58
+  P(unrelated compact pair within 1.0 A) = 3.283e-02
+  P(unrelated compact pair within 1.5 A) = 6.925e-02
+
+  Expected frames within 1.0 A of an ARBITRARY compact reference: 20,078
+  Observed frames within 1.0 A of 1UAO:                          481
+  enrichment over the compact null: 0.0x
+
+MIN-OVER-18 INFLATION: counts against each single NMR model
+  <= 1.0 A : min-over-18 481   vs model 1 only 293   inflation 1.64x
+  <= 1.5 A : min-over-18 4,929   vs model 1 only 1,096   inflation 4.50x
+  <= 2.0 A : min-over-18 32,376   vs model 1 only 9,810   inflation 3.30x
+decorrelated null: 400 compact frames, one per distinct trajectory file (496 files contain compact frames)
+
+  compact-vs-compact, different files (n=159,600): min 0.26  p1 0.73  median 2.92  max 4.62
+  P(within 1.0 A of an arbitrary compact reference) = 2.098e-02
+  P(within 1.5 A)                                   = 5.398e-02
+
+  frames within 1.0 A of 1UAO, expected from this null: 12,828
+  observed                                            : 481
+  ratio observed/null: 0.04
+
+  Reading: the native basin is NOT enriched relative to a typical compact basin in
+  this ensemble -- it is one of many, and by this measure a comparatively sparse one.
+  That is consistent with the report's claim (fold present, not thermodynamically
+  favoured) and inconsistent with any claim that the fold is the dominant compact state.
+(A) matched null: test set 496 compact frames, one per file
+    null P(min-over-18 <= 1.0 A) = 2.547e-01  (sd 4.7e-02, range 1.485e-01-3.473e-01, 40 trials)
+    null P(min-over-18 <= 1.5 A) = 5.131e-01  (sd 5.4e-02)
+    observed vs 1UAO: P(<=1.0) = 7.865e-04   P(<=1.5) = 8.060e-03
+    matched ratio observed/null: 0.003 at 1.0 A, 0.016 at 1.5 A
+    -> the native basin is 323.8x SPARSER than an 18-reference compact null
+
+(B) is the CV degenerate, or is the run under-converged at high CV1?
+  within the native CV1 window [0.82,0.93]: 58,670 frames
+
+  run segment                              frames   %<1.5A  rmsd p5  median     p95
+  epoch_000                                 6,073     0.48     1.66    2.23    3.20
+  epoch_001/baseline                        3,321     0.00     2.23    2.63    3.70
+  epoch_001/topup_001_2648000               1,965     0.00     2.37    2.71    3.75
+  epoch_001/topup_002_3378000               2,507    32.67     0.59    1.70    2.72
+  epoch_001/topup_003_4839000               6,396     4.86     1.51    2.65    3.71
+  epoch_002/baseline                        2,951     1.36     1.68    2.36    3.14
+  epoch_002/topup_001_2685000               1,779     0.00     2.18    2.54    3.64
+  epoch_002/topup_002_3394000               1,938     0.00     1.93    2.38    3.15
+  epoch_002/topup_003_4812000               5,604     0.05     2.11    2.65    3.10
+  final/baseline                            7,239     0.04     1.96    2.65    3.62
+  final/topup_001_6907000                   4,416    19.95     1.32    2.40    3.81
+  final/topup_002_8742000                   5,717     0.02     1.84    2.52    3.14
+  final/topup_003_12558000                  8,764     0.60     1.95    2.71    3.81
+
+  median RMSD inside the native CV1 window across 13 independent run segments: 1.70-2.71 A (spread 1.02 A)
+  native-like frames inside that window occur in 24 distinct replicas and 9 segments
+
+  Reading: every segment that samples the native CV1 window shows BOTH native and
+  non-native topologies, with a stable median. Coexistence is reproduced across
+  segments and replicas rather than drifting -> degeneracy, not a one-off excursion.
+Traceback (most recent call last):
+  File [35m"/home/sulcjo/.claude/jobs/b27cb9c3/tmp/null3.py"[0m, line [35m95[0m, in [35m<module>[0m
+    [31mjson.dump[0m[1;31m({"matched_null_p10": float(h10.mean()), "matched_null_p10_sd": float(h10.std()),[0m
+    [31m~~~~~~~~~[0m[1;31m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+               [1;31m"matched_null_p15": float(h15.mean()), "observed_p10": float(obs10),[0m
+               [1;31m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+    ...<4 lines>...
+               [1;31m"n_replicas_native_in_window": nrep, "n_segments_native_in_window": nseg},[0m
+               [1;31m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+              [1;31mopen(f"{OUT}/matched_null_and_stratification.json", "w"), indent=2)[0m
+              [1;31m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+  File [35m"/usr/lib/python3.14/json/__init__.py"[0m, line [35m181[0m, in [35mdump[0m
+    for chunk in [1;31miterable[0m:
+                 [1;31m^^^^^^^^[0m
+  File [35m"/usr/lib/python3.14/json/encoder.py"[0m, line [35m444[0m, in [35m_iterencode[0m
+    yield from _iterencode_dict(o, _current_indent_level)
+  File [35m"/usr/lib/python3.14/json/encoder.py"[0m, line [35m413[0m, in [35m_iterencode_dict[0m
+    yield from chunks
+  File [35m"/usr/lib/python3.14/json/encoder.py"[0m, line [35m326[0m, in [35m_iterencode_list[0m
+    yield from chunks
+  File [35m"/usr/lib/python3.14/json/encoder.py"[0m, line [35m413[0m, in [35m_iterencode_dict[0m
+    yield from chunks
+  File [35m"/usr/lib/python3.14/json/encoder.py"[0m, line [35m451[0m, in [35m_iterencode[0m
+    newobj = _default(o)
+  File [35m"/usr/lib/python3.14/json/encoder.py"[0m, line [35m182[0m, in [35mdefault[0m
+    raise TypeError(f'Object of type {o.__class__.__name__} '
+                    f'is not JSON serializable')
+[1;35mTypeError[0m: [35mObject of type float32 is not JSON serializable[0m
+when serializing dict item 'median_rmsd'
+when serializing list item 0
+when serializing dict item 'segments'
+NATIVE CONTACT FRACTION Q (vs 1UAO's own 65 native contacts)
+population                                         n  median Q     p99     max
+all frames                                   611,536     0.042   0.326   0.932
+compact frames, CV1 in [0.82,0.93]            58,670     0.174   0.500   0.932
+frames with bb RMSD <= 1.5 A                   4,929     0.294   0.779   0.932
+frames with bb RMSD <= 1.0 A                     481     0.660   0.857   0.932
+
+Q is what separates the native fold from merely-compact structures:
+  Q >= 0.50:     778 frames overall (1.27e-03);    587 of the 58,670 compact frames (1.00e-02)
+  Q >= 0.60:     402 frames overall (6.57e-04);    351 of the 58,670 compact frames (5.98e-03)
+  Q >= 0.70:     173 frames overall (2.83e-04);    162 of the 58,670 compact frames (2.76e-03)
+  Q >= 0.80:      33 frames overall (5.40e-05);     31 of the 58,670 compact frames (5.28e-04)
+  Q >= 0.85:       7 frames overall (1.14e-05);      7 of the 58,670 compact frames (1.19e-04)
+
+The conjunction that cannot be met by chance:
+  RMSD <= 1.0 A AND Q >= 0.80 AND Tyr2/Trp9 <= 6.0 A : 33 frames
+  RMSD <= 1.5 A AND Q >= 0.70 AND Tyr2/Trp9 <= 7.0 A : 173 frames
+  best such frame: RMSD 0.45 A, Q 0.830, Tyr2/Trp9 4.58 A, CV1 0.829
+
+  A structure that is compact by accident reproduces neither 1UAO's specific contact
+  map (Q) nor its hydrophobic cluster. The conjunction is the evidence; the RMSD count
+  alone is not, because the matched null gives it a 25% baseline.
+test set: 496 compact frames, one per trajectory file (CV1 in the native window)
+
+BOTH rates on the same test set, same min-over-18 structure:
+reference set                        P(<=1.0 A)   P(<=1.5 A)
+18 compact decoys from this run          0.2469       0.5202   (sd 0.047, 40 trials, ~478 frames each)
+18 native NMR models (1UAO)              0.0040       0.0222
+
+matched ratio decoy/native: 61.2x at 1.0 A, 23.5x at 1.5 A
+  -> among COMPACT structures, an arbitrary 18-decoy set is matched this many times
+     more often than the true native set. The native basin is that much sparser.
+
+  (whole-archive P(<=1.0 A of 1UAO) = 7.865e-04; this is conditioned on a
+   different population and must not be divided by the compact-conditioned null.)
+  compact-conditioned observed rate = 6.119e-03 (359 of 58,670)

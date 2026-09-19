@@ -1,0 +1,8 @@
+aggregate walker time: 611,536 frames x 8.75 ps = 5.351 us
+GaMD boost: mean 2.08, sd 1.30, max 13.01 kcal/mol
+  mean boost = 3.5 kT  -> best-case rate speedup exp(<dV>/kT) ~ 33x
+  (a true speedup is smaller: only boost AT THE BARRIER counts)
+
+folding events measured: 1 (Satoh CA def) to 25 (loose); Satoh got 159 in 180 ns of McMD
+events per us of walker time: 4.7 (loose) ... 0.7 (strict)
+to reach Satoh's 159 at the loose rate would need ~34 us of the same sampling
