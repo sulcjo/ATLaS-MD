@@ -87,3 +87,6 @@ nav:
       - Equilibrium CV selection — adversarial review: developer/equilibrium-cv-selection-adversarial-review.md
       - Equilibrium CV selection — task log: developer/equilibrium-cv-task-log.md
       - Equilibrium CV selection — T00 board judgment: developer/reviews/t00-board-judgment.md
+      - Auto (CV1, CV2) pair — specification: developer/equilibrium-cv-auto-pair-spec.md
+      - Auto (CV1, CV2) pair — implementation plan v0.2: developer/plans/2026-09-20-auto-cv-pair.md
+      - Auto (CV1, CV2) pair — small-board judgment: developer/reviews/auto-cv-pair-plan-small-board.md

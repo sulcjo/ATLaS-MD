@@ -328,3 +328,68 @@ Tests 114 -> 131. Fixture `decision.json` re-hashed (schema gained two fields).
 T01 (state wiring) and T03 (residual models) are unblocked and independent.
 Both must import their types from `gareus.cv_selection.contracts` rather than
 re-declaring them.
+
+## Auto (CV1, CV2) pair — plan v0.2 executed (2026-09-20, branch `cv-select/auto-cv2`)
+
+Spec: `equilibrium-cv-auto-pair-spec.md`. Plan: `plans/2026-09-20-auto-cv-pair.md`
+(v0.2, after the verification round recorded at its foot). Fixed-primary design:
+CV1 is the configured contact anchor, CV2 is selected; auto-CV1 is refused by the
+parser on purpose (nothing forces Rg, and the swarm umbrella is contacts by
+construction).
+
+### One entry per task
+
+| Task | Commit | What it delivers | Tests |
+|---|---|---|---|
+| 1 members record torsion features | `2e37502` | `run_member` writes `torsion_features.npy` (atomic `.tmp.npy` rename) + `torsion_index.json`; row *i* of the features is trace row *i*; crashed members write neither | `test_swarm_members.py` (+4) |
+| 2 residual components | `6519df3` | `models.py`: `fit_residual_components` — weighted OLS with intercept of every `sin/cos` torsion feature on `a` (degree 1 or clamped degree 2), SVD of the residuals, **individual** right-singular directions (not count mixtures); `evaluate_component`, `coupling_curvature_kcal = k2 (v·B1)²/(σ_j²σ_c²)`; `anchor_clamp` field added to `CandidateComponent` | `test_cv_selection_models.py` |
+| 3 anchor deployability | `73d975e` | `anchor.py`: `score_anchor` — `n_resolvable` from the existing `n_resolvable_windows`, unit-invariant `dynamic_range = range/σ`, `DEPLOYABLE_ANCHOR_KINDS = {"nonlocal-contact-fraction"}` | `test_cv_selection_anchor.py` |
+| 4 independence | `5ed0a92` | `independence.py`: shuffled grouped folds by seed family, held-out nonlinear R² (pooled + per fold), frame-level farthest-point partition on torsion+shape features **excluding the anchor**, `incremental_cell_information` with `gain = L1 − L12` on capacity-matched joint bins | `test_cv_selection_independence.py` |
+| 5 selection + PairModel | `b47aa0f` | `select_pair.py::select_cv_pair` — deterministic: deployable anchor → fit → per-component R² gate on mean + 2·SE, coupling ≤ `max_coupling_fraction·k1`, gain ≥ `min_gain_nats`, half-split winner agreement → `PairModel` with a numeric certificate (`cov_q_weighted ≤ 1e-8`, R² both ways, coupling, gains, design measure, n) and status `pair` / `cv1_only` / `no_deployable_anchor`; refuses non-`broad` GENPEPT presets | `test_cv_selection_select_pair.py` |
+| 6 runtime force + evaluator + reprojection | `a4b7215` | `production._add_residual_torsion_cv_force`: `CustomCVForce` over grouped trig sums and a private contact `CustomBondForce`, z2 expression with `K0/K1/K2`, clamp for degree 2, `0.5*ss_k*(z2-ss0)^2` with `ss_k` in **kJ** (no 4.184 in the expression); `cv.residual_cv2_from_positions_nm`; `mbar_analysis.cv2_reprojection` gains the residual regime. `PairModelRuntime.load/check_topology/check_anchor` bind the three artifacts to each other and to the run | `test_cv_selection_forces.py` (incl. `test_reconstructed_bias_equals_the_bias_the_context_actually_applied`), `test_cv_selection_reprojection.py` |
+| 7 2-D ladder | `ad25207` | `ladder_design.design_2d_layout` (joint grid under `max_replicas`, else sparse axes + bridge + diagonal patches; `max_replicas=0` refused), `reweighted_cv2_centers` on the λ=0 ∪ top-rung reweighted interval with per-rung ESS, `cv2_force_constants_per_gap`, `write_ladder_windows_2d_csv`; `windows.load_explicit_2d_window_csv` accepts an empty centre only with `k2 == 0` | `test_swarm_ladder_design.py` (+7) |
+| 8 swarm wiring + pair gate | `ecb3e02` | `analyze_swarm_stage` under `cv2: auto`: pooled dataset from every ok member (ok member without features = hard error, crashed member skipped), selection, artifacts `cv_pair_model.json`/`cv_candidate_set.json`/`cv_feature_schema.json`/`cv_selection_report.json`, 2-D CSV or 1-D fallback, sidecar with `cvs`, the three paths and `tica_switch_cv2: false`; `gates.pair_gate`: `pair` → ok, `cv1_only` → ok only under `fallback=cv1_only`, `no_deployable_anchor` → always fail; CV1-width shrink from the CV2 umbrella's coupling curvature warned above 10 % | `test_swarm_analyze.py` (+8), `tests/conftest.py` synthetic swarm |
+| 9 CLI/config | `1762b28` | `--cv2 auto|residual-torsion-pc|residual-pc`, `--secondary-cv-{model,candidate-set,feature-schema}`, `--cv-selection-*`, `--swarm-n-windows-cv2`; `_validate_cv_selection_args`: `auto` never reaches a manual run, residual mode in a manual run needs all three paths, `tica_switch_cv2` forced off; YAML `cv_selection:` block | `test_cv_selection_cli.py` |
+| 10 provenance + resume | `921e583` | `run_manifest.method_settings.cv_pair_model_sha256`; `reconcile_resume_secondary_cv_metadata(..., current_pair_sha256=)` refuses a changed model, records a first digest, leaves legacy runs untouched | `test_cv_selection_resume.py` |
+| 11 dry run + example | this commit | `test_cv_selection_e2e_dry.py` (swarm → sidecar → `parse_args` → `PairModelRuntime.load` + `check_topology`), `examples/chignolin_auto_cv2.yaml`, this log, mkdocs nav | — |
+
+### Thermodynamic statement of what was built
+
+The swarm's unbiased frames define a weighted joint density over the contact
+anchor `a` and the torsion features. CV2 is the residual direction of that
+density after conditioning out `a` to first (or clamped second) order, so its
+weighted covariance with `a` is identically zero and its held-out nonlinear
+dependence on `a` is bounded. Production restrains `(a, z2)` with harmonic
+umbrellas whose bias is an exact function of the two recorded coordinates, so
+MBAR reconstructs `u_nk` exactly from `(a, z2, V_pep, V_dih)` — no CV redefinition
+can occur after freezing because the artifacts carry their digests into the
+manifest and a resume compares them.
+
+### Deliberately open
+
+* Sparse-layout connectivity is asserted, not predicted (the k2 = 0 axis windows
+  sample the unbiased conditional); the campaign-end connected-components check
+  is the safety net.
+* `k2_reference_kcal` defaults to 1.0 because `z2` is standardised; the coupling
+  check is therefore a statement about `k2 ≈ RT/σ²`-scale umbrellas, not about the
+  per-gap constants actually written (those are reported separately in
+  `cv_selection_report.json["cv2_k_kcal"]` with the resulting CV1-width shrink).
+* Codex co-review did not run (workspace out of credits).
+
+### Verification
+
+Targeted regression (run through opencode, 2026-09-20 20:55): every `tests/test_cv_selection_*.py`,
+`test_swarm_{members,ladder_design,analyze,gates,epoch0_orchestration,provenance}.py`,
+`test_explicit_window_table_lambda.py`, `test_resume_secondary_cv_reconciliation.py`,
+`test_config_profiles.py`, `test_gamd_boost_default.py`, `test_package_smoke.py` —
+**350 passed, 2 failed** in 157 s. Both failures are pre-existing on `main` and
+untouched by this branch: `test_official_package_version_is_v07` asserts `"0.8"`
+after main's `v0.8.1` release (`24acc31`), and
+`test_tiny_lambda_ladder_run_completes_end_to_end_slow` reads `samples/` with
+`ds.dataset(..., format="parquet")`, which since `8bd4f11` also picks up the
+non-Parquet `parquet_manifest.json`. Neither is in this plan's scope; both are
+one-line fixes for whoever owns the smoke file.
+
+`python -m py_compile` clean on every touched module; `git diff --check` clean.
+Files under `gareus/cv_selection/` import NumPy only; `gareus/swarm/analyze.py`
+is 673 lines (ceiling 800).
