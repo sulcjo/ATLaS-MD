@@ -400,3 +400,69 @@ def test_tiny_real_swarm_member_moves_atoms_and_writes_trace_frames_and_done_slo
         f"atoms did not move between the first written frame and the last frame "
         f"(max per-atom displacement {max_disp_nm:.6f} nm <= 1e-3 nm threshold)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Task 1: canonical torsion features recorded alongside every trace row
+# ---------------------------------------------------------------------------
+
+def test_member_loop_writes_torsion_features_aligned_with_trace(tmp_path):
+    import numpy as np
+    from gareus.swarm.members import run_member_loop
+
+    calls = {"n": 0}
+
+    def measure_fn():
+        calls["n"] += 1
+        return {"cv1": 0.1 * calls["n"], "rg_nm": 1.0, "e2e_nm": 2.0,
+                "v_pep_kj": -1.0, "v_dih_kj": 1.0, "potential_kj": -5.0}
+
+    def feature_fn():
+        return np.array([np.sin(calls["n"]), np.cos(calls["n"]), 0.0, 1.0])
+
+    trace = tmp_path / "trace.csv"
+    feats = tmp_path / "torsion_features.npy"
+    run_member_loop(n_equil_steps=0, n_prod_steps=6, steps_per_frame=2, seed_frame_every=100,
+                    step_fn=lambda n: None, measure_fn=measure_fn, write_frame_fn=lambda i: None,
+                    trace_path=trace, timestep_ps=0.002, feature_fn=feature_fn,
+                    features_path=feats)
+    rows = trace.read_text().strip().splitlines()[1:]
+    stored = np.load(feats)
+    assert stored.shape == (len(rows), 4)
+    assert np.isclose(stored[1, 0], np.sin(2.0))      # measured in the same call as trace row 1
+    assert not list(tmp_path.glob("*.tmp*"))          # atomic publish left no temp file behind
+
+
+def test_member_loop_without_feature_fn_writes_no_feature_file(tmp_path):
+    from gareus.swarm.members import run_member_loop
+
+    trace = tmp_path / "trace.csv"
+    run_member_loop(n_equil_steps=0, n_prod_steps=2, steps_per_frame=1, seed_frame_every=100,
+                    step_fn=lambda n: None,
+                    measure_fn=lambda: {"cv1": 0.0, "rg_nm": 1.0, "e2e_nm": 1.0,
+                                        "v_pep_kj": 0.0, "v_dih_kj": 0.0, "potential_kj": 0.0},
+                    write_frame_fn=lambda i: None, trace_path=trace, timestep_ps=0.002)
+    assert not (tmp_path / "torsion_features.npy").exists()
+
+
+def test_a_crash_mid_loop_leaves_no_feature_file_and_is_recorded_as_md_failed(tmp_path):
+    import time
+    from gareus.swarm.members import _run_loop_recording_failure
+
+    calls = {"n": 0}
+
+    def step_fn(n):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise RuntimeError("NaN coordinate")
+
+    result = _run_loop_recording_failure(
+        n_equil_steps=0, n_prod_steps=6, steps_per_frame=1, seed_frame_every=100,
+        step_fn=step_fn,
+        measure_fn=lambda: {"cv1": 0.0, "rg_nm": 1.0, "e2e_nm": 1.0,
+                            "v_pep_kj": 0.0, "v_dih_kj": 0.0, "potential_kj": 0.0},
+        write_frame_fn=lambda i: None, trace_path=tmp_path / "trace.csv", timestep_ps=0.002,
+        member_dir=tmp_path, member_id=7, crash_label="swarm", t0=time.time(),
+        feature_fn=lambda: [0.0, 1.0], features_path=tmp_path / "torsion_features.npy")
+    assert result["failed"] and result["done"]["status"] == "md_failed"
+    assert not (tmp_path / "torsion_features.npy").exists()   # a partial member has no features

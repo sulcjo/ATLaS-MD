@@ -32,9 +32,12 @@ from gareus.cv import (
     find_atom_in_residue,
     nonlocal_contact_cv_from_positions_nm,
     peptide_residues,
+    secondary_structure_torsions,
     solute_atom_indices,
 )
+from gareus.io import write_json
 from gareus.system_setup import run_steps_safely, write_solute_only_pdb, write_state_pdb
+from gareus.tica import backbone_dihedral_features
 
 TRACE_COLUMNS = ["frame", "t_ps", "cv1", "rg_nm", "e2e_nm", "v_pep_kj", "v_dih_kj", "potential_kj"]
 
@@ -76,6 +79,8 @@ def run_member_loop(
     write_frame_fn: Callable[[int], Any],
     trace_path: Path,
     timestep_ps: float = 0.004,
+    feature_fn: Optional[Callable[[], Any]] = None,
+    features_path: Optional[Path] = None,
 ) -> dict:
     """Pure bookkeeping: equilibrate (discarded), then step/measure/write in chunks.
 
@@ -83,27 +88,53 @@ def run_member_loop(
     trace row's fields (without ``frame``/``t_ps``); ``write_frame_fn(frame_index)`` writes
     a seed-frame PDB for the current state. No OpenMM object is referenced here -- callers
     close over whatever simulation state they need in these three callables.
+
+    ``feature_fn()``, when given, returns one row of canonical torsion features measured on
+    the SAME frame as the trace row; the rows are stacked and written atomically to
+    ``features_path`` after the loop, so row ``i`` of the features is trace row ``i``.
     """
     if n_prod_steps % steps_per_frame:
         raise ValueError(f"n_prod_steps={n_prod_steps} not divisible by steps_per_frame={steps_per_frame}")
+    if (feature_fn is None) != (features_path is None):
+        raise ValueError("feature_fn and features_path must be given together")
     trace_path = Path(trace_path)
     trace_path.parent.mkdir(parents=True, exist_ok=True)
     if n_equil_steps > 0:
         step_fn(int(n_equil_steps))  # discarded by construction; never enters the trace
     n_frames = n_prod_steps // steps_per_frame
+    feature_rows: list = []
     with trace_path.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=TRACE_COLUMNS)
         w.writeheader()
         for i in range(n_frames):
             step_fn(int(steps_per_frame))
             row = dict(measure_fn())
+            if feature_fn is not None:
+                feature_rows.append(np.asarray(feature_fn(), dtype=np.float64))
             row["frame"] = i
             row["t_ps"] = (i + 1) * steps_per_frame * timestep_ps
             w.writerow({k: row.get(k, "") for k in TRACE_COLUMNS})
             f.flush()
             if seed_frame_every > 0 and (i + 1) % seed_frame_every == 0:
                 write_frame_fn(i)
+    if feature_fn is not None:
+        _write_features_atomic(Path(features_path), feature_rows)
     return {"n_frames": n_frames, "n_equil_steps": int(n_equil_steps), "n_prod_steps": int(n_prod_steps)}
+
+
+def _write_features_atomic(features_path: Path, feature_rows: list) -> None:
+    """Stack and publish the feature rows so a killed member never leaves a short file.
+
+    ``np.save`` appends ``.npy`` to any name that does not already end in it, so a
+    ``.npy.tmp`` temp name would silently become ``.npy.tmp.npy`` and the rename would
+    fail. Keep the temp name ending in ``.npy`` and write through an open handle.
+    """
+    stacked = np.vstack(feature_rows) if feature_rows else np.zeros((0, 0), dtype=np.float64)
+    features_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = features_path.with_name(features_path.stem + ".tmp.npy")
+    with tmp.open("wb") as fh:
+        np.save(fh, stacked)
+    tmp.replace(features_path)
 
 
 def member_done(member_dir: Path) -> bool:
@@ -170,6 +201,8 @@ def _run_loop_recording_failure(
     member_id,
     crash_label: str,
     t0: float,
+    feature_fn: Optional[Callable[[], Any]] = None,
+    features_path: Optional[Path] = None,
 ) -> dict:
     """Run ``run_member_loop``; a mid-loop exception is a failed member, never re-raised.
 
@@ -183,6 +216,7 @@ def _run_loop_recording_failure(
             n_equil_steps=n_equil_steps, n_prod_steps=n_prod_steps, steps_per_frame=steps_per_frame,
             seed_frame_every=seed_frame_every, step_fn=step_fn, measure_fn=measure_fn,
             write_frame_fn=write_frame_fn, trace_path=trace_path, timestep_ps=timestep_ps,
+            feature_fn=feature_fn, features_path=features_path,
         )
     except Exception as exc:
         frames_written = _count_trace_rows(trace_path)
@@ -288,6 +322,14 @@ def run_member(
     seed_frame_every = max(1, round(seed_frame_interval_ps / output_interval_ps))
 
     ca_indices = [find_atom_in_residue(res, "CA") for res in peptide_residues(topology)]
+    # Canonical torsion features per trace row: the discovery data for CV2 selection.
+    # The atom quadruplets travel with the features so a later stage can bind them.
+    phi_torsions, psi_torsions = secondary_structure_torsions(topology)
+    write_json(member_dir / "torsion_index.json", {
+        "phi_torsions": [list(map(int, t)) for t in phi_torsions],
+        "psi_torsions": [list(map(int, t)) for t in psi_torsions],
+    })
+    last_positions: dict = {}
 
     def step_fn(n):
         run_steps_safely(sim, n, "swarm", member_dir, app, topology, unit, progress=progress)
@@ -295,7 +337,11 @@ def run_member(
     def measure_fn():
         state = sim.context.getState(getPositions=True, enforcePeriodicBox=True)
         positions_nm = np.asarray(state.getPositions(asNumpy=True).value_in_unit(unit.nanometer))
+        last_positions["nm"] = positions_nm  # one State fetch per frame, shared with feature_fn
         return measure_frame(sim.context, system, unit, positions_nm, contact_pairs, ca_indices, args)
+
+    def feature_fn():
+        return backbone_dihedral_features(last_positions["nm"], phi_torsions, psi_torsions)
 
     def write_frame_fn(i):
         state = sim.context.getState(getPositions=True, enforcePeriodicBox=True)
@@ -307,6 +353,7 @@ def run_member(
         seed_frame_every=seed_frame_every, step_fn=step_fn, measure_fn=measure_fn,
         write_frame_fn=write_frame_fn, trace_path=member_dir / "trace.csv", timestep_ps=timestep_ps,
         member_dir=member_dir, member_id=member_row.get("member_id"), crash_label="swarm", t0=t0,
+        feature_fn=feature_fn, features_path=member_dir / "torsion_features.npy",
     )
     if result["failed"]:
         done = result["done"]
