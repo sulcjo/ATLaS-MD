@@ -192,7 +192,8 @@ class FeatureSchema(_Artifact):
 
 _COMPONENT_FIELDS = {"component_index", "singular_value", "eigenvalue_tie_flagged",
                      "right_singular_vector", "residual_mean", "regression_coefficients",
-                     "primary_mean", "primary_std", "projection_mean", "projection_std"}
+                     "primary_mean", "primary_std", "anchor_clamp", "projection_mean",
+                     "projection_std"}
 
 
 @dataclass(frozen=True)
@@ -207,6 +208,7 @@ class CandidateComponent:
     regression_coefficients: tuple[tuple[float, ...], ...]
     primary_mean: float
     primary_std: float
+    anchor_clamp: tuple[float, float]
     projection_mean: float
     projection_std: float
 
@@ -223,6 +225,7 @@ class CandidateComponent:
             "residual_mean": list(self.residual_mean),
             "regression_coefficients": [list(row) for row in self.regression_coefficients],
             "primary_mean": self.primary_mean, "primary_std": self.primary_std,
+            "anchor_clamp": list(self.anchor_clamp),
             "projection_mean": self.projection_mean, "projection_std": self.projection_std,
         }
 
@@ -269,9 +272,15 @@ def _parse_component(raw: Mapping[str, Any], position: int) -> CandidateComponen
                                   ReasonCode.NONPOSITIVE_SCALE)
     projection_std = _positive_float(raw["projection_std"], f"{label}.projection_std",
                                      ReasonCode.NONPOSITIVE_SCALE)
+    # The runtime clamps a degree-2 anchor to its training range so the chain-rule
+    # factor cannot grow without bound; the bounds travel with the component.
+    clamp = _finite_vector(raw["anchor_clamp"], f"{label}.anchor_clamp")
+    if len(clamp) != 2 or not clamp[0] < clamp[1]:
+        _fail(ReasonCode.INVALID_ESTIMATE,
+              f"{label}.anchor_clamp must be [lo, hi] with lo < hi in standardised anchor units")
     return CandidateComponent(index, float(singular), raw["eigenvalue_tie_flagged"], vector,
                               mean, tuple(coefficients), float(raw["primary_mean"]), primary_std,
-                              float(raw["projection_mean"]), projection_std)
+                              (clamp[0], clamp[1]), float(raw["projection_mean"]), projection_std)
 
 
 @dataclass(frozen=True)

@@ -62,6 +62,7 @@ def _component(index: int) -> dict:
         "regression_coefficients": [[0.0] * 4, [0.1] * 4, [0.01] * 4],
         "primary_mean": 0.2,
         "primary_std": 0.05,
+        "anchor_clamp": [-2.5, 2.5],
         "projection_mean": 0.0,
         "projection_std": 1.0,
     }
