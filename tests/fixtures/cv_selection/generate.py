@@ -61,6 +61,7 @@ def build() -> dict[str, C._Artifact]:
         "feature_schema_sha256": feature_schema.sha256,
         "physical_system_sha256": "0" * 63 + "2",
         "training_rows_sha256": "0" * 63 + "3",
+        "library_versions": {"numpy": "1.26.4", "python": "3.11.9"},
         "primary_definition": {
             "kind": "nonlocal-contact-fraction",
             "units": "dimensionless",
@@ -78,6 +79,8 @@ def build() -> dict[str, C._Artifact]:
                      "halfwidth_tolerance": 0.02}
                     for source in ("rg_nm", "end_to_end_nm")
                     for q in (0.2, 0.4, 0.6, 0.8)],
+        "discovery_rows_sha256": "0" * 63 + "4",
+        "quantile_algorithm": "numpy.quantile.linear",
         "cross_protocol_tolerance": 0.02,
         "diagnostic_partition_centers": 16,
         "diagnostic_histogram_bins": 20,

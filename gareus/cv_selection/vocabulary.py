@@ -68,6 +68,32 @@ _ROLE_MEASUREMENT_PHASE = {
 }
 
 
+class RegionStatus(str, Enum):
+    """Per-region evidence status (adversarial-review finding R6).
+
+    Zero observations in a region is not one situation but two, and collapsing
+    them is a scientific error in both directions:
+
+    * ``MASS_BOUNDED_SMALL`` — no visits, but a *valid* upper bound places the
+      mass below the declared tolerance. For an IID target region of true
+      probability 1e-6 with n=1000, zero visits happens ~99.9% of the time and
+      the exact one-sided 95% bound is 1 - 0.05**(1/1000) ~= 0.003, already
+      inside a 0.02 tolerance. Demanding a visit here would reject a perfectly
+      adequate result.
+    * ``UNRESOLVED_SUPPORT`` — no visits and no justified bound. The mass is
+      unknown. It must never be reported as zero with zero uncertainty.
+
+    The bound above is exact only for IID sampling from the target. Do not
+    substitute a Kish effective sample size into it for weighted
+    replica-exchange data; without a defensible bound the status is
+    ``UNRESOLVED_SUPPORT``.
+    """
+
+    RESOLVED_POPULATION = "RESOLVED_POPULATION"
+    MASS_BOUNDED_SMALL = "MASS_BOUNDED_SMALL"
+    UNRESOLVED_SUPPORT = "UNRESOLVED_SUPPORT"
+
+
 class SearchMode(str, Enum):
     JOINT_PAIR = "joint_pair"
     FIXED_PRIMARY = "fixed_primary"

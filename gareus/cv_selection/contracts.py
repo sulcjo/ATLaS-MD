@@ -29,16 +29,17 @@ from enum import Enum
 from typing import Any, Mapping
 
 from ..correctness._io import IntegrityError, json_bytes, json_loads
-from ..correctness.state_identity import _canonical_cv
 from ._base import (ContractError, ReasonCode, _Artifact, _canonical, _enum,
                     _exact_fields, _fail, _finite_vector, _hex64, _positive_float,
-                    _positive_int, _schema, artifact_digest, verify_artifact_digest)
+                    _positive_int, _schema, artifact_digest, canonical_cv_definition,
+                    has_visible_characters, require_visible_text, verify_artifact_digest)
+from .decision import (DECISION_VERSION, Decision, RegionRecord)
 from .protocol import (NATIVE_BLIND_GENERATOR_PRESETS, PROTOCOL_VERSION,
-                       MissingRequirement, ProtocolSpec, ReadinessReport,
-                       validate_protocol)
+                       READINESS_REPORT_VERSION, MissingRequirement, ProtocolSpec,
+                       ReadinessReport, validate_protocol)
 from .vocabulary import (Advantage, CrossProtocol, DecisionOutcome, Dependence,
                          ExitCode, Integrity, PhaseKind, Precision, Reproducibility,
-                         SearchMode, Stage, StudyRole, Support,
+                         RegionStatus, SearchMode, Stage, StudyRole, Support,
                          measurement_phase_for, validate_role_phase)
 
 __all__ = [
@@ -46,7 +47,8 @@ __all__ = [
     "Decision", "DecisionOutcome", "Dependence", "ExitCode", "FeatureId", "FeatureSchema",
     "Integrity", "IntegrityError", "MissingRequirement", "ObservablePanel", "PhaseKind",
     "Precision", "PrimaryObservable", "ProtocolSpec", "ReadinessReport", "ReasonCode",
-    "Reproducibility", "SearchMode", "Stage", "StudyRole", "Support", "TrialArm",
+    "RegionStatus", "Reproducibility", "SearchMode", "Stage", "StudyRole", "Support",
+    "TrialArm", "RegionRecord",
     "TrialPlan", "artifact_digest", "json_bytes", "json_loads", "measurement_phase_for",
     "require_feature_binding", "validate_protocol", "validate_role_phase",
     "verify_artifact_digest",
@@ -56,9 +58,21 @@ FEATURE_SCHEMA_VERSION = "atlas-cv-selection-feature-schema-v1"
 CANDIDATE_SET_VERSION = "atlas-cv-selection-candidate-set-v1"
 OBSERVABLE_PANEL_VERSION = "atlas-cv-selection-observable-panel-v1"
 TRIAL_PLAN_VERSION = "atlas-cv-selection-trial-plan-v1"
-DECISION_VERSION = "atlas-cv-selection-decision-v1"
 
 CANDIDATE_KIND_QUADRATIC_RESIDUAL = "quadratic-residual-torsion-pc-v1"
+
+#: The declared native-blind primitive dictionary (plan section 6.1). A CV kind
+#: outside this set is refused rather than trusted, because the blindness
+#: declaration is three strings in the protocol and cannot, by itself, see that
+#: a primary coordinate is an RMSD to the experimentally known fold. This is a
+#: fail-closed allowlist: widening it is a deliberate, reviewable act.
+NATIVE_BLIND_CV_KINDS = frozenset({
+    "nonlocal-contact-fraction",
+    "radius-of-gyration",
+    "end-to-end-distance",
+    "torsion-pca-component",
+    "quadratic-residual-torsion-pc",
+})
 
 #: Components are individual SVD directions numbered from one. The legacy
 #: ``compute_bootstrap_torsion_pca(component=...)`` argument is a *count* of
@@ -67,6 +81,16 @@ MAX_COMPONENT_INDEX = 6
 
 #: The frozen primary panel is eight CDF probabilities (plan section 7.1).
 PRIMARY_PANEL_SIZE = 8
+
+def _version_map(values: Any, label: str) -> dict[str, str]:
+    """Library name -> version. An SVD basis is not reproducible without it."""
+    if not isinstance(values, Mapping) or not values:
+        _fail(ReasonCode.MISSING_FIELD, f"{label} must be a nonempty mapping")
+    for name, version in values.items():
+        require_visible_text(name, f"{label} key")
+        require_visible_text(version, f"{label}[{name}]")
+    return dict(values)
+
 
 # ---------------------------------------------------------------------------
 # Feature schema
@@ -225,6 +249,10 @@ def _parse_component(raw: Mapping[str, Any], position: int) -> CandidateComponen
                   f"{label}.regression_coefficients[{order}] has width {len(values)}, "
                   f"expected {len(vector)}")
         coefficients.append(values)
+    if not any(abs(value) > 0.0 for value in vector):
+        _fail(ReasonCode.NONPOSITIVE_SCALE,
+              f"{label}.right_singular_vector is all zero; a zero direction defines no "
+              "coordinate and its umbrella would apply no force")
     singular = raw["singular_value"]
     if isinstance(singular, bool) or not isinstance(singular, (int, float)) or singular < 0:
         _fail(ReasonCode.NONPOSITIVE_SCALE, f"{label}.singular_value must be nonnegative")
@@ -248,6 +276,7 @@ class CandidateSet(_Artifact):
     feature_schema_sha256: str
     physical_system_sha256: str
     training_rows_sha256: str
+    library_versions: dict[str, str]
     primary_definition: dict[str, Any]
     components: tuple[CandidateComponent, ...]
     sha256: str
@@ -259,8 +288,8 @@ class CandidateSet(_Artifact):
     @classmethod
     def _parse(cls, data: dict[str, Any]) -> "CandidateSet":
         _exact_fields(data, {"schema", "kind", "feature_schema_sha256", "physical_system_sha256",
-                             "training_rows_sha256", "primary_definition", "components"},
-                      "candidate set")
+                             "training_rows_sha256", "library_versions", "primary_definition",
+                             "components"}, "candidate set")
         _schema(data, CANDIDATE_SET_VERSION, "candidate set")
         if data["kind"] != CANDIDATE_KIND_QUADRATIC_RESIDUAL:
             _fail(ReasonCode.INVALID_ENUM,
@@ -277,8 +306,16 @@ class CandidateSet(_Artifact):
         if len(widths) != 1:
             _fail(ReasonCode.FEATURE_WIDTH_MISMATCH,
                   f"components disagree on feature width: {sorted(widths)}")
+        # An SVD basis is only reproducible against the library that produced it.
+        libraries = _version_map(data["library_versions"], "candidate set.library_versions")
         # Reuse the existing CV canonicaliser: it rejects filename-based identity.
-        primary = _canonical_cv(data["primary_definition"], "candidate set.primary_definition")
+        primary = canonical_cv_definition(data["primary_definition"],
+                                          "candidate set.primary_definition")
+        if primary["kind"] not in NATIVE_BLIND_CV_KINDS:
+            _fail(ReasonCode.NATIVE_DERIVED_INPUT,
+                  f"primary CV kind {primary['kind']!r} is not in the declared native-blind "
+                  f"dictionary {sorted(NATIVE_BLIND_CV_KINDS)}; a coordinate defined against a "
+                  "known fold cannot enter a native-blind selection")
         body = {"schema": CANDIDATE_SET_VERSION, "kind": data["kind"],
                 "feature_schema_sha256": _hex64(data["feature_schema_sha256"],
                                                 "candidate set.feature_schema_sha256"),
@@ -286,16 +323,19 @@ class CandidateSet(_Artifact):
                                                  "candidate set.physical_system_sha256"),
                 "training_rows_sha256": _hex64(data["training_rows_sha256"],
                                                "candidate set.training_rows_sha256"),
+                "library_versions": dict(libraries),
                 "primary_definition": primary,
                 "components": [component.to_mapping() for component in components]}
         return cls(data["kind"], body["feature_schema_sha256"], body["physical_system_sha256"],
-                   body["training_rows_sha256"], primary, components, artifact_digest(body))
+                   body["training_rows_sha256"], dict(libraries), primary, components,
+                   artifact_digest(body))
 
     def _body(self) -> dict[str, Any]:
         return {"schema": CANDIDATE_SET_VERSION, "kind": self.kind,
                 "feature_schema_sha256": self.feature_schema_sha256,
                 "physical_system_sha256": self.physical_system_sha256,
                 "training_rows_sha256": self.training_rows_sha256,
+                "library_versions": dict(self.library_versions),
                 "primary_definition": dict(self.primary_definition),
                 "components": [component.to_mapping() for component in self.components]}
 
@@ -319,6 +359,41 @@ def require_feature_binding(candidates: CandidateSet, schema: FeatureSchema) -> 
 _OBSERVABLE_FIELDS = {"observable_id", "kind", "source_observable",
                       "discovery_quantile", "halfwidth_tolerance"}
 _OBSERVABLE_KINDS = frozenset({"cdf_probability"})
+_QUANTILE_ALGORITHMS = frozenset({"numpy.quantile.linear"})
+
+#: A probability tolerance above one is not a tolerance, it is a way to make
+#: every arm pass. Half-widths and practical-difference bands are bounded.
+_MAX_PROBABILITY_TOLERANCE = 1.0
+
+
+def _probability_tolerance(value: Any, label: str) -> float:
+    tolerance = _positive_float(value, label, ReasonCode.TOLERANCE_NOT_POSITIVE)
+    if tolerance > _MAX_PROBABILITY_TOLERANCE:
+        _fail(ReasonCode.TOLERANCE_NOT_POSITIVE,
+              f"{label} is a probability tolerance and must be <= "
+              f"{_MAX_PROBABILITY_TOLERANCE}; {tolerance} would make the gate vacuous")
+    return tolerance
+
+
+def _require_panel_shape(primary: tuple["PrimaryObservable", ...]) -> None:
+    """Eight copies of one measurement is not the declared panel.
+
+    Plan section 7.1 pins the primary panel to both global-shape observables at
+    four discovery quantiles each. Enforcing only the count would let a panel be
+    eight repeats of a single easy probability, which passes precision trivially
+    while measuring almost nothing.
+    """
+    pairs = [(item.source_observable, item.discovery_quantile) for item in primary]
+    if len(set(pairs)) != len(pairs):
+        _fail(ReasonCode.DUPLICATE_OBSERVABLE_ID,
+              "each (source observable, quantile) pair may appear once in the primary panel")
+    for source in _SOURCE_OBSERVABLES:
+        quantiles = {q for src, q in pairs if src == source}
+        if len(quantiles) != PRIMARY_PANEL_SIZE // len(_SOURCE_OBSERVABLES):
+            _fail(ReasonCode.PRIMARY_PANEL_SIZE,
+                  f"the primary panel needs "
+                  f"{PRIMARY_PANEL_SIZE // len(_SOURCE_OBSERVABLES)} distinct quantiles for "
+                  f"{source}, got {len(quantiles)}")
 _SOURCE_OBSERVABLES = frozenset({"rg_nm", "end_to_end_nm"})
 
 
@@ -352,8 +427,8 @@ def _parse_observable(raw: Mapping[str, Any], position: int) -> PrimaryObservabl
             or not 0.0 < float(quantile) < 1.0):
         _fail(ReasonCode.INVALID_QUANTILE,
               f"{label}.discovery_quantile must lie strictly inside (0, 1), got {quantile!r}")
-    tolerance = _positive_float(raw["halfwidth_tolerance"], f"{label}.halfwidth_tolerance",
-                                ReasonCode.TOLERANCE_NOT_POSITIVE)
+    tolerance = _probability_tolerance(raw["halfwidth_tolerance"],
+                                       f"{label}.halfwidth_tolerance")
     return PrimaryObservable(raw["observable_id"], raw["kind"], raw["source_observable"],
                              float(quantile), tolerance)
 
@@ -363,6 +438,8 @@ class ObservablePanel(_Artifact):
     """Frozen before any arm is scored; a candidate never gets its own panel."""
 
     primary: tuple[PrimaryObservable, ...]
+    discovery_rows_sha256: str
+    quantile_algorithm: str
     cross_protocol_tolerance: float
     diagnostic_partition_centers: int
     diagnostic_histogram_bins: int
@@ -378,7 +455,8 @@ class ObservablePanel(_Artifact):
     def _parse(cls, data: dict[str, Any]) -> "ObservablePanel":
         _exact_fields(data, {"schema", "primary", "cross_protocol_tolerance",
                              "diagnostic_partition_centers", "diagnostic_histogram_bins",
-                             "novelty_mass_tolerance"}, "observable panel")
+                             "novelty_mass_tolerance", "discovery_rows_sha256",
+                             "quantile_algorithm"}, "observable panel")
         _schema(data, OBSERVABLE_PANEL_VERSION, "observable panel")
         rows = data["primary"]
         if not isinstance(rows, list) or len(rows) != PRIMARY_PANEL_SIZE:
@@ -389,26 +467,37 @@ class ObservablePanel(_Artifact):
         identifiers = [observable.observable_id for observable in primary]
         if len(set(identifiers)) != len(identifiers):
             _fail(ReasonCode.DUPLICATE_OBSERVABLE_ID, "primary observable ids must be unique")
-        cross = _positive_float(data["cross_protocol_tolerance"],
-                                "observable panel.cross_protocol_tolerance",
-                                ReasonCode.TOLERANCE_NOT_POSITIVE)
-        novelty = _positive_float(data["novelty_mass_tolerance"],
-                                  "observable panel.novelty_mass_tolerance",
-                                  ReasonCode.TOLERANCE_NOT_POSITIVE)
+        _require_panel_shape(primary)
+        cross = _probability_tolerance(data["cross_protocol_tolerance"],
+                                       "observable panel.cross_protocol_tolerance")
+        novelty = _probability_tolerance(data["novelty_mass_tolerance"],
+                                         "observable panel.novelty_mass_tolerance")
         centers = _positive_int(data["diagnostic_partition_centers"],
                                 "observable panel.diagnostic_partition_centers",
                                 ReasonCode.MISSING_FIELD)
         bins = _positive_int(data["diagnostic_histogram_bins"],
                              "observable panel.diagnostic_histogram_bins", ReasonCode.MISSING_FIELD)
+        rows_digest = _hex64(data["discovery_rows_sha256"],
+                             "observable panel.discovery_rows_sha256")
+        algorithm = data["quantile_algorithm"]
+        if algorithm not in _QUANTILE_ALGORITHMS:
+            _fail(ReasonCode.INVALID_ENUM,
+                  f"observable panel.quantile_algorithm must be one of "
+                  f"{sorted(_QUANTILE_ALGORITHMS)}; a quantile is only reproducible "
+                  "against a named interpolation rule")
         body = {"schema": OBSERVABLE_PANEL_VERSION,
                 "primary": [observable.to_mapping() for observable in primary],
+                "discovery_rows_sha256": rows_digest, "quantile_algorithm": algorithm,
                 "cross_protocol_tolerance": cross, "diagnostic_partition_centers": centers,
                 "diagnostic_histogram_bins": bins, "novelty_mass_tolerance": novelty}
-        return cls(primary, cross, centers, bins, novelty, artifact_digest(body))
+        return cls(primary, rows_digest, algorithm, cross, centers, bins, novelty,
+                   artifact_digest(body))
 
     def _body(self) -> dict[str, Any]:
         return {"schema": OBSERVABLE_PANEL_VERSION,
                 "primary": [observable.to_mapping() for observable in self.primary],
+                "discovery_rows_sha256": self.discovery_rows_sha256,
+                "quantile_algorithm": self.quantile_algorithm,
                 "cross_protocol_tolerance": self.cross_protocol_tolerance,
                 "diagnostic_partition_centers": self.diagnostic_partition_centers,
                 "diagnostic_histogram_bins": self.diagnostic_histogram_bins,
@@ -439,8 +528,7 @@ class TrialArm:
 def _parse_arm(raw: Mapping[str, Any], position: int) -> TrialArm:
     label = f"arm[{position}]"
     _exact_fields(raw, _ARM_FIELDS, label)
-    if not isinstance(raw["arm_id"], str) or not raw["arm_id"]:
-        _fail(ReasonCode.MISSING_FIELD, f"{label}.arm_id must be a nonempty string")
+    require_visible_text(raw["arm_id"], f"{label}.arm_id")
     index = raw["secondary_component_index"]
     if index is not None and (isinstance(index, bool) or not isinstance(index, int)
                               or not 1 <= index <= MAX_COMPONENT_INDEX):
@@ -506,8 +594,7 @@ class TrialPlan(_Artifact):
                 "layout": data["layout"], "lambda_rungs": rungs, "states_per_arm": states,
                 "max_replicas": cap, "arms": [arm.to_mapping() for arm in arms]}
         for key in ("plan_id", "study_id", "layout"):
-            if not isinstance(body[key], str) or not body[key]:
-                _fail(ReasonCode.MISSING_FIELD, f"trial plan.{key} must be a nonempty string")
+            require_visible_text(body[key], f"trial plan.{key}")
         return cls(body["plan_id"], body["study_id"], stage, role, phase,
                    body["protocol_sha256"], body["layout"], rungs, states, cap, arms,
                    artifact_digest(body))
@@ -540,127 +627,3 @@ def _parse_arms(rows: Any) -> tuple[TrialArm, ...]:
     return arms
 
 
-# ---------------------------------------------------------------------------
-# Decision
-# ---------------------------------------------------------------------------
-
-_DECISION_STATUS_FIELDS: dict[str, type[Enum]] = {
-    "integrity": Integrity, "precision": Precision, "dependence": Dependence,
-    "reproducibility": Reproducibility, "cross_protocol": CrossProtocol,
-    "support": Support, "advantage": Advantage, "decision": DecisionOutcome,
-}
-
-#: Every status that must hold before a confirmation may be published.
-_CONFIRMATION_REQUIRES = {
-    "precision": Precision.MET,
-    "dependence": Dependence.SUPPORTED,
-    "reproducibility": Reproducibility.NO_CONFLICT_DETECTED,
-    "support": Support.SUPPORTED_ON_DECLARED_PANEL,
-    "cross_protocol": CrossProtocol.AGREEMENT_SUPPORTED,
-}
-
-
-@dataclass(frozen=True)
-class Decision(_Artifact):
-    """Eight independent statuses plus evidence. Precision is not accuracy."""
-
-    study_id: str
-    integrity: Integrity
-    precision: Precision
-    dependence: Dependence
-    reproducibility: Reproducibility
-    cross_protocol: CrossProtocol
-    support: Support
-    advantage: Advantage
-    decision: DecisionOutcome
-    reasons: tuple[ReasonCode, ...]
-    unresolved_regions: tuple[str, ...]
-    tested_protocol_ids: tuple[str, ...]
-    input_sha256: dict[str, str]
-    selected_arm_id: str | None
-    sha256: str
-
-    @property
-    def exit_code(self) -> ExitCode:
-        """A valid inconclusive analysis still exits zero (plan section 11)."""
-        return (ExitCode.INVALID_INPUT if self.decision is DecisionOutcome.INVALID_INPUT
-                else ExitCode.OK)
-
-    @classmethod
-    def _parse(cls, data: dict[str, Any]) -> "Decision":
-        _exact_fields(data, {"schema", "study_id", *_DECISION_STATUS_FIELDS, "reasons",
-                             "unresolved_regions", "tested_protocol_ids", "input_sha256",
-                             "selected_arm_id"}, "decision")
-        _schema(data, DECISION_VERSION, "decision")
-        statuses = {name: _enum(data[name], enum_cls, f"decision.{name}")
-                    for name, enum_cls in _DECISION_STATUS_FIELDS.items()}
-        reasons = _parse_reasons(data["reasons"])
-        _check_decision_consistency(statuses, data["selected_arm_id"])
-        regions = _string_tuple(data["unresolved_regions"], "decision.unresolved_regions")
-        protocols = _string_tuple(data["tested_protocol_ids"], "decision.tested_protocol_ids")
-        inputs = data["input_sha256"]
-        if not isinstance(inputs, dict):
-            _fail(ReasonCode.MISSING_FIELD, "decision.input_sha256 must be a mapping")
-        for name, value in inputs.items():
-            _hex64(value, f"decision.input_sha256[{name}]")
-        selected = data["selected_arm_id"]
-        if selected is not None and (not isinstance(selected, str) or not selected):
-            _fail(ReasonCode.MISSING_FIELD, "decision.selected_arm_id must be null or a name")
-        body = {"schema": DECISION_VERSION, "study_id": data["study_id"],
-                **{name: status.value for name, status in statuses.items()},
-                "reasons": [reason.value for reason in reasons],
-                "unresolved_regions": list(regions), "tested_protocol_ids": list(protocols),
-                "input_sha256": dict(inputs), "selected_arm_id": selected}
-        return cls(data["study_id"], statuses["integrity"], statuses["precision"],
-                   statuses["dependence"], statuses["reproducibility"],
-                   statuses["cross_protocol"], statuses["support"], statuses["advantage"],
-                   statuses["decision"], reasons, regions, protocols, dict(inputs), selected,
-                   artifact_digest(body))
-
-    def _body(self) -> dict[str, Any]:
-        return {"schema": DECISION_VERSION, "study_id": self.study_id,
-                "integrity": self.integrity.value, "precision": self.precision.value,
-                "dependence": self.dependence.value,
-                "reproducibility": self.reproducibility.value,
-                "cross_protocol": self.cross_protocol.value, "support": self.support.value,
-                "advantage": self.advantage.value, "decision": self.decision.value,
-                "reasons": [reason.value for reason in self.reasons],
-                "unresolved_regions": list(self.unresolved_regions),
-                "tested_protocol_ids": list(self.tested_protocol_ids),
-                "input_sha256": dict(self.input_sha256),
-                "selected_arm_id": self.selected_arm_id}
-
-
-def _string_tuple(values: Any, label: str) -> tuple[str, ...]:
-    if not isinstance(values, list) or any(not isinstance(item, str) for item in values):
-        _fail(ReasonCode.MISSING_FIELD, f"{label} must be a list of strings")
-    return tuple(values)
-
-
-def _parse_reasons(values: Any) -> tuple[ReasonCode, ...]:
-    if not isinstance(values, list):
-        _fail(ReasonCode.UNKNOWN_REASON_CODE, "decision.reasons must be a list of reason codes")
-    parsed = []
-    for value in values:
-        try:
-            parsed.append(ReasonCode(value))
-        except ValueError:
-            _fail(ReasonCode.UNKNOWN_REASON_CODE,
-                  f"{value!r} is not a declared reason code; free text is not evidence")
-    return tuple(parsed)
-
-
-def _check_decision_consistency(statuses: Mapping[str, Enum], selected_arm_id: Any) -> None:
-    if (statuses["integrity"] is Integrity.FAIL
-            and statuses["decision"] is not DecisionOutcome.INVALID_INPUT):
-        _fail(ReasonCode.INTEGRITY_OUTCOME_CONFLICT,
-              "a failed integrity check can only produce INVALID_INPUT")
-    if statuses["decision"] is not DecisionOutcome.CONFIRMED_FOR_DECLARED_PANEL:
-        return
-    if not selected_arm_id:
-        _fail(ReasonCode.MISSING_SELECTED_ARM,
-              "a confirmation must name the arm it confirms")
-    for name, required in _CONFIRMATION_REQUIRES.items():
-        if statuses[name] is not required:
-            _fail(ReasonCode.CONFIRMATION_BLOCKED,
-                  f"confirmation requires {name}={required.value}, got {statuses[name].value}")

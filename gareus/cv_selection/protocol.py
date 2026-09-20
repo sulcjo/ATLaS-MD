@@ -9,13 +9,14 @@ artifact-producing tasks is refused rather than quietly completed.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from ._base import (ReasonCode, _Artifact, _enum, _exact_fields, _fail, _hex64,
-                    _positive_float, _schema, artifact_digest)
+                    _positive_float, _schema, artifact_digest, require_visible_text)
 from .vocabulary import ExitCode, SearchMode, Stage, _STAGE_ORDER
 
 PROTOCOL_VERSION = "atlas-cv-selection-protocol-v1"
+READINESS_REPORT_VERSION = "atlas-cv-selection-readiness-report-v1"
 
 #: GENPEPT presets that encode a known fold bias are not native-blind sources.
 NATIVE_BLIND_GENERATOR_PRESETS = frozenset({"broad"})
@@ -90,6 +91,63 @@ def _validate_blindness(section: Mapping[str, Any]) -> None:
               "campaigns are never confirmatory evidence")
 
 
+#: Per-field value rules for the policies that may legitimately be unresolved.
+#: ``None`` means "not decided yet" and is reported by the readiness gate; any
+#: other value must already be a usable one. Without this, a protocol declaring
+#: a negative burn-in or a string campaign count passes readiness and is
+#: certified launch-ready, which is exactly the failure the machine-checked
+#: readiness state exists to prevent.
+_VALUE_RULES: dict[str, str] = {
+    "sampling.layout": "nonempty_str",
+    "sampling.lambda_rungs": "positive_int",
+    "sampling.burn_in_ticks": "nonnegative_int",
+    "sampling.measurement_ticks": "positive_int",
+    "sampling.campaigns_per_arm": "positive_int",
+    "resources.gpus": "positive_int",
+    "resources.cpu_thread_cap": "positive_int",
+    "resources.max_replicas": "positive_int",
+    "resources.gpu_hours_per_campaign": "positive_number",
+    "resources.total_gpu_hour_ceiling": "positive_number",
+    "uncertainty.policy": "nonempty_str",
+    "decision.provisional_choice_arm_id": "nonempty_str",
+    "decision.interval_family_size": "positive_int",
+}
+
+
+def _check_value(value: Any, rule: str, label: str) -> None:
+    if rule == "nonempty_str":
+        require_visible_text(value, label)
+        return
+    if rule in {"positive_int", "nonnegative_int"}:
+        # bool is a subclass of int; True would otherwise pass as 1.
+        if isinstance(value, bool) or not isinstance(value, int):
+            _fail(ReasonCode.WRONG_TYPE,
+                  f"{label} must be an integer, got {type(value).__name__}")
+        if rule == "positive_int" and value <= 0:
+            _fail(ReasonCode.NOT_POSITIVE, f"{label} must be positive, got {value}")
+        if rule == "nonnegative_int" and value < 0:
+            _fail(ReasonCode.NEGATIVE_VALUE, f"{label} must not be negative, got {value}")
+        return
+    if rule == "positive_number":
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            _fail(ReasonCode.WRONG_TYPE,
+                  f"{label} must be a number, got {type(value).__name__}")
+        if float(value) <= 0.0:
+            _fail(ReasonCode.NOT_POSITIVE, f"{label} must be positive, got {value}")
+        return
+    raise AssertionError(f"unknown value rule {rule!r}")
+
+
+def _validate_resolvable_values(sections: Mapping[str, Mapping[str, Any]]) -> None:
+    """A resolved policy must be usable; only ``None`` may mean 'not yet'."""
+    for dotted, rule in _VALUE_RULES.items():
+        section, _, field = dotted.partition(".")
+        value = sections[section][field]
+        if value is None:
+            continue
+        _check_value(value, rule, f"protocol.{dotted}")
+
+
 @dataclass(frozen=True)
 class ProtocolSpec(_Artifact):
     """The whole declared study. Unresolved policies stay ``None`` on purpose."""
@@ -134,6 +192,7 @@ class ProtocolSpec(_Artifact):
                "protocol.uncertainty.calibration_certificate_sha256", allow_none=True)
         if sections["decision"]["advantage_claim_enabled"] not in (True, False):
             _fail(ReasonCode.INVALID_ENUM, "decision.advantage_claim_enabled must be a boolean")
+        _validate_resolvable_values(sections)
         body = {"schema": PROTOCOL_VERSION, "study_id": data["study_id"],
                 "search_mode": mode.value, **sections}
         return cls(data["study_id"], mode, sections["target"], sections["blindness"],
@@ -169,22 +228,85 @@ class MissingRequirement:
 
 
 @dataclass(frozen=True)
-class ReadinessReport:
+class ReadinessReport(_Artifact):
+    """Persisted as ``readiness/<stage>.json``, so it is versioned and hashed.
+
+    A readiness verdict is evidence about whether a campaign may launch. If it
+    could not be round-tripped and checked like every other artifact, a stale or
+    edited report could authorise a launch it never actually cleared.
+    """
+
     stage: Stage
     ready: bool
     missing: tuple[MissingRequirement, ...]
     protocol_sha256: str
-    reason: ReasonCode | None = None
+    reason: ReasonCode | None
+    sha256: str
 
     @property
     def exit_code(self) -> ExitCode:
         return ExitCode.OK if self.ready else ExitCode.NOT_READY
 
-    def to_mapping(self) -> dict[str, Any]:
-        return {"stage": self.stage.value, "ready": self.ready,
-                "protocol_sha256": self.protocol_sha256,
-                "reason": None if self.reason is None else self.reason.value,
-                "missing": [item.to_mapping() for item in self.missing]}
+    @classmethod
+    def build(cls, stage: Stage, missing: Sequence[MissingRequirement],
+              protocol_sha256: str) -> "ReadinessReport":
+        ready = not missing
+        reason = None if ready else ReasonCode.PROTOCOL_NOT_READY
+        body = _readiness_body(stage, ready, tuple(missing), protocol_sha256, reason)
+        return cls(stage, ready, tuple(missing), protocol_sha256, reason,
+                   artifact_digest(body))
+
+    @classmethod
+    def _parse(cls, data: dict[str, Any]) -> "ReadinessReport":
+        _exact_fields(data, {"schema", "stage", "ready", "protocol_sha256", "reason",
+                             "missing"}, "readiness report")
+        _schema(data, READINESS_REPORT_VERSION, "readiness report")
+        stage = _enum(data["stage"], Stage, "readiness report.stage")
+        if not isinstance(data["ready"], bool):
+            _fail(ReasonCode.WRONG_TYPE, "readiness report.ready must be a boolean")
+        rows = data["missing"]
+        if not isinstance(rows, list):
+            _fail(ReasonCode.WRONG_TYPE, "readiness report.missing must be a list")
+        missing = tuple(_parse_missing_requirement(row, i) for i, row in enumerate(rows))
+        reason = (None if data["reason"] is None
+                  else _enum(data["reason"], ReasonCode, "readiness report.reason"))
+        if data["ready"] != (not missing):
+            _fail(ReasonCode.READINESS_INCONSISTENT,
+                  "readiness report.ready must agree with its own missing list")
+        if bool(missing) != (reason is ReasonCode.PROTOCOL_NOT_READY):
+            _fail(ReasonCode.READINESS_INCONSISTENT,
+                  "an unready report must carry PROTOCOL_NOT_READY, a ready one no reason")
+        digest_of = _hex64(data["protocol_sha256"], "readiness report.protocol_sha256")
+        body = _readiness_body(stage, data["ready"], missing, digest_of, reason)
+        return cls(stage, data["ready"], missing, digest_of, reason, artifact_digest(body))
+
+    def _body(self) -> dict[str, Any]:
+        return _readiness_body(self.stage, self.ready, self.missing,
+                               self.protocol_sha256, self.reason)
+
+
+def _readiness_body(stage: Stage, ready: bool, missing, protocol_sha256: str,
+                    reason: ReasonCode | None) -> dict[str, Any]:
+    return {"schema": READINESS_REPORT_VERSION, "stage": stage.value, "ready": ready,
+            "protocol_sha256": protocol_sha256,
+            "reason": None if reason is None else reason.value,
+            "missing": [item.to_mapping() for item in missing]}
+
+
+def _parse_missing_requirement(raw: Any, position: int) -> MissingRequirement:
+    label = f"readiness report.missing[{position}]"
+    if not isinstance(raw, Mapping):
+        _fail(ReasonCode.WRONG_TYPE, f"{label} must be a mapping")
+    _exact_fields(raw, {"requirement", "stage", "producing_task", "reason", "detail"}, label)
+    for key in ("requirement", "producing_task"):
+        require_visible_text(raw[key], f"{label}.{key}")
+    if not isinstance(raw["detail"], str):
+        _fail(ReasonCode.WRONG_TYPE, f"{label}.detail must be a string")
+    return MissingRequirement(raw["requirement"],
+                              _enum(raw["stage"], Stage, f"{label}.stage"),
+                              raw["producing_task"],
+                              _enum(raw["reason"], ReasonCode, f"{label}.reason"),
+                              raw["detail"])
 
 
 def _requirements_through(stage: Stage) -> tuple[str, ...]:
@@ -233,8 +355,6 @@ def validate_protocol(protocol: ProtocolSpec, artifacts: Mapping[str, str], *,
                 dotted, stage, _REQUIREMENT_TASKS[section], ReasonCode.MISSING_FIELD,
                 "unresolved policy; the producing task must supply a concrete value"))
     missing.extend(_artifact_findings(protocol, artifacts, stage))
-    ready = not missing
-    return ReadinessReport(stage, ready, tuple(missing), protocol.sha256,
-                           None if ready else ReasonCode.PROTOCOL_NOT_READY)
+    return ReadinessReport.build(stage, missing, protocol.sha256)
 
 

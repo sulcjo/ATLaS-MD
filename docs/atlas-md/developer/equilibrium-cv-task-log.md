@@ -22,13 +22,14 @@ records what was actually run, not what was expected to pass.
 | `gareus/cv_selection/_base.py` | New; primitive validation, digests, `_Artifact` base |
 | `gareus/cv_selection/vocabulary.py` | New; stages, roles, phases and the eight decision statuses |
 | `gareus/cv_selection/contracts.py` | New; the six artifacts, readiness validator, public façade |
-| `tests/test_cv_selection_contracts.py` | New; 67 rejection/round-trip cases |
+| `tests/test_cv_selection_contracts.py` | New; rejection and round-trip cases |
 | `tests/fixtures/cv_selection/generate.py` | New; regenerates the tiny artifacts |
 | `tests/fixtures/cv_selection/*.json` | New; six generated artifacts pinning the encoding |
 | `docs/atlas-md/developer/equilibrium-cv-implementation-plan.md` | Plan copied into the tracked docs path |
 | `docs/atlas-md/developer/equilibrium-cv-selection-spec-v0.1.md` | Historical design evidence |
 | `docs/atlas-md/developer/equilibrium-cv-selection-adversarial-review.md` | Historical design evidence |
-| `mkdocs.yml` | Three nav entries so the strict docs build keeps covering them |
+| `docs/atlas-md/developer/equilibrium-cv-task-log.md` | This record |
+| `mkdocs.yml` | Nav entries so the strict docs build keeps covering the new pages |
 
 `pyproject.toml` needed **no** change: `[tool.setuptools.packages.find]` already
 matches `gareus*`, so `gareus.cv_selection` is installed automatically, and the
@@ -45,9 +46,11 @@ validation primitives, digests, the `_Artifact` base) and `vocabulary.py` (the
 controlled vocabularies and the role/phase rule), with the artifacts and the
 readiness validator staying in `contracts.py`.
 
-The split was verified pure by regenerating the six fixtures: all `sha256`
-values are byte-identical before and after, because digests are taken over JSON
-payloads and never over module layout.
+Each split was verified pure by regenerating the six fixtures: all `sha256`
+values came back byte-identical, because digests are taken over JSON payloads
+and never over module layout. (The fixtures' digests *did* change later, when
+the adversarial round below added required fields to two schemas — that is a
+deliberate schema change, not a refactor.)
 
 ### Interfaces introduced
 
@@ -119,9 +122,9 @@ None are touched by T00; the plan's task prompt keeps unrelated fixes separate.
    `index.md` no longer contains a ```` ```mermaid ```` block.
 3. `test_example_configs.py::test_example_config_parses_without_unknown_keys[chignolin_genpept_contact_bias_sigma.yaml]` — `SystemExit: 2`.
 4. `test_npt_pep_adapter_boost.py::test_finite_difference_boost_force_matches_scaling_factor_expression` —
-   finite-difference vs integrator expression mismatch, **only when the whole
-   suite runs**. See the verification note below: this one is not a plain
-   pre-existing failure, it is a test-isolation failure.
+   finite-difference vs integrator expression mismatch. See the verification
+   note below: this one is **intrinsically nondeterministic** (~41% failure rate
+   run in isolation), so it is not a fixed pre-existing failure at all.
 5. `test_package_smoke.py::test_tiny_lambda_ladder_run_completes_end_to_end_slow` —
    `ArrowInvalid` reading `parquet_manifest.json` as Parquet.
 6. `test_package_smoke.py::test_official_package_version_is_v07` — expects `0.8`,
@@ -149,33 +152,51 @@ Provenance of each item:
   T00 touches, but that is an argument, not evidence. It was therefore run
   directly, and the result changed the conclusion. See below.
 
-### Verification note: item 4 is a test-isolation failure
+### Verification note: item 4 is an intrinsically flaky test (corrected)
 
-A clean `git worktree` was created at `cdee6cc` with none of this branch's files
-present, and `tests/test_npt_pep_adapter_boost.py` was run there:
+**An earlier version of this record called item 4 cross-test state pollution.
+That was wrong, and the evidence row it rested on does not reproduce.** An
+independent re-measurement established:
 
 | Tree | Invocation | Result |
 |---|---|---|
-| clean `cdee6cc` worktree | that file + `test_thermodynamic_validity_2d_rough.py` | `test_npt_pep_adapter_boost.py` fully green; the two `beta must be positive` failures reproduce |
-| `cv-select/t00-contracts` | that file alone | 27 passed |
-| `cv-select/t00-contracts` | whole suite | `test_finite_difference_boost_force_matches_scaling_factor_expression` fails |
+| clean `cdee6cc` worktree | that file + `test_thermodynamic_validity_2d_rough.py` | the file is green; the two `beta must be positive` failures reproduce |
+| `cv-select/t00-contracts` | the single node, run 17 times | **7 failures (~41%)** |
+| `cv-select/t00-contracts` | whole suite | fails |
 
-So the finite-difference test **passes in isolation on both trees** and fails
-only inside a whole-suite run. That is cross-test state pollution, not a
-deterministic defect and not attributable to T00, whose modules are on no import
-path this test touches. `pytest-randomly` is not installed in this environment,
-so test ordering is fixed and is *not* the variable — the likely culprit is
-global simulation state (platform, force groups, or an integrator left
-configured) surviving from an earlier test in the session.
+The original "27 passed alone" observation was a real run, but it is one draw
+from roughly a 59%-pass distribution, not evidence of determinism. Two
+independent re-runs of that file alone gave `1 failed, 26 passed`.
 
-This is worth its own investigation before T04, which builds residual-CV forces
-and will want this file's finite-difference check to be trustworthy in CI. It is
-recorded here rather than fixed, per the plan's rule on keeping unrelated fixes
-separate.
+Bisection found no poisoning neighbour because there is none: splitting the
+file's preceding tests yields a failing union whose two halves are each green,
+which is the signature of chance rather than of a stateful neighbour.
+Corroborating detail: failing runs finish in 3.6-6.6 s against ~7.9-8.4 s for
+passing ones, and always abort on the first probe atom, so the nondeterminism
+sits in context/system construction rather than in the finite-difference
+numerics.
 
-The two `beta must be positive` failures (items 7-8 of the list above, in
-`test_thermodynamic_validity_2d_rough.py`) **did** reproduce in the clean
-worktree, confirming those as genuinely pre-existing.
+The earlier remark that the randomising order plugin is absent is true but
+beside the point: the variable is inside the test, not in the ordering.
+
+**Consequence.** The follow-up is to make the test deterministic (seed it, pin
+the platform), not to hunt a polluting neighbour. Until then it must not be
+counted among the pre-existing baseline failures, because it is not a fixed
+quantity.
+
+### Verification note: the baseline count is indicative, not exact
+
+Treat "3075 passed, 10 failed, 3 skipped" as indicative. Two independent
+collections put the baseline test set at **3087** items while that triple sums
+to 3088; the discrepancy of one was not resolved. More importantly, one of the
+ten failures is the ~41% coin flip above, so the failure count is not a
+reproducible quantity. What is solid: the six failures also present in the
+2026-09-12 log, and the two `test_atlas_md_docs.py` assertions, both confirmed
+by reading them.
+
+"Working tree clean" in this record means no *tracked* file was modified. Four
+untracked entries (two `.docx` files, a log, and `chignolin_knowledge_base/`)
+predate this branch and are not part of it.
 
 ### Unresolved and handed on
 
