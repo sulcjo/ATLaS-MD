@@ -393,3 +393,18 @@ one-line fixes for whoever owns the smoke file.
 `python -m py_compile` clean on every touched module; `git diff --check` clean.
 Files under `gareus/cv_selection/` import NumPy only; `gareus/swarm/analyze.py`
 is 673 lines (ceiling 800).
+
+Full suite at `ffae231` (detached run, 2026-09-20 22:41–22:58): **3291 passed, 7 failed,
+3 skipped, 2 deselected** in 1034 s. The 2 deselected are the two `test_package_smoke.py`
+items above; the 7 failures are items 1, 2, 3 and 7–10 of T00's "Pre-existing failures
+at `cdee6cc`" list, unchanged (`test_atlas_md_docs.py` ×2 — `site_name` casing and the
+mermaid count, both identical on `main`; `test_example_configs.py[chignolin_genpept_contact_bias_sigma.yaml]`
+— `--seq` missing from that example; `test_thermodynamic_validity_{2d_rough,real_md}.py::test_mutation_is_caught`
+×4 — the `beta=0`/`flip_beta` mutations now hit `IntegrityError: beta must be positive`
+before they reach the estimator). Item 4 of that list (`test_npt_pep_adapter_boost`) passes
+here. **No failure introduced by this branch.**
+
+Operational note for whoever runs the suite next: opencode's shell tool kills any command
+after 120 s, so a full-suite run dispatched through it dies silently around 50 % with no
+summary line. Launch pytest detached (`setsid nohup … &`, log to a file) and poll the log.
+
