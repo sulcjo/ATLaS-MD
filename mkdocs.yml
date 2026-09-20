@@ -82,3 +82,7 @@ nav:
   - Developer:
       - Architecture: developer/architecture.md
       - Testing and contributing: developer/contributing.md
+      - Equilibrium CV selection — implementation plan: developer/equilibrium-cv-implementation-plan.md
+      - Equilibrium CV selection — specification v0.1: developer/equilibrium-cv-selection-spec-v0.1.md
+      - Equilibrium CV selection — adversarial review: developer/equilibrium-cv-selection-adversarial-review.md
+      - Equilibrium CV selection — task log: developer/equilibrium-cv-task-log.md
