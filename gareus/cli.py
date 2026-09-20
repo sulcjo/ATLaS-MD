@@ -104,13 +104,19 @@ def _add_system_args(p: argparse.ArgumentParser) -> None:
 
 def _add_cv_args(p: argparse.ArgumentParser) -> None:
     # Primary / secondary CV selectors
+    # NOTE: "auto" is deliberately NOT a valid --cv1 choice: the primary CV is the
+    # fixed nonlocal-contact anchor the whole pipeline is built around (see
+    # docs/atlas-md/developer/plans/2026-09-20-auto-cv-pair.md).
     p.add_argument("--cv1", choices=["distance", "contacts", "nonlocal-contacts"], default=None,
                    help="Primary CV: distance or contacts.")
     p.add_argument("--cv2", choices=["none", "alpha", "beta", "alpha-coil-beta", "acb",
                                       "rama-map", "rama", "custom", "tica", "tica-linear",
                                       "torsion-pca", "bootstrap-torsion", "bootstrap-linear",
-                                      "torsion-linear"], default=None,
-                   help="Secondary CV for 2D workflow. Default centers inserted automatically.")
+                                      "torsion-linear", "auto", "residual-torsion-pc",
+                                      "residual-pc"], default=None,
+                   help="Secondary CV for 2D workflow. Default centers inserted automatically. "
+                        "'auto' selects CV2 during the swarm stage (--swarm-stage analyze) "
+                        "and freezes it as residual-torsion-pc.")
     # Expert atom override
     p.add_argument("--cv-atom1", default=None, help="Explicit primary CV atom, e.g. 1:CA.")
     p.add_argument("--cv-atom2", default=None, help="Explicit primary CV atom, e.g. -1:CA.")
@@ -196,6 +202,49 @@ def _add_cv_args(p: argparse.ArgumentParser) -> None:
     # Debug
     p.add_argument("--self-test-primary-cv-force", action="store_true",
                    help="Test primary CV OpenMM force and exit.")
+
+
+def _add_cv_selection_args(p: argparse.ArgumentParser) -> None:
+    """Automatic CV2 selection: frozen-pair artifacts and selection thresholds.
+
+    The selection itself runs inside the swarm stage (--swarm-stage analyze);
+    the result is a frozen residual-torsion-pc pair that a manual production
+    run must consume via the three artifact paths below."""
+    p.add_argument("--secondary-cv-model", default=None,
+                   help="Frozen pair model JSON written by the swarm stage "
+                        "(--swarm-stage analyze) for cv2 residual-torsion-pc.")
+    p.add_argument("--secondary-cv-candidate-set", default=None,
+                   help="Frozen candidate-set JSON written by the swarm stage "
+                        "for cv2 residual-torsion-pc.")
+    p.add_argument("--secondary-cv-feature-schema", default=None,
+                   help="Frozen feature-schema JSON written by the swarm stage "
+                        "for cv2 residual-torsion-pc.")
+    p.add_argument("--cv-selection-residual-degree", type=int, choices=[1, 2], default=1,
+                   help="Degree of the CV1->CV2 regression removed by auto CV2 "
+                        "selection in the swarm stage (--swarm-stage analyze).")
+    p.add_argument("--cv-selection-max-nonlinear-r2", type=float, default=0.20,
+                   help="Auto CV2 selection (swarm stage) rejects candidates whose "
+                        "nonlinear CV1 coupling exceeds this R^2.")
+    p.add_argument("--cv-selection-max-coupling-fraction", type=float, default=0.25,
+                   help="Auto CV2 selection (swarm stage) rejects candidates whose CV2 "
+                        "umbrella curvature on CV1 (k2 (v.B1)^2/(sigma_j^2 sigma_c^2) at the "
+                        "reference k2) exceeds this fraction of the CV1 force-constant ceiling.")
+    p.add_argument("--cv-selection-k2-reference-kcal", type=float, default=1.0,
+                   help="Auto CV2 selection reference k2 in kcal/mol; z2 is "
+                        "standardised, so 1.0 -- NOT 50 -- is the meaningful scale.")
+    p.add_argument("--cv-selection-min-gain-nats", type=float, default=0.02,
+                   help="Auto CV2 selection (swarm stage) keeps a pair only if its "
+                        "information gain over CV1 alone exceeds this many nats.")
+    p.add_argument("--cv-selection-min-windows-cv1", type=int, default=4,
+                   help="Auto CV2 selection (swarm stage) requires at least this "
+                        "many usable CV1 windows before it will select a pair.")
+    p.add_argument("--cv-selection-fallback", choices=["cv1_only", "refuse"],
+                   default="cv1_only",
+                   help="Auto CV2 selection (swarm stage) behaviour when no pair "
+                        "passes the gates: cv1_only continues 1D, refuse errors out.")
+    p.add_argument("--swarm-n-windows-cv2", type=int, default=4,
+                   help="Number of CV2 window centres the swarm stage proposes for "
+                        "the frozen residual-torsion-pc pair.")
 
 
 def _add_window_args(p: argparse.ArgumentParser) -> None:
@@ -956,6 +1005,35 @@ def _validate_gamd_args(args: argparse.Namespace) -> None:
         )
 
 
+def _validate_cv_selection_args(p: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Validate the automatic-CV2-selection flags against the chosen window mode.
+
+    A frozen CV pair (auto-selected or residual-torsion-pc) is never redefined
+    mid-run, so the tICA CV2 switch is forced off; and a manual production run
+    can only consume a pair that already exists, never select one.
+    """
+    mode = secondary_cv_mode(args)
+    if mode == "auto":
+        args.tica_switch_cv2 = False
+        if getattr(args, "window_mode", None) == "manual":
+            p.error("--cv2 auto selects CV2 inside the swarm stage; a manual production "
+                    "run must pass --cv2 residual-torsion-pc with the three frozen "
+                    "artifact paths")
+    elif mode == "residual-torsion-pc":
+        # Frozen in every window mode, not only manual: the sidecar sets manual, but a
+        # hand-written adaptive config must not be allowed to switch a frozen pair either.
+        args.tica_switch_cv2 = False
+        if getattr(args, "window_mode", None) == "manual":
+            missing = [flag for flag, attr in (
+                ("--secondary-cv-model", "secondary_cv_model"),
+                ("--secondary-cv-candidate-set", "secondary_cv_candidate_set"),
+                ("--secondary-cv-feature-schema", "secondary_cv_feature_schema"),
+            ) if getattr(args, attr, None) is None]
+            if missing:
+                p.error("--cv2 residual-torsion-pc with --window-mode manual requires the "
+                        "three frozen artifact paths; missing: " + ", ".join(missing))
+
+
 def _validate_npt_args(args: argparse.Namespace) -> None:
     """Cross-validate the NPT-correction flags.
 
@@ -1485,6 +1563,7 @@ def build_gareus_parser() -> argparse.ArgumentParser:
     _add_core_args(p)
     _add_system_args(p)
     _add_cv_args(p)
+    _add_cv_selection_args(p)
     _add_window_args(p)
     _add_us_args(p)
     _add_seeding_args(p)
@@ -1516,6 +1595,7 @@ def parse_args(argv: Optional[Iterable[str]] = None):
     _add_core_args(p)
     _add_system_args(p)
     _add_cv_args(p)
+    _add_cv_selection_args(p)
     _add_window_args(p)
     _add_us_args(p)
     _add_seeding_args(p)
@@ -1545,6 +1625,7 @@ def parse_args(argv: Optional[Iterable[str]] = None):
     args.contact_scheme = contact_scheme(args)
     _validate_contact_args(args)
     _validate_gamd_args(args)
+    _validate_cv_selection_args(p, args)
     _validate_npt_args(args)
     validate_gamd_stage_multiples(args)
 

@@ -94,6 +94,16 @@ CONFIG_KEY_ALIASES: Dict[str, str] = {
     #        production_steps, equil_steps are now canonical dests — aliases removed.
     "boost_type": "gamd_boost_type",  # documented backward-compat alias
     "adaptive_min_rounds": "adaptive_feedback_min_rounds",
+    # cv_selection: section-child short names -> cv_selection_* dests
+    # (a frozen CV pair's knobs; the section name itself is cosmetic —
+    # _flatten_config_mapping matches leaf keys against argparse dests).
+    "residual_degree": "cv_selection_residual_degree",
+    "max_nonlinear_r2": "cv_selection_max_nonlinear_r2",
+    "max_coupling_fraction": "cv_selection_max_coupling_fraction",
+    "k2_reference_kcal": "cv_selection_k2_reference_kcal",
+    "min_gain_nats": "cv_selection_min_gain_nats",
+    "min_windows_cv1": "cv_selection_min_windows_cv1",
+    "fallback": "cv_selection_fallback",
 }
 
 
@@ -456,6 +466,17 @@ def _basic_chignolin_config() -> Dict[str, Any]:
             "cv2_adaptive_overlap_sigma": 2.3,
             "cv2_k_scale": 1.0,
             "cv2_n_centers": 3,
+        },
+        "cv_selection": {
+            # Automatic CV2 selection: runs in the swarm stage
+            # (--swarm-stage analyze) and freezes CV2 as residual-torsion-pc.
+            "residual_degree": 1,
+            "max_nonlinear_r2": 0.20,
+            "max_coupling_fraction": 0.25,
+            "k2_reference_kcal": 1.0,
+            "min_gain_nats": 0.02,
+            "min_windows_cv1": 4,
+            "fallback": "cv1_only",
         },
         "starting_structures": {
             "seed_conformers_dir": "chignolin_genpept_seeds/",
