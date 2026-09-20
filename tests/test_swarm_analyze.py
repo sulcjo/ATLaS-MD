@@ -331,14 +331,18 @@ def _seed_library(tmp_path, preset):
     return lib
 
 
-def test_a_hairpin_biased_seed_library_is_refused_even_when_the_config_says_broad(synthetic_swarm, swarm_args, tmp_path):
-    import pytest
+def test_a_hairpin_biased_seed_library_is_recorded_and_warned_even_when_the_config_says_broad(synthetic_swarm, swarm_args, tmp_path):
+    import json as _json
     from gareus.swarm.analyze import analyze_swarm_stage
     out = synthetic_swarm(with_features=True, wide_anchor=True)
     lib = _seed_library(tmp_path, "chignolin")
-    with pytest.raises(ValueError, match="not native-blind"):
-        analyze_swarm_stage(out, swarm_args(secondary_cv="auto", diversity_bank_preset="broad",
-                                            seed_conformers_dir=str(lib)))
+    report = analyze_swarm_stage(out, swarm_args(secondary_cv="auto", diversity_bank_preset="broad",
+                                                 seed_conformers_dir=str(lib)))
+    assert report["cv_selection"]["status"] == "pair"
+    model = _json.loads((out / "swarm" / "analysis" / "cv_pair_model.json").read_text())
+    assert model["genpept_preset"] == "chignolin"
+    assert any("not native-blind" in w and "ab initio" in w for w in report["warnings"])
+    assert any("library's record is authoritative" in w for w in report["warnings"])
 
 
 def test_the_library_record_wins_over_the_config_and_is_reported(synthetic_swarm, swarm_args, tmp_path):
@@ -351,14 +355,16 @@ def test_the_library_record_wins_over_the_config_and_is_reported(synthetic_swarm
     assert any("library's record is authoritative" in w for w in report["warnings"])
 
 
-def test_no_preset_anywhere_refuses_instead_of_assuming_broad(synthetic_swarm, swarm_args, tmp_path):
-    import pytest
+def test_no_preset_anywhere_records_unknown_instead_of_assuming_broad(synthetic_swarm, swarm_args, tmp_path):
+    import json as _json
     from gareus.swarm.analyze import analyze_swarm_stage
     out = synthetic_swarm(with_features=True, wide_anchor=True)
     lib = _seed_library(tmp_path, None)
-    with pytest.raises(RuntimeError, match="diversity_bank_preset"):
-        analyze_swarm_stage(out, swarm_args(secondary_cv="auto", diversity_bank_preset=None,
-                                            seed_conformers_dir=str(lib)))
+    report = analyze_swarm_stage(out, swarm_args(secondary_cv="auto", diversity_bank_preset=None,
+                                                 seed_conformers_dir=str(lib)))
+    model = _json.loads((out / "swarm" / "analysis" / "cv_pair_model.json").read_text())
+    assert model["genpept_preset"] == "unknown"
+    assert any("recording 'unknown'" in w for w in report["warnings"])
 
 
 def test_pair_gate_semantics():

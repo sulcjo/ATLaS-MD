@@ -270,7 +270,8 @@ def _seed_library_preset(args, warnings: List[str]) -> str:
     The library's own ``generation_config.json`` is authoritative -- a hairpin-biased
     library must not pass the native-blind check because a config forgot to say so.
     ``args.diversity_bank_preset`` is used only when the library carries no record;
-    with neither, the analysis refuses rather than assume."""
+    with neither, ``"unknown"`` is recorded. A fold-biased preset is accepted and
+    recorded in the pair model, never silently upgraded to native-blind."""
     configured = getattr(args, "diversity_bank_preset", None)
     recorded = None
     lib = getattr(args, "seed_conformers_dir", None)
@@ -289,10 +290,10 @@ def _seed_library_preset(args, warnings: List[str]) -> str:
         return str(recorded)
     if configured:
         return str(configured)
-    raise RuntimeError("cv2=auto needs to know the GENPEPT preset the seed library was generated with, "
-                       "and neither <seed_conformers_dir>/generation_config.json nor diversity_bank_preset "
-                       "records one; set diversity_bank_preset explicitly (only native-blind presets are "
-                       "accepted)")
+    warnings.append("cv selection: neither <seed_conformers_dir>/generation_config.json nor "
+                    "diversity_bank_preset records a GENPEPT preset; recording 'unknown' -- the pair "
+                    "model cannot claim a native-blind library")
+    return "unknown"
 
 
 def _swarm_contact_pairs(out_dir: Path, args, warnings: List[str]) -> Optional[list]:
@@ -575,6 +576,10 @@ def analyze_swarm_stage(out_dir, args) -> dict:
                 library_versions=_library_versions(),
                 genpept_preset=_seed_library_preset(args, warnings),
             )
+            if not sel.report.get("native_blind_library", False):
+                warnings.append(f"cv selection: seed library preset {sel.report.get('genpept_preset')!r} is not "
+                                "native-blind; the selected CV2 rests on a fold-aware library and this run "
+                                "cannot be quoted as ab initio")
             selection = {
                 "status": sel.status, "anchor": sel.anchor.kind, "anchor_reasons": list(sel.anchor.reasons),
                 "anchor_n_resolvable": int(sel.anchor.n_resolvable),

@@ -104,13 +104,17 @@ class PairModel(_Artifact):
     certificate: dict[str, Any]
     runner_ups: tuple[dict, ...]
     genpept_preset: str
+
+    @property
+    def native_blind_library(self) -> bool:
+        """True when the seed library's GENPEPT preset carries no fold-specific bank."""
+        from .protocol import NATIVE_BLIND_GENERATOR_PRESETS
+        return self.genpept_preset in NATIVE_BLIND_GENERATOR_PRESETS
     sha256: str
 
     @classmethod
     def _parse(cls, data: dict[str, Any]) -> "PairModel":
         from .contracts import MAX_COMPONENT_INDEX, NATIVE_BLIND_CV_KINDS
-        from .protocol import NATIVE_BLIND_GENERATOR_PRESETS
-
         _exact_fields(data, {"schema", "candidate_set_sha256", "feature_schema_sha256", "anchor",
                              "selected_component_index", "degree", "certificate", "runner_ups",
                              "genpept_preset"}, "pair model")
@@ -131,9 +135,8 @@ class PairModel(_Artifact):
             _fail(ReasonCode.INVALID_ENUM, "pair model.degree must be 1 or 2")
         preset = data["genpept_preset"]
         require_visible_text(preset, "pair model.genpept_preset")
-        if preset not in NATIVE_BLIND_GENERATOR_PRESETS:
-            _fail(ReasonCode.NATIVE_DERIVED_INPUT,
-                  f"GENPEPT preset {preset!r} encodes a fold bias; a pair fitted on it is not native-blind")
+        # Recorded, not enforced: a fold-biased preset is a documented property of the pair
+        # (see ``PairModel.native_blind_library``), not a parse error. 2026-09-21 user ruling.
         certificate = _parse_certificate(data["certificate"])
         runner_ups = _parse_runner_ups(data["runner_ups"], selected, MAX_COMPONENT_INDEX)
         body = {"schema": PAIR_MODEL_VERSION, "candidate_set_sha256": cs_digest,

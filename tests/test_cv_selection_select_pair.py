@@ -108,9 +108,16 @@ def test_balanced_weights_give_every_cell_equal_mass():
     assert abs(w[cells == 0].sum() - w[cells == 1].sum()) < 1e-12 and abs(w.sum() - 1.0) < 1e-12
 
 
-def test_a_fold_specific_genpept_preset_is_refused():
-    with pytest.raises(ValueError, match="native-blind"):
-        select_cv_pair(_dataset(), SelectionConfig(), **{**ARGS, "genpept_preset": "chignolin"})
+def test_a_fold_specific_genpept_preset_is_recorded_not_refused():
+    sel = select_cv_pair(_dataset(), SelectionConfig(), **{**ARGS, "genpept_preset": "chignolin"})
+    assert sel.report["genpept_preset"] == "chignolin" and sel.report["native_blind_library"] is False
+    if sel.pair_model is not None:
+        assert sel.pair_model.genpept_preset == "chignolin" and sel.pair_model.native_blind_library is False
+        from gareus.cv_selection.pair_model import PairModel
+        again = PairModel.from_json_bytes(sel.pair_model.to_json_bytes())
+        assert again.native_blind_library is False and again.sha256 == sel.pair_model.sha256
+    broad = select_cv_pair(_dataset(), SelectionConfig(), **ARGS)
+    assert broad.report["native_blind_library"] is True
 
 
 def test_a_stored_pair_whose_certificate_is_not_orthogonal_is_a_broken_artifact():

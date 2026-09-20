@@ -148,9 +148,11 @@ def _half_split_winners(X, a, shape, groups, cfg: SelectionConfig) -> tuple[Opti
 def select_cv_pair(data: SwarmDataset, config: SelectionConfig, *, physical_system_sha256: str,
                    training_rows_sha256: str, library_versions: Mapping[str, str],
                    genpept_preset: str) -> PairSelection:
-    if genpept_preset not in NATIVE_BLIND_GENERATOR_PRESETS:
-        raise ValueError(f"GENPEPT preset {genpept_preset!r} is not native-blind; use one of "
-                         f"{sorted(NATIVE_BLIND_GENERATOR_PRESETS)}")
+    # A fold-biased GENPEPT preset (e.g. "chignolin") is accepted and RECORDED, not refused:
+    # the selection then rests on a library that knows the fold, and the pair model says so
+    # (``genpept_preset``) so no downstream reader can mistake it for an ab initio run.
+    # ``NATIVE_BLIND_GENERATOR_PRESETS`` still names the presets that ARE native-blind.
+    native_blind_library = genpept_preset in NATIVE_BLIND_GENERATOR_PRESETS
     X = np.asarray(data.features, dtype=np.float64)
     a = np.asarray(data.anchor.values, dtype=np.float64)
     shape = np.asarray(data.shape_features, dtype=np.float64)
@@ -162,7 +164,8 @@ def select_cv_pair(data: SwarmDataset, config: SelectionConfig, *, physical_syst
 
     anchor = score_anchor(data.anchor, temperature_k=config.temperature_k,
                           k_max_kcal=config.k1_kcal_reference, min_windows=config.min_windows_cv1)
-    report: dict[str, Any] = {"anchor": {"kind": anchor.kind, "n_resolvable": anchor.n_resolvable,
+    report: dict[str, Any] = {"genpept_preset": genpept_preset, "native_blind_library": bool(native_blind_library),
+                              "anchor": {"kind": anchor.kind, "n_resolvable": anchor.n_resolvable,
                                          "dynamic_range": anchor.dynamic_range,
                                          "deployable": anchor.deployable, "reasons": list(anchor.reasons)},
                               "config": {k: (list(v) if isinstance(v, tuple) else v)
