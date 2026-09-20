@@ -254,3 +254,95 @@ def test_upper_bound_candidates_are_still_observed_seed_values():
                                    k_max_kcal=1200.0, max_seed_gap_sigma=0.05)
     assert out["autotuned"] is True
     assert np.min(np.abs(seeds - out["hi"])) < 1e-12
+
+
+# ---------------------------------------------------------------------------
+# Task 7: two-dimensional ladder layout for an auto-selected pair
+# ---------------------------------------------------------------------------
+
+def test_small_product_uses_a_joint_grid_and_respects_the_cap():
+    from gareus.swarm.ladder_design import design_2d_layout
+    lay = design_2d_layout(6, 4, n_rungs=4, max_replicas=128)
+    assert lay["kind"] == "joint" and lay["spatial_states"] == 24 and 24 * 4 <= 128
+    assert all(i1 is not None and i2 is not None for i1, i2 in lay["cells"])
+
+
+def test_large_product_falls_back_to_sparse_axes_plus_bridge_and_patches():
+    from gareus.swarm.ladder_design import design_2d_layout
+    lay = design_2d_layout(12, 8, n_rungs=4, max_replicas=128)
+    cells = lay["cells"]
+    assert lay["kind"] == "sparse" and lay["spatial_states"] * 4 <= 128
+    assert (None, None) in cells
+    assert sum(1 for i1, i2 in cells if i2 is None and i1 is not None) == 12
+    assert sum(1 for i1, i2 in cells if i1 is None and i2 is not None) == 8
+    assert lay["spatial_states"] == 32                       # cap filled with diagonal patches
+
+
+def test_default_zero_replica_cap_is_refused_not_silently_zero():
+    import pytest
+    from gareus.swarm.ladder_design import design_2d_layout
+    with pytest.raises(ValueError, match="max_replicas"):
+        design_2d_layout(6, 4, n_rungs=4, max_replicas=0)
+
+
+def test_cv2_centres_widen_with_the_boost_rungs():
+    import numpy as np
+    from gareus.swarm.ladder_design import reweighted_cv2_centers
+    rng = np.random.default_rng(0)
+    z2 = rng.normal(size=20000)
+    dv = 20.0 * (1.0 - np.tanh(z2 ** 2))                      # boost is LOWEST in the tails
+    out = reweighted_cv2_centers(z2, dv, 300.0, [0.0, 0.5, 1.0], 5)
+    lo0, hi0 = out["per_rung_quantiles"][0.0]
+    lo1, hi1 = out["per_rung_quantiles"][1.0]
+    assert lo1 <= lo0 and hi1 >= hi0                          # top rung is broader
+    assert out["centers"][0] <= lo0 and out["centers"][-1] >= hi0
+    assert all(out["per_rung_ess"][lam] > 0 for lam in (0.0, 0.5, 1.0))
+    assert out["per_rung_ess"][0.0] > out["per_rung_ess"][1.0]
+
+
+def test_per_gap_force_constants_are_stiffer_where_centres_are_closer():
+    import numpy as np
+    from gareus.swarm.ladder_design import cv2_force_constants_per_gap
+    ks = cv2_force_constants_per_gap(np.array([-2.0, -1.0, -0.5, 0.5, 2.0]), 300.0,
+                                     k_min_kcal=1e-3, k_max_kcal=1000.0)
+    assert len(ks) == 5 and ks[2] > ks[0] and ks[2] == ks[1]
+    rt = 0.0019872041 * 300.0
+    assert np.isclose(ks[0], rt / (1.0 / 1.5) ** 2)         # spacing 1.0 at the left end
+
+
+def test_2d_csv_round_trips_through_the_production_loader(tmp_path):
+    import csv
+    from gareus.swarm.ladder_design import write_ladder_windows_2d_csv
+    from gareus.windows import load_explicit_2d_window_csv
+    rows = [dict(center1=0.02, k1=800.0, center2=-1.0, k2=50.0),
+            dict(center1=0.04, k1=800.0, center2=None, k2=0.0)]
+    path = write_ladder_windows_2d_csv(tmp_path / "w.csv", rows, [0.0, 0.5, 1.0])
+    with path.open() as fh:
+        recs = list(csv.DictReader(fh))
+    assert len(recs) == 6 and recs[0]["gamd_lambda"] == "0.000000" and recs[3]["secondary_cv_center"] == ""
+
+    class Args:
+        primary_cv = "nonlocal-contacts"
+        secondary_cv = "residual-torsion-pc"
+        contact_k_kcal = None
+        secondary_cv_k_kcal = 50.0
+    centers, ks, sec_c, sec_k, meta, _ = load_explicit_2d_window_csv(Args(), path)
+    assert len(centers) == len(sec_c) == len(sec_k) == 6      # one per window, k2=0 rows included
+    assert sec_k[3] == 0.0 and sec_k[0] == 50.0
+    assert meta["enabled"] is True
+
+
+def test_an_empty_secondary_centre_with_a_nonzero_force_constant_is_refused(tmp_path):
+    import pytest
+    from gareus.swarm.ladder_design import write_ladder_windows_2d_csv
+    from gareus.windows import load_explicit_2d_window_csv
+    path = write_ladder_windows_2d_csv(tmp_path / "bad.csv",
+                                       [dict(center1=0.02, k1=800.0, center2=None, k2=5.0)], [0.0])
+
+    class Args:
+        primary_cv = "nonlocal-contacts"
+        secondary_cv = "residual-torsion-pc"
+        contact_k_kcal = None
+        secondary_cv_k_kcal = 50.0
+    with pytest.raises(ValueError, match="unrestrained"):
+        load_explicit_2d_window_csv(Args(), path)

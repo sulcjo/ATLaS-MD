@@ -375,3 +375,120 @@ def write_ladder_windows_csv(path, centers, ks_kcal, lambdas) -> Path:
         ["window", "primary_cv_mode", "primary_cv_center", "primary_cv_k_kcal", "gamd_lambda"],
         _rows(),
     )
+
+
+# ---------------------------------------------------------------------------
+# Two-dimensional layout for an automatically selected (CV1, CV2) pair
+# ---------------------------------------------------------------------------
+
+R_KCAL_PER_MOL_K = 0.0019872041
+R_KJ_PER_MOL_K = 0.0083144626
+
+
+def design_2d_layout(n1: int, n2: int, *, n_rungs: int, max_replicas: int) -> dict:
+    """Spatial states for a 2-D ladder under the replica cap.
+
+    ``n1 * n2`` cells fit -> a joint grid. Otherwise a sparse layout: one bridge
+    (both umbrellas off), every axis-1 window with ``k2 = 0``, every axis-2 window
+    with ``k1 = 0``, then joint patches filling the diagonal band outward until
+    the cap. Cells are ``(i1 | None, i2 | None)``; ``None`` = that axis unrestrained.
+    """
+    if int(max_replicas) <= 0:
+        raise ValueError("max_replicas must be set and positive; the default 0 cannot size a 2-D ladder")
+    if int(n_rungs) <= 0 or int(n1) <= 0 or int(n2) <= 0:
+        raise ValueError("n1, n2 and n_rungs must be positive")
+    cap = int(max_replicas) // int(n_rungs)
+    if n1 * n2 <= cap:
+        return {"kind": "joint", "spatial_states": n1 * n2, "n1": int(n1), "n2": int(n2),
+                "cells": [(i, j) for i in range(n1) for j in range(n2)]}
+    cells: list = [(None, None)] + [(i, None) for i in range(n1)] + [(None, j) for j in range(n2)]
+    budget = cap - len(cells)
+    if budget < 0:
+        raise ValueError(f"{n1} + {n2} + 1 axis states exceed the {cap}-state cap; reduce windows")
+    order = sorted(((i, j) for i in range(n1) for j in range(n2)),
+                   key=lambda ij: (abs(ij[0] / max(n1 - 1, 1) - ij[1] / max(n2 - 1, 1)), ij))
+    cells += order[:budget]
+    return {"kind": "sparse", "spatial_states": len(cells), "n1": int(n1), "n2": int(n2), "cells": cells}
+
+
+def _weighted_quantile(values: np.ndarray, weights: np.ndarray, q: float) -> float:
+    order = np.argsort(values)
+    v, w = values[order], weights[order]
+    cdf = np.cumsum(w) / np.sum(w)
+    return float(np.interp(q, cdf, v))
+
+
+def reweighted_cv2_centers(z2, deltav_kj, temperature_k: float, lambdas, n_windows: int, *,
+                           lo_q: float = 0.02, hi_q: float = 0.98) -> dict:
+    """CV2 centres spanning the union of the lambda = 0 and top-rung z2 distributions.
+
+    The Pep-GaMD dihedral channel boosts exactly the torsion energies z2 is built
+    from, so rungs above lambda = 0 sample a broader z2 than the unbiased swarm.
+    Reweighting the swarm frames by exp(-beta lambda DeltaV_max) -- the same weights
+    ladder_design uses for the rung ESS -- predicts each rung's quantiles; the
+    centres cover the union so no rung starts outside the grid. The ESS per rung
+    says how much to trust each prediction.
+    """
+    z = np.asarray(z2, dtype=float)
+    dv = np.asarray(deltav_kj, dtype=float)
+    if z.shape != dv.shape or z.ndim != 1:
+        raise ValueError("z2 and deltav_kj must be 1-D of equal length")
+    finite = np.isfinite(z) & np.isfinite(dv)
+    z, dv = z[finite], dv[finite]
+    if z.size < 2:
+        raise ValueError("need at least two finite frames to place CV2 centres")
+    beta = 1.0 / (R_KJ_PER_MOL_K * float(temperature_k))
+    quantiles: dict = {}
+    ess: dict = {}
+    for lam in lambdas:
+        w = np.exp(-beta * float(lam) * (dv - dv.min()))
+        w = w / w.sum()
+        quantiles[float(lam)] = (_weighted_quantile(z, w, lo_q), _weighted_quantile(z, w, hi_q))
+        ess[float(lam)] = float(1.0 / np.sum(w ** 2))
+    lo = min(q[0] for q in quantiles.values())
+    hi = max(q[1] for q in quantiles.values())
+    return {"centers": np.linspace(lo, hi, int(n_windows)), "per_rung_quantiles": quantiles,
+            "per_rung_ess": ess, "lo_q": float(lo_q), "hi_q": float(hi_q)}
+
+
+def cv2_force_constants_per_gap(centers, temperature_k: float, *, overlap_sigma: float = 1.5,
+                                k_min_kcal: float, k_max_kcal: float) -> list:
+    """k = RT / (spacing / overlap_sigma)^2 per centre, spacing = the smaller adjacent gap."""
+    c = np.asarray(centers, dtype=float)
+    if c.size < 2 or np.any(np.diff(c) <= 0):
+        raise ValueError("CV2 centres must be at least two and strictly increasing")
+    gaps = np.diff(c)
+    rt = R_KCAL_PER_MOL_K * float(temperature_k)
+    out = []
+    for i in range(c.size):
+        left = gaps[i - 1] if i > 0 else np.inf
+        right = gaps[i] if i < gaps.size else np.inf
+        spacing = float(min(left, right))
+        sigma = spacing / float(overlap_sigma)
+        out.append(float(min(max(rt / sigma ** 2, k_min_kcal), k_max_kcal)))
+    return out
+
+
+def write_ladder_windows_2d_csv(path, rows, lambdas) -> Path:
+    """(center1, k1, center2, k2) rows x lambda rungs; an unrestrained axis has k = 0.
+
+    A ``None`` centre on an unrestrained axis is written empty. The production loader
+    accepts that only together with ``k = 0`` on the same axis.
+    """
+    lambdas = list(lambdas)
+
+    def _rows():
+        n = 0
+        for r in rows:
+            for lam in lambdas:
+                c2 = "" if r.get("center2") is None else f"{float(r['center2']):.6f}"
+                yield [n, "contacts", f"{float(r['center1']):.6f}", f"{float(r['k1']):.4f}",
+                       c2, f"{float(r['k2']):.4f}", f"{float(lam):.6f}"]
+                n += 1
+
+    return write_csv_atomic(
+        Path(path),
+        ["window", "primary_cv_mode", "primary_cv_center", "primary_cv_k_kcal",
+         "secondary_cv_center", "secondary_cv_k_kcal_mol", "gamd_lambda"],
+        _rows(),
+    )

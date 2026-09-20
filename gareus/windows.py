@@ -1302,27 +1302,42 @@ def load_explicit_2d_window_csv(args, path: Path) -> tuple[np.ndarray, list[floa
         if k < 0.0:
             raise ValueError(f"primary-CV force constant in explicit 2D window CSV row {offset} must be non-negative; got {k}")
 
-        sec_raw = _csv_first_present(row, ["secondary_cv_center", "secondary_center", "secondary", "ss0", "secondary_cv_target"])
-        has_secondary = sec_raw is not None
+        sec_center_columns = ["secondary_cv_center", "secondary_center", "secondary", "ss0", "secondary_cv_target"]
+        sec_k_columns = ["secondary_cv_k_kcal_mol", "secondary_k_kcal_mol", "secondary_cv_k_kcal", "ss_k_kcal_mol", "secondary_k"]
+        sec_raw = _csv_first_present(row, sec_center_columns)
+        sec_k_raw = _csv_first_present(row, sec_k_columns)
+        # A row carries a secondary axis if it names a centre OR a force constant. An
+        # empty centre is legal only with k2 == 0 (an unrestrained axis: the centre is
+        # irrelevant, exactly as correctness/bias.py treats zero force). Such rows keep
+        # a placeholder so the per-window arrays stay one entry per window.
+        has_secondary = sec_raw is not None or sec_k_raw is not None
         any_secondary = any_secondary or has_secondary
         all_secondary = all_secondary and has_secondary
         if has_secondary:
-            sec = _csv_float_field(row, ["secondary_cv_center", "secondary_center", "secondary", "ss0", "secondary_cv_target"], offset, "secondary-CV center")
             sec_k = _csv_float_field(
                 row,
-                ["secondary_cv_k_kcal_mol", "secondary_k_kcal_mol", "secondary_cv_k_kcal", "ss_k_kcal_mol", "secondary_k"],
+                sec_k_columns,
                 offset,
                 "secondary-CV force constant (kcal/mol/CV^2)",
                 default=float(getattr(args, "secondary_cv_k_kcal", 50.0) or 50.0),
             )
             if sec_k < 0.0:
                 raise ValueError(f"secondary-CV force constant in explicit 2D window CSV row {offset} must be non-negative; got {sec_k}")
-            sec_min, sec_max = secondary_cv_range(args)
-            if sec < sec_min - 0.000001 or sec > sec_max + 0.000001:
-                raise ValueError(
-                    f"secondary-CV center in row {offset} is outside [{sec_min:g}, {sec_max:g}] "
-                    f"for {secondary_cv_mode(args)!r} mode: {sec}"
-                )
+            if sec_raw is None:
+                if sec_k != 0.0:
+                    raise ValueError(
+                        f"--windows-2d-csv row {offset}: a secondary-CV force constant {sec_k} without a "
+                        "secondary_cv_center is only allowed when the force constant is 0 (unrestrained axis)"
+                    )
+                sec = 0.0
+            else:
+                sec = _csv_float_field(row, sec_center_columns, offset, "secondary-CV center")
+                sec_min, sec_max = secondary_cv_range(args)
+                if sec_k > 0.0 and (sec < sec_min - 0.000001 or sec > sec_max + 0.000001):
+                    raise ValueError(
+                        f"secondary-CV center in row {offset} is outside [{sec_min:g}, {sec_max:g}] "
+                        f"for {secondary_cv_mode(args)!r} mode: {sec}"
+                    )
         else:
             sec = None
             sec_k = None
