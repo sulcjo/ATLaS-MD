@@ -1,5 +1,9 @@
 """Versioned artifacts for equilibrium CV selection, and the rules they enforce.
 
+This module is the public façade: later tasks import everything they need from
+``gareus.cv_selection.contracts``. Mechanism lives in :mod:`._base` and the
+controlled vocabularies in :mod:`.vocabulary`; both are re-exported here.
+
 Design rules this module exists to keep (plan sections 3, 5, 7):
 
 * Identity is *contents*, never a filename. Digests are taken over the existing
@@ -22,15 +26,35 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
-from ..correctness._io import IntegrityError, digest, json_bytes, json_loads
+from ..correctness._io import IntegrityError, json_bytes, json_loads
 from ..correctness.state_identity import _canonical_cv
+from ._base import (ContractError, ReasonCode, _Artifact, _canonical, _enum,
+                    _exact_fields, _fail, _finite_vector, _hex64, _positive_float,
+                    _positive_int, _schema, artifact_digest, verify_artifact_digest)
+from .protocol import (NATIVE_BLIND_GENERATOR_PRESETS, PROTOCOL_VERSION,
+                       MissingRequirement, ProtocolSpec, ReadinessReport,
+                       validate_protocol)
+from .vocabulary import (Advantage, CrossProtocol, DecisionOutcome, Dependence,
+                         ExitCode, Integrity, PhaseKind, Precision, Reproducibility,
+                         SearchMode, Stage, StudyRole, Support,
+                         measurement_phase_for, validate_role_phase)
+
+__all__ = [
+    "Advantage", "CandidateComponent", "CandidateSet", "ContractError", "CrossProtocol",
+    "Decision", "DecisionOutcome", "Dependence", "ExitCode", "FeatureId", "FeatureSchema",
+    "Integrity", "IntegrityError", "MissingRequirement", "ObservablePanel", "PhaseKind",
+    "Precision", "PrimaryObservable", "ProtocolSpec", "ReadinessReport", "ReasonCode",
+    "Reproducibility", "SearchMode", "Stage", "StudyRole", "Support", "TrialArm",
+    "TrialPlan", "artifact_digest", "json_bytes", "json_loads", "measurement_phase_for",
+    "require_feature_binding", "validate_protocol", "validate_role_phase",
+    "verify_artifact_digest",
+]
 
 FEATURE_SCHEMA_VERSION = "atlas-cv-selection-feature-schema-v1"
 CANDIDATE_SET_VERSION = "atlas-cv-selection-candidate-set-v1"
 OBSERVABLE_PANEL_VERSION = "atlas-cv-selection-observable-panel-v1"
-PROTOCOL_VERSION = "atlas-cv-selection-protocol-v1"
 TRIAL_PLAN_VERSION = "atlas-cv-selection-trial-plan-v1"
 DECISION_VERSION = "atlas-cv-selection-decision-v1"
 
@@ -43,292 +67,6 @@ MAX_COMPONENT_INDEX = 6
 
 #: The frozen primary panel is eight CDF probabilities (plan section 7.1).
 PRIMARY_PANEL_SIZE = 8
-
-#: GENPEPT presets that encode a known fold bias are not native-blind sources.
-NATIVE_BLIND_GENERATOR_PRESETS = frozenset({"broad"})
-
-
-class ReasonCode(str, Enum):
-    """Stable machine-readable rejection reasons."""
-
-    UNKNOWN_SCHEMA_VERSION = "UNKNOWN_SCHEMA_VERSION"
-    UNKNOWN_FIELD = "UNKNOWN_FIELD"
-    MISSING_FIELD = "MISSING_FIELD"
-    INVALID_ENUM = "INVALID_ENUM"
-    INVALID_ATOM_QUADRUPLET = "INVALID_ATOM_QUADRUPLET"
-    INVALID_QUANTILE = "INVALID_QUANTILE"
-    NONPOSITIVE_SCALE = "NONPOSITIVE_SCALE"
-    TOLERANCE_NOT_POSITIVE = "TOLERANCE_NOT_POSITIVE"
-    FEATURE_INDEX_NOT_CONTIGUOUS = "FEATURE_INDEX_NOT_CONTIGUOUS"
-    FEATURE_IDENTITY_MISMATCH = "FEATURE_IDENTITY_MISMATCH"
-    FEATURE_WIDTH_MISMATCH = "FEATURE_WIDTH_MISMATCH"
-    DUPLICATE_FEATURE_NAME = "DUPLICATE_FEATURE_NAME"
-    DUPLICATE_COMPONENT_INDEX = "DUPLICATE_COMPONENT_INDEX"
-    COMPONENT_INDEX_OUT_OF_RANGE = "COMPONENT_INDEX_OUT_OF_RANGE"
-    INCOMPLETE_REGRESSION = "INCOMPLETE_REGRESSION"
-    PRIMARY_PANEL_SIZE = "PRIMARY_PANEL_SIZE"
-    DUPLICATE_OBSERVABLE_ID = "DUPLICATE_OBSERVABLE_ID"
-    NATIVE_DERIVED_INPUT = "NATIVE_DERIVED_INPUT"
-    STUDY_ROLE_PHASE_CONFLICT = "STUDY_ROLE_PHASE_CONFLICT"
-    ARTIFACT_DIGEST_MISMATCH = "ARTIFACT_DIGEST_MISMATCH"
-    MISSING_ARTIFACT = "MISSING_ARTIFACT"
-    PROTOCOL_NOT_READY = "PROTOCOL_NOT_READY"
-    UNKNOWN_REASON_CODE = "UNKNOWN_REASON_CODE"
-    MISSING_SELECTED_ARM = "MISSING_SELECTED_ARM"
-    CONFIRMATION_BLOCKED = "CONFIRMATION_BLOCKED"
-    INTEGRITY_OUTCOME_CONFLICT = "INTEGRITY_OUTCOME_CONFLICT"
-    ARM_WITHOUT_BUDGET = "ARM_WITHOUT_BUDGET"
-    UNEQUAL_ARM_COST = "UNEQUAL_ARM_COST"
-    DUPLICATE_ARM_ID = "DUPLICATE_ARM_ID"
-    REPLICA_CAP_EXCEEDED = "REPLICA_CAP_EXCEEDED"
-    LAYOUT_INCONSISTENT = "LAYOUT_INCONSISTENT"
-    UNRESOLVED_CORRELATION = "UNRESOLVED_CORRELATION"
-    INSUFFICIENT_SUPPORT = "INSUFFICIENT_SUPPORT"
-    BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
-
-
-class ContractError(IntegrityError):
-    """A persisted selector artifact cannot be read as what it claims to be."""
-
-    def __init__(self, reason: ReasonCode, message: str) -> None:
-        super().__init__(f"[{reason.value}] {message}")
-        self.reason = reason
-
-
-def _fail(reason: ReasonCode, message: str) -> None:
-    raise ContractError(reason, message)
-
-
-class ExitCode(Enum):
-    """Process exit codes (plan section 11). Zero covers a valid abstention."""
-
-    OK = 0
-    INVALID_INPUT = 2
-    UNAVAILABLE_DEPENDENCY = 3
-    EXECUTION_FAILURE = 4
-    NOT_READY = 5
-
-
-class Stage(Enum):
-    """Readiness levels, in increasing order of what they permit."""
-
-    BUILD = "build"
-    ENGINEERING = "engineering"
-    SCREEN = "screen"
-    CONFIRM = "confirm"
-
-    @property
-    def rank(self) -> int:
-        return _STAGE_ORDER.index(self)
-
-
-_STAGE_ORDER = (Stage.BUILD, Stage.ENGINEERING, Stage.SCREEN, Stage.CONFIRM)
-
-
-class StudyRole(str, Enum):
-    """What a body of sampling is *for*. Deliberately disjoint from PhaseKind."""
-
-    DISCOVERY = "discovery"
-    CALIBRATION = "calibration"
-    ENGINEERING = "engineering"
-    SCREEN = "screen"
-    CONFIRM = "confirm"
-
-
-class PhaseKind(str, Enum):
-    """Mirrors ``gareus.correctness.sampling_policy`` exactly; do not extend."""
-
-    PRODUCTION = "production"
-    PILOT = "pilot"
-    EXPLORATION = "exploration"
-    EQUILIBRATION = "equilibration"
-
-
-_ROLE_MEASUREMENT_PHASE = {
-    StudyRole.DISCOVERY: PhaseKind.EXPLORATION,
-    StudyRole.CALIBRATION: PhaseKind.EXPLORATION,
-    StudyRole.ENGINEERING: PhaseKind.PILOT,
-    StudyRole.SCREEN: PhaseKind.PRODUCTION,
-    StudyRole.CONFIRM: PhaseKind.PRODUCTION,
-}
-
-
-class SearchMode(str, Enum):
-    JOINT_PAIR = "joint_pair"
-    FIXED_PRIMARY = "fixed_primary"
-
-
-class Integrity(str, Enum):
-    PASS = "PASS"
-    FAIL = "FAIL"
-
-
-class Precision(str, Enum):
-    MET = "MET"
-    NOT_MET = "NOT_MET"
-    UNRESOLVED = "UNRESOLVED"
-
-
-class Dependence(str, Enum):
-    SUPPORTED = "SUPPORTED"
-    UNRESOLVED_CORRELATION = "UNRESOLVED_CORRELATION"
-
-
-class Reproducibility(str, Enum):
-    NO_CONFLICT_DETECTED = "NO_CONFLICT_DETECTED"
-    CONFLICT = "CONFLICT"
-    UNRESOLVED = "UNRESOLVED"
-
-
-class CrossProtocol(str, Enum):
-    AGREEMENT_SUPPORTED = "AGREEMENT_SUPPORTED"
-    PROTOCOL_DISAGREEMENT = "PROTOCOL_DISAGREEMENT"
-    AGREEMENT_UNRESOLVED = "AGREEMENT_UNRESOLVED"
-    NOT_COMPARED = "NOT_COMPARED"
-
-
-class Support(str, Enum):
-    SUPPORTED_ON_DECLARED_PANEL = "SUPPORTED_ON_DECLARED_PANEL"
-    LIMITED = "LIMITED"
-    UNRESOLVED = "UNRESOLVED"
-
-
-class Advantage(str, Enum):
-    NOT_TESTED = "NOT_TESTED"
-    SUPPORTED = "SUPPORTED"
-    UNRESOLVED = "UNRESOLVED"
-
-
-class DecisionOutcome(str, Enum):
-    INVALID_INPUT = "INVALID_INPUT"
-    INSUFFICIENT_EVIDENCE = "INSUFFICIENT_EVIDENCE"
-    PROVISIONAL_CHOICE = "PROVISIONAL_CHOICE"
-    CONFIRMED_FOR_DECLARED_PANEL = "CONFIRMED_FOR_DECLARED_PANEL"
-    PANEL_REVISION_REQUIRED = "PANEL_REVISION_REQUIRED"
-
-
-# ---------------------------------------------------------------------------
-# Primitive validation
-# ---------------------------------------------------------------------------
-
-def _canonical(raw: Mapping[str, Any]) -> dict[str, Any]:
-    """Round-trip through the repository encoder: rejects NaN and odd types."""
-    if not isinstance(raw, Mapping):
-        _fail(ReasonCode.UNKNOWN_FIELD, "artifact must be a mapping")
-    return json_loads(json_bytes(dict(raw)))
-
-
-def _exact_fields(data: Mapping[str, Any], required: set[str], label: str) -> None:
-    unknown = sorted(set(data) - required)
-    if unknown:
-        _fail(ReasonCode.UNKNOWN_FIELD, f"{label} has unknown field(s): {', '.join(unknown)}")
-    missing = sorted(required - set(data))
-    if missing:
-        _fail(ReasonCode.MISSING_FIELD, f"{label} is missing field(s): {', '.join(missing)}")
-
-
-def _schema(data: Mapping[str, Any], expected: str, label: str) -> None:
-    if data.get("schema") != expected:
-        _fail(ReasonCode.UNKNOWN_SCHEMA_VERSION,
-              f"{label} requires schema {expected!r}, got {data.get('schema')!r}")
-
-
-def _enum(value: Any, enum_cls: type[Enum], label: str) -> Any:
-    try:
-        return enum_cls(value)
-    except ValueError:
-        _fail(ReasonCode.INVALID_ENUM, f"{label}: {value!r} is not a valid {enum_cls.__name__}")
-
-
-def _hex64(value: Any, label: str, *, allow_none: bool = False) -> str | None:
-    if value is None and allow_none:
-        return None
-    if (not isinstance(value, str) or len(value) != 64
-            or any(char not in "0123456789abcdef" for char in value)):
-        _fail(ReasonCode.MISSING_FIELD, f"{label} must be a lowercase SHA-256 hex digest")
-    return value
-
-
-def _positive_int(value: Any, label: str, reason: ReasonCode) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        _fail(reason, f"{label} must be a positive integer, got {value!r}")
-    return value
-
-
-def _positive_float(value: Any, label: str, reason: ReasonCode) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or float(value) <= 0.0:
-        _fail(reason, f"{label} must be a positive number, got {value!r}")
-    return float(value)
-
-
-def _finite_vector(values: Any, label: str) -> tuple[float, ...]:
-    if not isinstance(values, Sequence) or isinstance(values, (str, bytes)) or not values:
-        _fail(ReasonCode.MISSING_FIELD, f"{label} must be a nonempty numeric sequence")
-    out = []
-    for item in values:
-        if isinstance(item, bool) or not isinstance(item, (int, float)):
-            _fail(ReasonCode.MISSING_FIELD, f"{label} must contain numbers only")
-        out.append(float(item))
-    return tuple(out)
-
-
-def artifact_digest(payload: Mapping[str, Any]) -> str:
-    """Digest of the canonical encoding, excluding any embedded ``sha256``."""
-    body = {key: value for key, value in _canonical(payload).items() if key != "sha256"}
-    return digest(json_bytes(body))
-
-
-def verify_artifact_digest(payload: Mapping[str, Any]) -> str:
-    """Confirm a stored artifact still hashes to its recorded digest."""
-    recorded = payload.get("sha256")
-    actual = artifact_digest(payload)
-    if recorded != actual:
-        _fail(ReasonCode.ARTIFACT_DIGEST_MISMATCH,
-              f"artifact digest {recorded!r} does not match its contents ({actual})")
-    return actual
-
-
-def measurement_phase_for(role: StudyRole) -> PhaseKind:
-    """The only sampling phase whose records may be scored for that study role."""
-    return _ROLE_MEASUREMENT_PHASE[role]
-
-
-def validate_role_phase(role: StudyRole, phase: PhaseKind) -> None:
-    expected = measurement_phase_for(role)
-    if phase is not expected:
-        _fail(ReasonCode.STUDY_ROLE_PHASE_CONFLICT,
-              f"study role {role.value!r} measures in phase {expected.value!r}, not {phase.value!r}")
-
-
-class _Artifact:
-    """Shared load/serialize behaviour; subclasses supply ``_parse``/``_body``."""
-
-    sha256: str
-
-    @classmethod
-    def from_mapping(cls, raw: Mapping[str, Any]):
-        data = _canonical(raw)
-        data.pop("sha256", None)
-        return cls._parse(data)
-
-    @classmethod
-    def from_json_bytes(cls, data: bytes | str):
-        return cls.from_mapping(json_loads(data))
-
-    def to_mapping(self) -> dict[str, Any]:
-        body = _canonical(self._body())
-        return {**body, "sha256": artifact_digest(body)}
-
-    def to_json_bytes(self) -> bytes:
-        return json_bytes(self.to_mapping())
-
-    @classmethod
-    def _parse(cls, data: dict[str, Any]):  # pragma: no cover - abstract
-        raise NotImplementedError
-
-    def _body(self) -> dict[str, Any]:  # pragma: no cover - abstract
-        raise NotImplementedError
-
 
 # ---------------------------------------------------------------------------
 # Feature schema
@@ -675,226 +413,6 @@ class ObservablePanel(_Artifact):
                 "diagnostic_partition_centers": self.diagnostic_partition_centers,
                 "diagnostic_histogram_bins": self.diagnostic_histogram_bins,
                 "novelty_mass_tolerance": self.novelty_mass_tolerance}
-
-
-# ---------------------------------------------------------------------------
-# Protocol
-# ---------------------------------------------------------------------------
-
-_PROTOCOL_SECTIONS = {
-    "target": {"sequence", "temperature_k", "ensemble", "pressure_bar", "physical_system_sha256"},
-    "blindness": {"generator_preset", "require_native_blind_allowlist", "historical_data_role"},
-    "discovery": {"candidate_set_sha256", "feature_schema_sha256"},
-    "sampling": {"layout", "lambda_rungs", "burn_in_ticks", "measurement_ticks",
-                 "campaigns_per_arm"},
-    "resources": {"gpus", "cpu_thread_cap", "max_replicas", "gpu_hours_per_campaign",
-                  "total_gpu_hour_ceiling"},
-    "evaluation": {"observable_panel_sha256"},
-    "uncertainty": {"policy", "calibration_certificate_sha256"},
-    "decision": {"provisional_choice_arm_id", "interval_family_size", "advantage_claim_enabled"},
-}
-
-_HISTORICAL_DATA_ROLES = frozenset({"exploratory_only", "excluded"})
-
-#: Which task produces each resolvable policy, so a refusal is actionable.
-_REQUIREMENT_TASKS = {
-    "target": "T11", "discovery": "T03", "sampling": "T09", "resources": "T11",
-    "evaluation": "T07", "uncertainty": "T06", "decision": "T07",
-}
-
-_STAGE_REQUIREMENTS: dict[Stage, tuple[str, ...]] = {
-    Stage.BUILD: (),
-    Stage.ENGINEERING: ("sampling.layout", "sampling.lambda_rungs"),
-    Stage.SCREEN: ("discovery.candidate_set_sha256", "discovery.feature_schema_sha256",
-                   "evaluation.observable_panel_sha256", "uncertainty.policy",
-                   "uncertainty.calibration_certificate_sha256", "sampling.burn_in_ticks",
-                   "sampling.measurement_ticks", "sampling.campaigns_per_arm",
-                   "resources.gpu_hours_per_campaign", "resources.total_gpu_hour_ceiling"),
-    Stage.CONFIRM: ("decision.provisional_choice_arm_id", "decision.interval_family_size"),
-}
-
-#: Protocol field holding each artifact's declared digest.
-_ARTIFACT_FIELDS = {
-    "candidate_set": "discovery.candidate_set_sha256",
-    "feature_schema": "discovery.feature_schema_sha256",
-    "observable_panel": "evaluation.observable_panel_sha256",
-    "calibration_certificate": "uncertainty.calibration_certificate_sha256",
-}
-
-
-def _validate_target(section: Mapping[str, Any]) -> None:
-    if section["ensemble"] not in {"NPT", "NVT"}:
-        _fail(ReasonCode.INVALID_ENUM, "target.ensemble must be NPT or NVT")
-    if section["ensemble"] == "NPT" and section["pressure_bar"] is None:
-        _fail(ReasonCode.MISSING_FIELD, "an NPT target requires an explicit pressure_bar")
-    if section["ensemble"] == "NVT" and section["pressure_bar"] is not None:
-        _fail(ReasonCode.UNKNOWN_FIELD, "an NVT target must not carry a pressure_bar")
-    _positive_float(section["temperature_k"], "target.temperature_k", ReasonCode.MISSING_FIELD)
-    _hex64(section["physical_system_sha256"], "target.physical_system_sha256")
-    if not isinstance(section["sequence"], str) or not section["sequence"]:
-        _fail(ReasonCode.MISSING_FIELD, "target.sequence must be a nonempty string")
-
-
-def _validate_blindness(section: Mapping[str, Any]) -> None:
-    if section["require_native_blind_allowlist"] is not True:
-        _fail(ReasonCode.NATIVE_DERIVED_INPUT,
-              "prospective selection requires the native-blind allowlist; it cannot be disabled")
-    if section["generator_preset"] not in NATIVE_BLIND_GENERATOR_PRESETS:
-        _fail(ReasonCode.NATIVE_DERIVED_INPUT,
-              f"generator preset {section['generator_preset']!r} encodes a fold bias; use one of "
-              f"{sorted(NATIVE_BLIND_GENERATOR_PRESETS)}")
-    if section["historical_data_role"] not in _HISTORICAL_DATA_ROLES:
-        _fail(ReasonCode.INVALID_ENUM,
-              f"historical_data_role must be one of {sorted(_HISTORICAL_DATA_ROLES)}; historical "
-              "campaigns are never confirmatory evidence")
-
-
-@dataclass(frozen=True)
-class ProtocolSpec(_Artifact):
-    """The whole declared study. Unresolved policies stay ``None`` on purpose."""
-
-    study_id: str
-    search_mode: SearchMode
-    target: dict[str, Any]
-    blindness: dict[str, Any]
-    discovery: dict[str, Any]
-    sampling: dict[str, Any]
-    resources: dict[str, Any]
-    evaluation: dict[str, Any]
-    uncertainty: dict[str, Any]
-    decision: dict[str, Any]
-    sha256: str
-
-    def value_at(self, dotted: str) -> Any:
-        section, _, field = dotted.partition(".")
-        return getattr(self, section)[field]
-
-    @classmethod
-    def _parse(cls, data: dict[str, Any]) -> "ProtocolSpec":
-        _exact_fields(data, {"schema", "study_id", "search_mode", *_PROTOCOL_SECTIONS}, "protocol")
-        _schema(data, PROTOCOL_VERSION, "protocol")
-        if not isinstance(data["study_id"], str) or not data["study_id"]:
-            _fail(ReasonCode.MISSING_FIELD, "protocol.study_id must be a nonempty string")
-        mode = _enum(data["search_mode"], SearchMode, "protocol.search_mode")
-        sections = {}
-        for name, fields in _PROTOCOL_SECTIONS.items():
-            section = data[name]
-            if not isinstance(section, dict):
-                _fail(ReasonCode.MISSING_FIELD, f"protocol.{name} must be a mapping")
-            _exact_fields(section, fields, f"protocol.{name}")
-            sections[name] = dict(section)
-        _validate_target(sections["target"])
-        _validate_blindness(sections["blindness"])
-        for field in ("candidate_set_sha256", "feature_schema_sha256"):
-            _hex64(sections["discovery"][field], f"protocol.discovery.{field}", allow_none=True)
-        _hex64(sections["evaluation"]["observable_panel_sha256"],
-               "protocol.evaluation.observable_panel_sha256", allow_none=True)
-        _hex64(sections["uncertainty"]["calibration_certificate_sha256"],
-               "protocol.uncertainty.calibration_certificate_sha256", allow_none=True)
-        if sections["decision"]["advantage_claim_enabled"] not in (True, False):
-            _fail(ReasonCode.INVALID_ENUM, "decision.advantage_claim_enabled must be a boolean")
-        body = {"schema": PROTOCOL_VERSION, "study_id": data["study_id"],
-                "search_mode": mode.value, **sections}
-        return cls(data["study_id"], mode, sections["target"], sections["blindness"],
-                   sections["discovery"], sections["sampling"], sections["resources"],
-                   sections["evaluation"], sections["uncertainty"], sections["decision"],
-                   artifact_digest(body))
-
-    def _body(self) -> dict[str, Any]:
-        return {"schema": PROTOCOL_VERSION, "study_id": self.study_id,
-                "search_mode": self.search_mode.value, "target": dict(self.target),
-                "blindness": dict(self.blindness), "discovery": dict(self.discovery),
-                "sampling": dict(self.sampling), "resources": dict(self.resources),
-                "evaluation": dict(self.evaluation), "uncertainty": dict(self.uncertainty),
-                "decision": dict(self.decision)}
-
-
-# ---------------------------------------------------------------------------
-# Readiness
-# ---------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class MissingRequirement:
-    requirement: str
-    stage: Stage
-    producing_task: str
-    reason: ReasonCode
-    detail: str = ""
-
-    def to_mapping(self) -> dict[str, Any]:
-        return {"requirement": self.requirement, "stage": self.stage.value,
-                "producing_task": self.producing_task, "reason": self.reason.value,
-                "detail": self.detail}
-
-
-@dataclass(frozen=True)
-class ReadinessReport:
-    stage: Stage
-    ready: bool
-    missing: tuple[MissingRequirement, ...]
-    protocol_sha256: str
-    reason: ReasonCode | None = None
-
-    @property
-    def exit_code(self) -> ExitCode:
-        return ExitCode.OK if self.ready else ExitCode.NOT_READY
-
-    def to_mapping(self) -> dict[str, Any]:
-        return {"stage": self.stage.value, "ready": self.ready,
-                "protocol_sha256": self.protocol_sha256,
-                "reason": None if self.reason is None else self.reason.value,
-                "missing": [item.to_mapping() for item in self.missing]}
-
-
-def _requirements_through(stage: Stage) -> tuple[str, ...]:
-    return tuple(requirement for level in _STAGE_ORDER[:stage.rank + 1]
-                 for requirement in _STAGE_REQUIREMENTS[level])
-
-
-def _artifact_findings(protocol: ProtocolSpec, artifacts: Mapping[str, str],
-                       stage: Stage) -> list[MissingRequirement]:
-    findings: list[MissingRequirement] = []
-    required = set(_requirements_through(stage))
-    for name, dotted in _ARTIFACT_FIELDS.items():
-        if dotted not in required:
-            continue
-        declared = protocol.value_at(dotted)
-        if declared is None:
-            continue
-        supplied = artifacts.get(name)
-        section = dotted.split(".")[0]
-        if supplied is None:
-            findings.append(MissingRequirement(
-                dotted, stage, _REQUIREMENT_TASKS[section], ReasonCode.MISSING_ARTIFACT,
-                f"protocol declares {name} {declared} but no such artifact was supplied"))
-        elif supplied != declared:
-            findings.append(MissingRequirement(
-                dotted, stage, _REQUIREMENT_TASKS[section], ReasonCode.ARTIFACT_DIGEST_MISMATCH,
-                f"protocol declares {name} {declared}, supplied artifact hashes to {supplied}"))
-    return findings
-
-
-def validate_protocol(protocol: ProtocolSpec, artifacts: Mapping[str, str], *,
-                      stage: Stage) -> ReadinessReport:
-    """Report whether the protocol may be used at ``stage``; never fill a gap in.
-
-    ``artifacts`` maps an artifact name to the digest of the file actually on
-    hand. A declared-but-absent or declared-but-different artifact is reported,
-    not assumed.
-    """
-    if not isinstance(stage, Stage):
-        _fail(ReasonCode.INVALID_ENUM, f"stage must be a Stage, got {stage!r}")
-    missing: list[MissingRequirement] = []
-    for dotted in _requirements_through(stage):
-        if protocol.value_at(dotted) is None:
-            section = dotted.split(".")[0]
-            missing.append(MissingRequirement(
-                dotted, stage, _REQUIREMENT_TASKS[section], ReasonCode.MISSING_FIELD,
-                "unresolved policy; the producing task must supply a concrete value"))
-    missing.extend(_artifact_findings(protocol, artifacts, stage))
-    ready = not missing
-    return ReadinessReport(stage, ready, tuple(missing), protocol.sha256,
-                           None if ready else ReasonCode.PROTOCOL_NOT_READY)
 
 
 # ---------------------------------------------------------------------------

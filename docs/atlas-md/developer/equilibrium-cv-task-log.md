@@ -19,7 +19,9 @@ records what was actually run, not what was expected to pass.
 | Path | Change |
 |---|---|
 | `gareus/cv_selection/__init__.py` | New package; documents the NumPy-only import policy |
-| `gareus/cv_selection/contracts.py` | New; versioned artifacts, enums, readiness validator |
+| `gareus/cv_selection/_base.py` | New; primitive validation, digests, `_Artifact` base |
+| `gareus/cv_selection/vocabulary.py` | New; stages, roles, phases and the eight decision statuses |
+| `gareus/cv_selection/contracts.py` | New; the six artifacts, readiness validator, public façade |
 | `tests/test_cv_selection_contracts.py` | New; 67 rejection/round-trip cases |
 | `tests/fixtures/cv_selection/generate.py` | New; regenerates the tiny artifacts |
 | `tests/fixtures/cv_selection/*.json` | New; six generated artifacts pinning the encoding |
@@ -32,6 +34,20 @@ records what was actually run, not what was expected to pass.
 matches `gareus*`, so `gareus.cv_selection` is installed automatically, and the
 contracts add no dependency beyond the existing NumPy core. The console script
 `gareus-select-cvs` is deliberately left to T10, which owns the CLI.
+
+### Module layout
+
+`contracts.py` is the public façade — later tasks import everything from it, so
+`from gareus.cv_selection import contracts as C` keeps working regardless of how
+the internals move. The first cut was a single 1148-line module, over the
+repository's 800-line ceiling; it was split into `_base.py` (mechanism:
+validation primitives, digests, the `_Artifact` base) and `vocabulary.py` (the
+controlled vocabularies and the role/phase rule), with the artifacts and the
+readiness validator staying in `contracts.py`.
+
+The split was verified pure by regenerating the six fixtures: all `sha256`
+values are byte-identical before and after, because digests are taken over JSON
+payloads and never over module layout.
 
 ### Interfaces introduced
 
@@ -109,16 +125,27 @@ None are touched by T00; the plan's task prompt keeps unrelated fixes separate.
    package is `0.8.1` since the `release: v0.8.1` commit.
 7-10. `test_thermodynamic_validity_2d_rough.py` and
    `test_thermodynamic_validity_real_md.py`, `test_mutation_is_caught[...]` x2 each —
-   `IntegrityError: beta must be positive`. The mutation battery injects
-   `beta=0`/negative beta, which a later strict guard now rejects before the
-   oracle can observe the mutation. **The mutation is still caught; the test
-   asserts on the wrong failure channel.** Worth a dedicated fix, because these
-   four are the teeth of the thermodynamic oracle suite.
+   `IntegrityError: beta must be positive`. What was observed is only this: the
+   mutation battery injects `beta=0`/negative beta, and a strict guard raises
+   before the oracle evaluates the mutation, so the test fails on a different
+   channel than the one it asserts on. **Whether the mutation would still be
+   caught downstream was not established here** — it needs its own run. These
+   four are the teeth of the thermodynamic oracle suite, so the question matters
+   and is left open rather than answered by inspection.
 
-Items 5-10 also appear in the untracked `atlas_pytest_full_run.log` from
-2026-09-12, so they predate this branch. Items 1, 2 and 4 are newer than that
-log and were confirmed pre-existing by reading the assertions (none references
-the nav block this task edited) and by the strict docs build passing.
+Provenance of each item:
+
+* Items 5-10 also appear in the untracked `atlas_pytest_full_run.log` from
+  2026-09-12, so they predate this branch.
+* Items 1 and 2 are newer than that log and were confirmed pre-existing by
+  reading their assertions: both check `site_name` casing and a ```` ```mermaid ````
+  block in `index.md`, neither of which is the nav block this task edited. The
+  strict docs build passes with the nav additions.
+* Item 4 is newer than that log and is **not** explained by reading assertions —
+  a Pep-GaMD finite-difference force mismatch has nothing to do with anything
+  T00 touches, but that is an argument, not evidence. It was therefore verified
+  directly by running the file in a clean `git worktree` at `cdee6cc` with none
+  of this branch's files present (see the verification note below).
 
 ### Unresolved and handed on
 
