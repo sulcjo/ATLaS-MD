@@ -267,6 +267,23 @@ def _platform_request(args: Any) -> dict[str, Any]:
     return {k: getattr(args, k, None) for k in keys if hasattr(args, k)}
 
 
+def pair_model_sha256(path) -> Optional[str]:
+    """Content digest recorded inside a cv_pair_model.json, or None when there is no model."""
+    if not path:
+        return None
+    model_path = Path(path)
+    if not model_path.exists():
+        # A configured model that is not on disk must not degrade a resume refusal
+        # into a "no model" warning.
+        raise FileNotFoundError(f"--secondary-cv-model points at a missing file: {model_path}")
+    from .correctness._io import json_loads
+    doc = json_loads(model_path.read_text(encoding="utf-8"))
+    try:
+        return str(doc["sha256"])
+    except KeyError:
+        raise ValueError(f"pair model without sha256 field: {model_path}")
+
+
 def _method_settings(args: Any) -> dict[str, Any]:
     keys = [
         "seq", "seed", "water_model", "box_shape", "padding_nm", "ionic_strength_molar",
@@ -295,8 +312,15 @@ def _method_settings(args: Any) -> dict[str, Any]:
         "swarm_max_seed_gap_sigma", "shared_gamd_setup_dir",
         "swarm_stability_sigma_rel_tol", "swarm_stability_extrema_sigma_tol",
         "swarm_min_done_fraction", "swarm_max_graft_fallback_fraction",
+        # Frozen CV2 pair model, plan 2026-09-20-auto-cv-pair.
+        "secondary_cv_model", "secondary_cv_candidate_set", "secondary_cv_feature_schema",
+        "cv_selection_residual_degree", "cv_selection_max_nonlinear_r2",
+        "cv_selection_max_coupling_fraction", "cv_selection_k2_reference_kcal",
+        "cv_selection_min_gain_nats", "cv_selection_min_windows_cv1",
+        "cv_selection_fallback", "swarm_n_windows_cv2",
     ]
     settings = {k: getattr(args, k, None) for k in keys if hasattr(args, k)}
+    settings["cv_pair_model_sha256"] = pair_model_sha256(getattr(args, "secondary_cv_model", None))
     # The λ-ladder is frozen for the whole campaign (spec §3.1), so its
     # per-state lambdas and the envelope it was calibrated against both
     # belong in the immutable run manifest, next to gamd_boost_type above.

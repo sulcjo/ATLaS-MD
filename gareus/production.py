@@ -98,7 +98,7 @@ from .forces import (
     add_umbrella_force,
     add_contact_umbrella_force,
 )
-from .provenance import initialize_run_manifest, update_run_manifest, finalize_run_manifest
+from .provenance import initialize_run_manifest, update_run_manifest, finalize_run_manifest, pair_model_sha256
 
 __all__ = [
     "add_secondary_structure_cv_force",
@@ -1164,7 +1164,10 @@ def load_resume_run_definition(out_dir: Path, topology, args, manifest: Optional
     # the time any caller saw them, making the desync unrecoverable and
     # unobservable. Reconciling here, against the raw values, is the only
     # place that can actually catch and fix it.
-    secondary_meta = reconcile_resume_secondary_cv_metadata(secondary_meta, secondary_centers)
+    secondary_meta = reconcile_resume_secondary_cv_metadata(
+        secondary_meta, secondary_centers,
+        current_pair_sha256=pair_model_sha256(getattr(args, "secondary_cv_model", None)),
+    )
     if isinstance(secondary_meta, dict) and secondary_meta.get("enabled"):
         if secondary_centers is None or secondary_k is None:
             raise RuntimeError("Resume metadata says secondary CV was enabled, but secondary centers/k arrays are missing")
@@ -5842,7 +5845,10 @@ def run_shared_gamd_setup_article_a(
     return shared_globals_all, shared_globals_interesting, int(calib_steps), shared_context_checkpoint
 
 
-def reconcile_resume_secondary_cv_metadata(secondary_cv_metadata: Optional[dict], secondary_cv_centers) -> dict:
+def reconcile_resume_secondary_cv_metadata(
+    secondary_cv_metadata: Optional[dict], secondary_cv_centers, *,
+    current_pair_sha256: Optional[str] = None,
+) -> dict:
     """Reconcile a resumed run's secondary-CV metadata against its centers.
 
     The fast-resume path reads ``secondary_cv_metadata`` and
@@ -5860,6 +5866,15 @@ def reconcile_resume_secondary_cv_metadata(secondary_cv_metadata: Optional[dict]
     other fields (mode, phi0_deg, psi0_deg, sigma_deg, torsion lists, ...)
     were already present. It always warns loudly when it has to reconcile;
     it never silently continues with CV2 dropped.
+
+    A residual-torsion-pc run also pins its frozen pair model by the
+    ``sha256`` digest recorded inside the checkpoint's
+    ``pair_model_sha256`` field. When the current run's
+    ``--secondary-cv-model`` resolves to a different digest, the resume is
+    refused outright (a frozen pair is never redefined mid-campaign); when
+    the current run carries no model, a WARNING is printed and the recorded
+    digest is left untouched; when the checkpoint predates digest recording,
+    the current digest is recorded as the first one.
     """
     meta = dict(secondary_cv_metadata or {})
     has_centers = secondary_cv_centers is not None and len(secondary_cv_centers) > 0
@@ -5874,6 +5889,25 @@ def reconcile_resume_secondary_cv_metadata(secondary_cv_metadata: Optional[dict]
             "checkpoint manifest so CV2 is not silently dropped.\n" + "!" * 78
         )
         meta["enabled"] = True
+    recorded = meta.get("pair_model_sha256")
+    if isinstance(recorded, str) and recorded:
+        if current_pair_sha256 is None:
+            print(
+                "!" * 78 + "\n"
+                "WARNING [RESUME]: the checkpoint recorded a frozen CV2 pair model "
+                f"digest ({recorded}), but the current run carries no pair model "
+                "(no --secondary-cv-model). Proceeding with the recorded digest.\n"
+                + "!" * 78
+            )
+        elif current_pair_sha256 != recorded:
+            raise RuntimeError(
+                "resume refused: the frozen CV2 pair model changed "
+                f"(checkpoint {recorded}, current {current_pair_sha256}); "
+                "a frozen pair is never redefined mid-campaign -- point "
+                "--secondary-cv-model back at the original artifact"
+            )
+    elif current_pair_sha256 is not None:
+        meta["pair_model_sha256"] = current_pair_sha256
     return meta
 
 
