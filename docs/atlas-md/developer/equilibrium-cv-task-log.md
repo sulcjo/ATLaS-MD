@@ -198,6 +198,76 @@ by reading them.
 untracked entries (two `.docx` files, a log, and `chignolin_knowledge_base/`)
 predate this branch and are not part of it.
 
+### Adversarial review round (2026-09-20)
+
+T00 was put through three independent fresh-context reviews and a five-model
+adversarial panel. **Every finding acted on below was reproduced with a direct
+probe first**; findings that did not reproduce are recorded as such rather than
+acted on. The panel returned **4/5 ACCEPT-WITH-CHANGES** (confidences 85-90)
+with one **REJECT** from the mathematics/physics seat (confidence 85);
+aggregate 80, mean position-card cosine 0.533. The specialist audit of the
+final judgment raised no flags.
+
+#### Reproduced and fixed
+
+| Finding | Why it mattered |
+|---|---|
+| Readiness gate tested only `is None` | `burn_in_ticks=-5`, `campaigns_per_arm="many"`, `gpus=-3`, `layout=""` all returned `ready=True, missing=()`. A scientifically impossible study was certified launch-ready — the exact failure R9 exists to prevent |
+| Four refusals carried no reason code | Duplicate JSON key, non-finite number, path-based CV identity, unsupported units all raised a bare error, contradicting the module's promise that callers branch on codes |
+| `.strip()` does not remove format characters | A CONFIRMED verdict could name an arm made only of U+200B/U+FEFF/U+2060/U+00AD/U+180E: invisible everywhere, yet unequal to `""`, so no downstream comparison can match it |
+| Native-derived primary CV was screen-ready | Blindness was asserted by three protocol strings and never checked against the candidate set, so a primary CV of kind `rmsd-to-native-pdb` passed |
+| The frozen panel was gameable | `halfwidth_tolerance: 1e9` made `precision: MET` free for every arm, and eight copies of one measurement satisfied the panel |
+| Two disagreeing digests for one artifact | `artifact_digest` hashed the payload as written; `_parse` hashed rebuilt, coerced values. An artifact whose JSON said `1` where the schema means `1.0` could never be matched by a protocol declaring its on-disk digest, and a tampered payload was silently re-hashed |
+| A confirmation could rest on nothing | Empty `input_sha256`, no tested protocols, or citing `CONFIRMATION_BLOCKED` among its own reasons |
+| The writer bypassed every consistency rule | The rules lived only in `_parse`, so a producer could hand-build `integrity=FAIL` + `CONFIRMED` and serialize it with a valid digest; the contradiction surfaced only in whichever later task loaded it |
+| `0.0` passed as a feature index | `0.0 != 0` is `False` |
+| `1` passed as a boolean flag | `1 in (True, False)` is `True` |
+| Unvalidated NPT pressure, unvalidated `study_id` | A negative pressure and a null study id both parsed |
+| `Stage` and `StudyRole` share value names | A transposed pair parsed silently; now they must agree |
+| `temperature_k: 300` vs `300.0` | The same target hashed two ways. Real-valued protocol fields are now coerced before hashing |
+
+One refinement on the panel's condition 4. It asked for `unresolved_regions` to
+be **empty** for an unqualified confirmation. What ships is stricter where it
+matters and looser where it should be: a region of **unknown** mass
+(`UNRESOLVED_SUPPORT`) blocks confirmation, while a region whose mass is
+**bounded small** (`MASS_BOUNDED_SMALL`) does not. That is R6's actual
+distinction — for an IID region of true probability 1e-6 with n=1000, zero
+visits happens ~99.9% of the time and the exact one-sided 95% bound is ~0.003,
+already inside a 0.02 tolerance, so demanding a visit there would reject an
+adequate result.
+
+#### Recorded, not acted on
+
+* **The dissent stands.** The mathematics/physics seat voted REJECT on the
+  grounds that the confirmation gate is satisfiable by *self-asserted* statuses:
+  the `Decision` has no fields for estimates, intervals or run counts, so a
+  fabricated digest string passes. Evidence linkage was strengthened here
+  (mandatory artifact digests, two protocols for an agreement claim, no
+  unknown-mass regions), but the dissent's deeper point is correct and not
+  answered by T00: **a real evidence model belongs to the evaluation task**,
+  which owns estimates and intervals. This is a known, deliberate limitation of
+  the contracts layer, not an oversight.
+* **Invariant 5 is not enforceable here.** Whether a stored vector is one SVD
+  direction or a variance-weighted mixture of several cannot be decided at this
+  layer: both are float vectors of the same width. A probe confirmed a mixture
+  filed as `component_index: 3` is accepted verbatim. Index, range and
+  uniqueness are enforced; *provenance* of the direction must be enforced by the
+  fitting task. The module comment previously read as though the contract
+  guarded it.
+* **Cross-artifact binding is still absent from readiness.** `validate_protocol`
+  compares declared digests against supplied ones but never calls
+  `require_feature_binding`, never compares `physical_system_sha256` between
+  protocol and candidate set, and never binds a `TrialPlan` to its protocol's
+  layout, rungs, replica cap or budget ceiling. It receives digests, not
+  objects, so closing this is an interface change and belongs with the task that
+  owns trial planning.
+* **`singular_value = 0` is legitimate.** The dissent is right that SVD singular
+  values are non-negative by definition and a zero is a degenerate but valid
+  direction. Only an all-zero *vector* is refused, because that defines no
+  coordinate and its umbrella would apply no force.
+* The new test file is **not in CI**. CI runs a curated three-file list plus the
+  strict docs build; wiring the selector tests in belongs to the CLI/CI task.
+
 ### Unresolved and handed on
 
 * `ProtocolSpec` sections are validated for exact key sets but their *values*

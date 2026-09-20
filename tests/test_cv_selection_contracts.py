@@ -446,6 +446,7 @@ def _decision_mapping(**overrides) -> dict:
 
 
 def _confirmed_mapping(**overrides) -> dict:
+    """A confirmation that carries the evidence a confirmation must carry."""
     confirmed = {
         "decision": C.DecisionOutcome.CONFIRMED_FOR_DECLARED_PANEL.value,
         "precision": C.Precision.MET.value,
@@ -455,6 +456,9 @@ def _confirmed_mapping(**overrides) -> dict:
         "cross_protocol": C.CrossProtocol.AGREEMENT_SUPPORTED.value,
         "selected_arm_id": "contact+residual-pc02",
         "reasons": [],
+        "tested_protocol_ids": ["contact-only", "contact+residual-pc02"],
+        "input_sha256": {"protocol": "1" * 64, "trial_plan": "2" * 64,
+                         "observable_panel": "3" * 64, "candidate_set": "4" * 64},
     }
     confirmed.update(overrides)
     return _decision_mapping(**confirmed)
@@ -1006,3 +1010,108 @@ def test_a_tampered_readiness_report_is_detected(protocol):
     with pytest.raises(IntegrityError) as excinfo:
         C.verify_artifact_digest(payload)
     assert excinfo.value.reason is C.ReasonCode.ARTIFACT_DIGEST_MISMATCH
+
+
+# --------------------------------------------------------------------------
+# Conditions returned by the adversarial panel
+# --------------------------------------------------------------------------
+
+def _confirmable(**overrides) -> dict:
+    return _confirmed_mapping(**overrides)
+
+
+def test_a_producer_cannot_serialize_what_a_reader_would_refuse():
+    """The consistency rules live in _parse; the write path must honour them too."""
+    from gareus.cv_selection import decision as D
+
+    contradictory = D.Decision(
+        study_id="x", integrity=D.Integrity.FAIL,
+        decision=D.DecisionOutcome.CONFIRMED_FOR_DECLARED_PANEL,
+        precision=D.Precision.NOT_MET, dependence=D.Dependence.SUPPORTED,
+        reproducibility=D.Reproducibility.CONFLICT,
+        cross_protocol=D.CrossProtocol.PROTOCOL_DISAGREEMENT,
+        support=D.Support.UNRESOLVED, advantage=D.Advantage.NOT_TESTED,
+        reasons=(), unresolved_regions=(), tested_protocol_ids=(),
+        input_sha256={}, selected_arm_id=None, sha256="0" * 64)
+    with pytest.raises(IntegrityError) as excinfo:
+        contradictory.to_mapping()
+    assert excinfo.value.reason is C.ReasonCode.INTEGRITY_OUTCOME_CONFLICT
+
+
+def test_a_float_is_not_a_feature_index(feature_schema):
+    """`0.0 != 0` is False, so a value-only check lets a float through."""
+    payload = _mutable(feature_schema)
+    payload["features"][0]["index"] = 0.0
+    with pytest.raises(IntegrityError) as excinfo:
+        C.FeatureSchema.from_mapping(payload)
+    assert excinfo.value.reason is C.ReasonCode.FEATURE_INDEX_NOT_CONTIGUOUS
+
+
+def test_a_number_is_not_a_boolean_flag():
+    """`1 in (True, False)` is True, so identity is the only safe test."""
+    with pytest.raises(IntegrityError) as excinfo:
+        C.ProtocolSpec.from_mapping(_protocol_mapping(
+            decision={"provisional_choice_arm_id": None, "interval_family_size": None,
+                      "advantage_claim_enabled": 1}))
+    assert excinfo.value.reason is C.ReasonCode.WRONG_TYPE
+
+
+def test_an_npt_pressure_must_be_physical():
+    with pytest.raises(IntegrityError) as excinfo:
+        C.ProtocolSpec.from_mapping(_protocol_mapping(
+            target={"sequence": "GYDPETGTWG", "temperature_k": 300.0, "ensemble": "NPT",
+                    "pressure_bar": -500.0, "physical_system_sha256": "b" * 64}))
+    assert excinfo.value.reason is C.ReasonCode.NOT_POSITIVE
+
+
+def test_a_decision_must_name_the_study_it_decides():
+    with pytest.raises(IntegrityError) as excinfo:
+        C.Decision.from_mapping(_decision_mapping(study_id=None))
+    assert excinfo.value.reason is C.ReasonCode.WRONG_TYPE
+
+
+def test_the_same_temperature_spelled_two_ways_has_one_identity():
+    """JSON cannot tell 300 from 300.0; the protocol's identity must."""
+    as_int = _protocol_mapping(
+        target={"sequence": "GYDPETGTWG", "temperature_k": 300, "ensemble": "NPT",
+                "pressure_bar": 1, "physical_system_sha256": "b" * 64})
+    as_float = _protocol_mapping(
+        target={"sequence": "GYDPETGTWG", "temperature_k": 300.0, "ensemble": "NPT",
+                "pressure_bar": 1.0, "physical_system_sha256": "b" * 64})
+    assert (C.ProtocolSpec.from_mapping(as_int).sha256
+            == C.ProtocolSpec.from_mapping(as_float).sha256)
+
+
+def test_a_transposed_stage_and_study_role_cannot_pass_silently():
+    """`Stage` and `StudyRole` share value names, so the pair must be checked."""
+    payload = _trial_plan_mapping(stage=C.Stage.BUILD.value)
+    with pytest.raises(IntegrityError) as excinfo:
+        C.TrialPlan.from_mapping(payload)
+    assert excinfo.value.reason is C.ReasonCode.STUDY_ROLE_PHASE_CONFLICT
+
+
+def test_a_confirmation_must_name_every_artifact_it_rests_on():
+    assert C.Decision.from_mapping(_confirmable()).selected_arm_id == "contact+residual-pc02"
+    with pytest.raises(IntegrityError) as excinfo:
+        C.Decision.from_mapping(_confirmable(input_sha256={"protocol": "1" * 64}))
+    assert excinfo.value.reason is C.ReasonCode.MISSING_FIELD
+
+
+def test_cross_protocol_agreement_needs_two_protocols_to_agree():
+    with pytest.raises(IntegrityError) as excinfo:
+        C.Decision.from_mapping(_confirmable(tested_protocol_ids=["only-one"]))
+    assert excinfo.value.reason is C.ReasonCode.MISSING_FIELD
+
+
+def test_a_region_of_unknown_mass_blocks_an_unqualified_confirmation():
+    """Unknown mass blocks; a *bounded* small mass does not (review finding R6)."""
+    with pytest.raises(IntegrityError) as excinfo:
+        C.Decision.from_mapping(_confirmable(unresolved_regions=[
+            {"region_id": "cell-9", "status": C.RegionStatus.UNRESOLVED_SUPPORT.value,
+             "detail": "zero visits, no valid bound"}]))
+    assert excinfo.value.reason is C.ReasonCode.CONFIRMATION_BLOCKED
+
+    bounded = C.Decision.from_mapping(_confirmable(unresolved_regions=[
+        {"region_id": "cell-7", "status": C.RegionStatus.MASS_BOUNDED_SMALL.value,
+         "detail": "zero visits, exact IID upper bound 0.003 < 0.02 tolerance"}]))
+    assert bounded.decision is C.DecisionOutcome.CONFIRMED_FOR_DECLARED_PANEL

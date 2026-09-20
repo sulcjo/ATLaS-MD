@@ -123,7 +123,9 @@ class FeatureId:
 def _parse_feature(raw: Mapping[str, Any], position: int) -> FeatureId:
     label = f"feature[{position}]"
     _exact_fields(raw, _FEATURE_FIELDS, label)
-    if raw["index"] != position or isinstance(raw["index"], bool):
+    # `0.0 != 0` is False, so an index check by value alone lets a float in.
+    if (isinstance(raw["index"], bool) or not isinstance(raw["index"], int)
+            or raw["index"] != position):
         _fail(ReasonCode.FEATURE_INDEX_NOT_CONTIGUOUS,
               f"{label}.index must equal its position {position}, got {raw['index']!r}")
     if raw["trig"] not in _TRIG_VALUES:
@@ -574,6 +576,11 @@ class TrialPlan(_Artifact):
         phase = _enum(data["measurement_phase_kind"], PhaseKind,
                       "trial plan.measurement_phase_kind")
         validate_role_phase(role, phase)
+        if stage.value != role.value:
+            _fail(ReasonCode.STUDY_ROLE_PHASE_CONFLICT,
+                  f"trial plan stage {stage.value!r} and study role {role.value!r} must agree; "
+                  "`Stage` and `StudyRole` share value names, so a transposed pair would "
+                  "otherwise parse silently")
         rungs = _positive_int(data["lambda_rungs"], "trial plan.lambda_rungs",
                               ReasonCode.LAYOUT_INCONSISTENT)
         cap = _positive_int(data["max_replicas"], "trial plan.max_replicas",

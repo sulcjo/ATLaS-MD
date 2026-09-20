@@ -274,7 +274,18 @@ class _Artifact:
         return cls.from_mapping(loaded)
 
     def to_mapping(self) -> dict[str, Any]:
+        """Serialize, after proving the result would survive being read back.
+
+        Dataclasses are publicly constructible, and the consistency rules live
+        in ``_parse``. Without this round-trip a producer could hand-build a
+        ``Decision`` that says ``integrity=FAIL`` and
+        ``CONFIRMED_FOR_DECLARED_PANEL`` at once, write it with a perfectly
+        valid digest, and the contradiction would only surface later, in
+        whichever downstream task happened to load it. Refusing at the write
+        end puts the error where it was made.
+        """
         body = _canonical(self._body())
+        self._parse(dict(body))
         return {**body, "sha256": artifact_digest(body)}
 
     def to_json_bytes(self) -> bytes:

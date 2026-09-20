@@ -67,8 +67,11 @@ _ARTIFACT_FIELDS = {
 def _validate_target(section: Mapping[str, Any]) -> None:
     if section["ensemble"] not in {"NPT", "NVT"}:
         _fail(ReasonCode.INVALID_ENUM, "target.ensemble must be NPT or NVT")
-    if section["ensemble"] == "NPT" and section["pressure_bar"] is None:
-        _fail(ReasonCode.MISSING_FIELD, "an NPT target requires an explicit pressure_bar")
+    if section["ensemble"] == "NPT":
+        if section["pressure_bar"] is None:
+            _fail(ReasonCode.MISSING_FIELD, "an NPT target requires an explicit pressure_bar")
+        _positive_float(section["pressure_bar"], "target.pressure_bar",
+                        ReasonCode.NOT_POSITIVE)
     if section["ensemble"] == "NVT" and section["pressure_bar"] is not None:
         _fail(ReasonCode.UNKNOWN_FIELD, "an NVT target must not carry a pressure_bar")
     _positive_float(section["temperature_k"], "target.temperature_k", ReasonCode.MISSING_FIELD)
@@ -138,6 +141,22 @@ def _check_value(value: Any, rule: str, label: str) -> None:
     raise AssertionError(f"unknown value rule {rule!r}")
 
 
+#: Fields whose science is a real number. JSON cannot tell 300 from 300.0, so
+#: without coercion the same target hashes two ways and a protocol digest
+#: declared against one spelling can never match the other.
+_REAL_VALUED_FIELDS = (
+    ("target", "temperature_k"), ("target", "pressure_bar"),
+    ("resources", "gpu_hours_per_campaign"), ("resources", "total_gpu_hour_ceiling"),
+)
+
+
+def _normalise_numeric_fields(sections) -> None:
+    for section, field in _REAL_VALUED_FIELDS:
+        value = sections[section][field]
+        if value is not None and not isinstance(value, bool):
+            sections[section][field] = float(value)
+
+
 def _validate_resolvable_values(sections: Mapping[str, Mapping[str, Any]]) -> None:
     """A resolved policy must be usable; only ``None`` may mean 'not yet'."""
     for dotted, rule in _VALUE_RULES.items():
@@ -190,9 +209,12 @@ class ProtocolSpec(_Artifact):
                "protocol.evaluation.observable_panel_sha256", allow_none=True)
         _hex64(sections["uncertainty"]["calibration_certificate_sha256"],
                "protocol.uncertainty.calibration_certificate_sha256", allow_none=True)
-        if sections["decision"]["advantage_claim_enabled"] not in (True, False):
-            _fail(ReasonCode.INVALID_ENUM, "decision.advantage_claim_enabled must be a boolean")
+        # `1 in (True, False)` is True: compare identity, not equality.
+        if not isinstance(sections["decision"]["advantage_claim_enabled"], bool):
+            _fail(ReasonCode.WRONG_TYPE,
+                  "decision.advantage_claim_enabled must be a boolean, not a number")
         _validate_resolvable_values(sections)
+        _normalise_numeric_fields(sections)
         body = {"schema": PROTOCOL_VERSION, "study_id": data["study_id"],
                 "search_mode": mode.value, **sections}
         return cls(data["study_id"], mode, sections["target"], sections["blindness"],

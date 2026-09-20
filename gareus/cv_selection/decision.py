@@ -16,6 +16,12 @@ from typing import Any, Mapping
 from ._base import (ReasonCode, _Artifact, _enum, _exact_fields, _fail, _hex64,
                     _schema, artifact_digest, has_visible_characters,
                     require_visible_text)
+
+#: A confirmation rests on these four artifacts. Naming them is the minimum
+#: link between a verdict and the things it claims to have compared.
+CONFIRMATION_REQUIRED_INPUTS = frozenset({
+    "protocol", "trial_plan", "observable_panel", "candidate_set",
+})
 from .vocabulary import (Advantage, CrossProtocol, DecisionOutcome, Dependence,
                          ExitCode, Integrity, Precision, RegionStatus,
                          Reproducibility, Support)
@@ -84,6 +90,7 @@ class Decision(_Artifact):
 
     @classmethod
     def _parse(cls, data: dict[str, Any]) -> "Decision":
+        require_visible_text(data.get("study_id"), "decision.study_id")
         _exact_fields(data, {"schema", "study_id", *_DECISION_STATUS_FIELDS, "reasons",
                              "unresolved_regions", "tested_protocol_ids", "input_sha256",
                              "selected_arm_id"}, "decision")
@@ -91,9 +98,10 @@ class Decision(_Artifact):
         statuses = {name: _enum(data[name], enum_cls, f"decision.{name}")
                     for name, enum_cls in _DECISION_STATUS_FIELDS.items()}
         reasons = _parse_reasons(data["reasons"])
-        _check_decision_consistency(statuses, data["selected_arm_id"], reasons,
-                                    data.get("input_sha256"), data.get("tested_protocol_ids"))
         regions = _parse_regions(data["unresolved_regions"])
+        _check_decision_consistency(statuses, data["selected_arm_id"], reasons,
+                                    data.get("input_sha256"),
+                                    data.get("tested_protocol_ids"), regions)
         protocols = _string_tuple(data["tested_protocol_ids"], "decision.tested_protocol_ids")
         inputs = data["input_sha256"]
         if not isinstance(inputs, dict):
@@ -193,7 +201,7 @@ def _parse_reasons(values: Any) -> tuple[ReasonCode, ...]:
 
 
 def _check_decision_consistency(statuses: Mapping[str, Enum], selected_arm_id: Any,
-                                reasons=(), inputs=None, protocols=()) -> None:
+                                reasons=(), inputs=None, protocols=(), regions=()) -> None:
     if (statuses["integrity"] is Integrity.FAIL
             and statuses["decision"] is not DecisionOutcome.INVALID_INPUT):
         _fail(ReasonCode.INTEGRITY_OUTCOME_CONFLICT,
@@ -211,9 +219,24 @@ def _check_decision_consistency(statuses: Mapping[str, Enum], selected_arm_id: A
     if not inputs:
         _fail(ReasonCode.MISSING_FIELD,
               "a confirmation must record the digests of the artifacts it confirms")
+    absent = sorted(CONFIRMATION_REQUIRED_INPUTS - set(inputs))
+    if absent:
+        _fail(ReasonCode.MISSING_FIELD,
+              f"a confirmation must record the digests of {absent}; a verdict that cannot "
+              "name what it rested on is not reproducible")
     if not protocols:
         _fail(ReasonCode.MISSING_FIELD,
               "a confirmation must name the protocols that were actually compared")
+    if statuses["cross_protocol"] is CrossProtocol.AGREEMENT_SUPPORTED and len(protocols) < 2:
+        _fail(ReasonCode.MISSING_FIELD,
+              "cross-protocol agreement needs at least two compared protocols; "
+              f"got {list(protocols)}")
+    unknown_mass = sorted(region.region_id for region in regions
+                          if region.status is RegionStatus.UNRESOLVED_SUPPORT)
+    if unknown_mass:
+        _fail(ReasonCode.CONFIRMATION_BLOCKED,
+              f"regions {unknown_mass} have unknown mass; an unqualified confirmation cannot "
+              "stand while a relevant region is unresolved (a bounded-small region may)")
     blocking = sorted({reason.value for reason in reasons} & _BLOCKING_REASONS)
     if blocking:
         _fail(ReasonCode.CONFIRMATION_BLOCKED,
