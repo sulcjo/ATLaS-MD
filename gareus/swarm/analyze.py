@@ -16,12 +16,29 @@ from __future__ import annotations
 import csv
 import json
 import math
+import sys
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
 from gareus.config import _write_yaml_or_json
+from gareus.correctness._io import digest, file_digest
+from gareus.cv import (
+    contact_normalization_denominator,
+    contact_scheme,
+    prepare_primary_cv_definition,
+    secondary_cv_mode,
+)
+from gareus.cv_selection import contracts as C
+from gareus.cv_selection.anchor import AnchorCandidate
+from gareus.cv_selection.models import (
+    contact_pair_list_digest,
+    coupling_curvature_kcal,
+    evaluate_component,
+    from_candidate_set,
+)
+from gareus.cv_selection.select_pair import SelectionConfig, SwarmDataset, select_cv_pair
 from gareus.io import write_json
 from gareus.pep_gamd import PepGamdEnvelope
 from gareus.swarm.driver import _load_plan, round_dir, swarm_root
@@ -36,11 +53,15 @@ from gareus.swarm.ladder_design import (
     cv1_centers_from_samples,
     cv1_curvature_kcal,
     cv1_force_constants_from_curvature,
+    cv2_force_constants_per_gap,
     deltav_max_kj,
+    design_2d_layout,
     design_lambda_ladder,
     fsf_floor_per_rung,
     n_resolvable_windows,
+    reweighted_cv2_centers,
     window_sigma_cv,
+    write_ladder_windows_2d_csv,
     write_ladder_windows_csv,
 )
 from gareus.swarm.members import TRACE_COLUMNS, member_done
@@ -56,10 +77,13 @@ def _read_trace(path: Path) -> Dict[str, np.ndarray]:
     return {c: np.asarray(v, dtype=float) for c, v in cols.items()}
 
 
-def _load_members(rd: Path, rows: List[dict]) -> Tuple[Dict[int, dict], Dict[int, Dict[str, np.ndarray]], List[dict], List[int]]:
+def _load_members(rd: Path, rows: List[dict]) -> Tuple[Dict[int, dict], Dict[int, Dict[str, np.ndarray]], List[dict], List[int], Dict[int, Optional[tuple]]]:
     """Read every planned member's ``done.json`` (+ ``trace.csv`` when ``status == "ok"``).
 
-    Returns ``(done_summaries, ok_traces, frame_candidates, missing_members)``.
+    Returns ``(done_summaries, ok_traces, frame_candidates, missing_members, ok_features)``.
+    ``ok_features[m]`` is ``(features_array, torsion_index_dict)`` for an ok member that
+    recorded ``torsion_features.npy`` + ``torsion_index.json`` (Task 1), else ``None``;
+    only automatic CV2 selection reads it, and only for ok members.
     ``ok_traces`` only holds members whose ``done.json`` status is ``"ok"`` (missing key
     defaults to ``"ok"``, matching ``driver.run_swarm_stage``'s own convention) -- a
     ``graft_failed``/``md_failed`` member contributes nothing to the envelope, gates,
@@ -70,6 +94,7 @@ def _load_members(rd: Path, rows: List[dict]) -> Tuple[Dict[int, dict], Dict[int
     ok_traces: Dict[int, Dict[str, np.ndarray]] = {}
     frame_candidates: List[dict] = []
     missing_members: List[int] = []
+    ok_features: Dict[int, Optional[tuple]] = {}
     for row in rows:
         member_id = int(row["member_id"])
         member_dir = rd / f"member_{member_id:04d}"
@@ -84,6 +109,12 @@ def _load_members(rd: Path, rows: List[dict]) -> Tuple[Dict[int, dict], Dict[int
             continue
         tr = _read_trace(trace_path)
         ok_traces[member_id] = tr
+        features_path = member_dir / "torsion_features.npy"
+        index_path = member_dir / "torsion_index.json"
+        ok_features[member_id] = (
+            (np.load(features_path), json.loads(index_path.read_text()))
+            if features_path.exists() and index_path.exists() else None
+        )
         frames_dir = member_dir / "frames"
         for i, frame_val in enumerate(tr["frame"]):
             frame_idx = int(round(frame_val))
@@ -93,7 +124,7 @@ def _load_members(rd: Path, rows: List[dict]) -> Tuple[Dict[int, dict], Dict[int
                     "member_id": member_id, "frame": frame_idx, "cv1": float(tr["cv1"][i]),
                     "pdb_path": str(pdb_path), "member_dir": str(member_dir),
                 })
-    return done_summaries, ok_traces, frame_candidates, missing_members
+    return done_summaries, ok_traces, frame_candidates, missing_members, ok_features
 
 
 def _pool(traces: Dict[int, Dict[str, np.ndarray]], key: str, discard: int) -> np.ndarray:
@@ -104,11 +135,26 @@ def _pool(traces: Dict[int, Dict[str, np.ndarray]], key: str, discard: int) -> n
     return v[np.isfinite(v)]
 
 
-def _write_sidecar(an: Path, seed_bank_dir: Path, windows_csv: Path) -> None:
+def _write_sidecar(an: Path, seed_bank_dir: Path, windows_csv: Path, *,
+                   cvs: Optional[dict] = None, pair_paths: Optional[dict] = None) -> None:
     """The ``starting_structures``/``windows``/``gamd`` fragment a ``windows_2d_csv``
     production run must consume, so the seed-selection path travels with the CSV
-    (global constraint 5c; dests verified against ``gareus/cli.py``)."""
-    payload = {
+    (global constraint 5c; dests verified against ``gareus/cli.py``).
+
+    With automatic CV2 selection the fragment also carries the resolved ``cvs`` and,
+    for a selected pair, the three frozen artifact paths plus ``tica_switch_cv2: false``
+    -- a frozen pair is never redefined mid-campaign."""
+    payload: Dict[str, Any] = {}
+    if cvs is not None:
+        payload["cvs"] = dict(cvs)
+    if pair_paths is not None:
+        payload.update({
+            "secondary_cv_model": str(Path(pair_paths["pair_model"]).resolve()),
+            "secondary_cv_candidate_set": str(Path(pair_paths["candidate_set"]).resolve()),
+            "secondary_cv_feature_schema": str(Path(pair_paths["feature_schema"]).resolve()),
+            "tica_switch_cv2": False,
+        })
+    payload |= {
         "windows": {"window_mode": "manual", "windows_2d_csv": str(windows_csv.resolve())},
         "starting_structures": {
             "seed_conformers_dir": str(seed_bank_dir.resolve()),
@@ -210,6 +256,143 @@ def _extension_meta(out_dir: Path, round_index: int, plan_meta: dict) -> dict:
     return meta
 
 
+# ---------------------------------------------------------------------------
+# Automatic CV2 selection (plan Task 8): dataset assembly, selection, 2-D layout
+# ---------------------------------------------------------------------------
+
+def _library_versions() -> Dict[str, str]:
+    return {"numpy": str(np.__version__), "python": sys.version.split()[0]}
+
+
+def _swarm_contact_pairs(out_dir: Path, args, warnings: List[str]) -> Optional[list]:
+    """The contact pairs the members measured CV1 with, rebuilt exactly as the driver did.
+
+    ``swarm/system/topology.pdb`` is what ``driver`` fed to
+    ``prepare_primary_cv_definition``; without it (or without OpenMM to read it) the
+    anchor's pair list cannot be bound to the model and the report says so."""
+    topology_pdb = swarm_root(out_dir) / "system" / "topology.pdb"
+    if not topology_pdb.exists():
+        warnings.append("cv selection: swarm/system/topology.pdb absent; the anchor's contact pair list "
+                        "is NOT bound into the pair model (deployment can only check its parameters)")
+        return None
+    try:
+        from openmm import app  # noqa: WPS433 -- runtime dependency of the swarm stage itself
+        topology = app.PDBFile(str(topology_pdb)).topology
+        return list(prepare_primary_cv_definition(topology, args).get("contact_pairs", []))
+    except Exception as exc:  # pragma: no cover - environment dependent
+        warnings.append(f"cv selection: could not rebuild contact pairs from topology.pdb ({exc!r}); "
+                        "the anchor's pair list is NOT bound into the pair model")
+        return None
+
+
+def _anchor_definition(args, contact_pairs: Optional[list]) -> Dict[str, Any]:
+    """The contact CV by contents. Parameters always; pair list and norm when available."""
+    min_sep = int(getattr(args, "contact_min_sequence_separation", 4) or 4)
+    selection = str(getattr(args, "contact_atom_selection", "heavy") or "heavy")
+    definition: Dict[str, Any] = {
+        "r0_angstrom": float(getattr(args, "contact_r0_a", 4.5)),
+        "beta_per_angstrom": float(getattr(args, "contact_beta_a_inv", 6.0)),
+        "min_sequence_separation": min_sep,
+        "atom_selection": selection,
+        "normalize": bool(getattr(args, "contact_normalize", True)),
+        "pair_rule": f"{contact_scheme(args)}:{selection}:min-sep-{min_sep}",
+    }
+    if contact_pairs:
+        definition["pair_list_sha256"] = contact_pair_list_digest(contact_pairs)
+        definition["norm"] = float(contact_normalization_denominator(contact_pairs, args))
+    return definition
+
+
+def _feature_schema_from_index(index: dict, topology_sha256: str) -> C.FeatureSchema:
+    """Canonical feature order: phi block then psi block, sin then cos per torsion."""
+    rows = []
+    for block, quads in (("phi", index["phi_torsions"]), ("psi", index["psi_torsions"])):
+        for k, quad in enumerate(quads):
+            for trig in ("sin", "cos"):
+                rows.append({"index": len(rows), "name": f"{block}-{k}-{trig}", "torsion_name": f"{block}-{k}",
+                             "residue_index": int(k), "atom_indices": [int(x) for x in quad],
+                             "trig": trig, "dihedral_sign_convention": "negated"})
+    return C.FeatureSchema.from_mapping({"schema": C.FEATURE_SCHEMA_VERSION,
+                                         "topology_sha256": topology_sha256, "features": rows})
+
+
+def _build_swarm_dataset(rows: List[dict], ok_traces: Dict[int, Dict[str, np.ndarray]],
+                         ok_features: Dict[int, Optional[tuple]], discard: int, args,
+                         contact_pairs: Optional[list], topology_sha256: str) -> Tuple[SwarmDataset, dict]:
+    """Aligned per-frame rows past the discard: features, anchor, shape, energies, seed family.
+
+    Alignment is by row index (Task 1 guarantees feature row i is trace row i); rows with
+    a non-finite value anywhere are dropped jointly, never per column."""
+    seed_by_member = {int(r["member_id"]): str(r.get("seed_id", r["member_id"])) for r in rows}
+    index_ref: Optional[dict] = None
+    first_member: Optional[int] = None
+    parts: Dict[str, list] = {k: [] for k in ("features", "cv1", "rg", "e2e", "v_pep", "v_dih", "groups")}
+    for m in sorted(ok_traces):
+        record = ok_features.get(m)
+        if record is None:
+            raise RuntimeError(f"swarm member {m} completed (status ok) without torsion_features.npy; "
+                               "cv2=auto needs canonical torsion features from every ok member")
+        features, index = record
+        if index_ref is None:
+            index_ref, first_member = index, m
+        elif index != index_ref:
+            raise RuntimeError(f"member {m} torsion_index.json differs from member {first_member}; "
+                               "one feature schema per swarm")
+        tr = ok_traces[m]
+        n_rows = len(tr["cv1"])
+        if features.shape[0] != n_rows:
+            raise RuntimeError(f"member {m}: {features.shape[0]} feature rows vs {n_rows} trace rows; "
+                               "features are not aligned with the trace")
+        sl = slice(int(discard), n_rows)
+        parts["features"].append(np.asarray(features[sl], dtype=np.float64))
+        parts["cv1"].append(tr["cv1"][sl]); parts["rg"].append(tr["rg_nm"][sl]); parts["e2e"].append(tr["e2e_nm"][sl])
+        parts["v_pep"].append(tr["v_pep_kj"][sl]); parts["v_dih"].append(tr["v_dih_kj"][sl])
+        parts["groups"].append(np.full(n_rows - int(discard), seed_by_member[m], dtype=object))
+    if index_ref is None:
+        raise RuntimeError("no ok member with torsion features; cv2=auto has nothing to fit on")
+    features = np.vstack(parts["features"])
+    cv1, rg, e2e = (np.concatenate(parts[k]) for k in ("cv1", "rg", "e2e"))
+    v_pep, v_dih = (np.concatenate(parts[k]) for k in ("v_pep", "v_dih"))
+    groups = np.concatenate(parts["groups"])
+    finite = (np.isfinite(features).all(axis=1) & np.isfinite(cv1) & np.isfinite(rg) & np.isfinite(e2e)
+              & np.isfinite(v_pep) & np.isfinite(v_dih))
+    schema = _feature_schema_from_index(index_ref, topology_sha256)
+    anchor = AnchorCandidate("nonlocal-contact-fraction", _anchor_definition(args, contact_pairs), cv1[finite])
+    dataset = SwarmDataset(features[finite], schema, anchor, np.column_stack([rg[finite], e2e[finite]]),
+                           groups[finite])
+    aux = {"v_pep": v_pep[finite], "v_dih": v_dih[finite],
+           "rows_sha256": digest(b"".join(np.ascontiguousarray(f).tobytes() for f in parts["features"])),
+           "n_dropped_nonfinite": int((~finite).sum())}
+    return dataset, aux
+
+
+def _selection_config(args, k1_max_kcal: float, temperature_k: float) -> SelectionConfig:
+    return SelectionConfig(
+        residual_degree=int(getattr(args, "cv_selection_residual_degree", 1)),
+        max_nonlinear_r2=float(getattr(args, "cv_selection_max_nonlinear_r2", 0.20)),
+        max_coupling_fraction=float(getattr(args, "cv_selection_max_coupling_fraction", 0.25)),
+        k1_kcal_reference=float(k1_max_kcal),
+        k2_kcal_reference=float(getattr(args, "cv_selection_k2_reference_kcal", 1.0)),
+        min_gain_nats=float(getattr(args, "cv_selection_min_gain_nats", 0.02)),
+        min_windows_cv1=int(getattr(args, "cv_selection_min_windows_cv1", 4)),
+        temperature_k=float(temperature_k),
+    )
+
+
+def _two_d_rows(layout: dict, centers1, ks1, centers2, ks2) -> List[dict]:
+    """One (center1, k1, center2, k2) row per spatial cell; an unrestrained axis has k = 0."""
+    mid1 = float(np.mean(centers1))
+    rows = []
+    for i1, i2 in layout["cells"]:
+        rows.append({
+            "center1": float(centers1[i1]) if i1 is not None else mid1,
+            "k1": float(ks1[i1]) if i1 is not None else 0.0,
+            "center2": float(centers2[i2]) if i2 is not None else None,
+            "k2": float(ks2[i2]) if i2 is not None else 0.0,
+        })
+    return rows
+
+
 def analyze_swarm_stage(out_dir, args) -> dict:
     out_dir = Path(out_dir)
     round_index = int(getattr(args, "swarm_round", 0) or 0)
@@ -218,7 +401,7 @@ def analyze_swarm_stage(out_dir, args) -> dict:
     an.mkdir(parents=True, exist_ok=True)
 
     rows, plan_meta = _load_plan(rd)
-    done_summaries, ok_traces, frame_candidates, missing_members = _load_members(rd, rows)
+    done_summaries, ok_traces, frame_candidates, missing_members, ok_features = _load_members(rd, rows)
 
     graft_failed_members = sorted(m for m, d in done_summaries.items() if str(d.get("status", "ok")) == "graft_failed")
     md_failed_members = sorted(m for m, d in done_summaries.items() if str(d.get("status", "ok")) == "md_failed")
@@ -344,6 +527,75 @@ def analyze_swarm_stage(out_dir, args) -> dict:
         })
         write_json(an / "ladder_design.json", ladder_design)
 
+        # --- automatic CV2 selection against the configured contact anchor ------------
+        selection: Optional[Dict[str, Any]] = None
+        pair_layout: Optional[tuple] = None
+        pair_paths: Optional[dict] = None
+        if secondary_cv_mode(args) == "auto":
+            contact_pairs = _swarm_contact_pairs(out_dir, args, warnings)
+            system_xml = swarm_root(out_dir) / "system" / "base_system.xml"
+            topology_pdb = swarm_root(out_dir) / "system" / "topology.pdb"
+            physical_sha = file_digest(system_xml) if system_xml.exists() else digest(b"swarm-system-unavailable")
+            topology_sha = file_digest(topology_pdb) if topology_pdb.exists() else digest(b"swarm-topology-unavailable")
+            dataset, aux = _build_swarm_dataset(rows, ok_traces, ok_features, discard, args, contact_pairs, topology_sha)
+            sel = select_cv_pair(
+                dataset, _selection_config(args, k_max, temperature_k),
+                physical_system_sha256=physical_sha, training_rows_sha256=aux["rows_sha256"],
+                library_versions=_library_versions(),
+                genpept_preset=str(getattr(args, "diversity_bank_preset", "broad") or "broad"),
+            )
+            selection = {
+                "status": sel.status, "anchor": sel.anchor.kind, "anchor_reasons": list(sel.anchor.reasons),
+                "anchor_n_resolvable": int(sel.anchor.n_resolvable),
+                "selection_reason": sel.report.get("selection_reason"),
+                "n_frames": int(dataset.features.shape[0]), "n_dropped_nonfinite": aux["n_dropped_nonfinite"],
+                "physical_system_bound": bool(system_xml.exists()),
+                "anchor_pair_list_bound": contact_pairs is not None,
+            }
+            (an / "cv_feature_schema.json").write_bytes(dataset.feature_schema.to_json_bytes())
+            if sel.candidate_set is not None:
+                (an / "cv_candidate_set.json").write_bytes(sel.candidate_set.to_json_bytes())
+            if sel.pair_model is not None:
+                (an / "cv_pair_model.json").write_bytes(sel.pair_model.to_json_bytes())
+                selection["pair_model_sha256"] = sel.pair_model.sha256
+                selection["selected_component_index"] = int(sel.pair_model.selected_component_index)
+                selection["certificate"] = dict(sel.pair_model.certificate)
+            write_json(an / "cv_selection_report.json", {**sel.report, **selection})
+            if sel.status == "pair":
+                fit = from_candidate_set(sel.candidate_set)
+                j = int(sel.pair_model.selected_component_index)
+                z2_all = evaluate_component(fit, j, dataset.features, dataset.anchor.values)
+                dv_rows = deltav_max_kj(aux["v_pep"], aux["v_dih"], env)
+                n2 = max(2, int(getattr(args, "swarm_n_windows_cv2", 4)))
+                cv2_design = reweighted_cv2_centers(z2_all, dv_rows, temperature_k, ladder["lambdas"], n2)
+                k2_min = float(getattr(args, "cv2_k_min", 0.0) or 0.0) or 1e-3
+                ks2 = cv2_force_constants_per_gap(cv2_design["centers"], temperature_k, overlap_sigma=overlap_sigma,
+                                                  k_min_kcal=k2_min, k_max_kcal=float(getattr(args, "cv2_k_max", 1000.0)))
+                layout = design_2d_layout(int(n_win), n2, n_rungs=len(ladder["lambdas"]),
+                                          max_replicas=int(getattr(args, "max_replicas", 0) or 0))
+                # The CV2 umbrella also restrains the anchor through the chain-rule term;
+                # the CV1 windows are narrower than their own k says by this much.
+                coupling = coupling_curvature_kcal(fit, j, max(ks2))
+                shrink = [1.0 - math.sqrt(float(k) / (float(k) + coupling)) for k in ks]
+                if max(shrink) > 0.10:
+                    warnings.append(f"cv selection: the CV2 umbrella narrows CV1 windows by up to "
+                                    f"{100 * max(shrink):.0f}% (coupling curvature {coupling:.1f} kcal/mol/CV^2 "
+                                    f"at k2={max(ks2):.2f}); the CV1 overlap design assumed k1 alone")
+                selection.update({
+                    "layout": {k: v for k, v in layout.items() if k != "cells"},
+                    "cv2_centers": [float(c) for c in cv2_design["centers"]],
+                    "cv2_k_kcal": [float(k) for k in ks2],
+                    "cv2_per_rung_quantiles": {str(l): list(q) for l, q in cv2_design["per_rung_quantiles"].items()},
+                    "cv2_per_rung_ess": {str(l): e for l, e in cv2_design["per_rung_ess"].items()},
+                    "coupling_curvature_kcal_at_max_k2": float(coupling),
+                    "cv1_width_shrink_max": float(max(shrink)),
+                })
+                pair_layout = (layout, cv2_design["centers"], ks2)
+                pair_paths = {"pair_model": an / "cv_pair_model.json",
+                              "candidate_set": an / "cv_candidate_set.json",
+                              "feature_schema": an / "cv_feature_schema.json"}
+            report["cv_selection"] = selection
+
         gate = evaluate_gates(
             rows, set(ok_member_ids), ok_traces, discard, ladder, list(done_summaries.values()),
             min_done_fraction=float(getattr(args, "swarm_min_done_fraction", 0.9)),
@@ -351,6 +603,8 @@ def analyze_swarm_stage(out_dir, args) -> dict:
             extrema_sigma_tol=float(getattr(args, "swarm_stability_extrema_sigma_tol", 1.0)),
             ladder_ess_floor=int(getattr(args, "swarm_ess_floor", 50)),
             max_graft_fallback_fraction=float(getattr(args, "swarm_max_graft_fallback_fraction", 0.10)),
+            selection=selection,
+            pair_fallback=str(getattr(args, "cv_selection_fallback", "cv1_only") or "cv1_only"),
         )
         write_json(an / "swarm_gate.json", gate)
         # Also fold gate warnings (e.g. ladder_ess_gate's advisory ESS/extrapolation
@@ -371,8 +625,18 @@ def analyze_swarm_stage(out_dir, args) -> dict:
             "ladder_design": {"library_q99": library_q99, **cv1_upper_bound_probe},
         })
         if gate["status"] == "pass":
-            windows_csv = write_ladder_windows_csv(an / "windows_lambda_ladder.csv", centers, ks, ladder["lambdas"])
-            _write_sidecar(an, seed_bank_dir, windows_csv)
+            if pair_layout is not None:
+                layout, centers2, ks2 = pair_layout
+                windows_csv = write_ladder_windows_2d_csv(
+                    an / "windows_lambda_ladder.csv", _two_d_rows(layout, centers, ks, centers2, ks2),
+                    ladder["lambdas"])
+                report["n_states"] = int(layout["spatial_states"]) * len(ladder["lambdas"])
+                _write_sidecar(an, seed_bank_dir, windows_csv,
+                               cvs={"cv1": "contacts", "cv2": "residual-torsion-pc"}, pair_paths=pair_paths)
+            else:
+                windows_csv = write_ladder_windows_csv(an / "windows_lambda_ladder.csv", centers, ks, ladder["lambdas"])
+                _write_sidecar(an, seed_bank_dir, windows_csv,
+                               cvs={"cv1": "contacts", "cv2": "none"} if selection is not None else None)
         else:
             _withhold_ladder_artifacts(an)
             report["withheld_ladder_artifacts"] = True

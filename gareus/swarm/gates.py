@@ -222,6 +222,30 @@ def graft_gate(done_summaries: list[dict], *, max_fallback_fraction: float = 0.1
     }
 
 
+def pair_gate(selection: dict, *, fallback: str) -> dict:
+    """Did automatic CV2 selection leave the run with a deployable pair, or an honest 1-D fallback?
+
+    ``pair``: ok. ``cv1_only`` (a deployable anchor, but no component passed) is ok only
+    when the operator declared ``fallback = "cv1_only"``. ``no_deployable_anchor`` is never
+    ok: running the CV the selector just certified as resolving too few windows is the
+    exact failure the design names as the binding constraint, and no fallback buys it.
+    """
+    status = selection.get("status")
+    ok = status == "pair" or (status == "cv1_only" and fallback == "cv1_only")
+    if status == "no_deployable_anchor":
+        reasons = [f"the configured anchor is not deployable ({'; '.join(selection.get('anchor_reasons', []))}); "
+                   "no fallback runs an anchor the selector rejected"]
+    elif not ok:
+        reasons = [f"cv pair selection returned {status!r} with fallback={fallback!r}"]
+    else:
+        reasons = []
+    note = None
+    if ok and status == "cv1_only":
+        note = f"automatic CV2 selection found no deployable component ({selection.get('selection_reason')}); running CV1 alone as configured"
+    return {"ok": ok, "status": status, "fallback": fallback, "reasons": reasons,
+            "warnings": [note] if note else []}
+
+
 def evaluate_gates(
     plan_rows: list[dict],
     done_ids: set[int],
@@ -235,6 +259,8 @@ def evaluate_gates(
     extrema_sigma_tol: float = 1.0,
     ladder_ess_floor: int = 50,
     max_graft_fallback_fraction: float = 0.10,
+    selection: dict | None = None,
+    pair_fallback: str = "cv1_only",
 ) -> dict:
     """Evaluate all gates; return aggregate status and reasons.
 
@@ -264,6 +290,8 @@ def evaluate_gates(
         "ladder_ess": ladder_ess_gate(ladder, ess_floor=ladder_ess_floor),
         "graft": graft_gate(done_summaries, max_fallback_fraction=max_graft_fallback_fraction),
     }
+    if selection is not None:
+        gates["pair"] = pair_gate(selection, fallback=pair_fallback)
 
     # Aggregate reasons from all failed gates
     all_reasons = []

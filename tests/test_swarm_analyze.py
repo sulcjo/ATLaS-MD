@@ -234,3 +234,98 @@ def test_probe_pool_is_the_exported_frame_set_not_every_trace_row():
     assert "n_seed_pool" in probe, "the probe must report the pool it measured"
     # Post-discard subset of the exported PDB frames, never the full trace.
     assert 0 < probe["n_seed_pool"] <= n_exported
+
+
+# ---------------------------------------------------------------------------
+# Task 8: automatic CV2 selection wired into swarm analysis (fixtures: tests/conftest.py)
+# ---------------------------------------------------------------------------
+
+def test_auto_cv2_writes_a_pair_model_and_a_two_dimensional_ladder(synthetic_swarm, swarm_args):
+    from gareus.swarm.analyze import analyze_swarm_stage
+    from gareus.config import _load_config_file
+    out = synthetic_swarm(with_features=True, wide_anchor=True)
+    report = analyze_swarm_stage(out, swarm_args(secondary_cv="auto"))
+    an = out / "swarm" / "analysis"
+    assert report["cv_selection"]["status"] == "pair", report["cv_selection"]
+    for name in ("cv_pair_model.json", "cv_candidate_set.json", "cv_feature_schema.json",
+                 "cv_selection_report.json", "windows_lambda_ladder.csv"):
+        assert (an / name).exists(), name
+    with (an / "windows_lambda_ladder.csv").open() as fh:
+        header = fh.readline().strip().split(",")
+    assert {"secondary_cv_center", "secondary_cv_k_kcal_mol"} <= set(header)
+    side = _load_config_file(an / "ladder_run_args.yaml")
+    assert side["cvs"] == {"cv1": "contacts", "cv2": "residual-torsion-pc"}
+    assert side["tica_switch_cv2"] is False
+    for key in ("secondary_cv_model", "secondary_cv_candidate_set", "secondary_cv_feature_schema"):
+        assert pathlib.Path(side[key]).exists()
+    assert report["status"] == "pass" and report["gate"]["gates"]["pair"]["ok"] is True
+    assert report["cv_selection"]["layout"]["kind"] in ("joint", "sparse")
+
+
+def test_narrow_anchor_fails_the_pair_gate_whatever_the_fallback(synthetic_swarm, swarm_args):
+    from gareus.swarm.analyze import analyze_swarm_stage
+    out = synthetic_swarm(with_features=True, wide_anchor=False)
+    report = analyze_swarm_stage(out, swarm_args(secondary_cv="auto", cv_selection_fallback="cv1_only"))
+    an = out / "swarm" / "analysis"
+    assert report["cv_selection"]["status"] == "no_deployable_anchor"
+    assert report["status"] == "fail" and report["gate"]["gates"]["pair"]["ok"] is False
+    assert not (an / "windows_lambda_ladder.csv").exists()
+    assert not (an / "ladder_run_args.yaml").exists()
+
+
+def test_refuse_fallback_withholds_the_ladder_when_no_component_passes(synthetic_swarm, swarm_args):
+    from gareus.swarm.analyze import analyze_swarm_stage
+    out = synthetic_swarm(with_features=True, wide_anchor=True)
+    report = analyze_swarm_stage(out, swarm_args(secondary_cv="auto", cv_selection_fallback="refuse",
+                                                 cv_selection_min_gain_nats=1e9))
+    assert report["cv_selection"]["status"] == "cv1_only"
+    assert report["status"] == "fail" and report["gate"]["gates"]["pair"]["ok"] is False
+    assert not (out / "swarm" / "analysis" / "windows_lambda_ladder.csv").exists()
+
+
+def test_cv1_only_fallback_writes_a_one_dimensional_ladder_and_says_so(synthetic_swarm, swarm_args):
+    from gareus.swarm.analyze import analyze_swarm_stage
+    from gareus.config import _load_config_file
+    out = synthetic_swarm(with_features=True, wide_anchor=True)
+    report = analyze_swarm_stage(out, swarm_args(secondary_cv="auto", cv_selection_fallback="cv1_only",
+                                                 cv_selection_min_gain_nats=1e9))
+    an = out / "swarm" / "analysis"
+    assert report["cv_selection"]["status"] == "cv1_only" and report["status"] == "pass"
+    with (an / "windows_lambda_ladder.csv").open() as fh:
+        assert "secondary_cv_center" not in fh.readline()
+    side = _load_config_file(an / "ladder_run_args.yaml")
+    assert side["cvs"] == {"cv1": "contacts", "cv2": "none"}
+    assert any("no deployable component" in w for w in report["warnings"])
+
+
+def test_a_crashed_member_without_features_does_not_abort_the_analysis(synthetic_swarm, swarm_args):
+    from gareus.swarm.analyze import analyze_swarm_stage
+    out = synthetic_swarm(with_features=True, wide_anchor=True, crash_one_member=True)
+    report = analyze_swarm_stage(out, swarm_args(secondary_cv="auto"))
+    assert report["cv_selection"]["status"] == "pair"
+
+
+def test_an_ok_member_without_features_is_a_hard_error_in_auto_mode(synthetic_swarm, swarm_args):
+    import pytest
+    from gareus.swarm.analyze import analyze_swarm_stage
+    out = synthetic_swarm(with_features=True, wide_anchor=True)
+    (out / "swarm" / "round_000" / "member_0003" / "torsion_features.npy").unlink()
+    with pytest.raises(RuntimeError, match="torsion_features.npy"):
+        analyze_swarm_stage(out, swarm_args(secondary_cv="auto"))
+
+
+def test_explicit_cv2_none_leaves_the_existing_path_untouched(synthetic_swarm, swarm_args):
+    from gareus.swarm.analyze import analyze_swarm_stage
+    out = synthetic_swarm(with_features=False, wide_anchor=True)
+    report = analyze_swarm_stage(out, swarm_args(secondary_cv="none"))
+    assert "cv_selection" not in report and report["status"] == "pass"
+    assert "pair" not in report["gate"]["gates"]
+
+
+def test_pair_gate_semantics():
+    from gareus.swarm.gates import pair_gate
+    assert pair_gate({"status": "pair"}, fallback="refuse")["ok"]
+    assert pair_gate({"status": "cv1_only"}, fallback="cv1_only")["ok"]
+    assert not pair_gate({"status": "cv1_only"}, fallback="refuse")["ok"]
+    assert not pair_gate({"status": "no_deployable_anchor", "anchor_reasons": ["2 resolvable windows"]},
+                         fallback="cv1_only")["ok"]
