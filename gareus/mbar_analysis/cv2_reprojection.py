@@ -54,7 +54,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional, Sequence
+from typing import Any, Iterable, Optional, Sequence
 
 import numpy as np
 
@@ -99,20 +99,40 @@ CV2_REPROJECTION_MIN_COVERAGE = 0.99
 STORED_OBS_AGREEMENT_ATOL = 1e-8
 
 
+RESIDUAL_REGIME = 'residual-torsion-pc'
+
+
 @dataclass(frozen=True)
 class Cv2Model:
-    """One regime's CV2 definition: an affine map of torsion features."""
+    """One regime's CV2 definition.
+
+    Either an affine map of torsion features (``TICAResult``: tica-linear,
+    torsion-pca) or a residual component against the contact anchor
+    (``PairModelRuntime``), whose projection also needs the primary CV.
+    """
 
     regime: str
-    result: TICAResult
+    result: Any
     source: Optional[Path] = None
+    n_phi: Optional[int] = None      # residual regime only: size of the phi block
+
+    @property
+    def is_residual(self) -> bool:
+        return self.regime == RESIDUAL_REGIME
 
     @property
     def n_features(self) -> int:
+        if self.is_residual:
+            return int(self.result.fit.width)
         return int(np.asarray(self.result.weights).size)
 
     @property
     def torsion_indices(self) -> tuple:
+        if self.is_residual:
+            if self.n_phi is None:
+                raise ValueError(f'{self.regime}: phi/psi split unknown; load through load_cv2_model')
+            atoms = [list(q) for q in self.result.feature_atoms]
+            return (atoms[:self.n_phi], atoms[self.n_phi:])
         return (list(self.result.phi_torsion_indices),
                 list(self.result.psi_torsion_indices))
 
@@ -126,6 +146,8 @@ def load_cv2_model(path, regime: Optional[str] = None) -> Cv2Model:
     """
     path = Path(path)
     d = json.loads(path.read_text())
+    if d.get('schema') == 'atlas-cv-selection-pair-model-v1':
+        return _load_residual_model(path, d)
     result = TICAResult.from_dict(d)
     if regime is None:
         regime = 'torsion-pca' if str(d.get('method', 'tica')) == 'pca' else 'tica-linear'
@@ -141,8 +163,30 @@ def load_cv2_model(path, regime: Optional[str] = None) -> Cv2Model:
     return Cv2Model(regime=str(regime), result=result, source=path)
 
 
-def project_cv2(model: Cv2Model, features: np.ndarray) -> np.ndarray:
-    """Project a (n, n_features) feature matrix onto this regime's CV2."""
+def _load_residual_model(path: Path, d: dict) -> Cv2Model:
+    """A pair model needs its candidate set and feature schema; they live beside it."""
+    from gareus.cv_selection.models import PairModelRuntime
+
+    cs_path = path.parent / 'cv_candidate_set.json'
+    fs_path = path.parent / 'cv_feature_schema.json'
+    for p in (cs_path, fs_path):
+        if not p.exists():
+            raise FileNotFoundError(f'{path}: residual pair model needs {p.name} beside it')
+    runtime = PairModelRuntime.load(path, cs_path, fs_path)
+    # The pair model does not store the phi/psi split; the schema's torsion names do.
+    fs = json.loads(fs_path.read_text())
+    n_phi = sum(1 for f in fs['features'] if f['trig'] == 'sin' and f['torsion_name'].startswith('phi'))
+    return Cv2Model(regime=RESIDUAL_REGIME, result=runtime, source=path, n_phi=n_phi)
+
+
+def project_cv2(model: Cv2Model, features: np.ndarray,
+                primary_cv: Optional[np.ndarray] = None) -> np.ndarray:
+    """Project a (n, n_features) feature matrix onto this regime's CV2.
+
+    A residual model also needs ``primary_cv`` (the recorded anchor value per
+    row); refusing without it is the point -- a torsion-only projection would
+    be a different coordinate.
+    """
     features = np.asarray(features, dtype=np.float64)
     if features.ndim != 2:
         raise ValueError(f'features must be 2-D (n, n_features), got shape {features.shape}')
@@ -150,6 +194,15 @@ def project_cv2(model: Cv2Model, features: np.ndarray) -> np.ndarray:
         raise ValueError(
             f'{model.regime}: features have {features.shape[1]} columns but the model '
             f'has {model.n_features} weights')
+    if model.is_residual:
+        if primary_cv is None:
+            raise ValueError(f'{model.regime}: projection needs the recorded primary CV per row')
+        from gareus.cv_selection.models import evaluate_component
+        a = np.asarray(primary_cv, dtype=np.float64)
+        if a.shape != (features.shape[0],):
+            raise ValueError(f'{model.regime}: primary_cv must be (n,), got {a.shape}')
+        return evaluate_component(model.result.fit, model.result.j, features, a,
+                                  clamp=(model.result.fit.degree == 2))
     return project_tica1(features, model.result)
 
 
@@ -194,7 +247,7 @@ def validate_model_against_stored_obs(model: Cv2Model, obs: dict,
     observations were recorded; applying the other regime's model here is how
     you MEASURE the regime change, not how you validate it.
     """
-    got = project_cv2(model, obs['features'])
+    got = project_cv2(model, obs['features'], obs.get('primary_cv'))
     ref = np.asarray(obs['secondary_cv'], dtype=np.float64)
     finite = np.isfinite(got) & np.isfinite(ref)
     if not np.any(finite):
@@ -225,7 +278,7 @@ def reproject_stored_obs(models: Iterable[Cv2Model], obs: dict) -> dict:
     out = {'steps': np.asarray(obs['steps'], dtype=np.int64),
            'window': np.asarray(obs['window'], dtype=np.int64)}
     for model in models:
-        out[f'cv2_{model.regime}'] = project_cv2(model, obs['features'])
+        out[f'cv2_{model.regime}'] = project_cv2(model, obs['features'], obs.get('primary_cv'))
     return out
 
 

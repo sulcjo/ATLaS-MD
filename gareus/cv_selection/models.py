@@ -25,10 +25,13 @@ varies by orders of magnitude between otherwise interchangeable components.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Mapping
 
 import numpy as np
 
+from ..correctness._io import digest, json_bytes
 from . import contracts as C
 
 #: Two adjacent singular values closer than this fraction of the leading one
@@ -222,3 +225,108 @@ def from_candidate_set(candidates: C.CandidateSet) -> ResidualFit:
         projection_std=np.asarray([c.projection_std for c in comps], dtype=np.float64),
         degree=degree,
     )
+
+
+# ---------------------------------------------------------------------------
+# Runtime: the frozen pair as production loads it
+# ---------------------------------------------------------------------------
+
+#: Anchor-definition keys and the ``args`` attribute each must equal at deploy time.
+_ANCHOR_ARG_KEYS = (
+    ("r0_angstrom", "contact_r0_a"),
+    ("beta_per_angstrom", "contact_beta_a_inv"),
+    ("min_sequence_separation", "contact_min_sequence_separation"),
+    ("atom_selection", "contact_atom_selection"),
+    ("normalize", "contact_normalize"),
+)
+
+
+def contact_pair_list_digest(contact_pairs) -> str:
+    """Digest of the realised contact pair list, order-independent.
+
+    Binding the pair list, not just its parameters, is what stops a model
+    fitted on one contact definition from being deployed against another --
+    and is the one place a native contact map could otherwise slip in.
+    """
+    rows = sorted([int(p[0]), int(p[1]), float(p[2]) if len(p) > 2 else 1.0] for p in contact_pairs)
+    return digest(json_bytes(rows))
+
+
+def _same(expected: Any, got: Any) -> bool:
+    if isinstance(expected, bool) or isinstance(got, bool):
+        return bool(expected) == bool(got)
+    if isinstance(expected, (int, float)) and isinstance(got, (int, float)):
+        return bool(np.isclose(float(expected), float(got), rtol=1e-9, atol=0.0))
+    return expected == got
+
+
+@dataclass(frozen=True)
+class PairModelRuntime:
+    """One selected component plus everything needed to force and evaluate it."""
+
+    fit: ResidualFit
+    j: int
+    anchor_kind: str
+    anchor_definition: dict
+    pair_sha256: str
+    feature_atoms: tuple            # one quadruplet per torsion: phi block then psi block
+
+    @classmethod
+    def load(cls, pair_model_path, candidate_set_path, feature_schema_path) -> "PairModelRuntime":
+        """Load the three artifacts and hold them to each other's digests."""
+        from .pair_model import PairModel
+
+        pair = PairModel.from_json_bytes(Path(pair_model_path).read_bytes())
+        candidates = C.CandidateSet.from_json_bytes(Path(candidate_set_path).read_bytes())
+        schema = C.FeatureSchema.from_json_bytes(Path(feature_schema_path).read_bytes())
+        if pair.candidate_set_sha256 != candidates.sha256:
+            raise RuntimeError(f"pair model binds candidate set {pair.candidate_set_sha256} but "
+                               f"{candidate_set_path} hashes to {candidates.sha256}")
+        if pair.feature_schema_sha256 != schema.sha256:
+            raise RuntimeError(f"pair model binds feature schema {pair.feature_schema_sha256} but "
+                               f"{feature_schema_path} hashes to {schema.sha256}")
+        C.require_feature_binding(candidates, schema)
+        atoms = tuple(tuple(int(i) for i in f.atom_indices) for f in schema.features if f.trig == "sin")
+        return cls(from_candidate_set(candidates), int(pair.selected_component_index),
+                   str(pair.anchor["kind"]), dict(pair.anchor["definition"]), pair.sha256, atoms)
+
+    def contact_args(self) -> SimpleNamespace:
+        """The contact parameters as an ``args``-shaped object, from the frozen definition."""
+        d = self.anchor_definition
+        return SimpleNamespace(
+            contact_r0_a=float(d["r0_angstrom"]),
+            contact_beta_a_inv=float(d["beta_per_angstrom"]),
+            contact_normalize=bool(d.get("normalize", True)),
+            contact_min_sequence_separation=int(d.get("min_sequence_separation", 0)),
+            contact_atom_selection=str(d.get("atom_selection", "heavy")),
+        )
+
+    def check_topology(self, phi_torsions, psi_torsions) -> None:
+        """The production topology must yield the exact torsion quadruplets the model was fitted on."""
+        got = tuple(tuple(int(i) for i in q) for q in list(phi_torsions) + list(psi_torsions))
+        if len(got) != len(self.feature_atoms):
+            raise RuntimeError(f"feature schema defines {len(self.feature_atoms)} torsions, topology "
+                               f"yields {len(got)}")
+        for k, (expected, actual) in enumerate(zip(self.feature_atoms, got)):
+            if tuple(expected) != actual:
+                raise RuntimeError(f"feature schema torsion {k} is atoms {tuple(expected)}, topology "
+                                   f"yields {actual}; same width, different coordinate")
+
+    def check_anchor(self, args, contact_pairs) -> None:
+        """Every frozen anchor parameter must equal the run's, including the pair list itself."""
+        from ..cv import contact_normalization_denominator
+
+        d = self.anchor_definition
+        for key, attr in _ANCHOR_ARG_KEYS:
+            if key in d and not _same(d[key], getattr(args, attr, None)):
+                raise RuntimeError(f"anchor definition mismatch: model {key}={d[key]!r}, run "
+                                   f"{attr}={getattr(args, attr, None)!r}")
+        if "norm" in d:
+            live = contact_normalization_denominator(list(contact_pairs), args)
+            if not _same(d["norm"], live):
+                raise RuntimeError(f"anchor normalisation mismatch: model {d['norm']}, run {live}")
+        if "pair_list_sha256" in d:
+            live_digest = contact_pair_list_digest(contact_pairs)
+            if d["pair_list_sha256"] != live_digest:
+                raise RuntimeError("anchor contact pair list differs from the one the model was "
+                                   f"fitted on ({d['pair_list_sha256'][:12]} vs {live_digest[:12]})")

@@ -300,6 +300,8 @@ def secondary_cv_mode(args_or_mode) -> str:
         "bootstrap-linear": "torsion-pca",
         "torsion-linear": "torsion-pca",
         "torsion-pca": "torsion-pca",
+        "residual-torsion-pc": "residual-torsion-pc",
+        "residual-pc": "residual-torsion-pc",
     }
     return aliases.get(mode, mode)
 
@@ -311,13 +313,14 @@ def secondary_cv_enabled(args) -> bool:
 
 def secondary_cv_is_transition(args_or_mode) -> bool:
     """Return True if the secondary CV is a transition coordinate."""
-    return secondary_cv_mode(args_or_mode) in {"alpha-coil-beta", "rama-map", "tica-linear", "torsion-pca"}
+    return secondary_cv_mode(args_or_mode) in {"alpha-coil-beta", "rama-map", "tica-linear",
+                                               "torsion-pca", "residual-torsion-pc"}
 
 
 def secondary_cv_range(args_or_mode) -> Tuple[float, float]:
     """Return the valid scalar range for the selected secondary CV."""
     mode = secondary_cv_mode(args_or_mode)
-    if mode in {"tica-linear", "torsion-pca"}:
+    if mode in {"tica-linear", "torsion-pca", "residual-torsion-pc"}:
         return (-6.0, 6.0)
     return (-1.0, 1.0) if secondary_cv_is_transition(args_or_mode) else (0.0, 1.0)
 
@@ -485,7 +488,8 @@ def _ensure_secondary_cv_numeric_cache(ss_info: Dict[str, Any], mode: str) -> fl
         ss_info["_np_rama_region_values"] = np.asarray(values, dtype=np.float64)
         ss_info["_np_rama_phi_targets"] = np.asarray(phi_targets, dtype=np.float64)
         ss_info["_np_rama_psi_targets"] = np.asarray(psi_targets, dtype=np.float64)
-    elif mode not in {"alpha-coil-beta", "rama-map", "tica-linear", "torsion-pca"} and "_np_simple_phi_psi_targets" not in ss_info:
+    elif (mode not in {"alpha-coil-beta", "rama-map", "tica-linear", "torsion-pca", "residual-torsion-pc"}
+          and "_np_simple_phi_psi_targets" not in ss_info):
         ss_info["_np_simple_phi_psi_targets"] = np.asarray([
             math.radians(float(ss_info.get("phi0_deg", -60.0))),
             math.radians(float(ss_info.get("psi0_deg", -45.0))),
@@ -505,6 +509,15 @@ def secondary_structure_score_from_positions_nm(positions_nm, ss_info: Optional[
         return float("nan")
     mode = secondary_cv_mode(ss_info)
     sigma = _ensure_secondary_cv_numeric_cache(ss_info, mode)
+
+    if mode == "residual-torsion-pc":
+        runtime = _residual_runtime_from_ss_info(ss_info)
+        return residual_cv2_from_positions_nm(
+            positions_nm, runtime,
+            [tuple(map(int, quart)) for quart in ss_info.get("phi_torsions", [])],
+            [tuple(map(int, quart)) for quart in ss_info.get("psi_torsions", [])],
+            [tuple(pair) for pair in ss_info.get("contact_pairs", [])],
+        )
 
     if mode in {"tica-linear", "torsion-pca"}:
         from .tica import backbone_dihedral_features
@@ -560,6 +573,45 @@ def secondary_structure_score_from_positions_nm(positions_nm, ss_info: Optional[
     if phi_mean is not None and psi_mean is not None:
         return 0.5 * (phi_mean + psi_mean)
     return float(phi_mean if phi_mean is not None else psi_mean)
+
+
+def _residual_runtime_from_ss_info(ss_info: Dict[str, Any]):
+    """The live runtime object, or a fresh load from the recorded artifact paths.
+
+    The force builder stashes the runtime under ``_runtime`` (stripped from the
+    JSON manifest). After a resume the metadata comes back from JSON without
+    it, so reload from the three recorded paths and re-cache. Identity is the
+    embedded digests, not the paths: ``PairModelRuntime.load`` re-verifies them.
+    """
+    runtime = ss_info.get("_runtime")
+    if runtime is None:
+        from .cv_selection.models import PairModelRuntime
+
+        runtime = PairModelRuntime.load(ss_info["pair_model_path"], ss_info["candidate_set_path"],
+                                        ss_info["feature_schema_path"])
+        ss_info["_runtime"] = runtime
+    return runtime
+
+
+def residual_cv2_from_positions_nm(positions_nm, runtime, phi_torsions, psi_torsions,
+                                   contact_pairs) -> float:
+    """The residual-torsion CV2 exactly as the OpenMM force defines it.
+
+    Contact parameters come from the runtime's own anchor definition, which
+    ``PairModelRuntime.check_anchor`` has proven equal to the run's ``args``;
+    this keeps the evaluator usable after a resume, when no ``args`` travels
+    with the reloaded metadata. Degree-2 models clamp the anchor to the
+    training range, mirroring the force expression.
+    """
+    from .cv_selection.models import evaluate_component
+    from .tica import backbone_dihedral_features
+
+    positions = np.asarray(positions_nm, dtype=np.float64)
+    feats = backbone_dihedral_features(positions, list(phi_torsions), list(psi_torsions))
+    anchor_value = nonlocal_contact_cv_from_positions_nm(positions, contact_pairs, runtime.contact_args())
+    value = evaluate_component(runtime.fit, runtime.j, feats[None, :], np.array([anchor_value]),
+                               clamp=(runtime.fit.degree == 2))
+    return float(value[0])
 
 
 # MBAR-disconnection guard-rail: below this analytic flat-PMF neighbor

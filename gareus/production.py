@@ -59,6 +59,7 @@ from .state import _scalar_to_float, _energy_to_kj_mol
 from .cv import (
     apply_primary_cv_metadata_to_args,
     choose_cv_atoms,
+    contact_normalization_denominator,
     format_primary_delta_value,
     prepare_primary_cv_definition,
     primary_center_to_openmm_value,
@@ -446,6 +447,84 @@ def _add_weighted_trig_torsion_force(openmm, torsions, weights, trig: str):
     for (a, b, c, d), weight in zip(torsions, weights):
         force.addTorsion(int(a), int(b), int(c), int(d), [float(weight)])
     return force
+
+
+def _add_residual_torsion_cv_force(openmm, system, phi_torsions, psi_torsions, contact_pairs,
+                                   runtime, args, *, force_group):
+    """Harmonic umbrella on a residual torsion component, chain rule included.
+
+    z2 = ( v.phi - K0 - K1 a - K2 a^2 ) / sigma_j with a = (contacts/norm - mu_c)/sigma_c.
+    The whole expression is handed to one CustomCVForce so OpenMM differentiates
+    the anchor-dependent terms too: dropping them would sample a different CV
+    from the one the analysis reconstructs. The contact sum is a private copy
+    of the CV1 umbrella's child force (OpenMM allows one parent per child), with
+    the identical expression from forces.add_contact_umbrella_force.
+
+    ``ss_k`` arrives in kJ/mol/CV^2 (production converts before set_window), so
+    the energy expression carries no unit factor.
+    """
+    runtime.check_topology(phi_torsions, psi_torsions)
+    runtime.check_anchor(args, contact_pairs)
+    fit, j = runtime.fit, int(runtime.j)
+    v = np.asarray(fit.right_vectors[j - 1], dtype=np.float64)
+    n_phi, n_psi = len(phi_torsions), len(psi_torsions)
+    if v.size != 2 * n_phi + 2 * n_psi:
+        raise RuntimeError(f"pair model width {v.size} != topology features {2 * n_phi + 2 * n_psi}")
+    cv_force = openmm.CustomCVForce("0")
+    names = []
+    grouped = (
+        ("sum_sin_phi", phi_torsions, v[0:2 * n_phi:2], "sin"),
+        ("sum_cos_phi", phi_torsions, v[1:2 * n_phi:2], "cos"),
+        ("sum_sin_psi", psi_torsions, v[2 * n_phi::2], "sin"),
+        ("sum_cos_psi", psi_torsions, v[2 * n_phi + 1::2], "cos"),
+    )
+    for fname, torsions, weights, trig in grouped:
+        if len(torsions):
+            cv_force.addCollectiveVariable(fname, _add_weighted_trig_torsion_force(openmm, torsions, weights, trig))
+            names.append(fname)
+    r0_nm = float(args.contact_r0_a) * 0.1
+    beta_nm_inv = float(args.contact_beta_a_inv) * 10.0
+    contact_sum = openmm.CustomBondForce(
+        f"contact_weight*0.5*(1-tanh(0.5*{beta_nm_inv:.17g}*(r-{r0_nm:.17g})))")
+    contact_sum.addPerBondParameter("contact_weight")
+    for pair in contact_pairs:
+        contact_sum.addBond(int(pair[0]), int(pair[1]), [float(pair[2]) if len(pair) > 2 else 1.0])
+    cv_force.addCollectiveVariable("res_contacts", contact_sum)
+    norm = float(runtime.anchor_definition.get("norm", contact_normalization_denominator(list(contact_pairs), args)))
+    K0 = float(v @ (fit.coefficients[0] + fit.residual_mean) + fit.projection_mean[j - 1])
+    K1 = float(v @ fit.coefficients[1])
+    K2 = float(v @ fit.coefficients[2])
+    a_raw = f"((res_contacts/{norm:.17g}) - {fit.anchor_mean:.17g})/{fit.anchor_std:.17g}"
+    lo, hi = fit.anchor_clamp
+    a_expr = f"min({hi:.17g}, max({lo:.17g}, {a_raw}))" if fit.degree == 2 else a_raw
+    z2 = (f"(({' + '.join(names)}) - {K0:.17g} - {K1:.17g}*({a_expr}) - {K2:.17g}*({a_expr})^2)"
+          f"/{fit.projection_std[j - 1]:.17g}")
+    cv_force.addGlobalParameter("ss_k", 0.0)
+    cv_force.addGlobalParameter("ss0", 0.0)
+    cv_force.setEnergyFunction(f"0.5*ss_k*({z2}-ss0)^2")
+    cv_force.setForceGroup(int(force_group))
+    system.addForce(cv_force)
+    return {
+        "enabled": True,
+        "mode": "residual-torsion-pc",
+        "label": f"residual torsion component {j} (degree {fit.degree}) against {runtime.anchor_kind}",
+        "pair_model_sha256": runtime.pair_sha256,
+        "component_index": j,
+        "degree": int(fit.degree),
+        "anchor_clamp": [float(lo), float(hi)],
+        "range_min": -6.0,
+        "range_max": 6.0,
+        "n_phi_torsions": int(n_phi),
+        "n_psi_torsions": int(n_psi),
+        "phi_torsions": [list(map(int, t)) for t in phi_torsions],
+        "psi_torsions": [list(map(int, t)) for t in psi_torsions],
+        "contact_pairs": [[int(p[0]), int(p[1]), float(p[2]) if len(p) > 2 else 1.0] for p in contact_pairs],
+        "linear_subcv_names": list(names),
+        "force_group": int(force_group),
+        # Stripped from the JSON manifest by _json_ready's underscore rule; the
+        # scorer reloads from the recorded paths after a resume.
+        "_runtime": runtime,
+    }
 
 
 def _linear_torsion_state_for_mode(args, mode: str) -> tuple[Path, "TICAResult"]:
@@ -1431,7 +1510,8 @@ def run_adaptive_feedback_dispatcher_2d(*args, **kwargs):
     return _impl(*args, **kwargs)
 
 
-def add_secondary_structure_cv_force(openmm, system, topology, args, force_group: int = 29) -> dict:
+def add_secondary_structure_cv_force(openmm, system, topology, args, force_group: int = 29, *,
+                                     primary_cv_def=None) -> dict:
     """Add an optional harmonic bias on a smooth backbone secondary-structure CV.
 
     Modes ``alpha``, ``beta``, and ``custom`` use a 0..1 content score:
@@ -1454,6 +1534,29 @@ def add_secondary_structure_cv_force(openmm, system, topology, args, force_group
         raise RuntimeError("--secondary-cv was requested but no backbone phi/psi torsions could be identified")
 
     mode = secondary_cv_mode(args)
+    if mode == "auto":
+        # Left unresolved, "auto" would fall through to secondary_cv_target_angles,
+        # which returns 0,0,"disabled" for an unknown mode and builds a phi0=psi0=0
+        # content force without a word. Refuse loudly instead.
+        raise RuntimeError("cv2=auto must be resolved by the swarm stage before production; "
+                           "run with window_mode=adaptive-production or pass the frozen model")
+    if mode == "residual-torsion-pc":
+        if primary_cv_def is None:
+            raise RuntimeError("cv2=residual-torsion-pc needs the primary CV definition (contact pairs)")
+        paths = tuple(getattr(args, key, None) for key in
+                      ("secondary_cv_model", "secondary_cv_candidate_set", "secondary_cv_feature_schema"))
+        if any(p is None or not str(p) for p in paths):
+            raise RuntimeError("cv2=residual-torsion-pc needs --secondary-cv-model, "
+                               "--secondary-cv-candidate-set and --secondary-cv-feature-schema")
+        from .cv_selection.models import PairModelRuntime
+
+        runtime = PairModelRuntime.load(*paths)
+        info = _add_residual_torsion_cv_force(
+            openmm, system, phi_torsions, psi_torsions,
+            list(primary_cv_def.get("contact_pairs", [])), runtime, args, force_group=force_group)
+        info.update({"pair_model_path": str(paths[0]), "candidate_set_path": str(paths[1]),
+                     "feature_schema_path": str(paths[2])})
+        return info
     sigma_deg = float(getattr(args, "secondary_cv_sigma_deg", 35.0) or 35.0)
     sigma = max(math.radians(1.0), math.radians(sigma_deg))
 
@@ -6203,7 +6306,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     prepare_pep_gamd_args(args, topology)
     add_primary_umbrella_force(openmm, base_system, primary_cv_def, args, args.umbrella_force_group)
     secondary_cv_force_info = add_secondary_structure_cv_force(
-        openmm, base_system, topology, args, force_group=int(getattr(args, "secondary_cv_force_group", 29))
+        openmm, base_system, topology, args, force_group=int(getattr(args, "secondary_cv_force_group", 29)),
+        primary_cv_def=primary_cv_def,
     ) if (secondary_cv_metadata or {}).get("enabled") else {"enabled": False}
     if secondary_cv_force_info.get("enabled"):
         secondary_cv_metadata.update(secondary_cv_force_info)
@@ -6267,7 +6371,9 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         starting_structure_system = create_system(app, unit, forcefield, topology, args, include_barostat=False)
         add_primary_umbrella_force(openmm, starting_structure_system, primary_cv_def, args, args.umbrella_force_group)
         if (secondary_cv_metadata or {}).get("enabled"):
-            add_secondary_structure_cv_force(openmm, starting_structure_system, topology, args, force_group=int(getattr(args, "secondary_cv_force_group", 29)))
+            add_secondary_structure_cv_force(openmm, starting_structure_system, topology, args,
+                                             force_group=int(getattr(args, "secondary_cv_force_group", 29)),
+                                             primary_cv_def=primary_cv_def)
         pos = equil_state.getPositions()
         vel = equil_state.getVelocities()
         box = equil_state.getPeriodicBoxVectors()
