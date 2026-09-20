@@ -142,6 +142,8 @@ def build() -> dict[str, C._Artifact]:
                          "observable_panel": panel.sha256,
                          "protocol": protocol.sha256},
         "selected_arm_id": None,
+        "evidence": [],
+        "cross_protocol_tolerance": None,
     })
     return {"feature_schema": feature_schema, "candidate_set": candidate_set,
             "observable_panel": panel, "protocol": protocol, "trial_plan": plan,

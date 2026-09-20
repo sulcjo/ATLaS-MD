@@ -440,9 +440,28 @@ def _decision_mapping(**overrides) -> dict:
         "tested_protocol_ids": ["contact-only", "contact+residual-pc01"],
         "input_sha256": {"candidate_set": "c" * 64, "observable_panel": "d" * 64},
         "selected_arm_id": None,
+        "evidence": [],
+        "cross_protocol_tolerance": None,
     }
     base.update(overrides)
     return base
+
+
+_PANEL_IDS = [f"cdf::{obs}::q{q:g}" for obs in ("rg_nm", "end_to_end_nm")
+              for q in (0.2, 0.4, 0.6, 0.8)]
+
+
+def _arm(arm_id: str, estimate: float, halfwidth, tolerance: float = 0.02) -> dict:
+    """One arm reporting the same value on every primary observable."""
+    return {"arm_id": arm_id,
+            "estimates": [{"observable_id": obs, "estimate": estimate,
+                           "halfwidth": halfwidth, "tolerance": tolerance, "n_campaigns": 3}
+                          for obs in _PANEL_IDS]}
+
+
+def _agreeing_evidence() -> list[dict]:
+    """Two arms whose difference interval sits inside +/-0.02: agreement."""
+    return [_arm("contact-only", 0.500, 0.005), _arm("contact+residual-pc02", 0.505, 0.005)]
 
 
 def _confirmed_mapping(**overrides) -> dict:
@@ -459,6 +478,8 @@ def _confirmed_mapping(**overrides) -> dict:
         "tested_protocol_ids": ["contact-only", "contact+residual-pc02"],
         "input_sha256": {"protocol": "1" * 64, "trial_plan": "2" * 64,
                          "observable_panel": "3" * 64, "candidate_set": "4" * 64},
+        "evidence": _agreeing_evidence(),
+        "cross_protocol_tolerance": 0.02,
     }
     confirmed.update(overrides)
     return _decision_mapping(**confirmed)
@@ -498,15 +519,22 @@ def test_confirmation_requires_a_selected_arm():
 
 
 def test_a_protocol_disagreement_cannot_be_reported_as_confirmed():
+    # Two precise arms 0.30 apart: the difference interval lies wholly outside +/-0.02.
+    conflicting = [_arm("contact-only", 0.50, 0.005), _arm("contact+residual-pc02", 0.80, 0.005)]
     with pytest.raises(IntegrityError) as excinfo:
         C.Decision.from_mapping(_confirmed_mapping(
+            evidence=conflicting,
             cross_protocol=C.CrossProtocol.PROTOCOL_DISAGREEMENT.value))
     assert excinfo.value.reason is C.ReasonCode.CONFIRMATION_BLOCKED
 
 
 def test_unresolved_precision_cannot_be_reported_as_confirmed():
+    # The selected arm has no resolved half-width, so precision derives UNRESOLVED.
+    unresolved = [_arm("contact-only", 0.500, 0.005), _arm("contact+residual-pc02", 0.505, None)]
     with pytest.raises(IntegrityError) as excinfo:
-        C.Decision.from_mapping(_confirmed_mapping(precision=C.Precision.UNRESOLVED.value))
+        C.Decision.from_mapping(_confirmed_mapping(
+            evidence=unresolved, precision=C.Precision.UNRESOLVED.value,
+            cross_protocol=C.CrossProtocol.AGREEMENT_UNRESOLVED.value))
     assert excinfo.value.reason is C.ReasonCode.CONFIRMATION_BLOCKED
 
 
@@ -930,8 +958,10 @@ def test_an_unresolved_region_must_carry_a_status():
 def test_bounded_small_mass_and_unknown_mass_are_different_records():
     decision = C.Decision.from_mapping(_decision_mapping(unresolved_regions=[
         {"region_id": "cell-7", "status": C.RegionStatus.MASS_BOUNDED_SMALL.value,
-         "detail": "zero visits, exact IID upper bound 0.003 < 0.02 tolerance"},
+         "upper_bound": 0.002991, "bound_method": "exact_iid_binomial_zero_count",
+         "detail": "zero visits in n=1000 IID draws; 1 - 0.05**(1/1000)"},
         {"region_id": "cell-9", "status": C.RegionStatus.UNRESOLVED_SUPPORT.value,
+         "upper_bound": None, "bound_method": None,
          "detail": "zero visits, no valid bound for weighted replica-exchange data"},
     ]))
     statuses = {r.region_id: r.status for r in decision.unresolved_regions}
@@ -944,13 +974,13 @@ def test_a_resolved_region_does_not_belong_in_the_unresolved_list():
     with pytest.raises(IntegrityError) as excinfo:
         C.Decision.from_mapping(_decision_mapping(unresolved_regions=[
             {"region_id": "cell-1", "status": C.RegionStatus.RESOLVED_POPULATION.value,
-             "detail": ""}]))
+             "upper_bound": None, "bound_method": None, "detail": ""}]))
     assert excinfo.value.reason is C.ReasonCode.INVALID_REGION_STATUS
 
 
 def test_a_region_may_appear_once():
     row = {"region_id": "cell-7", "status": C.RegionStatus.UNRESOLVED_SUPPORT.value,
-           "detail": ""}
+           "upper_bound": None, "bound_method": None, "detail": ""}
     with pytest.raises(IntegrityError) as excinfo:
         C.Decision.from_mapping(_decision_mapping(unresolved_regions=[row, dict(row)]))
     assert excinfo.value.reason is C.ReasonCode.DUPLICATE_REGION_ID
@@ -962,9 +992,8 @@ def test_a_provisional_choice_must_also_name_its_arm():
             decision=C.DecisionOutcome.PROVISIONAL_CHOICE.value))
     assert excinfo.value.reason is C.ReasonCode.MISSING_SELECTED_ARM
 
-    named = C.Decision.from_mapping(_decision_mapping(
-        decision=C.DecisionOutcome.PROVISIONAL_CHOICE.value,
-        selected_arm_id="contact+residual-pc02"))
+    named = C.Decision.from_mapping(_confirmed_mapping(
+        decision=C.DecisionOutcome.PROVISIONAL_CHOICE.value))
     assert named.selected_arm_id == "contact+residual-pc02"
 
 
@@ -1032,7 +1061,8 @@ def test_a_producer_cannot_serialize_what_a_reader_would_refuse():
         cross_protocol=D.CrossProtocol.PROTOCOL_DISAGREEMENT,
         support=D.Support.UNRESOLVED, advantage=D.Advantage.NOT_TESTED,
         reasons=(), unresolved_regions=(), tested_protocol_ids=(),
-        input_sha256={}, selected_arm_id=None, sha256="0" * 64)
+        input_sha256={}, selected_arm_id=None, evidence=(),
+        cross_protocol_tolerance=None, sha256="0" * 64)
     with pytest.raises(IntegrityError) as excinfo:
         contradictory.to_mapping()
     assert excinfo.value.reason is C.ReasonCode.INTEGRITY_OUTCOME_CONFLICT
@@ -1097,10 +1127,10 @@ def test_a_confirmation_must_name_every_artifact_it_rests_on():
     assert excinfo.value.reason is C.ReasonCode.MISSING_FIELD
 
 
-def test_cross_protocol_agreement_needs_two_protocols_to_agree():
+def test_evidence_cannot_come_from_a_protocol_that_was_not_run():
     with pytest.raises(IntegrityError) as excinfo:
-        C.Decision.from_mapping(_confirmable(tested_protocol_ids=["only-one"]))
-    assert excinfo.value.reason is C.ReasonCode.MISSING_FIELD
+        C.Decision.from_mapping(_confirmable(tested_protocol_ids=["contact-only"]))
+    assert excinfo.value.reason is C.ReasonCode.EVIDENCE_INCOMPLETE
 
 
 def test_a_region_of_unknown_mass_blocks_an_unqualified_confirmation():
@@ -1108,10 +1138,184 @@ def test_a_region_of_unknown_mass_blocks_an_unqualified_confirmation():
     with pytest.raises(IntegrityError) as excinfo:
         C.Decision.from_mapping(_confirmable(unresolved_regions=[
             {"region_id": "cell-9", "status": C.RegionStatus.UNRESOLVED_SUPPORT.value,
+             "upper_bound": None, "bound_method": None,
              "detail": "zero visits, no valid bound"}]))
     assert excinfo.value.reason is C.ReasonCode.CONFIRMATION_BLOCKED
 
     bounded = C.Decision.from_mapping(_confirmable(unresolved_regions=[
         {"region_id": "cell-7", "status": C.RegionStatus.MASS_BOUNDED_SMALL.value,
-         "detail": "zero visits, exact IID upper bound 0.003 < 0.02 tolerance"}]))
+         "upper_bound": 0.002991, "bound_method": "exact_iid_binomial_zero_count",
+         "detail": "zero visits in n=1000 IID draws"}]))
     assert bounded.decision is C.DecisionOutcome.CONFIRMED_FOR_DECLARED_PANEL
+
+
+# --------------------------------------------------------------------------
+# Statuses that follow from numbers are derived, never asserted
+# --------------------------------------------------------------------------
+
+def test_precision_is_recomputed_from_the_selected_arms_estimates():
+    """Declaring MET while a half-width exceeds its tolerance is refused."""
+    too_wide = [_arm("contact-only", 0.500, 0.005), _arm("contact+residual-pc02", 0.505, 0.03)]
+    with pytest.raises(IntegrityError) as excinfo:
+        C.Decision.from_mapping(_confirmed_mapping(evidence=too_wide))
+    assert excinfo.value.reason is C.ReasonCode.EVIDENCE_STATUS_MISMATCH
+
+
+def test_precision_follows_the_worst_observable_not_the_average():
+    """L = max_a (h_a/eps_a)^2: one bad observable is enough for NOT_MET."""
+    arm = _arm("contact+residual-pc02", 0.505, 0.005)
+    arm["estimates"][3]["halfwidth"] = 0.021
+    evidence = [_arm("contact-only", 0.500, 0.005), arm]
+    with pytest.raises(IntegrityError) as excinfo:
+        C.Decision.from_mapping(_confirmed_mapping(evidence=evidence))
+    assert excinfo.value.reason is C.ReasonCode.EVIDENCE_STATUS_MISMATCH
+    parsed = C.Decision.from_mapping(_confirmed_mapping(
+        evidence=evidence, precision=C.Precision.NOT_MET.value,
+        decision=C.DecisionOutcome.INSUFFICIENT_EVIDENCE.value,
+        cross_protocol=C.CrossProtocol.AGREEMENT_UNRESOLVED.value))
+    assert parsed.precision is C.Precision.NOT_MET
+    assert C.derive_precision(parsed.evidence[1]) is C.Precision.NOT_MET
+
+
+def test_an_unresolved_halfwidth_makes_precision_unresolved_not_met():
+    unresolved = [_arm("contact-only", 0.500, 0.005), _arm("contact+residual-pc02", 0.505, None)]
+    with pytest.raises(IntegrityError) as excinfo:
+        C.Decision.from_mapping(_confirmed_mapping(evidence=unresolved))
+    assert excinfo.value.reason is C.ReasonCode.EVIDENCE_STATUS_MISMATCH
+
+
+def test_cross_protocol_agreement_is_recomputed_from_the_interval_rule():
+    """Two arms 0.30 apart cannot be declared in agreement, whatever the producer types."""
+    conflicting = [_arm("contact-only", 0.50, 0.005), _arm("contact+residual-pc02", 0.80, 0.005)]
+    with pytest.raises(IntegrityError) as excinfo:
+        C.Decision.from_mapping(_confirmed_mapping(evidence=conflicting))
+    assert excinfo.value.reason is C.ReasonCode.EVIDENCE_STATUS_MISMATCH
+
+
+def test_one_established_disagreement_dominates_seven_agreements():
+    """Plan section 7.2 item 3: a credible conflict blocks the comparison as a whole."""
+    arm = _arm("contact+residual-pc02", 0.505, 0.005)
+    arm["estimates"][5]["estimate"] = 0.90
+    evidence = [_arm("contact-only", 0.500, 0.005), arm]
+    parsed = C.Decision.from_mapping(_confirmed_mapping(
+        evidence=evidence, decision=C.DecisionOutcome.INSUFFICIENT_EVIDENCE.value,
+        cross_protocol=C.CrossProtocol.PROTOCOL_DISAGREEMENT.value,
+        reasons=[C.ReasonCode.CONFIRMATION_BLOCKED.value]))
+    assert parsed.cross_protocol is C.CrossProtocol.PROTOCOL_DISAGREEMENT
+
+
+def test_wide_overlapping_intervals_are_unresolved_not_agreement():
+    """A difference interval straddling +/-delta proves nothing either way."""
+    wide = [_arm("contact-only", 0.500, 0.03), _arm("contact+residual-pc02", 0.505, 0.03)]
+    with pytest.raises(IntegrityError) as excinfo:
+        C.Decision.from_mapping(_confirmed_mapping(evidence=wide))
+    assert excinfo.value.reason is C.ReasonCode.EVIDENCE_STATUS_MISMATCH
+    parsed = C.Decision.from_mapping(_confirmed_mapping(
+        evidence=wide, decision=C.DecisionOutcome.INSUFFICIENT_EVIDENCE.value,
+        precision=C.Precision.NOT_MET.value,
+        cross_protocol=C.CrossProtocol.AGREEMENT_UNRESOLVED.value))
+    assert parsed.cross_protocol is C.CrossProtocol.AGREEMENT_UNRESOLVED
+
+
+def test_a_single_arm_is_not_compared_with_anything():
+    single = [_arm("contact+residual-pc02", 0.505, 0.005)]
+    with pytest.raises(IntegrityError) as excinfo:
+        C.Decision.from_mapping(_confirmed_mapping(evidence=single))
+    assert excinfo.value.reason is C.ReasonCode.EVIDENCE_STATUS_MISMATCH
+    parsed = C.Decision.from_mapping(_confirmed_mapping(
+        evidence=single, decision=C.DecisionOutcome.PROVISIONAL_CHOICE.value,
+        cross_protocol=C.CrossProtocol.NOT_COMPARED.value, cross_protocol_tolerance=None))
+    assert parsed.cross_protocol is C.CrossProtocol.NOT_COMPARED
+
+
+def test_comparing_arms_requires_a_declared_practical_tolerance():
+    with pytest.raises(IntegrityError) as excinfo:
+        C.Decision.from_mapping(_confirmed_mapping(cross_protocol_tolerance=None))
+    assert excinfo.value.reason is C.ReasonCode.EVIDENCE_INCOMPLETE
+
+
+def test_a_selected_arm_must_have_recorded_evidence():
+    with pytest.raises(IntegrityError) as excinfo:
+        C.Decision.from_mapping(_confirmed_mapping(selected_arm_id="contact-only",
+                                                   evidence=[_arm("contact+residual-pc02", 0.5, 0.005)],
+                                                   tested_protocol_ids=["contact-only",
+                                                                        "contact+residual-pc02"]))
+    assert excinfo.value.reason is C.ReasonCode.EVIDENCE_INCOMPLETE
+
+
+def test_arms_must_report_the_same_frozen_panel():
+    short = _arm("contact+residual-pc02", 0.505, 0.005)
+    short["estimates"] = short["estimates"][:4]
+    with pytest.raises(IntegrityError) as excinfo:
+        C.Decision.from_mapping(_confirmed_mapping(
+            evidence=[_arm("contact-only", 0.500, 0.005), short]))
+    assert excinfo.value.reason is C.ReasonCode.EVIDENCE_INCOMPLETE
+
+
+def test_an_estimate_must_be_a_probability():
+    bad = _arm("contact+residual-pc02", 1.3, 0.005)
+    with pytest.raises(IntegrityError) as excinfo:
+        C.Decision.from_mapping(_confirmed_mapping(
+            evidence=[_arm("contact-only", 0.500, 0.005), bad]))
+    assert excinfo.value.reason is C.ReasonCode.INVALID_ESTIMATE
+
+
+def test_a_tolerance_of_one_half_or_more_is_not_a_tolerance(observable_panel):
+    """A probability half-width of 0.5 covers the unit interval: the gate would be free."""
+    payload = _mutable(observable_panel)
+    payload["primary"][0]["halfwidth_tolerance"] = 0.5
+    with pytest.raises(IntegrityError) as excinfo:
+        C.ObservablePanel.from_mapping(payload)
+    assert excinfo.value.reason is C.ReasonCode.TOLERANCE_NOT_POSITIVE
+    with pytest.raises(IntegrityError) as excinfo:
+        C.Decision.from_mapping(_confirmed_mapping(cross_protocol_tolerance=0.5))
+    assert excinfo.value.reason is C.ReasonCode.TOLERANCE_NOT_POSITIVE
+
+
+def test_derived_statuses_are_declared_as_such():
+    from gareus.cv_selection import decision as D
+
+    assert D.DERIVED_STATUSES == {"precision", "cross_protocol"}
+    assert D.ASSERTED_STATUSES.isdisjoint(D.DERIVED_STATUSES)
+    assert D.DERIVED_STATUSES | D.ASSERTED_STATUSES | {"decision"} == set(
+        D._DECISION_STATUS_FIELDS)
+
+
+# --------------------------------------------------------------------------
+# A bounded-small region must carry its bound (R6)
+# --------------------------------------------------------------------------
+
+def test_mass_bounded_small_without_a_bound_is_only_a_claim():
+    with pytest.raises(IntegrityError) as excinfo:
+        C.Decision.from_mapping(_decision_mapping(unresolved_regions=[
+            {"region_id": "cell-7", "status": C.RegionStatus.MASS_BOUNDED_SMALL.value,
+             "upper_bound": None, "bound_method": None, "detail": "trust me"}]))
+    assert excinfo.value.reason is C.ReasonCode.UNSUPPORTED_BOUND_METHOD
+
+
+def test_a_kish_ess_shortcut_is_not_a_supported_bound():
+    with pytest.raises(IntegrityError) as excinfo:
+        C.Decision.from_mapping(_decision_mapping(unresolved_regions=[
+            {"region_id": "cell-7", "status": C.RegionStatus.MASS_BOUNDED_SMALL.value,
+             "upper_bound": 0.003, "bound_method": "kish_ess_binomial", "detail": ""}]))
+    assert excinfo.value.reason is C.ReasonCode.UNSUPPORTED_BOUND_METHOD
+
+
+def test_the_exact_iid_zero_count_bound_reproduces_the_review_figure():
+    """1 - 0.05**(1/1000) ~= 0.002991, below a 0.02 tolerance: adequate without a visit."""
+    bound = 1.0 - 0.05 ** (1.0 / 1000.0)
+    assert abs(bound - 0.002991) < 1e-6
+    parsed = C.Decision.from_mapping(_decision_mapping(unresolved_regions=[
+        {"region_id": "cell-7", "status": C.RegionStatus.MASS_BOUNDED_SMALL.value,
+         "upper_bound": bound, "bound_method": "exact_iid_binomial_zero_count",
+         "detail": "n=1000 IID draws, zero visits"}]))
+    assert parsed.unresolved_regions[0].upper_bound == pytest.approx(bound)
+
+
+def test_an_unresolved_region_cannot_also_carry_a_bound():
+    with pytest.raises(IntegrityError) as excinfo:
+        C.Decision.from_mapping(_decision_mapping(unresolved_regions=[
+            {"region_id": "cell-9", "status": C.RegionStatus.UNRESOLVED_SUPPORT.value,
+             "upper_bound": 0.1, "bound_method": "exact_iid_binomial_zero_count",
+             "detail": ""}]))
+    assert excinfo.value.reason is C.ReasonCode.INVALID_REGION_STATUS

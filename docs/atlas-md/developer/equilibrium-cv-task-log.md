@@ -268,6 +268,49 @@ adequate result.
 * The new test file is **not in CI**. CI runs a curated three-file list plus the
   strict docs build; wiring the selector tests in belongs to the CLI/CI task.
 
+### Statuses became summaries of numbers, not assertions (2026-09-20, later)
+
+Stepping back from the findings to the goal: T00 exists so that a wrong
+equilibrium population cannot be published without an alarm. The panel's
+dissent named the residual self-deception precisely — the eight statuses were
+*typed in* by the producer, so every consistency rule was policing the grammar
+of a possible lie rather than its truth. Fixing the individual holes did not
+touch that.
+
+What changed:
+
+* **`precision` and `cross_protocol` are now derived, not declared.** A
+  `Decision` carries `evidence`: per arm, the estimate, half-width, tolerance
+  and campaign count for every primary observable. On load the parser
+  recomputes `precision` as `max_a (h_a/eps_a)^2 <= 1` over the selected arm
+  and `cross_protocol` by the plan §6.4 interval rule over every pair of arms
+  and every observable, and refuses a declared status that disagrees
+  (`EVIDENCE_STATUS_MISMATCH`). One established disagreement anywhere
+  dominates. A missing half-width derives `UNRESOLVED`; fewer than two arms
+  derives `NOT_COMPARED`; a selected arm with no evidence is refused.
+* **`MASS_BOUNDED_SMALL` must carry its bound.** A region record now holds
+  `upper_bound` and `bound_method`, the latter from a fail-closed allowlist
+  currently containing only `exact_iid_binomial_zero_count` — the
+  `1 - alpha**(1/n)` bound that is exact for IID target draws and invalid for
+  weighted replica-exchange samples. No Kish-ESS substitute is accepted. An
+  `UNRESOLVED_SUPPORT` region may not carry a bound.
+* **A probability tolerance must be below 0.5.** A half-width of 0.5 covers
+  the unit interval, so any gate against it is free. The bound applies to panel
+  half-widths, the cross-protocol band, the novelty band, and the tolerance
+  recorded with each estimate.
+* `dependence`, `reproducibility` and `support` remain **asserted**, and the
+  module now says so by name (`ASSERTED_STATUSES`). They rest on batch
+  covariances and per-campaign estimates this artifact does not carry; giving
+  them the same treatment is the evaluation task's job and would need those
+  numbers recorded first.
+
+What this buys, stated exactly: fabricating a verdict now means fabricating
+*numbers*, tied to artifact digests, that an auditor can re-derive and
+cross-check. It does not make a fabricated number true. That is the most a
+contract layer can do, and it is the line the dissent asked for.
+
+Tests 114 -> 131. Fixture `decision.json` re-hashed (schema gained two fields).
+
 ### Unresolved and handed on
 
 * `ProtocolSpec` sections are validated for exact key sets but their *values*

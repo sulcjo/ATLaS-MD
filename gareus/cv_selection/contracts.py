@@ -32,8 +32,11 @@ from ..correctness._io import IntegrityError, json_bytes, json_loads
 from ._base import (ContractError, ReasonCode, _Artifact, _canonical, _enum,
                     _exact_fields, _fail, _finite_vector, _hex64, _positive_float,
                     _positive_int, _schema, artifact_digest, canonical_cv_definition,
-                    has_visible_characters, require_visible_text, verify_artifact_digest)
-from .decision import (DECISION_VERSION, Decision, RegionRecord)
+                    has_visible_characters, probability_tolerance, require_visible_text,
+                    verify_artifact_digest)
+from .decision import (DECISION_VERSION, SUPPORTED_BOUND_METHODS, ArmEvidence, Decision,
+                       ObservableEstimate, RegionRecord, derive_cross_protocol,
+                       derive_precision)
 from .protocol import (NATIVE_BLIND_GENERATOR_PRESETS, PROTOCOL_VERSION,
                        READINESS_REPORT_VERSION, MissingRequirement, ProtocolSpec,
                        ReadinessReport, validate_protocol)
@@ -48,7 +51,8 @@ __all__ = [
     "Integrity", "IntegrityError", "MissingRequirement", "ObservablePanel", "PhaseKind",
     "Precision", "PrimaryObservable", "ProtocolSpec", "ReadinessReport", "ReasonCode",
     "RegionStatus", "Reproducibility", "SearchMode", "Stage", "StudyRole", "Support",
-    "TrialArm", "RegionRecord",
+    "TrialArm", "RegionRecord", "ArmEvidence", "ObservableEstimate",
+    "derive_precision", "derive_cross_protocol", "SUPPORTED_BOUND_METHODS",
     "TrialPlan", "artifact_digest", "json_bytes", "json_loads", "measurement_phase_for",
     "require_feature_binding", "validate_protocol", "validate_role_phase",
     "verify_artifact_digest",
@@ -363,20 +367,6 @@ _OBSERVABLE_FIELDS = {"observable_id", "kind", "source_observable",
 _OBSERVABLE_KINDS = frozenset({"cdf_probability"})
 _QUANTILE_ALGORITHMS = frozenset({"numpy.quantile.linear"})
 
-#: A probability tolerance above one is not a tolerance, it is a way to make
-#: every arm pass. Half-widths and practical-difference bands are bounded.
-_MAX_PROBABILITY_TOLERANCE = 1.0
-
-
-def _probability_tolerance(value: Any, label: str) -> float:
-    tolerance = _positive_float(value, label, ReasonCode.TOLERANCE_NOT_POSITIVE)
-    if tolerance > _MAX_PROBABILITY_TOLERANCE:
-        _fail(ReasonCode.TOLERANCE_NOT_POSITIVE,
-              f"{label} is a probability tolerance and must be <= "
-              f"{_MAX_PROBABILITY_TOLERANCE}; {tolerance} would make the gate vacuous")
-    return tolerance
-
-
 def _require_panel_shape(primary: tuple["PrimaryObservable", ...]) -> None:
     """Eight copies of one measurement is not the declared panel.
 
@@ -429,7 +419,7 @@ def _parse_observable(raw: Mapping[str, Any], position: int) -> PrimaryObservabl
             or not 0.0 < float(quantile) < 1.0):
         _fail(ReasonCode.INVALID_QUANTILE,
               f"{label}.discovery_quantile must lie strictly inside (0, 1), got {quantile!r}")
-    tolerance = _probability_tolerance(raw["halfwidth_tolerance"],
+    tolerance = probability_tolerance(raw["halfwidth_tolerance"],
                                        f"{label}.halfwidth_tolerance")
     return PrimaryObservable(raw["observable_id"], raw["kind"], raw["source_observable"],
                              float(quantile), tolerance)
@@ -470,9 +460,9 @@ class ObservablePanel(_Artifact):
         if len(set(identifiers)) != len(identifiers):
             _fail(ReasonCode.DUPLICATE_OBSERVABLE_ID, "primary observable ids must be unique")
         _require_panel_shape(primary)
-        cross = _probability_tolerance(data["cross_protocol_tolerance"],
+        cross = probability_tolerance(data["cross_protocol_tolerance"],
                                        "observable panel.cross_protocol_tolerance")
-        novelty = _probability_tolerance(data["novelty_mass_tolerance"],
+        novelty = probability_tolerance(data["novelty_mass_tolerance"],
                                          "observable panel.novelty_mass_tolerance")
         centers = _positive_int(data["diagnostic_partition_centers"],
                                 "observable panel.diagnostic_partition_centers",

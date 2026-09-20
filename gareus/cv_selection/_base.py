@@ -34,6 +34,10 @@ class ReasonCode(str, Enum):
     WRONG_TYPE = "WRONG_TYPE"
     EMPTY_STRING = "EMPTY_STRING"
     READINESS_INCONSISTENT = "READINESS_INCONSISTENT"
+    EVIDENCE_STATUS_MISMATCH = "EVIDENCE_STATUS_MISMATCH"
+    EVIDENCE_INCOMPLETE = "EVIDENCE_INCOMPLETE"
+    INVALID_ESTIMATE = "INVALID_ESTIMATE"
+    UNSUPPORTED_BOUND_METHOD = "UNSUPPORTED_BOUND_METHOD"
     INVALID_REGION_STATUS = "INVALID_REGION_STATUS"
     DUPLICATE_REGION_ID = "DUPLICATE_REGION_ID"
     FREE_ENERGY_UNRESOLVED = "FREE_ENERGY_UNRESOLVED"
@@ -141,6 +145,25 @@ def translate_integrity_error(exc: IntegrityError, table, default: ReasonCode,
         if needle in message:
             return ContractError(reason, f"{label}: {message}")
     return ContractError(default, f"{label}: {message}")
+
+
+#: A probability half-width of 0.5 covers the whole unit interval, and a
+#: practical-difference band of 0.5 accepts almost any pair of probabilities.
+#: A tolerance at or above this carries no information, so a status derived
+#: against it would be a free pass. The bound is strict.
+MAX_PROBABILITY_TOLERANCE = 0.5
+
+
+def probability_tolerance(value: Any, label: str) -> float:
+    """A tolerance on a probability: positive and small enough to mean something."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or float(value) <= 0.0:
+        _fail(ReasonCode.TOLERANCE_NOT_POSITIVE, f"{label} must be a positive number, got {value!r}")
+    tolerance = float(value)
+    if tolerance >= MAX_PROBABILITY_TOLERANCE:
+        _fail(ReasonCode.TOLERANCE_NOT_POSITIVE,
+              f"{label}={tolerance} is not a tolerance: any probability interval of half-width "
+              f">= {MAX_PROBABILITY_TOLERANCE} is uninformative, so the gate would be vacuous")
+    return tolerance
 
 
 def _canonical(raw: Mapping[str, Any]) -> dict[str, Any]:
