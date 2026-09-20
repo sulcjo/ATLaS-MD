@@ -264,6 +264,37 @@ def _library_versions() -> Dict[str, str]:
     return {"numpy": str(np.__version__), "python": sys.version.split()[0]}
 
 
+def _seed_library_preset(args, warnings: List[str]) -> str:
+    """The GENPEPT preset the swarm's seed library was generated with.
+
+    The library's own ``generation_config.json`` is authoritative -- a hairpin-biased
+    library must not pass the native-blind check because a config forgot to say so.
+    ``args.diversity_bank_preset`` is used only when the library carries no record;
+    with neither, the analysis refuses rather than assume."""
+    configured = getattr(args, "diversity_bank_preset", None)
+    recorded = None
+    lib = getattr(args, "seed_conformers_dir", None)
+    if lib:
+        cfg = Path(lib) / "generation_config.json"
+        if cfg.exists():
+            try:
+                recorded = json.loads(cfg.read_text()).get("diversity_bank_preset")
+            except (OSError, ValueError) as exc:
+                warnings.append(f"cv selection: could not read {cfg} ({exc!r}); falling back to the "
+                                "configured diversity_bank_preset")
+    if recorded:
+        if configured and str(configured) != str(recorded):
+            warnings.append(f"cv selection: config says diversity_bank_preset={configured!r} but the seed "
+                            f"library records {recorded!r}; the library's record is authoritative")
+        return str(recorded)
+    if configured:
+        return str(configured)
+    raise RuntimeError("cv2=auto needs to know the GENPEPT preset the seed library was generated with, "
+                       "and neither <seed_conformers_dir>/generation_config.json nor diversity_bank_preset "
+                       "records one; set diversity_bank_preset explicitly (only native-blind presets are "
+                       "accepted)")
+
+
 def _swarm_contact_pairs(out_dir: Path, args, warnings: List[str]) -> Optional[list]:
     """The contact pairs the members measured CV1 with, rebuilt exactly as the driver did.
 
@@ -542,7 +573,7 @@ def analyze_swarm_stage(out_dir, args) -> dict:
                 dataset, _selection_config(args, k_max, temperature_k),
                 physical_system_sha256=physical_sha, training_rows_sha256=aux["rows_sha256"],
                 library_versions=_library_versions(),
-                genpept_preset=str(getattr(args, "diversity_bank_preset", "broad") or "broad"),
+                genpept_preset=_seed_library_preset(args, warnings),
             )
             selection = {
                 "status": sel.status, "anchor": sel.anchor.kind, "anchor_reasons": list(sel.anchor.reasons),

@@ -322,6 +322,45 @@ def test_explicit_cv2_none_leaves_the_existing_path_untouched(synthetic_swarm, s
     assert "pair" not in report["gate"]["gates"]
 
 
+def _seed_library(tmp_path, preset):
+    lib = tmp_path / "genpept_lib"
+    lib.mkdir()
+    (lib / "final_survivor_seeds.csv").write_text("seed_id,pdb\n")
+    if preset is not None:
+        (lib / "generation_config.json").write_text(json.dumps({"diversity_bank_preset": preset}))
+    return lib
+
+
+def test_a_hairpin_biased_seed_library_is_refused_even_when_the_config_says_broad(synthetic_swarm, swarm_args, tmp_path):
+    import pytest
+    from gareus.swarm.analyze import analyze_swarm_stage
+    out = synthetic_swarm(with_features=True, wide_anchor=True)
+    lib = _seed_library(tmp_path, "chignolin")
+    with pytest.raises(ValueError, match="not native-blind"):
+        analyze_swarm_stage(out, swarm_args(secondary_cv="auto", diversity_bank_preset="broad",
+                                            seed_conformers_dir=str(lib)))
+
+
+def test_the_library_record_wins_over_the_config_and_is_reported(synthetic_swarm, swarm_args, tmp_path):
+    from gareus.swarm.analyze import analyze_swarm_stage
+    out = synthetic_swarm(with_features=True, wide_anchor=True)
+    lib = _seed_library(tmp_path, "broad")
+    report = analyze_swarm_stage(out, swarm_args(secondary_cv="auto", diversity_bank_preset="chignolin",
+                                                 seed_conformers_dir=str(lib)))
+    assert report["cv_selection"]["status"] == "pair"
+    assert any("library's record is authoritative" in w for w in report["warnings"])
+
+
+def test_no_preset_anywhere_refuses_instead_of_assuming_broad(synthetic_swarm, swarm_args, tmp_path):
+    import pytest
+    from gareus.swarm.analyze import analyze_swarm_stage
+    out = synthetic_swarm(with_features=True, wide_anchor=True)
+    lib = _seed_library(tmp_path, None)
+    with pytest.raises(RuntimeError, match="diversity_bank_preset"):
+        analyze_swarm_stage(out, swarm_args(secondary_cv="auto", diversity_bank_preset=None,
+                                            seed_conformers_dir=str(lib)))
+
+
 def test_pair_gate_semantics():
     from gareus.swarm.gates import pair_gate
     assert pair_gate({"status": "pair"}, fallback="refuse")["ok"]
