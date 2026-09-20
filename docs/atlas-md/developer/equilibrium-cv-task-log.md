@@ -118,7 +118,10 @@ None are touched by T00; the plan's task prompt keeps unrelated fixes separate.
 2. `test_atlas_md_docs.py::test_atlas_md_documents_rendered_diagrams_and_synthetic_harness` —
    `index.md` no longer contains a ```` ```mermaid ```` block.
 3. `test_example_configs.py::test_example_config_parses_without_unknown_keys[chignolin_genpept_contact_bias_sigma.yaml]` — `SystemExit: 2`.
-4. `test_npt_pep_adapter_boost.py::test_finite_difference_boost_force_matches_scaling_factor_expression` — finite-difference vs integrator expression mismatch.
+4. `test_npt_pep_adapter_boost.py::test_finite_difference_boost_force_matches_scaling_factor_expression` —
+   finite-difference vs integrator expression mismatch, **only when the whole
+   suite runs**. See the verification note below: this one is not a plain
+   pre-existing failure, it is a test-isolation failure.
 5. `test_package_smoke.py::test_tiny_lambda_ladder_run_completes_end_to_end_slow` —
    `ArrowInvalid` reading `parquet_manifest.json` as Parquet.
 6. `test_package_smoke.py::test_official_package_version_is_v07` — expects `0.8`,
@@ -143,9 +146,36 @@ Provenance of each item:
   strict docs build passes with the nav additions.
 * Item 4 is newer than that log and is **not** explained by reading assertions —
   a Pep-GaMD finite-difference force mismatch has nothing to do with anything
-  T00 touches, but that is an argument, not evidence. It was therefore verified
-  directly by running the file in a clean `git worktree` at `cdee6cc` with none
-  of this branch's files present (see the verification note below).
+  T00 touches, but that is an argument, not evidence. It was therefore run
+  directly, and the result changed the conclusion. See below.
+
+### Verification note: item 4 is a test-isolation failure
+
+A clean `git worktree` was created at `cdee6cc` with none of this branch's files
+present, and `tests/test_npt_pep_adapter_boost.py` was run there:
+
+| Tree | Invocation | Result |
+|---|---|---|
+| clean `cdee6cc` worktree | that file + `test_thermodynamic_validity_2d_rough.py` | `test_npt_pep_adapter_boost.py` fully green; the two `beta must be positive` failures reproduce |
+| `cv-select/t00-contracts` | that file alone | 27 passed |
+| `cv-select/t00-contracts` | whole suite | `test_finite_difference_boost_force_matches_scaling_factor_expression` fails |
+
+So the finite-difference test **passes in isolation on both trees** and fails
+only inside a whole-suite run. That is cross-test state pollution, not a
+deterministic defect and not attributable to T00, whose modules are on no import
+path this test touches. `pytest-randomly` is not installed in this environment,
+so test ordering is fixed and is *not* the variable — the likely culprit is
+global simulation state (platform, force groups, or an integrator left
+configured) surviving from an earlier test in the session.
+
+This is worth its own investigation before T04, which builds residual-CV forces
+and will want this file's finite-difference check to be trustworthy in CI. It is
+recorded here rather than fixed, per the plan's rule on keeping unrelated fixes
+separate.
+
+The two `beta must be positive` failures (items 7-8 of the list above, in
+`test_thermodynamic_validity_2d_rough.py`) **did** reproduce in the clean
+worktree, confirming those as genuinely pre-existing.
 
 ### Unresolved and handed on
 
