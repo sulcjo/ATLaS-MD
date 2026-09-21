@@ -175,3 +175,32 @@ Tests: `tests/test_exploration_layout_invariants.py`, `tests/test_exploration_la
 Not done here: 1-D (cv1-only) ladders keep their previous design; predicting sparse-layout
 connectivity before writing the table remains open (campaign-end connected-components check).
 
+
+## Completion record — M1 + F05 (2026-09-21)
+
+Commits on `main` (pushed 2026-09-21 21:5x CEST): `6daa088` P00 fixtures/log, `0b967c6` F01+F02+F04,
+`7e98fc0` F03, `3237298` F05, `ccd73c7` task log + release 0.9.0. Full test suite at `ccd73c7`
+(`-q tests/`, two slow smoke items deselected): **3374 passed, 2 skipped, 7 failed**; the 7 failures
+are the P00 baseline's pre-existing items (`test_atlas_md_docs` ×2 site_name casing,
+`test_example_configs` chignolin_genpept_contact_bias_sigma.yaml without `--seq`, and the four
+`beta must be positive` mutation-battery cases in `test_thermodynamic_validity_2d_rough` /
+`_real_md`), identified by collection index from the progress dots because the detached run ended
+before printing its summary. Targeted batch of the 47 touched/new test files: 835 passed.
+
+Deployment: both aurum2 trees (`/home/sulcjo/2026_peptide_sampler`, `/home/sulcjo/gareus`) rsynced
+from the tracked file list, package digest identical to local main (`d0a9a066…`), `compileall` clean
+under `conda-envs/calc` (Python 3.9.23), `DEPLOYED_COMMIT = ccd73c7`.
+
+chignolin_8 recovery without re-running MD: the swarm round (186 members) and `swarm/system` were kept;
+the v1 analysis and the pool bookkeeping were set aside; `analyze_swarm_stage` re-run on the login
+node with the deployed yaml (`swarm_n_windows 15`, `max_replicas 256`) → all six gates pass
+(`coverage`, `envelope_stability`, `ladder_ess`, `graft`, `pair`, `coverage_design`), pair =
+component 3, degree 1 / identity basis, deployable with real topology / physical-system / contact-pair
+digests, one CV1 region [0.04, 0.968], layout PROPOSED joint 62 spatial × 4 rungs = 248 states with
+the k1 = k2 = 0 stack (rows 0–3) and 4 region representatives mandatory. CPU pre-flight on the swarm's
+equilibrated frame: fast-path z = positions-evaluator z = 0.695036 (the value the I01 finding showed
+the old fast path mis-recorded as 0.6442), and umbrella energy on a restrained row equals
+0.5·k2·(z − c)² to 1e-6 (9.969554 kJ/mol). Job 2558439 submitted; the job re-analyses (deterministic),
+writes `epoch0_complete.json`, charges the swarm to the pool and starts production on the new ladder.
+
+Not done in this pass: F06–F08 (M2), F09 (M3); see the plan for their gates.
