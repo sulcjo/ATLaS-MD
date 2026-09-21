@@ -494,11 +494,12 @@ def _add_residual_torsion_cv_force(openmm, system, phi_torsions, psi_torsions, c
     K0 = float(v @ (fit.coefficients[0] + fit.residual_mean) + fit.projection_mean[j - 1])
     K1 = float(v @ fit.coefficients[1])
     K2 = float(v @ fit.coefficients[2])
+    projection_std = float(fit.projection_std[j - 1])
     a_raw = f"((res_contacts/{norm:.17g}) - {fit.anchor_mean:.17g})/{fit.anchor_std:.17g}"
     lo, hi = fit.anchor_clamp
     a_expr = f"min({hi:.17g}, max({lo:.17g}, {a_raw}))" if fit.degree == 2 else a_raw
     z2 = (f"(({' + '.join(names)}) - {K0:.17g} - {K1:.17g}*({a_expr}) - {K2:.17g}*({a_expr})^2)"
-          f"/{fit.projection_std[j - 1]:.17g}")
+          f"/{projection_std:.17g}")
     cv_force.addGlobalParameter("ss_k", 0.0)
     cv_force.addGlobalParameter("ss0", 0.0)
     cv_force.setEnergyFunction(f"0.5*ss_k*({z2}-ss0)^2")
@@ -520,6 +521,24 @@ def _add_residual_torsion_cv_force(openmm, system, phi_torsions, psi_torsions, c
         "psi_torsions": [list(map(int, t)) for t in psi_torsions],
         "contact_pairs": [[int(p[0]), int(p[1]), float(p[2]) if len(p) > 2 else 1.0] for p in contact_pairs],
         "linear_subcv_names": list(names),
+        # This is the exact scalar expression consumed by the fast production
+        # sampling and exchange paths.  Keep it JSON-safe so resume never has
+        # to guess the CustomCVForce child order or rederive rounded constants
+        # from a model artifact that may no longer be locally available.
+        "scalar_reconstruction": {
+            "schema_version": "residual-torsion-pc-scalar-v1",
+            "sub_cv_names": [*names, "res_contacts"],
+            "torsion_sub_cv_count": int(len(names)),
+            "anchor_norm": norm,
+            "anchor_mean": float(fit.anchor_mean),
+            "anchor_std": float(fit.anchor_std),
+            "anchor_clamp": [float(lo), float(hi)],
+            "degree": int(fit.degree),
+            "k0": K0,
+            "k1": K1,
+            "k2": K2,
+            "projection_std": projection_std,
+        },
         "force_group": int(force_group),
         # Stripped from the JSON manifest by _json_ready's underscore rule; the
         # scorer reloads from the recorded paths after a resume.
@@ -697,6 +716,54 @@ def _ss_scalar_from_sub_cv_values(sub_cv_values, metadata: dict) -> float:
     """
     mode = secondary_cv_mode(metadata)
     arr = np.asarray(sub_cv_values, dtype=np.float64)
+    if arr.ndim != 1 or not np.all(np.isfinite(arr)):
+        raise RuntimeError(f"Cannot reconstruct secondary CV {mode!r} from non-finite/non-vector sub-CV values")
+    if mode == "residual-torsion-pc":
+        reconstruction = metadata.get("scalar_reconstruction")
+        if not isinstance(reconstruction, dict):
+            raise RuntimeError(
+                "residual-torsion-pc metadata lacks scalar_reconstruction; refusing to use "
+                "the legacy two-value fallback because it defines a different CV"
+            )
+        schema = str(reconstruction.get("schema_version", ""))
+        if schema != "residual-torsion-pc-scalar-v1":
+            raise RuntimeError(f"Unsupported residual CV scalar reconstruction schema {schema!r}")
+        sub_cv_names = reconstruction.get("sub_cv_names")
+        if not isinstance(sub_cv_names, list) or not all(isinstance(name, str) for name in sub_cv_names):
+            raise RuntimeError("Residual CV scalar reconstruction has invalid sub_cv_names")
+        if len(sub_cv_names) != arr.size:
+            raise RuntimeError(
+                f"Residual CV sub-variable count {arr.size} does not match metadata order "
+                f"of length {len(sub_cv_names)}"
+            )
+        n_torsion = int(reconstruction.get("torsion_sub_cv_count", -1))
+        expected_names = list(metadata.get("linear_subcv_names", [])) + ["res_contacts"]
+        if (n_torsion != len(sub_cv_names) - 1 or sub_cv_names != expected_names
+                or sub_cv_names[-1:] != ["res_contacts"]):
+            raise RuntimeError("Residual CV sub-variable ordering does not match the force metadata")
+        try:
+            norm = float(reconstruction["anchor_norm"])
+            anchor_mean = float(reconstruction["anchor_mean"])
+            anchor_std = float(reconstruction["anchor_std"])
+            lo, hi = (float(x) for x in reconstruction["anchor_clamp"])
+            degree = int(reconstruction["degree"])
+            k0 = float(reconstruction["k0"])
+            k1 = float(reconstruction["k1"])
+            k2 = float(reconstruction["k2"])
+            projection_std = float(reconstruction["projection_std"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"Residual CV scalar reconstruction metadata is incomplete: {exc}") from exc
+        constants = np.asarray(
+            [norm, anchor_mean, anchor_std, lo, hi, k0, k1, k2, projection_std], dtype=np.float64)
+        if not np.all(np.isfinite(constants)) or norm <= 0.0 or anchor_std <= 0.0 or projection_std <= 0.0:
+            raise RuntimeError("Residual CV scalar reconstruction contains invalid normalization constants")
+        if degree not in {1, 2}:
+            raise RuntimeError(f"Residual CV scalar reconstruction has unsupported polynomial degree {degree}")
+        anchor = (float(arr[-1]) / norm - anchor_mean) / anchor_std
+        if degree == 2:
+            anchor = float(np.clip(anchor, lo, hi))
+        torsion_projection = float(np.sum(arr[:n_torsion]))
+        return float((torsion_projection - k0 - k1 * anchor - k2 * anchor * anchor) / projection_std)
     if mode in {"tica-linear", "torsion-pca"}:
         offset = float(metadata.get("tica_offset", 0.0))
         if str(metadata.get("linear_subcv_mode", "")) == "grouped-weighted-sums":
@@ -715,8 +782,9 @@ def _ss_scalar_from_sub_cv_values(sub_cv_values, metadata: dict) -> float:
         scores = 0.5 * (phi_scores + psi_scores)
         denom = float(np.sum(scores)) + 1e-8
         return float(np.dot(values, scores) / denom)
-    # alpha, beta, custom: [ss_phi, ss_psi]
-    return float(0.5 * (arr[0] + arr[1]))
+    if mode in {"alpha", "beta", "custom"}:
+        return float(0.5 * (arr[0] + arr[1]))
+    raise RuntimeError(f"Unsupported secondary CV mode {mode!r} in fast scalar reconstruction")
 
 
 def _first_present(*values):
