@@ -873,7 +873,13 @@ def filter_explicit_2d_windows_by_seed_reachability(
     centers_arr = np.asarray(centers_a, dtype=float)
     keep_mask = np.zeros(centers_arr.shape[0], dtype=bool)
     dropped = []
+    _mandatory = set(int(i) for i in ((window_metadata or {}).get("mandatory_window_indices") or []))
+    _k1 = np.asarray(k_list, dtype=float)
+    _k2 = np.asarray(secondary_cv_k_kcal_list, dtype=float) if secondary_cv_k_kcal_list is not None else None
     for i, c in enumerate(centers_arr):
+        if float(_k1[i]) == 0.0 and (_k2 is None or float(_k2[i]) == 0.0):
+            keep_mask[i] = True          # an unrestrained window is reachable from any seed (spec F05)
+            continue
         target_secondary = float(secondary_cv_centers[i]) if can_score_secondary else float("nan")
         best_score, best_components = None, None
         for conf in library:
@@ -901,6 +907,11 @@ def filter_explicit_2d_windows_by_seed_reachability(
                 "primary_score": primary_score,
                 "secondary_score": secondary_score,
             })
+    _blocked = sorted(int(i) for i in range(centers_arr.shape[0]) if not keep_mask[i] and int(i) in _mandatory)
+    if _blocked:
+        raise RuntimeError(
+            f"explicit-2D reachability: mandatory exploration windows {_blocked} have no reachable seed within the "
+            "preflight score; the layout must be redesigned, a mandatory role is never dropped (spec F05)")
     if not dropped:
         return centers_a, k_list, secondary_cv_centers, secondary_cv_k_kcal_list, secondary_cv_metadata, window_metadata
 
@@ -909,13 +920,16 @@ def filter_explicit_2d_windows_by_seed_reachability(
         f"no GENPEPT seed within --us-seed-preflight-max-score={max_score:g} window-spacings of their "
         f"target on primary and/or secondary CV:"
     )
+    def _g(value, spec=".4g"):
+        return format(float(value), spec) if isinstance(value, (int, float)) and value is not None else "n/a"
+
     for d in dropped:
         print(
-            f"    window {d['window']}: primary target={d['primary_center']:.4g} "
-            f"(nearest seed {d['nearest_seed_primary_cv']:.4g}, score={d['primary_score']:.2f})"
-            + (f", secondary target={d['secondary_center']:.4g} "
-               f"(nearest seed {d['nearest_seed_secondary_cv']:.4g}, score={d['secondary_score']:.2f})"
-               if d["secondary_center"] is not None else "")
+            f"    window {d['window']}: primary target={_g(d.get('primary_center'))} "
+            f"(nearest seed {_g(d.get('nearest_seed_primary_cv'))}, score={_g(d.get('primary_score'), '.2f')})"
+            + (f", secondary target={_g(d.get('secondary_center'))} "
+               f"(nearest seed {_g(d.get('nearest_seed_secondary_cv'))}, score={_g(d.get('secondary_score'), '.2f')})"
+               if d.get("secondary_center") is not None else "")
         )
 
     filtered_centers = centers_arr[keep_mask]
@@ -992,47 +1006,22 @@ def displace_clashing_solvent_nm(positions_nm: np.ndarray, box_nm: np.ndarray, p
                                  solvent_groups, heavy_mask, *, r_heavy_nm: float = _CLASH_R_HEAVY_NM,
                                  r_hydrogen_nm: float = _CLASH_R_HYDROGEN_NM, max_rounds: int = 25,
                                  seed: int = 0) -> tuple[np.ndarray, dict]:
-    """Push every solvent molecule that overlaps the placed peptide out along the min-image
-    vector from its nearest peptide atom until the pair clearance is met; rigid per molecule,
-    peptide never moves, untouched molecules are returned bitwise unchanged.
+    """Compatibility wrapper over ``gareus.solvent_repair.repair_solvent_clashes``.
 
-    Only the peptide-solvent clearance is enforced: a pushed water landing 0.2 nm from a
-    neighbour is a ~1e2 kJ/mol overlap the minimiser resolves routinely, while the 0.01 nm
-    peptide-water overlaps this exists for are 1e18 kJ/mol walls it cannot."""
-    pos = np.array(positions_nm, dtype=float, copy=True)
-    box = np.asarray(box_nm, dtype=float)
-    pep = np.asarray(peptide_indices, dtype=int)
-    heavy = np.asarray(heavy_mask, dtype=bool)
-    rng = np.random.default_rng(int(seed))
-    pep_pos = pos[pep]
-    pep_heavy = heavy[pep]
-    moved_groups: set = set()
-    n_rounds = 0
-    for _ in range(int(max_rounds)):
-        n_rounds += 1
-        moved_this_round = 0
-        for gi, group in enumerate(solvent_groups):
-            g = np.asarray(group, dtype=int)
-            d = _min_image_nm(pos[g][:, None, :] - pep_pos[None, :, :], box)
-            r = np.linalg.norm(d, axis=-1)
-            thresh = np.where(heavy[g][:, None] & pep_heavy[None, :], r_heavy_nm, r_hydrogen_nm)
-            viol = r < thresh
-            if not viol.any():
-                continue
-            k, j = np.unravel_index(np.argmin(r - thresh), r.shape)
-            direction = d[k, j]
-            norm = float(np.linalg.norm(direction))
-            if norm < 1e-6:
-                direction = rng.normal(size=3)
-                norm = float(np.linalg.norm(direction))
-            direction = direction / norm
-            needed = float(thresh[k, j] - r[k, j]) + _CLASH_MARGIN_NM
-            pos[g] += direction * needed
-            moved_groups.add(gi)
-            moved_this_round += 1
-        if moved_this_round == 0:
-            break
-    return pos, {"n_groups_moved": len(moved_groups), "n_rounds": n_rounds}
+    The first implementation moved each molecule radially and independently, which made two
+    waters exactly coincident (review N01) and could return with the clearance unmet and no
+    way to tell (N02). The repair module checks solvent-solvent clearance for every
+    candidate move and only claims RESOLVED after an independent validation pass. Returns
+    ``(positions, stats)`` with ``stats["status"]`` -- callers must read it."""
+    from .solvent_repair import RepairPolicy, repair_solvent_clashes
+
+    policy = RepairPolicy(peptide_heavy_heavy_nm=float(r_heavy_nm), peptide_hydrogen_nm=float(r_hydrogen_nm),
+                          max_rounds=int(max_rounds))
+    result = repair_solvent_clashes(positions_nm, box_nm, peptide_indices, solvent_groups, heavy_mask,
+                                    policy=policy, seed=seed)
+    stats = result.as_record()
+    stats["n_rounds"] = int(result.n_rounds)
+    return result.positions_nm, stats
 
 
 def graft_conformer_into_context(
@@ -1089,8 +1078,14 @@ def graft_conformer_into_context(
     if not wholesale and len(topo_to_seed) < _MIN_GRAFT_BACKBONE_ATOMS:
         return {"fallback": True, "fallback_reason": "too_few_mapped_atoms"}
 
-    # OpenMM calls — wrapped so a platform failure falls back gracefully
+    # OpenMM calls — wrapped so a platform failure falls back gracefully. The context's
+    # original positions are captured first and restored on every failed path (spec F03:
+    # a failed preparation must never leave candidate coordinates in the context).
+    original_positions = None
     try:
+        # Restoration must return the caller's exact coordinates, so capture them unwrapped;
+        # the wrapped copy below is only the graft's working frame.
+        original_positions = sim.context.getState(getPositions=True).getPositions()
         state = sim.context.getState(getPositions=True, enforcePeriodicBox=True)
         full_pos_nm = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
         graft_mode = "wholesale" if wholesale else "backbone-subset"
@@ -1118,29 +1113,44 @@ def graft_conformer_into_context(
             else:
                 ca_abs_arr = np.array([], dtype=int)
                 ca_aligned_nm = None
-        # The compact seed now occupies space the water box still fills: push overlapping
-        # solvent out before asking the minimiser to cope with 1/r^12 at r -> 0.
+        # The compact seed now occupies space the water box still fills: repack overlapping
+        # solvent (collision-aware, bounded) before asking the minimiser to cope with
+        # 1/r^12 at r -> 0. UNRESOLVED/INVALID_INPUT is a failed graft, not a warning.
+        from .solvent_repair import STATUS_RESOLVED, repair_solvent_clashes
+
         box_nm = np.asarray(state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.nanometer), dtype=float)
         solvent_groups, heavy_mask = solvent_groups_from_topology(topology)
+        massless = np.array([sim.system.getParticleMass(i).value_in_unit(unit.dalton) == 0.0
+                             for i in range(sim.system.getNumParticles())], dtype=bool)
         pep_indices = np.arange(first_pep_atom_index, first_pep_atom_index + n_pep)
-        new_full_pos, clash_stats = displace_clashing_solvent_nm(
-            new_full_pos, box_nm, pep_indices, solvent_groups, heavy_mask, seed=seed)
+        repair = repair_solvent_clashes(new_full_pos, box_nm, pep_indices, solvent_groups, heavy_mask,
+                                        seed=seed, seed_id=str(conformer.get("seed_id", conformer.get("pdb_path", ""))),
+                                        massless_mask=massless if massless.any() else None)
+        clash_stats = repair.as_record()
+        if repair.status != STATUS_RESOLVED:
+            sim.context.setPositions(original_positions)
+            return {"fallback": True, "fallback_reason": f"solvent_repair_{repair.status.lower()}:{repair.reason_code}",
+                    "solvent_repair": clash_stats}
+        new_full_pos = repair.positions_nm
         sim.context.setPositions(new_full_pos * unit.nanometer)
+        if massless.any():
+            sim.context.computeVirtualSites()
         _minimize_energy(sim, maxIterations=minimize_iters)
+        if massless.any():
+            sim.context.computeVirtualSites()
         min_state = sim.context.getState(getPositions=True, getEnergy=True, getForces=True,
                                          enforcePeriodicBox=True)
-        min_pos_nm = min_state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
-        if np.isnan(min_pos_nm).any():
-            return {"fallback": True, "fallback_reason": "minimization_nan"}
-        e_min = float(min_state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole))
-        f_max = float(np.abs(min_state.getForces(asNumpy=True).value_in_unit(
-            unit.kilojoule_per_mole / unit.nanometer)).max())
-        if not np.isfinite(e_min) or f_max > _GRAFT_MAX_FORCE_KJ_MOL_NM:
-            # A graft the minimiser could not repair is a failed graft, never a "successful"
-            # one that NaNs 50 steps into MD.
-            return {"fallback": True, "fallback_reason": "minimization_blowup",
-                    "post_minimization_energy_kj_mol": e_min, "post_minimization_max_force_kj_mol_nm": f_max,
-                    "n_solvent_groups_displaced": int(clash_stats["n_groups_moved"])}
+        accepted = _accepted_state_check(min_state, unit)
+        if accepted["fallback_reason"] is not None:
+            sim.context.setPositions(original_positions)
+            return {"fallback": True, "fallback_reason": accepted["fallback_reason"],
+                    "post_minimization_energy_kj_mol": accepted["energy_kj_mol"],
+                    "post_minimization_max_force_kj_mol_nm": accepted["max_force_kj_mol_nm"],
+                    "n_solvent_groups_displaced": int(clash_stats["n_groups_moved"]),
+                    "solvent_repair": clash_stats}
+        min_pos_nm = accepted["positions_nm"]
+        e_min = accepted["energy_kj_mol"]
+        f_max = accepted["max_force_kj_mol_nm"]
         sim.context.setVelocitiesToTemperature(temperature_k * unit.kelvin, seed)
         cv_after_nm = cv_distance_from_positions_nm(min_pos_nm, cv_atom1, cv_atom2)
         # Cα RMSD: Kabsch-aligned conformer vs post-minimization peptide — measures
@@ -1165,9 +1175,40 @@ def graft_conformer_into_context(
             "n_solvent_groups_displaced": int(clash_stats["n_groups_moved"]),
             "post_minimization_energy_kj_mol": e_min,
             "post_minimization_max_force_kj_mol_nm": f_max,
+            "solvent_repair": clash_stats,
         }
     except Exception as e:
+        if original_positions is not None:
+            try:
+                sim.context.setPositions(original_positions)
+            except Exception:
+                pass
         return {"fallback": True, "fallback_reason": f"exception:{e}"}
+
+
+def _accepted_state_check(min_state, unit) -> dict:
+    """Finite-state validation of a minimised graft (spec F03).
+
+    Every position, force component and the energy must be finite BEFORE the force bound is
+    applied: ``nan > threshold`` is False, so the old guard accepted a NaN force maximum
+    (review N03). The bound keeps its documented convention -- maximum absolute Cartesian
+    force component in kJ/mol/nm."""
+    positions_nm = np.asarray(min_state.getPositions(asNumpy=True).value_in_unit(unit.nanometer), dtype=float)
+    forces = np.asarray(min_state.getForces(asNumpy=True).value_in_unit(unit.kilojoule_per_mole / unit.nanometer),
+                        dtype=float)
+    energy = float(min_state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole))
+    reason = None
+    if not np.all(np.isfinite(positions_nm)):
+        reason = "minimization_nonfinite_positions"
+    elif not np.all(np.isfinite(forces)):
+        reason = "minimization_nonfinite_forces"
+    elif not np.isfinite(energy):
+        reason = "minimization_nonfinite_energy"
+    f_max = float(np.abs(forces).max()) if forces.size and np.all(np.isfinite(forces)) else float("nan")
+    if reason is None and f_max > _GRAFT_MAX_FORCE_KJ_MOL_NM:
+        reason = "minimization_blowup"
+    return {"fallback_reason": reason, "positions_nm": positions_nm, "energy_kj_mol": energy,
+            "max_force_kj_mol_nm": f_max}
 
 
 def generate_us_starting_states_by_pulling(

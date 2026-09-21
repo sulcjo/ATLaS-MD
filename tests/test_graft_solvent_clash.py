@@ -119,9 +119,15 @@ def test_graft_survives_a_water_placed_inside_the_peptide_and_refuses_a_blown_up
     fmax = np.abs(state.getForces(asNumpy=True).value_in_unit(unit.kilojoule_per_mole / unit.nanometer)).max()
     assert np.isfinite(e) and e < 0 and fmax < S._GRAFT_MAX_FORCE_KJ_MOL_NM
 
-    # And if minimisation cannot fix a graft, that is a failed graft -- not a successful one.
+    # And if minimisation cannot fix a graft, that is a failed graft -- not a successful one:
+    # leave the clash in place (repair reports RESOLVED without moving anything) and skip
+    # minimisation, so the accepted-state force bound is what has to catch it.
+    import gareus.solvent_repair as R
     monkeypatch.setattr(S, "_minimize_energy", lambda sim, **kw: None)
-    monkeypatch.setattr(S, "displace_clashing_solvent_nm", lambda pos, *a, **k: (pos, {"n_groups_moved": 0, "n_rounds": 0}))
+
+    def no_repair(positions_nm, *a, **k):
+        return R.RepairResult(R.STATUS_RESOLVED, "resolved", np.array(positions_nm, dtype=float))
+    monkeypatch.setattr(R, "repair_solvent_clashes", no_repair)
     sim.context.setPositions(clashed * unit.nanometer)
     st2 = S.graft_conformer_into_context(sim, topology, conformer, ca[0], ca[-1], 300.0, unit,
                                          minimize_iters=1, seed=1)
