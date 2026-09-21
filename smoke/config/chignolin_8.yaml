@@ -166,8 +166,8 @@ windows:
   # Supplying windows_2d_csv again would skip epoch 0 and use that table instead.
   # 64 = 16 CV1 centres x 4 lambda rungs. MUST be >= the ladder CSV row count or states
   # get capped. Was 64, written before the CV change raised the window count from 2 to 16.
-  # 256 (2026-09-21, was 128): 16 CV1 centres x 4 CV2 windows x 4 rungs = 256 states, so the
-  # cap now admits the full joint grid; below n1*n2*n_rungs design_2d_layout falls back to the
+  # 256 (2026-09-21, was 128): 15 CV1 centres x 4 CV2 windows x 4 rungs + the mandatory unrestrained
+  # stack = 244 replicas, so the cap admits the full joint grid; below n1*n2*n_rungs design_2d_layout falls back to the
   # sparse layout (CV1 axis + CV2 axis + bridge + diagonal patches). MUST stay >= the ladder
   # CSV row count or states get capped.
   max_replicas: 256
@@ -253,7 +253,12 @@ swarm:
   swarm_bins: "4,3,3"          # CV1 x Rg x end-to-end strata; seed DIVERSITY only, never a bias
   swarm_equil_ps: 100.0
   swarm_graft_minimize_iters: 500   # 100 left 18/99 members NaN within 3 s (2026-09-08); 500 -> 3/99
-  swarm_n_windows: 16               # CV1 centres; x 4 lambda rungs = 64 states
+  # 15 (2026-09-21, was 16): the exploration layout reserves one unrestrained spatial state
+  # (k1 = k2 = 0 on every rung, incl. lambda = 0) at any replica cap, so 256 / 4 rungs leaves 63
+  # other stacks; 15 x 4 + 1 = 61 stacks = 244 replicas keeps the FULL joint grid, 16 x 4 would
+  # fall back to the sparse axes+bridge layout. Region representatives are added on top when
+  # the discovery sample has more than one supported CV1 interval (layout_plan.json).
+  swarm_n_windows: 15               # CV1 centres; x 4 lambda rungs = 64 states
   # Rung count (was an unpinned 7). design_lambda_ladder grows lambda from 0 with
   # step = swarm_target_beta_sigma / (beta * sigma_lambda), forces a top rung at
   # 1.0, then bisects the widest gap until min_rungs is met; min == max pins the

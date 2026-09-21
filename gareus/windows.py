@@ -16,6 +16,7 @@ from typing import Optional, Tuple, List, Iterable, Dict, Any
 from pathlib import Path
 
 import csv
+import json
 import math
 import numpy as np
 
@@ -1437,6 +1438,20 @@ def load_explicit_2d_window_csv(args, path: Path) -> tuple[np.ndarray, list[floa
     }
     sec_arr = np.asarray(secondary_centers, dtype=float) if any_secondary else None
     sec_k = [float(x) for x in secondary_k_list] if any_secondary else None
+    # Companion layout plan (spec F05): which windows are mandatory exploration states. Read
+    # from beside the table; roles never live in the physics rows themselves.
+    _plan_path = Path(path).parent / "layout_plan.json"
+    if _plan_path.exists():
+        try:
+            _plan = json.loads(_plan_path.read_text(encoding="utf-8"))
+            _states = list(_plan.get("states") or [])
+            if _states and len(_states) == len(window_metadata.get("gamd_lambdas", [])):
+                window_metadata["state_roles"] = [s.get("role") for s in _states]
+                window_metadata["mandatory_window_indices"] = [int(s["state_id"]) for s in _states if s.get("mandatory")]
+                window_metadata["layout_plan_path"] = str(_plan_path)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            print(f"WARNING: layout_plan.json beside {path} could not be read ({exc!r}); mandatory-state guards inactive")
+
     return centers_arr, [float(x) for x in k_list], sec_arr, sec_k, secondary_metadata, window_metadata
 
 

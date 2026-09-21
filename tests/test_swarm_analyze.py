@@ -260,6 +260,18 @@ def test_auto_cv2_writes_a_pair_model_and_a_two_dimensional_ladder(synthetic_swa
         assert pathlib.Path(side[key]).exists()
     assert report["status"] == "pass" and report["gate"]["gates"]["pair"]["ok"] is True
     assert report["cv_selection"]["layout"]["kind"] in ("joint", "sparse")
+    # F05: the exploration invariants travel with the table
+    assert report["gate"]["gates"]["coverage_design"]["ok"] is True
+    plan = json.loads((an / "layout_plan.json").read_text())
+    assert plan["status"] == "PROPOSED" and plan["states"][0]["role"] == "unrestrained_anchor"
+    n_rungs = plan["n_rungs"]
+    with (an / "windows_lambda_ladder.csv").open() as fh:
+        recs = list(csv.DictReader(fh))
+    assert len(recs) == plan["n_states"] == report["n_states"]
+    for r in recs[:n_rungs]:                                    # the anchor stack: unrestrained on every rung
+        assert float(r["primary_cv_k_kcal"]) == 0.0 and float(r["secondary_cv_k_kcal_mol"]) == 0.0
+    assert len({r["gamd_lambda"] for r in recs[:n_rungs]}) == n_rungs and "0.000000" in {r["gamd_lambda"] for r in recs[:n_rungs]}
+    assert report["region_inventory"]["regions"] and (an / "region_inventory.json").exists()
     # The on-disk report must carry the 2-D design too (it used to be written before the
     # layout block; the launcher reads it on resume).
     on_disk = json.loads((an / "cv_selection_report.json").read_text())

@@ -511,6 +511,10 @@ class WindowStateRegistry:
         state = self._states.get(int(state_id))
         if state is None:
             raise KeyError(f"unknown state_id {state_id}")
+        if bool((state.metadata or {}).get("mandatory")):
+            raise ValueError(
+                f"state {state_id} is a mandatory exploration state "
+                f"({(state.metadata or {}).get('state_role')}) and cannot be retired (spec F05)")
         state.mark_retired(int(epoch))
         self.lifecycle.append(
             LifecycleEvent(epoch=int(epoch), event="retire", state_id=int(state_id), reason=str(reason))
@@ -798,6 +802,20 @@ def registry_from_window_csv(path: Path, epoch: int = 0, source: str = "window_c
             reg._states[new_id] = state
             reg._next_state_id = max(reg._next_state_id, new_id + 1)
             reg.lifecycle[-1].state_id = new_id
+    # Companion layout plan (spec F05): mark mandatory exploration states so no lifecycle path
+    # can retire, split or drop them. Roles are metadata, never physics.
+    _plan_path = Path(path).parent / "layout_plan.json"
+    if _plan_path.exists():
+        try:
+            _plan = json.loads(_plan_path.read_text(encoding="utf-8"))
+            _states = list(_plan.get("states") or [])
+            _active = reg.all_states()
+            if _states and len(_states) == len(_active):
+                for st, rec in zip(_active, _states):
+                    st.metadata["state_role"] = rec.get("role")
+                    st.metadata["mandatory"] = bool(rec.get("mandatory"))
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            print(f"WARNING: layout_plan.json beside {path} could not be read ({exc!r}); mandatory-state guards inactive")
     return reg
 
 
@@ -6725,6 +6743,11 @@ class AdaptiveProductionController:
             kind = str(action[0])
             if kind == "retire":
                 _, state_id, reason = action
+                _st = self.registry.get_state(int(state_id))
+                if _st is not None and bool((_st.metadata or {}).get("mandatory")):
+                    print(f"[adaptive] refusing to retire mandatory exploration state {state_id} "
+                          f"({(_st.metadata or {}).get('state_role')}); the proposal is dropped, not the state")
+                    continue
                 self.registry.retire_state(int(state_id), int(epoch) + 1, str(reason))
             elif kind == "extend":
                 _, state_id, reason = action
@@ -6759,6 +6782,10 @@ class AdaptiveProductionController:
                 # producer emits "split" today, so a future producer must
                 # decide whether splitting a centre retires the whole centre.
                 _, parent, children_params, reason = action
+                _pst = self.registry.get_state(int(parent))
+                if _pst is not None and bool((_pst.metadata or {}).get("mandatory")):
+                    print(f"[adaptive] refusing to split mandatory exploration state {parent}; proposal dropped")
+                    continue
                 self.registry.retire_state(int(parent), int(epoch) + 1, f"split: {reason}")
                 for child in children_params:
                     self._add_centre_on_every_rung(

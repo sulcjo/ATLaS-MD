@@ -411,6 +411,141 @@ def design_2d_layout(n1: int, n2: int, *, n_rungs: int, max_replicas: int) -> di
     return {"kind": "sparse", "spatial_states": len(cells), "n1": int(n1), "n2": int(n2), "cells": cells}
 
 
+# ---------------------------------------------------------------------------------------------
+# Exploration-preserving layout (repair spec F05; findings I02, I03)
+# ---------------------------------------------------------------------------------------------
+
+ROLE_UNRESTRAINED_ANCHOR = "unrestrained_anchor"      # k1 = k2 = 0 on every rung, including lambda = 0
+ROLE_REGION_REPRESENTATIVE = "region_representative"  # CV1 axis state at a discovered region's representative
+ROLE_AXIS = "axis"                                      # single-axis soft bridge state
+ROLE_JOINT = "joint"
+LAYOUT_STATUS_PROPOSED = "PROPOSED"
+LAYOUT_STATUS_INSUFFICIENT = "INSUFFICIENT_REGION_COVERAGE"
+LAYOUT_PLAN_VERSION = "layout_plan_v1"
+
+
+def design_exploration_layout(n1: int, n2: int, *, n_rungs: int, max_replicas: int,
+                              region_centre_indices=None) -> dict:
+    """Spatial states for a 2-D ladder with the exploration invariants of spec F05.
+
+    Builder order, at ANY replica cap:
+      1. one spatial state with k1 = k2 = 0 (an actual unbiased target at lambda = 0) -- one
+         complete rung stack, reserved before anything else;
+      2. a CV1-axis representative (k2 = 0) for every discovered region (``region_centre_indices``
+         are the CV1 centre indices that represent regions);
+      3. if the whole n1 x n2 grid still fits, every joint cell; otherwise the remaining CV1 axis
+         states, the CV2 axis states and joint cells filling the diagonal band outward.
+    Every spatial state gets a complete rung stack. If (1) + (2) alone exceed the cap the plan
+    is INSUFFICIENT_REGION_COVERAGE with requested/available counts; nothing is silently dropped.
+
+    Cells are ``(i1 | None, i2 | None)``; ``None`` = that axis unrestrained (k = 0, finite
+    placeholder centre). Roles live in the returned plan, never in the physics rows.
+    """
+    if int(max_replicas) <= 0:
+        raise ValueError("max_replicas must be set and positive; the default 0 cannot size a 2-D ladder")
+    if int(n_rungs) <= 0 or int(n1) <= 0 or int(n2) <= 0:
+        raise ValueError("n1, n2 and n_rungs must be positive")
+    cap = int(max_replicas) // int(n_rungs)
+    reps = sorted({int(i) for i in (region_centre_indices or [])})
+    if any(i < 0 or i >= n1 for i in reps):
+        raise ValueError("region centre indices must index the CV1 centres")
+    cells = [(None, None)]
+    roles = [ROLE_UNRESTRAINED_ANCHOR]
+    mandatory = 1 + len(reps)
+    if mandatory > cap:
+        return {"version": LAYOUT_PLAN_VERSION, "status": LAYOUT_STATUS_INSUFFICIENT, "kind": None,
+                "spatial_states": 0, "n1": int(n1), "n2": int(n2), "n_rungs": int(n_rungs), "cap_spatial": cap,
+                "mandatory_spatial": mandatory, "requested_replicas": mandatory * int(n_rungs),
+                "available_replicas": int(max_replicas), "cells": [], "state_roles": [],
+                "reason": f"{mandatory} mandatory rung stacks ({mandatory * int(n_rungs)} replicas) exceed the "
+                          f"cap of {int(max_replicas)} replicas / {cap} spatial states"}
+    for i in reps:
+        cells.append((i, None)); roles.append(ROLE_REGION_REPRESENTATIVE)
+    remaining = cap - len(cells)
+    if n1 * n2 <= remaining:
+        kind = "joint"
+        for i in range(n1):
+            for j in range(n2):
+                cells.append((i, j)); roles.append(ROLE_JOINT)
+    else:
+        kind = "sparse"
+        axis1 = [(i, None) for i in range(n1) if i not in reps]
+        axis2 = [(None, j) for j in range(n2)]
+        soft = axis1 + axis2
+        take = soft[:remaining]
+        cells += take; roles += [ROLE_AXIS] * len(take)
+        remaining -= len(take)
+        if remaining > 0:
+            order = sorted(((i, j) for i in range(n1) for j in range(n2)),
+                           key=lambda ij: (abs(ij[0] / max(n1 - 1, 1) - ij[1] / max(n2 - 1, 1)), ij))
+            cells += order[:remaining]; roles += [ROLE_JOINT] * min(remaining, len(order))
+    plan = {"version": LAYOUT_PLAN_VERSION, "status": LAYOUT_STATUS_PROPOSED, "kind": kind,
+            "spatial_states": len(cells), "n1": int(n1), "n2": int(n2), "n_rungs": int(n_rungs),
+            "cap_spatial": cap, "mandatory_spatial": mandatory, "cells": cells, "state_roles": roles,
+            "mandatory_spatial_indices": list(range(mandatory)),
+            "region_representative_centre_indices": reps}
+    _check_layout_invariants(plan)
+    return plan
+
+
+def _check_layout_invariants(plan: dict) -> None:
+    cells, roles = plan["cells"], plan["state_roles"]
+    if len(cells) != len(roles):
+        raise AssertionError("layout roles and cells disagree in length")
+    if cells[0] != (None, None) or roles[0] != ROLE_UNRESTRAINED_ANCHOR:
+        raise AssertionError("the unrestrained anchor stack must be the first spatial state")
+    if len(set(cells)) != len(cells):
+        raise AssertionError("duplicate spatial states in the layout")
+    if plan["spatial_states"] > plan["cap_spatial"]:
+        raise AssertionError("layout exceeds the replica cap")
+
+
+def layout_rows(plan: dict, centers1, ks1, centers2, ks2) -> list:
+    """One physics row per spatial cell (the canonical fields only). An unrestrained axis gets
+    k = 0 exactly and a finite placeholder centre (the axis midpoint) so no reader ever meets
+    ``0 * nan``; roles stay in the companion plan (spec F05)."""
+    c1 = np.asarray(centers1, dtype=float); c2 = np.asarray(centers2, dtype=float) if centers2 is not None and len(centers2) else np.array([0.0])
+    mid1 = float(0.5 * (c1.min() + c1.max())) if c1.size else 0.0
+    mid2 = float(0.5 * (c2.min() + c2.max())) if c2.size else 0.0
+    rows = []
+    for i1, i2 in plan["cells"]:
+        rows.append({"center1": float(c1[i1]) if i1 is not None else mid1,
+                     "k1": float(ks1[i1]) if i1 is not None else 0.0,
+                     "center2": float(c2[i2]) if i2 is not None else mid2,
+                     "k2": float(ks2[i2]) if i2 is not None else 0.0})
+    return rows
+
+
+def layout_plan_record(plan: dict, rows: list, lambdas, *, region_inventory: Optional[dict] = None,
+                       region_of_centre=None) -> dict:
+    """The companion artifact (``layout_plan.json``): per-state roles, region coverage, mandatory
+    state ids and unresolved regions -- digested separately from the physics rows."""
+    lambdas = [float(l) for l in lambdas]
+    states = []
+    state_id = 0
+    for cell_index, (cell, role) in enumerate(zip(plan["cells"], plan["state_roles"])):
+        for lam in lambdas:
+            states.append({"state_id": state_id, "spatial_index": cell_index, "cell": [cell[0], cell[1]],
+                           "role": role, "gamd_lambda": lam, "mandatory": role in (ROLE_UNRESTRAINED_ANCHOR, ROLE_REGION_REPRESENTATIVE),
+                           "center1": rows[cell_index]["center1"], "k1": rows[cell_index]["k1"],
+                           "center2": rows[cell_index]["center2"], "k2": rows[cell_index]["k2"]})
+            state_id += 1
+    coverage = None
+    if region_inventory is not None and region_of_centre is not None:
+        covered = {}
+        for cell, role in zip(plan["cells"], plan["state_roles"]):
+            if cell[0] is not None and role in (ROLE_REGION_REPRESENTATIVE, ROLE_AXIS, ROLE_JOINT):
+                covered.setdefault(region_of_centre[cell[0]], []).append(role)
+        coverage = {r["region_id"]: {"covered_by": covered.get(r["region_id"], []),
+                                     "unresolved": r["region_id"] not in covered}
+                    for r in region_inventory.get("regions", [])}
+    return {"version": plan["version"], "status": plan["status"], "kind": plan["kind"], "n_rungs": len(lambdas),
+            "spatial_states": plan["spatial_states"], "n_states": len(states), "cap_spatial": plan["cap_spatial"],
+            "mandatory_spatial": plan["mandatory_spatial"], "mandatory_state_ids": [s["state_id"] for s in states if s["mandatory"]],
+            "states": states, "region_coverage": coverage, "region_inventory": region_inventory,
+            "unresolved": (region_inventory or {}).get("unresolved", []) if region_inventory else []}
+
+
 def _weighted_quantile(values: np.ndarray, weights: np.ndarray, q: float) -> float:
     order = np.argsort(values)
     v, w = values[order], weights[order]

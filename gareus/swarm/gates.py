@@ -246,6 +246,24 @@ def pair_gate(selection: dict, *, fallback: str) -> dict:
             "warnings": [note] if note else []}
 
 
+def coverage_design_gate(layout_plan: dict) -> dict:
+    """The layout must be PROPOSED (mandatory stacks fit the cap) and leave no discovered
+    region unresolved (spec F05). A rare region is a reason to fail, never to delete."""
+    status = str((layout_plan or {}).get("status", ""))
+    unresolved = list((layout_plan or {}).get("unresolved") or [])
+    coverage = (layout_plan or {}).get("region_coverage") or {}
+    uncovered = sorted(rid for rid, info in coverage.items() if info.get("unresolved"))
+    reasons = []
+    if status != "PROPOSED":
+        reasons.append(f"layout status {status or 'absent'}")
+    if unresolved:
+        reasons.append("regions without an eligible seed: " + "; ".join(unresolved))
+    if uncovered:
+        reasons.append("regions without a design representative: " + ", ".join(uncovered))
+    return {"ok": not reasons, "status": status, "reasons": reasons, "warnings": [],
+            "mandatory_state_ids": list((layout_plan or {}).get("mandatory_state_ids") or [])}
+
+
 def evaluate_gates(
     plan_rows: list[dict],
     done_ids: set[int],
@@ -261,6 +279,7 @@ def evaluate_gates(
     max_graft_fallback_fraction: float = 0.10,
     selection: dict | None = None,
     pair_fallback: str = "cv1_only",
+    layout_plan: dict | None = None,
 ) -> dict:
     """Evaluate all gates; return aggregate status and reasons.
 
@@ -292,6 +311,8 @@ def evaluate_gates(
     }
     if selection is not None:
         gates["pair"] = pair_gate(selection, fallback=pair_fallback)
+    if layout_plan is not None:
+        gates["coverage_design"] = coverage_design_gate(layout_plan)
 
     # Aggregate reasons from all failed gates
     all_reasons = []

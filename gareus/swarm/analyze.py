@@ -39,6 +39,7 @@ from gareus.cv_selection.models import (
     from_candidate_set,
 )
 from gareus.cv_selection.select_pair import SelectionConfig, SwarmDataset, select_cv_pair
+from gareus.cv_selection.coverage import build_region_inventory, region_centres
 from gareus.io import write_json
 from gareus.pep_gamd import PepGamdEnvelope
 from gareus.swarm.driver import _load_plan, round_dir, swarm_root
@@ -53,10 +54,14 @@ from gareus.swarm.ladder_design import (
     cv1_centers_from_samples,
     cv1_curvature_kcal,
     cv1_force_constants_from_curvature,
+    LAYOUT_STATUS_PROPOSED,
+    autotune_cv1_upper_bound,
     cv2_force_constants_per_gap,
     deltav_max_kj,
-    design_2d_layout,
+    design_exploration_layout,
     design_lambda_ladder,
+    layout_plan_record,
+    layout_rows,
     fsf_floor_per_rung,
     n_resolvable_windows,
     reweighted_cv2_centers,
@@ -411,20 +416,14 @@ def _selection_config(args, k1_max_kcal: float, temperature_k: float) -> Selecti
     )
 
 
-def _two_d_rows(layout: dict, centers1, ks1, centers2, ks2) -> List[dict]:
-    """One (center1, k1, center2, k2) row per spatial cell; an unrestrained axis has k = 0."""
-    mid1 = float(np.mean(centers1))
-    rows = []
-    for i1, i2 in layout["cells"]:
-        rows.append({
-            "center1": float(centers1[i1]) if i1 is not None else mid1,
-            "k1": float(ks1[i1]) if i1 is not None else 0.0,
-            "center2": float(centers2[i2]) if i2 is not None else None,
-            "k2": float(ks2[i2]) if i2 is not None else 0.0,
-        })
-    return rows
-
-
+def _pool_member_ids(ok_traces: Dict[int, Dict[str, np.ndarray]], discard: int) -> np.ndarray:
+    """Member id per pooled ``cv1`` row, aligned with ``_pool(ok_traces, "cv1", discard)``: same
+    member order, same discard, same finiteness filter (``_pool`` drops non-finite rows)."""
+    parts = []
+    for m, tr in ok_traces.items():
+        v = np.asarray(tr["cv1"][int(discard):], dtype=float)
+        parts.append(np.full(int(np.isfinite(v).sum()), int(m), dtype=int))
+    return np.concatenate(parts) if parts else np.zeros(0, dtype=int)
 def analyze_swarm_stage(out_dir, args) -> dict:
     out_dir = Path(out_dir)
     round_index = int(getattr(args, "swarm_round", 0) or 0)
@@ -510,11 +509,47 @@ def analyze_swarm_stage(out_dir, args) -> dict:
         seed_pool_cv1 = np.asarray(
             [float(fr["cv1"]) for fr in frame_candidates if int(fr["frame"]) >= discard], dtype=float
         )
+        # Region inventory (spec F05; review I02): the supported CV1 intervals of the discovery
+        # sample, each with a representative that has an exported seed structure. Centres are
+        # placed inside supported intervals only; a gap between regions is bridged by the
+        # unrestrained anchor stack, never by lowering the upper bound until a seedless centre
+        # disappears. The old tuner is kept as a diagnostic that can no longer place centres.
+        member_of_row = _pool_member_ids(ok_traces, discard)
+        n_failed_members = sum(1 for d in done_summaries.values() if str(d.get("status", "ok")) != "ok")
+        inventory = build_region_inventory(cv1_all, groups=member_of_row, seed_values=seed_pool_cv1,
+                                           temperature_k=temperature_k, k_max_kcal=k_max,
+                                           n_failed_seed_preparations=n_failed_members)
+        region_of_centre: List[str] = []
+        region_rep_indices: List[int] = []
         try:
-            centers = cv1_centers_from_samples(
-                cv1_all, n_windows=n_win, seed_cv1=seed_pool_cv1, temperature_k=temperature_k,
-                k_max_kcal=k_max, max_seed_gap_sigma=max_seed_gap_sigma, probe_out=probe_out,
-            )
+            design_c = region_centres(inventory, n_win, temperature_k=temperature_k, k_max_kcal=k_max,
+                                      overlap_sigma=overlap_sigma)
+            if not design_c["centres"]:
+                raise ValueError("no supported CV1 region found in the swarm frames")
+            centers = np.asarray(design_c["centres"], dtype=float)
+            region_of_centre = list(design_c["region_of_centre"])
+            representatives = {r.region_id: r.representative for r in inventory.cv1_regions}
+            region_rep_indices = [i for i, c in enumerate(centers)
+                                  if abs(float(c) - representatives[region_of_centre[i]]) < 1e-12]
+            n_win = int(centers.size)
+            tol = float(max_seed_gap_sigma) * float(window_sigma_cv(k_max, temperature_k))
+            nearest_gap = [float(np.min(np.abs(seed_pool_cv1 - c))) if seed_pool_cv1.size else float("nan") for c in centers]
+            probe_out.update({"autotuned": False, "hi": float(centers.max()), "hi_initial": float(cv1_all.max()),
+                              "lo": float(centers.min()), "tol": tol, "nearest_seed_gap": nearest_gap,
+                              "n_probes": int(centers.size), "design": "region_inventory_v1",
+                              "n_regions": len(inventory.cv1_regions), "n_requested_windows": int(design_c["n_requested"])})
+            try:
+                legacy = autotune_cv1_upper_bound(cv1_all, seed_pool_cv1, n_windows=int(design_c["n_requested"]),
+                                                  temperature_k=temperature_k, k_max_kcal=k_max,
+                                                  max_seed_gap_sigma=max_seed_gap_sigma)
+                probe_out["legacy_autotune"] = {"hi": float(legacy["hi"]), "hi_initial": float(legacy["hi_initial"]),
+                                                "autotuned": bool(legacy["autotuned"])}
+                if bool(legacy["autotuned"]) and float(legacy["hi"]) < float(centers.max()) - 1e-12:
+                    warnings.append(f"cv1 design: the legacy endpoint tuner would have lowered the CV1 upper bound to "
+                                    f"{float(legacy['hi']):.4f} (retained support reaches {float(centers.max()):.4f}); "
+                                    "the region inventory keeps the upper region (review I02)")
+            except Exception as exc:  # diagnostic only
+                probe_out["legacy_autotune"] = {"error": str(exc)}
         except ValueError as exc:
             # The autotuned probe found no CV1 upper bound anywhere with seed support --
             # this is a hard ladder-design failure, not a soft gate the swarm could pass by
@@ -558,6 +593,9 @@ def analyze_swarm_stage(out_dir, args) -> dict:
             "library_q99": library_q99, "cv1_upper_bound_probe": cv1_upper_bound_probe,
         })
         write_json(an / "ladder_design.json", ladder_design)
+        report["region_inventory"] = inventory.as_record()
+        report["region_inventory"]["region_of_centre"] = list(region_of_centre)
+        write_json(an / "region_inventory.json", report["region_inventory"])
 
         # --- automatic CV2 selection against the configured contact anchor ------------
         selection: Optional[Dict[str, Any]] = None
@@ -567,14 +605,28 @@ def analyze_swarm_stage(out_dir, args) -> dict:
             contact_pairs = _swarm_contact_pairs(out_dir, args, warnings)
             system_xml = swarm_root(out_dir) / "system" / "base_system.xml"
             topology_pdb = swarm_root(out_dir) / "system" / "topology.pdb"
-            physical_sha = file_digest(system_xml) if system_xml.exists() else digest(b"swarm-system-unavailable")
-            topology_sha = file_digest(topology_pdb) if topology_pdb.exists() else digest(b"swarm-topology-unavailable")
-            dataset, aux = _build_swarm_dataset(rows, ok_traces, ok_features, discard, args, contact_pairs, topology_sha)
+            # Real bindings or none: a placeholder digest never makes an artifact deployable
+            # (spec F02). Missing swarm system/topology files mean a discovery-only pair.
+            physical_sha = file_digest(system_xml) if system_xml.exists() else None
+            topology_sha = file_digest(topology_pdb) if topology_pdb.exists() else None
+            deployment = {
+                "topology_sha256": topology_sha, "physical_system_sha256": physical_sha,
+                "contact_pair_list_sha256": contact_pair_list_digest(contact_pairs) if contact_pairs else None,
+            }
+            deployment["deployable"] = all(deployment[k] for k in ("topology_sha256", "physical_system_sha256",
+                                                                   "contact_pair_list_sha256"))
+            if not deployment["deployable"]:
+                warnings.append("cv selection: the pair model will NOT be deployable (missing swarm system, "
+                                "topology or contact pair list); production refuses a discovery-only artifact")
+            dataset, aux = _build_swarm_dataset(rows, ok_traces, ok_features, discard, args, contact_pairs,
+                                                topology_sha or digest(b"swarm-topology-unavailable"))
             sel = select_cv_pair(
                 dataset, _selection_config(args, k_max, temperature_k),
-                physical_system_sha256=physical_sha, training_rows_sha256=aux["rows_sha256"],
+                physical_system_sha256=physical_sha or digest(b"swarm-system-unavailable"),
+                training_rows_sha256=aux["rows_sha256"],
                 library_versions=_library_versions(),
                 genpept_preset=_seed_library_preset(args, warnings),
+                deployment=deployment,
             )
             if not sel.report.get("native_blind_library", False):
                 warnings.append(f"cv selection: seed library preset {sel.report.get('genpept_preset')!r} is not "
@@ -587,6 +639,7 @@ def analyze_swarm_stage(out_dir, args) -> dict:
                 "n_frames": int(dataset.features.shape[0]), "n_dropped_nonfinite": aux["n_dropped_nonfinite"],
                 "physical_system_bound": bool(system_xml.exists()),
                 "anchor_pair_list_bound": contact_pairs is not None,
+                "deployable": bool(deployment["deployable"]),
             }
             (an / "cv_feature_schema.json").write_bytes(dataset.feature_schema.to_json_bytes())
             if sel.candidate_set is not None:
@@ -606,8 +659,11 @@ def analyze_swarm_stage(out_dir, args) -> dict:
                 k2_min = float(getattr(args, "cv2_k_min", 0.0) or 0.0) or 1e-3
                 ks2 = cv2_force_constants_per_gap(cv2_design["centers"], temperature_k, overlap_sigma=overlap_sigma,
                                                   k_min_kcal=k2_min, k_max_kcal=float(getattr(args, "cv2_k_max", 1000.0)))
-                layout = design_2d_layout(int(n_win), n2, n_rungs=len(ladder["lambdas"]),
-                                          max_replicas=int(getattr(args, "max_replicas", 0) or 0))
+                layout = design_exploration_layout(int(n_win), n2, n_rungs=len(ladder["lambdas"]),
+                                                   max_replicas=int(getattr(args, "max_replicas", 0) or 0),
+                                                   region_centre_indices=region_rep_indices)
+                if layout["status"] != LAYOUT_STATUS_PROPOSED:
+                    warnings.append(f"layout: {layout['status']}: {layout.get('reason')}")
                 # The CV2 umbrella also restrains the anchor through the chain-rule term;
                 # the CV1 windows are narrower than their own k says by this much.
                 coupling = coupling_curvature_kcal(fit, j, max(ks2))
@@ -617,7 +673,7 @@ def analyze_swarm_stage(out_dir, args) -> dict:
                                     f"{100 * max(shrink):.0f}% (coupling curvature {coupling:.1f} kcal/mol/CV^2 "
                                     f"at k2={max(ks2):.2f}); the CV1 overlap design assumed k1 alone")
                 selection.update({
-                    "layout": {k: v for k, v in layout.items() if k != "cells"},
+                    "layout": {k: v for k, v in layout.items() if k not in ("cells", "state_roles")},
                     "cv2_centers": [float(c) for c in cv2_design["centers"]],
                     "cv2_k_kcal": [float(k) for k in ks2],
                     "cv2_per_rung_quantiles": {str(l): list(q) for l, q in cv2_design["per_rung_quantiles"].items()},
@@ -625,7 +681,11 @@ def analyze_swarm_stage(out_dir, args) -> dict:
                     "coupling_curvature_kcal_at_max_k2": float(coupling),
                     "cv1_width_shrink_max": float(max(shrink)),
                 })
-                pair_layout = (layout, cv2_design["centers"], ks2)
+                rows_2d = layout_rows(layout, centers, ks, cv2_design["centers"], ks2) if layout["cells"] else []
+                plan_record = layout_plan_record(layout, rows_2d, ladder["lambdas"],
+                                                 region_inventory=report["region_inventory"],
+                                                 region_of_centre=region_of_centre)
+                pair_layout = (layout, cv2_design["centers"], ks2, rows_2d, plan_record)
                 pair_paths = {"pair_model": an / "cv_pair_model.json",
                               "candidate_set": an / "cv_candidate_set.json",
                               "feature_schema": an / "cv_feature_schema.json"}
@@ -642,6 +702,7 @@ def analyze_swarm_stage(out_dir, args) -> dict:
             max_graft_fallback_fraction=float(getattr(args, "swarm_max_graft_fallback_fraction", 0.10)),
             selection=selection,
             pair_fallback=str(getattr(args, "cv_selection_fallback", "cv1_only") or "cv1_only"),
+            layout_plan=(pair_layout[4] if pair_layout is not None else None),
         )
         write_json(an / "swarm_gate.json", gate)
         # Also fold gate warnings (e.g. ladder_ess_gate's advisory ESS/extrapolation
@@ -663,11 +724,14 @@ def analyze_swarm_stage(out_dir, args) -> dict:
         })
         if gate["status"] == "pass":
             if pair_layout is not None:
-                layout, centers2, ks2 = pair_layout
-                windows_csv = write_ladder_windows_2d_csv(
-                    an / "windows_lambda_ladder.csv", _two_d_rows(layout, centers, ks, centers2, ks2),
-                    ladder["lambdas"])
-                report["n_states"] = int(layout["spatial_states"]) * len(ladder["lambdas"])
+                layout, centers2, ks2, rows_2d, plan_record = pair_layout
+                windows_csv = write_ladder_windows_2d_csv(an / "windows_lambda_ladder.csv", rows_2d, ladder["lambdas"])
+                # Companion artifact: state roles, region coverage, mandatory ids -- separately
+                # digested, never inside the physics rows (spec F05).
+                write_json(an / "layout_plan.json", plan_record)
+                report["n_states"] = int(plan_record["n_states"])
+                report["layout_plan"] = {k: plan_record[k] for k in ("status", "kind", "spatial_states", "n_states",
+                                                                     "mandatory_state_ids", "unresolved")}
                 _write_sidecar(an, seed_bank_dir, windows_csv,
                                cvs={"cv1": "contacts", "cv2": "residual-torsion-pc"}, pair_paths=pair_paths)
             else:

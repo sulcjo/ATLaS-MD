@@ -245,6 +245,12 @@ def _add_cv_selection_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--swarm-n-windows-cv2", type=int, default=4,
                    help="Number of CV2 window centres the swarm stage proposes for "
                         "the frozen residual-torsion-pc pair.")
+    p.add_argument("--legacy-model-policy", choices=["refuse", "allow-v1"], default="refuse",
+                   dest="legacy_model_policy",
+                   help="v1 residual pair-model artifacts (pre thermodynamic repair F02) describe a coordinate "
+                        "whose certificate was computed unclipped while the deployed force clipped; 'refuse' "
+                        "(default) rejects them at production, 'allow-v1' deploys the OLD force definition knowingly. "
+                        "Re-running the swarm analysis produces v2 artifacts instead.")
 
 
 def _add_window_args(p: argparse.ArgumentParser) -> None:
