@@ -946,6 +946,95 @@ def _format_seed_component_dict(d: dict) -> dict:
             out[k] = v
     return out
 
+# ---------------------------------------------------------------------------
+# Solvent clash removal for grafts (chignolin_8 swarm, 2026-09-21)
+# ---------------------------------------------------------------------------
+# A graft overwrites the peptide with a compact seed aligned onto the extended-chain frame
+# and leaves the water box untouched, so waters that occupied the space the compact peptide
+# now fills overlap it. Overlaps of ~0.15 A still minimise; a water oxygen 0.098 A from a
+# heavy atom gave E = 3.6e18 kJ/mol, a minimiser that could not move, and MD NaN at step 50
+# for six of six velocity seeds. Push the offending molecules out first; refuse a graft the
+# minimiser could not repair.
+
+_SOLVENT_RESIDUE_NAMES = frozenset({"HOH", "WAT", "TIP3", "SOL", "NA", "CL", "K", "MG", "CA", "ZN",
+                                    "Na+", "Cl-", "K+", "NA+", "CL-"})
+_CLASH_R_HEAVY_NM = 0.22          # heavy-heavy clearance after displacement
+_CLASH_R_HYDROGEN_NM = 0.16       # any pair with a hydrogen
+_CLASH_MARGIN_NM = 0.03
+_GRAFT_MAX_FORCE_KJ_MOL_NM = 1.0e5   # healthy post-minimisation grafts sit at ~4e3
+
+
+def _min_image_nm(d: np.ndarray, box: np.ndarray) -> np.ndarray:
+    """Minimum-image displacement for OpenMM's reduced triclinic box (rows a, b, c)."""
+    d = np.array(d, dtype=float, copy=True)
+    a, b, c = box[0], box[1], box[2]
+    d -= c * np.round(d[..., 2:3] / c[2])
+    d -= b * np.round(d[..., 1:2] / b[1])
+    d -= a * np.round(d[..., 0:1] / a[0])
+    return d
+
+
+def solvent_groups_from_topology(topology) -> tuple[list, np.ndarray]:
+    """Atom-index arrays of every solvent/ion residue (moved rigidly) and a heavy-atom mask."""
+    groups = []
+    heavy = np.ones(topology.getNumAtoms(), dtype=bool)
+    for atom in topology.atoms():
+        el = atom.element
+        if (el is not None and el.symbol == "H") or (el is None and atom.name.startswith("H")):
+            heavy[atom.index] = False
+    for res in topology.residues():
+        if res.name in _SOLVENT_RESIDUE_NAMES:
+            groups.append(np.fromiter((a.index for a in res.atoms()), dtype=int))
+    return groups, heavy
+
+
+def displace_clashing_solvent_nm(positions_nm: np.ndarray, box_nm: np.ndarray, peptide_indices,
+                                 solvent_groups, heavy_mask, *, r_heavy_nm: float = _CLASH_R_HEAVY_NM,
+                                 r_hydrogen_nm: float = _CLASH_R_HYDROGEN_NM, max_rounds: int = 25,
+                                 seed: int = 0) -> tuple[np.ndarray, dict]:
+    """Push every solvent molecule that overlaps the placed peptide out along the min-image
+    vector from its nearest peptide atom until the pair clearance is met; rigid per molecule,
+    peptide never moves, untouched molecules are returned bitwise unchanged.
+
+    Only the peptide-solvent clearance is enforced: a pushed water landing 0.2 nm from a
+    neighbour is a ~1e2 kJ/mol overlap the minimiser resolves routinely, while the 0.01 nm
+    peptide-water overlaps this exists for are 1e18 kJ/mol walls it cannot."""
+    pos = np.array(positions_nm, dtype=float, copy=True)
+    box = np.asarray(box_nm, dtype=float)
+    pep = np.asarray(peptide_indices, dtype=int)
+    heavy = np.asarray(heavy_mask, dtype=bool)
+    rng = np.random.default_rng(int(seed))
+    pep_pos = pos[pep]
+    pep_heavy = heavy[pep]
+    moved_groups: set = set()
+    n_rounds = 0
+    for _ in range(int(max_rounds)):
+        n_rounds += 1
+        moved_this_round = 0
+        for gi, group in enumerate(solvent_groups):
+            g = np.asarray(group, dtype=int)
+            d = _min_image_nm(pos[g][:, None, :] - pep_pos[None, :, :], box)
+            r = np.linalg.norm(d, axis=-1)
+            thresh = np.where(heavy[g][:, None] & pep_heavy[None, :], r_heavy_nm, r_hydrogen_nm)
+            viol = r < thresh
+            if not viol.any():
+                continue
+            k, j = np.unravel_index(np.argmin(r - thresh), r.shape)
+            direction = d[k, j]
+            norm = float(np.linalg.norm(direction))
+            if norm < 1e-6:
+                direction = rng.normal(size=3)
+                norm = float(np.linalg.norm(direction))
+            direction = direction / norm
+            needed = float(thresh[k, j] - r[k, j]) + _CLASH_MARGIN_NM
+            pos[g] += direction * needed
+            moved_groups.add(gi)
+            moved_this_round += 1
+        if moved_this_round == 0:
+            break
+    return pos, {"n_groups_moved": len(moved_groups), "n_rounds": n_rounds}
+
+
 def graft_conformer_into_context(
     sim,
     topology,
@@ -1029,12 +1118,29 @@ def graft_conformer_into_context(
             else:
                 ca_abs_arr = np.array([], dtype=int)
                 ca_aligned_nm = None
+        # The compact seed now occupies space the water box still fills: push overlapping
+        # solvent out before asking the minimiser to cope with 1/r^12 at r -> 0.
+        box_nm = np.asarray(state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.nanometer), dtype=float)
+        solvent_groups, heavy_mask = solvent_groups_from_topology(topology)
+        pep_indices = np.arange(first_pep_atom_index, first_pep_atom_index + n_pep)
+        new_full_pos, clash_stats = displace_clashing_solvent_nm(
+            new_full_pos, box_nm, pep_indices, solvent_groups, heavy_mask, seed=seed)
         sim.context.setPositions(new_full_pos * unit.nanometer)
         _minimize_energy(sim, maxIterations=minimize_iters)
-        min_state = sim.context.getState(getPositions=True, enforcePeriodicBox=True)
+        min_state = sim.context.getState(getPositions=True, getEnergy=True, getForces=True,
+                                         enforcePeriodicBox=True)
         min_pos_nm = min_state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
         if np.isnan(min_pos_nm).any():
             return {"fallback": True, "fallback_reason": "minimization_nan"}
+        e_min = float(min_state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole))
+        f_max = float(np.abs(min_state.getForces(asNumpy=True).value_in_unit(
+            unit.kilojoule_per_mole / unit.nanometer)).max())
+        if not np.isfinite(e_min) or f_max > _GRAFT_MAX_FORCE_KJ_MOL_NM:
+            # A graft the minimiser could not repair is a failed graft, never a "successful"
+            # one that NaNs 50 steps into MD.
+            return {"fallback": True, "fallback_reason": "minimization_blowup",
+                    "post_minimization_energy_kj_mol": e_min, "post_minimization_max_force_kj_mol_nm": f_max,
+                    "n_solvent_groups_displaced": int(clash_stats["n_groups_moved"])}
         sim.context.setVelocitiesToTemperature(temperature_k * unit.kelvin, seed)
         cv_after_nm = cv_distance_from_positions_nm(min_pos_nm, cv_atom1, cv_atom2)
         # Cα RMSD: Kabsch-aligned conformer vs post-minimization peptide — measures
@@ -1056,6 +1162,9 @@ def graft_conformer_into_context(
             "primary_cv_units": str(conformer.get("primary_cv_units", "")),
             "secondary_cv_before": float(conformer.get("secondary_cv_value", float("nan"))),
             "ca_rmsd_A": ca_rmsd_A,
+            "n_solvent_groups_displaced": int(clash_stats["n_groups_moved"]),
+            "post_minimization_energy_kj_mol": e_min,
+            "post_minimization_max_force_kj_mol_nm": f_max,
         }
     except Exception as e:
         return {"fallback": True, "fallback_reason": f"exception:{e}"}

@@ -260,6 +260,11 @@ def test_auto_cv2_writes_a_pair_model_and_a_two_dimensional_ladder(synthetic_swa
         assert pathlib.Path(side[key]).exists()
     assert report["status"] == "pass" and report["gate"]["gates"]["pair"]["ok"] is True
     assert report["cv_selection"]["layout"]["kind"] in ("joint", "sparse")
+    # The on-disk report must carry the 2-D design too (it used to be written before the
+    # layout block; the launcher reads it on resume).
+    on_disk = json.loads((an / "cv_selection_report.json").read_text())
+    assert on_disk["layout"]["kind"] == report["cv_selection"]["layout"]["kind"]
+    assert on_disk["cv2_centers"] and on_disk["cv2_k_kcal"] and "cv1_width_shrink_max" in on_disk
 
 
 def test_narrow_anchor_fails_the_pair_gate_whatever_the_fallback(synthetic_swarm, swarm_args):

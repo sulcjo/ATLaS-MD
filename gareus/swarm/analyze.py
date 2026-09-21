@@ -596,7 +596,6 @@ def analyze_swarm_stage(out_dir, args) -> dict:
                 selection["pair_model_sha256"] = sel.pair_model.sha256
                 selection["selected_component_index"] = int(sel.pair_model.selected_component_index)
                 selection["certificate"] = dict(sel.pair_model.certificate)
-            write_json(an / "cv_selection_report.json", {**sel.report, **selection})
             if sel.status == "pair":
                 fit = from_candidate_set(sel.candidate_set)
                 j = int(sel.pair_model.selected_component_index)
@@ -630,6 +629,8 @@ def analyze_swarm_stage(out_dir, args) -> dict:
                 pair_paths = {"pair_model": an / "cv_pair_model.json",
                               "candidate_set": an / "cv_candidate_set.json",
                               "feature_schema": an / "cv_feature_schema.json"}
+            # Written after the layout block so the file carries the 2-D design too.
+            write_json(an / "cv_selection_report.json", {**sel.report, **selection})
             report["cv_selection"] = selection
 
         gate = evaluate_gates(
