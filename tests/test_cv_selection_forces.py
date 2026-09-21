@@ -6,6 +6,8 @@ contains NO 4.184, and these tests set ss_k in kJ.
 """
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 
@@ -15,7 +17,8 @@ from openmm import unit  # noqa: E402
 from gareus.cv import contact_normalization_denominator, residual_cv2_from_positions_nm  # noqa: E402
 from gareus.cv_selection.models import (PairModelRuntime, ResidualFit,  # noqa: E402
                                         contact_pair_list_digest)
-from gareus.production import _add_residual_torsion_cv_force  # noqa: E402
+from gareus.production import (_add_residual_torsion_cv_force,  # noqa: E402
+                               _ss_scalar_from_sub_cv_values)
 
 KJ_PER_KCAL = 4.184
 
@@ -57,7 +60,7 @@ def _runtime(phi, psi, contacts, d=8, degree=2, seed=1):
                             tuple(phi) + tuple(psi))
 
 
-def _energy_forces(pos, phi, psi, contacts, runtime, ss_k_kj, c2):
+def _energy_forces(pos, phi, psi, contacts, runtime, ss_k_kj, c2, *, return_subcvs=False):
     system = openmm.System()
     for _ in range(len(pos)):
         system.addParticle(12.0)
@@ -71,6 +74,9 @@ def _energy_forces(pos, phi, psi, contacts, runtime, ss_k_kj, c2):
     st = ctx.getState(getEnergy=True, getForces=True, groups={29})
     energy = st.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
     forces = np.asarray(st.getForces(asNumpy=True).value_in_unit(unit.kilojoule_per_mole / unit.nanometer))
+    if return_subcvs:
+        subcvs = tuple(float(x) for x in system.getForce(0).getCollectiveVariableValues(ctx))
+        return energy, forces, meta, subcvs
     return energy, forces, meta
 
 
@@ -197,3 +203,41 @@ def test_the_scorer_reproduces_the_force_from_metadata_alone():
     _, _, meta = _energy_forces(pos, phi, psi, contacts, rt, 1.0, 0.0)
     scored = secondary_structure_score_from_positions_nm(pos, meta)
     assert np.isclose(scored, residual_cv2_from_positions_nm(pos, rt, phi, psi, contacts))
+
+
+@pytest.mark.parametrize("degree", [1, 2])
+def test_fast_subcv_reconstruction_matches_force_and_numpy_oracles(degree):
+    """Production sampling/exchange must use the exact CV that OpenMM biases."""
+    pos, phi, psi, contacts = _peptide_like(seed=21 + degree)
+    rt = _runtime(phi, psi, contacts, degree=degree)
+    k2_kcal, c2 = 37.0, -0.25
+    e_kj, _, meta, subcvs = _energy_forces(
+        pos, phi, psi, contacts, rt, k2_kcal * KJ_PER_KCAL, c2, return_subcvs=True)
+
+    resumed_meta = json.loads(json.dumps({key: value for key, value in meta.items()
+                                          if not key.startswith("_")}))
+    fast = _ss_scalar_from_sub_cv_values(subcvs, resumed_meta)
+    oracle = residual_cv2_from_positions_nm(pos, rt, phi, psi, contacts)
+    reconstructed_energy = 0.5 * k2_kcal * KJ_PER_KCAL * (fast - c2) ** 2
+
+    assert np.isclose(fast, oracle, rtol=1e-12, atol=1e-12)
+    assert np.isclose(reconstructed_energy, e_kj, rtol=1e-12, atol=1e-12)
+
+
+def test_residual_fast_path_refuses_legacy_or_incomplete_metadata():
+    """Fail closed instead of silently interpreting residual children as alpha/beta scores."""
+    pos, phi, psi, contacts = _peptide_like(seed=24)
+    rt = _runtime(phi, psi, contacts, degree=2)
+    _, _, meta, subcvs = _energy_forces(
+        pos, phi, psi, contacts, rt, 1.0, 0.0, return_subcvs=True)
+
+    legacy = dict(meta)
+    legacy.pop("scalar_reconstruction")
+    with pytest.raises(RuntimeError, match="lacks scalar_reconstruction"):
+        _ss_scalar_from_sub_cv_values(subcvs, legacy)
+
+    malformed = dict(meta)
+    malformed["scalar_reconstruction"] = dict(meta["scalar_reconstruction"])
+    malformed["scalar_reconstruction"]["sub_cv_names"] = ["sum_sin_phi", "res_contacts"]
+    with pytest.raises(RuntimeError, match="count"):
+        _ss_scalar_from_sub_cv_values(subcvs, malformed)
