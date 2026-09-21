@@ -59,3 +59,4 @@ compare_all_genpept_suite.sh
 # large raw census values (regenerable via scripts/)
 /GENPEPT_R7_CV_CENSUS_REPORT/genpept_rep3_cv_census_values.csv
 /GENPEPT_R7_CV_CENSUS_REPORT/TRPCAGE_CV_CENSUS_REPORT/trpcage_cv_census_values.csv
+!tests/fixtures/thermodynamic_repair/README.md
