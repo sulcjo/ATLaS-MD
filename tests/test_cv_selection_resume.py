@@ -3,6 +3,17 @@ import types
 import pytest
 
 
+def _residual_meta(sha=None):
+    meta = {
+        "enabled": True,
+        "mode": "residual-torsion-pc",
+        "scalar_reconstruction": {"schema_version": "residual_full_expression_v1"},
+    }
+    if sha is not None:
+        meta["pair_model_sha256"] = sha
+    return meta
+
+
 def _write_model(tmp_path, sha):
     p = tmp_path / "cv_pair_model.json"
     p.write_text(json.dumps({"schema": "atlas-cv-selection-pair-model-v1", "sha256": sha}))
@@ -11,18 +22,25 @@ def _write_model(tmp_path, sha):
 
 def test_resume_refuses_a_changed_pair_model():
     from gareus.production import reconcile_resume_secondary_cv_metadata
-    meta = {"enabled": True, "mode": "residual-torsion-pc", "pair_model_sha256": "a" * 64}
+    meta = _residual_meta("a" * 64)
     with pytest.raises(RuntimeError, match="frozen CV2 pair model changed"):
         reconcile_resume_secondary_cv_metadata(meta, [0.0, 1.0], current_pair_sha256="b" * 64)
 
 
 def test_resume_accepts_the_same_pair_model_and_records_a_first_digest():
     from gareus.production import reconcile_resume_secondary_cv_metadata
-    meta = {"enabled": True, "mode": "residual-torsion-pc", "pair_model_sha256": "a" * 64}
+    meta = _residual_meta("a" * 64)
     out = reconcile_resume_secondary_cv_metadata(meta, [0.0, 1.0], current_pair_sha256="a" * 64)
     assert out["pair_model_sha256"] == "a" * 64
-    first = reconcile_resume_secondary_cv_metadata({"enabled": True}, [0.0], current_pair_sha256="c" * 64)
+    first = reconcile_resume_secondary_cv_metadata(_residual_meta(), [0.0], current_pair_sha256="c" * 64)
     assert first["pair_model_sha256"] == "c" * 64
+
+
+def test_resume_refuses_a_legacy_residual_checkpoint_without_evaluator_identity():
+    from gareus.production import reconcile_resume_secondary_cv_metadata
+    meta = {"enabled": True, "mode": "residual-torsion-pc", "pair_model_sha256": "a" * 64}
+    with pytest.raises(RuntimeError, match="lacks the verified residual_full_expression_v1"):
+        reconcile_resume_secondary_cv_metadata(meta, [0.0, 1.0], current_pair_sha256="a" * 64)
 
 
 def test_resume_without_a_pair_digest_is_unchanged_for_legacy_runs():
