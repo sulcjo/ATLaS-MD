@@ -204,3 +204,29 @@ the old fast path mis-recorded as 0.6442), and umbrella energy on a restrained r
 writes `epoch0_complete.json`, charges the swarm to the pool and starts production on the new ladder.
 
 Not done in this pass: F06–F08 (M2), F09 (M3); see the plan for their gates.
+
+## Follow-up F04b — the sidecar's frozen GaMD envelope never reached production (2026-09-22)
+
+Found on the first job of the repaired chignolin_8 (2558439): `ladder_run_args.yaml` names
+`gamd.shared_gamd_setup_dir` (the swarm's frozen Pep-GaMD envelope, 16 integrator globals, no
+checkpoint) but `apply_epoch0_sidecar` applied only the CV block, and
+`run_adaptive_production_auto_loop` had already resolved `shared_gamd_setup_dir` to an empty
+`adaptive_production/global_shared_gamd_setup` before the epoch-0 hook ran. The first worker
+therefore ran its own 1,010,000-step shared GaMD setup and was about to run the per-state recon
+(~6.75 ns x 248 states ~ 1.7 us of a 6 us pool), re-deriving the envelope the frozen-envelope rule
+says is measured once; a second job would have loaded that recalibration. The job was cancelled at
+2h11m (seeding done, no production MD).
+
+Fix: `swarm.epoch0._apply_sidecar_gamd_envelope` points `shared_gamd_setup_dir` at the swarm
+envelope whenever nobody chose one (empty, or the driver's auto-resolved campaign default); an
+explicit user directory is kept and the decision recorded; a sidecar naming a directory without
+`shared_gamd_setup_globals.json` raises instead of recalibrating silently.
+`adaptive_production._seed_global_shared_gamd_from_envelope` copies the envelope into the
+campaign-global directory on the first job (never overwriting an existing one), because the hook
+does not run once a state registry exists and a worker that reuses a setup never exports one.
+Production's reuse path (`load_reusable_shared_gamd_setup`) accepts the 16-global payload, skips
+`run_shared_gamd_setup_article_a` and `apply_joint_envelope_gamd_calibration`, and applies the
+globals to every integrator; the epoch-0 recalibration is already a hard no-op under a lambda
+ladder. Tests: `tests/test_epoch0_sidecar_gamd_envelope.py` (6). Still unapplied from the sidecar,
+on purpose: the `starting_structures` pull knobs (its 150,000 pull steps would multiply seeding
+time ~15x); the run's own pull settings produced 0 bad / 155 warn starting structures.

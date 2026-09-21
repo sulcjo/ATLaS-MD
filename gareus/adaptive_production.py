@@ -6948,7 +6948,42 @@ def _epoch0_swarm_window_table(args, out_dir, adaptive_dir, runtime_pool, progre
     print(f"    Epoch 0 (unbiased swarm): window table {ladder}")
     if applied:
         print("    Epoch 0 sidecar applied: " + ", ".join(f"{k}={v}" for k, v in applied.items()))
+    if applied.get("shared_gamd_setup_dir"):
+        _seed_global_shared_gamd_from_envelope(args, applied["shared_gamd_setup_dir"])
     return ladder
+
+
+def _seed_global_shared_gamd_from_envelope(args, envelope_dir) -> Dict[str, Any]:
+    """Copy the swarm's frozen envelope into the campaign-global shared GaMD directory.
+
+    The epoch-0 hook runs only until a state registry exists; every later job resolves
+    ``shared_gamd_setup_dir`` to ``adaptive_production/global_shared_gamd_setup`` and a worker
+    that REUSES a setup never exports one. Without this copy the second job of the chain would
+    find that directory empty and recalibrate -- the exact failure the frozen-envelope rule
+    forbids. Copies only when the global directory has no globals file yet; an existing one is
+    the campaign's envelope and is left untouched (``ladder.load_pep_gamd_envelope`` resolves it)."""
+    from .production import _copy_shared_gamd_setup_files
+    global_dir = str(getattr(args, "_global_shared_gamd_setup_dir", "") or "").strip()
+    if not global_dir:
+        return {"status": "no_global_dir"}
+    global_dir_path = Path(global_dir)
+    envelope_path = Path(str(envelope_dir))
+    if global_dir_path.resolve() == envelope_path.resolve():
+        return {"status": "same_dir"}
+    target = global_dir_path / "shared_gamd_setup_globals.json"
+    if target.exists():
+        return {"status": "already_present", "path": str(target)}
+    global_dir_path.mkdir(parents=True, exist_ok=True)
+    copied = _copy_shared_gamd_setup_files(envelope_path, global_dir_path)
+    write_json(global_dir_path / "shared_gamd_envelope_source.json", {
+        "schema_version": "gareus_shared_gamd_envelope_source_v1",
+        "source_dir": str(envelope_path),
+        "copied_files": copied,
+        "note": ("Frozen Pep-GaMD envelope measured by the unbiased swarm (epoch 0); copied here so "
+                 "every later job/worker of this campaign reuses it instead of recalibrating."),
+    })
+    print(f"    Epoch 0 envelope: frozen swarm GaMD envelope seeded into {global_dir_path}")
+    return {"status": "copied", "copied_files": copied}
 
 
 def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, forcefield, topology, equil_state, progress=None) -> Dict[str, Any]:

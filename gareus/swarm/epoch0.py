@@ -256,12 +256,43 @@ def apply_epoch0_sidecar(args, out_dir) -> Dict[str, Any]:
     if "tica_switch_cv2" in side:
         args.tica_switch_cv2 = bool(side["tica_switch_cv2"])
         applied["tica_switch_cv2"] = bool(side["tica_switch_cv2"])
+    applied.update(_apply_sidecar_gamd_envelope(args, side, path))
     if str(getattr(args, "secondary_cv", "")) == "auto":
         raise RuntimeError(
             f"epoch 0 sidecar {path} does not resolve cv2 'auto' (cvs.cv2 missing); the swarm "
             "analysis must be re-run before production can build its restraints"
         )
     return applied
+
+
+def _apply_sidecar_gamd_envelope(args, side: Dict[str, Any], sidecar_path: Path) -> Dict[str, Any]:
+    """Point production at the swarm's frozen GaMD envelope (``gamd.shared_gamd_setup_dir``).
+
+    The envelope is measured once by epoch 0 and never re-derived; production reuses it through
+    ``load_reusable_shared_gamd_setup`` and skips its own shared setup and per-state recon. The
+    sidecar wins only where nobody chose a directory: an empty ``shared_gamd_setup_dir`` or one the
+    adaptive driver auto-resolved to its campaign default (``_global_shared_gamd_setup_dir``). An
+    explicit user directory is left alone and the decision is recorded in the returned mapping.
+    A sidecar that names a directory without a globals file is an error, not a silent
+    recalibration (job 2558439 recalibrated silently for exactly this class of gap)."""
+    gamd = side.get("gamd") or {}
+    shared_dir = gamd.get("shared_gamd_setup_dir")
+    if shared_dir in (None, ""):
+        return {}
+    shared_dir = str(shared_dir)
+    globals_path = Path(shared_dir) / "shared_gamd_setup_globals.json"
+    if not globals_path.exists():
+        raise RuntimeError(
+            f"epoch 0 sidecar {sidecar_path} names gamd.shared_gamd_setup_dir={shared_dir} but "
+            f"{globals_path.name} is missing there; the frozen envelope must exist before production "
+            "(re-run the swarm analysis)"
+        )
+    current = str(getattr(args, "shared_gamd_setup_dir", "") or "").strip()
+    auto_dir = str(getattr(args, "_global_shared_gamd_setup_dir", "") or "").strip()
+    if current and current != auto_dir and Path(current).resolve() != Path(shared_dir).resolve():
+        return {"shared_gamd_setup_dir_kept_explicit": current}
+    args.shared_gamd_setup_dir = shared_dir
+    return {"shared_gamd_setup_dir": shared_dir}
 
 
 def run_or_resume_epoch0(
