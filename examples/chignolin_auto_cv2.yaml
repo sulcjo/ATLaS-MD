@@ -165,9 +165,10 @@ windows:
   # Supplying windows_2d_csv again would skip epoch 0 and use that table instead.
   # 64 = 16 CV1 centres x 4 lambda rungs. MUST be >= the ladder CSV row count or states
   # get capped. Was 64, written before the CV change raised the window count from 2 to 16.
-  max_replicas: 128
-  # CV2 windows per CV1 centre when a pair is selected (16 x 4 x 4 rungs = 256 > 128:
-  # design_2d_layout falls back to a sparse axes+bridge layout under the cap).
+  # 16 CV1 centres x 4 CV2 windows x 4 rungs = 256 states: the cap admits the full joint
+  # grid. Below n1*n2*n_rungs design_2d_layout falls back to a sparse axes+bridge layout.
+  max_replicas: 256
+  # CV2 windows per CV1 centre when a pair is selected.
   swarm_n_windows_cv2: 4
 
 gamd:

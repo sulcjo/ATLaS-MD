@@ -119,7 +119,27 @@ simulation:
 
 cvs:
   cv1: contacts
-  cv2: none
+  # auto (2026-09-21): epoch 0 selects CV2 itself -- gareus/swarm/analyze.py fits residual
+  # torsion components r = phi - (B0 + B1 a) against the contact anchor a (weighted OLS with
+  # intercept, so weighted Cov(z2, a) = 0 exactly), keeps the SVD direction with the largest
+  # incremental cell information L1 - L12 that passes the held-out nonlinear R^2, the
+  # coupling-curvature and the half-split stability checks, freezes it as
+  # swarm/analysis/cv_pair_model.json (+ candidate set, feature schema) and writes a
+  # CV1 x CV2 x lambda ladder. The sidecar ladder_run_args.yaml then carries
+  # cv2: residual-torsion-pc + the three artifact paths; tica_switch_cv2 is forced off.
+  # NOTE: chignolin_genpept_rep5_t7 was generated with diversity_bank_preset 'chignolin'
+  # (fold-aware banks). The pair model records that preset; this run is not ab initio.
+  # Plan: docs/atlas-md/developer/plans/2026-09-20-auto-cv-pair.md
+  cv2: auto
+
+cv_selection:
+  residual_degree: 1            # 1: linear anchor regression; 2: adds a^2 with a clamped range
+  max_nonlinear_r2: 0.20        # held-out R^2 of z2 given z1 (mean + 2 SE) above this = dependent
+  max_coupling_fraction: 0.25   # CV2 umbrella curvature on CV1, as a fraction of cv1_k_max
+  k2_reference_kcal: 1.0        # reference k2 for the coupling check (z2 is standardised)
+  min_gain_nats: 0.02           # all gains below this: no component carries information
+  min_windows_cv1: 4            # anchor must resolve at least this many CV1 windows
+  fallback: cv1_only            # cv1_only: 1-D ladder when no component passes; refuse: gate fails
 
 contact_cv:
   # CV1 definition chosen 2026-09-08 from a scan over (min separation, r0) at fixed beta,
@@ -146,7 +166,13 @@ windows:
   # Supplying windows_2d_csv again would skip epoch 0 and use that table instead.
   # 64 = 16 CV1 centres x 4 lambda rungs. MUST be >= the ladder CSV row count or states
   # get capped. Was 64, written before the CV change raised the window count from 2 to 16.
-  max_replicas: 128
+  # 256 (2026-09-21, was 128): 16 CV1 centres x 4 CV2 windows x 4 rungs = 256 states, so the
+  # cap now admits the full joint grid; below n1*n2*n_rungs design_2d_layout falls back to the
+  # sparse layout (CV1 axis + CV2 axis + bridge + diagonal patches). MUST stay >= the ladder
+  # CSV row count or states get capped.
+  max_replicas: 256
+  # CV2 windows per CV1 centre when a pair is selected.
+  swarm_n_windows_cv2: 4
 
 gamd:
   gamd_boost_type: pep-gamd-lower-dual
