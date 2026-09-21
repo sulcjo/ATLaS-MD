@@ -321,6 +321,13 @@ def _method_settings(args: Any) -> dict[str, Any]:
     ]
     settings = {k: getattr(args, k, None) for k in keys if hasattr(args, k)}
     settings["cv_pair_model_sha256"] = pair_model_sha256(getattr(args, "secondary_cv_model", None))
+    # Numerical-kernel identity of this segment (spec F01/F04): which CV evaluator and
+    # which exchange-energy assembly produced its samples. A resume compares these.
+    from .kernel_identity import EXCHANGE_ENERGY_VERSION, RESIDUAL_EVALUATOR_VERSION
+    settings["exchange_energy_version"] = EXCHANGE_ENERGY_VERSION
+    settings["cv_evaluator_version"] = (RESIDUAL_EVALUATOR_VERSION
+                                        if str(getattr(args, "secondary_cv", "") or "") in ("residual-torsion-pc", "residual-pc")
+                                        else None)
     # The λ-ladder is frozen for the whole campaign (spec §3.1), so its
     # per-state lambdas and the envelope it was calibrated against both
     # belong in the immutable run manifest, next to gamd_boost_type above.

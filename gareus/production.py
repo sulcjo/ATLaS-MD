@@ -99,6 +99,8 @@ from .forces import (
     add_contact_umbrella_force,
 )
 from .provenance import initialize_run_manifest, update_run_manifest, finalize_run_manifest, pair_model_sha256
+from .kernel_identity import (EXCHANGE_ENERGY_VERSION, FAST_SCALAR_MODES, LEGACY_TWO_TERM_MODES,
+                              RESIDUAL_EVALUATOR_VERSION, kernel_identity_for_run)
 
 __all__ = [
     "add_secondary_structure_cv_force",
@@ -491,14 +493,13 @@ def _add_residual_torsion_cv_force(openmm, system, phi_torsions, psi_torsions, c
         contact_sum.addBond(int(pair[0]), int(pair[1]), [float(pair[2]) if len(pair) > 2 else 1.0])
     cv_force.addCollectiveVariable("res_contacts", contact_sum)
     norm = float(runtime.anchor_definition.get("norm", contact_normalization_denominator(list(contact_pairs), args)))
-    K0 = float(v @ (fit.coefficients[0] + fit.residual_mean) + fit.projection_mean[j - 1])
-    K1 = float(v @ fit.coefficients[1])
-    K2 = float(v @ fit.coefficients[2])
-    a_raw = f"((res_contacts/{norm:.17g}) - {fit.anchor_mean:.17g})/{fit.anchor_std:.17g}"
-    lo, hi = fit.anchor_clamp
-    a_expr = f"min({hi:.17g}, max({lo:.17g}, {a_raw}))" if fit.degree == 2 else a_raw
-    z2 = (f"(({' + '.join(names)}) - {K0:.17g} - {K1:.17g}*({a_expr}) - {K2:.17g}*({a_expr})^2)"
-          f"/{fit.projection_std[j - 1]:.17g}")
+    # The compiled coordinate writes the expression; the same object evaluates the fast-path
+    # scalar and the positions evaluator (spec F02: one frozen definition for every stage).
+    from .cv_selection.residual_runtime import compile_component
+    compiled = compile_component(fit, j, norm=norm)
+    K0, K1, K2 = compiled.k0, compiled.k1, compiled.k2
+    lo, hi = compiled.clamp_lo, compiled.clamp_hi
+    z2 = compiled.openmm_expression(names, "res_contacts")
     cv_force.addGlobalParameter("ss_k", 0.0)
     cv_force.addGlobalParameter("ss0", 0.0)
     cv_force.setEnergyFunction(f"0.5*ss_k*({z2}-ss0)^2")
@@ -520,6 +521,13 @@ def _add_residual_torsion_cv_force(openmm, system, phi_torsions, psi_torsions, c
         "psi_torsions": [list(map(int, t)) for t in psi_torsions],
         "contact_pairs": [[int(p[0]), int(p[1]), float(p[2]) if len(p) > 2 else 1.0] for p in contact_pairs],
         "linear_subcv_names": list(names),
+        # Ordered roles of every CustomCVForce sub-variable, in the order
+        # getCollectiveVariableValues() returns them. The fast-path scalar is
+        # reconstructed from these roles + residual_scalar, never from position
+        # assumptions (spec F01; review finding I01).
+        "subcv_roles": [{"name": n, "role": "torsion_sum"} for n in names] + [{"name": "res_contacts", "role": "contact_sum"}],
+        "residual_scalar": compiled.as_record(),
+        "cv_evaluator_version": RESIDUAL_EVALUATOR_VERSION,
         "force_group": int(force_group),
         # Stripped from the JSON manifest by _json_ready's underscore rule; the
         # scorer reloads from the recorded paths after a resume.
@@ -550,6 +558,35 @@ def _linear_torsion_state_for_mode(args, mode: str) -> tuple[Path, "TICAResult"]
     return path, result
 
 
+def verify_kernel_identity_on_resume(args, out_dir, secondary_cv_metadata: Optional[dict]) -> None:
+    """A changed kernel cannot continue the same scientific segment (spec F04 invariant 4).
+
+    Compares the run manifest's recorded ``exchange_energy_version`` / ``cv_evaluator_version``
+    with the current constants. A manifest without them predates kernel recording: for a
+    residual-CV run that is the affected/unknown kernel and the resume is refused; an
+    unrelated conventional/legacy-CV run keeps its own eligibility rules and continues.
+    """
+    manifest = read_json_file(Path(out_dir) / "run_manifest.json", {}) or {}
+    method = dict((manifest or {}).get("method_settings", {}) or {})
+    mode = secondary_cv_mode(secondary_cv_metadata or {}) if (secondary_cv_metadata or {}).get("enabled") else "none"
+    recorded_ex = method.get("exchange_energy_version")
+    recorded_ev = method.get("cv_evaluator_version")
+    if recorded_ex is not None and str(recorded_ex) != EXCHANGE_ENERGY_VERSION:
+        raise RuntimeError(
+            f"resume refused: this campaign's samples were exchanged with {recorded_ex!r}; the current code "
+            f"implements {EXCHANGE_ENERGY_VERSION!r}. A changed kernel starts a new segment from these "
+            "coordinates with fresh equilibration; it never appends to the old one (spec F04).")
+    if mode == "residual-torsion-pc":
+        if recorded_ev is None and "exchange_energy_version" not in method:
+            raise RuntimeError(
+                "resume refused: a residual-torsion-pc campaign whose run manifest records no kernel identity "
+                "was produced by the affected pre-F01 code; its samples are ineligible and cannot be extended.")
+        if recorded_ev is not None and str(recorded_ev) != RESIDUAL_EVALUATOR_VERSION:
+            raise RuntimeError(
+                f"resume refused: recorded cv_evaluator_version {recorded_ev!r} != current "
+                f"{RESIDUAL_EVALUATOR_VERSION!r} (spec F04).")
+
+
 def _restore_secondary_cv_args_from_metadata(args, secondary_cv_metadata: dict, out_dir: Optional[Path] = None) -> None:
     meta = dict(secondary_cv_metadata or {})
     if not meta.get("enabled"):
@@ -559,6 +596,28 @@ def _restore_secondary_cv_args_from_metadata(args, secondary_cv_metadata: dict, 
     args.secondary_cv_phi0_deg = float(meta.get("phi0_deg", getattr(args, "secondary_cv_phi0_deg", -60.0)))
     args.secondary_cv_psi0_deg = float(meta.get("psi0_deg", getattr(args, "secondary_cv_psi0_deg", -45.0)))
     args.secondary_cv_sigma_deg = float(meta.get("sigma_deg", getattr(args, "secondary_cv_sigma_deg", 35.0)))
+    if mode == "residual-torsion-pc":
+        version = str(meta.get("cv_evaluator_version") or "")
+        if version != RESIDUAL_EVALUATOR_VERSION:
+            raise RuntimeError(
+                "resume refused: this checkpoint's residual-torsion-pc segment was produced by an unverified "
+                f"CV evaluator (cv_evaluator_version={version or 'absent'!r}, current {RESIDUAL_EVALUATOR_VERSION!r}). "
+                "Its recorded coordinates and exchange energies are the affected kernel's and cannot be appended "
+                "to; start a new segment from these coordinates with fresh equilibration instead (spec F04)."
+            )
+        for meta_key, attr in (("pair_model_path", "secondary_cv_model"),
+                               ("candidate_set_path", "secondary_cv_candidate_set"),
+                               ("feature_schema_path", "secondary_cv_feature_schema")):
+            raw_path = str(meta.get(meta_key, "") or "")
+            if not raw_path:
+                raise RuntimeError(f"Resume metadata for residual-torsion-pc lacks {meta_key}")
+            path = Path(raw_path)
+            if not path.exists() and out_dir is not None and not path.is_absolute():
+                path = Path(out_dir) / path
+            if not path.exists():
+                raise RuntimeError(f"Resume metadata for residual-torsion-pc names a missing artifact: {raw_path}")
+            setattr(args, attr, str(path))
+        return
     if mode not in {"tica-linear", "torsion-pca"}:
         return
 
@@ -682,6 +741,58 @@ def primary_secondary_and_potential_from_state(
     return primary_value, ss, potential_kj
 
 
+def residual_scalar_from_sub_cvs(sub_cv_values, metadata: dict) -> float:
+    """z = (sum of torsion sub-CVs - K0 - K1*T(a) - K2*T(a)^2) / sigma_j, a = (contact/norm - mu_c)/sigma_c.
+
+    Every constant and the ordered sub-CV roles come from the force builder's own record
+    (``subcv_roles``, ``residual_scalar``), so this is the frozen force expression
+    evaluated on the values the force itself cached -- not a positional guess. Refuses
+    metadata written by the affected kernel (no roles/constants) instead of guessing.
+    """
+    roles = metadata.get("subcv_roles")
+    consts = metadata.get("residual_scalar")
+    if not roles or not consts:
+        raise ValueError(
+            "residual-torsion-pc metadata carries no subcv_roles/residual_scalar (cv_evaluator_version="
+            f"{metadata.get('cv_evaluator_version')!r}); the fast-path scalar cannot be reconstructed"
+        )
+    arr = np.asarray(sub_cv_values, dtype=np.float64)
+    if arr.ndim != 1 or arr.size != len(roles):
+        raise ValueError(f"residual-torsion-pc force returned {arr.size} sub-CVs, metadata declares {len(roles)} roles")
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"residual-torsion-pc sub-CVs are not finite: {arr.tolist()}")
+    from .cv_selection.residual_runtime import CompiledResidualComponent
+
+    # Feature weights are not needed for the sub-CV route (the force already summed them);
+    # a unit placeholder keeps the record valid.
+    compiled = CompiledResidualComponent.from_record(consts, [1.0])
+    named = {str(role["name"]): float(value) for value, role in zip(arr, roles)}
+    try:
+        return compiled.evaluate_subcvs(named, roles)
+    except (KeyError, ValueError) as exc:
+        raise ValueError(f"residual-torsion-pc sub-CV reconstruction failed: {exc}") from exc
+
+
+def fast_cv_path_supported(metadata: Optional[dict]) -> bool:
+    """True when the secondary CV's scalar can be reconstructed from its force sub-variables.
+
+    Activation used to depend only on whether the force exposed
+    getCollectiveVariableValues(); the residual force did, and its values were fed to the
+    legacy two-term average (review finding I01). Now the mode must be in the registry and,
+    for residual mode, the metadata must carry the current evaluator's roles and constants.
+    """
+    meta = dict(metadata or {})
+    if not meta.get("enabled"):
+        return True
+    mode = secondary_cv_mode(meta)
+    if mode not in FAST_SCALAR_MODES:
+        return False
+    if mode == "residual-torsion-pc":
+        return bool(meta.get("subcv_roles")) and bool(meta.get("residual_scalar")) \
+            and str(meta.get("cv_evaluator_version", "")) == RESIDUAL_EVALUATOR_VERSION
+    return True
+
+
 def _ss_scalar_from_sub_cv_values(sub_cv_values, metadata: dict) -> float:
     """Reconstruct the secondary-structure scalar CV from CustomCVForce sub-variable values.
 
@@ -690,6 +801,10 @@ def _ss_scalar_from_sub_cv_values(sub_cv_values, metadata: dict) -> float:
     recompute.  The force already evaluated these values on the GPU during the
     preceding step(); this function is pure Python arithmetic over scalars.
 
+    Explicit dispatch per mode; the sub-CV count is validated against what each mode's
+    force builder emits, non-finite inputs raise, and an unknown mode raises instead of
+    falling through to another mode's formula (spec F01 invariant 2).
+
     For rama-map: sub-CVs interleave phi/psi per region in
     definition order — [phi_0, psi_0, phi_1, psi_1, ...].
     For alpha-coil-beta: [alpha_phi, alpha_psi, beta_phi, beta_psi].
@@ -697,26 +812,78 @@ def _ss_scalar_from_sub_cv_values(sub_cv_values, metadata: dict) -> float:
     """
     mode = secondary_cv_mode(metadata)
     arr = np.asarray(sub_cv_values, dtype=np.float64)
+    if arr.ndim != 1 or not np.all(np.isfinite(arr)):
+        raise ValueError(f"secondary CV sub-variables for mode {mode!r} are not a finite vector: {arr.tolist()}")
+    if mode == "residual-torsion-pc":
+        return residual_scalar_from_sub_cvs(arr, metadata)
     if mode in {"tica-linear", "torsion-pca"}:
         offset = float(metadata.get("tica_offset", 0.0))
         if str(metadata.get("linear_subcv_mode", "")) == "grouped-weighted-sums":
             return float(np.sum(arr) + offset)
         weights = np.asarray(metadata.get("weights", []), dtype=np.float64)
+        if weights.shape != arr.shape:
+            raise ValueError(f"{mode}: {arr.size} sub-CVs but {weights.size} weights")
         return float(arr @ weights + offset)
     if mode == "alpha-coil-beta":
+        if arr.size != 4:
+            raise ValueError(f"alpha-coil-beta expects 4 sub-CVs [alpha_phi, alpha_psi, beta_phi, beta_psi], got {arr.size}")
         return float(0.5 * (arr[0] + arr[1]) - 0.5 * (arr[2] + arr[3]))
     if mode == "rama-map":
         regions = metadata.get("regions", [])
         if not regions:
             return 0.0
+        if arr.size != 2 * len(regions):
+            raise ValueError(f"rama-map expects 2 sub-CVs per region ({2 * len(regions)}), got {arr.size}")
         values = np.array([float(r["value"]) for r in regions], dtype=np.float64)
         phi_scores = arr[0::2]
         psi_scores = arr[1::2]
         scores = 0.5 * (phi_scores + psi_scores)
         denom = float(np.sum(scores)) + 1e-8
         return float(np.dot(values, scores) / denom)
-    # alpha, beta, custom: [ss_phi, ss_psi]
-    return float(0.5 * (arr[0] + arr[1]))
+    if mode in LEGACY_TWO_TERM_MODES:
+        if arr.size != 2:
+            raise ValueError(f"{mode} expects 2 sub-CVs [ss_phi, ss_psi], got {arr.size}")
+        return float(0.5 * (arr[0] + arr[1]))
+    raise ValueError(f"no fast-path scalar reconstruction is implemented for secondary CV mode {mode!r}")
+
+
+def observe_fast_path(ctx, primary_force, ss_force, args, secondary_cv_metadata) -> tuple:
+    """(primary CV, secondary CV) of one replica from its forces' cached sub-variables.
+
+    The one observation function both the sample writer and the exchange kernel call
+    (spec F01 acceptance: the same coordinate is recorded and exchanged on).
+    """
+    raw = float(primary_force.getCollectiveVariableValues(ctx)[0])
+    norm = float(ctx.getParameter("contact_norm")) if bool(getattr(args, "contact_normalize", True)) else 0.0
+    cv = raw / norm if norm > 0.0 else raw
+    if ss_force is None or not (secondary_cv_metadata or {}).get("enabled"):
+        return cv, float("nan")
+    return cv, _ss_scalar_from_sub_cv_values(ss_force.getCollectiveVariableValues(ctx), secondary_cv_metadata)
+
+
+def umbrella_bias_matrix_kcal(primary_values, ss_values, centers_a, k_kcal, ss_centers=None, ss_k_kcal=None):
+    """The two umbrella components of the [state, replica] bias matrix, in kcal/mol.
+
+    ``0.5 k (x - c)^2`` per axis; a state without a secondary centre, or a replica without
+    a finite secondary value, contributes zero on that axis (the previous sample-path
+    guard, now applied identically to the exchange path -- a NaN entry used to freeze
+    that replica's exchanges). Orientation is [state, replica]; the fixed-state export is
+    [sample, state] and converts by name, never by shape.
+    """
+    pv = np.asarray(primary_values, dtype=np.float64)
+    ca = np.asarray(centers_a, dtype=np.float64)
+    ka = np.asarray(k_kcal, dtype=np.float64)
+    dprimary = pv[np.newaxis, :] - ca[:, np.newaxis]
+    distance_kcal = 0.5 * ka[:, np.newaxis] * dprimary * dprimary
+    if ss_centers is None or ss_k_kcal is None:
+        return distance_kcal, np.zeros_like(distance_kcal)
+    sv = np.asarray(ss_values, dtype=np.float64)
+    sc = np.asarray(ss_centers, dtype=np.float64)
+    sk = np.asarray(ss_k_kcal, dtype=np.float64)
+    dss = sv[np.newaxis, :] - sc[:, np.newaxis]
+    ss_kcal = 0.5 * sk[:, np.newaxis] * dss * dss
+    ss_kcal = np.where(np.isfinite(dss), ss_kcal, 0.0)
+    return distance_kcal, ss_kcal
 
 
 def _first_present(*values):
@@ -1553,7 +1720,10 @@ def add_secondary_structure_cv_force(openmm, system, topology, args, force_group
                                "--secondary-cv-candidate-set and --secondary-cv-feature-schema")
         from .cv_selection.models import PairModelRuntime
 
-        runtime = PairModelRuntime.load(*paths)
+        # Deployment gate (spec F02): real bindings required; legacy v1 artifacts only by
+        # explicit policy, because their certificate described a different coordinate.
+        policy = str(getattr(args, "legacy_model_policy", "refuse") or "refuse")
+        runtime = PairModelRuntime.load(*paths, require_deployable=True, allow_legacy_v1=(policy == "allow-v1"))
         info = _add_residual_torsion_cv_force(
             openmm, system, phi_torsions, psi_torsions,
             list(primary_cv_def.get("contact_pairs", [])), runtime, args, force_group=force_group)
@@ -3747,6 +3917,12 @@ def drop_bad_us_windows_and_rebuild(
         print(f"WARNING: failed to rewrite sparse-safe explicit window metadata after auto-drop: {exc}")
 
     secondary_cv_metadata = dict(secondary_cv_metadata or {})
+    _mandatory_idx = set(int(i) for i in ((window_metadata or {}).get("mandatory_window_indices") or []))
+    _hit = sorted(int(i) for i in dropped if isinstance(i, (int, np.integer)) and int(i) in _mandatory_idx)
+    if _hit:
+        raise RuntimeError(
+            f"post-pull auto-drop would remove mandatory exploration windows {_hit}; a mandatory role blocks the "
+            "design instead of being dropped (spec F05)")
     secondary_cv_metadata["dropped_post_pull_bad_windows"] = dropped
     window_metadata = dict(window_metadata or {})
     window_metadata["dropped_post_pull_bad_windows"] = dropped
@@ -6102,6 +6278,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             # Resume must rebuild the same optional CV force, including linear
             # torsion state files, even if the user omits CV flags.
             _restore_secondary_cv_args_from_metadata(args, secondary_cv_metadata, out_dir=out_dir)
+            verify_kernel_identity_on_resume(args, out_dir, secondary_cv_metadata)
         window_metadata = dict(resume_def.get("window_metadata", {}))
         shared_gamd_globals_all = dict(resume_def.get("shared_gamd_globals_all", {}) or {})
         shared_gamd_globals_interesting = dict(resume_def.get("shared_gamd_globals_interesting", {}) or {})
@@ -6768,7 +6945,11 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     _use_fast_cv_path = (
         _fast_primary_force_idx >= 0
         and (not _ss_enabled_global or _fast_ss_force_idx >= 0)
+        and fast_cv_path_supported(secondary_cv_metadata)
     )
+    if _fast_primary_force_idx >= 0 and _ss_enabled_global and _fast_ss_force_idx >= 0 and not _use_fast_cv_path:
+        print(f"[production] secondary CV mode {secondary_cv_mode(secondary_cv_metadata)!r} has no verified "
+              "fast-path scalar; observing it from positions instead")
     # ────────────────────────────────────────────────────────────────────────────
 
     # ── tICA dihedral observation buffers (optional, gated by tica_obs_interval) ─
@@ -7009,7 +7190,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         getattr(args, "state_gamd_lambdas", None), n=nrep,
     )
     _cv2_type = (secondary_cv_metadata or {}).get("mode") if secondary_cv_centers is not None else None
-    WindowSnapshot(out_dir).snapshot(_seg_id, _win_snapshot_windows, cv1_type=primary_cv_mode(args), cv2_type=_cv2_type)
+    WindowSnapshot(out_dir).snapshot(_seg_id, _win_snapshot_windows, cv1_type=primary_cv_mode(args), cv2_type=_cv2_type,
+                                     kernel_identity=kernel_identity_for_run(args, secondary_cv_metadata))
     parquet_sample_writer = ParquetSampleWriter(
         out_dir / "samples" / _seg_id,
         flush_rows=int(getattr(args, "parquet_flush_rows", 5000) or 5000),
@@ -7203,15 +7385,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 r, sim = r_sim
                 if _use_fast_cv_path:
                     ctx = sim.context
-                    pf = _fast_primary_forces[r]
-                    raw = float(pf.getCollectiveVariableValues(ctx)[0])
-                    norm = float(ctx.getParameter("contact_norm")) if bool(getattr(args, "contact_normalize", True)) else 0.0
-                    cv = raw / norm if norm > 0.0 else raw
-                    sf = _fast_ss_forces[r]
-                    ss = (
-                        _ss_scalar_from_sub_cv_values(sf.getCollectiveVariableValues(ctx), secondary_cv_metadata)
-                        if sf is not None else float("nan")
-                    )
+                    cv, ss = observe_fast_path(ctx, _fast_primary_forces[r], _fast_ss_forces[r], args, secondary_cv_metadata)
                     if read_sample_potential:
                         state = ctx.getState(getEnergy=True, enforcePeriodicBox=True,
                                              groups=physical_energy_groups_for_args(args))
@@ -7230,22 +7404,13 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             for r, cv, ss, pe, v_pep, v_dih in _sim_pool.map(_fetch_state, enumerate(sims)):
                 primary_values[r], ss_values[r], potentials_kj[r] = cv, ss, pe
                 v_pep_kj[r], v_dih_kj[r] = v_pep, v_dih
-            primary_delta_matrix = primary_values[np.newaxis, :] - centers_a_arr[:, np.newaxis]
-            distance_bias_matrix_kcal = 0.5 * k_arr[:, np.newaxis] * primary_delta_matrix * primary_delta_matrix
-            if secondary_cv_centers is not None and secondary_cv_k_kcal_list is not None:
-                ss_centers_arr = ss_centers_arr_global
-                ss_k_arr = ss_k_kcal_arr_global
-                ss_delta_matrix = ss_values[np.newaxis, :] - ss_centers_arr[:, np.newaxis]
-                ss_bias_matrix_kcal = 0.5 * ss_k_arr[:, np.newaxis] * ss_delta_matrix * ss_delta_matrix
-                # Guard NaN: windows without a secondary center (ss_centers_arr init to NaN)
-                # or replicas with a missing secondary value produce NaN in the Metropolis term,
-                # silently freezing that replica's exchanges and corrupting the cached bias matrix.
-                # Zero those entries — their exchange criterion falls back to primary CV only.
-                ss_bias_matrix_kcal = np.where(np.isfinite(ss_delta_matrix), ss_bias_matrix_kcal, 0.0)
-            else:
-                ss_centers_arr = ss_centers_arr_global
-                ss_k_arr = ss_k_kcal_arr_global
-                ss_bias_matrix_kcal = np.zeros_like(distance_bias_matrix_kcal)
+            ss_centers_arr = ss_centers_arr_global
+            ss_k_arr = ss_k_kcal_arr_global
+            _has_ss_axis = secondary_cv_centers is not None and secondary_cv_k_kcal_list is not None
+            distance_bias_matrix_kcal, ss_bias_matrix_kcal = umbrella_bias_matrix_kcal(
+                primary_values, ss_values, centers_a_arr, k_arr,
+                ss_centers_arr if _has_ss_axis else None, ss_k_arr if _has_ss_axis else None,
+            )
             boost_bias_matrix_kj = (pep_gamd_boost_matrix_kj(v_pep_kj, v_dih_kj, state_lambdas, pep_env)
                                     if pep_env is not None else np.zeros((nrep, nrep)))
             bias_matrix_kcal, bias_matrix_kj = assemble_bias_matrices(
@@ -7597,15 +7762,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 r, sim = r_sim
                 if _use_fast_cv_path:
                     ctx = sim.context
-                    pf = _fast_primary_forces[r]
-                    raw = float(pf.getCollectiveVariableValues(ctx)[0])
-                    norm = float(ctx.getParameter("contact_norm")) if bool(getattr(args, "contact_normalize", True)) else 0.0
-                    cv = raw / norm if norm > 0.0 else raw
-                    sf = _fast_ss_forces[r]
-                    ss = (
-                        _ss_scalar_from_sub_cv_values(sf.getCollectiveVariableValues(ctx), secondary_cv_metadata)
-                        if sf is not None and _ss_enabled else float("nan")
-                    )
+                    cv, ss = observe_fast_path(ctx, _fast_primary_forces[r], _fast_ss_forces[r], args, secondary_cv_metadata)
                     v_pep, v_dih = _fetch_v_pep_v_dih(ctx, pep_env, unit)
                 else:
                     state = sim.context.getState(getPositions=True, enforcePeriodicBox=True)
@@ -7620,13 +7777,15 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 ss_values[r] = ss
                 v_pep_kj[r] = v_pep
                 v_dih_kj[r] = v_dih
-            dprimary = primary_values[np.newaxis, :] - centers_a_arr[:, np.newaxis]
-            distance_bias_kcal = 0.5 * k_arr[:, np.newaxis] * dprimary * dprimary
-            if secondary_cv_centers is not None and secondary_cv_ks_kj is not None and ss_ks_kj_arr_global is not None:
-                dss = ss_values[np.newaxis, :] - ss_centers_arr_global[:, np.newaxis]
-                ss_bias_kcal = (0.5 * ss_ks_kj_arr_global[:, np.newaxis] * dss * dss) / 4.184
-            else:
-                ss_bias_kcal = np.zeros_like(distance_bias_kcal)
+            _has_ss_axis = (secondary_cv_centers is not None and secondary_cv_ks_kj is not None
+                            and ss_ks_kj_arr_global is not None)
+            # Same kcal arrays as the sample path: the matrix the kernel exchanges on IS the
+            # matrix the writer records (spec F01, state_bias_matrix_v2).
+            distance_bias_kcal, ss_bias_kcal = umbrella_bias_matrix_kcal(
+                primary_values, ss_values, centers_a_arr, k_arr,
+                ss_centers_arr_global if _has_ss_axis else None,
+                ss_k_kcal_arr_global if _has_ss_axis else None,
+            )
             boost_bias_matrix_kj = (pep_gamd_boost_matrix_kj(v_pep_kj, v_dih_kj, state_lambdas, pep_env)
                                     if pep_env is not None else np.zeros((nrep, nrep)))
             _, bias_matrix_kj = assemble_bias_matrices(distance_bias_kcal, ss_bias_kcal, boost_bias_matrix_kj)

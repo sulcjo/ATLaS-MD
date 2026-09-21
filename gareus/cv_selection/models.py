@@ -56,6 +56,15 @@ class ResidualFit:
     projection_mean: np.ndarray     # (k,)
     projection_std: np.ndarray      # (k,)
     degree: int
+    #: Declared basis transform T applied to the standardised anchor everywhere: "identity"
+    #: (degree 1) or "hard_clip" to ``anchor_clamp`` (degree 2). Fitting, scoring, design, the
+    #: force and every evaluator use the same T (spec F02; finding I04).
+    transform: str = "identity"
+
+    def __post_init__(self):
+        expected = "hard_clip" if int(self.degree) == 2 else "identity"
+        if self.transform != expected:
+            object.__setattr__(self, "transform", expected)
 
     @property
     def n_components(self) -> int:
@@ -100,14 +109,22 @@ def fit_residual_components(X, anchor, *, degree: int = 1,
     if sd_c <= 1e-12:
         raise ValueError("anchor has zero variance; a constant anchor defines no coordinate")
     a_std = (a - mu_c) / sd_c
-    design = _design(a_std, degree)
+    # Degree 2 regresses on the CLIPPED anchor: the bounds are frozen from the training
+    # measure before the fit, so the fitted coordinate and the deployed one are the same
+    # function everywhere, tails included. Degree 1 is the identity transform.
+    clamp = (float(_weighted_quantile(a_std, w, _CLAMP_QUANTILES[0])),
+             float(_weighted_quantile(a_std, w, _CLAMP_QUANTILES[1])))
+    if not clamp[0] < clamp[1]:
+        raise ValueError("anchor clip bounds collapsed; the anchor has no spread on the training measure")
+    t = np.clip(a_std, *clamp) if degree == 2 else a_std
+    design = _design(t, degree)
     sqrt_w = np.sqrt(w)[:, None]
     B, _, rank, _ = np.linalg.lstsq(design * sqrt_w, X * sqrt_w, rcond=1e-12)
     if rank < design.shape[1]:
         raise ValueError(f"design matrix rank {rank} < {design.shape[1]}; residualisation is undefined")
     if degree == 1:
         B = np.vstack([B, np.zeros((1, d))])
-    residual = X - _design(a_std, 2) @ B
+    residual = X - _design(t, 2) @ B
     mean_R = np.sum(w[:, None] * residual, axis=0)
     _, singular, Vt = np.linalg.svd((residual - mean_R) * sqrt_w, full_matrices=False)
     k = min(int(n_components), Vt.shape[0])
@@ -120,27 +137,37 @@ def fit_residual_components(X, anchor, *, degree: int = 1,
     sd = np.sqrt(np.sum(w[:, None] * (scores - mu) ** 2, axis=0))
     if np.any(sd <= 1e-12):
         raise ValueError("a component has zero variance on the training data")
-    clamp = (float(np.quantile(a_std, _CLAMP_QUANTILES[0])),
-             float(np.quantile(a_std, _CLAMP_QUANTILES[1])))
-    return ResidualFit(B, mean_R, singular[:k], V, mu_c, sd_c, clamp, mu, sd, int(degree))
+    return ResidualFit(B, mean_R, singular[:k], V, mu_c, sd_c, clamp, mu, sd, int(degree),
+                       "hard_clip" if degree == 2 else "identity")
 
 
-def standardised_anchor(fit: ResidualFit, anchor, *, clamp: bool = False) -> np.ndarray:
+def _weighted_quantile(values: np.ndarray, weights: np.ndarray, q: float) -> float:
+    order = np.argsort(values, kind="stable")
+    cdf = np.cumsum(weights[order])
+    cdf = cdf / cdf[-1]
+    return float(values[order][int(np.searchsorted(cdf, q, side="left").clip(0, values.size - 1))])
+
+
+def standardised_anchor(fit: ResidualFit, anchor) -> np.ndarray:
+    """T(a): the fit's declared transform of the standardised anchor -- never a caller's choice."""
     a_std = (np.asarray(anchor, dtype=np.float64) - fit.anchor_mean) / fit.anchor_std
-    return np.clip(a_std, *fit.anchor_clamp) if clamp else a_std
+    return np.clip(a_std, *fit.anchor_clamp) if fit.transform == "hard_clip" else a_std
 
 
-def evaluate_component(fit: ResidualFit, j: int, X, anchor, *, clamp: bool = False) -> np.ndarray:
-    """Standardised ``z2^(j)`` for every row of ``X``."""
-    if not 1 <= int(j) <= fit.n_components:
-        raise ValueError(f"component {j} out of range 1..{fit.n_components}")
+def evaluate_component(fit: ResidualFit, j: int, X, anchor) -> np.ndarray:
+    """Standardised ``z2^(j)`` for every row of ``X`` -- the compiled coordinate, nothing else.
+
+    Delegates to :func:`gareus.cv_selection.residual_runtime.compile_component` so selection,
+    design, seed scoring, the force builder, the fast-path scalar, the positions evaluator and
+    reprojection all evaluate one definition (spec F02). ``norm`` does not enter here because
+    ``anchor`` is already the normalised contact CV.
+    """
+    from .residual_runtime import compile_component
+
     X = np.asarray(X, dtype=np.float64)
     if X.ndim != 2 or X.shape[1] != fit.width:
         raise ValueError(f"X must be (n, {fit.width})")
-    a_std = standardised_anchor(fit, anchor, clamp=clamp)
-    residual = X - _design(a_std, 2) @ fit.coefficients
-    score = (residual - fit.residual_mean) @ fit.right_vectors[j - 1]
-    return (score - fit.projection_mean[j - 1]) / fit.projection_std[j - 1]
+    return compile_component(fit, int(j), norm=1.0).evaluate_features(X, anchor)
 
 
 def coupling_curvature_kcal(fit: ResidualFit, j: int, k2_kcal: float) -> float:
@@ -173,8 +200,9 @@ def _tie_flags(singular: np.ndarray) -> list[bool]:
 
 def to_candidate_set(fit: ResidualFit, feature_schema: C.FeatureSchema,
                      primary_definition: Mapping[str, Any], physical_system_sha256: str,
-                     training_rows_sha256: str, library_versions: Mapping[str, str]) -> C.CandidateSet:
-    """Freeze the fit as the contract artifact every later stage reads."""
+                     training_rows_sha256: str, library_versions: Mapping[str, str],
+                     *, design_measure: str = "unspecified") -> C.CandidateSet:
+    """Freeze the fit as the v2 contract artifact every later stage reads (declared basis)."""
     if fit.width != feature_schema.width:
         raise ValueError(f"fit width {fit.width} != feature schema width {feature_schema.width}")
     ties = _tie_flags(fit.singular_values)
@@ -194,7 +222,7 @@ def to_candidate_set(fit: ResidualFit, feature_schema: C.FeatureSchema,
             "projection_std": float(fit.projection_std[j - 1]),
         })
     return C.CandidateSet.from_mapping({
-        "schema": C.CANDIDATE_SET_VERSION,
+        "schema": C.CANDIDATE_SET_VERSION_V2,
         "kind": C.CANDIDATE_KIND_QUADRATIC_RESIDUAL,
         "feature_schema_sha256": feature_schema.sha256,
         "physical_system_sha256": physical_system_sha256,
@@ -202,6 +230,8 @@ def to_candidate_set(fit: ResidualFit, feature_schema: C.FeatureSchema,
         "library_versions": dict(library_versions),
         "primary_definition": dict(primary_definition),
         "components": components,
+        "basis_transform": {"kind": fit.transform, "lo": float(fit.anchor_clamp[0]), "hi": float(fit.anchor_clamp[1])},
+        "design_measure": str(design_measure),
     })
 
 
@@ -224,6 +254,7 @@ def from_candidate_set(candidates: C.CandidateSet) -> ResidualFit:
         projection_mean=np.asarray([c.projection_mean for c in comps], dtype=np.float64),
         projection_std=np.asarray([c.projection_std for c in comps], dtype=np.float64),
         degree=degree,
+        transform=str(candidates.basis_transform["kind"]),
     )
 
 
@@ -239,6 +270,28 @@ _ANCHOR_ARG_KEYS = (
     ("atom_selection", "contact_atom_selection"),
     ("normalize", "contact_normalize"),
 )
+
+
+def validate_pair_semantics(pair, candidates: C.CandidateSet, schema: C.FeatureSchema) -> None:
+    """Cross-artifact consistency a digest cannot express (spec F02 'artifact semantics')."""
+    from .residual_runtime import check_feature_schema_layout
+
+    if dict(pair.anchor) != dict(candidates.primary_definition):
+        raise RuntimeError("pair model anchor differs from the candidate set's primary definition; "
+                           "the pair was not selected from these candidates")
+    indices = {c.component_index for c in candidates.components}
+    if int(pair.selected_component_index) not in indices:
+        raise RuntimeError(f"pair model selects component {pair.selected_component_index}, which the "
+                           f"candidate set does not contain ({sorted(indices)})")
+    if int(pair.degree) != int(candidates.degree):
+        raise RuntimeError(f"pair model declares degree {pair.degree} but the candidate coefficients imply "
+                           f"degree {candidates.degree}")
+    if pair.basis_transform is not None and dict(pair.basis_transform) != dict(candidates.basis_transform):
+        raise RuntimeError(f"pair model basis transform {pair.basis_transform} differs from the candidate "
+                           f"set's {candidates.basis_transform}")
+    n_phi, n_psi = check_feature_schema_layout(schema)
+    if 2 * (n_phi + n_psi) != candidates.width:
+        raise RuntimeError("feature schema torsion count does not match the candidate width")
 
 
 def contact_pair_list_digest(contact_pairs) -> str:
@@ -270,11 +323,19 @@ class PairModelRuntime:
     anchor_definition: dict
     pair_sha256: str
     feature_atoms: tuple            # one quadruplet per torsion: phi block then psi block
+    legacy: bool = False            # v1 artifacts, read in explicit legacy mode
+    deployable: bool = True
 
     @classmethod
-    def load(cls, pair_model_path, candidate_set_path, feature_schema_path) -> "PairModelRuntime":
-        """Load the three artifacts and hold them to each other's digests."""
+    def load(cls, pair_model_path, candidate_set_path, feature_schema_path, *,
+             require_deployable: bool = True, allow_legacy_v1: bool = False) -> "PairModelRuntime":
+        """Load the three artifacts, hold them to each other's digests AND to each other's
+        semantics (spec F02): the pair's anchor is the candidates' primary definition, the
+        selected component exists, degree and basis transform agree, the feature layout is one
+        the force builder compiles, and -- for deployment -- the bindings are real.
+        """
         from .pair_model import PairModel
+        from .residual_runtime import check_feature_schema_layout
 
         pair = PairModel.from_json_bytes(Path(pair_model_path).read_bytes())
         candidates = C.CandidateSet.from_json_bytes(Path(candidate_set_path).read_bytes())
@@ -286,9 +347,23 @@ class PairModelRuntime:
             raise RuntimeError(f"pair model binds feature schema {pair.feature_schema_sha256} but "
                                f"{feature_schema_path} hashes to {schema.sha256}")
         C.require_feature_binding(candidates, schema)
+        validate_pair_semantics(pair, candidates, schema)
+        if pair.legacy or candidates.legacy:
+            if not allow_legacy_v1:
+                raise RuntimeError(
+                    "legacy v1 residual artifacts: their degree-2 certificate describes the unclipped "
+                    "training calculation while the deployed coordinate was clipped (review I04). Reading "
+                    "them reproduces the OLD force definition exactly; pass allow_legacy_v1=True "
+                    "(--legacy-model-policy allow-v1) to deploy them knowingly, or re-run the swarm "
+                    "analysis to produce v2 artifacts")
+        if require_deployable and not pair.deployable:
+            raise RuntimeError(
+                "pair model is not deployable: it carries no real topology/system/contact-pair bindings "
+                f"(deployment={pair.deployment}); a discovery-only artifact cannot restrain production")
         atoms = tuple(tuple(int(i) for i in f.atom_indices) for f in schema.features if f.trig == "sin")
         return cls(from_candidate_set(candidates), int(pair.selected_component_index),
-                   str(pair.anchor["kind"]), dict(pair.anchor["definition"]), pair.sha256, atoms)
+                   str(pair.anchor["kind"]), dict(pair.anchor["definition"]), pair.sha256, atoms,
+                   legacy=bool(pair.legacy or candidates.legacy), deployable=bool(pair.deployable))
 
     def contact_args(self) -> SimpleNamespace:
         """The contact parameters as an ``args``-shaped object, from the frozen definition."""

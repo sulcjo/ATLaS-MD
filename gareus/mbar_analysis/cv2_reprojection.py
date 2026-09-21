@@ -146,7 +146,7 @@ def load_cv2_model(path, regime: Optional[str] = None) -> Cv2Model:
     """
     path = Path(path)
     d = json.loads(path.read_text())
-    if d.get('schema') == 'atlas-cv-selection-pair-model-v1':
+    if str(d.get('schema', '')).startswith('atlas-cv-selection-pair-model-'):     # v1 (legacy) and v2
         return _load_residual_model(path, d)
     result = TICAResult.from_dict(d)
     if regime is None:
@@ -172,7 +172,8 @@ def _load_residual_model(path: Path, d: dict) -> Cv2Model:
     for p in (cs_path, fs_path):
         if not p.exists():
             raise FileNotFoundError(f'{path}: residual pair model needs {p.name} beside it')
-    runtime = PairModelRuntime.load(path, cs_path, fs_path)
+    # Analysis reads historical artifacts of either schema; deployability is production's gate.
+    runtime = PairModelRuntime.load(path, cs_path, fs_path, require_deployable=False, allow_legacy_v1=True)
     # The pair model does not store the phi/psi split; the schema's torsion names do.
     fs = json.loads(fs_path.read_text())
     n_phi = sum(1 for f in fs['features'] if f['trig'] == 'sin' and f['torsion_name'].startswith('phi'))
@@ -201,8 +202,7 @@ def project_cv2(model: Cv2Model, features: np.ndarray,
         a = np.asarray(primary_cv, dtype=np.float64)
         if a.shape != (features.shape[0],):
             raise ValueError(f'{model.regime}: primary_cv must be (n,), got {a.shape}')
-        return evaluate_component(model.result.fit, model.result.j, features, a,
-                                  clamp=(model.result.fit.degree == 2))
+        return evaluate_component(model.result.fit, model.result.j, features, a)
     return project_tica1(features, model.result)
 
 

@@ -414,6 +414,7 @@ class WindowSnapshot:
         windows: List[Dict[str, Any]],
         cv1_type: str,
         cv2_type: Optional[str],
+        kernel_identity: Optional[Dict[str, Any]] = None,
     ) -> None:
         payload = {
             "segment_id": segment_id,
@@ -421,6 +422,10 @@ class WindowSnapshot:
             "cv2_type": cv2_type,
             "windows": windows,
         }
+        if kernel_identity is not None:
+            # Which arithmetic produced this segment's coordinates and exchange energies
+            # (gareus.kernel_identity); readers classify sample eligibility from it.
+            payload["kernel_identity"] = dict(kernel_identity)
         target = self._win_dir / f"{segment_id}.json"
         tmp = target.with_name(f"{target.name}.tmp.{os.getpid()}")
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")

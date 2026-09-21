@@ -73,15 +73,21 @@ def test_residual_is_exactly_uncorrelated_under_the_balanced_weights_it_was_fit_
 def test_degree_two_removes_quadratic_dependence_that_degree_one_leaves_in_some_component():
     X, a = _synthetic(degree=2, seed=3, quad_scale=6.0)
     a_std = (a - a.mean()) / a.std()
-    q = a_std ** 2 - (a_std ** 2).mean()
     lin = fit_residual_components(X, a, degree=1)
     quad = fit_residual_components(X, a, degree=2)
+    # The degree-2 regressor is T(a)^2 with T the declared clip (spec F02): exact orthogonality
+    # is to THAT column; the 1 % of rows outside the clip keep their raw quadratic dependence
+    # by construction, which is the deployed coordinate's honest definition.
+    t = np.clip(a_std, *quad.anchor_clamp)
+    q_fitted = t ** 2 - (t ** 2).mean()
+    q_raw = a_std ** 2 - (a_std ** 2).mean()
 
-    def corr(fit, j):
+    def corr(fit, j, q):
         return abs(np.corrcoef(evaluate_component(fit, j, X, a), q)[0, 1])
 
-    assert all(corr(quad, j) < 1e-6 for j in range(1, 7))
-    assert max(corr(lin, j) for j in range(1, 7)) > 0.05     # somewhere, not necessarily PC1
+    assert all(corr(quad, j, q_fitted) < 1e-6 for j in range(1, 7))
+    assert max(corr(lin, j, q_raw) for j in range(1, 7)) > 0.05     # somewhere, not necessarily PC1
+    assert max(corr(quad, j, q_raw) for j in range(1, 7)) < 0.05    # and the clip leaves only a tail remnant
 
 
 def test_components_are_individual_orthonormal_directions_with_positive_dominant_coefficient():
@@ -110,15 +116,21 @@ def test_degree_survives_the_round_trip_for_a_linear_fit(feature_schema_8):
     assert from_candidate_set(cs).degree == 1
 
 
-def test_clamped_evaluation_freezes_the_anchor_outside_the_training_range():
+def test_degree_two_evaluation_freezes_the_anchor_outside_the_training_range_by_its_declared_transform():
+    """The clip is a property of the fitted model (transform 'hard_clip'), applied at every
+    stage -- not a call-site option (spec F02; the old `clamp=` override was finding I04)."""
     X, a = _synthetic(degree=2)
     fit = fit_residual_components(X, a, degree=2)
+    assert fit.transform == "hard_clip"
     far = np.full(3, a.max() + 10 * a.std())
     edge = np.full(3, fit.anchor_mean + fit.anchor_clamp[1] * fit.anchor_std)
-    assert np.allclose(evaluate_component(fit, 1, X[:3], far, clamp=True),
-                       evaluate_component(fit, 1, X[:3], edge, clamp=True))
-    assert not np.allclose(evaluate_component(fit, 1, X[:3], far, clamp=False),
-                           evaluate_component(fit, 1, X[:3], edge, clamp=False))
+    assert np.allclose(evaluate_component(fit, 1, X[:3], far), evaluate_component(fit, 1, X[:3], edge))
+    # a degree-1 fit has the identity transform: the same two anchors give different values
+    X1, a1 = _synthetic(degree=1)
+    fit1 = fit_residual_components(X1, a1, degree=1)
+    assert fit1.transform == "identity"
+    far1 = np.full(3, a1.max() + 10 * a1.std()); edge1 = np.full(3, a1.max())
+    assert not np.allclose(evaluate_component(fit1, 1, X1[:3], far1), evaluate_component(fit1, 1, X1[:3], edge1))
 
 
 def test_coupling_curvature_matches_its_definition():

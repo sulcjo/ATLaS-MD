@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import csv
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from gareus.io import read_json_file, write_json
 from gareus.swarm.driver import round_dir, swarm_root
@@ -79,24 +79,69 @@ def _planned_member_ids(rd: Path) -> List[int]:
     return ids
 
 
-def mark_epoch0_complete(out_dir, *, n_members: int, ns_charged: float) -> Path:
+#: Artefacts an automatic-CV2 epoch 0 must also leave behind (spec F04).
+AUTO_CV_ARTEFACTS = ("ladder_run_args.yaml",)
+PAIR_ARTEFACTS = ("cv_pair_model.json", "cv_candidate_set.json", "cv_feature_schema.json")
+
+
+def _artefact_digests(out_dir, names) -> Dict[str, str]:
+    from gareus.correctness._io import file_digest
+
+    an = analysis_dir(out_dir)
+    out: Dict[str, str] = {}
+    for rel in names:
+        p = an / rel
+        if p.is_file():
+            out[rel] = file_digest(p)
+        elif p.is_dir():
+            csv_path = p / "final_survivor_seeds.csv"
+            if csv_path.is_file():
+                out[rel + "/final_survivor_seeds.csv"] = file_digest(csv_path)
+    return out
+
+
+def mark_epoch0_complete(out_dir, *, n_members: int, ns_charged: float,
+                         auto_cv: bool = False, selection_status: Optional[str] = None) -> Path:
     """Record that epoch 0 finished, after checking that it really did.
 
     Written last, and only once the artefacts exist: the marker is a claim about
-    other files, so it must never be able to outlive them.
+    other files, so it must never be able to outlive them. With automatic CV2 the
+    sidecar is required too, and a selected pair requires its three frozen artifacts.
+    The marker records every artefact's content digest and the selection outcome, so a
+    later job can tell that the files it is about to trust are the ones the gate passed.
     """
-    missing = missing_artefacts(out_dir)
+    required = list(REQUIRED_ARTEFACTS)
+    if auto_cv:
+        required += list(AUTO_CV_ARTEFACTS)
+        if selection_status == "pair":
+            required += list(PAIR_ARTEFACTS)
+    an = analysis_dir(out_dir)
+    missing = [rel for rel in required if not (an / rel).exists()]
     if missing:
         raise FileNotFoundError(
             "refusing to mark epoch 0 complete; missing swarm artefacts: " + ", ".join(missing)
         )
-    path = analysis_dir(out_dir) / EPOCH0_MARKER_NAME
+    path = an / EPOCH0_MARKER_NAME
     write_json(path, {
         "n_members": int(n_members),
         "ns_charged": float(ns_charged),
-        "artefacts": list(REQUIRED_ARTEFACTS),
+        "artefacts": required,
+        "artefact_digests": _artefact_digests(out_dir, required),
+        "auto_cv": bool(auto_cv),
+        "selection_status": selection_status,
     })
     return path
+
+
+def changed_artefacts(out_dir, marker: Dict[str, Any]) -> List[str]:
+    """Artefacts whose current content digest differs from the one the marker recorded."""
+    recorded = dict(marker.get("artefact_digests") or {})
+    if not recorded:
+        return []
+    current = _artefact_digests(out_dir, marker.get("artefacts") or [])
+    # A MISSING artefact is the old recoverable case (re-analyse); only a present-but-different
+    # file is a changed artefact that blocks production from trusting the marker.
+    return sorted(rel for rel, dig in recorded.items() if rel in current and current[rel] != dig)
 
 
 def epoch0_status(out_dir, round_index: int = 0) -> Dict[str, Any]:
@@ -137,11 +182,17 @@ def epoch0_status(out_dir, round_index: int = 0) -> Dict[str, Any]:
         "reasons": [],
     }
 
+    changed = changed_artefacts(out_dir, marker) if marker else []
+    status["changed_artefacts"] = changed
     if gate_status == "fail":
         # A recorded failure is the round's own verdict on itself. Re-running
         # members would not change it; only a new round can.
         status.update(state="blocked", next_action=EPOCH0_STOP)
         status["reasons"].append("swarm gate recorded status=fail")
+    elif marker and changed:
+        # The files production is about to trust are not the ones the gate passed.
+        status.update(state="blocked", next_action=EPOCH0_STOP)
+        status["reasons"].append("epoch-0 artefacts changed after completion: " + ", ".join(changed))
     elif marker and not absent and gate_status in ("pass", "ok"):
         status.update(state="complete", next_action=EPOCH0_PROCEED)
     elif marker and absent:
@@ -273,7 +324,10 @@ def run_or_resume_epoch0(
         settled = epoch0_status(out_dir, round_index)
         ns = float(settled["n_done"]) * float(getattr(args, "swarm_seed_ns", 1.0) or 0.0)
         # Marker last, and only now: analyze has written the artefacts it names.
-        mark_epoch0_complete(out_dir, n_members=settled["n_done"], ns_charged=ns)
+        auto_cv = str(getattr(args, "secondary_cv", "") or "") == "auto"
+        selection_status = (report.get("cv_selection") or {}).get("status") if isinstance(report, dict) else None
+        mark_epoch0_complete(out_dir, n_members=settled["n_done"], ns_charged=ns,
+                             auto_cv=auto_cv, selection_status=selection_status)
         if charge_ns is not None:
             charge_ns(ns)
         return ladder

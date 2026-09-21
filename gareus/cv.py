@@ -587,8 +587,10 @@ def _residual_runtime_from_ss_info(ss_info: Dict[str, Any]):
     if runtime is None:
         from .cv_selection.models import PairModelRuntime
 
+        # The deployment gate ran when the force was first built; a resume reloads by digest.
         runtime = PairModelRuntime.load(ss_info["pair_model_path"], ss_info["candidate_set_path"],
-                                        ss_info["feature_schema_path"])
+                                        ss_info["feature_schema_path"], require_deployable=False,
+                                        allow_legacy_v1=True)
         ss_info["_runtime"] = runtime
     return runtime
 
@@ -609,8 +611,7 @@ def residual_cv2_from_positions_nm(positions_nm, runtime, phi_torsions, psi_tors
     positions = np.asarray(positions_nm, dtype=np.float64)
     feats = backbone_dihedral_features(positions, list(phi_torsions), list(psi_torsions))
     anchor_value = nonlocal_contact_cv_from_positions_nm(positions, contact_pairs, runtime.contact_args())
-    value = evaluate_component(runtime.fit, runtime.j, feats[None, :], np.array([anchor_value]),
-                               clamp=(runtime.fit.degree == 2))
+    value = evaluate_component(runtime.fit, runtime.j, feats[None, :], np.array([anchor_value]))
     return float(value[0])
 
 

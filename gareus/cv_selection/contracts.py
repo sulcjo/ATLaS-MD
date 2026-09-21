@@ -59,7 +59,11 @@ __all__ = [
 ]
 
 FEATURE_SCHEMA_VERSION = "atlas-cv-selection-feature-schema-v1"
-CANDIDATE_SET_VERSION = "atlas-cv-selection-candidate-set-v1"
+CANDIDATE_SET_VERSION_V1 = "atlas-cv-selection-candidate-set-v1"
+CANDIDATE_SET_VERSION_V2 = "atlas-cv-selection-candidate-set-v2"
+CANDIDATE_SET_VERSIONS = (CANDIDATE_SET_VERSION_V1, CANDIDATE_SET_VERSION_V2)
+#: The legacy name: tests and the v1 reader refer to it; the fitter writes V2.
+CANDIDATE_SET_VERSION = CANDIDATE_SET_VERSION_V1
 OBSERVABLE_PANEL_VERSION = "atlas-cv-selection-observable-panel-v1"
 TRIAL_PLAN_VERSION = "atlas-cv-selection-trial-plan-v1"
 
@@ -285,7 +289,15 @@ def _parse_component(raw: Mapping[str, Any], position: int) -> CandidateComponen
 
 @dataclass(frozen=True)
 class CandidateSet(_Artifact):
-    """Frozen residual components plus the primary CV they were fitted against."""
+    """Frozen residual components plus the primary CV they were fitted against.
+
+    Two schema versions are read. ``v1`` carries no basis transform: its degree-2
+    components were fitted on the unclipped anchor and deployed clipped (review I04), so a
+    v1 set is read in explicit legacy mode with the transform inferred from the degree --
+    exactly the coordinate the old force applied, never a refit -- and its bytes and digest
+    are untouched. ``v2`` declares ``basis_transform`` and ``design_measure`` and is what the
+    fitter writes now.
+    """
 
     kind: str
     feature_schema_sha256: str
@@ -294,18 +306,34 @@ class CandidateSet(_Artifact):
     library_versions: dict[str, str]
     primary_definition: dict[str, Any]
     components: tuple[CandidateComponent, ...]
+    schema_version: str
+    basis_transform: dict[str, Any]
+    design_measure: Optional[str]
     sha256: str
 
     @property
     def width(self) -> int:
         return self.components[0].width
 
+    @property
+    def legacy(self) -> bool:
+        return self.schema_version == CANDIDATE_SET_VERSION_V1
+
+    @property
+    def degree(self) -> int:
+        return 2 if any(abs(v) > 0.0 for v in self.components[0].regression_coefficients[2]) else 1
+
     @classmethod
     def _parse(cls, data: dict[str, Any]) -> "CandidateSet":
-        _exact_fields(data, {"schema", "kind", "feature_schema_sha256", "physical_system_sha256",
-                             "training_rows_sha256", "library_versions", "primary_definition",
-                             "components"}, "candidate set")
-        _schema(data, CANDIDATE_SET_VERSION, "candidate set")
+        schema_version = str(data.get("schema", ""))
+        if schema_version not in CANDIDATE_SET_VERSIONS:
+            _fail(ReasonCode.UNKNOWN_SCHEMA_VERSION,
+                  f"candidate set schema must be one of {list(CANDIDATE_SET_VERSIONS)}, got {schema_version!r}")
+        required = {"schema", "kind", "feature_schema_sha256", "physical_system_sha256",
+                    "training_rows_sha256", "library_versions", "primary_definition", "components"}
+        if schema_version == CANDIDATE_SET_VERSION_V2:
+            required |= {"basis_transform", "design_measure"}
+        _exact_fields(data, required, "candidate set")
         if data["kind"] != CANDIDATE_KIND_QUADRATIC_RESIDUAL:
             _fail(ReasonCode.INVALID_ENUM,
                   f"candidate set kind must be {CANDIDATE_KIND_QUADRATIC_RESIDUAL!r}")
@@ -321,6 +349,28 @@ class CandidateSet(_Artifact):
         if len(widths) != 1:
             _fail(ReasonCode.FEATURE_WIDTH_MISMATCH,
                   f"components disagree on feature width: {sorted(widths)}")
+        # Shared regression/scaling parameters must agree across components: they are one
+        # fit, stored per component only for locality. A digest-valid artifact whose
+        # components disagree was not produced by the fitter.
+        first = components[0]
+        for component in components[1:]:
+            if (component.regression_coefficients != first.regression_coefficients
+                    or component.residual_mean != first.residual_mean
+                    or component.primary_mean != first.primary_mean
+                    or component.primary_std != first.primary_std
+                    or component.anchor_clamp != first.anchor_clamp):
+                _fail(ReasonCode.INCOMPLETE_REGRESSION,
+                      f"component {component.component_index} disagrees with component "
+                      f"{first.component_index} on the shared regression/scaling parameters")
+        degree = 2 if any(abs(v) > 0.0 for v in first.regression_coefficients[2]) else 1
+        if schema_version == CANDIDATE_SET_VERSION_V2:
+            transform = _parse_basis_transform(data["basis_transform"], degree, first.anchor_clamp,
+                                               "candidate set.basis_transform")
+            design_measure = require_visible_text(data["design_measure"], "candidate set.design_measure")
+        else:
+            transform = {"kind": "hard_clip" if degree == 2 else "identity",
+                         "lo": float(first.anchor_clamp[0]), "hi": float(first.anchor_clamp[1])}
+            design_measure = None
         # An SVD basis is only reproducible against the library that produced it.
         libraries = _version_map(data["library_versions"], "candidate set.library_versions")
         # Reuse the existing CV canonicaliser: it rejects filename-based identity.
@@ -331,7 +381,7 @@ class CandidateSet(_Artifact):
                   f"primary CV kind {primary['kind']!r} is not in the declared native-blind "
                   f"dictionary {sorted(NATIVE_BLIND_CV_KINDS)}; a coordinate defined against a "
                   "known fold cannot enter a native-blind selection")
-        body = {"schema": CANDIDATE_SET_VERSION, "kind": data["kind"],
+        body = {"schema": schema_version, "kind": data["kind"],
                 "feature_schema_sha256": _hex64(data["feature_schema_sha256"],
                                                 "candidate set.feature_schema_sha256"),
                 "physical_system_sha256": _hex64(data["physical_system_sha256"],
@@ -341,18 +391,52 @@ class CandidateSet(_Artifact):
                 "library_versions": dict(libraries),
                 "primary_definition": primary,
                 "components": [component.to_mapping() for component in components]}
+        if schema_version == CANDIDATE_SET_VERSION_V2:
+            body["basis_transform"] = dict(transform)
+            body["design_measure"] = design_measure
         return cls(data["kind"], body["feature_schema_sha256"], body["physical_system_sha256"],
                    body["training_rows_sha256"], dict(libraries), primary, components,
-                   artifact_digest(body))
+                   schema_version, dict(transform), design_measure, artifact_digest(body))
 
     def _body(self) -> dict[str, Any]:
-        return {"schema": CANDIDATE_SET_VERSION, "kind": self.kind,
+        body = {"schema": self.schema_version, "kind": self.kind,
                 "feature_schema_sha256": self.feature_schema_sha256,
                 "physical_system_sha256": self.physical_system_sha256,
                 "training_rows_sha256": self.training_rows_sha256,
                 "library_versions": dict(self.library_versions),
                 "primary_definition": dict(self.primary_definition),
                 "components": [component.to_mapping() for component in self.components]}
+        if self.schema_version == CANDIDATE_SET_VERSION_V2:
+            body["basis_transform"] = dict(self.basis_transform)
+            body["design_measure"] = self.design_measure
+        return body
+
+
+BASIS_TRANSFORM_KINDS = frozenset({"identity", "hard_clip"})
+
+
+def _parse_basis_transform(raw: Any, degree: int, anchor_clamp, label: str) -> dict[str, Any]:
+    """``{kind, lo, hi}``: kind must match the degree the coefficients imply, and for a clip
+    the bounds must be the components' own ``anchor_clamp`` (one T for fitting and deployment)."""
+    if not isinstance(raw, Mapping):
+        _fail(ReasonCode.WRONG_TYPE, f"{label} must be a mapping")
+    _exact_fields(raw, {"kind", "lo", "hi"}, label)
+    kind = raw["kind"]
+    if kind not in BASIS_TRANSFORM_KINDS:
+        _fail(ReasonCode.INVALID_ENUM, f"{label}.kind must be one of {sorted(BASIS_TRANSFORM_KINDS)}, got {kind!r}")
+    expected = "hard_clip" if degree == 2 else "identity"
+    if kind != expected:
+        _fail(ReasonCode.INVALID_ENUM,
+              f"{label}.kind={kind!r} but the regression coefficients imply degree {degree} "
+              f"(expected {expected!r}); the declared basis and the coefficients disagree")
+    lo, hi = _finite_vector([raw["lo"], raw["hi"]], f"{label}.lo/hi")
+    if not lo < hi:
+        _fail(ReasonCode.INVALID_ESTIMATE, f"{label} needs lo < hi")
+    if kind == "hard_clip" and (lo != float(anchor_clamp[0]) or hi != float(anchor_clamp[1])):
+        _fail(ReasonCode.INVALID_ESTIMATE,
+              f"{label} bounds ({lo}, {hi}) differ from the components' anchor_clamp "
+              f"{tuple(anchor_clamp)}; fitting and deployment must use one clip")
+    return {"kind": kind, "lo": float(lo), "hi": float(hi)}
 
 
 def require_feature_binding(candidates: CandidateSet, schema: FeatureSchema) -> None:

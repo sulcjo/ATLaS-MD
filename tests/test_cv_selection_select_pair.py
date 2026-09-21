@@ -53,7 +53,9 @@ def test_selects_a_residual_component_with_an_exact_weighted_certificate():
     sel = select_cv_pair(_dataset(), SelectionConfig(), **ARGS)
     assert sel.status == "pair", sel.report["selection_reason"]
     cert = sel.pair_model.certificate
-    assert abs(cert["cov_q_weighted"]) < 1e-8
+    assert abs(cert["cov_transformed_anchor_weighted"]) < 1e-8          # exact: orthogonal to the fitted regressor T(a)
+    assert np.isfinite(cert["cov_raw_anchor_weighted"])                   # reported, not certified (spec F02)
+    assert cert["certificate_version"] == "residual_certificate_v2"
     assert cert["coupling_fraction_of_k1"] <= 0.25
     assert cert["selected_gain_nats"] >= 0.02
     assert isinstance(cert["half_split_agrees"], bool)
@@ -124,7 +126,7 @@ def test_a_stored_pair_whose_certificate_is_not_orthogonal_is_a_broken_artifact(
     sel = select_cv_pair(_dataset(), SelectionConfig(), **ARGS)
     payload = sel.pair_model.to_mapping()
     payload.pop("sha256")
-    payload["certificate"]["cov_q_weighted"] = 0.05
+    payload["certificate"]["cov_transformed_anchor_weighted"] = 0.05
     with pytest.raises(C.IntegrityError) as excinfo:
         PairModel.from_mapping(payload)
     assert excinfo.value.reason is C.ReasonCode.INVALID_ESTIMATE

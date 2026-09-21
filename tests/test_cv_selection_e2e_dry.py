@@ -6,6 +6,8 @@ the artifacts the swarm writes are exactly the ones a manual production run can 
 """
 import csv
 
+import pytest
+
 from conftest import PHI_TORSIONS, PSI_TORSIONS  # tests/ is prepended to sys.path by the runner
 
 
@@ -40,13 +42,19 @@ def test_sidecar_artifacts_load_as_one_runtime_bound_to_the_fixture_topology(syn
     from gareus.cv_selection.models import PairModelRuntime
     out, report = _analyze(synthetic_swarm, swarm_args)
     side = _load_config_file(out / "swarm" / "analysis" / "ladder_run_args.yaml")
+    # The synthetic swarm has no swarm/system files, so the pair is honestly NOT deployable and
+    # production's default load refuses it; the analysis load reads it for inspection.
+    assert report["cv_selection"]["deployable"] is False
+    with pytest.raises(RuntimeError, match="not deployable"):
+        PairModelRuntime.load(side["secondary_cv_model"], side["secondary_cv_candidate_set"],
+                              side["secondary_cv_feature_schema"])
     rt = PairModelRuntime.load(side["secondary_cv_model"], side["secondary_cv_candidate_set"],
-                               side["secondary_cv_feature_schema"])
+                               side["secondary_cv_feature_schema"], require_deployable=False)
+    assert rt.deployable is False and rt.legacy is False
     assert rt.pair_sha256 == report["cv_selection"]["pair_model_sha256"]
     assert rt.j == report["cv_selection"]["selected_component_index"]
     rt.check_topology(PHI_TORSIONS, PSI_TORSIONS)
     # Same width, permuted torsions: a different coordinate, refused by name.
-    import pytest
     with pytest.raises(RuntimeError, match="different coordinate"):
         rt.check_topology(PSI_TORSIONS, PHI_TORSIONS)
     # The frozen anchor carries the run's contact parameters.

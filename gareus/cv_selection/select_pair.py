@@ -31,8 +31,8 @@ from .anchor import AnchorCandidate, AnchorScore, score_anchor
 from .independence import (DEFAULT_FOLD_SEED, frame_partition, heldout_nonlinear_r2,
                            incremental_cell_information)
 from .models import (ResidualFit, coupling_curvature_kcal, evaluate_component,
-                     fit_residual_components, to_candidate_set)
-from .pair_model import PAIR_MODEL_VERSION, PairModel
+                     fit_residual_components, to_candidate_set, standardised_anchor)
+from .pair_model import CERTIFICATE_VERSION_V2, PAIR_MODEL_VERSION_V2, PairModel
 from .protocol import NATIVE_BLIND_GENERATOR_PRESETS
 
 DESIGN_MEASURE = "balanced_frame_cells"
@@ -147,7 +147,7 @@ def _half_split_winners(X, a, shape, groups, cfg: SelectionConfig) -> tuple[Opti
 
 def select_cv_pair(data: SwarmDataset, config: SelectionConfig, *, physical_system_sha256: str,
                    training_rows_sha256: str, library_versions: Mapping[str, str],
-                   genpept_preset: str) -> PairSelection:
+                   genpept_preset: str, deployment: Optional[Mapping[str, Any]] = None) -> PairSelection:
     # A fold-biased GENPEPT preset (e.g. "chignolin") is accepted and RECORDED, not refused:
     # the selection then rests on a library that knows the fold, and the pair model says so
     # (``genpept_preset``) so no downstream reader can mistake it for an ab initio run.
@@ -185,8 +185,9 @@ def select_cv_pair(data: SwarmDataset, config: SelectionConfig, *, physical_syst
 
     primary_definition = {"kind": anchor.kind, "units": _units(anchor.kind),
                           "definition": dict(anchor.definition)}
+    design_measure_name = f"{DESIGN_MEASURE}_{config.n_cells_coarse}"
     candidate_set = to_candidate_set(fit, data.feature_schema, primary_definition,
-                                     physical_system_sha256, training_rows_sha256, library_versions)
+                                     physical_system_sha256, training_rows_sha256, library_versions, design_measure=design_measure_name)
 
     scores = _score_components(fit, X, a, z1, cells_fine, groups, config)
     winner, why = _pick(scores, config)
@@ -206,22 +207,34 @@ def select_cv_pair(data: SwarmDataset, config: SelectionConfig, *, physical_syst
     _, folds_rev = heldout_nonlinear_r2(z1, z2, groups, n_folds=config.n_folds)
     half_a, half_b = _half_split_winners(X, a, shape, groups, config)
     best = scores[winner]
+    t1 = standardised_anchor(fit, a)                                   # T(a): the fitted regressor
     certificate = {
-        "cov_q_weighted": float(np.sum(weights * z1 * z2)),
+        "certificate_version": CERTIFICATE_VERSION_V2,
+        # exact by construction: the residual is orthogonal to the fitted regressors under the
+        # training weights; the raw-anchor covariance is generally nonzero under a clip and is
+        # reported, not certified (spec F02)
+        "cov_transformed_anchor_weighted": float(np.sum(weights * z2 * (t1 - np.sum(weights * t1)))),
+        "cov_raw_anchor_weighted": float(np.sum(weights * z1 * z2)),
         "r2_z2_given_z1_mean": best["r2_mean"], "r2_z2_given_z1_se": best["r2_se"],
         "r2_z1_given_z2_mean": float(folds_rev.mean()),
         "coupling_curvature_kcal": best["coupling_curvature_kcal"],
         "coupling_fraction_of_k1": best["coupling_fraction_of_k1"],
         "std_unweighted_z2": float(z2.std()),
-        "design_measure": f"{DESIGN_MEASURE}_{config.n_cells_coarse}",
+        "design_measure": design_measure_name,
         "n_frames": int(X.shape[0]), "n_seed_families": int(np.unique(groups).size),
         "half_split_agrees": bool(half_a == half_b == winner),
         "selected_gain_nats": best["gain_nats"],
         "max_gain_nats": max(s["gain_nats"] for s in scores.values()),
     }
     report["half_split_winners"] = [half_a, half_b]
+    binding = {"topology_sha256": None, "physical_system_sha256": None, "contact_pair_list_sha256": None,
+               "deployable": False}
+    if deployment:
+        binding.update({k: deployment.get(k) for k in binding if k in deployment})
+        binding["deployable"] = bool(deployment.get("deployable", all(
+            binding[k] for k in ("topology_sha256", "physical_system_sha256", "contact_pair_list_sha256"))))
     pair_model = PairModel.from_mapping({
-        "schema": PAIR_MODEL_VERSION,
+        "schema": PAIR_MODEL_VERSION_V2,
         "candidate_set_sha256": candidate_set.sha256,
         "feature_schema_sha256": data.feature_schema.sha256,
         "anchor": primary_definition,
@@ -230,7 +243,10 @@ def select_cv_pair(data: SwarmDataset, config: SelectionConfig, *, physical_syst
         "certificate": certificate,
         "runner_ups": runner_ups,
         "genpept_preset": genpept_preset,
+        "basis_transform": dict(candidate_set.basis_transform),
+        "deployment": binding,
     })
+    report["deployable"] = bool(binding["deployable"])
     report["status"] = "pair"
     report["pair_model_sha256"] = pair_model.sha256
     return PairSelection("pair", pair_model, candidate_set, anchor, report)

@@ -169,11 +169,49 @@ def _read_parquet_segment(conn, files: list[str], segment_id: str, end_step: Opt
     return result
 
 
+def segment_eligibility(run_dir) -> dict:
+    """Per-segment sample eligibility from ``windows/<segment>.json`` (spec F04).
+
+    Returns ``{segment_id: {"eligibility": ..., "reason": ...}}`` for every segment in
+    ``segments.json``; segments without a window snapshot are ``unknown`` when the run's
+    latest snapshot says residual, else ``not_applicable``.
+    """
+    from .kernel_identity import ELIGIBLE_NOT_APPLICABLE, ELIGIBLE_UNKNOWN, classify_segment_kernel
+
+    run_dir = Path(run_dir)
+    seg_json = run_dir / "segments.json"
+    if not seg_json.exists():
+        return {}
+    segs = json.loads(seg_json.read_text(encoding="utf-8"))
+    out = {}
+    latest_residual = False
+    for seg in segs:
+        p = run_dir / "windows" / f"{seg['segment_id']}.json"
+        if p.exists():
+            latest_residual = str((json.loads(p.read_text(encoding="utf-8")) or {}).get("cv2_type")) == "residual-torsion-pc"
+    for seg in segs:
+        seg_id = str(seg["segment_id"])
+        p = run_dir / "windows" / f"{seg_id}.json"
+        if p.exists():
+            status, reason = classify_segment_kernel(json.loads(p.read_text(encoding="utf-8")))
+        elif latest_residual:
+            status, reason = ELIGIBLE_UNKNOWN, "no window snapshot for a residual-CV run"
+        else:
+            status, reason = ELIGIBLE_NOT_APPLICABLE, "no window snapshot; not a residual-CV run"
+        out[seg_id] = {"eligibility": status, "reason": reason}
+    return out
+
+
+#: Filled by the last ``load_samples`` call: which segments were excluded and why.
+LAST_ELIGIBILITY_REPORT: dict = {}
+
+
 def _load_segmented_parquet(
     run_dir: Path,
     dirname: str,
     segment_ids: Optional[list] = None,
     n_threads: int = 0,
+    include_ineligible: bool = False,
 ) -> dict:
     import duckdb
 
@@ -181,6 +219,20 @@ def _load_segmented_parquet(
     data_dir = run_dir / dirname
     if not data_dir.exists():
         return {}
+    # Sample eligibility (spec F04): affected/unknown residual-kernel segments never enter a
+    # validated analysis silently. They are excluded here -- the one loader every analysis
+    # path goes through -- and the exclusion is reported, never deleted or relabelled.
+    excluded: dict = {}
+    if dirname == "samples" and not include_ineligible:
+        from .kernel_identity import ELIGIBLE_NOT_APPLICABLE, ELIGIBLE_VERIFIED
+        for seg_id, info in segment_eligibility(run_dir).items():
+            if info["eligibility"] not in (ELIGIBLE_VERIFIED, ELIGIBLE_NOT_APPLICABLE):
+                excluded[seg_id] = info
+        LAST_ELIGIBILITY_REPORT.clear()
+        LAST_ELIGIBILITY_REPORT.update({"run_dir": str(run_dir), "excluded_segments": excluded})
+        if excluded:
+            print(f"[eligibility] {len(excluded)} segment(s) excluded from {run_dir}: "
+                  + "; ".join(f"{k}: {v['eligibility']} ({v['reason']})" for k, v in excluded.items()))
 
     conn = duckdb.connect()
     if n_threads > 0:
@@ -188,7 +240,7 @@ def _load_segmented_parquet(
     results = []
     try:
         if segment_ids is not None:
-            allowed = {str(x) for x in segment_ids}
+            allowed = {str(x) for x in segment_ids} - set(excluded)
             groups = _group_parquet_files_by_segment(data_dir, allowed)
             for seg_id, files in sorted(groups.items()):
                 results.append(_read_parquet_segment(conn, files, seg_id))
@@ -207,6 +259,8 @@ def _load_segmented_parquet(
         last_seg_id = str(segs[-1]["segment_id"])
         for seg in segs:
             seg_id = str(seg["segment_id"])
+            if seg_id in excluded:
+                continue
             seg_dir = data_dir / seg_id
             if not seg_dir.exists():
                 continue
@@ -233,6 +287,7 @@ def load_samples(
     run_dir: Path,
     segment_ids: Optional[list] = None,
     n_threads: int = 0,
+    include_ineligible: bool = False,
 ) -> dict:
     """Load production samples from Parquet files via DuckDB.
 
@@ -250,7 +305,8 @@ def load_samples(
     samples_dir = run_dir / "samples"
     if not samples_dir.exists():
         return {}
-    return _load_segmented_parquet(run_dir, "samples", segment_ids=segment_ids, n_threads=n_threads)
+    return _load_segmented_parquet(run_dir, "samples", segment_ids=segment_ids, n_threads=n_threads,
+                                   include_ineligible=include_ineligible)
 
 
 def load_exchanges(
