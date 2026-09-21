@@ -408,3 +408,34 @@ Operational note for whoever runs the suite next: opencode's shell tool kills an
 after 120 s, so a full-suite run dispatched through it dies silently around 50 % with no
 summary line. Launch pytest detached (`setsid nohup … &`, log to a file) and poll the log.
 
+## chignolin_8 first launch: epoch 0 failed its coverage gate (2026-09-21)
+
+First real run of `cv2: auto` (aurum2, job 2549101, 186 members, 176 ok / 10 `md_failed`).
+Exit 1 was `Epoch0GateFailure`: gate `coverage` -- "cells with no done members: ['3_2_1']".
+That cell holds a single distinct library seed (`seed_07546`; 2 of 31 cells are single-seed),
+replicated six times over velocity seeds, and all six NaN'd within 100 equilibration steps.
+The CV selection itself passed (status `pair`, component 2, gain 0.094 nats, coupling fraction
+2e-4, 48,576 frames from 167 seed families; half-split disagreed: winners [None, 6]).
+
+Root cause, reproduced on the CPU platform with the run's own `base_system.xml` /
+`equil_state.xml` / seed PDB: the graft overwrote all 138 peptide atoms with the compact seed
+aligned onto the extended-chain frame and left the water box untouched. Trp9 CZ2 landed
+0.098 A from a water oxygen; post-minimisation E = 3.6e18 kJ/mol, |F|max 3.4e21, Ca RMSD 0.00
+(the minimiser could not move), NaN at 3.5 fs step 50 -- and at 1 fs, and at 0.5 fs, and with
+2000 minimiser iterations. The healthy control seed's worst overlap was 0.149 A and minimised
+to E = -647,140. Whether a member survived was a lottery on where solvent sat; the same
+mechanism is the standing 1-5 % member-NaN rate (chignolin_7 swarm: 2/186).
+
+Fix (`gareus/seeding.py`): `displace_clashing_solvent_nm` pushes overlapping solvent
+molecules rigidly out along the minimum-image vector before minimisation; the graft refuses
+(`minimization_blowup`) when the minimised energy is non-finite or |F|max > 1e5. The failing
+seed now grafts to E = -647,920, |F|max 4,326, no NaN in 2000 steps (31 waters displaced).
+Tests: `tests/test_graft_solvent_clash.py` (6). Also fixed: `cv_selection_report.json` was
+written before the 2-D layout block, so the on-disk report lacked centres/k2/ESS/shrink.
+
+Left as is, on purpose: the coverage gate stays strict (an empty cell is an empty cell), and a
+single-seed cell remains a single point of failure -- with the graft fixed that failure now
+requires a seed that genuinely cannot be solvated, and `graft_failed` says so by name.
+Recovery of the existing run: delete the 10 failed members' `done.json` and `analysis/`, resume;
+only those members re-run.
+
