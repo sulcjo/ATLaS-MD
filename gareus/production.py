@@ -449,6 +449,9 @@ def _add_weighted_trig_torsion_force(openmm, torsions, weights, trig: str):
     return force
 
 
+_RESIDUAL_SCALAR_RECONSTRUCTION_SCHEMA = "residual_full_expression_v1"
+
+
 def _add_residual_torsion_cv_force(openmm, system, phi_torsions, psi_torsions, contact_pairs,
                                    runtime, args, *, force_group):
     """Harmonic umbrella on a residual torsion component, chain rule included.
@@ -526,7 +529,7 @@ def _add_residual_torsion_cv_force(openmm, system, phi_torsions, psi_torsions, c
         # to guess the CustomCVForce child order or rederive rounded constants
         # from a model artifact that may no longer be locally available.
         "scalar_reconstruction": {
-            "schema_version": "residual-torsion-pc-scalar-v1",
+            "schema_version": _RESIDUAL_SCALAR_RECONSTRUCTION_SCHEMA,
             "sub_cv_names": [*names, "res_contacts"],
             "torsion_sub_cv_count": int(len(names)),
             "anchor_norm": norm,
@@ -726,7 +729,7 @@ def _ss_scalar_from_sub_cv_values(sub_cv_values, metadata: dict) -> float:
                 "the legacy two-value fallback because it defines a different CV"
             )
         schema = str(reconstruction.get("schema_version", ""))
-        if schema != "residual-torsion-pc-scalar-v1":
+        if schema != _RESIDUAL_SCALAR_RECONSTRUCTION_SCHEMA:
             raise RuntimeError(f"Unsupported residual CV scalar reconstruction schema {schema!r}")
         sub_cv_names = reconstruction.get("sub_cv_names")
         if not isinstance(sub_cv_names, list) or not all(isinstance(name, str) for name in sub_cv_names):
@@ -5958,6 +5961,22 @@ def reconcile_resume_secondary_cv_metadata(
         )
         meta["enabled"] = True
     recorded = meta.get("pair_model_sha256")
+    residual_resume = bool(meta.get("enabled")) and (
+        secondary_cv_mode(meta) == "residual-torsion-pc"
+        or (isinstance(recorded, str) and bool(recorded))
+        or current_pair_sha256 is not None
+    )
+    if residual_resume:
+        reconstruction = meta.get("scalar_reconstruction")
+        schema = reconstruction.get("schema_version") if isinstance(reconstruction, dict) else None
+        if schema != _RESIDUAL_SCALAR_RECONSTRUCTION_SCHEMA:
+            raise RuntimeError(
+                "resume refused: residual-torsion-pc checkpoint lacks the verified "
+                f"{_RESIDUAL_SCALAR_RECONSTRUCTION_SCHEMA} evaluator identity; it may contain "
+                "samples or exchange decisions produced by the legacy inconsistent fast path. "
+                "Start a fresh production segment from a recorded configuration instead of "
+                "appending to this checkpoint."
+            )
     if isinstance(recorded, str) and recorded:
         if current_pair_sha256 is None:
             print(
