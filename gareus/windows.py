@@ -1245,6 +1245,13 @@ def load_explicit_2d_window_csv(args, path: Path) -> tuple[np.ndarray, list[floa
     The return shape mirrors choose_windows()+expand_windows_for_secondary_cv(),
     but without forcing a rectangular cross-product.
     """
+    if secondary_cv_mode(args) == "auto":
+        raise ValueError(
+            "cv2 'auto' is a swarm-stage request, not a coordinate: the selected mode and its frozen "
+            "artifact paths (swarm/analysis/ladder_run_args.yaml) must be applied to the run arguments "
+            "before a window table is loaded (gareus.swarm.epoch0.apply_epoch0_sidecar)"
+        )
+
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"--windows-2d-csv file not found: {path}")

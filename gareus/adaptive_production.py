@@ -6908,13 +6908,19 @@ def _epoch0_swarm_window_table(args, out_dir, adaptive_dir, runtime_pool, progre
     phase that creates it. Called on every job in the chain -- a completed swarm
     returns its ladder without running anything.
     """
-    from gareus.swarm.epoch0 import run_or_resume_epoch0
+    from gareus.swarm.epoch0 import apply_epoch0_sidecar, run_or_resume_epoch0
 
     ladder = run_or_resume_epoch0(
         args, out_dir, progress=progress,
         charge_ns=lambda ns: _charge_swarm_to_pool(runtime_pool, ns, adaptive_dir),
     )
+    # The table alone is not the whole decision: the sidecar carries the CV2 the swarm
+    # selected (or 'none'), the frozen pair-model paths and tica_switch_cv2. Applied on
+    # every job so a resumed chain builds the same restraints as the first one.
+    applied = apply_epoch0_sidecar(args, out_dir)
     print(f"    Epoch 0 (unbiased swarm): window table {ladder}")
+    if applied:
+        print("    Epoch 0 sidecar applied: " + ", ".join(f"{k}={v}" for k, v in applied.items()))
     return ladder
 
 

@@ -439,3 +439,28 @@ requires a seed that genuinely cannot be solvated, and `graft_failed` says so by
 Recovery of the existing run: delete the 10 failed members' `done.json` and `analysis/`, resume;
 only those members re-run.
 
+## chignolin_8 second launch: the swarm's decision never reached production (2026-09-21)
+
+Job 2553783 resumed cleanly (176 members skipped, the 10 re-run under the fixed graft all ok:
+29-34 waters displaced, E ~ -647k, |F|max ~ 4.3e3), every gate passed, a pair was selected
+(component 3, joint 64-state layout, k2 0.67 kcal/mol, CV1-width shrink 0.4 %), and epoch 1
+died in `load_explicit_2d_window_csv`: "secondary-CV center in row 2 is outside [0, 1] for
+'auto' mode: -1.979338". The adaptive driver (`_epoch0_swarm_window_table`) took only the
+window table from epoch 0; the sidecar (`ladder_run_args.yaml`: `cvs.cv2:
+residual-torsion-pc`, the three frozen artifact paths, `tica_switch_cv2: false`) was never
+applied, so `args.secondary_cv` stayed `"auto"` -- the loader used the default [0, 1] range,
+and one step later `add_secondary_structure_cv_force` would have refused `"auto"` outright.
+
+Fix: `gareus.swarm.epoch0.apply_epoch0_sidecar(args, out_dir)` applies the sidecar to the
+campaign args in place (idempotent; called on every job right after the ladder is known);
+`load_explicit_2d_window_csv` now refuses `"auto"` by name with a pointer to that function
+instead of a range complaint. Tests: `tests/test_epoch0_sidecar_handover.py` (5).
+
+Pre-flight of the step that has never run, on the CPU platform with the run's own
+`cv_pair_model.json`/`cv_candidate_set.json`/`cv_feature_schema.json`, `base_system.xml`,
+`equil_state.xml`: `PairModelRuntime.load` + `check_topology` (9 phi / 9 psi) +
+`check_anchor` (1256 pairs, norm 1256) pass; `_add_residual_torsion_cv_force` builds; on the
+equilibrated frame z2 = 0.695 and the group-29 umbrella energy is 9.9696 kJ/mol against
+0.5 k2 (z2 - c)^2 = 9.9696 for the first ladder row (c = -1.979, k2 = 2.7878 kJ); forces finite,
+|F|max 19.6 kJ/mol/nm. Ladder: 256 rows, 64 distinct (c1, c2), 4 rungs.
+

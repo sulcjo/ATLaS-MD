@@ -172,6 +172,47 @@ class Epoch0GateFailure(RuntimeError):
 _MAX_EPOCH0_PASSES = 4
 
 
+SIDECAR_NAME = "ladder_run_args.yaml"
+_SIDECAR_PATH_KEYS = ("secondary_cv_model", "secondary_cv_candidate_set", "secondary_cv_feature_schema")
+
+
+def apply_epoch0_sidecar(args, out_dir) -> Dict[str, Any]:
+    """Apply what epoch 0 decided about the CVs to the campaign arguments, in place.
+
+    The swarm hands production a window table AND a sidecar (``ladder_run_args.yaml``):
+    the resolved ``cvs`` (``auto`` -> the selected ``residual-torsion-pc``, or ``none`` on
+    the cv1-only fallback), the three frozen pair-model paths and ``tica_switch_cv2``.
+    The driver used to take only the table, so ``args.secondary_cv`` stayed ``"auto"``
+    into production and the loader rejected the residual centres against ``[0, 1]``
+    (chignolin_8, job 2553783). Idempotent: every job in the chain calls this.
+    Returns the fields applied (empty when there is no sidecar or it names no CVs)."""
+    from gareus.config import _load_config_file
+
+    path = analysis_dir(out_dir) / SIDECAR_NAME
+    if not path.exists():
+        return {}
+    side = _load_config_file(path) or {}
+    applied: Dict[str, Any] = {}
+    cvs = side.get("cvs") or {}
+    cv2 = cvs.get("cv2")
+    if cv2 not in (None, ""):
+        args.secondary_cv = str(cv2)
+        applied["secondary_cv"] = str(cv2)
+    for key in _SIDECAR_PATH_KEYS:
+        if side.get(key) not in (None, ""):
+            setattr(args, key, str(side[key]))
+            applied[key] = str(side[key])
+    if "tica_switch_cv2" in side:
+        args.tica_switch_cv2 = bool(side["tica_switch_cv2"])
+        applied["tica_switch_cv2"] = bool(side["tica_switch_cv2"])
+    if str(getattr(args, "secondary_cv", "")) == "auto":
+        raise RuntimeError(
+            f"epoch 0 sidecar {path} does not resolve cv2 'auto' (cvs.cv2 missing); the swarm "
+            "analysis must be re-run before production can build its restraints"
+        )
+    return applied
+
+
 def run_or_resume_epoch0(
     args,
     out_dir,
