@@ -2,14 +2,16 @@ name: Release v0.8.2
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+    paths:
+      - ".release-v0.8.2"
 
 permissions:
   contents: write
 
 jobs:
   release:
-    if: startsWith(github.event.head_commit.message, 'release: v0.8.2')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -26,10 +28,7 @@ jobs:
 
       - name: Verify packaged version
         run: |
-          python - <<'PY'
-          import gareus
-          assert gareus.__version__ == "0.8.2", gareus.__version__
-          PY
+          python -c "import gareus; assert gareus.__version__ == '0.8.2', gareus.__version__"
           python -m pytest -q tests/test_package_smoke.py::test_official_package_version_is_v082
 
       - name: Fast thermodynamic correctness gate
@@ -42,10 +41,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view v0.8.2 >/dev/null 2>&1; then
-            echo "v0.8.2 already exists; leaving it unchanged."
-            exit 0
-          fi
           gh release create v0.8.2 \
             --target "$GITHUB_SHA" \
             --title "ATLaS-MD v0.8.2" \
