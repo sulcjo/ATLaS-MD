@@ -75,9 +75,9 @@ There are two distinct problems.
 
 The specified half-width contains
 
-\[
+$$
 t_{R-1,\,1-0.05/(2M)}\sqrt{v_{\mathrm{check}}}.
-\]
+$$
 
 Computed critical values:
 
@@ -96,9 +96,9 @@ This is **not** a claim that the Student-t interval is algebraically invalid. Fo
 
 In an idealized benchmark with unbiased, independent normal campaign estimates, a one-sided 95% upper bound for an observed variance ratio `r` with four estimates per arm is
 
-\[
+$$
 r\,F_{0.95}(3,3)\approx9.277r.
-\]
+$$
 
 An observed ratio of 0.8 has an upper bound of about 7.42. The observed ratio must be below roughly 0.108 to exclude equal variance with this particular test. The normal-sample F construction and its distributional assumptions are documented by [NIST](https://www.itl.nist.gov/div898/software/dataplot/refman1/auxillar/ratio_sd.htm).
 
@@ -130,24 +130,24 @@ This is not necessarily infeasible, but it is not costed. CPU and memory caps do
 
 Use a gauge-fixed MBAR estimating-equation formulation. Treat a synchronized sample of the **whole replica ensemble** as one time-series observation. If the parameter estimate solves
 
-\[
+$$
 \frac1T\sum_{t=1}^{T}g_t(\widehat\theta)=0,
-\]
+$$
 
 define the sensitivity matrix `J = E[∂g_t/∂θ]` and the long-run covariance
 
-\[
+$$
 \Omega=\Gamma_0+\sum_{\ell\ge1}
 (\Gamma_\ell+\Gamma_\ell^T),
 \quad \Gamma_\ell=\operatorname{Cov}(g_t,g_{t+\ell}).
-\]
+$$
 
 Under the relevant stationarity, mixing and differentiability assumptions,
 
-\[
+$$
 \operatorname{Cov}(\widehat\theta)
 \approx\frac1T J^{-1}\Omega J^{-T}.
-\]
+$$
 
 Observable uncertainty follows by the delta method or equivalent influence functions. This generic estimating-equation expression is a proposed implementation route; all normalization factors must be reconciled with the repository’s sample/state convention and independently tested.
 
@@ -183,30 +183,30 @@ No correct physical kinetics is needed. The additional information is the mixing
 
 Take a periodic torsion θ and define
 
-\[
+$$
 z_1=\sin\theta,\qquad z_2=\cos\theta.
-\]
+$$
 
 Under uniform θ, the covariance matrix is diagonal with entries 1/2. But the gradient Gram matrix is
 
-\[
+$$
 G=
 \begin{pmatrix}
 \cos^2\theta&-\sin\theta\cos\theta\\
 -\sin\theta\cos\theta&\sin^2\theta
 \end{pmatrix},
 \qquad \det G=0.
-\]
+$$
 
 The pair has one local degree of freedom. Nevertheless, it identifies the angle continuously around a circle, while either sine or cosine alone folds different angles onto the same value.
 
 Furthermore, its joint harmonic restraint is an ordinary smooth periodic potential:
 
-\[
+$$
 \frac{k}{2}\{[\sin\theta-\sin\theta_0]^2+
 [\cos\theta-\cos\theta_0]^2\}
 =k[1-\cos(\theta-\theta_0)].
-\]
+$$
 
 Thus rank deficiency does not imply an invalid or useless bias representation. A numerical check on 10,000 angles reproduced zero covariance off-diagonal and determinant zero to roundoff.
 
@@ -226,9 +226,9 @@ Section 9 makes every coarse cell required. The gate table then requires repeate
 
 For a simple IID target-sampling example with true cell probability `p = 10^-6` and `n = 1,000`, the probability of zero visits is about 99.90%. Observing zero visits is entirely expected. The one-sided exact 95% upper bound after zero successes is
 
-\[
+$$
 1-0.05^{1/1000}\approx0.002991,
-\]
+$$
 
 which is already below the proposed absolute probability tolerance of 0.02. The no-visits condition therefore does not imply inadequate absolute population precision.
 
@@ -262,17 +262,17 @@ The Gram–Schmidt algebra is correct. But applying diagonal umbrellas after the
 
 For `z = A(y-μ)`, a diagonal stiffness matrix `Kz` produces, in the original variables,
 
-\[
+$$
 K_y=A^TK_zA.
-\]
+$$
 
 For example,
 
-\[
+$$
 A=\begin{pmatrix}1&0\\-2&1\end{pmatrix},\quad K_z=I
 \quad\Rightarrow\quad
 K_y=\begin{pmatrix}5&-2\\-2&1\end{pmatrix}.
-\]
+$$
 
 This is a valid bias, but it is not merely a harmless relabeling of the original diagonal bias. Reproducing the original restraint after a general transformation would usually require off-diagonal stiffness terms.
 
@@ -357,10 +357,10 @@ Use a validated joint-sampling influence/covariance estimator when its assumptio
 
 For supported observables in an established stationary regime, a useful efficiency diagnostic is
 
-\[
+$$
 E(P)=\max_a\frac{C\,\widehat{\operatorname{Var}}[
 \widehat{\langle A_a\rangle}_0]}{\epsilon_a^2},
-\]
+$$
 
 where C is measured compute cost. Use equal-cost comparison directly; only extrapolate required cost when approximately inverse-cost variance scaling is demonstrated. This is an efficiency estimate conditional on adequate sampling, not an estimate of unknown systematic bias.
 
