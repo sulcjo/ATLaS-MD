@@ -3,7 +3,10 @@
 ## DECIDED 2026-09-22: chignolin_9 runs 236 states under MPS (59 contexts/GPU)
 
 User decision after T6 (MPS cannot be bypassed at 248 contexts). Checklist for chignolin_9:
-- [ ] **BLOCKER: GaMD stage fix.** chignolin_8 production never left gamd stage 2 (unboosted; see
+- [x] **GaMD stage fix: implemented 2026-09-22 (commit on main after 0401199; seed_frozen_envelope_stage5 +
+      verify_gamd_production_stage5).** DEPLOY TO AURUM ONLY AFTER chignolin_8 has stopped (marker
+      ~/gareus/chignolin/chignolin_8.US_ONLY_STOPPED): the new check refuses chignolin_8's stage-2 resume.
+      Original note: chignolin_8 production never left gamd stage 2 (unboosted; see
       run-registry.md). Frozen-envelope production must start in stage 5; add a test asserting FSF < 1
       on a lambda = 1 replica after one warm step. Nothing else on this list matters without it.
 - [ ] T2 first: MPS throughput at 59 contexts/GPU with the REAL Pep-GaMD integrator (fix the
