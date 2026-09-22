@@ -1,0 +1,42 @@
+# Chignolin run registry — what each campaign actually was
+
+Maintained from 2026-09-22. Each run is named for **what it sampled**, which is not always what its
+config asked for. Verified facts cite the artefact they were read from; anything not verifiable from
+surviving artefacts is marked *(unverified)*.
+
+| Run | What it actually was | Boost as applied | CVs / states | Hardware | Status / usable for |
+|---|---|---|---|---|---|
+| **chignolin_5** | GaMD-REUS, adaptive production, 2D, with a mid-run CV2 switch | single-channel GaMD, boost applied; type *(unverified, likely `lower-dihedral` like chignolin_6)*; envelope recalibrated once after epoch 0 | CV1 contacts; CV2 torsion-pca in epoch_000, tica-linear from epoch_001 on; ~27-28 states | MPS *(unverified)* | Completed early Aug 2026, ~8.2M samples. Run directory no longer on disk (local or aurum2). Its PMF was wrong until the 2026-08-04 union-MBAR per-epoch-bias fix; any number predating that is invalid |
+| **chignolin_6** | GaMD-REUS, double-adaptive, 2D | `lower-dihedral` GaMD, **boost applied** (all checkpoints stage 5, FSF < 1 on every replica); sigma0 5 | CV1 contacts, CV2 torsion-pca; up to 64 replicas; 2 AP epochs + final with top-ups | 4 GPU, MPS | Ran 2026-08-28 to 09-04 (`RUNS/_old/chignolin_6`). ESS 0.74 % was the window-map drop bug (fixed 38af544; data repairable in the loader without new MD) |
+| **chignolin_7** | **Pep-GaMD-REUS, 1D** | `pep-gamd-lower-dual` (peptide-only boost), **boost applied** (all checkpoints stage 5, FSF < 1 on 48/64 replicas; the rest sit above threshold, as GaMD allows); no lambda ladder | CV1 contacts only, no CV2; up to 128 replicas; 3 AP epochs + final | 4 GPU, MPS | Completed 2026-09-13 to 09-17 (`RUNS/chignolin_7`). CV1 topology-degenerate (529 file-local episodes); the reference MPS throughput run (3,200-3,400 ns/day/node) |
+| **chignolin_8** | **Pure 2D umbrella sampling (sparse 2D grid), NOT GaMD** | **none**: the Pep-GaMD integrator never left gamd-openmm stage 2 (conventional MD collecting statistics). All 248 replicas `stage = 2`, FSF exactly 1.0 on both channels, Vmax drifted per replica | CV1 nonlocal contacts, CV2 residual-torsion-pc (auto-selected by the swarm stage); 62 CV centres x 4 lambda rungs = 248 states, where the four rungs are dynamically identical | 4 GPU, **no MPS** (248 > ~60 clients/GPU) | Production from 2026-09-22. **Stopped deliberately at the last checkpoint inside stage 2 (step 485,200)** by the launcher watchdog; kept as a pure-US reference dataset. See below |
+
+## chignolin_8 in detail
+
+- **Intended:** swarm-calibrated Pep-GaMD lower-dual boost with a frozen envelope and a 4-rung lambda
+  ladder over a sparse 2D umbrella grid.
+- **Actual:** the swarm-to-production hand-off (epoch-0 sidecar, 03e0d43) delivered the envelope's
+  physics globals but not the integrator's `stepCount`/stage, and calibration steps were 0, so every
+  replica started gamd-openmm's stage machine at step 0. Stage bounds solved from the stage counters
+  at two checkpoints: stage 1 = steps 0-5,000, stage 2 = 5,000-500,000, stage 3 from 500,001, where
+  each replica would recompute its own threshold and k0 from its drifted statistics.
+- **What the data are:** 62-window 2D umbrella sampling with 4-fold redundancy per window.
+- **Caveat before using it as US:** exchanges were priced with a boost that was never applied. Rung
+  swaps between dynamically identical states were accepted only 7-21 % (should be 100 %), and
+  cross-rung CV swaps carried a phantom boost term, so the exchange was not in detailed balance with
+  the simulated Hamiltonians. Check that the four rungs' CV distributions coincide at each centre;
+  if they do, analyse as 62 US states with the rungs collapsed and lambda ignored. The lambda > 0
+  labels and the recorded boost-reweighting inputs must not be used.
+- **Cutoff:** `STOP_AT_PROD_DONE=485200` in `~/gareus/chignolin/chignolin_8.sh`; marker file
+  `~/gareus/chignolin/chignolin_8.US_ONLY_STOPPED`; chain status line
+  `STOPPED: US-only cutoff before GaMD stage 3`.
+- **Engineering by-products (all valid):** chain checkpoint/resume fixes, skeleton-manifest resume
+  fix, multi-GPU pull, the throughput study (`gpu-throughput-benchmark-todo.md`, T1-T8).
+- **Must be fixed before chignolin_9:** frozen-envelope production must start in gamd stage 5 (build
+  the integrator with zero cMD/equilibration stages, or seed `stepCount` past stage 4), with a
+  regression test asserting FSF < 1 on a lambda = 1 replica after one warm step.
+
+## Naming rule for future runs
+
+Record, per run: boost type **as applied** (read stage and FSF from a production checkpoint, not
+from the config), CV1/CV2, state count, MPS or not, and what the data are usable for.

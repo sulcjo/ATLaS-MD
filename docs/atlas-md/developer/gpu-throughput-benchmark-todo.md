@@ -3,6 +3,9 @@
 ## DECIDED 2026-09-22: chignolin_9 runs 236 states under MPS (59 contexts/GPU)
 
 User decision after T6 (MPS cannot be bypassed at 248 contexts). Checklist for chignolin_9:
+- [ ] **BLOCKER: GaMD stage fix.** chignolin_8 production never left gamd stage 2 (unboosted; see
+      run-registry.md). Frozen-envelope production must start in stage 5; add a test asserting FSF < 1
+      on a lambda = 1 replica after one warm step. Nothing else on this list matters without it.
 - [ ] T2 first: MPS throughput at 59 contexts/GPU with the REAL Pep-GaMD integrator (fix the
       c8_integ_bench.py P-arm segfault at high context counts, or measure via a short real run).
 - [ ] State space: 59 CV centres x 4 lambda rungs = 236. Regenerate the joint CV2 layout to land on

@@ -99,6 +99,11 @@ function cleanup {
         echo quit | nvidia-cuda-mps-control 2>/dev/null || true
     fi
     rm -rf "${CUDA_MPS_PIPE_DIRECTORY:-}" "${CUDA_MPS_LOG_DIRECTORY:-}" "${CUDA_CACHE_PATH:-}" 2>/dev/null || true
+    if [[ -f "${STOP_MARKER:-/nonexistent}" ]]; then
+        echo "[gareus] ${PEPTIDE}: US-only cutoff reached ($(cat "${STOP_MARKER}")); chain ends, no resubmission."
+        chain_marker "STOPPED: US-only cutoff before GaMD stage 3 ($(cat "${STOP_MARKER}"))"
+        return
+    fi
     if pool_is_spent; then
         echo "[gareus] MD pool spent for ${PEPTIDE}; chain ends."
         chain_marker "DONE: md pool spent"
@@ -238,6 +243,19 @@ fi
 # inside each context (A/B against 9.25-9.56 steps/s/replica of 2575924). (b) --us-pull-device-index
 # 0,1,2,3: pull workers round-robin over all four GPUs instead of GPU 0 only; affects the next phase
 # start (epoch_001 / final / top-ups), not this resume (epoch_000 pull is done and checkpointed).
+# 2026-09-22 23:45 US-ONLY CUTOFF. chignolin_8 production never left gamd-openmm stage 2 (unboosted cMD:
+# all FSF == 1.0; the swarm hand-off did not carry stepCount/stage). Stage 2 ends at step 500,000 (solved
+# from the stage counters); stage 3 would recalibrate threshold/k0 per replica. The user decided to keep
+# the run as a pure-US dataset up to the last checkpoint inside stage 2 and stop there.
+STOP_AT_PROD_DONE=485200
+STOP_MARKER="${RUN_DIR}/chignolin_8.US_ONLY_STOPPED"
+CKPT_JSON="${OUT_DIR}/adaptive_production/epoch_000/checkpoints/production_checkpoint_manifest.json"
+ckpt_prod_done() { python3 -c "import json,sys; print(int(json.load(open(sys.argv[1]))['prod_done']))" "${CKPT_JSON}" 2>/dev/null || echo 0; }
+if [[ -f "${STOP_MARKER}" ]] || (( $(ckpt_prod_done) >= STOP_AT_PROD_DONE )); then
+    [[ -f "${STOP_MARKER}" ]] || echo "prod_done=$(ckpt_prod_done) at $(date -Is)" > "${STOP_MARKER}"
+    echo "[gareus] ${PEPTIDE}: US-only cutoff already reached; not starting python."
+    exit 0
+fi
 python -m gareus \
     --config "${CONFIG}" \
     --out "${OUT_DIR}" \
@@ -255,6 +273,19 @@ python -m gareus \
     --us-start-primary-bad-bias-kcal 15.0 \
     ${RESUME_FLAG} &
 GAREUS_PID=$!
+# US-only cutoff watchdog: graceful TERM (python writes its own checkpoint) once the 20k-step
+# checkpoint at STOP_AT_PROD_DONE exists; the marker makes cleanup end the chain.
+(
+    while kill -0 "${GAREUS_PID}" 2>/dev/null; do
+        if (( $(ckpt_prod_done) >= STOP_AT_PROD_DONE )); then
+            echo "prod_done=$(ckpt_prod_done) at $(date -Is), job ${SLURM_JOB_ID}" > "${STOP_MARKER}"
+            echo "[gareus] US-only cutoff: checkpoint $(ckpt_prod_done) >= ${STOP_AT_PROD_DONE}; sending graceful TERM."
+            kill -TERM "${GAREUS_PID}" 2>/dev/null || true
+            break
+        fi
+        sleep 60
+    done
+) &
 set +e
 # A trapped signal makes bash return from `wait` immediately while python is still
 # alive; the script would then exit, SLURM would tear the job down, and the
