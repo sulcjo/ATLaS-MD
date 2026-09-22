@@ -165,3 +165,46 @@ def test_fresh_process_sees_the_same_epoch0_verdicts(tmp_path):
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True,
                          cwd=str(Path(__file__).resolve().parents[1]))
     assert json.loads(out.stdout.strip().splitlines()[-1]) == {"state": "complete", "cv2": "none"}
+
+
+def _snapshot(tmp_path, segment_id, identity):
+    (tmp_path / "windows").mkdir(exist_ok=True)
+    payload = {"segment_id": segment_id, "cv1_type": "contacts", "cv2_type": "residual-torsion-pc", "windows": []}
+    if identity is not None:
+        payload["kernel_identity"] = identity
+    (tmp_path / "windows" / f"{segment_id}.json").write_text(json.dumps(payload))
+
+
+def test_resume_kernel_check_falls_back_to_the_segment_snapshot_when_the_manifest_is_a_skeleton(tmp_path):
+    """chignolin_8 job 2574830 (2026-09-22): the epoch manifest had been reduced to a skeleton
+    (method_settings held only state_gamd_lambdas) while windows/seg_001.json still carried the full
+    kernel_identity of the code that produced the samples. The snapshot is the record the loader
+    classifies eligibility from, so the resume guard must read it before declaring 'pre-F01'."""
+    from gareus.production import verify_kernel_identity_on_resume
+    (tmp_path / "run_manifest.json").write_text(json.dumps({"method_settings": {"state_gamd_lambdas": [0.0, 1.0]}}))
+    _snapshot(tmp_path, "seg_001", {"cv_evaluator_version": RESIDUAL_EVALUATOR_VERSION,
+                                    "exchange_energy_version": EXCHANGE_ENERGY_VERSION})
+    verify_kernel_identity_on_resume(types.SimpleNamespace(), tmp_path, _residual_meta())   # recorded == current: continues
+
+
+def test_resume_kernel_check_uses_the_latest_snapshot_and_still_refuses_a_changed_kernel(tmp_path):
+    from gareus.production import verify_kernel_identity_on_resume
+    (tmp_path / "run_manifest.json").write_text(json.dumps({"method_settings": {"state_gamd_lambdas": [0.0]}}))
+    _snapshot(tmp_path, "seg_001", {"cv_evaluator_version": RESIDUAL_EVALUATOR_VERSION,
+                                    "exchange_energy_version": EXCHANGE_ENERGY_VERSION})
+    _snapshot(tmp_path, "seg_002", {"cv_evaluator_version": "affected_pre_f01",
+                                    "exchange_energy_version": EXCHANGE_ENERGY_VERSION})
+    with pytest.raises(RuntimeError, match="cv_evaluator_version"):
+        verify_kernel_identity_on_resume(types.SimpleNamespace(), tmp_path, _residual_meta())
+    _snapshot(tmp_path, "seg_002", {"cv_evaluator_version": RESIDUAL_EVALUATOR_VERSION,
+                                    "exchange_energy_version": "state_bias_matrix_v1"})
+    with pytest.raises(RuntimeError, match="exchanged with"):
+        verify_kernel_identity_on_resume(types.SimpleNamespace(), tmp_path, _residual_meta())
+
+
+def test_resume_kernel_check_still_refuses_when_neither_manifest_nor_snapshot_records_a_kernel(tmp_path):
+    from gareus.production import verify_kernel_identity_on_resume
+    (tmp_path / "run_manifest.json").write_text(json.dumps({"method_settings": {"seq": "GYDPETGTWG"}}))
+    _snapshot(tmp_path, "seg_001", None)   # a genuinely pre-F01 segment: snapshot without kernel_identity
+    with pytest.raises(RuntimeError, match="records no kernel identity"):
+        verify_kernel_identity_on_resume(types.SimpleNamespace(), tmp_path, _residual_meta())

@@ -228,6 +228,10 @@ else
     echo "[gareus] No prior output; starting ${PEPTIDE} from scratch."
 fi
 
+# 2026-09-22 14:40 A/B (job 2567463 -> next): UseBlockingSync false -> true. With 248 replica
+# threads spin-waiting on 192 cores the process burnt 165-190 cores and hot threads showed ~4x
+# more involuntary than voluntary context switches (docs/atlas-md/developer/
+# gpu-throughput-benchmark-todo.md, T1). Single-variable test; baseline 9.7 steps/s/replica.
 python -m gareus \
     --config "${CONFIG}" \
     --out "${OUT_DIR}" \
@@ -235,7 +239,7 @@ python -m gareus \
     --device-index 0,1,2,3 \
     --precision mixed \
     --cuda-disable-pme-stream true \
-    --cuda-use-blocking-sync false \
+    --cuda-use-blocking-sync true \
     --cuda-deterministic-forces false \
     --platform-temp-directory "${TMPDIR:-/tmp}" \
     --tui-mode dashboard \
@@ -245,7 +249,15 @@ python -m gareus \
     ${RESUME_FLAG} &
 GAREUS_PID=$!
 set +e
+# A trapped signal makes bash return from `wait` immediately while python is still
+# alive; the script would then exit, SLURM would tear the job down, and the
+# graceful-shutdown checkpoint would never be written (job 2563608, 2026-09-22).
+# Re-wait until the PID is really gone.
 wait "${GAREUS_PID}"
 GAREUS_EXIT=$?
+while kill -0 "${GAREUS_PID}" 2>/dev/null; do
+    wait "${GAREUS_PID}"
+    GAREUS_EXIT=$?
+done
 set -e
 exit "${GAREUS_EXIT}"

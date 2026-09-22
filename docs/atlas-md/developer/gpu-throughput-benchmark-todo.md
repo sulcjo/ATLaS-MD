@@ -23,17 +23,60 @@ Benchmark harness already exists and prints ns/day: `~/gareus/chignolin/aurum_ct
 chignolin_8 `base_system.xml`). It builds **bare replica contexts only** — no setup context, no
 pull sims.
 
-## T1 — close the 570 vs 3,195 gap (do this first; costs nothing)
+## T1 — RESOLVED 2026-09-22 14:40: the gap is the no-MPS time-slicing regime, not the pipeline
 
-The benchmark excluded exchange attempts, reporting, the barostat and trajectory I/O. Find which of
-those dominates before buying throughput elsewhere.
+Measured on job 2567463 (d094, 248 replicas, production from 13:52:22; all numbers re-derived from
+the node, the 20k-step checkpoint and `progress.jsonl`, not from the dashboard):
 
-Live lead, not yet chased: `chignolin_8.yaml` sets `report_interval: 2500`, but job 2563608's
-parquet manifest shows an effective **250**-step cadence — 50,500 steps produced 50,000 rows across
-248 replicas, i.e. ~202 reports per replica. `traj_interval` is also 250. Project memory
-(`project_md_perf_levers`) records that `report_interval` bounds the step chunk, so a 10x
-discrepancy here is a plausible first-order cost. Confirm which interval actually drives the chunk
-size, then A/B it.
+- **Not a regression from the launcher/config update.** Job 2563608 (before the `wait` fix,
+  `checkpoint_interval` 250000, pull 10000) ran 8.86 steps/s/replica; 2567463 runs 9.7 (median of
+  296 production records). The 20k checkpoint had not even fired when the rate was first measured.
+- **GPU**: 4 x L40S at 97-99 % "utilisation" but only 160 W of 350 W and 25 % memory-bus
+  utilisation — a kernel is always resident, the SMs are mostly empty. That is what 62 contexts
+  time-slicing one GPU without MPS looks like: kernels from different contexts never overlap.
+  Assignment is balanced (31.1 GB x 3, 31.5 GB on GPU 0 which also hosts the setup context).
+- **CPU**: the process holds **7,474 threads** and burns **165-190 of 192 cores** continuously.
+  248 replica threads spin-wait (`UseBlockingSync=false`, inherited from the old `--cuda-mps` soft
+  default) on a 192-core node: hot threads show ~52k involuntary vs ~12k voluntary context switches
+  — the scheduler is preempting them. Affinity is unpinned (0-191); GPUs sit on NUMA nodes
+  3/9/15/21 of 24. ~7,000 of the threads are idle and of unidentified origin (not a cost, noted).
+- **Barostat** (`biased_mc`, every 200 steps): 100 attempts/replica in 2,075 s of production;
+  `evaluate_s` median 29.7 s + `read_s` 4.7 s = **34 s/replica = 1.7 % of wall**. 27 % acceptance.
+  Each U* evaluation is 5 group-energy `getState` reads, two evaluations plus a positions read and a
+  restore per attempt (~12 syncs). Per-sync cost measured from it: **47-59 ms** — one full
+  62-context scheduler round.
+- **Exchanges** (`gibbs-walk`, every 400 steps): 12,030 attempts / 20k steps, 16.9 % accepted.
+  Rung (lambda) swaps dw1/dw2/dw3 accept 20.6 / 6.6 / 14.9 %; CV-neighbour swaps dw4/dw8/dw16 accept
+  67 / 41 / 68 %. 341 of 674 pairs with >=5 attempts never accepted. The stop-the-world barrier
+  costs nothing measurable: over 60 s at 200 ms sampling, GPU util < 50 % in 1.6-2.3 % of samples,
+  longest dip 0.4 s. (`report_interval` 2500 vs the observed 250-step cadence is
+  `distance_output_interval`/`traj_interval` by design, and irrelevant at this barrier cost.)
+- **Why the Langevin benchmark under-predicted the MPS penalty by 2x**: `aurum_ctx_test.py` stepped
+  a plain `LangevinMiddleIntegrator`. The production Pep-GaMD `CustomIntegrator` reads three energy
+  groups into host-evaluated globals (`PepE0/1/2`, `gareus/pep_gamd.py` `_setup_energy_values`) and
+  four force groups (`f0`, `f1` = second PME, `f2`, bias) **every step**, so every step carries >=2
+  host<->device round trips. Without MPS each round trip waits one scheduler round (~50 ms measured
+  above); 2 x 50 ms ~= the observed 103 ms/step. Under MPS a round trip is kernel latency.
+- **The real-workload MPS number the decision needed** (same integrator, dt, cadences, node class;
+  `progress.jsonl`, median over all production records at that replica count):
+
+  | run | replicas | contexts/GPU | ns/day/replica | node aggregate ns/day |
+  |---|---|---|---|---|
+  | chignolin_7, MPS | 16 | 4 | 41.2 | 659 |
+  | chignolin_7, MPS | 32 | 8 | 105.4 | **3,373** |
+  | chignolin_7, MPS | 64 | 16 | 49.9 | **3,194** |
+  | chignolin_8, no MPS | 248 | 62 | 2.9 | **727** |
+
+  The 248-state no-MPS design costs **4.4-4.6x node throughput** against the MPS regime this
+  integrator was already measured in. (The 16-replica row is below the 32-replica row; whatever
+  that phase was doing, it is not the regime of interest and was not investigated.)
+
+Consequences for the items below: T2 is no longer optional — it is the only unknown left (does MPS
+hold its ~3,200 ns/day at 59 contexts/GPU, or does time-slicing overhead return?). T5's
+`UseBlockingSync=true` is the one single-variable A/B that can run on the *current* design at its
+next resubmission: it frees ~180 cores of spin and the involuntary-preemption penalty; expected
+effect is second-order next to MPS, but it is free to measure and it becomes first-order once a
+236-context MPS run puts 236 spinning threads back on 192 cores.
 
 ## T2 — measure the missing MPS points
 

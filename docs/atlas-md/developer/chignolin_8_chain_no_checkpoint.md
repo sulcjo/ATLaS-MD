@@ -74,3 +74,33 @@ Open questions, not changed here:
   separate, cosmetic, suppressed after the first occurrence.
 - When 2566295 enters production (~13:15), check whether it seals `seg_001` `abandoned` and opens
   `seg_002` or writes into the same segment with overlapping `first_step`/`last_step`.
+
+## Follow-up 2026-09-22 15:25-16:30: the fix worked, then the first real resume was refused
+
+- **Wait-loop fix verified live.** Job 2567463 at its TERM (15:24:43): `Stop signal` -> `SIGTERM received`
+  -> `Graceful shutdown: saving checkpoint at step 54400/540322` -> checkpoint written 15:24:57 ->
+  `Resubmitting` -> `sacct` COMPLETED 0:0 at 15:26:51. The `.err` line "CANCELLED ... DUE to SIGNAL
+  Terminated" is SLURM logging the TERM delivery; the job then ran two more minutes and exited on its
+  own. First job of the campaign to end with its work saved.
+- **The successor (2574830) was the first job ever to resume from a real checkpoint, and it failed in
+  2 min:** `verify_kernel_identity_on_resume` (`gareus/production.py`) raised
+  `resume refused: a residual-torsion-pc campaign whose run manifest records no kernel identity was
+  produced by the affected pre-F01 code`. The chain marker went to `FAILED: exit code 1, chain stopped`.
+- **Root cause:** `epoch_000/run_manifest.json` was a 10-key `update_run_manifest()` skeleton
+  (`method_settings` held only `state_gamd_lambdas`, no `start_time_utc`, no kernel versions).
+  `run_gareus` tested file *existence* before calling `initialize_run_manifest`, so the skeleton was
+  never completed, and the F04 guard's "both kernel keys absent => pre-F01" heuristic fired. The
+  samples were never in doubt: `windows/seg_001.json` carries the full `kernel_identity`
+  (`residual_full_expression_v1` / `state_bias_matrix_v2`), which is the record the loader classifies
+  eligibility from. All three archived `epoch_000_*` attempts have full 85-key manifests; only the live
+  epoch's was reduced to a skeleton, already 4 KB by 11:04 (job 2566295's resume). Which resume step
+  discarded the full manifest between 09:24 and 11:04 was not identified.
+- **Fix (code, not a hand-edit of the manifest):** (1) `provenance.ensure_run_manifest_initialized`
+  re-initialises a missing *or skeleton* manifest, preserving `run_id` and every patch recorded before
+  the initialisation; `run_gareus` calls it in place of the existence test and prints a
+  `[provenance] ... skeleton` line when it repairs one. (2) `verify_kernel_identity_on_resume` falls
+  back to the newest `windows/seg_*.json` `kernel_identity` when the manifest records none, and still
+  refuses when neither records a kernel or the recorded one differs. Tests:
+  `tests/test_run_manifest_skeleton_init.py`, three new cases in `tests/test_residual_kernel_resume.py`.
+- The `UseBlockingSync=true` A/B is therefore still unmeasured: 2574830 confirmed the flag took
+  (`'UseBlockingSync': 'true'` in the production platform props) but produced no steps.

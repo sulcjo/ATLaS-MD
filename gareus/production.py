@@ -98,7 +98,8 @@ from .forces import (
     add_umbrella_force,
     add_contact_umbrella_force,
 )
-from .provenance import initialize_run_manifest, update_run_manifest, finalize_run_manifest, pair_model_sha256
+from .provenance import (initialize_run_manifest, ensure_run_manifest_initialized, update_run_manifest,
+                         finalize_run_manifest, pair_model_sha256)
 from .kernel_identity import (EXCHANGE_ENERGY_VERSION, FAST_SCALAR_MODES, LEGACY_TWO_TERM_MODES,
                               RESIDUAL_EVALUATOR_VERSION, kernel_identity_for_run)
 
@@ -558,6 +559,23 @@ def _linear_torsion_state_for_mode(args, mode: str) -> tuple[Path, "TICAResult"]
     return path, result
 
 
+def _latest_segment_kernel_identity(out_dir) -> Optional[dict]:
+    """``kernel_identity`` of the newest ``windows/<segment>.json`` that records one, else None.
+
+    Segment ids sort chronologically (seg_001, seg_002, ...); the newest snapshot
+    is the segment a resume continues.
+    """
+    win_dir = Path(out_dir) / "windows"
+    if not win_dir.is_dir():
+        return None
+    for path in sorted(win_dir.glob("seg_*.json"), reverse=True):
+        payload = read_json_file(path, None)
+        identity = (payload or {}).get("kernel_identity") if isinstance(payload, dict) else None
+        if isinstance(identity, dict) and identity:
+            return dict(identity)
+    return None
+
+
 def verify_kernel_identity_on_resume(args, out_dir, secondary_cv_metadata: Optional[dict]) -> None:
     """A changed kernel cannot continue the same scientific segment (spec F04 invariant 4).
 
@@ -569,6 +587,19 @@ def verify_kernel_identity_on_resume(args, out_dir, secondary_cv_metadata: Optio
     manifest = read_json_file(Path(out_dir) / "run_manifest.json", {}) or {}
     method = dict((manifest or {}).get("method_settings", {}) or {})
     mode = secondary_cv_mode(secondary_cv_metadata or {}) if (secondary_cv_metadata or {}).get("enabled") else "none"
+    if "exchange_energy_version" not in method and "cv_evaluator_version" not in method:
+        # The manifest predates kernel recording or is an update_run_manifest()
+        # skeleton (chignolin_8/epoch_000, 2026-09-22: method_settings held only
+        # state_gamd_lambdas). The segment's own windows/<segment>.json is the
+        # record the loader classifies eligibility from, so it is authoritative
+        # for what kernel produced the samples; read it before concluding pre-F01.
+        recorded = _latest_segment_kernel_identity(out_dir)
+        if recorded:
+            method = {"exchange_energy_version": recorded.get("exchange_energy_version"),
+                      "cv_evaluator_version": recorded.get("cv_evaluator_version")}
+            print(f"[resume] run manifest records no kernel identity; using the latest segment snapshot's "
+                  f"kernel_identity ({method['cv_evaluator_version']!r} / {method['exchange_energy_version']!r}).",
+                  flush=True)
     recorded_ex = method.get("exchange_energy_version")
     recorded_ev = method.get("cv_evaluator_version")
     if recorded_ex is not None and str(recorded_ex) != EXCHANGE_ENERGY_VERSION:
@@ -6224,8 +6255,14 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     acquire_run_lock(out_dir)
     platform, props = platform_and_properties(openmm, args.platform, args.precision, args.device_index, args.cpu_threads, args=args)
     setup_platform, setup_props = setup_platform_and_properties(openmm, args)
-    if not (Path(out_dir) / "run_manifest.json").exists():
-        initialize_run_manifest(args, out_dir, argv=[])
+    # Existence is not completeness: update_run_manifest() leaves a skeleton
+    # behind when it patches a directory before this point, and a skeleton has
+    # no method_settings kernel identity for the F04 resume guard to read
+    # (chignolin_8/epoch_000, 2026-09-22).
+    _manifest_existed = (Path(out_dir) / "run_manifest.json").exists()
+    if ensure_run_manifest_initialized(args, out_dir, argv=[]) and _manifest_existed:
+        print(f"[provenance] {Path(out_dir) / 'run_manifest.json'} existed without start-of-run provenance "
+              "(update_run_manifest skeleton); re-initialised in place, recorded patches preserved.", flush=True)
     update_run_manifest(out_dir, {
         "status": "production_started",
         "openmm_runtime": {

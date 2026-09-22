@@ -36,6 +36,8 @@ __all__ = [
     "RUN_MANIFEST_SCHEMA_VERSION",
     "sha256_file",
     "initialize_run_manifest",
+    "ensure_run_manifest_initialized",
+    "run_manifest_is_skeleton",
     "update_run_manifest",
     "finalize_run_manifest",
     "collect_artifact_hashes",
@@ -575,6 +577,54 @@ def _deep_update(target: dict[str, Any], patch: Mapping[str, Any]) -> dict[str, 
         else:
             target[key] = value
     return target
+
+
+def run_manifest_is_skeleton(payload: Mapping[str, Any]) -> bool:
+    """True when a manifest never went through initialize_run_manifest().
+
+    update_run_manifest() creates a three-key skeleton (schema_version, run_id,
+    status) when it patches a directory that has no manifest yet, so a manifest
+    can exist on disk without any start-of-run provenance. ``start_time_utc`` is
+    written only by initialize_run_manifest(), which makes it the marker.
+    """
+    return not payload or not payload.get("start_time_utc")
+
+
+# Skeleton keys that the fresh initialisation must own; everything else recorded
+# before the initialisation (method_settings patches, openmm_runtime, ...) is kept.
+_SKELETON_KEYS_OWNED_BY_INIT = frozenset({
+    "schema_version", "status", "last_updated_utc", "start_time_utc", "run_id", "end_time_utc", "error",
+})
+
+
+def ensure_run_manifest_initialized(args: Any, out_dir: Path, argv: Optional[Iterable[str]] = None) -> bool:
+    """Initialise the run manifest unless a complete one already exists.
+
+    Returns True when a manifest was written (missing or skeleton), False when
+    the existing manifest was already complete and was left untouched. A
+    skeleton keeps its ``run_id`` and every patch recorded into it before the
+    initialisation -- those patches were written by code that ran closest to
+    the final value (e.g. ``method_settings.state_gamd_lambdas``), so they win
+    over the recomputed defaults.
+
+    chignolin_8/epoch_000 (2026-09-22): production ran three jobs against a
+    manifest holding only ``method_settings.state_gamd_lambdas``, because the
+    caller tested file existence. Without the kernel identity that
+    initialize_run_manifest() records, the F04 resume guard read the skeleton as
+    a pre-F01 campaign and refused to continue an eligible segment.
+    """
+    out_dir = Path(out_dir)
+    existing = _read_manifest(out_dir)
+    if existing and not run_manifest_is_skeleton(existing):
+        return False
+    payload = initialize_run_manifest(args, out_dir, argv=argv)
+    if existing:
+        if existing.get("run_id"):
+            payload["run_id"] = existing["run_id"]
+        overlay = {k: v for k, v in existing.items() if k not in _SKELETON_KEYS_OWNED_BY_INIT}
+        _deep_update(payload, overlay)
+        _write_manifest(out_dir, payload)
+    return True
 
 
 def update_run_manifest(out_dir: Path, patch: Mapping[str, Any]) -> dict[str, Any]:

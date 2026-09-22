@@ -76,7 +76,7 @@ output:
                                  # against 133 GB of checkpoints, so ~3.7 GB total.
   report_interval: 2500
   distance_output_interval: 250  # 1 ps CV samples for MBAR
-  checkpoint_interval: 250000   # 2026-09-16: raised 10x. Cadence is step-based, so the ~10x barostat speedup had collapsed it to 1.6 min wall (169 MB per immutable generation, ~152 GB/day). Restores ~16 min; worst-case loss on a walltime kill is 16 min of a 3h51m job.
+  checkpoint_interval: 20000   # 2026-09-22: 250000 was unreachable -- 248 replicas run ~8.9 steps/s, so the first periodic save needed ~7.8 h inside a 4 h walltime and never fired. 20000 ~= 37 min wall.
   parquet_flush_rows: 50000
 
 platform:
@@ -238,7 +238,7 @@ starting_structures:
   # few hundredths of centre, so the long pull buys nothing. 10000 x 3.0 fs = 30 ps is a
   # short settle after the graft; the NPT-pull fallback path (no conformer) would need the
   # old budget back.
-  us_pull_steps_per_window: 10000
+  us_pull_steps_per_window: 12500   # 2026-09-22: raised from 10000. Ceiling is the walltime: 10000 steps x 248 windows on ONE GPU took 2h11; 12500 ~= 2h45, leaving ~1h production before the walltime TERM. Raise further only with a multi-GPU pull.
   us_pull_timestep_fs: 3.0
   us_pull_k: 300.0
 
