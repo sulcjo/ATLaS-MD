@@ -7,7 +7,7 @@
   <a href="https://github.com/sulcjo/ATLaS-MD/actions/workflows/deploy-atlas-md.yml"><img alt="Docs" src="https://github.com/sulcjo/ATLaS-MD/actions/workflows/deploy-atlas-md.yml/badge.svg"></a>
   <img alt="Python" src="https://img.shields.io/badge/python-%E2%89%A53.10-3776AB?logo=python&logoColor=white">
   <img alt="OpenMM" src="https://img.shields.io/badge/OpenMM-%E2%89%A58-5C6BC0">
-  <img alt="Release" src="https://img.shields.io/badge/release-v0.7-2ea44f">
+  <img alt="Release" src="https://img.shields.io/badge/release-v0.8.2-2ea44f">
   <img alt="Research software" src="https://img.shields.io/badge/status-research%20software-6f42c1">
 </p>
 
