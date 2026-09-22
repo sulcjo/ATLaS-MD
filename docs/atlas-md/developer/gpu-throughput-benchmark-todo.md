@@ -1,5 +1,18 @@
 # TODO — MPS / CUDA throughput benchmarking and tune-ups (opened 2026-09-22)
 
+## DECIDED 2026-09-22: chignolin_9 runs 236 states under MPS (59 contexts/GPU)
+
+User decision after T6 (MPS cannot be bypassed at 248 contexts). Checklist for chignolin_9:
+- [ ] T2 first: MPS throughput at 59 contexts/GPU with the REAL Pep-GaMD integrator (fix the
+      c8_integ_bench.py P-arm segfault at high context counts, or measure via a short real run).
+- [ ] State space: 59 CV centres x 4 lambda rungs = 236. Regenerate the joint CV2 layout to land on
+      59 centres (swarm analyze / ladder design), do NOT delete rows from windows_lambda_ladder.csv;
+      the F05 zero-k unrestrained stack must survive.
+- [ ] Launcher: MPS daemon on, `--cuda-mps`, keep `ulimit -n 65536`, keep the wait-loop, keep
+      `--us-pull-device-index 0,1,2,3`; setup context + pull workers also count as MPS clients on
+      their GPUs -> check 59 + setup + pull stays under ~60 per GPU, or run the pull before MPS starts.
+- [ ] Carry over the #4 PME-stream verdict from chignolin_8's next job.
+
 Not started. Nothing here blocks chignolin_8; all of it applies to a **future** campaign or to a
 config change on a later resubmission. Owner: unassigned.
 
