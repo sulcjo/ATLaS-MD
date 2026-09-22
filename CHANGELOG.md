@@ -4,6 +4,35 @@ All notable changes to ATLaS-MD are documented here.
 
 The project follows semantic-style release numbering where practical. Research-method changes that alter a sampled Hamiltonian, estimator, output contract, or thermodynamic assumption should be called out explicitly even when backwards compatibility is retained.
 
+## [0.8.2] — 2026-09-22
+
+Official release of the adaptive CV-selection and thermodynamic-repair work landed after v0.8.1. This release supersedes the untagged internal `0.9.0` version bump that briefly existed on `main`; no v0.9.0 tag or GitHub release was published.
+
+### Added
+
+- **Ab initio automatic CV2 selection.** Swarm/GENPEPT evidence can select and freeze an orthogonal secondary coordinate without a native structure or supervised folded/unfolded labels. The pipeline includes residual-torsion-PC candidates, held-out independence/information diagnostics, coupling and stability checks, deployability certificates, frozen pair digests, resume invariants, and 2D ladder construction.
+- **Region-aware exploration layouts.** Adaptive layouts preserve an exactly unrestrained spatial state and representatives of every supported CV1 region before allocating the remaining state budget, so sparse production cannot silently erase discovered territory.
+- **Molecular-cartography project identity.** The README landing hero now reflects adaptive mapping of conformational/free-energy landscapes.
+
+### Correctness
+
+- **One residual-CV definition across the thermodynamic path.** Fitting, deployment, the OpenMM force, fast-path sampling, exchange cross-pricing, reprojection, and stored artifacts now use the same compiled residual coordinate, including declared transform and clamp semantics.
+- **Versioned kernel identity and sample eligibility.** Residual-CV segments record evaluator/exchange-kernel identity; affected or unknown residual segments are excluded by default from equilibrium analysis rather than silently pooled.
+- **Collision-aware solvent repair and transactional grafting.** Solvent molecules are moved rigidly with peptide-solvent and emergency solvent-solvent clearance checks. Unresolved/invalid grafts fail closed and restore the original Context; non-finite coordinates, forces, or energies are rejected explicitly.
+- **Exploration-preserving adaptive guards.** Mandatory region and unrestrained states survive retirement, reachability filtering, and post-pull auto-drop.
+- **Frozen GaMD envelope handoff.** The swarm epoch-0 sidecar now seeds the campaign-global shared GaMD setup, preventing production from silently recalibrating the already-frozen envelope.
+
+### Operations
+
+- The chignolin_8 248-state launcher raises the file-descriptor limit and runs without CUDA MPS because the measured MPS client ceiling is about 60 contexts per L40S. The repository records the measured throughput trade-off and exact launch settings.
+- Release metadata, citation metadata, package version, README badge, and release notes are synchronized at v0.8.2.
+
+### Compatibility and validation
+
+- The residual-CV kernel and artifact schemas changed after v0.8.1. Older residual-CV segments that cannot prove the current evaluator/exchange identity are classified `affected` or `unknown` by the loader and are not treated as equilibrium data by default.
+- At the thermodynamic-repair completion point, the recorded full-suite result was **3374 passed, 2 skipped, 7 pre-existing failures**; the 47-file touched/new targeted batch was **835 passed**. Follow-up envelope-handoff tests added six passing cases.
+- The v0.8.2 release workflow re-runs the fast exchange-kernel gate, the official package-version assertion, and a strict MkDocs build before publishing the GitHub release.
+
 ## [0.8.1] — 2026-09-18
 
 Analysis-only release. No simulation, integrator, estimator or Hamiltonian code

@@ -179,7 +179,7 @@ connectivity before writing the table remains open (campaign-end connected-compo
 ## Completion record — M1 + F05 (2026-09-21)
 
 Commits on `main` (pushed 2026-09-21 21:5x CEST): `6daa088` P00 fixtures/log, `0b967c6` F01+F02+F04,
-`7e98fc0` F03, `3237298` F05, `ccd73c7` task log + release 0.9.0. Full test suite at `ccd73c7`
+`7e98fc0` F03, `3237298` F05, `ccd73c7` task log + internal 0.9.0 version bump (superseded before tagging by the official v0.8.2 release). Full test suite at `ccd73c7`
 (`-q tests/`, two slow smoke items deselected): **3374 passed, 2 skipped, 7 failed**; the 7 failures
 are the P00 baseline's pre-existing items (`test_atlas_md_docs` ×2 site_name casing,
 `test_example_configs` chignolin_genpept_contact_bias_sigma.yaml without `--seq`, and the four
