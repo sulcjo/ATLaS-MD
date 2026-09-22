@@ -104,3 +104,9 @@ Open questions, not changed here:
   `tests/test_run_manifest_skeleton_init.py`, three new cases in `tests/test_residual_kernel_resume.py`.
 - The `UseBlockingSync=true` A/B is therefore still unmeasured: 2574830 confirmed the flag took
   (`'UseBlockingSync': 'true'` in the production platform props) but produced no steps.
+- **17:21 relaunch (job 2575924, code 0d56bc8) resumed cleanly**: `[provenance] ... skeleton ...
+  re-initialised`, `Production checkpoint manifest found; skipping ... US pulling`, seg_003 opened at
+  17:26:50 from step 54,400, next checkpoint at 74,400 written 18:02:51. The `UseBlockingSync=true`
+  A/B result is in `gpu-throughput-benchmark-todo.md` (T5): no gain. Side observation: a resumed run
+  appends no `gareus_production` records to `progress.jsonl` (last record is the pre-resume 15:24:52),
+  so its rate has to be read from XTC frame counts or checkpoint timestamps; not chased.

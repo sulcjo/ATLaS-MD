@@ -118,11 +118,36 @@ redone from scratch by the next job).
 *other* setup context a 4-GPU context, which is untested here and probably slower for a 21k-atom
 system. Needs a scoped test before use.
 
-## T5 — other CUDA knobs never A/B'd on this system
+## T5 — `UseBlockingSync=true` A/B: MEASURED 2026-09-22, no gain (-2 to -4 %)
 
-Currently passed: `--precision mixed --cuda-disable-pme-stream true --cuda-use-blocking-sync false
---cuda-deterministic-forces false`. `--cuda-mps` was dropped (it only set the latter two). None of
-these has been measured against its alternative at 248 contexts on L40S.
+Single-variable test on the live campaign: job 2567463 (`UseBlockingSync=false`, spin) vs its
+successor 2575924 (`true`, everything else identical, resumed from the 54,400-step checkpoint on the
+same node d094).
+
+| | spin (2567463) | blocking (2575924) |
+|---|---|---|
+| first 20,000 production steps, wall clock | 2,075 s -> **9.64** steps/s/rep | 2,161 s -> **9.25** |
+| XTC frame count, whole run so far | 9.75 (median of 326 records) | 9.56 (83 frames, 36 min) |
+| XTC frame count, steady window | 9.75 | 9.44 (17:51-18:03) |
+| cores busy (of 192) | 165-190 | 156-173 |
+| GPU power (of 350 W) | 160 W | 173-181 W |
+| hottest thread, voluntary / involuntary switches | 12k / 52k | 1.1M / 158k |
+
+The switch did what it says on the tin -- threads now sleep and wake (1,100 wake-ups/s each)
+instead of spinning and being preempted -- and the GPUs drew 11 % more power, but the step rate
+did not move (slightly down, consistent with the wake-up latency now sitting on every one of the
+>=2 host round trips per step). **CPU oversubscription was not the limiter.** The ~0.9 core per
+replica thread persists under blocking sync, so it is not spin either; it is the host side of the
+CustomIntegrator step (kernel launches, per-step global evaluation, energy downloads) times 62
+contexts per GPU waiting on one another. That leaves the time-slicing regime itself (T2/T3, MPS)
+as the only lever with a measured payoff (c7: 3,200-3,400 ns/day/node vs 727 here).
+
+Flag left at `true` in `~/gareus/chignolin/chignolin_8.sh` (line 242) and the repo mirror: neutral
+on throughput, ~15 fewer cores burnt. Revert to `false` if an exact baseline configuration is
+wanted for a later comparison; nothing else depends on it.
+
+Remaining, never A/B'd on this system: `--precision mixed`, `--cuda-disable-pme-stream true`,
+`--cuda-deterministic-forces false`.
 
 ## Related, already fixed — do not re-diagnose
 
