@@ -3,6 +3,16 @@
 ## DECIDED 2026-09-22: chignolin_9 runs 236 states under MPS (59 contexts/GPU)
 
 User decision after T6 (MPS cannot be bypassed at 248 contexts). Checklist for chignolin_9:
+- [ ] **0 (user, 2026-09-23): MBAR connectivity of chignolin_8's sparse pseudo-2D US layout.** Once
+      chignolin_8 has stopped (step 485,200), analyse it as umbrella sampling and check that every
+      window is connected and reweightable: (a) rung consistency first -- the 4 rungs per centre must
+      give coinciding CV1/CV2 distributions (exchanges used a phantom boost); if they do, collapse to
+      62 US states with lambda ignored and boost terms excluded; (b) joint (CV1,CV2) overlap matrix and
+      the connected-components check on the thresholded overlap graph -- a disconnected state set is a
+      FAIL (the CV1-marginal overlap is blind on this layout: many centres share a CV1 value);
+      (c) per-state self-bias (~1 kT expected), MBAR convergence, ESS per state, and whether the sparse
+      CV2 spacing (spacing/sigma) leaves gaps. Result decides whether the swarm-designed sparse layout
+      is fit to carry chignolin_9's 59-centre design.
 - [x] **GaMD stage fix: implemented 2026-09-22 (commit on main after 0401199; seed_frozen_envelope_stage5 +
       verify_gamd_production_stage5).** DEPLOY TO AURUM ONLY AFTER chignolin_8 has stopped (marker
       ~/gareus/chignolin/chignolin_8.US_ONLY_STOPPED): the new check refuses chignolin_8's stage-2 resume.
