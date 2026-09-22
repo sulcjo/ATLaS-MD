@@ -11,7 +11,8 @@ User decision after T6 (MPS cannot be bypassed at 248 contexts). Checklist for c
 - [ ] Launcher: MPS daemon on, `--cuda-mps`, keep `ulimit -n 65536`, keep the wait-loop, keep
       `--us-pull-device-index 0,1,2,3`; setup context + pull workers also count as MPS clients on
       their GPUs -> check 59 + setup + pull stays under ~60 per GPU, or run the pull before MPS starts.
-- [ ] Carry over the #4 PME-stream verdict from chignolin_8's next job.
+- [x] #4 PME-stream verdict (T8): `--cuda-disable-pme-stream false` = +8-11 % vs blocking-sync
+      baseline, keep it -- but re-check under MPS, where the flag was originally set for stability.
 - [ ] Candidate (T7): compute the 1,256-pair contact sum once per step -- CV2 (residual vs CV1)
       currently re-evaluates it; the two CV forces together cost 26 % per context.
 - [ ] **Integrator lever 1 (user, 2026-09-22): replace the water-only auxiliary PME with a cheap
@@ -237,3 +238,19 @@ What this run corrected in T6:
   contact sum as the CV1 umbrella every step. Evaluating it once (one CustomCVForce carrying both
   restraints, sharing the contact sub-CV) could recover up to roughly half of the 26 %. Changes the
   force layout -> chignolin_9 candidate, alongside integrator lever 1.
+
+## T8 — `--cuda-disable-pme-stream false`: MEASURED 2026-09-22 (job 2579059), +8-11 %, kept
+
+Same node (d094), same launcher except this one flag; blocking sync on in both.
+
+| | PME stream disabled (2575924) | PME stream enabled (2579059) |
+|---|---|---|
+| first 20,000 production steps | 2,161 s -> 9.25 steps/s/rep | 1,943 s -> **10.29** (+11 %) |
+| steady window (XTC frames) | 9.44 | **10.48** (+11 %) |
+| whole run so far | 9.56 | 10.39 (+9 %) |
+
+Against the original spin-sync configuration (2567463, 9.64-9.75) the net gain is +6-8 %.
+Production start taken from the resume XTC's birth time (21:40:36); checkpoint 205,200 written
+22:12:59. The separate PME stream lets reciprocal-space work overlap direct-space work inside each
+context, which time-slicing does not undo. Launcher keeps `false`. Under MPS (chignolin_9) the flag
+was historically `true` for stability -- A/B it again there rather than carrying it over blindly.
