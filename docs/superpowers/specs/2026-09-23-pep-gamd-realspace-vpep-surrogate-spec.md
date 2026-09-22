@@ -1,209 +1,665 @@
 # Spec: real-space surrogate for the Pep-GaMD peptide energy V_pep
 
-- **Status:** proposal for review (not implemented)
+- **Status:** reviewed design revision; implementation-ready after the mandatory gates below (not implemented)
 - **Date:** 2026-09-23
-- **Code base:** ATLaS-MD / gareus v0.8.2, `main` @ c73224f and later
-- **Target campaign:** chignolin_9 (new kernel identity, new swarm envelope; never a resume of an
-  existing campaign)
-- **Author:** ATLaS-MD development session, for review by Astra
+- **Code base reviewed:** ATLaS-MD / gareus v0.8.2, `main` @ dfeb8f983904948ddeeb0f8fa898f4cc9387ecf2
+- **Target campaign:** chignolin_9 (new boost kernel, new swarm envelope; never a resume of an
+  existing exact-Pep-GaMD campaign)
+- **Author:** ATLaS-MD development session; revised after independent review against `main`
 
 ---
 
 ## 1. Problem
 
-`PepGaMDLowerDualIntegrator` (`gareus/pep_gamd.py`) boosts only the peptide. It gets the peptide's
-nonbonded energy by subtracting a water-only copy of the nonbonded force:
+`PepGaMDLowerDualIntegrator` (`gareus/pep_gamd.py`) boosts only the peptide. The current exact
+implementation obtains the peptide-focused potential by subtracting a water-only copy of the
+physical nonbonded force:
 
-| Force group | Contents | Energy |
+| Force group | Current exact-Pep-GaMD contents | Energy |
 |---|---|---|
 | 0 | physical `NonbondedForce` (full PME), `HarmonicBondForce`, `HarmonicAngleForce`, `CMMotionRemover` | E0 |
 | 1 | auxiliary `NonbondedForce` `PepGaMDWaterOnlyNonbonded`: physical copy with peptide q, epsilon and peptide exceptions zeroed, PME parameters pinned to group 0 | E1 |
 | 2 | `PeriodicTorsionForce`, `CMAPTorsionForce` | E2 |
 | 29, 31 | secondary-CV restraint, primary contact umbrella (never boosted) | bias |
 
-```
-V_pep = E0 - E1 + E2
+```text
+V_pep_exact = E0 - E1 + E2
 ```
 
-Every MD step evaluates **two full PME forces** (groups 0 and 1) in **separate passes**, because an
-OpenMM `CustomIntegrator` computation step may read only one force group.
-
-Measured on the real chignolin_8 system (21k atoms, TIP3P, cutoff 0.8 nm, Ewald tolerance 1e-4),
-one context per NVIDIA L40S, no contention (jobs 2577764, 2579032):
+Every boosted MD step evaluates two full PME forces, groups 0 and 1, in separate passes. Measured on
+the real chignolin_8 system (about 21k atoms, TIP3P, cutoff 0.8 nm, Ewald tolerance 1e-4), one
+context per NVIDIA L40S, no contention (jobs 2577764 and 2579032):
 
 | Step | steps/s | vs Langevin |
-|---|---|---|
+|---|---:|---:|
 | Langevin, one force evaluation | 4,170 | 1.00 |
 | Langevin + auxiliary PME, still one evaluation | 3,030 | 0.73 |
 | Pep-GaMD, per-group evaluations | 1,978 | 0.47 |
 | Pep-GaMD + production CV forces | 1,461 | 0.35 |
 
-The water-only PME costs about 27 % by itself. Its separate pass, together with the other per-group
-reads, costs about another 35 %. The peptide has 138 atoms and the solvent about 21,000, so a second
-full-system PME is being spent to recover the energy of a 138-atom subset.
+The water-only PME costs about 27% by itself. Its separate pass, together with the remaining
+per-group reads, costs about another 35%. The peptide has 138 atoms and the solvent about 21,000, so
+a second full-system PME is being spent to recover the energy of a small atom subset.
 
-## 2. Correctness argument: the boost need not use the exact peptide energy
+The proposal is to replace that second PME, only for a new Pep-GaMD kernel, by a cheap real-space
+surrogate that remains a **measurement channel**, never a physical force.
 
-GaMD reweighting is exact for **any** boost `dV(x) = g(S(x))`, where `S` is any smooth function of
-the coordinates, provided two conditions hold:
+## 2. Correctness argument
 
-1. **The applied force is the exact negative gradient of `U(x) + dV(x)`.** The only thing that
-   matters is that the sampled distribution is proportional to `exp[-beta (U + dV)]`.
-2. **MBAR / the lambda ladder reweights with exactly the `dV` that was applied**, reconstructed from
-   the same recorded `S` value per frame with the same frozen envelope. That is the job of
-   `apply_ladder_boost_to_u` and `pep_gamd_boost_kj` today.
+### 2.1 The boost coordinate need not equal the exact peptide PME energy
 
-`V_pep` therefore only has to **target** the degrees of freedom whose barriers we want to lower. It
-does not have to equal the PME peptide energy. How close the surrogate is to the exact `V_pep`
-determines **efficiency** (how well the boost flattens the relevant barriers, and how Gaussian dV
-stays), not **validity**. This is the central claim for review.
+GaMD equilibrium reweighting is valid for any deterministic differentiable boost
 
-## 3. Proposed energy and force
-
-### 3.1 Surrogate
-
-Define the Total-channel argument with a surrogate `S(x)` in place of `E0 - E1`:
-
-```
-S(x)  = E_S(x)                      surrogate peptide nonbonded + peptide bonded energy
-Y(x)  = S(x) + E2(x) + dV_D(E2)      Total-channel energy (dual dependent, as today)
-dV_D  = 1/2 k_D (Eth_D - E2)^2       if E2 < Eth_D
-dV_T  = 1/2 k_T (Eth_T - Y)^2        if Y  < Eth_T
-FSF_D = 1 - k_D (Eth_D - E2),   FSF_T = 1 - k_T (Eth_T - Y)   (1 when above threshold)
-U*    = U_phys + U_bias + dV_D(E2) + dV_T(Y)
+```text
+DeltaV(x) = g(S(x))
 ```
 
-The surrogate force lives in its own force group `s`. It contributes **no physical force**: it
-exists only to compute `S` and `f_S = -grad S`.
+provided that:
 
-### 3.2 Force algebra (derived, to be checked independently)
+1. the propagated force is exactly `-grad[U_phys(x) + U_bias(x) + DeltaV(x)]`; and
+2. exchange and MBAR reconstruct exactly the same `DeltaV` from the same recorded raw boost
+   coordinates and the same frozen envelope.
 
+Therefore the Total-channel coordinate does not need to equal `E0 - E1 + E2`. The surrogate only
+needs to be a useful smooth coordinate for lowering the barriers of interest. Its agreement with the
+old exact target controls **sampling efficiency**, not the formal equilibrium target.
+
+For NPT the same statement is box-dependent:
+
+```text
+DeltaV = DeltaV(x, B)
 ```
--grad U* = f_phys + f_bias - (1 - FSF_D) f2 - (1 - FSF_T) (f_S + FSF_D f2)
-         = f_phys + f_bias - (1 - FSF_T) f_S - (1 - FSF_T FSF_D) f2
+
+The application-controlled biased-MC barostat must evaluate the same surrogate at both old and trial
+boxes and use
+
+```text
+U*(x, B) = U_phys(x, B) + U_bias(x, B) + DeltaV(x, B)
 ```
 
-Sanity check against today's integrator. Substituting the exact decomposition `f_S = f0 - f1` and
-`f_phys = f0 + f2` (the auxiliary force is not physical) recovers the current applied force
-`FSF_T (f0 - f1) + FSF_T FSF_D f2 + f1 + f_bias`. So the surrogate is a strict generalisation.
+for the Metropolis volume-move energy. The surrogate measurement energy itself is never added to
+`U*`.
 
-### 3.3 Per-step reads (cost)
+### 2.2 Dependent dual ordering is unchanged
 
-| Read | Contents | Cost |
+The dihedral channel is evaluated first. Its boost enters the Total-channel argument exactly as in
+the current dependent-dual implementation. The raw per-frame Total coordinate is the energy before
+that dependent dihedral boost is added.
+
+This ordering is load-bearing for the lambda ladder and MBAR reconstruction.
+
+## 3. Mandatory force-group architecture
+
+### 3.1 Reuse force group 1 as the universal Pep-GaMD measurement channel
+
+Do **not** allocate the surrogate to a new force group.
+
+The current repository defines `pep_gamd_bias_force_groups(system)` as every occupied group outside
+`{0, 1, 2}`. A surrogate placed in a new group would therefore be classified as an ordinary bias
+force and physically applied in addition to being used as a boost coordinate.
+
+Instead preserve one stable invariant:
+
+> **Force group 1 is the Pep-GaMD measurement channel. It is never part of the physical
+> Hamiltonian and is excluded from ordinary integration.**
+
+The two Pep-GaMD kernels are mutually exclusive:
+
+| Boost kernel | Group 1 contents | Total raw coordinate |
 |---|---|---|
-| `f` (all integrated groups), `energy` not needed | physical + bias, **one** PME | full pass |
-| `f_s`, `energy_s` | surrogate, real-space only, peptide pairs only | cheap |
-| `f2`, `energy2` | dihedrals | cheap |
+| `pep-gamd-lower-dual` | exact water-only PME auxiliary | `E0 - E1 + E2` |
+| `pep-gamd-lower-dual-rs` | real-space surrogate force set | `E1 + E2 = S + E2` |
 
-`f` must **exclude** group `s`. This is to be verified: whether `setIntegrationForceGroups` restricts
-`f` / `energy` inside a `CustomIntegrator`. If it does not, use `f - f_s`, which costs no extra pass
-because `f_s` is read anyway. The applied force is then:
+An exact auxiliary and an RS surrogate must never coexist in the same `System`. Construction must
+fail loudly if both are detected.
 
+Group 1 may contain multiple OpenMM Force objects for the RS kernel. `energy1` and `f1` then
+naturally mean the sum of all surrogate components.
+
+### 3.2 Required RS force names
+
+Use stable names so every code path can identify measurement forces by role rather than by Force
+class:
+
+- `PepGaMDRSNonbonded`
+- `PepGaMDRSExceptions`
+- `PepGaMDRSBonds`
+- `PepGaMDRSAngles`
+
+All live in force group 1. Optional future components must use the `PepGaMDRS` prefix and group 1.
+
+Generalize the existing exact-only helper logic to recognize a Pep-GaMD measurement channel, rather
+than assuming that the only nonphysical measuring force is `PepGaMDWaterOnlyNonbonded`.
+
+### 3.3 Physical and bias semantics
+
+For both exact and RS Pep-GaMD:
+
+- physical energy excludes group 1;
+- conventional MD integration excludes group 1;
+- group 2 remains physical peptide torsion energy;
+- umbrella and secondary-CV forces remain outside groups 0, 1 and 2;
+- `pep_gamd_bias_force_groups` can retain its current complement-of-{0,1,2} definition.
+
+This preserves the existing group ontology and avoids a repo-wide new-group migration.
+
+## 4. Proposed RS energy and force
+
+### 4.1 Energy definition
+
+Let group 1 contain the surrogate energy `S(x)` and group 2 contain `E2(x)`.
+
+```text
+S(x)       = E1(x)                       # surrogate peptide-focused non-torsion energy
+V_D(x)     = E2(x)                       # Dihedral raw coordinate
+V_T_raw(x) = S(x) + E2(x)                # raw Total coordinate recorded as v_pep_kj_mol
+
+dV_D = 1/2 k_D (Eth_D - E2)^2            if the lower-bound GaMD guard is active
+Y     = S + E2 + dV_D
+dV_T = 1/2 k_T (Eth_T - Y)^2             if the lower-bound GaMD guard is active
+
+FSF_D = 1 - k_D (Eth_D - E2)
+FSF_T = 1 - k_T (Eth_T - Y)
+
+U* = U_phys + U_bias + dV_D + dV_T
 ```
-F = (f - f_s) - (1 - FSF_T) f_s - (1 - FSF_T FSF_D) f2      if f includes group s
+
+The exact gamd-openmm small-range guards and threshold guards remain authoritative; the equations
+above show the dependency structure, not a replacement implementation of those guards.
+
+### 4.2 Force algebra
+
+Let `f1 = -grad S` and `f2 = -grad E2`. Then
+
+```text
+-grad U*
+    = f_phys + f_bias
+      - (1 - FSF_D) f2
+      - (1 - FSF_T) (f1 + FSF_D f2)
+
+    = f_phys + f_bias
+      - (1 - FSF_T) f1
+      - (1 - FSF_T FSF_D) f2
 ```
 
-That is one PME per step instead of two, and one full pass plus two cheap ones instead of four or
-more passes.
+This is the force that must be propagated.
 
-## 4. Surrogate candidates
+### 4.3 One-PME implementation
 
-All candidates cover the same pair set: every pair with **at least one peptide atom**
-(peptide-peptide and peptide-solvent). Water-water pairs are never included, which is exactly the
-set `E0 - E1` measures. Implement them with `CustomNonbondedForce` interaction groups
-`{pep} x {pep}` and `{pep} x {solvent}`, as two groups so no pair is counted twice. Mirror the
-physical exclusions (1-2, 1-3). Add the peptide 1-4 scaled pairs as a `CustomBondForce` over the
-physical exception list, and copies of the peptide's `HarmonicBond` / `HarmonicAngle` terms. The
-bonded copies keep `S` covering what `E0` covered for the peptide. Rigid TIP3P water carries no
-bond or angle terms, which is to be confirmed on the built system.
+Set the integrator's integration-force-group mask to all physical and bias groups **except group 1**.
+OpenMM's `CustomIntegrator` bare `f`/`energy` use that integration-force-group mask, while explicit
+`f1`/`energy1` request group 1 directly. This behavior has been checked against the current OpenMM
+implementation and must still be locked by a repository test.
 
-| ID | Electrostatics | LJ | Relation to exact E0 - E1 | Notes |
-|---|---|---|---|---|
-| **S1 (recommended)** | PME **real-space term only**: `q_i q_j erfc(alpha r)/r`, same alpha and cutoff as the physical PME | same as physical (cutoff 0.8 nm, same switch or dispersion treatment, minus the long-range correction) | differs by the reciprocal-space and self terms for peptide-involving pairs, which vary slowly with peptide conformation | closest to exact; alpha taken from `pme_parameters_from_tolerance` |
-| S2 | damped shifted force (DSF / Wolf) | same | smooth at cutoff by construction | fallback if S1 shows cutoff artefacts |
-| S3 | reaction field (eps_rf = 78.5) | same | classic, cruder | simplest reference |
+The boosted update becomes
 
-Chignolin (GYDPETGTWG) carries charged termini plus D3 and E5 side chains. The long-range part that
-S1 drops is the part most sensitive to that charge distribution, which is why the correlation test
-in §5 is mandatory rather than optional.
+```text
+F = f - (1 - FSF_T) f1 - (1 - FSF_T FSF_D) f2
+```
 
-## 5. Acceptance criteria before building (offline, no MD)
+where bare `f` already equals `f_phys + f_bias`.
 
-Use existing frames: chignolin_8 production (plain umbrella sampling over 62 windows, a broad
-conformational spread) and the swarm frames. For each frame compute the exact `E0 - E1`, and each
-surrogate `S` on the same coordinates (Reference or CUDA platform, single context).
+Required per-step reads:
 
-| Metric | Threshold (proposed) | Why |
+| Read | Contents | Expected cost |
 |---|---|---|
-| Pearson r of `S` vs `E0 - E1`, pooled and per window | >= 0.90 pooled, >= 0.80 in every window | the boost acts on fluctuations |
-| sigma of `S` / sigma of `E0 - E1`, per window | 0.8-1.25 | sigma_V sets k0 and the Gaussianity of dV |
-| force cosine similarity `f_S` vs `(f0 - f1)` on peptide atoms | median >= 0.90 | the boost flattens along `f_S` |
-| energy drift / NaN in a 1 ns NVE test with the surrogate boost live | none beyond the physical system's own drift | smoothness at the cutoff |
+| `f` | physical + bias, group 1 excluded | one full physical PME pass |
+| `f1` and `energy1` | surrogate components only | cheap real-space peptide-focused pass |
+| `f2` and `energy2` | dihedrals | cheap |
 
-Pick the cheapest surrogate that passes. If none pass, stay on the exact auxiliary PME; the
-method is unchanged and only the speed is lost.
+The conventional-MD stages can use bare `f` directly with the same group-1 exclusion.
 
-## 6. Implementation outline
+There is no fallback form that intentionally includes group 1 in bare `f`. A failure of the
+integration-force-group invariant is a hard error/test failure, not a production alternative.
 
-1. New boost type `pep-gamd-rs-lower-dual`. The stock `pep-gamd-lower-dual` stays bit-identical.
-2. `ensure_pep_gamd_rs_partition(system, peptide_atoms, flavour)`: adds the surrogate forces in a
-   dedicated group, never 0..2, and never counted by `pep_gamd_bias_force_groups`. It is idempotent
-   and found by name, like the auxiliary force today.
-3. Integrator subclass: overrides `_setup_energy_values` (`Y` from `energy_s + energy2`) and
-   `_add_gamd_update_step` (§3.2). The conventional-MD stages exclude the surrogate force.
-4. **Everything that prices the boost switches to the same `S`:**
-   - the recorded per-frame value, which replaces `v_pep_kj_mol` or is stored as a new
-     `v_s_kj_mol` column;
-   - the exchange state-bias matrix;
-   - the NPT biased-MC adapter's U*;
-   - `pep_gamd_boost_kj`;
-   - swarm envelope calibration.
+## 5. Surrogate construction
 
-   Physical-energy reports (`potential_kj_mol`, energy decomposition) exclude group `s`.
-5. **New kernel identity string** (F04): the loader refuses to mix surrogate and exact segments.
-6. The stage-5 seeding and `verify_gamd_production_stage5` from c73224f apply unchanged.
+### 5.1 Pair set
 
-## 7. Tests
+The surrogate nonbonded pair set contains every pair with at least one peptide atom:
 
-- **Force algebra:** on the Pep-GaMD test fixture with the Reference platform, the applied force
-  equals the finite-difference `-grad U*` to 1e-6 relative, with the boost live (0 < FSF < 1 on both
-  channels).
-- **k0 = 0 identity:** bit-identical trajectory to the physical system without the surrogate force,
-  after one warm step (gamd-openmm's first step is inert).
-- **Consistency:** the value that MBAR reconstructs (`pep_gamd_boost_kj` from the recorded `S`)
-  equals the integrator's own boost global within 1e-6 kJ/mol on every frame.
-- **Reweighting oracle:** one existing thermodynamic-validity oracle, extended with a surrogate
-  boost. The recovered FES must match ground truth as the exact-boost case does.
-- **Exclusion:** physical energy and pressure/barostat U* are unchanged by the surrogate force's
-  presence at k0 = 0.
+- peptide-peptide; and
+- peptide-solvent.
 
-## 8. Expected gain and how to measure
+Water-water and other nonpeptide-nonpeptide pairs are absent.
 
-Upper bound per context: from 1,978 steps/s (exact, no CV forces) toward the 3,030 of Langevin plus
-one extra PME, i.e. about 1.5x from removing the second PME. Collapsing four or more passes into one
-full pass plus two cheap ones may add more, up to about 2x. The CV forces (26 %) are untouched by
-this change. Measure with the existing `c8_integ_bench*.py` harness: single context, and 59
-contexts per GPU under MPS.
+Use `CustomNonbondedForce` interaction groups:
 
-## 9. Risks
+```text
+{peptide} x {peptide}
+{peptide} x {nonpeptide}
+```
 
-- **A weaker boost target.** If `S` misses the long-range part that couples to the peptide's slow
-  motions, the boost flattens less of the relevant landscape. §5 guards this.
-- **dV non-Gaussianity.** A different `S` gives a different dV distribution, so the anharmonicity
-  diagnostics must be re-checked on the first epoch.
-- **Hidden energy consumers.** Any code path that still reads `E0 - E1` as the boost argument
-  silently mis-prices the boost. The consistency test in §7 and the kernel-identity refusal guard
-  this.
-- **OpenMM detail.** Whether `f` inside a `CustomIntegrator` honours `setIntegrationForceGroups`
-  decides between the two forms in §3.3; verify first.
+with the nonpeptide set explicitly disjoint from the peptide set. Tests must verify that no pair is
+counted twice.
 
-## 10. Questions for review
+Use periodic cutoff semantics appropriate to the physical system.
 
-1. Is the §2 validity argument complete for the dual dependent scheme with the lambda ladder, and
-   for the biased-MC NPT barostat's U*?
-2. Is S1 (PME real space only) the right first choice over DSF / reaction field for a peptide with
-   net charges?
-3. Are the §5 thresholds appropriate, or should acceptance be judged on boost efficiency directly,
-   e.g. transition counts in a short boosted pilot?
-4. Recording: replace `v_pep_kj_mol` or add `v_s_kj_mol` alongside it (both are cheap)? Recording
-   both would allow a later exact-vs-surrogate comparison on the same frames.
+### 5.2 Exceptions: mirror the physical NonbondedForce exactly
+
+Do not infer 1-2, 1-3 or 1-4 structure from topology.
+
+Iterate the physical `NonbondedForce` exception table. For every exception involving at least one
+peptide atom:
+
+1. add the pair as an exclusion to the surrogate `CustomNonbondedForce`;
+2. if the physical exception has nonzero Coulomb and/or LJ energy, recreate that exception exactly
+   in `PepGaMDRSExceptions` using its actual `chargeProd`, `sigma` and `epsilon`.
+
+This prevents double counting and preserves arbitrary force-field exception scaling.
+
+### 5.3 Bonded terms
+
+`S` also includes peptide-associated physical `HarmonicBondForce` and `HarmonicAngleForce` terms
+that are part of the intended non-torsion peptide target. Copy only the selected terms into group 1;
+do not move or modify the physical originals.
+
+For the chignolin_9 TIP3P target, rigid water is expected not to contribute physical harmonic
+bond/angle energy. Confirm this on the built `System` and record the result. If a future solvent
+model has energetic bonded terms, they must not enter the RS surrogate merely because they happen to
+share a physical force group.
+
+Torsions remain exclusively in group 2 and are not duplicated into `S`.
+
+### 5.4 Candidate electrostatics
+
+| ID | Electrostatics | LJ | Purpose |
+|---|---|---|---|
+| **S1-direct** | PME direct-space term `q_i q_j erfc(alpha r)/r` with the physical PME alpha and cutoff | physical pair LJ form | closest diagnostic approximation to the existing exact target |
+| **S1-smooth** | smoothly switched/force-shifted version of the PME direct-space term | physical pair LJ form with compatible cutoff handling | preferred production candidate if it preserves correlation and improves force continuity |
+| S2 | DSF/Wolf | same physical LJ family | robust smooth fallback |
+| S3 | reaction field, e.g. `eps_rf = 78.5` | same physical LJ family | simple reference/fallback |
+
+For this application, smoothness of `S` and `grad S` at the cutoff is more important than literal
+identity to the direct-space PME term, because `S` is a boost coordinate, not part of
+`U_phys`.
+
+Chignolin (GYDPETGTWG) has charged termini plus D3 and E5 side chains, so removal of reciprocal-space
+electrostatics may matter. This is an efficiency question and must be measured rather than assumed.
+
+## 6. Offline surrogate gate
+
+Use existing chignolin_8 production frames spanning the umbrella windows plus swarm/seed-bank frames.
+On identical coordinates evaluate:
+
+```text
+B_exact = E0 - E1_exact
+S       = candidate surrogate group-1 energy
+```
+
+Compare non-torsion components here. For a full Total-channel comparison use `B_exact + E2` versus
+`S + E2`.
+
+Minimum prefilter:
+
+| Metric | Gate | Rationale |
+|---|---:|---|
+| pooled Pearson r, `S` vs `B_exact` | >= 0.90 | fluctuation tracking |
+| per-window Pearson r | >= 0.80 in every materially populated window | avoid a locally broken target |
+| per-window `sigma(S)/sigma(B_exact)` | 0.8-1.25 | protects GaMD envelope scale |
+| peptide-atom force cosine, `f_S` vs exact non-torsion target force | median >= 0.90 | direction of barrier flattening |
+| force cosine lower tail | p10 >= 0.70 | prevents a good median hiding bad regions |
+| peptide-atom force-norm ratio | report median and p10-p90; no near-zero-collapse mode | cosine alone cannot detect a vanishing surrogate |
+| finite energy/force | 100% finite | basic gate |
+
+These are **prefilters**, not the final promotion criterion. A surrogate that is thermodynamically
+valid and samples better must not be rejected solely because it is not numerically identical to the
+old target.
+
+If no candidate clears the prefilter, retain exact Pep-GaMD.
+
+## 7. Short boosted pilot gate
+
+After the offline gate, run a short representative boosted pilot over compact, intermediate and
+extended regions using a newly calibrated RS envelope.
+
+Required diagnostics:
+
+- no NaN/Inf or constraint instability;
+- cutoff/stability test, including an NVE or deterministic force-continuity control against the
+  physical-system baseline;
+- distribution of `dV_D`, `dV_T` and total `dV`;
+- existing GaMD anharmonicity diagnostics;
+- fraction of frames with each boost channel active;
+- lambda-rung overlap and effective sample-size diagnostics;
+- exchange acceptance / round trips when a ladder is used;
+- structural-space coverage and transitions as **efficiency** metrics;
+- no systematic disappearance of compact/folded-like seed-bank regions relative to the exact
+  control.
+
+Promotion is based on the combined thermodynamic and sampling diagnostics, not transition count
+alone.
+
+## 8. Recording and reweighting semantics
+
+### 8.1 Preserve `v_pep_kj_mol` as the raw Total-channel coordinate
+
+For the RS kernel record
+
+```text
+v_pep_kj_mol = S + E2
+v_dih_kj_mol = E2
+```
+
+This preserves the existing semantic contract consumed by `pep_gamd_boost_kj`: `v_pep_kj_mol` is
+the raw Total-channel energy before the dependent dihedral boost is added.
+
+Do **not** replace `v_pep_kj_mol` with bare `S`. Doing so would silently remove `E2` from the
+Total-channel reconstruction.
+
+Optionally add
+
+```text
+v_s_kj_mol = S
+```
+
+as a diagnostic column. It is not required for MBAR if `v_pep_kj_mol` and `v_dih_kj_mol` are
+present.
+
+### 8.2 Do not evaluate the exact auxiliary PME during RS production
+
+Running the old exact water-only PME merely to record exact and surrogate energies would reintroduce
+the cost this design removes.
+
+Exact-versus-surrogate comparisons belong in offline analysis contexts over saved frames.
+
+### 8.3 Frozen envelope
+
+The RS envelope is calibrated from RS raw coordinates and frozen for the campaign exactly like the
+current ladder envelope. Every exchange/MBAR consumer must reconstruct the boost from the recorded
+`v_pep_kj_mol`, `v_dih_kj_mol` and that RS envelope.
+
+No consumer may infer the boost from physical potential energy or from the old exact-Pep-GaMD
+definition.
+
+## 9. Repository implementation plan
+
+### 9.1 Boost type and dispatch
+
+Add
+
+```text
+pep-gamd-lower-dual-rs
+```
+
+rather than `pep-gamd-rs-lower-dual`. After the existing `pep-gamd-` prefix is stripped, the current
+calibration dispatcher still sees a name beginning with `lower`.
+
+Even with this compatible name, add an explicit regression test for threshold dispatch.
+
+Generalize the strict exact-only checks:
+
+- `is_pep_gamd(args)` becomes membership in the Pep-GaMD family;
+- add an exact-vs-RS discriminator;
+- add the RS type to `LADDER_BOOST_TYPES`;
+- keep `SUPPORTED_BIASED_MC_BOOST_TYPES` synchronized;
+- update CLI/help/preflight allow-lists.
+
+The stock `pep-gamd-lower-dual` path remains bit-identical.
+
+### 9.2 Partition builder
+
+Add `ensure_pep_gamd_rs_partition(system, peptide_atoms, flavour)`.
+
+It must:
+
+1. fail if the exact water-only auxiliary already exists;
+2. be idempotent for an already-built matching RS partition;
+3. construct all RS components in force group 1;
+4. assign the ordinary physical forces to groups 0/2 exactly as today;
+5. leave umbrella/secondary forces outside 0/1/2;
+6. expose enough metadata/name checks to distinguish surrogate flavour and prevent an accidental
+   S1/S2/S3 resume mismatch.
+
+Generalize `assign_pep_gamd_force_groups` so recognized RS measurement forces are legal in group 1,
+while unrelated `Custom*` forces in groups 0-2 are still rejected.
+
+### 9.3 Integrator
+
+Add an RS lower-dependent-dual integrator or parameterize the current subclass without changing the
+exact path.
+
+RS `_setup_energy_values`:
+
+```text
+PepE1 = energy1
+PepE2 = energy2
+
+StartingPotentialEnergy_Dihedral = PepE2
+StartingPotentialEnergy_Total    = PepE1 + PepE2
+```
+
+RS boosted force update:
+
+```text
+PepF1 = f1
+PepF2 = f2
+v += fscale * (f - (1-FSF_T)*PepF1 - (1-FSF_T*FSF_D)*PepF2) / m
+```
+
+The integration-force-group mask excludes group 1.
+
+Conventional stages use the same mask and bare `f`, with no surrogate force applied.
+
+### 9.4 Generic Total-channel helpers
+
+`total_energy_groups_for_args(args)` must return:
+
+```text
+exact Pep-GaMD: plus={0,2}, minus={1}
+RS Pep-GaMD:    plus={1,2}, minus={}
+stock modes:    existing behavior
+```
+
+Then `boost_target_energy_kj` can remain the shared calibration/recon primitive.
+
+Replace exact-only uses of `peptide_essential_energy_kj` in generic production/swarm paths with a
+boost-type-aware Total-channel helper. In particular, the swarm frame measurement must record
+`S+E2` for RS, not call the exact `E0-E1+E2` helper.
+
+### 9.5 Physical energy and conventional integration
+
+Generalize every helper that currently detects only `PepGaMDWaterOnlyNonbonded`:
+
+- `physical_energy_groups_for_args`;
+- `physical_potential_energy_kj`;
+- `make_cmd_integrator(..., system=...)`;
+- measurement-force discovery used by validation.
+
+For either Pep-GaMD kernel, group 1 is excluded from physical energy and from conventional
+integration.
+
+### 9.6 Lambda ladder and exchange
+
+No change to the dependent-dual closed-form mathematics is required.
+
+All exchange and MBAR paths keep consuming:
+
+```text
+v_pep_kj_mol = raw Total coordinate
+v_dih_kj_mol = raw Dihedral coordinate
+frozen envelope
+state lambda
+```
+
+The RS kernel merely changes how `v_pep_kj_mol` is measured.
+
+The existing one-place ladder reconstruction through `apply_ladder_boost_to_u` remains the desired
+architecture.
+
+### 9.7 NPT biased-MC adapter
+
+Add a dedicated RS target adapter.
+
+The current exact adapter cannot be reused unchanged because its Total coordinate is
+`E0-E1+E2` and its force-role classifier recognizes only the exact water-only auxiliary.
+
+For RS, classify the group-1 surrogate components explicitly as `measurement`, not `bias`.
+
+Endpoint evaluation:
+
+```text
+physical = energy of all physical groups, excluding group 1
+bias     = umbrella/secondary/nonphysical bias groups, excluding group 1
+S        = energy1
+E2       = energy2
+
+b_D = lower_bound_boost(E2)
+b_T = lower_bound_boost(S + E2 + b_D)
+
+boost     = b_D + b_T
+effective = physical + bias + boost
+```
+
+The surrogate/measurement energy is diagnostic only and is never added directly to `effective`.
+
+Evaluate this same definition at both old and trial box/coordinates. This is mandatory for exact NPT
+sampling.
+
+### 9.8 Kernel and resume identity
+
+`kernel_identity_for_run` already hashes `gamd_boost_type`. Therefore the distinct RS boost type
+already yields a different kernel digest.
+
+Do not add a redundant second identity string solely for RS.
+
+Add tests that:
+
+- exact and RS kernel digests differ;
+- a resume cannot append RS samples to an exact segment or vice versa;
+- surrogate flavour metadata is frozen so S1/S2/S3 cannot be silently mixed if they share the same
+  top-level boost type.
+
+## 10. Test matrix
+
+### 10.1 Builder and group invariants
+
+- exact and RS partitions are mutually exclusive;
+- repeated RS partition construction is idempotent;
+- every RS component is group 1;
+- no unrelated custom force is allowed in groups 0-2;
+- `pep_gamd_bias_force_groups` excludes group 1;
+- physical-energy helpers exclude group 1;
+- cMD integration excludes group 1.
+
+### 10.2 Surrogate energy construction
+
+On a small solvated peptide fixture:
+
+- interaction-group pair accounting has no duplicates;
+- all physical peptide-involving exceptions are excluded from the custom nonbonded term;
+- nonzero physical exceptions are reproduced by `PepGaMDRSExceptions`;
+- copied bond/angle terms match the selected physical terms;
+- group-1 energy equals the explicit component sum.
+
+### 10.3 Force algebra
+
+With both boost channels live (`0 < FSF < 1`):
+
+- finite-difference `-grad U*` agrees with the implemented effective force within the established
+  Reference-platform tolerance;
+- a warmed deterministic step moves atoms, so the gamd-openmm first-step inertness cannot make the
+  test vacuous;
+- an independent algebra oracle is used rather than the integrator's own helper.
+
+### 10.4 Zero-boost identities
+
+At `k0_Total = k0_Dihedral = 0`:
+
+- RS integrator trajectory matches the physical system on the Reference platform after the required
+  warm step;
+- physical potential is unchanged by presence of the surrogate measurement forces;
+- biased-MC `U*` equals physical + umbrella/secondary bias and does not contain `S`.
+
+### 10.5 Recording and closed-form reconstruction
+
+For every tested frame:
+
+```text
+recorded v_pep == energy1 + energy2
+recorded v_dih == energy2
+pep_gamd_boost_kj(recorded values, lambda, envelope)
+    == integrator-applied boost
+```
+
+within 1e-6 kJ/mol or the tighter established numerical tolerance.
+
+If `v_s_kj_mol` is stored, verify `v_s == energy1`.
+
+### 10.6 Exchange and MBAR
+
+- RS exchange state-bias matrix uses the same reconstructed boost as the integrator;
+- the existing thermodynamic-validity/reweighting oracle is extended with an RS boost;
+- recovered equilibrium FES/distributions match the known physical target within uncertainty;
+- lambda=0 remains a true zero-boost state.
+
+### 10.7 NPT
+
+- old/trial endpoint `U*` matches an independent RS oracle;
+- group-1 measurement energy is never counted directly in `U*`;
+- volume scaling updates the surrogate through the trial context;
+- zero-boost NPT reproduces the physical biased-MC target;
+- `SUPPORTED_BIASED_MC_BOOST_TYPES == LADDER_BOOST_TYPES` or the existing synchronization invariant
+  remains satisfied.
+
+### 10.8 Resume and provenance
+
+- exact -> RS resume fails;
+- RS -> exact resume fails;
+- RS flavour mismatch fails;
+- new campaign with RS succeeds with a fresh envelope.
+
+## 11. Performance gate
+
+Measure with the existing `c8_integ_bench*.py` harness:
+
+1. exact Pep-GaMD, no CV forces;
+2. RS Pep-GaMD, no CV forces;
+3. exact production CV forces;
+4. RS production CV forces;
+5. single context per L40S;
+6. production-like MPS occupancy, including the current high-context-per-GPU regime.
+
+The expected upper-bound trajectory is from about 1,978 steps/s toward the one-PME regime represented
+by about 3,030 steps/s before production CV cost. A roughly 1.5x gain is plausible from deleting the
+second full PME; larger gains are possible if the new update also eliminates unnecessary full-group
+passes.
+
+Do not claim the gain until measured. The physical CV forces are unchanged by this proposal.
+
+## 12. Main risks and safeguards
+
+- **Surrogate misses long-range peptide physics.** This reduces acceleration quality, not formal
+  reweighting validity. Guard with offline correlation/force tests and a boosted pilot.
+- **Cutoff discontinuity.** A cheap surrogate with a bad force discontinuity can destabilize the
+  boosted dynamics. Prefer a smooth candidate or reject it at the force/NVE gate.
+- **Measurement force accidentally becomes physical.** Group-1 invariant, physical-energy tests and
+  NPT tests are mandatory.
+- **Bare S recorded as v_pep.** This would omit E2 from the dependent Total channel. Lock the
+  `v_pep = S+E2` invariant in tests.
+- **Exact-only helper survives in an RS path.** Generalize calibration, swarm, physical-energy,
+  cMD and NPT measurement discovery; search the repo for `E0-E1` assumptions before merge.
+- **Surrogate flavour changes mid-campaign.** Freeze flavour metadata and refuse resume mismatch.
+- **Non-Gaussian dV.** Re-run the existing anharmonicity diagnostics on the RS envelope.
+- **Folded-region exploration is weakened.** Include compact/folded-like seed-bank regions in both
+  the offline and boosted pilot gates; do not judge only on pooled statistics.
+
+## 13. Decisions from review
+
+1. **Validity:** accepted. An exact peptide PME decomposition is not required for equilibrium
+   correctness if the propagated and reconstructed boost are identical.
+2. **Force group:** resolved. Reuse group 1 as the measurement channel; do not allocate a new
+   surrogate group.
+3. **Boost name:** resolved. Use `pep-gamd-lower-dual-rs` so the present lower-bound dispatch remains
+   compatible.
+4. **Recording:** resolved. Keep `v_pep_kj_mol = S + E2`. Optional `v_s_kj_mol = S` is diagnostic.
+5. **NPT:** resolved. Add an RS-specific effective-potential adapter and classify group 1 as
+   measurement, never bias.
+6. **S1 choice:** start with S1-direct as the diagnostic closest-to-exact candidate and evaluate a
+   smooth S1 variant in parallel; promote the cheapest smooth candidate that clears the gates.
+7. **Acceptance:** correlation thresholds are prefilters. Final promotion uses short boosted
+   thermodynamic/sampling diagnostics.
+8. **Exact comparison in production:** rejected. Do not keep the second PME alive merely for
+   diagnostics; compare exact and surrogate offline on saved frames.
+9. **Kernel identity:** the existing digest already includes `gamd_boost_type`. Add resume/flavour
+   tests rather than a redundant identity field.
