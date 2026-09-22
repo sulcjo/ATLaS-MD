@@ -30,6 +30,23 @@ plain umbrella sampling (the intended Pep-GaMD boost was never active).
   the simulated Hamiltonians. Check that the four rungs' CV distributions coincide at each centre;
   if they do, analyse as 62 US states with the rungs collapsed and lambda ignored. The lambda > 0
   labels and the recorded boost-reweighting inputs must not be used.
+- **Interim item-0 check, 2026-09-23 00:20, steps 5,250-265,000 (257,920 samples, ~1,040 per window;
+  script `~/gareus/chignolin/c8_us_connectivity.py`, read-only):**
+  - *Rung consistency: FAILS.* The 4 rungs of a centre should be identical, but 49/62 centres show a
+    pairwise mean difference > 3 block-SE (27/62 > 5); median largest difference 0.55 window sigma
+    (max 1.42), KS median 0.34. Null (two time-halves of the same rung): 7/62 > 3, median 0.16 sigma,
+    KS 0.18. The null makes 2 comparisons per centre against 12 for the rungs, so it is not a perfect
+    match, but rungs differ ~3x more than time-halves -- consistent with the phantom-boost exchange
+    distorting per-rung ensembles. Do not collapse rungs yet; re-test at the 485,200 cutoff.
+  - *MBAR connectivity (rungs collapsed, 62 states): connected.* One component at overlap >= 0.01;
+    at 0.03 and 0.09 only c28 separates -- the zero-k unrestrained state, whose overlap is spread
+    thinly over all others (O_28,28 = 0.02, 0.98 shared out), not a gap. Weakest restrained state
+    best link 0.094; spectral gap 1 - lambda2 = 0.038 (connected, slow-mixing).
+  - *Per-state quality: good.* Self-bias median 0.90 kT (max 2.60), no state > 10 kT; per-state Kish
+    ESS >= 8,233; unbiased-ensemble ESS 91 %; CV2 neighbour spacing 1.50 window sigma everywhere
+    (MBAR overlaps 0.10-0.21 across those steps).
+  - *Verdict so far:* the sparse pseudo-2D layout itself is connected and reweightable; the open
+    question is the rung (exchange) artefact, not the layout.
 - **Cutoff:** `STOP_AT_PROD_DONE=485200` in `~/gareus/chignolin/chignolin_8.sh`; marker file
   `~/gareus/chignolin/chignolin_8.US_ONLY_STOPPED`; chain status line
   `STOPPED: US-only cutoff before GaMD stage 3`.
