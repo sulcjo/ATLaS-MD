@@ -194,7 +194,7 @@ export CUDA_CACHE_DISABLE=0
 # JIT kernel cache on node-local scratch, NOT NFS $HOME (flock deadlock on first context).
 export CUDA_CACHE_PATH="${TMPDIR:-/tmp}/cuda_kernel_cache_${SLURM_JOB_ID:-$$}"
 mkdir -p "${CUDA_CACHE_PATH}"
-# MPS: many replica contexts share 4 GPUs; --cuda-mps below assumes a real daemon.
+# MPS pipe/log dirs are still created (cleanup removes them) but the daemon is NOT started -- see below.
 export CUDA_MPS_PIPE_DIRECTORY="${TMPDIR:-/tmp}/nvidia-mps-pipe_${SLURM_JOB_ID:-$$}"
 export CUDA_MPS_LOG_DIRECTORY="${TMPDIR:-/tmp}/nvidia-mps-log_${SLURM_JOB_ID:-$$}"
 mkdir -p "${CUDA_MPS_PIPE_DIRECTORY}" "${CUDA_MPS_LOG_DIRECTORY}"
@@ -205,8 +205,13 @@ mkdir -p "${CUDA_MPS_PIPE_DIRECTORY}" "${CUDA_MPS_LOG_DIRECTORY}"
 # the MPS daemon (which inherits it) and before python.
 ulimit -n 65536
 echo "[gareus] nofile soft/hard: $(ulimit -Sn)/$(ulimit -Hn)"
-nvidia-cuda-mps-control -d
-MPS_STARTED=1
+# NO MPS for this campaign: MPS on these L40S refuses more than ~60 client contexts per GPU
+# (c8_ctxtest3 job 2563506: 240 built, the 241st fails with "The requested CUDA device could not
+# be loaded"), and the 248-state ladder puts 62 on each. Without MPS all 248 build and step
+# (c8_ctxbench job 2563549: 3195 ns/day aggregate vs 7494 for 192 contexts under MPS -- the price
+# of keeping the joint 15 x 4 x 4-rung design at max_replicas 256). The MPS-optimal platform
+# properties are passed explicitly below instead of via --cuda-mps.
+MPS_STARTED=0
 
 nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv,noheader || true
 echo "[gareus] code commit: $(cat ${CODE_DIR}/DEPLOYED_COMMIT)  host: $(hostname)  job: ${SLURM_JOB_ID}"
@@ -230,7 +235,8 @@ python -m gareus \
     --device-index 0,1,2,3 \
     --precision mixed \
     --cuda-disable-pme-stream true \
-    --cuda-mps \
+    --cuda-use-blocking-sync false \
+    --cuda-deterministic-forces false \
     --platform-temp-directory "${TMPDIR:-/tmp}" \
     --tui-mode dashboard \
     --progress-mode both \

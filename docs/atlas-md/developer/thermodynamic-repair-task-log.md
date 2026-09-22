@@ -233,16 +233,24 @@ time ~15x); the run's own pull settings produced 0 bad / 155 warn starting struc
 
 ## Follow-up — 248 replica contexts on one node: descriptor hang and MPS ceiling (2026-09-22)
 
-chignolin_8 job 2560085 (first job past the envelope fix) hung at replica 223/248 for 1h41m and
-timed out with no checkpoint and no chain resubmission (the hung CUDA call never returned the
-TERM). Reproduced without seeding (, jobs 2562717/2563011/
-2563506/2563549): SLURM propagates the login soft  1024, the CUDA driver raises it only to
-4096, each context costs ~18 descriptors, so the 225th context blocks inside . With
- MPS builds 240 and fails at ~241 (; ~60 clients per L40S is the ceiling), while without MPS all 248 build in 106 s and step.
-Throughput (3000 steps x 3 fs per replica, all stepping concurrently): 64/MPS 10,940 ns/day,
-192/MPS 7,494 ns/day, 248/no-MPS 3,195 ns/day aggregate. Decision: keep the user's 248-state joint
-design and run without MPS (launcher: , no MPS daemon,  instead of ); the alternative (cap 192 with MPS,
-2.3x faster) changes the state-space design and is left to the user. Job 2563578 launched with this
-launcher ( mirrors it). Known gap: a hung python never returns the
-walltime TERM, so the chain does not resubmit; with the descriptor fix the known hang is gone, but
-the launcher still has no hang watchdog.
+chignolin_8 job 2560085 (the first job past the envelope fix) hung at replica 223/248 for 1h41m and
+timed out with no checkpoint and no chain resubmission: the hung CUDA call never returned, so the
+launcher's TERM handling and cleanup never ran. Reproduced without seeding
+(`~/gareus/chignolin/aurum_ctx_test.py`, jobs 2562717 / 2563011 / 2563506 / 2563549): SLURM
+propagates the login soft `nofile` limit of 1024 into jobs, the CUDA driver raises it only to 4096,
+and each context costs ~18 descriptors, so the 225th context blocks inside `Context()`. With
+`ulimit -n 65536` MPS builds 240 contexts and fails at ~241 (`The requested CUDA device could not be
+loaded`; about 60 clients per L40S is the ceiling), while without MPS all 248 contexts build in 106 s
+and step. Throughput (3000 steps x 3 fs per replica, all replicas stepping concurrently, upper
+bound): 64 contexts with MPS 10,940 ns/day, 192 with MPS 7,494 ns/day, 248 without MPS 3,195 ns/day
+aggregate.
+
+Decision: keep the user's 248-state joint design and run without MPS. Launcher changes:
+`ulimit -n 65536` before python, no MPS daemon, `--cuda-use-blocking-sync false
+--cuda-deterministic-forces false` in place of `--cuda-mps` (the flag only set those two soft
+defaults). The alternative (cap `max_replicas` at 192 with MPS, 2.3x the aggregate throughput)
+changes the state-space design and is left to the user. Job 2563608 launched with this
+launcher; `smoke/config/chignolin_8.sh` mirrors it. Known gap: a python process hung in a CUDA call
+never returns the walltime TERM, so the chain does not resubmit; the descriptor fix removes the
+known hang, but the launcher still has no hang watchdog. A wrongly patched relaunch (2563578, MPS
+still on) was cancelled before it left seeding.
