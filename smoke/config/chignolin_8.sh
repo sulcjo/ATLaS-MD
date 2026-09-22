@@ -198,6 +198,13 @@ mkdir -p "${CUDA_CACHE_PATH}"
 export CUDA_MPS_PIPE_DIRECTORY="${TMPDIR:-/tmp}/nvidia-mps-pipe_${SLURM_JOB_ID:-$$}"
 export CUDA_MPS_LOG_DIRECTORY="${TMPDIR:-/tmp}/nvidia-mps-log_${SLURM_JOB_ID:-$$}"
 mkdir -p "${CUDA_MPS_PIPE_DIRECTORY}" "${CUDA_MPS_LOG_DIRECTORY}"
+# 248 replica Contexts under MPS cost ~18 descriptors each in this process; SLURM propagates the
+# login soft nofile limit (1024) and the CUDA driver raises it only to 4096, so context #225
+# blocked inside construction for 1h41m (job 2560085, reproduced in c8_ctxtest jobs 2562717 and
+# 2563011: 224 built, 4094 descriptors open, the 225th never returns). Raise the soft limit before
+# the MPS daemon (which inherits it) and before python.
+ulimit -n 65536
+echo "[gareus] nofile soft/hard: $(ulimit -Sn)/$(ulimit -Hn)"
 nvidia-cuda-mps-control -d
 MPS_STARTED=1
 

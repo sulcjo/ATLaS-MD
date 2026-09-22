@@ -230,3 +230,19 @@ globals to every integrator; the epoch-0 recalibration is already a hard no-op u
 ladder. Tests: `tests/test_epoch0_sidecar_gamd_envelope.py` (6). Still unapplied from the sidecar,
 on purpose: the `starting_structures` pull knobs (its 150,000 pull steps would multiply seeding
 time ~15x); the run's own pull settings produced 0 bad / 155 warn starting structures.
+
+## Follow-up — 248 replica contexts on one node: descriptor hang and MPS ceiling (2026-09-22)
+
+chignolin_8 job 2560085 (first job past the envelope fix) hung at replica 223/248 for 1h41m and
+timed out with no checkpoint and no chain resubmission (the hung CUDA call never returned the
+TERM). Reproduced without seeding (, jobs 2562717/2563011/
+2563506/2563549): SLURM propagates the login soft  1024, the CUDA driver raises it only to
+4096, each context costs ~18 descriptors, so the 225th context blocks inside . With
+ MPS builds 240 and fails at ~241 (; ~60 clients per L40S is the ceiling), while without MPS all 248 build in 106 s and step.
+Throughput (3000 steps x 3 fs per replica, all stepping concurrently): 64/MPS 10,940 ns/day,
+192/MPS 7,494 ns/day, 248/no-MPS 3,195 ns/day aggregate. Decision: keep the user's 248-state joint
+design and run without MPS (launcher: , no MPS daemon,  instead of ); the alternative (cap 192 with MPS,
+2.3x faster) changes the state-space design and is left to the user. Job 2563578 launched with this
+launcher ( mirrors it). Known gap: a hung python never returns the
+walltime TERM, so the chain does not resubmit; with the descriptor fix the known hang is gone, but
+the launcher still has no hang watchdog.
