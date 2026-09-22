@@ -19,7 +19,8 @@ User decision after T6 (MPS cannot be bypassed at 248 contexts). Checklist for c
       Original note: chignolin_8 production never left gamd stage 2 (unboosted; see
       run-registry.md). Frozen-envelope production must start in stage 5; add a test asserting FSF < 1
       on a lambda = 1 replica after one warm step. Nothing else on this list matters without it.
-- [ ] T2 first: MPS throughput at 59 contexts/GPU with the REAL Pep-GaMD integrator (fix the
+- [x] T2 MEASURED 2026-09-23 (job 2580889, see T9): MPS at 59/GPU = 2,307 ns/day/node, 2.75x no-MPS.
+      Original note: MPS throughput at 59 contexts/GPU with the REAL Pep-GaMD integrator (fix the
       c8_integ_bench.py P-arm segfault at high context counts, or measure via a short real run).
 - [ ] State space: 59 CV centres x 4 lambda rungs = 236. Regenerate the joint CV2 layout to land on
       59 centres (swarm analyze / ladder design), do NOT delete rows from windows_lambda_ladder.csv;
@@ -270,3 +271,25 @@ Production start taken from the resume XTC's birth time (21:40:36); checkpoint 2
 22:12:59. The separate PME stream lets reciprocal-space work overlap direct-space work inside each
 context, which time-slicing does not undo. Launcher keeps `false`. Under MPS (chignolin_9) the flag
 was historically `true` for stability -- A/B it again there rather than carrying it over blindly.
+
+## T9 — MPS at 59 contexts/GPU, real integrator in stage 5: MEASURED 2026-09-23 (job 2580889)
+
+Real Pep-GaMD integrator + real CV forces, seeded into stage 5 with the frozen swarm envelope at
+lambda = 1; the boost was live in every arm (stage 5, FSF_Total 0.94-0.98, FSF_Dihedral 0.70-0.85).
+
+| MPS | contexts (per GPU) | PME stream | steps/s/rep | ns/day/rep | node ns/day | CPU cores/rep |
+|---|---|---|---|---|---|---|
+| on | 236 (59) | disabled | **32.3** | **9.8** | **2,307** | 0.75 |
+| on | 236 (59) | enabled | 31.1 | 9.4 | 2,220 | 0.75 |
+| on | 192 (48) | enabled | 37.6 | 11.4 | 2,182 | 0.94 |
+| on | 64 (16) | enabled | 163.0 | 49.3 | 3,154 | 0.99 |
+| off | 236 (59) | enabled | 11.8 | 3.6 | 840 | 0.77 |
+
+- **MPS at 236 contexts: 2.75x the no-MPS rate** (2,307 vs 840 ns/day/node); per replica 9.8 vs
+  3.1-3.6 ns/day. Less than the 3-4.5x extrapolated from chignolin_7: the node aggregate falls from
+  3,154 at 16/GPU to ~2,200-2,300 at 48-59/GPU. At 236 contexts ~177 of 192 cores are busy, so
+  host CPU (one thread per context) is a likely co-limit under MPS at this count.
+- **PME stream under MPS: keep it DISABLED** (2,307 vs 2,220, -4 % when enabled) -- the opposite of
+  the no-MPS result (T8, +8-11 %). chignolin_9's launcher must set `--cuda-disable-pme-stream true`.
+- The 64-context MPS point reproduces chignolin_7's production (3,154 vs 3,194-3,373 ns/day).
+- Stage-5 seeding works on the cluster (boost live in every arm).
