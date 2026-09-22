@@ -156,3 +156,32 @@ Still never A/B'd: `--precision mixed`, `--cuda-deterministic-forces false`.
   fixed by `ulimit -n 65536`. Not an MPS problem.
 - Chain never checkpointed because bash's `wait` returns early on a trapped signal: fixed
   2026-09-22, see `chignolin_8_chain_no_checkpoint.md`. First real test is job 2567463's TERM.
+
+## T6 — can MPS be bypassed with 248 contexts on 4 GPUs? MEASURED 2026-09-22 (job 2577764): no
+
+`~/gareus/chignolin/c8_integ_bench.py` on the real chignolin_8 system, no MPS, one thread per
+context, 250-step chunks, dt 3.5 fs (steps/s per replica; node ns/day):
+
+| arm | 1 context/GPU (N=4) | 248 contexts | kept under time-slicing |
+|---|---|---|---|
+| L   Langevin | 4,170 (5,045 node) | 50.6 (3,793 node) | 75 % |
+| L2  Langevin + 2nd PME | 3,030 (3,665) | 38.9 (2,918) | 80 % |
+| P   real PepGaMDLowerDualIntegrator, stage-2 globals | 1,978 (2,393) | **segfault after build** | — |
+| B   branch-free, same force/energy group reads as P | 2,010 (2,431) | 17.0 (1,275) | 52 % |
+| production (P + CV forces + gareus loop) | — | 9.75 (727) | — |
+
+- **The `if` blocks are not the cost.** Single-context P and B are identical (1,978 vs 2,010). The
+  hypothesis that host-evaluated conditionals caused the time-slicing penalty is refuted.
+- The Pep-GaMD step costs **1.5x the GPU time of L2** even alone (per-group force/energy reads:
+  f0, f1, f2, energy0/1/2 instead of one evaluation), and those extra launches are what time-slicing
+  punishes: B keeps 52 % of its single-context rate at 248 contexts, L keeps 75 %.
+- **Hard ceiling without MPS**: time-slicing can never beat one context per GPU, so this integrator
+  tops out at ~2,400 ns/day/node however the contexts are arranged -- and reaches 1,275 at 248.
+  Under MPS, chignolin_7 reached 3,200-3,400 with the same integrator: concurrent kernels from
+  several 21k-atom contexts fill SMs that a single context leaves idle. No arrangement of contexts
+  without MPS can do that.
+- Remaining no-MPS headroom over production: at most 17.0 / 9.75 = 1.7x, and only if the whole
+  gap to B is removable. What fills that gap (P's own penalty at 248, the contact/secondary CV
+  forces, the gareus loop) is unmeasured because P segfaulted at 248 in the benchmark (production
+  builds and runs the same integrator at 248, so this is a benchmark-harness difference, not
+  chased).
