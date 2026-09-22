@@ -63,29 +63,29 @@ Preserve the handoff’s existing η²/reweight-ratio experiment as a historical
 
 Let `x` include molecular coordinates and, for NPT, the volume/box variables. With a common reference measure, define the target reduced potential `u0(x)`. A fixed sampling state is
 
-\[
+$$
 u_k(x)=u_0(x)+\beta\{B_k[z_1(x),z_2(x)]+\Delta V_k(x)\},
-\]
+$$
 
 where the umbrella is
 
-\[
+$$
 B_k=\tfrac12 k_{1k}(z_1-c_{1k})^2+
      \tfrac12 k_{2k}(z_2-c_{2k})^2,
-\]
+$$
 
 and the positive GaMD boost `ΔV_k` is evaluated from that state’s actual frozen envelope and λ. Do not assume simple linear λ scaling unless the canonical boost implementation specifies it.
 
 For equilibrium samples from these states, normalized target weights satisfy
 
-\[
+$$
 \widetilde w_n=
 \frac{e^{-u_0(x_n)}}{\sum_k N_k e^{\widehat f_k-u_k(x_n)}},
 \qquad
 w_n=\frac{\widetilde w_n}{\sum_m\widetilde w_m},
 \qquad
 \widehat{\langle A\rangle}_0=\sum_n w_n A(x_n).
-\]
+$$
 
 This is the MBAR equilibrium-estimation basis, subject to adequate sampling and overlap; it is not an assertion of exact finite-sample results. [Shirts and Chodera](https://arxiv.org/abs/0801.1426)
 
@@ -186,25 +186,25 @@ Use continuous contact functions, not the hard distance thresholds appearing in 
 
 For periodic torsion feature vector `φ(x)` and anchor `a(x)`, fit weighted least squares on training data:
 
-\[
+$$
 m(a)=b_0+b_1a+b_2a^2,\qquad r(x)=\phi(x)-m[a(x)].
-\]
+$$
 
 The default prospective family uses degree 1; degree 2 is an explicit additional family if declared before trials. Historical PC2 reproduction must use degree 2 because the handoff script does.
 
 Diagonalize the weighted residual covariance and create **separate** candidates
 
-\[
+$$
 s_j(x)=v_j^T[\phi(x)-b_0-b_1a(x)-b_2a(x)^2],
 \quad j=1,\ldots,6.
-\]
+$$
 
 The runtime must include every term. In particular,
 
-\[
+$$
 \nabla s_j=\sum_l v_{jl}\nabla\phi_l
  -[v_j^Tb_1+2a\,v_j^Tb_2]\nabla a.
-\]
+$$
 
 Using `v_j·φ` alone changes the selected CV and its force. The existing projected-coefficient torsion-only method remains a separate, explicitly named candidate family; it is not an interchangeable implementation of this residual coordinate.
 
@@ -218,12 +218,12 @@ Bank density, balanced state density, and target equilibrium density are differe
 
 For each pair `(a,b)`, apply the frozen Gram–Schmidt transform
 
-\[
+$$
 z_1=(a-\mu_a)/\sigma_a,\quad
 \gamma=\operatorname{Cov}_{q}(b,z_1),\quad
 z_2=\frac{b-\mu_b-\gamma z_1}
 {\sqrt{\operatorname{Var}_{q}(b)-\gamma^2}}.
-\]
+$$
 
 This provides zero training covariance and unit variances when nonsingular. It is an invertible pair transformation, not a claim of statistical independence. Fix coordinate ordering by a declared rule; when using an anchor/residual pair, the anchor comes first. The ordering is part of the tested bias protocol because sparse axis restraints depend on it.
 
@@ -231,9 +231,9 @@ Report held-out correlation and nonlinear predictability in both directions. Lar
 
 Evaluate the local gradient Gram matrix, after tangent projection for constraints where used:
 
-\[
+$$
 G_{ij}(x)=\nabla z_i^T M^{-1}\nabla z_j.
-\]
+$$
 
 Persistent rank deficiency flags two biases acting along effectively one local direction. Report its distribution, including low-population structural regions. A global average must not hide singularity where a relevant basin lies.
 
@@ -350,9 +350,9 @@ All arms use the same required cells. If a trial discovers a new region with pla
 
 For supported basins `a,b`, compute
 
-\[
+$$
 \Delta F_{ab}=-k_BT\ln(p_a/p_b).
-\]
+$$
 
 Use joint population uncertainty, including covariance. A zero-count basin gives unresolved free energy, not a finite pseudocount-derived estimate with a narrow error bar. Coordinate-density PMFs require bin-volume/Jacobian conventions; compare basin probabilities or fixed common observables across different CV parameterizations, not the depth of each pair’s own PMF minimum.
 
@@ -381,10 +381,10 @@ Use 200 block replicates for screening and 500 for confirmation by default. Repe
 
 For observable `a`, let `v_ra` be the per-campaign block variance and `s_a²` the sample variance of independent campaign estimates. With `R` equal-budget campaigns, a conservative diagnostic variance for their mean is
 
-\[
+$$
 v_a^{\mathrm{check}}=
 \max\left\{\frac{1}{R^2}\sum_r v_{ra},\frac{s_a^2}{R}\right\}.
-\]
+$$
 
 This diagnostic is not a theorem guaranteeing coverage under metastability. Construct final intervals using the validated synchronized bootstrap and small-sample between-campaign uncertainty; adopt the wider result. Between-campaign disagreement is also a separate failure gate.
 
@@ -414,10 +414,10 @@ No uncertainty method can detect a basin absent from every input dataset. Divers
 
 At the same total cost `C` per arm, let `h_a(P,C)` be the simultaneous 95% interval half-width for primary observable `a`, and `ε_a` its frozen tolerance. Define
 
-\[
+$$
 L(P,C)=\max_{a\in\mathcal A}
 \left[\frac{h_a(P,C)}{\epsilon_a}\right]^2.
-\]
+$$
 
 Lower is better; `L ≤ 1` satisfies the declared scalar precision targets, subject to every other gate. Histogram equivalence, initialization dependence, unknown support, and correctness gates remain separate. The score is estimated precision, not a bound on unknown total error.
 
