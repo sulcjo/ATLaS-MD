@@ -41,6 +41,35 @@ def test_atlas_md_has_mkdocs_configuration_and_required_pages() -> None:
     assert not missing, f"Missing ATLAS-MD pages: {missing}"
 
 
+def test_github_markdown_math_uses_supported_display_delimiters() -> None:
+    """GitHub renders display math written with $...$, not bare \\[...\\] blocks."""
+
+    offenders: list[str] = []
+    roots = [ROOT / "docs"]
+    for docs_root in roots:
+        for page in docs_root.rglob("*.md"):
+            in_fence = False
+            fence_char: str | None = None
+            for line_no, line in enumerate(page.read_text(encoding="utf-8").splitlines(), 1):
+                stripped = line.strip()
+                match = re.match(r"^(```+|~~~+)", stripped)
+                if match:
+                    char = match.group(1)[0]
+                    if not in_fence:
+                        in_fence = True
+                        fence_char = char
+                    elif char == fence_char:
+                        in_fence = False
+                        fence_char = None
+                    continue
+                if not in_fence and stripped in {r"\\[", r"\\]"}:
+                    offenders.append(f"{page.relative_to(ROOT)}:{line_no}: {stripped}")
+    assert not offenders, (
+        "Use GitHub-compatible display math delimiters $...$ instead of \\[...\\]:\n"
+        + "\n".join(offenders)
+    )
+
+
 def test_atlas_md_local_markdown_links_resolve() -> None:
     missing: list[str] = []
     link_pattern = re.compile(r"!?\[[^]]*\]\(([^)]+)\)")
