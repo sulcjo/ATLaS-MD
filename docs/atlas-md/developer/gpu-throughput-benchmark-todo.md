@@ -104,19 +104,17 @@ state-count decision actually needs and nobody has it.
   sims on the same GPU. 61 clients on GPU 0 fails exactly as the 241st context did
   (`The requested CUDA device could not be loaded`). Target **236 = 59 centres x 4 rungs**.
 
-## T4 — multi-GPU US pull
+## T4 — multi-GPU US pull: IMPLEMENTED 2026-09-22 (`ac549a5`), takes effect at the next phase start
 
-The umbrella pull runs **all workers on GPU 0** while GPUs 1-3 idle: `gareus/seeding.py:1319` takes
-`device_tokens` from the *setup* platform props, and `setup_platform_and_properties`
-(`gareus/system_setup.py:318`) deliberately uses only the first entry of `--device-index`. Measured
-cost: 10,000 steps x 248 windows = 2h11 end-to-end, which is why `us_pull_steps_per_window` is
-capped at 12,500 (a longer pull risks not finishing inside the 3h50 TERM, and an unfinished pull is
-redone from scratch by the next job).
+`--us-pull-device-index 0,1,2,3` (new flag; `gareus/seeding.py:us_pull_device_tokens`) makes the
+28 pull workers round-robin over all four GPUs, each worker still a single-GPU context. Default
+(flag absent) is byte-for-byte the old behaviour. Not `--setup-device-index 0,1,2,3`: that would
+make every setup context (minimisation, NPT equilibration, shared GaMD setup) a multi-GPU context.
 
-`--setup-device-index 0,1,2,3` would round-robin the pull workers over 4 GPUs (each
-`_make_pull_sim` gets a single token, so each pull sim stays single-GPU) — but it also makes every
-*other* setup context a 4-GPU context, which is untested here and probably slower for a 21k-atom
-system. Needs a scoped test before use.
+Expected: 2h11 -> ~35 min per phase start if the pull is GPU-bound. Zero effect on steps/s.
+First real measurement will be the `epoch_001` (or `final`) pull -- the epoch_000 pull is done and
+checkpointed, so the current chain never re-runs it. Launcher line: `smoke/config/chignolin_8.sh`,
+mirrors `~/gareus/chignolin/chignolin_8.sh`. Test: `tests/test_us_pull_device_index.py`.
 
 ## T5 — `UseBlockingSync=true` A/B: MEASURED 2026-09-22, no gain (-2 to -4 %)
 
@@ -146,8 +144,11 @@ Flag left at `true` in `~/gareus/chignolin/chignolin_8.sh` (line 242) and the re
 on throughput, ~15 fewer cores burnt. Revert to `false` if an exact baseline configuration is
 wanted for a later comparison; nothing else depends on it.
 
-Remaining, never A/B'd on this system: `--precision mixed`, `--cuda-disable-pme-stream true`,
-`--cuda-deterministic-forces false`.
+`--cuda-disable-pme-stream true -> false` **queued as the next single-variable A/B** (launcher patched
+18:50 for the resubmission after job 2575924; baseline for it is 2575924's 9.25-9.56 steps/s/replica,
+blocking sync on in both). Rationale: the separate PME stream was disabled for MPS stability and MPS
+is off, so PME may overlap the rest of the force evaluation inside each context.
+Still never A/B'd: `--precision mixed`, `--cuda-deterministic-forces false`.
 
 ## Related, already fixed — do not re-diagnose
 

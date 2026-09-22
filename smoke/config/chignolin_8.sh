@@ -232,19 +232,26 @@ fi
 # threads spin-waiting on 192 cores the process burnt 165-190 cores and hot threads showed ~4x
 # more involuntary than voluntary context switches (docs/atlas-md/developer/
 # gpu-throughput-benchmark-todo.md, T1). Single-variable test; baseline 9.7 steps/s/replica.
+# 2026-09-22 18:50 (job 2575924 -> next): two more single-purpose changes, see docs/atlas-md/developer/
+# gpu-throughput-benchmark-todo.md T3/T4. (a) --cuda-disable-pme-stream true -> false: the separate PME
+# stream was disabled for MPS stability, MPS is off, so let PME overlap the rest of the force evaluation
+# inside each context (A/B against 9.25-9.56 steps/s/replica of 2575924). (b) --us-pull-device-index
+# 0,1,2,3: pull workers round-robin over all four GPUs instead of GPU 0 only; affects the next phase
+# start (epoch_001 / final / top-ups), not this resume (epoch_000 pull is done and checkpointed).
 python -m gareus \
     --config "${CONFIG}" \
     --out "${OUT_DIR}" \
     --platform CUDA \
     --device-index 0,1,2,3 \
     --precision mixed \
-    --cuda-disable-pme-stream true \
+    --cuda-disable-pme-stream false \
     --cuda-use-blocking-sync true \
     --cuda-deterministic-forces false \
     --platform-temp-directory "${TMPDIR:-/tmp}" \
     --tui-mode dashboard \
     --progress-mode both \
     --us-pull-workers 28 \
+    --us-pull-device-index 0,1,2,3 \
     --us-start-primary-bad-bias-kcal 15.0 \
     ${RESUME_FLAG} &
 GAREUS_PID=$!
