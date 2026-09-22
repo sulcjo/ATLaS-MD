@@ -12,6 +12,16 @@ User decision after T6 (MPS cannot be bypassed at 248 contexts). Checklist for c
       `--us-pull-device-index 0,1,2,3`; setup context + pull workers also count as MPS clients on
       their GPUs -> check 59 + setup + pull stays under ~60 per GPU, or run the pull before MPS starts.
 - [ ] Carry over the #4 PME-stream verdict from chignolin_8's next job.
+- [ ] **Integrator lever 1 (user, 2026-09-22): replace the water-only auxiliary PME with a cheap
+      real-space approximation of the peptide energy.** The boost may be any function of the
+      coordinates provided the applied force is its exact gradient and MBAR reweights with the same
+      recorded dV, so V_pep only needs to target the right DOFs, not equal the PME peptide energy.
+      Candidate: CustomNonbondedForce with interaction groups (138 peptide atoms x environment),
+      cutoff / reaction field, in place of group 1's PME. Removes the second PME and one pass:
+      single-context Pep-GaMD 1,978 steps/s vs 3,030 (Langevin + 2 PME) / 4,170 (Langevin) -> up to
+      ~2x per context. Before building: correlate approximate vs exact V_pep (and its fluctuation
+      sigma_V) on chignolin_8 swarm/production frames. Consequences: new kernel identity, new swarm
+      envelope calibration (Vmax/Vmin/sigma_V all change) -- fits a fresh campaign, not a resume.
 
 Not started. Nothing here blocks chignolin_8; all of it applies to a **future** campaign or to a
 config change on a later resubmission. Owner: unassigned.
