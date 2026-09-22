@@ -871,6 +871,10 @@ def _add_platform_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--setup-device-index", default="")
     p.add_argument("--setup-cpu-threads", type=int, default=0)
     p.add_argument("--us-pull-workers", default="auto")
+    p.add_argument("--us-pull-device-index", default="",
+                   help="Comma-separated GPU indices the umbrella-pull workers round-robin over (each worker "
+                        "is a single-GPU context). Default: the setup platform's device, i.e. the first entry "
+                        "of --device-index -- which leaves the other GPUs idle for the whole pull.")
     p.add_argument("--scratchdir", default="")
 
 

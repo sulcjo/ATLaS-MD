@@ -1211,6 +1211,27 @@ def _accepted_state_check(min_state, unit) -> dict:
             "max_force_kj_mol_nm": f_max}
 
 
+def us_pull_device_tokens(args, props) -> list[str]:
+    """GPU indices the umbrella-pull workers round-robin over.
+
+    ``--us-pull-device-index`` wins when given; each worker still gets a single
+    token, so every pull Simulation stays a single-GPU context. Without it the
+    list is the setup platform's own ``DeviceIndex`` (one device: the first entry
+    of ``--device-index``, by setup_platform_and_properties' design), which is
+    the pre-2026-09-22 behaviour -- and on a 4-GPU node it parks the whole pull
+    on GPU 0 while the other three idle (chignolin_8: 2h11 per phase start).
+    """
+    explicit = str(getattr(args, "us_pull_device_index", "") or "")
+    tokens = [x.strip() for x in explicit.split(",") if x.strip()]
+    if tokens:
+        return tokens
+    dev = str((props or {}).get("DeviceIndex", "") or "")
+    if not dev:
+        dev = (str(getattr(args, "setup_device_index", "") or "")
+               or _first_device_index(str(getattr(args, "device_index", "0") or "0")))
+    return [x.strip() for x in dev.split(",") if x.strip()] or ["0"]
+
+
 def generate_us_starting_states_by_pulling(
     args,
     out_dir: Path,
@@ -1310,13 +1331,7 @@ def generate_us_starting_states_by_pulling(
 
     # --- worker-count detection ---
     _setup_pname = platform.getName() if hasattr(platform, "getName") else str(platform)
-    _dev_tok_str = str(props.get("DeviceIndex", "") or "")
-    if not _dev_tok_str:
-        _dev_tok_str = (
-            str(getattr(args, "setup_device_index", "") or "")
-            or _first_device_index(str(getattr(args, "device_index", "0") or "0"))
-        )
-    device_tokens = [x.strip() for x in _dev_tok_str.split(",") if x.strip()] or ["0"]
+    device_tokens = us_pull_device_tokens(args, props)
     _us_pull_workers_arg = str(getattr(args, "us_pull_workers", "auto") or "auto").lower().strip()
     if _us_pull_workers_arg in {"auto", "0", ""}:
         n_pull_workers = len(device_tokens) if _setup_pname in {"CUDA", "HIP", "OpenCL"} else 1
