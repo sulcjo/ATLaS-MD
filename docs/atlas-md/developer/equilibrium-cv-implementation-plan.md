@@ -183,10 +183,10 @@ The model JSON contains the complete coefficients, all scaling factors, one-base
 
 Force evaluation must include the derivative of the primary-dependent subtraction:
 
-\[
+$$
 \nabla z_j={1\over\sigma_j}\left[\sum_m v_{jm}\nabla X_m
 -\left(v_j\!\cdot B_1+2a\,v_j\!\cdot B_2\right){\nabla c\over\sigma_c}\right].
-\]
+$$
 
 OpenMM automatic differentiation is suitable if the expression includes both the torsion projection and the actual primary contact CV. Do not approximate this by a torsion-only projection or reuse an OpenMM Force object owned by another parent. Aggregate weighted trig terms to respect CustomCVForce's variable limit. Preserve umbrella force groups and the Pep-GaMD exclusion of umbrella energy from physical boost targets.
 
@@ -216,30 +216,30 @@ Implement the following estimating equations for exactly one walker in each of K
 
 Let
 
-\[
+$$
 D_n=\sum_kN_k\exp(f_k-u_{nk}),\quad
 q_{nk}=N_k\exp(f_k-u_{nk})/D_n,\quad h_n=N/D_n.
-\]
+$$
 
 Fix `f_0=0` and omit its equation. For tick t, containing K samples, use
 
-\[
+$$
 g_{t,j}=\sum_{r=1}^Kq_{tr,j}-1\quad(j=1,\ldots,K-1),
-\]
+$$
 
-\[
+$$
 g_{t,A}=K^{-1}\sum_{r=1}^Kh_{tr}(A_{tr}-\mu_A).
-\]
+$$
 
 An overall constant rescaling of h cancels; evaluate it in log space to avoid overflow. Hold the chosen numerical scale constant when checking the Jacobian by finite differences. Use the gauge-fixed Jacobian `J=mean_t(dg_t/dtheta)` for `theta=(f_1,...,f_{K-1},mu_1,...,mu_M)`. Implement analytical derivatives and verify them independently by finite differences. The influence sequence is `psi_t=-solve(J,g_t)`. Never invert J explicitly or add an undocumented ridge to make a disconnected system look estimable. The initial numerical-identifiability guard rejects a gauge-fixed free-energy Jacobian with singular-value ratio <=1e-12; record its spectrum and distinguish numerical failure from physical support diagnostics. Calibration must exercise this guard.
 
 For batch length b, split the influence sequence into a complete prefix of A nonoverlapping batches. Estimate
 
-\[
+$$
 \widehat\Omega_b={b\over A-1}\sum_{a=1}^{A}
 (\bar\psi_a-\bar\psi)(\bar\psi_a-\bar\psi)^T,
 \qquad \widehat{\mathrm{Cov}}_b(\widehat\theta)=\widehat\Omega_b/T.
-\]
+$$
 
 Record the omitted covariance-estimation tail; point estimation still uses the declared full measurement set. This is an asymptotic estimator, not an exact finite-sample confidence statement.
 
@@ -264,10 +264,10 @@ Require equal planned cost and equal measurement policy across the R independent
 
 For observable a, use
 
-\[
+$$
 \bar\mu_a=R^{-1}\sum_r\widehat\mu_{ra},\quad
 v_a=\max\left\{R^{-2}\sum_r\widehat v_{ra},\ s_a^2/R\right\}.
-\]
+$$
 
 Use complete planned campaigns; do not selectively omit a disagreeing campaign or reuse its seed until it becomes favorable. A failed campaign leaves the planned comparison incomplete unless the predeclared replacement rule uses a fresh campaign ID and retains the failure in the report. For a family of F reported primary arm-observable means, the initial conservative interval is `mean +/- t(R-1, 1-alpha/(2F))*sqrt(v)`, with `alpha=0.05`. Freeze F before confirmation. Label the interval method and its calibrated/asymptotic status. R=3 screening estimates are exploratory; start confirmation design evaluation at R=6 per compared arm, then use control/runtime evidence to set the final R and duration. Neither number is a convergence guarantee.
 
