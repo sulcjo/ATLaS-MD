@@ -4093,6 +4093,65 @@ def set_integrator_globals_from_dict(integrator, values: dict[str, float]) -> tu
     return copied, skipped
 
 
+def seed_frozen_envelope_stage5(integrator, shared_globals: dict) -> Optional[int]:
+    """Put a gamd-openmm StageIntegrator into production (stage 5) for a frozen envelope.
+
+    gamd-openmm chooses its stage from its own ``stepCount``: stages 1-2 are
+    conventional MD (stage 2 accumulates Vmax/Vmin statistics), 3-4 equilibrate
+    the boost, and only stage 5 applies it. The in-process shared setup exported
+    ``stepCount`` with its calibrated globals, so copying them seated every
+    replica in stage 5. A swarm envelope carries only the physics globals, so
+    without this every replica starts at step 0 and runs unboosted conventional
+    MD -- chignolin_8, 2026-09-22: ForceScalingFactor 1.0 on all 248 replicas.
+
+    Sets ``stepCount`` to ``stage_5_start - 1`` (the integrator increments it at
+    the top of each step) and returns that value; returns None, changing
+    nothing, when the globals already carry ``stepCount`` or the integrator has
+    no stage machine.
+    """
+    start = getattr(integrator, "stage_5_start", None)
+    if start is None or "stepCount" in (shared_globals or {}):
+        return None
+    seeded = int(start) - 1
+    integrator.setGlobalVariableByName("stepCount", float(seeded))
+    integrator.setGlobalVariableByName("stage", 5.0)
+    return seeded
+
+
+def verify_gamd_production_stage5(integrators, production_steps: int) -> None:
+    """Refuse to start GaMD production unless every replica will run the boost throughout.
+
+    Checks each StageIntegrator's ``stepCount`` against its stage-5 window
+    ``[stage_5_start, stage_5_end]``: the next step must land in stage 5, and
+    the remaining ``production_steps`` must fit before ``stage_5_end`` (past it
+    no stage block runs and atoms stop being updated). Integrators without a
+    stage machine are skipped.
+    """
+    bad_stage, bad_budget = [], []
+    for i, integ in enumerate(integrators):
+        start = getattr(integ, "stage_5_start", None)
+        end = getattr(integ, "stage_5_end", None)
+        if start is None or end is None:
+            continue
+        step = int(round(integ.getGlobalVariableByName("stepCount")))
+        if step + 1 < int(start):
+            bad_stage.append((i, step))
+        elif step + int(production_steps) > int(end):
+            bad_budget.append((i, step))
+    if bad_stage:
+        i, step = bad_stage[0]
+        raise RuntimeError(
+            f"GaMD production would not run in stage 5 on {len(bad_stage)} replica(s) (e.g. replica {i}: "
+            f"stepCount {step}, stage 5 starts at {getattr(integrators[i], 'stage_5_start')}); the boost would "
+            "never be applied. Seed the stage machine (seed_frozen_envelope_stage5) before production.")
+    if bad_budget:
+        i, step = bad_budget[0]
+        raise RuntimeError(
+            f"GaMD production of {production_steps} steps overruns the stage-5 window on {len(bad_budget)} "
+            f"replica(s) (e.g. replica {i}: stepCount {step}, stage 5 ends at {getattr(integrators[i], 'stage_5_end')}); "
+            "raise gamd_production_steps so the integrator's nstlim covers the whole phase.")
+
+
 _SHARED_GAMD_SETUP_FILES = (
     "shared_gamd_setup_globals.json",
     "shared_gamd_setup_context.chk",
@@ -6889,6 +6948,12 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 if shared_gamd_globals_all:
                     copied, copied_skipped = set_integrator_globals_from_dict(integrator_i, shared_gamd_globals_all)
                     skipped.update({k: v for k, v in copied_skipped.items() if k not in skipped})
+                    # A swarm envelope has no stepCount: seat the replica in stage 5 or it
+                    # runs unboosted conventional MD (chignolin_8).
+                    seeded_step = seed_frozen_envelope_stage5(integrator_i, shared_gamd_globals_all)
+                    if seeded_step is not None and i == 0:
+                        print(f"    GaMD: frozen envelope carries no stage machine; replicas seeded into stage 5 "
+                              f"(stepCount {seeded_step})", flush=True)
                 set_replica_lambda_for_window(integrator_i, i, state_lambdas, k0max_by_channel)
             if not fast_resume:
                 sim_i.context.setPeriodicBoxVectors(*box)
@@ -8088,6 +8153,12 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         if prod_done <= 0:
             run_production_probe(args, out_dir, sims, assignments, centers_nm, ks_kj_nm2, primary_cv_def, cv_atom1, cv_atom2, unit, shared_gamd_globals_all,
                                  drivers=drivers, pool=_sim_pool, npt_runtime=npt_runtime)
+
+        if use_gamd:
+            # After any checkpoint restore, so a resume is judged on its restored stepCount and on
+            # the steps it still has to run. Loud failure instead of a silently unboosted (or
+            # stalled) campaign -- chignolin_8 ran unboosted for its whole production.
+            verify_gamd_production_stage5([sim.integrator for sim in sims], prod_total - prod_done)
 
         checkpoint_interval = int(getattr(args, "checkpoint_interval", 0) or 0)
         next_checkpoint = prod_done + checkpoint_interval if checkpoint_interval > 0 else prod_total + 1
