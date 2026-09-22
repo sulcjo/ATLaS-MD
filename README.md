@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/atlas-md/assets/atlas-md-logo.svg" alt="ATLaS-MD" width="720">
+  <img src="docs/atlas-md/assets/atlas-md-hero.webp" alt="ATLaS-MD: Adaptive Topological Landscape Sampling MD" width="100%">
 </p>
 
 <p align="center">
@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <strong>Adaptive Thermodynamic Landscape Sampling for molecular dynamics</strong>
+  <strong>Adaptive Topological Landscape Sampling MD</strong>
 </p>
 
 ATLaS-MD is an OpenMM-based peptide sampling framework for explicit-solvent umbrella sampling, replica exchange, GaMD/Pep-GaMD acceleration, adaptive state placement, and MBAR-ready analysis.
