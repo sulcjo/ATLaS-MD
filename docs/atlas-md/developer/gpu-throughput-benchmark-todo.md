@@ -12,6 +12,8 @@ User decision after T6 (MPS cannot be bypassed at 248 contexts). Checklist for c
       `--us-pull-device-index 0,1,2,3`; setup context + pull workers also count as MPS clients on
       their GPUs -> check 59 + setup + pull stays under ~60 per GPU, or run the pull before MPS starts.
 - [ ] Carry over the #4 PME-stream verdict from chignolin_8's next job.
+- [ ] Candidate (T7): compute the 1,256-pair contact sum once per step -- CV2 (residual vs CV1)
+      currently re-evaluates it; the two CV forces together cost 26 % per context.
 - [ ] **Integrator lever 1 (user, 2026-09-22): replace the water-only auxiliary PME with a cheap
       real-space approximation of the peptide energy.** The boost may be any function of the
       coordinates provided the applied force is its exact gradient and MBAR reweights with the same
@@ -208,3 +210,30 @@ context, 250-step chunks, dt 3.5 fs (steps/s per replica; node ns/day):
   forces, the gareus loop) is unmeasured because P segfaulted at 248 in the benchmark (production
   builds and runs the same integrator at 248, so this is a benchmark-harness difference, not
   chased).
+
+## T7 — lever 2 (merge bias forces into one group): MEASURED 2026-09-22 (job 2579032), ~2 %, not worth it
+
+Real production CV forces (contact umbrella, 1,256 pairs, group 31; residual-torsion-pc CV2,
+group 29) added to the benchmark system (`c8_integ_bench2.py`, `BIAS=split|merged`):
+
+| | split 29 + 31 (production) | merged into 29 |
+|---|---|---|
+| real integrator, 1 context/GPU (2 repeats) | 1,461 / 1,450 steps/s | 1,481 / 1,479 (+1.8 %) |
+| real integrator, 248 contexts | 10.34 | 10.52 (+1.7 %) |
+| branch-free, 248 contexts | harness error (B reads both groups in one step) | 10.61 |
+
+Not implemented: +1.7 % does not pay for re-keying the fast CV path (`production.py:6958`
+identifies the two CustomCVForces by force group).
+
+What this run corrected in T6:
+- **The CV forces cost 26 % per context** (real integrator 1,978 -> 1,461 steps/s). T6's
+  branch-free arm had no CV forces, so its "1.7x headroom over production" was an artefact.
+  With the real CV forces, branch-free and real integrator are equal at 248 (10.61 vs 10.52).
+- **Remaining gap to production is ~6 %** (10.34 in the benchmark vs 9.75 in production): that is
+  all the gareus loop (exchange, sampling, barostat, reporters) costs. There is no large
+  non-MPS headroom left anywhere in the step.
+- The real integrator did not segfault at 248 this time; T6's crash was transient.
+- Next per-context lever: the CV2 force (residual against CV1) re-evaluates the same 1,256-pair
+  contact sum as the CV1 umbrella every step. Evaluating it once (one CustomCVForce carrying both
+  restraints, sharing the contact sub-CV) could recover up to roughly half of the 26 %. Changes the
+  force layout -> chignolin_9 candidate, alongside integrator lever 1.
