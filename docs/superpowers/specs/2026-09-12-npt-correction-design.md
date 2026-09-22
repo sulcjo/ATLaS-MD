@@ -31,23 +31,23 @@ Even lambda zero is affected if the auxiliary energy enters acceptance. For nonz
 
 For window/label a, define
 
-\[
+$$
 U_a^*(x,B)=U_{\mathrm{phys}}(x,B)+W_a(x,B)+\Delta_a(x,B).
-\]
+$$
 
 Here B is the box matrix, W contains every actual umbrella, secondary-CV and other unscaled bias, and Delta is the boost actually applied by the integrator. Auxiliary bookkeeping forces contribute only to constructing boost inputs, never as additional physical energy.
 
 For the current Pep partition:
 
-\[
+$$
 V_{\mathrm{pep}}=E_0-E_1+E_2,\qquad V_d=E_2,
-\]
+$$
 
-\[
+$$
 b_d=b(V_d;\theta_d,k_{0d}),\quad
 b_t=b(V_{\mathrm{pep}}+b_d;\theta_t,k_{0t}),\quad
 \Delta=b_d+b_t.
-\]
+$$
 
 E0 and E2 are physical groups; E1 is the auxiliary water-only group. The remaining physical/bias forces are included once, unscaled. Implement an explicit force inventory: do not equate the helper `total_energy_groups()` with total physical energy; it describes the integrator's boost channel.
 
@@ -63,10 +63,10 @@ Use molecule translations, preserving every molecule's internal geometry. Match 
 
 For volume V = det(B), propose
 
-\[
+$$
 V'=V+\delta,\quad\delta\sim\mathrm{Uniform}[-a,a],\quad
 s=(V'/V)^{1/3},\quad B'=sB.
-\]
+$$
 
 For molecule m with consistently represented center Rm, translate all its atoms by `(s-1)*Rm`. Internal vectors, constraints and velocities remain unchanged. Whole-molecule periodic imaging may be used; independent atom wrapping must not tear molecules apart. Establish and test a reversible center/imaging convention. Recompute virtual sites when required. Do not project scaled atomic coordinates back onto constraints: that is a different proposal with an unaccounted Jacobian.
 
@@ -74,10 +74,10 @@ The absolute proposal half-width a is fixed during production. An initial config
 
 Accept using
 
-\[
+$$
 \log A=-\beta[U_a^*(x',B')-U_a^*(x,B)+P(V'-V)]
 +N_{\mathrm{mol}}\log(V'/V),
-\]
+$$
 
 and `log(u) < min(0, logA)`. Use beta = 1/(R T) with molar energies. The pressure conversion is `1 bar nm³ = 0.0602214076 kJ/mol`.
 
