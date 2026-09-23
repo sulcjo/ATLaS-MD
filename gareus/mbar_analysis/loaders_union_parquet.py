@@ -346,6 +346,9 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
         _, beta = infer_temp_beta(adaptive_dir, meta)
 
     per_dir_valid_counts = [0] * len(epoch_dirs)
+    # _epoch_source indexes the phases that CONTRIBUTED samples (skipped phases get no index), so it is
+    # not an index into adaptive_epoch_run_dirs (every discovered phase) once any phase is skipped.
+    epoch_source_dirs: list = []
     # Optional side-car giving every regime's CV2 for every recoverable frame
     # (reproject_cv2.py). Present only if somebody generated it; when absent
     # the pooled u_nk keeps its existing per-epoch-native cv2, which across a
@@ -372,6 +375,7 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
         # float64 transient that's then mostly discarded by [valid].
         cv_epoch = samples['cv1'][valid].astype(np.float64, copy=False)
         all_cv.append(cv_epoch)
+        epoch_source_dirs.append(str(epoch_dir))  # _epoch_source value len(all_cv) - 1 -> this phase
         cv2_raw = samples.get('cv2')
         cv2_epoch = _fill_masked_nan(cv2_raw[valid]) if cv2_raw is not None else np.full(valid.sum(), np.nan)
         all_cv2.append(cv2_epoch)
@@ -571,7 +575,8 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
                      'adaptive_union_states': K, 'adaptive_union_epochs': len(epoch_dirs),
                      'umbrella_window_rows': list(reg_rows),
                      '_epoch_source': epoch_src.tolist(),
-                     'adaptive_epoch_run_dirs': [str(ed) for ed, _ in epoch_dirs]})
+                     'adaptive_epoch_run_dirs': [str(ed) for ed, _ in epoch_dirs],
+                     '_epoch_source_run_dirs': list(epoch_source_dirs)})
     meta_out.update(_ladder_meta)
 
     _boost_dih_arg = boost_dih if np.any(np.isfinite(boost_dih)) else None

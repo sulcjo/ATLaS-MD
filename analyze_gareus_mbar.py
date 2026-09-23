@@ -47,6 +47,7 @@ from gareus.mbar_analysis.solvers import (
     logw_from_fk,
 )
 from gareus.mbar_analysis.crosscheck import ladder_crosscheck
+from gareus.mbar_analysis.thermo import analyze_thermo_decomposition
 # Single source for the ladder-axis state-overlap target: the argparse default,
 # the call site and ladder_overlap_by_axis's own default must not drift apart --
 # three independent literals is how the CV1-marginal 0.30 ended up grading a
@@ -5265,6 +5266,9 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
     fes2d_info=analyze_distance_rg_2d_fes(d,args,logw,selected,boost_ok,kbt_kcal,out,warn,progress) if isinstance(rg_info,dict) and rg_info.get('available') else {'available':False,'reason':'Rg analysis unavailable'}
     pca2d_info=analyze_pca_2d_fes(d,args,logw,selected,boost_ok,kbt_kcal,out,warn,progress)
     extra_obs_info=analyze_extra_observable_pmfs(d,args,logw,selected,boost_ok,kbt_kcal,out,warn,progress)
+    # Same full-population (d, m['logw']) pair as analyze_rg/2D FES, not d_main: on ladder and unboosted
+    # runs the global MBAR weights are exact for every epoch; stock GaMD is refused inside.
+    thermo_info=analyze_thermo_decomposition(d,args,m,kbt_kcal=kbt_kcal,out=out,warnings=warn)
     chignolin_fes_info=analyze_chignolin_fes(d,args,logw,selected,boost_ok,kbt_kcal,out,warn,progress)
     secondary_cv_pmf_info,cv1_cv2_fes_info=run_secondary_cv_analyses(d,args,logw,selected,boost_ok,kbt_kcal,out,warn,progress,f_k_global=m['f_k'])
     poincare_info=analyze_poincare_map(d,args,logw,selected,boost_ok,kbt_kcal,out,warn,progress)
@@ -5321,6 +5325,7 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
     s['distance_rg_2d_fes']=fes2d_info
     s['pca_2d_fes']=pca2d_info
     s['extra_observable_pmfs']=extra_obs_info
+    s['thermo_decomposition']=thermo_info
     s['chignolin_fes']=chignolin_fes_info
     s['secondary_cv_pmf']=secondary_cv_pmf_info
     s['poincare_map']=poincare_info
@@ -5738,6 +5743,18 @@ def parse_args(argv=None):
     p.add_argument('--no-poincare-residue-torsions', action='store_true', help='Disable per-residue torsion analysis at Poincaré crossing frames.')
     p.add_argument('--poincare-route-split', type=float, default=None, metavar='CV2', help='CV2 cutpoint to split Poincaré folding routes A (below) and B (above). Default: auto-midpoint of the two highest fold CV2 peaks.')
     p.add_argument('--no-adaptive-diag', action='store_true', help='Disable adaptive-production diagnostic plots (epoch/topup phase-space coverage, window layout, topup timeline, overlap). Enabled automatically for adaptive_production runs.')
+    p.add_argument('--no-thermo-decomposition', action='store_true', help='Disable the basin enthalpy/entropy split (dG, dH = d<U>, -TdS = dG - dH; on the exact pep-gamd-lower-dual kernel also dV_pep, dU_ee and -TdS\' = dG - dV_pep) from recorded per-sample potential/v_pep/v_dih, reweighted with the MBAR weights. See docs/superpowers/specs/2026-09-23-thermo-energy-decomposition/spec.md.')
+    p.add_argument('--thermo-basin', action='append', default=None, metavar='NAME:LO:HI', help='CV1 basin for the thermodynamic decomposition (repeatable; CV1 units). Without it basins are split automatically at the CV1 PMF barrier and labelled auto.')
+    p.add_argument('--thermo-bins', type=int, default=None, help='CV1 bins for the thermodynamic profiles. Defaults to --bins.')
+    p.add_argument('--thermo-bootstrap', type=int, default=200, metavar='N', help='Paired block-bootstrap replicates (blocks = one replica within one epoch/phase). 0 disables uncertainties. Default 200.')
+    p.add_argument('--thermo-frames', action='store_true', help='Also evaluate saved trajectory frames: peptide-only PME energy (V_pp, same alpha/grid as production) giving the exact peptide-peptide / peptide-environment split V_pe = v_pep - V_pp, and backbone phi/psi mutual-information configurational entropy per basin (solvent entropy by difference). Frames are matched to samples by (epoch, replica, step) and refused if the offline torsion energy disagrees with the recorded v_dih. Off by default: one PME evaluation per frame.')
+    p.add_argument('--thermo-frame-stride', type=int, default=1, metavar='N', help='Evaluate every N-th trajectory interval for --thermo-frames. Default 1.')
+    p.add_argument('--thermo-frame-platform', default='auto', help='OpenMM platform for --thermo-frames (auto = CUDA, then OpenCL, then CPU).')
+    p.add_argument('--thermo-entropy-bins', type=int, default=24, help='Histogram bins per torsion for the configurational entropy. Default 24.')
+    p.add_argument('--thermo-no-entropy', action='store_true', help='Skip the torsion entropy in --thermo-frames (energies only).')
+    p.add_argument('--thermo-seed', type=int, default=0, help='RNG seed for the thermodynamic bootstrap. Default 0.')
+    p.add_argument('--thermo-min-basin-ess', type=float, default=1000.0, help='Minimum weight ESS per basin; below it every difference involving the basin is inconclusive. Default 1000.')
+    p.add_argument('--thermo-min-basin-blocks', type=int, default=8, help='Minimum distinct (epoch, replica) blocks per basin. Default 8.')
     p.add_argument('--no-torsion-pca-scree', action='store_true', help='Disable the torsion-PCA scree analysis (full eigenvalue spectrum + per-component torsion loadings, computed from one epoch\'s real tica_obs dihedral samples). Enabled by default when adaptive_production/epoch_NNN/tica_obs/ is present.')
     p.add_argument('--torsion-pca-scree-epoch', type=int, default=0, metavar='N', help='Adaptive-production epoch index to source real dihedral samples from for the torsion-PCA scree analysis. Default 0 (bootstrap/first epoch).')
     p.add_argument('--adaptive-diag-stride', type=int, default=3, metavar='N', help='Sub-sample stride for adaptive diagnostic density maps. Higher = faster but coarser. Default 3.')
