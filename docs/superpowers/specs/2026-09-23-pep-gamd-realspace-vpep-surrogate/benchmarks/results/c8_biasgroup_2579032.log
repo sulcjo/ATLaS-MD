@@ -1,0 +1,25 @@
+host d094 job 2579032 | code ac549a5f2fd606eec5d9ccdb095b7032a6f8361b
+0, NVIDIA L40S
+1, NVIDIA L40S
+2, NVIDIA L40S
+3, NVIDIA L40S
+=== lever 2: bias forces split (29+31, production) vs merged (29) -- real CV forces
+--- 1 context/GPU (N=4), real Pep-GaMD integrator
+RESULT arm=P bias=split groups=(29, 31) N=4 steps/rep=44000 wall=30.1s | 1460.77 steps/s/rep | 441.74 ns/day/rep | node 1767 ns/day | cpu 3.9 cores (0.98/rep) | E0=-528514 kJ/mol finite=True
+RESULT arm=P bias=merged groups=(29,) N=4 steps/rep=44500 wall=30.0s | 1481.49 steps/s/rep | 448.00 ns/day/rep | node 1792 ns/day | cpu 3.9 cores (0.98/rep) | E0=-527167 kJ/mol finite=True
+RESULT arm=P bias=split groups=(29, 31) N=4 steps/rep=43500 wall=30.0s | 1449.75 steps/s/rep | 438.40 ns/day/rep | node 1754 ns/day | cpu 3.9 cores (0.98/rep) | E0=-527960 kJ/mol finite=True
+RESULT arm=P bias=merged groups=(29,) N=4 steps/rep=44500 wall=30.1s | 1479.48 steps/s/rep | 447.40 ns/day/rep | node 1790 ns/day | cpu 3.9 cores (0.98/rep) | E0=-527454 kJ/mol finite=True
+--- 248 contexts, branch-free integrator (the real one segfaulted at 248 in job 2577764)
+ARM B N=248: 248 contexts built in 179s
+Traceback (most recent call last):
+openmm.OpenMMException: A single computation step cannot depend on multiple force groups
+ARM B N=248: 248 contexts built in 177s
+RESULT arm=B bias=merged groups=(29,) N=248 steps/rep=750 wall=70.7s | 10.61 steps/s/rep | 3.21 ns/day/rep | node 795 ns/day | cpu 182.7 cores (0.74/rep) | E0=-527908 kJ/mol finite=True
+--- 248 contexts, real integrator (retry; may segfault again)
+ARM P N=248: 248 contexts built in 179s
+RESULT arm=P bias=split groups=(29, 31) N=248 steps/rep=750 wall=72.6s | 10.34 steps/s/rep | 3.13 ns/day/rep | node 775 ns/day | cpu 182.1 cores (0.73/rep) | E0=-527444 kJ/mol finite=True
+exit 0
+ARM P N=248: 248 contexts built in 178s
+RESULT arm=P bias=merged groups=(29,) N=248 steps/rep=750 wall=71.3s | 10.52 steps/s/rep | 3.18 ns/day/rep | node 789 ns/day | cpu 183.0 cores (0.74/rep) | E0=-527389 kJ/mol finite=True
+exit 0
+DONE

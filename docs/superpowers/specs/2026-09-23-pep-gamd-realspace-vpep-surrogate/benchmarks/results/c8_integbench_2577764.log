@@ -1,0 +1,25 @@
+host d093 job 2577764 | code ac549a5f2fd606eec5d9ccdb095b7032a6f8361b
+0, NVIDIA L40S
+1, NVIDIA L40S
+2, NVIDIA L40S
+3, NVIDIA L40S
+=== single context per GPU (N=4): GPU-side cost without time-slicing
+ARM L N=4: 4 contexts built in 4s
+RESULT arm=L N=4 steps/rep=125250 wall=30.0s | 4170.40 steps/s/rep | 1261.13 ns/day/rep | node 5045 ns/day | cpu 4.0 cores (0.99/rep) | E0=-266955 kJ/mol finite=True
+ARM L2 N=4: 4 contexts built in 2s
+RESULT arm=L2 N=4 steps/rep=91000 wall=30.0s | 3029.86 steps/s/rep | 916.23 ns/day/rep | node 3665 ns/day | cpu 4.0 cores (0.99/rep) | E0=-639079 kJ/mol finite=True
+P: copied 62 production-stage globals from the checkpoint (stage=2.0)
+ARM P N=4: 4 contexts built in 2s
+RESULT arm=P N=4 steps/rep=59500 wall=30.1s | 1978.03 steps/s/rep | 598.16 ns/day/rep | node 2393 ns/day | cpu 3.9 cores (0.99/rep) | E0=-527179 kJ/mol finite=True
+ARM B N=4: 4 contexts built in 2s
+RESULT arm=B N=4 steps/rep=60500 wall=30.1s | 2009.55 steps/s/rep | 607.69 ns/day/rep | node 2431 ns/day | cpu 3.9 cores (0.98/rep) | E0=-527532 kJ/mol finite=True
+=== 248 contexts, no MPS (production regime)
+ARM L N=248: 248 contexts built in 103s
+RESULT arm=L N=248 steps/rep=3250 wall=64.3s | 50.57 steps/s/rep | 15.29 ns/day/rep | node 3793 ns/day | cpu 188.3 cores (0.76/rep) | E0=-266012 kJ/mol finite=True
+ARM L2 N=248: 248 contexts built in 142s
+RESULT arm=L2 N=248 steps/rep=2500 wall=64.3s | 38.90 steps/s/rep | 11.76 ns/day/rep | node 2918 ns/day | cpu 188.5 cores (0.76/rep) | E0=-626017 kJ/mol finite=True
+P: copied 62 production-stage globals from the checkpoint (stage=2.0)
+ARM P N=248: 248 contexts built in 141s
+ARM B N=248: 248 contexts built in 142s
+RESULT arm=B N=248 steps/rep=1250 wall=73.5s | 17.00 steps/s/rep | 5.14 ns/day/rep | node 1275 ns/day | cpu 186.5 cores (0.75/rep) | E0=-527810 kJ/mol finite=True
+DONE

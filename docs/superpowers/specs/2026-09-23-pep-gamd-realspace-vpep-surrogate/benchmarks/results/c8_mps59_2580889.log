@@ -1,0 +1,19 @@
+host d094 job 2580889 | nofile 65536
+=== MPS on
+--- 236 contexts (59/GPU), PME stream disabled (the historical MPS setting)
+ARM P5 N=236: 236 contexts built in 155s
+RESULT arm=P5 bias=split groups=(29, 31) N=236 steps/rep=2000 wall=61.9s | 32.32 steps/s/rep | 9.77 ns/day/rep | node 2307 ns/day | cpu 175.9 cores (0.75/rep) | E0=-528351 kJ/mol finite=True | MPS=True PME_DISABLE=true | stage 5 FSF_T 0.936 FSF_D 0.845
+--- 236 contexts (59/GPU), PME stream enabled (+8-11 % without MPS)
+ARM P5 N=236: 236 contexts built in 154s
+RESULT arm=P5 bias=split groups=(29, 31) N=236 steps/rep=2000 wall=64.3s | 31.11 steps/s/rep | 9.41 ns/day/rep | node 2220 ns/day | cpu 177.6 cores (0.75/rep) | E0=-528000 kJ/mol finite=True | MPS=True PME_DISABLE=false | stage 5 FSF_T 0.944 FSF_D 0.702
+--- 192 contexts (48/GPU)
+ARM P5 N=192: 192 contexts built in 114s
+RESULT arm=P5 bias=split groups=(29, 31) N=192 steps/rep=2500 wall=66.5s | 37.59 steps/s/rep | 11.37 ns/day/rep | node 2182 ns/day | cpu 180.0 cores (0.94/rep) | E0=-527687 kJ/mol finite=True | MPS=True PME_DISABLE=false | stage 5 FSF_T 0.941 FSF_D 0.740
+--- 64 contexts (16/GPU, chignolin_7 scale)
+ARM P5 N=64: 64 contexts built in 29s
+RESULT arm=P5 bias=split groups=(29, 31) N=64 steps/rep=10000 wall=61.4s | 162.95 steps/s/rep | 49.28 ns/day/rep | node 3154 ns/day | cpu 63.1 cores (0.99/rep) | E0=-527088 kJ/mol finite=True | MPS=True PME_DISABLE=false | stage 5 FSF_T 0.976 FSF_D 0.748
+=== MPS off, reference
+--- 236 contexts, no MPS
+ARM P5 N=236: 236 contexts built in 165s
+RESULT arm=P5 bias=split groups=(29, 31) N=236 steps/rep=750 wall=63.7s | 11.77 steps/s/rep | 3.56 ns/day/rep | node 840 ns/day | cpu 182.7 cores (0.77/rep) | E0=-534883 kJ/mol finite=True | MPS=False PME_DISABLE=false | stage 5 FSF_T 0.965 FSF_D 0.766
+DONE
