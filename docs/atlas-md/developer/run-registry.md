@@ -47,6 +47,20 @@ plain umbrella sampling (the intended Pep-GaMD boost was never active).
     (MBAR overlaps 0.10-0.21 across those steps).
   - *Verdict so far:* the sparse pseudo-2D layout itself is connected and reweightable; the open
     question is the rung (exchange) artefact, not the layout.
+- **Final item-0 check at the cutoff, 2026-09-23 (steps 5,250-485,500; 476,656 samples, ~1,920 per
+  window; boost zero in every sample):**
+  - *MBAR connectivity (62 collapsed states): connected, unchanged from interim.* One component at
+    overlap >= 0.01; at 0.03/0.09 only the zero-k unrestrained state c28 separates (O_28,28 = 0.019,
+    0.981 spread over the others). Weakest restrained best link 0.102; spectral gap 0.0356.
+  - *Per-state quality: good.* Self-bias median 0.85 kT (max 2.86), none > 10 kT; per-state Kish ESS
+    >= 15,132; unbiased-ensemble ESS 87.9 %; CV2 neighbour spacing 1.50 window sigma, MBAR overlaps
+    0.11-0.21 across CV2 steps.
+  - *Rung consistency: still fails, smaller.* 56/62 centres > 3 SE (37/62 > 5); median largest rung
+    difference 0.43 window sigma (was 0.55), KS 0.28 (was 0.34). Null (time-halves of one rung):
+    10/62 > 3, 0.19 sigma, KS 0.16. The difference shrank with 2x the data but is still ~2.3x the null
+    and more significant (z grows with sample size), i.e. a persistent modest distortion from the
+    phantom-boost exchange on top of slow CV sampling. Rung-collapsed US estimates carry that caveat.
+  - Run directory pulled locally to `RUNS/chignolin_8/` (with launcher, benchmarks and job logs).
 - **Cutoff:** `STOP_AT_PROD_DONE=485200` in `~/gareus/chignolin/chignolin_8.sh`; marker file
   `~/gareus/chignolin/chignolin_8.US_ONLY_STOPPED`; chain status line
   `STOPPED: US-only cutoff before GaMD stage 3`.
