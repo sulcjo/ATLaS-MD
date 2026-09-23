@@ -2,7 +2,7 @@
 
 Date: 2026-09-23  
 Status: proposed implementation plan; no implementation or tests executed for this handoff.  
-Repository baseline: `sulcjo/atlas-md`, `main` at `dc9cb297cd17f9405ce296b796a99d3f1d6e708a`.  
+Repository baseline: `sulcjo/atlas-md`, `main` at `fa42346b8f18f459e1de93c264d60824f6cd665d` (PR #93 merge; same commit deployed on aurum2 `DEPLOYED_COMMIT`). Originally written against `dc9cb297cd17f9405ce296b796a99d3f1d6e708a`; revised 2026-09-23 for the shared contact-sum CV force layout, see §2.1.  
 Canonical specification: `docs/superpowers/specs/2026-09-23-pep-gamd-realspace-vpep-surrogate/spec.md`, including its new §14. The earlier flat specification path has moved.  
 Suggested repository destination: `docs/superpowers/specs/2026-09-23-pep-gamd-realspace-vpep-surrogate/implementation-plan.md`.
 
@@ -36,6 +36,21 @@ These are code-reading findings at the pinned baseline, not test results.
 | `production.sample` | Reads native boost globals after propagation and possible volume moves | Characterize coordinate timing before adding equality checks |
 
 The exact integrator already reads bias groups directly rather than recovering them through all-group force subtraction. Benchmark the actual baseline, not an obsolete implementation.
+
+### 2.1 Baseline change: shared contact-sum CV force (PR #93, `fa42346`)
+
+PR #93 does not touch `gareus/pep_gamd.py`, groups 0/1/2, or the Pep-GaMD boost algebra. It changes which bias groups exist, and that feeds the integrator's per-DOF bias variables, checkpoint compatibility and the benchmark baseline.
+
+| Location at `fa42346` | Behaviour | Consequence for RS |
+|---|---|---|
+| `production.cv_force_layout` / `add_umbrella_cv_forces` | CV1 nonlocal-contacts + CV2 `residual-torsion-pc` → `SHARED_CONTACT_LAYOUT`: CV1 umbrella `0.5*k*((res_contacts/contact_norm)-r0)^2` appended to the CV2 CustomCVForce in group 29; group 31 empty. Otherwise `SPLIT_CV_LAYOUT` | Three reachable bias-group shapes: shared `(29,)`, split 2-D `(29, 31)`, CV1-only `(31,)`. chignolin_9 uses `cv2: auto` with `fallback: cv1_only`, so its shape is decided by the swarm, not the config. Every RS integrator/NPT/audit test runs over all three |
+| `pep_gamd.pep_gamd_bias_force_groups` | Bias groups = occupied groups minus {0,1,2}, by construction | RS inherits this only if **all four** RS measurement components sit in group 1. An RS component parked anywhere else would silently become a "bias group" and be applied at full force. T01 validator enforces this |
+| `production._restore_secondary_cv_args_from_metadata` | Sets `args.cv_force_layout` from `secondary_cv_metadata["cv_force_layout"]`; absent record → split (pre-PR campaign) | Layout is now Hamiltonian-construction identity. T08 guard compares it alongside RS descriptor |
+| `production.reusable_checkpoint_matches_bias_groups` | Shared-GaMD `.chk` loaded only when recorded `bias_force_groups` equal current; unrecorded → not loaded, globals copy only | Precedent for T08. It covers only the binary checkpoint: `load_reusable_shared_gamd_setup` still copies files and returns globals before any identity check |
+| `production.fast_cv_force_indices` / `observe_fast_path` | Shared layout: CV1 read from the `contact_sum` sub-CV of the CV2 force; both observers point at one force | Unaffected by RS (`_fetch_v_pep_v_dih` reads groups 1/2 only), but RS wiring tests must run on a shared-layout system |
+| `benchmarks/c8_integ_bench4.py` arm `P5`, `BIAS=split\|shared`; job 2608721 | 236 contexts, 59/GPU, MPS on, PME stream disabled: split 2286/2294, shared 2630/2618 ns/day/node (+14.6 %); 1 context/GPU +8.1 %. Bias energy/forces equal on Reference (dE 0, max\|dF\| 1e-14) | Exact-kernel control for T11 = `P5 BIAS=shared` (or the layout the pilot actually uses). The ~2307 figure is split-layout history |
+
+Tests at baseline: `tests/test_shared_contact_cv_force.py`, plus the Pep-GaMD suites below.
 
 ## 3. Frozen mathematical and data contracts
 
@@ -97,14 +112,15 @@ Each task starts with a failing regression, ends with focused checks and a short
 
 ### T00 — Baseline characterization and acceptance fixtures
 
-**Files:** existing `tests/pep_gamd_fixture.py`, `tests/test_pep_gamd_boost.py`, `tests/test_pep_gamd_wiring.py`, `tests/test_pep_gamd_bias_force_groups.py`, `tests/test_gamd_frozen_envelope_stage5.py`; new `tests/test_pep_gamd_rs_platform_contract.py`.
+**Files:** existing `tests/pep_gamd_fixture.py`, `tests/test_pep_gamd_boost.py`, `tests/test_pep_gamd_wiring.py`, `tests/test_pep_gamd_bias_force_groups.py`, `tests/test_gamd_frozen_envelope_stage5.py`, `tests/test_shared_contact_cv_force.py`; new `tests/test_pep_gamd_rs_platform_contract.py`.
 
 1. Record commit, Python/OpenMM/gamd-openmm versions, CUDA precision/device and available test dependencies. Read any applicable repository instructions at implementation time.
 2. Run existing exact-kernel tests before edits; distinguish skips, dependency failures and real baseline failures.
 3. On a tiny independent-force fixture, prove bare `f`/`energy` respect the integration mask while explicit `f1`/`energy1` remain readable. Use separate computations for each force/energy read.
 4. Prove the same on Reference and supported CUDA versions; test masked cMD and a dummy native volume controller only where its acceptance is supposed to match exposed physical energy.
 5. Characterize native boost-global timing after a warmed step, accepted/rejected external volume move, and label swap. Inspect the installed upstream instruction sequence.
-6. Add an independent physical-System clone for comparisons; zero-boost trajectory equality must use the same update algorithm/noise/constraints, not compare GaMD Langevin to LangevinMiddle and demand equality.
+6. Parameterize the acceptance fixture over the three bias-group layouts of §2.1 (`(29,)`, `(29, 31)`, `(31,)`), with a cheap stand-in CV where the full residual-torsion-pc model is too heavy; later tasks reuse this parameterization.
+7. Add an independent physical-System clone for comparisons; zero-boost trajectory equality must use the same update algorithm/noise/constraints, not compare GaMD Langevin to LangevinMiddle and demand equality.
 
 **Exit:** mask semantics, timestep phase and deterministic test oracle established. Failure of explicit excluded-group reads blocks RS; do not enable all-group integration as a workaround.
 
@@ -123,7 +139,7 @@ validate_pep_gamd_partition(system, *, expected_kind, descriptor=None) -> None
 
 Keep `find_aux_force` exact-only for existing exact-specific callers. Add explicit `is_exact_pep_gamd`/`is_rs_pep_gamd`; make `is_pep_gamd` family membership only when all generic callers have been audited. Treat names as role identifiers plus structural validation, not trust in any arbitrary Force carrying a prefix.
 
-Validator rejects exact+RS coexistence, unrelated group-1 occupants, malformed RS sets and mismatched descriptor. Exact builder must reject RS as well as RS builder rejecting exact. Preserve reserved groups and existing bias-group complement.
+Validator rejects exact+RS coexistence, unrelated group-1 occupants, any RS component outside group 1 (it would otherwise be counted by `pep_gamd_bias_force_groups` as a bias group and applied unscaled), malformed RS sets and mismatched descriptor. Exact builder must reject RS as well as RS builder rejecting exact. Preserve reserved groups and existing bias-group complement.
 
 **Exit:** pure configuration/hash tests and invalid-inventory tests pass without importing OpenMM for pure tests.
 
@@ -149,7 +165,7 @@ Energy setup reads E1 and E2 into separate globals. Force update separately copi
 
 Add a last-force-evaluation witness containing raw R/D, both native boost components, effective FSFs, stage, channel parameters and lambda-related k0 values captured at the same force evaluation. It must retain values before position/box/label changes and must not overwrite upstream working globals for reporting.
 
-Tests cover both channels active, either inactive, lambda=0, lambda=0.5/1, umbrella blindness, calibration→production, out-of-envelope values and actual nonzero motion. Compare against an independent finite-difference Ustar oracle; test the force effect on solvent too. Add mutations for missing D in R, wrong F_S sign, omitted bias, doubled surrogate and incorrect channel order.
+Tests cover all three bias-group layouts of §2.1 (per-DOF bias-variable count must equal `len(pep_gamd_bias_force_groups(system))`), both channels active, either inactive, lambda=0, lambda=0.5/1, umbrella blindness, calibration→production, out-of-envelope values and actual nonzero motion. Compare against an independent finite-difference Ustar oracle; test the force effect on solvent too. Add mutations for missing D in R, wrong F_S sign, omitted bias, doubled surrogate and incorrect channel order.
 
 Energy reconstruction agreement alone is insufficient: the native audit and its independent reconstruction could agree while the integrator applies an incorrect force. Require two force-level oracles in addition to energy checks: (a) central finite differences of the independently evaluated Ustar for representative peptide and solvent coordinates, and (b) a deterministic warmed one-step comparison against an independently assembled reference integrator using identical positions, velocities, constraints, timestep, random seed/noise path and update ordering. Include nonzero dual boost and mutations that preserve reported energies while corrupting the applied F_S/F_D coefficients; those mutations must fail.
 
@@ -166,6 +182,7 @@ Energy reconstruction agreement alone is insufficient: the native audit and its 
 - Give `_fetch_v_pep_v_dih` an explicit boost-coordinate definition or args-derived group tuple; all four sample/exchange fast/slow call sites must use it.
 - Make `swarm.members.measure_frame` use generic raw Total measurement, and both swarm partition construction sites dispatch by intended campaign kernel even though swarm propagation is unboosted.
 - Thread identity through `_gamd_boost_group_targets`, cMD recon, shared setup and any serialized-System reconstruction path.
+- Build order: the RS partition and `add_umbrella_cv_forces` may run in either order; after both, `verify_pep_gamd_bias_force_groups` must hold and the layout recorded in `secondary_cv_metadata` must match the forces actually present.
 - Keep the single-dihedral path valid: absent Total energy may remain NaN there, not in a dual RS path.
 - Update CSV/NPZ metadata descriptions that currently say physical-minus-water-only.
 
@@ -208,6 +225,8 @@ Unified required-input policy: runtime exchange raises on nonfinite required coo
 
 Use reference-unit tolerance 1e-6 kJ/mol where measured achievable; define tighter/looser backend tolerances from controlled tests, with separate absolute and relative terms and a dimensionless beta*error ceiling. Do not silently loosen tolerances on mismatch. A failed audit prevents sample publication and further exchange, records context/phase/parameters, and aborts safely.
 
+Under the shared layout the umbrella energy W (CV1 and CV2 terms) lives in one force in group 29; umbrella-blindness and wrong-state-label mutations must be run there as well as on split and CV1-only systems.
+
 **Exit:** tests detect stale globals, wrong stage, wrong envelope, wrong lambda, missing D, reader failure and NaN. Valid accepted-volume-move and post-swap samples must pass.
 
 ### T07 — Swarm identities, sidecar fixes and dependent ladder design
@@ -234,11 +253,11 @@ Repair seed-bank digest coverage by hashing a deterministic manifest of the actu
 
 Write new raw R/D and lambda columns as float64 in Parquet; preserve float64 NPZ and round-trip-safe CSV/JSON formatting. Do not downgrade scientific inputs through `analysis_array_dtype`. Keep legacy reads supported without claiming their old float32 data meets new tolerance. Test mixed-schema read promotion/masks and non-binary lambda values such as 0.3.
 
-At every reusable-envelope load, validate boost type, RS descriptor digest, exact channel values/envelope digest, units and finite numbers before copying or returning globals. Missing RS identity is a hard failure; legacy exact compatibility must be explicit. Binary shared-setup reuse cannot cross coordinate definitions.
+At every reusable-envelope load, validate boost type, RS descriptor digest, exact channel values/envelope digest, units and finite numbers before copying or returning globals. Today `load_reusable_shared_gamd_setup` calls `_copy_shared_gamd_setup_files` and writes the local payload before any check, and `reusable_checkpoint_matches_bias_groups` gates only the later `.chk` load. Generalize that helper into one identity matcher (bias groups, `cv_force_layout`, boost type, RS descriptor digest, envelope digest), record all of these at export next to the existing `bias_force_groups`, and call it before the copy. An export lacking any RS field is refused for RS, not treated as legacy. Missing RS identity is a hard failure; legacy exact compatibility must be explicit. Binary shared-setup reuse cannot cross coordinate definitions.
 
-Extend the actual resume guard to compare kernel and Hamiltonian-defining fields, not only exchange/CV versions. Validate original ordered state table, state IDs, lambda assignments, descriptor and frozen envelope before any checkpoint load or output append. An intentional adaptive grid extension must use the existing explicit new-epoch/segment workflow with old-state identity preserved; an accidental reordered/relabelled table is not a resume.
+Extend the actual resume guard (`verify_kernel_identity_on_resume`) to compare kernel and Hamiltonian-defining fields, not only exchange/CV versions: boost type, RS descriptor digest and `cv_force_layout`. The layout is already restored from `secondary_cv_metadata` by `_restore_secondary_cv_args_from_metadata`, but nothing compares it with what the rebuilt System actually contains; test that a shared-layout RS campaign rebuilt as split (or vice versa) is refused before checkpoint load. Validate original ordered state table, state IDs, lambda assignments, descriptor and frozen envelope before any checkpoint load or output append. An intentional adaptive grid extension must use the existing explicit new-epoch/segment workflow with old-state identity preserved; an accidental reordered/relabelled table is not a resume.
 
-Test exact→RS, RS→exact, RS flavour/switch/alpha/cutoff/atom-set changes, modified envelope, missing descriptor, changed state assignments, unchanged restart, fresh-process serialization and context checkpoint restoration. Test no partial output writes on refusal. For new RS analysis, require authoritative lambda metadata and consistent kernel/envelope across sources; do not silently infer it through nanmedian. Exact and RS campaigns cannot be merged using one R value per frame, since cross-pricing would require both coordinates.
+Test exact→RS, RS→exact, shared↔split layout, RS flavour/switch/alpha/cutoff/atom-set changes, modified envelope, missing descriptor, changed state assignments, unchanged restart, fresh-process serialization and context checkpoint restoration. Test no partial output writes on refusal. For new RS analysis, require authoritative lambda metadata and consistent kernel/envelope across sources; do not silently infer it through nanmedian. Exact and RS campaigns cannot be merged using one R value per frame, since cross-pricing would require both coordinates.
 
 **Exit:** saved-frame reconstruction meets tolerance and all incompatible resume/analysis combinations fail before mutation.
 
@@ -272,11 +291,11 @@ Preserve stated prefilters: pooled r≥0.90, per-populated-window r≥0.80, sigm
 
 ### T11 — Boosted pilot, GPU benchmark and release gate
 
-**Files:** extend or wrap the shipped `benchmarks/c8_integ_bench3.py`; retain archived historical logs unchanged; new `tools/pep_gamd_rs_pilot_report.py` if existing reporting cannot express required comparisons.
+**Files:** extend or wrap the shipped `benchmarks/c8_integ_bench4.py` (successor of `c8_integ_bench3.py`; arm `P5` = real Pep-GaMD integrator in stage 5 with real CV forces, `BIAS=none|split|merged|shared`) and `benchmarks/c8_sharedcv.sh`; retain archived historical logs unchanged; new `tools/pep_gamd_rs_pilot_report.py` if existing reporting cannot express required comparisons.
 
 Parameterize hard-coded run paths/arm selection; use the real integrator, warm-up, fresh appropriate envelope, stage 5 and the T06 audit. Do not use the branch-free historical harness arm as a correctness oracle. Record envelope/descriptor/source/device/version hashes.
 
-Benchmark exact versus RS with/without real CV forces at one context/GPU, 16/GPU and the documented high-occupancy 48/59/GPU regimes where resources permit. Use four L40S/192 CPU threads as the primary node target. The recorded 236-context MPS result is about 2307 ns/day/node with PME stream disabled; it is historical context, not the RS control measurement. Use equal replica count, precision, timestep, output/exchange/barostat cadences and MPS settings, with repeated timings and compilation excluded. Measure audit overhead explicitly. Count actual force/kernel work rather than promising one PME evaluation from an algebraic expression.
+Benchmark exact versus RS with/without real CV forces at one context/GPU, 16/GPU and the documented high-occupancy 48/59/GPU regimes where resources permit. Use four L40S/192 CPU threads as the primary node target. Recorded 236-context MPS results with PME stream disabled: about 2307 ns/day/node (job 2580889) and 2286/2294 (job 2608721) for the split layout, 2630/2618 for the shared layout (job 2608721). These are historical context, not the RS control measurement: the exact control is re-measured in the same job as RS, with the CV layout the pilot actually uses (shared `(29,)` for a residual-torsion-pc CV2, CV1-only otherwise). The shared layout removed the duplicated contact sum; the second PME is untouched, so any RS gain is measured on top of that baseline. Use equal replica count, precision, timestep, output/exchange/barostat cadences and MPS settings, with repeated timings and compilation excluded. Measure audit overhead explicitly. Count actual force/kernel work rather than promising one PME evaluation from an algebraic expression.
 
 Pilot compact/intermediate/extended label-free seed strata, using independent seeds and newly fitted RS envelopes. Compare against exact and lambda=0 controls at matched scientific conditions; report per-step and per-wall-time performance. Include finite/constraint stability, force/guard crossings, boost/FSF distributions, actual ladder overlap, block-aware target ESS, zero-rung/full-ladder agreement and retention of compact seed regions. Use coverage as an efficiency diagnostic, not a native-structure selection criterion. No Gaussianity/CE2 assumption is needed by exact ladder MBAR; anharmonicity remains diagnostic.
 
@@ -303,7 +322,7 @@ Every commit record should list changed contracts, test command, platform, pass/
 Suggested test commands after proposed test files exist:
 
 ```bash
-python -m pytest -q tests/test_pep_gamd_boost.py tests/test_pep_gamd_wiring.py tests/test_pep_gamd_bias_force_groups.py tests/test_gamd_frozen_envelope_stage5.py
+python -m pytest -q tests/test_pep_gamd_boost.py tests/test_pep_gamd_wiring.py tests/test_pep_gamd_bias_force_groups.py tests/test_gamd_frozen_envelope_stage5.py tests/test_shared_contact_cv_force.py
 python -m pytest -q tests/test_pep_gamd_rs_platform_contract.py tests/test_pep_gamd_rs_identity.py tests/test_pep_gamd_rs_partition.py tests/test_pep_gamd_rs_energy.py tests/test_pep_gamd_rs_integrator.py tests/test_pep_gamd_rs_wiring.py
 python -m pytest -q tests/test_npt_rs_adapter.py tests/test_rs_runtime_hamiltonian_echo.py tests/test_swarm_rs_handoff.py tests/test_rs_recording_roundtrip.py tests/test_rs_resume_identity.py
 python -m pytest -q tests/ -m 'not slow'
@@ -320,6 +339,7 @@ rg -n 'PepGaMDWaterOnlyNonbonded|find_aux_force|ensure_pep_gamd_partition|peptid
 rg -n 'pep-gamd-lower-dual|LADDER_BOOST_TYPES|SUPPORTED_BIASED_MC_BOOST_TYPES' gareus tests
 rg -n 'v_pep|v_dih|float32|infer_gamd_boost|load_reusable_shared_gamd_setup' gareus
 rg -n 'nanmedian|state_gamd_lambdas|kernel_identity|shared_gamd_setup|artefact_digests' gareus
+rg -n 'cv_force_layout|SHARED_CONTACT_LAYOUT|bias_force_groups|reusable_checkpoint_matches' gareus tests
 ```
 
 ## 6. Stop conditions and rollback
@@ -332,14 +352,17 @@ rg -n 'nanmedian|state_gamd_lambdas|kernel_identity|shared_gamd_setup|artefact_d
 
 ## 7. Source anchors
 
-- [Current specification and §14](https://github.com/sulcjo/atlas-md/blob/dc9cb297cd17f9405ce296b796a99d3f1d6e708a/docs/superpowers/specs/2026-09-23-pep-gamd-realspace-vpep-surrogate/spec.md)
-- [Pep-GaMD implementation](https://github.com/sulcjo/atlas-md/blob/dc9cb297cd17f9405ce296b796a99d3f1d6e708a/gareus/pep_gamd.py)
-- [Production, measurement, resume and sampling](https://github.com/sulcjo/atlas-md/blob/dc9cb297cd17f9405ce296b796a99d3f1d6e708a/gareus/production.py)
-- [Swarm ladder design](https://github.com/sulcjo/atlas-md/blob/dc9cb297cd17f9405ce296b796a99d3f1d6e708a/gareus/swarm/ladder_design.py)
-- [Swarm epoch-0 identities](https://github.com/sulcjo/atlas-md/blob/dc9cb297cd17f9405ce296b796a99d3f1d6e708a/gareus/swarm/epoch0.py)
-- [Parquet writer](https://github.com/sulcjo/atlas-md/blob/dc9cb297cd17f9405ce296b796a99d3f1d6e708a/gareus/store.py)
-- [Kernel identity](https://github.com/sulcjo/atlas-md/blob/dc9cb297cd17f9405ce296b796a99d3f1d6e708a/gareus/kernel_identity.py)
-- [Historical production-stage benchmark](https://github.com/sulcjo/atlas-md/blob/dc9cb297cd17f9405ce296b796a99d3f1d6e708a/docs/superpowers/specs/2026-09-23-pep-gamd-realspace-vpep-surrogate/benchmarks/c8_integ_bench3.py)
-- [Historical MPS log](https://github.com/sulcjo/atlas-md/blob/dc9cb297cd17f9405ce296b796a99d3f1d6e708a/docs/superpowers/specs/2026-09-23-pep-gamd-realspace-vpep-surrogate/benchmarks/results/c8_mps59_2580889.log)
+- [Current specification and §14](https://github.com/sulcjo/atlas-md/blob/fa42346b8f18f459e1de93c264d60824f6cd665d/docs/superpowers/specs/2026-09-23-pep-gamd-realspace-vpep-surrogate/spec.md)
+- [Pep-GaMD implementation](https://github.com/sulcjo/atlas-md/blob/fa42346b8f18f459e1de93c264d60824f6cd665d/gareus/pep_gamd.py)
+- [Production, measurement, resume and sampling](https://github.com/sulcjo/atlas-md/blob/fa42346b8f18f459e1de93c264d60824f6cd665d/gareus/production.py)
+- [Swarm ladder design](https://github.com/sulcjo/atlas-md/blob/fa42346b8f18f459e1de93c264d60824f6cd665d/gareus/swarm/ladder_design.py)
+- [Swarm epoch-0 identities](https://github.com/sulcjo/atlas-md/blob/fa42346b8f18f459e1de93c264d60824f6cd665d/gareus/swarm/epoch0.py)
+- [Parquet writer](https://github.com/sulcjo/atlas-md/blob/fa42346b8f18f459e1de93c264d60824f6cd665d/gareus/store.py)
+- [Kernel identity](https://github.com/sulcjo/atlas-md/blob/fa42346b8f18f459e1de93c264d60824f6cd665d/gareus/kernel_identity.py)
+- [Historical production-stage benchmark](https://github.com/sulcjo/atlas-md/blob/fa42346b8f18f459e1de93c264d60824f6cd665d/docs/superpowers/specs/2026-09-23-pep-gamd-realspace-vpep-surrogate/benchmarks/c8_integ_bench3.py)
+- [Current benchmark harness, split/shared CV arms](https://github.com/sulcjo/atlas-md/blob/fa42346b8f18f459e1de93c264d60824f6cd665d/docs/superpowers/specs/2026-09-23-pep-gamd-realspace-vpep-surrogate/benchmarks/c8_integ_bench4.py)
+- [Shared contact-sum benchmark log, job 2608721](https://github.com/sulcjo/atlas-md/blob/fa42346b8f18f459e1de93c264d60824f6cd665d/docs/superpowers/specs/2026-09-23-pep-gamd-realspace-vpep-surrogate/benchmarks/results/c8_sharedcv_2608721.log)
+- [Shared-layout tests](https://github.com/sulcjo/atlas-md/blob/fa42346b8f18f459e1de93c264d60824f6cd665d/tests/test_shared_contact_cv_force.py)
+- [Historical MPS log](https://github.com/sulcjo/atlas-md/blob/fa42346b8f18f459e1de93c264d60824f6cd665d/docs/superpowers/specs/2026-09-23-pep-gamd-realspace-vpep-surrogate/benchmarks/results/c8_mps59_2580889.log)
 
 API references checked during planning: [OpenMM CustomIntegrator](https://docs.openmm.org/latest/api-python/generated/openmm.openmm.CustomIntegrator.html) for persistent globals and separate group reads; [CustomNonbondedForce](https://docs.openmm.org/latest/api-python/generated/openmm.openmm.CustomNonbondedForce.html) for interaction groups, exclusions and switching; [NonbondedForce](https://docs.openmm.org/latest/api-python/generated/openmm.openmm.NonbondedForce.html) for physical parameters and exception settings. These latest pages identify a development version; installed-version runtime tests in T00/T02, not the latest-page label, determine support.
