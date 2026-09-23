@@ -14,8 +14,8 @@ User decision after T6 (MPS cannot be bypassed at 248 contexts). Checklist for c
       CV2 spacing (spacing/sigma) leaves gaps. Result decides whether the swarm-designed sparse layout
       is fit to carry chignolin_9's 59-centre design.
 - [x] **GaMD stage fix: implemented 2026-09-22 (commit on main after 0401199; seed_frozen_envelope_stage5 +
-      verify_gamd_production_stage5).** DEPLOY TO AURUM ONLY AFTER chignolin_8 has stopped (marker
-      ~/gareus/chignolin/chignolin_8.US_ONLY_STOPPED): the new check refuses chignolin_8's stage-2 resume.
+      verify_gamd_production_stage5).** DEPLOYED to aurum2 on 2026-09-23 after chignolin_8 stopped (both trees,
+      DEPLOYED_COMMIT dc9cb29, md5-verified); confirmed live in job 2580889 (stage 5, FSF < 1).
       Original note: chignolin_8 production never left gamd stage 2 (unboosted; see
       run-registry.md). Frozen-envelope production must start in stage 5; add a test asserting FSF < 1
       on a lambda = 1 replica after one warm step. Nothing else on this list matters without it.
