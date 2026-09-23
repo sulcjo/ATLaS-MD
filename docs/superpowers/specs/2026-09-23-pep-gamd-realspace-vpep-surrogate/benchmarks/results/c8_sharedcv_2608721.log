@@ -1,0 +1,27 @@
+host d098 job 2608721 | code 2683288d09425215e31711dce89fab399816cf09 | nofile 65536
+0, NVIDIA L40S
+1, NVIDIA L40S
+2, NVIDIA L40S
+3, NVIDIA L40S
+=== equivalence: shared vs split bias energy/forces (mixed, then double)
+RESULT CHECK E_split=10.887140 E_shared=10.887140 dE=0.000e+00 kJ/mol | max|F_split|=21.996 max|dF|=4.768e-07 kJ/mol/nm | rel=2.17e-08
+RESULT CHECK E_split=10.887131 E_shared=10.887131 dE=0.000e+00 kJ/mol | max|F_split|=21.996 max|dF|=2.328e-10 kJ/mol/nm | rel=1.06e-11
+=== no MPS, 1 context/GPU (N=4): per-context cost, PME stream enabled (no-MPS verdict)
+ARM P5 N=4: 4 contexts built in 3s
+RESULT arm=P5 bias=split groups=(29, 31) N=4 steps/rep=50000 wall=30.0s | 1665.75 steps/s/rep | 503.72 ns/day/rep | node 2015 ns/day | cpu 3.9 cores (0.97/rep) | E0=-526135 kJ/mol finite=True | MPS=False PME_DISABLE=false | stage 5 FSF_T 0.962 FSF_D 0.739
+ARM P5 N=4: 4 contexts built in 2s
+RESULT arm=P5 bias=shared groups=(29,) N=4 steps/rep=53750 wall=30.1s | 1783.42 steps/s/rep | 539.31 ns/day/rep | node 2157 ns/day | cpu 3.9 cores (0.97/rep) | E0=-527992 kJ/mol finite=True | MPS=False PME_DISABLE=false | stage 5 FSF_T 0.965 FSF_D 0.762
+ARM P5 N=4: 4 contexts built in 2s
+RESULT arm=P5 bias=split groups=(29, 31) N=4 steps/rep=49250 wall=30.1s | 1635.44 steps/s/rep | 494.56 ns/day/rep | node 1978 ns/day | cpu 3.9 cores (0.97/rep) | E0=-526510 kJ/mol finite=True | MPS=False PME_DISABLE=false | stage 5 FSF_T 0.958 FSF_D 0.696
+ARM P5 N=4: 4 contexts built in 2s
+RESULT arm=P5 bias=shared groups=(29,) N=4 steps/rep=53750 wall=30.1s | 1784.09 steps/s/rep | 539.51 ns/day/rep | node 2158 ns/day | cpu 3.9 cores (0.97/rep) | E0=-527595 kJ/mol finite=True | MPS=False PME_DISABLE=false | stage 5 FSF_T 0.928 FSF_D 0.722
+=== MPS on, 236 contexts (59/GPU, chignolin_9 layout), PME stream disabled (MPS verdict)
+ARM P5 N=236: 236 contexts built in 153s
+RESULT arm=P5 bias=split groups=(29, 31) N=236 steps/rep=2000 wall=62.5s | 32.03 steps/s/rep | 9.68 ns/day/rep | node 2286 ns/day | cpu 177.9 cores (0.75/rep) | E0=-528792 kJ/mol finite=True | MPS=True PME_DISABLE=true | stage 5 FSF_T 0.932 FSF_D 0.722
+ARM P5 N=236: 236 contexts built in 143s
+RESULT arm=P5 bias=shared groups=(29,) N=236 steps/rep=2250 wall=61.1s | 36.85 steps/s/rep | 11.14 ns/day/rep | node 2630 ns/day | cpu 179.7 cores (0.76/rep) | E0=-526470 kJ/mol finite=True | MPS=True PME_DISABLE=true | stage 5 FSF_T 0.972 FSF_D 0.770
+ARM P5 N=236: 236 contexts built in 153s
+RESULT arm=P5 bias=split groups=(29, 31) N=236 steps/rep=2000 wall=62.2s | 32.14 steps/s/rep | 9.72 ns/day/rep | node 2294 ns/day | cpu 179.2 cores (0.76/rep) | E0=-527192 kJ/mol finite=True | MPS=True PME_DISABLE=true | stage 5 FSF_T 0.920 FSF_D 0.654
+ARM P5 N=236: 236 contexts built in 143s
+RESULT arm=P5 bias=shared groups=(29,) N=236 steps/rep=2250 wall=61.3s | 36.68 steps/s/rep | 11.09 ns/day/rep | node 2618 ns/day | cpu 178.7 cores (0.76/rep) | E0=-529790 kJ/mol finite=True | MPS=True PME_DISABLE=true | stage 5 FSF_T 0.946 FSF_D 0.948
+DONE
