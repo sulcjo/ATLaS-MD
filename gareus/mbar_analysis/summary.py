@@ -49,6 +49,55 @@ def _key_diagnostics_md(s):
     return (['### Key diagnostics','']+lines+['']) if lines else []
 
 
+def _thermo_md(t):
+    """Basin-difference table for gareus.mbar_analysis.thermo's block (kJ/mol, estimate +- bootstrap SE)."""
+    if not t.get('available'):
+        return [f"Unavailable: {t.get('reason', 'not computed')}"]
+    out = [f"Weights: **{t.get('weights')}**; boost type: `{t.get('boost_type')}`; basins: **{t.get('basin_source')}**; "
+           f"bootstrap: {t.get('n_bootstrap')} replicates over {t.get('n_blocks')} blocks"]
+    if not t.get('split_available'):
+        out.append(f"V_pep/U_ee split unavailable: {t.get('split_reason')}")
+    keys = [('dG_kj', 'ΔG'), ('dH_kj', 'ΔH'), ('minus_TdS_kj', '−TΔS'), ('dV_pep_kj', 'ΔV_pep'),
+            ('dU_ee_kj', 'ΔU_ee'), ('minus_TdS_prime_kj', '−TΔS′')]
+    diffs = t.get('differences') or []
+    keys = [(k, n) for k, n in keys if any(k in d for d in diffs)]
+    if diffs:
+        out += ['', '| pair | status | ' + ' | '.join(f'{n} kJ/mol' for _, n in keys) + ' |',
+                '|---|---|' + '---:|' * len(keys)]
+        for d in diffs:
+            cells = []
+            for k, _ in keys:
+                v = d.get(k) or {}
+                est, se = v.get('estimate'), v.get('se')
+                cells.append('' if est is None else (f"{est:.1f} ± {se:.1f}" if se == se and se is not None else f"{est:.1f}"))
+            out.append(f"| {d['pair']} | {d['status']} | " + ' | '.join(cells) + ' |')
+        out += ['', '−TΔS′ = ΔG − ΔV_pep follows from the solvent-reorganization identity (ΔU_ee enters ΔH and TΔS equally); '
+                'it is derived, not measured.']
+    else:
+        out.append('No basin pair (profiles only).')
+    fr = t.get('frames') or {}
+    if fr:
+        out += ['', '### From saved frames (peptide-only PME, backbone torsion entropy)', '']
+        if not fr.get('available'):
+            out.append(f"Unavailable: {fr.get('reason')}")
+        else:
+            al = fr.get('frame_alignment') or {}
+            out.append(f"{fr.get('n_used')} samples with frames; alignment oracle median |E_dih − v_dih| "
+                       f"{al.get('median_abs_kj', float('nan')):.2f} kJ/mol")
+            fkeys = [('dV_pp_kj', 'ΔV_pp'), ('dV_pe_kj', 'ΔV_pe'), ('dU_ee_kj', 'ΔU_ee'), ('dH_kj', 'ΔH'),
+                     ('TdS_conf_S2_kj', 'TΔS_conf'), ('minus_TdS_solv_kj', '−TΔS_solv')]
+            out += ['', '| pair | status | ' + ' | '.join(f'{n} kJ/mol' for _, n in fkeys) + ' |',
+                    '|---|---|' + '---:|' * len(fkeys)]
+            for d in fr.get('differences') or []:
+                cells = []
+                for k, _ in fkeys:
+                    v = d.get(k) or {}
+                    est, se = v.get('estimate'), v.get('se')
+                    cells.append('' if est is None else (f"{est:.1f} ± {se:.1f}" if se is not None and se == se else f"{est:.1f}"))
+                out.append(f"| {d['pair']} | {d['status']} | " + ' | '.join(cells) + ' |')
+    return out
+
+
 def summary_md(path,s):
     _cu=s.get('primary_cv_units','A')
     lines=['# GaREUS PMF analysis summary','',f"Input: `{s['production_dir']}`",f"Samples/windows: **{s['n_samples']} / {s['n_windows']}**",f"Temperature: **{s['temperature_K']:.2f} K**",f"CV range: **{s['cv_min_A']:.3f} - {s['cv_max_A']:.3f} {_cu}**",f"Selected unbiased PMF: **{s['selected_unbiased_method']}**",f"PMF minimum: **{s['pmf_minimum_cv_A']} {_cu}**",f"PMF span: **{s['pmf_span_kcal_mol']:.3f} kcal/mol**",''] + _render_health_section_md(s) + _key_diagnostics_md(s) + ['## MBAR / umbrella diagnostics','',f"Converged: **{s['mbar']['converged']}** after {s['mbar']['iterations']} iterations",f"Backend: **{s['mbar'].get('backend','unknown')}**" + (f" / threads: **{s['mbar'].get('threads')}**" if s['mbar'].get('threads') else ""),f"Base ESS: **{s['mbar']['base_ess']:.1f}** / {s['n_samples']}", '', '## GaMD boost diagnostics','']
@@ -98,6 +147,7 @@ def summary_md(path,s):
         lines += [f"Selected method: **{extra.get('selected_unbiased_method')}**",f"Frames accumulated: **{extra.get('n_samples')}**",f"Scalar PMFs: **{', '.join(sorted(scalar.keys())) if scalar else 'none'}**",f"Contact 2D FES: **{', '.join(sorted(c2d.keys())) if c2d else 'none'}**",f"Torsion PMFs: **phi residues {tors.get('phi_residues',0)}, psi residues {tors.get('psi_residues',0)}, Ramachandran 2D residues {tors.get('ramachandran_residues',0)}**",f"Secondary-structure residue probabilities: **{extra.get('secondary_structure_residue_count',0)} residues**"]
     else:
         lines.append(f"Extra observable PMFs unavailable: {extra.get('reason','not computed')}")
+    lines += ['', '## Thermodynamic energy decomposition', ''] + _thermo_md(s.get('thermo_decomposition') or {})
     lines += ['', '## Outputs', ''] + [f"- `{k}`: `{v}`" for k,v in s['files'].items()] + ['', '## Warnings', '']
     lines += [f'- {w}' for w in s['warnings']] if s['warnings'] else ['- No major automatic warnings.']
     path.write_text('\n'.join(lines)+'\n')
