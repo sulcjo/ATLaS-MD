@@ -1,0 +1,92 @@
+schema_version: '2.0'
+description: >
+  Chignolin (GYDPETGTWG) GENPEPT seed generation for chignolin_9. Adapted from
+  examples/chignolin_genpept_contact_bias_sigma.yaml (the worked port of
+  RUNS/chignolin.yaml's r7/rep5_t7 config off the legacy contact_bias_strength
+  onto the length-invariant contact_bias_sigma) -- diversity_bank_preset:
+  broad (NOT the 'chignolin' fold-aware preset every prior chignolin campaign's
+  seed library used), so this is chignolin's first genuinely ab-initio-quotable
+  seed library: no native/folded structure informs generation, banks or basin
+  hopping anywhere in this file. User decision 2026-09-23: chignolin_9 uses
+  this library (not a reuse of chignolin_8's chignolin_genpept_rep5_t7), which
+  means chignolin_9's epoch 0 (the unbiased swarm) must re-run against these
+  seeds from scratch -- the swarm-data reuse shortcut used to regenerate the
+  59-centre layout locally on 2026-09-23 does NOT carry over; that layout was
+  built from chignolin_8's rep5_t7 round_000 data and is provisional until this
+  library's own round 0 exists and gets re-analyzed.
+
+  Run with:  python GENPEPT.py --config chignolin_9_genpept.yaml
+
+# ---------------------------------------------------------------------------
+# Differences from examples/chignolin_genpept_contact_bias_sigma.yaml:
+#   * out: chignolin_genpept_9_sigma (was chignolin_genpept_sigma) -- distinct
+#     from chignolin_8's chignolin_genpept_rep5_t7, matching the launcher's
+#     out dir convention (/home/sulcjo/gareus/chignolin/chignolin_genpept_9_sigma).
+#   * implicit_max_iterations 300->1000, bh_initial_min_iterations 200->1000,
+#     bh_min_iterations 150->1000: the example file predates CLAUDE.md's
+#     "Minimization step-count defaults raised to >= 1000" fix and still
+#     carries the pre-fix argparse defaults as explicit overrides, which would
+#     silently defeat that fix if left as-is. adaptive_min_chunk_iterations
+#     (25) is untouched -- it is a convergence-check chunk granularity, not a
+#     total step count, and was deliberately excluded from that raise.
+# Everything else (seq, n/n_candidate_seeds/n_final_seeds, contact_bias_sigma
+# 1.0, preselection/basin-hop/NMA/explore-loop parameters) is unchanged from
+# the worked example -- see that file's own header for the sigma-vs-strength
+# calibration and why sigma=1.0 was chosen as the portable default.
+# ---------------------------------------------------------------------------
+
+genpept:
+  seq: "GYDPETGTWG"
+  out: "chignolin_genpept_9_sigma"   # relative to this config file
+  clean: false
+  two_stage: true
+  implicit_only: true
+  n: 500000
+  n_candidate_seeds: 5000
+  n_final_seeds: 2500
+  jobs: 16
+  min_jobs: 1
+  generation_backend: full
+  rama_sampling: stratified
+  initial_diversity_features: mixed
+  diversity_bank_preset: broad
+
+  contact_bias_sigma: 1.0
+
+  preselection_bin_quota: 6
+  preselection_rg_bin_A: 1.0
+  preselection_e2e_bin_A: 1.0
+  preselection_contact_bin: 2
+  preselection_include_bank: true
+  adaptive_min: true
+  implicit_max_iterations: 1000
+  adaptive_min_chunk_iterations: 25
+  adaptive_min_energy_tol: 0.05
+  adaptive_min_force_tol: 500.0
+  adaptive_min_stall_rounds: 2
+  basin_hop: true
+  bh_parent_seeds: 120
+  bh_steps: 3
+  bh_md_steps: 350
+  bh_temperature: 675.0
+  bh_friction: 5.0
+  bh_timestep: 0.0035
+  bh_hmr_mass: 3.014
+  bh_initial_min_iterations: 1000
+  bh_min_iterations: 1000
+  bh_restart_from_parent: true
+  nma_expand: true
+  nma_modes: 2
+  nma_amplitudes: "0.75,1.35"
+  nma_cutoff: 12.0
+  explore_loop: true
+  explore_rounds: 5
+  explore_proposals: 50000
+  explore_keep: 250
+  explore_bins: 45
+  explore_target_max_count: 0
+  explore_pca_padding: 0.15
+  explore_frontier_only: true
+  explore_allow_outside: true
+  explore_max_kept_per_bin: 4
+  explore_bh: false
