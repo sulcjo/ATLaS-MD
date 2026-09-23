@@ -1,6 +1,13 @@
 # Claude Handoff
 
-Updated 2026-09-07.
+Updated 2026-09-23.
+
+## Shared contact-sum CV force (`SHARED_CONTACT_LAYOUT`) — CV1 umbrella rides on the residual CV2 force
+
+- When CV2 is `residual-torsion-pc` over a contact CV1, the CV2 CustomCVForce already holds a private copy of the 1,256-pair contact sum (`res_contacts`). `add_umbrella_cv_forces` (`gareus/production.py`) now appends `0.5*k*((res_contacts/contact_norm)-r0)^2` to that force (group 29, same parameter names as `forces.add_contact_umbrella_force`) and builds no separate CV1 force: group 31 is empty. Measured +14.6 % node ns/day at 236 contexts under MPS, +8.1 % at 1 context/GPU (job 2608721; `docs/superpowers/specs/2026-09-23-pep-gamd-realspace-vpep-surrogate/benchmarks/c8_sharedcv.sh`). Bias energy/forces are identical to the split pair (Reference: dE 0, max|dF| 1e-14 on chignolin_8's real system), so the kernel identity is unchanged.
+- Consumers that must know: `observe_fast_path` reads CV1 from the `contact_sum` sub-CV role (sub-CV [0] of the shared force is a torsion sum); `fast_cv_force_indices` points both observers at the one force. Pep-GaMD bias groups and the NPT split are structural, so they become (29,) with no special case.
+- **Resume invariant:** binary Context checkpoints (and the Pep-GaMD integrator's per-DOF bias variables, one per bias group) depend on the layout. `_restore_secondary_cv_args_from_metadata` sets `args.cv_force_layout` from `secondary_cv_metadata["cv_force_layout"]`; an absent record means the campaign predates the shared layout and is rebuilt split. A reused shared-GaMD `.chk` is loaded only if its recorded `bias_force_groups` match (`reusable_checkpoint_matches_bias_groups`); unrecorded exports are not loaded (globals copy only).
+- Tests: `tests/test_shared_contact_cv_force.py`.
 
 ## Pep-GaMD (`--gamd-boost-type pep-gamd-lower-dual`) — boost only the peptide
 

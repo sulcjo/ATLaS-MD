@@ -716,7 +716,9 @@ force group 1, and
 
 so water-water and every non-physical group (umbrella 31, secondary CV 29) are
 applied unscaled and excluded from every boost statistic. Costs one extra PME
-evaluation per step.
+evaluation per step. With cv2 residual-torsion-pc over a contact CV1, both
+umbrellas share one force in group 29 (the contact sum is evaluated once) and
+group 31 is empty.
 
 Invariants the code enforces:
 

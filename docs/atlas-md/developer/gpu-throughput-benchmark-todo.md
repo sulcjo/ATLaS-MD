@@ -3,7 +3,11 @@
 ## DECIDED 2026-09-22: chignolin_9 runs 236 states under MPS (59 contexts/GPU)
 
 User decision after T6 (MPS cannot be bypassed at 248 contexts). Checklist for chignolin_9:
-- [ ] **0 (user, 2026-09-23): MBAR connectivity of chignolin_8's sparse pseudo-2D US layout.** Once
+- [x] **0 (user, 2026-09-23): MBAR connectivity of chignolin_8's sparse pseudo-2D US layout -- DONE.**
+      Verdict (commits e3b5786, dc9cb29; `RUNS/chignolin_8_US/ANALYSIS_SUMMARY.md`): connected and
+      reweightable (MBAR converged 43 iters, 87% ESS, 481k samples), native hairpin not sampled
+      (dG_fold ~ +5.3 kcal/mol), rung distortion persists. Sparse layout is fit to carry chignolin_9.
+      Original note: Once
       chignolin_8 has stopped (step 485,200), analyse it as umbrella sampling and check that every
       window is connected and reweightable: (a) rung consistency first -- the 4 rungs per centre must
       give coinciding CV1/CV2 distributions (exchanges used a phantom boost); if they do, collapse to
@@ -22,16 +26,54 @@ User decision after T6 (MPS cannot be bypassed at 248 contexts). Checklist for c
 - [x] T2 MEASURED 2026-09-23 (job 2580889, see T9): MPS at 59/GPU = 2,307 ns/day/node, 2.75x no-MPS.
       Original note: MPS throughput at 59 contexts/GPU with the REAL Pep-GaMD integrator (fix the
       c8_integ_bench.py P-arm segfault at high context counts, or measure via a short real run).
-- [ ] State space: 59 CV centres x 4 lambda rungs = 236. Regenerate the joint CV2 layout to land on
-      59 centres (swarm analyze / ladder design), do NOT delete rows from windows_lambda_ladder.csv;
-      the F05 zero-k unrestrained stack must survive.
-- [ ] Launcher: MPS daemon on, `--cuda-mps`, keep `ulimit -n 65536`, keep the wait-loop, keep
-      `--us-pull-device-index 0,1,2,3`; setup context + pull workers also count as MPS clients on
-      their GPUs -> check 59 + setup + pull stays under ~60 per GPU, or run the pull before MPS starts.
+- [x] State space regen done 2026-09-23: `smoke/config/chignolin_9.yaml` (max_replicas 236, otherwise
+      identical to chignolin_8.yaml) + `python -m gareus --config smoke/config/chignolin_9.yaml --out
+      RUNS/chignolin_9 --swarm-stage analyze --max-replicas 236 --platform CPU`, reusing chignolin_8's
+      real round_000 unbiased-swarm data (symlinked, same peptide/library, frozen-envelope rule) rather
+      than re-running MD. Result verified in `RUNS/chignolin_9/swarm/analysis/layout_plan.json`:
+      spatial_states=59, cap_spatial=59, kind=sparse (1 unrestrained anchor + 1 region representative +
+      18 axis states + 39 joint diagonal-band cells) x 4 rungs = 236 states; gate status=pass; F05
+      zero-k unrestrained stack confirmed present (states 0-3, k1=k2=0). windows_lambda_ladder.csv is
+      237 lines (236 rows + header) -- a fresh design, not chignolin_8's 249-line CSV with 3 rows cut.
+      CAVEAT: this local run had no GENPEPT seed_conformers_dir on disk, so cv_selection_report.json
+      records genpept_preset="unknown" instead of chignolin_8's real "chignolin" preset -- cosmetic for
+      the layout itself (window centres are identical, verified against chignolin_8's own
+      ladder_design.json) but re-run on aurum2 (where the real seed dir exists) before treating
+      cv_pair_model.json/cv_selection_report.json as final, not just windows_lambda_ladder.csv.
+      NOT YET DONE: deploying this swarm/ tree (round_000 + system + this analysis output) into
+      chignolin_9's actual aurum2 out dir so its epoch 0 is skipped rather than re-running 186x1ns of
+      unbiased MD -- `epoch0_complete.json` (written by the production driver, not `--swarm-stage
+      analyze`) does not exist yet; production would still treat epoch 0 as pending on a fresh launch.
+- [x] Launcher applied 2026-09-23: `smoke/config/chignolin_9.sh` (MPS daemon on, `--cuda-mps`,
+      `ulimit -n 65536` kept, wait-loop kept, `--us-pull-device-index 0,1,2,3` kept). NOT verified:
+      whether the up-to-28 `--us-pull-workers` pull contexts (round-robin over 4 GPUs, ~7/GPU) fully
+      close before the 59/GPU production contexts open -- T2's 2,307 ns/day/node measured
+      production-only, never pull+production concurrently under MPS -- re-check before a real
+      launch. `--cuda-disable-pme-stream true` is confirmed right under MPS (2,307 disabled vs
+      2,220 enabled, job 2580889; 2,290 disabled again in job 2608721). `chignolin_9.yaml` does not
+      exist yet (state-space item below).
 - [x] #4 PME-stream verdict (T8): `--cuda-disable-pme-stream false` = +8-11 % vs blocking-sync
       baseline, keep it -- but re-check under MPS, where the flag was originally set for stability.
-- [ ] Candidate (T7): compute the 1,256-pair contact sum once per step -- CV2 (residual vs CV1)
+- [x] Candidate (T7): compute the 1,256-pair contact sum once per step -- CV2 (residual vs CV1)
       currently re-evaluates it; the two CV forces together cost 26 % per context.
+      **IMPLEMENTED 2026-09-23 (branch feat/shared-contact-cv-force):** `gareus/production.py`
+      `cv_force_layout` / `add_umbrella_cv_forces` build SHARED_CONTACT_LAYOUT for every new
+      residual-torsion-pc-over-contacts campaign (chignolin_9 gets it automatically); resumed
+      campaigns rebuild the layout recorded in their secondary_cv_metadata (absent = split).
+      **MEASURED 2026-09-23 (job 2608721, d098, `c8_integ_bench4.py` + `c8_sharedcv.sh`): +14.6 %
+      node ns/day at the chignolin_9 layout -- worth building.** "shared" = the residual-torsion-pc
+      CustomCVForce (group 29) with `+ 0.5*k*((res_contacts/contact_norm)-r0)^2` appended and the CV1
+      force removed; same parameter names (k, r0, contact_norm) as `forces.add_contact_umbrella_force`.
+      Equivalence vs split at k=1000, ss_k=20: dE = 0, max|dF| 4.8e-7 (CUDA mixed) / 2.3e-10 (double)
+      kJ/mol/nm; CV1 term is 9.33 kJ/mol of the 10.89 total, so the check has teeth.
+      | real integrator, stage 5 | split (29+31) | shared (29) | gain |
+      |---|---|---|---|
+      | no MPS, 1 ctx/GPU (2 repeats) | 1,666 / 1,635 steps/s | 1,783 / 1,784 | +8.1 % |
+      | MPS, 236 ctx (59/GPU), PME stream off | 2,286 / 2,294 ns/day/node | 2,630 / 2,618 | **+14.6 %** |
+      Repeats agree within 0.5 %. CPU load unchanged (~179 cores). Not yet implemented in production:
+      needs the fast CV path (`production.py` ~6958, identifies the two CustomCVForces by force group)
+      and the CV1 value readout re-keyed to the shared force, and changes the kernel identity -> fresh
+      campaign only (chignolin_9 qualifies).
 - [ ] **Integrator lever 1 (user, 2026-09-22): replace the water-only auxiliary PME with a cheap
       real-space approximation of the peptide energy.** The boost may be any function of the
       coordinates provided the applied force is its exact gradient and MBAR reweights with the same

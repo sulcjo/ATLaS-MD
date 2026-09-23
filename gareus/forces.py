@@ -25,8 +25,20 @@ __all__ = [
     "validate_openmm_force_group",
     "add_umbrella_force",
     "add_contact_umbrella_force",
+    "contact_switch_constants_nm",
     "self_test_nonlocal_contact_force",
 ]
+
+def contact_switch_constants_nm(args) -> tuple[float, float]:
+    """(r0 in nm, beta in 1/nm) of the contact switching function, validated positive finite."""
+    r0_nm = float(getattr(args, "contact_r0_a", 4.5) or 4.5) * 0.1
+    beta_nm_inv = float(getattr(args, "contact_beta_a_inv", 6.0) or 6.0) * 10.0
+    if not math.isfinite(r0_nm) or r0_nm <= 0.0:
+        raise ValueError("--contact-r0-a must be a positive finite value")
+    if not math.isfinite(beta_nm_inv) or beta_nm_inv <= 0.0:
+        raise ValueError("--contact-beta-a-inv must be a positive finite value")
+    return r0_nm, beta_nm_inv
+
 
 def validate_openmm_force_group(force_group: int, label: str = "force group") -> int:
     """OpenMM force groups are limited to integers 0..31."""
@@ -68,12 +80,7 @@ def add_contact_umbrella_force(openmm, system, contact_pairs: list[tuple[int, in
     # instead of adding child-force global parameters.  This keeps the Context
     # parameter namespace limited to the actual thermodynamic-state parameters
     # (r0 and k) plus contact_norm.
-    contact_switch_r0_nm = float(getattr(args, "contact_r0_a", 4.5) or 4.5) * 0.1
-    contact_beta_nm_inv = float(getattr(args, "contact_beta_a_inv", 6.0) or 6.0) * 10.0
-    if not math.isfinite(contact_switch_r0_nm) or contact_switch_r0_nm <= 0.0:
-        raise ValueError("--contact-r0-a must be a positive finite value")
-    if not math.isfinite(contact_beta_nm_inv) or contact_beta_nm_inv <= 0.0:
-        raise ValueError("--contact-beta-a-inv must be a positive finite value")
+    contact_switch_r0_nm, contact_beta_nm_inv = contact_switch_constants_nm(args)
     # Numerically stable logistic contact switch.  This is algebraically
     # identical to 1/(1+exp(beta*(r-r0))) but avoids exponential overflow
     # on GPU kernels/fast math paths when the argument becomes large during

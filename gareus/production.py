@@ -97,6 +97,7 @@ from .forces import (
     validate_openmm_force_group,
     add_umbrella_force,
     add_contact_umbrella_force,
+    contact_switch_constants_nm,
 )
 from .provenance import (initialize_run_manifest, ensure_run_manifest_initialized, update_run_manifest,
                          finalize_run_manifest, pair_model_sha256)
@@ -452,8 +453,29 @@ def _add_weighted_trig_torsion_force(openmm, torsions, weights, trig: str):
     return force
 
 
+#: CV1 umbrella and residual CV2 umbrella in one CustomCVForce sharing one contact sum.
+SHARED_CONTACT_LAYOUT = "shared_contact_subcv"
+#: CV1 umbrella in its own CustomCVForce (umbrella_force_group), CV2 in another.
+SPLIT_CV_LAYOUT = "split"
+
+
+def cv_force_layout(primary_cv_def, args, *, secondary_enabled: bool) -> str:
+    """SHARED_CONTACT_LAYOUT when the residual CV2 force already holds CV1's contact sum.
+
+    ``args.cv_force_layout == "split"`` keeps the two-force layout; resume sets it for a
+    campaign whose checkpoints were written before the shared layout existed, because a
+    binary Context checkpoint is loaded into a context built from the current System.
+    """
+    if (secondary_enabled
+            and primary_cv_mode(primary_cv_def) == "nonlocal-contacts"
+            and secondary_cv_mode(args) == "residual-torsion-pc"
+            and str(getattr(args, "cv_force_layout", "shared") or "shared") != "split"):
+        return SHARED_CONTACT_LAYOUT
+    return SPLIT_CV_LAYOUT
+
+
 def _add_residual_torsion_cv_force(openmm, system, phi_torsions, psi_torsions, contact_pairs,
-                                   runtime, args, *, force_group):
+                                   runtime, args, *, force_group, carry_primary_umbrella=False):
     """Harmonic umbrella on a residual torsion component, chain rule included.
 
     z2 = ( v.phi - K0 - K1 a - K2 a^2 ) / sigma_j with a = (contacts/norm - mu_c)/sigma_c.
@@ -462,6 +484,11 @@ def _add_residual_torsion_cv_force(openmm, system, phi_torsions, psi_torsions, c
     from the one the analysis reconstructs. The contact sum is a private copy
     of the CV1 umbrella's child force (OpenMM allows one parent per child), with
     the identical expression from forces.add_contact_umbrella_force.
+
+    ``carry_primary_umbrella`` appends the CV1 contact umbrella to this force, under the
+    parameter names forces.add_contact_umbrella_force uses (k, r0, contact_norm), so the
+    caller adds no separate CV1 force and the contact sum is evaluated once per step
+    (SHARED_CONTACT_LAYOUT).
 
     ``ss_k`` arrives in kJ/mol/CV^2 (production converts before set_window), so
     the energy expression carries no unit factor.
@@ -485,8 +512,7 @@ def _add_residual_torsion_cv_force(openmm, system, phi_torsions, psi_torsions, c
         if len(torsions):
             cv_force.addCollectiveVariable(fname, _add_weighted_trig_torsion_force(openmm, torsions, weights, trig))
             names.append(fname)
-    r0_nm = float(args.contact_r0_a) * 0.1
-    beta_nm_inv = float(args.contact_beta_a_inv) * 10.0
+    r0_nm, beta_nm_inv = contact_switch_constants_nm(args)
     contact_sum = openmm.CustomBondForce(
         f"contact_weight*0.5*(1-tanh(0.5*{beta_nm_inv:.17g}*(r-{r0_nm:.17g})))")
     contact_sum.addPerBondParameter("contact_weight")
@@ -503,12 +529,19 @@ def _add_residual_torsion_cv_force(openmm, system, phi_torsions, psi_torsions, c
     z2 = compiled.openmm_expression(names, "res_contacts")
     cv_force.addGlobalParameter("ss_k", 0.0)
     cv_force.addGlobalParameter("ss0", 0.0)
-    cv_force.setEnergyFunction(f"0.5*ss_k*({z2}-ss0)^2")
+    energy = f"0.5*ss_k*({z2}-ss0)^2"
+    if carry_primary_umbrella:
+        energy += " + 0.5*k*((res_contacts/contact_norm)-r0)^2"
+        cv_force.addGlobalParameter("contact_norm", contact_normalization_denominator(list(contact_pairs), args))
+        cv_force.addGlobalParameter("k", 0.0)
+        cv_force.addGlobalParameter("r0", 0.0)
+    cv_force.setEnergyFunction(energy)
     cv_force.setForceGroup(int(force_group))
     system.addForce(cv_force)
     return {
         "enabled": True,
         "mode": "residual-torsion-pc",
+        "cv_force_layout": SHARED_CONTACT_LAYOUT if carry_primary_umbrella else SPLIT_CV_LAYOUT,
         "label": f"residual torsion component {j} (degree {fit.degree}) against {runtime.anchor_kind}",
         "pair_model_sha256": runtime.pair_sha256,
         "component_index": j,
@@ -628,6 +661,9 @@ def _restore_secondary_cv_args_from_metadata(args, secondary_cv_metadata: dict, 
     args.secondary_cv_psi0_deg = float(meta.get("psi0_deg", getattr(args, "secondary_cv_psi0_deg", -45.0)))
     args.secondary_cv_sigma_deg = float(meta.get("sigma_deg", getattr(args, "secondary_cv_sigma_deg", 35.0)))
     if mode == "residual-torsion-pc":
+        # The binary Context checkpoints were written against this campaign's force layout;
+        # a record predating the shared layout means the split one.
+        args.cv_force_layout = "shared" if meta.get("cv_force_layout") == SHARED_CONTACT_LAYOUT else "split"
         version = str(meta.get("cv_evaluator_version") or "")
         if version != RESIDUAL_EVALUATOR_VERSION:
             raise RuntimeError(
@@ -878,18 +914,50 @@ def _ss_scalar_from_sub_cv_values(sub_cv_values, metadata: dict) -> float:
     raise ValueError(f"no fast-path scalar reconstruction is implemented for secondary CV mode {mode!r}")
 
 
+def fast_cv_force_indices(system, primary_group: int, ss_group: int, secondary_cv_metadata) -> tuple:
+    """(primary, secondary) CustomCVForce indices for the fast CV path; -1 when absent.
+
+    Under SHARED_CONTACT_LAYOUT both observers use the one secondary-group force.
+    """
+    primary_idx = ss_idx = -1
+    for i in range(system.getNumForces()):
+        force = system.getForce(i)
+        if not hasattr(force, "getCollectiveVariableValues"):
+            continue
+        if force.getForceGroup() == primary_group:
+            primary_idx = i
+        elif force.getForceGroup() == ss_group:
+            ss_idx = i
+    meta = secondary_cv_metadata or {}
+    if meta.get("enabled") and meta.get("cv_force_layout") == SHARED_CONTACT_LAYOUT:
+        if primary_idx >= 0:
+            raise RuntimeError("shared CV force layout but a CustomCVForce also sits in the umbrella group")
+        primary_idx = ss_idx
+    return primary_idx, ss_idx
+
+
 def observe_fast_path(ctx, primary_force, ss_force, args, secondary_cv_metadata) -> tuple:
     """(primary CV, secondary CV) of one replica from its forces' cached sub-variables.
 
     The one observation function both the sample writer and the exchange kernel call
     (spec F01 acceptance: the same coordinate is recorded and exchanged on).
     """
-    raw = float(primary_force.getCollectiveVariableValues(ctx)[0])
+    meta = secondary_cv_metadata or {}
     norm = float(ctx.getParameter("contact_norm")) if bool(getattr(args, "contact_normalize", True)) else 0.0
+    if meta.get("enabled") and meta.get("cv_force_layout") == SHARED_CONTACT_LAYOUT:
+        # One force, one read: CV1 is the contact_sum role, not sub-CV [0] (a torsion sum).
+        sub = ss_force.getCollectiveVariableValues(ctx)
+        roles = [str(r.get("role")) for r in meta.get("subcv_roles", [])]
+        if roles.count("contact_sum") != 1 or len(roles) != len(sub):
+            raise ValueError(f"shared CV force: expected one contact_sum role among {len(sub)} sub-CVs, got {roles}")
+        raw = float(sub[roles.index("contact_sum")])
+        cv = raw / norm if norm > 0.0 else raw
+        return cv, _ss_scalar_from_sub_cv_values(sub, meta)
+    raw = float(primary_force.getCollectiveVariableValues(ctx)[0])
     cv = raw / norm if norm > 0.0 else raw
-    if ss_force is None or not (secondary_cv_metadata or {}).get("enabled"):
+    if ss_force is None or not meta.get("enabled"):
         return cv, float("nan")
-    return cv, _ss_scalar_from_sub_cv_values(ss_force.getCollectiveVariableValues(ctx), secondary_cv_metadata)
+    return cv, _ss_scalar_from_sub_cv_values(ss_force.getCollectiveVariableValues(ctx), meta)
 
 
 def umbrella_bias_matrix_kcal(primary_values, ss_values, centers_a, k_kcal, ss_centers=None, ss_k_kcal=None):
@@ -1712,7 +1780,7 @@ def run_adaptive_feedback_dispatcher_2d(*args, **kwargs):
 
 
 def add_secondary_structure_cv_force(openmm, system, topology, args, force_group: int = 29, *,
-                                     primary_cv_def=None) -> dict:
+                                     primary_cv_def=None, carry_primary_umbrella: bool = False) -> dict:
     """Add an optional harmonic bias on a smooth backbone secondary-structure CV.
 
     Modes ``alpha``, ``beta``, and ``custom`` use a 0..1 content score:
@@ -1741,6 +1809,8 @@ def add_secondary_structure_cv_force(openmm, system, topology, args, force_group
         # content force without a word. Refuse loudly instead.
         raise RuntimeError("cv2=auto must be resolved by the swarm stage before production; "
                            "run with window_mode=adaptive-production or pass the frozen model")
+    if carry_primary_umbrella and mode != "residual-torsion-pc":
+        raise ValueError(f"only a residual-torsion-pc force can carry the CV1 umbrella, not {mode!r}")
     if mode == "residual-torsion-pc":
         if primary_cv_def is None:
             raise RuntimeError("cv2=residual-torsion-pc needs the primary CV definition (contact pairs)")
@@ -1757,7 +1827,8 @@ def add_secondary_structure_cv_force(openmm, system, topology, args, force_group
         runtime = PairModelRuntime.load(*paths, require_deployable=True, allow_legacy_v1=(policy == "allow-v1"))
         info = _add_residual_torsion_cv_force(
             openmm, system, phi_torsions, psi_torsions,
-            list(primary_cv_def.get("contact_pairs", [])), runtime, args, force_group=force_group)
+            list(primary_cv_def.get("contact_pairs", [])), runtime, args, force_group=force_group,
+            carry_primary_umbrella=carry_primary_umbrella)
         info.update({"pair_model_path": str(paths[0]), "candidate_set_path": str(paths[1]),
                      "feature_schema_path": str(paths[2])})
         return info
@@ -1903,6 +1974,23 @@ def add_primary_umbrella_force(openmm, system, primary_cv_def: dict, args, force
         return add_contact_umbrella_force(openmm, system, list(primary_cv_def.get("contact_pairs", [])), args, force_group)
     return add_umbrella_force(openmm, system, int(primary_cv_def["cv_atom1"]), int(primary_cv_def["cv_atom2"]), force_group)
 
+
+def add_umbrella_cv_forces(openmm, system, topology, primary_cv_def: dict, args, *, secondary_enabled: bool) -> dict:
+    """Both umbrella forces of a production-like System; returns the secondary-CV force info.
+
+    Under SHARED_CONTACT_LAYOUT the CV1 umbrella rides on the residual CV2 force (group
+    secondary_cv_force_group) and umbrella_force_group stays empty.
+    """
+    ss_group = int(getattr(args, "secondary_cv_force_group", 29))
+    layout = cv_force_layout(primary_cv_def, args, secondary_enabled=secondary_enabled)
+    if layout == SPLIT_CV_LAYOUT:
+        add_primary_umbrella_force(openmm, system, primary_cv_def, args, args.umbrella_force_group)
+        if not secondary_enabled:
+            return {"enabled": False}
+    return add_secondary_structure_cv_force(openmm, system, topology, args, force_group=ss_group,
+                                            primary_cv_def=primary_cv_def,
+                                            carry_primary_umbrella=(layout == SHARED_CONTACT_LAYOUT))
+
 def production_run_mode(args) -> str:
     """Return the canonical high-level dynamics mode.
 
@@ -1919,6 +2007,7 @@ def production_run_mode(args) -> str:
 
 
 from .pep_gamd import (
+    pep_gamd_bias_force_groups as _pep_gamd_bias_force_groups,
     boost_target_energy_kj,
     build_pep_gamd_integrator,
     find_aux_force as _find_pep_gamd_aux_force,
@@ -4232,6 +4321,7 @@ def load_reusable_shared_gamd_setup(args, out_dir: Path) -> Optional[tuple[dict[
         "source_shared_gamd_setup_dir": str(setup_dir),
         "source_shared_gamd_globals_json": str(globals_path),
         "source_shared_gamd_context_checkpoint": str(chk_path) if chk_path.exists() else "",
+        "source_bias_force_groups": payload.get("bias_force_groups"),
         "local_copied_files": copied,
         "description": "This worker reused a previously calibrated shared GaMD setup instead of recalibrating. Coordinates/window parameters are still worker-local; GaMD thresholds/statistics are campaign-global.",
     }
@@ -4243,6 +4333,18 @@ def load_reusable_shared_gamd_setup(args, out_dir: Path) -> Optional[tuple[dict[
         except Exception:
             pass
     return all_globals, interesting, calib_steps, checkpoint, reuse_note
+
+
+def reusable_checkpoint_matches_bias_groups(recorded, current) -> bool:
+    """Whether an exported shared-GaMD Context checkpoint fits a context with ``current`` bias groups.
+
+    The bias groups fix the integrator's per-DOF bias variables, so a mismatch is a
+    CustomIntegrator checkpoint mismatch. An export without the record predates it and its
+    layout is unknown: do not load it (the calibrated-globals copy is authoritative anyway).
+    """
+    if recorded is None:
+        return False
+    return sorted(int(g) for g in recorded) == sorted(int(g) for g in current)
 
 
 def export_shared_gamd_setup_if_requested(args, out_dir: Path) -> dict[str, str]:
@@ -6054,6 +6156,9 @@ def run_shared_gamd_setup_article_a(
         ),
         "gamd_vmin_kj": _vmin_kj,
         "gamd_vmax_kj": _vmax_kj,
+        # The checkpoint below carries the integrator's per-DOF bias layout; a context built
+        # with different bias groups (e.g. the shared vs split CV layout) must not load it.
+        "bias_force_groups": [int(g) for g in _pep_gamd_bias_force_groups(shared_sim.system)],
     }
     write_json(out_dir / "shared_gamd_setup_globals.json", payload)
 
@@ -6611,11 +6716,9 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         barostat_frequency=production_barostat_frequency,
     )
     prepare_pep_gamd_args(args, topology)
-    add_primary_umbrella_force(openmm, base_system, primary_cv_def, args, args.umbrella_force_group)
-    secondary_cv_force_info = add_secondary_structure_cv_force(
-        openmm, base_system, topology, args, force_group=int(getattr(args, "secondary_cv_force_group", 29)),
-        primary_cv_def=primary_cv_def,
-    ) if (secondary_cv_metadata or {}).get("enabled") else {"enabled": False}
+    secondary_cv_force_info = add_umbrella_cv_forces(
+        openmm, base_system, topology, primary_cv_def, args,
+        secondary_enabled=bool((secondary_cv_metadata or {}).get("enabled")))
     if secondary_cv_force_info.get("enabled"):
         secondary_cv_metadata.update(secondary_cv_force_info)
         print(
@@ -6676,11 +6779,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         # the pulling preparation. The shared GaMD setup and production replicas use
         # the production system above.
         starting_structure_system = create_system(app, unit, forcefield, topology, args, include_barostat=False)
-        add_primary_umbrella_force(openmm, starting_structure_system, primary_cv_def, args, args.umbrella_force_group)
-        if (secondary_cv_metadata or {}).get("enabled"):
-            add_secondary_structure_cv_force(openmm, starting_structure_system, topology, args,
-                                             force_group=int(getattr(args, "secondary_cv_force_group", 29)),
-                                             primary_cv_def=primary_cv_def)
+        add_umbrella_cv_forces(openmm, starting_structure_system, topology, primary_cv_def, args,
+                               secondary_enabled=bool((secondary_cv_metadata or {}).get("enabled")))
         pos = equil_state.getPositions()
         vel = equil_state.getVelocities()
         box = equil_state.getPeriodicBoxVectors()
@@ -6756,6 +6856,11 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     "    GaMD shared setup: reusing campaign/global calibration from "
                     f"{reuse_note.get('source_shared_gamd_setup_dir', '<unknown>')}"
                 )
+                if shared_gamd_context_checkpoint is not None and not reusable_checkpoint_matches_bias_groups(
+                        reuse_note.get("source_bias_force_groups"), _pep_gamd_bias_force_groups(base_system)):
+                    shared_gamd_context_checkpoint = None
+                    print("    GaMD shared setup: exported Context checkpoint was built with different bias force "
+                          "groups (CV force layout); reusing the calibrated globals only")
             else:
                 # GaMD calibration is sensitive to the starting PE range.  The NPT-
                 # equilibrated structure is typically extended (high PE for chignolin),
@@ -7020,21 +7125,12 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     # GPU→CPU position transfer, saving the dominant DMA cost at each sample and
     # exchange interval.  All replica systems are deserialized copies of base_system
     # and share the same force-index layout.
-    _primary_umbrella_fg = int(getattr(args, "umbrella_force_group", 31))
-    _secondary_cv_fg = int(getattr(args, "secondary_cv_force_group", 29))
     _fast_primary_force_idx: int = -1
     _fast_ss_force_idx: int = -1
     if sims:
-        _probe_sys = sims[0].system
-        for _fi in range(_probe_sys.getNumForces()):
-            _f = _probe_sys.getForce(_fi)
-            if not hasattr(_f, "getCollectiveVariableValues"):
-                continue
-            _fg = _f.getForceGroup()
-            if _fg == _primary_umbrella_fg:
-                _fast_primary_force_idx = _fi
-            elif _fg == _secondary_cv_fg:
-                _fast_ss_force_idx = _fi
+        _fast_primary_force_idx, _fast_ss_force_idx = fast_cv_force_indices(
+            sims[0].system, int(getattr(args, "umbrella_force_group", 31)),
+            int(getattr(args, "secondary_cv_force_group", 29)), secondary_cv_metadata)
     _fast_primary_forces = (
         [sim.system.getForce(_fast_primary_force_idx) for sim in sims]
         if _fast_primary_force_idx >= 0 else [None] * nrep
