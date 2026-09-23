@@ -663,3 +663,77 @@ Do not claim the gain until measured. The physical CV forces are unchanged by th
    diagnostics; compare exact and surrogate offline on saved frames.
 9. **Kernel identity:** the existing digest already includes `gamd_boost_type`. Add resume/flavour
    tests rather than a redundant identity field.
+
+## 14. Whole-codebase board review (2026-09-23) and what it means for this kernel
+
+A seven-board adversarial review ran over `main` @ dfeb8f9 from 00:59 to 04:35. Each board had five
+judges (glm, kimi, deepseek-thinking, mini, thinker), a debate round, a chair and a math/physics
+veto. Six boards covered code subsystems and one covered the method. The full transcripts are local
+only, in `docs/_local_docs/bigboard_2026-09-23/` (gitignored). The consolidated report there is
+`CONSOLIDATED.md`. Every headline claim below was re-checked against the code or the OpenMM runtime.
+
+### 14.1 Verdicts
+
+| Board | Subsystem | Result |
+|---|---|---|
+| b1 | Pep-GaMD integrator, boost hand-off, pricing | ACCEPT-WITH-CHANGES (75), split 3-2 |
+| b2 | Replica exchange | ACCEPT-WITH-CHANGES (74), split 3-2 |
+| b3 | NPT biased-MC barostat | REJECT (78), split 3-2; its main pillar is refuted (§14.3) |
+| b4 | Analysis / MBAR | the chair's output was truncated; judges 2 REJECT / 2 ACCEPT-WITH-CHANGES / 1 n/a |
+| b5 | Swarm, envelope, sidecar hand-off | REJECT (80), split 4-1 |
+| b6 | Checkpoint / resume / recalibration | the chair's output was truncated; judges 4 of 5 REJECT |
+| b7 | Method as a whole | SOUND WITH CONDITIONS, value SIMPLIFY (74), split 4-1 |
+
+Every board agreed that the core mathematics is correct:
+- the Pep-GaMD force algebra is the exact gradient of the boosted potential;
+- `_channel_boost` reproduces the gamd-openmm lower-bound kernel;
+- the gibbs-walk Metropolis-Hastings kernel is in detailed balance;
+- MBAR over (window, rung) states with a λ=0 anchor is exact.
+
+The failures sit in **hand-offs and silent fallbacks around that core**, which is the chignolin_8
+stage-2 class.
+
+### 14.2 Verified findings this kernel must not inherit
+
+| # | Finding | Location | Requirement for `pep-gamd-lower-dual-rs` |
+|---|---|---|---|
+| F1 | No runtime check that the applied boost equals the priced boost. `sample()` holds both and never compares them. | `gareus/production.py`, sample path | **Mandatory.** On every sample, assert that the integrator's boost global equals `pep_gamd_boost_kj(v_pep = S+E2, v_dih, λ, env)` within tolerance, and fail loudly on a mismatch. This is the runtime twin of the §10 consistency test. The RS kernel changes exactly the quantity this check guards. |
+| F2 | NaN becomes zero, in exchange only. `umbrella_bias_matrix_kcal` zeroes a non-finite secondary displacement, and `_channel_boost` maps a NaN energy to zero boost. MBAR propagates NaN for the same frame. | `production.py` L914-916; `pep_gamd.py` `_channel_boost` | One shared missing-data policy for exchange, NPT U* and MBAR. A non-finite `S` must raise or exclude the frame everywhere, never price as 0. |
+| F3 | The swarm step overwrites the CV-selection result. `selection` is reassigned to the seed selection (never `None`), so the 1-D sidecar branch always writes `cv2: "none"`. | `gareus/swarm/analyze.py` L601 / L715 / L740 | Fix before chignolin_9's swarm, otherwise a hand-configured CV2 silently becomes 1-D. It does not affect `cv2: auto` pair layouts. |
+| F4 | Native boost reader swallows exceptions; the fallback `infer_gamd_boost_kj_from_globals` returns only the last "total"-like global, dropping the dihedral channel. | `production.py` L344-365, L382-409 | Recorded boost columns for the RS kernel must come from the native reader or fail; no heuristic fallback. |
+
+### 14.3 Reported by the board, not yet re-checked
+
+- **b5:** the epoch-0 marker does not digest `shared_gamd_setup_globals.json` or the seed bank, so a
+  changed frozen envelope passes the gate. Directly relevant: this kernel's envelope differs from
+  the exact one, so the marker must bind the envelope digest and the surrogate flavour.
+- **b5:** the FSF floor is reported but not gated. The forced top rung (`lambdas[-1] = 1.0`) is
+  never re-checked for adjacent-rung acceptance.
+- **b5:** `done.get("status", "ok")` pools members without a status as successful.
+- **b6:** resume can relabel states without validating the window/λ table.
+- **b4:** λ per state is inferred by `nanmedian` rather than read from one authoritative source.
+- **b2:** `sample()` and `_current_exchange_arrays()` use different predicates for the secondary
+  axis.
+
+**Refuted:**
+- **b3's main pillar**, that `Simulation.currentStep` does not advance on `integrator.step()`, is
+  false. It is a property returning `context.getStepCount()` in OpenMM 8.5.1 and 8.3.1; tested.
+- **b7's dissent**, that the barostat omits the PV term, is false. `npt.py:274-276` is
+  `-β(ΔU* + PΔV) + N_mol ln(V_new/V_old)`.
+
+### 14.4 Method-level verdict (b7), as it bears on this spec
+
+**SOUND WITH CONDITIONS / SIMPLIFY.** The board regards the Pep-GaMD + λ-ladder + custom barostat +
+adaptive-epoch stack as unearned complexity for chignolin. It holds that no chignolin FES may be
+quoted until these validation gates pass:
+- the overlap matrix and ESS;
+- identical-rung consistency;
+- PMF invariance under window removal;
+- agreement with a ≥100 μs unbiased reference or the published FES;
+- a known-answer benchmark in CI.
+
+Consequence for this spec: the RS kernel is a speed optimisation of the boosted path. It should be
+built only if the boosted path is kept at all. Its promotion gate (§7, §11) should include the b7
+validation gates, not only throughput and correlation. One correction to b7: its "native NPT"
+recommendation applies only to an unboosted method. Under any GaMD boost, the biased-MC barostat
+is required.
