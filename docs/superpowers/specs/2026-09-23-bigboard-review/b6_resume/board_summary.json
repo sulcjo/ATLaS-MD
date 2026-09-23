@@ -1,0 +1,81 @@
+{
+  "convened": "20260923_034950",
+  "judges": [
+    "glm",
+    "kimi",
+    "deepseek-thinking",
+    "mini",
+    "thinker"
+  ],
+  "chair": "deepseek-thinking",
+  "specialist": "thinker",
+  "rounds": [
+    {
+      "glm": {
+        "verdict": "(TRUNCATED - output hit the token limit before completion)",
+        "confidence": 50,
+        "enum": null
+      },
+      "kimi": {
+        "verdict": "(TRUNCATED - output hit the token limit before completion)",
+        "confidence": 50,
+        "enum": null
+      },
+      "deepseek-thinking": {
+        "verdict": "(TRUNCATED - output hit the token limit before completion)",
+        "confidence": 50,
+        "enum": null
+      },
+      "mini": {
+        "verdict": "Addressing these points will eliminate the silent pathways that currently jeopardize the scientific validity of the free\u2011energy calculations.",
+        "confidence": 50,
+        "enum": null
+      },
+      "thinker": {
+        "verdict": "(TRUNCATED - output hit the token limit before completion)",
+        "confidence": 50,
+        "enum": null
+      }
+    },
+    {
+      "glm": {
+        "verdict": "REJECT - verified silent-failure pathways (resume state relabeling without window/\u03bb validation, dead kernel-identity refusal, Nk/unk inconsistency, destructive envelope overwrite) reproduce the chignolin8 class the board was asked to find.",
+        "confidence": 84,
+        "enum": "REJECT"
+      },
+      "kimi": {
+        "verdict": "REJECT - multiple VERIFIED line-level paths (analysis boost omission, resume state relabeling, partial kernel-identity pass) let the code silently return non-Boltzmann free energies, and the fixes are design-level, not cosmetic",
+        "confidence": 85,
+        "enum": "REJECT"
+      },
+      "deepseek-thinking": {
+        "verdict": "REJECT - the MBAR bias reconstruction silently omits the non-ladder GaMD boost and treats missing secondary CVs as zero bias, so the output is not the claimed Boltzmann free energy.",
+        "confidence": 82,
+        "enum": "REJECT"
+      },
+      "mini": {
+        "verdict": "REJECT \u2013 the review misses critical correctness failures (missing GaMD boost in MBAR, bypassable kernel checks, incomplete global restoration, unchecked umbrella parameters) that compromise the claimed Boltzmann\u2011weighted free\u2011energy results.",
+        "confidence": 92,
+        "enum": "REJECT"
+      },
+      "thinker": {
+        "verdict": "(TRUNCATED - output hit the token limit before completion)",
+        "confidence": 50,
+        "enum": null
+      }
+    }
+  ],
+  "agreement": [
+    {
+      "majority": "n/a",
+      "majority_fraction": 0.0,
+      "mean_position_card_cosine": "0.745"
+    },
+    {
+      "majority": "REJECT",
+      "majority_fraction": 0.8,
+      "mean_position_card_cosine": "0.572"
+    }
+  ],
+  "converged": true
+}

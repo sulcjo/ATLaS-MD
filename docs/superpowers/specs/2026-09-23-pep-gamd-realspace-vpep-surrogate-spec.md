@@ -668,9 +668,9 @@ Do not claim the gain until measured. The physical CV forces are unchanged by th
 
 A seven-board adversarial review ran over `main` @ dfeb8f9 from 00:59 to 04:35. Each board had five
 judges (glm, kimi, deepseek-thinking, mini, thinker), a debate round, a chair and a math/physics
-veto. Six boards covered code subsystems and one covered the method. The full transcripts are local
-only, in `docs/_local_docs/bigboard_2026-09-23/` (gitignored). The consolidated report there is
-`CONSOLIDATED.md`. Every headline claim below was re-checked against the code or the OpenMM runtime.
+veto. Six boards covered code subsystems and one covered the method. The consolidated report is
+`docs/superpowers/specs/2026-09-23-bigboard-review/README.md`; each board's judgment, summary and
+full transcript are in the sub-folders next to it. Every headline claim below was re-checked against the code or the OpenMM runtime.
 
 ### 14.1 Verdicts
 

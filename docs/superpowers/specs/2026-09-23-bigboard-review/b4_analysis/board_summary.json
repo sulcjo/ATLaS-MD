@@ -1,0 +1,113 @@
+{
+  "convened": "20260923_024711",
+  "judges": [
+    "glm",
+    "kimi",
+    "deepseek-thinking",
+    "mini",
+    "thinker"
+  ],
+  "chair": "deepseek-thinking",
+  "specialist": "thinker",
+  "rounds": [
+    {
+      "glm": {
+        "verdict": "(TRUNCATED - output hit the token limit before completion)",
+        "confidence": 50,
+        "enum": null
+      },
+      "kimi": {
+        "verdict": "(TRUNCATED - output hit the token limit before completion)",
+        "confidence": 50,
+        "enum": null
+      },
+      "deepseek-thinking": {
+        "verdict": "(TRUNCATED - output hit the token limit before completion)",
+        "confidence": 50,
+        "enum": null
+      },
+      "mini": {
+        "verdict": "ACCEPT-WITH-CHANGES - the core pipeline works but there are several verified and suspected pathways that can silently corrupt the reduced potentials and thus the Boltzmann free\u2011energy estimate.",
+        "confidence": 92,
+        "enum": "ACCEPT-WITH-CHANGES"
+      },
+      "thinker": {
+        "verdict": "(TRUNCATED - output hit the token limit before completion)",
+        "confidence": 50,
+        "enum": null
+      }
+    },
+    {
+      "glm": {
+        "verdict": "REJECT \u2014 the applied-vs-priced boost cross-check is absent, the \u03bb-consistency guard is one-sided, and a NaN registry \u03bb silently disables ladder reweighting.",
+        "confidence": 88,
+        "enum": "REJECT"
+      },
+      "kimi": {
+        "verdict": "ACCEPT-WITH-CHANGES - the reduced-potential and MBAR core is sound, but the review must add the boost-consistency guard, tighten \u03bb/state-identity checks, and downgrade corrupt-registry/caller-contract items from VERIFIED to SUSPECTED.",
+        "confidence": 88,
+        "enum": "ACCEPT-WITH-CHANGES"
+      },
+      "deepseek-thinking": {
+        "verdict": "(TRUNCATED - output hit the token limit before completion)",
+        "confidence": 50,
+        "enum": null
+      },
+      "mini": {
+        "verdict": "**Confidence** \u2013\u202f92",
+        "confidence": 50,
+        "enum": null
+      },
+      "thinker": {
+        "verdict": "(TRUNCATED - output hit the token limit before completion)",
+        "confidence": 50,
+        "enum": null
+      }
+    },
+    {
+      "glm": {
+        "verdict": "REJECT \u2014 the applied-vs-priced boost cross-check is absent, the \u03bb-consistency guard is one-sided, and a NaN registry \u03bb silently disables ladder reweighting.",
+        "confidence": 88,
+        "enum": "REJECT"
+      },
+      "kimi": {
+        "verdict": "ACCEPT-WITH-CHANGES - the reduced-potential and MBAR core is mathematically correct as written; the genuine defects are missing guards (boost cross-check, two-sided \u03bb, legacy fail-open, decline logging), none of which yields a wrong free energy without an external corruption precondition",
+        "confidence": 88,
+        "enum": "ACCEPT-WITH-CHANGES"
+      },
+      "deepseek-thinking": {
+        "verdict": "ACCEPT-WITH-CHANGES - the review\u2019s core MBAR math is sound, but it must add the applied-vs-priced boost guard, make the lambda-consistency check bidirectional, and downgrade corrupt-registry items from VERIFIED to SUSPECTED.",
+        "confidence": 85,
+        "enum": "ACCEPT-WITH-CHANGES"
+      },
+      "mini": {
+        "verdict": "REJECT \u2013 the analysis can silently price incorrect Hamiltonians (ladder boost mis\u2011applied, \u03bb\u2011registry mismatch, integer overflow) and thus cannot guarantee the claimed Boltzmann free energy.",
+        "confidence": 92,
+        "enum": "REJECT"
+      },
+      "thinker": {
+        "verdict": "(TRUNCATED - output hit the token limit before completion)",
+        "confidence": 50,
+        "enum": null
+      }
+    }
+  ],
+  "agreement": [
+    {
+      "majority": "n/a",
+      "majority_fraction": 0.0,
+      "mean_position_card_cosine": "0.763"
+    },
+    {
+      "majority": "n/a",
+      "majority_fraction": 0.0,
+      "mean_position_card_cosine": "0.556"
+    },
+    {
+      "majority": "REJECT",
+      "majority_fraction": 0.4,
+      "mean_position_card_cosine": "0.594"
+    }
+  ],
+  "converged": false
+}

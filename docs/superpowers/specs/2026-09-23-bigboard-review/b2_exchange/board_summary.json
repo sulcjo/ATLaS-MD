@@ -1,0 +1,113 @@
+{
+  "convened": "20260923_013423",
+  "judges": [
+    "glm",
+    "kimi",
+    "deepseek-thinking",
+    "mini",
+    "thinker"
+  ],
+  "chair": "deepseek-thinking",
+  "specialist": "thinker",
+  "rounds": [
+    {
+      "glm": {
+        "verdict": "(TRUNCATED - output hit the token limit before completion)",
+        "confidence": 50,
+        "enum": null
+      },
+      "kimi": {
+        "verdict": "(TRUNCATED - output hit the token limit before completion)",
+        "confidence": 50,
+        "enum": null
+      },
+      "deepseek-thinking": {
+        "verdict": "(TRUNCATED - output hit the token limit before completion)",
+        "confidence": 50,
+        "enum": null
+      },
+      "mini": {
+        "verdict": "Addressing these points will eliminate silent bias and ensure that the reported free\u2011energy surfaces are truly Boltzmann\u2011weighted.",
+        "confidence": 50,
+        "enum": null
+      },
+      "thinker": {
+        "verdict": "(TRUNCATED - output hit the token limit before completion)",
+        "confidence": 50,
+        "enum": null
+      }
+    },
+    {
+      "glm": {
+        "verdict": "ACCEPT-WITH-CHANGES \u2014 core exchange kernels are correct but NaN\u21920 fallbacks, the missing applied-vs-priced boost assertion, and the k0max dual-source risk must be fixed before this code can be trusted to produce the Boltzmann free energy it claims.",
+        "confidence": 78,
+        "enum": "ACCEPT-WITH-CHANGES"
+      },
+      "kimi": {
+        "verdict": "REJECT - verified NaN-to-zero secondary-bias and boost paths let exchange/MBAR price a Hamiltonian different from the sampled one.",
+        "confidence": 86,
+        "enum": "REJECT"
+      },
+      "deepseek-thinking": {
+        "verdict": "ACCEPT-WITH-CHANGES - the core REUS kernel is sound, but the secondary-axis condition mismatch and unverified boost-formula parity are silent-failure risks.",
+        "confidence": 70,
+        "enum": "ACCEPT-WITH-CHANGES"
+      },
+      "mini": {
+        "verdict": "REJECT \u2013 multiple silent, mathematically\u2011critical bugs can corrupt the free\u2011energy estimate.",
+        "confidence": 85,
+        "enum": "REJECT"
+      },
+      "thinker": {
+        "verdict": "(TRUNCATED - output hit the token limit before completion)",
+        "confidence": 50,
+        "enum": null
+      }
+    },
+    {
+      "glm": {
+        "verdict": "ACCEPT-WITH-CHANGES - the exchange kernel is mathematically sound, but verified NaN-to-zero bias paths, the missing applied-vs-priced boost assertion, and the divergent secondary-axis predicates can silently corrupt the free energy and must be fixed first.",
+        "confidence": 80,
+        "enum": "ACCEPT-WITH-CHANGES"
+      },
+      "kimi": {
+        "verdict": "REJECT - verified NaN\u21920 substitution in the secondary-bias and boost paths plus the unasserted applied-vs-priced boost parity let exchange and MBAR price a Hamiltonian different from the sampled one.",
+        "confidence": 85,
+        "enum": "REJECT"
+      },
+      "deepseek-thinking": {
+        "verdict": "(TRUNCATED - output hit the token limit before completion)",
+        "confidence": 50,
+        "enum": null
+      },
+      "mini": {
+        "verdict": "REJECT \u2013 multiple verified, silent violations of the Boltzmann weighting guarantee render the free\u2011energy estimates unreliable.",
+        "confidence": 92,
+        "enum": "REJECT"
+      },
+      "thinker": {
+        "verdict": "(TRUNCATED - output hit the token limit before completion)",
+        "confidence": 50,
+        "enum": null
+      }
+    }
+  ],
+  "agreement": [
+    {
+      "majority": "n/a",
+      "majority_fraction": 0.0,
+      "mean_position_card_cosine": "0.738"
+    },
+    {
+      "majority": "ACCEPT-WITH-CHANGES",
+      "majority_fraction": 0.4,
+      "mean_position_card_cosine": "0.575"
+    },
+    {
+      "majority": "n/a",
+      "majority_fraction": 0.0,
+      "mean_position_card_cosine": "0.611"
+    }
+  ],
+  "converged": false
+}

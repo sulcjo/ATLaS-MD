@@ -1,0 +1,113 @@
+{
+  "convened": "20260923_032428",
+  "judges": [
+    "glm",
+    "kimi",
+    "deepseek-thinking",
+    "mini",
+    "thinker"
+  ],
+  "chair": "deepseek-thinking",
+  "specialist": "thinker",
+  "rounds": [
+    {
+      "glm": {
+        "verdict": "(TRUNCATED - output hit the token limit before completion)",
+        "confidence": 50,
+        "enum": null
+      },
+      "kimi": {
+        "verdict": "(TRUNCATED - output hit the token limit before completion)",
+        "confidence": 50,
+        "enum": null
+      },
+      "deepseek-thinking": {
+        "verdict": "(TRUNCATED - output hit the token limit before completion)",
+        "confidence": 50,
+        "enum": null
+      },
+      "mini": {
+        "verdict": "REJECT - the code contains multiple silent failure modes that can corrupt the Hamiltonian, boost calibration, and MBAR reweighting, leading to non\u2011Boltzmann free\u2011energy estimates.",
+        "confidence": 92,
+        "enum": "REJECT"
+      },
+      "thinker": {
+        "verdict": "(TRUNCATED - output hit the token limit before completion)",
+        "confidence": 50,
+        "enum": null
+      }
+    },
+    {
+      "glm": {
+        "verdict": "REJECT - three verified silent hand-off defects (vacuous envelope digests, unreachable sidecar guard, selection shadowing that overrides configured CV2) corrupt or misrepresent the delivered free energy.",
+        "confidence": 82,
+        "enum": "REJECT"
+      },
+      "kimi": {
+        "verdict": "REJECT - a verified silent cv2\u2192none sidecar override, a header-only ladder path on INSUFFICIENT layout, and advisory-only ESS/FSF gates mean the shipped number is not provably the Boltzmann free energy",
+        "confidence": 78,
+        "enum": "REJECT"
+      },
+      "deepseek-thinking": {
+        "verdict": "ACCEPT-WITH-CHANGES \u2014 the code\u2019s core Hamiltonian/reweighting consistency holds, but the derivative factor error and off-by-one window count must be fixed.",
+        "confidence": 68,
+        "enum": "ACCEPT-WITH-CHANGES"
+      },
+      "mini": {
+        "verdict": "**Confidence** \u2013 92",
+        "confidence": 50,
+        "enum": null
+      },
+      "thinker": {
+        "verdict": "REJECT - verified silent handoff and CV2-derivative errors can produce a different (1D vs 2D) or mis-forced free-energy surface.",
+        "confidence": 85,
+        "enum": "REJECT"
+      }
+    },
+    {
+      "glm": {
+        "verdict": "REJECT - verified silent sidecar/selection-handoff defects can deliver a differently-dimensioned or mis-seeded free-energy surface than configured.",
+        "confidence": 84,
+        "enum": "REJECT"
+      },
+      "kimi": {
+        "verdict": "(TRUNCATED - output hit the token limit before completion)",
+        "confidence": 50,
+        "enum": null
+      },
+      "deepseek-thinking": {
+        "verdict": "ACCEPT-WITH-CHANGES - fix the sidecar CV2 override and the derivative factor; the core reweighting and applied-vs-priced consistency hold.",
+        "confidence": 70,
+        "enum": "ACCEPT-WITH-CHANGES"
+      },
+      "mini": {
+        "verdict": "REJECT \u2013 the code contains verified logic errors that can silently generate incorrect Boltzmann\u2011weighted free energies.",
+        "confidence": 92,
+        "enum": "REJECT"
+      },
+      "thinker": {
+        "verdict": "REJECT - verified selection shadowing and anchorpartials norm error can produce a different free-energy surface than claimed",
+        "confidence": 80,
+        "enum": "REJECT"
+      }
+    }
+  ],
+  "agreement": [
+    {
+      "majority": "n/a",
+      "majority_fraction": 0.0,
+      "mean_position_card_cosine": "0.807"
+    },
+    {
+      "majority": "REJECT",
+      "majority_fraction": 0.6,
+      "mean_position_card_cosine": "0.591"
+    },
+    {
+      "majority": "REJECT",
+      "majority_fraction": 0.6,
+      "mean_position_card_cosine": "0.612"
+    }
+  ],
+  "converged": false
+}
