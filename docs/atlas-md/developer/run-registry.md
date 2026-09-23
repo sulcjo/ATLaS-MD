@@ -61,6 +61,11 @@ plain umbrella sampling (the intended Pep-GaMD boost was never active).
     and more significant (z grows with sample size), i.e. a persistent modest distortion from the
     phantom-boost exchange on top of slow CV sampling. Rung-collapsed US estimates carry that caveat.
   - Run directory pulled locally to `RUNS/chignolin_8/` (with launcher, benchmarks and job logs).
+- **Full analysis as US (2026-09-23, `RUNS/chignolin_8_US/`, lambda zeroed):** MBAR converged, ESS 87 %,
+  joint overlap graph connected; CV1 PMF converged but nearly flat (topology-degenerate contact CV);
+  chignolin H-bond FES shows no native basin -- folded (both H-bonds <= 5 A) 0.01 %, dG_fold ~ +5 kcal/mol
+  vs about -0.5 to -1 experimentally, after 1.7 ns/replica unboosted. The layout samples and reweights;
+  the unboosted dynamics never reached the hairpin. Summary: `RUNS/chignolin_8_US/ANALYSIS_SUMMARY.md`.
 - **Cutoff:** `STOP_AT_PROD_DONE=485200` in `~/gareus/chignolin/chignolin_8.sh`; marker file
   `~/gareus/chignolin/chignolin_8.US_ONLY_STOPPED`; chain status line
   `STOPPED: US-only cutoff before GaMD stage 3`.
