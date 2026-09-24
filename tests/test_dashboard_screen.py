@@ -136,14 +136,14 @@ def test_render_screen_never_exceeds_the_terminal_height_or_width(tmp_path):
 
 def test_render_screen_puts_the_spine_first_and_the_footer_last(tmp_path):
     lines = strip_ansi(render_screen(_ctx(tmp_path))).splitlines()
-    assert lines[0].startswith("GaREUS")
+    assert lines[0].startswith("ATLaS-MD v")
     assert "PROGRESS" in lines[-1] or "progress" in lines[-1]
 
 
 def test_render_screen_degrades_to_spine_only_on_a_very_short_terminal(tmp_path):
     lines = strip_ansi(render_screen(_ctx(tmp_path, term_h=18))).splitlines()
     assert 0 < len(lines) <= 17
-    assert lines[0].startswith("GaREUS")
+    assert lines[0].startswith("ATLaS-MD v")
 
 
 def test_footer_line_names_dropped_panels_instead_of_hiding_them(tmp_path):

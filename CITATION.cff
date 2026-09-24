@@ -9,8 +9,8 @@ authors:
     given-names: Josef
 repository-code: https://github.com/sulcjo/ATLaS-MD
 url: https://sulcjo.github.io/2026_peptide_sampler/
-version: 0.8.2
-date-released: 2026-09-22
+version: 0.8.3
+date-released: 2026-09-24
 license: LicenseRef-Proprietary-Research-Internal
 keywords:
   - molecular dynamics

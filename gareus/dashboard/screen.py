@@ -18,7 +18,7 @@ from ..tui import _ansi_truncate
 from ..tui_screen import FOOTER_LINES, allocate_rows, compose_rows, frame_tiers
 from . import view_physics, view_progress, view_windows
 from .context import DashboardContext
-from .ranking import BAD, rank_windows
+from .ranking import BAD, rank_windows_for
 from .spine import spine_lines
 from .view_physics import connectivity_verdict
 
@@ -34,11 +34,7 @@ ANHARMONICITY_PROMOTE = 1.0
 def promotion_reasons(ctx: DashboardContext) -> tuple[str, ...]:
     """Conditions that justify taking over the screen, worst first."""
     reasons: list[str] = []
-    ranked = rank_windows(
-        n_windows=ctx.n_windows, centers_a=ctx.centers_a, k_list=ctx.k_list,
-        acceptance_by_window=ctx.acceptance_windows, overlap_by_pair=ctx.overlap_pairs,
-        delta_by_window=ctx.deltas, temperature_k=ctx.temperature_k,
-    )
+    ranked = rank_windows_for(ctx)
     for status in ranked:
         if status.status == BAD:
             reasons.append(f"windows: w{status.window:02d} " + ", ".join(status.reasons))

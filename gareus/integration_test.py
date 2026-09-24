@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from .branding import product_label
+
 __all__ = [
     "build_tiny_run_argv",
     "check_optional_md_dependencies",
@@ -210,7 +212,7 @@ def _write_report(out_dir: Path, report: dict) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "tiny_integration_test_report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     lines = [
-        "# GAREUS tiny integration test report",
+        f"# {product_label()} tiny integration test report",
         "",
         f"Status: **{report.get('status', 'unknown')}**",
         f"Started UTC: `{report.get('started_utc', '')}`",
@@ -247,9 +249,11 @@ def _write_report(out_dir: Path, report: dict) -> None:
 def _parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="gareus-test-run",
-        description="Run or print a tiny real GAREUS OpenMM/GaMD integration workflow.",
+        description="Run or print a tiny real ATLaS-MD OpenMM/GaMD integration workflow.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    parser.add_argument("-V", "--version", action="version", version=product_label(), dest=argparse.SUPPRESS,
+                        help="Print the ATLaS-MD version and exit.")
     parser.add_argument("--out", default="gareus_tiny_integration_test", help="Output directory for the tiny run.")
     parser.add_argument("--seq", default="AA", help="Tiny test peptide sequence.")
     parser.add_argument("--platform", default="Reference", help="OpenMM production platform for the tiny test.")

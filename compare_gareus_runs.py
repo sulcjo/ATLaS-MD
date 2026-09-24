@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Multi-run GAREUS PMF comparison.
+Multi-run ATLaS-MD PMF comparison.
 
-Loads N GAREUS run directories, runs MBAR on each independently, then
+Loads N ATLaS-MD run directories, runs MBAR on each independently, then
 optionally computes a combined "united MBAR" PMF by pooling all samples
 against the full global state space.  Produces a multi-panel comparison
 figure and per-run PMF CSVs.

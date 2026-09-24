@@ -28,6 +28,7 @@ from typing import Any, NamedTuple, Optional
 
 import numpy as np
 
+from .branding import product_label
 from .io import BufferedCsvDictWriter, write_json, read_json_file, _json_ready, acquire_run_lock
 from .logger import DistanceLogger, is_gamd_production_phase
 from .store import ParquetSampleWriter, ParquetExchangeWriter, SegmentRegistry, WindowSnapshot, parse_gamd_boost_components, finalize_segment
@@ -2137,7 +2138,7 @@ def _production_barostat_description(args) -> str:
     backend = str(getattr(args, "npt_barostat_backend", "auto") or "auto")
     if backend == "biased_mc":
         freq = _production_barostat_frequency(args)
-        return f"gareus BiasedMCBarostatController (biased Metropolis, every {freq} steps)"
+        return f"ATLaS-MD BiasedMCBarostatController (biased Metropolis, every {freq} steps)"
     return "OpenMM MonteCarloBarostat"
 
 
@@ -4934,7 +4935,7 @@ def write_final_run_report(out_dir: Path, args, centers_a, k_list, exchange_stat
         return str((d or {}).get("status", "n/a")).upper()
 
     lines = []
-    lines.append(f"# GaREUS/GaMD final run report")
+    lines.append(f"# {product_label()} final run report")
     lines.append("")
     lines.append(f"Sequence: `{getattr(args, 'seq', '')}`")
     lines.append(f"Output directory: `{out_dir}`")
@@ -5935,7 +5936,7 @@ def apply_joint_envelope_gamd_calibration(
             "bias seeds the boost, then (2) the boost is turned on and the per-window "
             "recon is repeated and pooled, iterating to self-consistency on sigmaV so the "
             "frozen boost matches the boosted production ensemble (not the unboosted one). "
-            "The resulting CustomIntegrator globals are copied to every GaREUS replica "
+            "The resulting CustomIntegrator globals are copied to every ATLaS-MD replica "
             "before production."
         ),
         "calibration_steps": int(calib_steps),
@@ -6134,7 +6135,7 @@ def run_shared_gamd_setup_article_a(
 
     payload = {
         "mode": "article_a_single_equilibrated_shared_gamd",
-        "description": "One GaMD calibration/equilibration was run from the NPT-equilibrated peptide with umbrella k=0. The resulting same-name CustomIntegrator globals are copied to every GaREUS replica before production.",
+        "description": "One GaMD calibration/equilibration was run from the NPT-equilibrated peptide with umbrella k=0. The resulting same-name CustomIntegrator globals are copied to every ATLaS-MD replica before production.",
         "calibration_steps": int(calib_steps),
         "temperature_K": float(args.temperature_k),
         "pressure_bar": float(getattr(args, "pressure_bar", 1.0)),
@@ -6489,7 +6490,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         print(f"[resume] Production checkpoint manifest found; skipping window generation, US pulling, and shared GaMD setup.")
     else:
         if equil_state is None:
-            raise RuntimeError("No equilibrated state is available; cannot start GaREUS without a production checkpoint or saved 03_npt_equilibrated_state.xml.")
+            raise RuntimeError("No equilibrated state is available; cannot start ATLaS-MD production without a production checkpoint or saved 03_npt_equilibrated_state.xml.")
         cv_atom1, cv_atom2, distance_cv_label = choose_cv_atoms(topology, args)
         primary_cv_def = prepare_primary_cv_definition(topology, args, cv_atom1=cv_atom1, cv_atom2=cv_atom2, cv_label=distance_cv_label)
         cv_label = str(primary_cv_def.get("label", distance_cv_label))
@@ -6975,13 +6976,13 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
 
     if primary_cv_is_contacts(args):
         print(
-            f"[4/4] Building {nrep} GaREUS replicas with primary CV {cv_label}: "
+            f"[4/4] Building {nrep} ATLaS-MD replicas with primary CV {cv_label}: "
             f"{primary_cv_def.get('n_contact_terms', primary_cv_def.get('n_contact_pairs', 0))} weighted contact terms; "
             f"effective contacts {primary_cv_def.get('n_effective_contact_pairs', primary_cv_def.get('n_contact_pairs', 0)):.3g}; "
             f"scheme {primary_cv_def.get('contact_scheme', 'atom-pairs')}"
         )
     else:
-        print(f"[4/4] Building {nrep} GaREUS replicas with CV {cv_label}: atoms {cv_atom1}, {cv_atom2}")
+        print(f"[4/4] Building {nrep} ATLaS-MD replicas with CV {cv_label}: atoms {cv_atom1}, {cv_atom2}")
     print("    Each replica receives the same shared GaMD setup globals and starts directly in production.")
     if progress is not None:
         progress.progress("replica_construction", 0, nrep, message=f"{nrep} replicas", force=True)
@@ -7273,7 +7274,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         "progress_jsonl": str(out_dir / str(getattr(args, "progress_jsonl", "progress.jsonl"))),
         "distance_csv": str(out_dir / str(getattr(args, "distance_csv", "distances.csv"))),
         "distance_jsonl": str(out_dir / str(getattr(args, "distance_jsonl", "distances.jsonl"))),
-        "note": "Quick GaREUS-like OpenMM scaffold. Validate force groups and reweighting for production free energies.",
+        "note": "Quick ATLaS-MD scaffold. Validate force groups and reweighting for production free energies.",
         "resume_fast_path": bool(fast_resume),
     }
     write_json(out_dir / "gareus_metadata.json", metadata)
@@ -7352,7 +7353,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         "shared_gamd_context_checkpoint": str(out_dir / "shared_gamd_setup_context.chk"),
         "replica_shared_gamd_copy_report_json": str(out_dir / "replica_shared_gamd_copy_report.json"),
         "samples_written_only_for_phases": ["gareus_production", "gamd_production", "production"],
-        "samples_note": "samples.csv is opened lazily after the single shared GaMD setup and contains only GaREUS production samples; calibration/equilibration rows are not written for MBAR." if use_gamd else f"samples.csv contains conventional umbrella/REUS production samples; GaMD boost fields are empty in --run-mode {run_mode}.",
+        "samples_note": "samples.csv is opened lazily after the single shared GaMD setup and contains only ATLaS-MD production samples; calibration/equilibration rows are not written for MBAR." if use_gamd else f"samples.csv contains conventional umbrella/REUS production samples; GaMD boost fields are empty in --run-mode {run_mode}.",
         "samples_columns_for_mbar": {
             "cv_A": f"sampled primary CV ({primary_cv_label(args)}) in {primary_cv_units(args)}; legacy column name",
             "window": "thermodynamic umbrella state assigned to the replica at this sample",
@@ -8123,7 +8124,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             print("    Conventional MD mode: no GaMD setup/calibration; replicas start directly in umbrella/REUS production")
 
         prod_total = int(args.gamd_production_steps)
-        print(f"    {'GaREUS' if use_gamd else 'US/REUS CMD'} production with {getattr(args, 'exchange_mode', 'neighbor')} exchanges: {prod_total} steps")
+        print(f"    {'ATLaS-MD' if use_gamd else 'US/REUS CMD'} production with {getattr(args, 'exchange_mode', 'neighbor')} exchanges: {prod_total} steps")
         prod_done = 0
         attempt = 0
         parity = 0
@@ -8213,7 +8214,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     if fallback_exchange_report.get("restored"):
                         print(f"    Restored exchange dashboard stats from {fallback_exchange_report.get('source')} ({fallback_exchange_report.get('rows')} rows).")
                     print(f"    TUI/dashboard history not restored: {resume_tui_report.get('reason', 'unknown reason')}")
-                print(f"    Resumed GaREUS production from checkpoint at production step {prod_done}/{prod_total}; attempt {attempt}")
+                print(f"    Resumed ATLaS-MD production from checkpoint at production step {prod_done}/{prod_total}; attempt {attempt}")
                 if effective_traj_interval > 0:
                     for i, driver in enumerate(drivers):
                         reporter = make_trajectory_reporter(app, traj_dir / f"replica_{i:03d}_resume_from_{prod_done:09d}", effective_traj_interval, args, atom_subset=traj_atom_subset)

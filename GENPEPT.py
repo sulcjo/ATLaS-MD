@@ -276,14 +276,14 @@ def _genpept_config_defaults(
         unknown_top_level = [str(k) for k in raw.keys() if str(k) not in GAREUS_FRIENDLY_TOP_LEVEL_BLOCKS and str(k) not in GENPEPT_CONFIG_BLOCKS and str(k) not in body]
         _CONFIG_COMPAT_MESSAGES.append(
             "No top-level genpept/conformer_generation/seed_generation block found; "
-            "using legacy filtered top-level mode and ignoring recognized GaREUS sections."
+            "using legacy filtered top-level mode and ignoring recognized ATLaS-MD sections."
         )
     else:
         ignored = [str(k) for k in raw.keys() if k not in GENPEPT_CONFIG_BLOCKS and k not in {selected_block_name}]
         ignored_gareus = [k for k in ignored if k in GAREUS_FRIENDLY_TOP_LEVEL_BLOCKS]
         if ignored_gareus:
             _CONFIG_COMPAT_MESSAGES.append(
-                f"Using top-level {selected_block_name!r} block for GENPEPT; ignored GaREUS sections: "
+                f"Using top-level {selected_block_name!r} block for GENPEPT; ignored ATLaS-MD sections: "
                 + ", ".join(ignored_gareus[:12])
                 + (" ..." if len(ignored_gareus) > 12 else "")
             )
@@ -8089,11 +8089,11 @@ def parse_args(argv=None):
 
     p = argparse.ArgumentParser(description="Fast Ramachandran + implicit basin-hopping peptide seed workflow.")
 
-    p.add_argument("--config", default=None, help="YAML/JSON config file. In combined workflow YAMLs, GENPEPT reads the top-level conformer_generation/genpept/seed_generation block and ignores GAREUS blocks.")
+    p.add_argument("--config", default=None, help="YAML/JSON config file. In combined workflow YAMLs, GENPEPT reads the top-level conformer_generation/genpept/seed_generation block and ignores ATLaS-MD blocks.")
     p.add_argument("--profile", default=None,
-                   help="Named bundle of boilerplate config keys, shared with GAREUS (see config_profiles.py). "
+                   help="Named bundle of boilerplate config keys, shared with ATLaS-MD (see config_profiles.py). "
                         "Explicit YAML/CLI keys override anything from the profile.")
-    p.add_argument("--strict-config", action="store_true", help="Treat unknown keys inside the GENPEPT config block as fatal. Default is friendly/warn-only for combined GaREUS YAMLs.")
+    p.add_argument("--strict-config", action="store_true", help="Treat unknown keys inside the GENPEPT config block as fatal. Default is friendly/warn-only for combined ATLaS-MD YAMLs.")
     p.add_argument("--seq", default=None)
     p.add_argument("--out", default=None, type=Path)
     p.add_argument("--clean", action="store_true")

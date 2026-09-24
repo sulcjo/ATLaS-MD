@@ -26,11 +26,12 @@ from typing import Any, Sequence
 
 import numpy as np
 
-from ..colors import ROLE_BAD, ROLE_GOOD, ROLE_WARN, color_text, role_text
-from ..tui import _ansi_truncate, _coverage_bar, format_duration, make_progress_bar
+from ..colors import ROLE_BAD, ROLE_GOOD, ROLE_TITLE, ROLE_WARN, color_text, role_text
+from ..branding import product_label
+from ..tui import _ansi_truncate, _coverage_bar, format_duration, make_progress_bar, strip_ansi_len
 from .context import DashboardContext
 from .panels import _num, live_gamd_envelope
-from .ranking import BAD, DEAD_ACCEPTANCE, OK, WARN, WindowStatus, rank_windows
+from .ranking import BAD, DEAD_ACCEPTANCE, OK, WARN, WindowStatus, rank_windows_for
 
 FULL_SPINE_LINES = 10
 COMPACT_SPINE_LINES = 5
@@ -101,21 +102,35 @@ def bucket_strip(
         elif WARN in chunk_status:
             out.append(role_text(_WARN_GLYPH, ROLE_WARN))
         else:
-            out.append(glyph)
+            out.append(role_text(glyph, ROLE_GOOD, bold=False))
     return "".join(out)
 
 
 def _ranked_windows(ctx: DashboardContext) -> tuple[WindowStatus, ...]:
-    return rank_windows(
-        n_windows=ctx.n_windows, centers_a=ctx.centers_a, k_list=ctx.k_list,
-        acceptance_by_window=ctx.acceptance_windows, overlap_by_pair=ctx.overlap_pairs,
-        delta_by_window=ctx.deltas, temperature_k=ctx.temperature_k,
-    )
+    return rank_windows_for(ctx)
 
 
 def _statuses_by_window(ranked: Sequence[WindowStatus], n_windows: int) -> list[str]:
     by_window = {s.window: s.status for s in ranked}
     return [by_window.get(w, OK) for w in range(n_windows)]
+
+
+def _identity_with_verdict(identity: str, verdict: str, width: int) -> str:
+    """Join the identity text and the health verdict without ever cutting the verdict.
+
+    The verdict is the one thing on the line an operator acts on, so when the
+    line is too long the gap shrinks to two columns first and then the identity
+    text is truncated -- never the verdict (the final per-line safety truncation
+    would otherwise eat it from the right on long run labels).
+    """
+    for gap in ("      ", "  "):
+        line = identity + gap + verdict
+        if strip_ansi_len(line) <= width:
+            return line
+    room = width - 2 - strip_ansi_len(verdict)
+    if room < 8:
+        return _ansi_truncate(identity + "  " + verdict, width)
+    return _ansi_truncate(identity, room) + "  " + verdict
 
 
 def _verdict(ctx: DashboardContext) -> str:
@@ -263,11 +278,11 @@ def spine_lines(ctx: DashboardContext, lines_budget: int) -> tuple[str, ...]:
     elif ctx.epoch_index is not None:
         total = ctx.epoch_total
         epoch = f"ep {ctx.epoch_index}/{total}  " if total is not None else f"ep {ctx.epoch_index}  "
-    identity = (f"GaREUS  {ctx.run_label}   {ctx.phase}  {epoch}{ctx.segment_name}   "
+    identity = (f"{role_text(product_label(), ROLE_TITLE)}  {ctx.run_label}   {ctx.phase}  {epoch}{ctx.segment_name}   "
                 f"{ctx.n_windows} win  {ctx.topology_label}")
     if ctx.secondary_cv_type:
         identity += f"  cv2 {ctx.secondary_cv_type}"
-    identity += "      " + _verdict(ctx)
+    identity = _identity_with_verdict(identity, _verdict(ctx), width)
 
     cells = max(8, width - 60)
     win_strip = bucket_strip(counts, statuses, cells=cells, glyphs=ctx.glyphs)

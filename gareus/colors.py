@@ -8,6 +8,7 @@ sequences and to toggle colour output on or off.
 
 from __future__ import annotations
 
+import os
 import sys
 from typing import Optional
 
@@ -49,12 +50,16 @@ _ROLE_STYLE: dict[str, tuple[str, bool]] = {
 ASCII_COLOR_ENABLED: bool = False
 
 
-def configure_color(mode: str) -> None:
+def configure_color(mode: str, *, tui_mode: Optional[str] = None) -> None:
     """Configure ANSI colour handling for console output.
 
-    ``mode`` may be ``"always"``, ``"never"``, or ``"auto"`` (the
-    default).  In ``auto`` mode, colour is enabled if ``sys.stdout``
-    appears to be a TTY.
+    ``mode`` may be ``"always"``, ``"never"``, or ``"auto"`` (the default).
+    ``auto`` enables colour when ``sys.stdout`` is a TTY, and also for the live
+    dashboard (``tui_mode="dashboard"``) even when stdout is a SLURM log: the
+    dashboard already writes cursor/clear escapes there, so a log reader must
+    handle ANSI anyway, and without colour the OK/WARN/BAD status is lost.
+    The ``NO_COLOR`` convention (https://no-color.org) switches ``auto`` off;
+    an explicit ``always`` still wins, since it was asked for by name.
     """
     global ASCII_COLOR_ENABLED
     mode = str(mode or "auto").lower()
@@ -62,10 +67,11 @@ def configure_color(mode: str) -> None:
         ASCII_COLOR_ENABLED = True
     elif mode == "never":
         ASCII_COLOR_ENABLED = False
+    elif os.environ.get("NO_COLOR"):
+        ASCII_COLOR_ENABLED = False
     else:
-        # Fall back to auto detection.  Some environments may not set
-        # isatty properly, but this provides a reasonable default.
-        ASCII_COLOR_ENABLED = bool(getattr(sys.stdout, "isatty", lambda: False)())
+        is_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
+        ASCII_COLOR_ENABLED = is_tty or str(tui_mode or "").lower() == "dashboard"
 
 
 def style_text(

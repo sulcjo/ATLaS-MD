@@ -9,7 +9,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 from . import __version__ as PACKAGE_VERSION
-from .colors import ROLE_BAD, role_text
+from .branding import PRODUCT_NAME
+from .colors import ROLE_BAD, role_text, style_text
 from .provenance import _dist_version, _optional_module_version
 
 WIDTH = 66
@@ -19,16 +20,22 @@ NEAR_BASE = 7
 NEAR = [3, 4, 2, 6, 3, 4, 3, 3, 3, 2]
 REPO_URL = "github.com/sulcjo/ATLaS-MD"
 
-_GLYPHS = {
-    "A": ["    _    ", "   / \\   ", "  / _ \\  ", " / ___ \\ ", "/_/   \\_\\", "        "],
-    "T": [" _____  ", "|_   _| ", "  | |   ", "  | |   ", "  |_|   ", "        "],
-    "L": [" _      ", "| |     ", "| |     ", "| |___  ", "|_____| ", "        "],
-    "a": ["        ", "        ", "  __ _  ", " / _` | ", "| (_| | ", " \\__,_| "],
-    "S": ["  ____  ", " / ___| ", " \\___ \\ ", "  ___) |", " |____/ ", "        "],
-    "M": ["  __  __ ", " |  \\/  |", " | |\\/| |", " | |  | |", " |_|  |_|", "        "],
-    "D": ["  ____  ", " |  _ \\ ", " | | | |", " | |_| |", " |____/ ", "        "],
-    "-": ["        ", " _____  ", "|_____| ", "        ", "        ", "        "],
+# 5x7 pixel font, one full block per pixel: solid strokes and a shared
+# baseline read far better in a log tail than thin figlet strokes (whose
+# lowercase "a" dropped a row below the capitals). Add a letter here to use it.
+_PIXEL_FONT = {
+    "A": [".###.", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"],
+    "T": ["#####", "..#..", "..#..", "..#..", "..#..", "..#..", "..#.."],
+    "L": ["#....", "#....", "#....", "#....", "#....", "#....", "#####"],
+    "a": [".....", ".....", ".###.", "....#", ".####", "#...#", ".####"],
+    "S": [".####", "#....", "#....", ".###.", "....#", "....#", "####."],
+    "-": [".....", ".....", ".....", "####.", ".....", ".....", "....."],
+    "M": ["#...#", "##.##", "#.#.#", "#.#.#", "#...#", "#...#", "#...#"],
+    "D": ["####.", "#...#", "#...#", "#...#", "#...#", "#...#", "####."],
 }
+_FONT_ROWS = 7
+# Left-to-right 256-colour gradient (cyan -> blue) for the wordmark when colour is on.
+_WORDMARK_GRADIENT = (51, 45, 39, 33, 27)
 
 
 def _num(value: Any) -> str:
@@ -54,21 +61,25 @@ def _dur(seconds: float) -> str:
 
 
 def _wordmark(name: str, gap: int = 1) -> list[str]:
-    out = [""] * 6
+    rows = [""] * _FONT_ROWS
     for k, ch in enumerate(name):
-        g = _GLYPHS[ch]
-        w = max(len(r) for r in g)
-        g = [r.ljust(w) for r in g]
-        cols = [j for j in range(w) if any(g[i][j] != " " for i in range(6))]
-        lo, hi = min(cols), max(cols)
-        b = [row[lo:hi + 1] for row in g]
-        if k:
-            out = [out[r] + " " * gap for r in range(6)]
-        for r in range(6):
-            out[r] += b[r]
-    while out and not out[-1].strip():
-        out.pop()
-    return out
+        glyph = _PIXEL_FONT[ch]
+        for r in range(_FONT_ROWS):
+            rows[r] += ("." * gap if k else "") + glyph[r]
+    return ["".join("█" if px == "#" else " " for px in row).rstrip() for row in rows]
+
+
+def _colour_wordmark(line: str) -> str:
+    """Tint each block by its column, so the word reads as one gradient."""
+    out = []
+    for col, ch in enumerate(line):
+        if ch == " ":
+            out.append(ch)
+            continue
+        shade = _WORDMARK_GRADIENT[min(len(_WORDMARK_GRADIENT) - 1,
+                                       col * len(_WORDMARK_GRADIENT) // WIDTH)]
+        out.append(style_text(ch, fg256=shade, bold=True))
+    return "".join(out)
 
 
 def _peak_cells(cx: int, h: int, base_row: int):
@@ -269,7 +280,9 @@ def _panel_rows(args: Any, out_dir: Path, resume: bool, mbar_version: Optional[s
 
 def banner_lines(args: Any, out_dir: Path, *, resume: bool = False,
                  mbar_version: Optional[str] = None) -> list[str]:
-    lines = [r.center(WIDTH).rstrip() for r in _wordmark("ATLaS-MD")]
+    mark = _wordmark(PRODUCT_NAME)
+    indent = " " * max(0, (WIDTH - max(len(r) for r in mark)) // 2)
+    lines = [_colour_wordmark(indent + r) for r in mark]
     lines.append("")
     subtitle = "resuming run" if resume else "starting run"
     lines.append(subtitle.center(WIDTH).rstrip())

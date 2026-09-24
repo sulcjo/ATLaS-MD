@@ -555,6 +555,12 @@ def build_fleet_snapshot(states: list, now: Optional[float] = None) -> FleetSnap
                          slurm_unmatched_jobs=tuple(unmatched),
                          slurm_error=slurm_error)
 
+try:  # standalone copies of this script may run without the package
+    from gareus.branding import product_label as _product_label
+    _PRODUCT_LABEL = _product_label()
+except ImportError:
+    _PRODUCT_LABEL = "ATLaS-MD"
+
 try:
     import termios
     import tty
@@ -3176,7 +3182,7 @@ def render(states: list, selected: Optional[int] = None) -> str:
     selected = 0 if selected is None else max(0, min(len(states) - 1, selected))
     fleet = build_fleet_snapshot(states)
 
-    title = c(A.BOLD, A.BCYAN) + " GAREUS Monitor " + A.RESET + c(A.DIM) + now + A.RESET
+    title = c(A.BOLD, A.BCYAN) + f" {_PRODUCT_LABEL} Monitor " + A.RESET + c(A.DIM) + now + A.RESET
     lines = ["", "  " + title]
 
     if fleet.global_percent is not None:
@@ -4007,7 +4013,7 @@ def _rich_summary_panel(fleet: FleetSnapshot):
     from rich.text import Text
 
     t = Text()
-    t.append("GAREUS fleet  ", style="bold cyan")
+    t.append(f"{_PRODUCT_LABEL} fleet  ", style="bold cyan")
     if fleet.global_percent is not None:
         t.append(f"{fleet.done_ns:.0f}/{fleet.total_budget_ns:.0f} ns  ", style="white")
         t.append(f"{fleet.global_percent:.1f}%  ", style="bold yellow")
@@ -4834,9 +4840,10 @@ def interactive_loop(states: list, interval: float,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="GAREUS multi-peptide live monitor (Textual/Rich optional, ANSI fallback)",
+        description=f"{_PRODUCT_LABEL} multi-peptide live monitor (Textual/Rich optional, ANSI fallback)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    parser.add_argument("-V", "--version", action="version", version=_PRODUCT_LABEL)
     parser.add_argument("runs_dirs", nargs="*", default=["."],
                         help="Root dir(s) containing peptide subdirs (or flat run dirs)")
     parser.add_argument("--interval", "-i", type=float, default=10.0,

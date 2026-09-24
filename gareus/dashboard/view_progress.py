@@ -13,7 +13,9 @@ from ..colors import color_text
 from ..tui import format_duration
 from ..tui_screen import Panel, Row
 from .context import DashboardContext
+from .grid2d import window_grid_panel
 from .panels import _num, panel
+from .ranking import rank_windows_for
 from .spine import _ns_per_day
 
 
@@ -165,10 +167,18 @@ def throughput_panel(ctx: DashboardContext) -> Panel:
 
 
 def build(ctx: DashboardContext) -> tuple[Row, ...]:
-    return (
+    rows = [
         Row(panels=(timeline_panel(ctx),)),
         Row(panels=(projection_panel(ctx), throughput_panel(ctx))),
-    )
+    ]
+    # 2D runs: the window map also fits here when the terminal has room. It is
+    # the lowest priority on this view, so a short terminal drops it first
+    # (the WINDOWS view carries it at a higher priority).
+    statuses = rank_windows_for(ctx) if ctx.is_2d else ()
+    grid = window_grid_panel(ctx, statuses, priority=4) if ctx.is_2d else None
+    if grid is not None:
+        rows.append(Row(panels=(grid,)))
+    return tuple(rows)
 
 
 __all__ = ["build", "collapse_extension_rounds", "projection_panel", "throughput_panel",

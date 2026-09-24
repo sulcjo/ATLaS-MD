@@ -2026,7 +2026,7 @@ def generate_us_starting_states_by_pulling(
             seed_selection_rows_sorted = sorted(seed_selection_rows, key=lambda r: int(r.get("window", 0)))
             write_json(pull_dir / "seed_selection_report.json", _json_ready({
                 "mode": "active_cv_seed_selection",
-                "description": "GENPEPT survivor choice per umbrella window, scored in the active GAREUS CV space before graft/minimize/pull.",
+                "description": "GENPEPT survivor choice per umbrella window, scored in the active ATLaS-MD CV space before graft/minimize/pull.",
                 "seed_selection_mode": seed_selection_mode,
                 "seed_secondary_weight": float(seed_secondary_weight),
                 "seed_max_reuse_per_conformer": int(seed_max_reuse),
