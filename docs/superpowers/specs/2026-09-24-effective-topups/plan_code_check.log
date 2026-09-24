@@ -1,0 +1,45 @@
+[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[31mF[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[32m.[0m[31m                                                 [100%][0m
+=================================== FAILURES ===================================
+[31m[1m__________ test_healthy_chain_has_small_sigma_and_all_edges_measured ___________[0m
+
+tmp_path = PosixPath('/tmp/pytest-of-sulcjo/pytest-2090/test_healthy_chain_has_small_s0')
+
+    [0m[94mdef[39;49;00m[90m [39;49;00m[92mtest_healthy_chain_has_small_sigma_and_all_edges_measured[39;49;00m(tmp_path):[90m[39;49;00m
+        p = _write(tmp_path, [[94m0.0[39;49;00m, [94m1.0[39;49;00m, [94m2.0[39;49;00m, [94m3.0[39;49;00m], k=[94m4.0[39;49;00m, n_per=[94m2000[39;49;00m)[90m[39;49;00m
+        d = union_diagnostics_from_npz(p, [([94m0[39;49;00m, [94m1[39;49;00m), ([94m1[39;49;00m, [94m2[39;49;00m), ([94m2[39;49;00m, [94m3[39;49;00m)], kt_kcal=KT)[90m[39;49;00m
+        [94massert[39;49;00m d [95mis[39;49;00m [95mnot[39;49;00m [94mNone[39;49;00m[90m[39;49;00m
+        [94massert[39;49;00m [96mall[39;49;00m(math.isfinite(d.sigma_kcal[s]) [95mand[39;49;00m d.sigma_kcal[s] > [94m0[39;49;00m [94mfor[39;49;00m s [95min[39;49;00m ([94m0[39;49;00m, [94m1[39;49;00m, [94m2[39;49;00m, [94m3[39;49;00m))[90m[39;49;00m
+        [90m# local sigma: the chain end is not penalised for its distance from state 0[39;49;00m[90m[39;49;00m
+        [94massert[39;49;00m d.sigma_kcal[[94m3[39;49;00m] < [94m2.0[39;49;00m * d.sigma_kcal[[94m1[39;49;00m][90m[39;49;00m
+        [94massert[39;49;00m [96mset[39;49;00m(d.edge_overlap) == {([94m0[39;49;00m, [94m1[39;49;00m), ([94m1[39;49;00m, [94m2[39;49;00m), ([94m2[39;49;00m, [94m3[39;49;00m)}[90m[39;49;00m
+        [94massert[39;49;00m [96mmin[39;49;00m(d.edge_overlap.values()) > [94m0.15[39;49;00m[90m[39;49;00m
+>       [94massert[39;49;00m [95mnot[39;49;00m d.unconverged[90m[39;49;00m
+[1m[31mE       assert not frozenset({0, 1})[0m
+[1m[31mE        +  where frozenset({0, 1}) = UnionDiagnostics(state_ids=(0, 1, 2, 3), n_k={0: 2000, 1: 2000, 2: 2000, 3: 2000}, sigma_kcal={0: 0.020644320628349165..., 2: 1.0, 3: 1.0}, edge_overlap={(0, 1): 0.21781854168524173, (1, 2): 0.2054972373604152, (2, 3): 0.21594614196894987}).unconverged[0m
+
+[1m[31mtests/test_topup_union_diagnostics.py[0m:37: AssertionError
+------------------------------ Captured log call -------------------------------
+[33mWARNING [0m pymbar.timeseries:timeseries.py:75 Warning on use of the timeseries module: If the inherent timescales of the system are long compared to those being analyzed, this statistical inefficiency may be an underestimate.  The estimate presumes the use of many statistically independent samples.  Tests should be performed to assess whether this condition is satisfied.   Be cautious in the interpretation of the data.
+[33mWARNING [0m pymbar.mbar_solvers:mbar_solvers.py:28 
+****** PyMBAR will use 64-bit JAX! *******
+* JAX is currently set to 32-bit bitsize *
+* which is its default.                  *
+*                                        *
+* PyMBAR requires 64-bit mode and WILL   *
+* enable JAX's 64-bit mode when called.  *
+*                                        *
+* This MAY cause problems with other     *
+* Uses of JAX in the same code.          *
+******************************************
+
+[33mWARNING [0m pymbar.mbar_solvers:mbar_solvers.py:149 
+******* JAX 64-bit mode is now on! *******
+*     JAX is now set to 64-bit mode!     *
+*   This MAY cause problems with other   *
+*      uses of JAX in the same code.     *
+******************************************
+
+[33mWARNING [0m jax._src.xla_bridge:xla_bridge.py:864 An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.
+[36m[1m=========================== short test summary info ============================[0m
+[31mFAILED[0m tests/test_topup_union_diagnostics.py::[1mtest_healthy_chain_has_small_sigma_and_all_edges_measured[0m - assert not frozenset({0, 1})
+[31m[31m[1m1 failed[0m, [32m23 passed[0m[31m in 6.65s[0m[0m
