@@ -459,6 +459,12 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                         "(deliberately NOT the pool-derived final target: an extension round runs "
                         "after the final phase already drew its share of the MD pool).")
     p.add_argument("--ap-retire-converged", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--ap-topups", action=argparse.BooleanOptionalAction, default=True,
+                   help="Scheduled epochs/final run an all-state baseline plus top-up segments over "
+                        "state subsets. --no-ap-topups runs the baseline only, giving it the phase's "
+                        "whole per-state budget (mean of the allocator's requested steps). Recommended "
+                        "for lambda-ladder campaigns, where a top-up batch holds one rung (no lambda "
+                        "exchange) and restarts its windows from a fresh pull.")
     p.add_argument("--ap-gamd-boost-sd-warn", type=float, default=6.0)
     p.add_argument("--ap-write-reports", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--md-budget-ns", type=float, default=0.0,
@@ -1396,6 +1402,7 @@ def _shim_adaptive_production(args: argparse.Namespace) -> None:
     args.adaptive_production_bridge_repairable_first = args.ap_bridge_repairable_first
     args.adaptive_production_bridge_skip_unreachable = args.ap_bridge_skip_unreachable
     args.adaptive_production_retire_converged = args.ap_retire_converged
+    args.adaptive_production_topups = args.ap_topups
     args.adaptive_production_max_gamd_boost_sd_kcal_mol = args.ap_gamd_boost_sd_warn
     args.adaptive_production_write_action_reports = args.ap_write_reports
     args.adaptive_production_total_md_pool_ns = args.md_budget_ns
