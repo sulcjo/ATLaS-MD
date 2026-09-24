@@ -4,37 +4,128 @@
 
 **Goal:** Make scheduled top-ups spend MD only where a per-epoch union MBAR shows a statistical deficit, costed in wall-hours under the lockstep constraint, batched with minimal exchange partners, and seeded by continuing each window's chain from the baseline's final state; off by default; validated in the synthetic harness only.
 
-**Architecture:** Three new pure modules under `gareus/adaptive/` (throughput model, autocorrelation, union diagnostics) feed a pure allocator (`topup_allocator.py`) that returns one `TopupPlan` per epoch. `run_scheduled_adaptive_epoch` runs the all-state baseline, calls the diagnostics and allocator, and runs at most one top-up segment. Production exports each window's final portable State at segment end; a top-up segment starts its windows from those States instead of pulling. The synthetic harness gains rungs, a mixing model, lockstep segments and the real union solve, and runs the A/B study.
+**Architecture:** Pure modules under `gareus/adaptive/` (throughput model, union diagnostics, allocator, plan/calibration persistence) produce one `TopupPlan` per epoch. `run_scheduled_adaptive_epoch` runs the all-state baseline, calls the diagnostics and allocator, and runs at most one top-up segment. The union builder records per-state equilibration cut and statistical inefficiency, which the allocator uses. Production exports each window's final portable State at segment end; a top-up runs only windows that have one, continuing their chains. The synthetic harness gains rungs, a mixing model, lockstep segments and the real union solve, and runs the A/B study.
 
-**Tech Stack:** Python 3.9 (aurum2 conda env `calc`) / 3.14 (local), numpy, pymbar 4.x, OpenMM 8.x (seeding only), existing `gareus` package.
+**Tech Stack:** Python 3.9 (aurum2 conda env `calc`) / 3.14 (local), numpy, scipy, pymbar 4.0.3, OpenMM 8.x (seeding only), existing `gareus` package.
 
-**Spec:** `docs/superpowers/specs/2026-09-24-effective-topups-design.md` (read it first; this plan argues from it).
+**Spec:** `docs/superpowers/specs/2026-09-24-effective-topups-design.md` (read it first; this plan argues from it). Review records: `docs/superpowers/specs/2026-09-24-effective-topups/` (design board, plan board, `plan_code_check.log`).
+
+**Revision 2 (2026-09-25).** Revision 1's pure code for Tasks 3-6 was executed verbatim in a scratch worktree (23/24 tests passed) and reviewed by the small board (ACCEPT_WITH_CHANGES, split 1-1, one judge failed). Folded in: (V2) split-halves threshold corrected for multiple comparisons with an effect-size floor, each neighbour pair tested once; (V3) the union inputs are already decorrelated, so the allocator uses the builder's kept counts and its per-state inefficiency instead of a second autocorrelation pass (old Task 4 replaced); (V4) top-up budget computed from the un-shortened default steps; plus from the board: budget-feasible maximum length as a candidate, clamped and smoothed calibration factor, never-sampled states excluded as partners, persistent weak-edge escalation to structural, atomic plan writes and layout validation on resume, MBAR initialised from zeros / previous epoch instead of BAR (states are not in overlap order), predicted vs realised wall-time logged. Rejected with reasons: "healthy epochs forfeit the reserved share" (the live pool already rolls it forward) and "allow +inf in u_kn" (harmonic biases are never infinite; NaN rows are dropped by design).
 
 ## Global Constraints
 
 - Top-ups are **off by default**: `--ap-topups` default `False`; YAML key `ap_topups`.
-- Defaults: `--ap-topup-target-sigma 0.10` (kcal/mol), `--ap-topup-weak-overlap 0.15`, `--ap-topup-max-fraction 0.3`.
-- Throughput table default (contexts/GPU → ns/day/node): `16 → 3154.0`, `59 → 2300.0`; flat (no extrapolated gain) below the lowest point and above the highest.
+- Defaults: `--ap-topup-target-sigma 0.10` (kcal/mol), `--ap-topup-weak-overlap 0.15`, `--ap-topup-max-fraction 0.3`, `--ap-topup-min-effect 0.05` (kcal/mol, split-halves practical floor), `--ap-topup-max-edge-attempts 2`.
+- Throughput table default (contexts/GPU → ns/day/node): `16 → 3154.0`, `59 → 2300.0`; flat outside the measured range.
 - An unmeasured edge is **never** weak (allocator and convergence gate).
 - Healthy states get **zero** top-up steps; no default score; no distribution of left-over budget.
-- A weak edge whose both endpoints are statistically adequate is **structural**: route to the bridge/add proposal, never to MD.
+- A weak edge whose both endpoints are statistically adequate, or that stayed weak after `max_edge_attempts` top-ups, is **structural**: routed to the bridge/add proposal, never to MD.
 - One top-up segment per epoch at most; all its replicas run the same number of steps (lockstep).
+- **No pull inside a top-up.** A window without an exported final State (or whose State fails the seeding check) is dropped from that top-up, with a warning naming it; the next baseline exports it.
+- The top-up budget is `topup_max_fraction × wall_hours(un-shortened default steps, all active states)`.
 - The old allocator path (score ≥ 1 for every state, grouping by extra size, re-pull seeding for top-ups) is removed, not kept as a mode.
 - Validation is synthetic only: no MD campaign, no benchmark job, no real-file spike in this plan.
 - Tests run through opencode (pytest is hook-blocked in this repo): `opencode run "From the repo root run exactly: python -m pytest -q -p no:cacheprovider <files> > atlas_task.log 2>&1 ; then print the last 30 lines of atlas_task.log. Do not edit any files."`. Run only the test files named in the task (user preference: targeted tests only, never the full suite).
 - Commit messages: conventional commits, ending with the session's `Co-Authored-By` line.
 
-**Deviation from the spec (1), flagged for review — local σ_k:** the spec defines σ_k "relative to a fixed reference state". That makes the reference state's σ identically 0 (it can never be a deficit) and gives distant states a large σ accumulated along the whole chain, which topping up those states cannot fix. This plan uses the **local** uncertainty σ_k = min over k's edge-neighbours j of the pairwise uncertainty of f_k − f_j (pymbar's `dDelta_f[j, k]`); a state with no measured neighbour falls back to the median of its row. This is the quantity more MD on k actually reduces.
+**Deviation from the spec (1), flagged — local σ_k:** the spec defines σ_k "relative to a fixed reference state", which makes the reference state's σ identically 0 and gives distant states an uncertainty accumulated along the whole chain that topping them up cannot fix. This plan uses σ_k = min over k's edge-neighbours j of pymbar's pairwise `dDelta_f[j, k]` (median of the row when k has no measured neighbour). Verified on a healthy chain: 0.021 kcal/mol for every state.
 
-**Deviation from the spec (2), flagged for review — seeding route:** the spec makes the binary-checkpoint load the primary seeding route and a portable State the fallback. This plan makes the **portable State** (positions, velocities, box of each window's final frame, exported at segment end) the primary route, because the fresh-segment code already accepts per-window start positions/velocities and a binary checkpoint cannot be loaded into a Context of a different replica set without re-implementing the resume path. Exact positions + velocities with the frozen GaMD envelope continue the chain, so no burn-in is needed; the spec's seeding assertion is kept. The fallback when no exported State exists is the existing pull (with a warning), not a burn-in route.
+**Deviation from the spec (2), flagged — seeding route:** the spec makes the binary-checkpoint load the primary route. This plan exports each window's final positions, velocities and box at segment end (`final_window_states/`) and starts top-up windows from them through the existing start-state path; a binary checkpoint cannot be loaded into a Context of a different replica set without re-implementing the resume path. Exact positions + velocities with the frozen GaMD envelope continue the chain, so no burn-in is needed. Where the spec's fallback was "portable State + burn-in", this plan's fallback is stricter: the window is left out of that top-up.
 
 ## Review Focus
 
-1. **A deficit state with no same-rung spatial neighbour** (edge of the layout, or a sparse row) — the patch builder must still return a valid patch (it adds the nearest partner on any rung) rather than crash or silently drop the state. Test in Task 6.
-2. **The union solve fails or returns NaN σ for some states** (a state with zero samples, a solver non-convergence) — the epoch runs no top-up and says why; it must never fall back to the old allocator or top up NaN states. Test in Task 5 and Task 8.
-3. **Resume in the middle of a top-up** — the top-up plan must be read back from disk (`topup_plan.json`) rather than recomputed from diagnostics that now include the partial top-up's own samples, or the segment name/steps change under a resumed segment. Test in Task 8.
-4. **Exported final State missing for some windows** (segment written by older code, interrupted before the end) — top-up seeding uses the exported States it has, and falls back to the pull only for the windows without one, with a warning naming them. Test in Task 9.
-5. **Cap smaller than one useful top-up** (tiny remaining pool) — the allocator returns "no top-up" instead of a zero-length or sub-report-interval segment. Test in Task 6.
+1. **A deficit state with no same-rung spatial neighbour** (layout edge, sparse row) — the patch builder still returns a valid patch (partner from another rung) instead of crashing or dropping the state. Test in Task 6.
+2. **The union solve fails or gives NaN σ for some states** (zero samples, non-convergence) — the epoch runs no top-up and says why; never the old allocator, never a top-up of a NaN state. Tests in Tasks 5 and 6.
+3. **Resume in the middle of a top-up, or after the layout changed** — the saved `topup_plan.json` is reused if its states are all still active, otherwise discarded with a warning and recomputed. Tests in Task 8.
+4. **Exported final States missing or inconsistent for some windows** — those windows are dropped from the top-up with a warning; a `SeedMismatchError` inside the segment ends that top-up only, never the campaign. Tests in Tasks 8 and 9.
+5. **Split-halves false alarms at production scale** — on an iid layout of 236 states the check flags at most ~α of epochs. Test in Task 5.
+
+---
+
+### Task 0: pymbar availability — hardening and a loud check (prerequisite)
+
+Found while verifying revision 1 (2026-09-25): in aurum2's production environment (`/home/sulcjo/conda-envs/calc`: scipy 1.13.1, numpy 1.24.2, pymbar 4.0.3) `import pymbar` fails with `AttributeError: module 'scipy.linalg' has no attribute 'tril'` (pymbar's optional JAX backend references a scipy function removed in 1.13; pymbar only catches ImportError). Consequences today, silently:
+- `gareus.mbar_subsample.equilibrated_subsample` returns `status="pymbar_missing"`, so the driver's union builder does **no** equilibration discard or thinning on aurum2;
+- the campaign-end union MBAR analysis (`adaptive_production.py`, `from pymbar import MBAR` guarded by `except Exception`) writes coverage only;
+- `_compute_mbar_weights_for_tica` guards with `except ImportError` only, so a tICA refit would crash there;
+- this plan's per-epoch diagnostics (Task 5) would always return None → top-ups would never run on aurum2.
+
+Fixing the environment (e.g. removing or pinning `jax` in `calc`) changes the live chignolin_9 campaign's behaviour at its next resubmit (subsampling starts working), so it is a **user decision, not part of this task**. This task makes the failure loud and non-crashing.
+
+**Files:**
+- Create: `gareus/pymbar_check.py`
+- Modify: `gareus/adaptive_production.py` (`_compute_mbar_weights_for_tica`: `except ImportError:` → `except Exception:`), `gareus/mbar_subsample.py` (log the reason once when returning `pymbar_missing`), `gareus/cli.py` (call the check once at startup when adaptive production runs)
+- Test: `tests/test_pymbar_check.py`
+
+**Interfaces:**
+- Produces: `pymbar_status() -> tuple[bool, str]` (cached; `(True, "pymbar 4.0.3")` or `(False, "<exception type>: <message>")`); `warn_if_pymbar_unusable(context: str) -> bool` printing one line `WARNING [pymbar]: unusable (<reason>); <context> will run degraded` and returning the availability.
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+# tests/test_pymbar_check.py
+import builtins
+
+import gareus.pymbar_check as pc
+
+
+def test_reports_available_when_import_works():
+    pc.pymbar_status.cache_clear()
+    ok, msg = pc.pymbar_status()
+    assert ok and msg.startswith("pymbar")
+
+
+def test_reports_any_import_time_exception_not_just_importerror(monkeypatch, capsys):
+    real_import = builtins.__import__
+
+    def broken(name, *a, **k):
+        if name == "pymbar":
+            raise AttributeError("module 'scipy.linalg' has no attribute 'tril'")
+        return real_import(name, *a, **k)
+
+    pc.pymbar_status.cache_clear()
+    monkeypatch.setattr(builtins, "__import__", broken)
+    ok, msg = pc.pymbar_status()
+    assert not ok and "AttributeError" in msg and "tril" in msg
+    assert pc.warn_if_pymbar_unusable("top-up diagnostics") is False
+    assert "WARNING [pymbar]" in capsys.readouterr().out
+    pc.pymbar_status.cache_clear()
+```
+
+- [ ] **Step 2: Run to verify it fails** — expected `ModuleNotFoundError: gareus.pymbar_check`.
+
+- [ ] **Step 3: Implement**
+
+```python
+# gareus/pymbar_check.py
+"""Whether pymbar can actually be imported here, and why not (any exception, not only ImportError)."""
+from __future__ import annotations
+
+from functools import lru_cache
+from typing import Tuple
+
+
+@lru_cache(maxsize=1)
+def pymbar_status() -> Tuple[bool, str]:
+    try:
+        import pymbar  # noqa: PLC0415
+        from pymbar import MBAR  # noqa: F401,PLC0415
+    except Exception as exc:  # e.g. AttributeError from an incompatible jax/scipy pair
+        return False, f"{type(exc).__name__}: {exc}"
+    return True, f"pymbar {getattr(pymbar, '__version__', '?')}"
+
+
+def warn_if_pymbar_unusable(context: str) -> bool:
+    ok, msg = pymbar_status()
+    if not ok:
+        print(f"WARNING [pymbar]: unusable ({msg}); {context} will run degraded", flush=True)
+    return ok
+```
+
+In `cli.py`, call `warn_if_pymbar_unusable("equilibration subsampling, union MBAR analysis and top-up diagnostics")` once, in the function that holds the three `prod_summary = run_adaptive_production_auto_loop(` call sites (currently ~lines 1837, 1867, 1919), before the first of them runs. In `_compute_mbar_weights_for_tica` change the import guard to `except Exception:`. In `mbar_subsample.equilibrated_subsample`, before `return _fallback("pymbar_missing")`, call `warn_if_pymbar_unusable("equilibration subsampling")` once per process (guard with a module-level flag).
+
+- [ ] **Step 4: Run tests** — `tests/test_pymbar_check.py tests/test_mbar_subsample*.py tests/test_adaptive_segmented_diagnostics.py`; expected PASS.
+- [ ] **Step 5: Commit** — `git commit -am "fix: detect an unusable pymbar loudly instead of degrading silently"`
 
 ---
 
@@ -157,13 +248,13 @@ git commit -m "refactor: move the layout-neighbour rule out of the dashboard"
 
 **Files:**
 - Modify: `gareus/cli.py` (the `--ap-topups` argument added in PR #98; the `_apply_v2_compat_shims` block that sets `args.adaptive_production_topups`)
-- Modify: `gareus/adaptive_production.py` (`AdaptiveDecisionPolicy` dataclass; `policy_from_args`)
+- Modify: `gareus/adaptive_production.py` (`AdaptiveDecisionPolicy` dataclass; `policy_from_args`; the `_arg_bool(args, "adaptive_production_topups", True)` default inside `run_scheduled_adaptive_epoch`)
 - Modify: `tests/test_no_topups.py` (default flips to off)
 - Test: `tests/test_topup_flags.py`
 
 **Interfaces:**
-- Produces: `AdaptiveDecisionPolicy.topups_enabled: bool = False`, `.topup_target_sigma: float = 0.10`, `.topup_weak_overlap: float = 0.15`, `.topup_max_fraction: float = 0.3`, `.topup_throughput_table: tuple = ((16.0, 3154.0), (59.0, 2300.0))`.
-- Produces: `args.adaptive_production_topups` and `args.adaptive_production_topup_{target_sigma,weak_overlap,max_fraction,throughput_table}`.
+- Produces: `AdaptiveDecisionPolicy.topups_enabled: bool = False`, `.topup_target_sigma: float = 0.10`, `.topup_weak_overlap: float = 0.15`, `.topup_max_fraction: float = 0.3`, `.topup_min_effect: float = 0.05`, `.topup_max_edge_attempts: int = 2`, `.topup_throughput_table: tuple = ((16.0, 3154.0), (59.0, 2300.0))`.
+- Produces: `args.adaptive_production_topups` and `args.adaptive_production_topup_{target_sigma,weak_overlap,max_fraction,min_effect,max_edge_attempts,throughput_table}`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -181,10 +272,12 @@ def test_topups_are_off_by_default_and_opt_in():
 
 def test_topup_knobs_reach_the_policy():
     args = parse_args(["--seq", "AA", "--ap-topups", "--ap-topup-target-sigma", "0.2",
-                       "--ap-topup-weak-overlap", "0.1", "--ap-topup-max-fraction", "0.25"])
+                       "--ap-topup-weak-overlap", "0.1", "--ap-topup-max-fraction", "0.25",
+                       "--ap-topup-min-effect", "0.03", "--ap-topup-max-edge-attempts", "3"])
     pol = policy_from_args(args)
     assert pol.topups_enabled is True
     assert (pol.topup_target_sigma, pol.topup_weak_overlap, pol.topup_max_fraction) == (0.2, 0.1, 0.25)
+    assert (pol.topup_min_effect, pol.topup_max_edge_attempts) == (0.03, 3)
     assert pol.topup_throughput_table == ((16.0, 3154.0), (59.0, 2300.0))
 
 
@@ -192,24 +285,35 @@ def test_policy_defaults_match_the_spec():
     pol = AdaptiveDecisionPolicy()
     assert pol.topups_enabled is False
     assert (pol.topup_target_sigma, pol.topup_weak_overlap, pol.topup_max_fraction) == (0.10, 0.15, 0.3)
+    assert (pol.topup_min_effect, pol.topup_max_edge_attempts) == (0.05, 2)
+
+
+def test_a_malformed_throughput_table_is_a_clear_error():
+    import pytest
+    with pytest.raises(SystemExit):
+        parse_args(["--seq", "AA", "--ap-topup-throughput-table", "16-3154"])
 ```
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `python -m pytest -q -p no:cacheprovider tests/test_topup_flags.py`
+Run (via opencode, see Global Constraints): `python -m pytest -q -p no:cacheprovider tests/test_topup_flags.py`
 Expected: FAIL (`ap_topups` default is True; unknown `--ap-topup-target-sigma`).
 
 - [ ] **Step 3: Implement**
 
-In `gareus/cli.py`, change the `--ap-topups` argument's `default=True` to `default=False` and its help's first sentence to "Top-ups (off by default): ...". Add after it:
+In `gareus/cli.py`, change the `--ap-topups` argument's `default=True` to `default=False` and start its help with "Top-ups (off by default): ...". Add after it:
 
 ```python
     p.add_argument("--ap-topup-target-sigma", type=float, default=0.10,
-                   help="Per-state free-energy uncertainty target (kcal/mol) for top-ups.")
+                   help="Per-state local free-energy uncertainty target (kcal/mol) for top-ups.")
     p.add_argument("--ap-topup-weak-overlap", type=float, default=0.15,
                    help="Symmetric energy-space overlap below which an edge is weak.")
     p.add_argument("--ap-topup-max-fraction", type=float, default=0.3,
                    help="Cap on the share of an epoch's wall-hour budget spent on top-ups.")
+    p.add_argument("--ap-topup-min-effect", type=float, default=0.05,
+                   help="Smallest split-halves free-energy discrepancy (kcal/mol) that can flag a state.")
+    p.add_argument("--ap-topup-max-edge-attempts", type=int, default=2,
+                   help="Top-ups a weak edge may receive before it is treated as structural (bridge).")
     p.add_argument("--ap-topup-throughput-table", default="16:3154,59:2300",
                    help="contexts_per_gpu:ns_per_day_node pairs, comma separated.")
 ```
@@ -220,8 +324,13 @@ In `_apply_v2_compat_shims`, after `args.adaptive_production_topups = args.ap_to
     args.adaptive_production_topup_target_sigma = args.ap_topup_target_sigma
     args.adaptive_production_topup_weak_overlap = args.ap_topup_weak_overlap
     args.adaptive_production_topup_max_fraction = args.ap_topup_max_fraction
-    args.adaptive_production_topup_throughput_table = tuple(
-        (float(a), float(b)) for a, b in (item.split(":") for item in str(args.ap_topup_throughput_table).split(",") if item))
+    args.adaptive_production_topup_min_effect = args.ap_topup_min_effect
+    args.adaptive_production_topup_max_edge_attempts = args.ap_topup_max_edge_attempts
+    try:
+        args.adaptive_production_topup_throughput_table = tuple(
+            (float(a), float(b)) for a, b in (item.split(":") for item in str(args.ap_topup_throughput_table).split(",") if item))
+    except ValueError as exc:
+        raise SystemExit(f"--ap-topup-throughput-table must be 'ctx:ns_per_day,...' ({exc})")
 ```
 
 In `AdaptiveDecisionPolicy` (after `min_exchange_acceptance`):
@@ -231,6 +340,8 @@ In `AdaptiveDecisionPolicy` (after `min_exchange_acceptance`):
     topup_target_sigma: float = 0.10
     topup_weak_overlap: float = 0.15
     topup_max_fraction: float = 0.3
+    topup_min_effect: float = 0.05
+    topup_max_edge_attempts: int = 2
     topup_throughput_table: tuple = ((16.0, 3154.0), (59.0, 2300.0))
 ```
 
@@ -241,11 +352,13 @@ In `policy_from_args(...)` add:
         topup_target_sigma=_arg_float(args, "adaptive_production_topup_target_sigma", 0.10),
         topup_weak_overlap=_arg_float(args, "adaptive_production_topup_weak_overlap", 0.15),
         topup_max_fraction=_arg_float(args, "adaptive_production_topup_max_fraction", 0.3),
+        topup_min_effect=_arg_float(args, "adaptive_production_topup_min_effect", 0.05),
+        topup_max_edge_attempts=_arg_int(args, "adaptive_production_topup_max_edge_attempts", 2),
         topup_throughput_table=tuple(getattr(args, "adaptive_production_topup_throughput_table",
                                              ((16.0, 3154.0), (59.0, 2300.0)))),
 ```
 
-In `tests/test_no_topups.py::test_the_flag_parses_and_defaults_on` rename to `test_the_flag_parses_and_defaults_off` and swap the asserts (`--seq AA` → False, `--seq AA --ap-topups` → True). In `run_scheduled_adaptive_epoch` change `_arg_bool(args, "adaptive_production_topups", True)` to `False`.
+In `tests/test_no_topups.py::test_the_flag_parses_and_defaults_on` rename to `test_the_flag_parses_and_defaults_off` and swap the asserts (`--seq AA` → False, `--seq AA --ap-topups` → True). Its driver test sets `args.adaptive_production_topups = False` explicitly already, so it keeps passing. In `run_scheduled_adaptive_epoch` change `_arg_bool(args, "adaptive_production_topups", True)` to `False`.
 
 - [ ] **Step 4: Run tests**
 
@@ -256,7 +369,7 @@ Expected: PASS.
 
 ```bash
 git add gareus/cli.py gareus/adaptive_production.py tests/test_topup_flags.py tests/test_no_topups.py
-git commit -m "feat: top-ups off by default; add top-up target/overlap/cap/throughput knobs"
+git commit -m "feat: top-ups off by default; add top-up target/overlap/cap/effect/attempt/throughput knobs"
 ```
 
 ---
@@ -351,129 +464,103 @@ def wall_hours(steps: int, n_states: int, timestep_fs: float, n_gpus: int,
 
 ---
 
-### Task 4: Conservative autocorrelation estimator
+### Task 4: Per-state equilibration cut and inefficiency in the union meta
+
+The union builder already discards equilibration and thins each state's samples to decorrelated ones (`equilibrated_subsample_indices`), recording only `{raw, kept}`. The allocator needs the statistical inefficiency and the post-equilibration count, which the full `equilibrated_subsample` result already carries (`SubsampleResult(indices, t0, g, status, ...)`). Record them; do not run a second autocorrelation pass on the already-thinned samples (revision-1 defect V3).
 
 **Files:**
-- Create: `gareus/adaptive/autocorr.py`
-- Test: `tests/test_topup_autocorr.py`
+- Modify: `gareus/adaptive_production.py` — `build_union_state_mbar_inputs`, the per-state subsampling loop (`from .mbar_subsample import equilibrated_subsample_indices as _esi` … `_subsample_counts[str(_sid)] = {"raw": ..., "kept": ...}`)
+- Test: `tests/test_union_subsample_counts.py`
 
 **Interfaces:**
-- Produces: `statistical_inefficiency_ips(x: np.ndarray) -> float` returning g = 1 + 2τ (≥ 1) with Geyer's initial positive sequence; `per_state_inefficiency(values: np.ndarray, state_of_row: np.ndarray, state_ids: Sequence[int]) -> dict[int, float]` (rows must be in time order within each state).
+- Produces: `meta["subsample_counts_per_state"][str(state_id)] == {"raw": int, "t0": int, "kept": int, "g": float, "status": str}` where `g` is the inefficiency the subsampler used and, when it is NaN or < 1, `max(1.0, (raw - t0) / max(1, kept))`.
 
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/test_topup_autocorr.py
-import numpy as np
-import pytest
+# tests/test_union_subsample_counts.py
+import math
+import sys
+from pathlib import Path
 
-from gareus.adaptive.autocorr import per_state_inefficiency, statistical_inefficiency_ips
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from test_adaptive_segmented_diagnostics import N_WINDOWS, _write_parquet_epoch_run, _write_window_csv
 
-def _ar1(phi, n, seed):
-    rng = np.random.default_rng(seed)
-    x = np.zeros(n)
-    for i in range(1, n):
-        x[i] = phi * x[i - 1] + rng.normal()
-    return x
+from gareus.adaptive_production import build_union_state_mbar_inputs, registry_from_window_csv
 
 
-def test_white_noise_has_inefficiency_near_one():
-    x = np.random.default_rng(0).normal(size=20000)
-    assert statistical_inefficiency_ips(x) == pytest.approx(1.0, abs=0.15)
-
-
-def test_ar1_matches_the_closed_form():
-    phi = 0.9                                  # g = (1 + phi) / (1 - phi) = 19
-    g = statistical_inefficiency_ips(_ar1(phi, 200000, 1))
-    assert g == pytest.approx(19.0, rel=0.15)
-
-
-def test_constant_or_short_traces_return_one():
-    assert statistical_inefficiency_ips(np.ones(100)) == 1.0
-    assert statistical_inefficiency_ips(np.array([1.0, 2.0])) == 1.0
-
-
-def test_per_state_splits_by_state_in_time_order():
-    a = _ar1(0.9, 50000, 2); b = np.random.default_rng(3).normal(size=50000)
-    values = np.concatenate([a, b]); state = np.array([7] * 50000 + [9] * 50000)
-    g = per_state_inefficiency(values, state, [7, 9, 11])
-    assert g[7] > 10 and g[9] < 1.5 and g[11] == 1.0
+def test_union_meta_records_equilibration_cut_and_inefficiency(tmp_path):
+    registry = registry_from_window_csv(_write_window_csv(tmp_path / "w.csv"), epoch=0, source="t")
+    adaptive = tmp_path / "adaptive"
+    _write_parquet_epoch_run(adaptive / "final", n_windows=N_WINDOWS, rows_per_window=200)
+    meta = build_union_state_mbar_inputs(adaptive, registry)
+    counts = meta["subsample_counts_per_state"]
+    assert set(counts) == {str(i) for i in range(N_WINDOWS)}
+    for rec in counts.values():
+        assert set(rec) >= {"raw", "t0", "kept", "g", "status"}
+        assert rec["raw"] == 200 and 0 <= rec["t0"] < rec["raw"] and 0 < rec["kept"] <= rec["raw"] - rec["t0"]
+        assert math.isfinite(rec["g"]) and rec["g"] >= 1.0
 ```
 
-- [ ] **Step 2: Run to verify it fails** — expected `ModuleNotFoundError`.
+- [ ] **Step 2: Run to verify it fails** — `python -m pytest -q -p no:cacheprovider tests/test_union_subsample_counts.py`; expected FAIL (`KeyError: 't0'` / missing keys).
 
-- [ ] **Step 3: Implement**
+- [ ] **Step 3: Implement** — in the subsampling loop replace the `_esi` call and the counts line:
 
 ```python
-# gareus/adaptive/autocorr.py
-"""Statistical inefficiency with Geyer's initial positive sequence (conservative)."""
-from __future__ import annotations
-
-from typing import Dict, Sequence
-
-import numpy as np
-
-
-def statistical_inefficiency_ips(x) -> float:
-    x = np.asarray(x, dtype=float)
-    x = x[np.isfinite(x)]
-    n = x.size
-    if n < 4:
-        return 1.0
-    x = x - x.mean()
-    var = float(np.dot(x, x) / n)
-    if var <= 0.0:
-        return 1.0
-    f = np.fft.rfft(x, n=2 * n)
-    acf = np.fft.irfft(f * np.conjugate(f))[:n] / (var * np.arange(n, 0, -1))
-    g = 1.0
-    # Geyer: sum consecutive pairs Gamma_m = rho(2m) + rho(2m+1) while positive.
-    for m in range(1, n // 2):
-        pair = acf[2 * m - 1] + acf[2 * m]
-        if pair <= 0.0:
-            break
-        g += 2.0 * pair
-    return float(max(1.0, g))
-
-
-def per_state_inefficiency(values, state_of_row, state_ids: Sequence[int]) -> Dict[int, float]:
-    values = np.asarray(values, dtype=float)
-    state_of_row = np.asarray(state_of_row)
-    return {int(s): statistical_inefficiency_ips(values[state_of_row == s]) for s in state_ids}
+    from .mbar_subsample import equilibrated_subsample as _es  # noqa: PLC0415
+    ...
+    for _sid, _idx_list in _state_to_indices.items():
+        _trace = np.asarray([float(sample_rows[i]["cv_A"]) for i in _idx_list], dtype=np.float64)
+        _res = _es(_trace)
+        _keep = np.asarray(_res.indices, dtype=np.int64)
+        _kept_global.extend(_idx_list[k] for k in _keep.tolist())
+        _raw, _t0, _kept = len(_idx_list), int(_res.t0), int(len(_keep))
+        _g = float(_res.g)
+        if not math.isfinite(_g) or _g < 1.0:
+            _g = max(1.0, (_raw - _t0) / max(1, _kept))
+        _subsample_counts[str(_sid)] = {"raw": _raw, "t0": _t0, "kept": _kept, "g": _g,
+                                        "status": str(_res.status)}
 ```
 
-- [ ] **Step 4: Run tests** — expected PASS.
-- [ ] **Step 5: Commit** — `git add gareus/adaptive/autocorr.py tests/test_topup_autocorr.py && git commit -m "feat: conservative statistical-inefficiency estimator for top-up gain model"`
+`equilibrated_subsample_indices(series)` is `equilibrated_subsample(series).indices`, so the kept rows are unchanged; only the recorded provenance grows. Remove the now-unused `_esi` import.
+
+- [ ] **Step 4: Run tests** — `tests/test_union_subsample_counts.py tests/test_adaptive_segmented_diagnostics.py tests/test_union_state_mbar_native_params.py tests/test_lambda_ladder_mbar.py`; expected PASS.
+- [ ] **Step 5: Commit** — `git commit -am "feat: union meta records per-state equilibration cut and inefficiency"`
 
 ---
 
 ### Task 5: Per-epoch union diagnostics
 
-Solve the union MBAR the driver already builds and return per-state σ, split-halves flags, inefficiency and a symmetric overlap for every geometry edge (spatial and rung).
+Solve the union MBAR the driver builds and return per-state local σ, a multiplicity-corrected split-halves flag, the builder's decorrelated counts and inefficiency, a symmetric overlap for every geometry edge (spatial and rung), and f_k for warm-starting the next epoch.
 
 **Files:**
 - Create: `gareus/adaptive/union_diagnostics.py`
 - Test: `tests/test_topup_union_diagnostics.py`
 
 **Interfaces:**
-- Consumes: the union NPZ written by `build_union_state_mbar_inputs` (keys `umbrella_reduced_bias_nk`, `state_ids`, `sampled_state_ids`); `gareus.mbar_analysis.ladder.mbar_state_overlap(u_nk, f_k, n_k)`; `gareus.adaptive.autocorr.per_state_inefficiency`.
+- Consumes: the union NPZ written by `build_union_state_mbar_inputs` (keys `umbrella_reduced_bias_nk`, `state_ids`, `sampled_state_ids`; samples already decorrelated per state, in chronological order within each state and source); `meta["subsample_counts_per_state"]` (Task 4); `gareus.mbar_analysis.ladder.mbar_state_overlap(u_nk, f_k, n_k)`.
 - Produces:
 
 ```python
 @dataclass(frozen=True)
 class UnionDiagnostics:
     state_ids: tuple            # union order
-    n_k: dict                   # state_id -> samples in the solve
-    sigma_kcal: dict            # state_id -> LOCAL free-energy uncertainty (kcal/mol): min_j dDelta_f[j,k] over edge-neighbours; nan if unknown
-    unconverged: frozenset      # state_ids failing the split-halves check
-    inefficiency: dict          # state_id -> g = 1 + 2 tau (>= 1)
+    n_k: dict                   # state_id -> decorrelated samples in the solve (= kept)
+    sigma_kcal: dict            # state_id -> LOCAL uncertainty: min_j dDelta_f[j,k] over edge-neighbours (kcal/mol); nan if unsampled
+    unconverged: frozenset      # state_ids flagged by the multiplicity-corrected split-halves check
+    inefficiency: dict          # state_id -> g >= 1: raw report-interval samples per decorrelated sample
     edge_overlap: dict          # (min_id, max_id) -> symmetric sqrt(O_ij O_ji)
+    f_kT: dict                  # state_id -> reduced free energy (warm start for the next epoch)
 
-def union_diagnostics_from_npz(npz_path, edges, *, kt_kcal: float, split_halves: bool = True) -> Optional[UnionDiagnostics]
+def union_diagnostics_from_npz(npz_path, edges, *, kt_kcal: float, subsample_counts: dict | None = None,
+                               min_effect_kcal: float = 0.05, alpha: float = 0.05,
+                               f_init: dict | None = None, split_halves: bool = True) -> UnionDiagnostics | None
 ```
 
-`edges` is a list of `(state_i, state_j)`. Returns `None` (never raises) when the file is missing, has no finite rows, or the solve fails.
+Returns `None` (never raises) when the file is missing, has no finite rows, or the solve fails.
+
+Split-halves rule (revision-1 defect V2): each unordered edge (j, k) with both endpoints holding ≥ `MIN_HALF` (20) samples per half is tested **once**; the family size m is the number of such tests; the pair disagrees if |Δ_A − Δ_B| > max(z*·√(σ_A² + σ_B²), min_effect/kT) with z* = Φ⁻¹(1 − α/(2m)) (Bonferroni, α = 0.05) and Δ = f_k − f_j within each half; both endpoints of a disagreeing pair are flagged. Halves are contiguous in time (first vs second half of each state's rows); never shuffled (a shuffle destroys the drift signal).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -488,7 +575,7 @@ from gareus.adaptive.union_diagnostics import union_diagnostics_from_npz
 KT = 0.596  # kcal/mol at 300 K
 
 
-def _write(tmp_path, centers, k, n_per, seed=0, drift_state=None):
+def _write(tmp_path, centers, k, n_per, seed=0, drift_state=None, name="u.npz"):
     rng = np.random.default_rng(seed)
     x, sid = [], []
     for s, c in enumerate(centers):
@@ -499,34 +586,60 @@ def _write(tmp_path, centers, k, n_per, seed=0, drift_state=None):
         x.append(xs); sid += [s] * n_per
     x = np.concatenate(x)
     u = 0.5 * k * (x[:, None] - np.asarray(centers)[None, :]) ** 2   # reduced (kT units)
-    p = tmp_path / "u.npz"
+    p = tmp_path / name
     np.savez(p, umbrella_reduced_bias_nk=u, state_ids=np.arange(len(centers)),
              sampled_state_ids=np.asarray(sid))
     return p
 
 
-def test_healthy_chain_has_small_sigma_and_all_edges_measured(tmp_path):
+def _chain_edges(n):
+    return [(i, i + 1) for i in range(n - 1)]
+
+
+def test_healthy_chain_has_small_local_sigma_and_all_edges_measured(tmp_path):
     p = _write(tmp_path, [0.0, 1.0, 2.0, 3.0], k=4.0, n_per=2000)
-    d = union_diagnostics_from_npz(p, [(0, 1), (1, 2), (2, 3)], kt_kcal=KT)
+    d = union_diagnostics_from_npz(p, _chain_edges(4), kt_kcal=KT)
     assert d is not None
-    assert all(math.isfinite(d.sigma_kcal[s]) and d.sigma_kcal[s] > 0 for s in (0, 1, 2, 3))
-    # local sigma: the chain end is not penalised for its distance from state 0
-    assert d.sigma_kcal[3] < 2.0 * d.sigma_kcal[1]
-    assert set(d.edge_overlap) == {(0, 1), (1, 2), (2, 3)}
-    assert min(d.edge_overlap.values()) > 0.15
+    assert all(math.isfinite(d.sigma_kcal[s]) and d.sigma_kcal[s] > 0 for s in range(4))
+    assert d.sigma_kcal[3] < 2.0 * d.sigma_kcal[1]          # local sigma: no penalty for distance from state 0
+    assert set(d.edge_overlap) == set(_chain_edges(4)) and min(d.edge_overlap.values()) > 0.15
     assert not d.unconverged
 
 
 def test_fewer_samples_means_larger_sigma(tmp_path):
-    big = union_diagnostics_from_npz(_write(tmp_path, [0.0, 1.0], 4.0, 4000), [(0, 1)], kt_kcal=KT)
-    small = union_diagnostics_from_npz(_write(tmp_path, [0.0, 1.0], 4.0, 250), [(0, 1)], kt_kcal=KT)
+    big = union_diagnostics_from_npz(_write(tmp_path, [0.0, 1.0], 4.0, 4000, name="b.npz"), [(0, 1)], kt_kcal=KT)
+    small = union_diagnostics_from_npz(_write(tmp_path, [0.0, 1.0], 4.0, 250, name="s.npz"), [(0, 1)], kt_kcal=KT)
     assert small.sigma_kcal[1] > big.sigma_kcal[1]
 
 
 def test_a_state_whose_halves_disagree_is_flagged(tmp_path):
     p = _write(tmp_path, [0.0, 1.0, 2.0], k=4.0, n_per=3000, drift_state=1)
-    d = union_diagnostics_from_npz(p, [(0, 1), (1, 2)], kt_kcal=KT)
+    d = union_diagnostics_from_npz(p, _chain_edges(3), kt_kcal=KT)
     assert 1 in d.unconverged
+
+
+def test_false_alarms_are_controlled_at_production_scale(tmp_path):
+    # 236 iid states: a fixed 2-sigma rule flags ~10 states; Bonferroni keeps the family error ~alpha.
+    p = _write(tmp_path, [0.5 * i for i in range(236)], k=4.0, n_per=160, seed=7)
+    d = union_diagnostics_from_npz(p, _chain_edges(236), kt_kcal=KT)
+    assert d is not None and len(d.unconverged) <= 2
+
+
+def test_inefficiency_comes_from_the_builder_meta(tmp_path):
+    p = _write(tmp_path, [0.0, 1.0], k=4.0, n_per=500)
+    counts = {"0": {"raw": 5000, "t0": 500, "kept": 500, "g": 9.0, "status": "subsampled"},
+              "1": {"raw": 5000, "t0": 0, "kept": 500, "g": float("nan"), "status": "detect_failed"}}
+    d = union_diagnostics_from_npz(p, [(0, 1)], kt_kcal=KT, subsample_counts=counts)
+    assert d.inefficiency[0] == 9.0
+    assert d.inefficiency[1] == 10.0                        # fallback: (raw - t0) / kept
+    assert d.n_k == {0: 500, 1: 500}
+
+
+def test_a_warm_start_reproduces_the_cold_solution(tmp_path):
+    p = _write(tmp_path, [0.0, 1.0, 2.0], k=4.0, n_per=1500)
+    cold = union_diagnostics_from_npz(p, _chain_edges(3), kt_kcal=KT)
+    warm = union_diagnostics_from_npz(p, _chain_edges(3), kt_kcal=KT, f_init=cold.f_kT)
+    assert all(abs(cold.f_kT[s] - warm.f_kT[s]) < 1e-6 for s in range(3))
 
 
 def test_missing_or_empty_input_returns_none(tmp_path):
@@ -543,7 +656,7 @@ def test_a_state_with_zero_samples_gets_nan_sigma_not_a_crash(tmp_path):
         u, ids, sid = z["umbrella_reduced_bias_nk"], z["state_ids"], z["sampled_state_ids"]
     keep = sid != 2
     np.savez(p, umbrella_reduced_bias_nk=u[keep], state_ids=ids, sampled_state_ids=sid[keep])
-    d = union_diagnostics_from_npz(p, [(0, 1), (1, 2)], kt_kcal=KT)
+    d = union_diagnostics_from_npz(p, _chain_edges(3), kt_kcal=KT)
     assert d is not None and math.isnan(d.sigma_kcal[2]) and d.n_k[2] == 0
 ```
 
@@ -553,11 +666,13 @@ def test_a_state_with_zero_samples_gets_nan_sigma_not_a_crash(tmp_path):
 
 ```python
 # gareus/adaptive/union_diagnostics.py
-"""Per-epoch union MBAR: per-state sigma, split-halves check, inefficiency, edge overlap.
+"""Per-epoch union MBAR: local sigma, multiplicity-corrected split halves, edge overlap.
 
-Reads the union NPZ written by adaptive_production.build_union_state_mbar_inputs
-(reduced potential of every sample in every state, lambda boost folded in).
-Never raises: any failure returns None and the epoch runs no top-up.
+Reads the union NPZ written by adaptive_production.build_union_state_mbar_inputs.
+Its samples are ALREADY decorrelated per state (equilibration discard + thinning),
+so no second autocorrelation pass runs here: the inefficiency comes from the
+builder's meta (subsample_counts_per_state). Never raises: any failure returns
+None and the epoch runs no top-up.
 """
 from __future__ import annotations
 
@@ -565,11 +680,12 @@ import logging
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 
 import numpy as np
+from scipy.stats import norm
 
-from .autocorr import per_state_inefficiency
+MIN_HALF = 20
 
 
 @dataclass(frozen=True)
@@ -580,16 +696,24 @@ class UnionDiagnostics:
     unconverged: frozenset
     inefficiency: dict
     edge_overlap: dict
+    f_kT: dict
 
 
-def _solve(u_nk: np.ndarray, window: np.ndarray, n_states: int):
-    """f (vs first active state) and the full pairwise uncertainty matrix dDelta_f (K x K, nan for unsampled)."""
+def _solve(u_nk: np.ndarray, window: np.ndarray, n_states: int, f_init: Optional[np.ndarray] = None):
+    """f (reduced, vs first active state), pairwise uncertainty matrix (K x K, nan where unsampled), n_k.
+
+    Initialised from zeros or a warm start, not BAR: pymbar's BAR initialisation chains
+    consecutive states, and the union's state order (centres x rungs) is not overlap order.
+    """
     from pymbar import MBAR  # noqa: PLC0415
     n_k = np.bincount(window, minlength=n_states)
     active = np.flatnonzero(n_k > 0)
     order = np.argsort(window, kind="stable")                 # pymbar wants rows grouped by state
     u_kn = u_nk[order][:, active].T
-    mbar = MBAR(u_kn, n_k[active], initialize="BAR", solver_protocol="robust")
+    kwargs = {"initialize": "zeros", "solver_protocol": "robust"}
+    if f_init is not None and np.all(np.isfinite(f_init[active])):
+        kwargs["initial_f_k"] = f_init[active] - f_init[active][0]
+    mbar = MBAR(u_kn, n_k[active], **kwargs)
     res = mbar.compute_free_energy_differences(compute_uncertainty=True)
     f = np.full(n_states, np.nan); dmat = np.full((n_states, n_states), np.nan)
     f[active] = res["Delta_f"][0]
@@ -606,7 +730,44 @@ def _local_sigma(dmat: np.ndarray, k: int, neighbours) -> float:
     return float(np.median(row)) if row.size else float("nan")
 
 
+def _inefficiency(ids, n_k, subsample_counts) -> Dict[int, float]:
+    out = {}
+    for k, sid in enumerate(ids):
+        rec = (subsample_counts or {}).get(str(sid)) or {}
+        g = rec.get("g")
+        if not (isinstance(g, (int, float)) and math.isfinite(float(g)) and float(g) >= 1.0):
+            raw, t0, kept = rec.get("raw"), rec.get("t0", 0), rec.get("kept")
+            g = max(1.0, (raw - t0) / max(1, kept)) if raw is not None and kept else 1.0
+        out[sid] = float(g)
+    return out
+
+
+def _split_halves(u, window, K, nbr_pairs, min_effect_kT, alpha, f_init):
+    half = np.zeros(len(window), dtype=bool)
+    per_state = [np.flatnonzero(window == k) for k in range(K)]
+    for rows in per_state:
+        half[rows[: len(rows) // 2]] = True                    # contiguous halves, never shuffled
+    eligible = [(j, k) for j, k in nbr_pairs
+                if min(len(per_state[j]), len(per_state[k])) >= 2 * MIN_HALF]
+    if not eligible:
+        return set()
+    fa, da, _ = _solve(u[half], window[half], K, f_init)
+    fb, db, _ = _solve(u[~half], window[~half], K, f_init)
+    z_star = float(norm.ppf(1.0 - alpha / (2.0 * len(eligible))))
+    flagged = set()
+    for j, k in eligible:
+        delta_a, delta_b = fa[k] - fa[j], fb[k] - fb[j]
+        comb = math.hypot(da[j, k], db[j, k])
+        if not all(math.isfinite(v) for v in (delta_a, delta_b, comb)):
+            continue
+        if abs(delta_a - delta_b) > max(z_star * comb, min_effect_kT):
+            flagged.update((j, k))
+    return flagged
+
+
 def union_diagnostics_from_npz(npz_path, edges: Iterable[Tuple[int, int]], *, kt_kcal: float,
+                               subsample_counts: Optional[dict] = None, min_effect_kcal: float = 0.05,
+                               alpha: float = 0.05, f_init: Optional[dict] = None,
                                split_halves: bool = True) -> Optional[UnionDiagnostics]:
     try:
         npz_path = Path(npz_path)
@@ -618,66 +779,52 @@ def union_diagnostics_from_npz(npz_path, edges: Iterable[Tuple[int, int]], *, kt
             sampled = np.asarray(z["sampled_state_ids"], dtype=np.int64)
         idx = {s: i for i, s in enumerate(ids)}
         window = np.asarray([idx.get(int(s), -1) for s in sampled], dtype=np.int64)
-        keep = (window >= 0) & np.isfinite(u).all(axis=1)
+        keep = (window >= 0) & np.isfinite(u).all(axis=1)       # NaN rows = missing energies, excluded by design
+        if int((~keep).sum()):
+            logging.info("top-up diagnostics: %d of %d rows excluded (non-finite)", int((~keep).sum()), len(keep))
         u, window = u[keep], window[keep]
         if u.shape[0] == 0:
             return None
         K = len(ids)
-        f, dmat, n_k = _solve(u, window, K)
+        f0 = None
+        if f_init:
+            f0 = np.asarray([float(f_init.get(s, np.nan)) for s in ids])
+        f, dmat, n_k = _solve(u, window, K, f0)
         nbrs = {k: [] for k in range(K)}
+        pairs = set()
         for a, b in edges:
             ia, ib = idx.get(int(a)), idx.get(int(b))
-            if ia is not None and ib is not None:
+            if ia is not None and ib is not None and ia != ib:
                 nbrs[ia].append(ib); nbrs[ib].append(ia)
-        df = np.array([_local_sigma(dmat, k, nbrs[k]) if n_k[k] > 0 else np.nan for k in range(K)])
-        unconverged = set()
-        if split_halves:
-            half = np.zeros(len(window), dtype=bool)
-            for k in range(K):
-                rows = np.flatnonzero(window == k)
-                half[rows[: len(rows) // 2]] = True
-            fa, dma, _ = _solve(u[half], window[half], K)
-            fb, dmb, _ = _solve(u[~half], window[~half], K)
-            for k in range(K):
-                # compare each state's free energy relative to its neighbours between the halves
-                js = [j for j in nbrs[k] if np.isfinite(fa[j]) and np.isfinite(fb[j])]
-                if not js:
-                    continue
-                j = js[0]
-                da, db = fa[k] - fa[j], fb[k] - fb[j]
-                comb = math.hypot(dma[j, k], dmb[j, k])
-                fa_k, fb_k = da, db
-                if all(math.isfinite(v) for v in (fa_k, fb_k, comb)) and abs(fa_k - fb_k) > 2.0 * comb:
-                    unconverged.add(ids[k])
+                pairs.add((min(ia, ib), max(ia, ib)))
+        sigma = np.array([_local_sigma(dmat, k, nbrs[k]) if n_k[k] > 0 else np.nan for k in range(K)])
+        flagged = (_split_halves(u, window, K, sorted(pairs), min_effect_kcal / kt_kcal, alpha, f)
+                   if split_halves else set())
         from ..mbar_analysis.ladder import mbar_state_overlap  # noqa: PLC0415
-        f_fill = np.where(np.isfinite(f), f, 0.0)
-        O = mbar_state_overlap(u, f_fill, n_k)
+        O = mbar_state_overlap(u, np.where(np.isfinite(f), f, 0.0), n_k)
         edge_overlap = {}
-        for a, b in edges:
-            ia, ib = idx.get(int(a)), idx.get(int(b))
-            if ia is None or ib is None or n_k[ia] == 0 or n_k[ib] == 0:
+        for ia, ib in sorted(pairs):
+            if n_k[ia] == 0 or n_k[ib] == 0:
                 continue
             x, y = float(O[ia, ib]), float(O[ib, ia])
             if math.isfinite(x) and math.isfinite(y) and x >= 0 and y >= 0:
-                edge_overlap[(min(int(a), int(b)), max(int(a), int(b)))] = math.sqrt(x * y)
-        own_u = u[np.arange(len(window)), window]              # each sample's reduced potential in its own state
-        g = per_state_inefficiency(own_u, window, list(range(K)))
+                edge_overlap[(min(ids[ia], ids[ib]), max(ids[ia], ids[ib]))] = math.sqrt(x * y)
         return UnionDiagnostics(
             state_ids=tuple(ids),
             n_k={ids[k]: int(n_k[k]) for k in range(K)},
-            sigma_kcal={ids[k]: (float(df[k]) * kt_kcal if math.isfinite(df[k]) else math.nan) for k in range(K)},
-            unconverged=frozenset(unconverged),
-            inefficiency={ids[k]: float(g[k]) for k in range(K)},
+            sigma_kcal={ids[k]: (float(sigma[k]) * kt_kcal if math.isfinite(sigma[k]) else math.nan)
+                        for k in range(K)},
+            unconverged=frozenset(ids[k] for k in flagged),
+            inefficiency=_inefficiency(ids, n_k, subsample_counts),
             edge_overlap=edge_overlap,
+            f_kT={ids[k]: float(f[k]) for k in range(K) if math.isfinite(f[k])},
         )
     except Exception as exc:  # the epoch then runs no top-up
         logging.warning("top-up union diagnostics unavailable (%s)", exc)
         return None
 ```
 
-Check the rows passed to `per_state_inefficiency` are in time order within each state: the union builder writes `sample_rows` in source order and keeps `sorted(_kept_global)` indices, so within a state rows are chronological per source. State that assumption in a comment.
-
-- [ ] **Step 4: Run tests** — expected PASS. If `test_a_state_whose_halves_disagree_is_flagged` is flaky, raise `n_per`, not the threshold.
+- [ ] **Step 4: Run tests** — expected PASS. If `test_a_warm_start_reproduces_the_cold_solution` fails on the `initial_f_k` keyword, check pymbar 4.0.3's `MBAR.__init__` signature (`python -c "import inspect, pymbar; print(inspect.signature(pymbar.MBAR.__init__))"`) and use its name for the initial free energies; do not drop the warm start.
 - [ ] **Step 5: Commit** — `git add gareus/adaptive/union_diagnostics.py tests/test_topup_union_diagnostics.py && git commit -m "feat: per-epoch union MBAR diagnostics for top-up allocation"`
 
 ---
@@ -689,37 +836,38 @@ Check the rows passed to `per_state_inefficiency` are in time order within each 
 - Test: `tests/test_topup_allocator.py`
 
 **Interfaces:**
-- Consumes: `UnionDiagnostics` (Task 5), `wall_hours` (Task 3), `same_rung_neighbours` / `other_rung_same_centre` (Task 1).
+- Consumes: `UnionDiagnostics` (Task 5: `n_k` = decorrelated count, `inefficiency` = raw samples per decorrelated sample, `sigma_kcal`, `unconverged`, `edge_overlap`), `wall_hours` (Task 3).
 - Produces:
 
 ```python
 @dataclass(frozen=True)
 class TopupPlan:
-    state_ids: tuple            # patch, sorted
-    steps: int                  # lockstep length, multiple of report_interval
-    deficit_state_ids: tuple
-    partner_state_ids: tuple
-    structural_edges: tuple     # (i, j) routed to bridge proposal
-    predicted_sigma: dict       # state_id -> sigma after the top-up
-    cost_hours: float
-    reason: str                 # "planned" | "healthy" | "no_diagnostics" | "cap_too_small"
-    sigma_before: dict          # state_id -> sigma when planned (for calibration)
+    state_ids: tuple = ()             # patch, sorted
+    steps: int = 0                    # lockstep length, multiple of report_interval
+    deficit_state_ids: tuple = ()
+    partner_state_ids: tuple = ()
+    structural_edges: tuple = ()      # (i, j) routed to the bridge/add proposal
+    weak_edges_topped: tuple = ()     # (i, j) noise-weak edges this top-up tries to fix (attempt counting)
+    predicted_sigma: dict = {}        # state_id -> sigma after the top-up
+    sigma_before: dict = {}           # state_id -> sigma when planned
+    cost_hours: float = 0.0
+    reason: str = "healthy"           # planned | healthy | no_diagnostics | cap_too_small
 
-def plan_topup(diag, *, state_ids_in_order, neighbours, rung_partners, policy,
-               steps_so_far: dict, report_interval: int, timestep_fs: float, n_gpus: int,
-               budget_hours: float, correction: dict | None = None) -> TopupPlan
+def plan_topup(diag, *, state_ids_in_order, neighbours, rung_partners, policy, report_interval: int,
+               timestep_fs: float, n_gpus: int, budget_hours: float,
+               correction: dict | None = None, edge_attempts: dict | None = None) -> TopupPlan
 ```
 
-`neighbours`: state_id → same-rung spatial neighbour state_ids; `rung_partners`: state_id → other rungs of the same centre; `steps_so_far`: state_id → steps sampled so far; `correction`: state_id → realised/predicted gain factor from earlier top-ups (default 1.0).
+`neighbours`: state_id → same-rung spatial neighbours; `rung_partners`: state_id → other rungs of the same centre; `correction`: state_id → realised/predicted gain factor (clamped to [0.1, 2.0] here, whatever is passed); `edge_attempts`: (min_id, max_id) → top-ups already spent on that weak edge.
 
-Rules (from spec 4.2–4.3):
-- deficit = `sigma > target` or in `unconverged`; NaN sigma is **not** a deficit (reason recorded) — it is an unsampled state, which is a coverage problem, not a top-up target;
-- weak edge = measured overlap `< topup_weak_overlap`; noise if either endpoint is a deficit → both endpoints join the deficit set; structural otherwise → `structural_edges`;
-- predicted σ after L extra steps: `sigma * sqrt(n_eff / (n_eff + c * L / (report_interval * g)))`, with `n_eff = steps_so_far / (report_interval * g)`, `c = correction.get(s, 1.0)`;
-- required steps for s: smallest L (rounded up to `report_interval`) with predicted σ ≤ target, capped at 4× `steps_so_far[s]`;
-- partners: for each deficit s, if no deficit in `neighbours[s]` add the neighbour with the largest σ (any rung if `neighbours[s]` is empty: fall back to the nearest listed in `rung_partners`); if no deficit among `rung_partners[s]` add the rung partner with the largest σ;
-- length: candidates = sorted distinct required steps; for each L, patch = deficits still short at L ∪ their partners; benefit = reduction of max σ over deficits (primary) + 1e-3 × reduction of Σ σ² (tie-break); pick best benefit / `wall_hours(L, |patch|, ...)`; skip any L whose cost exceeds `budget_hours`;
-- if no candidate fits the budget → `reason="cap_too_small"`, empty patch; if no deficits → `reason="healthy"`.
+Rules (spec 4.2–4.3, revision 2):
+- Decorrelated count n_k = `diag.n_k[s]`; one new decorrelated sample costs `report_interval × g_s` steps with g_s = `diag.inefficiency[s]`; current steps ≈ n_k·interval·g_s.
+- Deficit = σ > target or s ∈ `unconverged`; NaN σ or n_k = 0 is **not** a deficit (unsampled = coverage, not top-up).
+- Weak edge = measured overlap < `topup_weak_overlap`. Structural if both endpoints are adequate **or** `edge_attempts[edge] >= topup_max_edge_attempts`; otherwise noise → both sampled endpoints join the deficits and the edge goes into `weak_edges_topped`.
+- Predicted σ after L steps: σ·√(n / (n + c·L / (interval·g))). Required L for s: smallest multiple of `interval` reaching the target (an unconverged state below target: target = σ/√2, i.e. double its data), capped at 4× its current steps.
+- Partners (lockstep: the patch is fixed, only L varies): for each deficit s, if no deficit among its same-rung neighbours, add the same-rung neighbour with the largest σ (another rung's partner when it has none); if no deficit among its rung partners, add the rung partner with the largest σ. Candidates with n_k = 0 or NaN σ are never partners.
+- Length candidates: every distinct required L, plus the largest budget-feasible L (`floor(budget / wall_hours(interval, |patch|)) × interval`). For each candidate within budget: benefit = drop in max σ over deficits + 1e-3 × drop in Σσ²; score = benefit / wall_hours. Candidates with a non-finite prediction or score are skipped. Best score wins; ties keep the shorter L.
+- No deficits → `healthy`; no candidate within budget or best L < interval → `cap_too_small`; `diag is None` → `no_diagnostics`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -727,108 +875,131 @@ Rules (from spec 4.2–4.3):
 # tests/test_topup_allocator.py
 import math
 
+from gareus.adaptive.throughput import wall_hours
 from gareus.adaptive.topup_allocator import plan_topup
 from gareus.adaptive.union_diagnostics import UnionDiagnostics
 from gareus.adaptive_production import AdaptiveDecisionPolicy
 
-POL = AdaptiveDecisionPolicy(topups_enabled=True)          # target 0.10, weak 0.15, cap 0.3
-TABLE = POL.topup_throughput_table
+POL = AdaptiveDecisionPolicy(topups_enabled=True)          # target 0.10, weak 0.15, cap 0.3, 2 attempts
+IV = 500                                                   # report interval
 
 
-def _diag(sigma, edges=None, unconverged=(), g=None):
+def _diag(sigma, edges=None, unconverged=(), n=None):
     ids = tuple(sorted(sigma))
-    return UnionDiagnostics(state_ids=ids, n_k={s: 1000 for s in ids}, sigma_kcal=dict(sigma),
-                            unconverged=frozenset(unconverged),
-                            inefficiency=g or {s: 2.0 for s in ids}, edge_overlap=edges or {})
+    return UnionDiagnostics(state_ids=ids, n_k=n or {s: 100 for s in ids}, sigma_kcal=dict(sigma),
+                            unconverged=frozenset(unconverged), inefficiency={s: 2.0 for s in ids},
+                            edge_overlap=edges or {}, f_kT={})
 
 
 def _chain(n):
-    # 1D chain of centres on one rung; rung partner = the same index offset by n (second rung)
+    # n centres on one rung (0..n-1) and the same centres on a second rung (n..2n-1)
     nb = {s: [x for x in (s - 1, s + 1) if 0 <= x < n] for s in range(n)}
     nb.update({s + n: [x + n for x in (s - 1, s + 1) if 0 <= x < n] for s in range(n)})
     rp = {s: [s + n] for s in range(n)}; rp.update({s + n: [s] for s in range(n)})
     return nb, rp
 
 
-def _plan(diag, n, budget=100.0, steps=None, correction=None):
-    nb, rp = _chain(n)
-    return plan_topup(diag, state_ids_in_order=list(diag.state_ids), neighbours=nb, rung_partners=rp,
-                      policy=POL, steps_so_far=steps or {s: 100_000 for s in diag.state_ids},
-                      report_interval=500, timestep_fs=4.0, n_gpus=4, budget_hours=budget,
-                      correction=correction)
+def _plan(diag, n=4, budget=100.0, correction=None, attempts=None, nb=None, rp=None):
+    nb0, rp0 = _chain(n)
+    return plan_topup(diag, state_ids_in_order=list(diag.state_ids), neighbours=nb or nb0,
+                      rung_partners=rp or rp0, policy=POL, report_interval=IV, timestep_fs=4.0,
+                      n_gpus=4, budget_hours=budget, correction=correction, edge_attempts=attempts)
+
+
+def _one_deficit(sigma1=0.15):
+    s = {x: 0.05 for x in range(8)}; s[1] = sigma1
+    return s
 
 
 def test_no_diagnostics_means_no_topup():
     nb, rp = _chain(4)
     p = plan_topup(None, state_ids_in_order=list(range(8)), neighbours=nb, rung_partners=rp, policy=POL,
-                   steps_so_far={}, report_interval=500, timestep_fs=4.0, n_gpus=4, budget_hours=100.0)
+                   report_interval=IV, timestep_fs=4.0, n_gpus=4, budget_hours=100.0)
     assert p.reason == "no_diagnostics" and p.state_ids == ()
 
 
 def test_a_healthy_campaign_gets_no_topup():
-    p = _plan(_diag({s: 0.05 for s in range(8)}), 4)
+    p = _plan(_diag({s: 0.05 for s in range(8)}))
     assert p.reason == "healthy" and p.state_ids == () and p.steps == 0
 
 
 def test_unmeasured_edges_never_make_a_state_deficient():
-    d = _diag({s: 0.05 for s in range(8)}, edges={})       # no overlap measured at all
-    assert _plan(d, 4).reason == "healthy"
+    assert _plan(_diag({s: 0.05 for s in range(8)}, edges={})).reason == "healthy"
 
 
-def test_one_deficit_state_gets_minimal_partners_not_the_whole_layout():
-    sigma = {s: 0.05 for s in range(8)}; sigma[1] = 0.15
-    p = _plan(_diag(sigma), 4)
+def test_one_deficit_state_gets_minimal_partners_and_the_right_length():
+    p = _plan(_diag(_one_deficit()))
     assert p.reason == "planned" and p.deficit_state_ids == (1,)
-    assert set(p.state_ids) == {1} | set(p.partner_state_ids)
-    assert len(p.partner_state_ids) == 2                    # one same-rung, one other-rung
-    assert 5 in p.partner_state_ids                         # its rung partner
+    assert len(p.partner_state_ids) == 2 and 5 in p.partner_state_ids   # one same-rung, one rung partner
+    # n=100 decorrelated, g=2, sigma 0.15 -> 0.10 needs 125 more decorrelated = 125*500*2 steps
+    assert p.steps == 125_000
     assert p.predicted_sigma[1] <= POL.topup_target_sigma + 1e-9
-    assert p.steps % 500 == 0 and p.steps > 0
 
 
 def test_a_weak_edge_between_healthy_states_is_structural_not_md():
-    sigma = {s: 0.05 for s in range(8)}
-    p = _plan(_diag(sigma, edges={(1, 2): 0.02}), 4)
+    p = _plan(_diag({s: 0.05 for s in range(8)}, edges={(1, 2): 0.02}))
     assert p.structural_edges == ((1, 2),) and p.reason == "healthy"
 
 
 def test_a_weak_edge_touching_a_deficit_tops_up_both_endpoints():
-    sigma = {s: 0.05 for s in range(8)}; sigma[1] = 0.15
-    p = _plan(_diag(sigma, edges={(1, 2): 0.02}), 4)
+    p = _plan(_diag(_one_deficit(), edges={(1, 2): 0.02}))
     assert {1, 2} <= set(p.deficit_state_ids) and p.structural_edges == ()
+    assert p.weak_edges_topped == ((1, 2),)
 
 
-def test_nan_sigma_is_not_a_topup_target():
-    sigma = {s: 0.05 for s in range(8)}; sigma[3] = math.nan
-    assert _plan(_diag(sigma), 4).reason == "healthy"
+def test_an_edge_that_stayed_weak_after_max_attempts_becomes_structural():
+    p = _plan(_diag(_one_deficit(), edges={(1, 2): 0.02}), attempts={(1, 2): 2})
+    assert p.structural_edges == ((1, 2),) and 2 not in p.deficit_state_ids
 
 
-def test_a_budget_smaller_than_one_useful_segment_plans_nothing():
-    sigma = {s: 0.05 for s in range(8)}; sigma[1] = 0.15
-    p = _plan(_diag(sigma), 4, budget=1e-6)
+def test_nan_sigma_or_zero_samples_is_not_a_topup_target():
+    s = {x: 0.05 for x in range(8)}; s[3] = math.nan
+    assert _plan(_diag(s)).reason == "healthy"
+
+
+def test_a_never_sampled_state_is_never_a_partner():
+    s = _one_deficit(); s[0] = math.nan; s[2] = math.nan          # both same-rung neighbours of 1 unsampled
+    n = {x: 100 for x in range(8)}; n[0] = 0; n[2] = 0
+    p = _plan(_diag(s, n=n))
+    assert p.reason == "planned" and not ({0, 2} & set(p.partner_state_ids))
+
+
+def test_a_budget_smaller_than_one_report_interval_plans_nothing():
+    p = _plan(_diag(_one_deficit()), budget=1e-9)
     assert p.reason == "cap_too_small" and p.state_ids == () and p.steps == 0
 
 
+def test_a_moderate_budget_funds_a_partial_topup():
+    budget = wall_hours(60_000, 3, 4.0, 4, POL.topup_throughput_table)   # half of the 125k need, 3-state patch
+    p = _plan(_diag(_one_deficit()), budget=budget)
+    assert p.reason == "planned" and 0 < p.steps <= 60_000
+    assert POL.topup_target_sigma < p.predicted_sigma[1] < 0.15
+
+
 def test_a_deficit_at_the_layout_edge_still_gets_a_partner():
-    sigma = {s: 0.05 for s in range(8)}; sigma[0] = 0.15
-    nb = {0: [], 1: [0], 2: [], 3: [], 4: [], 5: [], 6: [], 7: []}   # window 0 has no same-rung neighbour
+    s = {x: 0.05 for x in range(8)}; s[0] = 0.15
+    nb = {0: [], 1: [0], 2: [], 3: [], 4: [], 5: [], 6: [], 7: []}
     rp = {0: [4], 4: [0], 1: [5], 5: [1], 2: [6], 6: [2], 3: [7], 7: [3]}
-    p = plan_topup(_diag(sigma), state_ids_in_order=list(range(8)), neighbours=nb, rung_partners=rp,
-                   policy=POL, steps_so_far={s: 100_000 for s in range(8)}, report_interval=500,
-                   timestep_fs=4.0, n_gpus=4, budget_hours=100.0)
+    p = _plan(_diag(s), nb=nb, rp=rp)
     assert p.reason == "planned" and 4 in p.partner_state_ids
 
 
 def test_uniformly_deficient_states_degenerate_to_all_states():
-    p = _plan(_diag({s: 0.30 for s in range(8)}), 4)
+    p = _plan(_diag({s: 0.15 for s in range(8)}))
     assert set(p.state_ids) == set(range(8)) and p.partner_state_ids == ()
 
 
 def test_a_state_that_underdelivered_needs_more_steps():
-    sigma = {s: 0.05 for s in range(8)}; sigma[1] = 0.15
-    normal = _plan(_diag(sigma), 4)
-    penalised = _plan(_diag(sigma), 4, correction={1: 0.5})
-    assert penalised.steps > normal.steps
+    assert _plan(_diag(_one_deficit()), correction={1: 0.5}).steps > _plan(_diag(_one_deficit())).steps
+
+
+def test_a_bad_correction_factor_is_clamped_not_propagated():
+    p = _plan(_diag(_one_deficit()), correction={1: -3.0})
+    assert p.reason == "planned" and math.isfinite(p.predicted_sigma[1]) and p.steps > 0
+
+
+def test_the_plan_is_deterministic():
+    assert _plan(_diag(_one_deficit())) == _plan(_diag(_one_deficit()))
 ```
 
 - [ ] **Step 2: Run to verify it fails** — expected `ModuleNotFoundError`.
@@ -837,16 +1008,17 @@ def test_a_state_that_underdelivered_needs_more_steps():
 
 ```python
 # gareus/adaptive/topup_allocator.py
-"""Deficit-driven, wall-hour-costed top-up plan (spec 4.2-4.3). Pure function; no I/O."""
+"""Deficit-driven, wall-hour-costed top-up plan (spec 4.2-4.3, revision 2). Pure function; no I/O."""
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from .throughput import wall_hours
 
 MAX_STEP_MULTIPLE = 4
+CORRECTION_BOUNDS = (0.1, 2.0)
 
 
 @dataclass(frozen=True)
@@ -856,105 +1028,118 @@ class TopupPlan:
     deficit_state_ids: tuple = ()
     partner_state_ids: tuple = ()
     structural_edges: tuple = ()
+    weak_edges_topped: tuple = ()
     predicted_sigma: dict = field(default_factory=dict)
+    sigma_before: dict = field(default_factory=dict)
     cost_hours: float = 0.0
     reason: str = "healthy"
-    sigma_before: dict = field(default_factory=dict)   # sigma of each patch state when planned
 
 
-def _finite(x) -> bool:
-    return x is not None and isinstance(x, (int, float)) and math.isfinite(float(x))
+def _ok(x) -> bool:
+    return isinstance(x, (int, float)) and math.isfinite(float(x))
 
 
-def _predicted(sigma, steps_so_far, extra, interval, g, c) -> float:
-    n_eff = max(1e-9, steps_so_far / (interval * g))
-    return sigma * math.sqrt(n_eff / (n_eff + c * extra / (interval * g)))
+def _clamp(c) -> float:
+    lo, hi = CORRECTION_BOUNDS
+    return min(hi, max(lo, float(c))) if _ok(c) else 1.0
 
 
-def _required_steps(sigma, target, steps_so_far, interval, g, c) -> Optional[int]:
-    if sigma <= target:
-        return 0
-    n_eff = max(1e-9, steps_so_far / (interval * g))
-    extra_eff = n_eff * ((sigma / target) ** 2 - 1.0)
-    steps = extra_eff * interval * g / max(c, 1e-9)
-    steps = int(math.ceil(steps / interval) * interval)
-    cap = MAX_STEP_MULTIPLE * max(interval, int(steps_so_far))
-    return min(steps, int(math.ceil(cap / interval) * interval))
-
-
-def _worst(sig: Dict[int, float], ids: Iterable[int]) -> float:
-    vals = [sig[s] for s in ids]
-    return max(vals) if vals else 0.0
+def _round_up(steps: float, interval: int) -> int:
+    return int(math.ceil(max(0.0, steps) / interval) * interval)
 
 
 def plan_topup(diag, *, state_ids_in_order: Sequence[int], neighbours: Dict[int, List[int]],
-               rung_partners: Dict[int, List[int]], policy, steps_so_far: Dict[int, int],
-               report_interval: int, timestep_fs: float, n_gpus: int, budget_hours: float,
-               correction: Optional[Dict[int, float]] = None) -> TopupPlan:
+               rung_partners: Dict[int, List[int]], policy, report_interval: int, timestep_fs: float,
+               n_gpus: int, budget_hours: float, correction: Optional[Dict[int, float]] = None,
+               edge_attempts: Optional[Dict[Tuple[int, int], int]] = None) -> TopupPlan:
     if diag is None:
         return TopupPlan(reason="no_diagnostics")
-    correction = correction or {}
+    interval = max(1, int(report_interval))
     target = float(policy.topup_target_sigma)
+    corr = {s: _clamp((correction or {}).get(s, 1.0)) for s in state_ids_in_order}
+    attempts = edge_attempts or {}
     sigma = {s: float(diag.sigma_kcal.get(s, math.nan)) for s in state_ids_in_order}
-    deficits = {s for s, v in sigma.items() if _finite(v) and (v > target or s in diag.unconverged)}
-    structural = []
+    n_eff = {s: int(diag.n_k.get(s, 0)) for s in state_ids_in_order}
+    g = {s: max(1.0, float(diag.inefficiency.get(s, 1.0))) for s in state_ids_in_order}
+    sampled = {s for s in state_ids_in_order if n_eff[s] > 0 and _ok(sigma[s])}
+
+    deficits = {s for s in sampled if sigma[s] > target or s in diag.unconverged}
+    structural, noise_edges = [], []
     for (a, b), ov in sorted(diag.edge_overlap.items()):
-        if not _finite(ov) or ov >= float(policy.topup_weak_overlap):
+        if not _ok(ov) or ov >= float(policy.topup_weak_overlap):
             continue
-        if a in deficits or b in deficits:
-            deficits.update(x for x in (a, b) if _finite(sigma.get(x, math.nan)))
+        tried_out = attempts.get((a, b), 0) >= int(policy.topup_max_edge_attempts)
+        if (a in deficits or b in deficits) and not tried_out:
+            deficits.update(x for x in (a, b) if x in sampled)
+            noise_edges.append((a, b))
         else:
             structural.append((a, b))
     if not deficits:
         return TopupPlan(structural_edges=tuple(structural), reason="healthy")
 
-    g = {s: max(1.0, float(diag.inefficiency.get(s, 1.0))) for s in state_ids_in_order}
-    need = {}
-    for s in deficits:
-        # an unconverged state below the sigma target still gets one doubling of its data
+    def predicted(s: int, L: int) -> float:
+        n = max(1e-9, float(n_eff[s]))
+        return sigma[s] * math.sqrt(n / (n + corr[s] * L / (interval * g[s])))
+
+    def required(s: int) -> int:
         eff_target = target if sigma[s] > target else sigma[s] / math.sqrt(2.0)
-        need[s] = _required_steps(sigma[s], eff_target, max(1, steps_so_far.get(s, 0)),
-                                  report_interval, g[s], correction.get(s, 1.0)) or report_interval
+        extra_eff = n_eff[s] * ((sigma[s] / eff_target) ** 2 - 1.0)
+        need = _round_up(extra_eff * interval * g[s] / corr[s], interval)
+        cap = _round_up(MAX_STEP_MULTIPLE * n_eff[s] * interval * g[s], interval)
+        return max(interval, min(need, cap))
 
-    def partners_for(short: set) -> set:
-        chosen: set = set()
-        for s in sorted(short):
-            same = [x for x in neighbours.get(s, []) if x in sigma]
-            rung = [x for x in rung_partners.get(s, []) if x in sigma]
-            pool = same or rung
-            if pool and not any(x in short for x in same) and not any(x in chosen for x in same):
-                chosen.add(max(pool, key=lambda x: (sigma[x] if _finite(sigma[x]) else -1.0, -x)))
-            if rung and not any(x in short or x in chosen for x in rung):
-                chosen.add(max(rung, key=lambda x: (sigma[x] if _finite(sigma[x]) else -1.0, -x)))
-        return chosen - short
+    def pick(pool: List[int]) -> int:
+        return max(pool, key=lambda x: (sigma[x], -x))
 
+    chosen: set = set()
+    for s in sorted(deficits):
+        same = [x for x in neighbours.get(s, []) if x in sampled]
+        rung = [x for x in rung_partners.get(s, []) if x in sampled]
+        if not any(x in deficits or x in chosen for x in same):
+            pool = same or [x for x in rung if x not in deficits]
+            if pool:
+                chosen.add(pick(pool))
+        if rung and not any(x in deficits or x in chosen for x in rung):
+            chosen.add(pick(rung))
+    partners = chosen - deficits
+    patch = deficits | partners
+
+    table = policy.topup_throughput_table
+    per_step_hours = wall_hours(interval, len(patch), timestep_fs, n_gpus, table) / interval
+    candidates = {required(s) for s in deficits}
+    budget_max = int(budget_hours / per_step_hours // interval) * interval if per_step_hours > 0 else 0
+    if budget_max >= interval:
+        candidates.add(budget_max)
+    worst0 = max(sigma[s] for s in deficits)
+    ssq0 = sum(sigma[s] ** 2 for s in deficits)
     best = None
-    short = set(deficits)            # lockstep: every deficit runs the chosen L; unmet need carries to the next epoch
-    partners = partners_for(short)
-    for L in sorted(set(need.values())):
-        patch = short | partners
-        cost = wall_hours(L, len(patch), timestep_fs, n_gpus, policy.topup_throughput_table)
+    for L in sorted(candidates):
+        if L < interval:
+            continue
+        cost = per_step_hours * L
         if cost > budget_hours:
             continue
-        pred = {s: _predicted(sigma[s], max(1, steps_so_far.get(s, 0)), L, report_interval, g[s],
-                              correction.get(s, 1.0)) if _finite(sigma[s]) else math.nan for s in patch}
-        benefit = (_worst(sigma, deficits) - _worst({**sigma, **pred}, deficits)) \
-            + 1e-3 * sum(sigma[s] ** 2 - pred[s] ** 2 for s in deficits)
+        pred = {s: predicted(s, L) for s in patch}
+        if not all(_ok(v) for v in pred.values()):
+            continue
+        benefit = (worst0 - max(pred[s] for s in deficits)) + 1e-3 * (ssq0 - sum(pred[s] ** 2 for s in deficits))
         score = benefit / max(cost, 1e-12)
-        if best is None or score > best[0]:
-            best = (score, L, patch, short, partners, pred, cost)
+        if not _ok(score):
+            continue
+        if best is None or score > best[0] + 1e-15:
+            best = (score, L, pred, cost)
     if best is None:
         return TopupPlan(structural_edges=tuple(structural), reason="cap_too_small")
-    _, L, patch, short, partners, pred, cost = best
-    return TopupPlan(state_ids=tuple(sorted(patch)), steps=int(L), deficit_state_ids=tuple(sorted(short)),
+    _, L, pred, cost = best
+    return TopupPlan(state_ids=tuple(sorted(patch)), steps=int(L), deficit_state_ids=tuple(sorted(deficits)),
                      partner_state_ids=tuple(sorted(partners)), structural_edges=tuple(structural),
-                     predicted_sigma=pred, cost_hours=float(cost), reason="planned",
-                     sigma_before={s: sigma[s] for s in patch})
+                     weak_edges_topped=tuple(noise_edges), predicted_sigma=pred,
+                     sigma_before={s: sigma[s] for s in patch}, cost_hours=float(cost), reason="planned")
 ```
 
-Note: in a lockstep segment every deficit runs length L, so the patch is fixed and only L varies; states needing more than L carry to the next epoch (the diagnostics then still show them deficient).
+Note: lockstep means the patch is fixed and only L varies; states needing more than the chosen L carry to the next epoch (the diagnostics then still show them deficient).
 
-- [ ] **Step 4: Run tests** — expected PASS. If `test_uniformly_deficient_states_degenerate_to_all_states` finds partners, the partner rule is adding non-deficit states when every state is a deficit; fix `partners_for`, not the test.
+- [ ] **Step 4: Run tests** — expected PASS. If `test_uniformly_deficient_states_degenerate_to_all_states` finds partners, the partner rule is adding non-deficit states when every state is a deficit; fix the rule, not the test.
 - [ ] **Step 5: Commit** — `git add gareus/adaptive/topup_allocator.py tests/test_topup_allocator.py && git commit -m "feat: deficit-driven wall-hour top-up allocator"`
 
 ---
@@ -1030,29 +1215,82 @@ Replace the body of the gate loop with `if _edge_is_measured_weak(edge, policy):
 ### Task 8: Wire diagnostics, allocator and one top-up into scheduled phases
 
 **Files:**
-- Modify: `gareus/adaptive_production.py` — `build_adaptive_epoch_schedule` (remove score distribution), `run_scheduled_adaptive_epoch` (baseline sizing, allocator call, single top-up, plan persistence, recalibration)
-- Create: `gareus/adaptive/topup_state.py` (plan and calibration persistence)
-- Test: `tests/test_topup_epoch_wiring.py`
+- Modify: `gareus/adaptive_production.py` — `build_adaptive_epoch_schedule` (remove score distribution), `run_scheduled_adaptive_epoch` (baseline sizing, allocator call, single top-up, persistence, calibration, wall-time log), new module-level `_topup_plan_for_phase` and `_seedable_patch`
+- Create: `gareus/adaptive/topup_state.py` (atomic persistence of plan and campaign top-up state)
+- Test: `tests/test_topup_epoch_wiring.py`, `tests/test_topup_state.py`
 
 **Interfaces:**
-- Consumes: `build_union_state_mbar_inputs(adaptive_dir, registry, include_epochs=True)` (existing), `union_diagnostics_from_npz` (Task 5), `plan_topup` (Task 6), `build_geometry_edges(registry, policy)` (existing, returns `(a, b, edge_type, normalized_distance)`), `spatial_neighbour_pairs` / `same_rung_neighbours` / `other_rung_same_centre` (Task 1).
-- Produces: `topup_state.save_plan(epoch_dir, plan)`, `topup_state.load_plan(epoch_dir) -> TopupPlan | None`, `topup_state.load_correction(adaptive_dir) -> dict`, `topup_state.update_correction(adaptive_dir, plan, realised_sigma: dict, sigma_before: dict) -> dict`. Files: `<epoch_dir>/topup_plan.json`, `<adaptive_dir>/topup_calibration.json`.
+- Consumes: `build_union_state_mbar_inputs(adaptive_dir, registry)` (existing; meta has `arrays_npz` and, after Task 4, `subsample_counts_per_state`), `union_diagnostics_from_npz` (Task 5), `plan_topup`/`TopupPlan` (Task 6), `wall_hours` (Task 3), `build_geometry_edges(registry, policy)` (existing; yields `(a, b, edge_type, normalized_distance)`), `spatial_neighbour_pairs`/`same_rung_neighbours`/`other_rung_same_centre` (Task 1), `load_seed_index(parent_dirs) -> dict[int, str]` and `SeedMismatchError` (Task 9).
+- Produces (`gareus/adaptive/topup_state.py`):
+  - `save_plan(epoch_dir, plan) -> Path`, `load_plan(epoch_dir) -> TopupPlan | None` (`<epoch_dir>/topup_plan.json`);
+  - `load_state(adaptive_dir) -> dict` with keys `correction` (int → float), `edge_attempts` ((int, int) → int), `f_kT` (int → float), `wall_time` (list of dicts); `save_state(adaptive_dir, state)` (`<adaptive_dir>/topup_state.json`);
+  - `update_after_topup(state, plan, realised_sigma: dict) -> dict` (returns the new state: calibration + edge attempts);
+  - all writes atomic (`<name>.tmp` + `os.replace`); JSON keys stored as strings and restored to ints/tuples; non-finite floats stored as `null` and restored as `nan`.
 
 Behaviour:
-1. `build_adaptive_epoch_schedule` gives every active state `requested_steps = default_steps`, `baseline_steps = default_steps`, `reason = "baseline"`; the score/weak-count distribution is deleted (the old allocator). Keep its signature and the schedule file format so resume keeps working.
-2. In `run_scheduled_adaptive_epoch`: if `policy.topups_enabled` is false, keep the current baseline-only path (PR #98). If true: baseline runs `default_steps * (1 - policy.topup_max_fraction)` steps (quantized to 1000); after it completes and before diagnostics, compute the plan:
-   - if `<epoch_dir>/topup_plan.json` exists (resume) → load it, do not recompute;
-   - else: `build_union_state_mbar_inputs(adaptive_dir, registry)` → `union_diagnostics_from_npz(meta["arrays_npz"], edges, kt_kcal=0.0019872041 * temperature_k)` → neighbours from `spatial_neighbour_pairs` on the registry's active states → `plan_topup(...)` with `budget_hours = wall_hours(default_steps, n_active, timestep_fs, n_gpus, table) * policy.topup_max_fraction`, `steps_so_far` from the union NPZ's per-state sample counts × `report_interval`, `correction = load_correction(adaptive_dir)`; save the plan.
-   - print one line: `top-up plan: <reason>, <n> states (<n_deficit> deficit + <n_partner> partners), <steps> steps, <cost_hours:.2f} h`;
-   - if `plan.reason == "planned"`: `run_segment(f"topup_001_{plan.steps}", plan.state_ids, plan.steps)`; then rebuild the union diagnostics and call `update_correction(adaptive_dir, plan, realised_sigma)`.
-   - write the union overlaps into the epoch diagnostics: for every edge dict in `diagnostics["edges"]`, set `edge["mbar_overlap"] = diag.edge_overlap[(min, max)]` when measured. The existing proposer already turns a measured low `mbar_overlap` into `add_rung` and a low spatial overlap into a bridge, so structural edges reach it with no new key, and rung gaps are now caught every epoch instead of only at campaign end. Save `plan.structural_edges` in `topup_plan.json` for the record.
-3. `n_gpus` = number of entries in `args.device_index` split on commas; `report_interval` = `args.report_interval`; `timestep_fs` = `args.timestep_fs`; `temperature_k` = `args.temperature_k`.
+1. `build_adaptive_epoch_schedule` gives every active state `requested_steps = baseline_steps = default_steps`, `extra_steps = 0`, `score = 0.0`, `allocation_reason = "baseline"`; the score/weak-count distribution and `_weak_edge_touch_counts` are deleted (grep first; keep any policy field another module still reads). Signature and schedule file format unchanged, so resume keeps working.
+2. In `run_scheduled_adaptive_epoch`, keep `full_steps = baseline_steps` (the un-shortened default) **before** any shortening. Top-ups off → the PR #98 path (baseline at the quantized mean requested steps). Top-ups on → the baseline runs `max(1000, quantize(full_steps × (1 − topup_max_fraction)))`.
+3. After the baseline (and its interruption check), `plan = _topup_plan_for_phase(args, epoch_dir, registry, policy, full_steps=full_steps)`:
+   - a saved plan is reused only if every `plan.state_ids` is still an active state id; otherwise print `top-up plan discarded: layout changed (<missing ids>)` and recompute;
+   - recompute: union inputs → `union_diagnostics_from_npz(meta["arrays_npz"], edges, kt_kcal=0.0019872041 × T, subsample_counts=meta.get("subsample_counts_per_state"), min_effect_kcal=policy.topup_min_effect, f_init=state["f_kT"])` → `plan_topup(..., budget_hours = policy.topup_max_fraction × wall_hours(full_steps, n_active, timestep_fs, n_gpus, table), correction=state["correction"], edge_attempts=state["edge_attempts"])`; store the new `f_kT` into the state; save plan and state;
+   - write the union overlaps into the epoch diagnostics: for each edge dict in `diagnostics["edges"]`, `edge["mbar_overlap"] = diag.edge_overlap[(min, max)]` when measured (the existing proposer turns a measured low `mbar_overlap` into `add_rung` and a low spatial overlap into a bridge, so structural edges reach it with no new key).
+4. `_seedable_patch(plan, parent_dirs)`: drop from the plan every state without an exported final State in the parent segments (`load_seed_index`), printing `top-up: <n> window(s) without a final State left out (state_ids ...)`; if no deficit state remains, the top-up is skipped (`reason="no_seed_states"`).
+5. If the (seedable) plan is `planned`: time it, `run_segment(f"topup_001_{plan.steps}", list(plan.state_ids), int(plan.steps))`, with the same interrupted-payload return as the baseline. A `SeedMismatchError` from inside the segment is caught here: print it, record `reason="seed_mismatch"` in the saved plan, and continue the epoch without the top-up (the campaign is never stopped by it).
+6. After a completed top-up: recompute the union diagnostics (no saved-plan short-circuit), `state = update_after_topup(state, plan, diag_after.sigma_kcal)`, append `{"segment", "n_states", "steps", "predicted_h": plan.cost_hours, "realised_h"}` to `state["wall_time"]`, save state.
+7. `n_gpus` = number of comma-separated entries in `args.device_index`; `report_interval` = `args.report_interval`; `timestep_fs` = `args.timestep_fs`; `T` = `args.temperature_k`.
+
+Calibration rule (`update_after_topup`): for each deficit s with finite `sigma_before > predicted`, `ratio = (before² − realised²) / (before² − predicted²)`; `c = clamp(0.7·c_old + 0.3·ratio, 0.1, 2.0)`; if `ratio < 0.5`, `c = max(0.1, 0.5·c)`. Edge attempts: every edge in `plan.weak_edges_topped` gets `+1`.
 
 - [ ] **Step 1: Write the failing tests**
 
 ```python
-# tests/test_topup_epoch_wiring.py
+# tests/test_topup_state.py
 import json
+import math
+
+from gareus.adaptive.topup_allocator import TopupPlan
+from gareus.adaptive.topup_state import load_plan, load_state, save_plan, save_state, update_after_topup
+
+
+def _plan():
+    return TopupPlan(state_ids=(3, 4), steps=5000, deficit_state_ids=(3,), partner_state_ids=(4,),
+                     weak_edges_topped=((3, 7),), predicted_sigma={3: 0.09, 4: math.nan},
+                     sigma_before={3: 0.20, 4: 0.05}, cost_hours=1.5, reason="planned")
+
+
+def test_plan_round_trips_including_int_keys_and_nan(tmp_path):
+    save_plan(tmp_path, _plan())
+    got = load_plan(tmp_path)
+    assert got.state_ids == (3, 4) and got.weak_edges_topped == ((3, 7),)
+    assert got.predicted_sigma[3] == 0.09 and math.isnan(got.predicted_sigma[4])
+    assert not list(tmp_path.glob("*.tmp"))                       # atomic write leaves no temp file
+    json.loads((tmp_path / "topup_plan.json").read_text())       # strict JSON (no bare NaN)
+
+
+def test_state_defaults_and_round_trip(tmp_path):
+    st = load_state(tmp_path)
+    assert st == {"correction": {}, "edge_attempts": {}, "f_kT": {}, "wall_time": []}
+    st["edge_attempts"][(1, 2)] = 1; st["correction"][3] = 0.7
+    save_state(tmp_path, st)
+    assert load_state(tmp_path)["edge_attempts"] == {(1, 2): 1}
+
+
+def test_underdelivery_halves_and_smooths_the_correction_and_counts_the_edge():
+    st = {"correction": {}, "edge_attempts": {}, "f_kT": {}, "wall_time": []}
+    new = update_after_topup(st, _plan(), realised_sigma={3: 0.18})
+    # ratio = (0.04-0.0324)/(0.04-0.0081) = 0.238; c = 0.7*1 + 0.3*0.238 = 0.771; halved -> 0.386
+    assert abs(new["correction"][3] - 0.386) < 0.01
+    assert new["edge_attempts"][(3, 7)] == 1
+
+
+def test_the_correction_never_leaves_its_bounds():
+    st = {"correction": {3: 0.1}, "edge_attempts": {}, "f_kT": {}, "wall_time": []}
+    new = update_after_topup(st, _plan(), realised_sigma={3: 0.20})          # no improvement at all
+    assert new["correction"][3] >= 0.1
+```
+
+```python
+# tests/test_topup_epoch_wiring.py
 from pathlib import Path
 
 import pytest
@@ -1060,8 +1298,8 @@ import pytest
 import gareus.adaptive_production as ap
 import gareus.production as prod
 from gareus.adaptive.topup_allocator import TopupPlan
-from gareus.adaptive.topup_state import load_correction, load_plan, save_plan, update_correction
 from gareus.lifecycle import _graceful_shutdown
+from gareus.topup_seeding import SeedMismatchError
 
 from test_scheduled_final_interruption import _scheduled_final_campaign
 
@@ -1071,12 +1309,29 @@ def _clear():
     _graceful_shutdown.clear(); yield; _graceful_shutdown.clear()
 
 
-def _drive(monkeypatch, args, out, plan):
+def _drive(monkeypatch, args, out, plan, *, worker=None, seedable=None):
     calls = []
-    monkeypatch.setattr(prod, "run_gareus", lambda a, d, *r, **k: calls.append((Path(d).name, int(a.gamd_production_steps))))
+
+    def _fake(a, d, *r, **k):
+        calls.append((Path(d).name, int(a.gamd_production_steps)))
+        if worker:
+            worker(Path(d).name)
+
+    monkeypatch.setattr(prod, "run_gareus", _fake)
     monkeypatch.setattr(ap, "_topup_plan_for_phase", lambda *a, **k: plan)
+    monkeypatch.setattr(ap, "_seedable_patch", seedable or (lambda plan, parents: plan))
+    monkeypatch.setattr(ap, "_after_topup_update", lambda *a, **k: None)
     ap.run_adaptive_production_auto_loop(args, out, None, None, None, None, None, None)
     return calls
+
+
+def _topups_on(tmp_path):
+    args, out = _scheduled_final_campaign(tmp_path)
+    args.adaptive_production_topups = True
+    return args, out
+
+
+PLAN = TopupPlan(state_ids=(0, 1), steps=2000, deficit_state_ids=(0,), partner_state_ids=(1,), reason="planned")
 
 
 def test_schedule_is_uniform_no_score_distribution(tmp_path):
@@ -1088,63 +1343,107 @@ def test_schedule_is_uniform_no_score_distribution(tmp_path):
 
 
 def test_topups_on_runs_a_shortened_baseline_and_exactly_one_topup(tmp_path, monkeypatch):
-    args, out = _scheduled_final_campaign(tmp_path)
-    args.adaptive_production_topups = True
-    plan = TopupPlan(state_ids=(0, 1), steps=2000, deficit_state_ids=(0,), partner_state_ids=(1,), reason="planned")
-    calls = _drive(monkeypatch, args, out, plan)
+    args, out = _topups_on(tmp_path)
+    calls = _drive(monkeypatch, args, out, PLAN)
     names = [n for n, _ in calls]
     assert names.count("baseline") == 1 and [n for n in names if n.startswith("topup_")] == ["topup_001_2000"]
 
 
+def test_the_topup_budget_uses_the_unshortened_default(tmp_path, monkeypatch):
+    args, out = _topups_on(tmp_path)
+    seen = {}
+
+    def _capture(a, epoch_dir, registry, policy, *, full_steps):
+        seen["full_steps"] = full_steps
+        return TopupPlan(reason="healthy")
+
+    monkeypatch.setattr(prod, "run_gareus", lambda a, d, *r, **k: seen.setdefault("baseline", int(a.gamd_production_steps)))
+    monkeypatch.setattr(ap, "_topup_plan_for_phase", _capture)
+    ap.run_adaptive_production_auto_loop(args, out, None, None, None, None, None, None)
+    assert seen["full_steps"] > seen["baseline"]                 # budget from full, baseline shortened
+
+
 def test_a_healthy_plan_runs_no_topup(tmp_path, monkeypatch):
-    args, out = _scheduled_final_campaign(tmp_path)
-    args.adaptive_production_topups = True
+    args, out = _topups_on(tmp_path)
     calls = _drive(monkeypatch, args, out, TopupPlan(reason="healthy"))
     assert not [n for n, _ in calls if n.startswith("topup_")]
 
 
-def test_a_saved_plan_survives_resume(tmp_path):
-    plan = TopupPlan(state_ids=(3, 4), steps=5000, deficit_state_ids=(3,), partner_state_ids=(4,),
-                     predicted_sigma={3: 0.09, 4: 0.05}, cost_hours=1.5, reason="planned")
-    save_plan(tmp_path, plan)
-    assert load_plan(tmp_path) == plan
+def test_a_seed_mismatch_ends_the_topup_not_the_campaign(tmp_path, monkeypatch):
+    args, out = _topups_on(tmp_path)
+
+    def worker(name):
+        if name.startswith("topup_"):
+            raise SeedMismatchError("state 1 seeded from the wrong window")
+
+    calls = _drive(monkeypatch, args, out, PLAN, worker=worker)
+    assert any(n.startswith("topup_") for n, _ in calls)          # it was attempted, the drive returned normally
 
 
-def test_calibration_halves_priority_after_underdelivery(tmp_path):
-    plan = TopupPlan(state_ids=(3,), steps=5000, deficit_state_ids=(3,), predicted_sigma={3: 0.09},
-                     reason="planned")
-    before = {3: 0.20}
-    corr = update_correction(tmp_path, plan, realised_sigma={3: 0.18}, sigma_before=before)
-    assert corr[3] <= 0.5 and load_correction(tmp_path)[3] == corr[3]
+def test_windows_without_a_final_state_are_left_out(tmp_path, monkeypatch):
+    args, out = _topups_on(tmp_path)
+    shrunk = TopupPlan(state_ids=(0,), steps=2000, deficit_state_ids=(0,), reason="planned")
+    calls = _drive(monkeypatch, args, out, PLAN, seedable=lambda plan, parents: shrunk)
+    assert [n for n, _ in calls if n.startswith("topup_")] == ["topup_001_2000"]
+
+
+def test_a_saved_plan_is_discarded_when_the_layout_changed(tmp_path, monkeypatch):
+    from gareus.adaptive.topup_state import save_plan
+    args, out = _topups_on(tmp_path)
+    reg = ap.WindowStateRegistry.load(Path(out) / "adaptive_production")
+    epoch_dir = Path(out) / "adaptive_production" / "final"
+    epoch_dir.mkdir(parents=True, exist_ok=True)
+    save_plan(epoch_dir, TopupPlan(state_ids=(999,), steps=1000, deficit_state_ids=(999,), reason="planned"))
+    monkeypatch.setattr(ap, "build_union_state_mbar_inputs", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no data")))
+    plan = ap._topup_plan_for_phase(args, epoch_dir, reg, ap.policy_from_args(args), full_steps=10_000)
+    assert 999 not in plan.state_ids and plan.reason == "no_diagnostics"
 ```
 
-- [ ] **Step 2: Run to verify they fail** — expected import errors (`topup_state`, `_topup_plan_for_phase`).
+- [ ] **Step 2: Run to verify they fail** — expected import errors (`topup_state`, `_topup_plan_for_phase`, `gareus.topup_seeding` if Task 9 is not in yet: implement Task 9's `SeedMismatchError`/`load_seed_index` first or temporarily stub them in `gareus/topup_seeding.py` with the Task 9 signatures).
 
 - [ ] **Step 3: Implement `gareus/adaptive/topup_state.py`**
 
 ```python
-"""Top-up plan persistence (resume-stable) and online gain calibration."""
+"""Top-up plan persistence (resume-stable) and campaign-level top-up state, written atomically."""
 from __future__ import annotations
 
 import json
 import math
+import os
 from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from .topup_allocator import TopupPlan
 
 PLAN_NAME = "topup_plan.json"
-CALIBRATION_NAME = "topup_calibration.json"
+STATE_NAME = "topup_state.json"
+CORRECTION_BOUNDS = (0.1, 2.0)
+
+
+def _clean(v):
+    return None if isinstance(v, float) and not math.isfinite(v) else v
+
+
+def _atomic_write(path: Path, obj: Any) -> Path:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2, allow_nan=False))
+    os.replace(tmp, path)
+    return path
+
+
+def _num(v) -> float:
+    return math.nan if v is None else float(v)
 
 
 def save_plan(epoch_dir, plan: TopupPlan) -> Path:
-    path = Path(epoch_dir) / PLAN_NAME
-    payload = asdict(plan)
-    payload["predicted_sigma"] = {str(k): v for k, v in plan.predicted_sigma.items()}
-    payload["sigma_before"] = {str(k): v for k, v in plan.sigma_before.items()}
-    path.write_text(json.dumps(payload, indent=2))
-    return path
+    d = asdict(plan)
+    for key in ("predicted_sigma", "sigma_before"):
+        d[key] = {str(k): _clean(float(v)) for k, v in getattr(plan, key).items()}
+    d["cost_hours"] = _clean(float(plan.cost_hours))
+    d["structural_edges"] = [list(e) for e in plan.structural_edges]
+    d["weak_edges_topped"] = [list(e) for e in plan.weak_edges_topped]
+    return _atomic_write(Path(epoch_dir) / PLAN_NAME, d)
 
 
 def load_plan(epoch_dir) -> Optional[TopupPlan]:
@@ -1152,39 +1451,61 @@ def load_plan(epoch_dir) -> Optional[TopupPlan]:
     if not path.exists():
         return None
     d = json.loads(path.read_text())
-    d["predicted_sigma"] = {int(k): float(v) for k, v in d.get("predicted_sigma", {}).items()}
-    d["sigma_before"] = {int(k): float(v) for k, v in d.get("sigma_before", {}).items()}
     for key in ("state_ids", "deficit_state_ids", "partner_state_ids"):
         d[key] = tuple(int(x) for x in d.get(key, ()))
-    d["structural_edges"] = tuple(tuple(int(x) for x in e) for e in d.get("structural_edges", ()))
+    for key in ("structural_edges", "weak_edges_topped"):
+        d[key] = tuple(tuple(int(x) for x in e) for e in d.get(key, ()))
+    for key in ("predicted_sigma", "sigma_before"):
+        d[key] = {int(k): _num(v) for k, v in d.get(key, {}).items()}
+    d["cost_hours"] = _num(d.get("cost_hours"))
     return TopupPlan(**d)
 
 
-def load_correction(adaptive_dir) -> Dict[int, float]:
-    path = Path(adaptive_dir) / CALIBRATION_NAME
+def load_state(adaptive_dir) -> Dict[str, Any]:
+    path = Path(adaptive_dir) / STATE_NAME
     if not path.exists():
-        return {}
-    return {int(k): float(v) for k, v in json.loads(path.read_text()).items()}
+        return {"correction": {}, "edge_attempts": {}, "f_kT": {}, "wall_time": []}
+    d = json.loads(path.read_text())
+    return {
+        "correction": {int(k): float(v) for k, v in d.get("correction", {}).items()},
+        "edge_attempts": {tuple(int(x) for x in k.split("-")): int(v) for k, v in d.get("edge_attempts", {}).items()},
+        "f_kT": {int(k): float(v) for k, v in d.get("f_kT", {}).items()},
+        "wall_time": list(d.get("wall_time", [])),
+    }
 
 
-def update_correction(adaptive_dir, plan: TopupPlan, realised_sigma: Dict[int, float],
-                      sigma_before: Dict[int, float]) -> Dict[int, float]:
-    """factor = realised variance reduction / predicted; < 0.5 of prediction halves priority."""
-    corr = load_correction(adaptive_dir)
+def save_state(adaptive_dir, state: Dict[str, Any]) -> Path:
+    d = {
+        "correction": {str(k): v for k, v in state["correction"].items()},
+        "edge_attempts": {f"{a}-{b}": v for (a, b), v in state["edge_attempts"].items()},
+        "f_kT": {str(k): _clean(float(v)) for k, v in state["f_kT"].items()},
+        "wall_time": state["wall_time"],
+    }
+    return _atomic_write(Path(adaptive_dir) / STATE_NAME, d)
+
+
+def update_after_topup(state: Dict[str, Any], plan: TopupPlan, realised_sigma: Dict[int, float]) -> Dict[str, Any]:
+    lo, hi = CORRECTION_BOUNDS
+    new = {"correction": dict(state["correction"]), "edge_attempts": dict(state["edge_attempts"]),
+           "f_kT": dict(state["f_kT"]), "wall_time": list(state["wall_time"])}
     for s in plan.deficit_state_ids:
-        pred, real, before = plan.predicted_sigma.get(s), realised_sigma.get(s), sigma_before.get(s)
-        if not all(isinstance(v, float) and math.isfinite(v) for v in (pred, real, before)) or before <= pred:
+        before, pred, real = plan.sigma_before.get(s), plan.predicted_sigma.get(s), realised_sigma.get(s)
+        if not all(isinstance(v, float) and math.isfinite(v) for v in (before, pred, real)) or before <= pred:
             continue
         ratio = (before ** 2 - real ** 2) / (before ** 2 - pred ** 2)
-        factor = max(0.05, min(2.0, ratio)) * corr.get(s, 1.0)
-        corr[s] = factor * 0.5 if ratio < 0.5 else factor
-    (Path(adaptive_dir) / CALIBRATION_NAME).write_text(json.dumps({str(k): v for k, v in corr.items()}, indent=2))
-    return corr
+        c = min(hi, max(lo, 0.7 * new["correction"].get(s, 1.0) + 0.3 * ratio))
+        if ratio < 0.5:
+            c = max(lo, 0.5 * c)
+        new["correction"][s] = c
+    for edge in plan.weak_edges_topped:
+        key = (int(edge[0]), int(edge[1]))
+        new["edge_attempts"][key] = new["edge_attempts"].get(key, 0) + 1
+    return new
 ```
 
 - [ ] **Step 4: Implement the wiring in `gareus/adaptive_production.py`**
 
-(a) In `build_adaptive_epoch_schedule`, replace everything after `state_rows = _state_rows_by_id(diagnostics)` with:
+(a) `build_adaptive_epoch_schedule`: replace everything after `state_rows = _state_rows_by_id(diagnostics)` with:
 
 ```python
     rows = []
@@ -1199,26 +1520,29 @@ def update_correction(adaptive_dir, plan: TopupPlan, realised_sigma: Dict[int, f
     return rows
 ```
 
-Delete `_weak_edge_touch_counts` and the now-unused allocation-score code; keep the `policy` fields (`weak_edge_bonus` etc.) only if other code reads them (grep before deleting).
-
-(b) Add a module-level helper (monkeypatched by the tests):
+(b) Module-level helpers (monkeypatched by the tests, so call them through the module globals):
 
 ```python
 def _topup_plan_for_phase(args, epoch_dir: Path, registry: "WindowStateRegistry",
-                          policy: AdaptiveDecisionPolicy, default_steps: int):
-    """Resume-stable top-up plan for this phase: read it back if saved, else compute and save."""
-    from .adaptive.topup_state import load_correction, load_plan, save_plan
-    from .adaptive.topup_allocator import plan_topup, TopupPlan
-    from .adaptive.union_diagnostics import union_diagnostics_from_npz
+                          policy: AdaptiveDecisionPolicy, *, full_steps: int):
+    """Resume-stable top-up plan for this phase (spec 4.1-4.3)."""
     from .adaptive.throughput import wall_hours
+    from .adaptive.topup_allocator import TopupPlan, plan_topup
+    from .adaptive.topup_state import load_plan, load_state, save_plan, save_state
+    from .adaptive.union_diagnostics import union_diagnostics_from_npz
     from .layout_neighbours import other_rung_same_centre, same_rung_neighbours, spatial_neighbour_pairs
 
-    saved = load_plan(epoch_dir)
-    if saved is not None:
-        return saved
-    adaptive_dir = Path(epoch_dir).parent
+    epoch_dir = Path(epoch_dir)
+    adaptive_dir = epoch_dir.parent
     active = registry.active_states()
     ids = [int(s.state_id) for s in active]
+    saved = load_plan(epoch_dir)
+    if saved is not None:
+        missing = sorted(set(saved.state_ids) - set(ids))
+        if not missing:
+            return saved
+        print(f"      top-up plan discarded: layout changed (states {missing} no longer active)")
+    state = load_state(adaptive_dir)
     c1 = [float(s.primary_center) for s in active]
     c2 = [float(s.secondary_center) if s.secondary_center is not None else 0.0 for s in active]
     lam = [float(s.gamd_lambda or 0.0) for s in active]
@@ -1226,37 +1550,82 @@ def _topup_plan_for_phase(args, epoch_dir: Path, registry: "WindowStateRegistry"
     k2 = [float(s.secondary_k or 0.0) for s in active]
     temperature = float(getattr(args, "temperature_k", 300.0) or 300.0)
     pairs = spatial_neighbour_pairs(c1, c2, lam, k1, k2, temperature)
-    nb_local = same_rung_neighbours(pairs, lam)
-    rp_local = other_rung_same_centre(c1, c2, lam)
+    nb_local, rp_local = same_rung_neighbours(pairs, lam), other_rung_same_centre(c1, c2, lam)
     neighbours = {ids[w]: [ids[x] for x in nb_local.get(w, [])] for w in range(len(ids))}
     rung_partners = {ids[w]: [ids[x] for x in rp_local.get(w, [])] for w in range(len(ids))}
     edges = [(a, b) for a, b, _t, _d in build_geometry_edges(registry, policy)]
     try:
         meta = build_union_state_mbar_inputs(adaptive_dir, registry)
-        diag = union_diagnostics_from_npz(meta["arrays_npz"], edges, kt_kcal=0.0019872041 * temperature)
+        diag = union_diagnostics_from_npz(
+            meta["arrays_npz"], edges, kt_kcal=0.0019872041 * temperature,
+            subsample_counts=meta.get("subsample_counts_per_state"),
+            min_effect_kcal=float(policy.topup_min_effect), f_init=state["f_kT"])
     except Exception as exc:
         print(f"      top-up diagnostics unavailable ({exc}); no top-up this phase")
         diag = None
     interval = int(getattr(args, "report_interval", 5000) or 5000)
     n_gpus = max(1, len(str(getattr(args, "device_index", "0")).split(",")))
     timestep = float(getattr(args, "timestep_fs", 4.0) or 4.0)
-    table = policy.topup_throughput_table
-    steps_so_far = {s: int(diag.n_k.get(s, 0)) * interval for s in ids} if diag else {}
-    budget = wall_hours(default_steps, len(ids), timestep, n_gpus, table) * float(policy.topup_max_fraction)
+    budget = float(policy.topup_max_fraction) * wall_hours(int(full_steps), len(ids), timestep, n_gpus,
+                                                           policy.topup_throughput_table)
     plan = plan_topup(diag, state_ids_in_order=ids, neighbours=neighbours, rung_partners=rung_partners,
-                      policy=policy, steps_so_far=steps_so_far, report_interval=interval,
-                      timestep_fs=timestep, n_gpus=n_gpus, budget_hours=budget,
-                      correction=load_correction(adaptive_dir))
+                      policy=policy, report_interval=interval, timestep_fs=timestep, n_gpus=n_gpus,
+                      budget_hours=budget, correction=state["correction"], edge_attempts=state["edge_attempts"])
+    if diag is not None:
+        state["f_kT"] = dict(diag.f_kT)
+        save_state(adaptive_dir, state)
     save_plan(epoch_dir, plan)
     return plan
+
+
+def _seedable_patch(plan, parent_dirs):
+    """Drop states without an exported final State; skip the top-up if no deficit remains."""
+    from dataclasses import replace
+    from .topup_seeding import load_seed_index
+    have = set(load_seed_index(parent_dirs))
+    missing = [s for s in plan.state_ids if s not in have]
+    if not missing:
+        return plan
+    print(f"      top-up: {len(missing)} window(s) without a final State left out (state_ids {missing})")
+    keep = tuple(s for s in plan.state_ids if s in have)
+    deficits = tuple(s for s in plan.deficit_state_ids if s in have)
+    if not deficits:
+        return replace(plan, state_ids=(), steps=0, deficit_state_ids=(), partner_state_ids=(), reason="no_seed_states")
+    return replace(plan, state_ids=keep, deficit_state_ids=deficits,
+                   partner_state_ids=tuple(s for s in plan.partner_state_ids if s in have))
+
+
+def _after_topup_update(args, epoch_dir: Path, registry, policy, plan, elapsed_s: float) -> None:
+    """Calibration, edge attempts and wall-time log after a completed top-up."""
+    from .adaptive.topup_state import load_state, save_state, update_after_topup
+    from .adaptive.union_diagnostics import union_diagnostics_from_npz
+    adaptive_dir = Path(epoch_dir).parent
+    state = load_state(adaptive_dir)
+    try:
+        meta = build_union_state_mbar_inputs(adaptive_dir, registry)
+        edges = [(a, b) for a, b, _t, _d in build_geometry_edges(registry, policy)]
+        diag = union_diagnostics_from_npz(meta["arrays_npz"], edges,
+                                          kt_kcal=0.0019872041 * float(getattr(args, "temperature_k", 300.0)),
+                                          subsample_counts=meta.get("subsample_counts_per_state"),
+                                          min_effect_kcal=float(policy.topup_min_effect), f_init=state["f_kT"])
+    except Exception as exc:
+        print(f"      top-up calibration skipped ({exc})")
+        diag = None
+    if diag is not None:
+        state = update_after_topup(state, plan, diag.sigma_kcal)
+        state["f_kT"] = dict(diag.f_kT)
+    state["wall_time"].append({"segment": f"{Path(epoch_dir).name}/topup_001_{plan.steps}",
+                               "n_states": len(plan.state_ids), "steps": int(plan.steps),
+                               "predicted_h": float(plan.cost_hours), "realised_h": float(elapsed_s) / 3600.0})
+    save_state(adaptive_dir, state)
 ```
 
-(c) In `run_scheduled_adaptive_epoch`: replace the `topups_enabled` block from PR #98 and the `groups` loop with:
+(c) In `run_scheduled_adaptive_epoch`: set `full_steps = baseline_steps` right after it is first computed; replace the PR #98 `topups_enabled` block and the `groups` loop with:
 
 ```python
     topups_enabled = bool(getattr(policy, "topups_enabled", False)) or _arg_bool(args, "adaptive_production_topups", False)
     if topups_enabled:
-        baseline_steps = max(1000, _quantized_extra_steps(int(baseline_steps * (1.0 - float(policy.topup_max_fraction)))))
+        baseline_steps = max(1000, _quantized_extra_steps(int(full_steps * (1.0 - float(policy.topup_max_fraction)))))
     else:
         requested = [int(r.get("requested_steps", 0) or 0) for r in schedule if int(r.get("requested_steps", 0) or 0) > 0]
         baseline_steps = max(baseline_steps, _quantized_extra_steps(int(round(sum(requested) / len(requested)))))
@@ -1266,59 +1635,77 @@ and after `run_segment("baseline", ...)` plus its interruption check:
 
 ```python
     if topups_enabled:
-        plan = _topup_plan_for_phase(args, epoch_dir, registry, policy, default_steps=baseline_steps)
+        from dataclasses import replace
+        from .adaptive.topup_state import save_plan
+        from .topup_seeding import SeedMismatchError
+        plan = _topup_plan_for_phase(args, epoch_dir, registry, policy, full_steps=full_steps)
+        if plan.reason == "planned":
+            plan = _seedable_patch(plan, [epoch_dir / "baseline"])
         print(f"      top-up plan: {plan.reason}, {len(plan.state_ids)} states "
               f"({len(plan.deficit_state_ids)} deficit + {len(plan.partner_state_ids)} partners), "
-              f"{plan.steps} steps, {plan.cost_hours:.2f} h")
+              f"{plan.steps} steps, {plan.cost_hours:.2f} h predicted")
         if plan.reason == "planned" and plan.state_ids and plan.steps > 0:
-            run_segment(f"topup_001_{plan.steps}", list(plan.state_ids), int(plan.steps))
-            if _graceful_shutdown.is_set():
-                payload = {
-                    "schema_version": "adaptive_scheduled_epoch_v1",
-                    "status": "interrupted_after_checkpoint",
-                    "epoch_dir": str(epoch_dir),
-                    "baseline_steps": int(baseline_steps),
-                    "segments": segment_summaries,
-                    "diagnostics_json": "",
-                    "schedule_csv": str(epoch_dir / "epoch_schedule.csv"),
-                }
-                write_json(epoch_dir / "scheduled_epoch_summary.json", payload)
-                return {"summary": payload, "diagnostics": {}}
+            t_start = time.monotonic()
+            try:
+                run_segment(f"topup_001_{plan.steps}", list(plan.state_ids), int(plan.steps))
+            except SeedMismatchError as exc:
+                print(f"      top-up aborted, campaign continues: {exc}")
+                save_plan(epoch_dir, replace(plan, reason="seed_mismatch"))
+            else:
+                if _graceful_shutdown.is_set():
+                    payload = {
+                        "schema_version": "adaptive_scheduled_epoch_v1",
+                        "status": "interrupted_after_checkpoint",
+                        "epoch_dir": str(epoch_dir),
+                        "baseline_steps": int(baseline_steps),
+                        "segments": segment_summaries,
+                        "diagnostics_json": "",
+                        "schedule_csv": str(epoch_dir / "epoch_schedule.csv"),
+                    }
+                    write_json(epoch_dir / "scheduled_epoch_summary.json", payload)
+                    return {"summary": payload, "diagnostics": {}}
+                _after_topup_update(args, epoch_dir, registry, policy, plan, time.monotonic() - t_start)
 ```
 
-(Same payload as the existing baseline-interruption return a few lines above; keep both explicit in this task.) After the top-up segment, recompute diagnostics with the same helper minus the saved-plan short-circuit (call `union_diagnostics_from_npz` directly), then `update_correction(adaptive_dir, plan, realised_sigma=diag_after.sigma_kcal, sigma_before=plan.sigma_before)` (`TopupPlan.sigma_before` is filled by `plan_topup` in Task 6 and persisted by `save_plan`).
-
-Remove the leftover old-path code (`groups`, `_quantized_extra_steps(... - baseline_steps)` grouping).
+Delete the leftover old-path code (`groups`, grouping by extra size). After `diagnostics = collect_segmented_epoch_diagnostics(...)`, set `edge["mbar_overlap"]` from the saved plan's diagnostics as described in behaviour 3 (load the diagnostics again with `union_diagnostics_from_npz` only if a plan was computed this call; otherwise leave the diagnostics as they are). Import `time` at module top if it is not imported.
 
 - [ ] **Step 5: Run tests**
 
-Run: `python -m pytest -q -p no:cacheprovider tests/test_topup_epoch_wiring.py tests/test_no_topups.py tests/test_scheduled_final_interruption.py tests/test_epoch_window_map_rewrite_after_drop.py tests/test_adaptive_segmented_diagnostics.py tests/test_ap_epoch0_step_fraction.py`
-Expected: PASS. Tests in `test_epoch_window_map_rewrite_after_drop.py` that construct top-up segments through the old grouping must be updated to set `adaptive_production_topups = True` and monkeypatch `_topup_plan_for_phase`; say so in the commit body.
+Run: `python -m pytest -q -p no:cacheprovider tests/test_topup_state.py tests/test_topup_epoch_wiring.py tests/test_no_topups.py tests/test_scheduled_final_interruption.py tests/test_epoch_window_map_rewrite_after_drop.py tests/test_adaptive_segmented_diagnostics.py tests/test_ap_epoch0_step_fraction.py`
+Expected: PASS. Tests in `test_epoch_window_map_rewrite_after_drop.py` that build top-up segments through the old grouping must set `adaptive_production_topups = True` and monkeypatch `_topup_plan_for_phase`/`_seedable_patch`; say so in the commit body.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add gareus/adaptive_production.py gareus/adaptive/topup_state.py gareus/adaptive/topup_allocator.py tests/
+git add gareus/adaptive_production.py gareus/adaptive/topup_state.py tests/test_topup_state.py tests/test_topup_epoch_wiring.py tests/
 git commit -m "feat: scheduled phases run at most one allocator-planned top-up; remove score allocator"
 ```
 
 ---
 
-### Task 9: Top-up seeding from the baseline's final window States
+### Task 9: Top-up seeding from the parent segment's final window States
 
 **Files:**
-- Modify: `gareus/production.py` — segment end (next to the `final_pdbs` writer, `# Save one final PDB per configuration replica.`), the fresh-path call `generate_us_starting_states_by_pulling(` in `run_gareus`, and the production replica construction that consumes `window_start_positions` / `window_start_velocities` (add per-window box).
 - Create: `gareus/topup_seeding.py`
+- Modify: `gareus/production.py` — segment end (right after the `final_pdbs` loop, `# Save one final PDB per configuration replica.`); the fresh-path block around `generate_us_starting_states_by_pulling(` in `run_gareus`; the production replica construction that consumes `window_start_positions` / `window_start_velocities` (add a per-window box)
+- Modify: `tests/pep_gamd_fixture.py` (add `build_small_simulation`, below)
 - Test: `tests/test_topup_seeding.py`
 
 **Interfaces:**
-- Produces: `export_final_window_states(out_dir, sims, assignments, state_id_of_window, cv_of_replica) -> Path` writing `<out_dir>/final_window_states/state_<sid>.xml` (OpenMM `XmlSerializer` State with positions, velocities, box) and `index.json` (`{sid: {"window": w, "cv1": x, "cv2": y}}`).
-- Produces: `load_seed_states(parent_dirs, state_ids) -> dict[int, SeedState]` with `SeedState(positions, velocities, box, cv1, cv2, source)`; missing states are absent from the dict.
-- Produces: `assert_seed_matches(seed: SeedState, cv1_now: float, cv2_now: float, tol: float = 1e-4) -> None` raising `SeedMismatchError`.
+- Produces: `export_final_window_states(out_dir, sims, assignments, state_id_of_window: dict, cv_of_replica) -> Path` — writes `<out_dir>/final_window_states/state_<sid>.xml` (OpenMM `XmlSerializer` State: positions, velocities, box) and `index.json` (`{sid: {"window": w, "cv1": x, "cv2": y}}`).
+- Produces: `load_seed_index(parent_dirs) -> dict[int, str]` (state_id → parent dir holding its State; later parents win; reads `index.json` only, no XML parsing — used by the driver's `_seedable_patch`, Task 8).
+- Produces: `load_seed_states(parent_dirs, state_ids) -> dict[int, SeedState]` with `SeedState(positions, velocities, box, cv1, cv2, source)`.
+- Produces: `assert_seed_matches(seed, cv1_now, cv2_now, tol=1e-3)` raising `SeedMismatchError(RuntimeError)`.
 
-Behaviour in `run_gareus` fresh path, when `args._adaptive_phase_info["is_topup"]` is true: parent dirs = the same phase's `baseline/` (sibling of this segment dir) then earlier top-ups; for windows with a seed state, set `window_start_positions[w]`, `window_start_velocities[w]`, and a new `window_start_boxes[w]`; call `generate_us_starting_states_by_pulling` only for the windows without one (warning listing their state_ids); if every window has a seed state, skip the pull entirely. After replica construction and `set_window`, evaluate each replica's CV (use the CV evaluation already used for sample logging in `run_gareus`) and call `assert_seed_matches`; on mismatch raise (aborts the top-up; the driver's interruption handling keeps the campaign resumable).
+Behaviour in `run_gareus`, fresh path, when `(getattr(args, "_adaptive_phase_info", {}) or {}).get("is_topup")`:
+- parent dirs = `[out_dir.parent / "baseline", *sorted(out_dir.parent.glob("topup_*"))]` minus `out_dir`; window → state_id from this segment's `epoch_window_map.csv` (read with `_read_csv_dicts`; identity when absent);
+- every window must have a seed State (the driver removed the others, Task 8); if one is missing anyway, raise `SeedMismatchError` naming it (the driver ends the top-up, the campaign continues);
+- set `window_start_positions[w]`, `window_start_velocities[w]`, `window_start_boxes[w]` from the seeds and **skip `generate_us_starting_states_by_pulling` entirely** (no pull inside a top-up);
+- after the production replicas are built and `set_window` applied, for each window evaluate CV1/CV2 on its context (the same evaluation the sample logger uses) and call `assert_seed_matches`; a mismatch raises out of `run_gareus` (same handling).
 
-- [ ] **Step 1: Write the failing tests** (pure part; the OpenMM part uses the Reference platform fixture)
+Export at the end of every segment: `state_id_of_window` from the segment's `epoch_window_map.csv` (identity when absent); `cv_of_replica(r)` evaluates CV1/CV2 on `sims[r].context` with the sample logger's function (find it: `grep -n "cv_A" gareus/production.py | head`; reuse it, do not reimplement). The export uses the live in-memory `assignments` (authoritative for which window each replica holds), not the checkpoint manifest.
+
+- [ ] **Step 1: Write the failing tests**
 
 ```python
 # tests/test_topup_seeding.py
@@ -1326,7 +1713,9 @@ import json
 
 import pytest
 
-from gareus.topup_seeding import SeedMismatchError, SeedState, assert_seed_matches, load_seed_states
+from gareus.topup_seeding import (
+    SeedMismatchError, SeedState, assert_seed_matches, load_seed_index, load_seed_states,
+)
 
 
 def _fake_export(d, sid, cv1, cv2, xml="<State/>"):
@@ -1338,43 +1727,62 @@ def _fake_export(d, sid, cv1, cv2, xml="<State/>"):
     idx.write_text(json.dumps(data))
 
 
-def test_loads_only_the_states_it_has_and_prefers_the_latest_parent(tmp_path, monkeypatch):
-    import gareus.topup_seeding as ts
-    monkeypatch.setattr(ts, "_deserialize_state", lambda text: ("pos", "vel", "box"))
+def test_the_index_names_the_latest_parent_per_state(tmp_path):
     base, top = tmp_path / "baseline", tmp_path / "topup_001_1000"
     _fake_export(base, 3, 0.1, 0.2); _fake_export(base, 4, 0.3, 0.4); _fake_export(top, 3, 0.5, 0.6)
-    got = load_seed_states([base, top], [3, 4, 9])
-    assert set(got) == {3, 4}
-    assert got[3].cv1 == 0.5 and got[3].source.endswith("topup_001_1000")
+    idx = load_seed_index([base, top])
+    assert idx == {3: str(top), 4: str(base)}
+    assert load_seed_index([tmp_path / "nothing"]) == {}
+
+
+def test_loads_only_the_states_it_has(tmp_path, monkeypatch):
+    import gareus.topup_seeding as ts
+    monkeypatch.setattr(ts, "_deserialize_state", lambda text: ("pos", "vel", "box"))
+    base = tmp_path / "baseline"
+    _fake_export(base, 3, 0.1, 0.2)
+    got = load_seed_states([base], [3, 9])
+    assert set(got) == {3} and got[3].cv1 == 0.1
 
 
 def test_assertion_accepts_a_matching_frame_and_rejects_a_swapped_one():
     seed = SeedState(positions=None, velocities=None, box=None, cv1=0.40, cv2=-0.25, source="x")
-    assert_seed_matches(seed, 0.40, -0.25)
-    with pytest.raises(SeedMismatchError, match="state"):
+    assert_seed_matches(seed, 0.4004, -0.2496)
+    with pytest.raises(SeedMismatchError, match="does not reproduce"):
         assert_seed_matches(seed, 0.47, -0.25)
 
 
 def test_export_and_reload_round_trip_on_the_reference_platform(tmp_path):
     pytest.importorskip("openmm")
-    from pep_gamd_fixture import build_small_system  # tests/pep_gamd_fixture.py
+    from pep_gamd_fixture import build_small_simulation
     from gareus.topup_seeding import export_final_window_states
-    sim = build_small_system(platform="Reference")
+    sim = build_small_simulation(platform="Reference")
     export_final_window_states(tmp_path, [sim], assignments=[0], state_id_of_window={0: 7},
                                cv_of_replica=lambda r: (0.11, 0.22))
     seed = load_seed_states([tmp_path], [7])[7]
     st = sim.context.getState(getPositions=True, getVelocities=True)
     assert seed.cv1 == 0.11 and len(seed.positions) == len(st.getPositions())
+    assert seed.box is not None
 ```
 
-If `tests/pep_gamd_fixture.py` has no `build_small_system`, add a thin wrapper there that returns an `app.Simulation` on the GA dipeptide system it already builds (read the fixture first; reuse its builder, do not duplicate the system setup).
+Append to `tests/pep_gamd_fixture.py` (reuses the cached GA-dipeptide system):
+
+```python
+def build_small_simulation(platform="Reference"):
+    """An app.Simulation on a fresh copy of the cached GA dipeptide in TIP3P, velocities set."""
+    openmm, app, unit, topology, system, positions = tiny_solvated_system()
+    integ = openmm.LangevinMiddleIntegrator(300 * unit.kelvin, 1.0 / unit.picosecond, 0.002 * unit.picoseconds)
+    sim = app.Simulation(topology, system, integ, openmm.Platform.getPlatformByName(platform))
+    sim.context.setPositions(positions)
+    sim.context.setVelocitiesToTemperature(300 * unit.kelvin, 1)
+    return sim
+```
 
 - [ ] **Step 2: Run to verify they fail** — expected `ModuleNotFoundError: gareus.topup_seeding`.
 
 - [ ] **Step 3: Implement `gareus/topup_seeding.py`**
 
 ```python
-"""Continue each top-up window's chain from its parent segment's final State (spec 4.4)."""
+"""Continue each top-up window's chain from its parent segment's final State (spec 4.4, revision 2)."""
 from __future__ import annotations
 
 import json
@@ -1419,44 +1827,48 @@ def export_final_window_states(out_dir, sims: Sequence, assignments: Sequence[in
         (d / f"state_{sid}.xml").write_text(XmlSerializer.serialize(st))
         cv1, cv2 = cv_of_replica(r)
         index[str(sid)] = {"window": w, "cv1": float(cv1), "cv2": float(cv2)}
-    (d / "index.json").write_text(json.dumps(index, indent=2))
+    tmp = d / "index.json.tmp"
+    tmp.write_text(json.dumps(index, indent=2))
+    tmp.replace(d / "index.json")
     return d
 
 
-def load_seed_states(parent_dirs: Iterable, state_ids: Iterable[int]) -> Dict[int, SeedState]:
-    wanted = {int(s) for s in state_ids}
-    out: Dict[int, SeedState] = {}
+def load_seed_index(parent_dirs: Iterable) -> Dict[int, str]:
+    out: Dict[int, str] = {}
     for parent in parent_dirs:                       # later parents override earlier ones
-        d = Path(parent) / DIR_NAME
-        idx_path = d / "index.json"
-        if not idx_path.exists():
+        idx = Path(parent) / DIR_NAME / "index.json"
+        if not idx.exists():
             continue
-        index = json.loads(idx_path.read_text())
-        for key, rec in index.items():
-            sid = int(key)
-            xml = d / f"state_{sid}.xml"
-            if sid not in wanted or not xml.exists():
-                continue
-            pos, vel, box = _deserialize_state(xml.read_text())
-            out[sid] = SeedState(pos, vel, box, float(rec["cv1"]), float(rec["cv2"]), str(parent))
+        for key in json.loads(idx.read_text()):
+            if (Path(parent) / DIR_NAME / f"state_{int(key)}.xml").exists():
+                out[int(key)] = str(parent)
     return out
 
 
-def assert_seed_matches(seed: SeedState, cv1_now: float, cv2_now: float, tol: float = 1e-4) -> None:
+def load_seed_states(parent_dirs: Iterable, state_ids: Iterable[int]) -> Dict[int, SeedState]:
+    parents = list(parent_dirs)
+    where = load_seed_index(parents)
+    out: Dict[int, SeedState] = {}
+    for sid in state_ids:
+        parent = where.get(int(sid))
+        if parent is None:
+            continue
+        d = Path(parent) / DIR_NAME
+        rec = json.loads((d / "index.json").read_text())[str(int(sid))]
+        pos, vel, box = _deserialize_state((d / f"state_{int(sid)}.xml").read_text())
+        out[int(sid)] = SeedState(pos, vel, box, float(rec["cv1"]), float(rec["cv2"]), str(parent))
+    return out
+
+
+def assert_seed_matches(seed: SeedState, cv1_now: float, cv2_now: float, tol: float = 1e-3) -> None:
     if abs(cv1_now - seed.cv1) > tol or abs(cv2_now - seed.cv2) > tol:
         raise SeedMismatchError(
             f"seeded state from {seed.source} does not reproduce its recorded CVs "
-            f"(cv1 {cv1_now:.6f} vs {seed.cv1:.6f}, cv2 {cv2_now:.6f} vs {seed.cv2:.6f}): "
-            "the parent manifest's window assignment is out of step with its final frames")
+            f"(cv1 {cv1_now:.6f} vs {seed.cv1:.6f}, cv2 {cv2_now:.6f} vs {seed.cv2:.6f})")
 ```
 
-- [ ] **Step 4: Wire into `production.py`**
-  - Export: immediately after the `final_pdbs` loop, call `export_final_window_states(out_dir, sims, assignments, state_id_of_window, cv_of_replica)`; `state_id_of_window` comes from this segment's `epoch_window_map.csv` (read with `_read_csv_dicts`; identity map when absent); `cv_of_replica` evaluates CV1/CV2 on `sims[r].context` with the same function the sample logger uses (find it: `grep -n "cv_A" gareus/production.py | head` near the per-step logging; reuse, do not reimplement).
-  - Seeding: in the fresh path just before `generate_us_starting_states_by_pulling(`, when `(getattr(args, "_adaptive_phase_info", {}) or {}).get("is_topup")`: load seeds from `[out_dir.parent / "baseline", *sorted(out_dir.parent.glob("topup_*"))]` excluding `out_dir`; build the window→state_id map from this segment's `epoch_window_map.csv`; fill `window_start_positions/velocities/boxes`; pull only the missing windows (pass the reduced window list to the existing call, then merge); print `top-up seeding: <n> windows continued from <source>, <m> pulled (state_ids ...)`.
-  - Box: in the production replica construction that uses `window_start_positions[i]`, add `box = window_start_boxes[i] if window_start_boxes and window_start_boxes[i] is not None else equil_box` and use it in `setPeriodicBoxVectors`. Default `window_start_boxes = [None] * nrep` wherever `window_start_positions` is initialised.
-  - Assertion: after the production replicas are built and `set_window` applied, for each seeded window call `assert_seed_matches(seed, *cv_of_replica(r))`.
-
-- [ ] **Step 5: Run tests** — `tests/test_topup_seeding.py tests/test_pep_gamd_wiring.py tests/test_resume_round_trip.py`; expected PASS (the Reference round-trip may be skipped where OpenMM is absent; it must run locally).
+- [ ] **Step 4: Wire into `production.py`** as described under Behaviour: export after the `final_pdbs` loop; in the fresh path, when `is_topup`, fill `window_start_positions/velocities/boxes` from `load_seed_states(...)` and skip the pull call; default `window_start_boxes = [None] * nrep` wherever `window_start_positions` is initialised; in the production replica construction use `box = window_start_boxes[i] if window_start_boxes and window_start_boxes[i] is not None else equil_box` for `setPeriodicBoxVectors`; after replicas are built and `set_window` applied, `assert_seed_matches(seed, *cv_of_replica(r))` per seeded window.
+- [ ] **Step 5: Run tests** — `tests/test_topup_seeding.py tests/test_pep_gamd_wiring.py tests/test_resume_round_trip.py`; expected PASS (the Reference round-trip must run locally).
 - [ ] **Step 6: Commit** — `git add gareus/topup_seeding.py gareus/production.py tests/ && git commit -m "feat: top-ups continue each window from the parent segment's final State"`
 
 ---
@@ -1476,7 +1888,7 @@ Model (spec 6.1):
 - windows on the landscape's default 2D ladder × rungs λ ∈ {0, 1/3, 2/3, 1}; the boost is a λ-scaled flattening `dV = λ * a * max(0, E_ref - F(x))` with `a = 0.5`, `E_ref` = 60th percentile of F on the grid, so rung states at one centre are distinct Hamiltonians; samples are drawn from the window's biased+boosted density; reduced potentials in every state = umbrella bias + boost term of that state (closed form);
 - τ per window from `tau_int` (existing landscape steepness) × `2 / max(1, n_partners)` where `n_partners` = the window's exchange partners present in its segment;
 - a segment samples all its windows for the same length; the number of decorrelated samples per window = length / (interval · (1 + 2τ)); wall time is charged with `wall_hours` and the same throughput table the allocator uses;
-- the pooled samples are written in the union NPZ format and solved with `union_diagnostics_from_npz` (real production code path);
+- the pooled samples are thinned to decorrelated ones per window and written in the union NPZ format, then solved with `union_diagnostics_from_npz` (real production code path), passing `subsample_counts={str(state): {"raw": n_raw, "t0": 0, "kept": n_kept, "g": 1 + 2*tau, "status": "subsampled"}}` from the harness's own mixing model;
 - arm A: uniform baseline only for the whole budget; arm B: per epoch, baseline at (1 − cap) then `plan_topup` with the same budget;
 - 3 epochs per campaign; equal modelled wall-hours per arm (arm A absorbs arm B's unused top-up hours into its baseline).
 
