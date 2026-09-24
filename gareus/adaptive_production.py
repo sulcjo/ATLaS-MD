@@ -6388,6 +6388,16 @@ def run_scheduled_adaptive_epoch(
         raise RuntimeError("adaptive allocation schedule selected no states")
     baseline_steps = min(int(r.get("baseline_steps", 0) or 0) for r in schedule if int(r.get("requested_steps", 0) or 0) > 0)
     baseline_steps = max(1, baseline_steps)
+    topups_enabled = _arg_bool(args, "adaptive_production_topups", True)
+    if not topups_enabled:
+        # Baseline only: it carries the phase's whole per-state budget, so the MD
+        # the allocator meant for the phase is spent uniformly over every state
+        # (and a resumed baseline simply continues from its checkpoint).
+        requested = [int(r.get("requested_steps", 0) or 0) for r in schedule
+                     if int(r.get("requested_steps", 0) or 0) > 0]
+        uniform = _quantized_extra_steps(int(round(sum(requested) / len(requested))))
+        baseline_steps = max(baseline_steps, uniform)
+        print(f"      top-ups disabled (--no-ap-topups): all-state baseline runs {baseline_steps} steps/state")
     segment_summaries: List[Dict[str, Any]] = []
     resume_requested = _arg_bool(args, "adaptive_production_resume", False)
     _seg_call_counter: List[int] = [0]
@@ -6645,7 +6655,7 @@ def run_scheduled_adaptive_epoch(
         write_json(epoch_dir / "scheduled_epoch_summary.json", payload)
         return {"summary": payload, "diagnostics": {}}
     groups: Dict[int, List[int]] = {}
-    for row in schedule:
+    for row in (schedule if topups_enabled else ()):
         extra = _quantized_extra_steps(int(row.get("requested_steps", 0) or 0) - baseline_steps)
         if extra <= 0:
             continue
