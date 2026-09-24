@@ -11,11 +11,14 @@ The project follows semantic-style release numbering where practical. Research-m
 - **Thermodynamic energy decomposition in `gareus-analyze`.** ΔH / −TΔS decomposition of the reweighted ensemble (`gareus/mbar_analysis/thermo*.py`).
 - **Shared contact-sum CV force.** When CV2 is `residual-torsion-pc` over a contact CV1, the CV1 umbrella rides on CV2's existing contact sub-CV instead of a second private copy (+14.6 % node ns/day at 236 MPS contexts). Bias energy and forces are identical to the split layout; resumed runs rebuild the layout they recorded.
 - **`--us-pull-device-index`** lets the umbrella pull use every GPU on the node.
+- **2D window map** on the dashboard (WINDOWS view, and PROGRESS when there is room): the (CV1, CV2) layout as a grid, one status glyph per λ rung, unrestrained windows in their own row.
 - **`-V` / `--version`** on `gareus`, `gareus-analyze`, `gareus-energy-decompose`, `gareus-suggest-cvs`, `gareus-consolidate-traj`, `gareus-test-run` and `gareus_monitor.py`.
 
 ### Changed
 
 - **User-facing name is ATLaS-MD everywhere.** Help (`-h`, `-hh`), the live dashboard, the monitor, console messages, report headings and plot titles no longer say "GaREUS"/"GAREUS". The `-h`/`-hh` titles, the dashboard status line, the monitor title and the run/PMF/CV-suggestion/integration-test report headings carry the version (`ATLaS-MD v0.8.3`), built from one place (`gareus.branding`). Command names, the `gareus` Python package, on-disk artifact names (`gareus_metadata.json`, ...) and `GAREUS_*` environment variables are unchanged, so existing scripts, configs and runs keep working.
+- **Dashboard colour on by default.** `--color auto` now enables colour for `--tui-mode dashboard` even when stdout is a log file (SLURM logs previously carried no colour at all); `--color never` or `NO_COLOR=1` turns it off. The startup wordmark is redrawn as solid 5x7 block letters.
+- **Dashboard window ranking on 2D layouts** compares spatial neighbours (nearest windows on the same λ rung, in restraint-width units) and flags a window only when its best neighbour overlap is dead. The flat `(w, w+1)` pairing it replaces compared windows in different cells or rungs and flagged 78 of 236 windows on a chignolin_9-shaped layout. Dashboard warnings only; sampling and analysis are unaffected. 1D ladders are unchanged.
 
 ### Correctness
 
