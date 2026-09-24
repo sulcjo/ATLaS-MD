@@ -12,6 +12,7 @@ from typing import Sequence
 from ..tui import _weighted_panel_widths, dashboard_row_gap
 from ..tui_screen import Row
 from .context import DashboardContext
+from .grid2d import window_grid_panel
 from .panels import (
     cv_map_panel,
     pe_map_panel,
@@ -20,7 +21,7 @@ from .panels import (
     window_detail_panel,
     window_table_panel,
 )
-from .ranking import OK, WindowStatus, rank_windows
+from .ranking import OK, WindowStatus, rank_windows_for
 
 CV_WEIGHT = 2.4
 PE_WEIGHT = 0.9
@@ -43,14 +44,15 @@ def _map_bar_widths(ctx: DashboardContext) -> tuple[int, int]:
 
 
 def build(ctx: DashboardContext) -> tuple[Row, ...]:
-    statuses = rank_windows(
-        n_windows=ctx.n_windows, centers_a=ctx.centers_a, k_list=ctx.k_list,
-        acceptance_by_window=ctx.acceptance_windows, overlap_by_pair=ctx.overlap_pairs,
-        delta_by_window=ctx.deltas, temperature_k=ctx.temperature_k,
-    )
+    statuses = rank_windows_for(ctx)
     cv_bar_w, pe_bar_w = _map_bar_widths(ctx)
+    # 2D runs only: the (CV1, CV2) layout map sits right under the ranked table
+    # it colours, so a flagged row can be located in CV space at a glance.
+    grid = window_grid_panel(ctx, statuses)
+    grid_rows = (Row(panels=(grid,)),) if grid is not None else ()
     return (
         Row(panels=(window_table_panel(ctx, statuses),)),
+        *grid_rows,
         Row(panels=(cv_map_panel(ctx, cv_bar_w), pe_map_panel(ctx, pe_bar_w))),
         Row(panels=(window_detail_panel(ctx, select_window(ctx, statuses)),)),
         # I3: `pull_panel`/`replica_table_panel` (gareus/dashboard/panels.py) had

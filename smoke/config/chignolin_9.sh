@@ -86,7 +86,7 @@ function has_any_progress {
 
 function request_graceful_stop {
     STOP_REQUESTED=1
-    echo "[gareus] Stop signal for ${PEPTIDE}; forwarding SIGTERM so GAREUS writes a checkpoint."
+    echo "[ATLaS-MD] Stop signal for ${PEPTIDE}; forwarding SIGTERM so ATLaS-MD writes a checkpoint."
     if [[ -n "${GAREUS_PID:-}" ]] && kill -0 "${GAREUS_PID}" 2>/dev/null; then
         kill -TERM "${GAREUS_PID}" 2>/dev/null || true
     fi
@@ -103,29 +103,29 @@ function cleanup {
     fi
     rm -rf "${CUDA_MPS_PIPE_DIRECTORY:-}" "${CUDA_MPS_LOG_DIRECTORY:-}" "${CUDA_CACHE_PATH:-}" 2>/dev/null || true
     if pool_is_spent; then
-        echo "[gareus] MD pool spent for ${PEPTIDE}; chain ends."
+        echo "[ATLaS-MD] MD pool spent for ${PEPTIDE}; chain ends."
         chain_marker "DONE: md pool spent"
         return
     fi
     if driver_is_complete; then
-        echo "[gareus] Adaptive-production driver reports status=completed for ${PEPTIDE}; chain ends."
+        echo "[ATLaS-MD] Adaptive-production driver reports status=completed for ${PEPTIDE}; chain ends."
         chain_marker "DONE: driver status=completed"
         return
     fi
     if [[ "${exit_code}" -ne 0 && "${STOP_REQUESTED:-0}" != "1" ]]; then
-        echo "[gareus] ${PEPTIDE} exited with code ${exit_code} unexpectedly; no resubmission."
+        echo "[ATLaS-MD] ${PEPTIDE} exited with code ${exit_code} unexpectedly; no resubmission."
         chain_marker "FAILED: exit code ${exit_code}, chain stopped -- inspect logs"
         return
     fi
     local n="${resubmit_count:-0}"
     if (( n >= MAX_RESUBMITS )); then
-        echo "[gareus] resubmit cap ${MAX_RESUBMITS} reached; chain ends. Pool not spent -- inspect before continuing."
+        echo "[ATLaS-MD] resubmit cap ${MAX_RESUBMITS} reached; chain ends. Pool not spent -- inspect before continuing."
         chain_marker "STOPPED: resubmit cap ${MAX_RESUBMITS} reached, pool NOT spent"
         return
     fi
-    echo "[gareus] Resubmitting ${PEPTIDE} with --resume (count $((n+1)) of ${MAX_RESUBMITS})."
+    echo "[ATLaS-MD] Resubmitting ${PEPTIDE} with --resume (count $((n+1)) of ${MAX_RESUBMITS})."
     if ! sbatch --export=ALL,job_restarted=1,resubmit_count=$((n+1)) "${RUN_SCRIPT}"; then
-        echo "[gareus] ERROR: sbatch resubmission failed for ${PEPTIDE}."
+        echo "[ATLaS-MD] ERROR: sbatch resubmission failed for ${PEPTIDE}."
         chain_marker "FAILED: sbatch resubmission rejected"
         exit 92
     fi
@@ -143,17 +143,17 @@ d = yaml.safe_load(open(sys.argv[1])) or {}
 print((d.get("starting_structures") or {}).get("seed_conformers_dir", ""))
 PYSEED
 )"
-[[ -n "${GENPEPT_DIR}" ]] || { echo "[gareus] ERROR: starting_structures.seed_conformers_dir is not set in ${CONFIG}."; exit 90; }
+[[ -n "${GENPEPT_DIR}" ]] || { echo "[ATLaS-MD] ERROR: starting_structures.seed_conformers_dir is not set in ${CONFIG}."; exit 90; }
 [[ -s "${GENPEPT_DIR}/final_survivor_seeds.csv" ]] || {
-    echo "[gareus] ERROR: no GENPEPT library at ${GENPEPT_DIR} (need final_survivor_seeds.csv)."
-    echo "[gareus]        Epoch 0 grafts every swarm member from it; it cannot start without one."
+    echo "[ATLaS-MD] ERROR: no GENPEPT library at ${GENPEPT_DIR} (need final_survivor_seeds.csv)."
+    echo "[ATLaS-MD]        Epoch 0 grafts every swarm member from it; it cannot start without one."
     exit 90
 }
-echo "[gareus] preflight OK: GENPEPT library ${GENPEPT_DIR}"
+echo "[ATLaS-MD] preflight OK: GENPEPT library ${GENPEPT_DIR}"
 if [[ -f "${OUT_DIR}/swarm/analysis/epoch0_complete.json" ]]; then
-    echo "[gareus] epoch 0 already complete; resuming at the ladder it designed."
+    echo "[ATLaS-MD] epoch 0 already complete; resuming at the ladder it designed."
 elif [[ -d "${OUT_DIR}/swarm" ]]; then
-    echo "[gareus] epoch 0 in progress; finished members will be skipped."
+    echo "[ATLaS-MD] epoch 0 in progress; finished members will be skipped."
 fi
 
 # --- environment ---
@@ -183,28 +183,28 @@ mkdir -p "${CUDA_MPS_PIPE_DIRECTORY}" "${CUDA_MPS_LOG_DIRECTORY}"
 # limit; the CUDA driver only raises it to 4096, and MPS clients cost ~18 fds each).
 # Raise it before the MPS daemon (which inherits it) and before python.
 ulimit -n 65536
-echo "[gareus] nofile soft/hard: $(ulimit -Sn)/$(ulimit -Hn)"
+echo "[ATLaS-MD] nofile soft/hard: $(ulimit -Sn)/$(ulimit -Hn)"
 
 # MPS ON for this campaign (2026-09-22 decision): 236 states = 59 contexts/GPU, under
 # the ~60/GPU MPS client ceiling measured on chignolin_8 (c8_ctxtest3 job 2563506).
-echo "[gareus] starting CUDA MPS control daemon"
+echo "[ATLaS-MD] starting CUDA MPS control daemon"
 nvidia-cuda-mps-control -d
 sleep 2
 MPS_STARTED=1
 
 nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv,noheader || true
-echo "[gareus] code commit: $(cat ${CODE_DIR}/DEPLOYED_COMMIT)  host: $(hostname)  job: ${SLURM_JOB_ID}"
+echo "[ATLaS-MD] code commit: $(cat ${CODE_DIR}/DEPLOYED_COMMIT)  host: $(hostname)  job: ${SLURM_JOB_ID}"
 
 # --- resume: filesystem-based ---
 if has_any_progress; then
     RESUME_FLAG="--resume"
-    echo "[gareus] Existing output at ${OUT_DIR}; resuming ${PEPTIDE}."
+    echo "[ATLaS-MD] Existing output at ${OUT_DIR}; resuming ${PEPTIDE}."
 elif [[ "${job_restarted:-0}" == "1" ]]; then
-    echo "[gareus] ERROR: job_restarted=1 but no output at ${OUT_DIR}; refusing fresh restart."
+    echo "[ATLaS-MD] ERROR: job_restarted=1 but no output at ${OUT_DIR}; refusing fresh restart."
     exit 90
 else
     RESUME_FLAG=""
-    echo "[gareus] No prior output; starting ${PEPTIDE} from scratch."
+    echo "[ATLaS-MD] No prior output; starting ${PEPTIDE} from scratch."
 fi
 
 # --cuda-disable-pme-stream true: measured under MPS at 236 contexts (59/GPU), real

@@ -170,3 +170,18 @@ def test_golden_frame_matches_the_committed_snapshot(view):
         golden.write_text(actual)
     assert golden.is_file(), f"missing golden file; regenerate with GAREUS_UPDATE_GOLDEN=1"
     assert actual == golden.read_text()
+
+
+def test_golden_2d_windows_frame_shows_the_window_map():
+    """The 2D WINDOWS view carries the (CV1, CV2) window map; snapshot it too."""
+    import pathlib
+    import tempfile
+    golden = pathlib.Path(__file__).parent / "golden" / "dashboard" / "windows_2d_140x45.txt"
+    run_dir = pathlib.Path(tempfile.gettempdir()) / "gareus_dashboard_golden_fixture"
+    actual = _normalize_clock(strip_ansi(render_screen(
+        _ctx(run_dir, 140, 45, "windows", is_2d=True))))
+    assert "2D window map" in actual
+    if os.environ.get("GAREUS_UPDATE_GOLDEN") == "1":
+        golden.write_text(actual)
+    assert golden.is_file(), "missing golden file; regenerate with GAREUS_UPDATE_GOLDEN=1"
+    assert actual == golden.read_text()

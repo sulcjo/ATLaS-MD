@@ -1,4 +1,4 @@
-GaREUS  gareus_dashboard_golden_fixture   gareus_production  ep 1/2  epoch_001/topup_002   25 win  1D/secondary-fixed      ✗ BAD 1 issue
+ATLaS-MD v0.8.3  gareus_dashboard_golden_fixture   gareus_production  ep 1/2  epoch_001/topup_002   25 win  1D/secondary-f…  ✗ BAD 1 issue
 run   [#########################---------------------------------------------------]   33.2%   12.45/37.50 Msteps   wall 6h00m  eta 12h04m
 pool  [################################################-----------------------------------------------]  7500/15000 ns   perf 199 ns/d/rep
 cv1    4.0 |█▒▒▒▒▒░▒▒▒▒▒░▒░▒▒▒▒▒▒▒▒▒░░░▒▒▒▒▒▒▒▒▒▒▒▒░▒▒▒▒▒░░▒▒▒▒▒▒▒▒▒▒░▒▒▒░░▒▒▒░▒▒▒▒▒▒▒▒▒▒▒▒▒░▒▒▒▒▒░░▒▒▒█|   17.2 A   span 13.2

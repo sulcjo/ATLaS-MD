@@ -33,6 +33,7 @@ from .production import run_gareus, sync_scratch_to_main
 from .progress import GuiProgressSink
 from .provenance import initialize_run_manifest, finalize_run_manifest
 from .system_setup import minimize_and_npt_equilibrate, validate_sequence
+from .branding import product_label
 from .helptext import SimpleHelpAction, HeavyHelpAction
 
 __all__ = ["parse_args", "main"]
@@ -657,7 +658,9 @@ def _add_output_args(p: argparse.ArgumentParser) -> None:
                         "characters regardless of this setting. 'auto' picks "
                         "unicode on a UTF-8 stdout, ascii otherwise.")
     p.add_argument("--color", choices=["auto", "always", "never"], default="auto",
-                   help="ANSI colour output. 'auto' enables it when stdout is a TTY.")
+                   help="ANSI colour output. 'auto' enables it when stdout is a TTY, and for "
+                        "--tui-mode dashboard even when stdout is a log file; NO_COLOR=1 "
+                        "switches 'auto' off.")
     p.add_argument("--tui-clear-mode", choices=["always", "never"], default="always",
                    help="Whether full-frame TUI redraws clear the visible terminal. "
                         "'never' appends frames instead (log-style).")
@@ -1600,9 +1603,11 @@ def parse_args(argv: Optional[Iterable[str]] = None):
         prog="gareus",
         add_help=False,
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        description="ATLaS-MD peptide GaMD/REUS workflow. Use -h for help or -hh for method details.",
+        description=f"{product_label()} peptide GaMD/REUS workflow. Use -h for help or -hh for method details.",
     )
     _add_core_args(p)
+    p.add_argument("-V", "--version", action="version", version=product_label(), dest=argparse.SUPPRESS,
+                        help="Print the ATLaS-MD version and exit.")
     _add_system_args(p)
     _add_cv_args(p)
     _add_cv_selection_args(p)
@@ -1961,7 +1966,7 @@ def main(argv: Optional[Iterable[str]] = None):
                 print(f"WARNING [scratchdir hydrate]: {_main_dir} → {out_dir} failed: {exc}")
     else:
         out_dir.mkdir(parents=True, exist_ok=True)
-    configure_color(args.color)
+    configure_color(args.color, tui_mode=getattr(args, "tui_mode", None))
     if bool(getattr(args, "self_test_primary_cv_force", False)):
         if primary_cv_is_contacts(args):
             result = self_test_nonlocal_contact_force(args)

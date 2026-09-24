@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Optional
 import numpy as np
 from gareus.units import KJ_PER_KCAL, K_B_KJ_PER_MOL_K
+from gareus.branding import product_label
 from gareus.diagnostics import pmf_probability, js_divergence_1d, pmf_rmse_1d, barrier_error_1d
 from gareus.diagnostics import identify_basins_1d, _compute_basin_populations
 from gareus.diagnostics import _weighted_mean_std, _pmf_distribution_mean_std
@@ -5585,8 +5586,10 @@ def analyze(d, args, progress: Optional[Progress] = None):
     return dominant_summary
 
 def parse_args(argv=None):
-    p=argparse.ArgumentParser(description='GaREUS MBAR/PMF analysis. By default, this runs the full analysis suite: main CV PMF, convergence plots, Rg, distance-Rg 2D FES, PCA1-PCA2 FES, phi/psi/Ramachandran, SASA, secondary-structure fractions, and internal-contact PMFs whenever trajectories/topology are available.', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p=argparse.ArgumentParser(description='ATLaS-MD MBAR/PMF analysis. By default, this runs the full analysis suite: main CV PMF, convergence plots, Rg, distance-Rg 2D FES, PCA1-PCA2 FES, phi/psi/Ramachandran, SASA, secondary-structure fractions, and internal-contact PMFs whenever trajectories/topology are available.', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument('input', help='Run directory or final_production directory')
+    p.add_argument('-V', '--version', action='version', version=product_label(), dest=argparse.SUPPRESS,
+                   help='Print the ATLaS-MD version and exit.')
     p.add_argument('--epoch', dest='epochs', type=int, action='append', default=None,
                    metavar='N', help='Pool only adaptive-production epoch N; repeat to select multiple epochs. '
                    'The final/ phase (baseline + topup_*) is always included regardless of this filter.')
@@ -5808,7 +5811,7 @@ def parse_args(argv=None):
 def main(argv=None):
     args=parse_args(argv)
     progress=Progress()
-    progress.step('load', 'reading current GaREUS outputs')
+    progress.step('load', 'reading current ATLaS-MD outputs')
     _t0=time.time()
     epoch_ids = set(args.epochs) if args.epochs is not None else None
     d=load_data(Path(args.input), Path(args.out) if args.out else None, args.analysis_source, no_augment=getattr(args,'no_adaptive_rounds',False), n_threads=getattr(args,'duckdb_threads',0), n_workers=getattr(args,'load_workers',8), epoch_ids=epoch_ids)
@@ -5840,8 +5843,8 @@ def main(argv=None):
                 print(f'  [adaptive_diag] plot_adaptive_diagnostics.py not found next to analyze_gareus_mbar.py — skipping')
         except Exception as _exc:
             print(f'  [adaptive_diag] skipped: {_exc}')
-    progress.done('complete', 'GaREUS PMF analysis complete')
-    print('GaREUS PMF analysis complete')
+    progress.done('complete', f'{product_label()} PMF analysis complete')
+    print(f'{product_label()} PMF analysis complete')
     print(f"  production dir: {s['production_dir']}")
     print(f"  samples/windows: {s['n_samples']} / {s['n_windows']}")
     _pool = _epoch_source_pooling_table(d)

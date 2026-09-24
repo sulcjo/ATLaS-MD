@@ -213,8 +213,11 @@ def consolidate_run(
 def main(argv=None) -> None:
     import argparse
     p = argparse.ArgumentParser(
-        description="Consolidate per-segment GAREUS replica trajectories per epoch."
+        description="Consolidate per-segment ATLaS-MD replica trajectories per epoch."
     )
+    from .branding import product_label
+    p.add_argument("-V", "--version", action="version", version=product_label(), dest=argparse.SUPPRESS,
+                   help="Print the ATLaS-MD version and exit.")
     p.add_argument("run_dir", help="Run directory (contains adaptive_production/).")
     p.add_argument("--delete-originals", action="store_true",
                    help="Remove per-segment traj files after successful merge.")

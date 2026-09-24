@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional, Sequence
 
 from ..math_helpers import _hist_overlap
+from .neighbours import best_neighbour_overlaps, overlap_by_pair_2d
 from .ranking import MIN_ATTEMPTS_FOR_DEAD
 from .sidecar import SidecarSnapshot
 
@@ -144,6 +145,40 @@ def overlap_by_pair(
     return out
 
 
+def per_window_from_rows(rows: Sequence[Mapping[str, Any]], key: str, n_windows: int) -> list[float]:
+    """`rows[i][key]` re-indexed by the window each replica currently occupies; NaN if absent."""
+    out = [math.nan] * int(n_windows)
+    for row in rows:
+        try:
+            w, value = int(row.get("window")), float(row.get(key))
+        except (TypeError, ValueError):
+            continue
+        if 0 <= w < n_windows:
+            out[w] = value
+    return out
+
+
+def _layout_overlap_pairs(logger: Any, rows, hist_windows, centers, sec_centers, k_list,
+                          secondary_k, is_2d: bool, temperature_k: float
+                          ) -> tuple[dict[tuple[int, int], float], dict[int, float]]:
+    """``(pairs, per_window)``.
+
+    1D: flat (w, w+1) neighbours, no per-window map. 2D: each window's best link
+    to its nearest same-rung neighbours (gareus/dashboard/neighbours.py), plus
+    that best overlap per window.
+    """
+    if not is_2d or len(sec_centers) < len(centers):
+        return overlap_by_pair(hist_windows, centers), {}
+    n = len(centers)
+    k2 = list(secondary_k) if len(secondary_k) >= n else per_window_from_rows(
+        rows, "secondary_cv_k_kcal_mol", n)
+    pairs = overlap_by_pair_2d(
+        hist_windows, _tuple_map(getattr(logger, "secondary_history_by_window", {})),
+        centers, sec_centers, per_window_from_rows(rows, "gamd_lambda", n), k_list, k2,
+        temperature_k)
+    return best_neighbour_overlaps(pairs, n)
+
+
 def delta_by_window(rows: Sequence[Mapping[str, Any]]) -> dict[int, float]:
     """Signed CV offset from each window's restraint centre, latest sample."""
     out: dict[int, float] = {}
@@ -215,6 +250,9 @@ class DashboardContext:
     # sequence, so it carries this flag instead of an epoch_index. Defaulted so
     # every existing construction site keeps working unchanged.
     is_final_stage: bool = False
+    # 2D layouts only: each window's best spatial-neighbour overlap (empty for a
+    # 1D ladder, where the ranking reads `overlap_pairs` directly).
+    overlap_windows: Mapping[int, float] = field(default_factory=dict)
 
 
 def _tuple_map(source: Mapping[int, Any]) -> dict[int, tuple[float, ...]]:
@@ -324,6 +362,13 @@ def build_context(
     # to `out_dir` only when no sidecar/run_root is available (most unit-test
     # fixtures, and any caller that built `SidecarSnapshot` by hand).
     run_root_name = str(getattr(sidecar.run_root, "name", "") or "")
+    k_list = tuple(float(x) for x in info.get("k_list", ())) or tuple(
+        float(r.get("k_kcal_mol_A2", float("nan"))) for r in rows
+    )
+    secondary_k = tuple(float(x) for x in info.get("secondary_cv_k_kcal_mol", ()))
+    temperature_k = _resolve_temperature(logger.args, sidecar)
+    overlap_pairs, overlap_windows = _layout_overlap_pairs(
+        logger, rows, hist_windows, centers, sec_centers, k_list, secondary_k, is_2d, temperature_k)
     return DashboardContext(
         run_label=run_root_name or str(getattr(logger.out_dir, "name", "") or ""),
         phase=str(phase),
@@ -344,15 +389,13 @@ def build_context(
         term_h=int(term_h),
         n_windows=n_windows,
         centers_a=centers,
-        k_list=tuple(float(x) for x in info.get("k_list", ())) or tuple(
-            float(r.get("k_kcal_mol_A2", float("nan"))) for r in rows
-        ),
+        k_list=k_list,
         secondary_centers=sec_centers,
-        secondary_k=tuple(float(x) for x in info.get("secondary_cv_k_kcal_mol", ())),
+        secondary_k=secondary_k,
         is_2d=is_2d,
         topology_label=topology,
         secondary_cv_type=str(sec_meta.get("type", "") or ""),
-        temperature_k=_resolve_temperature(logger.args, sidecar),
+        temperature_k=temperature_k,
         rows=tuple(dict(r) for r in rows),
         summary=dict(summary),
         cv_history_by_window=hist_windows,
@@ -376,7 +419,8 @@ def build_context(
         acceptance_pairs=pairs,
         acceptance_windows=acceptance_by_window(
             pairs, n_windows, attempts=info.get("exchange_stats")),
-        overlap_pairs=overlap_by_pair(hist_windows, centers),
+        overlap_pairs=overlap_pairs,
+        overlap_windows=overlap_windows,
         deltas=delta_by_window(rows),
         decision=dict(decision or {}),
         primary_cv_label=str(info.get("primary_cv_label", "primary CV")),

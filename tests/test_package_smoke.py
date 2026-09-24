@@ -784,10 +784,12 @@ def _banner_args():
     )
 
 
-def test_official_package_version_is_v082() -> None:
+def test_official_package_version_is_v083() -> None:
     import gareus
+    from gareus.branding import product_label
 
-    assert gareus.__version__ == "0.8.2"
+    assert gareus.__version__ == "0.8.3"
+    assert product_label() == "ATLaS-MD v0.8.3"
 
 
 def test_startup_banner_panel_alignment_and_resume_rows(tmp_path) -> None:

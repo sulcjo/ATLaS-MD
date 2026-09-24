@@ -1,5 +1,5 @@
 """
-Diagnostic plots for GAREUS adaptive-production epoch/topup behavior.
+Diagnostic plots for ATLaS-MD adaptive-production epoch/topup behavior.
 
 Usage:
     python plot_adaptive_diagnostics.py <run_dir> [--out <out_dir>] [--stride N]
@@ -586,7 +586,7 @@ def fig_window_layout(state_reg: pd.DataFrame, phases: list[dict],
                              fontsize=7, color="white" if cnt > grid.max()*0.3 else "black")
     fig.colorbar(im, ax=ax_heat, label="Samples (log)", shrink=0.5)
 
-    fig.suptitle("GAREUS: Window Layout & Sample Distribution", fontsize=12)
+    fig.suptitle("ATLaS-MD: Window Layout & Sample Distribution", fontsize=12)
     _annotate_map_warnings(fig, _phase_map_notes(phases))
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -712,7 +712,7 @@ def fig_topup_timeline(state_reg: pd.DataFrame, phases: list[dict],
                     ax_ovlp.text(j, i, f"{v:.2f}", ha="center", va="center",
                                  fontsize=5.5, color="white" if v > 0.5 else "black")
 
-    fig.suptitle("GAREUS: Topup Timeline, Allocation & Window Overlap", fontsize=12)
+    fig.suptitle("ATLaS-MD: Topup Timeline, Allocation & Window Overlap", fontsize=12)
     _annotate_map_warnings(fig, _phase_map_notes(phases))
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -840,7 +840,7 @@ def fig_topup_targeting(ap_dir: Path, state_reg: pd.DataFrame, out_path: Path) -
                              color="white" if samp_mat[i,j] > smax*0.2 else "black")
     fig.colorbar(im2, ax=ax_samp, label="Samples (log scale)", shrink=0.8)
 
-    fig.suptitle("GAREUS: Topup Window Targeting & Sample Accumulation", fontsize=12)
+    fig.suptitle("ATLaS-MD: Topup Window Targeting & Sample Accumulation", fontsize=12)
     _annotate_map_warnings(fig, map_notes)
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)

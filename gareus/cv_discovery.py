@@ -19,6 +19,7 @@ from typing import Any, Iterable
 import numpy as np
 
 from .analysis import validate_analysis_metadata_readiness
+from .branding import product_label
 from .diagnostics import _hist_overlap_np, _read_csv_dicts, _safe_float
 from .io import read_json_file, write_json, _json_ready
 
@@ -257,7 +258,7 @@ def suggest_cvs(run_dir: Path, target_overlap: float = 0.25) -> dict[str, Any]:
 
 def _markdown_report(payload: dict[str, Any]) -> str:
     lines = []
-    lines.append("# GAREUS CV suggestion report")
+    lines.append(f"# {product_label()} CV suggestion report")
     lines.append("")
     lines.append(f"Run directory: `{payload.get('run_dir')}`")
     lines.append(f"Array source: `{(payload.get('array_source') or {}).get('source_kind', 'unknown')}`")
@@ -304,9 +305,11 @@ def _markdown_report(payload: dict[str, Any]) -> str:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         prog="gareus-suggest-cvs",
-        description="Generate a heuristic, analysis-driven CV/window suggestion report from a completed GAREUS run.",
+        description="Generate a heuristic, analysis-driven CV/window suggestion report from a completed ATLaS-MD run.",
     )
-    p.add_argument("--run-dir", default=".", help="Completed GAREUS run directory.")
+    p.add_argument("-V", "--version", action="version", version=product_label(), dest=argparse.SUPPRESS,
+                        help="Print the ATLaS-MD version and exit.")
+    p.add_argument("--run-dir", default=".", help="Completed ATLaS-MD run directory.")
     p.add_argument("--out-prefix", default="cv_suggestions", help="Output prefix under the run directory.")
     p.add_argument("--target-overlap", type=float, default=0.25, help="Neighbor histogram overlap threshold used for weak-window suggestions.")
     p.add_argument("--print", dest="print_report", action="store_true", help="Print the Markdown report to stdout as well as writing files.")

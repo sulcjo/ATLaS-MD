@@ -1,0 +1,48 @@
+name: Release v0.8.3
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".release-v0.8.3"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install release-gate dependencies
+        run: python -m pip install -e ".[dev,docs]"
+
+      - name: Verify packaged version
+        run: |
+          python -c "import gareus; assert gareus.__version__ == '0.8.3', gareus.__version__"
+          python -m pytest -q tests/test_package_smoke.py::test_official_package_version_is_v083
+
+      - name: Fast thermodynamic correctness gate
+        run: python -m pytest -q tests/test_exchange_kernel_exact.py tests/test_gibbs_walk.py tests/test_exchange_fixes.py
+
+      - name: Strict documentation build
+        run: python -m mkdocs build --strict
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create v0.8.3 \
+            --target "$GITHUB_SHA" \
+            --title "ATLaS-MD v0.8.3" \
+            --notes-file docs/releases/v0.8.3.md \
+            --latest

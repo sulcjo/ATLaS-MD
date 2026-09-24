@@ -406,3 +406,27 @@ def test_run_health_badge_names_its_unit_so_it_cannot_read_as_a_window_count(tmp
     ctx = _phase_ctx(tmp_path, {"epoch_index": 1, "epoch_total": 3, "segment_name": "baseline"})
     text = strip_ansi("\n".join(spine_lines(ctx, FULL_SPINE_LINES)))
     assert "issue" in text, "the badge must say what it is counting"
+
+
+def test_identity_line_starts_with_the_versioned_product_label(tmp_path):
+    from gareus.branding import product_label
+
+    first = strip_ansi(spine_lines(_ctx(tmp_path), FULL_SPINE_LINES)[0])
+    assert first.startswith(product_label() + "  ")
+
+
+def test_identity_line_never_truncates_the_verdict_on_a_long_run_label():
+    from gareus.dashboard.spine import _identity_with_verdict
+
+    verdict = "\x1b[31m✗ BAD 1 issue\x1b[0m"
+    identity = "ATLaS-MD v0.8.3  " + "a_very_long_campaign_directory_name_" * 4 + "   final  25 win"
+    line = _identity_with_verdict(identity, verdict, 100)
+    assert strip_ansi_len(line) <= 100
+    assert strip_ansi(line).endswith("✗ BAD 1 issue")
+    assert "…" in strip_ansi(line)
+
+
+def test_identity_line_keeps_the_wide_gap_when_everything_fits():
+    from gareus.dashboard.spine import _identity_with_verdict
+
+    assert _identity_with_verdict("ATLaS-MD v0.8.3  run", "✓ OK", 140) == "ATLaS-MD v0.8.3  run      ✓ OK"

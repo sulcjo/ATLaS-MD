@@ -97,14 +97,27 @@ def rank_windows(
     overlap_by_pair: Mapping[tuple[int, int], float],
     delta_by_window: Mapping[int, float],
     temperature_k: float,
+    overlap_by_window: "Mapping[int, float] | None" = None,
 ) -> tuple[WindowStatus, ...]:
-    """Rank windows worst-first. Ties break by window index for stability."""
+    """Rank windows worst-first. Ties break by window index for stability.
+
+    ``overlap_by_window`` (2D layouts) gives each window's best neighbour
+    overlap directly; when it is set, a window is flagged only if it is isolated.
+    Without it (1D ladders), either side of a dead (w, w+1) pair is flagged,
+    since in a chain every gap disconnects the ladder.
+    """
     low_overlap: dict[int, float] = {}
-    for (a, b), raw_ov in overlap_by_pair.items():
-        ov = _as_float(raw_ov, float("nan"))
-        if math.isfinite(ov) and ov < DEAD_OVERLAP:
-            for w in (a, b):
-                low_overlap[w] = min(low_overlap.get(w, math.inf), float(ov))
+    if overlap_by_window:
+        for w, raw_ov in overlap_by_window.items():
+            ov = _as_float(raw_ov, float("nan"))
+            if math.isfinite(ov) and ov < DEAD_OVERLAP:
+                low_overlap[int(w)] = float(ov)
+    else:
+        for (a, b), raw_ov in overlap_by_pair.items():
+            ov = _as_float(raw_ov, float("nan"))
+            if math.isfinite(ov) and ov < DEAD_OVERLAP:
+                for w in (a, b):
+                    low_overlap[w] = min(low_overlap.get(w, math.inf), float(ov))
 
     out: list[WindowStatus] = []
     for w in range(int(n_windows)):
@@ -131,6 +144,16 @@ def rank_windows(
     return tuple(sorted(out, key=lambda s: (-s.severity, s.window)))
 
 
+def rank_windows_for(ctx) -> tuple[WindowStatus, ...]:
+    """`rank_windows` over a DashboardContext -- the one call every panel shares."""
+    return rank_windows(
+        n_windows=ctx.n_windows, centers_a=ctx.centers_a, k_list=ctx.k_list,
+        acceptance_by_window=ctx.acceptance_windows, overlap_by_pair=ctx.overlap_pairs,
+        delta_by_window=ctx.deltas, temperature_k=ctx.temperature_k,
+        overlap_by_window=getattr(ctx, "overlap_windows", None),
+    )
+
+
 class Hysteresis:
     """Hold a key in its ranked slot until it has been clear for `frames` frames."""
 
@@ -152,5 +175,6 @@ class Hysteresis:
 
 __all__ = [
     "BAD", "DEAD_ACCEPTANCE", "DEAD_OVERLAP", "Hysteresis", "LOW_ACCEPTANCE", "OK",
-    "PINNED_SIGMA_MULTIPLE", "WARN", "WindowStatus", "rank_windows", "restraint_sigma",
+    "PINNED_SIGMA_MULTIPLE", "WARN", "WindowStatus", "rank_windows", "rank_windows_for",
+    "restraint_sigma",
 ]

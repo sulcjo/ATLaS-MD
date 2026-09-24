@@ -197,7 +197,7 @@ def acquire_run_lock(out_dir: Path) -> None:
             existing_pid = None
         if existing_pid is not None and _pid_is_alive(existing_pid):
             raise RuntimeError(
-                f"Another gareus run appears to be active in {out_dir} (PID {existing_pid} is still running); refusing to start."
+                f"Another ATLaS-MD run appears to be active in {out_dir} (PID {existing_pid} is still running); refusing to start."
             )
         # Stale lock left behind by a crashed/killed process: remove and retry.
         try:

@@ -35,6 +35,7 @@ from typing import Iterable, Iterator, Optional, Sequence
 
 import numpy as np
 
+from .branding import product_label
 from .constants import ION_RESNAMES, WATER_RESNAMES
 from .helptext import page_text, render_encyclopedia_help
 from .imports import import_openmm
@@ -639,13 +640,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         prog="gareus-energy-decompose",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         description=(
-            "Post-process saved GAREUS coordinates into peptide intrapeptide/interpeptide "
+            "Post-process saved ATLaS-MD coordinates into peptide intrapeptide/interpeptide "
             "direct nonbonded energy components. Use -hh for equations, grouping definitions, "
             "PME caveats, and output-column semantics."
         ),
     )
+    parser.add_argument("-V", "--version", action="version", version=product_label(), dest=argparse.SUPPRESS,
+                        help="Print the ATLaS-MD version and exit.")
     parser.add_argument("-hh", "--help-heavy", action=_EnergyDecompHeavyHelpAction, help="Show energy-decomposition method reference, equations, grouping definitions, caveats, and complete options; then exit.")
-    parser.add_argument("--run-dir", default=None, help="Completed GAREUS run directory. Used to infer topology, trajectories, and output path.")
+    parser.add_argument("--run-dir", default=None, help="Completed ATLaS-MD run directory. Used to infer topology, trajectories, and output path.")
     parser.add_argument("--topology", default=None, help="Topology PDB, usually 02_npt_equilibrated.pdb or 01_solvated_start.pdb.")
     parser.add_argument("--trajectory", nargs="*", default=None, help="Trajectory/PDB path(s) or glob(s). Defaults to run-dir replica_trajectories/*.dcd/*.xtc, then final_pdbs/*.pdb.")
     parser.add_argument("--out", default=None, help="Output CSV path. Defaults to run-dir/energy_decomposition.csv.")

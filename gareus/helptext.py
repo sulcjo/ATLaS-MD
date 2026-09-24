@@ -34,6 +34,8 @@ import sys
 import textwrap
 from typing import Iterable
 
+from .branding import versioned_title
+
 __all__ = [
     "SimpleHelpAction",
     "HeavyHelpAction",
@@ -1937,9 +1939,20 @@ def _dedent(text: str) -> str:
     return textwrap.dedent(text).strip() + "\n"
 
 
+def _version_leading_heading(text: str) -> str:
+    """Put the version into ``text``'s first ``Title\n=====`` heading, keeping
+    the underline the same length as the title (the TOC parser requires it)."""
+    title, sep, rest = text.partition("\n")
+    underline, sep2, body = rest.partition("\n")
+    if not underline or set(underline.strip()) - set("=-~"):
+        return text
+    new_title = versioned_title(title)
+    return f"{new_title}\n{underline.strip()[0] * len(new_title)}\n{body}"
+
+
 def simple_help_text(prog: str = "gareus") -> str:
     """Return the concise user-facing help page."""
-    text = _dedent(_OVERVIEW) + "\n" + _dedent(_SIMPLE_HELP)
+    text = _version_leading_heading(_dedent(_OVERVIEW)) + "\n" + _dedent(_SIMPLE_HELP)
     if prog and prog != "gareus":
         text = text.replace("gareus ", f"{prog} ", 1)
     return text
@@ -2080,6 +2093,7 @@ def render_encyclopedia_help(
     toc = _render_toc(sections, color=color)
     if topic and topic.strip().lower() == "list":
         return toc + "\n"
+    banner = versioned_title(banner)
     heading = _style(banner, color, bold=True)
     underline = "=" * len(banner)
     body = "\n\n".join(_render_section(s, color=color) for s in sections)

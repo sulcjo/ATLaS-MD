@@ -3077,7 +3077,7 @@ def run_adaptive_feedback_auto_loop(args, out_dir: Path, openmm, app, unit, forc
 
     driver_summary = {
         "mode": "adaptive-feedback-auto-loop",
-        "description": "Memory-guided short pilot GaREUS round(s) converge windows/k toward the smallest useful replica set near 0.30 neighbor overlap/exchange, then execute a final clean fixed-window production run. In 2D adaptive-feedback runs, sparse local patch candidates are iterated through later pilots and consumed automatically for final production.",
+        "description": "Memory-guided short pilot ATLaS-MD round(s) converge windows/k toward the smallest useful replica set near 0.30 neighbor overlap/exchange, then execute a final clean fixed-window production run. In 2D adaptive-feedback runs, sparse local patch candidates are iterated through later pilots and consumed automatically for final production.",
         "target_neighbor_overlap": float(target_overlap),
         "pilot_rounds_requested": int(n_rounds),
         "pilot_production_fraction": float(pilot_fraction),

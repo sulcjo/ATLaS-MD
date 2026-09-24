@@ -1024,7 +1024,7 @@ def build_genpept_window_prior(
         "enabled": True,
         "used": True,
         "mode": "genpept-window-prior",
-        "description": "GENPEPT proposal structures rescored in active GAREUS CV space and converted into a round-zero explicit sparse 2D window table. This is a sampling prior only, not thermodynamic PMF evidence.",
+        "description": "GENPEPT proposal structures rescored in active ATLaS-MD CV space and converted into a round-zero explicit sparse 2D window table. This is a sampling prior only, not thermodynamic PMF evidence.",
         "genpept_dir": str(genpept_dir),
         "output_dir": str(prior_out),
         "windows_2d_csv": str(windows_csv),
