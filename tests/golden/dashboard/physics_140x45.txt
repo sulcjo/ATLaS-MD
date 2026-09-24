@@ -39,6 +39,6 @@ alert w17 BAD dead exchange 0.000   |   w18 BAD dead exchange 0.000
 │CV2 regime + graph connectivity                                                                                                         │
 ├────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
 │ graph 18/25 connected   isolated: w18, w19, w20, w21, w22, w23, w24                                                                    │
-│ → union MBAR drops 7 states unless a bridge is added                                                                                   │
+│ → 7 windows never exchange with the rest; MBAR keeps them but needs CV overlap to link them                                            │
 └────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ──── [1] progress   [2] PHYSICS   [3] windows   00:00:00

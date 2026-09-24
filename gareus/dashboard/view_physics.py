@@ -163,8 +163,13 @@ def connectivity_panel(ctx: DashboardContext) -> Panel:
             f"{largest}/{ctx.n_windows} connected", ROLE_BAD)
             + f"   isolated: {shown}"
             + ("" if len(isolated) <= 8 else f" (+{len(isolated) - 8} more)"))
+        # This graph is exchange acceptance in the running segment. Union MBAR does
+        # not use exchange and never drops a state: it keeps every registry state
+        # and links them through CV-space overlap of the pooled samples, so the
+        # isolated windows cost exchange mixing, not their place in the estimate.
         lines.append(role_text(
-            f" → union MBAR drops {ctx.n_windows - largest} states unless a bridge is added",
+            f" → {ctx.n_windows - largest} windows never exchange with the rest; MBAR keeps them "
+            "but needs CV overlap to link them",
             ROLE_WARN))
     return panel("connectivity", "CV2 regime + graph connectivity", lines,
                  min_lines=2, want_lines=4, priority=1)
