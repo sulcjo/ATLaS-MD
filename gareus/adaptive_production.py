@@ -3291,6 +3291,29 @@ def _epoch_sample_sources(
     return sources
 
 
+def _union_umbrella_bias_kcal(
+    cv_values: np.ndarray,
+    secondary_values: np.ndarray,
+    primary_centers: np.ndarray,
+    primary_k: np.ndarray,
+    secondary_centers: np.ndarray,
+    secondary_k: np.ndarray,
+) -> np.ndarray:
+    """N x K umbrella bias (kcal/mol) of one sample block against every union state.
+
+    A missing sample CV2 or a state with no CV2 centre contributes no CV2 term
+    (unchanged from the single-snapshot version this block form replaced).
+    """
+    primary_delta = cv_values[:, np.newaxis] - primary_centers[np.newaxis, :]
+    bias = 0.5 * primary_k[np.newaxis, :] * primary_delta * primary_delta
+    if np.isfinite(secondary_values).any() and np.isfinite(secondary_centers).any():
+        dsec = secondary_values[:, np.newaxis] - secondary_centers[np.newaxis, :]
+        mask = np.isfinite(dsec) & np.isfinite(secondary_centers[np.newaxis, :])
+        k_mat = np.broadcast_to(secondary_k[np.newaxis, :], dsec.shape)
+        bias[mask] += 0.5 * k_mat[mask] * dsec[mask] * dsec[mask]
+    return bias
+
+
 def build_union_state_mbar_inputs(
     adaptive_dir: Path,
     registry: WindowStateRegistry,
@@ -3312,6 +3335,18 @@ def build_union_state_mbar_inputs(
     the matrices required for MBAR-like downstream analysis.  This is still a
     conservative helper: it only includes final-phase samples by default unless
     ``include_epochs`` is true.
+
+    Each sample source (epoch, baseline or topup segment) is reconstructed with
+    the window centres ITS OWN ``epoch_window_map.csv`` recorded, not the
+    registry's current ones: a state re-centred after a segment ran (the tICA
+    CV2 auto-switch rewrites ``secondary_center`` in place) would otherwise
+    have that segment's samples biased against the new centre -- the stale
+    snapshot error the analysis loader fixed on 2026-08-04 (~124 kT per sample
+    on chignolin_5). States a segment's map does not cover, and force
+    constants the map does not record, fall back to the registry
+    (``gareus.mbar_analysis.bias._epoch_bias_param_vectors``, shared with the
+    analysis loader). The saved ``primary_centers``/``secondary_centers``
+    arrays remain the registry snapshot.
     """
     adaptive_dir = Path(adaptive_dir)
     out_prefix = adaptive_dir / output_prefix
@@ -3328,7 +3363,12 @@ def build_union_state_mbar_inputs(
         0.0 if s.secondary_k is None else float(s.secondary_k) for s in states
     ], dtype=np.float64)
 
+    from .mbar_analysis.bias import _epoch_bias_param_vectors, _parse_epoch_window_map_native_params
+
     sample_rows: List[Dict[str, Any]] = []
+    # Per source: (primary_center, primary_k, secondary_center, secondary_k) vectors
+    # over the union states, native where that source's own map records them.
+    source_params: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
     for source_label, sample_dir in _epoch_sample_sources(
         adaptive_dir, include_epochs=include_epochs, pilot_dirs=pilot_dirs, tica_cv_version=tica_cv_version
     ):
@@ -3336,6 +3376,10 @@ def build_union_state_mbar_inputs(
         if not rows:
             continue
         window_map = _load_epoch_window_map(sample_dir, registry)
+        native = _parse_epoch_window_map_native_params(_read_csv_dicts(Path(sample_dir) / "epoch_window_map.csv"))
+        source_index = len(source_params)
+        source_params.append(_epoch_bias_param_vectors(
+            native, state_ids.tolist(), primary_centers, primary_k, secondary_centers, secondary_k))
         for row in rows:
             w = _float_or_none(row.get("window"))
             cv = _float_or_none(row.get("cv_A", row.get("primary_cv_value")))
@@ -3361,6 +3405,7 @@ def build_union_state_mbar_inputs(
                 "v_pep_kj_mol": "" if v_pep is None else float(v_pep),
                 "v_dih_kj_mol": "" if v_dih is None else float(v_dih),
                 "usable_for_mbar": int(source_label.startswith("final") or include_epochs),
+                "_source_index": source_index,
             })
 
     if not sample_rows:
@@ -3401,17 +3446,12 @@ def build_union_state_mbar_inputs(
         np.nan if r.get("v_dih_kj_mol", "") == "" else float(r["v_dih_kj_mol"]) for r in sample_rows
     ], dtype=np.float64)
 
-    primary_delta = cv_values[:, np.newaxis] - primary_centers[np.newaxis, :]
-    primary_bias_kcal = 0.5 * primary_k[np.newaxis, :] * primary_delta * primary_delta
-    secondary_bias_kcal = np.zeros_like(primary_bias_kcal)
-    has_secondary_samples = np.isfinite(secondary_values).any()
-    has_secondary_states = np.isfinite(secondary_centers).any()
-    if has_secondary_samples and has_secondary_states:
-        dsec = secondary_values[:, np.newaxis] - secondary_centers[np.newaxis, :]
-        secondary_mask = np.isfinite(dsec) & np.isfinite(secondary_centers[np.newaxis, :])
-        secondary_k_mat = np.broadcast_to(secondary_k[np.newaxis, :], dsec.shape)
-        secondary_bias_kcal[secondary_mask] = 0.5 * secondary_k_mat[secondary_mask] * dsec[secondary_mask] * dsec[secondary_mask]
-    umbrella_bias_kcal = primary_bias_kcal + secondary_bias_kcal
+    source_of_row = np.asarray([int(r["_source_index"]) for r in sample_rows], dtype=np.int64)
+    umbrella_bias_kcal = np.zeros((len(sample_rows), len(states)), dtype=np.float64)
+    for src in np.unique(source_of_row):
+        rows_src = np.flatnonzero(source_of_row == src)
+        umbrella_bias_kcal[rows_src] = _union_umbrella_bias_kcal(
+            cv_values[rows_src], secondary_values[rows_src], *source_params[int(src)])
     umbrella_bias_kj = 4.184 * umbrella_bias_kcal
 
     # λ-ladder boost term: added by the one shared helper every MBAR
