@@ -77,6 +77,52 @@ def test_driver_handover_applies_the_sidecar_after_the_ladder(tmp_path, monkeypa
     assert args.secondary_cv == "residual-torsion-pc" and args.tica_switch_cv2 is False
 
 
+def test_a_later_job_in_the_chain_still_resolves_auto_after_the_registry_exists(tmp_path):
+    """chignolin_9 job 2634493: the epoch-0 hook runs only until state_registry.json
+    exists, so a resumed job kept secondary_cv='auto'. Resumed segments restored CV2
+    from their own metadata and hid it; the first FRESH segment of a later job
+    (epoch_001/topup_001) reached the window loader with 'auto' and the chain died."""
+    from gareus.adaptive_production import _apply_epoch0_cv_decision_on_resume
+    _write_sidecar(tmp_path, _pair_sidecar(tmp_path / "swarm" / "analysis"))
+    (tmp_path / "adaptive_production").mkdir()
+    (tmp_path / "adaptive_production" / "state_registry.json").write_text("{}")
+    args = types.SimpleNamespace(secondary_cv="auto", tica_switch_cv2=True,
+                                 shared_gamd_setup_dir="adaptive_production/global_shared_gamd_setup")
+    applied = _apply_epoch0_cv_decision_on_resume(args, tmp_path)
+    assert args.secondary_cv == "residual-torsion-pc"
+    assert args.secondary_cv_model.endswith("cv_pair_model.json")
+    assert args.tica_switch_cv2 is False
+    assert "secondary_cv" in applied
+
+
+def test_resume_reapplication_points_at_the_same_envelope_as_the_first_job(tmp_path):
+    """chignolin_9's epoch_000 and epoch_001/baseline both ran with the swarm's envelope
+    directory; a fresh segment in a later job must get the same one, not the
+    auto-resolved campaign default."""
+    from gareus.adaptive_production import _apply_epoch0_cv_decision_on_resume
+    an = tmp_path / "swarm" / "analysis"
+    env = an / "shared_gamd_setup"
+    env.mkdir(parents=True)
+    (env / "shared_gamd_setup_globals.json").write_text("{}")
+    _write_sidecar(tmp_path, {**_pair_sidecar(an), "gamd": {"shared_gamd_setup_dir": str(env)}})
+    auto_dir = str(tmp_path / "adaptive_production" / "global_shared_gamd_setup")
+    args = types.SimpleNamespace(secondary_cv="auto", shared_gamd_setup_dir=auto_dir,
+                                 _global_shared_gamd_setup_dir=auto_dir)
+    _apply_epoch0_cv_decision_on_resume(args, tmp_path)
+    assert args.secondary_cv == "residual-torsion-pc"
+    assert args.shared_gamd_setup_dir == str(env)
+
+
+def test_resume_reapplication_leaves_an_explicit_cv2_alone(tmp_path):
+    from gareus.adaptive_production import _apply_epoch0_cv_decision_on_resume
+    _write_sidecar(tmp_path, _pair_sidecar(tmp_path / "swarm" / "analysis"))
+    args = types.SimpleNamespace(secondary_cv="none")
+    assert _apply_epoch0_cv_decision_on_resume(args, tmp_path) == {}
+    assert args.secondary_cv == "none"
+    no_sidecar = types.SimpleNamespace(secondary_cv="auto")
+    assert _apply_epoch0_cv_decision_on_resume(no_sidecar, tmp_path / "elsewhere") == {}
+
+
 def test_the_two_d_loader_refuses_auto_by_name_instead_of_a_range_complaint(tmp_path):
     from gareus.windows import load_explicit_2d_window_csv
     csv_path = tmp_path / "w.csv"

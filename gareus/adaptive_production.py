@@ -6953,6 +6953,32 @@ def _epoch0_swarm_window_table(args, out_dir, adaptive_dir, runtime_pool, progre
     return ladder
 
 
+def _apply_epoch0_cv_decision_on_resume(args, out_dir) -> Dict[str, Any]:
+    """Re-apply epoch 0's CV decision on a job that no longer runs the epoch-0 hook.
+
+    The hook (and with it ``apply_epoch0_sidecar``) runs only until
+    ``state_registry.json`` exists, so every later job of a chain kept the config's
+    ``cv2: auto``. Resumed segments hid this -- they restore CV2 from their own
+    metadata -- until a later job started a FRESH segment: chignolin_9 job 2634493,
+    ``epoch_001/topup_001``, reached the 2D window loader with ``'auto'`` and the chain
+    stopped. Applies the whole sidecar -- exactly what the first job applied, so a fresh
+    segment in a later job builds the same restraints and points at the same frozen
+    envelope directory as every segment before it -- and only while CV2 is still
+    ``'auto'``: an explicit CV2 is never overridden.
+    """
+    if str(getattr(args, "secondary_cv", "") or "") != "auto":
+        return {}
+    from gareus.swarm.epoch0 import SIDECAR_NAME, analysis_dir, apply_epoch0_sidecar
+
+    if not (analysis_dir(out_dir) / SIDECAR_NAME).exists():
+        return {}
+    applied = apply_epoch0_sidecar(args, out_dir)
+    if applied:
+        print("    Epoch 0 CV decision re-applied on resume: "
+              + ", ".join(f"{k}={v}" for k, v in applied.items()))
+    return applied
+
+
 def _seed_global_shared_gamd_from_envelope(args, envelope_dir) -> Dict[str, Any]:
     """Copy the swarm's frozen envelope into the campaign-global shared GaMD directory.
 
@@ -7100,6 +7126,10 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
         if _swarm_bank is not None:
             current_seed_bank = _swarm_bank
             print(f"    Epoch 0: umbrella seeding uses the swarm seed bank {_swarm_bank}")
+    else:
+        # Every later job of the chain: the hook above is skipped once the registry
+        # exists, but the CV decision it applied still has to reach this job's args.
+        _apply_epoch0_cv_decision_on_resume(args, out_dir)
 
     summary_path = adaptive_dir / "adaptive_production_driver_summary.json"
     registry_path = adaptive_dir / "state_registry.json"
