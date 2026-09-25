@@ -25,6 +25,18 @@ It is research software built around an explicit scientific contract: sampled Ha
 
 This is the advertised end-to-end route; ATLaS-MD also supports simpler conventional-MD and manually specified-window runs.
 
+## Performance improvements
+
+| Optimization | Evidence and scope |
+| --- | --- |
+| Shared contact-sum calculation for CV1 and residual-torsion CV2 | **+14.6% node throughput** in a 236-context MPS production A/B, with equivalent bias energy and forces. |
+| Fewer Pep-GaMD force evaluations and barostat state reads | **~1.26× campaign throughput** in a measured in-campaign A/B. |
+| CUDA MPS for a high replica count | **2,307 vs 840 aggregate ns/day** at 236 replicas / 59 contexts per L40S, MPS on vs off (**2.75×** for that tested workload). |
+| Multi-GPU umbrella pulls | `--us-pull-device-index` spreads setup workers across GPUs; this affects startup work, not production MD step rate. |
+| PME stream choice | +8–11% in a no-MPS test; about −4% when enabled at 236 contexts with MPS. Measure against the intended regime. |
+
+See the [detailed throughput benchmark record](developer/gpu-throughput-benchmark-todo.md). These results are hardware- and workload-specific, not general speedup guarantees.
+
 The intended target and exactness limits are described in the [thermodynamic validity guide](guide/thermodynamic-validity.md); the [PMF validity guide](analysis/pmf-validity.md) covers checks required before interpreting a result.
 
 ## Start here
