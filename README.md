@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/atlas-md/assets/atlas-md-hero.webp" alt="ATLaS-MD: Adaptive Topological Landscape Sampling MD" width="100%">
+  <img src="docs/atlas-md/assets/atlas-md-hero.webp" alt="ATLaS-MD: Adaptive Topological Landscape Sampling" width="100%">
 </p>
 
 <p align="center">
@@ -12,12 +12,12 @@
 </p>
 
 <p align="center">
-  <strong>Adaptive Topological Landscape Sampling MD</strong>
+  <strong>Adaptive Topological Landscape Sampling for Molecular Dynamics</strong>
 </p>
 
-ATLaS-MD is an OpenMM-based peptide sampling framework for explicit-solvent umbrella sampling, replica exchange, GaMD/Pep-GaMD acceleration, adaptive state placement, and MBAR-ready analysis.
+ATLaS-MD (Adaptive Topological Landscape Sampling) is an OpenMM-based workflow for exploring peptide conformational landscapes. It combines explicit-solvent molecular dynamics with collective-variable (CV) umbrella states, replica exchange, optional GaMD/Pep-GaMD acceleration, adaptive state placement, and MBAR/PMF analysis.
 
-It is designed for workflows where the sampling protocol itself is part of the scientific method: state definitions are explicit, exchange kernels are tested against their target distribution, adaptive phases are tracked separately, and production data are written with enough provenance to reconstruct the sampled Hamiltonians later.
+A run defines the peptide system and CVs, builds biased thermodynamic states, propagates replicas and attempts exchanges, then records samples and state history for analysis. Adaptive phases are tracked separately so a changing set of states is not silently treated as one fixed ensemble. ATLaS-MD helps make a simulation and its assumptions inspectable; it does not guarantee that sampling has converged or that a PMF is valid.
 
 <p align="center">
   <img src="docs/atlas-md/assets/workflow.svg" alt="ATLaS-MD scientific workflow" width="100%">
@@ -34,6 +34,15 @@ It is designed for workflows where the sampling protocol itself is part of the s
 | **GENPEPT seeding** | Conformer generation and CV-aware starting-state selection |
 | **MBAR-ready storage** | Per-sample CVs, energies, state mappings, exchange records, and phase-local Hamiltonian metadata |
 | **Reproducibility** | Checkpoints, manifests, source/input hashes, segment tracking, and restart-safe output layout |
+
+## What a run does
+
+1. **Build the system.** Prepare a peptide in explicit solvent, optionally using GENPEPT conformers and hydrogen-mass repartitioning (HMR).
+2. **Define the landscape coordinates.** Select one or two collective variables (CVs) and place umbrella states over the region to explore.
+3. **Sample and exchange.** Run OpenMM replicas with conventional MD or supported GaMD/Pep-GaMD modes; optional adaptive stages refine state placement before a separately identified production phase.
+4. **Audit and analyze.** Preserve per-sample CVs, state assignments, energies, exchanges, checkpoints and provenance for MBAR/PMF analysis and overlap/ESS diagnostics.
+
+New users can begin with the [quickstart](docs/atlas-md/start/quickstart.md), then read [how CVs and windows work](docs/atlas-md/guide/collective-variables.md) and the [analysis validity checks](docs/atlas-md/analysis/pmf-validity.md).
 
 ## Scientific contract
 
@@ -248,7 +257,7 @@ Finite-timestep propagation is not claimed to be mathematically exact. The therm
 
 ## Documentation
 
-**[Full ATLaS-MD manual](https://sulcjo.github.io/2026_peptide_sampler/)**
+**[Full ATLaS-MD manual](https://github.com/sulcjo/ATLaS-MD/tree/main/docs/atlas-md)**
 
 Useful entry points:
 

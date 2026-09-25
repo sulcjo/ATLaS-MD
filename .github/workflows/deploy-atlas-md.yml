@@ -4,7 +4,18 @@ on:
   push:
     branches: [main]
     paths:
+      - "README.md"
       - "docs/atlas-md/**"
+      - "tools/check_docs_links.py"
+      - "mkdocs.yml"
+      - "pyproject.toml"
+      - ".github/workflows/deploy-atlas-md.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "README.md"
+      - "docs/atlas-md/**"
+      - "tools/check_docs_links.py"
       - "mkdocs.yml"
       - "pyproject.toml"
       - ".github/workflows/deploy-atlas-md.yml"
@@ -30,9 +41,12 @@ jobs:
         with:
           python-version: "3.11"
       - name: Configure GitHub Pages
+        if: github.event_name != 'pull_request'
         uses: actions/configure-pages@v5
       - name: Install documentation dependencies
         run: python -m pip install ".[docs]"
+      - name: Check local documentation links
+        run: python tools/check_docs_links.py README.md docs/atlas-md
       - name: Build ATLAS-MD
         run: python -m mkdocs build --strict --site-dir site
       - name: Upload GitHub Pages artifact
@@ -41,6 +55,7 @@ jobs:
           path: site
 
   deploy:
+    if: github.event_name != 'pull_request'
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
