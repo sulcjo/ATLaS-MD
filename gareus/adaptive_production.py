@@ -6341,7 +6341,13 @@ def _phase_union_diagnostics(args, adaptive_dir: Path, registry: "WindowStateReg
     from .adaptive.union_diagnostics import union_diagnostics_from_npz
     temperature = float(getattr(args, "temperature_k", 300.0) or 300.0)
     edges = [(a, b) for a, b, _t, _d in build_geometry_edges(registry, policy)]
-    meta = build_union_state_mbar_inputs(adaptive_dir, registry, output_prefix=TOPUP_UNION_PREFIX)
+    # Same source filters as the campaign-end union build: the tICA guard must drop
+    # epochs sampled under a different CV2 definition, or their cv2 samples are
+    # scored against the wrong centres and the plan targets the wrong states.
+    meta = build_union_state_mbar_inputs(
+        adaptive_dir, registry, output_prefix=TOPUP_UNION_PREFIX,
+        pilot_dirs=[Path(p) for p in (getattr(args, "adaptive_production_pilot_sample_dirs", None) or [])],
+        tica_cv_version=getattr(args, "tica_cv_version", None))
     return union_diagnostics_from_npz(
         meta["arrays_npz"], edges, kt_kcal=KB_KCAL_PER_MOL_K * temperature,
         subsample_counts=meta.get("subsample_counts_per_state"),

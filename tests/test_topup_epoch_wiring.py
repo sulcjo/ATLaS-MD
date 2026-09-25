@@ -206,3 +206,22 @@ def test_union_edge_overlaps_reach_the_epoch_diagnostics():
     assert ap._edge_is_measured_weak(rung, policy)
     assert spatial["mbar_overlap"] == 0.7 and spatial["overlap"] == 0.4
     assert "mbar_overlap" not in unmeasured
+
+
+def test_the_plan_uses_the_campaign_end_union_source_filters(tmp_path, monkeypatch):
+    """The tICA guard must apply mid-campaign too; the campaign-end artifacts are never overwritten."""
+    args, out = _topups_on(tmp_path)
+    args.tica_cv_version = "tica_v3"
+    reg = ap.WindowStateRegistry.load(Path(out) / "adaptive_production")
+    epoch_dir = Path(out) / "adaptive_production" / "final"
+    epoch_dir.mkdir(parents=True, exist_ok=True)
+    seen = {}
+
+    def _capture(*a, **k):
+        seen.update(k)
+        raise RuntimeError("stop")
+
+    monkeypatch.setattr(ap, "build_union_state_mbar_inputs", _capture)
+    ap._topup_plan_for_phase(args, epoch_dir, reg, ap.policy_from_args(args), full_steps=10_000)
+    assert seen["tica_cv_version"] == "tica_v3"
+    assert seen["output_prefix"] != "adaptive_union_mbar"
