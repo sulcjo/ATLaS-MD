@@ -1,4 +1,4 @@
-"""Spatial neighbour pairs for the dashboard's overlap check on a 2D layout.
+"""Spatial neighbour pairs for the overlay check on lambda-ladder layouts (shared by dashboard and top-up allocator).
 
 The 1D check (`context.overlap_by_pair`) compares window w with w+1. On a 2D
 lambda-ladder layout that pairing is meaningless: consecutive indices sit in
@@ -29,8 +29,7 @@ from typing import Mapping, Optional, Sequence
 
 import numpy as np
 
-from .math_helpers import _hist_overlap
-from .dashboard.ranking import restraint_sigma
+from .math_helpers import _hist_overlap, restraint_sigma
 
 NEIGHBOUR_SLACK = 1.5
 _CENTRE_DECIMALS = 6          # same grouping tolerance as the 2D window map
@@ -188,11 +187,12 @@ def other_rung_same_centre(centers, secondary_centers, lambdas) -> dict:
     key = [(round(float(centers[w]), _CENTRE_DECIMALS), round(float(secondary_centers[w]), _CENTRE_DECIMALS))
            for w in range(n)]
     lam = [(_finite(lambdas[w]) if w < len(lambdas) else None) for w in range(n)]
+    rung = [None if lam[w] is None else round(lam[w], _CENTRE_DECIMALS) for w in range(n)]
     out = {}
     for w in range(n):
-        out[w] = [] if lam[w] is None else [
+        out[w] = [] if rung[w] is None else [
             j for j in range(n)
-            if j != w and key[j] == key[w] and lam[j] is not None and lam[j] != lam[w]]
+            if j != w and key[j] == key[w] and rung[j] is not None and rung[j] != rung[w]]
     return out
 
 
