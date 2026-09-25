@@ -78,8 +78,13 @@ def test_retire_fires_with_raw_sample_gating():
                  "k1": [60.0] * 8, "centers2": [-0.5, 0.5], "k2": [50.0, 50.0]}
     pol = AdaptiveDecisionPolicy(redundant_overlap=0.40, min_samples_for_retire=200,
                                  retire_converged=True, min_state_steps=40, max_state_steps=4000)
+    # Budget doubled when the score allocator was removed (effective top-ups, task 8):
+    # the old score weights (new states got max_state_steps//2 = 5x the default)
+    # concentrated enough MD for 6000/40000 to reach the retire gate.  Under the
+    # uniform schedule 6000/40000 retires nothing in 5 epochs; 12000/80000 retires
+    # in epoch 4 (measured).
     out = double_adaptive_campaign(lp, layout=redundant, policy=pol, mode="exact",
-                                  n_epochs=5, epoch_raw_budget=6000, total_budget=40000,
+                                  n_epochs=5, epoch_raw_budget=12000, total_budget=80000,
                                   res=80, seed=0, default_steps=400)
     assert sum(len(e["retired"]) for e in out["epochs"]) >= 1     # retire now fires
     assert all(e["n_active"] >= pol.min_active_states for e in out["epochs"])  # floor held

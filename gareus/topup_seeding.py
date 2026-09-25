@@ -127,8 +127,10 @@ def topup_parent_dirs_by_creation_order(out_dir) -> List[Path]:
     all (an unexported parent can never override one that has a real export).
     """
     out_dir = Path(out_dir)
+    # Directories only: the phase dir also holds ``topup_plan.json`` and each
+    # segment's ``topup_*_windows.csv``, which match the glob but are no parent.
     candidates = [
-        d for d in [out_dir.parent / "baseline", *out_dir.parent.glob("topup_*")]
+        d for d in [out_dir.parent / "baseline", *(p for p in out_dir.parent.glob("topup_*") if p.is_dir())]
         if d != out_dir
     ]
 

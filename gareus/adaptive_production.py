@@ -31,6 +31,7 @@ import logging
 import math
 import re
 import shutil
+import time
 from typing import Any, Collection, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -5167,22 +5168,6 @@ def _edge_is_measured_weak(edge: Dict[str, Any], policy: AdaptiveDecisionPolicy)
     return weak
 
 
-def _weak_edge_touch_counts(diagnostics: Optional[Dict[str, Any]], policy: AdaptiveDecisionPolicy) -> Dict[int, int]:
-    counts: Dict[int, int] = {}
-    if not isinstance(diagnostics, dict):
-        return counts
-    for edge in diagnostics.get("edges", []) or []:
-        weak = _edge_is_measured_weak(edge, policy)
-        if weak:
-            for key in ("state_i", "state_j"):
-                try:
-                    sid = int(edge.get(key))
-                    counts[sid] = counts.get(sid, 0) + 1
-                except Exception:
-                    pass
-    return counts
-
-
 def build_adaptive_epoch_schedule(
     registry: WindowStateRegistry,
     diagnostics: Optional[Dict[str, Any]],
@@ -5192,11 +5177,16 @@ def build_adaptive_epoch_schedule(
     default_steps: int,
     final: bool = False,
 ) -> List[Dict[str, Any]]:
-    """Allocate per-state MD steps for the next epoch/final phase.
+    """Uniform per-state MD steps for the next epoch/final phase.
 
-    The schedule is intentionally conservative: every active state receives a
-    baseline all-state segment so graph/exchange connectivity is sampled at
-    least briefly.  Extra top-up segments are assigned to uncertain states.
+    Every active state gets the same share of the phase budget: ``default_steps``,
+    or ``policy.epoch_step_budget``/``final_step_budget`` spread evenly when one is
+    set (``_policy_with_pool_step_budget`` sets it to what the MD pool can still
+    afford), bounded by ``min_state_steps``/``max_state_steps``.  There is no
+    per-state score any more: extra MD for under-converged states is the job of the
+    single deficit-driven top-up ``run_scheduled_adaptive_epoch`` plans from union
+    MBAR diagnostics (``_topup_plan_for_phase``).  The row format is unchanged, so a
+    schedule written by an older version still loads on resume.
     """
     active = registry.active_states()
     if not active:
@@ -5207,64 +5197,18 @@ def build_adaptive_epoch_schedule(
     if max_steps < min_steps:
         max_steps = min_steps
     total_budget = int((policy.final_step_budget if final else policy.epoch_step_budget) or (len(active) * default_steps))
-    total_budget = max(len(active) * min_steps, total_budget)
-    remaining = max(0, total_budget - len(active) * min_steps)
+    per_state = int(min(max_steps, max(min_steps, total_budget // len(active))))
     state_rows = _state_rows_by_id(diagnostics)
-    weak_counts = _weak_edge_touch_counts(diagnostics, policy)
-    articulation = _graph_articulation_states(registry)
-    articulation_degenerate = _articulation_is_degenerate(
-        articulation, active, float(policy.articulation_degenerate_fraction))
-    scored: List[Dict[str, Any]] = []
+    rows = []
     for state in active:
         sid = int(state.state_id)
-        diag = state_rows.get(sid, {})
-        sample_count = int(float(diag.get("sample_count", 0) or 0))
-        boost_sd = diag.get("gamd_boost_sd_kcal_mol")
-        score = 1.0
-        reasons = ["baseline"]
-        if sample_count <= 0:
-            score += 2.0 * float(policy.low_sample_bonus)
-            reasons.append("no_samples_yet")
-        elif sample_count < int(policy.min_samples_for_retire):
-            deficit = 1.0 - min(1.0, sample_count / max(1.0, float(policy.min_samples_for_retire)))
-            score += float(policy.low_sample_bonus) * deficit
-            reasons.append("low_effective_sample_proxy")
-        if sid in weak_counts:
-            score += float(policy.weak_edge_bonus) * float(weak_counts[sid])
-            reasons.append(f"touches_{weak_counts[sid]}_weak_edge(s)")
-        if sid in articulation and not articulation_degenerate:
-            score += float(policy.frontier_bonus)
-            reasons.append("graph_bridge_state")
-        if int(state.created_epoch) >= int(epoch):
-            score += float(policy.frontier_bonus) + 1.0
-            reasons.append("new_state")
-        if boost_sd is not None:
-            try:
-                if float(boost_sd) > float(policy.max_gamd_boost_sd_kcal_mol):
-                    score += float(policy.high_boost_bonus)
-                    reasons.append("high_gamd_boost_sd")
-            except Exception:
-                pass
-        scored.append({
-            "state_id": sid,
-            "score": float(max(0.0, score)),
-            "sample_count": sample_count,
-            "requested_steps": int(min_steps),
-            "baseline_steps": int(min_steps),
-            "extra_steps": 0,
-            "allocation_reason": "; ".join(reasons),
+        rows.append({
+            "state_id": sid, "requested_steps": per_state, "baseline_steps": per_state,
+            "extra_steps": 0, "score": 0.0,
+            "sample_count": int(float((state_rows.get(sid) or {}).get("sample_count", 0) or 0)),
+            "allocation_reason": "baseline",
         })
-    score_sum = sum(float(r["score"]) for r in scored) or float(len(scored))
-    for row in scored:
-        extra = int(round(float(remaining) * float(row["score"]) / score_sum)) if remaining > 0 else 0
-        requested = min(max_steps, int(row["baseline_steps"]) + max(0, extra))
-        state = registry.get_state(int(row["state_id"]))
-        if state is not None and int(state.created_epoch) >= int(epoch):
-            new_steps = int(policy.new_state_steps or max(default_steps, max_steps // 2))
-            requested = min(max_steps, max(requested, new_steps))
-        row["requested_steps"] = int(requested)
-        row["extra_steps"] = max(0, int(requested) - int(row["baseline_steps"]))
-    return scored
+    return rows
 
 
 def write_epoch_schedule_files(epoch_dir: Path, schedule: Sequence[Dict[str, Any]], *, prefix: str = "epoch_schedule") -> Dict[str, str]:
@@ -6377,6 +6321,215 @@ def stage_phase_identity(epoch_dir_name: str, max_epochs: Optional[int] = None) 
     return ident
 
 
+# ---- effective top-ups: one deficit-driven top-up per scheduled phase ------------
+
+# Distinct from the campaign-end "adaptive_union_mbar" artifacts, which a mid-phase
+# union build must never overwrite.
+TOPUP_UNION_PREFIX = "topup_union_mbar"
+KB_KCAL_PER_MOL_K = 0.0019872041
+
+# Union diagnostics measured for a phase IN THIS PROCESS (plan time, then after the
+# top-up), keyed by str(epoch_dir); the epoch diagnostics take their union edge
+# overlaps from here instead of paying for a third union MBAR solve.  A plan reused
+# from disk leaves no entry, so a resumed phase keeps its diagnostics as they are.
+_PHASE_UNION_DIAG: Dict[str, Any] = {}
+
+
+def _phase_union_diagnostics(args, adaptive_dir: Path, registry: "WindowStateRegistry",
+                             policy: AdaptiveDecisionPolicy, f_init):
+    """Union-MBAR top-up diagnostics over every sample the campaign holds so far."""
+    from .adaptive.union_diagnostics import union_diagnostics_from_npz
+    temperature = float(getattr(args, "temperature_k", 300.0) or 300.0)
+    edges = [(a, b) for a, b, _t, _d in build_geometry_edges(registry, policy)]
+    meta = build_union_state_mbar_inputs(adaptive_dir, registry, output_prefix=TOPUP_UNION_PREFIX)
+    return union_diagnostics_from_npz(
+        meta["arrays_npz"], edges, kt_kcal=KB_KCAL_PER_MOL_K * temperature,
+        subsample_counts=meta.get("subsample_counts_per_state"),
+        min_effect_kcal=float(policy.topup_min_effect), f_init=f_init)
+
+
+def _topup_plan_for_phase(args, epoch_dir: Path, registry: "WindowStateRegistry",
+                          policy: AdaptiveDecisionPolicy, *, full_steps: int):
+    """Resume-stable top-up plan for this phase (spec 4.1-4.3).
+
+    A saved plan that is no longer ``"planned"`` (completed, refused, healthy, ...)
+    is this phase's final decision and is returned as-is, so a phase never gets a
+    second top-up.  A saved ``"planned"`` plan is reused (an interrupted top-up
+    resumes the SAME plan) unless one of its states has left the active set.
+    """
+    from .adaptive.throughput import wall_hours
+    from .adaptive.topup_allocator import plan_topup
+    from .adaptive.topup_state import load_plan, load_state, save_plan, save_state
+    from .layout_neighbours import other_rung_same_centre, same_rung_neighbours, spatial_neighbour_pairs
+
+    epoch_dir = Path(epoch_dir)
+    adaptive_dir = epoch_dir.parent
+    active = registry.active_states()
+    ids = [int(s.state_id) for s in active]
+    saved = load_plan(epoch_dir)
+    if saved is not None:
+        if saved.reason != "planned":
+            return saved
+        missing = sorted(set(saved.state_ids) - set(ids))
+        if not missing:
+            return saved
+        print(f"      top-up plan discarded: layout changed (states {missing} no longer active)")
+    state = load_state(adaptive_dir)
+    c1 = [float(s.primary_center) for s in active]
+    c2 = [float(s.secondary_center) if s.secondary_center is not None else 0.0 for s in active]
+    lam = [float(s.gamd_lambda or 0.0) for s in active]
+    k1 = [float(s.primary_k) for s in active]
+    k2 = [float(s.secondary_k or 0.0) for s in active]
+    temperature = float(getattr(args, "temperature_k", 300.0) or 300.0)
+    pairs = spatial_neighbour_pairs(c1, c2, lam, k1, k2, temperature)
+    nb_local, rp_local = same_rung_neighbours(pairs, lam), other_rung_same_centre(c1, c2, lam)
+    neighbours = {ids[w]: [ids[x] for x in nb_local.get(w, [])] for w in range(len(ids))}
+    rung_partners = {ids[w]: [ids[x] for x in rp_local.get(w, [])] for w in range(len(ids))}
+    try:
+        diag = _phase_union_diagnostics(args, adaptive_dir, registry, policy, state["f_kT"])
+    except Exception as exc:
+        print(f"      top-up diagnostics unavailable ({exc}); no top-up this phase")
+        diag = None
+    interval = int(getattr(args, "report_interval", 5000) or 5000)
+    n_gpus = max(1, len(str(getattr(args, "device_index", "0")).split(",")))
+    timestep = float(getattr(args, "timestep_fs", 4.0) or 4.0)
+    budget = float(policy.topup_max_fraction) * wall_hours(int(full_steps), len(ids), timestep, n_gpus,
+                                                           policy.topup_throughput_table)
+    plan = plan_topup(diag, state_ids_in_order=ids, neighbours=neighbours, rung_partners=rung_partners,
+                      policy=policy, report_interval=interval, timestep_fs=timestep, n_gpus=n_gpus,
+                      budget_hours=budget, correction=state["correction"], edge_attempts=state["edge_attempts"])
+    if diag is not None:
+        _PHASE_UNION_DIAG[str(epoch_dir)] = diag
+        state["f_kT"] = dict(diag.f_kT)
+        save_state(adaptive_dir, state)
+    save_plan(epoch_dir, plan)
+    return plan
+
+
+def _seedable_patch(plan, parent_dirs):
+    """Drop states without an exported final State; skip the top-up if no deficit remains.
+
+    ``parent_dirs`` must be the list the segment itself will load
+    (``topup_parent_dirs_by_creation_order``).  ``load_seed_index`` raises
+    ``SeedMismatchError`` on an unreadable parent index (ruling 19); the caller
+    treats that like a runtime seed mismatch.
+    """
+    from dataclasses import replace
+    from .topup_seeding import load_seed_index
+    have = set(load_seed_index(parent_dirs))
+    missing = [s for s in plan.state_ids if s not in have]
+    if not missing:
+        return plan
+    print(f"      top-up: {len(missing)} window(s) without a final State left out (state_ids {missing})")
+    keep = tuple(s for s in plan.state_ids if s in have)
+    deficits = tuple(s for s in plan.deficit_state_ids if s in have)
+    if not deficits:
+        return replace(plan, state_ids=(), steps=0, deficit_state_ids=(), partner_state_ids=(), reason="no_seed_states")
+    return replace(plan, state_ids=keep, deficit_state_ids=deficits,
+                   partner_state_ids=tuple(s for s in plan.partner_state_ids if s in have))
+
+
+def _after_topup_update(args, epoch_dir: Path, registry, policy, plan, elapsed_s: float):
+    """Calibration, edge attempts and wall-time log after a completed top-up.
+
+    Returns the post-top-up union diagnostics (``None`` when unavailable).
+    """
+    from .adaptive.topup_state import load_state, save_state, update_after_topup
+    adaptive_dir = Path(epoch_dir).parent
+    state = load_state(adaptive_dir)
+    try:
+        diag = _phase_union_diagnostics(args, adaptive_dir, registry, policy, state["f_kT"])
+    except Exception as exc:
+        print(f"      top-up calibration skipped ({exc})")
+        diag = None
+    if diag is not None:
+        state = update_after_topup(state, plan, diag.sigma_kcal)
+        state["f_kT"] = dict(diag.f_kT)
+    state["wall_time"].append({"segment": f"{Path(epoch_dir).name}/topup_001_{plan.steps}",
+                               "n_states": len(plan.state_ids), "steps": int(plan.steps),
+                               "predicted_h": float(plan.cost_hours), "realised_h": float(elapsed_s) / 3600.0})
+    save_state(adaptive_dir, state)
+    return diag
+
+
+def _phase_topup_recorded(state: Dict[str, Any], phase_name: str) -> bool:
+    """True once topup_state.json logs a completed top-up for this phase."""
+    prefix = f"{phase_name}/topup_"
+    return any(str((row or {}).get("segment", "")).startswith(prefix) for row in state.get("wall_time", []))
+
+
+def _run_phase_topup(args, epoch_dir: Path, registry, policy, run_segment, *, full_steps: int):
+    """Plan, seed-check and run this phase's single top-up, then calibrate.
+
+    Returns ``"interrupted"`` when a graceful shutdown cut the top-up short;
+    otherwise the union edge overlaps measured in this call (``None`` if none were).
+    A ``SeedMismatchError`` (from the seed index or from inside the segment) ends
+    the top-up only: it is recorded in the saved plan and the phase goes on.
+    """
+    from dataclasses import replace
+    from .adaptive.topup_state import load_state, save_plan
+    from .topup_seeding import SeedMismatchError, topup_parent_dirs_by_creation_order
+
+    epoch_dir = Path(epoch_dir)
+    if _phase_topup_recorded(load_state(epoch_dir.parent), epoch_dir.name):
+        print(f"      top-up: {epoch_dir.name} already ran its top-up (topup_state.json); one per phase")
+        return None
+    _PHASE_UNION_DIAG.pop(str(epoch_dir), None)
+    plan = _topup_plan_for_phase(args, epoch_dir, registry, policy, full_steps=full_steps)
+    try:
+        if plan.reason == "planned":
+            parents = topup_parent_dirs_by_creation_order(epoch_dir / f"topup_001_{int(plan.steps)}")
+            patched = _seedable_patch(plan, parents)
+            if patched != plan:
+                save_plan(epoch_dir, patched)   # a resumed segment must get the same state set
+            plan = patched
+        print(f"      top-up plan: {plan.reason}, {len(plan.state_ids)} states "
+              f"({len(plan.deficit_state_ids)} deficit + {len(plan.partner_state_ids)} partners), "
+              f"{plan.steps} steps, {float(plan.cost_hours):.2f} h predicted")
+        if plan.reason == "planned" and plan.state_ids and int(plan.steps) > 0:
+            t_start = time.monotonic()
+            run_segment(f"topup_001_{int(plan.steps)}", list(plan.state_ids), int(plan.steps))
+            if _graceful_shutdown.is_set():
+                return "interrupted"
+            diag_after = _after_topup_update(args, epoch_dir, registry, policy, plan, time.monotonic() - t_start)
+            save_plan(epoch_dir, replace(plan, reason="completed"))
+            if diag_after is not None:
+                _PHASE_UNION_DIAG[str(epoch_dir)] = diag_after
+    except SeedMismatchError as exc:
+        print(f"      top-up aborted, campaign continues: {exc}")
+        save_plan(epoch_dir, replace(plan, reason="seed_mismatch"))
+    diag = _PHASE_UNION_DIAG.pop(str(epoch_dir), None)
+    return dict(diag.edge_overlap) if diag is not None else None
+
+
+def _apply_union_edge_overlap(diagnostics: Dict[str, Any], edge_overlap: Dict[Tuple[int, int], float],
+                              policy: AdaptiveDecisionPolicy) -> None:
+    """Write measured union overlaps into the epoch diagnostics' edges, in place.
+
+    Every measured edge gets ``mbar_overlap``; a rung edge's warnings are
+    re-derived from it (its ``rung_overlap_unavailable`` is no longer true), so the
+    existing proposer turns a measured low rung overlap into ``add_rung``.  Spatial
+    edges keep their CV-histogram ``overlap``, which is what bridges are judged on.
+    """
+    for edge in (diagnostics or {}).get("edges", []) or []:
+        try:
+            si, sj = int(edge.get("state_i")), int(edge.get("state_j"))
+        except (TypeError, ValueError):
+            continue
+        value = edge_overlap.get((min(si, sj), max(si, sj)))
+        if value is None:
+            continue
+        edge["mbar_overlap"] = float(value)
+        if str(edge.get("edge_type")) == "rung":
+            kept = [w for w in edge.get("warnings", []) or []
+                    if w not in ("rung_overlap_unavailable", "low_rung_overlap")]
+            wi, wj = edge.get("window_i"), edge.get("window_j")
+            rung = EdgeDiagnostics(state_i=si, state_j=sj, window_i=-1 if wi is None else int(wi),
+                                   window_j=-1 if wj is None else int(wj), edge_type="rung",
+                                   mbar_overlap=float(value), warnings=kept)
+            edge["warnings"] = _annotate_edge_warnings(rung, policy).warnings
+
+
 def run_scheduled_adaptive_epoch(
     args: Any,
     epoch_dir: Path,
@@ -6407,16 +6560,22 @@ def run_scheduled_adaptive_epoch(
         raise RuntimeError("adaptive allocation schedule selected no states")
     baseline_steps = min(int(r.get("baseline_steps", 0) or 0) for r in schedule if int(r.get("requested_steps", 0) or 0) > 0)
     baseline_steps = max(1, baseline_steps)
-    topups_enabled = _arg_bool(args, "adaptive_production_topups", False)
-    if not topups_enabled:
+    # The un-shortened per-state phase length: the top-up budget is a fraction of
+    # THIS, taken before the baseline is shortened to make room for the top-up.
+    full_steps = baseline_steps
+    topups_enabled = bool(getattr(policy, "topups_enabled", False)) or _arg_bool(args, "adaptive_production_topups", False)
+    if topups_enabled:
+        baseline_steps = max(1000, _quantized_extra_steps(int(full_steps * (1.0 - float(policy.topup_max_fraction)))))
+        print(f"      top-ups on: all-state baseline runs {baseline_steps} of {full_steps} steps/state; "
+              f"up to {float(policy.topup_max_fraction):.0%} of the phase's wall time is held for one top-up")
+    else:
         # Baseline only: it carries the phase's whole per-state budget, so the MD
-        # the allocator meant for the phase is spent uniformly over every state
+        # the schedule meant for the phase is spent uniformly over every state
         # (and a resumed baseline simply continues from its checkpoint).
         requested = [int(r.get("requested_steps", 0) or 0) for r in schedule
                      if int(r.get("requested_steps", 0) or 0) > 0]
-        uniform = _quantized_extra_steps(int(round(sum(requested) / len(requested))))
-        baseline_steps = max(baseline_steps, uniform)
-        print(f"      top-ups disabled (--no-ap-topups): all-state baseline runs {baseline_steps} steps/state")
+        baseline_steps = max(baseline_steps, _quantized_extra_steps(int(round(sum(requested) / len(requested)))))
+        print(f"      top-ups off (enable with --ap-topups): all-state baseline runs {baseline_steps} steps/state")
     segment_summaries: List[Dict[str, Any]] = []
     resume_requested = _arg_bool(args, "adaptive_production_resume", False)
     _seg_call_counter: List[int] = [0]
@@ -6660,8 +6819,7 @@ def run_scheduled_adaptive_epoch(
         })
         return seg_dir
 
-    run_segment("baseline", active_ids, baseline_steps)
-    if _graceful_shutdown.is_set():
+    def _interrupted() -> Dict[str, Any]:
         payload = {
             "schema_version": "adaptive_scheduled_epoch_v1",
             "status": "interrupted_after_checkpoint",
@@ -6673,27 +6831,20 @@ def run_scheduled_adaptive_epoch(
         }
         write_json(epoch_dir / "scheduled_epoch_summary.json", payload)
         return {"summary": payload, "diagnostics": {}}
-    groups: Dict[int, List[int]] = {}
-    for row in (schedule if topups_enabled else ()):
-        extra = _quantized_extra_steps(int(row.get("requested_steps", 0) or 0) - baseline_steps)
-        if extra <= 0:
-            continue
-        groups.setdefault(extra, []).append(int(row["state_id"]))
-    for idx, (extra_steps, state_ids) in enumerate(sorted(groups.items()), start=1):
-        run_segment(f"topup_{idx:03d}_{extra_steps}", state_ids, extra_steps)
-        if _graceful_shutdown.is_set():
-            payload = {
-                "schema_version": "adaptive_scheduled_epoch_v1",
-                "status": "interrupted_after_checkpoint",
-                "epoch_dir": str(epoch_dir),
-                "baseline_steps": int(baseline_steps),
-                "segments": segment_summaries,
-                "diagnostics_json": "",
-                "schedule_csv": str(epoch_dir / "epoch_schedule.csv"),
-            }
-            write_json(epoch_dir / "scheduled_epoch_summary.json", payload)
-            return {"summary": payload, "diagnostics": {}}
+
+    run_segment("baseline", active_ids, baseline_steps)
+    if _graceful_shutdown.is_set():
+        return _interrupted()
+    union_edge_overlap: Optional[Dict[Tuple[int, int], float]] = None
+    if topups_enabled:
+        outcome = _run_phase_topup(args, epoch_dir, registry, policy, run_segment, full_steps=full_steps)
+        if outcome == "interrupted":
+            return _interrupted()
+        union_edge_overlap = outcome
     diagnostics = collect_segmented_epoch_diagnostics(epoch_dir, registry, policy)
+    if union_edge_overlap:
+        _apply_union_edge_overlap(diagnostics, union_edge_overlap, policy)
+        write_json(epoch_dir / "adaptive_epoch_diagnostics.json", diagnostics)
     payload = {
         "schema_version": "adaptive_scheduled_epoch_v1",
         "epoch_dir": str(epoch_dir),

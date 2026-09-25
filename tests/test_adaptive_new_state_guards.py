@@ -476,9 +476,12 @@ def test_pool_sized_final_default_steps_actually_reaches_the_new_states():
     new = build_adaptive_epoch_schedule(
         registry, diagnostics, policy, epoch=2, default_steps=new_steps, final=True)
 
+    # The schedule is uniform now (no per-state "new_state" score), so pick the
+    # three late-created states by their creation epoch, not the reason string.
+    new_ids = {s.state_id for s in registry.active_states() if int(s.created_epoch) >= 2}
+
     def _new_state_steps(rows):
-        return [int(r["requested_steps"]) for r in rows
-                if "new_state" in str(r["allocation_reason"])]
+        return [int(r["requested_steps"]) for r in rows if int(r["state_id"]) in new_ids]
 
     old_new = _new_state_steps(old)
     new_new = _new_state_steps(new)
