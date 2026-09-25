@@ -138,15 +138,37 @@ def test_a_truncated_state_xml_is_treated_as_missing_with_a_warning(tmp_path, ca
     assert any("state 3" in rec.message for rec in caplog.records if rec.name == "gareus.topup_seeding")
 
 
-def test_a_corrupt_index_json_is_treated_as_no_seeds_with_a_warning(tmp_path, caplog):
+def test_a_corrupt_index_json_in_any_parent_raises_seed_mismatch_error(tmp_path):
+    # Ruling 19: unlike a per-state problem (this test's sibling above), a whole
+    # corrupt/unreadable index.json must NOT be silently skipped -- skipping it could
+    # let an older parent's copy of the same state win and restart its chain from an
+    # earlier point. It must raise, naming the broken parent, instead.
     base = tmp_path / "baseline"
     (base / "final_window_states").mkdir(parents=True)
     (base / "final_window_states" / "state_3.xml").write_text("<State/>")
     (base / "final_window_states" / "index.json").write_text("{not valid json")
-    with caplog.at_level(logging.WARNING, logger="gareus.topup_seeding"):
-        idx = load_seed_index([base])
-    assert idx == {}
-    assert any(str(base) in rec.message for rec in caplog.records if rec.name == "gareus.topup_seeding")
+    with pytest.raises(SeedMismatchError) as exc_info:
+        load_seed_index([base])
+    assert str(base) in str(exc_info.value)
+
+
+def test_a_corrupt_index_in_the_newest_parent_is_not_silently_skipped_in_favor_of_an_older_one(tmp_path):
+    # The exact scenario ruling 19 exists to prevent: an older parent genuinely has a
+    # copy of state 3, and a naive "skip a broken parent" policy would silently seed
+    # from that stale copy instead of failing loudly.
+    older = tmp_path / "baseline"
+    newer = tmp_path / "topup_001_1000"
+    _fake_export(older, 3, 0.1, 0.2, export_seq=1)
+    (newer / "final_window_states").mkdir(parents=True)
+    (newer / "final_window_states" / "index.json").write_text("{not valid json")
+
+    with pytest.raises(SeedMismatchError) as exc_info:
+        load_seed_index([older, newer])
+    assert str(newer) in str(exc_info.value)
+
+    with pytest.raises(SeedMismatchError) as exc_info2:
+        load_seed_states([older, newer], [3])
+    assert str(newer) in str(exc_info2.value)
 
 
 def test_a_record_missing_required_fields_is_treated_as_missing_with_a_warning(tmp_path, caplog):

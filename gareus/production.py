@@ -6295,136 +6295,6 @@ def reconcile_resume_secondary_cv_metadata(
     return meta
 
 
-def _find_adaptive_dir_root(out_dir: Path) -> Optional[Path]:
-    """Walk up from a segment's own out_dir to find the campaign's adaptive_production/ root.
-
-    Always named "adaptive_production" throughout this codebase (see
-    adaptive_production.py's own adaptive_dir construction). Walking up
-    rather than assuming a fixed nesting depth, since baseline/topup
-    segments nest one level deeper than a plain epoch, and "final" one
-    level deeper still.
-    """
-    for parent in Path(out_dir).resolve().parents:
-        if parent.name == "adaptive_production":
-            return parent
-    return None
-
-
-def _seed_bank_row_exists(seed_bank_dir: Path, seed_name: str) -> bool:
-    csv_path = Path(seed_bank_dir) / "final_survivor_seeds.csv"
-    if not csv_path.exists() or csv_path.stat().st_size <= 0:
-        return False
-    try:
-        with csv_path.open(newline="") as handle:
-            return any(row.get("seed_name") == seed_name for row in csv.DictReader(handle))
-    except Exception:
-        return False
-
-
-def _augment_seed_bank_with_campaign_search(
-    args, out_dir: Path, topology, centers_a, secondary_cv_centers,
-) -> None:
-    """For topup segments, search the campaign's own accumulated trajectory
-    history for a real frame close to each window's target, adding one to
-    the seed bank when found - before generate_us_starting_states_by_pulling
-    runs its own per-window nearest-conformer selection over whatever the
-    (otherwise static) GENPEPT library currently offers.
-
-    Scoped to topup-tagged segments only (``_adaptive_phase_info["is_topup"]``):
-    a baseline/initial-epoch window getting seeded wrong sets a worse
-    foundation for everything the adaptive process subsequently builds on
-    top of it, so those keep the stricter, unmodified library-only path. A
-    topup is always re-seeding an ALREADY-established window, and the
-    accumulated trajectory is exactly the kind of real data a static
-    pre-generated library can never anticipate (confirmed on real data:
-    chignolin_6 state 27, an original edge-of-range window, kept failing its
-    seed-preflight check on every topup retry with only the static library
-    to draw from).
-
-    Never raises, and only ever ADDS a new seed-bank row - never removes or
-    replaces anything - so generate_us_starting_states_by_pulling's own
-    existing per-window nearest-conformer selection just naturally discovers
-    and prefers it if (and only if) it scores closer than every existing
-    candidate. Every fail-closed/ground-truth-verification guarantee in
-    resolve_seed_frame_pdb/search_campaign_for_near_frame still applies -
-    this can only ever help or be a no-op, never make a window's seeding
-    worse than it already was.
-    """
-    phase_info = getattr(args, "_adaptive_phase_info", {}) or {}
-    if not phase_info.get("is_topup"):
-        return
-    if secondary_cv_centers is None or centers_a is None or len(centers_a) == 0:
-        return
-    seed_bank_dir_value = getattr(args, "seed_conformers_dir", None)
-    if not seed_bank_dir_value:
-        return
-    seed_bank_dir = Path(seed_bank_dir_value)
-    if not seed_bank_dir.is_dir():
-        return
-    adaptive_dir = _find_adaptive_dir_root(out_dir)
-    if adaptive_dir is None:
-        return
-
-    try:
-        from .tica import search_campaign_for_near_frame
-        from .seeding import _finite_spacing_scale
-    except Exception:
-        return
-
-    primary_scale = _finite_spacing_scale(list(centers_a), fallback=1.0)
-    finite_secondary = [
-        float(c) for c in secondary_cv_centers if c is not None and math.isfinite(float(c))
-    ]
-    secondary_scale = _finite_spacing_scale(finite_secondary, fallback=0.25)
-    max_score = float(getattr(args, "us_seed_preflight_max_score", 1.2) or 1.2)
-
-    n_added = 0
-    n_searched = 0
-    for w in range(len(centers_a)):
-        secondary_c = secondary_cv_centers[w] if secondary_cv_centers is not None else None
-        if secondary_c is None or not math.isfinite(float(secondary_c)):
-            continue
-        primary_c = float(centers_a[w])
-        secondary_c = float(secondary_c)
-        seed_name = f"campaign_search_p{primary_c:.4f}_s{secondary_c:.4f}"
-        if _seed_bank_row_exists(seed_bank_dir, seed_name):
-            continue
-        n_searched += 1
-        pdb_path = seed_bank_dir / "pdbs" / f"{seed_name}.pdb"
-        try:
-            info = search_campaign_for_near_frame(
-                adaptive_dir, topology, primary_c, secondary_c,
-                primary_scale, secondary_scale, max_score, pdb_path,
-            )
-        except Exception as exc:
-            print(f"WARNING: campaign seed search failed for window {w} ({exc})")
-            continue
-        if info is None:
-            continue
-        try:
-            from .adaptive_production import _append_seed_bank_row
-            _append_seed_bank_row(seed_bank_dir, {
-                "seed_name": seed_name,
-                "survivor_pdb_path": str(Path("pdbs") / pdb_path.name),
-                "source_run_dir": info["seed_frame"]["epoch_dir"],
-                "source_pdb_path": info["source_xtc"],
-                "source_label": "campaign_search_topup",
-                "source_state_id": "",
-                "source_epoch_window": info["frame_index"],
-                "primary_cv_value": primary_c,
-                "secondary_cv_value": secondary_c,
-            })
-        except Exception as exc:
-            print(f"WARNING: failed to register campaign-search seed for window {w} ({exc})")
-            continue
-        n_added += 1
-    if n_searched:
-        print(
-            f"    Campaign seed search (topup): searched {n_searched} window(s) with no prior "
-            f"campaign-search seed, added {n_added} real extracted frame(s) to {seed_bank_dir}"
-        )
-
-
 def _release_run_lock_best_effort(out_dir: Path) -> None:
     """Best-effort removal of this process's own ``.gareus_run.lock``.
 
@@ -6911,8 +6781,6 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             add_umbrella_cv_forces(openmm, starting_structure_system, topology, primary_cv_def, args,
                                    secondary_enabled=bool((secondary_cv_metadata or {}).get("enabled")))
 
-            _augment_seed_bank_with_campaign_search(args, out_dir, topology, centers_a, secondary_cv_centers)
-
             window_start_positions, window_start_velocities, dropped_window_indices = generate_us_starting_states_by_pulling(
                 args, out_dir, openmm, app, unit, topology, starting_structure_system, centers_nm, ks_kj_nm2,
                 equil_state, primary_cv_def, cv_atom1, cv_atom2, setup_platform, setup_props, progress=progress,
@@ -7114,6 +6982,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     if progress is not None:
         progress.progress("replica_construction", 0, nrep, message=f"{nrep} replicas", force=True)
     replica_gamd_copy_report = []
+    _velocity_randomize_skip_count = 0
     for i in range(nrep):
         system_i = deserialize_system(openmm, base_system)
         integrator_i, gamd_result = make_production_integrator(openmm, system_i, args, unit)
@@ -7188,6 +7057,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                         print(f"    GaMD: frozen envelope carries no stage machine; replicas seeded into stage 5 "
                               f"(stepCount {seeded_step})", flush=True)
                 set_replica_lambda_for_window(integrator_i, i, state_lambdas, k0max_by_channel)
+            _skipped_velocity_randomization = False
             if not fast_resume:
                 start_box = window_start_boxes[i] if window_start_boxes and i < len(window_start_boxes) and window_start_boxes[i] is not None else box
                 sim_i.context.setPeriodicBoxVectors(*start_box)
@@ -7203,12 +7073,10 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                         # existing velocity chain; randomizing it here would throw
                         # away exactly the continuity effective top-ups exist to
                         # preserve, even though --randomize-replica-velocities was
-                        # requested for the campaign as a whole.
-                        logger.info(
-                            "Window %d was seeded from a top-up parent State; skipping "
-                            "--randomize-replica-velocities for it to preserve its continued "
-                            "velocity chain.", i,
-                        )
+                        # requested for the campaign as a whole. Logged once for the
+                        # whole segment (with a count), not once per window here --
+                        # see the summary line after the replica-construction loop.
+                        _skipped_velocity_randomization = True
                     sim_i.context.setVelocities(start_vel)
                 set_window(sim_i.context, centers_nm, ks_kj_nm2, i, secondary_cv_centers, secondary_cv_ks_kj)
                 if _is_seeded_window:
@@ -7234,10 +7102,11 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 controller_i = npt_runtime.initialize_controller(
                     sim_i.context, seed=npt_seed_replica(args, i)
                 )
-            return sim_i, loaded_checkpoint, copied, skipped, controller_i
+            return sim_i, loaded_checkpoint, copied, skipped, controller_i, _skipped_velocity_randomization
 
         try:
-            sim_i, loaded_shared_gamd_checkpoint, copied_globals, skipped_globals, controller_i = _sim_pool.submit(i, _build_context_i).result()
+            (sim_i, loaded_shared_gamd_checkpoint, copied_globals, skipped_globals, controller_i,
+             _replica_skipped_velocity_randomization) = _sim_pool.submit(i, _build_context_i).result()
         except SeedMismatchError:
             # A seeded window's post-set_window CV assertion failed (ruling 17): tear
             # down every per-replica worker thread (some already hold live OpenMM
@@ -7247,6 +7116,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             _sim_pool.shutdown(wait=True)
             _release_run_lock_best_effort(out_dir)
             raise
+        if _replica_skipped_velocity_randomization:
+            _velocity_randomize_skip_count += 1
         replica_gamd_copy_report.append({
             "replica": int(i),
             "copied_count": int(len(copied_globals)),
@@ -7279,6 +7150,16 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         drivers.append(driver_i)
         if progress is not None:
             progress.progress("replica_construction", i + 1, nrep, message=f"built replica {i + 1}/{nrep}")
+
+    if _velocity_randomize_skip_count:
+        # Ruling 17: one summary line for the whole segment, not one per window --
+        # --randomize-replica-velocities was requested for the campaign but skipped
+        # for every seeded (top-up-continued) window, to preserve its velocity chain.
+        logger.info(
+            "%d of %d replicas were seeded from a top-up parent State; "
+            "--randomize-replica-velocities was skipped for them to preserve their "
+            "continued velocity chains.", _velocity_randomize_skip_count, nrep,
+        )
 
     if progress is not None:
         progress.progress("replica_construction", nrep, nrep, message=f"{nrep} replicas ready", force=True)

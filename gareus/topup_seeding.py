@@ -133,6 +133,13 @@ def topup_parent_dirs_by_creation_order(out_dir) -> List[Path]:
     ]
 
     def _order_key(d: Path) -> float:
+        # A corrupt/unreadable index here only affects sort position (it sorts
+        # first, like an unexported parent) -- it does NOT decide whether this
+        # parent's states are usable. load_seed_index (ruling 19) is the single
+        # place that raises on a corrupt index, the moment it is actually asked to
+        # resolve a state from it; ordering happens earlier and must stay
+        # exception-free so a merely-cosmetic ordering pass can't itself crash a
+        # segment that never needed the broken parent's states at all.
         idx = d / DIR_NAME / "index.json"
         try:
             record = json.loads(idx.read_text())
@@ -205,6 +212,19 @@ def export_final_window_states(out_dir, sims: Sequence, assignments: Sequence[in
 
 
 def load_seed_index(parent_dirs: Iterable) -> Dict[int, str]:
+    """Window/state -> parent dir map, "later parents override earlier ones".
+
+    A corrupt or unreadable ``index.json`` in ANY candidate parent raises
+    ``SeedMismatchError`` naming that parent (ruling 19), rather than silently
+    skipping it the way a per-state problem does (ruling 14). Skipping a whole
+    corrupt parent would let an OLDER parent's copy of the same state silently win
+    the "later parents override earlier ones" resolution -- restarting that
+    window's chain from an earlier point instead of failing loudly, which is
+    exactly the kind of silent-regression bug this whole seeding mechanism exists
+    to prevent. A problem confined to one state's own record or XML (the index
+    itself parses fine) is unaffected and still degrades to "treated as missing"
+    via :func:`load_seed_states`.
+    """
     out: Dict[int, str] = {}
     for parent in parent_dirs:                       # later parents override earlier ones
         idx = Path(parent) / DIR_NAME / "index.json"
@@ -213,13 +233,16 @@ def load_seed_index(parent_dirs: Iterable) -> Dict[int, str]:
         try:
             record = json.loads(idx.read_text())
         except Exception as exc:
-            logger.warning("Top-up seed index %s is unreadable (%s); treating parent %s as having no seeds",
-                          idx, exc, parent)
-            continue
+            raise SeedMismatchError(
+                f"top-up seed index {idx} (parent {parent}) is unreadable ({exc}); refusing to silently "
+                "skip this parent -- that could let an older parent's copy of the same state win and "
+                "restart its chain from an earlier point"
+            )
         if not isinstance(record, dict):
-            logger.warning("Top-up seed index %s does not hold a JSON object; treating parent %s as having no seeds",
-                          idx, parent)
-            continue
+            raise SeedMismatchError(
+                f"top-up seed index {idx} (parent {parent}) does not hold a JSON object; refusing to "
+                "silently skip this parent"
+            )
         for key in record:
             try:
                 sid = int(key)
