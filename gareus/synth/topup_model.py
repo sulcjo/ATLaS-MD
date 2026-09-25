@@ -143,7 +143,12 @@ def _write_union_npz(path: Path, landscape, camp: _Campaign, windows) -> dict:
 
 
 def _diagnose(tmp: Path, landscape, camp, windows, layout, f_init):
-    """The driver's ``_phase_union_diagnostics`` call: sigma against same-rung neighbours, rung fallback."""
+    """The driver's ``_phase_union_diagnostics`` call: sigma against same-rung neighbours, rung fallback.
+
+    Frozen with the study (ruling 31): the driver has since also dropped tried-out
+    edges from the sigma neighbour sets and forces the sigma-setting neighbour into
+    the patch (ruling 33, I4/I5); this harness does not mirror either.
+    """
     from ..adaptive.union_diagnostics import union_diagnostics_from_npz
     edges, neighbours, rung_partners, policy = layout
     path = Path(tmp) / "union.npz"

@@ -221,3 +221,31 @@ def test_run_gareus_guards_the_export_with_the_predicate():
     everywhere = [c for c in ast.walk(ast.parse(src)) if isinstance(c, ast.Call)
                   and ast.unparse(c.func) == "export_final_window_states"]
     assert len(everywhere) == 1                      # no unguarded second call site
+
+
+# ---- I4: a tried-out (structural) edge no longer sets its endpoints' sigma ----
+
+def test_an_exhausted_edge_is_dropped_from_both_endpoints_sigma_neighbours():
+    nb = {0: [1, 2], 1: [0], 2: [0]}
+    rung = {0: [10], 1: [11], 2: [12]}
+    got = ap._topup_sigma_neighbours([0, 1, 2], nb, rung, {(0, 1): 2}, 2)
+    assert got == {0: [2], 1: [11], 2: [0]}          # 1 lost its only neighbour -> rung fallback
+
+
+def test_an_edge_below_the_attempt_limit_still_counts():
+    nb = {0: [1], 1: [0]}
+    got = ap._topup_sigma_neighbours([0, 1], nb, {}, {(1, 0): 1}, 2)
+    assert got == {0: [1], 1: [0]}
+
+
+def test_phase_diagnostics_pass_the_filtered_sigma_neighbours(tmp_path, monkeypatch):
+    args, adaptive, reg = _campaign(tmp_path)
+    seen = {}
+    monkeypatch.setattr(ap, "build_union_state_mbar_inputs", lambda *a, **k: {"arrays_npz": "x"})
+    import gareus.adaptive.union_diagnostics as ud
+    monkeypatch.setattr(ud, "union_diagnostics_from_npz",
+                        lambda *a, **k: seen.setdefault("sigma_neighbours", k["sigma_neighbours"]))
+    layout = ([0, 1, 2], {0: [1], 1: [0, 2], 2: [1]}, {0: [], 1: [], 2: []})
+    ap._phase_union_diagnostics(args, adaptive, reg, ap.policy_from_args(args), {}, layout,
+                                edge_attempts={(1, 2): 5})
+    assert seen["sigma_neighbours"] == {0: [1], 1: [0], 2: []}

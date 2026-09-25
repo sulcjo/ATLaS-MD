@@ -6361,18 +6361,41 @@ def _topup_layout_neighbours(args, active):
     return ids, neighbours, rung_partners
 
 
+def _topup_sigma_neighbours(ids, neighbours, rung_partners, edge_attempts, max_edge_attempts: int):
+    """The states each state's sigma_k is read against (rulings 23 and 33/I4).
+
+    Same-rung spatial neighbours, minus any neighbour whose edge is structural
+    by exhaustion (``edge_attempts >= max_edge_attempts``): across a real gap
+    the max-over-neighbours sigma stays high for both endpoints, so without
+    this both endpoints would be topped every phase after the edge was already
+    handed to the bridge machinery.  Rung partners (same centre, other rung)
+    are the fallback when no same-rung neighbour is left.
+    """
+    exhausted = {(min(int(a), int(b)), max(int(a), int(b)))
+                 for (a, b), n in (edge_attempts or {}).items() if int(n) >= int(max_edge_attempts)}
+    out = {}
+    for s in ids:
+        same = [j for j in (neighbours.get(s) or []) if (min(s, j), max(s, j)) not in exhausted]
+        out[s] = same or list(rung_partners.get(s, []))
+    return out
+
+
 def _phase_union_diagnostics(args, adaptive_dir: Path, registry: "WindowStateRegistry",
-                             policy: AdaptiveDecisionPolicy, f_init, layout_neighbours=None):
+                             policy: AdaptiveDecisionPolicy, f_init, layout_neighbours=None,
+                             edge_attempts=None):
     """Union-MBAR top-up diagnostics over every sample the campaign holds so far.
 
     ``layout_neighbours`` is ``_topup_layout_neighbours``'s result when the caller already has it.
+    ``edge_attempts`` (``topup_state.json``'s counts) removes tried-out edges from the
+    sigma neighbour sets; pass the SAME counts at plan time and after the top-up, so
+    the realised sigma is measured on the neighbour set the prediction was made for.
     """
     from .adaptive.union_diagnostics import union_diagnostics_from_npz
     temperature = float(getattr(args, "temperature_k", 300.0) or 300.0)
     edges = [(a, b) for a, b, _t, _d in build_geometry_edges(registry, policy)]
-    # sigma_k is read against same-rung spatial neighbours, rung partners as fallback (ruling 23).
     ids, neighbours, rung_partners = layout_neighbours or _topup_layout_neighbours(args, registry.active_states())
-    sigma_neighbours = {s: neighbours.get(s) or rung_partners.get(s, []) for s in ids}
+    sigma_neighbours = _topup_sigma_neighbours(ids, neighbours, rung_partners, edge_attempts,
+                                               int(policy.topup_max_edge_attempts))
     # Same source filters as the campaign-end union build: the tICA guard must drop
     # epochs sampled under a different CV2 definition, or their cv2 samples are
     # scored against the wrong centres and the plan targets the wrong states.
@@ -6424,7 +6447,8 @@ def _topup_plan_for_phase(args, epoch_dir: Path, registry: "WindowStateRegistry"
     layout = _topup_layout_neighbours(args, active)
     _ids, neighbours, rung_partners = layout
     try:
-        diag = _phase_union_diagnostics(args, adaptive_dir, registry, policy, state["f_kT"], layout)
+        diag = _phase_union_diagnostics(args, adaptive_dir, registry, policy, state["f_kT"], layout,
+                                        edge_attempts=state["edge_attempts"])
     except Exception as exc:
         print(f"      top-up diagnostics unavailable ({exc}); no top-up this phase")
         diag = None
@@ -6481,7 +6505,8 @@ def _after_topup_update(args, epoch_dir: Path, registry, policy, plan, elapsed_s
     adaptive_dir = Path(epoch_dir).parent
     state = load_state(adaptive_dir)
     try:
-        diag = _phase_union_diagnostics(args, adaptive_dir, registry, policy, state["f_kT"])
+        diag = _phase_union_diagnostics(args, adaptive_dir, registry, policy, state["f_kT"],
+                                        edge_attempts=state["edge_attempts"])
     except Exception as exc:
         print(f"      top-up calibration skipped ({exc})")
         diag = None
