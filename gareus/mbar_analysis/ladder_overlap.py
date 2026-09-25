@@ -15,13 +15,16 @@ from gareus.mbar_analysis.pmf import overlap_components
 
 _TOL = 1.0e-9
 
-# Threshold for the SYMMETRISED MBAR STATE-OVERLAP metric this module grades --
-# NOT for a CV histogram-intersection overlap. The two are different quantities
-# on different scales and are not interchangeable: gareus.mbar_analysis.pmf
-# says so explicitly of overlap_matrix.csv vs --min-neighbor-overlap, and this
-# module used to default to that CV1-marginal target (0.30), against which no
-# pair of chignolin_7's 64 states cleared on either axis while the CV1-marginal
-# check on the same axis simultaneously passed at 0.491/connected.
+# Threshold for the SYMMETRISED PAIRWISE MBAR STATE-OVERLAP metric this module
+# grades -- NOT for a CV histogram-intersection overlap, and NOT for a raw
+# entry of the full-union ``mbar_state_overlap`` matrix either (see
+# ``ladder_overlap_by_axis``'s ``pair_overlap`` argument below). The CV
+# histogram-intersection quantity is a different scale entirely and not
+# interchangeable: gareus.mbar_analysis.pmf says so explicitly of
+# overlap_matrix.csv vs --min-neighbor-overlap, and this module used to
+# default to that CV1-marginal target (0.30), against which no pair of
+# chignolin_7's 64 states cleared on either axis while the CV1-marginal check
+# on the same axis simultaneously passed at 0.491/connected.
 #
 # 0.15 is the project's own calibration for this metric, not a new number:
 # AdaptivePolicy.min_rung_overlap (gareus/adaptive_production.py) gates rung
@@ -31,13 +34,23 @@ _TOL = 1.0e-9
 # that symmetrising O_ij leaves that calibration valid). Using it here makes
 # the analysis report agree with the driver gate on the same measurement.
 #
+# That pilot calibration is confirmed, not merely reused, at full campaign
+# scale: RUNS/chignolin_7's 64-state union (16 CV1 centres x 4 rungs) measures
+# a PAIRWISE median of 0.258 across its 48 adjacent-rung edges (0/48 below
+# 0.15) -- consistent with the pilot's 0.240-0.298 -- once each edge is scored
+# with ``gareus.mbar_analysis.ladder.pairwise_state_overlap`` (union f_k held
+# fixed, only the pair's own samples in the denominator) instead of a raw
+# entry of the full-union matrix. The full-union matrix on those SAME 48
+# edges gives a median of only 0.089 (38/48 below 0.15) -- diluted by roughly
+# how many other states share each edge's region, not a real overlap
+# difference -- which is why ``ladder_overlap_by_axis`` grades the pairwise
+# value, never the full-matrix one, for its neighbour-edge/threshold rows.
+#
 # Caveat, deliberately not encoded: that calibration is a RUNG calibration,
 # measured on a 1-D 5-state single-centre ladder. The cv1_direction rows reuse
 # it as the nearest calibration for the same metric -- far better than
-# borrowing a different metric's target, but still a reuse. It is also
-# conservative for a 2-D (centre x rung) grid, where each state shares its
-# unit column sum with up to 4 neighbours instead of 2, so healthy adjacent
-# overlaps are intrinsically lower than on the 1-D pilot ladder.
+# borrowing a different metric's target, but still a reuse across axes (rung
+# vs CV1), independent of the pairwise-vs-full-matrix fix above.
 LADDER_STATE_OVERLAP_MIN = 0.15
 
 _EMPTY_AXIS = {"pairs": [], "worst": None, "worst_pair": None, "n_pairs": 0,
@@ -111,20 +124,41 @@ def _axis_connectivity(K: int, pairs, group_values: np.ndarray,
 
 
 def ladder_overlap_by_axis(overlap, state_lambdas, centers,
-                            thr: float = LADDER_STATE_OVERLAP_MIN, n_k=None):
+                            thr: float = LADDER_STATE_OVERLAP_MIN, n_k=None,
+                            pair_overlap=None):
     """Split neighbour overlaps into the λ direction and the CV1 direction,
     and grade each axis' own bridging.
 
     λ-direction pairs share a CV1 centre and are adjacent in sorted λ.
     CV1-direction pairs share a rung and are adjacent in sorted centre.
 
-    Each pair's value is ``symmetric_state_overlap(overlap, a, b)`` -- i.e.
-    ``sqrt(O_ab * O_ba)`` -- never the raw ``overlap[a, b]``. ``O`` is
-    asymmetric whenever the two states' sample counts differ (unequal
-    ``n_k`` is the normal case under adaptive extension, not the exception;
-    see ``gareus.mbar_analysis.ladder.symmetric_state_overlap``), so the raw
+    Each pair's value comes from ``pair_overlap(a, b)`` if given, else from
+    ``symmetric_state_overlap(overlap, a, b)`` -- i.e. ``sqrt(O_ab * O_ba)`` --
+    never the raw ``overlap[a, b]``. ``O`` is asymmetric whenever the two
+    states' sample counts differ (unequal ``n_k`` is the normal case under
+    adaptive extension, not the exception; see
+    ``gareus.mbar_analysis.ladder.symmetric_state_overlap``), so the raw
     entry would make a reported "worst" pair depend on which state happened
     to come first in the pair -- not on anything physical.
+
+    ``pair_overlap``, when given, is a ``(a, b) -> Optional[float]`` callable
+    used INSTEAD of indexing ``overlap`` (which may then be ``None``) --
+    normally a closure over
+    ``gareus.mbar_analysis.ladder.pairwise_state_overlap(u_nk, window, f_k,
+    n_k, a, b)``. This module's neighbour-edge/threshold rows are meant to be
+    graded on the PAIRWISE metric, not a raw entry of the full-union
+    ``mbar_state_overlap`` matrix, which dilutes an edge's overlap by roughly
+    how many OTHER states share its region (see ``LADDER_STATE_OVERLAP_MIN``'s
+    module-level comment for the chignolin_7 numbers). ``overlap`` stays a
+    real, separate parameter -- not merely kept for backward compatibility --
+    because nothing in this function actually needs the FULL K x K matrix:
+    every value it reads is one ``(a, b)`` pair the axis-splitting loops
+    below already identified, and the connectivity check
+    (``_axis_connectivity``) is built from that same already-symmetrised
+    pair list, never from ``overlap`` itself. Omitting ``pair_overlap``
+    (the default) keeps the original full-matrix-indexing behaviour, still
+    exercised directly by this module's own unit tests, which construct
+    ``overlap`` by hand rather than from real per-sample MBAR data.
 
     Returns ``(summary, warnings)``. ``summary`` has one key per axis
     (``lambda_direction``, ``cv1_direction``), each carrying the pairwise
@@ -142,9 +176,10 @@ def ladder_overlap_by_axis(overlap, state_lambdas, centers,
     - ``state_lambdas is None`` -- reachable: the CONTRADICTION case in
       ``gareus.mbar_analysis.crosscheck`` (``gamd_ladder`` asserted while a
       loader dropped ``state_lambdas``) leaves exactly this on ``d``.
-    - ``overlap``/``state_lambdas``/``centers`` disagree in length -- also
-      independently reachable: ``gareus.mbar_analysis.data``'s window reader
-      can silently drop a state with a blank centre, making
+    - ``state_lambdas``/``centers`` disagree in length, or (when
+      ``pair_overlap`` is not given) ``overlap``'s shape disagrees with
+      either -- also independently reachable: ``gareus.mbar_analysis.data``'s
+      window reader can silently drop a state with a blank centre, making
       ``len(centers) < K`` true on its own.
     """
     if state_lambdas is None:
@@ -154,14 +189,22 @@ def ladder_overlap_by_axis(overlap, state_lambdas, centers,
             "case in gareus.mbar_analysis.crosscheck)"
         ]
 
-    overlap = np.asarray(overlap, dtype=np.float64)
     lam = np.asarray(state_lambdas, dtype=np.float64)
     cen = np.asarray(centers, dtype=np.float64)
-    K = int(overlap.shape[0]) if (overlap.ndim == 2 and overlap.shape[0] == overlap.shape[1]) else -1
-    if K < 0 or lam.shape[0] != K or cen.shape[0] != K:
+    K = int(lam.shape[0])
+    if pair_overlap is None:
+        overlap = np.asarray(overlap, dtype=np.float64)
+        overlap_ok = overlap.ndim == 2 and overlap.shape[0] == overlap.shape[1] and overlap.shape[0] == K
+        if not overlap_ok or cen.shape[0] != K:
+            return _empty_axes(), [
+                "ladder-overlap axis report skipped: array length mismatch "
+                f"(overlap {overlap.shape}, state_lambdas {lam.shape}, centers {cen.shape})"
+            ]
+        pair_overlap = lambda a, b: symmetric_state_overlap(overlap, a, b)  # noqa: E731
+    elif cen.shape[0] != K:
         return _empty_axes(), [
             "ladder-overlap axis report skipped: array length mismatch "
-            f"(overlap {overlap.shape}, state_lambdas {lam.shape}, centers {cen.shape})"
+            f"(state_lambdas {lam.shape}, centers {cen.shape})"
         ]
 
     lam_pairs, cv1_pairs = [], []
@@ -170,7 +213,7 @@ def ladder_overlap_by_axis(overlap, state_lambdas, centers,
         order = idx[np.argsort(lam[idx])]
         for a, b in zip(order[:-1], order[1:]):
             if abs(lam[b] - lam[a]) > _TOL:
-                v = symmetric_state_overlap(overlap, a, b)
+                v = pair_overlap(int(a), int(b))
                 if v is not None:
                     lam_pairs.append((a, b, v))
     for value in np.unique(np.round(lam, 9)):
@@ -178,7 +221,7 @@ def ladder_overlap_by_axis(overlap, state_lambdas, centers,
         order = idx[np.argsort(cen[idx])]
         for a, b in zip(order[:-1], order[1:]):
             if abs(cen[b] - cen[a]) > _TOL:
-                v = symmetric_state_overlap(overlap, a, b)
+                v = pair_overlap(int(a), int(b))
                 if v is not None:
                     cv1_pairs.append((a, b, v))
 

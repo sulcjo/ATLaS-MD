@@ -21,6 +21,8 @@ from typing import Dict, Iterable, Optional, Tuple
 import numpy as np
 from scipy.stats import norm
 
+from gareus.mbar_analysis.ladder import pairwise_state_overlap as _pair_overlap
+
 MIN_HALF = 20
 
 
@@ -114,22 +116,13 @@ def _split_halves(u, window, K, min_effect_kT, alpha):
             if math.isfinite(d) and math.isfinite(se) and d > max(z_star * se, min_effect_kT)}
 
 
-def _pair_overlap(u: np.ndarray, window: np.ndarray, f: np.ndarray, n_k: np.ndarray, ia: int, ib: int) -> float:
-    """Symmetric pairwise overlap sqrt(O_ij O_ji) of states ia, ib with the union f held fixed.
-
-    Only the pair's own samples enter, with a 2-state mixture denominator:
-    W_nk = exp(f_k - u_k(x_n)) / sum_{l in {i,j}} N_l exp(f_l - u_l(x_n)), O_ij = N_j sum_n W_ni W_nj.
-    Unlike the full-union overlap matrix, this does not shrink with the number of other
-    states the pair overlaps (K identical states give 1/K there; here two identical states give 0.5).
-    """
-    from scipy.special import logsumexp  # noqa: PLC0415
-    rows = (window == ia) | (window == ib)
-    cols = np.array([ia, ib])
-    logq = f[cols][None, :] - u[np.ix_(rows, cols)]                 # log exp(f_k - u_k), k in {i, j}
-    n = n_k[cols].astype(float)
-    log_w = logq - logsumexp(logq, b=n[None, :], axis=1)[:, None]
-    shared = float(np.exp(logsumexp(log_w[:, 0] + log_w[:, 1])))   # sum_n W_ni W_nj
-    return math.sqrt((n[1] * shared) * (n[0] * shared))            # sqrt(O_ij O_ji)
+# _pair_overlap (symmetric pairwise overlap sqrt(O_ij O_ji) of two states, with the
+# union f held fixed and only the pair's own samples entering the denominator) used
+# to be defined here. It is now the shared ``gareus.mbar_analysis.ladder.pairwise_state_overlap``
+# (imported above under this module's original name) -- the campaign-end rung gate
+# (``gareus.adaptive_production.rung_mbar_overlap_from_union``) and the analysis-side
+# ladder-overlap report (``gareus.mbar_analysis.ladder_overlap.ladder_overlap_by_axis``)
+# were found to need the identical computation, so it moved to avoid a third copy.
 
 
 def union_diagnostics_from_npz(npz_path, edges: Iterable[Tuple[int, int]], *, kt_kcal: float,

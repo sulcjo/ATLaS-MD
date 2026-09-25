@@ -257,3 +257,57 @@ def symmetric_state_overlap(overlap: np.ndarray, i: int, j: int) -> Optional[flo
     if not (math.isfinite(a) and math.isfinite(b)) or a < 0.0 or b < 0.0:
         return None
     return math.sqrt(a * b)
+
+
+def pairwise_state_overlap(
+    u_nk: np.ndarray, window: np.ndarray, f_k: np.ndarray, n_k: np.ndarray, i: int, j: int,
+) -> float:
+    """Symmetric pairwise overlap ``sqrt(O_ij * O_ji)`` of states ``i``, ``j``
+    ALONE, with the rest of the union's ``f_k`` held fixed.
+
+    ``mbar_state_overlap`` above normalises each sample's weight over EVERY
+    state in the union, so a pair's own overlap is diluted by roughly however
+    many other states share its region -- on RUNS/chignolin_7's 64-state
+    union (16 CV1 centres x 4 rungs), the 48 adjacent-rung pairs came out at
+    a full-union ``sqrt(O_ij*O_ji)`` median of 0.089 (38/48 below the 0.15
+    floor) versus a pairwise median of 0.258 (0/48 below) -- roughly the
+    ratio of "how many states sit in the same region" one would expect from
+    dilution, not a real overlap difference. This function is what
+    ``min_rung_overlap``/``target_rung_overlap``
+    (``gareus/adaptive_production.py``) and ``LADDER_STATE_OVERLAP_MIN``
+    (``gareus/mbar_analysis/ladder_overlap.py``) are actually calibrated
+    against (the S3 pilot ladder that produced 0.298/0.250/0.240/0.273 had
+    only ~4 states total, i.e. an effectively pairwise scale already).
+
+    Only the pair's own samples enter, with a 2-state mixture denominator:
+    ``W_nk = exp(f_k - u_k(x_n)) / sum_{l in {i,j}} N_l exp(f_l - u_l(x_n))``,
+    ``O_ij = N_j sum_n W_ni W_nj``. Unlike the full-union overlap matrix,
+    this does not shrink with the number of OTHER states the pair overlaps:
+    ``K`` identical states give ``1/K`` there; two identical states give
+    ``0.5`` here, regardless of how many other states are in the union
+    (``f_k`` is held fixed rather than re-solved on the pair alone, so this
+    is exact only to the extent the passed-in ``f_k`` is itself converged).
+
+    ``window`` is the per-row generating-state index (as returned by e.g.
+    ``solve_mbar``'s own convention), NOT a boolean mask.
+
+    This is the canonical home for the computation: it used to be a private
+    copy in ``gareus.adaptive.union_diagnostics._pair_overlap`` (top-up
+    per-epoch diagnostics), which now aliases this function instead of
+    hand-rolling a second copy. ``gareus.adaptive_production.rung_mbar_overlap_from_union``
+    and ``gareus.mbar_analysis.ladder_overlap.ladder_overlap_by_axis`` (via
+    its ``pair_overlap`` callback) are the two campaign-end/analysis
+    consumers switched onto it in the same change.
+    """
+    from scipy.special import logsumexp  # noqa: PLC0415
+    u_nk = np.asarray(u_nk, dtype=np.float64)
+    window = np.asarray(window)
+    f_k = np.asarray(f_k, dtype=np.float64).reshape(-1)
+    n_k = np.asarray(n_k, dtype=np.float64).reshape(-1)
+    rows = (window == i) | (window == j)
+    cols = np.array([i, j])
+    logq = f_k[cols][None, :] - u_nk[np.ix_(rows, cols)]            # log exp(f_k - u_k), k in {i, j}
+    n = n_k[cols]
+    log_w = logq - logsumexp(logq, b=n[None, :], axis=1)[:, None]
+    shared = float(np.exp(logsumexp(log_w[:, 0] + log_w[:, 1])))    # sum_n W_ni W_nj
+    return math.sqrt((n[1] * shared) * (n[0] * shared))             # sqrt(O_ij O_ji)
