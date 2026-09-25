@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Tuple
 
@@ -35,6 +35,10 @@ class UnionDiagnostics:
     inefficiency: dict
     edge_overlap: dict
     f_kT: dict
+    # state_id -> the sigma neighbour whose link set sigma_k (the max); absent when
+    # sigma_k came from the no-measured-neighbour fallback.  The allocator forces
+    # it into the patch so the link that makes the state deficient is itself topped.
+    sigma_argmax: dict = field(default_factory=dict)
 
 
 def _solve(u_nk: np.ndarray, window: np.ndarray, n_states: int, f_init: Optional[np.ndarray] = None):
@@ -73,11 +77,17 @@ def _local_sigma(dmat: np.ndarray, k: int, neighbours) -> float:
     same-rung spatial neighbour tracks the true local PMF error best. The old rule (min over
     all edge neighbours) let a well-sampled rung twin hide a sparse state.
     """
-    vals = [dmat[j, k] for j in neighbours if np.isfinite(dmat[j, k])]
+    return _local_sigma_and_argmax(dmat, k, neighbours)[0]
+
+
+def _local_sigma_and_argmax(dmat: np.ndarray, k: int, neighbours):
+    """``(_local_sigma, j)``: ``j`` is the neighbour achieving the max, ``None`` on the fallback."""
+    vals = [(float(dmat[j, k]), j) for j in neighbours if np.isfinite(dmat[j, k])]
     if vals:
-        return float(max(vals))
+        best = max(v for v, _j in vals)
+        return best, next(j for v, j in vals if v == best)
     row = dmat[k][np.isfinite(dmat[k]) & (np.arange(len(dmat)) != k)]
-    return float(np.min(row)) if row.size else float("nan")
+    return (float(np.min(row)) if row.size else float("nan")), None
 
 
 def _inefficiency(ids, subsample_counts) -> Dict[int, float]:
@@ -171,7 +181,9 @@ def union_diagnostics_from_npz(npz_path, edges: Iterable[Tuple[int, int]], *, kt
         if sigma_neighbours is not None:
             sig_nbrs = {k: [idx[int(j)] for j in sigma_neighbours.get(ids[k], []) if int(j) in idx and idx[int(j)] != k]
                         for k in range(K)}
-        sigma = np.array([_local_sigma(dmat, k, sig_nbrs[k]) if n_k[k] > 0 else np.nan for k in range(K)])
+        local = [_local_sigma_and_argmax(dmat, k, sig_nbrs[k]) if n_k[k] > 0 else (np.nan, None)
+                 for k in range(K)]
+        sigma = np.array([v for v, _j in local])
         flagged = (_split_halves(u, window, K, min_effect_kcal / kt_kcal, alpha)
                    if split_halves else set())
         edge_overlap = {}
@@ -190,6 +202,7 @@ def union_diagnostics_from_npz(npz_path, edges: Iterable[Tuple[int, int]], *, kt
             inefficiency=_inefficiency(ids, subsample_counts),
             edge_overlap=edge_overlap,
             f_kT={ids[k]: float(f[k]) for k in range(K) if math.isfinite(f[k])},
+            sigma_argmax={ids[k]: ids[j] for k, (_v, j) in enumerate(local) if j is not None},
         )
     except Exception as exc:  # the epoch then runs no top-up
         logging.warning("top-up union diagnostics unavailable (%s)", exc, exc_info=True)

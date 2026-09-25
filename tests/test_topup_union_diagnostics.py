@@ -249,3 +249,22 @@ def test_pair_overlap_with_f_held_fixed_is_identical_in_a_3_and_a_30_state_union
         f = np.zeros(len(centers)); f[1] = 0.3                      # the pair's f, held fixed
         got.append(_pair_overlap(u, w, f, np.bincount(w, minlength=len(centers)), 0, 1))
     assert got[0] == got[1]
+
+
+def test_sigma_argmax_names_the_neighbour_that_sets_sigma(tmp_path):
+    """State 1 sits between a well-sampled 0 and a sparse 2: the 1-2 link is the least certain."""
+    rng = np.random.default_rng(3)
+    centers, k, n = [0.0, 1.0, 2.0], 4.0, [4000, 4000, 60]
+    x = np.concatenate([rng.normal(c, 0.5, m) for c, m in zip(centers, n)])
+    sid = np.concatenate([np.full(m, s) for s, m in enumerate(n)])
+    u = 0.5 * k * (x[:, None] - np.asarray(centers)[None, :]) ** 2
+    p = tmp_path / "a.npz"
+    np.savez(p, umbrella_reduced_bias_nk=u, state_ids=np.arange(3), sampled_state_ids=sid)
+    d = union_diagnostics_from_npz(p, _chain_edges(3), kt_kcal=KT, split_halves=False)
+    assert d.sigma_argmax[1] == 2 and d.sigma_argmax[0] == 1 and d.sigma_argmax[2] == 1
+
+
+def test_sigma_argmax_is_absent_on_the_no_neighbour_fallback(tmp_path):
+    p = _write(tmp_path, [0.0, 1.0], k=4.0, n_per=500)
+    d = union_diagnostics_from_npz(p, [(0, 1)], kt_kcal=KT, sigma_neighbours={0: [], 1: [0]})
+    assert 0 not in d.sigma_argmax and d.sigma_argmax[1] == 0

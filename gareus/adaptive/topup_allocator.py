@@ -68,8 +68,17 @@ def plan_topup(diag, *, state_ids_in_order: Sequence[int], neighbours: Dict[int,
     deficits = {s for s in sampled if sigma[s] > target or s in diag.unconverged}
     initial = frozenset(deficits)
     structural, noise_edges = [], []
+    # Rung pairs (same centre, other rung -- the driver's other_rung_same_centre,
+    # passed as rung_partners) are judged against the campaign's one rung floor,
+    # min_rung_overlap, like every other rung reader; spatial edges against
+    # topup_weak_overlap.
+    rung_edges = {(min(int(a), int(b)), max(int(a), int(b)))
+                  for a, bs in rung_partners.items() for b in bs}
+    weak_spatial = float(policy.topup_weak_overlap)
+    weak_rung = float(getattr(policy, "min_rung_overlap", weak_spatial))
     for (a, b), ov in sorted(diag.edge_overlap.items()):
-        if not _ok(ov) or ov >= float(policy.topup_weak_overlap):
+        threshold = weak_rung if (min(a, b), max(a, b)) in rung_edges else weak_spatial
+        if not _ok(ov) or ov >= threshold:
             continue
         tried_out = attempts.get((a, b), 0) >= int(policy.topup_max_edge_attempts)
         if (a in initial or b in initial) and not tried_out:
@@ -107,6 +116,13 @@ def plan_topup(diag, *, state_ids_in_order: Sequence[int], neighbours: Dict[int,
                 chosen.add(pick(pool))
         if rung and not any(x in deficits or x in chosen for x in rung):
             chosen.add(pick(rung))
+    # The neighbour whose link sets a deficit's sigma_k (the max) is what makes
+    # that state deficient; topping the deficit alone leaves that link half-fed.
+    sigma_argmax = getattr(diag, "sigma_argmax", None) or {}
+    for s in sorted(deficits):
+        j = sigma_argmax.get(s)
+        if j is not None and j in sampled:
+            chosen.add(j)
     partners = chosen - deficits
     patch = deficits | partners
 

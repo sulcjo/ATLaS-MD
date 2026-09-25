@@ -217,3 +217,36 @@ def test_the_length_is_capped_by_budget_when_worst_deficit_is_expensive():
     assert p.reason == "planned"
     # L must be a multiple of interval, so ~200k (within interval tolerance)
     assert p.steps <= 200_000 and p.steps >= 200_000 - IV
+
+
+def test_the_neighbour_that_sets_a_deficits_sigma_is_in_the_patch():
+    """I5: state 1's sigma is set by its link to healthy 2; the default partner rule picks 0."""
+    from dataclasses import replace
+    base = _plan(_diag(_one_deficit()))
+    assert 2 not in base.state_ids                          # the partner rule alone leaves 2 out
+    p = _plan(replace(_diag(_one_deficit()), sigma_argmax={1: 2}))
+    assert 2 in p.partner_state_ids and {0, 1, 5} <= set(p.state_ids)
+    assert p.steps == base.steps and p.deficit_state_ids == base.deficit_state_ids
+
+
+def test_an_unsampled_sigma_argmax_is_never_added():
+    from dataclasses import replace
+    s = _one_deficit(); s[2] = math.nan
+    p = _plan(replace(_diag(s), sigma_argmax={1: 2}))
+    assert 2 not in p.state_ids
+
+
+def _plan_with(policy, diag, n=4):
+    nb, rp = _chain(n)
+    return plan_topup(diag, state_ids_in_order=list(diag.state_ids), neighbours=nb, rung_partners=rp,
+                      policy=policy, report_interval=IV, timestep_fs=4.0, n_gpus=4, budget_hours=100.0)
+
+
+def test_rung_edges_are_judged_against_min_rung_overlap_not_topup_weak_overlap():
+    """M1: (1, 5) is a rung pair in _chain(4), (1, 2) a spatial one; both measured at 0.20."""
+    healthy = {s: 0.05 for s in range(8)}
+    edges = {(1, 2): 0.20, (1, 5): 0.20}
+    strict_rung = AdaptiveDecisionPolicy(topups_enabled=True, topup_weak_overlap=0.15, min_rung_overlap=0.30)
+    assert _plan_with(strict_rung, _diag(healthy, edges=edges)).structural_edges == ((1, 5),)
+    strict_spatial = AdaptiveDecisionPolicy(topups_enabled=True, topup_weak_overlap=0.30, min_rung_overlap=0.10)
+    assert _plan_with(strict_spatial, _diag(healthy, edges=edges)).structural_edges == ((1, 2),)
