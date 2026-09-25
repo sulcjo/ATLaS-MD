@@ -445,6 +445,13 @@ class AdaptiveDecisionPolicy:
     # stall.  Either way the edge is reported, never silently dropped.
     bridge_repairable_first: bool = True
     bridge_skip_unreachable: bool = False
+    topups_enabled: bool = False
+    topup_target_sigma: float = 0.10
+    topup_weak_overlap: float = 0.15
+    topup_max_fraction: float = 0.3
+    topup_min_effect: float = 0.05
+    topup_max_edge_attempts: int = 2
+    topup_throughput_table: tuple = ((16.0, 3154.0), (59.0, 2300.0))
 
 
 class WindowStateRegistry:
@@ -6388,7 +6395,7 @@ def run_scheduled_adaptive_epoch(
         raise RuntimeError("adaptive allocation schedule selected no states")
     baseline_steps = min(int(r.get("baseline_steps", 0) or 0) for r in schedule if int(r.get("requested_steps", 0) or 0) > 0)
     baseline_steps = max(1, baseline_steps)
-    topups_enabled = _arg_bool(args, "adaptive_production_topups", True)
+    topups_enabled = _arg_bool(args, "adaptive_production_topups", False)
     if not topups_enabled:
         # Baseline only: it carries the phase's whole per-state budget, so the MD
         # the allocator meant for the phase is spent uniformly over every state
@@ -6934,6 +6941,14 @@ def policy_from_args(args: Any) -> AdaptiveDecisionPolicy:
             args, "adaptive_production_bridge_repairable_first", True),
         bridge_skip_unreachable=_arg_bool(
             args, "adaptive_production_bridge_skip_unreachable", False),
+        topups_enabled=_arg_bool(args, "adaptive_production_topups", False),
+        topup_target_sigma=_arg_float(args, "adaptive_production_topup_target_sigma", 0.10),
+        topup_weak_overlap=_arg_float(args, "adaptive_production_topup_weak_overlap", 0.15),
+        topup_max_fraction=_arg_float(args, "adaptive_production_topup_max_fraction", 0.3),
+        topup_min_effect=_arg_float(args, "adaptive_production_topup_min_effect", 0.05),
+        topup_max_edge_attempts=_arg_int(args, "adaptive_production_topup_max_edge_attempts", 2),
+        topup_throughput_table=tuple(getattr(args, "adaptive_production_topup_throughput_table",
+                                             ((16.0, 3154.0), (59.0, 2300.0)))),
         context_reuse=_arg_bool(args, "adaptive_production_context_reuse", False),
         context_reuse_require=_arg_bool(args, "adaptive_production_context_reuse_require", False),
         context_reuse_mode=str(getattr(args, "adaptive_production_context_reuse_mode", "off") or "off"),

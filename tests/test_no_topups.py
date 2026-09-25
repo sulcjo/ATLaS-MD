@@ -56,9 +56,9 @@ def test_no_topups_runs_only_the_baseline_at_the_mean_requested_steps(tmp_path, 
     assert not list((Path(out) / "adaptive_production" / "final").glob("topup_*"))
 
 
-def test_the_flag_parses_and_defaults_on():
+def test_the_flag_parses_and_defaults_off():
     from gareus.cli import build_gareus_parser
 
     p = build_gareus_parser()
-    assert p.parse_args(["--seq", "AA"]).ap_topups is True
-    assert p.parse_args(["--seq", "AA", "--no-ap-topups"]).ap_topups is False
+    assert p.parse_args(["--seq", "AA"]).ap_topups is False
+    assert p.parse_args(["--seq", "AA", "--ap-topups"]).ap_topups is True

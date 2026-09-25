@@ -476,12 +476,24 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                         "(deliberately NOT the pool-derived final target: an extension round runs "
                         "after the final phase already drew its share of the MD pool).")
     p.add_argument("--ap-retire-converged", action=argparse.BooleanOptionalAction, default=False)
-    p.add_argument("--ap-topups", action=argparse.BooleanOptionalAction, default=True,
-                   help="Scheduled epochs/final run an all-state baseline plus top-up segments over "
-                        "state subsets. --no-ap-topups runs the baseline only, giving it the phase's "
+    p.add_argument("--ap-topups", action=argparse.BooleanOptionalAction, default=False,
+                   help="Top-ups (off by default): Scheduled epochs/final run an all-state baseline plus top-up segments over "
+                        "state subsets. --ap-topups enables them; --no-ap-topups runs the baseline only, giving it the phase's "
                         "whole per-state budget (mean of the allocator's requested steps). Recommended "
                         "for lambda-ladder campaigns, where a top-up batch holds one rung (no lambda "
                         "exchange) and restarts its windows from a fresh pull.")
+    p.add_argument("--ap-topup-target-sigma", type=float, default=0.10,
+                   help="Per-state local free-energy uncertainty target (kcal/mol) for top-ups.")
+    p.add_argument("--ap-topup-weak-overlap", type=float, default=0.15,
+                   help="Symmetric energy-space overlap below which an edge is weak.")
+    p.add_argument("--ap-topup-max-fraction", type=float, default=0.3,
+                   help="Cap on the share of an epoch's wall-hour budget spent on top-ups.")
+    p.add_argument("--ap-topup-min-effect", type=float, default=0.05,
+                   help="Smallest split-halves free-energy discrepancy (kcal/mol) that can flag a state.")
+    p.add_argument("--ap-topup-max-edge-attempts", type=int, default=2,
+                   help="Top-ups a weak edge may receive before it is treated as structural (bridge).")
+    p.add_argument("--ap-topup-throughput-table", default="16:3154,59:2300",
+                   help="contexts_per_gpu:ns_per_day_node pairs, comma separated.")
     p.add_argument("--ap-gamd-boost-sd-warn", type=float, default=6.0)
     p.add_argument("--ap-write-reports", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--md-budget-ns", type=float, default=0.0,
@@ -1420,6 +1432,16 @@ def _shim_adaptive_production(args: argparse.Namespace) -> None:
     args.adaptive_production_bridge_skip_unreachable = args.ap_bridge_skip_unreachable
     args.adaptive_production_retire_converged = args.ap_retire_converged
     args.adaptive_production_topups = args.ap_topups
+    args.adaptive_production_topup_target_sigma = args.ap_topup_target_sigma
+    args.adaptive_production_topup_weak_overlap = args.ap_topup_weak_overlap
+    args.adaptive_production_topup_max_fraction = args.ap_topup_max_fraction
+    args.adaptive_production_topup_min_effect = args.ap_topup_min_effect
+    args.adaptive_production_topup_max_edge_attempts = args.ap_topup_max_edge_attempts
+    try:
+        args.adaptive_production_topup_throughput_table = tuple(
+            (float(a), float(b)) for a, b in (item.split(":") for item in str(args.ap_topup_throughput_table).split(",") if item))
+    except ValueError as exc:
+        raise SystemExit(f"--ap-topup-throughput-table must be 'ctx:ns_per_day,...' ({exc})")
     args.adaptive_production_max_gamd_boost_sd_kcal_mol = args.ap_gamd_boost_sd_warn
     args.adaptive_production_write_action_reports = args.ap_write_reports
     args.adaptive_production_total_md_pool_ns = args.md_budget_ns
