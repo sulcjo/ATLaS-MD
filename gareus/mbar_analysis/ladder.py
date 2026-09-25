@@ -239,18 +239,12 @@ def symmetric_state_overlap(overlap: np.ndarray, i: int, j: int) -> Optional[flo
     combination, ``S_ij * sqrt(N_i * N_j)``, and it equals ``O_ij`` exactly
     when ``N_i == N_j``.
 
-    Shared home for the convention: ``gareus.adaptive_production`` has its own
-    ``_symmetric_state_overlap`` with the same formula and the same reasoning
-    (see ``gareus/adaptive_production.py:3697-3725``), predating this one and
-    not de-duplicated here. There is no import-cycle risk in doing so --
-    ``adaptive_production`` already imports FROM this module
-    (``gareus/adaptive_production.py:3416,3697``) and this module imports
-    nothing from ``adaptive_production``, so ``adaptive_production``'s copy
-    could safely be replaced with an import of this function; that
-    de-duplication was simply out of scope for the task that added this
-    function and has not been done. Any *new* caller of
-    ``mbar_state_overlap`` -- e.g. ``gareus.mbar_analysis.ladder_overlap`` --
-    should call this function rather than hand-roll a third copy.
+    The one home for this convention: ``gareus.adaptive_production`` used to
+    carry a private copy (``_symmetric_state_overlap``), deleted once it had no
+    production caller. The full-matrix value it returns is diluted on a large
+    union (see ``pairwise_state_overlap`` below); gates and health checks use
+    the pairwise function, and ``gareus.mbar_analysis.ladder_overlap`` falls
+    back to this one only when no ``pair_overlap`` callable is given.
     """
     a = float(overlap[i, j])
     b = float(overlap[j, i])

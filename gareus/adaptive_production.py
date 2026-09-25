@@ -32,7 +32,7 @@ import math
 import re
 import shutil
 import time
-from typing import Any, Collection, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -3801,35 +3801,6 @@ def rung_mbar_overlap_from_union(
         return {}
 
 
-def _symmetric_state_overlap(overlap: np.ndarray, i: int, j: int) -> Optional[float]:
-    """The full-union-matrix per-edge overlap metric: ``sqrt(O_ij * O_ji)``.
-
-    ``mbar_state_overlap`` returns ``O = diag(N) @ S`` with ``S`` symmetric, so
-    ``O_ij != O_ji`` whenever ``N_i != N_j`` -- and adaptive extension makes
-    unequal per-state sample counts the normal case, not the exception.  The raw
-    ``O[i, j]`` would make an edge's gate metric depend on which of its two
-    states happens to hold the lower state id, which is unrelated to anything
-    physical.  The geometric mean is the symmetric combination,
-    ``S_ij * sqrt(N_i * N_j)``, and it equals ``O_ij`` exactly when
-    ``N_i == N_j``.
-
-    NOT what ``rung_mbar_overlap_from_union`` uses any more: the full-union
-    matrix dilutes an edge's overlap by roughly how many OTHER states share
-    its region (measured on chignolin_7: full-union median 0.089 vs a
-    pairwise median of 0.258 on the same 48 adjacent-rung edges -- see
-    ``gareus.mbar_analysis.ladder.pairwise_state_overlap``, which is what the
-    driver calls today and what the 0.15 / 0.25 thresholds are calibrated
-    against). Kept here -- and still directly unit-tested -- as the
-    full-matrix analogue used by ``gareus.mbar_analysis.ladder_overlap``'s
-    default (non-``pair_overlap``) code path.
-    """
-    a = float(overlap[i, j])
-    b = float(overlap[j, i])
-    if not (math.isfinite(a) and math.isfinite(b)) or a < 0.0 or b < 0.0:
-        return None
-    return math.sqrt(a * b)
-
-
 def _write_matrix_csv(path: Path, matrix: np.ndarray, state_ids: np.ndarray) -> None:
     matrix = np.asarray(matrix, dtype=float)
     with Path(path).open("w", newline="") as handle:
@@ -5022,31 +4993,6 @@ def propose_actions_from_diagnostics(
         if int(diag.get("sample_count", 0) or 0) < int(policy.min_samples_for_retire):
             actions.append(("extend", sid, "below minimum retirement sample count"))
     return actions
-
-
-def _articulation_is_degenerate(
-    articulation: Collection[int],
-    active: Collection[Any],
-    fraction: float = 0.80,
-) -> bool:
-    """True when the articulation set is too large to discriminate.
-
-    `frontier_bonus` is meant to protect states that hold the MBAR overlap graph
-    together. That is a real signal when bridges are rare. On a path graph it is
-    not a signal at all: every interior node is an articulation point, so the
-    term fires for n-2 of n states before any data exists.
-
-    Measured on chignolin_7 (112 states): 110 of 112 scored the bonus every epoch,
-    and the two chain-end states took a ~36% smaller top-up purely for ending the
-    chain (extra 1,539,102 vs 2,407,082 steps in epoch_001). In epoch_002 those
-    endpoints had *fewer* samples than the interior (9,345 vs 12,817), so the one
-    term that does track run data ranked them higher -- and was overridden anyway.
-    """
-    n_active = len(active)
-    n_art = len(articulation)
-    if n_active <= 0 or n_art <= 0:
-        return False
-    return (n_art / float(n_active)) >= float(fraction)
 
 
 def _graph_articulation_states(registry: WindowStateRegistry) -> set[int]:
