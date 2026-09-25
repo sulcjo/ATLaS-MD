@@ -139,7 +139,7 @@ def test_weak_edge_classification_depends_on_initial_deficits_only():
 
 
 def test_weak_edge_classification_mirror():
-    # Same layout, but only state 3 deficient.
+    # Symmetry check: same layout, but only state 3 deficient. Ensures order-independence.
     s = {x: 0.05 for x in range(8)}; s[3] = 0.15
     nb = {0: [], 1: [2], 2: [1, 3], 3: [2], 4: [], 5: [], 6: [], 7: []}
     rp = {i: [i+4] for i in range(4)}; rp.update({i+4: [i] for i in range(4)})
@@ -195,3 +195,25 @@ def test_correction_factor_lower_bound_is_clamped():
     p = _plan(_diag(_one_deficit()), correction={1: -3.0})
     p_ref = _plan(_diag(_one_deficit()), correction={1: 0.1})
     assert p.steps == p_ref.steps
+
+
+def test_the_length_serves_the_worst_deficit():
+    # Regression test: L must be determined by the worst (highest sigma) deficit, not the first or smallest.
+    # State 1: σ=0.12, State 4: σ=0.30 (target 0.10). Others healthy.
+    # State 4 needs: min(n*((σ/target)^2-1)*interval*g, 4*n*interval*g) = min(800k, 400k) = 400,000 steps
+    # State 1 needs: n*((0.12/0.10)^2-1)*interval*g = 100*0.44*1000 = 44,000 steps
+    s = {x: 0.05 for x in range(8)}; s[1] = 0.12; s[4] = 0.30
+    p = _plan(_diag(s), budget=1000.0)  # generous budget
+    assert p.reason == "planned" and p.steps == 400_000  # capped at 4*n*interval*g
+    assert p.steps > 44_000  # strictly greater than state 1's required L
+
+
+def test_the_length_is_capped_by_budget_when_worst_deficit_is_expensive():
+    # Same setup as above, but budget only affords ~half of state 4's max required L.
+    # State 4 max required is 400k (capped by 4*n*interval*g), so budget for 200k.
+    s = {x: 0.05 for x in range(8)}; s[1] = 0.12; s[4] = 0.30
+    budget = wall_hours(200_000, 4, 4.0, 4, POL.topup_throughput_table)
+    p = _plan(_diag(s), budget=budget)
+    assert p.reason == "planned"
+    # L must be a multiple of interval, so ~200k (within interval tolerance)
+    assert p.steps <= 200_000 and p.steps >= 200_000 - IV
