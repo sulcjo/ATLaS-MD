@@ -6376,13 +6376,16 @@ def _topup_layout_neighbours(args, active):
 
 
 def _phase_union_diagnostics(args, adaptive_dir: Path, registry: "WindowStateRegistry",
-                             policy: AdaptiveDecisionPolicy, f_init):
-    """Union-MBAR top-up diagnostics over every sample the campaign holds so far."""
+                             policy: AdaptiveDecisionPolicy, f_init, layout_neighbours=None):
+    """Union-MBAR top-up diagnostics over every sample the campaign holds so far.
+
+    ``layout_neighbours`` is ``_topup_layout_neighbours``'s result when the caller already has it.
+    """
     from .adaptive.union_diagnostics import union_diagnostics_from_npz
     temperature = float(getattr(args, "temperature_k", 300.0) or 300.0)
     edges = [(a, b) for a, b, _t, _d in build_geometry_edges(registry, policy)]
     # sigma_k is read against same-rung spatial neighbours, rung partners as fallback (ruling 23).
-    ids, neighbours, rung_partners = _topup_layout_neighbours(args, registry.active_states())
+    ids, neighbours, rung_partners = layout_neighbours or _topup_layout_neighbours(args, registry.active_states())
     sigma_neighbours = {s: neighbours.get(s) or rung_partners.get(s, []) for s in ids}
     # Same source filters as the campaign-end union build: the tICA guard must drop
     # epochs sampled under a different CV2 definition, or their cv2 samples are
@@ -6432,9 +6435,10 @@ def _topup_plan_for_phase(args, epoch_dir: Path, registry: "WindowStateRegistry"
             return final
         print(f"      top-up plan discarded: layout changed (states {missing} no longer active)")
     state = load_state(adaptive_dir)
-    _ids, neighbours, rung_partners = _topup_layout_neighbours(args, active)
+    layout = _topup_layout_neighbours(args, active)
+    _ids, neighbours, rung_partners = layout
     try:
-        diag = _phase_union_diagnostics(args, adaptive_dir, registry, policy, state["f_kT"])
+        diag = _phase_union_diagnostics(args, adaptive_dir, registry, policy, state["f_kT"], layout)
     except Exception as exc:
         print(f"      top-up diagnostics unavailable ({exc}); no top-up this phase")
         diag = None

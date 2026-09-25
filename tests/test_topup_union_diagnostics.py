@@ -236,3 +236,16 @@ def test_a_sparse_state_is_not_rescued_by_a_well_sampled_rung_twin(tmp_path):
     assert d.sigma_kcal[0] > 3.0 * via_twin.sigma_kcal[0]       # the twin no longer hides the sparse state
     default = union_diagnostics_from_npz(p, edges, kt_kcal=KT)      # edge neighbours {1, 2}: max picks the spatial link
     assert math.isclose(default.sigma_kcal[0], d.sigma_kcal[0], rel_tol=1e-9)
+
+
+def test_pair_overlap_with_f_held_fixed_is_identical_in_a_3_and_a_30_state_union(tmp_path):
+    from gareus.adaptive.union_diagnostics import _pair_overlap
+    small = [0.0, 1.0, 2.0]
+    crowded = small + list(np.linspace(-0.5, 1.5, 27))
+    got = []
+    for centers, name in ((small, "s.npz"), (crowded, "l.npz")):
+        with np.load(_write_seeded(tmp_path, centers, 4.0, 500, name)) as z:
+            u, w = z["umbrella_reduced_bias_nk"], z["sampled_state_ids"]
+        f = np.zeros(len(centers)); f[1] = 0.3                      # the pair's f, held fixed
+        got.append(_pair_overlap(u, w, f, np.bincount(w, minlength=len(centers)), 0, 1))
+    assert got[0] == got[1]
