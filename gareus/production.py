@@ -55,8 +55,16 @@ from .seeding import (
     deserialize_system,
     filter_explicit_2d_windows_by_seed_reachability,
 )
-from .diagnostics import compute_gamd_reweighting_diagnostics, validate_us_mbar_inputs, _read_csv_dicts
-from .topup_seeding import assert_seed_matches, export_final_window_states
+from .diagnostics import compute_gamd_reweighting_diagnostics, validate_us_mbar_inputs
+from .topup_seeding import (
+    SeedMismatchError,
+    assert_seed_matches,
+    assert_seed_restraint_matches,
+    export_final_window_states,
+    load_seed_states,
+    state_id_of_window_from_epoch_map,
+    topup_parent_dirs_by_creation_order,
+)
 from .imports import import_gamd_factory, import_openmm
 from .state import _scalar_to_float, _energy_to_kj_mol
 from .cv import (
@@ -6417,66 +6425,58 @@ def _augment_seed_bank_with_campaign_search(
         )
 
 
-def _state_id_of_window_from_epoch_map(out_dir: Path) -> dict:
-    """Window -> state_id for this segment, from its own ``epoch_window_map.csv``.
+def _release_run_lock_best_effort(out_dir: Path) -> None:
+    """Best-effort removal of this process's own ``.gareus_run.lock``.
 
-    Identity mapping when the file is absent/empty -- the same fallback used
-    throughout the adaptive-production driver for this file.
+    Mirrors ``acquire_run_lock``'s own atexit-registered release closure
+    (``gareus/io.py``), which is not exposed as a callable public function -- only
+    registered as a private closure passed to ``atexit.register``. Relying on that
+    atexit hook alone would leave a live-PID lock file in place until process exit,
+    which matters when a SeedMismatchError should let the same process retry the same
+    output directory (e.g. a controller catching this and moving on) without first
+    tearing the whole process down.
     """
-    rows = _read_csv_dicts(Path(out_dir) / "epoch_window_map.csv")
-    out: dict = {}
-    for row in rows:
-        w = _int_or_none(row.get("epoch_window"))
-        sid = _int_or_none(row.get("state_id"))
-        if w is not None and sid is not None:
-            out[w] = sid
-    return out
+    try:
+        lock_path = Path(out_dir) / ".gareus_run.lock"
+        if lock_path.read_text(encoding="utf-8").strip() == str(os.getpid()):
+            lock_path.unlink()
+    except Exception:
+        pass
 
 
-def _topup_parent_dirs_by_creation_order(out_dir: Path) -> list:
-    """This top-up's candidate parent dirs (baseline + every sibling topup_*), oldest
-    first -- ``load_seed_index``'s "later parents override earlier ones" then makes the
-    most recently exported parent win, not merely the alphabetically-last one.
-
-    Ordered by each parent's own ``final_window_states/index.json`` mtime, NOT by
-    directory name. ``topup_<idx>_<extra_steps>`` directory names are not chronological:
-    the numeric suffix is that segment's own remaining-step duration, which *shrinks*
-    across successive quality-gate extension rounds -- CLAUDE.md's 2026-08-05
-    ``plot_adaptive_diagnostics.py`` fix documents the identical footgun on a real run
-    (``topup_001_34794000`` created first, ``...25733000`` second, ``...18937000`` last;
-    name-ascending sort is exactly the reverse of creation order). A name-sorted parent
-    list would let a stale, earlier-created topup's export silently outrank a later,
-    more-authoritative one. A parent with no export yet (no ``index.json``) sorts first,
-    so it can never override a parent that actually has one.
-    """
-    out_dir = Path(out_dir)
-    candidates = [
-        d for d in [out_dir.parent / "baseline", *out_dir.parent.glob("topup_*")]
-        if d != out_dir
-    ]
-
-    def _mtime_key(d: Path) -> float:
-        try:
-            return (d / "final_window_states" / "index.json").stat().st_mtime
-        except OSError:
-            return -1.0
-
-    return sorted(candidates, key=_mtime_key)
-
-
-def _seed_topup_windows_from_parent_states(args, out_dir: Path, nrep: int):
+def _seed_topup_windows_from_parent_states(
+    args, out_dir: Path, nrep: int,
+    centers_nm, ks_kj_nm2, secondary_cv_centers=None, secondary_cv_ks_kj=None,
+):
     """Load each window's starting State from the parent segment(s)' export (task 9,
     effective top-ups). Continues each window's own chain instead of re-pulling.
+
+    ``centers_nm``/``ks_kj_nm2``/``secondary_cv_centers``/``secondary_cv_ks_kj`` are
+    this segment's own current window table -- the exact arrays :func:`set_window` is
+    called with for these replicas -- used to verify (ruling 15) that each loaded seed
+    really belongs to the window it is being placed into.
+
+    Fails closed (raises ``SeedMismatchError``) when this segment has no
+    ``epoch_window_map.csv`` at all: identity window->state_id is not a safe
+    assumption to make silently for a top-up's own seeding (ruling 15). The identity
+    fallback inside ``state_id_of_window_from_epoch_map`` itself is still used (a) for
+    a present-but-sparse map here, and (b) unconditionally by the export side and by
+    non-top-up segments, where that fallback has always been safe.
 
     Raises ``SeedMismatchError`` naming the missing window/state if any surviving
     window in this top-up has no seed available -- the driver (task 8) is
     responsible for only launching a top-up once every window it kept has one.
     """
-    from .topup_seeding import SeedMismatchError, load_seed_states
-
     out_dir = Path(out_dir)
-    state_id_of_window = _state_id_of_window_from_epoch_map(out_dir)
-    parent_dirs = _topup_parent_dirs_by_creation_order(out_dir)
+    window_map_path = out_dir / "epoch_window_map.csv"
+    if not window_map_path.exists():
+        raise SeedMismatchError(
+            f"top-up segment {out_dir} has no epoch_window_map.csv; refusing to fall back to an "
+            "identity window->state mapping for seeding (fail closed, spec revision 2 ruling 15; "
+            "segment-wide failure, no single window/state_id -- both are None)"
+        )
+    state_id_of_window = state_id_of_window_from_epoch_map(out_dir)
+    parent_dirs = topup_parent_dirs_by_creation_order(out_dir)
     needed_state_ids = [state_id_of_window.get(w, w) for w in range(nrep)]
     seeds = load_seed_states(parent_dirs, needed_state_ids)
 
@@ -6490,8 +6490,16 @@ def _seed_topup_windows_from_parent_states(args, out_dir: Path, nrep: int):
         if seed is None:
             raise SeedMismatchError(
                 f"top-up segment {out_dir} has no seed State for window {w} (state {sid}); "
-                f"parent dirs searched: {[str(p) for p in parent_dirs]}"
+                f"parent dirs searched: {[str(p) for p in parent_dirs]}",
+                window=w, state_id=sid,
             )
+        primary_center_w = float(centers_nm[w]) if w < len(centers_nm) else None
+        primary_k_w = float(ks_kj_nm2[w]) if w < len(ks_kj_nm2) else None
+        secondary_center_w = (float(secondary_cv_centers[w])
+                              if secondary_cv_centers is not None and w < len(secondary_cv_centers) else None)
+        secondary_k_w = (float(secondary_cv_ks_kj[w])
+                         if secondary_cv_ks_kj is not None and w < len(secondary_cv_ks_kj) else None)
+        assert_seed_restraint_matches(seed, w, primary_center_w, primary_k_w, secondary_center_w, secondary_k_w)
         window_start_positions[w] = seed.positions
         window_start_velocities[w] = seed.velocities
         window_start_boxes[w] = seed.box
@@ -6885,8 +6893,18 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             # (task 8) only launches a top-up once every surviving window has a
             # seed State available; a missing one raises SeedMismatchError,
             # which propagates out of run_gareus like any other setup failure.
-            (window_start_positions, window_start_velocities,
-             window_start_boxes, topup_seed_by_window) = _seed_topup_windows_from_parent_states(args, out_dir, nrep)
+            try:
+                (window_start_positions, window_start_velocities,
+                 window_start_boxes, topup_seed_by_window) = _seed_topup_windows_from_parent_states(
+                    args, out_dir, nrep, centers_nm, ks_kj_nm2, secondary_cv_centers, secondary_cv_ks_kj,
+                )
+            except SeedMismatchError:
+                # _sim_pool does not exist yet at this point in setup -- nothing to
+                # shut down -- but the run lock must still be released so the
+                # campaign can retry this output directory without waiting on this
+                # process to exit (ruling 17).
+                _release_run_lock_best_effort(out_dir)
+                raise
             dropped_window_indices = []
         else:
             starting_structure_system = create_system(app, unit, forcefield, topology, args, include_barostat=False)
@@ -7176,12 +7194,24 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 start_pos = window_start_positions[i] if i < len(window_start_positions) and window_start_positions[i] is not None else pos
                 start_vel = window_start_velocities[i] if i < len(window_start_velocities) and window_start_velocities[i] is not None else vel
                 sim_i.context.setPositions(start_pos)
-                if args.randomize_replica_velocities:
+                _is_seeded_window = topup_seed_by_window.get(i) is not None
+                if args.randomize_replica_velocities and not _is_seeded_window:
                     sim_i.context.setVelocitiesToTemperature(args.temperature_k * unit.kelvin, args.seed + i + 17)
                 else:
+                    if _is_seeded_window and args.randomize_replica_velocities:
+                        # Top-up seeding (ruling 17): a seeded window continues an
+                        # existing velocity chain; randomizing it here would throw
+                        # away exactly the continuity effective top-ups exist to
+                        # preserve, even though --randomize-replica-velocities was
+                        # requested for the campaign as a whole.
+                        logger.info(
+                            "Window %d was seeded from a top-up parent State; skipping "
+                            "--randomize-replica-velocities for it to preserve its continued "
+                            "velocity chain.", i,
+                        )
                     sim_i.context.setVelocities(start_vel)
                 set_window(sim_i.context, centers_nm, ks_kj_nm2, i, secondary_cv_centers, secondary_cv_ks_kj)
-                if topup_seed_by_window.get(i) is not None:
+                if _is_seeded_window:
                     # Top-up seeding (task 9): the loaded State must reproduce the CV
                     # values it was exported under. Runs here, right after set_window,
                     # on replica i's own _sim_pool thread -- every context-touching call
@@ -7193,7 +7223,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                         sim_i.context, primary_cv_def, args, unit, secondary_cv_metadata,
                         read_potential_energy=False,
                     )
-                    assert_seed_matches(topup_seed_by_window[i], _seed_cv1_now, _seed_cv2_now)
+                    assert_seed_matches(topup_seed_by_window[i], _seed_cv1_now, _seed_cv2_now, window=i)
             controller_i = None
             if npt_runtime is not None and npt_runtime.needs_controller and not fast_resume:
                 # NPT correction: the biased-MC volume controller is initialized
@@ -7206,7 +7236,17 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 )
             return sim_i, loaded_checkpoint, copied, skipped, controller_i
 
-        sim_i, loaded_shared_gamd_checkpoint, copied_globals, skipped_globals, controller_i = _sim_pool.submit(i, _build_context_i).result()
+        try:
+            sim_i, loaded_shared_gamd_checkpoint, copied_globals, skipped_globals, controller_i = _sim_pool.submit(i, _build_context_i).result()
+        except SeedMismatchError:
+            # A seeded window's post-set_window CV assertion failed (ruling 17): tear
+            # down every per-replica worker thread (some already hold live OpenMM
+            # Contexts for replicas 0..i-1) and release the run lock before this
+            # propagates out of run_gareus, so a controller catching this can retry
+            # the same output directory without waiting on process exit.
+            _sim_pool.shutdown(wait=True)
+            _release_run_lock_best_effort(out_dir)
+            raise
         replica_gamd_copy_report.append({
             "replica": int(i),
             "copied_count": int(len(copied_globals)),
@@ -8566,7 +8606,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         # future top-up depends on this, and a top-up whose seed is missing raises
         # its own clear SeedMismatchError at seeding time instead.
         try:
-            _export_state_id_of_window = _state_id_of_window_from_epoch_map(out_dir)
+            _export_state_id_of_window = state_id_of_window_from_epoch_map(out_dir)
 
             def _export_cv_of_replica(r: int):
                 cv1, cv2, _ = primary_secondary_and_potential_from_state(
@@ -8575,7 +8615,10 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 )
                 return cv1, cv2
 
-            export_final_window_states(out_dir, sims, assignments, _export_state_id_of_window, _export_cv_of_replica)
+            export_final_window_states(
+                out_dir, sims, assignments, _export_state_id_of_window, _export_cv_of_replica,
+                centers_nm, ks_kj_nm2, secondary_cv_centers, secondary_cv_ks_kj,
+            )
         except Exception:
             logger.warning("Failed to export final window States for top-up seeding (segment %s)", out_dir, exc_info=True)
 
