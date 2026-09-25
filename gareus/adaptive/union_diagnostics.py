@@ -65,10 +65,15 @@ def _solve(u_nk: np.ndarray, window: np.ndarray, n_states: int, f_init: Optional
 
 
 def _local_sigma(dmat: np.ndarray, k: int, neighbours) -> float:
-    """min over edge-neighbours j of dDelta_f[j, k]; min of the finite off-diagonal row when k has no measured neighbour."""
+    """max over sigma-neighbours j of dDelta_f[j, k]; min of the finite off-diagonal row when k has no measured neighbour.
+
+    Ruling 23 (measured in gareus/synth/sigma_rule_study.py): the least certain link to a
+    same-rung spatial neighbour tracks the true local PMF error best. The old rule (min over
+    all edge neighbours) let a well-sampled rung twin hide a sparse state.
+    """
     vals = [dmat[j, k] for j in neighbours if np.isfinite(dmat[j, k])]
     if vals:
-        return float(min(vals))
+        return float(max(vals))
     row = dmat[k][np.isfinite(dmat[k]) & (np.arange(len(dmat)) != k)]
     return float(np.min(row)) if row.size else float("nan")
 
@@ -130,7 +135,11 @@ def _pair_overlap(u: np.ndarray, window: np.ndarray, f: np.ndarray, n_k: np.ndar
 def union_diagnostics_from_npz(npz_path, edges: Iterable[Tuple[int, int]], *, kt_kcal: float,
                                subsample_counts: Optional[dict] = None, min_effect_kcal: float = 0.05,
                                alpha: float = 0.05, f_init: Optional[dict] = None,
-                               split_halves: bool = True) -> Optional[UnionDiagnostics]:
+                               split_halves: bool = True,
+                               sigma_neighbours: Optional[Dict[int, Iterable[int]]] = None,
+                               ) -> Optional[UnionDiagnostics]:
+    """``sigma_neighbours`` (state_id -> state_ids): the states sigma_k is measured against,
+    normally same-rung spatial neighbours with rung partners as fallback; default: edge neighbours."""
     try:
         npz_path = Path(npz_path)
         if not npz_path.exists():
@@ -165,7 +174,11 @@ def union_diagnostics_from_npz(npz_path, edges: Iterable[Tuple[int, int]], *, kt
             if ia is not None and ib is not None and ia != ib:
                 nbrs[ia].append(ib); nbrs[ib].append(ia)
                 pairs.add((min(ia, ib), max(ia, ib)))
-        sigma = np.array([_local_sigma(dmat, k, nbrs[k]) if n_k[k] > 0 else np.nan for k in range(K)])
+        sig_nbrs = nbrs
+        if sigma_neighbours is not None:
+            sig_nbrs = {k: [idx[int(j)] for j in sigma_neighbours.get(ids[k], []) if int(j) in idx and idx[int(j)] != k]
+                        for k in range(K)}
+        sigma = np.array([_local_sigma(dmat, k, sig_nbrs[k]) if n_k[k] > 0 else np.nan for k in range(K)])
         flagged = (_split_halves(u, window, K, min_effect_kcal / kt_kcal, alpha)
                    if split_halves else set())
         edge_overlap = {}

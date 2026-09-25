@@ -185,12 +185,16 @@ def _write_union_npz(path: Path, landscape, camp: _Campaign, windows) -> dict:
     return counts
 
 
-def _diagnose(tmp: Path, landscape, camp, windows, edges, policy, f_init):
+def _diagnose(tmp: Path, landscape, camp, windows, layout, f_init):
+    """The driver's ``_phase_union_diagnostics`` call: sigma against same-rung neighbours, rung fallback."""
     from ..adaptive.union_diagnostics import union_diagnostics_from_npz
+    edges, neighbours, rung_partners, policy = layout
     path = Path(tmp) / "union.npz"
     counts = _write_union_npz(path, landscape, camp, windows)
+    sigma_nb = {w: neighbours.get(w) or rung_partners.get(w, []) for w in range(len(windows))}
     return union_diagnostics_from_npz(path, edges, kt_kcal=KT_KCAL, subsample_counts=counts,
-                                      min_effect_kcal=float(policy.topup_min_effect), f_init=f_init or None)
+                                      min_effect_kcal=float(policy.topup_min_effect), f_init=f_init or None,
+                                      sigma_neighbours=sigma_nb)
 
 
 def _pmf_rmse(landscape, windows, camp, f_kT: Dict[int, float]) -> float:
@@ -235,7 +239,8 @@ def run_arm(landscape: Landscape, *, arm: str, seed: int, wall_hours_budget: flo
     if arm not in ("uniform", "topup"):
         raise ValueError(f"unknown arm {arm!r}")
     windows = _ladder(landscape, remove_bridge)
-    edges, neighbours, rung_partners, policy = _layout(windows)
+    layout = _layout(windows)
+    edges, neighbours, rung_partners, policy = layout
     table, cap = policy.topup_throughput_table, float(policy.topup_max_fraction)
     ids = list(range(len(windows)))
     per_step_all = wall_hours(1, len(ids), TIMESTEP_FS, N_GPUS, table)
@@ -254,7 +259,7 @@ def run_arm(landscape: Landscape, *, arm: str, seed: int, wall_hours_budget: flo
             spent = all_state_segment(hours if arm == "uniform" else (1.0 - cap) * hours)
             rec = {"epoch": e, "hours": hours, "baseline_hours": spent}
             if arm == "topup":
-                diag = _diagnose(tmp, landscape, camp, windows, edges, policy, state["f_kT"])
+                diag = _diagnose(tmp, landscape, camp, windows, layout, state["f_kT"])
                 plan = plan_topup(diag, state_ids_in_order=ids, neighbours=neighbours, rung_partners=rung_partners,
                                   policy=policy, report_interval=REPORT_INTERVAL, timestep_fs=TIMESTEP_FS,
                                   n_gpus=N_GPUS, budget_hours=cap * hours, correction=state["correction"],
@@ -269,7 +274,7 @@ def run_arm(landscape: Landscape, *, arm: str, seed: int, wall_hours_budget: flo
                     h = _sample_segment(landscape, windows, plan.state_ids, plan.steps, streams, np_patch, camp, table)
                     spent += h
                     camp.topup_hours += h
-                    after = _diagnose(tmp, landscape, camp, windows, edges, policy, state["f_kT"])
+                    after = _diagnose(tmp, landscape, camp, windows, layout, state["f_kT"])
                     if after is not None:
                         state = update_after_topup(state, plan, after.sigma_kcal)
                         state["f_kT"] = dict(after.f_kT)
@@ -277,7 +282,7 @@ def run_arm(landscape: Landscape, *, arm: str, seed: int, wall_hours_budget: flo
             carry = hours - spent
             epochs.append(rec)
         all_state_segment(carry)
-        final = _diagnose(tmp, landscape, camp, windows, edges, policy, state["f_kT"])
+        final = _diagnose(tmp, landscape, camp, windows, layout, state["f_kT"])
     if final is None:
         raise RuntimeError("final union-MBAR solve failed; the campaign has no result")
     sig = np.array([final.sigma_kcal.get(k, math.nan) for k in ids], dtype=float)

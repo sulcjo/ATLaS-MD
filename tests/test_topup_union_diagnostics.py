@@ -215,3 +215,24 @@ def test_edge_overlap_does_not_shrink_when_the_pair_sits_in_a_bigger_union(tmp_p
 def test_two_identical_states_have_pairwise_overlap_one_half(tmp_path):
     d = union_diagnostics_from_npz(_write_seeded(tmp_path, [0.0, 0.0], 4.0, 1000, "c.npz"), [(0, 1)], kt_kcal=KT)
     assert math.isclose(d.edge_overlap[(0, 1)], 0.5, rel_tol=1e-9)
+
+
+def test_a_sparse_state_is_not_rescued_by_a_well_sampled_rung_twin(tmp_path):
+    # Ruling 23: sigma_k = max dDelta_f over the state's same-rung spatial neighbours (rung
+    # partners only as fallback). State 0 is sparse; state 1 is its rung twin (same centre,
+    # a slightly tilted Hamiltonian) and well sampled; state 2 is 0's spatial neighbour.
+    k, tilt = 4.0, 0.05
+    rng = np.random.default_rng(3)
+    n = {0: 30, 1: 3000, 2: 3000}
+    centre = {0: 0.0, 1: 0.0, 2: 1.0}
+    x = np.concatenate([rng.normal(centre[s], 1.0 / math.sqrt(k), n[s]) for s in (0, 1, 2)])
+    sid = np.concatenate([[s] * n[s] for s in (0, 1, 2)])
+    u = np.column_stack([0.5 * k * x ** 2, 0.5 * k * x ** 2 + tilt * x, 0.5 * k * (x - 1.0) ** 2])
+    p = tmp_path / "twin.npz"
+    np.savez(p, umbrella_reduced_bias_nk=u, state_ids=np.arange(3), sampled_state_ids=sid)
+    edges = [(0, 1), (0, 2)]
+    d = union_diagnostics_from_npz(p, edges, kt_kcal=KT, sigma_neighbours={0: [2], 1: [0], 2: [0]})
+    via_twin = union_diagnostics_from_npz(p, edges, kt_kcal=KT, sigma_neighbours={0: [1], 1: [0], 2: [0]})
+    assert d.sigma_kcal[0] > 3.0 * via_twin.sigma_kcal[0]       # the twin no longer hides the sparse state
+    default = union_diagnostics_from_npz(p, edges, kt_kcal=KT)      # edge neighbours {1, 2}: max picks the spatial link
+    assert math.isclose(default.sigma_kcal[0], d.sigma_kcal[0], rel_tol=1e-9)

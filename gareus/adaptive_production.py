@@ -6358,12 +6358,32 @@ KB_KCAL_PER_MOL_K = 0.0019872041
 # overlaps whether or not the phase was interrupted -- and no third solve is paid.
 
 
+def _topup_layout_neighbours(args, active):
+    """(ids, same-rung spatial neighbours, other-rung same-centre partners), keyed by state_id."""
+    from .layout_neighbours import other_rung_same_centre, same_rung_neighbours, spatial_neighbour_pairs
+    ids = [int(s.state_id) for s in active]
+    c1 = [float(s.primary_center) for s in active]
+    c2 = [float(s.secondary_center) if s.secondary_center is not None else 0.0 for s in active]
+    lam = [float(s.gamd_lambda or 0.0) for s in active]
+    k1 = [float(s.primary_k) for s in active]
+    k2 = [float(s.secondary_k or 0.0) for s in active]
+    temperature = float(getattr(args, "temperature_k", 300.0) or 300.0)
+    pairs = spatial_neighbour_pairs(c1, c2, lam, k1, k2, temperature)
+    nb_local, rp_local = same_rung_neighbours(pairs, lam), other_rung_same_centre(c1, c2, lam)
+    neighbours = {ids[w]: [ids[x] for x in nb_local.get(w, [])] for w in range(len(ids))}
+    rung_partners = {ids[w]: [ids[x] for x in rp_local.get(w, [])] for w in range(len(ids))}
+    return ids, neighbours, rung_partners
+
+
 def _phase_union_diagnostics(args, adaptive_dir: Path, registry: "WindowStateRegistry",
                              policy: AdaptiveDecisionPolicy, f_init):
     """Union-MBAR top-up diagnostics over every sample the campaign holds so far."""
     from .adaptive.union_diagnostics import union_diagnostics_from_npz
     temperature = float(getattr(args, "temperature_k", 300.0) or 300.0)
     edges = [(a, b) for a, b, _t, _d in build_geometry_edges(registry, policy)]
+    # sigma_k is read against same-rung spatial neighbours, rung partners as fallback (ruling 23).
+    ids, neighbours, rung_partners = _topup_layout_neighbours(args, registry.active_states())
+    sigma_neighbours = {s: neighbours.get(s) or rung_partners.get(s, []) for s in ids}
     # Same source filters as the campaign-end union build: the tICA guard must drop
     # epochs sampled under a different CV2 definition, or their cv2 samples are
     # scored against the wrong centres and the plan targets the wrong states.
@@ -6374,7 +6394,7 @@ def _phase_union_diagnostics(args, adaptive_dir: Path, registry: "WindowStateReg
     return union_diagnostics_from_npz(
         meta["arrays_npz"], edges, kt_kcal=KB_KCAL_PER_MOL_K * temperature,
         subsample_counts=meta.get("subsample_counts_per_state"),
-        min_effect_kcal=float(policy.topup_min_effect), f_init=f_init)
+        min_effect_kcal=float(policy.topup_min_effect), f_init=f_init, sigma_neighbours=sigma_neighbours)
 
 
 def _topup_plan_for_phase(args, epoch_dir: Path, registry: "WindowStateRegistry",
@@ -6390,7 +6410,6 @@ def _topup_plan_for_phase(args, epoch_dir: Path, registry: "WindowStateRegistry"
     from .adaptive.topup_allocator import plan_topup
     from dataclasses import replace
     from .adaptive.topup_state import load_plan, load_state, save_plan, save_state, save_union_overlap
-    from .layout_neighbours import other_rung_same_centre, same_rung_neighbours, spatial_neighbour_pairs
 
     epoch_dir = Path(epoch_dir)
     adaptive_dir = epoch_dir.parent
@@ -6413,16 +6432,7 @@ def _topup_plan_for_phase(args, epoch_dir: Path, registry: "WindowStateRegistry"
             return final
         print(f"      top-up plan discarded: layout changed (states {missing} no longer active)")
     state = load_state(adaptive_dir)
-    c1 = [float(s.primary_center) for s in active]
-    c2 = [float(s.secondary_center) if s.secondary_center is not None else 0.0 for s in active]
-    lam = [float(s.gamd_lambda or 0.0) for s in active]
-    k1 = [float(s.primary_k) for s in active]
-    k2 = [float(s.secondary_k or 0.0) for s in active]
-    temperature = float(getattr(args, "temperature_k", 300.0) or 300.0)
-    pairs = spatial_neighbour_pairs(c1, c2, lam, k1, k2, temperature)
-    nb_local, rp_local = same_rung_neighbours(pairs, lam), other_rung_same_centre(c1, c2, lam)
-    neighbours = {ids[w]: [ids[x] for x in nb_local.get(w, [])] for w in range(len(ids))}
-    rung_partners = {ids[w]: [ids[x] for x in rp_local.get(w, [])] for w in range(len(ids))}
+    _ids, neighbours, rung_partners = _topup_layout_neighbours(args, active)
     try:
         diag = _phase_union_diagnostics(args, adaptive_dir, registry, policy, state["f_kT"])
     except Exception as exc:
