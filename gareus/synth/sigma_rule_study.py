@@ -19,6 +19,7 @@ Reports Spearman rho of each rule against that error, pooled over seeds x states
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 from pathlib import Path
 
@@ -102,7 +103,9 @@ def main() -> int:
                **{f"hours={h}": spearman([q for q in rows if q["hours"] == h]) for h in a.hours},
                **{name: spearman([q for q in rows if q["landscape"] == name]) for name in a.landscapes}}
     a.out.mkdir(parents=True, exist_ok=True)
-    (a.out / "sigma_rule_study.json").write_text(json.dumps({"summary": summary, "rows": rows}, indent=1))
+    (a.out / "sigma_rule_study.json").write_text(json.dumps({"summary": summary}, indent=1))
+    with gzip.open(a.out / "sigma_rule_study_rows.json.gz", "wt") as fh:
+        json.dump(rows, fh)
     print(json.dumps(summary, indent=1))
     return 0
 

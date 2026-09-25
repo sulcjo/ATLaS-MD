@@ -1,9 +1,11 @@
 import numpy as np
+import pytest
 
 from gareus.synth import LANDSCAPES
 from gareus.synth.ess import tau_int
 from gareus.synth.sampler import BOOST_A, Window, boost_dv, boost_reference_energy
-from gareus.synth.topup_study import FROZEN_BUDGET_HOURS as H, run_arm, run_study, wins
+from gareus.synth.topup_study import (FROZEN_BUDGET_HOURS, ROWS_FLOOR_HOURS as H, flanking_edges,
+                                      removed_pass_centres, run_arm, run_study, wins)
 
 
 def test_boost_is_a_lambda_scaled_flattening_below_the_reference_energy():
@@ -42,6 +44,9 @@ def _arms(name, seeds=range(5)):
     return a, b
 
 
+@pytest.mark.xfail(strict=True, reason="effective-topups Ruling 31: synthetic study verdict, see "
+                   "docs/superpowers/specs/2026-09-24-effective-topups/synth_study/topup_study.json "
+                   "(no targetable regime; at the rows floor B wins max sigma, not PMF RMSE)")
 def test_topups_beat_uniform_on_a_heterogeneous_landscape():
     a, b = _arms("gated-barrier")         # a win: B more than 1 % below A, on max sigma AND on PMF RMSE
     assert wins([r.max_sigma for r in b], [r.max_sigma for r in a]) >= 4
@@ -56,14 +61,22 @@ def test_topups_match_uniform_on_a_homogeneous_landscape():
     assert max(r.topup_md_fraction for r in b) <= 0.3 + 1e-9
 
 
-def test_a_missing_bridge_is_routed_and_an_intact_layout_is_not():
+def test_the_edges_flanking_a_removed_pass_are_routed_and_are_not_routed_intact():
+    # Ruling 27: edges keyed by (centre, lambda), not state index (the cut ladder renumbers states).
     ls = LANDSCAPES["gated-barrier"]
     cut = run_arm(ls, arm="topup", seed=2, wall_hours_budget=H["gated-barrier"], remove_bridge=True)
     whole = run_arm(ls, arm="topup", seed=2, wall_hours_budget=H["gated-barrier"])
-    assert cut.structural_routed
-    assert not whole.structural_routed
+    flank = flanking_edges(cut.routed_coords, removed_pass_centres(ls))
+    assert flank
+    assert not flank & set(whole.routed_coords)
+
+
+def test_the_study_regime_was_frozen_from_arm_a():
+    # Ruling 28: no landscape has 10-40 % deficits at >= 40 rows/state, so none is A/B-tested.
+    assert set(FROZEN_BUDGET_HOURS) == set(H) and all(v is None for v in FROZEN_BUDGET_HOURS.values())
 
 
 def test_study_writes_a_summary(tmp_path):
-    summary = run_study(["rugged-2d"], n_seeds=2, out=tmp_path, budgets=H)
-    assert (tmp_path / "topup_study.json").exists() and "rugged-2d" in summary
+    summary = run_study(["rugged-2d"], n_seeds=2, out=tmp_path, budgets=FROZEN_BUDGET_HOURS)
+    assert (tmp_path / "topup_study.json").exists() and (tmp_path / "topup_study_detail.json.gz").exists()
+    assert summary["rugged-2d"]["status"] == "no targetable regime" and summary["rugged-2d"]["pass"] is None
