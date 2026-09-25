@@ -2850,7 +2850,7 @@ def _compute_mbar_weights_for_tica(
     try:
         from pymbar import MBAR as _MBAR  # noqa: PLC0415
         from scipy.special import logsumexp as _logsumexp  # noqa: PLC0415
-    except ImportError:
+    except Exception:
         return uniform
 
     try:

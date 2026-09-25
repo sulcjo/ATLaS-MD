@@ -1812,9 +1812,13 @@ def _committed_shared_gamd_dir(out_dir: Path) -> str:
 
 
 def run_double_adaptive_auto_loop(args, out_dir: Path, openmm, app, unit, forcefield, topology, equil_state, progress: Optional[GuiProgressSink] = None) -> dict:
+    from gareus.pymbar_check import warn_if_pymbar_unusable
+
     out_dir = Path(out_dir)
     summary_path = out_dir / "double_adaptive_driver_summary.json"
     adaptive_registry = out_dir / "adaptive_production" / "state_registry.json"
+
+    warn_if_pymbar_unusable("equilibration subsampling, union MBAR analysis and top-up diagnostics")
 
     feedback_driver_summary_path = out_dir / "adaptive_feedback_driver_summary.json"
     feedback_completed = False
