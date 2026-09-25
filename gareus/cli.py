@@ -38,6 +38,23 @@ from .helptext import SimpleHelpAction, HeavyHelpAction
 
 __all__ = ["parse_args", "main"]
 
+# Guard to warn once per process when pymbar is unusable (adaptive-production entry points)
+_warned_pymbar_in_cli = False
+
+
+def _warn_pymbar_once() -> None:
+    """Print warning about unusable pymbar exactly once per process.
+
+    Checks module-level guard flag and calls warn_if_pymbar_unusable with the
+    context string for adaptive-production workflows. Subsequent calls in the
+    same process are no-ops due to the flag.
+    """
+    global _warned_pymbar_in_cli
+    if not _warned_pymbar_in_cli:
+        from gareus.pymbar_check import warn_if_pymbar_unusable  # noqa: PLC0415
+        warn_if_pymbar_unusable("equilibration subsampling, union MBAR analysis and top-up diagnostics")
+        _warned_pymbar_in_cli = True
+
 
 # ---------------------------------------------------------------------------
 # Argument group builders
@@ -459,12 +476,27 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                         "(deliberately NOT the pool-derived final target: an extension round runs "
                         "after the final phase already drew its share of the MD pool).")
     p.add_argument("--ap-retire-converged", action=argparse.BooleanOptionalAction, default=False)
-    p.add_argument("--ap-topups", action=argparse.BooleanOptionalAction, default=True,
-                   help="Scheduled epochs/final run an all-state baseline plus top-up segments over "
-                        "state subsets. --no-ap-topups runs the baseline only, giving it the phase's "
-                        "whole per-state budget (mean of the allocator's requested steps). Recommended "
-                        "for lambda-ladder campaigns, where a top-up batch holds one rung (no lambda "
-                        "exchange) and restarts its windows from a fresh pull.")
+    p.add_argument("--ap-topups", action=argparse.BooleanOptionalAction, default=False,
+                   help="Top-ups (off by default): --no-ap-topups runs each scheduled phase as a single "
+                        "all-state baseline only. --ap-topups adds, after that baseline, at most one "
+                        "deficit-driven top-up segment over a state subset, continuing each of its windows "
+                        "from the parent segment's exported final States (no fresh pull).")
+    p.add_argument("--ap-topup-target-sigma", type=float, default=0.10,
+                   help="Per-state local free-energy uncertainty target (kcal/mol) for top-ups.")
+    p.add_argument("--ap-topup-weak-overlap", type=float, default=0.15,
+                   help="Symmetric energy-space overlap below which an edge is weak.")
+    p.add_argument("--ap-topup-max-fraction", type=float, default=0.3,
+                   help="Cap on the share of an epoch's wall-hour budget spent on top-ups.")
+    p.add_argument("--ap-topup-min-effect", type=float, default=0.05,
+                   help="Smallest split-halves free-energy discrepancy (kcal/mol) that can flag a state.")
+    p.add_argument("--ap-topup-max-edge-attempts", type=int, default=2,
+                   help="Top-ups a weak edge may receive before it is treated as structural (bridge).")
+    p.add_argument("--ap-topup-throughput-table", default="16:3154,59:2300",
+                   help="contexts_per_gpu:ns_per_day_node pairs, comma separated.")
+    p.add_argument("--ap-topup-diagnostics-max-gb", type=float, default=8.0,
+                   help="Skip a phase's top-up diagnostics (no top-up, reason no_diagnostics) when the "
+                        "per-epoch union build + MBAR solve is estimated to peak above this many GB "
+                        "(kept rows x states x 8 B x 7.7, measured at 236 states).")
     p.add_argument("--ap-gamd-boost-sd-warn", type=float, default=6.0)
     p.add_argument("--ap-write-reports", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--md-budget-ns", type=float, default=0.0,
@@ -1403,6 +1435,17 @@ def _shim_adaptive_production(args: argparse.Namespace) -> None:
     args.adaptive_production_bridge_skip_unreachable = args.ap_bridge_skip_unreachable
     args.adaptive_production_retire_converged = args.ap_retire_converged
     args.adaptive_production_topups = args.ap_topups
+    args.adaptive_production_topup_target_sigma = args.ap_topup_target_sigma
+    args.adaptive_production_topup_weak_overlap = args.ap_topup_weak_overlap
+    args.adaptive_production_topup_max_fraction = args.ap_topup_max_fraction
+    args.adaptive_production_topup_min_effect = args.ap_topup_min_effect
+    args.adaptive_production_topup_max_edge_attempts = args.ap_topup_max_edge_attempts
+    args.adaptive_production_topup_diagnostics_max_gb = args.ap_topup_diagnostics_max_gb
+    try:
+        args.adaptive_production_topup_throughput_table = tuple(
+            (float(a), float(b)) for a, b in (item.split(":") for item in str(args.ap_topup_throughput_table).split(",") if item))
+    except ValueError as exc:
+        raise SystemExit(f"--ap-topup-throughput-table must be 'ctx:ns_per_day,...' ({exc})")
     args.adaptive_production_max_gamd_boost_sd_kcal_mol = args.ap_gamd_boost_sd_warn
     args.adaptive_production_write_action_reports = args.ap_write_reports
     args.adaptive_production_total_md_pool_ns = args.md_budget_ns
@@ -1816,6 +1859,8 @@ def run_double_adaptive_auto_loop(args, out_dir: Path, openmm, app, unit, forcef
     summary_path = out_dir / "double_adaptive_driver_summary.json"
     adaptive_registry = out_dir / "adaptive_production" / "state_registry.json"
 
+    _warn_pymbar_once()
+
     feedback_driver_summary_path = out_dir / "adaptive_feedback_driver_summary.json"
     feedback_completed = False
     if feedback_driver_summary_path.exists():
@@ -2062,6 +2107,7 @@ def main(argv: Optional[Iterable[str]] = None):
             if _resume_window_mode == "double-adaptive":
                 run_double_adaptive_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
             else:
+                _warn_pymbar_once()
                 run_adaptive_production_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
 
         elif bool(getattr(args, "extend", False)) and str(getattr(args, "window_mode", "adaptive")) in {"adaptive-production", "double-adaptive"}:
@@ -2087,6 +2133,7 @@ def main(argv: Optional[Iterable[str]] = None):
             if _extend_window_mode == "double-adaptive":
                 run_double_adaptive_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
             else:
+                _warn_pymbar_once()
                 run_adaptive_production_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
 
         elif bool(getattr(args, "resume", False)):
@@ -2151,6 +2198,7 @@ def main(argv: Optional[Iterable[str]] = None):
             if str(getattr(args, "window_mode", "adaptive")) in {"adaptive-feedback", "delaunay-feedback"}:
                 run_adaptive_feedback_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
             elif str(getattr(args, "window_mode", "adaptive")) == "adaptive-production":
+                _warn_pymbar_once()
                 run_adaptive_production_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
             elif str(getattr(args, "window_mode", "adaptive")) == "double-adaptive":
                 run_double_adaptive_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)

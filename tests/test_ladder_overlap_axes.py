@@ -202,3 +202,21 @@ class LadderOverlapBadInputTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_the_full_matrix_path_warns_once_and_the_pairwise_path_never(caplog):
+    import logging
+
+    import gareus.mbar_analysis.ladder_overlap as lo
+    lam = np.array([0.0, 0.5, 0.0, 0.5]); cen = np.array([0.0, 0.0, 1.0, 1.0])
+    overlap = np.full((4, 4), 0.2)
+    lo._FULL_MATRIX_WARNED = False
+    try:
+        with caplog.at_level(logging.WARNING):
+            lo.ladder_overlap_by_axis(None, lam, cen, pair_overlap=lambda a, b: 0.2)
+            assert "FULL-matrix" not in caplog.text
+            lo.ladder_overlap_by_axis(overlap, lam, cen)
+            lo.ladder_overlap_by_axis(overlap, lam, cen)
+        assert caplog.text.count("FULL-matrix") == 1
+    finally:
+        lo._FULL_MATRIX_WARNED = False

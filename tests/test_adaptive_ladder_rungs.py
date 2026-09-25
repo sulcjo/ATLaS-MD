@@ -547,7 +547,7 @@ def test_symmetric_state_overlap_is_order_independent_under_unequal_n():
     """O = diag(N) @ S, so O_ij != O_ji once the two states hold different
     sample counts -- which adaptive extension makes normal.  The per-edge gate
     metric must not depend on which state holds the lower id."""
-    from gareus.adaptive_production import _symmetric_state_overlap
+    from gareus.mbar_analysis.ladder import symmetric_state_overlap as _symmetric_state_overlap
 
     rng = np.random.default_rng(7)
     centers = np.array([0.0, 1.0])
@@ -579,7 +579,7 @@ def test_symmetric_state_overlap_is_order_independent_under_unequal_n():
 def test_symmetric_metric_reproduces_the_pilot_numbers():
     """Equal N_k in the pilot, so the symmetric metric must land on the same
     calibration the raw adjacent entries do."""
-    from gareus.adaptive_production import _symmetric_state_overlap
+    from gareus.mbar_analysis.ladder import symmetric_state_overlap as _symmetric_state_overlap
     from gareus.mbar_analysis.solvers import solve_mbar
 
     with np.load(FIXTURE_NPZ, allow_pickle=False) as data:

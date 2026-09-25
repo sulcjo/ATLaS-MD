@@ -36,6 +36,7 @@ class Window:
     k1: float
     center2: Optional[float] = None
     k2: Optional[float] = None
+    lam: float = 0.0          # lambda-ladder rung: boost strength in [0, 1] (see ``boost_dv``)
 
 
 def BIAS(window: Window, cv1, cv2) -> np.ndarray:
@@ -46,10 +47,39 @@ def BIAS(window: Window, cv1, cv2) -> np.ndarray:
     return u
 
 
+BOOST_A = 0.5               # flattening strength of the synthetic boost at lambda = 1
+BOOST_REF_PERCENTILE = 60.0  # E_ref: this percentile of F over the landscape's grid
+_E_REF_CACHE: dict = {}
+
+
+def boost_reference_energy(landscape: Landscape, res: int = 120) -> float:
+    """E_ref of the synthetic boost: the 60th percentile of raw F over a ``res x res`` grid."""
+    key = (id(landscape), int(res))
+    if key not in _E_REF_CACHE:
+        g1, g2 = np.meshgrid(np.linspace(*landscape.cv1_bounds, res),
+                             np.linspace(*landscape.cv2_bounds, res), indexing="ij")
+        _E_REF_CACHE[key] = float(np.percentile(landscape.energy(g1, g2), BOOST_REF_PERCENTILE))
+    return _E_REF_CACHE[key]
+
+
+def boost_dv(landscape: Landscape, window: Window, cv1, cv2) -> np.ndarray:
+    """Synthetic GaMD-like boost of a rung: ``dV = lam * a * max(0, E_ref - F(cv))`` in kBT.
+
+    A lambda-scaled flattening of the analytic surface below E_ref, so states at one
+    centre on different rungs are distinct Hamiltonians with a closed-form energy
+    difference (energy-space rung overlap is well defined).
+    """
+    lam = float(window.lam)
+    if lam == 0.0:
+        return np.zeros(np.broadcast(np.asarray(cv1, float), np.asarray(cv2, float)).shape)
+    f = landscape.energy(cv1, cv2)
+    return lam * BOOST_A * np.maximum(0.0, boost_reference_energy(landscape) - f)
+
+
 def sample_window_exact(landscape: Landscape, window: Window, n_samples: int,
                         *, beta: float = 1.0, res: int = 120,
                         rng: Optional[np.random.Generator] = None) -> np.ndarray:
-    """Draw ``n_samples`` ``(cv1, cv2)`` points from the biased equilibrium.
+    """Draw ``n_samples`` ``(cv1, cv2)`` points from the biased (and, for lam > 0, boosted) equilibrium.
 
     Builds the biased probability on a ``res x res`` grid, normalizes, draws
     cell indices by inverse-CDF (multinomial), and adds intra-cell uniform
@@ -67,7 +97,8 @@ def sample_window_exact(landscape: Landscape, window: Window, n_samples: int,
     c2 = lo2 + (np.arange(res) + 0.5) * d2
     g1, g2 = np.meshgrid(c1, c2, indexing="ij")
     f = landscape.energy(g1, g2)
-    logp = -beta * (f + BIAS(window, g1, g2))
+    # The rung's boost is part of the sampled Hamiltonian (zero at lam = 0).
+    logp = -beta * (f + BIAS(window, g1, g2) + boost_dv(landscape, window, g1, g2))
     logp = logp - logp.max()
     p = np.exp(logp).ravel()
     total = p.sum()

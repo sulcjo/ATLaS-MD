@@ -12,7 +12,7 @@ import math
 from dataclasses import dataclass
 from typing import Iterable, Mapping, Sequence
 
-from ..units import KJ_PER_KCAL, K_B_KJ_PER_MOL_K
+from ..math_helpers import restraint_sigma
 
 OK = "ok"
 WARN = "WARN"
@@ -66,24 +66,6 @@ def _as_float(value: object, default: float) -> float:
     except (TypeError, ValueError):
         return float(default)
     return out
-
-
-def restraint_sigma(k_kcal_per_a2: float, temperature_k: float) -> float:
-    """Gaussian width of a harmonic umbrella, in the CV's own units.
-
-    ``sigma = sqrt(k_B T / k)`` with ``k`` converted from kcal/mol/A^2 to
-    kJ/mol/A^2 so it divides a kJ/mol thermal energy. Anything unusable -- a
-    non-positive or non-finite ``k``, a non-positive temperature -- yields
-    ``inf``, which makes the pinned-window comparison unsatisfiable rather than
-    raising or flagging spuriously.
-    """
-    k = _as_float(k_kcal_per_a2, float("nan")) * KJ_PER_KCAL
-    temperature = _as_float(temperature_k, float("nan"))
-    if not math.isfinite(k) or k <= 0.0:
-        return math.inf
-    if not math.isfinite(temperature) or temperature <= 0.0:
-        return math.inf
-    return math.sqrt(K_B_KJ_PER_MOL_K * temperature / k)
 
 
 def rank_windows(

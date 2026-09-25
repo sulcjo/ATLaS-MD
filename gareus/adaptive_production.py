@@ -31,7 +31,8 @@ import logging
 import math
 import re
 import shutil
-from typing import Any, Collection, Dict, Iterable, List, Optional, Sequence, Tuple
+import time
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -276,9 +277,10 @@ class EdgeDiagnostics:
     # ``mbar_state_overlap`` matrix, which dilutes an edge's overlap by
     # roughly how many OTHER states share its region (measured on
     # chignolin_7's 64-state union: full-union median 0.089 across the 48
-    # adjacent-rung edges vs a pairwise median of 0.258 on the same edges;
-    # the ``min_rung_overlap`` / ``target_rung_overlap`` thresholds below are
-    # calibrated against the pairwise number).  ``None`` means "not scored"
+    # adjacent-rung edges vs a pairwise median of 0.258 on the same edges).
+    # The ``min_rung_overlap`` / ``target_rung_overlap`` thresholds below are
+    # applied to this pairwise number but were NOT calibrated on it -- see
+    # their comment.  ``None`` means "not scored"
     # (no union MBAR solve was available), which is warned but never counted
     # as a weak rung edge.
     mbar_overlap: Optional[float] = None
@@ -309,16 +311,18 @@ class AdaptiveDecisionPolicy:
     # own samples in the denominator, union f_k held fixed) -- NEVER a raw
     # entry of the full-union ``mbar_state_overlap`` matrix, which dilutes an
     # edge's overlap by roughly how many other states share its region.
-    # Calibration (S3 pilot attempt 8, sigma0 = 6, rungs 0/.1/.25/.5/1, a ~4-
-    # state ladder -- i.e. already at an effectively pairwise scale):
-    # adjacent-rung O_ij came out 0.298 / 0.250 / 0.240 / 0.273, so 0.25 is a
-    # realistic target and 0.15 a floor that a healthy ladder clears with
-    # margin.  Confirmed at full campaign scale on RUNS/chignolin_7's
-    # 64-state union (16 CV1 centres x 4 rungs): the 48 adjacent-rung edges'
-    # pairwise median is 0.258 (0/48 below 0.15) -- consistent with the pilot
-    # -- while the full-union matrix on the SAME edges gives a median of
-    # 0.089 (38/48 below 0.15), which is why the full matrix must never be
-    # used for this gate.  Exchange acceptance is NOT usable here: under
+    # Calibration (S3 pilot attempt 8, sigma0 = 6, rungs 0/.1/.25/.5/1): a
+    # 5-state single-centre ladder whose adjacent-rung entries of the FULL
+    # 5-state overlap matrix came out 0.298 / 0.250 / 0.240 / 0.273, so 0.25
+    # was taken as a realistic target and 0.15 as a floor.  That full-matrix
+    # calibration is itself diluted (5 states share the region); the two
+    # thresholds are applied unchanged to the pairwise metric and have NOT
+    # been re-measured on it.  For scale only: on RUNS/chignolin_7's
+    # 64-state union (16 CV1 centres x 4 rungs) the 48 adjacent-rung edges'
+    # pairwise median is 0.258 (0/48 below 0.15) while the full-union matrix
+    # on the SAME edges gives a median of 0.089 (38/48 below 0.15), which is
+    # why the full matrix must never be used for this gate.  Exchange
+    # acceptance is NOT usable here: under
     # gibbs-walk the heat-bath choice inflated the same ladder's per-pair
     # acceptance to 91-95 % against a true pairwise overlap of 0.24-0.30.
     min_rung_overlap: float = 0.15
@@ -333,10 +337,12 @@ class AdaptiveDecisionPolicy:
     #      per-epoch/segment diagnostics carry no rung O_ij (they run before
     #      build_union_state_mbar_inputs and nothing passes them a
     #      ``rung_mbar_overlap`` mapping), so their rung edges are warned
-    #      ``rung_overlap_unavailable`` and skipped by the proposer. A rung gap
-    #      is therefore caught at CAMPAIGN END by the quality gate, not repaired
-    #      mid-campaign; feeding the epoch loop a per-epoch union solve is what
-    #      would change that.
+    #      ``rung_overlap_unavailable`` and skipped by the proposer. With
+    #      top-ups OFF a rung gap is therefore caught at CAMPAIGN END by the
+    #      quality gate, not repaired mid-campaign.  With top-ups ON the
+    #      per-epoch union solve they run feeds its pairwise overlaps into the
+    #      epoch diagnostics (``_apply_union_edge_overlap``), so the gate and
+    #      ``add_rung`` see real rung numbers mid-campaign.
     # (ii) Under an active ladder ``retire_converged`` is inert: every centre
     #      representative carries its own rungs, so it is an articulation point
     #      of the rung-aware graph and can never be retired, while a
@@ -459,6 +465,16 @@ class AdaptiveDecisionPolicy:
     # stall.  Either way the edge is reported, never silently dropped.
     bridge_repairable_first: bool = True
     bridge_skip_unreachable: bool = False
+    topups_enabled: bool = False
+    topup_target_sigma: float = 0.10
+    topup_weak_overlap: float = 0.15
+    topup_max_fraction: float = 0.3
+    topup_min_effect: float = 0.05
+    topup_max_edge_attempts: int = 2
+    topup_throughput_table: tuple = ((16.0, 3154.0), (59.0, 2300.0))
+    # Peak-memory ceiling (GB) for the per-epoch union build + MBAR solve top-ups
+    # run; an estimate above it skips the phase's diagnostics (no_diagnostics).
+    topup_diagnostics_max_gb: float = 8.0
 
 
 class WindowStateRegistry:
@@ -2864,7 +2880,7 @@ def _compute_mbar_weights_for_tica(
     try:
         from pymbar import MBAR as _MBAR  # noqa: PLC0415
         from scipy.special import logsumexp as _logsumexp  # noqa: PLC0415
-    except ImportError:
+    except Exception:
         return uniform
 
     try:
@@ -3336,8 +3352,13 @@ def build_union_state_mbar_inputs(
     pilot_dirs: "List[Path] | None" = None,
     output_prefix: str = "adaptive_union_mbar",
     tica_cv_version: "Optional[str]" = None,
+    size_guard: "Optional[Callable[[int, int], None]]" = None,
 ) -> Dict[str, Any]:
     """Build post-hoc bias matrices over the union of registry states.
+
+    ``size_guard(n_rows, n_states)``, when given, is called after subsampling and
+    before any rows x states matrix is allocated; it raises to abort the build
+    (the top-up diagnostics' memory guard).  ``None`` (every other caller): no check.
 
     Adaptive production can add and retire states, so per-epoch analysis arrays
     may have different widths.  This helper reconstructs one sample-major
@@ -3427,10 +3448,10 @@ def build_union_state_mbar_inputs(
 
     # Per-state equilibration-discard + autocorrelation subsampling.
     # Group row indices by sampled_state_id, thin each group's cv_A trace with
-    # equilibrated_subsample_indices, then rebuild sample_rows from kept indices.
+    # equilibrated_subsample, then rebuild sample_rows from kept indices.
     # All downstream numpy arrays are derived from sample_rows so alignment is
     # preserved automatically.
-    from .mbar_subsample import equilibrated_subsample_indices as _esi  # noqa: PLC0415
+    from .mbar_subsample import equilibrated_subsample as _es  # noqa: PLC0415
     _state_to_indices: Dict[int, List[int]] = {}
     for _gi, _row in enumerate(sample_rows):
         _sid = int(_row["sampled_state_id"])
@@ -3439,10 +3460,18 @@ def build_union_state_mbar_inputs(
     _subsample_counts: Dict[str, Any] = {}
     for _sid, _idx_list in _state_to_indices.items():
         _trace = np.asarray([float(sample_rows[i]["cv_A"]) for i in _idx_list], dtype=np.float64)
-        _keep = _esi(_trace)
+        _res = _es(_trace)
+        _keep = np.asarray(_res.indices, dtype=np.int64)
         _kept_global.extend(_idx_list[k] for k in _keep.tolist())
-        _subsample_counts[str(_sid)] = {"raw": len(_idx_list), "kept": int(len(_keep))}
+        _raw, _t0, _kept = len(_idx_list), int(_res.t0), int(len(_keep))
+        _g = float(_res.g)
+        if not math.isfinite(_g) or _g < 1.0:
+            _g = max(1.0, (_raw - _t0) / max(1, _kept))
+        _subsample_counts[str(_sid)] = {"raw": _raw, "t0": _t0, "kept": _kept, "g": _g,
+                                        "status": str(_res.status)}
     sample_rows = [sample_rows[i] for i in sorted(_kept_global)]
+    if size_guard is not None:
+        size_guard(len(sample_rows), len(states))
 
     cv_values = np.asarray([float(r["cv_A"]) for r in sample_rows], dtype=np.float64)
     secondary_values = np.asarray([
@@ -3738,8 +3767,9 @@ def rung_mbar_overlap_from_union(
     ``build_union_state_mbar_inputs`` -> ``apply_ladder_boost_to_u``), so it is
     the only honest source for an energy-space rung diagnostic.  Returns an
     empty mapping -- never raises -- when there is no ladder, no NPZ, or the
-    solve fails; a missing ``mbar_overlap`` then reads as a weak rung edge,
-    which is the conservative direction.
+    solve fails; an edge left without ``mbar_overlap`` is then unmeasured,
+    and an unmeasured edge is never weak (``_edge_is_measured_weak``): it is
+    warned ``rung_overlap_unavailable``, not proposed for ``add_rung``.
 
     Each edge is scored with ``gareus.mbar_analysis.ladder.pairwise_state_overlap``
     (union ``f_k`` held fixed, only the pair's own samples in the denominator),
@@ -3747,9 +3777,10 @@ def rung_mbar_overlap_from_union(
     an edge's overlap by roughly how many OTHER states share its region.  On
     RUNS/chignolin_7's 64-state union (16 centres x 4 rungs) the 48
     adjacent-rung edges came out at a full-union median of 0.089 (38/48 below
-    the 0.15 floor) versus a pairwise median of 0.258 (0/48 below) -- see
-    ``min_rung_overlap`` above, which is calibrated against the pairwise
-    number.
+    the 0.15 floor) versus a pairwise median of 0.258 (0/48 below).  The
+    ``min_rung_overlap`` threshold this is graded against came from a 5-state
+    full-matrix pilot and has not been re-measured on the pairwise scale (see
+    its comment on ``AdaptiveDecisionPolicy``).
     """
     policy = policy or AdaptiveDecisionPolicy()
     rung_pairs = [(a, b) for a, b, etype, _nd in build_geometry_edges(registry, policy) if etype == "rung"]
@@ -3785,35 +3816,6 @@ def rung_mbar_overlap_from_union(
     except Exception as exc:
         logging.warning("adaptive-production: rung MBAR overlap unavailable (%s)", exc)
         return {}
-
-
-def _symmetric_state_overlap(overlap: np.ndarray, i: int, j: int) -> Optional[float]:
-    """The full-union-matrix per-edge overlap metric: ``sqrt(O_ij * O_ji)``.
-
-    ``mbar_state_overlap`` returns ``O = diag(N) @ S`` with ``S`` symmetric, so
-    ``O_ij != O_ji`` whenever ``N_i != N_j`` -- and adaptive extension makes
-    unequal per-state sample counts the normal case, not the exception.  The raw
-    ``O[i, j]`` would make an edge's gate metric depend on which of its two
-    states happens to hold the lower state id, which is unrelated to anything
-    physical.  The geometric mean is the symmetric combination,
-    ``S_ij * sqrt(N_i * N_j)``, and it equals ``O_ij`` exactly when
-    ``N_i == N_j``.
-
-    NOT what ``rung_mbar_overlap_from_union`` uses any more: the full-union
-    matrix dilutes an edge's overlap by roughly how many OTHER states share
-    its region (measured on chignolin_7: full-union median 0.089 vs a
-    pairwise median of 0.258 on the same 48 adjacent-rung edges -- see
-    ``gareus.mbar_analysis.ladder.pairwise_state_overlap``, which is what the
-    driver calls today and what the 0.15 / 0.25 thresholds are calibrated
-    against). Kept here -- and still directly unit-tested -- as the
-    full-matrix analogue used by ``gareus.mbar_analysis.ladder_overlap``'s
-    default (non-``pair_overlap``) code path.
-    """
-    a = float(overlap[i, j])
-    b = float(overlap[j, i])
-    if not (math.isfinite(a) and math.isfinite(b)) or a < 0.0 or b < 0.0:
-        return None
-    return math.sqrt(a * b)
 
 
 def _write_matrix_csv(path: Path, matrix: np.ndarray, state_ids: np.ndarray) -> None:
@@ -4165,12 +4167,7 @@ def evaluate_adaptive_quality_gate(
                 weak_edges.append(edge)
                 weak_rung_edges.append(reason)
             continue
-        overlap = edge.get("overlap")
-        acc = edge.get("exchange_acceptance")
-        weak = overlap is None or float(overlap) < float(policy.target_overlap)
-        if acc is not None and float(acc) < float(policy.min_exchange_acceptance):
-            weak = True
-        if weak:
+        if _edge_is_measured_weak(edge, policy):
             weak_edges.append(edge)
     if weak_edges:
         needs_more_sampling.append(f"{len(weak_edges)} final edge(s) are below overlap/exchange thresholds")
@@ -4562,12 +4559,7 @@ def propose_actions_from_diagnostics(
             # (which the test below would otherwise read as "weak").  Rung
             # gaps are repaired by add_rung, in the pass after this one.
             continue
-        overlap = edge.get("overlap")
-        acc = edge.get("exchange_acceptance")
-        weak = (overlap is None or float(overlap) < float(policy.target_overlap))
-        if acc is not None:
-            weak = weak or float(acc) < float(policy.min_exchange_acceptance)
-        if not weak:
+        if not _edge_is_measured_weak(edge, policy):
             continue
         si, sj = int(edge["state_i"]), int(edge["state_j"])
         di, dj = state_rows.get(si, {}), state_rows.get(sj, {})
@@ -5020,31 +5012,6 @@ def propose_actions_from_diagnostics(
     return actions
 
 
-def _articulation_is_degenerate(
-    articulation: Collection[int],
-    active: Collection[Any],
-    fraction: float = 0.80,
-) -> bool:
-    """True when the articulation set is too large to discriminate.
-
-    `frontier_bonus` is meant to protect states that hold the MBAR overlap graph
-    together. That is a real signal when bridges are rare. On a path graph it is
-    not a signal at all: every interior node is an articulation point, so the
-    term fires for n-2 of n states before any data exists.
-
-    Measured on chignolin_7 (112 states): 110 of 112 scored the bonus every epoch,
-    and the two chain-end states took a ~36% smaller top-up purely for ending the
-    chain (extra 1,539,102 vs 2,407,082 steps in epoch_001). In epoch_002 those
-    endpoints had *fewer* samples than the interior (9,345 vs 12,817), so the one
-    term that does track run data ranked them higher -- and was overridden anyway.
-    """
-    n_active = len(active)
-    n_art = len(articulation)
-    if n_active <= 0 or n_art <= 0:
-        return False
-    return (n_art / float(n_active)) >= float(fraction)
-
-
 def _graph_articulation_states(registry: WindowStateRegistry) -> set[int]:
     active_ids = registry.active_state_ids()
     if len(active_ids) <= 2:
@@ -5177,24 +5144,47 @@ def _state_rows_by_id(diagnostics: Optional[Dict[str, Any]]) -> Dict[int, Dict[s
     return out
 
 
-def _weak_edge_touch_counts(diagnostics: Optional[Dict[str, Any]], policy: AdaptiveDecisionPolicy) -> Dict[int, int]:
-    counts: Dict[int, int] = {}
-    if not isinstance(diagnostics, dict):
-        return counts
-    for edge in diagnostics.get("edges", []) or []:
-        overlap = edge.get("overlap")
-        acc = edge.get("exchange_acceptance")
-        weak = overlap is None or float(overlap) < float(policy.target_overlap)
-        if acc is not None:
-            weak = weak or float(acc) < float(policy.min_exchange_acceptance)
-        if weak:
-            for key in ("state_i", "state_j"):
-                try:
-                    sid = int(edge.get(key))
-                    counts[sid] = counts.get(sid, 0) + 1
-                except Exception:
-                    pass
-    return counts
+def _edge_is_measured_weak(edge: Dict[str, Any], policy: AdaptiveDecisionPolicy) -> bool:
+    """Weak only if MEASURED below threshold; an unmeasured edge is never weak.
+
+    Rung edges are judged on the energy-space ``mbar_overlap`` alone against
+    ``policy.min_rung_overlap`` (their CV overlap is ~1 by construction and
+    gibbs-walk inflates their acceptance) -- the same calibrated rung floor
+    used by ``_annotate_edge_warnings``, ``_weak_rung_edge_reason`` and
+    ``_propose_rung_actions``.
+    """
+    if str(edge.get("edge_type")) == "rung":
+        value = edge.get("mbar_overlap")
+        return value is not None and float(value) < float(policy.min_rung_overlap)
+    overlap = edge.get("overlap")
+    weak = overlap is not None and float(overlap) < float(policy.target_overlap)
+    acc = edge.get("exchange_acceptance")
+    if acc is not None and float(acc) < float(policy.min_exchange_acceptance):
+        weak = True
+    return weak
+
+
+# Policy fields that only ever fed the per-state score allocator, removed with the
+# effective-top-ups change.  Kept on AdaptiveDecisionPolicy (and their CLI/YAML
+# keys) so existing configs still load; a non-default value is warned about once.
+SCORE_ALLOCATOR_FIELDS = ("low_sample_bonus", "weak_edge_bonus", "frontier_bonus", "high_boost_bonus",
+                          "new_state_steps", "articulation_degenerate_fraction")
+_SCORE_FIELDS_WARNED: set = set()
+
+
+def _warn_ignored_score_fields(policy: "AdaptiveDecisionPolicy") -> None:
+    defaults = AdaptiveDecisionPolicy()
+    changed = sorted(f for f in SCORE_ALLOCATOR_FIELDS
+                     if getattr(policy, f, None) != getattr(defaults, f)
+                     and f not in _SCORE_FIELDS_WARNED)
+    if not changed:
+        return
+    _SCORE_FIELDS_WARNED.update(changed)
+    logging.warning(
+        "adaptive-production: %s set to a non-default value but ignored: the per-state score "
+        "allocator was removed (every state now gets an equal share of the phase budget; extra MD "
+        "for under-converged states comes from the single --ap-topups top-up)",
+        ", ".join(changed))
 
 
 def build_adaptive_epoch_schedule(
@@ -5206,12 +5196,18 @@ def build_adaptive_epoch_schedule(
     default_steps: int,
     final: bool = False,
 ) -> List[Dict[str, Any]]:
-    """Allocate per-state MD steps for the next epoch/final phase.
+    """Uniform per-state MD steps for the next epoch/final phase.
 
-    The schedule is intentionally conservative: every active state receives a
-    baseline all-state segment so graph/exchange connectivity is sampled at
-    least briefly.  Extra top-up segments are assigned to uncertain states.
+    Every active state gets the same share of the phase budget: ``default_steps``,
+    or ``policy.epoch_step_budget``/``final_step_budget`` spread evenly when one is
+    set (``_policy_with_pool_step_budget`` sets it to what the MD pool can still
+    afford), bounded by ``min_state_steps``/``max_state_steps``.  There is no
+    per-state score any more: extra MD for under-converged states is the job of the
+    single deficit-driven top-up ``run_scheduled_adaptive_epoch`` plans from union
+    MBAR diagnostics (``_topup_plan_for_phase``).  The row format is unchanged, so a
+    schedule written by an older version still loads on resume.
     """
+    _warn_ignored_score_fields(policy)
     active = registry.active_states()
     if not active:
         return []
@@ -5221,64 +5217,18 @@ def build_adaptive_epoch_schedule(
     if max_steps < min_steps:
         max_steps = min_steps
     total_budget = int((policy.final_step_budget if final else policy.epoch_step_budget) or (len(active) * default_steps))
-    total_budget = max(len(active) * min_steps, total_budget)
-    remaining = max(0, total_budget - len(active) * min_steps)
+    per_state = int(min(max_steps, max(min_steps, total_budget // len(active))))
     state_rows = _state_rows_by_id(diagnostics)
-    weak_counts = _weak_edge_touch_counts(diagnostics, policy)
-    articulation = _graph_articulation_states(registry)
-    articulation_degenerate = _articulation_is_degenerate(
-        articulation, active, float(policy.articulation_degenerate_fraction))
-    scored: List[Dict[str, Any]] = []
+    rows = []
     for state in active:
         sid = int(state.state_id)
-        diag = state_rows.get(sid, {})
-        sample_count = int(float(diag.get("sample_count", 0) or 0))
-        boost_sd = diag.get("gamd_boost_sd_kcal_mol")
-        score = 1.0
-        reasons = ["baseline"]
-        if sample_count <= 0:
-            score += 2.0 * float(policy.low_sample_bonus)
-            reasons.append("no_samples_yet")
-        elif sample_count < int(policy.min_samples_for_retire):
-            deficit = 1.0 - min(1.0, sample_count / max(1.0, float(policy.min_samples_for_retire)))
-            score += float(policy.low_sample_bonus) * deficit
-            reasons.append("low_effective_sample_proxy")
-        if sid in weak_counts:
-            score += float(policy.weak_edge_bonus) * float(weak_counts[sid])
-            reasons.append(f"touches_{weak_counts[sid]}_weak_edge(s)")
-        if sid in articulation and not articulation_degenerate:
-            score += float(policy.frontier_bonus)
-            reasons.append("graph_bridge_state")
-        if int(state.created_epoch) >= int(epoch):
-            score += float(policy.frontier_bonus) + 1.0
-            reasons.append("new_state")
-        if boost_sd is not None:
-            try:
-                if float(boost_sd) > float(policy.max_gamd_boost_sd_kcal_mol):
-                    score += float(policy.high_boost_bonus)
-                    reasons.append("high_gamd_boost_sd")
-            except Exception:
-                pass
-        scored.append({
-            "state_id": sid,
-            "score": float(max(0.0, score)),
-            "sample_count": sample_count,
-            "requested_steps": int(min_steps),
-            "baseline_steps": int(min_steps),
-            "extra_steps": 0,
-            "allocation_reason": "; ".join(reasons),
+        rows.append({
+            "state_id": sid, "requested_steps": per_state, "baseline_steps": per_state,
+            "extra_steps": 0, "score": 0.0,
+            "sample_count": int(float((state_rows.get(sid) or {}).get("sample_count", 0) or 0)),
+            "allocation_reason": "baseline",
         })
-    score_sum = sum(float(r["score"]) for r in scored) or float(len(scored))
-    for row in scored:
-        extra = int(round(float(remaining) * float(row["score"]) / score_sum)) if remaining > 0 else 0
-        requested = min(max_steps, int(row["baseline_steps"]) + max(0, extra))
-        state = registry.get_state(int(row["state_id"]))
-        if state is not None and int(state.created_epoch) >= int(epoch):
-            new_steps = int(policy.new_state_steps or max(default_steps, max_steps // 2))
-            requested = min(max_steps, max(requested, new_steps))
-        row["requested_steps"] = int(requested)
-        row["extra_steps"] = max(0, int(requested) - int(row["baseline_steps"]))
-    return scored
+    return rows
 
 
 def write_epoch_schedule_files(epoch_dir: Path, schedule: Sequence[Dict[str, Any]], *, prefix: str = "epoch_schedule") -> Dict[str, str]:
@@ -6391,6 +6341,403 @@ def stage_phase_identity(epoch_dir_name: str, max_epochs: Optional[int] = None) 
     return ident
 
 
+# ---- effective top-ups: one deficit-driven top-up per scheduled phase ------------
+
+# Distinct from the campaign-end "adaptive_union_mbar" artifacts, which a mid-phase
+# union build must never overwrite.
+TOPUP_UNION_PREFIX = "topup_union_mbar"
+KB_KCAL_PER_MOL_K = 0.0019872041
+
+# The phase's latest measured union edge overlaps are persisted beside its plan
+# (topup_union_overlap.json, written at plan time and again after the top-up) and
+# read back for the epoch diagnostics, so the gate and proposer see the same rung
+# overlaps whether or not the phase was interrupted -- and no third solve is paid.
+
+
+def _topup_layout_neighbours(args, active):
+    """(ids, same-rung spatial neighbours, other-rung same-centre partners), keyed by state_id."""
+    from .layout_neighbours import other_rung_same_centre, same_rung_neighbours, spatial_neighbour_pairs
+    ids = [int(s.state_id) for s in active]
+    c1 = [float(s.primary_center) for s in active]
+    c2 = [float(s.secondary_center) if s.secondary_center is not None else 0.0 for s in active]
+    lam = [float(s.gamd_lambda or 0.0) for s in active]
+    k1 = [float(s.primary_k) for s in active]
+    k2 = [float(s.secondary_k or 0.0) for s in active]
+    temperature = float(getattr(args, "temperature_k", 300.0) or 300.0)
+    pairs = spatial_neighbour_pairs(c1, c2, lam, k1, k2, temperature)
+    nb_local, rp_local = same_rung_neighbours(pairs, lam), other_rung_same_centre(c1, c2, lam)
+    neighbours = {ids[w]: [ids[x] for x in nb_local.get(w, [])] for w in range(len(ids))}
+    rung_partners = {ids[w]: [ids[x] for x in rp_local.get(w, [])] for w in range(len(ids))}
+    return ids, neighbours, rung_partners
+
+
+class TopupDiagnosticsTooLarge(RuntimeError):
+    """The per-epoch union for top-up diagnostics would exceed topup_diagnostics_max_gb."""
+
+
+def _topup_union_size_guard(max_gb: float):
+    """A ``build_union_state_mbar_inputs`` size guard: WARNING and raise over ``max_gb``.
+
+    Raised inside the build, so the caller's existing handling turns it into
+    ``no_diagnostics`` (plan time) or a skipped calibration (after the top-up).
+    """
+    from .adaptive.union_diagnostics import estimate_union_diagnostics_peak_gb
+
+    def _guard(n_rows: int, n_states: int) -> None:
+        est = estimate_union_diagnostics_peak_gb(n_rows, n_states)
+        if est > float(max_gb):
+            logger.warning(
+                "top-up diagnostics skipped: the union of %d rows x %d states is estimated at %.1f GB peak, "
+                "over --ap-topup-diagnostics-max-gb %.1f", n_rows, n_states, est, float(max_gb))
+            raise TopupDiagnosticsTooLarge(
+                f"union of {n_rows} rows x {n_states} states estimated at {est:.1f} GB peak "
+                f"> --ap-topup-diagnostics-max-gb {float(max_gb):.1f}")
+    return _guard
+
+
+def _topup_sigma_neighbours(ids, neighbours, rung_partners, edge_attempts, max_edge_attempts: int):
+    """The states each state's sigma_k is read against (rulings 23 and 33/I4).
+
+    Same-rung spatial neighbours, minus any neighbour whose edge is structural
+    by exhaustion (``edge_attempts >= max_edge_attempts``): across a real gap
+    the max-over-neighbours sigma stays high for both endpoints, so without
+    this both endpoints would be topped every phase after the edge was already
+    handed to the bridge machinery.  Rung partners (same centre, other rung)
+    are the fallback when no same-rung neighbour is left.
+    """
+    exhausted = {(min(int(a), int(b)), max(int(a), int(b)))
+                 for (a, b), n in (edge_attempts or {}).items() if int(n) >= int(max_edge_attempts)}
+    out = {}
+    for s in ids:
+        same = [j for j in (neighbours.get(s) or []) if (min(s, j), max(s, j)) not in exhausted]
+        out[s] = same or list(rung_partners.get(s, []))
+    return out
+
+
+def _phase_union_diagnostics(args, adaptive_dir: Path, registry: "WindowStateRegistry",
+                             policy: AdaptiveDecisionPolicy, f_init, layout_neighbours=None,
+                             edge_attempts=None):
+    """Union-MBAR top-up diagnostics over every sample the campaign holds so far.
+
+    ``layout_neighbours`` is ``_topup_layout_neighbours``'s result when the caller already has it.
+    ``edge_attempts`` (``topup_state.json``'s counts) removes tried-out edges from the
+    sigma neighbour sets; pass the SAME counts at plan time and after the top-up, so
+    the realised sigma is measured on the neighbour set the prediction was made for.
+    """
+    from .adaptive.union_diagnostics import union_diagnostics_from_npz
+    temperature = float(getattr(args, "temperature_k", 300.0) or 300.0)
+    edges = [(a, b) for a, b, _t, _d in build_geometry_edges(registry, policy)]
+    ids, neighbours, rung_partners = layout_neighbours or _topup_layout_neighbours(args, registry.active_states())
+    sigma_neighbours = _topup_sigma_neighbours(ids, neighbours, rung_partners, edge_attempts,
+                                               int(policy.topup_max_edge_attempts))
+    # Same source filters as the campaign-end union build: the tICA guard must drop
+    # epochs sampled under a different CV2 definition, or their cv2 samples are
+    # scored against the wrong centres and the plan targets the wrong states.
+    meta = build_union_state_mbar_inputs(
+        adaptive_dir, registry, output_prefix=TOPUP_UNION_PREFIX,
+        pilot_dirs=[Path(p) for p in (getattr(args, "adaptive_production_pilot_sample_dirs", None) or [])],
+        tica_cv_version=getattr(args, "tica_cv_version", None),
+        size_guard=_topup_union_size_guard(float(policy.topup_diagnostics_max_gb)))
+    return union_diagnostics_from_npz(
+        meta["arrays_npz"], edges, kt_kcal=KB_KCAL_PER_MOL_K * temperature,
+        subsample_counts=meta.get("subsample_counts_per_state"),
+        min_effect_kcal=float(policy.topup_min_effect), f_init=f_init, sigma_neighbours=sigma_neighbours)
+
+
+def _topup_plan_for_phase(args, epoch_dir: Path, registry: "WindowStateRegistry",
+                          policy: AdaptiveDecisionPolicy, *, full_steps: int):
+    """Resume-stable top-up plan for this phase (spec 4.1-4.3).
+
+    A saved plan that is no longer ``"planned"`` (completed, refused, healthy, ...)
+    is this phase's final decision and is returned as-is, so a phase never gets a
+    second top-up.  A saved ``"planned"`` plan is reused (an interrupted top-up
+    resumes the SAME plan) unless one of its states has left the active set.
+    """
+    from .adaptive.throughput import wall_hours
+    from .adaptive.topup_allocator import plan_topup
+    from dataclasses import replace
+    from .adaptive.topup_state import load_plan, load_state, save_plan, save_state, save_union_overlap
+
+    epoch_dir = Path(epoch_dir)
+    adaptive_dir = epoch_dir.parent
+    active = registry.active_states()
+    ids = [int(s.state_id) for s in active]
+    saved = load_plan(epoch_dir)
+    if saved is not None:
+        if saved.reason != "planned":
+            return saved
+        missing = sorted(set(saved.state_ids) - set(ids))
+        if not missing:
+            return saved
+        if _phase_has_partial_topup(epoch_dir):
+            # The old plan's segment already holds data: replanning would open a
+            # second top-up directory for this phase.  Keep the partial samples.
+            print(f"      top-up ended: layout changed (states {missing} no longer active) after the "
+                  "top-up had started; keeping its partial samples, no replan")
+            final = replace(saved, reason="layout_changed")
+            save_plan(epoch_dir, final)
+            return final
+        print(f"      top-up plan discarded: layout changed (states {missing} no longer active)")
+    state = load_state(adaptive_dir)
+    layout = _topup_layout_neighbours(args, active)
+    _ids, neighbours, rung_partners = layout
+    try:
+        diag = _phase_union_diagnostics(args, adaptive_dir, registry, policy, state["f_kT"], layout,
+                                        edge_attempts=state["edge_attempts"])
+    except Exception as exc:
+        print(f"      top-up diagnostics unavailable ({exc}); no top-up this phase")
+        diag = None
+    interval = int(getattr(args, "report_interval", 5000) or 5000)
+    n_gpus = max(1, len(str(getattr(args, "device_index", "0")).split(",")))
+    timestep = float(getattr(args, "timestep_fs", 4.0) or 4.0)
+    budget = float(policy.topup_max_fraction) * wall_hours(int(full_steps), len(ids), timestep, n_gpus,
+                                                           policy.topup_throughput_table)
+    plan = plan_topup(diag, state_ids_in_order=ids, neighbours=neighbours, rung_partners=rung_partners,
+                      policy=policy, report_interval=interval, timestep_fs=timestep, n_gpus=n_gpus,
+                      budget_hours=budget, correction=state["correction"], edge_attempts=state["edge_attempts"])
+    if diag is not None:
+        save_union_overlap(epoch_dir, diag.edge_overlap)
+        state["f_kT"] = dict(diag.f_kT)
+        save_state(adaptive_dir, state)
+    save_plan(epoch_dir, plan)
+    return plan
+
+
+def _seedable_patch(plan, parent_dirs):
+    """Drop states without an exported final State; skip the top-up if no deficit remains.
+
+    ``parent_dirs`` must be the list the segment itself will load
+    (``topup_parent_dirs_by_creation_order``).  ``load_seed_index`` raises
+    ``SeedMismatchError`` on an unreadable parent index (ruling 19); the caller
+    treats that like a runtime seed mismatch.
+    """
+    from dataclasses import replace
+    from .topup_seeding import load_seed_index
+    have = set(load_seed_index(parent_dirs))
+    missing = [s for s in plan.state_ids if s not in have]
+    if not missing:
+        return plan
+    print(f"      top-up: {len(missing)} window(s) without a final State left out (state_ids {missing})")
+    keep = tuple(s for s in plan.state_ids if s in have)
+    deficits = tuple(s for s in plan.deficit_state_ids if s in have)
+    if not deficits:
+        return replace(plan, state_ids=(), steps=0, deficit_state_ids=(), partner_state_ids=(), reason="no_seed_states")
+    return replace(plan, state_ids=keep, deficit_state_ids=deficits,
+                   partner_state_ids=tuple(s for s in plan.partner_state_ids if s in have))
+
+
+def _after_topup_update(args, epoch_dir: Path, registry, policy, plan, elapsed_s: Optional[float],
+                        *, segment_name: Optional[str] = None):
+    """Calibration, edge attempts and wall-time log after a completed top-up.
+
+    ``plan`` is the plan AS RUN (steps and predictions at the steps actually taken);
+    ``segment_name`` is the directory it ran in.  ``elapsed_s`` is ``None`` when the
+    segment was already complete on disk (crash-resume fast path): no wall time was
+    measured, so ``realised_h`` is logged as null rather than as ~0.
+    Returns the post-top-up union diagnostics (``None`` when unavailable).
+    """
+    from .adaptive.topup_state import load_state, save_state, save_union_overlap, update_after_topup
+    adaptive_dir = Path(epoch_dir).parent
+    state = load_state(adaptive_dir)
+    try:
+        diag = _phase_union_diagnostics(args, adaptive_dir, registry, policy, state["f_kT"],
+                                        edge_attempts=state["edge_attempts"])
+    except Exception as exc:
+        print(f"      top-up calibration skipped ({exc})")
+        diag = None
+    if diag is not None:
+        state = update_after_topup(state, plan, diag.sigma_kcal)
+        state["f_kT"] = dict(diag.f_kT)
+        save_union_overlap(epoch_dir, diag.edge_overlap)
+    name = segment_name or f"topup_001_{plan.steps}"
+    state["wall_time"].append({"segment": f"{Path(epoch_dir).name}/{name}",
+                               "n_states": len(plan.state_ids), "steps": int(plan.steps),
+                               "predicted_h": float(plan.cost_hours),
+                               "realised_h": None if elapsed_s is None else float(elapsed_s) / 3600.0})
+    save_state(adaptive_dir, state)
+    return diag
+
+
+def _plan_at_steps(plan, steps: int):
+    """The plan as it actually ran when the MD pool clipped it to ``steps``.
+
+    Predictions are re-derived with the allocator's own model
+    (``topup_allocator.predicted_sigma``) at the steps taken, so calibration
+    compares the realised sigma with what THAT length should have delivered, not
+    with the full plan's promise.  Cost is linear in steps.
+    """
+    from dataclasses import replace
+    from .adaptive.topup_allocator import predicted_sigma
+    steps = int(steps)
+    predicted = {s: predicted_sigma(plan.sigma_before[s], plan.sample_scale_steps[s], steps)
+                 for s in plan.state_ids
+                 if s in plan.sigma_before and s in plan.sample_scale_steps}
+    frac = steps / float(plan.steps) if int(plan.steps) > 0 else 0.0
+    return replace(plan, steps=steps, predicted_sigma=predicted, cost_hours=float(plan.cost_hours) * frac)
+
+
+def _phase_has_partial_topup(epoch_dir: Path) -> bool:
+    """True when a ``topup_001_*`` segment of this phase already holds a checkpoint or samples."""
+    for d in Path(epoch_dir).glob("topup_001_*"):
+        if not d.is_dir():
+            continue
+        try:
+            if production_checkpoint_available(d) or _run_dir_has_samples(d):
+                return True
+        except Exception:
+            return True   # unreadable checkpoint: something is there; never replan over it
+    return False
+
+
+def _phase_topup_recorded(state: Dict[str, Any], phase_name: str) -> bool:
+    """True once topup_state.json logs a completed top-up for this phase."""
+    prefix = f"{phase_name}/topup_"
+    return any(str((row or {}).get("segment", "")).startswith(prefix) for row in state.get("wall_time", []))
+
+
+STRUCTURAL_EDGES_LOGGED = 5
+
+
+def _log_structural_edges(plan) -> None:
+    """One driver log line for the plan's structural edges (also saved in topup_plan.json)."""
+    edges = [tuple(int(x) for x in e) for e in (plan.structural_edges or ())]
+    if not edges:
+        return
+    shown = ", ".join(f"{a}-{b}" for a, b in edges[:STRUCTURAL_EDGES_LOGGED])
+    more = f" (+{len(edges) - STRUCTURAL_EDGES_LOGGED} more)" if len(edges) > STRUCTURAL_EDGES_LOGGED else ""
+    print(f"      top-up plan: {len(edges)} structural edge(s) left to the bridge/add machinery: {shown}{more}")
+
+
+def _run_phase_topup(args, epoch_dir: Path, registry, policy, run_segment, segment_summaries, *,
+                     full_steps: int):
+    """Plan, seed-check and run this phase's single top-up, then calibrate.
+
+    Returns ``"interrupted"`` when a graceful shutdown cut the top-up short;
+    otherwise this phase's persisted union edge overlaps (``None`` if never measured).
+    A ``SeedMismatchError`` (from the seed index or from inside the segment) ends
+    the top-up only: it is recorded in the saved plan and the phase goes on.
+    ``segment_summaries`` is ``run_segment``'s own log: its last row tells whether
+    the MD pool skipped or clipped the top-up (ruling 20).
+    """
+    from dataclasses import replace
+    from .adaptive.topup_state import load_state, load_union_overlap, save_plan
+    from .topup_seeding import SeedMismatchError, topup_parent_dirs_by_creation_order
+
+    epoch_dir = Path(epoch_dir)
+    if _phase_topup_recorded(load_state(epoch_dir.parent), epoch_dir.name):
+        print(f"      top-up: {epoch_dir.name} already ran its top-up (topup_state.json); one per phase")
+        return load_union_overlap(epoch_dir)
+    plan = _topup_plan_for_phase(args, epoch_dir, registry, policy, full_steps=full_steps)
+    try:
+        if plan.reason == "planned":
+            parents = topup_parent_dirs_by_creation_order(epoch_dir / f"topup_001_{int(plan.steps)}")
+            patched = _seedable_patch(plan, parents)
+            if patched != plan:
+                save_plan(epoch_dir, patched)   # a resumed segment must get the same state set
+            plan = patched
+        print(f"      top-up plan: {plan.reason}, {len(plan.state_ids)} states "
+              f"({len(plan.deficit_state_ids)} deficit + {len(plan.partner_state_ids)} partners), "
+              f"{plan.steps} steps, {float(plan.cost_hours):.2f} h predicted")
+        _log_structural_edges(plan)
+        if plan.reason == "planned" and plan.state_ids and int(plan.steps) > 0:
+            name = f"topup_001_{int(plan.steps)}"
+            n_before = len(segment_summaries)
+            t_start = time.monotonic()
+            run_segment(name, list(plan.state_ids), int(plan.steps))
+            if _graceful_shutdown.is_set():
+                return "interrupted"
+            elapsed = time.monotonic() - t_start
+            outcome = segment_summaries[-1] if len(segment_summaries) > n_before else {}
+            if outcome.get("skipped_by_runtime_pool"):
+                print(f"      top-up {name} skipped: MD pool exhausted; no calibration this phase")
+                save_plan(epoch_dir, replace(plan, reason="pool_exhausted"))
+                return load_union_overlap(epoch_dir)
+            actual = int(outcome.get("steps", plan.steps) or 0)
+            ran = _plan_at_steps(plan, actual) if 0 < actual < int(plan.steps) else plan
+            _after_topup_update(args, epoch_dir, registry, policy, ran,
+                                None if outcome.get("already_complete") else elapsed, segment_name=name)
+            save_plan(epoch_dir, replace(plan, reason="completed"))
+    except SeedMismatchError as exc:
+        print(f"      top-up aborted, campaign continues: {exc}")
+        save_plan(epoch_dir, replace(plan, reason="seed_mismatch"))
+    return load_union_overlap(epoch_dir)
+
+
+def _apply_union_edge_overlap(diagnostics: Dict[str, Any], edge_overlap: Dict[Tuple[int, int], float],
+                              policy: AdaptiveDecisionPolicy) -> None:
+    """Write measured union overlaps into the epoch diagnostics' edges, in place.
+
+    Every measured edge gets ``mbar_overlap``; a rung edge's warnings are
+    re-derived from it (its ``rung_overlap_unavailable`` is no longer true), so the
+    existing proposer turns a measured low rung overlap into ``add_rung``.  Spatial
+    edges keep their CV-histogram ``overlap``, which is what bridges are judged on.
+    """
+    for edge in (diagnostics or {}).get("edges", []) or []:
+        try:
+            si, sj = int(edge.get("state_i")), int(edge.get("state_j"))
+        except (TypeError, ValueError):
+            continue
+        value = edge_overlap.get((min(si, sj), max(si, sj)))
+        if value is None:
+            continue
+        edge["mbar_overlap"] = float(value)
+        if str(edge.get("edge_type")) == "rung":
+            kept = [w for w in edge.get("warnings", []) or []
+                    if w not in ("rung_overlap_unavailable", "low_rung_overlap")]
+            wi, wj = edge.get("window_i"), edge.get("window_j")
+            rung = EdgeDiagnostics(state_i=si, state_j=sj, window_i=-1 if wi is None else int(wi),
+                                   window_j=-1 if wj is None else int(wj), edge_type="rung",
+                                   mbar_overlap=float(value), warnings=kept)
+            edge["warnings"] = _annotate_edge_warnings(rung, policy).warnings
+
+
+def _schedule_full_steps(schedule: Sequence[Dict[str, Any]]) -> int:
+    """The un-shortened per-state phase length of an allocation schedule.
+
+    The quantized mean of the active rows' ``requested_steps``, floored at the
+    smallest ``baseline_steps``.  With top-ups off this IS the baseline length
+    (unchanged formula); with top-ups on the top-up budget is a fraction of it,
+    taken before the baseline is shortened.  Read from ``requested_steps``, not
+    ``baseline_steps``: a schedule written by the removed score allocator (a
+    phase resumed across the top-ups deploy) stored each state's minimum in
+    ``baseline_steps`` and its extra MD in ``requested_steps``, so the minimum
+    alone would give a tiny baseline and top-up budget.  New uniform schedules
+    carry the same value in both columns.
+    """
+    active = [r for r in schedule if int(r.get("requested_steps", 0) or 0) > 0]
+    min_baseline = max(1, min(int(r.get("baseline_steps", 0) or 0) for r in active))
+    requested = [int(r.get("requested_steps", 0) or 0) for r in active]
+    return max(min_baseline, _quantized_extra_steps(int(round(sum(requested) / len(requested)))))
+
+
+def _final_phase_strands_topup_budget(epoch_dir: Path, baseline_steps: int, full_steps: int) -> bool:
+    """True when the FINAL phase withheld top-up budget that its top-up never spent.
+
+    Only the final phase: a numbered epoch's unspent MD stays in the campaign
+    pool for the next phase.  "Spent" means the top-up completed (or this
+    phase's top-up is already logged in ``topup_state.json``), or the MD pool
+    skipped it (``pool_exhausted`` -- there is nothing left to extend with).
+    Every other outcome (healthy, cap_too_small, no_diagnostics,
+    no_seed_states, seed_mismatch, layout_changed) strands the withheld
+    fraction.  Requires the baseline's own checkpoint, since the extension is
+    a resume of it; without one it would restart the baseline from scratch.
+    """
+    from .adaptive.topup_state import load_plan, load_state
+    epoch_dir = Path(epoch_dir)
+    if epoch_dir.name != "final" or int(full_steps) <= int(baseline_steps):
+        return False
+    if _phase_topup_recorded(load_state(epoch_dir.parent), epoch_dir.name):
+        return False
+    plan = load_plan(epoch_dir)
+    if plan is not None and plan.reason in ("completed", "pool_exhausted"):
+        return False
+    if not production_checkpoint_available(epoch_dir / "baseline"):
+        print("      final phase: no top-up ran, but the baseline has no checkpoint to extend from; "
+              "the withheld top-up budget stays unspent")
+        return False
+    return True
+
+
 def run_scheduled_adaptive_epoch(
     args: Any,
     epoch_dir: Path,
@@ -6419,18 +6766,18 @@ def run_scheduled_adaptive_epoch(
     active_ids = [int(r["state_id"]) for r in schedule if int(r.get("requested_steps", 0) or 0) > 0]
     if not active_ids:
         raise RuntimeError("adaptive allocation schedule selected no states")
-    baseline_steps = min(int(r.get("baseline_steps", 0) or 0) for r in schedule if int(r.get("requested_steps", 0) or 0) > 0)
-    baseline_steps = max(1, baseline_steps)
-    topups_enabled = _arg_bool(args, "adaptive_production_topups", True)
-    if not topups_enabled:
+    full_steps = _schedule_full_steps(schedule)
+    topups_enabled = bool(getattr(policy, "topups_enabled", False)) or _arg_bool(args, "adaptive_production_topups", False)
+    if topups_enabled:
+        baseline_steps = max(1000, _quantized_extra_steps(int(full_steps * (1.0 - float(policy.topup_max_fraction)))))
+        print(f"      top-ups on: all-state baseline runs {baseline_steps} of {full_steps} steps/state; "
+              f"up to {float(policy.topup_max_fraction):.0%} of the phase's wall time is held for one top-up")
+    else:
         # Baseline only: it carries the phase's whole per-state budget, so the MD
-        # the allocator meant for the phase is spent uniformly over every state
+        # the schedule meant for the phase is spent uniformly over every state
         # (and a resumed baseline simply continues from its checkpoint).
-        requested = [int(r.get("requested_steps", 0) or 0) for r in schedule
-                     if int(r.get("requested_steps", 0) or 0) > 0]
-        uniform = _quantized_extra_steps(int(round(sum(requested) / len(requested))))
-        baseline_steps = max(baseline_steps, uniform)
-        print(f"      top-ups disabled (--no-ap-topups): all-state baseline runs {baseline_steps} steps/state")
+        baseline_steps = full_steps
+        print(f"      top-ups off (enable with --ap-topups): all-state baseline runs {baseline_steps} steps/state")
     segment_summaries: List[Dict[str, Any]] = []
     resume_requested = _arg_bool(args, "adaptive_production_resume", False)
     _seg_call_counter: List[int] = [0]
@@ -6445,7 +6792,10 @@ def run_scheduled_adaptive_epoch(
     # depends on the window already being established.
     _baseline_skipped_state_ids: set = set()
 
-    def run_segment(name: str, state_ids: Sequence[int], steps: int) -> Path:
+    def run_segment(name: str, state_ids: Sequence[int], steps: int, *, force_resume: bool = False) -> Path:
+        """``force_resume``: continue this segment from its own checkpoint even
+        when the campaign itself was not started with ``--resume`` (the final
+        phase's baseline extension)."""
         seg_dir = epoch_dir / name
         seg_dir.mkdir(parents=True, exist_ok=True)
         windows_csv = epoch_dir / f"{name}_windows.csv"
@@ -6455,7 +6805,7 @@ def run_scheduled_adaptive_epoch(
         # only runs on a fresh start). Writing a fresh identity map over it is
         # the chignolin_6 mis-attribution.  See
         # _phase_window_map_is_owned_by_a_resuming_phase.
-        _seg_will_resume = bool(resume_requested and production_checkpoint_available(seg_dir))
+        _seg_will_resume = bool((resume_requested or force_resume) and production_checkpoint_available(seg_dir))
         _seg_map_path = seg_dir / "epoch_window_map.csv"
         # Both no-clobber vetoes, not just the resume one: a segment can also
         # already hold samples from an attempt whose checkpoint is unusable, and
@@ -6532,7 +6882,30 @@ def run_scheduled_adaptive_epoch(
         requested_steps = int(steps)
         actual_steps = requested_steps
         pool_event = None
-        if runtime_pool is not None and runtime_pool.enabled:
+        if force_resume:
+            # The final phase's baseline extension (ruling 34): the checkpoint
+            # already holds `prior` steps, so only the DELTA is new MD and only
+            # the delta is clipped against the pool.  Clipping the full target
+            # (the ordinary path below) lands under the checkpoint whenever the
+            # pool holds just the withheld fraction, i.e. always in production.
+            # No summary row for a no-op: the baseline's own row already exists.
+            _fr_prior = int(_segment_checkpoint_prod_done(seg_dir) or 0) if seg_args.resume else 0
+            _fr_delta = max(0, requested_steps - _fr_prior)
+            if runtime_pool is not None and runtime_pool.enabled:
+                _fr_delta = runtime_pool.clip_steps(
+                    len(state_ids), _fr_delta,
+                    reserve_ns=float(pool_reserve_ns),
+                    hard_stop=bool(getattr(args, "adaptive_production_pool_hard_stop", True)),
+                )
+            if _fr_delta <= 0:
+                print(f"      scheduled segment {name}: extension skipped, no new steps "
+                      f"({_fr_prior}/{requested_steps} checkpointed; MD pool left for it: 0)")
+                return seg_dir
+            actual_steps = _fr_prior + int(_fr_delta)
+            if actual_steps < requested_steps:
+                print(f"      scheduled segment {name}: extension clipped by MD pool "
+                      f"{requested_steps}->{actual_steps} steps for {len(state_ids)} state(s)")
+        elif runtime_pool is not None and runtime_pool.enabled:
             actual_steps = runtime_pool.clip_steps(
                 len(state_ids), requested_steps,
                 reserve_ns=float(pool_reserve_ns),
@@ -6674,8 +7047,7 @@ def run_scheduled_adaptive_epoch(
         })
         return seg_dir
 
-    run_segment("baseline", active_ids, baseline_steps)
-    if _graceful_shutdown.is_set():
+    def _interrupted() -> Dict[str, Any]:
         payload = {
             "schema_version": "adaptive_scheduled_epoch_v1",
             "status": "interrupted_after_checkpoint",
@@ -6687,27 +7059,36 @@ def run_scheduled_adaptive_epoch(
         }
         write_json(epoch_dir / "scheduled_epoch_summary.json", payload)
         return {"summary": payload, "diagnostics": {}}
-    groups: Dict[int, List[int]] = {}
-    for row in (schedule if topups_enabled else ()):
-        extra = _quantized_extra_steps(int(row.get("requested_steps", 0) or 0) - baseline_steps)
-        if extra <= 0:
-            continue
-        groups.setdefault(extra, []).append(int(row["state_id"]))
-    for idx, (extra_steps, state_ids) in enumerate(sorted(groups.items()), start=1):
-        run_segment(f"topup_{idx:03d}_{extra_steps}", state_ids, extra_steps)
-        if _graceful_shutdown.is_set():
-            payload = {
-                "schema_version": "adaptive_scheduled_epoch_v1",
-                "status": "interrupted_after_checkpoint",
-                "epoch_dir": str(epoch_dir),
-                "baseline_steps": int(baseline_steps),
-                "segments": segment_summaries,
-                "diagnostics_json": "",
-                "schedule_csv": str(epoch_dir / "epoch_schedule.csv"),
-            }
-            write_json(epoch_dir / "scheduled_epoch_summary.json", payload)
-            return {"summary": payload, "diagnostics": {}}
+
+    run_segment("baseline", active_ids, baseline_steps)
+    if _graceful_shutdown.is_set():
+        return _interrupted()
+    union_edge_overlap: Optional[Dict[Tuple[int, int], float]] = None
+    if topups_enabled:
+        outcome = _run_phase_topup(args, epoch_dir, registry, policy, run_segment, segment_summaries,
+                                   full_steps=full_steps)
+        if outcome == "interrupted":
+            return _interrupted()
+        union_edge_overlap = outcome
+        if _final_phase_strands_topup_budget(epoch_dir, baseline_steps, full_steps):
+            # No later phase can spend the budget this final phase withheld for a
+            # top-up that did not run: give it back to every state by continuing
+            # the baseline to the un-shortened length.  A forced resume from the
+            # baseline's own checkpoint, so only the extra steps run and are
+            # charged to the pool (a resumed campaign that already extended hits
+            # run_segment's already-complete fast path instead).
+            print(f"      final phase: no top-up ran; extending the baseline {baseline_steps} -> "
+                  f"{full_steps} steps/state so the withheld budget is not stranded")
+            run_segment("baseline", active_ids, full_steps, force_resume=True)
+            # Report the length the baseline actually reached (a pool clip can stop short).
+            baseline_steps = max(int(baseline_steps),
+                                 int(_segment_checkpoint_prod_done(epoch_dir / "baseline") or 0))
+            if _graceful_shutdown.is_set():
+                return _interrupted()
     diagnostics = collect_segmented_epoch_diagnostics(epoch_dir, registry, policy)
+    if union_edge_overlap:
+        _apply_union_edge_overlap(diagnostics, union_edge_overlap, policy)
+        write_json(epoch_dir / "adaptive_epoch_diagnostics.json", diagnostics)
     payload = {
         "schema_version": "adaptive_scheduled_epoch_v1",
         "epoch_dir": str(epoch_dir),
@@ -6967,6 +7348,15 @@ def policy_from_args(args: Any) -> AdaptiveDecisionPolicy:
             args, "adaptive_production_bridge_repairable_first", True),
         bridge_skip_unreachable=_arg_bool(
             args, "adaptive_production_bridge_skip_unreachable", False),
+        topups_enabled=_arg_bool(args, "adaptive_production_topups", False),
+        topup_target_sigma=_arg_float(args, "adaptive_production_topup_target_sigma", 0.10),
+        topup_weak_overlap=_arg_float(args, "adaptive_production_topup_weak_overlap", 0.15),
+        topup_max_fraction=_arg_float(args, "adaptive_production_topup_max_fraction", 0.3),
+        topup_min_effect=_arg_float(args, "adaptive_production_topup_min_effect", 0.05),
+        topup_max_edge_attempts=_arg_int(args, "adaptive_production_topup_max_edge_attempts", 2),
+        topup_throughput_table=tuple(getattr(args, "adaptive_production_topup_throughput_table",
+                                             ((16.0, 3154.0), (59.0, 2300.0)))),
+        topup_diagnostics_max_gb=_arg_float(args, "adaptive_production_topup_diagnostics_max_gb", 8.0),
         context_reuse=_arg_bool(args, "adaptive_production_context_reuse", False),
         context_reuse_require=_arg_bool(args, "adaptive_production_context_reuse_require", False),
         context_reuse_mode=str(getattr(args, "adaptive_production_context_reuse_mode", "off") or "off"),
@@ -8314,15 +8704,7 @@ def write_epoch_action_report(
     action_dicts = [_action_to_dict(a) for a in actions]
     state_rows = diagnostics.get("states", []) or []
     edge_rows = diagnostics.get("edges", []) or []
-    weak_edges = []
-    for edge in edge_rows:
-        overlap = edge.get("overlap")
-        acc = edge.get("exchange_acceptance")
-        weak = overlap is None or float(overlap) < float(policy.target_overlap)
-        if acc is not None and float(acc) < float(policy.min_exchange_acceptance):
-            weak = True
-        if weak:
-            weak_edges.append(edge)
+    weak_edges = [edge for edge in edge_rows if _edge_is_measured_weak(edge, policy)]
     undersampled = [
         s for s in state_rows
         if int(s.get("sample_count", 0) or 0) < int(policy.min_samples_for_retire)
@@ -8435,15 +8817,7 @@ def _action_to_dict(action: Tuple) -> Dict[str, Any]:
 def _adaptive_production_converged(actions: Sequence[Tuple], diagnostics: Dict[str, Any], policy: AdaptiveDecisionPolicy) -> bool:
     if any(str(a[0]) == "add" for a in actions):
         return False
-    weak_edges = []
-    for edge in diagnostics.get("edges", []):
-        overlap = edge.get("overlap")
-        acc = edge.get("exchange_acceptance")
-        if overlap is None or float(overlap) < float(policy.target_overlap):
-            weak_edges.append(edge)
-            continue
-        if acc is not None and float(acc) < float(policy.min_exchange_acceptance):
-            weak_edges.append(edge)
+    weak_edges = [edge for edge in diagnostics.get("edges", []) if _edge_is_measured_weak(edge, policy)]
     return len(weak_edges) == 0
 
 
@@ -8577,12 +8951,7 @@ def evaluate_adaptive_convergence_gate(
 
     weak_edges: List[Dict[str, Any]] = []
     for edge in diagnostics.get("edges", []) or []:
-        overlap = edge.get("overlap")
-        acc = edge.get("exchange_acceptance")
-        weak = overlap is None or float(overlap) < float(policy.target_overlap)
-        if acc is not None and float(acc) < float(policy.min_exchange_acceptance):
-            weak = True
-        if weak:
+        if _edge_is_measured_weak(edge, policy):
             weak_edges.append(edge)
     if len(weak_edges) > int(policy.convergence_max_weak_edges):
         continue_reasons.append(

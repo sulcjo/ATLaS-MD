@@ -44,13 +44,18 @@ def _local_steepness(landscape: Landscape, c1: float, c2: float, h: float = 0.02
 
 def tau_int(landscape: Landscape, window: Window,
             *, tau_base: float = TAU_BASE, k_factor: float = TAU_K_FACTOR,
-            barrier_factor: float = TAU_BARRIER_FACTOR) -> float:
-    """Integrated autocorrelation time for a window (>= tau_base)."""
+            barrier_factor: float = TAU_BARRIER_FACTOR, n_partners: int = 2) -> float:
+    """Integrated autocorrelation time for a window.
+
+    Scaled by ``2 / max(1, n_partners)``: a window with more exchange partners in its
+    segment mixes faster; the default (2 partners, a 1D chain) leaves tau unchanged.
+    """
     k = float(window.k1)
     tight = max(0.0, k / K_REF - 1.0)
     steep = _local_steepness(landscape, float(window.center1),
                              float(window.center2 if window.center2 is not None else 0.0))
-    return float(tau_base * (1.0 + k_factor * tight + barrier_factor * steep))
+    mixing = 2.0 / max(1, int(n_partners))
+    return float(tau_base * (1.0 + k_factor * tight + barrier_factor * steep) * mixing)
 
 
 def effective_count(n_raw: int, tau: float, *, burn_in: int = BURN_IN,

@@ -29,6 +29,9 @@ from typing import NamedTuple
 
 import numpy as np
 
+# Guard to warn once per process when pymbar is unusable
+_warned_pymbar_missing = False
+
 
 class SubsampleResult(NamedTuple):
     """Indices plus the provenance needed to judge whether they mean anything."""
@@ -128,6 +131,11 @@ def equilibrated_subsample(series, *, min_samples: int = 10,
     try:
         import pymbar  # noqa: F401
     except Exception:
+        global _warned_pymbar_missing
+        if not _warned_pymbar_missing:
+            from gareus.pymbar_check import warn_if_pymbar_unusable  # noqa: PLC0415
+            warn_if_pymbar_unusable("equilibration subsampling")
+            _warned_pymbar_missing = True
         return _fallback("pymbar_missing")
     try:
         t0, g, kept, n_detect, exhausted = _detect(arr, max_detect_points)

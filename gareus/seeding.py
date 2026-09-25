@@ -2386,18 +2386,24 @@ def generate_us_starting_states_by_pulling(
         elif _topup_auto_allow:
             # Last-resort fallback, topup segments ONLY: a topup is always re-seeding
             # an already-established window (never a baseline/initial-epoch window,
-            # which keeps the strict raise below), and by this point the campaign-wide
-            # trajectory search (production.py's _augment_seed_bank_with_campaign_search)
-            # has already had a chance to supply a better real seed before this pull
-            # ever ran. If windows are still bad after both of those, hard-failing the
-            # whole topup segment over a handful of stubborn windows blocks every OTHER
-            # window in the same segment for no benefit - proceed instead, accepting the
-            # same risk --us-allow-bad-windows opts into explicitly, just auto-applied
-            # and scoped to topup only.
+            # which keeps the strict raise below). If windows are still bad after the
+            # pull, hard-failing the whole topup segment over a handful of stubborn
+            # windows blocks every OTHER window in the same segment for no benefit -
+            # proceed instead, accepting the same risk --us-allow-bad-windows opts
+            # into explicitly, just auto-applied and scoped to topup only.
+            #
+            # NOTE: as of the effective-top-ups feature (spec 4.4 rev 2,
+            # production.py's _seed_topup_windows_from_parent_states), a real topup
+            # segment no longer calls generate_us_starting_states_by_pulling at all --
+            # it continues each window from its parent segment's exported final State
+            # instead of pulling. This branch (and the auto-drop/allow logic around it)
+            # is therefore presently unreachable from the normal topup path; it is left
+            # in place as a defensive fallback for any caller that still reaches this
+            # function with _adaptive_phase_info["is_topup"] set.
             print(
                 f"WARNING [US topup auto-allow]: {n_bad}/{nwin} windows remained 'bad' after the "
-                "starting-structure pull (and after the campaign-wide seed search) during a topup "
-                "segment; proceeding with production anyway instead of hard-failing the segment:\n"
+                "starting-structure pull during a topup segment; proceeding with production anyway "
+                "instead of hard-failing the segment:\n"
                 f"{_bad_lines}\n"
                 f"See {pull_dir / 'us_starting_structure_quality.json'} for full details."
             )

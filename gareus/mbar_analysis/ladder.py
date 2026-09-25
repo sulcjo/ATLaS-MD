@@ -239,18 +239,12 @@ def symmetric_state_overlap(overlap: np.ndarray, i: int, j: int) -> Optional[flo
     combination, ``S_ij * sqrt(N_i * N_j)``, and it equals ``O_ij`` exactly
     when ``N_i == N_j``.
 
-    Shared home for the convention: ``gareus.adaptive_production`` has its own
-    ``_symmetric_state_overlap`` with the same formula and the same reasoning
-    (see ``gareus/adaptive_production.py:3697-3725``), predating this one and
-    not de-duplicated here. There is no import-cycle risk in doing so --
-    ``adaptive_production`` already imports FROM this module
-    (``gareus/adaptive_production.py:3416,3697``) and this module imports
-    nothing from ``adaptive_production``, so ``adaptive_production``'s copy
-    could safely be replaced with an import of this function; that
-    de-duplication was simply out of scope for the task that added this
-    function and has not been done. Any *new* caller of
-    ``mbar_state_overlap`` -- e.g. ``gareus.mbar_analysis.ladder_overlap`` --
-    should call this function rather than hand-roll a third copy.
+    The one home for this convention: ``gareus.adaptive_production`` used to
+    carry a private copy (``_symmetric_state_overlap``), deleted once it had no
+    production caller. The full-matrix value it returns is diluted on a large
+    union (see ``pairwise_state_overlap`` below); gates and health checks use
+    the pairwise function, and ``gareus.mbar_analysis.ladder_overlap`` falls
+    back to this one only when no ``pair_overlap`` callable is given.
     """
     a = float(overlap[i, j])
     b = float(overlap[j, i])
@@ -272,12 +266,13 @@ def pairwise_state_overlap(
     a full-union ``sqrt(O_ij*O_ji)`` median of 0.089 (38/48 below the 0.15
     floor) versus a pairwise median of 0.258 (0/48 below) -- roughly the
     ratio of "how many states sit in the same region" one would expect from
-    dilution, not a real overlap difference. This function is what
-    ``min_rung_overlap``/``target_rung_overlap``
-    (``gareus/adaptive_production.py``) and ``LADDER_STATE_OVERLAP_MIN``
-    (``gareus/mbar_analysis/ladder_overlap.py``) are actually calibrated
-    against (the S3 pilot ladder that produced 0.298/0.250/0.240/0.273 had
-    only ~4 states total, i.e. an effectively pairwise scale already).
+    dilution, not a real overlap difference. ``min_rung_overlap`` /
+    ``target_rung_overlap`` (``gareus/adaptive_production.py``) and
+    ``LADDER_STATE_OVERLAP_MIN`` (``gareus/mbar_analysis/ladder_overlap.py``)
+    are applied to this function's value, but they were calibrated on the S3
+    pilot's 5-state FULL-matrix entries (0.298/0.250/0.240/0.273), which are
+    themselves diluted; the thresholds have not been re-measured on the
+    pairwise scale.
 
     Only the pair's own samples enter, with a 2-state mixture denominator:
     ``W_nk = exp(f_k - u_k(x_n)) / sum_{l in {i,j}} N_l exp(f_l - u_l(x_n))``,

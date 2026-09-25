@@ -17,6 +17,8 @@ from typing import List
 
 import numpy as np
 
+from .units import KJ_PER_KCAL, K_B_KJ_PER_MOL_K
+
 
 def _hist_overlap(a: List[float], b: List[float], lo: float, hi: float, bins: int = 24) -> float:
     """Compute the histogram overlap between two one‑dimensional samples.
@@ -220,6 +222,33 @@ def anharmonicity_label(score: float) -> tuple[str, str]:
     return "BAD", "red"
 
 
+def restraint_sigma(k_kcal_per_a2: float, temperature_k: float) -> float:
+    """Gaussian width of a harmonic umbrella, in the CV's own units.
+
+    ``sigma = sqrt(k_B T / k)`` with ``k`` converted from kcal/mol/A^2 to
+    kJ/mol/A^2 so it divides a kJ/mol thermal energy. Anything unusable -- a
+    non-positive or non-finite ``k``, a non-positive temperature -- yields
+    ``inf``, which makes the pinned-window comparison unsatisfiable rather than
+    raising or flagging spuriously.
+    """
+    # Inline _as_float logic to avoid importing from ranking
+    try:
+        k = float(k_kcal_per_a2)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        k = float("nan")
+    try:
+        temperature = float(temperature_k)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        temperature = float("nan")
+
+    k = k * KJ_PER_KCAL
+    if not math.isfinite(k) or k <= 0.0:
+        return math.inf
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        return math.inf
+    return math.sqrt(K_B_KJ_PER_MOL_K * temperature / k)
+
+
 __all__ = [
     "_hist_overlap",
     "_adaptive_hist_overlap",
@@ -229,4 +258,5 @@ __all__ = [
     "_torsion_angle_rad_from_positions",
     "boost_anharmonicity",
     "anharmonicity_label",
+    "restraint_sigma",
 ]
