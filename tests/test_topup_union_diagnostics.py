@@ -187,3 +187,31 @@ def test_warning_is_logged_on_all_nan_input(tmp_path, caplog):
         result = union_diagnostics_from_npz(p, [(0, 1)], kt_kcal=KT)
     assert result is None
     assert "no finite rows" in caplog.text.lower() or "remain" in caplog.text.lower()
+
+
+def _write_seeded(tmp_path, centers, k, n_per, name):
+    """Per-state RNG streams: a state's samples do not depend on which other states exist."""
+    x, sid = [], []
+    for s, c in enumerate(centers):
+        rng = np.random.default_rng([11, s])
+        x.append(rng.normal(c, 1.0 / math.sqrt(k), n_per)); sid += [s] * n_per
+    x = np.concatenate(x)
+    u = 0.5 * k * (x[:, None] - np.asarray(centers)[None, :]) ** 2
+    p = tmp_path / name
+    np.savez(p, umbrella_reduced_bias_nk=u, state_ids=np.arange(len(centers)), sampled_state_ids=np.asarray(sid))
+    return p
+
+
+def test_edge_overlap_does_not_shrink_when_the_pair_sits_in_a_bigger_union(tmp_path):
+    # The same pair (states 0, 1) alone with one neighbour, then crowded by 27 more states
+    # overlapping it; the full-union overlap matrix would dilute ~1/degree, the pairwise one must not.
+    small = [0.0, 1.0, 2.0]
+    crowded = small + list(np.linspace(-0.5, 1.5, 27))
+    a = union_diagnostics_from_npz(_write_seeded(tmp_path, small, 4.0, 2000, "a.npz"), [(0, 1)], kt_kcal=KT)
+    b = union_diagnostics_from_npz(_write_seeded(tmp_path, crowded, 4.0, 2000, "b.npz"), [(0, 1)], kt_kcal=KT)
+    assert abs(a.edge_overlap[(0, 1)] - b.edge_overlap[(0, 1)]) < 2e-3
+
+
+def test_two_identical_states_have_pairwise_overlap_one_half(tmp_path):
+    d = union_diagnostics_from_npz(_write_seeded(tmp_path, [0.0, 0.0], 4.0, 1000, "c.npz"), [(0, 1)], kt_kcal=KT)
+    assert math.isclose(d.edge_overlap[(0, 1)], 0.5, rel_tol=1e-9)

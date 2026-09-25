@@ -1,4 +1,4 @@
-"""Per-epoch union MBAR: local sigma, per-state local split-halves, edge overlap.
+"""Per-epoch union MBAR: local sigma, per-state local split-halves, pairwise edge overlap.
 
 Reads the union NPZ written by adaptive_production.build_union_state_mbar_inputs.
 Its samples are ALREADY decorrelated per state (equilibration discard + thinning),
@@ -109,6 +109,24 @@ def _split_halves(u, window, K, min_effect_kT, alpha):
             if math.isfinite(d) and math.isfinite(se) and d > max(z_star * se, min_effect_kT)}
 
 
+def _pair_overlap(u: np.ndarray, window: np.ndarray, f: np.ndarray, n_k: np.ndarray, ia: int, ib: int) -> float:
+    """Symmetric pairwise overlap sqrt(O_ij O_ji) of states ia, ib with the union f held fixed.
+
+    Only the pair's own samples enter, with a 2-state mixture denominator:
+    W_nk = exp(f_k - u_k(x_n)) / sum_{l in {i,j}} N_l exp(f_l - u_l(x_n)), O_ij = N_j sum_n W_ni W_nj.
+    Unlike the full-union overlap matrix, this does not shrink with the number of other
+    states the pair overlaps (K identical states give 1/K there; here two identical states give 0.5).
+    """
+    from scipy.special import logsumexp  # noqa: PLC0415
+    rows = (window == ia) | (window == ib)
+    cols = np.array([ia, ib])
+    logq = f[cols][None, :] - u[np.ix_(rows, cols)]                 # log exp(f_k - u_k), k in {i, j}
+    n = n_k[cols].astype(float)
+    log_w = logq - logsumexp(logq, b=n[None, :], axis=1)[:, None]
+    shared = float(np.exp(logsumexp(log_w[:, 0] + log_w[:, 1])))   # sum_n W_ni W_nj
+    return math.sqrt((n[1] * shared) * (n[0] * shared))            # sqrt(O_ij O_ji)
+
+
 def union_diagnostics_from_npz(npz_path, edges: Iterable[Tuple[int, int]], *, kt_kcal: float,
                                subsample_counts: Optional[dict] = None, min_effect_kcal: float = 0.05,
                                alpha: float = 0.05, f_init: Optional[dict] = None,
@@ -150,15 +168,13 @@ def union_diagnostics_from_npz(npz_path, edges: Iterable[Tuple[int, int]], *, kt
         sigma = np.array([_local_sigma(dmat, k, nbrs[k]) if n_k[k] > 0 else np.nan for k in range(K)])
         flagged = (_split_halves(u, window, K, min_effect_kcal / kt_kcal, alpha)
                    if split_halves else set())
-        from ..mbar_analysis.ladder import mbar_state_overlap  # noqa: PLC0415
-        O = mbar_state_overlap(u, np.where(np.isfinite(f), f, 0.0), n_k)
         edge_overlap = {}
         for ia, ib in sorted(pairs):
-            if n_k[ia] == 0 or n_k[ib] == 0:
+            if n_k[ia] == 0 or n_k[ib] == 0 or not (math.isfinite(f[ia]) and math.isfinite(f[ib])):
                 continue
-            x, y = float(O[ia, ib]), float(O[ib, ia])
-            if math.isfinite(x) and math.isfinite(y) and x >= 0 and y >= 0:
-                edge_overlap[(min(ids[ia], ids[ib]), max(ids[ia], ids[ib]))] = math.sqrt(x * y)
+            ov = _pair_overlap(u, window, f, n_k, ia, ib)
+            if math.isfinite(ov) and ov >= 0:
+                edge_overlap[(min(ids[ia], ids[ib]), max(ids[ia], ids[ib]))] = ov
         return UnionDiagnostics(
             state_ids=tuple(ids),
             n_k={ids[k]: int(n_k[k]) for k in range(K)},
