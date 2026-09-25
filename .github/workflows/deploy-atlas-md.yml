@@ -41,6 +41,7 @@ jobs:
         with:
           python-version: "3.11"
       - name: Configure GitHub Pages
+        if: github.event_name != 'pull_request'
         uses: actions/configure-pages@v5
       - name: Install documentation dependencies
         run: python -m pip install ".[docs]"
