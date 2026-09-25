@@ -8308,22 +8308,7 @@ def write_epoch_action_report(
     action_dicts = [_action_to_dict(a) for a in actions]
     state_rows = diagnostics.get("states", []) or []
     edge_rows = diagnostics.get("edges", []) or []
-    weak_edges = []
-    for edge in edge_rows:
-        # This function has no rung branch of its own; a rung edge's overlap
-        # is None by construction, so the old inline expression is preserved
-        # verbatim for rung edges here (unchanged, out of scope for this fix)
-        # and only non-rung edges are routed through the shared helper.
-        if str(edge.get("edge_type")) == "rung":
-            overlap = edge.get("overlap")
-            acc = edge.get("exchange_acceptance")
-            weak = overlap is None or float(overlap) < float(policy.target_overlap)
-            if acc is not None and float(acc) < float(policy.min_exchange_acceptance):
-                weak = True
-        else:
-            weak = _edge_is_measured_weak(edge, policy)
-        if weak:
-            weak_edges.append(edge)
+    weak_edges = [edge for edge in edge_rows if _edge_is_measured_weak(edge, policy)]
     undersampled = [
         s for s in state_rows
         if int(s.get("sample_count", 0) or 0) < int(policy.min_samples_for_retire)
@@ -8436,22 +8421,7 @@ def _action_to_dict(action: Tuple) -> Dict[str, Any]:
 def _adaptive_production_converged(actions: Sequence[Tuple], diagnostics: Dict[str, Any], policy: AdaptiveDecisionPolicy) -> bool:
     if any(str(a[0]) == "add" for a in actions):
         return False
-    weak_edges = []
-    for edge in diagnostics.get("edges", []):
-        # No rung branch of its own; preserve the old inline expression for
-        # rung edges verbatim (unchanged, out of scope for this fix) and only
-        # route non-rung edges through the shared helper.
-        if str(edge.get("edge_type")) == "rung":
-            overlap = edge.get("overlap")
-            acc = edge.get("exchange_acceptance")
-            if overlap is None or float(overlap) < float(policy.target_overlap):
-                weak_edges.append(edge)
-                continue
-            if acc is not None and float(acc) < float(policy.min_exchange_acceptance):
-                weak_edges.append(edge)
-            continue
-        if _edge_is_measured_weak(edge, policy):
-            weak_edges.append(edge)
+    weak_edges = [edge for edge in diagnostics.get("edges", []) if _edge_is_measured_weak(edge, policy)]
     return len(weak_edges) == 0
 
 

@@ -7,6 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from gareus.adaptive_production import (  # noqa: E402
     AdaptiveDecisionPolicy,
     WindowStateRegistry,
+    _adaptive_production_converged,
     _edge_is_measured_weak,
     evaluate_adaptive_quality_gate,
     propose_actions_from_diagnostics,
@@ -76,3 +77,18 @@ def test_propose_actions_does_not_bridge_an_unmeasured_spatial_edge():
     }
     actions = propose_actions_from_diagnostics(reg, diag, policy=pol)
     assert not any(str(a[0]) == "add" for a in actions), actions
+
+
+def test_converged_is_not_blocked_by_an_unscored_rung_edge():
+    """An unscored rung edge (mbar_overlap is None -- only available after the
+    campaign-end union solve) must never make _adaptive_production_converged
+    report it as weak, otherwise convergence is impossible on any ladder run
+    and write_epoch_action_report's converged_by_current_policy disagrees with
+    the (already-fixed) gate."""
+    pol = AdaptiveDecisionPolicy()
+    diag = {
+        "states": [_state_row(0), _state_row(1)],
+        "edges": [{"state_i": 0, "state_j": 1, "edge_type": "rung",
+                   "overlap": None, "mbar_overlap": None}],
+    }
+    assert _adaptive_production_converged([], diag, pol) is True
