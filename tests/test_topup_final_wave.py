@@ -261,3 +261,57 @@ def test_the_driver_logs_structural_edges_and_saves_them(tmp_path, monkeypatch, 
     out = capsys.readouterr().out
     assert "7 structural edge(s)" in out and "0-1, 1-2, 2-3, 3-4, 4-5 (+2 more)" in out
     assert tuple(tuple(e) for e in load_plan(adaptive / "epoch_001").structural_edges) == edges
+
+
+# ---- memory guard: an oversized per-epoch union is skipped, not OOM-killed ----
+
+def test_the_peak_estimate_reproduces_the_bench():
+    from gareus.adaptive.union_diagnostics import estimate_union_diagnostics_peak_gb
+    assert abs(estimate_union_diagnostics_peak_gb(1_000_000, 236) - 14.6) < 0.2
+    assert estimate_union_diagnostics_peak_gb(250_000, 236) < 4.06
+
+
+def test_the_real_builder_calls_the_guard_with_kept_rows_before_the_matrices(tmp_path):
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from test_adaptive_segmented_diagnostics import N_WINDOWS, _write_parquet_epoch_run, _write_window_csv
+    registry = ap.registry_from_window_csv(_write_window_csv(tmp_path / "w.csv"), epoch=0, source="t")
+    adaptive = tmp_path / "adaptive"
+    _write_parquet_epoch_run(adaptive / "final", n_windows=N_WINDOWS, rows_per_window=200)
+    seen = []
+    meta = ap.build_union_state_mbar_inputs(adaptive, registry, size_guard=lambda n, k: seen.append((n, k)))
+    assert seen == [(meta["n_samples"], meta["n_states"])]
+    with pytest.raises(ap.TopupDiagnosticsTooLarge):
+        ap.build_union_state_mbar_inputs(adaptive, registry, output_prefix="guarded",
+                                         size_guard=ap._topup_union_size_guard(1e-9))
+    assert not (adaptive / "guarded.npz").exists()
+
+
+def test_an_oversized_union_skips_the_plan_with_no_diagnostics_and_warns(tmp_path, monkeypatch, caplog):
+    import logging
+    args, adaptive, reg = _campaign(tmp_path)
+    args.adaptive_production_topup_diagnostics_max_gb = 8.0
+    policy = ap.policy_from_args(args)
+    assert policy.topup_diagnostics_max_gb == 8.0
+
+    def _builder(*a, size_guard=None, **k):
+        size_guard(1_000_000, 236)                      # ~14.5 GB at the bench's scale
+        raise AssertionError("the guard must stop the build")
+
+    monkeypatch.setattr(ap, "build_union_state_mbar_inputs", _builder)
+    (adaptive / "epoch_001").mkdir()
+    with caplog.at_level(logging.WARNING):
+        plan = ap._topup_plan_for_phase(args, adaptive / "epoch_001", reg, policy, full_steps=20_000)
+    assert plan.reason == "no_diagnostics"
+    assert "14.5 GB" in caplog.text and "--ap-topup-diagnostics-max-gb 8.0" in caplog.text
+
+
+def test_the_guard_passes_a_union_under_the_limit():
+    ap._topup_union_size_guard(8.0)(250_000, 236)     # ~3.6 GB: no raise
+
+
+def test_the_diagnostics_limit_is_a_cli_flag():
+    from gareus.cli import parse_args
+    args = parse_args(["--seq", "AA", "--ap-topup-diagnostics-max-gb", "3.5"])
+    assert ap.policy_from_args(args).topup_diagnostics_max_gb == 3.5
+    assert ap.policy_from_args(parse_args(["--seq", "AA"])).topup_diagnostics_max_gb == 8.0

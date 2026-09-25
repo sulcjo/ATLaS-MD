@@ -24,6 +24,15 @@ from scipy.stats import norm
 from gareus.mbar_analysis.ladder import pairwise_state_overlap as _pair_overlap
 
 MIN_HALF = 20
+# Peak memory of union_diagnostics_from_npz per rows x states float64 cell, measured
+# with gareus.synth.union_solve_bench at 236 states: 1,000,000 rows peaked at 14.6 GB
+# RSS (1e6 x 236 x 8 B = 1.888 GB -> 7.7x); 250,000 rows at 4.06 GB (est. 3.6 GB).
+UNION_PEAK_BYTES_PER_CELL = 8.0 * 7.7
+
+
+def estimate_union_diagnostics_peak_gb(n_rows: int, n_states: int) -> float:
+    """Estimated peak RSS (GB) of the per-epoch union diagnostics for ``n_rows`` kept rows."""
+    return float(n_rows) * float(n_states) * UNION_PEAK_BYTES_PER_CELL / 1e9
 
 
 @dataclass(frozen=True)

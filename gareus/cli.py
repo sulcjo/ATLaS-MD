@@ -493,6 +493,10 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                    help="Top-ups a weak edge may receive before it is treated as structural (bridge).")
     p.add_argument("--ap-topup-throughput-table", default="16:3154,59:2300",
                    help="contexts_per_gpu:ns_per_day_node pairs, comma separated.")
+    p.add_argument("--ap-topup-diagnostics-max-gb", type=float, default=8.0,
+                   help="Skip a phase's top-up diagnostics (no top-up, reason no_diagnostics) when the "
+                        "per-epoch union build + MBAR solve is estimated to peak above this many GB "
+                        "(kept rows x states x 8 B x 7.7, measured at 236 states).")
     p.add_argument("--ap-gamd-boost-sd-warn", type=float, default=6.0)
     p.add_argument("--ap-write-reports", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--md-budget-ns", type=float, default=0.0,
@@ -1436,6 +1440,7 @@ def _shim_adaptive_production(args: argparse.Namespace) -> None:
     args.adaptive_production_topup_max_fraction = args.ap_topup_max_fraction
     args.adaptive_production_topup_min_effect = args.ap_topup_min_effect
     args.adaptive_production_topup_max_edge_attempts = args.ap_topup_max_edge_attempts
+    args.adaptive_production_topup_diagnostics_max_gb = args.ap_topup_diagnostics_max_gb
     try:
         args.adaptive_production_topup_throughput_table = tuple(
             (float(a), float(b)) for a, b in (item.split(":") for item in str(args.ap_topup_throughput_table).split(",") if item))

@@ -1954,6 +1954,7 @@ Knobs:
     --ap-topup-min-effect 0.05      split-halves effect floor, kcal/mol
     --ap-topup-max-edge-attempts 2  top-ups a weak edge may get before it is treated as structural
     --ap-topup-throughput-table     "16:3154,59:2300" contexts_per_gpu:ns_per_day_node pairs
+    --ap-topup-diagnostics-max-gb 8.0  skip a phase's diagnostics above this estimated peak RAM
 
 What triggers a top-up
 ~~~~~~~~~~~~~~~~~~~~~~
@@ -2048,7 +2049,8 @@ own latest measured edge overlaps are mirrored to
 ``<phase>/topup_union_overlap.json`` so the gate and proposer see the same
 numbers across a resume.  A plan's ``reason`` is one of: ``healthy`` (no
 deficit), ``planned``/``completed`` (ran), ``pool_exhausted``,
-``cap_too_small``, ``no_diagnostics`` (the union solve failed),
+``cap_too_small``, ``no_diagnostics`` (the union solve failed, or its
+estimated memory exceeds ``--ap-topup-diagnostics-max-gb``),
 ``no_seed_states`` (every deficit's parent seed was unusable),
 ``seed_mismatch`` (a seeded window's restraint or CVs disagreed with the
 top-up's own window table), or ``layout_changed``.
@@ -2079,7 +2081,13 @@ and after the top-up).  Measured at 236 states: 1,000,000 rows takes 102.7 s
 and peaks at 14.6 GB RSS; 250,000 rows takes 26.4 s and 4.06 GB.  This runs
 on the analysis/driver node, not a GPU -- size the node's RAM for the
 campaign's row count before enabling top-ups on a large layout; an
-out-of-memory kill during this solve cannot be caught.
+out-of-memory kill during this solve cannot be caught.  A guard runs first:
+after subsampling, before any rows x states matrix is allocated, the peak is
+estimated as kept rows x states x 8 bytes x 7.7 (the bench's 14.6 GB at
+1,000,000 x 236); above ``--ap-topup-diagnostics-max-gb`` (default 8.0) the
+phase's diagnostics are skipped with a WARNING naming the estimate, and the
+phase runs no top-up (``no_diagnostics``).  At 236 states the default admits
+about 550,000 kept (decorrelated) rows.
 
 Synthetic validation
 ~~~~~~~~~~~~~~~~~~~~

@@ -32,7 +32,7 @@ import math
 import re
 import shutil
 import time
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -472,6 +472,9 @@ class AdaptiveDecisionPolicy:
     topup_min_effect: float = 0.05
     topup_max_edge_attempts: int = 2
     topup_throughput_table: tuple = ((16.0, 3154.0), (59.0, 2300.0))
+    # Peak-memory ceiling (GB) for the per-epoch union build + MBAR solve top-ups
+    # run; an estimate above it skips the phase's diagnostics (no_diagnostics).
+    topup_diagnostics_max_gb: float = 8.0
 
 
 class WindowStateRegistry:
@@ -3349,8 +3352,13 @@ def build_union_state_mbar_inputs(
     pilot_dirs: "List[Path] | None" = None,
     output_prefix: str = "adaptive_union_mbar",
     tica_cv_version: "Optional[str]" = None,
+    size_guard: "Optional[Callable[[int, int], None]]" = None,
 ) -> Dict[str, Any]:
     """Build post-hoc bias matrices over the union of registry states.
+
+    ``size_guard(n_rows, n_states)``, when given, is called after subsampling and
+    before any rows x states matrix is allocated; it raises to abort the build
+    (the top-up diagnostics' memory guard).  ``None`` (every other caller): no check.
 
     Adaptive production can add and retire states, so per-epoch analysis arrays
     may have different widths.  This helper reconstructs one sample-major
@@ -3462,6 +3470,8 @@ def build_union_state_mbar_inputs(
         _subsample_counts[str(_sid)] = {"raw": _raw, "t0": _t0, "kept": _kept, "g": _g,
                                         "status": str(_res.status)}
     sample_rows = [sample_rows[i] for i in sorted(_kept_global)]
+    if size_guard is not None:
+        size_guard(len(sample_rows), len(states))
 
     cv_values = np.asarray([float(r["cv_A"]) for r in sample_rows], dtype=np.float64)
     secondary_values = np.asarray([
@@ -6361,6 +6371,30 @@ def _topup_layout_neighbours(args, active):
     return ids, neighbours, rung_partners
 
 
+class TopupDiagnosticsTooLarge(RuntimeError):
+    """The per-epoch union for top-up diagnostics would exceed topup_diagnostics_max_gb."""
+
+
+def _topup_union_size_guard(max_gb: float):
+    """A ``build_union_state_mbar_inputs`` size guard: WARNING and raise over ``max_gb``.
+
+    Raised inside the build, so the caller's existing handling turns it into
+    ``no_diagnostics`` (plan time) or a skipped calibration (after the top-up).
+    """
+    from .adaptive.union_diagnostics import estimate_union_diagnostics_peak_gb
+
+    def _guard(n_rows: int, n_states: int) -> None:
+        est = estimate_union_diagnostics_peak_gb(n_rows, n_states)
+        if est > float(max_gb):
+            logger.warning(
+                "top-up diagnostics skipped: the union of %d rows x %d states is estimated at %.1f GB peak, "
+                "over --ap-topup-diagnostics-max-gb %.1f", n_rows, n_states, est, float(max_gb))
+            raise TopupDiagnosticsTooLarge(
+                f"union of {n_rows} rows x {n_states} states estimated at {est:.1f} GB peak "
+                f"> --ap-topup-diagnostics-max-gb {float(max_gb):.1f}")
+    return _guard
+
+
 def _topup_sigma_neighbours(ids, neighbours, rung_partners, edge_attempts, max_edge_attempts: int):
     """The states each state's sigma_k is read against (rulings 23 and 33/I4).
 
@@ -6402,7 +6436,8 @@ def _phase_union_diagnostics(args, adaptive_dir: Path, registry: "WindowStateReg
     meta = build_union_state_mbar_inputs(
         adaptive_dir, registry, output_prefix=TOPUP_UNION_PREFIX,
         pilot_dirs=[Path(p) for p in (getattr(args, "adaptive_production_pilot_sample_dirs", None) or [])],
-        tica_cv_version=getattr(args, "tica_cv_version", None))
+        tica_cv_version=getattr(args, "tica_cv_version", None),
+        size_guard=_topup_union_size_guard(float(policy.topup_diagnostics_max_gb)))
     return union_diagnostics_from_npz(
         meta["arrays_npz"], edges, kt_kcal=KB_KCAL_PER_MOL_K * temperature,
         subsample_counts=meta.get("subsample_counts_per_state"),
@@ -7295,6 +7330,7 @@ def policy_from_args(args: Any) -> AdaptiveDecisionPolicy:
         topup_max_edge_attempts=_arg_int(args, "adaptive_production_topup_max_edge_attempts", 2),
         topup_throughput_table=tuple(getattr(args, "adaptive_production_topup_throughput_table",
                                              ((16.0, 3154.0), (59.0, 2300.0)))),
+        topup_diagnostics_max_gb=_arg_float(args, "adaptive_production_topup_diagnostics_max_gb", 8.0),
         context_reuse=_arg_bool(args, "adaptive_production_context_reuse", False),
         context_reuse_require=_arg_bool(args, "adaptive_production_context_reuse_require", False),
         context_reuse_mode=str(getattr(args, "adaptive_production_context_reuse_mode", "off") or "off"),
