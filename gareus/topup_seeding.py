@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Sequence
@@ -77,7 +78,22 @@ def load_seed_states(parent_dirs: Iterable, state_ids: Iterable[int]) -> Dict[in
 
 
 def assert_seed_matches(seed: SeedState, cv1_now: float, cv2_now: float, tol: float = 1e-3) -> None:
-    if abs(cv1_now - seed.cv1) > tol or abs(cv2_now - seed.cv2) > tol:
+    """CV1 must always be finite and match; CV2 is compared only when both sides are finite.
+
+    CV2 is legitimately NaN for a CV1-only run (no secondary CV configured) on both the
+    recorded seed and the freshly-evaluated context, so that comparison is skipped rather
+    than raised. CV1 is never expected to be NaN -- a NaN there means the loaded/seeded
+    state is physically broken (e.g. blown-up positions), which must raise loudly rather
+    than be silently accepted by NaN comparison semantics.
+    """
+    if not math.isfinite(cv1_now) or not math.isfinite(seed.cv1):
+        raise SeedMismatchError(
+            f"seeded state from {seed.source} does not reproduce its recorded CVs "
+            f"(cv1 {cv1_now!r} vs {seed.cv1!r} -- non-finite CV1)")
+    cv1_mismatch = abs(cv1_now - seed.cv1) > tol
+    cv2_comparable = math.isfinite(cv2_now) and math.isfinite(seed.cv2)
+    cv2_mismatch = cv2_comparable and abs(cv2_now - seed.cv2) > tol
+    if cv1_mismatch or cv2_mismatch:
         raise SeedMismatchError(
             f"seeded state from {seed.source} does not reproduce its recorded CVs "
             f"(cv1 {cv1_now:.6f} vs {seed.cv1:.6f}, cv2 {cv2_now:.6f} vs {seed.cv2:.6f})")

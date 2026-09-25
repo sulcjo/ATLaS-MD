@@ -6433,6 +6433,37 @@ def _state_id_of_window_from_epoch_map(out_dir: Path) -> dict:
     return out
 
 
+def _topup_parent_dirs_by_creation_order(out_dir: Path) -> list:
+    """This top-up's candidate parent dirs (baseline + every sibling topup_*), oldest
+    first -- ``load_seed_index``'s "later parents override earlier ones" then makes the
+    most recently exported parent win, not merely the alphabetically-last one.
+
+    Ordered by each parent's own ``final_window_states/index.json`` mtime, NOT by
+    directory name. ``topup_<idx>_<extra_steps>`` directory names are not chronological:
+    the numeric suffix is that segment's own remaining-step duration, which *shrinks*
+    across successive quality-gate extension rounds -- CLAUDE.md's 2026-08-05
+    ``plot_adaptive_diagnostics.py`` fix documents the identical footgun on a real run
+    (``topup_001_34794000`` created first, ``...25733000`` second, ``...18937000`` last;
+    name-ascending sort is exactly the reverse of creation order). A name-sorted parent
+    list would let a stale, earlier-created topup's export silently outrank a later,
+    more-authoritative one. A parent with no export yet (no ``index.json``) sorts first,
+    so it can never override a parent that actually has one.
+    """
+    out_dir = Path(out_dir)
+    candidates = [
+        d for d in [out_dir.parent / "baseline", *out_dir.parent.glob("topup_*")]
+        if d != out_dir
+    ]
+
+    def _mtime_key(d: Path) -> float:
+        try:
+            return (d / "final_window_states" / "index.json").stat().st_mtime
+        except OSError:
+            return -1.0
+
+    return sorted(candidates, key=_mtime_key)
+
+
 def _seed_topup_windows_from_parent_states(args, out_dir: Path, nrep: int):
     """Load each window's starting State from the parent segment(s)' export (task 9,
     effective top-ups). Continues each window's own chain instead of re-pulling.
@@ -6445,10 +6476,7 @@ def _seed_topup_windows_from_parent_states(args, out_dir: Path, nrep: int):
 
     out_dir = Path(out_dir)
     state_id_of_window = _state_id_of_window_from_epoch_map(out_dir)
-    parent_dirs = [
-        d for d in [out_dir.parent / "baseline", *sorted(out_dir.parent.glob("topup_*"))]
-        if d != out_dir
-    ]
+    parent_dirs = _topup_parent_dirs_by_creation_order(out_dir)
     needed_state_ids = [state_id_of_window.get(w, w) for w in range(nrep)]
     seeds = load_seed_states(parent_dirs, needed_state_ids)
 
@@ -7153,6 +7181,19 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 else:
                     sim_i.context.setVelocities(start_vel)
                 set_window(sim_i.context, centers_nm, ks_kj_nm2, i, secondary_cv_centers, secondary_cv_ks_kj)
+                if topup_seed_by_window.get(i) is not None:
+                    # Top-up seeding (task 9): the loaded State must reproduce the CV
+                    # values it was exported under. Runs here, right after set_window,
+                    # on replica i's own _sim_pool thread -- every context-touching call
+                    # for this replica belongs on that thread (see the comment at the
+                    # top of _build_context_i). Reuses the sample logger's own CV
+                    # evaluation (primary_secondary_and_potential_from_state), not a
+                    # reimplementation.
+                    _seed_cv1_now, _seed_cv2_now, _ = primary_secondary_and_potential_from_state(
+                        sim_i.context, primary_cv_def, args, unit, secondary_cv_metadata,
+                        read_potential_energy=False,
+                    )
+                    assert_seed_matches(topup_seed_by_window[i], _seed_cv1_now, _seed_cv2_now)
             controller_i = None
             if npt_runtime is not None and npt_runtime.needs_controller and not fast_resume:
                 # NPT correction: the biased-MC volume controller is initialized
@@ -7196,17 +7237,6 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 driver_i.register_reporter(reporter)
         sims.append(sim_i)
         drivers.append(driver_i)
-        if not fast_resume and topup_seed_by_window.get(i) is not None:
-            # Top-up seeding (task 9): the loaded State must reproduce the CV
-            # values it was exported under -- set_window has just been applied
-            # above, so this is the first point the context's real CV can be
-            # read after seeding. Reuses the sample logger's own CV evaluation
-            # (primary_secondary_and_potential_from_state), not a reimplementation.
-            _seed_cv1_now, _seed_cv2_now, _ = primary_secondary_and_potential_from_state(
-                sim_i.context, primary_cv_def, args, unit, secondary_cv_metadata,
-                read_potential_energy=False,
-            )
-            assert_seed_matches(topup_seed_by_window[i], _seed_cv1_now, _seed_cv2_now)
         if progress is not None:
             progress.progress("replica_construction", i + 1, nrep, message=f"built replica {i + 1}/{nrep}")
 
