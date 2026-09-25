@@ -2024,7 +2024,15 @@ With top-ups on, the baseline segment itself is shortened to
 ``max(1000, (1 - --ap-topup-max-fraction) * the topups-off uniform length)``
 steps per state, so every state -- not just the patch -- gets less baseline
 MD than it would with top-ups off; the withheld fraction is what funds the
-one top-up.
+one top-up.  In a numbered epoch an unspent withheld fraction stays in the
+campaign's MD pool for later phases.  In the FINAL phase nothing comes
+after, so when its top-up does not run (any outcome except ``completed`` or
+``pool_exhausted``) the baseline is continued from its own checkpoint to the
+full un-shortened length instead -- only the extra steps run and are charged.
+The phase's ``full_steps`` is the quantized mean of the schedule's
+``requested_steps`` (for a phase resumed from a schedule the removed score
+allocator wrote, ``baseline_steps`` held each state's minimum and would have
+given a tiny baseline and top-up budget).
 
 One top-up per phase; where it lands
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

@@ -6617,6 +6617,53 @@ def _apply_union_edge_overlap(diagnostics: Dict[str, Any], edge_overlap: Dict[Tu
             edge["warnings"] = _annotate_edge_warnings(rung, policy).warnings
 
 
+def _schedule_full_steps(schedule: Sequence[Dict[str, Any]]) -> int:
+    """The un-shortened per-state phase length of an allocation schedule.
+
+    The quantized mean of the active rows' ``requested_steps``, floored at the
+    smallest ``baseline_steps``.  With top-ups off this IS the baseline length
+    (unchanged formula); with top-ups on the top-up budget is a fraction of it,
+    taken before the baseline is shortened.  Read from ``requested_steps``, not
+    ``baseline_steps``: a schedule written by the removed score allocator (a
+    phase resumed across the top-ups deploy) stored each state's minimum in
+    ``baseline_steps`` and its extra MD in ``requested_steps``, so the minimum
+    alone would give a tiny baseline and top-up budget.  New uniform schedules
+    carry the same value in both columns.
+    """
+    active = [r for r in schedule if int(r.get("requested_steps", 0) or 0) > 0]
+    min_baseline = max(1, min(int(r.get("baseline_steps", 0) or 0) for r in active))
+    requested = [int(r.get("requested_steps", 0) or 0) for r in active]
+    return max(min_baseline, _quantized_extra_steps(int(round(sum(requested) / len(requested)))))
+
+
+def _final_phase_strands_topup_budget(epoch_dir: Path, baseline_steps: int, full_steps: int) -> bool:
+    """True when the FINAL phase withheld top-up budget that its top-up never spent.
+
+    Only the final phase: a numbered epoch's unspent MD stays in the campaign
+    pool for the next phase.  "Spent" means the top-up completed (or this
+    phase's top-up is already logged in ``topup_state.json``), or the MD pool
+    skipped it (``pool_exhausted`` -- there is nothing left to extend with).
+    Every other outcome (healthy, cap_too_small, no_diagnostics,
+    no_seed_states, seed_mismatch, layout_changed) strands the withheld
+    fraction.  Requires the baseline's own checkpoint, since the extension is
+    a resume of it; without one it would restart the baseline from scratch.
+    """
+    from .adaptive.topup_state import load_plan, load_state
+    epoch_dir = Path(epoch_dir)
+    if epoch_dir.name != "final" or int(full_steps) <= int(baseline_steps):
+        return False
+    if _phase_topup_recorded(load_state(epoch_dir.parent), epoch_dir.name):
+        return False
+    plan = load_plan(epoch_dir)
+    if plan is not None and plan.reason in ("completed", "pool_exhausted"):
+        return False
+    if not production_checkpoint_available(epoch_dir / "baseline"):
+        print("      final phase: no top-up ran, but the baseline has no checkpoint to extend from; "
+              "the withheld top-up budget stays unspent")
+        return False
+    return True
+
+
 def run_scheduled_adaptive_epoch(
     args: Any,
     epoch_dir: Path,
@@ -6645,11 +6692,7 @@ def run_scheduled_adaptive_epoch(
     active_ids = [int(r["state_id"]) for r in schedule if int(r.get("requested_steps", 0) or 0) > 0]
     if not active_ids:
         raise RuntimeError("adaptive allocation schedule selected no states")
-    baseline_steps = min(int(r.get("baseline_steps", 0) or 0) for r in schedule if int(r.get("requested_steps", 0) or 0) > 0)
-    baseline_steps = max(1, baseline_steps)
-    # The un-shortened per-state phase length: the top-up budget is a fraction of
-    # THIS, taken before the baseline is shortened to make room for the top-up.
-    full_steps = baseline_steps
+    full_steps = _schedule_full_steps(schedule)
     topups_enabled = bool(getattr(policy, "topups_enabled", False)) or _arg_bool(args, "adaptive_production_topups", False)
     if topups_enabled:
         baseline_steps = max(1000, _quantized_extra_steps(int(full_steps * (1.0 - float(policy.topup_max_fraction)))))
@@ -6659,9 +6702,7 @@ def run_scheduled_adaptive_epoch(
         # Baseline only: it carries the phase's whole per-state budget, so the MD
         # the schedule meant for the phase is spent uniformly over every state
         # (and a resumed baseline simply continues from its checkpoint).
-        requested = [int(r.get("requested_steps", 0) or 0) for r in schedule
-                     if int(r.get("requested_steps", 0) or 0) > 0]
-        baseline_steps = max(baseline_steps, _quantized_extra_steps(int(round(sum(requested) / len(requested)))))
+        baseline_steps = full_steps
         print(f"      top-ups off (enable with --ap-topups): all-state baseline runs {baseline_steps} steps/state")
     segment_summaries: List[Dict[str, Any]] = []
     resume_requested = _arg_bool(args, "adaptive_production_resume", False)
@@ -6677,7 +6718,10 @@ def run_scheduled_adaptive_epoch(
     # depends on the window already being established.
     _baseline_skipped_state_ids: set = set()
 
-    def run_segment(name: str, state_ids: Sequence[int], steps: int) -> Path:
+    def run_segment(name: str, state_ids: Sequence[int], steps: int, *, force_resume: bool = False) -> Path:
+        """``force_resume``: continue this segment from its own checkpoint even
+        when the campaign itself was not started with ``--resume`` (the final
+        phase's baseline extension)."""
         seg_dir = epoch_dir / name
         seg_dir.mkdir(parents=True, exist_ok=True)
         windows_csv = epoch_dir / f"{name}_windows.csv"
@@ -6687,7 +6731,7 @@ def run_scheduled_adaptive_epoch(
         # only runs on a fresh start). Writing a fresh identity map over it is
         # the chignolin_6 mis-attribution.  See
         # _phase_window_map_is_owned_by_a_resuming_phase.
-        _seg_will_resume = bool(resume_requested and production_checkpoint_available(seg_dir))
+        _seg_will_resume = bool((resume_requested or force_resume) and production_checkpoint_available(seg_dir))
         _seg_map_path = seg_dir / "epoch_window_map.csv"
         # Both no-clobber vetoes, not just the resume one: a segment can also
         # already hold samples from an attempt whose checkpoint is unusable, and
@@ -6929,6 +6973,18 @@ def run_scheduled_adaptive_epoch(
         if outcome == "interrupted":
             return _interrupted()
         union_edge_overlap = outcome
+        if _final_phase_strands_topup_budget(epoch_dir, baseline_steps, full_steps):
+            # No later phase can spend the budget this final phase withheld for a
+            # top-up that did not run: give it back to every state by continuing
+            # the baseline to the un-shortened length.  A forced resume from the
+            # baseline's own checkpoint, so only the extra steps run and are
+            # charged to the pool (a resumed campaign that already extended hits
+            # run_segment's already-complete fast path instead).
+            print(f"      final phase: no top-up ran; extending the baseline {baseline_steps} -> "
+                  f"{full_steps} steps/state so the withheld budget is not stranded")
+            run_segment("baseline", active_ids, full_steps, force_resume=True)
+            if _graceful_shutdown.is_set():
+                return _interrupted()
     diagnostics = collect_segmented_epoch_diagnostics(epoch_dir, registry, policy)
     if union_edge_overlap:
         _apply_union_edge_overlap(diagnostics, union_edge_overlap, policy)
