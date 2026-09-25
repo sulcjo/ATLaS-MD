@@ -249,3 +249,15 @@ def test_phase_diagnostics_pass_the_filtered_sigma_neighbours(tmp_path, monkeypa
     ap._phase_union_diagnostics(args, adaptive, reg, ap.policy_from_args(args), {}, layout,
                                 edge_attempts={(1, 2): 5})
     assert seen["sigma_neighbours"] == {0: [1], 1: [0], 2: []}
+
+
+# ---- M2: the driver logs the plan's structural edges ----
+
+def test_the_driver_logs_structural_edges_and_saves_them(tmp_path, monkeypatch, capsys):
+    args, adaptive, reg = _campaign(tmp_path)
+    edges = tuple((i, i + 1) for i in range(7))
+    plan = TopupPlan(structural_edges=edges, reason="healthy")
+    _run(monkeypatch, args, adaptive / "epoch_001", reg, _rows([20_000] * 3, [20_000] * 3), plan)
+    out = capsys.readouterr().out
+    assert "7 structural edge(s)" in out and "0-1, 1-2, 2-3, 3-4, 4-5 (+2 more)" in out
+    assert tuple(tuple(e) for e in load_plan(adaptive / "epoch_001").structural_edges) == edges

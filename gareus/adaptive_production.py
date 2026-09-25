@@ -6560,6 +6560,19 @@ def _phase_topup_recorded(state: Dict[str, Any], phase_name: str) -> bool:
     return any(str((row or {}).get("segment", "")).startswith(prefix) for row in state.get("wall_time", []))
 
 
+STRUCTURAL_EDGES_LOGGED = 5
+
+
+def _log_structural_edges(plan) -> None:
+    """One driver log line for the plan's structural edges (also saved in topup_plan.json)."""
+    edges = [tuple(int(x) for x in e) for e in (plan.structural_edges or ())]
+    if not edges:
+        return
+    shown = ", ".join(f"{a}-{b}" for a, b in edges[:STRUCTURAL_EDGES_LOGGED])
+    more = f" (+{len(edges) - STRUCTURAL_EDGES_LOGGED} more)" if len(edges) > STRUCTURAL_EDGES_LOGGED else ""
+    print(f"      top-up plan: {len(edges)} structural edge(s) left to the bridge/add machinery: {shown}{more}")
+
+
 def _run_phase_topup(args, epoch_dir: Path, registry, policy, run_segment, segment_summaries, *,
                      full_steps: int):
     """Plan, seed-check and run this phase's single top-up, then calibrate.
@@ -6590,6 +6603,7 @@ def _run_phase_topup(args, epoch_dir: Path, registry, policy, run_segment, segme
         print(f"      top-up plan: {plan.reason}, {len(plan.state_ids)} states "
               f"({len(plan.deficit_state_ids)} deficit + {len(plan.partner_state_ids)} partners), "
               f"{plan.steps} steps, {float(plan.cost_hours):.2f} h predicted")
+        _log_structural_edges(plan)
         if plan.reason == "planned" and plan.state_ids and int(plan.steps) > 0:
             name = f"topup_001_{int(plan.steps)}"
             n_before = len(segment_summaries)
