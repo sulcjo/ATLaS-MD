@@ -1,4 +1,4 @@
-"""Deficit-driven, wall-hour-costed top-up plan (spec 4.2-4.3, revision 2). Pure function; no I/O."""
+"""Deficit-driven, wall-hour-costed top-up plan (spec 4.2-4.3, revision 2, rulings 8-10). Pure function; no I/O."""
 from __future__ import annotations
 
 import math
@@ -35,7 +35,7 @@ def _clamp(c) -> float:
 
 
 def _round_up(steps: float, interval: int) -> int:
-    return int(math.ceil(max(0.0, steps) / interval) * interval)
+    return int(math.ceil(max(0.0, steps) / interval - 1e-9) * interval)
 
 
 def plan_topup(diag, *, state_ids_in_order: Sequence[int], neighbours: Dict[int, List[int]],
@@ -54,16 +54,17 @@ def plan_topup(diag, *, state_ids_in_order: Sequence[int], neighbours: Dict[int,
     sampled = {s for s in state_ids_in_order if n_eff[s] > 0 and _ok(sigma[s])}
 
     deficits = {s for s in sampled if sigma[s] > target or s in diag.unconverged}
+    initial = frozenset(deficits)
     structural, noise_edges = [], []
     for (a, b), ov in sorted(diag.edge_overlap.items()):
         if not _ok(ov) or ov >= float(policy.topup_weak_overlap):
             continue
         tried_out = attempts.get((a, b), 0) >= int(policy.topup_max_edge_attempts)
-        if (a in deficits or b in deficits) and not tried_out:
-            deficits.update(x for x in (a, b) if x in sampled)
+        if (a in initial or b in initial) and not tried_out:
             noise_edges.append((a, b))
         else:
             structural.append((a, b))
+    deficits.update(x for (a, b) in noise_edges for x in (a, b) if x in sampled)
     if not deficits:
         return TopupPlan(structural_edges=tuple(structural), reason="healthy")
 
@@ -72,6 +73,7 @@ def plan_topup(diag, *, state_ids_in_order: Sequence[int], neighbours: Dict[int,
         return sigma[s] * math.sqrt(n / (n + corr[s] * L / (interval * g[s])))
 
     def required(s: int) -> int:
+        # noise-edge endpoints and unconverged states below target both use σ/√2 (double their data)
         eff_target = target if sigma[s] > target else sigma[s] / math.sqrt(2.0)
         extra_eff = n_eff[s] * ((sigma[s] / eff_target) ** 2 - 1.0)
         need = _round_up(extra_eff * interval * g[s] / corr[s], interval)
@@ -96,31 +98,15 @@ def plan_topup(diag, *, state_ids_in_order: Sequence[int], neighbours: Dict[int,
 
     table = policy.topup_throughput_table
     per_step_hours = wall_hours(interval, len(patch), timestep_fs, n_gpus, table) / interval
-    candidates = {required(s) for s in deficits}
+    need_L = max(required(s) for s in deficits)
     budget_max = int(budget_hours / per_step_hours // interval) * interval if per_step_hours > 0 else 0
-    if budget_max >= interval:
-        candidates.add(budget_max)
-    worst0 = max(sigma[s] for s in deficits)
-    ssq0 = sum(sigma[s] ** 2 for s in deficits)
-    best = None
-    for L in sorted(candidates):
-        if L < interval:
-            continue
-        cost = per_step_hours * L
-        if cost > budget_hours:
-            continue
-        pred = {s: predicted(s, L) for s in patch}
-        if not all(_ok(v) for v in pred.values()):
-            continue
-        benefit = (worst0 - max(pred[s] for s in deficits)) + 1e-3 * (ssq0 - sum(pred[s] ** 2 for s in deficits))
-        score = benefit / max(cost, 1e-12)
-        if not _ok(score):
-            continue
-        if best is None or score > best[0] + 1e-15:
-            best = (score, L, pred, cost)
-    if best is None:
+    L = min(need_L, budget_max)          # bring the worst deficit to target, capped by the budget
+    if L < interval:
         return TopupPlan(structural_edges=tuple(structural), reason="cap_too_small")
-    _, L, pred, cost = best
+    pred = {s: predicted(s, L) for s in patch}
+    if not all(_ok(v) for v in pred.values()):
+        return TopupPlan(structural_edges=tuple(structural), reason="cap_too_small")
+    cost = per_step_hours * L
     return TopupPlan(state_ids=tuple(sorted(patch)), steps=int(L), deficit_state_ids=tuple(sorted(deficits)),
                      partner_state_ids=tuple(sorted(partners)), structural_edges=tuple(structural),
                      weak_edges_topped=tuple(noise_edges), predicted_sigma=pred,
