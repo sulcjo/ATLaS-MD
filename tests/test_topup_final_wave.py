@@ -41,9 +41,10 @@ def _rows(requested, baseline):
             for i, (r, b) in enumerate(zip(requested, baseline))]
 
 
-def _run(monkeypatch, args, epoch_dir, reg, schedule, plan):
+def _run(monkeypatch, args, epoch_dir, reg, schedule, plan, runtime_pool=None, done=None):
     """Run one scheduled phase; returns [(segment, steps, resume)]."""
-    calls, done = [], {}
+    calls = []
+    done = {} if done is None else done
 
     def _fake_run_gareus(a, d, *rest, **kw):
         calls.append((Path(d).name, int(a.gamd_production_steps), bool(a.resume)))
@@ -60,7 +61,7 @@ def _run(monkeypatch, args, epoch_dir, reg, schedule, plan):
     monkeypatch.setattr(ap, "_after_topup_update", lambda *a, **k: None)
     ap.run_scheduled_adaptive_epoch(args, epoch_dir, reg, schedule, _fake_run_gareus,
                                     None, None, None, None, None, None,
-                                    policy=ap.policy_from_args(args))
+                                    policy=ap.policy_from_args(args), runtime_pool=runtime_pool)
     return calls
 
 
@@ -315,3 +316,54 @@ def test_the_diagnostics_limit_is_a_cli_flag():
     args = parse_args(["--seq", "AA", "--ap-topup-diagnostics-max-gb", "3.5"])
     assert ap.policy_from_args(args).topup_diagnostics_max_gb == 3.5
     assert ap.policy_from_args(parse_args(["--seq", "AA"])).topup_diagnostics_max_gb == 8.0
+
+
+# ---- ruling 34: under an enabled MD pool the extension clips the DELTA, not the target ----
+
+def _pool(total_ns):
+    return ap.AdaptiveRuntimePool(total_ns=total_ns, timestep_fs=2.0)
+
+
+def _summary(epoch_dir):
+    import json
+    return json.loads((Path(epoch_dir) / "scheduled_epoch_summary.json").read_text())
+
+
+def test_under_a_real_pool_the_final_extension_spends_the_withheld_budget(tmp_path, monkeypatch):
+    args, adaptive, reg = _campaign(tmp_path)
+    pool = _pool(3 * 20_000 * 2.0 / 1e6)                 # exactly the phase's full MD: 0.12 ns
+    final = adaptive / "final"
+    calls = _run(monkeypatch, args, final, reg, _rows([20_000] * 3, [20_000] * 3), HEALTHY, runtime_pool=pool)
+    assert calls[0] == ("baseline", 14_000, False)
+    assert len(calls) == 2 and calls[1][0] == "baseline" and calls[1][2] is True
+    assert 19_990 <= calls[1][1] <= 20_000               # the delta ran (floor rounding may drop a step)
+    assert pool.remaining_ns() < 3 * 10 * 2.0 / 1e6      # pool ends ~spent
+    rows = _summary(final)["segments"]
+    assert [r["segment"] for r in rows] == ["baseline", "baseline"]
+    assert not any(r.get("already_complete") or r.get("skipped_by_runtime_pool") for r in rows)
+    assert _summary(final)["baseline_steps"] == calls[1][1]
+
+
+def test_an_exactly_exhausted_pool_makes_the_extension_a_silent_noop(tmp_path, monkeypatch, capsys):
+    args, adaptive, reg = _campaign(tmp_path)
+    pool = _pool(3 * 14_000 * 2.0 / 1e6)                 # only the shortened baseline's MD
+    final = adaptive / "final"
+    calls = _run(monkeypatch, args, final, reg, _rows([20_000] * 3, [20_000] * 3), HEALTHY, runtime_pool=pool)
+    assert calls == [("baseline", 14_000, False)]
+    rows = _summary(final)["segments"]
+    assert len(rows) == 1 and not rows[0].get("skipped_by_runtime_pool")
+    assert _summary(final)["baseline_steps"] == 14_000
+    assert capsys.readouterr().out.count("extension skipped, no new steps") == 1
+
+
+def test_an_ordinary_resume_still_clips_the_full_target(tmp_path, monkeypatch):
+    """force_resume=False (chignolin_9's path) is unchanged: the full target is clipped."""
+    args, adaptive, reg = _campaign(tmp_path, topups=False, resume=True)
+    epoch = adaptive / "epoch_001"
+    pool = _pool(3 * 6_000 * 2.0 / 1e6)                  # room for 6,000 more steps/state
+    done = {epoch / "baseline": 14_000}
+    calls = _run(monkeypatch, args, epoch, reg, _rows([20_000] * 3, [20_000] * 3), HEALTHY,
+                 runtime_pool=pool, done=done)
+    assert calls == []                                    # 20,000 clipped to 6,000 < 14,000: fast path, as today
+    rows = _summary(epoch)["segments"]
+    assert len(rows) == 1 and rows[0]["already_complete"] and rows[0]["steps"] <= 6_000

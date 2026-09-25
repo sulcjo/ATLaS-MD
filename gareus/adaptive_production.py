@@ -6882,7 +6882,30 @@ def run_scheduled_adaptive_epoch(
         requested_steps = int(steps)
         actual_steps = requested_steps
         pool_event = None
-        if runtime_pool is not None and runtime_pool.enabled:
+        if force_resume:
+            # The final phase's baseline extension (ruling 34): the checkpoint
+            # already holds `prior` steps, so only the DELTA is new MD and only
+            # the delta is clipped against the pool.  Clipping the full target
+            # (the ordinary path below) lands under the checkpoint whenever the
+            # pool holds just the withheld fraction, i.e. always in production.
+            # No summary row for a no-op: the baseline's own row already exists.
+            _fr_prior = int(_segment_checkpoint_prod_done(seg_dir) or 0) if seg_args.resume else 0
+            _fr_delta = max(0, requested_steps - _fr_prior)
+            if runtime_pool is not None and runtime_pool.enabled:
+                _fr_delta = runtime_pool.clip_steps(
+                    len(state_ids), _fr_delta,
+                    reserve_ns=float(pool_reserve_ns),
+                    hard_stop=bool(getattr(args, "adaptive_production_pool_hard_stop", True)),
+                )
+            if _fr_delta <= 0:
+                print(f"      scheduled segment {name}: extension skipped, no new steps "
+                      f"({_fr_prior}/{requested_steps} checkpointed; MD pool left for it: 0)")
+                return seg_dir
+            actual_steps = _fr_prior + int(_fr_delta)
+            if actual_steps < requested_steps:
+                print(f"      scheduled segment {name}: extension clipped by MD pool "
+                      f"{requested_steps}->{actual_steps} steps for {len(state_ids)} state(s)")
+        elif runtime_pool is not None and runtime_pool.enabled:
             actual_steps = runtime_pool.clip_steps(
                 len(state_ids), requested_steps,
                 reserve_ns=float(pool_reserve_ns),
@@ -7057,6 +7080,9 @@ def run_scheduled_adaptive_epoch(
             print(f"      final phase: no top-up ran; extending the baseline {baseline_steps} -> "
                   f"{full_steps} steps/state so the withheld budget is not stranded")
             run_segment("baseline", active_ids, full_steps, force_resume=True)
+            # Report the length the baseline actually reached (a pool clip can stop short).
+            baseline_steps = max(int(baseline_steps),
+                                 int(_segment_checkpoint_prod_done(epoch_dir / "baseline") or 0))
             if _graceful_shutdown.is_set():
                 return _interrupted()
     diagnostics = collect_segmented_epoch_diagnostics(epoch_dir, registry, policy)
