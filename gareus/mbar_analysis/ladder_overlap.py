@@ -8,12 +8,16 @@ second is a problem.
 """
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 
 from gareus.mbar_analysis.ladder import symmetric_state_overlap
 from gareus.mbar_analysis.pmf import overlap_components
 
 _TOL = 1.0e-9
+# One warning per process for the full-matrix (pair_overlap=None) path; reset in tests.
+_FULL_MATRIX_WARNED = False
 
 # Threshold for the SYMMETRISED PAIRWISE MBAR STATE-OVERLAP metric this module
 # grades -- NOT for a CV histogram-intersection overlap, and NOT for a raw
@@ -122,6 +126,18 @@ def _axis_connectivity(K: int, pairs, group_values: np.ndarray,
             "expected_components": expected}
 
 
+def _warn_full_matrix_once() -> None:
+    global _FULL_MATRIX_WARNED
+    if _FULL_MATRIX_WARNED:
+        return
+    _FULL_MATRIX_WARNED = True
+    logging.warning(
+        "ladder_overlap_by_axis: no pair_overlap given, grading FULL-matrix overlap entries against "
+        "the pairwise-scale threshold %.2f; the full matrix is diluted on a large union (chignolin_7: "
+        "median 0.089 full vs 0.258 pairwise). Pass pair_overlap (pairwise_state_overlap) for a real "
+        "verdict.", LADDER_STATE_OVERLAP_MIN)
+
+
 def ladder_overlap_by_axis(overlap, state_lambdas, centers,
                             thr: float = LADDER_STATE_OVERLAP_MIN, n_k=None,
                             pair_overlap=None):
@@ -192,6 +208,7 @@ def ladder_overlap_by_axis(overlap, state_lambdas, centers,
     cen = np.asarray(centers, dtype=np.float64)
     K = int(lam.shape[0])
     if pair_overlap is None:
+        _warn_full_matrix_once()
         overlap = np.asarray(overlap, dtype=np.float64)
         overlap_ok = overlap.ndim == 2 and overlap.shape[0] == overlap.shape[1] and overlap.shape[0] == K
         if not overlap_ok or cen.shape[0] != K:
