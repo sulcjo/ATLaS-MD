@@ -269,15 +269,18 @@ class EdgeDiagnostics:
     # ``overlap`` is ~1 by construction and is therefore left None rather than
     # recorded as if it meant something.
     #
-    # The value is the SYMMETRIC MBAR state overlap ``sqrt(O_ij * O_ji)``
-    # (= ``S_ij * sqrt(N_i * N_j)``), not a raw matrix entry: ``mbar_state_overlap``
-    # returns ``O = diag(N) @ S``, so ``O_ij != O_ji`` whenever the two states
-    # hold different sample counts -- which adaptive extension makes normal --
-    # and the raw entry would make the metric depend on the states' id order.
-    # It equals ``O_ij`` when ``N_i == N_j``, so the S3 pilot calibration and
-    # the ``min_rung_overlap`` / ``target_rung_overlap`` thresholds are
-    # unchanged.  ``None`` means "not scored" (no union MBAR solve was
-    # available), which is warned but never counted as a weak rung edge.
+    # The value is the PAIRWISE MBAR state overlap ``sqrt(O_ij * O_ji)``,
+    # computed by ``gareus.mbar_analysis.ladder.pairwise_state_overlap`` with
+    # only the two states' own samples in the denominator and the union
+    # ``f_k`` held fixed -- NOT a raw entry of the full-union
+    # ``mbar_state_overlap`` matrix, which dilutes an edge's overlap by
+    # roughly how many OTHER states share its region (measured on
+    # chignolin_7's 64-state union: full-union median 0.089 across the 48
+    # adjacent-rung edges vs a pairwise median of 0.258 on the same edges;
+    # the ``min_rung_overlap`` / ``target_rung_overlap`` thresholds below are
+    # calibrated against the pairwise number).  ``None`` means "not scored"
+    # (no union MBAR solve was available), which is warned but never counted
+    # as a weak rung edge.
     mbar_overlap: Optional[float] = None
     exchange_attempts: int = 0
     exchange_accepted: int = 0
@@ -301,10 +304,21 @@ class AdaptiveDecisionPolicy:
     target_overlap: float = 0.30
     min_exchange_acceptance: float = 0.08
     # λ-ladder rung edges are scored in ENERGY space (MBAR O_ij), never by CV
-    # histogram.  Calibration (S3 pilot attempt 8, sigma0 = 6, rungs
-    # 0/.1/.25/.5/1): adjacent-rung O_ij came out 0.298 / 0.250 / 0.240 /
-    # 0.273, so 0.25 is a realistic target and 0.15 a floor that a healthy
-    # ladder clears with margin.  Exchange acceptance is NOT usable here: under
+    # histogram, and specifically via the PAIRWISE metric
+    # (``gareus.mbar_analysis.ladder.pairwise_state_overlap``: only the pair's
+    # own samples in the denominator, union f_k held fixed) -- NEVER a raw
+    # entry of the full-union ``mbar_state_overlap`` matrix, which dilutes an
+    # edge's overlap by roughly how many other states share its region.
+    # Calibration (S3 pilot attempt 8, sigma0 = 6, rungs 0/.1/.25/.5/1, a ~4-
+    # state ladder -- i.e. already at an effectively pairwise scale):
+    # adjacent-rung O_ij came out 0.298 / 0.250 / 0.240 / 0.273, so 0.25 is a
+    # realistic target and 0.15 a floor that a healthy ladder clears with
+    # margin.  Confirmed at full campaign scale on RUNS/chignolin_7's
+    # 64-state union (16 CV1 centres x 4 rungs): the 48 adjacent-rung edges'
+    # pairwise median is 0.258 (0/48 below 0.15) -- consistent with the pilot
+    # -- while the full-union matrix on the SAME edges gives a median of
+    # 0.089 (38/48 below 0.15), which is why the full matrix must never be
+    # used for this gate.  Exchange acceptance is NOT usable here: under
     # gibbs-walk the heat-bath choice inflated the same ladder's per-pair
     # acceptance to 91-95 % against a true pairwise overlap of 0.24-0.30.
     min_rung_overlap: float = 0.15
@@ -3716,7 +3730,8 @@ def rung_mbar_overlap_from_union(
     registry: WindowStateRegistry,
     policy: Optional[AdaptiveDecisionPolicy] = None,
 ) -> Dict[Tuple[int, int], float]:
-    """MBAR state overlap ``O_ij`` for every rung edge, from the union inputs.
+    """PAIRWISE MBAR state overlap ``sqrt(O_ij * O_ji)`` for every rung edge,
+    from the union inputs.
 
     The union NPZ is the only place that carries every state's reduced
     potential for every sample WITH the λ-ladder boost already folded in (see
@@ -3725,6 +3740,16 @@ def rung_mbar_overlap_from_union(
     empty mapping -- never raises -- when there is no ladder, no NPZ, or the
     solve fails; a missing ``mbar_overlap`` then reads as a weak rung edge,
     which is the conservative direction.
+
+    Each edge is scored with ``gareus.mbar_analysis.ladder.pairwise_state_overlap``
+    (union ``f_k`` held fixed, only the pair's own samples in the denominator),
+    NOT the full-union ``mbar_state_overlap`` matrix -- the full matrix dilutes
+    an edge's overlap by roughly how many OTHER states share its region.  On
+    RUNS/chignolin_7's 64-state union (16 centres x 4 rungs) the 48
+    adjacent-rung edges came out at a full-union median of 0.089 (38/48 below
+    the 0.15 floor) versus a pairwise median of 0.258 (0/48 below) -- see
+    ``min_rung_overlap`` above, which is calibrated against the pairwise
+    number.
     """
     policy = policy or AdaptiveDecisionPolicy()
     rung_pairs = [(a, b) for a, b, etype, _nd in build_geometry_edges(registry, policy) if etype == "rung"]
@@ -3746,25 +3771,24 @@ def rung_mbar_overlap_from_union(
             return {}
         n_k = np.bincount(window, minlength=u_nk.shape[1]).astype(np.int64)
         from .mbar_analysis.solvers import solve_mbar  # noqa: PLC0415
-        from .mbar_analysis.ladder import mbar_state_overlap  # noqa: PLC0415
+        from .mbar_analysis.ladder import pairwise_state_overlap  # noqa: PLC0415
         f_k = np.asarray(solve_mbar(u_nk, window)["f_k"], dtype=float)
-        overlap = mbar_state_overlap(u_nk, f_k, n_k)
+        out: Dict[Tuple[int, int], float] = {}
+        for a, b in rung_pairs:
+            ia, ib = idx_of.get(int(a)), idx_of.get(int(b))
+            if ia is None or ib is None:
+                continue
+            value = pairwise_state_overlap(u_nk, window, f_k, n_k, ia, ib)
+            if math.isfinite(value) and value >= 0.0:
+                out[(int(min(a, b)), int(max(a, b)))] = float(value)
+        return out
     except Exception as exc:
         logging.warning("adaptive-production: rung MBAR overlap unavailable (%s)", exc)
         return {}
-    out: Dict[Tuple[int, int], float] = {}
-    for a, b in rung_pairs:
-        ia, ib = idx_of.get(int(a)), idx_of.get(int(b))
-        if ia is None or ib is None:
-            continue
-        value = _symmetric_state_overlap(overlap, ia, ib)
-        if value is not None:
-            out[(int(min(a, b)), int(max(a, b)))] = value
-    return out
 
 
 def _symmetric_state_overlap(overlap: np.ndarray, i: int, j: int) -> Optional[float]:
-    """The per-edge rung metric: ``sqrt(O_ij * O_ji)``.
+    """The full-union-matrix per-edge overlap metric: ``sqrt(O_ij * O_ji)``.
 
     ``mbar_state_overlap`` returns ``O = diag(N) @ S`` with ``S`` symmetric, so
     ``O_ij != O_ji`` whenever ``N_i != N_j`` -- and adaptive extension makes
@@ -3773,8 +3797,17 @@ def _symmetric_state_overlap(overlap: np.ndarray, i: int, j: int) -> Optional[fl
     states happens to hold the lower state id, which is unrelated to anything
     physical.  The geometric mean is the symmetric combination,
     ``S_ij * sqrt(N_i * N_j)``, and it equals ``O_ij`` exactly when
-    ``N_i == N_j`` -- so the S3 pilot calibration and the 0.15 / 0.25 thresholds
-    carry over unchanged.
+    ``N_i == N_j``.
+
+    NOT what ``rung_mbar_overlap_from_union`` uses any more: the full-union
+    matrix dilutes an edge's overlap by roughly how many OTHER states share
+    its region (measured on chignolin_7: full-union median 0.089 vs a
+    pairwise median of 0.258 on the same 48 adjacent-rung edges -- see
+    ``gareus.mbar_analysis.ladder.pairwise_state_overlap``, which is what the
+    driver calls today and what the 0.15 / 0.25 thresholds are calibrated
+    against). Kept here -- and still directly unit-tested -- as the
+    full-matrix analogue used by ``gareus.mbar_analysis.ladder_overlap``'s
+    default (non-``pair_overlap``) code path.
     """
     a = float(overlap[i, j])
     b = float(overlap[j, i])
