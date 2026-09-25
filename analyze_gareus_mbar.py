@@ -5372,14 +5372,25 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
     if d.meta.get('gamd_ladder'):
         try:
             from gareus_report import overall_from_checks
-            from gareus.mbar_analysis.ladder import mbar_state_overlap
+            from gareus.mbar_analysis.ladder import pairwise_state_overlap
             from gareus.mbar_analysis.ladder_overlap import ladder_overlap_by_axis, ladder_overlap_health_checks
-            _ov=mbar_state_overlap(d.u_nk, m['f_k'], m['n_k'])
+            # PAIRWISE, not the full-union mbar_state_overlap matrix: the full
+            # matrix dilutes a neighbour edge's overlap by roughly how many
+            # OTHER states share its region (RUNS/chignolin_7's 64-state union:
+            # full-union median 0.089 vs pairwise median 0.258 on the same 48
+            # adjacent-rung edges -- see LADDER_STATE_OVERLAP_MIN's module-level
+            # comment in ladder_overlap.py). d.u_nk/d.window are still row-aligned
+            # with m['f_k']/m['n_k'] here (both come from the same solve_mbar call
+            # above with nothing re-masking d in between).
+            def _pair_ov(a, b):
+                v = pairwise_state_overlap(d.u_nk, d.window, m['f_k'], m['n_k'], a, b)
+                return float(v) if math.isfinite(v) and v >= 0.0 else None
             # Deliberately NOT --min-neighbor-overlap: that grades CV
             # histogram-intersection overlap, while this axis report grades
             # symmetrised MBAR state overlap. See _LADDER_STATE_OVERLAP_MIN.
             _thr=float(getattr(args,'min_ladder_state_overlap',_LADDER_STATE_OVERLAP_MIN))
-            _lo,_lo_warnings=ladder_overlap_by_axis(_ov, d.state_lambdas, d.centers, thr=_thr, n_k=m['n_k'])
+            _lo,_lo_warnings=ladder_overlap_by_axis(None, d.state_lambdas, d.centers, thr=_thr, n_k=m['n_k'],
+                                                     pair_overlap=_pair_ov)
             s['ladder_overlap']=_lo
             for _w in _lo_warnings:
                 s.setdefault('warnings',[]).append(_w)
