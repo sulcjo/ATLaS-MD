@@ -38,6 +38,9 @@ from .helptext import SimpleHelpAction, HeavyHelpAction
 
 __all__ = ["parse_args", "main"]
 
+# Guard to warn once per process when pymbar is unusable (adaptive-production entry points)
+_warned_pymbar_in_cli = False
+
 
 # ---------------------------------------------------------------------------
 # Argument group builders
@@ -1812,13 +1815,16 @@ def _committed_shared_gamd_dir(out_dir: Path) -> str:
 
 
 def run_double_adaptive_auto_loop(args, out_dir: Path, openmm, app, unit, forcefield, topology, equil_state, progress: Optional[GuiProgressSink] = None) -> dict:
-    from gareus.pymbar_check import warn_if_pymbar_unusable
+    global _warned_pymbar_in_cli
 
     out_dir = Path(out_dir)
     summary_path = out_dir / "double_adaptive_driver_summary.json"
     adaptive_registry = out_dir / "adaptive_production" / "state_registry.json"
 
-    warn_if_pymbar_unusable("equilibration subsampling, union MBAR analysis and top-up diagnostics")
+    if not _warned_pymbar_in_cli:
+        from gareus.pymbar_check import warn_if_pymbar_unusable  # noqa: PLC0415
+        warn_if_pymbar_unusable("equilibration subsampling, union MBAR analysis and top-up diagnostics")
+        _warned_pymbar_in_cli = True
 
     feedback_driver_summary_path = out_dir / "adaptive_feedback_driver_summary.json"
     feedback_completed = False
@@ -1937,6 +1943,8 @@ def run_double_adaptive_auto_loop(args, out_dir: Path, openmm, app, unit, forcef
 
 
 def main(argv: Optional[Iterable[str]] = None):
+    global _warned_pymbar_in_cli
+
     _graceful_shutdown.clear()
     argv_list = _argv_as_list(argv)
     args = parse_args(argv_list)
@@ -2066,6 +2074,10 @@ def main(argv: Optional[Iterable[str]] = None):
             if _resume_window_mode == "double-adaptive":
                 run_double_adaptive_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
             else:
+                if not _warned_pymbar_in_cli:
+                    from gareus.pymbar_check import warn_if_pymbar_unusable  # noqa: PLC0415
+                    warn_if_pymbar_unusable("equilibration subsampling, union MBAR analysis and top-up diagnostics")
+                    _warned_pymbar_in_cli = True
                 run_adaptive_production_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
 
         elif bool(getattr(args, "extend", False)) and str(getattr(args, "window_mode", "adaptive")) in {"adaptive-production", "double-adaptive"}:
@@ -2091,6 +2103,10 @@ def main(argv: Optional[Iterable[str]] = None):
             if _extend_window_mode == "double-adaptive":
                 run_double_adaptive_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
             else:
+                if not _warned_pymbar_in_cli:
+                    from gareus.pymbar_check import warn_if_pymbar_unusable  # noqa: PLC0415
+                    warn_if_pymbar_unusable("equilibration subsampling, union MBAR analysis and top-up diagnostics")
+                    _warned_pymbar_in_cli = True
                 run_adaptive_production_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
 
         elif bool(getattr(args, "resume", False)):
@@ -2155,6 +2171,10 @@ def main(argv: Optional[Iterable[str]] = None):
             if str(getattr(args, "window_mode", "adaptive")) in {"adaptive-feedback", "delaunay-feedback"}:
                 run_adaptive_feedback_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
             elif str(getattr(args, "window_mode", "adaptive")) == "adaptive-production":
+                if not _warned_pymbar_in_cli:
+                    from gareus.pymbar_check import warn_if_pymbar_unusable  # noqa: PLC0415
+                    warn_if_pymbar_unusable("equilibration subsampling, union MBAR analysis and top-up diagnostics")
+                    _warned_pymbar_in_cli = True
                 run_adaptive_production_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
             elif str(getattr(args, "window_mode", "adaptive")) == "double-adaptive":
                 run_double_adaptive_auto_loop(args, out_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
