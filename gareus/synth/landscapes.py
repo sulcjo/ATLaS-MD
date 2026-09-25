@@ -300,6 +300,14 @@ def chaos_2d() -> Landscape:
     return Landscape("chaos-2d", f, (0.0, 1.0), (-1.0, 1.0), basins)
 
 
+def harmonic_bowl() -> Landscape:
+    """Smooth single harmonic well (~1 kBT across the domain): near-uniform difficulty, the homogeneous control."""
+    def f(cv1, cv2):
+        return 0.5 * ((np.asarray(cv1, float) - 0.5) / 0.5) ** 2 + 0.5 * np.asarray(cv2, float) ** 2
+
+    return Landscape("harmonic-bowl", f, (0.0, 1.0), (-1.0, 1.0), basins=((0.5, 0.0),))
+
+
 LANDSCAPES: dict[str, Landscape] = {
     "mixture-wells": mixture_wells(),
     "gated-barrier": gated_barrier(),
@@ -308,4 +316,5 @@ LANDSCAPES: dict[str, Landscape] = {
     "rugged-1d": rugged_1d(),
     "rugged-2d": rugged_2d(),
     "chaos-2d": chaos_2d(),
+    "harmonic-bowl": harmonic_bowl(),
 }
