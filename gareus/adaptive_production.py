@@ -277,9 +277,10 @@ class EdgeDiagnostics:
     # ``mbar_state_overlap`` matrix, which dilutes an edge's overlap by
     # roughly how many OTHER states share its region (measured on
     # chignolin_7's 64-state union: full-union median 0.089 across the 48
-    # adjacent-rung edges vs a pairwise median of 0.258 on the same edges;
-    # the ``min_rung_overlap`` / ``target_rung_overlap`` thresholds below are
-    # calibrated against the pairwise number).  ``None`` means "not scored"
+    # adjacent-rung edges vs a pairwise median of 0.258 on the same edges).
+    # The ``min_rung_overlap`` / ``target_rung_overlap`` thresholds below are
+    # applied to this pairwise number but were NOT calibrated on it -- see
+    # their comment.  ``None`` means "not scored"
     # (no union MBAR solve was available), which is warned but never counted
     # as a weak rung edge.
     mbar_overlap: Optional[float] = None
@@ -310,16 +311,18 @@ class AdaptiveDecisionPolicy:
     # own samples in the denominator, union f_k held fixed) -- NEVER a raw
     # entry of the full-union ``mbar_state_overlap`` matrix, which dilutes an
     # edge's overlap by roughly how many other states share its region.
-    # Calibration (S3 pilot attempt 8, sigma0 = 6, rungs 0/.1/.25/.5/1, a ~4-
-    # state ladder -- i.e. already at an effectively pairwise scale):
-    # adjacent-rung O_ij came out 0.298 / 0.250 / 0.240 / 0.273, so 0.25 is a
-    # realistic target and 0.15 a floor that a healthy ladder clears with
-    # margin.  Confirmed at full campaign scale on RUNS/chignolin_7's
-    # 64-state union (16 CV1 centres x 4 rungs): the 48 adjacent-rung edges'
-    # pairwise median is 0.258 (0/48 below 0.15) -- consistent with the pilot
-    # -- while the full-union matrix on the SAME edges gives a median of
-    # 0.089 (38/48 below 0.15), which is why the full matrix must never be
-    # used for this gate.  Exchange acceptance is NOT usable here: under
+    # Calibration (S3 pilot attempt 8, sigma0 = 6, rungs 0/.1/.25/.5/1): a
+    # 5-state single-centre ladder whose adjacent-rung entries of the FULL
+    # 5-state overlap matrix came out 0.298 / 0.250 / 0.240 / 0.273, so 0.25
+    # was taken as a realistic target and 0.15 as a floor.  That full-matrix
+    # calibration is itself diluted (5 states share the region); the two
+    # thresholds are applied unchanged to the pairwise metric and have NOT
+    # been re-measured on it.  For scale only: on RUNS/chignolin_7's
+    # 64-state union (16 CV1 centres x 4 rungs) the 48 adjacent-rung edges'
+    # pairwise median is 0.258 (0/48 below 0.15) while the full-union matrix
+    # on the SAME edges gives a median of 0.089 (38/48 below 0.15), which is
+    # why the full matrix must never be used for this gate.  Exchange
+    # acceptance is NOT usable here: under
     # gibbs-walk the heat-bath choice inflated the same ladder's per-pair
     # acceptance to 91-95 % against a true pairwise overlap of 0.24-0.30.
     min_rung_overlap: float = 0.15
@@ -334,10 +337,12 @@ class AdaptiveDecisionPolicy:
     #      per-epoch/segment diagnostics carry no rung O_ij (they run before
     #      build_union_state_mbar_inputs and nothing passes them a
     #      ``rung_mbar_overlap`` mapping), so their rung edges are warned
-    #      ``rung_overlap_unavailable`` and skipped by the proposer. A rung gap
-    #      is therefore caught at CAMPAIGN END by the quality gate, not repaired
-    #      mid-campaign; feeding the epoch loop a per-epoch union solve is what
-    #      would change that.
+    #      ``rung_overlap_unavailable`` and skipped by the proposer. With
+    #      top-ups OFF a rung gap is therefore caught at CAMPAIGN END by the
+    #      quality gate, not repaired mid-campaign.  With top-ups ON the
+    #      per-epoch union solve they run feeds its pairwise overlaps into the
+    #      epoch diagnostics (``_apply_union_edge_overlap``), so the gate and
+    #      ``add_rung`` see real rung numbers mid-campaign.
     # (ii) Under an active ladder ``retire_converged`` is inert: every centre
     #      representative carries its own rungs, so it is an articulation point
     #      of the rung-aware graph and can never be retired, while a
@@ -3752,8 +3757,9 @@ def rung_mbar_overlap_from_union(
     ``build_union_state_mbar_inputs`` -> ``apply_ladder_boost_to_u``), so it is
     the only honest source for an energy-space rung diagnostic.  Returns an
     empty mapping -- never raises -- when there is no ladder, no NPZ, or the
-    solve fails; a missing ``mbar_overlap`` then reads as a weak rung edge,
-    which is the conservative direction.
+    solve fails; an edge left without ``mbar_overlap`` is then unmeasured,
+    and an unmeasured edge is never weak (``_edge_is_measured_weak``): it is
+    warned ``rung_overlap_unavailable``, not proposed for ``add_rung``.
 
     Each edge is scored with ``gareus.mbar_analysis.ladder.pairwise_state_overlap``
     (union ``f_k`` held fixed, only the pair's own samples in the denominator),
@@ -3761,9 +3767,10 @@ def rung_mbar_overlap_from_union(
     an edge's overlap by roughly how many OTHER states share its region.  On
     RUNS/chignolin_7's 64-state union (16 centres x 4 rungs) the 48
     adjacent-rung edges came out at a full-union median of 0.089 (38/48 below
-    the 0.15 floor) versus a pairwise median of 0.258 (0/48 below) -- see
-    ``min_rung_overlap`` above, which is calibrated against the pairwise
-    number.
+    the 0.15 floor) versus a pairwise median of 0.258 (0/48 below).  The
+    ``min_rung_overlap`` threshold this is graded against came from a 5-state
+    full-matrix pilot and has not been re-measured on the pairwise scale (see
+    its comment on ``AdaptiveDecisionPolicy``).
     """
     policy = policy or AdaptiveDecisionPolicy()
     rung_pairs = [(a, b) for a, b, etype, _nd in build_geometry_edges(registry, policy) if etype == "rung"]

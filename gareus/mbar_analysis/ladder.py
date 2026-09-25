@@ -266,12 +266,13 @@ def pairwise_state_overlap(
     a full-union ``sqrt(O_ij*O_ji)`` median of 0.089 (38/48 below the 0.15
     floor) versus a pairwise median of 0.258 (0/48 below) -- roughly the
     ratio of "how many states sit in the same region" one would expect from
-    dilution, not a real overlap difference. This function is what
-    ``min_rung_overlap``/``target_rung_overlap``
-    (``gareus/adaptive_production.py``) and ``LADDER_STATE_OVERLAP_MIN``
-    (``gareus/mbar_analysis/ladder_overlap.py``) are actually calibrated
-    against (the S3 pilot ladder that produced 0.298/0.250/0.240/0.273 had
-    only ~4 states total, i.e. an effectively pairwise scale already).
+    dilution, not a real overlap difference. ``min_rung_overlap`` /
+    ``target_rung_overlap`` (``gareus/adaptive_production.py``) and
+    ``LADDER_STATE_OVERLAP_MIN`` (``gareus/mbar_analysis/ladder_overlap.py``)
+    are applied to this function's value, but they were calibrated on the S3
+    pilot's 5-state FULL-matrix entries (0.298/0.250/0.240/0.273), which are
+    themselves diluted; the thresholds have not been re-measured on the
+    pairwise scale.
 
     Only the pair's own samples enter, with a 2-state mixture denominator:
     ``W_nk = exp(f_k - u_k(x_n)) / sum_{l in {i,j}} N_l exp(f_l - u_l(x_n))``,
