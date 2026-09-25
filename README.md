@@ -35,12 +35,16 @@ A run defines the peptide system and CVs, builds biased thermodynamic states, pr
 | **MBAR-ready storage** | Per-sample CVs, energies, state mappings, exchange records, and phase-local Hamiltonian metadata |
 | **Reproducibility** | Checkpoints, manifests, source/input hashes, segment tracking, and restart-safe output layout |
 
-## What a run does
+## Standard workflow
 
-1. **Build the system.** Prepare a peptide in explicit solvent, optionally using GENPEPT conformers and hydrogen-mass repartitioning (HMR).
-2. **Define the landscape coordinates.** Select one or two collective variables (CVs) and place umbrella states over the region to explore.
-3. **Sample and exchange.** Run OpenMM replicas with conventional MD or supported GaMD/Pep-GaMD modes; optional adaptive stages refine state placement before a separately identified production phase.
-4. **Audit and analyze.** Preserve per-sample CVs, state assignments, energies, exchanges, checkpoints and provenance for MBAR/PMF analysis and overlap/ESS diagnostics.
+1. **GENPEPT seeding.** Generate and rank candidate peptide conformers.
+2. **Swarm exploration.** Run a parallel ensemble of simulations to gather exploratory sampling data.
+3. **CV selection.** Select the CVs from the available seed-bank and swarm evidence, before committing to the production state layout.
+4. **Adaptive epochs.** Iteratively refine and allocate umbrella states using epoch feedback.
+5. **Optional top-ups.** Extend sampling under the current regime when more data are needed; keep the regime and phase provenance explicit.
+6. **MBAR analysis.** Reconstruct state weights and assess PMFs alongside overlap, effective sample size (ESS), and reweighting diagnostics.
+
+ATLaS-MD also supports simpler workflows, including conventional MD and manually specified windows. See the [quickstart](docs/atlas-md/start/quickstart.md) for an entry point and the [CV selection guide](docs/atlas-md/guide/collective-variables.md) for coordinate definitions.
 
 New users can begin with the [quickstart](docs/atlas-md/start/quickstart.md), then read [how CVs and windows work](docs/atlas-md/guide/collective-variables.md) and the [analysis validity checks](docs/atlas-md/analysis/pmf-validity.md).
 
