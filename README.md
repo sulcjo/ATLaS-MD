@@ -257,7 +257,7 @@ Finite-timestep propagation is not claimed to be mathematically exact. The therm
 
 ## Documentation
 
-**[Full ATLaS-MD manual](https://sulcjo.github.io/ATLaS-MD/)**
+**[Full ATLaS-MD manual](https://github.com/sulcjo/ATLaS-MD/tree/main/docs/atlas-md)**
 
 Useful entry points:
 
