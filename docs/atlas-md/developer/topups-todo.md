@@ -13,7 +13,7 @@ state), every uniform-baseline (top-ups-off) state is already at or under the si
 heterogeneous-vs-uniform criterion is untestable in this harness. Reported for information only, at the rows
 floor: top-ups lower the worst per-state sigma on two of four landscapes (gated-barrier -8.4%, 20/20 seeds,
 p=9.5e-7; slow-cv2-double-branch -1.3%, 19/20) but improve PMF RMSE on none (gated-barrier 7% worse, 7/20
-seeds). Missing-bridge routing (an edge spanning a genuine gap is topped as structural; the same coordinate
+seeds). Missing-bridge routing (an edge spanning a genuine gap is routed as structural; the same coordinate
 pair in an intact layout is not) passes 20/20. The patch τ penalty (kept deliberately — it is a real cost of
 a lockstep patch with fewer exchange partners than the full state set) measured g(patch)/g(all-state) =
 1.19-1.26. **Honest summary: top-ups are not shown to help in this harness.** Full numbers and regenerate
@@ -22,7 +22,10 @@ remains the real test.
 
 ## T1 — chignolin_10: real-MD test of the new top-ups (not started)
 
-Run only after the synthetic validation passes. Compare against a uniform-extension control at equal
+chignolin_10 proceeds as the real-MD test regardless (user decision 2026-09-24): the synthetic harness found
+no targetable heterogeneous-deficit regime on any of its four landscapes, so it neither supports nor blocks
+running chignolin_10 — it is simply uninformative here, not a green light or a red flag. Compare against a
+uniform-extension control at equal
 wall-hours: same layout, lambda ladder and budget; same contexts/GPU in both arms (or report the targeting
 and throughput effects separately); paired seeds for the shared baseline and distinct RNG streams after the
 branch; replicates per arm (min per-state ESS is a noisy order statistic). Success: lower max per-state

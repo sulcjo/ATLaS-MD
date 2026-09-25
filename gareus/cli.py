@@ -477,11 +477,10 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                         "after the final phase already drew its share of the MD pool).")
     p.add_argument("--ap-retire-converged", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--ap-topups", action=argparse.BooleanOptionalAction, default=False,
-                   help="Top-ups (off by default): Scheduled epochs/final run an all-state baseline plus top-up segments over "
-                        "state subsets. --ap-topups enables them; --no-ap-topups runs the baseline only, giving it the phase's "
-                        "whole per-state budget (mean of the allocator's requested steps). Recommended "
-                        "for lambda-ladder campaigns, where a top-up batch holds one rung (no lambda "
-                        "exchange) and restarts its windows from a fresh pull.")
+                   help="Top-ups (off by default): --no-ap-topups runs each scheduled phase as a single "
+                        "all-state baseline only. --ap-topups adds, after that baseline, at most one "
+                        "deficit-driven top-up segment over a state subset, continuing each of its windows "
+                        "from the parent segment's exported final States (no fresh pull).")
     p.add_argument("--ap-topup-target-sigma", type=float, default=0.10,
                    help="Per-state local free-energy uncertainty target (kcal/mol) for top-ups.")
     p.add_argument("--ap-topup-weak-overlap", type=float, default=0.15,

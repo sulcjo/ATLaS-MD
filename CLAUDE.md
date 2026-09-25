@@ -8,7 +8,8 @@ Updated 2026-09-25.
 - **Off by default**, and the topups-off baseline changed with this work: the per-state score allocator (low-sample/weak-edge/frontier/high-boost bonuses, the 2x new-state step multiplier) is gone, replaced by a uniform per-state share of the phase's budget. Any epoch run with `ap_topups: false` after this change allocates differently than before, even though no top-up ever runs. The removed score-policy fields still load from old configs but warn once if set non-default.
 - **An edge that could not be measured is never weak** — not in the top-up gate, not in the campaign quality gate, not in action proposals, not in reports. `_edge_is_measured_weak` is the one predicate all of these route through; rung edges are judged on pairwise `mbar_overlap` against `policy.min_rung_overlap` (0.15), never against `topup_weak_overlap`.
 - **One top-up per phase.** `topup_plan.json` is this phase's persisted decision; once its `reason` is anything other than `"planned"` the phase never gets a second one. A resumed run reuses the SAME saved plan rather than replanning; a layout change discovered after the segment already holds data keeps the partial samples (`reason: layout_changed`) instead of opening a second `topup_001_*` directory.
-- **Seeding never pulls.** A top-up continues each window from the newest `final_window_states/` export across its phase's whole ancestor chain (ordered by `export_seq`, a `time.time_ns()` write-order stamp — not directory name or mtime, which a copy can scramble), and asserts the seed's restraint centre/k and CVs match the top-up's own window table before using it. A missing/mismatched seed drops that window only; the top-up (never the campaign) ends on a runtime mismatch. No `epoch_window_map.csv` fails the phase closed.
+- **Seeding never pulls.** A top-up continues each window from the newest `final_window_states/` export across its phase's whole ancestor chain (ordered by `export_seq`, a `time.time_ns()` write-order stamp — not directory name or mtime, which a copy can scramble), and asserts the seed's restraint centre/k and CVs match the top-up's own window table before using it. Two distinct outcomes for two distinct failures: a window with a MISSING export is dropped from the top-up before launch (the top-up still runs for the rest); a restraint/CV MISMATCH found at runtime, or a corrupt/unreadable parent `index.json` (ruling 19, caught before launch but handled the same way), ends the WHOLE top-up (`reason: seed_mismatch`) — the campaign continues. No `epoch_window_map.csv` fails the phase closed before it starts.
+- **The allocator's own caps.** A deficit state's required top-up length is itself capped at 4x its current effective steps-worth of data (`MAX_STEP_MULTIPLE`), so a severely deficient state can stay above target after its one top-up even with budget to spare; `cap_too_small` fires when the phase's wall-hour budget itself affords less than one report interval, not when a deficit's own required length is small. With top-ups on, every active state's baseline segment is shortened to `max(1000, (1 - topup_max_fraction) * the topups-off uniform length)` steps — a healthy, non-patch state gets less baseline MD than it would with top-ups off; the withheld fraction funds the one top-up.
 - **Campaign-end rung overlap is now pairwise**, not full-union (commit `f7e007b`) — the full-union statistic reads ~2.7x too low on a large ladder (chignolin_7, 64 states: median 0.089 full vs 0.258 pairwise, 38/48 vs 0/48 below 0.15). The 0.15/0.25 rung thresholds are carried over unchanged and have **not** been re-measured on the pairwise scale. This updates the "λ ladder ... adaptive production" section's limitation below ("a rung gap is caught at campaign end, not mid-campaign"): with top-ups on, the per-epoch union diagnostics now reach the rung gate and `add_rung` mid-campaign too; with top-ups off, that limitation is unchanged.
 - Synthetic validation found no landscape with a targetable heterogeneous-deficit regime; top-ups are not shown to help on any tested metric except worst-case sigma on two of four landscapes. See `docs/atlas-md/developer/topups-todo.md` and the `-hh top-ups` help topic for the numbers and the real-MD test (chignolin_10) still to run.
 
@@ -374,18 +375,23 @@ Every state an action adds is now replicated onto every active rung
 states), and rung pairs get their own `"rung"` edges scored in ENERGY space — a CV
 histogram cannot see a rung gap, since two rungs at one centre overlap ~1 by construction,
 and gibbs-walk inflates their exchange acceptance to 91-95% against a true pairwise overlap
-of 0.24-0.30. The metric is the symmetric MBAR state overlap `sqrt(O_ij*O_ji)` from
-`gareus.mbar_analysis.ladder.mbar_state_overlap` (`O = diag(N) @ S` is asymmetric once the
-two states hold different sample counts; the geometric mean equals `O_ij` when they are
-equal, so the S3 pilot calibration 0.298/0.250/0.240/0.273 and the 0.15/0.25 thresholds
-stand). Two accepted limitations:
+of 0.24-0.30. The metric is the **pairwise** symmetric MBAR state overlap `sqrt(O_ij*O_ji)`,
+each pair evaluated on its own two-state sample set with the union `f_k` held fixed
+(`gareus.mbar_analysis.ladder.pairwise_state_overlap`, commit `f7e007b` — the campaign-end
+gate and `add_rung` used the full-union `mbar_state_overlap` matrix before that commit,
+which read ~2.7x too low on a large union; see the "Adaptive top-ups" section above). The
+S3 pilot calibration (0.298/0.250/0.240/0.273) and the 0.15/0.25 thresholds are carried
+over from the full-union scale and have **not** been re-measured on the pairwise scale.
+Two accepted limitations:
 
-- **A rung gap is caught at campaign end, not mid-campaign.** `add_rung` is proposed only
-  from the post-union diagnostics; the per-epoch/segment diagnostics run before
+- **A rung gap is caught at campaign end only when top-ups are off.** `add_rung` is
+  proposed from the post-union diagnostics; the per-epoch/segment diagnostics run before
   `build_union_state_mbar_inputs` and carry no rung O_ij, so their rung edges are warned
   `rung_overlap_unavailable` and skipped by the proposer (an unscored rung edge is never
   treated as a weak one — that would make the pre-union gate demand more sampling on every
-  ladder run). Feeding the epoch loop a per-epoch union solve is what would change this.
+  ladder run) — this still holds with top-ups off. With `--ap-topups` on, the per-epoch
+  union-MBAR diagnostics top-ups already run (see "Adaptive top-ups" above) give the gate
+  and `add_rung` real, pairwise rung overlap mid-campaign too, not only at campaign end.
 - **`retire_converged` is inert under an active ladder.** Every centre representative
   carries its own rungs and is therefore an articulation point of the rung-aware graph, so
   it can never be retired; a non-representative rung state earns no CV-overlap credit and

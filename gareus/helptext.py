@@ -1962,10 +1962,11 @@ campaign holds so far (all epochs/phases pooled, the same tICA-regime and
 pilot-directory filters the campaign-end union build uses) produces, per
 active state:
 
-    sigma_k         local free-energy uncertainty.  Read against same-rung
-                    spatial neighbours (layout neighbours at the same lambda
-                    rung); falls back to the state's cross-rung partners
-                    (same centre, other rung) only when it has none.
+    sigma_k         local free-energy uncertainty: the MAX (least-certain
+                    link) over the state's same-rung spatial neighbours
+                    (layout neighbours at the same lambda rung); falls back
+                    to its cross-rung partners (same centre, other rung)
+                    only when it has none.
     unconverged     per-state local split-halves drift test: that state's own
                     reduced-bias samples, first half vs second half, Welch z
                     with a Bonferroni correction over tested states and an
@@ -1980,37 +1981,50 @@ active state:
                     a CLI flag), never against ``--ap-topup-weak-overlap`` --
                     one rung threshold for the whole campaign.
 
-A state is a deficit when it is sampled, sigma_k exceeds
-``--ap-topup-target-sigma`` (default 0.10 kcal/mol), or its split-halves test
-flags it.  An edge below ``--ap-topup-weak-overlap`` (default 0.15) whose
-weaker endpoint is a deficit is a noise edge and gets topped along with the
-deficit set (up to ``--ap-topup-max-edge-attempts`` times, default 2, before
-it is treated as structural instead); an edge below threshold between two
-already-adequate endpoints, or one already tried out, is structural and is
-left for the bridge/add-state machinery, never for a top-up.  An edge that
-could not be measured at all (missing sample overlap, an unsampled endpoint)
-is never treated as weak -- not in this diagnostic, not in the quality gate,
-not in action proposals, not in reports.  A top-up run therefore reaches the
-per-epoch gate and ``add_rung`` mid-campaign with real rung overlap numbers;
+A state is a deficit when it is sampled AND (sigma_k exceeds
+``--ap-topup-target-sigma``, default 0.10 kcal/mol, OR its split-halves test
+flags it).  An edge below ``--ap-topup-weak-overlap`` (default 0.15) with
+either endpoint in the initial deficit set is a noise edge and gets topped
+along with the deficit set (up to ``--ap-topup-max-edge-attempts`` times,
+default 2, before it is treated as structural instead); an edge below
+threshold between two already-adequate endpoints, or one already tried out,
+is structural and is left for the bridge/add-state machinery, never for a
+top-up.  An edge that could not be measured at all (missing sample overlap,
+an unsampled endpoint) is never treated as weak -- not in this diagnostic,
+not in the quality gate, not in action proposals, not in reports.  A top-up
+run therefore reaches the per-epoch gate and ``add_rung`` mid-campaign with
+real rung overlap numbers;
 with top-ups off, a rung gap is still only ever caught at campaign end (no
 per-epoch union solve runs).
 
 The allocator
 ~~~~~~~~~~~~~
-Deficit states plus one layout partner per deficit (a same-rung spatial
-neighbour, or a cross-rung partner when it has none) form the patch.  Every
+Deficit states plus up to two layout partners per deficit (one same-rung
+spatial neighbour, falling back to a rung partner when it has no same-rung
+neighbour; and, independently, one rung partner) form the patch.  Every
 state in the patch runs the same number of extra steps L (lockstep, no
 per-state stagger): L is the smaller of (a) the steps the worst deficit needs
 to reach target under a 1/sqrt(N_eff) model and (b) the largest length the
 phase's wall-hour budget can afford, where the budget is
 ``--ap-topup-max-fraction`` (default 0.3) of the phase's un-shortened default
-wall-hours.  A required L below one report interval yields no top-up
-(``cap_too_small``).  A per-state calibration correction, learned from how
-each earlier top-up's realised sigma compared with its prediction, is
-clamped to [0.1, 2.0] and carried in ``topup_state.json``.  A top-up the MD
-pool skips outright is recorded ``pool_exhausted`` and never calibrated; one
-the pool clips short is calibrated against the steps it actually ran, not
-the planned length.
+wall-hours.  A required L for any one deficit state is itself capped at 4x
+that state's current effective steps-worth of data (``MAX_STEP_MULTIPLE``),
+so a severely deficient state can still be above target after its top-up
+even when the budget would have afforded more.  When the budget itself
+affords less than one report interval (b < one interval), no top-up runs
+(``cap_too_small``) -- this is a budget-size trigger, not a small-deficit
+one.  A per-state calibration correction, learned from how each earlier
+top-up's realised sigma compared with its prediction, is clamped to
+[0.1, 2.0] and carried in ``topup_state.json``.  A top-up the MD pool skips
+outright is recorded ``pool_exhausted`` and never calibrated; one the pool
+clips short is calibrated against the steps it actually ran, not the
+planned length.
+
+With top-ups on, the baseline segment itself is shortened to
+``max(1000, (1 - --ap-topup-max-fraction) * the topups-off uniform length)``
+steps per state, so every state -- not just the patch -- gets less baseline
+MD than it would with top-ups off; the withheld fraction is what funds the
+one top-up.
 
 One top-up per phase; where it lands
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2036,14 +2050,18 @@ Seeding: every segment (baseline or top-up) exports, on completion,
 window plus ``index.json`` recording each window's restraint centres/k, CVs,
 and an ``export_seq`` write-order stamp.  A top-up continues each of its
 windows from the newest parent export across the phase's whole ancestor
-chain (ordered by ``export_seq``, not directory name or mtime), asserting
-that the seed's restraint and CVs match the top-up's own window table before
-using it.  A window whose seed is missing or fails that assertion is dropped
-from the top-up before it starts (the deficit set shrinks; the top-up still
-runs for the rest); a mismatch discovered at runtime ends only that top-up,
-never the campaign.  There is no pull inside a top-up -- it is a pure
-continuation.  A top-up phase with no ``epoch_window_map.csv`` fails closed
-(``seed_mismatch``) rather than guessing a window-to-state mapping.
+chain (ordered by ``export_seq``, not directory name or mtime).  There is
+no pull inside a top-up -- it is a pure continuation.  Two distinct failure
+modes, with two distinct outcomes: a window with a MISSING export (no
+recorded final State for it in any candidate parent) is dropped from the
+top-up BEFORE it launches -- the deficit set shrinks and the top-up still
+runs for the rest (``_seedable_patch``).  A restraint/CV MISMATCH discovered
+at runtime, or a CORRUPT/unreadable ``index.json`` in any candidate parent
+(caught before launch, but treated the same way), ends the WHOLE top-up
+(``reason: seed_mismatch``); the campaign continues, and the next phase
+plans its own top-up normally.  A top-up phase with no
+``epoch_window_map.csv`` fails closed (``seed_mismatch``) before it starts,
+rather than guessing a window-to-state mapping.
 
 Cost
 ~~~~
@@ -2066,7 +2084,7 @@ uniform baseline.  Reported for information only: top-ups lower the worst
 per-state sigma on two of four landscapes (gated-barrier -8.4%, 20/20 seeds;
 slow-cv2-double-branch -1.3%, 19/20) but do not improve PMF RMSE on any
 landscape (gated-barrier is 7% worse).  Missing-bridge routing (an edge
-spanning a genuine gap is topped as structural, an intact layout's matching
+spanning a genuine gap is routed as structural, an intact layout's matching
 edge is not) passes 20/20.  The honest summary is that top-ups are not shown
 to help in this harness; a real-MD comparison (chignolin_10, not yet run) is
 the actual test.
