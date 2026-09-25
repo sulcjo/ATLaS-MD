@@ -1,6 +1,6 @@
 site_name: ATLaS-MD
-site_description: Adaptive Thermodynamic Landscape Sampling for molecular dynamics
-site_url: https://sulcjo.github.io/2026_peptide_sampler/
+site_description: OpenMM peptide conformational sampling with umbrella exchange, adaptive state placement and MBAR/PMF analysis
+site_url: https://sulcjo.github.io/ATLaS-MD/
 repo_name: sulcjo/ATLaS-MD
 repo_url: https://github.com/sulcjo/ATLaS-MD
 edit_uri: edit/main/docs/atlas-md/
@@ -42,6 +42,7 @@ markdown_extensions:
   - toc:
       permalink: true
 extra_javascript:
+  - javascripts/mathjax.js
   - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
 nav:
   - ATLaS-MD: index.md
