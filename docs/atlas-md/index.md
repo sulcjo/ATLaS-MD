@@ -14,14 +14,28 @@ It is research software built around an explicit scientific contract: sampled Ha
   <img src="assets/workflow.svg" alt="ATLaS-MD workflow" width="100%">
 </p>
 
-## How the pieces fit
+## Standard workflow
 
-| Stage | What you choose or get |
+1. **GENPEPT:** generate and rank candidate conformers.
+2. **Swarm:** run parallel exploratory simulations and collect sampling evidence.
+3. **CV selection:** choose collective variables (CVs) using the seed-bank and swarm evidence.
+4. **Adaptive epochs:** refine the umbrella-state layout and allocate sampling using epoch feedback.
+5. **Optional top-ups:** extend the run under the current regime when more sampling is needed, preserving phase and state provenance.
+6. **MBAR:** analyze the recorded states and samples, then inspect PMF, overlap, effective sample size (ESS), and reweighting diagnostics.
+
+This is the advertised end-to-end route; ATLaS-MD also supports simpler conventional-MD and manually specified-window runs.
+
+## Performance improvements
+
+| Optimization | Evidence and scope |
 | --- | --- |
-| Prepare | Peptide sequence or structure, solvent/system settings, and optional GENPEPT seeds |
-| Define states | One or two CVs, umbrella centers and force constants, temperature, and supported acceleration settings |
-| Sample | OpenMM trajectories, replica-exchange proposals, checkpoints, and phase-specific state maps |
-| Analyze | MBAR/PMF inputs plus overlap, effective-sample-size (ESS), and reweighting diagnostics |
+| Shared contact-sum calculation for CV1 and residual-torsion CV2 | **+14.6% node throughput** in a 236-context MPS production A/B, with equivalent bias energy and forces. |
+| Fewer Pep-GaMD force evaluations and barostat state reads | **~1.26× campaign throughput** in a measured in-campaign A/B. |
+| CUDA MPS for a high replica count | **2,307 vs 840 aggregate ns/day** at 236 replicas / 59 contexts per L40S, MPS on vs off (**2.75×** for that tested workload). |
+| Multi-GPU umbrella pulls | `--us-pull-device-index` spreads setup workers across GPUs; this affects startup work, not production MD step rate. |
+| PME stream choice | +8–11% in a no-MPS test; about −4% when enabled at 236 contexts with MPS. Measure against the intended regime. |
+
+See the [detailed throughput benchmark record](developer/gpu-throughput-benchmark-todo.md). These results are hardware- and workload-specific, not general speedup guarantees.
 
 The intended target and exactness limits are described in the [thermodynamic validity guide](guide/thermodynamic-validity.md); the [PMF validity guide](analysis/pmf-validity.md) covers checks required before interpreting a result.
 
