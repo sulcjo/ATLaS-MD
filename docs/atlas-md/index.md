@@ -14,14 +14,16 @@ It is research software built around an explicit scientific contract: sampled Ha
   <img src="assets/workflow.svg" alt="ATLaS-MD workflow" width="100%">
 </p>
 
-## How the pieces fit
+## Standard workflow
 
-| Stage | What you choose or get |
-| --- | --- |
-| Prepare | Peptide sequence or structure, solvent/system settings, and optional GENPEPT seeds |
-| Define states | One or two CVs, umbrella centers and force constants, temperature, and supported acceleration settings |
-| Sample | OpenMM trajectories, replica-exchange proposals, checkpoints, and phase-specific state maps |
-| Analyze | MBAR/PMF inputs plus overlap, effective-sample-size (ESS), and reweighting diagnostics |
+1. **GENPEPT:** generate and rank candidate conformers.
+2. **Swarm:** run parallel exploratory simulations and collect sampling evidence.
+3. **CV selection:** choose collective variables (CVs) using the seed-bank and swarm evidence.
+4. **Adaptive epochs:** refine the umbrella-state layout and allocate sampling using epoch feedback.
+5. **Optional top-ups:** extend the run under the current regime when more sampling is needed, preserving phase and state provenance.
+6. **MBAR:** analyze the recorded states and samples, then inspect PMF, overlap, effective sample size (ESS), and reweighting diagnostics.
+
+This is the advertised end-to-end route; ATLaS-MD also supports simpler conventional-MD and manually specified-window runs.
 
 The intended target and exactness limits are described in the [thermodynamic validity guide](guide/thermodynamic-validity.md); the [PMF validity guide](analysis/pmf-validity.md) covers checks required before interpreting a result.
 
