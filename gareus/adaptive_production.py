@@ -3420,10 +3420,10 @@ def build_union_state_mbar_inputs(
 
     # Per-state equilibration-discard + autocorrelation subsampling.
     # Group row indices by sampled_state_id, thin each group's cv_A trace with
-    # equilibrated_subsample_indices, then rebuild sample_rows from kept indices.
+    # equilibrated_subsample, then rebuild sample_rows from kept indices.
     # All downstream numpy arrays are derived from sample_rows so alignment is
     # preserved automatically.
-    from .mbar_subsample import equilibrated_subsample_indices as _esi  # noqa: PLC0415
+    from .mbar_subsample import equilibrated_subsample as _es  # noqa: PLC0415
     _state_to_indices: Dict[int, List[int]] = {}
     for _gi, _row in enumerate(sample_rows):
         _sid = int(_row["sampled_state_id"])
@@ -3432,9 +3432,15 @@ def build_union_state_mbar_inputs(
     _subsample_counts: Dict[str, Any] = {}
     for _sid, _idx_list in _state_to_indices.items():
         _trace = np.asarray([float(sample_rows[i]["cv_A"]) for i in _idx_list], dtype=np.float64)
-        _keep = _esi(_trace)
+        _res = _es(_trace)
+        _keep = np.asarray(_res.indices, dtype=np.int64)
         _kept_global.extend(_idx_list[k] for k in _keep.tolist())
-        _subsample_counts[str(_sid)] = {"raw": len(_idx_list), "kept": int(len(_keep))}
+        _raw, _t0, _kept = len(_idx_list), int(_res.t0), int(len(_keep))
+        _g = float(_res.g)
+        if not math.isfinite(_g) or _g < 1.0:
+            _g = max(1.0, (_raw - _t0) / max(1, _kept))
+        _subsample_counts[str(_sid)] = {"raw": _raw, "t0": _t0, "kept": _kept, "g": _g,
+                                        "status": str(_res.status)}
     sample_rows = [sample_rows[i] for i in sorted(_kept_global)]
 
     cv_values = np.asarray([float(r["cv_A"]) for r in sample_rows], dtype=np.float64)
