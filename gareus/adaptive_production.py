@@ -5157,16 +5157,29 @@ def _state_rows_by_id(diagnostics: Optional[Dict[str, Any]]) -> Dict[int, Dict[s
     return out
 
 
+def _edge_is_measured_weak(edge: Dict[str, Any], policy: AdaptiveDecisionPolicy) -> bool:
+    """Weak only if MEASURED below threshold; an unmeasured edge is never weak.
+
+    Rung edges are judged on the energy-space ``mbar_overlap`` alone (their CV
+    overlap is ~1 by construction and gibbs-walk inflates their acceptance).
+    """
+    if str(edge.get("edge_type")) == "rung":
+        value = edge.get("mbar_overlap")
+        return value is not None and float(value) < float(policy.topup_weak_overlap)
+    overlap = edge.get("overlap")
+    weak = overlap is not None and float(overlap) < float(policy.target_overlap)
+    acc = edge.get("exchange_acceptance")
+    if acc is not None and float(acc) < float(policy.min_exchange_acceptance):
+        weak = True
+    return weak
+
+
 def _weak_edge_touch_counts(diagnostics: Optional[Dict[str, Any]], policy: AdaptiveDecisionPolicy) -> Dict[int, int]:
     counts: Dict[int, int] = {}
     if not isinstance(diagnostics, dict):
         return counts
     for edge in diagnostics.get("edges", []) or []:
-        overlap = edge.get("overlap")
-        acc = edge.get("exchange_acceptance")
-        weak = overlap is None or float(overlap) < float(policy.target_overlap)
-        if acc is not None:
-            weak = weak or float(acc) < float(policy.min_exchange_acceptance)
+        weak = _edge_is_measured_weak(edge, policy)
         if weak:
             for key in ("state_i", "state_j"):
                 try:
@@ -8565,12 +8578,7 @@ def evaluate_adaptive_convergence_gate(
 
     weak_edges: List[Dict[str, Any]] = []
     for edge in diagnostics.get("edges", []) or []:
-        overlap = edge.get("overlap")
-        acc = edge.get("exchange_acceptance")
-        weak = overlap is None or float(overlap) < float(policy.target_overlap)
-        if acc is not None and float(acc) < float(policy.min_exchange_acceptance):
-            weak = True
-        if weak:
+        if _edge_is_measured_weak(edge, policy):
             weak_edges.append(edge)
     if len(weak_edges) > int(policy.convergence_max_weak_edges):
         continue_reasons.append(
