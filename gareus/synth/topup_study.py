@@ -24,8 +24,9 @@ Model (all choices fixed up front, identical for both arms):
   then the allocator's single top-up with budget cap * epoch hours (as
   ``_topup_plan_for_phase``); unused hours roll into the next epoch (the live pool),
   and both arms spend what is left after epoch 3 in one final all-state segment, so the
-  arms use equal modelled wall hours up to one report interval. Arm B carries the
-  calibration state (correction, edge attempts, warm-start f) across epochs like the driver.
+  arms use equal modelled wall hours up to one 1000-step all-state quantum (the driver's
+  ``_quantized_extra_steps``). Arm B carries the calibration state (correction, edge
+  attempts, warm-start f) across epochs like the driver.
 """
 from __future__ import annotations
 
@@ -39,26 +40,15 @@ from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
-from .ess import tau_int
 from .landscapes import LANDSCAPES, Landscape
-from .oracle import LOW_F_THRESHOLD_KBT, reference_pmf
-from .sampler import BIAS, Window, boost_dv, sample_window_exact
+from .topup_model import (KT_KCAL, K_WINDOW, N_EPOCHS, N_GPUS, REPORT_INTERVAL, RUNGS, TIMESTEP_FS,  # noqa: F401
+                          _Campaign, _diagnose, _ladder, _layout, _partners_in, _pmf_rmse,
+                          _reduced_potentials, _sample_segment, _Streams, _write_union_npz)
 
-RUNGS = (0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0)
-K_WINDOW = 50.0
-SPACING_SIGMA = 2.0
-EDGE_MARGIN = 0.05
-N_EPOCHS = 3
-REPORT_INTERVAL = 5000
-TIMESTEP_FS = 4.0
-N_GPUS = 4
-TEMPERATURE_K = 300.0
-KT_KCAL = 0.0019872041 * TEMPERATURE_K
-BLOCK = 256
 HETEROGENEOUS = ("rugged-2d", "gated-barrier", "slow-cv2-double-branch")
 HOMOGENEOUS = ("harmonic-bowl",)
 BRIDGE_LANDSCAPE = "gated-barrier"
-PMF_BINS = 60
+SEGMENT_QUANTUM = 1000
 
 
 @dataclass(frozen=True)
@@ -72,150 +62,6 @@ class ArmResult:
     n_sigma_nan: int = 0
     epochs: tuple = ()
 
-
-def _axis(lo: float, hi: float) -> np.ndarray:
-    a, b = lo + EDGE_MARGIN * (hi - lo), hi - EDGE_MARGIN * (hi - lo)
-    n = int(round((b - a) / (SPACING_SIGMA / math.sqrt(K_WINDOW)))) + 1
-    return np.linspace(a, b, max(2, n))
-
-
-def _ladder(landscape: Landscape, remove_bridge: bool = False) -> List[Window]:
-    """Centres x rungs, ordered centre-major. ``remove_bridge`` drops the gated pass.
-
-    The bridge is the CV2 row nearest gated-barrier's low-F pass (cv2 = 0.2), removed in
-    the two CV1 columns flanking the ridge (cv1 = 0.5) on every rung: the cross-ridge
-    edge then has weak but nonzero overlap (the ridge's own CV2 flanks still leak).
-    """
-    c1s, c2s = _axis(*landscape.cv1_bounds), _axis(*landscape.cv2_bounds)
-    drop = set()
-    if remove_bridge:
-        row = float(c2s[np.argmin(np.abs(c2s - 0.2))])
-        cols = sorted(c1s, key=lambda c: abs(c - 0.5))[:2]
-        drop = {(float(c), row) for c in cols}
-    return [Window(float(c1), K_WINDOW, float(c2), K_WINDOW, lam=float(lam))
-            for c1 in c1s for c2 in c2s if (float(c1), float(c2)) not in drop for lam in RUNGS]
-
-
-def _layout(windows: Sequence[Window]):
-    """Edges, same-rung neighbours and rung partners, built exactly as the driver builds them."""
-    from ..adaptive_production import AdaptiveDecisionPolicy, WindowStateRegistry, build_geometry_edges
-    from ..layout_neighbours import other_rung_same_centre, same_rung_neighbours, spatial_neighbour_pairs
-    registry = WindowStateRegistry()
-    for w in windows:   # the driver's k is kcal/mol/CV^2
-        registry.add_state(primary_center=w.center1, primary_k=w.k1 * KT_KCAL, secondary_center=w.center2,
-                           secondary_k=w.k2 * KT_KCAL, gamd_lambda=w.lam, source="synthetic")
-    policy = AdaptiveDecisionPolicy(topups_enabled=True)
-    edges = [(a, b) for a, b, _t, _d in build_geometry_edges(registry, policy)]
-    c1 = [w.center1 for w in windows]; c2 = [w.center2 for w in windows]; lam = [w.lam for w in windows]
-    pairs = spatial_neighbour_pairs(c1, c2, lam, [w.k1 * KT_KCAL for w in windows],
-                                    [w.k2 * KT_KCAL for w in windows], TEMPERATURE_K)
-    nb, rp = same_rung_neighbours(pairs, lam), other_rung_same_centre(c1, c2, lam)
-    n = len(windows)
-    return edges, {w: nb.get(w, []) for w in range(n)}, {w: rp.get(w, []) for w in range(n)}, policy
-
-
-class _Streams:
-    """Per-window i.i.d. draw streams, blocked so sample i never depends on how draws were chunked."""
-
-    def __init__(self, landscape: Landscape, windows: Sequence[Window], seed: int):
-        self._ls, self._w, self._seed, self._blocks = landscape, windows, int(seed), {}
-
-    def take(self, w: int, start: int, n: int) -> np.ndarray:
-        first, last = start // BLOCK, (start + n - 1) // BLOCK
-        for b in range(first, last + 1):
-            if (w, b) not in self._blocks:
-                rng = np.random.default_rng([self._seed, w, b])
-                self._blocks[(w, b)] = sample_window_exact(self._ls, self._w[w], BLOCK, rng=rng)
-        pooled = np.concatenate([self._blocks[(w, b)] for b in range(first, last + 1)])
-        off = start - first * BLOCK
-        return pooled[off:off + n]
-
-
-class _Campaign:
-    def __init__(self, n_states: int):
-        self.steps = np.zeros(n_states)
-        self.eff = np.zeros(n_states)
-        self.kept = np.zeros(n_states, dtype=np.int64)
-        self.rows_w: List[np.ndarray] = []
-        self.rows_x: List[np.ndarray] = []
-        self.hours = 0.0
-        self.topup_hours = 0.0
-
-
-def _partners_in(members, neighbours, rung_partners) -> Dict[int, int]:
-    mset = set(members)
-    return {w: len((set(neighbours.get(w, [])) | set(rung_partners.get(w, []))) & mset) for w in members}
-
-
-def _sample_segment(landscape, windows, members, length, streams, n_partners, camp, table) -> float:
-    """One lockstep segment: every member advances ``length`` steps; returns its wall hours."""
-    from ..adaptive.throughput import wall_hours
-    for w in members:
-        g = 1.0 + 2.0 * tau_int(landscape, windows[w], n_partners=n_partners[w])
-        camp.steps[w] += length
-        camp.eff[w] += length / (REPORT_INTERVAL * g)
-        new = int(math.floor(camp.eff[w] + 1e-9)) - int(camp.kept[w])
-        if new > 0:
-            camp.rows_x.append(streams.take(w, int(camp.kept[w]), new))
-            camp.rows_w.append(np.full(new, w, dtype=np.int64))
-            camp.kept[w] += new
-    hours = wall_hours(int(length), len(members), TIMESTEP_FS, N_GPUS, table)
-    camp.hours += hours
-    return hours
-
-
-def _reduced_potentials(landscape, windows, x: np.ndarray) -> np.ndarray:
-    u = np.empty((x.shape[0], len(windows)))
-    for k, win in enumerate(windows):
-        u[:, k] = BIAS(win, x[:, 0], x[:, 1]) + boost_dv(landscape, win, x[:, 0], x[:, 1])
-    return u
-
-
-def _write_union_npz(path: Path, landscape, camp: _Campaign, windows) -> dict:
-    """The union NPZ format read by ``union_diagnostics_from_npz``; returns subsample counts."""
-    x = np.concatenate(camp.rows_x) if camp.rows_x else np.empty((0, 2))
-    w = np.concatenate(camp.rows_w) if camp.rows_w else np.empty(0, dtype=np.int64)
-    np.savez(path, umbrella_reduced_bias_nk=_reduced_potentials(landscape, windows, x),
-             state_ids=np.arange(len(windows)), sampled_state_ids=w, cv1=x[:, 0], cv2=x[:, 1])
-    counts = {}
-    for k in range(len(windows)):
-        raw = int(camp.steps[k] // REPORT_INTERVAL)
-        g = raw / camp.eff[k] if camp.eff[k] > 0 else 1.0
-        counts[str(k)] = {"raw": raw, "t0": 0, "kept": int(camp.kept[k]), "g": float(g), "status": "subsampled"}
-    return counts
-
-
-def _diagnose(tmp: Path, landscape, camp, windows, layout, f_init):
-    """The driver's ``_phase_union_diagnostics`` call: sigma against same-rung neighbours, rung fallback."""
-    from ..adaptive.union_diagnostics import union_diagnostics_from_npz
-    edges, neighbours, rung_partners, policy = layout
-    path = Path(tmp) / "union.npz"
-    counts = _write_union_npz(path, landscape, camp, windows)
-    sigma_nb = {w: neighbours.get(w) or rung_partners.get(w, []) for w in range(len(windows))}
-    return union_diagnostics_from_npz(path, edges, kt_kcal=KT_KCAL, subsample_counts=counts,
-                                      min_effect_kcal=float(policy.topup_min_effect), f_init=f_init or None,
-                                      sigma_neighbours=sigma_nb)
-
-
-def _pmf_rmse(landscape, windows, camp, f_kT: Dict[int, float]) -> float:
-    """Low-F-weighted RMSE (kBT) of the union-MBAR CV1 PMF vs the reference PMF."""
-    from scipy.special import logsumexp
-    x = np.concatenate(camp.rows_x)
-    n_k = np.bincount(np.concatenate(camp.rows_w), minlength=len(windows))
-    act = [k for k in range(len(windows)) if n_k[k] > 0 and k in f_kT]
-    u = _reduced_potentials(landscape, [windows[k] for k in act], x)
-    f = np.array([f_kT[k] for k in act])
-    log_w = -logsumexp(f[None, :] - u, b=n_k[act][None, :], axis=1)
-    bins = np.linspace(*landscape.cv1_bounds, PMF_BINS + 1)
-    dens, _ = np.histogram(x[:, 0], bins=bins, weights=np.exp(log_w - log_w.max()))
-    raw, _ = np.histogram(x[:, 0], bins=bins)
-    xr, pr = reference_pmf(landscape, axis="cv1")
-    ref = np.interp(0.5 * (bins[:-1] + bins[1:]), xr, pr)
-    use = (raw > 0) & (dens > 0) & (ref <= LOW_F_THRESHOLD_KBT)
-    diff = -np.log(dens[use]) - ref[use]
-    wgt = np.exp(-ref[use]); wgt /= wgt.sum()
-    diff -= np.sum(wgt * diff)
-    return float(np.sqrt(np.sum(wgt * diff ** 2)))
 
 
 def _plan_record(plan, diag_after) -> dict:
@@ -250,7 +96,8 @@ def run_arm(landscape: Landscape, *, arm: str, seed: int, wall_hours_budget: flo
     carry, structural, epochs = 0.0, set(), []
 
     def all_state_segment(hours: float) -> float:
-        steps = int(hours / per_step_all // REPORT_INTERVAL) * REPORT_INTERVAL
+        # floor to the driver's segment quantum (_quantized_extra_steps: 1000 steps), never overspending
+        steps = int(hours / per_step_all // SEGMENT_QUANTUM) * SEGMENT_QUANTUM
         return _sample_segment(landscape, windows, ids, steps, streams, full_np, camp, table) if steps else 0.0
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -309,61 +156,119 @@ def _one_sided_p(b: Sequence[float], a: Sequence[float]) -> float:
     return float(wilcoxon(b, a, alternative="less").pvalue)
 
 
+WIN_MARGIN = 0.01          # a "win" needs B more than 1 % below A (ruling 24)
+SIGMA_BAND = (1.5, 2.0)    # arm A's median max sigma, in units of the top-up target, at the frozen budget
+CAL_SEEDS = (100, 101, 102)  # calibration seeds, disjoint from the study's seeds 0..n-1
+# Frozen by `calibrate_budget` (arm A only, CAL_SEEDS) before any arm B ran; recorded with the
+# calibration trace in topup_study.json (``--recalibrate`` reproduces these exactly).
+FROZEN_BUDGET_HOURS = {
+    "rugged-2d": 0.3270618273826279,
+    "gated-barrier": 0.7874790695726125,
+    "slow-cv2-double-branch": 0.3360239363932954,
+    "harmonic-bowl": 0.267254855639931,
+}
+
+
+def wins(b: Sequence[float], a: Sequence[float]) -> int:
+    return int(sum(1 for x, y in zip(b, a) if x < (1.0 - WIN_MARGIN) * y))
+
+
+def calibrate_budget(landscape: Landscape, *, target_sigma: float, band=SIGMA_BAND, seeds=CAL_SEEDS,
+                     start_hours: float = 5.0, max_iter: int = 8):
+    """Wall-hour budget at which arm A's median max sigma sits in ``band`` x target (arm A only).
+
+    sigma ~ 1/sqrt(hours), so each step rescales hours by (median / (mid * target))^2.
+    Returns (hours, trace).
+    """
+    hours, mid, trace = float(start_hours), 0.5 * (band[0] + band[1]), []
+    for _ in range(max_iter):
+        med = float(np.median([run_arm(landscape, arm="uniform", seed=s, wall_hours_budget=hours).max_sigma
+                               for s in seeds]))
+        trace.append({"hours": hours, "median_max_sigma": med, "ratio": med / target_sigma})
+        if band[0] <= med / target_sigma <= band[1]:
+            return hours, trace
+        hours *= (med / (mid * target_sigma)) ** 2
+    raise RuntimeError(f"budget calibration did not converge for {landscape.name}: {trace}")
+
+
 def _landscape_summary(name: str, a: List[ArmResult], b: List[ArmResult], cap: float) -> dict:
     ma = {k: float(np.median([getattr(r, k) for r in a])) for k in ("max_sigma", "pmf_rmse")}
     mb = {k: float(np.median([getattr(r, k) for r in b])) for k in ("max_sigma", "pmf_rmse")}
-    p_sig = _one_sided_p([r.max_sigma for r in b], [r.max_sigma for r in a])
-    p_rmse = _one_sided_p([r.pmf_rmse for r in b], [r.pmf_rmse for r in a])
+    sa, sb = [r.max_sigma for r in a], [r.max_sigma for r in b]
+    ra, rb = [r.pmf_rmse for r in a], [r.pmf_rmse for r in b]
     out = {"kind": "homogeneous" if name in HOMOGENEOUS else "heterogeneous", "n_states": a[0].n_states,
-           "median_uniform": ma, "median_topup": mb, "p_max_sigma": p_sig, "p_pmf_rmse": p_rmse,
+           "median_uniform": ma, "median_topup": mb, "p_max_sigma": _one_sided_p(sb, sa),
+           "p_pmf_rmse": _one_sided_p(rb, ra), "wins_max_sigma": wins(sb, sa), "wins_pmf_rmse": wins(rb, ra),
            "max_topup_md_fraction": float(max(r.topup_md_fraction for r in b)),
            "hours_uniform": [r.hours_used for r in a], "hours_topup": [r.hours_used for r in b],
-           "per_seed": [{"seed": s, "uniform": [ra.max_sigma, ra.pmf_rmse], "topup": [rb.max_sigma, rb.pmf_rmse],
-                         "topup_md_fraction": rb.topup_md_fraction, "epochs": list(rb.epochs)}
-                        for s, (ra, rb) in enumerate(zip(a, b))]}
+           "per_seed": [{"seed": s, "uniform": [x.max_sigma, x.pmf_rmse], "topup": [y.max_sigma, y.pmf_rmse],
+                         "topup_md_fraction": y.topup_md_fraction, "epochs": list(y.epochs)}
+                        for s, (x, y) in enumerate(zip(a, b))]}
+    rel = {k: (mb[k] - ma[k]) / ma[k] for k in ma}
+    out["rel_diff"] = rel
     if out["kind"] == "homogeneous":
-        rel = abs(mb["max_sigma"] - ma["max_sigma"]) / ma["max_sigma"]
-        out["rel_diff_max_sigma"] = rel
-        out["pass"] = bool(rel < 0.05 and out["max_topup_md_fraction"] <= cap + 1e-9)
+        within = out["max_topup_md_fraction"] <= cap + 1e-9
+        out["pass_max_sigma"] = bool(abs(rel["max_sigma"]) < 0.05 and within)
+        out["pass_pmf_rmse"] = bool(abs(rel["pmf_rmse"]) < 0.05 and within)
     else:
-        out["pass"] = bool(mb["max_sigma"] < ma["max_sigma"] and mb["pmf_rmse"] < ma["pmf_rmse"] and p_sig < 0.05)
-        out["pass_strict_both_p"] = bool(out["pass"] and p_rmse < 0.05)
+        for k, p_key in (("max_sigma", "p_max_sigma"), ("pmf_rmse", "p_pmf_rmse")):
+            out[f"pass_{k}"] = bool(mb[k] < (1.0 - WIN_MARGIN) * ma[k] and out[p_key] < 0.05)
+    out["pass"] = bool(out["pass_max_sigma"] and out["pass_pmf_rmse"])
     return out
 
 
 def _bridge_summary(n_seeds: int, budget: float) -> dict:
+    """Two-sided: an edge is routed structural with the gap, and none is routed without it."""
     ls = LANDSCAPES[BRIDGE_LANDSCAPE]
     cut = [run_arm(ls, arm="topup", seed=s, wall_hours_budget=budget, remove_bridge=True) for s in range(n_seeds)]
     whole = [run_arm(ls, arm="topup", seed=s, wall_hours_budget=budget) for s in range(n_seeds)]
     topped = sum(1 for r in cut for e in r.epochs if "plan" in e
                  and set(map(tuple, e["plan"]["weak_edges_topped"])) & set(map(tuple, e["plan"]["structural_edges"])))
-    return {"landscape": BRIDGE_LANDSCAPE, "seeds_routed_with_gap": sum(bool(r.structural_routed) for r in cut),
+    return {"landscape": BRIDGE_LANDSCAPE, "budget_hours": budget, "n_seeds": n_seeds,
+            "seeds_routed_with_gap": sum(bool(r.structural_routed) for r in cut),
             "seeds_routed_without_gap": sum(bool(r.structural_routed) for r in whole),
             "routed_edges_with_gap": sorted({e for r in cut for e in r.structural_routed}),
             "routed_edges_without_gap": sorted({e for r in whole for e in r.structural_routed}),
-            "epochs_topping_a_routed_edge": topped, "n_seeds": n_seeds,
-            "pass": bool(all(r.structural_routed for r in cut) and topped == 0)}
+            "epochs_topping_a_routed_edge": topped,
+            "pass": bool(all(r.structural_routed for r in cut) and not any(r.structural_routed for r in whole)
+                         and topped == 0)}
 
 
-def run_study(landscapes: Sequence[str], *, n_seeds: int = 20, out: Path, wall_hours_budget: float = 5.0,
-              bridge: bool = False) -> dict:
-    """Both arms x ``n_seeds`` per landscape; writes ``<out>/topup_study.json`` and returns the summary."""
+def _write(out: Path, doc: dict) -> None:
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "topup_study.json").write_text(json.dumps(doc, indent=1, default=str))
+
+
+def run_study(landscapes: Sequence[str], *, n_seeds: int = 20, out: Path,
+              budgets: Optional[Dict[str, float]] = None, bridge: bool = False) -> dict:
+    """Both arms x ``n_seeds`` per landscape; writes ``<out>/topup_study.json`` and returns the summary.
+
+    Budgets not given are calibrated from arm A alone (``calibrate_budget``) and written to
+    the JSON before any arm B campaign runs.
+    """
     from ..adaptive_production import AdaptiveDecisionPolicy
-    cap = float(AdaptiveDecisionPolicy(topups_enabled=True).topup_max_fraction)
+    policy = AdaptiveDecisionPolicy(topups_enabled=True)
+    cap, target = float(policy.topup_max_fraction), float(policy.topup_target_sigma)
+    out = Path(out)
+    names = list(landscapes) + ([BRIDGE_LANDSCAPE] if bridge and BRIDGE_LANDSCAPE not in landscapes else [])
+    frozen, calibration = dict(budgets or {}), {}
+    for name in names:
+        if name not in frozen:
+            frozen[name], calibration[name] = calibrate_budget(LANDSCAPES[name], target_sigma=target)
+    meta = {"n_seeds": n_seeds, "n_epochs": N_EPOCHS, "n_gpus": N_GPUS, "report_interval": REPORT_INTERVAL,
+            "timestep_fs": TIMESTEP_FS, "kt_kcal": KT_KCAL, "rungs": list(RUNGS), "k_window_kT": K_WINDOW,
+            "target_sigma_kcal": target, "sigma_band_x_target": list(SIGMA_BAND), "win_margin": WIN_MARGIN,
+            "frozen_budget_hours": frozen, "budget_calibration_arm_A_only": calibration}
+    _write(out, {"meta": meta, "landscapes": {}})          # frozen before any arm B runs
     summary: Dict[str, dict] = {}
     for name in landscapes:
-        ls = LANDSCAPES[name]
-        a = [run_arm(ls, arm="uniform", seed=s, wall_hours_budget=wall_hours_budget) for s in range(n_seeds)]
-        b = [run_arm(ls, arm="topup", seed=s, wall_hours_budget=wall_hours_budget) for s in range(n_seeds)]
-        summary[name] = _landscape_summary(name, a, b, cap)
+        ls, h = LANDSCAPES[name], frozen[name]
+        a = [run_arm(ls, arm="uniform", seed=s, wall_hours_budget=h) for s in range(n_seeds)]
+        b = [run_arm(ls, arm="topup", seed=s, wall_hours_budget=h) for s in range(n_seeds)]
+        summary[name] = {"budget_hours": h, **_landscape_summary(name, a, b, cap)}
     if bridge:
-        summary["structural_gap"] = _bridge_summary(n_seeds, wall_hours_budget)
-    out = Path(out)
-    out.mkdir(parents=True, exist_ok=True)
-    meta = {"n_seeds": n_seeds, "wall_hours_budget": wall_hours_budget, "n_epochs": N_EPOCHS, "n_gpus": N_GPUS,
-            "report_interval": REPORT_INTERVAL, "timestep_fs": TIMESTEP_FS, "kt_kcal": KT_KCAL,
-            "rungs": list(RUNGS), "k_window_kT": K_WINDOW}
-    (out / "topup_study.json").write_text(json.dumps({"meta": meta, "landscapes": summary}, indent=1, default=str))
+        summary["structural_gap"] = _bridge_summary(n_seeds, frozen[BRIDGE_LANDSCAPE])
+    _write(out, {"meta": meta, "landscapes": summary})
     return summary
 
 
@@ -371,21 +276,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--n-seeds", type=int, default=20)
     p.add_argument("--out", type=Path, required=True)
-    p.add_argument("--budget-hours", type=float, default=5.0)
     p.add_argument("--landscapes", nargs="+", default=list(HETEROGENEOUS + HOMOGENEOUS), choices=sorted(LANDSCAPES))
+    p.add_argument("--recalibrate", action="store_true", help="ignore FROZEN_BUDGET_HOURS and calibrate from arm A")
     p.add_argument("--no-bridge", action="store_true", help="skip the structural-gap scenario")
     a = p.parse_args(argv)
-    summary = run_study(a.landscapes, n_seeds=a.n_seeds, out=a.out, wall_hours_budget=a.budget_hours,
-                        bridge=not a.no_bridge)
+    summary = run_study(a.landscapes, n_seeds=a.n_seeds, out=a.out, bridge=not a.no_bridge,
+                        budgets=None if a.recalibrate else FROZEN_BUDGET_HOURS)
     for name, s in summary.items():
         if name == "structural_gap":
             print(f"{name}: routed {s['seeds_routed_with_gap']}/{s['n_seeds']} with gap, "
                   f"{s['seeds_routed_without_gap']}/{s['n_seeds']} without; pass={s['pass']}")
             continue
-        print(f"{name} ({s['kind']}): max sigma A {s['median_uniform']['max_sigma']:.4f} B "
-              f"{s['median_topup']['max_sigma']:.4f} (p={s['p_max_sigma']:.3g}); PMF RMSE A "
-              f"{s['median_uniform']['pmf_rmse']:.4f} B {s['median_topup']['pmf_rmse']:.4f} "
-              f"(p={s['p_pmf_rmse']:.3g}); pass={s['pass']}")
+        print(f"{name} ({s['kind']}, {s['budget_hours']:.3f} h): max sigma A {s['median_uniform']['max_sigma']:.4f} "
+              f"B {s['median_topup']['max_sigma']:.4f} (p={s['p_max_sigma']:.3g}, wins {s['wins_max_sigma']}) "
+              f"pass={s['pass_max_sigma']}; PMF RMSE A {s['median_uniform']['pmf_rmse']:.4f} "
+              f"B {s['median_topup']['pmf_rmse']:.4f} (p={s['p_pmf_rmse']:.3g}, wins {s['wins_pmf_rmse']}) "
+              f"pass={s['pass_pmf_rmse']}")
     return 0
 
 
