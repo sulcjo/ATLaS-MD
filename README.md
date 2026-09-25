@@ -35,14 +35,30 @@ A run defines the peptide system and CVs, builds biased thermodynamic states, pr
 | **MBAR-ready storage** | Per-sample CVs, energies, state mappings, exchange records, and phase-local Hamiltonian metadata |
 | **Reproducibility** | Checkpoints, manifests, source/input hashes, segment tracking, and restart-safe output layout |
 
-## What a run does
+## Standard workflow
 
-1. **Build the system.** Prepare a peptide in explicit solvent, optionally using GENPEPT conformers and hydrogen-mass repartitioning (HMR).
-2. **Define the landscape coordinates.** Select one or two collective variables (CVs) and place umbrella states over the region to explore.
-3. **Sample and exchange.** Run OpenMM replicas with conventional MD or supported GaMD/Pep-GaMD modes; optional adaptive stages refine state placement before a separately identified production phase.
-4. **Audit and analyze.** Preserve per-sample CVs, state assignments, energies, exchanges, checkpoints and provenance for MBAR/PMF analysis and overlap/ESS diagnostics.
+1. **GENPEPT seeding.** Generate and rank candidate peptide conformers.
+2. **Swarm exploration.** Run a parallel ensemble of simulations to gather exploratory sampling data.
+3. **CV selection.** Select the CVs from the available seed-bank and swarm evidence, before committing to the production state layout.
+4. **Adaptive epochs.** Iteratively refine and allocate umbrella states using epoch feedback.
+5. **Optional top-ups.** Extend sampling under the current regime when more data are needed; keep the regime and phase provenance explicit.
+6. **MBAR analysis.** Reconstruct state weights and assess PMFs alongside overlap, effective sample size (ESS), and reweighting diagnostics.
 
-New users can begin with the [quickstart](docs/atlas-md/start/quickstart.md), then read [how CVs and windows work](docs/atlas-md/guide/collective-variables.md) and the [analysis validity checks](docs/atlas-md/analysis/pmf-validity.md).
+ATLaS-MD also supports simpler workflows, including conventional MD and manually specified windows. New users can begin with the [quickstart](docs/atlas-md/start/quickstart.md), then read [how CVs and windows work](docs/atlas-md/guide/collective-variables.md) and the [analysis validity checks](docs/atlas-md/analysis/pmf-validity.md).
+
+## Performance work
+
+The current implementation includes measured optimizations, with gains that depend on the workload and hardware:
+
+| Optimization | Measured scope |
+|---|---|
+| Reuse the contact sum shared by CV1 and the residual-torsion CV2 force | **+14.6% node throughput** in the recorded 236-context MPS production A/B; the bias energy and forces remain equivalent to the split layout. |
+| Remove a redundant all-groups force evaluation in the Pep-GaMD integrator and reduce barostat state reads | **~1.26× campaign throughput** in the recorded in-campaign A/B. |
+| Use CUDA MPS for many replicas | At 236 production replicas (59 contexts per L40S), **2,307 vs 840 aggregate ns/day** with MPS on vs off (**2.75×** in that tested run). This is a measured operating point, not a universal scaling promise. |
+| Distribute umbrella start-pull workers across GPUs | `--us-pull-device-index 0,1,2,3` spreads this setup phase across the selected devices; it targets startup time, not MD steps/s. |
+| Tune PME stream for the execution regime | Enabling it gave **+8–11%** without MPS in one measured run, but was about **4% slower** at 236 contexts with MPS. The right setting depends on the production configuration. |
+
+The [throughput benchmark record](docs/atlas-md/developer/gpu-throughput-benchmark-todo.md) includes the workload, controls, and measured comparisons. CUDA Graphs and MIG are not listed as shipped optimizations.
 
 ## Scientific contract
 
