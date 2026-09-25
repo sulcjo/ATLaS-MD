@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/atlas-md/assets/atlas-md-hero.webp" alt="ATLaS-MD: Adaptive Topological Landscape Sampling MD" width="100%">
+  <img src="docs/atlas-md/assets/atlas-md-hero.webp" alt="ATLaS-MD: Adaptive Topological Landscape Sampling" width="100%">
 </p>
 
 <p align="center">
@@ -12,12 +12,12 @@
 </p>
 
 <p align="center">
-  <strong>Adaptive Topological Landscape Sampling MD</strong>
+  <strong>Adaptive Topological Landscape Sampling for Molecular Dynamics</strong>
 </p>
 
-ATLaS-MD is an OpenMM-based peptide sampling framework for explicit-solvent umbrella sampling, replica exchange, GaMD/Pep-GaMD acceleration, adaptive state placement, and MBAR-ready analysis.
+ATLaS-MD (Adaptive Topological Landscape Sampling) is an OpenMM-based workflow for exploring peptide conformational landscapes. It combines explicit-solvent molecular dynamics with collective-variable (CV) umbrella states, replica exchange, optional GaMD/Pep-GaMD acceleration, adaptive state placement, and MBAR/PMF analysis.
 
-It is designed for workflows where the sampling protocol itself is part of the scientific method: state definitions are explicit, exchange kernels are tested against their target distribution, adaptive phases are tracked separately, and production data are written with enough provenance to reconstruct the sampled Hamiltonians later.
+A run defines the peptide system and CVs, builds biased thermodynamic states, propagates replicas and attempts exchanges, then records samples and state history for analysis. Adaptive phases are tracked separately so a changing set of states is not silently treated as one fixed ensemble. ATLaS-MD helps make a simulation and its assumptions inspectable; it does not guarantee that sampling has converged or that a PMF is valid.
 
 <p align="center">
   <img src="docs/atlas-md/assets/workflow.svg" alt="ATLaS-MD scientific workflow" width="100%">
@@ -34,6 +34,31 @@ It is designed for workflows where the sampling protocol itself is part of the s
 | **GENPEPT seeding** | Conformer generation and CV-aware starting-state selection |
 | **MBAR-ready storage** | Per-sample CVs, energies, state mappings, exchange records, and phase-local Hamiltonian metadata |
 | **Reproducibility** | Checkpoints, manifests, source/input hashes, segment tracking, and restart-safe output layout |
+
+## Standard workflow
+
+1. **GENPEPT seeding.** Generate and rank candidate peptide conformers.
+2. **Swarm exploration.** Run a parallel ensemble of simulations to gather exploratory sampling data.
+3. **CV selection.** Select the CVs from the available seed-bank and swarm evidence, before committing to the production state layout.
+4. **Adaptive epochs.** Iteratively refine and allocate umbrella states using epoch feedback.
+5. **Optional top-ups.** Extend sampling under the current regime when more data are needed; keep the regime and phase provenance explicit.
+6. **MBAR analysis.** Reconstruct state weights and assess PMFs alongside overlap, effective sample size (ESS), and reweighting diagnostics.
+
+ATLaS-MD also supports simpler workflows, including conventional MD and manually specified windows. New users can begin with the [quickstart](docs/atlas-md/start/quickstart.md), then read [how CVs and windows work](docs/atlas-md/guide/collective-variables.md) and the [analysis validity checks](docs/atlas-md/analysis/pmf-validity.md).
+
+## Performance work
+
+The current implementation includes measured optimizations, with gains that depend on the workload and hardware:
+
+| Optimization | Measured scope |
+|---|---|
+| Reuse the contact sum shared by CV1 and the residual-torsion CV2 force | **+14.6% node throughput** in the recorded 236-context MPS production A/B; the bias energy and forces remain equivalent to the split layout. |
+| Remove a redundant all-groups force evaluation in the Pep-GaMD integrator and reduce barostat state reads | **~1.26× campaign throughput** in the recorded in-campaign A/B. |
+| Use CUDA MPS for many replicas | At 236 production replicas (59 contexts per L40S), **2,307 vs 840 aggregate ns/day** with MPS on vs off (**2.75×** in that tested run). This is a measured operating point, not a universal scaling promise. |
+| Distribute umbrella start-pull workers across GPUs | `--us-pull-device-index 0,1,2,3` spreads this setup phase across the selected devices; it targets startup time, not MD steps/s. |
+| Tune PME stream for the execution regime | Enabling it gave **+8–11%** without MPS in one measured run, but was about **4% slower** at 236 contexts with MPS. The right setting depends on the production configuration. |
+
+The [throughput benchmark record](docs/atlas-md/developer/gpu-throughput-benchmark-todo.md) includes the workload, controls, and measured comparisons. CUDA Graphs and MIG are not listed as shipped optimizations.
 
 ## Scientific contract
 
@@ -248,7 +273,7 @@ Finite-timestep propagation is not claimed to be mathematically exact. The therm
 
 ## Documentation
 
-**[Full ATLaS-MD manual](https://sulcjo.github.io/2026_peptide_sampler/)**
+**[Full ATLaS-MD manual](https://github.com/sulcjo/ATLaS-MD/tree/main/docs/atlas-md)**
 
 Useful entry points:
 

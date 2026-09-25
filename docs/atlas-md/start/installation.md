@@ -1,10 +1,10 @@
 # Installation
 
-GAREUS requires Python 3.10+. Choose extras matching task.
+ATLaS-MD (the `gareus` command and Python package) requires Python 3.10+. Choose extras matching your task. Clone the current repository and install only the dependency groups you need:
 
 ```bash
-git clone <repository-url>
-cd 2026_peptide_sampler
+git clone https://github.com/sulcjo/ATLaS-MD.git
+cd ATLaS-MD
 python -m pip install -e ".[dev]"       # parser, tests, lightweight tooling
 python -m pip install -e ".[all]"       # OpenMM, config, MBAR/storage stack
 python -m pip install -e ".[docs]"      # ATLAS-MD builder

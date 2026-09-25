@@ -1,6 +1,6 @@
 # Thermodynamic target and detailed-balance contract
 
-> GitHub mobile may not render LaTeX reliably. The key equations are duplicated below as SVG cards for cross-platform readability; the full derivation that follows remains MathJax-native on the published documentation site.
+The SVG equation cards below provide a readable summary in GitHub and other Markdown viewers. The full derivation uses LaTeX and is rendered by MathJax on the documentation site.
 
 <p align="center">
   <img src="../assets/equation-effective-hamiltonian.svg" alt="Effective state Hamiltonian" width="100%">
