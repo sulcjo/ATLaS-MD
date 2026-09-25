@@ -19,6 +19,7 @@ import copy
 import csv
 import itertools
 import json
+import logging
 import math
 import os
 import shutil
@@ -54,7 +55,8 @@ from .seeding import (
     deserialize_system,
     filter_explicit_2d_windows_by_seed_reachability,
 )
-from .diagnostics import compute_gamd_reweighting_diagnostics, validate_us_mbar_inputs
+from .diagnostics import compute_gamd_reweighting_diagnostics, validate_us_mbar_inputs, _read_csv_dicts
+from .topup_seeding import assert_seed_matches, export_final_window_states
 from .imports import import_gamd_factory, import_openmm
 from .state import _scalar_to_float, _energy_to_kj_mol
 from .cv import (
@@ -104,6 +106,8 @@ from .provenance import (initialize_run_manifest, ensure_run_manifest_initialize
                          finalize_run_manifest, pair_model_sha256)
 from .kernel_identity import (EXCHANGE_ENERGY_VERSION, FAST_SCALAR_MODES, LEGACY_TWO_TERM_MODES,
                               RESIDUAL_EVALUATOR_VERSION, kernel_identity_for_run)
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "add_secondary_structure_cv_force",
@@ -6413,6 +6417,64 @@ def _augment_seed_bank_with_campaign_search(
         )
 
 
+def _state_id_of_window_from_epoch_map(out_dir: Path) -> dict:
+    """Window -> state_id for this segment, from its own ``epoch_window_map.csv``.
+
+    Identity mapping when the file is absent/empty -- the same fallback used
+    throughout the adaptive-production driver for this file.
+    """
+    rows = _read_csv_dicts(Path(out_dir) / "epoch_window_map.csv")
+    out: dict = {}
+    for row in rows:
+        w = _int_or_none(row.get("epoch_window"))
+        sid = _int_or_none(row.get("state_id"))
+        if w is not None and sid is not None:
+            out[w] = sid
+    return out
+
+
+def _seed_topup_windows_from_parent_states(args, out_dir: Path, nrep: int):
+    """Load each window's starting State from the parent segment(s)' export (task 9,
+    effective top-ups). Continues each window's own chain instead of re-pulling.
+
+    Raises ``SeedMismatchError`` naming the missing window/state if any surviving
+    window in this top-up has no seed available -- the driver (task 8) is
+    responsible for only launching a top-up once every window it kept has one.
+    """
+    from .topup_seeding import SeedMismatchError, load_seed_states
+
+    out_dir = Path(out_dir)
+    state_id_of_window = _state_id_of_window_from_epoch_map(out_dir)
+    parent_dirs = [
+        d for d in [out_dir.parent / "baseline", *sorted(out_dir.parent.glob("topup_*"))]
+        if d != out_dir
+    ]
+    needed_state_ids = [state_id_of_window.get(w, w) for w in range(nrep)]
+    seeds = load_seed_states(parent_dirs, needed_state_ids)
+
+    window_start_positions: list = [None] * nrep
+    window_start_velocities: list = [None] * nrep
+    window_start_boxes: list = [None] * nrep
+    seed_by_window: dict = {}
+    for w in range(nrep):
+        sid = state_id_of_window.get(w, w)
+        seed = seeds.get(sid)
+        if seed is None:
+            raise SeedMismatchError(
+                f"top-up segment {out_dir} has no seed State for window {w} (state {sid}); "
+                f"parent dirs searched: {[str(p) for p in parent_dirs]}"
+            )
+        window_start_positions[w] = seed.positions
+        window_start_velocities[w] = seed.velocities
+        window_start_boxes[w] = seed.box
+        seed_by_window[w] = seed
+    print(
+        f"    Top-up seeding: continuing all {nrep} window(s) from parent segment State export(s) "
+        f"in {[str(p) for p in parent_dirs]} (no pull)"
+    )
+    return window_start_positions, window_start_velocities, window_start_boxes, seed_by_window
+
+
 def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equil_state, progress: Optional[GuiProgressSink] = None):
     from .correctness.sampling_policy import require_rescue_disabled_in_current_driver
     require_rescue_disabled_in_current_driver(args)
@@ -6774,26 +6836,45 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         pos = vel = box = None
         window_start_positions = [None] * nrep
         window_start_velocities = [None] * nrep
+        window_start_boxes = [None] * nrep
+        topup_seed_by_window: dict = {}
     else:
         # Keep pre-production US starting-structure pulling on the previous fixed-box
         # system so changing the default production ensemble does not silently alter
         # the pulling preparation. The shared GaMD setup and production replicas use
         # the production system above.
-        starting_structure_system = create_system(app, unit, forcefield, topology, args, include_barostat=False)
-        add_umbrella_cv_forces(openmm, starting_structure_system, topology, primary_cv_def, args,
-                               secondary_enabled=bool((secondary_cv_metadata or {}).get("enabled")))
         pos = equil_state.getPositions()
         vel = equil_state.getVelocities()
         box = equil_state.getPeriodicBoxVectors()
 
-        _augment_seed_bank_with_campaign_search(args, out_dir, topology, centers_a, secondary_cv_centers)
+        _topup_phase_info = getattr(args, "_adaptive_phase_info", {}) or {}
+        is_topup_segment = bool(_topup_phase_info.get("is_topup"))
 
-        window_start_positions, window_start_velocities, dropped_window_indices = generate_us_starting_states_by_pulling(
-            args, out_dir, openmm, app, unit, topology, starting_structure_system, centers_nm, ks_kj_nm2,
-            equil_state, primary_cv_def, cv_atom1, cv_atom2, setup_platform, setup_props, progress=progress,
-            secondary_cv_centers=secondary_cv_centers, secondary_cv_ks_kj=secondary_cv_ks_kj,
-            secondary_cv_metadata=secondary_cv_metadata,
-        )
+        if is_topup_segment:
+            # Effective top-ups (spec 4.4 rev 2): continue every window's chain
+            # from its parent segment's exported final State instead of
+            # re-pulling -- no starting_structure_system/pull at all. The driver
+            # (task 8) only launches a top-up once every surviving window has a
+            # seed State available; a missing one raises SeedMismatchError,
+            # which propagates out of run_gareus like any other setup failure.
+            (window_start_positions, window_start_velocities,
+             window_start_boxes, topup_seed_by_window) = _seed_topup_windows_from_parent_states(args, out_dir, nrep)
+            dropped_window_indices = []
+        else:
+            starting_structure_system = create_system(app, unit, forcefield, topology, args, include_barostat=False)
+            add_umbrella_cv_forces(openmm, starting_structure_system, topology, primary_cv_def, args,
+                                   secondary_enabled=bool((secondary_cv_metadata or {}).get("enabled")))
+
+            _augment_seed_bank_with_campaign_search(args, out_dir, topology, centers_a, secondary_cv_centers)
+
+            window_start_positions, window_start_velocities, dropped_window_indices = generate_us_starting_states_by_pulling(
+                args, out_dir, openmm, app, unit, topology, starting_structure_system, centers_nm, ks_kj_nm2,
+                equil_state, primary_cv_def, cv_atom1, cv_atom2, setup_platform, setup_props, progress=progress,
+                secondary_cv_centers=secondary_cv_centers, secondary_cv_ks_kj=secondary_cv_ks_kj,
+                secondary_cv_metadata=secondary_cv_metadata,
+            )
+            window_start_boxes = [None] * nrep
+            topup_seed_by_window = {}
 
         if dropped_window_indices:
             _drop_result = drop_bad_us_windows_and_rebuild(
@@ -7062,7 +7143,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                               f"(stepCount {seeded_step})", flush=True)
                 set_replica_lambda_for_window(integrator_i, i, state_lambdas, k0max_by_channel)
             if not fast_resume:
-                sim_i.context.setPeriodicBoxVectors(*box)
+                start_box = window_start_boxes[i] if window_start_boxes and i < len(window_start_boxes) and window_start_boxes[i] is not None else box
+                sim_i.context.setPeriodicBoxVectors(*start_box)
                 start_pos = window_start_positions[i] if i < len(window_start_positions) and window_start_positions[i] is not None else pos
                 start_vel = window_start_velocities[i] if i < len(window_start_velocities) and window_start_velocities[i] is not None else vel
                 sim_i.context.setPositions(start_pos)
@@ -7114,6 +7196,17 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 driver_i.register_reporter(reporter)
         sims.append(sim_i)
         drivers.append(driver_i)
+        if not fast_resume and topup_seed_by_window.get(i) is not None:
+            # Top-up seeding (task 9): the loaded State must reproduce the CV
+            # values it was exported under -- set_window has just been applied
+            # above, so this is the first point the context's real CV can be
+            # read after seeding. Reuses the sample logger's own CV evaluation
+            # (primary_secondary_and_potential_from_state), not a reimplementation.
+            _seed_cv1_now, _seed_cv2_now, _ = primary_secondary_and_potential_from_state(
+                sim_i.context, primary_cv_def, args, unit, secondary_cv_metadata,
+                read_potential_energy=False,
+            )
+            assert_seed_matches(topup_seed_by_window[i], _seed_cv1_now, _seed_cv2_now)
         if progress is not None:
             progress.progress("replica_construction", i + 1, nrep, message=f"built replica {i + 1}/{nrep}")
 
@@ -8434,6 +8527,27 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             state = sim.context.getState(getPositions=True, enforcePeriodicBox=True)
             with (final_dir / f"replica_{r:03d}_window_{assignments[r]:03d}.pdb").open("w") as handle:
                 app.PDBFile.writeFile(topology, state.getPositions(), handle, keepIds=True)
+
+        # Export each window's final OpenMM State (task 9, effective top-ups): the
+        # only thing a later top-up segment needs to continue this window's chain
+        # instead of re-pulling. Uses the live in-memory `assignments` (authoritative
+        # for which window each replica currently holds), not the checkpoint
+        # manifest. Never allowed to fail an otherwise-successful segment -- only a
+        # future top-up depends on this, and a top-up whose seed is missing raises
+        # its own clear SeedMismatchError at seeding time instead.
+        try:
+            _export_state_id_of_window = _state_id_of_window_from_epoch_map(out_dir)
+
+            def _export_cv_of_replica(r: int):
+                cv1, cv2, _ = primary_secondary_and_potential_from_state(
+                    sims[r].context, primary_cv_def, args, unit, secondary_cv_metadata,
+                    read_potential_energy=False,
+                )
+                return cv1, cv2
+
+            export_final_window_states(out_dir, sims, assignments, _export_state_id_of_window, _export_cv_of_replica)
+        except Exception:
+            logger.warning("Failed to export final window States for top-up seeding (segment %s)", out_dir, exc_info=True)
 
         try:
             exchange_report = write_exchange_tuning_report(out_dir, args, exchange_stats, centers_a=centers_a, secondary_cv_centers=secondary_cv_centers, secondary_cv_metadata=secondary_cv_metadata)

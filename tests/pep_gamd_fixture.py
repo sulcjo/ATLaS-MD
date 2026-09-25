@@ -70,3 +70,13 @@ def _energy(system, positions, groups, openmm, unit):
     return float(e)
 
 
+def build_small_simulation(platform="Reference"):
+    """An app.Simulation on a fresh copy of the cached GA dipeptide in TIP3P, velocities set."""
+    openmm, app, unit, topology, system, positions = tiny_solvated_system()
+    integ = openmm.LangevinMiddleIntegrator(300 * unit.kelvin, 1.0 / unit.picosecond, 0.002 * unit.picoseconds)
+    sim = app.Simulation(topology, system, integ, openmm.Platform.getPlatformByName(platform))
+    sim.context.setPositions(positions)
+    sim.context.setVelocitiesToTemperature(300 * unit.kelvin, 1)
+    return sim
+
+
