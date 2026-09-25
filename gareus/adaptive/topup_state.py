@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional
 from .topup_allocator import TopupPlan
 
 PLAN_NAME = "topup_plan.json"
+OVERLAP_NAME = "topup_union_overlap.json"
 STATE_NAME = "topup_state.json"
 CORRECTION_BOUNDS = (0.1, 2.0)
 
@@ -32,7 +33,7 @@ def _num(v) -> float:
 
 def save_plan(epoch_dir, plan: TopupPlan) -> Path:
     d = asdict(plan)
-    for key in ("predicted_sigma", "sigma_before"):
+    for key in ("predicted_sigma", "sigma_before", "sample_scale_steps"):
         d[key] = {str(k): _clean(float(v)) for k, v in getattr(plan, key).items()}
     d["cost_hours"] = _clean(float(plan.cost_hours))
     d["structural_edges"] = [list(e) for e in plan.structural_edges]
@@ -49,7 +50,7 @@ def load_plan(epoch_dir) -> Optional[TopupPlan]:
         d[key] = tuple(int(x) for x in d.get(key, ()))
     for key in ("structural_edges", "weak_edges_topped"):
         d[key] = tuple(tuple(int(x) for x in e) for e in d.get(key, ()))
-    for key in ("predicted_sigma", "sigma_before"):
+    for key in ("predicted_sigma", "sigma_before", "sample_scale_steps"):
         d[key] = {int(k): _num(v) for k, v in d.get(key, {}).items()}
     d["cost_hours"] = _num(d.get("cost_hours"))
     return TopupPlan(**d)
@@ -96,3 +97,23 @@ def update_after_topup(state: Dict[str, Any], plan: TopupPlan, realised_sigma: D
         key = (int(edge[0]), int(edge[1]))
         new["edge_attempts"][key] = new["edge_attempts"].get(key, 0) + 1
     return new
+
+
+def save_union_overlap(epoch_dir, edge_overlap: Dict) -> Path:
+    """The phase's latest measured union edge overlaps, beside its plan (resume-stable)."""
+    d = {f"{int(a)}-{int(b)}": _clean(float(v)) for (a, b), v in edge_overlap.items()}
+    return _atomic_write(Path(epoch_dir) / OVERLAP_NAME, d)
+
+
+def load_union_overlap(epoch_dir) -> Optional[Dict]:
+    path = Path(epoch_dir) / OVERLAP_NAME
+    if not path.exists():
+        return None
+    d = json.loads(path.read_text())
+    out = {}
+    for k, v in d.items():
+        if v is None:
+            continue
+        a, b = (int(x) for x in k.split("-"))
+        out[(a, b)] = float(v)
+    return out

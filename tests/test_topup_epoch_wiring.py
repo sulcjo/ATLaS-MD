@@ -85,6 +85,8 @@ def test_a_seed_mismatch_ends_the_topup_not_the_campaign(tmp_path, monkeypatch):
 
     calls = _drive(monkeypatch, args, out, PLAN, worker=worker)
     assert any(n.startswith("topup_") for n, _ in calls)          # it was attempted, the drive returned normally
+    from gareus.adaptive.topup_state import load_plan
+    assert load_plan(Path(out) / "adaptive_production" / "final").reason == "seed_mismatch"
 
 
 def test_a_corrupt_parent_seed_index_skips_the_topup_not_the_campaign(tmp_path, monkeypatch):
@@ -225,3 +227,139 @@ def test_the_plan_uses_the_campaign_end_union_source_filters(tmp_path, monkeypat
     ap._topup_plan_for_phase(args, epoch_dir, reg, ap.policy_from_args(args), full_steps=10_000)
     assert seen["tica_cv_version"] == "tica_v3"
     assert seen["output_prefix"] != "adaptive_union_mbar"
+
+
+# ---- fix round 1 (rulings 20, 21) -------------------------------------------------
+
+import math
+from dataclasses import replace
+from types import SimpleNamespace
+
+from gareus.adaptive.topup_allocator import predicted_sigma
+from gareus.adaptive.topup_state import (load_plan, load_state, load_union_overlap, save_plan,
+                                         save_union_overlap, update_after_topup)
+
+_SCALE = 4000.0
+PLAN_CAL = TopupPlan(state_ids=(0, 1), steps=4000, deficit_state_ids=(0,), partner_state_ids=(1,),
+                     sigma_before={0: 0.2, 1: 0.05}, sample_scale_steps={0: _SCALE, 1: _SCALE},
+                     predicted_sigma={0: predicted_sigma(0.2, _SCALE, 4000), 1: predicted_sigma(0.05, _SCALE, 4000)},
+                     cost_hours=2.0, reason="planned")
+
+
+def _pool_limits_the_topup(monkeypatch, topup_steps):
+    """The MD pool gives the 2-state top-up `topup_steps` and leaves the baseline alone."""
+    real = ap.AdaptiveRuntimePool.clip_steps
+
+    def _clip(self, n_states, requested_steps, reserve_ns=0.0, hard_stop=True):
+        if n_states == 2:
+            return topup_steps
+        return real(self, n_states, requested_steps, reserve_ns=reserve_ns, hard_stop=hard_stop)
+
+    monkeypatch.setattr(ap.AdaptiveRuntimePool, "clip_steps", _clip)
+
+
+def _drive_calibrating(monkeypatch, args, out, realised):
+    calls = []
+    monkeypatch.setattr(prod, "run_gareus", lambda a, d, *r, **k: calls.append((Path(d).name, int(a.gamd_production_steps))))
+    monkeypatch.setattr(ap, "_topup_plan_for_phase", lambda *a, **k: PLAN_CAL)
+    monkeypatch.setattr(ap, "_seedable_patch", lambda plan, parents: plan)
+    monkeypatch.setattr(ap, "_phase_union_diagnostics", lambda *a, **k: SimpleNamespace(
+        sigma_kcal=dict(realised), f_kT={}, edge_overlap={(0, 1): 0.4}))
+    ap.run_adaptive_production_auto_loop(args, out, None, None, None, None, None, None)
+    return calls
+
+
+def test_a_topup_the_pool_skips_is_not_calibrated(tmp_path, monkeypatch):
+    args, out = _topups_on(tmp_path)
+    _pool_limits_the_topup(monkeypatch, 0)
+    calls = _drive_calibrating(monkeypatch, args, out, {0: 0.19})
+    assert not [n for n, _ in calls if n.startswith("topup_")]
+    adaptive_dir = Path(out) / "adaptive_production"
+    st = load_state(adaptive_dir)
+    assert st["correction"] == {} and st["edge_attempts"] == {} and st["wall_time"] == []
+    assert load_plan(adaptive_dir / "final").reason == "pool_exhausted"
+
+
+def test_a_clipped_topup_is_calibrated_against_the_clipped_prediction(tmp_path, monkeypatch):
+    args, out = _topups_on(tmp_path)
+    _pool_limits_the_topup(monkeypatch, 1000)
+    calls = _drive_calibrating(monkeypatch, args, out, {0: 0.17})
+    assert ("topup_001_4000", 1000) in calls                     # same directory, clipped length
+    st = load_state(Path(out) / "adaptive_production")
+    empty = {"correction": {}, "edge_attempts": {}, "f_kT": {}, "wall_time": []}
+    at_1000 = replace(PLAN_CAL, predicted_sigma={0: predicted_sigma(0.2, _SCALE, 1000)})
+    expected = update_after_topup(empty, at_1000, {0: 0.17})["correction"][0]
+    full = update_after_topup(empty, PLAN_CAL, {0: 0.17})["correction"][0]
+    assert math.isclose(st["correction"][0], expected) and not math.isclose(expected, full)
+    row = st["wall_time"][-1]
+    assert row["segment"] == "final/topup_001_4000" and row["steps"] == 1000
+    assert math.isclose(row["predicted_h"], 0.5)                 # cost is linear in steps
+
+
+def test_the_topup_segment_writes_its_own_epoch_window_map(tmp_path, monkeypatch):
+    """Task 9's seeding fails closed without it."""
+    args, out = _topups_on(tmp_path)
+    seen = {}
+
+    def _fake(a, d, *r, **k):
+        d = Path(d)
+        if d.name.startswith("topup_"):
+            m = d / "epoch_window_map.csv"
+            seen["rows"] = len(m.read_text().strip().splitlines()) - 1 if m.exists() else None
+
+    monkeypatch.setattr(prod, "run_gareus", _fake)
+    monkeypatch.setattr(ap, "_topup_plan_for_phase", lambda *a, **k: PLAN)
+    monkeypatch.setattr(ap, "_seedable_patch", lambda plan, parents: plan)
+    monkeypatch.setattr(ap, "_after_topup_update", lambda *a, **k: None)
+    ap.run_adaptive_production_auto_loop(args, out, None, None, None, None, None, None)
+    assert seen["rows"] == len(PLAN.state_ids)
+
+
+def test_a_layout_change_after_the_topup_started_keeps_its_samples_and_never_replans(tmp_path, monkeypatch):
+    args, out = _topups_on(tmp_path)
+    reg = ap.WindowStateRegistry.load(Path(out) / "adaptive_production")
+    epoch_dir = Path(out) / "adaptive_production" / "final"
+    (epoch_dir / "topup_001_1000").mkdir(parents=True)
+    save_plan(epoch_dir, TopupPlan(state_ids=(999,), steps=1000, deficit_state_ids=(999,), reason="planned"))
+    monkeypatch.setattr(ap, "production_checkpoint_available", lambda d: Path(d).name == "topup_001_1000")
+    monkeypatch.setattr(ap, "build_union_state_mbar_inputs",
+                        lambda *a, **k: pytest.fail("a started top-up must not be replanned"))
+    plan = ap._topup_plan_for_phase(args, epoch_dir, reg, ap.policy_from_args(args), full_steps=10_000)
+    assert plan.reason == "layout_changed" and load_plan(epoch_dir).reason == "layout_changed"
+    assert [d.name for d in epoch_dir.glob("topup_001_*") if d.is_dir()] == ["topup_001_1000"]
+
+
+def test_an_already_complete_topup_logs_no_realised_wall_time(tmp_path, monkeypatch):
+    epoch_dir = tmp_path / "final"
+    epoch_dir.mkdir()
+    monkeypatch.setattr(ap, "_phase_union_diagnostics", lambda *a, **k: None)
+    ap._after_topup_update(SimpleNamespace(), epoch_dir, None, ap.AdaptiveDecisionPolicy(), PLAN_CAL, None,
+                           segment_name="topup_001_4000")
+    row = load_state(tmp_path)["wall_time"][-1]
+    assert row["realised_h"] is None and row["segment"] == "final/topup_001_4000"
+
+
+def test_the_union_overlap_is_reloaded_for_a_resumed_phase(tmp_path):
+    """Interrupted or not, the gate sees the same rung overlaps."""
+    epoch_dir = tmp_path / "final"
+    epoch_dir.mkdir()
+    save_plan(epoch_dir, replace(PLAN, reason="completed"))
+    save_union_overlap(epoch_dir, {(0, 1): 0.07, (1, 2): math.nan})
+    assert load_union_overlap(epoch_dir) == {(0, 1): 0.07}
+    got = ap._run_phase_topup(SimpleNamespace(), epoch_dir, ap.WindowStateRegistry(), ap.AdaptiveDecisionPolicy(),
+                              lambda *a: pytest.fail("no segment may run"), [], full_steps=10_000)
+    assert got == {(0, 1): 0.07}
+
+
+def test_ignored_score_allocator_fields_are_warned_about_once(tmp_path, caplog):
+    args, out = _scheduled_final_campaign(tmp_path)
+    reg = ap.WindowStateRegistry.load(Path(out) / "adaptive_production")
+    ap._SCORE_FIELDS_WARNED.clear()
+    pol = ap.AdaptiveDecisionPolicy(weak_edge_bonus=9.0, new_state_steps=5)
+    with caplog.at_level("WARNING"):
+        ap.build_adaptive_epoch_schedule(reg, None, pol, epoch=1, default_steps=10_000)
+        ap.build_adaptive_epoch_schedule(reg, None, pol, epoch=1, default_steps=10_000)
+        ap.build_adaptive_epoch_schedule(reg, None, ap.AdaptiveDecisionPolicy(), epoch=1, default_steps=10_000)
+    hits = [r.getMessage() for r in caplog.records if "score allocator was removed" in r.getMessage()]
+    assert len(hits) == 1 and "new_state_steps" in hits[0] and "weak_edge_bonus" in hits[0]
+    assert "frontier_bonus" not in hits[0]

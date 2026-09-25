@@ -23,6 +23,11 @@ class TopupPlan:
     sigma_before: dict = field(default_factory=dict)
     cost_hours: float = 0.0
     reason: str = "healthy"
+    # Per state: the steps-equivalent of the data it already holds,
+    # n_eff * report_interval * inefficiency / correction.  predicted_sigma(...) at
+    # any top-up length L is sigma_before * sqrt(scale / (scale + L)), so a caller
+    # whose top-up ran fewer steps than planned can re-predict with the same model.
+    sample_scale_steps: dict = field(default_factory=dict)
 
 
 def _ok(x) -> bool:
@@ -36,6 +41,13 @@ def _clamp(c) -> float:
 
 def _round_up(steps: float, interval: int) -> int:
     return int(math.ceil(max(0.0, steps) / interval - 1e-9) * interval)
+
+
+def predicted_sigma(sigma_before: float, sample_scale_steps: float, steps: float) -> float:
+    """sigma after ``steps`` more steps for a state whose existing data is worth
+    ``sample_scale_steps`` steps (the allocator's 1/sqrt(N_eff) model)."""
+    scale = max(1e-9, float(sample_scale_steps))
+    return float(sigma_before) * math.sqrt(scale / (scale + max(0.0, float(steps))))
 
 
 def plan_topup(diag, *, state_ids_in_order: Sequence[int], neighbours: Dict[int, List[int]],
@@ -68,9 +80,11 @@ def plan_topup(diag, *, state_ids_in_order: Sequence[int], neighbours: Dict[int,
     if not deficits:
         return TopupPlan(structural_edges=tuple(structural), reason="healthy")
 
+    def scale(s: int) -> float:
+        return max(1e-9, float(n_eff[s])) * interval * g[s] / corr[s]
+
     def predicted(s: int, L: int) -> float:
-        n = max(1e-9, float(n_eff[s]))
-        return sigma[s] * math.sqrt(n / (n + corr[s] * L / (interval * g[s])))
+        return predicted_sigma(sigma[s], scale(s), L)
 
     def required(s: int) -> int:
         # noise-edge endpoints and unconverged states below target both use σ/√2 (double their data)
@@ -110,4 +124,5 @@ def plan_topup(diag, *, state_ids_in_order: Sequence[int], neighbours: Dict[int,
     return TopupPlan(state_ids=tuple(sorted(patch)), steps=int(L), deficit_state_ids=tuple(sorted(deficits)),
                      partner_state_ids=tuple(sorted(partners)), structural_edges=tuple(structural),
                      weak_edges_topped=tuple(noise_edges), predicted_sigma=pred,
-                     sigma_before={s: sigma[s] for s in patch}, cost_hours=float(cost), reason="planned")
+                     sigma_before={s: sigma[s] for s in patch}, cost_hours=float(cost), reason="planned",
+                     sample_scale_steps={s: scale(s) for s in patch})

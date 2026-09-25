@@ -5168,6 +5168,29 @@ def _edge_is_measured_weak(edge: Dict[str, Any], policy: AdaptiveDecisionPolicy)
     return weak
 
 
+# Policy fields that only ever fed the per-state score allocator, removed with the
+# effective-top-ups change.  Kept on AdaptiveDecisionPolicy (and their CLI/YAML
+# keys) so existing configs still load; a non-default value is warned about once.
+SCORE_ALLOCATOR_FIELDS = ("low_sample_bonus", "weak_edge_bonus", "frontier_bonus", "high_boost_bonus",
+                          "new_state_steps", "articulation_degenerate_fraction")
+_SCORE_FIELDS_WARNED: set = set()
+
+
+def _warn_ignored_score_fields(policy: "AdaptiveDecisionPolicy") -> None:
+    defaults = AdaptiveDecisionPolicy()
+    changed = sorted(f for f in SCORE_ALLOCATOR_FIELDS
+                     if getattr(policy, f, None) != getattr(defaults, f)
+                     and f not in _SCORE_FIELDS_WARNED)
+    if not changed:
+        return
+    _SCORE_FIELDS_WARNED.update(changed)
+    logging.warning(
+        "adaptive-production: %s set to a non-default value but ignored: the per-state score "
+        "allocator was removed (every state now gets an equal share of the phase budget; extra MD "
+        "for under-converged states comes from the single --ap-topups top-up)",
+        ", ".join(changed))
+
+
 def build_adaptive_epoch_schedule(
     registry: WindowStateRegistry,
     diagnostics: Optional[Dict[str, Any]],
@@ -5188,6 +5211,7 @@ def build_adaptive_epoch_schedule(
     MBAR diagnostics (``_topup_plan_for_phase``).  The row format is unchanged, so a
     schedule written by an older version still loads on resume.
     """
+    _warn_ignored_score_fields(policy)
     active = registry.active_states()
     if not active:
         return []
@@ -6328,11 +6352,10 @@ def stage_phase_identity(epoch_dir_name: str, max_epochs: Optional[int] = None) 
 TOPUP_UNION_PREFIX = "topup_union_mbar"
 KB_KCAL_PER_MOL_K = 0.0019872041
 
-# Union diagnostics measured for a phase IN THIS PROCESS (plan time, then after the
-# top-up), keyed by str(epoch_dir); the epoch diagnostics take their union edge
-# overlaps from here instead of paying for a third union MBAR solve.  A plan reused
-# from disk leaves no entry, so a resumed phase keeps its diagnostics as they are.
-_PHASE_UNION_DIAG: Dict[str, Any] = {}
+# The phase's latest measured union edge overlaps are persisted beside its plan
+# (topup_union_overlap.json, written at plan time and again after the top-up) and
+# read back for the epoch diagnostics, so the gate and proposer see the same rung
+# overlaps whether or not the phase was interrupted -- and no third solve is paid.
 
 
 def _phase_union_diagnostics(args, adaptive_dir: Path, registry: "WindowStateRegistry",
@@ -6365,7 +6388,8 @@ def _topup_plan_for_phase(args, epoch_dir: Path, registry: "WindowStateRegistry"
     """
     from .adaptive.throughput import wall_hours
     from .adaptive.topup_allocator import plan_topup
-    from .adaptive.topup_state import load_plan, load_state, save_plan, save_state
+    from dataclasses import replace
+    from .adaptive.topup_state import load_plan, load_state, save_plan, save_state, save_union_overlap
     from .layout_neighbours import other_rung_same_centre, same_rung_neighbours, spatial_neighbour_pairs
 
     epoch_dir = Path(epoch_dir)
@@ -6379,6 +6403,14 @@ def _topup_plan_for_phase(args, epoch_dir: Path, registry: "WindowStateRegistry"
         missing = sorted(set(saved.state_ids) - set(ids))
         if not missing:
             return saved
+        if _phase_has_partial_topup(epoch_dir):
+            # The old plan's segment already holds data: replanning would open a
+            # second top-up directory for this phase.  Keep the partial samples.
+            print(f"      top-up ended: layout changed (states {missing} no longer active) after the "
+                  "top-up had started; keeping its partial samples, no replan")
+            final = replace(saved, reason="layout_changed")
+            save_plan(epoch_dir, final)
+            return final
         print(f"      top-up plan discarded: layout changed (states {missing} no longer active)")
     state = load_state(adaptive_dir)
     c1 = [float(s.primary_center) for s in active]
@@ -6405,7 +6437,7 @@ def _topup_plan_for_phase(args, epoch_dir: Path, registry: "WindowStateRegistry"
                       policy=policy, report_interval=interval, timestep_fs=timestep, n_gpus=n_gpus,
                       budget_hours=budget, correction=state["correction"], edge_attempts=state["edge_attempts"])
     if diag is not None:
-        _PHASE_UNION_DIAG[str(epoch_dir)] = diag
+        save_union_overlap(epoch_dir, diag.edge_overlap)
         state["f_kT"] = dict(diag.f_kT)
         save_state(adaptive_dir, state)
     save_plan(epoch_dir, plan)
@@ -6435,12 +6467,17 @@ def _seedable_patch(plan, parent_dirs):
                    partner_state_ids=tuple(s for s in plan.partner_state_ids if s in have))
 
 
-def _after_topup_update(args, epoch_dir: Path, registry, policy, plan, elapsed_s: float):
+def _after_topup_update(args, epoch_dir: Path, registry, policy, plan, elapsed_s: Optional[float],
+                        *, segment_name: Optional[str] = None):
     """Calibration, edge attempts and wall-time log after a completed top-up.
 
+    ``plan`` is the plan AS RUN (steps and predictions at the steps actually taken);
+    ``segment_name`` is the directory it ran in.  ``elapsed_s`` is ``None`` when the
+    segment was already complete on disk (crash-resume fast path): no wall time was
+    measured, so ``realised_h`` is logged as null rather than as ~0.
     Returns the post-top-up union diagnostics (``None`` when unavailable).
     """
-    from .adaptive.topup_state import load_state, save_state, update_after_topup
+    from .adaptive.topup_state import load_state, save_state, save_union_overlap, update_after_topup
     adaptive_dir = Path(epoch_dir).parent
     state = load_state(adaptive_dir)
     try:
@@ -6451,11 +6488,45 @@ def _after_topup_update(args, epoch_dir: Path, registry, policy, plan, elapsed_s
     if diag is not None:
         state = update_after_topup(state, plan, diag.sigma_kcal)
         state["f_kT"] = dict(diag.f_kT)
-    state["wall_time"].append({"segment": f"{Path(epoch_dir).name}/topup_001_{plan.steps}",
+        save_union_overlap(epoch_dir, diag.edge_overlap)
+    name = segment_name or f"topup_001_{plan.steps}"
+    state["wall_time"].append({"segment": f"{Path(epoch_dir).name}/{name}",
                                "n_states": len(plan.state_ids), "steps": int(plan.steps),
-                               "predicted_h": float(plan.cost_hours), "realised_h": float(elapsed_s) / 3600.0})
+                               "predicted_h": float(plan.cost_hours),
+                               "realised_h": None if elapsed_s is None else float(elapsed_s) / 3600.0})
     save_state(adaptive_dir, state)
     return diag
+
+
+def _plan_at_steps(plan, steps: int):
+    """The plan as it actually ran when the MD pool clipped it to ``steps``.
+
+    Predictions are re-derived with the allocator's own model
+    (``topup_allocator.predicted_sigma``) at the steps taken, so calibration
+    compares the realised sigma with what THAT length should have delivered, not
+    with the full plan's promise.  Cost is linear in steps.
+    """
+    from dataclasses import replace
+    from .adaptive.topup_allocator import predicted_sigma
+    steps = int(steps)
+    predicted = {s: predicted_sigma(plan.sigma_before[s], plan.sample_scale_steps[s], steps)
+                 for s in plan.state_ids
+                 if s in plan.sigma_before and s in plan.sample_scale_steps}
+    frac = steps / float(plan.steps) if int(plan.steps) > 0 else 0.0
+    return replace(plan, steps=steps, predicted_sigma=predicted, cost_hours=float(plan.cost_hours) * frac)
+
+
+def _phase_has_partial_topup(epoch_dir: Path) -> bool:
+    """True when a ``topup_001_*`` segment of this phase already holds a checkpoint or samples."""
+    for d in Path(epoch_dir).glob("topup_001_*"):
+        if not d.is_dir():
+            continue
+        try:
+            if production_checkpoint_available(d) or _run_dir_has_samples(d):
+                return True
+        except Exception:
+            return True   # unreadable checkpoint: something is there; never replan over it
+    return False
 
 
 def _phase_topup_recorded(state: Dict[str, Any], phase_name: str) -> bool:
@@ -6464,23 +6535,25 @@ def _phase_topup_recorded(state: Dict[str, Any], phase_name: str) -> bool:
     return any(str((row or {}).get("segment", "")).startswith(prefix) for row in state.get("wall_time", []))
 
 
-def _run_phase_topup(args, epoch_dir: Path, registry, policy, run_segment, *, full_steps: int):
+def _run_phase_topup(args, epoch_dir: Path, registry, policy, run_segment, segment_summaries, *,
+                     full_steps: int):
     """Plan, seed-check and run this phase's single top-up, then calibrate.
 
     Returns ``"interrupted"`` when a graceful shutdown cut the top-up short;
-    otherwise the union edge overlaps measured in this call (``None`` if none were).
+    otherwise this phase's persisted union edge overlaps (``None`` if never measured).
     A ``SeedMismatchError`` (from the seed index or from inside the segment) ends
     the top-up only: it is recorded in the saved plan and the phase goes on.
+    ``segment_summaries`` is ``run_segment``'s own log: its last row tells whether
+    the MD pool skipped or clipped the top-up (ruling 20).
     """
     from dataclasses import replace
-    from .adaptive.topup_state import load_state, save_plan
+    from .adaptive.topup_state import load_state, load_union_overlap, save_plan
     from .topup_seeding import SeedMismatchError, topup_parent_dirs_by_creation_order
 
     epoch_dir = Path(epoch_dir)
     if _phase_topup_recorded(load_state(epoch_dir.parent), epoch_dir.name):
         print(f"      top-up: {epoch_dir.name} already ran its top-up (topup_state.json); one per phase")
-        return None
-    _PHASE_UNION_DIAG.pop(str(epoch_dir), None)
+        return load_union_overlap(epoch_dir)
     plan = _topup_plan_for_phase(args, epoch_dir, registry, policy, full_steps=full_steps)
     try:
         if plan.reason == "planned":
@@ -6493,19 +6566,27 @@ def _run_phase_topup(args, epoch_dir: Path, registry, policy, run_segment, *, fu
               f"({len(plan.deficit_state_ids)} deficit + {len(plan.partner_state_ids)} partners), "
               f"{plan.steps} steps, {float(plan.cost_hours):.2f} h predicted")
         if plan.reason == "planned" and plan.state_ids and int(plan.steps) > 0:
+            name = f"topup_001_{int(plan.steps)}"
+            n_before = len(segment_summaries)
             t_start = time.monotonic()
-            run_segment(f"topup_001_{int(plan.steps)}", list(plan.state_ids), int(plan.steps))
+            run_segment(name, list(plan.state_ids), int(plan.steps))
             if _graceful_shutdown.is_set():
                 return "interrupted"
-            diag_after = _after_topup_update(args, epoch_dir, registry, policy, plan, time.monotonic() - t_start)
+            elapsed = time.monotonic() - t_start
+            outcome = segment_summaries[-1] if len(segment_summaries) > n_before else {}
+            if outcome.get("skipped_by_runtime_pool"):
+                print(f"      top-up {name} skipped: MD pool exhausted; no calibration this phase")
+                save_plan(epoch_dir, replace(plan, reason="pool_exhausted"))
+                return load_union_overlap(epoch_dir)
+            actual = int(outcome.get("steps", plan.steps) or 0)
+            ran = _plan_at_steps(plan, actual) if 0 < actual < int(plan.steps) else plan
+            _after_topup_update(args, epoch_dir, registry, policy, ran,
+                                None if outcome.get("already_complete") else elapsed, segment_name=name)
             save_plan(epoch_dir, replace(plan, reason="completed"))
-            if diag_after is not None:
-                _PHASE_UNION_DIAG[str(epoch_dir)] = diag_after
     except SeedMismatchError as exc:
         print(f"      top-up aborted, campaign continues: {exc}")
         save_plan(epoch_dir, replace(plan, reason="seed_mismatch"))
-    diag = _PHASE_UNION_DIAG.pop(str(epoch_dir), None)
-    return dict(diag.edge_overlap) if diag is not None else None
+    return load_union_overlap(epoch_dir)
 
 
 def _apply_union_edge_overlap(diagnostics: Dict[str, Any], edge_overlap: Dict[Tuple[int, int], float],
@@ -6843,7 +6924,8 @@ def run_scheduled_adaptive_epoch(
         return _interrupted()
     union_edge_overlap: Optional[Dict[Tuple[int, int], float]] = None
     if topups_enabled:
-        outcome = _run_phase_topup(args, epoch_dir, registry, policy, run_segment, full_steps=full_steps)
+        outcome = _run_phase_topup(args, epoch_dir, registry, policy, run_segment, segment_summaries,
+                                   full_steps=full_steps)
         if outcome == "interrupted":
             return _interrupted()
         union_edge_overlap = outcome

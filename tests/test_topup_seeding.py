@@ -382,3 +382,16 @@ def test_state_id_of_window_from_epoch_map_reads_a_sparse_map_and_defaults_to_em
     d = tmp_path / "seg"
     _write_epoch_window_map(d, {0: 12, 2: 7})
     assert state_id_of_window_from_epoch_map(d) == {0: 12, 2: 7}
+
+
+def test_parent_dirs_are_directories_only(tmp_path):
+    """The phase dir's topup_plan.json and topup_*_windows.csv match the glob but are no parent."""
+    epoch = tmp_path / "final"
+    for name in ("baseline", "topup_001_2000", "topup_002_1000"):
+        (epoch / name).mkdir(parents=True)
+    (epoch / "topup_plan.json").write_text("{}")
+    (epoch / "topup_001_2000_windows.csv").write_text("")
+    (epoch / "topup_union_overlap.json").write_text("{}")
+    got = topup_parent_dirs_by_creation_order(epoch / "topup_002_1000")
+    assert sorted(p.name for p in got) == ["baseline", "topup_001_2000"]
+    assert all(p.is_dir() for p in got)
