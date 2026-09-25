@@ -2053,8 +2053,9 @@ deficit), ``planned``/``completed`` (ran), ``pool_exhausted``,
 ``seed_mismatch`` (a seeded window's restraint or CVs disagreed with the
 top-up's own window table), or ``layout_changed``.
 
-Seeding: every segment (baseline or top-up) exports, on completion,
-``final_window_states/`` under its own directory -- an OpenMM State per
+Seeding: with top-ups on, every adaptive-production segment (baseline or
+top-up) exports, on completion, ``final_window_states/`` under its own
+directory (top-ups off: no export, ~3 MB per State is not written) -- an OpenMM State per
 window plus ``index.json`` recording each window's restraint centres/k, CVs,
 and an ``export_seq`` write-order stamp.  A top-up continues each of its
 windows from the newest parent export across the phase's whole ancestor

@@ -174,3 +174,50 @@ def test_a_resumed_final_that_already_extended_charges_nothing_more(tmp_path, mo
                                     lambda a, d, *r, **k: calls.append(Path(d).name),
                                     None, None, None, None, None, None, policy=ap.policy_from_args(args))
     assert calls == []
+
+
+# ---- I1: final_window_states is exported only where a top-up can read it ----
+
+def _segment_export_decisions(tmp_path, *, topups):
+    from gareus.topup_seeding import should_export_final_window_states
+    args, adaptive, reg = _campaign(tmp_path, topups=topups)
+    seen = []
+    ap.run_scheduled_adaptive_epoch(
+        args, adaptive / "epoch_001", reg, _rows([20_000] * 3, [20_000] * 3),
+        lambda a, d, *r, **k: seen.append(should_export_final_window_states(a)),
+        None, None, None, None, None, None, policy=ap.AdaptiveDecisionPolicy(topups_enabled=False))
+    return seen
+
+
+def test_a_topups_off_segment_exports_no_final_window_states(tmp_path):
+    assert _segment_export_decisions(tmp_path, topups=False) == [False]
+
+
+def test_a_topups_on_segment_exports_final_window_states(tmp_path, monkeypatch):
+    monkeypatch.setattr(ap, "_run_phase_topup", lambda *a, **k: None)
+    assert _segment_export_decisions(tmp_path, topups=True) == [True]
+
+
+def test_a_run_outside_adaptive_production_never_exports():
+    from types import SimpleNamespace
+    from gareus.topup_seeding import should_export_final_window_states
+    assert should_export_final_window_states(SimpleNamespace(adaptive_production_topups=True)) is False
+    assert should_export_final_window_states(SimpleNamespace(
+        adaptive_production_topups=True, _adaptive_phase_info={"is_adaptive_epoch": False})) is False
+    assert should_export_final_window_states(SimpleNamespace(
+        adaptive_production_topups=False, _adaptive_phase_info={"is_adaptive_epoch": True})) is False
+
+
+def test_run_gareus_guards_the_export_with_the_predicate():
+    """run_gareus itself needs a live OpenMM stack; pin the guard structurally."""
+    import ast
+    src = (Path(__file__).resolve().parents[1] / "gareus" / "production.py").read_text()
+    guarded = [n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.If)
+               and ast.unparse(n.test) == "should_export_final_window_states(args)"]
+    assert len(guarded) == 1
+    calls = [c for c in ast.walk(guarded[0]) if isinstance(c, ast.Call)
+             and ast.unparse(c.func) == "export_final_window_states"]
+    assert len(calls) == 1
+    everywhere = [c for c in ast.walk(ast.parse(src)) if isinstance(c, ast.Call)
+                  and ast.unparse(c.func) == "export_final_window_states"]
+    assert len(everywhere) == 1                      # no unguarded second call site

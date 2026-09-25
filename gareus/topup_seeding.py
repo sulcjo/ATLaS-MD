@@ -163,6 +163,19 @@ def topup_parent_dirs_by_creation_order(out_dir) -> List[Path]:
     return sorted(candidates, key=_order_key)
 
 
+def should_export_final_window_states(args) -> bool:
+    """True only for a top-ups-on adaptive-production segment.
+
+    ``final_window_states/`` exists solely to seed a later top-up, and costs
+    ~3 MB per window State at 19k atoms.  ``_adaptive_phase_info`` is set by
+    the adaptive-production driver on every epoch/final segment it launches
+    (``is_adaptive_epoch``); a standalone run, a pilot, or any segment of a
+    top-ups-off campaign writes nothing.
+    """
+    info = getattr(args, "_adaptive_phase_info", None) or {}
+    return bool(getattr(args, "adaptive_production_topups", False)) and bool(info.get("is_adaptive_epoch"))
+
+
 def export_final_window_states(out_dir, sims: Sequence, assignments: Sequence[int],
                                state_id_of_window: Dict[int, int],
                                cv_of_replica: Callable[[int], tuple],

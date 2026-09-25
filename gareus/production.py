@@ -62,6 +62,7 @@ from .topup_seeding import (
     assert_seed_restraint_matches,
     export_final_window_states,
     load_seed_states,
+    should_export_final_window_states,
     state_id_of_window_from_epoch_map,
     topup_parent_dirs_by_creation_order,
 )
@@ -8485,23 +8486,27 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         # for which window each replica currently holds), not the checkpoint
         # manifest. Never allowed to fail an otherwise-successful segment -- only a
         # future top-up depends on this, and a top-up whose seed is missing raises
-        # its own clear SeedMismatchError at seeding time instead.
-        try:
-            _export_state_id_of_window = state_id_of_window_from_epoch_map(out_dir)
+        # its own clear SeedMismatchError at seeding time instead.  Gated to
+        # top-ups-on adaptive-production segments: ~3 MB per State at 19k atoms
+        # (~0.7 GB per 236-window segment, written on the main thread) is pure
+        # cost when no top-up will ever read it.
+        if should_export_final_window_states(args):
+            try:
+                _export_state_id_of_window = state_id_of_window_from_epoch_map(out_dir)
 
-            def _export_cv_of_replica(r: int):
-                cv1, cv2, _ = primary_secondary_and_potential_from_state(
-                    sims[r].context, primary_cv_def, args, unit, secondary_cv_metadata,
-                    read_potential_energy=False,
+                def _export_cv_of_replica(r: int):
+                    cv1, cv2, _ = primary_secondary_and_potential_from_state(
+                        sims[r].context, primary_cv_def, args, unit, secondary_cv_metadata,
+                        read_potential_energy=False,
+                    )
+                    return cv1, cv2
+
+                export_final_window_states(
+                    out_dir, sims, assignments, _export_state_id_of_window, _export_cv_of_replica,
+                    centers_nm, ks_kj_nm2, secondary_cv_centers, secondary_cv_ks_kj,
                 )
-                return cv1, cv2
-
-            export_final_window_states(
-                out_dir, sims, assignments, _export_state_id_of_window, _export_cv_of_replica,
-                centers_nm, ks_kj_nm2, secondary_cv_centers, secondary_cv_ks_kj,
-            )
-        except Exception:
-            logger.warning("Failed to export final window States for top-up seeding (segment %s)", out_dir, exc_info=True)
+            except Exception:
+                logger.warning("Failed to export final window States for top-up seeding (segment %s)", out_dir, exc_info=True)
 
         try:
             exchange_report = write_exchange_tuning_report(out_dir, args, exchange_stats, centers_a=centers_a, secondary_cv_centers=secondary_cv_centers, secondary_cv_metadata=secondary_cv_metadata)
