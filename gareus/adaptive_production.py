@@ -4145,12 +4145,7 @@ def evaluate_adaptive_quality_gate(
                 weak_edges.append(edge)
                 weak_rung_edges.append(reason)
             continue
-        overlap = edge.get("overlap")
-        acc = edge.get("exchange_acceptance")
-        weak = overlap is None or float(overlap) < float(policy.target_overlap)
-        if acc is not None and float(acc) < float(policy.min_exchange_acceptance):
-            weak = True
-        if weak:
+        if _edge_is_measured_weak(edge, policy):
             weak_edges.append(edge)
     if weak_edges:
         needs_more_sampling.append(f"{len(weak_edges)} final edge(s) are below overlap/exchange thresholds")
@@ -4542,12 +4537,7 @@ def propose_actions_from_diagnostics(
             # (which the test below would otherwise read as "weak").  Rung
             # gaps are repaired by add_rung, in the pass after this one.
             continue
-        overlap = edge.get("overlap")
-        acc = edge.get("exchange_acceptance")
-        weak = (overlap is None or float(overlap) < float(policy.target_overlap))
-        if acc is not None:
-            weak = weak or float(acc) < float(policy.min_exchange_acceptance)
-        if not weak:
+        if not _edge_is_measured_weak(edge, policy):
             continue
         si, sj = int(edge["state_i"]), int(edge["state_j"])
         di, dj = state_rows.get(si, {}), state_rows.get(sj, {})
@@ -5160,12 +5150,15 @@ def _state_rows_by_id(diagnostics: Optional[Dict[str, Any]]) -> Dict[int, Dict[s
 def _edge_is_measured_weak(edge: Dict[str, Any], policy: AdaptiveDecisionPolicy) -> bool:
     """Weak only if MEASURED below threshold; an unmeasured edge is never weak.
 
-    Rung edges are judged on the energy-space ``mbar_overlap`` alone (their CV
-    overlap is ~1 by construction and gibbs-walk inflates their acceptance).
+    Rung edges are judged on the energy-space ``mbar_overlap`` alone against
+    ``policy.min_rung_overlap`` (their CV overlap is ~1 by construction and
+    gibbs-walk inflates their acceptance) -- the same calibrated rung floor
+    used by ``_annotate_edge_warnings``, ``_weak_rung_edge_reason`` and
+    ``_propose_rung_actions``.
     """
     if str(edge.get("edge_type")) == "rung":
         value = edge.get("mbar_overlap")
-        return value is not None and float(value) < float(policy.topup_weak_overlap)
+        return value is not None and float(value) < float(policy.min_rung_overlap)
     overlap = edge.get("overlap")
     weak = overlap is not None and float(overlap) < float(policy.target_overlap)
     acc = edge.get("exchange_acceptance")
@@ -8317,11 +8310,18 @@ def write_epoch_action_report(
     edge_rows = diagnostics.get("edges", []) or []
     weak_edges = []
     for edge in edge_rows:
-        overlap = edge.get("overlap")
-        acc = edge.get("exchange_acceptance")
-        weak = overlap is None or float(overlap) < float(policy.target_overlap)
-        if acc is not None and float(acc) < float(policy.min_exchange_acceptance):
-            weak = True
+        # This function has no rung branch of its own; a rung edge's overlap
+        # is None by construction, so the old inline expression is preserved
+        # verbatim for rung edges here (unchanged, out of scope for this fix)
+        # and only non-rung edges are routed through the shared helper.
+        if str(edge.get("edge_type")) == "rung":
+            overlap = edge.get("overlap")
+            acc = edge.get("exchange_acceptance")
+            weak = overlap is None or float(overlap) < float(policy.target_overlap)
+            if acc is not None and float(acc) < float(policy.min_exchange_acceptance):
+                weak = True
+        else:
+            weak = _edge_is_measured_weak(edge, policy)
         if weak:
             weak_edges.append(edge)
     undersampled = [
@@ -8438,12 +8438,19 @@ def _adaptive_production_converged(actions: Sequence[Tuple], diagnostics: Dict[s
         return False
     weak_edges = []
     for edge in diagnostics.get("edges", []):
-        overlap = edge.get("overlap")
-        acc = edge.get("exchange_acceptance")
-        if overlap is None or float(overlap) < float(policy.target_overlap):
-            weak_edges.append(edge)
+        # No rung branch of its own; preserve the old inline expression for
+        # rung edges verbatim (unchanged, out of scope for this fix) and only
+        # route non-rung edges through the shared helper.
+        if str(edge.get("edge_type")) == "rung":
+            overlap = edge.get("overlap")
+            acc = edge.get("exchange_acceptance")
+            if overlap is None or float(overlap) < float(policy.target_overlap):
+                weak_edges.append(edge)
+                continue
+            if acc is not None and float(acc) < float(policy.min_exchange_acceptance):
+                weak_edges.append(edge)
             continue
-        if acc is not None and float(acc) < float(policy.min_exchange_acceptance):
+        if _edge_is_measured_weak(edge, policy):
             weak_edges.append(edge)
     return len(weak_edges) == 0
 
