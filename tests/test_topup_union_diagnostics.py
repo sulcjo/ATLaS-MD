@@ -1,4 +1,5 @@
 import math
+from unittest import mock
 
 import numpy as np
 
@@ -90,3 +91,99 @@ def test_a_state_with_zero_samples_gets_nan_sigma_not_a_crash(tmp_path):
     np.savez(p, umbrella_reduced_bias_nk=u[keep], state_ids=ids, sampled_state_ids=sid[keep])
     d = union_diagnostics_from_npz(p, _chain_edges(3), kt_kcal=KT)
     assert d is not None and math.isnan(d.sigma_kcal[2]) and d.n_k[2] == 0
+
+
+def test_split_halves_is_specific_not_leaking(tmp_path):
+    """9-state chain with only state 4 drifting → only state 4 flagged."""
+    p = _write(tmp_path, [0.5 * i for i in range(9)], k=4.0, n_per=3000, drift_state=4)
+    d = union_diagnostics_from_npz(p, _chain_edges(9), kt_kcal=KT)
+    assert d is not None
+    assert d.unconverged == frozenset({4})
+
+
+def test_warm_start_is_actually_passed(tmp_path):
+    """Verify that initial_f_k is passed to MBAR when f_init is given."""
+    from pymbar import MBAR as RealMBAR
+
+    p = _write(tmp_path, [0.0, 1.0, 2.0], k=4.0, n_per=1500)
+    cold = union_diagnostics_from_npz(p, _chain_edges(3), kt_kcal=KT)
+
+    # Save the real MBAR init
+    real_init = RealMBAR.__init__
+    recorded_kwargs = {}
+
+    def mock_mbar_init(self, *args, **kwargs):
+        recorded_kwargs.update(kwargs)
+        return real_init(self, *args, **kwargs)
+
+    with mock.patch('pymbar.MBAR.__init__', mock_mbar_init):
+        # Call with warm start
+        recorded_kwargs.clear()
+        warm = union_diagnostics_from_npz(p, _chain_edges(3), kt_kcal=KT, f_init=cold.f_kT)
+
+        # Verify initial_f_k was passed
+        assert "initial_f_k" in recorded_kwargs
+        assert recorded_kwargs["initial_f_k"] is not None
+        assert warm is not None
+
+
+def test_unsampled_endpoint_edge_absent_from_overlap(tmp_path):
+    """An edge with an unsampled endpoint is absent from edge_overlap."""
+    p = _write(tmp_path, [0.0, 1.0, 2.0], k=4.0, n_per=1000)
+    with np.load(p) as z:
+        u, ids, sid = z["umbrella_reduced_bias_nk"], z["state_ids"], z["sampled_state_ids"]
+    keep = sid != 2
+    np.savez(p, umbrella_reduced_bias_nk=u[keep], state_ids=ids, sampled_state_ids=sid[keep])
+    d = union_diagnostics_from_npz(p, _chain_edges(3), kt_kcal=KT)
+    assert d is not None
+    assert (1, 2) not in d.edge_overlap
+
+
+def test_non_contiguous_state_ids(tmp_path):
+    """State ids [3, 7, 20] should work and map correctly."""
+    rng = np.random.default_rng(42)
+    centers = [0.0, 1.0, 2.0]
+    states = [3, 7, 20]
+    k = 4.0
+    n_per = 1000
+
+    x, sid = [], []
+    for s, c in zip(states, centers):
+        sig = 1.0 / math.sqrt(k)
+        xs = rng.normal(c, sig, n_per)
+        x.append(xs)
+        sid += [s] * n_per
+
+    x = np.concatenate(x)
+    u = 0.5 * k * (x[:, None] - np.asarray(centers)[None, :]) ** 2
+    p = tmp_path / "noncontig.npz"
+    np.savez(p, umbrella_reduced_bias_nk=u, state_ids=np.array(states),
+             sampled_state_ids=np.array(sid))
+
+    d = union_diagnostics_from_npz(p, [(3, 7), (7, 20)], kt_kcal=KT)
+    assert d is not None
+    assert set(d.n_k.keys()) == {3, 7, 20}
+    assert set(d.sigma_kcal.keys()) == {3, 7, 20}
+    assert (3, 7) in d.edge_overlap
+    assert (7, 20) in d.edge_overlap
+
+
+def test_warning_is_logged_on_missing_file(tmp_path, caplog):
+    """A warning is logged when the input file is missing."""
+    import logging
+    with caplog.at_level(logging.WARNING):
+        result = union_diagnostics_from_npz(tmp_path / "nope.npz", [], kt_kcal=KT)
+    assert result is None
+    assert "not found" in caplog.text.lower() or "missing" in caplog.text.lower()
+
+
+def test_warning_is_logged_on_all_nan_input(tmp_path, caplog):
+    """A warning is logged when all rows are excluded (non-finite)."""
+    import logging
+    p = tmp_path / "e.npz"
+    np.savez(p, umbrella_reduced_bias_nk=np.full((3, 2), np.nan), state_ids=np.arange(2),
+             sampled_state_ids=np.array([0, 1, 1]))
+    with caplog.at_level(logging.WARNING):
+        result = union_diagnostics_from_npz(p, [(0, 1)], kt_kcal=KT)
+    assert result is None
+    assert "no finite rows" in caplog.text.lower() or "remain" in caplog.text.lower()
