@@ -1,8 +1,24 @@
 # TODO — adaptive top-ups follow-ups (opened 2026-09-24)
 
 Design: `docs/superpowers/specs/2026-09-24-effective-topups-design.md`. Top-ups are off by default and off in
-chignolin_9 (`ap_topups: false`); the new top-ups are validated synthetically first (spec section 6). The
-items below are the real-world steps deliberately left out of that spec.
+chignolin_9 (`ap_topups: false`).
+
+## Synthetic validation (done, 2026-09-25)
+
+Spec section 6 (Task 10, controller rulings 22-31). Ran a 20-seed A/B study over four analytic 2D
+landscapes (a 112-state, 28-centre x 4-rung ladder) driving the real allocator, union-MBAR diagnostics,
+throughput model and layout graphs. Result: **no landscape has a budget where the design's heterogeneous
+deficit regime exists** — at the rows floor the split-halves test needs (median >= 40 decorrelated rows per
+state), every uniform-baseline (top-ups-off) state is already at or under the sigma target, so spec 6.2's
+heterogeneous-vs-uniform criterion is untestable in this harness. Reported for information only, at the rows
+floor: top-ups lower the worst per-state sigma on two of four landscapes (gated-barrier -8.4%, 20/20 seeds,
+p=9.5e-7; slow-cv2-double-branch -1.3%, 19/20) but improve PMF RMSE on none (gated-barrier 7% worse, 7/20
+seeds). Missing-bridge routing (an edge spanning a genuine gap is topped as structural; the same coordinate
+pair in an intact layout is not) passes 20/20. The patch τ penalty (kept deliberately — it is a real cost of
+a lockstep patch with fewer exchange partners than the full state set) measured g(patch)/g(all-state) =
+1.19-1.26. **Honest summary: top-ups are not shown to help in this harness.** Full numbers and regenerate
+commands: `docs/superpowers/specs/2026-09-24-effective-topups/synth_study/README.md`. chignolin_10 (below)
+remains the real test.
 
 ## T1 — chignolin_10: real-MD test of the new top-ups (not started)
 
@@ -29,3 +45,21 @@ window/lambda globals, and check the seeding assertion (seeded frame's reduced p
 The small board's largest efficiency lever: run the campaign as sequential ~16 ctx/GPU panels instead of one
 236-context run (~0.73x wall-time for the same per-state ns if throughput holds). Cost: no exchange across
 panels. Measure realised per-state autocorrelation in panel vs full-graph mode before deciding.
+
+## T5 — re-measure the 0.15/0.25 rung-overlap thresholds on the pairwise scale (not started)
+
+Campaign-end rung overlap (the quality gate's `add_rung` and `analyze_gareus_mbar.py`'s ladder health check)
+switched from a full-union MBAR overlap matrix to a pairwise statistic (commit `f7e007b`). The existing
+`min_rung_overlap` (0.15) and `target_rung_overlap` (0.25) thresholds were calibrated on the old full-union
+scale — real data shows the two scales disagree by roughly 2.7x on a large ladder (chignolin_7, 64 states:
+median 0.089 full-union vs 0.258 pairwise on the same 48 adjacent-rung edges). Re-measure both thresholds
+directly on the pairwise statistic before trusting a rung-health verdict on a new large ladder campaign.
+
+## T6 — union-diagnostics memory before chignolin_10 (not started)
+
+The per-epoch union-MBAR solve top-ups add (`union_diagnostics_from_npz`, called up to twice per
+top-ups-on phase) measured 102.7 s / 14.6 GB peak RSS at 1,000,000 rows and 26.4 s / 4.06 GB at 250,000 rows,
+at 236 states. This runs on the driver/analysis node, not a GPU, and an out-of-memory kill during the solve
+cannot be caught. Before enabling `--ap-topups` on chignolin_10 (or any campaign of comparable size), either
+subsample the union input before the solve or confirm the launch node has enough RAM for the campaign's full
+row count.

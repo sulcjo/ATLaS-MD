@@ -4,6 +4,25 @@ All notable changes to ATLaS-MD are documented here.
 
 The project follows semantic-style release numbering where practical. Research-method changes that alter a sampled Hamiltonian, estimator, output contract, or thermodynamic assumption should be called out explicitly even when backwards compatibility is retained.
 
+## [Unreleased]
+
+### Added
+
+- **Adaptive top-ups (`--ap-topups`, off by default).** A scheduled phase (numbered epoch or final) can now follow its all-state baseline with at most one lockstep top-up segment over the states a per-epoch union-MBAR solve finds deficient (local sigma above `--ap-topup-target-sigma`, or a per-state local split-halves drift test), plus their layout partners. The allocator picks one step length that brings the worst deficit to target, capped by `--ap-topup-max-fraction` of the phase's wall-hour budget; a per-state calibration correction learned from realised-vs-predicted sigma is clamped to [0.1, 2.0]. New knobs: `--ap-topup-target-sigma` (0.10 kcal/mol), `--ap-topup-weak-overlap` (0.15), `--ap-topup-max-fraction` (0.3), `--ap-topup-min-effect` (0.05 kcal/mol), `--ap-topup-max-edge-attempts` (2), `--ap-topup-throughput-table`.
+- **Top-up seeding continues each window from its own parent segment.** Every segment (baseline or top-up) exports a `final_window_states/` directory (an OpenMM `State` per window plus `index.json` recording restraint centres/k, CVs, and a write-order `export_seq`); a top-up loads the newest export per window across the phase's full ancestor chain and asserts the seed's restraint/CVs match the top-up's own window table. No pull runs inside a top-up. A missing or mismatched seed drops that window from the top-up (never the campaign); a phase with no `epoch_window_map.csv` fails closed.
+- **Unmeasured overlap edges are never treated as weak**, in the per-epoch top-up gate, the campaign quality gate, action proposals, and reports alike — an edge with no measured sample overlap used to be read as "weak" in several of these paths, which could spend MD reacting to a number that was never actually measured.
+
+### Changed — results-changing
+
+- **With `--no-ap-topups` (the default), scheduled-phase allocation is now a uniform per-state share of the phase's budget.** The previous per-state score allocator (bonuses for low-sample, weak-edge, frontier and high-boost states, and a 2x step multiplier for newly added states) is removed outright, not just superseded. Any campaign run under `ap_topups: false` after this change allocates differently per-epoch than before, even though no top-up ever runs. The now-unused score-policy fields (`low_sample_bonus`, `weak_edge_bonus`, `frontier_bonus`, `high_boost_bonus`, `new_state_steps`, `articulation_degenerate_fraction`) stay readable from old configs but warn once if set to a non-default value.
+- **Campaign-end rung overlap (the quality gate's `add_rung` and `analyze_gareus_mbar.py`'s ladder-health check) now uses pairwise MBAR state overlap** (each edge evaluated on its own two-state sample set with the union `f_k` held fixed) instead of the full-union matrix. On a real run (chignolin_7, 64 lambda-ladder states) the full-union statistic read ~2.7x too low against the same edges (median 0.089 vs 0.258 pairwise; 38/48 vs 0/48 below the 0.15 threshold). **The existing 0.15/0.25 rung-overlap thresholds were calibrated on a full-matrix computation and have not been re-measured on this pairwise scale** — they are carried over unchanged for now.
+- With top-ups on, per-epoch union diagnostics give the campaign-end rung gate and `add_rung` real overlap numbers mid-campaign, not only at campaign end. With top-ups off this limitation is unchanged: a rung gap is still only caught when the campaign-end union is built.
+
+### Validation
+
+- A synthetic A/B study (four analytic 2D landscapes, a 112-state 28-centre x 4-rung ladder, 20 seeds; `docs/superpowers/specs/2026-09-24-effective-topups/synth_study/README.md`) found no budget on any landscape where the design's heterogeneous-deficit regime actually exists — at the rows floor the split-halves test needs, every uniform-baseline state is already at or under target. Reported for information only: top-ups lower the worst per-state sigma on two of four landscapes (gated-barrier -8.4%, 20/20 seeds; slow-cv2-double-branch -1.3%, 19/20) but improve PMF RMSE on none (gated-barrier 7% worse). Missing-bridge routing passes 20/20. The patch-vs-all-state exchange-partner penalty (kept deliberately) measured 1.19-1.26x. Top-ups are not shown to help in this harness; a real-MD comparison (chignolin_10) is the open test — see `docs/atlas-md/developer/topups-todo.md`.
+- The per-epoch union-MBAR solve top-ups add costs real memory on the driver node: 1,000,000 rows / 236 states took 102.7 s and peaked at 14.6 GB RSS; 250,000 rows took 26.4 s and 4.06 GB. An OOM kill during this solve cannot be caught.
+
 ## [0.8.3] — 2026-09-24
 
 ### Added

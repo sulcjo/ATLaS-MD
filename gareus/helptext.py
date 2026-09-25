@@ -1932,6 +1932,144 @@ ensembles on purpose. The swarm envelope stays authoritative for the campaign; a
 "fail" means inspect which channel disagrees and extend the swarm, never
 
 No native reference or folded-state label is used anywhere in this stage.
+
+19. Adaptive top-ups
+--------------------
+Top-ups are off by default (``--ap-topups`` / YAML ``ap_topups``; ``--no-ap-topups``
+is the default).  With top-ups off, every scheduled phase (a numbered epoch or
+the final phase) runs one all-state baseline segment and gives every active
+state a uniform share of the phase's own per-state step budget -- there is
+no per-state score, no bonus for a new or low-sample state.  Enabling
+top-ups adds, after that baseline, at most one top-up segment per phase: a
+lockstep MD batch over a state subset (the states
+found deficient plus their layout partners), sized to bring the worst deficit
+to target and capped by the phase's wall-hour budget.
+
+Knobs:
+
+    --ap-topups                     off by default; enables top-ups (--no-ap-topups is the default)
+    --ap-topup-target-sigma 0.10    per-state free-energy uncertainty target, kcal/mol
+    --ap-topup-weak-overlap 0.15    edge overlap below which it is weak (never rung edges)
+    --ap-topup-max-fraction 0.3     cap on the phase's wall-hour budget a top-up may spend
+    --ap-topup-min-effect 0.05      split-halves effect floor, kcal/mol
+    --ap-topup-max-edge-attempts 2  top-ups a weak edge may get before it is treated as structural
+    --ap-topup-throughput-table     "16:3154,59:2300" contexts_per_gpu:ns_per_day_node pairs
+
+What triggers a top-up
+~~~~~~~~~~~~~~~~~~~~~~
+After the baseline, a per-epoch union-MBAR solve over every sample the
+campaign holds so far (all epochs/phases pooled, the same tICA-regime and
+pilot-directory filters the campaign-end union build uses) produces, per
+active state:
+
+    sigma_k         local free-energy uncertainty.  Read against same-rung
+                    spatial neighbours (layout neighbours at the same lambda
+                    rung); falls back to the state's cross-rung partners
+                    (same centre, other rung) only when it has none.
+    unconverged     per-state local split-halves drift test: that state's own
+                    reduced-bias samples, first half vs second half, Welch z
+                    with a Bonferroni correction over tested states and an
+                    effect floor (``--ap-topup-min-effect``, default 0.05
+                    kcal/mol) -- cannot leak into any other state's number.
+    edge_overlap    pairwise symmetric MBAR state overlap sqrt(O_ij * O_ji),
+                    each pair evaluated on its own two-state sample set with
+                    the union's f_k held fixed (not diluted by every other
+                    state in a large union).  Rung-rung edges are judged on
+                    this same ``mbar_overlap`` against the campaign's rung
+                    floor (``min_rung_overlap``, default 0.15, not currently
+                    a CLI flag), never against ``--ap-topup-weak-overlap`` --
+                    one rung threshold for the whole campaign.
+
+A state is a deficit when it is sampled, sigma_k exceeds
+``--ap-topup-target-sigma`` (default 0.10 kcal/mol), or its split-halves test
+flags it.  An edge below ``--ap-topup-weak-overlap`` (default 0.15) whose
+weaker endpoint is a deficit is a noise edge and gets topped along with the
+deficit set (up to ``--ap-topup-max-edge-attempts`` times, default 2, before
+it is treated as structural instead); an edge below threshold between two
+already-adequate endpoints, or one already tried out, is structural and is
+left for the bridge/add-state machinery, never for a top-up.  An edge that
+could not be measured at all (missing sample overlap, an unsampled endpoint)
+is never treated as weak -- not in this diagnostic, not in the quality gate,
+not in action proposals, not in reports.  A top-up run therefore reaches the
+per-epoch gate and ``add_rung`` mid-campaign with real rung overlap numbers;
+with top-ups off, a rung gap is still only ever caught at campaign end (no
+per-epoch union solve runs).
+
+The allocator
+~~~~~~~~~~~~~
+Deficit states plus one layout partner per deficit (a same-rung spatial
+neighbour, or a cross-rung partner when it has none) form the patch.  Every
+state in the patch runs the same number of extra steps L (lockstep, no
+per-state stagger): L is the smaller of (a) the steps the worst deficit needs
+to reach target under a 1/sqrt(N_eff) model and (b) the largest length the
+phase's wall-hour budget can afford, where the budget is
+``--ap-topup-max-fraction`` (default 0.3) of the phase's un-shortened default
+wall-hours.  A required L below one report interval yields no top-up
+(``cap_too_small``).  A per-state calibration correction, learned from how
+each earlier top-up's realised sigma compared with its prediction, is
+clamped to [0.1, 2.0] and carried in ``topup_state.json``.  A top-up the MD
+pool skips outright is recorded ``pool_exhausted`` and never calibrated; one
+the pool clips short is calibrated against the steps it actually ran, not
+the planned length.
+
+One top-up per phase; where it lands
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+A phase (``epoch_NNN`` or ``final``) gets at most one top-up segment, named
+``topup_001_<steps>``.  Its plan is persisted next to it as
+``<phase>/topup_plan.json`` before the segment is launched; a resumed run
+reuses that same plan rather than replanning (a layout change after the
+segment already holds a checkpoint keeps its partial samples and records
+``reason: layout_changed`` instead of opening a second top-up directory).
+Campaign-level calibration state lives in ``<adaptive_dir>/topup_state.json``
+(correction factors, edge-attempt counts, the wall-time log); each phase's
+own latest measured edge overlaps are mirrored to
+``<phase>/topup_union_overlap.json`` so the gate and proposer see the same
+numbers across a resume.  A plan's ``reason`` is one of: ``healthy`` (no
+deficit), ``planned``/``completed`` (ran), ``pool_exhausted``,
+``cap_too_small``, ``no_diagnostics`` (the union solve failed),
+``no_seed_states`` (every deficit's parent seed was unusable),
+``seed_mismatch`` (a seeded window's restraint or CVs disagreed with the
+top-up's own window table), or ``layout_changed``.
+
+Seeding: every segment (baseline or top-up) exports, on completion,
+``final_window_states/`` under its own directory -- an OpenMM State per
+window plus ``index.json`` recording each window's restraint centres/k, CVs,
+and an ``export_seq`` write-order stamp.  A top-up continues each of its
+windows from the newest parent export across the phase's whole ancestor
+chain (ordered by ``export_seq``, not directory name or mtime), asserting
+that the seed's restraint and CVs match the top-up's own window table before
+using it.  A window whose seed is missing or fails that assertion is dropped
+from the top-up before it starts (the deficit set shrinks; the top-up still
+runs for the rest); a mismatch discovered at runtime ends only that top-up,
+never the campaign.  There is no pull inside a top-up -- it is a pure
+continuation.  A top-up phase with no ``epoch_window_map.csv`` fails closed
+(``seed_mismatch``) rather than guessing a window-to-state mapping.
+
+Cost
+~~~~
+One extra per-epoch union-MBAR solve per top-ups-on phase (up to two: before
+and after the top-up).  Measured at 236 states: 1,000,000 rows takes 102.7 s
+and peaks at 14.6 GB RSS; 250,000 rows takes 26.4 s and 4.06 GB.  This runs
+on the analysis/driver node, not a GPU -- size the node's RAM for the
+campaign's row count before enabling top-ups on a large layout; an
+out-of-memory kill during this solve cannot be caught.
+
+Synthetic validation
+~~~~~~~~~~~~~~~~~~~~
+A synthetic study (four analytic 2D landscapes, a 112-state 28-centre x
+4-rung ladder, 20 seeds; see
+``docs/superpowers/specs/2026-09-24-effective-topups/synth_study/README.md``)
+found no budget on any landscape where the heterogeneous-deficit regime the
+design spec asks for actually exists -- at the floor of decorrelated rows the
+split-halves test needs, zero states are still above target under the
+uniform baseline.  Reported for information only: top-ups lower the worst
+per-state sigma on two of four landscapes (gated-barrier -8.4%, 20/20 seeds;
+slow-cv2-double-branch -1.3%, 19/20) but do not improve PMF RMSE on any
+landscape (gated-barrier is 7% worse).  Missing-bridge routing (an edge
+spanning a genuine gap is topped as structural, an intact layout's matching
+edge is not) passes 20/20.  The honest summary is that top-ups are not shown
+to help in this harness; a real-MD comparison (chignolin_10, not yet run) is
+the actual test.
 """
 
 
