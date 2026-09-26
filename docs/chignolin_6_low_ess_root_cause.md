@@ -185,7 +185,9 @@ numbers and the top-level health verdict can move. Read this before comparing a 
 The overlap numbers that already existed keep their exact meaning, so cross-run comparisons
 against older analyses stay valid:
 
-- `s['neighbor_overlap']`, `overlap_matrix.csv`, `overlap_matrix.png` and
+- `s['neighbor_overlap']`, `overlap_matrix.csv`, the marginal heatmap (`overlap_matrix.png` at the time;
+  `overlap_matrix_cv1_hist.png` since 2026-09-26, when `overlap_matrix.png` became the pairwise-MBAR
+  overlap graph) and
   `window_diagnostics.csv`'s `overlap_left`/`overlap_right` are still the **CV1-marginal**
   histogram overlap, bit-identical to what the pre-fix code produced.
 - The `Weak neighbor CV overlap below 0.30 …` warning is still computed on that marginal

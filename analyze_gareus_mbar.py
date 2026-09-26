@@ -5408,6 +5408,35 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
         except Exception as _lo_exc:
             s.setdefault('warnings',[]).append(f"ladder-overlap axis report failed: {_lo_exc}")
 
+    # Pairwise MBAR overlap graph over the state layout (CV1, CV2, lambda) --
+    # overlap_matrix.png. Same global f_k/n_k and row alignment as the ladder
+    # block above. Presentation only: never changes the health verdict.
+    if getattr(args, 'no_overlap_graph', False):
+        try:
+            from gareus.mbar_analysis.plotting_overlap import remove_overlap_graph_outputs
+            remove_overlap_graph_outputs(out)   # never leave a previous run's graph looking current
+        except Exception as _og_exc:
+            s.setdefault('warnings', []).append(f"overlap graph cleanup failed: {_og_exc}")
+    else:
+        try:
+            from gareus.mbar_analysis.plotting_overlap import render_overlap_graph
+            from gareus.mbar_analysis.plotting import _secondary_cv_label
+            from gareus.mbar_analysis.pmf import _secondary_window_params
+            _og_sec_c, _og_sec_k = _secondary_window_params(d.meta, d.u_nk.shape[1])
+            _og = render_overlap_graph(
+                out, u_nk=d.u_nk, window=d.window, f_k=m['f_k'], n_k=m['n_k'], cv1=d.cv, cv2=d.cv2,
+                centers=d.centers, secondary_centers=_og_sec_c, lambdas=d.state_lambdas,
+                k1=list(d.k_kcal), k2=list(_og_sec_k), temperature_k=float(d.temp),
+                threshold=float(getattr(args, 'min_ladder_state_overlap', _LADDER_STATE_OVERLAP_MIN)),
+                bins=int(getattr(args, 'overlap_density_bins', 40)),
+                cv1_label=_primary_cv_axis_label(d.meta), cv2_label=_secondary_cv_label(d.meta))
+            s['overlap_graph'] = {k: v for k, v in _og.items() if k != 'files'}
+            s.setdefault('files', {}).update(_og.get('files') or {})
+            if not _og.get('available'):
+                s.setdefault('warnings', []).append(f"overlap graph skipped: {_og.get('reason')}")
+        except Exception as _og_exc:
+            s.setdefault('warnings', []).append(f"overlap graph failed: {_og_exc}")
+
     # Trajectory frame coverage -> RESULT HEALTH. This is deliberately a health
     # ROW, not just a warning: chignolin_7 lost 98% of its coordinate data to a
     # mis-resolved steps_per_frame and the only trace was an absent one, so a
@@ -5632,6 +5661,16 @@ def parse_args(argv=None):
                         'from a 1-D single-centre ladder: the CV1-direction rows reuse it, and it '
                         'is conservative for a 2-D (centre x rung) grid where each state shares '
                         'its unit column sum with up to 4 neighbours rather than 2.')
+    p.add_argument('--no-overlap-graph', action='store_true',
+                   help='Do not draw the pairwise MBAR overlap graph (overlap_matrix.png, '
+                        'overlap_density_layers.png, overlap_pairs_mbar.csv, overlap_graph_3d.html). '
+                        'It places every state at its (CV1 centre, CV2 centre, lambda) labelled by its '
+                        'state index, colours each neighbour and adjacent-rung edge by the pairwise '
+                        'symmetric MBAR overlap sqrt(O_ij*O_ji), and shades CV space by the overlap '
+                        'integrand. Edges below --min-ladder-state-overlap are drawn red dashed.')
+    p.add_argument('--overlap-density-bins', type=int, default=40, metavar='N',
+                   help='Bins per CV axis for the overlap-density sheets of the overlap graph '
+                        '(default %(default)s).')
     p.add_argument('--no-joint-overlap', action='store_true',
                    help='Do not compute the joint (CV1, CV2) window-overlap matrix; report and grade '
                         'the CV1 marginal only (pre-2026-08-25 behaviour). The marginal cannot see a '

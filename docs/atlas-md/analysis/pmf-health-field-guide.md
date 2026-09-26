@@ -49,6 +49,8 @@ Inspect full CV support, off-target restraint behavior, GaMD boost quality, traj
 
 For default analysis target 0.30, report marks worst overlap below 0.15 `FAIL` and 0.15–<0.30 `CAUTION`. Those are report thresholds. In 2D, diagnose CV1 **and** CV2 intersection support; CV1 histogram overlap alone cannot validate two-dimensional exchange/reweighting.
 
+`overlap_matrix.png` shows every state at its (CV1, CV2, λ) position with pairwise MBAR overlap on each neighbour and rung edge; weak edges are red dashed. See [Overlap graph](overlap-graph.md).
+
 Repair with bridge windows, centers on observed intersections, or restraint adjustment. Recheck explicit window table and new production samples.
 
 ### GaMD reweighting concern
