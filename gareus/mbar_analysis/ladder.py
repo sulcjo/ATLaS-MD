@@ -301,8 +301,22 @@ def pairwise_state_overlap(
     n_k = np.asarray(n_k, dtype=np.float64).reshape(-1)
     rows = (window == i) | (window == j)
     cols = np.array([i, j])
-    logq = f_k[cols][None, :] - u_nk[np.ix_(rows, cols)]            # log exp(f_k - u_k), k in {i, j}
     n = n_k[cols]
-    log_w = logq - logsumexp(logq, b=n[None, :], axis=1)[:, None]
+    log_w = pair_log_weights(u_nk[np.ix_(rows, cols)], f_k[cols], n)
     shared = float(np.exp(logsumexp(log_w[:, 0] + log_w[:, 1])))    # sum_n W_ni W_nj
     return math.sqrt((n[1] * shared) * (n[0] * shared))             # sqrt(O_ij O_ji)
+
+
+def pair_log_weights(u_pair: np.ndarray, f_pair: np.ndarray, n_pair: np.ndarray) -> np.ndarray:
+    """``log W_nk`` for k in the pair, with the 2-state mixture denominator of
+    ``pairwise_state_overlap``: ``W_nk = exp(f_k - u_k(x_n)) / sum_l N_l exp(f_l - u_l(x_n))``.
+
+    ``u_pair`` is (rows, 2): the pair's own samples, the pair's two columns.
+    ``exp(log_w[:, 0] + log_w[:, 1]) * sqrt(N_i N_j)`` is each sample's
+    contribution to ``sqrt(O_ij O_ji)`` -- the integrand the overlap graph bins
+    on the CV grid (``gareus.mbar_analysis.overlap_graph``).
+    """
+    from scipy.special import logsumexp  # noqa: PLC0415
+    logq = np.asarray(f_pair, dtype=np.float64)[None, :] - np.asarray(u_pair, dtype=np.float64)
+    n = np.asarray(n_pair, dtype=np.float64)
+    return logq - logsumexp(logq, b=n[None, :], axis=1)[:, None]

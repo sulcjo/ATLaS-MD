@@ -1453,6 +1453,38 @@ friendly to MBAR/PMF workflows, while retaining enough metadata to diagnose bad
 window overlap before pretending the PMF is meaningful.  Science: proudly turning
 uncertainty into files with names.
 
+Overlap graph (gareus-analyze)
+-----------------------------
+`gareus-analyze` writes overlap_matrix.png as a graph over the state layout,
+not a K x K heatmap in state-index order:
+
+    nodes     every state at (CV1 centre, CV2 centre, lambda), labelled with
+              its state index
+    edges     same-rung spatial neighbours + adjacent rungs at each centre,
+              coloured by the PAIRWISE symmetric MBAR overlap
+              sqrt(O_ij * O_ji) (0..0.5; two identical states give 0.5);
+              below --min-ladder-state-overlap (0.15): red dashed
+              unmeasured (state without samples): grey dotted, never weak
+    gap       a rung whose groups the neighbour rule left disconnected gets
+              its closest cross-group pair added, so a CV break is drawn
+              (red, near-zero overlap) instead of just missing
+    sheets    the per-sample overlap integrand sqrt(N_i N_j) W_ni W_nj binned
+              on the CV grid -- where in CV space the pair shares
+              configurations; integrates back to the edge's overlap.
+              Same-rung pairs on their rung, rung pairs at mid-lambda.
+
+A CV histogram cannot see a rung gap (two rungs at one centre overlap ~1 in CV
+space); the MBAR state overlap can.  CV1-only runs get a 2D (CV1 x lambda)
+version.  Other files:
+
+    overlap_density_layers.png     density sheets as flat panels
+    overlap_pairs_mbar.csv         i, j, kind (cv/rung/gap), layer_lambda, overlap, below_threshold
+    overlap_graph_3d.html          rotatable (needs CV2 and plotly)
+    overlap_matrix_cv1_hist.png    the old CV1-marginal heatmap (renamed)
+
+Flags: --no-overlap-graph, --overlap-density-bins N (40).  Presentation only;
+never changes the health verdict.  Manual: docs/atlas-md/analysis/overlap-graph.md
+
 14. Stale window maps after --us-auto-drop-bad-windows
 ------------------------------------------------------
 `--us-auto-drop-bad-windows` prunes umbrella windows after the pull stage and

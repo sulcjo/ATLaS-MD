@@ -1613,9 +1613,11 @@ def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.nd
     # ALONGSIDE the marginal, never in place of it, and this is not tidiness:
     #
     #  * Every historical key/column/file keeps carrying the marginal number.
-    #    `neighbor_overlap`, `overlap_matrix.csv`, `overlap_matrix.png` and
-    #    window_diagnostics.csv's overlap_left/overlap_right have meant "CV1
-    #    marginal" for the whole life of this pipeline; silently switching the
+    #    `neighbor_overlap`, `overlap_matrix.csv` and window_diagnostics.csv's
+    #    overlap_left/overlap_right have meant "CV1 marginal" for the whole life
+    #    of this pipeline (the marginal heatmap, formerly `overlap_matrix.png`,
+    #    is `overlap_matrix_cv1_hist.png` since 2026-09-26; `overlap_matrix.png`
+    #    is now the pairwise-MBAR overlap graph); silently switching the
     #    *space* of an existing key makes two runs analysed either side of the
     #    change incomparable with nothing on disk to tell them apart.
     #  * Joint overlap is bounded above by the CV1 marginal (a refinement of the

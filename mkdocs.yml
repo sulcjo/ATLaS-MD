@@ -63,6 +63,7 @@ nav:
       - Analysis workflow: analysis/overview.md
       - PMF validity: analysis/pmf-validity.md
       - PMF health field guide: analysis/pmf-health-field-guide.md
+      - Overlap graph: analysis/overlap-graph.md
       - Synthetic adaptive harness: analysis/synthetic-harness.md
       - Energy decomposition: analysis/energy-decomposition.md
   - Reference:
