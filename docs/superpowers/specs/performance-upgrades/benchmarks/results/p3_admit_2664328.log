@@ -1,0 +1,32 @@
+host d098 job 2664328 | code dda8caae07236c77b3943c6267198aa64fb241e7 | nofile 65536
+0, NVIDIA L40S, 595.71.05
+1, NVIDIA L40S, 595.71.05
+2, NVIDIA L40S, 595.71.05
+3, NVIDIA L40S, 595.71.05
+=== MPS on, CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=inherit (fresh process)
+built 236 contexts in 142s | resident/GPU {'0': 59, '2': 59, '1': 59, '3': 59} | cv_force_layout=shared_contact_subcv | bias groups=(29,)
+RESULT rep=0 admit=all eff/GPU=59 maxseen/GPU=59 N=236 rounds=10 wall=66.0s | 37.86 steps/s/rep | 11.45 ns/day/rep | node 2702 ns/day | cpu 163.3 cores | E0=-528465 finite=True | MPS=True pct=inherit PME_DISABLE=true chunk=250 quantum=250 | FSF_T 0.919
+RESULT rep=0 admit=32 eff/GPU=32 maxseen/GPU=32 N=236 rounds=12 wall=65.5s | 45.83 steps/s/rep | 13.86 ns/day/rep | node 3271 ns/day | cpu 107.6 cores | E0=-527173 finite=True | MPS=True pct=inherit PME_DISABLE=true chunk=250 quantum=250 | FSF_T 0.949
+RESULT rep=0 admit=16 eff/GPU=16 maxseen/GPU=16 N=236 rounds=14 wall=63.9s | 54.79 steps/s/rep | 16.57 ns/day/rep | node 3910 ns/day | cpu 59.9 cores | E0=-529535 finite=True | MPS=True pct=inherit PME_DISABLE=true chunk=250 quantum=250 | FSF_T 0.957
+RESULT rep=0 admit=8 eff/GPU=8 maxseen/GPU=8 N=236 rounds=14 wall=60.8s | 57.58 steps/s/rep | 17.41 ns/day/rep | node 4109 ns/day | cpu 30.6 cores | E0=-527041 finite=True | MPS=True pct=inherit PME_DISABLE=true chunk=250 quantum=250 | FSF_T 0.980
+RESULT rep=1 admit=all eff/GPU=59 maxseen/GPU=59 N=236 rounds=9 wall=61.8s | 36.44 steps/s/rep | 11.02 ns/day/rep | node 2600 ns/day | cpu 176.7 cores | E0=-529268 finite=True | MPS=True pct=inherit PME_DISABLE=true chunk=250 quantum=250 | FSF_T 0.928
+RESULT rep=1 admit=32 eff/GPU=32 maxseen/GPU=32 N=236 rounds=11 wall=61.5s | 44.69 steps/s/rep | 13.52 ns/day/rep | node 3190 ns/day | cpu 118.0 cores | E0=-527170 finite=True | MPS=True pct=inherit PME_DISABLE=true chunk=250 quantum=250 | FSF_T 0.943
+RESULT rep=1 admit=16 eff/GPU=16 maxseen/GPU=16 N=236 rounds=14 wall=64.0s | 54.70 steps/s/rep | 16.54 ns/day/rep | node 3904 ns/day | cpu 59.9 cores | E0=-528552 finite=True | MPS=True pct=inherit PME_DISABLE=true chunk=250 quantum=250 | FSF_T 0.928
+RESULT rep=1 admit=8 eff/GPU=8 maxseen/GPU=8 N=236 rounds=14 wall=60.9s | 57.46 steps/s/rep | 17.38 ns/day/rep | node 4101 ns/day | cpu 30.6 cores | E0=-528801 finite=True | MPS=True pct=inherit PME_DISABLE=true chunk=250 quantum=250 | FSF_T 0.915
+=== MPS on, CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=50 (fresh process)
+built 236 contexts in 139s | resident/GPU {'0': 59, '1': 59, '2': 59, '3': 59} | cv_force_layout=shared_contact_subcv | bias groups=(29,)
+RESULT rep=0 admit=all eff/GPU=59 maxseen/GPU=59 N=236 rounds=10 wall=64.4s | 38.82 steps/s/rep | 11.74 ns/day/rep | node 2771 ns/day | cpu 178.9 cores | E0=-529146 finite=True | MPS=True pct=50 PME_DISABLE=true chunk=250 quantum=250 | FSF_T 0.944
+RESULT rep=0 admit=16 eff/GPU=16 maxseen/GPU=16 N=236 rounds=15 wall=63.4s | 59.13 steps/s/rep | 17.88 ns/day/rep | node 4220 ns/day | cpu 59.9 cores | E0=-527920 finite=True | MPS=True pct=50 PME_DISABLE=true chunk=250 quantum=250 | FSF_T 0.957
+RESULT rep=0 admit=8 eff/GPU=8 maxseen/GPU=8 N=236 rounds=15 wall=60.4s | 62.09 steps/s/rep | 18.78 ns/day/rep | node 4431 ns/day | cpu 30.6 cores | E0=-528582 finite=True | MPS=True pct=50 PME_DISABLE=true chunk=250 quantum=250 | FSF_T 0.938
+RESULT rep=1 admit=all eff/GPU=59 maxseen/GPU=59 N=236 rounds=10 wall=65.2s | 38.34 steps/s/rep | 11.60 ns/day/rep | node 2736 ns/day | cpu 178.3 cores | E0=-528052 finite=True | MPS=True pct=50 PME_DISABLE=true chunk=250 quantum=250 | FSF_T 0.958
+RESULT rep=1 admit=16 eff/GPU=16 maxseen/GPU=16 N=236 rounds=15 wall=63.6s | 58.98 steps/s/rep | 17.84 ns/day/rep | node 4209 ns/day | cpu 59.9 cores | E0=-527235 finite=True | MPS=True pct=50 PME_DISABLE=true chunk=250 quantum=250 | FSF_T 0.961
+RESULT rep=1 admit=8 eff/GPU=8 maxseen/GPU=8 N=236 rounds=15 wall=60.5s | 61.94 steps/s/rep | 18.73 ns/day/rep | node 4420 ns/day | cpu 30.6 cores | E0=-528303 finite=True | MPS=True pct=50 PME_DISABLE=true chunk=250 quantum=250 | FSF_T 0.939
+=== MPS on, CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=25 (fresh process)
+built 236 contexts in 138s | resident/GPU {'0': 59, '2': 59, '1': 59, '3': 59} | cv_force_layout=shared_contact_subcv | bias groups=(29,)
+RESULT rep=0 admit=all eff/GPU=59 maxseen/GPU=59 N=236 rounds=10 wall=62.6s | 39.95 steps/s/rep | 12.08 ns/day/rep | node 2851 ns/day | cpu 178.6 cores | E0=-528811 finite=True | MPS=True pct=25 PME_DISABLE=true chunk=250 quantum=250 | FSF_T 0.934
+RESULT rep=0 admit=16 eff/GPU=16 maxseen/GPU=16 N=236 rounds=15 wall=60.4s | 62.05 steps/s/rep | 18.76 ns/day/rep | node 4429 ns/day | cpu 59.9 cores | E0=-528499 finite=True | MPS=True pct=25 PME_DISABLE=true chunk=250 quantum=250 | FSF_T 0.943
+RESULT rep=0 admit=8 eff/GPU=8 maxseen/GPU=8 N=236 rounds=16 wall=62.6s | 63.93 steps/s/rep | 19.33 ns/day/rep | node 4562 ns/day | cpu 30.3 cores | E0=-528725 finite=True | MPS=True pct=25 PME_DISABLE=true chunk=250 quantum=250 | FSF_T 0.946
+RESULT rep=1 admit=all eff/GPU=59 maxseen/GPU=59 N=236 rounds=10 wall=63.0s | 39.65 steps/s/rep | 11.99 ns/day/rep | node 2830 ns/day | cpu 178.0 cores | E0=-528855 finite=True | MPS=True pct=25 PME_DISABLE=true chunk=250 quantum=250 | FSF_T 0.925
+RESULT rep=1 admit=16 eff/GPU=16 maxseen/GPU=16 N=236 rounds=15 wall=60.6s | 61.85 steps/s/rep | 18.70 ns/day/rep | node 4414 ns/day | cpu 59.9 cores | E0=-528582 finite=True | MPS=True pct=25 PME_DISABLE=true chunk=250 quantum=250 | FSF_T 0.940
+RESULT rep=1 admit=8 eff/GPU=8 maxseen/GPU=8 N=236 rounds=16 wall=62.9s | 63.64 steps/s/rep | 19.25 ns/day/rep | node 4542 ns/day | cpu 30.3 cores | E0=-528701 finite=True | MPS=True pct=25 PME_DISABLE=true chunk=250 quantum=250 | FSF_T 0.922
+DONE

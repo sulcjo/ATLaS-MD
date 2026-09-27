@@ -350,6 +350,7 @@ def _method_settings(args: Any) -> dict[str, Any]:
     settings["pep_gamd_envelope_path"] = (
         "global_shared_gamd_setup/shared_gamd_setup_globals.json" if _pep_gamd else None
     )
+    settings["replica_admission"] = admission_manifest_record(args)
     return settings
 
 
@@ -566,6 +567,13 @@ def initialize_run_manifest(args: Any, out_dir: Path, argv: Optional[Iterable[st
             "Large trajectory files are summarized by size/count and are not fully hashed by default.",
         ],
     }
+    # A real --resume continues the same campaign, so the per-job replica-admission
+    # record (spec 2026-09-26 §3) must go on appending to this same history rather
+    # than being wiped by the from-scratch rebuild above -- same carry-forward
+    # pattern as run_id/start_time_utc. A non-resume start into the same directory
+    # is a fresh campaign and gets a fresh history.
+    if resume and existing and isinstance(existing.get("replica_admission_history"), list):
+        payload["replica_admission_history"] = existing["replica_admission_history"]
     _write_manifest(out_dir, payload)
     return payload
 
@@ -634,6 +642,55 @@ def update_run_manifest(out_dir: Path, patch: Mapping[str, Any]) -> dict[str, An
         payload = {"schema_version": RUN_MANIFEST_SCHEMA_VERSION, "run_id": str(uuid.uuid4()), "status": "partial"}
     payload["last_updated_utc"] = _utc_now()
     _deep_update(payload, dict(patch))
+    _write_manifest(out_dir, payload)
+    return payload
+
+
+def admission_manifest_record(args: Any, effective_per_queue: Optional[Mapping[str, int]] = None) -> dict[str, Any]:
+    """The one manifest representation of the replica-admission settings (spec 2026-09-26 §3).
+
+    Stored as ``method_settings["replica_admission"]``; never also as flat keys,
+    which would go stale on a resume (a resume leaves a complete manifest's
+    method_settings untouched -- see ensure_run_manifest_initialized).
+    """
+    if hasattr(args, "_cuda_mps_inherited_env"):
+        inherited = getattr(args, "_cuda_mps_inherited_env")
+    else:
+        inherited = os.environ.get("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE")
+    return {
+        "active_replicas_per_gpu": getattr(args, "active_replicas_per_gpu", "all"),
+        "active_replica_turn_steps": int(getattr(args, "active_replica_turn_steps", 50)),
+        "cuda_mps_active_thread_percentage": {
+            "requested": getattr(args, "cuda_mps_active_thread_percentage", "inherit"),
+            "inherited_env": inherited if inherited is not None else "unset",
+        },
+        "effective_per_queue": dict(effective_per_queue) if effective_per_queue is not None else None,
+    }
+
+
+def record_replica_admission(out_dir: Path, args: Any, effective_per_queue: Mapping[str, int]) -> dict[str, Any]:
+    """Record this job's admission settings; runs on every job, fresh or resumed.
+
+    Replaces ``method_settings["replica_admission"]`` wholesale (``_deep_update``
+    would merge nested dicts and keep a previous job's queue keys) and appends
+    one ``replica_admission_history`` entry. One job process is the manifest's
+    only writer while it runs, so read-modify-write needs no file lock.
+    """
+    out_dir = Path(out_dir)
+    record = admission_manifest_record(args, effective_per_queue)
+    payload = _read_manifest(out_dir) or update_run_manifest(out_dir, {})
+    method_settings = payload.get("method_settings")
+    if not isinstance(method_settings, dict):
+        method_settings = {}
+    history = payload.get("replica_admission_history")
+    history = list(history) if isinstance(history, list) else []
+    entry = {"recorded_utc": _utc_now(), "slurm_job_id": os.environ.get("SLURM_JOB_ID"), **record}
+    payload = {
+        **payload,
+        "method_settings": {**method_settings, "replica_admission": record},
+        "replica_admission_history": history + [entry],
+        "last_updated_utc": _utc_now(),
+    }
     _write_manifest(out_dir, payload)
     return payload
 

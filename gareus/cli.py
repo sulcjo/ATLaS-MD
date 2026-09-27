@@ -895,6 +895,24 @@ def _add_platform_args(p: argparse.ArgumentParser) -> None:
                    help="Apply CUDA MPS-optimal settings as soft defaults: UseBlockingSync=false, "
                         "DeterministicForces=false. Individual --cuda-* flags override these. "
                         "Requires CUDA MPS running on the node (nvidia-cuda-mps-control -d).")
+    p.add_argument("--active-replicas-per-gpu", default="all",
+                   help="Production stepping: at most this many replicas per GPU advance at once, in "
+                        "FIFO turns ('all' = every replica at once, today's behaviour). Measured best "
+                        "with MPS at 59 contexts/GPU: 6-8. Spec 2026-09-26-replica-admission-design.")
+    # Deliberately no type= here, consistent with --active-replicas-per-gpu and
+    # --cuda-mps-active-thread-percentage below: with type=int, argparse applies that
+    # conversion to a *string* default too (e.g. one set via parser.set_defaults() from a
+    # quoted YAML scalar), so a bad value would exit via argparse's own SystemExit before
+    # _validate_replica_admission_args ever runs, and a good quoted numeric string would
+    # be silently converted before that validator's own string-handling code could ever
+    # see it. Leaving this a plain string/int lets both cases reach the validator.
+    p.add_argument("--active-replica-turn-steps", default=50,
+                   help="Steps a replica runs per admitted turn before rejoining its GPU's queue. "
+                        "Ignored when --active-replicas-per-gpu is 'all'.")
+    p.add_argument("--cuda-mps-active-thread-percentage", default="inherit",
+                   help="Set CUDA_MPS_ACTIVE_THREAD_PERCENTAGE for this process before any CUDA "
+                        "context exists ('inherit' = leave the environment alone). Errors if the "
+                        "environment already holds a different value. Applies to every phase.")
     p.add_argument("--platform-temp-directory", default="")
     p.add_argument("--cpu-threads", type=int, default=1,
                    help="Threads per replica context (platform CPU only). "
@@ -1083,6 +1101,31 @@ def _validate_cv_selection_args(p: argparse.ArgumentParser, args: argparse.Names
             if missing:
                 p.error("--cv2 residual-torsion-pc with --window-mode manual requires the "
                         "three frozen artifact paths; missing: " + ", ".join(missing))
+
+
+def _validate_replica_admission_args(args: argparse.Namespace) -> None:
+    """Normalise the replica-admission settings (spec 2026-09-26 §3); raise ValueError if invalid."""
+    from .replica_admission import parse_active_replicas_per_gpu, parse_mps_thread_percentage
+
+    args.active_replicas_per_gpu = parse_active_replicas_per_gpu(getattr(args, "active_replicas_per_gpu", "all"))
+    raw_turn = getattr(args, "active_replica_turn_steps", 50)
+    turn = raw_turn
+    if isinstance(turn, bool):
+        raise ValueError(f"--active-replica-turn-steps must be an integer >= 1, got {raw_turn!r}")
+    if isinstance(turn, str):
+        # A numeric YAML string (e.g. `active_replica_turn_steps: "30"`), consistent
+        # with --active-replicas-per-gpu/--cuda-mps-active-thread-percentage.
+        try:
+            turn = int(turn.strip())
+        except ValueError:
+            raise ValueError(f"--active-replica-turn-steps must be an integer >= 1, got {raw_turn!r}") from None
+    elif not isinstance(turn, int):
+        raise ValueError(f"--active-replica-turn-steps must be an integer >= 1, got {raw_turn!r}")
+    if turn < 1:
+        raise ValueError(f"--active-replica-turn-steps must be an integer >= 1, got {raw_turn!r}")
+    args.active_replica_turn_steps = int(turn)
+    args.cuda_mps_active_thread_percentage = parse_mps_thread_percentage(
+        getattr(args, "cuda_mps_active_thread_percentage", "inherit"))
 
 
 def _validate_npt_args(args: argparse.Namespace) -> None:
@@ -1692,6 +1735,7 @@ def parse_args(argv: Optional[Iterable[str]] = None):
     _validate_gamd_args(args)
     _validate_cv_selection_args(p, args)
     _validate_npt_args(args)
+    _validate_replica_admission_args(args)
     validate_gamd_stage_multiples(args)
 
     return args
@@ -1981,6 +2025,9 @@ def main(argv: Optional[Iterable[str]] = None):
     _graceful_shutdown.clear()
     argv_list = _argv_as_list(argv)
     args = parse_args(argv_list)
+    # Before any OpenMM platform/context exists (spec 2026-09-26 §5).
+    from .mps_share import apply_mps_thread_percentage
+    apply_mps_thread_percentage(args)
     # For --input-pdb runs the sequence is nominal (real topology comes from the
     # supplied structure), so the >=2-residue terminal-CV gate does not apply.
     args.seq = validate_sequence(args.seq, require_min_two=not bool(getattr(args, "input_pdb", None)))

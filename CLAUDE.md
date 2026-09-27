@@ -1,6 +1,6 @@
 # Claude Handoff
 
-Updated 2026-09-25.
+Updated 2026-09-27.
 
 ## Adaptive top-ups (`--ap-topups`, off by default) — allocator + seeding
 
@@ -13,6 +13,17 @@ Updated 2026-09-25.
 - **Campaign-end rung overlap is now pairwise**, not full-union (commit `f7e007b`) — the full-union statistic reads ~2.7x too low on a large ladder (chignolin_7, 64 states: median 0.089 full vs 0.258 pairwise, 38/48 vs 0/48 below 0.15). The 0.15/0.25 rung thresholds are carried over unchanged and have **not** been re-measured on the pairwise scale. This updates the "λ ladder ... adaptive production" section's limitation below ("a rung gap is caught at campaign end, not mid-campaign"): with top-ups on, the per-epoch union diagnostics now reach the rung gate and `add_rung` mid-campaign too; with top-ups off, that limitation is unchanged.
 - **Memory guard.** The per-epoch union build takes `size_guard` (`_topup_union_size_guard`): after subsampling, before any rows x states matrix, peak = kept rows x states x 8 B x 7.7 (`UNION_PEAK_BYTES_PER_CELL`, from the 1M x 236 = 14.6 GB bench); over `--ap-topup-diagnostics-max-gb` (8.0, ~550k kept rows at 236 states) -> WARNING + `no_diagnostics`. The raw sample dicts the builder reads before subsampling are not guarded.
 - Synthetic validation found no landscape with a targetable heterogeneous-deficit regime; top-ups are not shown to help on any tested metric except worst-case sigma on two of four landscapes. See `docs/atlas-md/developer/topups-todo.md` and the `-hh top-ups` help topic for the numbers and the real-MD test (chignolin_10) still to run.
+
+## Replica admission cap + MPS thread share (`--active-replicas-per-gpu`, off by default)
+
+- Files: `gareus/replica_admission.py` (`AdmissionDispatcher`, `advance_replicas`, `make_dispatcher`), `gareus/mps_share.py`, wiring in `gareus/production.py` (`step_all`, after replica construction), settings in `gareus/cli.py`, record in `gareus/provenance.py`. Spec `docs/superpowers/specs/2026-09-26-replica-admission-design.md`.
+- Defaults `all` / `50` / `inherit` keep `step_all` on today's `pool.map` path (`dispatcher is None`). Benchmark best (harness, not yet production): 8 per GPU, 50-step turns, MPS 25 % = +78 % node ns/day at 236 contexts (jobs 2664328, 2665264).
+- Turns are neutral: `ReplicaStepDriver.advance` admits deadlines `due <= end`, so a volume move or report on a turn end is serviced inside that turn, once. Pinned by `tests/test_replica_admission_drivers.py`.
+- Dispatcher lock is a plain `Lock`, never held across submit/callback/fn/wait; synchronous callbacks are trampolined (no recursion on instant turns); first failure drains all GPUs before re-raising, so the pool is idle when NaN diagnostics read Contexts (today's `pool.map` path does not guarantee that).
+- Manifest: ONE key, `method_settings["replica_admission"]`, replaced wholesale every job by `record_replica_admission`, plus `replica_admission_history`. Never add flat keys. "A resume leaves `method_settings` untouched" only holds for adaptive-production PHASE directories, which go through `ensure_run_manifest_initialized` (skips a complete manifest); a plain run's top-level out_dir goes through `main()`'s unconditional `initialize_run_manifest` on every job, fresh or resumed, which rebuilds `method_settings`/`resolved_args` from the current job's args each time. `replica_admission_history` is the one thing carried across a real `--resume` (commit `465d8d5`), not the values in `method_settings` itself. Known residual: `--extend` in regular mode on a plain run reaches `initialize_run_manifest` before `_resolve_and_apply_extend_mode` sets `args.resume = True`, so the history-carry check sees `resume=False` and the history resets there (the current job's own `method_settings["replica_admission"]` stays correct regardless, since the job rewrites it after).
+- Readers use `method_settings["replica_admission"]`, never `resolved_args`. `resolved_args` being "a stale first-job snapshot" is, again, only true for adaptive-production phase directories (`ensure_run_manifest_initialized` skips a complete manifest); for a plain run's top-level out_dir it holds the current job's own args, rebuilt every job by `initialize_run_manifest`. History is one entry per `run_gareus` call, i.e. per phase directory.
+- MPS percentage is set right after `parse_args`; errors if `openmm` is already imported or the environment holds a different value. At 25 %, single-context setup/recon phases can be up to ~4x slower on a fresh campaign (unmeasured).
+- Tests: `tests/test_replica_admission.py`, `tests/test_replica_admission_drivers.py`, `tests/test_replica_admission_config.py`.
 
 ## Shared contact-sum CV force (`SHARED_CONTACT_LAYOUT`) — CV1 umbrella rides on the residual CV2 force
 
