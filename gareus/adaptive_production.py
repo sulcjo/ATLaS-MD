@@ -40,6 +40,7 @@ from .checkpoints import production_checkpoint_available
 from .io import write_json, write_text_atomic, read_json_file, resolve_run_temperature_k, _json_ready, acquire_run_lock
 from .lifecycle import _graceful_shutdown
 from .store import SegmentRegistry
+from .extension_seeding import extension_parent_dirs
 # Real-frame seed extraction lives in tica.py (a dependency-free leaf module)
 # so seeding.py can also use it for campaign-wide seed search without a
 # circular import - seeding.py -> production.py -> adaptive_production.py is
@@ -8477,6 +8478,20 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
         ext_dir.mkdir(parents=True, exist_ok=True)
         ext_args = copy.copy(args)
         ext_args.out = str(ext_dir)
+        # Fresh exchange/thermostat/velocity/NPT streams per round: continuing each
+        # window's chain from its end state would otherwise replay the previous
+        # round's random sequences exactly (N4). Stride distinct from run_segment's
+        # epoch (1_000_003) and segment (997) offsets.
+        ext_args.seed = int(args.seed) + (ext_index + 1) * 7_919_993
+        # Continue every window from its newest parent end state (no graft, no pull);
+        # run_gareus falls back to pulling only if some window has no parent state.
+        setattr(ext_args, "_adaptive_phase_info", {
+            "is_extension": True,
+            "is_final_stage": True,
+            "extension_index": int(ext_index + 1),
+            "segment_name": ext_dir.name,
+            "extension_parent_dirs": [str(p) for p in extension_parent_dirs(adaptive_dir, ext_index)],
+        })
         actual_ext_steps = runtime_pool.clip_steps(
             max(1, len(registry.active_states())),
             int(ext_steps),

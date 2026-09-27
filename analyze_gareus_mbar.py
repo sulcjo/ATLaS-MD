@@ -744,6 +744,8 @@ def checkpoint_steps_from_data(step: np.ndarray, n_timepoints: int) -> np.ndarra
     steps=steps[np.isfinite(steps)]
     if steps.size==0:
         return np.arange(1,max(2,int(n_timepoints))+1,dtype=np.int64)
+    if int(n_timepoints)<=0:
+        return np.empty(0,dtype=np.int64)
     uniq=np.unique(steps)
     if uniq.size<=int(n_timepoints):
         return uniq
@@ -5815,6 +5817,8 @@ def parse_args(argv=None):
     args=p.parse_args(argv)
     if args.epochs is not None and any(epoch < 0 for epoch in args.epochs):
         p.error('--epoch must be non-negative')
+    if int(getattr(args,'convergence_timepoints',10))<=0:
+        args.no_convergence=True
     if getattr(args,'no_rg',False):
         args.rg_from_trajectories='never'
     if getattr(args,'no_pca_fes',False):

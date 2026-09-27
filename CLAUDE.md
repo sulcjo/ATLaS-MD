@@ -1,6 +1,6 @@
 # Claude Handoff
 
-Updated 2026-09-27.
+Updated 2026-09-27 (extension seeding).
 
 ## Adaptive top-ups (`--ap-topups`, off by default) — allocator + seeding
 
@@ -31,6 +31,15 @@ Updated 2026-09-27.
 - Top-level phases: `md` (step_all), `sample`, `log`, `exchange`, `checkpoint_flush`, `checkpoint_save`, `checkpoint_scratch_sync`, `progress`. Sub-phases (dotted, excluded from the top-level sum): `sample.fetch`, `exchange.fetch`, `exchange.swap_apply`. `unattributed_s` = loop wall outside all top-level phases.
 - Written atomically to `<out>/production_phase_timers.json` at every checkpoint (before the scratch sync) and at loop end, with the summed NPT controller `_timings` (read/scale/restore/evaluate/verify, attempts) under `"npt"`; a one-line `[phase-timers]` summary prints at loop end. Normalised per 2000 steps (the sample/exchange LCM).
 - Why: the replica cap's +57 % harness gain became +2.4 % in production with ~19 s/2000 steps unattributed; see docs/superpowers/specs/performance-upgrades/review-2026-09-27-p5-p7.md. Note `md` includes NPT attempts and trajectory frames (they run inside each replica's advance).
+
+## Frozen-final extensions continue from end states (`gareus/extension_seeding.py`)
+
+- A `final_extension_NNN` round runs the final phase's own window set, so it no longer re-grafts seeds and US-pulls every window: that cost 51 % of chignolin_9's extension job (job 2680578, 1 h 57 min of 3 h 51 min). The driver sets `_adaptive_phase_info = {"is_extension": True, "extension_parent_dirs": [...]}` (parents oldest first: `final/baseline`, the final top-ups, earlier extensions) and a per-round RNG seed offset (`+ (round) * 7_919_993`, so continued chains never replay the previous round's streams); `run_gareus` calls `_seed_extension_windows_from_parent_ends`.
+- Per state, the NEWEST parent that holds it wins, whichever source it has: `final_window_states/` (exact State; restraint in nm/kJ, CVs re-checked after `set_window`) or `final_pdbs/` (positions to 1e-3 A + CRYST1 box; restraint checked in A/kcal against the parent's checkpoint-manifest `windows_A`/`window_k_kcal_mol_A2`/`secondary_cv_*`, which are post-drop and in the PDB filenames' window order; the replica then gets `applyConstraints` and fresh Maxwell-Boltzmann velocities). Parent window -> state always goes through the parent's own `epoch_window_map.csv`.
+- All-or-nothing: if any window has no parent end state, the extension has no `epoch_window_map.csv`, or a parent state fails the restraint/atom-count check (`SeedMismatchError`, caught in `run_gareus`), the segment prints a WARNING and pulls every window as before. An export seed whose CVs fail the post-`set_window` check still raises (as for top-ups). Parent maps are read raw, not repaired (same as top-ups); a stale one fails the restraint check and falls back to the pull.
+- Extensions always export `final_window_states/` (~0.7 GB per 236-window segment) so the next round continues exactly, even with top-ups off.
+- Verified on chignolin_9's real data (scratch copy on aurum2): all 236 windows resolve to `final_extension_001/final_pdbs` with matching restraints, 19,008 atoms, box 5.82 nm, peptide whole (max consecutive CA-CA 4.10 A). Tests: `tests/test_extension_seeding.py`. The production context-building branch (constraints + velocities) has no unit test; it needs a live Context.
+- Phase-timer note: `aggregate_npt_timings` reported `controllers: 0` because `BiasedMCBarostatController` keeps `_timings` on its `_core`; the wrapper now exposes a `_timings` property. The probe's real NPT cost, recovered from the checkpoint manifest, is ~41 ms per attempt, about 4.8 % of `md`; results are in the integrator docx §6.5.
 
 ## Shared contact-sum CV force (`SHARED_CONTACT_LAYOUT`) — CV1 umbrella rides on the residual CV2 force
 

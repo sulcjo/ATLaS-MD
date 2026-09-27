@@ -66,3 +66,31 @@ at 236 states. This runs on the driver/analysis node, not a GPU, and an out-of-m
 cannot be caught. Before enabling `--ap-topups` on chignolin_10 (or any campaign of comparable size), either
 subsample the union input before the solve or confirm the launch node has enough RAM for the campaign's full
 row count.
+
+## T7 — compress and prune output files before chignolin_10 (not started)
+
+Requested 2026-09-27. chignolin_9's run directory is 334 GB (local copy of 27 Sep, `final/baseline` at 28 %;
+aurum2 reports 188 GB for the same 282 GB of files because its filesystem compresses). Where it goes:
+
+| Output | Size | Note |
+| --- | --- | --- |
+| Checkpoint generations (`*/checkpoints/generations/*/replica_*.chk`) | 328 GB | every generation kept: 30-67 per phase x 236 replicas x 6.9 MB (~1.6 GB/generation); epoch_001/baseline alone 108 GB |
+| PDB files | 15 GB | seed banks, `final_pdbs`, `filtered_seed_bank` (~700-1,100 PDBs per directory) |
+| `progress.jsonl` | 11 GB | one growing JSON line per progress/distances event, uncompressed |
+| Trajectories (`.xtc`), samples/exchanges (Parquet) | 4 GB | already compressed formats |
+
+To do before launching chignolin_10:
+
+1. **Checkpoint retention (biggest win).** Keep only the newest N generations per phase (e.g. 2-3, enough for
+   a corrupt-latest fallback) and delete older ones once a newer generation is fully written and verified.
+   Check resume, `load_production_checkpoint`, top-up seeding (`final_window_states/`) and the Pep-GaMD
+   integrator-globals restore do not read old generations first.
+2. **`progress.jsonl`.** Rotate per job or per phase and gzip closed files, or stop writing a line for every
+   `distances` event (it duplicates the Parquet samples). Check readers (dashboard, `gareus_monitor.py`,
+   resume ETA) before changing the format.
+3. **PDB sets.** Write seed banks and `final_pdbs` as one compressed archive or a multi-model/`.pdb.gz` file;
+   check `GENPEPT.py`, seeding and analysis readers accept it.
+4. **Checkpoints themselves.** Measure whether gzip/zstd on `.chk` is worth the resume latency (binary
+   OpenMM state, likely compresses poorly; measure before deciding).
+
+Measure the saving on a copy of chignolin_9 before changing defaults; none of this may change sampled data.

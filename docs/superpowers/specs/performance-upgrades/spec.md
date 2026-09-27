@@ -209,6 +209,8 @@ Benchmark `none`, local owner placement, and local placement plus measured first
 
 ## 9. P6 — remove passive reporting barriers
 
+> **Dropped 2026-09-27.** The production phase-timer probe (job 2680578, chignolin_9 `final_extension_001`, cap 8/GPU) puts everything outside `md` at 3.1 s per 2000 steps (<5 %); `sample` + `log` are 1.49 s (2.3 %), which is P6's whole ceiling, against three critical concurrency findings in the review. Kept below for the record only.
+
 ### 9.1 Eligibility and boundaries
 
 This is an event-scheduler change, not merely moving the existing `sample()` call to a helper. It depends on immutable observations, helper-cpus' bounded queues and durable output protocol, and a complete inventory of report consumers.
