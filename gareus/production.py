@@ -112,6 +112,7 @@ from .forces import (
     contact_switch_constants_nm,
 )
 from .replica_admission import advance_replicas, effective_limits, make_dispatcher, queue_keys_from_platform_props
+from .phase_timers import PhaseTimers, aggregate_npt_timings
 from .provenance import (record_replica_admission, initialize_run_manifest, ensure_run_manifest_initialized, update_run_manifest,
                          finalize_run_manifest, pair_model_sha256)
 from .kernel_identity import (EXCHANGE_ENERGY_VERSION, FAST_SCALAR_MODES, LEGACY_TWO_TERM_MODES,
@@ -7169,6 +7170,9 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         flush=True,
     )
     record_replica_admission(out_dir, args, _admission_effective)
+    # Optional production-loop phase timers (--production-phase-timers, off by default).
+    _phase_timers = PhaseTimers(enabled=bool(getattr(args, "production_phase_timers", False)))
+    _phase_timers_path = out_dir / "production_phase_timers.json"
 
     if _velocity_randomize_skip_count:
         # Ruling 17: one summary line for the whole segment, not one per window --
@@ -7663,7 +7667,9 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 v_pep, v_dih = _fetch_v_pep_v_dih(sim.context, pep_env, unit)
                 return r, cv, ss, pe, v_pep, v_dih
 
-            for r, cv, ss, pe, v_pep, v_dih in _sim_pool.map(_fetch_state, enumerate(sims)):
+            with _phase_timers.phase("sample.fetch"):
+                _fetched_states = _sim_pool.map(_fetch_state, enumerate(sims))
+            for r, cv, ss, pe, v_pep, v_dih in _fetched_states:
                 primary_values[r], ss_values[r], potentials_kj[r] = cv, ss, pe
                 v_pep_kj[r], v_dih_kj[r] = v_pep, v_dih
             ss_centers_arr = ss_centers_arr_global
@@ -7974,8 +7980,9 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     set_window(sims[replica_index].context, centers_nm, ks_kj_nm2, assignments[replica_index], secondary_cv_centers, secondary_cv_ks_kj)
                     set_replica_lambda_for_window(sims[replica_index].integrator, assignments[replica_index], state_lambdas, k0max_by_channel)
 
-                _sim_pool.submit(i, _apply_swap_to_replica, i).result()
-                _sim_pool.submit(j, _apply_swap_to_replica, j).result()
+                with _phase_timers.phase("exchange.swap_apply"):
+                    _sim_pool.submit(i, _apply_swap_to_replica, i).result()
+                    _sim_pool.submit(j, _apply_swap_to_replica, j).result()
                 observable_cache.clear()
             parquet_exchange_writer.write_exchange(
                 step=int(absolute_step),
@@ -8029,7 +8036,9 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     v_pep, v_dih = _fetch_v_pep_v_dih(sim.context, pep_env, unit)
                 return r, cv, ss, v_pep, v_dih
 
-            for r, cv, ss, v_pep, v_dih in _sim_pool.map(_fetch_exchange_state, enumerate(sims)):
+            with _phase_timers.phase("exchange.fetch"):
+                _fetched_exchange = _sim_pool.map(_fetch_exchange_state, enumerate(sims))
+            for r, cv, ss, v_pep, v_dih in _fetched_exchange:
                 primary_values[r] = cv
                 ss_values[r] = ss
                 v_pep_kj[r] = v_pep
@@ -8321,6 +8330,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         if progress is not None:
             progress.progress("gareus_production", prod_done, prod_total, message=f"{nrep} replicas | {getattr(args, 'exchange_mode', 'neighbor')} exchange attempts {attempt}", timestep_fs=float(args.timestep_fs), n_replicas=nrep, force=True)
 
+        _phase_timers.begin()
         while prod_done < prod_total:
             if _graceful_shutdown.is_set():
                 print(f"Graceful shutdown: saving checkpoint at step {prod_done}/{prod_total} and exiting.", flush=True)
@@ -8350,21 +8360,26 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             if checkpoint_interval > 0 and next_checkpoint > prod_done:
                 target = min(target, next_checkpoint)
             chunk = max(1, target - prod_done)
-            step_all(chunk)
+            with _phase_timers.phase("md"):
+                step_all(chunk)
+            _phase_timers.note_steps(chunk)
             prod_done += chunk
             absolute_step = calib_steps + prod_done
             summary = {}
 
             if prod_done >= next_log or prod_done >= prod_total:
-                rows = sample(absolute_step, "gareus_production")
+                with _phase_timers.phase("sample"):
+                    rows = sample(absolute_step, "gareus_production")
                 dashboard_info["display_step"] = int(prod_done)
                 dashboard_info["display_total_steps"] = int(prod_total)
-                summary = distance_logger.log(rows, "gareus_production", absolute_step, calib_steps + prod_total, dashboard_info=dashboard_info)
+                with _phase_timers.phase("log"):
+                    summary = distance_logger.log(rows, "gareus_production", absolute_step, calib_steps + prod_total, dashboard_info=dashboard_info)
                 while next_log <= prod_done:
                     next_log += distance_interval
 
             if prod_done >= next_exchange and prod_done < prod_total + 1:
-                parity, attempt = attempt_exchanges(absolute_step, parity, attempt)
+                with _phase_timers.phase("exchange"):
+                    parity, attempt = attempt_exchanges(absolute_step, parity, attempt)
                 while next_exchange <= prod_done:
                     next_exchange += int(args.exchange_interval) if int(args.exchange_interval) > 0 else prod_total + 1
                 # Stuck-replica rescue: replicas pinned at CV1≈0 have near-zero umbrella gradient
@@ -8417,23 +8432,28 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                                     )
 
             if checkpoint_interval > 0 and (prod_done >= next_checkpoint or prod_done >= prod_total):
-                flush_scalar_writers()
-                save_production_checkpoint(
-                    out_dir, sims, assignments, prod_done, absolute_step, parity, attempt,
-                    next_exchange, next_log, exchange_stats, rng,
-                    centers_a=centers_a, k_list=k_list, cv_atom1=cv_atom1, cv_atom2=cv_atom2,
-                    cv_label=cv_label, calib_steps=calib_steps,
-                    secondary_cv_metadata=secondary_cv_metadata,
-                    secondary_cv_centers=secondary_cv_centers,
-                    secondary_cv_k_kcal_list=secondary_cv_k_kcal_list,
-                    primary_cv_metadata=_json_ready(primary_cv_def),
-                    openmm_version=str(getattr(getattr(openmm, "version", None), "version", None)),
-                    platform_name=str(platform.getName()),
-                    drivers=drivers, pool=_sim_pool, npt_runtime=npt_runtime,
-                )
+                with _phase_timers.phase("checkpoint_flush"):
+                    flush_scalar_writers()
+                with _phase_timers.phase("checkpoint_save"):
+                    save_production_checkpoint(
+                        out_dir, sims, assignments, prod_done, absolute_step, parity, attempt,
+                        next_exchange, next_log, exchange_stats, rng,
+                        centers_a=centers_a, k_list=k_list, cv_atom1=cv_atom1, cv_atom2=cv_atom2,
+                        cv_label=cv_label, calib_steps=calib_steps,
+                        secondary_cv_metadata=secondary_cv_metadata,
+                        secondary_cv_centers=secondary_cv_centers,
+                        secondary_cv_k_kcal_list=secondary_cv_k_kcal_list,
+                        primary_cv_metadata=_json_ready(primary_cv_def),
+                        openmm_version=str(getattr(getattr(openmm, "version", None), "version", None)),
+                        platform_name=str(platform.getName()),
+                        drivers=drivers, pool=_sim_pool, npt_runtime=npt_runtime,
+                    )
+                # Written before the scratch sync so the main directory gets this checkpoint's timers.
+                _phase_timers.write(_phase_timers_path, extra={"npt": aggregate_npt_timings(drivers)})
                 _scratch_main = getattr(args, "_main_dir", None)
                 if _scratch_main:
-                    sync_scratch_to_main(out_dir, Path(_scratch_main))
+                    with _phase_timers.phase("checkpoint_scratch_sync"):
+                        sync_scratch_to_main(out_dir, Path(_scratch_main))
                 while next_checkpoint <= prod_done:
                     next_checkpoint += checkpoint_interval
 
@@ -8447,14 +8467,19 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                         msg += f" | k {summary.get('k_min_kcal_mol_A2', float('nan')):.3f}-{summary.get('k_max_kcal_mol_A2', float('nan')):.3f}"
                     if "umbrella_bias_mean_kcal_mol" in summary:
                         msg += f" | Ubias mean/max {summary.get('umbrella_bias_mean_kcal_mol', float('nan')):.1f}/{summary.get('umbrella_bias_max_kcal_mol', float('nan')):.1f} kcal"
-                progress.progress(
-                    "gareus_production", prod_done, prod_total,
-                    message=msg,
-                    timestep_fs=float(args.timestep_fs),
-                    n_replicas=nrep,
-                    extra={"exchange_attempts": attempt, **summary},
-                    force=(prod_done >= prod_total),
-                )
+                with _phase_timers.phase("progress"):
+                    progress.progress(
+                        "gareus_production", prod_done, prod_total,
+                        message=msg,
+                        timestep_fs=float(args.timestep_fs),
+                        n_replicas=nrep,
+                        extra={"exchange_attempts": attempt, **summary},
+                        force=(prod_done >= prod_total),
+                    )
+
+        if _phase_timers.enabled:
+            _phase_timers.write(_phase_timers_path, extra={"npt": aggregate_npt_timings(drivers)})
+            print(_phase_timers.summary_line(), flush=True)
 
         if not analysis_arrays_written:
             flush_scalar_writers()

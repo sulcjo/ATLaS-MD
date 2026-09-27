@@ -25,6 +25,13 @@ Updated 2026-09-27.
 - MPS percentage is set right after `parse_args`; errors if `openmm` is already imported or the environment holds a different value. At 25 %, single-context setup/recon phases can be up to ~4x slower on a fresh campaign (unmeasured).
 - Tests: `tests/test_replica_admission.py`, `tests/test_replica_admission_drivers.py`, `tests/test_replica_admission_config.py`.
 
+## Production phase timers (`--production-phase-timers`, off by default)
+
+- `gareus/phase_timers.py` (`PhaseTimers`, `aggregate_npt_timings`); wired in `gareus/production.py` around the production loop. Diagnostics only; disabled = `nullcontext`, no overhead.
+- Top-level phases: `md` (step_all), `sample`, `log`, `exchange`, `checkpoint_flush`, `checkpoint_save`, `checkpoint_scratch_sync`, `progress`. Sub-phases (dotted, excluded from the top-level sum): `sample.fetch`, `exchange.fetch`, `exchange.swap_apply`. `unattributed_s` = loop wall outside all top-level phases.
+- Written atomically to `<out>/production_phase_timers.json` at every checkpoint (before the scratch sync) and at loop end, with the summed NPT controller `_timings` (read/scale/restore/evaluate/verify, attempts) under `"npt"`; a one-line `[phase-timers]` summary prints at loop end. Normalised per 2000 steps (the sample/exchange LCM).
+- Why: the replica cap's +57 % harness gain became +2.4 % in production with ~19 s/2000 steps unattributed; see docs/superpowers/specs/performance-upgrades/review-2026-09-27-p5-p7.md. Note `md` includes NPT attempts and trajectory frames (they run inside each replica's advance).
+
 ## Shared contact-sum CV force (`SHARED_CONTACT_LAYOUT`) — CV1 umbrella rides on the residual CV2 force
 
 - When CV2 is `residual-torsion-pc` over a contact CV1, the CV2 CustomCVForce already holds a private copy of the 1,256-pair contact sum (`res_contacts`). `add_umbrella_cv_forces` (`gareus/production.py`) now appends `0.5*k*((res_contacts/contact_norm)-r0)^2` to that force (group 29, same parameter names as `forces.add_contact_umbrella_force`) and builds no separate CV1 force: group 31 is empty. Measured +14.6 % node ns/day at 236 contexts under MPS, +8.1 % at 1 context/GPU (job 2608721; `docs/superpowers/specs/2026-09-23-pep-gamd-realspace-vpep-surrogate/benchmarks/c8_sharedcv.sh`). Bias energy/forces are identical to the split pair (Reference: dE 0, max|dF| 1e-14 on chignolin_8's real system), so the kernel identity is unchanged.
