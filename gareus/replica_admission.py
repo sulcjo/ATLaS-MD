@@ -283,3 +283,38 @@ def make_dispatcher(pool, queue_keys: Sequence[str], active_replicas_per_gpu, tu
     if active_replicas_per_gpu == "all":
         return None
     return AdmissionDispatcher(pool, list(queue_keys), limit=int(active_replicas_per_gpu), turn_steps=int(turn_steps))
+
+
+# ------------------------------------------------------------ value parsing
+
+
+def _int_or_word(value, *, word: str, flag: str, lo: int, hi: Optional[int]):
+    """``word`` (case-insensitive) or an integer in [lo, hi]; booleans are rejected."""
+    if isinstance(value, bool):
+        raise ValueError(f"{flag} must be '{word}' or an integer, got the boolean {value!r}")
+    if isinstance(value, str):
+        text = value.strip()
+        if text.lower() == word:
+            return word
+        try:
+            number = int(text)
+        except ValueError:
+            raise ValueError(f"{flag} must be '{word}' or an integer, got {value!r}") from None
+    elif isinstance(value, int):
+        number = int(value)
+    else:
+        raise ValueError(f"{flag} must be '{word}' or an integer, got {value!r}")
+    if number < lo or (hi is not None and number > hi):
+        bound = f">= {lo}" if hi is None else f"in {lo}-{hi}"
+        raise ValueError(f"{flag} must be '{word}' or an integer {bound}, got {value!r}")
+    return number
+
+
+def parse_active_replicas_per_gpu(value):
+    """``"all"`` or an integer >= 1."""
+    return _int_or_word(value, word="all", flag="--active-replicas-per-gpu", lo=1, hi=None)
+
+
+def parse_mps_thread_percentage(value):
+    """``"inherit"`` or an integer 1-100."""
+    return _int_or_word(value, word="inherit", flag="--cuda-mps-active-thread-percentage", lo=1, hi=100)
