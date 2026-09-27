@@ -567,6 +567,13 @@ def initialize_run_manifest(args: Any, out_dir: Path, argv: Optional[Iterable[st
             "Large trajectory files are summarized by size/count and are not fully hashed by default.",
         ],
     }
+    # A real --resume continues the same campaign, so the per-job replica-admission
+    # record (spec 2026-09-26 §3) must go on appending to this same history rather
+    # than being wiped by the from-scratch rebuild above -- same carry-forward
+    # pattern as run_id/start_time_utc. A non-resume start into the same directory
+    # is a fresh campaign and gets a fresh history.
+    if resume and existing and isinstance(existing.get("replica_admission_history"), list):
+        payload["replica_admission_history"] = existing["replica_admission_history"]
     _write_manifest(out_dir, payload)
     return payload
 

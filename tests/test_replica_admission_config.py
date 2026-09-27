@@ -98,10 +98,11 @@ def test_record_on_fresh_and_resumed_complete_manifest(tmp_path, monkeypatch):
     initialize_run_manifest(job1, tmp_path, argv=[])
     record_replica_admission(tmp_path, job1, {"shared": 4})
 
-    # Second job: a resume against the now-complete manifest, cap switched on,
+    # Second job: a real resume against the now-complete manifest, cap switched on,
     # queues moved to real GPUs. The old "shared" key must not survive.
     monkeypatch.setenv("SLURM_JOB_ID", "222")
-    job2 = parse_args(MINIMAL + ["--active-replicas-per-gpu", "8"])
+    job2 = parse_args(MINIMAL + ["--active-replicas-per-gpu", "8", "--resume"])
+    initialize_run_manifest(job2, tmp_path, argv=[])
     record_replica_admission(tmp_path, job2, {"0": 8, "1": 8})
 
     payload = json.loads((tmp_path / "run_manifest.json").read_text())
@@ -115,6 +116,24 @@ def test_record_on_fresh_and_resumed_complete_manifest(tmp_path, monkeypatch):
     assert hist[0]["active_replicas_per_gpu"] == "all"
     assert hist[0]["effective_per_queue"] == {"shared": 4}
     assert all("recorded_utc" in h for h in hist)
+
+
+def test_fresh_non_resume_start_resets_history(tmp_path):
+    job1 = parse_args(MINIMAL)
+    initialize_run_manifest(job1, tmp_path, argv=[])
+    record_replica_admission(tmp_path, job1, {"shared": 4})
+
+    # A fresh (non-resume) start into the same directory must reset the history,
+    # unlike a real --resume (covered above).
+    job2 = parse_args(MINIMAL + ["--active-replicas-per-gpu", "8"])
+    initialize_run_manifest(job2, tmp_path, argv=[])
+    record_replica_admission(tmp_path, job2, {"0": 8, "1": 8})
+
+    payload = json.loads((tmp_path / "run_manifest.json").read_text())
+    hist = payload["replica_admission_history"]
+    assert len(hist) == 1
+    assert hist[0]["active_replicas_per_gpu"] == 8
+    assert hist[0]["effective_per_queue"] == {"0": 8, "1": 8}
 
 
 def test_record_without_existing_manifest_creates_one(tmp_path):
