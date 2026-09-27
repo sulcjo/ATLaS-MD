@@ -8449,7 +8449,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                         drivers=drivers, pool=_sim_pool, npt_runtime=npt_runtime,
                     )
                 # Written before the scratch sync so the main directory gets this checkpoint's timers.
-                _phase_timers.write(_phase_timers_path, extra={"npt": aggregate_npt_timings(drivers)})
+                if _phase_timers.enabled:
+                    _phase_timers.write(_phase_timers_path, extra={"npt": aggregate_npt_timings(drivers)})
                 _scratch_main = getattr(args, "_main_dir", None)
                 if _scratch_main:
                     with _phase_timers.phase("checkpoint_scratch_sync"):
