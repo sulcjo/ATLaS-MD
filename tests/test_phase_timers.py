@@ -122,6 +122,17 @@ def test_aggregate_npt_timings_sums_controllers_and_skips_missing():
     assert aggregate_npt_timings([SimpleNamespace(controller=None)]) == {"controllers": 0}
 
 
+def test_aggregate_npt_timings_reads_real_biased_mc_controller():
+    # Production controllers are BiasedMCBarostatController wrappers whose timings
+    # live on the wrapped core; the chignolin_9 probe (job 2680578) reported
+    # "controllers": 0 for 236 live controllers because only the wrapper was read.
+    from gareus.npt import BiasedMCBarostatController
+
+    core = SimpleNamespace(_timings={"read_s": 2.0, "attempts": 5})
+    drivers = [SimpleNamespace(controller=BiasedMCBarostatController(core))]
+    assert aggregate_npt_timings(drivers) == {"read_s": 2.0, "attempts": 5, "controllers": 1}
+
+
 def test_flag_defaults_off_and_is_reachable_from_cli_and_yaml(tmp_path):
     assert parse_args(MINIMAL).production_phase_timers is False
     assert parse_args(MINIMAL + ["--production-phase-timers"]).production_phase_timers is True

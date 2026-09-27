@@ -6384,6 +6384,81 @@ def _seed_topup_windows_from_parent_states(
     return window_start_positions, window_start_velocities, window_start_boxes, seed_by_window
 
 
+def _seed_extension_windows_from_parent_ends(
+    args, out_dir: Path, nrep: int, n_atoms: int,
+    centers_nm, ks_kj_nm2, secondary_cv_centers, secondary_cv_ks_kj,
+    centers_a, k_list, secondary_cv_k_kcal_list,
+):
+    """Seed every window of a frozen-final extension from its newest parent end state.
+
+    Returns ``(positions, velocities, boxes, state_seed_by_window, pdb_seeded_windows)``,
+    or ``None`` when any window has no usable seed -- the caller then pulls every
+    window as before (all-or-nothing: a partially pulled segment would mix fresh
+    and continued chains for no gain). State-export seeds are verified exactly like
+    a top-up's (restraint here, CVs after ``set_window``); PDB seeds are checked
+    against the parent's recorded restraint in A/kcal and get constraints re-applied
+    and fresh velocities by the caller.
+    """
+    from .extension_seeding import is_state_seed, load_extension_seeds, read_pdb_seed
+
+    info = getattr(args, "_adaptive_phase_info", {}) or {}
+    parent_dirs = [Path(p) for p in info.get("extension_parent_dirs") or []]
+    if not (Path(out_dir) / "epoch_window_map.csv").exists():
+        print(f"WARNING: extension {out_dir} has no epoch_window_map.csv; pulling every window instead of continuing")
+        return None
+    state_id_of_window = state_id_of_window_from_epoch_map(out_dir)
+    needed = [state_id_of_window.get(w, w) for w in range(nrep)]
+    seeds = load_extension_seeds(parent_dirs, needed)
+    missing = [w for w, sid in enumerate(needed) if sid not in seeds]
+    if missing:
+        print(
+            f"WARNING: extension {out_dir}: {len(missing)}/{nrep} window(s) have no parent end state "
+            f"(first: window {missing[0]}, state {needed[missing[0]]}; parents {[str(p) for p in parent_dirs]}); "
+            "pulling every window instead of continuing"
+        )
+        return None
+
+    def _at(seq, w):
+        return float(seq[w]) if seq is not None and w < len(seq) and seq[w] is not None else None
+
+    positions: list = [None] * nrep
+    velocities: list = [None] * nrep
+    boxes: list = [None] * nrep
+    state_seed_by_window: dict = {}
+    pdb_seeded_windows: set = set()
+    counts = {"export": 0, "pdb": 0}
+    for w, sid in enumerate(needed):
+        seed = seeds[sid]
+        if is_state_seed(seed):
+            assert_seed_restraint_matches(
+                seed, w, _at(centers_nm, w), _at(ks_kj_nm2, w),
+                _at(secondary_cv_centers, w), _at(secondary_cv_ks_kj, w),
+            )
+            positions[w], velocities[w], boxes[w] = seed.positions, seed.velocities, seed.box
+            state_seed_by_window[w] = seed
+            counts["export"] += 1
+        else:
+            assert_seed_restraint_matches(
+                seed, w, _at(centers_a, w), _at(k_list, w),
+                _at(secondary_cv_centers, w), _at(secondary_cv_k_kcal_list, w),
+                rel_tol=1e-5, abs_tol=1e-6,
+            )
+            pos, box = read_pdb_seed(seed)
+            if len(pos) != int(n_atoms):
+                raise SeedMismatchError(
+                    f"extension seed PDB {seed.path} has {len(pos)} atoms, system has {n_atoms}",
+                    window=w, state_id=sid,
+                )
+            positions[w], boxes[w] = pos, box
+            pdb_seeded_windows.add(w)
+            counts["pdb"] += 1
+    print(
+        f"    Extension seeding: continuing all {nrep} window(s) from parent end states "
+        f"({counts['export']} State export(s), {counts['pdb']} final PDB(s); no pull)"
+    )
+    return positions, velocities, boxes, state_seed_by_window, pdb_seeded_windows
+
+
 def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equil_state, progress: Optional[GuiProgressSink] = None):
     from .correctness.sampling_policy import require_rescue_disabled_in_current_driver
     require_rescue_disabled_in_current_driver(args)
@@ -6747,6 +6822,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         window_start_velocities = [None] * nrep
         window_start_boxes = [None] * nrep
         topup_seed_by_window: dict = {}
+        pdb_seeded_windows: set = set()
     else:
         # Keep pre-production US starting-structure pulling on the previous fixed-box
         # system so changing the default production ensemble does not silently alter
@@ -6758,8 +6834,29 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
 
         _topup_phase_info = getattr(args, "_adaptive_phase_info", {}) or {}
         is_topup_segment = bool(_topup_phase_info.get("is_topup"))
+        pdb_seeded_windows = set()
+        # A frozen-final extension runs the final phase's own window set: continue
+        # each window from its newest parent end state instead of re-pulling.
+        _extension_seeds = None
+        if bool(_topup_phase_info.get("is_extension")) and not is_topup_segment:
+            try:
+                _extension_seeds = _seed_extension_windows_from_parent_ends(
+                    args, out_dir, nrep, topology.getNumAtoms(),
+                    centers_nm, ks_kj_nm2, secondary_cv_centers, secondary_cv_ks_kj,
+                    centers_a, k_list, secondary_cv_k_kcal_list,
+                )
+            except SeedMismatchError as exc:
+                # A parent end state that does not match this window (restraint or
+                # atom count) means the parent's bookkeeping disagrees with ours;
+                # pulling fresh uses no parent data at all, so it is the safe fallback.
+                print(f"WARNING: extension {out_dir}: parent end states rejected ({exc}); pulling every window instead")
+                _extension_seeds = None
 
-        if is_topup_segment:
+        if _extension_seeds is not None:
+            (window_start_positions, window_start_velocities, window_start_boxes,
+             topup_seed_by_window, pdb_seeded_windows) = _extension_seeds
+            dropped_window_indices = []
+        elif is_topup_segment:
             # Effective top-ups (spec 4.4 rev 2): continue every window's chain
             # from its parent segment's exported final State instead of
             # re-pulling -- no starting_structure_system/pull at all. The driver
@@ -7070,7 +7167,13 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 start_vel = window_start_velocities[i] if i < len(window_start_velocities) and window_start_velocities[i] is not None else vel
                 sim_i.context.setPositions(start_pos)
                 _is_seeded_window = topup_seed_by_window.get(i) is not None
-                if args.randomize_replica_velocities and not _is_seeded_window:
+                if i in pdb_seeded_windows:
+                    # Extension seed from a final PDB: coordinates rounded to 1e-3 A
+                    # violate rigid-water/HMR constraints slightly, and there are no
+                    # velocities to continue.
+                    sim_i.context.applyConstraints(1e-6)
+                    sim_i.context.setVelocitiesToTemperature(args.temperature_k * unit.kelvin, args.seed + i + 17)
+                elif args.randomize_replica_velocities and not _is_seeded_window:
                     sim_i.context.setVelocitiesToTemperature(args.temperature_k * unit.kelvin, args.seed + i + 17)
                 else:
                     if _is_seeded_window and args.randomize_replica_velocities:

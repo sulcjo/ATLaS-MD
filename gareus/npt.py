@@ -824,6 +824,11 @@ class BiasedMCBarostatController:
     def __init__(self, core: _ControllerCore):
         self._core = core
 
+    @property
+    def _timings(self) -> dict:
+        """The core's per-job NPT phase accumulators (read by ``aggregate_npt_timings``)."""
+        return self._core._timings
+
     @classmethod
     def initialize(
         cls,

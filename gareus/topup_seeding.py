@@ -164,15 +164,19 @@ def topup_parent_dirs_by_creation_order(out_dir) -> List[Path]:
 
 
 def should_export_final_window_states(args) -> bool:
-    """True only for a top-ups-on adaptive-production segment.
+    """True for a top-ups-on adaptive-production segment or a frozen-final extension.
 
-    ``final_window_states/`` exists solely to seed a later top-up, and costs
-    ~3 MB per window State at 19k atoms.  ``_adaptive_phase_info`` is set by
-    the adaptive-production driver on every epoch/final segment it launches
-    (``is_adaptive_epoch``); a standalone run, a pilot, or any segment of a
-    top-ups-off campaign writes nothing.
+    ``final_window_states/`` exists to seed a later segment that continues the same
+    windows -- a top-up, or the next extension round (``gareus.extension_seeding``)
+    -- and costs ~3 MB per window State at 19k atoms.  ``_adaptive_phase_info`` is
+    set by the adaptive-production driver on every epoch/final segment
+    (``is_adaptive_epoch``) and extension round (``is_extension``) it launches; a
+    standalone run, a pilot, or a non-extension segment of a top-ups-off campaign
+    writes nothing.
     """
     info = getattr(args, "_adaptive_phase_info", None) or {}
+    if bool(info.get("is_extension")):
+        return True
     return bool(getattr(args, "adaptive_production_topups", False)) and bool(info.get("is_adaptive_epoch"))
 
 
