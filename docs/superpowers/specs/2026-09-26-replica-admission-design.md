@@ -1,7 +1,11 @@
 # Replica admission cap and MPS thread share — design
 
 Date: 2026-09-26
-Status: design approved in conversation; written spec awaiting review
+Status: design approved in conversation; amended 2026-09-27 after spec review (manifest per job, MPS timing,
+turn-end deadlines, hang semantics, non-GPU queue key); amended again 2026-09-27 for the small board's seven
+conditions (one manifest representation, total callback, drain protocol and lock rule, pool exclusivity,
+four test gaps, real entry chain, single-context phases). Board transcript: job tmp
+`board_admission/transcript.md`, verdict ACCEPT-WITH-CHANGES 82/100, one REJECT dissent (§11)
 Scope: performance-upgrades P3 (bounded active replicas per GPU) and P4 (MPS active-thread percentage),
 production delivery. Parent spec: `docs/superpowers/specs/performance-upgrades/spec.md` §6–7.
 
@@ -49,7 +53,7 @@ recon phases; CPU affinity (P5); removing reporting barriers (P6).
 ## 3. Configuration
 
 Three settings, each a YAML key and a CLI flag (same name, dashes for underscores), validated in
-`parse_args`, and recorded in `run_manifest.json` via `provenance._method_settings`:
+`parse_args`, and recorded in `run_manifest.json` for every job (see "Recording" below):
 
 | Key | Values | Default | Meaning |
 | --- | --- | --- | --- |
@@ -59,11 +63,35 @@ Three settings, each a YAML key and a CLI flag (same name, dashes for underscore
 
 Validation rejects 0, negatives, non-integers and percentages outside 1–100 with a clear message. A cap
 above a GPU's resident count is capped to that count; the effective per-GPU values are printed at production
-start and recorded in the manifest (`method_settings["active_replicas_per_gpu_effective"]`, a dict GPU →
-limit).
+start.
 
 The cap is not part of any checkpoint and changes no recorded number, so it may differ between the jobs of
 one campaign (for example, off before a clean restart, on after it).
+
+**Recording.** `provenance._method_settings` alone is not enough: on a resume,
+`ensure_run_manifest_initialized` finds a complete manifest and leaves it untouched, so `method_settings`
+keeps the values of the campaign's first job. chignolin_9 would switch the cap on at a resume, and the
+manifest would still say `all`/`inherit`. Each job therefore records its own values through
+`update_run_manifest`, which runs on every job:
+
+- `method_settings["replica_admission"]` — the current job's values, overwritten each job:
+  `{"active_replicas_per_gpu": ..., "active_replica_turn_steps": ..., "cuda_mps_active_thread_percentage":
+  {"requested": ..., "inherited_env": ...}, "effective_per_queue": {queue_key: limit}}`.
+- `replica_admission_history` — a list with one entry per `run_gareus` call, i.e. per phase output directory
+  (a job spanning two phases writes one entry into each phase's manifest; UTC time, `SLURM_JOB_ID` if set, and
+  the same dict), appended read-modify-write (`_deep_update` replaces lists, so the patch carries the whole
+  list). Safe without a file lock because one job process is the manifest's only writer while it runs.
+
+This nested dict is the **only** representation. `_method_settings` does not gain three flat keys; it
+emits the same `replica_admission` dict (built by one shared function, `admission_manifest_record(args,
+effective_per_queue=None)`), so a fresh campaign's first manifest already holds it and every later job
+overwrites the whole dict. `effective_per_queue` is `null` until production has built its replicas, then
+patched. Every current reader of `method_settings` looks up explicit keys (checked 2026-09-27), so a record
+that differs between jobs cannot trip a resume guard; a future whole-dict comparison must exclude it. Two copies of the same setting in one file would let one go stale on a resume — the bug this
+section exists to fix — so the config test asserts the flat keys are absent (§7).
+
+Readers (dashboard, `gareus_report.py`, provenance summaries) read `method_settings["replica_admission"]`,
+never the history list and never `resolved_args` (a first-job snapshot that still holds the flat values), and treat an absent key as a pre-change manifest meaning `all`/`inherit`.
 
 ## 4. Dispatcher
 
@@ -89,21 +117,81 @@ Behaviour, carried over from the benchmark harness (`p3_admission_bench.py`) whe
   its GPU's queue if it still has steps left. The last turn of a call may be shorter.
 - At most one admitted turn per replica at a time, so a replica's calls never overlap and keep its thread
   affinity (`_ReplicaAffinityExecutor` is unchanged).
-- Failure: on the first exception, every replica still queued is dropped, turns already running are allowed
-  to finish, and `run` re-raises the first exception only after nothing is in flight. The pool is therefore
-  idle when `step_all`'s diagnostics read Contexts.
 - No busy waiting and no thread blocked on a semaphore: `run` waits on one `threading.Event`.
 
-`gpu_of_replica` is taken from the `DeviceIndex` that `replica_platform_properties` assigns when production
-builds each replica's context (`production.py`, replica construction loop), so the cap follows the real
-placement for round-robin and `--replica-device-map` alike. Non-GPU platforms (CPU, Reference) have no
-`DeviceIndex`; all replicas then share one queue, and the cap limits total concurrency (useful for tests).
+**Protocol.** Shared state (per-GPU queues, per-replica remaining steps, per-GPU in-flight counts, a
+total in-flight count, `failed`, `first_exc`) is touched only under one plain `threading.Lock`. A done-
+callback runs in the worker thread when the turn finishes, or synchronously in the submitting thread if the
+future had already finished when the callback was attached; both cases go through the same code:
+
+1. `_on_done(i, fut)`, under the lock: decrement replica `i`'s GPU in-flight count and the total; if
+   `fut` raised and `failed` is not yet set, set `failed` and store that exception as `first_exc` (a later
+   exception is kept only in a list for the log). If not `failed`: subtract the turn's steps from `i`'s
+   remaining and, if steps remain, append `i` to the back of its GPU's queue. Then, still under the lock,
+   pop the turns to launch: if not `failed`, fill every GPU's free slots from its queue head; if `failed`,
+   pop nothing and clear every queue. If the total in-flight count is 0 and no turns were popped, set the
+   Event. Release the lock.
+2. Outside the lock, submit each popped turn (`pool.submit(i, fn, i, n)`) and attach `_on_done` with
+   `add_done_callback`. A submit that raises is fed straight back into `_on_done` as a failed turn, so its
+   in-flight count is returned.
+3. `run` seeds the queues, performs one fill-and-submit as in steps 1–2, then calls `Event.wait()`.
+   After it returns: if `first_exc` is set, clear the state and raise it; otherwise every replica has
+   remaining 0 (asserted).
+
+Rules the implementation must keep, each pinned by a test (§7):
+
+- **Lock discipline.** The lock is never held across `pool.submit`, `add_done_callback`, `fn` or
+  `Event.wait()`. It is a plain `Lock`, not an `RLock`: re-entry from the synchronous callback path would
+  then corrupt state instead of deadlocking loudly, and releasing before submit makes re-entry impossible.
+- **Total callback.** `_on_done`'s whole body is wrapped; an unexpected internal error is recorded as a
+  failure (if none is recorded yet), the in-flight counts are still decremented in a `finally`, and the
+  Event is still set when nothing remains in flight. This matters because `concurrent.futures` catches and
+  only logs an exception raised inside a done-callback: an unguarded error there would lose the completion
+  signal and leave `run` waiting forever with one log line as the only trace.
+- **Drain.** Once `failed` is set no turn is re-queued, and no turn is popped, on any GPU; a turn already
+  popped but not yet submitted when `failed` is set is skipped by `_submit_one`'s check, except in the
+  unavoidable microsecond window between that check and `pool.submit` (the check cannot be atomic with a
+  submit made outside the lock), where it may still start. Its result is then discarded and its slot
+  released like any other. Turns already running finish; `run` raises `first_exc` only when the total in-flight count is 0. `run` therefore never returns
+  or raises while any replica's `fn` is still executing, and a dispatcher that raised is reusable (the next
+  `run` starts from clean state).
+- **Pool exclusivity.** While `run` is active, only the dispatcher submits to the pool. This holds in
+  production: `run_gareus` uses `_sim_pool` only from the coordinator thread (`production.py` step,
+  fetch, swap-apply and rescue sites are all sequential calls), and the dispatcher's own callbacks submit
+  only replica turns. The in-flight accounting and the idle-pool guarantee depend on it; `run` asserts it
+  cheaply by refusing re-entry (a `running` flag, set and cleared under the lock, raises if `run` is called
+  while already running).
+
+The idle-pool guarantee is new: today's `_ReplicaAffinityExecutor.map` returns from `f.result()` at the
+first failed replica in index order while later replicas may still be stepping, so `step_all`'s NaN
+diagnostics can read Contexts that are still in use. With the dispatcher they never do. The
+`dispatcher=None` path keeps today's behaviour unchanged, including this.
+
+`gpu_of_replica` is taken from the `DeviceIndex` that `replica_platform_properties`
+(`gareus/system_setup.py`) assigns when production builds each replica's context (`production.py`, replica
+construction loop), so the cap follows the real placement for round-robin and `--replica-device-map` alike.
+The queue key is the `DeviceIndex` string as given. In `single-context-split` mode every context gets the
+same multi-device string (for example `"0,1,2,3"`), so all replicas share one queue — correct, since each
+context spans every GPU. Non-GPU platforms (CPU, Reference) return no `DeviceIndex`; all replicas then share
+one queue under the key `"shared"`, and the cap limits total concurrency (useful for tests). The same key
+names appear in `effective_per_queue` (§3).
+
+**A hung replica still hangs the run.** "Turns already running are allowed to finish" means one turn that
+never returns blocks `run` forever. Today's `pool.map` join behaves the same way, so this is not a
+regression; the dispatcher adds no timeout, and the existing job-level watchdogs (SLURM time limit, the
+dashboard's stalled-progress warning) remain the only detection.
 
 ## 5. MPS thread share
 
 Applied as the first action of `gareus.cli.main` after `parse_args`, before any OpenMM platform or context
 exists (the setup, US-pull and production phases all run in this one process, and the MPS client reads the
-variable when CUDA first initialises):
+variable when CUDA first initialises). Timing checked 2026-09-27 on the real entry chain: `python -m
+gareus` runs `gareus.__main__` → `gareus.core.main`, which imports `gareus.cli` lazily; after importing
+`gareus.core` and `gareus.cli` and running `parse_args`, neither `openmm` nor `gamd` is in `sys.modules`.
+So at the apply point no OpenMM platform exists. The apply function asserts this: if `openmm` is already in
+`sys.modules` when a percentage is requested, it exits with an error rather than set a variable that may be
+read too late. The guard only sees OpenMM; CUDA initialised by some other import (none today) would pass it
+undetected, which the spec accepts. A subprocess test pins the fact on the real entry chain (§7).
 
 - `inherit`: do nothing; record the inherited `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` (or "unset") in the
   manifest.
@@ -116,6 +204,23 @@ variable when CUDA first initialises):
 MPS does not report the effective share back to the client, so the manifest records the requested value
 and labels it "requested". The setting applies to every context the process opens, including setup and
 US-pull contexts; up to 28 pull contexts at 25 % each still cover the GPUs.
+
+**Single-context phases.** Setup (minimisation, NVT/NPT equilibration), the shared GaMD setup and the
+recon phase run one or a few contexts per GPU; at 25 % each such context can use at most a quarter of its
+GPU's SMs. Unmeasured bound: those phases can run up to ~4x slower, since they are compute-bound on one
+context. They do not re-run on a production resume, so the chignolin_9 switch (§9, a resume in the final
+phase) does not pay this; a fresh campaign with the setting on does. The rollout records these phases'
+wall time from the job log when a fresh campaign first uses the setting; measuring them now is out of
+scope. §9 step 3's production ns/day comparison cannot see this cost.
+
+**Daemon side.** A default percentage can also be set on the MPS control daemon
+(`set_default_active_thread_percentage`, or the variable exported to `nvidia-cuda-mps-control -d`), and
+the client's request then interacts with that limit. The chignolin_9 launcher (`smoke/config/chignolin_9.sh`)
+starts the daemon with neither (checked 2026-09-27), so today only the client value applies. The benchmark
+jobs (2664328, 2665264) set the client variable the same way, so the measured gain is for this
+configuration. The rollout (§9 step 2) requires the launcher to keep the daemon default unset; if a future
+launcher sets one, the benchmark does not cover that configuration. How a client request above a daemon
+default is resolved has not been checked against NVIDIA's documentation and is not relied on.
 
 ## 6. Integration in `step_all`
 
@@ -141,8 +246,14 @@ Invariants (unchanged from today):
 - Each replica's own NPT volume moves and trajectory frames fire inside its `driver.advance`, at the same
   local steps: `ReplicaStepDriver.advance` (`gareus/npt_driver.py`) integrates to each local deadline
   (volume move, then that state's reports) within the requested span, so splitting one call into several
-  shorter ones visits the same events in the same order; a deadline that falls exactly on a turn's end is
-  serviced at the end of that turn, on the same state.
+  shorter ones visits the same events in the same order. A deadline exactly on a turn's end is serviced
+  inside that turn's call: `advance` admits deadlines with `due <= end` (inclusive), integrates to `end`,
+  then runs the due volume move and the reports of the post-move state before returning, and each moves
+  its own next deadline past `end`. The next turn therefore neither repeats nor skips it (checked in the
+  code 2026-09-27; the drivers test in §7 pins it).
+- A `production_safe_chunk_steps` sub-call shorter than `turn_steps` simply makes every turn in that
+  sub-call at most the sub-call's length; turn length never crosses a sub-call boundary, because each
+  sub-call is one `dispatcher.run`.
 - Random-number consumption per replica is unchanged (each replica's integrator and NPT RNG advance only
   with its own steps); the global exchange RNG is consumed only at boundaries, by the coordinator.
 
@@ -163,7 +274,24 @@ steps and an independent per-GPU in-flight counter):
   `nsteps < turn_steps`;
 - instant `fn` (exercises the already-finished-future callback path, no deadlock);
 - a failure in one replica mid-run: `run` raises that exception, no hang, nothing in flight afterwards,
-  and a subsequent `run` on the same dispatcher works.
+  and a subsequent `run` on the same dispatcher works;
+- drain across GPUs: one replica on GPU 0 fails while long turns run on GPUs 1–3; `run` does not raise
+  until those turns finish (the fake `fn` records exit times; the raise must come after the last one), and
+  no turn starts after the failure on any GPU;
+- two near-simultaneous failures (two replicas released by one `threading.Barrier`, both raising): `run`
+  raises exactly one of them, as `first_exc`, and the other is logged; no hang;
+- total callback: an internal error injected into `_on_done` (monkeypatched bookkeeping helper that
+  raises once) makes `run` raise within a timeout instead of hanging;
+- lock discipline: the test replaces the dispatcher's lock with a recording proxy that tracks the owning
+  thread, and asserts the lock is not held by the calling thread inside the fake `fn`, inside a wrapper
+  around `pool.submit`, and inside a patched `Event.wait` (`lock.locked()` alone cannot tell whose lock
+  it is);
+- re-entry: calling `run` from inside `fn` raises;
+- randomized stress (seeded, a few hundred iterations, CPU only, seconds): 200–300 replicas over 1–4
+  queues with uneven populations, random limit, turn length and `nsteps`, `fn` sleeping a random 0–2 ms or
+  returning instantly; assert every replica completes exactly `nsteps` per run, the per-queue in-flight
+  maximum never exceeds `min(limit, resident)` and is reached when there is enough work, and no run takes
+  longer than a generous timeout.
 
 `tests/test_replica_admission_drivers.py` — `advance_replicas` over real `ReplicaStepDriver`s wrapping
 small OpenMM Simulations (`tests/pep_gamd_fixture.build_small_simulation`, Reference or CPU platform, 4
@@ -171,22 +299,34 @@ replicas on 2 fake GPUs), each with a fake controller and a fake reporter that r
 which they fire (the pattern of `tests/test_npt_driver_scheduling.py`):
 
 - over a sequence of calls shaped like production's boundaries (for example 400, 250, 150, 400 steps),
-  cap 1 with 50-step turns and 30-step turns vs `dispatcher=None`: identical per-replica step counters and
-  identical recorded volume-move and report steps, in the same order;
+  vs `dispatcher=None`: identical per-replica step counters and identical recorded volume-move and report
+  steps, in the same order — for cap 1 with 50- and 30-step turns, and for the production shape of a cap
+  below the resident count with many replicas interleaving (8 small-OpenMM replicas on 2 queues, cap 2,
+  so 2 of the 4 replicas per queue wait at any moment), plus cap ≥ resident;
 - a deadline exactly on a turn boundary is serviced once;
 - finite energies afterwards.
 
 Trajectories are not compared bit for bit (thread scheduling is not deterministic on the CPU platform).
 `step_all` itself stays a thin wrapper and is covered by the chignolin_9 production check (§9).
 
+Defaults: with `active_replicas_per_gpu: all` the dispatcher factory returns `None`, and
+`advance_replicas(pool, drivers, n, None)` calls `pool.map` exactly once with every driver (a recording
+fake pool asserts the call and that `submit` is never used).
+
 `tests/test_replica_admission_config.py` — parsing and validation of the three keys (YAML and CLI),
-manifest recording, the MPS conflict error, and the "MPS not running" warning.
+manifest recording on a fresh run AND on a resume against an already-complete manifest (the resume must
+overwrite `method_settings["replica_admission"]` and append one `replica_admission_history` entry), no flat
+`active_replicas_per_gpu`/`active_replica_turn_steps`/`cuda_mps_active_thread_percentage` keys anywhere
+under `method_settings`, the MPS conflict error, the "MPS not running" warning, the `openmm`-already-imported
+error, and — in a subprocess — the real entry chain: import `gareus.core` and `gareus.cli`, run
+`parse_args` with a percentage, apply the MPS setting, and assert `openmm` and `gamd` are absent from
+`sys.modules` and `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` is set.
 
 ## 8. Files
 
 - New: `gareus/replica_admission.py` (`AdmissionDispatcher`, `advance_replicas`), the three test files above.
 - Changed: `gareus/cli.py` (flags, validation, MPS apply in `main`), `gareus/provenance.py`
-  (`_method_settings` keys), `gareus/production.py` (dispatcher build after replica construction; `step_all`
+  (`admission_manifest_record`, used by `_method_settings` and the per-job patch), `gareus/production.py` (dispatcher build after replica construction; `step_all`
   branch), `gareus/helptext.py` (short entry under the performance/MPS topic).
 - Launcher: `smoke/config/chignolin_9.yaml` gains the three keys only when the chignolin_9 switch is made
   (§9), not in this change.
@@ -214,3 +354,29 @@ manifest recording, the MPS conflict error, and the "MPS not running" warning.
   is a separate change.
 - **Straggler replica.** A slow replica (for example a costly NPT move) delays its GPU's queue by at most
   one turn per boundary, the same as today's join.
+- **Hung replica.** Blocks the run forever, as today (§4); no new detection.
+- **MPS daemon default.** Unset in today's launcher; a launcher that sets one runs outside the measured
+  configuration (§5).
+- **Single-context phases at 25 %.** Up to ~4x slower setup/recon on a fresh campaign; not paid by the
+  chignolin_9 resume (§5).
+
+## 11. Review record
+
+Small board, 2026-09-27 (kimi, mini; thinker failed with HTTP 500 twice and gave no position; chair glm):
+ACCEPT-WITH-CHANGES, 82/100. Its seven conditions are folded in above: one manifest representation (§3),
+total callback, drain and lock rule, pool exclusivity (§4), the added tests (§7), the real entry chain
+(§5, §7), and single-context phases plus absent-key tolerance (§3, §5).
+
+Dissent (mini, REJECT, 92), not adopted, with the reason:
+
+- *Callbacks run in the worker thread and deadlock on the lock.* A callback attached to a pending
+  future runs in the worker thread; one attached to an already-finished future runs synchronously in the
+  attaching thread. The protocol (§4) never holds the lock while attaching or submitting, so neither case
+  can re-enter or deadlock; the lock-discipline test pins it.
+- *A replica is re-queued across `production_safe_chunk_steps` sub-calls, adding a turn.* Each sub-call
+  is one `run`, which returns only when every replica's remaining count is 0 (asserted), so nothing carries
+  into the next `run`. A turn is `min(turn_steps, remaining)` inside one `run`; a 60 + 40 split gives
+  50 + 10 then 40 steps, exactly the requested totals, and the driver visits the same deadlines (§6).
+- *The client value is silently capped by the daemon default; query the daemon.* Not verified against
+  NVIDIA's documentation, and the launcher sets no daemon default (§5); the control is the §9 step 2
+  launcher requirement, not a runtime query.
