@@ -2006,6 +2006,9 @@ def main(argv: Optional[Iterable[str]] = None):
     _graceful_shutdown.clear()
     argv_list = _argv_as_list(argv)
     args = parse_args(argv_list)
+    # Before any OpenMM platform/context exists (spec 2026-09-26 §5).
+    from .mps_share import apply_mps_thread_percentage
+    apply_mps_thread_percentage(args)
     # For --input-pdb runs the sequence is nominal (real topology comes from the
     # supplied structure), so the >=2-residue terminal-CV gate does not apply.
     args.seq = validate_sequence(args.seq, require_min_two=not bool(getattr(args, "input_pdb", None)))

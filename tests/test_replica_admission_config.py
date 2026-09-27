@@ -149,3 +149,78 @@ def test_record_reads_inherited_env_captured_by_mps_apply():
     args._cuda_mps_inherited_env = None
     rec = admission_manifest_record(args)
     assert rec["cuda_mps_active_thread_percentage"] == {"requested": "inherit", "inherited_env": "unset"}
+
+
+# ------------------------------------------------------------------ MPS share
+
+import subprocess  # noqa: E402
+import sys  # noqa: E402
+import textwrap  # noqa: E402
+
+from gareus.mps_share import ENV_VAR, apply_mps_thread_percentage  # noqa: E402
+
+
+def _args(pct):
+    return parse_args(MINIMAL + ["--cuda-mps-active-thread-percentage", str(pct)])
+
+
+def test_inherit_records_and_leaves_env_alone():
+    env = {ENV_VAR: "40"}
+    args = parse_args(MINIMAL)
+    apply_mps_thread_percentage(args, environ=env, modules={})
+    assert env == {ENV_VAR: "40"}
+    assert args._cuda_mps_inherited_env == "40"
+
+
+def test_sets_env_when_unset():
+    env = {"CUDA_MPS_PIPE_DIRECTORY": "/tmp/pipe"}
+    args = _args(25)
+    apply_mps_thread_percentage(args, environ=env, modules={})
+    assert env[ENV_VAR] == "25"
+    assert args._cuda_mps_inherited_env is None
+
+
+@pytest.mark.parametrize("inherited", ["25", " 25 "])
+def test_equal_inherited_value_is_accepted(inherited):
+    env = {ENV_VAR: inherited, "CUDA_MPS_PIPE_DIRECTORY": "/tmp/pipe"}
+    apply_mps_thread_percentage(_args(25), environ=env, modules={})
+    assert env[ENV_VAR].strip() == "25"
+
+
+def test_conflicting_inherited_value_exits_naming_both():
+    env = {ENV_VAR: "40"}
+    with pytest.raises(SystemExit, match=r"40.*25|25.*40"):
+        apply_mps_thread_percentage(_args(25), environ=env, modules={})
+    assert env[ENV_VAR] == "40"
+
+
+def test_openmm_already_imported_exits():
+    with pytest.raises(SystemExit, match="openmm"):
+        apply_mps_thread_percentage(_args(25), environ={}, modules={"openmm": object()})
+
+
+def test_warns_when_mps_not_running(capsys):
+    env = {}
+    apply_mps_thread_percentage(_args(25), environ=env, modules={})
+    assert "CUDA_MPS_PIPE_DIRECTORY" in capsys.readouterr().err
+    assert env[ENV_VAR] == "25"
+
+
+def test_real_entry_chain_loads_no_openmm_and_sets_env():
+    script = textwrap.dedent(
+        """
+        import os, sys
+        os.environ.pop("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE", None)
+        os.environ["CUDA_MPS_PIPE_DIRECTORY"] = "/tmp/unused-pipe"
+        import gareus.core
+        import gareus.cli
+        from gareus.mps_share import apply_mps_thread_percentage
+        args = gareus.cli.parse_args(["--seq", "AA", "--out", "unused",
+                                      "--cuda-mps-active-thread-percentage", "25"])
+        apply_mps_thread_percentage(args)
+        print("openmm" in sys.modules, "gamd" in sys.modules,
+              os.environ.get("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"))
+        """
+    )
+    out = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=300, check=True)
+    assert out.stdout.split()[-3:] == ["False", "False", "25"]
