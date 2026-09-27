@@ -23,7 +23,7 @@ import operator
 import threading
 from collections import deque
 from concurrent.futures import CancelledError
-from typing import Callable, Optional, Sequence
+from typing import Callable, Mapping, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -229,3 +229,57 @@ class AdmissionDispatcher:
             raise first
         if not complete:
             raise RuntimeError("AdmissionDispatcher.run finished with replicas short of nsteps (dispatcher bug)")
+
+
+# ------------------------------------------------------------------ helpers
+
+
+def _advance_item(item) -> int:
+    """Today's step_all._step_item, unchanged: one replica's whole advance."""
+    idx, driver, n = item
+    driver.advance(int(n))
+    return int(idx)
+
+
+def advance_replicas(pool, drivers: Sequence, nsteps: int, dispatcher: Optional[AdmissionDispatcher]) -> None:
+    """Advance every driver by exactly ``nsteps``.
+
+    ``dispatcher is None`` is today's path: one ``pool.map`` over every
+    driver's ``advance(nsteps)``. Otherwise the dispatcher runs capped turns.
+    """
+    nsteps = int(nsteps)
+    if dispatcher is None:
+        list(pool.map(_advance_item, [(i, d, nsteps) for i, d in enumerate(drivers)]))
+        return
+    dispatcher.run(lambda i, n: drivers[i].advance(n), nsteps)
+
+
+def queue_keys_from_platform_props(props_list: Sequence[Mapping[str, str]]) -> list[str]:
+    """One admission queue key per replica: its DeviceIndex, or ``"shared"``.
+
+    A ``single-context-split`` DeviceIndex such as ``"0,1,2,3"`` is kept as
+    one key, so every such context shares one queue (each spans every GPU).
+    """
+    keys = []
+    for props in props_list:
+        dev = str((props or {}).get("DeviceIndex", "") or "").strip()
+        keys.append(dev if dev else SHARED_QUEUE_KEY)
+    return keys
+
+
+def effective_limits(queue_keys: Sequence[str], active_replicas_per_gpu) -> dict[str, int]:
+    """Per-queue concurrency actually in force: ``min(cap, resident)``, or resident for ``"all"``."""
+    resident: dict[str, int] = {}
+    for k in queue_keys:
+        resident[str(k)] = resident.get(str(k), 0) + 1
+    if active_replicas_per_gpu == "all":
+        return dict(resident)
+    cap = int(active_replicas_per_gpu)
+    return {k: min(cap, n) for k, n in resident.items()}
+
+
+def make_dispatcher(pool, queue_keys: Sequence[str], active_replicas_per_gpu, turn_steps: int) -> Optional[AdmissionDispatcher]:
+    """``None`` for ``"all"`` (today's code path), else an ``AdmissionDispatcher``."""
+    if active_replicas_per_gpu == "all":
+        return None
+    return AdmissionDispatcher(pool, list(queue_keys), limit=int(active_replicas_per_gpu), turn_steps=int(turn_steps))
