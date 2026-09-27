@@ -68,11 +68,16 @@ start.
 The cap is not part of any checkpoint and changes no recorded number, so it may differ between the jobs of
 one campaign (for example, off before a clean restart, on after it).
 
-**Recording.** `provenance._method_settings` alone is not enough: on a resume,
-`ensure_run_manifest_initialized` finds a complete manifest and leaves it untouched, so `method_settings`
-keeps the values of the campaign's first job. chignolin_9 would switch the cap on at a resume, and the
-manifest would still say `all`/`inherit`. Each job therefore records its own values through
-`update_run_manifest`, which runs on every job:
+**Recording.** `provenance._method_settings` alone is not enough for a resumed *phase directory*
+(adaptive-production's per-phase manifests): there, `ensure_run_manifest_initialized` finds a complete
+manifest and leaves it untouched, so `method_settings` would keep the values of that phase's first job if
+nothing else recorded a per-job update. A plain run's top-level out_dir does not have this problem the same
+way — `gareus/cli.py`'s `main()` calls `initialize_run_manifest` unconditionally on every job, fresh or
+resumed, which rebuilds `method_settings`/`resolved_args` from that job's current args regardless of what an
+earlier job recorded; only `replica_admission_history` is deliberately carried forward across a real
+`--resume` there (`initialize_run_manifest`'s existing-history check, commit `465d8d5`), everything else is
+rebuilt fresh. Either way, chignolin_9 switching the cap on at a resume must not leave the manifest saying
+`all`/`inherit`, so each job records its own values through `update_run_manifest`, which runs on every job:
 
 - `method_settings["replica_admission"]` — the current job's values, overwritten each job:
   `{"active_replicas_per_gpu": ..., "active_replica_turn_steps": ..., "cuda_mps_active_thread_percentage":
@@ -92,6 +97,14 @@ section exists to fix — so the config test asserts the flat keys are absent (�
 
 Readers (dashboard, `gareus_report.py`, provenance summaries) read `method_settings["replica_admission"]`,
 never the history list and never `resolved_args` (a first-job snapshot that still holds the flat values), and treat an absent key as a pre-change manifest meaning `all`/`inherit`.
+
+**Known residual.** `--extend` in regular mode on a plain (non-adaptive-production) run reaches
+`main()`'s `initialize_run_manifest` call before `_resolve_and_apply_extend_mode` sets `args.resume = True`
+(it must run "before the CLI dispatch chain" per that function's own docstring, i.e. after the manifest
+call). `initialize_run_manifest` only carries `replica_admission_history` forward when it observes
+`args.resume` already true, so this one call sees `resume=False` and resets the history for that job. The
+current job's own `method_settings["replica_admission"]` record stays correct regardless, since
+`record_replica_admission` rewrites it later in the job either way — only the history list is affected.
 
 ## 4. Dispatcher
 
