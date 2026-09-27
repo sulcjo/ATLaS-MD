@@ -899,9 +899,12 @@ def _add_platform_args(p: argparse.ArgumentParser) -> None:
                    help="Production stepping: at most this many replicas per GPU advance at once, in "
                         "FIFO turns ('all' = every replica at once, today's behaviour). Measured best "
                         "with MPS at 59 contexts/GPU: 6-8. Spec 2026-09-26-replica-admission-design.")
-    p.add_argument("--active-replica-turn-steps", type=int, default=50,
+    p.add_argument("--active-replica-turn-steps", default=50,
                    help="Steps a replica runs per admitted turn before rejoining its GPU's queue. "
-                        "Ignored when --active-replicas-per-gpu is 'all'.")
+                        "Ignored when --active-replicas-per-gpu is 'all'. No argparse type= here "
+                        "(consistent with --active-replicas-per-gpu/--cuda-mps-active-thread-percentage): "
+                        "a bad value must reach _validate_replica_admission_args's ValueError rather than "
+                        "argparse's own SystemExit, and a quoted numeric YAML string must be accepted.")
     p.add_argument("--cuda-mps-active-thread-percentage", default="inherit",
                    help="Set CUDA_MPS_ACTIVE_THREAD_PERCENTAGE for this process before any CUDA "
                         "context exists ('inherit' = leave the environment alone). Errors if the "
@@ -1101,9 +1104,21 @@ def _validate_replica_admission_args(args: argparse.Namespace) -> None:
     from .replica_admission import parse_active_replicas_per_gpu, parse_mps_thread_percentage
 
     args.active_replicas_per_gpu = parse_active_replicas_per_gpu(getattr(args, "active_replicas_per_gpu", "all"))
-    turn = getattr(args, "active_replica_turn_steps", 50)
-    if isinstance(turn, bool) or not isinstance(turn, int) or int(turn) < 1:
-        raise ValueError(f"--active-replica-turn-steps must be an integer >= 1, got {turn!r}")
+    raw_turn = getattr(args, "active_replica_turn_steps", 50)
+    turn = raw_turn
+    if isinstance(turn, bool):
+        raise ValueError(f"--active-replica-turn-steps must be an integer >= 1, got {raw_turn!r}")
+    if isinstance(turn, str):
+        # A numeric YAML string (e.g. `active_replica_turn_steps: "30"`), consistent
+        # with --active-replicas-per-gpu/--cuda-mps-active-thread-percentage.
+        try:
+            turn = int(turn.strip())
+        except ValueError:
+            raise ValueError(f"--active-replica-turn-steps must be an integer >= 1, got {raw_turn!r}") from None
+    elif not isinstance(turn, int):
+        raise ValueError(f"--active-replica-turn-steps must be an integer >= 1, got {raw_turn!r}")
+    if turn < 1:
+        raise ValueError(f"--active-replica-turn-steps must be an integer >= 1, got {raw_turn!r}")
     args.active_replica_turn_steps = int(turn)
     args.cuda_mps_active_thread_percentage = parse_mps_thread_percentage(
         getattr(args, "cuda_mps_active_thread_percentage", "inherit"))

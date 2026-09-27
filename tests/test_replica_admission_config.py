@@ -73,6 +73,20 @@ def test_bad_turn_steps_rejected(bad):
         parse_args(MINIMAL + ["--active-replica-turn-steps", bad])
 
 
+def test_yaml_quoted_turn_steps_string_accepted(tmp_path):
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text('active_replica_turn_steps: "30"\n')
+    args = parse_args(MINIMAL + ["--config", str(cfg)])
+    assert args.active_replica_turn_steps == 30
+
+
+def test_yaml_non_numeric_turn_steps_string_rejected(tmp_path):
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text('active_replica_turn_steps: "abc"\n')
+    with pytest.raises(ValueError, match="--active-replica-turn-steps"):
+        parse_args(MINIMAL + ["--config", str(cfg)])
+
+
 @pytest.mark.parametrize("bad", ["0", "101", "-1", "25.5", "half"])
 def test_bad_percentage_rejected(bad):
     with pytest.raises(ValueError, match="--cuda-mps-active-thread-percentage"):

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import operator
+import sys
 import threading
 from collections import deque
 from concurrent.futures import CancelledError
@@ -218,6 +219,13 @@ class AdmissionDispatcher:
             self._done.wait()
         finally:
             with self._lock:
+                # sys.exc_info() is non-None here exactly when the try body left via an
+                # exception (e.g. KeyboardInterrupt while turns are still in flight, not a
+                # turn failure -- those are already recorded through _on_done and leave
+                # _done.wait() returning normally). Record it as this run's failure before
+                # the state below is cleared, so no further turn is popped or re-queued.
+                if sys.exc_info()[1] is not None and not self._failed:
+                    self._record_failure_locked(sys.exc_info()[1])
                 first = self._first_exc
                 later = list(self._later_excs)
                 complete = all(r == 0 for r in self._remaining)
@@ -225,7 +233,7 @@ class AdmissionDispatcher:
                 self._fn = None
         if first is not None:
             for extra in later:
-                logger.error("replica admission: additional turn failure after the first: %r", extra)
+                logger.error("replica admission: additional turn failure after the first: %r", extra, exc_info=extra)
             raise first
         if not complete:
             raise RuntimeError("AdmissionDispatcher.run finished with replicas short of nsteps (dispatcher bug)")
@@ -251,6 +259,11 @@ def advance_replicas(pool, drivers: Sequence, nsteps: int, dispatcher: Optional[
     if dispatcher is None:
         list(pool.map(_advance_item, [(i, d, nsteps) for i, d in enumerate(drivers)]))
         return
+    if len(drivers) != len(dispatcher._queue_of):
+        raise ValueError(
+            f"advance_replicas: {len(drivers)} drivers but dispatcher was built for "
+            f"{len(dispatcher._queue_of)} replicas"
+        )
     dispatcher.run(lambda i, n: drivers[i].advance(n), nsteps)
 
 

@@ -47,8 +47,8 @@ def apply_mps_thread_percentage(
     env[ENV_VAR] = str(requested)
     if not env.get("CUDA_MPS_PIPE_DIRECTORY"):
         print(
-            f"[mps] WARNING: --cuda-mps-active-thread-percentage {requested} set, but CUDA_MPS_PIPE_DIRECTORY "
-            "is not set; MPS does not appear to be running and the setting has no effect.",
+            f"[mps] WARNING: --cuda-mps-active-thread-percentage {requested} set, but MPS may not be "
+            "running (CUDA_MPS_PIPE_DIRECTORY is not set); the setting may have no effect.",
             file=sys.stderr,
             flush=True,
         )

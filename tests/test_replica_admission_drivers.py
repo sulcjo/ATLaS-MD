@@ -9,6 +9,7 @@ as today's one-call-per-replica pool.map. Tiny 4-particle Reference systems
 from __future__ import annotations
 
 import threading
+import time
 
 import numpy as np
 import pytest
@@ -18,6 +19,7 @@ from openmm import LangevinMiddleIntegrator, Platform, System, Vec3, unit  # noq
 from openmm.app import Simulation, Topology  # noqa: E402
 from openmm.app.element import Element  # noqa: E402
 
+import gareus.replica_admission as replica_admission  # noqa: E402
 from gareus.npt_driver import ReplicaStepDriver  # noqa: E402
 from gareus.production import _ReplicaAffinityExecutor  # noqa: E402
 from gareus.replica_admission import (  # noqa: E402
@@ -196,3 +198,61 @@ def test_effective_limits():
     assert effective_limits(keys, 8) == {"0": 8, "1": 8}
     assert effective_limits(keys, "all") == {"0": 59, "1": 58}
     assert effective_limits(["0", "0"], 8) == {"0": 2}
+
+
+def test_advance_replicas_rejects_driver_count_mismatch():
+    pool = _ReplicaAffinityExecutor(3)
+    try:
+        dispatcher = AdmissionDispatcher(pool, ["0", "0", "1"], limit=8, turn_steps=50)
+        drivers = [CountingDriver(), CountingDriver()]  # 2 drivers, dispatcher built for 3
+        with pytest.raises(ValueError):
+            advance_replicas(pool, drivers, 10, dispatcher)
+    finally:
+        pool.shutdown(wait=True)
+
+
+def test_run_interrupted_mid_flight_stops_new_turns_and_recovers(monkeypatch):
+    """KeyboardInterrupt from Event.wait re-raises, and no turn starts after it settles.
+
+    A later run() on the same dispatcher still works once the earlier (still
+    in-flight when interrupted) turns have had time to finish.
+    """
+    starts: list[float] = []
+    starts_lock = threading.Lock()
+
+    def fn(i, n):
+        with starts_lock:
+            starts.append(time.monotonic())
+        time.sleep(0.005)
+
+    raised = {"done": False}
+
+    class _RaiseOnceEvent(threading.Event):
+        def wait(self, timeout=None):
+            if not raised["done"]:
+                raised["done"] = True
+                time.sleep(0.05)
+                raise KeyboardInterrupt()
+            return super().wait(timeout)
+
+    monkeypatch.setattr(replica_admission, "_Event", _RaiseOnceEvent)
+
+    pool = _ReplicaAffinityExecutor(2)
+    try:
+        dispatcher = AdmissionDispatcher(pool, ["0", "1"], limit=1, turn_steps=1)
+        interrupt_at = time.monotonic() + 0.05
+        with pytest.raises(KeyboardInterrupt):
+            dispatcher.run(fn, 10_000)
+
+        # Give any turn that was already in flight at the moment of the interrupt
+        # a chance to finish, then confirm no new turn started after that point.
+        time.sleep(0.1)
+        assert all(s <= interrupt_at + 0.05 for s in starts)
+
+        # Reusing the dispatcher works once the earlier turns have fully drained.
+        time.sleep(0.1)
+        starts.clear()
+        dispatcher.run(fn, 5)
+        assert starts
+    finally:
+        pool.shutdown(wait=True)
