@@ -96,7 +96,11 @@ that differs between jobs cannot trip a resume guard; a future whole-dict compar
 section exists to fix — so the config test asserts the flat keys are absent (§7).
 
 Readers (dashboard, `gareus_report.py`, provenance summaries) read `method_settings["replica_admission"]`,
-never the history list and never `resolved_args` (a first-job snapshot that still holds the flat values), and treat an absent key as a pre-change manifest meaning `all`/`inherit`.
+never the history list and never `resolved_args`. `resolved_args` being "a first-job snapshot that still
+holds the flat values" is true for adaptive-production phase directories (`ensure_run_manifest_initialized`
+skips a complete manifest); for a plain run's top-level out_dir, `resolved_args` instead holds the current
+job's own args, rebuilt every job by `main()`'s `initialize_run_manifest` — either way, readers must not use
+it for this setting. Treat an absent `replica_admission` key as a pre-change manifest meaning `all`/`inherit`.
 
 **Known residual.** `--extend` in regular mode on a plain (non-adaptive-production) run reaches
 `main()`'s `initialize_run_manifest` call before `_resolve_and_apply_extend_mode` sets `args.resume = True`

@@ -899,12 +899,16 @@ def _add_platform_args(p: argparse.ArgumentParser) -> None:
                    help="Production stepping: at most this many replicas per GPU advance at once, in "
                         "FIFO turns ('all' = every replica at once, today's behaviour). Measured best "
                         "with MPS at 59 contexts/GPU: 6-8. Spec 2026-09-26-replica-admission-design.")
+    # Deliberately no type= here, consistent with --active-replicas-per-gpu and
+    # --cuda-mps-active-thread-percentage below: with type=int, argparse applies that
+    # conversion to a *string* default too (e.g. one set via parser.set_defaults() from a
+    # quoted YAML scalar), so a bad value would exit via argparse's own SystemExit before
+    # _validate_replica_admission_args ever runs, and a good quoted numeric string would
+    # be silently converted before that validator's own string-handling code could ever
+    # see it. Leaving this a plain string/int lets both cases reach the validator.
     p.add_argument("--active-replica-turn-steps", default=50,
                    help="Steps a replica runs per admitted turn before rejoining its GPU's queue. "
-                        "Ignored when --active-replicas-per-gpu is 'all'. No argparse type= here "
-                        "(consistent with --active-replicas-per-gpu/--cuda-mps-active-thread-percentage): "
-                        "a bad value must reach _validate_replica_admission_args's ValueError rather than "
-                        "argparse's own SystemExit, and a quoted numeric YAML string must be accepted.")
+                        "Ignored when --active-replicas-per-gpu is 'all'.")
     p.add_argument("--cuda-mps-active-thread-percentage", default="inherit",
                    help="Set CUDA_MPS_ACTIVE_THREAD_PERCENTAGE for this process before any CUDA "
                         "context exists ('inherit' = leave the environment alone). Errors if the "

@@ -211,19 +211,34 @@ def test_advance_replicas_rejects_driver_count_mismatch():
         pool.shutdown(wait=True)
 
 
-def test_run_interrupted_mid_flight_stops_new_turns_and_recovers(monkeypatch):
-    """KeyboardInterrupt from Event.wait re-raises, and no turn starts after it settles.
+class _CountingSubmitPool:
+    """Wraps a real pool and counts .submit() calls, to prove no NEW turn is ever
+    submitted once a run has been marked failed (as opposed to merely no turn
+    *starting*, which an already-submitted-but-not-yet-run turn could still do)."""
 
-    A later run() on the same dispatcher still works once the earlier (still
-    in-flight when interrupted) turns have had time to finish.
+    def __init__(self, inner):
+        self._inner = inner
+        self.submit_calls = 0
+        self._count_lock = threading.Lock()
+
+    def submit(self, replica_index, fn, *args, **kwargs):
+        with self._count_lock:
+            self.submit_calls += 1
+        return self._inner.submit(replica_index, fn, *args, **kwargs)
+
+    def shutdown(self, wait=True):
+        self._inner.shutdown(wait=wait)
+
+
+def test_run_interrupted_mid_flight_guards_reuse_and_stops_new_turns(monkeypatch):
+    """KeyboardInterrupt from Event.wait re-raises; immediate reuse is refused while
+    the interrupted run's turns are still in flight; no new turn is ever submitted
+    once the run is marked failed; a later run() works once those turns have drained.
     """
-    starts: list[float] = []
-    starts_lock = threading.Lock()
+    TURN_SLEEP = 0.2
 
     def fn(i, n):
-        with starts_lock:
-            starts.append(time.monotonic())
-        time.sleep(0.005)
+        time.sleep(TURN_SLEEP)
 
     raised = {"done": False}
 
@@ -231,28 +246,56 @@ def test_run_interrupted_mid_flight_stops_new_turns_and_recovers(monkeypatch):
         def wait(self, timeout=None):
             if not raised["done"]:
                 raised["done"] = True
-                time.sleep(0.05)
+                # Shorter than TURN_SLEEP: both initial turns are still running
+                # (mid-fn) when this fires, and stay running for a while after.
+                time.sleep(0.02)
                 raise KeyboardInterrupt()
             return super().wait(timeout)
 
     monkeypatch.setattr(replica_admission, "_Event", _RaiseOnceEvent)
 
+    inner_pool = _ReplicaAffinityExecutor(2)
+    pool = _CountingSubmitPool(inner_pool)
+    try:
+        # nsteps == turn_steps: exactly one turn per queue, no resubmission chain,
+        # so submit_calls is exactly 2 per successful/attempted run() call.
+        dispatcher = AdmissionDispatcher(pool, ["0", "1"], limit=1, turn_steps=1)
+
+        with pytest.raises(KeyboardInterrupt):
+            dispatcher.run(fn, 1)
+        count_at_interrupt = pool.submit_calls
+        assert count_at_interrupt == 2
+
+        # The two turns are still in flight (they sleep TURN_SLEEP, the interrupt
+        # fired at ~0.02s): reuse must be refused, not race the running turns.
+        with pytest.raises(RuntimeError, match="still in flight"):
+            dispatcher.run(fn, 1)
+        assert pool.submit_calls == count_at_interrupt  # the refusal submitted nothing
+
+        # Let the two in-flight turns finish. Their completion callbacks must pop
+        # nothing further, since the run was marked failed before they finished.
+        time.sleep(TURN_SLEEP + 0.1)
+        assert pool.submit_calls == count_at_interrupt
+
+        # Usable again now that the earlier turns have fully drained.
+        dispatcher.run(fn, 1)
+        assert pool.submit_calls == count_at_interrupt + 2
+    finally:
+        inner_pool.shutdown(wait=True)
+
+
+def test_run_succeeds_when_called_from_inside_an_except_block():
+    """A caller's own in-flight exception (visible to sys.exc_info() throughout the
+    `except` block) must never be mistaken for a failure of a run() called from
+    inside it."""
     pool = _ReplicaAffinityExecutor(2)
     try:
-        dispatcher = AdmissionDispatcher(pool, ["0", "1"], limit=1, turn_steps=1)
-        interrupt_at = time.monotonic() + 0.05
-        with pytest.raises(KeyboardInterrupt):
-            dispatcher.run(fn, 10_000)
-
-        # Give any turn that was already in flight at the moment of the interrupt
-        # a chance to finish, then confirm no new turn started after that point.
-        time.sleep(0.1)
-        assert all(s <= interrupt_at + 0.05 for s in starts)
-
-        # Reusing the dispatcher works once the earlier turns have fully drained.
-        time.sleep(0.1)
-        starts.clear()
-        dispatcher.run(fn, 5)
-        assert starts
+        dispatcher = AdmissionDispatcher(pool, ["0", "1"], limit=1, turn_steps=5)
+        drivers = [CountingDriver(), CountingDriver()]
+        try:
+            raise ValueError("unrelated to the dispatcher")
+        except ValueError:
+            advance_replicas(pool, drivers, 12, dispatcher)
+        assert [sum(d.calls) for d in drivers] == [12, 12]
     finally:
         pool.shutdown(wait=True)

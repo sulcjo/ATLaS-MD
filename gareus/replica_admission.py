@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import logging
 import operator
-import sys
 import threading
 from collections import deque
 from concurrent.futures import CancelledError
@@ -205,6 +204,17 @@ class AdmissionDispatcher:
         with self._lock:
             if self._running:
                 raise RuntimeError("AdmissionDispatcher.run is not re-entrant (called while already running)")
+            if self._total_in_flight != 0:
+                # A previous call left via an exception (e.g. KeyboardInterrupt) while
+                # turns were still in flight: _running was already cleared (see the
+                # except/finally below), but those turns' done-callbacks may still be
+                # running against this dispatcher's *current* state. Reusing it now
+                # would let a stale callback corrupt state _reset_state_locked() is
+                # about to rebuild. Wait for them to drain first (see the module's
+                # tests for exactly how long that takes in practice).
+                raise RuntimeError(
+                    "AdmissionDispatcher.run called while turns from an interrupted run are still in flight"
+                )
             self._running = True
             self._reset_state_locked()
             self._fn = fn
@@ -217,15 +227,18 @@ class AdmissionDispatcher:
         try:
             self._submit(launches)
             self._done.wait()
+        except BaseException as exc:  # noqa: BLE001 - e.g. KeyboardInterrupt while turns are in flight
+            # Not a turn failure: those are recorded via _on_done/_record_failure_locked
+            # and leave _done.wait() returning normally. This is the try body itself
+            # leaving abnormally (a signal, or a bug in _submit/_done.wait()). Record it
+            # as this run's failure *before* the finally below clears _running/_fn, so no
+            # further turn is popped or re-queued, then re-raise unchanged.
+            with self._lock:
+                if not self._failed:
+                    self._record_failure_locked(exc)
+            raise
         finally:
             with self._lock:
-                # sys.exc_info() is non-None here exactly when the try body left via an
-                # exception (e.g. KeyboardInterrupt while turns are still in flight, not a
-                # turn failure -- those are already recorded through _on_done and leave
-                # _done.wait() returning normally). Record it as this run's failure before
-                # the state below is cleared, so no further turn is popped or re-queued.
-                if sys.exc_info()[1] is not None and not self._failed:
-                    self._record_failure_locked(sys.exc_info()[1])
                 first = self._first_exc
                 later = list(self._later_excs)
                 complete = all(r == 0 for r in self._remaining)
