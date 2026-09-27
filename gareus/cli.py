@@ -895,6 +895,11 @@ def _add_platform_args(p: argparse.ArgumentParser) -> None:
                    help="Apply CUDA MPS-optimal settings as soft defaults: UseBlockingSync=false, "
                         "DeterministicForces=false. Individual --cuda-* flags override these. "
                         "Requires CUDA MPS running on the node (nvidia-cuda-mps-control -d).")
+    p.add_argument("--production-phase-timers", action="store_true", default=False,
+                   help="Diagnostics: record wall time per production-loop phase (stepping, sampling, "
+                        "logging, exchange, checkpoint) and NPT controller timings to "
+                        "<out>/production_phase_timers.json at every checkpoint. Off by default; "
+                        "changes nothing that production computes.")
     p.add_argument("--active-replicas-per-gpu", default="all",
                    help="Production stepping: at most this many replicas per GPU advance at once, in "
                         "FIFO turns ('all' = every replica at once, today's behaviour). Measured best "
