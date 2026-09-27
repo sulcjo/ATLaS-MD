@@ -111,7 +111,8 @@ from .forces import (
     add_contact_umbrella_force,
     contact_switch_constants_nm,
 )
-from .provenance import (initialize_run_manifest, ensure_run_manifest_initialized, update_run_manifest,
+from .replica_admission import advance_replicas, effective_limits, make_dispatcher, queue_keys_from_platform_props
+from .provenance import (record_replica_admission, initialize_run_manifest, ensure_run_manifest_initialized, update_run_manifest,
                          finalize_run_manifest, pair_model_sha256)
 from .kernel_identity import (EXCHANGE_ENERGY_VERSION, FAST_SCALAR_MODES, LEGACY_TWO_TERM_MODES,
                               RESIDUAL_EVALUATOR_VERSION, kernel_identity_for_run)
@@ -6983,6 +6984,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     if progress is not None:
         progress.progress("replica_construction", 0, nrep, message=f"{nrep} replicas", force=True)
     replica_gamd_copy_report = []
+    _replica_platform_props: list[dict] = []
     _velocity_randomize_skip_count = 0
     for i in range(nrep):
         system_i = deserialize_system(openmm, base_system)
@@ -6990,6 +6992,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         copied_globals, skipped_globals = {}, {}
         loaded_shared_gamd_checkpoint = False
         props_i = replica_platform_properties(platform, props, args, i)
+        _replica_platform_props.append(dict(props_i))
 
         def _build_context_i():
             # Runs entirely on replica i's dedicated _sim_pool thread: Context
@@ -7151,6 +7154,21 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         drivers.append(driver_i)
         if progress is not None:
             progress.progress("replica_construction", i + 1, nrep, message=f"built replica {i + 1}/{nrep}")
+
+    # Replica admission (spec 2026-09-26-replica-admission-design §4/§6): None
+    # for the default 'all', which keeps step_all on today's pool.map path.
+    _admission_queue_keys = queue_keys_from_platform_props(_replica_platform_props)
+    _admission_cap = getattr(args, "active_replicas_per_gpu", "all")
+    _admission_turn = int(getattr(args, "active_replica_turn_steps", 50))
+    _admission_dispatcher = make_dispatcher(_sim_pool, _admission_queue_keys, _admission_cap, _admission_turn)
+    _admission_effective = effective_limits(_admission_queue_keys, _admission_cap)
+    print(
+        f"[production] Replica admission: active_replicas_per_gpu={_admission_cap}, "
+        f"turn_steps={_admission_turn if _admission_dispatcher is not None else 'n/a'}, "
+        f"effective per queue={_admission_effective}",
+        flush=True,
+    )
+    record_replica_admission(out_dir, args, _admission_effective)
 
     if _velocity_randomize_skip_count:
         # Ruling 17: one summary line for the whole segment, not one per window --
@@ -7875,20 +7893,15 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 return
             safe_chunk = int(getattr(args, "production_safe_chunk_steps", 0) or 0)
 
-            def _step_item(item):
-                _idx, _driver, _n = item
-                _driver.advance(int(_n))
-                return int(_idx)
-
             completed = 0
             try:
                 if safe_chunk <= 0 or safe_chunk >= nsteps:
-                    list(_sim_pool.map(_step_item, [(i, d, nsteps) for i, d in enumerate(drivers)]))
+                    advance_replicas(_sim_pool, drivers, nsteps, _admission_dispatcher)
                 else:
                     remaining = nsteps
                     while remaining > 0:
                         sub = min(int(safe_chunk), int(remaining))
-                        list(_sim_pool.map(_step_item, [(i, d, sub) for i, d in enumerate(drivers)]))
+                        advance_replicas(_sim_pool, drivers, sub, _admission_dispatcher)
                         completed += sub
                         remaining -= sub
             except Exception as exc:
