@@ -911,6 +911,10 @@ def _add_platform_args(p: argparse.ArgumentParser) -> None:
                         "--scratchdir sync). 0 = keep every generation (default). Recommended 4. "
                         "Only the newest generation is ever read on resume. "
                         "Spec 2026-09-28-output-retention-design.")
+    p.add_argument("--prune-us-starting-structures", action="store_true", default=False,
+                   help="After a phase's first production checkpoint, delete the pulled window PDBs in "
+                        "<phase>/us_starting_structures/ (reports are kept). A resumed phase never "
+                        "pulls again. Off by default: the PDBs help debug a bad pull.")
     p.add_argument("--active-replicas-per-gpu", default="all",
                    help="Production stepping: at most this many replicas per GPU advance at once, in "
                         "FIFO turns ('all' = every replica at once, today's behaviour). Measured best "
