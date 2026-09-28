@@ -1,7 +1,7 @@
 """Output retention tools (spec docs/superpowers/specs/2026-09-28-output-retention-design.md).
 
     python -m gareus.retention prune-checkpoints <run_dir> [--keep 4] [--apply]
-    python -m gareus.retention split-progress <progress.jsonl> [--apply]
+    python -m gareus.retention split-progress <progress.jsonl> [--apply] [--force]
     python -m gareus.retention archive <run_dir> [--apply] [--force]
     python -m gareus.retention restore <run_dir> [--apply]
 
@@ -49,7 +49,8 @@ def _generation_count(phase: Path) -> int:
     gens_dir = phase / "checkpoints" / "generations"
     if not gens_dir.is_dir():
         return 0
-    return sum(1 for e in gens_dir.iterdir() if e.is_dir())
+    # Dot-names (.deleting-* leftovers of an interrupted prune) are not generations.
+    return sum(1 for e in gens_dir.iterdir() if e.is_dir() and not e.name.startswith("."))
 
 
 def prune_run_checkpoints(run_dir: Path, keep: int, apply: bool) -> list[dict]:
@@ -123,16 +124,35 @@ def _rewrite_lines(src: Path, dst: Path) -> tuple[int, int]:
     return n_lines, n_dist
 
 
-def split_progress_jsonl(path: Path, apply: bool) -> dict:
+RUN_LOCK_NAME = ".gareus_run.lock"
+
+
+def _run_locks_below(directory: Path) -> list:
+    """Every .gareus_run.lock at or below directory (no PID check: may be another host)."""
+    return sorted(Path(directory).rglob(RUN_LOCK_NAME))
+
+
+def split_progress_jsonl(path: Path, apply: bool, force: bool = False) -> dict:
     """Rewrite an existing progress.jsonl, replacing each distances event with its
     small distances_summary (the same event name production now writes live).
 
-    Aborts without touching the original file if it changes size/mtime during the
-    rewrite (a live run still appending to it), reporting status
+    Stopped campaigns only: a live job's open append handle would keep writing to
+    the unlinked old inode after os.replace, silently losing every later line. So
+    any .gareus_run.lock at or below the file's directory refuses the rewrite
+    (status "run_locked") unless force=True; the lock's PID is not checked because
+    the job may run on another host.
+
+    Also aborts without touching the original file if it changes size/mtime during
+    the rewrite (a live run still appending to it), reporting status
     "changed_during_rewrite" rather than risking a lost concurrent write.
     """
     path = Path(path)
     before = path.stat()
+    locks = _run_locks_below(path.parent)
+    if locks and not force:
+        return {"status": "run_locked", "locks": [str(p) for p in locks], "lines": 0,
+                "distances_lines": 0, "bytes_before": before.st_size,
+                "bytes_after": before.st_size}
     tmp = path.with_name(path.name + ".split.tmp")
     try:
         n_lines, n_dist = _rewrite_lines(path, tmp)
@@ -314,6 +334,10 @@ def restore_run(run_dir: Path, apply: bool) -> list[dict]:
             rows.append({"archive": str(archive), "status": "verify_failed",
                          "error": f"unreadable index {index_path}: {exc}"})
             continue
+        if not isinstance(index, dict) or not isinstance(index.get("members"), dict):
+            rows.append({"archive": str(archive), "status": "verify_failed",
+                         "error": f"index {index_path} has no 'members' table"})
+            continue
         staging = dest.with_name("." + dest.name + ".restore")
         shutil.rmtree(staging, ignore_errors=True)
         try:
@@ -342,13 +366,25 @@ def main(argv: Optional[list] = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m gareus.retention", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
-    pc = sub.add_parser("prune-checkpoints", help="keep the newest N checkpoint generations per phase")
+    pc = sub.add_parser("prune-checkpoints", help="keep the newest N checkpoint generations per phase",
+                        description="Keep the newest N checkpoint generations per phase. A phase whose "
+                                    ".gareus_run.lock names a live PID is skipped ('locked'); that "
+                                    "live-lock check is host-local (os.kill on this host), so do not "
+                                    "run --apply while the job may be running on another node.")
     pc.add_argument("run_dir", type=Path)
     pc.add_argument("--keep", type=int, default=DEFAULT_KEEP)
     pc.add_argument("--apply", action="store_true")
-    sp = sub.add_parser("split-progress", help="drop per-replica distances dumps from a progress.jsonl")
+    sp = sub.add_parser("split-progress",
+                        help="drop per-replica distances dumps from a progress.jsonl (stopped campaigns only)",
+                        description="For stopped campaigns only: rewrite a progress.jsonl, replacing each "
+                                    "distances event with its distances_summary. Refuses (run_locked, "
+                                    "exit 1) if any .gareus_run.lock exists at or below the file's "
+                                    "directory, since a live job would keep appending to the replaced "
+                                    "file's old inode and lose those lines; --force overrides.")
     sp.add_argument("path", type=Path)
     sp.add_argument("--apply", action="store_true")
+    sp.add_argument("--force", action="store_true",
+                    help="rewrite even though a .gareus_run.lock exists (the campaign is known to be stopped)")
     ar = sub.add_parser("archive", help="pack PDB sets and final_window_states of a finished campaign")
     ar.add_argument("run_dir", type=Path)
     ar.add_argument("--apply", action="store_true")
@@ -364,7 +400,11 @@ def main(argv: Optional[list] = None) -> int:
         _print_rows(rows, args.apply)
         return 1 if any(r["status"] == "error" for r in rows) else 0
     if args.command == "split-progress":
-        r = split_progress_jsonl(args.path, args.apply)
+        r = split_progress_jsonl(args.path, args.apply, force=args.force)
+        if r["status"] == "run_locked":
+            print(f"run_locked: {len(r['locks'])} .gareus_run.lock file(s) below {args.path.parent}, "
+                  f"e.g. {r['locks'][0]}; stopped campaigns only (use --force if it is stopped)")
+            return 1
         print(f"{r['status']}: {r['distances_lines']}/{r['lines']} distances lines, "
               f"{r['bytes_before'] / 1e9:.2f} GB -> {r['bytes_after'] / 1e9:.2f} GB")
         return 0 if r["status"] in ("dry_run", "rewritten") else 1

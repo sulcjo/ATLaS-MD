@@ -262,3 +262,20 @@ def test_archive_skips_symlinks_counts_them_and_warns(tmp_path, capsys):
     retention.restore_run(run, apply=True)
     restored_names = {p.name for p in (target_dir / "pdbs").iterdir()}
     assert restored_names == {"s.pdb"}  # the symlink itself was never archived
+
+
+@pytest.mark.parametrize("index_text", ['{"other": 1}', '[1, 2]', '{"members": [1]}'])
+def test_restore_index_without_members_is_verify_failed_and_others_continue(tmp_path, index_text):
+    run = _campaign(tmp_path)
+    retention.archive_run(run, apply=True)
+    bad, good = sorted(run.rglob("*" + retention.ARCHIVE_SUFFIX))
+    bad_index = bad.with_name(bad.name + ".index.json")
+    bad_index.write_text(index_text)
+
+    rows = retention.restore_run(run, apply=True)
+
+    status = {r["archive"]: r["status"] for r in rows}
+    assert status[str(bad)] == "verify_failed"
+    assert status[str(good)] == "restored"
+    assert bad.exists() and bad_index.read_text() == index_text
+    assert not bad.with_name(bad.name[: -len(retention.ARCHIVE_SUFFIX)]).exists()

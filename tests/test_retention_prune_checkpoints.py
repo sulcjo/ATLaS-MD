@@ -84,3 +84,17 @@ def test_error_isolates_phase_and_apply_continues(tmp_path, monkeypatch):
     assert _ngen(b) == 4
 
     assert retention.main(["prune-checkpoints", str(tmp_path), "--keep", "4", "--apply"]) == 1
+
+
+def _subcommand_help(capsys, name):
+    import pytest
+    with pytest.raises(SystemExit):
+        main([name, "--help"])
+    import re
+    return " ".join(re.sub(r"\x1b\[[0-9;]*m", "", capsys.readouterr().out).split())
+
+
+def test_help_states_host_local_lock_and_stopped_campaigns_only(capsys):
+    assert "host-local" in _subcommand_help(capsys, "prune-checkpoints")
+    sp = _subcommand_help(capsys, "split-progress")
+    assert "stopped campaigns only" in sp and "--force" in sp
