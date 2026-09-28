@@ -5112,6 +5112,10 @@ def _report_summary_fields(report_info: dict) -> dict:
         # runs stay comparable. 'overlap_space' stamps that into the summary.
         'neighbor_overlap': report_info['neighbor_overlap'],
         'overlap_space': report_info['overlap_space'],
+        # False on a 2D layout or an out-of-order 1D ladder: then consecutive
+        # indices are not CV-space neighbours and the index-adjacent array is
+        # reported but not graded (gareus_report._check_overlap).
+        'index_order_is_cv_order': report_info.get('index_order_is_cv_order'),
         # The same marginal matrix re-paired by true CV-space adjacency (index
         # adjacency sent the chignolin_6 investigation at an innocent window),
         # plus the joint (CV1, CV2) numbers under their own key and their own

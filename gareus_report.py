@@ -372,17 +372,31 @@ def _check_overlap(s: dict, thr: float) -> dict:
         metric, metric_space = worst, OVERLAP_SPACE_MARGINAL
         parts.append(f"worst {worst:.3f} CV1-marginal (windows {i}-{j}, CV-space nearest "
                      f"neighbours)")
+    # Correction 4: index adjacency is a CV-space adjacency only on a monotone
+    # 1D ladder. The analysis says which (index_order_is_cv_order); on a 2D
+    # layout (chignolin_9: "index-adjacent 7-8" at 0.000 between windows that
+    # are not neighbours) the number is shown but not graded, provided a
+    # CV-space number exists -- bridging there is graded by
+    # _check_overlap_connectivity in both spaces, which covers the edges a
+    # nearest-neighbour pairing never examines (correction 3's concern).
+    # A summary without the flag (older analyses) keeps grading it.
+    index_is_cv = s.get("index_order_is_cv_order")
+    grade_index = index_is_cv is not False or (cv_worst is None and jworst is None)
     if iworst is not None:
         worst, i, j = iworst
-        st = _worse(st, _status_for_overlap(worst, thr))
-        if metric is None:
-            metric, metric_space = worst, OVERLAP_SPACE_MARGINAL
-        # Spelled out deliberately: the old wording ("pair 23-24") reads as a
-        # physical adjacency claim it cannot support, which is exactly what
-        # misdirected the chignolin_6 investigation. It is still graded (see
-        # correction 3 above) -- just never presented as the adjacent pair.
-        parts.append(f"worst {worst:.3f} CV1-marginal index-adjacent (windows {i}-{j} -- "
-                     f"may not be neighbours in CV space)")
+        if grade_index:
+            st = _worse(st, _status_for_overlap(worst, thr))
+            if metric is None:
+                metric, metric_space = worst, OVERLAP_SPACE_MARGINAL
+            # Spelled out deliberately: the old wording ("pair 23-24") reads as a
+            # physical adjacency claim it cannot support, which is exactly what
+            # misdirected the chignolin_6 investigation. It is still graded (see
+            # correction 3 above) -- just never presented as the adjacent pair.
+            parts.append(f"worst {worst:.3f} CV1-marginal index-adjacent (windows {i}-{j} -- "
+                         f"may not be neighbours in CV space)")
+        else:
+            parts.append(f"worst {worst:.3f} CV1-marginal index-adjacent (windows {i}-{j}; "
+                         f"not graded: index order is not CV order on this layout)")
     detail = "; ".join(parts)
     if detail:
         detail += f"; target ≥{thr:.2f}"
