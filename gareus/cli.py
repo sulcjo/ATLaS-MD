@@ -711,6 +711,11 @@ def _add_output_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--distance-output-mode", choices=["none", "csv", "jsonl", "both"],
                    default="none")
     p.add_argument("--distance-output-interval", type=int, default=1000)
+    p.add_argument("--live-distances-max-mb", type=int, default=256,
+                   help="Per-phase live_distances.jsonl ring for the monitor: per-replica CV/bias/boost "
+                        "rows every sample, at most 2 x this many MB on disk; progress.jsonl then gets "
+                        "only a small summary event. 0 = legacy: the full distances event goes into "
+                        "progress.jsonl. Spec 2026-09-28-output-retention-design.")
     p.add_argument("--parquet-flush-rows", type=int, default=200000,
                    help="Rows buffered per parquet writer before flushing a chunk to disk (default 200000). "
                         "Larger values → fewer, bigger parquet parts per run.")
