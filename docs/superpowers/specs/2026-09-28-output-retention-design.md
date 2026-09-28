@@ -78,13 +78,21 @@ plus three fallbacks a human can recover from by hand).
   root manifest has been replaced and fsynced (`checkpoint_store.py:223`), under the same publication lock.
   Also run by `copy_committed_generation` on the destination after a successful copy (scratch -> main), so the main
   tree does not keep accumulating the generations scratch prunes.
-- What it deletes: generation directories of this phase whose id is neither the root manifest's `generation_id`
-  nor among the `keep - 1` next-newest by the root manifests' publish order. Order by the `created_unix_time`
-  recorded in each generation's own `manifest.json`, never by directory mtime (a copy can scramble mtimes).
-  Never delete a directory whose `manifest.json` cannot be read (log a WARNING instead), and never delete
-  `.staging-*` directories here (publish already cleans those, `checkpoint_store.py:226-230`).
-- Deletion is `rmtree` of a complete, superseded directory, after the new root manifest is durable. A crash during
-  pruning leaves extra old generations, never a missing current one.
+- What it keeps (as implemented): the `keep` generations reached by following each generation manifest's
+  `previous_generation_id` back from the root manifest's `generation_id`, never ordered by directory mtime (a copy
+  can scramble mtimes). If that chain breaks before `keep` readable generations (an unreadable or missing manifest
+  in the middle, or the main copy of a `--scratchdir` run lacking a generation scratch never synced), the remaining
+  slots are filled from readable generations with `absolute_step` <= the root's, newest step first (tie-break
+  `created_unix_time` when present), so older valid fallbacks are not all deleted. Any generation off the chain
+  with `absolute_step` >= the root's (an unpublished orphan) is kept. Never delete a directory whose
+  `manifest.json` cannot be read (it is reported as skipped), and never touch `.staging-*` directories here
+  (publish already cleans those).
+- Deletion renames a complete, superseded directory to `generations/.deleting-<id>-<nonce>` and then `rmtree`s it,
+  after the new root manifest is durable. A crash mid-delete leaves a dot-name no reader or counter enumerates; the
+  next prune sweeps any `.deleting-*` leftover first (one it cannot remove is reported as skipped and never blocks
+  the prune). A crash during pruning leaves extra old generations, never a missing current one.
+- An in-run prune failure (inside `publish_generation` or `copy_committed_generation`) prints a WARNING and
+  returns normally: the new checkpoint is already committed.
 - Nothing reads older generations (§3), so resume behaviour is unchanged. Chignolin_9 at 4: 424 generations -> 28,
   633 GB -> ~46 GB (apparent).
 
@@ -94,11 +102,12 @@ manifest kept, payloads removed, `require_available` returns True and `load_prod
 clear error). Saves ~1.6 GB per finished phase (8-11 GB on chignolin_9). Not in the first cut: small gain for a
 change to the resume state machine.
 
-**c) Retro-pruning existing runs.** `python -m gareus.tools.prune_checkpoints <run_dir> [--keep 4] [--dry-run]`:
-walks every `checkpoints/` under the run, applies the same rule, prints per-phase bytes freed, and refuses to touch
-a phase whose `.gareus_run.lock` names a live process on this host (on a cluster, run it when no job of the campaign
-is running, or accept that it only ever deletes generations older than the two newest, which the running job never
-reads). Default `--dry-run`; deleting needs `--apply`.
+**c) Retro-pruning existing runs.** `python -m gareus.retention prune-checkpoints <run_dir> [--keep 4] [--apply]`:
+walks every `checkpoints/` under the run, applies the same rule (`prune_generations`), prints per-phase bytes freed,
+and refuses to touch a phase whose `.gareus_run.lock` names a live process. That live-lock check is host-local
+(`os.kill` on this host); on a cluster, run it when no job of the campaign is running. A dry run by default;
+deleting needs `--apply`. On an existing campaign with many generations, retro-prune first before turning on
+`--checkpoint-keep-generations`: the first in-run prune otherwise deletes them inline under the checkpoint lock.
 
 ### 4.2 R2: move `distances` events out of `progress.jsonl` (-23 GB, and growing ~5 GB/day on chignolin_9)
 
@@ -113,10 +122,23 @@ every replica. The monitor needs only the recent tail; the same per-replica valu
   `live_distances.1.jsonl` (replacing the previous one) and a new file starts. At most ~512 MB on disk per phase.
 - `gareus_monitor.py` reads `live_distances.jsonl`, then `live_distances.1.jsonl` if it needs more depth, then
   falls back to `progress.jsonl` for runs written before this change.
+- The exchange dashboard (~0.5 MB at 236 states) goes into every 20th ring line only, so a 1 MB ring tail misses it
+  about half the time (20 slim lines are ~1.1 MB). `DistanceLogger` therefore also atomically replaces
+  `<phase>/live_dashboard.json` (newest dashboard with `wall_time_s` and `step`) whenever it puts a dashboard in the
+  ring; the monitor takes the dashboard and its age in seconds from that file when `progress.jsonl` has none,
+  falling back to the ring scan.
+- The ring is monitor-only output and must never stop production: if creating or writing the ring (or
+  `live_dashboard.json`) raises (ENOSPC, stale NFS handle, failed rotate, a non-JSON value), `DistanceLogger` prints
+  one WARNING, drops the ring, and emits the legacy full `distances` event to `progress.jsonl` for the rest of the
+  run.
 - Dashboard history restore is unaffected (it reads CSV/Parquet, `logger.py:166-181`).
-- Existing runs: a one-off `gareus.tools.split_progress_jsonl` rewrites `progress.jsonl` without `distances` lines
-  (streaming, atomic replace) and optionally keeps the last 256 MB of them as `live_distances.jsonl`. Opt-in,
-  because it deletes data (the old per-sample CV dumps) that nothing reads but a human might.
+- Existing runs: `python -m gareus.retention split-progress <progress.jsonl> [--apply] [--force]` rewrites
+  `progress.jsonl`, replacing each `distances` line with its `distances_summary` (streaming, atomic replace). There
+  is no keep-tail option: the old per-sample dumps are not moved into a ring. Opt-in, because it deletes data (the
+  old per-sample CV dumps) that nothing reads but a human might. Stopped campaigns only: a live job's open append
+  handle would keep writing to the replaced file's old inode and lose every later line, so it refuses
+  (`run_locked`, exit 1) whenever any `.gareus_run.lock` exists at or below the file's directory (no PID check, the
+  job may run on another host) unless `--force`.
 
 ### 4.3 R3: PDB sets (-7 to -21 GB)
 
@@ -133,13 +155,14 @@ every replica. The monitor needs only the recent tail; the same per-replica valu
 
 ### 4.4 R4: cold archive for a finished campaign (opt-in tool)
 
-`python -m gareus.tools.archive_run <run_dir> [--restore]`, for a campaign whose driver reports `completed` and that
+`python -m gareus.retention archive <run_dir> [--apply] [--force]` and
+`python -m gareus.retention restore <run_dir> [--apply]`, for a campaign whose driver reports `completed` and that
 will not be extended soon:
 
 - packs each PDB directory and each `final_window_states/` into `<dir>.tar.zst` (Python `zstandard`, level 19,
-  `--long`), with a sidecar listing member names, sizes and sha256; removes the originals only after the archive
-  verifies;
-- `--restore` unpacks everything back to the original paths byte for byte (checked against the sidecar), so a later
+  without long-distance matching), with a sidecar listing member names, sizes and sha256; removes the originals
+  only after the archive verifies;
+- `restore` unpacks everything back to the original paths byte for byte (checked against the sidecar), so a later
   `--extend` works unchanged after a restore;
 - leaves Parquet, trajectories, npz, checkpoints (after R1), manifests and all small files untouched.
 
@@ -168,8 +191,9 @@ generations per phase, so the saving increases for as long as the campaign runs.
 ## 6. Tasks
 
 1. **R1** `prune_generations` in `checkpoint_store` + wiring in `publish_generation` and
-   `copy_committed_generation` + CLI/YAML flag + `gareus.tools.prune_checkpoints`.
-   Tests: default `0` deletes nothing; keeps exactly the current + N-1 newest by `created_unix_time`; never deletes the root manifest's
+   `copy_committed_generation` + CLI/YAML flag + `python -m gareus.retention prune-checkpoints`.
+   Tests: default `0` deletes nothing; keeps exactly the current + N-1 newest along the `previous_generation_id`
+   chain (step-sorted fill when it breaks); never deletes the root manifest's
    generation, even with scrambled mtimes; crash injected between root replace and prune leaves a resumable
    phase; prune after `copy_committed_generation` on the destination; `keep=0` deletes nothing; unreadable
    generation manifest is skipped with a WARNING; resume after pruning loads bit-identical state.
@@ -182,7 +206,7 @@ generations per phase, so the saving increases for as long as the campaign runs.
    opt-in prune flag. Tests: seeding from a hard-linked bank is identical; cross-device fallback copies.
 4. **R4** archive/restore tool. Tests: round trip byte-identical; refuses a campaign that is not `completed`;
    refuses to delete originals if verification fails.
-5. **Roll-out on chignolin_9:** R1 retro-prune with `--dry-run`, then `--apply` between two jobs of the chain
+5. **Roll-out on chignolin_9:** R1 retro-prune as a dry run, then `--apply` between two jobs of the chain
    (job held, like a deploy); record bytes before/after. The local mirror keeps old generations unless its sync
    runs with `--delete` on `checkpoints/`; prune it with the same tool.
 
