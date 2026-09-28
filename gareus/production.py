@@ -146,6 +146,7 @@ __all__ = [
     "checkpoint_manifest_path",
     "save_production_checkpoint",
     "sync_scratch_to_main",
+    "prune_us_starting_pdbs",
     "load_production_checkpoint",
     "restore_exchange_stats_from_csv_if_needed",
     "run_production_probe",
@@ -5263,9 +5264,24 @@ def prune_us_starting_pdbs(out_dir: Path) -> int:
         try:
             pdb.unlink()
             n += 1
-        except OSError:
-            pass
+        except OSError as e:
+            print(f"[retention] WARNING: could not remove {pdb}: {e}", flush=True)
     return n
+
+def _maybe_prune_us_starting(args, *dirs) -> None:
+    """Conditionally prune us_starting_structures from multiple directories when flag is set.
+
+    When --prune-us-starting-structures is enabled, removes pulled window PDBs from
+    each directory's us_starting_structures/ subdirectory (e.g., scratch and main
+    directories). Logs per-directory results.
+    """
+    if not bool(getattr(args, "prune_us_starting_structures", False)):
+        return
+    for d in dirs:
+        _n_pruned = prune_us_starting_pdbs(d)
+        if _n_pruned:
+            print(f"[retention] removed {_n_pruned} pulled window PDBs from "
+                  f"{Path(d) / 'us_starting_structures'}", flush=True)
 
 def _validate_npt_checkpoint_compatibility(out_dir: Path, manifest: dict, npt_runtime: NptRunContext, sims: list) -> Optional[str]:
     """Validate backend/adapter/T/P/topology before accepting a checkpoint.
@@ -8472,10 +8488,12 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     drivers=drivers, pool=_sim_pool, npt_runtime=npt_runtime,
                     keep_generations=int(getattr(args, "checkpoint_keep_generations", 0) or 0),
                 )
+                _maybe_prune_us_starting(args, out_dir)
                 _scratch_main = getattr(args, "_main_dir", None)
                 if _scratch_main:
                     sync_scratch_to_main(out_dir, Path(_scratch_main),
                                           keep_generations=int(getattr(args, "checkpoint_keep_generations", 0) or 0))
+                    _maybe_prune_us_starting(args, _scratch_main)
                 break
             target = prod_total
             if next_exchange > prod_done:
@@ -8574,11 +8592,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                         drivers=drivers, pool=_sim_pool, npt_runtime=npt_runtime,
                         keep_generations=int(getattr(args, "checkpoint_keep_generations", 0) or 0),
                     )
-                if bool(getattr(args, "prune_us_starting_structures", False)):
-                    _n_pruned = prune_us_starting_pdbs(out_dir)
-                    if _n_pruned:
-                        print(f"[retention] removed {_n_pruned} pulled window PDBs from "
-                              f"{out_dir / 'us_starting_structures'}", flush=True)
+                _maybe_prune_us_starting(args, out_dir)
                 # Written before the scratch sync so the main directory gets this checkpoint's timers.
                 if _phase_timers.enabled:
                     _phase_timers.write(_phase_timers_path, extra={"npt": aggregate_npt_timings(drivers)})
@@ -8587,6 +8601,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     with _phase_timers.phase("checkpoint_scratch_sync"):
                         sync_scratch_to_main(out_dir, Path(_scratch_main),
                                               keep_generations=int(getattr(args, "checkpoint_keep_generations", 0) or 0))
+                    _maybe_prune_us_starting(args, _scratch_main)
                 while next_checkpoint <= prod_done:
                     next_checkpoint += checkpoint_interval
 
