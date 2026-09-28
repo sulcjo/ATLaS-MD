@@ -1043,11 +1043,13 @@ def test_analyze_publishes_every_mapping_diagnostic_end_to_end(tmp_path):
     # adjacent is what misdirected the original investigation. Round 3 folded
     # the index-adjacent number back in as an additional GRADED number (a
     # passing CV-space pair must not be able to hide a broken index ladder), so
-    # it appears in `detail` too -- explicitly labelled as possibly-not-
-    # adjacent, which is what is checked here now.
+    # it appears in `detail` too. This fixture is a 2D (CV1, CV2) layout, so
+    # index order is not CV order: the number is shown, labelled as not
+    # graded (correction 4 in gareus_report._check_overlap).
+    assert disk['index_order_is_cv_order'] is False
     assert 'CV-space nearest' in ov['detail'], ov['detail']
     assert 'index-adjacent (windows' in ov['detail'], ov['detail']
-    assert 'may not be neighbours in CV space' in ov['detail'], ov['detail']
+    assert 'not graded: index order is not CV order' in ov['detail'], ov['detail']
     assert 'joint' in ov['detail'].lower(), ov['detail']
     # M4: `metric` alone cannot say which space it was measured in, and the two
     # carry different thresholds. The label has to survive the trip onto disk --

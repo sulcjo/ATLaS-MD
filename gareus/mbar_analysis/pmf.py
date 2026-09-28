@@ -1121,6 +1121,29 @@ def self_bias_warning_lines(sb: dict, warning_prefix: str = '',
         f'(umbrella_explicit_windows.csv). See docs/chignolin_6_low_ess_root_cause.md.']
 
 
+def index_order_is_cv_order(centers, secondary_centers=None, tol: float = 1.0e-9) -> bool:
+    """True iff consecutive window indices are consecutive in CV space.
+
+    That holds for a monotone 1D ladder (CV1 centres non-decreasing or
+    non-increasing with index; repeats are rungs of one centre) with no varying
+    CV2 centre. On a 2D layout, or a 1D ladder stored out of order, windows i
+    and i+1 need not be neighbours at all (chignolin_9: "index-adjacent 7-8"
+    at overlap 0.000 between windows that are not neighbours), so the
+    index-adjacent overlap array is not a window-overlap measurement there.
+    """
+    cen = np.asarray(centers, dtype=float)
+    cen = cen[np.isfinite(cen)]
+    if secondary_centers is not None:
+        sec = np.asarray(secondary_centers, dtype=float)
+        sec = sec[np.isfinite(sec)]
+        if sec.size and float(np.max(sec) - np.min(sec)) > tol:
+            return False
+    if cen.size < 2:
+        return True
+    step = np.diff(cen)
+    return bool(np.all(step >= -tol) or np.all(step <= tol))
+
+
 def cv_space_neighbor_overlap(O: np.ndarray, centers: np.ndarray, k_kcal: np.ndarray,
                               centers2: np.ndarray, k2: np.ndarray, kbt_kcal: float,
                               n_k: Optional[np.ndarray] = None) -> list:
@@ -1999,6 +2022,9 @@ def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.nd
         # silently kept using the index-adjacency fallback on real runs.
         'neighbor_overlap': neigh, 'n_samples': N, 'O': O,
         'overlap_space': OVERLAP_SPACE_MARGINAL,
+        # Whether 'neighbor_overlap' pairs are CV-space neighbours at all:
+        # gareus_report grades the index-adjacent array only when this is True.
+        'index_order_is_cv_order': index_order_is_cv_order(d.centers, _sec_centers),
         'cv_space_neighbor_overlap': cv_neigh,
         'self_bias': self_bias,
         'joint_overlap': joint_info,
