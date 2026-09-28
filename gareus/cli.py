@@ -714,7 +714,9 @@ def _add_output_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--live-distances-max-mb", type=int, default=256,
                    help="Per-phase live_distances.jsonl ring for the monitor: per-replica CV/bias/boost "
                         "rows every sample, at most 2 x this many MB on disk; progress.jsonl then gets "
-                        "only a small summary event. 0 = legacy: the full distances event goes into "
+                        "only a small summary event. The ring (and <phase>/live_dashboard.json, the "
+                        "newest exchange dashboard) is written even with --progress-mode console. "
+                        "0 = legacy: the full distances event goes into "
                         "progress.jsonl. Spec 2026-09-28-output-retention-design.")
     p.add_argument("--parquet-flush-rows", type=int, default=200000,
                    help="Rows buffered per parquet writer before flushing a chunk to disk (default 200000). "
@@ -909,7 +911,10 @@ def _add_platform_args(p: argparse.ArgumentParser) -> None:
                    help="Keep only the newest N production checkpoint generations per phase and "
                         "delete older ones after each checkpoint (and on the main copy after a "
                         "--scratchdir sync). 0 = keep every generation (default). Recommended 4. "
-                        "Only the newest generation is ever read on resume. "
+                        "Only the newest generation is ever read on resume. On an existing campaign "
+                        "with many generations, retro-prune with `python -m gareus.retention "
+                        "prune-checkpoints` first (the first in-run prune otherwise deletes them "
+                        "inline under the checkpoint lock). "
                         "Spec 2026-09-28-output-retention-design.")
     p.add_argument("--prune-us-starting-structures", action="store_true", default=False,
                    help="After a phase's first production checkpoint, delete the pulled window PDBs in "
@@ -1758,6 +1763,8 @@ def parse_args(argv: Optional[Iterable[str]] = None):
     _validate_replica_admission_args(args)
     if int(getattr(args, "checkpoint_keep_generations", 0) or 0) < 0:
         p.error("--checkpoint-keep-generations must be >= 0")
+    if int(getattr(args, "live_distances_max_mb", 0) or 0) < 0:
+        p.error("--live-distances-max-mb must be >= 0")
     validate_gamd_stage_multiples(args)
 
     return args

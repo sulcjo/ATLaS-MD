@@ -46,3 +46,14 @@ def test_quiescent_sync_prunes_destination(tmp_path):
         sync_run_tree_quiescent(src, dst, keep_generations=2)
     assert len(list((dst / "checkpoints" / "generations").iterdir())) == 2
     assert (dst / "note.txt").read_text() == "x"
+
+
+def test_help_says_retro_prune_existing_campaign_first():
+    import argparse
+    import re
+    from gareus import cli
+    p = argparse.ArgumentParser()
+    cli._add_platform_args(p)
+    text = " ".join(re.sub(r"\x1b\[[0-9;]*m", "", p.format_help()).split())
+    assert "python -m gareus.retention prune-checkpoints" in text
+    assert "under the checkpoint lock" in text
