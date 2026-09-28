@@ -25,7 +25,9 @@ def _bank(tmp_path):
 def test_filtered_bank_uses_hard_links(tmp_path):
     bank = _bank(tmp_path)
     out = tmp_path / "seg" / "filtered_seed_bank"
-    ap.filter_seed_bank_for_state_ids(bank, [0, 1], out)
+    report = ap.filter_seed_bank_for_state_ids(bank, [0, 1], out)
+    assert report["linked"] == 2, f"Expected 2 links, got {report['linked']}"
+    assert report["copied"] == 0, f"Expected 0 copies, got {report['copied']}"
     for sid in (0, 1):
         src, dst = bank / "pdbs" / f"seed_{sid}.pdb", out / "pdbs" / f"seed_{sid}.pdb"
         assert dst.read_text() == src.read_text()
@@ -39,7 +41,36 @@ def test_falls_back_to_copy_when_link_fails(tmp_path, monkeypatch):
         raise OSError("cross-device")
     monkeypatch.setattr(ap.os, "link", no_link)
     out = tmp_path / "seg" / "filtered_seed_bank"
-    ap.filter_seed_bank_for_state_ids(bank, [0], out)
+    report = ap.filter_seed_bank_for_state_ids(bank, [0], out)
+    assert report["linked"] == 0, f"Expected 0 links, got {report['linked']}"
+    assert report["copied"] == 1, f"Expected 1 copy, got {report['copied']}"
     dst = out / "pdbs" / "seed_0.pdb"
     assert dst.read_text() == "ATOM 0\nEND\n"
     assert os.stat(dst).st_ino != os.stat(bank / "pdbs" / "seed_0.pdb").st_ino
+
+
+def test_source_rewrite_preserves_filtered_content(tmp_path):
+    """Regression test: rewriting source PDB doesn't affect filtered bank's hard links."""
+    bank = _bank(tmp_path)
+    out = tmp_path / "seg" / "filtered_seed_bank"
+    report = ap.filter_seed_bank_for_state_ids(bank, [0], out)
+    assert report["linked"] == 1, "Should have created a hard link"
+
+    # Verify initial content matches
+    src = bank / "pdbs" / "seed_0.pdb"
+    dst = out / "pdbs" / "seed_0.pdb"
+    original_content = "ATOM 0\nEND\n"
+    assert dst.read_text() == original_content
+    assert os.stat(dst).st_ino == os.stat(src).st_ino
+
+    # Rewrite source PDB with different content using _copy_replace
+    new_content = "ATOM 999\nNEW\n"
+    tmp_new_pdb = bank / "pdbs" / "temp_seed.pdb"
+    tmp_new_pdb.write_text(new_content)
+    ap._copy_replace(tmp_new_pdb, src)
+    tmp_new_pdb.unlink()
+
+    # Verify: source now has new content, but filtered bank still has original
+    assert src.read_text() == new_content, "Source should be rewritten"
+    assert dst.read_text() == original_content, "Filtered bank should retain original content"
+    assert os.stat(dst).st_ino != os.stat(src).st_ino, "After rewrite, inodes should differ"
