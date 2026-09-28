@@ -53,7 +53,7 @@ def _copy_atomic(source: Path, destination: Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def sync_run_tree_quiescent(source, destination) -> None:
+def sync_run_tree_quiescent(source, destination, keep_generations: int = 0) -> None:
     """Copy a single paused run tree; publish checkpoint files/manifest LAST.
 
     Checkpoint ensemble is transactional. Each other copied file is atomic, but
@@ -98,4 +98,4 @@ def sync_run_tree_quiescent(source, destination) -> None:
             _copy_atomic(path, dest)
         if checkpoint_manifest_path(source).read_bytes() != root_bytes:
             raise CheckpointError("Source changed during synchronization; no checkpoint published")
-        copy_committed_generation(source, destination)
+        copy_committed_generation(source, destination, keep_generations=keep_generations)

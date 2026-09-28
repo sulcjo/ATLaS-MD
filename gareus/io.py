@@ -376,6 +376,44 @@ class BufferedJsonlWriter:
                 pass
 
 
+class RotatingJsonlWriter:
+    """Two-file JSONL ring: ``<path>`` (current) and ``<stem>.1<suffix>`` (previous).
+
+    Each line is flushed immediately (a monitor tails the file). When the current
+    file would pass ``max_bytes`` it replaces the previous one and a new current
+    file starts, so the pair never holds more than ~2 x max_bytes.
+    """
+
+    def __init__(self, path: Path, max_bytes: int) -> None:
+        self.path = Path(path)
+        self.previous_path = self.path.with_name(self.path.stem + ".1" + self.path.suffix)
+        self.max_bytes = max(1, int(max_bytes))
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.handle = self.path.open("a", encoding="utf-8")
+        self.size = self.path.stat().st_size
+
+    def write_json(self, payload: Dict[str, Any]) -> None:
+        line = json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+        n = len(line.encode("utf-8"))
+        if self.size > 0 and self.size + n > self.max_bytes:
+            self._rotate()
+        self.handle.write(line)
+        self.handle.flush()
+        self.size += n
+
+    def _rotate(self) -> None:
+        self.handle.close()
+        os.replace(self.path, self.previous_path)
+        self.handle = self.path.open("a", encoding="utf-8")
+        self.size = 0
+
+    def close(self) -> None:
+        try:
+            self.handle.close()
+        except Exception:
+            pass
+
+
 __all__ = [
     "_NumpyEncoder",
     "write_json",
@@ -385,4 +423,5 @@ __all__ = [
     "_json_ready",
     "BufferedCsvDictWriter",
     "BufferedJsonlWriter",
+    "RotatingJsonlWriter",
 ]

@@ -29,6 +29,7 @@ import csv
 import json
 import logging
 import math
+import os
 import re
 import shutil
 import time
@@ -938,7 +939,7 @@ def write_epoch_seed_bank(
         dst_name = f"{source_label}_state_{state_id:04d}_seed_{idx:02d}.pdb"
         dst = pdb_dst_dir / dst_name
         try:
-            shutil.copy2(src, dst)
+            _copy_replace(src, dst)
         except Exception:
             skipped += 1
             continue
@@ -1037,7 +1038,7 @@ def write_seed_bank_from_run_dirs(
             dst_name = f"{source_label}_state_{state_id:04d}_seed_{idx:02d}.pdb"
             dst = pdb_dst_dir / dst_name
             try:
-                shutil.copy2(src, dst)
+                _copy_replace(src, dst)
             except Exception:
                 skipped += 1
                 continue
@@ -1366,6 +1367,39 @@ def extract_and_register_coverage_seeds(
     return {"n_extracted": n_extracted, "n_skipped": n_skipped, "rows": rows}
 
 
+def _copy_replace(src: Path, dst: Path) -> None:
+    """Copy src to dst atomically, replacing any existing dst.
+
+    Writes to a temporary file in dst's directory, then uses os.replace to
+    atomically swap it in. This ensures that any hard links to the old dst
+    retain the old content while dst itself gets new content. If the copy
+    fails, the temp file is removed and dst is left unchanged.
+    """
+    tmp = dst.with_name("." + dst.name + ".tmp")
+    try:
+        shutil.copy2(src, tmp)
+        os.replace(tmp, dst)
+    except Exception:
+        if tmp.exists():
+            tmp.unlink()
+        raise
+
+
+def _link_or_copy(src: Path, dst: Path) -> str:
+    """Hard-link a seed PDB into a filtered bank; copy when linking is impossible.
+
+    Seed PDBs are never modified after they are written, so a link is
+    indistinguishable to every reader and saves the whole copy (chignolin_9:
+    7.1 GB of filtered_seed_bank). Spec 2026-09-28-output-retention-design R3a.
+    """
+    try:
+        os.link(src, dst)
+        return "link"
+    except OSError:
+        shutil.copy2(src, dst)
+        return "copy"
+
+
 def filter_seed_bank_for_state_ids(
     seed_bank_dir: Path,
     target_state_ids: Sequence[int],
@@ -1393,8 +1427,11 @@ def filter_seed_bank_for_state_ids(
     assignment_rows = _read_csv_dicts(seed_bank_dir / "state_aware_seed_assignments.csv")
     chosen: List[Dict[str, Any]] = []
     seen_paths: set[str] = set()
+    linked_count = 0
+    copied_count = 0
 
     def _copy_row(row: Dict[str, Any], target_state_id: Optional[int], source: str) -> None:
+        nonlocal linked_count, copied_count
         src_text = str(row.get("seed_pdb_path", row.get("survivor_pdb_path", ""))).strip()
         if not src_text:
             return
@@ -1416,7 +1453,11 @@ def filter_seed_bank_for_state_ids(
         dst_dir.mkdir(parents=True, exist_ok=True)
         dst = dst_dir / Path(src).name
         if not dst.exists():
-            shutil.copy2(src, dst)
+            result = _link_or_copy(src, dst)
+            if result == "link":
+                linked_count += 1
+            else:
+                copied_count += 1
         chosen.append({
             "seed_name": str(row.get("seed_name", Path(src).stem)),
             "survivor_pdb_path": str(dst),
@@ -1475,6 +1516,8 @@ def filter_seed_bank_for_state_ids(
         "final_survivor_seeds_csv": str(csv_path),
         "target_state_ids": [int(x) for x in target_ids],
         "n_rows": int(len(chosen)),
+        "linked": linked_count,
+        "copied": copied_count,
         "rows": _json_ready(chosen[:200]),
     }
     write_json(output_dir / "filtered_seed_bank_report.json", payload)
