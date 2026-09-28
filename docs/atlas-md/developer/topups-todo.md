@@ -67,7 +67,9 @@ cannot be caught. Before enabling `--ap-topups` on chignolin_10 (or any campaign
 subsample the union input before the solve or confirm the launch node has enough RAM for the campaign's full
 row count.
 
-## T7 — compress and prune output files before chignolin_10 (not started)
+## T7 — compress and prune output files before chignolin_10 (implemented; roll-out pending)
+
+Spec: `docs/superpowers/specs/2026-09-28-output-retention-design.md` (28 Sep: 688 GB, 92 % checkpoint generations, of which only the newest per phase is ever read).
 
 Requested 2026-09-27. chignolin_9's run directory is 334 GB (local copy of 27 Sep, `final/baseline` at 28 %;
 aurum2 reports 188 GB for the same 282 GB of files because its filesystem compresses). Where it goes:
