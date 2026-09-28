@@ -42,10 +42,18 @@ def _generation_count(phase: Path) -> int:
     gens_dir = phase / "checkpoints" / "generations"
     if not gens_dir.is_dir():
         return 0
-    return len(list(gens_dir.iterdir()))
+    return sum(1 for e in gens_dir.iterdir() if e.is_dir())
 
 
 def prune_run_checkpoints(run_dir: Path, keep: int, apply: bool) -> list[dict]:
+    """One row per checkpoint phase; a per-phase failure never aborts the others.
+
+    status is one of "locked" (a live run owns the phase; never pruned),
+    "error" (prune_generations raised; nothing in that phase was touched or, if
+    it raised mid-delete, is reported as if it had not been), "dry_run", or
+    "pruned". "skipped" (unreadable/orphaned generations prune_generations itself
+    declined to touch) is only present on "dry_run"/"pruned" rows.
+    """
     rows = []
     for phase in find_checkpoint_phases(run_dir):
         n_gen = _generation_count(phase)
@@ -53,18 +61,30 @@ def prune_run_checkpoints(run_dir: Path, keep: int, apply: bool) -> list[dict]:
             rows.append({"phase": str(phase), "status": "locked",
                          "generations": n_gen, "would_delete": 0, "bytes": 0})
             continue
-        report = prune_generations(phase, keep, dry_run=not apply)
+        try:
+            report = prune_generations(phase, keep, dry_run=not apply)
+        except Exception as exc:  # noqa: BLE001 - isolate one bad phase from the rest
+            rows.append({"phase": str(phase), "status": "error",
+                         "generations": n_gen, "would_delete": 0, "bytes": 0,
+                         "error": str(exc)})
+            continue
         status = "pruned" if apply else "dry_run"
         rows.append({"phase": str(phase), "status": status, "generations": n_gen,
-                     "would_delete": len(report["deleted"]), "bytes": report["bytes_freed"]})
+                     "would_delete": len(report["deleted"]), "bytes": report["bytes_freed"],
+                     "skipped": len(report["skipped"])})
     return rows
 
 
 def _print_rows(rows: Iterable[dict], apply: bool) -> None:
     total = 0
     for r in rows:
-        total += r["bytes"] if r["status"] != "locked" else 0
+        if r["status"] == "error":
+            print(f"error    {r['phase']}: {r['error']}")
+            continue
+        if r["status"] != "locked":
+            total += r["bytes"]
         print(f"{r['status']:8s} {r['would_delete']:5d}/{r['generations']:<5d} "
+              f"skip={r.get('skipped', 0):<3d} "
               f"{r['bytes'] / 1e9:9.2f} GB  {r['phase']}")
     verb = "freed" if apply else "would free (dry run; add --apply)"
     print(f"total {verb}: {total / 1e9:.2f} GB")
@@ -82,8 +102,9 @@ def main(argv: Optional[list] = None) -> int:
     if args.command == "prune-checkpoints":
         if args.keep < 1:
             parser.error("--keep must be >= 1 for retro-pruning")
-        _print_rows(prune_run_checkpoints(args.run_dir, args.keep, args.apply), args.apply)
-        return 0
+        rows = prune_run_checkpoints(args.run_dir, args.keep, args.apply)
+        _print_rows(rows, args.apply)
+        return 1 if any(r["status"] == "error" for r in rows) else 0
     return 2
 
 

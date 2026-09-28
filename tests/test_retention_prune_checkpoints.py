@@ -59,3 +59,28 @@ def test_cli_defaults_to_dry_run(tmp_path, capsys):
     assert "dry run" in capsys.readouterr().out
     assert main(["prune-checkpoints", str(tmp_path), "--keep", "4", "--apply"]) == 0
     assert _ngen(d) == 4
+
+
+def test_error_isolates_phase_and_apply_continues(tmp_path, monkeypatch):
+    import gareus.retention as retention
+
+    a = _phase(tmp_path, "adaptive_production/epoch_000", 6)
+    b = _phase(tmp_path, "adaptive_production/final/baseline", 6)
+    real_prune = retention.prune_generations
+
+    def _flaky(phase, keep, dry_run=False):
+        if phase == a:
+            raise RuntimeError("boom")
+        return real_prune(phase, keep, dry_run=dry_run)
+
+    monkeypatch.setattr(retention, "prune_generations", _flaky)
+
+    rows = retention.prune_run_checkpoints(tmp_path, keep=4, apply=True)
+    by_phase = {r["phase"]: r for r in rows}
+    assert by_phase[str(a)]["status"] == "error"
+    assert "boom" in by_phase[str(a)]["error"]
+    assert by_phase[str(b)]["status"] == "pruned"
+    assert _ngen(a) == 6
+    assert _ngen(b) == 4
+
+    assert retention.main(["prune-checkpoints", str(tmp_path), "--keep", "4", "--apply"]) == 1
