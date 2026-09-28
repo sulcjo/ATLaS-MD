@@ -29,6 +29,7 @@ import csv
 import json
 import logging
 import math
+import os
 import re
 import shutil
 import time
@@ -1366,6 +1367,21 @@ def extract_and_register_coverage_seeds(
     return {"n_extracted": n_extracted, "n_skipped": n_skipped, "rows": rows}
 
 
+def _link_or_copy(src: Path, dst: Path) -> str:
+    """Hard-link a seed PDB into a filtered bank; copy when linking is impossible.
+
+    Seed PDBs are never modified after they are written, so a link is
+    indistinguishable to every reader and saves the whole copy (chignolin_9:
+    7.1 GB of filtered_seed_bank). Spec 2026-09-28-output-retention-design R3a.
+    """
+    try:
+        os.link(src, dst)
+        return "link"
+    except OSError:
+        shutil.copy2(src, dst)
+        return "copy"
+
+
 def filter_seed_bank_for_state_ids(
     seed_bank_dir: Path,
     target_state_ids: Sequence[int],
@@ -1416,7 +1432,7 @@ def filter_seed_bank_for_state_ids(
         dst_dir.mkdir(parents=True, exist_ok=True)
         dst = dst_dir / Path(src).name
         if not dst.exists():
-            shutil.copy2(src, dst)
+            _link_or_copy(src, dst)
         chosen.append({
             "seed_name": str(row.get("seed_name", Path(src).stem)),
             "survivor_pdb_path": str(dst),
