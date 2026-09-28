@@ -71,3 +71,96 @@ def test_zero_keeps_legacy_full_event(tmp_path):
     lg.close()
     assert not (tmp_path / "live_distances.jsonl").exists()
     assert sink.events[0]["event"] == "distances" and len(sink.events[0]["distances"]) == 3
+
+
+# ---- final-review fix wave (I1, I3, M4, M5) ---------------------------------
+
+import pytest  # noqa: E402
+
+import gareus.logger as logger_mod  # noqa: E402
+
+
+class _BrokenRing:
+    def __init__(self):
+        self.calls = 0
+
+    def write_json(self, payload):
+        self.calls += 1
+        raise OSError(28, "No space left on device")
+
+    def close(self):
+        pass
+
+
+def test_ring_write_failure_falls_back_to_legacy_event_and_warns_once(tmp_path, capsys):
+    sink = FakeSink()
+    lg = DistanceLogger(tmp_path, _args(), progress=sink, no_file_persistence=True)
+    broken = _BrokenRing()
+    lg._live_ring = broken
+    for k in range(3):
+        lg.log(_rows(), "gareus_production", 250 * (k + 1), 1000, dashboard_info=_dash())
+    lg.close()
+    assert broken.calls == 1
+    assert capsys.readouterr().out.count("WARNING") == 1
+    assert [e["event"] for e in sink.events] == ["distances"] * 3
+    assert all(len(e["distances"]) == 3 and "dashboard" in e for e in sink.events)
+
+
+def test_ring_construction_failure_falls_back_to_legacy_event(tmp_path, capsys, monkeypatch):
+    def boom(*a, **k):
+        raise OSError(116, "Stale file handle")
+
+    monkeypatch.setattr(logger_mod, "RotatingJsonlWriter", boom)
+    sink = FakeSink()
+    lg = DistanceLogger(tmp_path, _args(), progress=sink, no_file_persistence=True)
+    lg.log(_rows(), "gareus_production", 250, 1000, dashboard_info=_dash())
+    lg.close()
+    assert capsys.readouterr().out.count("WARNING") == 1
+    assert sink.events[0]["event"] == "distances" and len(sink.events[0]["distances"]) == 3
+
+
+def test_non_json_dashboard_value_does_not_crash_log(tmp_path, capsys):
+    sink = FakeSink()
+    lg = DistanceLogger(tmp_path, _args(), progress=sink, no_file_persistence=True)
+    dash = _dash()
+    dash["exchange_stats"] = {"bad": object()}
+    lg.log(_rows(), "gareus_production", 250, 1000, dashboard_info=dash)
+    lg.close()
+    assert "WARNING" in capsys.readouterr().out
+    assert sink.events[-1]["event"] == "distances"
+
+
+def test_live_dashboard_json_written_atomically_with_wall_time_and_step(tmp_path):
+    lg = DistanceLogger(tmp_path, _args(), progress=FakeSink(), no_file_persistence=True)
+    for k in range(LIVE_DASHBOARD_EVERY + 1):
+        lg.log(_rows(), "gareus_production", 250 * (k + 1), None, dashboard_info=_dash())
+        if k == 0:
+            first = json.loads((tmp_path / "live_dashboard.json").read_text())
+    lg.close()
+    assert first["step"] == 250 and "wall_time_s" in first
+    last = json.loads((tmp_path / "live_dashboard.json").read_text())
+    assert last["step"] == 250 * (LIVE_DASHBOARD_EVERY + 1)
+    assert last["dashboard"]["exchange_stats"] == _dash()["exchange_stats"]
+    assert [p.name for p in tmp_path.iterdir() if "live_dashboard" in p.name] == ["live_dashboard.json"]
+
+
+def test_no_live_dashboard_json_when_ring_disabled(tmp_path):
+    lg = DistanceLogger(tmp_path, _args(live_distances_max_mb=0), progress=FakeSink(), no_file_persistence=True)
+    lg.log(_rows(), "gareus_production", 250, 1000, dashboard_info=_dash())
+    lg.close()
+    assert not (tmp_path / "live_dashboard.json").exists()
+
+
+def test_negative_live_distances_max_mb_rejected():
+    with pytest.raises(SystemExit):
+        parse_args(["--seq", "AA", "--out", "u", "--live-distances-max-mb", "-1"])
+
+
+def test_live_distances_help_mentions_console_mode():
+    import argparse
+    import re
+    from gareus import cli
+    p = argparse.ArgumentParser()
+    cli._add_output_args(p)
+    text = " ".join(re.sub(r"\x1b\[[0-9;]*m", "", p.format_help()).split())
+    assert "--progress-mode console" in text

@@ -13,7 +13,9 @@ from __future__ import annotations
 import collections
 import concurrent.futures
 import csv
+import json
 import math
+import os
 import shutil
 import sys
 import time
@@ -56,6 +58,10 @@ LIVE_ROW_KEYS = ("replica", "window", "window_index", "state_id", "primary_cv_va
 # The dashboard block (cumulative exchange stats, ~0.5 MB at 236 states) goes into
 # every Nth ring line only; the monitor reads the newest one.
 LIVE_DASHBOARD_EVERY = 20
+# The newest of those dashboards is also kept, atomically replaced, in this file next
+# to the ring: at 236 states a dashboard line is ~0.5 MB and 20 slim lines ~1.1 MB, so
+# a monitor's 1 MB ring tail alone misses it about half the time.
+LIVE_DASHBOARD_NAME = "live_dashboard.json"
 
 
 def is_gamd_production_phase(phase: str) -> bool:
@@ -131,8 +137,11 @@ class DistanceLogger:
         self._live_count = 0
         _live_mb = int(getattr(args, "live_distances_max_mb", 256) or 0)
         if _live_mb > 0:
-            self._live_ring = RotatingJsonlWriter(self.out_dir / "live_distances.jsonl",
-                                                  max_bytes=_live_mb * 1024 * 1024)
+            try:
+                self._live_ring = RotatingJsonlWriter(self.out_dir / "live_distances.jsonl",
+                                                      max_bytes=_live_mb * 1024 * 1024)
+            except Exception as exc:  # noqa: BLE001 - monitor output must never stop production
+                self._disable_live_ring(exc)
         if no_file_persistence:
             return
         if self.mode in {"csv", "both"}:
@@ -176,7 +185,50 @@ class DistanceLogger:
                 except Exception:
                     pass
         if getattr(self, "_live_ring", None) is not None:
-            self._live_ring.close()
+            try:
+                self._live_ring.close()
+            except Exception:
+                pass
+
+    def _disable_live_ring(self, exc: BaseException) -> None:
+        """Monitor-only output failed (ENOSPC, stale NFS handle, failed rotate, a
+        non-JSON value): warn once and fall back to the legacy full progress event."""
+        ring, self._live_ring = getattr(self, "_live_ring", None), None
+        if ring is not None:
+            try:
+                ring.close()
+            except Exception:
+                pass
+        print(f"WARNING: live_distances ring disabled for {self.out_dir} "
+              f"({type(exc).__name__}: {exc}); full distances events go to progress.jsonl "
+              "for the rest of this run", flush=True)
+
+    def _write_live_dashboard(self, live: dict) -> None:
+        """Atomically replace <out>/live_dashboard.json with the newest dashboard."""
+        payload = {k: live[k] for k in ("event", "phase", "step", "total_steps", "wall_time_s", "dashboard")
+                   if k in live}
+        text = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        path = self.out_dir / LIVE_DASHBOARD_NAME
+        tmp = path.with_name("." + LIVE_DASHBOARD_NAME + ".tmp")
+        try:
+            tmp.write_text(text, encoding="utf-8")
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
+
+    def _write_live(self, event: dict, clean_rows: list) -> None:
+        live = {k: event[k] for k in ("event", "phase", "step", "total_steps") if k in event}
+        live["wall_time_s"] = time.time()
+        live["distances"] = [{k: r[k] for k in LIVE_ROW_KEYS if k in r} for r in clean_rows]
+        if "dashboard" in event and self._live_count % LIVE_DASHBOARD_EVERY == 0:
+            live["dashboard"] = event["dashboard"]
+            self._write_live_dashboard(live)
+        self._live_ring.write_json(live)
+        self._live_count += 1
 
 
     def _restore_candidate_paths(self) -> list[Path]:
@@ -1706,13 +1758,10 @@ class DistanceLogger:
         if self.jsonl_handle is not None:
             self.jsonl_handle.write_json(event)
         if self._live_ring is not None:
-            live = {k: event[k] for k in ("event", "phase", "step", "total_steps") if k in event}
-            live["wall_time_s"] = time.time()
-            live["distances"] = [{k: r[k] for k in LIVE_ROW_KEYS if k in r} for r in clean_rows]
-            if "dashboard" in event and self._live_count % LIVE_DASHBOARD_EVERY == 0:
-                live["dashboard"] = event["dashboard"]
-            self._live_ring.write_json(live)
-            self._live_count += 1
+            try:
+                self._write_live(event, clean_rows)
+            except Exception as exc:  # noqa: BLE001 - monitor output must never stop production
+                self._disable_live_ring(exc)
         if self.progress is not None and not self.no_gui:
             if self._live_ring is not None:
                 self.progress.emit({**{k: v for k, v in event.items() if k not in ("distances", "dashboard")},

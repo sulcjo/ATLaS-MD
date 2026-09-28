@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 
 import gareus_monitor as gm
+from gareus.logger import LIVE_DASHBOARD_EVERY
 
 
 def _event(step, windows=2, dashboard=False):
@@ -77,3 +78,90 @@ def test_live_snapshot_dashboard_age_from_ring_when_progress_has_none(tmp_path):
     assert snap["_dashboard_age"] == 1
     assert snap["_dashboard_age_s"] == 18.0
     assert len(snap["_dist_samples"]) == 4
+
+
+# ---- final-review fix wave (I3): realistic sizes ----------------------------
+
+class _ProgressFileSink:
+    """Appends each emitted event to progress.jsonl, stamped like GuiProgressSink."""
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def emit(self, event):
+        import time
+        with self.path.open("a") as fh:
+            fh.write(json.dumps({**event, "wall_time_s": time.time()}) + "\n")
+
+
+def _big_rows(n=300):
+    return [{"replica": i, "window": i, "center_A": 0.5, "k_kcal_mol_A2": 100.0, "cv_A": 0.4,
+             "primary_cv_value": 0.4123456789, "secondary_cv": 1.5123456789,
+             "gamd_boost_total_kcal_mol": 2.0123456789, "umbrella_bias_kcal_mol": 0.0123456789,
+             "gamd_lambda": 0.25, "potential_kj_mol": -5e5} for i in range(n)]
+
+
+def _big_dash():
+    # ~500 kB exchange_stats block, like 236 states' cumulative pair statistics.
+    pairs = {f"{i}-{j}": [i * 1000 + j, 0.123456789, 0.987654321]
+             for i in range(236) for j in range(i + 1, min(236, i + 60))}
+    return {"n_windows": 300, "exchange_stats": {"pairs": pairs}, "secondary_cv": {},
+            "secondary_cv_centers": []}
+
+
+def test_dashboard_always_found_with_realistic_line_sizes(tmp_path):
+    from types import SimpleNamespace
+
+    from gareus.logger import DistanceLogger
+
+    run_dir = tmp_path / "chignolin_big"
+    phase = run_dir / "adaptive_production" / "final" / "baseline"
+    phase.mkdir(parents=True)
+    progress = run_dir / "progress.jsonl"
+    progress.write_text("")
+    dash = _big_dash()
+    assert len(json.dumps(dash)) > 450_000
+    args = SimpleNamespace(tui_mode="none", distance_output_mode="none", live_distances_max_mb=256)
+    lg = DistanceLogger(phase, args, progress=_ProgressFileSink(progress), no_file_persistence=True)
+    state = gm.PeptideState.from_rundir(run_dir)
+    missing = []
+    try:
+        for k in range(45):
+            lg.log(_big_rows(), "gareus_production", 250 * (k + 1), None, dashboard_info=dash)
+            snap = state.live_snapshot()
+            if snap.get("_dashboard") is None or snap.get("_dashboard_age_s") is None:
+                missing.append(k)
+    finally:
+        lg.close()
+    ring = phase / "live_distances.jsonl"
+    slim = [len(x) for x in ring.read_text().splitlines()[1:LIVE_DASHBOARD_EVERY]]
+    assert min(slim) > 40_000  # realistic slim-line size, so 20 of them outrun a 1 MB tail
+    assert missing == []
+    assert snap["_dashboard"]["exchange_stats"] == dash["exchange_stats"]
+    assert snap["_dashboard_age_s"] >= 0.0
+
+
+def test_live_dashboard_json_missing_falls_back_to_ring_scan(tmp_path):
+    run_dir = tmp_path / "r"
+    run_dir.mkdir()
+    _write(run_dir / "progress.jsonl", [{"event": "progress", "step": 5, "wall_time_s": 10.0}])
+    ring = run_dir / "adaptive_production" / "final" / "baseline" / "live_distances.jsonl"
+    _write(ring, [_event(1, dashboard=True)])
+    (ring.parent / "live_dashboard.json").write_text("{corrupt")
+    snap = gm.PeptideState.from_rundir(run_dir).live_snapshot()
+    assert snap["_dashboard"] == {"exchange_stats": {"attempts": 1}}
+    assert snap["_dashboard_age_s"] == 8.0
+
+
+def test_live_dashboard_json_preferred_over_ring_scan(tmp_path):
+    run_dir = tmp_path / "r"
+    run_dir.mkdir()
+    _write(run_dir / "progress.jsonl", [{"event": "progress", "step": 5, "wall_time_s": 100.0}])
+    ring = run_dir / "adaptive_production" / "final" / "baseline" / "live_distances.jsonl"
+    _write(ring, [_event(1, dashboard=True), _event(2)])
+    (ring.parent / "live_dashboard.json").write_text(json.dumps(
+        {"step": 2, "wall_time_s": 95.0, "dashboard": {"exchange_stats": {"attempts": 99}}}))
+    snap = gm.PeptideState.from_rundir(run_dir).live_snapshot()
+    assert snap["_dashboard"] == {"exchange_stats": {"attempts": 99}}
+    assert snap["_dashboard_age"] is None
+    assert snap["_dashboard_age_s"] == 5.0

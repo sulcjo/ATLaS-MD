@@ -1335,6 +1335,25 @@ def read_boost_samples(path: Path,
 
 LIVE_RING_NAME = "live_distances.jsonl"
 LIVE_RING_PREV = "live_distances.1.jsonl"
+LIVE_DASHBOARD_NAME = "live_dashboard.json"
+
+
+def read_live_dashboard(ring: list) -> Optional[dict]:
+    """The newest exchange dashboard DistanceLogger keeps next to the ring.
+
+    A ~0.5 MB dashboard goes into only every 20th ring line, so a 1 MB ring tail
+    can miss it; <phase>/live_dashboard.json always holds the newest one. Returns
+    {"dashboard": ..., "wall_time_s": ...} or None when absent/unreadable.
+    """
+    if not ring:
+        return None
+    try:
+        data = json.loads((Path(ring[-1]).parent / LIVE_DASHBOARD_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("dashboard"), dict) or not data["dashboard"]:
+        return None
+    return data
 
 
 def live_ring_files(run_dir: Path) -> list:
@@ -2480,10 +2499,17 @@ class PeptideState:
         snap["_dist_samples"] = parse_distances_samples(entries)[-6000:]
         ring = live_ring_files(self.run_dir)
         dash_from_ring = False
+        dash_from_file = False
         ring_entries: list = []
         if ring:
             ring_entries = read_ring_entries(ring, max_bytes=chunk_bytes)
             snap["_dist_samples"] = parse_distances_samples(ring_entries)[-6000:]
+            if dash is None:
+                live_dash = read_live_dashboard(ring)
+                if live_dash is not None:
+                    # age in entries is unknown for the side file; age_s is exact
+                    dash, dash_wall = live_dash["dashboard"], live_dash.get("wall_time_s")
+                    dash_from_file = True
             if dash is None:
                 for e in reversed(ring_entries):
                     if e.get("dashboard"):
@@ -2493,7 +2519,10 @@ class PeptideState:
         snap["_dashboard"] = dash
         snap["_dashboard_age"] = None
         snap["_dashboard_age_s"] = None
-        if dash is not None:
+        if dash is not None and dash_from_file:
+            if newest_wall is not None and dash_wall is not None:
+                snap["_dashboard_age_s"] = max(0.0, newest_wall - dash_wall)
+        elif dash is not None:
             # age in entries, or in ring_entries when the dashboard came from
             # the ring (progress.jsonl carries no dashboard once a ring exists)
             age_source = ring_entries if dash_from_ring else entries
