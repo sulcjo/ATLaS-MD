@@ -1333,6 +1333,74 @@ def read_boost_samples(path: Path,
     return samples
 
 
+LIVE_RING_NAME = "live_distances.jsonl"
+LIVE_RING_PREV = "live_distances.1.jsonl"
+
+
+def live_ring_files(run_dir: Path) -> list:
+    """The most recently written phase's live_distances ring, oldest file first.
+
+    DistanceLogger writes one ring per phase directory (spec
+    2026-09-28-output-retention-design, R2); a campaign root has none of its own.
+    Phases sit at most three levels below the run root.
+    """
+    run_dir = Path(run_dir)
+    candidates = []
+    for pattern in (LIVE_RING_NAME, f"*/{LIVE_RING_NAME}", f"*/*/{LIVE_RING_NAME}",
+                    f"*/*/*/{LIVE_RING_NAME}"):
+        candidates.extend(run_dir.glob(pattern))
+    if not candidates:
+        return []
+    try:
+        current = max(candidates, key=lambda p: p.stat().st_mtime)
+    except OSError:
+        return []
+    prev = current.with_name(LIVE_RING_PREV)
+    return [prev, current] if prev.exists() else [current]
+
+
+def read_ring_entries(paths: list, max_bytes: int = BOOST_READ_MAX_BYTES) -> list:
+    """Tail entries across the ring files (newest last), reading at most max_bytes."""
+    entries: list = []
+    budget = int(max_bytes)
+    for p in reversed(list(paths)):
+        if budget <= 0:
+            break
+        try:
+            size = p.stat().st_size
+        except OSError:
+            continue
+        take = min(size, budget)
+        if take <= 0:
+            continue
+        entries = tail_jsonl(p, 1_000_000, chunk_bytes=take) + entries
+        budget -= take
+    return entries
+
+
+def read_ring_boost_samples(paths: list,
+                            target_per_window: int = BOOST_TARGET_PER_WINDOW,
+                            max_bytes: int = BOOST_READ_MAX_BYTES) -> list:
+    """Like read_boost_samples, but over the ring: newest file first, older only if short."""
+    entries: list = []
+    budget = int(max_bytes)
+    samples: list = []
+    for p in reversed(list(paths)):
+        if budget <= 0:
+            break
+        try:
+            size = p.stat().st_size
+        except OSError:
+            continue
+        take = min(size, budget)
+        entries = tail_jsonl(p, 1_000_000, chunk_bytes=take) + entries
+        budget -= take
+        samples = parse_distances_samples(entries)
+        if _min_boost_samples_per_window(samples) >= target_per_window:
+            break
+    return samples
+
+
 def boost_values_from_entries(entries: list, limit: int = 4000) -> list[float]:
     samples = parse_distances_samples(entries)
     vals = [
@@ -2324,6 +2392,21 @@ class PeptideState:
         self._load_runtime_pool()
         if not self._progress_has_uncommitted_live_ns():
             return []
+        ring = live_ring_files(self.run_dir)
+        if ring:
+            try:
+                st = ring[-1].stat()
+                key = ("ring", str(ring[-1]), st.st_mtime, st.st_size, target_per_window)
+            except OSError:
+                key = None
+            if key is not None and self._boost_samples_cache is not None \
+                    and self._boost_samples_cache[0] == key:
+                return self._boost_samples_cache[1]
+            samples = read_ring_boost_samples(ring, target_per_window=target_per_window,
+                                              max_bytes=max_bytes)
+            if key is not None:
+                self._boost_samples_cache = (key, samples)
+            return samples
         p = self.run_dir / "progress.jsonl"
         if not p.exists():
             return []
@@ -2391,6 +2474,15 @@ class PeptideState:
         snap["_ages"] = ages
         snap["_n"] = len(entries)
         snap["_dist_samples"] = parse_distances_samples(entries)[-6000:]
+        ring = live_ring_files(self.run_dir)
+        if ring:
+            ring_entries = read_ring_entries(ring, max_bytes=chunk_bytes)
+            snap["_dist_samples"] = parse_distances_samples(ring_entries)[-6000:]
+            if dash is None:
+                for e in reversed(ring_entries):
+                    if e.get("dashboard"):
+                        dash, dash_wall = e["dashboard"], e.get("wall_time_s")
+                        break
         snap["_dashboard"] = dash
         snap["_dashboard_age"] = None
         snap["_dashboard_age_s"] = None
