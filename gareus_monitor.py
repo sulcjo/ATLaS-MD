@@ -1359,13 +1359,20 @@ def live_ring_files(run_dir: Path) -> list:
     return [prev, current] if prev.exists() else [current]
 
 
-def read_ring_entries(paths: list, max_bytes: int = BOOST_READ_MAX_BYTES) -> list:
-    """Tail entries across the ring files (newest last), reading at most max_bytes."""
+def _iter_ring_tails(paths: list, max_bytes: int):
+    """Yield the cumulative tail entries after folding in each ring file, newest first.
+
+    Reads paths newest-to-oldest, budgeting max_bytes in total across the whole
+    rotation; each yield's entries list is the full chronological tail read so
+    far (oldest-of-what's-been-read first). Shared by read_ring_entries (which
+    drains it fully) and read_ring_boost_samples (which can stop early once
+    every window has enough boost samples).
+    """
     entries: list = []
     budget = int(max_bytes)
     for p in reversed(list(paths)):
         if budget <= 0:
-            break
+            return
         try:
             size = p.stat().st_size
         except OSError:
@@ -1375,6 +1382,14 @@ def read_ring_entries(paths: list, max_bytes: int = BOOST_READ_MAX_BYTES) -> lis
             continue
         entries = tail_jsonl(p, 1_000_000, chunk_bytes=take) + entries
         budget -= take
+        yield entries
+
+
+def read_ring_entries(paths: list, max_bytes: int = BOOST_READ_MAX_BYTES) -> list:
+    """Tail entries across the ring files (newest last), reading at most max_bytes."""
+    entries: list = []
+    for entries in _iter_ring_tails(paths, max_bytes):
+        pass
     return entries
 
 
@@ -1382,19 +1397,8 @@ def read_ring_boost_samples(paths: list,
                             target_per_window: int = BOOST_TARGET_PER_WINDOW,
                             max_bytes: int = BOOST_READ_MAX_BYTES) -> list:
     """Like read_boost_samples, but over the ring: newest file first, older only if short."""
-    entries: list = []
-    budget = int(max_bytes)
     samples: list = []
-    for p in reversed(list(paths)):
-        if budget <= 0:
-            break
-        try:
-            size = p.stat().st_size
-        except OSError:
-            continue
-        take = min(size, budget)
-        entries = tail_jsonl(p, 1_000_000, chunk_bytes=take) + entries
-        budget -= take
+    for entries in _iter_ring_tails(paths, max_bytes):
         samples = parse_distances_samples(entries)
         if _min_boost_samples_per_window(samples) >= target_per_window:
             break
@@ -2475,6 +2479,8 @@ class PeptideState:
         snap["_n"] = len(entries)
         snap["_dist_samples"] = parse_distances_samples(entries)[-6000:]
         ring = live_ring_files(self.run_dir)
+        dash_from_ring = False
+        ring_entries: list = []
         if ring:
             ring_entries = read_ring_entries(ring, max_bytes=chunk_bytes)
             snap["_dist_samples"] = parse_distances_samples(ring_entries)[-6000:]
@@ -2482,13 +2488,16 @@ class PeptideState:
                 for e in reversed(ring_entries):
                     if e.get("dashboard"):
                         dash, dash_wall = e["dashboard"], e.get("wall_time_s")
+                        dash_from_ring = True
                         break
         snap["_dashboard"] = dash
         snap["_dashboard_age"] = None
         snap["_dashboard_age_s"] = None
         if dash is not None:
-            # age in entries
-            for age, e in enumerate(reversed(entries)):
+            # age in entries, or in ring_entries when the dashboard came from
+            # the ring (progress.jsonl carries no dashboard once a ring exists)
+            age_source = ring_entries if dash_from_ring else entries
+            for age, e in enumerate(reversed(age_source)):
                 if e.get("dashboard"):
                     snap["_dashboard_age"] = age
                     break

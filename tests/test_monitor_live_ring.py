@@ -51,3 +51,29 @@ def test_ring_entries_newest_last(tmp_path):
     _write(ring, [_event(2, dashboard=True)])
     entries = gm.read_ring_entries(gm.live_ring_files(tmp_path), max_bytes=1 << 20)
     assert [e["step"] for e in entries] == [1, 2]
+
+
+def test_live_snapshot_dashboard_age_from_ring_when_progress_has_none(tmp_path):
+    # progress.jsonl holds only distances_summary/progress lines (Task 5's split:
+    # the ring gets every 'distances' event, progress.jsonl only the periodic
+    # scalar summary) -- no dashboard payload ever appears there once a ring
+    # exists, so live_snapshot must source both the dashboard and its age from
+    # the ring, not from progress.jsonl's own tail.
+    run_dir = tmp_path / "chignolin_test"
+    run_dir.mkdir()
+    progress = run_dir / "progress.jsonl"
+    _write(progress, [
+        {"event": "progress", "phase": "gareus_production", "step": 100, "wall_time_s": 10.0},
+        {"event": "distances_summary", "phase": "gareus_production", "step": 200, "wall_time_s": 20.0},
+    ])
+    ring = run_dir / "adaptive_production" / "final" / "baseline" / "live_distances.jsonl"
+    # newest ring line (step=2) has no dashboard; the older one (step=1) does.
+    _write(ring, [_event(1, dashboard=True), _event(2, dashboard=False)])
+
+    state = gm.PeptideState.from_rundir(run_dir)
+    snap = state.live_snapshot()
+
+    assert snap["_dashboard"] == {"exchange_stats": {"attempts": 1}}
+    assert snap["_dashboard_age"] == 1
+    assert snap["_dashboard_age_s"] == 18.0
+    assert len(snap["_dist_samples"]) == 4
