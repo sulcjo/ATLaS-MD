@@ -1,12 +1,14 @@
 """Output retention tools (spec docs/superpowers/specs/2026-09-28-output-retention-design.md).
 
     python -m gareus.retention prune-checkpoints <run_dir> [--keep 4] [--apply]
+    python -m gareus.retention split-progress <progress.jsonl> [--apply]
 
 Every subcommand is a dry run unless --apply is given.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -90,6 +92,61 @@ def _print_rows(rows: Iterable[dict], apply: bool) -> None:
     print(f"total {verb}: {total / 1e9:.2f} GB")
 
 
+def _rewrite_lines(src: Path, dst: Path) -> tuple[int, int]:
+    """Copy src to dst, replacing each distances event by its scalar summary."""
+    n_lines = n_dist = 0
+    with src.open("rb") as fin, dst.open("wb") as fout:
+        for raw in fin:
+            n_lines += 1
+            if b'"event": "distances"' not in raw and b'"event":"distances"' not in raw:
+                fout.write(raw)
+                continue
+            try:
+                e = json.loads(raw)
+            except ValueError:
+                fout.write(raw)
+                continue
+            if e.get("event") != "distances":
+                fout.write(raw)
+                continue
+            n_dist += 1
+            summary = {k: v for k, v in e.items() if k not in ("distances", "dashboard")}
+            summary["event"] = "distances_summary"
+            fout.write((json.dumps(summary, sort_keys=True) + "\n").encode("utf-8"))
+        fout.flush()
+        os.fsync(fout.fileno())
+    return n_lines, n_dist
+
+
+def split_progress_jsonl(path: Path, apply: bool) -> dict:
+    """Rewrite an existing progress.jsonl, replacing each distances event with its
+    small distances_summary (the same event name production now writes live).
+
+    Aborts without touching the original file if it changes size/mtime during the
+    rewrite (a live run still appending to it), reporting status
+    "changed_during_rewrite" rather than risking a lost concurrent write.
+    """
+    path = Path(path)
+    before = path.stat()
+    tmp = path.with_name(path.name + ".split.tmp")
+    try:
+        n_lines, n_dist = _rewrite_lines(path, tmp)
+        result = {"lines": n_lines, "distances_lines": n_dist, "bytes_before": before.st_size,
+                  "bytes_after": tmp.stat().st_size}
+        after = path.stat()
+        if (after.st_size, after.st_mtime_ns) != (before.st_size, before.st_mtime_ns):
+            result["status"] = "changed_during_rewrite"
+            return result
+        if not apply:
+            result["status"] = "dry_run"
+            return result
+        os.replace(tmp, path)
+        result["status"] = "rewritten"
+        return result
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def main(argv: Optional[list] = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m gareus.retention", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -98,6 +155,9 @@ def main(argv: Optional[list] = None) -> int:
     pc.add_argument("run_dir", type=Path)
     pc.add_argument("--keep", type=int, default=DEFAULT_KEEP)
     pc.add_argument("--apply", action="store_true")
+    sp = sub.add_parser("split-progress", help="drop per-replica distances dumps from a progress.jsonl")
+    sp.add_argument("path", type=Path)
+    sp.add_argument("--apply", action="store_true")
     args = parser.parse_args(argv)
     if args.command == "prune-checkpoints":
         if args.keep < 1:
@@ -105,6 +165,11 @@ def main(argv: Optional[list] = None) -> int:
         rows = prune_run_checkpoints(args.run_dir, args.keep, args.apply)
         _print_rows(rows, args.apply)
         return 1 if any(r["status"] == "error" for r in rows) else 0
+    if args.command == "split-progress":
+        r = split_progress_jsonl(args.path, args.apply)
+        print(f"{r['status']}: {r['distances_lines']}/{r['lines']} distances lines, "
+              f"{r['bytes_before'] / 1e9:.2f} GB -> {r['bytes_after'] / 1e9:.2f} GB")
+        return 0 if r["status"] in ("dry_run", "rewritten") else 1
     return 2
 
 
