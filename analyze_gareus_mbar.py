@@ -5391,8 +5391,13 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
             # histogram-intersection overlap, while this axis report grades
             # symmetrised MBAR state overlap. See _LADDER_STATE_OVERLAP_MIN.
             _thr=float(getattr(args,'min_ladder_state_overlap',_LADDER_STATE_OVERLAP_MIN))
+            # CV2 centres too: on a 2D layout, CV1 alone chains different
+            # (CV1, CV2) windows together as if they were one window's rungs.
+            from gareus.mbar_analysis.pmf import _secondary_window_params
+            _lo_sec_c, _ = _secondary_window_params(d.meta, d.u_nk.shape[1])
             _lo,_lo_warnings=ladder_overlap_by_axis(None, d.state_lambdas, d.centers, thr=_thr, n_k=m['n_k'],
-                                                     pair_overlap=_pair_ov)
+                                                     pair_overlap=_pair_ov, secondary_centers=_lo_sec_c,
+                                                     primary_k=d.k_kcal)
             s['ladder_overlap']=_lo
             for _w in _lo_warnings:
                 s.setdefault('warnings',[]).append(_w)

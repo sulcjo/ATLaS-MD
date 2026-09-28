@@ -84,14 +84,20 @@ def _eligible_mask(K: int, n_k) -> np.ndarray:
     return np.ones(K, dtype=bool)
 
 
-def _axis_connectivity(K: int, pairs, group_values: np.ndarray,
+def _round_key(value: float):
+    """Hashable centre key at the grid tolerance; NaN (no such coordinate) -> None."""
+    return None if not np.isfinite(value) else float(np.round(value, 9))
+
+
+def _axis_connectivity(K: int, pairs, group_keys: list,
                         eligible: np.ndarray, thr: float, n_k) -> dict:
     """Connected-components verdict for one axis, using ONLY that axis' own
     already-symmetrised pairs as edges -- never the other axis' pairs, never
     the raw asymmetric ``overlap[i, j]``.
 
-    A lambda-direction pair always shares a CV1 centre; a CV1-direction pair
-    always shares a rung -- so an edge never crosses groups, and a connected
+    A lambda-direction pair always shares a (CV1, CV2) centre; a CV1-direction
+    pair always shares a rung and a CV2 row -- so an edge never crosses
+    groups (``group_keys[i]`` is state i's group), and a connected
     component can therefore never span two groups either. The best
     achievable outcome is exactly one component per eligible group, NOT one
     component overall: with more than one CV1 centre (the normal case --
@@ -119,8 +125,7 @@ def _axis_connectivity(K: int, pairs, group_values: np.ndarray,
     if n_components == 0:
         return {"n_components": 0, "connected": None, "expected_components": None}
     excluded = {int(i) for i in (comp.get("excluded_unsampled_states") or [])}
-    expected = len({float(np.round(group_values[i], 9))
-                    for i in range(K) if eligible[i] and i not in excluded})
+    expected = len({group_keys[i] for i in range(K) if eligible[i] and i not in excluded})
     expected = max(expected, 1)
     return {"n_components": n_components, "connected": bool(n_components == expected),
             "expected_components": expected}
@@ -140,12 +145,24 @@ def _warn_full_matrix_once() -> None:
 
 def ladder_overlap_by_axis(overlap, state_lambdas, centers,
                             thr: float = LADDER_STATE_OVERLAP_MIN, n_k=None,
-                            pair_overlap=None):
+                            pair_overlap=None, secondary_centers=None, primary_k=None):
     """Split neighbour overlaps into the λ direction and the CV1 direction,
     and grade each axis' own bridging.
 
-    λ-direction pairs share a CV1 centre and are adjacent in sorted λ.
-    CV1-direction pairs share a rung and are adjacent in sorted centre.
+    λ-direction pairs share a (CV1, CV2) centre and are adjacent in sorted λ.
+    CV1-direction pairs share a rung and a CV2 row and are adjacent in sorted
+    CV1 centre. ``secondary_centers`` (per-state CV2 centre, NaN where a state
+    has none) is required for a 2D layout: without it, states of different
+    CV2 centres that share a CV1 value are chained together as if they were
+    one window's rungs (chignolin_9: 48 "λ pairs" over 16 CV1 values instead
+    of 177 over 59 centres, worst pair 76-69 at CV2 1.35 vs -0.78). Omitted
+    or all-NaN, grouping is by CV1 alone (the 1D ladder behaviour).
+    ``primary_k`` (per-state CV1 force constant): a state with ``k <= 0`` has
+    no CV1 restraint, so its CV1 "centre" is a placeholder (the CV2-only
+    windows of the chignolin_8/9 sparse layout sit at CV1 0.502 with k1 = 0,
+    in the middle of every CV2 row). Such states stay on the λ axis but are
+    left off the CV1 axis entirely: no CV1 pairs, not counted as a CV1 group
+    and not a node of the CV1 connectivity graph.
 
     Each pair's value comes from ``pair_overlap(a, b)`` if given, else from
     ``symmetric_state_overlap(overlap, a, b)`` -- i.e. ``sqrt(O_ab * O_ba)`` --
@@ -223,29 +240,58 @@ def ladder_overlap_by_axis(overlap, state_lambdas, centers,
             f"(state_lambdas {lam.shape}, centers {cen.shape})"
         ]
 
-    lam_pairs, cv1_pairs = [], []
-    for value in np.unique(np.round(cen, 9)):
-        idx = np.flatnonzero(np.abs(cen - value) < _TOL)
-        order = idx[np.argsort(lam[idx])]
-        for a, b in zip(order[:-1], order[1:]):
-            if abs(lam[b] - lam[a]) > _TOL:
-                v = pair_overlap(int(a), int(b))
-                if v is not None:
-                    lam_pairs.append((a, b, v))
-    for value in np.unique(np.round(lam, 9)):
-        idx = np.flatnonzero(np.abs(lam - value) < _TOL)
-        order = idx[np.argsort(cen[idx])]
-        for a, b in zip(order[:-1], order[1:]):
-            if abs(cen[b] - cen[a]) > _TOL:
-                v = pair_overlap(int(a), int(b))
-                if v is not None:
-                    cv1_pairs.append((a, b, v))
+    if secondary_centers is None:
+        sec = np.full(K, np.nan)
+    else:
+        sec = np.asarray(secondary_centers, dtype=np.float64)
+        if sec.shape[0] != K:
+            return _empty_axes(), [
+                "ladder-overlap axis report skipped: array length mismatch "
+                f"(state_lambdas {lam.shape}, secondary_centers {sec.shape})"
+            ]
+
+    if primary_k is None:
+        on_cv1 = np.ones(K, dtype=bool)
+    else:
+        k1 = np.asarray(primary_k, dtype=np.float64)
+        if k1.shape[0] != K:
+            return _empty_axes(), [
+                "ladder-overlap axis report skipped: array length mismatch "
+                f"(state_lambdas {lam.shape}, primary_k {k1.shape})"
+            ]
+        on_cv1 = np.isfinite(k1) & (k1 > 0.0)
+
+    sec_key = [_round_key(v) for v in sec]
+    centre_key = [(_round_key(cen[i]), sec_key[i]) for i in range(K)]
+    row_key = [(_round_key(lam[i]), sec_key[i]) if on_cv1[i] else (None, None) for i in range(K)]
+
+    def _chain_pairs(group_keys, sort_values):
+        groups = {}
+        for i, key in enumerate(group_keys):
+            groups.setdefault(key, []).append(i)
+        pairs = []
+        for key, idx in groups.items():
+            if key[0] is None:  # a state with no CV1 centre / rung is not on the grid
+                continue
+            idx = np.asarray(idx)
+            order = idx[np.argsort(sort_values[idx], kind="stable")]
+            for a, b in zip(order[:-1], order[1:]):
+                if abs(sort_values[b] - sort_values[a]) > _TOL:
+                    v = pair_overlap(int(a), int(b))
+                    if v is not None:
+                        pairs.append((a, b, v))
+        return pairs
+
+    lam_pairs = _chain_pairs(centre_key, lam)
+    cv1_pairs = _chain_pairs(row_key, cen)
 
     eligible = _eligible_mask(K, n_k)
     lam_summary = _summarise(lam_pairs)
     cv1_summary = _summarise(cv1_pairs)
-    lam_summary.update(_axis_connectivity(K, lam_pairs, cen, eligible, thr, n_k))
-    cv1_summary.update(_axis_connectivity(K, cv1_pairs, lam, eligible, thr, n_k))
+    lam_summary.update(_axis_connectivity(K, lam_pairs, centre_key, eligible, thr, n_k))
+    cv1_nk = (np.asarray(n_k, dtype=np.float64).ravel()[:K] if n_k is not None and np.asarray(n_k).size >= K
+              else np.ones(K)) * on_cv1
+    cv1_summary.update(_axis_connectivity(K, cv1_pairs, row_key, eligible & on_cv1, thr, cv1_nk))
     return {"lambda_direction": lam_summary, "cv1_direction": cv1_summary}, []
 
 
