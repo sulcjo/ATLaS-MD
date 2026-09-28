@@ -5,9 +5,12 @@ loads or steps an OpenMM Context. Capture must happen at an ensemble barrier.
 Its copy operation copies *checkpoint generations only*, not a transaction over
 mutable samples/trajectories elsewhere in the run directory.
 
-No generation garbage collection is performed: in-flight readers and previous
-commits retain valid filenames. Filesystems must support POSIX locks, same-FS
-rename, and directory fsync. Network-storage durability must be validated locally.
+Generation retention is opt-in: ``publish_generation``/``copy_committed_generation``
+accept ``keep_generations`` (0 = keep all). Pruning follows the
+``previous_generation_id`` chain back from the root manifest, never directory
+mtimes, and never touches the root's generation or orphans newer than it.
+Filesystems must support POSIX locks, same-FS rename, and directory fsync.
+Network-storage durability must be validated locally.
 """
 from __future__ import annotations
 
@@ -138,6 +141,7 @@ def publish_generation(
     *,
     artifacts: Mapping[str, bytes] | None = None,
     fault_hook: EventHook | None = None,
+    keep_generations: int = 0,
 ) -> dict[str, Any]:
     """Publish all replicas or none; old committed files are never overwritten.
 
@@ -222,6 +226,8 @@ def publish_generation(
             _event(fault_hook, "generation_published")
             atomic_bytes(root / MANIFEST_NAME, encoded)
             _event(fault_hook, "root_published")
+            if keep_generations:
+                _prune_locked(root, keep_generations)
             return fields
         finally:
             # A hard kill may leave staging behind; the reader never enumerates
@@ -333,9 +339,100 @@ def require_available(out_dir: Path | str) -> bool:
     return True
 
 
+def _generation_manifest(generations: Path, generation_id: str) -> dict[str, Any] | None:
+    try:
+        data = json_loads((generations / generation_id / "manifest.json").read_bytes())
+    except (OSError, IntegrityError, ValueError, TypeError):
+        return None
+    if not isinstance(data, dict) or data.get("generation_id") != generation_id:
+        return None
+    return data
+
+
+def _dir_bytes(path: Path) -> int:
+    total = 0
+    for directory, _, files in os.walk(path):
+        for name in files:
+            try:
+                total += (Path(directory) / name).stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def _prune_locked(root: Path, keep: int, dry_run: bool = False) -> dict[str, Any]:
+    """Delete superseded generations; caller holds ``writer_lock(root)``.
+
+    With ``dry_run=True`` the same selection rule runs but nothing is deleted:
+    ``report["deleted"]`` lists the ids that WOULD be removed and
+    ``report["bytes_freed"]`` their bytes, so a caller can preview a real prune.
+    """
+    keep = int(keep)
+    if keep < 0:
+        raise ValueError(f"keep must be >= 0, got {keep}")
+    report: dict[str, Any] = {
+        "kept": [], "deleted": [], "skipped": [], "bytes_freed": 0, "dry_run": bool(dry_run),
+    }
+    encoded = _root_bytes(root)
+    generations = root / "generations"
+    if keep == 0 or encoded is None or not generations.is_dir():
+        return report
+    root_manifest = json_loads(encoded)
+    if not isinstance(root_manifest, dict) or not isinstance(root_manifest.get("generation_id"), str):
+        return report
+    root_step = root_manifest.get("absolute_step")
+    # The newest `keep` generations, following previous_generation_id from the root.
+    kept: list[str] = []
+    current = root_manifest["generation_id"]
+    while current and len(kept) < keep:
+        kept.append(current)
+        data = _generation_manifest(generations, current)
+        if data is None:
+            break
+        current = data.get("previous_generation_id")
+    report["kept"] = list(kept)
+    for entry in sorted(generations.iterdir()):
+        if not entry.is_dir() or entry.name in kept:
+            continue
+        data = _generation_manifest(generations, entry.name)
+        if data is None:
+            report["skipped"].append((entry.name, "unreadable or mismatched manifest.json"))
+            continue
+        step = data.get("absolute_step")
+        if not isinstance(step, int) or not isinstance(root_step, int) or step > root_step:
+            report["skipped"].append((entry.name, "newer than the root manifest (unpublished orphan)"))
+            continue
+        size = _dir_bytes(entry)
+        if not dry_run:
+            shutil.rmtree(entry)
+        report["deleted"].append(entry.name)
+        report["bytes_freed"] += size
+    if report["deleted"] and not dry_run:
+        fsync_directory(generations)
+    return report
+
+
+def prune_generations(out_dir: Path | str, keep: int, dry_run: bool = False) -> dict[str, Any]:
+    """Keep the newest ``keep`` generations of one phase; ``keep=0`` deletes nothing.
+
+    Takes the writer lock itself. ``dry_run=True`` reports what would be deleted
+    without deleting anything; see ``_prune_locked``.
+    """
+    if int(keep) < 0:
+        raise ValueError(f"keep must be >= 0, got {keep}")
+    root = _storage_root(out_dir)
+    if not root.is_dir():
+        return {
+            "kept": [], "deleted": [], "skipped": [], "bytes_freed": 0, "dry_run": bool(dry_run),
+        }
+    with writer_lock(root):
+        return _prune_locked(root, keep, dry_run=dry_run)
+
+
 def copy_committed_generation(
     source: Path | str, destination: Path | str, *,
     fault_hook: EventHook | None = None,
+    keep_generations: int = 0,
 ) -> dict[str, Any]:
     """Copy one pinned, verified generation; publish destination manifest last.
 
@@ -395,4 +492,6 @@ def copy_committed_generation(
                     shutil.rmtree(staging)
         atomic_bytes(dest_root / MANIFEST_NAME, encoded)
         _event(fault_hook, "copy_root_published")
+        if keep_generations:
+            _prune_locked(dest_root, keep_generations)
     return manifest
