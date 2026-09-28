@@ -900,6 +900,12 @@ def _add_platform_args(p: argparse.ArgumentParser) -> None:
                         "logging, exchange, checkpoint) and NPT controller timings to "
                         "<out>/production_phase_timers.json at every checkpoint. Off by default; "
                         "changes nothing that production computes.")
+    p.add_argument("--checkpoint-keep-generations", type=int, default=0,
+                   help="Keep only the newest N production checkpoint generations per phase and "
+                        "delete older ones after each checkpoint (and on the main copy after a "
+                        "--scratchdir sync). 0 = keep every generation (default). Recommended 4. "
+                        "Only the newest generation is ever read on resume. "
+                        "Spec 2026-09-28-output-retention-design.")
     p.add_argument("--active-replicas-per-gpu", default="all",
                    help="Production stepping: at most this many replicas per GPU advance at once, in "
                         "FIFO turns ('all' = every replica at once, today's behaviour). Measured best "
@@ -1741,6 +1747,8 @@ def parse_args(argv: Optional[Iterable[str]] = None):
     _validate_cv_selection_args(p, args)
     _validate_npt_args(args)
     _validate_replica_admission_args(args)
+    if int(getattr(args, "checkpoint_keep_generations", 0) or 0) < 0:
+        p.error("--checkpoint-keep-generations must be >= 0")
     validate_gamd_stage_multiples(args)
 
     return args
@@ -2275,4 +2283,5 @@ def main(argv: Optional[Iterable[str]] = None):
         _final_main = getattr(args, "_main_dir", None)
         if _final_main:
             print(f"[scratchdir] final sync → {_final_main}")
-            sync_scratch_to_main(out_dir, Path(_final_main))
+            sync_scratch_to_main(out_dir, Path(_final_main),
+                                  keep_generations=int(getattr(args, "checkpoint_keep_generations", 0) or 0))

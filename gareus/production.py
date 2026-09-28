@@ -5128,7 +5128,8 @@ def save_production_checkpoint(out_dir: Path, sims: list, assignments: list[int]
                                secondary_cv_metadata=None, secondary_cv_centers=None, secondary_cv_k_kcal_list=None,
                                primary_cv_metadata=None, openmm_version: Optional[str] = None,
                                platform_name: Optional[str] = None,
-                               drivers: Optional[list] = None, pool=None, npt_runtime: Optional[NptRunContext] = None) -> None:
+                               drivers: Optional[list] = None, pool=None, npt_runtime: Optional[NptRunContext] = None,
+                               keep_generations: int = 0) -> None:
     """Write restart checkpoints for all production replicas.
 
     The OpenMM binary checkpoint is platform/version specific but it is the most
@@ -5236,16 +5237,17 @@ def save_production_checkpoint(out_dir: Path, sims: list, assignments: list[int]
     if secondary_cv_k_kcal_list is not None:
         manifest["secondary_cv_k_kcal_mol"] = [float(x) for x in secondary_cv_k_kcal_list]
     from .correctness.checkpoint_store import publish_generation
-    publish_generation(out_dir, replica_payloads, manifest)
+    publish_generation(out_dir, replica_payloads, manifest, keep_generations=int(keep_generations or 0))
 
-def sync_scratch_to_main(scratch_dir: Path, main_dir: Path) -> None:
+def sync_scratch_to_main(scratch_dir: Path, main_dir: Path, keep_generations: int = 0) -> None:
     """Checkpoint-safe quiescent copy; mutable sample files are individually atomic.
 
     This is not yet a generation-index transaction across all Parquet output.
     Any failure remains visible instead of claiming a successful backup.
+    ``keep_generations`` prunes the main copy's generations the same way.
     """
     from .correctness.repo_adapters import sync_run_tree_quiescent
-    sync_run_tree_quiescent(scratch_dir, main_dir)
+    sync_run_tree_quiescent(scratch_dir, main_dir, keep_generations=keep_generations)
 
 def _validate_npt_checkpoint_compatibility(out_dir: Path, manifest: dict, npt_runtime: NptRunContext, sims: list) -> Optional[str]:
     """Validate backend/adapter/T/P/topology before accepting a checkpoint.
@@ -8450,10 +8452,12 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     openmm_version=str(getattr(getattr(openmm, "version", None), "version", None)),
                     platform_name=str(platform.getName()),
                     drivers=drivers, pool=_sim_pool, npt_runtime=npt_runtime,
+                    keep_generations=int(getattr(args, "checkpoint_keep_generations", 0) or 0),
                 )
                 _scratch_main = getattr(args, "_main_dir", None)
                 if _scratch_main:
-                    sync_scratch_to_main(out_dir, Path(_scratch_main))
+                    sync_scratch_to_main(out_dir, Path(_scratch_main),
+                                          keep_generations=int(getattr(args, "checkpoint_keep_generations", 0) or 0))
                 break
             target = prod_total
             if next_exchange > prod_done:
@@ -8550,6 +8554,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                         openmm_version=str(getattr(getattr(openmm, "version", None), "version", None)),
                         platform_name=str(platform.getName()),
                         drivers=drivers, pool=_sim_pool, npt_runtime=npt_runtime,
+                        keep_generations=int(getattr(args, "checkpoint_keep_generations", 0) or 0),
                     )
                 # Written before the scratch sync so the main directory gets this checkpoint's timers.
                 if _phase_timers.enabled:
@@ -8557,7 +8562,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 _scratch_main = getattr(args, "_main_dir", None)
                 if _scratch_main:
                     with _phase_timers.phase("checkpoint_scratch_sync"):
-                        sync_scratch_to_main(out_dir, Path(_scratch_main))
+                        sync_scratch_to_main(out_dir, Path(_scratch_main),
+                                              keep_generations=int(getattr(args, "checkpoint_keep_generations", 0) or 0))
                 while next_checkpoint <= prod_done:
                     next_checkpoint += checkpoint_interval
 
