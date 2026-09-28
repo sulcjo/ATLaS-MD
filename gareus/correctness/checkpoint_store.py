@@ -7,8 +7,10 @@ mutable samples/trajectories elsewhere in the run directory.
 
 Generation retention is opt-in: ``publish_generation``/``copy_committed_generation``
 accept ``keep_generations`` (0 = keep all). Pruning follows the
-``previous_generation_id`` chain back from the root manifest, never directory
-mtimes, and never touches the root's generation or orphans newer than it.
+``previous_generation_id`` chain back from the root manifest (topped up from
+step-sorted fallbacks when the chain breaks early), never directory mtimes, and
+never touches the root's generation or orphans at or above its step. An in-run
+prune failure only prints a WARNING: the new checkpoint is already committed.
 Filesystems must support POSIX locks, same-FS rename, and directory fsync.
 Network-storage durability must be validated locally.
 """
@@ -227,7 +229,7 @@ def publish_generation(
             atomic_bytes(root / MANIFEST_NAME, encoded)
             _event(fault_hook, "root_published")
             if keep_generations:
-                _prune_locked(root, keep_generations)
+                _prune_best_effort(root, keep_generations)
             return fields
         finally:
             # A hard kill may leave staging behind; the reader never enumerates
@@ -360,8 +362,69 @@ def _dir_bytes(path: Path) -> int:
     return total
 
 
+DELETING_PREFIX = ".deleting-"
+
+
+def _is_generation_dir(entry: Path) -> bool:
+    """A real generation directory: never a dot-name (``.deleting-*`` leftovers)."""
+    return entry.is_dir() and not entry.name.startswith(".")
+
+
+def _sweep_deleting(generations: Path, report: dict[str, Any]) -> None:
+    """Remove ``.deleting-*`` leftovers of an earlier prune that crashed mid-rmtree.
+
+    One undeletable leftover is reported under ``skipped`` and never blocks the prune.
+    """
+    for entry in sorted(generations.iterdir()):
+        if not entry.name.startswith(DELETING_PREFIX):
+            continue
+        try:
+            shutil.rmtree(entry)
+        except Exception as exc:  # noqa: BLE001 - one bad leftover never blocks pruning
+            report["skipped"].append((entry.name, f"leftover of an interrupted delete: {exc}"))
+
+
+def _fill_kept(generations: Path, kept: list[str], keep: int, root_step: Any) -> list[str]:
+    """Top up ``kept`` when the chain walk broke before ``keep`` readable generations.
+
+    A chain can break at an unreadable/missing manifest (e.g. the main copy of a
+    ``--scratchdir`` run lacks a generation that was never synced). The remaining
+    slots go to readable generations at or below the root's step, newest step first
+    (tie: ``created_unix_time``), so older valid fallbacks are not all deleted.
+    """
+    if not isinstance(root_step, int):
+        return kept
+    readable = sum(1 for gid in kept if _generation_manifest(generations, gid) is not None)
+    if readable >= keep:
+        return kept
+    candidates = []
+    for entry in generations.iterdir():
+        if not _is_generation_dir(entry) or entry.name in kept:
+            continue
+        data = _generation_manifest(generations, entry.name)
+        if data is None:
+            continue
+        step = data.get("absolute_step")
+        if not isinstance(step, int) or isinstance(step, bool) or step > root_step:
+            continue
+        created = data.get("created_unix_time")
+        created = float(created) if isinstance(created, (int, float)) and not isinstance(created, bool) else 0.0
+        candidates.append((step, created, entry.name))
+    candidates.sort(reverse=True)
+    extra = [name for _, _, name in candidates[: keep - readable]]
+    return kept + extra
+
+
 def _prune_locked(root: Path, keep: int, dry_run: bool = False) -> dict[str, Any]:
     """Delete superseded generations; caller holds ``writer_lock(root)``.
+
+    Kept: the newest ``keep`` generations following ``previous_generation_id`` from
+    the root manifest, topped up from step-sorted readable fallbacks if that chain
+    breaks early (``_fill_kept``); any non-chain generation at or above the root's
+    step (an unpublished orphan) and any unreadable manifest are never deleted.
+    A deleted generation is first renamed to ``.deleting-<id>-<nonce>`` and then
+    removed, so a crash mid-delete leaves a dot-name that no reader enumerates and
+    the next prune sweeps.
 
     With ``dry_run=True`` the same selection rule runs but nothing is deleted:
     ``report["deleted"]`` lists the ids that WOULD be removed and
@@ -380,6 +443,8 @@ def _prune_locked(root: Path, keep: int, dry_run: bool = False) -> dict[str, Any
     root_manifest = json_loads(encoded)
     if not isinstance(root_manifest, dict) or not isinstance(root_manifest.get("generation_id"), str):
         return report
+    if not dry_run:
+        _sweep_deleting(generations, report)
     root_step = root_manifest.get("absolute_step")
     # The newest `keep` generations, following previous_generation_id from the root.
     kept: list[str] = []
@@ -390,26 +455,39 @@ def _prune_locked(root: Path, keep: int, dry_run: bool = False) -> dict[str, Any
         if data is None:
             break
         current = data.get("previous_generation_id")
+    kept = _fill_kept(generations, kept, keep, root_step)
     report["kept"] = list(kept)
     for entry in sorted(generations.iterdir()):
-        if not entry.is_dir() or entry.name in kept:
+        if not _is_generation_dir(entry) or entry.name in kept:
             continue
         data = _generation_manifest(generations, entry.name)
         if data is None:
             report["skipped"].append((entry.name, "unreadable or mismatched manifest.json"))
             continue
         step = data.get("absolute_step")
-        if not isinstance(step, int) or not isinstance(root_step, int) or step > root_step:
-            report["skipped"].append((entry.name, "newer than the root manifest (unpublished orphan)"))
+        if not isinstance(step, int) or not isinstance(root_step, int) or step >= root_step:
+            report["skipped"].append((entry.name, "not older than the root manifest (unpublished orphan)"))
             continue
         size = _dir_bytes(entry)
         if not dry_run:
-            shutil.rmtree(entry)
+            doomed = generations / f"{DELETING_PREFIX}{entry.name}-{uuid.uuid4().hex[:8]}"
+            os.rename(entry, doomed)
+            shutil.rmtree(doomed)
         report["deleted"].append(entry.name)
         report["bytes_freed"] += size
     if report["deleted"] and not dry_run:
         fsync_directory(generations)
     return report
+
+
+def _prune_best_effort(root: Path, keep: int) -> None:
+    """In-run prune after a checkpoint is already durable: a failure only warns."""
+    try:
+        _prune_locked(root, keep)
+    except Exception as exc:  # noqa: BLE001 - the checkpoint itself is committed
+        print(f"WARNING: checkpoint generation pruning failed in {root} "
+              f"({type(exc).__name__}: {exc}); the new checkpoint is committed, "
+              "older generations were left in place", flush=True)
 
 
 def prune_generations(out_dir: Path | str, keep: int, dry_run: bool = False) -> dict[str, Any]:
@@ -493,5 +571,5 @@ def copy_committed_generation(
         atomic_bytes(dest_root / MANIFEST_NAME, encoded)
         _event(fault_hook, "copy_root_published")
         if keep_generations:
-            _prune_locked(dest_root, keep_generations)
+            _prune_best_effort(dest_root, keep_generations)
     return manifest
