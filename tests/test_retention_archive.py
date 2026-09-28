@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import tarfile
 
 import pytest
@@ -93,8 +94,7 @@ def test_intra_directory_hard_links_round_trip(tmp_path):
     original = bank / "a.pdb"
     original.write_text("ATOM 1\n")
     linked = bank / "b.pdb"
-    import os as _os
-    _os.link(original, linked)
+    os.link(original, linked)
     assert original.stat().st_ino == linked.stat().st_ino
 
     before = _snapshot(run)
@@ -150,3 +150,115 @@ def test_restore_refuses_hostile_archive_member(tmp_path, member_name, symlink):
     # ...and nothing escaped outside the run directory tree.
     assert not (tmp_path / "escaped.txt").exists()
     assert not (tmp_path.parent / "escaped.txt").exists()
+
+
+# --- Fix round 1 (Controller Ruling 9) -------------------------------------
+
+
+def test_main_archive_returns_1_when_a_row_is_verify_failed(tmp_path, monkeypatch, capsys):
+    run = _campaign(tmp_path)
+    monkeypatch.setattr(retention, "_verify_archive", lambda archive, index: False)
+
+    rc = retention.main(["archive", str(run), "--apply"])
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "verify_failed" in out
+
+
+def test_main_archive_returns_0_when_every_row_archives_cleanly(tmp_path):
+    run = _campaign(tmp_path)
+
+    rc = retention.main(["archive", str(run), "--apply"])
+
+    assert rc == 0
+
+
+def test_main_restore_returns_1_when_one_archives_index_is_corrupt(tmp_path):
+    run = _campaign(tmp_path)
+    retention.archive_run(run, apply=True)
+    archives = sorted(run.rglob("*" + retention.ARCHIVE_SUFFIX))
+    assert len(archives) == 2  # seed_bank_final + final/baseline/final_pdbs, per _campaign()
+    bad, good = archives
+    bad_index = bad.with_name(bad.name + ".index.json")
+    bad_index.write_text("{not valid json")
+    good_dest = good.with_name(good.name[: -len(retention.ARCHIVE_SUFFIX)])
+    bad_dest = bad.with_name(bad.name[: -len(retention.ARCHIVE_SUFFIX)])
+
+    rc = retention.main(["restore", str(run), "--apply"])
+
+    assert rc == 1
+    # The good archive restored and was consumed.
+    assert good_dest.exists()
+    assert not good.exists()
+    # The bad archive/index are left exactly as they were; nothing was extracted.
+    assert bad.exists()
+    assert bad_index.read_text() == "{not valid json"
+    assert not bad_dest.exists()
+
+
+def test_restore_missing_index_yields_verify_failed_and_leaves_archive(tmp_path):
+    run = _campaign(tmp_path)
+    retention.archive_run(run, apply=True)
+    archive = next(run.rglob("seed_bank_final" + retention.ARCHIVE_SUFFIX))
+    index_path = archive.with_name(archive.name + ".index.json")
+    index_path.unlink()
+
+    rows = retention.restore_run(run, apply=True)
+
+    row = next(r for r in rows if r["archive"] == str(archive))
+    assert row["status"] == "verify_failed"
+    assert archive.exists()
+    dest = archive.with_name(archive.name[: -len(retention.ARCHIVE_SUFFIX)])
+    assert not dest.exists()
+
+
+@pytest.mark.parametrize("which", ["archive", "index"])
+def test_archive_run_never_overwrites_a_preexisting_archive_or_index(tmp_path, which):
+    run = _campaign(tmp_path)
+    target_dir = run / "adaptive_production" / "seed_bank_final"
+    archive_path = target_dir.with_name(target_dir.name + retention.ARCHIVE_SUFFIX)
+    index_path = target_dir.with_name(target_dir.name + retention.ARCHIVE_SUFFIX + ".index.json")
+    if which == "archive":
+        archive_path.write_bytes(b"PRE-EXISTING-ARCHIVE")
+    else:
+        index_path.write_text('{"members": {}}')
+
+    rows = retention.archive_run(run, apply=True)
+
+    row = next(r for r in rows if r["dir"] == str(target_dir))
+    assert row["status"] == "exists"
+    # Directory untouched - never opened, never removed.
+    assert target_dir.exists()
+    assert (target_dir / "pdbs" / "s.pdb").read_text() == "ATOM 2\n"
+    if which == "archive":
+        assert archive_path.read_bytes() == b"PRE-EXISTING-ARCHIVE"
+        assert not index_path.exists()
+    else:
+        assert index_path.read_text() == '{"members": {}}'
+        assert not archive_path.exists()
+
+
+def test_archive_skips_symlinks_counts_them_and_warns(tmp_path, capsys):
+    run = _campaign(tmp_path)
+    target_dir = run / "adaptive_production" / "seed_bank_final"
+    real_file = run / "adaptive_production" / "outside_the_bank.pdb"
+    real_file.write_text("ATOM 9\n")
+    link = target_dir / "pdbs" / "link.pdb"
+    os.symlink(real_file, link)
+
+    rows = retention.archive_run(run, apply=True)
+
+    row = next(r for r in rows if r["dir"] == str(target_dir))
+    assert row["status"] == "archived"
+    assert row["skipped_symlinks"] == 1
+    out = capsys.readouterr().out
+    assert "WARNING" in out
+    assert str(target_dir) in out
+    # The unaffected target's row is not warned about and carries no skip count.
+    other_row = next(r for r in rows if r["dir"] != str(target_dir))
+    assert other_row["skipped_symlinks"] == 0
+
+    retention.restore_run(run, apply=True)
+    restored_names = {p.name for p in (target_dir / "pdbs").iterdir()}
+    assert restored_names == {"s.pdb"}  # the symlink itself was never archived

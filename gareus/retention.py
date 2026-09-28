@@ -195,19 +195,27 @@ def _campaign_completed(run_dir: Path) -> bool:
 def _write_archive(src: Path, archive: Path) -> dict:
     """Stream every regular file under src into a new tar.zst, hashing as it goes.
 
-    Symlinks are deliberately never archived (skipped, not followed) so an archive
-    this code writes can never itself carry a member restore must refuse. Every
-    member is forced to REGTYPE with full content, rather than using tar.add()'s
-    default same-session hard-link collapsing (a second file sharing an inode with
-    one already added would otherwise be written as an LNKTYPE reference, which
-    restore's isfile()-only guard would then have to refuse) - archived seed banks
-    genuinely contain hard-linked PDBs (Task 8, filtered_seed_bank).
+    Symlinks are deliberately never archived (skipped, not followed - counted in the
+    returned "skipped_symlinks" so callers can warn) so an archive this code writes
+    can never itself carry a member restore must refuse. Every member is forced to
+    REGTYPE with full content, rather than using tar.add()'s default same-session
+    hard-link collapsing (a second file sharing an inode with one already added
+    would otherwise be written as an LNKTYPE reference, which restore's
+    isfile()-only guard would then have to refuse) - archived seed banks genuinely
+    contain hard-linked PDBs (Task 8, filtered_seed_bank).
     """
     members = {}
+    skipped_symlinks = 0
     zstandard = _zstd()
     cctx = zstandard.ZstdCompressor(level=19, write_checksum=True)
     with archive.open("wb") as fh, cctx.stream_writer(fh) as zw, tarfile.open(fileobj=zw, mode="w|") as tar:
-        for f in sorted(p for p in src.rglob("*") if p.is_file() and not p.is_symlink()):
+        for p in sorted(src.rglob("*")):
+            if p.is_symlink():
+                skipped_symlinks += 1
+                continue
+            if not p.is_file():
+                continue
+            f = p
             rel = f.relative_to(src).as_posix()
             members[rel] = {"size": f.stat().st_size, "sha256": _sha256(f)}
             info = tar.gettarinfo(str(f), arcname=rel)
@@ -219,7 +227,7 @@ def _write_archive(src: Path, archive: Path) -> dict:
             info.size = members[rel]["size"]
             with f.open("rb") as data:
                 tar.addfile(info, data)
-    return {"members": members}
+    return {"members": members, "skipped_symlinks": skipped_symlinks}
 
 
 def _iter_archive(archive: Path):
@@ -259,14 +267,25 @@ def archive_run(run_dir: Path, apply: bool, force: bool = False) -> list[dict]:
             continue
         archive = d.with_name(d.name + ARCHIVE_SUFFIX)
         index_path = d.with_name(d.name + ARCHIVE_SUFFIX + ".index.json")
-        index = _write_archive(d, archive)
+        if archive.exists() or index_path.exists():
+            # Never open/overwrite a pre-existing archive or index - a re-run over a
+            # directory already archived (or one that collides with a leftover file)
+            # must leave both the directory and the existing archive untouched.
+            rows.append({**row, "status": "exists"})
+            continue
+        result = _write_archive(d, archive)
+        skipped = result.get("skipped_symlinks", 0)
+        if skipped:
+            print(f"WARNING: skipped {skipped} symlink(s) while archiving {d}", flush=True)
+        index = {"members": result["members"]}
         if not _verify_archive(archive, index):
             archive.unlink(missing_ok=True)
-            rows.append({**row, "status": "verify_failed"})
+            rows.append({**row, "status": "verify_failed", "skipped_symlinks": skipped})
             continue
         index_path.write_text(json.dumps(index, indent=1, sort_keys=True))
         shutil.rmtree(d)
-        rows.append({**row, "status": "archived", "archive_bytes": archive.stat().st_size})
+        rows.append({**row, "status": "archived", "archive_bytes": archive.stat().st_size,
+                     "skipped_symlinks": skipped})
     return rows
 
 
@@ -289,7 +308,12 @@ def restore_run(run_dir: Path, apply: bool) -> list[dict]:
             rows.append({"archive": str(archive), "status": "verify_failed",
                          "error": f"destination already exists: {dest}"})
             continue
-        index = json.loads(index_path.read_text())
+        try:
+            index = json.loads(index_path.read_text())
+        except (OSError, ValueError) as exc:
+            rows.append({"archive": str(archive), "status": "verify_failed",
+                         "error": f"unreadable index {index_path}: {exc}"})
+            continue
         staging = dest.with_name("." + dest.name + ".restore")
         shutil.rmtree(staging, ignore_errors=True)
         try:
@@ -345,9 +369,10 @@ def main(argv: Optional[list] = None) -> int:
               f"{r['bytes_before'] / 1e9:.2f} GB -> {r['bytes_after'] / 1e9:.2f} GB")
         return 0 if r["status"] in ("dry_run", "rewritten") else 1
     if args.command == "archive":
-        for r in archive_run(args.run_dir, args.apply, args.force):
+        rows = archive_run(args.run_dir, args.apply, args.force)
+        for r in rows:
             print(f"{r['status']:13s} {r['bytes'] / 1e9:8.2f} GB  {r['dir']}")
-        return 0
+        return 1 if any(r["status"] == "verify_failed" for r in rows) else 0
     if args.command == "restore":
         rows = restore_run(args.run_dir, args.apply)
         for r in rows:
