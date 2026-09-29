@@ -6531,6 +6531,64 @@ def _segment_checkpoint_prod_done(seg_dir: Path) -> Optional[int]:
         return None
 
 
+EXTENSION_DIAGNOSTICS_STATE = "extension_diagnostics_state.json"
+
+
+def _record_extension_diagnostics_state(ext_dir: Path) -> None:
+    """Record the checkpointed production step the round's diagnostics were built from."""
+    write_json(Path(ext_dir) / EXTENSION_DIAGNOSTICS_STATE,
+               {"prod_done": _segment_checkpoint_prod_done(ext_dir), "written_unix": time.time()})
+
+
+def _extension_diagnostics_are_stale(ext_dir: Path) -> bool:
+    """True when a finished round's ``adaptive_epoch_diagnostics.json`` predates its samples.
+
+    A round's diagnostics are collected by the job that finishes its MD. They go stale
+    when a later job continues the same round (a raised MD budget re-enters
+    final_extension_NNN with a larger target), and that job is stopped by SIGTERM right
+    after the round's MD completes: the driver returns ``interrupted_after_checkpoint``
+    before collecting, and the next job starts the next round, trusting the old record
+    (chignolin_9 final_extension_001: diagnostics from 10,369 samples per state, the
+    finished round holds 15,796). No record (rounds from before this check) counts as
+    stale when the round has a checkpoint.
+    """
+    now = _segment_checkpoint_prod_done(ext_dir)
+    if now is None:
+        return False
+    state = read_json_file(Path(ext_dir) / EXTENSION_DIAGNOSTICS_STATE, None)
+    if not isinstance(state, dict) or state.get("prod_done") is None:
+        return True
+    try:
+        return int(state["prod_done"]) != int(now)
+    except (TypeError, ValueError):
+        return True
+
+
+def _refresh_stale_extension_diagnostics(adaptive_dir: Path, prior_summaries: Sequence[Dict[str, Any]],
+                                         registry: "WindowStateRegistry",
+                                         policy: "AdaptiveDecisionPolicy") -> List[str]:
+    """Recollect every earlier round whose diagnostics predate its samples; returns their names."""
+    refreshed = []
+    for summary in prior_summaries:
+        # The recorded dir can be another host's absolute path (a synced copy); the round
+        # number names the directory under this campaign either way.
+        recorded = str(summary.get("dir") or "")
+        ext_dir = Path(recorded) if recorded else None
+        if ext_dir is None or not ext_dir.is_dir():
+            ext_dir = Path(adaptive_dir) / f"final_extension_{int(summary.get('extension', 0) or 0):03d}"
+        if not ext_dir.is_dir() or not _extension_diagnostics_are_stale(ext_dir):
+            continue
+        try:
+            collect_segmented_epoch_diagnostics(ext_dir, registry, policy)
+            _record_extension_diagnostics_state(ext_dir)
+            refreshed.append(ext_dir.name)
+            print(f"    Adaptive-production: refreshed stale diagnostics of {ext_dir.name} "
+                  f"(its samples outgrew them; see _extension_diagnostics_are_stale)")
+        except Exception as exc:          # a report refresh must never block the campaign
+            print(f"WARNING: could not refresh diagnostics of {ext_dir} ({exc})")
+    return refreshed
+
+
 def stage_phase_identity(epoch_dir_name: str, max_epochs: Optional[int] = None) -> Dict[str, Any]:
     """Identify a scheduled stage for the TUI header.
 
@@ -9008,6 +9066,7 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
     # final_extension_001 and colliding with already-completed round directories.
     extension_summaries: List[Dict[str, Any]] = list(prior_extension_summaries)
     start_ext_round = len(prior_extension_summaries)
+    _refresh_stale_extension_diagnostics(adaptive_dir, prior_extension_summaries, registry, policy)
     final_diag = collect_final_combined_diagnostics(adaptive_dir, registry, policy=policy)
     quality_gate = evaluate_adaptive_quality_gate(
         adaptive_dir, registry, final_diag, policy=policy, output_prefix="adaptive_quality_gate_pre_union"
@@ -9118,6 +9177,7 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             )
             _write_runtime_pool_reports(adaptive_dir, runtime_pool)
         ext_diag = collect_segmented_epoch_diagnostics(ext_dir, registry, policy)
+        _record_extension_diagnostics_state(ext_dir)
         final_diag = collect_final_combined_diagnostics(adaptive_dir, registry, policy=policy)
         quality_gate = evaluate_adaptive_quality_gate(
             adaptive_dir,
