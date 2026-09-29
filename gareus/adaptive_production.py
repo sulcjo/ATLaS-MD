@@ -8392,6 +8392,10 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             )
             diagnostics = collect_segmented_epoch_diagnostics(epoch_dir, registry, policy)
             _assert_epoch_has_samples(diagnostics, registry, epoch_dir, int(actual_epoch_steps))
+        if _arg_bool(args, "adaptive_production_discovery_census", False):
+            # X8 diagnostics only: never changes a decision; census_for_epoch never raises.
+            from gareus.adaptive.discovery_census import census_for_epoch
+            census_for_epoch(adaptive_dir, epoch_dir)
         bridge_plan: List[Dict[str, Any]] = []
         if _post_action_registry is not None:
             actions = [tuple(a) for a in _ledger.get("actions", [])]

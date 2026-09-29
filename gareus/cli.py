@@ -548,6 +548,12 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--ap-max-coupling-fraction", type=float, default=0.25,
                    help="Largest CV2-induced CV1 curvature, as a fraction of RT/sigma_w1^2, the adaptive "
                         "coupling gate accepts.")
+    p.add_argument("--ap-discovery-census", action=argparse.BooleanOptionalAction, default=False,
+                   help="Diagnostics only (off by default): after each numbered epoch's MD, count new "
+                        "reference-free structural states (core backbone basin strings, 2 A C-alpha "
+                        "clusters) per phase so far and write epoch_NNN/discovery_census.json. Never "
+                        "changes a decision; a failure only prints a WARNING. Same as "
+                        "python -m gareus.adaptive.discovery_census <adaptive_dir>.")
     p.add_argument("--ap-topups", action=argparse.BooleanOptionalAction, default=False,
                    help="Top-ups (off by default): --no-ap-topups runs each scheduled phase as a single "
                         "all-state baseline only. --ap-topups adds, after that baseline, at most one "
@@ -1587,6 +1593,7 @@ def _shim_adaptive_production(args: argparse.Namespace) -> None:
     args.adaptive_production_allocation_weight = args.ap_allocation_weight
     args.adaptive_production_cv2_coupling_gate = args.ap_cv2_coupling_gate
     args.adaptive_production_max_coupling_fraction = args.ap_max_coupling_fraction
+    args.adaptive_production_discovery_census = args.ap_discovery_census
     args.adaptive_production_topup_target_sigma = args.ap_topup_target_sigma
     args.adaptive_production_topup_weak_overlap = args.ap_topup_weak_overlap
     args.adaptive_production_topup_max_fraction = args.ap_topup_max_fraction
