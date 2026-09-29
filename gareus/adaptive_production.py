@@ -526,6 +526,10 @@ class AdaptiveDecisionPolicy:
     refine_budget_fraction: float = 0.5
     refine_protect_epochs: int = 2
     refine_min_sigma: float = 0.1
+    # R3 crossing count: "replica" (within one replica's residence at the window; an
+    # exchange swap is not a crossing) or "state-series" (every switch of the window's
+    # state-indexed series, swaps included). Undecided for chignolin_10.
+    refine_transition_count: str = "replica"
 
 
 LADDER_SETTINGS_FIELDS = ("ladder_adapt", "ladder_min_overlap", "ladder_overlap_quantile", "ladder_min_ess",
@@ -548,6 +552,7 @@ DECISION_SETTINGS_FIELDS = (
     "layout_neighbour_rule",
     "cv2_resolution", "coverage_min_windows", "refine_min_transitions", "refine_pmf_sigma_kT",
     "refine_budget_fraction", "refine_protect_epochs", "refine_min_sigma",
+    "refine_transition_count",
 )
 DECISION_SETTINGS_FILENAME = "decision_settings.json"
 
@@ -8143,6 +8148,8 @@ def policy_from_args(args: Any) -> AdaptiveDecisionPolicy:
         refine_budget_fraction=_arg_float(args, "adaptive_production_refine_budget_fraction", 0.5),
         refine_protect_epochs=_arg_int(args, "adaptive_production_refine_protect_epochs", 2),
         refine_min_sigma=_arg_float(args, "adaptive_production_refine_min_sigma", 0.1),
+        refine_transition_count=str(getattr(args, "adaptive_production_refine_transition_count", "replica")
+                                    or "replica"),
     )
 
 

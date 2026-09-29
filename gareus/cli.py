@@ -615,6 +615,11 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--ap-refine-min-transitions", type=int, default=10,
                    help="R3: within-residence core-to-core CV2 transitions a bimodal window needs before "
                         "its modes get windows. Uncalibrated default.")
+    p.add_argument("--ap-refine-transition-count", choices=("replica", "state-series"), default="replica",
+                   help="R3: which crossings count toward --ap-refine-min-transitions. replica (default): "
+                        "within one replica's residence at the window, so an exchange swap is not a crossing "
+                        "(rarely fires when replicas stay only a few samples); state-series: every switch of "
+                        "the window's series, swaps included. Frozen with the decision settings.")
     p.add_argument("--ap-refine-pmf-sigma-kt", type=float, default=0.5,
                    help="R2: block-bootstrap sigma (kT) of a CV2 interval's free energy above which it is a "
                         "hole. Uncalibrated default.")
@@ -1685,6 +1690,7 @@ def _shim_adaptive_production(args: argparse.Namespace) -> None:
     args.adaptive_production_cv2_resolution = args.ap_cv2_resolution
     args.adaptive_production_coverage_min_windows = args.ap_coverage_min_windows
     args.adaptive_production_refine_min_transitions = args.ap_refine_min_transitions
+    args.adaptive_production_refine_transition_count = args.ap_refine_transition_count
     args.adaptive_production_refine_pmf_sigma_kt = args.ap_refine_pmf_sigma_kt
     args.adaptive_production_refine_budget_fraction = args.ap_refine_budget_fraction
     args.adaptive_production_refine_protect_epochs = args.ap_refine_protect_epochs

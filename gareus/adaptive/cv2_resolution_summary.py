@@ -153,7 +153,7 @@ def _r3_by_state(report: Optional[Mapping[str, Any]]) -> Dict[int, Mapping[str, 
 
 def _transitions(m: Mapping[str, Any]) -> Tuple[Optional[int], str]:
     if m.get("transitions") is not None:
-        return int(m["transitions"]), "replica"
+        return int(m["transitions"]), str(m.get("transitions_estimator") or "replica")
     if m.get("transitions_lower_bound") is not None:
         return int(m["transitions_lower_bound"]), "state_series_lower_bound"
     return None, "none"

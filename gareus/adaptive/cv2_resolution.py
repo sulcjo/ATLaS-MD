@@ -88,7 +88,9 @@ BURN_IN_NOTE = ("standard: the US pull is not written as samples, per-state burn
 # Knob defaults. Only refine_budget_fraction (0.5) and refine_protect_epochs (2) are spec
 # values; the rest are conservative, UNCALIBRATED choices (spec T2 calibrates them).
 DEFAULTS = {"coverage_min_windows": 2.0, "refine_min_transitions": 10, "refine_pmf_sigma_kT": 0.5,
-            "refine_budget_fraction": 0.5, "refine_protect_epochs": 2, "refine_min_sigma": 0.1}
+            "refine_budget_fraction": 0.5, "refine_protect_epochs": 2, "refine_min_sigma": 0.1,
+            "refine_transition_count": "replica"}
+TRANSITION_COUNTS = ("replica", "state-series")
 
 
 @dataclass(frozen=True)
@@ -99,6 +101,7 @@ class ResolutionSettings:
     refine_budget_fraction: float = DEFAULTS["refine_budget_fraction"]
     refine_protect_epochs: int = DEFAULTS["refine_protect_epochs"]
     refine_min_sigma: float = DEFAULTS["refine_min_sigma"]
+    refine_transition_count: str = DEFAULTS["refine_transition_count"]
     temperature_k: float = 300.0
     k1_min: float = 0.0
     k2_min: float = 0.0

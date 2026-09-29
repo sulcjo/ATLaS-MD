@@ -2224,7 +2224,9 @@ under-resolved.  Only states restraining both axes above their floors
         gets a window at the interval centre.
     R3  mode resolution: a window whose CV2 samples show two mixture modes (depth
         >= 1 kT, both >= 10 %) AND >= --ap-refine-min-transitions core-to-core
-        transitions within replica residences gets two children at the modes; the
+        transitions (--ap-refine-transition-count: replica = within replica
+        residences, default; state-series = every switch at the window, exchange
+        swaps included) gets two children at the modes; the
         parent is kept. Without transitions it is flagged trapped_or_orthogonal and
         nothing is inserted (more CV2 windows cannot resolve a hidden slow mode).
 

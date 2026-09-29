@@ -404,3 +404,40 @@ def test_pending_resolution_blocks_convergence(tmp_path):
     gate = ap.evaluate_adaptive_convergence_gate(epoch_dir, 0, reg, {"states": [], "edges": []}, [], policy)
     assert any("CV2-resolution" in r for r in gate["continue_reasons"])
     assert gate["status"] != "converged"
+
+
+
+def test_state_series_count_lets_swap_driven_switches_resolve_the_window():
+    """The 'without' case has 0 within-residence crossings but many state-series switches:
+    replica counting flags it, state-series counting proposes the two children."""
+    import dataclasses
+    reg = _registry()
+    parent = _sid(reg, 0.2, 0.0)
+    z = _bimodal()
+    sub = {parent: {"cv2": z, "cv1": np.full(z.size, 0.2), "source_index": np.zeros(z.size, int)}}
+    runs = {parent: {"source": "parquet", "replica_runs": [np.full(60, -0.66), np.full(60, 0.66)],
+                     "state_runs": _alternating_runs()}}
+    settings = dataclasses.replace(SETTINGS, refine_transition_count="state-series")
+    new, report, _h = _propose(reg, _payload(reg, samples={parent: z}), subsamples=sub, runs=runs, settings=settings)
+    (cand,) = [c for c in _decisions(report, "R3") if c["state_ids"] == [parent]]
+    assert cand["decision"] == "proposed", cand["reason"]
+    assert cand["metrics"]["transitions_estimator"] == "state-series"
+    assert cand["metrics"]["transitions"] == cand["metrics"]["transitions_state_series"] > 0
+    assert [a for a in new if a[0] == "insert"]
+
+
+def test_transition_count_mode_is_validated_and_recorded():
+    from gareus.adaptive import cv2_resolution_rules as rules
+    rec = {"source": "parquet", "replica_runs": [np.array([-1.0, 1.0])],
+           "state_runs": [np.array([-1.0, 1.0, -1.0])]}
+    assert rules._transitions(rec, (-0.5, 0.5))["transitions"] == 1
+    out = rules._transitions(rec, (-0.5, 0.5), "state-series")
+    assert out["transitions"] == 2 and out["transitions_estimator"] == "state-series"
+    sub_only = rules._transitions({"source": "subsample", "state_runs": rec["state_runs"]}, (-0.5, 0.5),
+                                  "state-series")
+    assert sub_only["transitions"] is None and sub_only["transitions_lower_bound"] == 2
+    with pytest.raises(ValueError):
+        rules._transitions(rec, (-0.5, 0.5), "bogus")
+    assert cr.ResolutionSettings.from_policy(ap.AdaptiveDecisionPolicy()).refine_transition_count == "replica"
+    pol = ap.AdaptiveDecisionPolicy(refine_transition_count="state-series")
+    assert cr.ResolutionSettings.from_policy(pol).refine_transition_count == "state-series"

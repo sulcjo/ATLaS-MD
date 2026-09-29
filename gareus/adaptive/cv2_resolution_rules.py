@@ -42,13 +42,21 @@ def _r3_children(view: cr.StateView, modes: Mapping[str, Any], settings: cr.Reso
     return kids
 
 
-def _transitions(rec: Optional[Mapping[str, Any]], bounds: Tuple[float, float]) -> Dict[str, Any]:
+def _transitions(rec: Optional[Mapping[str, Any]], bounds: Tuple[float, float],
+                 count: str = "replica") -> Dict[str, Any]:
+    """Crossings R3 decides on. ``count`` "replica": within one replica's residence (an
+    exchange swap bringing in a walker from the other mode is not a crossing);
+    "state-series": every switch of the state-indexed series, swaps included. Both need the
+    full Parquet series; the strided subsample only gives a state-series lower bound."""
+    if count not in cr.TRANSITION_COUNTS:
+        raise ValueError(f"refine_transition_count must be one of {cr.TRANSITION_COUNTS}, got {count!r}")
     rec = rec or {}
     src = str(rec.get("source", "none"))
-    out = {"transitions_source": src, "core_bounds": list(bounds),
+    out = {"transitions_source": src, "core_bounds": list(bounds), "transitions_estimator": count,
            "transitions_state_series": cr.count_transitions(rec.get("state_runs", []), *bounds)}
     if src == "parquet":
-        out["transitions"] = cr.count_transitions(rec.get("replica_runs", []), *bounds)
+        out["transitions"] = (cr.count_transitions(rec.get("replica_runs", []), *bounds) if count == "replica"
+                              else out["transitions_state_series"])
     else:
         out["transitions"] = None
         out["transitions_lower_bound"] = out["transitions_state_series"]
@@ -60,7 +68,8 @@ def _r3_decide(view: cr.StateView, modes: Dict[str, Any], rec: Optional[Mapping[
     metrics = {**_r3_metrics(view, settings), "mixture": modes["fit"], "depth": modes["depth"],
                "modes": modes["pair"], "trapped_or_orthogonal": False}
     lo, hi = modes["pair"]
-    metrics.update(_transitions(rec, cr.core_bounds(lo, hi, float(modes["depth"]["barrier_z"]))))
+    metrics.update(_transitions(rec, cr.core_bounds(lo, hi, float(modes["depth"]["barrier_z"])),
+                                str(settings.refine_transition_count)))
     ids = [view.state_id]
     if metrics["transitions"] is None:
         return cr.new_candidate("R3", "state", ids, "flagged", "transitions_unavailable: no replica-resolved "
@@ -69,7 +78,8 @@ def _r3_decide(view: cr.StateView, modes: Dict[str, Any], rec: Optional[Mapping[
         metrics["trapped_or_orthogonal"] = True
         return cr.new_candidate("R3", "state", ids, "flagged",
                                 f"trapped_or_orthogonal: bimodal (depth {modes['depth']['depth_kT']:.2f} kT) but "
-                                f"{metrics['transitions']} < {settings.refine_min_transitions} within-residence "
+                                f"{metrics['transitions']} < {settings.refine_min_transitions} "
+                                f"{'within-residence' if settings.refine_transition_count == 'replica' else 'state-series'} "
                                 "transitions", metrics=metrics)
     kids = _r3_children(view, modes, settings, gate)
     proposal = {"parent_state_id": view.state_id, "children": kids}
