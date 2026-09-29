@@ -2202,6 +2202,48 @@ Read-only replay on a finished campaign:
 On chignolin_9 it reproduces the union MBAR rung overlaps (0.244/0.272/0.404
 predicted vs 0.243/0.272/0.402) and proposes [0, 0.175, 0.47, 1] (10th-percentile
 overlaps 0.281/0.281/0.286, from 0.209/0.248/0.396).
+
+21. Adaptive CV2 resolution
+---------------------------
+Off by default (``--ap-cv2-resolution``).  After the other proposers, between
+numbered epochs, three rules add CV2 resolution where the data say CV2 is
+under-resolved.  Only states restraining both axes above their floors
+(k1 > --cv1-k-min, k2 > --cv2-k-min) take part; anchors and axis states never do.
+
+    R1  CV2-gap bridge, for same-pattern geometry edges whose ends differ mainly in
+        CV2 (per-axis restraint-width distance d2 >= d1). Needs --ap-edge-metric
+        pairwise-mbar. Structural (the edge's absence splits the overlap graph into
+        components): bridge now. Weak (confidently below min_rung_overlap): bridge.
+        Unmeasured: extend both ends; bridge after 2 more epochs if still
+        unmeasured or weak (history in adaptive_production/cv2_resolution_history.json).
+        The bridge replaces the midpoint bridger on that edge.
+    R2  coverage hole, post-union only (needs --ap-topups, which build a union each
+        epoch; otherwise recorded unavailable): a CV2 interval at fixed CV1 whose
+        unbiased weight comes from fewer than --ap-coverage-min-windows centres, or
+        whose block-bootstrap free-energy sigma exceeds --ap-refine-pmf-sigma-kt,
+        gets a window at the interval centre.
+    R3  mode resolution: a window whose CV2 samples show two mixture modes (depth
+        >= 1 kT, both >= 10 %) AND >= --ap-refine-min-transitions core-to-core
+        transitions within replica residences gets two children at the modes; the
+        parent is kept. Without transitions it is flagged trapped_or_orthogonal and
+        nothing is inserted (more CV2 windows cannot resolve a hidden slow mode).
+
+Every new window: target sampled sigma from the spacing (children: 2 delta / 1.5),
+never below --ap-refine-min-sigma; F'' from the window's own samples minus its own
+spring; k2 = RT/sigma^2 - F'' in [--cv2-k-min, min(--cv2-k-max, 4 x parent k2)], then
+the coupling gate. A k2 at the floor is refused (k2_at_floor), never created.
+Sampled sd/sigma_w, Sarle bimodality and curvature are reported, never trigger.
+
+Budget: resolution actions draw only on the swarm layout's reserve
+(--swarm-adaptive-reserve-fraction; layout_plan.json adaptive_reserve), at most
+--ap-refine-budget-fraction (0.5) of the free slots left after add_rung, which a
+reserve limits to 1/3 of them. Without a reserve every proposal is refused
+(no_reserve) and recorded. New windows are protected from retirement and further
+refinement for --ap-refine-protect-epochs (2). Pending resolution blocks the
+convergence gate. Report: epoch_NNN/cv2_resolution_report.json
+(cv2_resolution_report_v1). The knobs are frozen with the decision settings;
+coverage-min-windows, refine-min-transitions, refine-pmf-sigma-kt and
+refine-min-sigma are uncalibrated defaults.
 """
 
 

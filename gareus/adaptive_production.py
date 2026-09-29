@@ -516,6 +516,16 @@ class AdaptiveDecisionPolicy:
     # pre-P7b graphs; "restraint-width" = the P7a rule. MD-driving, so frozen here and
     # threaded into every phase's args by the driver.
     layout_neighbour_rule: str = "legacy"
+    # Spec 3.3 CV2 resolution R1-R3 (gareus/adaptive/cv2_resolution*.py), off by default.
+    # refine_budget_fraction and refine_protect_epochs are spec values; the other four are
+    # conservative, uncalibrated choices (spec T2 calibrates them).
+    cv2_resolution: bool = False
+    coverage_min_windows: float = 2.0
+    refine_min_transitions: int = 10
+    refine_pmf_sigma_kT: float = 0.5
+    refine_budget_fraction: float = 0.5
+    refine_protect_epochs: int = 2
+    refine_min_sigma: float = 0.1
 
 
 LADDER_SETTINGS_FIELDS = ("ladder_adapt", "ladder_min_overlap", "ladder_overlap_quantile", "ladder_min_ess",
@@ -536,6 +546,8 @@ DECISION_SETTINGS_FIELDS = (
     "slow_mode_reseed_fraction",
     "edge_metric", "min_edge_neff",
     "layout_neighbour_rule",
+    "cv2_resolution", "coverage_min_windows", "refine_min_transitions", "refine_pmf_sigma_kT",
+    "refine_budget_fraction", "refine_protect_epochs", "refine_min_sigma",
 )
 DECISION_SETTINGS_FILENAME = "decision_settings.json"
 
@@ -1162,6 +1174,19 @@ def write_seed_bank_from_run_dirs(
     return payload
 
 
+def _seed_rows_for_target(rows: List[Dict[str, Any]], target: WindowState) -> List[Dict[str, Any]]:
+    """The bank rows a target may start from: all of them, except for a state created by a
+    spec 3.3 resolution action, which starts from its parent's frames (the nearest to its own
+    centre) whenever the bank holds any."""
+    meta = (target.metadata or {}).get("cv2_resolution") or {}
+    parent = meta.get("seed_source_state_id")
+    if parent is None:
+        return rows
+    own = [r for r in rows if str(r.get("source_state_id", "")).strip() not in ("", "None")
+           and int(float(r["source_state_id"])) == int(parent)]
+    return own or rows
+
+
 def select_state_aware_seeds_for_targets(seed_bank_dir: Path, registry: WindowStateRegistry) -> Dict[str, Any]:
     """Score seed-bank structures against active target states by CV distance.
 
@@ -1186,7 +1211,7 @@ def select_state_aware_seeds_for_targets(seed_bank_dir: Path, registry: WindowSt
     for target in registry.active_states():
         best = None
         best_score = float("inf")
-        for row in rows:
+        for row in _seed_rows_for_target(rows, target):
             p = _float_or_none(row.get("primary_cv_value"))
             s = _float_or_none(row.get("secondary_cv_value"))
             if p is None:
@@ -7770,8 +7795,10 @@ class AdaptiveProductionController:
                          "secondary_center": c2, "secondary_k": k2, "notes": notes})
         return plan, None
 
-    def _validate_split(self, action: Tuple) -> Tuple[Optional[Dict[str, Any]], Optional[Tuple]]:
-        _, parent, children_params, _reason = action
+    def _parent_centre_refusal(self, parent: Any, *, refuse_mandatory: bool
+                               ) -> Tuple[Optional[List[WindowState]], Optional[Tuple]]:
+        """The parent's whole centre, or a refusal: unknown/inactive, mandatory (a split
+        retires the centre; an insert keeps it, so it does not ask), anchor/axis."""
         state = self.registry.get_state(int(parent))
         if state is None:
             return None, ("unknown_state", f"parent state {parent} is not in the registry", {})
@@ -7779,7 +7806,7 @@ class AdaptiveProductionController:
             return None, ("inactive", f"parent state {parent} is already retired", {})
         members = self._centre_members(state)
         mandatory = [int(s.state_id) for s in members if bool((s.metadata or {}).get("mandatory"))]
-        if mandatory:
+        if refuse_mandatory and mandatory:
             return None, ("mandatory", f"centre of state {parent} holds mandatory exploration state(s) "
                                        f"{mandatory}", {})
         has_cv2 = any(s.secondary_center is not None for s in self.registry.all_states())
@@ -7788,11 +7815,29 @@ class AdaptiveProductionController:
             return None, ("anchor_or_axis", f"centre of state {parent} is an anchor/axis centre "
                                             f"(k1 = 0 or k2 = 0: states {structural}); only k1 > 0, k2 > 0 "
                                             "centres can be split", {})
+        return members, None
+
+    def _validate_split(self, action: Tuple) -> Tuple[Optional[Dict[str, Any]], Optional[Tuple]]:
+        _, parent, children_params, _reason = action
+        members, refusal = self._parent_centre_refusal(parent, refuse_mandatory=True)
+        if refusal is not None:
+            return None, refusal
         plan, refusal = self._plan_children(children_params, f"split of {parent}")
         if refusal is not None:
             return None, (refusal[0], refusal[1], {})
         added = len(plan) * len(self._centre_rungs()) - len(members)
         return {"children": plan, "members": members, "added": added}, None
+
+    def _validate_insert(self, action: Tuple) -> Tuple[Optional[Dict[str, Any]], Optional[Tuple]]:
+        """Spec 3.3 R3: like a split, but the parent centre stays active (nothing retired)."""
+        parent, children_params = action[1], action[2]
+        _members, refusal = self._parent_centre_refusal(parent, refuse_mandatory=False)
+        if refusal is not None:
+            return None, refusal
+        plan, refusal = self._plan_children(children_params, f"insert at {parent}")
+        if refusal is not None:
+            return None, (refusal[0], refusal[1], {})
+        return {"children": plan, "added": len(plan) * len(self._centre_rungs())}, None
 
     def _validate_respace_ladder(self, drop: Sequence[float], add: Sequence[float]
                                  ) -> Tuple[Optional[Dict[str, Any]], Optional[Tuple]]:
@@ -7849,6 +7894,8 @@ class AdaptiveProductionController:
             parent = self.registry.get_state(int(action[1]))
             n_members = len(self._centre_members(parent)) if parent is not None and parent.active else 0
             return per_centre * len(action[2]) - n_members
+        if kind == "insert":
+            return per_centre * len(action[2])
         if kind == "add_rung":
             lam = float(action[1])
             policy = AdaptiveDecisionPolicy()
@@ -7885,6 +7932,11 @@ class AdaptiveProductionController:
             if refusal is not None:
                 return None, refusal
             plan, added = split_plan, int(split_plan["added"])
+        elif kind == "insert":
+            insert_plan, refusal = self._validate_insert(action)
+            if refusal is not None:
+                return None, refusal
+            plan, added = insert_plan, int(insert_plan["added"])
         elif kind == "add_rung":
             plan, added = {}, self._states_added_by(action)
         elif kind == "respace_ladder":
@@ -7912,8 +7964,11 @@ class AdaptiveProductionController:
             if child["notes"]:
                 reason = "; ".join([reason, *child["notes"]])
             if kind == "add":
+                # An optional 5th element carries state metadata (spec 3.3 resolution adds);
+                # a 4-tuple creates exactly what it always did.
                 self._add_centre_on_every_rung(epoch, child["params"], parent=parent,
-                                               source="adaptive_production", reason=reason)
+                                               source="adaptive_production", reason=reason,
+                                               metadata=dict(action[4]) if len(action) > 4 else None)
             else:
                 self._add_centre_on_every_rung(epoch, child["params"], parent=parent, source="tica_coverage",
                                                reason=reason, metadata=dict(action[4]))
@@ -7922,6 +7977,15 @@ class AdaptiveProductionController:
             self._add_rung_at_every_centre(epoch, float(lambda_new), str(reason))
         elif kind == "respace_ladder":
             self._execute_respace(epoch, plan, str(action[3]))
+        elif kind == "insert":
+            # Spec 3.3 R3: children on every rung; the parent centre is kept (it bridges the barrier).
+            _, parent, _children, reason = action[:4]
+            meta = dict(action[4]) if len(action) > 4 else None
+            for child in plan["plan"]["children"]:
+                child_reason = "; ".join([f"insert child: {reason}", *child["notes"]])
+                self._add_centre_on_every_rung(epoch, child["params"], parent=int(parent),
+                                               source="adaptive_production_cv2_resolution",
+                                               reason=child_reason, metadata=meta)
         elif kind == "split":
             # Children first, on the rungs resolved at validation (retiring first would shrink
             # rung_lambdas()), then every rung of the parent centre. One atomic unit.
@@ -8072,6 +8136,13 @@ def policy_from_args(args: Any) -> AdaptiveDecisionPolicy:
         edge_metric=str(getattr(args, "adaptive_production_edge_metric", "marginal") or "marginal"),
         layout_neighbour_rule=str(getattr(args, "layout_neighbour_rule", "legacy") or "legacy"),
         min_edge_neff=_arg_float(args, "adaptive_production_min_edge_neff", 100.0),
+        cv2_resolution=_arg_bool(args, "adaptive_production_cv2_resolution", False),
+        coverage_min_windows=_arg_float(args, "adaptive_production_coverage_min_windows", 2.0),
+        refine_min_transitions=_arg_int(args, "adaptive_production_refine_min_transitions", 10),
+        refine_pmf_sigma_kT=_arg_float(args, "adaptive_production_refine_pmf_sigma_kt", 0.5),
+        refine_budget_fraction=_arg_float(args, "adaptive_production_refine_budget_fraction", 0.5),
+        refine_protect_epochs=_arg_int(args, "adaptive_production_refine_protect_epochs", 2),
+        refine_min_sigma=_arg_float(args, "adaptive_production_refine_min_sigma", 0.1),
     )
 
 
@@ -8856,6 +8927,16 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                 write_json(epoch_dir / "ladder_adapt_report.json", _ladder_report)
                 print(f"    Adaptive ladder: {_ladder_report.get('status')}; "
                       f"{(_ladder_report.get('change') or {}).get('reason', '')}")
+            if bool(policy.cv2_resolution):
+                # Spec 3.3 R1-R3 (off by default): after every other proposer, drawing only on
+                # the P1 reserve; writes epoch_NNN/cv2_resolution_report.json. Never raises.
+                from .adaptive.cv2_resolution_io import run_epoch_cv2_resolution  # noqa: PLC0415
+                actions = run_epoch_cv2_resolution(
+                    adaptive_dir=adaptive_dir, epoch_dir=epoch_dir, epoch=epoch, registry=registry,
+                    diagnostics=diagnostics, actions=actions, policy=policy, args=args, out_dir=out_dir,
+                    phase_dirs=([Path(s.get("dir")) for s in scheduled_summary.get("segments", []) if s.get("dir")]
+                                if scheduled_summary is not None else [epoch_dir]),
+                    gate=_coupling_gate)
         action_report = None
         if _arg_bool(args, "adaptive_production_write_action_reports", True):
             try:
@@ -8911,6 +8992,9 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                 registry, actions, epoch, policy=policy,
                 secondary_k_max=_resolve_secondary_k_max(args), coupling_gate=_coupling_gate)
             _write_coupling_gate_report(epoch_dir, epoch, _coupling_gate)
+            if bool(policy.cv2_resolution):
+                from .adaptive.cv2_resolution_io import annotate_report_with_refusals  # noqa: PLC0415
+                annotate_report_with_refusals(epoch_dir, actions, _refused_actions)
         registry_paths = registry.save(adaptive_dir)
         if _post_action_registry is not None:
             # A recovered epoch's ``actions`` are the ledger's applied list; carry its refusals
@@ -9912,8 +9996,14 @@ def _write_epoch_action_markdown(path: Path, report: Dict[str, Any]) -> None:
 def _action_to_dict(action: Tuple) -> Dict[str, Any]:
     kind = str(action[0])
     if kind == "add":
-        _, parent, params, reason = action
-        return {"action": kind, "parent_state_id": parent, "params": list(params), "reason": reason}
+        _, parent, params, reason = action[:4]
+        row = {"action": kind, "parent_state_id": parent, "params": list(params), "reason": reason}
+        if len(action) > 4:
+            row["metadata"] = action[4]
+        return row
+    if kind == "insert":
+        _, parent, children, reason = action[:4]
+        return {"action": kind, "parent_state_id": parent, "children": children, "reason": reason}
     if kind == "retire":
         _, sid, reason = action
         return {"action": kind, "state_id": sid, "reason": reason}
@@ -9928,7 +10018,7 @@ def _action_to_dict(action: Tuple) -> Dict[str, Any]:
 
 def _adaptive_production_converged(actions: Sequence[Tuple], diagnostics: Dict[str, Any], policy: AdaptiveDecisionPolicy) -> bool:
     # Any proposed insertion or resolution blocks convergence (spec P2: split/refine too).
-    if any(str(a[0]) in ("add", "split", "refine") for a in actions):
+    if any(str(a[0]) in ("add", "split", "refine", "insert") for a in actions):
         return False
     weak_edges = [edge for edge in diagnostics.get("edges", []) if _edge_is_measured_weak(edge, policy)]
     return len(weak_edges) == 0
@@ -10050,7 +10140,7 @@ def evaluate_adaptive_convergence_gate(
     """
     epoch_dir = Path(epoch_dir)
     action_rows = [_action_to_dict(a) for a in actions]
-    add_like = [a for a in action_rows if a.get("action") in {"add", "split"}]
+    add_like = [a for a in action_rows if a.get("action") in {"add", "split", "insert"}]
     extend_like = [a for a in action_rows if a.get("action") == "extend"]
 
     errors: List[str] = []
@@ -10099,6 +10189,13 @@ def evaluate_adaptive_convergence_gate(
 
     if extend_like and not bool(policy.convergence_allow_extend_actions):
         continue_reasons.append(f"{len(extend_like)} extend action(s) proposed")
+
+    if bool(getattr(policy, "cv2_resolution", False)):
+        # Spec 3.3: R1-R3 work still pending (proposed, or refused for want of reserve/budget).
+        from .adaptive.cv2_resolution_io import is_blocking
+        n_pending = is_blocking(epoch_dir)
+        if n_pending:
+            continue_reasons.append(f"{n_pending} CV2-resolution action(s) pending (cv2_resolution_report.json)")
 
     high_boost_states = []
     for row in diagnostics.get("states", []) or []:

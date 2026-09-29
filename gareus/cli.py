@@ -600,6 +600,33 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                         "one-sided along it -- from a pooled end state inside the window's restraint "
                         "on its under-sampled side. Starting points only; report epoch_NNN/"
                         "slow_mode_reseed.json. Needs a frozen residual pair and saved trajectories.")
+    p.add_argument("--ap-cv2-resolution", action=argparse.BooleanOptionalAction, default=False,
+                   help="Spec 3.3 CV2 resolution actions (off by default). R1 bridges CV2-mainly edges that "
+                        "split the pairwise-MBAR overlap graph or are confidently weak (unmeasured ones get "
+                        "2 epochs of extra sampling first; needs --ap-edge-metric pairwise-mbar); R2 adds a "
+                        "window at a CV2 coverage hole of the per-epoch union (needs --ap-topups); R3 inserts "
+                        "two windows at the modes of a bimodal window with observed transitions (parent kept; "
+                        "no transitions = flagged trapped_or_orthogonal). Draws only on the swarm layout's "
+                        "reserve (--swarm-adaptive-reserve-fraction); without one every proposal is refused "
+                        "(no_reserve). Report epoch_NNN/cv2_resolution_report.json. Frozen decision rule.")
+    p.add_argument("--ap-coverage-min-windows", type=float, default=2.0,
+                   help="R2: a CV2 interval whose unbiased weight comes from fewer effective centres "
+                        "(1/sum p^2) is a hole. Uncalibrated default.")
+    p.add_argument("--ap-refine-min-transitions", type=int, default=10,
+                   help="R3: within-residence core-to-core CV2 transitions a bimodal window needs before "
+                        "its modes get windows. Uncalibrated default.")
+    p.add_argument("--ap-refine-pmf-sigma-kt", type=float, default=0.5,
+                   help="R2: block-bootstrap sigma (kT) of a CV2 interval's free energy above which it is a "
+                        "hole. Uncalibrated default.")
+    p.add_argument("--ap-refine-budget-fraction", type=_unit_interval_float, default=0.5,
+                   help="Largest share of the reserve's free slots (after add_rung) resolution actions may "
+                        "spend per epoch (spec 3.3: 0.5).")
+    p.add_argument("--ap-refine-protect-epochs", type=int, default=2,
+                   help="Epochs a window created by R1-R3 is protected from retirement and further "
+                        "refinement (spec 3.1: 2).")
+    p.add_argument("--ap-refine-min-sigma", type=float, default=0.1,
+                   help="Smallest target sampled CV2 sigma (CV2 units) of a new R1-R3 window. Uncalibrated "
+                        "default.")
     p.add_argument("--ap-topups", action=argparse.BooleanOptionalAction, default=False,
                    help="Top-ups (off by default): --no-ap-topups runs each scheduled phase as a single "
                         "all-state baseline only. --ap-topups adds, after that baseline, at most one "
@@ -1655,6 +1682,13 @@ def _shim_adaptive_production(args: argparse.Namespace) -> None:
     args.adaptive_production_discovery_census = args.ap_discovery_census
     args.adaptive_production_slow_mode_reseed_fraction = args.ap_slow_mode_reseed_fraction
     args.adaptive_production_edge_metric = args.ap_edge_metric
+    args.adaptive_production_cv2_resolution = args.ap_cv2_resolution
+    args.adaptive_production_coverage_min_windows = args.ap_coverage_min_windows
+    args.adaptive_production_refine_min_transitions = args.ap_refine_min_transitions
+    args.adaptive_production_refine_pmf_sigma_kt = args.ap_refine_pmf_sigma_kt
+    args.adaptive_production_refine_budget_fraction = args.ap_refine_budget_fraction
+    args.adaptive_production_refine_protect_epochs = args.ap_refine_protect_epochs
+    args.adaptive_production_refine_min_sigma = args.ap_refine_min_sigma
     args.adaptive_production_min_edge_neff = args.ap_min_edge_neff
     args.adaptive_production_topup_target_sigma = args.ap_topup_target_sigma
     args.adaptive_production_topup_weak_overlap = args.ap_topup_weak_overlap
