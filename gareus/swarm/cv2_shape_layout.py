@@ -299,7 +299,7 @@ def build_shape_pair_layout(*, cv1, z2, member_ids, deltav_kj, centers1, ks1, la
                    "min_mode_members": int(min_mode_members), "cv2_k_min": float(k_min), "cv2_k_max": float(k_max)})
     summary = {"n_columns": len(columns), "n_accepted_modes": [len(c.fit.accepted_components) for c in columns],
                "n_centres_per_column": [len(c.placement.centres) for c in columns],
-               "n_at_k_floor": [c.placement.n_at_k_floor for c in columns], "n_mode_axis_windows": len(modes),
+               "n_at_k_floor": [c.placement.n_at_k_floor for c in columns], "n_at_compression_floor": [c.placement.n_at_compression_floor for c in columns], "n_mode_axis_windows": len(modes),
                "n_granted": record.get("n_granted"), "n_dropped": record.get("n_dropped"),
                "sigma_w_target": sigma_t, "kind": layout.get("kind"), "warnings": _floor_warnings(columns, k_min)}
     return {"layout": layout, "centres2": centres2, "ks2": ks2, "record": record, "summary": summary}

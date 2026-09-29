@@ -58,14 +58,18 @@ def test_shoulder_mixture_gets_a_centre_at_the_narrow_mode(mu):
     assert np.all(np.diff(c) <= 1.5 * np.minimum(sig[:-1], sig[1:]) + 1e-9)
 
 
-def test_placement_steps_by_the_smallest_sampled_sigma_ahead():
-    """With shrinkage negligible (many members) the fill resolves the narrow mode at 1.5 x its width
-    and approaches it from the broad side without overshooting (min sigma over the step)."""
+def _narrow_mode_fit():
     from gareus.adaptive.cv2_shape import CV2MixtureFit, MixtureComponent
     comps = (MixtureComponent(0.0, 0.71 ** 2, 0.8, 10 ** 7, True, "accepted"),
              MixtureComponent(1.4, 0.15 ** 2, 0.2, 10 ** 7, True, "accepted"))
-    fit = CV2MixtureFit(comps, 2, {2: 0.0}, 1e-3, {}, 4, 10 ** 4, 10 ** 7, 1e4, 0.28, 0.8, 8)
-    pl = place_cv2_centres(fit, (-1.4, 2.0), sigma_w_target=0.7, temperature_k=T, k_min=1e-3, k_max=1000.0)
+    return CV2MixtureFit(comps, 2, {2: 0.0}, 1e-3, {}, 4, 10 ** 4, 10 ** 7, 1e4, 0.28, 0.8, 8)
+
+
+def test_placement_steps_by_the_smallest_sampled_sigma_ahead():
+    """Plain width rule (compression floor off), shrinkage negligible: the fill resolves the
+    narrow mode at 1.5 x its width and approaches it from the broad side without overshooting."""
+    pl = place_cv2_centres(_narrow_mode_fit(), (-1.4, 2.0), sigma_w_target=0.7, temperature_k=T, k_min=1e-3,
+                           k_max=1000.0, min_mean_compression=0.0)
     c, sig = np.asarray(pl.centres), np.asarray(pl.sampled_sigma)
     near = c[np.abs(c - 1.4) < 0.35]
     assert near.size >= 3
@@ -75,8 +79,27 @@ def test_placement_steps_by_the_smallest_sampled_sigma_ahead():
     i0 = int(np.argmin(np.abs(c)))
     assert np.diff(near).min() < 0.5 * np.diff(c)[i0]
     assert np.all(np.diff(c) <= 1.5 * np.minimum(sig[:-1], sig[1:]) + 1e-9)
-    assert pl.n_at_k_floor >= near.size                       # the narrow mode floors k2: recorded
+    assert pl.n_at_k_floor >= near.size                       # without the floor the narrow mode floors k2
+    assert pl.n_at_compression_floor == 0
     assert max(pl.mean_compression[i] for i, x in enumerate(c) if abs(x - 1.4) < 0.35) < 0.01
+
+
+def test_compression_floor_restrains_the_narrow_mode():
+    """Default floor: at the narrow mode k2 = F'' (window means move half-way to their centre),
+    so the sampled width there is sqrt(RT / 2F''), below the mode's own width, and no centre
+    is left at cv2_k_min."""
+    pl = place_cv2_centres(_narrow_mode_fit(), (-1.4, 2.0), sigma_w_target=0.7, temperature_k=T, k_min=1e-3,
+                           k_max=1000.0)
+    c, k2, f2 = np.asarray(pl.centres), np.asarray(pl.k2), np.asarray(pl.f2)
+    at = f2 > 0.5 * RT / 0.15 ** 2                          # centres governed by the narrow mode
+    assert np.all(np.abs(c[at] - 1.4) < 0.35)
+    assert pl.n_at_k_floor == 0
+    assert pl.n_at_compression_floor >= int(at.sum()) > 0
+    np.testing.assert_allclose(k2[at], f2[at], rtol=1e-9)
+    assert min(pl.mean_compression) >= 0.5 - 1e-12
+    np.testing.assert_allclose(np.asarray(pl.sampled_sigma)[at], np.sqrt(RT / (2 * f2[at])), rtol=1e-9)
+    assert np.all(np.asarray(pl.sampled_sigma)[at] < 0.15)
+    assert pl.as_record()["min_mean_compression"] == 0.5
 
 
 def test_single_gaussian_reproduces_a_uniform_equivalent_layout():
@@ -137,7 +160,12 @@ def test_f2_shrinks_toward_the_pooled_variance_and_is_floored():
 
 def test_shape_rule_k2_floor_and_clamp():
     assert shape_rule_k2(0.5, 1.0, T, 1e-3, 1000.0) == pytest.approx(RT / 0.25 - 1.0)
-    assert shape_rule_k2(0.5, 50.0, T, 0.1, 1000.0) == 0.1            # the landscape is stiffer: floor
+    assert shape_rule_k2(0.5, 50.0, T, 0.1, 1000.0, min_mean_compression=0.0) == 0.1   # width rule alone: floor
+    assert shape_rule_k2(0.5, 50.0, T, 0.1, 1000.0) == pytest.approx(50.0)          # compression floor: k2 = F''
+    assert shape_rule_k2(0.5, 50.0, T, 0.1, 1000.0, min_mean_compression=0.75) == pytest.approx(150.0)
+    assert shape_rule_k2(0.5, 50.0, T, 0.1, 20.0) == 20.0                            # cv2_k_max wins over the floor
+    with pytest.raises(ValueError):
+        shape_rule_k2(0.5, 1.0, T, 0.1, 1000.0, min_mean_compression=1.0)
     assert shape_rule_k2(1e-3, 0.0, T, 0.1, 1000.0) == 1000.0         # clamp at cv2_k_max
     assert predicted_sampled_sigma(1.0, 3.0, T) == pytest.approx(math.sqrt(RT / 4.0))
     assert predicted_sampled_sigma(0.0, 0.0, T) == math.inf

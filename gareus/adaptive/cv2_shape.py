@@ -16,8 +16,9 @@ Pieces (pure, NumPy only):
   mixture and R3's "depth >= 1 kT, both modes >= 10 %" test.
 * ``estimate_f2`` -- F''_est = RT / var, the component variance shrunk toward the pooled
   region variance with weight n/(n + 8); floored at 0.
-* ``shape_rule_k2`` -- k2 = RT/sigma_w^2 - F''_est, floored at cv2_k_min and clamped at
-  cv2_k_max (the CV1 curvature design rule of ``ladder_design.cv1_force_constants_from_curvature``
+* ``shape_rule_k2`` -- k2 = RT/sigma_w^2 - F''_est, raised to the mean-compression floor
+  (k2 >= F''_est x c/(1 - c), c = ``min_mean_compression``, default 0.5 -> k2 >= F''_est),
+  floored at cv2_k_min and clamped at cv2_k_max (the CV1 curvature design rule of ``ladder_design.cv1_force_constants_from_curvature``
   applied to CV2). The coupling gate (3.4) is the caller's job.
 * ``place_cv2_centres`` -- a mandatory centre at every accepted mode, then steps of
   ``spacing_sigma`` (1.5) x the SMALLEST predicted sampled sigma over [z, z + delta] (never the
@@ -26,10 +27,15 @@ Pieces (pure, NumPy only):
 Units: CV2 in its own (standardised) units; F'' and k2 in kcal/mol per CV^2, as the deployed
 k2; RT from ``ladder_design.R_KCAL_MOL_K``; depth in kT.
 
-Known limitation (recorded, not patched): the rule designs the sampled WIDTH only. Where
-F''_est >= RT/sigma_w^2 the spring floors at cv2_k_min and the window mean follows the mode,
-not the centre: the sampled means are compressed by k2/(k2 + F''), reported per centre as
-``mean_compression``.
+Mean-compression floor: the width rule alone designs the sampled WIDTH only. Where the
+landscape is already as narrow as the target (F''_est >= RT/sigma_w^2; chignolin_9's swarm:
+49 of 63 centres) it asks for no spring, and a window's sampled mean follows the mode, not
+its centre (means compressed by k2/(k2 + F'')). The floor keeps every window's mean at least
+``min_mean_compression`` of the way to its centre; the price is a narrower sampled width
+there (sqrt(RT/(2 F'')) at c = 0.5), so the placement steps more finely. Per centre the
+compression is reported as ``mean_compression``; ``n_at_compression_floor`` counts centres
+where the floor binds and ``n_at_k_floor`` those left at cv2_k_min (nominally restrained).
+``min_mean_compression = 0`` restores the plain width rule.
 """
 from __future__ import annotations
 
@@ -49,6 +55,7 @@ DEFAULT_MIN_MEMBER_WEIGHT = 3.0     # kernel-weighted frames a member needs to s
 DEFAULT_MIN_MEMBER_FRACTION = 0.2   # ...and this share of its own kernel-weighted frames
 DEFAULT_MAX_FRAMES = 5000           # deterministic stride subsample (swarm frames are ps apart)
 DEFAULT_MODE_MERGE_SIGMA = 0.5      # accepted modes closer than this x sampled sigma are one mode
+DEFAULT_MIN_MEAN_COMPRESSION = 0.5  # k2/(k2 + F'') floor: window means move >= half-way to their centre
 _LOG_2PI = math.log(2.0 * math.pi)
 
 
@@ -331,13 +338,25 @@ def estimate_f2(component_variance: float, pooled_variance: float, n_members: in
     return max(0.0, R_KCAL_MOL_K * float(temperature_k) / var)
 
 
-def shape_rule_k2(sigma_w_target: float, f2_est: float, temperature_k: float, k_min: float, k_max: float) -> float:
-    """k2 = RT/sigma_w^2 - F''_est (kcal/mol per CV^2), floored at ``k_min``, clamped at ``k_max``."""
+def compression_floor_k2(f2_est, min_mean_compression: float = DEFAULT_MIN_MEAN_COMPRESSION):
+    """Smallest k2 with k2/(k2 + F''_est) >= c: F''_est x c/(1 - c) (0 where F''_est <= 0)."""
+    c = float(min_mean_compression)
+    if not 0.0 <= c < 1.0:
+        raise ValueError(f"min_mean_compression must be in [0, 1), got {min_mean_compression!r}")
+    f2 = np.maximum(np.nan_to_num(np.asarray(f2_est, dtype=float), nan=0.0), 0.0)
+    return f2 * (c / (1.0 - c))
+
+
+def shape_rule_k2(sigma_w_target: float, f2_est: float, temperature_k: float, k_min: float, k_max: float, *,
+                  min_mean_compression: float = DEFAULT_MIN_MEAN_COMPRESSION) -> float:
+    """k2 = max(RT/sigma_w^2 - F''_est, F''_est c/(1 - c)) (kcal/mol per CV^2), floored at
+    ``k_min``, clamped at ``k_max`` (the clamp wins over the compression floor)."""
     sigma = float(sigma_w_target)
     if not (math.isfinite(sigma) and sigma > 0.0):
         raise ValueError(f"sigma_w_target must be finite and > 0, got {sigma_w_target!r}")
     f2 = float(f2_est) if math.isfinite(float(f2_est)) else 0.0
-    raw = R_KCAL_MOL_K * float(temperature_k) / sigma ** 2 - f2
+    raw = max(R_KCAL_MOL_K * float(temperature_k) / sigma ** 2 - f2,
+              float(compression_floor_k2(f2, min_mean_compression)))
     return float(min(float(k_max), max(float(k_min), raw)))
 
 
@@ -362,20 +381,25 @@ class CV2Placement:
     spacing_sigma: float
     n_at_k_floor: int
     dropped_modes: Tuple[dict, ...] = field(default_factory=tuple)
+    n_at_compression_floor: int = 0
+    min_mean_compression: float = DEFAULT_MIN_MEAN_COMPRESSION
 
     def as_record(self) -> dict:
         return {"centres": list(self.centres), "k2": list(self.k2), "f2": list(self.f2),
                 "sampled_sigma": list(self.sampled_sigma), "mean_compression": list(self.mean_compression),
                 "kinds": list(self.kinds), "envelope": list(self.envelope), "sigma_w_target": self.sigma_w_target,
                 "spacing_sigma": self.spacing_sigma, "n_at_k_floor": self.n_at_k_floor,
-                "dropped_modes": list(self.dropped_modes)}
+                "dropped_modes": list(self.dropped_modes), "n_at_compression_floor": self.n_at_compression_floor,
+                "min_mean_compression": self.min_mean_compression}
 
 
 class _ShapeModel:
     """F''(z) from the dominant accepted component at z (pooled when none), and sigma_s(z)."""
 
-    def __init__(self, fit: CV2MixtureFit, temperature_k, sigma_w_target, k_min, k_max, prior_members):
+    def __init__(self, fit: CV2MixtureFit, temperature_k, sigma_w_target, k_min, k_max, prior_members,
+                 min_mean_compression=DEFAULT_MIN_MEAN_COMPRESSION):
         self.t, self.sigma_t, self.k_min, self.k_max = float(temperature_k), float(sigma_w_target), k_min, k_max
+        self.min_c = float(min_mean_compression)
         self.comps = list(fit.accepted_components)
         self.f2_comp = np.array([estimate_f2(c.variance, fit.pooled_variance, c.n_members, temperature_k,
                                              prior_members=prior_members) for c in self.comps])
@@ -390,9 +414,12 @@ class _ShapeModel:
                                [c.weight for c in self.comps])
         return self.f2_comp[np.argmax(logp, axis=1)]
 
+    def width_k2(self, z) -> np.ndarray:
+        return R_KCAL_MOL_K * self.t / self.sigma_t ** 2 - self.f2(z)
+
     def k2(self, z) -> np.ndarray:
-        rt = R_KCAL_MOL_K * self.t
-        return np.clip(rt / self.sigma_t ** 2 - self.f2(z), self.k_min, self.k_max)
+        raw = np.maximum(self.width_k2(z), compression_floor_k2(self.f2(z), self.min_c))
+        return np.clip(raw, self.k_min, self.k_max)
 
     def sigma(self, z) -> np.ndarray:
         total = self.k2(z) + np.maximum(self.f2(z), 0.0)
@@ -434,6 +461,7 @@ def place_cv2_centres(fit: CV2MixtureFit, envelope: Tuple[float, float], *, sigm
                       temperature_k: float, k_min: float, k_max: float,
                       spacing_sigma: float = DEFAULT_SPACING_SIGMA, prior_members: float = DEFAULT_PRIOR_MEMBERS,
                       edge_fraction: float = 0.5, mode_merge_sigma: float = DEFAULT_MODE_MERGE_SIGMA,
+                      min_mean_compression: float = DEFAULT_MIN_MEAN_COMPRESSION,
                       n_grid: int = 33, max_centres: int = 500) -> CV2Placement:
     """CV2 centres for one CV1 window (spec 3.2): mandatory centres at accepted mode means
     inside ``envelope``, filled by greedy steps of ``spacing_sigma`` x min sigma_s over the step
@@ -445,7 +473,8 @@ def place_cv2_centres(fit: CV2MixtureFit, envelope: Tuple[float, float], *, sigm
     non-Gaussian bump) are one mode (``dropped_modes``, reason "merged"). k2, F'', sigma_s and
     the mean compression k2/(k2 + F'') are reported per centre."""
     lo, hi = float(min(envelope)), float(max(envelope))
-    model = _ShapeModel(fit, temperature_k, sigma_w_target, float(k_min), float(k_max), prior_members)
+    model = _ShapeModel(fit, temperature_k, sigma_w_target, float(k_min), float(k_max), prior_members,
+                        min_mean_compression)
     tol = 1e-9 * max(hi - lo, 1e-12)
     anchors, dropped = [], []
     for c in sorted(fit.accepted_components, key=lambda c: -c.weight):
@@ -469,15 +498,16 @@ def place_cv2_centres(fit: CV2MixtureFit, envelope: Tuple[float, float], *, sigm
         placed.extend(_walk(model, a, hi if last else anchors[i + 1][0], +1, to_edge=last, **walk))
     z = np.array([p[0] for p in placed])
     k2, f2, sig = model.k2(z), model.f2(z), model.sigma(z)
-    rt = R_KCAL_MOL_K * float(temperature_k)
-    floor = int(np.sum((rt / float(sigma_w_target) ** 2 - f2) < float(k_min)))
+    floor = int(np.sum(k2 <= float(k_min) * (1.0 + 1e-12)))
+    width = model.width_k2(z)
+    c_floor = int(np.sum((width < compression_floor_k2(f2, min_mean_compression)) & (k2 > float(k_min))))
     return CV2Placement(tuple(float(x) for x in z), tuple(float(x) for x in k2), tuple(float(x) for x in f2),
                         tuple(float(x) for x in sig), tuple(float(a / (a + max(b, 0.0))) if a + max(b, 0.0) > 0
                                                             else 1.0 for a, b in zip(k2, f2)),
                         tuple(p[1] for p in placed), (lo, hi), float(sigma_w_target), float(spacing_sigma), floor,
-                        tuple(dropped))
+                        tuple(dropped), c_floor, float(min_mean_compression))
 
 
-__all__ = ["CV2MixtureFit", "CV2Placement", "DEFAULT_MIN_MODE_MEMBERS", "DEFAULT_PRIOR_MEMBERS",
-           "DEFAULT_SPACING_SIGMA", "MixtureComponent", "estimate_f2", "fit_cv2_mixture", "mixture_logpdf",
+__all__ = ["CV2MixtureFit", "CV2Placement", "DEFAULT_MIN_MEAN_COMPRESSION", "DEFAULT_MIN_MODE_MEMBERS", "DEFAULT_PRIOR_MEMBERS",
+           "DEFAULT_SPACING_SIGMA", "MixtureComponent", "estimate_f2", "fit_cv2_mixture", "mixture_logpdf", "compression_floor_k2",
            "mode_depth", "mode_pair_resolvable", "place_cv2_centres", "predicted_sampled_sigma", "shape_rule_k2"]
