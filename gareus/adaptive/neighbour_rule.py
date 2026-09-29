@@ -17,12 +17,17 @@ the axis is normalised by the PAIR'S OWN scale
 
 the width of the difference x_a - x_b of two independent draws, one from each
 window. |c_a - c_b| / s_ab is then the separation of the two distributions in
-units of their combined spread, which is what their overlap depends on: for two
-Gaussians the overlap is a function of that ratio alone, whatever the two
-widths are. A global median width (today's `layout_neighbours`) instead makes
-a stiff window look far from everything and a soft one near to everything, and
-the arithmetic mean of the widths, or the larger one, is not the width of the
-difference. The per-axis ratios combine in quadrature:
+units of their combined spread, which is what their overlap mainly depends on.
+For equal widths the overlap is a function of that ratio alone; for unequal
+widths there is an extra width-ratio factor (1D Bhattacharyya coefficient
+BC = sqrt(2 sigma_a sigma_b / (sigma_a^2 + sigma_b^2)) exp(-d^2 / 4)) that can
+only LOWER the overlap at a given d, so the equal-width numbers below are an
+upper bound and a radius set from them errs toward inclusion (chignolin_9's
+most unequal CV1 pair, k 186 vs 520, has a prefactor ~0.94). A global median
+width (today's `layout_neighbours`) instead makes a stiff window (small
+sigma_w) look NEARER than it is and a soft one FARTHER, and the arithmetic mean
+of the widths, or the larger one, is not the width of the difference. The
+per-axis ratios combine in quadrature:
 
     d_ab = sqrt(sum over used axes of ((c_a - c_b) / s_ab)^2).
 
