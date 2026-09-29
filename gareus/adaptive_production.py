@@ -6716,7 +6716,8 @@ def _topup_plan_for_phase(args, epoch_dir: Path, registry: "WindowStateRegistry"
         return plan_topup(diag, state_ids_in_order=ids, neighbours=neighbours, rung_partners=rung_partners,
                           policy=policy, report_interval=interval, timestep_fs=timestep, n_gpus=n_gpus,
                           budget_hours=budget, correction=state["correction"],
-                          edge_attempts=state["edge_attempts"], effective_g=effective_g)
+                          edge_attempts=state["edge_attempts"], effective_g=effective_g,
+                          sample_interval=_sample_interval_steps(args))
     plan = _plan()
     if str(getattr(policy, "allocation_weight", "raw")) == "ess":     # X5; raw never estimates
         from .adaptive import effective_samples as _es
@@ -9293,6 +9294,17 @@ def _reassign_seeds_after_actions(seed_bank: Optional[Path], registry: WindowSta
         print(f"WARNING: state-aware seed assignment after this epoch's actions failed ({exc}); "
               f"states added this epoch may start from the generic seed pool")
         return None
+
+
+def _sample_interval_steps(args) -> int:
+    """MD steps between two sample rows of one replica (Parquet/CSV), i.e. what one raw sample
+    is worth. Same rule as ``production.run_gareus``'s ``distance_interval``:
+    ``distance_output_interval``, or when unset min(report_interval, exchange_interval)."""
+    dist = int(getattr(args, "distance_output_interval", 0) or 0)
+    if dist <= 0:
+        dist = min(int(getattr(args, "report_interval", 5000) or 5000),
+                   int(getattr(args, "exchange_interval", 0) or 0) or 10 ** 12)
+    return max(1, dist)
 
 
 def _require_phase_within_replica_cap(args, n_states: int, phase_dir: Path, label: str) -> None:
