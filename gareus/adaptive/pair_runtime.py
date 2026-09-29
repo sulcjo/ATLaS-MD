@@ -167,12 +167,18 @@ class AdaptiveCouplingGate:
                        f"(CV1 curvature fraction {before['fraction']:.3f} > {self.max_fraction})")
 
     def report(self) -> Dict[str, Any]:
+        # ``counts`` are the proposers' decisions; the applier (spec P2) re-gates every child it
+        # validates, with an ``apply: `` context, and those are counted apart so a proposed and
+        # then applied state is not counted twice.
         counts: Dict[str, int] = {}
+        apply_counts: Dict[str, int] = {}
         for r in self.records:
-            counts[r["status"]] = counts.get(r["status"], 0) + 1
+            target = apply_counts if str(r.get("context", "")).startswith("apply: ") else counts
+            target[r["status"]] = target.get(r["status"], 0) + 1
         return {"schema_version": "cv2_coupling_gate_v1", "pair": self.pair.as_record(),
                 "max_coupling_fraction": float(self.max_fraction), "cv2_k_min": float(self.k_min or 0.0),
-                "temperature_k": float(self.temperature_k), "counts": counts, "decisions": list(self.records)}
+                "temperature_k": float(self.temperature_k), "counts": counts, "apply_counts": apply_counts,
+                "decisions": list(self.records)}
 
 
 def gate_from_args(args, out_dir, policy, *, temperature_k: float) -> Optional[AdaptiveCouplingGate]:
