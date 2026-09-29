@@ -258,3 +258,26 @@ def test_hook_writes_an_in_memory_payload_holding_numpy_scalars(tmp_path):
     assert path is not None
     s = json.loads(path.read_text())
     assert s["states"][0]["sample_count"] == 1000 and s["counts"]["n_components"] == 1
+
+
+def test_write_final_combined_summary_is_what_the_report_row_discovers(tmp_path, capsys):
+    ap = _campaign(tmp_path)
+    path = crs.write_final_combined_summary(ap, _payload())
+    assert path == crs.default_json_path(ap, crs.FINAL_LABEL) and path.is_file()
+    s = json.loads(path.read_text())
+    assert s["label"] == crs.FINAL_LABEL and s["sources"]["report"] is None
+    assert (ap / "cv2_resolution_summary_final_combined_states.csv").is_file()
+    assert crs.write_final_combined_summary(ap, {"states": [{"state_id": "x"}]}) is None
+    assert "WARNING" in capsys.readouterr().out
+
+
+def test_final_combined_hook_only_inside_the_cv2_resolution_flag_block():
+    src = (Path(__file__).resolve().parents[1] / "gareus" / "adaptive_production.py").read_text()
+    hits = []
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.If) and "cv2_resolution" in ast.unparse(node.test):
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Call) and ast.unparse(sub.func) == "write_final_combined_summary":
+                    hits.append(ast.unparse(node.test))
+    assert hits == ["bool(policy.cv2_resolution)"]
+    assert src.count("write_final_combined_summary(") == 1

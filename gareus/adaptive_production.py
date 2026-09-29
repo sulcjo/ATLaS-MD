@@ -4367,6 +4367,10 @@ def collect_final_combined_diagnostics(
     attach_paired_cv(payload, paired, adaptive_dir / "adaptive_final_combined_diagnostics.json")
     attach_edge_metric(payload, policy, adaptive_dir)  # spec 3.1; no-op under the default metric
     write_json(adaptive_dir / "adaptive_final_combined_diagnostics.json", payload)
+    if bool(policy.cv2_resolution):
+        # Spec 3.7: the table the gareus_report "CV2 resolution" row reads. Never raises.
+        from .adaptive.cv2_resolution_summary import write_final_combined_summary  # noqa: PLC0415
+        write_final_combined_summary(adaptive_dir, payload)
     return payload
 
 

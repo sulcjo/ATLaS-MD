@@ -9,7 +9,9 @@ gets a valid summary; it just carries fewer numbers.
 
 Written only by the CLI (``python -m gareus.adaptive.cv2_resolution_summary <adaptive_dir>``)
 and, with ``--ap-cv2-resolution`` on, by the driver after each numbered epoch's apply
-(``write_epoch_summary``). With the flag off nothing is written unless the CLI is run.
+(``write_epoch_summary``) and after every final-combined collection
+(``write_final_combined_summary``, the file gareus_report grades). With the flag off nothing
+is written unless the CLI is run.
 
 Summary ``cv2_resolution_summary.json`` (schema ``cv2_resolution_summary_v1``)::
 
@@ -420,6 +422,26 @@ def write_epoch_summary(epoch_dir: Path, diagnostics: Mapping[str, Any]) -> Opti
         return None
 
 
+def write_final_combined_summary(adaptive_dir: Path, diagnostics: Mapping[str, Any]) -> Optional[Path]:
+    """Driver hook (``--ap-cv2-resolution`` only): the final-combined table that the
+    gareus_report "CV2 resolution" row reads, rewritten every time the final-combined
+    diagnostics are (so later extensions refresh it). No 3.3 report exists for the final
+    phase. Never raises."""
+    try:
+        adaptive_dir = Path(adaptive_dir)
+        reg = load_registry_rows(adaptive_dir)
+        summary = build_summary(diagnostics, None, label=FINAL_LABEL, registry_rows=reg,
+                                sources={"diagnostics": str(adaptive_dir / FINAL_DIAGNOSTICS), "report": None,
+                                         "registry": str(adaptive_dir / "state_registry.csv") if reg else None})
+        path = default_json_path(adaptive_dir, FINAL_LABEL)
+        write_summary(summary, path)
+        return path
+    except Exception as exc:  # reporting never kills a completed campaign phase
+        print(f"WARNING: final-combined CV2 resolution summary failed in {adaptive_dir} "
+              f"({type(exc).__name__}: {exc})")
+        return None
+
+
 def _one_line(summary: Mapping[str, Any]) -> str:
     c = summary["counts"]
     return (f"{summary['label']}: {c['n_states']} states ({c['n_cv2_restrained']} CV2-restrained, "
@@ -455,7 +477,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 __all__ = ["DEFINITIONS", "FINAL_LABEL", "SCHEMA_VERSION", "SUMMARY_NAME", "build_summary", "default_json_path",
            "discover_phases", "edge_record", "load_registry_rows", "main", "resolve_temperature", "sigma_w",
-           "state_record", "summarise", "write_epoch_summary", "write_summary"]
+           "state_record", "summarise", "write_epoch_summary", "write_final_combined_summary", "write_summary"]
 
 
 if __name__ == "__main__":
