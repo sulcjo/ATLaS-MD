@@ -175,6 +175,9 @@ def build_health_verdict(s: dict, min_neighbor_overlap: float = 0.30) -> dict:
     checks.append(_check_gamd(s))
     checks.append(_check_pmf_convergence(s))
     checks.append(_check_ladder_crosscheck(s))
+    cv2_row = _check_cv2_resolution(s, checks)
+    if cv2_row is not None:
+        checks.append(cv2_row)
 
     overall = overall_from_checks(checks)
 
@@ -781,6 +784,21 @@ def _check_pmf_convergence(s: dict) -> dict:
         return {"name": name, "status": PASS, "detail": f"converged by JS/RMSE tail test{tail_txt}"}
     return {"name": name, "status": CAUTION,
             "detail": f"NOT converged by JS/RMSE tail test{tail_txt}"}
+
+
+def _check_cv2_resolution(s: dict, checks: list) -> Optional[dict]:
+    """Spec 3.7 "CV2 resolution" row, graded by gareus.adaptive.cv2_resolution_grade (its
+    docstring states the rule) from a ``cv2_resolution_summary`` table: ``s['cv2_resolution']``
+    or a summary file under ``s['production_dir']``. None -- no row at all -- when there is
+    no such source, so a campaign without one keeps its verdict and table byte-identical."""
+    try:
+        from gareus.adaptive import cv2_resolution_grade as g
+    except ImportError:
+        return None
+    if g.summary_block(s) is None:
+        return None
+    conn_failed = any(c.get("name") == "Overlap connectivity" and c.get("status") == FAIL for c in checks)
+    return g.check_cv2_resolution(s, connectivity_failed=conn_failed)
 
 
 def _check_ladder_crosscheck(s: dict) -> dict:

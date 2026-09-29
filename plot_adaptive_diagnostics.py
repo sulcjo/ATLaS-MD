@@ -9,6 +9,7 @@ Generates:
   fig2_window_layout.png    -- window ellipses + sample counts
   fig3_topup_timeline.png   -- cumulative samples, step allocation, overlap
   fig4_topup_targeting.png  -- state participation matrix per topup round
+  fig5_state_coordinates.png -- states at explicit (c1, c2) per rung, CV2-resolution flags
 """
 
 import argparse
@@ -468,18 +469,8 @@ def fig_phase_coverage(phases: list[dict], state_reg: pd.DataFrame,
 
 # ── figure 2: window layout ───────────────────────────────────────────────────
 
-def fig_window_layout(state_reg: pd.DataFrame, phases: list[dict],
-                       stride: int, out_path: Path) -> None:
-    """Window ellipses on total-density background + sample count summary."""
-    if state_reg.empty:
-        print("[warn] state_registry empty", file=sys.stderr)
-        return
-
-    sig1 = _sigma(250.0)
-    sig2 = _sigma(100.0)
-    cv2_label = _secondary_cv_label(phases)
-
-    # total samples per state_id
+def _state_sample_counts(phases: list[dict]) -> dict[int, int]:
+    """Total samples per state_id over every phase (each phase's own window map)."""
     state_counts: dict[int, int] = {}
     for ph in phases:
         sp = ph["path"] / "samples"
@@ -490,6 +481,24 @@ def fig_window_layout(state_reg: pd.DataFrame, phases: list[dict],
         for ew, sid in ew2sid.items():
             cnt = int((df["window_id"] == ew).sum())
             state_counts[sid] = state_counts.get(sid, 0) + cnt
+    return state_counts
+
+
+def fig_window_layout(state_reg: pd.DataFrame, phases: list[dict],
+                       stride: int, out_path: Path,
+                       state_counts: dict[int, int] | None = None) -> None:
+    """Window ellipses on total-density background + sample count summary."""
+    if state_reg.empty:
+        print("[warn] state_registry empty", file=sys.stderr)
+        return
+
+    sig1 = _sigma(250.0)
+    sig2 = _sigma(100.0)
+    cv2_label = _secondary_cv_label(phases)
+
+    # total samples per state_id
+    if state_counts is None:
+        state_counts = _state_sample_counts(phases)
 
     # all-sample density
     cv1_all, cv2_all = [], []
@@ -591,6 +600,41 @@ def fig_window_layout(state_reg: pd.DataFrame, phases: list[dict],
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  saved {out_path}")
+
+
+# ── figure 5: states at their explicit coordinates (spec 3.7) ────────────────
+
+def fig_state_coordinates(state_reg: pd.DataFrame, state_counts: dict[int, int],
+                          out_path: Path, summary: dict | None = None,
+                          cv2_label: str = "CV2") -> Path | None:
+    """Every active state at its own (c1, c2), one panel per lambda rung.
+
+    Additive: fig2's heatmap assumes a regular grid (rounded centre pairs) and
+    stays as it was; this figure is the one that reads correctly for sparse and
+    shape-based 2D layouts. ``summary`` (a cv2_resolution_summary table) adds
+    the trapped_or_orthogonal rings, weak/unmeasured edges and the sampled-mean
+    placement on unrestrained axes (gareus.adaptive.state_grid_plot)."""
+    from gareus.adaptive.state_grid_plot import flagged_edges, render_state_grid, state_grid_points
+    if state_reg.empty:
+        return None
+    pts = state_grid_points(state_reg.to_dict("records"), state_counts, summary)
+    path = render_state_grid(pts, flagged_edges(summary), out_path, cv2_label=cv2_label)
+    if path is not None:
+        print(f"  saved {path}")
+    return path
+
+
+def _load_cv2_resolution_summary(ap_dir: Path) -> dict | None:
+    from gareus.adaptive.cv2_resolution_grade import find_summary
+    path = find_summary(ap_dir)
+    if path is None:
+        return None
+    try:
+        import json as _json
+        return _json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        print(f"[warn] unreadable {path} ({exc})", file=sys.stderr)
+        return None
 
 
 # ── figure 3: topup timeline + overlap ───────────────────────────────────────
@@ -873,7 +917,17 @@ def run_all(run_dir: Path, out_dir: Path, stride: int = 20,
         fig_phase_coverage(phases, state_reg, stride, out_dir / "adaptive_fig1_phase_coverage.png")
 
     print("[fig2] window layout …")
-    fig_window_layout(state_reg, phases, stride, out_dir / "adaptive_fig2_window_layout.png")
+    state_counts = _state_sample_counts(phases)
+    fig_window_layout(state_reg, phases, stride, out_dir / "adaptive_fig2_window_layout.png",
+                      state_counts=state_counts)
+
+    print("[fig5] state coordinates …")
+    try:   # additive figure: its failure must not cost figs 3-4
+        fig_state_coordinates(state_reg, state_counts, out_dir / "adaptive_fig5_state_coordinates.png",
+                              summary=_load_cv2_resolution_summary(ap_dir),
+                              cv2_label=_secondary_cv_label(phases))
+    except Exception as exc:
+        print(f"[warn] fig5 skipped ({type(exc).__name__}: {exc})", file=sys.stderr)
 
     print("[fig3] topup timeline …")
     fig_topup_timeline(state_reg, phases, ap_dir, out_dir / "adaptive_fig3_topup_timeline.png")

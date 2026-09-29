@@ -8995,6 +8995,9 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             if bool(policy.cv2_resolution):
                 from .adaptive.cv2_resolution_io import annotate_report_with_refusals  # noqa: PLC0415
                 annotate_report_with_refusals(epoch_dir, actions, _refused_actions)
+                # Spec 3.7: the epoch's CV2-resolution table beside the report. Never raises.
+                from .adaptive.cv2_resolution_summary import write_epoch_summary  # noqa: PLC0415
+                write_epoch_summary(epoch_dir, diagnostics)
         registry_paths = registry.save(adaptive_dir)
         if _post_action_registry is not None:
             # A recovered epoch's ``actions`` are the ledger's applied list; carry its refusals
