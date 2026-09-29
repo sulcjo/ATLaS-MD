@@ -149,8 +149,8 @@ def test_weights_act_as_a_cv1_kernel():
     assert not any(abs(c.mean - 1.4) < 0.1 for c in fit.accepted_components)
 
 
-def test_f2_shrinks_toward_the_pooled_variance_and_is_floored():
-    assert estimate_f2(0.01, 1.0, 8, T) == pytest.approx(RT / (0.5 * 0.01 + 0.5 * 1.0))
+def test_f2_shrinks_toward_the_pooled_precision_and_is_floored():
+    assert estimate_f2(0.01, 1.0, 8, T) == pytest.approx(RT * (0.5 / 0.01 + 0.5 / 1.0))
     assert estimate_f2(0.01, 1.0, 0, T) == pytest.approx(RT / 1.0)
     assert estimate_f2(0.01, 1.0, 10 ** 9, T) == pytest.approx(RT / 0.01, rel=1e-6)
     assert estimate_f2(float("nan"), 1.0, 8, T) == 0.0
@@ -300,3 +300,14 @@ def test_two_accepted_components_on_one_bump_are_one_mode():
     pl = place_cv2_centres(fit, (-1.5, 1.5), sigma_w_target=0.2, temperature_k=T, k_min=1e-3, k_max=1000.0)
     assert pl.kinds.count("mode") == 1 and -0.04 in pl.centres     # the heavier one is kept
     assert len(pl.dropped_modes) == 1 and pl.dropped_modes[0]["reason"].startswith("merged")
+
+
+
+def test_precision_shrinkage_keeps_a_small_narrow_mode_narrow():
+    """A 12-member mode of sd 0.15 inside a pooled sd 0.7 keeps most of its own curvature
+    (variance-space shrinkage widened it to a sampled sd ~0.4-0.56)."""
+    f2 = estimate_f2(0.15 ** 2, 0.7 ** 2, 12, T)
+    assert f2 == pytest.approx(RT * (0.6 / 0.15 ** 2 + 0.4 / 0.7 ** 2))
+    assert f2 > 0.5 * RT / 0.15 ** 2
+    k2 = shape_rule_k2(0.711, f2, T, 1e-3, 1000.0)
+    assert predicted_sampled_sigma(k2, f2, T) < 0.15

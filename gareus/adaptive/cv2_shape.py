@@ -14,8 +14,9 @@ Pieces (pure, NumPy only):
   accepted only when at least ``min_mode_members`` independent members support it.
 * ``mode_depth`` / ``mode_pair_resolvable`` -- free-energy depth (kT) between two modes of a
   mixture and R3's "depth >= 1 kT, both modes >= 10 %" test.
-* ``estimate_f2`` -- F''_est = RT / var, the component variance shrunk toward the pooled
-  region variance with weight n/(n + 8); floored at 0.
+* ``estimate_f2`` -- F''_est = RT x precision, the component precision (1/var) shrunk toward
+  the pooled region precision with weight n/(n + 8) (precision space, not the spec's variance
+  space); floored at 0.
 * ``shape_rule_k2`` -- k2 = RT/sigma_w^2 - F''_est, raised to the mean-compression floor
   (k2 >= F''_est x c/(1 - c), c = ``min_mean_compression``, default 0.5 -> k2 >= F''_est),
   floored at cv2_k_min and clamped at cv2_k_max (the CV1 curvature design rule of ``ladder_design.cv1_force_constants_from_curvature``
@@ -48,7 +49,7 @@ import numpy as np
 from gareus.swarm.ladder_design import R_KCAL_MOL_K
 
 DEFAULT_MIN_MODE_MEMBERS = 8
-DEFAULT_PRIOR_MEMBERS = 8           # shrinkage weight n / (n + 8) toward the pooled variance
+DEFAULT_PRIOR_MEMBERS = 8           # shrinkage weight n / (n + 8) toward the pooled precision
 DEFAULT_SPACING_SIGMA = 1.5         # neighbour spacing in predicted sampled sigma (spec 3.2)
 DEFAULT_REG_GRID = (1e-4, 1e-3, 1e-2, 3e-2)   # variance regularisation, x pooled variance
 DEFAULT_MIN_MEMBER_WEIGHT = 3.0     # kernel-weighted frames a member needs to support a mode
@@ -324,18 +325,22 @@ def mode_pair_resolvable(depth: dict, *, min_depth_kT: float = 1.0, min_weight: 
 
 def estimate_f2(component_variance: float, pooled_variance: float, n_members: int, temperature_k: float, *,
                 prior_members: float = DEFAULT_PRIOR_MEMBERS) -> float:
-    """F''_est = RT / var_s (kcal/mol per CV^2), var_s = w var_c + (1 - w) var_pool with
-    w = n/(n + prior_members). A non-finite pooled variance leaves the component's own; no
-    usable variance gives 0 (the floor: no curvature is assumed)."""
+    """F''_est = RT x prec_s (kcal/mol per CV^2), prec_s = w / var_c + (1 - w) / var_pool with
+    w = n/(n + prior_members): the PRECISION is shrunk toward the pooled one (user decision
+    2026-09-30; the spec's variance-space form let the broad pooled variance dominate and
+    widened narrow modes: 12 members, sd 0.15 -> sampled sd ~0.4-0.56). F'' is linear in the
+    precision, so this is shrinkage of the curvature itself. A non-finite pooled variance
+    leaves the component's own; no usable variance gives 0 (no curvature is assumed)."""
     vc, vp = float(component_variance), float(pooled_variance)
     if not (math.isfinite(vc) and vc > 0.0):
         return 0.0
     n = max(0.0, float(n_members))
-    w = n / (n + float(prior_members)) if (math.isfinite(vp) and vp > 0.0) else 1.0
-    var = w * vc + (1.0 - w) * (vp if (math.isfinite(vp) and vp > 0.0) else 0.0)
-    if not (math.isfinite(var) and var > 0.0):
+    pool_ok = math.isfinite(vp) and vp > 0.0
+    w = n / (n + float(prior_members)) if pool_ok else 1.0
+    prec = w / vc + ((1.0 - w) / vp if pool_ok else 0.0)
+    if not (math.isfinite(prec) and prec > 0.0):
         return 0.0
-    return max(0.0, R_KCAL_MOL_K * float(temperature_k) / var)
+    return max(0.0, R_KCAL_MOL_K * float(temperature_k) * prec)
 
 
 def compression_floor_k2(f2_est, min_mean_compression: float = DEFAULT_MIN_MEAN_COMPRESSION):
