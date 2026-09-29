@@ -45,7 +45,7 @@ from .store import SegmentRegistry
 from .extension_seeding import extension_parent_dirs
 from .adaptive.paired_cv import PairedCVCollector, attach_paired_cv
 from .adaptive.pair_runtime import GATE_REPORT_NAME, gate_from_args
-from .adaptive.edge_metric import attach_edge_metric, edge_is_weak_pairwise, edge_sort_overlap
+from .adaptive.edge_metric import GRAPH_EDGE_TYPES, attach_edge_metric, edge_is_weak_pairwise, edge_sort_overlap
 # Real-frame seed extraction lives in tica.py (a dependency-free leaf module)
 # so seeding.py can also use it for campaign-wide seed search without a
 # circular import - seeding.py -> production.py -> adaptive_production.py is
@@ -5115,6 +5115,15 @@ def propose_actions_from_diagnostics(
                 # retire_converged for the whole ladder.  Rung states are
                 # already safe from retirement: they gain no CV overlap credit,
                 # so state_max_overlap never reaches redundant_overlap for them.
+                continue
+            if str(edge.get("edge_type")) in GRAPH_EDGE_TYPES:
+                # Spec 3.1's appended graph edges (``neighbour``: any same-pattern pair
+                # within the P7a radius; ``spanning``) are graded, never actionable: they
+                # carry no CV1-marginal ``overlap`` (None by construction), and reading
+                # that None as "bad" marked both ends of every one of them, so
+                # --ap-edge-metric pairwise-mbar retired nothing (spec T2 bug 1).
+                # Retirement stays on the collector's geometry edges; an unmeasured
+                # GEOMETRY edge (no samples) still blocks, as before.
                 continue
             ov = edge.get("overlap")
             if ov is None or float(ov) < float(policy.target_overlap):

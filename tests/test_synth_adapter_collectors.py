@@ -165,11 +165,10 @@ def test_real_proposer_bridges_the_cv2_gap_only_under_pairwise(tmp_path):
     assert adds and all(0.0 < a[2][2] < 0.64 for a in adds)
 
 
-@pytest.mark.xfail(strict=True, reason="production bug found by T2: the 3.1 grading appends neighbour/"
-                   "spanning edges with overlap None, and the retire_converged loop marks both "
-                   "endpoints of any edge with overlap None as bad_touching, so --ap-edge-metric "
-                   "pairwise-mbar disables retirement entirely")
 def test_pairwise_metric_does_not_disable_retirement(tmp_path):
+    # Production bug found by T2 (fixed with P7b): the 3.1 grading appends neighbour/spanning
+    # edges with overlap None, and the retire_converged loop marked both endpoints of any edge
+    # with overlap None as bad_touching, so --ap-edge-metric pairwise-mbar disabled retirement.
     ls = LANDSCAPES["harmonic-bowl"]
     ws = [Window(float(c), 200.0, 0.0, 10.0) for c in np.linspace(0.3, 0.58, 8)]   # 0.04 apart, sigma_w 0.07
     rng = np.random.default_rng(7)
