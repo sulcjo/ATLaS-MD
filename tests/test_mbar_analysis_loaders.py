@@ -34,6 +34,26 @@ def test_npz_sample_count_open_prefers_step_key(tmp_path):
         assert _npz_sample_count_open(f) == 3
 
 
+def test_npz_window_count_open_does_not_read_matrix_payload(tmp_path):
+    npz_path = tmp_path / 'compressed.npz'
+    np.savez_compressed(
+        npz_path,
+        cv_A=np.arange(4, dtype=float),
+        umbrella_reduced_bias_nk=np.zeros((4, 3), dtype=float),
+    )
+    with np.load(npz_path, allow_pickle=False) as f:
+        original = f.zip.open
+        opened = []
+
+        def tracked(name, *args, **kwargs):
+            opened.append(name)
+            return original(name, *args, **kwargs)
+
+        f.zip.open = tracked
+        assert _npz_window_count_open(f, 4) == 3
+        assert 'umbrella_reduced_bias_nk.npy' in opened
+
+
 def test_arrays_wrapper_exposes_files_property():
     a = _Arrays({"cv_A": np.array([1.0])})
     assert a.files == ["cv_A"]

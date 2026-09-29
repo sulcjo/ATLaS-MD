@@ -12,7 +12,9 @@ from __future__ import annotations
 import csv
 import math
 import os
+import shutil
 import tempfile
+import atexit
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
@@ -21,6 +23,7 @@ import numpy as np
 
 from gareus.units import K_B_KJ_PER_MOL_K
 from .data import (Data, clean, infer_temp_beta, rjson, _fill_masked_nan,
+                   analysis_stride_keep_mask,
                    _epoch_run_manifest_secondary_cv_type)
 from .loaders_adaptive import (_find_adaptive_epoch_dirs, _phase_label,
                                _validate_and_repair_epoch_window_map,
@@ -61,6 +64,39 @@ def _spool_u_nk_blocks(blocks: list, directory: Path):
         del matrix
         path.unlink(missing_ok=True)
         raise
+    return matrix, path
+
+
+def _cleanup_memmap_file(path: Path) -> None:
+    try:
+        Path(path).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _materialize_block_files(block_paths: list[Path], rows: int, columns: int,
+                             directory: Path) -> tuple[np.memmap, Path]:
+    """Combine disk-backed per-epoch blocks without retaining them in RAM."""
+    fd, raw_path = tempfile.mkstemp(prefix='.adaptive-u-nk-', suffix='.dat', dir=directory)
+    os.close(fd)
+    path = Path(raw_path)
+    matrix = np.memmap(path, mode='w+', dtype=np.float64, shape=(rows, columns))
+    offset = 0
+    try:
+        for block_path in block_paths:
+            block = np.load(block_path, mmap_mode='r', allow_pickle=False)
+            end = offset + int(block.shape[0])
+            matrix[offset:end] = block
+            offset = end
+            del block
+        matrix.flush()
+    except Exception:
+        del matrix
+        _cleanup_memmap_file(path)
+        raise
+    for block_path in block_paths:
+        _cleanup_memmap_file(block_path)
+    atexit.register(_cleanup_memmap_file, path)
     return matrix, path
 
 
@@ -260,7 +296,8 @@ def _per_regime_bias_block(cv_epoch, step_epoch, beta, pc_e, pk_e, sc_e, sk_e,
 
 def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_workers: int = 4,
                                 epoch_ids: Optional[set[int]] = None,
-                                low_memory: bool = False) -> Data:
+                                low_memory: bool = False, analysis_stride: int = 1,
+                                analysis_stride_offset: int = 0) -> Data:
     """Load MBAR inputs from adaptive-production Parquet epoch data.
 
     Pools samples from all epoch run directories, remaps per-epoch window IDs to
@@ -340,6 +377,8 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
     all_v_pep = []; all_v_dih = []
     all_gamd_lambda_sample = []
     all_unk_blocks = []
+    u_nk_block_paths: list[Path] = []
+    u_nk_tmp_dir: Optional[Path] = None
     beta = float('nan')
     meta: dict = rjson(adaptive_dir.parent / 'run_manifest.json', {})
 
@@ -412,6 +451,15 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
         valid = remapped >= 0
         if not np.any(valid):
             continue
+        if low_memory and (analysis_stride > 1 or analysis_stride_offset > 0):
+            valid_idx = np.flatnonzero(valid)
+            stride_keep = analysis_stride_keep_mask(
+                samples['replica'][valid_idx], samples['step'][valid_idx],
+                np.full(valid_idx.size, _ei, dtype=np.int32),
+                analysis_stride, analysis_stride_offset)
+            valid[valid_idx[~stride_keep]] = False
+            if not np.any(valid):
+                continue
         # Filter first, cast second: avoids allocating a full-epoch-length
         # float64 transient that's then mostly discarded by [valid].
         cv_epoch = samples['cv1'][valid].astype(np.float64, copy=False)
@@ -499,7 +547,15 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
                 _reproj_declined[str(epoch_dir)] = _cov
         if block is None:
             block = _reconstruct_union_bias_block(cv_epoch, cv2_epoch, beta, pc_e, pk_e, sc_e, sk_e)
-        all_unk_blocks.append(block)
+        if low_memory:
+            if u_nk_tmp_dir is None:
+                u_nk_tmp_dir = Path(tempfile.mkdtemp(prefix='.adaptive-u-nk-blocks-', dir=adaptive_dir))
+            block_path = u_nk_tmp_dir / f'block_{len(u_nk_block_paths):06d}.npy'
+            np.save(block_path, block, allow_pickle=False)
+            u_nk_block_paths.append(block_path)
+            del block
+        else:
+            all_unk_blocks.append(block)
 
     if not all_cv:
         raise ValueError(f'No valid samples after window remapping in {adaptive_dir}')
@@ -521,13 +577,14 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
     pot_arr = np.concatenate(all_potential); del all_potential
     potential = pot_arr if np.any(np.isfinite(pot_arr)) else None
     if low_memory:
-        # np.concatenate temporarily holds both all epoch blocks and the pooled
-        # matrix. For chignolin_9 that peak is enough to trigger global OOM.
-        u_nk, _u_nk_path = _spool_u_nk_blocks(all_unk_blocks, adaptive_dir)
+        rows = sum(int(np.load(p, mmap_mode='r', allow_pickle=False).shape[0])
+                   for p in u_nk_block_paths)
+        columns = int(np.load(u_nk_block_paths[0], mmap_mode='r', allow_pickle=False).shape[1])
+        u_nk, _u_nk_path = _materialize_block_files(
+            u_nk_block_paths, rows, columns, adaptive_dir)
+        if u_nk_tmp_dir is not None:
+            shutil.rmtree(u_nk_tmp_dir, ignore_errors=True)
         del all_unk_blocks
-        # The live memmap keeps its file descriptor-backed mapping after unlink;
-        # do not leave an 11+ GiB staging file behind after analysis exits.
-        _u_nk_path.unlink(missing_ok=True)
     else:
         u_nk = np.concatenate(all_unk_blocks, axis=0); del all_unk_blocks
 
@@ -627,6 +684,12 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
                      '_epoch_source': epoch_src.tolist(),
                      'adaptive_epoch_run_dirs': [str(ed) for ed, _ in epoch_dirs],
                      '_epoch_source_run_dirs': list(epoch_source_dirs)})
+    if low_memory and isinstance(u_nk, np.memmap):
+        meta_out['_u_nk_temp_path'] = str(_u_nk_path)
+    if low_memory and (analysis_stride > 1 or analysis_stride_offset > 0):
+        meta_out['analysis_stride'] = int(analysis_stride)
+        meta_out['analysis_stride_offset'] = int(analysis_stride_offset)
+        meta_out['analysis_stride_applied_in_loader'] = True
     meta_out.update(_ladder_meta)
 
     _boost_dih_arg = boost_dih if np.any(np.isfinite(boost_dih)) else None

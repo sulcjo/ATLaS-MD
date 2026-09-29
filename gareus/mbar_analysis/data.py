@@ -338,6 +338,33 @@ def _sample_block_ids(d: 'Data') -> np.ndarray:
     return block_ids.reshape(-1).astype(np.int64)
 
 
+def analysis_stride_keep_mask(replica: np.ndarray, step: np.ndarray,
+                              epoch_source: Optional[np.ndarray] = None,
+                              stride: int = 1, offset: int = 0) -> np.ndarray:
+    """Return stride mask matching post-load per-block ordering semantics."""
+    replica = np.asarray(replica)
+    step = np.asarray(step)
+    if replica.shape != step.shape:
+        raise ValueError('replica and step must have identical shapes')
+    stride = max(1, int(stride or 1))
+    offset = max(0, int(offset or 0))
+    keep = np.zeros(replica.size, dtype=bool)
+    if epoch_source is None:
+        epoch_source = np.zeros(replica.size, dtype=np.int64)
+    epoch_source = np.asarray(epoch_source)
+    if epoch_source.shape != replica.shape:
+        raise ValueError('epoch_source must match replica shape')
+    keys = np.column_stack((epoch_source, replica))
+    for key in np.unique(keys, axis=0):
+        idx = np.flatnonzero((keys == key).all(axis=1))
+        order = idx[np.argsort(step[idx], kind='stable')]
+        if offset < order.size:
+            keep[order[offset::stride]] = True
+    if not np.any(keep):
+        raise ValueError(f'analysis stride/offset kept zero samples: stride={stride}, offset={offset}')
+    return keep
+
+
 def _skip_first_n_frames(d: Data, n: int) -> Data:
     """Drop first n samples per replica (sorted by step) for equilibration burn-in."""
     keep = np.ones(d.cv.size, dtype=bool)
@@ -366,16 +393,8 @@ def _apply_analysis_stride(d: Data, stride: int, offset: int = 0) -> Data:
     offset=max(0,int(offset or 0))
     if stride <= 1 and offset <= 0:
         return d
-    keep=np.zeros(d.cv.size,dtype=bool)
-    for rep in np.unique(d.replica):
-        idx=np.where(d.replica==rep)[0]
-        if idx.size == 0:
-            continue
-        order=idx[np.argsort(d.step[idx],kind='stable')]
-        if offset < order.size:
-            keep[order[offset::stride]]=True
-    if not np.any(keep):
-        raise ValueError(f'analysis stride/offset kept zero samples: stride={stride}, offset={offset}')
+    keep = analysis_stride_keep_mask(
+        d.replica, d.step, d.meta.get('_epoch_source'), stride, offset)
     before=int(d.cv.size)
     d.cv=d.cv[keep]; d.cv2=d.cv2[keep]; d.rg_A=d.rg_A[keep]
     d.window=d.window[keep]; d.replica=d.replica[keep]; d.step=d.step[keep]

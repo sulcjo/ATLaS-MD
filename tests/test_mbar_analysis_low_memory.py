@@ -3,6 +3,7 @@ import json
 import sys
 
 import pytest
+import numpy as np
 
 import analyze_gareus_mbar
 from gareus.mbar_analysis import loaders
@@ -14,6 +15,11 @@ sys.path.insert(0, str(Path(__file__).parent))
 def test_analyze_parser_exposes_low_memory_flag():
     args = analyze_gareus_mbar.parse_args(["run", "--low-memory"])
     assert args.low_memory is True
+
+
+def test_analyze_parser_exposes_memory_report_flag():
+    args = analyze_gareus_mbar.parse_args(["run", "--memory-report", "rss.jsonl"])
+    assert str(args.memory_report) == "rss.jsonl"
 
 
 def test_low_memory_adaptive_prefers_union_npz(tmp_path, monkeypatch, capsys):
@@ -93,6 +99,7 @@ def test_low_memory_parquet_does_not_start_parallel_executor(tmp_path, monkeypat
     data = parquet_loaders.load_parquet_adaptive_union(adaptive, low_memory=True)
 
     assert data.cv.tolist() == [1.0, 2.0]
+    assert isinstance(data.u_nk, np.memmap)
 
 
 def test_low_memory_block_spool_avoids_concatenate_peak(tmp_path):
@@ -108,3 +115,13 @@ def test_low_memory_block_spool_avoids_concatenate_peak(tmp_path):
         __import__('numpy').testing.assert_array_equal(matrix, __import__('numpy').vstack(blocks))
     finally:
         path.unlink(missing_ok=True)
+
+
+def test_early_stride_matches_post_load_semantics():
+    from gareus.mbar_analysis.data import analysis_stride_keep_mask
+
+    replica = np.array([0, 0, 1, 1, 0, 0, 1, 1])
+    step = np.array([20, 10, 20, 10, 30, 40, 30, 40])
+    epoch = np.array([0, 0, 0, 0, 1, 1, 1, 1])
+    keep = analysis_stride_keep_mask(replica, step, epoch, stride=2, offset=1)
+    assert np.flatnonzero(keep).tolist() == [0, 2, 5, 7]

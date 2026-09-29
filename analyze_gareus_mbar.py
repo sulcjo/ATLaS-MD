@@ -5176,7 +5176,12 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
     """
     out=Path(out); out.mkdir(parents=True,exist_ok=True); N,K=d.u_nk.shape; kbt_kj=1.0/d.beta; kbt_kcal=kbt_kj/KJ_PER_KCAL; warn=list(d.meta.get('load_notes',[]))
     if progress is not None: progress.step('analysis', f'loaded {N} samples across {K} windows from {d.source}')
+    _memory_reporter = getattr(args, '_memory_reporter', None)
+    if _memory_reporter is not None:
+        _memory_reporter.record('before_first_mbar')
     m=solve_mbar(d.u_nk,d.window, tol=float(getattr(args,'mbar_tol',1e-10)), progress=progress, backend=getattr(args,'mbar_backend','auto'), threads=getattr(args,'mbar_threads',0)); base_w=norm_logw(m['logw'])
+    if _memory_reporter is not None:
+        _memory_reporter.record('after_first_mbar')
     if progress is not None: progress.bar('analysis stages', 1, 6, 'MBAR solved', force=True)
     if not m['converged']: warn.append(f"MBAR solver did not fully converge: max_delta={m['max_delta']:.3e}")
     zero=np.where(m['n_k']==0)[0].tolist()
@@ -5695,6 +5700,8 @@ def parse_args(argv=None):
     p.add_argument('--load-workers', type=int, default=8, help='Number of parallel epoch-dir workers for adaptive parquet loading. Each opens its own DuckDB connection with (--duckdb-threads / --load-workers) threads. Set to 1 to disable parallelism.')
     p.add_argument('--low-memory', action='store_true',
                    help='Use low-memory adaptive loading: prefer the resolved union NPZ snapshot, or load Parquet epochs sequentially.')
+    p.add_argument('--memory-report', type=Path, default=None, metavar='PATH',
+                   help='Write best-effort RSS/swap checkpoints as JSONL.')
     # MBAR solver backend selection.  Choices include auto, explicit deterministic
     # solvers (lbfgs, numpy, anderson), Numba variants (numba, numba-anderson,
     # numba-diis), and sambar which performs a stochastic warm‑start before a
@@ -5875,23 +5882,36 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args=parse_args(argv)
+    from gareus.mbar_analysis.memory import MemoryReporter
+    memory_reporter = MemoryReporter(getattr(args, 'memory_report', None))
+    args._memory_reporter = memory_reporter
+    memory_reporter.record('startup')
     progress=Progress()
     progress.step('load', 'reading current ATLaS-MD outputs')
     _t0=time.time()
     epoch_ids = set(args.epochs) if args.epochs is not None else None
-    d=load_data(Path(args.input), Path(args.out) if args.out else None, args.analysis_source, no_augment=getattr(args,'no_adaptive_rounds',False), n_threads=getattr(args,'duckdb_threads',0), n_workers=getattr(args,'load_workers',8), epoch_ids=epoch_ids, low_memory=getattr(args, 'low_memory', False))
+    memory_reporter.record('source_selected')
+    d=load_data(Path(args.input), Path(args.out) if args.out else None, args.analysis_source, no_augment=getattr(args,'no_adaptive_rounds',False), n_threads=getattr(args,'duckdb_threads',0), n_workers=getattr(args,'load_workers',8), epoch_ids=epoch_ids, low_memory=getattr(args, 'low_memory', False), analysis_stride=getattr(args, 'analysis_stride', 1), analysis_stride_offset=getattr(args, 'analysis_stride_offset', 0))
+    memory_reporter.record('source_loaded')
+    memory_reporter.record('after_u_nk_write')
     if getattr(args,'skip_first_n_frames',0)>0:
         n_before=d.cv.size
         d=_skip_first_n_frames(d,args.skip_first_n_frames)
+        memory_reporter.record('after_clean')
         print(f'  [skip-first-n-frames] dropped {n_before-d.cv.size} samples ({args.skip_first_n_frames} per replica)')
-    if getattr(args,'analysis_stride',1)>1 or getattr(args,'analysis_stride_offset',0)>0:
+    if (getattr(args,'analysis_stride',1)>1 or getattr(args,'analysis_stride_offset',0)>0) and not d.meta.get('analysis_stride_applied_in_loader'):
         n_before=d.cv.size
         d=_apply_analysis_stride(d,args.analysis_stride,args.analysis_stride_offset)
+        memory_reporter.record('after_stride')
+    else:
+        memory_reporter.record('after_clean')
+        memory_reporter.record('after_stride')
         print(f'  [analysis-stride] kept {d.cv.size}/{n_before} samples (stride={args.analysis_stride}, offset={args.analysis_stride_offset})')
     print(f'  [load] {d.cv.size} samples in {time.time()-_t0:.1f}s')
     progress.done('load', f'{d.cv.size} samples')
     _t1=time.time()
     s=analyze(d,args,progress=progress)
+    memory_reporter.close()
     print(f'  [analyze] total {time.time()-_t1:.1f}s')
     # Adaptive-production diagnostic plots (epoch/topup phase-space, window layout, overlap)
     if getattr(d,'prod_dir',None) is not None and Path(d.prod_dir).name=='adaptive_production' and not getattr(args,'no_adaptive_diag',False):
