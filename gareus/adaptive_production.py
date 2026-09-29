@@ -2355,8 +2355,6 @@ def build_geometry_edges(
 
 
 GEOMETRY_LINK_EDGE_TYPE = "pattern_link"
-# Geometry edge types that carry a spatial gap the bridge proposer may act on.
-WEAK_ELIGIBLE_GEOMETRY_EDGE_TYPES = ("primary_chain", "secondary_chain", "nearest_2d", "geometry", "segmented")
 _GEOMETRY_RANK_TEMPERATURE_K = 300.0   # ranking only; same-pattern distances scale as 1/sqrt(T)
 _GEOMETRY_CENTRE_DECIMALS = 6          # row/column identity, as layout_neighbours / the 2D window map
 
