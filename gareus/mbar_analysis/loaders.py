@@ -1015,19 +1015,58 @@ def check_union_npz_window_map_provenance(ap_dir: Path) -> list:
     return notes
 
 
+def _union_npz_older_than_samples(prod: Path, union_npz: Path) -> Optional[str]:
+    """First sample file newer than the union NPZ snapshot, or None.
+
+    The snapshot records no list of the phases it pooled, so modification times are the
+    only evidence; a copy that rewrites mtimes can only make this fire spuriously, which
+    falls back to the (correct, slower) Parquet path -- never to a stale snapshot.
+    chignolin_9: the snapshot predates final_extension_001's last segments.
+    """
+    try:
+        t = union_npz.stat().st_mtime
+        for f in prod.glob('*/samples/**/*.parquet'):
+            if f.stat().st_mtime > t:
+                return str(f.relative_to(prod))
+        for f in prod.glob('*/*/samples/**/*.parquet'):
+            if f.stat().st_mtime > t:
+                return str(f.relative_to(prod))
+    except OSError:
+        return None
+    return None
+
+
 def load_data(inp: Path, out: Optional[Path], source: str = 'auto', no_augment: bool = False,
               n_threads: int = 0, n_workers: int = 4,
-              epoch_ids: Optional[set[int]] = None) -> Data:
+              epoch_ids: Optional[set[int]] = None,
+              low_memory: bool = False) -> Data:
     prod=prod_dir_of(inp)
     # Adaptive-production: prefer new Parquet epoch data, fall back to legacy NPZ.
     if prod.name == 'adaptive_production':
+        union_npz = prod / 'adaptive_union_mbar.npz'
+        _stale = _union_npz_older_than_samples(prod, union_npz) if (low_memory and epoch_ids is None
+                                                                    and union_npz.exists()) else None
+        if _stale:
+            print(f'    WARNING [load] --low-memory: adaptive_union_mbar.npz is older than {_stale} '
+                  '(a phase ran on after the snapshot); loading Parquet sequentially instead')
+        if low_memory and epoch_ids is None and union_npz.exists() and not _stale:
+            prov_notes = check_union_npz_window_map_provenance(prod)
+            d = load_union_npz(prod)
+            print('    [load] low-memory adaptive_union_mbar.npz snapshot')
+            for _n in prov_notes:
+                print(f'    {_n}')
+            if prov_notes:
+                d.meta['load_notes'] = list(d.meta.get('load_notes') or []) + prov_notes
+            if out is not None: d.out_dir = Path(out)
+            return d
         has_registry = (prod / 'final_registry_used_for_mbar.csv').exists() or (prod / 'state_registry.csv').exists()
         has_epoch_parquet = has_registry and any(prod.glob('*/samples/**/*.parquet'))
         if not has_epoch_parquet:
             has_epoch_parquet = bool(_find_adaptive_epoch_dirs(prod, epoch_ids=epoch_ids))
         if has_epoch_parquet:
             d = load_parquet_adaptive_union(
-                prod, n_threads=n_threads, n_workers=n_workers, epoch_ids=epoch_ids)
+                prod, n_threads=n_threads, n_workers=n_workers, epoch_ids=epoch_ids,
+                low_memory=low_memory)
         elif (prod / 'adaptive_union_mbar.npz').exists():
             if epoch_ids is not None:
                 raise ValueError(
