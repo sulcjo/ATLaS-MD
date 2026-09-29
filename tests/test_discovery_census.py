@@ -298,3 +298,38 @@ def test_run_census_strides_are_recorded_and_applied(tmp_path):
     assert res["ca_clusters"]["phases"][0]["frames"] == 2
     assert res["definitions"]["basin_strings"]["frame_stride"] == 4
     assert res["definitions"]["ca_clusters"]["frame_stride"] == 10
+
+
+# --------------------------------------------------------------------------- driver wiring
+
+def test_ap_discovery_census_flag_and_shim(tmp_path):
+    from gareus.cli import parse_args
+    on = parse_args(["--seq", "GYDPETGTWG", "--out", str(tmp_path), "--ap-discovery-census"])
+    assert on.adaptive_production_discovery_census is True
+    off = parse_args(["--seq", "GYDPETGTWG", "--out", str(tmp_path)])
+    assert off.adaptive_production_discovery_census is False
+
+
+def test_census_for_epoch_never_raises(tmp_path, capsys):
+    assert dc.census_for_epoch(tmp_path / "missing", tmp_path) is None
+    assert "WARNING: discovery census failed" in capsys.readouterr().out
+
+
+def test_census_for_epoch_writes_epoch_json(tmp_path):
+    rng = np.random.default_rng(2)
+    ad = tmp_path / "adaptive_production"
+    _write_phase(ad, "epoch_000", [[_frames_for(["AA"] * 4, rng)]], _topology(4))
+    path = dc.census_for_epoch(ad, ad / "epoch_000", basin_stride=1, cluster_stride=1)
+    assert path == str(ad / "epoch_000" / "discovery_census.json")
+    assert json.loads(Path(path).read_text())["reference_free"] is True
+
+
+def test_driver_hook_is_gated_and_after_epoch_diagnostics():
+    import inspect
+    from gareus import adaptive_production as ap
+    src = inspect.getsource(ap.run_adaptive_production_auto_loop)
+    i_hook = src.index('_arg_bool(args, "adaptive_production_discovery_census", False)')
+    assert src.index("census_for_epoch(adaptive_dir, epoch_dir)") > i_hook
+    assert i_hook > src.index("diagnostics = collect_segmented_epoch_diagnostics(epoch_dir, registry, policy)")
+    assert i_hook < src.index("propose_actions_from_diagnostics(")
+    assert "adaptive_production_discovery_census" not in "".join(ap.DECISION_SETTINGS_FIELDS)
