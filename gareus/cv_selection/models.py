@@ -60,11 +60,30 @@ class ResidualFit:
     #: (degree 1) or "hard_clip" to ``anchor_clamp`` (degree 2). Fitting, scoring, design, the
     #: force and every evaluator use the same T (spec F02; finding I04).
     transform: str = "identity"
+    #: Per component (index j-1): C.COMPONENT_FAMILY_PCA or C.COMPONENT_FAMILY_TICA, and for a
+    #: conditional tICA mode its lag (frames) and eigenvalue. Empty means every component is PCA.
+    families: tuple = ()
+    tica_lag_frames: tuple = ()
+    tica_eigenvalues: tuple = ()
 
     def __post_init__(self):
         expected = "hard_clip" if int(self.degree) == 2 else "identity"
         if self.transform != expected:
             object.__setattr__(self, "transform", expected)
+        k = int(np.asarray(self.right_vectors).shape[0])
+        if not self.families:
+            object.__setattr__(self, "families", (C.COMPONENT_FAMILY_PCA,) * k)
+        if not self.tica_lag_frames:
+            object.__setattr__(self, "tica_lag_frames", (None,) * k)
+        if not self.tica_eigenvalues:
+            object.__setattr__(self, "tica_eigenvalues", (None,) * k)
+        if not len(self.families) == len(self.tica_lag_frames) == len(self.tica_eigenvalues) == k:
+            raise ValueError("per-component family metadata must have one entry per component")
+        for fam, lag, ev in zip(self.families, self.tica_lag_frames, self.tica_eigenvalues):
+            if fam == C.COMPONENT_FAMILY_TICA and (lag is None or ev is None):
+                raise ValueError("a conditional tICA component needs its lag and eigenvalue")
+            if fam == C.COMPONENT_FAMILY_PCA and (lag is not None or ev is not None):
+                raise ValueError("a residual PC carries no tICA lag or eigenvalue")
 
     @property
     def n_components(self) -> int:
@@ -92,7 +111,7 @@ def _normalised_weights(weights, n: int) -> np.ndarray:
 
 
 def fit_residual_components(X, anchor, *, degree: int = 1,
-                            n_components: int = C.MAX_COMPONENT_INDEX,
+                            n_components: int = C.MAX_PCA_COMPONENTS,
                             weights=None) -> ResidualFit:
     X = np.asarray(X, dtype=np.float64)
     a = np.asarray(anchor, dtype=np.float64)
@@ -198,6 +217,22 @@ def _tie_flags(singular: np.ndarray) -> list[bool]:
     return flags
 
 
+def _family_tie_flags(fit: ResidualFit) -> list[bool]:
+    """Tie flags within each family: PCA by singular value (as before), conditional tICA by
+    implied rate -ln(eigenvalue), relative to the larger of the pair."""
+    flags = [False] * fit.n_components
+    pca = [j for j in range(fit.n_components) if fit.families[j] == C.COMPONENT_FAMILY_PCA]
+    for j, f in zip(pca, _tie_flags(np.asarray(fit.singular_values)[pca])):
+        flags[j] = f
+    tica = [j for j in range(fit.n_components) if fit.families[j] == C.COMPONENT_FAMILY_TICA]
+    rates = [-np.log(min(max(float(fit.tica_eigenvalues[j]), 1e-300), 1.0 - 1e-15)) for j in tica]
+    for pos, j in enumerate(tica):
+        near = [abs(rates[pos] - rates[q]) / max(rates[pos], rates[q]) for q in (pos - 1, pos + 1)
+                if 0 <= q < len(tica)]
+        flags[j] = bool(near) and min(near) < _TIE_FRACTION
+    return flags
+
+
 def to_candidate_set(fit: ResidualFit, feature_schema: C.FeatureSchema,
                      primary_definition: Mapping[str, Any], physical_system_sha256: str,
                      training_rows_sha256: str, library_versions: Mapping[str, str],
@@ -205,10 +240,13 @@ def to_candidate_set(fit: ResidualFit, feature_schema: C.FeatureSchema,
     """Freeze the fit as the v2 contract artifact every later stage reads (declared basis)."""
     if fit.width != feature_schema.width:
         raise ValueError(f"fit width {fit.width} != feature schema width {feature_schema.width}")
-    ties = _tie_flags(fit.singular_values)
+    ties = _family_tie_flags(fit)
     components = []
     for j in range(1, fit.n_components + 1):
-        components.append({
+        extra = ({} if fit.families[j - 1] == C.COMPONENT_FAMILY_PCA else
+                 {"family": fit.families[j - 1], "tica_lag_frames": int(fit.tica_lag_frames[j - 1]),
+                  "tica_eigenvalue": float(fit.tica_eigenvalues[j - 1])})
+        components.append({**extra,
             "component_index": j,
             "singular_value": float(fit.singular_values[j - 1]),
             "eigenvalue_tie_flagged": ties[j - 1],
@@ -255,6 +293,9 @@ def from_candidate_set(candidates: C.CandidateSet) -> ResidualFit:
         projection_std=np.asarray([c.projection_std for c in comps], dtype=np.float64),
         degree=degree,
         transform=str(candidates.basis_transform["kind"]),
+        families=tuple(c.family for c in comps),
+        tica_lag_frames=tuple(c.tica_lag_frames for c in comps),
+        tica_eigenvalues=tuple(c.tica_eigenvalue for c in comps),
     )
 
 

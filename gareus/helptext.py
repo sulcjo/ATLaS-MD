@@ -2137,6 +2137,43 @@ spanning a genuine gap is routed as structural, an intact layout's matching
 edge is not) passes 20/20.  The honest summary is that top-ups are not shown
 to help in this harness; a real-MD comparison (chignolin_10, not yet run) is
 the actual test.
+
+20. Adaptive lambda ladder
+--------------------------
+Off by default (``--ap-ladder-adapt off``).  With ``--ap-ladder-adapt respace``
+(YAML ``ap_ladder_adapt: respace``) the interior Pep-GaMD rungs are re-placed
+between numbered epochs so every adjacent rung pair overlaps at least
+``--ap-ladder-min-overlap`` (default 0.25, pairwise MBAR scale 0..0.5), judged
+on a low quantile over umbrella centres (``--ap-ladder-overlap-quantile``,
+default 0.10).  lambda = 0 and the top rung are never moved or dropped.
+
+How it decides: at one umbrella centre the rungs differ only in boost
+strength, so each sample's reduced energy at ANY lambda is recomputed from its
+stored ``v_pep``/``v_dih`` and the frozen envelope.  A small MBAR over that
+centre's rungs predicts the overlap between any two lambda values, sampled or
+not.  The designer finds the fewest rungs meeting the minimum, then spaces them
+so the adjacent overlaps are equal.  A change of at most ``--ap-ladder-max-moves``
+interior rungs (default 2) is applied atomically at the epoch boundary (new
+rungs are new states; retired rung states keep their samples in the union
+MBAR); it replaces the weak-edge ``add_rung`` proposer.  The settings are
+frozen in ``adaptive_production/ladder_adapt_settings.json`` at first use;
+``--ap-ladder-adapt-override`` replaces them.  Each epoch writes
+``epoch_NNN/ladder_adapt_report.json``.
+
+    --ap-ladder-adapt {off,respace}   off by default
+    --ap-ladder-min-overlap 0.25      minimum adjacent-rung overlap
+    --ap-ladder-overlap-quantile 0.1  quantile over centres that must meet it
+    --ap-ladder-max-moves 2           interior rungs moved per epoch
+    --ap-ladder-max-rungs 8           largest ladder designed
+    --ap-ladder-hysteresis 0.03       improvement worth a respace of a good ladder
+    --ap-ladder-min-ess 200           reweighting ESS a centre needs to predict a lambda
+
+Read-only replay on a finished campaign:
+    python -m gareus.adaptive.ladder_adapt replay RUNS/<run>/adaptive_production \\
+        --phases final/baseline --target 0.25
+On chignolin_9 it reproduces the union MBAR rung overlaps (0.244/0.272/0.404
+predicted vs 0.243/0.272/0.402) and proposes [0, 0.175, 0.47, 1] (10th-percentile
+overlaps 0.281/0.281/0.286, from 0.209/0.248/0.396).
 """
 
 

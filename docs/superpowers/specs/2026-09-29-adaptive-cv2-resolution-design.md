@@ -1,0 +1,506 @@
+# ATLaS-MD: adaptive machinery that sees and resolves CV2
+
+Status: proposed specification, v0.4 -- revised after a three-way adversarial review
+(code grounding, statistics/physics, failure modes; Section 9) and a small-board review
+(ACCEPT-WITH-CHANGES, 2-1; conditions folded into the body, record in Section 10), a
+self-verification pass (Section 11) and exploration optimizations (Section 12). Date: 2026-09-29.
+Branch: `feat/cv2-conditional-tica` (builds on the conditional-tICA CV2 selection there).
+Code references are to that branch's working tree; line numbers drift.
+
+## 1. Problem
+
+The CV2 selector can now choose a slow, bimodal CV2. The layout and adaptive layers were built
+for a fast, uniformly gridded one:
+
+| Stage | Current behaviour | Evidence |
+|---|---|---|
+| Swarm layout, CV2 centres | one global `linspace` between rung-reweighted 2/98 % quantiles | `ladder_design.py:556-586` |
+| Swarm layout, k2 | per-gap rule `RT/(spacing/1.5)^2`, uniform in practice because the centres are a linspace (chignolin_9: 1.18 everywhere) | `ladder_design.py:589-604` |
+| Sparse layout | joint cells chosen along a fixed index diagonal; at CV1 >= 0.82 chignolin_9 has CV2 rows +0.28 and +1.35 only | `ladder_design.py:465-481` |
+| Layout headroom | the layout fills `max_replicas` exactly (chignolin_9: 236/236 active, 0 adaptive adds); no slot is ever free for an adaptive state | `ladder_design.py:462-481` |
+| Adaptive edge overlap | CV1-sample histogram in all four places it is computed (`_build_edge_diagnostics`, the segmented pooling that scheduled epochs use, the final combined collector, `_non_neighbor_redundant_pairs`); CV2 gaps invisible unless exchange acceptance < 0.08 | `adaptive_production.py:2139, 6131-6142, 6222-6226, 2309-2369` |
+| Local CV2 resolution | for a residual CV2 no action adds CV2 resolution or stiffens k2: bridges interpolate k between endpoints; `split` has no producer; the one k2-stiffening path (`_propose_tica_coverage_actions`) runs only after a tICA refit | `adaptive_production.py:4878-4909, 7278, 2687-2860` |
+| Coupling CV2 -> CV1 | gated at selection (k2_ref 1.0 vs the global k1 ceiling); at swarm layout only a warning at the maximum deployed k2 (CV1 width shrink > 10 %); adaptive k2 never checked | `select_pair.py:161-167`, `analyze.py:682-687` |
+| Replica cap | adaptive additions unchecked; production truncates the window list with a print, after the window-map repair, so truncated windows keep map rows | `production.py:6716, 6730-6750` |
+| Labels / refits | sidecar always writes `residual-torsion-pc`; an opt-in tICA refit (or a resumed recorded switch) would overwrite residual CV2 centres | `analyze.py:749`, `adaptive_production.py:3018, 2558-2575, 7679-7690` |
+
+Motivation (computed in-session, not stored as an artifact): re-running the new selector on
+chignolin_9's swarm picks conditional tICA component 7 (psi(P4) 0.32 + psi(D3) 0.13). On
+chignolin_9 production frames (sampled under the deployed PC1 restraint, so biased), native
+D3N-T8O H-bond frames (analysis-only label) sit at CV1 > 0.75 in a narrow band of that
+coordinate (0.44 +/- 0.15) against +/- 0.56 for all high-CV1 frames. The deployed layout would
+give such a band two windows of width 0.71 and has no way to notice.
+
+## 2. Objectives, non-goals, invariants
+
+Objectives: (O1) every CV2 gap is measured, on one metric, and can trigger action; (O2) CV2
+windows are designed from the local free-energy shape per CV1 region, with explicit budget;
+(O3) where evidence says CV2 is under-resolved, the campaign can add resolution within a
+reserved budget; (O4) no deployed or adaptive k2 breaks the CV1 overlap design; (O5) no state
+is silently dropped and no campaign is bricked by a cap check; (O6) artifacts say what CV2 is.
+
+Non-goals: selecting CV2; any native information; kinetics; CV1 definitions; the lambda
+envelope; multiple CV2s (auxiliary-CV spec).
+
+Invariants: no native information in any decision; a state_id's Hamiltonian never changes (any
+centre/k change creates a new state_id -- asserted); changes only at epoch boundaries; every
+state change goes through the registry and the phase window-map funnel
+(`_write_phase_window_map`) with its no-clobber vetoes; retired states stay in the union MBAR
+with their native per-epoch parameters; campaign method settings are frozen at campaign start
+(Section 3.0 P8); fail closed on missing provenance, never on a running campaign's resume.
+
+## 3. Design
+
+### 3.0 Prerequisites (no behaviour change on their own)
+
+- **P1 Layout headroom.** `--swarm-adaptive-reserve-fraction` (0 until O3 is enabled): the
+  swarm layout leaves that fraction of `max_replicas` unfilled, recorded in `layout_plan.json`.
+  Without headroom O3 is unreachable on ladder layouts (retirement is inert under a ladder).
+  The default is set from T3's cap-ignoring dry-run (95th percentile of per-epoch need, plus
+  the immediate-bridge case of 3.3 R1); 0.15 is a placeholder. On a 4-rung ladder the reserve
+  buys few centres (0.15 x 236 = 35 states = 8 centres), so Section 12 X1 (rung reallocation)
+  is the preferred source of headroom. Within the reserve, add_rung may take at most 1/3 of
+  the free slots per epoch; resolution actions at most 1/2 of what remains.
+- **P2 Split/insert applier rewrite.** Resolve the whole centre (all rungs) via the centre
+  key; refuse if any member is an anchor or axis state (structural: k1 = 0 or k2 = 0) or
+  mandatory; validate every child first (duplicate check, `_clamp_secondary_k`, coupling
+  3.4, budget 3.5); only then add children on every rung and, where the action retires,
+  retire every rung of the parent. One atomic unit for budgeting and for the ledger (P3).
+  `_adaptive_production_converged` treats split/refine as blocking convergence.
+- **P3 Applied-actions ledger and resume idempotence.** Write
+  `epoch_NNN/actions_applied.json` (actions, post-apply registry digest) atomically with the
+  registry save, and keep `state_registry_pre_epoch_NNN.json`. On resume, an epoch with an
+  applied-actions file never re-proposes; its diagnostics use the pre-action snapshot. This
+  also closes the existing hazard for adds (kill between `registry.save` and the summary
+  write re-enters epoch N with states its window map does not have).
+- **P4 CV2 data in every collector.** Both epoch collectors and the final combined collector
+  keep paired (CV1, CV2) samples per state (or, for memory, paired per-state subsamples plus
+  moments up to fourth order) and the per-state restraint parameters; the segmented pooling no
+  longer overwrites edge overlap with a CV1-only value.
+- **P5 Pair-model threading.** The adaptive driver loads the frozen candidate set and pair
+  model (`args.secondary_cv_candidate_set`, restored on resume) and rebuilds the fit with
+  `from_candidate_set`. Only for `residual-torsion-pc` with a bound, digest-verified model;
+  otherwise coupling is recorded `NA` and nothing is blocked.
+- **P6 Restraint-aware identity.** Every centre key (`_centre_group_key`,
+  `has_near_duplicate`, `ladder_overlap` centre key) includes the restraint pattern
+  (k1 > 0, k2 > 0); placeholder coordinates of unrestrained axes are never identity.
+- **P7a One neighbour rule.** One per-pair restraint-width neighbour rule (normalise each
+  axis by the pair's own sigma_w, not a global median; an unrestrained axis uses the pooled
+  sampled sd) in a shared module, delivered before 3.1.
+- **P7b Layout schema v2 and its consumers.** `layout_plan.json` v2 lists every state
+  explicitly (c1, k1, c2, k2, region, role); readers of v1 keep working. The exchange graph
+  (`windows.py`), top-up partners (`layout_neighbours.py`) and `ladder_overlap` (which gains a
+  CV2-direction axis) switch to the P7a rule.
+- **P8 Frozen method settings.** `run_manifest.method_settings` records edge metric, layout
+  mode, refine on/off and thresholds at campaign start; resume honours them unless an
+  explicit override flag is given; each epoch's action report stamps the metric used. A code
+  deploy never changes a live campaign's decision rules.
+
+### 3.1 One edge metric: two-state MBAR overlap
+
+- Every spatial edge is graded on the symmetrised pairwise MBAR overlap sqrt(O_ij O_ji):
+  - pre-union: a two-state solve (BAR, float64, log-sum-exp) on the two states' own samples.
+    Spatial edges are graded between same-rung states (the lambda = 0 representative of each
+    centre, as today; rung edges separately). Both states share lambda and the frozen
+    envelope, so the Pep-GaMD boost (a function of V_pep and V_dih, not of the CVs) is the same
+    function of configuration in both and cancels; the reduced-energy difference is the two
+    umbrella terms on the paired (CV1, CV2) samples -- exact and dimension-free. Samples of a
+    state pooled across epochs are valid because a state_id's Hamiltonian never changes;
+  - post-union: `pairwise_state_overlap` with the union f_k (already written onto spatial
+    edges by `_apply_union_edge_overlap`; the weak predicate and warnings start reading it).
+- Thresholds: `min_rung_overlap` / `target_rung_overlap` (0.15 / 0.25), now for spatial and
+  rung edges alike; carried over, calibrated in T2 before defaults flip. The CV1-marginal and
+  joint-histogram overlaps stay as reported diagnostics only.
+- Sample sufficiency and decisions: tau by blocking (Flyvbjerg-Petersen) with its
+  uncertainty; an edge is graded only with an effective sample count >= `min_edge_neff`
+  (default 200) per state, below which it is "unmeasured" (never weak -- same rule as today).
+  The weak/ok decision uses the upper 90 % bound of the overlap from a block bootstrap
+  (block >= 2 tau): an edge is weak only if confidently below threshold; the point estimate
+  is recorded.
+- Graph: all same-rung pairs within a restraint-width radius (P7a rule) are measured
+  (K ~ 250, cheap); connectivity is decided on connected components (`overlap_components`),
+  not on a chain. Spanning guarantee for connectivity checks: axis states (k1 = 0 or k2 = 0)
+  and the anchor get explicit edges to their nearest restrained neighbours; a test asserts
+  chignolin_9's registry stays connected.
+- Retirement and redundancy (`retire_converged`, `_non_neighbor_redundant_pairs`) read the
+  same metric; a state created by refinement is not retired within `refine_protect_epochs`
+  (default 2); retire/extend actions on a state being split in the same epoch are dropped.
+
+### 3.2 CV2 window design from the local free-energy shape (swarm layout)
+
+`--swarm-cv2-layout {uniform,shape}`; `uniform` is today's behaviour.
+
+- Regions: the existing CV1 region inventory (`build_region_inventory`); the conditional CV2
+  distribution for a CV1 window uses a CV1 kernel of that window's width.
+- The swarm distribution is a design measure (seeded short runs), not an equilibrium
+  conditional. It is used only as an upper bound on resolution and to locate candidate
+  structure: a Gaussian mixture per CV1 window; BIC selects the component count,
+  member-blocked cross-validation selects the covariance regularisation; a component is
+  accepted only with >= `min_mode_members` (default 8) independent swarm members. This is a
+  heuristic; R2 (3.3) is the swarm-independent fallback when it misses structure.
+- F''_est per accepted component = RT / (component variance), the variance shrunk toward the
+  pooled region variance with weight n_members / (n_members + 8), floored so F''_est >= 0.
+- Placement: a mandatory centre at every accepted component mean; then fill the support by
+  stepping with the minimum predicted sampled sigma over [z, z + delta] (not the value at z),
+  using the predicted sampled distribution under k2 + F''_est (the CV1 curvature design rule
+  of `ladder_design.py:288-356`, applied to CV2): k2 = RT/sigma_w^2 - F''_est, floored at
+  `cv2_k_min`, clamped at `cv2_k_max`, then the coupling gate (3.4).
+- Budget: requests from all regions are ranked by predicted contribution to connectivity and
+  PMF variance (not by narrowness); the sparse fill keeps mandatory cells, then the P1
+  reserve, then ranked requests; `layout_plan.json` v2 records granted and dropped cells.
+- Top-rung support: the per-rung reweighted support of today's `reweighted_cv2_centers` is
+  kept as the outer envelope of the placement.
+
+### 3.3 Resolution actions
+
+Eligibility is structural: only states with k1 > 0 and k2 > 0; never anchors or axis states.
+
+- R1 (primary) CV2-gap bridge, for edges whose endpoints differ mainly in CV2:
+  - structural: if the edge's absence splits the overlap graph into components (a component
+    boundary MBAR cannot cross), bridge immediately -- more sampling cannot connect it;
+  - weak inside a connected graph (confidently below threshold, 3.1): bridge;
+  - unmeasured inside a connected graph: extend sampling first; bridge only if it is still
+    unmeasured or weak after 2 epochs.
+  Bridges go through the existing `add` path, with the CV2 spring from 3.2's shape rule
+  instead of endpoint interpolation.
+- R2 coverage hole: post-union, a CV2 interval at fixed CV1 whose unbiased weight is
+  concentrated in < `coverage_min_windows` windows, or whose block-bootstrap PMF sigma exceeds
+  `refine_pmf_sigma_kT`, gets a window at the interval centre.
+- R3 mode resolution (an insertion, not a retirement): a window whose CV2 samples show two
+  modes by the 3.2 mixture test (depth >= 1 kT, both modes >= 10 %) AND observed
+  within-window transitions between them (>= `refine_min_transitions` in its trajectories).
+  Two child windows at the modes; the parent is kept (it bridges the barrier), so no
+  resolution action retires anything and the `split` action's retirement path stays unused.
+  No transitions: the window is flagged `trapped_or_orthogonal` and nothing is inserted (a
+  hidden slow mode projecting onto CV2 cannot be resolved by more CV2 windows; Section 12 X3
+  and X4 address it).
+- Diagnostics only (never triggers): sampled sd / sigma_w, Sarle bimodality, PMF curvature
+  inside a window. Under a harmonic restraint sd^2 = RT/(k2 + F''), so these measure
+  landscape confinement, not missing resolution, and they fire at walls.
+- New windows: sigma_child from the shape rule so neighbour spacing is 1.5 sigma (for a pair
+  of children at +/- delta around the sampled mean: sigma_child = 2 delta / 1.5); centred on
+  the sampled mean or the mixture modes, never the nominal centre; child k2 <= 4x parent k2
+  per epoch; never below `refine_min_sigma`.
+- Seeding: children get `seed_source_state_id = parent`; the state-aware seed assignment is
+  re-run after apply; the start is the parent frame nearest the child centre, with a
+  declared burn-in discarded.
+- Budget: resolution actions draw only on the P1 reserve and never more than
+  `refine_budget_fraction` (0.5) of the free slots per epoch left after add_rung. Cost per
+  action on an n-rung ladder: R1/R2 one centre (n states), R3 two centres (2n states).
+
+### 3.4 Coupling gate at deployed and adaptive k2
+
+`cv2_coupling_fraction(fit, j, k2, window)`: the CV1 curvature the CV2 umbrella induces,
+d2/dc2 [k2 (z - z0)^2 / 2] = k2 [(dz/dc)^2 + (z - z0) d2z/dc2], with dz/dc and d2z/dc2 from the
+fit's regression rows (dz/dc = -(K1 + 2 K2 a)/(sigma_j sigma_c) varies with a for a degree-2
+residual, so the maximum over a_w +/- 2 sigma_w1 and |z - z0| <= 2 sigma_w2 is well-posed),
+divided by the designed CV1 curvature k1 + F''_1,est = RT/sigma_w1^2 of that window. Anchor
+values outside the fit's training clamp are evaluated at the clamp and logged. For k1 = 0
+states: bound the predicted CV1 mean shift (tilt k2 (z - z0) dz/dc) and width change instead
+(axis states are not eligible for refinement, but deployed k2 still applies). Called for every
+window at swarm layout (replacing the warning-only check), in `_clamp_secondary_k`, and for
+every adaptive k2. Above `max_coupling_fraction` (0.25) k2 is lowered to the largest passing
+value; below `cv2_k_min` the state is not created; a lowered k2 is re-graded by 3.1 the next
+epoch and can trigger R1. O4 is enforced only for `residual-torsion-pc` with P5's bound,
+digest-verified model; for other CV2 types (an explicit scope limitation) the gate is `NA` and
+adaptive k2 is capped at the layout's k2 for that region.
+
+### 3.5 Replica cap
+
+- `max_replicas = 0` means unlimited (today's CLI meaning).
+- Before starting a new phase the driver checks `len(active states) <= max_replicas`; above
+  it the phase refuses to start with counts and the remedy. A phase with an existing
+  checkpoint resumes with its checkpointed window set and a warning -- a cap check never
+  bricks a resume.
+- Every apply call (main and post-coverage) reads the budget from the live registry;
+  priority weak/disconnected-edge bridges > coverage > add_rung > resolution actions.
+- `production.py`: for plain (non-adaptive) runs the truncation moves before the window-map
+  repair so no map row names an unrun window; adaptive phases never reach it.
+- Default at merge: the check is on (it only refuses to start phases that would exceed the
+  cap, which today lose states). Release note: while the reserve is 0 (until the O3 flip),
+  adaptive additions on full layouts are refused loudly, where today they are truncated. The
+  priority order is a no-op until 3.1/3.3 land.
+
+### 3.6 Labels and refit safety
+
+- Sidecar and manifests record `cv2_component_family`, `cv2_component_index`, tICA lag in ps.
+- A campaign whose frozen pair is residual refuses tICA refits and centre overwrites as a
+  campaign invariant, checked in `_maybe_update_tica_cvaux`, `_apply_tica_centers_to_registry`
+  and at resume (a recorded switch on such a campaign fails closed with a message).
+- Contract: "all PCA indices precede all tICA indices, no gaps" replaces "tICA iff index > 6";
+  old artifacts validate byte-for-byte; consumers read the `family` field.
+
+### 3.7 Reporting
+
+Per state: sampled CV2 mean/sd, sigma_w, confinement ratio, mixture modes, transition count,
+`trapped_or_orthogonal` flag. Per edge: pairwise MBAR overlap, marginal and joint-histogram
+diagnostics, space stamp. `ladder_overlap` CV2-direction axis; `gareus_report` "CV2
+resolution" row; `plot_adaptive_diagnostics` sample grid by explicit state coordinates.
+
+## 4. Configuration
+
+| Flag | Default at merge | After T2/T3 |
+|---|---|---|
+| `--ap-edge-metric {marginal,pairwise-mbar}` | marginal | pairwise-mbar |
+| `--swarm-cv2-layout {uniform,shape}` | uniform | shape |
+| `--swarm-adaptive-reserve-fraction` | 0 | 0.15 |
+| `--ap-cv2-resolution` (R1-R3) | off | on |
+| `--ap-enforce-replica-cap` | on | on |
+| thresholds: `min_edge_neff`, `min_mode_members`, `refine_min_transitions`, `refine_pmf_sigma_kT`, `refine_budget_fraction`, `refine_protect_epochs`, `refine_min_sigma` | spec values | calibrated |
+
+All recorded in `method_settings` (P8). YAML: `cv_selection:` has a short-name map in
+`gareus/config.py`; `adaptive_production:` / `swarm:` keys are added the same way (verify
+the flattener at implementation).
+
+## 5. Validation
+
+T1 unit (each with a failing test first):
+- two-state MBAR edge equals the union pairwise value on a synthetic two-state set;
+  unmeasured below `min_edge_neff`;
+- chignolin_9's registry stays connected under the new graph; axis states and anchor edged;
+- both collectors (flat and segmented) produce CV2 moments and paired samples;
+- applier: atomic whole-centre insert/split, refusal on axis/anchor/mandatory, duplicate
+  check with restraint-aware key, children replicated on every rung;
+- resume: kill between registry save and summary write, resume, no re-proposal, no
+  missing-state error; epoch-N diagnostics on the pre-action snapshot;
+- no state_id changes Hamiltonian (assertion on every apply);
+- retired parent stays in the union MBAR with native per-epoch params;
+- shape layout: shoulder mixture (80 % N(0,0.71) + 20 % N(1.2..1.6, 0.15)) gets a centre at
+  the narrow mode; single Gaussian reproduces a uniform-equivalent layout;
+- R3: bimodal-with-transitions splits; bimodal-without-transitions flags, no split;
+  plateau between hard walls: zero actions; stiff bowl: zero actions;
+- coupling at a_w for degree-2 fits; `NA` without a bound model;
+- cap: refusal at phase start, resume never refused, priority order, add_rung counted;
+- label/refit invariants including the resume path; contract ordering rule.
+
+T2 synthetic: the harness gets an adapter that runs the real collectors
+(`collect_*_diagnostics`) and proposers on its samples, in `--mode langevin` (reports tau).
+Landscapes: `slow-cv2-double-branch`, `gated-barrier`, `harmonic-bowl` (F'' < k2: zero
+actions; plus a stiff-bowl variant), new `narrow-cv2-band-at-high-cv1` (shoulder geometry),
+plateau with walls, and a 3D landscape with a hidden slow CV3 projecting bimodally onto CV2;
+swarm input built as a design-measure swarm (short correlated runs from stratified seeds).
+Metrics vs today's machinery at matched budget: MBAR PMF error against the analytic FES,
+worst pairwise edge overlap, connected components, number of actions by kind, verdict flips
+pre- vs post-union. Calibrates the thresholds before any default flips.
+
+T3 retrospective: replay chignolin_9's recorded samples through the new edge metric and the
+proposer in cap-ignoring dry-run. Stated limits: chignolin_9's CV2 is residual PC1, not the
+conditional tICA component; R2 needs per-epoch union solves (top-ups were off).
+
+T2 additionally reports false-weak / false-strong edge rates against N_eff at the 0.15
+threshold, asserts end-to-end that `slow-cv2-double-branch` is resolved (PMF error in both
+branches below a pre-set tolerance, not merely that actions fired), and measures union-MBAR
+memory against `max_replicas` and `UNION_PEAK_BYTES_PER_CELL`.
+
+T4 real MD: chignolin, campaigns per arm set by a power analysis from chignolin_7/9
+between-block variance (at least 3), pre-registered spread estimator, at matched node-hours, (contacts, cond-tIC1,
+uniform, today's adaptive) vs (same pair, shape layout, pairwise-MBAR edges, R1-R3).
+Pre-registered reference-free basin definition on the CV grid (native used only in the
+report). Primary: between-campaign spread of the basin free energy. Accuracy: lambda = 0 vs
+full-ladder crosscheck and self-bias; also connected components and worst edge per arm.
+
+## 6. Risks
+
+- Headroom costs sampling up front (15 % of states idle until used); T2/T4 report the trade.
+- Narrow stiff windows can trap walkers; lambda transport and `refine_min_sigma` mitigate;
+  T2 langevin measures it.
+- More states: more contexts per GPU under MPS and more union-MBAR memory (guard at
+  `UNION_PEAK_BYTES_PER_CELL`); both checked against the P1 reserve size.
+- The 0.15 / 0.25 thresholds are carried over; T2 calibrates.
+- The block bootstrap does not account for adaptive design choices; stated in reports.
+- R3's transition test depends on trajectory length per window; short windows default to
+  "flag, no split".
+
+## 7. Delivery order (dependencies explicit)
+
+1. P8 frozen settings; P6 restraint-aware identity; 3.6 labels/refit/contract (small, safe).
+2. P3 applied-actions ledger + resume idempotence (fixes an existing hazard for adds).
+3. 3.5 cap check at phase start (needs P3 for the resume rule).
+4. P4 collectors; P5 model threading; 3.4 coupling helper.
+5. P7a shared per-pair restraint-width neighbour rule; then 3.1 edge metric and graph behind
+   `--ap-edge-metric` (needs P4, P6, P7a).
+6. P2 applier rewrite; P7b layout schema v2 and the remaining consumers of the neighbour rule.
+7. 3.2 shape layout and P1 reserve behind flags (needs P7).
+8. 3.3 R1-R3 behind `--ap-cv2-resolution` (needs P1-P5, 3.1, 3.4).
+9. T2 calibration, T3 replay; then default flips (release note; live campaigns unaffected
+   by P8); T4.
+
+## 8. Open questions for review
+
+- Is 15 % headroom the right order of magnitude, or should headroom come from retiring
+  redundant windows under the new metric instead?
+- Should R3 ever retire the parent, or is "keep parent" always right under a ladder?
+- Is a two-state BAR on per-epoch samples robust enough at small effective N, or should the
+  pre-union regime grade "unmeasured" more often and rely on top-ups for the union solve?
+
+## 9. Adversarial review record (v0.1 -> v0.2)
+
+| ID | Source | Severity | Finding | Disposition |
+|---|---|---|---|---|
+| A1 | code | blocking | layout fills the cap exactly; refine/add always rejected under an enforced cap | P1 reserve; dry-run T3 |
+| A2/C4 | code, failure | high | edge overlap computed in 4 places; scheduled path overwrites with CV1 pooling; CV2 sd dropped; CV1/CV2 not row-paired | P4; 3.1 names every site |
+| A3/C2 | code, failure | high | split applier retires parent first, one rung only, no duplicate check | P2 |
+| A4 | code | high | refine proposer lacks CV2 sd / moments / curvature | P4; triggers redesigned |
+| A5 | code | high | synth harness never calls the real collectors | T2 adapter |
+| A6/C9 | code, failure | medium-high | cap budget spans two apply sites; add_rung missing; 0 = unlimited undefined; fail-closed could brick resume | 3.5 rewritten |
+| A7 | code | medium | production truncation after window-map repair | 3.5 |
+| A8/C7 | code, failure | medium/high | layout cells index one global CV2 list; consumers equate row = exact CV2 | P7 |
+| A9/B-H2/C14 | all | medium | sigma/4 bins far finer than the analysis calibration; small-N bias | histogram demoted to diagnostic |
+| A10/C10 | code, failure | medium | coupling helper signature; no model in the adaptive driver | P5, 3.4 |
+| A11/C8 | code, failure | high | new edge set could isolate axis states and brick the final | spanning guarantee, test |
+| A-B1..B9 | code | false/misleading claims in v0.1 table (coupling re-check, tica coverage stiffening, "silently", uniform k2, component-7 provenance, ledger, applier obligations, union plumbing) | table corrected |
+| B-C1 | stats | critical | 1 kT minima miss a narrow shoulder band; walk jumps narrow modes | 3.2: GMM/BIC, mandatory component centres, min-sigma stepping |
+| B-C2 | stats | critical | sd/sigma_w and curvature triggers measure confinement; fire at walls; runaway refinement | demoted to diagnostics; R1-R3 |
+| B-H1 | stats | high | histogram 0.09 vs MBAR 0.15 disagree (3.4 sigma vs 2.5 sigma gaps) | one metric (3.1) |
+| B-H3/C6 | stats, failure | high | children 3 sigma apart; (b) retires the bridging parent | sigma_child = 2 delta/1.5; keep parent |
+| B-H4 | stats | high | swarm density is a design measure; spurious modes; k2 rule sqrt(2) off | upper-bound use, member minimum, k2 = RT/sigma^2 - F'' |
+| B-H5 | stats | high | coupling vs bare k1 wrong; k1 = 0 reference meaningless; a = 0 only | 3.4 |
+| B-H6 | stats | high | cap priority inverted | 3.5 order; refine budget fraction |
+| B-H7 | stats | high | in-place k2 change = two Hamiltonians per id; child seeding; retired parents in union | invariants; seeding; T1 |
+| B-M1 | stats | medium | bimodality can be a hidden orthogonal slow mode | R3 transition test, flag |
+| B-M2..M4 | stats | medium | chain-only edges; budget favours easy regions; rung pooling | 3.1 graph; 3.2 budget; same-rung edges |
+| C1 | failure | high | k2 = 0 axis states always trigger; mandatory metadata absent in chignolin_9 | structural eligibility |
+| C3 | failure | high | resume between registry save and summary re-enters epoch / double split | P3 |
+| C5 | failure | high | retire_converged undoes refinements on marginal overlap | 3.1 retirement on the same metric; protection |
+| C11 | failure | medium | children born without seeds | 3.3 seeding |
+| C12 | failure | medium | resume re-applies recorded tICA switch | 3.6 invariant |
+| C13 | failure | medium | centre identity ignores restraint pattern | P6 |
+| C16 | failure | medium | four neighbour-graph definitions | P7 shared rule |
+| C17 | failure | medium | default flips reach live campaigns via deploy | P8 |
+| B-low, C-low | both | low | determinism, plot grid, union memory, top-up waste, bootstrap caveat, torsion stiffness ceiling | 3.7, Section 6, T1 |
+
+## 10. Small-board review (2026-09-29) and dispositions
+
+Board: kimi, mini, thinker; chair glm. Final: ACCEPT-WITH-CHANGES, 2-1 (mini REJECT, 78).
+Transcript: `/home/sulcjo/.claude/jobs/55927a12/tmp/small_board_cv2spec/` (job-temporary).
+
+| # | Condition | Disposition |
+|---|---|---|
+| 1 | P7 used by 3.1 before delivery | P7 split: P7a (neighbour rule) before 3.1, P7b (schema v2, consumers) later; Section 7 updated |
+| 2 | R1 conflates unmeasured and disconnected edges | R1 acts immediately only when the edge's absence splits the overlap graph into components (structural MBAR failure); an unmeasured edge inside a connected component first gets extended sampling and must persist for >= 2 epochs before a bridge |
+| 3 | F''_est estimator unspecified; GMM/BIC vs blocked CV ambiguous | F''_est per accepted component = RT / (component variance), component variance shrunk toward the pooled region variance with weight n_members/(n_members + 8), floored so F''_est >= 0; BIC selects component count, member-blocked CV selects covariance regularisation. The board's suggested assumption "boost is a function of the CVs only" is NOT adopted: it is false for Pep-GaMD (boost depends on V_pep, V_dih). Cancellation in 3.1 holds because both states of a same-rung edge share lambda and the frozen envelope, so the boost is the same function of configuration in both |
+| 4 | Coupling degree-2 ambiguity; support; NA scope | Induced CV1 curvature written explicitly as k2 [(dz/dc)^2 + z d2z/dc2] (dz/dc varies with a for a degree-2 residual, so the maximum over a_w +/- 2 sigma is well-posed); evaluation outside the pair model's training anchor range (its clamp bounds) clamps to the bound and logs it; O4 is enforced only for residual-torsion-pc with a bound, digest-verified model -- other CV2 types are an explicit scope limitation, with k2 capped at the layout's k2 there |
+| 5 | add_rung vs reserve | add_rung draws on the reserve, at most 1/3 of the free slots per epoch; resolution actions keep their own 0.5 fraction of what remains |
+| 6 | decision-boundary statistics | tau by blocking (Flyvbjerg-Petersen) with its uncertainty; bootstrap block length >= 2 tau; `min_edge_neff` default 200 per state; weak-edge decision on the lower 90 % bound of the overlap (bridge only if confidently weak), point estimate recorded; T2 reports false-weak / false-strong rates vs N_eff at 0.15, and asserts end-to-end resolution on `slow-cv2-double-branch` |
+| 7 | 15 % headroom unproven | reserve default set from T3's cap-ignoring dry-run need (95th percentile over epochs, plus the R1 immediate case); 0.15 is a placeholder until then |
+| 8 | T4 power | power analysis from chignolin_7/9 between-block variance before T4; pre-registered spread estimator; campaigns per arm set from it (>= 3) |
+| 9 | union memory | T2 measures union memory vs max_replicas against `UNION_PEAK_BYTES_PER_CELL` |
+| 10 | interim state | release note: with the cap check on and reserve 0, adaptive adds on full layouts are refused loudly until the O3 flip |
+| 11 | minor | float64 / log-sum-exp in the two-state solve and PMF slice; Sarle kept as a diagnostic only (outlier-sensitive); 3.5 priority is a no-op until 3.1/3.3 land; the swarm "upper bound" is a heuristic, with R2 as the swarm-independent fallback |
+
+Dissent (mini) points and dispositions: boost non-cancellation under k2 changes -- does not
+arise (any k2 change creates a new state_id; same-rung states share lambda and envelope);
+low-N BAR bias -- handled by `min_edge_neff`, lower-bound decisions and "unmeasured" below it;
+clamp could create gaps -- a clamped k2 is re-graded by 3.1 next epoch and can trigger R1;
+R3 flag-only for orthogonal modes -- deliberate: a CV2 split cannot resolve a slow mode
+orthogonal to CV2 (the auxiliary-CV spec covers that); headroom magnitude -- condition 7.
+
+## 11. Self-verification (v0.4)
+
+Issues found re-reading v0.3 against the code and the chignolin_9 data, and their fixes:
+
+| Issue | Fix |
+|---|---|
+| R3 was "the only retiring action" yet kept its parent (contradiction) | R3 is an insertion; no resolution action retires; the `split` retirement path stays unused (P2 still makes it atomic for future producers) |
+| A 15 % reserve on a 4-rung ladder buys only ~8 centres; R3 costs 2 centres x 4 rungs | P1 notes it; X1 below is the preferred headroom source |
+| Boost cancellation was argued from "same Hamiltonian"; the board then proposed "boost is a function of the CVs", which is false for Pep-GaMD | 3.1 now states the actual condition: same rung and frozen envelope |
+| 3.1 needed the neighbour rule before P7 was delivered | P7 split into P7a (before 3.1) and P7b |
+| Coupling "maximum over a +/- 2 sigma" was not written as a formula | 3.4 now gives d2/dc2 of the CV2 umbrella explicitly |
+| R1's "unmeasured" policy cannot act in the frozen final phase (no later epoch), and R2 needs a union solve (mid-campaign only with top-ups on) | Stated here: in the final phase R1/R2 act only through a `final_extension_NNN` round; without top-ups R2 is campaign-end only |
+| A lowered (clamped) k2 could open a gap | 3.4: re-graded next epoch, can trigger R1 |
+
+Checked and holding: spatial edges are graded among lambda = 0 centre representatives
+(`_split_rung_groups`); `pairwise_state_overlap(u_nk, window, f_k, n_k, i, j)` exists
+(`mbar_analysis/ladder.py:256`); the union path already writes spatial `mbar_overlap`
+(`_apply_union_edge_overlap`); chignolin_9's registry is 236/236 with zero adaptive adds.
+
+## 12. Optimizations for exploring conformational space and minima
+
+Ranked by evidence and cost. Each is a separate, flag-gated change with its own test; none
+uses native information in a decision. Numbers are chignolin_9 unless stated.
+
+**X1 Reallocate the lambda ladder (highest value, low risk).** The top rung pair
+0.636-1.0 overlaps 0.40 (0-0.235: 0.24), the two rungs have near-equal transition rates (turn
+H-bond 4.9x vs 5.8x lambda = 0) and near-equal delivery shares of lambda = 0 H-bonded frames
+(23 % vs 22 %), and lambda = 1.0 carries 0.4 % of the MBAR weight. Dropping it (or respacing
+to e.g. {0, 0.12, 0.3, 0.65}, balancing adjacent overlaps near 0.25-0.3) frees 25 % of the
+states -- 59 on chignolin_9 -- which funds P1 headroom and the high-CV1 CV2 rows without
+touching lambda = 0 sampling. Test: T4 arm with the respaced ladder; the ladder crosscheck and
+rung overlaps must stay >= 0.20.
+
+**X2 Rung-sparse insertion (medium value, medium risk).** Resolution only needs statistics
+on the rungs that carry weight (lambda = 0 and ~0.23: 97 % of the MBAR weight). New centres
+from R1-R3 are inserted on the low rungs plus the lowest boosted rung that keeps a rung edge,
+not on every rung, halving their cost. Requires relaxing "every centre on every rung" in the
+registry, `ladder_overlap` and the rung graph (a centre's rung set becomes explicit);
+transport to the new centre then goes through spatial exchange on the low rungs.
+
+**X3 Slow-mode-aware reseeding at epoch boundaries (high value, low cost).** The slowest
+motion left after (CV1, component 7) is psi(D3) (loading 0.39, autocorrelation 0.990 at
+200 ps) -- the same torsion that separates native-like frames (about 111 deg vs -10 deg). A
+walker stuck on the wrong side of it stays stuck for the whole segment. At each epoch
+boundary, reseed a fraction (e.g. 25 %) of windows from the pooled end states, choosing for
+each window a configuration inside its restraint that balances occupancy of the hidden
+mode's states (reference-free: the hidden mode is the leading conditional tICA mode of the
+residual after the deployed pair). MBAR validity is unaffected (starting points only; the
+declared burn-in is discarded); cost is the burn-in. Test: T2 3D landscape with a hidden
+slow CV3 (Section 5) -- CV3 state balance per window and PMF error with and without X3.
+
+**X4 Auxiliary bias on the hidden mode on one exploratory rung (high value, high cost).**
+The frozen, bounded 1D auxiliary bias of the auxiliary-CV spec, applied to the X3 hidden
+mode on the top rung only, so boosted walkers cross it and deliver both states down the
+ladder. Needs that spec's force-group audit (A06) and trials; after X1/X3.
+
+**X5 Allocate MD time by effective samples (medium value, low cost).** Top-ups and
+per-state segment lengths use raw sample counts. Weighting by the tau-corrected deficit
+(the 3.1 blocking estimate) moves steps to windows whose samples are correlated (the slow
+turn states) and away from fast, already-decorrelated ones.
+
+**X6 Longer swarm members for selection and layout (medium value, pre-production cost).**
+Swarm members are 1 ns with 450 ps discarded; candidate autocorrelations at 200 ps are
+0.95-0.99, so slowness is extrapolated and each member barely crosses a slow mode. Fewer,
+longer members (e.g. 3-5 ns) for the selection and 3.2's mixture fit give real timescales,
+real within-member transitions for the R3-style test at design time, and more independent
+evidence per mode (`min_mode_members`).
+
+**X7 CV1-free windows per CV2 mode (low cost).** The CV2-only (k1 = 0) windows held about one sixth
+(16-18 % in two independent counts) of chignolin_9's H-bonded frames although they are 8 % of
+states: letting contacts relax
+at fixed CV2 helps close the hairpin. The shape layout keeps one CV1-free window per
+accepted CV2 mode (not only per uniform row).
+
+**X8 Discovery census as a campaign diagnostic (low cost).** Per epoch, count new
+reference-free structural states (core backbone basin strings; 2 A C-alpha clusters) and
+report the discovery curve. Both chignolin_7 and chignolin_9 were still discovering at their
+end; a flat curve is evidence to stop exploring and spend on precision, a rising one to keep
+X3/R2 active.
+
+**Measured and not recommended as a lever:** transferring configurations seen only on
+boosted rungs to lambda = 0 windows -- 85 of 345 core states are never seen at lambda = 0,
+but they are 0.01 % of frames (transient); keep as a diagnostic only. NMA-derived CVs were
+assessed separately and are not competitive.
+
+Suggested order: X1 with the P-prerequisites (it creates the headroom), X3 and X8 next
+(cheap, directly target the hidden psi(D3) mode and tell whether exploration is saturating),
+then 3.1-3.3, X5, X6; X2 and X4 last.
+
+## 13. Implementation status (2026-09-29)
+
+All on branch `feat/cv2-conditional-tica`, uncommitted.
+
+| Item | Status | Where |
+|---|---|---|
+| CV2 selection: conditional tICA candidates, slowness ranking (the premise of this spec) | done | `gareus/cv_selection/slowness.py`, `select_pair.py`; CLAUDE.md section |
+| X1 adaptive lambda ladder | done, redesigned: keeps lambda = 0 and the top rung, respaces/adds/drops interior rungs to a 0.25 minimum overlap (not "drop lambda = 1") | `gareus/adaptive/ladder_adapt.py`, `--ap-ladder-adapt`; plan `docs/superpowers/plans/2026-09-29-adaptive-lambda-ladder.md` |
+| P3 applied-actions ledger, resume idempotence | done (all campaigns) | `_record_applied_actions` / `_load_applied_actions`, epoch loop |
+| P8 frozen method settings | partial: ladder settings only (`ladder_adapt_settings.json`) | `_resolve_ladder_settings` |
+| 3.5 replica cap | partial: `max_replicas_budget` enforced by `respace_ladder` only; no phase-start check; production truncation unchanged | `_apply_respace_ladder` |
+| P1 headroom, P2 applier rewrite, P4 collectors, P5 model threading, P6 identity, P7a/b neighbour rule + schema v2 | not started | |
+| 3.1 edge metric, 3.2 shape layout, 3.3 R1-R3, 3.4 coupling gate, 3.6 labels/refit safety (incl. contract ordering rule), 3.7 reporting | not started | |
+| X2-X8 | not started | |
+| T1 | per-feature unit tests for X1 and the ledger only; T2-T4 not started | |
+
+Notes from implementation: the X1 replay found that both chignolin_7 and chignolin_9 keep
+4 rungs and move the interior down ([0, ~0.18, ~0.47, 1]), so the extra headroom X1 was
+expected to free (Section 12) does not appear under a 0.25 minimum; P1 headroom still has to
+come from somewhere else.

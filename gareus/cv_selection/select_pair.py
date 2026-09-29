@@ -9,12 +9,23 @@ The rule (plan Task 5, after adversarial review):
 4. Per component: held-out nonlinear R²(z2 | z1) gated on ``mean + 2·SE`` over
    folds; incremental information about the fine partition; the curvature the
    CV2 umbrella induces along the anchor as a fraction of the CV1 stiffness.
-5. Winner: the deployable component with the largest gain, provided that gain
-   clears ``min_gain_nats``. Below the floor every candidate is noise and the
-   tie-break would crown PC1 while the report read as principled; instead the
-   answer is ``cv1_only`` with the reason spelled out.
-6. Stability: re-run on two disjoint halves of the seed families and record
-   whether the same component wins. Recorded, not gating.
+5. Winner, ``ranking="gain"`` (the legacy rule, PCA components only): the deployable
+   component with the largest gain, provided that gain clears ``min_gain_nats``. Below
+   the floor every candidate is noise and the tie-break would crown PC1 while the report
+   read as principled; instead the answer is ``cv1_only`` with the reason spelled out.
+6. Stability (gain ranking): re-run on two disjoint halves of the seed families and
+   record whether the same component wins. Recorded, not gating.
+
+``ranking="slowness"`` (the default) adds the conditional tICA modes of the same residual
+(:mod:`.slowness`) as components 7-9 and replaces steps 5-6: a candidate must also clear
+the gain floor, a minimum lag autocorrelation at fixed CV1 and a bimodality coefficient at
+fixed CV1, and must be reproducible: both seed-family halves, refitted from scratch, must
+each contain a candidate that correlates with it (|r| >= ``half_split_min_corr`` on all
+rows). The slowest reproducible candidate wins; none gives ``cv1_only``. Reproducibility is
+checked per candidate, not on the argmax: near-equal slow modes swap rank between halves
+(chignolin_9: psi(P4)+psi(D3) reproduced at |r| 0.93/0.85 but ranked second by 0.02 in one
+half), and a gate on the argmax would refuse a stable coordinate over that tie. It needs trajectory order (``member_ids``, ``frame_index``,
+``frame_dt_ps``); without it the gain rule runs and the report says why.
 
 Everything measured is about the swarm's balanced design measure. Nothing is
 a statement about the 300 K equilibrium ensemble.
@@ -32,6 +43,8 @@ from .independence import (DEFAULT_FOLD_SEED, frame_partition, heldout_nonlinear
                            incremental_cell_information)
 from .models import (ResidualFit, coupling_curvature_kcal, evaluate_component,
                      fit_residual_components, to_candidate_set, standardised_anchor)
+from .slowness import (anchor_cells, conditional_autocorrelation, fit_conditional_tica,
+                       max_bimodality_at_fixed_anchor)
 from .pair_model import CERTIFICATE_VERSION_V2, PAIR_MODEL_VERSION_V2, PairModel
 from .protocol import NATIVE_BLIND_GENERATOR_PRESETS
 
@@ -46,6 +59,9 @@ class SwarmDataset:
     shape_features: np.ndarray      # (n, m): rg_nm, e2e_nm -- for the partition only
     groups: np.ndarray              # seed_id per row (fold grouping)
     weights: Optional[np.ndarray] = None   # ignored: the selector balances over its own cells
+    member_ids: Optional[np.ndarray] = None    # swarm member per row (trajectory identity)
+    frame_index: Optional[np.ndarray] = None   # frame number within that member's trace
+    frame_dt_ps: Optional[float] = None        # time between consecutive frames
 
 
 @dataclass(frozen=True)
@@ -62,6 +78,14 @@ class SelectionConfig:
     min_windows_cv1: int = 4
     temperature_k: float = 300.0
     n_folds: int = 4
+    ranking: str = "slowness"                # "slowness" | "gain" (legacy, PCA only)
+    tica_lag_ps: float = 50.0                # conditional tICA lag
+    slowness_lag_ps: float = 200.0           # lag of the ranking autocorrelation
+    n_tica_components: int = C.MAX_TICA_COMPONENTS
+    min_slowness_rho: float = 0.72           # ~exp(-1/3): implied timescale >= 3 lags
+    min_bimodality: float = 5.0 / 9.0        # Sarle's coefficient of a uniform distribution
+    half_split_min_corr: float = 0.8
+    n_cells_slowness: int = 8
 
 
 @dataclass(frozen=True)
@@ -85,10 +109,49 @@ def _units(kind: str) -> str:
     return "dimensionless" if kind == "nonlocal-contact-fraction" else "nanometer"
 
 
-def _score_components(fit: ResidualFit, X, a, z1, cells_fine, groups, cfg: SelectionConfig) -> dict[int, dict]:
+@dataclass(frozen=True)
+class _TimeContext:
+    """Trajectory order for the rows being scored (a subset keeps its own rows)."""
+    members: np.ndarray
+    frames: np.ndarray
+    tica_lag: int
+    slowness_lag: int
+
+    def subset(self, rows) -> "_TimeContext":
+        return _TimeContext(self.members[rows], self.frames[rows], self.tica_lag, self.slowness_lag)
+
+
+def _time_context(data: SwarmDataset, cfg: SelectionConfig) -> tuple[Optional[_TimeContext], str]:
+    if data.member_ids is None or data.frame_index is None or not data.frame_dt_ps or data.frame_dt_ps <= 0:
+        return None, "no trajectory order (member_ids, frame_index, frame_dt_ps) in the swarm dataset"
+    members, frames = np.asarray(data.member_ids), np.asarray(data.frame_index)
+    if members.shape[0] != np.asarray(data.features).shape[0] or frames.shape != members.shape:
+        raise ValueError("member_ids and frame_index must have one entry per row")
+    dt = float(data.frame_dt_ps)
+    return _TimeContext(members, frames.astype(np.int64), max(1, int(round(cfg.tica_lag_ps / dt))),
+                        max(1, int(round(cfg.slowness_lag_ps / dt)))), ""
+
+
+def _fit(X, a, cfg: SelectionConfig, weights, time: Optional[_TimeContext]) -> tuple[ResidualFit, list[str]]:
+    """Residual PCA, plus conditional tICA modes when ranking by slowness."""
+    fit = fit_residual_components(X, a, degree=cfg.residual_degree, weights=weights)
+    notes = []
+    if time is not None and cfg.n_tica_components > 0:
+        try:
+            fit = fit_conditional_tica(fit, X, a, time.members, time.frames, lag=time.tica_lag,
+                                       n_modes=cfg.n_tica_components, weights=weights)
+        except ValueError as exc:
+            notes.append(f"conditional tICA candidates skipped: {exc}")
+    return fit, notes
+
+
+def _score_components(fit: ResidualFit, X, a, z1, cells_fine, groups, cfg: SelectionConfig,
+                      time: Optional[_TimeContext] = None, weights=None) -> dict[int, dict]:
     scores: dict[int, dict] = {}
-    for j in cfg.components:
-        if not 1 <= int(j) <= fit.n_components:
+    slow_cells = anchor_cells(a, cfg.n_cells_slowness) if time is not None else None
+    for j in range(1, fit.n_components + 1):
+        family = fit.families[j - 1]
+        if family == C.COMPONENT_FAMILY_PCA and j not in cfg.components:
             continue
         z2 = evaluate_component(fit, int(j), X, a)
         r2, folds = heldout_nonlinear_r2(z2, z1, groups, n_folds=cfg.n_folds)
@@ -102,17 +165,42 @@ def _score_components(fit: ResidualFit, X, a, z1, cells_fine, groups, cfg: Selec
             reasons.append(f"nonlinear R2(z2|z1) gate {r2_gate:.3f} > {cfg.max_nonlinear_r2}")
         if fraction > cfg.max_coupling_fraction:
             reasons.append(f"coupling into CV1 {fraction:.3f} of k1 > {cfg.max_coupling_fraction}")
-        scores[int(j)] = {
+        row = {
             "r2_pooled": float(r2), "r2_mean": float(folds.mean()), "r2_se": r2_se, "r2_gate": r2_gate,
             "gain_nats": info["gain"], "l1": info["l1"], "l2": info["l2"], "l12": info["l12"],
             "coupling_curvature_kcal": float(coupling), "coupling_fraction_of_k1": float(fraction),
-            "deployable": not reasons, "reasons": reasons,
         }
+        if time is not None or family != C.COMPONENT_FAMILY_PCA:   # gain-mode output stays as before
+            row["family"] = family
+        if family == C.COMPONENT_FAMILY_TICA:
+            row["tica_eigenvalue"] = float(fit.tica_eigenvalues[j - 1])
+            row["tica_lag_frames"] = int(fit.tica_lag_frames[j - 1])
+        if time is not None:
+            rho = conditional_autocorrelation(z2, slow_cells, time.members, time.frames,
+                                              time.slowness_lag, weights=weights)
+            bim = max_bimodality_at_fixed_anchor(z2, slow_cells)
+            row["slowness_rho"] = float(rho)
+            row["slowness_lag_frames"] = int(time.slowness_lag)
+            row["bimodality_max"] = float(bim)
+            if info["gain"] < cfg.min_gain_nats:
+                reasons.append(f"information gain {info['gain']:.4f} < {cfg.min_gain_nats:.3f}")
+            if not np.isfinite(rho) or rho < cfg.min_slowness_rho:
+                reasons.append(f"slowness rho {rho:.3f} < {cfg.min_slowness_rho} at lag {time.slowness_lag} frames")
+            if not np.isfinite(bim) or bim < cfg.min_bimodality:
+                reasons.append(f"bimodality at fixed CV1 {bim:.3f} < {cfg.min_bimodality:.3f}")
+        row.update({"deployable": not reasons, "reasons": reasons})
+        scores[int(j)] = row
     return scores
 
 
-def _pick(scores: Mapping[int, dict], cfg: SelectionConfig) -> tuple[Optional[int], str]:
+def _pick(scores: Mapping[int, dict], cfg: SelectionConfig, ranking: str = "gain") -> tuple[Optional[int], str]:
     deployable = {j: s for j, s in scores.items() if s["deployable"]}
+    if ranking == "slowness":
+        if not deployable:
+            return None, ("no component passed the R2, coupling, gain, slowness, bimodality and "
+                          "seed-half reproducibility gates at fixed CV1")
+        best = max(deployable, key=lambda j: (deployable[j]["slowness_rho"], -j))
+        return best, "slowest reproducible deployable component at fixed CV1 (lag autocorrelation)"
     if not deployable:
         return None, "no component passed the nonlinear-R2 and coupling gates"
     best = max(deployable, key=lambda j: (deployable[j]["gain_nats"], -j))
@@ -123,11 +211,9 @@ def _pick(scores: Mapping[int, dict], cfg: SelectionConfig) -> tuple[Optional[in
 
 
 def _half_split_winners(X, a, shape, groups, cfg: SelectionConfig) -> tuple[Optional[int], Optional[int]]:
-    unique = np.unique(groups)
-    unique = unique[np.random.default_rng(DEFAULT_FOLD_SEED).permutation(unique.size)]
-    halves = (unique[: unique.size // 2], unique[unique.size // 2:])
+    """Legacy (gain ranking): refit and re-pick on each half; recorded, not gating."""
     winners = []
-    for members in halves:
+    for members in _seed_halves(groups):
         rows = np.isin(groups, members)
         if np.unique(groups[rows]).size < cfg.n_folds:
             winners.append(None)
@@ -143,6 +229,42 @@ def _half_split_winners(X, a, shape, groups, cfg: SelectionConfig) -> tuple[Opti
         except ValueError:
             winners.append(None)
     return winners[0], winners[1]
+
+
+def _seed_halves(groups) -> tuple[np.ndarray, np.ndarray]:
+    unique = np.unique(groups)
+    unique = unique[np.random.default_rng(DEFAULT_FOLD_SEED).permutation(unique.size)]
+    return unique[: unique.size // 2], unique[unique.size // 2:]
+
+
+def _half_fits(X, a, shape, groups, cfg: SelectionConfig,
+               time: Optional[_TimeContext]) -> list[Optional[ResidualFit]]:
+    """Refit (PCA + conditional tICA) from scratch on each half of the seed families."""
+    out: list[Optional[ResidualFit]] = []
+    for members in _seed_halves(groups):
+        rows = np.isin(groups, members)
+        try:
+            cells_c, _ = frame_partition(np.column_stack([X[rows], shape[rows]]), n_cells=cfg.n_cells_coarse)
+            fit, _ = _fit(X[rows], a[rows], cfg, balanced_weights(cells_c),
+                          time.subset(rows) if time is not None else None)
+            out.append(fit)
+        except ValueError:
+            out.append(None)
+    return out
+
+
+def _reproducibility(fit: ResidualFit, halves: list, X, a, scores: dict, cfg: SelectionConfig) -> None:
+    """Gate every candidate on being reproduced by some candidate of each half (in place)."""
+    half_z = [None if h is None else [evaluate_component(h, k, X, a) for k in range(1, h.n_components + 1)]
+              for h in halves]
+    for j, row in scores.items():
+        z = evaluate_component(fit, j, X, a)
+        corrs = [None if hz is None else float(max(abs(np.corrcoef(zk, z)[0, 1]) for zk in hz)) for hz in half_z]
+        row["half_split_abs_corr"] = corrs
+        if any(c is None or not c >= cfg.half_split_min_corr for c in corrs):
+            row["reasons"].append(f"not reproduced in both seed-family halves (|r| {corrs}, need >= "
+                                  f"{cfg.half_split_min_corr})")
+            row["deployable"] = False
 
 
 def select_cv_pair(data: SwarmDataset, config: SelectionConfig, *, physical_system_sha256: str,
@@ -180,7 +302,16 @@ def select_cv_pair(data: SwarmDataset, config: SelectionConfig, *, physical_syst
     cells_coarse, _ = frame_partition(partition_features, n_cells=config.n_cells_coarse)
     cells_fine, _ = frame_partition(partition_features, n_cells=config.n_cells_fine)
     weights = balanced_weights(cells_coarse)
-    fit = fit_residual_components(X, a, degree=config.residual_degree, weights=weights)
+    if config.ranking not in ("slowness", "gain"):
+        raise ValueError(f"ranking must be 'slowness' or 'gain', got {config.ranking!r}")
+    time, no_time_reason = _time_context(data, config) if config.ranking == "slowness" else (None, "")
+    ranking = "slowness" if time is not None else "gain"
+    report["ranking"] = ranking
+    if config.ranking == "slowness" and time is None:
+        report["ranking_fallback_reason"] = no_time_reason
+    fit, fit_notes = _fit(X, a, config, weights, time)
+    if fit_notes:
+        report["notes"] = fit_notes
     z1 = (a - fit.anchor_mean) / fit.anchor_std
 
     primary_definition = {"kind": anchor.kind, "units": _units(anchor.kind),
@@ -189,13 +320,16 @@ def select_cv_pair(data: SwarmDataset, config: SelectionConfig, *, physical_syst
     candidate_set = to_candidate_set(fit, data.feature_schema, primary_definition,
                                      physical_system_sha256, training_rows_sha256, library_versions, design_measure=design_measure_name)
 
-    scores = _score_components(fit, X, a, z1, cells_fine, groups, config)
-    winner, why = _pick(scores, config)
+    scores = _score_components(fit, X, a, z1, cells_fine, groups, config, time, weights)
+    if ranking == "slowness":
+        _reproducibility(fit, _half_fits(X, a, shape, groups, config, time), X, a, scores, config)
+    winner, why = _pick(scores, config, ranking)
     report["components"] = {str(j): s for j, s in scores.items()}
     report["selection_reason"] = why
+    lower = "slowness" if ranking == "slowness" else "information gain"
     runner_ups = [{"component_index": j,
                    "reason": "; ".join(s["reasons"]) if s["reasons"]
-                   else f"lower information gain than component {winner}",
+                   else f"lower {lower} than component {winner}",
                    "scores": {k: v for k, v in s.items() if k not in ("reasons", "deployable")}}
                   for j, s in sorted(scores.items()) if j != winner]
     report["runner_ups"] = runner_ups
@@ -205,7 +339,14 @@ def select_cv_pair(data: SwarmDataset, config: SelectionConfig, *, physical_syst
 
     z2 = evaluate_component(fit, winner, X, a)
     _, folds_rev = heldout_nonlinear_r2(z1, z2, groups, n_folds=config.n_folds)
-    half_a, half_b = _half_split_winners(X, a, shape, groups, config)
+    if ranking == "slowness":
+        half_a = half_b = None                     # per-candidate reproducibility gated above
+        agrees = True
+        report["half_split"] = {"winner_abs_corr": scores[winner]["half_split_abs_corr"],
+                                "min_corr": config.half_split_min_corr}
+    else:
+        half_a, half_b = _half_split_winners(X, a, shape, groups, config)
+        agrees = bool(half_a == half_b == winner)
     best = scores[winner]
     t1 = standardised_anchor(fit, a)                                   # T(a): the fitted regressor
     certificate = {
@@ -222,7 +363,7 @@ def select_cv_pair(data: SwarmDataset, config: SelectionConfig, *, physical_syst
         "std_unweighted_z2": float(z2.std()),
         "design_measure": design_measure_name,
         "n_frames": int(X.shape[0]), "n_seed_families": int(np.unique(groups).size),
-        "half_split_agrees": bool(half_a == half_b == winner),
+        "half_split_agrees": agrees,
         "selected_gain_nats": best["gain_nats"],
         "max_gain_nats": max(s["gain_nats"] for s in scores.values()),
     }

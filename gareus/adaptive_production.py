@@ -22,10 +22,11 @@ clean production segment suitable for downstream MBAR/FES analysis.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 import copy
 import csv
+import hashlib
 import json
 import logging
 import math
@@ -477,6 +478,25 @@ class AdaptiveDecisionPolicy:
     # Peak-memory ceiling (GB) for the per-epoch union build + MBAR solve top-ups
     # run; an estimate above it skips the phase's diagnostics (no_diagnostics).
     topup_diagnostics_max_gb: float = 8.0
+    # Active-state budget for actions that change the state count (0 = unlimited,
+    # the --max-replicas convention). Only the atomic ``respace_ladder`` action reads
+    # it today; see Section 3.5 of the adaptive-CV2 spec for the wider cap check.
+    max_replicas_budget: int = 0
+    # Adaptive lambda ladder (X1, docs/superpowers/plans/2026-09-29-adaptive-lambda-ladder.md):
+    # between numbered epochs, re-place interior rungs so adjacent overlaps stay >= ladder_min_overlap
+    # (quantile ladder_overlap_quantile over centres); endpoints fixed. "off" keeps today's add_rung.
+    ladder_adapt: str = "off"
+    ladder_min_overlap: float = 0.25
+    ladder_overlap_quantile: float = 0.10
+    ladder_min_ess: float = 200.0
+    ladder_max_rungs: int = 8
+    ladder_hysteresis: float = 0.03
+    ladder_max_moves: int = 2
+
+
+LADDER_SETTINGS_FIELDS = ("ladder_adapt", "ladder_min_overlap", "ladder_overlap_quantile", "ladder_min_ess",
+                          "ladder_max_rungs", "ladder_hysteresis", "ladder_max_moves")
+LADDER_SETTINGS_FILENAME = "ladder_adapt_settings.json"
 
 
 class WindowStateRegistry:
@@ -7154,8 +7174,10 @@ class AdaptiveProductionController:
     remains useful for future in-process Context recycling.
     """
 
-    def __init__(self, registry: WindowStateRegistry, epoch_steps: int = 50000, registry_dir: Optional[Path] = None):
+    def __init__(self, registry: WindowStateRegistry, epoch_steps: int = 50000, registry_dir: Optional[Path] = None,
+                 policy: Optional["AdaptiveDecisionPolicy"] = None):
         self.registry = registry
+        self.policy = policy if policy is not None else AdaptiveDecisionPolicy()
         self.epoch_steps = int(epoch_steps)
         self.registry_dir = None if registry_dir is None else Path(registry_dir)
         self.current_epoch = 0
@@ -7246,6 +7268,61 @@ class AdaptiveProductionController:
             ))
         return created
 
+    def _retire_rung_at_every_centre(self, epoch: int, lam: float, reason: str) -> List[int]:
+        """Retire every active state on rung ``lam`` (all centres); mandatory states are kept.
+
+        Retired states stay in the registry, so their samples remain in the union MBAR with
+        their own Hamiltonian; nothing about any other state changes.
+        """
+        retired: List[int] = []
+        for state in list(self.registry.active_states()):
+            if abs(float(state.gamd_lambda or 0.0) - float(lam)) > 1.0e-9:
+                continue
+            if bool((state.metadata or {}).get("mandatory")):
+                print(f"[adaptive] keeping mandatory state {state.state_id} on retired rung lambda={lam}")
+                continue
+            self.registry.retire_state(int(state.state_id), int(epoch) + 1, str(reason))
+            retired.append(int(state.state_id))
+        return retired
+
+    def _apply_respace_ladder(self, epoch: int, drop: Sequence[float], add: Sequence[float], reason: str) -> bool:
+        """Atomically replace interior rungs: validate everything, then add, then retire.
+
+        Endpoints (lambda = 0 and the current top rung) are never dropped. With a positive
+        ``policy.max_replicas_budget`` the projected active-state count must fit it. A refused
+        action changes nothing. New rungs are new state ids (a state's lambda never changes).
+        """
+        rungs = self.registry.rung_lambdas()
+        if len(rungs) < 2:
+            print(f"[adaptive] refusing respace_ladder: no active lambda ladder ({rungs})")
+            return False
+        lo, hi = rungs[0], rungs[-1]
+        drop = [float(x) for x in drop]
+        add = [float(x) for x in add
+               if not any(abs(float(x) - r) <= 1.0e-9 for r in rungs) and lo < float(x) < hi]
+        if any(abs(x - lo) <= 1.0e-9 or abs(x - hi) <= 1.0e-9 for x in drop):
+            print(f"[adaptive] refusing respace_ladder: endpoints {lo}, {hi} are never dropped (drop={drop})")
+            return False
+        drop = [x for x in drop if any(abs(x - r) <= 1.0e-9 for r in rungs)]
+        if not drop and not add:
+            return False
+        policy = AdaptiveDecisionPolicy()
+        centres = {_centre_group_key(s, policy) for s in self.registry.active_states()}
+        n_drop = sum(1 for s in self.registry.active_states()
+                     if any(abs(float(s.gamd_lambda or 0.0) - x) <= 1.0e-9 for x in drop)
+                     and not bool((s.metadata or {}).get("mandatory")))
+        projected = len(self.registry.active_states()) + len(centres) * len(add) - n_drop
+        budget = int(getattr(self.policy, "max_replicas_budget", 0) or 0)
+        if budget > 0 and projected > budget:
+            print(f"[adaptive] refusing respace_ladder over the replica cap: {projected} active states "
+                  f"projected > max_replicas {budget} (drop={drop}, add={add})")
+            return False
+        for lam in add:
+            self._add_rung_at_every_centre(epoch, lam, reason)
+        for lam in drop:
+            self._retire_rung_at_every_centre(epoch, lam, f"respace_ladder: {reason}")
+        return True
+
     def apply_actions(self, epoch: int, actions: Sequence[Tuple]) -> None:
         for action in actions:
             kind = str(action[0])
@@ -7269,6 +7346,9 @@ class AdaptiveProductionController:
             elif kind == "add_rung":
                 _, lambda_new, reason = action
                 self._add_rung_at_every_centre(epoch, float(lambda_new), str(reason))
+            elif kind == "respace_ladder":
+                _, drop, add, reason = action
+                self._apply_respace_ladder(epoch, drop, add, str(reason))
             elif kind == "tica_coverage_add":
                 _, parent, params, reason, metadata = action
                 self._add_centre_on_every_rung(
@@ -7408,7 +7488,89 @@ def policy_from_args(args: Any) -> AdaptiveDecisionPolicy:
         min_active_states=_arg_int(args, "adaptive_production_min_active_states", _arg_int(args, "min_total_windows", 0) or 8),
         max_target_deviation_sigma=_arg_float(args, "adaptive_production_max_target_deviation_sigma", 3.0),
         coverage_k_stiffen_cap=_arg_float(args, "adaptive_production_coverage_k_stiffen_cap", 10.0),
+        max_replicas_budget=_arg_int(args, "max_replicas", 0),
+        ladder_adapt=str(getattr(args, "adaptive_production_ladder_adapt", "off") or "off"),
+        ladder_min_overlap=_arg_float(args, "adaptive_production_ladder_min_overlap", 0.25),
+        ladder_overlap_quantile=_arg_float(args, "adaptive_production_ladder_overlap_quantile", 0.10),
+        ladder_min_ess=_arg_float(args, "adaptive_production_ladder_min_ess", 200.0),
+        ladder_max_rungs=_arg_int(args, "adaptive_production_ladder_max_rungs", 8),
+        ladder_hysteresis=_arg_float(args, "adaptive_production_ladder_hysteresis", 0.03),
+        ladder_max_moves=_arg_int(args, "adaptive_production_ladder_max_moves", 2),
     )
+
+
+def _resolve_ladder_settings(adaptive_dir: Path, policy: "AdaptiveDecisionPolicy", *,
+                             override: bool = False) -> "AdaptiveDecisionPolicy":
+    """Freeze the adaptive-ladder settings at a campaign's first use; honour them on resume.
+
+    The first job that runs with ``ladder_adapt != "off"`` writes ``ladder_adapt_settings.json``
+    in the campaign's ``adaptive_production`` directory. Every later job uses the recorded values,
+    whatever its own flags say, so a code deploy or a changed default never changes a live
+    campaign's decision rule; ``override`` (``--ap-ladder-adapt-override``) replaces the record.
+    """
+    path = Path(adaptive_dir) / LADDER_SETTINGS_FILENAME
+    current = {f: getattr(policy, f) for f in LADDER_SETTINGS_FIELDS}
+    if path.exists() and not override:
+        recorded = read_json_file(path, {}) or {}
+        values = {f: recorded[f] for f in LADDER_SETTINGS_FIELDS if f in recorded}
+        if values != {f: current[f] for f in values}:
+            print(f"    Adaptive ladder: using the campaign's recorded settings from {path} "
+                  f"({values}); pass --ap-ladder-adapt-override to replace them")
+        return replace(policy, **values)
+    if str(policy.ladder_adapt) != "off" or path.exists():
+        write_json(path, current)
+    return policy
+
+
+def _propose_ladder_respace(adaptive_dir: Path, registry: "WindowStateRegistry", epoch: int,
+                            policy: "AdaptiveDecisionPolicy") -> Tuple[Optional[Tuple], Dict[str, Any]]:
+    """``(("respace_ladder", drop, add, reason) or None, report)`` from this epoch's samples.
+
+    Never raises: any failure is reported (``status: error``) and the ladder is left as it is.
+    """
+    if str(policy.ladder_adapt) != "respace":
+        return None, {"status": "off"}
+    try:
+        from gareus.adaptive import ladder_adapt as la
+        from gareus.mbar_analysis.ladder import load_pep_gamd_envelope
+        rungs = registry.rung_lambdas()
+        if len(rungs) < 2:
+            return None, {"status": "no_ladder", "current": rungs}
+        env = load_pep_gamd_envelope(Path(adaptive_dir))
+        if env is None:
+            return None, {"status": "no_data", "reason": "no frozen Pep-GaMD envelope"}
+        beta = la._campaign_beta(adaptive_dir)
+        phases = la.phase_dirs(adaptive_dir, names=[f"epoch_{int(epoch):03d}"])
+        if not phases:
+            return None, {"status": "no_data", "reason": f"no samples for epoch {epoch}"}
+        states = [s.to_dict() for s in registry.all_states()]
+        samples = la.load_centre_rung_samples(phases, states)
+        models = [m for m in (la.fit_centre_model(r, env, beta) for r in samples.values()) if m is not None]
+        if not models:
+            return None, {"status": "no_data", "reason": "no centre with two sampled rungs"}
+        kw = dict(target=float(policy.ladder_min_overlap), quantile=float(policy.ladder_overlap_quantile),
+                  min_ess=float(policy.ladder_min_ess))
+        design = la.design_ladder(models, lam_max=float(rungs[-1]), max_rungs=int(policy.ladder_max_rungs), **kw)
+        change = la.plan_ladder_change(rungs, models, design, hysteresis=float(policy.ladder_hysteresis),
+                                       max_moves=int(policy.ladder_max_moves), **kw)
+        report = {
+            "status": "ok", "epoch": int(epoch), "n_centres": len(models), "current": [float(x) for x in rungs],
+            "predicted_q": [None if v is None else float(v)
+                            for v in la._predicted(models, rungs, kw["quantile"], kw["min_ess"])],
+            "design": {"lambdas": [float(x) for x in design.lambdas],
+                       "predicted": [None if v is None else float(v) for v in design.predicted],
+                       "min_overlap": design.min_overlap, "feasible": design.feasible, "reason": design.reason},
+            "change": {"drop": list(change.drop), "add": list(change.add), "reason": change.reason},
+            "settings": {f: getattr(policy, f) for f in LADDER_SETTINGS_FIELDS},
+        }
+        if not change.drop and not change.add:
+            return None, report
+        reason = (f"adaptive ladder epoch {epoch}: {change.reason}; current min overlap "
+                  f"{report['predicted_q']} -> design {report['design']['predicted']}")
+        return ("respace_ladder", tuple(change.drop), tuple(change.add), reason), report
+    except Exception as exc:  # the ladder must never break a completed MD epoch
+        logging.warning("adaptive ladder proposal failed for epoch %s: %s", epoch, exc)
+        return None, {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
 
 
 def _epoch_loop_missing_convergence(epoch: int, max_epochs: int, gate_converged: bool,
@@ -7593,6 +7755,8 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
     # a locked segment directory - lock the campaign root itself too.
     acquire_run_lock(adaptive_dir)
     policy = policy_from_args(args)
+    policy = _resolve_ladder_settings(adaptive_dir, policy,
+                                      override=_arg_bool(args, "adaptive_production_ladder_adapt_override", False))
     max_epochs = max(1, _arg_int(args, "adaptive_production_epochs", 3))
     # Epoch 0 also bootstraps the tICA model and (when enabled) the shared GaMD
     # envelope recalibration -- both need only a short look at real sampling, not
@@ -7783,6 +7947,18 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
     for epoch in range(start_epoch, max_epochs):
         epoch_dir = adaptive_dir / f"epoch_{epoch:03d}"
         epoch_dir.mkdir(parents=True, exist_ok=True)
+        # Applied-actions ledger: a job killed after this epoch's registry.save but before the
+        # summary advanced epochs_completed re-enters the epoch with the POST-action registry.
+        # Re-enter it on the pre-action snapshot instead (window map, MD, diagnostics, reports
+        # all describe the states that actually ran) and never propose or apply again.
+        _ledger = _load_applied_actions(epoch_dir, registry_path) if (resume_requested and registry is not None) else None
+        _post_action_registry = None
+        if _ledger is not None and _pre_action_registry_path(epoch_dir).exists():
+            _post_action_registry = registry
+            registry = WindowStateRegistry.load_json(_pre_action_registry_path(epoch_dir))
+            print(f"    Adaptive-production resume: epoch {epoch} actions were already applied "
+                  f"({len(_ledger.get('actions', []))} recorded in {APPLIED_ACTIONS_FILENAME}); re-entering on "
+                  "the pre-action registry, without proposing or applying again")
         scheduled_summary = None
         # For both scheduled and unscheduled paths: recompute default steps from pool
         # when pool is enabled and no explicit override, so each epoch gets its fair share.
@@ -8015,14 +8191,27 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             diagnostics = collect_segmented_epoch_diagnostics(epoch_dir, registry, policy)
             _assert_epoch_has_samples(diagnostics, registry, epoch_dir, int(actual_epoch_steps))
         bridge_plan: List[Dict[str, Any]] = []
-        actions = propose_actions_from_diagnostics(
-            registry, diagnostics, policy=policy,
-            temperature_K=_args_temperature_k(args),
-            # Read live, not from a loop-start snapshot: _apply_tica_cv2_switch
-            # rewrites args.cv2_k_max mid-campaign. See _resolve_secondary_k_max.
-            secondary_k_max=_resolve_secondary_k_max(args),
-            bridge_plan_out=bridge_plan,
-        )
+        if _post_action_registry is not None:
+            actions = [tuple(a) for a in _ledger.get("actions", [])]
+        else:
+            actions = propose_actions_from_diagnostics(
+                registry, diagnostics, policy=policy,
+                temperature_K=_args_temperature_k(args),
+                # Read live, not from a loop-start snapshot: _apply_tica_cv2_switch
+                # rewrites args.cv2_k_max mid-campaign. See _resolve_secondary_k_max.
+                secondary_k_max=_resolve_secondary_k_max(args),
+                bridge_plan_out=bridge_plan,
+            )
+            if str(policy.ladder_adapt) == "respace" and len(registry.rung_lambdas()) > 1:
+                # The adaptive ladder replaces the weak-edge add_rung proposer: it re-places the
+                # whole interior ladder from this epoch's samples (at most ladder_max_moves moves).
+                _ladder_action, _ladder_report = _propose_ladder_respace(adaptive_dir, registry, epoch, policy)
+                actions = [a for a in actions if str(a[0]) != "add_rung"]
+                if _ladder_action is not None:
+                    actions.append(_ladder_action)
+                write_json(epoch_dir / "ladder_adapt_report.json", _ladder_report)
+                print(f"    Adaptive ladder: {_ladder_report.get('status')}; "
+                      f"{(_ladder_report.get('change') or {}).get('reason', '')}")
         action_report = None
         if _arg_bool(args, "adaptive_production_write_action_reports", True):
             try:
@@ -8067,8 +8256,13 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             if seed_bank_report.get("status") == "ok":
                 current_seed_bank = seed_bank_dir
 
-        _apply_registry_actions(registry, actions, epoch)
+        if _post_action_registry is not None:
+            registry = _post_action_registry          # the actions are already in it
+        else:
+            _snapshot_pre_action_registry(epoch_dir, registry)
+            _apply_registry_actions(registry, actions, epoch, policy=policy)
         registry_paths = registry.save(adaptive_dir)
+        _record_applied_actions(epoch_dir, epoch, actions, registry_path)
         runtime_pool_paths = _write_runtime_pool_reports(adaptive_dir, runtime_pool)
 
         next_csv = adaptive_dir / f"windows_epoch_{epoch + 1:03d}.csv"
@@ -8121,8 +8315,12 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                                 secondary_k_max=_resolve_secondary_k_max(args),
                             )
                             _state_ids_before = {s.state_id for s in registry.active_states()}
+                            if _coverage_actions and _post_action_registry is not None:
+                                print("    tICA: coverage actions of this epoch were already applied before the "
+                                      "restart; not applying them again")
+                                _coverage_actions = []
                             if _coverage_actions:
-                                _apply_registry_actions(registry, _coverage_actions, epoch)
+                                _apply_registry_actions(registry, _coverage_actions, epoch, policy=policy)
                             tica_update_report["tica_coverage_actions"] = [
                                 {"action": action[0], "parent_state_id": action[1],
                                  "params": list(action[2]), "reason": action[3],
@@ -8179,6 +8377,9 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                                 print(f"WARNING: seed-bank rescore failed ({_rescore_exc})")
 
                         registry.save(adaptive_dir)
+                        _record_applied_actions(epoch_dir, epoch,
+                                                list(actions) + list(locals().get("_coverage_actions") or []),
+                                                registry_path)
                         # Re-write window CSV so the next epoch sees updated centers.
                         # (Initial write at lines above precedes this block; without
                         # this re-write the center update would be silently lost.)
@@ -8757,8 +8958,77 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
     return payload
 
 
-def _apply_registry_actions(registry: WindowStateRegistry, actions: Sequence[Tuple], epoch: int) -> None:
-    controller = AdaptiveProductionController(registry)
+APPLIED_ACTIONS_FILENAME = "actions_applied.json"
+PRE_ACTION_REGISTRY_FILENAME = "state_registry_pre_actions.json"
+
+
+def _pre_action_registry_path(epoch_dir: Path) -> Path:
+    return Path(epoch_dir) / PRE_ACTION_REGISTRY_FILENAME
+
+
+def _file_sha256(path: Path) -> Optional[str]:
+    path = Path(path)
+    if not path.exists():
+        return None
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _jsonable_action(action: Any) -> Any:
+    if isinstance(action, (list, tuple)):
+        return [_jsonable_action(a) for a in action]
+    if isinstance(action, dict):
+        return {str(k): _jsonable_action(v) for k, v in action.items()}
+    if isinstance(action, (np.floating, np.integer)):
+        return action.item()
+    return action
+
+
+def _snapshot_pre_action_registry(epoch_dir: Path, registry: WindowStateRegistry) -> Path:
+    """Registry as it was when epoch ``epoch_dir`` ran (what its diagnostics must be built on)."""
+    path = _pre_action_registry_path(epoch_dir)
+    tmp = path.with_name(path.name + f".tmp{os.getpid()}")
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    tmp.write_text(json.dumps(registry.to_dict(), sort_keys=True))
+    os.replace(tmp, path)
+    return path
+
+
+def _record_applied_actions(epoch_dir: Path, epoch: int, actions: Sequence[Tuple], registry_path: Path) -> Path:
+    """Atomically record that ``actions`` were applied and saved as ``registry_path``.
+
+    Written right after ``registry.save``: a resume that finds this file with a matching
+    registry digest knows epoch ``epoch``'s actions are already in the registry and must not
+    propose or apply them again (see ``_load_applied_actions``).
+    """
+    path = Path(epoch_dir) / APPLIED_ACTIONS_FILENAME
+    payload = {"epoch": int(epoch), "actions": _jsonable_action(list(actions)),
+               "registry_digest": _file_sha256(registry_path), "written_unix": time.time()}
+    tmp = path.with_name(path.name + f".tmp{os.getpid()}")
+    tmp.write_text(json.dumps(payload, sort_keys=True))
+    os.replace(tmp, path)
+    return path
+
+
+def _load_applied_actions(epoch_dir: Path, registry_path: Path) -> Optional[Dict[str, Any]]:
+    """The epoch's applied-actions ledger if it describes the registry on disk, else None."""
+    path = Path(epoch_dir) / APPLIED_ACTIONS_FILENAME
+    if not path.exists():
+        return None
+    try:
+        ledger = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        print(f"WARNING: unreadable {path} ({exc}); epoch actions will be proposed again")
+        return None
+    if ledger.get("registry_digest") != _file_sha256(registry_path):
+        print(f"WARNING: {path} registry digest does not match {registry_path}; the ledger is stale "
+              "and epoch actions will be proposed again")
+        return None
+    return ledger
+
+
+def _apply_registry_actions(registry: WindowStateRegistry, actions: Sequence[Tuple], epoch: int,
+                            policy: Optional[AdaptiveDecisionPolicy] = None) -> None:
+    controller = AdaptiveProductionController(registry, policy=policy)
     controller.apply_actions(epoch, actions)
 
 

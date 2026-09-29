@@ -256,6 +256,27 @@ def _add_cv_selection_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--cv-selection-min-windows-cv1", type=int, default=4,
                    help="Auto CV2 selection (swarm stage) requires at least this "
                         "many usable CV1 windows before it will select a pair.")
+    p.add_argument("--cv-selection-rank", choices=["slowness", "gain"], default="slowness",
+                   help="Auto CV2 ranking. slowness (default): residual PCs plus conditional "
+                        "tICA modes of the CV1-residualised torsions; the slowest candidate at "
+                        "fixed CV1 wins if it also clears the gain floor, --cv-selection-min-"
+                        "slowness and --cv-selection-min-bimodality, and both seed-family halves "
+                        "agree. gain: the legacy rule (residual PCs only, max information gain).")
+    p.add_argument("--cv-selection-tica-lag-ps", type=float, default=50.0,
+                   help="Lag of the conditional tICA fit (swarm frames within one member).")
+    p.add_argument("--cv-selection-slowness-lag-ps", type=float, default=200.0,
+                   help="Lag of the autocorrelation that ranks candidates at fixed CV1.")
+    p.add_argument("--cv-selection-n-tica", type=int, default=3, choices=[0, 1, 2, 3],
+                   help="Number of conditional tICA candidates (components 7..6+N).")
+    p.add_argument("--cv-selection-min-slowness", type=float, default=0.72,
+                   help="Minimum lag autocorrelation at fixed CV1 (0.72 ~ implied timescale "
+                        ">= 3 lags).")
+    p.add_argument("--cv-selection-min-bimodality", type=float, default=5.0 / 9.0,
+                   help="Minimum Sarle bimodality coefficient of CV2 within some CV1 cell "
+                        "(5/9 = uniform distribution; above it reads as bimodal).")
+    p.add_argument("--cv-selection-half-split-min-corr", type=float, default=0.8,
+                   help="Both seed-family halves, refitted from scratch, must pick a CV2 with "
+                        "|r| >= this against the full-data winner, else cv1_only.")
     p.add_argument("--cv-selection-fallback", choices=["cv1_only", "refuse"],
                    default="cv1_only",
                    help="Auto CV2 selection (swarm stage) behaviour when no pair "
@@ -476,6 +497,27 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                         "(deliberately NOT the pool-derived final target: an extension round runs "
                         "after the final phase already drew its share of the MD pool).")
     p.add_argument("--ap-retire-converged", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--ap-ladder-adapt", choices=["off", "respace"], default="off",
+                   help="Adaptive lambda ladder (off by default). respace: between numbered epochs, "
+                        "re-place the interior Pep-GaMD rungs from each centre's rung samples so every "
+                        "adjacent pair's predicted overlap (a low quantile over centres) is at least "
+                        "--ap-ladder-min-overlap; lambda = 0 and the top rung are fixed; replaces the "
+                        "weak-edge add_rung proposer. Frozen at the campaign's first use "
+                        "(ladder_adapt_settings.json) unless --ap-ladder-adapt-override.")
+    p.add_argument("--ap-ladder-min-overlap", type=float, default=0.25,
+                   help="Minimum adjacent-rung overlap (pairwise MBAR scale, 0..0.5) for --ap-ladder-adapt.")
+    p.add_argument("--ap-ladder-overlap-quantile", type=float, default=0.10,
+                   help="Quantile over centres of the adjacent-rung overlap that must meet the minimum.")
+    p.add_argument("--ap-ladder-min-ess", type=float, default=200.0,
+                   help="Minimum reweighting ESS for a centre to predict a lambda value.")
+    p.add_argument("--ap-ladder-max-rungs", type=int, default=8,
+                   help="Largest ladder the adaptive ladder may design.")
+    p.add_argument("--ap-ladder-hysteresis", type=float, default=0.03,
+                   help="Minimum overlap improvement worth a respace when the ladder already meets the target.")
+    p.add_argument("--ap-ladder-max-moves", type=int, default=2,
+                   help="Interior rungs the adaptive ladder may move per epoch (a respace within this is atomic).")
+    p.add_argument("--ap-ladder-adapt-override", action=argparse.BooleanOptionalAction, default=False,
+                   help="Replace a campaign's recorded --ap-ladder-* settings with this job's flags.")
     p.add_argument("--ap-topups", action=argparse.BooleanOptionalAction, default=False,
                    help="Top-ups (off by default): --no-ap-topups runs each scheduled phase as a single "
                         "all-state baseline only. --ap-topups adds, after that baseline, at most one "
@@ -1503,6 +1545,14 @@ def _shim_adaptive_production(args: argparse.Namespace) -> None:
     args.adaptive_production_bridge_skip_unreachable = args.ap_bridge_skip_unreachable
     args.adaptive_production_retire_converged = args.ap_retire_converged
     args.adaptive_production_topups = args.ap_topups
+    args.adaptive_production_ladder_adapt = args.ap_ladder_adapt
+    args.adaptive_production_ladder_min_overlap = args.ap_ladder_min_overlap
+    args.adaptive_production_ladder_overlap_quantile = args.ap_ladder_overlap_quantile
+    args.adaptive_production_ladder_min_ess = args.ap_ladder_min_ess
+    args.adaptive_production_ladder_max_rungs = args.ap_ladder_max_rungs
+    args.adaptive_production_ladder_hysteresis = args.ap_ladder_hysteresis
+    args.adaptive_production_ladder_max_moves = args.ap_ladder_max_moves
+    args.adaptive_production_ladder_adapt_override = args.ap_ladder_adapt_override
     args.adaptive_production_topup_target_sigma = args.ap_topup_target_sigma
     args.adaptive_production_topup_weak_overlap = args.ap_topup_weak_overlap
     args.adaptive_production_topup_max_fraction = args.ap_topup_max_fraction
