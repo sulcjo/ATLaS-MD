@@ -497,6 +497,18 @@ class AdaptiveDecisionPolicy:
 LADDER_SETTINGS_FIELDS = ("ladder_adapt", "ladder_min_overlap", "ladder_overlap_quantile", "ladder_min_ess",
                           "ladder_max_rungs", "ladder_hysteresis", "ladder_max_moves")
 LADDER_SETTINGS_FILENAME = "ladder_adapt_settings.json"
+# Spec P8: the adaptive DECISION RULES a campaign runs under, frozen at its first job.
+# Budgets, step counts and pool sizes are not decision rules and stay per-job. A later
+# spec item that adds a decision knob (edge metric, layout mode, refine, thresholds)
+# appends its policy field here, so a deploy can never change a live campaign's rules.
+DECISION_SETTINGS_FIELDS = (
+    "target_overlap", "min_exchange_acceptance", "min_rung_overlap", "target_rung_overlap",
+    "max_new_rungs_per_epoch", "min_samples_for_add", "min_samples_for_retire",
+    "max_new_windows_per_epoch", "retire_converged", "duplicate_primary_tol",
+    "duplicate_secondary_tol", "redundant_overlap", "max_target_deviation_sigma",
+    "coverage_k_stiffen_cap", "convergence_min_samples_per_state", "convergence_max_weak_edges",
+)
+DECISION_SETTINGS_FILENAME = "decision_settings.json"
 
 
 class WindowStateRegistry:
@@ -7615,6 +7627,50 @@ def policy_from_args(args: Any) -> AdaptiveDecisionPolicy:
     )
 
 
+def _resolve_decision_settings(adaptive_dir: Path, policy: "AdaptiveDecisionPolicy", *,
+                               override: bool = False) -> Tuple["AdaptiveDecisionPolicy", Dict[str, Any]]:
+    """Freeze the campaign's decision rules at its first job; honour them on every resume (P8).
+
+    Returns ``(policy, record)``. The first job writes ``decision_settings.json`` with this
+    job's values of ``DECISION_SETTINGS_FIELDS``; every later job runs with the recorded
+    values whatever its own flags or the code's defaults say, and prints what it overrode.
+    ``override`` (``--ap-decision-settings-override``) replaces the record with this job's
+    values. A field added to the tuple after a campaign started is recorded from the job
+    that first sees it (the record is extended, never rewritten).
+    """
+    path = Path(adaptive_dir) / DECISION_SETTINGS_FILENAME
+    current = {f: getattr(policy, f) for f in DECISION_SETTINGS_FIELDS}
+    recorded = (read_json_file(path, {}) or {}) if (path.exists() and not override) else {}
+    values = {f: recorded["settings"][f] for f in DECISION_SETTINGS_FIELDS
+              if isinstance(recorded.get("settings"), dict) and f in recorded["settings"]}
+    differs = {f: {"recorded": values[f], "this_job": current[f]} for f in values if values[f] != current[f]}
+    if differs:
+        print(f"    Adaptive decision rules: using the campaign's recorded settings from {path} for "
+              f"{sorted(differs)}; pass --ap-decision-settings-override to replace them")
+    merged = {**current, **values}
+    record = {
+        "schema_version": "adaptive_decision_settings_v1",
+        "settings": merged,
+        "created_unix": recorded.get("created_unix", time.time()),
+        "overridden_by_job": bool(override and path.exists()),
+    }
+    if record["settings"] != recorded.get("settings") or not path.exists():
+        write_json(path, record)
+    return replace(policy, **merged), {**record, "ignored_job_values": differs}
+
+
+def _record_decision_settings_in_manifest(out_dir: Path, record: Dict[str, Any]) -> None:
+    """Mirror the frozen decision rules into the campaign manifest (one key, replaced whole)."""
+    try:
+        from .provenance import update_run_manifest
+        update_run_manifest(out_dir, {"method_settings": {"adaptive_decision_settings": None}})
+        update_run_manifest(out_dir, {"method_settings": {"adaptive_decision_settings": {
+            "settings": record["settings"], "file": DECISION_SETTINGS_FILENAME,
+            "ignored_job_values": record.get("ignored_job_values", {})}}})
+    except Exception as exc:                   # the settings file is authoritative; the mirror is a record
+        print(f"WARNING: could not record the adaptive decision settings in the run manifest ({exc})")
+
+
 def _resolve_ladder_settings(adaptive_dir: Path, policy: "AdaptiveDecisionPolicy", *,
                              override: bool = False) -> "AdaptiveDecisionPolicy":
     """Freeze the adaptive-ladder settings at a campaign's first use; honour them on resume.
@@ -7828,6 +7884,9 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
     policy = policy_from_args(args)
     policy = _resolve_ladder_settings(adaptive_dir, policy,
                                       override=_arg_bool(args, "adaptive_production_ladder_adapt_override", False))
+    policy, _decision_record = _resolve_decision_settings(
+        adaptive_dir, policy, override=_arg_bool(args, "adaptive_production_decision_settings_override", False))
+    _record_decision_settings_in_manifest(out_dir, _decision_record)
     max_epochs = max(1, _arg_int(args, "adaptive_production_epochs", 3))
     # Epoch 0 also bootstraps the tICA model and (when enabled) the shared GaMD
     # envelope recalibration -- both need only a short look at real sampling, not

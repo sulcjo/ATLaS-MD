@@ -518,6 +518,10 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                    help="Interior rungs the adaptive ladder may move per epoch (a respace within this is atomic).")
     p.add_argument("--ap-ladder-adapt-override", action=argparse.BooleanOptionalAction, default=False,
                    help="Replace a campaign's recorded --ap-ladder-* settings with this job's flags.")
+    p.add_argument("--ap-decision-settings-override", action=argparse.BooleanOptionalAction, default=False,
+                   help="Replace a campaign's recorded adaptive decision rules (overlap targets, sample "
+                        "floors, per-epoch add limits, duplicate tolerances; adaptive_production/"
+                        "decision_settings.json, frozen at the campaign's first job) with this job's values.")
     p.add_argument("--ap-topups", action=argparse.BooleanOptionalAction, default=False,
                    help="Top-ups (off by default): --no-ap-topups runs each scheduled phase as a single "
                         "all-state baseline only. --ap-topups adds, after that baseline, at most one "
@@ -1553,6 +1557,7 @@ def _shim_adaptive_production(args: argparse.Namespace) -> None:
     args.adaptive_production_ladder_hysteresis = args.ap_ladder_hysteresis
     args.adaptive_production_ladder_max_moves = args.ap_ladder_max_moves
     args.adaptive_production_ladder_adapt_override = args.ap_ladder_adapt_override
+    args.adaptive_production_decision_settings_override = args.ap_decision_settings_override
     args.adaptive_production_topup_target_sigma = args.ap_topup_target_sigma
     args.adaptive_production_topup_weak_overlap = args.ap_topup_weak_overlap
     args.adaptive_production_topup_max_fraction = args.ap_topup_max_fraction

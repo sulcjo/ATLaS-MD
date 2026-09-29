@@ -486,8 +486,8 @@ then 3.1-3.3, X5, X6; X2 and X4 last.
 
 ## 13. Implementation status (2026-09-29)
 
-X1, P3 and the CV2 selection are in PR #111 (`feat/cv2-conditional-tica`). P6, 3.5, 3.6 and the two
-X1 gap fixes are on `feat/adaptive-cv2-prereqs` (stacked on #111), uncommitted.
+X1, P3 and the CV2 selection are in PR #111 (`feat/cv2-conditional-tica`). P6, 3.5, 3.6, P8 and the two
+X1 gap fixes are in PR #113 (`feat/adaptive-cv2-prereqs`, stacked on #111).
 
 | Item | Status | Where |
 |---|---|---|
@@ -495,7 +495,7 @@ X1 gap fixes are on `feat/adaptive-cv2-prereqs` (stacked on #111), uncommitted.
 | X1 adaptive lambda ladder | done, redesigned: keeps lambda = 0 and the top rung, respaces/adds/drops interior rungs to a 0.25 minimum overlap (not "drop lambda = 1") | `gareus/adaptive/ladder_adapt.py`, `--ap-ladder-adapt`; plan `docs/superpowers/plans/2026-09-29-adaptive-lambda-ladder.md` |
 | P3 applied-actions ledger, resume idempotence | done (all campaigns); kill/resume verified end to end through the real epoch loop | `_record_applied_actions` / `_load_applied_actions`, epoch loop; `tests/test_ladder_adapt_resume_e2e.py` |
 | Seeding of states created by actions (add, add_rung, respace_ladder, split) | done: the nearest-seed assignment is re-run after the actions are applied; before, a segment holding only new states got the bank's first rows (`generic_fallback`) | `_reassign_seeds_after_actions`; `tests/test_seed_assignment_after_actions.py` |
-| P8 frozen method settings | partial: ladder settings only (`ladder_adapt_settings.json`) | `_resolve_ladder_settings` |
+| P8 frozen method settings | done: ladder settings (`ladder_adapt_settings.json`) plus the adaptive decision rules (`DECISION_SETTINGS_FIELDS` -> `adaptive_production/decision_settings.json`, mirrored to `run_manifest.method_settings["adaptive_decision_settings"]`), frozen at the first job, honoured on resume, `--ap-decision-settings-override` replaces; budgets stay per-job; later decision knobs (edge metric, layout mode, refine) append their field to the tuple; each epoch action report already stamps the full resolved policy | `_resolve_decision_settings`; `tests/test_decision_settings_frozen.py` |
 | 3.5 replica cap | done except the priority order (a no-op until 3.1/3.3): phase-start refusal at all four launch sites (checkpointed phase resumes with a warning); every add/add_rung/split/coverage apply reads the budget from the live registry; plain-run truncation moved before the window table, neighbour graph and map repair, and a fast resume keeps its checkpointed window set | `_require_phase_within_replica_cap`, `AdaptiveProductionController._within_replica_budget`, `production.run_gareus`; `tests/test_replica_cap.py` |
 | P6 restraint-aware identity | done: `_centre_group_key`, `has_near_duplicate`, `ladder_overlap_by_axis` (new `secondary_k`) and `ladder_adapt.centre_key` key an unrestrained axis as None; k not recorded counts as restrained, so old registries key as before | `tests/test_restraint_aware_identity.py` |
 | 3.6 labels and refit safety | done: `cv2_component` (family, index, tICA lag frames/ps) in `cv_selection_report.json` and `run_manifest.method_settings`; a frozen residual pair refuses tICA refit (skip + warning), tIC1 recentring (raises) and the tica-linear switch, and a resume that finds a recorded switch fails closed; contract rule "PCA indices precede tICA indices, no gaps" replaces "tICA iff index > 6" (c8/c9 artifacts validate to the same digests) | `gareus/cv_selection/labels.py`, `_frozen_residual_pair`, `contracts._require_family_order`; `tests/test_cv2_labels_refit_safety.py` |
