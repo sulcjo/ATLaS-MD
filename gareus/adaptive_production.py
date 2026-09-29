@@ -43,6 +43,7 @@ from .io import write_json, write_text_atomic, read_json_file, resolve_run_tempe
 from .lifecycle import _graceful_shutdown
 from .store import SegmentRegistry
 from .extension_seeding import extension_parent_dirs
+from .adaptive.pair_runtime import GATE_REPORT_NAME, gate_from_args
 # Real-frame seed extraction lives in tica.py (a dependency-free leaf module)
 # so seeding.py can also use it for campaign-wide seed search without a
 # circular import - seeding.py -> production.py -> adaptive_production.py is
@@ -492,6 +493,9 @@ class AdaptiveDecisionPolicy:
     ladder_max_rungs: int = 8
     ladder_hysteresis: float = 0.03
     ladder_max_moves: int = 2
+    # Spec 3.4 coupling gate on adaptive k2 (gareus.adaptive.pair_runtime), off by default.
+    cv2_coupling_gate: bool = False
+    max_coupling_fraction: float = 0.25
 
 
 LADDER_SETTINGS_FIELDS = ("ladder_adapt", "ladder_min_overlap", "ladder_overlap_quantile", "ladder_min_ess",
@@ -507,6 +511,7 @@ DECISION_SETTINGS_FIELDS = (
     "max_new_windows_per_epoch", "retire_converged", "duplicate_primary_tol",
     "duplicate_secondary_tol", "redundant_overlap", "max_target_deviation_sigma",
     "coverage_k_stiffen_cap", "convergence_min_samples_per_state", "convergence_max_weak_edges",
+    "cv2_coupling_gate", "max_coupling_fraction",
 )
 DECISION_SETTINGS_FILENAME = "decision_settings.json"
 
@@ -4680,6 +4685,7 @@ def propose_actions_from_diagnostics(
     temperature_K: float = 298.0,
     secondary_k_max: Optional[float] = None,
     bridge_plan_out: Optional[List[Dict[str, Any]]] = None,
+    coupling_gate: Optional[Any] = None,
 ) -> List[Tuple]:
     """Propose registry-changing actions from one epoch's diagnostics.
 
@@ -5018,6 +5024,18 @@ def propose_actions_from_diagnostics(
                 secondary_k_max,
                 context=f"weak-edge bridge {s1.state_id}-{s2.state_id}",
             )
+            if coupling_gate is not None and secondary_k is not None:
+                # Spec 3.4, after the cv2_k_max cap: lower k2 to the largest value whose CV1
+                # curvature passes; below cv2_k_min the bridge is not created (None here would
+                # mean a CV1-only state, so refuse with continue instead).
+                secondary_k, _gate_note = coupling_gate.gate(
+                    primary, primary_k, secondary, secondary_k,
+                    context=f"weak-edge bridge {s1.state_id}-{s2.state_id}")
+                if secondary_k is None:
+                    print(f"[adaptive] {_gate_note}")
+                    continue
+                if _gate_note:
+                    _k_warning = f"{_k_warning}; {_gate_note}" if _k_warning else _gate_note
             params = (primary, primary_k, secondary, secondary_k)
             placed_this_edge += 1
             reason = (
@@ -7624,6 +7642,8 @@ def policy_from_args(args: Any) -> AdaptiveDecisionPolicy:
         ladder_max_rungs=_arg_int(args, "adaptive_production_ladder_max_rungs", 8),
         ladder_hysteresis=_arg_float(args, "adaptive_production_ladder_hysteresis", 0.03),
         ladder_max_moves=_arg_int(args, "adaptive_production_ladder_max_moves", 2),
+        cv2_coupling_gate=_arg_bool(args, "adaptive_production_cv2_coupling_gate", False),
+        max_coupling_fraction=_arg_float(args, "adaptive_production_max_coupling_fraction", 0.25),
     )
 
 
@@ -8343,6 +8363,7 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
         if _post_action_registry is not None:
             actions = [tuple(a) for a in _ledger.get("actions", [])]
         else:
+            _coupling_gate = gate_from_args(args, out_dir, policy, temperature_k=_args_temperature_k(args))
             actions = propose_actions_from_diagnostics(
                 registry, diagnostics, policy=policy,
                 temperature_K=_args_temperature_k(args),
@@ -8350,7 +8371,13 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                 # rewrites args.cv2_k_max mid-campaign. See _resolve_secondary_k_max.
                 secondary_k_max=_resolve_secondary_k_max(args),
                 bridge_plan_out=bridge_plan,
+                coupling_gate=_coupling_gate,
             )
+            if _coupling_gate is not None:
+                try:
+                    write_json(epoch_dir / GATE_REPORT_NAME, _coupling_gate.report())
+                except Exception as exc:          # a report must never invalidate a completed epoch
+                    print(f"WARNING: failed to write {GATE_REPORT_NAME} for epoch {epoch}: {exc}")
             if str(policy.ladder_adapt) == "respace" and len(registry.rung_lambdas()) > 1:
                 # The adaptive ladder replaces the weak-edge add_rung proposer: it re-places the
                 # whole interior ladder from this epoch's samples (at most ladder_max_moves moves).

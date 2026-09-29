@@ -284,6 +284,16 @@ def _add_cv_selection_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--swarm-n-windows-cv2", type=int, default=4,
                    help="Number of CV2 window centres the swarm stage proposes for "
                         "the frozen residual-torsion-pc pair.")
+    p.add_argument("--swarm-cv2-coupling-gate", action=argparse.BooleanOptionalAction, default=False,
+                   help="Spec 3.4 at the swarm layout (off by default: the 'narrows CV1 windows' check "
+                        "stays a warning): every 2-D layout cell's k2 is lowered to the largest value whose "
+                        "CV2-induced CV1 curvature is <= --swarm-cv2-max-coupling-fraction of the cell's "
+                        "designed CV1 curvature (k1 + F''); a cell whose passing k2 is below --cv2-k-min "
+                        "fails the swarm gate (cv2_coupling).")
+    p.add_argument("--swarm-cv2-max-coupling-fraction", type=float, default=0.25,
+                   help="Largest CV2-induced CV1 curvature, as a fraction of the cell's designed CV1 "
+                        "curvature, --swarm-cv2-coupling-gate accepts (a different quantity from "
+                        "--cv-selection-max-coupling-fraction, which judges candidates at a reference k2).")
     p.add_argument("--legacy-model-policy", choices=["refuse", "allow-v1"], default="refuse",
                    dest="legacy_model_policy",
                    help="v1 residual pair-model artifacts (pre thermodynamic repair F02) describe a coordinate "
@@ -522,6 +532,16 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                    help="Replace a campaign's recorded adaptive decision rules (overlap targets, sample "
                         "floors, per-epoch add limits, duplicate tolerances; adaptive_production/"
                         "decision_settings.json, frozen at the campaign's first job) with this job's values.")
+    p.add_argument("--ap-cv2-coupling-gate", action=argparse.BooleanOptionalAction, default=False,
+                   help="Spec 3.4 coupling gate on adaptive k2 (off by default): a bridge's k2 whose CV2 "
+                        "umbrella would add more than --ap-max-coupling-fraction of the window's CV1 "
+                        "curvature is lowered to the largest passing value; below --cv2-k-min the bridge "
+                        "is not created. Only for residual-torsion-pc with a bound, digest-verified pair "
+                        "model; otherwise recorded NA (epoch_NNN/cv2_coupling_gate.json) and nothing is "
+                        "blocked. A decision rule: frozen with the campaign's other rules.")
+    p.add_argument("--ap-max-coupling-fraction", type=float, default=0.25,
+                   help="Largest CV2-induced CV1 curvature, as a fraction of RT/sigma_w1^2, the adaptive "
+                        "coupling gate accepts.")
     p.add_argument("--ap-topups", action=argparse.BooleanOptionalAction, default=False,
                    help="Top-ups (off by default): --no-ap-topups runs each scheduled phase as a single "
                         "all-state baseline only. --ap-topups adds, after that baseline, at most one "
@@ -1558,6 +1578,8 @@ def _shim_adaptive_production(args: argparse.Namespace) -> None:
     args.adaptive_production_ladder_max_moves = args.ap_ladder_max_moves
     args.adaptive_production_ladder_adapt_override = args.ap_ladder_adapt_override
     args.adaptive_production_decision_settings_override = args.ap_decision_settings_override
+    args.adaptive_production_cv2_coupling_gate = args.ap_cv2_coupling_gate
+    args.adaptive_production_max_coupling_fraction = args.ap_max_coupling_fraction
     args.adaptive_production_topup_target_sigma = args.ap_topup_target_sigma
     args.adaptive_production_topup_weak_overlap = args.ap_topup_weak_overlap
     args.adaptive_production_topup_max_fraction = args.ap_topup_max_fraction

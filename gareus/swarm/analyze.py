@@ -613,6 +613,7 @@ def analyze_swarm_stage(out_dir, args) -> dict:
         # --- automatic CV2 selection against the configured contact anchor ------------
         selection: Optional[Dict[str, Any]] = None
         pair_layout: Optional[tuple] = None
+        coupling_gate: Optional[Dict[str, Any]] = None
         pair_paths: Optional[dict] = None
         if secondary_cv_mode(args) == "auto":
             contact_pairs = _swarm_contact_pairs(out_dir, args, warnings)
@@ -685,7 +686,8 @@ def analyze_swarm_stage(out_dir, args) -> dict:
                 # the CV1 windows are narrower than their own k says by this much.
                 coupling = coupling_curvature_kcal(fit, j, max(ks2))
                 shrink = [1.0 - math.sqrt(float(k) / (float(k) + coupling)) for k in ks]
-                if max(shrink) > 0.10:
+                # With --swarm-cv2-coupling-gate the per-cell gate below replaces this warning.
+                if max(shrink) > 0.10 and not bool(getattr(args, "swarm_cv2_coupling_gate", False)):
                     warnings.append(f"cv selection: the CV2 umbrella narrows CV1 windows by up to "
                                     f"{100 * max(shrink):.0f}% (coupling curvature {coupling:.1f} kcal/mol/CV^2 "
                                     f"at k2={max(ks2):.2f}); the CV1 overlap design assumed k1 alone")
@@ -699,6 +701,16 @@ def analyze_swarm_stage(out_dir, args) -> dict:
                     "cv1_width_shrink_max": float(max(shrink)),
                 })
                 rows_2d = layout_rows(layout, centers, ks, cv2_design["centers"], ks2) if layout["cells"] else []
+                if bool(getattr(args, "swarm_cv2_coupling_gate", False)) and rows_2d:
+                    # Spec 3.4: per cell, lower k2 to the largest value that keeps the CV2-induced
+                    # CV1 curvature within the fraction; the design k2 stays in cv2_k_kcal.
+                    from ..cv_selection.coupling import gate_layout_rows
+                    rows_2d, coupling_gate = gate_layout_rows(
+                        fit, j, rows_2d, layout["cells"], curvature, temperature_k=temperature_k,
+                        pooled_cv1_sd=float(np.std(cv1_all)),
+                        max_fraction=float(getattr(args, "swarm_cv2_max_coupling_fraction", 0.25)),
+                        k_min=k2_min)
+                    selection["cv2_coupling_gate"] = coupling_gate
                 plan_record = layout_plan_record(layout, rows_2d, ladder["lambdas"],
                                                  region_inventory=report["region_inventory"],
                                                  region_of_centre=region_of_centre)
@@ -720,6 +732,7 @@ def analyze_swarm_stage(out_dir, args) -> dict:
             selection=selection,
             pair_fallback=str(getattr(args, "cv_selection_fallback", "cv1_only") or "cv1_only"),
             layout_plan=(pair_layout[4] if pair_layout is not None else None),
+            **({"cv2_coupling": coupling_gate} if coupling_gate is not None else {}),
         )
         write_json(an / "swarm_gate.json", gate)
         # Also fold gate warnings (e.g. ladder_ess_gate's advisory ESS/extrapolation
