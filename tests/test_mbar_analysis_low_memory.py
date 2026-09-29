@@ -93,3 +93,18 @@ def test_low_memory_parquet_does_not_start_parallel_executor(tmp_path, monkeypat
     data = parquet_loaders.load_parquet_adaptive_union(adaptive, low_memory=True)
 
     assert data.cv.tolist() == [1.0, 2.0]
+
+
+def test_low_memory_block_spool_avoids_concatenate_peak(tmp_path):
+    """Low-memory merge writes blocks into one disk-backed matrix."""
+    blocks = [
+        __import__('numpy').arange(6, dtype=float).reshape(2, 3),
+        __import__('numpy').arange(9, 15, dtype=float).reshape(2, 3),
+    ]
+    matrix, path = parquet_loaders._spool_u_nk_blocks(blocks, tmp_path)
+    try:
+        assert isinstance(matrix, __import__('numpy').memmap)
+        assert matrix.shape == (4, 3)
+        __import__('numpy').testing.assert_array_equal(matrix, __import__('numpy').vstack(blocks))
+    finally:
+        path.unlink(missing_ok=True)
