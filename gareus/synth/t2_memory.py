@@ -2,7 +2,7 @@
 
 Runs ``gareus.synth.union_solve_bench`` in a FRESH subprocess per (states, rows) point
 (``ru_maxrss`` is the process-lifetime peak) and compares the measured peak RSS with
-``estimate_union_diagnostics_peak_gb`` (``UNION_PEAK_BYTES_PER_CELL`` = 8 B x 7.7, the
+``estimate_union_diagnostics_peak_gb`` (0.9 GB fixed + 8 B x 7.7 per cell, the
 guard behind ``--ap-topup-diagnostics-max-gb``). States = centres x 4 rungs. Also reports,
 per state count, the largest kept row count the 8 GB default guard admits.
 
@@ -31,7 +31,7 @@ def run_point(n_centres: int, n_rows: int) -> dict:
 
 
 def main(argv=None) -> int:
-    from gareus.adaptive.union_diagnostics import UNION_PEAK_BYTES_PER_CELL, estimate_union_diagnostics_peak_gb
+    from gareus.adaptive.union_diagnostics import estimate_union_diagnostics_peak_gb, max_union_rows_under_guard
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--out", required=True)
     a = p.parse_args(argv)
@@ -41,7 +41,7 @@ def main(argv=None) -> int:
         est = estimate_union_diagnostics_peak_gb(r["n_rows"], r["n_states"])
         r.update(estimated_peak_gb=round(est, 2),
                  measured_over_estimate=round(r["peak_rss_gb_after_call"] / est, 2) if est else None,
-                 guard_max_rows_at_8gb=int(GUARD_GB * 1e9 / (r["n_states"] * UNION_PEAK_BYTES_PER_CELL)))
+                 guard_max_rows_at_8gb=max_union_rows_under_guard(GUARD_GB, r["n_states"]))
         rows.append(r)
         print(json.dumps(r), flush=True)
     out = Path(a.out)

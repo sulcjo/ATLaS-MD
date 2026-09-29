@@ -544,9 +544,10 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                         "min_rung_overlap; also grades every same-rung pair within the restraint-width "
                         "radius plus spanning edges for axis/anchor states. A decision rule: frozen with "
                         "the campaign's decision settings.")
-    p.add_argument("--ap-min-edge-neff", type=float, default=200.0,
+    p.add_argument("--ap-min-edge-neff", type=float, default=100.0,
                    help="Effective samples per state (blocking) below which a pairwise-mbar edge is "
-                        "unmeasured (never weak).")
+                        "unmeasured (never weak). Default 100 (spec T2: floor 200's false-weak/-strong "
+                        "rates, 35 %% vs 47 %% of edges unmeasured). Frozen with the decision settings.")
     p.add_argument("--ap-decision-settings-override", action=argparse.BooleanOptionalAction, default=False,
                    help="Replace a campaign's recorded adaptive decision rules (overlap targets, sample "
                         "floors, per-epoch add limits, duplicate tolerances; adaptive_production/"
@@ -600,7 +601,7 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--ap-topup-diagnostics-max-gb", type=float, default=8.0,
                    help="Skip a phase's top-up diagnostics (no top-up, reason no_diagnostics) when the "
                         "per-epoch union build + MBAR solve is estimated to peak above this many GB "
-                        "(kept rows x states x 8 B x 7.7, measured at 236 states).")
+                        "(0.9 GB + kept rows x states x 8 B x 7.7, measured at 60-400 states).")
     p.add_argument("--ap-gamd-boost-sd-warn", type=float, default=6.0)
     p.add_argument("--ap-write-reports", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--md-budget-ns", type=float, default=0.0,

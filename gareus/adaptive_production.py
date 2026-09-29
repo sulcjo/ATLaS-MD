@@ -507,9 +507,10 @@ class AdaptiveDecisionPolicy:
     slow_mode_reseed_fraction: float = 0.0
     # Spec 3.1 edge metric (gareus/adaptive/edge_metric.py): "marginal" = today's CV1
     # histogram overlap; "pairwise-mbar" = two-state MBAR overlap graded against
-    # min_rung_overlap, unmeasured below min_edge_neff effective samples per state.
+    # min_rung_overlap, unmeasured below min_edge_neff effective samples per state
+    # (100 from the spec-T2 calibration: floor 200's error rates, fewer edges unmeasured).
     edge_metric: str = "marginal"
-    min_edge_neff: float = 200.0
+    min_edge_neff: float = 100.0
 
 
 LADDER_SETTINGS_FIELDS = ("ladder_adapt", "ladder_min_overlap", "ladder_overlap_quantile", "ladder_min_ess",
@@ -7766,7 +7767,7 @@ def policy_from_args(args: Any) -> AdaptiveDecisionPolicy:
         max_coupling_fraction=_arg_float(args, "adaptive_production_max_coupling_fraction", 0.25),
         slow_mode_reseed_fraction=_arg_float(args, "adaptive_production_slow_mode_reseed_fraction", 0.0),
         edge_metric=str(getattr(args, "adaptive_production_edge_metric", "marginal") or "marginal"),
-        min_edge_neff=_arg_float(args, "adaptive_production_min_edge_neff", 200.0),
+        min_edge_neff=_arg_float(args, "adaptive_production_min_edge_neff", 100.0),
     )
 
 

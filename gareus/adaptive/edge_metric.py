@@ -44,7 +44,7 @@ first level whose successor is not higher by more than its error is the
 plateau (else the last level with >= ``MIN_BLOCKS`` blocks, flagged
 ``plateau: False`` -- a lower bound). tau = (g - 1) / 2 in subsample frames,
 N_eff = n / g. An edge is graded only if both states have
-N_eff >= ``min_edge_neff`` (200); below it it is "unmeasured" and never weak.
+N_eff >= ``min_edge_neff`` (100, spec-T2 calibration); below it it is "unmeasured" and never weak.
 The decision uses a moving-block bootstrap (block length >= 2 tau, i.e.
 ceil(g), blocks never straddle a source), df re-solved per replicate, seeded
 from the edge's state ids: an edge is weak only if the UPPER 90 % quantile is
@@ -122,7 +122,7 @@ from gareus.units import K_B_KJ_PER_MOL_K, KJ_PER_KCAL
 EDGE_METRICS = ("marginal", "pairwise-mbar")
 DEFAULT_EDGE_METRIC = "marginal"
 PAIRWISE_MBAR = "pairwise-mbar"
-DEFAULT_MIN_EDGE_NEFF = 200.0
+DEFAULT_MIN_EDGE_NEFF = 100.0
 N_BOOTSTRAP = 200
 BOOTSTRAP_QUANTILES = (0.10, 0.90)
 MIN_BLOCKS = 16
