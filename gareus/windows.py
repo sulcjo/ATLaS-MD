@@ -1443,12 +1443,14 @@ def load_explicit_2d_window_csv(args, path: Path) -> tuple[np.ndarray, list[floa
     _plan_path = Path(path).parent / "layout_plan.json"
     if _plan_path.exists():
         try:
-            _plan = json.loads(_plan_path.read_text(encoding="utf-8"))
-            _states = list(_plan.get("states") or [])
+            from .layout_plan import read_layout_plan, schema_version
+            _plan, _states = read_layout_plan(_plan_path)
             if _states and len(_states) == len(window_metadata.get("gamd_lambdas", [])):
-                window_metadata["state_roles"] = [s.get("role") for s in _states]
-                window_metadata["mandatory_window_indices"] = [int(s["state_id"]) for s in _states if s.get("mandatory")]
+                window_metadata["state_roles"] = [s.role for s in _states]
+                window_metadata["mandatory_window_indices"] = [int(s.state_id) for s in _states if s.mandatory]
+                window_metadata["state_regions"] = [s.region for s in _states]
                 window_metadata["layout_plan_path"] = str(_plan_path)
+                window_metadata["layout_plan_schema_version"] = int(schema_version(_plan))
         except (OSError, ValueError, KeyError, TypeError) as exc:
             print(f"WARNING: layout_plan.json beside {path} could not be read ({exc!r}); mandatory-state guards inactive")
 

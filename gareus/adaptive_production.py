@@ -904,13 +904,15 @@ def registry_from_window_csv(path: Path, epoch: int = 0, source: str = "window_c
     _plan_path = Path(path).parent / "layout_plan.json"
     if _plan_path.exists():
         try:
-            _plan = json.loads(_plan_path.read_text(encoding="utf-8"))
-            _states = list(_plan.get("states") or [])
+            from .layout_plan import read_layout_plan
+            _plan, _states = read_layout_plan(_plan_path)
             _active = reg.all_states()
             if _states and len(_states) == len(_active):
                 for st, rec in zip(_active, _states):
-                    st.metadata["state_role"] = rec.get("role")
-                    st.metadata["mandatory"] = bool(rec.get("mandatory"))
+                    st.metadata["state_role"] = rec.role
+                    st.metadata["mandatory"] = bool(rec.mandatory)
+                    if rec.region is not None:
+                        st.metadata["region"] = rec.region
         except (OSError, ValueError, KeyError, TypeError) as exc:
             print(f"WARNING: layout_plan.json beside {path} could not be read ({exc!r}); mandatory-state guards inactive")
     return reg

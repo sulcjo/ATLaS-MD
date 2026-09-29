@@ -349,3 +349,88 @@ def test_pattern_link_is_never_weak_and_gives_no_redundancy_credit():
              "overlap": 0.95 if t == "pattern_link" else 0.35} for a, b, t, _d in geom]   # ok, not redundant
     acts = propose_actions_from_diagnostics(reg, _diag(reg, rows), AdaptiveDecisionPolicy(min_active_states=1))
     assert not [a for a in acts if a[0] == "retire"]
+
+
+# ---- D: layout_plan.json schema v2 ---------------------------------------------------------
+
+def _swarm_plan(n1=4, n2=3, n_rungs=2, cap=40, reps=(3,)):
+    from gareus.swarm.ladder_design import design_exploration_layout, layout_plan_record, layout_rows
+    plan = design_exploration_layout(n1, n2, n_rungs=n_rungs, max_replicas=cap, region_centre_indices=list(reps))
+    rows = layout_rows(plan, np.linspace(0.1, 0.9, n1), np.full(n1, 200.0), np.linspace(-1, 1, n2), np.full(n2, 0.7))
+    lambdas = list(np.linspace(0.0, 1.0, n_rungs))
+    region_of_centre = ["cv1_region_00"] * (n1 - 1) + ["cv1_region_01"]
+    inventory = {"regions": [{"region_id": "cv1_region_00"}, {"region_id": "cv1_region_01"}],
+                 "region_of_centre": region_of_centre, "unresolved": []}
+    rec = layout_plan_record(plan, rows, lambdas, region_inventory=inventory, region_of_centre=region_of_centre)
+    return plan, rows, lambdas, rec
+
+
+def test_layout_plan_v2_lists_every_state_with_region_and_pattern_and_round_trips(tmp_path):
+    import json
+    from gareus.layout_plan import LAYOUT_PLAN_V2, read_layout_plan
+    plan, rows, lambdas, rec = _swarm_plan()
+    assert rec["version"] == LAYOUT_PLAN_V2 and rec["schema_version"] == 2
+    assert len(rec["states"]) == rec["n_states"] == len(plan["cells"]) * len(lambdas)
+    for s in rec["states"]:
+        assert {"state_id", "center1", "k1", "center2", "k2", "region", "role", "restrained"} <= set(s)
+        assert s["restrained"] == [s["k1"] > 0, s["k2"] > 0]
+        assert (s["region"] is None) == (s["cell"][0] is None)
+    anchor = rec["states"][0]
+    assert anchor["role"] == "unrestrained_anchor" and anchor["region"] is None and anchor["restrained"] == [False, False]
+    (tmp_path / "layout_plan.json").write_text(json.dumps(rec))
+    raw, states = read_layout_plan(tmp_path / "layout_plan.json")
+    assert [(s.state_id, s.role, s.mandatory, s.region, s.restrained) for s in states] == \
+        [(r["state_id"], r["role"], r["mandatory"], r["region"], tuple(r["restrained"])) for r in rec["states"]]
+
+
+def test_a_v1_layout_plan_still_reads_with_region_from_the_inventory(tmp_path):
+    import json
+    from gareus.layout_plan import read_layout_plan, schema_version
+    _plan, _rows, _lambdas, rec = _swarm_plan()
+    v1 = dict(rec, version="layout_plan_v1")
+    v1.pop("schema_version")
+    v1["states"] = [{k: v for k, v in s.items() if k not in ("region", "restrained")} for s in rec["states"]]
+    (tmp_path / "layout_plan.json").write_text(json.dumps(v1))
+    raw, states = read_layout_plan(tmp_path / "layout_plan.json")
+    assert schema_version(raw) == 1
+    assert [(s.region, s.restrained, s.role, s.mandatory) for s in states] == \
+        [(r["region"], tuple(r["restrained"]), r["role"], r["mandatory"]) for r in rec["states"]]
+
+
+C9_LAYOUT_PLAN = C9_REGISTRY.parents[1] / "swarm" / "analysis" / "layout_plan.json"
+
+
+@pytest.mark.skipif(not C9_LAYOUT_PLAN.exists(), reason="chignolin_9 layout plan not available")
+def test_the_real_chignolin9_v1_plan_reads():
+    from gareus.layout_plan import read_layout_plan, schema_version
+    raw, states = read_layout_plan(C9_LAYOUT_PLAN)
+    assert schema_version(raw) == 1 and len(states) == 236
+    assert states[0].role == "unrestrained_anchor" and states[0].restrained == (False, False)
+    assert {s.region for s in states if s.restrained[0]} == {"cv1_region_00"}
+    assert all(s.region is None for s in states if not s.restrained[0])
+
+
+@pytest.mark.parametrize("version", ["v1", "v2"])
+def test_both_loaders_take_roles_from_either_schema(tmp_path, version):
+    import json
+    from gareus.adaptive_production import registry_from_window_csv
+    from gareus.swarm.ladder_design import write_ladder_windows_2d_csv
+    from gareus.windows import load_explicit_2d_window_csv
+    _plan, rows, lambdas, rec = _swarm_plan()
+    if version == "v1":
+        rec = dict(rec, version="layout_plan_v1", states=[{k: v for k, v in s.items() if k not in ("region", "restrained")}
+                                                          for s in rec["states"]])
+        rec.pop("schema_version")
+    path = write_ladder_windows_2d_csv(tmp_path / "windows_lambda_ladder.csv", rows, lambdas)
+    (tmp_path / "layout_plan.json").write_text(json.dumps(rec))
+
+    class Args:
+        primary_cv = "nonlocal-contacts"; secondary_cv = "residual-torsion-pc"; contact_k_kcal = None
+        secondary_cv_k_kcal = 1.0
+    *_rest, meta = load_explicit_2d_window_csv(Args(), path)
+    assert meta["mandatory_window_indices"] == rec["mandatory_state_ids"]
+    assert meta["state_roles"] == [s["role"] for s in rec["states"]]
+    reg = registry_from_window_csv(path, epoch=0, source="t")
+    assert [bool(s.metadata.get("mandatory")) for s in reg.all_states()] == [s["mandatory"] for s in rec["states"]]
+    if version == "v2":
+        assert [s.metadata.get("region") for s in reg.all_states()] == [s["region"] for s in rec["states"]]
