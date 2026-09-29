@@ -76,6 +76,9 @@ def apply_ladder_boost_to_u(
     ``meta["gamd_ladder"] = False`` and ``meta["gamd_ladder_samples_without_raw_energies"]
     = 0`` set for a uniform contract across every caller.
 
+    Writable owned scratch is corrected in place in bounded row blocks;
+    caller-owned mappings get a new disk-backed result. Dense inputs remain unchanged.
+
     When some state DOES carry ``gamd_lambda > 0``:
 
     - raises ``ValueError`` naming ``v_pep`` when EVERY sample lacks a
@@ -138,6 +141,24 @@ def apply_ladder_boost_to_u(
 
     from gareus.pep_gamd import pep_gamd_boost_matrix_kj
     # (n_states, n_samples) -> (n_samples, n_states), matching u_nk's convention.
+    from .storage import disk_array, create_matrix, row_blocks, release_pages, owned_writable_matrix
+    if disk_array(u_nk) is not None:
+        from pathlib import Path
+        result = u_nk if owned_writable_matrix(u_nk) else create_matrix(
+            u_nk.shape, directory=Path(disk_array(u_nk).filename).parent)
+        for start, stop in row_blocks(*u_nk.shape):
+            boost = pep_gamd_boost_matrix_kj(v_pep[start:stop], v_dih[start:stop],
+                                            state_lambdas, envelope).T
+            boost[np.ix_(missing[start:stop], lam_active)] = np.nan
+            boost *= float(beta)
+            result[start:stop] = u_nk[start:stop] + boost
+            del boost
+            release_pages(result, written=True)
+            if result is not u_nk:
+                release_pages(u_nk)
+        meta['gamd_ladder'] = True
+        meta['gamd_ladder_samples_without_raw_energies'] = int(missing.sum())
+        return result
     boost_kj_nk = pep_gamd_boost_matrix_kj(v_pep, v_dih, state_lambdas, envelope).T.copy()
     n_missing = int(np.count_nonzero(missing))
     if n_missing:
@@ -218,13 +239,19 @@ def mbar_state_overlap(u_nk: np.ndarray, f_k: np.ndarray, n_k: np.ndarray) -> np
     with np.errstate(divide="ignore"):
         log_n_k = np.where(n_k > 0.0, np.log(np.maximum(n_k, 1.0e-300)), -np.inf)
     # log W_nk = (f_k - u_nk) - logsumexp_l(log N_l + f_l - u_nl)
-    log_num = f_k[None, :] - u_nk
-    shifted = log_n_k[None, :] + log_num
-    max_l = np.max(np.where(np.isfinite(shifted), shifted, -np.inf), axis=1, keepdims=True)
-    max_l = np.where(np.isfinite(max_l), max_l, 0.0)
-    log_denom = max_l + np.log(np.sum(np.exp(shifted - max_l), axis=1, keepdims=True))
-    w_nk = np.exp(log_num - log_denom)
-    return n_k[:, None] * (w_nk.T @ w_nk)
+    from .storage import row_blocks, release_pages
+    active = (n_k > 0) & np.isfinite(f_k)
+    gram = np.zeros((f_k.size, f_k.size), dtype=np.float64)
+    for start, stop in row_blocks(*u_nk.shape):
+        log_num = np.where(active[None, :], f_k[None, :] - u_nk[start:stop], -np.inf)
+        shifted = log_n_k[None, :] + log_num
+        max_l = np.max(shifted, axis=1, keepdims=True)
+        max_l = np.where(np.isfinite(max_l), max_l, 0.0)
+        log_denom = max_l + np.log(np.sum(np.exp(shifted - max_l), axis=1, keepdims=True))
+        w_nk = np.exp(log_num - log_denom)
+        gram += w_nk.T @ w_nk
+        release_pages(u_nk)
+    return n_k[:, None] * gram
 
 
 def symmetric_state_overlap(overlap: np.ndarray, i: int, j: int) -> Optional[float]:

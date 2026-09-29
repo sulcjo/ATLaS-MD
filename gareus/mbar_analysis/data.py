@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
+from .storage import finite_rows, select_matrix
 
 from gareus.units import KJ_PER_KCAL, K_B_KJ_PER_MOL_K
 
@@ -250,7 +251,7 @@ def clean(d: Data) -> Data:
     if d.boost_kj.shape != d.cv.shape: d.boost_kj=np.full(d.cv.shape,np.nan)
     if d.cv2.shape != d.cv.shape: d.cv2=np.full(d.cv.shape,np.nan)
     if d.rg_A.shape != d.cv.shape: d.rg_A=np.full(d.cv.shape,np.nan)
-    mask=np.isfinite(d.cv) & np.all(np.isfinite(d.u_nk),axis=1)
+    mask=np.isfinite(d.cv) & finite_rows(d.u_nk)
     if mask.all():
         # Nothing to filter: boolean fancy indexing always copies in NumPy,
         # even when the mask keeps every element, so skip the copies below
@@ -260,7 +261,7 @@ def clean(d: Data) -> Data:
         # sample count) and must still run regardless of this fast path.
         _filter_optional_per_sample(d, mask)
         return d
-    d.cv=d.cv[mask]; d.cv2=d.cv2[mask]; d.rg_A=d.rg_A[mask]; d.window=d.window[mask]; d.replica=d.replica[mask]; d.step=d.step[mask]; d.u_nk=d.u_nk[mask]; d.boost_kj=d.boost_kj[mask]
+    d.cv=d.cv[mask]; d.cv2=d.cv2[mask]; d.rg_A=d.rg_A[mask]; d.window=d.window[mask]; d.replica=d.replica[mask]; d.step=d.step[mask]; d.u_nk=select_matrix(d.u_nk, mask); d.boost_kj=d.boost_kj[mask]
     _filter_optional_per_sample(d, mask)
     _filter_epoch_source(d, mask)
     return d
@@ -289,7 +290,7 @@ def _masked_data(d: 'Data', mask: np.ndarray, meta_override: Optional[dict] = No
         prod_dir=d.prod_dir, out_dir=d.out_dir,
         cv=_sl(d.cv), cv2=_sl(d.cv2), rg_A=_sl(d.rg_A),
         window=_sl(d.window), replica=_sl(d.replica), step=_sl(d.step),
-        u_nk=d.u_nk[mask] if d.u_nk is not None else None,
+        u_nk=select_matrix(d.u_nk, mask) if d.u_nk is not None else None,
         centers=d.centers, k_kcal=d.k_kcal,
         beta=d.beta, temp=d.temp,
         boost_kj=_sl(d.boost_kj),
@@ -374,7 +375,7 @@ def _skip_first_n_frames(d: Data, n: int) -> Data:
         keep[idx[order[:min(n, idx.size)]]] = False
     d.cv=d.cv[keep]; d.cv2=d.cv2[keep]; d.rg_A=d.rg_A[keep]
     d.window=d.window[keep]; d.replica=d.replica[keep]; d.step=d.step[keep]
-    d.u_nk=d.u_nk[keep]; d.boost_kj=d.boost_kj[keep]
+    d.u_nk=select_matrix(d.u_nk, keep); d.boost_kj=d.boost_kj[keep]
     _filter_optional_per_sample(d, keep)
     _filter_epoch_source(d, keep)
     _assert_per_sample_alignment(d, '_skip_first_n_frames')
@@ -398,7 +399,7 @@ def _apply_analysis_stride(d: Data, stride: int, offset: int = 0) -> Data:
     before=int(d.cv.size)
     d.cv=d.cv[keep]; d.cv2=d.cv2[keep]; d.rg_A=d.rg_A[keep]
     d.window=d.window[keep]; d.replica=d.replica[keep]; d.step=d.step[keep]
-    d.u_nk=d.u_nk[keep]; d.boost_kj=d.boost_kj[keep]
+    d.u_nk=select_matrix(d.u_nk, keep); d.boost_kj=d.boost_kj[keep]
     _filter_optional_per_sample(d, keep)
     _filter_epoch_source(d, keep)
     _assert_per_sample_alignment(d, '_apply_analysis_stride')

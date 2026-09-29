@@ -1056,7 +1056,7 @@ def load_data(inp: Path, out: Optional[Path], source: str = 'auto', no_augment: 
               n_threads: int = 0, n_workers: int = 4,
               epoch_ids: Optional[set[int]] = None,
               low_memory: bool = False, analysis_stride: int = 1,
-              analysis_stride_offset: int = 0) -> Data:
+              analysis_stride_offset: int = 0, memory_reporter=None) -> Data:
     prod=prod_dir_of(inp)
     # Adaptive-production: prefer new Parquet epoch data, fall back to legacy NPZ.
     if prod.name == 'adaptive_production':
@@ -1068,7 +1068,7 @@ def load_data(inp: Path, out: Optional[Path], source: str = 'auto', no_augment: 
                   '(a phase ran on after the snapshot); loading Parquet sequentially instead')
         if low_memory and epoch_ids is None and union_npz.exists() and not _stale:
             prov_notes = check_union_npz_window_map_provenance(prod)
-            d = load_union_npz(prod)
+            d = load_union_npz(prod, low_memory=True)
             if analysis_stride > 1 or analysis_stride_offset > 0:
                 d = _apply_analysis_stride(d, analysis_stride, analysis_stride_offset)
                 d.meta['analysis_stride_applied_in_loader'] = True
@@ -1087,7 +1087,7 @@ def load_data(inp: Path, out: Optional[Path], source: str = 'auto', no_augment: 
             d = load_parquet_adaptive_union(
                 prod, n_threads=n_threads, n_workers=n_workers, epoch_ids=epoch_ids,
                 low_memory=low_memory, analysis_stride=analysis_stride,
-                analysis_stride_offset=analysis_stride_offset)
+                analysis_stride_offset=analysis_stride_offset, memory_reporter=memory_reporter)
         elif (prod / 'adaptive_union_mbar.npz').exists():
             if epoch_ids is not None:
                 raise ValueError(
@@ -1101,7 +1101,7 @@ def load_data(inp: Path, out: Optional[Path], source: str = 'auto', no_augment: 
             # otherwise. Notes also ride into meta['load_notes'] so they reach
             # pmf_summary.json rather than only the terminal.
             prov_notes = check_union_npz_window_map_provenance(prod)
-            d = load_union_npz(prod)
+            d = load_union_npz(prod, low_memory=low_memory)
             for _n in prov_notes:
                 print(f'    {_n}')
             if prov_notes:

@@ -402,7 +402,8 @@ def run_epoch_pmf_convergence(d: Data, args, bins: np.ndarray, selected: str,
         if progress is not None:
             progress.bar('epoch_convergence', n_ep, n_epochs,
                          f'epochs 0-{n_ep-1}: {n} samples')
-        sub_u = d.u_nk[mask]; sub_w = d.window[mask]
+        from gareus.mbar_analysis.storage import select_matrix
+        sub_u = select_matrix(d.u_nk, mask); sub_w = d.window[mask]
         sub_cv = d.cv[mask]; sub_boost = d.boost_kj[mask]
         try:
             mb = solve_mbar(sub_u, sub_w,
@@ -990,7 +991,8 @@ def run_observable_pmf_convergence(
             continue
         if progress is not None:
             progress.bar(f'{metric_name} convergence',ci,steps.size,f'step {int(ck)} samples {n}')
-        sub_u=d.u_nk[mask]
+        from gareus.mbar_analysis.storage import select_matrix
+        sub_u=select_matrix(d.u_nk, mask)
         sub_w=d.window[mask]
         sub_x=values[mask]
         sub_boost=d.boost_kj[mask]
@@ -5699,7 +5701,7 @@ def parse_args(argv=None):
     p.add_argument('--duckdb-threads', type=int, default=0, help='Total DuckDB threads distributed across parallel parquet loaders. 0=auto (min(cpu_count, NUMEXPR_MAX_THREADS, 64)). Divide by --load-workers to get per-connection thread count.')
     p.add_argument('--load-workers', type=int, default=8, help='Number of parallel epoch-dir workers for adaptive parquet loading. Each opens its own DuckDB connection with (--duckdb-threads / --load-workers) threads. Set to 1 to disable parallelism.')
     p.add_argument('--low-memory', action='store_true',
-                   help='Use low-memory adaptive loading: prefer the resolved union NPZ snapshot, or load Parquet epochs sequentially.')
+                   help='Use disk-backed adaptive bias matrices and bounded GaMD/MBAR work blocks. Scratch files use the adaptive run filesystem; all samples are retained unless explicit filters/stride apply.')
     p.add_argument('--memory-report', type=Path, default=None, metavar='PATH',
                    help='Write best-effort RSS/swap checkpoints as JSONL.')
     # MBAR solver backend selection.  Choices include auto, explicit deterministic
@@ -5881,9 +5883,19 @@ def parse_args(argv=None):
     return args
 
 def main(argv=None):
-    args=parse_args(argv)
+    from gareus.mbar_analysis.storage import cleanup
     from gareus.mbar_analysis.memory import MemoryReporter
+    args = parse_args(argv)
     memory_reporter = MemoryReporter(getattr(args, 'memory_report', None))
+    try:
+        return _main(args, memory_reporter)
+    finally:
+        cleanup()
+        memory_reporter.record('cleanup')
+        memory_reporter.close()
+
+
+def _main(args, memory_reporter):
     args._memory_reporter = memory_reporter
     memory_reporter.record('startup')
     progress=Progress()
@@ -5891,7 +5903,9 @@ def main(argv=None):
     _t0=time.time()
     epoch_ids = set(args.epochs) if args.epochs is not None else None
     memory_reporter.record('source_selected')
-    d=load_data(Path(args.input), Path(args.out) if args.out else None, args.analysis_source, no_augment=getattr(args,'no_adaptive_rounds',False), n_threads=getattr(args,'duckdb_threads',0), n_workers=getattr(args,'load_workers',8), epoch_ids=epoch_ids, low_memory=getattr(args, 'low_memory', False), analysis_stride=getattr(args, 'analysis_stride', 1), analysis_stride_offset=getattr(args, 'analysis_stride_offset', 0))
+    loader_stride = 1 if getattr(args, 'skip_first_n_frames', 0) > 0 else getattr(args, 'analysis_stride', 1)
+    loader_offset = 0 if getattr(args, 'skip_first_n_frames', 0) > 0 else getattr(args, 'analysis_stride_offset', 0)
+    d=load_data(Path(args.input), Path(args.out) if args.out else None, args.analysis_source, no_augment=getattr(args,'no_adaptive_rounds',False), n_threads=getattr(args,'duckdb_threads',0), n_workers=getattr(args,'load_workers',8), epoch_ids=epoch_ids, low_memory=getattr(args, 'low_memory', False), analysis_stride=loader_stride, analysis_stride_offset=loader_offset, memory_reporter=memory_reporter)
     memory_reporter.record('source_loaded')
     memory_reporter.record('after_u_nk_write')
     if getattr(args,'skip_first_n_frames',0)>0:
@@ -5903,15 +5917,14 @@ def main(argv=None):
         n_before=d.cv.size
         d=_apply_analysis_stride(d,args.analysis_stride,args.analysis_stride_offset)
         memory_reporter.record('after_stride')
+        print(f'  [analysis-stride] kept {d.cv.size}/{n_before} samples (stride={args.analysis_stride}, offset={args.analysis_stride_offset})')
     else:
         memory_reporter.record('after_clean')
         memory_reporter.record('after_stride')
-        print(f'  [analysis-stride] kept {d.cv.size}/{n_before} samples (stride={args.analysis_stride}, offset={args.analysis_stride_offset})')
     print(f'  [load] {d.cv.size} samples in {time.time()-_t0:.1f}s')
     progress.done('load', f'{d.cv.size} samples')
     _t1=time.time()
     s=analyze(d,args,progress=progress)
-    memory_reporter.close()
     print(f'  [analyze] total {time.time()-_t1:.1f}s')
     # Adaptive-production diagnostic plots (epoch/topup phase-space, window layout, overlap)
     if getattr(d,'prod_dir',None) is not None and Path(d.prod_dir).name=='adaptive_production' and not getattr(args,'no_adaptive_diag',False):

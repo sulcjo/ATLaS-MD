@@ -31,6 +31,7 @@ from .loaders_adaptive import (_find_adaptive_epoch_dirs, _phase_label,
 from .bias import _reconstruct_union_bias_block_per_regime
 from .cv2_reprojection import (CV2_REPROJECTION_FILENAME,
                                CV2_REPROJECTION_MIN_COVERAGE, join_on_step)
+from .storage import create_matrix, row_blocks, release_pages, select_matrix, cleanup_on_error
 
 
 def _is_usable_for_mbar(row: dict) -> bool:
@@ -46,10 +47,8 @@ def _spool_u_nk_blocks(blocks: list, directory: Path):
         raise ValueError(f'u_nk block must be 2-D, got shape {first.shape}')
     rows = sum(int(np.asarray(block).shape[0]) for block in blocks)
     columns = int(first.shape[1])
-    fd, raw_path = tempfile.mkstemp(prefix='.adaptive-u-nk-', suffix='.dat', dir=directory)
-    os.close(fd)
-    path = Path(raw_path)
-    matrix = np.memmap(path, mode='w+', dtype=np.float64, shape=(rows, columns))
+    matrix = create_matrix((rows, columns), directory=directory)
+    path = Path(matrix.filename)
     offset = 0
     try:
         for block in blocks:
@@ -57,7 +56,10 @@ def _spool_u_nk_blocks(blocks: list, directory: Path):
             if block.ndim != 2 or block.shape[1] != columns:
                 raise ValueError('u_nk blocks have inconsistent shapes')
             end = offset + block.shape[0]
-            matrix[offset:end] = block
+            for start, stop in row_blocks(*block.shape):
+                matrix[offset + start:offset + stop] = block[start:stop]
+                release_pages(matrix, written=True)
+                release_pages(block)
             offset = end
         matrix.flush()
     except Exception:
@@ -77,16 +79,17 @@ def _cleanup_memmap_file(path: Path) -> None:
 def _materialize_block_files(block_paths: list[Path], rows: int, columns: int,
                              directory: Path) -> tuple[np.memmap, Path]:
     """Combine disk-backed per-epoch blocks without retaining them in RAM."""
-    fd, raw_path = tempfile.mkstemp(prefix='.adaptive-u-nk-', suffix='.dat', dir=directory)
-    os.close(fd)
-    path = Path(raw_path)
-    matrix = np.memmap(path, mode='w+', dtype=np.float64, shape=(rows, columns))
+    matrix = create_matrix((rows, columns), directory=directory)
+    path = Path(matrix.filename)
     offset = 0
     try:
         for block_path in block_paths:
             block = np.load(block_path, mmap_mode='r', allow_pickle=False)
             end = offset + int(block.shape[0])
-            matrix[offset:end] = block
+            for start, stop in row_blocks(*block.shape):
+                matrix[offset + start:offset + stop] = block[start:stop]
+                release_pages(matrix, written=True)
+                release_pages(block)
             offset = end
             del block
         matrix.flush()
@@ -251,7 +254,8 @@ def _load_cv2_reprojection(adaptive_dir: Path) -> Optional[dict]:
 
 
 def _per_regime_bias_block(cv_epoch, step_epoch, beta, pc_e, pk_e, sc_e, sk_e,
-                            state_regimes, reproj: dict, cv2_epoch, epoch_regime: str):
+                            state_regimes, reproj: dict, cv2_epoch, epoch_regime: str,
+                            low_memory: bool = False, directory=None):
     """One epoch-block's u_nk with each column in its own CV2 definition.
 
     Returns ``(block, coverage)``, or ``(None, {})`` when the table cannot
@@ -290,14 +294,16 @@ def _per_regime_bias_block(cv_epoch, step_epoch, beta, pc_e, pk_e, sc_e, sk_e,
         cv2_by_regime[regime] = vals
         coverage[regime] = cov
     block = _reconstruct_union_bias_block_per_regime(
-        cv_epoch, cv2_by_regime, beta, pc_e, pk_e, sc_e, sk_e, state_regimes)
+        cv_epoch, cv2_by_regime, beta, pc_e, pk_e, sc_e, sk_e, state_regimes,
+        low_memory=low_memory, directory=directory)
     return block, coverage
 
 
+@cleanup_on_error
 def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_workers: int = 4,
                                 epoch_ids: Optional[set[int]] = None,
                                 low_memory: bool = False, analysis_stride: int = 1,
-                                analysis_stride_offset: int = 0) -> Data:
+                                analysis_stride_offset: int = 0, memory_reporter=None) -> Data:
     """Load MBAR inputs from adaptive-production Parquet epoch data.
 
     Pools samples from all epoch run directories, remaps per-epoch window IDs to
@@ -377,8 +383,7 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
     all_v_pep = []; all_v_dih = []
     all_gamd_lambda_sample = []
     all_unk_blocks = []
-    u_nk_block_paths: list[Path] = []
-    u_nk_tmp_dir: Optional[Path] = None
+    u_nk_block_paths: list[np.memmap] = []
     beta = float('nan')
     meta: dict = rjson(adaptive_dir.parent / 'run_manifest.json', {})
 
@@ -438,6 +443,8 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
                      if epoch_dirs else '') or ''
 
     for _ei, ((samples, wmap, ep_meta, native_params, _notes), (epoch_dir, _)) in enumerate(epoch_iter):
+        if memory_reporter is not None:
+            memory_reporter.record(f'epoch_loaded:{_phase_label(epoch_dir)}')
         load_notes.extend(_notes)
         for _n in _notes:
             print(f'    {_n}')
@@ -540,22 +547,22 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
             ]
             block, _cov = _per_regime_bias_block(
                 cv_epoch, step_epoch, beta, pc_e, pk_e, sc_e, sk_e,
-                _state_regimes, _reproj, cv2_epoch, _epoch_regime)
+                _state_regimes, _reproj, cv2_epoch, _epoch_regime, low_memory=low_memory,
+                directory=adaptive_dir)
             if block is not None:
                 _reproj_coverage[str(epoch_dir)] = _cov
             elif _cov.get('declined_regime'):
                 _reproj_declined[str(epoch_dir)] = _cov
         if block is None:
-            block = _reconstruct_union_bias_block(cv_epoch, cv2_epoch, beta, pc_e, pk_e, sc_e, sk_e)
+            block = _reconstruct_union_bias_block(cv_epoch, cv2_epoch, beta, pc_e, pk_e, sc_e, sk_e,
+                                                  low_memory=low_memory, directory=adaptive_dir)
         if low_memory:
-            if u_nk_tmp_dir is None:
-                u_nk_tmp_dir = Path(tempfile.mkdtemp(prefix='.adaptive-u-nk-blocks-', dir=adaptive_dir))
-            block_path = u_nk_tmp_dir / f'block_{len(u_nk_block_paths):06d}.npy'
-            np.save(block_path, block, allow_pickle=False)
-            u_nk_block_paths.append(block_path)
-            del block
+            u_nk_block_paths.append(block)
         else:
             all_unk_blocks.append(block)
+        if memory_reporter is not None:
+            memory_reporter.record(f'epoch_bias_written:{_phase_label(epoch_dir)}')
+        del block, samples
 
     if not all_cv:
         raise ValueError(f'No valid samples after window remapping in {adaptive_dir}')
@@ -577,16 +584,23 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
     pot_arr = np.concatenate(all_potential); del all_potential
     potential = pot_arr if np.any(np.isfinite(pot_arr)) else None
     if low_memory:
-        rows = sum(int(np.load(p, mmap_mode='r', allow_pickle=False).shape[0])
-                   for p in u_nk_block_paths)
-        columns = int(np.load(u_nk_block_paths[0], mmap_mode='r', allow_pickle=False).shape[1])
-        u_nk, _u_nk_path = _materialize_block_files(
-            u_nk_block_paths, rows, columns, adaptive_dir)
-        if u_nk_tmp_dir is not None:
-            shutil.rmtree(u_nk_tmp_dir, ignore_errors=True)
+        rows = sum(block.shape[0] for block in u_nk_block_paths)
+        columns = u_nk_block_paths[0].shape[1]
+        u_nk = create_matrix((rows, columns), directory=adaptive_dir)
+        _u_nk_path = Path(u_nk.filename)
+        offset = 0
+        for block in u_nk_block_paths:
+            for start, stop in row_blocks(*block.shape):
+                u_nk[offset + start:offset + stop] = block[start:stop]
+                release_pages(u_nk, written=True)
+                release_pages(block)
+            offset += block.shape[0]
+        del block, u_nk_block_paths
         del all_unk_blocks
     else:
         u_nk = np.concatenate(all_unk_blocks, axis=0); del all_unk_blocks
+    if memory_reporter is not None:
+        memory_reporter.record('after_union_write')
 
     # state_registry.csv (state_lambdas, built above) and the per-sample
     # gamd_lambda column just concatenated here are two independent sources for
@@ -613,7 +627,7 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
         epoch_src = epoch_src[keep]
         pot_arr = pot_arr[keep]
         potential = pot_arr if np.any(np.isfinite(pot_arr)) else None
-        u_nk = u_nk[keep]
+        u_nk = select_matrix(u_nk, keep)
 
     temp = 1.0 / (K_B_KJ_PER_MOL_K * beta)
 
@@ -628,6 +642,8 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
     _ladder_envelope = load_pep_gamd_envelope(adaptive_dir) if np.any(state_lambdas > 0.0) else None
     _ladder_meta: dict = {}
     u_nk = apply_ladder_boost_to_u(u_nk, v_pep, v_dih, state_lambdas, _ladder_envelope, beta, _ladder_meta)
+    if memory_reporter is not None:
+        memory_reporter.record('after_ladder_correction')
 
     # Mid-campaign secondary-CV redefinition: reported, not corrected (see
     # _secondary_cv_regime_change_note).
@@ -693,7 +709,7 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
     meta_out.update(_ladder_meta)
 
     _boost_dih_arg = boost_dih if np.any(np.isfinite(boost_dih)) else None
-    return clean(Data(
+    result = clean(Data(
         prod_dir=adaptive_dir, out_dir=adaptive_dir / 'pmf_analysis',
         cv=cv, cv2=cv2, rg_A=np.full(cv.shape, np.nan),
         window=window, replica=replica, step=step,
@@ -703,3 +719,6 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
         boost_dih_kj=_boost_dih_arg,
         v_pep_kj=v_pep, v_dih_kj=v_dih, state_lambdas=state_lambdas,
     ))
+    if memory_reporter is not None:
+        memory_reporter.record('after_loader_clean')
+    return result

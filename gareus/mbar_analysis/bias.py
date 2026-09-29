@@ -142,7 +142,8 @@ def _epoch_bias_param_vectors(native_params: dict, state_ids: list,
 
 def _reconstruct_union_bias_block(cv: np.ndarray, cv2: np.ndarray, beta: float,
                                    primary_centers: np.ndarray, primary_ks: np.ndarray,
-                                   sec_centers: np.ndarray, sec_ks: np.ndarray) -> np.ndarray:
+                                   sec_centers: np.ndarray, sec_ks: np.ndarray,
+                                   low_memory: bool = False, directory=None) -> np.ndarray:
     """Build one epoch-block's N x K reduced-bias-energy matrix.
 
     Thin delegation to reconstruct_bias_matrix: converts the array-based
@@ -156,13 +157,19 @@ def _reconstruct_union_bias_block(cv: np.ndarray, cv2: np.ndarray, beta: float,
     windows = [_strict_window(primary_centers[k], primary_ks[k],
                               sec_centers[k], sec_ks[k])
                for k in range(len(primary_centers))]
+    if low_memory:
+        from .storage import build_matrix
+        return build_matrix((len(cv), len(windows)),
+                            lambda start, stop: query.reconstruct_bias_matrix(
+                                cv[start:stop], cv2[start:stop], windows, beta), directory=directory)
     return query.reconstruct_bias_matrix(cv, cv2, windows, beta)
 
 
 def _reconstruct_union_bias_block_per_regime(cv: np.ndarray, cv2_by_regime: dict, beta: float,
                                               primary_centers: np.ndarray, primary_ks: np.ndarray,
                                               sec_centers: np.ndarray, sec_ks: np.ndarray,
-                                              state_regimes: Sequence[str]) -> np.ndarray:
+                                              state_regimes: Sequence[str],
+                                              low_memory: bool = False, directory=None) -> np.ndarray:
     """Like ``_reconstruct_union_bias_block``, but each COLUMN gets the cv2 of
     the regime its own secondary params were written for.
 
@@ -193,6 +200,13 @@ def _reconstruct_union_bias_block_per_regime(cv: np.ndarray, cv2_by_regime: dict
         raise ValueError(f'no cv2 supplied for regime(s) {missing}; '
                          f'have {sorted(cv2_by_regime)}')
     cv = np.asarray(cv, dtype=np.float64)
+    if low_memory:
+        from .storage import build_matrix
+        return build_matrix((len(cv), K), lambda start, stop:
+                            _reconstruct_union_bias_block_per_regime(
+                                cv[start:stop], {r: v[start:stop] for r, v in cv2_by_regime.items()},
+                                beta, primary_centers, primary_ks, sec_centers, sec_ks,
+                                state_regimes), directory=directory)
     out = np.empty((cv.size, K), dtype=np.float64)
     regimes = np.asarray(list(state_regimes), dtype=object)
     for regime in dict.fromkeys(state_regimes):  # stable order, deduplicated
