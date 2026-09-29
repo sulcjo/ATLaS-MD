@@ -45,6 +45,7 @@ from .store import SegmentRegistry
 from .extension_seeding import extension_parent_dirs
 from .adaptive.paired_cv import PairedCVCollector, attach_paired_cv
 from .adaptive.pair_runtime import GATE_REPORT_NAME, gate_from_args
+from .adaptive.edge_metric import attach_edge_metric, edge_is_weak_pairwise, edge_sort_overlap
 # Real-frame seed extraction lives in tica.py (a dependency-free leaf module)
 # so seeding.py can also use it for campaign-wide seed search without a
 # circular import - seeding.py -> production.py -> adaptive_production.py is
@@ -504,6 +505,11 @@ class AdaptiveDecisionPolicy:
     # reseed up to this fraction of windows from pooled end states on the under-sampled side of
     # the hidden slow mode. 0 = off (no report, no override, seeding exactly as before).
     slow_mode_reseed_fraction: float = 0.0
+    # Spec 3.1 edge metric (gareus/adaptive/edge_metric.py): "marginal" = today's CV1
+    # histogram overlap; "pairwise-mbar" = two-state MBAR overlap graded against
+    # min_rung_overlap, unmeasured below min_edge_neff effective samples per state.
+    edge_metric: str = "marginal"
+    min_edge_neff: float = 200.0
 
 
 LADDER_SETTINGS_FIELDS = ("ladder_adapt", "ladder_min_overlap", "ladder_overlap_quantile", "ladder_min_ess",
@@ -522,6 +528,7 @@ DECISION_SETTINGS_FIELDS = (
     "allocation_weight",
     "cv2_coupling_gate", "max_coupling_fraction",
     "slow_mode_reseed_fraction",
+    "edge_metric", "min_edge_neff",
 )
 DECISION_SETTINGS_FILENAME = "decision_settings.json"
 
@@ -2464,8 +2471,13 @@ def collect_epoch_diagnostics(
     policy: Optional[AdaptiveDecisionPolicy] = None,
     *,
     rung_mbar_overlap: Optional[Dict[Tuple[int, int], float]] = None,
+    edge_metric: bool = True,
 ) -> Dict[str, Any]:
-    """Collect simple per-state and per-edge diagnostics from one epoch output."""
+    """Collect simple per-state and per-edge diagnostics from one epoch output.
+
+    ``edge_metric=False`` skips the spec 3.1 grading (the segmented collector's
+    per-segment calls; it grades the pooled payload once).
+    """
     epoch_dir = Path(epoch_dir)
     policy = policy or AdaptiveDecisionPolicy()
     samples = _read_sample_dicts(epoch_dir)
@@ -2573,6 +2585,8 @@ def collect_epoch_diagnostics(
         "policy": _json_ready(asdict(policy)),
     }
     attach_paired_cv(payload, paired, epoch_dir / "adaptive_epoch_diagnostics.json")
+    if edge_metric:
+        attach_edge_metric(payload, policy, epoch_dir)  # spec 3.1; no-op under the default metric
     write_json(epoch_dir / "adaptive_epoch_diagnostics.json", payload)
     return payload
 
@@ -4219,6 +4233,7 @@ def collect_final_combined_diagnostics(
         "policy": _json_ready(asdict(policy)),
     }
     attach_paired_cv(payload, paired, adaptive_dir / "adaptive_final_combined_diagnostics.json")
+    attach_edge_metric(payload, policy, adaptive_dir)  # spec 3.1; no-op under the default metric
     write_json(adaptive_dir / "adaptive_final_combined_diagnostics.json", payload)
     return payload
 
@@ -4747,7 +4762,7 @@ def propose_actions_from_diagnostics(
         weak_edges.append(edge)
 
     weak_edges.sort(key=lambda e: (
-        1.0 if e.get("overlap") is None else float(e.get("overlap")),
+        1.0 if edge_sort_overlap(e, policy) is None else float(edge_sort_overlap(e, policy)),
         1.0 if e.get("exchange_acceptance") is None else float(e.get("exchange_acceptance")),
     ))
 
@@ -5347,6 +5362,10 @@ def _edge_is_measured_weak(edge: Dict[str, Any], policy: AdaptiveDecisionPolicy)
     if str(edge.get("edge_type")) == "rung":
         value = edge.get("mbar_overlap")
         return value is not None and float(value) < float(policy.min_rung_overlap)
+    if str(getattr(policy, "edge_metric", "marginal")) == "pairwise-mbar":
+        # Spec 3.1: one metric (two-state / union pairwise MBAR, bootstrap bound);
+        # cross-pattern and unmeasured edges are never weak.
+        return edge_is_weak_pairwise(edge, float(policy.min_rung_overlap))
     overlap = edge.get("overlap")
     weak = overlap is not None and float(overlap) < float(policy.target_overlap)
     acc = edge.get("exchange_acceptance")
@@ -6261,7 +6280,7 @@ def collect_segmented_epoch_diagnostics(epoch_dir: Path, registry: WindowStateRe
     paired = PairedCVCollector(registry)
 
     for seg in segment_dirs:
-        diag = collect_epoch_diagnostics(seg, registry, policy=policy)
+        diag = collect_epoch_diagnostics(seg, registry, policy=policy, edge_metric=False)
         segment_payloads.append({"segment": seg.name, "diagnostics_json": str(seg / "adaptive_epoch_diagnostics.json")})
 
         # --- Accumulate raw cv_A values per state from this segment's samples ---
@@ -6421,6 +6440,7 @@ def collect_segmented_epoch_diagnostics(epoch_dir: Path, registry: WindowStateRe
         "policy": _json_ready(asdict(policy)),
     }
     attach_paired_cv(payload, paired, epoch_dir / "adaptive_epoch_diagnostics.json")
+    attach_edge_metric(payload, policy, epoch_dir)  # spec 3.1; no-op under the default metric
     write_json(epoch_dir / "adaptive_epoch_diagnostics.json", payload)
     return payload
 
@@ -7686,6 +7706,8 @@ def policy_from_args(args: Any) -> AdaptiveDecisionPolicy:
         cv2_coupling_gate=_arg_bool(args, "adaptive_production_cv2_coupling_gate", False),
         max_coupling_fraction=_arg_float(args, "adaptive_production_max_coupling_fraction", 0.25),
         slow_mode_reseed_fraction=_arg_float(args, "adaptive_production_slow_mode_reseed_fraction", 0.0),
+        edge_metric=str(getattr(args, "adaptive_production_edge_metric", "marginal") or "marginal"),
+        min_edge_neff=_arg_float(args, "adaptive_production_min_edge_neff", 200.0),
     )
 
 

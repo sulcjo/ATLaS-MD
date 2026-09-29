@@ -536,6 +536,17 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                    help="Interior rungs the adaptive ladder may move per epoch (a respace within this is atomic).")
     p.add_argument("--ap-ladder-adapt-override", action=argparse.BooleanOptionalAction, default=False,
                    help="Replace a campaign's recorded --ap-ladder-* settings with this job's flags.")
+    p.add_argument("--ap-edge-metric", choices=["marginal", "pairwise-mbar"], default="marginal",
+                   help="Spatial-edge metric the weak-edge gate and proposers read (spec 3.1). marginal "
+                        "(default): today's CV1 histogram overlap. pairwise-mbar: two-state MBAR overlap "
+                        "sqrt(O_ab O_ba) on the states' paired (CV1, CV2) samples (union value when a union "
+                        "solve scored the edge), weak only if the bootstrap q90 is below "
+                        "min_rung_overlap; also grades every same-rung pair within the restraint-width "
+                        "radius plus spanning edges for axis/anchor states. A decision rule: frozen with "
+                        "the campaign's decision settings.")
+    p.add_argument("--ap-min-edge-neff", type=float, default=200.0,
+                   help="Effective samples per state (blocking) below which a pairwise-mbar edge is "
+                        "unmeasured (never weak).")
     p.add_argument("--ap-decision-settings-override", action=argparse.BooleanOptionalAction, default=False,
                    help="Replace a campaign's recorded adaptive decision rules (overlap targets, sample "
                         "floors, per-epoch add limits, duplicate tolerances; adaptive_production/"
@@ -1610,6 +1621,8 @@ def _shim_adaptive_production(args: argparse.Namespace) -> None:
     args.adaptive_production_max_coupling_fraction = args.ap_max_coupling_fraction
     args.adaptive_production_discovery_census = args.ap_discovery_census
     args.adaptive_production_slow_mode_reseed_fraction = args.ap_slow_mode_reseed_fraction
+    args.adaptive_production_edge_metric = args.ap_edge_metric
+    args.adaptive_production_min_edge_neff = args.ap_min_edge_neff
     args.adaptive_production_topup_target_sigma = args.ap_topup_target_sigma
     args.adaptive_production_topup_weak_overlap = args.ap_topup_weak_overlap
     args.adaptive_production_topup_max_fraction = args.ap_topup_max_fraction
