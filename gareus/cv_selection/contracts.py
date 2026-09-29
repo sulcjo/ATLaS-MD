@@ -270,10 +270,9 @@ def _parse_component(raw: Mapping[str, Any], position: int) -> CandidateComponen
             or not 1 <= index <= MAX_COMPONENT_INDEX):
         _fail(ReasonCode.COMPONENT_INDEX_OUT_OF_RANGE,
               f"{label}.component_index must be 1..{MAX_COMPONENT_INDEX}, got {index!r}")
-    if (family == COMPONENT_FAMILY_TICA) != (isinstance(index, int) and index > MAX_PCA_COMPONENTS):
+    if family == COMPONENT_FAMILY_PCA and index > MAX_PCA_COMPONENTS:
         _fail(ReasonCode.COMPONENT_INDEX_OUT_OF_RANGE,
-              f"{label}: residual PCs are components 1..{MAX_PCA_COMPONENTS} and conditional tICA modes "
-              f"{MAX_PCA_COMPONENTS + 1}..{MAX_COMPONENT_INDEX}; got {family!r} at index {index!r}")
+              f"{label}: residual PCs are at most components 1..{MAX_PCA_COMPONENTS}; got index {index!r}")
     if not isinstance(raw["eigenvalue_tie_flagged"], bool):
         _fail(ReasonCode.MISSING_FIELD, f"{label}.eigenvalue_tie_flagged must be a boolean")
     vector = _finite_vector(raw["right_singular_vector"], f"{label}.right_singular_vector")
@@ -318,6 +317,26 @@ def _parse_component(raw: Mapping[str, Any], position: int) -> CandidateComponen
                               mean, tuple(coefficients), float(raw["primary_mean"]), primary_std,
                               (clamp[0], clamp[1]), float(raw["projection_mean"]), projection_std,
                               family, tica_lag, tica_ev)
+
+
+def _require_family_order(components) -> None:
+    """All PCA indices precede all tICA indices, with no gaps (spec 3.6).
+
+    Replaces the old fixed binding "tICA iff index > MAX_PCA_COMPONENTS", which rejected a
+    fit with fewer than MAX_PCA_COMPONENTS residual PCs (its tICA modes are appended right
+    after the last PC). Every artifact the old rule accepted satisfies this one too.
+    """
+    ordered = sorted(components, key=lambda c: c.component_index)
+    indices = [c.component_index for c in ordered]
+    if indices != list(range(1, len(indices) + 1)):
+        _fail(ReasonCode.COMPONENT_INDEX_OUT_OF_RANGE,
+              f"component indices must be 1..{len(indices)} with no gaps; got {indices}")
+    families = [c.family for c in ordered]
+    first_tica = next((i for i, f in enumerate(families) if f == COMPONENT_FAMILY_TICA), len(families))
+    if any(f != COMPONENT_FAMILY_TICA for f in families[first_tica:]):
+        _fail(ReasonCode.COMPONENT_INDEX_OUT_OF_RANGE,
+              "all residual-PC components must precede all conditional tICA components; got families "
+              + ", ".join(f"{i}:{f}" for i, f in zip(indices, families)))
 
 
 @dataclass(frozen=True)
@@ -378,6 +397,7 @@ class CandidateSet(_Artifact):
         if len(set(indices)) != len(indices):
             _fail(ReasonCode.DUPLICATE_COMPONENT_INDEX,
                   "each component index may appear once; these are individual directions")
+        _require_family_order(components)
         widths = {component.width for component in components}
         if len(widths) != 1:
             _fail(ReasonCode.FEATURE_WIDTH_MISMATCH,

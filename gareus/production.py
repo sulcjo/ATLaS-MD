@@ -6673,6 +6673,29 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     # each of which re-calls _persist_state_gamd_lambdas so the manifest
     # always reflects the LAST mutation, not this first one.
     _persist_state_gamd_lambdas(args, out_dir)
+    # --max-replicas truncation, before any per-window artifact (window table, neighbour
+    # graph, explicit window table, window-map repair) is written, so no row of those
+    # names a window this run never runs (spec 3.5). Adaptive phases never reach it: the
+    # driver refuses a phase above the cap before it starts. A fast resume keeps its
+    # checkpointed window set -- truncating it would orphan checkpointed replicas.
+    _max_replicas = int(getattr(args, "max_replicas", 0) or 0)
+    if _max_replicas > 0 and len(centers_a) > _max_replicas and fast_resume:
+        print(f"WARNING [production] --max-replicas {_max_replicas}: the checkpoint holds "
+              f"{len(centers_a)} windows; resuming with the checkpointed window set, not truncating")
+    elif _max_replicas > 0 and len(centers_a) > _max_replicas:
+        print(f"[production] --max-replicas {_max_replicas}: truncating {len(centers_a)} windows to {_max_replicas}")
+        centers_a = centers_a[:_max_replicas]
+        k_list = k_list[:_max_replicas]
+        if secondary_cv_centers is not None:
+            secondary_cv_centers = np.asarray(secondary_cv_centers, dtype=float)[:_max_replicas]
+        if secondary_cv_k_kcal_list is not None:
+            secondary_cv_k_kcal_list = list(secondary_cv_k_kcal_list)[:_max_replicas]
+        if getattr(args, "state_gamd_lambdas", None) is not None:
+            args.state_gamd_lambdas = list(args.state_gamd_lambdas)[:_max_replicas]
+            # Re-patch: the manifest snapshot written just above is now stale-length --
+            # see _persist_state_gamd_lambdas' docstring for why persisting a
+            # pre-truncation value would corrupt a later --resume.
+            _persist_state_gamd_lambdas(args, out_dir)
     window_rows = window_assignment_rows(centers_a, k_list, args.temperature_k, secondary_cv_centers, secondary_cv_k_kcal_list, args=args, gamd_lambdas=args.state_gamd_lambdas)
     write_window_assignment_csv(out_dir / "umbrella_windows.csv", window_rows)
     print_window_assignment_table(window_rows)
@@ -6727,27 +6750,6 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     secondary_cv_ks_kj = np.asarray([kcal_to_kj(k) for k in secondary_cv_k_kcal_list], dtype=float) if secondary_cv_k_kcal_list is not None else None
     nrep = len(centers_nm)
 
-    _max_replicas = int(getattr(args, "max_replicas", 0) or 0)
-    if _max_replicas > 0 and nrep > _max_replicas:
-        print(f"[production] --max-replicas {_max_replicas}: truncating {nrep} windows to {_max_replicas}")
-        centers_nm = centers_nm[:_max_replicas]
-        ks_kj_nm2 = ks_kj_nm2[:_max_replicas]
-        centers_a = centers_a[:_max_replicas]
-        k_list = k_list[:_max_replicas]
-        if secondary_cv_ks_kj is not None:
-            secondary_cv_ks_kj = secondary_cv_ks_kj[:_max_replicas]
-        if secondary_cv_centers is not None:
-            secondary_cv_centers = np.asarray(secondary_cv_centers, dtype=float)[:_max_replicas]
-        if secondary_cv_k_kcal_list is not None:
-            secondary_cv_k_kcal_list = list(secondary_cv_k_kcal_list)[:_max_replicas]
-        if getattr(args, "state_gamd_lambdas", None) is not None:
-            args.state_gamd_lambdas = list(args.state_gamd_lambdas)[:_max_replicas]
-            # Re-patch: the manifest snapshot written earlier (right after the
-            # initial derive) is now stale-length -- see _persist_state_gamd_lambdas'
-            # docstring for why persisting a pre-truncation value would corrupt
-            # a later --resume.
-            _persist_state_gamd_lambdas(args, out_dir)
-        nrep = _max_replicas
 
     # The rung dimension: one gamd_lambda per surviving state, aligned with
     # centers_a/k_list/nrep above (including any --max-replicas truncation).

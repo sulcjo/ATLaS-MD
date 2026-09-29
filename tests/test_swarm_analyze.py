@@ -293,6 +293,34 @@ def test_auto_cv2_writes_a_pair_model_and_a_two_dimensional_ladder(synthetic_swa
     assert on_disk["cv2_centers"] and on_disk["cv2_k_kcal"] and "cv1_width_shrink_max" in on_disk
 
 
+def test_swarm_cv2_coupling_gate_is_off_by_default_and_gates_layout_k2_when_on(synthetic_swarm, swarm_args):
+    """Spec 3.4 at the layout: off keeps today's report; on lowers per-cell k2 or fails the gate."""
+    from gareus.swarm.analyze import analyze_swarm_stage
+    out = synthetic_swarm(with_features=True, wide_anchor=True)
+    an = out / "swarm" / "analysis"
+    off = analyze_swarm_stage(out, swarm_args(secondary_cv="auto"))
+    assert "cv2_coupling_gate" not in off["cv_selection"] and "cv2_coupling" not in off["gate"]["gates"]
+    csv_off = (an / "windows_lambda_ladder.csv").read_bytes()
+    probe = analyze_swarm_stage(out, swarm_args(secondary_cv="auto", swarm_cv2_coupling_gate=True))
+    worst = probe["cv_selection"]["cv2_coupling_gate"]["fraction_max"]
+    assert worst is not None and worst > 0.0
+    # Half the worst cell's fraction forces that cell down; the table carries the gated k2.
+    on = analyze_swarm_stage(out, swarm_args(secondary_cv="auto", swarm_cv2_coupling_gate=True,
+                                             swarm_cv2_max_coupling_fraction=0.5 * worst))
+    gate = on["cv_selection"]["cv2_coupling_gate"]
+    assert on["gate"]["gates"]["cv2_coupling"]["ok"] is True and gate["n_lowered"] >= 1
+    assert on["status"] == "pass"
+    with (an / "windows_lambda_ladder.csv").open() as fh:
+        k2_on = sorted({float(r["secondary_cv_k_kcal_mol"]) for r in csv.DictReader(fh)})
+    assert (an / "windows_lambda_ladder.csv").read_bytes() != csv_off
+    assert set(round(k, 4) for k in k2_on) <= set(round(float(k), 4) for k in gate["gated_k2"])
+    # ...and a cv2_k_min above every passing k2 fails the swarm gate and withholds the table.
+    strict = analyze_swarm_stage(out, swarm_args(secondary_cv="auto", swarm_cv2_coupling_gate=True,
+                                                 swarm_cv2_max_coupling_fraction=1e-9, cv2_k_min=0.5))
+    assert strict["gate"]["gates"]["cv2_coupling"]["ok"] is False and strict["status"] == "fail"
+    assert not (an / "windows_lambda_ladder.csv").exists()
+
+
 def test_narrow_anchor_fails_the_pair_gate_whatever_the_fallback(synthetic_swarm, swarm_args):
     from gareus.swarm.analyze import analyze_swarm_stage
     out = synthetic_swarm(with_features=True, wide_anchor=False)

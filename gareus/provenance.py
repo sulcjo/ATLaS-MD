@@ -323,6 +323,13 @@ def _method_settings(args: Any) -> dict[str, Any]:
     ]
     settings = {k: getattr(args, k, None) for k in keys if hasattr(args, k)}
     settings["cv_pair_model_sha256"] = pair_model_sha256(getattr(args, "secondary_cv_model", None))
+    # What the frozen CV2 is (spec 3.6): family, index and tICA lag, from the artifacts.
+    from .cv_selection.labels import frozen_pair_label
+    try:
+        settings["cv2_component"] = frozen_pair_label(getattr(args, "secondary_cv_model", None),
+                                                      getattr(args, "secondary_cv_candidate_set", None))
+    except Exception as exc:          # a label must never block a manifest; the loaders refuse bad artifacts
+        settings["cv2_component"] = {"error": f"{type(exc).__name__}: {exc}"}
     # Numerical-kernel identity of this segment (spec F01/F04): which CV evaluator and
     # which exchange-energy assembly produced its samples. A resume compares these.
     from .kernel_identity import EXCHANGE_ENERGY_VERSION, RESIDUAL_EVALUATOR_VERSION

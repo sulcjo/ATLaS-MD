@@ -60,6 +60,14 @@ def _warn_pymbar_once() -> None:
 # Argument group builders
 # ---------------------------------------------------------------------------
 
+def _unit_interval_float(text: str) -> float:
+    """argparse type: a float in [0, 1]."""
+    value = float(text)
+    if not 0.0 <= value <= 1.0:
+        raise argparse.ArgumentTypeError(f"must be in [0, 1], got {text}")
+    return value
+
+
 def _add_core_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("-h", "--help", action=SimpleHelpAction)
     p.add_argument("-hh", "--help-heavy", action=HeavyHelpAction)
@@ -284,6 +292,16 @@ def _add_cv_selection_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--swarm-n-windows-cv2", type=int, default=4,
                    help="Number of CV2 window centres the swarm stage proposes for "
                         "the frozen residual-torsion-pc pair.")
+    p.add_argument("--swarm-cv2-coupling-gate", action=argparse.BooleanOptionalAction, default=False,
+                   help="Spec 3.4 at the swarm layout (off by default: the 'narrows CV1 windows' check "
+                        "stays a warning): every 2-D layout cell's k2 is lowered to the largest value whose "
+                        "CV2-induced CV1 curvature is <= --swarm-cv2-max-coupling-fraction of the cell's "
+                        "designed CV1 curvature (k1 + F''); a cell whose passing k2 is below --cv2-k-min "
+                        "fails the swarm gate (cv2_coupling).")
+    p.add_argument("--swarm-cv2-max-coupling-fraction", type=float, default=0.25,
+                   help="Largest CV2-induced CV1 curvature, as a fraction of the cell's designed CV1 "
+                        "curvature, --swarm-cv2-coupling-gate accepts (a different quantity from "
+                        "--cv-selection-max-coupling-fraction, which judges candidates at a reference k2).")
     p.add_argument("--legacy-model-policy", choices=["refuse", "allow-v1"], default="refuse",
                    dest="legacy_model_policy",
                    help="v1 residual pair-model artifacts (pre thermodynamic repair F02) describe a coordinate "
@@ -518,6 +536,50 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                    help="Interior rungs the adaptive ladder may move per epoch (a respace within this is atomic).")
     p.add_argument("--ap-ladder-adapt-override", action=argparse.BooleanOptionalAction, default=False,
                    help="Replace a campaign's recorded --ap-ladder-* settings with this job's flags.")
+    p.add_argument("--ap-edge-metric", choices=["marginal", "pairwise-mbar"], default="marginal",
+                   help="Spatial-edge metric the weak-edge gate and proposers read (spec 3.1). marginal "
+                        "(default): today's CV1 histogram overlap. pairwise-mbar: two-state MBAR overlap "
+                        "sqrt(O_ab O_ba) on the states' paired (CV1, CV2) samples (union value when a union "
+                        "solve scored the edge), weak only if the bootstrap q90 is below "
+                        "min_rung_overlap; also grades every same-rung pair within the restraint-width "
+                        "radius plus spanning edges for axis/anchor states. A decision rule: frozen with "
+                        "the campaign's decision settings.")
+    p.add_argument("--ap-min-edge-neff", type=float, default=200.0,
+                   help="Effective samples per state (blocking) below which a pairwise-mbar edge is "
+                        "unmeasured (never weak).")
+    p.add_argument("--ap-decision-settings-override", action=argparse.BooleanOptionalAction, default=False,
+                   help="Replace a campaign's recorded adaptive decision rules (overlap targets, sample "
+                        "floors, per-epoch add limits, duplicate tolerances; adaptive_production/"
+                        "decision_settings.json, frozen at the campaign's first job) with this job's values.")
+    p.add_argument("--ap-allocation-weight", choices=("raw", "ess"), default="raw",
+                   help="How the --ap-topups allocator counts a state's samples. raw (default): the "
+                        "union builder's thinned count. ess: N/g with g the integrated autocorrelation "
+                        "time of the state's own CV1/CV2 series (contiguous runs, never stitched), so "
+                        "slow states get more top-up MD. Frozen with the decision rules. No effect "
+                        "without --ap-topups (the baseline runs every state in lockstep).")
+    p.add_argument("--ap-cv2-coupling-gate", action=argparse.BooleanOptionalAction, default=False,
+                   help="Spec 3.4 coupling gate on adaptive k2 (off by default): a bridge's k2 whose CV2 "
+                        "umbrella would add more than --ap-max-coupling-fraction of the window's CV1 "
+                        "curvature is lowered to the largest passing value; below --cv2-k-min the bridge "
+                        "is not created. Only for residual-torsion-pc with a bound, digest-verified pair "
+                        "model; otherwise recorded NA (epoch_NNN/cv2_coupling_gate.json) and nothing is "
+                        "blocked. A decision rule: frozen with the campaign's other rules.")
+    p.add_argument("--ap-max-coupling-fraction", type=float, default=0.25,
+                   help="Largest CV2-induced CV1 curvature, as a fraction of RT/sigma_w1^2, the adaptive "
+                        "coupling gate accepts.")
+    p.add_argument("--ap-discovery-census", action=argparse.BooleanOptionalAction, default=False,
+                   help="Diagnostics only (off by default): after each numbered epoch's MD, count new "
+                        "reference-free structural states (core backbone basin strings, 2 A C-alpha "
+                        "clusters) per phase so far and write epoch_NNN/discovery_census.json. Never "
+                        "changes a decision; a failure only prints a WARNING. Same as "
+                        "python -m gareus.adaptive.discovery_census <adaptive_dir>.")
+    p.add_argument("--ap-slow-mode-reseed-fraction", type=_unit_interval_float, default=0.0,
+                   help="X3 slow-mode reseeding (0 = off). At each epoch boundary, fit the leading "
+                        "conditional tICA mode of the torsion residual after the deployed CV1/CV2 pair "
+                        "(reference-free), and restart up to this fraction of windows -- the most "
+                        "one-sided along it -- from a pooled end state inside the window's restraint "
+                        "on its under-sampled side. Starting points only; report epoch_NNN/"
+                        "slow_mode_reseed.json. Needs a frozen residual pair and saved trajectories.")
     p.add_argument("--ap-topups", action=argparse.BooleanOptionalAction, default=False,
                    help="Top-ups (off by default): --no-ap-topups runs each scheduled phase as a single "
                         "all-state baseline only. --ap-topups adds, after that baseline, at most one "
@@ -1553,6 +1615,14 @@ def _shim_adaptive_production(args: argparse.Namespace) -> None:
     args.adaptive_production_ladder_hysteresis = args.ap_ladder_hysteresis
     args.adaptive_production_ladder_max_moves = args.ap_ladder_max_moves
     args.adaptive_production_ladder_adapt_override = args.ap_ladder_adapt_override
+    args.adaptive_production_decision_settings_override = args.ap_decision_settings_override
+    args.adaptive_production_allocation_weight = args.ap_allocation_weight
+    args.adaptive_production_cv2_coupling_gate = args.ap_cv2_coupling_gate
+    args.adaptive_production_max_coupling_fraction = args.ap_max_coupling_fraction
+    args.adaptive_production_discovery_census = args.ap_discovery_census
+    args.adaptive_production_slow_mode_reseed_fraction = args.ap_slow_mode_reseed_fraction
+    args.adaptive_production_edge_metric = args.ap_edge_metric
+    args.adaptive_production_min_edge_neff = args.ap_min_edge_neff
     args.adaptive_production_topup_target_sigma = args.ap_topup_target_sigma
     args.adaptive_production_topup_weak_overlap = args.ap_topup_weak_overlap
     args.adaptive_production_topup_max_fraction = args.ap_topup_max_fraction

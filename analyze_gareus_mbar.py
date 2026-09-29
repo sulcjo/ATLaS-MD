@@ -5398,10 +5398,10 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
             # CV2 centres too: on a 2D layout, CV1 alone chains different
             # (CV1, CV2) windows together as if they were one window's rungs.
             from gareus.mbar_analysis.pmf import _secondary_window_params
-            _lo_sec_c, _ = _secondary_window_params(d.meta, d.u_nk.shape[1])
+            _lo_sec_c, _lo_sec_k = _secondary_window_params(d.meta, d.u_nk.shape[1])
             _lo,_lo_warnings=ladder_overlap_by_axis(None, d.state_lambdas, d.centers, thr=_thr, n_k=m['n_k'],
                                                      pair_overlap=_pair_ov, secondary_centers=_lo_sec_c,
-                                                     primary_k=d.k_kcal)
+                                                     primary_k=d.k_kcal, secondary_k=_lo_sec_k)
             s['ladder_overlap']=_lo
             for _w in _lo_warnings:
                 s.setdefault('warnings',[]).append(_w)

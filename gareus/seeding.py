@@ -1735,6 +1735,23 @@ def generate_us_starting_states_by_pulling(
                 + "!" * 78
             )
 
+    # X3 slow-mode reseed overrides (gareus/adaptive/slow_mode_reseed.py): a seed bank's
+    # slow_mode_reseed/ table names the end state a reseeded window must start from. Empty
+    # (no lookup at all) when the bank has none, so every other window and run is unchanged.
+    _x3_by_window: dict = {}
+    if seed_dir is not None and conformer_library:
+        try:
+            from .adaptive.slow_mode_reseed import reseed_conformers_by_window
+            _x3_by_window = reseed_conformers_by_window(
+                Path(seed_dir), out_dir, centers_user_arr,
+                secondary_cv_centers if secondary_available else None,
+                lambda d: load_genpept_conformer_library(
+                    d, cv_atom1, cv_atom2, primary_cv_def=primary_cv_def, args=args,
+                    topology=topology, secondary_cv_metadata=secondary_cv_metadata))
+        except Exception as exc:  # noqa: BLE001 -- never fail seeding over an override
+            print(f"WARNING [slow-mode reseed]: overrides not applied ({exc}); default seeding")
+            _x3_by_window = {}
+
     def _select_conformer_for_window(w: int) -> tuple[dict, dict]:
         """Choose the best GENPEPT seed for a window using active CV-space distance."""
         if not conformer_library:
@@ -1755,6 +1772,16 @@ def generate_us_starting_states_by_pulling(
                 secondary_seed_scale=secondary_seed_scale,
                 args=args,
             )
+
+        if w in _x3_by_window:
+            conf = _x3_by_window[w]
+            _total, components = _score(conf)
+            components["slow_mode_reseed"] = True
+            with seed_selection_lock:
+                key = str(conf.get("pdb_path", ""))
+                seed_usage_counts[key] = seed_usage_counts.get(key, 0) + 1
+                components["reuse_count_after_selection"] = int(seed_usage_counts[key])
+            return conf, _format_seed_component_dict(components)
 
         with seed_selection_lock:
             ranked = []

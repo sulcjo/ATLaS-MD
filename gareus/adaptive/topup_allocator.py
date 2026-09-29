@@ -24,7 +24,7 @@ class TopupPlan:
     cost_hours: float = 0.0
     reason: str = "healthy"
     # Per state: the steps-equivalent of the data it already holds,
-    # n_eff * report_interval * inefficiency / correction.  predicted_sigma(...) at
+    # n_eff * sample_interval * inefficiency / correction.  predicted_sigma(...) at
     # any top-up length L is sigma_before * sqrt(scale / (scale + L)), so a caller
     # whose top-up ran fewer steps than planned can re-predict with the same model.
     sample_scale_steps: dict = field(default_factory=dict)
@@ -50,13 +50,44 @@ def predicted_sigma(sigma_before: float, sample_scale_steps: float, steps: float
     return float(sigma_before) * math.sqrt(scale / (scale + max(0.0, float(steps))))
 
 
+def decision_sigma(sigma: float, g_builder: float, g_effective: Optional[float]) -> float:
+    """sigma a state would have with its samples counted at ``g_effective`` instead of the
+    union builder's ``g_builder`` (sigma ~ 1/sqrt(N_eff), N_eff = N/g).  ``g_effective``
+    None/non-finite leaves sigma unchanged (X5, ``allocation_weight = "ess"``).
+
+    One-sided: the ratio is clamped at 1, so a state is only ever judged WORSE sampled
+    than the builder says.  The contiguity-aware g is a lower bound for slow states
+    (per-run centring removes modes slower than a run), while the builder's stitched g
+    also carries inter-segment drift and the equilibration discard; neither is a reason
+    to call a state healthier.  Steps leave fast states only by budget competition."""
+    if not _ok(g_effective) or float(g_effective) <= 0.0 or not _ok(sigma):
+        return float(sigma)
+    return float(sigma) * math.sqrt(max(1.0, max(1.0, float(g_effective)) / max(1.0, float(g_builder))))
+
+
 def plan_topup(diag, *, state_ids_in_order: Sequence[int], neighbours: Dict[int, List[int]],
                rung_partners: Dict[int, List[int]], policy, report_interval: int, timestep_fs: float,
                n_gpus: int, budget_hours: float, correction: Optional[Dict[int, float]] = None,
-               edge_attempts: Optional[Dict[Tuple[int, int], int]] = None) -> TopupPlan:
+               edge_attempts: Optional[Dict[Tuple[int, int], int]] = None,
+               effective_g: Optional[Dict[int, float]] = None,
+               sample_interval: Optional[int] = None) -> TopupPlan:
+    """``effective_g`` (X5, ``--ap-allocation-weight ess``): per-state statistical inefficiency
+    from ``gareus.adaptive.effective_samples``.  Deficits, partner choice and the required
+    length then use each state's sigma rescaled to that g (``decision_sigma``); the steps-worth
+    of data a state holds, the MAX_STEP_MULTIPLE cap and the recorded sigma/predictions stay
+    on the builder's scale, so post-top-up calibration is unchanged.  None: today's plan.
+
+    ``sample_interval``: MD steps between two sample rows (production writes one row per
+    replica every ``distance_output_interval`` steps). One raw sample is worth that many
+    steps; ``report_interval`` is only the granularity top-up lengths are rounded to. None
+    keeps the old assumption that one sample is ``report_interval`` steps, which overstated
+    every state's steps-worth by report_interval / distance_output_interval (10x on
+    chignolin_9: 2500 / 250), so each planned top-up length L came out 10x too long
+    before the budget cap."""
     if diag is None:
         return TopupPlan(reason="no_diagnostics")
     interval = max(1, int(report_interval))
+    per_sample = max(1, int(sample_interval)) if sample_interval else interval
     target = float(policy.topup_target_sigma)
     corr = {s: _clamp((correction or {}).get(s, 1.0)) for s in state_ids_in_order}
     attempts = edge_attempts or {}
@@ -64,6 +95,9 @@ def plan_topup(diag, *, state_ids_in_order: Sequence[int], neighbours: Dict[int,
     n_eff = {s: int(diag.n_k.get(s, 0)) for s in state_ids_in_order}
     g = {s: max(1.0, float(diag.inefficiency.get(s, 1.0))) for s in state_ids_in_order}
     sampled = {s for s in state_ids_in_order if n_eff[s] > 0 and _ok(sigma[s])}
+    sigma_raw = sigma
+    if effective_g:
+        sigma = {s: decision_sigma(sigma_raw[s], g[s], effective_g.get(s)) for s in state_ids_in_order}
 
     deficits = {s for s in sampled if sigma[s] > target or s in diag.unconverged}
     initial = frozenset(deficits)
@@ -90,17 +124,17 @@ def plan_topup(diag, *, state_ids_in_order: Sequence[int], neighbours: Dict[int,
         return TopupPlan(structural_edges=tuple(structural), reason="healthy")
 
     def scale(s: int) -> float:
-        return max(1e-9, float(n_eff[s])) * interval * g[s] / corr[s]
+        return max(1e-9, float(n_eff[s])) * per_sample * g[s] / corr[s]
 
     def predicted(s: int, L: int) -> float:
-        return predicted_sigma(sigma[s], scale(s), L)
+        return predicted_sigma(sigma_raw[s], scale(s), L)
 
     def required(s: int) -> int:
         # noise-edge endpoints and unconverged states below target both use σ/√2 (double their data)
         eff_target = target if sigma[s] > target else sigma[s] / math.sqrt(2.0)
         extra_eff = n_eff[s] * ((sigma[s] / eff_target) ** 2 - 1.0)
-        need = _round_up(extra_eff * interval * g[s] / corr[s], interval)
-        cap = _round_up(MAX_STEP_MULTIPLE * n_eff[s] * interval * g[s], interval)
+        need = _round_up(extra_eff * per_sample * g[s] / corr[s], interval)
+        cap = _round_up(MAX_STEP_MULTIPLE * n_eff[s] * per_sample * g[s], interval)
         return max(interval, min(need, cap))
 
     def pick(pool: List[int]) -> int:
@@ -140,5 +174,5 @@ def plan_topup(diag, *, state_ids_in_order: Sequence[int], neighbours: Dict[int,
     return TopupPlan(state_ids=tuple(sorted(patch)), steps=int(L), deficit_state_ids=tuple(sorted(deficits)),
                      partner_state_ids=tuple(sorted(partners)), structural_edges=tuple(structural),
                      weak_edges_topped=tuple(noise_edges), predicted_sigma=pred,
-                     sigma_before={s: sigma[s] for s in patch}, cost_hours=float(cost), reason="planned",
+                     sigma_before={s: sigma_raw[s] for s in patch}, cost_hours=float(cost), reason="planned",
                      sample_scale_steps={s: scale(s) for s in patch})

@@ -302,12 +302,24 @@ def plan_ladder_change(current: Sequence[float], models, design: LadderDesign, *
 R_KJ_PER_MOL_K = 0.0083144626
 
 
+def _restrained(k) -> bool:
+    """k None = not recorded, i.e. the run's default restraint (same rule as the registry)."""
+    if k is None:
+        return True
+    k = float(k)
+    return bool(np.isfinite(k) and k > 0.0)
+
+
 def centre_key(state: dict) -> tuple:
-    """Umbrella centre identity with the restraint pattern (rungs of one centre share it)."""
+    """Umbrella centre identity with the restraint pattern (rungs of one centre share it).
+
+    The coordinate of an unrestrained axis is a placeholder and never part of the identity
+    (spec P6)."""
+    on1 = _restrained(state.get("primary_k"))
     sc = state.get("secondary_center")
-    sc = None if sc is None or not np.isfinite(float(sc)) else round(float(sc), 6)
-    return (round(float(state["primary_center"]), 6), float(state.get("primary_k") or 0.0) > 0.0,
-            sc, float(state.get("secondary_k") or 0.0) > 0.0)
+    on2 = sc is not None and np.isfinite(float(sc)) and _restrained(state.get("secondary_k"))
+    return (round(float(state["primary_center"]), 6) if on1 else None, on1,
+            round(float(sc), 6) if on2 else None, on2)
 
 
 def phase_dirs(adaptive_dir, *, names: Optional[Sequence[str]] = None) -> List[tuple]:

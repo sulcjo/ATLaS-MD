@@ -145,7 +145,8 @@ def _warn_full_matrix_once() -> None:
 
 def ladder_overlap_by_axis(overlap, state_lambdas, centers,
                             thr: float = LADDER_STATE_OVERLAP_MIN, n_k=None,
-                            pair_overlap=None, secondary_centers=None, primary_k=None):
+                            pair_overlap=None, secondary_centers=None, primary_k=None,
+                            secondary_k=None):
     """Split neighbour overlaps into the λ direction and the CV1 direction,
     and grade each axis' own bridging.
 
@@ -163,6 +164,12 @@ def ladder_overlap_by_axis(overlap, state_lambdas, centers,
     in the middle of every CV2 row). Such states stay on the λ axis but are
     left off the CV1 axis entirely: no CV1 pairs, not counted as a CV1 group
     and not a node of the CV1 connectivity graph.
+    ``secondary_k`` (per-state CV2 force constant): likewise, a state with
+    ``k2 <= 0`` carries no CV2 restraint, so its CV2 centre is a placeholder.
+    Centre identity (which states are one window's rungs) uses only the
+    coordinates of restrained axes, plus the restraint pattern itself (spec
+    P6): a CV1-restrained window and a CV2-only window sharing a placeholder
+    coordinate are different windows.
 
     Each pair's value comes from ``pair_overlap(a, b)`` if given, else from
     ``symmetric_state_overlap(overlap, a, b)`` -- i.e. ``sqrt(O_ab * O_ba)`` --
@@ -261,8 +268,24 @@ def ladder_overlap_by_axis(overlap, state_lambdas, centers,
             ]
         on_cv1 = np.isfinite(k1) & (k1 > 0.0)
 
-    sec_key = [_round_key(v) for v in sec]
-    centre_key = [(_round_key(cen[i]), sec_key[i]) for i in range(K)]
+    if secondary_k is None:
+        on_cv2 = np.isfinite(sec)
+    else:
+        k2 = np.asarray(secondary_k, dtype=np.float64)
+        if k2.shape[0] != K:
+            return _empty_axes(), [
+                "ladder-overlap axis report skipped: array length mismatch "
+                f"(state_lambdas {lam.shape}, secondary_k {k2.shape})"
+            ]
+        # NaN k2 = not recorded (a loader without the column): keep the centre.
+        on_cv2 = np.isfinite(sec) & ~(np.isfinite(k2) & (k2 <= 0.0))
+
+    sec_key = [_round_key(sec[i]) if on_cv2[i] else None for i in range(K)]
+    # (restrained on CV1?, CV1 centre if restrained, CV2 centre if restrained); first
+    # element None for a state with no CV1 centre at all, which is off the grid.
+    centre_key = [((bool(on_cv1[i]) if np.isfinite(cen[i]) else None),
+                   _round_key(cen[i]) if on_cv1[i] else None, sec_key[i])
+                  for i in range(K)]
     row_key = [(_round_key(lam[i]), sec_key[i]) if on_cv1[i] else (None, None) for i in range(K)]
 
     def _chain_pairs(group_keys, sort_values):

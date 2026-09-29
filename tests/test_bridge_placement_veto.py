@@ -194,9 +194,18 @@ def test_an_unmeasurable_geometry_is_never_declared_unreachable():
     }
     policy = AdaptiveDecisionPolicy(max_new_windows_per_epoch=1,
                                     bridge_skip_unreachable=True)
+    plan = []
     adds = _adds(propose_actions_from_diagnostics(
-        registry, diagnostics, policy, temperature_K=300.0))
-    assert len(adds) == 1
+        registry, diagnostics, policy, temperature_K=300.0, bridge_plan_out=plan))
+    # The veto did not fire: the edge is funded as repairable with one bridge.
+    assert plan[0]["funded_repairable"] is True and plan[0]["bridges_allocated"] == 1
+    assert plan[0]["outcome"] == "bridged"
+    # No state is added all the same: with no spring on either axis every such state
+    # has the same Hamiltonian, so under restraint-aware identity (spec P6) the
+    # unrestrained midpoint is a duplicate of both endpoints -- their CV1 "centres"
+    # are placeholders and never identity.
+    assert adds == []
+    assert registry.has_near_duplicate(0.25, None, policy, primary_k=0.0)
 
 
 # ---------------------------------------------------------------------------

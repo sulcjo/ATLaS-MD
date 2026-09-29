@@ -280,6 +280,7 @@ def evaluate_gates(
     selection: dict | None = None,
     pair_fallback: str = "cv1_only",
     layout_plan: dict | None = None,
+    cv2_coupling: dict | None = None,
 ) -> dict:
     """Evaluate all gates; return aggregate status and reasons.
 
@@ -313,6 +314,13 @@ def evaluate_gates(
         gates["pair"] = pair_gate(selection, fallback=pair_fallback)
     if layout_plan is not None:
         gates["coverage_design"] = coverage_design_gate(layout_plan)
+    if cv2_coupling is not None:
+        # Spec 3.4 at the layout (--swarm-cv2-coupling-gate): fails when a cell's passing k2
+        # would fall below cv2_k_min. Only its verdict here; the per-cell record is in the report.
+        gates["cv2_coupling"] = {"ok": bool(cv2_coupling.get("ok", True)),
+                                 "reasons": list(cv2_coupling.get("reasons") or []),
+                                 "n_lowered": cv2_coupling.get("n_lowered"),
+                                 "n_below_k_min": cv2_coupling.get("n_below_k_min")}
 
     # Aggregate reasons from all failed gates
     all_reasons = []

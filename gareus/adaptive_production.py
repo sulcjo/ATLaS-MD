@@ -43,6 +43,9 @@ from .io import write_json, write_text_atomic, read_json_file, resolve_run_tempe
 from .lifecycle import _graceful_shutdown
 from .store import SegmentRegistry
 from .extension_seeding import extension_parent_dirs
+from .adaptive.paired_cv import PairedCVCollector, attach_paired_cv
+from .adaptive.pair_runtime import GATE_REPORT_NAME, gate_from_args
+from .adaptive.edge_metric import attach_edge_metric, edge_is_weak_pairwise, edge_sort_overlap
 # Real-frame seed extraction lives in tica.py (a dependency-free leaf module)
 # so seeding.py can also use it for campaign-wide seed search without a
 # circular import - seeding.py -> production.py -> adaptive_production.py is
@@ -478,6 +481,9 @@ class AdaptiveDecisionPolicy:
     # Peak-memory ceiling (GB) for the per-epoch union build + MBAR solve top-ups
     # run; an estimate above it skips the phase's diagnostics (no_diagnostics).
     topup_diagnostics_max_gb: float = 8.0
+    # X5: "raw" (today) or "ess" -- the top-up's deficits use each state's sigma rescaled to
+    # a contiguity-aware statistical inefficiency (gareus/adaptive/effective_samples.py).
+    allocation_weight: str = "raw"
     # Active-state budget for actions that change the state count (0 = unlimited,
     # the --max-replicas convention). Only the atomic ``respace_ladder`` action reads
     # it today; see Section 3.5 of the adaptive-CV2 spec for the wider cap check.
@@ -492,11 +498,39 @@ class AdaptiveDecisionPolicy:
     ladder_max_rungs: int = 8
     ladder_hysteresis: float = 0.03
     ladder_max_moves: int = 2
+    # Spec 3.4 coupling gate on adaptive k2 (gareus.adaptive.pair_runtime), off by default.
+    cv2_coupling_gate: bool = False
+    max_coupling_fraction: float = 0.25
+    # X3 slow-mode-aware reseeding (gareus/adaptive/slow_mode_reseed.py): at each epoch boundary
+    # reseed up to this fraction of windows from pooled end states on the under-sampled side of
+    # the hidden slow mode. 0 = off (no report, no override, seeding exactly as before).
+    slow_mode_reseed_fraction: float = 0.0
+    # Spec 3.1 edge metric (gareus/adaptive/edge_metric.py): "marginal" = today's CV1
+    # histogram overlap; "pairwise-mbar" = two-state MBAR overlap graded against
+    # min_rung_overlap, unmeasured below min_edge_neff effective samples per state.
+    edge_metric: str = "marginal"
+    min_edge_neff: float = 200.0
 
 
 LADDER_SETTINGS_FIELDS = ("ladder_adapt", "ladder_min_overlap", "ladder_overlap_quantile", "ladder_min_ess",
                           "ladder_max_rungs", "ladder_hysteresis", "ladder_max_moves")
 LADDER_SETTINGS_FILENAME = "ladder_adapt_settings.json"
+# Spec P8: the adaptive DECISION RULES a campaign runs under, frozen at its first job.
+# Budgets, step counts and pool sizes are not decision rules and stay per-job. A later
+# spec item that adds a decision knob (edge metric, layout mode, refine, thresholds)
+# appends its policy field here, so a deploy can never change a live campaign's rules.
+DECISION_SETTINGS_FIELDS = (
+    "target_overlap", "min_exchange_acceptance", "min_rung_overlap", "target_rung_overlap",
+    "max_new_rungs_per_epoch", "min_samples_for_add", "min_samples_for_retire",
+    "max_new_windows_per_epoch", "retire_converged", "duplicate_primary_tol",
+    "duplicate_secondary_tol", "redundant_overlap", "max_target_deviation_sigma",
+    "coverage_k_stiffen_cap", "convergence_min_samples_per_state", "convergence_max_weak_edges",
+    "allocation_weight",
+    "cv2_coupling_gate", "max_coupling_fraction",
+    "slow_mode_reseed_fraction",
+    "edge_metric", "min_edge_neff",
+)
+DECISION_SETTINGS_FILENAME = "decision_settings.json"
 
 
 class WindowStateRegistry:
@@ -617,6 +651,8 @@ class WindowStateRegistry:
         secondary: Optional[float],
         policy: AdaptiveDecisionPolicy,
         gamd_lambda: float = 0.0,
+        primary_k: Optional[float] = None,
+        secondary_k: Optional[float] = None,
     ) -> bool:
         """Is there already a state at this centre *on this rung*?
 
@@ -625,18 +661,26 @@ class WindowStateRegistry:
         or replicating a centre across rungs would be rejected as duplication
         of itself.  ``gamd_lambda`` defaults to 0.0, which reproduces the old
         behaviour exactly for a registry with no ladder (every state at λ = 0).
+
+        Identity includes the restraint pattern (spec P6): a state only
+        duplicates one restrained on the same axes, and the coordinate of an
+        unrestrained axis (k = 0; e.g. the CV1 placeholder of a CV2-only window)
+        is never compared. ``primary_k``/``secondary_k`` left None mean "restrained
+        where a coordinate is given", which is what every caller proposes.
         """
         lam = float(gamd_lambda or 0.0)
+        want = _restraint_pattern(primary_k, secondary_k, secondary)
         for state in self.all_states():
-            if abs(float(state.primary_center) - float(primary)) > float(policy.duplicate_primary_tol):
-                continue
             if abs(float(state.gamd_lambda or 0.0) - lam) > 1.0e-9:
                 continue
-            if state.secondary_center is None and secondary is None:
-                return True
-            if state.secondary_center is not None and secondary is not None:
-                if abs(float(state.secondary_center) - float(secondary)) <= float(policy.duplicate_secondary_tol):
-                    return True
+            have = _restraint_pattern(state.primary_k, state.secondary_k, state.secondary_center)
+            if have != want:
+                continue
+            if want[0] and abs(float(state.primary_center) - float(primary)) > float(policy.duplicate_primary_tol):
+                continue
+            if want[1] and abs(float(state.secondary_center) - float(secondary)) > float(policy.duplicate_secondary_tol):
+                continue
+            return True
         return False
 
     # ---- persistence ------------------------------------------------------
@@ -1540,6 +1584,9 @@ def filter_seed_bank_for_state_ids(
         "copied": copied_count,
         "rows": _json_ready(chosen[:200]),
     }
+    if (seed_bank_dir / "slow_mode_reseed").is_dir():       # X3 overrides (absent when off)
+        from .adaptive.slow_mode_reseed import filter_overrides  # noqa: PLC0415
+        payload["slow_mode_reseed_rows"] = filter_overrides(seed_bank_dir, target_ids, output_dir)
     write_json(output_dir / "filtered_seed_bank_report.json", payload)
     lines = [
         "# Filtered adaptive seed bank",
@@ -2180,18 +2227,47 @@ def _build_edge_diagnostics(
     return rows
 
 
-def _centre_group_key(state: WindowState, policy: AdaptiveDecisionPolicy) -> Tuple[int, Optional[int]]:
+def _axis_restrained(k: Optional[float]) -> bool:
+    """k None = not recorded, which every writer means as "the run's default restraint"."""
+    if k is None:
+        return True
+    try:
+        k = float(k)
+    except (TypeError, ValueError):
+        return True
+    return bool(math.isfinite(k) and k > 0.0)
+
+
+def _restraint_pattern(primary_k: Optional[float], secondary_k: Optional[float],
+                       secondary_center: Optional[float]) -> Tuple[bool, bool]:
+    """(CV1 restrained, CV2 restrained). No CV2 centre means no CV2 restraint."""
+    return (_axis_restrained(primary_k), secondary_center is not None and _axis_restrained(secondary_k))
+
+
+def _centre_group_key(state: WindowState, policy: AdaptiveDecisionPolicy) -> Tuple[Optional[int], Optional[int]]:
     """Quantised (primary, secondary) centre, at the duplicate tolerances.
 
     Two states sharing this key are the same umbrella window on different rungs
     of the λ-ladder -- the pair whose CV-histogram overlap is ~1 by
     construction and therefore says nothing about their phase-space overlap.
+
+    An unrestrained axis (k = 0) keys as None, whatever placeholder centre it
+    carries (spec P6): a CV2-only window at the CV1 placeholder is not the same
+    window as a CV1-restrained one at that CV1 value, and two CV2-only windows
+    differ only in CV2. None is unambiguous, since a restrained axis always keys
+    as an int.
     """
     p_tol = max(float(policy.duplicate_primary_tol), 1.0e-12)
     s_tol = max(float(policy.duplicate_secondary_tol), 1.0e-12)
-    p_key = int(round(float(state.primary_center) / p_tol))
-    s_key = None if state.secondary_center is None else int(round(float(state.secondary_center) / s_tol))
+    on1, on2 = _restraint_pattern(state.primary_k, state.secondary_k, state.secondary_center)
+    p_key = int(round(float(state.primary_center) / p_tol)) if on1 else None
+    s_key = int(round(float(state.secondary_center) / s_tol)) if on2 else None
     return (p_key, s_key)
+
+
+def _sortable_centre_key(key: Tuple[Optional[int], Optional[int]]) -> Tuple:
+    """Order centre keys deterministically; an unrestrained axis (None) sorts first."""
+    return tuple((0, 0) if v is None else (1, int(v)) for v in key)
 
 
 def _representative_rung(registry: WindowStateRegistry) -> float:
@@ -2395,8 +2471,13 @@ def collect_epoch_diagnostics(
     policy: Optional[AdaptiveDecisionPolicy] = None,
     *,
     rung_mbar_overlap: Optional[Dict[Tuple[int, int], float]] = None,
+    edge_metric: bool = True,
 ) -> Dict[str, Any]:
-    """Collect simple per-state and per-edge diagnostics from one epoch output."""
+    """Collect simple per-state and per-edge diagnostics from one epoch output.
+
+    ``edge_metric=False`` skips the spec 3.1 grading (the segmented collector's
+    per-segment calls; it grades the pooled payload once).
+    """
     epoch_dir = Path(epoch_dir)
     policy = policy or AdaptiveDecisionPolicy()
     samples = _read_sample_dicts(epoch_dir)
@@ -2415,8 +2496,10 @@ def collect_epoch_diagnostics(
 
     state_rows: List[StateDiagnostics] = []
     state_by_id: Dict[int, StateDiagnostics] = {}
+    paired = PairedCVCollector(registry)  # spec P4; additive keys only
     for epoch_window, state_id in sorted(window_map.items()):
         rows = by_state.get(int(state_id), [])
+        paired.add_rows(int(state_id), rows, source=epoch_dir.name)
         cv = _finite_float_list(r.get("cv_A", r.get("primary_cv_value")) for r in rows)
         sec = _finite_float_list(r.get("secondary_cv") for r in rows)
         boost_kcal = _finite_float_list(r.get("gamd_boost_total_kcal_mol") for r in rows)
@@ -2501,6 +2584,9 @@ def collect_epoch_diagnostics(
         "non_neighbor_redundancies": non_neighbor_redundancies,
         "policy": _json_ready(asdict(policy)),
     }
+    attach_paired_cv(payload, paired, epoch_dir / "adaptive_epoch_diagnostics.json")
+    if edge_metric:
+        attach_edge_metric(payload, policy, epoch_dir)  # spec 3.1; no-op under the default metric
     write_json(epoch_dir / "adaptive_epoch_diagnostics.json", payload)
     return payload
 
@@ -2543,9 +2629,35 @@ def _write_tica_version_marker(run_dir: Path, args) -> None:
         pass
 
 
+_RESIDUAL_CV2_MODES = ("residual-torsion-pc", "residual-pc")
+
+
+def _frozen_residual_pair(args) -> bool:
+    """Is this campaign's CV2 a frozen residual pair (spec 3.6)?
+
+    Such a pair is fixed for the whole campaign: its samples, window centres and MBAR bias
+    are defined by the pair model's one direction. A tICA refit, a recentre onto tIC1
+    medians or a switch to tica-linear would silently redefine CV2 mid-campaign.
+    """
+    return bool(str(getattr(args, "secondary_cv", "") or "") in _RESIDUAL_CV2_MODES
+                or getattr(args, "secondary_cv_model", None))
+
+
+FROZEN_PAIR_REFIT_MESSAGE = (
+    "this campaign's CV2 is a frozen residual pair (--secondary-cv-model / residual-torsion-pc); "
+    "tICA refits, tIC1 recentring and the tica-linear switch would redefine CV2 mid-campaign and "
+    "are refused. Remove the tICA update settings (--tica-obs-interval, --tica-update-after-epochs, "
+    "--tica-epochs-per-cycle, --tica-switch-cv2) for this campaign")
+
+
 def _apply_tica_cv2_switch(args, tica_update_report: dict, *, next_epoch: int) -> bool:
     """Apply one-shot tica-linear CV2 switch only after a valid tICA update."""
     if not getattr(args, "tica_switch_cv2", False):
+        return False
+    if _frozen_residual_pair(args):
+        if isinstance(tica_update_report, dict):
+            tica_update_report["cv2_switch_skipped"] = {"reason": "frozen_residual_pair"}
+        print(f"WARNING: tica-linear CV2 switch refused: {FROZEN_PAIR_REFIT_MESSAGE}")
         return False
     prev_cv2 = str(getattr(args, "secondary_cv", "none") or "none")
     if prev_cv2 == "tica-linear":
@@ -2579,11 +2691,16 @@ def _apply_tica_centers_to_registry(
     registry: "WindowStateRegistry",
     per_window_tic1_centers: Dict[int, float],
     epoch_dir: Path,
+    *,
+    frozen_residual_pair: bool = False,
 ) -> int:
     """Update registry secondary_center for active states using per-window tIC1 medians.
 
-    Returns number of states updated.
+    Returns number of states updated. Refuses (raises) on a frozen residual pair: overwriting
+    its centres would change the Hamiltonian of states that already hold samples.
     """
+    if frozen_residual_pair and per_window_tic1_centers:
+        raise RuntimeError(f"tIC1 recentring refused: {FROZEN_PAIR_REFIT_MESSAGE}")
     window_map = _load_epoch_window_map(epoch_dir, registry)
     updated = 0
     for win_idx, state_id in window_map.items():
@@ -3050,6 +3167,9 @@ def _maybe_update_tica_cvaux(epoch: int, epoch_dir: Path, adaptive_dir: Path, ar
 
     if not should_update:
         return {}
+    if _frozen_residual_pair(args):
+        print(f"WARNING: tICA refit refused for epoch {epoch}: {FROZEN_PAIR_REFIT_MESSAGE}")
+        return {"status": "refused_frozen_residual_pair", "epoch": int(epoch)}
 
     tica_dir = epoch_dir / "tica_obs"
     if not tica_dir.exists() or not any(tica_dir.glob("dihedral_obs_*.npz")):
@@ -4011,9 +4131,11 @@ def collect_final_combined_diagnostics(
     canonical_state_to_window = {int(s.state_id): int(i) for i, s in enumerate(canonical_active)}
     canonical_window_map = {int(i): int(s.state_id) for i, s in enumerate(canonical_active)}
 
+    paired = PairedCVCollector(registry)  # spec P4; additive keys only
     for source_label, sample_dir in sources:
         window_map = _load_epoch_window_map(sample_dir, registry)
         samples = _read_sample_dicts(sample_dir)
+        source_rows: Dict[int, List[Dict[str, Any]]] = {}
         exchanges = _read_exchange_dicts(sample_dir)
         total_samples += len(samples)
         total_exchanges += len(exchanges)
@@ -4030,11 +4152,14 @@ def collect_final_combined_diagnostics(
                 continue
             sid = window_map.get(int(w), int(w))
             by_state.setdefault(int(sid), []).append(row)
+            source_rows.setdefault(int(sid), []).append(row)
             cv = _float_or_none(row.get("cv_A", row.get("primary_cv_value")))
             if cv is not None:
                 canonical_w = canonical_state_to_window.get(int(sid))
                 if canonical_w is not None:
                     by_window_values.setdefault(int(canonical_w), []).append(float(cv))
+        for sid, rows in source_rows.items():
+            paired.add_rows(sid, rows, source=source_label)
         for row in exchanges:
             wi = _float_or_none(row.get("window_i"))
             wj = _float_or_none(row.get("window_j"))
@@ -4107,6 +4232,8 @@ def collect_final_combined_diagnostics(
         "edges": [e.to_dict() for e in edge_rows],
         "policy": _json_ready(asdict(policy)),
     }
+    attach_paired_cv(payload, paired, adaptive_dir / "adaptive_final_combined_diagnostics.json")
+    attach_edge_metric(payload, policy, adaptive_dir)  # spec 3.1; no-op under the default metric
     write_json(adaptive_dir / "adaptive_final_combined_diagnostics.json", payload)
     return payload
 
@@ -4595,6 +4722,7 @@ def propose_actions_from_diagnostics(
     temperature_K: float = 298.0,
     secondary_k_max: Optional[float] = None,
     bridge_plan_out: Optional[List[Dict[str, Any]]] = None,
+    coupling_gate: Optional[Any] = None,
 ) -> List[Tuple]:
     """Propose registry-changing actions from one epoch's diagnostics.
 
@@ -4634,7 +4762,7 @@ def propose_actions_from_diagnostics(
         weak_edges.append(edge)
 
     weak_edges.sort(key=lambda e: (
-        1.0 if e.get("overlap") is None else float(e.get("overlap")),
+        1.0 if edge_sort_overlap(e, policy) is None else float(edge_sort_overlap(e, policy)),
         1.0 if e.get("exchange_acceptance") is None else float(e.get("exchange_acceptance")),
     ))
 
@@ -4915,6 +5043,8 @@ def propose_actions_from_diagnostics(
             # rung (the same one build_geometry_edges wired this edge between).
             if registry.has_near_duplicate(
                 primary, secondary, policy, gamd_lambda=_representative_rung(registry),
+                primary_k=primary_k,
+                secondary_k=secondary_k if (s1.secondary_k is not None and s2.secondary_k is not None) else None,
             ):
                 # A slot freed by a near-duplicate skip is deliberately *not*
                 # handed back to another edge: the allocation above is what the
@@ -4931,6 +5061,18 @@ def propose_actions_from_diagnostics(
                 secondary_k_max,
                 context=f"weak-edge bridge {s1.state_id}-{s2.state_id}",
             )
+            if coupling_gate is not None and secondary_k is not None:
+                # Spec 3.4, after the cv2_k_max cap: lower k2 to the largest value whose CV1
+                # curvature passes; below cv2_k_min the bridge is not created (None here would
+                # mean a CV1-only state, so refuse with continue instead).
+                secondary_k, _gate_note = coupling_gate.gate(
+                    primary, primary_k, secondary, secondary_k,
+                    context=f"weak-edge bridge {s1.state_id}-{s2.state_id}")
+                if secondary_k is None:
+                    print(f"[adaptive] {_gate_note}")
+                    continue
+                if _gate_note:
+                    _k_warning = f"{_k_warning}; {_gate_note}" if _k_warning else _gate_note
             params = (primary, primary_k, secondary, secondary_k)
             placed_this_edge += 1
             reason = (
@@ -5220,6 +5362,10 @@ def _edge_is_measured_weak(edge: Dict[str, Any], policy: AdaptiveDecisionPolicy)
     if str(edge.get("edge_type")) == "rung":
         value = edge.get("mbar_overlap")
         return value is not None and float(value) < float(policy.min_rung_overlap)
+    if str(getattr(policy, "edge_metric", "marginal")) == "pairwise-mbar":
+        # Spec 3.1: one metric (two-state / union pairwise MBAR, bootstrap bound);
+        # cross-pattern and unmeasured edges are never weak.
+        return edge_is_weak_pairwise(edge, float(policy.min_rung_overlap))
     overlap = edge.get("overlap")
     weak = overlap is not None and float(overlap) < float(policy.target_overlap)
     acc = edge.get("exchange_acceptance")
@@ -6129,24 +6275,32 @@ def collect_segmented_epoch_diagnostics(epoch_dir: Path, registry: WindowStateRe
     # Hoist the static edge list once — build_geometry_edges depends only on
     # the registry, which is constant for the lifetime of this call.
     geometry_edges = build_geometry_edges(registry)
+    # Spec P4: row-paired (CV1, CV2) pooled over ALL segments, so the joint edge
+    # overlap below is a pooled value, never a per-segment or CV1-only one.
+    paired = PairedCVCollector(registry)
 
     for seg in segment_dirs:
-        diag = collect_epoch_diagnostics(seg, registry, policy=policy)
+        diag = collect_epoch_diagnostics(seg, registry, policy=policy, edge_metric=False)
         segment_payloads.append({"segment": seg.name, "diagnostics_json": str(seg / "adaptive_epoch_diagnostics.json")})
 
         # --- Accumulate raw cv_A values per state from this segment's samples ---
         seg_window_map = _load_epoch_window_map(seg, registry)
         seg_cv_by_state: Dict[int, List[float]] = {}
+        seg_rows_by_state: Dict[int, List[Dict[str, Any]]] = {}
         for sample_row in _read_sample_dicts(seg):
             w = _float_or_none(sample_row.get("window"))
             if w is None:
                 continue
             sid = seg_window_map.get(int(w), int(w))
+            seg_rows_by_state.setdefault(sid, []).append(sample_row)
             cv = _float_or_none(sample_row.get("cv_A", sample_row.get("primary_cv_value")))
             if cv is not None:
                 seg_cv_by_state.setdefault(sid, []).append(float(cv))
         for sid, vals in seg_cv_by_state.items():
             pooled_cv_by_state.setdefault(sid, []).extend(vals)
+        for sid, seg_rows in seg_rows_by_state.items():
+            paired.add_rows(sid, seg_rows, source=seg.name)
+        del seg_rows_by_state
 
         # --- Compute per-segment per-edge overlap (0.0 for degenerate segments) ---
         for si, sj, _etype, _nd in geometry_edges:
@@ -6285,6 +6439,8 @@ def collect_segmented_epoch_diagnostics(epoch_dir: Path, registry: WindowStateRe
         "active_graph_connected": active_graph_connected(registry),
         "policy": _json_ready(asdict(policy)),
     }
+    attach_paired_cv(payload, paired, epoch_dir / "adaptive_epoch_diagnostics.json")
+    attach_edge_metric(payload, policy, epoch_dir)  # spec 3.1; no-op under the default metric
     write_json(epoch_dir / "adaptive_epoch_diagnostics.json", payload)
     return payload
 
@@ -6373,6 +6529,64 @@ def _segment_checkpoint_prod_done(seg_dir: Path) -> Optional[int]:
         return int(manifest.get("prod_done", 0))
     except (TypeError, ValueError):
         return None
+
+
+EXTENSION_DIAGNOSTICS_STATE = "extension_diagnostics_state.json"
+
+
+def _record_extension_diagnostics_state(ext_dir: Path) -> None:
+    """Record the checkpointed production step the round's diagnostics were built from."""
+    write_json(Path(ext_dir) / EXTENSION_DIAGNOSTICS_STATE,
+               {"prod_done": _segment_checkpoint_prod_done(ext_dir), "written_unix": time.time()})
+
+
+def _extension_diagnostics_are_stale(ext_dir: Path) -> bool:
+    """True when a finished round's ``adaptive_epoch_diagnostics.json`` predates its samples.
+
+    A round's diagnostics are collected by the job that finishes its MD. They go stale
+    when a later job continues the same round (a raised MD budget re-enters
+    final_extension_NNN with a larger target), and that job is stopped by SIGTERM right
+    after the round's MD completes: the driver returns ``interrupted_after_checkpoint``
+    before collecting, and the next job starts the next round, trusting the old record
+    (chignolin_9 final_extension_001: diagnostics from 10,369 samples per state, the
+    finished round holds 15,796). No record (rounds from before this check) counts as
+    stale when the round has a checkpoint.
+    """
+    now = _segment_checkpoint_prod_done(ext_dir)
+    if now is None:
+        return False
+    state = read_json_file(Path(ext_dir) / EXTENSION_DIAGNOSTICS_STATE, None)
+    if not isinstance(state, dict) or state.get("prod_done") is None:
+        return True
+    try:
+        return int(state["prod_done"]) != int(now)
+    except (TypeError, ValueError):
+        return True
+
+
+def _refresh_stale_extension_diagnostics(adaptive_dir: Path, prior_summaries: Sequence[Dict[str, Any]],
+                                         registry: "WindowStateRegistry",
+                                         policy: "AdaptiveDecisionPolicy") -> List[str]:
+    """Recollect every earlier round whose diagnostics predate its samples; returns their names."""
+    refreshed = []
+    for summary in prior_summaries:
+        # The recorded dir can be another host's absolute path (a synced copy); the round
+        # number names the directory under this campaign either way.
+        recorded = str(summary.get("dir") or "")
+        ext_dir = Path(recorded) if recorded else None
+        if ext_dir is None or not ext_dir.is_dir():
+            ext_dir = Path(adaptive_dir) / f"final_extension_{int(summary.get('extension', 0) or 0):03d}"
+        if not ext_dir.is_dir() or not _extension_diagnostics_are_stale(ext_dir):
+            continue
+        try:
+            collect_segmented_epoch_diagnostics(ext_dir, registry, policy)
+            _record_extension_diagnostics_state(ext_dir)
+            refreshed.append(ext_dir.name)
+            print(f"    Adaptive-production: refreshed stale diagnostics of {ext_dir.name} "
+                  f"(its samples outgrew them; see _extension_diagnostics_are_stale)")
+        except Exception as exc:          # a report refresh must never block the campaign
+            print(f"WARNING: could not refresh diagnostics of {ext_dir} ({exc})")
+    return refreshed
 
 
 def stage_phase_identity(epoch_dir_name: str, max_epochs: Optional[int] = None) -> Dict[str, Any]:
@@ -6556,9 +6770,19 @@ def _topup_plan_for_phase(args, epoch_dir: Path, registry: "WindowStateRegistry"
     timestep = float(getattr(args, "timestep_fs", 4.0) or 4.0)
     budget = float(policy.topup_max_fraction) * wall_hours(int(full_steps), len(ids), timestep, n_gpus,
                                                            policy.topup_throughput_table)
-    plan = plan_topup(diag, state_ids_in_order=ids, neighbours=neighbours, rung_partners=rung_partners,
-                      policy=policy, report_interval=interval, timestep_fs=timestep, n_gpus=n_gpus,
-                      budget_hours=budget, correction=state["correction"], edge_attempts=state["edge_attempts"])
+    def _plan(effective_g=None):
+        return plan_topup(diag, state_ids_in_order=ids, neighbours=neighbours, rung_partners=rung_partners,
+                          policy=policy, report_interval=interval, timestep_fs=timestep, n_gpus=n_gpus,
+                          budget_hours=budget, correction=state["correction"],
+                          edge_attempts=state["edge_attempts"], effective_g=effective_g,
+                          sample_interval=_sample_interval_steps(args))
+    plan = _plan()
+    if str(getattr(policy, "allocation_weight", "raw")) == "ess":     # X5; raw never estimates
+        from .adaptive import effective_samples as _es
+        plan = _es.ess_topup_plan(
+            _plan, plan, diag, epoch_dir=epoch_dir, adaptive_dir=adaptive_dir, registry=registry, state_ids=ids,
+            pilot_dirs=[Path(p) for p in (getattr(args, "adaptive_production_pilot_sample_dirs", None) or [])],
+            tica_cv_version=getattr(args, "tica_cv_version", None))
     if diag is not None:
         save_union_overlap(epoch_dir, diag.edge_overlap)
         state["f_kT"] = dict(diag.f_kT)
@@ -7054,6 +7278,7 @@ def run_scheduled_adaptive_epoch(
             })
             return seg_dir
         print(f"      scheduled segment {name}: {len(state_ids)} state(s), {actual_steps} steps")
+        _require_phase_within_replica_cap(args, len(state_ids), seg_dir, f"segment {name}")
         run_gareus_callable(seg_args, seg_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
         if _graceful_shutdown.is_set():
             # Charge the pool for what actually ran before returning. Returning
@@ -7181,6 +7406,7 @@ class AdaptiveProductionController:
         self.epoch_steps = int(epoch_steps)
         self.registry_dir = None if registry_dir is None else Path(registry_dir)
         self.current_epoch = 0
+        self.refused_actions: List[Dict[str, Any]] = []
 
     def run(self, max_epochs: Optional[int] = None) -> None:
         epoch = 0
@@ -7252,7 +7478,7 @@ class AdaptiveProductionController:
         for state in self.registry.active_states():
             groups.setdefault(_centre_group_key(state, policy), []).append(state)
         created: List[WindowState] = []
-        for _key, members in sorted(groups.items()):
+        for _key, members in sorted(groups.items(), key=lambda kv: _sortable_centre_key(kv[0])):
             members = sorted(members, key=lambda s: (float(s.gamd_lambda or 0.0), int(s.state_id)))
             zeros = [s for s in members if abs(float(s.gamd_lambda or 0.0)) <= 1.0e-9]
             rep = zeros[0] if zeros else members[0]
@@ -7323,9 +7549,48 @@ class AdaptiveProductionController:
             self._retire_rung_at_every_centre(epoch, lam, f"respace_ladder: {reason}")
         return True
 
+    def _states_added_by(self, action: Tuple) -> int:
+        """Net number of active states ``action`` would add to the live registry."""
+        kind = str(action[0])
+        rungs = self.registry.rung_lambdas()
+        per_centre = len(rungs) if any(lam > 0.0 for lam in rungs) else 1
+        if kind in ("add", "tica_coverage_add"):
+            return per_centre
+        if kind == "split":
+            return per_centre * len(action[2]) - 1
+        if kind == "add_rung":
+            lam = float(action[1])
+            policy = AdaptiveDecisionPolicy()
+            groups: Dict[Tuple, List[WindowState]] = {}
+            for state in self.registry.active_states():
+                groups.setdefault(_centre_group_key(state, policy), []).append(state)
+            return sum(1 for members in groups.values()
+                       if not any(abs(float(s.gamd_lambda or 0.0) - lam) <= 1.0e-9 for s in members))
+        return 0
+
+    def _within_replica_budget(self, action: Tuple) -> bool:
+        """Spec 3.5: every apply reads the budget from the LIVE registry, so a later action
+        (or the post-coverage apply) sees the states earlier ones already added. 0 = unlimited.
+        ``respace_ladder`` checks its own projected count in ``_apply_respace_ladder``."""
+        budget = int(getattr(self.policy, "max_replicas_budget", 0) or 0)
+        added = self._states_added_by(action)
+        if budget <= 0 or added <= 0:
+            return True
+        n_active = len(self.registry.active_states())
+        if n_active + added <= budget:
+            return True
+        print(f"[adaptive] refusing {action[0]!r}: it would bring the active states to "
+              f"{n_active + added} (+{added}), above --max-replicas {budget}; the proposal is dropped")
+        self.refused_actions.append({"action": str(action[0]), "n_active": n_active, "added": added,
+                                     "budget": budget, "reason": "max_replicas_budget"})
+        return False
+
     def apply_actions(self, epoch: int, actions: Sequence[Tuple]) -> None:
-        for action in actions:
+        for index, action in enumerate(actions):
             kind = str(action[0])
+            if not self._within_replica_budget(action):
+                self.refused_actions[-1]["index"] = int(index)
+                continue
             if kind == "retire":
                 _, state_id, reason = action
                 _st = self.registry.get_state(int(state_id))
@@ -7481,6 +7746,7 @@ def policy_from_args(args: Any) -> AdaptiveDecisionPolicy:
         topup_throughput_table=tuple(getattr(args, "adaptive_production_topup_throughput_table",
                                              ((16.0, 3154.0), (59.0, 2300.0)))),
         topup_diagnostics_max_gb=_arg_float(args, "adaptive_production_topup_diagnostics_max_gb", 8.0),
+        allocation_weight=str(getattr(args, "adaptive_production_allocation_weight", "raw") or "raw"),
         context_reuse=_arg_bool(args, "adaptive_production_context_reuse", False),
         context_reuse_require=_arg_bool(args, "adaptive_production_context_reuse_require", False),
         context_reuse_mode=str(getattr(args, "adaptive_production_context_reuse_mode", "off") or "off"),
@@ -7496,7 +7762,56 @@ def policy_from_args(args: Any) -> AdaptiveDecisionPolicy:
         ladder_max_rungs=_arg_int(args, "adaptive_production_ladder_max_rungs", 8),
         ladder_hysteresis=_arg_float(args, "adaptive_production_ladder_hysteresis", 0.03),
         ladder_max_moves=_arg_int(args, "adaptive_production_ladder_max_moves", 2),
+        cv2_coupling_gate=_arg_bool(args, "adaptive_production_cv2_coupling_gate", False),
+        max_coupling_fraction=_arg_float(args, "adaptive_production_max_coupling_fraction", 0.25),
+        slow_mode_reseed_fraction=_arg_float(args, "adaptive_production_slow_mode_reseed_fraction", 0.0),
+        edge_metric=str(getattr(args, "adaptive_production_edge_metric", "marginal") or "marginal"),
+        min_edge_neff=_arg_float(args, "adaptive_production_min_edge_neff", 200.0),
     )
+
+
+def _resolve_decision_settings(adaptive_dir: Path, policy: "AdaptiveDecisionPolicy", *,
+                               override: bool = False) -> Tuple["AdaptiveDecisionPolicy", Dict[str, Any]]:
+    """Freeze the campaign's decision rules at its first job; honour them on every resume (P8).
+
+    Returns ``(policy, record)``. The first job writes ``decision_settings.json`` with this
+    job's values of ``DECISION_SETTINGS_FIELDS``; every later job runs with the recorded
+    values whatever its own flags or the code's defaults say, and prints what it overrode.
+    ``override`` (``--ap-decision-settings-override``) replaces the record with this job's
+    values. A field added to the tuple after a campaign started is recorded from the job
+    that first sees it (the record is extended, never rewritten).
+    """
+    path = Path(adaptive_dir) / DECISION_SETTINGS_FILENAME
+    current = {f: getattr(policy, f) for f in DECISION_SETTINGS_FIELDS}
+    recorded = (read_json_file(path, {}) or {}) if (path.exists() and not override) else {}
+    values = {f: recorded["settings"][f] for f in DECISION_SETTINGS_FIELDS
+              if isinstance(recorded.get("settings"), dict) and f in recorded["settings"]}
+    differs = {f: {"recorded": values[f], "this_job": current[f]} for f in values if values[f] != current[f]}
+    if differs:
+        print(f"    Adaptive decision rules: using the campaign's recorded settings from {path} for "
+              f"{sorted(differs)}; pass --ap-decision-settings-override to replace them")
+    merged = {**current, **values}
+    record = {
+        "schema_version": "adaptive_decision_settings_v1",
+        "settings": merged,
+        "created_unix": recorded.get("created_unix", time.time()),
+        "overridden_by_job": bool(override and path.exists()),
+    }
+    if record["settings"] != recorded.get("settings") or not path.exists():
+        write_json(path, record)
+    return replace(policy, **merged), {**record, "ignored_job_values": differs}
+
+
+def _record_decision_settings_in_manifest(out_dir: Path, record: Dict[str, Any]) -> None:
+    """Mirror the frozen decision rules into the campaign manifest (one key, replaced whole)."""
+    try:
+        from .provenance import update_run_manifest
+        update_run_manifest(out_dir, {"method_settings": {"adaptive_decision_settings": None}})
+        update_run_manifest(out_dir, {"method_settings": {"adaptive_decision_settings": {
+            "settings": record["settings"], "file": DECISION_SETTINGS_FILENAME,
+            "ignored_job_values": record.get("ignored_job_values", {})}}})
+    except Exception as exc:                   # the settings file is authoritative; the mirror is a record
+        print(f"WARNING: could not record the adaptive decision settings in the run manifest ({exc})")
 
 
 def _resolve_ladder_settings(adaptive_dir: Path, policy: "AdaptiveDecisionPolicy", *,
@@ -7757,6 +8072,9 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
     policy = policy_from_args(args)
     policy = _resolve_ladder_settings(adaptive_dir, policy,
                                       override=_arg_bool(args, "adaptive_production_ladder_adapt_override", False))
+    policy, _decision_record = _resolve_decision_settings(
+        adaptive_dir, policy, override=_arg_bool(args, "adaptive_production_decision_settings_override", False))
+    _record_decision_settings_in_manifest(out_dir, _decision_record)
     max_epochs = max(1, _arg_int(args, "adaptive_production_epochs", 3))
     # Epoch 0 also bootstraps the tICA model and (when enabled) the shared GaMD
     # envelope recalibration -- both need only a short look at real sampling, not
@@ -7892,6 +8210,12 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
         for _es in reversed(epoch_summaries):
             _sw = (_es.get("tica_update") or {}).get("cv2_switched")
             if _sw and _sw.get("to") == "tica-linear":
+                if _frozen_residual_pair(args):
+                    raise RuntimeError(
+                        f"resume refused: epoch {_es.get('epoch')} recorded a CV2 switch "
+                        f"'{_sw.get('from')}' -> 'tica-linear', but {FROZEN_PAIR_REFIT_MESSAGE}. "
+                        "A frozen pair's campaign can never have switched; the epoch summaries do not "
+                        "belong to this configuration")
                 if str(getattr(args, "secondary_cv", "none") or "none") != "tica-linear":
                     args.secondary_cv = "tica-linear"
                     args.cv2_k_min = float(getattr(args, "tica_linear_k_min", 5.0) or 5.0)
@@ -8159,6 +8483,9 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                     expected_rows=len(registry.active_states()),
                 )
             _write_tica_version_marker(epoch_dir, epoch_args)
+            if registry is not None:
+                _require_phase_within_replica_cap(args, len(registry.active_states()), epoch_dir,
+                                                  f"epoch {epoch:03d}")
             run_gareus(epoch_args, epoch_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
             if _graceful_shutdown.is_set():
                 _write_runtime_pool_reports(adaptive_dir, runtime_pool)
@@ -8190,10 +8517,15 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             )
             diagnostics = collect_segmented_epoch_diagnostics(epoch_dir, registry, policy)
             _assert_epoch_has_samples(diagnostics, registry, epoch_dir, int(actual_epoch_steps))
+        if _arg_bool(args, "adaptive_production_discovery_census", False):
+            # X8 diagnostics only: never changes a decision; census_for_epoch never raises.
+            from gareus.adaptive.discovery_census import census_for_epoch
+            census_for_epoch(adaptive_dir, epoch_dir)
         bridge_plan: List[Dict[str, Any]] = []
         if _post_action_registry is not None:
             actions = [tuple(a) for a in _ledger.get("actions", [])]
         else:
+            _coupling_gate = gate_from_args(args, out_dir, policy, temperature_k=_args_temperature_k(args))
             actions = propose_actions_from_diagnostics(
                 registry, diagnostics, policy=policy,
                 temperature_K=_args_temperature_k(args),
@@ -8201,7 +8533,13 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                 # rewrites args.cv2_k_max mid-campaign. See _resolve_secondary_k_max.
                 secondary_k_max=_resolve_secondary_k_max(args),
                 bridge_plan_out=bridge_plan,
+                coupling_gate=_coupling_gate,
             )
+            if _coupling_gate is not None:
+                try:
+                    write_json(epoch_dir / GATE_REPORT_NAME, _coupling_gate.report())
+                except Exception as exc:          # a report must never invalidate a completed epoch
+                    print(f"WARNING: failed to write {GATE_REPORT_NAME} for epoch {epoch}: {exc}")
             if str(policy.ladder_adapt) == "respace" and len(registry.rung_lambdas()) > 1:
                 # The adaptive ladder replaces the weak-edge add_rung proposer: it re-places the
                 # whole interior ladder from this epoch's samples (at most ladder_max_moves moves).
@@ -8256,13 +8594,27 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             if seed_bank_report.get("status") == "ok":
                 current_seed_bank = seed_bank_dir
 
+        _refused_actions: List[Dict[str, Any]] = []
         if _post_action_registry is not None:
             registry = _post_action_registry          # the actions are already in it
         else:
             _snapshot_pre_action_registry(epoch_dir, registry)
-            _apply_registry_actions(registry, actions, epoch, policy=policy)
+            _refused_actions = _apply_registry_actions(registry, actions, epoch, policy=policy)
         registry_paths = registry.save(adaptive_dir)
-        _record_applied_actions(epoch_dir, epoch, actions, registry_path)
+        if _post_action_registry is not None:
+            # A recovered epoch's ``actions`` are the ledger's applied list; carry its refusals
+            # over as they are (their index points into the original proposal list).
+            _refused_actions = [{k: v for k, v in r.items() if k != "index"}
+                                for r in (_ledger.get("refused") or [])]
+        _record_applied_actions(epoch_dir, epoch, actions, registry_path, refused=_refused_actions)
+        _reassign_seeds_after_actions(current_seed_bank, registry)
+        if float(policy.slow_mode_reseed_fraction or 0.0) > 0.0:
+            from .adaptive.slow_mode_reseed_io import run_epoch_slow_mode_reseed  # noqa: PLC0415
+            run_epoch_slow_mode_reseed(
+                fraction=float(policy.slow_mode_reseed_fraction), epoch_dir=epoch_dir,
+                phase_dirs=([Path(s.get("dir")) for s in scheduled_summary.get("segments", []) if s.get("dir")]
+                            if scheduled_summary is not None else [epoch_dir]),
+                states=registry.active_states(), seed_bank_dir=current_seed_bank, args=args)
         runtime_pool_paths = _write_runtime_pool_reports(adaptive_dir, runtime_pool)
 
         next_csv = adaptive_dir / f"windows_epoch_{epoch + 1:03d}.csv"
@@ -8285,7 +8637,9 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             if tica_update_report.get("status") == "updated" and registry is not None:
                 per_window_centers = tica_update_report.get("per_window_tic1_centers", {})
                 if per_window_centers:
-                    n_updated = _apply_tica_centers_to_registry(registry, per_window_centers, epoch_dir)
+                    n_updated = _apply_tica_centers_to_registry(
+                        registry, per_window_centers, epoch_dir,
+                        frozen_residual_pair=_frozen_residual_pair(args))
                     tica_update_report["registry_states_updated"] = n_updated
                     print(f"    tICA: updated secondary_center for {n_updated} active registry states")
                     if n_updated > 0:
@@ -8320,7 +8674,9 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                                       "restart; not applying them again")
                                 _coverage_actions = []
                             if _coverage_actions:
-                                _apply_registry_actions(registry, _coverage_actions, epoch, policy=policy)
+                                _coverage_actions = _without_refused(
+                                    _coverage_actions,
+                                    _apply_registry_actions(registry, _coverage_actions, epoch, policy=policy))
                             tica_update_report["tica_coverage_actions"] = [
                                 {"action": action[0], "parent_state_id": action[1],
                                  "params": list(action[2]), "reason": action[3],
@@ -8695,6 +9051,8 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                 print(f"    Adaptive-production final frozen phase: {actual_final_steps} steps -> {final_dir}")
             print(f"      final active window table: {final_windows_csv}")
             _write_tica_version_marker(final_dir, final_args)
+            if registry is not None:
+                _require_phase_within_replica_cap(args, len(registry.active_states()), final_dir, "final phase")
             run_gareus(final_args, final_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
             if _graceful_shutdown.is_set():
                 _write_runtime_pool_reports(adaptive_dir, runtime_pool)
@@ -8734,6 +9092,7 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
     extension_summaries: List[Dict[str, Any]] = list(prior_extension_summaries)
     start_ext_round = len(prior_extension_summaries)
     _check_extension_rounds_on_disk(adaptive_dir, start_ext_round)
+    _refresh_stale_extension_diagnostics(adaptive_dir, prior_extension_summaries, registry, policy)
     final_diag = collect_final_combined_diagnostics(adaptive_dir, registry, policy=policy)
     quality_gate = evaluate_adaptive_quality_gate(
         adaptive_dir, registry, final_diag, policy=policy, output_prefix="adaptive_quality_gate_pre_union"
@@ -8820,6 +9179,9 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                 f"{actual_ext_steps} steps -> {ext_dir}"
             )
             _write_tica_version_marker(ext_dir, ext_args)
+            if registry is not None:
+                _require_phase_within_replica_cap(args, len(registry.active_states()), ext_dir,
+                                                  f"final extension {ext_index + 1}")
             run_gareus(ext_args, ext_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
             if _graceful_shutdown.is_set():
                 _write_runtime_pool_reports(adaptive_dir, runtime_pool)
@@ -8836,6 +9198,7 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             )
             _write_runtime_pool_reports(adaptive_dir, runtime_pool)
         ext_diag = collect_segmented_epoch_diagnostics(ext_dir, registry, policy)
+        _record_extension_diagnostics_state(ext_dir)
         final_diag = collect_final_combined_diagnostics(adaptive_dir, registry, policy=policy)
         quality_gate = evaluate_adaptive_quality_gate(
             adaptive_dir,
@@ -8993,15 +9356,78 @@ def _snapshot_pre_action_registry(epoch_dir: Path, registry: WindowStateRegistry
     return path
 
 
-def _record_applied_actions(epoch_dir: Path, epoch: int, actions: Sequence[Tuple], registry_path: Path) -> Path:
+def _reassign_seeds_after_actions(seed_bank: Optional[Path], registry: WindowStateRegistry) -> Optional[Dict[str, Any]]:
+    """Re-run the nearest-seed assignment once the epoch's actions are in the registry.
+
+    The seed bank's assignment is written before the actions are applied, so a state an
+    action creates (add, split, add_rung, respace_ladder) has no row of its own. A scheduled
+    segment holding only such states would then get filter_seed_bank_for_state_ids's
+    generic fallback: the first rows of the bank, whatever their CVs. The assignment scores
+    on CV distance alone, so a new rung gets the same seed as its centre's other rungs.
+    """
+    # Only a propagated seed bank (with its survivor table) is reassigned; a raw conformer
+    # library in that slot is left untouched rather than given an empty assignment file.
+    if seed_bank is None or not (Path(seed_bank) / "final_survivor_seeds.csv").exists():
+        return None
+    try:
+        return select_state_aware_seeds_for_targets(Path(seed_bank), registry)
+    except Exception as exc:
+        print(f"WARNING: state-aware seed assignment after this epoch's actions failed ({exc}); "
+              f"states added this epoch may start from the generic seed pool")
+        return None
+
+
+def _sample_interval_steps(args) -> int:
+    """MD steps between two sample rows of one replica (Parquet/CSV), i.e. what one raw sample
+    is worth. Same rule as ``production.run_gareus``'s ``distance_interval``:
+    ``distance_output_interval``, or when unset min(report_interval, exchange_interval)."""
+    dist = int(getattr(args, "distance_output_interval", 0) or 0)
+    if dist <= 0:
+        dist = min(int(getattr(args, "report_interval", 5000) or 5000),
+                   int(getattr(args, "exchange_interval", 0) or 0) or 10 ** 12)
+    return max(1, dist)
+
+
+def _require_phase_within_replica_cap(args, n_states: int, phase_dir: Path, label: str) -> None:
+    """Refuse to START a phase with more states than ``--max-replicas`` (spec 3.5).
+
+    0 means unlimited. Above the cap production would silently truncate the window set,
+    and the states past the cap would never be sampled while the registry, the epoch
+    window map and the union MBAR still carry them. A phase that already holds a
+    checkpoint resumes with its checkpointed window set and a warning: the cap check
+    never bricks a resume.
+    """
+    cap = int(getattr(args, "max_replicas", 0) or 0)
+    n = int(n_states)
+    if cap <= 0 or n <= cap:
+        return
+    if production_checkpoint_available(phase_dir):
+        print(f"WARNING: {label} has {n} states, above --max-replicas {cap}; it already holds a "
+              f"checkpoint, so it resumes with its checkpointed window set")
+        return
+    raise RuntimeError(
+        f"{label} would start with {n} active states, above --max-replicas {cap}. Production would "
+        f"truncate the window set and never sample {n - cap} of them. Raise --max-replicas to at "
+        f"least {n} (0 = unlimited), or reduce the layout (fewer rungs/centres) before starting "
+        f"{phase_dir}")
+
+
+def _record_applied_actions(epoch_dir: Path, epoch: int, actions: Sequence[Tuple], registry_path: Path,
+                            refused: Optional[Sequence[Dict[str, Any]]] = None) -> Path:
     """Atomically record that ``actions`` were applied and saved as ``registry_path``.
 
     Written right after ``registry.save``: a resume that finds this file with a matching
     registry digest knows epoch ``epoch``'s actions are already in the registry and must not
-    propose or apply them again (see ``_load_applied_actions``).
+    propose or apply them again (see ``_load_applied_actions``). ``actions`` lists only what
+    was applied; proposals the replica budget refused go under ``refused`` with their action.
     """
     path = Path(epoch_dir) / APPLIED_ACTIONS_FILENAME
-    payload = {"epoch": int(epoch), "actions": _jsonable_action(list(actions)),
+    refused = list(refused or [])
+    skip = {int(r["index"]) for r in refused if "index" in r}
+    payload = {"epoch": int(epoch),
+               "actions": _jsonable_action([a for i, a in enumerate(actions) if i not in skip]),
+               "refused": [{**r, "proposal": _jsonable_action(list(actions)[int(r["index"])])}
+                           if "index" in r else dict(r) for r in refused],
                "registry_digest": _file_sha256(registry_path), "written_unix": time.time()}
     tmp = path.with_name(path.name + f".tmp{os.getpid()}")
     tmp.write_text(json.dumps(payload, sort_keys=True))
@@ -9027,9 +9453,16 @@ def _load_applied_actions(epoch_dir: Path, registry_path: Path) -> Optional[Dict
 
 
 def _apply_registry_actions(registry: WindowStateRegistry, actions: Sequence[Tuple], epoch: int,
-                            policy: Optional[AdaptiveDecisionPolicy] = None) -> None:
+                            policy: Optional[AdaptiveDecisionPolicy] = None) -> List[Dict[str, Any]]:
+    """Apply ``actions``; return the ones refused by the replica budget (each with its index)."""
     controller = AdaptiveProductionController(registry, policy=policy)
     controller.apply_actions(epoch, actions)
+    return list(controller.refused_actions)
+
+
+def _without_refused(actions: Sequence[Tuple], refused: Sequence[Dict[str, Any]]) -> List[Tuple]:
+    skip = {int(r["index"]) for r in refused if "index" in r}
+    return [a for i, a in enumerate(actions) if i not in skip]
 
 
 def write_epoch_action_report(

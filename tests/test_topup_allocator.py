@@ -250,3 +250,39 @@ def test_rung_edges_are_judged_against_min_rung_overlap_not_topup_weak_overlap()
     assert _plan_with(strict_rung, _diag(healthy, edges=edges)).structural_edges == ((1, 5),)
     strict_spatial = AdaptiveDecisionPolicy(topups_enabled=True, topup_weak_overlap=0.30, min_rung_overlap=0.10)
     assert _plan_with(strict_spatial, _diag(healthy, edges=edges)).structural_edges == ((1, 2),)
+
+
+def test_a_sample_is_worth_the_sample_interval_not_the_report_interval():
+    # chignolin_9: rows every 250 steps, report interval 2500. The old plan counted each
+    # sample as 2500 steps, so its top-up length was 10x too long.
+    nb, rp = _chain(4)
+    diag = _diag(_one_deficit(0.15))
+    kw = dict(state_ids_in_order=list(diag.state_ids), neighbours=nb, rung_partners=rp, policy=POL,
+              report_interval=2500, timestep_fs=4.0, n_gpus=4, budget_hours=1e9)
+    old = plan_topup(diag, **kw)
+    new = plan_topup(diag, sample_interval=250, **kw)
+    assert old.reason == new.reason == "planned"
+    # extra_eff = 100 * (1.5^2 - 1) = 125 samples, g = 2: 125*2*250 = 62,500 steps
+    assert new.steps == 62_500 and new.steps % 2500 == 0
+    assert old.steps == 625_000
+    assert new.sample_scale_steps[1] == 100 * 250 * 2.0
+    # prediction at the planned length reaches the target either way (same model, right units)
+    assert math.isclose(new.predicted_sigma[1], 0.10, rel_tol=1e-6)
+
+
+def test_sample_interval_none_keeps_the_old_units():
+    diag = _diag(_one_deficit(0.15))
+    assert _plan(diag).steps == plan_topup(
+        diag, state_ids_in_order=list(diag.state_ids), neighbours=_chain(4)[0], rung_partners=_chain(4)[1],
+        policy=POL, report_interval=IV, timestep_fs=4.0, n_gpus=4, budget_hours=100.0,
+        sample_interval=None).steps
+
+
+def test_driver_sample_interval_follows_production_rule():
+    from types import SimpleNamespace
+    from gareus.adaptive_production import _sample_interval_steps
+    assert _sample_interval_steps(SimpleNamespace(distance_output_interval=250, report_interval=2500)) == 250
+    assert _sample_interval_steps(SimpleNamespace(distance_output_interval=0, report_interval=2500,
+                                                  exchange_interval=400)) == 400
+    assert _sample_interval_steps(SimpleNamespace(distance_output_interval=0, report_interval=2500,
+                                                  exchange_interval=0)) == 2500
