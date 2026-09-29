@@ -279,6 +279,8 @@ def test_regating_a_k2_the_gate_already_lowered_is_idempotent():
     assert new[0].reason == action[3]                       # no second "lowered" note
     assert gate.records[-1]["context"].startswith("apply: ")
     assert gate.records[-1]["k2"] == pytest.approx(action[2][3], rel=1e-9)   # at the threshold again
+    rep = gate.report()
+    assert rep["counts"] == {"lowered": 1} and sum(rep["apply_counts"].values()) == 1   # not double-counted
 
 
 # ---- behaviour differences vs the pre-P2 applier ----------------------------------------------
