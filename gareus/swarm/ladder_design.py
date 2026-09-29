@@ -421,7 +421,10 @@ ROLE_AXIS = "axis"                                      # single-axis soft bridg
 ROLE_JOINT = "joint"
 LAYOUT_STATUS_PROPOSED = "PROPOSED"
 LAYOUT_STATUS_INSUFFICIENT = "INSUFFICIENT_REGION_COVERAGE"
-LAYOUT_PLAN_VERSION = "layout_plan_v1"
+# v2 (spec P7b): every state also carries its CV1 region and its restraint pattern; readers go
+# through gareus.layout_plan, which reads v1 files too.
+LAYOUT_PLAN_VERSION = "layout_plan_v2"
+LAYOUT_PLAN_SCHEMA_VERSION = 2
 
 
 def design_exploration_layout(n1: int, n2: int, *, n_rungs: int, max_replicas: int,
@@ -519,16 +522,28 @@ def layout_rows(plan: dict, centers1, ks1, centers2, ks2) -> list:
 def layout_plan_record(plan: dict, rows: list, lambdas, *, region_inventory: Optional[dict] = None,
                        region_of_centre=None) -> dict:
     """The companion artifact (``layout_plan.json``): per-state roles, region coverage, mandatory
-    state ids and unresolved regions -- digested separately from the physics rows."""
+    state ids and unresolved regions -- digested separately from the physics rows.
+
+    Schema v2 (spec P7b): every state is listed explicitly with its physics row (``center1``,
+    ``k1``, ``center2``, ``k2``; an unrestrained axis keeps k = 0 and the row's placeholder
+    centre), ``role``, ``region`` (the CV1 region its CV1 centre represents, from
+    ``region_of_centre``; None when CV1 is unrestrained or no inventory is given) and
+    ``restrained`` = [CV1, CV2] (k > 0, the P6 pattern). Read it with
+    ``gareus.layout_plan.read_layout_plan`` (v1 files too)."""
     lambdas = [float(l) for l in lambdas]
     states = []
     state_id = 0
     for cell_index, (cell, role) in enumerate(zip(plan["cells"], plan["state_roles"])):
+        row = rows[cell_index]
+        region = (str(region_of_centre[cell[0]]) if region_of_centre is not None and cell[0] is not None
+                  else None)
         for lam in lambdas:
             states.append({"state_id": state_id, "spatial_index": cell_index, "cell": [cell[0], cell[1]],
-                           "role": role, "gamd_lambda": lam, "mandatory": role in (ROLE_UNRESTRAINED_ANCHOR, ROLE_REGION_REPRESENTATIVE),
-                           "center1": rows[cell_index]["center1"], "k1": rows[cell_index]["k1"],
-                           "center2": rows[cell_index]["center2"], "k2": rows[cell_index]["k2"]})
+                           "role": role, "region": region, "gamd_lambda": lam,
+                           "mandatory": role in (ROLE_UNRESTRAINED_ANCHOR, ROLE_REGION_REPRESENTATIVE),
+                           "center1": row["center1"], "k1": row["k1"],
+                           "center2": row["center2"], "k2": row["k2"],
+                           "restrained": [float(row["k1"]) > 0.0, float(row["k2"]) > 0.0]})
             state_id += 1
     coverage = None
     if region_inventory is not None and region_of_centre is not None:
@@ -539,7 +554,8 @@ def layout_plan_record(plan: dict, rows: list, lambdas, *, region_inventory: Opt
         coverage = {r["region_id"]: {"covered_by": covered.get(r["region_id"], []),
                                      "unresolved": r["region_id"] not in covered}
                     for r in region_inventory.get("regions", [])}
-    return {"version": plan["version"], "status": plan["status"], "kind": plan["kind"], "n_rungs": len(lambdas),
+    return {"version": LAYOUT_PLAN_VERSION, "schema_version": LAYOUT_PLAN_SCHEMA_VERSION,
+            "status": plan["status"], "kind": plan["kind"], "n_rungs": len(lambdas),
             "spatial_states": plan["spatial_states"], "n_states": len(states), "cap_spatial": plan["cap_spatial"],
             "mandatory_spatial": plan["mandatory_spatial"], "mandatory_state_ids": [s["state_id"] for s in states if s["mandatory"]],
             "states": states, "region_coverage": coverage, "region_inventory": region_inventory,

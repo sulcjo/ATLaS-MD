@@ -95,6 +95,7 @@ from .cv import (
 )
 from .windows import (
     build_explicit_2d_neighbor_edges,
+    layout_neighbour_rule,
     expand_windows_for_secondary_cv,
     choose_windows,
     load_explicit_2d_window_csv,
@@ -1561,9 +1562,13 @@ def _grid_neighbor_pairs_2d(n_primary: int, n_secondary: int, parity: int = 0) -
                 pairs.append((a, a + n_secondary))
     return pairs
 
-def explicit_2d_neighbor_pairs_for_exchange(centers_a, secondary_cv_centers, parity: int, args=None) -> tuple[list[tuple[int, int, str, float]], int, list[dict]]:
-    """Return a disjoint subset of graph edges for one exchange interval."""
-    edges = build_explicit_2d_neighbor_edges(centers_a, secondary_cv_centers, args=args)
+def explicit_2d_neighbor_pairs_for_exchange(centers_a, secondary_cv_centers, parity: int, args=None, *,
+                                            k1=None, k2=None, lambdas=None) -> tuple[list[tuple[int, int, str, float]], int, list[dict]]:
+    """Return a disjoint subset of graph edges for one exchange interval.
+
+    ``k1``/``k2``/``lambdas`` feed the P7b ``restraint-width`` rule; ``legacy`` ignores them."""
+    edges = build_explicit_2d_neighbor_edges(centers_a, secondary_cv_centers, args=args, k1=k1, k2=k2,
+                                             lambdas=lambdas)
     slots = max(1, int(getattr(args, "explicit_2d_exchange_slots", 4) if args is not None else 4))
     slot = int(parity) % slots
     chosen = []
@@ -2589,7 +2594,8 @@ def write_window_assignment_csv(path: Path, rows: list[dict]) -> None:
         for row in rows:
             writer.writerow(row)
 
-def write_explicit_2d_neighbor_graph_files(out_dir: Path, centers_a, secondary_cv_centers, args=None, prefix: str = "explicit_2d_neighbor_graph") -> dict:
+def write_explicit_2d_neighbor_graph_files(out_dir: Path, centers_a, secondary_cv_centers, args=None, prefix: str = "explicit_2d_neighbor_graph",
+                                           *, k1=None, k2=None, lambdas=None) -> dict:
     """Write the geometry neighbor graph used for explicit/sparse 2D exchange.
 
     This is diagnostic-only and does not change the exchange schedule.  It makes
@@ -2598,7 +2604,8 @@ def write_explicit_2d_neighbor_graph_files(out_dir: Path, centers_a, secondary_c
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    edges = build_explicit_2d_neighbor_edges(centers_a, secondary_cv_centers, args=args)
+    edges = build_explicit_2d_neighbor_edges(centers_a, secondary_cv_centers, args=args, k1=k1, k2=k2,
+                                             lambdas=lambdas)
     csv_path = out_dir / f"{prefix}.csv"
     rows = []
     centers = np.asarray(centers_a, dtype=float)
@@ -2628,6 +2635,8 @@ def write_explicit_2d_neighbor_graph_files(out_dir: Path, centers_a, secondary_c
     payload = {
         "mode": "explicit-2d-neighbor-graph",
         "description": "Geometry neighbor graph used for explicit/sparse 2D neighbor exchange; exchange intervals use disjoint slot subsets of these edges.",
+        # spec P7b: which rule built it (legacy = the pre-P7b graph; restraint-width = P7a)
+        "neighbour_rule": layout_neighbour_rule(args),
         "n_windows": int(len(centers)),
         "n_edges": int(len(rows)),
         "edge_csv": str(csv_path),
@@ -3888,12 +3897,16 @@ def drop_bad_us_windows_and_rebuild(
     """
     nwin_before = len(centers_a)
     dropped_requested = sorted({int(i) for i in dropped_window_indices})
+    _pre_drop_lams = _derive_state_gamd_lambdas(window_metadata, nwin_before, existing=None)
 
     def _components_for_drop(drop_set):
         keep_idx = [i for i in range(nwin_before) if i not in drop_set]
         ca = np.asarray([centers_a[i] for i in keep_idx], dtype=float)
         sc = np.asarray([secondary_cv_centers[i] for i in keep_idx], dtype=float)
-        edges = build_explicit_2d_neighbor_edges(ca, sc, args=args)
+        edges = build_explicit_2d_neighbor_edges(
+            ca, sc, args=args, k1=[k_list[i] for i in keep_idx],
+            k2=([secondary_cv_k_kcal_list[i] for i in keep_idx] if secondary_cv_k_kcal_list is not None else None),
+            lambdas=[_pre_drop_lams[i] for i in keep_idx])
         return _connected_components_count(len(keep_idx), edges)
 
     needs_2d_check = (
@@ -4023,7 +4036,9 @@ def drop_bad_us_windows_and_rebuild(
     graph_summary = None
     if needs_2d_check and new_secondary_cv_centers is not None:
         graph_summary = write_explicit_2d_neighbor_graph_files(
-            out_dir, new_centers_a, new_secondary_cv_centers, args=args, prefix="explicit_2d_neighbor_graph"
+            out_dir, new_centers_a, new_secondary_cv_centers, args=args, prefix="explicit_2d_neighbor_graph",
+            k1=new_k_list, k2=new_secondary_cv_k_kcal_list,
+            lambdas=_derive_state_gamd_lambdas(window_metadata, len(new_centers_a), existing=None),
         )
 
     # window_metadata was just resubscripted above (_resubscript_normalized_rows),
@@ -6702,7 +6717,9 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     graph_summary = None
     if isinstance(secondary_cv_metadata, dict) and bool(secondary_cv_metadata.get("explicit_2d_windows", False)) and secondary_cv_centers is not None:
         try:
-            graph_summary = write_explicit_2d_neighbor_graph_files(out_dir, centers_a, secondary_cv_centers, args=args, prefix="explicit_2d_neighbor_graph")
+            graph_summary = write_explicit_2d_neighbor_graph_files(
+                out_dir, centers_a, secondary_cv_centers, args=args, prefix="explicit_2d_neighbor_graph",
+                k1=k_list, k2=secondary_cv_k_kcal_list, lambdas=getattr(args, "state_gamd_lambdas", None))
             window_metadata = dict(window_metadata or {})
             window_metadata["explicit_2d_neighbor_graph"] = graph_summary
             secondary_cv_metadata = dict(secondary_cv_metadata or {})
@@ -7673,7 +7690,9 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     explicit_2d_exchange_graph_cache = None
     if bool((secondary_cv_metadata or {}).get("explicit_2d_windows", False)) and secondary_cv_centers is not None:
         try:
-            _graph_edges = build_explicit_2d_neighbor_edges(centers_a, secondary_cv_centers, args=args)
+            _graph_edges = build_explicit_2d_neighbor_edges(
+                centers_a, secondary_cv_centers, args=args, k1=k_list, k2=secondary_cv_k_kcal_list,
+                lambdas=getattr(args, "state_gamd_lambdas", None))
             _graph_slots = max(1, int(getattr(args, "explicit_2d_exchange_slots", 4) or 4))
             _pairs_by_slot: list[list[tuple[int, int, str, float]]] = []
             for _slot in range(_graph_slots):
@@ -8231,7 +8250,9 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                         graph_pairs = explicit_2d_exchange_graph_cache["pairs_by_slot"][int(parity) % max(1, graph_slots)]
                     else:
                         graph_pairs, graph_slots, graph_edges = explicit_2d_neighbor_pairs_for_exchange(
-                            centers_a, secondary_cv_centers, parity=parity, args=args
+                            centers_a, secondary_cv_centers, parity=parity, args=args,
+                            k1=k_list, k2=secondary_cv_k_kcal_list,
+                            lambdas=getattr(args, "state_gamd_lambdas", None),
                         )
                     exchange_stats["mode"] = "neighbor-graph-explicit-2d"
                     exchange_stats["neighbor_graph"] = {

@@ -45,7 +45,7 @@ from .store import SegmentRegistry
 from .extension_seeding import extension_parent_dirs
 from .adaptive.paired_cv import PairedCVCollector, attach_paired_cv
 from .adaptive.pair_runtime import GATE_REPORT_NAME, gate_from_args
-from .adaptive.edge_metric import attach_edge_metric, edge_is_weak_pairwise, edge_sort_overlap
+from .adaptive.edge_metric import GRAPH_EDGE_TYPES, attach_edge_metric, edge_is_weak_pairwise, edge_sort_overlap
 # Real-frame seed extraction lives in tica.py (a dependency-free leaf module)
 # so seeding.py can also use it for campaign-wide seed search without a
 # circular import - seeding.py -> production.py -> adaptive_production.py is
@@ -507,9 +507,15 @@ class AdaptiveDecisionPolicy:
     slow_mode_reseed_fraction: float = 0.0
     # Spec 3.1 edge metric (gareus/adaptive/edge_metric.py): "marginal" = today's CV1
     # histogram overlap; "pairwise-mbar" = two-state MBAR overlap graded against
-    # min_rung_overlap, unmeasured below min_edge_neff effective samples per state.
+    # min_rung_overlap, unmeasured below min_edge_neff effective samples per state
+    # (100 from the spec-T2 calibration: floor 200's error rates, fewer edges unmeasured).
     edge_metric: str = "marginal"
-    min_edge_neff: float = 200.0
+    min_edge_neff: float = 100.0
+    # Spec P7b (--layout-neighbour-rule): which windows are neighbours for the phases'
+    # exchange graph, post-pull drop connectivity and top-up partners. "legacy" = the
+    # pre-P7b graphs; "restraint-width" = the P7a rule. MD-driving, so frozen here and
+    # threaded into every phase's args by the driver.
+    layout_neighbour_rule: str = "legacy"
 
 
 LADDER_SETTINGS_FIELDS = ("ladder_adapt", "ladder_min_overlap", "ladder_overlap_quantile", "ladder_min_ess",
@@ -529,6 +535,7 @@ DECISION_SETTINGS_FIELDS = (
     "cv2_coupling_gate", "max_coupling_fraction",
     "slow_mode_reseed_fraction",
     "edge_metric", "min_edge_neff",
+    "layout_neighbour_rule",
 )
 DECISION_SETTINGS_FILENAME = "decision_settings.json"
 
@@ -903,13 +910,15 @@ def registry_from_window_csv(path: Path, epoch: int = 0, source: str = "window_c
     _plan_path = Path(path).parent / "layout_plan.json"
     if _plan_path.exists():
         try:
-            _plan = json.loads(_plan_path.read_text(encoding="utf-8"))
-            _states = list(_plan.get("states") or [])
+            from .layout_plan import read_layout_plan
+            _plan, _states = read_layout_plan(_plan_path)
             _active = reg.all_states()
             if _states and len(_states) == len(_active):
                 for st, rec in zip(_active, _states):
-                    st.metadata["state_role"] = rec.get("role")
-                    st.metadata["mandatory"] = bool(rec.get("mandatory"))
+                    st.metadata["state_role"] = rec.role
+                    st.metadata["mandatory"] = bool(rec.mandatory)
+                    if rec.region is not None:
+                        st.metadata["region"] = rec.region
         except (OSError, ValueError, KeyError, TypeError) as exc:
             print(f"WARNING: layout_plan.json beside {path} could not be read ({exc!r}); mandatory-state guards inactive")
     return reg
@@ -2360,11 +2369,46 @@ def build_geometry_edges(
     registry: WindowStateRegistry,
     policy: Optional[AdaptiveDecisionPolicy] = None,
 ) -> List[Tuple[int, int, str, Optional[float]]]:
-    """Build a light geometry graph between active states.
+    """Build a light geometry graph between active states: true neighbours only.
 
-    For 1D states, this is a simple sorted nearest-neighbor chain.  For 2D
-    states, use immediate row/column-like nearest neighbors plus one nearest
-    Euclidean neighbor per state to keep sparse patches connected.
+    Edge types (the weak-edge gate, the bridge proposer, retirement and the
+    reports read them):
+
+    * ``primary_chain`` -- the CV1 direction: consecutive states in sorted CV1
+      centre WITHIN one CV2 row, i.e. among states of one restraint pattern
+      (spec P6) sharing the CV2 centre (CV1-only states form one row: their CV2
+      coordinate is a placeholder and never identity). Weak-eligible.
+    * ``secondary_chain`` -- the CV2 direction: consecutive states in sorted CV2
+      centre WITHIN one CV1 column (same pattern, same CV1 centre; CV2-only
+      states form one column). Weak-eligible.
+    * ``nearest_2d`` -- only when some state carries a CV2 centre: each state's
+      nearest state of its OWN restraint pattern by the P7a restraint-width
+      distance (``neighbour_rule.pair_distance``), plus the closest same-pattern
+      pair between any two still-separate pieces of one pattern (a sparse patch,
+      or an off-grid bridge state with no row or column partner). Weak-eligible:
+      it is the nearest pair, so a low overlap on it is a real gap.
+    * ``pattern_link`` -- connectivity bookkeeping between restraint patterns
+      (anchor, CV1-only, CV2-only, 2D), one per pair of patterns that share a
+      restrained axis (the closest pair on the shared axes only, placeholders
+      never read), each anchor linked to the most central state of the largest
+      pattern, and a last-resort join of anything still separate. NEVER weak
+      under either metric and never read by retirement: a midpoint between two
+      patterns lands on a placeholder coordinate, and a CV1-marginal overlap
+      across patterns says nothing about redundancy. They exist so
+      ``active_graph_connected`` / the articulation set see one graph.
+
+    Before this rule (spec-T3 / T2 bug) the CV1 chain was ``argsort`` over ALL
+    states, so ties and columns were ordered arbitrarily: chignolin_9 got CV2-only
+    windows three rows apart (64-76), 2D windows two rows apart in one column
+    (160-216, 136-232, 184-204), a diagonal across a column boundary (164-200)
+    and, on any grid, the top of one column joined to the bottom of the next.
+
+    Neighbour ranking uses the P7a distance at a fixed 300 K: on one restraint
+    pattern every distance scales as 1/sqrt(T), so the choice does not depend on
+    T. A restrained axis whose k is not recorded gets
+    ``neighbour_rule.fallback_axis_sigmas`` (median recorded width, else median
+    centre spacing). A layout where no state carries a CV2 centre (a CV1-only
+    ladder, chignolin_7) produces exactly the old sorted chain.
 
     Under an active λ-ladder (some state carries ``gamd_lambda > 0``) states
     are first grouped by centre: adjacent rungs within one group get a
@@ -2385,32 +2429,20 @@ def build_geometry_edges(
         active, rung_edges = _split_rung_groups(active, policy)
         if len(active) <= 1:
             return rung_edges
-    has_secondary = any(s.secondary_center is not None for s in active)
-    primary = np.asarray([s.primary_center for s in active], dtype=float)
-    secondary = np.asarray([0.0 if s.secondary_center is None else s.secondary_center for s in active], dtype=float)
+    return rung_edges + _neighbour_geometry_edges(active)
+
+
+GEOMETRY_LINK_EDGE_TYPE = "pattern_link"
+
+
+def _neighbour_geometry_edges(active: List[WindowState]) -> List[Tuple[int, int, str, Optional[float]]]:
+    """The non-rung part of ``build_geometry_edges`` over one representative per centre."""
+    from .adaptive.neighbour_rule import NeighbourPoint, chain_edges
     ids = [int(s.state_id) for s in active]
-    edges: Dict[Tuple[int, int], Tuple[int, int, str, Optional[float]]] = {}
-
-    def add(a_idx: int, b_idx: int, etype: str, nd: Optional[float]) -> None:
-        if a_idx == b_idx:
-            return
-        a, b = sorted((ids[a_idx], ids[b_idx]))
-        edges[(a, b)] = (a, b, etype, nd)
-
-    order = list(np.argsort(primary))
-    for left, right in zip(order[:-1], order[1:]):
-        add(int(left), int(right), "primary_chain", None)
-    if has_secondary:
-        p_scale = _positive_scale(primary)
-        s_scale = _positive_scale(secondary)
-        coords = np.column_stack([primary / p_scale, secondary / s_scale])
-        for i in range(len(active)):
-            dist = np.sqrt(np.sum((coords - coords[i]) ** 2, axis=1))
-            dist[i] = np.inf
-            j = int(np.argmin(dist))
-            if math.isfinite(float(dist[j])):
-                add(i, j, "nearest_2d", float(dist[j]))
-    return rung_edges + list(edges.values())
+    points = [NeighbourPoint(primary_center=float(s.primary_center), primary_k=s.primary_k,
+                             secondary_center=s.secondary_center, secondary_k=s.secondary_k)
+              for s in active]
+    return [(ids[i], ids[j], etype, d) for i, j, etype, d in chain_edges(points, ids=ids)]
 
 
 def _split_rung_groups(
@@ -5007,6 +5039,10 @@ def propose_actions_from_diagnostics(
                 "state_j": int(s2.state_id),
                 "overlap": edge.get("overlap"),
                 "exchange_acceptance": edge.get("exchange_acceptance"),
+                # The value of the metric that made the edge weak (``overlap`` stays the
+                # CV1 marginal, whatever the metric).
+                "graded_overlap": _weak_edge_graded_value(edge, policy)[0],
+                "graded_overlap_source": _weak_edge_graded_value(edge, policy)[1],
                 "bridges_needed": needed,
                 "min_useful_bridges": min_useful,
                 "bridges_allocated": n_place,
@@ -5147,7 +5183,7 @@ def propose_actions_from_diagnostics(
             placed_this_edge += 1
             reason = (
                 f"weak edge {s1.state_id}-{s2.state_id}: "
-                f"overlap={edge.get('overlap')}, exchange_acceptance={edge.get('exchange_acceptance')}"
+                f"{_weak_edge_metric_text(edge, policy)}"
                 f"; bridge {placed_this_edge}/{n_place} of {needed} needed ({prediction_note})"
             )
             if shortfall:
@@ -5184,6 +5220,18 @@ def propose_actions_from_diagnostics(
                 # retire_converged for the whole ladder.  Rung states are
                 # already safe from retirement: they gain no CV overlap credit,
                 # so state_max_overlap never reaches redundant_overlap for them.
+                continue
+            if str(edge.get("edge_type")) in GRAPH_EDGE_TYPES or str(edge.get("edge_type")) == GEOMETRY_LINK_EDGE_TYPE:
+                # Spec 3.1's appended graph edges (``neighbour``: any same-pattern pair
+                # within the P7a radius; ``spanning``) are graded, never actionable: they
+                # carry no CV1-marginal ``overlap`` (None by construction), and reading
+                # that None as "bad" marked both ends of every one of them, so
+                # --ap-edge-metric pairwise-mbar retired nothing (spec T2 bug 1).
+                # Retirement stays on the collector's geometry edges; an unmeasured
+                # GEOMETRY edge (no samples) still blocks, as before. A ``pattern_link``
+                # (connectivity bookkeeping between restraint patterns) is skipped for the
+                # same reason: its CV1 marginal across patterns is no redundancy evidence.
+                # Articulation (graph_critical) still protects every link endpoint.
                 continue
             ov = edge.get("overlap")
             if ov is None or float(ov) < float(policy.target_overlap):
@@ -5250,7 +5298,10 @@ def propose_actions_from_diagnostics(
         # Hard minimum-replica floor: never retire the active set below
         # policy.min_active_states (default 8), independent of how many windows are
         # redundant. Snapshot the count before any tentative removal.
-        min_active = max(0, int(getattr(policy, "min_active_states", 0)))
+        # At least one state always stays: ``active_graph_connected`` is True for an empty
+        # graph, so with a floor of 0 a pure cycle (a 2x2 grid, whose geometry graph has no
+        # articulation point once chains join true neighbours only) retired every state.
+        min_active = max(1, int(getattr(policy, "min_active_states", 0)))
         n_active_start = len(registry.active_state_ids())
         admitted: List[int] = []
         for sid in retire_candidates:
@@ -5432,6 +5483,10 @@ def _edge_is_measured_weak(edge: Dict[str, Any], policy: AdaptiveDecisionPolicy)
     if str(edge.get("edge_type")) == "rung":
         value = edge.get("mbar_overlap")
         return value is not None and float(value) < float(policy.min_rung_overlap)
+    if str(edge.get("edge_type")) == GEOMETRY_LINK_EDGE_TYPE:
+        # Connectivity bookkeeping between restraint patterns (build_geometry_edges):
+        # a midpoint between two patterns is a placeholder coordinate, never a bridge.
+        return False
     if str(getattr(policy, "edge_metric", "marginal")) == "pairwise-mbar":
         # Spec 3.1: one metric (two-state / union pairwise MBAR, bootstrap bound);
         # cross-pattern and unmeasured edges are never weak.
@@ -5442,6 +5497,46 @@ def _edge_is_measured_weak(edge: Dict[str, Any], policy: AdaptiveDecisionPolicy)
     if acc is not None and float(acc) < float(policy.min_exchange_acceptance):
         weak = True
     return weak
+
+
+def _weak_edge_graded_value(edge: Dict[str, Any], policy: AdaptiveDecisionPolicy) -> Tuple[Optional[float], str]:
+    """(value, source) of the overlap that graded this spatial edge: the metric that made it weak.
+
+    ``pairwise-mbar``: the union ``mbar_overlap`` when a union solve scored the edge, else the
+    two-state point estimate (source ``pairwise_mbar``); ``marginal``: the CV1-marginal
+    ``overlap`` (source ``cv1_marginal``).
+    """
+    if str(getattr(policy, "edge_metric", "marginal")) == "pairwise-mbar":
+        union = _finite_or_none(edge.get("mbar_overlap"))
+        if union is not None:
+            return union, "pairwise_mbar_union"
+        return _finite_or_none((edge.get("pairwise_mbar") or {}).get("overlap")), "pairwise_mbar"
+    return _finite_or_none(edge.get("overlap")), "cv1_marginal"
+
+
+def _weak_edge_metric_text(edge: Dict[str, Any], policy: AdaptiveDecisionPolicy) -> str:
+    """The reason-text clause naming why an edge is weak, on the metric that graded it.
+
+    Under ``marginal`` the text is exactly what it always was. Under ``pairwise-mbar`` it
+    quotes the pairwise value (and its bootstrap q90, the number the decision read) against
+    ``min_rung_overlap``; the CV1 marginal is kept, labelled, since it is still recorded --
+    before, the reason quoted only the marginal (e.g. ``overlap=0.777`` for chignolin_9's
+    64-76, weak at pairwise 0.080).
+    """
+    marginal = f"overlap={edge.get('overlap')}, exchange_acceptance={edge.get('exchange_acceptance')}"
+    if str(getattr(policy, "edge_metric", "marginal")) != "pairwise-mbar":
+        return marginal
+    value, source = _weak_edge_graded_value(edge, policy)
+    thr = f"min_rung_overlap={float(policy.min_rung_overlap):g}"
+    tail = (f"cv1_marginal_overlap={edge.get('overlap')}, "
+            f"exchange_acceptance={edge.get('exchange_acceptance')}")
+    if value is None:
+        return f"pairwise_mbar_overlap=None; {tail}"
+    if source == "pairwise_mbar_union":
+        return f"pairwise_mbar_overlap={value:.4f} (union) < {thr}; {tail}"
+    upper = _finite_or_none((edge.get("pairwise_mbar") or {}).get("overlap_upper"))
+    q90 = f", q90 {upper:.4f}" if upper is not None else ""
+    return f"pairwise_mbar_overlap={value:.4f} (two-state{q90}) < {thr}; {tail}"
 
 
 # Policy fields that only ever fed the per-state score allocator, removed with the
@@ -6712,7 +6807,9 @@ def _topup_layout_neighbours(args, active):
     k1 = [float(s.primary_k) for s in active]
     k2 = [float(s.secondary_k or 0.0) for s in active]
     temperature = float(getattr(args, "temperature_k", 300.0) or 300.0)
-    pairs = spatial_neighbour_pairs(c1, c2, lam, k1, k2, temperature)
+    # Spec P7b: the campaign's frozen --layout-neighbour-rule (legacy by default).
+    rule = str(getattr(args, "layout_neighbour_rule", "legacy") or "legacy")
+    pairs = spatial_neighbour_pairs(c1, c2, lam, k1, k2, temperature, rule=rule)
     nb_local, rp_local = same_rung_neighbours(pairs, lam), other_rung_same_centre(c1, c2, lam)
     neighbours = {ids[w]: [ids[x] for x in nb_local.get(w, [])] for w in range(len(ids))}
     rung_partners = {ids[w]: [ids[x] for x in rp_local.get(w, [])] for w in range(len(ids))}
@@ -7973,7 +8070,8 @@ def policy_from_args(args: Any) -> AdaptiveDecisionPolicy:
         max_coupling_fraction=_arg_float(args, "adaptive_production_max_coupling_fraction", 0.25),
         slow_mode_reseed_fraction=_arg_float(args, "adaptive_production_slow_mode_reseed_fraction", 0.0),
         edge_metric=str(getattr(args, "adaptive_production_edge_metric", "marginal") or "marginal"),
-        min_edge_neff=_arg_float(args, "adaptive_production_min_edge_neff", 200.0),
+        layout_neighbour_rule=str(getattr(args, "layout_neighbour_rule", "legacy") or "legacy"),
+        min_edge_neff=_arg_float(args, "adaptive_production_min_edge_neff", 100.0),
     )
 
 
@@ -8282,6 +8380,10 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
     policy, _decision_record = _resolve_decision_settings(
         adaptive_dir, policy, override=_arg_bool(args, "adaptive_production_decision_settings_override", False))
     _record_decision_settings_in_manifest(out_dir, _decision_record)
+    # Spec P7b: the neighbour rule drives MD inside the phases (exchange graph, drop
+    # connectivity, top-up partners), so every phase runs with the campaign's frozen value,
+    # whatever this job's --layout-neighbour-rule says (phase args are copies of args).
+    args.layout_neighbour_rule = str(policy.layout_neighbour_rule)
     max_epochs = max(1, _arg_int(args, "adaptive_production_epochs", 3))
     # Epoch 0 also bootstraps the tICA model and (when enabled) the shared GaMD
     # envelope recalibration -- both need only a short look at real sampling, not
