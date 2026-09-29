@@ -31,7 +31,7 @@ def test_low_memory_adaptive_prefers_union_npz(tmp_path, monkeypatch, capsys):
     calls = []
 
     monkeypatch.setattr(loaders, "check_union_npz_window_map_provenance", lambda p: [])
-    monkeypatch.setattr(loaders, "load_union_npz", lambda p: calls.append(p) or sentinel)
+    monkeypatch.setattr(loaders, "load_union_npz", lambda p, **kw: calls.append(p) or sentinel)
 
     out = loaders.load_data(run_dir, None, low_memory=True)
 
@@ -54,7 +54,7 @@ def test_low_memory_skips_a_union_npz_older_than_the_samples(tmp_path, monkeypat
     (adaptive / "state_registry.csv").write_text("state_id\n0\n")
     sentinel = object()
     calls = []
-    monkeypatch.setattr(loaders, "load_union_npz", lambda p: calls.append("npz"))
+    monkeypatch.setattr(loaders, "load_union_npz", lambda p, **kw: calls.append("npz"))
     monkeypatch.setattr(loaders, "load_parquet_adaptive_union",
                         lambda p, **kw: calls.append(("parquet", kw["low_memory"])) or sentinel)
 

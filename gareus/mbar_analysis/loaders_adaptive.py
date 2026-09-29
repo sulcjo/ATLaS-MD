@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+from .storage import cleanup_on_error
 
 from gareus.units import KJ_PER_KCAL, K_B_KJ_PER_MOL_K
 from .data import Data, clean, infer_temp_beta, rjson, read_windows, _epoch_dir_index
@@ -1809,7 +1810,8 @@ def load_epoch_csv_adaptive(ap: Path, epoch_ids: Optional[set[int]] = None) -> D
                        v_pep_kj=v_pep, v_dih_kj=v_dih, state_lambdas=state_lambdas))
 
 
-def load_union_npz(ap_dir: Path) -> Data:
+@cleanup_on_error
+def load_union_npz(ap_dir: Path, low_memory: bool = False) -> Data:
     """Load MBAR inputs from adaptive_union_mbar.npz (adaptive-production runs where final_production/ not yet complete)."""
     npz_path = ap_dir / 'adaptive_union_mbar.npz'
     jmeta = rjson(ap_dir / 'adaptive_union_mbar.json', {})
@@ -1818,7 +1820,11 @@ def load_union_npz(ap_dir: Path) -> Data:
         cv = np.asarray(f['cv_A'], dtype=np.float64)
         cv2 = np.asarray(f['secondary_cv'], dtype=np.float64)
         sampled_state_ids = np.asarray(f['sampled_state_ids'], dtype=np.int64)
-        u_nk = np.asarray(f['umbrella_reduced_bias_nk'], dtype=np.float64)
+        if low_memory:
+            from .storage import extract_npz_matrix
+            u_nk = extract_npz_matrix(f, 'umbrella_reduced_bias_nk', directory=ap_dir)
+        else:
+            u_nk = np.asarray(f['umbrella_reduced_bias_nk'], dtype=np.float64)
         centers = np.asarray(f['primary_centers'], dtype=np.float64)
         k_kcal = np.asarray(f['primary_k'], dtype=np.float64)
         # state_ids is the u_nk COLUMN ORDER (build_union_state_mbar_inputs,

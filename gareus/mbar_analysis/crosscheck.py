@@ -69,7 +69,8 @@ def _subset(d: Any, mask: np.ndarray) -> Any:
     s = d.__class__.__new__(d.__class__)
     s.cv = d.cv[mask]
     s.window = np.asarray(d.window)[mask]
-    s.u_nk = d.u_nk[mask]
+    from .storage import select_matrix
+    s.u_nk = select_matrix(d.u_nk, mask)
     s.beta = d.beta
     s.state_lambdas = d.state_lambdas
     s.meta = dict(d.meta)

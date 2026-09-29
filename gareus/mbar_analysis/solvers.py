@@ -20,6 +20,7 @@ import math
 from typing import Optional
 
 import numpy as np
+from .storage import disk_array, select_matrix, row_blocks, release_pages, solver_matrix
 
 try:
     from numba import njit, prange, set_num_threads, get_num_threads
@@ -202,6 +203,49 @@ def _anderson_step(F_hist: list, G_hist: list, m: int = 5) -> np.ndarray:
     return coeffs @ Gk
 
 
+def _active_matrix(u, active):
+    return u if active.size == u.shape[1] else select_matrix(u, columns=active)
+
+
+def _blocked_logdenom(u, logn, f):
+    ld = np.empty(u.shape[0], dtype=np.float64)
+    for start, stop in row_blocks(*u.shape):
+        ld[start:stop] = logsumexp_axis1_finite(logn + f - u[start:stop])
+        release_pages(u)
+    return ld
+
+
+def _blocked_update(u, logn, f, indices=None):
+    count = u.shape[0] if indices is None else len(indices)
+    sums = np.full(u.shape[1], -np.inf)
+    for start, stop in row_blocks(count, u.shape[1]):
+        block = u[start:stop] if indices is None else u[indices[start:stop]]
+        ld = logsumexp_axis1_finite(logn + f - block)
+        sums = np.logaddexp(sums, logsumexp_axis0_finite(-block - ld[:, None]))
+        release_pages(u)
+    return -sums
+
+
+def _bounded_numba_update(u, logn, f, ld, nf):
+    if disk_array(u) is None:
+        return _numba_mbar_update(u, logn, f, ld, nf)
+    sums = np.full(f.size, -np.inf)
+    partial = np.empty_like(f)
+    for start, stop in row_blocks(*u.shape):
+        _numba_mbar_update(u[start:stop], logn, f, ld[start:stop], partial)
+        sums = np.logaddexp(sums, -partial)
+        release_pages(u)
+    nf[:] = -sums
+
+
+def _bounded_numba_logdenom(u, logn, f, ld):
+    if disk_array(u) is None:
+        return _numba_mbar_logdenom(u, logn, f, ld)
+    for start, stop in row_blocks(*u.shape):
+        _numba_mbar_logdenom(u[start:stop], logn, f, ld[start:stop])
+        release_pages(u)
+
+
 def solve_mbar_numba(u_nk, window, tol=1e-10, maxiter=10000, progress: Optional['Progress'] = None, threads: int = 0, f_init: Optional[np.ndarray] = None):
     """Parallel MBAR fixed-point solve using optional Numba kernels.
 
@@ -215,7 +259,7 @@ def solve_mbar_numba(u_nk, window, tol=1e-10, maxiter=10000, progress: Optional[
     if int(threads or 0) > 0 and set_num_threads is not None:
         set_num_threads(int(threads))
     used_threads = int(get_num_threads()) if get_num_threads is not None else None
-    u_nk=np.asarray(u_nk,dtype=np.float64,order='C')
+    u_nk=solver_matrix(u_nk)
     window=np.asarray(window,dtype=np.int64)
     N,K=u_nk.shape
     nk=np.bincount(window[(window>=0)&(window<K)],minlength=K).astype(np.float64)
@@ -227,7 +271,7 @@ def solve_mbar_numba(u_nk, window, tol=1e-10, maxiter=10000, progress: Optional[
     # case. u_nk is already float64/C-contiguous from the np.asarray call
     # above, so u_nk[:, active] would just be a full copy of u_nk itself;
     # skip it and use u_nk directly instead of paying for that copy.
-    u = u_nk if active.size==K else np.ascontiguousarray(u_nk[:,active],dtype=np.float64)
+    u = _active_matrix(u_nk, active)
     n=nk[active]
     logn=np.log(n)
     f=np.zeros(active.size,dtype=np.float64)
@@ -246,11 +290,11 @@ def solve_mbar_numba(u_nk, window, tol=1e-10, maxiter=10000, progress: Optional[
     # look like a mysterious MBAR coma. Yes, JIT compilation has theatre.
     if progress is not None:
         progress.step('MBAR backend', f'numba parallel backend; threads={used_threads if used_threads is not None else "auto"}; compiling kernels')
-    _numba_mbar_update(u,logn,f,ld,nf)
+    _bounded_numba_update(u,logn,f,ld,nf)
     for it in range(1,maxiter+1):
         if progress is not None and (it == 1 or it % 25 == 0):
             progress.bar('MBAR iterations', it, maxiter, f'numba delta {md:.2e}')
-        _numba_mbar_update(u,logn,f,ld,nf)
+        _bounded_numba_update(u,logn,f,ld,nf)
         nf-=nf[0]
         md=float(np.max(np.abs(nf-f)))
         f,nf=nf,f
@@ -259,7 +303,7 @@ def solve_mbar_numba(u_nk, window, tol=1e-10, maxiter=10000, progress: Optional[
             break
     if progress is not None:
         progress.bar('MBAR iterations', 1, 1, f'backend=numba converged={conv} iter={it} delta={md:.2e}', force=True)
-    _numba_mbar_logdenom(u,logn,f,ld)
+    _bounded_numba_logdenom(u,logn,f,ld)
     lw=-ld
     lw-=logsumexp(lw)
     fall=np.full(K,np.nan,dtype=np.float64)
@@ -318,7 +362,7 @@ def solve_mbar_numba_anderson(u_nk, window, tol: float = 1e-10, maxiter: int = 1
     used_threads = int(get_num_threads()) if get_num_threads is not None else None
 
     # Convert inputs to contiguous arrays
-    u_nk = np.asarray(u_nk, dtype=np.float64, order='C')
+    u_nk = solver_matrix(u_nk)
     window = np.asarray(window, dtype=np.int64)
     N, K = u_nk.shape
     # Sample counts per state and active state indices
@@ -330,7 +374,7 @@ def solve_mbar_numba_anderson(u_nk, window, tol: float = 1e-10, maxiter: int = 1
     # (every window has samples, the common case) implies active==arange(K)
     # exactly; u_nk is already float64/C-contiguous, so u_nk[:, active] would
     # just copy u_nk itself -- skip that copy and use u_nk directly.
-    u = u_nk if active.size == K else np.ascontiguousarray(u_nk[:, active], dtype=np.float64)
+    u = _active_matrix(u_nk, active)
     n = nk[active]
     logn = np.log(n)
     Ka = active.size
@@ -355,14 +399,14 @@ def solve_mbar_numba_anderson(u_nk, window, tol: float = 1e-10, maxiter: int = 1
     # Compile kernels before timing loop
     if progress is not None:
         progress.step('MBAR backend', f'numba-anderson backend; threads={used_threads if used_threads is not None else "auto"}; compiling kernels')
-    _numba_mbar_update(u, logn, f, ld, nf)
+    _bounded_numba_update(u, logn, f, ld, nf)
     # Main fixed‑point iteration with Anderson mixing
     for it in range(1, maxiter + 1):
         # Update status every 25 iterations or on the first iteration
         if progress is not None and (it == 1 or it % 25 == 0):
             progress.bar('MBAR iterations', it, maxiter, f'numba-anderson delta {md:.2e}')
         # Compute next iterate via Numba update
-        _numba_mbar_update(u, logn, f, ld, nf)
+        _bounded_numba_update(u, logn, f, ld, nf)
         # Re‑gauge nf so nf[0] = 0
         nf -= nf[0]
         # Change magnitude before mixing
@@ -395,7 +439,7 @@ def solve_mbar_numba_anderson(u_nk, window, tol: float = 1e-10, maxiter: int = 1
     if progress is not None:
         progress.bar('MBAR iterations', 1, 1, f'backend=numba-anderson converged={conv} iter={it} delta={md:.2e}', force=True)
     # Compute log denominators and weights using Numba kernel
-    _numba_mbar_logdenom(u, logn, f, ld)
+    _bounded_numba_logdenom(u, logn, f, ld)
     lw = -ld
     lw -= logsumexp(lw)
     fall = np.full(K, np.nan, dtype=np.float64)
@@ -472,7 +516,7 @@ def solve_mbar_sambar_warmstart(u_nk, window,
     if delta_f_max is None:
         delta_f_max = SAMBAR_DELTA_F_MAX
     # Convert inputs
-    u_nk = np.asarray(u_nk, dtype=np.float64)
+    u_nk = solver_matrix(u_nk)
     window = np.asarray(window, dtype=np.int64)
     N, K = u_nk.shape
     # Sample counts per state and active windows
@@ -483,7 +527,7 @@ def solve_mbar_sambar_warmstart(u_nk, window,
     # active.size==K (every window has samples, the common case) implies
     # active==arange(K) exactly, so u_nk[:, active] would just copy u_nk
     # itself; skip that copy and use u_nk directly.
-    u = u_nk if active.size == K else np.ascontiguousarray(u_nk[:, active], dtype=np.float64)
+    u = _active_matrix(u_nk, active)
     n = nk[active]
     logn = np.log(n)
     Ka = active.size
@@ -508,21 +552,17 @@ def solve_mbar_sambar_warmstart(u_nk, window,
         # Determine indices for current batch; sample with replacement when necessary
         if batch_size >= N:
             # Use all samples
-            idx = np.arange(N)
+            idx = None
         else:
             idx = rng.integers(0, N, batch_size)
         # Compute log denominators for the batch
-        tmp = logn[None, :] + f[None, :] - u[idx, :]
-        # logsumexp along axis=1
-        ld = logsumexp_axis1_finite(tmp)
-        # Compute new f_k estimate from the batch
-        tmp2 = -u[idx, :] - ld[:, None]
-        nf = -logsumexp_axis0_finite(tmp2)
+        nf = _blocked_update(u, logn, f, idx)
         nf -= nf[0]
         # Update step
         delta = nf - f
         # Compute learning rate based on relative batch size
-        lr = float(lr_scale) * math.sqrt(float(len(idx)) / float(N)) if N > 0 else float(lr_scale)
+        used_rows = N if idx is None else len(idx)
+        lr = float(lr_scale) * math.sqrt(float(used_rows) / float(N)) if N > 0 else float(lr_scale)
         # Clip free energy changes to prevent divergence
         if delta_f_max is not None and float(delta_f_max) > 0:
             delta = np.clip(delta, -float(delta_f_max), float(delta_f_max))
@@ -630,7 +670,7 @@ def solve_mbar_lbfgs(u_nk, window, tol=1e-10, maxiter=10000, progress: Optional[
     """
     if not SCIPY_AVAILABLE:
         raise RuntimeError('lbfgs backend requires scipy')
-    u_nk = np.asarray(u_nk, dtype=np.float64, order='C')
+    u_nk = solver_matrix(u_nk)
     window = np.asarray(window, dtype=np.int64)
     N, K = u_nk.shape
     nk = np.bincount(window[(window >= 0) & (window < K)], minlength=K).astype(np.float64)
@@ -641,7 +681,7 @@ def solve_mbar_lbfgs(u_nk, window, tol=1e-10, maxiter=10000, progress: Optional[
     # active.size==K (every window has samples, the common case) implies
     # active==arange(K) exactly, so u_nk[:, active] would just copy u_nk
     # itself; skip that copy and use u_nk directly.
-    u = u_nk if active.size == K else np.ascontiguousarray(u_nk[:, active], dtype=np.float64)
+    u = _active_matrix(u_nk, active)
     n = nk[active]
     logn = np.log(n)
 
@@ -654,20 +694,23 @@ def solve_mbar_lbfgs(u_nk, window, tol=1e-10, maxiter=10000, progress: Optional[
                     f0[_i] = fi[_a]
             f0 -= f0[0]
 
-    tmp = np.empty((N, Ka), dtype=np.float64)
-
     def neg_loglik_and_grad(f_red):
         f = np.empty(Ka, dtype=np.float64)
         f[0] = 0.0
         f[1:] = f_red
         # log denominator: log Σ_k N_k exp(f_k - u_nk) for each sample
-        np.add(logn[None, :] + f[None, :], -u, out=tmp)
-        ld = logsumexp_axis1_finite(tmp)
-        # -L = -(dot(n,f) - sum(ld))
-        neg_L = -(float(np.dot(n, f)) - float(np.sum(ld)))
-        # gradient of L w.r.t. f: N_k - Σ_n exp(logn_k + f_k - u_nk - ld_n)
-        tmp2 = tmp - ld[:, None]
-        grad_L = n - np.sum(np.exp(tmp2), axis=0)
+        sum_ld = 0.0
+        sum_weights = np.zeros(Ka)
+        for start, stop in row_blocks(*u.shape):
+            tmp = logn + f - u[start:stop]
+            ld = logsumexp_axis1_finite(tmp)
+            sum_ld += float(ld.sum())
+            tmp -= ld[:, None]
+            np.exp(tmp, out=tmp)
+            sum_weights += tmp.sum(axis=0)
+            release_pages(u)
+        neg_L = sum_ld - float(np.dot(n, f))
+        grad_L = n - sum_weights
         # negate and drop f[0] component (fixed gauge)
         neg_grad_red = -grad_L[1:]
         return neg_L, neg_grad_red
@@ -697,8 +740,7 @@ def solve_mbar_lbfgs(u_nk, window, tol=1e-10, maxiter=10000, progress: Optional[
     grad_norm = float(np.max(np.abs(result.jac))) if result.jac is not None else float('nan')
 
     # Final log-denominator and weights
-    np.add(logn[None, :] + f[None, :], -u, out=tmp)
-    ld = logsumexp_axis1_finite(tmp)
+    ld = _blocked_logdenom(u, logn, f)
     lw = -ld
     lw -= logsumexp(lw)
 
@@ -781,7 +823,7 @@ def solve_mbar(u_nk, window, tol=1e-10, maxiter=10000, progress: Optional['Progr
     use_anderson = backend in ('anderson', 'auto')
     if progress is not None:
         progress.step('MBAR backend', f'{"anderson" if use_anderson else "numpy"} vectorized backend')
-    u_nk=np.asarray(u_nk,dtype=np.float64,order='C')
+    u_nk=solver_matrix(u_nk)
     window=np.asarray(window,dtype=np.int64)
     N,K=u_nk.shape
     nk=np.bincount(window[(window>=0)&(window<K)],minlength=K).astype(np.float64)
@@ -790,7 +832,7 @@ def solve_mbar(u_nk, window, tol=1e-10, maxiter=10000, progress: Optional['Progr
     # active.size==K (every window has samples, the common case) implies
     # active==arange(K) exactly, so u_nk[:, active] would just copy u_nk
     # itself; skip that copy and use u_nk directly.
-    u = u_nk if active.size==K else np.ascontiguousarray(u_nk[:,active],dtype=np.float64)
+    u = _active_matrix(u_nk, active)
     n=nk[active]
     logn=np.log(n)
     f=np.zeros(active.size,dtype=np.float64)
@@ -803,19 +845,13 @@ def solve_mbar(u_nk, window, tol=1e-10, maxiter=10000, progress: Optional['Progr
             f-=f[0]
     conv=False
     md=float('inf')
-    tmp=np.empty_like(u)
     F_hist: list = []
     G_hist: list = []
     for it in range(1,maxiter+1):
         if progress is not None and (it == 1 or it % 25 == 0):
             progress.bar('MBAR iterations', it, maxiter, f'delta {md:.2e}')
         # log denominator for each sample: log sum_k N_k exp(f_k-u_nk)
-        np.subtract(logn[None,:]+f[None,:],u,out=tmp)
-        ld=logsumexp_axis1_finite(tmp)
-        # new f_k = -log sum_n exp(-u_nk - ld_n), shifted to f_0=0
-        np.negative(u,out=tmp)
-        tmp-=ld[:,None]
-        nf=-logsumexp_axis0_finite(tmp)
+        nf = _blocked_update(u, logn, f)
         nf-=nf[0]
         md=float(np.max(np.abs(nf-f)))
         if use_anderson:
@@ -833,8 +869,7 @@ def solve_mbar(u_nk, window, tol=1e-10, maxiter=10000, progress: Optional['Progr
     bname = 'anderson' if use_anderson else 'numpy'
     if progress is not None:
         progress.bar('MBAR iterations', 1, 1, f'backend={bname} converged={conv} iter={it} delta={md:.2e}', force=True)
-    np.subtract(logn[None,:]+f[None,:],u,out=tmp)
-    ld=logsumexp_axis1_finite(tmp)
+    ld = _blocked_logdenom(u, logn, f)
     lw=-ld
     lw-=logsumexp(lw)
     fall=np.full(K,np.nan,dtype=np.float64)
@@ -1198,6 +1233,7 @@ def logw_from_fk(u_nk, window, f_k) -> np.ndarray:
         stop = min(start + chunk, N)
         block = u_nk[start:stop] if full_columns else u_nk[start:stop, active]
         logw_s[start:stop] = -logsumexp_axis1_finite(row_terms - block)
+        release_pages(u_nk)
     logw_s -= logsumexp(logw_s)
     return logw_s
 
