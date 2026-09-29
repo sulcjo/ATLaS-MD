@@ -501,10 +501,21 @@ X1 gap fixes are in PR #113 (`feat/adaptive-cv2-prereqs`, stacked on #111).
 | 3.6 labels and refit safety | done: `cv2_component` (family, index, tICA lag frames/ps) in `cv_selection_report.json` and `run_manifest.method_settings`; a frozen residual pair refuses tICA refit (skip + warning), tIC1 recentring (raises) and the tica-linear switch, and a resume that finds a recorded switch fails closed; contract rule "PCA indices precede tICA indices, no gaps" replaces "tICA iff index > 6" (c8/c9 artifacts validate to the same digests) | `gareus/cv_selection/labels.py`, `_frozen_residual_pair`, `contracts._require_family_order`; `tests/test_cv2_labels_refit_safety.py` |
 | P1 headroom, P2 applier rewrite, P4 collectors, P5 model threading, P7a/b neighbour rule + schema v2 | not started | |
 | 3.1 edge metric, 3.2 shape layout, 3.3 R1-R3, 3.4 coupling gate, 3.7 reporting | not started | |
-| X2-X8 | not started | |
+| X3 slow-mode-aware reseeding | done behind `--ap-slow-mode-reseed-fraction` (0 = off); hidden mode = leading conditional tICA mode of the torsion residual after CV1 and the deployed CV2 direction (from saved XTC frames joined to the Parquet samples, or `tica_obs`); one-sided = minority side <= 20 % of a window's frames; seeds = pooled `final_pdbs` end states within 2 sigma_w on the minority side, injected through a seed-bank `slow_mode_reseed/` override that `filter_seed_bank_for_state_ids` carries and `generate_us_starting_states_by_pulling` honours per window; report `epoch_NNN/slow_mode_reseed.json`. No MD has run with it; T2 (3D landscape with a hidden CV3) not done | `gareus/adaptive/slow_mode_reseed.py`, `slow_mode_reseed_io.py` (+ read-only replay CLI); `tests/test_slow_mode_reseed.py` |
+| X2, X4-X8 | not started | |
 | T1 | per-feature unit tests for X1 and the ledger only; T2-T4 not started | |
 
 Notes from implementation: the X1 replay found that both chignolin_7 and chignolin_9 keep
 4 rungs and move the interior down ([0, ~0.18, ~0.47, 1]), so the extra headroom X1 was
 expected to free (Section 12) does not appear under a 0.25 minimum; P1 headroom still has to
 come from somewhere else.
+
+X3 replay on chignolin_9 (read-only, 200 ps lag, 3.5 ps frame stride): chignolin_9 deployed
+residual PC1, not component 7, so its hidden mode is the one after (CV1, PC1): phi(E5) 0.81 +
+psi(P4) 0.52 (epoch_002; epoch_001 0.79/0.48), tICA eigenvalue 0.988 (implied 16 ns),
+autocorrelation at fixed CV1 0.95, bimodality 0.88, split at a density minimum. psi(D3) loads
+only 0.07 there. Counterfactually, after (CV1, the slowest CV1-residual mode = phi(E5) 0.76 +
+psi(D3) 0.53, a production analogue of component 7) the hidden mode is psi(P4) 0.73 + psi(D3)
+0.56. Per window (236), 102 are one-sided in epoch_002 (54 in epoch_001); a 25 % reseed picks 59
+(42) windows, 58 of 59 seeds from another state's end state (46 from another lambda rung), and
+raises the windows whose starting seed sits on their own minority side from 71 to 130 (91 to 133).

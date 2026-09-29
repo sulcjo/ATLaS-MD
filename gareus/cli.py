@@ -60,6 +60,14 @@ def _warn_pymbar_once() -> None:
 # Argument group builders
 # ---------------------------------------------------------------------------
 
+def _unit_interval_float(text: str) -> float:
+    """argparse type: a float in [0, 1]."""
+    value = float(text)
+    if not 0.0 <= value <= 1.0:
+        raise argparse.ArgumentTypeError(f"must be in [0, 1], got {text}")
+    return value
+
+
 def _add_core_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("-h", "--help", action=SimpleHelpAction)
     p.add_argument("-hh", "--help-heavy", action=HeavyHelpAction)
@@ -522,6 +530,13 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                    help="Replace a campaign's recorded adaptive decision rules (overlap targets, sample "
                         "floors, per-epoch add limits, duplicate tolerances; adaptive_production/"
                         "decision_settings.json, frozen at the campaign's first job) with this job's values.")
+    p.add_argument("--ap-slow-mode-reseed-fraction", type=_unit_interval_float, default=0.0,
+                   help="X3 slow-mode reseeding (0 = off). At each epoch boundary, fit the leading "
+                        "conditional tICA mode of the torsion residual after the deployed CV1/CV2 pair "
+                        "(reference-free), and restart up to this fraction of windows -- the most "
+                        "one-sided along it -- from a pooled end state inside the window's restraint "
+                        "on its under-sampled side. Starting points only; report epoch_NNN/"
+                        "slow_mode_reseed.json. Needs a frozen residual pair and saved trajectories.")
     p.add_argument("--ap-topups", action=argparse.BooleanOptionalAction, default=False,
                    help="Top-ups (off by default): --no-ap-topups runs each scheduled phase as a single "
                         "all-state baseline only. --ap-topups adds, after that baseline, at most one "
@@ -1558,6 +1573,7 @@ def _shim_adaptive_production(args: argparse.Namespace) -> None:
     args.adaptive_production_ladder_max_moves = args.ap_ladder_max_moves
     args.adaptive_production_ladder_adapt_override = args.ap_ladder_adapt_override
     args.adaptive_production_decision_settings_override = args.ap_decision_settings_override
+    args.adaptive_production_slow_mode_reseed_fraction = args.ap_slow_mode_reseed_fraction
     args.adaptive_production_topup_target_sigma = args.ap_topup_target_sigma
     args.adaptive_production_topup_weak_overlap = args.ap_topup_weak_overlap
     args.adaptive_production_topup_max_fraction = args.ap_topup_max_fraction
