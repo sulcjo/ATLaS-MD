@@ -228,7 +228,8 @@ def _per_regime_bias_block(cv_epoch, step_epoch, beta, pc_e, pk_e, sc_e, sk_e,
 
 
 def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_workers: int = 4,
-                                epoch_ids: Optional[set[int]] = None) -> Data:
+                                epoch_ids: Optional[set[int]] = None,
+                                low_memory: bool = False) -> Data:
     """Load MBAR inputs from adaptive-production Parquet epoch data.
 
     Pools samples from all epoch run directories, remaps per-epoch window IDs to
@@ -237,6 +238,8 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
 
     n_threads: DuckDB threads per connection (0=auto, capped at min(cpu_count,64))
     n_workers: parallel epoch-dir workers; each opens its own DuckDB connection
+    low_memory: use one epoch worker at a time instead of retaining all worker
+        results; callers should prefer the resolved union NPZ when available.
     """
     try:
         from gareus.query import load_samples  # noqa: F401 – used in _load_epoch_task
@@ -312,34 +315,39 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
     # Compute per-connection thread budget: distribute n_threads across n_workers.
     _cpu_cap = min(os.cpu_count() or 64, int(os.environ.get('NUMEXPR_MAX_THREADS', 64)))
     _total_threads = n_threads if n_threads > 0 else _cpu_cap
-    _n_workers = min(len(epoch_dirs), max(1, n_workers))
+    _n_workers = 1 if low_memory else min(len(epoch_dirs), max(1, n_workers))
     _threads_per_conn = max(1, _total_threads // _n_workers)
 
     # Load all epochs in parallel (I/O bound); post-process sequentially (order-dependent).
-    with ThreadPoolExecutor(max_workers=_n_workers) as _pool:
-        epoch_loaded = list(_pool.map(
-            lambda _ewt: _load_epoch_task(_ewt[0], _ewt[1], _ewt[2]),
-            [(ed, wp, _threads_per_conn) for ed, wp in epoch_dirs],
-        ))
+    # Low-memory mode keeps only the current worker result alive.
+    if low_memory:
+        epoch_iter = (
+            (_load_epoch_task(_ed, _wp, _threads_per_conn), (_ed, _wp))
+            for _ed, _wp in epoch_dirs
+        )
+    else:
+        with ThreadPoolExecutor(max_workers=_n_workers) as _pool:
+            epoch_loaded = list(_pool.map(
+                lambda _ewt: _load_epoch_task(_ewt[0], _ewt[1], _ewt[2]),
+                [(ed, wp, _threads_per_conn) for ed, wp in epoch_dirs],
+            ))
+        epoch_iter = zip(epoch_loaded, epoch_dirs)
 
     # Any phase whose stale window map had to be repaired in memory says so
     # here (an unrepairable one raised inside the worker instead). Printed
     # immediately *and* carried into meta['load_notes'], which analyze()
     # folds into pmf_summary.json's warnings -- a silent repair would be as
     # misleading as the bug it fixes.
-    load_notes = [n for _s, _w, _m, _prm, _notes in epoch_loaded for n in _notes]
-    for _n in load_notes:
-        print(f'    {_n}')
+    load_notes = []
 
     # Resolve beta once, up front, using the same fallback order as before (first
     # epoch whose metadata yields it, else a top-level adaptive_dir inference).
     # Must be fixed *before* any per-epoch bias block is built below, since every
     # block needs the same beta.
-    for (samples, _wmap, ep_meta, _native_params, _notes), (epoch_dir, _) in zip(epoch_loaded, epoch_dirs):
+    for epoch_dir, _ in epoch_dirs:
         if math.isfinite(beta):
             break
-        if not samples or 'cv1' not in samples or len(samples['cv1']) == 0:
-            continue
+        ep_meta = rjson(epoch_dir / 'umbrella_pymbar_metadata.json', {})
         b = float(ep_meta.get('beta_1_over_kJ_mol') or 0.0)
         beta = b if b > 0 else infer_temp_beta(epoch_dir, ep_meta)[1]
     if not math.isfinite(beta):
@@ -359,8 +367,10 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
     _final_regime = (_epoch_run_manifest_secondary_cv_type(Path(epoch_dirs[-1][0]))
                      if epoch_dirs else '') or ''
 
-    for _ei, ((samples, wmap, ep_meta, native_params, _notes), (epoch_dir, _)) in enumerate(
-            zip(epoch_loaded, epoch_dirs)):
+    for _ei, ((samples, wmap, ep_meta, native_params, _notes), (epoch_dir, _)) in enumerate(epoch_iter):
+        load_notes.extend(_notes)
+        for _n in _notes:
+            print(f'    {_n}')
         if not samples or 'cv1' not in samples or len(samples['cv1']) == 0:
             continue
         raw_w = samples['window_id'].astype(np.int32)

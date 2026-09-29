@@ -5693,6 +5693,8 @@ def parse_args(argv=None):
     p.add_argument('--traj-workers', type=int, default=8, help='Number of parallel worker threads for trajectory-derived observables (Rg, chignolin FES). Each thread loads one replica\'s segments concurrently. mdtraj releases the GIL during XTC/DCD reads so true parallelism is achieved. Set to 1 to disable threading.')
     p.add_argument('--duckdb-threads', type=int, default=0, help='Total DuckDB threads distributed across parallel parquet loaders. 0=auto (min(cpu_count, NUMEXPR_MAX_THREADS, 64)). Divide by --load-workers to get per-connection thread count.')
     p.add_argument('--load-workers', type=int, default=8, help='Number of parallel epoch-dir workers for adaptive parquet loading. Each opens its own DuckDB connection with (--duckdb-threads / --load-workers) threads. Set to 1 to disable parallelism.')
+    p.add_argument('--low-memory', action='store_true',
+                   help='Use low-memory adaptive loading: prefer the resolved union NPZ snapshot, or load Parquet epochs sequentially.')
     # MBAR solver backend selection.  Choices include auto, explicit deterministic
     # solvers (lbfgs, numpy, anderson), Numba variants (numba, numba-anderson,
     # numba-diis), and sambar which performs a stochastic warm‑start before a
@@ -5877,7 +5879,7 @@ def main(argv=None):
     progress.step('load', 'reading current ATLaS-MD outputs')
     _t0=time.time()
     epoch_ids = set(args.epochs) if args.epochs is not None else None
-    d=load_data(Path(args.input), Path(args.out) if args.out else None, args.analysis_source, no_augment=getattr(args,'no_adaptive_rounds',False), n_threads=getattr(args,'duckdb_threads',0), n_workers=getattr(args,'load_workers',8), epoch_ids=epoch_ids)
+    d=load_data(Path(args.input), Path(args.out) if args.out else None, args.analysis_source, no_augment=getattr(args,'no_adaptive_rounds',False), n_threads=getattr(args,'duckdb_threads',0), n_workers=getattr(args,'load_workers',8), epoch_ids=epoch_ids, low_memory=getattr(args, 'low_memory', False))
     if getattr(args,'skip_first_n_frames',0)>0:
         n_before=d.cv.size
         d=_skip_first_n_frames(d,args.skip_first_n_frames)
