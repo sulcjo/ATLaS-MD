@@ -2232,8 +2232,10 @@ under-resolved.  Only states restraining both axes above their floors
 
 Every new window: target sampled sigma from the spacing (children: 2 delta / 1.5),
 never below --ap-refine-min-sigma; F'' from the window's own samples minus its own
-spring; k2 = RT/sigma^2 - F'' in [--cv2-k-min, min(--cv2-k-max, 4 x parent k2)], then
-the coupling gate. A k2 at the floor is refused (k2_at_floor), never created.
+spring; k2 = max(RT/sigma^2 - F'', F'') (the F'' floor keeps the window mean at least
+half-way to its centre) in [--cv2-k-min, min(--cv2-k-max, 4 x parent k2)], then the
+coupling gate. A k2 at --cv2-k-min is refused (k2_at_floor), and so is one the cap holds
+below the F'' floor (k2_capped_below_compression); neither is created.
 Sampled sd/sigma_w, Sarle bimodality and curvature are reported, never trigger.
 
 Budget: resolution actions draw only on the swarm layout's reserve

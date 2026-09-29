@@ -472,7 +472,8 @@ def place_cv2_centres(fit: CV2MixtureFit, envelope: Tuple[float, float], *, sigm
     inside ``envelope``, filled by greedy steps of ``spacing_sigma`` x min sigma_s over the step
     (so every adjacent gap is <= 1.5 x the smallest predicted sampled sigma between the pair).
     ``sigma_w_target`` is the base design width (the uniform layout's spacing / overlap_sigma);
-    a single Gaussian whose F'' is below RT/sigma_w^2 therefore reproduces the uniform grid.
+    a single Gaussian whose F'' is at most RT/(2 sigma_w^2) therefore reproduces the uniform grid
+    (with the default mean-compression floor; below RT/sigma_w^2 with it off).
     With no accepted mode the walk starts at the pooled mean. Accepted modes closer than
     ``mode_merge_sigma`` x their predicted sampled sigma to a heavier one (BIC splitting one
     non-Gaussian bump) are one mode (``dropped_modes``, reason "merged"). k2, F'', sigma_s and
