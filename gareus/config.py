@@ -111,6 +111,10 @@ CONFIG_KEY_ALIASES: Dict[str, str] = {
     "min_slowness": "cv_selection_min_slowness",
     "min_bimodality": "cv_selection_min_bimodality",
     "half_split_min_corr": "cv_selection_half_split_min_corr",
+    # swarm: section-child short names -> swarm_* dests (spec P1 / 3.2)
+    "adaptive_reserve_fraction": "swarm_adaptive_reserve_fraction",
+    "cv2_layout": "swarm_cv2_layout",
+    "cv2_min_mode_members": "swarm_cv2_min_mode_members",
 }
 
 

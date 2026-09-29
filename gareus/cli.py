@@ -68,6 +68,15 @@ def _unit_interval_float(text: str) -> float:
     return value
 
 
+def _reserve_fraction(text: str) -> float:
+    """argparse type: an adaptive reserve fraction in [0, 1) (spec P1)."""
+    from .adaptive.reserve_budget import validate_reserve_fraction
+    try:
+        return validate_reserve_fraction(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def _add_core_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("-h", "--help", action=SimpleHelpAction)
     p.add_argument("-hh", "--help-heavy", action=HeavyHelpAction)
@@ -302,6 +311,16 @@ def _add_cv_selection_args(p: argparse.ArgumentParser) -> None:
                    help="Largest CV2-induced CV1 curvature, as a fraction of the cell's designed CV1 "
                         "curvature, --swarm-cv2-coupling-gate accepts (a different quantity from "
                         "--cv-selection-max-coupling-fraction, which judges candidates at a reference k2).")
+    p.add_argument("--swarm-cv2-layout", choices=["uniform", "shape"], default="uniform",
+                   help="Spec 3.2 CV2 window design of the 2-D swarm layout. uniform (default): today's "
+                        "global linspace and per-gap k2. shape: per CV1 window a Gaussian mixture of the "
+                        "swarm's CV2 (BIC count, member-blocked CV regularisation) puts a centre at every "
+                        "mode with >= --swarm-cv2-min-mode-members members, fills at 1.5 x the smallest "
+                        "predicted sampled sigma, k2 = RT/sigma^2 - F'' in [--cv2-k-min, --cv2-k-max], adds "
+                        "one CV1-free window per mode (X7) and ranks cells under the cap.")
+    p.add_argument("--swarm-cv2-min-mode-members", type=int, default=8,
+                   help="Independent swarm members a CV2 mixture component needs before "
+                        "--swarm-cv2-layout shape places a mandatory centre on it.")
     p.add_argument("--legacy-model-policy", choices=["refuse", "allow-v1"], default="refuse",
                    dest="legacy_model_policy",
                    help="v1 residual pair-model artifacts (pre thermodynamic repair F02) describe a coordinate "
@@ -920,6 +939,11 @@ def _add_swarm_args(p: argparse.ArgumentParser) -> None:
                         "graft_failed or md_failed. Failing this gate means too many "
                         "members never reached a usable trace to trust the pooled "
                         "envelope/ladder.")
+    p.add_argument("--swarm-adaptive-reserve-fraction", type=_reserve_fraction, default=0.0,
+                   help="Spec P1 layout headroom (0 = off, today's layout): the swarm layout leaves "
+                        "floor(f * --max-replicas) replicas unfilled for adaptive additions and records the "
+                        "reserve in layout_plan.json (adaptive_reserve). Mandatory stacks are never dropped "
+                        "for it; a shortfall is recorded instead. Must be in [0, 1).")
     p.add_argument("--swarm-seeds-per-window", type=int, default=3)
     p.add_argument("--swarm-discard-block-frames", type=int, default=25,
                    help="V-trace block size for the discard detector.")

@@ -16,6 +16,12 @@ state ids and region coverage -- metadata, never physics (spec F05). Two schemas
 
 ``read_layout_plan`` returns one normalised form for both; v1 files keep working (region is
 derived from ``region_of_centre`` when that is present, restrained from k > 0).
+
+Two optional v2 keys appear only when their flag is on (absent = the plan is byte-identical
+to one written without them): ``adaptive_reserve`` (spec P1, ``--swarm-adaptive-reserve-
+fraction``; read with ``adaptive_reserve``) and ``cv2_shape`` (spec 3.2, ``--swarm-cv2-layout
+shape``: per-CV1-window mixture fits, placements and every requested cell with its rank,
+granted flag and reason; dropped cells are never in ``states``).
 """
 from __future__ import annotations
 
@@ -103,11 +109,23 @@ def read_layout_plan(path: Path) -> Tuple[dict, List[LayoutPlanState]]:
     return plan, plan_states(plan)
 
 
+def adaptive_reserve(plan: Mapping[str, Any]) -> Optional[dict]:
+    """The P1 headroom record (``--swarm-adaptive-reserve-fraction``), or None.
+
+    Present only in plans written with a reserve fraction > 0 (v1 plans never have one):
+    ``fraction``, ``max_replicas``, ``n_rungs``, ``reserved_replicas_requested``,
+    ``fill_cap_spatial``, ``granted_states``, ``free_slots``, ``reserve_shortfall`` and the
+    per-epoch shares. ``gareus.adaptive.reserve_budget.reserve_allowances`` takes it as is."""
+    record = plan.get("adaptive_reserve")
+    return dict(record) if isinstance(record, Mapping) else None
+
+
 def layout_plan_beside(table_path: Path) -> Optional[Path]:
     """The companion ``layout_plan.json`` next to a window table, if there is one."""
     candidate = Path(table_path).parent / LAYOUT_PLAN_FILENAME
     return candidate if candidate.exists() else None
 
 
-__all__ = ["LAYOUT_PLAN_FILENAME", "LAYOUT_PLAN_V1", "LAYOUT_PLAN_V2", "LayoutPlanState", "layout_plan_beside",
+__all__ = ["LAYOUT_PLAN_FILENAME", "LAYOUT_PLAN_V1", "LAYOUT_PLAN_V2", "LayoutPlanState", "adaptive_reserve",
+           "layout_plan_beside",
            "plan_states", "read_layout_plan", "schema_version"]

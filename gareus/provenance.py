@@ -320,6 +320,9 @@ def _method_settings(args: Any) -> dict[str, Any]:
         "cv_selection_max_coupling_fraction", "cv_selection_k2_reference_kcal",
         "cv_selection_min_gain_nats", "cv_selection_min_windows_cv1",
         "cv_selection_fallback", "swarm_n_windows_cv2",
+        # Spec 3.4 at the layout, P1 headroom, 3.2 shape layout.
+        "swarm_cv2_coupling_gate", "swarm_cv2_max_coupling_fraction",
+        "swarm_adaptive_reserve_fraction", "swarm_cv2_layout", "swarm_cv2_min_mode_members",
     ]
     settings = {k: getattr(args, k, None) for k in keys if hasattr(args, k)}
     settings["cv_pair_model_sha256"] = pair_model_sha256(getattr(args, "secondary_cv_model", None))

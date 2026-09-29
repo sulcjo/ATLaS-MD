@@ -1952,6 +1952,32 @@ envelope_stability failure, adds +1 on a coverage failure, caps the total at 4x
 the base replicate count, and analyze is re-run after the extra members
 complete. ladder_ess no longer triggers an extension since it cannot fail.
 
+Layout headroom and shape-based CV2 windows (2-D layout)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Both are off by default; the defaults reproduce today's windows table and
+layout_plan.json byte for byte.
+
+    --swarm-adaptive-reserve-fraction f   leave floor(f * --max-replicas) replicas unfilled
+                                          for adaptive additions (spec P1). layout_plan.json
+                                          records adaptive_reserve (fraction, requested and
+                                          free slots, granted states, shortfall). The
+                                          mandatory stacks are never dropped for it.
+    --swarm-cv2-layout shape              per CV1 window, a Gaussian mixture of the swarm's
+                                          CV2 (CV1 kernel of the window's width; BIC count,
+                                          member-blocked CV regularisation) places a centre
+                                          on every mode with >= --swarm-cv2-min-mode-members
+                                          (8) members, then fills at 1.5 x the smallest
+                                          predicted sampled sigma ahead; k2 = RT/sigma^2 - F''
+                                          in [--cv2-k-min, --cv2-k-max]; one CV1-free window
+                                          per mode (X7); under the cap mode cells first, then
+                                          the reserve, then axis states, then fill cells by
+                                          adjacency and design-mass share.
+
+The swarm is a design measure, not an equilibrium conditional: the mixture only
+locates structure and bounds how finely CV2 is resolved. Where a mode is stiffer
+than the target width, k2 floors at --cv2-k-min and the window mean follows the
+mode (mean_compression in layout_plan.json's cv2_shape record).
+
 Pilot comparison
 ~~~~~~~~~~~~~~~~~
 --swarm-stage compare --swarm-pilot-globals <S3 pilot's shared_gamd_setup_globals.json>

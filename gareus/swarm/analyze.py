@@ -40,6 +40,7 @@ from gareus.cv_selection.models import (
 )
 from gareus.cv_selection.select_pair import SelectionConfig, SwarmDataset, select_cv_pair
 from gareus.cv_selection.coverage import build_region_inventory, region_centres
+from gareus.swarm.cv2_shape_layout import one_dimensional_reserve, select_pair_layout
 from gareus.io import write_json
 from gareus.pep_gamd import PepGamdEnvelope
 from gareus.swarm.driver import _load_plan, round_dir, swarm_root
@@ -677,9 +678,11 @@ def analyze_swarm_stage(out_dir, args) -> dict:
                 k2_min = float(getattr(args, "cv2_k_min", 0.0) or 0.0) or 1e-3
                 ks2 = cv2_force_constants_per_gap(cv2_design["centers"], temperature_k, overlap_sigma=overlap_sigma,
                                                   k_min_kcal=k2_min, k_max_kcal=float(getattr(args, "cv2_k_max", 1000.0)))
-                layout = design_exploration_layout(int(n_win), n2, n_rungs=len(ladder["lambdas"]),
-                                                   max_replicas=int(getattr(args, "max_replicas", 0) or 0),
-                                                   region_centre_indices=region_rep_indices)
+                layout, centers2, ks2, shaped = select_pair_layout(
+                    args, n_win, n2, ladder["lambdas"], region_rep_indices, cv2_design["centers"], ks2,
+                    cv1=dataset.anchor.values, z2=z2_all, member_ids=dataset.member_ids, deltav_kj=dv_rows,
+                    centers1=centers, ks1=ks, temperature_k=temperature_k, overlap_sigma=overlap_sigma, k_min=k2_min)
+                warnings.extend(shaped["summary"]["warnings"] if shaped else [])
                 if layout["status"] != LAYOUT_STATUS_PROPOSED:
                     warnings.append(f"layout: {layout['status']}: {layout.get('reason')}")
                 # The CV2 umbrella also restrains the anchor through the chain-rule term;
@@ -693,14 +696,15 @@ def analyze_swarm_stage(out_dir, args) -> dict:
                                     f"at k2={max(ks2):.2f}); the CV1 overlap design assumed k1 alone")
                 selection.update({
                     "layout": {k: v for k, v in layout.items() if k not in ("cells", "state_roles")},
-                    "cv2_centers": [float(c) for c in cv2_design["centers"]],
+                    "cv2_centers": [float(c) for c in centers2],
                     "cv2_k_kcal": [float(k) for k in ks2],
                     "cv2_per_rung_quantiles": {str(l): list(q) for l, q in cv2_design["per_rung_quantiles"].items()},
                     "cv2_per_rung_ess": {str(l): e for l, e in cv2_design["per_rung_ess"].items()},
                     "coupling_curvature_kcal_at_max_k2": float(coupling),
                     "cv1_width_shrink_max": float(max(shrink)),
+                    **({"cv2_layout": "shape", "cv2_shape_summary": shaped["summary"]} if shaped else {}),
                 })
-                rows_2d = layout_rows(layout, centers, ks, cv2_design["centers"], ks2) if layout["cells"] else []
+                rows_2d = layout_rows(layout, centers, ks, centers2, ks2) if layout["cells"] else []
                 if bool(getattr(args, "swarm_cv2_coupling_gate", False)) and rows_2d:
                     # Spec 3.4: per cell, lower k2 to the largest value that keeps the CV2-induced
                     # CV1 curvature within the fraction; the design k2 stays in cv2_k_kcal.
@@ -714,7 +718,7 @@ def analyze_swarm_stage(out_dir, args) -> dict:
                 plan_record = layout_plan_record(layout, rows_2d, ladder["lambdas"],
                                                  region_inventory=report["region_inventory"],
                                                  region_of_centre=region_of_centre)
-                pair_layout = (layout, cv2_design["centers"], ks2, rows_2d, plan_record)
+                pair_layout = (layout, centers2, ks2, rows_2d, plan_record)
                 pair_paths = {"pair_model": an / "cv_pair_model.json",
                               "candidate_set": an / "cv_candidate_set.json",
                               "feature_schema": an / "cv_feature_schema.json"}
@@ -766,6 +770,7 @@ def analyze_swarm_stage(out_dir, args) -> dict:
                                cvs={"cv1": "contacts", "cv2": "residual-torsion-pc"}, pair_paths=pair_paths)
             else:
                 windows_csv = write_ladder_windows_csv(an / "windows_lambda_ladder.csv", centers, ks, ladder["lambdas"])
+                report.update(one_dimensional_reserve(args, ladder_design["n_states"], warnings))
                 _write_sidecar(an, seed_bank_dir, windows_csv,
                                cvs={"cv1": "contacts", "cv2": "none"} if selection is not None else None)
         else:
