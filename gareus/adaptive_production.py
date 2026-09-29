@@ -2355,155 +2355,16 @@ def build_geometry_edges(
 
 
 GEOMETRY_LINK_EDGE_TYPE = "pattern_link"
-_GEOMETRY_RANK_TEMPERATURE_K = 300.0   # ranking only; same-pattern distances scale as 1/sqrt(T)
-_GEOMETRY_CENTRE_DECIMALS = 6          # row/column identity, as layout_neighbours / the 2D window map
 
 
 def _neighbour_geometry_edges(active: List[WindowState]) -> List[Tuple[int, int, str, Optional[float]]]:
     """The non-rung part of ``build_geometry_edges`` over one representative per centre."""
-    from .adaptive.neighbour_rule import NeighbourPoint, fallback_axis_sigmas, pair_distance
-    n = len(active)
+    from .adaptive.neighbour_rule import NeighbourPoint, chain_edges
     ids = [int(s.state_id) for s in active]
-    primary = np.asarray([s.primary_center for s in active], dtype=float)
-    secondary = np.asarray([0.0 if s.secondary_center is None else s.secondary_center for s in active],
-                           dtype=float)
-    has_secondary = any(s.secondary_center is not None for s in active)
-    pattern = [_restraint_pattern(s.primary_k, s.secondary_k, s.secondary_center) for s in active]
     points = [NeighbourPoint(primary_center=float(s.primary_center), primary_k=s.primary_k,
                              secondary_center=s.secondary_center, secondary_k=s.secondary_k)
               for s in active]
-    fallback, _src = fallback_axis_sigmas(points, _GEOMETRY_RANK_TEMPERATURE_K)
-    edges: Dict[Tuple[int, int], Tuple[int, int, str, Optional[float]]] = {}
-    parent = list(range(n))
-
-    def find(x: int) -> int:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def add(a_idx: int, b_idx: int, etype: str, nd: Optional[float]) -> None:
-        if a_idx == b_idx:
-            return
-        a, b = sorted((ids[a_idx], ids[b_idx]))
-        if (a, b) not in edges:            # first (most specific) type wins
-            edges[(a, b)] = (a, b, etype, nd)
-        ra, rb = find(a_idx), find(b_idx)
-        if ra != rb:
-            parent[max(ra, rb)] = min(ra, rb)
-
-    def dist(i: int, j: int) -> float:
-        return pair_distance(points[i], points[j], _GEOMETRY_RANK_TEMPERATURE_K, fallback_sigma=fallback)
-
-    def key(v: float) -> float:
-        return round(float(v), _GEOMETRY_CENTRE_DECIMALS)
-
-    def chains(axis: int, etype: str) -> None:
-        groups: Dict[Tuple, List[int]] = {}
-        for i in range(n):
-            if not pattern[i][axis]:
-                continue
-            other = 1 - axis
-            other_key = (key(secondary[i]) if other == 1 else key(primary[i])) if pattern[i][other] else None
-            groups.setdefault((pattern[i], other_key), []).append(i)
-        values = primary if axis == 0 else secondary
-        for gkey in sorted(groups, key=lambda g: (g[0], (0, 0.0) if g[1] is None else (1, g[1]))):
-            idx = groups[gkey]
-            order = [idx[t] for t in np.argsort(values[idx])]
-            for left, right in zip(order[:-1], order[1:]):
-                add(int(left), int(right), etype, None)
-
-    chains(0, "primary_chain")
-    if not has_secondary:
-        # A CV1-only layout: exactly the old sorted chain (one row), plus the links below for
-        # an anchor (k1 = 0), if any.
-        _link_patterns(active, pattern, points, fallback, add, find)
-        return list(edges.values())
-    chains(1, "secondary_chain")
-    by_pattern: Dict[Tuple[bool, bool], List[int]] = {}
-    for i in range(n):
-        if any(pattern[i]):
-            by_pattern.setdefault(pattern[i], []).append(i)
-    for members in by_pattern.values():
-        for i in members:
-            cands = [(dist(i, j), ids[j], j) for j in members if j != i]
-            cands = [c for c in cands if math.isfinite(c[0])]
-            if cands:
-                d, _sid, j = min(cands)
-                add(i, j, "nearest_2d", float(d))
-        # Closest pair between still-separate pieces of this pattern (Kruskal over the
-        # remaining cross-piece pairs), so an off-grid state is never left alone.
-        pairs = sorted((dist(i, j), ids[i], ids[j], i, j) for a, i in enumerate(members)
-                       for j in members[a + 1:] if find(i) != find(j))
-        for d, _a, _b, i, j in pairs:
-            if find(i) != find(j) and math.isfinite(d):
-                add(i, j, "nearest_2d", float(d))
-    _link_patterns(active, pattern, points, fallback, add, find)
-    return list(edges.values())
-
-
-def _link_patterns(active, pattern, points, fallback, add, find) -> None:
-    """``pattern_link`` edges joining the restraint-pattern groups (see ``build_geometry_edges``)."""
-    from .adaptive.neighbour_rule import axis_separation
-    n = len(active)
-    ids = [int(s.state_id) for s in active]
-    groups: Dict[Tuple[bool, bool], List[int]] = {}
-    for i in range(n):
-        groups.setdefault(pattern[i], []).append(i)
-
-    def central(members: List[int]) -> int:
-        """The member nearest the medians of its restrained centres (P7a units, no placeholder)."""
-        axes = [a for a in (0, 1) if pattern[members[0]][a]]
-        if not axes:
-            return min(members, key=lambda i: ids[i])
-        med = {a: float(np.median([points[i].centre(a) for i in members])) for a in axes}
-
-        def score(i: int) -> Tuple[float, int]:
-            tot = 0.0
-            for a in axes:
-                w = fallback[a] if fallback[a] else 1.0
-                tot += ((points[i].centre(a) - med[a]) / w) ** 2
-            return (tot, ids[i])
-        return min(members, key=score)
-
-    restrained_groups = [g for g in groups if any(g)]
-    for ga_i, ga in enumerate(restrained_groups):
-        for gb in restrained_groups[ga_i + 1:]:
-            shared = [a for a in (0, 1) if ga[a] and gb[a]]
-            if not shared:
-                continue
-            med_b = {a: float(np.median([points[j].centre(a) for j in groups[gb]])) for a in (0, 1) if gb[a]}
-            med_a = {a: float(np.median([points[i].centre(a) for i in groups[ga]])) for a in (0, 1) if ga[a]}
-            best = None
-            for i in groups[ga]:
-                for j in groups[gb]:
-                    d2 = 0.0
-                    for a in shared:
-                        sep = axis_separation(points[i], points[j], a, _GEOMETRY_RANK_TEMPERATURE_K,
-                                              fallback_sigma=fallback[a])
-                        d2 += (sep if sep is not None else math.inf) ** 2
-                    # tie-break: the partners' unshared restrained axes nearest their own
-                    # pattern's median (the middle row / column), then state ids
-                    tie = sum(abs(points[j].centre(a) - med_b[a]) for a in med_b if a not in shared)
-                    tie += sum(abs(points[i].centre(a) - med_a[a]) for a in med_a if a not in shared)
-                    cand = (d2, tie, ids[i], ids[j], i, j)
-                    if best is None or cand < best:
-                        best = cand
-            if best is not None and math.isfinite(best[0]):
-                add(best[4], best[5], GEOMETRY_LINK_EDGE_TYPE, float(math.sqrt(best[0])))
-    if restrained_groups and groups.get((False, False)):
-        hub_group = max(restrained_groups, key=lambda g: (len(groups[g]), g))
-        hub = central(groups[hub_group])
-        for i in groups.get((False, False), []):
-            add(i, hub, GEOMETRY_LINK_EDGE_TYPE, None)
-    # Last resort (e.g. CV1-only + CV2-only with no 2D state and no anchor): join what is
-    # still separate, most central state to most central state, in state-id order.
-    comps: Dict[int, List[int]] = {}
-    for i in range(n):
-        comps.setdefault(find(i), []).append(i)
-    pieces = sorted(comps.values(), key=lambda c: min(ids[i] for i in c))
-    for piece in pieces[1:]:
-        add(central(pieces[0]), central(piece), GEOMETRY_LINK_EDGE_TYPE, None)
+    return [(ids[i], ids[j], etype, d) for i, j, etype, d in chain_edges(points, ids=ids)]
 
 
 def _split_rung_groups(

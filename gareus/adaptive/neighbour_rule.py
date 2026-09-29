@@ -85,6 +85,8 @@ import statistics
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional, Sequence, Tuple
 
+import numpy as np
+
 from gareus.math_helpers import restraint_sigma
 
 DEFAULT_RADIUS = 2.5
@@ -320,6 +322,161 @@ def components(n: int, pairs: Iterable[Tuple[int, int]]) -> list[list[int]]:
     return sorted((sorted(g) for g in groups.values()), key=lambda g: g[0])
 
 
-__all__ = ["DEFAULT_RADIUS", "NeighbourPoint", "axis_restrained", "axis_separation", "components",
+# ---- true-neighbour chains (P7b): shared by build_geometry_edges and the exchange graph ----
+
+LINK_EDGE_TYPE = "pattern_link"
+RANK_TEMPERATURE_K = 300.0      # ranking only: same-pattern distances all scale as 1/sqrt(T)
+CENTRE_DECIMALS = 6             # row / column identity, as layout_neighbours and the 2D window map
+
+
+def chain_edges(points: Sequence[NeighbourPoint], ids: Optional[Sequence[int]] = None
+                ) -> list[Tuple[int, int, str, Optional[float]]]:
+    """True-neighbour edges over ``points`` (all on ONE rung), as (i, j, type, distance).
+
+    ``i``/``j`` index ``points`` with ``ids[i] < ids[j]`` (``ids`` default: the indices; they
+    also break ties). Types, first one found wins for a pair:
+
+    * ``primary_chain``: consecutive in sorted CV1 centre within one CV2 row (same restraint
+      pattern, same CV2 centre; the CV1-only states are one row, their CV2 a placeholder);
+    * ``secondary_chain``: consecutive in sorted CV2 centre within one CV1 column;
+    * ``nearest_2d`` (only when some point has a CV2 centre): each point's nearest point of its
+      own pattern by ``pair_distance``, then the closest same-pattern pair joining two
+      still-separate pieces of a pattern (Kruskal), so no point is left alone;
+    * ``pattern_link``: one per pair of patterns sharing a restrained axis (closest pair on
+      the shared axes only; ties to the partners' middle row / column, then ids), each anchor
+      (no axis restrained) to the most central point of the largest pattern, and a last-resort
+      join of anything still separate. Connectivity bookkeeping, never a gap.
+
+    Distances use ``RANK_TEMPERATURE_K`` and ``fallback_axis_sigmas`` for k not recorded; the
+    ranking does not depend on T. With no CV2 centre anywhere the result is exactly the sorted
+    CV1 chain (``np.argsort``, as the pre-P7b builder), plus anchor links.
+    """
+    n = len(points)
+    ids = list(range(n)) if ids is None else [int(v) for v in ids]
+    pattern = [p.pattern for p in points]
+    primary = np.asarray([float(p.primary_center) for p in points], dtype=float)
+    secondary = np.asarray([0.0 if p.secondary_center is None else float(p.secondary_center) for p in points],
+                           dtype=float)
+    has_secondary = any(p.secondary_center is not None for p in points)
+    fallback, _src = fallback_axis_sigmas(points, RANK_TEMPERATURE_K)
+    edges: dict = {}
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def add(i: int, j: int, etype: str, d: Optional[float]) -> None:
+        if i == j:
+            return
+        a, b = (i, j) if ids[i] < ids[j] else (j, i)
+        if (ids[a], ids[b]) not in edges:
+            edges[(ids[a], ids[b])] = (a, b, etype, d)
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[max(ri, rj)] = min(ri, rj)
+
+    def dist(i: int, j: int) -> float:
+        return pair_distance(points[i], points[j], RANK_TEMPERATURE_K, fallback_sigma=fallback)
+
+    def key(v: float) -> float:
+        return round(float(v), CENTRE_DECIMALS)
+
+    def chains(axis: int, etype: str) -> None:
+        groups: dict = {}
+        for i in range(n):
+            if not pattern[i][axis]:
+                continue
+            other = 1 - axis
+            other_key = (key(secondary[i]) if other == 1 else key(primary[i])) if pattern[i][other] else None
+            groups.setdefault((pattern[i], other_key), []).append(i)
+        values = primary if axis == 0 else secondary
+        for gkey in sorted(groups, key=lambda g: (g[0], (0, 0.0) if g[1] is None else (1, g[1]))):
+            idx = groups[gkey]
+            order = [idx[t] for t in np.argsort(values[idx])]
+            for left, right in zip(order[:-1], order[1:]):
+                add(int(left), int(right), etype, None)
+
+    chains(0, "primary_chain")
+    if has_secondary:
+        chains(1, "secondary_chain")
+        by_pattern: dict = {}
+        for i in range(n):
+            if any(pattern[i]):
+                by_pattern.setdefault(pattern[i], []).append(i)
+        for members in by_pattern.values():
+            for i in members:
+                cands = [(dist(i, j), ids[j], j) for j in members if j != i]
+                cands = [c for c in cands if math.isfinite(c[0])]
+                if cands:
+                    d, _sid, j = min(cands)
+                    add(i, j, "nearest_2d", float(d))
+            pairs = sorted((dist(i, j), ids[i], ids[j], i, j) for a, i in enumerate(members)
+                           for j in members[a + 1:] if find(i) != find(j))
+            for d, _a, _b, i, j in pairs:
+                if find(i) != find(j) and math.isfinite(d):
+                    add(i, j, "nearest_2d", float(d))
+    _pattern_links(points, pattern, ids, fallback, add, find)
+    return list(edges.values())
+
+
+def _pattern_links(points, pattern, ids, fallback, add, find) -> None:
+    n = len(points)
+    groups: dict = {}
+    for i in range(n):
+        groups.setdefault(pattern[i], []).append(i)
+
+    def central(members: list) -> int:
+        """The member nearest the medians of its restrained centres (never a placeholder)."""
+        axes = [a for a in (0, 1) if pattern[members[0]][a]]
+        if not axes:
+            return min(members, key=lambda i: ids[i])
+        med = {a: float(np.median([points[i].centre(a) for i in members])) for a in axes}
+
+        def score(i: int):
+            return (sum(((points[i].centre(a) - med[a]) / (fallback[a] or 1.0)) ** 2 for a in axes), ids[i])
+        return min(members, key=score)
+
+    restrained = [g for g in groups if any(g)]
+    for ia, ga in enumerate(restrained):
+        for gb in restrained[ia + 1:]:
+            shared = [a for a in (0, 1) if ga[a] and gb[a]]
+            if not shared:
+                continue
+            med_a = {a: float(np.median([points[i].centre(a) for i in groups[ga]])) for a in (0, 1) if ga[a]}
+            med_b = {a: float(np.median([points[j].centre(a) for j in groups[gb]])) for a in (0, 1) if gb[a]}
+            best = None
+            for i in groups[ga]:
+                for j in groups[gb]:
+                    d2 = 0.0
+                    for a in shared:
+                        sep = axis_separation(points[i], points[j], a, RANK_TEMPERATURE_K,
+                                              fallback_sigma=fallback[a])
+                        d2 += (math.inf if sep is None else sep) ** 2
+                    tie = sum(abs(points[j].centre(a) - med_b[a]) for a in med_b if a not in shared)
+                    tie += sum(abs(points[i].centre(a) - med_a[a]) for a in med_a if a not in shared)
+                    cand = (d2, tie, ids[i], ids[j], i, j)
+                    if best is None or cand < best:
+                        best = cand
+            if best is not None and math.isfinite(best[0]):
+                add(best[4], best[5], LINK_EDGE_TYPE, float(math.sqrt(best[0])))
+    if restrained and groups.get((False, False)):
+        hub = central(groups[max(restrained, key=lambda g: (len(groups[g]), g))])
+        for i in groups[(False, False)]:
+            add(i, hub, LINK_EDGE_TYPE, None)
+    # Last resort (e.g. CV1-only + CV2-only, no 2D state, no anchor): join what is still
+    # separate, lowest id to lowest id.
+    comps: dict = {}
+    for i in range(n):
+        comps.setdefault(find(i), []).append(i)
+    pieces = sorted(comps.values(), key=lambda c: min(ids[i] for i in c))
+    for piece in pieces[1:]:
+        add(min(pieces[0], key=lambda i: ids[i]), min(piece, key=lambda i: ids[i]), LINK_EDGE_TYPE, None)
+
+
+__all__ = ["DEFAULT_RADIUS", "LINK_EDGE_TYPE", "NeighbourPoint", "axis_restrained", "axis_separation",
+           "chain_edges", "components",
            "fallback_axis_sigmas",
            "is_neighbour", "neighbour_lists", "neighbour_pairs", "pair_distance", "restraint_pattern"]
