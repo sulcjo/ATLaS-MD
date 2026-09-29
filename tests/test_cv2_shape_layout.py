@@ -253,6 +253,15 @@ def test_swarm_analyze_shape_layout_writes_a_consistent_plan(synthetic_swarm, sw
                                                 if s["role"] in ("unrestrained_anchor", "region_representative")}
     sel = json.loads((an / "cv_selection_report.json").read_text())
     assert sel["cv2_layout"] == "shape" and sel["cv2_shape_summary"]["n_columns"] >= 1
+    assert "cv2_shape" not in sel["layout"]                   # the full record lives in layout_plan.json only
+    # consumable by the P7b geometry: one rung's states chain into a single connected graph
+    from gareus.adaptive.neighbour_rule import NeighbourPoint, chain_edges, components
+    from gareus.layout_plan import read_layout_plan
+    _raw, states = read_layout_plan(an / "layout_plan.json")
+    rung0 = [s for s in states if s.gamd_lambda == 0.0]
+    pts = [NeighbourPoint(s.center1, s.k1, s.center2, s.k2, 0.0) for s in rung0]
+    edges = chain_edges(pts)
+    assert len(components(len(pts), [(i, j) for i, j, _t, _d in edges])) == 1
 
 
 def test_two_accepted_components_on_one_bump_are_one_mode():

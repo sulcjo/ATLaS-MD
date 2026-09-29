@@ -695,7 +695,7 @@ def analyze_swarm_stage(out_dir, args) -> dict:
                                     f"{100 * max(shrink):.0f}% (coupling curvature {coupling:.1f} kcal/mol/CV^2 "
                                     f"at k2={max(ks2):.2f}); the CV1 overlap design assumed k1 alone")
                 selection.update({
-                    "layout": {k: v for k, v in layout.items() if k not in ("cells", "state_roles")},
+                    "layout": {k: v for k, v in layout.items() if k not in ("cells", "state_roles", "cv2_shape")},
                     "cv2_centers": [float(c) for c in centers2],
                     "cv2_k_kcal": [float(k) for k in ks2],
                     "cv2_per_rung_quantiles": {str(l): list(q) for l, q in cv2_design["per_rung_quantiles"].items()},
