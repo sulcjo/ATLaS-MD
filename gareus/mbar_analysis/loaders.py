@@ -20,7 +20,8 @@ from typing import Optional
 import numpy as np
 
 from gareus.units import KJ_PER_KCAL
-from .data import Data, clean, infer_temp_beta, rjson, read_windows, jvec, _fill_masked_nan
+from .data import (Data, clean, infer_temp_beta, rjson, read_windows, jvec,
+                   _fill_masked_nan, _apply_analysis_stride)
 from .loaders_adaptive import (
     _find_adaptive_epoch_dirs, _find_selfcontained_epoch_dirs,
     _find_adaptive_epoch_csv_sources, _has_epoch_csv_layout,
@@ -61,28 +62,43 @@ _ANALYSIS_VECTOR_KEYS = {
 }
 
 
+def _npz_member_shape_open(f, key: str):
+    """Read one compressed-NPZ member header without inflating its payload."""
+    zip_file = getattr(f, 'zip', None)
+    if zip_file is not None:
+        with zip_file.open(f'{key}.npy') as member:
+            major, minor = np.lib.format.read_magic(member)
+            reader = (np.lib.format.read_array_header_1_0
+                      if (major, minor) == (1, 0)
+                      else np.lib.format.read_array_header_2_0)
+            shape, _fortran, _dtype = reader(member)
+            return shape
+    arr = f[key]
+    return getattr(arr, 'shape', None)
+
+
 def _npz_sample_count_open(f) -> Optional[int]:
     for key in ('step', 'cv_A', 'window', 'replica'):
         if key in f.files:
-            arr = f[key]
-            if getattr(arr, 'ndim', 0) >= 1:
-                return int(arr.shape[0])
+            shape = _npz_member_shape_open(f, key)
+            if shape and len(shape) >= 1:
+                return int(shape[0])
     return None
 
 
 def _npz_window_count_open(f, n_samples: Optional[int]) -> Optional[int]:
     for key in ('umbrella_reduced_bias_nk', 'umbrella_bias_kcal_mol_nk', 'umbrella_bias_kj_mol_nk'):
         if key in f.files:
-            arr = f[key]
-            if getattr(arr, 'ndim', 0) == 2:
-                return int(arr.shape[1])
+            shape = _npz_member_shape_open(f, key)
+            if shape and len(shape) == 2:
+                return int(shape[1])
     if 'umbrella_reduced_bias_kn' in f.files and n_samples is not None:
-        arr = f['umbrella_reduced_bias_kn']
-        if getattr(arr, 'ndim', 0) == 2:
-            if arr.shape[0] == n_samples:
-                return int(arr.shape[1])
-            if arr.shape[1] == n_samples:
-                return int(arr.shape[0])
+        shape = _npz_member_shape_open(f, 'umbrella_reduced_bias_kn')
+        if shape and len(shape) == 2:
+            if shape[0] == n_samples:
+                return int(shape[1])
+            if shape[1] == n_samples:
+                return int(shape[0])
     return None
 
 
@@ -1039,7 +1055,8 @@ def _union_npz_older_than_samples(prod: Path, union_npz: Path) -> Optional[str]:
 def load_data(inp: Path, out: Optional[Path], source: str = 'auto', no_augment: bool = False,
               n_threads: int = 0, n_workers: int = 4,
               epoch_ids: Optional[set[int]] = None,
-              low_memory: bool = False) -> Data:
+              low_memory: bool = False, analysis_stride: int = 1,
+              analysis_stride_offset: int = 0) -> Data:
     prod=prod_dir_of(inp)
     # Adaptive-production: prefer new Parquet epoch data, fall back to legacy NPZ.
     if prod.name == 'adaptive_production':
@@ -1052,6 +1069,9 @@ def load_data(inp: Path, out: Optional[Path], source: str = 'auto', no_augment: 
         if low_memory and epoch_ids is None and union_npz.exists() and not _stale:
             prov_notes = check_union_npz_window_map_provenance(prod)
             d = load_union_npz(prod)
+            if analysis_stride > 1 or analysis_stride_offset > 0:
+                d = _apply_analysis_stride(d, analysis_stride, analysis_stride_offset)
+                d.meta['analysis_stride_applied_in_loader'] = True
             print('    [load] low-memory adaptive_union_mbar.npz snapshot')
             for _n in prov_notes:
                 print(f'    {_n}')
@@ -1066,7 +1086,8 @@ def load_data(inp: Path, out: Optional[Path], source: str = 'auto', no_augment: 
         if has_epoch_parquet:
             d = load_parquet_adaptive_union(
                 prod, n_threads=n_threads, n_workers=n_workers, epoch_ids=epoch_ids,
-                low_memory=low_memory)
+                low_memory=low_memory, analysis_stride=analysis_stride,
+                analysis_stride_offset=analysis_stride_offset)
         elif (prod / 'adaptive_union_mbar.npz').exists():
             if epoch_ids is not None:
                 raise ValueError(
