@@ -44,7 +44,7 @@ first level whose successor is not higher by more than its error is the
 plateau (else the last level with >= ``MIN_BLOCKS`` blocks, flagged
 ``plateau: False`` -- a lower bound). tau = (g - 1) / 2 in subsample frames,
 N_eff = n / g. An edge is graded only if both states have
-N_eff >= ``min_edge_neff`` (200); below it it is "unmeasured" and never weak.
+N_eff >= ``min_edge_neff`` (100, spec-T2 calibration); below it it is "unmeasured" and never weak.
 The decision uses a moving-block bootstrap (block length >= 2 tau, i.e.
 ceil(g), blocks never straddle a source), df re-solved per replicate, seeded
 from the edge's state ids: an edge is weak only if the UPPER 90 % quantile is
@@ -73,7 +73,8 @@ the lowest; the same rule as ``build_geometry_edges``). Edges:
   axis). Without these the same-pattern graph is 4 components per rung on
   chignolin_9 (anchor, CV1-only, CV2-only, 2D) by construction.
 
-The collector's own geometry edges (``primary_chain``, ``nearest_2d``) are
+The collector's own geometry edges (``primary_chain``, ``secondary_chain``, ``nearest_2d``;
+``pattern_link`` is cross-pattern and never weak) are
 graded too; graph edges they do not already contain are appended.
 
 Which edges can be WEAK (what the gate counts and the bridge proposer acts on):
@@ -122,7 +123,7 @@ from gareus.units import K_B_KJ_PER_MOL_K, KJ_PER_KCAL
 EDGE_METRICS = ("marginal", "pairwise-mbar")
 DEFAULT_EDGE_METRIC = "marginal"
 PAIRWISE_MBAR = "pairwise-mbar"
-DEFAULT_MIN_EDGE_NEFF = 200.0
+DEFAULT_MIN_EDGE_NEFF = 100.0
 N_BOOTSTRAP = 200
 BOOTSTRAP_QUANTILES = (0.10, 0.90)
 MIN_BLOCKS = 16

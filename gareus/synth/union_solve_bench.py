@@ -27,10 +27,14 @@ def _peak_rss_gb() -> float:
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0 ** 2   # Linux: KiB
 
 
-def bench(n_rows: int, n_centres: int = 59, landscape: str = "rugged-2d", seed: int = 0) -> dict:
+def bench(n_rows: int, n_centres: int = 59, landscape: str = "rugged-2d", seed: int = 0,
+          grid_side: int = 8) -> dict:
     from ..adaptive.union_diagnostics import union_diagnostics_from_npz
     ls = LANDSCAPES[landscape]
-    grid = [(float(a), float(b)) for a in np.linspace(0.05, 0.95, 8) for b in np.linspace(-0.9, 0.9, 8)]
+    grid = [(float(a), float(b)) for a in np.linspace(0.05, 0.95, grid_side)
+            for b in np.linspace(-0.9, 0.9, grid_side)]
+    if n_centres > len(grid):
+        raise ValueError(f"n_centres {n_centres} > grid_side^2 = {len(grid)}")
     windows = [Window(c1, T.K_WINDOW, c2, T.K_WINDOW, lam=lam) for c1, c2 in grid[:n_centres] for lam in T.RUNGS]
     edges, _nb, _rp, policy = T._layout(windows)
     per_state = max(1, n_rows // len(windows))
@@ -59,8 +63,9 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--n-rows", type=int, default=250_000)
     p.add_argument("--n-centres", type=int, default=59)
+    p.add_argument("--grid-side", type=int, default=8, help="centres drawn from a side x side grid")
     a = p.parse_args()
-    print(json.dumps(bench(a.n_rows, a.n_centres)))
+    print(json.dumps(bench(a.n_rows, a.n_centres, grid_side=a.grid_side)))
     return 0
 
 

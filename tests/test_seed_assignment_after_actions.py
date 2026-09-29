@@ -65,6 +65,6 @@ def test_a_missing_seed_bank_is_a_no_op(tmp_path):
 def test_the_epoch_loop_reassigns_seeds_after_applying_actions():
     import inspect
     src = inspect.getsource(ap.run_adaptive_production_auto_loop)
-    apply_at = src.index("_apply_registry_actions(registry, actions, epoch, policy=policy)")
+    apply_at = src.index("_apply_registry_actions(\n                registry, actions, epoch, policy=policy,")
     reassign_at = src.index("_reassign_seeds_after_actions(current_seed_bank, registry)")
     assert apply_at < reassign_at < src.index("_write_runtime_pool_reports(adaptive_dir, runtime_pool)", apply_at)

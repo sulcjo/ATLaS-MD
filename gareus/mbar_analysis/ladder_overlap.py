@@ -199,8 +199,16 @@ def ladder_overlap_by_axis(overlap, state_lambdas, centers,
     exercised directly by this module's own unit tests, which construct
     ``overlap`` by hand rather than from real per-sample MBAR data.
 
+    ``cv2_direction`` (spec P7b) is added when ``secondary_centers`` is given and some
+    state restrains CV2: pairs share a rung, a restraint pattern and a CV1 column (the
+    restrained CV1 centre; CV2-only states, whose CV1 is a placeholder, form one column of
+    their own) and are adjacent in sorted CV2 centre -- true neighbours, the same
+    adjacency the CV1 axis uses, never a radius (second neighbours would read "below
+    threshold" without being a gap). Its connectivity expects one component per column.
+    A CV1-only layout's summary keeps exactly the two keys it always had.
+
     Returns ``(summary, warnings)``. ``summary`` has one key per axis
-    (``lambda_direction``, ``cv1_direction``), each carrying the pairwise
+    (``lambda_direction``, ``cv1_direction``[, ``cv2_direction``]), each carrying the pairwise
     diagnostic (``pairs``, ``worst``, ``worst_pair``, ``n_pairs``) and the
     connectivity diagnostic (``n_components``, ``connected``,
     ``expected_components`` -- see ``_axis_connectivity``). ``warnings`` is a
@@ -307,6 +315,11 @@ def ladder_overlap_by_axis(overlap, state_lambdas, centers,
 
     lam_pairs = _chain_pairs(centre_key, lam)
     cv1_pairs = _chain_pairs(row_key, cen)
+    # CV2 direction: same rung, same pattern, same CV1 column (None for a CV2-only state).
+    col_key = [(_round_key(lam[i]), bool(on_cv1[i]), _round_key(cen[i]) if on_cv1[i] else None)
+               if on_cv2[i] else (None, None, None) for i in range(K)]
+    sec_sort = np.where(np.isfinite(sec), sec, 0.0)
+    cv2_pairs = _chain_pairs(col_key, sec_sort) if bool(np.any(on_cv2)) and secondary_centers is not None else None
 
     eligible = _eligible_mask(K, n_k)
     lam_summary = _summarise(lam_pairs)
@@ -315,7 +328,14 @@ def ladder_overlap_by_axis(overlap, state_lambdas, centers,
     cv1_nk = (np.asarray(n_k, dtype=np.float64).ravel()[:K] if n_k is not None and np.asarray(n_k).size >= K
               else np.ones(K)) * on_cv1
     cv1_summary.update(_axis_connectivity(K, cv1_pairs, row_key, eligible & on_cv1, thr, cv1_nk))
-    return {"lambda_direction": lam_summary, "cv1_direction": cv1_summary}, []
+    out = {"lambda_direction": lam_summary, "cv1_direction": cv1_summary}
+    if cv2_pairs is not None:
+        cv2_summary = _summarise(cv2_pairs)
+        cv2_nk = (np.asarray(n_k, dtype=np.float64).ravel()[:K] if n_k is not None and np.asarray(n_k).size >= K
+                  else np.ones(K)) * on_cv2
+        cv2_summary.update(_axis_connectivity(K, cv2_pairs, col_key, eligible & on_cv2, thr, cv2_nk))
+        out["cv2_direction"] = cv2_summary
+    return out, []
 
 
 def ladder_overlap_health_checks(lo: dict, thr: float) -> list:
@@ -349,8 +369,12 @@ def ladder_overlap_health_checks(lo: dict, thr: float) -> list:
     """
     from gareus_report import PASS, CAUTION, FAIL, NA, OVERLAP_FAIL_FRACTION
     checks = []
-    for axis_key, label in (("lambda_direction", "Overlap along λ"),
-                             ("cv1_direction", "Overlap across CV1")):
+    has_cv2 = "cv2_direction" in lo      # spec P7b: only when some state restrains CV2
+    overlap_axes = (("lambda_direction", "Overlap along λ"), ("cv1_direction", "Overlap across CV1")) + \
+        ((("cv2_direction", "Overlap across CV2"),) if has_cv2 else ())
+    connectivity_axes = (("lambda_direction", "Connectivity along λ"), ("cv1_direction", "Connectivity across CV1")) + \
+        ((("cv2_direction", "Connectivity across CV2"),) if has_cv2 else ())
+    for axis_key, label in overlap_axes:
         ax = lo[axis_key]
         if ax.get("worst") is None:
             status, detail = NA, "no adjacent pairs on this axis"
@@ -359,8 +383,7 @@ def ladder_overlap_health_checks(lo: dict, thr: float) -> list:
             status = FAIL if w < OVERLAP_FAIL_FRACTION * thr else (CAUTION if w < thr else PASS)
             detail = f"worst {w:.3f} (states {a}-{b})"
         checks.append({"name": label, "status": status, "detail": detail})
-    for axis_key, label in (("lambda_direction", "Connectivity along λ"),
-                            ("cv1_direction", "Connectivity across CV1")):
+    for axis_key, label in connectivity_axes:
         ax = lo[axis_key]
         n_comp = ax.get("n_components") or 0
         connected = ax.get("connected")

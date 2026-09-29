@@ -163,6 +163,22 @@ def slow_cv2_double_branch() -> Landscape:
                      basins=((0.5, -0.6), (0.5, 0.6)))
 
 
+def slow_cv2_double_branch_asym(tilt: float = 1.5) -> Landscape:
+    """``slow-cv2-double-branch`` plus a linear CV2 tilt: the + branch sits ~1.8 kBT higher.
+
+    The symmetric original cannot expose a disconnected MBAR in the branch free energy (a
+    solve started at f = 0 is right by symmetry); this one can.
+    """
+    base = slow_cv2_double_branch()
+    b = float(tilt)
+
+    def f(cv1, cv2):
+        return base.energy(cv1, cv2) + b * np.asarray(cv2, float)
+
+    return Landscape("slow-cv2-double-branch-asym", f, (0.0, 1.0), (-1.0, 1.0),
+                     basins=((0.5, -0.6), (0.5, 0.6)))
+
+
 def rugged_1d() -> Landscape:
     """Rugged 6-basin CV1 profile with a large barrier, plus a mild fast CV2 well.
 
@@ -308,13 +324,191 @@ def harmonic_bowl() -> Landscape:
     return Landscape("harmonic-bowl", f, (0.0, 1.0), (-1.0, 1.0), basins=((0.5, 0.0),))
 
 
+def stiff_bowl(cv2_curvature: float = 400.0) -> Landscape:
+    """Harmonic bowl whose CV2 curvature F''_2 (kBT/CV^2) is far above any deployed k2.
+
+    The landscape, not the restraint, sets the CV2 width, so every CV2 window samples the
+    same narrow band around 0: windows overlap strongly and nothing needs resolution
+    (spec T1/T2: zero actions expected).
+    """
+    k2 = float(cv2_curvature)
+
+    def f(cv1, cv2):
+        return 0.5 * ((np.asarray(cv1, float) - 0.5) / 0.5) ** 2 + 0.5 * k2 * np.asarray(cv2, float) ** 2
+
+    return Landscape("stiff-bowl", f, (0.0, 1.0), (-1.0, 1.0), basins=((0.5, 0.0),))
+
+
+SHOULDER_WIDE_SD = 0.71
+SHOULDER_NARROW_SD = 0.15
+SHOULDER_NARROW_WEIGHT = 0.20
+SHOULDER_CV1_ONSET = 0.75
+
+
+def _shoulder_mix(cv1):
+    """Fraction of the high-CV1 mixture at CV1 (smooth onset at SHOULDER_CV1_ONSET)."""
+    return 1.0 / (1.0 + np.exp(-(np.asarray(cv1, float) - SHOULDER_CV1_ONSET) / 0.03))
+
+
+def shoulder_narrow_mean(cv1):
+    """Mean of the narrow CV2 band: 1.2 at the onset rising to 1.6 at CV1 = 1."""
+    t = np.clip((np.asarray(cv1, float) - SHOULDER_CV1_ONSET) / (1.0 - SHOULDER_CV1_ONSET), 0.0, 1.0)
+    return 1.2 + 0.4 * t
+
+
+def shoulder_conditional_cv2_density(cv1, cv2):
+    """Normalised conditional p(cv2 | cv1) of the shoulder landscape (on the real line)."""
+    cv1 = np.asarray(cv1, float)
+    cv2 = np.asarray(cv2, float)
+
+    def npdf(x, m, s):
+        return np.exp(-0.5 * ((x - m) / s) ** 2) / (s * np.sqrt(2.0 * np.pi))
+
+    wide = npdf(cv2, 0.0, SHOULDER_WIDE_SD)
+    narrow = npdf(cv2, shoulder_narrow_mean(cv1), SHOULDER_NARROW_SD)
+    high = (1.0 - SHOULDER_NARROW_WEIGHT) * wide + SHOULDER_NARROW_WEIGHT * narrow
+    s = _shoulder_mix(cv1)
+    return (1.0 - s) * wide + s * high
+
+
+def narrow_cv2_band_at_high_cv1() -> Landscape:
+    """Shoulder geometry of the spec (Section 1 motivation, T1 shape-layout case).
+
+    Along CV2: N(0, 0.71) at low CV1; at high CV1 (>= 0.75, smooth onset) a mixture
+    80 % N(0, 0.71) + 20 % N(mu, 0.15) with mu rising 1.2 -> 1.6 as CV1 goes 0.75 -> 1.
+    CV1 carries a gentle well so the CV1 marginal is smooth. CV2 domain [-2.5, 2.5]
+    (the wide component's 3.5 sd).
+    """
+    def f(cv1, cv2):
+        cv1 = np.asarray(cv1, float)
+        p = shoulder_conditional_cv2_density(cv1, cv2)
+        return -np.log(np.clip(p, 1e-300, None)) + 0.5 * ((cv1 - 0.55) / 0.35) ** 2
+
+    return Landscape("narrow-cv2-band-at-high-cv1", f, (0.0, 1.0), (-2.5, 2.5),
+                     basins=((0.5, 0.0), (0.9, 1.5)))
+
+
+PLATEAU_HALF_WIDTH = 0.6
+PLATEAU_WALL_CURVATURE = 2000.0
+
+
+def plateau_walls() -> Landscape:
+    """Flat CV2 plateau on [-0.6, 0.6] between hard (quadratic, 2000 kBT/CV^2) walls.
+
+    Windows at the walls are confined by the landscape (sampled sd << sigma_w), which the
+    spec treats as a diagnostic, never a trigger: zero actions expected.
+    """
+    a = PLATEAU_HALF_WIDTH
+    kw = PLATEAU_WALL_CURVATURE
+
+    def f(cv1, cv2):
+        cv1 = np.asarray(cv1, float)
+        cv2 = np.asarray(cv2, float)
+        excess = np.maximum(0.0, np.abs(cv2) - a)
+        return 0.5 * kw * excess ** 2 + 0.5 * ((cv1 - 0.5) / 0.4) ** 2
+
+    return Landscape("plateau-walls", f, (0.0, 1.0), (-1.0, 1.0), basins=((0.5, 0.0),))
+
+
+def coupled_tilt(slope: float, *, cv1_curvature: float = 16.0, cv2_curvature: float = 60.0) -> Landscape:
+    """CV2 = y + slope * (cv1 - 0.5) with y independent of CV1 (spec 3.4 coupling construction).
+
+    In (cv1, cv2) coordinates (a unit-Jacobian shear of (x, y)):
+    F = 0.5 F''_1 (cv1 - 0.5)^2 + 0.5 F''_y (cv2 - slope (cv1 - 0.5))^2.  A CV2 umbrella of
+    stiffness k2 then adds slope^2 k2 F''_y / (k2 + F''_y) of curvature along CV1 (the
+    spec's k2 (dz/dc)^2 is the F''_y -> infinity upper bound), so dz/dc = slope exactly.
+    """
+    a = float(slope)
+    f1 = float(cv1_curvature)
+    fy = float(cv2_curvature)
+
+    def f(cv1, cv2):
+        c = np.asarray(cv1, float) - 0.5
+        z = np.asarray(cv2, float)
+        return 0.5 * f1 * c ** 2 + 0.5 * fy * (z - a * c) ** 2
+
+    return Landscape(f"coupled-tilt-{a:g}", f, (0.0, 1.0), (-1.5, 1.5), basins=((0.5, 0.0),))
+
+
+@dataclass(frozen=True)
+class Landscape3D:
+    """A 3D analytic surface ``F(cv1, cv2, cv3)`` in kBT; windows restrain cv1 and cv2 only."""
+
+    name: str
+    f: Callable[[np.ndarray, np.ndarray, np.ndarray], np.ndarray]
+    bounds: tuple[tuple[float, float], tuple[float, float], tuple[float, float]]
+    hidden_split: float = 0.0     # cv3 value separating the two hidden states (the barrier top)
+
+    @property
+    def cv1_bounds(self):
+        return self.bounds[0]
+
+    @property
+    def cv2_bounds(self):
+        return self.bounds[1]
+
+    def energy(self, cv1, cv2, cv3) -> np.ndarray:
+        return np.asarray(self.f(np.asarray(cv1, float), np.asarray(cv2, float), np.asarray(cv3, float)), float)
+
+    def grid(self, res: int = 60):
+        axes = [np.linspace(lo, hi, res) for lo, hi in self.bounds]
+        g = np.meshgrid(*axes, indexing="ij")
+        f = self.energy(*g)
+        return axes, f - float(np.min(f))
+
+    def marginal_2d(self, res: int = 60):
+        """(cv1 axis, cv2 axis, F(cv1, cv2) min-shifted) by integrating cv3 out on the grid."""
+        axes, f = self.grid(res)
+        from scipy.special import logsumexp
+        f2 = -logsumexp(-f, axis=2)
+        return axes[0], axes[1], f2 - float(np.min(f2))
+
+
+HIDDEN_CV3_BARRIER = 7.0
+HIDDEN_CV3_PROJECTION = 0.45      # cv2 mean shift per unit cv3 (bimodal projection onto CV2)
+HIDDEN_CV3_CV2_CURVATURE = 40.0   # kBT/CV^2 of cv2 about b * cv3 (sd 0.16)
+HIDDEN_CV3_TILT = 3.0             # cv1-dependent asymmetry of the two hidden states
+
+
+def hidden_slow_cv3(projection: float = HIDDEN_CV3_PROJECTION, tilt: float = HIDDEN_CV3_TILT,
+                    name: str = "hidden-slow-cv3") -> Landscape3D:
+    """3D landscape with a hidden slow CV3 that projects bimodally onto CV2 (spec T2 / X3).
+
+    cv3 is a symmetric double well (minima +-1, 7 kBT barrier) tilted by
+    3 (cv1 - 0.5) cv3, so which hidden state is favoured depends on CV1; cv2 sits at
+    0.45 cv3 +- 0.16, so the two hidden states project onto CV2 as two modes 0.9 apart
+    (``projection`` / ``tilt`` override the 0.45 / 3).
+    CV1 carries a gentle well. Run with a small D3 so cv3 is the slowest motion.
+    """
+    def f(cv1, cv2, cv3):
+        cv1 = np.asarray(cv1, float)
+        cv2 = np.asarray(cv2, float)
+        cv3 = np.asarray(cv3, float)
+        dw = HIDDEN_CV3_BARRIER * (cv3 ** 2 - 1.0) ** 2 + float(tilt) * (cv1 - 0.5) * cv3
+        proj = 0.5 * HIDDEN_CV3_CV2_CURVATURE * (cv2 - float(projection) * cv3) ** 2
+        return dw + proj + 0.5 * ((cv1 - 0.5) / 0.3) ** 2
+
+    return Landscape3D(name, f, ((0.0, 1.0), (-1.0, 1.0), (-2.0, 2.0)), hidden_split=0.0)
+
+
 LANDSCAPES: dict[str, Landscape] = {
     "mixture-wells": mixture_wells(),
     "gated-barrier": gated_barrier(),
     "banana-valley": banana_valley(),
     "slow-cv2-double-branch": slow_cv2_double_branch(),
+    "slow-cv2-double-branch-asym": slow_cv2_double_branch_asym(),
     "rugged-1d": rugged_1d(),
     "rugged-2d": rugged_2d(),
     "chaos-2d": chaos_2d(),
     "harmonic-bowl": harmonic_bowl(),
+    "stiff-bowl": stiff_bowl(),
+    "narrow-cv2-band-at-high-cv1": narrow_cv2_band_at_high_cv1(),
+    "plateau-walls": plateau_walls(),
+}
+
+LANDSCAPES_3D: dict[str, Landscape3D] = {
+    "hidden-slow-cv3": hidden_slow_cv3(),
+    # weaker projection/tilt: most windows are two-sided in equilibrium, so a one-sided window
+    # is (mostly) a trapped one -- the case X3 is designed for
+    "hidden-slow-cv3-weak": hidden_slow_cv3(projection=0.2, tilt=1.5, name="hidden-slow-cv3-weak"),
 }

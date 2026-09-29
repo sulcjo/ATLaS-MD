@@ -24,15 +24,31 @@ from scipy.stats import norm
 from gareus.mbar_analysis.ladder import pairwise_state_overlap as _pair_overlap
 
 MIN_HALF = 20
-# Peak memory of union_diagnostics_from_npz per rows x states float64 cell, measured
-# with gareus.synth.union_solve_bench at 236 states: 1,000,000 rows peaked at 14.6 GB
-# RSS (1e6 x 236 x 8 B = 1.888 GB -> 7.7x); 250,000 rows at 4.06 GB (est. 3.6 GB).
+# Peak memory of union_diagnostics_from_npz = a fixed part + a per (rows x states) float64
+# cell part, measured with gareus.synth.union_solve_bench: 1,000,000 rows x 236 states
+# peaked at 14.6 GB RSS (1e6 x 236 x 8 B = 1.888 GB -> 7.7x). The spec-T2 sweep
+# (docs/superpowers/specs/2026-09-29-adaptive-cv2-validation/t2_synthetic.md Section 6,
+# 60-400 states at 100k/250k rows) fits ~0.8 GB + 55-58 B/cell; with the cell term alone
+# the estimate was 28-106 % low at 100k rows. The per-cell constant is kept at the 1M-row
+# bench's 61.6 B and the fixed term set to 0.9 GB, which covers every measured point
+# (the largest intercept they need is 0.81 GB, 320 states x 100k rows) -- conservative, so the guard trips early
+# rather than late: at the 8 GB default it now allows ~488k kept rows at 236 states
+# (was ~550k).
 UNION_PEAK_BYTES_PER_CELL = 8.0 * 7.7
+UNION_PEAK_FIXED_GB = 0.9
 
 
 def estimate_union_diagnostics_peak_gb(n_rows: int, n_states: int) -> float:
     """Estimated peak RSS (GB) of the per-epoch union diagnostics for ``n_rows`` kept rows."""
-    return float(n_rows) * float(n_states) * UNION_PEAK_BYTES_PER_CELL / 1e9
+    return UNION_PEAK_FIXED_GB + float(n_rows) * float(n_states) * UNION_PEAK_BYTES_PER_CELL / 1e9
+
+
+def max_union_rows_under_guard(max_gb: float, n_states: int) -> int:
+    """Largest kept-row count whose estimated peak stays within ``max_gb`` (0 if none)."""
+    budget = float(max_gb) - UNION_PEAK_FIXED_GB
+    if budget <= 0.0 or int(n_states) <= 0:
+        return 0
+    return int(math.floor(budget * 1e9 / (float(n_states) * UNION_PEAK_BYTES_PER_CELL)))
 
 
 @dataclass(frozen=True)

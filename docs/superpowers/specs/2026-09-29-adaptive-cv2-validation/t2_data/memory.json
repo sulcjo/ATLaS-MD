@@ -1,0 +1,90 @@
+[
+ {
+  "n_states": 60,
+  "n_rows": 99960,
+  "wall_s": 3.54,
+  "peak_rss_gb_before_call": 0.18,
+  "peak_rss_gb_after_call": 0.76,
+  "solved": true,
+  "estimated_peak_gb": 0.37,
+  "measured_over_estimate": 2.06,
+  "guard_max_rows_at_8gb": 2164502
+ },
+ {
+  "n_states": 120,
+  "n_rows": 99960,
+  "wall_s": 6.75,
+  "peak_rss_gb_before_call": 0.22,
+  "peak_rss_gb_after_call": 1.12,
+  "solved": true,
+  "estimated_peak_gb": 0.74,
+  "measured_over_estimate": 1.52,
+  "guard_max_rows_at_8gb": 1082251
+ },
+ {
+  "n_states": 236,
+  "n_rows": 99828,
+  "wall_s": 18.82,
+  "peak_rss_gb_before_call": 0.31,
+  "peak_rss_gb_after_call": 2.09,
+  "solved": true,
+  "estimated_peak_gb": 1.45,
+  "measured_over_estimate": 1.44,
+  "guard_max_rows_at_8gb": 550297
+ },
+ {
+  "n_states": 272,
+  "n_rows": 99824,
+  "wall_s": 17.57,
+  "peak_rss_gb_before_call": 0.34,
+  "peak_rss_gb_after_call": 2.4,
+  "solved": true,
+  "estimated_peak_gb": 1.67,
+  "measured_over_estimate": 1.43,
+  "guard_max_rows_at_8gb": 477463
+ },
+ {
+  "n_states": 320,
+  "n_rows": 99840,
+  "wall_s": 25.79,
+  "peak_rss_gb_before_call": 0.37,
+  "peak_rss_gb_after_call": 2.78,
+  "solved": true,
+  "estimated_peak_gb": 1.97,
+  "measured_over_estimate": 1.41,
+  "guard_max_rows_at_8gb": 405844
+ },
+ {
+  "n_states": 400,
+  "n_rows": 100000,
+  "wall_s": 33.2,
+  "peak_rss_gb_before_call": 0.43,
+  "peak_rss_gb_after_call": 3.15,
+  "solved": true,
+  "estimated_peak_gb": 2.46,
+  "measured_over_estimate": 1.28,
+  "guard_max_rows_at_8gb": 324675
+ },
+ {
+  "n_states": 236,
+  "n_rows": 249924,
+  "wall_s": 46.18,
+  "peak_rss_gb_before_call": 0.58,
+  "peak_rss_gb_after_call": 4.03,
+  "solved": true,
+  "estimated_peak_gb": 3.63,
+  "measured_over_estimate": 1.11,
+  "guard_max_rows_at_8gb": 550297
+ },
+ {
+  "n_states": 400,
+  "n_rows": 250000,
+  "wall_s": 80.58,
+  "peak_rss_gb_before_call": 0.88,
+  "peak_rss_gb_after_call": 6.61,
+  "solved": true,
+  "estimated_peak_gb": 6.16,
+  "measured_over_estimate": 1.07,
+  "guard_max_rows_at_8gb": 324675
+ }
+]

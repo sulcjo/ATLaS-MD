@@ -44,11 +44,16 @@ def _finite(value: object) -> Optional[float]:
 
 
 def _restrained_mask(k: Sequence[float], n: int) -> np.ndarray:
-    """Unknown k counts as restrained: only a recorded 0 takes a window off an axis."""
+    """Unknown k (None / NaN / missing) counts as restrained; a recorded k <= 0 does not.
+
+    Spec P6 / P7b: a negative k used to count as restrained here, unlike the driver's
+    ``_axis_restrained`` and ``neighbour_rule``; no writer records one, so real layouts are
+    unchanged.
+    """
     out = np.ones(n, dtype=bool)
     for w in range(min(n, len(k))):
         value = _finite(k[w])
-        if value is not None and value == 0.0:
+        if value is not None and value <= 0.0:
             out[w] = False
     return out
 
@@ -111,9 +116,50 @@ def spatial_neighbour_pairs(
     k1: Sequence[float],
     k2: Sequence[float],
     temperature_k: float,
+    rule: str = "legacy",
 ) -> list[tuple[int, int]]:
-    """`(a, b)` with a < b for every nearest-neighbour pair on the same rung."""
+    """`(a, b)` with a < b for every nearest-neighbour pair on the same rung.
+
+    ``rule="legacy"`` (default): nearest + ``NEIGHBOUR_SLACK`` in global-median widths, as
+    before. ``rule="restraint-width"`` (spec P7b, ``--layout-neighbour-rule``): the P7a rule
+    (``p7a_spatial_neighbour_pairs``).
+    """
+    if rule == "restraint-width":
+        return p7a_spatial_neighbour_pairs(centers, secondary_centers, lambdas, k1, k2, temperature_k)
+    if rule != "legacy":
+        raise ValueError(f"unknown layout neighbour rule {rule!r}")
     return _pairs_from_layout(*_layout(centers, secondary_centers, lambdas, k1, k2, temperature_k))
+
+
+def p7a_spatial_neighbour_pairs(centers, secondary_centers, lambdas, k1, k2, temperature_k: float,
+                                radius: Optional[float] = None) -> list[tuple[int, int]]:
+    """Same-rung, same-pattern pairs within the P7a restraint-width radius (spec P7a/P7b).
+
+    Each axis is normalised by the pair's own sqrt(sigma_a^2 + sigma_b^2); an axis with a
+    recorded k <= 0 is unrestrained and its placeholder centre is never read; a k not
+    recorded (None / NaN) takes ``neighbour_rule.fallback_axis_sigmas`` (median recorded width,
+    else median centre spacing). Fully unrestrained windows have no spatial partners.
+    """
+    from .adaptive.neighbour_rule import DEFAULT_RADIUS, NeighbourPoint, fallback_axis_sigmas, neighbour_pairs
+    n = min(len(centers), len(secondary_centers))
+
+    def _at(seq, w):
+        return seq[w] if w < len(seq) else None
+
+    def _k(value):
+        v = _finite(value)
+        return v                                   # None = not recorded (restrained, width unknown)
+
+    points = []
+    for w in range(n):
+        kk1, kk2 = _k(_at(k1, w)), _k(_at(k2, w))
+        c2 = _finite(_at(secondary_centers, w))
+        points.append(NeighbourPoint(primary_center=float(centers[w]), primary_k=kk1,
+                                     secondary_center=c2, secondary_k=kk2, rung=_finite(_at(lambdas, w))))
+    fallback, _src = fallback_axis_sigmas(points, temperature_k)
+    return [(int(a), int(b)) for a, b in neighbour_pairs(points, temperature_k,
+                                                          DEFAULT_RADIUS if radius is None else float(radius),
+                                                          fallback_sigma=fallback)]
 
 
 def overlap_by_pair_2d(
@@ -196,5 +242,5 @@ def other_rung_same_centre(centers, secondary_centers, lambdas) -> dict:
     return out
 
 
-__all__ = ["NEIGHBOUR_SLACK", "best_neighbour_overlaps", "overlap_by_pair_2d",
+__all__ = ["NEIGHBOUR_SLACK", "best_neighbour_overlaps", "overlap_by_pair_2d", "p7a_spatial_neighbour_pairs",
            "spatial_neighbour_pairs", "same_rung_neighbours", "other_rung_same_centre"]

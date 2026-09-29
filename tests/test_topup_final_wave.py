@@ -266,10 +266,30 @@ def test_the_driver_logs_structural_edges_and_saves_them(tmp_path, monkeypatch, 
 
 # ---- memory guard: an oversized per-epoch union is skipped, not OOM-killed ----
 
-def test_the_peak_estimate_reproduces_the_bench():
+# Measured peaks (GB) from T2 (docs/superpowers/specs/2026-09-29-adaptive-cv2-validation/
+# t2_synthetic.md Section 6) plus the original 1M x 236 bench: (states, kept rows, peak).
+_MEASURED_UNION_PEAKS = [(60, 100_000, 0.76), (120, 100_000, 1.12), (236, 100_000, 2.09),
+                         (272, 100_000, 2.40), (320, 100_000, 2.78), (400, 100_000, 3.15),
+                         (236, 250_000, 4.03), (400, 250_000, 6.61), (236, 1_000_000, 14.6)]
+
+
+def test_the_peak_estimate_never_underestimates_a_measured_peak():
     from gareus.adaptive.union_diagnostics import estimate_union_diagnostics_peak_gb
-    assert abs(estimate_union_diagnostics_peak_gb(1_000_000, 236) - 14.6) < 0.2
-    assert estimate_union_diagnostics_peak_gb(250_000, 236) < 4.06
+    for n_states, n_rows, peak in _MEASURED_UNION_PEAKS:
+        est = estimate_union_diagnostics_peak_gb(n_rows, n_states)
+        assert est >= peak, (n_states, n_rows, est, peak)
+        # conservative, not wildly so: within 1 GB of the largest measured peak
+        assert est - peak < 1.0, (n_states, n_rows, est, peak)
+
+
+def test_the_peak_estimate_has_a_fixed_term_and_the_guard_row_limit_inverts_it():
+    from gareus.adaptive.union_diagnostics import (UNION_PEAK_FIXED_GB, estimate_union_diagnostics_peak_gb,
+                                                   max_union_rows_under_guard)
+    assert estimate_union_diagnostics_peak_gb(0, 236) == pytest.approx(UNION_PEAK_FIXED_GB)
+    assert UNION_PEAK_FIXED_GB >= 0.81          # the largest intercept the T2 points need
+    n = max_union_rows_under_guard(8.0, 236)
+    assert estimate_union_diagnostics_peak_gb(n, 236) <= 8.0 < estimate_union_diagnostics_peak_gb(n + 1, 236)
+    assert max_union_rows_under_guard(0.1, 236) == 0
 
 
 def test_the_real_builder_calls_the_guard_with_kept_rows_before_the_matrices(tmp_path):
@@ -296,7 +316,7 @@ def test_an_oversized_union_skips_the_plan_with_no_diagnostics_and_warns(tmp_pat
     assert policy.topup_diagnostics_max_gb == 8.0
 
     def _builder(*a, size_guard=None, **k):
-        size_guard(1_000_000, 236)                      # ~14.5 GB at the bench's scale
+        size_guard(1_000_000, 236)                      # ~15.4 GB estimated (14.6 GB measured)
         raise AssertionError("the guard must stop the build")
 
     monkeypatch.setattr(ap, "build_union_state_mbar_inputs", _builder)
@@ -304,7 +324,7 @@ def test_an_oversized_union_skips_the_plan_with_no_diagnostics_and_warns(tmp_pat
     with caplog.at_level(logging.WARNING):
         plan = ap._topup_plan_for_phase(args, adaptive / "epoch_001", reg, policy, full_steps=20_000)
     assert plan.reason == "no_diagnostics"
-    assert "14.5 GB" in caplog.text and "--ap-topup-diagnostics-max-gb 8.0" in caplog.text
+    assert "15.4 GB" in caplog.text and "--ap-topup-diagnostics-max-gb 8.0" in caplog.text
 
 
 def test_the_guard_passes_a_union_under_the_limit():

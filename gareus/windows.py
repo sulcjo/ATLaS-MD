@@ -61,6 +61,8 @@ __all__ = [
     "expand_windows_for_secondary_cv",
     "set_window",
     "build_explicit_2d_neighbor_edges",
+    "layout_neighbour_rule",
+    "restraint_width_neighbor_edges",
     "build_delaunay_windows_from_pilot_samples",
     "estimate_terminal_cv_envelope_a",
     "run_cv_boundary_pulls",
@@ -1443,20 +1445,46 @@ def load_explicit_2d_window_csv(args, path: Path) -> tuple[np.ndarray, list[floa
     _plan_path = Path(path).parent / "layout_plan.json"
     if _plan_path.exists():
         try:
-            _plan = json.loads(_plan_path.read_text(encoding="utf-8"))
-            _states = list(_plan.get("states") or [])
+            from .layout_plan import read_layout_plan, schema_version
+            _plan, _states = read_layout_plan(_plan_path)
             if _states and len(_states) == len(window_metadata.get("gamd_lambdas", [])):
-                window_metadata["state_roles"] = [s.get("role") for s in _states]
-                window_metadata["mandatory_window_indices"] = [int(s["state_id"]) for s in _states if s.get("mandatory")]
+                window_metadata["state_roles"] = [s.role for s in _states]
+                window_metadata["mandatory_window_indices"] = [int(s.state_id) for s in _states if s.mandatory]
+                window_metadata["state_regions"] = [s.region for s in _states]
                 window_metadata["layout_plan_path"] = str(_plan_path)
+                window_metadata["layout_plan_schema_version"] = int(schema_version(_plan))
         except (OSError, ValueError, KeyError, TypeError) as exc:
             print(f"WARNING: layout_plan.json beside {path} could not be read ({exc!r}); mandatory-state guards inactive")
 
     return centers_arr, [float(x) for x in k_list], sec_arr, sec_k, secondary_metadata, window_metadata
 
 
-def build_explicit_2d_neighbor_edges(centers_a, secondary_cv_centers, args=None) -> list[dict]:
-    """Build a conservative geometry graph for explicit sparse 2D windows."""
+LAYOUT_NEIGHBOUR_RULES = ("legacy", "restraint-width")
+
+
+def layout_neighbour_rule(args) -> str:
+    """The layout neighbour rule a run uses (``--layout-neighbour-rule``; spec P7b).
+
+    ``legacy`` (default): today's exchange graph and top-up partners, unchanged. ``restraint-
+    width``: the P7a rule (``gareus.adaptive.neighbour_rule``). Adaptive campaigns freeze it
+    with their decision settings (``AdaptiveDecisionPolicy.layout_neighbour_rule``), so a
+    deploy never changes a live campaign's exchange graph.
+    """
+    rule = str(getattr(args, "layout_neighbour_rule", "legacy") or "legacy") if args is not None else "legacy"
+    if rule not in LAYOUT_NEIGHBOUR_RULES:
+        raise ValueError(f"unknown layout neighbour rule {rule!r} (choices {LAYOUT_NEIGHBOUR_RULES})")
+    return rule
+
+
+def build_explicit_2d_neighbor_edges(centers_a, secondary_cv_centers, args=None, *, k1=None, k2=None,
+                                     lambdas=None) -> list[dict]:
+    """Build a conservative geometry graph for explicit sparse 2D windows.
+
+    Under ``--layout-neighbour-rule restraint-width`` (spec P7b) the graph is
+    ``restraint_width_neighbor_edges`` instead (needs the per-window ``k1``/``k2`` and rung
+    ``lambdas``; missing k falls back as P7a's open point is resolved there). The default
+    ``legacy`` rule below is unchanged byte for byte and ignores the extra arguments.
+    """
     centers = np.asarray(centers_a, dtype=float)
     secondary = np.asarray(secondary_cv_centers, dtype=float) if secondary_cv_centers is not None else None
     n = int(len(centers))
@@ -1464,6 +1492,8 @@ def build_explicit_2d_neighbor_edges(centers_a, secondary_cv_centers, args=None)
         return []
     if secondary is None or len(secondary) != n:
         return [{"wi": i, "wj": i + 1, "edge_type": "linear_neighbor", "normalized_distance": 1.0} for i in range(n - 1)]
+    if layout_neighbour_rule(args) == "restraint-width":
+        return restraint_width_neighbor_edges(centers, secondary, k1=k1, k2=k2, lambdas=lambdas, args=args)
 
     d_scale = _positive_spacing_scale(centers, fallback=max(1.0, float(np.nanmax(centers) - np.nanmin(centers)) if n > 1 else 1.0))
     s_scale = _positive_spacing_scale(secondary, fallback=0.25 if secondary_cv_is_transition(getattr(args, "secondary_cv", "none")) else 0.15)
@@ -1575,6 +1605,112 @@ def build_explicit_2d_neighbor_edges(centers_a, secondary_cv_centers, args=None)
 
     out = list(edges.values())
     out.sort(key=lambda r: (float(r.get("normalized_distance", float("inf"))), int(r["wi"]), int(r["wj"]), str(r.get("edge_type", ""))))
+    return out
+
+
+def _per_window(values, n: int) -> list:
+    if values is None:
+        return [None] * n
+    vals = list(values)
+    return vals if len(vals) == n else [None] * n
+
+
+def restraint_width_neighbor_edges(centers, secondary, *, k1=None, k2=None, lambdas=None, args=None,
+                                   temperature_k: Optional[float] = None) -> list[dict]:
+    """The P7a exchange graph for explicit 2D windows (spec P7b), same edge-dict format.
+
+    Per rung (same ``gamd_lambda``):
+
+    * ``p7a_neighbor``: every same-pattern pair within ``neighbour_rule.DEFAULT_RADIUS`` of the
+      per-pair restraint-width distance (placeholders never read, P6);
+    * the true-neighbour chains of ``neighbour_rule.chain_edges`` (``primary_chain``,
+      ``secondary_chain``, ``nearest_2d``, ``pattern_link``), so adjacent windows are attempted
+      even across a gap wider than the radius and every restraint pattern -- the unrestrained
+      anchor included -- stays connected;
+
+    plus ``lambda_neighbor`` between adjacent rungs of one centre (same restraint pattern and
+    restrained centres): P7a pairs one rung only, so without these a replica would never move
+    along the ladder. Anything still separate is joined by ``connectivity_bridge`` (lowest
+    window indices). ``normalized_distance`` is the P7a distance (NaN where no restrained axis
+    is shared). k not recorded (NaN / None): ``neighbour_rule.fallback_axis_sigmas``.
+    """
+    from .adaptive.neighbour_rule import (DEFAULT_RADIUS, NeighbourPoint, chain_edges, fallback_axis_sigmas,
+                                          neighbour_pairs, pair_distance)
+    n = int(len(centers))
+    k1s, k2s = _per_window(k1, n), _per_window(k2, n)
+    lams = _per_window(lambdas if lambdas is not None else getattr(args, "state_gamd_lambdas", None), n)
+    temperature = float(temperature_k if temperature_k is not None else getattr(args, "temperature_k", 300.0) or 300.0)
+
+    def _k(v):
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        return f if math.isfinite(f) else None
+
+    points = [NeighbourPoint(primary_center=float(centers[w]), primary_k=_k(k1s[w]),
+                             secondary_center=float(secondary[w]) if math.isfinite(float(secondary[w])) else None,
+                             secondary_k=_k(k2s[w]), rung=_k(lams[w])) for w in range(n)]
+    fallback, _src = fallback_axis_sigmas(points, temperature)
+    edges: dict[tuple[int, int], dict] = {}
+
+    def add_edge(i: int, j: int, edge_type: str) -> None:
+        if i == j:
+            return
+        a, b = sorted((int(i), int(j)))
+        nd = pair_distance(points[a], points[b], temperature, fallback_sigma=fallback)
+        nd = float(nd) if math.isfinite(nd) else float("nan")
+        row = edges.get((a, b))
+        if row is None:
+            edges[(a, b)] = {"wi": a, "wj": b, "edge_type": str(edge_type), "normalized_distance": nd}
+        else:
+            types = set(str(row.get("edge_type", "")).split("+"))
+            types.add(str(edge_type))
+            row["edge_type"] = "+".join(sorted(t for t in types if t))
+
+    rungs: dict = {}
+    for w, p in enumerate(points):
+        rungs.setdefault(p.rung_key(), []).append(w)
+    for _rung, members in sorted(rungs.items(), key=lambda kv: (kv[0] is None, kv[0] or 0.0)):
+        sub = [points[w] for w in members]
+        for i, j in neighbour_pairs(sub, temperature, DEFAULT_RADIUS, fallback_sigma=fallback):
+            add_edge(members[i], members[j], "p7a_neighbor")
+        for i, j, etype, _d in chain_edges(sub, ids=members):
+            add_edge(members[i], members[j], etype)
+    # lambda_neighbor: adjacent rungs of one centre (restrained axes only identify a centre)
+    centre_groups: dict = {}
+    for w, p in enumerate(points):
+        if p.rung_key() is None:
+            continue
+        on1, on2 = p.pattern
+        key = (p.pattern, round(p.primary_center, 6) if on1 else None,
+               round(p.secondary_center, 6) if on2 and p.secondary_center is not None else None)
+        centre_groups.setdefault(key, []).append(w)
+    for members in centre_groups.values():
+        members = sorted(members, key=lambda w: (points[w].rung_key(), w))
+        for lo, hi in zip(members[:-1], members[1:]):
+            if points[hi].rung_key() != points[lo].rung_key():
+                add_edge(lo, hi, "lambda_neighbor")
+    # anything still separate (e.g. a centre present on one rung only, no shared centre)
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for a, b in edges:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+    roots = sorted({find(w) for w in range(n)})
+    for r in roots[1:]:
+        add_edge(roots[0], r, "connectivity_bridge")
+    out = list(edges.values())
+    out.sort(key=lambda r: (0 if math.isfinite(float(r["normalized_distance"])) else 1,
+                            float(r["normalized_distance"]) if math.isfinite(float(r["normalized_distance"])) else 0.0,
+                            int(r["wi"]), int(r["wj"]), str(r.get("edge_type", ""))))
     return out
 
 

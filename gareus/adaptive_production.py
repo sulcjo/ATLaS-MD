@@ -45,7 +45,7 @@ from .store import SegmentRegistry
 from .extension_seeding import extension_parent_dirs
 from .adaptive.paired_cv import PairedCVCollector, attach_paired_cv
 from .adaptive.pair_runtime import GATE_REPORT_NAME, gate_from_args
-from .adaptive.edge_metric import attach_edge_metric, edge_is_weak_pairwise, edge_sort_overlap
+from .adaptive.edge_metric import GRAPH_EDGE_TYPES, attach_edge_metric, edge_is_weak_pairwise, edge_sort_overlap
 # Real-frame seed extraction lives in tica.py (a dependency-free leaf module)
 # so seeding.py can also use it for campaign-wide seed search without a
 # circular import - seeding.py -> production.py -> adaptive_production.py is
@@ -507,9 +507,15 @@ class AdaptiveDecisionPolicy:
     slow_mode_reseed_fraction: float = 0.0
     # Spec 3.1 edge metric (gareus/adaptive/edge_metric.py): "marginal" = today's CV1
     # histogram overlap; "pairwise-mbar" = two-state MBAR overlap graded against
-    # min_rung_overlap, unmeasured below min_edge_neff effective samples per state.
+    # min_rung_overlap, unmeasured below min_edge_neff effective samples per state
+    # (100 from the spec-T2 calibration: floor 200's error rates, fewer edges unmeasured).
     edge_metric: str = "marginal"
-    min_edge_neff: float = 200.0
+    min_edge_neff: float = 100.0
+    # Spec P7b (--layout-neighbour-rule): which windows are neighbours for the phases'
+    # exchange graph, post-pull drop connectivity and top-up partners. "legacy" = the
+    # pre-P7b graphs; "restraint-width" = the P7a rule. MD-driving, so frozen here and
+    # threaded into every phase's args by the driver.
+    layout_neighbour_rule: str = "legacy"
 
 
 LADDER_SETTINGS_FIELDS = ("ladder_adapt", "ladder_min_overlap", "ladder_overlap_quantile", "ladder_min_ess",
@@ -529,6 +535,7 @@ DECISION_SETTINGS_FIELDS = (
     "cv2_coupling_gate", "max_coupling_fraction",
     "slow_mode_reseed_fraction",
     "edge_metric", "min_edge_neff",
+    "layout_neighbour_rule",
 )
 DECISION_SETTINGS_FILENAME = "decision_settings.json"
 
@@ -903,13 +910,15 @@ def registry_from_window_csv(path: Path, epoch: int = 0, source: str = "window_c
     _plan_path = Path(path).parent / "layout_plan.json"
     if _plan_path.exists():
         try:
-            _plan = json.loads(_plan_path.read_text(encoding="utf-8"))
-            _states = list(_plan.get("states") or [])
+            from .layout_plan import read_layout_plan
+            _plan, _states = read_layout_plan(_plan_path)
             _active = reg.all_states()
             if _states and len(_states) == len(_active):
                 for st, rec in zip(_active, _states):
-                    st.metadata["state_role"] = rec.get("role")
-                    st.metadata["mandatory"] = bool(rec.get("mandatory"))
+                    st.metadata["state_role"] = rec.role
+                    st.metadata["mandatory"] = bool(rec.mandatory)
+                    if rec.region is not None:
+                        st.metadata["region"] = rec.region
         except (OSError, ValueError, KeyError, TypeError) as exc:
             print(f"WARNING: layout_plan.json beside {path} could not be read ({exc!r}); mandatory-state guards inactive")
     return reg
@@ -2270,6 +2279,76 @@ def _sortable_centre_key(key: Tuple[Optional[int], Optional[int]]) -> Tuple:
     return tuple((0, 0) if v is None else (1, int(v)) for v in key)
 
 
+# Relative change below which a re-gated k2 counts as unchanged (see _plan_children).
+_GATE_RELOWER_RTOL = 1.0e-9
+
+# Layout roles (gareus.swarm.ladder_design ROLE_*) that are structurally anchor/axis states.
+_STRUCTURAL_AXIS_ROLES = frozenset({"unrestrained_anchor", "region_representative", "axis"})
+
+
+def _is_anchor_or_axis_state(state: WindowState, campaign_has_cv2: bool) -> bool:
+    """Spec P2/3.3 structural test: an anchor (no restrained axis) or an axis state (one axis
+    unrestrained, k1 = 0 or k2 = 0), whatever its metadata says (mandatory flags can be absent,
+    as in chignolin_9). A state without any CV2 centre is a CV1 axis state only when the
+    campaign has a CV2; in a CV1-only campaign every CV1-restrained state is a full window."""
+    role = (state.metadata or {}).get("state_role")
+    if role in _STRUCTURAL_AXIS_ROLES:
+        return True
+    on1, on2 = _restraint_pattern(state.primary_k, state.secondary_k, state.secondary_center)
+    return (not on1) or (campaign_has_cv2 and not on2)
+
+
+def _same_centre_identity(prev: Dict[str, Any], primary: float, primary_k: Optional[float],
+                          secondary: Optional[float], secondary_k: Optional[float],
+                          policy: AdaptiveDecisionPolicy) -> bool:
+    """``has_near_duplicate``'s restraint-aware identity between two not-yet-created centres."""
+    want = _restraint_pattern(primary_k, secondary_k, secondary)
+    have = _restraint_pattern(prev["primary_k"], prev["secondary_k"], prev["secondary_center"])
+    if have != want:
+        return False
+    if want[0] and abs(float(prev["primary_center"]) - float(primary)) > float(policy.duplicate_primary_tol):
+        return False
+    if want[1] and abs(float(prev["secondary_center"]) - float(secondary)) > float(policy.duplicate_secondary_tol):
+        return False
+    return True
+
+
+# A state_id's Hamiltonian: every parameter that enters its reduced potential.
+_HAMILTONIAN_FIELDS = ("primary_center", "primary_k", "secondary_center", "secondary_k",
+                       "gamd_lambda", "gamd_sigma0p", "gamd_sigma0d")
+
+
+def _hamiltonian_snapshot(registry: "WindowStateRegistry") -> Dict[int, Tuple[Any, ...]]:
+    return {int(s.state_id): tuple(getattr(s, f) for f in _HAMILTONIAN_FIELDS) for s in registry.all_states()}
+
+
+def _same_parameter(a: Any, b: Any) -> bool:
+    if a is None or b is None:
+        return a is None and b is None
+    try:
+        fa, fb = float(a), float(b)
+    except (TypeError, ValueError):
+        return a == b
+    if math.isnan(fa) or math.isnan(fb):
+        return math.isnan(fa) and math.isnan(fb)
+    return fa == fb
+
+
+def _assert_hamiltonians_unchanged(before: Dict[int, Tuple[Any, ...]], registry: "WindowStateRegistry") -> None:
+    """Spec invariant: a state_id's Hamiltonian never changes and no state_id disappears
+    (any centre/k/lambda change must create a new state_id). Checked after every apply."""
+    now = {int(s.state_id): s for s in registry.all_states()}
+    missing = sorted(set(before) - set(now))
+    if missing:
+        raise RuntimeError(f"apply_actions removed state_id(s) {missing} from the registry; retired states "
+                           "must stay (they carry samples into the union MBAR)")
+    changed = [sid for sid, ham in before.items()
+               if not all(_same_parameter(a, getattr(now[sid], f)) for a, f in zip(ham, _HAMILTONIAN_FIELDS))]
+    if changed:
+        raise RuntimeError(f"apply_actions changed the Hamiltonian of existing state_id(s) {changed}; "
+                           "a centre/k/lambda change must create a new state_id")
+
+
 def _representative_rung(registry: WindowStateRegistry) -> float:
     """The λ a per-centre *proposal* is deduplicated against.
 
@@ -2290,11 +2369,46 @@ def build_geometry_edges(
     registry: WindowStateRegistry,
     policy: Optional[AdaptiveDecisionPolicy] = None,
 ) -> List[Tuple[int, int, str, Optional[float]]]:
-    """Build a light geometry graph between active states.
+    """Build a light geometry graph between active states: true neighbours only.
 
-    For 1D states, this is a simple sorted nearest-neighbor chain.  For 2D
-    states, use immediate row/column-like nearest neighbors plus one nearest
-    Euclidean neighbor per state to keep sparse patches connected.
+    Edge types (the weak-edge gate, the bridge proposer, retirement and the
+    reports read them):
+
+    * ``primary_chain`` -- the CV1 direction: consecutive states in sorted CV1
+      centre WITHIN one CV2 row, i.e. among states of one restraint pattern
+      (spec P6) sharing the CV2 centre (CV1-only states form one row: their CV2
+      coordinate is a placeholder and never identity). Weak-eligible.
+    * ``secondary_chain`` -- the CV2 direction: consecutive states in sorted CV2
+      centre WITHIN one CV1 column (same pattern, same CV1 centre; CV2-only
+      states form one column). Weak-eligible.
+    * ``nearest_2d`` -- only when some state carries a CV2 centre: each state's
+      nearest state of its OWN restraint pattern by the P7a restraint-width
+      distance (``neighbour_rule.pair_distance``), plus the closest same-pattern
+      pair between any two still-separate pieces of one pattern (a sparse patch,
+      or an off-grid bridge state with no row or column partner). Weak-eligible:
+      it is the nearest pair, so a low overlap on it is a real gap.
+    * ``pattern_link`` -- connectivity bookkeeping between restraint patterns
+      (anchor, CV1-only, CV2-only, 2D), one per pair of patterns that share a
+      restrained axis (the closest pair on the shared axes only, placeholders
+      never read), each anchor linked to the most central state of the largest
+      pattern, and a last-resort join of anything still separate. NEVER weak
+      under either metric and never read by retirement: a midpoint between two
+      patterns lands on a placeholder coordinate, and a CV1-marginal overlap
+      across patterns says nothing about redundancy. They exist so
+      ``active_graph_connected`` / the articulation set see one graph.
+
+    Before this rule (spec-T3 / T2 bug) the CV1 chain was ``argsort`` over ALL
+    states, so ties and columns were ordered arbitrarily: chignolin_9 got CV2-only
+    windows three rows apart (64-76), 2D windows two rows apart in one column
+    (160-216, 136-232, 184-204), a diagonal across a column boundary (164-200)
+    and, on any grid, the top of one column joined to the bottom of the next.
+
+    Neighbour ranking uses the P7a distance at a fixed 300 K: on one restraint
+    pattern every distance scales as 1/sqrt(T), so the choice does not depend on
+    T. A restrained axis whose k is not recorded gets
+    ``neighbour_rule.fallback_axis_sigmas`` (median recorded width, else median
+    centre spacing). A layout where no state carries a CV2 centre (a CV1-only
+    ladder, chignolin_7) produces exactly the old sorted chain.
 
     Under an active λ-ladder (some state carries ``gamd_lambda > 0``) states
     are first grouped by centre: adjacent rungs within one group get a
@@ -2315,32 +2429,20 @@ def build_geometry_edges(
         active, rung_edges = _split_rung_groups(active, policy)
         if len(active) <= 1:
             return rung_edges
-    has_secondary = any(s.secondary_center is not None for s in active)
-    primary = np.asarray([s.primary_center for s in active], dtype=float)
-    secondary = np.asarray([0.0 if s.secondary_center is None else s.secondary_center for s in active], dtype=float)
+    return rung_edges + _neighbour_geometry_edges(active)
+
+
+GEOMETRY_LINK_EDGE_TYPE = "pattern_link"
+
+
+def _neighbour_geometry_edges(active: List[WindowState]) -> List[Tuple[int, int, str, Optional[float]]]:
+    """The non-rung part of ``build_geometry_edges`` over one representative per centre."""
+    from .adaptive.neighbour_rule import NeighbourPoint, chain_edges
     ids = [int(s.state_id) for s in active]
-    edges: Dict[Tuple[int, int], Tuple[int, int, str, Optional[float]]] = {}
-
-    def add(a_idx: int, b_idx: int, etype: str, nd: Optional[float]) -> None:
-        if a_idx == b_idx:
-            return
-        a, b = sorted((ids[a_idx], ids[b_idx]))
-        edges[(a, b)] = (a, b, etype, nd)
-
-    order = list(np.argsort(primary))
-    for left, right in zip(order[:-1], order[1:]):
-        add(int(left), int(right), "primary_chain", None)
-    if has_secondary:
-        p_scale = _positive_scale(primary)
-        s_scale = _positive_scale(secondary)
-        coords = np.column_stack([primary / p_scale, secondary / s_scale])
-        for i in range(len(active)):
-            dist = np.sqrt(np.sum((coords - coords[i]) ** 2, axis=1))
-            dist[i] = np.inf
-            j = int(np.argmin(dist))
-            if math.isfinite(float(dist[j])):
-                add(i, j, "nearest_2d", float(dist[j]))
-    return rung_edges + list(edges.values())
+    points = [NeighbourPoint(primary_center=float(s.primary_center), primary_k=s.primary_k,
+                             secondary_center=s.secondary_center, secondary_k=s.secondary_k)
+              for s in active]
+    return [(ids[i], ids[j], etype, d) for i, j, etype, d in chain_edges(points, ids=ids)]
 
 
 def _split_rung_groups(
@@ -4937,6 +5039,10 @@ def propose_actions_from_diagnostics(
                 "state_j": int(s2.state_id),
                 "overlap": edge.get("overlap"),
                 "exchange_acceptance": edge.get("exchange_acceptance"),
+                # The value of the metric that made the edge weak (``overlap`` stays the
+                # CV1 marginal, whatever the metric).
+                "graded_overlap": _weak_edge_graded_value(edge, policy)[0],
+                "graded_overlap_source": _weak_edge_graded_value(edge, policy)[1],
                 "bridges_needed": needed,
                 "min_useful_bridges": min_useful,
                 "bridges_allocated": n_place,
@@ -5077,7 +5183,7 @@ def propose_actions_from_diagnostics(
             placed_this_edge += 1
             reason = (
                 f"weak edge {s1.state_id}-{s2.state_id}: "
-                f"overlap={edge.get('overlap')}, exchange_acceptance={edge.get('exchange_acceptance')}"
+                f"{_weak_edge_metric_text(edge, policy)}"
                 f"; bridge {placed_this_edge}/{n_place} of {needed} needed ({prediction_note})"
             )
             if shortfall:
@@ -5114,6 +5220,18 @@ def propose_actions_from_diagnostics(
                 # retire_converged for the whole ladder.  Rung states are
                 # already safe from retirement: they gain no CV overlap credit,
                 # so state_max_overlap never reaches redundant_overlap for them.
+                continue
+            if str(edge.get("edge_type")) in GRAPH_EDGE_TYPES or str(edge.get("edge_type")) == GEOMETRY_LINK_EDGE_TYPE:
+                # Spec 3.1's appended graph edges (``neighbour``: any same-pattern pair
+                # within the P7a radius; ``spanning``) are graded, never actionable: they
+                # carry no CV1-marginal ``overlap`` (None by construction), and reading
+                # that None as "bad" marked both ends of every one of them, so
+                # --ap-edge-metric pairwise-mbar retired nothing (spec T2 bug 1).
+                # Retirement stays on the collector's geometry edges; an unmeasured
+                # GEOMETRY edge (no samples) still blocks, as before. A ``pattern_link``
+                # (connectivity bookkeeping between restraint patterns) is skipped for the
+                # same reason: its CV1 marginal across patterns is no redundancy evidence.
+                # Articulation (graph_critical) still protects every link endpoint.
                 continue
             ov = edge.get("overlap")
             if ov is None or float(ov) < float(policy.target_overlap):
@@ -5180,7 +5298,10 @@ def propose_actions_from_diagnostics(
         # Hard minimum-replica floor: never retire the active set below
         # policy.min_active_states (default 8), independent of how many windows are
         # redundant. Snapshot the count before any tentative removal.
-        min_active = max(0, int(getattr(policy, "min_active_states", 0)))
+        # At least one state always stays: ``active_graph_connected`` is True for an empty
+        # graph, so with a floor of 0 a pure cycle (a 2x2 grid, whose geometry graph has no
+        # articulation point once chains join true neighbours only) retired every state.
+        min_active = max(1, int(getattr(policy, "min_active_states", 0)))
         n_active_start = len(registry.active_state_ids())
         admitted: List[int] = []
         for sid in retire_candidates:
@@ -5362,6 +5483,10 @@ def _edge_is_measured_weak(edge: Dict[str, Any], policy: AdaptiveDecisionPolicy)
     if str(edge.get("edge_type")) == "rung":
         value = edge.get("mbar_overlap")
         return value is not None and float(value) < float(policy.min_rung_overlap)
+    if str(edge.get("edge_type")) == GEOMETRY_LINK_EDGE_TYPE:
+        # Connectivity bookkeeping between restraint patterns (build_geometry_edges):
+        # a midpoint between two patterns is a placeholder coordinate, never a bridge.
+        return False
     if str(getattr(policy, "edge_metric", "marginal")) == "pairwise-mbar":
         # Spec 3.1: one metric (two-state / union pairwise MBAR, bootstrap bound);
         # cross-pattern and unmeasured edges are never weak.
@@ -5372,6 +5497,46 @@ def _edge_is_measured_weak(edge: Dict[str, Any], policy: AdaptiveDecisionPolicy)
     if acc is not None and float(acc) < float(policy.min_exchange_acceptance):
         weak = True
     return weak
+
+
+def _weak_edge_graded_value(edge: Dict[str, Any], policy: AdaptiveDecisionPolicy) -> Tuple[Optional[float], str]:
+    """(value, source) of the overlap that graded this spatial edge: the metric that made it weak.
+
+    ``pairwise-mbar``: the union ``mbar_overlap`` when a union solve scored the edge, else the
+    two-state point estimate (source ``pairwise_mbar``); ``marginal``: the CV1-marginal
+    ``overlap`` (source ``cv1_marginal``).
+    """
+    if str(getattr(policy, "edge_metric", "marginal")) == "pairwise-mbar":
+        union = _finite_or_none(edge.get("mbar_overlap"))
+        if union is not None:
+            return union, "pairwise_mbar_union"
+        return _finite_or_none((edge.get("pairwise_mbar") or {}).get("overlap")), "pairwise_mbar"
+    return _finite_or_none(edge.get("overlap")), "cv1_marginal"
+
+
+def _weak_edge_metric_text(edge: Dict[str, Any], policy: AdaptiveDecisionPolicy) -> str:
+    """The reason-text clause naming why an edge is weak, on the metric that graded it.
+
+    Under ``marginal`` the text is exactly what it always was. Under ``pairwise-mbar`` it
+    quotes the pairwise value (and its bootstrap q90, the number the decision read) against
+    ``min_rung_overlap``; the CV1 marginal is kept, labelled, since it is still recorded --
+    before, the reason quoted only the marginal (e.g. ``overlap=0.777`` for chignolin_9's
+    64-76, weak at pairwise 0.080).
+    """
+    marginal = f"overlap={edge.get('overlap')}, exchange_acceptance={edge.get('exchange_acceptance')}"
+    if str(getattr(policy, "edge_metric", "marginal")) != "pairwise-mbar":
+        return marginal
+    value, source = _weak_edge_graded_value(edge, policy)
+    thr = f"min_rung_overlap={float(policy.min_rung_overlap):g}"
+    tail = (f"cv1_marginal_overlap={edge.get('overlap')}, "
+            f"exchange_acceptance={edge.get('exchange_acceptance')}")
+    if value is None:
+        return f"pairwise_mbar_overlap=None; {tail}"
+    if source == "pairwise_mbar_union":
+        return f"pairwise_mbar_overlap={value:.4f} (union) < {thr}; {tail}"
+    upper = _finite_or_none((edge.get("pairwise_mbar") or {}).get("overlap_upper"))
+    q90 = f", q90 {upper:.4f}" if upper is not None else ""
+    return f"pairwise_mbar_overlap={value:.4f} (two-state{q90}) < {thr}; {tail}"
 
 
 # Policy fields that only ever fed the per-state score allocator, removed with the
@@ -6642,7 +6807,9 @@ def _topup_layout_neighbours(args, active):
     k1 = [float(s.primary_k) for s in active]
     k2 = [float(s.secondary_k or 0.0) for s in active]
     temperature = float(getattr(args, "temperature_k", 300.0) or 300.0)
-    pairs = spatial_neighbour_pairs(c1, c2, lam, k1, k2, temperature)
+    # Spec P7b: the campaign's frozen --layout-neighbour-rule (legacy by default).
+    rule = str(getattr(args, "layout_neighbour_rule", "legacy") or "legacy")
+    pairs = spatial_neighbour_pairs(c1, c2, lam, k1, k2, temperature, rule=rule)
     nb_local, rp_local = same_rung_neighbours(pairs, lam), other_rung_same_centre(c1, c2, lam)
     neighbours = {ids[w]: [ids[x] for x in nb_local.get(w, [])] for w in range(len(ids))}
     rung_partners = {ids[w]: [ids[x] for x in rp_local.get(w, [])] for w in range(len(ids))}
@@ -7400,13 +7567,21 @@ class AdaptiveProductionController:
     """
 
     def __init__(self, registry: WindowStateRegistry, epoch_steps: int = 50000, registry_dir: Optional[Path] = None,
-                 policy: Optional["AdaptiveDecisionPolicy"] = None):
+                 policy: Optional["AdaptiveDecisionPolicy"] = None, *,
+                 secondary_k_max: Optional[float] = None, coupling_gate: Optional[Any] = None):
         self.registry = registry
         self.policy = policy if policy is not None else AdaptiveDecisionPolicy()
         self.epoch_steps = int(epoch_steps)
         self.registry_dir = None if registry_dir is None else Path(registry_dir)
         self.current_epoch = 0
         self.refused_actions: List[Dict[str, Any]] = []
+        # Spec P2: the live CV2 spring ceiling (``_resolve_secondary_k_max(args)``, read at
+        # apply time like the proposers read it: the tICA switch rewrites it mid-campaign, so
+        # it is a campaign setting, not a frozen P8 decision rule) and the optional 3.4
+        # coupling gate (``gate_from_args``; None = off). Both default to "not configured",
+        # which reproduces the pre-P2 applier exactly.
+        self.secondary_k_max = secondary_k_max
+        self.coupling_gate = coupling_gate
 
     def run(self, max_epochs: Optional[int] = None) -> None:
         epoch = 0
@@ -7511,53 +7686,169 @@ class AdaptiveProductionController:
             retired.append(int(state.state_id))
         return retired
 
-    def _apply_respace_ladder(self, epoch: int, drop: Sequence[float], add: Sequence[float], reason: str) -> bool:
-        """Atomically replace interior rungs: validate everything, then add, then retire.
+    # ---- spec P2: validate a whole action, then apply it atomically ------------------------
 
-        Endpoints (lambda = 0 and the current top rung) are never dropped. With a positive
-        ``policy.max_replicas_budget`` the projected active-state count must fit it. A refused
-        action changes nothing. New rungs are new state ids (a state's lambda never changes).
+    def _centre_rungs(self) -> List[float]:
+        """The rungs a new centre is replicated onto (``_add_centre_on_every_rung``'s rule)."""
+        rungs = self.registry.rung_lambdas()
+        return rungs if any(lam > 0.0 for lam in rungs) else [0.0]
+
+    def _centre_members(self, state: WindowState) -> List[WindowState]:
+        """Every ACTIVE state at ``state``'s umbrella centre (all rungs), via the centre key."""
+        key = _centre_group_key(state, self.policy)
+        members = [s for s in self.registry.active_states() if _centre_group_key(s, self.policy) == key]
+        return sorted(members, key=lambda s: (float(s.gamd_lambda or 0.0), int(s.state_id)))
+
+    def _refuse(self, index: int, kind: str, reason: str, detail: str, **extra: Any) -> None:
+        """Record a refused action (nothing of it was applied) with its reason code and index."""
+        print(f"[adaptive] refusing {kind!r} ({reason}): {detail}; the proposal is dropped")
+        self.refused_actions.append({"action": str(kind), "reason": str(reason), "detail": str(detail),
+                                     **extra, "index": int(index)})
+
+    def _budget_refusal(self, kind: str, added: int) -> Optional[Dict[str, Any]]:
+        """Spec 3.5 for one whole action: ``added`` = its net new active states. 0 = unlimited.
+
+        Read from the LIVE registry, so a later action (or the post-coverage apply) sees the
+        states earlier ones already added."""
+        budget = int(getattr(self.policy, "max_replicas_budget", 0) or 0)
+        if budget <= 0 or added <= 0:
+            return None
+        n_active = len(self.registry.active_states())
+        if n_active + added <= budget:
+            return None
+        return {"detail": (f"it would bring the active states to {n_active + added} (+{added}), "
+                           f"above the replica cap --max-replicas {budget}"),
+                "n_active": n_active, "added": int(added), "budget": budget}
+
+    def _plan_children(self, children: Sequence[Sequence[Any]], context: str
+                       ) -> Tuple[Optional[List[Dict[str, Any]]], Optional[Tuple[str, str]]]:
+        """Validate every new centre of one action; nothing is created here.
+
+        Per child: the live ``cv2_k_max`` clamp (``_clamp_secondary_k``), the restraint-aware
+        duplicate check (P6 key) on every rung the child will occupy -- against the registry,
+        retired states included, and against the action's own earlier children -- then the 3.4
+        coupling gate when one is configured (below ``cv2_k_min`` it refuses). Returns
+        ``(plan, None)`` or ``(None, (reason_code, detail))``.
         """
+        rungs = self._centre_rungs()
+        plan: List[Dict[str, Any]] = []
+        for i, params in enumerate(children):
+            c1, k1 = float(params[0]), float(params[1])
+            c2 = None if len(params) < 3 or params[2] is None else float(params[2])
+            k2 = None if len(params) < 4 or params[3] is None else params[3]
+            label = f"apply: {context} child {i}"
+            notes: List[str] = []
+            k2, clamp_note = _clamp_secondary_k(k2, self.secondary_k_max, context=label)
+            if clamp_note:
+                logging.warning("adaptive-production: %s", clamp_note)
+                notes.append(clamp_note)
+            for lam in rungs:
+                if self.registry.has_near_duplicate(c1, c2, self.policy, gamd_lambda=lam,
+                                                    primary_k=k1, secondary_k=k2):
+                    return None, ("duplicate", f"child {i} at ({c1:.6g}, {c2}) duplicates an existing "
+                                               f"state on rung lambda={lam}")
+            for prev in plan:
+                if _same_centre_identity(prev, c1, k1, c2, k2, self.policy):
+                    return None, ("duplicate", f"child {i} at ({c1:.6g}, {c2}) duplicates an earlier "
+                                               "child of the same action")
+            if self.coupling_gate is not None and k2 is not None and c2 is not None:
+                k2_gated, gate_note = self.coupling_gate.gate(c1, k1, c2, k2, context=label)
+                if k2_gated is None:
+                    return None, ("below_k_min", str(gate_note or "coupling gate refused the child"))
+                # Re-gating a k2 the proposer's gate already lowered lands on the threshold again
+                # (fraction 0.25 +- rounding), which the gate reports as "lowered" to the same
+                # value; only a real lowering changes the child or its reason.
+                if float(k2_gated) < float(k2) * (1.0 - _GATE_RELOWER_RTOL):
+                    k2 = k2_gated
+                    if gate_note:
+                        notes.append(str(gate_note))
+            if len(params) >= 4:
+                child_params: Tuple[Any, ...] = (c1, k1, c2, k2)
+            else:
+                child_params = tuple(params)
+            plan.append({"params": child_params, "primary_center": c1, "primary_k": k1,
+                         "secondary_center": c2, "secondary_k": k2, "notes": notes})
+        return plan, None
+
+    def _validate_split(self, action: Tuple) -> Tuple[Optional[Dict[str, Any]], Optional[Tuple]]:
+        _, parent, children_params, _reason = action
+        state = self.registry.get_state(int(parent))
+        if state is None:
+            return None, ("unknown_state", f"parent state {parent} is not in the registry", {})
+        if not state.active:
+            return None, ("inactive", f"parent state {parent} is already retired", {})
+        members = self._centre_members(state)
+        mandatory = [int(s.state_id) for s in members if bool((s.metadata or {}).get("mandatory"))]
+        if mandatory:
+            return None, ("mandatory", f"centre of state {parent} holds mandatory exploration state(s) "
+                                       f"{mandatory}", {})
+        has_cv2 = any(s.secondary_center is not None for s in self.registry.all_states())
+        structural = [int(s.state_id) for s in members if _is_anchor_or_axis_state(s, has_cv2)]
+        if structural:
+            return None, ("anchor_or_axis", f"centre of state {parent} is an anchor/axis centre "
+                                            f"(k1 = 0 or k2 = 0: states {structural}); only k1 > 0, k2 > 0 "
+                                            "centres can be split", {})
+        plan, refusal = self._plan_children(children_params, f"split of {parent}")
+        if refusal is not None:
+            return None, (refusal[0], refusal[1], {})
+        added = len(plan) * len(self._centre_rungs()) - len(members)
+        return {"children": plan, "members": members, "added": added}, None
+
+    def _validate_respace_ladder(self, drop: Sequence[float], add: Sequence[float]
+                                 ) -> Tuple[Optional[Dict[str, Any]], Optional[Tuple]]:
+        """Endpoints (lambda = 0 and the current top rung) are never dropped; the projected
+        active-state count must fit a positive ``policy.max_replicas_budget``."""
         rungs = self.registry.rung_lambdas()
         if len(rungs) < 2:
-            print(f"[adaptive] refusing respace_ladder: no active lambda ladder ({rungs})")
-            return False
+            return None, ("no_ladder", f"no active lambda ladder ({rungs})", {})
         lo, hi = rungs[0], rungs[-1]
         drop = [float(x) for x in drop]
         add = [float(x) for x in add
                if not any(abs(float(x) - r) <= 1.0e-9 for r in rungs) and lo < float(x) < hi]
         if any(abs(x - lo) <= 1.0e-9 or abs(x - hi) <= 1.0e-9 for x in drop):
-            print(f"[adaptive] refusing respace_ladder: endpoints {lo}, {hi} are never dropped (drop={drop})")
-            return False
+            return None, ("ladder_endpoint", f"endpoints {lo}, {hi} are never dropped (drop={drop})", {})
         drop = [x for x in drop if any(abs(x - r) <= 1.0e-9 for r in rungs)]
         if not drop and not add:
-            return False
+            return None, ("no_change", "no rung to drop or add after filtering", {})
         policy = AdaptiveDecisionPolicy()
         centres = {_centre_group_key(s, policy) for s in self.registry.active_states()}
         n_drop = sum(1 for s in self.registry.active_states()
                      if any(abs(float(s.gamd_lambda or 0.0) - x) <= 1.0e-9 for x in drop)
                      and not bool((s.metadata or {}).get("mandatory")))
-        projected = len(self.registry.active_states()) + len(centres) * len(add) - n_drop
-        budget = int(getattr(self.policy, "max_replicas_budget", 0) or 0)
-        if budget > 0 and projected > budget:
-            print(f"[adaptive] refusing respace_ladder over the replica cap: {projected} active states "
-                  f"projected > max_replicas {budget} (drop={drop}, add={add})")
+        refusal = self._budget_refusal("respace_ladder", len(centres) * len(add) - n_drop)
+        if refusal is not None:
+            detail = refusal.pop("detail")
+            return None, ("max_replicas_budget", f"{detail} (drop={drop}, add={add})", refusal)
+        return {"drop": drop, "add": add}, None
+
+    def _apply_respace_ladder(self, epoch: int, drop: Sequence[float], add: Sequence[float], reason: str) -> bool:
+        """Atomically replace interior rungs: validate everything, then add, then retire.
+
+        A refused action changes nothing. New rungs are new state ids (a state's lambda never
+        changes)."""
+        plan, refusal = self._validate_respace_ladder(drop, add)
+        if refusal is not None:
+            print(f"[adaptive] refusing respace_ladder ({refusal[0]}): {refusal[1]}")
             return False
-        for lam in add:
-            self._add_rung_at_every_centre(epoch, lam, reason)
-        for lam in drop:
-            self._retire_rung_at_every_centre(epoch, lam, f"respace_ladder: {reason}")
+        self._execute_respace(epoch, plan, reason)
         return True
+
+    def _execute_respace(self, epoch: int, plan: Dict[str, Any], reason: str) -> None:
+        for lam in plan["add"]:
+            self._add_rung_at_every_centre(epoch, lam, reason)
+        for lam in plan["drop"]:
+            self._retire_rung_at_every_centre(epoch, lam, f"respace_ladder: {reason}")
 
     def _states_added_by(self, action: Tuple) -> int:
         """Net number of active states ``action`` would add to the live registry."""
         kind = str(action[0])
-        rungs = self.registry.rung_lambdas()
-        per_centre = len(rungs) if any(lam > 0.0 for lam in rungs) else 1
+        per_centre = len(self._centre_rungs())
         if kind in ("add", "tica_coverage_add"):
             return per_centre
         if kind == "split":
-            return per_centre * len(action[2]) - 1
+            parent = self.registry.get_state(int(action[1]))
+            n_members = len(self._centre_members(parent)) if parent is not None and parent.active else 0
+            return per_centre * len(action[2]) - n_members
         if kind == "add_rung":
             lam = float(action[1])
             policy = AdaptiveDecisionPolicy()
@@ -7568,86 +7859,99 @@ class AdaptiveProductionController:
                        if not any(abs(float(s.gamd_lambda or 0.0) - lam) <= 1.0e-9 for s in members))
         return 0
 
-    def _within_replica_budget(self, action: Tuple) -> bool:
-        """Spec 3.5: every apply reads the budget from the LIVE registry, so a later action
-        (or the post-coverage apply) sees the states earlier ones already added. 0 = unlimited.
-        ``respace_ladder`` checks its own projected count in ``_apply_respace_ladder``."""
-        budget = int(getattr(self.policy, "max_replicas_budget", 0) or 0)
-        added = self._states_added_by(action)
-        if budget <= 0 or added <= 0:
-            return True
-        n_active = len(self.registry.active_states())
-        if n_active + added <= budget:
-            return True
-        print(f"[adaptive] refusing {action[0]!r}: it would bring the active states to "
-              f"{n_active + added} (+{added}), above --max-replicas {budget}; the proposal is dropped")
-        self.refused_actions.append({"action": str(action[0]), "n_active": n_active, "added": added,
-                                     "budget": budget, "reason": "max_replicas_budget"})
-        return False
+    def _validate_action(self, action: Tuple) -> Tuple[Optional[Dict[str, Any]], Optional[Tuple]]:
+        """Complete validation of one action against the live registry; mutates nothing.
+
+        Returns ``(plan, None)`` or ``(None, (reason_code, detail, extra_fields))``. Refusal
+        precedence: unknown_state/inactive, mandatory, anchor_or_axis, duplicate, below_k_min
+        (coupling gate), max_replicas_budget -- an invalid action never reports as a budget one.
+        """
+        kind = str(action[0])
+        if kind == "retire":
+            state = self.registry.get_state(int(action[1]))
+            if state is not None and bool((state.metadata or {}).get("mandatory")):
+                return None, ("mandatory", f"state {action[1]} is a mandatory exploration state "
+                                           f"({(state.metadata or {}).get('state_role')}); the state is kept", {})
+            return {}, None
+        if kind == "extend":
+            return {}, None
+        if kind in ("add", "tica_coverage_add"):
+            plan, refusal = self._plan_children([action[2]], f"{kind} (parent {action[1]})")
+            if refusal is not None:
+                return None, (refusal[0], refusal[1], {})
+            added = len(self._centre_rungs())
+        elif kind == "split":
+            split_plan, refusal = self._validate_split(action)
+            if refusal is not None:
+                return None, refusal
+            plan, added = split_plan, int(split_plan["added"])
+        elif kind == "add_rung":
+            plan, added = {}, self._states_added_by(action)
+        elif kind == "respace_ladder":
+            return self._validate_respace_ladder(action[1], action[2])
+        else:
+            raise ValueError(f"unknown adaptive-production action {kind!r}")
+        budget = self._budget_refusal(kind, added)
+        if budget is not None:
+            detail = budget.pop("detail")
+            return None, ("max_replicas_budget", detail, budget)
+        return {"plan": plan}, None
+
+    def _execute_action(self, epoch: int, action: Tuple, plan: Dict[str, Any]) -> None:
+        """Apply one validated action from its plan."""
+        kind = str(action[0])
+        if kind == "retire":
+            _, state_id, reason = action
+            self.registry.retire_state(int(state_id), int(epoch) + 1, str(reason))
+        elif kind == "extend":
+            _, state_id, reason = action
+            self.registry.record_extend(int(state_id), int(epoch) + 1, str(reason))
+        elif kind in ("add", "tica_coverage_add"):
+            parent, reason = action[1], str(action[3])
+            (child,) = plan["plan"]
+            if child["notes"]:
+                reason = "; ".join([reason, *child["notes"]])
+            if kind == "add":
+                self._add_centre_on_every_rung(epoch, child["params"], parent=parent,
+                                               source="adaptive_production", reason=reason)
+            else:
+                self._add_centre_on_every_rung(epoch, child["params"], parent=parent, source="tica_coverage",
+                                               reason=reason, metadata=dict(action[4]))
+        elif kind == "add_rung":
+            _, lambda_new, reason = action
+            self._add_rung_at_every_centre(epoch, float(lambda_new), str(reason))
+        elif kind == "respace_ladder":
+            self._execute_respace(epoch, plan, str(action[3]))
+        elif kind == "split":
+            # Children first, on the rungs resolved at validation (retiring first would shrink
+            # rung_lambdas()), then every rung of the parent centre. One atomic unit.
+            _, parent, _children, reason = action
+            for child in plan["plan"]["children"]:
+                child_reason = "; ".join([f"split child: {reason}", *child["notes"]])
+                self._add_centre_on_every_rung(epoch, child["params"], parent=int(parent),
+                                               source="adaptive_production_split", reason=child_reason)
+            for member in plan["plan"]["members"]:
+                self.registry.retire_state(int(member.state_id), int(epoch) + 1, f"split: {reason}")
 
     def apply_actions(self, epoch: int, actions: Sequence[Tuple]) -> None:
+        """Validate each action completely, then apply it atomically (spec P2).
+
+        Actions are taken in order; each is validated against the live registry after the
+        earlier ones were applied, so the budget and the duplicate check see them. A refused
+        action changes nothing and is recorded in ``refused_actions`` with its reason code and
+        index (the applied-actions ledger's ``refused`` list). After the whole batch no existing
+        state_id may have changed its Hamiltonian or disappeared (raises RuntimeError).
+        """
+        before = _hamiltonian_snapshot(self.registry)
         for index, action in enumerate(actions):
             kind = str(action[0])
-            if not self._within_replica_budget(action):
-                self.refused_actions[-1]["index"] = int(index)
+            plan, refusal = self._validate_action(action)
+            if refusal is not None:
+                reason, detail, extra = refusal
+                self._refuse(index, kind, reason, detail, **extra)
                 continue
-            if kind == "retire":
-                _, state_id, reason = action
-                _st = self.registry.get_state(int(state_id))
-                if _st is not None and bool((_st.metadata or {}).get("mandatory")):
-                    print(f"[adaptive] refusing to retire mandatory exploration state {state_id} "
-                          f"({(_st.metadata or {}).get('state_role')}); the proposal is dropped, not the state")
-                    continue
-                self.registry.retire_state(int(state_id), int(epoch) + 1, str(reason))
-            elif kind == "extend":
-                _, state_id, reason = action
-                self.registry.record_extend(int(state_id), int(epoch) + 1, str(reason))
-            elif kind == "add":
-                _, parent, params, reason = action
-                self._add_centre_on_every_rung(
-                    epoch, params, parent=parent,
-                    source="adaptive_production", reason=str(reason),
-                )
-            elif kind == "add_rung":
-                _, lambda_new, reason = action
-                self._add_rung_at_every_centre(epoch, float(lambda_new), str(reason))
-            elif kind == "respace_ladder":
-                _, drop, add, reason = action
-                self._apply_respace_ladder(epoch, drop, add, str(reason))
-            elif kind == "tica_coverage_add":
-                _, parent, params, reason, metadata = action
-                self._add_centre_on_every_rung(
-                    epoch, params, parent=parent, source="tica_coverage",
-                    reason=str(reason), metadata=dict(metadata),
-                )
-            elif kind == "split":
-                # No producer emits "split" today (grep: only "add",
-                # "tica_coverage_add", "retire" and "extend" are ever appended).
-                # Whichever future producer does must run its children's
-                # secondary_k through _clamp_secondary_k the way the other two
-                # new-state paths do -- this applier has no access to the live
-                # cv2_k_max, so the clamp cannot be enforced from here.
-                #
-                # Under a ladder the children are replicated onto every rung
-                # like any other insertion.  The RETIREMENT is deliberately
-                # left as-is (only the named parent state, not its siblings at
-                # the other rungs): the spec covers insertion only, and no
-                # producer emits "split" today, so a future producer must
-                # decide whether splitting a centre retires the whole centre.
-                _, parent, children_params, reason = action
-                _pst = self.registry.get_state(int(parent))
-                if _pst is not None and bool((_pst.metadata or {}).get("mandatory")):
-                    print(f"[adaptive] refusing to split mandatory exploration state {parent}; proposal dropped")
-                    continue
-                self.registry.retire_state(int(parent), int(epoch) + 1, f"split: {reason}")
-                for child in children_params:
-                    self._add_centre_on_every_rung(
-                        epoch, child, parent=int(parent),
-                        source="adaptive_production_split",
-                        reason=f"split child: {reason}",
-                    )
-            else:
-                raise ValueError(f"unknown adaptive-production action {kind!r}")
+            self._execute_action(epoch, action, plan)
+        _assert_hamiltonians_unchanged(before, self.registry)
 
     def perform_md_sampling(self, epoch: int) -> None:
         raise NotImplementedError
@@ -7766,7 +8070,8 @@ def policy_from_args(args: Any) -> AdaptiveDecisionPolicy:
         max_coupling_fraction=_arg_float(args, "adaptive_production_max_coupling_fraction", 0.25),
         slow_mode_reseed_fraction=_arg_float(args, "adaptive_production_slow_mode_reseed_fraction", 0.0),
         edge_metric=str(getattr(args, "adaptive_production_edge_metric", "marginal") or "marginal"),
-        min_edge_neff=_arg_float(args, "adaptive_production_min_edge_neff", 200.0),
+        layout_neighbour_rule=str(getattr(args, "layout_neighbour_rule", "legacy") or "legacy"),
+        min_edge_neff=_arg_float(args, "adaptive_production_min_edge_neff", 100.0),
     )
 
 
@@ -8075,6 +8380,10 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
     policy, _decision_record = _resolve_decision_settings(
         adaptive_dir, policy, override=_arg_bool(args, "adaptive_production_decision_settings_override", False))
     _record_decision_settings_in_manifest(out_dir, _decision_record)
+    # Spec P7b: the neighbour rule drives MD inside the phases (exchange graph, drop
+    # connectivity, top-up partners), so every phase runs with the campaign's frozen value,
+    # whatever this job's --layout-neighbour-rule says (phase args are copies of args).
+    args.layout_neighbour_rule = str(policy.layout_neighbour_rule)
     max_epochs = max(1, _arg_int(args, "adaptive_production_epochs", 3))
     # Epoch 0 also bootstraps the tICA model and (when enabled) the shared GaMD
     # envelope recalibration -- both need only a short look at real sampling, not
@@ -8522,6 +8831,7 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             from gareus.adaptive.discovery_census import census_for_epoch
             census_for_epoch(adaptive_dir, epoch_dir)
         bridge_plan: List[Dict[str, Any]] = []
+        _coupling_gate = None
         if _post_action_registry is not None:
             actions = [tuple(a) for a in _ledger.get("actions", [])]
         else:
@@ -8535,11 +8845,7 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                 bridge_plan_out=bridge_plan,
                 coupling_gate=_coupling_gate,
             )
-            if _coupling_gate is not None:
-                try:
-                    write_json(epoch_dir / GATE_REPORT_NAME, _coupling_gate.report())
-                except Exception as exc:          # a report must never invalidate a completed epoch
-                    print(f"WARNING: failed to write {GATE_REPORT_NAME} for epoch {epoch}: {exc}")
+            _write_coupling_gate_report(epoch_dir, epoch, _coupling_gate)
             if str(policy.ladder_adapt) == "respace" and len(registry.rung_lambdas()) > 1:
                 # The adaptive ladder replaces the weak-edge add_rung proposer: it re-places the
                 # whole interior ladder from this epoch's samples (at most ladder_max_moves moves).
@@ -8599,7 +8905,12 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             registry = _post_action_registry          # the actions are already in it
         else:
             _snapshot_pre_action_registry(epoch_dir, registry)
-            _refused_actions = _apply_registry_actions(registry, actions, epoch, policy=policy)
+            # Spec P2: the applier re-validates every child with the same live k2 ceiling and
+            # gate the proposer used (idempotent on the proposer's own output).
+            _refused_actions = _apply_registry_actions(
+                registry, actions, epoch, policy=policy,
+                secondary_k_max=_resolve_secondary_k_max(args), coupling_gate=_coupling_gate)
+            _write_coupling_gate_report(epoch_dir, epoch, _coupling_gate)
         registry_paths = registry.save(adaptive_dir)
         if _post_action_registry is not None:
             # A recovered epoch's ``actions`` are the ledger's applied list; carry its refusals
@@ -8676,7 +8987,10 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                             if _coverage_actions:
                                 _coverage_actions = _without_refused(
                                     _coverage_actions,
-                                    _apply_registry_actions(registry, _coverage_actions, epoch, policy=policy))
+                                    _apply_registry_actions(registry, _coverage_actions, epoch, policy=policy,
+                                                            secondary_k_max=_resolve_secondary_k_max(args),
+                                                            coupling_gate=_coupling_gate))
+                                _write_coupling_gate_report(epoch_dir, epoch, _coupling_gate)
                             tica_update_report["tica_coverage_actions"] = [
                                 {"action": action[0], "parent_state_id": action[1],
                                  "params": list(action[2]), "reason": action[3],
@@ -9453,11 +9767,27 @@ def _load_applied_actions(epoch_dir: Path, registry_path: Path) -> Optional[Dict
 
 
 def _apply_registry_actions(registry: WindowStateRegistry, actions: Sequence[Tuple], epoch: int,
-                            policy: Optional[AdaptiveDecisionPolicy] = None) -> List[Dict[str, Any]]:
-    """Apply ``actions``; return the ones refused by the replica budget (each with its index)."""
-    controller = AdaptiveProductionController(registry, policy=policy)
+                            policy: Optional[AdaptiveDecisionPolicy] = None, *,
+                            secondary_k_max: Optional[float] = None,
+                            coupling_gate: Optional[Any] = None) -> List[Dict[str, Any]]:
+    """Apply ``actions`` (spec P2: each validated whole, then applied atomically); return the
+    refused ones, each with its reason code and index. ``secondary_k_max`` / ``coupling_gate``
+    None = not configured (the pre-P2 behaviour)."""
+    controller = AdaptiveProductionController(registry, policy=policy, secondary_k_max=secondary_k_max,
+                                              coupling_gate=coupling_gate)
     controller.apply_actions(epoch, actions)
     return list(controller.refused_actions)
+
+
+def _write_coupling_gate_report(epoch_dir: Path, epoch: int, gate: Optional[Any]) -> None:
+    """(Re)write ``cv2_coupling_gate.json``: after proposing, and again after each apply, whose
+    own decisions are recorded with an ``apply: `` context."""
+    if gate is None:
+        return
+    try:
+        write_json(Path(epoch_dir) / GATE_REPORT_NAME, gate.report())
+    except Exception as exc:          # a report must never invalidate a completed epoch
+        print(f"WARNING: failed to write {GATE_REPORT_NAME} for epoch {epoch}: {exc}")
 
 
 def _without_refused(actions: Sequence[Tuple], refused: Sequence[Dict[str, Any]]) -> List[Tuple]:
@@ -9597,7 +9927,8 @@ def _action_to_dict(action: Tuple) -> Dict[str, Any]:
 
 
 def _adaptive_production_converged(actions: Sequence[Tuple], diagnostics: Dict[str, Any], policy: AdaptiveDecisionPolicy) -> bool:
-    if any(str(a[0]) == "add" for a in actions):
+    # Any proposed insertion or resolution blocks convergence (spec P2: split/refine too).
+    if any(str(a[0]) in ("add", "split", "refine") for a in actions):
         return False
     weak_edges = [edge for edge in diagnostics.get("edges", []) if _edge_is_measured_weak(edge, policy)]
     return len(weak_edges) == 0

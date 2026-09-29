@@ -5415,7 +5415,7 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
             # Skip the recompute when build_health_verdict itself already
             # failed (s['health']['error'] set, from the try/except a few
             # lines above): overall is already 'UNKNOWN' for a reason, and
-            # recomputing from only the 4 ladder rows just added could turn
+            # recomputing from only the 4 (6 with a CV2 axis) ladder rows just added could turn
             # a crashed verdict into a false PASS. build_health_verdict is
             # documented never to raise, so this is defensive only.
             if (isinstance(s.get('health'),dict) and isinstance(s['health'].get('checks'),list)
