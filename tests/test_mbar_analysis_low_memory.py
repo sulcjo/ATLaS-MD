@@ -34,6 +34,30 @@ def test_low_memory_adaptive_prefers_union_npz(tmp_path, monkeypatch, capsys):
     assert "low-memory adaptive_union_mbar.npz" in capsys.readouterr().out
 
 
+def test_low_memory_skips_a_union_npz_older_than_the_samples(tmp_path, monkeypatch, capsys):
+    import os
+
+    run_dir = tmp_path / "run"
+    adaptive = run_dir / "adaptive_production"
+    (adaptive / "final_extension_001" / "samples" / "seg_001").mkdir(parents=True)
+    npz = adaptive / "adaptive_union_mbar.npz"
+    npz.write_bytes(b"placeholder")
+    newer = adaptive / "final_extension_001" / "samples" / "seg_001" / "data.parquet"
+    newer.write_bytes(b"x")
+    os.utime(npz, (1_000_000, 1_000_000))
+    (adaptive / "state_registry.csv").write_text("state_id\n0\n")
+    sentinel = object()
+    calls = []
+    monkeypatch.setattr(loaders, "load_union_npz", lambda p: calls.append("npz"))
+    monkeypatch.setattr(loaders, "load_parquet_adaptive_union",
+                        lambda p, **kw: calls.append(("parquet", kw["low_memory"])) or sentinel)
+
+    out = loaders.load_data(run_dir, None, low_memory=True)
+
+    assert out is sentinel and calls == [("parquet", True)]
+    assert "older than final_extension_001/samples/seg_001/data.parquet" in capsys.readouterr().out
+
+
 def test_low_memory_union_npz_refuses_stale_provenance(tmp_path, monkeypatch):
     run_dir = tmp_path / "run"
     adaptive = run_dir / "adaptive_production"
