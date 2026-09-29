@@ -2117,9 +2117,9 @@ out-of-memory kill during this solve cannot be caught.  A guard runs first:
 after subsampling, before any rows x states matrix is allocated, the peak is
 estimated as 0.9 GB + kept rows x states x 8 bytes x 7.7 (the bench's 14.6 GB
 at 1,000,000 x 236; the fixed part covers the 60-400-state sweep of spec T2,
-where the per-cell term alone was up to 2x low at 100,000 rows); above
-``--ap-topup-diagnostics-max-gb`` (default 8.0) the phase's diagnostics are
-skipped with a WARNING naming the estimate, and the phase runs no top-up
+where the per-cell term alone was up to 2x low at 100,000 rows);
+above ``--ap-topup-diagnostics-max-gb`` (default 8.0) the phase's diagnostics
+are skipped with a WARNING naming the estimate, and the phase runs no top-up
 (``no_diagnostics``).  At 236 states the default admits about 488,000 kept
 (decorrelated) rows.
 
