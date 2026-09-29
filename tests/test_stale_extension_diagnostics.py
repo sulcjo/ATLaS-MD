@@ -82,3 +82,25 @@ def test_the_driver_refreshes_prior_rounds_and_records_each_collected_round():
     assert refresh < src.index("for ext_index in range(start_ext_round, ext_round_total)")
     collect = src.index("ext_diag = collect_segmented_epoch_diagnostics(ext_dir, registry, policy)")
     assert src.index("_record_extension_diagnostics_state(ext_dir)", collect) - collect < 120
+    # the on-disk round check fails closed before any refresh work
+    assert src.index("_check_extension_rounds_on_disk(adaptive_dir, start_ext_round)") < refresh
+
+
+def test_chignolin_9_shape_resumes_round_two_and_refreshes_round_one(tmp_path, monkeypatch):
+    # Round 1 recorded done (diagnostics from an older checkpoint), round 2 interrupted
+    # with a checkpoint: the resume must continue round 2 (not renumber) and refresh round 1.
+    import pytest
+
+    r1 = _round(tmp_path, 1, 2_592_077)
+    ap._record_extension_diagnostics_state(r1)
+    _set_prod(r1, 3_948_750)
+    _round(tmp_path, 2, 745_250)
+    prior = [{"extension": 1, "dir": str(r1)}]
+    ap._check_extension_rounds_on_disk(tmp_path, len(prior))        # round 2 = the resumed one: ok
+    monkeypatch.setattr(ap, "collect_segmented_epoch_diagnostics", lambda d, reg, pol: {})
+    assert ap._refresh_stale_extension_diagnostics(tmp_path, prior, None, None) == ["final_extension_001"]
+    # losing the record of round 1 (pre-#112 interrupt summaries did) now fails closed
+    with pytest.raises(RuntimeError, match="refusing to restart"):
+        ap._check_extension_rounds_on_disk(tmp_path, 0)
+    payload = ap._interrupted_driver_summary(tmp_path / "final_extension_002", [], prior)
+    assert payload["final_extension_summaries"] == prior

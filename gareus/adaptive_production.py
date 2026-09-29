@@ -8006,6 +8006,51 @@ def _seed_global_shared_gamd_from_envelope(args, envelope_dir) -> Dict[str, Any]
     return {"status": "copied", "copied_files": copied}
 
 
+def _interrupted_driver_summary(
+    segment_dir: Path,
+    epoch_summaries: Sequence[Dict[str, Any]],
+    extension_summaries: Sequence[Dict[str, Any]],
+    **extra: Any,
+) -> Dict[str, Any]:
+    """Driver summary written when a walltime stop interrupts a segment.
+
+    It must carry ``final_extension_summaries``: the next job numbers its
+    frozen-final extension rounds from that list's length. Without it a stop
+    inside round N restarts numbering at round 1 and re-runs final_extension_001
+    with round N's step target (chignolin_9, jobs 2708570 -> 2712121).
+    """
+    payload = {
+        "schema_version": "adaptive_production_driver_summary_v1",
+        "status": "interrupted_after_checkpoint",
+        "interrupted_segment": str(segment_dir),
+        "epochs_completed": int(len(epoch_summaries)),
+        "epoch_summaries": _json_ready(list(epoch_summaries)),
+        "final_extension_summaries": _json_ready(list(extension_summaries)),
+    }
+    payload.update({k: _json_ready(v) for k, v in extra.items()})
+    return payload
+
+
+def _check_extension_rounds_on_disk(adaptive_dir: Path, start_ext_round: int) -> None:
+    """Fail closed when the driver summary has lost extension-round records.
+
+    Round ``start_ext_round + 1`` may legitimately hold a checkpoint (it is the
+    one being resumed). A later round with a checkpoint means earlier rounds ran
+    that the summary no longer records; resuming would silently re-run an old
+    round instead of continuing the interrupted one.
+    """
+    for ext_dir in sorted(Path(adaptive_dir).glob("final_extension_[0-9][0-9][0-9]")):
+        index = int(ext_dir.name.rsplit("_", 1)[1])
+        manifest = ext_dir / "checkpoints" / "production_checkpoint_manifest.json"
+        if index > start_ext_round + 1 and manifest.exists():
+            raise RuntimeError(
+                f"{ext_dir.name} holds a production checkpoint but the driver summary records "
+                f"only {start_ext_round} completed extension round(s); refusing to restart "
+                "extension numbering. Restore final_extension_summaries in "
+                f"{Path(adaptive_dir) / 'adaptive_production_driver_summary.json'}."
+            )
+
+
 def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, forcefield, topology, equil_state, progress=None) -> Dict[str, Any]:
     """Run adaptive production by calling the existing GAREUS worker per epoch.
 
@@ -8295,14 +8340,9 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             scheduled_summary = result["summary"]
             if _graceful_shutdown.is_set():
                 _write_runtime_pool_reports(adaptive_dir, runtime_pool)
-                payload = {
-                    "schema_version": "adaptive_production_driver_summary_v1",
-                    "status": "interrupted_after_checkpoint",
-                    "interrupted_segment": str(epoch_dir),
-                    "epochs_completed": int(len(epoch_summaries)),
-                    "epoch_summaries": _json_ready(epoch_summaries),
-                    "scheduled_epoch": _json_ready(scheduled_summary),
-                }
+                payload = _interrupted_driver_summary(
+                    epoch_dir, epoch_summaries, prior_extension_summaries,
+                    scheduled_epoch=scheduled_summary)
                 write_json(summary_path, payload)
                 return payload
             # Guard: only fires on a real completed scheduled epoch (shutdown path
@@ -8449,13 +8489,8 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             run_gareus(epoch_args, epoch_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
             if _graceful_shutdown.is_set():
                 _write_runtime_pool_reports(adaptive_dir, runtime_pool)
-                payload = {
-                    "schema_version": "adaptive_production_driver_summary_v1",
-                    "status": "interrupted_after_checkpoint",
-                    "interrupted_segment": str(epoch_dir),
-                    "epochs_completed": int(len(epoch_summaries)),
-                    "epoch_summaries": _json_ready(epoch_summaries),
-                }
+                payload = _interrupted_driver_summary(
+                    epoch_dir, epoch_summaries, prior_extension_summaries)
                 write_json(summary_path, payload)
                 return payload
 
@@ -8953,14 +8988,9 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             # samples, while the quality gate underneath said needs_more_sampling.
             if _graceful_shutdown.is_set():
                 _write_runtime_pool_reports(adaptive_dir, runtime_pool)
-                payload = {
-                    "schema_version": "adaptive_production_driver_summary_v1",
-                    "status": "interrupted_after_checkpoint",
-                    "interrupted_segment": str(final_dir),
-                    "epochs_completed": int(len(epoch_summaries)),
-                    "epoch_summaries": _json_ready(epoch_summaries),
-                    "scheduled_final": _json_ready(final_scheduled_summary),
-                }
+                payload = _interrupted_driver_summary(
+                    final_dir, epoch_summaries, prior_extension_summaries,
+                    scheduled_final=final_scheduled_summary)
                 write_json(summary_path, payload)
                 return payload
             if bool(policy.propagate_seed_bank):
@@ -9026,13 +9056,8 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             run_gareus(final_args, final_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
             if _graceful_shutdown.is_set():
                 _write_runtime_pool_reports(adaptive_dir, runtime_pool)
-                payload = {
-                    "schema_version": "adaptive_production_driver_summary_v1",
-                    "status": "interrupted_after_checkpoint",
-                    "interrupted_segment": str(final_dir),
-                    "epochs_completed": int(len(epoch_summaries)),
-                    "epoch_summaries": _json_ready(epoch_summaries),
-                }
+                payload = _interrupted_driver_summary(
+                    final_dir, epoch_summaries, prior_extension_summaries)
                 write_json(summary_path, payload)
                 return payload
             runtime_pool.consume(
@@ -9066,6 +9091,7 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
     # final_extension_001 and colliding with already-completed round directories.
     extension_summaries: List[Dict[str, Any]] = list(prior_extension_summaries)
     start_ext_round = len(prior_extension_summaries)
+    _check_extension_rounds_on_disk(adaptive_dir, start_ext_round)
     _refresh_stale_extension_diagnostics(adaptive_dir, prior_extension_summaries, registry, policy)
     final_diag = collect_final_combined_diagnostics(adaptive_dir, registry, policy=policy)
     quality_gate = evaluate_adaptive_quality_gate(
@@ -9159,13 +9185,8 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             run_gareus(ext_args, ext_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
             if _graceful_shutdown.is_set():
                 _write_runtime_pool_reports(adaptive_dir, runtime_pool)
-                payload = {
-                    "schema_version": "adaptive_production_driver_summary_v1",
-                    "status": "interrupted_after_checkpoint",
-                    "interrupted_segment": str(ext_dir),
-                    "epochs_completed": int(len(epoch_summaries)),
-                    "epoch_summaries": _json_ready(epoch_summaries),
-                }
+                payload = _interrupted_driver_summary(
+                    ext_dir, epoch_summaries, extension_summaries)
                 write_json(summary_path, payload)
                 return payload
             runtime_pool.consume(
