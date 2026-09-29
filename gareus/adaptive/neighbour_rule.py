@@ -1,10 +1,12 @@
 """One per-pair restraint-width neighbour rule (spec P7a, Section 3.0).
 
 Which umbrella states are spatial neighbours of which: the rule 3.1's edge
-metric measures (every same-rung pair within the radius), and the rule P7b will
-switch the exchange graph (`windows.build_explicit_2d_neighbor_edges`), the
-top-up partners (`layout_neighbours.spatial_neighbour_pairs`) and
-`ladder_overlap` to. Nothing calls it yet; this module changes no behaviour.
+metric measures (every same-rung pair within the radius). P7b consumers: the
+exchange graph (`windows.restraint_width_neighbor_edges`) and the top-up
+partners (`layout_neighbours.p7a_spatial_neighbour_pairs`), both only under
+``--layout-neighbour-rule restraint-width`` (default legacy); and, always,
+`chain_edges` -- the true-neighbour chains `build_geometry_edges` is built from
+(P7a distance for the nearest-neighbour choice, adjacency not radius).
 
 Distance
 --------

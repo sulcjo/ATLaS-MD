@@ -434,3 +434,169 @@ def test_both_loaders_take_roles_from_either_schema(tmp_path, version):
     assert [bool(s.metadata.get("mandatory")) for s in reg.all_states()] == [s["mandatory"] for s in rec["states"]]
     if version == "v2":
         assert [s.metadata.get("region") for s in reg.all_states()] == [s["region"] for s in rec["states"]]
+
+
+# ---- D: consumers on the P7a rule, behind --layout-neighbour-rule ----------------------------
+
+def _c9_windows(lambdas=C9_LAMBDAS):
+    """chignolin_9's window table order (centre-major, rungs inner): c1, k1, c2, k2, lambda."""
+    rows = [(c1, k1, c2, k2, lam) for _sid, c1, k1, c2, k2 in C9_LAMBDA0 for lam in lambdas]
+    return [np.asarray([r[i] for r in rows], dtype=float) for i in range(5)]
+
+
+class _Args:
+    def __init__(self, rule):
+        self.layout_neighbour_rule = rule
+        self.temperature_k = 300.0
+        self.secondary_cv = "residual-torsion-pc"
+
+
+def test_the_exchange_graph_is_unchanged_under_the_default_rule():
+    from gareus.windows import build_explicit_2d_neighbor_edges
+    c1, k1, c2, k2, lam = _c9_windows()
+    plain = build_explicit_2d_neighbor_edges(c1, c2, args=None)
+    assert build_explicit_2d_neighbor_edges(c1, c2, args=_Args("legacy"), k1=k1, k2=k2, lambdas=lam) == plain
+    assert {e["edge_type"] for e in plain} <= {"distance_axis", "secondary_axis", "knn_geometry",
+                                               "connectivity_bridge"} | {
+        "+".join(sorted(t)) for t in (("distance_axis", "knn_geometry"), ("knn_geometry", "secondary_axis"),
+                                      ("distance_axis", "knn_geometry", "secondary_axis"),
+                                      ("distance_axis", "secondary_axis"))}
+
+
+def _pattern_of(k1, k2):
+    return (bool(k1 > 0), bool(k2 > 0))
+
+
+def test_the_restraint_width_exchange_graph_on_the_c9_ladder():
+    from gareus.adaptive.neighbour_rule import DEFAULT_RADIUS
+    from gareus.windows import build_explicit_2d_neighbor_edges
+    c1, k1, c2, k2, lam = _c9_windows()
+    edges = build_explicit_2d_neighbor_edges(c1, c2, args=_Args("restraint-width"), k1=k1, k2=k2, lambdas=lam)
+    n = len(c1)
+    types = Counter()
+    for e in edges:
+        a, b, ts = e["wi"], e["wj"], set(e["edge_type"].split("+"))
+        types.update(ts)
+        if lam[a] != lam[b]:                       # across rungs: only adjacent rungs of one centre
+            assert ts == {"lambda_neighbor"}, e
+            assert (c1[a], c2[a], k1[a], k2[a]) == (c1[b], c2[b], k1[b], k2[b])
+            assert abs(C9_LAMBDAS.index(lam[a]) - C9_LAMBDAS.index(lam[b])) == 1
+            continue
+        if _pattern_of(k1[a], k2[a]) != _pattern_of(k1[b], k2[b]):
+            assert ts == {"pattern_link"}, e       # no placeholder-coordinate neighbour
+            continue
+        if ts == {"p7a_neighbor"}:
+            assert e["normalized_distance"] <= DEFAULT_RADIUS + 1e-12
+    assert types["lambda_neighbor"] == 59 * 3
+    assert types["pattern_link"] == 3 * 4           # per rung: CV1-only/2D, CV2-only/2D, anchor
+    # connected, and the anchor stack exchanges with someone on every rung
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            x = parent[x]
+        return x
+    for e in edges:
+        ra, rb = find(e["wi"]), find(e["wj"])
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+    assert len({find(w) for w in range(n)}) == 1
+    anchors = [w for w in range(n) if k1[w] == 0 and k2[w] == 0]
+    assert all(any(w in (e["wi"], e["wj"]) and lam[e["wi"]] == lam[e["wj"]] for e in edges) for w in anchors)
+
+
+def test_the_restraint_width_exchange_graph_falls_back_when_k_is_missing():
+    from gareus.windows import build_explicit_2d_neighbor_edges
+    c1 = np.array([0.3, 0.3, 0.4, 0.4])
+    c2 = np.array([-0.5, 0.5, -0.5, 0.5])
+    edges = build_explicit_2d_neighbor_edges(c1, c2, args=_Args("restraint-width"))   # no k, no lambdas
+    pairs = {(e["wi"], e["wj"]) for e in edges}
+    assert {(0, 2), (1, 3), (0, 1), (2, 3)} <= pairs and all(np.isfinite(e["normalized_distance"]) for e in edges)
+
+
+def test_an_unknown_rule_is_refused():
+    from gareus.windows import build_explicit_2d_neighbor_edges
+    with pytest.raises(ValueError):
+        build_explicit_2d_neighbor_edges(np.array([0.1, 0.2]), np.array([0.0, 0.0]), args=_Args("nope"))
+
+
+def test_topup_partners_follow_the_rule_and_p6_negative_k():
+    from gareus.adaptive.neighbour_rule import DEFAULT_RADIUS, NeighbourPoint, pair_distance
+    from gareus.layout_neighbours import spatial_neighbour_pairs
+    c1, k1, c2, k2, lam = _c9_windows()
+    legacy = spatial_neighbour_pairs(c1, c2, lam, k1, k2, 300.0)
+    assert spatial_neighbour_pairs(c1, c2, lam, k1, k2, 300.0, rule="legacy") == legacy
+    p7a = spatial_neighbour_pairs(c1, c2, lam, k1, k2, 300.0, rule="restraint-width")
+    assert set(legacy) <= set(p7a)                  # P7a: a superset on c9 (235 vs 108 edges per rung)
+    assert len(p7a) == 4 * 235 and len(legacy) == 4 * 108
+    for a, b in p7a:
+        assert lam[a] == lam[b] and _pattern_of(k1[a], k2[a]) == _pattern_of(k1[b], k2[b])
+        pa = NeighbourPoint(c1[a], k1[a], c2[a], k2[a]); pb = NeighbourPoint(c1[b], k1[b], c2[b], k2[b])
+        assert pair_distance(pa, pb, 300.0) <= DEFAULT_RADIUS + 1e-12
+    # a negative k is unrestrained (P6), as a recorded 0 already was
+    neg = spatial_neighbour_pairs([0.1, 0.2, 0.3], [0.0, 0.0, 0.5], [0, 0, 0], [300.0, 300.0, -5.0],
+                                  [0.0, 0.0, 1.2], 300.0)
+    assert all(2 not in p for p in neg)
+
+
+def test_topup_layout_neighbours_read_the_campaign_rule(monkeypatch):
+    import gareus.adaptive_production as ap
+    import gareus.layout_neighbours as ln
+    seen = []
+    real = ln.spatial_neighbour_pairs
+    monkeypatch.setattr(ln, "spatial_neighbour_pairs", lambda *a, **k: (seen.append(k.get("rule")), real(*a, **k))[1])
+    reg = _c9_registry()
+    for rule in ("legacy", "restraint-width"):
+        ap._topup_layout_neighbours(_Args(rule), reg.active_states())
+    assert seen == ["legacy", "restraint-width"]
+
+
+def test_the_rule_is_a_frozen_decision_setting_threaded_into_phase_args(tmp_path):
+    import gareus.adaptive_production as ap
+    from gareus.cli import parse_args
+    args = parse_args(["--seq", "GYDPETGTWG", "--out", str(tmp_path)])
+    assert args.layout_neighbour_rule == "legacy"
+    args = parse_args(["--seq", "GYDPETGTWG", "--out", str(tmp_path), "--layout-neighbour-rule", "restraint-width"])
+    pol = ap.policy_from_args(args)
+    assert pol.layout_neighbour_rule == "restraint-width" and "layout_neighbour_rule" in ap.DECISION_SETTINGS_FIELDS
+    ap._resolve_decision_settings(tmp_path, AdaptiveDecisionPolicy())            # first job: legacy frozen
+    later, rec = ap._resolve_decision_settings(tmp_path, pol)                    # a later job's flag is ignored
+    assert later.layout_neighbour_rule == "legacy" and rec["settings"]["layout_neighbour_rule"] == "legacy"
+    src = Path(ap.__file__).read_text()
+    assert "args.layout_neighbour_rule = str(policy.layout_neighbour_rule)" in src
+
+
+def test_ladder_overlap_gains_a_cv2_axis_on_true_cv2_neighbours():
+    from gareus.mbar_analysis.ladder_overlap import ladder_overlap_by_axis, ladder_overlap_health_checks
+    c1, k1, c2, k2, lam = _c9_windows()
+    seen = []
+
+    def _ov(a, b):
+        seen.append((a, b))
+        return 0.38
+    out, warnings = ladder_overlap_by_axis(None, lam, c1, pair_overlap=_ov, secondary_centers=c2,
+                                           primary_k=k1, secondary_k=k2)
+    assert warnings == []
+    cv2 = out["cv2_direction"]
+    pairs = {tuple(sorted((int(a), int(b)))) for a, b, _v in cv2["pairs"]}
+    for a, b in pairs:
+        assert lam[a] == lam[b] and _pattern_of(k1[a], k2[a]) == _pattern_of(k1[b], k2[b])
+        if k1[a] > 0:
+            assert c1[a] == c1[b]                  # one CV1 column
+        lo, hi = sorted((c2[a], c2[b]))
+        between = [w for w in range(len(c1)) if lam[w] == lam[a] and _pattern_of(k1[w], k2[w]) ==
+                   _pattern_of(k1[a], k2[a]) and (k1[a] == 0 or c1[w] == c1[a]) and lo < c2[w] < hi]
+        assert not between                         # adjacent rows only
+    assert cv2["n_pairs"] == 27 * 4 and cv2["connected"] is True
+    names = [c["name"] for c in ladder_overlap_health_checks(out, 0.15)]
+    assert "Overlap across CV2" in names and "Connectivity across CV2" in names and len(names) == 6
+
+
+def test_a_cv1_only_ladder_overlap_report_keeps_its_two_axes():
+    from gareus.mbar_analysis.ladder_overlap import ladder_overlap_by_axis, ladder_overlap_health_checks
+    lam = np.array([0.0, 0.0, 1.0, 1.0])
+    cen = np.array([0.2, 0.3, 0.2, 0.3])
+    out, _w = ladder_overlap_by_axis(None, lam, cen, pair_overlap=lambda a, b: 0.3,
+                                     secondary_centers=np.full(4, np.nan))
+    assert set(out) == {"lambda_direction", "cv1_direction"}
+    assert len(ladder_overlap_health_checks(out, 0.15)) == 4

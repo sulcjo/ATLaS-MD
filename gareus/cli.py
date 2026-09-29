@@ -760,6 +760,14 @@ def _add_gamd_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--exchange-mode",
                    choices=["neighbor", "random-pair", "all-pair-sweep", "gibbs-walk"],
                    default="neighbor")
+    p.add_argument("--layout-neighbour-rule", choices=["legacy", "restraint-width"], default="legacy",
+                   help="Which windows of an explicit 2D layout are neighbours for the exchange graph "
+                        "(drives swaps under --exchange-mode neighbor), the post-pull drop connectivity "
+                        "check and the top-up partners (spec P7b). legacy (default): today's graphs. "
+                        "restraint-width: the P7a rule -- same rung, same restraint pattern, per-pair "
+                        "restraint-width distance <= 2.5, plus true-neighbour chains, adjacent-rung "
+                        "edges and pattern links so the graph stays connected. Adaptive campaigns "
+                        "freeze it with their decision settings.")
     p.add_argument("--report-interval", type=int, default=5000)
     p.add_argument("--traj-interval", type=int, default=5000)
     p.add_argument("--traj-format", choices=["dcd", "xtc", "none"], default="dcd")

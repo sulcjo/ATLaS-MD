@@ -511,6 +511,11 @@ class AdaptiveDecisionPolicy:
     # (100 from the spec-T2 calibration: floor 200's error rates, fewer edges unmeasured).
     edge_metric: str = "marginal"
     min_edge_neff: float = 100.0
+    # Spec P7b (--layout-neighbour-rule): which windows are neighbours for the phases'
+    # exchange graph, post-pull drop connectivity and top-up partners. "legacy" = the
+    # pre-P7b graphs; "restraint-width" = the P7a rule. MD-driving, so frozen here and
+    # threaded into every phase's args by the driver.
+    layout_neighbour_rule: str = "legacy"
 
 
 LADDER_SETTINGS_FIELDS = ("ladder_adapt", "ladder_min_overlap", "ladder_overlap_quantile", "ladder_min_ess",
@@ -530,6 +535,7 @@ DECISION_SETTINGS_FIELDS = (
     "cv2_coupling_gate", "max_coupling_fraction",
     "slow_mode_reseed_fraction",
     "edge_metric", "min_edge_neff",
+    "layout_neighbour_rule",
 )
 DECISION_SETTINGS_FILENAME = "decision_settings.json"
 
@@ -6731,7 +6737,9 @@ def _topup_layout_neighbours(args, active):
     k1 = [float(s.primary_k) for s in active]
     k2 = [float(s.secondary_k or 0.0) for s in active]
     temperature = float(getattr(args, "temperature_k", 300.0) or 300.0)
-    pairs = spatial_neighbour_pairs(c1, c2, lam, k1, k2, temperature)
+    # Spec P7b: the campaign's frozen --layout-neighbour-rule (legacy by default).
+    rule = str(getattr(args, "layout_neighbour_rule", "legacy") or "legacy")
+    pairs = spatial_neighbour_pairs(c1, c2, lam, k1, k2, temperature, rule=rule)
     nb_local, rp_local = same_rung_neighbours(pairs, lam), other_rung_same_centre(c1, c2, lam)
     neighbours = {ids[w]: [ids[x] for x in nb_local.get(w, [])] for w in range(len(ids))}
     rung_partners = {ids[w]: [ids[x] for x in rp_local.get(w, [])] for w in range(len(ids))}
@@ -7855,6 +7863,7 @@ def policy_from_args(args: Any) -> AdaptiveDecisionPolicy:
         max_coupling_fraction=_arg_float(args, "adaptive_production_max_coupling_fraction", 0.25),
         slow_mode_reseed_fraction=_arg_float(args, "adaptive_production_slow_mode_reseed_fraction", 0.0),
         edge_metric=str(getattr(args, "adaptive_production_edge_metric", "marginal") or "marginal"),
+        layout_neighbour_rule=str(getattr(args, "layout_neighbour_rule", "legacy") or "legacy"),
         min_edge_neff=_arg_float(args, "adaptive_production_min_edge_neff", 100.0),
     )
 
@@ -8164,6 +8173,10 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
     policy, _decision_record = _resolve_decision_settings(
         adaptive_dir, policy, override=_arg_bool(args, "adaptive_production_decision_settings_override", False))
     _record_decision_settings_in_manifest(out_dir, _decision_record)
+    # Spec P7b: the neighbour rule drives MD inside the phases (exchange graph, drop
+    # connectivity, top-up partners), so every phase runs with the campaign's frozen value,
+    # whatever this job's --layout-neighbour-rule says (phase args are copies of args).
+    args.layout_neighbour_rule = str(policy.layout_neighbour_rule)
     max_epochs = max(1, _arg_int(args, "adaptive_production_epochs", 3))
     # Epoch 0 also bootstraps the tICA model and (when enabled) the shared GaMD
     # envelope recalibration -- both need only a short look at real sampling, not
