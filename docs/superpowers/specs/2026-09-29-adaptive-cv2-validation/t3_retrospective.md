@@ -21,14 +21,16 @@ recorded samples. No MD was run and no state was created.
    - Section 5 has the evidence. This is a bug to fix before `pairwise-mbar` becomes the default,
      and before R1 (3.3) uses these edges.
 2. **Threshold calibration.** The data show no overlap level at which an edge stops working.
-   - Down to the smallest measured overlap, 0.065, every reference behaves smoothly:
-     - two-state Δf σ matches iid BAR theory within 1-8 %;
-     - two-state and union Δf agree (median |ΔΔf| 0.04-0.08 kT);
+   - At every measured overlap, down to 0.065:
+     - the direct two-state Δf agrees with the union's multi-path Δf (median |ΔΔf| 0.04-0.08 kT);
      - realised replica transitions fall smoothly as about O^2.3, from about 115 /ns at 0.45 to
        about 1-1.6 /ns below 0.08, and no pair has zero transitions.
    - The largest error that is actually present is time non-stationarity. First-half vs
      second-half Δf differs by 0.03-0.17 kT (median), 2-3x the iid σ, at every overlap.
-   - So the data can only say that the failure threshold is **below 0.065**.
+   - None of the 105 edges below 0.15 is a cut edge: removing every edge below 0.10, or below
+     0.15, still leaves 1 component. So the data show that a direct estimate across an edge at
+     O = 0.065-0.15 is accurate. They say nothing about an edge that is a graph's only
+     connection, and they do not locate a failure point.
    - Recommendation: keep `min_rung_overlap` = 0.15 as the weak threshold for spatial edges,
      with moderate confidence that it is not too strict. It corresponds to 2.5 sampled-sd spacing
      and gives σ(Δf) ≤ 0.1 kT at n_eff ≥ 470. It should only be applied to true adjacent pairs.
@@ -38,19 +40,27 @@ recorded samples. No MD was run and no state was created.
      the degree-1 fit the fraction is linear in k2, so it would take k2 of about 80 (70x the
      deployed value) to reach 0.25.
    - The 4 CV1-unrestrained (k1 = 0) windows score 0.42 on the mean-shift bound. But:
-     - the realised CV1 shift is ≤ 0.25 anchor-sd in all 7 phases, and ≤ 0.06 on the pooled
-       final data;
-     - the gate's linear-response prediction has the wrong sign for the outer windows in 5 of 7
-       phases.
+     - the realised CV1 shift, as a mean over 6 disjoint phases ± SE, is -0.14 ± 0.05,
+       -0.04 ± 0.03, +0.05 ± 0.02 and -0.01 ± 0.06 anchor-sd;
+     - the gate's linear-response prediction is +0.21, +0.07, -0.09 and -0.26, which is 3.7-6.8
+       SE from the realised value, with the opposite sign in 3 of 4 windows;
+     - the bound 0.42 sits 5.5-17 SE above the realised |shift|.
    - Lowering k2 to 0.42, as the gate would, raises the adjacent CV2-only overlap from 0.39 to
      0.47, which makes those windows close to redundant, with no benefit seen.
    - Recommendation: do not enforce the k1 = 0 shift branch with the current mechanical model.
      Either drop it, or gate on a realised shift with its own threshold (≥ 0.5 sd would pass
      every c9 window). The data give no basis to change 0.25 for the curvature branch, because
      it is never approached.
-4. **Proposer dry-run (caps lifted).**
-   - Pairwise-mbar would propose 3-11 bridge centres per epoch on c9, i.e. 12-44 states on
-     4 rungs (5-19 % of 236). Marginal would propose 3-8 centres.
+4. **Proposer dry-run.**
+   - Validation: with the campaign's own recorded policy and caps, the dry-run reproduces the
+     recorded actions exactly, 236 `extend` on c9 and 64 on c7 in each of epochs 0-2. c9 used
+     `min_samples_for_add` 20000 and `min_samples_for_retire` 30000.
+   - That sample floor blocks every bridge in the numbered epochs, on both metrics. So on c9 as
+     configured the artefacts would never have reached the registry.
+   - With default rules and caps lifted:
+     - pairwise-mbar would propose 3-11 bridge centres per epoch on c9, i.e. 12-44 states on
+       4 rungs (5-19 % of 236);
+     - marginal would propose 3-8 centres.
    - Every proposal on both metrics targets an artefact edge (item 1). With the edge set fixed,
      the expected need is 0.
    - chignolin_7: 0 proposals on both metrics. No `add_rung` is proposed pre-union (by design).
@@ -194,7 +204,7 @@ Checks on the method:
 
 chignolin_9, binned by the two-state union overlap (`scripts/t3_calibration_summary.py`):
 
-| O bin | n | σ(Δf) kT (med) | σ / iid theory | \|2-state − union Δf\| kT (med, q90) | \|Δf half1 − half2\| kT (med, q90) | \|z_split\| > 2 | union-f overlap − 2-state | acceptance (med) | transitions /ns (med, min) |
+| O bin | n | σ(Δf) kT (med) | σ / iid theory (sanity check) | \|2-state − union Δf\| kT (med, q90) | \|Δf half1 − half2\| kT (med, q90) | \|z_split\| > 2 | union-f overlap − 2-state | acceptance (med) | transitions /ns (med, min) |
 |---|---:|---:|---:|---|---|---:|---:|---:|---|
 | < 0.08 | 8 | 0.069 | 0.99 | 0.078, 0.240 | 0.174, 0.278 | 5 / 8 | 0.000 | 0.38 | 1.6, 0.9 |
 | 0.08-0.10 | 23 | 0.056 | 0.99 | 0.036, 0.158 | 0.173, 0.283 | 12 / 23 | 0.000 | 0.41 | 2.7, 1.1 |
@@ -216,15 +226,22 @@ chignolin_9, binned by the two-state union overlap (`scripts/t3_calibration_summ
   - the half-to-half drift is 0.03-0.71 kT with no dependence on O. Its union is not
     g-subsampled, so the iid σ understates the error and |z_split| > 2 on 24/29 edges.
 
+The σ / theory column compares an iid bootstrap on g-subsampled rows with the iid asymptotic
+formula. The two agree by construction, so the column only confirms that the estimator is
+implemented correctly. It is not evidence about gaps.
+
 ### 3.3 What the data support
 
-- **No failure point in range.** Down to O = 0.065 (c9) and 0.081 (c7), nothing that
-  distinguishes a gap from an edge appears:
-  - σ(Δf) follows the iid theory;
-  - the union f and the pair's own Δf agree;
+- **No failure seen in range, and none could be seen.** Down to O = 0.065 (c9) and 0.081 (c7):
+  - the direct two-state Δf agrees with the union's multi-path Δf;
   - the post-union (`ouf`) and pre-union values are identical to 3 decimals;
   - replicas still cross at ≥ 0.9 /ns;
   - no pair has zero transitions.
+- **The graph is redundant.** None of the 105 c9 edges below 0.15 is a cut edge (bridge), and
+  the graph stays 1 component after removing every edge below 0.10 or below 0.15. So the
+  evidence is that a direct estimate across an edge at O ≥ 0.065 is accurate. It is not
+  evidence that an edge at that overlap would still hold the free energies together if it
+  were the only connection.
 - **The error that exists does not come from overlap.** The half-to-half Δf drift is
   0.03-0.17 kT (median) and exceeds 2 σ_iid on about 50 % of c9 edges in every bin. It grows
   about 5x from high to low overlap in absolute kT. That is slow orthogonal dynamics, which
@@ -235,9 +252,8 @@ chignolin_9, binned by the two-state union overlap (`scripts/t3_calibration_summ
   - anything about rung edges beyond the union values above (no pre-union rung metric exists).
 - **Proposed thresholds.**
   - Keep weak = 0.15 and target = 0.25 on the pairwise scale. Confidence: moderate that 0.15 is
-    not too strict, since there is a ≥ 2x margin to the lowest overlap seen working. Low
-    confidence on where it should be, since the data only bound the failure point from above
-    at 0.065.
+    not too strict, since non-cut edges at 0.065 are measured accurately. Low confidence on where
+    it should be, because no sole-connection edge or real gap exists in these data.
   - Justification: 0.15 is a 2.5-sd spacing, 1.7x the spec's 1.5-sd design spacing. It keeps
     σ(Δf) ≤ 0.1 kT at the n_eff ≥ 470 these edges have. No c9/c7 true adjacent pair falls
     below it:
@@ -290,10 +306,21 @@ gate LR prediction / anchor-regression prediction:
 | final_extension_002 | -0.03 / +0.22 / 0.00 | -0.01 / +0.07 / 0.00 | +0.12 / -0.08 / 0.00 | -0.04 / -0.26 / 0.00 |
 | final-combined | -0.06 / +0.22 / -0.05 | -0.01 / +0.07 / -0.02 | +0.05 / -0.09 / +0.02 | +0.04 / -0.25 / +0.05 |
 
-- The realised shift never exceeds 0.25 anchor-sd, and on pooled data it is ≤ 0.06.
-- The gate's mechanical prediction has a fixed sign set by dz/dc and the realised z offset.
-  For the outer windows it is opposite to the realised shift in 5 of 7 phases (64) and 4 of 7
-  (76).
+Mean over the 6 disjoint phases (epoch_000 through final_extension_002) ± SE, where
+SE = phase sd / √6. Sequential seeding makes the phases not strictly independent.
+
+| window | realised (anchor sd) | phase sd | gate LR prediction | (prediction − realised) / SE | (0.419 − \|realised\|) / SE |
+|---|---|---:|---:|---:|---:|
+| 64 | -0.139 ± 0.051 | 0.125 | +0.211 | 6.8 | 5.5 |
+| 68 | -0.043 ± 0.030 | 0.073 | +0.068 | 3.7 | 12.6 |
+| 72 | +0.051 ± 0.022 | 0.053 | -0.089 | -6.4 | 16.9 |
+| 76 | -0.005 ± 0.064 | 0.157 | -0.258 | -3.9 | 6.5 |
+
+- The gate's prediction is 3.7-6.8 SE from the realised shift, with the opposite sign in 3 of
+  4 windows. The bound 0.42 is 5.5-17 SE above the realised |shift|.
+- Individual phases scatter by ±0.2 sd. Single-phase values up to 0.25 are therefore within
+  noise of the 0.25 threshold and cannot by themselves show the true shift is below it; the
+  pooled means above can (≤ 0.14 + 2 SE = 0.24 for the worst window).
 - The realised shift follows the anchor's own equilibrium c-z correlation (corr ≈ 0.13 in
   epoch_002). That correlation is not stable between phases. This is the thermodynamic effect,
   which the explicit-derivative model does not contain.
@@ -316,9 +343,9 @@ for the adjacent overlap (measured pairwise at 1.18: 0.38 / 0.39 / 0.39):
 - **Coupling threshold call.**
   - k1 > 0: the data cannot decide. The gate is never within a factor of 60 of binding.
   - k1 = 0: the evidence goes against enforcing the shift branch at 0.25 with this model. The
-    realised shift is below the threshold in every phase, the model's predictor has no skill
-    (wrong sign), and obeying it would roughly halve the useful CV2 resolution of the axis
-    windows.
+    pooled realised shift is ≤ 0.14 ± 0.05 sd, the predictor misses by 3.7-6.8 SE with the
+    wrong sign in 3 of 4 windows, and obeying it would roughly halve the useful CV2 resolution
+    of the axis windows.
   - If a shift gate is kept, base it on the realised shift, with its own threshold (for
     example ≥ 0.5 sd) and its between-phase spread (±0.2 sd here) as the noise floor.
   - Only c9 (one k2, one CV2 definition) was available, so this is a single-point check, not a
@@ -365,6 +392,22 @@ On chignolin_9 λ = 0:
 
 ## 6. Task 4: proposer dry-run (cap-ignoring)
 
+**Validation against the real campaign.** First, `--policy-from epoch_002/adaptive_epoch_actions.json
+--real-caps` was run: the campaign's own recorded policy, which differs from the defaults in
+`min_samples_for_add` 20000, `min_samples_for_retire` 30000, `retire_converged` False, pool
+sizes and seed-bank size. It reproduces the recorded actions exactly on both metrics:
+
+- c9 epochs 0-2: 236 `extend` each (reason "below minimum retirement sample count"), 0 adds;
+- c7 epochs 0 and 2: 64 `extend` each.
+
+A per-epoch state never reaches 20,000 samples, so under c9's rules neither metric bridges
+anything in a numbered epoch. Only the final-combined payload clears the floor. There, with
+the recorded caps (4 new windows), marginal would place 4 centres and pairwise-mbar 2 (164-200).
+The final phase is frozen and never runs the proposer, so this last result is hypothetical.
+
+The table below uses the DEFAULT rules (`min_samples_for_add` 50) with caps lifted. It shows
+what the metric itself asks for.
+
 `propose_actions_from_diagnostics` was run on a deep copy of the registry with
 `max_new_windows_per_epoch` = `max_new_rungs_per_epoch` = 10000, `max_replicas_budget` = 0,
 T = 300 K and `cv2_k_max` from the run manifest. Nothing was applied
@@ -393,6 +436,7 @@ time.
 - R1's structural "immediate" case never occurs: 1 component in every phase once unmeasured edges
   are kept.
 - Do not set the reserve from these counts until Section 5 is fixed and the dry-run is re-run.
+- Under c9's own rules the reserve need was 0 regardless: the sample floor blocked every add.
 
 ## 7. Task 5: X8 discovery census (cited, not re-run)
 
@@ -432,9 +476,13 @@ Scripts are in `docs/superpowers/specs/2026-09-29-adaptive-cv2-validation/script
 - `t3_exchange_transitions.py`: Task 2 (b);
 - `t3_calibration_summary.py`;
 - `t3_coupling.py`: Task 3;
-- `t3_proposer_dryrun.py`: Task 4.
+- `t3_proposer_dryrun.py`: Task 4 (`--policy-from`, `--real-caps` for the validation run);
+- `t3_cut_edges_and_coupling_se.py`: cut-edge check and the k1 = 0 shift SE.
 
-Outputs are in `/tmp/t3/`, outside the repo and not committed:
+The full per-phase class tables and every weak edge of every phase (Task 1) are committed as
+`t3_edge_tables.txt` next to this report.
+
+Other outputs are in `/tmp/t3/`, outside the repo and not committed:
 
 - payloads and NPZ sidecars: `out/<campaign>/<phase>/`;
 - `tables.{json,txt}`;

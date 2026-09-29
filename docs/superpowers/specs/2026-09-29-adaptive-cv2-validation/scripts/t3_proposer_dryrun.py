@@ -1,6 +1,11 @@
 """T3 task 4: cap-ignoring proposer dry-run, marginal vs pairwise-mbar, on replayed payloads.
 
-Usage: python t3_proposer_dryrun.py <adaptive_dir> <out.json> <payload.json> [<payload.json> ...]
+Usage: python t3_proposer_dryrun.py <adaptive_dir> <out.json> [--policy-from actions.json] [--real-caps]
+       <payload.json> [<payload.json> ...]
+
+``--policy-from`` builds the policy from a recorded ``adaptive_epoch_actions.json`` ``policy``
+(the campaign's own rules, e.g. chignolin_9's min_samples_for_add = 20000); ``--real-caps``
+keeps that policy's caps (validation against the recorded actions) instead of lifting them.
 
 Nothing is applied and nothing is written except ``out.json``: the registry is loaded fresh
 (and deep-copied) for every call; ``propose_actions_from_diagnostics`` only reads it.
@@ -16,14 +21,29 @@ from pathlib import Path
 
 import gareus.adaptive_production as ap
 
-ad = Path(sys.argv[1])
-out = Path(sys.argv[2])
+import dataclasses
+
+argv = list(sys.argv[1:])
+real_caps = "--real-caps" in argv
+if real_caps:
+    argv.remove("--real-caps")
+base = {}
+if "--policy-from" in argv:
+    i = argv.index("--policy-from")
+    rec = json.loads(Path(argv[i + 1]).read_text())["policy"]
+    names = {f.name for f in dataclasses.fields(ap.AdaptiveDecisionPolicy)}
+    base = {k: v for k, v in rec.items() if k in names and k != "edge_metric" and v is not None}
+    del argv[i:i + 2]
+ad = Path(argv[0])
+out = Path(argv[1])
+payload_paths = argv[2:]
 man = json.loads((ad / "final" / "baseline" / "run_manifest.json").read_text()) \
     if (ad / "final" / "baseline" / "run_manifest.json").exists() else {}
 ra = man.get("resolved_args", {})
 k2max = ra.get("cv2_k_max")
 T = float(ra.get("temperature_k", 300.0))
 CAPS = dict(max_new_windows_per_epoch=10000, max_new_rungs_per_epoch=10000, max_replicas_budget=0)
+CAPS = {**base} if real_caps else {**base, **CAPS}
 
 
 def strip(payload):
@@ -49,7 +69,7 @@ def summarise(actions, plan):
 
 
 res = {}
-for path in sys.argv[3:]:
+for path in payload_paths:
     payload = json.loads(Path(path).read_text())
     row = {}
     for name, pol, pay in (
