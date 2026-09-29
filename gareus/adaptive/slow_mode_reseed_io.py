@@ -330,7 +330,9 @@ def _targets(states) -> List[Dict[str, Any]]:
 
 
 def _default_seed_paths(seed_bank_dir) -> Dict[int, str]:
-    """target state -> the seed today's assignment would give it (for the before/after view)."""
+    """target state -> the seed the bank's state-aware assignment names for it. Without an
+    override, seeding re-ranks the whole filtered pool by CV distance, so the structure a
+    window is actually grafted from may be another state's seed; "assigned" is a proxy."""
     import csv
 
     if seed_bank_dir is None:
@@ -373,7 +375,7 @@ def _window_rows(targets, occ, plan, default_measured, default_paths, one_sided_
                      "minority_side": o.get("minority_side"),
                      "one_sided": bool(o) and o.get("n_frames", 0) >= X3.MIN_FRAMES_PER_STATE
                      and float(o.get("minority_fraction", 1.0)) <= one_sided_max,
-                     "default_seed_side": d.get("side"), "reseeded": c is not None,
+                     "assigned_seed_side": d.get("side"), "reseeded": c is not None,
                      "start_side_after": c["seed_side"] if c else d.get("side")})
     return rows
 
@@ -404,10 +406,30 @@ def _hidden_mode_report(mode, table, ctx, occ_all):
     }
 
 
+def seed_preflight(targets, seed_args=None) -> Dict[str, Any]:
+    """The seed preflight generate_us_starting_states_by_pulling applies to this window set
+    (same spacing helper over the same centres, same defaults and the same ``or`` fallbacks)."""
+    from gareus.seeding import _finite_spacing_scale
+
+    a = seed_args if seed_args is not None else argparse.Namespace()
+    mode = str(getattr(a, "seed_selection_mode", "auto") or "auto").strip().lower().replace("_", "-")
+    weight = max(0.0, float(getattr(a, "seed_secondary_weight", 1.0) or 0.0))
+    secondary = [t["secondary_center"] for t in targets if t.get("secondary_center") is not None]
+    return {"max_score": float(getattr(a, "us_seed_preflight_max_score", 1.2) or 1.2),
+            "primary_scale": _finite_spacing_scale([t["primary_center"] for t in targets], fallback=0.2),
+            "secondary_scale": _finite_spacing_scale(secondary, fallback=0.25) if secondary else None,
+            "secondary_weight": weight if mode in ("auto", "active-cv") else 0.0}
+
+
 def plan_epoch(phase_dirs, targets, ctx: PairContext, *, fraction: float, temperature_k: float,
                seed_bank_dir=None, lag_ps: float = X3.DEFAULT_LAG_PS, stride: int = DEFAULT_STRIDE,
-               timestep_fs: Optional[float] = None) -> Dict[str, Any]:
-    """Fit, measure and plan (no writes). Returns the report body."""
+               timestep_fs: Optional[float] = None, seed_args=None) -> Dict[str, Any]:
+    """Fit, measure and plan (no writes). Returns the report body.
+
+    ``seed_args`` (the campaign args, or anything carrying ``us_seed_preflight_max_score``,
+    ``seed_secondary_weight``, ``seed_selection_mode``) sets the seeding preflight the
+    chosen seeds must pass; ``None`` uses the CLI defaults.
+    """
     table = load_frame_table(phase_dirs, ctx, lag_ps=lag_ps, stride=stride, timestep_fs=timestep_fs)
     mode = X3.fit_hidden_mode(ctx.runtime.fit, ctx.runtime.j, table.X, table.cv1, table.member,
                               table.frame_index, lag=table.lag_steps)
@@ -416,9 +438,9 @@ def plan_epoch(phase_dirs, targets, ctx: PairContext, *, fraction: float, temper
     rt_kcal = X3.R_KCAL * float(temperature_k)
     default_paths = _default_seed_paths(seed_bank_dir)
     default_measured = measure_structures(sorted(set(default_paths.values())), ctx, mode)
-    default_sides = {sid: default_measured[p]["side"] for sid, p in default_paths.items() if p in default_measured}
+    assigned_sides = {sid: default_measured[p]["side"] for sid, p in default_paths.items() if p in default_measured}
     plan = X3.plan_reseed(targets, occ, candidates, fraction=fraction, rt_kcal=rt_kcal,
-                          default_sides=default_sides)
+                          assigned_sides=assigned_sides, preflight=seed_preflight(targets, seed_args))
     lam = {int(t["state_id"]): t["gamd_lambda"] for t in targets}
     for r in plan["reseeded"]:
         src = r.get("seed_source_state_id")
@@ -430,11 +452,14 @@ def plan_epoch(phase_dirs, targets, ctx: PairContext, *, fraction: float, temper
         "n_reseeded": plan["n_reseeded"],
         "n_seed_from_other_state": sum(1 for r in plan["reseeded"] if r["seed_from_other_state"]),
         "n_seed_from_other_rung": sum(1 for r in plan["reseeded"] if r["seed_from_other_rung"]),
-        "reseeded_default_seed_on_minority_side": sum(1 for w in resd if w["default_seed_side"] == w["minority_side"]),
-        "windows_starting_on_minority_side_before": sum(1 for w in windows if w["minority_side"] is not None
-                                                        and w["default_seed_side"] == w["minority_side"]),
-        "windows_starting_on_minority_side_after": sum(1 for w in windows if w["minority_side"] is not None
+        "reseeded_assigned_seed_on_minority_side": sum(1 for w in resd if w["assigned_seed_side"] == w["minority_side"]),
+        "windows_assigned_seed_on_minority_side": sum(1 for w in windows if w["minority_side"] is not None
+                                                        and w["assigned_seed_side"] == w["minority_side"]),
+        "windows_start_on_minority_side_after_x3": sum(1 for w in windows if w["minority_side"] is not None
                                                        and w["start_side_after"] == w["minority_side"]),
+        "assigned_seed_note": "assigned = the seed the bank's state-aware assignment names; without X3 "
+                              "seeding re-ranks the filtered pool by CV distance, so the grafted "
+                              "structure may differ. seed_from_other_rung = source state has another lambda",
         "n_candidates": len(candidates),
         "candidates_per_side": {str(s): sum(1 for c in candidates if c["side"] == s) for s in (0, 1)},
     }
@@ -482,7 +507,7 @@ def run_epoch_slow_mode_reseed(*, fraction: float, epoch_dir, phase_dirs, states
             ctx = load_pair_context(paths, solute)
             body = plan_epoch(phases, _targets(states), ctx, fraction=float(fraction),
                               temperature_k=float(getattr(args, "temperature_k", 300.0) or 300.0),
-                              seed_bank_dir=seed_bank_dir,
+                              seed_bank_dir=seed_bank_dir, seed_args=args,
                               timestep_fs=float(getattr(args, "timestep_fs", 0.0) or 0.0) or None)
             report.update(body)
             if body["reseeded"]:
@@ -526,6 +551,15 @@ def _registry_targets(adaptive_dir: Path, phases: Sequence[Path]) -> List[Dict[s
              "gamd_lambda": float(by_id[s].get("gamd_lambda") or 0.0)} for s in sids]
 
 
+def _campaign_args(adaptive_dir: Path):
+    """The campaign's recorded args (``run_args.json`` beside ``adaptive_production``), if any."""
+    path = Path(adaptive_dir).parent / "run_args.json"
+    try:
+        return argparse.Namespace(**json.loads(path.read_text()))
+    except (OSError, ValueError, TypeError):
+        return None
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="Read-only X3 replay on a finished campaign; writes only --out.")
     p.add_argument("adaptive_dir", type=Path)
@@ -544,7 +578,7 @@ def main(argv=None) -> int:
     ctx = load_pair_context(paths, phases[0] / "solute_only.pdb")
     body = plan_epoch(phases, _registry_targets(a.adaptive_dir, phases), ctx, fraction=a.fraction,
                       temperature_k=a.temperature_k, lag_ps=a.lag_ps, stride=a.stride,
-                      seed_bank_dir=a.seed_bank)
+                      seed_bank_dir=a.seed_bank, seed_args=_campaign_args(a.adaptive_dir))
     a.out.mkdir(parents=True, exist_ok=True)
     _write_report(a.out / X3.REPORT_NAME, {"schema_version": "slow_mode_reseed_v1", "status": "replay", **body})
     hm, s = body["hidden_mode"], body["summary"]

@@ -144,13 +144,13 @@ def test_window_without_admissible_candidate_is_skipped_and_the_next_takes_its_s
                                 "minority_side": 1, "minority_fraction": 0.01}]
 
 
-def test_default_seed_already_on_minority_side_is_not_reseeded():
+def test_assigned_seed_already_on_minority_side_is_not_reseeded():
     targets = _targets(3)
     occ = _occ({0: 0.01, 1: 0.05, 2: 0.5})
     cands = [_cand("a", 0.0, 1), _cand("b", 0.1, 1)]
-    plan = X3.plan_reseed(targets, occ, cands, fraction=0.34, rt_kcal=RT, default_sides={0: 1})
+    plan = X3.plan_reseed(targets, occ, cands, fraction=0.34, rt_kcal=RT, assigned_sides={0: 1})
     assert [r["target_state_id"] for r in plan["reseeded"]] == [1]
-    assert plan["skipped"][0]["reason"] == "default_seed_already_on_minority_side"
+    assert plan["skipped"][0]["reason"] == "assigned_seed_already_on_minority_side"
 
 
 def test_plan_is_deterministic_under_candidate_order_and_prefers_unused_seeds():
@@ -164,6 +164,59 @@ def test_plan_is_deterministic_under_candidate_order_and_prefers_unused_seeds():
         plans.append(X3.plan_reseed(targets, occ, shuffled, fraction=1.0, rt_kcal=RT))
     assert all(p["reseeded"] == plans[0]["reseeded"] for p in plans)
     assert [r["seed_path"] for r in plans[0]["reseeded"]] == ["near", "farther", "near", "farther"]
+
+
+def test_preflight_mirrors_seeding_scores():
+    t = {"primary_center": 0.30, "secondary_center": 1.0}
+    pf = {"max_score": 1.2, "primary_scale": 0.05, "secondary_scale": 0.8, "secondary_weight": 1.0}
+    assert X3.preflight_ok(0.30 + 0.059, 1.0 + 0.95, t, pf)
+    assert not X3.preflight_ok(0.30 + 0.061, 1.0, t, pf)                  # 1.22 spacings on CV1
+    assert not X3.preflight_ok(0.30, 1.0 + 0.97, t, pf)                   # 1.21 on CV2
+    assert X3.preflight_ok(0.30, 1.0 + 0.97, t, dict(pf, secondary_weight=0.0))
+    assert X3.preflight_ok(0.30, None, t, pf)                             # missing CV2 costs weight 1.0
+    assert X3.preflight_ok(9.0, 9.0, t, None)
+
+
+def test_plan_never_picks_a_seed_the_seeding_preflight_would_not_pull():
+    sig = math.sqrt(RT / 400.0)
+    targets = _targets(2)
+    occ = _occ({0: 0.01, 1: 0.5})
+    cands = [_cand("inside_sigma_but_far_in_spacings", 0.0 + 1.5 * sig, 1), _cand("close", 0.0 + 0.2 * sig, 1)]
+    pf = {"max_score": 1.2, "primary_scale": 1.0 * sig, "secondary_scale": None, "secondary_weight": 1.0}
+    plan = X3.plan_reseed(targets, occ, cands, fraction=0.5, rt_kcal=RT, preflight=pf)
+    assert [r["seed_path"] for r in plan["reseeded"]] == ["close"]
+    plan = X3.plan_reseed(targets, occ, cands[:1], fraction=0.5, rt_kcal=RT, preflight=pf)
+    assert plan["n_reseeded"] == 0 and plan["skipped"][0]["reason"] == "no_admissible_minority_side_candidate"
+
+
+def test_seed_preflight_uses_the_seeding_spacing_helper():
+    targets = [{"primary_center": c, "secondary_center": s} for c, s in ((0.1, 0.0), (0.2, 0.5), (0.3, 1.0))]
+    pf = IO.seed_preflight(targets, SimpleNamespace(us_seed_preflight_max_score=0.0, seed_secondary_weight=2.0,
+                                                    seed_selection_mode="distance"))
+    assert pf["primary_scale"] == pytest.approx(0.1) and pf["secondary_scale"] == pytest.approx(0.5)
+    assert pf["max_score"] == 1.2 and pf["secondary_weight"] == 0.0     # seeding's `or 1.2`; distance mode
+
+
+def test_override_matches_a_window_read_back_from_the_active_window_csv(tmp_path):
+    reg = ap.WindowStateRegistry()
+    reg.add_state(0.123456789012345, 400.0, secondary_center=-0.98765432109876, secondary_k=2.0, epoch=0, source="t")
+    csv_path = tmp_path / "windows.csv"
+    reg.write_active_window_csv(csv_path, map_path=tmp_path / "map.csv")
+    row = next(csv.DictReader(csv_path.open()))
+    bank = tmp_path / "adaptive_production" / "seed_bank_epoch_000"
+    (bank / "pdbs").mkdir(parents=True)
+    src = tmp_path / "end.pdb"
+    src.write_text("END\n")
+    s = reg.active_states()[0]
+    X3.write_overrides(bank, [{"target_state_id": s.state_id, "target_primary_center": s.primary_center,
+                               "target_secondary_center": s.secondary_center, "seed_path": str(src),
+                               "seed_cv1": 0.1, "seed_hidden_z": 1.0, "seed_side": 1}])
+    phase = tmp_path / "phase"
+    phase.mkdir()
+    (phase / "epoch_window_map.csv").write_text(f"epoch_window,state_id\n0,{s.state_id}\n")
+    got = X3.reseed_conformers_by_window(bank, phase, [float(row["primary_cv_center"])],
+                                         [float(row["secondary_cv_center"])], _fake_loader)
+    assert list(got) == [0]
 
 
 def test_too_few_frames_is_reported():

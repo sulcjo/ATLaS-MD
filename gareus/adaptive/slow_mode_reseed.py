@@ -208,6 +208,26 @@ def admissible(cv1: float, cv2: Optional[float], target: Mapping[str, Any], rt_k
     return restraint_distance(cv1, cv2, target, rt_kcal) <= float(n_sigma)
 
 
+def preflight_ok(cv1: float, cv2: Optional[float], target: Mapping[str, Any],
+                 preflight: Optional[Mapping[str, Any]]) -> bool:
+    """Would seeding pull from this seed? Mirrors generate_us_starting_states_by_pulling's
+    seed preflight: per axis |d| / window spacing (CV2 times its seed weight, a missing CV2
+    costing the weight) must not exceed ``--us-seed-preflight-max-score``; a seed past it is
+    not pulled at all, so X3 must never choose one. ``None`` or max <= 0 disables the check.
+    """
+    if not preflight or float(preflight.get("max_score", 0.0) or 0.0) <= 0.0:
+        return True
+    mx = float(preflight["max_score"])
+    if abs(float(cv1) - float(target["primary_center"])) / float(preflight["primary_scale"]) > mx:
+        return False
+    sc, w = target.get("secondary_center"), float(preflight.get("secondary_weight", 1.0) or 0.0)
+    if sc is None or w <= 0.0 or not preflight.get("secondary_scale"):
+        return True
+    if cv2 is None or not math.isfinite(float(cv2)):
+        return w <= mx
+    return w * abs(float(cv2) - float(sc)) / float(preflight["secondary_scale"]) <= mx
+
+
 def _n_target(fraction: float, n_windows: int) -> int:
     if fraction <= 0.0 or n_windows <= 0:
         return 0
@@ -219,7 +239,8 @@ def plan_reseed(targets: Sequence[Mapping[str, Any]], occupancy: Mapping[int, Ma
                 n_sigma: float = ADMISSIBLE_SIGMA,
                 one_sided_max: float = ONE_SIDED_MINORITY_MAX,
                 min_frames: int = MIN_FRAMES_PER_STATE,
-                default_sides: Optional[Mapping[int, int]] = None) -> Dict[str, Any]:
+                assigned_sides: Optional[Mapping[int, int]] = None,
+                preflight: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     """Choose which windows to reseed and from which end state. Deterministic.
 
     ``targets``: the next epoch's windows (state_id, primary/secondary centre and k).
@@ -229,9 +250,11 @@ def plan_reseed(targets: Sequence[Mapping[str, Any]], occupancy: Mapping[int, Ma
     (minority fraction, then more frames, then state_id), and up to
     floor(fraction x n_windows) of them are reseeded, each from the admissible
     minority-side candidate nearest its centre (in sigma_w), preferring candidates not yet
-    used. A window with no such candidate, or whose default seed (``default_sides``: state ->
-    side of the seed today's assignment gives it) is already on its minority side, is
-    skipped and the next one takes its slot.
+    used. Admissible = within ``n_sigma`` sigma_w on every restrained axis AND passing the
+    seeding preflight (:func:`preflight_ok`). A window with no such candidate, or whose
+    assigned seed (``assigned_sides``: state -> side of the seed-bank assignment's seed; the
+    structure actually grafted without X3 is re-ranked by CV distance and may differ) is
+    already on its minority side, is skipped and the next one takes its slot.
     """
     n_target = _n_target(fraction, len(targets))
     rows: List[Dict[str, Any]] = []
@@ -255,8 +278,8 @@ def plan_reseed(targets: Sequence[Mapping[str, Any]], occupancy: Mapping[int, Ma
             break
         sid = int(t["state_id"])
         want = int(occupancy[sid]["minority_side"])
-        if default_sides is not None and default_sides.get(sid) == want:
-            skipped.append({"state_id": sid, "reason": "default_seed_already_on_minority_side",
+        if assigned_sides is not None and assigned_sides.get(sid) == want:
+            skipped.append({"state_id": sid, "reason": "assigned_seed_already_on_minority_side",
                             "minority_side": want})
             continue
         ranked = []
@@ -264,7 +287,7 @@ def plan_reseed(targets: Sequence[Mapping[str, Any]], occupancy: Mapping[int, Ma
             if int(c["side"]) != want:
                 continue
             dist = restraint_distance(float(c["cv1"]), c.get("cv2"), t, rt_kcal)
-            if dist <= float(n_sigma):
+            if dist <= float(n_sigma) and preflight_ok(float(c["cv1"]), c.get("cv2"), t, preflight):
                 ranked.append((used.get(str(c["path"]), 0), dist, str(c["path"]), c))
         if not ranked:
             skipped.append({"state_id": sid, "reason": "no_admissible_minority_side_candidate",
@@ -298,7 +321,8 @@ def plan_reseed(targets: Sequence[Mapping[str, Any]], occupancy: Mapping[int, Ma
     return {"n_windows": len(targets), "n_target": n_target, "n_one_sided": int(n_one_sided),
             "n_eligible": len(eligible), "n_reseeded": len(rows), "reseeded": rows, "skipped": skipped,
             "rules": {"fraction": float(fraction), "admissible_sigma": float(n_sigma),
-                      "one_sided_minority_max": float(one_sided_max), "min_frames_per_state": int(min_frames)}}
+                      "one_sided_minority_max": float(one_sided_max), "min_frames_per_state": int(min_frames),
+                      "seed_preflight": None if preflight is None else dict(preflight)}}
 
 
 # ---------------------------------------------------------------------------------------
