@@ -187,7 +187,8 @@ def _r1_decide(cls, edge, a, b, metrics, history, epoch, settings, gate):
         return _bridge_candidate(cls, a, b, metrics, f"still unmeasured/weak after {n - 1} epoch(s) of sampling",
                                  settings, gate)
     return cr.new_candidate("R1", "edge", [a.state_id, b.state_id], "extend",
-                            f"unmeasured {n}/{need} epochs: extend sampling first", cls=cls, metrics=metrics)
+                            f"unmeasured {n}/{need} epochs: extend sampling first (the extend is a lifecycle "
+                            "record; the edge waits through ordinary epochs)", cls=cls, metrics=metrics)
 
 
 def propose_r1(payload: Mapping[str, Any], views: Mapping[int, cr.StateView], rep_ids: Sequence[int],

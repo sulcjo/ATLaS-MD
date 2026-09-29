@@ -21,6 +21,9 @@ iff d2^2 >= MAINLY_CV2_SHARE (1/2) x (d1^2 + d2^2), i.e. d2 >= d1. Under the 3.1
   * weak: ``edge_is_weak_pairwise`` inside one component -> bridge;
   * unmeasured: extend both endpoints; bridge once it has been unmeasured-or-weak in
     UNMEASURED_WAIT_EPOCHS + 1 consecutive epochs (first sighting + 2 epochs of sampling).
+    An ``extend`` action is a lifecycle record only: the epoch schedule gives every state a
+    uniform share (top-ups, when on, allocate by their own deficits), so "extend sampling
+    first" means the edge waits through two ordinary epochs of sampling.
   The per-edge history is keyed by (min, max) state id and stores the SET of epochs per
   status, so re-proposing an epoch (a kill before the P3 ledger) never double-counts.
 
@@ -342,7 +345,8 @@ def edge_key(i: int, j: int) -> str:
 
 def classify_edge(edge: Mapping[str, Any], comp_of: Mapping[int, int], threshold: float) -> str:
     si, sj = int(edge["state_i"]), int(edge["state_j"])
-    if edge_below_threshold(edge, threshold) and comp_of.get(si) != comp_of.get(sj):
+    split = si in comp_of and sj in comp_of and comp_of[si] != comp_of[sj]
+    if edge_below_threshold(edge, threshold) and split:
         return "structural"
     if edge_is_weak_pairwise(edge, threshold):
         return "weak"

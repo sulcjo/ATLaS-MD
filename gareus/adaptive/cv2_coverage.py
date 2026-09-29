@@ -57,17 +57,23 @@ def reduced_umbrella(cv1: np.ndarray, cv2: np.ndarray, views: Sequence[cr.StateV
     return float(beta) * u
 
 
-def solve_mbar(u_kn: np.ndarray, n_k: np.ndarray, *, tol: float = 1e-8, max_iter: int = 20000) -> np.ndarray:
-    """Self-consistent MBAR free energies (f_0 = 0) of the sampled states."""
+def solve_mbar(u_kn: np.ndarray, n_k: np.ndarray, *, tol: float = 1e-8, max_iter: int = 20000,
+               info: Optional[Dict[str, Any]] = None) -> np.ndarray:
+    """Self-consistent MBAR free energies (f_0 = 0) of the sampled states. ``info``, when
+    given, receives ``converged``, ``iterations`` and the last ``max_delta_f``."""
     log_n = np.log(np.maximum(n_k, 1e-300))
     f = np.zeros(u_kn.shape[0])
-    for _ in range(int(max_iter)):
+    delta, it = float("inf"), 0
+    for it in range(1, int(max_iter) + 1):
         log_den = _logsumexp(log_n[:, None] + f[:, None] - u_kn, axis=0)
         f_new = -_logsumexp(-u_kn - log_den[None, :], axis=1)
         f_new -= f_new[0]
-        if np.max(np.abs(f_new - f)) < tol:
-            return f_new
+        delta = float(np.max(np.abs(f_new - f)))
         f = f_new
+        if delta < tol:
+            break
+    if info is not None:
+        info.update(converged=bool(delta < tol), iterations=int(it), max_delta_f=delta)
     return f
 
 

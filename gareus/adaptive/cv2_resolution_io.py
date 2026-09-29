@@ -19,7 +19,9 @@ Report ``epoch_NNN/cv2_resolution_report.json`` (schema ``cv2_resolution_report_
                   at_compression_floor, refusal, centred_on, gate_note?}]} | null,
     budget        -- {mode ("reserve"|"no_reserve"|"ignored"), n_rungs, resolution_slots,
                       spent_states, allowance {...}, add_rung {...}, reserve_source},
-    actions_added, actions_removed -- what this step did to the epoch's action list,
+    actions_added -- [{action ("extend"|"add"|"insert"), state_id (parent or extended state),
+                     rule}], actions_removed -- [{action [kind, id], reason}]: what this step did
+                     to the epoch's action list,
     summary       -- {counts {rule: {decision: n}}, n_proposed, n_windows_at_compression_floor,
                       n_blocking (proposed + refused for no_reserve/resolution_budget),
                       n_trapped_or_orthogonal},
@@ -280,7 +282,11 @@ def union_coverage(npz_path: Path, column_views: Mapping[int, cr.StateView], set
     sampled_k = np.flatnonzero(n_k > 0)
     remap = -np.ones(len(rep), dtype=np.int64)
     remap[sampled_k] = np.arange(sampled_k.size)
-    f = cov.solve_mbar(u[sampled_k], n_k[sampled_k])
+    mbar_info: Dict[str, Any] = {}
+    f = cov.solve_mbar(u[sampled_k], n_k[sampled_k], info=mbar_info)
+    status["mbar"] = mbar_info
+    if not mbar_info.get("converged"):
+        return [], {**status, "status": "unavailable", "reason": "lambda = 0 MBAR did not converge"}
     logw = cov.log_weights(u[sampled_k], n_k[sampled_k], f)
     w = np.exp(logw - logw.max())
     w /= w.sum()
@@ -377,7 +383,9 @@ def propose_cv2_resolution(registry: Any, diagnostics: Mapping[str, Any], action
                         "R3": {"status": "ok" if subsamples else "unavailable",
                                "reason": None if subsamples else "no P4 paired-CV subsample"}},
               "candidates": cands, "budget": budget, "actions_removed": removed,
-              "actions_added": [list(a[:2]) + [a[0]] for a in extends + new_actions],
+              "actions_added": [{"action": str(a[0]), "state_id": int(a[1]),
+                                 "rule": ((a[4] if len(a) > 4 else {}).get(cr.METADATA_KEY) or {}).get("rule", "R1")}
+                                for a in extends + new_actions],
               "summary": cr.summarise(cands)}
     return [*main, *extends, *new_actions], _clean(report), new_history
 

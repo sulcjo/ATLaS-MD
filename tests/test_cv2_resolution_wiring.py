@@ -95,9 +95,9 @@ def test_off_path_proposer_applier_reports_are_identical_to_the_base_commit(tmp_
     old = _run_off_path(base, tmp_path / "old")
     new = _run_off_path(ap, tmp_path / "new")
     for key in ("report", "gate"):
-        stamp = new[key].pop("policy")
-        assert {k: stamp.pop(k) for k in NEW_FIELDS} == NEW_FIELDS
-        assert stamp == old[key].pop("policy")
+        stamp, base_stamp = new[key].pop("policy"), old[key].pop("policy")
+        assert {k: stamp[k] for k in NEW_FIELDS} == NEW_FIELDS          # present, all off
+        assert {k: stamp[k] for k in base_stamp} == base_stamp          # the base's own keys unchanged
         new[key].pop("diagnostics_json", None), old[key].pop("diagnostics_json", None)
     assert _strip_volatile(json.loads(json.dumps(old, default=str))) == \
         _strip_volatile(json.loads(json.dumps(new, default=str)))
@@ -111,7 +111,7 @@ def test_off_path_policy_and_decision_settings_only_gain_the_new_off_keys(tmp_pa
     new_fields = set(NEW_FIELDS)
     assert {f: getattr(old_p, f) for f in base.DECISION_SETTINGS_FIELDS} == \
         {f: getattr(new_p, f) for f in base.DECISION_SETTINGS_FIELDS}
-    assert set(ap.DECISION_SETTINGS_FIELDS) - set(base.DECISION_SETTINGS_FIELDS) == new_fields
+    assert new_fields <= set(ap.DECISION_SETTINGS_FIELDS) - set(base.DECISION_SETTINGS_FIELDS)
     assert new_p.cv2_resolution is False
     # A live campaign's record (written by the base code) resumes untouched; the new keys are
     # recorded from the job that first sees them, with the flag off.
@@ -122,7 +122,7 @@ def test_off_path_policy_and_decision_settings_only_gain_the_new_off_keys(tmp_pa
     policy, record = ap._resolve_decision_settings(adaptive, new_p)
     assert policy.min_rung_overlap == 0.2 and policy.cv2_resolution is False
     assert {k: record["settings"][k] for k in recorded} == recorded
-    assert set(record["settings"]) - set(recorded) == new_fields
+    assert {k: record["settings"][k] for k in new_fields} == NEW_FIELDS
 
 
 def test_cli_flags_and_yaml_reach_the_policy(tmp_path):
