@@ -478,6 +478,9 @@ class AdaptiveDecisionPolicy:
     # Peak-memory ceiling (GB) for the per-epoch union build + MBAR solve top-ups
     # run; an estimate above it skips the phase's diagnostics (no_diagnostics).
     topup_diagnostics_max_gb: float = 8.0
+    # X5: "raw" (today) or "ess" -- the top-up's deficits use each state's sigma rescaled to
+    # a contiguity-aware statistical inefficiency (gareus/adaptive/effective_samples.py).
+    allocation_weight: str = "raw"
     # Active-state budget for actions that change the state count (0 = unlimited,
     # the --max-replicas convention). Only the atomic ``respace_ladder`` action reads
     # it today; see Section 3.5 of the adaptive-CV2 spec for the wider cap check.
@@ -507,6 +510,7 @@ DECISION_SETTINGS_FIELDS = (
     "max_new_windows_per_epoch", "retire_converged", "duplicate_primary_tol",
     "duplicate_secondary_tol", "redundant_overlap", "max_target_deviation_sigma",
     "coverage_k_stiffen_cap", "convergence_min_samples_per_state", "convergence_max_weak_edges",
+    "allocation_weight",
 )
 DECISION_SETTINGS_FILENAME = "decision_settings.json"
 
@@ -6643,9 +6647,18 @@ def _topup_plan_for_phase(args, epoch_dir: Path, registry: "WindowStateRegistry"
     timestep = float(getattr(args, "timestep_fs", 4.0) or 4.0)
     budget = float(policy.topup_max_fraction) * wall_hours(int(full_steps), len(ids), timestep, n_gpus,
                                                            policy.topup_throughput_table)
-    plan = plan_topup(diag, state_ids_in_order=ids, neighbours=neighbours, rung_partners=rung_partners,
-                      policy=policy, report_interval=interval, timestep_fs=timestep, n_gpus=n_gpus,
-                      budget_hours=budget, correction=state["correction"], edge_attempts=state["edge_attempts"])
+    def _plan(effective_g=None):
+        return plan_topup(diag, state_ids_in_order=ids, neighbours=neighbours, rung_partners=rung_partners,
+                          policy=policy, report_interval=interval, timestep_fs=timestep, n_gpus=n_gpus,
+                          budget_hours=budget, correction=state["correction"],
+                          edge_attempts=state["edge_attempts"], effective_g=effective_g)
+    plan = _plan()
+    if str(getattr(policy, "allocation_weight", "raw")) == "ess":     # X5; raw never estimates
+        from .adaptive import effective_samples as _es
+        plan = _es.ess_topup_plan(
+            _plan, plan, diag, epoch_dir=epoch_dir, adaptive_dir=adaptive_dir, registry=registry, state_ids=ids,
+            pilot_dirs=[Path(p) for p in (getattr(args, "adaptive_production_pilot_sample_dirs", None) or [])],
+            tica_cv_version=getattr(args, "tica_cv_version", None))
     if diag is not None:
         save_union_overlap(epoch_dir, diag.edge_overlap)
         state["f_kT"] = dict(diag.f_kT)
@@ -7609,6 +7622,7 @@ def policy_from_args(args: Any) -> AdaptiveDecisionPolicy:
         topup_throughput_table=tuple(getattr(args, "adaptive_production_topup_throughput_table",
                                              ((16.0, 3154.0), (59.0, 2300.0)))),
         topup_diagnostics_max_gb=_arg_float(args, "adaptive_production_topup_diagnostics_max_gb", 8.0),
+        allocation_weight=str(getattr(args, "adaptive_production_allocation_weight", "raw") or "raw"),
         context_reuse=_arg_bool(args, "adaptive_production_context_reuse", False),
         context_reuse_require=_arg_bool(args, "adaptive_production_context_reuse_require", False),
         context_reuse_mode=str(getattr(args, "adaptive_production_context_reuse_mode", "off") or "off"),
