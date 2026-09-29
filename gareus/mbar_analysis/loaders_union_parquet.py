@@ -12,6 +12,7 @@ from __future__ import annotations
 import csv
 import math
 import os
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
@@ -31,6 +32,36 @@ from .cv2_reprojection import (CV2_REPROJECTION_FILENAME,
 
 def _is_usable_for_mbar(row: dict) -> bool:
     return str(row.get('usable_for_mbar', '')).strip().lower() in ('true', '1', 'yes')
+
+
+def _spool_u_nk_blocks(blocks: list, directory: Path):
+    """Merge bias blocks into disk-backed storage without a second RAM copy."""
+    if not blocks:
+        raise ValueError('cannot spool empty u_nk block list')
+    first = np.asarray(blocks[0])
+    if first.ndim != 2:
+        raise ValueError(f'u_nk block must be 2-D, got shape {first.shape}')
+    rows = sum(int(np.asarray(block).shape[0]) for block in blocks)
+    columns = int(first.shape[1])
+    fd, raw_path = tempfile.mkstemp(prefix='.adaptive-u-nk-', suffix='.dat', dir=directory)
+    os.close(fd)
+    path = Path(raw_path)
+    matrix = np.memmap(path, mode='w+', dtype=np.float64, shape=(rows, columns))
+    offset = 0
+    try:
+        for block in blocks:
+            block = np.asarray(block)
+            if block.ndim != 2 or block.shape[1] != columns:
+                raise ValueError('u_nk blocks have inconsistent shapes')
+            end = offset + block.shape[0]
+            matrix[offset:end] = block
+            offset = end
+        matrix.flush()
+    except Exception:
+        del matrix
+        path.unlink(missing_ok=True)
+        raise
+    return matrix, path
 
 
 def _merge_missing_usable_states(primary_rows: list, live_rows: list) -> list:
@@ -489,7 +520,16 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
     gamd_lambda_sample = np.concatenate(all_gamd_lambda_sample); del all_gamd_lambda_sample
     pot_arr = np.concatenate(all_potential); del all_potential
     potential = pot_arr if np.any(np.isfinite(pot_arr)) else None
-    u_nk    = np.concatenate(all_unk_blocks, axis=0); del all_unk_blocks
+    if low_memory:
+        # np.concatenate temporarily holds both all epoch blocks and the pooled
+        # matrix. For chignolin_9 that peak is enough to trigger global OOM.
+        u_nk, _u_nk_path = _spool_u_nk_blocks(all_unk_blocks, adaptive_dir)
+        del all_unk_blocks
+        # The live memmap keeps its file descriptor-backed mapping after unlink;
+        # do not leave an 11+ GiB staging file behind after analysis exits.
+        _u_nk_path.unlink(missing_ok=True)
+    else:
+        u_nk = np.concatenate(all_unk_blocks, axis=0); del all_unk_blocks
 
     # state_registry.csv (state_lambdas, built above) and the per-sample
     # gamd_lambda column just concatenated here are two independent sources for
