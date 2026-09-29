@@ -77,21 +77,21 @@ def test_components_not_failed_twice_when_overlap_connectivity_already_fails():
     assert row["status"] == "fail"
 
 
-def test_discovery_prefers_final_combined_then_the_latest_phase(tmp_path):
+def test_discovery_reads_only_the_final_combined_summary(tmp_path):
     ap = tmp_path / "adaptive_production"
-    for name, n in (("epoch_001", 5), ("epoch_010", 1), ("final", 2)):
+    for name in ("epoch_001", "final"):
         (ap / name).mkdir(parents=True)
-        (ap / name / g.SUMMARY_NAME).write_text(json.dumps({"label": name, "counts": _counts(n_weak=n)["counts"]}))
-    (ap / "pmf_analysis").mkdir()
-    assert g.find_summary(ap) == ap / "final" / g.SUMMARY_NAME
-    (ap / "final_extension_002").mkdir()
-    (ap / "final_extension_002" / g.SUMMARY_NAME).write_text(json.dumps(_counts()))
-    assert g.find_summary(ap).parent.name == "final_extension_002"
-    (ap / g.FINAL_NAME).write_text(json.dumps({"label": "final_combined", "counts": _counts()["counts"]}))
+        (ap / name / g.SUMMARY_NAME).write_text(json.dumps({"label": name, "counts": _counts(n_weak=4)["counts"]}))
     s = _good_summary()
     s["production_dir"] = str(ap)
+    assert g.find_summary(ap) is None                      # per-epoch tables never grade a union PMF
+    assert gr.build_health_verdict(s) == gr.build_health_verdict(_good_summary())
+    (ap / g.FINAL_NAME).write_text(json.dumps({"label": "final_combined", "counts": _counts()["counts"]}))
+    assert g.find_summary(ap) == ap / g.FINAL_NAME
     row = _cv2_row(gr.build_health_verdict(s))
     assert row["status"] == "pass" and row["detail"].startswith("[final_combined]")
+    s["cv2_resolution"] = _counts(n_weak=1)                # an attached block wins over the file
+    assert _cv2_row(gr.build_health_verdict(s))["status"] == "fail"
 
 
 def test_unreadable_summary_file_grades_na(tmp_path):

@@ -2253,8 +2253,8 @@ with --ap-cv2-resolution the driver writes each epoch's after the apply. Per sta
 restraint, sampled CV2 mean/sd, sigma_w2 = sqrt(kT/k2), confinement ratio = sd/sigma_w2
 (a landscape diagnostic, never a trigger), mixture modes, transitions (+ estimator),
 trapped_or_orthogonal. Per edge: pairwise MBAR (q10/q90, status), CV1 marginal and joint
-2D overlap, each with its space stamp. gareus_report adds a "CV2 resolution" row when a
-summary exists (FAIL: a weak pairwise edge or > 1 spatial component; CAUTION: unmeasured
+2D overlap, each with its space stamp. gareus_report adds a "CV2 resolution" row when the
+final-combined summary exists (FAIL: a weak pairwise edge or > 1 spatial component; CAUTION: unmeasured
 edges, trapped windows, budget refusals); plot_adaptive_diagnostics adds
 adaptive_fig5_state_coordinates.png (states at their own (c1, c2), one panel per rung).
 """

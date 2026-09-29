@@ -611,14 +611,16 @@ def fig_state_coordinates(state_reg: pd.DataFrame, state_counts: dict[int, int],
 
     Additive: fig2's heatmap assumes a regular grid (rounded centre pairs) and
     stays as it was; this figure is the one that reads correctly for sparse and
-    shape-based 2D layouts. ``summary`` (a cv2_resolution_summary table) adds
+    shape-based 2D layouts. ``summary`` (the final-combined cv2_resolution_summary) adds
     the trapped_or_orthogonal rings, weak/unmeasured edges and the sampled-mean
     placement on unrestrained axes (gareus.adaptive.state_grid_plot)."""
     from gareus.adaptive.state_grid_plot import flagged_edges, render_state_grid, state_grid_points
     if state_reg.empty:
         return None
     pts = state_grid_points(state_reg.to_dict("records"), state_counts, summary)
-    path = render_state_grid(pts, flagged_edges(summary), out_path, cv2_label=cv2_label)
+    flags = f"CV2-resolution flags: {summary.get('label', '?')}" if summary else "no CV2-resolution summary"
+    path = render_state_grid(pts, flagged_edges(summary), out_path, cv2_label=cv2_label,
+                             title=f"States at explicit coordinates: samples over all phases; {flags}")
     if path is not None:
         print(f"  saved {path}")
     return path

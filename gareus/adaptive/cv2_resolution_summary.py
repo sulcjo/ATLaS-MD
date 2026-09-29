@@ -176,7 +176,7 @@ def _r3_fields(cand: Optional[Mapping[str, Any]], has_report: bool) -> Dict[str,
             "n_modes": len(modes), "modes": modes, "r3_mode_pair": pair or None,
             "depth_kT": _finite((m.get("depth") or {}).get("depth_kT")),
             "transitions": n, "transitions_estimator": est,
-            "transitions_state_series": m.get("transitions_state_series"),
+            "transitions_state_series": _int(m.get("transitions_state_series")),
             "trapped_or_orthogonal": bool(m.get("trapped_or_orthogonal", False))}
 
 
@@ -190,8 +190,8 @@ def state_record(row: Mapping[str, Any], reg: Optional[Mapping[str, Any]], r3: O
     sd2 = math.sqrt(max(var2, 0.0)) if var2 is not None else None
     sw2 = sigma_w(rest["k2"], temperature_k)
     sarle = ((r3 or {}).get("metrics") or {}).get("sarle_bimodality")
-    return {"state_id": int(row.get("state_id")), **rest, "sample_count": row.get("sample_count"),
-            "n_pairs": pc.get("n_pairs"), "cv1_mean": _finite(m1.get("mean")),
+    return {"state_id": int(row.get("state_id")), **rest, "sample_count": _int(row.get("sample_count")),
+            "n_pairs": _int(pc.get("n_pairs")), "cv1_mean": _finite(m1.get("mean")),
             "cv2_mean": _finite(m2.get("mean")) if m2 else _finite(row.get("secondary_mean")),
             "cv2_sd": sd2, "sigma_w2": sw2,
             "confinement_ratio": sd2 / sw2 if sd2 is not None and sw2 else None,
@@ -207,7 +207,8 @@ def edge_record(edge: Mapping[str, Any], threshold: Optional[float]) -> Dict[str
     union = _finite(edge.get("mbar_overlap"))
     weak = edge_is_weak_pairwise(edge, threshold) if graded else None
     measured = (bool(weak) or pm.get("status") == "ok" or union is not None) if graded else None
-    neff = [v for v in (_finite(x) for x in (pm.get("n_eff") or [])) if v is not None]
+    raw = pm.get("n_eff")
+    neff = [v for v in (_finite(x) for x in (list(raw) if raw is not None else [])) if v is not None]
     return {"state_i": int(edge.get("state_i")), "state_j": int(edge.get("state_j")),
             "edge_type": edge.get("edge_type"), "graph_kind": pm.get("graph_kind"),
             "pattern_pair": pm.get("pattern_pair"), "graded": graded,
@@ -305,6 +306,22 @@ def _cell(v: Any) -> Any:
     return v
 
 
+def _json_default(o: Any) -> Any:
+    """numpy scalars/arrays from an in-memory payload (the driver hook) -> plain JSON."""
+    if hasattr(o, "tolist"):
+        return o.tolist()
+    if hasattr(o, "item"):
+        return o.item()
+    return str(o)
+
+
+def _int(x: Any) -> Optional[int]:
+    try:
+        return int(x)
+    except (TypeError, ValueError):
+        return None
+
+
 def _join(values: Any) -> str:
     return ";".join(f"{v:.4g}" for v in values if v is not None)
 
@@ -324,7 +341,7 @@ def write_summary(summary: Mapping[str, Any], json_path: Path) -> Dict[str, Path
     json_path = Path(json_path)
     json_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = json_path.with_name(json_path.name + f".tmp{os.getpid()}")
-    tmp.write_text(json.dumps(summary, indent=1, sort_keys=False, allow_nan=False))
+    tmp.write_text(json.dumps(summary, indent=1, sort_keys=False, allow_nan=False, default=_json_default))
     os.replace(tmp, json_path)
     stem = json_path.with_suffix("")
     states = [{**s, "mode_means": _join(m.get("mean") for m in (s.get("modes") or [])),
@@ -346,7 +363,7 @@ def _read_json(path: Optional[Path]) -> Optional[Dict[str, Any]]:
 
 
 def default_json_path(adaptive_dir: Path, label: str) -> Path:
-    """Where a phase's summary lives by default (gareus_report looks here)."""
+    """Where a phase's summary lives by default (gareus_report reads the final-combined one)."""
     if label == FINAL_LABEL:
         return Path(adaptive_dir) / f"{Path(SUMMARY_NAME).stem}_{FINAL_LABEL}.json"
     return Path(adaptive_dir) / label / SUMMARY_NAME

@@ -7,6 +7,7 @@ import json
 import math
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from gareus.adaptive import cv2_resolution as cr
@@ -243,3 +244,17 @@ def test_driver_hook_only_inside_the_cv2_resolution_flag_block():
                     hits.append(ast.unparse(node.test))
     assert hits == ["bool(policy.cv2_resolution)"]
     assert src.count("write_epoch_summary(") == 1
+
+
+def test_hook_writes_an_in_memory_payload_holding_numpy_scalars(tmp_path):
+    ap = _campaign(tmp_path)
+    payload = _payload()
+    payload["states"][0]["sample_count"] = np.int64(1000)
+    payload["states"][0]["paired_cv"]["n_pairs"] = np.int64(1000)
+    payload["states"][0]["paired_cv"]["cv2"]["var"] = np.float64(0.25)
+    payload["edges"][0]["pairwise_mbar"]["n_eff"] = np.array([300.0, 250.0])
+    payload["edge_metric"]["components"]["n_components"] = np.int64(1)
+    path = crs.write_epoch_summary(ap / "epoch_002", payload)
+    assert path is not None
+    s = json.loads(path.read_text())
+    assert s["states"][0]["sample_count"] == 1000 and s["counts"]["n_components"] == 1

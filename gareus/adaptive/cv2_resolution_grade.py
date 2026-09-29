@@ -4,10 +4,12 @@ Stdlib only and presentation only: it reads the precomputed ``counts`` block tha
 ``gareus.adaptive.cv2_resolution_summary`` wrote and never recomputes a metric, so
 ``gareus_report`` can call it on an in-process summary dict or a JSON round-trip alike.
 
-Source, first found: ``s["cv2_resolution"]`` (a summary dict a caller attached), else a file
-under ``s["production_dir"]``: ``cv2_resolution_summary_final_combined.json`` at the adaptive
-root, else the latest phase's ``<phase>/cv2_resolution_summary.json`` (final_extension_NNN >
-final > epoch_NNN, by number). No source: no row (``gareus_report`` appends it only then).
+Source: ``s["cv2_resolution"]`` (a summary dict a caller attached), else
+``<s["production_dir"]>/cv2_resolution_summary_final_combined.json`` -- the table over the
+same pooled data the PMF is computed on. Per-epoch summaries are never auto-discovered: an
+epoch-era flag would grade a union PMF (chignolin_9: epoch_002 CAUTION, final-combined PASS).
+The file is not checked for freshness; the row prints the table's label. No source: no row
+(``gareus_report`` appends it only then).
 
 Rule (stated in the row text):
   FAIL    -- a same-pattern geometry edge is weak under the pairwise-MBAR metric
@@ -24,7 +26,6 @@ Rule (stated in the row text):
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
@@ -35,31 +36,14 @@ SUMMARY_NAME = "cv2_resolution_summary.json"            # mirrors cv2_resolution
 FINAL_NAME = "cv2_resolution_summary_final_combined.json"
 RULE_TEXT = ("rule: FAIL if a pairwise-MBAR weak edge or >1 spatial component; CAUTION for "
              "unmeasured edges, trapped_or_orthogonal windows, budget refusals, metric/report errors")
-_PHASE_RX = re.compile(r"^(epoch|final_extension)_(\d+)$|^final$")
-
-
-def _phase_key(name: str) -> Optional[tuple]:
-    m = _PHASE_RX.match(name)
-    if m is None:
-        return None
-    if name == "final":
-        return (1, 0)
-    return (0 if m.group(1) == "epoch" else 2, int(m.group(2)))
 
 
 def find_summary(production_dir: Any) -> Optional[Path]:
-    """The summary file ``gareus_report`` grades for this analysis, or None."""
+    """The final-combined summary ``gareus_report`` grades for this analysis, or None."""
     if not production_dir:
         return None
-    root = Path(str(production_dir))
-    if (root / FINAL_NAME).is_file():
-        return root / FINAL_NAME
-    try:
-        found = [(k, d / SUMMARY_NAME) for d in root.iterdir()
-                 if d.is_dir() and (k := _phase_key(d.name)) is not None and (d / SUMMARY_NAME).is_file()]
-    except OSError:
-        return None
-    return max(found)[1] if found else None
+    path = Path(str(production_dir)) / FINAL_NAME
+    return path if path.is_file() else None
 
 
 def summary_block(s: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
