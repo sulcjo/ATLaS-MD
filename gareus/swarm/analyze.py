@@ -662,6 +662,10 @@ def analyze_swarm_stage(out_dir, args) -> dict:
                 selection["pair_model_sha256"] = sel.pair_model.sha256
                 selection["selected_component_index"] = int(sel.pair_model.selected_component_index)
                 selection["certificate"] = dict(sel.pair_model.certificate)
+                if sel.candidate_set is not None:
+                    from ..cv_selection.labels import component_label
+                    selection["cv2_component"] = component_label(
+                        sel.candidate_set, int(sel.pair_model.selected_component_index), dataset.frame_dt_ps)
             if sel.status == "pair":
                 fit = from_candidate_set(sel.candidate_set)
                 j = int(sel.pair_model.selected_component_index)

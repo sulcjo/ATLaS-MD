@@ -617,6 +617,8 @@ class WindowStateRegistry:
         secondary: Optional[float],
         policy: AdaptiveDecisionPolicy,
         gamd_lambda: float = 0.0,
+        primary_k: Optional[float] = None,
+        secondary_k: Optional[float] = None,
     ) -> bool:
         """Is there already a state at this centre *on this rung*?
 
@@ -625,18 +627,26 @@ class WindowStateRegistry:
         or replicating a centre across rungs would be rejected as duplication
         of itself.  ``gamd_lambda`` defaults to 0.0, which reproduces the old
         behaviour exactly for a registry with no ladder (every state at λ = 0).
+
+        Identity includes the restraint pattern (spec P6): a state only
+        duplicates one restrained on the same axes, and the coordinate of an
+        unrestrained axis (k = 0; e.g. the CV1 placeholder of a CV2-only window)
+        is never compared. ``primary_k``/``secondary_k`` left None mean "restrained
+        where a coordinate is given", which is what every caller proposes.
         """
         lam = float(gamd_lambda or 0.0)
+        want = _restraint_pattern(primary_k, secondary_k, secondary)
         for state in self.all_states():
-            if abs(float(state.primary_center) - float(primary)) > float(policy.duplicate_primary_tol):
-                continue
             if abs(float(state.gamd_lambda or 0.0) - lam) > 1.0e-9:
                 continue
-            if state.secondary_center is None and secondary is None:
-                return True
-            if state.secondary_center is not None and secondary is not None:
-                if abs(float(state.secondary_center) - float(secondary)) <= float(policy.duplicate_secondary_tol):
-                    return True
+            have = _restraint_pattern(state.primary_k, state.secondary_k, state.secondary_center)
+            if have != want:
+                continue
+            if want[0] and abs(float(state.primary_center) - float(primary)) > float(policy.duplicate_primary_tol):
+                continue
+            if want[1] and abs(float(state.secondary_center) - float(secondary)) > float(policy.duplicate_secondary_tol):
+                continue
+            return True
         return False
 
     # ---- persistence ------------------------------------------------------
@@ -2180,18 +2190,47 @@ def _build_edge_diagnostics(
     return rows
 
 
-def _centre_group_key(state: WindowState, policy: AdaptiveDecisionPolicy) -> Tuple[int, Optional[int]]:
+def _axis_restrained(k: Optional[float]) -> bool:
+    """k None = not recorded, which every writer means as "the run's default restraint"."""
+    if k is None:
+        return True
+    try:
+        k = float(k)
+    except (TypeError, ValueError):
+        return True
+    return bool(math.isfinite(k) and k > 0.0)
+
+
+def _restraint_pattern(primary_k: Optional[float], secondary_k: Optional[float],
+                       secondary_center: Optional[float]) -> Tuple[bool, bool]:
+    """(CV1 restrained, CV2 restrained). No CV2 centre means no CV2 restraint."""
+    return (_axis_restrained(primary_k), secondary_center is not None and _axis_restrained(secondary_k))
+
+
+def _centre_group_key(state: WindowState, policy: AdaptiveDecisionPolicy) -> Tuple[Optional[int], Optional[int]]:
     """Quantised (primary, secondary) centre, at the duplicate tolerances.
 
     Two states sharing this key are the same umbrella window on different rungs
     of the λ-ladder -- the pair whose CV-histogram overlap is ~1 by
     construction and therefore says nothing about their phase-space overlap.
+
+    An unrestrained axis (k = 0) keys as None, whatever placeholder centre it
+    carries (spec P6): a CV2-only window at the CV1 placeholder is not the same
+    window as a CV1-restrained one at that CV1 value, and two CV2-only windows
+    differ only in CV2. None is unambiguous, since a restrained axis always keys
+    as an int.
     """
     p_tol = max(float(policy.duplicate_primary_tol), 1.0e-12)
     s_tol = max(float(policy.duplicate_secondary_tol), 1.0e-12)
-    p_key = int(round(float(state.primary_center) / p_tol))
-    s_key = None if state.secondary_center is None else int(round(float(state.secondary_center) / s_tol))
+    on1, on2 = _restraint_pattern(state.primary_k, state.secondary_k, state.secondary_center)
+    p_key = int(round(float(state.primary_center) / p_tol)) if on1 else None
+    s_key = int(round(float(state.secondary_center) / s_tol)) if on2 else None
     return (p_key, s_key)
+
+
+def _sortable_centre_key(key: Tuple[Optional[int], Optional[int]]) -> Tuple:
+    """Order centre keys deterministically; an unrestrained axis (None) sorts first."""
+    return tuple((0, 0) if v is None else (1, int(v)) for v in key)
 
 
 def _representative_rung(registry: WindowStateRegistry) -> float:
@@ -2543,9 +2582,35 @@ def _write_tica_version_marker(run_dir: Path, args) -> None:
         pass
 
 
+_RESIDUAL_CV2_MODES = ("residual-torsion-pc", "residual-pc")
+
+
+def _frozen_residual_pair(args) -> bool:
+    """Is this campaign's CV2 a frozen residual pair (spec 3.6)?
+
+    Such a pair is fixed for the whole campaign: its samples, window centres and MBAR bias
+    are defined by the pair model's one direction. A tICA refit, a recentre onto tIC1
+    medians or a switch to tica-linear would silently redefine CV2 mid-campaign.
+    """
+    return bool(str(getattr(args, "secondary_cv", "") or "") in _RESIDUAL_CV2_MODES
+                or getattr(args, "secondary_cv_model", None))
+
+
+FROZEN_PAIR_REFIT_MESSAGE = (
+    "this campaign's CV2 is a frozen residual pair (--secondary-cv-model / residual-torsion-pc); "
+    "tICA refits, tIC1 recentring and the tica-linear switch would redefine CV2 mid-campaign and "
+    "are refused. Remove the tICA update settings (--tica-obs-interval, --tica-update-after-epochs, "
+    "--tica-epochs-per-cycle, --tica-switch-cv2) for this campaign")
+
+
 def _apply_tica_cv2_switch(args, tica_update_report: dict, *, next_epoch: int) -> bool:
     """Apply one-shot tica-linear CV2 switch only after a valid tICA update."""
     if not getattr(args, "tica_switch_cv2", False):
+        return False
+    if _frozen_residual_pair(args):
+        if isinstance(tica_update_report, dict):
+            tica_update_report["cv2_switch_skipped"] = {"reason": "frozen_residual_pair"}
+        print(f"WARNING: tica-linear CV2 switch refused: {FROZEN_PAIR_REFIT_MESSAGE}")
         return False
     prev_cv2 = str(getattr(args, "secondary_cv", "none") or "none")
     if prev_cv2 == "tica-linear":
@@ -2579,11 +2644,16 @@ def _apply_tica_centers_to_registry(
     registry: "WindowStateRegistry",
     per_window_tic1_centers: Dict[int, float],
     epoch_dir: Path,
+    *,
+    frozen_residual_pair: bool = False,
 ) -> int:
     """Update registry secondary_center for active states using per-window tIC1 medians.
 
-    Returns number of states updated.
+    Returns number of states updated. Refuses (raises) on a frozen residual pair: overwriting
+    its centres would change the Hamiltonian of states that already hold samples.
     """
+    if frozen_residual_pair and per_window_tic1_centers:
+        raise RuntimeError(f"tIC1 recentring refused: {FROZEN_PAIR_REFIT_MESSAGE}")
     window_map = _load_epoch_window_map(epoch_dir, registry)
     updated = 0
     for win_idx, state_id in window_map.items():
@@ -3050,6 +3120,9 @@ def _maybe_update_tica_cvaux(epoch: int, epoch_dir: Path, adaptive_dir: Path, ar
 
     if not should_update:
         return {}
+    if _frozen_residual_pair(args):
+        print(f"WARNING: tICA refit refused for epoch {epoch}: {FROZEN_PAIR_REFIT_MESSAGE}")
+        return {"status": "refused_frozen_residual_pair", "epoch": int(epoch)}
 
     tica_dir = epoch_dir / "tica_obs"
     if not tica_dir.exists() or not any(tica_dir.glob("dihedral_obs_*.npz")):
@@ -4915,6 +4988,8 @@ def propose_actions_from_diagnostics(
             # rung (the same one build_geometry_edges wired this edge between).
             if registry.has_near_duplicate(
                 primary, secondary, policy, gamd_lambda=_representative_rung(registry),
+                primary_k=primary_k,
+                secondary_k=secondary_k if (s1.secondary_k is not None and s2.secondary_k is not None) else None,
             ):
                 # A slot freed by a near-duplicate skip is deliberately *not*
                 # handed back to another edge: the allocation above is what the
@@ -7054,6 +7129,7 @@ def run_scheduled_adaptive_epoch(
             })
             return seg_dir
         print(f"      scheduled segment {name}: {len(state_ids)} state(s), {actual_steps} steps")
+        _require_phase_within_replica_cap(args, len(state_ids), seg_dir, f"segment {name}")
         run_gareus_callable(seg_args, seg_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
         if _graceful_shutdown.is_set():
             # Charge the pool for what actually ran before returning. Returning
@@ -7181,6 +7257,7 @@ class AdaptiveProductionController:
         self.epoch_steps = int(epoch_steps)
         self.registry_dir = None if registry_dir is None else Path(registry_dir)
         self.current_epoch = 0
+        self.refused_actions: List[Dict[str, Any]] = []
 
     def run(self, max_epochs: Optional[int] = None) -> None:
         epoch = 0
@@ -7252,7 +7329,7 @@ class AdaptiveProductionController:
         for state in self.registry.active_states():
             groups.setdefault(_centre_group_key(state, policy), []).append(state)
         created: List[WindowState] = []
-        for _key, members in sorted(groups.items()):
+        for _key, members in sorted(groups.items(), key=lambda kv: _sortable_centre_key(kv[0])):
             members = sorted(members, key=lambda s: (float(s.gamd_lambda or 0.0), int(s.state_id)))
             zeros = [s for s in members if abs(float(s.gamd_lambda or 0.0)) <= 1.0e-9]
             rep = zeros[0] if zeros else members[0]
@@ -7323,9 +7400,48 @@ class AdaptiveProductionController:
             self._retire_rung_at_every_centre(epoch, lam, f"respace_ladder: {reason}")
         return True
 
+    def _states_added_by(self, action: Tuple) -> int:
+        """Net number of active states ``action`` would add to the live registry."""
+        kind = str(action[0])
+        rungs = self.registry.rung_lambdas()
+        per_centre = len(rungs) if any(lam > 0.0 for lam in rungs) else 1
+        if kind in ("add", "tica_coverage_add"):
+            return per_centre
+        if kind == "split":
+            return per_centre * len(action[2]) - 1
+        if kind == "add_rung":
+            lam = float(action[1])
+            policy = AdaptiveDecisionPolicy()
+            groups: Dict[Tuple, List[WindowState]] = {}
+            for state in self.registry.active_states():
+                groups.setdefault(_centre_group_key(state, policy), []).append(state)
+            return sum(1 for members in groups.values()
+                       if not any(abs(float(s.gamd_lambda or 0.0) - lam) <= 1.0e-9 for s in members))
+        return 0
+
+    def _within_replica_budget(self, action: Tuple) -> bool:
+        """Spec 3.5: every apply reads the budget from the LIVE registry, so a later action
+        (or the post-coverage apply) sees the states earlier ones already added. 0 = unlimited.
+        ``respace_ladder`` checks its own projected count in ``_apply_respace_ladder``."""
+        budget = int(getattr(self.policy, "max_replicas_budget", 0) or 0)
+        added = self._states_added_by(action)
+        if budget <= 0 or added <= 0:
+            return True
+        n_active = len(self.registry.active_states())
+        if n_active + added <= budget:
+            return True
+        print(f"[adaptive] refusing {action[0]!r}: it would bring the active states to "
+              f"{n_active + added} (+{added}), above --max-replicas {budget}; the proposal is dropped")
+        self.refused_actions.append({"action": str(action[0]), "n_active": n_active, "added": added,
+                                     "budget": budget, "reason": "max_replicas_budget"})
+        return False
+
     def apply_actions(self, epoch: int, actions: Sequence[Tuple]) -> None:
-        for action in actions:
+        for index, action in enumerate(actions):
             kind = str(action[0])
+            if not self._within_replica_budget(action):
+                self.refused_actions[-1]["index"] = int(index)
+                continue
             if kind == "retire":
                 _, state_id, reason = action
                 _st = self.registry.get_state(int(state_id))
@@ -7847,6 +7963,12 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
         for _es in reversed(epoch_summaries):
             _sw = (_es.get("tica_update") or {}).get("cv2_switched")
             if _sw and _sw.get("to") == "tica-linear":
+                if _frozen_residual_pair(args):
+                    raise RuntimeError(
+                        f"resume refused: epoch {_es.get('epoch')} recorded a CV2 switch "
+                        f"'{_sw.get('from')}' -> 'tica-linear', but {FROZEN_PAIR_REFIT_MESSAGE}. "
+                        "A frozen pair's campaign can never have switched; the epoch summaries do not "
+                        "belong to this configuration")
                 if str(getattr(args, "secondary_cv", "none") or "none") != "tica-linear":
                     args.secondary_cv = "tica-linear"
                     args.cv2_k_min = float(getattr(args, "tica_linear_k_min", 5.0) or 5.0)
@@ -8119,6 +8241,9 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                     expected_rows=len(registry.active_states()),
                 )
             _write_tica_version_marker(epoch_dir, epoch_args)
+            if registry is not None:
+                _require_phase_within_replica_cap(args, len(registry.active_states()), epoch_dir,
+                                                  f"epoch {epoch:03d}")
             run_gareus(epoch_args, epoch_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
             if _graceful_shutdown.is_set():
                 _write_runtime_pool_reports(adaptive_dir, runtime_pool)
@@ -8221,13 +8346,20 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             if seed_bank_report.get("status") == "ok":
                 current_seed_bank = seed_bank_dir
 
+        _refused_actions: List[Dict[str, Any]] = []
         if _post_action_registry is not None:
             registry = _post_action_registry          # the actions are already in it
         else:
             _snapshot_pre_action_registry(epoch_dir, registry)
-            _apply_registry_actions(registry, actions, epoch, policy=policy)
+            _refused_actions = _apply_registry_actions(registry, actions, epoch, policy=policy)
         registry_paths = registry.save(adaptive_dir)
-        _record_applied_actions(epoch_dir, epoch, actions, registry_path)
+        if _post_action_registry is not None:
+            # A recovered epoch's ``actions`` are the ledger's applied list; carry its refusals
+            # over as they are (their index points into the original proposal list).
+            _refused_actions = [{k: v for k, v in r.items() if k != "index"}
+                                for r in (_ledger.get("refused") or [])]
+        _record_applied_actions(epoch_dir, epoch, actions, registry_path, refused=_refused_actions)
+        _reassign_seeds_after_actions(current_seed_bank, registry)
         runtime_pool_paths = _write_runtime_pool_reports(adaptive_dir, runtime_pool)
 
         next_csv = adaptive_dir / f"windows_epoch_{epoch + 1:03d}.csv"
@@ -8250,7 +8382,9 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             if tica_update_report.get("status") == "updated" and registry is not None:
                 per_window_centers = tica_update_report.get("per_window_tic1_centers", {})
                 if per_window_centers:
-                    n_updated = _apply_tica_centers_to_registry(registry, per_window_centers, epoch_dir)
+                    n_updated = _apply_tica_centers_to_registry(
+                        registry, per_window_centers, epoch_dir,
+                        frozen_residual_pair=_frozen_residual_pair(args))
                     tica_update_report["registry_states_updated"] = n_updated
                     print(f"    tICA: updated secondary_center for {n_updated} active registry states")
                     if n_updated > 0:
@@ -8285,7 +8419,9 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                                       "restart; not applying them again")
                                 _coverage_actions = []
                             if _coverage_actions:
-                                _apply_registry_actions(registry, _coverage_actions, epoch, policy=policy)
+                                _coverage_actions = _without_refused(
+                                    _coverage_actions,
+                                    _apply_registry_actions(registry, _coverage_actions, epoch, policy=policy))
                             tica_update_report["tica_coverage_actions"] = [
                                 {"action": action[0], "parent_state_id": action[1],
                                  "params": list(action[2]), "reason": action[3],
@@ -8665,6 +8801,8 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                 print(f"    Adaptive-production final frozen phase: {actual_final_steps} steps -> {final_dir}")
             print(f"      final active window table: {final_windows_csv}")
             _write_tica_version_marker(final_dir, final_args)
+            if registry is not None:
+                _require_phase_within_replica_cap(args, len(registry.active_states()), final_dir, "final phase")
             run_gareus(final_args, final_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
             if _graceful_shutdown.is_set():
                 _write_runtime_pool_reports(adaptive_dir, runtime_pool)
@@ -8794,6 +8932,9 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                 f"{actual_ext_steps} steps -> {ext_dir}"
             )
             _write_tica_version_marker(ext_dir, ext_args)
+            if registry is not None:
+                _require_phase_within_replica_cap(args, len(registry.active_states()), ext_dir,
+                                                  f"final extension {ext_index + 1}")
             run_gareus(ext_args, ext_dir, openmm, app, unit, forcefield, topology, equil_state, progress=progress)
             if _graceful_shutdown.is_set():
                 _write_runtime_pool_reports(adaptive_dir, runtime_pool)
@@ -8972,15 +9113,67 @@ def _snapshot_pre_action_registry(epoch_dir: Path, registry: WindowStateRegistry
     return path
 
 
-def _record_applied_actions(epoch_dir: Path, epoch: int, actions: Sequence[Tuple], registry_path: Path) -> Path:
+def _reassign_seeds_after_actions(seed_bank: Optional[Path], registry: WindowStateRegistry) -> Optional[Dict[str, Any]]:
+    """Re-run the nearest-seed assignment once the epoch's actions are in the registry.
+
+    The seed bank's assignment is written before the actions are applied, so a state an
+    action creates (add, split, add_rung, respace_ladder) has no row of its own. A scheduled
+    segment holding only such states would then get filter_seed_bank_for_state_ids's
+    generic fallback: the first rows of the bank, whatever their CVs. The assignment scores
+    on CV distance alone, so a new rung gets the same seed as its centre's other rungs.
+    """
+    # Only a propagated seed bank (with its survivor table) is reassigned; a raw conformer
+    # library in that slot is left untouched rather than given an empty assignment file.
+    if seed_bank is None or not (Path(seed_bank) / "final_survivor_seeds.csv").exists():
+        return None
+    try:
+        return select_state_aware_seeds_for_targets(Path(seed_bank), registry)
+    except Exception as exc:
+        print(f"WARNING: state-aware seed assignment after this epoch's actions failed ({exc}); "
+              f"states added this epoch may start from the generic seed pool")
+        return None
+
+
+def _require_phase_within_replica_cap(args, n_states: int, phase_dir: Path, label: str) -> None:
+    """Refuse to START a phase with more states than ``--max-replicas`` (spec 3.5).
+
+    0 means unlimited. Above the cap production would silently truncate the window set,
+    and the states past the cap would never be sampled while the registry, the epoch
+    window map and the union MBAR still carry them. A phase that already holds a
+    checkpoint resumes with its checkpointed window set and a warning: the cap check
+    never bricks a resume.
+    """
+    cap = int(getattr(args, "max_replicas", 0) or 0)
+    n = int(n_states)
+    if cap <= 0 or n <= cap:
+        return
+    if production_checkpoint_available(phase_dir):
+        print(f"WARNING: {label} has {n} states, above --max-replicas {cap}; it already holds a "
+              f"checkpoint, so it resumes with its checkpointed window set")
+        return
+    raise RuntimeError(
+        f"{label} would start with {n} active states, above --max-replicas {cap}. Production would "
+        f"truncate the window set and never sample {n - cap} of them. Raise --max-replicas to at "
+        f"least {n} (0 = unlimited), or reduce the layout (fewer rungs/centres) before starting "
+        f"{phase_dir}")
+
+
+def _record_applied_actions(epoch_dir: Path, epoch: int, actions: Sequence[Tuple], registry_path: Path,
+                            refused: Optional[Sequence[Dict[str, Any]]] = None) -> Path:
     """Atomically record that ``actions`` were applied and saved as ``registry_path``.
 
     Written right after ``registry.save``: a resume that finds this file with a matching
     registry digest knows epoch ``epoch``'s actions are already in the registry and must not
-    propose or apply them again (see ``_load_applied_actions``).
+    propose or apply them again (see ``_load_applied_actions``). ``actions`` lists only what
+    was applied; proposals the replica budget refused go under ``refused`` with their action.
     """
     path = Path(epoch_dir) / APPLIED_ACTIONS_FILENAME
-    payload = {"epoch": int(epoch), "actions": _jsonable_action(list(actions)),
+    refused = list(refused or [])
+    skip = {int(r["index"]) for r in refused if "index" in r}
+    payload = {"epoch": int(epoch),
+               "actions": _jsonable_action([a for i, a in enumerate(actions) if i not in skip]),
+               "refused": [{**r, "proposal": _jsonable_action(list(actions)[int(r["index"])])}
+                           if "index" in r else dict(r) for r in refused],
                "registry_digest": _file_sha256(registry_path), "written_unix": time.time()}
     tmp = path.with_name(path.name + f".tmp{os.getpid()}")
     tmp.write_text(json.dumps(payload, sort_keys=True))
@@ -9006,9 +9199,16 @@ def _load_applied_actions(epoch_dir: Path, registry_path: Path) -> Optional[Dict
 
 
 def _apply_registry_actions(registry: WindowStateRegistry, actions: Sequence[Tuple], epoch: int,
-                            policy: Optional[AdaptiveDecisionPolicy] = None) -> None:
+                            policy: Optional[AdaptiveDecisionPolicy] = None) -> List[Dict[str, Any]]:
+    """Apply ``actions``; return the ones refused by the replica budget (each with its index)."""
     controller = AdaptiveProductionController(registry, policy=policy)
     controller.apply_actions(epoch, actions)
+    return list(controller.refused_actions)
+
+
+def _without_refused(actions: Sequence[Tuple], refused: Sequence[Dict[str, Any]]) -> List[Tuple]:
+    skip = {int(r["index"]) for r in refused if "index" in r}
+    return [a for i, a in enumerate(actions) if i not in skip]
 
 
 def write_epoch_action_report(

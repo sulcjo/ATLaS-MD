@@ -486,17 +486,21 @@ then 3.1-3.3, X5, X6; X2 and X4 last.
 
 ## 13. Implementation status (2026-09-29)
 
-All on branch `feat/cv2-conditional-tica`, uncommitted.
+X1, P3 and the CV2 selection are in PR #111 (`feat/cv2-conditional-tica`). P6, 3.5, 3.6 and the two
+X1 gap fixes are on `feat/adaptive-cv2-prereqs` (stacked on #111), uncommitted.
 
 | Item | Status | Where |
 |---|---|---|
 | CV2 selection: conditional tICA candidates, slowness ranking (the premise of this spec) | done | `gareus/cv_selection/slowness.py`, `select_pair.py`; CLAUDE.md section |
 | X1 adaptive lambda ladder | done, redesigned: keeps lambda = 0 and the top rung, respaces/adds/drops interior rungs to a 0.25 minimum overlap (not "drop lambda = 1") | `gareus/adaptive/ladder_adapt.py`, `--ap-ladder-adapt`; plan `docs/superpowers/plans/2026-09-29-adaptive-lambda-ladder.md` |
-| P3 applied-actions ledger, resume idempotence | done (all campaigns) | `_record_applied_actions` / `_load_applied_actions`, epoch loop |
+| P3 applied-actions ledger, resume idempotence | done (all campaigns); kill/resume verified end to end through the real epoch loop | `_record_applied_actions` / `_load_applied_actions`, epoch loop; `tests/test_ladder_adapt_resume_e2e.py` |
+| Seeding of states created by actions (add, add_rung, respace_ladder, split) | done: the nearest-seed assignment is re-run after the actions are applied; before, a segment holding only new states got the bank's first rows (`generic_fallback`) | `_reassign_seeds_after_actions`; `tests/test_seed_assignment_after_actions.py` |
 | P8 frozen method settings | partial: ladder settings only (`ladder_adapt_settings.json`) | `_resolve_ladder_settings` |
-| 3.5 replica cap | partial: `max_replicas_budget` enforced by `respace_ladder` only; no phase-start check; production truncation unchanged | `_apply_respace_ladder` |
-| P1 headroom, P2 applier rewrite, P4 collectors, P5 model threading, P6 identity, P7a/b neighbour rule + schema v2 | not started | |
-| 3.1 edge metric, 3.2 shape layout, 3.3 R1-R3, 3.4 coupling gate, 3.6 labels/refit safety (incl. contract ordering rule), 3.7 reporting | not started | |
+| 3.5 replica cap | done except the priority order (a no-op until 3.1/3.3): phase-start refusal at all four launch sites (checkpointed phase resumes with a warning); every add/add_rung/split/coverage apply reads the budget from the live registry; plain-run truncation moved before the window table, neighbour graph and map repair, and a fast resume keeps its checkpointed window set | `_require_phase_within_replica_cap`, `AdaptiveProductionController._within_replica_budget`, `production.run_gareus`; `tests/test_replica_cap.py` |
+| P6 restraint-aware identity | done: `_centre_group_key`, `has_near_duplicate`, `ladder_overlap_by_axis` (new `secondary_k`) and `ladder_adapt.centre_key` key an unrestrained axis as None; k not recorded counts as restrained, so old registries key as before | `tests/test_restraint_aware_identity.py` |
+| 3.6 labels and refit safety | done: `cv2_component` (family, index, tICA lag frames/ps) in `cv_selection_report.json` and `run_manifest.method_settings`; a frozen residual pair refuses tICA refit (skip + warning), tIC1 recentring (raises) and the tica-linear switch, and a resume that finds a recorded switch fails closed; contract rule "PCA indices precede tICA indices, no gaps" replaces "tICA iff index > 6" (c8/c9 artifacts validate to the same digests) | `gareus/cv_selection/labels.py`, `_frozen_residual_pair`, `contracts._require_family_order`; `tests/test_cv2_labels_refit_safety.py` |
+| P1 headroom, P2 applier rewrite, P4 collectors, P5 model threading, P7a/b neighbour rule + schema v2 | not started | |
+| 3.1 edge metric, 3.2 shape layout, 3.3 R1-R3, 3.4 coupling gate, 3.7 reporting | not started | |
 | X2-X8 | not started | |
 | T1 | per-feature unit tests for X1 and the ledger only; T2-T4 not started | |
 
