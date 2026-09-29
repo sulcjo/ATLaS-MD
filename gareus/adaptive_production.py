@@ -500,6 +500,10 @@ class AdaptiveDecisionPolicy:
     # Spec 3.4 coupling gate on adaptive k2 (gareus.adaptive.pair_runtime), off by default.
     cv2_coupling_gate: bool = False
     max_coupling_fraction: float = 0.25
+    # X3 slow-mode-aware reseeding (gareus/adaptive/slow_mode_reseed.py): at each epoch boundary
+    # reseed up to this fraction of windows from pooled end states on the under-sampled side of
+    # the hidden slow mode. 0 = off (no report, no override, seeding exactly as before).
+    slow_mode_reseed_fraction: float = 0.0
 
 
 LADDER_SETTINGS_FIELDS = ("ladder_adapt", "ladder_min_overlap", "ladder_overlap_quantile", "ladder_min_ess",
@@ -517,6 +521,7 @@ DECISION_SETTINGS_FIELDS = (
     "coverage_k_stiffen_cap", "convergence_min_samples_per_state", "convergence_max_weak_edges",
     "allocation_weight",
     "cv2_coupling_gate", "max_coupling_fraction",
+    "slow_mode_reseed_fraction",
 )
 DECISION_SETTINGS_FILENAME = "decision_settings.json"
 
@@ -1572,6 +1577,9 @@ def filter_seed_bank_for_state_ids(
         "copied": copied_count,
         "rows": _json_ready(chosen[:200]),
     }
+    if (seed_bank_dir / "slow_mode_reseed").is_dir():       # X3 overrides (absent when off)
+        from .adaptive.slow_mode_reseed import filter_overrides  # noqa: PLC0415
+        payload["slow_mode_reseed_rows"] = filter_overrides(seed_bank_dir, target_ids, output_dir)
     write_json(output_dir / "filtered_seed_bank_report.json", payload)
     lines = [
         "# Filtered adaptive seed bank",
@@ -7677,6 +7685,7 @@ def policy_from_args(args: Any) -> AdaptiveDecisionPolicy:
         ladder_max_moves=_arg_int(args, "adaptive_production_ladder_max_moves", 2),
         cv2_coupling_gate=_arg_bool(args, "adaptive_production_cv2_coupling_gate", False),
         max_coupling_fraction=_arg_float(args, "adaptive_production_max_coupling_fraction", 0.25),
+        slow_mode_reseed_fraction=_arg_float(args, "adaptive_production_slow_mode_reseed_fraction", 0.0),
     )
 
 
@@ -8483,6 +8492,13 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                                 for r in (_ledger.get("refused") or [])]
         _record_applied_actions(epoch_dir, epoch, actions, registry_path, refused=_refused_actions)
         _reassign_seeds_after_actions(current_seed_bank, registry)
+        if float(policy.slow_mode_reseed_fraction or 0.0) > 0.0:
+            from .adaptive.slow_mode_reseed_io import run_epoch_slow_mode_reseed  # noqa: PLC0415
+            run_epoch_slow_mode_reseed(
+                fraction=float(policy.slow_mode_reseed_fraction), epoch_dir=epoch_dir,
+                phase_dirs=([Path(s.get("dir")) for s in scheduled_summary.get("segments", []) if s.get("dir")]
+                            if scheduled_summary is not None else [epoch_dir]),
+                states=registry.active_states(), seed_bank_dir=current_seed_bank, args=args)
         runtime_pool_paths = _write_runtime_pool_reports(adaptive_dir, runtime_pool)
 
         next_csv = adaptive_dir / f"windows_epoch_{epoch + 1:03d}.csv"
