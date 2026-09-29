@@ -24,9 +24,10 @@ Every rejection raises :class:`ContractError` carrying a stable
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional
 
 from ..correctness._io import IntegrityError, json_bytes, json_loads
 from ._base import (ContractError, ReasonCode, _Artifact, _canonical, _enum,
@@ -85,7 +86,13 @@ NATIVE_BLIND_CV_KINDS = frozenset({
 #: Components are individual SVD directions numbered from one. The legacy
 #: ``compute_bootstrap_torsion_pca(component=...)`` argument is a *count* of
 #: leading PCs combined; these two meanings must never be interchanged.
-MAX_COMPONENT_INDEX = 6
+MAX_PCA_COMPONENTS = 6
+#: Conditional tICA modes (slow directions of the CV1-residualised features) follow the
+#: residual PCs as components MAX_PCA_COMPONENTS+1 .. MAX_COMPONENT_INDEX.
+MAX_TICA_COMPONENTS = 3
+MAX_COMPONENT_INDEX = MAX_PCA_COMPONENTS + MAX_TICA_COMPONENTS
+COMPONENT_FAMILY_PCA = "pca"
+COMPONENT_FAMILY_TICA = "conditional_tica"
 
 #: The frozen primary panel is eight CDF probabilities (plan section 7.1).
 PRIMARY_PANEL_SIZE = 8
@@ -198,6 +205,8 @@ _COMPONENT_FIELDS = {"component_index", "singular_value", "eigenvalue_tie_flagge
                      "right_singular_vector", "residual_mean", "regression_coefficients",
                      "primary_mean", "primary_std", "anchor_clamp", "projection_mean",
                      "projection_std"}
+#: Written only for non-PCA components, so a PCA-only candidate set keeps its bytes and digest.
+_COMPONENT_OPTIONAL_FIELDS = {"family", "tica_lag_frames", "tica_eigenvalue"}
 
 
 @dataclass(frozen=True)
@@ -215,6 +224,9 @@ class CandidateComponent:
     anchor_clamp: tuple[float, float]
     projection_mean: float
     projection_std: float
+    family: str = COMPONENT_FAMILY_PCA
+    tica_lag_frames: Optional[int] = None
+    tica_eigenvalue: Optional[float] = None
 
     @property
     def width(self) -> int:
@@ -231,17 +243,37 @@ class CandidateComponent:
             "primary_mean": self.primary_mean, "primary_std": self.primary_std,
             "anchor_clamp": list(self.anchor_clamp),
             "projection_mean": self.projection_mean, "projection_std": self.projection_std,
+            **({} if self.family == COMPONENT_FAMILY_PCA else
+               {"family": self.family, "tica_lag_frames": self.tica_lag_frames,
+                "tica_eigenvalue": self.tica_eigenvalue}),
         }
 
 
 def _parse_component(raw: Mapping[str, Any], position: int) -> CandidateComponent:
     label = f"component[{position}]"
-    _exact_fields(raw, _COMPONENT_FIELDS, label)
+    _exact_fields({k: v for k, v in raw.items() if k not in _COMPONENT_OPTIONAL_FIELDS},
+                  _COMPONENT_FIELDS, label)
+    family = raw.get("family", COMPONENT_FAMILY_PCA)
+    if family not in (COMPONENT_FAMILY_PCA, COMPONENT_FAMILY_TICA):
+        _fail(ReasonCode.INVALID_ESTIMATE, f"{label}.family must be 'pca' or 'conditional_tica', got {family!r}")
+    tica_lag, tica_ev = raw.get("tica_lag_frames"), raw.get("tica_eigenvalue")
+    if family == COMPONENT_FAMILY_TICA:
+        if isinstance(tica_lag, bool) or not isinstance(tica_lag, int) or tica_lag < 1:
+            _fail(ReasonCode.MISSING_FIELD, f"{label}.tica_lag_frames must be a positive integer")
+        if isinstance(tica_ev, bool) or not isinstance(tica_ev, (int, float)) or not math.isfinite(tica_ev):
+            _fail(ReasonCode.MISSING_FIELD, f"{label}.tica_eigenvalue must be a finite number")
+        tica_ev = float(tica_ev)
+    elif tica_lag is not None or tica_ev is not None:
+        _fail(ReasonCode.UNKNOWN_FIELD, f"{label}: tica_* fields are only valid for conditional_tica components")
     index = raw["component_index"]
     if (isinstance(index, bool) or not isinstance(index, int)
             or not 1 <= index <= MAX_COMPONENT_INDEX):
         _fail(ReasonCode.COMPONENT_INDEX_OUT_OF_RANGE,
               f"{label}.component_index must be 1..{MAX_COMPONENT_INDEX}, got {index!r}")
+    if (family == COMPONENT_FAMILY_TICA) != (isinstance(index, int) and index > MAX_PCA_COMPONENTS):
+        _fail(ReasonCode.COMPONENT_INDEX_OUT_OF_RANGE,
+              f"{label}: residual PCs are components 1..{MAX_PCA_COMPONENTS} and conditional tICA modes "
+              f"{MAX_PCA_COMPONENTS + 1}..{MAX_COMPONENT_INDEX}; got {family!r} at index {index!r}")
     if not isinstance(raw["eigenvalue_tie_flagged"], bool):
         _fail(ReasonCode.MISSING_FIELD, f"{label}.eigenvalue_tie_flagged must be a boolean")
     vector = _finite_vector(raw["right_singular_vector"], f"{label}.right_singular_vector")
@@ -284,7 +316,8 @@ def _parse_component(raw: Mapping[str, Any], position: int) -> CandidateComponen
               f"{label}.anchor_clamp must be [lo, hi] with lo < hi in standardised anchor units")
     return CandidateComponent(index, float(singular), raw["eigenvalue_tie_flagged"], vector,
                               mean, tuple(coefficients), float(raw["primary_mean"]), primary_std,
-                              (clamp[0], clamp[1]), float(raw["projection_mean"]), projection_std)
+                              (clamp[0], clamp[1]), float(raw["projection_mean"]), projection_std,
+                              family, tica_lag, tica_ev)
 
 
 @dataclass(frozen=True)

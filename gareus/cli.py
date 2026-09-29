@@ -256,6 +256,27 @@ def _add_cv_selection_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--cv-selection-min-windows-cv1", type=int, default=4,
                    help="Auto CV2 selection (swarm stage) requires at least this "
                         "many usable CV1 windows before it will select a pair.")
+    p.add_argument("--cv-selection-rank", choices=["slowness", "gain"], default="slowness",
+                   help="Auto CV2 ranking. slowness (default): residual PCs plus conditional "
+                        "tICA modes of the CV1-residualised torsions; the slowest candidate at "
+                        "fixed CV1 wins if it also clears the gain floor, --cv-selection-min-"
+                        "slowness and --cv-selection-min-bimodality, and both seed-family halves "
+                        "agree. gain: the legacy rule (residual PCs only, max information gain).")
+    p.add_argument("--cv-selection-tica-lag-ps", type=float, default=50.0,
+                   help="Lag of the conditional tICA fit (swarm frames within one member).")
+    p.add_argument("--cv-selection-slowness-lag-ps", type=float, default=200.0,
+                   help="Lag of the autocorrelation that ranks candidates at fixed CV1.")
+    p.add_argument("--cv-selection-n-tica", type=int, default=3, choices=[0, 1, 2, 3],
+                   help="Number of conditional tICA candidates (components 7..6+N).")
+    p.add_argument("--cv-selection-min-slowness", type=float, default=0.72,
+                   help="Minimum lag autocorrelation at fixed CV1 (0.72 ~ implied timescale "
+                        ">= 3 lags).")
+    p.add_argument("--cv-selection-min-bimodality", type=float, default=5.0 / 9.0,
+                   help="Minimum Sarle bimodality coefficient of CV2 within some CV1 cell "
+                        "(5/9 = uniform distribution; above it reads as bimodal).")
+    p.add_argument("--cv-selection-half-split-min-corr", type=float, default=0.8,
+                   help="Both seed-family halves, refitted from scratch, must pick a CV2 with "
+                        "|r| >= this against the full-data winner, else cv1_only.")
     p.add_argument("--cv-selection-fallback", choices=["cv1_only", "refuse"],
                    default="cv1_only",
                    help="Auto CV2 selection (swarm stage) behaviour when no pair "

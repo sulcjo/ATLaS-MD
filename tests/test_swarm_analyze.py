@@ -240,6 +240,20 @@ def test_probe_pool_is_the_exported_frame_set_not_every_trace_row():
 # Task 8: automatic CV2 selection wired into swarm analysis (fixtures: tests/conftest.py)
 # ---------------------------------------------------------------------------
 
+def test_default_slowness_ranking_uses_trajectory_order_and_refuses_a_fast_cv2(synthetic_swarm, swarm_args):
+    """The fake swarm's CV2 candidates are fast and single-peaked: the default ranking must
+    see trajectory order, score slowness/bimodality per component and not deploy any."""
+    from gareus.swarm.analyze import analyze_swarm_stage
+    out = synthetic_swarm(with_features=True, wide_anchor=True)
+    report = analyze_swarm_stage(out, swarm_args(secondary_cv="auto", cv_selection_rank="slowness"))
+    on_disk = json.loads((out / "swarm" / "analysis" / "cv_selection_report.json").read_text())
+    assert on_disk["ranking"] == "slowness"
+    assert "ranking_fallback_reason" not in on_disk
+    assert any(c.get("family") == "conditional_tica" for c in on_disk["components"].values())
+    assert all("slowness_rho" in c and "bimodality_max" in c for c in on_disk["components"].values())
+    assert report["cv_selection"]["status"] == "cv1_only"
+
+
 def test_auto_cv2_writes_a_pair_model_and_a_two_dimensional_ladder(synthetic_swarm, swarm_args):
     from gareus.swarm.analyze import analyze_swarm_stage
     from gareus.config import _load_config_file

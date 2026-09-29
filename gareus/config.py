@@ -104,6 +104,13 @@ CONFIG_KEY_ALIASES: Dict[str, str] = {
     "min_gain_nats": "cv_selection_min_gain_nats",
     "min_windows_cv1": "cv_selection_min_windows_cv1",
     "fallback": "cv_selection_fallback",
+    "rank": "cv_selection_rank",
+    "tica_lag_ps": "cv_selection_tica_lag_ps",
+    "slowness_lag_ps": "cv_selection_slowness_lag_ps",
+    "n_tica": "cv_selection_n_tica",
+    "min_slowness": "cv_selection_min_slowness",
+    "min_bimodality": "cv_selection_min_bimodality",
+    "half_split_min_corr": "cv_selection_half_split_min_corr",
 }
 
 

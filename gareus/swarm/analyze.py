@@ -363,7 +363,8 @@ def _build_swarm_dataset(rows: List[dict], ok_traces: Dict[int, Dict[str, np.nda
     seed_by_member = {int(r["member_id"]): str(r.get("seed_id", r["member_id"])) for r in rows}
     index_ref: Optional[dict] = None
     first_member: Optional[int] = None
-    parts: Dict[str, list] = {k: [] for k in ("features", "cv1", "rg", "e2e", "v_pep", "v_dih", "groups")}
+    parts: Dict[str, list] = {k: [] for k in ("features", "cv1", "rg", "e2e", "v_pep", "v_dih", "groups",
+                                              "member", "frame")}
     for m in sorted(ok_traces):
         record = ok_features.get(m)
         if record is None:
@@ -385,18 +386,23 @@ def _build_swarm_dataset(rows: List[dict], ok_traces: Dict[int, Dict[str, np.nda
         parts["cv1"].append(tr["cv1"][sl]); parts["rg"].append(tr["rg_nm"][sl]); parts["e2e"].append(tr["e2e_nm"][sl])
         parts["v_pep"].append(tr["v_pep_kj"][sl]); parts["v_dih"].append(tr["v_dih_kj"][sl])
         parts["groups"].append(np.full(n_rows - int(discard), seed_by_member[m], dtype=object))
+        # trajectory order, so slowness ranking never pairs frames across members or gaps
+        parts["member"].append(np.full(n_rows - int(discard), int(m), dtype=np.int64))
+        parts["frame"].append(np.arange(int(discard), n_rows, dtype=np.int64))
     if index_ref is None:
         raise RuntimeError("no ok member with torsion features; cv2=auto has nothing to fit on")
     features = np.vstack(parts["features"])
     cv1, rg, e2e = (np.concatenate(parts[k]) for k in ("cv1", "rg", "e2e"))
     v_pep, v_dih = (np.concatenate(parts[k]) for k in ("v_pep", "v_dih"))
     groups = np.concatenate(parts["groups"])
+    member_ids, frame_index = np.concatenate(parts["member"]), np.concatenate(parts["frame"])
     finite = (np.isfinite(features).all(axis=1) & np.isfinite(cv1) & np.isfinite(rg) & np.isfinite(e2e)
               & np.isfinite(v_pep) & np.isfinite(v_dih))
     schema = _feature_schema_from_index(index_ref, topology_sha256)
     anchor = AnchorCandidate("nonlocal-contact-fraction", _anchor_definition(args, contact_pairs), cv1[finite])
     dataset = SwarmDataset(features[finite], schema, anchor, np.column_stack([rg[finite], e2e[finite]]),
-                           groups[finite])
+                           groups[finite], member_ids=member_ids[finite], frame_index=frame_index[finite],
+                           frame_dt_ps=float(getattr(args, "swarm_output_interval_ps", 2.0)))
     aux = {"v_pep": v_pep[finite], "v_dih": v_dih[finite],
            "rows_sha256": digest(b"".join(np.ascontiguousarray(f).tobytes() for f in parts["features"])),
            "n_dropped_nonfinite": int((~finite).sum())}
@@ -413,6 +419,13 @@ def _selection_config(args, k1_max_kcal: float, temperature_k: float) -> Selecti
         min_gain_nats=float(getattr(args, "cv_selection_min_gain_nats", 0.02)),
         min_windows_cv1=int(getattr(args, "cv_selection_min_windows_cv1", 4)),
         temperature_k=float(temperature_k),
+        ranking=str(getattr(args, "cv_selection_rank", "slowness")),
+        tica_lag_ps=float(getattr(args, "cv_selection_tica_lag_ps", 50.0)),
+        slowness_lag_ps=float(getattr(args, "cv_selection_slowness_lag_ps", 200.0)),
+        n_tica_components=int(getattr(args, "cv_selection_n_tica", 3)),
+        min_slowness_rho=float(getattr(args, "cv_selection_min_slowness", 0.72)),
+        min_bimodality=float(getattr(args, "cv_selection_min_bimodality", 5.0 / 9.0)),
+        half_split_min_corr=float(getattr(args, "cv_selection_half_split_min_corr", 0.8)),
     )
 
 

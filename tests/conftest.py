@@ -86,6 +86,9 @@ def make_swarm_args(**overrides) -> types.SimpleNamespace:
         cv_selection_max_coupling_fraction=0.25, cv_selection_k2_reference_kcal=1.0,
         cv_selection_min_windows_cv1=4, cv_selection_min_gain_nats=0.02,
         cv_selection_fallback="cv1_only",
+        # The fake swarm's CV2 is neither slow nor bimodal, so the default slowness ranking
+        # (correctly) returns cv1_only; plumbing tests pin the legacy rule to get a pair.
+        cv_selection_rank="gain",
     )
     base.update(overrides)
     return types.SimpleNamespace(**base)
