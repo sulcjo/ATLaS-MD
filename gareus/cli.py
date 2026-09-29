@@ -522,6 +522,12 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                    help="Replace a campaign's recorded adaptive decision rules (overlap targets, sample "
                         "floors, per-epoch add limits, duplicate tolerances; adaptive_production/"
                         "decision_settings.json, frozen at the campaign's first job) with this job's values.")
+    p.add_argument("--ap-allocation-weight", choices=("raw", "ess"), default="raw",
+                   help="How the --ap-topups allocator counts a state's samples. raw (default): the "
+                        "union builder's thinned count. ess: N/g with g the integrated autocorrelation "
+                        "time of the state's own CV1/CV2 series (contiguous runs, never stitched), so "
+                        "slow states get more top-up MD. Frozen with the decision rules. No effect "
+                        "without --ap-topups (the baseline runs every state in lockstep).")
     p.add_argument("--ap-topups", action=argparse.BooleanOptionalAction, default=False,
                    help="Top-ups (off by default): --no-ap-topups runs each scheduled phase as a single "
                         "all-state baseline only. --ap-topups adds, after that baseline, at most one "
@@ -1558,6 +1564,7 @@ def _shim_adaptive_production(args: argparse.Namespace) -> None:
     args.adaptive_production_ladder_max_moves = args.ap_ladder_max_moves
     args.adaptive_production_ladder_adapt_override = args.ap_ladder_adapt_override
     args.adaptive_production_decision_settings_override = args.ap_decision_settings_override
+    args.adaptive_production_allocation_weight = args.ap_allocation_weight
     args.adaptive_production_topup_target_sigma = args.ap_topup_target_sigma
     args.adaptive_production_topup_weak_overlap = args.ap_topup_weak_overlap
     args.adaptive_production_topup_max_fraction = args.ap_topup_max_fraction

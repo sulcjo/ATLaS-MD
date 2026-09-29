@@ -50,10 +50,31 @@ def predicted_sigma(sigma_before: float, sample_scale_steps: float, steps: float
     return float(sigma_before) * math.sqrt(scale / (scale + max(0.0, float(steps))))
 
 
+def decision_sigma(sigma: float, g_builder: float, g_effective: Optional[float]) -> float:
+    """sigma a state would have with its samples counted at ``g_effective`` instead of the
+    union builder's ``g_builder`` (sigma ~ 1/sqrt(N_eff), N_eff = N/g).  ``g_effective``
+    None/non-finite leaves sigma unchanged (X5, ``allocation_weight = "ess"``).
+
+    One-sided: the ratio is clamped at 1, so a state is only ever judged WORSE sampled
+    than the builder says.  The contiguity-aware g is a lower bound for slow states
+    (per-run centring removes modes slower than a run), while the builder's stitched g
+    also carries inter-segment drift and the equilibration discard; neither is a reason
+    to call a state healthier.  Steps leave fast states only by budget competition."""
+    if not _ok(g_effective) or float(g_effective) <= 0.0 or not _ok(sigma):
+        return float(sigma)
+    return float(sigma) * math.sqrt(max(1.0, max(1.0, float(g_effective)) / max(1.0, float(g_builder))))
+
+
 def plan_topup(diag, *, state_ids_in_order: Sequence[int], neighbours: Dict[int, List[int]],
                rung_partners: Dict[int, List[int]], policy, report_interval: int, timestep_fs: float,
                n_gpus: int, budget_hours: float, correction: Optional[Dict[int, float]] = None,
-               edge_attempts: Optional[Dict[Tuple[int, int], int]] = None) -> TopupPlan:
+               edge_attempts: Optional[Dict[Tuple[int, int], int]] = None,
+               effective_g: Optional[Dict[int, float]] = None) -> TopupPlan:
+    """``effective_g`` (X5, ``--ap-allocation-weight ess``): per-state statistical inefficiency
+    from ``gareus.adaptive.effective_samples``.  Deficits, partner choice and the required
+    length then use each state's sigma rescaled to that g (``decision_sigma``); the steps-worth
+    of data a state holds, the MAX_STEP_MULTIPLE cap and the recorded sigma/predictions stay
+    on the builder's scale, so post-top-up calibration is unchanged.  None: today's plan."""
     if diag is None:
         return TopupPlan(reason="no_diagnostics")
     interval = max(1, int(report_interval))
@@ -64,6 +85,9 @@ def plan_topup(diag, *, state_ids_in_order: Sequence[int], neighbours: Dict[int,
     n_eff = {s: int(diag.n_k.get(s, 0)) for s in state_ids_in_order}
     g = {s: max(1.0, float(diag.inefficiency.get(s, 1.0))) for s in state_ids_in_order}
     sampled = {s for s in state_ids_in_order if n_eff[s] > 0 and _ok(sigma[s])}
+    sigma_raw = sigma
+    if effective_g:
+        sigma = {s: decision_sigma(sigma_raw[s], g[s], effective_g.get(s)) for s in state_ids_in_order}
 
     deficits = {s for s in sampled if sigma[s] > target or s in diag.unconverged}
     initial = frozenset(deficits)
@@ -93,7 +117,7 @@ def plan_topup(diag, *, state_ids_in_order: Sequence[int], neighbours: Dict[int,
         return max(1e-9, float(n_eff[s])) * interval * g[s] / corr[s]
 
     def predicted(s: int, L: int) -> float:
-        return predicted_sigma(sigma[s], scale(s), L)
+        return predicted_sigma(sigma_raw[s], scale(s), L)
 
     def required(s: int) -> int:
         # noise-edge endpoints and unconverged states below target both use σ/√2 (double their data)
@@ -140,5 +164,5 @@ def plan_topup(diag, *, state_ids_in_order: Sequence[int], neighbours: Dict[int,
     return TopupPlan(state_ids=tuple(sorted(patch)), steps=int(L), deficit_state_ids=tuple(sorted(deficits)),
                      partner_state_ids=tuple(sorted(partners)), structural_edges=tuple(structural),
                      weak_edges_topped=tuple(noise_edges), predicted_sigma=pred,
-                     sigma_before={s: sigma[s] for s in patch}, cost_hours=float(cost), reason="planned",
+                     sigma_before={s: sigma_raw[s] for s in patch}, cost_hours=float(cost), reason="planned",
                      sample_scale_steps={s: scale(s) for s in patch})
