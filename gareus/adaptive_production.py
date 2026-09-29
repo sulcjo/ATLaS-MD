@@ -4938,6 +4938,10 @@ def propose_actions_from_diagnostics(
                 "state_j": int(s2.state_id),
                 "overlap": edge.get("overlap"),
                 "exchange_acceptance": edge.get("exchange_acceptance"),
+                # The value of the metric that made the edge weak (``overlap`` stays the
+                # CV1 marginal, whatever the metric).
+                "graded_overlap": _weak_edge_graded_value(edge, policy)[0],
+                "graded_overlap_source": _weak_edge_graded_value(edge, policy)[1],
                 "bridges_needed": needed,
                 "min_useful_bridges": min_useful,
                 "bridges_allocated": n_place,
@@ -5078,7 +5082,7 @@ def propose_actions_from_diagnostics(
             placed_this_edge += 1
             reason = (
                 f"weak edge {s1.state_id}-{s2.state_id}: "
-                f"overlap={edge.get('overlap')}, exchange_acceptance={edge.get('exchange_acceptance')}"
+                f"{_weak_edge_metric_text(edge, policy)}"
                 f"; bridge {placed_this_edge}/{n_place} of {needed} needed ({prediction_note})"
             )
             if shortfall:
@@ -5382,6 +5386,46 @@ def _edge_is_measured_weak(edge: Dict[str, Any], policy: AdaptiveDecisionPolicy)
     if acc is not None and float(acc) < float(policy.min_exchange_acceptance):
         weak = True
     return weak
+
+
+def _weak_edge_graded_value(edge: Dict[str, Any], policy: AdaptiveDecisionPolicy) -> Tuple[Optional[float], str]:
+    """(value, source) of the overlap that graded this spatial edge: the metric that made it weak.
+
+    ``pairwise-mbar``: the union ``mbar_overlap`` when a union solve scored the edge, else the
+    two-state point estimate (source ``pairwise_mbar``); ``marginal``: the CV1-marginal
+    ``overlap`` (source ``cv1_marginal``).
+    """
+    if str(getattr(policy, "edge_metric", "marginal")) == "pairwise-mbar":
+        union = _finite_or_none(edge.get("mbar_overlap"))
+        if union is not None:
+            return union, "pairwise_mbar_union"
+        return _finite_or_none((edge.get("pairwise_mbar") or {}).get("overlap")), "pairwise_mbar"
+    return _finite_or_none(edge.get("overlap")), "cv1_marginal"
+
+
+def _weak_edge_metric_text(edge: Dict[str, Any], policy: AdaptiveDecisionPolicy) -> str:
+    """The reason-text clause naming why an edge is weak, on the metric that graded it.
+
+    Under ``marginal`` the text is exactly what it always was. Under ``pairwise-mbar`` it
+    quotes the pairwise value (and its bootstrap q90, the number the decision read) against
+    ``min_rung_overlap``; the CV1 marginal is kept, labelled, since it is still recorded --
+    before, the reason quoted only the marginal (e.g. ``overlap=0.777`` for chignolin_9's
+    64-76, weak at pairwise 0.080).
+    """
+    marginal = f"overlap={edge.get('overlap')}, exchange_acceptance={edge.get('exchange_acceptance')}"
+    if str(getattr(policy, "edge_metric", "marginal")) != "pairwise-mbar":
+        return marginal
+    value, source = _weak_edge_graded_value(edge, policy)
+    thr = f"min_rung_overlap={float(policy.min_rung_overlap):g}"
+    tail = (f"cv1_marginal_overlap={edge.get('overlap')}, "
+            f"exchange_acceptance={edge.get('exchange_acceptance')}")
+    if value is None:
+        return f"pairwise_mbar_overlap=None; {tail}"
+    if source == "pairwise_mbar_union":
+        return f"pairwise_mbar_overlap={value:.4f} (union) < {thr}; {tail}"
+    upper = _finite_or_none((edge.get("pairwise_mbar") or {}).get("overlap_upper"))
+    q90 = f", q90 {upper:.4f}" if upper is not None else ""
+    return f"pairwise_mbar_overlap={value:.4f} (two-state{q90}) < {thr}; {tail}"
 
 
 # Policy fields that only ever fed the per-state score allocator, removed with the
