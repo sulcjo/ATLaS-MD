@@ -2291,11 +2291,46 @@ def build_geometry_edges(
     registry: WindowStateRegistry,
     policy: Optional[AdaptiveDecisionPolicy] = None,
 ) -> List[Tuple[int, int, str, Optional[float]]]:
-    """Build a light geometry graph between active states.
+    """Build a light geometry graph between active states: true neighbours only.
 
-    For 1D states, this is a simple sorted nearest-neighbor chain.  For 2D
-    states, use immediate row/column-like nearest neighbors plus one nearest
-    Euclidean neighbor per state to keep sparse patches connected.
+    Edge types (the weak-edge gate, the bridge proposer, retirement and the
+    reports read them):
+
+    * ``primary_chain`` -- the CV1 direction: consecutive states in sorted CV1
+      centre WITHIN one CV2 row, i.e. among states of one restraint pattern
+      (spec P6) sharing the CV2 centre (CV1-only states form one row: their CV2
+      coordinate is a placeholder and never identity). Weak-eligible.
+    * ``secondary_chain`` -- the CV2 direction: consecutive states in sorted CV2
+      centre WITHIN one CV1 column (same pattern, same CV1 centre; CV2-only
+      states form one column). Weak-eligible.
+    * ``nearest_2d`` -- only when some state carries a CV2 centre: each state's
+      nearest state of its OWN restraint pattern by the P7a restraint-width
+      distance (``neighbour_rule.pair_distance``), plus the closest same-pattern
+      pair between any two still-separate pieces of one pattern (a sparse patch,
+      or an off-grid bridge state with no row or column partner). Weak-eligible:
+      it is the nearest pair, so a low overlap on it is a real gap.
+    * ``pattern_link`` -- connectivity bookkeeping between restraint patterns
+      (anchor, CV1-only, CV2-only, 2D), one per pair of patterns that share a
+      restrained axis (the closest pair on the shared axes only, placeholders
+      never read), each anchor linked to the most central state of the largest
+      pattern, and a last-resort join of anything still separate. NEVER weak
+      under either metric and never read by retirement: a midpoint between two
+      patterns lands on a placeholder coordinate, and a CV1-marginal overlap
+      across patterns says nothing about redundancy. They exist so
+      ``active_graph_connected`` / the articulation set see one graph.
+
+    Before this rule (spec-T3 / T2 bug) the CV1 chain was ``argsort`` over ALL
+    states, so ties and columns were ordered arbitrarily: chignolin_9 got CV2-only
+    windows three rows apart (64-76), 2D windows two rows apart in one column
+    (160-216, 136-232, 184-204), a diagonal across a column boundary (164-200)
+    and, on any grid, the top of one column joined to the bottom of the next.
+
+    Neighbour ranking uses the P7a distance at a fixed 300 K: on one restraint
+    pattern every distance scales as 1/sqrt(T), so the choice does not depend on
+    T. A restrained axis whose k is not recorded gets
+    ``neighbour_rule.fallback_axis_sigmas`` (median recorded width, else median
+    centre spacing). A layout where no state carries a CV2 centre (a CV1-only
+    ladder, chignolin_7) produces exactly the old sorted chain.
 
     Under an active λ-ladder (some state carries ``gamd_lambda > 0``) states
     are first grouped by centre: adjacent rungs within one group get a
@@ -2316,32 +2351,161 @@ def build_geometry_edges(
         active, rung_edges = _split_rung_groups(active, policy)
         if len(active) <= 1:
             return rung_edges
-    has_secondary = any(s.secondary_center is not None for s in active)
-    primary = np.asarray([s.primary_center for s in active], dtype=float)
-    secondary = np.asarray([0.0 if s.secondary_center is None else s.secondary_center for s in active], dtype=float)
+    return rung_edges + _neighbour_geometry_edges(active)
+
+
+GEOMETRY_LINK_EDGE_TYPE = "pattern_link"
+# Geometry edge types that carry a spatial gap the bridge proposer may act on.
+WEAK_ELIGIBLE_GEOMETRY_EDGE_TYPES = ("primary_chain", "secondary_chain", "nearest_2d", "geometry", "segmented")
+_GEOMETRY_RANK_TEMPERATURE_K = 300.0   # ranking only; same-pattern distances scale as 1/sqrt(T)
+_GEOMETRY_CENTRE_DECIMALS = 6          # row/column identity, as layout_neighbours / the 2D window map
+
+
+def _neighbour_geometry_edges(active: List[WindowState]) -> List[Tuple[int, int, str, Optional[float]]]:
+    """The non-rung part of ``build_geometry_edges`` over one representative per centre."""
+    from .adaptive.neighbour_rule import NeighbourPoint, fallback_axis_sigmas, pair_distance
+    n = len(active)
     ids = [int(s.state_id) for s in active]
+    primary = np.asarray([s.primary_center for s in active], dtype=float)
+    secondary = np.asarray([0.0 if s.secondary_center is None else s.secondary_center for s in active],
+                           dtype=float)
+    has_secondary = any(s.secondary_center is not None for s in active)
+    pattern = [_restraint_pattern(s.primary_k, s.secondary_k, s.secondary_center) for s in active]
+    points = [NeighbourPoint(primary_center=float(s.primary_center), primary_k=s.primary_k,
+                             secondary_center=s.secondary_center, secondary_k=s.secondary_k)
+              for s in active]
+    fallback, _src = fallback_axis_sigmas(points, _GEOMETRY_RANK_TEMPERATURE_K)
     edges: Dict[Tuple[int, int], Tuple[int, int, str, Optional[float]]] = {}
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
 
     def add(a_idx: int, b_idx: int, etype: str, nd: Optional[float]) -> None:
         if a_idx == b_idx:
             return
         a, b = sorted((ids[a_idx], ids[b_idx]))
-        edges[(a, b)] = (a, b, etype, nd)
+        if (a, b) not in edges:            # first (most specific) type wins
+            edges[(a, b)] = (a, b, etype, nd)
+        ra, rb = find(a_idx), find(b_idx)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
 
-    order = list(np.argsort(primary))
-    for left, right in zip(order[:-1], order[1:]):
-        add(int(left), int(right), "primary_chain", None)
-    if has_secondary:
-        p_scale = _positive_scale(primary)
-        s_scale = _positive_scale(secondary)
-        coords = np.column_stack([primary / p_scale, secondary / s_scale])
-        for i in range(len(active)):
-            dist = np.sqrt(np.sum((coords - coords[i]) ** 2, axis=1))
-            dist[i] = np.inf
-            j = int(np.argmin(dist))
-            if math.isfinite(float(dist[j])):
-                add(i, j, "nearest_2d", float(dist[j]))
-    return rung_edges + list(edges.values())
+    def dist(i: int, j: int) -> float:
+        return pair_distance(points[i], points[j], _GEOMETRY_RANK_TEMPERATURE_K, fallback_sigma=fallback)
+
+    def key(v: float) -> float:
+        return round(float(v), _GEOMETRY_CENTRE_DECIMALS)
+
+    def chains(axis: int, etype: str) -> None:
+        groups: Dict[Tuple, List[int]] = {}
+        for i in range(n):
+            if not pattern[i][axis]:
+                continue
+            other = 1 - axis
+            other_key = (key(secondary[i]) if other == 1 else key(primary[i])) if pattern[i][other] else None
+            groups.setdefault((pattern[i], other_key), []).append(i)
+        values = primary if axis == 0 else secondary
+        for gkey in sorted(groups, key=lambda g: (g[0], (0, 0.0) if g[1] is None else (1, g[1]))):
+            idx = groups[gkey]
+            order = [idx[t] for t in np.argsort(values[idx])]
+            for left, right in zip(order[:-1], order[1:]):
+                add(int(left), int(right), etype, None)
+
+    chains(0, "primary_chain")
+    if not has_secondary:
+        # A CV1-only layout: exactly the old sorted chain (one row), plus the links below for
+        # an anchor (k1 = 0), if any.
+        _link_patterns(active, pattern, points, fallback, add, find)
+        return list(edges.values())
+    chains(1, "secondary_chain")
+    by_pattern: Dict[Tuple[bool, bool], List[int]] = {}
+    for i in range(n):
+        if any(pattern[i]):
+            by_pattern.setdefault(pattern[i], []).append(i)
+    for members in by_pattern.values():
+        for i in members:
+            cands = [(dist(i, j), ids[j], j) for j in members if j != i]
+            cands = [c for c in cands if math.isfinite(c[0])]
+            if cands:
+                d, _sid, j = min(cands)
+                add(i, j, "nearest_2d", float(d))
+        # Closest pair between still-separate pieces of this pattern (Kruskal over the
+        # remaining cross-piece pairs), so an off-grid state is never left alone.
+        pairs = sorted((dist(i, j), ids[i], ids[j], i, j) for a, i in enumerate(members)
+                       for j in members[a + 1:] if find(i) != find(j))
+        for d, _a, _b, i, j in pairs:
+            if find(i) != find(j) and math.isfinite(d):
+                add(i, j, "nearest_2d", float(d))
+    _link_patterns(active, pattern, points, fallback, add, find)
+    return list(edges.values())
+
+
+def _link_patterns(active, pattern, points, fallback, add, find) -> None:
+    """``pattern_link`` edges joining the restraint-pattern groups (see ``build_geometry_edges``)."""
+    from .adaptive.neighbour_rule import axis_separation
+    n = len(active)
+    ids = [int(s.state_id) for s in active]
+    groups: Dict[Tuple[bool, bool], List[int]] = {}
+    for i in range(n):
+        groups.setdefault(pattern[i], []).append(i)
+
+    def central(members: List[int]) -> int:
+        """The member nearest the medians of its restrained centres (P7a units, no placeholder)."""
+        axes = [a for a in (0, 1) if pattern[members[0]][a]]
+        if not axes:
+            return min(members, key=lambda i: ids[i])
+        med = {a: float(np.median([points[i].centre(a) for i in members])) for a in axes}
+
+        def score(i: int) -> Tuple[float, int]:
+            tot = 0.0
+            for a in axes:
+                w = fallback[a] if fallback[a] else 1.0
+                tot += ((points[i].centre(a) - med[a]) / w) ** 2
+            return (tot, ids[i])
+        return min(members, key=score)
+
+    restrained_groups = [g for g in groups if any(g)]
+    for ga_i, ga in enumerate(restrained_groups):
+        for gb in restrained_groups[ga_i + 1:]:
+            shared = [a for a in (0, 1) if ga[a] and gb[a]]
+            if not shared:
+                continue
+            med_b = {a: float(np.median([points[j].centre(a) for j in groups[gb]])) for a in (0, 1) if gb[a]}
+            med_a = {a: float(np.median([points[i].centre(a) for i in groups[ga]])) for a in (0, 1) if ga[a]}
+            best = None
+            for i in groups[ga]:
+                for j in groups[gb]:
+                    d2 = 0.0
+                    for a in shared:
+                        sep = axis_separation(points[i], points[j], a, _GEOMETRY_RANK_TEMPERATURE_K,
+                                              fallback_sigma=fallback[a])
+                        d2 += (sep if sep is not None else math.inf) ** 2
+                    # tie-break: the partners' unshared restrained axes nearest their own
+                    # pattern's median (the middle row / column), then state ids
+                    tie = sum(abs(points[j].centre(a) - med_b[a]) for a in med_b if a not in shared)
+                    tie += sum(abs(points[i].centre(a) - med_a[a]) for a in med_a if a not in shared)
+                    cand = (d2, tie, ids[i], ids[j], i, j)
+                    if best is None or cand < best:
+                        best = cand
+            if best is not None and math.isfinite(best[0]):
+                add(best[4], best[5], GEOMETRY_LINK_EDGE_TYPE, float(math.sqrt(best[0])))
+    if restrained_groups and groups.get((False, False)):
+        hub_group = max(restrained_groups, key=lambda g: (len(groups[g]), g))
+        hub = central(groups[hub_group])
+        for i in groups.get((False, False), []):
+            add(i, hub, GEOMETRY_LINK_EDGE_TYPE, None)
+    # Last resort (e.g. CV1-only + CV2-only with no 2D state and no anchor): join what is
+    # still separate, most central state to most central state, in state-id order.
+    comps: Dict[int, List[int]] = {}
+    for i in range(n):
+        comps.setdefault(find(i), []).append(i)
+    pieces = sorted(comps.values(), key=lambda c: min(ids[i] for i in c))
+    for piece in pieces[1:]:
+        add(central(pieces[0]), central(piece), GEOMETRY_LINK_EDGE_TYPE, None)
 
 
 def _split_rung_groups(
@@ -5120,14 +5284,17 @@ def propose_actions_from_diagnostics(
                 # already safe from retirement: they gain no CV overlap credit,
                 # so state_max_overlap never reaches redundant_overlap for them.
                 continue
-            if str(edge.get("edge_type")) in GRAPH_EDGE_TYPES:
+            if str(edge.get("edge_type")) in GRAPH_EDGE_TYPES or str(edge.get("edge_type")) == GEOMETRY_LINK_EDGE_TYPE:
                 # Spec 3.1's appended graph edges (``neighbour``: any same-pattern pair
                 # within the P7a radius; ``spanning``) are graded, never actionable: they
                 # carry no CV1-marginal ``overlap`` (None by construction), and reading
                 # that None as "bad" marked both ends of every one of them, so
                 # --ap-edge-metric pairwise-mbar retired nothing (spec T2 bug 1).
                 # Retirement stays on the collector's geometry edges; an unmeasured
-                # GEOMETRY edge (no samples) still blocks, as before.
+                # GEOMETRY edge (no samples) still blocks, as before. A ``pattern_link``
+                # (connectivity bookkeeping between restraint patterns) is skipped for the
+                # same reason: its CV1 marginal across patterns is no redundancy evidence.
+                # Articulation (graph_critical) still protects every link endpoint.
                 continue
             ov = edge.get("overlap")
             if ov is None or float(ov) < float(policy.target_overlap):
@@ -5194,7 +5361,10 @@ def propose_actions_from_diagnostics(
         # Hard minimum-replica floor: never retire the active set below
         # policy.min_active_states (default 8), independent of how many windows are
         # redundant. Snapshot the count before any tentative removal.
-        min_active = max(0, int(getattr(policy, "min_active_states", 0)))
+        # At least one state always stays: ``active_graph_connected`` is True for an empty
+        # graph, so with a floor of 0 a pure cycle (a 2x2 grid, whose geometry graph has no
+        # articulation point once chains join true neighbours only) retired every state.
+        min_active = max(1, int(getattr(policy, "min_active_states", 0)))
         n_active_start = len(registry.active_state_ids())
         admitted: List[int] = []
         for sid in retire_candidates:
@@ -5376,6 +5546,10 @@ def _edge_is_measured_weak(edge: Dict[str, Any], policy: AdaptiveDecisionPolicy)
     if str(edge.get("edge_type")) == "rung":
         value = edge.get("mbar_overlap")
         return value is not None and float(value) < float(policy.min_rung_overlap)
+    if str(edge.get("edge_type")) == GEOMETRY_LINK_EDGE_TYPE:
+        # Connectivity bookkeeping between restraint patterns (build_geometry_edges):
+        # a midpoint between two patterns is a placeholder coordinate, never a bridge.
+        return False
     if str(getattr(policy, "edge_metric", "marginal")) == "pairwise-mbar":
         # Spec 3.1: one metric (two-state / union pairwise MBAR, bootstrap bound);
         # cross-pattern and unmeasured edges are never weak.

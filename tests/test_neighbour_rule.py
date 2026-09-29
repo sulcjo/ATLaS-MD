@@ -165,3 +165,27 @@ def test_from_state_reads_window_state():
                         secondary_k=1.2, gamd_lambda=0.25)
     p = P.from_state(st)
     assert (p.primary_center, p.primary_k, p.secondary_center, p.secondary_k, p.rung) == (0.2, 300.0, 0.1, 1.2, 0.25)
+
+
+# --- P7b: k not recorded (old registries) -------------------------------------
+
+def test_unrecorded_k_uses_the_callers_fallback_width():
+    a, b = P(0.1, None), P(0.2, 300.0)
+    s = 0.05
+    got = nr.pair_distance(a, b, T, fallback_sigma=(s, None))
+    assert got == pytest.approx(0.1 / math.hypot(s, _sig(300.0)), rel=1e-12)
+    assert nr.pair_distance(a, b, T) == math.inf          # without a fallback: unmeasurable, as before
+    assert nr.is_neighbour(a, b, T, radius=10.0, fallback_sigma=(s, None))
+
+
+def test_fallback_widths_prefer_default_k_then_median_known_width_then_centre_spacing():
+    pts = [P(0.1, None), P(0.2, 300.0), P(0.3, 100.0), P(0.4, None)]
+    sig, src = nr.fallback_axis_sigmas(pts, T)
+    assert sig[0] == pytest.approx((_sig(300.0) + _sig(100.0)) / 2)      # median of the two known widths
+    assert src[0] == "median_restraint_width"
+    no_k = [P(0.1, None), P(0.3, None), P(0.6, None)]
+    sig, src = nr.fallback_axis_sigmas(no_k, T)
+    assert sig[0] == pytest.approx(0.25) and src[0] == "median_centre_spacing"   # gaps 0.2, 0.3
+    assert sig[1] is None and src[1] == "unrestrained"
+    sig, src = nr.fallback_axis_sigmas(no_k, T, default_k=(300.0, None))
+    assert sig[0] == pytest.approx(_sig(300.0)) and src[0] == "run_default_k"

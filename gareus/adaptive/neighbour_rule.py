@@ -34,8 +34,10 @@ per-axis ratios combine in quadrature:
 Axis cases:
 
   * restrained on both states: as above. A restrained axis whose k is not
-    recorded (None) has no known width, so the pair is unmeasurable (inf);
-    callers with such states pass the run's default k explicitly;
+    recorded (None) has no known width, so the pair is unmeasurable (inf)
+    unless the caller passes ``fallback_sigma`` (P7b: ``fallback_axis_sigmas``
+    = the run's default k, else the median recorded width, else the median
+    centre spacing; the caller records which);
   * restrained on neither: the axis is left out. An unrestrained axis carries a
     placeholder centre, and placeholders are never identity (spec P6);
   * restrained on exactly one state (only reachable with
@@ -79,6 +81,7 @@ sampled means x s) leaves every d_ab unchanged; so does T x c with k x c.
 from __future__ import annotations
 
 import math
+import statistics
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional, Sequence, Tuple
 
@@ -173,20 +176,34 @@ def _restrained_width(k: Optional[float], temperature_k: float) -> Optional[floa
     return sigma if math.isfinite(sigma) and sigma > 0.0 else None
 
 
+def _width_or_fallback(k: Optional[float], temperature_k: float, fallback: Optional[float]) -> Optional[float]:
+    """sigma_w of a restrained axis; ``fallback`` (a finite positive width) when k is not recorded."""
+    width = _restrained_width(k, temperature_k)
+    if width is not None:
+        return width
+    fb = _finite(fallback)
+    return fb if fb is not None and fb > 0.0 else None
+
+
 def axis_separation(a: NeighbourPoint, b: NeighbourPoint, axis: int, temperature_k: float,
-                    pooled_sd: Optional[float] = None) -> Optional[float]:
-    """|delta| / s_ab on one axis; None if the axis is left out; inf if unmeasurable."""
+                    pooled_sd: Optional[float] = None, fallback_sigma: Optional[float] = None) -> Optional[float]:
+    """|delta| / s_ab on one axis; None if the axis is left out; inf if unmeasurable.
+
+    ``fallback_sigma`` is the width used for a restrained axis whose k is not recorded
+    (``fallback_axis_sigmas``); without it such an axis is unmeasurable (inf), as in P7a.
+    """
     on_a, on_b = a.pattern[axis], b.pattern[axis]
     if not (on_a or on_b):
         return None
     if on_a and on_b:
         ca, cb = a.centre(axis), b.centre(axis)
-        sa, sb = _restrained_width(a.k(axis), temperature_k), _restrained_width(b.k(axis), temperature_k)
+        sa = _width_or_fallback(a.k(axis), temperature_k, fallback_sigma)
+        sb = _width_or_fallback(b.k(axis), temperature_k, fallback_sigma)
         if ca is None or cb is None or sa is None or sb is None:
             return math.inf
         return abs(ca - cb) / math.sqrt(sa * sa + sb * sb)
     fixed, free = (a, b) if on_a else (b, a)
-    c_fixed, s_fixed = fixed.centre(axis), _restrained_width(fixed.k(axis), temperature_k)
+    c_fixed, s_fixed = fixed.centre(axis), _width_or_fallback(fixed.k(axis), temperature_k, fallback_sigma)
     m_free, sd_free = _finite(free.sampled_mean[axis]), _finite(pooled_sd)
     if c_fixed is None or s_fixed is None or m_free is None or sd_free is None or sd_free <= 0.0:
         return math.inf
@@ -194,11 +211,11 @@ def axis_separation(a: NeighbourPoint, b: NeighbourPoint, axis: int, temperature
 
 
 def pair_distance(a: NeighbourPoint, b: NeighbourPoint, temperature_k: float,
-                  pooled_sd: PooledSd = (None, None)) -> float:
+                  pooled_sd: PooledSd = (None, None), fallback_sigma: PooledSd = (None, None)) -> float:
     """Normalised distance d_ab (symmetric). inf when no axis is usable or one is unmeasurable."""
     total, used = 0.0, 0
     for axis in (0, 1):
-        sep = axis_separation(a, b, axis, temperature_k, pooled_sd[axis])
+        sep = axis_separation(a, b, axis, temperature_k, pooled_sd[axis], fallback_sigma[axis])
         if sep is None:
             continue
         if not math.isfinite(sep):
@@ -210,7 +227,7 @@ def pair_distance(a: NeighbourPoint, b: NeighbourPoint, temperature_k: float,
 
 def is_neighbour(a: NeighbourPoint, b: NeighbourPoint, temperature_k: float,
                  radius: float = DEFAULT_RADIUS, pooled_sd: PooledSd = (None, None),
-                 same_pattern_only: bool = True) -> bool:
+                 same_pattern_only: bool = True, fallback_sigma: PooledSd = (None, None)) -> bool:
     """The P7a criterion (module docstring). ``a is b`` is never a neighbour of itself."""
     if a is b or a.rung_key() != b.rung_key():
         return False
@@ -219,19 +236,59 @@ def is_neighbour(a: NeighbourPoint, b: NeighbourPoint, temperature_k: float,
         return False
     if same_pattern_only and pa != pb:
         return False
-    return pair_distance(a, b, temperature_k, pooled_sd) <= float(radius)
+    return pair_distance(a, b, temperature_k, pooled_sd, fallback_sigma) <= float(radius)
 
 
 def neighbour_pairs(points: Sequence[NeighbourPoint], temperature_k: float,
                     radius: float = DEFAULT_RADIUS, pooled_sd: PooledSd = (None, None),
-                    same_pattern_only: bool = True) -> list[Tuple[int, int]]:
+                    same_pattern_only: bool = True, fallback_sigma: PooledSd = (None, None)
+                    ) -> list[Tuple[int, int]]:
     """Sorted index pairs (i, j), i < j, that are neighbours."""
     out = []
     for i in range(len(points)):
         for j in range(i + 1, len(points)):
-            if is_neighbour(points[i], points[j], temperature_k, radius, pooled_sd, same_pattern_only):
+            if is_neighbour(points[i], points[j], temperature_k, radius, pooled_sd, same_pattern_only,
+                            fallback_sigma):
                 out.append((i, j))
     return out
+
+
+def fallback_axis_sigmas(points: Sequence[NeighbourPoint], temperature_k: float,
+                         default_k: Tuple[Optional[float], Optional[float]] = (None, None)
+                         ) -> Tuple[Tuple[Optional[float], Optional[float]], Tuple[str, str]]:
+    """Per axis, the width a restrained-but-k-unrecorded state is given, and where it came from.
+
+    Resolves P7a's open point for old registries (k None = restrained, width unknown). In
+    order: the run's default k (``default_k``, e.g. ``--k`` / ``--secondary-cv-k``) ->
+    ``"run_default_k"``; else the median sigma_w over the states whose k IS recorded ->
+    ``"median_restraint_width"``; else the median gap between distinct restrained centres on
+    that axis (the same last resort as ``layout_neighbours._axis_scale``) ->
+    ``"median_centre_spacing"``. An axis no state restrains -> (None, ``"unrestrained"``); a
+    restrained axis where none of these exists -> (None, ``"unmeasurable"``). Callers record
+    the source next to the graph they build.
+    """
+    sig: list = []
+    src: list = []
+    for axis in (0, 1):
+        on = [p for p in points if p.pattern[axis]]
+        if not on:
+            sig.append(None); src.append("unrestrained")
+            continue
+        width = _restrained_width(default_k[axis], temperature_k)
+        if width is not None:
+            sig.append(width); src.append("run_default_k")
+            continue
+        known = [w for w in (_restrained_width(p.k(axis), temperature_k) for p in on) if w is not None]
+        if known:
+            sig.append(float(statistics.median(known))); src.append("median_restraint_width")
+            continue
+        centres = sorted({round(c, RUNG_DECIMALS) for c in (p.centre(axis) for p in on) if c is not None})
+        gaps = [b - a for a, b in zip(centres[:-1], centres[1:]) if b - a > 0.0]
+        if gaps:
+            sig.append(float(statistics.median(gaps))); src.append("median_centre_spacing")
+        else:
+            sig.append(None); src.append("unmeasurable")
+    return (sig[0], sig[1]), (src[0], src[1])
 
 
 def neighbour_lists(n: int, pairs: Iterable[Tuple[int, int]]) -> dict[int, list[int]]:
@@ -264,4 +321,5 @@ def components(n: int, pairs: Iterable[Tuple[int, int]]) -> list[list[int]]:
 
 
 __all__ = ["DEFAULT_RADIUS", "NeighbourPoint", "axis_restrained", "axis_separation", "components",
+           "fallback_axis_sigmas",
            "is_neighbour", "neighbour_lists", "neighbour_pairs", "pair_distance", "restraint_pattern"]

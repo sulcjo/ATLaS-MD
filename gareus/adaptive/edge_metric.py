@@ -73,7 +73,8 @@ the lowest; the same rule as ``build_geometry_edges``). Edges:
   axis). Without these the same-pattern graph is 4 components per rung on
   chignolin_9 (anchor, CV1-only, CV2-only, 2D) by construction.
 
-The collector's own geometry edges (``primary_chain``, ``nearest_2d``) are
+The collector's own geometry edges (``primary_chain``, ``secondary_chain``, ``nearest_2d``;
+``pattern_link`` is cross-pattern and never weak) are
 graded too; graph edges they do not already contain are appended.
 
 Which edges can be WEAK (what the gate counts and the bridge proposer acts on):
