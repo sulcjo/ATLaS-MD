@@ -39,6 +39,8 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import multiprocessing
+import os
 import re
 import sys
 import time
@@ -62,6 +64,7 @@ DEFAULT_CUTOFF_NM = 0.2
 DEFAULT_MIN_FRAMES = 5
 DEFAULT_MAX_CLUSTER_FRAMES = 100_000
 SATURATION_RATIO = 0.1
+HOOK_WORKERS = 4
 
 _REPLICA_RE = re.compile(r"replica_(\d+)(?:_resume_from_(\d+))?\.(xtc|dcd)$")
 _TOPUP_RE = re.compile(r"topup_(\d+)")
@@ -429,7 +432,9 @@ def run_census(adaptive_dir, *, basin_stride: int = 1, cluster_stride: Optional[
     cluster_stride = max(1, int(cluster_stride))
 
     per_phase = []
-    pool = ProcessPoolExecutor(max_workers=int(workers)) if int(workers) > 1 else None
+    # spawn, never fork: the driver hook runs inside a process that holds CUDA contexts.
+    pool = (ProcessPoolExecutor(max_workers=int(workers), mp_context=multiprocessing.get_context("spawn"))
+            if int(workers) > 1 else None)
     try:
         for label, path in found:
             tp = _find_topology(path, ad) or top_path
@@ -590,6 +595,7 @@ def census_for_epoch(adaptive_dir, epoch_dir, **kwargs) -> Optional[str]:
 
     Never raises: diagnostics must not end an epoch.
     """
+    kwargs.setdefault("workers", min(HOOK_WORKERS, os.cpu_count() or 1))
     try:
         result = run_census(adaptive_dir, **kwargs)
         return write_outputs(result, epoch_dir, plot=False)["json"]
