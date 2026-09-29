@@ -43,6 +43,7 @@ from .io import write_json, write_text_atomic, read_json_file, resolve_run_tempe
 from .lifecycle import _graceful_shutdown
 from .store import SegmentRegistry
 from .extension_seeding import extension_parent_dirs
+from .adaptive.paired_cv import PairedCVCollector, attach_paired_cv
 # Real-frame seed extraction lives in tica.py (a dependency-free leaf module)
 # so seeding.py can also use it for campaign-wide seed search without a
 # circular import - seeding.py -> production.py -> adaptive_production.py is
@@ -2466,8 +2467,10 @@ def collect_epoch_diagnostics(
 
     state_rows: List[StateDiagnostics] = []
     state_by_id: Dict[int, StateDiagnostics] = {}
+    paired = PairedCVCollector(registry)  # spec P4; additive keys only
     for epoch_window, state_id in sorted(window_map.items()):
         rows = by_state.get(int(state_id), [])
+        paired.add_rows(int(state_id), rows, source=epoch_dir.name)
         cv = _finite_float_list(r.get("cv_A", r.get("primary_cv_value")) for r in rows)
         sec = _finite_float_list(r.get("secondary_cv") for r in rows)
         boost_kcal = _finite_float_list(r.get("gamd_boost_total_kcal_mol") for r in rows)
@@ -2552,6 +2555,7 @@ def collect_epoch_diagnostics(
         "non_neighbor_redundancies": non_neighbor_redundancies,
         "policy": _json_ready(asdict(policy)),
     }
+    attach_paired_cv(payload, paired, epoch_dir / "adaptive_epoch_diagnostics.json")
     write_json(epoch_dir / "adaptive_epoch_diagnostics.json", payload)
     return payload
 
@@ -4096,9 +4100,11 @@ def collect_final_combined_diagnostics(
     canonical_state_to_window = {int(s.state_id): int(i) for i, s in enumerate(canonical_active)}
     canonical_window_map = {int(i): int(s.state_id) for i, s in enumerate(canonical_active)}
 
+    paired = PairedCVCollector(registry)  # spec P4; additive keys only
     for source_label, sample_dir in sources:
         window_map = _load_epoch_window_map(sample_dir, registry)
         samples = _read_sample_dicts(sample_dir)
+        source_rows: Dict[int, List[Dict[str, Any]]] = {}
         exchanges = _read_exchange_dicts(sample_dir)
         total_samples += len(samples)
         total_exchanges += len(exchanges)
@@ -4115,11 +4121,14 @@ def collect_final_combined_diagnostics(
                 continue
             sid = window_map.get(int(w), int(w))
             by_state.setdefault(int(sid), []).append(row)
+            source_rows.setdefault(int(sid), []).append(row)
             cv = _float_or_none(row.get("cv_A", row.get("primary_cv_value")))
             if cv is not None:
                 canonical_w = canonical_state_to_window.get(int(sid))
                 if canonical_w is not None:
                     by_window_values.setdefault(int(canonical_w), []).append(float(cv))
+        for sid, rows in source_rows.items():
+            paired.add_rows(sid, rows, source=source_label)
         for row in exchanges:
             wi = _float_or_none(row.get("window_i"))
             wj = _float_or_none(row.get("window_j"))
@@ -4192,6 +4201,7 @@ def collect_final_combined_diagnostics(
         "edges": [e.to_dict() for e in edge_rows],
         "policy": _json_ready(asdict(policy)),
     }
+    attach_paired_cv(payload, paired, adaptive_dir / "adaptive_final_combined_diagnostics.json")
     write_json(adaptive_dir / "adaptive_final_combined_diagnostics.json", payload)
     return payload
 
@@ -6216,6 +6226,9 @@ def collect_segmented_epoch_diagnostics(epoch_dir: Path, registry: WindowStateRe
     # Hoist the static edge list once — build_geometry_edges depends only on
     # the registry, which is constant for the lifetime of this call.
     geometry_edges = build_geometry_edges(registry)
+    # Spec P4: row-paired (CV1, CV2) pooled over ALL segments, so the joint edge
+    # overlap below is a pooled value, never a per-segment or CV1-only one.
+    paired = PairedCVCollector(registry)
 
     for seg in segment_dirs:
         diag = collect_epoch_diagnostics(seg, registry, policy=policy)
@@ -6224,16 +6237,21 @@ def collect_segmented_epoch_diagnostics(epoch_dir: Path, registry: WindowStateRe
         # --- Accumulate raw cv_A values per state from this segment's samples ---
         seg_window_map = _load_epoch_window_map(seg, registry)
         seg_cv_by_state: Dict[int, List[float]] = {}
+        seg_rows_by_state: Dict[int, List[Dict[str, Any]]] = {}
         for sample_row in _read_sample_dicts(seg):
             w = _float_or_none(sample_row.get("window"))
             if w is None:
                 continue
             sid = seg_window_map.get(int(w), int(w))
+            seg_rows_by_state.setdefault(sid, []).append(sample_row)
             cv = _float_or_none(sample_row.get("cv_A", sample_row.get("primary_cv_value")))
             if cv is not None:
                 seg_cv_by_state.setdefault(sid, []).append(float(cv))
         for sid, vals in seg_cv_by_state.items():
             pooled_cv_by_state.setdefault(sid, []).extend(vals)
+        for sid, seg_rows in seg_rows_by_state.items():
+            paired.add_rows(sid, seg_rows, source=seg.name)
+        del seg_rows_by_state
 
         # --- Compute per-segment per-edge overlap (0.0 for degenerate segments) ---
         for si, sj, _etype, _nd in geometry_edges:
@@ -6372,6 +6390,7 @@ def collect_segmented_epoch_diagnostics(epoch_dir: Path, registry: WindowStateRe
         "active_graph_connected": active_graph_connected(registry),
         "policy": _json_ready(asdict(policy)),
     }
+    attach_paired_cv(payload, paired, epoch_dir / "adaptive_epoch_diagnostics.json")
     write_json(epoch_dir / "adaptive_epoch_diagnostics.json", payload)
     return payload
 
