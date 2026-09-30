@@ -104,6 +104,7 @@ it never raises into a collector.
 
 from __future__ import annotations
 
+import copy
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -580,6 +581,76 @@ def _components_summary(ids: Sequence[int], graded: Sequence[Tuple[int, int, Opt
     return out
 
 
+_WEAK_TAG, _UNMEASURED_TAG = "low_pairwise_mbar_overlap", "pairwise_mbar_unmeasured"
+
+
+def _components_warning(n: int, threshold: float) -> str:
+    return (f"spatial overlap graph splits into {n} components "
+            f"at {threshold:g} (no action here; spec 3.3 R1)")
+
+
+def _grade_record(record: Dict[str, Any], edges: List[Dict[str, Any]], rung_ids: Sequence[int],
+                  n_pairs: Sequence[int], threshold: float) -> None:
+    """Weak/unmeasured tags, ``below_threshold``, counts and ``components`` from the edges'
+    current ``pairwise_mbar`` + ``mbar_overlap`` (the union value wins when present)."""
+    graded: List[Tuple[int, int, Optional[float], bool]] = []
+    n_weak = n_unmeasured = 0
+    for edge in edges:
+        res = edge.get("pairwise_mbar")
+        if str(edge.get("edge_type")) == "rung" or res is None:
+            continue
+        si, sj = sorted((int(edge["state_i"]), int(edge["state_j"])))
+        warnings = [w for w in edge.get("warnings", []) or [] if w not in (_WEAK_TAG, _UNMEASURED_TAG)]
+        union = _finite(edge.get("mbar_overlap"))
+        if edge_is_weak_pairwise(edge, threshold):
+            n_weak += 1
+            warnings.append(_WEAK_TAG)
+        elif res.get("status") != "ok" and union is None:
+            n_unmeasured += 1
+            warnings.append(_UNMEASURED_TAG)
+        edge["warnings"] = warnings
+        below = edge_below_threshold(edge, threshold)
+        res["below_threshold"] = bool(below)
+        graded.append((si, sj, union if union is not None else
+                       (res.get("overlap_upper") if res.get("status") == "ok" else None), below))
+    record.update(n_weak=n_weak, n_unmeasured=n_unmeasured, n_below_threshold=sum(1 for g in graded if g[3]))
+    record["components"] = _components_summary(rung_ids, graded, threshold, n_pairs)
+    record["warnings"] = [w for w in record.get("warnings", []) if not w.startswith("spatial overlap graph splits")]
+    if record["components"]["n_components"] > 1:
+        record["warnings"].append(_components_warning(record["components"]["n_components"], threshold))
+
+
+def refresh_edge_metric_after_union(payload: Dict[str, Any], policy: Any) -> Dict[str, Any]:
+    """Re-grade ``payload["edge_metric"]`` once a union solve wrote ``mbar_overlap`` onto the edges.
+
+    The collector grades pre-union; the weak predicate already prefers the union value, so the
+    record (counts, per-edge ``below_threshold`` and tags, ``components`` -- 3.3 R1's structural
+    gaps) is re-derived from the same edges. The first refresh stores the collector's verdict
+    under ``pre_union`` and stamps ``stage: post_union``; later refreshes re-derive from the
+    edges again (idempotent). No record, marginal metric or an error record: untouched.
+    Never raises.
+    """
+    record = (payload or {}).get("edge_metric")
+    if not isinstance(record, dict) or record.get("status") != "ok":
+        return payload
+    if str(getattr(policy, "edge_metric", DEFAULT_EDGE_METRIC)) != PAIRWISE_MBAR:
+        return payload
+    try:
+        nodes = _state_nodes(payload)
+        rep = record.get("representative_rung")
+        rung_ids = sorted(s for s, n in nodes.items()
+                          if rep is not None and round(float(n["restraint"].gamd_lambda or 0.0), 6) == rep)
+        if "pre_union" not in record:
+            record["pre_union"] = {k: copy.deepcopy(record.get(k)) for k in
+                                   ("n_weak", "n_unmeasured", "n_below_threshold", "components")}
+        _grade_record(record, payload.get("edges", []) or [], rung_ids,
+                      [nodes[s]["n_pairs"] for s in rung_ids], float(record["threshold"]))
+        record["stage"] = "post_union"
+    except Exception as exc:  # the pre-union record stays
+        record.setdefault("warnings", []).append(f"post-union refresh failed: {type(exc).__name__}: {exc}")
+    return payload
+
+
 def attach_edge_metric(payload: Dict[str, Any], policy: Any, run_dir: Path, *,
                        temperature_k: Optional[float] = None,
                        n_bootstrap: int = N_BOOTSTRAP) -> Dict[str, Any]:
@@ -602,8 +673,7 @@ def attach_edge_metric(payload: Dict[str, Any], policy: Any, run_dir: Path, *,
         "min_edge_neff": min_neff, "radius": DEFAULT_RADIUS, "spanning_neighbours": SPANNING_NEIGHBOURS,
         "n_bootstrap": int(n_bootstrap), "temperature_k": None, "warnings": [],
         # Graded at collection time. A union solve applied later (``_apply_union_edge_overlap``)
-        # writes ``mbar_overlap``, which the weak predicate then reads instead; the counts,
-        # warnings and components here are not refreshed.
+        # writes ``mbar_overlap`` and re-grades this record (``refresh_edge_metric_after_union``).
         "stage": "pre_union",
     }
     edges = payload.setdefault("edges", [])
@@ -650,8 +720,6 @@ def attach_edge_metric(payload: Dict[str, Any], policy: Any, run_dir: Path, *,
             return StateSamples(sid, nodes[sid]["restraint"], s["cv1"], s["cv2"], s["source_index"])
 
         counts: Dict[str, int] = {}
-        graded: List[Tuple[int, int, Optional[float]]] = []
-        n_weak = n_unmeasured = 0
         for edge in edges:
             if str(edge.get("edge_type")) == "rung":
                 continue
@@ -668,30 +736,10 @@ def attach_edge_metric(payload: Dict[str, Any], policy: Any, run_dir: Path, *,
             edge["pairwise_mbar"] = res
             kind = str(edge.get("edge_type"))
             counts[kind] = counts.get(kind, 0) + 1
-            warnings = edge.setdefault("warnings", [])
-            if edge_is_weak_pairwise(edge, threshold):
-                n_weak += 1
-                if "low_pairwise_mbar_overlap" not in warnings:
-                    warnings.append("low_pairwise_mbar_overlap")
-            elif res.get("status") != "ok" and _finite(edge.get("mbar_overlap")) is None:
-                n_unmeasured += 1
-                if "pairwise_mbar_unmeasured" not in warnings:
-                    warnings.append("pairwise_mbar_unmeasured")
-            union = _finite(edge.get("mbar_overlap"))
-            below = edge_below_threshold(edge, threshold)
-            res["below_threshold"] = bool(below)
-            graded.append((si, sj, union if union is not None else
-                           (res.get("overlap_upper") if res.get("status") == "ok" else None), below))
         record.update(representative_rung=rep, n_graph_nodes=len(rung_ids), n_graph_edges=len(graph),
-                      n_edges_added=added, n_edges_graded_by_type=counts, n_weak=n_weak,
-                      n_unmeasured=n_unmeasured, pooled_free_axis_sd=list(pooled),
-                      n_below_threshold=sum(1 for g in graded if g[3]))
-        record["components"] = _components_summary(rung_ids, graded, threshold,
-                                                    [nodes[s]["n_pairs"] for s in rung_ids])
-        if record["components"]["n_components"] > 1:
-            record["warnings"].append(
-                f"spatial overlap graph splits into {record['components']['n_components']} components "
-                f"at {threshold:g} (no action here; spec 3.3 R1)")
+                      n_edges_added=added, n_edges_graded_by_type=counts, n_weak=0,
+                      n_unmeasured=0, pooled_free_axis_sd=list(pooled), n_below_threshold=0)
+        _grade_record(record, edges, rung_ids, [nodes[s]["n_pairs"] for s in rung_ids], threshold)
     except Exception as exc:  # diagnostics never kill a completed epoch
         record.update(status="error", error=f"{type(exc).__name__}: {exc}")
         for edge in edges:
@@ -704,5 +752,5 @@ def attach_edge_metric(payload: Dict[str, Any], policy: Any, run_dir: Path, *,
 __all__ = ["DEFAULT_EDGE_METRIC", "DEFAULT_MIN_EDGE_NEFF", "EDGE_METRICS", "PAIRWISE_MBAR", "Restraint",
            "StateSamples", "attach_edge_metric", "beta_mol_per_kcal", "blocking_inefficiency",
            "build_edge_graph", "edge_is_weak_pairwise", "edge_sort_overlap", "evaluate_edge",
-           "pooled_free_axis_sd", "representative_rung", "resolve_temperature_k", "solve_two_state_df",
-           "two_state_overlap"]
+           "pooled_free_axis_sd", "refresh_edge_metric_after_union", "representative_rung",
+           "resolve_temperature_k", "solve_two_state_df", "two_state_overlap"]
