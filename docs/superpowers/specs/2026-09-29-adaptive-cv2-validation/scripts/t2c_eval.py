@@ -156,7 +156,9 @@ def eval_r2(sc: S.Scenario, sim: S.Sim, n: int, seed: int) -> Dict[str, Any]:
     cols = []
     for col in cov.columns(views, ids, base):
         col = cov._extend_to_weight(col, cv1, cv2, w)
-        frac, n_eff, n_contrib, sigma = cov._interval_stats(col, cv1, cv2, sidx, w, centre_of_state, rng)
+        # pre-v3 fixed 20 blocks per state, so Section 9.6 reproduces (v3's default is autocorrelation blocks)
+        frac, n_eff, n_contrib, sigma = cov._interval_stats(col, cv1, cv2, sidx, w, centre_of_state, rng,
+                                                            block_ids=cov._block_ids(sidx, cov.BOOT_BLOCKS))
         edges = col["edges"]
         tot = frac.sum()
         with np.errstate(divide="ignore"):
