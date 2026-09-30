@@ -4410,8 +4410,9 @@ def collect_final_combined_diagnostics(
     attach_paired_cv(payload, paired, adaptive_dir / "adaptive_final_combined_diagnostics.json")
     attach_edge_metric(payload, policy, adaptive_dir)  # spec 3.1; no-op under the default metric
     write_json(adaptive_dir / "adaptive_final_combined_diagnostics.json", payload)
-    if bool(policy.cv2_resolution):
-        # Spec 3.7: the table the gareus_report "CV2 resolution" row reads. Never raises.
+    if bool(policy.cv2_resolution) or bool(policy.cv2_respring):
+        # Spec 3.7: the table the gareus_report "CV2 resolution" row reads (either CV2 flag, so
+        # a respring-only campaign's unresolved windows are graded too). Never raises.
         from .adaptive.cv2_resolution_summary import write_final_combined_summary  # noqa: PLC0415
         write_final_combined_summary(adaptive_dir, payload)
     return payload
@@ -9134,7 +9135,8 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             if bool(policy.cv2_resolution):
                 from .adaptive.cv2_resolution_io import annotate_report_with_refusals  # noqa: PLC0415
                 annotate_report_with_refusals(epoch_dir, actions, _refused_actions)
-                # Spec 3.7: the epoch's CV2-resolution table beside the report. Never raises.
+            if bool(policy.cv2_resolution) or bool(policy.cv2_respring):
+                # Spec 3.7: the epoch's CV2-resolution table beside the report(s). Never raises.
                 from .adaptive.cv2_resolution_summary import write_epoch_summary  # noqa: PLC0415
                 write_epoch_summary(epoch_dir, diagnostics)
         registry_paths = registry.save(adaptive_dir)
