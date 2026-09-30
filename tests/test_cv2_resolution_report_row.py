@@ -12,7 +12,9 @@ from test_gareus_report import _good_summary
 def _counts(**kw):
     c = {"n_states": 236, "n_cv2_restrained": 172, "n_r3_evaluated": 39, "n_trapped_or_orthogonal": 0,
          "n_graded_edges": 276, "n_weak": 0, "n_unmeasured": 0, "n_components": 1,
-         "edge_metric_status": "ok", "report_status": "ok", "n_refused_budget": 0}
+         "edge_metric_status": "ok", "report_status": "ok", "n_refused_budget": 0,
+         "evaluation_metadata": "ok", "evaluation_complete": True, "n_rules_requested": 2, "n_rules_ok": 2,
+         "n_rules_unavailable": 0, "n_rules_error": 0, "rules_incomplete": []}
     c.update(kw)
     return {"label": "epoch_002", "counts": c}
 

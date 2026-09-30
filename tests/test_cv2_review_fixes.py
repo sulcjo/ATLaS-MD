@@ -137,7 +137,8 @@ def test_spring_cap_refusals_are_counted_in_the_summary():
 def test_spring_cap_refusals_grade_caution_not_fail():
     c = {"n_states": 10, "n_cv2_restrained": 10, "n_graded_edges": 5, "n_weak": 0, "n_unmeasured": 0,
          "n_components": 1, "edge_metric_status": "ok", "report_status": "ok", "n_refused_budget": 0,
-         "n_trapped_or_orthogonal": 0, "n_refused_spring_cap": 3}
+         "n_trapped_or_orthogonal": 0, "n_refused_spring_cap": 3,
+         "evaluation_metadata": "ok", "evaluation_complete": True, "rules_incomplete": []}
     row = grade.check_cv2_resolution({"cv2_resolution": {"label": "epoch_002", "counts": c}})
     assert row["status"] == "caution"
     assert "k2_capped_below_compression" in row["detail"] and "spring cap" in grade.RULE_TEXT

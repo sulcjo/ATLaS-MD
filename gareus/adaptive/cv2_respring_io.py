@@ -6,7 +6,8 @@ ledger (a recovered epoch re-uses the ledger's actions and never proposes again)
 ``propose_respring`` is the pure orchestrator (tests and the replay script call it directly).
 The decision rules are in ``cv2_respring``.
 
-Report ``epoch_NNN/cv2_respring_report.json`` (schema ``cv2_respring_report_v1``)::
+Report ``epoch_NNN/cv2_respring_report.json`` (schema ``cv2_respring_report_v2``; v1 carried
+``g``/``g_source`` = the CV2 series' g, used for n_eff and blocks; v2 removes them)::
 
     schema_version, epoch, status ("ok" | "error"), error, stage ("numbered_epoch" | "replay"),
     settings   -- RespringSettings.as_record() (knobs, constants, sigma_target and its source),
@@ -15,9 +16,15 @@ Report ``epoch_NNN/cv2_respring_report.json`` (schema ``cv2_respring_report_v1``
         state_id, centre_state_ids (every rung of the centre), c1, k1, c2, k2, lambda,
         decision (proposed | no_action | skipped | refused | deferred), reason, refusal,
         triggered (whole c_real interval below the trigger), metrics {n, var, sd, sigma_w2,
-        f2_prod, f2_prod_conditional, c_real, g, g_source (x5 | subsample), n_eff,
-        subsample_stride, bootstrap {block_len, n_blocks, guard, block_len_requested},
-        var_interval, c_interval, f2_interval, over_compressed},
+        f2_prod, f2_prod_conditional, c_real,
+        g_cv2, g_cv2_source (x5 | subsample | none) -- CV2 series' g (raw spacing), audit,
+        g_q, g_q_status -- the variance observable (z - mean z)^2's g (raw spacing),
+        g_variance = max(g_cv2, g_q), g_variance_source (cv2 | variance | none),
+        g_variance_status (ok | no_subsample | variance_inefficiency_<estimator status>),
+        n_eff = n_eff_variance = n / g_variance, subsample_stride,
+        bootstrap {block_len, block_len_requested, n_blocks, n_sources, source_boundary_guard,
+        bootstrap_status}, bootstrap_status (ok | too_few_source_blocks | zero_variance |
+        no_subsample | not_run), var_interval, c_interval, f2_interval, over_compressed},
         proposal {k2_old, k2_new, k2_ratio, predicted_c, predicted_c_interval,
                   predicted_sampled_sigma, min_mean_compression, sigma_target,
                   sigma_target_source, k2_cap, compression_floor_k2, refusal, gate_note?} | null,

@@ -2299,12 +2299,14 @@ union MBAR). Refused: k2_capped_below_compression, below_k_min, no_change (withi
 first; the rest deferred). F''_prod <= 0 (var >= RT/k2) is recorded, never acted on, and
 over-stiff windows are only flagged. Never blocks the convergence gate; the new state
 seeds from the old one's frames. Report: epoch_NNN/cv2_respring_report.json
-(cv2_respring_report_v1); with --ap-cv2-resolution also on, the 3.7 table carries the
+(cv2_respring_report_v2: confidence from g_variance = max(g_cv2, g_q), g_q of
+(z - mean z)^2, blocks never cross a sample source; no variance g = skipped); with
+--ap-cv2-resolution also on, the 3.7 table carries the
 counts and the row grades unresolved under-compressed windows CAUTION.
 
 Reporting (spec 3.7). One table per phase from files that already exist:
     python -m gareus.adaptive.cv2_resolution_summary RUNS/<run>/adaptive_production [--out DIR]
-writes cv2_resolution_summary.json (cv2_resolution_summary_v2) + _states.csv/_edges.csv
+writes cv2_resolution_summary.json (cv2_resolution_summary_v3) + _states.csv/_edges.csv
 into each epoch/final dir (final-combined: *_final_combined.* at the adaptive root);
 with --ap-cv2-resolution the driver writes each epoch's after the apply. Per state:
 restraint, sampled CV2 mean/sd, sigma_w2 = sqrt(kT/k2), confinement ratio = sd/sigma_w2
@@ -2312,7 +2314,9 @@ restraint, sampled CV2 mean/sd, sigma_w2 = sqrt(kT/k2), confinement ratio = sd/s
 trapped_or_orthogonal. Per edge: pairwise MBAR (q10/q90, status), CV1 marginal and joint
 2D overlap, each with its space stamp. gareus_report adds a "CV2 resolution" row when the
 final-combined summary exists (FAIL: a weak pairwise edge or > 1 spatial component; CAUTION: unmeasured
-edges, trapped windows, budget refusals, k2_capped_below_compression refusals, r3_flag_only windows); plot_adaptive_diagnostics adds
+edges, trapped windows, budget refusals, k2_capped_below_compression refusals, r3_flag_only windows,
+requested R1-R3 rules not completed: R1 needs --ap-edge-metric pairwise-mbar, R2 is requested with
+top-ups on; no 3.3 report or a legacy one is CAUTION, never PASS); plot_adaptive_diagnostics adds
 adaptive_fig5_state_coordinates.png (states at their own (c1, c2), one panel per rung).
 """
 

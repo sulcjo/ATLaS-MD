@@ -59,8 +59,15 @@ width = [c["metrics"]["c_interval"][1] - c["metrics"]["c_interval"][0] for c in 
 out = {"phase": phase, "payload": str(payload_path), "sigma_target_source": settings.sigma_target_source,
        "layout_plan": plan_src, "n_centres": n_centres, "n_candidates": len(nocap), "n_measured": len(meas),
        "wall_s": {"x5": round(t_x5, 1), "total": round(time.time() - t0, 1)},
-       "g_source": sorted({c["metrics"].get("g_source") for c in meas}),
-       "g_q": q([c["metrics"].get("g") for c in meas]), "n_eff_q": q([c["metrics"].get("n_eff") for c in meas]),
+       "g_cv2_source": sorted({str(c["metrics"].get("g_cv2_source")) for c in nocap if c.get("metrics")}),
+       "g_variance_source": sorted({str(c["metrics"].get("g_variance_source")) for c in nocap if c.get("metrics")}),
+       # report v2: g_variance = max(g_cv2, g_q) sets n_eff and the blocks (v1: the CV2 series' g)
+       "g_cv2_q": q([c["metrics"].get("g_cv2") for c in nocap if c.get("metrics")]),
+       "g_qobs_q": q([c["metrics"].get("g_q") for c in nocap if c.get("metrics")]),
+       "g_variance_q": q([c["metrics"].get("g_variance") for c in meas]),
+       "g_q_over_g_cv2_q": q([c["metrics"]["g_q"] / c["metrics"]["g_cv2"] for c in nocap
+                              if (c.get("metrics") or {}).get("g_q") and (c.get("metrics") or {}).get("g_cv2")]),
+       "n_eff_q": q([c["metrics"].get("n_eff") for c in meas]),
        "k2_q": q([c["k2"] for c in meas]),
        "c_real_q": q([c["metrics"]["c_real"] for c in meas]),
        "c_interval_width_q": q(width),

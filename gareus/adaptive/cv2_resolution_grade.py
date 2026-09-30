@@ -28,8 +28,14 @@ Rule (stated in the row text):
              windows), under-compressed windows respring left unresolved
              (``n_respring_unresolved``, only when a ``cv2_respring_report.json`` was carried:
              refused, capped or deferred), or an edge-metric / 3.3-report / respring-report
-             error. None of the CAUTIONs blocks the convergence gate.
-  PASS    -- none of those. NA -- a CV1-only table with no graded edges and no 3.3 report.
+             error, or an incomplete evaluation: a requested R1-R3 rule that did not finish
+             ``ok`` (``counts.rules_incomplete``: R1 unavailable under the default marginal edge
+             metric, R2 -- requested only with top-ups on -- unavailable, R3 without a P4
+             subsample, a rule error), no 3.3 report at all for a CV2 table, or a legacy
+             report/summary without the completeness metadata. None of the CAUTIONs blocks the
+             convergence gate.
+  PASS    -- none of those: every requested rule completed. NA -- a CV1-only table with no
+             graded edges and no 3.3 report.
 """
 from __future__ import annotations
 
@@ -44,7 +50,8 @@ SUMMARY_NAME = "cv2_resolution_summary.json"            # mirrors cv2_resolution
 FINAL_NAME = "cv2_resolution_summary_final_combined.json"
 RULE_TEXT = ("rule: FAIL if a pairwise-MBAR weak edge or >1 spatial component; CAUTION for "
              "unmeasured edges, trapped_or_orthogonal windows, budget refusals, spring cap below the "
-             "mean-compression floor, R3 flag-only windows, metric/report errors")
+             "mean-compression floor, R3 flag-only windows, metric/report errors, requested R1-R3 "
+             "rules not completed")
 
 
 def find_summary(production_dir: Any) -> Optional[Path]:
@@ -94,7 +101,21 @@ def _issues(c: Mapping[str, Any], connectivity_failed: bool) -> tuple:
                       ("respring_status", "respring report")):
         if c.get(key) == "error":
             cautions.append(f"{what} error")
+    cautions.extend(_incomplete_evaluation(c))
     return fails, cautions
+
+
+def _incomplete_evaluation(c: Mapping[str, Any]) -> list:
+    """CAUTIONs for requested R1-R3 checks that did not complete (never a PASS by omission).
+
+    A summary written before the completeness counts existed (no ``evaluation_metadata``) is
+    legacy: its rules' completion is unknown, so it cannot PASS either."""
+    meta = c.get("evaluation_metadata")
+    if meta is None:
+        return ["summary predates rule-completeness metadata (legacy): R1-R3 completeness unknown"]
+    if meta == "report_error":
+        return []                                  # already graded by report_status
+    return [f"incomplete evaluation: {r}" for r in (c.get("rules_incomplete") or [])]
 
 
 def check_cv2_resolution(s: Mapping[str, Any], connectivity_failed: bool = False) -> Dict[str, Any]:
@@ -108,7 +129,7 @@ def check_cv2_resolution(s: Mapping[str, Any], connectivity_failed: bool = False
     label = blk.get("label") or "?"
     carried = (blk.get("sources") or {}).get("report_carried_from")
     if carried:
-        label = f"{label}; R3/budget from {carried}"
+        label = f"{label}; R2/R3/budget from {carried}"
     graded = int(c.get("n_graded_edges") or 0)
     if not int(c.get("n_cv2_restrained") or 0) and not graded and c.get("report_status") is None:
         return {"name": NAME, "status": NA, "detail": f"[{label}] CV1-only: no CV2-restrained state, "

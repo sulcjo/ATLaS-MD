@@ -54,7 +54,8 @@ def test_f2_prod_and_c_real_recover_a_known_landscape_under_a_known_spring(f2_tr
     lo, hi = m["c_interval"]
     assert lo < k2 / (k2 + f2_true) < hi
     assert m["f2_interval"][0] < f2_true < m["f2_interval"][1]
-    assert m["n_eff"] == pytest.approx(z.size)
+    assert m["g_variance"] == pytest.approx(1.0, abs=0.3)          # iid: g_q ~ 1, X5 g_cv2 = 1
+    assert m["n_eff"] == pytest.approx(z.size / m["g_variance"])
 
 
 def test_block_bootstrap_widens_with_the_autocorrelation_time_and_scales_the_full_series_var():
@@ -62,9 +63,12 @@ def test_block_bootstrap_widens_with_the_autocorrelation_time_and_scales_the_ful
     z = _ar1(8000, RT / (k2 + 2.0), 0.95, seed=3)
     iid = rs.measure_window(var=float(np.var(z)), n=z.size, k2=k2, rt=RT, z=z, g=1.0)
     corr = rs.measure_window(var=float(np.var(z)), n=z.size, k2=k2, rt=RT, z=z, g=39.0)
+    # an X5 g of 1 no longer sets the blocks: the variance's own g_q (~(1 + r^2)/(1 - r^2) = 19.5) does
+    assert iid["g_variance_source"] == "variance" and iid["g_variance"] > 10
+    assert iid["n_eff"] == pytest.approx(8000 / iid["g_variance"])
     w = lambda m: m["c_interval"][1] - m["c_interval"][0]
-    assert w(corr) > 1.8 * w(iid)         # 5-row blocks already catch part of rho = 0.95
-    assert corr["n_eff"] == pytest.approx(8000 / 39.0)
+    assert w(corr) >= w(iid) * 0.9
+    assert corr["g_variance_source"] == "cv2" and corr["n_eff"] == pytest.approx(8000 / 39.0)
     # the interval is a ratio applied to the FULL-series variance (here 2x the subsample's)
     scaled = rs.measure_window(var=2 * float(np.var(z)), n=z.size, k2=k2, rt=RT, z=z, g=39.0)
     assert scaled["c_interval"][0] == pytest.approx(2 * corr["c_interval"][0])
@@ -73,8 +77,10 @@ def test_block_bootstrap_widens_with_the_autocorrelation_time_and_scales_the_ful
 def test_subsample_g_is_used_in_raw_spacing_when_x5_is_missing():
     z = _ar1(4000, 0.1, 0.9, seed=5)
     m = rs.measure_window(var=float(np.var(z)), n=8000, k2=1.0, rt=RT, z=z, stride=2, g=None)
-    assert m["g_source"] == "subsample" and m["g"] > 2 * 10     # ~19 subsample rows x stride 2
-    assert m["bootstrap"]["block_len"] == math.ceil(rs.BOOT_BLOCK_G_MULTIPLE * m["g"] / 2)
+    assert m["g_cv2_source"] == "subsample" and m["g_cv2"] > 2 * 10     # ~19 subsample rows x stride 2
+    assert m["g_variance"] == max(m["g_cv2"], m["g_q"])            # Gaussian AR(1): g_q < g_z, max = g_z
+    assert m["g_variance_source"] == "cv2"
+    assert m["bootstrap"]["block_len"] == math.ceil(rs.BOOT_BLOCK_G_MULTIPLE * m["g_variance"] / 2)
 
 
 def test_blocks_never_cross_a_source():
