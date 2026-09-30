@@ -1,6 +1,6 @@
 # Claude Handoff
 
-Updated 2026-09-29 (adaptive-CV2 prereqs: P6, 3.5, 3.6).
+Updated 2026-09-30. Branch `feat/cv2-resolution` holds P1, 3.2 (shape layout), 3.3 (R1-R3), 3.7 (reporting), the review fixes and follow-ups (a)-(l), respring and the gareus-analyze MBAR wrapper (all behind flags, off by default, none run in MD). PR #118 merged it into main only up to `3b2c8eb`; the later commits (`0115bf3`..) need a second PR. Resolved-bug writeups live in `docs/CLAUDE_FIXED_BUG_ARCHIVE.md`. Validation reports: `docs/superpowers/specs/2026-09-29-adaptive-cv2-validation/` (`t2_synthetic.md` section 9, `t3_retrospective.md` section 10).
 
 ## Adaptive λ ladder (`--ap-ladder-adapt respace`, off by default)
 
