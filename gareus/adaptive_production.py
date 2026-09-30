@@ -45,7 +45,8 @@ from .store import SegmentRegistry
 from .extension_seeding import extension_parent_dirs
 from .adaptive.paired_cv import PairedCVCollector, attach_paired_cv
 from .adaptive.pair_runtime import GATE_REPORT_NAME, gate_from_args
-from .adaptive.edge_metric import GRAPH_EDGE_TYPES, attach_edge_metric, edge_is_weak_pairwise, edge_sort_overlap
+from .adaptive.edge_metric import (GRAPH_EDGE_TYPES, attach_edge_metric, edge_is_weak_pairwise, edge_sort_overlap,
+                                   refresh_edge_metric_after_union)
 # Real-frame seed extraction lives in tica.py (a dependency-free leaf module)
 # so seeding.py can also use it for campaign-wide seed search without a
 # circular import - seeding.py -> production.py -> adaptive_production.py is
@@ -7222,6 +7223,7 @@ def _apply_union_edge_overlap(diagnostics: Dict[str, Any], edge_overlap: Dict[Tu
                                    window_j=-1 if wj is None else int(wj), edge_type="rung",
                                    mbar_overlap=float(value), warnings=kept)
             edge["warnings"] = _annotate_edge_warnings(rung, policy).warnings
+    refresh_edge_metric_after_union(diagnostics, policy)  # spec 3.1; no-op under the default metric
 
 
 def _schedule_full_steps(schedule: Sequence[Dict[str, Any]]) -> int:
