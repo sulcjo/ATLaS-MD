@@ -440,7 +440,7 @@ def requested_rules(policy: Any, rules: Mapping[str, Mapping[str, Any]]) -> Dict
     """Each rule record plus ``requested`` (the grader's completeness set, from the live policy).
 
     R1 and R3 are always requested with --ap-cv2-resolution on: R1 ``unavailable`` under the
-    default marginal edge metric is an incomplete evaluation (graded CAUTION), not an opt-out.
+    marginal edge metric is an incomplete evaluation (graded CAUTION), not an opt-out.
     R2 is requested only with top-ups on (``policy.topups_enabled``): it reads the top-up union.
     """
     want = {"R1": True, "R2": bool(getattr(policy, "topups_enabled", False)), "R3": True}

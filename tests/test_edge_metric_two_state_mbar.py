@@ -420,9 +420,14 @@ def test_cli_flag_and_frozen_decision_setting(tmp_path):
     from gareus.cli import parse_args
     args = parse_args(["--seq", "GYDPETGTWG", "--out", str(tmp_path)])
     # T2 calibration: floor 100 gives floor 200's error rates with 35 % instead of 47 % unmeasured.
-    assert args.adaptive_production_edge_metric == "marginal" and args.adaptive_production_min_edge_neff == 100.0
+    # campaign default pairwise-mbar since 2026-09-30; the library dataclass default stays marginal
+    assert args.adaptive_production_edge_metric == "pairwise-mbar" and args.adaptive_production_min_edge_neff == 100.0
+    assert ap.policy_from_args(args).edge_metric == "pairwise-mbar"
+    assert AdaptiveDecisionPolicy().edge_metric == "marginal"
     assert AdaptiveDecisionPolicy().min_edge_neff == 100.0 and em.DEFAULT_MIN_EDGE_NEFF == 100.0
     assert ap.policy_from_args(args).min_edge_neff == 100.0
+    marginal = parse_args(["--seq", "GYDPETGTWG", "--out", str(tmp_path), "--ap-edge-metric", "marginal"])
+    assert ap.policy_from_args(marginal).edge_metric == "marginal"
     args = parse_args(["--seq", "GYDPETGTWG", "--out", str(tmp_path), "--ap-edge-metric", "pairwise-mbar",
                        "--ap-min-edge-neff", "150"])
     policy = ap.policy_from_args(args)

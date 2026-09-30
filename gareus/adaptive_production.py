@@ -506,10 +506,14 @@ class AdaptiveDecisionPolicy:
     # reseed up to this fraction of windows from pooled end states on the under-sampled side of
     # the hidden slow mode. 0 = off (no report, no override, seeding exactly as before).
     slow_mode_reseed_fraction: float = 0.0
-    # Spec 3.1 edge metric (gareus/adaptive/edge_metric.py): "marginal" = today's CV1
-    # histogram overlap; "pairwise-mbar" = two-state MBAR overlap graded against
-    # min_rung_overlap, unmeasured below min_edge_neff effective samples per state
-    # (100 from the spec-T2 calibration: floor 200's error rates, fewer edges unmeasured).
+    # Spec 3.1 edge metric (gareus/adaptive/edge_metric.py): "marginal" = the CV1 histogram
+    # overlap (blind to CV2 separation); "pairwise-mbar" = two-state MBAR overlap graded against
+    # min_rung_overlap, unmeasured below min_edge_neff effective samples per state (100 from the
+    # spec-T2 calibration: floor 200's error rates, fewer edges unmeasured). The CAMPAIGN
+    # default is pairwise-mbar since 2026-09-30 (--ap-edge-metric, policy_from_args); this
+    # library default stays marginal (as retire_converged's differs from its CLI default) so
+    # policies built directly on payloads without P4 paired-CV data keep grading edges.
+    # Frozen per campaign: a recorded decision_settings.json keeps its metric.
     edge_metric: str = "marginal"
     min_edge_neff: float = 100.0
     # Spec P7b (--layout-neighbour-rule): which windows are neighbours for the phases'
@@ -2762,7 +2766,7 @@ def collect_epoch_diagnostics(
     }
     attach_paired_cv(payload, paired, epoch_dir / "adaptive_epoch_diagnostics.json")
     if edge_metric:
-        attach_edge_metric(payload, policy, epoch_dir)  # spec 3.1; no-op under the default metric
+        attach_edge_metric(payload, policy, epoch_dir)  # spec 3.1; no-op under the marginal metric
     write_json(epoch_dir / "adaptive_epoch_diagnostics.json", payload)
     return payload
 
@@ -4409,7 +4413,7 @@ def collect_final_combined_diagnostics(
         "policy": _json_ready(asdict(policy)),
     }
     attach_paired_cv(payload, paired, adaptive_dir / "adaptive_final_combined_diagnostics.json")
-    attach_edge_metric(payload, policy, adaptive_dir)  # spec 3.1; no-op under the default metric
+    attach_edge_metric(payload, policy, adaptive_dir)  # spec 3.1; no-op under the marginal metric
     write_json(adaptive_dir / "adaptive_final_combined_diagnostics.json", payload)
     if bool(policy.cv2_resolution) or bool(policy.cv2_respring):
         # Spec 3.7: the table the gareus_report "CV2 resolution" row reads (either CV2 flag, so
@@ -6684,7 +6688,7 @@ def collect_segmented_epoch_diagnostics(epoch_dir: Path, registry: WindowStateRe
         "policy": _json_ready(asdict(policy)),
     }
     attach_paired_cv(payload, paired, epoch_dir / "adaptive_epoch_diagnostics.json")
-    attach_edge_metric(payload, policy, epoch_dir)  # spec 3.1; no-op under the default metric
+    attach_edge_metric(payload, policy, epoch_dir)  # spec 3.1; no-op under the marginal metric
     write_json(epoch_dir / "adaptive_epoch_diagnostics.json", payload)
     return payload
 
@@ -7223,7 +7227,7 @@ def _apply_union_edge_overlap(diagnostics: Dict[str, Any], edge_overlap: Dict[Tu
                                    window_j=-1 if wj is None else int(wj), edge_type="rung",
                                    mbar_overlap=float(value), warnings=kept)
             edge["warnings"] = _annotate_edge_warnings(rung, policy).warnings
-    refresh_edge_metric_after_union(diagnostics, policy)  # spec 3.1; no-op under the default metric
+    refresh_edge_metric_after_union(diagnostics, policy)  # spec 3.1; no-op under the marginal metric
 
 
 def _schedule_full_steps(schedule: Sequence[Dict[str, Any]]) -> int:
@@ -8247,7 +8251,7 @@ def policy_from_args(args: Any) -> AdaptiveDecisionPolicy:
         cv2_coupling_gate=_arg_bool(args, "adaptive_production_cv2_coupling_gate", False),
         max_coupling_fraction=_arg_float(args, "adaptive_production_max_coupling_fraction", 0.25),
         slow_mode_reseed_fraction=_arg_float(args, "adaptive_production_slow_mode_reseed_fraction", 0.0),
-        edge_metric=str(getattr(args, "adaptive_production_edge_metric", "marginal") or "marginal"),
+        edge_metric=str(getattr(args, "adaptive_production_edge_metric", "pairwise-mbar") or "pairwise-mbar"),
         layout_neighbour_rule=str(getattr(args, "layout_neighbour_rule", "legacy") or "legacy"),
         min_edge_neff=_arg_float(args, "adaptive_production_min_edge_neff", 100.0),
         cv2_resolution=_arg_bool(args, "adaptive_production_cv2_resolution", False),

@@ -2,14 +2,31 @@
 
 Status: ATLaS-MD v0.8.4 released (PR #120, tag v0.8.4). CV2/λ-ladder remake (P1, 3.2, 3.3 R1-R3, 3.7, respring) merged to main, all flags off by default, **zero MD run with any of it**. This list tracks what's left before/around the chignolin_10 launch.
 
-## A. Decisions needed before launching chignolin_10 (no code)
+## A. chignolin_10 configuration (decided with the user 2026-09-30)
 
-- [ ] Pick flag set: `--ap-cv2-resolution`, `--ap-cv2-respring`, `--swarm-cv2-layout shape`, `--swarm-adaptive-reserve-fraction` (must be > 0 or every R1-R3 action is refused `no_reserve`), `--ap-edge-metric pairwise-mbar`, `--layout-neighbour-rule restraint-width`, `--ap-ladder-adapt respace`.
-- [ ] 4x-parent k2 cap — refused c9's real R3 upper modes (F'' 7-30 vs cap 4.72 kcal/mol/CV²). Decide whether to raise it for c10.
-- [ ] Uncalibrated knobs, still defaults: `coverage_min_windows` 2, `refine_min_transitions` 10, `refine_min_sigma` 0.1, `min_mean_compression` 0.5, coupling-gate 0.25 mean-shift threshold, rung overlap 0.15/0.25 thresholds (none re-measured at pairwise MBAR scale).
-- [ ] Capacity: shape layout is cap-bound at 236 states (only ~7/76 fill cells granted in dry run). Decide: fewer rungs, or raise `max_replicas`, or accept the cap.
-- [ ] R3 crossing-count estimator: confirm `replica-path` (current default) is right for c10, vs `state-series`/`replica`.
-- [ ] Constraint: leave tICA update flags (`--tica-obs-interval`, `--tica-update-after-epochs`, ...) unset -- keeps the out-of-priority coverage apply (C3) unreachable.
+Scope: full CV2/lambda remake stack with staged risk -- measuring/reporting features and bounded
+actions on, R3 flag-only, respring on at a low cap. One campaign, attribution via the per-feature
+reports.
+
+| # | Decision | Setting |
+|---|---|---|
+| 1 | Scope | full stack, staged risk |
+| 2 | CV2 selection | `--cv-selection-rank slowness` (default; c9 swarm picks tICA component 7, psi(P4) + psi(D3)) |
+| 3 | Swarm | reuse c9 `swarm/round_000` (copy into c10), re-run `--swarm-stage analyze` on main only -- no new MD, frozen envelope identical to c9 |
+| 4 | Layout / capacity | `--swarm-cv2-layout shape`, `max_replicas` 236, 4 rungs, `--swarm-adaptive-reserve-fraction 0.10` (23 reserved -> 53 base centres, ~5 centres of headroom); cap-bound shape layout accepted |
+| 5 | Edge metric / neighbours | `--ap-edge-metric pairwise-mbar`, `--layout-neighbour-rule restraint-width`; pairwise-mbar is the CLI default since 2026-09-30 (branch `feat/pairwise-mbar-default`; c10's YAML sets it explicitly anyway) |
+| 6 | 3.3 R1-R3 | `--ap-cv2-resolution` on, `--ap-refine-r3-mode flag`, `--ap-refine-transition-count replica-path`, 4 x parent k2 cap kept |
+| 7 | Respring | `--ap-cv2-respring` on, `--ap-respring-max-fraction 0.10` (<= 5 centres per epoch) |
+| 8 | lambda ladder | `--ap-ladder-adapt respace`, defaults (min overlap 0.25, q10, max 2 moves, hysteresis 0.03); starts from c9's [0, 0.235, 0.636, 1] |
+| 9 | Top-ups / retirement / budget | `ap_topups: false` (R2 not requested), `--ap-retire-converged` off (default; F4), `md_budget_ns` 10000, `ap_epochs` 4 |
+| 10 | Everything else | tICA update flags unset (C3); uncalibrated knobs at defaults (refine_min_transitions 10, refine_min_sigma 0.1, min_mean_compression 0.5, coupling gate off/0.25, rung 0.15/0.25, respring min n_eff 200 / tolerance 0.05); physics + platform as c9 (r7 seeds, sigma0 6, gibbs-walk, MPS 50 %, 8 active/GPU, blocking sync off, keep-4 checkpoints) |
+
+Prepared 2026-09-30 on aurum2 (not submitted): `~/gareus/chignolin/chignolin_10.yaml` + `chignolin_10.sh` (copies in
+`RUNS/`), `chignolin_10/swarm/{round_000,system}` copied from chignolin_9 (174/174 members done, byte-identical;
+`analysis/` deliberately NOT copied -- its sidecar holds c9 absolute paths). First job: skips swarm MD, re-runs analyze
+with the c10 flags, charges ~174 ns (174 members x 1 ns) to the 10 us pool, starts production. After it: check the CV2
+pick, layout and reserve in `chignolin_10/swarm/analysis/layout_plan.json`, and that `ladder_run_args.yaml` points only
+at chignolin_10.
 
 ## B. Deploy (closed 2026-09-30)
 

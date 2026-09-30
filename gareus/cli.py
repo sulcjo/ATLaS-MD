@@ -555,9 +555,10 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                    help="Interior rungs the adaptive ladder may move per epoch (a respace within this is atomic).")
     p.add_argument("--ap-ladder-adapt-override", action=argparse.BooleanOptionalAction, default=False,
                    help="Replace a campaign's recorded --ap-ladder-* settings with this job's flags.")
-    p.add_argument("--ap-edge-metric", choices=["marginal", "pairwise-mbar"], default="marginal",
-                   help="Spatial-edge metric the weak-edge gate and proposers read (spec 3.1). marginal "
-                        "(default): today's CV1 histogram overlap. pairwise-mbar: two-state MBAR overlap "
+    p.add_argument("--ap-edge-metric", choices=["marginal", "pairwise-mbar"], default="pairwise-mbar",
+                   help="Spatial-edge metric the weak-edge gate and proposers read (spec 3.1). marginal: "
+                        "the CV1 histogram overlap (the default before 2026-09-30; blind to CV2 "
+                        "separation). pairwise-mbar (default): two-state MBAR overlap "
                         "sqrt(O_ab O_ba) on the states' paired (CV1, CV2) samples (union value when a union "
                         "solve scored the edge), weak only if the bootstrap q90 is below "
                         "min_rung_overlap; also grades every same-rung pair within the restraint-width "

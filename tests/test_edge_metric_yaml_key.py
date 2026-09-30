@@ -14,6 +14,13 @@ def test_yaml_keys_reach_the_adaptive_edge_metric_settings(tmp_path):
     assert args.layout_neighbour_rule == "restraint-width"
 
 
-def test_edge_metric_defaults_to_marginal_without_the_key(tmp_path):
+def test_edge_metric_defaults_to_pairwise_mbar_without_the_key(tmp_path):
     args = parse_args(["--out", str(tmp_path / "o"), "--seq", "GYDPETGTWG"])
+    assert args.adaptive_production_edge_metric == "pairwise-mbar"          # campaign default since 2026-09-30
+
+
+def test_yaml_can_still_select_marginal(tmp_path):
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text("ap_edge_metric: marginal\n")
+    args = parse_args(["--config", str(cfg), "--out", str(tmp_path / "o"), "--seq", "GYDPETGTWG"])
     assert args.adaptive_production_edge_metric == "marginal"
