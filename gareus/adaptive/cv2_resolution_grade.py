@@ -29,7 +29,7 @@ Rule (stated in the row text):
              (``n_respring_unresolved``, only when a ``cv2_respring_report.json`` was carried:
              refused, capped or deferred), or an edge-metric / 3.3-report / respring-report
              error, or an incomplete evaluation: a requested R1-R3 rule that did not finish
-             ``ok`` (``counts.rules_incomplete``: R1 unavailable under the default marginal edge
+             ``ok`` (``counts.rules_incomplete``: R1 unavailable under the marginal edge
              metric, R2 -- requested only with top-ups on -- unavailable, R3 without a P4
              subsample, a rule error), no 3.3 report at all for a CV2 table, or a legacy
              report/summary without the completeness metadata. None of the CAUTIONs blocks the

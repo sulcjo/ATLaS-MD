@@ -2215,7 +2215,7 @@ under-resolved.  Only states restraining both axes above their floors
 
     R1  CV2-gap bridge, for same-pattern geometry edges whose ends differ mainly in
         CV2 (per-axis restraint-width distance d2 >= d1). Needs --ap-edge-metric
-        pairwise-mbar. Structural (the edge's absence splits the overlap graph into
+        pairwise-mbar (the default since 2026-09-30). Structural (the edge's absence splits the overlap graph into
         components): bridge now. Weak (confidently below min_rung_overlap): bridge.
         Unmeasured: extend both ends; bridge after 2 more epochs if still
         unmeasured or weak (history in adaptive_production/cv2_resolution_history.json).
