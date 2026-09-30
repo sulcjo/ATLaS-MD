@@ -493,3 +493,321 @@ Other outputs are in `/tmp/t3/`, outside the repo and not committed:
 - `prop_c9.json`, `prop_c7.json`.
 
 Run with `PYTHONPATH=<worktree>`.
+
+
+## 10. Follow-up replays for P1, 3.2, 3.3 and 3.7 (2026-09-30, branch `feat/cv2-resolution`)
+
+All replays are read-only on chignolin_9, and nothing was written under `RUNS/`. The two kinds of
+replay treat the replica cap differently:
+
+- The 3.3 dry runs (10.2) ignore the cap. They are run with `ignore_budget`, so no action is ever
+  refused for budget.
+- The 3.2 shape replay (10.1) honours it. c9's cap is 236 replicas on 4 rungs, i.e. 59 spatial
+  states.
+
+The scripts are in `scripts/t3b_*.py` and `scripts/t3c_*.py`. Every behaviour below is off by
+default, and none of it has run in MD.
+
+The numbers below are post-fix: they include review fix (f), which computes F'' from the
+de-regularised variance (`variance_curvature`), and carrying the epoch report into the
+final-combined table (`aa1a9d2`). Where a number changed, the pre-fix value is given in
+parentheses. The sources are the replay JSONs, not prose:
+
+- the shape replay: `c9_shape_r0.0_m8.json`, before and after;
+- the dry-run reports: `dry_epoch_002.json`, `dry_epoch_002_ss.json` and `dry_final.json`;
+- the 3.7 summaries.
+
+### 10.1 3.2 shape layout on the chignolin_9 swarm
+
+The input is 48,024 frames from 174 members, analysed in 15 CV1 columns. The fit accepts 26 CV2
+modes across them. Script: `t3b_shape_layout_replay.py [reserve] [min_mode_members] [out_dir]`.
+
+| Shape rule | Centres at the k2 floor | k2 range (uniform layout: 1.18) | Mean compression k2/(k2+F'') | CV2 centres per column |
+|---|---|---|---|---|
+| As specified: k2 = RT/sigma_w^2 - F'', variance-space shrinkage | 49 / 63 | 0.001-0.106 (median 0.001) | <= 0.09 | 3-6 |
+| + mean-compression floor k2 >= F'' (`980fcaf`) | 0 / 63 | 1.07-2.73 | 0.50 at every centre | 5-7 |
+| + precision-space shrinkage (`1d94d8d`) | 0 / 99 | 1.07-13.05 | 0.50 at every centre | 5-9 |
+| + F'' from the de-regularised variance (review fix (f)) | 0 / 101 | 1.10-13.45 | 0.50 at every centre | 5-10 |
+
+- **Why the specified rule failed.** The target width is the uniform layout's sigma_w = 0.711.
+  That equals the swarm's own per-column CV2 sd of 0.6-0.75, so RT/sigma_w^2 - F'' is <= 0. The
+  windows are then restrained in name only, and their sampled means follow the mode rather than
+  their centres.
+- **What the floor does.** It binds at every chignolin_9 centre (101 of 101), so on this system
+  the width target never takes effect. Section 10.5 checks the F'' behind it against production
+  data.
+- **What precision-space shrinkage changes.** Narrow modes keep their curvature. The recurrent
+  narrow mode at CV2 about -1.4 (sd 0.2-0.35) now gets k2 up to 13.45 (13.05 before fix (f)).
+- **What fix (f) changes.** Over the 26 accepted modes, the median ratio variance_curvature /
+  variance is 0.96 (minimum 0.43), so most F'' values rise by a few per cent. There are now 7
+  X7 windows (6 before), with k2 1.12-11.69.
+- **The layout is cap-bound. It fills exactly the 59-state spatial cap.**
+  - The layout places 2 mandatory stacks: the unrestrained anchor, and one CV1-axis region
+    representative (centre index 8).
+  - It grants 57 ranked requests:
+    - 25 mode cells;
+    - 7 X7 per-mode CV1-free windows;
+    - 14 remaining CV1-axis states;
+    - 4 uniform CV2 rows;
+    - 7 of 76 fill cells.
+  - 2 + 25 + 7 + 14 + 4 + 7 = 59. The 69 dropped requests are all fills. Before fix (f) it
+    was 2 + 25 + 6 + 14 + 4 + 8 = 59, with 66 of 74 fills dropped.
+  - With a 0.15 reserve (re-run, `t3b_shape_layout_replay.py 0.15 8`) the fill cap drops to 50
+    spatial states: 2 + 25 + 7 + 14 + 2 of the 4 CV2 rows = 50, so all 76 fills and 2 of the
+    uniform CV2 rows are dropped.
+  - `--ap-ladder-adapt respace` keeps the rung count, so it frees no replicas. Real headroom
+    needs fewer rungs (X1, drop lambda = 1) or more replicas.
+
+### 10.2 3.3 R1-R3 dry run
+
+Script: `t3b_cv2_resolution_dryrun.py <adaptive_dir> <payload> <phase> <out.json> [--union NPZ]
+[--transition-count ...]`. The payloads are the section-2 collector re-runs with
+`--ap-edge-metric pairwise-mbar`.
+
+| | epoch_002 | final-combined |
+|---|---|---|
+| R1 | 24 edges that differ mainly in CV2, all `ok`. 17 edges were not eligible and 35 were not CV2-mainly. 1 component. | same, 24 `ok` |
+| R2 | Unavailable: top-ups were off, so there is no per-epoch union. | Ran on 143,513 lambda = 0 rows of `adaptive_union_mbar.npz` (0.41 GB), 0 candidates. Re-measured with R2's own interval code (`t3c_union_checks.py`) over 72 intervals in 15 columns holding >= 2 % of their slab's weight: 1-6 contributing centres (median 3-4); 58 of the 72 draw a contributor from another CV1 column. Bootstrap sigma 0.015-0.14 kT. The only interval with < 2 contributors holds a window centre, so it can never be a hole. |
+| R3 (39 windows, `r3_gate`) | 36 no_action: depth_below_1kT 15, no_density_minimum 11, member_support 9, single_component 1. 3 flagged `trapped_or_orthogonal` (transitions_below_min). | 39 no_action: member_support 16, single_component 12, no_density_minimum 9, depth_below_1kT 2 |
+| Actions | 0 | 0 |
+| Wall time | 62 s | 146 s |
+
+The three flagged windows sit on the top CV2 row (1.348). Their modes are at about +0.2 and +1.2
+in CV2 units. The child values come from the state-series re-run, where the children are
+planned:
+
+| State | Depth (kT) | Crossings within replica residence | State-series switches | Child F''_est (lower / upper mode) | Child k2 at the cap (4 x 1.18 = 4.72) | Mean compression at the upper mode |
+|---|---|---|---|---|---|---|
+| 84 | 1.55 | 5 | 370 | 4.72 / 30.41 (4.7 / 30.3) | 4.72 / 4.72 | 0.13 |
+| 200 | 1.10 | 0 | 469 | 1.87 / 7.32 (1.9 / 7.3) | 1.87 / 4.72 | 0.39 |
+| 220 | 1.65 | 5 | 458 | 3.73 / 21.90 (3.7 / 21.3) | 3.73 / 4.72 | 0.18 |
+
+- **The crossing count.** The replica-resolved count (`--ap-refine-transition-count replica`,
+  the default) excludes exchange swaps that bring in a walker already in the other mode.
+  chignolin_9 replicas stay about 2 samples per window, so that count almost never reaches the
+  threshold of 10.
+- **State-series counting.** Re-run with `--transition-count state-series` (the flag,
+  `337ff9b`), all 3 windows pass the crossing test. They are refused
+  `k2_capped_below_compression` instead: every upper-mode child, and 84's lower child, whose
+  F'' of 4.72 equals the cap. Either way chignolin_9 gets 0 actions.
+- **The binding limit.** It is the 4x-parent growth cap against upper-mode curvatures of 7-30,
+  not the transition rule. The T2 calibration (`t2_synthetic.md` Section 9) finds this cap
+  refusal on almost every synthetic R3 candidate too.
+- **Why the 3 flags disappear at final-combined (condition 6).** More data shrink the upper
+  CV2 mode, so the mixture gate stops before the transition test. Final-combined has 38,812 vs
+  2,750 pairs per state, and 1,941 vs 1,375 subsample frames.
+  - 84: epoch_002 had modes 0.25 (w 0.61) / 1.10 (w 0.27, in 16 of 32 blocks). At final the
+    upper mode is 1.17 (w 0.075), in 5 of 33 blocks, which fails `member_support`.
+  - 220: epoch_002 had 0.19 (w 0.68) / 1.20 (w 0.23, 19 blocks). At final there are two small
+    components, 0.83 (w 0.13, 1 block) and 1.54 (w 0.03, 0 blocks), which fail
+    `member_support`.
+  - 200: epoch_002 had 0.17 (w 0.41) / 1.27 (w 0.36, 28 blocks). At final the accepted pair is
+    0.49 (w 0.75) / 0.79 (w 0.20), with no density minimum between them. Its 1.47 component
+    (w 0.05) has 1 block. The gate is `no_density_minimum`.
+  - This is the mixture test responding to more data, not a code change.
+  - These two phases cannot show whether a persistence rule (bimodal in >= 2 consecutive
+    epochs) would change the epoch_002 verdict. epoch_001 was not replayed.
+
+### 10.3 3.7 summary and report row
+
+Command: `python -m gareus.adaptive.cv2_resolution_summary`, run on the 10.2 payloads and reports.
+
+| | epoch_002 | final-combined |
+|---|---|---|
+| States / CV2-restrained / R3-evaluated | 236 / 172 / 39 | 236 / 172 / 39 |
+| Graded edges / weak / unmeasured | 276 / 0 / 0 | 276 / 0 / 0 |
+| Graded edges with pairwise point < 0.15 (never weak: neighbour, spanning or cross-pattern kinds, or q90 >= 0.15) | 91 | 84 |
+| Components | 1 | 1 |
+| trapped_or_orthogonal (the table's own counts) | 3 | 0 |
+| `gareus_report` "CV2 resolution" row, as the table was built before `aa1a9d2` | CAUTION | PASS |
+| Same row since `aa1a9d2`: the final table carries the newest epoch's 3.3 report | CAUTION | CAUTION ("final_combined; R3/budget from epoch_002": 3 trapped_or_orthogonal) |
+| Same, state-series crossing count | CAUTION (3 spring-cap refusals) | CAUTION (3 spring-cap refusals, carried from epoch_002) |
+| Confinement ratio cv2_sd / sigma_w2, lambda = 0 (43 states) | 0.56-0.84, median 0.72 | 0.55-0.77, median 0.66 |
+| Graded-edge median overlap: pairwise / CV1 marginal / joint 2D | 0.25 / 0.52 / 0.50 | 0.26 / 0.51 / 0.52 |
+
+- **The carried report.** The final-combined table now carries epoch_002's 3.3 report.
+  - Rebuilt with the `aa1a9d2` CLI on a /tmp adaptive dir, the final table reads
+    `sources.report_carried_from = epoch_002`.
+  - Its trapped / spring-cap counts come from that report, while its edges and restraints stay
+    final-combined.
+  - So a campaign run like c9's would grade the final table CAUTION on epoch_002's 3 trapped
+    windows, even though the final-combined data no longer show them as bimodal (10.2).
+  - The CAUTION is therefore about the last numbered epoch, not the final data.
+- The new row leaves chignolin_9's overall verdict at CAUTION, because other rows already
+  grade it CAUTION.
+- `adaptive_fig5_state_coordinates.png` shows the 4 rungs.
+  - The CV1-only windows sit at their sampled CV2 means. These trace a curved valley rather
+    than a placeholder row.
+  - The 3 trapped windows are ringed in the epoch_002 panel.
+- With `--ap-cv2-resolution` on, a campaign writes
+  `adaptive_production/cv2_resolution_summary_final_combined.json`, the file the row reads,
+  after every final-combined collection (`df8f387`).
+
+### 10.4 What this means for chignolin_10
+
+- **The shape layout.** With both follow-ups, the CV2 windows it designs are genuinely
+  restrained on paper, at 5-10 centres per CV1 column. At chignolin_9 scale this does not fit:
+  7 of 76 fills fit, and none with a 0.15 reserve.
+- **The springs.** On c9 the whole spring field is k2 = F''_est, because the compression floor
+  binds everywhere. The production cross-check (10.5) agrees with that F'' only to within a
+  factor of about 1.6, so the realised compression will be 0.35-0.73, not 0.50.
+- **R1-R3 find nothing to do on chignolin_9's data.** That is expected: its CV2 is residual PC1
+  with uniform k2 = 1.18, and the layout is already connected on the pairwise metric.
+- **Two decisions still open before launch, now answered by the T2 calibration**
+  (`t2_synthetic.md` Section 9):
+  - *The crossing count.*
+    - `replica` never fires under exchange, and `state-series` passes every bimodal window,
+      trapped or not.
+    - A replica-path count, which joins a replica's own visits to the state, is the only
+      estimator that separated equilibrated from mis-populated windows in the harness. It is
+      not implemented in `gareus/`.
+    - On c9 epoch_002 it gives 22 / 12 / 21 for states 84 / 200 / 220, against 5 / 0 / 5 for
+      `replica` and 370 / 469 / 458 for `state-series`. That comes from the Parquet `replica`
+      column (`t3c_replica_path_c9.py`, `t2_data/t3c_replica_path_c9.json`), which reproduces
+      the dry run's own two counts exactly.
+  - *The 4x cap.*
+    - It refused all 202 R3 candidates on the three synthetic landscapes whose CV2 modes are
+      real 2-D structure. c9's three need 6-26x.
+    - It let through all 34 candidates on hidden-cv3, whose children need only about 2.2x.
+      There the CV2 bimodality comes from the hidden slow coordinate.
+    - At matched budget, the inserted children gave no PMF benefit in the harness with or
+      without the cap.
+    - Run R3 flag-only (no inserts) until T4 shows a benefit, whatever the crossing estimator.
+      With the replica-path count, the 4x cap would insert only on the hidden-mode landscape
+      (15 windows at re/8,000). The value 4 is irrelevant while inserts are off.
+- **Set a reserve > 0.** Otherwise every action is refused `no_reserve`.
+- **The other knobs.** The calibration recommends:
+  - `refine_pmf_sigma_kt` 0.25, because today's bootstrap sigma is about 2.5x too small;
+  - `coverage_min_windows` stays 2. It is structurally near-inert on a 2-D grid: on c9, 58 of
+    72 heavy intervals count a centre from another CV1 column;
+  - `refine_min_sigma` never binds;
+  - `refine_min_transitions` 10, on the replica-path count. It is an absolute count and
+    does not transfer between series lengths.
+
+### 10.5 Condition 5: the swarm's F''_est against production-sampled curvature
+
+Script: `scripts/t3c_f2_crosscheck.py`, which is read-only. It is reduced by `t3c_f2_summary.py`
+to `t2_data/t3c_f2_crosscheck.json`, with the weight attribution in `t2_data/t3c_union_checks.json`.
+
+**Swarm side.** This is the post-fix shape replay (10.1), taking per column:
+
+- the pooled variance;
+- the accepted mixture components, with `variance_curvature`;
+- the layout's own rule for F''(z): `estimate_f2` of the dominant accepted component at z,
+  falling back to the pooled value where a column has no accepted mode.
+
+**The projection is the same.** The replay evaluates the swarm report's
+`selected_component_index` = 1, residual PC1. Its uniform CV2 centres (-1.851, -0.785, 0.281,
+1.348) are the production registry's. The 15 swarm CV1 columns are exactly c9's 15 CV1 centres.
+
+**Production side.** Everything is lambda = 0 and final-combined, at RT = 0.596 kcal/mol, with
+three estimators:
+
+- **P1 window-local.** All 39 CV2-restrained 2-D windows (k2 = 1.18). F''_loc = RT/var(cv2 | cv1)
+  - k2, using the conditional variance var2 - cov^2/var1. |corr(cv1, cv2)| <= 0.24, so
+  conditional and marginal F'' agree within 11 %.
+- **P2 CV1-only windows.** The 15 windows with k2 = 0, at the same CV1 centres. They sample CV2
+  in a thin CV1 slab with no CV2 spring, which is the closest analogue of a swarm column.
+  - Pooled RT/var2.
+  - A mixture fit with 32 time blocks as members, as R3 does.
+- **P3 union MBAR.** The 143,513 lambda = 0 rows of `adaptive_union_mbar.npz`, with their own
+  MBAR over the 59 lambda = 0 states.
+  - Per column, the swarm's own CV1 kernel times the unbiased weights. Kish n_eff is 5k-33k per
+    column.
+  - Pooled RT/var and a weighted mixture fit.
+
+**Uncertainty.**
+
+- P1/P2: block bootstrap over the P4 subsample's 32 time blocks per state, 200 reps. The 5-95 %
+  range is about ±10-15 % of F''.
+- P3 pooled: block bootstrap with f fixed, about ±2-5 %.
+- P3 modes: 20 refits. Their CIs are wide, and sometimes exclude the point estimate when a refit
+  matches a different component, so they are indicative only.
+- No replica-level bootstrap is possible, because neither NPZ carries a replica column.
+- The swarm F'' has no uncertainty estimate of its own.
+
+| Level (production / swarm) | n | median | 10-90 % | range |
+|---|---|---|---|---|
+| Pooled per column, P2 CV1-only windows vs swarm RT/pooled var | 15 | 1.18 | 1.06-1.57 | 0.97-1.85 |
+| Pooled per column, P3 union vs swarm RT/pooled var | 15 | 1.24 | 1.06-1.86 | 0.95-3.60 |
+| Window-local, P1 F''_loc vs swarm model F''(sampled mean) | 39 | 0.86 | 0.51-1.56 | 0.30-1.90 (log-ratio sd 0.45) |
+| Per mode, matched pairs only (P3 union vs swarm F''_est; means within one narrower sd) | 11 | see below | | |
+
+**Agreement.**
+
+- **Window-local curvature, the quantity that sets a window's spring.** It agrees to within a
+  factor of about 1.6 (one log-sd), with no bias to speak of: the median is 0.86.
+  - F''_loc is 0.83-2.75, and it is positive in every one of the 39 windows. Every c9 CV2
+    window samples narrower than its sigma_w, which is what makes the "RT/var - k2" subtraction
+    of the R-rules usable on real data.
+- **Pooled per column.** Production is 18-24 % stiffer than the swarm in the median, and 1.5-3.6x
+  stiffer in the lowest column (0.070) and the two highest (0.889, 0.934). The swarm is broader
+  than equilibrium there.
+
+**Where they disagree.**
+
+1. **The swarm's recurrent narrow mode at CV2 about -1.4.** This is sd 0.18-0.35, F''_est 4-13,
+   in 8 columns.
+   - Where production has a matching component, at CV1 0.242 and 0.306, the production mode sits
+     at -1.14 / -1.18 with sd 0.41-0.42. F'' is 3.35 / 3.60 (CI 2.5-6.1 / 2.7-4.1) against the
+     swarm's 5.06 / 6.01, a ratio of 0.66 / 0.60.
+   - In the other 6 columns production has no mode within one sd: the nearest component sits at
+     -0.52 to -0.84, broad (sd 0.50-0.63) except at CV1 0.934.
+   - So the swarm makes this mode narrower, and pushes it further out, than production samples
+     it.
+   - The shape layout gives its 2 centres per column k2 4-13. Under the union F'' they would
+     compress to 0.60-0.86, not 0.5, and sample narrower than designed.
+2. **The broad main mode.** In the 9 matched broad-mode pairs, production is narrower. The
+   ratios are 1.08-3.46, median 1.5, and the means are shifted by up to 0.4.
+3. **High CV1 (0.82-0.93).** The union fit finds narrow components that the swarm does not have:
+   sd 0.09-0.12, weight 0.20-0.36, F'' 38-80, at CV2 about -0.5 and 0.0.
+   - Each is carried by 5-13 effective states. The largest single-state share is 14-30 %, and it
+     comes from 2-D windows at 0.281 / 1.348 and from CV1-only windows. So it is not one state's
+     reweighted samples.
+   - But the unbiased CV1-only window of the same column (state 60, CV1 0.934) shows no narrow
+     mode there. The band is therefore unconfirmed: it may be real sampling or a
+     reweighting/ergodicity artefact.
+   - The union-model numbers that depend on it are conditional.
+4. **The lowest CV1 column (0.070).** The swarm has no accepted mode there, so it falls back to
+   pooled F'' 1.45. Production gives 2.3-2.75.
+
+**What it implies for the springs.** k2 = F''_est at every shape centre. The primary check uses
+the 41 of the layout's 101 centres that have a production 2-D window whose sampled mean lies
+within the centre's predicted sampled sigma:
+
+- the realised compression k2/(k2 + F''_loc) would be 0.35-0.73, median 0.53;
+- 15 of 41 are below the 0.5 target, and 2 are above 0.7.
+
+Conditional on the union mixture model, including the unconfirmed high-CV1 bands:
+
+- the median over all 101 centres is 0.45, 10-90 % 0.23-0.80;
+- 60 centres are below 0.5, and 12 below 0.25, almost all of those at high CV1.
+
+The predicted sampled widths would change by 0.55-2.0x (10-90 %). The centre count barely moves
+in the median (x1.1), but halves or doubles locally. 2 centres (CV1 0.934, CV2 -1.85 / -1.73)
+have < 1 % union weight within one predicted sigma: they are extrapolated.
+
+**Reading.**
+
+- The 0.5 compression is a nominal target. With a design-measure F'' it is realised as about
+  0.35-0.75 where production can check it.
+- That is roughly what a factor-2 error in F'' gives: 0.33-0.67.
+- The swarm does not reproduce the production mode structure, neither the -1.4 mode's width nor
+  the high-CV1 bands.
+- Options, none implemented:
+  - after the first epoch, re-derive each window's k2 from its own samples, F''_loc =
+    RT/var - k2. This is the same subtraction R1-R3 already use, and it is validated here in the
+    sense that it is positive and stable on c9. Doing so means new state ids, because a
+    Hamiltonian never changes under a state_id;
+  - or cap how far the floor may rely on F''_est, for example min(F''_est, 2 x pooled F'').
+- The T2 calibration (`t2_synthetic.md` Section 9) finds R3 cap-bound and without a measured
+  benefit. So R3 cannot currently be relied on as the correction path for a mis-set spring.
+
+**Confounds.**
+
+- Production windows sample only near their own centres, so P1 is local. It checks the spring at
+  41 of 101 centres, not the whole support.
+- P3 covers the support, but only as well as the union's coverage and reweighting do.
+- Bimodal windows make F''_loc an average curvature.
+- All comparisons are at lambda = 0.
+- The swarm side is one replay with no error bar.

@@ -68,6 +68,15 @@ def _unit_interval_float(text: str) -> float:
     return value
 
 
+def _reserve_fraction(text: str) -> float:
+    """argparse type: an adaptive reserve fraction in [0, 1) (spec P1)."""
+    from .adaptive.reserve_budget import validate_reserve_fraction
+    try:
+        return validate_reserve_fraction(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def _add_core_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("-h", "--help", action=SimpleHelpAction)
     p.add_argument("-hh", "--help-heavy", action=HeavyHelpAction)
@@ -302,6 +311,16 @@ def _add_cv_selection_args(p: argparse.ArgumentParser) -> None:
                    help="Largest CV2-induced CV1 curvature, as a fraction of the cell's designed CV1 "
                         "curvature, --swarm-cv2-coupling-gate accepts (a different quantity from "
                         "--cv-selection-max-coupling-fraction, which judges candidates at a reference k2).")
+    p.add_argument("--swarm-cv2-layout", choices=["uniform", "shape"], default="uniform",
+                   help="Spec 3.2 CV2 window design of the 2-D swarm layout. uniform (default): today's "
+                        "global linspace and per-gap k2. shape: per CV1 window a Gaussian mixture of the "
+                        "swarm's CV2 (BIC count, member-blocked CV regularisation) puts a centre at every "
+                        "mode with >= --swarm-cv2-min-mode-members members, fills at 1.5 x the smallest "
+                        "predicted sampled sigma, k2 = RT/sigma^2 - F'' in [--cv2-k-min, --cv2-k-max], adds "
+                        "one CV1-free window per mode (X7) and ranks cells under the cap.")
+    p.add_argument("--swarm-cv2-min-mode-members", type=int, default=8,
+                   help="Independent swarm members a CV2 mixture component needs before "
+                        "--swarm-cv2-layout shape places a mandatory centre on it.")
     p.add_argument("--legacy-model-policy", choices=["refuse", "allow-v1"], default="refuse",
                    dest="legacy_model_policy",
                    help="v1 residual pair-model artifacts (pre thermodynamic repair F02) describe a coordinate "
@@ -581,6 +600,40 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                         "one-sided along it -- from a pooled end state inside the window's restraint "
                         "on its under-sampled side. Starting points only; report epoch_NNN/"
                         "slow_mode_reseed.json. Needs a frozen residual pair and saved trajectories.")
+    p.add_argument("--ap-cv2-resolution", action=argparse.BooleanOptionalAction, default=False,
+                   help="Spec 3.3 CV2 resolution actions (off by default). R1 bridges CV2-mainly edges that "
+                        "split the pairwise-MBAR overlap graph or are confidently weak (unmeasured ones get "
+                        "2 epochs of extra sampling first; needs --ap-edge-metric pairwise-mbar); R2 adds a "
+                        "window at a CV2 coverage hole of the per-epoch union (needs --ap-topups); R3 inserts "
+                        "two windows at the modes of a bimodal window with observed transitions (parent kept; "
+                        "no transitions = flagged trapped_or_orthogonal). Draws only on the swarm layout's "
+                        "reserve (--swarm-adaptive-reserve-fraction); without one every proposal is refused "
+                        "(no_reserve). Report epoch_NNN/cv2_resolution_report.json. Frozen decision rule.")
+    p.add_argument("--ap-coverage-min-windows", type=float, default=2.0,
+                   help="R2: a CV2 interval whose unbiased weight comes from fewer effective centres "
+                        "(1/sum p^2) is a hole. Uncalibrated default.")
+    p.add_argument("--ap-refine-min-transitions", type=int, default=10,
+                   help="R3: within-residence core-to-core CV2 transitions a bimodal window needs before "
+                        "its modes get windows. Uncalibrated default.")
+    p.add_argument("--ap-refine-transition-count", choices=("replica", "state-series"), default="replica",
+                   help="R3: which crossings count toward --ap-refine-min-transitions. replica (default): "
+                        "within one replica's residence at the window, so an exchange swap is not a crossing "
+                        "(rarely fires when replicas stay only a few samples); state-series: every switch of "
+                        "the window's series, swaps included -- always >= the replica count (within-residence "
+                        "crossings + swap-induced label changes), so the permissive choice. Frozen with the "
+                        "decision settings; a bad recorded value fails when the policy is loaded.")
+    p.add_argument("--ap-refine-pmf-sigma-kt", type=float, default=0.5,
+                   help="R2: block-bootstrap sigma (kT) of a CV2 interval's free energy above which it is a "
+                        "hole. Uncalibrated default.")
+    p.add_argument("--ap-refine-budget-fraction", type=_unit_interval_float, default=0.5,
+                   help="Largest share of the reserve's free slots (after add_rung) resolution actions may "
+                        "spend per epoch (spec 3.3: 0.5).")
+    p.add_argument("--ap-refine-protect-epochs", type=int, default=2,
+                   help="Epochs a window created by R1-R3 is protected from retirement and further "
+                        "refinement (spec 3.1: 2).")
+    p.add_argument("--ap-refine-min-sigma", type=float, default=0.1,
+                   help="Smallest target sampled CV2 sigma (CV2 units) of a new R1-R3 window. Uncalibrated "
+                        "default.")
     p.add_argument("--ap-topups", action=argparse.BooleanOptionalAction, default=False,
                    help="Top-ups (off by default): --no-ap-topups runs each scheduled phase as a single "
                         "all-state baseline only. --ap-topups adds, after that baseline, at most one "
@@ -920,6 +973,11 @@ def _add_swarm_args(p: argparse.ArgumentParser) -> None:
                         "graft_failed or md_failed. Failing this gate means too many "
                         "members never reached a usable trace to trust the pooled "
                         "envelope/ladder.")
+    p.add_argument("--swarm-adaptive-reserve-fraction", type=_reserve_fraction, default=0.0,
+                   help="Spec P1 layout headroom (0 = off, today's layout): the swarm layout leaves "
+                        "floor(f * --max-replicas) replicas unfilled for adaptive additions and records the "
+                        "reserve in layout_plan.json (adaptive_reserve). Mandatory stacks are never dropped "
+                        "for it; a shortfall is recorded instead. Must be in [0, 1).")
     p.add_argument("--swarm-seeds-per-window", type=int, default=3)
     p.add_argument("--swarm-discard-block-frames", type=int, default=25,
                    help="V-trace block size for the discard detector.")
@@ -1631,6 +1689,14 @@ def _shim_adaptive_production(args: argparse.Namespace) -> None:
     args.adaptive_production_discovery_census = args.ap_discovery_census
     args.adaptive_production_slow_mode_reseed_fraction = args.ap_slow_mode_reseed_fraction
     args.adaptive_production_edge_metric = args.ap_edge_metric
+    args.adaptive_production_cv2_resolution = args.ap_cv2_resolution
+    args.adaptive_production_coverage_min_windows = args.ap_coverage_min_windows
+    args.adaptive_production_refine_min_transitions = args.ap_refine_min_transitions
+    args.adaptive_production_refine_transition_count = args.ap_refine_transition_count
+    args.adaptive_production_refine_pmf_sigma_kt = args.ap_refine_pmf_sigma_kt
+    args.adaptive_production_refine_budget_fraction = args.ap_refine_budget_fraction
+    args.adaptive_production_refine_protect_epochs = args.ap_refine_protect_epochs
+    args.adaptive_production_refine_min_sigma = args.ap_refine_min_sigma
     args.adaptive_production_min_edge_neff = args.ap_min_edge_neff
     args.adaptive_production_topup_target_sigma = args.ap_topup_target_sigma
     args.adaptive_production_topup_weak_overlap = args.ap_topup_weak_overlap

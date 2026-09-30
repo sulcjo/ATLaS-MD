@@ -1952,6 +1952,35 @@ envelope_stability failure, adds +1 on a coverage failure, caps the total at 4x
 the base replicate count, and analyze is re-run after the extra members
 complete. ladder_ess no longer triggers an extension since it cannot fail.
 
+Layout headroom and shape-based CV2 windows (2-D layout)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Both are off by default; the defaults reproduce today's windows table and
+layout_plan.json byte for byte.
+
+    --swarm-adaptive-reserve-fraction f   leave floor(f * --max-replicas) replicas unfilled
+                                          for adaptive additions (spec P1). layout_plan.json
+                                          records adaptive_reserve (fraction, requested and
+                                          free slots, granted states, shortfall). The
+                                          mandatory stacks are never dropped for it.
+    --swarm-cv2-layout shape              per CV1 window, a Gaussian mixture of the swarm's
+                                          CV2 (CV1 kernel of the window's width; BIC count,
+                                          member-blocked CV regularisation) places a centre
+                                          on every mode with >= --swarm-cv2-min-mode-members
+                                          (8) members, then fills at 1.5 x the smallest
+                                          predicted sampled sigma ahead; k2 = max(RT/sigma^2 -
+                                          F'', F'') in [--cv2-k-min, --cv2-k-max] (F'' from
+                                          the mode's de-regularised variance, the fit
+                                          re-converged without the EM regularisation); one CV1-free window
+                                          per mode (X7); under the cap mode cells first, then
+                                          the reserve, then axis states, then fill cells by
+                                          adjacency and design-mass share.
+
+The swarm is a design measure, not an equilibrium conditional: the mixture only
+locates structure and bounds how finely CV2 is resolved. Where a mode is stiffer
+than the target width the F'' floor (mean-compression 0.5) keeps every window mean at
+least half-way to its centre (mean_compression and n_at_compression_floor in
+layout_plan.json's cv2_shape record; on chignolin_9 the floor binds at every centre).
+
 Pilot comparison
 ~~~~~~~~~~~~~~~~~
 --swarm-stage compare --swarm-pilot-globals <S3 pilot's shared_gamd_setup_globals.json>
@@ -2176,6 +2205,72 @@ Read-only replay on a finished campaign:
 On chignolin_9 it reproduces the union MBAR rung overlaps (0.244/0.272/0.404
 predicted vs 0.243/0.272/0.402) and proposes [0, 0.175, 0.47, 1] (10th-percentile
 overlaps 0.281/0.281/0.286, from 0.209/0.248/0.396).
+
+21. Adaptive CV2 resolution
+---------------------------
+Off by default (``--ap-cv2-resolution``).  After the other proposers, between
+numbered epochs, three rules add CV2 resolution where the data say CV2 is
+under-resolved.  Only states restraining both axes above their floors
+(k1 > --cv1-k-min, k2 > --cv2-k-min) take part; anchors and axis states never do.
+
+    R1  CV2-gap bridge, for same-pattern geometry edges whose ends differ mainly in
+        CV2 (per-axis restraint-width distance d2 >= d1). Needs --ap-edge-metric
+        pairwise-mbar. Structural (the edge's absence splits the overlap graph into
+        components): bridge now. Weak (confidently below min_rung_overlap): bridge.
+        Unmeasured: extend both ends; bridge after 2 more epochs if still
+        unmeasured or weak (history in adaptive_production/cv2_resolution_history.json).
+        The bridge replaces the midpoint bridger on that edge.
+    R2  coverage hole, post-union only (needs --ap-topups, which build a union each
+        epoch; otherwise recorded unavailable): a CV2 interval at fixed CV1 whose
+        unbiased weight comes from fewer than --ap-coverage-min-windows centres, or
+        whose block-bootstrap free-energy sigma exceeds --ap-refine-pmf-sigma-kt,
+        gets a window at the interval centre.
+    R3  mode resolution: a window whose CV2 samples show two mixture modes (depth
+        >= 1 kT, both >= 10 %) AND >= --ap-refine-min-transitions core-to-core
+        transitions (--ap-refine-transition-count: replica = within replica
+        residences, default; state-series = every switch at the window, exchange
+        swaps included, always >= the replica count: the permissive choice) gets
+        two children at the modes; the parent is kept. Without transitions it is
+        flagged trapped_or_orthogonal and nothing is inserted (more CV2 windows
+        cannot resolve a hidden slow mode). Every R3 window records the test that
+        decided it (r3_gate: single_component, member_support, no_density_minimum,
+        depth_below_1kT, mode_weight_below_10pct, too_few_samples,
+        no_replica_series, transitions_below_min, passed) with its numbers.
+
+Every new window: target sampled sigma from the spacing (children: 2 delta / 1.5),
+never below --ap-refine-min-sigma; F'' from the window's own samples minus its own
+spring (R3: the mode's de-regularised mixture variance); k2 = max(RT/sigma^2 - F'', F'') (the F'' floor keeps the window mean at least
+half-way to its centre) in [--cv2-k-min, min(--cv2-k-max, 4 x parent k2)], then the
+coupling gate. A k2 at --cv2-k-min is refused (k2_at_floor), and so is one the cap holds
+below the F'' floor (k2_capped_below_compression); neither is created.
+Sampled sd/sigma_w, Sarle bimodality and curvature are reported, never trigger.
+
+Budget: resolution actions draw only on the swarm layout's reserve
+(--swarm-adaptive-reserve-fraction; layout_plan.json adaptive_reserve), at most
+--ap-refine-budget-fraction (0.5) of the free slots left after add_rung, which a
+reserve limits to 1/3 of them. Without a reserve every proposal is refused
+(no_reserve) and recorded, and the driver prints one WARNING per campaign job. New
+windows are protected from retirement and further refinement for
+--ap-refine-protect-epochs (2). Proposed (funded) resolution blocks the convergence
+gate; budget refusals (no_reserve, resolution_budget) and spring-cap refusals never do
+-- they are recorded and graded CAUTION. Report: epoch_NNN/cv2_resolution_report.json
+(cv2_resolution_report_v2: v1's transitions_lower_bound is now
+transitions_state_series_lower_bound; readers accept both). The knobs are frozen with the decision settings;
+coverage-min-windows, refine-min-transitions, refine-pmf-sigma-kt and
+refine-min-sigma are uncalibrated defaults.
+
+Reporting (spec 3.7). One table per phase from files that already exist:
+    python -m gareus.adaptive.cv2_resolution_summary RUNS/<run>/adaptive_production [--out DIR]
+writes cv2_resolution_summary.json (cv2_resolution_summary_v1) + _states.csv/_edges.csv
+into each epoch/final dir (final-combined: *_final_combined.* at the adaptive root);
+with --ap-cv2-resolution the driver writes each epoch's after the apply. Per state:
+restraint, sampled CV2 mean/sd, sigma_w2 = sqrt(kT/k2), confinement ratio = sd/sigma_w2
+(a landscape diagnostic, never a trigger), mixture modes, transitions (+ estimator),
+trapped_or_orthogonal. Per edge: pairwise MBAR (q10/q90, status), CV1 marginal and joint
+2D overlap, each with its space stamp. gareus_report adds a "CV2 resolution" row when the
+final-combined summary exists (FAIL: a weak pairwise edge or > 1 spatial component; CAUTION: unmeasured
+edges, trapped windows, budget refusals, k2_capped_below_compression refusals); plot_adaptive_diagnostics adds
+adaptive_fig5_state_coordinates.png (states at their own (c1, c2), one panel per rung).
 """
 
 

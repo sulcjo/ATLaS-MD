@@ -25,6 +25,7 @@ from typing import List, Optional
 import numpy as np
 
 from gareus.pep_gamd import PepGamdEnvelope, pep_gamd_boost_kj
+from gareus.adaptive.reserve_budget import layout_reserve_record, reserved_replicas
 
 R_KJ_MOL_K = 0.008314462618
 R_KCAL_MOL_K = 0.0019872041
@@ -428,7 +429,7 @@ LAYOUT_PLAN_SCHEMA_VERSION = 2
 
 
 def design_exploration_layout(n1: int, n2: int, *, n_rungs: int, max_replicas: int,
-                              region_centre_indices=None) -> dict:
+                              region_centre_indices=None, reserve_fraction: float = 0.0) -> dict:
     """Spatial states for a 2-D ladder with the exploration invariants of spec F05.
 
     Builder order, at ANY replica cap:
@@ -443,6 +444,11 @@ def design_exploration_layout(n1: int, n2: int, *, n_rungs: int, max_replicas: i
 
     Cells are ``(i1 | None, i2 | None)``; ``None`` = that axis unrestrained (k = 0, finite
     placeholder centre). Roles live in the returned plan, never in the physics rows.
+
+    ``reserve_fraction`` > 0 (spec P1, ``--swarm-adaptive-reserve-fraction``): steps 3 fill only
+    ``(max_replicas - floor(f * max_replicas)) // n_rungs`` spatial states, never fewer than the
+    mandatory ones (the reserve shrinks instead, recorded as ``reserve_shortfall``), and the plan
+    gains ``adaptive_reserve``. At 0 the plan is today's, key for key.
     """
     if int(max_replicas) <= 0:
         raise ValueError("max_replicas must be set and positive; the default 0 cannot size a 2-D ladder")
@@ -464,7 +470,8 @@ def design_exploration_layout(n1: int, n2: int, *, n_rungs: int, max_replicas: i
                           f"cap of {int(max_replicas)} replicas / {cap} spatial states"}
     for i in reps:
         cells.append((i, None)); roles.append(ROLE_REGION_REPRESENTATIVE)
-    remaining = cap - len(cells)
+    fill_cap = reserve_fill_cap(cap, mandatory, max_replicas, n_rungs, reserve_fraction)
+    remaining = fill_cap - len(cells)
     if n1 * n2 <= remaining:
         kind = "joint"
         for i in range(n1):
@@ -487,8 +494,20 @@ def design_exploration_layout(n1: int, n2: int, *, n_rungs: int, max_replicas: i
             "cap_spatial": cap, "mandatory_spatial": mandatory, "cells": cells, "state_roles": roles,
             "mandatory_spatial_indices": list(range(mandatory)),
             "region_representative_centre_indices": reps}
+    if float(reserve_fraction) > 0.0:
+        plan["adaptive_reserve"] = layout_reserve_record(float(reserve_fraction), int(max_replicas), int(n_rungs),
+                                                         fill_cap_spatial=fill_cap, spatial_states=len(cells))
     _check_layout_invariants(plan)
     return plan
+
+
+def reserve_fill_cap(cap: int, mandatory: int, max_replicas: int, n_rungs: int, reserve_fraction: float) -> int:
+    """Spatial states the layout may fill under the P1 reserve (``cap`` itself at f = 0); never
+    below the mandatory stacks, so the reserve cannot make a feasible layout insufficient."""
+    if float(reserve_fraction) <= 0.0:
+        return int(cap)
+    reserved = reserved_replicas(int(max_replicas), float(reserve_fraction))
+    return max(int(mandatory), min(int(cap), (int(max_replicas) - reserved) // int(n_rungs)))
 
 
 def _check_layout_invariants(plan: dict) -> None:
@@ -559,7 +578,9 @@ def layout_plan_record(plan: dict, rows: list, lambdas, *, region_inventory: Opt
             "spatial_states": plan["spatial_states"], "n_states": len(states), "cap_spatial": plan["cap_spatial"],
             "mandatory_spatial": plan["mandatory_spatial"], "mandatory_state_ids": [s["state_id"] for s in states if s["mandatory"]],
             "states": states, "region_coverage": coverage, "region_inventory": region_inventory,
-            "unresolved": (region_inventory or {}).get("unresolved", []) if region_inventory else []}
+            "unresolved": (region_inventory or {}).get("unresolved", []) if region_inventory else [],
+            # P1 reserve and 3.2 shape provenance travel only when present (absent = today's bytes)
+            **{key: plan[key] for key in ("adaptive_reserve", "cv2_shape") if key in plan}}
 
 
 def _weighted_quantile(values: np.ndarray, weights: np.ndarray, q: float) -> float:
