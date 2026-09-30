@@ -289,10 +289,18 @@ def ladder_overlap_by_axis(overlap, state_lambdas, centers,
         on_cv2 = np.isfinite(sec) & ~(np.isfinite(k2) & (k2 <= 0.0))
 
     sec_key = [_round_key(sec[i]) if on_cv2[i] else None for i in range(K)]
-    # (restrained on CV1?, CV1 centre if restrained, CV2 centre if restrained); first
-    # element None for a state with no CV1 centre at all, which is off the grid.
+    k1_arr = np.full(K, np.nan) if primary_k is None else k1
+    k2_arr = np.full(K, np.nan) if secondary_k is None else k2
+    # (restrained on CV1?, CV1 centre if restrained, CV2 centre if restrained, restrained
+    # springs); first element None for a state with no CV1 centre at all, which is off the
+    # grid. The springs separate a re-sprung centre (--ap-cv2-respring: same centres, new k2)
+    # from its retired states -- different Hamiltonians, never one window's rungs. Rungs of
+    # one centre share their springs, and an unrecorded k keys as None, so without a respring
+    # this groups exactly as the centre alone.
     centre_key = [((bool(on_cv1[i]) if np.isfinite(cen[i]) else None),
-                   _round_key(cen[i]) if on_cv1[i] else None, sec_key[i])
+                   _round_key(cen[i]) if on_cv1[i] else None, sec_key[i],
+                   _round_key(k1_arr[i]) if on_cv1[i] else None,
+                   _round_key(k2_arr[i]) if on_cv2[i] else None)
                   for i in range(K)]
     row_key = [(_round_key(lam[i]), sec_key[i]) if on_cv1[i] else (None, None) for i in range(K)]
 
@@ -306,11 +314,21 @@ def ladder_overlap_by_axis(overlap, state_lambdas, centers,
                 continue
             idx = np.asarray(idx)
             order = idx[np.argsort(sort_values[idx], kind="stable")]
-            for a, b in zip(order[:-1], order[1:]):
-                if abs(sort_values[b] - sort_values[a]) > _TOL:
-                    v = pair_overlap(int(a), int(b))
-                    if v is not None:
-                        pairs.append((a, b, v))
+            # States tied on the chain coordinate (a re-sprung window and its retired
+            # predecessor) form one slot; every member links to every member of the next
+            # slot. Without ties each slot is one state: the plain adjacent chain.
+            slots = [[order[0]]]
+            for b in order[1:]:
+                if abs(sort_values[b] - sort_values[slots[-1][0]]) > _TOL:
+                    slots.append([b])
+                else:
+                    slots[-1].append(b)
+            for lo, hi in zip(slots[:-1], slots[1:]):
+                for a in lo:
+                    for b in hi:
+                        v = pair_overlap(int(a), int(b))
+                        if v is not None:
+                            pairs.append((a, b, v))
         return pairs
 
     lam_pairs = _chain_pairs(centre_key, lam)
