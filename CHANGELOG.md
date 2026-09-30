@@ -6,8 +6,35 @@ The project follows semantic-style release numbering where practical. Research-m
 
 ## [Unreleased]
 
+## [0.8.4] — 2026-09-30
+
+Everything new in this release that changes sampling or adaptive decisions is behind a flag that is off by default, except where listed under "Changed — results-changing". None of the adaptive-CV2 machinery has run in production MD yet; the validation below is synthetic (T2) and retrospective replays on chignolin_9 / chignolin_7 (T3).
+
 ### Added
 
+- **Slowness-ranked CV2 selection** (`--cv-selection-rank slowness`, the new default for swarm CV selection; `gain` is the previous rule, byte-identical). Candidates are residual torsion PCs 1-6 plus conditional tICA modes 7-9 of the same CV1-residualised features; the slowest candidate that passes the R²/coupling gates, the gain floor, a fixed-CV1 lag-autocorrelation floor, a bimodality test and seed-family reproducibility is deployed. On chignolin_9's swarm it picks component 7 = psi(P4) + psi(D3).
+- **Adaptive λ ladder** (`--ap-ladder-adapt respace`): a per-centre MBAR over each centre's rungs predicts the overlap between any two λ values, and the ladder is respaced atomically at an epoch boundary to the fewest rungs whose adjacent overlaps all reach `--ap-ladder-min-overlap`.
+- **Applied-actions ledger** (all campaigns): each epoch records the actions it applied and the pre-action registry, so a job killed between the registry save and the summary write re-enters that epoch on the states that actually ran and never re-proposes.
+- **Adaptive-CV2 machinery** (spec `docs/superpowers/specs/2026-09-29-adaptive-cv2-resolution-design.md`):
+  - P1 layout headroom (`--swarm-adaptive-reserve-fraction`).
+  - P2 validate-then-apply action applier with recorded refusals.
+  - P4 paired (CV1, CV2) statistics in every diagnostics collector.
+  - P6 restraint-aware window identity.
+  - P7 one restraint-width neighbour rule (`--layout-neighbour-rule`).
+  - P8 decision rules frozen per campaign (`decision_settings.json`).
+  - 3.1 two-state MBAR edge metric (`--ap-edge-metric pairwise-mbar`).
+  - 3.2 shape-based CV2 swarm layout (`--swarm-cv2-layout shape`), with a mean-compression spring floor (k2 >= F'') and precision-space curvature shrinkage.
+  - 3.3 resolution actions (`--ap-cv2-resolution`): R1 CV2-gap bridges, R2 coverage holes, R3 mode resolution. R3 is flag-only by default (`--ap-refine-r3-mode`), counts crossings along each replica's path (`--ap-refine-transition-count replica-path`), and R2 counts same-column contributors (`--ap-coverage-count`).
+  - 3.4 CV2 coupling gate, 3.5 replica cap at phase start and per action, 3.6 CV2 labels and frozen-pair refit safety.
+  - 3.7 CV2-resolution tables and a "CV2 resolution" row in `gareus_report`.
+  - Respring (`--ap-cv2-respring`): re-derive a CV2 window's spring from its own production samples, as a new state.
+  - X3 slow-mode-aware reseeding, X5 effective-sample top-up allocation, X8 discovery census.
+- **Replica admission cap and MPS thread share** (`--active-replicas-per-gpu`, `--mps-active-thread-percentage`, off by default).
+- **Production phase timers** (`--production-phase-timers`).
+- **Output retention**: `--checkpoint-keep-generations`, a rotating `live_distances` ring for the monitor, `--prune-us-starting-structures`, and the `python -m gareus.retention` tools (prune, split-progress, archive/restore).
+- **Frozen-final extensions continue from end states** instead of re-grafting and re-pulling every window.
+- **Pairwise MBAR overlap graph over (CV1, CV2, λ)** in `gareus-analyze`.
+- **Low-memory adaptive analysis** (`gareus-analyze --low-memory`): disk-backed bias matrices and bounded GaMD/MBAR work blocks.
 - **Adaptive top-ups (`--ap-topups`, off by default).** A scheduled phase (numbered epoch or final) can now follow its all-state baseline with at most one lockstep top-up segment over the states a per-epoch union-MBAR solve finds deficient (local sigma above `--ap-topup-target-sigma`, or a per-state local split-halves drift test), plus their layout partners. The allocator picks one step length that brings the worst deficit to target, capped by `--ap-topup-max-fraction` of the phase's wall-hour budget; a per-state calibration correction learned from realised-vs-predicted sigma is clamped to [0.1, 2.0]. With top-ups on, each phase's baseline is shortened by that fraction to fund the top-up; in the final phase, when the top-up does not run (anything but completed or pool-skipped), the baseline is resumed to its full length so the withheld budget is not stranded. New knobs: `--ap-topup-target-sigma` (0.10 kcal/mol), `--ap-topup-weak-overlap` (0.15), `--ap-topup-max-fraction` (0.3), `--ap-topup-min-effect` (0.05 kcal/mol), `--ap-topup-max-edge-attempts` (2), `--ap-topup-throughput-table`, `--ap-topup-diagnostics-max-gb` (8.0).
 - **Top-up seeding continues each window from its own parent segment.** With top-ups on, every adaptive-production segment (baseline or top-up) exports a `final_window_states/` directory (top-ups off, or outside adaptive production: nothing is written — ~3 MB per State at 19k atoms) (an OpenMM `State` per window plus `index.json` recording restraint centres/k, CVs, and a write-order `export_seq`); a top-up loads the newest export per window across the phase's full ancestor chain and asserts the seed's restraint/CVs match the top-up's own window table. No pull runs inside a top-up. A window with a *missing* seed is dropped from the top-up before it launches (the top-up still runs for the rest); a restraint/CV *mismatch* discovered at runtime, or a corrupt/unreadable parent `index.json`, ends the *whole* top-up (never the campaign). A phase with no `epoch_window_map.csv` fails closed before it starts.
 - **Unmeasured overlap edges are never treated as weak**, in the per-epoch top-up gate, the campaign quality gate, action proposals, and reports alike — an edge with no measured sample overlap used to be read as "weak" in several of these paths, which could spend MD reacting to a number that was never actually measured.
@@ -23,6 +50,23 @@ The project follows semantic-style release numbering where practical. Research-m
 
 - A synthetic A/B study (four analytic 2D landscapes, a 112-state 28-centre x 4-rung ladder, 20 seeds; `docs/superpowers/specs/2026-09-24-effective-topups/synth_study/README.md`) found no budget on any landscape where the design's heterogeneous-deficit regime actually exists — at the rows floor the split-halves test needs, every uniform-baseline state is already at or under target. Reported for information only: top-ups lower the worst per-state sigma on two of four landscapes (gated-barrier -8.4%, 20/20 seeds; slow-cv2-double-branch -1.3%, 19/20) but improve PMF RMSE on none (gated-barrier 7% worse). Missing-bridge routing passes 20/20. The patch-vs-all-state exchange-partner penalty (kept deliberately) measured 1.19-1.26x. Top-ups are not shown to help in this harness; a real-MD comparison (chignolin_10) is the open test — see `docs/atlas-md/developer/topups-todo.md`.
 - The per-epoch union-MBAR solve top-ups add costs real memory on the driver node: 1,000,000 rows / 236 states took 102.7 s and peaked at 14.6 GB RSS; 250,000 rows took 26.4 s and 4.06 GB. An OOM kill during this solve cannot be caught, so a guard now skips it: after subsampling and before any rows x states matrix is allocated, the peak is estimated as kept rows x states x 8 B x 7.7; above `--ap-topup-diagnostics-max-gb` (default 8.0, about 550,000 kept rows at 236 states) the phase logs a WARNING with the estimate and runs no top-up (`no_diagnostics`).
+
+### Changed
+
+- Every adaptive-side MBAR solve (R2 coverage, the λ-ladder centre model) now uses gareus-analyze's solver (`gareus/adaptive/mbar_solve.py`, numba-anderson): chignolin_9's R2 solve dropped from 43 s to about 1 s with identical proposals.
+
+### Fixed
+
+- Geometry edges (`build_geometry_edges`) chained states that were not neighbours on 2D/sparse layouts; the whole pairwise weak-edge set on chignolin_9 came from this. This changes weak edges, bridge adds, retirement and the final connectivity gate on every 2D campaign (chignolin_9's final gate: 6 weak spatial edges -> 0).
+- Driver union MBAR uses each segment's native window centres; the epoch-0 CV decision is re-applied on every job of a chain; extension-round records survive interrupt summaries; stale extension-round diagnostics are refreshed on resume.
+- Ladder and window overlap are graded per (CV1, CV2) centre on 2D layouts, and index-adjacent window overlap only where index order is CV order.
+- `plan_topup` converted samples to steps with the report interval instead of the sample interval (10x on chignolin_9).
+- Low-memory `u_nk` out-of-memory in adaptive loading.
+
+### Validation (adaptive CV2)
+
+- Adaptive-CV2 T2 synthetic calibration and T3 chignolin_9/chignolin_7 replays: `docs/superpowers/specs/2026-09-29-adaptive-cv2-validation/` (`t2_synthetic.md` section 9, `t3_retrospective.md` section 10). R3 inserts gave no PMF benefit at matched budget, hence flag-only by default; the R2 block bootstrap under-reports its error 2-3x (re-solving f per replicate, `--ap-coverage-bootstrap resolve-f`, reduces this to 1.3-2x but is not calibrated and stays opt-in), hence `--ap-refine-pmf-sigma-kt` 0.25.
+- An adversarial review board (four models) judged the CV2-resolution branch ACCEPT-WITH-CHANGES; every condition was fixed or measured.
 
 ## [0.8.3] — 2026-09-24
 
