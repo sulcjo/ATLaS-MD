@@ -620,9 +620,11 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--ap-coverage-bootstrap", choices=("fixed-f", "resolve-f"), default="fixed-f",
                    help="R2: block bootstrap of a CV2 interval's free-energy sigma (--ap-refine-pmf-sigma-kt). "
                         "resolve-f re-solves the lambda = 0 MBAR on every replicate (gareus-analyze's solver, "
-                        "warm-started; ~1 min per epoch at 143k rows x 59 states); fixed-f holds the MBAR f "
-                        "at the point estimate, which misses the neighbouring windows' f uncertainty and "
-                        "reads ~3x too small (T2 9.9-9.10). Default fixed-f. Frozen with the decision settings.")
+                        "warm-started, 100 replicates; ~95 s per epoch at 143k rows x 59 states); fixed-f holds "
+                        "the MBAR f at the point estimate and misses the neighbouring windows' f uncertainty. "
+                        "Neither is calibrated (T2 9.10: median |error|/sigma 2.2-3.1 fixed-f, 1.3-2.0 resolve-f, "
+                        "0.67 ideal), so the default stays fixed-f with --ap-refine-pmf-sigma-kt 0.25. Frozen "
+                        "with the decision settings.")
     p.add_argument("--ap-refine-min-transitions", type=int, default=10,
                    help="R3: within-residence core-to-core CV2 transitions a bimodal window needs before "
                         "its modes get windows. Uncalibrated default.")
@@ -642,8 +644,9 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                         "blocks convergence; insert emits the insert action. Frozen with the decision settings.")
     p.add_argument("--ap-refine-pmf-sigma-kt", type=float, default=0.25,
                    help="R2: block-bootstrap sigma (kT) of a CV2 interval's free energy above which it is a "
-                        "hole. Default 0.25 (T2): the bootstrap holds the MBAR f fixed and reads ~2-3x below "
-                        "the true error, so 0.25 corresponds to roughly 0.6-0.75 kT of true error.")
+                        "hole. Default 0.25 (T2): the default bootstrap (--ap-coverage-bootstrap fixed-f) holds "
+                        "the MBAR f fixed and reads ~2-3x below the true error, so 0.25 corresponds to roughly "
+                        "0.6-0.75 kT of true error.")
     p.add_argument("--ap-refine-budget-fraction", type=_unit_interval_float, default=0.5,
                    help="Largest share of the reserve's free slots (after add_rung) resolution actions may "
                         "spend per epoch (spec 3.3: 0.5).")

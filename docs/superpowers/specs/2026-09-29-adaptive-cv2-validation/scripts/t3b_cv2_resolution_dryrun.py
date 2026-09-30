@@ -2,6 +2,7 @@
 
 Usage: python t3b_cv2_resolution_dryrun.py <adaptive_dir> <payload.json> <phase|final_combined> <out.json>
        [--union NPZ] [--transition-count replica|replica-path|state-series] [--r3-mode flag|insert] [--coverage-count any|same-column]
+       [--coverage-bootstrap fixed-f|resolve-f]
 Nothing under RUNS is written (the history is kept in memory, the report goes to out.json).
 """
 import json
@@ -21,9 +22,10 @@ reg = ap.WindowStateRegistry.load(adaptive_dir)
 count = sys.argv[sys.argv.index("--transition-count") + 1] if "--transition-count" in sys.argv else "replica-path"
 r3_mode = sys.argv[sys.argv.index("--r3-mode") + 1] if "--r3-mode" in sys.argv else "flag"
 cov_count = sys.argv[sys.argv.index("--coverage-count") + 1] if "--coverage-count" in sys.argv else "same-column"
+cov_boot = sys.argv[sys.argv.index("--coverage-bootstrap") + 1] if "--coverage-bootstrap" in sys.argv else "fixed-f"
 policy = ap.AdaptiveDecisionPolicy(cv2_resolution=True, edge_metric="pairwise-mbar", max_replicas_budget=236,
                                    refine_transition_count=count, refine_r3_mode=r3_mode,
-                                   coverage_count=cov_count)
+                                   coverage_count=cov_count, coverage_bootstrap=cov_boot)
 args = Namespace(temperature_k=300.0, cv2_k_min=0.0, cv2_k_max=1000.0, cv1_k_min=0.0)
 settings = cio.settings_from(policy, args)
 if phase == "final_combined":

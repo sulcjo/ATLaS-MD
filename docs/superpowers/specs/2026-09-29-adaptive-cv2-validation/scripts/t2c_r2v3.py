@@ -12,8 +12,14 @@ block rules:
 Then every (count, block rule, coverage_min_windows, refine_pmf_sigma_kT) combination's R2
 proposals (cv2_coverage._hole_runs / _hole_candidate, as coverage_holes does).
 
-``--resolve-f``: also a bootstrap that RE-SOLVES the lambda = 0 MBAR per replicate (g5 blocks,
-N_RESOLVE replicates), to attribute what the fixed-f bootstrap misses (diagnostic, not in gareus).
+``--resolve-f``: also the bootstrap that RE-SOLVES the lambda = 0 MBAR per replicate
+(``cv2_coverage.resolve_f_sigma``, the shipped ``--ap-coverage-bootstrap resolve-f``: g5 blocks,
+cov.N_BOOT = 100 replicates, warm-started from the point f), at both prefixes, as block rule
+``g5_resolve_f`` in the sigma records and the combos. (Before 9.10 this was a 40-replicate
+diagnostic re-implementation at the 2,000 prefix only.)
+
+MBAR: gareus-analyze's solver through ``cv2_coverage.solve_mbar`` (numba-anderson, tol 1e-12);
+before 9.10 L-BFGS + polish (``fast_mbar``), which agreed to ~1e-8.
 
 python t2c_r2v3.py OUT [--seeds 0 1 2 3] [--workers 8] [--scenarios ...] [--resolve-f]
 """
@@ -30,6 +36,7 @@ from pathlib import Path
 
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMBA_NUM_THREADS", "1")       # one thread per worker process
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, "/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler")
@@ -49,29 +56,9 @@ N_RESOLVE = 40
 
 
 def fast_mbar(u, n_k, f0=None, polish=20):
-    """MBAR f (f_0 = 0) by L-BFGS on the convex MBAR objective, then ``polish`` self-consistent
-    iterations (cv2_coverage.solve_mbar's update); agrees with solve_mbar to ~1e-8 at a
-    fraction of its cost (the fixed-point iteration needs ~5,000 sweeps here)."""
-    from scipy.optimize import minimize  # noqa: PLC0415
-    log_n = np.log(np.maximum(n_k, 1e-300))
-
-    def obj(x):
-        f = np.concatenate([[0.0], x])
-        a = log_n[:, None] + f[:, None] - u
-        top = a.max(axis=0)
-        e = np.exp(a - top)
-        s = e.sum(axis=0)
-        val = float(np.sum(top + np.log(s)) - np.dot(n_k, f))
-        grad = (e / s).sum(axis=1) - n_k
-        return val, grad[1:]
-    x0 = np.zeros(u.shape[0] - 1) if f0 is None else np.asarray(f0[1:], float)
-    res = minimize(obj, x0, jac=True, method="L-BFGS-B", options={"maxiter": 5000, "gtol": 1e-10, "ftol": 1e-15})
-    f = np.concatenate([[0.0], res.x])
-    for _ in range(int(polish)):
-        log_den = cov._logsumexp(log_n[:, None] + f[:, None] - u, axis=0)
-        f = -cov._logsumexp(-u - log_den[None, :], axis=1)
-        f -= f[0]
-    return f
+    """MBAR f (f_0 = 0) on (K, N) ``u`` with rows ordered by state: gareus-analyze's solver
+    (``cv2_coverage.solve_mbar``). ``polish`` is ignored (kept for the old call sites)."""
+    return cov.solve_mbar(u, n_k, f_init=f0)
 
 
 def _blocks(rule, sidx, cv1, cv2):
@@ -82,34 +69,9 @@ def _blocks(rule, sidx, cv1, cv2):
     return ids, {k: v for k, v in info.items() if k != "states"}
 
 
-def _resolve_sigma(u, n_k, sidx, blocks, cols_data, rng, f_full):
-    """sigma of each column interval's F over a block bootstrap that re-solves f per replicate."""
-    uniq, inv = np.unique(blocks, return_inverse=True)
-    rows_of = [np.flatnonzero(inv == b) for b in range(uniq.size)]
-    strata = {}
-    for b, key in enumerate(uniq):
-        strata.setdefault(int(key // 10 ** 7), []).append(b)
-    reps = [[] for _ in cols_data]
-    for _ in range(N_RESOLVE):
-        pick = np.concatenate([rows_of[b] for k, bl in strata.items() for b in rng.choice(bl, size=len(bl))])
-        nk = np.bincount(sidx[pick], minlength=n_k.size).astype(float)
-        f = fast_mbar(u[:, pick], nk, f0=f_full, polish=5)
-        lw = cov.log_weights(u[:, pick], nk, f)
-        w = np.exp(lw - lw.max())
-        for c, (slab_mask, bins, inside, n_int) in enumerate(cols_data):
-            ws = np.where(slab_mask[pick], w, 0.0)
-            tot = ws.sum()
-            part = np.bincount(bins[pick][inside[pick]], weights=w[inside[pick]], minlength=n_int)
-            with np.errstate(divide="ignore"):
-                reps[c].append(-np.log(part / tot) if tot > 0 else np.full(n_int, np.inf))
-    out = []
-    for r in reps:
-        r = np.asarray(r)
-        fin = np.isfinite(r)
-        with np.errstate(invalid="ignore"):
-            sd = np.nanstd(np.where(fin, r, np.nan), axis=0)
-        out.append(np.where(fin.mean(axis=0) >= 0.9, sd, np.inf))
-    return out
+def _resolve_sigma(u, sidx, blocks, cols_data, rng, f_full):
+    """sigma of each column interval's F over the shipped re-solved-f block bootstrap."""
+    return cov.resolve_f_sigma(np.ascontiguousarray(u.T), sidx, blocks, cols_data, f_full, rng, n_boot=cov.N_BOOT)
 
 
 def eval_prefix(sc, sim, n, seed, resolve_f):
@@ -134,9 +96,18 @@ def eval_prefix(sc, sim, n, seed, resolve_f):
     # so fixed20 reproduces the t2c jobs' sigma where the columns' weights agree
     rngs = {b: np.random.default_rng([3303, int(seed)]) for b in BLOCKS}
     cols, cols_data = [], []
-    for col in cov.columns(views, ids, base):
-        col = cov._extend_to_weight(col, cv1, cv2, w)
+    ext = [cov._extend_to_weight(col, cv1, cv2, w) for col in cov.columns(views, ids, base)]
+    rules = BLOCKS
+    if resolve_f:
+        t_rf = time.time()
+        resolved = _resolve_sigma(u, sidx, blocks["g5"][0], [cov.column_bins(c, cv1, cv2) for c in ext],
+                                  np.random.default_rng([cov._RESOLVE_SEED, int(seed)]), f)
+        t_rf = time.time() - t_rf
+        rules = BLOCKS + ("g5_resolve_f",)
+    for ci, col in enumerate(ext):
         stats = {}
+        if resolve_f:
+            stats["g5_resolve_f"] = resolved[ci]
         for b in BLOCKS:
             extra = {}
             frac, n_eff, n_any, sigma = cov._interval_stats(col, cv1, cv2, sidx, w, centre_of_state, rngs[b],
@@ -158,7 +129,7 @@ def eval_prefix(sc, sim, n, seed, resolve_f):
         combos = {}
         for cnt in COUNTS:
             nc = n_same if cnt == "same-column" else n_any
-            for b in BLOCKS:
+            for b in rules:
                 sigma = stats[b]
                 for cmw in MIN_WINDOWS:
                     for ps in SIGMAS:
@@ -181,14 +152,13 @@ def eval_prefix(sc, sim, n, seed, resolve_f):
         cols_data.append((slab, bins, inside, edges.size - 1))
         cols.append({"c1": col["c1"], "frac": frac.tolist(), "n_contrib_any": n_any.tolist(),
                      "n_contrib_same": n_same.tolist(), "err_kT": [None if not math.isfinite(x) else float(x) for x in err],
-                     "sigma": {b: [None if not math.isfinite(x) else float(x) for x in stats[b]] for b in BLOCKS},
+                     "sigma": {b: [None if not math.isfinite(x) else float(x) for x in stats[b]] for b in rules},
                      "in_hole": in_hole.tolist(), "combos": combos})
+    out = {"columns": cols, "blocks": {b: blocks[b][1] for b in BLOCKS}}
     if resolve_f:
-        rs = _resolve_sigma(u, n_k, sidx, blocks["g5"][0], cols_data, np.random.default_rng([4404, int(seed)]),
-                            f)
-        for c, s in zip(cols, rs):
-            c["sigma"]["g5_resolve_f"] = [None if not math.isfinite(x) else float(x) for x in s]
-    return {"columns": cols, "blocks": {b: blocks[b][1] for b in BLOCKS}}
+        out["resolve_f_wall_s"] = t_rf
+        out["resolve_f_shape"] = [int(u.shape[1]), int(u.shape[0])]
+    return out
 
 
 def job(a):
@@ -201,7 +171,7 @@ def job(a):
     sim = S.simulate(sc, regime, seed, max(PREFIXES), attempts_per_window=2.0)
     rec = {"scenario": name, "regime": regime, "seed": seed, "hole": sc.hole, "r2": {}}
     for p in PREFIXES:
-        rec["r2"][str(p)] = eval_prefix(sc, sim, p, seed, resolve_f and p == min(PREFIXES))
+        rec["r2"][str(p)] = eval_prefix(sc, sim, p, seed, resolve_f)
     rec["wall_s"] = time.time() - t0
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(rec, default=float))

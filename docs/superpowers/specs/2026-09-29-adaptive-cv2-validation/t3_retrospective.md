@@ -924,3 +924,38 @@ triggered window therefore gets k2' = F''_prod, and its predicted c is 0.5 by co
   - The epoch_002 run uses the final registry, as the 3.3 dry runs do.
   - No bootstrap over replicas, because the P4 NPZ carries no replica column. The blocks are
     time blocks of 5 g within a source.
+
+### 10.8 R2 on gareus-analyze's MBAR solver and the re-solved-f bootstrap (2026-09-30)
+
+Read-only, chignolin_9 final-combined, 143,513 lambda = 0 union rows x 59 states, 2 row sources.
+
+**Solver.** R2's own lambda = 0 MBAR now runs on gareus-analyze's `numba-anderson` backend
+(`cv2_coverage.solve_rows`, tol 1e-12, deterministic).
+- 0.8-1.1 s and 45 iterations, against 42.9 s and 320 sweeps for the old NumPy loop.
+- The old loop stopped 1.9e-7 from the answer. The new one is 7e-12 from a tol-1e-13 solve.
+- The shipped dry run (`t3b_cv2_resolution_dryrun.py final_combined --union`, same flags as
+  10.6) now takes 105 s, of which the union takes 6.7 s. In 10.6 it was 165 s, 56 s of it union.
+
+**R2 re-run, fixed-f (the default).** Same-column still proposes **3**, at the same intervals:
+- CV1 0.177 at CV2 -0.01..0.64
+- CV1 0.824 at -1.79..-1.14
+- CV1 0.889 at -1.79..-1.14
+
+Their sigmas are 0.0333 / 0.0635 / 0.1403 kT, equal to the 10.6 record to 3e-11.
+
+**R2 re-run, `--ap-coverage-bootstrap resolve-f`** (`t3e_r2_bootstrap_modes_c9.py`, plus the
+same dry run with `--coverage-bootstrap resolve-f`):
+- **Same 3 proposals.** Their sigmas are 0.037 / 0.060 / 0.114 kT, and the count rule still
+  decides them: 1 own-column centre, 3 in total.
+- **Over all 72 heavy intervals:** the resolve-f / fixed-f sigma ratio is 0.94 / 1.05 / 1.23
+  (q10 / q50 / q90). The largest sigma is 0.140 kT fixed-f and 0.136 kT resolve-f. No interval
+  exceeds 0.25 under either.
+- **Why so little changes:** with 143k rows over well-overlapping windows, the relative f are
+  determined far more tightly than the interval weights. The harness holes, where resolve-f
+  mattered (T2 9.10), were near-disconnected.
+- **Cost:** 100 replicates in 95 s (0.95 s each, median 46 iterations, max 68, 0 not
+  converged). The dry run grows from 105 s to 205 s. Peak RSS 1.12 GB against 1.06 GB.
+
+**Verdict for chignolin_10.** Resolve-f is affordable at this scale: about 1.5 min per epoch,
+0.26 % of c9 epoch_002's ~10.1 h wall clock. It would change nothing here, and in the harness
+it is not calibrated (T2 9.10). The default stays fixed-f with `refine_pmf_sigma_kt` 0.25.

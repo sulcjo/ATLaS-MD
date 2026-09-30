@@ -4,7 +4,10 @@ python t2c_r2v3_fpfn.py JOBS_DIR OUT.json
 """
 import json,glob,numpy as np,sys
 jobs=[json.load(open(p)) for p in glob.glob(sys.argv[1] + '/*.json')]
-K=['any|fixed20|2.0|0.5','any|fixed20|2.0|0.25','any|g5|2.0|0.25','same-column|g5|1.0|0.25','same-column|g5|2.0|0.5','same-column|g5|2.0|0.25','same-column|g5|3.0|0.25']
+K=['any|fixed20|2.0|0.5','any|fixed20|2.0|0.25','any|g5|2.0|0.25','same-column|g5|1.0|0.25','same-column|g5|2.0|0.5','same-column|g5|2.0|0.25','same-column|g5|3.0|0.25',
+   # resolve-f (T2 9.10; present when the jobs were run with --resolve-f)
+   'same-column|g5_resolve_f|2.0|0.25','same-column|g5_resolve_f|2.0|0.5','any|g5_resolve_f|2.0|0.5','any|g5_resolve_f|2.0|0.25']
+K=[k for k in K if k in jobs[0]['r2']['2000']['columns'][0]['combos']]
 out={}
 for k in K:
   row={}

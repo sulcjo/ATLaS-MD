@@ -2230,9 +2230,11 @@ under-resolved.  Only states restraining both axes above their floors
         --ap-refine-pmf-sigma-kt, gets a window at the interval centre. Bootstrap
         blocks are 5 x each state's autocorrelation time g (Geyer, max over its
         restrained axes; >= 5 blocks per state; never across a sample source).
-        --ap-coverage-bootstrap fixed-f (default): f held at the point MBAR estimate
-        (resolve-f re-solves the lambda = 0 MBAR per replicate;
-        gareus-analyze's numba-anderson solver, warm-started).
+        --ap-coverage-bootstrap fixed-f (default) holds the MBAR f at the point
+        estimate; resolve-f re-solves the lambda = 0 MBAR on every replicate
+        (gareus-analyze's numba-anderson solver, warm-started; ~95 s per epoch at
+        chignolin_9 scale). Neither is calibrated: median |error|/sigma 2.2-3.1
+        (fixed-f) and 1.3-2.0 (resolve-f) against 0.67 for a true sigma (T2 9.10).
     R3  mode resolution: a window whose CV2 samples show two mixture modes (depth
         >= 1 kT, both >= 10 %) AND >= --ap-refine-min-transitions core-to-core
         transitions (--ap-refine-transition-count: replica-path, default = each
