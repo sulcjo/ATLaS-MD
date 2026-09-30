@@ -1,4 +1,4 @@
-# T2 synthetic validation of the adaptive-CV2 spec (Sections 3.1, 3.4, 12 X3)
+# T2 synthetic validation of the adaptive-CV2 spec (Sections 3.1, 3.3, 3.4, 12 X3)
 
 Date 2026-09-29. Branch `val/t2-synthetic`, base `963742e`. Spec:
 `docs/superpowers/specs/2026-09-29-adaptive-cv2-resolution-design.md` (Section 5 T2).
@@ -18,7 +18,8 @@ No production decision code was changed. New code is in `gareus/synth/` and
 | X3 reseeding (6) | Modest gain where one-sidedness means trapping. On `hidden-slow-cv3-weak` the final 2D PMF error goes 0.38 → 0.31 kT and the CV2 PMF error 0.31 → 0.22 (5/6 seeds better). The side deviation drops 18 %. It is harmful where the hidden mode projects strongly onto CV2 (`hidden-slow-cv3`): about half of the reseeds push equilibrium-one-sided windows to their equilibrium-minority side, and the side deviation does not improve. |
 | Union memory (7) | Measured peak ≈ 0.8 GB + 55–58 B per (row × state) cell. `UNION_PEAK_BYTES_PER_CELL` assumes 61.6 B with no intercept. At 250k rows it underestimates by 7–11 %, and at 100k rows by 28–106 %. At the 8 GB guard this is about 0.3 GB over. The kept-row limit is 550k at 236 states, 477k at 272 (+15 % reserve), 406k at 320 and 325k at 400. |
 | Production bugs | (1) **`--ap-edge-metric pairwise-mbar` disables `retire_converged` entirely.** Reproducer is below; it is a strict-xfail test. (2) On a 2D grid the `primary_chain` in `build_geometry_edges` includes wrap-around edges from the top of one CV1 column to the bottom of the next. These are weak-eligible under both metrics and account for most of the bridges on `plateau-walls`. |
-| Not done | The end-to-end "double-branch resolved" assertion is written and skipped until 3.3 lands (R1–R3 do not exist; see Section 8). Nothing emulates the tICA estimate of the hidden mode or the `_non_neighbor_redundant_pairs` path. |
+| 3.3 knob calibration (Section 9, 2026-09-30) | **R3 crossing count.** Neither shipped estimator works under replica exchange (the harness's new `re` regime has residence about 2 samples, as on c9). `replica` passes 4/64 equilibrated bimodal windows at >= 10, so it is a safe off switch. `state-series` passes 100 % of equilibrated, mis-populated and spurious windows, so it does not discriminate. A replica-path count (not in `gareus/`) separates them (>= 50: 35/64 vs 0/15); on c9 epoch_002 it gives 22 / 12 / 21 for states 84 / 200 / 220. **4x cap.** It refused all 202 genuine 2-D R3 candidates (children need 13-27x) and let every hidden-cv3 candidate through (about 2.2x): the default's only inserts are spurious. At matched budget, inserts gave no PMF benefit (c9-like: +0.02-0.06 kT in 3/3 seeds, cap or not). Keep 4 until T4. **R2.** `refine_pmf_sigma_kT` 0.25 (bootstrap sigma is about 2.5x too small). `coverage_min_windows` 2 is structurally near-inert on 2-D grids (it counts neighbouring columns' windows); leave it. A real hole's added window cuts the hole PMF error from 0.75-0.96 to 0.09-0.16 kT. **`refine_min_sigma`** never binds. `refine_min_transitions` 10 is an absolute count and does not transfer between series lengths. |
+| Not done | The end-to-end "double-branch resolved" assertion is still skipped (Section 8). Nothing emulates the tICA estimate of the hidden mode or the `_non_neighbor_redundant_pairs` path. |
 
 ## 1. Methods
 
@@ -283,12 +284,355 @@ Kept-row capacity under the 8 GB default, with the budget implications for the P
 
 ## 8. Limits, and what remains after 3.3
 
-- Harness walkers do not exchange between windows (no replica exchange, no λ-ladder). Acceptance is an independent-sample two-window estimate. The CV2 slowness is set by D2/D3, not by a peptide.
+- Harness walkers do not exchange between windows in `gareus/synth` (no replica exchange, no λ-ladder). Acceptance is an independent-sample two-window estimate. The CV2 slowness is set by D2/D3, not by a peptide. Section 9's scripts (`scripts/t2c_sim.py`) add a Hamiltonian replica-exchange regime with recorded replica identity, used for the 3.3 calibration only. The campaign runner (`t2_campaign`) is unchanged.
 - The truth is equilibrium. For trapped windows (15 % of calibration grades) the analytic overlap is not what the samples can support. Those grades are reported separately.
 - The calibration uses the P4 stride subsample and blocking exactly as the collector does. The rates depend on the landscape mix: per-landscape FS at 0.15/200 is 2.7–8.2 %, FW 0–1.7 %.
 - Not emulated: the tICA hidden-mode estimate (X3), top-up union diagnostics mid-campaign, the λ-ladder, the segmented collector's multi-segment pooling (the adapter supports it; the campaigns use flat phases), and 3.2's shape layout.
-- **After 3.3:**
-  - Switch on `test_slow_cv2_double_branch_is_resolved_end_to_end`. It runs `slow-cv2-double-branch-asym:k2x4` in the low-N_eff regime (20 steps/sample, 3 seeds) against the tolerance above. Today it fails: 1/3 seeds resolved. That regime is budget-limited (see the no-action baseline in Section 3), so a 3.3 arm must be compared with the no-action arm at the same budget, not only with the absolute tolerance.
+- **After 3.3 (landed; Section 9 calibrated its knobs on the rules directly, not through a campaign):**
+  - Still to do: switch on `test_slow_cv2_double_branch_is_resolved_end_to_end`. It runs `slow-cv2-double-branch-asym:k2x4` in the low-N_eff regime (20 steps/sample, 3 seeds) against the tolerance above. Today it fails: 1/3 seeds resolved. That regime is budget-limited (see the no-action baseline in Section 3), so a 3.3 arm must be compared with the no-action arm at the same budget, not only with the absolute tolerance.
   - Re-run `t2_campaign` with a 3.3 arm. R1's shape-rule k2 at the saddle should cure the trapped midpoint bridges.
   - Re-run the controls to confirm R1–R3 add no actions on harmonic/stiff/plateau (after fixing item 2) and that R2 finds the narrow band.
   - Re-calibrate `min_edge_neff` once 3.1 retirement is on the same metric.
+
+## 9. Calibration of the 3.3 knobs (board condition 9, 2026-09-30)
+
+Branch `feat/cv2-resolution` at HEAD `aa1a9d2`. Nothing under `gareus/` was changed. The
+scripts live next to this file in `scripts/t2c_*.py`:
+
+- `t2c_sim.py`: scenarios, exact truth, the two regimes;
+- `t2c_eval.py`: the shipped R2/R3 code evaluated at every knob value;
+- `t2c_run.py`: the sweep driver;
+- `t2c_e2e.py`: matched-budget end-to-end runs;
+- `t2c_summarise.py` / `t2c_compact.py`: the reductions.
+
+The compact record is `t2_data/t2c_calibration.json`.
+
+**Compute.** The sweep was 136 jobs, 11.5 process-hours. The end-to-end runs added roughly
+another 6-10 process-hours. The machine was oversubscribed (load 15-20 on 24 cores), so
+process-hours overstate CPU time. The total is above the few-CPU-hours target; most of it went
+to the mixture fits, not the MD.
+
+### 9.1 Methods
+
+**Sample once, evaluate many.**
+
+- One job = (scenario, regime, seed). It runs 8,000 samples per window at 20 MALA steps per
+  sample, D = (1, 0.05[, 0.05]), and 4 seeds. R2 and R3 are evaluated on the 2,000-sample prefix
+  and on the full run.
+- R3: `cv2_resolution_rules.propose_r3` runs with `refine_min_transitions` = 0, so every
+  window that passes the mixture test reaches the spring code. It records both shipped crossing
+  counts, and `r3_gate`, `core_bounds` and the child springs. Thresholds, estimator and growth
+  cap are then applied post hoc.
+  - A child is refused at growth g iff its compression-floor k2 (= F''_est at c = 0.5) exceeds
+    g x parent k2. That is `child_spring`'s `k2_capped_below_compression`.
+- R2: its own per-column statistics (`cov.columns`, `_extend_to_weight`, `_interval_stats`)
+  are computed once. The two knobs change only the flag test, which uses `_hole_runs` and
+  `_hole_candidate`.
+- Units: the 3.3 code runs at temperature_k = 1/R, so RT = 1 in harness kBT.
+
+**Regimes.**
+
+- `indep`: one chain per window, as in Sections 1-5.
+- `re`: Hamiltonian replica exchange.
+  - After every sample, 2 x n_windows random neighbour-pair swap attempts are made (adjacent
+    CV2 rows within a CV1 column, adjacent columns within a row), with Metropolis acceptance on
+    the two bias energies.
+  - Each window keeps exactly one walker, and replica identity is recorded per (sample, window)
+    like the production Parquet `replica` column.
+  - Median residence was 2.0 samples per (replica, window) stay, and swap acceptance 0.33.
+    chignolin_9 epoch_002, measured on the Parquet, is 2.5-2.6 samples per stay for states
+    84 / 200 / 220.
+- The runs provider hands R3 the state series as `state_runs` and each replica's contiguous
+  residences as `replica_runs`, as `parquet_runs_provider` does.
+
+**Candidate estimator (not in `gareus/`): the replica-path count.**
+
+- Take each replica's samples at the state in time order, joined across its absences.
+- Count core-to-core label changes between consecutive visits.
+- A swap relabels a window but never moves coordinates, so every counted change is a real
+  crossing by that replica's own dynamics. The crossing may have happened while the replica sat
+  in another window.
+- Within a single source it would be computable from today's Parquet.
+
+**Truth**, from the analytic surface by quadrature.
+
+- *Exact-resolvable window.* The exact within-window CV2 density has a pair of peaks at least
+  1 kT above the valley between them, with basin masses of at least 10 %. This is R3's own test,
+  applied to the exact density.
+- *E (equilibrated) / T (mis-populated).* For an exact-resolvable window that passes the mixture
+  test: the sampled lower-basin population, as ln-odds at the exact valley, lies within
+  0.5 kT (E) or not (T) of exact.
+- *S (spurious).* A mixture pass on a window with no exact resolvable pair.
+
+**Scenarios.**
+
+- Pre-registered before any run:
+  - controls: harmonic-bowl, stiff-bowl, plateau-walls, and dbl-gap (the k2x4 double branch,
+    an R1 case);
+  - R3: dbl-saddle (a CV2 row on the 6 kBT saddle), gated-barrier and narrow-band;
+  - c9-like-narrow: a broad N(0.25, 0.30) plus narrow N(1.2, 0.12) CV2 mode pair at every CV1,
+    under c9's soft k2 of 1.98 kBT. This mimics epoch_002 state 84's fit.
+  - hidden-cv3 and hidden-cv3-weak (3D), with cv3 starting at alternating ±1.
+- Changed after measurement, which is stated here:
+  - The first R2 constructions dropped the centre window(s) of one CV1 column
+    (harmonic-drop1, plateau-drop1). They were measured *not* to be holes: the PMF error there
+    was <= 0.15 kT, because the adjacent columns' windows, 1.5 sigma_w1 away, cover the cell. So
+    they were reclassified as controls.
+  - The row gaps (harmonic-rowgap, plateau-rowgap: the middle CV2 rows removed in every column)
+    turned out not to be holes either. The PMF error in the gap was 0.14-0.20 kT, because the
+    remaining rows' tails cover it.
+  - The plateau-hardgap-k20/k30/k45 scenarios were added after the first sweep. They are the
+    plateau with CV2 rows at ±0.6 only, at k2 = 20 / 30 / 45, so the gap centre sits
+    3.6 / 5.4 / 8.1 kT up each spring. This is the real R2 test: sampled, but thinly.
+
+### 9.2 R3 crossing count: replica vs state-series (and replica-path)
+
+R3 pass counts, windows passing / windows in class, at the full 8,000 samples and 4 seeds.
+Under `indep` all three estimators are identical, because there are no swaps.
+
+| Regime | Estimator | min 5 (E / T / S) | min 10 | min 20 | min 50 |
+|---|---|---|---|---|---|
+| indep | any | 24/26, 8/16, 6/11 | 24/26, 6/16, 6/11 | 23/26, 6/16, 4/11 | 0/26, 1/16, 0/11 |
+| re | replica (default) | 13/64, 0/15, 2/5 | 4/64, 0/15, 1/5 | 0/64, 0/15, 0/5 | 0 / 0 / 0 |
+| re | state-series | 64/64, 15/15, 5/5 | 64/64, 15/15, 5/5 | 64/64, 15/15, 5/5 | 64/64, 15/15, 5/5 |
+| re | replica-path | 61/64, 11/15, 5/5 | 52/64, 9/15, 5/5 | 41/64, 9/15, 4/5 | 35/64, 0/15, 0/5 |
+
+At the 2,000-sample prefix the pattern is the same, with lower counts:
+
+- re replica: 0/51 E at >= 5;
+- state-series: 51/51 E and 25/25 T at >= 50;
+- replica-path at >= 10: E 27/51, T 6/25, S 0/8.
+
+Crossings are given as q10 / median / q90 at 8,000 samples.
+
+- **indep.**
+  - E: 19 / 32 / 40, i.e. 4 per 1,000 samples.
+  - T: 1 / 4 / 38.
+- **re.**
+  - E, replica: 0 / 1 / 8.
+  - E, state-series: 979 / 1,414 / 1,998 (about 170 per 1,000 samples, the swap rate).
+  - E, replica-path: 6 / 168 / 203.
+  - T, replica-path: 0 / 24 / 37.
+
+**Verdict.** Neither shipped estimator works under exchange.
+
+- **`replica` is inert.** With residences of about 2 samples it almost never reaches any
+  threshold >= 5, so every bimodal window is flagged `trapped_or_orthogonal`. This is the
+  chignolin_9 behaviour: 5 / 0 / 5 crossings.
+- **`state-series` does not discriminate at all.** It counts swap-induced label changes, so it
+  passes every E, T and S window at every threshold up to 100. It would let every mis-populated
+  or spurious bimodal window through to the spring code.
+  - It is kept as an option, but it should not be used as the R3 trigger. This confirms the
+    board's condition 3.
+- **Keep `replica` as the default, knowing it is a safe off switch under exchange, not a
+  calibrated trigger.**
+- **The replica-path count is the only estimator here that separates E from T under exchange.**
+  - At >= 10 it passes 52/64 E vs 9/15 T; at >= 50, 35/64 E vs 0/15 T.
+  - It also passes the 5 spurious windows, all on hidden-cv3 (corner windows at CV2 -0.45 /
+    +0.45). Their replicas' own labels change 15-35 times. So replica-path counting guards
+    against swap relabelling, not against hidden-mode bimodality.
+  - On chignolin_9 epoch_002 it gives 22 / 12 / 21 for states 84 / 200 / 220
+    (`t3_retrospective.md` 10.4, `t2_data/t3c_replica_path_c9.json`). So at >= 10 all three
+    would reach the spring code, and there they are refused by the cap.
+  - It is recommended for implementation and for a T4 test.
+
+### 9.3 `refine_min_transitions` (10)
+
+- **It is an absolute count, so it does not transfer between series lengths.**
+  - Under `indep`, >= 10 passes 3/9 E at 2,000 samples but 24/26 at 8,000.
+  - Equilibrated windows crossed at about 4 per 1,000 samples here. c9's epoch_002 has 2,750
+    rows per state.
+- **Separation of E from T is weak at any threshold without exchange.** At 8,000 samples:
+  - >= 10 gives 92 % of E and 38 % of T;
+  - >= 20 gives 88 % / 38 %;
+  - >= 50 removes everything.
+  - T windows cross tens of times and are still mis-populated: the crossings exist but are too
+    few for the population.
+- **Recommendation.** Keep 10 on the replica-path count. Better, express it as a rate against
+  the series (crossings per effective sample, or >= 10 and a population ln-odds bootstrap below
+  0.5 kT), which needs a code change.
+- **What the harness cannot give** is a single absolute number that is right for c9's series
+  lengths.
+
+### 9.4 `MAX_K2_GROWTH` (4x parent k2)
+
+The growth an R3 child needs to reach the compression floor is F''_mode / k2_parent, reported
+as q10 / median / q90 over the passing windows:
+
+| Scenario | Growth needed | Refused at 4x | Refused at 32x |
+|---|---|---|---|
+| c9-like-narrow | 18-20 / 24-27 / 29-31 | 110/110 | 5/110 |
+| dbl-saddle | 11-14 / 13-16 / 18-22 | 38/38 | 0 |
+| gated-barrier | 10-13 / 14-17 / 18-21 | 73/73 | 0 |
+| hidden-cv3 | 1.9-2.4 / 2.2-2.5 / 2.2-2.8 | 0/34 | 0 |
+| chignolin_9 epoch_002 (84 / 200 / 220) | 25.8 / 6.2 / 18.6 | 3/3 | 0 |
+
+The synthetic ranges span the four (regime, N) cells. "Refused" counts are over every R3
+candidate that passed the mixture gate, spurious ones included. The genuine (exact-resolvable)
+candidates on the three 2-D landscapes are 202, all refused at 4x.
+
+- **The cap and the compression floor are nearly always incompatible for a genuinely bimodal
+  window.** A parent soft enough to span two modes has k2 far below each mode's own curvature.
+- So at 4x the cap refused every candidate on the three 2-D landscapes whose CV2 modes are real
+  (202/202, and all 3 on c9). It let through every hidden-cv3 candidate, whose children need
+  only about 2.2x.
+- The only R3 inserts the default configuration produces in the harness are on hidden-cv3: 5
+  windows at indep/8,000 and 1 at re/8,000. That is the case the spec wants flagged, not
+  inserted.
+- The cap is therefore not protective in the intended direction. It acts as an off switch for
+  real modes.
+
+**End to end, at matched budget** (`indep` regime; epoch 1 of 4,000 samples; epoch 2 spends
+2 x 4,000 per parent):
+
+- *None*: the budget goes to the existing windows.
+- *Forced*: the children are inserted at min(shape rule, 4x parent), ignoring the refusal.
+- *Uncapped*: the children are inserted at the shape rule (median child k2 36-70, maximum
+  57-117).
+
+The metric is the column-slab CV2 PMF (low-F-weighted RMSE vs exact) and the mode-population
+ln-odds error. Columns within a seed share one base run, so the seed is the unit (n = 3).
+
+| Scenario (parents per seed) | Arm | Delta RMSE vs none (kT), per seed | Delta population error (kT), per seed |
+|---|---|---|---|
+| c9-like-narrow (4, 7, 7) | forced | +0.022, +0.040, +0.059 | +0.006, +0.099, +0.166 |
+| c9-like-narrow | uncapped | +0.051, +0.063, +0.024 | +0.130, +0.144, +0.012 |
+| gated-barrier (3, 1, 4) | forced | +0.039, -0.018, -0.002 | +0.213, +0.021, -0.042 |
+| gated-barrier | uncapped | +0.024, -0.016, +0.008 | +0.187, -0.054, -0.177 |
+| dbl-saddle (3, 0, 1) | forced / uncapped | +0.004 / +0.003, +0.006 / +0.008 | +0.011 / +0.009, -0.020 / -0.020 |
+
+The no-action column RMSE is 0.107 kT (c9-like), 0.095 (gated) and 0.189 (dbl-saddle).
+
+- Child-parent exact pairwise overlap is 0.03-0.49 uncapped and 0.04-0.49 forced (c9-like:
+  0.15-0.49 / 0.25-0.49).
+- Parents are every mixture-passing window, with no crossing requirement.
+  - On c9-like, 16 of the 18 have >= 10 crossings; the >= 10 subset gives the same signs.
+  - The dbl-saddle and gated parents have 1-28 crossings, mostly 1-4, so most are not R3
+    candidates as shipped.
+
+- **No benefit was measured.** On c9-like-narrow the inserts made the column PMF worse in all 3
+  seeds, both arms (+0.02 to +0.06 kT on 0.11). They also made the mode populations worse in
+  all 6 seed-arms (+0.01 to +0.17 kT). On gated-barrier and dbl-saddle the differences are
+  mixed and small.
+- **This measures R3's cost, not its value.**
+  - The harness modes are smooth Gaussians with no within-mode structure for children to
+    resolve.
+  - A child restrained to one mode adds no crossings, while the parent, which carries the
+    population ratio, loses samples to it.
+  - So "no benefit on these landscapes" is supported; a general "R3 makes things worse" is
+    not.
+- **Recommendation.** Keep 4. It is not calibrated, but with R3 inserts effectively off it does
+  no harm, and no insert has shown a benefit. Revisit together with the replica-path estimator
+  in T4. If R3 is to act on real modes, the cap should be relative to the compression floor
+  (for example, allow up to max(4 k2_parent, F''_mode)), not a multiple of the parent spring.
+  That is a code change, not a knob value.
+
+### 9.5 `refine_min_sigma` (0.1)
+
+- **It never binds.** Children's sigma_target is 0.38-0.75 in harness CV2 units (q10-q90,
+  74-168 children per cell), or 0.72-1.87 x the parent's sigma_w. On c9 it is 0.57-0.73.
+  0 of the children fall below 0.05, 0.1 or 0.2.
+- **It is in absolute CV units**, so a harness value would not transfer anyway.
+- Since R3 splits only resolvable pairs (depth >= 1 kT, modes merged below 0.5 sampled sigma),
+  sigma_target = (separation)/1.5 is naturally >= about 0.5 sigma_w.
+- **Recommendation.** Leave it, or redefine it relative to the parent (for example
+  0.25 sigma_w,parent). It is inert either way today.
+
+### 9.6 R2: `coverage_min_windows` (2) and `refine_pmf_sigma_kt` (0.5)
+
+The table gives hole columns hit (6 columns x 4 seeds = 24 per scenario), then false-positive
+proposals over all non-hole scenarios. Each column reads: indep 2,000 / indep 8,000 /
+re 2,000 / re 8,000.
+
+| (min windows, sigma) | hardgap-k20 | hardgap-k30 | hardgap-k45 | row gaps | FP proposals (where) |
+|---|---|---|---|---|---|
+| (2, 0.5) default | 3 / 0 / 0 / 0 | 6 / 0 / 2 / 0 | 22 / 14 / 17 / 13 | 0 | 0 / 0 / 1 / 0 (hidden-cv3) |
+| (2, 0.25) | 4 / 0 / 0 / 0 | 24 / 3 / 19 / 0 | 24 / 23 / 24 / 23 | 0 | 2 / 1 / 3 / 1 (hidden-cv3) |
+| (2, 1.0) | 3 / 0 / 0 / 0 | 2 / 0 / 0 / 0 | 17 / 6 / 12 / 8 | 0 | 0 / 0 / 1 / 0 |
+| (2, inf): contributor rule only | 3 / 0 / 0 / 0 | 2 / 0 / 0 / 0 | 15 / 3 / 10 / 6 | 0 | 0 / 0 / 1 / 0 |
+| (1, 0.5): sigma rule only, in effect | 0 / 0 / 0 / 0 | 4 / 0 / 2 / 0 | 22 / 13 / 17 / 13 | 0 | 0 |
+| (3, 0.5) | 11 / 7 / 7 / 7 | 13 / 8 / 9 / 8 | 24 / 21 / 23 / 18 | 2+2 / 1 / 0 / 0 | 1 / 1 / 2 / 9 (hidden-cv3, dbl-gap) |
+
+There were 0 proposals on the harmonic, stiff, plateau and both drop1 controls at every
+setting. The dbl-gap control (an R1 case) gets 1-6 proposals, at min windows 3 only.
+
+**End to end** (`indep`, 2,000-sample epoch plus one 2,000-sample window per proposal, against
+the same budget on the existing windows). The metric is the hole-interval CV2 PMF RMSE, mean
+over the 6 columns, given per seed as none -> add:
+
+| Scenario | (2, 0.5) default | (2, 0.25) | (3, 0.5) |
+|---|---|---|---|
+| hardgap-k45 | 0.75 -> 0.10, 0.75 -> 0.14, 0.96 -> 0.13 | 0.76 -> 0.09, 0.75 -> 0.13, 0.92 -> 0.11 | 0.75 -> 0.10, 0.75 -> 0.15, 0.89 -> 0.13 |
+| hardgap-k30 | 0.39 -> 0.20, (0 proposals, 0.25), 0.24 -> 0.19 | 0.26 -> 0.12, 0.24 -> 0.15, 0.35 -> 0.13 | 0.33 -> 0.26, 0.25 -> 0.17, 0.35 -> 0.16 |
+| hardgap-k20 | 0.25 -> 0.19, (0, 0.19), 0.20 -> 0.20 | 0.25 -> 0.19, (0, 0.19), 0.19 -> 0.17 | 0.21 -> 0.19, 0.19 -> 0.13, 0.19 -> 0.15 |
+
+Every proposal fell inside the pre-registered hole interval.
+
+- **R2 works when a hole is real, and the added window repairs it.** At k45 the hole PMF error
+  goes from 0.75-0.96 kT to 0.09-0.16.
+- **The contributor rule is structurally near-inert on a 2-D grid.**
+  - It counts every centre that contributes >= 10 % of an interval's weight, including windows
+    of the neighbouring CV1 columns. Their samples reach the slab when CV1 spacing is about
+    1.5 sigma_w1.
+  - So heavy intervals have 2-4 contributors (q10-q90), and fewer than 2 in 0-1.7 % of them.
+  - chignolin_9 has the same geometry (`t3_retrospective.md` 10.2): 58 of 72 heavy intervals
+    draw a contributor from another column. Same-column contributors are 1-3.
+  - Raising the threshold to 3 finds more of the moderate holes (k20/k30: 7-13 of 24) but adds
+    proposals on dbl-gap (1-6) and hidden-cv3.
+  - A same-column count would be the meaningful quantity. It is a code change and is not
+    calibrated here.
+- **The sigma rule is the working trigger, but today's bootstrap sigma is about 2.4-3.0x too
+  small.**
+  - Median |F_est - F_exact| / sigma over about 1,870 heavy intervals is 2.4-3.0, and the q90 is
+    9-13. The q90 is dominated by trapped landscapes, where the error is bias that no bootstrap
+    sees.
+  - So sigma > 0.5 fires only when the true error is about 1.2-1.5 kT. It caught 1-4 % of the
+    intervals whose true error exceeded 0.5 kT; sigma > 0.25 caught 5-14 %.
+  - This matches Section 2's under-coverage: the blocks are short relative to tau.
+
+**Recommendations.**
+
+- `refine_pmf_sigma_kT` **0.25 with today's bootstrap**, which is roughly 0.6-0.75 kT of true
+  error.
+  - At 2,000 samples it raises moderate-hole (k30) detection from 2-6 to 19-24 of 24 columns,
+    and it halves the k30 hole error end to end.
+  - The cost is 1-3 sigma-driven proposals per 4 runs on hidden-cv3, with interval errors of
+    0.12-0.38 kT.
+  - The alternative is to keep 0.5 and fix the bootstrap block length (blocks of several tau).
+    Then the knob would mean what it says.
+- `coverage_min_windows` **2 (unchanged)**. The data do not support 3 as a default. Redefine it
+  to count same-column centres before calibrating it further.
+- **At 8,000 samples every setting finds fewer moderate holes** (k30: 0-3 of 24 at 0.25). The
+  sampling closes them, so a lower detection rate there is not a false negative in PMF terms:
+  the k30 hole error is <= 0.25 kT by then (not re-measured end to end at 8,000).
+
+### 9.7 False positives and false negatives in one place
+
+- **Controls.** The R3 mixture gate passed 2 of 1,552 control window-evaluations (harmonic-bowl
+  and harmonic-drop1, indep/2,000). Both were then refused at the cap. R2 made 0 proposals on
+  the harmonic / stiff / plateau / drop1 controls at every setting. It made 1-6 on dbl-gap, at
+  `coverage_min_windows` 3 only.
+- **R3 false negatives before any knob.** Of the exact-resolvable windows, the mixture gate
+  passed:
+
+  | Scenario | indep/8,000 | re/8,000 |
+  |---|---|---|
+  | c9-like-narrow | 29/40 | 35/40 |
+  | dbl-saddle | 5/20 | 12/20 |
+  | gated-barrier | 8/28 | 22/28 |
+
+  The misses are `member_support` and `no_density_minimum`: a slowly mixing window shows one
+  mode per time block. Exchange raises member support, because walkers bring both modes in.
+  narrow-band has no exact-resolvable window under its layout: the narrow band never reaches
+  1 kT depth inside a soft window, with depth 0.3-0.75 kT at any tested centre and k2.
+- **R3 false negatives after the knobs, at the defaults (replica, 10, 4x).** Every genuine
+  candidate ends refused or flagged. R3 inserts nothing on any 2-D landscape.
+
+### 9.8 What the harness cannot answer
+
+- Whether R3 children help on a real peptide, where modes have internal structure. It needs T4.
+- The absolute `refine_min_transitions` for c9-length series.
+- Whether the replica-path estimator behaves on the λ-ladder. The harness has no rungs, and
+  replicas cross rungs in production.
+- How a same-column R2 contributor rule would behave.
+- R1 is not exercised here: the dbl-gap control is its case, and Sections 3 and 7 cover it.

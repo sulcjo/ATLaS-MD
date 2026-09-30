@@ -1,0 +1,54 @@
+{
+ "phase": "epoch_002",
+ "report": "/home/sulcjo/.claude/jobs/45d68034/tmp/c9fix/after/dry_epoch_002.json",
+ "states": {
+  "84": {
+   "decision": "flagged",
+   "gate": "transitions_below_min",
+   "core_bounds": [
+    0.7569810555438059,
+    0.8705132662754813
+   ],
+   "report_transitions": 5,
+   "report_state_series": 370,
+   "replica_residence": 5,
+   "state_series": 370,
+   "replica_path": 22,
+   "n_rows": 2750,
+   "n_replicas": 54,
+   "mean_residence_samples": 2.5022747952684257
+  },
+  "200": {
+   "decision": "flagged",
+   "gate": "transitions_below_min",
+   "core_bounds": [
+    0.6269196545470693,
+    0.8658269832441788
+   ],
+   "report_transitions": 0,
+   "report_state_series": 469,
+   "replica_residence": 0,
+   "state_series": 469,
+   "replica_path": 12,
+   "n_rows": 2750,
+   "n_replicas": 103,
+   "mean_residence_samples": 2.5749063670411987
+  },
+  "220": {
+   "decision": "flagged",
+   "gate": "transitions_below_min",
+   "core_bounds": [
+    0.7922595626955622,
+    0.9305122728485598
+   ],
+   "report_transitions": 5,
+   "report_state_series": 458,
+   "replica_residence": 5,
+   "state_series": 458,
+   "replica_path": 21,
+   "n_rows": 2750,
+   "n_replicas": 105,
+   "mean_residence_samples": 2.55338904363974
+  }
+ }
+}
