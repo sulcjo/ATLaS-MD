@@ -63,6 +63,7 @@ FINAL_LABEL = "final_combined"
 FINAL_DIAGNOSTICS = "adaptive_final_combined_diagnostics.json"
 EPOCH_DIAGNOSTICS = "adaptive_epoch_diagnostics.json"
 REPORT_NAME = "cv2_resolution_report.json"          # mirrors cv2_resolution.REPORT_NAME
+RESPRING_REPORT_NAME = "cv2_respring_report.json"    # mirrors cv2_respring.REPORT_NAME
 
 # Overlap-space stamps. The first two mirror gareus.mbar_analysis.pmf.OVERLAP_SPACE_MARGINAL /
 # _JOINT (and gareus_report's copies) so one vocabulary covers pmf_summary and this table.
@@ -325,8 +326,11 @@ def resolve_temperature(diagnostics: Mapping[str, Any], report: Optional[Mapping
 def build_summary(diagnostics: Mapping[str, Any], report: Optional[Mapping[str, Any]] = None, *,
                   label: str, registry_rows: Optional[Mapping[int, Mapping[str, Any]]] = None,
                   temperature_k: Optional[float] = None,
-                  sources: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
-    """The phase's CV2-resolution table. Pure: reads its arguments only."""
+                  sources: Optional[Mapping[str, Any]] = None,
+                  respring: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+    """The phase's CV2-resolution table. Pure: reads its arguments only. ``respring`` (a
+    ``cv2_respring_report.json``, --ap-cv2-respring) adds a ``respring`` block and the counts
+    ``n_respring_proposed`` / ``n_respring_unresolved``; without one the table is unchanged."""
     reg = registry_rows or {}
     temp, temp_src = resolve_temperature(diagnostics, report, temperature_k)
     em = diagnostics.get("edge_metric")
@@ -343,12 +347,19 @@ def build_summary(diagnostics: Mapping[str, Any], report: Optional[Mapping[str, 
         "status": report.get("status"), "epoch": report.get("epoch"), "stage": report.get("stage"),
         "rules": {k: (v or {}).get("status") for k, v in (report.get("rules") or {}).items()},
         "summary": report.get("summary"), "budget_mode": (report.get("budget") or {}).get("mode")}
-    return {"schema_version": SCHEMA_VERSION, "label": label,
-            "sources": {**dict(sources or {}), "diagnostics_schema": diagnostics.get("schema_version"),
-                        "report_status": (report or {}).get("status")},
-            "temperature_k": temp, "temperature_source": temp_src, "definitions": DEFINITIONS,
-            "edge_metric": em_rec, "report": rep_rec, "counts": _counts(states, edges, em, report),
-            "states": states, "edges": edges}
+    out = {"schema_version": SCHEMA_VERSION, "label": label,
+           "sources": {**dict(sources or {}), "diagnostics_schema": diagnostics.get("schema_version"),
+                       "report_status": (report or {}).get("status")},
+           "temperature_k": temp, "temperature_source": temp_src, "definitions": DEFINITIONS,
+           "edge_metric": em_rec, "report": rep_rec, "counts": _counts(states, edges, em, report),
+           "states": states, "edges": edges}
+    if respring is not None:
+        summ = respring.get("summary") or {}
+        out["respring"] = {"status": respring.get("status"), "epoch": respring.get("epoch"), "summary": summ}
+        out["counts"].update(n_respring_proposed=int(summ.get("n_proposed", 0) or 0),
+                             n_respring_unresolved=int(summ.get("n_unresolved", 0) or 0),
+                             respring_status=respring.get("status"))
+    return out
 
 
 # ---- I/O --------------------------------------------------------------------------------
@@ -469,18 +480,31 @@ def summarise(label: str, diagnostics_path: Path, report_path: Optional[Path], j
     return summary
 
 
+def latest_respring_report(adaptive_dir: Path) -> Optional[Path]:
+    """The newest numbered epoch's ``cv2_respring_report.json`` (respring runs in numbered
+    epochs only), or None."""
+    found = []
+    for d in Path(adaptive_dir).glob("epoch_*"):
+        m = re.match(r"^epoch_(\d+)$", d.name)
+        if m and (d / RESPRING_REPORT_NAME).is_file():
+            found.append((int(m.group(1)), d / RESPRING_REPORT_NAME))
+    return max(found)[1] if found else None
+
+
 def write_epoch_summary(epoch_dir: Path, diagnostics: Mapping[str, Any]) -> Optional[Path]:
     """Driver hook (``--ap-cv2-resolution`` only, after the apply): the epoch's summary next to
-    its 3.3 report. Never raises."""
+    its 3.3 report (and its respring report, when one exists). Never raises."""
     try:
         epoch_dir = Path(epoch_dir)
         report_path = epoch_dir / REPORT_NAME
         report = _read_json(report_path)
         reg = load_registry_rows(epoch_dir.parent)
+        respring = _read_json(epoch_dir / RESPRING_REPORT_NAME)
         summary = build_summary(diagnostics, report, label=epoch_dir.name, registry_rows=reg,
                                 sources={"diagnostics": str(epoch_dir / EPOCH_DIAGNOSTICS),
                                          "report": str(report_path) if report is not None else None,
-                                         "registry": str(epoch_dir.parent / "state_registry.csv") if reg else None})
+                                         "registry": str(epoch_dir.parent / "state_registry.csv") if reg else None},
+                                respring=respring)
         path = epoch_dir / SUMMARY_NAME
         write_summary(summary, path)
         return path
@@ -507,7 +531,12 @@ def write_final_combined_summary(adaptive_dir: Path, diagnostics: Mapping[str, A
                    "registry": str(adaptive_dir / "state_registry.csv") if reg else None}
         if report is not None:
             sources["report_carried_from"] = Path(report_path).parent.name
-        summary = build_summary(diagnostics, report, label=FINAL_LABEL, registry_rows=reg, sources=sources)
+        respring_path = latest_respring_report(adaptive_dir)
+        respring = _read_json(respring_path)
+        if respring is not None:
+            sources["respring_carried_from"] = Path(respring_path).parent.name
+        summary = build_summary(diagnostics, report, label=FINAL_LABEL, registry_rows=reg, sources=sources,
+                                respring=respring)
         path = default_json_path(adaptive_dir, FINAL_LABEL)
         write_summary(summary, path)
         return path

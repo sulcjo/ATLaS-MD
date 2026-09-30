@@ -322,6 +322,17 @@ def centre_key(state: dict) -> tuple:
             round(float(sc), 6) if on2 else None, on2)
 
 
+def _centre_spring_key(state: dict) -> tuple:
+    """``centre_key`` plus the restrained springs: a re-sprung centre (``--ap-cv2-respring``:
+    same centres, new k2, new state ids) is a different Hamiltonian, so its samples never pool
+    with the retired centre's. Rungs of one centre share their springs, so without a respring
+    this groups exactly as ``centre_key``."""
+    key = centre_key(state)
+    ks = tuple(round(float(state.get(f)), 9) if on and state.get(f) is not None else None
+               for f, on in (("primary_k", key[1]), ("secondary_k", key[3])))
+    return key + ks
+
+
 def phase_dirs(adaptive_dir, *, names: Optional[Sequence[str]] = None) -> List[tuple]:
     """``(phase_dir, window_map_path)`` for every campaign phase with Parquet samples.
 
@@ -383,7 +394,7 @@ def load_centre_rung_samples(phases: Sequence[tuple], registry_states: Sequence[
             lam = round(float(st.get("gamd_lambda") or 0.0), 9)
             vp = grp["v_pep_kj_mol"].to_numpy(dtype=float, na_value=np.nan)
             vd = grp["v_dih_kj_mol"].to_numpy(dtype=float, na_value=np.nan)
-            acc.setdefault(centre_key(st), {}).setdefault(lam, []).append((vp, vd))
+            acc.setdefault(_centre_spring_key(st), {}).setdefault(lam, []).append((vp, vd))
     return {k: {lam: (np.concatenate([a for a, _ in parts]), np.concatenate([b for _, b in parts]))
                 for lam, parts in rungs.items()} for k, rungs in acc.items()}
 

@@ -2273,6 +2273,30 @@ transition count, R3 mode, coverage count and pmf-sigma defaults follow the T2
 calibration (t2_synthetic.md 9, 9.9); refine-min-transitions and refine-min-sigma are
 uncalibrated.
 
+Respring (--ap-cv2-respring, off by default; independent of --ap-cv2-resolution).
+The shape layout sets k2 from the swarm's F''_est; production can disagree by ~1.6x
+(chignolin_9: realised compression 0.35-0.73 instead of 0.5). After each numbered epoch,
+every active CV2-restrained window on the representative rung (lambda = 0; CV1-free X7 /
+CV2-only windows included; anchors, CV1-only, mandatory, protected, already re-sprung and
+windows another action of this epoch retires/splits/inserts at are skipped) is measured
+from its own samples: F''_prod = RT/var(CV2) - k2 (P4 full-series variance) and
+c_real = k2/(k2 + F''_prod) = var/sigma_w^2, with a 5-95 % block-bootstrap interval
+(blocks of 5 x g, the X5 CV2 autocorrelation time, never across a source). A window with
+>= --ap-respring-min-neff (200) effective samples whose WHOLE interval is below 0.5 -
+--ap-respring-tolerance (0.05) gets k2' = max(RT/sigma_t^2 - F''_prod, F''_prod)
+(sigma_t = layout_plan.json cv2_shape.sigma_w_target, else the sampled sd, which gives
+k2' = F''_prod: predicted c = 0.5), capped by --cv2-k-max and the coupling gate. It
+becomes ONE action: a new centre at the same (c1, k1, c2) with k2' on every rung, and the
+old centre retired on every rung (net 0 states; retired states keep their samples in the
+union MBAR). Refused: k2_capped_below_compression, below_k_min, no_change (within
+--ap-respring-k2-rtol, 0.10), and the applier's duplicate/mandatory codes; at most
+--ap-respring-max-fraction (0.25) of the centres per epoch (the most under-compressed
+first; the rest deferred). F''_prod <= 0 (var >= RT/k2) is recorded, never acted on, and
+over-stiff windows are only flagged. Never blocks the convergence gate; the new state
+seeds from the old one's frames. Report: epoch_NNN/cv2_respring_report.json
+(cv2_respring_report_v1); with --ap-cv2-resolution also on, the 3.7 table carries the
+counts and the row grades unresolved under-compressed windows CAUTION.
+
 Reporting (spec 3.7). One table per phase from files that already exist:
     python -m gareus.adaptive.cv2_resolution_summary RUNS/<run>/adaptive_production [--out DIR]
 writes cv2_resolution_summary.json (cv2_resolution_summary_v2) + _states.csv/_edges.csv

@@ -647,6 +647,24 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--ap-refine-min-sigma", type=float, default=0.1,
                    help="Smallest target sampled CV2 sigma (CV2 units) of a new R1-R3 window. Uncalibrated "
                         "default.")
+    p.add_argument("--ap-cv2-respring", action=argparse.BooleanOptionalAction, default=False,
+                   help="Re-derive CV2 springs from production samples (off by default). After each numbered "
+                        "epoch, a CV2-restrained window whose realised mean compression k2/(k2 + F''_prod), "
+                        "F''_prod = RT/var(CV2) - k2 from its own samples, lies below the shape rule's 0.5 minus "
+                        "--ap-respring-tolerance over its whole block-bootstrap interval gets a new centre with "
+                        "k2' from the shape rule on F''_prod (old centre retired on every rung; net 0 states). "
+                        "Report epoch_NNN/cv2_respring_report.json. Frozen decision rule.")
+    p.add_argument("--ap-respring-min-neff", type=float, default=200.0,
+                   help="Respring: effective CV2 samples (n / g, X5 g) a window needs before its spring is "
+                        "re-derived. Uncalibrated default.")
+    p.add_argument("--ap-respring-tolerance", type=float, default=0.05,
+                   help="Respring: act only when the whole c_real interval is below 0.5 minus this. Uncalibrated.")
+    p.add_argument("--ap-respring-max-fraction", type=_unit_interval_float, default=0.25,
+                   help="Respring: most windows re-sprung per epoch, as a fraction of the active centres "
+                        "(at least 1 when > 0); the most under-compressed go first, the rest are deferred.")
+    p.add_argument("--ap-respring-k2-rtol", type=float, default=0.10,
+                   help="Respring: a new k2 within this relative distance of the old one is refused (no_change); "
+                        "the same tolerance makes a different k2 at the same centre a different window.")
     p.add_argument("--ap-topups", action=argparse.BooleanOptionalAction, default=False,
                    help="Top-ups (off by default): --no-ap-topups runs each scheduled phase as a single "
                         "all-state baseline only. --ap-topups adds, after that baseline, at most one "
@@ -1712,6 +1730,11 @@ def _shim_adaptive_production(args: argparse.Namespace) -> None:
     args.adaptive_production_refine_budget_fraction = args.ap_refine_budget_fraction
     args.adaptive_production_refine_protect_epochs = args.ap_refine_protect_epochs
     args.adaptive_production_refine_min_sigma = args.ap_refine_min_sigma
+    args.adaptive_production_cv2_respring = args.ap_cv2_respring
+    args.adaptive_production_respring_min_neff = args.ap_respring_min_neff
+    args.adaptive_production_respring_tolerance = args.ap_respring_tolerance
+    args.adaptive_production_respring_max_fraction = args.ap_respring_max_fraction
+    args.adaptive_production_respring_k2_rtol = args.ap_respring_k2_rtol
     args.adaptive_production_min_edge_neff = args.ap_min_edge_neff
     args.adaptive_production_topup_target_sigma = args.ap_topup_target_sigma
     args.adaptive_production_topup_weak_overlap = args.ap_topup_weak_overlap

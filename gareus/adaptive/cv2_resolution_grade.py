@@ -25,8 +25,10 @@ Rule (stated in the row text):
              rule asked for was not placed), R3 windows flagged only (r3_flag_only, 3.3 report
              v3 with --ap-refine-r3-mode flag: bimodal with enough crossings and placeable
              children, recorded instead of inserted -- the modes are real but unresolved by
-             windows), or an edge-metric / 3.3-report error. None of the CAUTIONs blocks the
-             convergence gate.
+             windows), under-compressed windows respring left unresolved
+             (``n_respring_unresolved``, only when a ``cv2_respring_report.json`` was carried:
+             refused, capped or deferred), or an edge-metric / 3.3-report / respring-report
+             error. None of the CAUTIONs blocks the convergence gate.
   PASS    -- none of those. NA -- a CV1-only table with no graded edges and no 3.3 report.
 """
 from __future__ import annotations
@@ -82,11 +84,14 @@ def _issues(c: Mapping[str, Any], connectivity_failed: bool) -> tuple:
                               ("n_refused_spring_cap", "window(s) refused at the spring cap "
                                "(k2_capped_below_compression)", cautions),
                               ("n_r3_flag_only", "R3 window(s) flagged only (r3_flag_only: would get two "
-                               "windows in --ap-refine-r3-mode insert)", cautions)):
+                               "windows in --ap-refine-r3-mode insert)", cautions),
+                              ("n_respring_unresolved", "under-compressed window(s) left un-resprung "
+                               "(--ap-cv2-respring: refused, capped or deferred)", cautions)):
         n = int(c.get(key) or 0)
         if n > 0:
             bucket.append(f"{n} {text}")
-    for key, what in (("edge_metric_status", "edge metric"), ("report_status", "3.3 report")):
+    for key, what in (("edge_metric_status", "edge metric"), ("report_status", "3.3 report"),
+                      ("respring_status", "respring report")):
         if c.get(key) == "error":
             cautions.append(f"{what} error")
     return fails, cautions
