@@ -811,3 +811,151 @@ have < 1 % union weight within one predicted sigma: they are extrapolated.
 - Bimodal windows make F''_loc an average curvature.
 - All comparisons are at lambda = 0.
 - The swarm side is one replay with no error bar.
+
+### 10.6 Report v3 on chignolin_9 (follow-ups (h), 2026-09-30)
+
+Read-only dry runs through the shipped code (`scripts/t3b_cv2_resolution_dryrun.py`, v3
+defaults: `--ap-refine-transition-count replica-path`, `--ap-refine-r3-mode flag`,
+`--ap-coverage-count same-column`, `refine_pmf_sigma_kt` 0.25; outputs outside RUNS, compact
+record in `t2_data/t2c_r2v3.json` under `c9`).
+
+- **epoch_002 R3, replica-path.** States 84 / 200 / 220: replica-path **22 / 12 / 21**, the
+  same numbers as `t3c_replica_path_c9.py` (10.4), with identical core bounds (e.g. 84:
+  0.75698 / 0.87051) and the other two counts recomputed alongside (replica 5 / 0 / 5,
+  state-series 370 / 469 / 458). At >= 10 all three pass the transition gate and reach the
+  spring code, where the 4 x 1.18 cap refuses them `k2_capped_below_compression` (would_be
+  refused; flag mode changes nothing for a refusal). So the epoch_002 CAUTION changes cause:
+  3 trapped_or_orthogonal (v2 default) -> 3 spring-cap refusals (v3 default). 36 other windows
+  no_action; 0 actions; 61 s.
+- **final-combined R2 on the 143,513 lambda = 0 union rows.** Row sources from
+  `adaptive_union_mbar.samples.csv` (2 sources); bootstrap g median 1.8 rows (q10 1.2, q90 4.0:
+  the builder already thinned them), no state at the 5-block guard, 1 g fallback. `any`: 0
+  proposals, as in 10.2. `same-column`: 3 proposals -- CV1 0.177 at CV2 -0.01..0.64 (18 % of
+  that slab's weight), 0.824 and 0.889 at -1.79..-1.14 (10 % / 6 %) -- each interval with 3
+  contributing centres in total but only 1 of its own column, and bootstrap sigma 0.03-0.14 kT.
+  These are the geometric proposals T2 9.9 describes (the neighbouring columns cover the
+  interval); the sigma rule at 0.25 fires nowhere. 165 s total, 56 s union.
+- For chignolin_10: flag-only R3 cannot insert; same-column R2 at 2 would spend reserve on
+  intervals like these three. If that is unwanted, `--ap-coverage-count any` (or
+  `--ap-coverage-min-windows 1`) restores the near-inert count rule; the choice is frozen per
+  campaign.
+
+### 10.7 Respring dry run on chignolin_9 (`--ap-cv2-respring`, 2026-09-30)
+
+Script: `scripts/t3d_respring_dryrun.py`. It is read-only and runs the shipped
+`cv2_respring_io.propose_respring` with the default knobs:
+
+- min n_eff 200;
+- tolerance 0.05, so a window triggers when the upper end of its c_real interval is below 0.45;
+- per-epoch cap 0.25 x 59 centres = 14.
+
+g is the X5 CV2 inefficiency over the phase's Parquet sources. The payloads are the replayed P4
+ones from 10.2. The compact record is `t2_data/t3d_respring_c9.json`. After both runs,
+`find RUNS/chignolin_9 -newer <stamp>` returned nothing.
+
+**What this measures.** c9's CV2 springs are the uniform k2 = 1.18, not a shape design. So this
+measures how far the uniform spring sits from the shape rule's 0.5 compression. It does not
+measure how a shape layout's springs are realised; that is 10.5.
+
+c9's `layout_plan.json` has no `cv2_shape` record, so the sigma target is the sampled sd. Every
+triggered window therefore gets k2' = F''_prod, and its predicted c is 0.5 by construction.
+
+| | epoch_002 | final-combined |
+|---|---|---|
+| candidates (CV2-restrained, lambda = 0) | 43 (39 2-D + 4 CV2-only) | 43 |
+| X5 g (CV2), median [min, max] | 4.5 [3.0, 10.5] | 6.9 [3.3, 24.9] |
+| n_eff, median [min] | 613 [261] | 5,590 [1,561] |
+| c_real, median (10-90 %) [range] | 0.52 (0.40-0.61) [0.32-0.70] | 0.44 (0.37-0.56) [0.30-0.59] |
+| F''_prod, median [range] | 1.10 [0.50, 2.57] | 1.53 [0.83, 2.72] |
+| 90 % interval width of c_real, median | 0.082 | 0.049 |
+| point c_real < 0.5 / < 0.45 | 20 / 11 | 30 / 24 |
+| triggered (whole interval < 0.45) | 6 | 20 |
+| proposed at the default cap (14) | 6 | 14 (6 deferred) |
+| k2', median [range] | 1.86 [1.70, 2.57] | 1.83 [1.60, 2.72] |
+| k2' / k2, median [range] | 1.57 [1.44, 2.17] | 1.55 [1.36, 2.30] |
+| over-compressed flags / F''_prod <= 0 | 0 / 0 | 0 / 0 |
+| wall time (X5 included) | 1.5 s | 15 s |
+
+- **Where.** 15 of the 20 final-combined triggers are on the two outer CV2 rows: 8 at -1.851 and
+  7 at +1.348. There the landscape is stiff and the window means sit far inside their centres.
+  - 3 triggers are at 0.281 and 2 at -0.785.
+  - The CV1 = 0.070 column triggers on both of its lower rows (80, 192; c_real 0.30 / 0.33).
+  - None of the 4 CV1-free CV2-only windows (64-76) triggers.
+- **epoch_002 vs final-combined.** epoch_002 triggers 6 windows: 80, 108, 128 and 152 at -1.851,
+  192 and 196. The final-combined payload has about 9x more samples and triggers 20, a superset.
+  A confident-only rule acts on more windows as its intervals shrink.
+- **The final-combined intervals are conservative.** Its P4 subsample stride is 20 (n = 38,812,
+  about 1,940 kept rows), while g is 3.3-24.9. So the bootstrap blocks are 1-7 rows, and the
+  bootstrap sees about n / stride nearly independent rows instead of n_eff = n / g. The ratio is
+  0.8-6.2, median 2.9, so the c_real intervals are up to about 1.7x too wide in the median.
+  - Point estimates are unaffected. The bias is in the safe direction: fewer triggers.
+  - With correctly sized intervals, more of the 24 windows whose point c_real is below 0.45 would
+    trigger.
+  - epoch_002 is consistent: its stride is 2, and n_eff / (n / stride) is 0.19-0.66.
+  - A live epoch with a large P4 stride would show the same bias.
+- **Cross-check with 10.5.** It uses the same final-combined payload.
+  - The conditional F''_prod equals t3c's F''_loc for all 39 2-D windows (ratio 1.000 at every
+    quantile). This uses the same payload and the same formula, so it checks arithmetic and
+    wiring only; it is not independent evidence.
+  - The marginal F''_prod, which is the value the rule decides on, is 0.91-1.00 of it (median
+    0.996).
+  - By t3c's point values, 27 of the 39 would sit below 0.5 under k2 = 1.18. The interval rule
+    acts on 20.
+- **Independent check of the compression premise (payload only, `t2_data/t3d_respring_c_mean_check.json`).**
+  c_real is read from the variance under a harmonic assumption. It can also be read from the means:
+  c_mean = (window CV2 mean - z0)/(c2 - z0), where z0 is the CV2 mean of the same column's
+  CV1-only (k2 = 0) window. The check uses 34 2-D windows; 5 have |c2 - z0| < 0.3 and are
+  excluded.
+  - The two correlate at 0.72.
+  - Over all 34: c_mean median 0.50 (10-90 % 0.41-0.59), c_real 0.42 (0.37-0.57).
+  - Over the 18 triggered windows among them: c_mean 0.45 (range 0.32-0.53), and 14 of the 18 are
+    below 0.5.
+  - So the variance proxy reads about 0.05 lower than the mean-based measure. For 4 triggered
+    windows the independent measure says the target is already reached.
+  - The check itself assumes that the CV1-only window's mean is the column's unbiased CV2 mean,
+    and that the displacement is harmonic.
+- **Cost to the layout (predicted, not measured).** At k2' = F''_prod, the sampled CV2 sd of a
+  triggered window shrinks by sqrt((k2 + F'')/(2 F'')). That is 0.85-0.93x on c9. Its CV2
+  neighbour overlaps drop accordingly, and the next epoch's 3.1 metric re-grades those edges.
+- **Not measured.**
+  - Whether k2' actually realises 0.5. That needs MD. The prediction assumes F'' is unchanged as
+    the window narrows, and a bimodal window's F''_prod is an average curvature.
+  - The lambda > 0 rungs. The rule reads lambda = 0 only and replicates k2' onto every rung.
+  - The epoch_002 run uses the final registry, as the 3.3 dry runs do.
+  - No bootstrap over replicas, because the P4 NPZ carries no replica column. The blocks are
+    time blocks of 5 g within a source.
+
+### 10.8 R2 on gareus-analyze's MBAR solver and the re-solved-f bootstrap (2026-09-30)
+
+Read-only, chignolin_9 final-combined, 143,513 lambda = 0 union rows x 59 states, 2 row sources.
+
+**Solver.** R2's own lambda = 0 MBAR now runs on gareus-analyze's `numba-anderson` backend
+(`cv2_coverage.solve_rows`, tol 1e-12, deterministic).
+- 0.8-1.1 s and 45 iterations, against 42.9 s and 320 sweeps for the old NumPy loop.
+- The old loop stopped 1.9e-7 from the answer. The new one is 7e-12 from a tol-1e-13 solve.
+- The shipped dry run (`t3b_cv2_resolution_dryrun.py final_combined --union`, same flags as
+  10.6) now takes 105 s, of which the union takes 6.7 s. In 10.6 it was 165 s, 56 s of it union.
+
+**R2 re-run, fixed-f (the default).** Same-column still proposes **3**, at the same intervals:
+- CV1 0.177 at CV2 -0.01..0.64
+- CV1 0.824 at -1.79..-1.14
+- CV1 0.889 at -1.79..-1.14
+
+Their sigmas are 0.0333 / 0.0635 / 0.1403 kT, equal to the 10.6 record to 3e-11.
+
+**R2 re-run, `--ap-coverage-bootstrap resolve-f`** (`t3e_r2_bootstrap_modes_c9.py`, plus the
+same dry run with `--coverage-bootstrap resolve-f`):
+- **Same 3 proposals.** Their sigmas are 0.037 / 0.060 / 0.114 kT, and the count rule still
+  decides them: 1 own-column centre, 3 in total.
+- **Over all 72 heavy intervals:** the resolve-f / fixed-f sigma ratio is 0.94 / 1.05 / 1.23
+  (q10 / q50 / q90). The largest sigma is 0.140 kT fixed-f and 0.136 kT resolve-f. No interval
+  exceeds 0.25 under either.
+- **Why so little changes:** with 143k rows over well-overlapping windows, the relative f are
+  determined far more tightly than the interval weights. The harness holes, where resolve-f
+  mattered (T2 9.10), were near-disconnected.
+- **Cost:** 100 replicates in 95 s (0.95 s each, median 46 iterations, max 68, 0 not
+  converged). The dry run grows from 105 s to 205 s. Peak RSS 1.12 GB against 1.06 GB.
+
+**Verdict for chignolin_10.** Resolve-f is affordable at this scale: about 1.5 min per epoch,
+0.26 % of c9 epoch_002's ~10.1 h wall clock. It would change nothing here, and in the harness
+it is not calibrated (T2 9.10). The default stays fixed-f with `refine_pmf_sigma_kt` 0.25.

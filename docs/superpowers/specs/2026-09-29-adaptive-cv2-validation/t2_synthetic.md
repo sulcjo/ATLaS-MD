@@ -550,18 +550,22 @@ The no-action column RMSE is 0.107 kT (c9-like), 0.095 (gated) and 0.189 (dbl-sa
 
 ### 9.6 R2: `coverage_min_windows` (2) and `refine_pmf_sigma_kt` (0.5)
 
+Re-measured 2026-09-30 with R2's MBAR on gareus-analyze's solver (9.10): only hardgap-k45 and
+the aggregate sigma calibration moved (the old fixed-point loop stopped up to ~6e-6 from the
+answer, which mattered on the near-disconnected k45 hole); the pre-9.10 values are in git.
+
 The table gives hole columns hit (6 columns x 4 seeds = 24 per scenario), then false-positive
 proposals over all non-hole scenarios. Each column reads: indep 2,000 / indep 8,000 /
 re 2,000 / re 8,000.
 
 | (min windows, sigma) | hardgap-k20 | hardgap-k30 | hardgap-k45 | row gaps | FP proposals (where) |
 |---|---|---|---|---|---|
-| (2, 0.5) default | 3 / 0 / 0 / 0 | 6 / 0 / 2 / 0 | 22 / 14 / 17 / 13 | 0 | 0 / 0 / 1 / 0 (hidden-cv3) |
+| (2, 0.5) default | 3 / 0 / 0 / 0 | 6 / 0 / 2 / 0 | 21 / 15 / 17 / 13 | 0 | 0 / 0 / 1 / 0 (hidden-cv3) |
 | (2, 0.25) | 4 / 0 / 0 / 0 | 24 / 3 / 19 / 0 | 24 / 23 / 24 / 23 | 0 | 2 / 1 / 3 / 1 (hidden-cv3) |
-| (2, 1.0) | 3 / 0 / 0 / 0 | 2 / 0 / 0 / 0 | 17 / 6 / 12 / 8 | 0 | 0 / 0 / 1 / 0 |
-| (2, inf): contributor rule only | 3 / 0 / 0 / 0 | 2 / 0 / 0 / 0 | 15 / 3 / 10 / 6 | 0 | 0 / 0 / 1 / 0 |
-| (1, 0.5): sigma rule only, in effect | 0 / 0 / 0 / 0 | 4 / 0 / 2 / 0 | 22 / 13 / 17 / 13 | 0 | 0 |
-| (3, 0.5) | 11 / 7 / 7 / 7 | 13 / 8 / 9 / 8 | 24 / 21 / 23 / 18 | 2+2 / 1 / 0 / 0 | 1 / 1 / 2 / 9 (hidden-cv3, dbl-gap) |
+| (2, 1.0) | 3 / 0 / 0 / 0 | 2 / 0 / 0 / 0 | 16 / 7 / 11 / 8 | 0 | 0 / 0 / 1 / 0 |
+| (2, inf): contributor rule only | 3 / 0 / 0 / 0 | 2 / 0 / 0 / 0 | 14 / 4 / 9 / 6 | 0 | 0 / 0 / 1 / 0 |
+| (1, 0.5): sigma rule only, in effect | 0 / 0 / 0 / 0 | 4 / 0 / 2 / 0 | 21 / 14 / 17 / 13 | 0 | 0 |
+| (3, 0.5) | 11 / 7 / 7 / 7 | 13 / 8 / 9 / 8 | 23 / 21 / 23 / 18 | 2+2 / 1 / 0 / 0 | 1 / 1 / 2 / 9 (hidden-cv3, dbl-gap) |
 
 There were 0 proposals on the harmonic, stiff, plateau and both drop1 controls at every
 setting. The dbl-gap control (an R1 case) gets 1-6 proposals, at min windows 3 only.
@@ -572,14 +576,14 @@ over the 6 columns, given per seed as none -> add:
 
 | Scenario | (2, 0.5) default | (2, 0.25) | (3, 0.5) |
 |---|---|---|---|
-| hardgap-k45 | 0.75 -> 0.10, 0.75 -> 0.14, 0.96 -> 0.13 | 0.76 -> 0.09, 0.75 -> 0.13, 0.92 -> 0.11 | 0.75 -> 0.10, 0.75 -> 0.15, 0.89 -> 0.13 |
+| hardgap-k45 | 0.80 -> 0.10, 0.75 -> 0.14, 0.99 -> 0.13 | 0.81 -> 0.09, 0.75 -> 0.13, 0.96 -> 0.11 | 0.81 -> 0.10, 0.75 -> 0.15, 0.94 -> 0.13 |
 | hardgap-k30 | 0.39 -> 0.20, (0 proposals, 0.25), 0.24 -> 0.19 | 0.26 -> 0.12, 0.24 -> 0.15, 0.35 -> 0.13 | 0.33 -> 0.26, 0.25 -> 0.17, 0.35 -> 0.16 |
 | hardgap-k20 | 0.25 -> 0.19, (0, 0.19), 0.20 -> 0.20 | 0.25 -> 0.19, (0, 0.19), 0.19 -> 0.17 | 0.21 -> 0.19, 0.19 -> 0.13, 0.19 -> 0.15 |
 
 Every proposal fell inside the pre-registered hole interval.
 
 - **R2 works when a hole is real, and the added window repairs it.** At k45 the hole PMF error
-  goes from 0.75-0.96 kT to 0.09-0.16.
+  goes from 0.75-0.99 kT to 0.09-0.15.
 - **The contributor rule is structurally near-inert on a 2-D grid.**
   - It counts every centre that contributes >= 10 % of an interval's weight, including windows
     of the neighbouring CV1 columns. Their samples reach the slab when CV1 spacing is about
@@ -593,11 +597,11 @@ Every proposal fell inside the pre-registered hole interval.
     calibrated here.
 - **The sigma rule is the working trigger, but today's bootstrap sigma is about 2.4-3.0x too
   small.**
-  - Median |F_est - F_exact| / sigma over about 1,870 heavy intervals is 2.4-3.0, and the q90 is
-    9-13. The q90 is dominated by trapped landscapes, where the error is bias that no bootstrap
+  - Median |F_est - F_exact| / sigma over about 1,870 heavy intervals is 2.3-3.0, and the q90 is
+    9-14. The q90 is dominated by trapped landscapes, where the error is bias that no bootstrap
     sees.
   - So sigma > 0.5 fires only when the true error is about 1.2-1.5 kT. It caught 1-4 % of the
-    intervals whose true error exceeded 0.5 kT; sigma > 0.25 caught 5-14 %.
+    intervals whose true error exceeded 0.5 kT; sigma > 0.25 caught 4-14 %.
   - This matches Section 2's under-coverage: the blocks are short relative to tau.
 
 **Recommendations.**
@@ -644,5 +648,252 @@ Every proposal fell inside the pre-registered hole interval.
 - The absolute `refine_min_transitions` for c9-length series.
 - Whether the replica-path estimator behaves on the λ-ladder. The harness has no rungs, and
   replicas cross rungs in production.
-- How a same-column R2 contributor rule would behave.
+- How a same-column R2 contributor rule would behave (answered in 9.9).
 - R1 is not exercised here: the dbl-gap control is its case, and Sections 3 and 7 cover it.
+
+### 9.9 Re-runs for report v3 (follow-ups (h), 2026-09-30)
+
+What changed in `gareus/` (all behind `--ap-cv2-resolution`, frozen decision settings):
+`--ap-refine-r3-mode` (default `flag`), `--ap-refine-transition-count replica-path` (new
+default), `--ap-coverage-count` (default `same-column`), bootstrap blocks from the
+autocorrelation time, and `refine_pmf_sigma_kt` 0.25. Scripts: `scripts/t2c_r2v3.py`
+(R2 only: no mixture fits), `t2c_r2v3_summarise.py`, `t2c_r2v3_fpfn.py`; data
+`t2_data/t2c_r2v3.json`. Same 17 scenarios x 2 regimes x 4 seeds as 9.1 (136 jobs, 7.4 min
+wall on 8 workers, about 1 CPU-hour; the resolve-f subset below 2 min). The MBAR f is solved
+by L-BFGS on the MBAR objective plus self-consistent polish instead of the fixed-point loop
+(which needs ~5,000 sweeps and stops ~6e-6 from the optimum here), so the re-run is not
+bit-identical to 9.6: with the bootstrap RNG consumed column after column as in `t2c_eval`,
+1,459 of 1,568 column-prefix cells reproduce 9.6's fixed-20 sigma to 1e-6 (q99 relative
+difference 2.9 %, max 21 %), and the (2, 0.5) / (3, 0.5) hole-hit rows match 9.6 to within
+one column except k45 indep/8,000 (15 vs 14) and k45 indep/2,000 (21 vs 22). Since 9.10 both
+scripts use gareus-analyze's solver; 9.6 re-measured reads 21 / 15 there, and this section's tables
+reproduce exactly (they were already converged to well below their rounding).
+
+**Replica-path count.** `gareus` now has it (`cv2_resolution_rules._transitions`,
+`cv2_resolution_io._runs_one_source`): per (source, segment, replica), the replica's finite
+CV2 at the state in step order, joined across its absences, never broken at a step gap. It
+reproduces `t2c_eval.replica_path_count` (test) and, on chignolin_9 epoch_002 through the
+shipped dry run (`t3b_cv2_resolution_dryrun.py`, default flags), 22 / 12 / 21 for states
+84 / 200 / 220 with identical core bounds (replica 5 / 0 / 5, state-series 370 / 469 / 458).
+Ordering, by construction and pinned by tests: replica <= replica-path and replica <=
+state-series (a residence is a contiguous piece of both; joining pieces only adds label
+changes). replica-path and state-series are **not** ordered: two walkers fixed in opposite
+modes with alternating residences give state-series > 0 = replica-path, and a state series
+A A B B whose two replicas each go A -> B gives state-series 1 < replica-path 2.
+
+**R3 flag-only.** With replica-path at >= 10 all three c9 windows reach the spring code and
+are refused `k2_capped_below_compression` (would_be refused) -- in `flag` mode as in `insert`,
+so c9 epoch_002 moves from 3 trapped_or_orthogonal to 3 spring-cap refusals, both CAUTION.
+A window that would have been inserted is `flagged` / `r3_flag_only` (no action, no budget,
+never blocking; CAUTION in 3.7). The harness has no new R3 numbers: 9.2-9.4 stand.
+
+**Bootstrap block length: the premise was wrong.** The harness series' own g (Geyer, per
+state, max over CV1/CV2) is median 31-33 samples under `indep` and 7-8 under `re`, so the
+pre-v3 blocks (2,000/20 = 100 and 8,000/20 = 400 rows) were already longer than 2 g in most
+states. Blocks of ceil(5 g) rows (>= 5 per state; the guard bound 268 of 1,024 state-prefix
+cells at indep/2,000, 0 at re/8,000) barely move the calibration. Heavy intervals (>= 2 %),
+n = 1,860-1,884 per cell; a calibrated Gaussian sigma gives median |err|/sigma 0.67 and 68 % /
+95 % within 1 / 2 sigma:
+
+| Cell | fixed 20 blocks: median err/sigma, within 1s / 2s | 2 g blocks | 5 g blocks (shipped) |
+|---|---|---|---|
+| indep 2,000 | 2.34, 25 % / 44 % | 2.18, 27 % / 47 % | 2.17, 27 % / 48 % |
+| indep 8,000 | 2.49, 25 % / 43 % | 2.41, 25 % / 44 % | 2.33, 25 % / 45 % |
+| re 2,000 | 2.69, 21 % / 40 % | 2.89, 19 % / 38 % | 2.65, 21 % / 40 % |
+| re 8,000 | 3.04, 21 % / 36 % | 3.40, 19 % / 34 % | 3.12, 21 % / 36 % |
+
+On AR(1) series (tests) the 5 g rule reads 0.95 +- 0.01 of the exact sigma at phi 0.9,
+n 20,000, and helps where n/20 < g (phi 0.99, n 4,000: 0.85 +- 0.07 vs fixed-20 0.74 +- 0.04),
+so it is kept: it costs nothing where the old blocks were long enough.
+
+**The measured root cause is holding f fixed.** A diagnostic bootstrap that re-solves the
+lambda = 0 MBAR per replicate (5 g blocks, 40 replicates, warm-started; not in `gareus`) on
+6 scenarios x 2 seeds x 2 regimes at the 2,000-sample prefix (363-367 heavy intervals per
+regime; the subset used a fresh RNG per column, so its fixed-20 row differs slightly from the
+table above):
+
+| Regime (2,000) | fixed f, fixed 20 | fixed f, 5 g | f re-solved, 5 g |
+|---|---|---|---|
+| indep: median err/sigma, within 1s / 2s | 2.41, 24 % / 42 % | 2.23, 25 % / 45 % | **1.08, 47 % / 67 %** |
+| re | 2.14, 23 % / 49 % | 2.15, 25 % / 49 % | **1.30, 39 % / 64 %** |
+
+Per scenario (indep), fixed-f 5 g -> re-solved: hardgap-k45 3.63 -> 0.96, hardgap-k30
+1.19 -> 0.46, gated 1.68 -> 1.25, c9-like 1.79 -> 1.61, harmonic-bowl 1.62 -> 1.58,
+hidden-cv3 6.3 -> 4.3. Re-solving f roughly halves the miscalibration where the error is
+statistical (the hole intervals, whose F depends on the neighbouring windows' relative f);
+what remains (median 1.1-1.3 against 0.67) is bias on slowly mixing or trapped landscapes that
+no bootstrap sees. Not built into `gareus`: at c9 scale it is 100 re-solves of a 143k x 59
+MBAR per epoch and needs a faster solver (open, with T4). Built since (`--ap-coverage-bootstrap
+resolve-f`, gareus-analyze's solver) and re-measured over all 136 jobs at both prefixes: 9.10
+(the full set reads 1.3-2.0, not 1.1-1.3: the subset above left out the slowest landscapes).
+
+**`refine_pmf_sigma_kt` default -> 0.25.** The shipped bootstrap is still fixed-f, so it is not
+calibrated; 0.25 is the value 9.6 supports (about 0.6-0.75 kT of true error).
+
+**R2 contributor count, same-column vs any.** Holes hit = columns with a proposal inside the
+pre-registered hole, of 24 (cells indep 2,000 / indep 8,000 / re 2,000 / re 8,000):
+
+| Rule (count, min windows, sigma; 5 g blocks) | hardgap-k20 | hardgap-k30 | hardgap-k45 | row gaps | proposals elsewhere (where) |
+|---|---|---|---|---|---|
+| any, 2, 0.5 (pre-v3 rule, fixed-20 blocks) | 3 / 0 / 0 / 0 | 6 / 0 / 2 / 0 | 21 / 15 / 17 / 13 | 0 | 0 / 0 / 1 / 0 (hidden-cv3) |
+| any, 2, 0.25 | 7 / 0 / 0 / 0 | 24 / 3 / 20 / 0 | 24 / 24 / 24 / 23 | 0 | 2 / 0 / 4 / 1 (hidden-cv3) |
+| same-column, 1, 0.25 | 4 / 0 / 0 / 0 | 24 / 3 / 20 / 0 | 24 / 24 / 24 / 23 | 0 | 5 / 3 / 8 / 5 (hidden-cv3, plateau-drop1) |
+| **same-column, 2, 0.25 (v3 default)** | 23 / 23 / 20 / 22 | 24 / 24 / 24 / 24 | 24 / 24 / 24 / 24 | 1 / 0 / 0 / 0 | 6 / 7 / 8 / 17 (plateau-drop1 16, dbl-gap 13, hidden-cv3 8, plateau-rowgap 1) |
+| same-column, 2, 0.5 | 23 / 23 / 20 / 22 | 24 / 24 / 24 / 24 | 24 / 24 / 24 / 24 | 1 / 0 / 0 / 0 | 6 / 7 / 7 / 17 (hidden-cv3 7) |
+| same-column, 3, 0.25 | 24 everywhere | 24 | 24 | plateau-rowgap 24 / 24 / 24 / 24 | 28 / 31 / 28 / 38 |
+
+Judged by the PMF truth instead of the labels (each proposal's worst |F_est - F_exact| in its
+interval; > 0.5 kT = a real error, <= 0.2 kT = not needed; columns with a heavy interval
+> 0.5 kT = 180 / 129 / 130 / 91, most of them bias on the R3 landscapes that no window fixes):
+
+| Rule | proposals <= 0.2 kT | proposals > 0.5 kT | error columns hit |
+|---|---|---|---|
+| any, 2, 0.5 (pre-v3) | 4 / 5 / 2 / 1 | 25 / 7 / 13 / 7 | 21 / 7 / 12 / 7 |
+| any, 2, 0.25 (5 g) | 14 / 2 / 10 / 6 | 37 / 14 / 28 / 12 | 32 / 14 / 24 / 12 |
+| same-column, 1, 0.25 | 16 / 5 / 14 / 10 | 35 / 14 / 28 / 12 | 30 / 14 / 24 / 12 |
+| **same-column, 2, 0.25** | 21 / 43 / 14 / 58 | 48 / 32 / 42 / 23 | 40 / 30 / 31 / 21 |
+| same-column, 3, 0.25 | 31 / 55 / 32 / 66 | 49 / 31 / 41 / 21 | 41 / 30 / 31 / 20 |
+
+- **same-column makes the count rule live.** At 2 it finds the moderate holes the sigma rule
+  misses (k20: 20-23 of 24 vs 0-7) and hits 25-115 % more error columns (> 0.5 kT) than any, 2, 0.25.
+- **Its cost is geometric proposals that sampling has already made unnecessary.** It fires
+  wherever a column lacks two of its own windows' support, whether or not neighbours cover the
+  interval: plateau-drop1 (4 per cell, error 0.02-0.12 kT -- the 9.1 case that was measured not
+  to be a hole), dbl-gap (3-10, error 0.40), and the hardgap columns at 8,000 samples (k20 error
+  0.10-0.16 kT). At 8,000 samples 43-58 proposals are <= 0.2 kT, against 2-6 for any.
+- **1** makes the count rule inert again (it fires only with no own-column support at all,
+  i.e. the drop1 false positives); **3** exceeds the rows per column of every 2-row layout and
+  floods plateau-rowgap (96 proposals). The knob must stay <= rows per column.
+- **Default kept at 2** (with same-column): it is the only value at which the count rule adds
+  recall, and the reserve bounds what it can spend. Its false-positive rate grows with series
+  length, which a rate- or sigma-gated count (count < 2 AND sigma above a floor) would fix --
+  a code change, not calibrated here.
+- **chignolin_9 final-combined** (143,513 lambda = 0 union rows, row sources read from
+  `adaptive_union_mbar.samples.csv`, 2 sources; union rows are already thinned, so g median 1.8
+  (q90 4.0), 0 states at the min-block guard, 1 g fallback): any -> 0 proposals (as before);
+  same-column -> **3 proposals** (CV1 0.18 at CV2 -0.01..0.64; 0.82 and 0.89 at -1.79..-1.14),
+  each with 3 contributing centres in total but 1 of its own column and bootstrap sigma
+  0.03-0.14 kT, i.e. the geometric kind above; the sigma rule at 0.25 fires nowhere. c9's
+  CV1-only windows (k2 = 0) do count as same-column where they sit at the column's CV1 centre.
+
+Not measured: re-solved-f calibration at 8,000 samples (measured in 9.10); any end-to-end PMF effect of the
+same-column proposals (9.6's end-to-end runs used any); the lambda-ladder (the harness has no
+rungs).
+
+### 9.10 R2 on gareus-analyze's MBAR solver, and the re-solved-f bootstrap (2026-09-30)
+
+**Solver swap.** `cv2_coverage.solve_mbar` (a NumPy fixed-point loop, tol 1e-8 on the step)
+is now a thin (K, N) wrapper over `solve_rows`, which calls gareus-analyze's
+`gareus.mbar_analysis.solvers.solve_mbar` with backend `numba-anderson` (NumPy `anderson` without
+numba), tol 1e-12. It is deterministic: each per-sample and per-state reduction in the numba
+kernel is one thread's serial loop, so f does not depend on the thread count. The default
+`sambar` warm start is stochastic and is not used; `lbfgs` reported `converged` 3.9e-7 from the
+answer on c9 and is not used either. On chignolin_9's final-combined lambda = 0 union (143,513
+rows x 59 states):
+
+| Solver | wall | iterations | max abs f error |
+|---|---|---|---|
+| old NumPy loop, tol 1e-8 | 42.9 s | 320 | 1.9e-7 |
+| numba-anderson, tol 1e-12 (shipped) | 0.8-1.1 s | 45 | 7e-12 |
+| NumPy anderson (fallback), tol 1e-10 | 6.0 s | 38 | 4e-13 vs numba-anderson |
+
+The reference is numba-anderson at tol 1e-13 (49 iterations), and plain numba to 1e-13 agrees to
+1.7e-12. R2's union step on c9 dropped from 56 s (T3 10.6) to 6.7 s, and the proposals did not
+change (T3 10.8).
+
+**Recorded numbers after the swap.** Every script whose MBAR changed was re-run:
+- `t2c_eval` (9.1-9.6). `t2c_r2_rerun.py` re-simulates each of the 136 jobs with its own seed
+  (136/136 simulations reproduced) and recomputes only `eval_r2`, keeping `r3` (the mixture
+  fits never call the MBAR).
+  - 994 of 12,848 interval sigmas moved by more than 1e-6 relative (max 21 %), almost all on
+    hardgap-k45, where the old loop had stopped short of the answer.
+  - `t2_data/t2c_calibration.json` is regenerated by `t2c_summarise.py` and `t2c_compact.py`,
+    with the e2e files in the order r3gate, e2e, r2hard. That order reproduced the old record
+    byte for byte from the old jobs.
+  - 9.6 is updated in place: k45 hole hits and the aggregate medians.
+- `t2c_e2e`. `t2c_e2e_rerun.py` recomputes the R2 records in full, and the R3 arms on the
+  recorded parents. With the old solver it reproduces the recorded arms exactly.
+  - R3: unchanged at the recorded precision.
+  - R2: only the k45 no-action arm moved, its hole RMSE up 0-0.05 kT.
+- `t2c_r2v3` (9.9). Now on the same solver. Its fixed-20, 2 g and 5 g tables, combos and FP/FN
+  tables are identical to the recorded ones.
+- `t3c_f2_crosscheck`, via `t3c_f2_summary`. Identical.
+- `t3c_union_checks`. Its output does not depend on the solver. It had stopped reproducing its
+  record at v3, when `_interval_stats` switched to autocorrelation blocks by default. It is now
+  pinned to 20 fixed blocks and reproduces the record exactly.
+
+**Re-solved-f bootstrap (`--ap-coverage-bootstrap resolve-f`, `cv2_coverage.resolve_f_sigma`).**
+- Blocks and state strata are the same as the fixed-f bootstrap (5 g).
+- Each of the 100 replicates re-solves the lambda = 0 MBAR on its own rows, warm-started from
+  the point f. One solve per replicate serves every column.
+- It has its own RNG stream. A non-converged replicate counts as non-finite. As in fixed-f,
+  sigma is inf when more than 10 % of replicates are non-finite.
+- Tested against a hand-rolled reference that uses the old solver per replicate (1e-6).
+- On iid two-window data it matches the true spread of F over 30 independent data sets
+  (median ratio 0.75-1.3), where fixed-f reads low.
+
+Calibration of the shipped function: all 136 jobs (17 scenarios x 2 regimes x 4 seeds), both
+prefixes, heavy intervals (>= 2 %, n = 1,860-1,884 per cell). The table gives median |err|/sigma,
+then the fraction of intervals within 1 sigma / within 2 sigma. A true sigma reads 0.67, 68 % / 95 %.
+
+| Cell | fixed-f, 20 blocks | fixed-f, 5 g (shipped default) | resolve-f, 5 g |
+|---|---|---|---|
+| indep 2,000 | 2.34, 25 % / 44 % | 2.17, 27 % / 48 % | **1.35**, 40 % / 62 % |
+| indep 8,000 | 2.49, 25 % / 43 % | 2.33, 25 % / 45 % | **1.32**, 41 % / 64 % |
+| re 2,000 | 2.69, 21 % / 40 % | 2.65, 21 % / 40 % | **1.89**, 29 % / 52 % |
+| re 8,000 | 3.04, 21 % / 36 % | 3.12, 21 % / 36 % | **2.04**, 31 % / 49 % |
+
+- **The q90 falls from 8.7-14.0 to 5.8-10.7.**
+- **Recall of intervals with true error > 0.5 kT.**
+  - At sigma > 0.25: 16 / 6 / 12 / 4 % -> 46 / 35 / 36 / 17 %.
+  - At sigma > 0.5: 4 / 1 / 5 / 1 % -> 21 / 9 / 18 / 12 %.
+- **Per scenario, where the error is statistical, resolve-f is calibrated or close** (indep
+  2,000, 5 g -> resolve-f):
+  - hardgap-k45 4.24 -> 1.15, k30 1.50 -> 0.66, k20 1.29 -> 0.77
+  - plateau-rowgap 1.25 -> 0.72, plateau-walls 1.25 -> 0.81, plateau-drop1 1.39 -> 0.97
+  - narrow-band 0.88 -> 0.71
+- **The rest is bias on slowly mixing landscapes, which no bootstrap sees:**
+  - stiff-bowl 6.5 -> 6.5, dbl-gap 9.1 -> 6.1, hidden-cv3 5.4 -> 3.7
+  - dbl-saddle 3.7 -> 2.2, harmonic-drop1 3.1 -> 2.5, harmonic-rowgap 3.0 -> 2.4
+  - gated-barrier 1.7 -> 1.6, harmonic-bowl 1.6 -> 1.4, c9-like 1.3 -> 1.2
+- **The 9.9 subset over-stated the gain.** That subset was a 40-replicate re-implementation on
+  6 scenarios x 2 seeds at 2,000 samples, and it read 1.08 / 1.30. The full set reads higher.
+- **Proposals.** Under the v3 default (same-column, 2, 0.25) resolve-f changes no hole hit and
+  no count of proposals elsewhere in any cell. The count rule decides those columns. PMF-truth
+  proposals changed by at most 2 per cell:
+  - <= 0.2 kT: 21 / 43 / 14 / 58 -> 20 / 41 / 15 / 58
+  - \> 0.5 kT: 48 / 32 / 42 / 23 -> 48 / 32 / 41 / 23
+- **Under `any`, 2, 0.25, the sigma rule does the work:**
+  - Error columns hit rise from 32 / 14 / 24 / 12 to 37 / 24 / 26 / 15.
+  - Proposals <= 0.2 kT fall from 14 / 2 / 10 / 6 to 9 / 2 / 8 / 4.
+
+**Cost.**
+- **chignolin_9 final-combined** (`t3e_r2_bootstrap_modes_c9.py`):
+  - 100 replicates take 95 s: 0.95 s each, median 46 iterations (max 68), 0 not converged.
+  - Warm-starting saves nothing at tol 1e-12, because Anderson mixing converges geometrically
+    from any start.
+  - R2 as a whole: 5.1 s -> 98 s.
+  - Peak RSS: 1.06 -> 1.12 GB, one extra (N, K) copy per replicate.
+- **Harness** (1 numba thread per worker, 12 workers on a loaded 24-core machine): median
+  20 s / 114 s per job at 2,000 / 8,000 samples. The worst case is 521 s, for plateau-walls at
+  192,000 x 24.
+
+**Decision (pre-registered before looking at the results).**
+- **The rule.** Calibrated meant median |err|/sigma <= 1.0 in all four cells. Affordable meant
+  less than 1 % of a c9 epoch's wall clock. Epoch_002 took about 10.1 h, 07:04 -> 17:08 by file
+  mtimes, so the limit was about 6 min.
+- **Affordable: yes.** 95 s is 0.26 % of the epoch.
+  - Against the between-epoch diagnostics it is not small. The epoch_002 collector took about
+    72 s. A 236-state union build takes 19-46 s (Section 6). The edge metric takes 58 s.
+  - So resolve-f roughly doubles those diagnostics. It is far over a "5 % of diagnostics time"
+    budget.
+- **Calibrated: no.** The medians are 1.35 / 1.32 / 1.89 / 2.04.
+- **Default kept.** `--ap-coverage-bootstrap fixed-f` with `refine_pmf_sigma_kT` 0.25; resolve-f
+  ships opt-in.
+- **resolve-f is the better-ranked sigma.** It has 2-6x the recall of real errors at the same
+  threshold, but it is still about 2-3x too small against a true sigma, so its threshold would
+  have to be chosen. Under the same-column default it changes nothing in the harness.
+- **What would change the call:**
+  - an end-to-end run on `any` with resolve-f at 0.25-0.5;
+  - a bias-aware check. The residual is bias; the fixed-f deficit that resolve-f removed was
+    statistical.

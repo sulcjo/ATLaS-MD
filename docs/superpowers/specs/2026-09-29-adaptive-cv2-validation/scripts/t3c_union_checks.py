@@ -94,7 +94,10 @@ def main(f2_path, out_path):
     rng = np.random.default_rng([3303, 2])
     for col in cov.columns(cviews, sorted(cviews), settings):
         col = cov._extend_to_weight(col, cv1, cv2, w)
-        frac, n_eff, n_contrib, sigma = cov._interval_stats(col, cv1, cv2, sidx, w, centre_of_state, rng)
+        # pre-v3 fixed 20 blocks per state, so t2_data/t3c_union_checks.json reproduces (v3's default
+        # is autocorrelation blocks; the 10.6 re-measure is t3b_cv2_resolution_dryrun.py)
+        frac, n_eff, n_contrib, sigma = cov._interval_stats(col, cv1, cv2, sidx, w, centre_of_state, rng,
+                                                            block_ids=cov._block_ids(sidx, cov.BOOT_BLOCKS))
         edges = col['edges']
         slab = np.abs(cv1 - col['c1']) <= col['slab_half_width']
         bins = np.clip(np.searchsorted(edges, cv2, side='right') - 1, 0, edges.size - 2)

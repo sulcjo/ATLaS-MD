@@ -522,25 +522,50 @@ class AdaptiveDecisionPolicy:
     cv2_resolution: bool = False
     coverage_min_windows: float = 2.0
     refine_min_transitions: int = 10
-    refine_pmf_sigma_kT: float = 0.5
+    refine_pmf_sigma_kT: float = 0.25          # T2 9.9: the fixed-f bootstrap sigma is ~3x too small
     refine_budget_fraction: float = 0.5
     refine_protect_epochs: int = 2
     refine_min_sigma: float = 0.1
-    # R3 crossing count: "replica" (within one replica's residence at the window; an
-    # exchange swap is not a crossing) or "state-series" (every switch of the window's
-    # state-indexed series, swaps included; >= the replica count always, so the permissive
-    # choice). Undecided for chignolin_10. Validated here, so a bad flag, YAML value or
-    # recorded decision_settings.json fails when the policy is built, not inside the epoch loop.
-    refine_transition_count: str = "replica"
+    # R3 crossing count: "replica-path" (default since T2 9.2: each replica's own visits joined
+    # across its absences), "replica" (within one residence; inert under exchange) or
+    # "state-series" (every switch, swaps included; passes everything under exchange).
+    # R3 mode: "flag" (default since T2 9.4: record the would-be children, never insert) or
+    # "insert". R2 contributor count: "same-column" (default since T2 9.9) or "any".
+    # Validated here, so a bad flag, YAML value or recorded decision_settings.json fails when
+    # the policy is built, not inside the epoch loop.
+    refine_transition_count: str = "replica-path"
+    refine_r3_mode: str = "flag"
+    coverage_count: str = "same-column"
+    # R2 bootstrap: "fixed-f" (MBAR f held at the point estimate) or "resolve-f" (the lambda = 0
+    # MBAR re-solved per replicate with gareus-analyze's solver; t2_synthetic.md 9.10).
+    coverage_bootstrap: str = "fixed-f"
+    # Respring (gareus/adaptive/cv2_respring*.py, --ap-cv2-respring), off by default: after a
+    # numbered epoch, re-derive a CV2-restrained window's k2 from its own samples as a NEW
+    # centre (old centre retired on every rung) when its realised mean compression
+    # k2/(k2 + F''_prod) is confidently below the shape rule's 0.5. Uncalibrated knobs.
+    cv2_respring: bool = False
+    respring_min_neff: float = 200.0
+    respring_tolerance: float = 0.05
+    respring_max_fraction: float = 0.25
+    respring_k2_rtol: float = 0.10
 
     def __post_init__(self) -> None:
-        if self.refine_transition_count not in REFINE_TRANSITION_COUNTS:
-            raise ValueError(f"refine_transition_count must be one of {REFINE_TRANSITION_COUNTS}, "
-                             f"got {self.refine_transition_count!r}")
+        for name, allowed in (("refine_transition_count", REFINE_TRANSITION_COUNTS),
+                              ("refine_r3_mode", REFINE_R3_MODES), ("coverage_count", COVERAGE_COUNTS),
+                              ("coverage_bootstrap", COVERAGE_BOOTSTRAPS)):
+            if getattr(self, name) not in allowed:
+                raise ValueError(f"{name} must be one of {allowed}, got {getattr(self, name)!r}")
+        from .adaptive.cv2_respring import validate_knobs  # noqa: PLC0415
+        validate_knobs(self.respring_min_neff, self.respring_tolerance, self.respring_max_fraction,
+                       self.respring_k2_rtol)
 
 
-# Mirrors gareus.adaptive.cv2_resolution.TRANSITION_COUNTS (not imported: that module imports this one lazily).
-REFINE_TRANSITION_COUNTS = ("replica", "state-series")
+# Mirror gareus.adaptive.cv2_resolution.TRANSITION_COUNTS / R3_MODES / COVERAGE_COUNTS (not
+# imported: that module imports this one lazily); a test pins them equal.
+REFINE_TRANSITION_COUNTS = ("replica", "replica-path", "state-series")
+REFINE_R3_MODES = ("flag", "insert")
+COVERAGE_COUNTS = ("any", "same-column")
+COVERAGE_BOOTSTRAPS = ("fixed-f", "resolve-f")      # mirrors cv2_resolution.COVERAGE_BOOTSTRAPS
 LADDER_SETTINGS_FIELDS = ("ladder_adapt", "ladder_min_overlap", "ladder_overlap_quantile", "ladder_min_ess",
                           "ladder_max_rungs", "ladder_hysteresis", "ladder_max_moves")
 LADDER_SETTINGS_FILENAME = "ladder_adapt_settings.json"
@@ -561,7 +586,8 @@ DECISION_SETTINGS_FIELDS = (
     "layout_neighbour_rule",
     "cv2_resolution", "coverage_min_windows", "refine_min_transitions", "refine_pmf_sigma_kT",
     "refine_budget_fraction", "refine_protect_epochs", "refine_min_sigma",
-    "refine_transition_count",
+    "refine_transition_count", "refine_r3_mode", "coverage_count", "coverage_bootstrap",
+    "cv2_respring", "respring_min_neff", "respring_tolerance", "respring_max_fraction", "respring_k2_rtol",
 )
 DECISION_SETTINGS_FILENAME = "decision_settings.json"
 
@@ -686,6 +712,7 @@ class WindowStateRegistry:
         gamd_lambda: float = 0.0,
         primary_k: Optional[float] = None,
         secondary_k: Optional[float] = None,
+        k2_rtol: Optional[float] = None,
     ) -> bool:
         """Is there already a state at this centre *on this rung*?
 
@@ -700,6 +727,10 @@ class WindowStateRegistry:
         unrestrained axis (k = 0; e.g. the CV1 placeholder of a CV2-only window)
         is never compared. ``primary_k``/``secondary_k`` left None mean "restrained
         where a coordinate is given", which is what every caller proposes.
+
+        ``k2_rtol`` (None = off, today's rule): a state whose CV2 spring differs from
+        ``secondary_k`` by more than this relative tolerance is a different Hamiltonian at
+        the same centre, not a duplicate (used only by the respring applier).
         """
         lam = float(gamd_lambda or 0.0)
         want = _restraint_pattern(primary_k, secondary_k, secondary)
@@ -712,6 +743,9 @@ class WindowStateRegistry:
             if want[0] and abs(float(state.primary_center) - float(primary)) > float(policy.duplicate_primary_tol):
                 continue
             if want[1] and abs(float(state.secondary_center) - float(secondary)) > float(policy.duplicate_secondary_tol):
+                continue
+            if k2_rtol is not None and want[1] and secondary_k is not None and state.secondary_k is not None \
+                    and abs(float(state.secondary_k) - float(secondary_k)) > float(k2_rtol) * abs(float(secondary_k)):
                 continue
             return True
         return False
@@ -4376,8 +4410,9 @@ def collect_final_combined_diagnostics(
     attach_paired_cv(payload, paired, adaptive_dir / "adaptive_final_combined_diagnostics.json")
     attach_edge_metric(payload, policy, adaptive_dir)  # spec 3.1; no-op under the default metric
     write_json(adaptive_dir / "adaptive_final_combined_diagnostics.json", payload)
-    if bool(policy.cv2_resolution):
-        # Spec 3.7: the table the gareus_report "CV2 resolution" row reads. Never raises.
+    if bool(policy.cv2_resolution) or bool(policy.cv2_respring):
+        # Spec 3.7: the table the gareus_report "CV2 resolution" row reads (either CV2 flag, so
+        # a respring-only campaign's unresolved windows are graded too). Never raises.
         from .adaptive.cv2_resolution_summary import write_final_combined_summary  # noqa: PLC0415
         write_final_combined_summary(adaptive_dir, payload)
     return payload
@@ -7763,7 +7798,7 @@ class AdaptiveProductionController:
                            f"above the replica cap --max-replicas {budget}"),
                 "n_active": n_active, "added": int(added), "budget": budget}
 
-    def _plan_children(self, children: Sequence[Sequence[Any]], context: str
+    def _plan_children(self, children: Sequence[Sequence[Any]], context: str, *, k2_rtol: Optional[float] = None
                        ) -> Tuple[Optional[List[Dict[str, Any]]], Optional[Tuple[str, str]]]:
         """Validate every new centre of one action; nothing is created here.
 
@@ -7787,7 +7822,7 @@ class AdaptiveProductionController:
                 notes.append(clamp_note)
             for lam in rungs:
                 if self.registry.has_near_duplicate(c1, c2, self.policy, gamd_lambda=lam,
-                                                    primary_k=k1, secondary_k=k2):
+                                                    primary_k=k1, secondary_k=k2, k2_rtol=k2_rtol):
                     return None, ("duplicate", f"child {i} at ({c1:.6g}, {c2}) duplicates an existing "
                                                f"state on rung lambda={lam}")
             for prev in plan:
@@ -7857,6 +7892,45 @@ class AdaptiveProductionController:
             return None, (refusal[0], refusal[1], {})
         return {"children": plan, "added": len(plan) * len(self._centre_rungs())}, None
 
+    def _validate_respring(self, action: Tuple) -> Tuple[Optional[Dict[str, Any]], Optional[Tuple]]:
+        """Respring (``--ap-cv2-respring``): one new centre at the old one's (c1, k1, c2) with
+        a new k2, then the old centre's every rung retired -- one atomic unit, net 0 states
+        on a complete centre. Unlike split, a CV1-free window (k1 = 0, e.g. an X7 axis
+        state) may be re-sprung; a CV2-unrestrained state (anchor, CV1-only) may not. The
+        duplicate check compares k2 (``k2_rtol``), so the old centre itself is not a duplicate."""
+        parent = action[1]
+        state = self.registry.get_state(int(parent))
+        if state is None:
+            return None, ("unknown_state", f"state {parent} is not in the registry", {})
+        if not state.active:
+            return None, ("inactive", f"state {parent} is already retired", {})
+        if not _restraint_pattern(state.primary_k, state.secondary_k, state.secondary_center)[1]:
+            return None, ("anchor_or_axis", f"state {parent} does not restrain CV2; nothing to re-spring", {})
+        members = self._centre_members(state)
+        mandatory = [int(s.state_id) for s in members if bool((s.metadata or {}).get("mandatory"))]
+        if mandatory:
+            return None, ("mandatory", f"centre of state {parent} holds mandatory exploration state(s) "
+                                       f"{mandatory}", {})
+        rtol = float(getattr(self.policy, "respring_k2_rtol", 0.10))
+        k2_old = float(state.secondary_k)
+
+        def _unchanged(k2_new: Any) -> Optional[Tuple]:
+            if k2_new is None or abs(float(k2_new) - k2_old) <= rtol * k2_old:
+                return ("no_change", f"k2 {k2_new} is within {rtol:g} of state {parent}'s k2 {k2_old:g}", {})
+            return None
+        # no_change before the duplicate check (the old centre itself would match it), and again
+        # after the cv2_k_max clamp and the coupling gate, which can move k2 back.
+        refusal = _unchanged(action[2][3] if len(action[2]) > 3 else None)
+        if refusal is not None:
+            return None, refusal
+        plan, refusal = self._plan_children([action[2]], f"respring of {parent}", k2_rtol=rtol)
+        if refusal is not None:
+            return None, (refusal[0], refusal[1], {})
+        refusal = _unchanged(plan[0]["secondary_k"])
+        if refusal is not None:
+            return None, refusal
+        return {"children": plan, "members": members, "added": len(self._centre_rungs()) - len(members)}, None
+
     def _validate_respace_ladder(self, drop: Sequence[float], add: Sequence[float]
                                  ) -> Tuple[Optional[Dict[str, Any]], Optional[Tuple]]:
         """Endpoints (lambda = 0 and the current top rung) are never dropped; the projected
@@ -7914,6 +7988,9 @@ class AdaptiveProductionController:
             return per_centre * len(action[2]) - n_members
         if kind == "insert":
             return per_centre * len(action[2])
+        if kind == "respring":
+            parent = self.registry.get_state(int(action[1]))
+            return per_centre - (len(self._centre_members(parent)) if parent is not None and parent.active else 0)
         if kind == "add_rung":
             lam = float(action[1])
             policy = AdaptiveDecisionPolicy()
@@ -7955,6 +8032,11 @@ class AdaptiveProductionController:
             if refusal is not None:
                 return None, refusal
             plan, added = insert_plan, int(insert_plan["added"])
+        elif kind == "respring":
+            respring_plan, refusal = self._validate_respring(action)
+            if refusal is not None:
+                return None, refusal
+            plan, added = respring_plan, int(respring_plan["added"])
         elif kind == "add_rung":
             plan, added = {}, self._states_added_by(action)
         elif kind == "respace_ladder":
@@ -8005,6 +8087,17 @@ class AdaptiveProductionController:
                 self._add_centre_on_every_rung(epoch, child["params"], parent=int(parent),
                                                source="adaptive_production_cv2_resolution",
                                                reason=child_reason, metadata=meta)
+        elif kind == "respring":
+            # New centre first (on the rungs resolved at validation), then the members captured
+            # at validation -- never recomputed: the new states share the old centre key.
+            _, parent, _child, reason = action[:4]
+            meta = dict(action[4]) if len(action) > 4 else None
+            (child,) = plan["plan"]["children"]
+            self._add_centre_on_every_rung(epoch, child["params"], parent=int(parent),
+                                           source="adaptive_production_cv2_respring",
+                                           reason="; ".join([str(reason), *child["notes"]]), metadata=meta)
+            for member in plan["plan"]["members"]:
+                self.registry.retire_state(int(member.state_id), int(epoch) + 1, f"respring: {reason}")
         elif kind == "split":
             # Children first, on the rungs resolved at validation (retiring first would shrink
             # rung_lambdas()), then every rung of the parent centre. One atomic unit.
@@ -8158,12 +8251,20 @@ def policy_from_args(args: Any) -> AdaptiveDecisionPolicy:
         cv2_resolution=_arg_bool(args, "adaptive_production_cv2_resolution", False),
         coverage_min_windows=_arg_float(args, "adaptive_production_coverage_min_windows", 2.0),
         refine_min_transitions=_arg_int(args, "adaptive_production_refine_min_transitions", 10),
-        refine_pmf_sigma_kT=_arg_float(args, "adaptive_production_refine_pmf_sigma_kt", 0.5),
+        refine_pmf_sigma_kT=_arg_float(args, "adaptive_production_refine_pmf_sigma_kt", 0.25),
         refine_budget_fraction=_arg_float(args, "adaptive_production_refine_budget_fraction", 0.5),
         refine_protect_epochs=_arg_int(args, "adaptive_production_refine_protect_epochs", 2),
         refine_min_sigma=_arg_float(args, "adaptive_production_refine_min_sigma", 0.1),
-        refine_transition_count=str(getattr(args, "adaptive_production_refine_transition_count", "replica")
-                                    or "replica"),
+        refine_transition_count=str(getattr(args, "adaptive_production_refine_transition_count", "replica-path")
+                                    or "replica-path"),
+        refine_r3_mode=str(getattr(args, "adaptive_production_refine_r3_mode", "flag") or "flag"),
+        coverage_count=str(getattr(args, "adaptive_production_coverage_count", "same-column") or "same-column"),
+        coverage_bootstrap=str(getattr(args, "adaptive_production_coverage_bootstrap", "fixed-f") or "fixed-f"),
+        cv2_respring=_arg_bool(args, "adaptive_production_cv2_respring", False),
+        respring_min_neff=_arg_float(args, "adaptive_production_respring_min_neff", 200.0),
+        respring_tolerance=_arg_float(args, "adaptive_production_respring_tolerance", 0.05),
+        respring_max_fraction=_arg_float(args, "adaptive_production_respring_max_fraction", 0.25),
+        respring_k2_rtol=_arg_float(args, "adaptive_production_respring_k2_rtol", 0.10),
     )
 
 
@@ -8963,6 +9064,16 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                     phase_dirs=([Path(s.get("dir")) for s in scheduled_summary.get("segments", []) if s.get("dir")]
                                 if scheduled_summary is not None else [epoch_dir]),
                     gate=_coupling_gate)
+            if bool(policy.cv2_respring):
+                # Respring (off by default): after 3.3, never overriding another action's centre;
+                # writes epoch_NNN/cv2_respring_report.json. Never raises.
+                from .adaptive.cv2_respring_io import run_epoch_cv2_respring  # noqa: PLC0415
+                actions = run_epoch_cv2_respring(
+                    adaptive_dir=adaptive_dir, epoch_dir=epoch_dir, epoch=epoch, registry=registry,
+                    diagnostics=diagnostics, actions=actions, policy=policy, args=args, out_dir=out_dir,
+                    phase_dirs=([Path(s.get("dir")) for s in scheduled_summary.get("segments", []) if s.get("dir")]
+                                if scheduled_summary is not None else [epoch_dir]),
+                    gate=_coupling_gate)
         action_report = None
         if _arg_bool(args, "adaptive_production_write_action_reports", True):
             try:
@@ -9018,10 +9129,14 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                 registry, actions, epoch, policy=policy,
                 secondary_k_max=_resolve_secondary_k_max(args), coupling_gate=_coupling_gate)
             _write_coupling_gate_report(epoch_dir, epoch, _coupling_gate)
+            if bool(policy.cv2_respring):
+                from .adaptive.cv2_respring_io import annotate_report_with_refusals as _annotate_respring  # noqa: PLC0415
+                _annotate_respring(epoch_dir, actions, _refused_actions)
             if bool(policy.cv2_resolution):
                 from .adaptive.cv2_resolution_io import annotate_report_with_refusals  # noqa: PLC0415
                 annotate_report_with_refusals(epoch_dir, actions, _refused_actions)
-                # Spec 3.7: the epoch's CV2-resolution table beside the report. Never raises.
+            if bool(policy.cv2_resolution) or bool(policy.cv2_respring):
+                # Spec 3.7: the epoch's CV2-resolution table beside the report(s). Never raises.
                 from .adaptive.cv2_resolution_summary import write_epoch_summary  # noqa: PLC0415
                 write_epoch_summary(epoch_dir, diagnostics)
         registry_paths = registry.save(adaptive_dir)
@@ -10033,6 +10148,10 @@ def _action_to_dict(action: Tuple) -> Dict[str, Any]:
     if kind == "insert":
         _, parent, children, reason = action[:4]
         return {"action": kind, "parent_state_id": parent, "children": children, "reason": reason}
+    if kind == "respring":
+        _, parent, params, reason = action[:4]
+        return {"action": kind, "parent_state_id": parent, "params": list(params), "reason": reason,
+                **({"metadata": action[4]} if len(action) > 4 else {})}
     if kind == "retire":
         _, sid, reason = action
         return {"action": kind, "state_id": sid, "reason": reason}

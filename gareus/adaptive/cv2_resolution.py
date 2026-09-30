@@ -29,12 +29,18 @@ iff d2^2 >= MAINLY_CV2_SHARE (1/2) x (d1^2 + d2^2), i.e. d2 >= d1. Under the 3.1
 
 R3 mode resolution -- a state whose CV2 subsample (P4 NPZ) has two accepted mixture modes
 passing ``mode_pair_resolvable`` (depth >= 1 kT, both >= 10 %) AND at least
-``refine_min_transitions`` core-to-core crossings within replica residences (see
-``count_transitions``). Mixture "members" for production windows are time blocks: each
-state's subsample is cut into MEMBER_BLOCKS contiguous blocks, never across a source, so a
-mode must be revisited in >= 8 blocks to be accepted. Bimodal without transitions is
-flagged ``trapped_or_orthogonal`` and nothing is inserted. Otherwise: an ``insert`` of two
-children at the mode means, the parent is kept.
+``refine_min_transitions`` core-to-core crossings (``count_transitions``; which crossings is
+``refine_transition_count``: replica-path by default, see cv2_resolution_rules._transitions).
+Mixture "members" for production windows are time blocks: each state's subsample is cut into
+MEMBER_BLOCKS contiguous blocks, never across a source, so a mode must be revisited in >= 8
+blocks to be accepted. Bimodal without transitions is flagged ``trapped_or_orthogonal`` and
+nothing is inserted. Otherwise the two children at the mode means (parent kept) are planned;
+with ``refine_r3_mode`` "insert" they become an ``insert`` action, with "flag" (the default
+since T2: inserts gave no PMF benefit at matched budget and the 4 x cap refused every genuine
+candidate) the candidate is ``flagged`` with reason ``r3_flag_only``, keeps the would-be
+children and springs in ``proposal`` and ``metrics.would_be`` = {decision proposed|refused,
+refusal}, and never becomes an action, draws on the budget or blocks convergence. A would-be
+spring-cap refusal stays ``refused`` in either mode (nothing to insert).
 
 Springs (every new window): target sampled sigma from the spacing (R3: 2 delta / 1.5 with the
 children at +/- delta; R1/R2: the new centre's distance to its neighbour / 1.5), never below
@@ -72,7 +78,7 @@ from gareus.adaptive.cv2_shape import (DEFAULT_MIN_MEAN_COMPRESSION, DEFAULT_MIN
 from gareus.adaptive.edge_metric import edge_below_threshold, edge_is_weak_pairwise
 from gareus.swarm.ladder_design import R_KCAL_MOL_K
 
-SCHEMA_VERSION = "cv2_resolution_report_v2"
+SCHEMA_VERSION = "cv2_resolution_report_v3"
 REPORT_NAME = "cv2_resolution_report.json"
 HISTORY_NAME = "cv2_resolution_history.json"
 HISTORY_SCHEMA = "cv2_resolution_history_v1"
@@ -86,17 +92,34 @@ MEMBER_BLOCKS = 32
 SPACING_SIGMA = 1.5
 MAX_K2_GROWTH = 4.0
 CORE_HALF_SD = 0.5
+# R2 bootstrap blocks (cv2_coverage._block_ids): each state's rows are cut, within each sample
+# source, into blocks of ceil(BOOT_BLOCK_G_MULTIPLE x g) rows, g = the state's statistical
+# inefficiency (effective_samples.pooled_inefficiency, max over CV1/CV2), and never fewer than
+# BOOT_MIN_BLOCKS blocks per state (the guard is recorded when it binds).
+BOOT_BLOCK_G_MULTIPLE = 5.0
+BOOT_MIN_BLOCKS = 5
 NON_BRIDGE_EDGE_TYPES = ("rung", "neighbour", "spanning", "pattern_link")
 PRIORITY = ("R1:structural", "R1:weak", "R1:unmeasured", "R2", "R3")
 BURN_IN_NOTE = ("standard: the US pull is not written as samples, per-state burnin_steps 0, "
                 "union MBAR per-state equilibration (t0) detection")
 # Knob defaults. Only refine_budget_fraction (0.5) and refine_protect_epochs (2) are spec
-# values; the rest are conservative, UNCALIBRATED choices (spec T2 calibrates them).
-DEFAULTS = {"coverage_min_windows": 2.0, "refine_min_transitions": 10, "refine_pmf_sigma_kT": 0.5,
+# values; refine_transition_count, refine_r3_mode, coverage_count and refine_pmf_sigma_kT
+# follow the T2 calibration (t2_synthetic.md 9, 9.9); the rest are uncalibrated choices.
+DEFAULTS = {"coverage_min_windows": 2.0, "refine_min_transitions": 10, "refine_pmf_sigma_kT": 0.25,
             "refine_budget_fraction": 0.5, "refine_protect_epochs": 2, "refine_min_sigma": 0.1,
-            "refine_transition_count": "replica"}
-TRANSITION_COUNTS = ("replica", "state-series")
+            "refine_transition_count": "replica-path", "refine_r3_mode": "flag",
+            "coverage_count": "same-column", "coverage_bootstrap": "fixed-f"}
+# R3 crossing counts (``count_transitions`` over different runs; see cv2_resolution_rules._transitions).
+TRANSITION_COUNTS = ("replica", "replica-path", "state-series")
+# R3 modes: "flag" records the would-be children and never emits an insert; "insert" acts.
+R3_MODES = ("flag", "insert")
+# R2 contributor count: "same-column" counts only centres of the interval's own CV1 column.
+COVERAGE_COUNTS = ("any", "same-column")
+# R2 bootstrap: "fixed-f" resamples the weights at the point MBAR f; "resolve-f" re-solves the
+# lambda = 0 MBAR per replicate (cv2_coverage.resolve_f_sigma).
+COVERAGE_BOOTSTRAPS = ("fixed-f", "resolve-f")
 BUDGET_REFUSALS = ("no_reserve", "resolution_budget")
+R3_FLAG_ONLY = "r3_flag_only"
 # The test that decided an R3 candidate (metrics["r3_gate"]), in the order they are applied.
 # Mixture gates (mode_analysis / r3_mode_gate): single_component (the fit has < 2 components),
 # member_support (< 2 components with >= min_mode_members member blocks), no_density_minimum
@@ -118,11 +141,20 @@ class ResolutionSettings:
     refine_protect_epochs: int = DEFAULTS["refine_protect_epochs"]
     refine_min_sigma: float = DEFAULTS["refine_min_sigma"]
     refine_transition_count: str = DEFAULTS["refine_transition_count"]
+    refine_r3_mode: str = DEFAULTS["refine_r3_mode"]
+    coverage_count: str = DEFAULTS["coverage_count"]
+    coverage_bootstrap: str = DEFAULTS["coverage_bootstrap"]
     temperature_k: float = 300.0
     k1_min: float = 0.0
     k2_min: float = 0.0
     k2_max: Optional[float] = None
     threshold: float = 0.15
+
+    def __post_init__(self) -> None:
+        for name, allowed in (("refine_transition_count", TRANSITION_COUNTS), ("refine_r3_mode", R3_MODES),
+                              ("coverage_count", COVERAGE_COUNTS), ("coverage_bootstrap", COVERAGE_BOOTSTRAPS)):
+            if getattr(self, name) not in allowed:
+                raise ValueError(f"{name} must be one of {allowed}, got {getattr(self, name)!r}")
 
     @classmethod
     def from_policy(cls, policy: Any, **extra: Any) -> "ResolutionSettings":
@@ -141,8 +173,8 @@ class ResolutionSettings:
                    min_mode_members=DEFAULT_MIN_MODE_MEMBERS, spacing_sigma=SPACING_SIGMA,
                    min_mean_compression=DEFAULT_MIN_MEAN_COMPRESSION,
                    max_k2_growth=MAX_K2_GROWTH, core_half_sd=CORE_HALF_SD,
-                   uncalibrated=["coverage_min_windows", "refine_min_transitions", "refine_pmf_sigma_kT",
-                                 "refine_min_sigma"])
+                   boot_block_g_multiple=BOOT_BLOCK_G_MULTIPLE, boot_min_blocks=BOOT_MIN_BLOCKS,
+                   uncalibrated=["refine_min_transitions", "refine_min_sigma"])
         return rec
 
 
@@ -531,7 +563,14 @@ def summarise(cands: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
             "n_blocking": int(blocking),
             "n_refused_budget": sum(1 for c in cands if c.get("refusal") in BUDGET_REFUSALS),
             "n_refused_spring_cap": sum(1 for c in cands if c.get("refusal") == "k2_capped_below_compression"),
-            "n_trapped_or_orthogonal": sum(1 for c in cands if (c.get("metrics") or {}).get("trapped_or_orthogonal"))}
+            "n_trapped_or_orthogonal": sum(1 for c in cands if (c.get("metrics") or {}).get("trapped_or_orthogonal")),
+            "n_r3_flag_only": sum(1 for c in cands if is_flag_only(c))}
+
+
+def is_flag_only(cand: Mapping[str, Any]) -> bool:
+    """An R3 candidate that would have been inserted but ``refine_r3_mode`` is "flag"."""
+    return (str(cand.get("rule")) == "R3" and cand.get("decision") == "flagged"
+            and str(cand.get("reason", "")).startswith(R3_FLAG_ONLY))
 
 
 def new_candidate(rule: str, kind: str, state_ids: Sequence[int], decision: str, reason: str, **extra: Any
@@ -542,7 +581,8 @@ def new_candidate(rule: str, kind: str, state_ids: Sequence[int], decision: str,
             "cost_states": 0, **extra}
 
 
-__all__ = ["BUDGET_REFUSALS", "DEFAULTS", "HISTORY_NAME", "METADATA_KEY", "R3_GATES", "REPORT_NAME", "SCHEMA_VERSION",
+__all__ = ["BUDGET_REFUSALS", "COVERAGE_COUNTS", "DEFAULTS", "R3_FLAG_ONLY", "R3_MODES", "TRANSITION_COUNTS",
+           "is_flag_only", "HISTORY_NAME", "METADATA_KEY", "R3_GATES", "REPORT_NAME", "SCHEMA_VERSION",
            "SOURCE", "r3_mode_gate",
            "ResolutionSettings", "StateView", "allocate", "axis_distances", "bridge_child", "candidate_action",
            "child_spring", "classify_edge", "consecutive_bad", "core_bounds", "count_transitions", "edge_key",

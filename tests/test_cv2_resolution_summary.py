@@ -243,7 +243,7 @@ def test_driver_hook_only_inside_the_cv2_resolution_flag_block():
             for sub in ast.walk(node):
                 if isinstance(sub, ast.Call) and ast.unparse(sub.func) == "write_epoch_summary":
                     hits.append(ast.unparse(node.test))
-    assert hits == ["bool(policy.cv2_resolution)"]
+    assert hits == ["bool(policy.cv2_resolution) or bool(policy.cv2_respring)"]
     assert src.count("write_epoch_summary(") == 1
 
 
@@ -283,7 +283,7 @@ def test_final_combined_hook_only_inside_the_cv2_resolution_flag_block():
             for sub in ast.walk(node):
                 if isinstance(sub, ast.Call) and ast.unparse(sub.func) == "write_final_combined_summary":
                     hits.append(ast.unparse(node.test))
-    assert hits == ["bool(policy.cv2_resolution)"]
+    assert hits == ["bool(policy.cv2_resolution) or bool(policy.cv2_respring)"]
     assert src.count("write_final_combined_summary(") == 1
 
 
