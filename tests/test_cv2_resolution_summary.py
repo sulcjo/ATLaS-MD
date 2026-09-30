@@ -311,5 +311,5 @@ def test_grade_row_names_the_carried_report(tmp_path):
     ap = _campaign(tmp_path)
     s = json.loads(crs.write_final_combined_summary(ap, _payload()).read_text())
     row = grade.check_cv2_resolution({"cv2_resolution": s})
-    assert "R3/budget from epoch_002" in row["detail"]
+    assert "R2/R3/budget from epoch_002" in row["detail"]
     assert row["status"] != grade.NA

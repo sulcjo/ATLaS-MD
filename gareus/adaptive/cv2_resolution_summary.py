@@ -13,7 +13,10 @@ and, with ``--ap-cv2-resolution`` on, by the driver after each numbered epoch's 
 (``write_final_combined_summary``, the file gareus_report grades). With the flag off nothing
 is written unless the CLI is run.
 
-Summary ``cv2_resolution_summary.json`` (schema ``cv2_resolution_summary_v2``; v2 adds the
+Summary ``cv2_resolution_summary.json`` (schema ``cv2_resolution_summary_v3``; v3 adds the
+rule-completeness counts ``evaluation_metadata``, ``evaluation_complete``, ``n_rules_requested``
+/ ``_ok`` / ``_unavailable`` / ``_error``, ``rules_incomplete`` (``rule_completeness``) and
+``report.rule_records``; the grade CAUTIONs a v1/v2 summary as legacy; v2 adds the
 state fields ``transitions_replica``, ``transitions_replica_path``, ``r3_flag_only`` and
 ``r3_would_be`` and the count ``n_r3_flag_only``; it reads 3.3 reports v1-v3)::
 
@@ -57,7 +60,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from gareus.adaptive.edge_metric import edge_below_threshold, edge_is_weak_pairwise
 from gareus.math_helpers import restraint_sigma
 
-SCHEMA_VERSION = "cv2_resolution_summary_v2"
+SCHEMA_VERSION = "cv2_resolution_summary_v3"
 SUMMARY_NAME = "cv2_resolution_summary.json"
 FINAL_LABEL = "final_combined"
 FINAL_DIAGNOSTICS = "adaptive_final_combined_diagnostics.json"
@@ -288,8 +291,70 @@ def _spring_cap_refusals(report: Mapping[str, Any]) -> int:
     return sum(1 for c in report.get("candidates", []) or [] if c.get("refusal") == SPRING_CAP_REFUSAL)
 
 
+def rule_completeness(report: Optional[Mapping[str, Any]], em: Optional[Mapping[str, Any]],
+                      carried: bool = False, resolution_requested: Optional[bool] = None) -> Dict[str, Any]:
+    """Which requested R1-R3 checks completed (grading input; never a PASS by omission).
+
+    ``evaluation_metadata``: ``ok`` (the report records ``requested`` per rule), ``no_report``
+    (R1-R3 never ran for this table although --ap-cv2-resolution may have been on),
+    ``not_requested`` (the payload's recorded policy has ``cv2_resolution`` false, e.g. a
+    respring-only campaign: nothing to complete), ``report_error`` (graded by ``report_status``)
+    or ``legacy`` (a report that predates ``requested``). ``resolution_requested`` is the
+    payload's recorded ``policy.cv2_resolution``; None (not recorded) counts as possibly on. ``rules_incomplete`` lists every requested
+    rule that did not finish ``ok`` with its reason. On a table that carries an epoch's report
+    (final-combined, ``carried``), R1's completeness is this table's OWN edge metric: the
+    epoch's R1 graded other edges, so its ``ok`` never vouches for these. R2 and R3 never run
+    on the final-combined table; their statuses are the carried epoch's (``rules_carried``,
+    and the grade row's label says ``R2/R3/budget from epoch_NNN``).
+    """
+    out: Dict[str, Any] = {"evaluation_metadata": None, "evaluation_complete": False,
+                           "n_rules_requested": None, "n_rules_ok": None, "n_rules_unavailable": None,
+                           "n_rules_error": None, "rules_incomplete": [], "rules_carried": []}
+    if report is None and resolution_requested is False:
+        return {**out, "evaluation_metadata": "not_requested", "evaluation_complete": True,
+                "n_rules_requested": 0, "n_rules_ok": 0, "n_rules_unavailable": 0, "n_rules_error": 0}
+    if report is None:
+        return {**out, "evaluation_metadata": "no_report",
+                "rules_incomplete": ["R1-R3 not evaluated (no 3.3 cv2_resolution_report)"]}
+    if report.get("status") == "error":
+        return {**out, "evaluation_metadata": "report_error"}
+    rules = report.get("rules") or {}
+    if not rules or any(not isinstance(v, Mapping) or "requested" not in v for v in rules.values()):
+        return {**out, "evaluation_metadata": "legacy",
+                "rules_incomplete": ["3.3 report predates rule-completeness metadata (legacy): "
+                                     "R1-R3 completeness unknown"]}
+    n_ok = n_unavail = n_err = n_req = 0
+    missing = []
+    for name in sorted(rules):
+        rec = rules[name]
+        if not rec.get("requested"):
+            continue
+        n_req += 1
+        status, reason = rec.get("status"), rec.get("reason") or rec.get("error")
+        if name == "R1" and carried:
+            em_status = (em or {}).get("status")
+            status = "ok" if em_status == "ok" else "unavailable"
+            reason = None if status == "ok" else (
+                f"this table's edge metric is {em_status}" if em else
+                "no pairwise edge metric on this table (requires --ap-edge-metric pairwise-mbar)")
+        if status == "ok":
+            n_ok += 1
+            continue
+        if status == "error":
+            n_err += 1
+        else:
+            n_unavail += 1
+        missing.append(f"{name} {status or 'unknown'}" + (f" ({reason})" if reason else ""))
+    carried_rules = sorted(k for k in rules if k != "R1" and rules[k].get("requested")) if carried else []
+    return {**out, "evaluation_metadata": "ok", "evaluation_complete": not missing, "n_rules_requested": n_req,
+            "rules_carried": carried_rules,
+            "n_rules_ok": n_ok, "n_rules_unavailable": n_unavail, "n_rules_error": n_err,
+            "rules_incomplete": missing}
+
+
 def _counts(states: Sequence[Mapping[str, Any]], edges: Sequence[Mapping[str, Any]],
-            em: Optional[Mapping[str, Any]], report: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+            em: Optional[Mapping[str, Any]], report: Optional[Mapping[str, Any]],
+            carried: bool = False, resolution_requested: Optional[bool] = None) -> Dict[str, Any]:
     graded = [e for e in edges if e["graded"]]
     comps = ((em or {}).get("components") or {}).get("n_components")
     summ = (report or {}).get("summary") or {}
@@ -307,10 +372,17 @@ def _counts(states: Sequence[Mapping[str, Any]], edges: Sequence[Mapping[str, An
             "report_status": (report or {}).get("status"),
             "n_proposed": summ.get("n_proposed"), "n_blocking": summ.get("n_blocking"),
             "n_refused_budget": _budget_refusals(report) if report else None,
-            "n_refused_spring_cap": _spring_cap_refusals(report) if report else None}
+            "n_refused_spring_cap": _spring_cap_refusals(report) if report else None,
+            **rule_completeness(report, em, carried, resolution_requested)}
 
 
 # ---- the summary ------------------------------------------------------------------------
+
+def _resolution_requested(diagnostics: Mapping[str, Any]) -> Optional[bool]:
+    """The payload's recorded ``policy.cv2_resolution`` (None when the payload predates it)."""
+    value = (diagnostics.get("policy") or {}).get("cv2_resolution")
+    return None if value is None else bool(value)
+
 
 def resolve_temperature(diagnostics: Mapping[str, Any], report: Optional[Mapping[str, Any]],
                         override: Optional[float] = None) -> Tuple[Optional[float], Optional[str]]:
@@ -346,12 +418,16 @@ def build_summary(diagnostics: Mapping[str, Any], report: Optional[Mapping[str, 
     rep_rec = None if report is None else {
         "status": report.get("status"), "epoch": report.get("epoch"), "stage": report.get("stage"),
         "rules": {k: (v or {}).get("status") for k, v in (report.get("rules") or {}).items()},
+        "rule_records": {k: {f: (v or {}).get(f) for f in ("status", "reason", "requested")}
+                         for k, v in (report.get("rules") or {}).items()},
         "summary": report.get("summary"), "budget_mode": (report.get("budget") or {}).get("mode")}
     out = {"schema_version": SCHEMA_VERSION, "label": label,
            "sources": {**dict(sources or {}), "diagnostics_schema": diagnostics.get("schema_version"),
                        "report_status": (report or {}).get("status")},
            "temperature_k": temp, "temperature_source": temp_src, "definitions": DEFINITIONS,
-           "edge_metric": em_rec, "report": rep_rec, "counts": _counts(states, edges, em, report),
+           "edge_metric": em_rec, "report": rep_rec,
+           "counts": _counts(states, edges, em, report, carried=bool((sources or {}).get("report_carried_from")),
+                             resolution_requested=_resolution_requested(diagnostics)),
            "states": states, "edges": edges}
     if respring is not None:
         summ = respring.get("summary") or {}

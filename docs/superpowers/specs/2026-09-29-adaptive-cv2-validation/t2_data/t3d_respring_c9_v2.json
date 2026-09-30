@@ -1,0 +1,729 @@
+{
+ "epoch_002": {
+  "phase": "epoch_002",
+  "payload": "/home/sulcjo/.claude/jobs/45d68034/tmp/c9dry/replay/t3_epoch_002_payload.json",
+  "sigma_target_source": "sampled_sd",
+  "layout_plan": "RUNS/chignolin_9/swarm/analysis/layout_plan.json",
+  "n_centres": 59,
+  "n_candidates": 43,
+  "n_measured": 43,
+  "wall_s": {
+   "x5": 2.3,
+   "total": 3.8
+  },
+  "g_cv2_source": [
+   "x5"
+  ],
+  "g_variance_source": [
+   "cv2",
+   "variance"
+  ],
+  "g_cv2_q": [
+   3.011,
+   3.279,
+   4.489,
+   7.843,
+   10.54
+  ],
+  "g_qobs_q": [
+   2.701,
+   3.15,
+   4.111,
+   6.972,
+   18.041
+  ],
+  "g_variance_q": [
+   3.161,
+   3.646,
+   5.115,
+   8.699,
+   18.041
+  ],
+  "g_q_over_g_cv2_q": [
+   0.343,
+   0.643,
+   0.934,
+   1.235,
+   2.665
+  ],
+  "n_eff_q": [
+   152.431,
+   316.173,
+   537.623,
+   754.341,
+   869.944
+  ],
+  "k2_q": [
+   1.179,
+   1.179,
+   1.179,
+   1.179,
+   1.179
+  ],
+  "c_real_q": [
+   0.315,
+   0.403,
+   0.518,
+   0.609,
+   0.701
+  ],
+  "c_interval_width_q": [
+   0.05,
+   0.06,
+   0.083,
+   0.104,
+   0.131
+  ],
+  "f2_prod_q": [
+   0.504,
+   0.756,
+   1.098,
+   1.748,
+   2.565
+  ],
+  "n_c_point_below_0p5": 20,
+  "n_c_point_below_trigger": 11,
+  "n_triggered": 6,
+  "triggered_c_real_q": [
+   0.315,
+   0.331,
+   0.389,
+   0.406,
+   0.41
+  ],
+  "triggered_c_hi_q": [
+   0.339,
+   0.359,
+   0.421,
+   0.442,
+   0.445
+  ],
+  "proposed_k2_new_q": [
+   1.695,
+   1.728,
+   1.855,
+   2.391,
+   2.565
+  ],
+  "proposed_k2_ratio_q": [
+   1.437,
+   1.465,
+   1.573,
+   2.028,
+   2.174
+  ],
+  "proposed_predicted_c_q": [
+   0.5,
+   0.5,
+   0.5,
+   0.5,
+   0.5
+  ],
+  "n_over_compressed": 0,
+  "cv1_free_triggered": [],
+  "summary_cap": {
+   "n_candidates": 43,
+   "n_measured": 43,
+   "n_triggered": 6,
+   "n_proposed": 6,
+   "n_unresolved": 0,
+   "n_over_compressed": 0,
+   "decisions": {
+    "no_action": 36,
+    "proposed": 6,
+    "skipped": 1
+   },
+   "reasons": {
+    "compression_reached": 36,
+    "under-compressed": 6,
+    "too_few_effective_samples": 1
+   },
+   "c_real_quantiles": {
+    "0.1": 0.40288687964158865,
+    "0.5": 0.5177944321340332,
+    "0.9": 0.6093702433121851
+   }
+  },
+  "cap": {
+   "max_fraction": 0.25,
+   "n_centres": 59,
+   "limit": 14,
+   "n_over_cap": 0
+  },
+  "summary_nocap": {
+   "n_candidates": 43,
+   "n_measured": 43,
+   "n_triggered": 6,
+   "n_proposed": 6,
+   "n_unresolved": 0,
+   "n_over_compressed": 0,
+   "decisions": {
+    "no_action": 36,
+    "proposed": 6,
+    "skipped": 1
+   },
+   "reasons": {
+    "compression_reached": 36,
+    "under-compressed": 6,
+    "too_few_effective_samples": 1
+   },
+   "c_real_quantiles": {
+    "0.1": 0.40288687964158865,
+    "0.5": 0.5177944321340332,
+    "0.9": 0.6093702433121851
+   }
+  },
+  "triggered": [
+   {
+    "state": 80,
+    "c1": 0.0697,
+    "c2": -1.851,
+    "k1": 519.7073,
+    "c_real": 0.347,
+    "c_interval": [
+     0.316,
+     0.379
+    ],
+    "f2_prod": 2.218,
+    "n_eff": 315.0,
+    "k2_new": 2.218,
+    "decision_cap": "proposed"
+   },
+   {
+    "state": 108,
+    "c1": 0.1118,
+    "c2": -1.851,
+    "k1": 255.4299,
+    "c_real": 0.401,
+    "c_interval": [
+     0.371,
+     0.431
+    ],
+    "f2_prod": 1.762,
+    "n_eff": 517.0,
+    "k2_new": 1.762,
+    "decision_cap": "proposed"
+   },
+   {
+    "state": 128,
+    "c1": 0.1767,
+    "c2": -1.851,
+    "k1": 293.1075,
+    "c_real": 0.383,
+    "c_interval": [
+     0.356,
+     0.412
+    ],
+    "f2_prod": 1.899,
+    "n_eff": 535.0,
+    "k2_new": 1.899,
+    "decision_cap": "proposed"
+   },
+   {
+    "state": 152,
+    "c1": 0.2416,
+    "c2": -1.851,
+    "k1": 270.0115,
+    "c_real": 0.41,
+    "c_interval": [
+     0.383,
+     0.445
+    ],
+    "f2_prod": 1.695,
+    "n_eff": 552.0,
+    "k2_new": 1.695,
+    "decision_cap": "proposed"
+   },
+   {
+    "state": 192,
+    "c1": 0.0697,
+    "c2": -0.785,
+    "k1": 519.7073,
+    "c_real": 0.315,
+    "c_interval": [
+     0.288,
+     0.339
+    ],
+    "f2_prod": 2.565,
+    "n_eff": 504.0,
+    "k2_new": 2.565,
+    "decision_cap": "proposed"
+   },
+   {
+    "state": 196,
+    "c1": 0.9345,
+    "c2": 0.281,
+    "k1": 331.8321,
+    "c_real": 0.394,
+    "c_interval": [
+     0.355,
+     0.439
+    ],
+    "f2_prod": 1.812,
+    "n_eff": 261.0,
+    "k2_new": 1.812,
+    "decision_cap": "proposed"
+   }
+  ]
+ },
+ "final_combined": {
+  "phase": "final_combined",
+  "payload": "/home/sulcjo/.claude/jobs/45d68034/tmp/c9dry/replay/t3_final_combined_payload.json",
+  "sigma_target_source": "sampled_sd",
+  "layout_plan": "RUNS/chignolin_9/swarm/analysis/layout_plan.json",
+  "n_centres": 59,
+  "n_candidates": 43,
+  "n_measured": 43,
+  "wall_s": {
+   "x5": 43.3,
+   "total": 45.5
+  },
+  "g_cv2_source": [
+   "x5"
+  ],
+  "g_variance_source": [
+   "variance"
+  ],
+  "g_cv2_q": [
+   3.214,
+   4.427,
+   6.987,
+   11.435,
+   25.064
+  ],
+  "g_qobs_q": [
+   20.0,
+   20.897,
+   25.017,
+   38.129,
+   57.338
+  ],
+  "g_variance_q": [
+   20.0,
+   20.897,
+   25.017,
+   38.129,
+   57.338
+  ],
+  "g_q_over_g_cv2_q": [
+   1.583,
+   2.247,
+   3.61,
+   5.68,
+   9.354
+  ],
+  "n_eff_q": [
+   676.901,
+   1018.416,
+   1551.412,
+   1857.375,
+   1940.6
+  ],
+  "k2_q": [
+   1.179,
+   1.179,
+   1.179,
+   1.179,
+   1.179
+  ],
+  "c_real_q": [
+   0.303,
+   0.37,
+   0.436,
+   0.561,
+   0.588
+  ],
+  "c_interval_width_q": [
+   0.038,
+   0.041,
+   0.051,
+   0.058,
+   0.065
+  ],
+  "f2_prod_q": [
+   0.827,
+   0.921,
+   1.527,
+   2.005,
+   2.716
+  ],
+  "n_c_point_below_0p5": 30,
+  "n_c_point_below_trigger": 24,
+  "n_triggered": 19,
+  "triggered_c_real_q": [
+   0.303,
+   0.33,
+   0.392,
+   0.415,
+   0.424
+  ],
+  "triggered_c_hi_q": [
+   0.322,
+   0.348,
+   0.412,
+   0.438,
+   0.443
+  ],
+  "proposed_k2_new_q": [
+   1.601,
+   1.662,
+   1.833,
+   2.394,
+   2.716
+  ],
+  "proposed_k2_ratio_q": [
+   1.358,
+   1.409,
+   1.554,
+   2.03,
+   2.303
+  ],
+  "proposed_predicted_c_q": [
+   0.5,
+   0.5,
+   0.5,
+   0.5,
+   0.5
+  ],
+  "n_over_compressed": 0,
+  "cv1_free_triggered": [],
+  "summary_cap": {
+   "n_candidates": 43,
+   "n_measured": 43,
+   "n_triggered": 19,
+   "n_proposed": 14,
+   "n_unresolved": 5,
+   "n_over_compressed": 0,
+   "decisions": {
+    "no_action": 24,
+    "proposed": 14,
+    "deferred": 5
+   },
+   "reasons": {
+    "compression_reached": 24,
+    "under-compressed": 14,
+    "per_epoch_cap": 5
+   },
+   "c_real_quantiles": {
+    "0.1": 0.3703935031374335,
+    "0.5": 0.43584838235198886,
+    "0.9": 0.5614796048169057
+   }
+  },
+  "cap": {
+   "max_fraction": 0.25,
+   "n_centres": 59,
+   "limit": 14,
+   "n_over_cap": 5
+  },
+  "summary_nocap": {
+   "n_candidates": 43,
+   "n_measured": 43,
+   "n_triggered": 19,
+   "n_proposed": 19,
+   "n_unresolved": 0,
+   "n_over_compressed": 0,
+   "decisions": {
+    "no_action": 24,
+    "proposed": 19
+   },
+   "reasons": {
+    "compression_reached": 24,
+    "under-compressed": 19
+   },
+   "c_real_quantiles": {
+    "0.1": 0.3703935031374335,
+    "0.5": 0.43584838235198886,
+    "0.9": 0.5614796048169057
+   }
+  },
+  "triggered": [
+   {
+    "state": 80,
+    "c1": 0.0697,
+    "c2": -1.851,
+    "k1": 519.7073,
+    "c_real": 0.303,
+    "c_interval": [
+     0.284,
+     0.322
+    ],
+    "f2_prod": 2.716,
+    "n_eff": 967.0,
+    "k2_new": 2.716,
+    "decision_cap": "proposed"
+   },
+   {
+    "state": 84,
+    "c1": 0.9345,
+    "c2": 1.348,
+    "k1": 331.8321,
+    "c_real": 0.424,
+    "c_interval": [
+     0.397,
+     0.443
+    ],
+    "f2_prod": 1.601,
+    "n_eff": 1171.0,
+    "k2_new": 1.601,
+    "decision_cap": "deferred"
+   },
+   {
+    "state": 104,
+    "c1": 0.8892,
+    "c2": 1.348,
+    "k1": 186.2469,
+    "c_real": 0.411,
+    "c_interval": [
+     0.387,
+     0.436
+    ],
+    "f2_prod": 1.692,
+    "n_eff": 1087.0,
+    "k2_new": 1.692,
+    "decision_cap": "deferred"
+   },
+   {
+    "state": 108,
+    "c1": 0.1118,
+    "c2": -1.851,
+    "k1": 255.4299,
+    "c_real": 0.376,
+    "c_interval": [
+     0.349,
+     0.396
+    ],
+    "f2_prod": 1.955,
+    "n_eff": 763.0,
+    "k2_new": 1.955,
+    "decision_cap": "proposed"
+   },
+   {
+    "state": 128,
+    "c1": 0.1767,
+    "c2": -1.851,
+    "k1": 293.1075,
+    "c_real": 0.392,
+    "c_interval": [
+     0.369,
+     0.414
+    ],
+    "f2_prod": 1.829,
+    "n_eff": 956.0,
+    "k2_new": 1.829,
+    "decision_cap": "proposed"
+   },
+   {
+    "state": 132,
+    "c1": 0.8244,
+    "c2": 1.348,
+    "k1": 246.672,
+    "c_real": 0.392,
+    "c_interval": [
+     0.372,
+     0.411
+    ],
+    "f2_prod": 1.833,
+    "n_eff": 1630.0,
+    "k2_new": 1.833,
+    "decision_cap": "proposed"
+   },
+   {
+    "state": 148,
+    "c1": 0.8244,
+    "c2": 0.281,
+    "k1": 246.672,
+    "c_real": 0.419,
+    "c_interval": [
+     0.395,
+     0.439
+    ],
+    "f2_prod": 1.637,
+    "n_eff": 1683.0,
+    "k2_new": 1.637,
+    "decision_cap": "deferred"
+   },
+   {
+    "state": 152,
+    "c1": 0.2416,
+    "c2": -1.851,
+    "k1": 270.0115,
+    "c_real": 0.387,
+    "c_interval": [
+     0.363,
+     0.409
+    ],
+    "f2_prod": 1.872,
+    "n_eff": 1172.0,
+    "k2_new": 1.872,
+    "decision_cap": "proposed"
+   },
+   {
+    "state": 156,
+    "c1": 0.7598,
+    "c2": 1.348,
+    "k1": 341.2721,
+    "c_real": 0.368,
+    "c_interval": [
+     0.349,
+     0.39
+    ],
+    "f2_prod": 2.026,
+    "n_eff": 1064.0,
+    "k2_new": 2.026,
+    "decision_cap": "proposed"
+   },
+   {
+    "state": 168,
+    "c1": 0.1118,
+    "c2": -0.785,
+    "k1": 255.4299,
+    "c_real": 0.402,
+    "c_interval": [
+     0.382,
+     0.423
+    ],
+    "f2_prod": 1.757,
+    "n_eff": 1861.0,
+    "k2_new": 1.757,
+    "decision_cap": "proposed"
+   },
+   {
+    "state": 172,
+    "c1": 0.8892,
+    "c2": 0.281,
+    "k1": 186.2469,
+    "c_real": 0.377,
+    "c_interval": [
+     0.355,
+     0.402
+    ],
+    "f2_prod": 1.951,
+    "n_eff": 1685.0,
+    "k2_new": 1.951,
+    "decision_cap": "proposed"
+   },
+   {
+    "state": 176,
+    "c1": 0.3063,
+    "c2": -1.851,
+    "k1": 325.6154,
+    "c_real": 0.394,
+    "c_interval": [
+     0.374,
+     0.414
+    ],
+    "f2_prod": 1.815,
+    "n_eff": 1551.0,
+    "k2_new": 1.815,
+    "decision_cap": "proposed"
+   },
+   {
+    "state": 180,
+    "c1": 0.6949,
+    "c2": 1.348,
+    "k1": 272.8659,
+    "c_real": 0.369,
+    "c_interval": [
+     0.348,
+     0.39
+    ],
+    "f2_prod": 2.018,
+    "n_eff": 1491.0,
+    "k2_new": 2.018,
+    "decision_cap": "proposed"
+   },
+   {
+    "state": 192,
+    "c1": 0.0697,
+    "c2": -0.785,
+    "k1": 519.7073,
+    "c_real": 0.326,
+    "c_interval": [
+     0.306,
+     0.344
+    ],
+    "f2_prod": 2.439,
+    "n_eff": 1310.0,
+    "k2_new": 2.439,
+    "decision_cap": "proposed"
+   },
+   {
+    "state": 196,
+    "c1": 0.9345,
+    "c2": 0.281,
+    "k1": 331.8321,
+    "c_real": 0.331,
+    "c_interval": [
+     0.306,
+     0.349
+    ],
+    "f2_prod": 2.383,
+    "n_eff": 1941.0,
+    "k2_new": 2.383,
+    "decision_cap": "proposed"
+   },
+   {
+    "state": 200,
+    "c1": 0.6301,
+    "c2": 1.348,
+    "k1": 373.334,
+    "c_real": 0.393,
+    "c_interval": [
+     0.363,
+     0.422
+    ],
+    "f2_prod": 1.818,
+    "n_eff": 1126.0,
+    "k2_new": 1.818,
+    "decision_cap": "proposed"
+   },
+   {
+    "state": 204,
+    "c1": 0.3709,
+    "c2": -1.851,
+    "k1": 321.6274,
+    "c_real": 0.389,
+    "c_interval": [
+     0.361,
+     0.412
+    ],
+    "f2_prod": 1.856,
+    "n_eff": 1117.0,
+    "k2_new": 1.856,
+    "decision_cap": "proposed"
+   },
+   {
+    "state": 216,
+    "c1": 0.4359,
+    "c2": -1.851,
+    "k1": 299.4758,
+    "c_real": 0.407,
+    "c_interval": [
+     0.38,
+     0.433
+    ],
+    "f2_prod": 1.717,
+    "n_eff": 1445.0,
+    "k2_new": 1.717,
+    "decision_cap": "deferred"
+   },
+   {
+    "state": 232,
+    "c1": 0.5005,
+    "c2": -1.851,
+    "k1": 256.489,
+    "c_real": 0.414,
+    "c_interval": [
+     0.389,
+     0.438
+    ],
+    "f2_prod": 1.669,
+    "n_eff": 1560.0,
+    "k2_new": 1.669,
+    "decision_cap": "deferred"
+   }
+  ]
+ },
+ "note": "2026-09-30 re-run after verification F2 (report v2: n_eff and blocks from g_variance = max(g_cv2, g_q), g_q of (z - mean z)^2 on the P4 subsample x stride; source-stratified blocks). Compare t3d_respring_c9.json (v1: g = X5 g_cv2). final-combined g_q floors at the P4 stride (20)."
+}

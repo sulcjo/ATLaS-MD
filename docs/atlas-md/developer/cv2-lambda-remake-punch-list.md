@@ -49,6 +49,17 @@ Status: ATLaS-MD v0.8.4 released (PR #120, tag v0.8.4). CV2/λ-ladder remake (P1
 - [ ] Replica-admission cap + MPS 25% (+78% node ns/day benchmark, jobs 2664328/2665264): not yet applied to any production launcher config.
 - [ ] X8 discovery census: per-epoch hook cost at c9 scale (~10 min between epochs) is extrapolated from a read-only replay, never measured live.
 
+## G. Adversarial verification findings (2026-09-30, branch `fix/cv2-verification-f1-f3`)
+
+| ID | Finding | Outcome |
+|---|---|---|
+| F1 | CV2 row PASSed with every rule `unavailable` | Fixed: rule-completeness metadata; incomplete/no report/legacy = CAUTION; R1 under the marginal metric = CAUTION (user choice b); respring-only (recorded policy.cv2_resolution false) = nothing requested; final-combined R2/R3 labelled as carried from the newest epoch, not re-evaluated |
+| F2 | Respring n_eff/blocks from the CV2 series' g, not the variance's; guard merged sources; g = 1 on failure | Fixed: g_variance = max(g_cv2, g_q) (user choice), source-local stratified blocks, skip on failure. c9 replay: decisions nearly unchanged |
+| F3 | Tied old/new states on a single-slot row read as a connectivity split | Fixed: slot-level components (single-slot groups still count as one expected component; no per-group not_applicable field) |
+| F4 | Retirement on CV1 marginal | Deferred (C2, VERY IMPORTANT TODO) |
+
+Respring still not validated by production MD; its knobs (min n_eff 200, tolerance 0.05, cap 0.25) stay uncalibrated.
+
 ## Stale branches (deferred by user, not on this list's critical path)
 
 `fix/residual-cv-thermodynamic-consistency`, `feat/pep-gamd-internal-boost`, `docs/atlas-md-scientific-manual`, `fix/parquet-segment-manifests-v2` (PR #90 closed). **Never merge** `perf/centroid-run-plan` (marked DO NOT MERGE).

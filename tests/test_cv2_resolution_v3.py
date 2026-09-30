@@ -135,7 +135,7 @@ def test_summary_and_grade_count_flag_only_windows():
     row = {"state_id": parent, "sample_count": 5000,
            "paired_cv": {"n_pairs": 2000, "cv2": {"mean": 0.0, "var": 0.4}}}
     s = summ.build_summary({"states": [row], "edges": []}, report, label="epoch_001", temperature_k=T)
-    assert s["schema_version"] == "cv2_resolution_summary_v2"
+    assert s["schema_version"] == "cv2_resolution_summary_v3"
     assert s["counts"]["n_r3_flag_only"] == 1
     (st,) = s["states"]
     assert st["r3_flag_only"] is True and st["r3_would_be"]["decision"] == "proposed"

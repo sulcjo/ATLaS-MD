@@ -90,7 +90,7 @@ def _round_key(value: float):
 
 
 def _axis_connectivity(K: int, pairs, group_keys: list,
-                        eligible: np.ndarray, thr: float, n_k) -> dict:
+                        eligible: np.ndarray, thr: float, n_k, ties=()) -> dict:
     """Connected-components verdict for one axis, using ONLY that axis' own
     already-symmetrised pairs as edges -- never the other axis' pairs, never
     the raw asymmetric ``overlap[i, j]``.
@@ -113,12 +113,22 @@ def _axis_connectivity(K: int, pairs, group_keys: list,
     NA, matching the pairwise check's own "no adjacent pairs on this axis"
     NA for the same axis, rather than the vacuous FAIL a bare component count
     over singleton nodes would otherwise report.
+
+    ``ties`` (state pairs sharing one chain slot: a re-sprung window and its
+    retired predecessor at the same coordinate) are contracted into one node,
+    the node space the pair generation uses: the slot, not the state, is what
+    must be bridged. Without them a slot with no neighbour on its row counted
+    each tied state as its own component (a false split). Adjacent slots are
+    joined when any pair between them is at or above ``thr``. A tie never
+    enters ``worst``; it only merges nodes here.
     """
     if not pairs:
         return {"n_components": 0, "connected": None, "expected_components": None}
     mat = np.zeros((K, K), dtype=np.float64)
     for a, b, v in pairs:
         mat[a, b] = mat[b, a] = v
+    for a, b in ties:
+        mat[a, b] = mat[b, a] = 1.0
     np.fill_diagonal(mat, 1.0)
     comp = overlap_components(mat, float(thr), n_k)
     n_components = int(comp.get("n_components", 0) or 0)
@@ -128,7 +138,7 @@ def _axis_connectivity(K: int, pairs, group_keys: list,
     expected = len({group_keys[i] for i in range(K) if eligible[i] and i not in excluded})
     expected = max(expected, 1)
     return {"n_components": n_components, "connected": bool(n_components == expected),
-            "expected_components": expected}
+            "expected_components": expected, "n_tied_states": len(ties)}
 
 
 def _warn_full_matrix_once() -> None:
@@ -308,7 +318,7 @@ def ladder_overlap_by_axis(overlap, state_lambdas, centers,
         groups = {}
         for i, key in enumerate(group_keys):
             groups.setdefault(key, []).append(i)
-        pairs = []
+        pairs, ties = [], []
         for key, idx in groups.items():
             if key[0] is None:  # a state with no CV1 centre / rung is not on the grid
                 continue
@@ -323,35 +333,37 @@ def ladder_overlap_by_axis(overlap, state_lambdas, centers,
                     slots.append([b])
                 else:
                     slots[-1].append(b)
+            ties.extend((int(sl[0]), int(b)) for sl in slots for b in sl[1:])
             for lo, hi in zip(slots[:-1], slots[1:]):
                 for a in lo:
                     for b in hi:
                         v = pair_overlap(int(a), int(b))
                         if v is not None:
                             pairs.append((a, b, v))
-        return pairs
+        return pairs, ties
 
-    lam_pairs = _chain_pairs(centre_key, lam)
-    cv1_pairs = _chain_pairs(row_key, cen)
+    lam_pairs, lam_ties = _chain_pairs(centre_key, lam)
+    cv1_pairs, cv1_ties = _chain_pairs(row_key, cen)
     # CV2 direction: same rung, same pattern, same CV1 column (None for a CV2-only state).
     col_key = [(_round_key(lam[i]), bool(on_cv1[i]), _round_key(cen[i]) if on_cv1[i] else None)
                if on_cv2[i] else (None, None, None) for i in range(K)]
     sec_sort = np.where(np.isfinite(sec), sec, 0.0)
-    cv2_pairs = _chain_pairs(col_key, sec_sort) if bool(np.any(on_cv2)) and secondary_centers is not None else None
+    cv2_pairs, cv2_ties = (_chain_pairs(col_key, sec_sort) if bool(np.any(on_cv2)) and secondary_centers is not None
+                           else (None, []))
 
     eligible = _eligible_mask(K, n_k)
     lam_summary = _summarise(lam_pairs)
     cv1_summary = _summarise(cv1_pairs)
-    lam_summary.update(_axis_connectivity(K, lam_pairs, centre_key, eligible, thr, n_k))
+    lam_summary.update(_axis_connectivity(K, lam_pairs, centre_key, eligible, thr, n_k, lam_ties))
     cv1_nk = (np.asarray(n_k, dtype=np.float64).ravel()[:K] if n_k is not None and np.asarray(n_k).size >= K
               else np.ones(K)) * on_cv1
-    cv1_summary.update(_axis_connectivity(K, cv1_pairs, row_key, eligible & on_cv1, thr, cv1_nk))
+    cv1_summary.update(_axis_connectivity(K, cv1_pairs, row_key, eligible & on_cv1, thr, cv1_nk, cv1_ties))
     out = {"lambda_direction": lam_summary, "cv1_direction": cv1_summary}
     if cv2_pairs is not None:
         cv2_summary = _summarise(cv2_pairs)
         cv2_nk = (np.asarray(n_k, dtype=np.float64).ravel()[:K] if n_k is not None and np.asarray(n_k).size >= K
                   else np.ones(K)) * on_cv2
-        cv2_summary.update(_axis_connectivity(K, cv2_pairs, col_key, eligible & on_cv2, thr, cv2_nk))
+        cv2_summary.update(_axis_connectivity(K, cv2_pairs, col_key, eligible & on_cv2, thr, cv2_nk, cv2_ties))
         out["cv2_direction"] = cv2_summary
     return out, []
 

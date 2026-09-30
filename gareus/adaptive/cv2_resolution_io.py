@@ -8,7 +8,9 @@ Report ``epoch_NNN/cv2_resolution_report.json`` (schema ``cv2_resolution_report_
 
     schema_version, epoch, status ("ok" | "error"), error, stage ("numbered_epoch" | "replay"),
     settings      -- every knob and constant used (ResolutionSettings.as_record),
-    rules         -- {"R1"|"R2"|"R3": {"status": "ok"|"unavailable"|"error", "reason", ...}},
+    rules         -- {"R1"|"R2"|"R3": {"status": "ok"|"unavailable"|"error", "reason", ...,
+                      "requested": bool (additive, 2026-09-30; see ``requested_rules``; a report
+                      without it is graded as legacy/incomplete metadata)}},
     candidates    -- one record per edge (R1), interval (R2) or state (R3) considered:
         rule, kind ("edge"|"interval"|"state"), state_ids, class (R1: structural|weak|unmeasured),
         decision ("proposed"|"extend"|"flagged"|"refused"|"no_action"|"skipped"),
@@ -434,6 +436,17 @@ def _protected_ids(views: Mapping[int, cr.StateView], epoch: int, settings: cr.R
     return {s for s, v in views.items() if cr.is_protected(v, epoch, settings)}
 
 
+def requested_rules(policy: Any, rules: Mapping[str, Mapping[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Each rule record plus ``requested`` (the grader's completeness set, from the live policy).
+
+    R1 and R3 are always requested with --ap-cv2-resolution on: R1 ``unavailable`` under the
+    default marginal edge metric is an incomplete evaluation (graded CAUTION), not an opt-out.
+    R2 is requested only with top-ups on (``policy.topups_enabled``): it reads the top-up union.
+    """
+    want = {"R1": True, "R2": bool(getattr(policy, "topups_enabled", False)), "R3": True}
+    return {k: {**dict(v or {}), "requested": bool(want.get(k, True))} for k, v in rules.items()}
+
+
 def propose_cv2_resolution(registry: Any, diagnostics: Mapping[str, Any], actions: Sequence[Tuple],
                            settings: cr.ResolutionSettings, policy: Any, *, epoch: int,
                            history: Mapping[str, Any], subsamples: Mapping[int, Mapping[str, np.ndarray]],
@@ -460,9 +473,10 @@ def propose_cv2_resolution(registry: Any, diagnostics: Mapping[str, Any], action
     report = {"schema_version": cr.SCHEMA_VERSION, "epoch": int(epoch), "status": "ok", "error": None,
               "settings": settings.as_record(),
               "edge_metric": {k: (diagnostics.get("edge_metric") or {}).get(k) for k in ("metric", "status", "stage")},
-              "rules": {"R1": r1_status, "R2": r2_status,
-                        "R3": {"status": "ok" if subsamples else "unavailable",
-                               "reason": None if subsamples else "no P4 paired-CV subsample"}},
+              "rules": requested_rules(policy, {
+                  "R1": r1_status, "R2": r2_status,
+                  "R3": {"status": "ok" if subsamples else "unavailable",
+                         "reason": None if subsamples else "no P4 paired-CV subsample"}}),
               "candidates": cands, "budget": budget, "actions_removed": removed,
               "actions_added": [{"action": str(a[0]), "state_id": int(a[1]),
                                  "rule": ((a[4] if len(a) > 4 else {}).get(cr.METADATA_KEY) or {}).get("rule", "R1")}
@@ -567,5 +581,6 @@ def is_blocking(epoch_dir: Path) -> int:
 
 __all__ = ["annotate_report_with_refusals", "budget_for_epoch", "find_layout_reserve", "is_blocking",
            "load_history", "parquet_runs_provider", "phase_union_npz", "propose_cv2_resolution",
-           "reset_no_reserve_warnings", "run_epoch_cv2_resolution", "save_history", "settings_from",
+           "requested_rules", "reset_no_reserve_warnings", "run_epoch_cv2_resolution", "save_history",
+           "settings_from",
            "union_coverage", "union_row_sources", "warn_no_reserve_once"]

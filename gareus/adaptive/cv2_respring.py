@@ -20,12 +20,19 @@ lambda > 0, and the new k2 is replicated onto every rung as every centre is):
   * F''_prod = RT/var - k2 (samples taken under the window's own spring: sampled precision is
     k2 + F''), and c_real = k2/(k2 + F''_prod) = k2 var / RT, i.e. var / sigma_w^2. c_real is
     linear in var, so a var interval maps straight onto it; F''_prod <= 0 is c_real >= 1.
-  * interval: moving-block bootstrap of var on the P4 subsample, blocks of
-    ceil(BOOT_BLOCK_G_MULTIPLE x g / stride) subsample rows (g = the X5 statistical
-    inefficiency of the state's CV2 series in raw sample spacing, ``effective_samples``; else
-    the subsample's own g x stride), never across a sample source, at least BOOT_MIN_BLOCKS
-    blocks (guard recorded). The bootstrap's var_b/var_sub quantiles scale the full-series var
-    (BOOT_QUANTILES 5-95 %). n_eff = n / g must reach ``respring_min_neff``.
+  * interval: block bootstrap of var on the P4 subsample, blocks of
+    ceil(BOOT_BLOCK_G_MULTIPLE x g_variance / stride) subsample rows, never across a sample
+    source (the minimum-block guard included: too few source-local blocks = no interval,
+    skipped ``too_few_source_blocks``), each replicate redrawing every source's own blocks
+    (stratified). The bootstrap's var_b/var_sub quantiles scale the full-series var
+    (BOOT_QUANTILES 5-95 %). n_eff = n / g_variance must reach ``respring_min_neff``.
+    g_variance (raw sample spacing, report schema v2; v1's ``g`` was the CV2 series' g) =
+    max(g_cv2, g_q): g_q = the subsample's inefficiency of the variance observable
+    q = (z - mean z)^2 (one mean over the sample) x stride, g_cv2 = the X5 inefficiency of the
+    CV2 series (``effective_samples``; else the subsample's own x stride). A variance is a second
+    moment: a slowly switching amplitude gives g_q >> g_z (synthetic: 275 vs 1.05), while for a
+    Gaussian series g_q <= g_z, so the max never trusts the variance more than the series. No g_q
+    (estimate failed) = skipped ``variance_inefficiency_unavailable``, never g = 1.
     Known bias (safe direction): when the P4 stride exceeds g the bootstrap sees about
     n / stride nearly independent rows, not n_eff, so the interval is too wide by up to
     sqrt(n_eff stride / n) (chignolin_9 final-combined: stride 20, median ~1.7x) and fewer
@@ -39,8 +46,9 @@ Decision (per candidate state, ``decision`` / ``reason``):
     so a noisy estimate cannot oscillate), ``protected`` (created by a 3.3 action within
     ``refine_protect_epochs``), ``touched_by_other_action`` (another action this epoch retires,
     splits or inserts at this centre -- respring never overrides another proposer; with R3 in
-    its default flag mode no insert exists), ``no_samples`` / ``no_subsample`` (no interval,
-    never act) and ``too_few_effective_samples``.
+    its default flag mode no insert exists), ``no_samples`` / ``no_subsample`` /
+    ``too_few_source_blocks`` / ``variance_inefficiency_unavailable`` (no interval or no
+    variance g, never act) and ``too_few_effective_samples``.
     CV1-free windows (k1 = 0 with k2 > floor: the X7 mode-axis windows and CV2-only axis
     states) ARE candidates: their CV2 spring is what the shape rule set. Their var is the CV2
     marginal over a free CV1, so F''_prod is the marginal curvature.
@@ -81,7 +89,7 @@ from gareus.adaptive.cv2_shape import (DEFAULT_MIN_MEAN_COMPRESSION, compression
 from gareus.adaptive.effective_samples import contiguous_runs, pooled_inefficiency
 from gareus.swarm.ladder_design import R_KCAL_MOL_K
 
-SCHEMA_VERSION = "cv2_respring_report_v1"
+SCHEMA_VERSION = "cv2_respring_report_v2"
 REPORT_NAME = "cv2_respring_report.json"
 ACTION = "respring"
 RULE = "respring"
@@ -190,65 +198,142 @@ def block_ids(n: int, source_index: Optional[np.ndarray], block_len: int) -> np.
     return np.asarray(ids, dtype=np.int64).ravel()
 
 
-def subsample_inefficiency(z: np.ndarray, source_index: Optional[np.ndarray], step: Optional[np.ndarray]) -> float:
-    """g of the subsample itself (subsample spacing), runs within a source, 1 on failure."""
-    z = np.asarray(z, dtype=float)
-    src = np.zeros(z.size, dtype=np.int64) if source_index is None else np.asarray(source_index, dtype=np.int64)
+def _series_inefficiency(x: np.ndarray, source_index: Optional[np.ndarray],
+                         step: Optional[np.ndarray]) -> Tuple[Optional[float], str]:
+    """(g in subsample spacing, status) of one observable; runs never cross a source or a step gap.
+
+    ``status`` is the estimator's (ok | no_samples | too_short | zero_variance | failed); g is
+    None unless ok -- a failed estimate is never read as g = 1.
+    """
+    x = np.asarray(x, dtype=float)
+    src = np.zeros(x.size, dtype=np.int64) if source_index is None else np.asarray(source_index, dtype=np.int64)
     runs = []
     for s in np.unique(src):
         idx = np.flatnonzero(src == s)
         if step is not None and np.all(np.asarray(step)[idx] >= 0):
-            runs.extend(contiguous_runs(np.asarray(step, dtype=np.int64)[idx], z[idx]))
+            runs.extend(contiguous_runs(np.asarray(step, dtype=np.int64)[idx], x[idx]))
         else:
-            runs.append(z[idx])
+            runs.append(x[idx])
     est = pooled_inefficiency(runs, min_segment=10)
-    return float(est.g) if est.status == "ok" else 1.0
+    return (float(est.g), "ok") if est.status == "ok" else (None, str(est.status))
+
+
+def subsample_inefficiency(z: np.ndarray, source_index: Optional[np.ndarray],
+                           step: Optional[np.ndarray]) -> Optional[float]:
+    """g of the CV2 subsample itself (subsample spacing); None on failure."""
+    return _series_inefficiency(z, source_index, step)[0]
+
+
+def variance_observable(z: np.ndarray) -> np.ndarray:
+    """q = (z - mean(z))^2 with ONE mean over the measured sample (population-variance summand).
+
+    One fixed mean keeps between-source mean differences inside the variance, as ``np.var(z)``
+    does; centring per source would measure a different (within-source) variance.
+    """
+    z0 = np.asarray(z, dtype=float)
+    return (z0 - float(np.mean(z0))) ** 2
+
+
+def variance_inefficiency(z: np.ndarray, source_index: Optional[np.ndarray],
+                          step: Optional[np.ndarray]) -> Tuple[Optional[float], str]:
+    """g (subsample spacing) of the variance observable q; the variance's own correlation time.
+
+    For a Gaussian series rho_q(t) = rho_z(t)^2, so g_q <= g_z; a slowly switching amplitude
+    (two CV2 modes of different width, rare hops) gives g_q >> g_z.
+    """
+    return _series_inefficiency(variance_observable(z), source_index, step)
 
 
 def bootstrap_var_ratio(z: np.ndarray, source_index: Optional[np.ndarray], block_len: int, *,
                         reps: int = BOOT_REPS, seed: int = 0) -> Tuple[np.ndarray, Dict[str, Any]]:
-    """Block-bootstrap distribution of var_b / var(z) (population variance)."""
+    """Source-stratified block-bootstrap distribution of var_b / var(z) (population variance).
+
+    Blocks never cross a sample source, the minimum-block guard included: with fewer than
+    BOOT_MIN_BLOCKS blocks at ``block_len`` the length drops to floor(n / BOOT_MIN_BLOCKS)
+    (still source-local; ``source_boundary_guard`` recorded); still fewer = no distribution,
+    ``bootstrap_status`` ``too_few_source_blocks``. Each replicate redraws every source's own
+    blocks with replacement, as many as that source has, so each source keeps its share.
+    """
     z = np.asarray(z, dtype=float)
-    info: Dict[str, Any] = {"block_len_requested": int(block_len), "guard": False}
-    ids = block_ids(z.size, source_index, block_len)
+    src = np.zeros(z.size, dtype=np.int64) if source_index is None else np.asarray(source_index, dtype=np.int64)
+    info: Dict[str, Any] = {"block_len_requested": int(block_len), "source_boundary_guard": False,
+                            "n_sources": int(np.unique(src).size)}
+    ids = block_ids(z.size, src, block_len)
     n_blocks = int(ids.max()) + 1 if ids.size else 0
     if n_blocks < BOOT_MIN_BLOCKS:
-        block_len = max(1, int(math.ceil(z.size / float(BOOT_MIN_BLOCKS))))
-        ids = block_ids(z.size, None, block_len)
+        block_len = max(1, z.size // BOOT_MIN_BLOCKS)
+        ids = block_ids(z.size, src, block_len)
         n_blocks = int(ids.max()) + 1 if ids.size else 0
-        info["guard"] = True
+        info["source_boundary_guard"] = True
     info.update(block_len=int(block_len), n_blocks=n_blocks)
     v0 = float(np.var(z))
-    if n_blocks < 2 or not v0 > 0:
+    if n_blocks < BOOT_MIN_BLOCKS:
+        info["bootstrap_status"] = "too_few_source_blocks"
+        return np.array([]), info
+    if not v0 > 0:
+        info["bootstrap_status"] = "zero_variance"
         return np.array([]), info
     members = [np.flatnonzero(ids == b) for b in range(n_blocks)]
+    block_src = np.array([int(src[m[0]]) for m in members])
+    strata = [np.flatnonzero(block_src == s) for s in np.unique(block_src)]
     rng = np.random.default_rng(int(seed))
     out = np.empty(int(reps))
     for r in range(int(reps)):
-        pick = rng.integers(0, n_blocks, size=n_blocks)
+        pick = np.concatenate([rng.choice(bl, size=bl.size, replace=True) for bl in strata])
         out[r] = float(np.var(z[np.concatenate([members[b] for b in pick])])) / v0
+    info["bootstrap_status"] = "ok"
     return out, info
+
+
+def _combine_g(g_cv2: Optional[float], g_q: Optional[float]) -> Tuple[Optional[float], str]:
+    """g_variance = max(g_cv2, g_q) (raw spacing): never less conservative than the CV2 series' g.
+
+    Needs g_q; g_cv2 alone is not an estimate of the variance's correlation time.
+    """
+    if g_q is None:
+        return None, "none"
+    if g_cv2 is not None and g_cv2 > g_q:
+        return float(g_cv2), "cv2"
+    return float(g_q), "variance"
 
 
 def measure_window(*, var: float, n: int, k2: float, rt: float, z: Optional[np.ndarray],
                    source_index: Optional[np.ndarray] = None, step: Optional[np.ndarray] = None,
                    stride: int = 1, g: Optional[float] = None, g_source: str = "x5", seed: int = 0,
                    cond_var: Optional[float] = None) -> Dict[str, Any]:
-    """F''_prod and c_real of one window, with block-bootstrap intervals (see module docstring)."""
+    """F''_prod and c_real of one window, with block-bootstrap intervals (see module docstring).
+
+    ``g`` is the CV2 series' inefficiency in raw sample spacing (X5), audit and lower bound only;
+    the decision uses ``g_variance`` = max(g_cv2, g_q) with g_q from the variance observable.
+    """
     stride = max(1, int(stride or 1))
     m: Dict[str, Any] = {"n": int(n), "var": float(var), "sd": math.sqrt(var), "sigma_w2": math.sqrt(rt / k2),
                          "subsample_stride": stride, "f2_prod": f2_from_var(var, k2, rt),
                          "c_real": compression_from_var(var, k2, rt)}
     m["f2_prod_conditional"] = f2_from_var(cond_var, k2, rt) if cond_var and cond_var > 0 else None
+    empty = dict(g_variance=None, g_variance_status="no_subsample", g_variance_source="none",
+                 n_eff=None, n_eff_variance=None, c_interval=None, f2_interval=None, bootstrap=None,
+                 bootstrap_status="no_subsample")
     if z is None or np.asarray(z).size < 2 * BOOT_MIN_BLOCKS:
-        m.update(g=g, g_source=g_source, n_eff=None, c_interval=None, f2_interval=None, bootstrap=None)
+        m.update(g_cv2=g, g_cv2_source=g_source, g_q=None, **empty)
         return m
     z = np.asarray(z, dtype=float)
     if g is None or not (g > 0):
-        g, g_source = subsample_inefficiency(z, source_index, step) * stride, "subsample"
-    block = int(math.ceil(BOOT_BLOCK_G_MULTIPLE * float(g) / stride))
+        g_sub = subsample_inefficiency(z, source_index, step)
+        g, g_source = (None, "none") if g_sub is None else (g_sub * stride, "subsample")
+    gq_sub, gq_status = variance_inefficiency(z, source_index, step)
+    g_q = None if gq_sub is None else gq_sub * stride
+    g_var, g_var_source = _combine_g(g, g_q)
+    m.update(g_cv2=g, g_cv2_source=g_source, g_q=g_q, g_q_status=gq_status)
+    if g_var is None:
+        m.update({**empty, "g_variance_status": f"variance_inefficiency_{gq_status}",
+                  "bootstrap_status": "not_run"})
+        return m
+    n_eff = float(n) / max(1.0, g_var)
+    block = int(math.ceil(BOOT_BLOCK_G_MULTIPLE * g_var / stride))
     ratio, info = bootstrap_var_ratio(z, source_index, block, seed=seed)
-    m.update(g=float(g), g_source=g_source, n_eff=float(n) / max(1.0, float(g)), bootstrap=info)
+    m.update(g_variance=g_var, g_variance_status="ok", g_variance_source=g_var_source, n_eff=n_eff,
+             n_eff_variance=n_eff, bootstrap=info, bootstrap_status=info["bootstrap_status"])
     if ratio.size == 0:
         m.update(c_interval=None, f2_interval=None)
         return m
@@ -348,8 +433,12 @@ def evaluate(view: Mapping[str, Any], m: Optional[Mapping[str, Any]], settings: 
         return _candidate(view, "skipped", skip)
     if m is None:
         return _candidate(view, "skipped", "no_samples")
+    if str(m.get("g_variance_status") or "").startswith("variance_inefficiency_"):
+        return _candidate(view, "skipped", "variance_inefficiency_unavailable", metrics=dict(m))
     if m.get("c_interval") is None:
-        return _candidate(view, "skipped", "no_subsample", metrics=dict(m))
+        reason = ("too_few_source_blocks" if m.get("bootstrap_status") == "too_few_source_blocks"
+                  else "no_subsample")
+        return _candidate(view, "skipped", reason, metrics=dict(m))
     if m.get("n_eff") is None or float(m["n_eff"]) < float(settings.respring_min_neff):
         return _candidate(view, "skipped", "too_few_effective_samples", metrics=dict(m))
     if float(m["f2_prod"]) <= 0.0:
@@ -421,4 +510,5 @@ def summarise(cands: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
 __all__ = ["ACTION", "BOOT_QUANTILES", "DEFAULTS", "METADATA_KEY", "REPORT_NAME", "RULE", "SCHEMA_VERSION",
            "RespringSettings", "action_of", "apply_cap", "block_ids", "bootstrap_var_ratio",
            "compression_from_var", "evaluate", "f2_from_var", "gate_spring", "measure_window", "plan_spring",
-           "structural_skip", "subsample_inefficiency", "summarise", "validate_knobs"]
+           "structural_skip", "subsample_inefficiency", "summarise", "validate_knobs",
+           "variance_inefficiency", "variance_observable"]
