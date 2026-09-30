@@ -15,14 +15,14 @@ PRODUCT_NAME = "ATLaS-MD"
 
 
 def product_label() -> str:
-    """Return the versioned product label, e.g. ``"ATLaS-MD v0.8.3"``."""
+    """Return the versioned product label, e.g. ``"ATLaS-MD v0.8.4"``."""
     return f"{PRODUCT_NAME} v{__version__}"
 
 
 def versioned_title(title: str) -> str:
     """Insert the version after the product name in a heading.
 
-    ``"ATLaS-MD peptide workflow"`` -> ``"ATLaS-MD v0.8.3 peptide workflow"``;
+    ``"ATLaS-MD peptide workflow"`` -> ``"ATLaS-MD v0.8.4 peptide workflow"``;
     a title without the product name is prefixed instead.  Idempotent.
     """
     label = product_label()
