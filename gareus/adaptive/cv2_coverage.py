@@ -58,7 +58,8 @@ import numpy as np
 
 from gareus.adaptive import cv2_resolution as cr
 from gareus.adaptive.effective_samples import pooled_inefficiency
-from gareus.mbar_analysis import solvers as _mbar
+from gareus.adaptive.mbar_solve import (MBAR_BACKEND, MBAR_FALLBACK_BACKEND, MBAR_MAX_ITER,  # noqa: F401
+                                        MBAR_TOL, solve_mbar, solve_rows)
 
 MIN_INTERVAL_WEIGHT = 0.02
 WEIGHT_RANGE = (0.01, 0.99)
@@ -71,10 +72,6 @@ G_MIN_RUN = 20                   # shortest per-source run used to estimate g (p
 N_BOOT = 100
 _BOOT_SEED = 3303
 _RESOLVE_SEED = 3304             # resolve-f replicates draw from their own stream
-MBAR_BACKEND = "numba-anderson"  # gareus-analyze backend (deterministic, see the module docstring)
-MBAR_FALLBACK_BACKEND = "anderson"
-MBAR_TOL = 1e-12                 # max |f_new - f| of the un-mixed step (c9: 7e-12 from the 1e-13 answer, 45 iterations)
-MBAR_MAX_ITER = 20000
 
 
 def _logsumexp(a: np.ndarray, axis: int) -> np.ndarray:
@@ -92,52 +89,6 @@ def reduced_umbrella(cv1: np.ndarray, cv2: np.ndarray, views: Sequence[cr.StateV
         if v.c2 is not None and v.k2 is not None and v.k2 > 0:
             u[k] += 0.5 * v.k2 * (cv2 - v.c2) ** 2
     return float(beta) * u
-
-
-def solve_rows(u_nk: np.ndarray, window: np.ndarray, *, tol: float = MBAR_TOL, max_iter: int = MBAR_MAX_ITER,
-               f_init: Optional[np.ndarray] = None, info: Optional[Dict[str, Any]] = None
-               ) -> Tuple[np.ndarray, np.ndarray]:
-    """MBAR on (N, K) reduced energies ``u_nk`` with ``window`` = each row's state index, by
-    gareus-analyze's ``solve_mbar`` (MBAR_BACKEND, NumPy fallback). Returns (f, logw): f over
-    all K states with f_0 = 0 (NaN for a state without rows, gauge then set on the first
-    sampled one), logw the normalised per-row log weights. ``f_init`` warm-starts the solve.
-    ``info`` receives ``converged``, ``iterations``, ``max_delta_f`` and ``backend``."""
-    kw = dict(tol=float(tol), maxiter=int(max_iter), threads=0, f_init=f_init)
-    try:
-        res = _mbar.solve_mbar(u_nk, window, backend=MBAR_BACKEND, **kw)
-    except RuntimeError as exc:
-        if _mbar.NUMBA_AVAILABLE:
-            raise
-        res = _mbar.solve_mbar(u_nk, window, backend=MBAR_FALLBACK_BACKEND, **kw)
-        res["fallback_reason"] = str(exc)
-    f = np.asarray(res["f_k"], dtype=float).copy()
-    fin = np.flatnonzero(np.isfinite(f))
-    if fin.size:
-        f -= f[fin[0]]
-    if info is not None:
-        info.update(converged=bool(res["converged"]), iterations=int(res["iterations"]),
-                    max_delta_f=float(res["max_delta"]), backend=str(res["backend"]))
-    return f, np.asarray(res["logw"], dtype=float)
-
-
-def solve_mbar(u_kn: np.ndarray, n_k: np.ndarray, *, tol: float = MBAR_TOL, max_iter: int = MBAR_MAX_ITER,
-               info: Optional[Dict[str, Any]] = None, f_init: Optional[np.ndarray] = None) -> np.ndarray:
-    """Self-consistent MBAR free energies (f_0 = 0) of the sampled states, (K, N) layout: the
-    pre-v3 signature, now a thin wrapper over ``solve_rows`` (gareus-analyze's solver). MBAR's f
-    depends on the per-state counts only, not on which row came from which state, so the rows
-    are given the window ``repeat(arange(K), n_k)``. ``n_k`` must be positive integers summing
-    to N. ``info`` receives ``converged``, ``iterations``, ``max_delta_f`` and ``backend``."""
-    u_kn = np.asarray(u_kn, dtype=float)
-    n = np.asarray(n_k, dtype=float)
-    counts = np.rint(n).astype(np.int64)
-    if n.ndim != 1 or n.size != u_kn.shape[0] or np.any(np.abs(n - counts) > 1e-9) or np.any(counts <= 0) \
-            or int(counts.sum()) != u_kn.shape[1]:
-        raise ValueError("solve_mbar: n_k must be one positive integer count per row of u_kn, summing to its "
-                         f"columns (got {n.size} counts summing to {n.sum():g} for u_kn {u_kn.shape})")
-    window = np.repeat(np.arange(counts.size), counts)
-    f, _logw = solve_rows(np.ascontiguousarray(u_kn.T), window, tol=tol, max_iter=max_iter, f_init=f_init,
-                          info=info)
-    return f
 
 
 def log_weights(u_kn: np.ndarray, n_k: np.ndarray, f: np.ndarray) -> np.ndarray:

@@ -69,17 +69,11 @@ class CentreRungModel:
 
 
 def _mbar_f(u_kn: np.ndarray, n_k: np.ndarray, tol: float = 1e-10, max_iter: int = 20000) -> np.ndarray:
-    """Self-consistent MBAR free energies (reduced units, f[0] = 0)."""
-    f = np.zeros(u_kn.shape[0])
-    log_n = np.log(n_k)
-    for _ in range(max_iter):
-        denom = _logsumexp(log_n[:, None] + f[:, None] - u_kn, axis=0)
-        f_new = -_logsumexp(-u_kn - denom[None, :], axis=1)
-        f_new = f_new - f_new[0]
-        if np.max(np.abs(f_new - f)) < tol:
-            return f_new
-        f = f_new
-    return f
+    """Self-consistent MBAR free energies (reduced units, f[0] = 0) of the centre's rungs, (K, N)
+    layout, on gareus-analyze's solver (``gareus.adaptive.mbar_solve``; imported here so loading
+    this module does not pull in the MBAR/numba stack)."""
+    from gareus.adaptive.mbar_solve import solve_mbar  # noqa: PLC0415
+    return solve_mbar(u_kn, n_k, tol=tol, max_iter=max_iter)
 
 
 def fit_centre_model(samples: Dict[float, Tuple[np.ndarray, np.ndarray]], env: PepGamdEnvelope, beta: float,

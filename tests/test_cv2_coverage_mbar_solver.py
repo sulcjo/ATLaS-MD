@@ -74,7 +74,8 @@ def test_gareus_analyze_solver_matches_the_old_fixed_point_to_1e8():
     lw_old = cov.log_weights(u[:, perm], n_k, ref)
     assert np.allclose(logw - logw.max(), lw_old - lw_old.max(), atol=1e-8)
     # and the NumPy fallback backend agrees too
-    res = cov._mbar.solve_mbar(np.ascontiguousarray(u.T), idx, backend=cov.MBAR_FALLBACK_BACKEND, tol=1e-10)
+    from gareus.adaptive import mbar_solve as ms
+    res = ms._mbar.solve_mbar(np.ascontiguousarray(u.T), idx, backend=cov.MBAR_FALLBACK_BACKEND, tol=1e-10)
     assert np.max(np.abs(res["f_k"] - res["f_k"][0] - ref)) < 1e-8
 
 
