@@ -26,6 +26,10 @@ lambda > 0, and the new k2 is replicated onto every rung as every centre is):
     the subsample's own g x stride), never across a sample source, at least BOOT_MIN_BLOCKS
     blocks (guard recorded). The bootstrap's var_b/var_sub quantiles scale the full-series var
     (BOOT_QUANTILES 5-95 %). n_eff = n / g must reach ``respring_min_neff``.
+    Known bias (safe direction): when the P4 stride exceeds g the bootstrap sees about
+    n / stride nearly independent rows, not n_eff, so the interval is too wide by up to
+    sqrt(n_eff stride / n) (chignolin_9 final-combined: stride 20, median ~1.7x) and fewer
+    windows trigger; point estimates are unaffected.
 
 Decision (per candidate state, ``decision`` / ``reason``):
   * skipped -- ``not_representative_rung`` (never reported per state), ``cv2_unrestrained``

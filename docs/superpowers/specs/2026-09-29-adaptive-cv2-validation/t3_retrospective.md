@@ -882,16 +882,38 @@ triggered window therefore gets k2' = F''_prod, and its predicted c is 0.5 by co
   - The CV1 = 0.070 column triggers on both of its lower rows (80, 192; c_real 0.30 / 0.33).
   - None of the 4 CV1-free CV2-only windows (64-76) triggers.
 - **epoch_002 vs final-combined.** epoch_002 triggers 6 windows: 80, 108, 128 and 152 at -1.851,
-  192 and 196. The final-combined data are about 9x more samples and triggers 20, a superset.
-  A confident-only rule acts on more windows as the intervals shrink. At final-combined scale
-  the 0.05 tolerance, not the interval, decides.
+  192 and 196. The final-combined payload has about 9x more samples and triggers 20, a superset.
+  A confident-only rule acts on more windows as its intervals shrink.
+- **The final-combined intervals are conservative.** Its P4 subsample stride is 20 (n = 38,812,
+  about 1,940 kept rows), while g is 3.3-24.9. So the bootstrap blocks are 1-7 rows, and the
+  bootstrap sees about n / stride nearly independent rows instead of n_eff = n / g. The ratio is
+  0.8-6.2, median 2.9, so the c_real intervals are up to about 1.7x too wide in the median.
+  - Point estimates are unaffected. The bias is in the safe direction: fewer triggers.
+  - With correctly sized intervals, more of the 24 windows whose point c_real is below 0.45 would
+    trigger.
+  - epoch_002 is consistent: its stride is 2, and n_eff / (n / stride) is 0.19-0.66.
+  - A live epoch with a large P4 stride would show the same bias.
 - **Cross-check with 10.5.** It uses the same final-combined payload.
   - The conditional F''_prod equals t3c's F''_loc for all 39 2-D windows (ratio 1.000 at every
-    quantile).
+    quantile). This uses the same payload and the same formula, so it checks arithmetic and
+    wiring only; it is not independent evidence.
   - The marginal F''_prod, which is the value the rule decides on, is 0.91-1.00 of it (median
     0.996).
   - By t3c's point values, 27 of the 39 would sit below 0.5 under k2 = 1.18. The interval rule
     acts on 20.
+- **Independent check of the compression premise (payload only, `t2_data/t3d_respring_c_mean_check.json`).**
+  c_real is read from the variance under a harmonic assumption. It can also be read from the means:
+  c_mean = (window CV2 mean - z0)/(c2 - z0), where z0 is the CV2 mean of the same column's
+  CV1-only (k2 = 0) window. The check uses 34 2-D windows; 5 have |c2 - z0| < 0.3 and are
+  excluded.
+  - The two correlate at 0.72.
+  - Over all 34: c_mean median 0.50 (10-90 % 0.41-0.59), c_real 0.42 (0.37-0.57).
+  - Over the 18 triggered windows among them: c_mean 0.45 (range 0.32-0.53), and 14 of the 18 are
+    below 0.5.
+  - So the variance proxy reads about 0.05 lower than the mean-based measure. For 4 triggered
+    windows the independent measure says the target is already reached.
+  - The check itself assumes that the CV1-only window's mean is the column's unbiased CV2 mean,
+    and that the displacement is harmonic.
 - **Cost to the layout (predicted, not measured).** At k2' = F''_prod, the sampled CV2 sd of a
   triggered window shrinks by sqrt((k2 + F'')/(2 F'')). That is 0.85-0.93x on c9. Its CV2
   neighbour overlaps drop accordingly, and the next epoch's 3.1 metric re-grades those edges.
