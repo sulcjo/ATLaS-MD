@@ -493,3 +493,104 @@ Other outputs are in `/tmp/t3/`, outside the repo and not committed:
 - `prop_c9.json`, `prop_c7.json`.
 
 Run with `PYTHONPATH=<worktree>`.
+
+
+## 10. Follow-up replays for P1, 3.2, 3.3 and 3.7 (2026-09-30, branch `feat/cv2-resolution`)
+
+All replays are read-only on chignolin_9 and ignore the replica cap. Nothing under `RUNS/` was
+written. The scripts are in `scripts/t3b_*.py`. Every behaviour below is off by default and none
+of it has run in MD.
+
+### 10.1 3.2 shape layout on the chignolin_9 swarm
+
+Input: 48,024 frames from 174 members, analysed in 15 CV1 columns; the fit accepts 26 CV2 modes
+across them. Script: `t3b_shape_layout_replay.py [reserve] [min_mode_members] [out_dir]`.
+
+| Shape rule | Centres at the k2 floor | k2 range (uniform layout: 1.18) | Mean compression k2/(k2+F'') | CV2 centres per column |
+|---|---|---|---|---|
+| As specified: k2 = RT/sigma_w^2 - F'', variance-space shrinkage | 49 / 63 | 0.001-0.106 (median 0.001) | <= 0.09 | 3-6 |
+| + mean-compression floor k2 >= F'' (`980fcaf`) | 0 / 63 | 1.07-2.73 | 0.50 at every centre | 5-7 |
+| + precision-space shrinkage (`1d94d8d`) | 0 | 1.07-13.1 | 0.50 at every centre | 5-9 |
+
+- **Why the specified rule failed.** The target width, the uniform layout's sigma_w = 0.711,
+  equals the swarm's own per-column CV2 sd of 0.6-0.75. RT/sigma_w^2 - F'' is then <= 0, so the
+  windows are restrained in name only and their sampled means follow the mode, not their
+  centres.
+- **What the floor does.** It binds at every chignolin_9 centre, so on this system the width
+  target never takes effect.
+- **What precision-space shrinkage changes.** Narrow modes keep their curvature. The recurrent
+  narrow mode at CV2 about -1.4 (sd 0.2-0.35) now gets k2 up to 13.1.
+- **The layout is cap-bound.** The final layout under the 59-state spatial cap is 25 mode cells,
+  6 CV1-free per-mode windows (X7), 14 CV1-axis states, 4 CV2 rows and 8 of 74 fill cells.
+  With a 0.15 reserve there are about no fills left. `--ap-ladder-adapt respace` keeps the
+  rung count, so it frees no replicas. Real headroom needs fewer rungs (X1, drop lambda = 1) or
+  more replicas.
+
+### 10.2 3.3 R1-R3 dry run
+
+Script: `t3b_cv2_resolution_dryrun.py <adaptive_dir> <payload> <phase> <out.json> [--union NPZ]
+[--transition-count ...]`. The payloads are the section-2 collector re-runs with
+`--ap-edge-metric pairwise-mbar`.
+
+| | epoch_002 | final-combined |
+|---|---|---|
+| R1 | 24 edges that differ mainly in CV2, all `ok` (17 not eligible, 35 not CV2-mainly); 1 component | same, 24 `ok` |
+| R2 | unavailable: top-ups were off, so there is no per-epoch union | ran on 143,513 lambda = 0 rows of `adaptive_union_mbar.npz` (0.41 GB); every weighted interval has 2-6 contributing centres and bootstrap sigma <= 0.34 kT, so no holes |
+| R3 | 36 no_action, 3 flagged `trapped_or_orthogonal` | 39 no_action |
+| Actions | 0 | 0 |
+| Wall time | 61 s | 167 s |
+
+The three R3 windows sit on the top CV2 row. Their modes are about +0.2 and +1.2 in CV2 units:
+
+| State | Depth (kT) | Crossings within replica residence | State-series switches | Child F''_est (lower / upper mode) | Child k2 at the cap (4 x 1.18 = 4.72) | Mean compression at the upper mode |
+|---|---|---|---|---|---|---|
+| 84 | 1.55 | 5 | 370 | 4.7 / 30.3 | 4.72 / 4.72 | 0.13 |
+| 200 | 1.10 | 0 | 469 | 1.9 / 7.3 | 1.87 / 4.72 | 0.39 |
+| 220 | 1.65 | 5 | 458 | 3.7 / 21.3 | 3.73 / 4.72 | 0.18 |
+
+- **The crossing count is the open decision.** The replica-resolved count (`--ap-refine-transition-count replica`,
+  the default) excludes exchange swaps that bring in a walker already in the other mode. chignolin_9
+  replicas stay about 2 samples per window, so that count almost never reaches the threshold of 10.
+- **State-series counting.** Re-run with `--transition-count state-series` (the flag, `337ff9b`),
+  all 3 windows pass the crossing test and are refused `k2_capped_below_compression` instead,
+  exactly as the pre-flag counterfactual did. Either way chignolin_9 gets 0 actions.
+- **The binding limit.** It is the 4x-parent growth cap against upper-mode curvatures of
+  7-30, not the transition rule.
+
+### 10.3 3.7 summary and report row
+
+Command: `python -m gareus.adaptive.cv2_resolution_summary`, run on the 10.2 payloads and reports.
+
+| | epoch_002 | final-combined |
+|---|---|---|
+| States / CV2-restrained / R3-evaluated | 236 / 172 / 39 | 236 / 172 / 39 |
+| Graded edges / weak / unmeasured | 276 / 0 / 0 | 276 / 0 / 0 |
+| Graded edges with pairwise point < 0.15 (never weak: neighbour, spanning or cross-pattern kinds, or q90 >= 0.15) | 91 | 84 |
+| Components | 1 | 1 |
+| trapped_or_orthogonal | 3 | 0 |
+| `gareus_report` "CV2 resolution" row | CAUTION | PASS |
+| Confinement ratio cv2_sd / sigma_w2, lambda = 0 (43 states) | 0.56-0.84, median 0.72 | 0.55-0.77, median 0.66 |
+| Graded-edge median overlap: pairwise / CV1 marginal / joint 2D | 0.25 / 0.52 / 0.50 | 0.26 / 0.51 / 0.52 |
+
+- The new row leaves chignolin_9's overall verdict at CAUTION, because other rows already
+  grade it CAUTION.
+- `adaptive_fig5_state_coordinates.png` shows the 4 rungs. The CV1-only windows sit at their
+  sampled CV2 means, which trace a curved valley rather than a placeholder row. The 3 trapped
+  windows are ringed in the epoch_002 panel.
+- With `--ap-cv2-resolution` on, a campaign writes
+  `adaptive_production/cv2_resolution_summary_final_combined.json` (the file the row reads)
+  after every final-combined collection (`df8f387`).
+
+### 10.4 What this means for chignolin_10
+
+- The shape layout with both follow-ups gives CV2 windows that are genuinely restrained. The
+  cost is 5-9 centres per CV1 column, and at chignolin_9 scale that does not fit without more
+  replica headroom.
+- R1-R3 find nothing to do on chignolin_9's data. That is expected: its CV2 is residual PC1
+  with uniform k2 = 1.18, and the layout is already connected on the pairwise metric.
+- Before launch:
+  - decide the crossing count;
+  - decide the 4x cap, which is what refuses the only candidates;
+  - set a reserve > 0, since otherwise every action is refused `no_reserve`;
+  - calibrate `refine_min_transitions` (10), `coverage_min_windows` (2),
+    `refine_pmf_sigma_kt` (0.5) and `refine_min_sigma` (0.1) in T2.
