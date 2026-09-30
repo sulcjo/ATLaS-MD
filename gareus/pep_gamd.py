@@ -332,7 +332,9 @@ def _build_integrator_class():
                 ["threshold_energy", "StartingPotentialEnergy"], compute_type)
             self.add_compute_global_by_name(
                 "boost_threshold", "0.001 * {0}", ["energy_scale"], compute_type)
-            dc = "((1 - {6}) * ({3} - {4}) / max({0}, 1e-300))"
+            # |Vmax - Vmin|: an uninitialised envelope (Vmax = -1e99, Vmin = 1e99, k0 = 0) must not
+            # turn d_c into -inf and 0.5*k0*min(d, d_c)^2 into 0*inf = NaN (legacy gives 0 there).
+            dc = "((1 - {6}) * abs({3} - {4}) / max({0}, 1e-300))"
             self.add_compute_global_by_name(
                 "BoostPotential",
                 "select(step(abs({3} - {4}) - {5}), "
@@ -611,7 +613,7 @@ def _channel_boost(v, e, vmax, vmin, k0, fsf_floor=None):
         # Clamped: C1 linear continuation past d_c, where 1 - k d_c = f.
         a = 1.0 - float(fsf_floor)
         d = e - v
-        dc = a * rng / max(float(k0), 1e-300)
+        dc = a * abs(rng) / max(float(k0), 1e-300)
         b = 0.5 * k0 * _np.minimum(d, dc) ** 2 / rng + a * _np.maximum(0.0, d - dc)
     b = _np.where(_np.abs(rng) <= 0.001 * scale, 0.0, b)
     return _np.where((b + v) < e, b, 0.0)
@@ -735,7 +737,7 @@ def _npt_lower_bound_channel_boost(e_channel, vmax, vmin, threshold, k0, fsf_flo
         b = 0.5 * k0 * d ** 2 / (vmax - vmin)
     else:
         a = 1.0 - float(fsf_floor)
-        d_c = a * (vmax - vmin) / max(float(k0), 1e-300)
+        d_c = a * abs(vmax - vmin) / max(float(k0), 1e-300)
         b = 0.5 * k0 * min(d, d_c) ** 2 / (vmax - vmin) + a * max(0.0, d - d_c)
     if not (e_channel + b < threshold):
         return 0.0

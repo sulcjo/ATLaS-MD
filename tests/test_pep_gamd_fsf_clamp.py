@@ -336,3 +336,55 @@ def test_npt_channel_boost_matches_closed_form_with_a_floor():
             a = _npt_lower_bound_channel_boost(v, VMAX, VMIN, E, 1.0, fsf_floor=floor)
             b = float(_channel_boost(np.array([v]), E, VMAX, VMIN, 1.0, fsf_floor=floor)[0])
             assert abs(a - b) < 1e-9, (v, floor, a, b)
+
+
+# --------------------------------------------------------------------------- review fixes (2026-10-01)
+
+def test_uninitialised_envelope_gives_zero_boost_not_nan_in_closed_form():
+    from gareus.pep_gamd import _channel_boost, _npt_lower_bound_channel_boost
+    b = _channel_boost(np.array([-3000.0, 0.0]), -1e99, -1e99, 1e99, 0.0, fsf_floor=0.6)
+    assert np.all(np.isfinite(b)) and np.all(b == 0.0)
+    assert _npt_lower_bound_channel_boost(-3000.0, -1e99, 1e99, -1e99, 0.0, fsf_floor=0.6) == 0.0
+
+
+def test_clamped_integrator_with_default_globals_stays_finite():
+    """Adversarial finding: an integrator stepped in a boost stage with its default globals
+    (Vmax = -1e99, Vmin = 1e99, k0 = 0) used to NaN through d_c = -inf. Legacy stays finite there."""
+    openmm, _app, unit = import_openmm()
+    system, fx = _system()
+    integ = _integ(system, unit, fsf_floor_total=0.6, fsf_floor_dihedral=0.0)
+    ctx = openmm.Context(system, integ, openmm.Platform.getPlatformByName("Reference"))
+    ctx.setPositions(fx["positions"]); ctx.setVelocitiesToTemperature(300 * unit.kelvin, 5)
+    integ.step(1)
+    for k, v in {"stepCount": 50, "stage": 5, "k0_Total": 0.0, "k0_Dihedral": 0.0,
+                 "Vmax_Total": -1e99, "Vmin_Total": 1e99, "Vmax_Dihedral": -1e99, "Vmin_Dihedral": 1e99}.items():
+        integ.setGlobalVariableByName(k, v)
+    integ.step(3)
+    for n in ("BoostPotential_Total", "BoostPotential_Dihedral", "ForceScalingFactor_Total",
+              "ForceScalingFactor_Dihedral", "StartingPotentialEnergy_Total"):
+        assert np.isfinite(integ.getGlobalVariableByName(n)), n
+    pos = ctx.getState(getPositions=True).getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+    assert np.all(np.isfinite(pos))
+
+
+def test_sidecar_run_adopts_the_envelopes_floors(tmp_path):
+    from types import SimpleNamespace
+    from gareus.swarm.epoch0 import _apply_sidecar_gamd_envelope
+    d = tmp_path / "shared_gamd_setup"; d.mkdir()
+    (d / "shared_gamd_setup_globals.json").write_text(json.dumps({"all_globals": _globals(fsf_floor_Total=0.6, fsf_floor_Dihedral=0.0)}))
+    side = {"gamd": {"shared_gamd_setup_dir": str(d)}}
+    args = SimpleNamespace(shared_gamd_setup_dir="", pep_gamd_fsf_floor_total=None, pep_gamd_fsf_floor_dihedral=None)
+    rec = _apply_sidecar_gamd_envelope(args, side, tmp_path / "ladder_run_args.yaml")
+    assert args.pep_gamd_fsf_floor_total == 0.6 and args.pep_gamd_fsf_floor_dihedral == 0.0
+    assert rec["pep_gamd_fsf_floor_total"] == 0.6
+    explicit = SimpleNamespace(shared_gamd_setup_dir="", pep_gamd_fsf_floor_total=0.4, pep_gamd_fsf_floor_dihedral=0.0)
+    _apply_sidecar_gamd_envelope(explicit, side, tmp_path / "ladder_run_args.yaml")
+    assert explicit.pep_gamd_fsf_floor_total == 0.4          # explicit args kept; reconcile refuses later
+
+
+def test_interesting_globals_keep_the_floors():
+    from gareus.production import integrator_globals
+    openmm, _app, unit = import_openmm()
+    system, _fx = _system()
+    g = integrator_globals(_integ(system, unit, fsf_floor_total=0.6, fsf_floor_dihedral=0.0))
+    assert g.get("fsf_floor_Total") == 0.6 and g.get("fsf_floor_Dihedral") == 0.0

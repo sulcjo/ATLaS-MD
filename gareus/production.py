@@ -1033,7 +1033,7 @@ def integrator_globals(integrator, unit=None, include_all: bool = False) -> dict
     else:
         interesting = (
             "boost", "sigma", "vmax", "vmin", "vavg", "energy",
-            "threshold", "k0", "step", "stage", "window", "potential",
+            "threshold", "k0", "step", "stage", "window", "potential", "fsf_floor",
         )
         out = {name: value for name, value in all_globals.items() if any(s in name.lower() for s in interesting)}
     # Add native stage/step where available; these names are stable in
