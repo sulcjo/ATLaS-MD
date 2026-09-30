@@ -294,7 +294,8 @@ def _method_settings(args: Any) -> dict[str, Any]:
         "ewald_error_tolerance", "run_mode", "hmr", "hydrogen_mass_amu", "cv1", "cv2",
         "primary_cv", "cv_mode", "contact_scheme", "contact_atom_selection",
         "window_mode", "secondary_cv", "secondary_cv_centers",
-        "gamd_boost_type", "sigma0p_kcal_mol", "sigma0d_kcal_mol", "gamd_production_steps",
+        "gamd_boost_type", "sigma0p_kcal_mol", "sigma0d_kcal_mol",
+        "pep_gamd_fsf_floor_total", "pep_gamd_fsf_floor_dihedral", "gamd_production_steps",
         "exchange_mode", "exchange_interval", "traj_format", "sample_potential_energy",
         "flush_every_log", "analysis_array_dtype", "state_gamd_lambdas",
         # NPT correction (2026-09-12 design): the resolved backend and the

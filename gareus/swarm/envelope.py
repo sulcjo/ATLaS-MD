@@ -4,7 +4,7 @@ production.load_reusable_shared_gamd_setup read. Fitted once; frozen (spec §3.6
 from __future__ import annotations
 import math
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 import numpy as np
 from gareus.gamd_calibration import (
     WelfordAccumulator,
@@ -83,7 +83,7 @@ def pool_member_envelopes(traces: Dict[int, Dict[str, np.ndarray]], discard: int
 
 
 def write_envelope_setup_dir(setup_dir: Path, envelopes: Dict[str, PooledEnvelope], *, sigma0_kj: Dict[str, float],
-                              temperature_k: float, meta: dict) -> Path:
+                              temperature_k: float, meta: dict, fsf_floor: Optional[Dict[str, float]] = None) -> Path:
     setup_dir = Path(setup_dir)
     setup_dir.mkdir(parents=True, exist_ok=True)
     all_globals: Dict[str, float] = {}
@@ -100,6 +100,10 @@ def write_envelope_setup_dir(setup_dir: Path, envelopes: Dict[str, PooledEnvelop
             "sigma0_kj_mol": float(sigma0_kj[grp]), "k0": thr.k0, "k": thr.k, "threshold_energy_kj_mol": thr.threshold_energy,
             "boosted": thr.boosted, "n_windows_pooled": env.n_windows, "n_samples_pooled": env.n_total,
         }
+    if fsf_floor is not None:
+        # The FSF clamp is part of the frozen envelope: integrator, in-run MBAR and analysis all read it here.
+        for grp, floor in fsf_floor.items():
+            all_globals[f"fsf_floor_{grp}"] = float(floor)
     path = setup_dir / "shared_gamd_setup_globals.json"
     write_json(path, {
         "mode": "swarm_unbiased_envelope",

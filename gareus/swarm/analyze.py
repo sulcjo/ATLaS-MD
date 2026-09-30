@@ -42,7 +42,7 @@ from gareus.cv_selection.select_pair import SelectionConfig, SwarmDataset, selec
 from gareus.cv_selection.coverage import build_region_inventory, region_centres
 from gareus.swarm.cv2_shape_layout import one_dimensional_reserve, select_pair_layout
 from gareus.io import write_json
-from gareus.pep_gamd import PepGamdEnvelope
+from gareus.pep_gamd import PepGamdEnvelope, resolve_fsf_floors
 from gareus.swarm.driver import _load_plan, round_dir, swarm_root
 from gareus.swarm.envelope import (
     discard_frames_from_trace,
@@ -497,7 +497,10 @@ def analyze_swarm_stage(out_dir, args) -> dict:
             "n_members_pooled": len(ok_traces), "seed_ns": seed_ns,
         }
         setup_path = write_envelope_setup_dir(an / "shared_gamd_setup", envelopes, sigma0_kj=sigma0_kj,
-                                               temperature_k=temperature_k, meta=setup_meta)
+                                               temperature_k=temperature_k, meta=setup_meta,
+                                               fsf_floor=resolve_fsf_floors(
+                                                   getattr(args, "pep_gamd_fsf_floor_total", None),
+                                                   getattr(args, "pep_gamd_fsf_floor_dihedral", None)))
         env = PepGamdEnvelope.from_json(setup_path)
 
         v_pep = _pool(ok_traces, "v_pep_kj", discard)

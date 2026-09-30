@@ -833,6 +833,14 @@ def _add_gamd_args(p: argparse.ArgumentParser) -> None:
                    help="Primary sigma0 in kcal/mol for GaMD.")
     p.add_argument("--sigma0d", type=float, default=6.0,
                    help="Secondary sigma0 in kcal/mol for dual-boost GaMD.")
+    p.add_argument("--pep-gamd-fsf-floor-total", type=float, default=None,
+                   help="Pep-GaMD FSF clamp: lower floor in [0, 1) for the Total channel's force scaling "
+                        "factor. Past the point where 1 - k(E - V) reaches the floor, the boost continues "
+                        "linearly (C1), so boosted forces never weaken below the floor or reverse. Frozen "
+                        "into the GaMD envelope. Unset on both channels = legacy unclamped boost. Setting "
+                        "either channel clamps both (the other at 0.0). pep-gamd-lower-dual only.")
+    p.add_argument("--pep-gamd-fsf-floor-dihedral", type=float, default=None,
+                   help="Pep-GaMD FSF clamp floor for the Dihedral channel; see --pep-gamd-fsf-floor-total.")
     p.add_argument("--equil-steps", type=int, default=50000,
                    help="GaMD equilibration steps for boost calibration.")
     p.add_argument("--gamd-cmd-steps", type=int, default=250000,
@@ -1309,6 +1317,25 @@ def _validate_gamd_args(args: argparse.Namespace) -> None:
             "calibration here; set that instead.",
             flush=True,
         )
+
+
+def _validate_fsf_clamp_args(p: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """--pep-gamd-fsf-floor-*: [0, 1), Pep-GaMD only; one set clamps both (the other at 0.0)."""
+    total = getattr(args, "pep_gamd_fsf_floor_total", None)
+    dihedral = getattr(args, "pep_gamd_fsf_floor_dihedral", None)
+    if total is None and dihedral is None:
+        return
+    boost_type = str(getattr(args, "gamd_boost_type", "") or "")
+    if boost_type != "pep-gamd-lower-dual":
+        p.error(f"--pep-gamd-fsf-floor-total/--pep-gamd-fsf-floor-dihedral need --gamd-boost-type "
+                f"pep-gamd-lower-dual; got {boost_type!r}")
+    from .pep_gamd import resolve_fsf_floors
+    try:
+        floors = resolve_fsf_floors(total, dihedral)
+    except ValueError as exc:
+        p.error(str(exc))
+    args.pep_gamd_fsf_floor_total = floors["Total"]
+    args.pep_gamd_fsf_floor_dihedral = floors["Dihedral"]
 
 
 def _validate_cv_selection_args(p: argparse.ArgumentParser, args: argparse.Namespace) -> None:
@@ -2002,6 +2029,7 @@ def parse_args(argv: Optional[Iterable[str]] = None):
     args.contact_scheme = contact_scheme(args)
     _validate_contact_args(args)
     _validate_gamd_args(args)
+    _validate_fsf_clamp_args(p, args)
     _validate_cv_selection_args(p, args)
     _validate_npt_args(args)
     _validate_replica_admission_args(args)

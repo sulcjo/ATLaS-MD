@@ -15,7 +15,7 @@ water-water twice.
 """
 from __future__ import annotations
 
-from typing import Iterable
+from typing import Iterable, Optional
 
 PEP_GAMD_PREFIX = "pep-gamd-"
 PEP_GAMD_BOOST_TYPE = PEP_GAMD_PREFIX + "lower-dual"
@@ -32,6 +32,57 @@ _GROUP0_CLASSES = (
     "CMMotionRemover", "MonteCarloBarostat", "MonteCarloAnisotropicBarostat",
     "MonteCarloMembraneBarostat",
 )
+
+
+FSF_FLOOR_GLOBAL = "fsf_floor"
+FSF_CHANNELS = ("Total", "Dihedral")
+
+
+def resolve_fsf_floors(total=None, dihedral=None):
+    """``None`` when both are unset (legacy, unclamped); else {channel: floor}, an unset one at 0.0.
+
+    A floor f in [0, 1) keeps the lower-bound force scaling factor >= f by continuing the
+    boost linearly past the point where 1 - k d = f (spec 2026-10-01-pep-gamd-fsf-clamp.md).
+    """
+    if total is None and dihedral is None:
+        return None
+    out = {"Total": 0.0 if total is None else float(total), "Dihedral": 0.0 if dihedral is None else float(dihedral)}
+    for ch, f in out.items():
+        if not (0.0 <= f < 1.0):
+            raise ValueError(f"FSF floor for the {ch} channel must lie in [0, 1); got {f}")
+    return out
+
+
+def reconcile_fsf_floors(integrator, values) -> None:
+    """Fail closed when an envelope/globals dict and an integrator disagree about the FSF clamp.
+
+    Called before copying ``values`` into ``integrator`` by name. A floor the integrator lacks
+    would be skipped silently (integrator unclamped, analysis clamped); an envelope (it carries
+    ``k0_<channel>``) without the floor of a clamped integrator would leave analysis unclamped;
+    and two different floors are two different Hamiltonians.
+    """
+    values = values or {}
+    try:
+        names = {str(integrator.getGlobalVariableName(i)) for i in range(int(integrator.getNumGlobalVariables()))}
+    except AttributeError:
+        return
+    for ch in FSF_CHANNELS:
+        key = f"{FSF_FLOOR_GLOBAL}_{ch}"
+        has_int, has_val = key in names, key in values
+        if has_val and not has_int:
+            raise ValueError(
+                f"the frozen GaMD envelope carries {key}={values[key]} but the integrator was built "
+                "without the FSF clamp; set --pep-gamd-fsf-floor-total/--pep-gamd-fsf-floor-dihedral "
+                "to the envelope's values")
+        if has_int and not has_val and f"k0_{ch}" in values:
+            raise ValueError(
+                f"the integrator clamps the {ch} FSF ({key}={integrator.getGlobalVariableByName(key)}) "
+                "but the frozen GaMD envelope has no FSF floor; the envelope was built without the "
+                "clamp, so analysis would reweight with a different boost")
+        if has_int and has_val:
+            a, b = float(integrator.getGlobalVariableByName(key)), float(values[key])
+            if abs(a - b) > 1e-12:
+                raise ValueError(f"{key}: integrator {a} differs from the frozen GaMD envelope {b}")
 
 
 def find_aux_force(system):
@@ -231,7 +282,7 @@ def _build_integrator_class():
         TOTAL_ENERGY_PLUS_GROUPS = frozenset({PHYSICAL_NONBONDED_GROUP, DIHEDRAL_GROUP})
         TOTAL_ENERGY_MINUS_GROUPS = frozenset({AUX_NONBONDED_GROUP})
 
-        def __init__(self, *args, bias_force_groups=None, **kwargs):
+        def __init__(self, *args, bias_force_groups=None, fsf_floor_total=None, fsf_floor_dihedral=None, **kwargs):
             # REQUIRED, deliberately. The applied force reads the bias groups
             # directly instead of recovering them from an all-groups
             # evaluation, so a caller that omits them would silently drop every
@@ -251,7 +302,65 @@ def _build_integrator_class():
             # Must precede super().__init__: the parent builds the computation
             # steps during construction, and those steps read this list.
             self._pep_bias_groups = tuple(int(g) for g in bias_force_groups)
+            # FSF clamp (spec 2026-10-01-pep-gamd-fsf-clamp.md). Unset on both
+            # channels = the upstream program, byte-identical; setting either
+            # clamps both, an unset one at 0.0 (only forbids force reversal).
+            self._fsf_floors = resolve_fsf_floors(fsf_floor_total, fsf_floor_dihedral)
             super().__init__(*args, **kwargs)
+
+        def _add_common_variables(self):
+            super()._add_common_variables()
+            for name in ("PepF0", "PepF1", "PepF2"):
+                self.addPerDofVariable(name, 0.0)
+            for j in range(len(self._pep_bias_groups)):
+                self.addPerDofVariable(f"PepFb{j}", 0.0)
+            for name in ("PepE0", "PepE1", "PepE2"):
+                self.addGlobalVariable(name, 0.0)
+            if self._fsf_floors is not None:
+                for channel, floor in self._fsf_floors.items():
+                    self.addGlobalVariable(self._append_group_name(FSF_FLOOR_GLOBAL, channel), floor)
+
+        def _add_gamd_pre_calc_step(self, compute_type):
+            if self._fsf_floors is None:
+                return super()._add_gamd_pre_calc_step(compute_type)
+            # Upstream (gamd/langevin/base_integrator.py) with the harmonic boost
+            # replaced by its C1 linear continuation past d_c = (1-f)(Vmax-Vmin)/k0:
+            #   dV = 1/2 k0 min(d, d_c)^2/(Vmax-Vmin) + (1-f) max(0, d - d_c),  d = E - V.
+            # No division by k0 reaches the result: at k0 = 0 d_c is huge, min() = d.
+            self.add_compute_global_by_name(
+                "energy_scale", "max(max(abs({0}), abs({1})), 1.0)",
+                ["threshold_energy", "StartingPotentialEnergy"], compute_type)
+            self.add_compute_global_by_name(
+                "boost_threshold", "0.001 * {0}", ["energy_scale"], compute_type)
+            dc = "((1 - {6}) * ({3} - {4}) / max({0}, 1e-300))"
+            self.add_compute_global_by_name(
+                "BoostPotential",
+                "select(step(abs({3} - {4}) - {5}), "
+                "0.5 * {0} * min({1} - {2}, " + dc + ")^2 / ({3} - {4})"
+                " + (1 - {6}) * max(0, ({1} - {2}) - " + dc + "), 0)",
+                ["k0", "threshold_energy", "StartingPotentialEnergy", "Vmax",
+                 "Vmin", "boost_threshold", FSF_FLOOR_GLOBAL], compute_type)
+            self.add_compute_global_by_name(
+                "BoostPotential", "{0}*step({1} - ({2} + {3}))",
+                ["BoostPotential", "threshold_energy", "BoostPotential",
+                 "StartingPotentialEnergy"], compute_type)
+            self.add_compute_global_by_name(
+                "check_boost", "1 - delta({0})", ["BoostPotential"], compute_type)
+            self.add_compute_global_by_name(
+                "boosted_energy", "{0} + {1}",
+                ["StartingPotentialEnergy", "BoostPotential"], compute_type)
+
+        def _add_gamd_boost_calculations_step(self, compute_type):
+            if self._fsf_floors is None:
+                return super()._add_gamd_boost_calculations_step(compute_type)
+            # FSF = 1 + d(dV)/dV = max(f, 1 - k0 (E - V)/(Vmax - Vmin)); check_boost as upstream.
+            self.add_compute_global_by_name(
+                "ForceScalingFactor", "max({5}, 1.0 - (({0} * ({1} - {2}))/({3} - {4})))",
+                ["k0", "threshold_energy", "StartingPotentialEnergy", "Vmax",
+                 "Vmin", FSF_FLOOR_GLOBAL], compute_type)
+            self.add_compute_global_by_name(
+                "ForceScalingFactor", "1.0 - {0} + {0} * {1}",
+                ["check_boost", "ForceScalingFactor"], compute_type)
 
         def _bias_force_expression(self) -> str:
             """Emit one read per bias group; return the expression summing them.
@@ -270,15 +379,6 @@ def _build_integrator_class():
         def _dihedral_group_id(self) -> int:
             (gid,) = [g for g, name in self.get_group_dict().items() if name == "Dihedral"]
             return int(gid)
-
-        def _add_common_variables(self):
-            super()._add_common_variables()
-            for name in ("PepF0", "PepF1", "PepF2"):
-                self.addPerDofVariable(name, 0.0)
-            for j in range(len(self._pep_bias_groups)):
-                self.addPerDofVariable(f"PepFb{j}", 0.0)
-            for name in ("PepE0", "PepE1", "PepE2"):
-                self.addGlobalVariable(name, 0.0)
 
         def _setup_energy_values(self):
             self.add_global_variables_by_name("StartingPotentialEnergy", 0.0)
@@ -435,6 +535,8 @@ def build_pep_gamd_integrator(system, args, unit) -> list:
     integrator = _integrator_class()(
         DIHEDRAL_GROUP,
         bias_force_groups=bias_groups,
+        fsf_floor_total=getattr(args, "pep_gamd_fsf_floor_total", None),
+        fsf_floor_dihedral=getattr(args, "pep_gamd_fsf_floor_dihedral", None),
         dt=float(args.timestep_fs) * unit.femtosecond,
         ntcmdprep=int(args.gamd_cmd_prep_steps),
         ntcmd=int(args.gamd_cmd_steps),
@@ -462,16 +564,21 @@ class PepGamdEnvelope:
     # False for a single dihedral boost (stock ``lower-dihedral``): the globals carry no
     # ``*_Total`` entries, the Total channel contributes nothing, and v_pep is not needed.
     has_total: bool = True
+    # FSF clamp floors (spec 2026-10-01-pep-gamd-fsf-clamp.md); None = legacy, unclamped.
+    fsf_floor_total: Optional[float] = None
+    fsf_floor_dih: Optional[float] = None
 
     @classmethod
     def from_integrator_globals(cls, g: dict) -> "PepGamdEnvelope":
         f = lambda k: float(g[k])
+        floor = lambda ch: (float(g[f"{FSF_FLOOR_GLOBAL}_{ch}"]) if f"{FSF_FLOOR_GLOBAL}_{ch}" in g else None)
         if "k0_Total" in g:
             return cls(f("Vmax_Total"), f("Vmin_Total"), f("threshold_energy_Total"), f("k0_Total"),
-                       f("Vmax_Dihedral"), f("Vmin_Dihedral"), f("threshold_energy_Dihedral"), f("k0_Dihedral"))
+                       f("Vmax_Dihedral"), f("Vmin_Dihedral"), f("threshold_energy_Dihedral"), f("k0_Dihedral"),
+                       fsf_floor_total=floor("Total"), fsf_floor_dih=floor("Dihedral"))
         return cls(0.0, 0.0, 0.0, 0.0,
                    f("Vmax_Dihedral"), f("Vmin_Dihedral"), f("threshold_energy_Dihedral"), f("k0_Dihedral"),
-                   has_total=False)
+                   has_total=False, fsf_floor_dih=floor("Dihedral"))
 
     @classmethod
     def from_json(cls, path) -> "PepGamdEnvelope":
@@ -494,13 +601,30 @@ class PepGamdEnvelope:
         raise KeyError(f"{path}: no dict with k0_Dihedral/Vmax_Dihedral/... found")
 
 
-def _channel_boost(v, e, vmax, vmin, k0):
+def _channel_boost(v, e, vmax, vmin, k0, fsf_floor=None):
     v = _np.asarray(v, dtype=float)
     rng = vmax - vmin
     scale = _np.maximum(_np.maximum(abs(e), _np.abs(v)), 1.0)
-    b = 0.5 * k0 * (e - v) ** 2 / rng
+    if fsf_floor is None:
+        b = 0.5 * k0 * (e - v) ** 2 / rng
+    else:
+        # Clamped: C1 linear continuation past d_c, where 1 - k d_c = f.
+        a = 1.0 - float(fsf_floor)
+        d = e - v
+        dc = a * rng / max(float(k0), 1e-300)
+        b = 0.5 * k0 * _np.minimum(d, dc) ** 2 / rng + a * _np.maximum(0.0, d - dc)
     b = _np.where(_np.abs(rng) <= 0.001 * scale, 0.0, b)
     return _np.where((b + v) < e, b, 0.0)
+
+
+def channel_force_scaling_factor(v, e, vmax, vmin, k0, fsf_floor=None):
+    """The integrator's per-channel FSF: 1 - k0 (E - V)/(Vmax - Vmin), floored at ``fsf_floor``,
+    and exactly 1 wherever the boost is 0 (gamd-openmm's check_boost)."""
+    v = _np.asarray(v, dtype=float)
+    fsf = 1.0 - k0 * (e - v) / (vmax - vmin)
+    if fsf_floor is not None:
+        fsf = _np.maximum(float(fsf_floor), fsf)
+    return _np.where(_channel_boost(v, e, vmax, vmin, k0, fsf_floor) == 0.0, 1.0, fsf)
 
 
 def pep_gamd_boost_kj(v_pep_kj, v_dih_kj, lam, env: PepGamdEnvelope):
@@ -508,13 +632,15 @@ def pep_gamd_boost_kj(v_pep_kj, v_dih_kj, lam, env: PepGamdEnvelope):
     dihedral boost added to the Total energy before the square (stage_integrator
     _add_dihedral_boost_to_total_energy)."""
     lam = float(lam)
-    b_dih = _channel_boost(v_dih_kj, env.threshold_dih, env.vmax_dih, env.vmin_dih, lam * env.k0max_dih)
+    b_dih = _channel_boost(v_dih_kj, env.threshold_dih, env.vmax_dih, env.vmin_dih, lam * env.k0max_dih,
+                           env.fsf_floor_dih)
     if not env.has_total:
         # Single dihedral boost: no Total channel exists, v_pep is ignored (it is NaN
         # on such runs by construction, see production._fetch_v_pep_v_dih).
         out = _np.asarray(b_dih, dtype=float)
         return float(out) if out.ndim == 0 else out
-    b_tot = _channel_boost(_np.asarray(v_pep_kj, dtype=float) + b_dih, env.threshold_total, env.vmax_total, env.vmin_total, lam * env.k0max_total)
+    b_tot = _channel_boost(_np.asarray(v_pep_kj, dtype=float) + b_dih, env.threshold_total, env.vmax_total, env.vmin_total,
+                           lam * env.k0max_total, env.fsf_floor_total)
     out = b_dih + b_tot
     return float(out) if out.ndim == 0 else out
 
@@ -581,7 +707,7 @@ def set_replica_lambda_for_window(integrator, window_index, state_lambdas, k0max
 # applying lambda again is the double-application bug).
 
 
-def _npt_lower_bound_channel_boost(e_channel, vmax, vmin, threshold, k0):
+def _npt_lower_bound_channel_boost(e_channel, vmax, vmin, threshold, k0, fsf_floor=None):
     """One channel of gamd-openmm's lower-bound dual boost.
 
     Reimplemented from the upstream kernels (vendored
@@ -596,11 +722,21 @@ def _npt_lower_bound_channel_boost(e_channel, vmax, vmin, threshold, k0):
     Deliberately NOT reusing ``_channel_boost`` above: that closed form is the
     independent oracle the NPT boost-agreement tests compare against (spec:
     never use one helper as both implementation and oracle).
+
+    With an FSF floor f (the integrator's clamped kernel, PepGaMDLowerDualIntegrator
+    ._add_gamd_pre_calc_step) the square is replaced past d_c = (1-f)(Vmax-Vmin)/k0 by
+    its linear continuation of slope (1-f).
     """
     energy_scale = max(abs(threshold), abs(e_channel), 1.0)
     if abs(vmax - vmin) <= 0.001 * energy_scale:
         return 0.0
-    b = 0.5 * k0 * (threshold - e_channel) ** 2 / (vmax - vmin)
+    d = threshold - e_channel
+    if fsf_floor is None:
+        b = 0.5 * k0 * d ** 2 / (vmax - vmin)
+    else:
+        a = 1.0 - float(fsf_floor)
+        d_c = a * (vmax - vmin) / max(float(k0), 1e-300)
+        b = 0.5 * k0 * min(d, d_c) ** 2 / (vmax - vmin) + a * max(0.0, d - d_c)
     if not (e_channel + b < threshold):
         return 0.0
     return b
@@ -660,13 +796,14 @@ def _npt_split_groups(system):
 
 
 class _NptChannelParams:
-    __slots__ = ("threshold_kj_mol", "vmax_kj_mol", "vmin_kj_mol", "k0")
+    __slots__ = ("threshold_kj_mol", "vmax_kj_mol", "vmin_kj_mol", "k0", "fsf_floor")
 
-    def __init__(self, threshold_kj_mol, vmax_kj_mol, vmin_kj_mol, k0):
+    def __init__(self, threshold_kj_mol, vmax_kj_mol, vmin_kj_mol, k0, fsf_floor=None):
         self.threshold_kj_mol = float(threshold_kj_mol)
         self.vmax_kj_mol = float(vmax_kj_mol)
         self.vmin_kj_mol = float(vmin_kj_mol)
         self.k0 = float(k0)
+        self.fsf_floor = None if fsf_floor is None else float(fsf_floor)
 
 
 class _NptBoostSnapshot:
@@ -713,6 +850,8 @@ def _npt_read_channel(integrator, channel, names):
         integrator.getGlobalVariableByName(f"Vmax_{channel}"),
         integrator.getGlobalVariableByName(f"Vmin_{channel}"),
         integrator.getGlobalVariableByName(f"k0_{channel}"),
+        (integrator.getGlobalVariableByName(f"{FSF_FLOOR_GLOBAL}_{channel}")
+         if _npt_has_global(integrator, f"{FSF_FLOOR_GLOBAL}_{channel}") else None),
     )
 
 
@@ -818,10 +957,12 @@ class PepGamdLowerDualNptTargetAdapter:
         def _boost():
             b_d = _npt_lower_bound_channel_boost(
                 e2, snapshot.dihedral.vmax_kj_mol, snapshot.dihedral.vmin_kj_mol,
-                snapshot.dihedral.threshold_kj_mol, snapshot.dihedral.k0)
+                snapshot.dihedral.threshold_kj_mol, snapshot.dihedral.k0,
+                snapshot.dihedral.fsf_floor)
             b_t = _npt_lower_bound_channel_boost(
                 (e0 - e1 + e2) + b_d, snapshot.total.vmax_kj_mol, snapshot.total.vmin_kj_mol,
-                snapshot.total.threshold_kj_mol, snapshot.total.k0)
+                snapshot.total.threshold_kj_mol, snapshot.total.k0,
+                snapshot.total.fsf_floor)
             return b_d + b_t
 
         boost = _npt_boost_for_stage(_boost, snapshot.stage)
@@ -885,7 +1026,8 @@ class LowerDihedralNptTargetAdapter:
         def _boost():
             return _npt_lower_bound_channel_boost(
                 e_dih, snapshot.dihedral.vmax_kj_mol, snapshot.dihedral.vmin_kj_mol,
-                snapshot.dihedral.threshold_kj_mol, snapshot.dihedral.k0)
+                snapshot.dihedral.threshold_kj_mol, snapshot.dihedral.k0,
+                snapshot.dihedral.fsf_floor)
 
         boost = _npt_boost_for_stage(_boost, snapshot.stage)
         return EnergyBreakdown(
