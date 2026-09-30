@@ -672,7 +672,9 @@ Command: `python -m gareus.adaptive.cv2_resolution_summary`, run on the 10.2 pay
       There the CV2 bimodality comes from the hidden slow coordinate.
     - At matched budget, the inserted children gave no PMF benefit in the harness with or
       without the cap.
-    - Keep 4, which leaves R3 inserts effectively off, until T4 shows a benefit.
+    - Run R3 flag-only (no inserts) until T4 shows a benefit, whatever the crossing estimator.
+      With the replica-path count, the 4x cap would insert only on the hidden-mode landscape
+      (15 windows at re/8,000). The value 4 is irrelevant while inserts are off.
 - **Set a reserve > 0.** Otherwise every action is refused `no_reserve`.
 - **The other knobs.** The calibration recommends:
   - `refine_pmf_sigma_kt` 0.25, because today's bootstrap sigma is about 2.5x too small;

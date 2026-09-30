@@ -18,7 +18,7 @@ No production decision code was changed. New code is in `gareus/synth/` and
 | X3 reseeding (6) | Modest gain where one-sidedness means trapping. On `hidden-slow-cv3-weak` the final 2D PMF error goes 0.38 → 0.31 kT and the CV2 PMF error 0.31 → 0.22 (5/6 seeds better). The side deviation drops 18 %. It is harmful where the hidden mode projects strongly onto CV2 (`hidden-slow-cv3`): about half of the reseeds push equilibrium-one-sided windows to their equilibrium-minority side, and the side deviation does not improve. |
 | Union memory (7) | Measured peak ≈ 0.8 GB + 55–58 B per (row × state) cell. `UNION_PEAK_BYTES_PER_CELL` assumes 61.6 B with no intercept. At 250k rows it underestimates by 7–11 %, and at 100k rows by 28–106 %. At the 8 GB guard this is about 0.3 GB over. The kept-row limit is 550k at 236 states, 477k at 272 (+15 % reserve), 406k at 320 and 325k at 400. |
 | Production bugs | (1) **`--ap-edge-metric pairwise-mbar` disables `retire_converged` entirely.** Reproducer is below; it is a strict-xfail test. (2) On a 2D grid the `primary_chain` in `build_geometry_edges` includes wrap-around edges from the top of one CV1 column to the bottom of the next. These are weak-eligible under both metrics and account for most of the bridges on `plateau-walls`. |
-| 3.3 knob calibration (Section 9, 2026-09-30) | **R3 crossing count.** Neither shipped estimator works under replica exchange (the harness's new `re` regime has residence about 2 samples, as on c9). `replica` passes 4/64 equilibrated bimodal windows at >= 10, so it is a safe off switch. `state-series` passes 100 % of equilibrated, mis-populated and spurious windows, so it does not discriminate. A replica-path count (not in `gareus/`) separates them (>= 50: 35/64 vs 0/15); on c9 epoch_002 it gives 22 / 12 / 21 for states 84 / 200 / 220. **4x cap.** It refused all 202 genuine 2-D R3 candidates (children need 13-27x) and let every hidden-cv3 candidate through (about 2.2x): the default's only inserts are spurious. At matched budget, inserts gave no PMF benefit (c9-like: +0.02-0.06 kT in 3/3 seeds, cap or not). Keep 4 until T4. **R2.** `refine_pmf_sigma_kT` 0.25 (bootstrap sigma is about 2.5x too small). `coverage_min_windows` 2 is structurally near-inert on 2-D grids (it counts neighbouring columns' windows); leave it. A real hole's added window cuts the hole PMF error from 0.75-0.96 to 0.09-0.16 kT. **`refine_min_sigma`** never binds. `refine_min_transitions` 10 is an absolute count and does not transfer between series lengths. |
+| 3.3 knob calibration (Section 9, 2026-09-30) | **R3 crossing count.** Neither shipped estimator works under replica exchange (the harness's new `re` regime has residence about 2 samples, as on c9). `replica` passes 4/64 equilibrated bimodal windows at >= 10, so it is a safe off switch. `state-series` passes 100 % of equilibrated, mis-populated and spurious windows, so it does not discriminate. A replica-path count (not in `gareus/`) separates them (>= 50: 35/64 vs 0/15); on c9 epoch_002 it gives 22 / 12 / 21 for states 84 / 200 / 220. **4x cap.** It refused all 202 genuine 2-D R3 candidates (children need 13-27x) and let every hidden-cv3 candidate through (about 2.2x): the default's only inserts are spurious. At matched budget, inserts gave no PMF benefit (c9-like: +0.02-0.06 kT in 3/3 seeds, cap or not). Run R3 flag-only (no inserts) until T4, whatever the estimator: replica-path plus the 4x cap would insert only on hidden-cv3 (15 windows at re/8,000). The value 4 is irrelevant while inserts are off. **R2.** `refine_pmf_sigma_kT` 0.25 (bootstrap sigma is about 2.5x too small). `coverage_min_windows` 2 is structurally near-inert on 2-D grids (it counts neighbouring columns' windows); leave it. A real hole's added window cuts the hole PMF error from 0.75-0.96 to 0.09-0.16 kT. **`refine_min_sigma`** never binds. `refine_min_transitions` 10 is an absolute count and does not transfer between series lengths. |
 | Not done | The end-to-end "double-branch resolved" assertion is still skipped (Section 8). Nothing emulates the tICA estimate of the hidden mode or the `_non_neighbor_redundant_pairs` path. |
 
 ## 1. Methods
@@ -434,7 +434,9 @@ Crossings are given as q10 / median / q90 at 8,000 samples.
   - On chignolin_9 epoch_002 it gives 22 / 12 / 21 for states 84 / 200 / 220
     (`t3_retrospective.md` 10.4, `t2_data/t3c_replica_path_c9.json`). So at >= 10 all three
     would reach the spring code, and there they are refused by the cap.
-  - It is recommended for implementation and for a T4 test.
+  - It is recommended for implementation and a T4 test as a better trapped / equilibrated
+    screen, not as an insert trigger. It does not guard against hidden-mode bimodality (above),
+    and with the 4x cap it would insert only on hidden-cv3 (9.4).
 
 ### 9.3 `refine_min_transitions` (10)
 
@@ -521,11 +523,19 @@ The no-action column RMSE is 0.107 kT (c9-like), 0.095 (gated) and 0.189 (dbl-sa
     population ratio, loses samples to it.
   - So "no benefit on these landscapes" is supported; a general "R3 makes things worse" is
     not.
-- **Recommendation.** Keep 4. It is not calibrated, but with R3 inserts effectively off it does
-  no harm, and no insert has shown a benefit. Revisit together with the replica-path estimator
-  in T4. If R3 is to act on real modes, the cap should be relative to the compression floor
-  (for example, allow up to max(4 k2_parent, F''_mode)), not a multiple of the parent spring.
-  That is a code change, not a knob value.
+- **Recommendation: run R3 flag-only (no inserts) until T4, whatever the crossing estimator.**
+  - The cap does not make inserts safe.
+    - With the shipped `replica` count it still produced 1 hidden-cv3 insert at re/8,000 and 5
+      at indep/8,000.
+    - With the replica-path count plus the 4x cap, R3 would insert on hidden-cv3 only: 15
+      windows at re/8,000 and 3 at re/2,000. It would refuse every c9-like, double-branch and
+      gated candidate.
+    - The only inserts would be the ones the spec wants flagged.
+  - The value 4 is uncalibrated, and it is irrelevant while inserts are off.
+  - If R3 is ever to act on real modes, the cap should be relative to the compression floor
+    (for example, allow up to max(4 k2_parent, F''_mode)), not a multiple of the parent spring.
+    It also needs a guard against hidden-mode bimodality, and T4 must first show an insert
+    helps. Those are code and validation changes, not a knob value.
 
 ### 9.5 `refine_min_sigma` (0.1)
 
