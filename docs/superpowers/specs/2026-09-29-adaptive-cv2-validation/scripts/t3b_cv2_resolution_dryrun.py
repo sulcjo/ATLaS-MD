@@ -1,7 +1,7 @@
 """Read-only, cap-ignoring R1-R3 dry run on a replayed chignolin_9 payload.
 
 Usage: python t3b_cv2_resolution_dryrun.py <adaptive_dir> <payload.json> <phase|final_combined> <out.json>
-       [--union NPZ] [--transition-count replica|state-series]
+       [--union NPZ] [--transition-count replica|replica-path|state-series] [--r3-mode flag|insert] [--coverage-count any|same-column]
 Nothing under RUNS is written (the history is kept in memory, the report goes to out.json).
 """
 import json
@@ -18,9 +18,12 @@ adaptive_dir, payload_path, phase, out = Path(sys.argv[1]), Path(sys.argv[2]), s
 union_npz = Path(sys.argv[sys.argv.index("--union") + 1]) if "--union" in sys.argv else None
 diag = json.loads(payload_path.read_text())
 reg = ap.WindowStateRegistry.load(adaptive_dir)
-count = sys.argv[sys.argv.index("--transition-count") + 1] if "--transition-count" in sys.argv else "replica"
+count = sys.argv[sys.argv.index("--transition-count") + 1] if "--transition-count" in sys.argv else "replica-path"
+r3_mode = sys.argv[sys.argv.index("--r3-mode") + 1] if "--r3-mode" in sys.argv else "flag"
+cov_count = sys.argv[sys.argv.index("--coverage-count") + 1] if "--coverage-count" in sys.argv else "same-column"
 policy = ap.AdaptiveDecisionPolicy(cv2_resolution=True, edge_metric="pairwise-mbar", max_replicas_budget=236,
-                                   refine_transition_count=count)
+                                   refine_transition_count=count, refine_r3_mode=r3_mode,
+                                   coverage_count=cov_count)
 args = Namespace(temperature_k=300.0, cv2_k_min=0.0, cv2_k_max=1000.0, cv1_k_min=0.0)
 settings = cio.settings_from(policy, args)
 if phase == "final_combined":

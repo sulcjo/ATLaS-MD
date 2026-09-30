@@ -811,3 +811,31 @@ have < 1 % union weight within one predicted sigma: they are extrapolated.
 - Bimodal windows make F''_loc an average curvature.
 - All comparisons are at lambda = 0.
 - The swarm side is one replay with no error bar.
+
+### 10.6 Report v3 on chignolin_9 (follow-ups (h), 2026-09-30)
+
+Read-only dry runs through the shipped code (`scripts/t3b_cv2_resolution_dryrun.py`, v3
+defaults: `--ap-refine-transition-count replica-path`, `--ap-refine-r3-mode flag`,
+`--ap-coverage-count same-column`, `refine_pmf_sigma_kt` 0.25; outputs outside RUNS, compact
+record in `t2_data/t2c_r2v3.json` under `c9`).
+
+- **epoch_002 R3, replica-path.** States 84 / 200 / 220: replica-path **22 / 12 / 21**, the
+  same numbers as `t3c_replica_path_c9.py` (10.4), with identical core bounds (e.g. 84:
+  0.75698 / 0.87051) and the other two counts recomputed alongside (replica 5 / 0 / 5,
+  state-series 370 / 469 / 458). At >= 10 all three pass the transition gate and reach the
+  spring code, where the 4 x 1.18 cap refuses them `k2_capped_below_compression` (would_be
+  refused; flag mode changes nothing for a refusal). So the epoch_002 CAUTION changes cause:
+  3 trapped_or_orthogonal (v2 default) -> 3 spring-cap refusals (v3 default). 36 other windows
+  no_action; 0 actions; 61 s.
+- **final-combined R2 on the 143,513 lambda = 0 union rows.** Row sources from
+  `adaptive_union_mbar.samples.csv` (2 sources); bootstrap g median 1.8 rows (q10 1.2, q90 4.0:
+  the builder already thinned them), no state at the 5-block guard, 1 g fallback. `any`: 0
+  proposals, as in 10.2. `same-column`: 3 proposals -- CV1 0.177 at CV2 -0.01..0.64 (18 % of
+  that slab's weight), 0.824 and 0.889 at -1.79..-1.14 (10 % / 6 %) -- each interval with 3
+  contributing centres in total but only 1 of its own column, and bootstrap sigma 0.03-0.14 kT.
+  These are the geometric proposals T2 9.9 describes (the neighbouring columns cover the
+  interval); the sigma rule at 0.25 fires nowhere. 165 s total, 56 s union.
+- For chignolin_10: flag-only R3 cannot insert; same-column R2 at 2 would spend reserve on
+  intervals like these three. If that is unwanted, `--ap-coverage-count any` (or
+  `--ap-coverage-min-windows 1`) restores the near-inert count rule; the choice is frozen per
+  campaign.
