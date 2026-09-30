@@ -9,8 +9,8 @@ authors:
     given-names: Josef
 repository-code: https://github.com/sulcjo/ATLaS-MD
 url: https://github.com/sulcjo/ATLaS-MD
-version: 0.8.3
-date-released: 2026-09-24
+version: 0.8.4
+date-released: 2026-09-30
 license: LicenseRef-Proprietary-Research-Internal
 keywords:
   - molecular dynamics

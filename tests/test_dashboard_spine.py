@@ -419,7 +419,7 @@ def test_identity_line_never_truncates_the_verdict_on_a_long_run_label():
     from gareus.dashboard.spine import _identity_with_verdict
 
     verdict = "\x1b[31m✗ BAD 1 issue\x1b[0m"
-    identity = "ATLaS-MD v0.8.3  " + "a_very_long_campaign_directory_name_" * 4 + "   final  25 win"
+    identity = "ATLaS-MD v0.8.4  " + "a_very_long_campaign_directory_name_" * 4 + "   final  25 win"
     line = _identity_with_verdict(identity, verdict, 100)
     assert strip_ansi_len(line) <= 100
     assert strip_ansi(line).endswith("✗ BAD 1 issue")
@@ -429,4 +429,4 @@ def test_identity_line_never_truncates_the_verdict_on_a_long_run_label():
 def test_identity_line_keeps_the_wide_gap_when_everything_fits():
     from gareus.dashboard.spine import _identity_with_verdict
 
-    assert _identity_with_verdict("ATLaS-MD v0.8.3  run", "✓ OK", 140) == "ATLaS-MD v0.8.3  run      ✓ OK"
+    assert _identity_with_verdict("ATLaS-MD v0.8.4  run", "✓ OK", 140) == "ATLaS-MD v0.8.4  run      ✓ OK"
