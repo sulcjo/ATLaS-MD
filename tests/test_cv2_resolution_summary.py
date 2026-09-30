@@ -198,7 +198,8 @@ def test_discover_uses_phase_level_payloads_and_final_combined(tmp_path):
     found = crs.discover_phases(ap)
     assert [(lab, Path(d).parent.name) for lab, d, _r in found] == [("epoch_002", "epoch_002"),
                                                                      ("final_combined", "adaptive_production")]
-    assert found[0][2] is not None and found[1][2] is None
+    assert found[0][2] is not None
+    assert found[1][2] == ap / "epoch_002" / crs.REPORT_NAME     # final carries the newest epoch report
 
 
 def test_cli_default_paths_and_csvs(tmp_path):
@@ -265,7 +266,10 @@ def test_write_final_combined_summary_is_what_the_report_row_discovers(tmp_path,
     path = crs.write_final_combined_summary(ap, _payload())
     assert path == crs.default_json_path(ap, crs.FINAL_LABEL) and path.is_file()
     s = json.loads(path.read_text())
-    assert s["label"] == crs.FINAL_LABEL and s["sources"]["report"] is None
+    assert s["label"] == crs.FINAL_LABEL
+    assert s["sources"]["report"].endswith(crs.REPORT_NAME)
+    assert s["sources"]["report_carried_from"] == "epoch_002"
+    assert s["counts"]["n_trapped_or_orthogonal"] == 1           # R3 verdicts reach the graded table
     assert (ap / "cv2_resolution_summary_final_combined_states.csv").is_file()
     assert crs.write_final_combined_summary(ap, {"states": [{"state_id": "x"}]}) is None
     assert "WARNING" in capsys.readouterr().out
@@ -281,3 +285,31 @@ def test_final_combined_hook_only_inside_the_cv2_resolution_flag_block():
                     hits.append(ast.unparse(node.test))
     assert hits == ["bool(policy.cv2_resolution)"]
     assert src.count("write_final_combined_summary(") == 1
+
+
+
+def test_latest_epoch_report_picks_the_highest_numbered_epoch(tmp_path):
+    ap = _campaign(tmp_path)
+    assert crs.latest_epoch_report(ap) == ap / "epoch_002" / crs.REPORT_NAME
+    (ap / "epoch_010").mkdir()
+    (ap / "epoch_010" / crs.REPORT_NAME).write_text(json.dumps(_report(cands=[])))
+    (ap / "epoch_003").mkdir()                                    # no report: ignored
+    assert crs.latest_epoch_report(ap) == ap / "epoch_010" / crs.REPORT_NAME
+    assert crs.latest_epoch_report(tmp_path / "missing") is None
+
+
+def test_final_combined_without_any_epoch_report_has_no_carried_source(tmp_path):
+    ap = _campaign(tmp_path)
+    (ap / "epoch_002" / crs.REPORT_NAME).unlink()
+    s = json.loads(crs.write_final_combined_summary(ap, _payload()).read_text())
+    assert s["sources"]["report"] is None and "report_carried_from" not in s["sources"]
+    assert s["report"] is None
+
+
+def test_grade_row_names_the_carried_report(tmp_path):
+    from gareus.adaptive import cv2_resolution_grade as grade
+    ap = _campaign(tmp_path)
+    s = json.loads(crs.write_final_combined_summary(ap, _payload()).read_text())
+    row = grade.check_cv2_resolution({"cv2_resolution": s})
+    assert "R3/budget from epoch_002" in row["detail"]
+    assert row["status"] != grade.NA

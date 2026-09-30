@@ -399,9 +399,21 @@ def default_json_path(adaptive_dir: Path, label: str) -> Path:
     return Path(adaptive_dir) / label / SUMMARY_NAME
 
 
+def latest_epoch_report(adaptive_dir: Path) -> Optional[Path]:
+    """The newest numbered epoch's 3.3 report (the final phase proposes nothing, so the
+    final-combined table carries this one's R3 verdicts, refusals and budget), or None."""
+    found = []
+    for d in Path(adaptive_dir).glob("epoch_*"):
+        m = re.match(r"^epoch_(\d+)$", d.name)
+        if m and (d / REPORT_NAME).is_file():
+            found.append((int(m.group(1)), d / REPORT_NAME))
+    return max(found)[1] if found else None
+
+
 def discover_phases(adaptive_dir: Path) -> List[Tuple[str, Path, Optional[Path]]]:
     """(label, diagnostics, report-or-None) for every numbered epoch/final phase with a
-    phase-level (pooled) diagnostics file, plus the final-combined payload."""
+    phase-level (pooled) diagnostics file, plus the final-combined payload (with the newest
+    numbered epoch's report, see ``latest_epoch_report``)."""
     root = Path(adaptive_dir)
     out: List[Tuple[str, Path, Optional[Path]]] = []
     for d in sorted(p for p in root.iterdir() if p.is_dir() and re.match(r"^(epoch_\d+|final(_extension_\d+)?)$",
@@ -410,7 +422,7 @@ def discover_phases(adaptive_dir: Path) -> List[Tuple[str, Path, Optional[Path]]
             rep = d / REPORT_NAME
             out.append((d.name, d / EPOCH_DIAGNOSTICS, rep if rep.exists() else None))
     if (root / FINAL_DIAGNOSTICS).exists():
-        out.append((FINAL_LABEL, root / FINAL_DIAGNOSTICS, None))
+        out.append((FINAL_LABEL, root / FINAL_DIAGNOSTICS, latest_epoch_report(root)))
     return out
 
 
@@ -422,10 +434,12 @@ def summarise(label: str, diagnostics_path: Path, report_path: Optional[Path], j
         raise FileNotFoundError(f"no readable diagnostics at {diagnostics_path}")
     report = _read_json(report_path)
     reg = load_registry_rows(adaptive_dir)
+    sources = {"diagnostics": str(diagnostics_path), "report": str(report_path) if report is not None else None,
+               "registry": str(Path(adaptive_dir) / "state_registry.csv") if reg else None}
+    if report is not None and label == FINAL_LABEL:
+        sources["report_carried_from"] = Path(report_path).parent.name
     summary = build_summary(diag, report, label=label, registry_rows=reg, temperature_k=temperature_k,
-                            sources={"diagnostics": str(diagnostics_path),
-                                     "report": str(report_path) if report is not None else None,
-                                     "registry": str(Path(adaptive_dir) / "state_registry.csv") if reg else None})
+                            sources=sources)
     write_summary(summary, json_path)
     return summary
 
@@ -453,14 +467,22 @@ def write_epoch_summary(epoch_dir: Path, diagnostics: Mapping[str, Any]) -> Opti
 def write_final_combined_summary(adaptive_dir: Path, diagnostics: Mapping[str, Any]) -> Optional[Path]:
     """Driver hook (``--ap-cv2-resolution`` only): the final-combined table that the
     gareus_report "CV2 resolution" row reads, rewritten every time the final-combined
-    diagnostics are (so later extensions refresh it). No 3.3 report exists for the final
-    phase. Never raises."""
+    diagnostics are (so later extensions refresh it). The final phase proposes nothing, so
+    the table carries the newest numbered epoch's 3.3 report (R3 verdicts, refusals, budget;
+    ``sources.report_carried_from`` names it): without it the trapped / budget / spring-cap
+    grades could never fire on the graded table. Edges and restraints are the final-combined
+    ones. Never raises."""
     try:
         adaptive_dir = Path(adaptive_dir)
         reg = load_registry_rows(adaptive_dir)
-        summary = build_summary(diagnostics, None, label=FINAL_LABEL, registry_rows=reg,
-                                sources={"diagnostics": str(adaptive_dir / FINAL_DIAGNOSTICS), "report": None,
-                                         "registry": str(adaptive_dir / "state_registry.csv") if reg else None})
+        report_path = latest_epoch_report(adaptive_dir)
+        report = _read_json(report_path)
+        sources = {"diagnostics": str(adaptive_dir / FINAL_DIAGNOSTICS),
+                   "report": str(report_path) if report is not None else None,
+                   "registry": str(adaptive_dir / "state_registry.csv") if reg else None}
+        if report is not None:
+            sources["report_carried_from"] = Path(report_path).parent.name
+        summary = build_summary(diagnostics, report, label=FINAL_LABEL, registry_rows=reg, sources=sources)
         path = default_json_path(adaptive_dir, FINAL_LABEL)
         write_summary(summary, path)
         return path
@@ -505,7 +527,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 __all__ = ["DEFINITIONS", "FINAL_LABEL", "SCHEMA_VERSION", "SUMMARY_NAME", "build_summary", "default_json_path",
-           "discover_phases", "edge_record", "load_registry_rows", "main", "resolve_temperature", "sigma_w",
+           "discover_phases", "edge_record", "latest_epoch_report", "load_registry_rows", "main", "resolve_temperature", "sigma_w",
            "state_record", "summarise", "write_epoch_summary", "write_final_combined_summary", "write_summary"]
 
 

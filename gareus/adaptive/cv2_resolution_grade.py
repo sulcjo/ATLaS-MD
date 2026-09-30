@@ -96,6 +96,9 @@ def check_cv2_resolution(s: Mapping[str, Any], connectivity_failed: bool = False
         return {"name": NAME, "status": NA, "detail": f"unreadable summary {blk['unreadable']}"}
     c = blk.get("counts") or {}
     label = blk.get("label") or "?"
+    carried = (blk.get("sources") or {}).get("report_carried_from")
+    if carried:
+        label = f"{label}; R3/budget from {carried}"
     graded = int(c.get("n_graded_edges") or 0)
     if not int(c.get("n_cv2_restrained") or 0) and not graded and c.get("report_status") is None:
         return {"name": NAME, "status": NA, "detail": f"[{label}] CV1-only: no CV2-restrained state, "
