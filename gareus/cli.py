@@ -619,7 +619,9 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                    help="R3: which crossings count toward --ap-refine-min-transitions. replica (default): "
                         "within one replica's residence at the window, so an exchange swap is not a crossing "
                         "(rarely fires when replicas stay only a few samples); state-series: every switch of "
-                        "the window's series, swaps included. Frozen with the decision settings.")
+                        "the window's series, swaps included -- always >= the replica count (within-residence "
+                        "crossings + swap-induced label changes), so the permissive choice. Frozen with the "
+                        "decision settings; a bad recorded value fails when the policy is loaded.")
     p.add_argument("--ap-refine-pmf-sigma-kt", type=float, default=0.5,
                    help="R2: block-bootstrap sigma (kT) of a CV2 interval's free energy above which it is a "
                         "hole. Uncalibrated default.")

@@ -51,7 +51,12 @@ Sarle bimodality and curvature are reported, never trigger.
 Budget: resolution actions draw only on the P1 reserve (``reserve_allowances``), in priority
 order R1 structural > R1 weak > R1 after the wait > R2 > R3, costing one centre (R1/R2, n
 states on an n-rung ladder) or two (R3, 2n). Without a reserve every proposal is refused
-(``no_reserve``); a dry run can pass ``ignore_budget``.
+(``no_reserve``; the driver hook prints one WARNING per campaign job); a dry run can pass
+``ignore_budget``. Budget refusals are recorded and CAUTION-graded (3.7) but never block the
+convergence gate: only funded (``proposed``) work does.
+
+R3 records the test that decided every candidate in ``metrics.r3_gate`` (``R3_GATES``) with
+the measured values in ``metrics.r3_gate_values``.
 """
 from __future__ import annotations
 
@@ -67,7 +72,7 @@ from gareus.adaptive.cv2_shape import (DEFAULT_MIN_MEAN_COMPRESSION, DEFAULT_MIN
 from gareus.adaptive.edge_metric import edge_below_threshold, edge_is_weak_pairwise
 from gareus.swarm.ladder_design import R_KCAL_MOL_K
 
-SCHEMA_VERSION = "cv2_resolution_report_v1"
+SCHEMA_VERSION = "cv2_resolution_report_v2"
 REPORT_NAME = "cv2_resolution_report.json"
 HISTORY_NAME = "cv2_resolution_history.json"
 HISTORY_SCHEMA = "cv2_resolution_history_v1"
@@ -91,6 +96,17 @@ DEFAULTS = {"coverage_min_windows": 2.0, "refine_min_transitions": 10, "refine_p
             "refine_budget_fraction": 0.5, "refine_protect_epochs": 2, "refine_min_sigma": 0.1,
             "refine_transition_count": "replica"}
 TRANSITION_COUNTS = ("replica", "state-series")
+BUDGET_REFUSALS = ("no_reserve", "resolution_budget")
+# The test that decided an R3 candidate (metrics["r3_gate"]), in the order they are applied.
+# Mixture gates (mode_analysis / r3_mode_gate): single_component (the fit has < 2 components),
+# member_support (< 2 components with >= min_mode_members member blocks), no_density_minimum
+# (no accepted pair has a density minimum between its means), depth_below_1kT (the deepest
+# accepted pair is shallower than R3_MIN_DEPTH_KT), mode_weight_below_10pct (a pair deep
+# enough has a mode below R3_MIN_WEIGHT); then too_few_samples (skipped before the fit),
+# no_replica_series / transitions_below_min (flagged), passed (proposed or refused; a refused
+# candidate also carries its refusal code).
+R3_GATES = ("too_few_samples", "single_component", "member_support", "no_density_minimum", "depth_below_1kT",
+            "mode_weight_below_10pct", "no_replica_series", "transitions_below_min", "passed")
 
 
 @dataclass(frozen=True)
@@ -276,26 +292,65 @@ def sarle_bimodality(moments: Mapping[str, Any]) -> Optional[float]:
     return (sk * sk + 1.0) / (ku + 3.0 * (n - 1) ** 2 / ((n - 2) * (n - 3)))
 
 
+def _pair_record(i: int, j: int, d: Mapping[str, Any]) -> Dict[str, Any]:
+    return {"a": int(i), "b": int(j), "depth_kT": float(d["depth_kT"]), "bimodal": bool(d["bimodal"]),
+            "weight_a": float(d["weight_a"]), "weight_b": float(d["weight_b"]),
+            "mean_a": float(d["mean_a"]), "mean_b": float(d["mean_b"])}
+
+
+def r3_mode_gate(components: Sequence[Any]) -> Dict[str, Any]:
+    """Which mixture test decides R3 for these components (``R3_GATES``, applied in order),
+    with every measured value: {gate, pair (i, j) | None, depth (mode_depth dict) | None,
+    values {n_components, n_accepted, component_members, component_weights, min_mode_members,
+    min_depth_kT, min_weight, pairs [every accepted pair], deepest_pair}}. ``passed`` names
+    the deepest resolvable pair."""
+    comps = list(components)
+    acc = [i for i, c in enumerate(comps) if c.accepted]
+    values: Dict[str, Any] = {"n_components": len(comps), "n_accepted": len(acc),
+                              "component_members": [int(c.n_members) for c in comps],
+                              "component_weights": [float(c.weight) for c in comps],
+                              "min_mode_members": DEFAULT_MIN_MODE_MEMBERS, "min_depth_kT": R3_MIN_DEPTH_KT,
+                              "min_weight": R3_MIN_WEIGHT, "pairs": [], "deepest_pair": None}
+    if len(comps) < 2:
+        return {"gate": "single_component", "pair": None, "depth": None, "values": values}
+    if len(acc) < 2:
+        return {"gate": "member_support", "pair": None, "depth": None, "values": values}
+    best, deepest = None, None
+    for ii, i in enumerate(acc):
+        for j in acc[ii + 1:]:
+            d = mode_depth(comps, i, j)
+            values["pairs"].append(_pair_record(i, j, d))
+            if deepest is None or d["depth_kT"] > deepest[2]["depth_kT"]:
+                deepest = (i, j, d)
+            if mode_pair_resolvable(d, min_depth_kT=R3_MIN_DEPTH_KT, min_weight=R3_MIN_WEIGHT):
+                if best is None or d["depth_kT"] > best[2]["depth_kT"]:
+                    best = (i, j, d)
+    values["deepest_pair"] = _pair_record(*deepest)
+    if best is not None:
+        return {"gate": "passed", "pair": (best[0], best[1]), "depth": best[2], "values": values}
+    if not any(p["bimodal"] for p in values["pairs"]):
+        gate = "no_density_minimum"
+    elif deepest[2]["depth_kT"] < R3_MIN_DEPTH_KT:
+        gate = "depth_below_1kT"
+    else:
+        gate = "mode_weight_below_10pct"
+    return {"gate": gate, "pair": None, "depth": None, "values": values}
+
+
 def mode_analysis(cv2: np.ndarray, source_index: Optional[np.ndarray], *, seed: int = 0) -> Dict[str, Any]:
-    """Mixture fit of one window's CV2 subsample and its deepest resolvable mode pair."""
+    """Mixture fit of one window's CV2 subsample, its deepest resolvable mode pair, and the
+    mixture gate that decided (``r3_mode_gate``)."""
     z = np.asarray(cv2, dtype=float)
     fit = fit_cv2_mixture(z, member_blocks(source_index, z.size), max_components=3,
                           min_mode_members=DEFAULT_MIN_MODE_MEMBERS, seed=seed)
     comps = list(fit.components)
-    best = None
-    for i in range(len(comps)):
-        for j in range(i + 1, len(comps)):
-            if not (comps[i].accepted and comps[j].accepted):
-                continue
-            d = mode_depth(comps, i, j)
-            if mode_pair_resolvable(d, min_depth_kT=R3_MIN_DEPTH_KT, min_weight=R3_MIN_WEIGHT):
-                if best is None or d["depth_kT"] > best[2]["depth_kT"]:
-                    best = (i, j, d)
-    out = {"fit": fit.as_record(), "bimodal": best is not None, "pair": None, "depth": None}
-    if best is not None:
-        i, j, d = best
+    g = r3_mode_gate(comps)
+    out = {"fit": fit.as_record(), "bimodal": g["pair"] is not None, "pair": None, "depth": None,
+           "gate": g["gate"], "gate_values": g["values"]}
+    if g["pair"] is not None:
+        i, j = g["pair"]
         lo, hi = sorted((comps[i], comps[j]), key=lambda c: c.mean)
-        out.update(pair=[lo.as_record(), hi.as_record()], depth=d)
+        out.update(pair=[lo.as_record(), hi.as_record()], depth=g["depth"])
     return out
 
 
@@ -465,12 +520,17 @@ def summarise(cands: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     for c in cands:
         by_rule = counts.setdefault(str(c["rule"]), {})
         by_rule[str(c["decision"])] = by_rule.get(str(c["decision"]), 0) + 1
-    blocking = sum(1 for c in cands if c["decision"] == "proposed"
-                   or c.get("refusal") in ("no_reserve", "resolution_budget"))
+    # Only funded work blocks convergence. A budget refusal (no_reserve, resolution_budget)
+    # repeats every epoch while the reserve is missing or spent, so counting it would pin the
+    # gate at "continue" for the rest of the campaign; it is recorded (n_refused_budget) and
+    # CAUTION-graded by the 3.7 row instead.
+    blocking = sum(1 for c in cands if c["decision"] == "proposed")
     kids = [k for c in cands if c["decision"] == "proposed" for k in (c.get("proposal") or {}).get("children", [])]
     return {"counts": counts, "n_proposed": sum(1 for c in cands if c["decision"] == "proposed"),
             "n_windows_at_compression_floor": sum(1 for k in kids if k.get("at_compression_floor")),
             "n_blocking": int(blocking),
+            "n_refused_budget": sum(1 for c in cands if c.get("refusal") in BUDGET_REFUSALS),
+            "n_refused_spring_cap": sum(1 for c in cands if c.get("refusal") == "k2_capped_below_compression"),
             "n_trapped_or_orthogonal": sum(1 for c in cands if (c.get("metrics") or {}).get("trapped_or_orthogonal"))}
 
 
@@ -482,7 +542,8 @@ def new_candidate(rule: str, kind: str, state_ids: Sequence[int], decision: str,
             "cost_states": 0, **extra}
 
 
-__all__ = ["DEFAULTS", "HISTORY_NAME", "METADATA_KEY", "REPORT_NAME", "SCHEMA_VERSION", "SOURCE",
+__all__ = ["BUDGET_REFUSALS", "DEFAULTS", "HISTORY_NAME", "METADATA_KEY", "R3_GATES", "REPORT_NAME", "SCHEMA_VERSION",
+           "SOURCE", "r3_mode_gate",
            "ResolutionSettings", "StateView", "allocate", "axis_distances", "bridge_child", "candidate_action",
            "child_spring", "classify_edge", "consecutive_bad", "core_bounds", "count_transitions", "edge_key",
            "eligibility", "f2_under_bias", "gate_child", "is_protected", "mainly_cv2", "member_blocks",

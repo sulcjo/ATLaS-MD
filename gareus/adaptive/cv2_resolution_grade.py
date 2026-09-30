@@ -19,8 +19,11 @@ Rule (stated in the row text):
   CAUTION -- graded edges left unmeasured (never weak, but not shown to be connected),
              trapped_or_orthogonal windows (3.3 R3: bimodal without transitions -- more CV2
              windows cannot resolve that), resolution actions refused for budget
-             (no_reserve, resolution_budget, max_replicas_budget), or an edge-metric /
-             3.3-report error.
+             (no_reserve, resolution_budget, max_replicas_budget), resolution windows refused
+             at the spring cap (k2_capped_below_compression: the 4 x parent k2 / cv2_k_max cap
+             or the coupling gate holds k2 below the mean-compression floor -- the window the
+             rule asked for was not placed), or an edge-metric / 3.3-report error. None of the
+             CAUTIONs blocks the convergence gate.
   PASS    -- none of those. NA -- a CV1-only table with no graded edges and no 3.3 report.
 """
 from __future__ import annotations
@@ -35,7 +38,8 @@ NAME = "CV2 resolution"
 SUMMARY_NAME = "cv2_resolution_summary.json"            # mirrors cv2_resolution_summary
 FINAL_NAME = "cv2_resolution_summary_final_combined.json"
 RULE_TEXT = ("rule: FAIL if a pairwise-MBAR weak edge or >1 spatial component; CAUTION for "
-             "unmeasured edges, trapped_or_orthogonal windows, budget refusals, metric/report errors")
+             "unmeasured edges, trapped_or_orthogonal windows, budget refusals, spring cap below the "
+             "mean-compression floor, metric/report errors")
 
 
 def find_summary(production_dir: Any) -> Optional[Path]:
@@ -71,7 +75,9 @@ def _issues(c: Mapping[str, Any], connectivity_failed: bool) -> tuple:
     for key, text, bucket in (("n_weak", "weak pairwise-MBAR edge(s)", fails),
                               ("n_unmeasured", "unmeasured graded edge(s)", cautions),
                               ("n_trapped_or_orthogonal", "trapped_or_orthogonal window(s)", cautions),
-                              ("n_refused_budget", "action(s) refused for budget", cautions)):
+                              ("n_refused_budget", "action(s) refused for budget", cautions),
+                              ("n_refused_spring_cap", "window(s) refused at the spring cap "
+                               "(k2_capped_below_compression)", cautions)):
         n = int(c.get(key) or 0)
         if n > 0:
             bucket.append(f"{n} {text}")

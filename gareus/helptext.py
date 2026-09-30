@@ -1967,16 +1967,19 @@ layout_plan.json byte for byte.
                                           member-blocked CV regularisation) places a centre
                                           on every mode with >= --swarm-cv2-min-mode-members
                                           (8) members, then fills at 1.5 x the smallest
-                                          predicted sampled sigma ahead; k2 = RT/sigma^2 - F''
-                                          in [--cv2-k-min, --cv2-k-max]; one CV1-free window
+                                          predicted sampled sigma ahead; k2 = max(RT/sigma^2 -
+                                          F'', F'') in [--cv2-k-min, --cv2-k-max] (F'' from
+                                          the mode's de-regularised variance, the fit
+                                          re-converged without the EM regularisation); one CV1-free window
                                           per mode (X7); under the cap mode cells first, then
                                           the reserve, then axis states, then fill cells by
                                           adjacency and design-mass share.
 
 The swarm is a design measure, not an equilibrium conditional: the mixture only
 locates structure and bounds how finely CV2 is resolved. Where a mode is stiffer
-than the target width, k2 floors at --cv2-k-min and the window mean follows the
-mode (mean_compression in layout_plan.json's cv2_shape record).
+than the target width the F'' floor (mean-compression 0.5) keeps every window mean at
+least half-way to its centre (mean_compression and n_at_compression_floor in
+layout_plan.json's cv2_shape record; on chignolin_9 the floor binds at every centre).
 
 Pilot comparison
 ~~~~~~~~~~~~~~~~~
@@ -2226,13 +2229,17 @@ under-resolved.  Only states restraining both axes above their floors
         >= 1 kT, both >= 10 %) AND >= --ap-refine-min-transitions core-to-core
         transitions (--ap-refine-transition-count: replica = within replica
         residences, default; state-series = every switch at the window, exchange
-        swaps included) gets two children at the modes; the
-        parent is kept. Without transitions it is flagged trapped_or_orthogonal and
-        nothing is inserted (more CV2 windows cannot resolve a hidden slow mode).
+        swaps included, always >= the replica count: the permissive choice) gets
+        two children at the modes; the parent is kept. Without transitions it is
+        flagged trapped_or_orthogonal and nothing is inserted (more CV2 windows
+        cannot resolve a hidden slow mode). Every R3 window records the test that
+        decided it (r3_gate: single_component, member_support, no_density_minimum,
+        depth_below_1kT, mode_weight_below_10pct, too_few_samples,
+        no_replica_series, transitions_below_min, passed) with its numbers.
 
 Every new window: target sampled sigma from the spacing (children: 2 delta / 1.5),
 never below --ap-refine-min-sigma; F'' from the window's own samples minus its own
-spring; k2 = max(RT/sigma^2 - F'', F'') (the F'' floor keeps the window mean at least
+spring (R3: the mode's de-regularised mixture variance); k2 = max(RT/sigma^2 - F'', F'') (the F'' floor keeps the window mean at least
 half-way to its centre) in [--cv2-k-min, min(--cv2-k-max, 4 x parent k2)], then the
 coupling gate. A k2 at --cv2-k-min is refused (k2_at_floor), and so is one the cap holds
 below the F'' floor (k2_capped_below_compression); neither is created.
@@ -2242,10 +2249,13 @@ Budget: resolution actions draw only on the swarm layout's reserve
 (--swarm-adaptive-reserve-fraction; layout_plan.json adaptive_reserve), at most
 --ap-refine-budget-fraction (0.5) of the free slots left after add_rung, which a
 reserve limits to 1/3 of them. Without a reserve every proposal is refused
-(no_reserve) and recorded. New windows are protected from retirement and further
-refinement for --ap-refine-protect-epochs (2). Pending resolution blocks the
-convergence gate. Report: epoch_NNN/cv2_resolution_report.json
-(cv2_resolution_report_v1). The knobs are frozen with the decision settings;
+(no_reserve) and recorded, and the driver prints one WARNING per campaign job. New
+windows are protected from retirement and further refinement for
+--ap-refine-protect-epochs (2). Proposed (funded) resolution blocks the convergence
+gate; budget refusals (no_reserve, resolution_budget) and spring-cap refusals never do
+-- they are recorded and graded CAUTION. Report: epoch_NNN/cv2_resolution_report.json
+(cv2_resolution_report_v2: v1's transitions_lower_bound is now
+transitions_state_series_lower_bound; readers accept both). The knobs are frozen with the decision settings;
 coverage-min-windows, refine-min-transitions, refine-pmf-sigma-kt and
 refine-min-sigma are uncalibrated defaults.
 
@@ -2259,7 +2269,7 @@ restraint, sampled CV2 mean/sd, sigma_w2 = sqrt(kT/k2), confinement ratio = sd/s
 trapped_or_orthogonal. Per edge: pairwise MBAR (q10/q90, status), CV1 marginal and joint
 2D overlap, each with its space stamp. gareus_report adds a "CV2 resolution" row when the
 final-combined summary exists (FAIL: a weak pairwise edge or > 1 spatial component; CAUTION: unmeasured
-edges, trapped windows, budget refusals); plot_adaptive_diagnostics adds
+edges, trapped windows, budget refusals, k2_capped_below_compression refusals); plot_adaptive_diagnostics adds
 adaptive_fig5_state_coordinates.png (states at their own (c1, c2), one panel per rung).
 """
 

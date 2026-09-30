@@ -134,7 +134,7 @@ def mode_axis_windows(columns: Sequence[ShapeColumn], uniform_centres2, *, tempe
         lo, hi = col.placement.envelope
         for comp in col.fit.accepted_components:
             if lo <= comp.mean <= hi:
-                f2 = estimate_f2(comp.variance, col.fit.pooled_variance, comp.n_members, temperature_k)
+                f2 = estimate_f2(comp.variance_curvature, col.fit.pooled_variance, comp.n_members, temperature_k)
                 k2 = shape_rule_k2(sigma_w_target, f2, temperature_k, k_min, k_max)
                 cands.append({"center2": float(comp.mean), "k2": k2, "f2": f2, "source_column": col.index,
                               "sampled_sigma": predicted_sampled_sigma(k2, f2, temperature_k),

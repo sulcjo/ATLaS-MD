@@ -223,7 +223,8 @@ def test_r3_on_subsample_only_records_a_lower_bound_and_never_inserts():
     runs = {parent: {"source": "no_replica_column", "replica_runs": [], "state_runs": [z]}}
     new, report, _h = _propose(reg, _payload(reg, samples={parent: z}), subsamples=sub, runs=runs)
     (cand,) = [c for c in _decisions(report, "R3") if c["state_ids"] == [parent]]
-    assert cand["decision"] == "flagged" and cand["metrics"]["transitions_lower_bound"] > 0
+    assert cand["decision"] == "flagged" and cand["metrics"]["transitions_state_series_lower_bound"] > 0
+    assert cand["metrics"]["r3_gate"] == "no_replica_series"
     assert new == []
 
 
@@ -343,7 +344,9 @@ def test_no_reserve_refuses_with_a_recorded_reason(reserve, cap, code):
     new, report, _h = _propose(reg, _structural_setup(reg), reserve=reserve, policy=_policy(cap=cap))
     (cand,) = _decisions(report, "R1")
     assert cand["decision"] == "refused" and cand["refusal"] == code
-    assert report["summary"]["n_blocking"] == 1 and not [a for a in new if a[0] == "add"]
+    # recorded, never blocking (a missing reserve would otherwise pin the gate at "continue")
+    assert report["summary"]["n_blocking"] == 0 and report["summary"]["n_refused_budget"] == 1
+    assert not [a for a in new if a[0] == "add"]
 
 
 def test_budget_split_add_rung_third_and_resolution_half_of_the_rest():
@@ -400,7 +403,9 @@ def test_pending_resolution_blocks_convergence(tmp_path):
     reg = _registry()
     epoch_dir = tmp_path / "epoch_000"
     epoch_dir.mkdir()
-    (epoch_dir / cr.REPORT_NAME).write_text(json.dumps({"summary": {"n_blocking": 2}}))
+    cands = [cr.new_candidate("R1", "edge", [1, 2], "proposed", "r1", cls="weak"),
+             cr.new_candidate("R3", "state", [3], "proposed", "r3")]
+    (epoch_dir / cr.REPORT_NAME).write_text(json.dumps({"candidates": cands, "summary": cr.summarise(cands)}))
     gate = ap.evaluate_adaptive_convergence_gate(epoch_dir, 0, reg, {"states": [], "edges": []}, [], policy)
     assert any("CV2-resolution" in r for r in gate["continue_reasons"])
     assert gate["status"] != "converged"
@@ -435,7 +440,7 @@ def test_transition_count_mode_is_validated_and_recorded():
     assert out["transitions"] == 2 and out["transitions_estimator"] == "state-series"
     sub_only = rules._transitions({"source": "subsample", "state_runs": rec["state_runs"]}, (-0.5, 0.5),
                                   "state-series")
-    assert sub_only["transitions"] is None and sub_only["transitions_lower_bound"] == 2
+    assert sub_only["transitions"] is None and sub_only["transitions_state_series_lower_bound"] == 2
     with pytest.raises(ValueError):
         rules._transitions(rec, (-0.5, 0.5), "bogus")
     assert cr.ResolutionSettings.from_policy(ap.AdaptiveDecisionPolicy()).refine_transition_count == "replica"

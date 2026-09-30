@@ -528,10 +528,19 @@ class AdaptiveDecisionPolicy:
     refine_min_sigma: float = 0.1
     # R3 crossing count: "replica" (within one replica's residence at the window; an
     # exchange swap is not a crossing) or "state-series" (every switch of the window's
-    # state-indexed series, swaps included). Undecided for chignolin_10.
+    # state-indexed series, swaps included; >= the replica count always, so the permissive
+    # choice). Undecided for chignolin_10. Validated here, so a bad flag, YAML value or
+    # recorded decision_settings.json fails when the policy is built, not inside the epoch loop.
     refine_transition_count: str = "replica"
 
+    def __post_init__(self) -> None:
+        if self.refine_transition_count not in REFINE_TRANSITION_COUNTS:
+            raise ValueError(f"refine_transition_count must be one of {REFINE_TRANSITION_COUNTS}, "
+                             f"got {self.refine_transition_count!r}")
 
+
+# Mirrors gareus.adaptive.cv2_resolution.TRANSITION_COUNTS (not imported: that module imports this one lazily).
+REFINE_TRANSITION_COUNTS = ("replica", "state-series")
 LADDER_SETTINGS_FIELDS = ("ladder_adapt", "ladder_min_overlap", "ladder_overlap_quantile", "ladder_min_ess",
                           "ladder_max_rungs", "ladder_hysteresis", "ladder_max_moves")
 LADDER_SETTINGS_FILENAME = "ladder_adapt_settings.json"
@@ -7988,6 +7997,7 @@ class AdaptiveProductionController:
             self._execute_respace(epoch, plan, str(action[3]))
         elif kind == "insert":
             # Spec 3.3 R3: children on every rung; the parent centre is kept (it bridges the barrier).
+            # plan["plan"] is _validate_insert's {"children", "added"} dict, wrapped by _validate_action.
             _, parent, _children, reason = action[:4]
             meta = dict(action[4]) if len(action) > 4 else None
             for child in plan["plan"]["children"]:
@@ -8186,7 +8196,12 @@ def _resolve_decision_settings(adaptive_dir: Path, policy: "AdaptiveDecisionPoli
     }
     if record["settings"] != recorded.get("settings") or not path.exists():
         write_json(path, record)
-    return replace(policy, **merged), {**record, "ignored_job_values": differs}
+    try:
+        resolved = replace(policy, **merged)          # runs AdaptiveDecisionPolicy.__post_init__
+    except ValueError as exc:
+        raise ValueError(f"{path}: invalid recorded adaptive decision setting ({exc}); fix the file or pass "
+                         "--ap-decision-settings-override to replace it with this job's values") from exc
+    return resolved, {**record, "ignored_job_values": differs}
 
 
 def _record_decision_settings_in_manifest(out_dir: Path, record: Dict[str, Any]) -> None:
@@ -10210,6 +10225,17 @@ def evaluate_adaptive_convergence_gate(
         n_pending = is_blocking(epoch_dir)
         if n_pending:
             continue_reasons.append(f"{n_pending} CV2-resolution action(s) pending (cv2_resolution_report.json)")
+        # Budget refusals (no_reserve / resolution_budget) are recorded, never blocking: they
+        # would repeat every epoch and pin the gate at "continue".
+        try:
+            _cv2_rep = json.loads((Path(epoch_dir) / "cv2_resolution_report.json").read_text())
+            _n_budget = sum(1 for c in _cv2_rep.get("candidates", []) or []
+                            if isinstance(c, dict) and c.get("refusal") in ("no_reserve", "resolution_budget"))
+        except (OSError, ValueError, TypeError, AttributeError):
+            _n_budget = 0
+        if _n_budget:
+            recommendations.append(f"{_n_budget} CV2-resolution action(s) refused for budget (not blocking); "
+                                   "set --swarm-adaptive-reserve-fraction > 0 at swarm design to fund them.")
 
     high_boost_states = []
     for row in diagnostics.get("states", []) or []:

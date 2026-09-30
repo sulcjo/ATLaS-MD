@@ -4,7 +4,7 @@
 ``--ap-cv2-resolution``) right after the existing proposers; ``propose_cv2_resolution`` is
 the pure orchestrator it wraps (tests and the replay CLI call it directly).
 
-Report ``epoch_NNN/cv2_resolution_report.json`` (schema ``cv2_resolution_report_v1``)::
+Report ``epoch_NNN/cv2_resolution_report.json`` (schema ``cv2_resolution_report_v2``)::
 
     schema_version, epoch, status ("ok" | "error"), error, stage ("numbered_epoch" | "replay"),
     settings      -- every knob and constant used (ResolutionSettings.as_record),
@@ -23,16 +23,26 @@ Report ``epoch_NNN/cv2_resolution_report.json`` (schema ``cv2_resolution_report_
                      rule}], actions_removed -- [{action [kind, id], reason}]: what this step did
                      to the epoch's action list,
     summary       -- {counts {rule: {decision: n}}, n_proposed, n_windows_at_compression_floor,
-                      n_blocking (proposed + refused for no_reserve/resolution_budget),
-                      n_trapped_or_orthogonal},
+                      n_blocking (proposed only), n_refused_budget (no_reserve/resolution_budget),
+                      n_refused_spring_cap (k2_capped_below_compression), n_trapped_or_orthogonal},
     apply         -- (after the applier) {"refused": [...]} for this step's actions.
 
 Refusal codes: no_reserve, resolution_budget, k2_at_floor, k2_capped_below_compression (the
 4 x parent / cv2_k_max cap or the coupling gate holds k2 below the shape rule's mean-compression
 floor), below_k_min (coupling gate), and the applier's own (duplicate, max_replicas_budget, ...)
-under ``apply``. R3 metrics carry ``transitions`` (replica-resolved, decides),
-``transitions_state_series`` (diagnostic: exchange swaps count there too), or
-``transitions_lower_bound`` when no replica column exists (then R3 never inserts).
+under ``apply``. R3 metrics carry ``transitions`` (the count R3 decides on, estimator
+``transitions_estimator``: replica-resolved by default), ``transitions_state_series`` (every
+switch of the state series, exchange swaps included; always >= the replica count), or, when no
+replica-resolved series exists, ``transitions`` None and ``transitions_state_series_lower_bound``
+(then R3 never inserts). Every R3 candidate carries ``r3_gate`` (``cv2_resolution.R3_GATES``:
+the test that decided it) and ``r3_gate_values`` (the measured numbers behind it).
+
+v2 (2026-09-30) vs v1: ``transitions_lower_bound`` renamed ``transitions_state_series_lower_bound``
+(it bounds the state-series count from below and the replica count from above); summary
+``n_blocking`` counts proposed candidates only (v1 added budget refusals) and gains
+``n_refused_budget`` / ``n_refused_spring_cap``; R3 metrics gain ``r3_gate`` /
+``r3_gate_values``; mixture components gain ``reg_variance`` / ``variance_curvature``. Readers
+(``cv2_resolution_summary``, ``is_blocking``) accept both versions.
 """
 from __future__ import annotations
 
@@ -54,6 +64,29 @@ from gareus.adaptive.reserve_budget import reserve_allowances
 UNION_NPZ_NAME = "topup_union_mbar.npz"
 UNION_OVERLAP_NAME = "topup_union_overlap.json"
 UNION_BYTES_PER_CELL = 8.0 * 6.0
+_NO_RESERVE_WARNED: set = set()      # adaptive dirs already warned in this process (one per campaign job)
+
+
+def reset_no_reserve_warnings() -> None:
+    """Forget which campaigns were warned (tests)."""
+    _NO_RESERVE_WARNED.clear()
+
+
+def warn_no_reserve_once(adaptive_dir: Path, budget: Mapping[str, Any]) -> bool:
+    """One WARNING per campaign job when no P1 reserve governs the resolution budget (every
+    R1-R3 proposal is then refused ``no_reserve``). Returns whether it printed."""
+    if (budget or {}).get("mode") != "no_reserve":
+        return False
+    key = str(Path(adaptive_dir).resolve())
+    if key in _NO_RESERVE_WARNED:
+        return False
+    _NO_RESERVE_WARNED.add(key)
+    reason = ((budget.get("allowance") or {}).get("reason")) or "no_reserve"
+    print(f"WARNING: --ap-cv2-resolution is on but no P1 layout reserve governs this campaign ({reason}): "
+          "every CV2-resolution action will be refused (no_reserve; recorded and CAUTION-graded, never "
+          "convergence-blocking). Set --swarm-adaptive-reserve-fraction > 0 at swarm design (and "
+          "--max-replicas > 0) to fund R1-R3.")
+    return True
 
 
 def _atomic_json(path: Path, obj: Any) -> Path:
@@ -425,10 +458,12 @@ def run_epoch_cv2_resolution(*, adaptive_dir: Path, epoch_dir: Path, epoch: int,
             subsamples=_subsamples(diagnostics), runs_for=runs_for, union=union, union_reason=why,
             reserve=reserve, reserve_source=source, gate=gate)
         save_history(adaptive_dir, history)
+        warn_no_reserve_once(adaptive_dir, report.get("budget") or {})
         report["stage"] = "numbered_epoch"
         _atomic_json(path, report)
         s = report["summary"]
         print(f"    CV2 resolution: {s['n_proposed']} action(s) proposed, {s['n_blocking']} blocking, "
+              f"{s['n_refused_budget']} refused for budget, {s['n_refused_spring_cap']} at the spring cap, "
               f"{s['n_trapped_or_orthogonal']} trapped_or_orthogonal ({path.name})")
         return new_actions
     except Exception as exc:          # never kill a completed epoch
@@ -436,8 +471,8 @@ def run_epoch_cv2_resolution(*, adaptive_dir: Path, epoch_dir: Path, epoch: int,
         try:
             _atomic_json(path, {"schema_version": cr.SCHEMA_VERSION, "epoch": int(epoch), "status": "error",
                                 "error": f"{type(exc).__name__}: {exc}", "candidates": [],
-                                "summary": {"counts": {}, "n_proposed": 0, "n_blocking": 0,
-                                            "n_trapped_or_orthogonal": 0}})
+                                "summary": {"counts": {}, "n_proposed": 0, "n_blocking": 0, "n_refused_budget": 0,
+                                            "n_refused_spring_cap": 0, "n_trapped_or_orthogonal": 0}})
         except OSError:
             pass
         return list(actions)
@@ -464,16 +499,25 @@ def annotate_report_with_refusals(epoch_dir: Path, actions: Sequence[Tuple], ref
 
 
 def is_blocking(epoch_dir: Path) -> int:
-    """Pending R1-R3 work recorded for this epoch (proposed or refused for budget), 0 if none."""
+    """Funded R1-R3 work recorded for this epoch (``proposed`` candidates), 0 if none.
+
+    Recounted from ``candidates`` so a v1 report (whose ``n_blocking`` also counted budget
+    refusals) reads the same way; budget refusals never block. A report without candidates
+    falls back to its summary."""
     path = Path(epoch_dir) / cr.REPORT_NAME
     if not path.exists():
         return 0
     try:
-        return int((json.loads(path.read_text()).get("summary") or {}).get("n_blocking", 0) or 0)
-    except (OSError, ValueError):
+        rep = json.loads(path.read_text())
+        cands = rep.get("candidates")
+        if isinstance(cands, list):
+            return sum(1 for c in cands if isinstance(c, dict) and c.get("decision") == "proposed")
+        return int((rep.get("summary") or {}).get("n_blocking", 0) or 0)
+    except (OSError, ValueError, TypeError):
         return 0
 
 
 __all__ = ["annotate_report_with_refusals", "budget_for_epoch", "find_layout_reserve", "is_blocking",
            "load_history", "parquet_runs_provider", "phase_union_npz", "propose_cv2_resolution",
-           "run_epoch_cv2_resolution", "save_history", "settings_from", "union_coverage"]
+           "reset_no_reserve_warnings", "run_epoch_cv2_resolution", "save_history", "settings_from",
+           "union_coverage", "warn_no_reserve_once"]

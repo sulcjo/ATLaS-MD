@@ -16,7 +16,9 @@ Pieces (pure, NumPy only):
   mixture and R3's "depth >= 1 kT, both modes >= 10 %" test.
 * ``estimate_f2`` -- F''_est = RT x precision, the component precision (1/var) shrunk toward
   the pooled region precision with weight n/(n + 8) (precision space, not the spec's variance
-  space); floored at 0.
+  space); floored at 0. Callers pass the component's ``variance_curvature`` (the fit
+  re-converged at the smallest regularisation, ``curvature_variance``), never the regularised
+  ``variance``: reg 3e-2 x pooled 0.55 made a var-0.041 mode read 0.070 (F'' ~40 % low).
 * ``shape_rule_k2`` -- k2 = RT/sigma_w^2 - F''_est, raised to the mean-compression floor
   (k2 >= F''_est x c/(1 - c), c = ``min_mean_compression``, default 0.5 -> k2 >= F''_est),
   floored at cv2_k_min and clamped at cv2_k_max (the CV1 curvature design rule of ``ladder_design.cv1_force_constants_from_curvature``
@@ -57,22 +59,50 @@ DEFAULT_MIN_MEMBER_FRACTION = 0.2   # ...and this share of its own kernel-weight
 DEFAULT_MAX_FRAMES = 5000           # deterministic stride subsample (swarm frames are ps apart)
 DEFAULT_MODE_MERGE_SIGMA = 0.5      # accepted modes closer than this x sampled sigma are one mode
 DEFAULT_MIN_MEAN_COMPRESSION = 0.5  # k2/(k2 + F'') floor: window means move >= half-way to their centre
+CURVATURE_VARIANCE_FLOOR = 1e-4     # x pooled variance: the de-regularised variance's floor (= the smallest reg)
 _LOG_2PI = math.log(2.0 * math.pi)
+
+
+def curvature_variance(variance: float, reg_variance: float, pooled_variance: float,
+                       polished: Optional[float] = None) -> float:
+    """The variance F'' (= RT/var) uses for one component: ``polished`` when given (the
+    component's variance after EM re-converges from the fit at the grid's smallest
+    regularisation, ``_polish_variances``), else ``variance - reg_variance``; never below
+    ``CURVATURE_VARIANCE_FLOOR`` x the pooled variance (a collapsed component) nor above
+    ``variance``. The EM adds ``reg_variance`` = reg x pooled variance to every component;
+    that stabilises the fit but is not the mode's width. Subtracting it alone leaves part of
+    the bias (the inflated width also pulled in the neighbour's tail: var 0.041, reg 3e-2 x
+    pooled 0.55 -> 0.070 fitted, 0.053 subtracted, 0.043 polished)."""
+    v, r = float(variance), max(0.0, float(reg_variance))
+    floor = CURVATURE_VARIANCE_FLOOR * float(pooled_variance) if math.isfinite(float(pooled_variance)) else 0.0
+    base = float(polished) if polished is not None and math.isfinite(float(polished)) else v - r
+    return float(min(v, max(base, floor)))
 
 
 @dataclass(frozen=True)
 class MixtureComponent:
+    """One mixture component. ``variance`` is the regularised EM variance (density, BIC,
+    responsibilities, ``mode_depth``); ``variance_curvature`` = ``variance`` - ``reg_variance``
+    (``curvature_variance``) is what every F'' estimate uses. Built without them (an old
+    record, a hand-made component) both default to "no regularisation"."""
     mean: float
     variance: float
     weight: float
     n_members: int
     accepted: bool
     reason: str
+    reg_variance: float = 0.0
+    variance_curvature: Optional[float] = None
+
+    def __post_init__(self):
+        if self.variance_curvature is None:
+            object.__setattr__(self, "variance_curvature", float(self.variance))
 
     def as_record(self) -> dict:
         return {"mean": self.mean, "variance": self.variance, "sd": math.sqrt(max(self.variance, 0.0)),
                 "weight": self.weight, "n_members": int(self.n_members), "accepted": bool(self.accepted),
-                "reason": self.reason}
+                "reason": self.reason, "reg_variance": self.reg_variance,
+                "variance_curvature": self.variance_curvature}
 
 
 @dataclass(frozen=True)
@@ -143,6 +173,20 @@ def _em(z, w, params, reg_var: float, max_iter: int, tol: float):
             break
         ll_prev = ll
     return (means, var, pis), _weighted_loglik(z, w, (means, var, pis))
+
+
+def _polish_variances(z, w, params, pooled_var: float, max_iter: int, tol: float) -> List[Optional[float]]:
+    """Per component (same order as ``params``): the variance after EM re-converges from the
+    regularised fit with regularisation CURVATURE_VARIANCE_FLOOR x pooled (then removed), or
+    None where the polished component is not the same mode (its mean moved by more than one
+    regularised sd, or its weight halved) -- the caller then subtracts the regularisation."""
+    reg_c = CURVATURE_VARIANCE_FLOOR * float(pooled_var)
+    (m2, v2, p2), _ = _em(z, w, params, reg_c, max_iter, tol)
+    out: List[Optional[float]] = []
+    for m, v, p, mm, vv, pp in zip(*params, m2, v2, p2):
+        same = abs(float(mm) - float(m)) <= math.sqrt(max(float(v), 0.0)) and float(pp) >= 0.5 * float(p)
+        out.append(float(vv) - reg_c if same and math.isfinite(float(vv)) else None)
+    return out
 
 
 def _weighted_loglik(z, w, params) -> float:
@@ -249,7 +293,9 @@ def fit_cv2_mixture(cv2, member_ids, weights=None, *, max_components: int = 3,
 
     ``weights`` are per-frame CV1-kernel weights (1 = every frame counts fully). For each
     component count K in 1..max_components the regularisation (``reg`` x pooled variance added
-    to every component variance) is chosen by member-blocked cross-validation, the model is
+    to every component variance; recorded per component as ``reg_variance``; ``variance_curvature``,
+    the variance F'' uses, re-converges the fit without it, ``curvature_variance``) is chosen
+    by member-blocked cross-validation, the model is
     refitted on all frames and scored by weighted BIC (n = sum of weights, 3K - 1 parameters);
     the lowest BIC wins. A member supports a component when its responsibility-weighted frames
     sum to >= ``min_member_weight`` and to >= ``min_member_fraction`` of its own weighted
@@ -279,10 +325,13 @@ def fit_cv2_mixture(cv2, member_ids, weights=None, *, max_components: int = 3,
     params, _ll, reg, scores, folds, _bic = fits[best_k]
     support = _member_support(z, w, ids, params, min_member_weight, min_member_fraction)
     comps = []
-    for mean, var, pi, n_mem in sorted(zip(*params, support), key=lambda t: t[0]):
+    reg_var = float(reg) * pooled_var
+    polished = _polish_variances(z, w, params, pooled_var, max_iter, tol)
+    for mean, var, pi, n_mem, pol in sorted(zip(*params, support, polished), key=lambda t: t[0]):
         ok = n_mem >= int(min_mode_members)
         comps.append(MixtureComponent(float(mean), float(var), float(pi), int(n_mem), bool(ok),
-                                      "accepted" if ok else f"min_mode_members: {n_mem} < {int(min_mode_members)}"))
+                                      "accepted" if ok else f"min_mode_members: {n_mem} < {int(min_mode_members)}",
+                                      reg_var, curvature_variance(float(var), reg_var, pooled_var, pol)))
     return CV2MixtureFit(tuple(comps), int(best_k), {k: float(v[5]) for k, v in fits.items()}, float(reg),
                          dict(scores), int(folds), int(z.size), int(np.unique(ids).size), total, pooled_mean,
                          pooled_var, int(min_mode_members))
@@ -406,7 +455,8 @@ class _ShapeModel:
         self.t, self.sigma_t, self.k_min, self.k_max = float(temperature_k), float(sigma_w_target), k_min, k_max
         self.min_c = float(min_mean_compression)
         self.comps = list(fit.accepted_components)
-        self.f2_comp = np.array([estimate_f2(c.variance, fit.pooled_variance, c.n_members, temperature_k,
+        # F'' from the de-regularised variance; the argmax dominance in f2() keeps the density's.
+        self.f2_comp = np.array([estimate_f2(c.variance_curvature, fit.pooled_variance, c.n_members, temperature_k,
                                              prior_members=prior_members) for c in self.comps])
         self.f2_pool = estimate_f2(fit.pooled_variance, fit.pooled_variance, fit.n_members, temperature_k,
                                    prior_members=prior_members)
@@ -433,7 +483,12 @@ class _ShapeModel:
 
 
 def _step(model: _ShapeModel, z: float, direction: int, spacing: float, reach: float, n_grid: int) -> float:
-    """Largest delta with delta = spacing x min sigma_s over [z, z + direction*delta] (fixed point)."""
+    """A step delta with delta <= spacing x min sigma_s over [z, z + direction*delta].
+
+    Iterates delta <- spacing x min sigma_s over the current step, from spacing x sigma_s(z)
+    downward, and stops at the first delta that satisfies the rule. That delta is feasible
+    but can undershoot the largest feasible (fixed-point) step: conservative -- a centre too
+    many, never a gap too wide. (After 64 iterations the last value is returned unchecked.)"""
     d = min(spacing * float(model.sigma(z)[0]), reach)
     for _ in range(64):
         pts = z + direction * np.linspace(0.0, d, int(n_grid))
@@ -514,6 +569,6 @@ def place_cv2_centres(fit: CV2MixtureFit, envelope: Tuple[float, float], *, sigm
                         tuple(dropped), c_floor, float(min_mean_compression))
 
 
-__all__ = ["CV2MixtureFit", "CV2Placement", "DEFAULT_MIN_MEAN_COMPRESSION", "DEFAULT_MIN_MODE_MEMBERS", "DEFAULT_PRIOR_MEMBERS",
+__all__ = ["CURVATURE_VARIANCE_FLOOR", "CV2MixtureFit", "CV2Placement", "DEFAULT_MIN_MEAN_COMPRESSION", "curvature_variance", "DEFAULT_MIN_MODE_MEMBERS", "DEFAULT_PRIOR_MEMBERS",
            "DEFAULT_SPACING_SIGMA", "MixtureComponent", "estimate_f2", "fit_cv2_mixture", "mixture_logpdf", "compression_floor_k2",
            "mode_depth", "mode_pair_resolvable", "place_cv2_centres", "predicted_sampled_sigma", "shape_rule_k2"]

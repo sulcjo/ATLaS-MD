@@ -33,8 +33,10 @@ def _r3_children(view: cr.StateView, modes: Mapping[str, Any], settings: cr.Reso
     sigma_target = 2.0 * (0.5 * (float(hi["mean"]) - float(lo["mean"]))) / cr.SPACING_SIGMA
     kids = []
     for comp in (lo, hi):
-        f2 = cr.f2_under_bias(comp["variance"], view.k2, settings.temperature_k, pooled_var=pooled,
-                              n_members=comp["n_members"])
+        # The de-regularised variance (cv2_shape.curvature_variance); a v1 record has only "variance".
+        var_c = comp.get("variance_curvature")
+        f2 = cr.f2_under_bias(comp["variance"] if var_c is None else var_c, view.k2, settings.temperature_k,
+                              pooled_var=pooled, n_members=comp["n_members"])
         child = {"primary_center": view.c1, "primary_k": float(view.k1), "secondary_center": float(comp["mean"]),
                  "centred_on": "mixture_mode", **cr.child_spring(sigma_target, f2, float(view.k2), settings)}
         kids.append(cr.gate_child(child, view.c1, float(view.k1), float(comp["mean"]), gate,
@@ -46,8 +48,17 @@ def _transitions(rec: Optional[Mapping[str, Any]], bounds: Tuple[float, float],
                  count: str = "replica") -> Dict[str, Any]:
     """Crossings R3 decides on. ``count`` "replica": within one replica's residence (an
     exchange swap bringing in a walker from the other mode is not a crossing);
-    "state-series": every switch of the state-indexed series, swaps included. Both need the
-    full Parquet series; the strided subsample only gives a state-series lower bound."""
+    "state-series": every switch of the state-indexed series, swaps included.
+
+    state-series >= replica always: a replica run is a contiguous piece of a state run (same
+    step stride), so the state series counts every within-residence crossing plus the label
+    changes where a swap brings in a walker from the other mode. "state-series" is therefore
+    the permissive choice (under exchange it counts swap frequency: chignolin_9 370-469
+    switches vs 0-5 crossings). Both need a replica-resolved Parquet source; without one
+    ``transitions`` is None and ``transitions_state_series_lower_bound`` (report v2; v1 called
+    it ``transitions_lower_bound``) holds the state-series count that exists -- from the full
+    series when the Parquet has no replica column, 0 when no series was read -- a lower bound
+    on the state-series count, NOT on the replica count (it bounds that from above)."""
     if count not in cr.TRANSITION_COUNTS:
         raise ValueError(f"refine_transition_count must be one of {cr.TRANSITION_COUNTS}, got {count!r}")
     rec = rec or {}
@@ -59,7 +70,7 @@ def _transitions(rec: Optional[Mapping[str, Any]], bounds: Tuple[float, float],
                               else out["transitions_state_series"])
     else:
         out["transitions"] = None
-        out["transitions_lower_bound"] = out["transitions_state_series"]
+        out["transitions_state_series_lower_bound"] = out["transitions_state_series"]
     return out
 
 
@@ -71,16 +82,22 @@ def _r3_decide(view: cr.StateView, modes: Dict[str, Any], rec: Optional[Mapping[
     metrics.update(_transitions(rec, cr.core_bounds(lo, hi, float(modes["depth"]["barrier_z"])),
                                 str(settings.refine_transition_count)))
     ids = [view.state_id]
+    metrics["r3_gate_values"] = {**(modes.get("gate_values") or {}), "transitions": metrics["transitions"],
+                                 "min_transitions": int(settings.refine_min_transitions),
+                                 "transitions_estimator": metrics["transitions_estimator"]}
     if metrics["transitions"] is None:
+        metrics["r3_gate"] = "no_replica_series"
         return cr.new_candidate("R3", "state", ids, "flagged", "transitions_unavailable: no replica-resolved "
-                                "series (the subsample count is a state-series lower bound only)", metrics=metrics)
+                                "series (the recorded count is a state-series lower bound only)", metrics=metrics)
     if metrics["transitions"] < int(settings.refine_min_transitions):
+        metrics["r3_gate"] = "transitions_below_min"
         metrics["trapped_or_orthogonal"] = True
         return cr.new_candidate("R3", "state", ids, "flagged",
                                 f"trapped_or_orthogonal: bimodal (depth {modes['depth']['depth_kT']:.2f} kT) but "
                                 f"{metrics['transitions']} < {settings.refine_min_transitions} "
                                 f"{'within-residence' if settings.refine_transition_count == 'replica' else 'state-series'} "
                                 "transitions", metrics=metrics)
+    metrics["r3_gate"] = "passed"
     kids = _r3_children(view, modes, settings, gate)
     proposal = {"parent_state_id": view.state_id, "children": kids}
     refusal = next((k["refusal"] for k in kids if k.get("refusal")), None)
@@ -111,15 +128,18 @@ def propose_r3(views: Mapping[int, cr.StateView], rep_ids: Sequence[int],
         z = np.asarray(sub.get("cv2", []), dtype=float)
         if np.isfinite(z).sum() < 3 * cr.MEMBER_BLOCKS:
             out.append(cr.new_candidate("R3", "state", [sid], "skipped", "too_few_samples",
-                                        metrics=_r3_metrics(view, settings)))
+                                        metrics={**_r3_metrics(view, settings), "r3_gate": "too_few_samples",
+                                                 "r3_gate_values": {"n_finite": int(np.isfinite(z).sum()),
+                                                                    "min_finite": 3 * cr.MEMBER_BLOCKS}}))
             continue
         keep = np.isfinite(z)
         src = sub.get("source_index")
         modes = cr.mode_analysis(z[keep], None if src is None else np.asarray(src)[keep], seed=sid)
         if not modes["bimodal"]:
             out.append(cr.new_candidate("R3", "state", [sid], "no_action", "no resolvable mode pair "
-                                        "(depth >= 1 kT, both >= 10 %)",
-                                        metrics={**_r3_metrics(view, settings), "mixture": modes["fit"]}))
+                                        f"(depth >= 1 kT, both >= 10 %): {modes['gate']}",
+                                        metrics={**_r3_metrics(view, settings), "mixture": modes["fit"],
+                                                 "r3_gate": modes["gate"], "r3_gate_values": modes["gate_values"]}))
             continue
         bimodal[sid] = modes
     runs = dict(runs_for(sorted(bimodal)) or {}) if (runs_for is not None and bimodal) else {}

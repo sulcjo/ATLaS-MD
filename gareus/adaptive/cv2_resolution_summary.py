@@ -26,6 +26,7 @@ Summary ``cv2_resolution_summary.json`` (schema ``cv2_resolution_summary_v1``)::
                 n_modes + modes [{mean, sd, weight}] (the accepted mixture components),
                 r3_mode_pair (means of the pair R3 judged, or null), depth_kT, transitions,
                 transitions_estimator, transitions_state_series, trapped_or_orthogonal,
+                r3_gate + r3_gate_values (the R3 test that decided and its numbers),
     edges    -- per edge: state_i, state_j, edge_type, graph_kind, pattern_pair, graded,
                 pairwise_status, pairwise_reason, pairwise_overlap, pairwise_q10, pairwise_q90,
                 pairwise_n_eff_min, union_mbar_overlap, below_threshold, weak, measured,
@@ -65,6 +66,7 @@ SPACE_JOINT = "cv1_cv2_joint"
 SPACE_PAIRWISE = "two_state_mbar"      # 3.1: BAR on the pair's own samples, umbrella terms only
 SPACE_UNION = "union_mbar"             # the union solve's pairwise value, when applied
 BUDGET_REFUSALS = ("no_reserve", "resolution_budget", "max_replicas_budget")
+SPRING_CAP_REFUSAL = "k2_capped_below_compression"
 
 DEFINITIONS = {
     "sigma_w2": "sqrt(k_B T / k2): the CV2 umbrella's own Gaussian width (math_helpers."
@@ -74,9 +76,15 @@ DEFINITIONS = {
                          "spring; ~1: spring-dominated; > 1: broader than the spring (a mode mixture "
                          "or a soft direction). Landscape-confinement diagnostic only, never a trigger.",
     "transitions": "core-to-core CV2 transitions between the two R3 modes (3.3 report). Estimator "
-                   "'replica': within replica residences (the value R3 decides on); "
-                   "'state_series_lower_bound': the state's time series only, exchange swaps "
-                   "counted too, used when no replica column exists; 'none': not evaluated.",
+                   "'replica': within replica residences (R3's default); 'state-series': every "
+                   "switch of the state's series, exchange swaps included (>= replica always: the "
+                   "permissive choice); 'state_series_lower_bound': no replica-resolved series, a "
+                   "lower bound on the state-series count (an upper bound on the replica count); "
+                   "'none': not evaluated.",
+    "r3_gate": "the 3.3 R3 test that decided the window (cv2_resolution.R3_GATES): single_component, "
+               "member_support, no_density_minimum, depth_below_1kT, mode_weight_below_10pct, "
+               "too_few_samples, no_replica_series, transitions_below_min or passed; r3_gate_values "
+               "holds the measured numbers (members, weights, depth per accepted pair, transitions).",
     "weak": "gareus.adaptive.edge_metric.edge_is_weak_pairwise at the payload threshold: same-"
             "pattern collector geometry edge, measured, bootstrap q90 (or union value) < threshold. "
             "neighbour/spanning/cross-pattern/unmeasured edges are never weak.",
@@ -87,7 +95,7 @@ _STATE_COLS = ["state_id", "c1", "k1", "c2", "k2", "lambda", "cv1_restrained", "
                "restraint_source", "sample_count", "n_pairs", "cv1_mean", "cv2_mean", "cv2_sd", "sigma_w2",
                "confinement_ratio", "sarle_bimodality", "r3_evaluated", "r3_decision", "n_modes",
                "mode_means", "r3_mode_pair", "depth_kT", "transitions", "transitions_estimator", "transitions_state_series",
-               "trapped_or_orthogonal", "r3_reason"]
+               "trapped_or_orthogonal", "r3_gate", "r3_reason"]
 _EDGE_COLS = ["state_i", "state_j", "edge_type", "graph_kind", "pattern_pair", "graded", "pairwise_status",
               "pairwise_reason", "pairwise_overlap", "pairwise_q10", "pairwise_q90", "pairwise_n_eff_min",
               "pairwise_space", "union_mbar_overlap", "union_space", "below_threshold", "weak", "measured",
@@ -153,11 +161,24 @@ def _r3_by_state(report: Optional[Mapping[str, Any]]) -> Dict[int, Mapping[str, 
     return out
 
 
+_LOWER_BOUND_KEYS = ("transitions_state_series_lower_bound",   # 3.3 report v2
+                     "transitions_lower_bound")                 # v1 (same value, misleading name)
+
+
 def _transitions(m: Mapping[str, Any]) -> Tuple[Optional[int], str]:
+    """(count, estimator) from a 3.3 R3 candidate's metrics, v1 or v2 report.
+
+    ``replica``: crossings within one replica's residence (R3's default). ``state-series``:
+    every switch of the state-indexed series = the within-residence crossings PLUS the label
+    changes an exchange swap causes, so state-series >= replica always and
+    ``--ap-refine-transition-count state-series`` is the permissive choice.
+    ``state_series_lower_bound``: no replica-resolved series; the value bounds the state-series
+    count from below and says nothing that could raise the replica count (it bounds it above)."""
     if m.get("transitions") is not None:
         return int(m["transitions"]), str(m.get("transitions_estimator") or "replica")
-    if m.get("transitions_lower_bound") is not None:
-        return int(m["transitions_lower_bound"]), "state_series_lower_bound"
+    for key in _LOWER_BOUND_KEYS:
+        if m.get(key) is not None:
+            return int(m[key]), "state_series_lower_bound"
     return None, "none"
 
 
@@ -167,7 +188,8 @@ def _r3_fields(cand: Optional[Mapping[str, Any]], has_report: bool) -> Dict[str,
         return {"r3_evaluated": False, "r3_decision": None, "r3_reason": why, "n_modes": None, "modes": None,
                 "r3_mode_pair": None,
                 "depth_kT": None, "transitions": None, "transitions_estimator": "none",
-                "transitions_state_series": None, "trapped_or_orthogonal": None}
+                "transitions_state_series": None, "trapped_or_orthogonal": None, "r3_gate": None,
+                "r3_gate_values": None}
     m = cand.get("metrics") or {}
     comps = [x for x in ((m.get("mixture") or {}).get("components") or []) if x.get("accepted")]
     modes = [{"mean": _finite(x.get("mean")), "sd": _finite(x.get("sd")), "weight": _finite(x.get("weight"))}
@@ -179,7 +201,8 @@ def _r3_fields(cand: Optional[Mapping[str, Any]], has_report: bool) -> Dict[str,
             "depth_kT": _finite((m.get("depth") or {}).get("depth_kT")),
             "transitions": n, "transitions_estimator": est,
             "transitions_state_series": _int(m.get("transitions_state_series")),
-            "trapped_or_orthogonal": bool(m.get("trapped_or_orthogonal", False))}
+            "trapped_or_orthogonal": bool(m.get("trapped_or_orthogonal", False)),
+            "r3_gate": m.get("r3_gate"), "r3_gate_values": m.get("r3_gate_values")}
 
 
 def state_record(row: Mapping[str, Any], reg: Optional[Mapping[str, Any]], r3: Optional[Mapping[str, Any]],
@@ -236,6 +259,10 @@ def _budget_refusals(report: Optional[Mapping[str, Any]]) -> int:
     return n
 
 
+def _spring_cap_refusals(report: Mapping[str, Any]) -> int:
+    return sum(1 for c in report.get("candidates", []) or [] if c.get("refusal") == SPRING_CAP_REFUSAL)
+
+
 def _counts(states: Sequence[Mapping[str, Any]], edges: Sequence[Mapping[str, Any]],
             em: Optional[Mapping[str, Any]], report: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     graded = [e for e in edges if e["graded"]]
@@ -253,7 +280,8 @@ def _counts(states: Sequence[Mapping[str, Any]], edges: Sequence[Mapping[str, An
             "edge_metric_status": (em or {}).get("status"),
             "report_status": (report or {}).get("status"),
             "n_proposed": summ.get("n_proposed"), "n_blocking": summ.get("n_blocking"),
-            "n_refused_budget": _budget_refusals(report) if report else None}
+            "n_refused_budget": _budget_refusals(report) if report else None,
+            "n_refused_spring_cap": _spring_cap_refusals(report) if report else None}
 
 
 # ---- the summary ------------------------------------------------------------------------
@@ -447,7 +475,8 @@ def _one_line(summary: Mapping[str, Any]) -> str:
     return (f"{summary['label']}: {c['n_states']} states ({c['n_cv2_restrained']} CV2-restrained, "
             f"{c['n_r3_evaluated']} R3-evaluated, {c['n_trapped_or_orthogonal']} trapped_or_orthogonal); "
             f"{c['n_graded_edges']} graded edges, {c['n_weak']} weak, {c['n_unmeasured']} unmeasured, "
-            f"components {c['n_components']}; budget refusals {c['n_refused_budget']}")
+            f"components {c['n_components']}; budget refusals {c['n_refused_budget']}, "
+            f"spring-cap refusals {c['n_refused_spring_cap']}")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
