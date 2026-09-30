@@ -839,3 +839,66 @@ record in `t2_data/t2c_r2v3.json` under `c9`).
   intervals like these three. If that is unwanted, `--ap-coverage-count any` (or
   `--ap-coverage-min-windows 1`) restores the near-inert count rule; the choice is frozen per
   campaign.
+
+### 10.7 Respring dry run on chignolin_9 (`--ap-cv2-respring`, 2026-09-30)
+
+Script: `scripts/t3d_respring_dryrun.py`. It is read-only and runs the shipped
+`cv2_respring_io.propose_respring` with the default knobs:
+
+- min n_eff 200;
+- tolerance 0.05, so a window triggers when the upper end of its c_real interval is below 0.45;
+- per-epoch cap 0.25 x 59 centres = 14.
+
+g is the X5 CV2 inefficiency over the phase's Parquet sources. The payloads are the replayed P4
+ones from 10.2. The compact record is `t2_data/t3d_respring_c9.json`. After both runs,
+`find RUNS/chignolin_9 -newer <stamp>` returned nothing.
+
+**What this measures.** c9's CV2 springs are the uniform k2 = 1.18, not a shape design. So this
+measures how far the uniform spring sits from the shape rule's 0.5 compression. It does not
+measure how a shape layout's springs are realised; that is 10.5.
+
+c9's `layout_plan.json` has no `cv2_shape` record, so the sigma target is the sampled sd. Every
+triggered window therefore gets k2' = F''_prod, and its predicted c is 0.5 by construction.
+
+| | epoch_002 | final-combined |
+|---|---|---|
+| candidates (CV2-restrained, lambda = 0) | 43 (39 2-D + 4 CV2-only) | 43 |
+| X5 g (CV2), median [min, max] | 4.5 [3.0, 10.5] | 6.9 [3.3, 24.9] |
+| n_eff, median [min] | 613 [261] | 5,590 [1,561] |
+| c_real, median (10-90 %) [range] | 0.52 (0.40-0.61) [0.32-0.70] | 0.44 (0.37-0.56) [0.30-0.59] |
+| F''_prod, median [range] | 1.10 [0.50, 2.57] | 1.53 [0.83, 2.72] |
+| 90 % interval width of c_real, median | 0.082 | 0.049 |
+| point c_real < 0.5 / < 0.45 | 20 / 11 | 30 / 24 |
+| triggered (whole interval < 0.45) | 6 | 20 |
+| proposed at the default cap (14) | 6 | 14 (6 deferred) |
+| k2', median [range] | 1.86 [1.70, 2.57] | 1.83 [1.60, 2.72] |
+| k2' / k2, median [range] | 1.57 [1.44, 2.17] | 1.55 [1.36, 2.30] |
+| over-compressed flags / F''_prod <= 0 | 0 / 0 | 0 / 0 |
+| wall time (X5 included) | 1.5 s | 15 s |
+
+- **Where.** 15 of the 20 final-combined triggers are on the two outer CV2 rows: 8 at -1.851 and
+  7 at +1.348. There the landscape is stiff and the window means sit far inside their centres.
+  - 3 triggers are at 0.281 and 2 at -0.785.
+  - The CV1 = 0.070 column triggers on both of its lower rows (80, 192; c_real 0.30 / 0.33).
+  - None of the 4 CV1-free CV2-only windows (64-76) triggers.
+- **epoch_002 vs final-combined.** epoch_002 triggers 6 windows: 80, 108, 128 and 152 at -1.851,
+  192 and 196. The final-combined data are about 9x more samples and triggers 20, a superset.
+  A confident-only rule acts on more windows as the intervals shrink. At final-combined scale
+  the 0.05 tolerance, not the interval, decides.
+- **Cross-check with 10.5.** It uses the same final-combined payload.
+  - The conditional F''_prod equals t3c's F''_loc for all 39 2-D windows (ratio 1.000 at every
+    quantile).
+  - The marginal F''_prod, which is the value the rule decides on, is 0.91-1.00 of it (median
+    0.996).
+  - By t3c's point values, 27 of the 39 would sit below 0.5 under k2 = 1.18. The interval rule
+    acts on 20.
+- **Cost to the layout (predicted, not measured).** At k2' = F''_prod, the sampled CV2 sd of a
+  triggered window shrinks by sqrt((k2 + F'')/(2 F'')). That is 0.85-0.93x on c9. Its CV2
+  neighbour overlaps drop accordingly, and the next epoch's 3.1 metric re-grades those edges.
+- **Not measured.**
+  - Whether k2' actually realises 0.5. That needs MD. The prediction assumes F'' is unchanged as
+    the window narrows, and a bimodal window's F''_prod is an average curvature.
+  - The lambda > 0 rungs. The rule reads lambda = 0 only and replicates k2' onto every rung.
+  - The epoch_002 run uses the final registry, as the 3.3 dry runs do.
+  - No bootstrap over replicas, because the P4 NPZ carries no replica column. The blocks are
+    time blocks of 5 g within a source.
