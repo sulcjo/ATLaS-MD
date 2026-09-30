@@ -22,7 +22,10 @@ from gareus.swarm.ladder_design import R_KCAL_MOL_K  # noqa: E402
 T = 300.0
 RT = R_KCAL_MOL_K * T
 K1, K2 = 800.0, 5.0
-SETTINGS = cr.ResolutionSettings(temperature_k=T)
+# Pinned to the pre-v3 rules (the tests below exercise them); the v3 defaults are tested in
+# tests/test_cv2_resolution_v3.py.
+SETTINGS = cr.ResolutionSettings(temperature_k=T, refine_transition_count="replica", refine_r3_mode="insert", coverage_count="any",
+                               refine_pmf_sigma_kT=0.5)
 
 
 def _registry(lambdas=(0.0,), c1s=(0.2, 0.4), c2s=(-1.0, 0.0, 1.0), k2=K2):
@@ -435,7 +438,7 @@ def test_transition_count_mode_is_validated_and_recorded():
     from gareus.adaptive import cv2_resolution_rules as rules
     rec = {"source": "parquet", "replica_runs": [np.array([-1.0, 1.0])],
            "state_runs": [np.array([-1.0, 1.0, -1.0])]}
-    assert rules._transitions(rec, (-0.5, 0.5))["transitions"] == 1
+    assert rules._transitions(rec, (-0.5, 0.5), "replica")["transitions"] == 1
     out = rules._transitions(rec, (-0.5, 0.5), "state-series")
     assert out["transitions"] == 2 and out["transitions_estimator"] == "state-series"
     sub_only = rules._transitions({"source": "subsample", "state_runs": rec["state_runs"]}, (-0.5, 0.5),
@@ -443,6 +446,6 @@ def test_transition_count_mode_is_validated_and_recorded():
     assert sub_only["transitions"] is None and sub_only["transitions_state_series_lower_bound"] == 2
     with pytest.raises(ValueError):
         rules._transitions(rec, (-0.5, 0.5), "bogus")
-    assert cr.ResolutionSettings.from_policy(ap.AdaptiveDecisionPolicy()).refine_transition_count == "replica"
+    assert cr.ResolutionSettings.from_policy(ap.AdaptiveDecisionPolicy()).refine_transition_count == "replica-path"
     pol = ap.AdaptiveDecisionPolicy(refine_transition_count="state-series")
     assert cr.ResolutionSettings.from_policy(pol).refine_transition_count == "state-series"

@@ -95,7 +95,7 @@ def test_fallback_field_is_named_a_state_series_lower_bound():
     out = rules._transitions(rec, (-0.5, 0.5))
     assert out["transitions"] is None and out["transitions_state_series_lower_bound"] == 2
     assert "transitions_lower_bound" not in out
-    assert cr.SCHEMA_VERSION == "cv2_resolution_report_v2"
+    assert cr.SCHEMA_VERSION == "cv2_resolution_report_v3"
 
 
 @pytest.mark.parametrize("key", ["transitions_lower_bound", "transitions_state_series_lower_bound"])
@@ -161,7 +161,9 @@ def _r3_propose(z, runs=None):
     runs_for = (lambda ids: {i: runs for i in ids}) if runs is not None else None
     policy = ap.AdaptiveDecisionPolicy(cv2_resolution=True, edge_metric="pairwise-mbar", max_replicas_budget=10)
     _new, report, _h = cio.propose_cv2_resolution(
-        reg, {"states": rows, "edges": []}, [], cr.ResolutionSettings(temperature_k=T), policy, epoch=0,
+        reg, {"states": rows, "edges": []}, [], cr.ResolutionSettings(temperature_k=T, refine_transition_count="replica", refine_r3_mode="insert", coverage_count="any",
+                               refine_pmf_sigma_kT=0.5), policy,
+        epoch=0,
         history={}, subsamples=sub, runs_for=runs_for, reserve={"fraction": 0.2, "max_replicas": 10})
     return next(c for c in report["candidates"] if c["rule"] == "R3" and c["state_ids"] == [parent])
 
@@ -275,7 +277,7 @@ def test_bad_transition_count_fails_at_policy_construction():
         ap.AdaptiveDecisionPolicy(refine_transition_count="bogus")
     with pytest.raises(ValueError, match="refine_transition_count"):
         ap.policy_from_args(Namespace(adaptive_production_refine_transition_count="bogus"))
-    assert ap.policy_from_args(Namespace()).refine_transition_count == "replica"
+    assert ap.policy_from_args(Namespace()).refine_transition_count == "replica-path"
 
 
 def test_bad_recorded_transition_count_fails_at_load_with_the_file_named(tmp_path):

@@ -1,4 +1,4 @@
-"""The "CV2 resolution" health row (spec 3.7), graded from a ``cv2_resolution_summary_v1`` table.
+"""The "CV2 resolution" health row (spec 3.7), graded from a ``cv2_resolution_summary_v1``/``v2`` table.
 
 Stdlib only and presentation only: it reads the precomputed ``counts`` block that
 ``gareus.adaptive.cv2_resolution_summary`` wrote and never recomputes a metric, so
@@ -22,8 +22,11 @@ Rule (stated in the row text):
              (no_reserve, resolution_budget, max_replicas_budget), resolution windows refused
              at the spring cap (k2_capped_below_compression: the 4 x parent k2 / cv2_k_max cap
              or the coupling gate holds k2 below the mean-compression floor -- the window the
-             rule asked for was not placed), or an edge-metric / 3.3-report error. None of the
-             CAUTIONs blocks the convergence gate.
+             rule asked for was not placed), R3 windows flagged only (r3_flag_only, 3.3 report
+             v3 with --ap-refine-r3-mode flag: bimodal with enough crossings and placeable
+             children, recorded instead of inserted -- the modes are real but unresolved by
+             windows), or an edge-metric / 3.3-report error. None of the CAUTIONs blocks the
+             convergence gate.
   PASS    -- none of those. NA -- a CV1-only table with no graded edges and no 3.3 report.
 """
 from __future__ import annotations
@@ -39,7 +42,7 @@ SUMMARY_NAME = "cv2_resolution_summary.json"            # mirrors cv2_resolution
 FINAL_NAME = "cv2_resolution_summary_final_combined.json"
 RULE_TEXT = ("rule: FAIL if a pairwise-MBAR weak edge or >1 spatial component; CAUTION for "
              "unmeasured edges, trapped_or_orthogonal windows, budget refusals, spring cap below the "
-             "mean-compression floor, metric/report errors")
+             "mean-compression floor, R3 flag-only windows, metric/report errors")
 
 
 def find_summary(production_dir: Any) -> Optional[Path]:
@@ -77,7 +80,9 @@ def _issues(c: Mapping[str, Any], connectivity_failed: bool) -> tuple:
                               ("n_trapped_or_orthogonal", "trapped_or_orthogonal window(s)", cautions),
                               ("n_refused_budget", "action(s) refused for budget", cautions),
                               ("n_refused_spring_cap", "window(s) refused at the spring cap "
-                               "(k2_capped_below_compression)", cautions)):
+                               "(k2_capped_below_compression)", cautions),
+                              ("n_r3_flag_only", "R3 window(s) flagged only (r3_flag_only: would get two "
+                               "windows in --ap-refine-r3-mode insert)", cautions)):
         n = int(c.get(key) or 0)
         if n > 0:
             bucket.append(f"{n} {text}")

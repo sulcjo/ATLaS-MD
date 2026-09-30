@@ -2222,15 +2222,26 @@ under-resolved.  Only states restraining both axes above their floors
         The bridge replaces the midpoint bridger on that edge.
     R2  coverage hole, post-union only (needs --ap-topups, which build a union each
         epoch; otherwise recorded unavailable): a CV2 interval at fixed CV1 whose
-        unbiased weight comes from fewer than --ap-coverage-min-windows centres, or
-        whose block-bootstrap free-energy sigma exceeds --ap-refine-pmf-sigma-kt,
-        gets a window at the interval centre.
+        unbiased weight comes from fewer than --ap-coverage-min-windows centres
+        (--ap-coverage-count same-column, default: only centres restrained at that
+        CV1 column count -- neighbouring columns reach every slab of a 2-D grid, so
+        counting them, "any", makes the rule near-inert; CV1-unrestrained windows
+        count in no column), or whose block-bootstrap free-energy sigma exceeds
+        --ap-refine-pmf-sigma-kt, gets a window at the interval centre. Bootstrap
+        blocks are 5 x each state's autocorrelation time g (Geyer, max over its
+        restrained axes; >= 5 blocks per state; never across a sample source).
     R3  mode resolution: a window whose CV2 samples show two mixture modes (depth
         >= 1 kT, both >= 10 %) AND >= --ap-refine-min-transitions core-to-core
-        transitions (--ap-refine-transition-count: replica = within replica
-        residences, default; state-series = every switch at the window, exchange
-        swaps included, always >= the replica count: the permissive choice) gets
-        two children at the modes; the parent is kept. Without transitions it is
+        transitions (--ap-refine-transition-count: replica-path, default = each
+        replica's own visits to the window joined in time order across its
+        absences, so swaps never count but a replica's own crossings do; replica =
+        within one contiguous residence, inert under exchange; state-series = every
+        switch at the window, swaps included, passes everything under exchange.
+        replica <= replica-path and replica <= state-series; the other two are not
+        ordered) gets two children at the modes; the parent is kept. With
+        --ap-refine-r3-mode flag (default) the children and springs are only
+        recorded (decision flagged, reason r3_flag_only: no insert, no budget,
+        never blocks convergence, graded CAUTION); insert acts. Without transitions it is
         flagged trapped_or_orthogonal and nothing is inserted (more CV2 windows
         cannot resolve a hidden slow mode). Every R3 window records the test that
         decided it (r3_gate: single_component, member_support, no_density_minimum,
@@ -2254,14 +2265,17 @@ windows are protected from retirement and further refinement for
 --ap-refine-protect-epochs (2). Proposed (funded) resolution blocks the convergence
 gate; budget refusals (no_reserve, resolution_budget) and spring-cap refusals never do
 -- they are recorded and graded CAUTION. Report: epoch_NNN/cv2_resolution_report.json
-(cv2_resolution_report_v2: v1's transitions_lower_bound is now
-transitions_state_series_lower_bound; readers accept both). The knobs are frozen with the decision settings;
-coverage-min-windows, refine-min-transitions, refine-pmf-sigma-kt and
-refine-min-sigma are uncalibrated defaults.
+(cv2_resolution_report_v3; v2 renamed v1's transitions_lower_bound to
+transitions_state_series_lower_bound, v3 adds r3_flag_only / would_be, the replica and
+replica-path counts, same-column contributor counts and the bootstrap block record;
+readers accept v1-v3). The knobs are frozen with the decision settings; the
+transition count, R3 mode, coverage count and pmf-sigma defaults follow the T2
+calibration (t2_synthetic.md 9, 9.9); refine-min-transitions and refine-min-sigma are
+uncalibrated.
 
 Reporting (spec 3.7). One table per phase from files that already exist:
     python -m gareus.adaptive.cv2_resolution_summary RUNS/<run>/adaptive_production [--out DIR]
-writes cv2_resolution_summary.json (cv2_resolution_summary_v1) + _states.csv/_edges.csv
+writes cv2_resolution_summary.json (cv2_resolution_summary_v2) + _states.csv/_edges.csv
 into each epoch/final dir (final-combined: *_final_combined.* at the adaptive root);
 with --ap-cv2-resolution the driver writes each epoch's after the apply. Per state:
 restraint, sampled CV2 mean/sd, sigma_w2 = sqrt(kT/k2), confinement ratio = sd/sigma_w2
@@ -2269,7 +2283,7 @@ restraint, sampled CV2 mean/sd, sigma_w2 = sqrt(kT/k2), confinement ratio = sd/s
 trapped_or_orthogonal. Per edge: pairwise MBAR (q10/q90, status), CV1 marginal and joint
 2D overlap, each with its space stamp. gareus_report adds a "CV2 resolution" row when the
 final-combined summary exists (FAIL: a weak pairwise edge or > 1 spatial component; CAUTION: unmeasured
-edges, trapped windows, budget refusals, k2_capped_below_compression refusals); plot_adaptive_diagnostics adds
+edges, trapped windows, budget refusals, k2_capped_below_compression refusals, r3_flag_only windows); plot_adaptive_diagnostics adds
 adaptive_fig5_state_coordinates.png (states at their own (c1, c2), one panel per rung).
 """
 

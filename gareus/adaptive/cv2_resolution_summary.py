@@ -13,7 +13,9 @@ and, with ``--ap-cv2-resolution`` on, by the driver after each numbered epoch's 
 (``write_final_combined_summary``, the file gareus_report grades). With the flag off nothing
 is written unless the CLI is run.
 
-Summary ``cv2_resolution_summary.json`` (schema ``cv2_resolution_summary_v1``)::
+Summary ``cv2_resolution_summary.json`` (schema ``cv2_resolution_summary_v2``; v2 adds the
+state fields ``transitions_replica``, ``transitions_replica_path``, ``r3_flag_only`` and
+``r3_would_be`` and the count ``n_r3_flag_only``; it reads 3.3 reports v1-v3)::
 
     schema_version, label, sources {diagnostics, report, registry, diagnostics_schema,
     report_status}, temperature_k, temperature_source, definitions {...},
@@ -25,7 +27,10 @@ Summary ``cv2_resolution_summary.json`` (schema ``cv2_resolution_summary_v1``)::
                 confinement_ratio, sarle_bimodality, r3_evaluated, r3_decision, r3_reason,
                 n_modes + modes [{mean, sd, weight}] (the accepted mixture components),
                 r3_mode_pair (means of the pair R3 judged, or null), depth_kT, transitions,
-                transitions_estimator, transitions_state_series, trapped_or_orthogonal,
+                transitions_estimator, transitions_state_series, transitions_replica,
+                transitions_replica_path (v3 reports only), trapped_or_orthogonal,
+                r3_flag_only + r3_would_be (v3, ``--ap-refine-r3-mode flag``: the window would
+                have been inserted; would_be {decision proposed|refused, refusal, r3_mode}),
                 r3_gate + r3_gate_values (the R3 test that decided and its numbers),
     edges    -- per edge: state_i, state_j, edge_type, graph_kind, pattern_pair, graded,
                 pairwise_status, pairwise_reason, pairwise_overlap, pairwise_q10, pairwise_q90,
@@ -52,7 +57,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from gareus.adaptive.edge_metric import edge_below_threshold, edge_is_weak_pairwise
 from gareus.math_helpers import restraint_sigma
 
-SCHEMA_VERSION = "cv2_resolution_summary_v1"
+SCHEMA_VERSION = "cv2_resolution_summary_v2"
 SUMMARY_NAME = "cv2_resolution_summary.json"
 FINAL_LABEL = "final_combined"
 FINAL_DIAGNOSTICS = "adaptive_final_combined_diagnostics.json"
@@ -67,6 +72,7 @@ SPACE_PAIRWISE = "two_state_mbar"      # 3.1: BAR on the pair's own samples, umb
 SPACE_UNION = "union_mbar"             # the union solve's pairwise value, when applied
 BUDGET_REFUSALS = ("no_reserve", "resolution_budget", "max_replicas_budget")
 SPRING_CAP_REFUSAL = "k2_capped_below_compression"
+R3_FLAG_ONLY = "r3_flag_only"                       # mirrors cv2_resolution.R3_FLAG_ONLY
 
 DEFINITIONS = {
     "sigma_w2": "sqrt(k_B T / k2): the CV2 umbrella's own Gaussian width (math_helpers."
@@ -76,11 +82,17 @@ DEFINITIONS = {
                          "spring; ~1: spring-dominated; > 1: broader than the spring (a mode mixture "
                          "or a soft direction). Landscape-confinement diagnostic only, never a trigger.",
     "transitions": "core-to-core CV2 transitions between the two R3 modes (3.3 report). Estimator "
-                   "'replica': within replica residences (R3's default); 'state-series': every "
-                   "switch of the state's series, exchange swaps included (>= replica always: the "
-                   "permissive choice); 'state_series_lower_bound': no replica-resolved series, a "
-                   "lower bound on the state-series count (an upper bound on the replica count); "
-                   "'none': not evaluated.",
+                   "'replica-path' (R3's default since report v3): each replica's own visits joined "
+                   "across its absences; 'replica': within one contiguous residence; 'state-series': "
+                   "every switch of the state's series, exchange swaps included. replica <= "
+                   "replica-path and replica <= state-series always; replica-path and state-series "
+                   "are not ordered. 'state_series_lower_bound': no replica-resolved series, a lower "
+                   "bound on the state-series count (an upper bound on the replica count only); "
+                   "'none': not evaluated. transitions_replica / transitions_replica_path hold the "
+                   "other counts when the report has them (v3).",
+    "r3_flag_only": "the window passed every R3 test and its two children could be placed, but "
+                    "--ap-refine-r3-mode flag records them instead of inserting (T2 9.4); "
+                    "r3_would_be holds what insert mode would have done.",
     "r3_gate": "the 3.3 R3 test that decided the window (cv2_resolution.R3_GATES): single_component, "
                "member_support, no_density_minimum, depth_below_1kT, mode_weight_below_10pct, "
                "too_few_samples, no_replica_series, transitions_below_min or passed; r3_gate_values "
@@ -95,7 +107,8 @@ _STATE_COLS = ["state_id", "c1", "k1", "c2", "k2", "lambda", "cv1_restrained", "
                "restraint_source", "sample_count", "n_pairs", "cv1_mean", "cv2_mean", "cv2_sd", "sigma_w2",
                "confinement_ratio", "sarle_bimodality", "r3_evaluated", "r3_decision", "n_modes",
                "mode_means", "r3_mode_pair", "depth_kT", "transitions", "transitions_estimator", "transitions_state_series",
-               "trapped_or_orthogonal", "r3_gate", "r3_reason"]
+               "transitions_replica", "transitions_replica_path", "trapped_or_orthogonal", "r3_flag_only",
+               "r3_gate", "r3_reason"]
 _EDGE_COLS = ["state_i", "state_j", "edge_type", "graph_kind", "pattern_pair", "graded", "pairwise_status",
               "pairwise_reason", "pairwise_overlap", "pairwise_q10", "pairwise_q90", "pairwise_n_eff_min",
               "pairwise_space", "union_mbar_overlap", "union_space", "below_threshold", "weak", "measured",
@@ -166,12 +179,13 @@ _LOWER_BOUND_KEYS = ("transitions_state_series_lower_bound",   # 3.3 report v2
 
 
 def _transitions(m: Mapping[str, Any]) -> Tuple[Optional[int], str]:
-    """(count, estimator) from a 3.3 R3 candidate's metrics, v1 or v2 report.
+    """(count, estimator) from a 3.3 R3 candidate's metrics, report v1-v3.
 
-    ``replica``: crossings within one replica's residence (R3's default). ``state-series``:
-    every switch of the state-indexed series = the within-residence crossings PLUS the label
-    changes an exchange swap causes, so state-series >= replica always and
-    ``--ap-refine-transition-count state-series`` is the permissive choice.
+    ``replica-path`` (default since v3): each replica's own visits joined across its absences.
+    ``replica``: crossings within one replica's residence (v1/v2 default; a v1/v2 record without
+    an estimator is read as replica). ``state-series``: every switch of the state-indexed series,
+    exchange swaps included. replica <= replica-path and replica <= state-series always;
+    replica-path and state-series are not ordered (cv2_resolution_rules._transitions).
     ``state_series_lower_bound``: no replica-resolved series; the value bounds the state-series
     count from below and says nothing that could raise the replica count (it bounds it above)."""
     if m.get("transitions") is not None:
@@ -182,13 +196,20 @@ def _transitions(m: Mapping[str, Any]) -> Tuple[Optional[int], str]:
     return None, "none"
 
 
+def _is_flag_only(cand: Mapping[str, Any]) -> bool:
+    """A v3 R3 candidate recorded instead of inserted (``--ap-refine-r3-mode flag``)."""
+    return (str(cand.get("rule")) == "R3" and cand.get("decision") == "flagged"
+            and str(cand.get("reason", "")).startswith(R3_FLAG_ONLY))
+
+
 def _r3_fields(cand: Optional[Mapping[str, Any]], has_report: bool) -> Dict[str, Any]:
     if cand is None:
         why = "not an R3 candidate in the 3.3 report" if has_report else "no 3.3 report for this phase"
         return {"r3_evaluated": False, "r3_decision": None, "r3_reason": why, "n_modes": None, "modes": None,
                 "r3_mode_pair": None,
                 "depth_kT": None, "transitions": None, "transitions_estimator": "none",
-                "transitions_state_series": None, "trapped_or_orthogonal": None, "r3_gate": None,
+                "transitions_state_series": None, "transitions_replica": None, "transitions_replica_path": None,
+                "trapped_or_orthogonal": None, "r3_flag_only": None, "r3_would_be": None, "r3_gate": None,
                 "r3_gate_values": None}
     m = cand.get("metrics") or {}
     comps = [x for x in ((m.get("mixture") or {}).get("components") or []) if x.get("accepted")]
@@ -201,7 +222,10 @@ def _r3_fields(cand: Optional[Mapping[str, Any]], has_report: bool) -> Dict[str,
             "depth_kT": _finite((m.get("depth") or {}).get("depth_kT")),
             "transitions": n, "transitions_estimator": est,
             "transitions_state_series": _int(m.get("transitions_state_series")),
+            "transitions_replica": _int(m.get("transitions_replica")),
+            "transitions_replica_path": _int(m.get("transitions_replica_path")),
             "trapped_or_orthogonal": bool(m.get("trapped_or_orthogonal", False)),
+            "r3_flag_only": _is_flag_only(cand), "r3_would_be": m.get("would_be"),
             "r3_gate": m.get("r3_gate"), "r3_gate_values": m.get("r3_gate_values")}
 
 
@@ -272,6 +296,7 @@ def _counts(states: Sequence[Mapping[str, Any]], edges: Sequence[Mapping[str, An
             "n_with_paired_cv": sum(1 for s in states if s["n_pairs"]),
             "n_r3_evaluated": sum(1 for s in states if s["r3_evaluated"]),
             "n_trapped_or_orthogonal": sum(1 for s in states if s["trapped_or_orthogonal"]),
+            "n_r3_flag_only": sum(1 for c in (report or {}).get("candidates", []) or [] if _is_flag_only(c)),
             "n_edges": len(edges), "n_graded_edges": len(graded),
             "n_weak": sum(1 for e in graded if e["weak"]),
             "n_unmeasured": sum(1 for e in graded if not e["measured"]),
@@ -495,7 +520,8 @@ def write_final_combined_summary(adaptive_dir: Path, diagnostics: Mapping[str, A
 def _one_line(summary: Mapping[str, Any]) -> str:
     c = summary["counts"]
     return (f"{summary['label']}: {c['n_states']} states ({c['n_cv2_restrained']} CV2-restrained, "
-            f"{c['n_r3_evaluated']} R3-evaluated, {c['n_trapped_or_orthogonal']} trapped_or_orthogonal); "
+            f"{c['n_r3_evaluated']} R3-evaluated, {c['n_trapped_or_orthogonal']} trapped_or_orthogonal, "
+            f"{c.get('n_r3_flag_only', 0)} flag-only); "
             f"{c['n_graded_edges']} graded edges, {c['n_weak']} weak, {c['n_unmeasured']} unmeasured, "
             f"components {c['n_components']}; budget refusals {c['n_refused_budget']}, "
             f"spring-cap refusals {c['n_refused_spring_cap']}")

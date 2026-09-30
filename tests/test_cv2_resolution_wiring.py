@@ -84,8 +84,9 @@ def _strip_volatile(obj):
 
 
 NEW_FIELDS = {"cv2_resolution": False, "coverage_min_windows": 2.0, "refine_min_transitions": 10,
-              "refine_pmf_sigma_kT": 0.5, "refine_budget_fraction": 0.5, "refine_protect_epochs": 2,
-              "refine_min_sigma": 0.1, "refine_transition_count": "replica"}
+              "refine_pmf_sigma_kT": 0.25, "refine_budget_fraction": 0.5, "refine_protect_epochs": 2,
+              "refine_min_sigma": 0.1, "refine_transition_count": "replica-path", "refine_r3_mode": "flag",
+              "coverage_count": "same-column"}
 
 
 def test_off_path_proposer_applier_reports_are_identical_to_the_base_commit(tmp_path):
@@ -138,7 +139,7 @@ def test_cli_flags_and_yaml_reach_the_policy(tmp_path):
     args = parse_args(["--config", str(cfg), "--seq", "GYDPETGTWG", "--out", str(tmp_path / "r2")])
     p = ap.policy_from_args(args)
     assert p.cv2_resolution is True and p.refine_min_transitions == 7
-    assert p.refine_transition_count == "replica"
+    assert p.refine_transition_count == "replica-path"
     args = parse_args(["--seq", "GYDPETGTWG", "--out", str(tmp_path / "r3"),
                        "--ap-refine-transition-count", "state-series"])
     assert ap.policy_from_args(args).refine_transition_count == "state-series"

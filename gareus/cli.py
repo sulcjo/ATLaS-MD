@@ -610,21 +610,34 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                         "reserve (--swarm-adaptive-reserve-fraction); without one every proposal is refused "
                         "(no_reserve). Report epoch_NNN/cv2_resolution_report.json. Frozen decision rule.")
     p.add_argument("--ap-coverage-min-windows", type=float, default=2.0,
-                   help="R2: a CV2 interval whose unbiased weight comes from fewer effective centres "
-                        "(1/sum p^2) is a hole. Uncalibrated default.")
+                   help="R2: a CV2 interval (>= 2 %% of its column slab's weight) with fewer contributing "
+                        "centres (each >= 10 %% of the interval's weight) than this is a hole.")
+    p.add_argument("--ap-coverage-count", choices=("any", "same-column"), default="same-column",
+                   help="R2: which centres count toward --ap-coverage-min-windows. same-column (default): only "
+                        "centres whose CV1 restraint centre is the interval's column (CV1-unrestrained windows "
+                        "never count); any: every centre, neighbouring columns included (near-inert on a 2-D "
+                        "grid, whose adjacent columns reach every slab). Frozen with the decision settings.")
     p.add_argument("--ap-refine-min-transitions", type=int, default=10,
                    help="R3: within-residence core-to-core CV2 transitions a bimodal window needs before "
                         "its modes get windows. Uncalibrated default.")
-    p.add_argument("--ap-refine-transition-count", choices=("replica", "state-series"), default="replica",
-                   help="R3: which crossings count toward --ap-refine-min-transitions. replica (default): "
-                        "within one replica's residence at the window, so an exchange swap is not a crossing "
-                        "(rarely fires when replicas stay only a few samples); state-series: every switch of "
-                        "the window's series, swaps included -- always >= the replica count (within-residence "
-                        "crossings + swap-induced label changes), so the permissive choice. Frozen with the "
+    p.add_argument("--ap-refine-transition-count", choices=("replica", "replica-path", "state-series"),
+                   default="replica-path",
+                   help="R3: which crossings count toward --ap-refine-min-transitions. replica-path (default): "
+                        "each replica's own visits to the window joined in time order across its absences, so a "
+                        "swap (which moves no coordinates) is never a crossing but a replica's own crossing made "
+                        "elsewhere is; replica: within one contiguous residence only (inert under exchange, "
+                        "residences are ~2 samples); state-series: every switch of the window's series, swaps "
+                        "included (passes every bimodal window under exchange). replica <= replica-path and "
+                        "replica <= state-series; replica-path and state-series are not ordered. Frozen with the "
                         "decision settings; a bad recorded value fails when the policy is loaded.")
-    p.add_argument("--ap-refine-pmf-sigma-kt", type=float, default=0.5,
+    p.add_argument("--ap-refine-r3-mode", choices=("flag", "insert"), default="flag",
+                   help="R3: flag (default) evaluates every window and records the would-be children and "
+                        "springs (decision flagged, reason r3_flag_only) but never inserts, spends budget or "
+                        "blocks convergence; insert emits the insert action. Frozen with the decision settings.")
+    p.add_argument("--ap-refine-pmf-sigma-kt", type=float, default=0.25,
                    help="R2: block-bootstrap sigma (kT) of a CV2 interval's free energy above which it is a "
-                        "hole. Uncalibrated default.")
+                        "hole. Default 0.25 (T2): the bootstrap holds the MBAR f fixed and reads ~2-3x below "
+                        "the true error, so 0.25 corresponds to roughly 0.6-0.75 kT of true error.")
     p.add_argument("--ap-refine-budget-fraction", type=_unit_interval_float, default=0.5,
                    help="Largest share of the reserve's free slots (after add_rung) resolution actions may "
                         "spend per epoch (spec 3.3: 0.5).")
@@ -1693,6 +1706,8 @@ def _shim_adaptive_production(args: argparse.Namespace) -> None:
     args.adaptive_production_coverage_min_windows = args.ap_coverage_min_windows
     args.adaptive_production_refine_min_transitions = args.ap_refine_min_transitions
     args.adaptive_production_refine_transition_count = args.ap_refine_transition_count
+    args.adaptive_production_refine_r3_mode = args.ap_refine_r3_mode
+    args.adaptive_production_coverage_count = args.ap_coverage_count
     args.adaptive_production_refine_pmf_sigma_kt = args.ap_refine_pmf_sigma_kt
     args.adaptive_production_refine_budget_fraction = args.ap_refine_budget_fraction
     args.adaptive_production_refine_protect_epochs = args.ap_refine_protect_epochs

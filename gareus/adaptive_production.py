@@ -522,25 +522,33 @@ class AdaptiveDecisionPolicy:
     cv2_resolution: bool = False
     coverage_min_windows: float = 2.0
     refine_min_transitions: int = 10
-    refine_pmf_sigma_kT: float = 0.5
+    refine_pmf_sigma_kT: float = 0.25          # T2 9.9: the fixed-f bootstrap sigma is ~3x too small
     refine_budget_fraction: float = 0.5
     refine_protect_epochs: int = 2
     refine_min_sigma: float = 0.1
-    # R3 crossing count: "replica" (within one replica's residence at the window; an
-    # exchange swap is not a crossing) or "state-series" (every switch of the window's
-    # state-indexed series, swaps included; >= the replica count always, so the permissive
-    # choice). Undecided for chignolin_10. Validated here, so a bad flag, YAML value or
-    # recorded decision_settings.json fails when the policy is built, not inside the epoch loop.
-    refine_transition_count: str = "replica"
+    # R3 crossing count: "replica-path" (default since T2 9.2: each replica's own visits joined
+    # across its absences), "replica" (within one residence; inert under exchange) or
+    # "state-series" (every switch, swaps included; passes everything under exchange).
+    # R3 mode: "flag" (default since T2 9.4: record the would-be children, never insert) or
+    # "insert". R2 contributor count: "same-column" (default since T2 9.9) or "any".
+    # Validated here, so a bad flag, YAML value or recorded decision_settings.json fails when
+    # the policy is built, not inside the epoch loop.
+    refine_transition_count: str = "replica-path"
+    refine_r3_mode: str = "flag"
+    coverage_count: str = "same-column"
 
     def __post_init__(self) -> None:
-        if self.refine_transition_count not in REFINE_TRANSITION_COUNTS:
-            raise ValueError(f"refine_transition_count must be one of {REFINE_TRANSITION_COUNTS}, "
-                             f"got {self.refine_transition_count!r}")
+        for name, allowed in (("refine_transition_count", REFINE_TRANSITION_COUNTS),
+                              ("refine_r3_mode", REFINE_R3_MODES), ("coverage_count", COVERAGE_COUNTS)):
+            if getattr(self, name) not in allowed:
+                raise ValueError(f"{name} must be one of {allowed}, got {getattr(self, name)!r}")
 
 
-# Mirrors gareus.adaptive.cv2_resolution.TRANSITION_COUNTS (not imported: that module imports this one lazily).
-REFINE_TRANSITION_COUNTS = ("replica", "state-series")
+# Mirror gareus.adaptive.cv2_resolution.TRANSITION_COUNTS / R3_MODES / COVERAGE_COUNTS (not
+# imported: that module imports this one lazily); a test pins them equal.
+REFINE_TRANSITION_COUNTS = ("replica", "replica-path", "state-series")
+REFINE_R3_MODES = ("flag", "insert")
+COVERAGE_COUNTS = ("any", "same-column")
 LADDER_SETTINGS_FIELDS = ("ladder_adapt", "ladder_min_overlap", "ladder_overlap_quantile", "ladder_min_ess",
                           "ladder_max_rungs", "ladder_hysteresis", "ladder_max_moves")
 LADDER_SETTINGS_FILENAME = "ladder_adapt_settings.json"
@@ -561,7 +569,7 @@ DECISION_SETTINGS_FIELDS = (
     "layout_neighbour_rule",
     "cv2_resolution", "coverage_min_windows", "refine_min_transitions", "refine_pmf_sigma_kT",
     "refine_budget_fraction", "refine_protect_epochs", "refine_min_sigma",
-    "refine_transition_count",
+    "refine_transition_count", "refine_r3_mode", "coverage_count",
 )
 DECISION_SETTINGS_FILENAME = "decision_settings.json"
 
@@ -8158,12 +8166,14 @@ def policy_from_args(args: Any) -> AdaptiveDecisionPolicy:
         cv2_resolution=_arg_bool(args, "adaptive_production_cv2_resolution", False),
         coverage_min_windows=_arg_float(args, "adaptive_production_coverage_min_windows", 2.0),
         refine_min_transitions=_arg_int(args, "adaptive_production_refine_min_transitions", 10),
-        refine_pmf_sigma_kT=_arg_float(args, "adaptive_production_refine_pmf_sigma_kt", 0.5),
+        refine_pmf_sigma_kT=_arg_float(args, "adaptive_production_refine_pmf_sigma_kt", 0.25),
         refine_budget_fraction=_arg_float(args, "adaptive_production_refine_budget_fraction", 0.5),
         refine_protect_epochs=_arg_int(args, "adaptive_production_refine_protect_epochs", 2),
         refine_min_sigma=_arg_float(args, "adaptive_production_refine_min_sigma", 0.1),
-        refine_transition_count=str(getattr(args, "adaptive_production_refine_transition_count", "replica")
-                                    or "replica"),
+        refine_transition_count=str(getattr(args, "adaptive_production_refine_transition_count", "replica-path")
+                                    or "replica-path"),
+        refine_r3_mode=str(getattr(args, "adaptive_production_refine_r3_mode", "flag") or "flag"),
+        coverage_count=str(getattr(args, "adaptive_production_coverage_count", "same-column") or "same-column"),
     )
 
 

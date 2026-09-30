@@ -45,20 +45,36 @@ def _r3_children(view: cr.StateView, modes: Mapping[str, Any], settings: cr.Reso
 
 
 def _transitions(rec: Optional[Mapping[str, Any]], bounds: Tuple[float, float],
-                 count: str = "replica") -> Dict[str, Any]:
-    """Crossings R3 decides on. ``count`` "replica": within one replica's residence (an
-    exchange swap bringing in a walker from the other mode is not a crossing);
-    "state-series": every switch of the state-indexed series, swaps included.
+                 count: str = "replica-path") -> Dict[str, Any]:
+    """Crossings R3 decides on, from a runs record {source, state_runs, replica_runs,
+    replica_paths} (``cv2_resolution_io.parquet_runs_provider``). All three are
+    ``count_transitions`` (core-to-core label changes, samples between the cores ignored):
 
-    state-series >= replica always: a replica run is a contiguous piece of a state run (same
-    step stride), so the state series counts every within-residence crossing plus the label
-    changes where a swap brings in a walker from the other mode. "state-series" is therefore
-    the permissive choice (under exchange it counts swap frequency: chignolin_9 370-469
-    switches vs 0-5 crossings). Both need a replica-resolved Parquet source; without one
-    ``transitions`` is None and ``transitions_state_series_lower_bound`` (report v2; v1 called
-    it ``transitions_lower_bound``) holds the state-series count that exists -- from the full
+    * "replica": within one replica's contiguous residence at the window (broken at every
+      source, segment, step gap, NaN and change of replica), so an exchange swap is never a
+      crossing. Under exchange (c9: ~2.5 samples per residence) it almost never reaches 10.
+    * "replica-path" (default): each replica's own visits to the window joined in time order
+      across its absences, one path per (source, segment, replica), NaN dropped, never broken
+      at a step gap (every absence IS a step gap in the replica's own visits). A swap relabels
+      the window but never moves coordinates, so every counted change is a crossing by that
+      replica's own dynamics, possibly made while it sat in another window. The T2 harness
+      estimator (t2c_eval.replica_path_count) and t3c_replica_path_c9.py; c9 epoch_002
+      84 / 200 / 220: 22 / 12 / 21.
+    * "state-series": every switch of the state-indexed series, swaps included.
+
+    Ordering. replica <= replica-path and replica <= state-series always: a residence is a
+    contiguous piece of both the replica's path and the state series (same source/segment
+    breaks), and removing the boundaries between pieces can only add label changes. replica-path
+    and state-series are NOT ordered: two walkers each fixed in one mode and alternating
+    residences give state-series > 0 = replica-path, and a state series A A B B whose two
+    replicas each go A -> B gives state-series 1 < replica-path 2 (pinned by tests). Under
+    exchange state-series counts swap frequency (c9 370-469 vs replica-path 12-22).
+
+    Every count needs a replica-resolved Parquet source; without one ``transitions`` is None
+    and ``transitions_state_series_lower_bound`` (report v2+; v1 called it
+    ``transitions_lower_bound``) holds the state-series count that exists -- from the full
     series when the Parquet has no replica column, 0 when no series was read -- a lower bound
-    on the state-series count, NOT on the replica count (it bounds that from above)."""
+    on the state-series count, an upper bound on the replica count only."""
     if count not in cr.TRANSITION_COUNTS:
         raise ValueError(f"refine_transition_count must be one of {cr.TRANSITION_COUNTS}, got {count!r}")
     rec = rec or {}
@@ -66,12 +82,19 @@ def _transitions(rec: Optional[Mapping[str, Any]], bounds: Tuple[float, float],
     out = {"transitions_source": src, "core_bounds": list(bounds), "transitions_estimator": count,
            "transitions_state_series": cr.count_transitions(rec.get("state_runs", []), *bounds)}
     if src == "parquet":
-        out["transitions"] = (cr.count_transitions(rec.get("replica_runs", []), *bounds) if count == "replica"
-                              else out["transitions_state_series"])
+        out["transitions_replica"] = cr.count_transitions(rec.get("replica_runs", []), *bounds)
+        paths = rec.get("replica_paths")
+        out["transitions_replica_path"] = None if paths is None else cr.count_transitions(paths, *bounds)
+        out["transitions"] = {"replica": out["transitions_replica"], "replica-path": out["transitions_replica_path"],
+                              "state-series": out["transitions_state_series"]}[count]
     else:
         out["transitions"] = None
+    if out["transitions"] is None:
         out["transitions_state_series_lower_bound"] = out["transitions_state_series"]
     return out
+
+
+_ESTIMATOR_WORDS = {"replica": "within-residence", "replica-path": "replica-path", "state-series": "state-series"}
 
 
 def _r3_decide(view: cr.StateView, modes: Dict[str, Any], rec: Optional[Mapping[str, Any]],
@@ -95,18 +118,24 @@ def _r3_decide(view: cr.StateView, modes: Dict[str, Any], rec: Optional[Mapping[
         return cr.new_candidate("R3", "state", ids, "flagged",
                                 f"trapped_or_orthogonal: bimodal (depth {modes['depth']['depth_kT']:.2f} kT) but "
                                 f"{metrics['transitions']} < {settings.refine_min_transitions} "
-                                f"{'within-residence' if settings.refine_transition_count == 'replica' else 'state-series'} "
+                                f"{_ESTIMATOR_WORDS[str(settings.refine_transition_count)]} "
                                 "transitions", metrics=metrics)
     metrics["r3_gate"] = "passed"
     kids = _r3_children(view, modes, settings, gate)
     proposal = {"parent_state_id": view.state_id, "children": kids}
     refusal = next((k["refusal"] for k in kids if k.get("refusal")), None)
+    metrics["would_be"] = {"decision": "refused" if refusal else "proposed", "refusal": refusal,
+                           "r3_mode": str(settings.refine_r3_mode)}
     if refusal:
         return cr.new_candidate("R3", "state", ids, "refused", f"{refusal}: a child spring cannot be placed",
                                 refusal=refusal, metrics=metrics, proposal=proposal)
-    return cr.new_candidate("R3", "state", ids, "proposed",
-                            f"two modes {lo['mean']:.4g} / {hi['mean']:.4g} (depth {modes['depth']['depth_kT']:.2f} kT, "
-                            f"{metrics['transitions']} transitions); parent kept", metrics=metrics, proposal=proposal)
+    what = (f"two modes {lo['mean']:.4g} / {hi['mean']:.4g} (depth {modes['depth']['depth_kT']:.2f} kT, "
+            f"{metrics['transitions']} transitions)")
+    if str(settings.refine_r3_mode) == "flag":
+        return cr.new_candidate("R3", "state", ids, "flagged", f"{cr.R3_FLAG_ONLY}: {what} would get two windows "
+                                "(refine_r3_mode flag: recorded, never inserted)", metrics=metrics, proposal=proposal)
+    return cr.new_candidate("R3", "state", ids, "proposed", f"{what}; parent kept", metrics=metrics,
+                            proposal=proposal)
 
 
 def propose_r3(views: Mapping[int, cr.StateView], rep_ids: Sequence[int],

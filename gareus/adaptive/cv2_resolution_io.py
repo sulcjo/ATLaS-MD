@@ -4,7 +4,7 @@
 ``--ap-cv2-resolution``) right after the existing proposers; ``propose_cv2_resolution`` is
 the pure orchestrator it wraps (tests and the replay CLI call it directly).
 
-Report ``epoch_NNN/cv2_resolution_report.json`` (schema ``cv2_resolution_report_v2``)::
+Report ``epoch_NNN/cv2_resolution_report.json`` (schema ``cv2_resolution_report_v3``)::
 
     schema_version, epoch, status ("ok" | "error"), error, stage ("numbered_epoch" | "replay"),
     settings      -- every knob and constant used (ResolutionSettings.as_record),
@@ -24,25 +24,34 @@ Report ``epoch_NNN/cv2_resolution_report.json`` (schema ``cv2_resolution_report_
                      to the epoch's action list,
     summary       -- {counts {rule: {decision: n}}, n_proposed, n_windows_at_compression_floor,
                       n_blocking (proposed only), n_refused_budget (no_reserve/resolution_budget),
-                      n_refused_spring_cap (k2_capped_below_compression), n_trapped_or_orthogonal},
+                      n_refused_spring_cap (k2_capped_below_compression), n_trapped_or_orthogonal,
+                      n_r3_flag_only (v3)},
     apply         -- (after the applier) {"refused": [...]} for this step's actions.
 
 Refusal codes: no_reserve, resolution_budget, k2_at_floor, k2_capped_below_compression (the
 4 x parent / cv2_k_max cap or the coupling gate holds k2 below the shape rule's mean-compression
 floor), below_k_min (coupling gate), and the applier's own (duplicate, max_replicas_budget, ...)
 under ``apply``. R3 metrics carry ``transitions`` (the count R3 decides on, estimator
-``transitions_estimator``: replica-resolved by default), ``transitions_state_series`` (every
-switch of the state series, exchange swaps included; always >= the replica count), or, when no
-replica-resolved series exists, ``transitions`` None and ``transitions_state_series_lower_bound``
-(then R3 never inserts). Every R3 candidate carries ``r3_gate`` (``cv2_resolution.R3_GATES``:
+``transitions_estimator``: replica-path by default since v3), ``transitions_replica``,
+``transitions_replica_path`` and ``transitions_state_series`` (replica <= both others; those two
+are not ordered, see cv2_resolution_rules._transitions), or, when no replica-resolved series
+exists, ``transitions`` None and ``transitions_state_series_lower_bound`` (then R3 never inserts). Every R3 candidate carries ``r3_gate`` (``cv2_resolution.R3_GATES``:
 the test that decided it) and ``r3_gate_values`` (the measured numbers behind it).
 
 v2 (2026-09-30) vs v1: ``transitions_lower_bound`` renamed ``transitions_state_series_lower_bound``
 (it bounds the state-series count from below and the replica count from above); summary
 ``n_blocking`` counts proposed candidates only (v1 added budget refusals) and gains
 ``n_refused_budget`` / ``n_refused_spring_cap``; R3 metrics gain ``r3_gate`` /
-``r3_gate_values``; mixture components gain ``reg_variance`` / ``variance_curvature``. Readers
-(``cv2_resolution_summary``, ``is_blocking``) accept both versions.
+``r3_gate_values``; mixture components gain ``reg_variance`` / ``variance_curvature``. 
+v3 (2026-09-30, follow-ups (h)) vs v2: R3 metrics gain ``transitions_replica``,
+``transitions_replica_path`` and ``would_be`` {decision, refusal, r3_mode}; a passing R3 window
+in ``--ap-refine-r3-mode flag`` (the default) is ``flagged`` with reason ``r3_flag_only`` (its
+would-be children stay in ``proposal``) instead of ``proposed``; summary gains ``n_r3_flag_only``;
+R2 metrics gain ``coverage_count``, ``n_contributing_windows_any`` / ``_same_column``
+(``n_contributing_windows`` is the count the rule used) and ``rules.R2`` gains ``row_sources``,
+``bootstrap`` (block rule record) and ``coverage_count``; settings gain ``refine_r3_mode``,
+``coverage_count``, ``boot_block_g_multiple``, ``boot_min_blocks``. Readers
+(``cv2_resolution_summary``, ``is_blocking``) accept v1-v3.
 """
 from __future__ import annotations
 
@@ -215,8 +224,10 @@ def _load_samples(sample_dir: Path) -> dict:
 
 
 def _runs_one_source(data: Mapping[str, Any], wmap: Mapping[int, int], wanted: set) -> Dict[int, Dict[str, list]]:
-    """Per wanted state: state-indexed runs (segment, step-contiguous) and replica-resolved runs
-    (additionally broken wherever the replica at the state changes)."""
+    """Per wanted state: state-indexed runs (segment, step-contiguous), replica-resolved runs
+    (additionally broken wherever the replica at the state changes) and replica paths (each
+    replica's own visits in step order, one per segment and replica, NaN dropped, joined across
+    its absences: ``cv2_resolution_rules._transitions`` "replica-path")."""
     n = int(len(data.get("step", [])))
     steps = np.asarray(data["step"], dtype=np.int64)
     win = np.asarray(data["window_id"], dtype=np.int64)
@@ -231,13 +242,16 @@ def _runs_one_source(data: Mapping[str, Any], wmap: Mapping[int, int], wanted: s
         for g in np.unique(seg_idx[state == sid]):
             idx = np.flatnonzero((state == sid) & (seg_idx == g))
             idx = idx[np.argsort(steps[idx], kind="stable")]
-            rec = out.setdefault(int(sid), {"state_runs": [], "replica_runs": []})
+            rec = out.setdefault(int(sid), {"state_runs": [], "replica_runs": [], "replica_paths": []})
             rec["state_runs"].extend(contiguous_runs(steps[idx], cv2[idx]))
             if rep is None:
                 continue
+            stride = _stride(steps[idx])
             for r in np.unique(rep[idx]):
                 ridx = idx[rep[idx] == r]
-                rec["replica_runs"].extend(contiguous_runs(steps[ridx], cv2[ridx], stride=_stride(steps[idx])))
+                rec["replica_runs"].extend(contiguous_runs(steps[ridx], cv2[ridx], stride=stride))
+                z = cv2[ridx]
+                rec["replica_paths"].append(z[np.isfinite(z)])
     return out
 
 
@@ -257,8 +271,8 @@ def parquet_runs_provider(sources: Sequence[Tuple[str, Path]], window_map_for: C
 
     def _provide(state_ids: Sequence[int]) -> Dict[int, Dict[str, Any]]:
         wanted = {int(s) for s in state_ids}
-        merged: Dict[int, Dict[str, Any]] = {s: {"state_runs": [], "replica_runs": [], "source": "parquet"}
-                                             for s in wanted}
+        merged: Dict[int, Dict[str, Any]] = {s: {"state_runs": [], "replica_runs": [], "replica_paths": [],
+                                                 "source": "parquet"} for s in wanted}
         have_replica = True
         for label, sample_dir in sources:
             try:
@@ -269,6 +283,7 @@ def parquet_runs_provider(sources: Sequence[Tuple[str, Path]], window_map_for: C
                 for sid, rec in _runs_one_source(data, dict(window_map_for(Path(sample_dir)) or {}), wanted).items():
                     merged[sid]["state_runs"].extend(rec["state_runs"])
                     merged[sid]["replica_runs"].extend(rec["replica_runs"])
+                    merged[sid]["replica_paths"].extend(rec["replica_paths"])
             except Exception as exc:
                 print(f"      cv2 resolution: skipping {label} for transitions ({type(exc).__name__}: {exc})")
         if not have_replica:
@@ -291,6 +306,29 @@ def _npz_views(z: Mapping[str, np.ndarray]) -> Tuple[List[cr.StateView], np.ndar
     return views, lam
 
 
+def union_row_sources(npz_path: Path, n_rows: int) -> Tuple[Optional[np.ndarray], str]:
+    """Per union row, its sample source (index), from the builder's sidecar
+    ``<stem>.samples.csv`` (same kept rows, same order, column ``source_dir`` or ``source``).
+    (None, reason) when the file is missing, unreadable or has a different row count; R2 then
+    treats each state's rows as one source."""
+    path = Path(npz_path).with_suffix(".samples.csv")
+    if not path.exists():
+        return None, f"no {path.name}"
+    import csv  # noqa: PLC0415
+    try:
+        with path.open(newline="") as handle:
+            reader = csv.reader(handle)
+            header = next(reader)
+            col = header.index("source_dir") if "source_dir" in header else header.index("source")
+            labels = [row[col] for row in reader]
+    except (OSError, ValueError, StopIteration, IndexError) as exc:
+        return None, f"{path.name} unreadable ({type(exc).__name__}: {exc})"
+    if len(labels) != int(n_rows):
+        return None, f"{path.name} has {len(labels)} rows, the NPZ {int(n_rows)}"
+    _u, idx = np.unique(np.asarray(labels, dtype=object).astype(str), return_inverse=True)
+    return idx.astype(np.int64), path.name
+
+
 def union_coverage(npz_path: Path, column_views: Mapping[int, cr.StateView], settings: cr.ResolutionSettings,
                    *, epoch: int, max_gb: float = 8.0) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """R2 on one union NPZ: lambda = 0 rows and states only, own MBAR, then ``coverage_holes``."""
@@ -299,6 +337,7 @@ def union_coverage(npz_path: Path, column_views: Mapping[int, cr.StateView], set
                                                    "secondary_centers", "secondary_k") if k in z.files})
         sampled = np.asarray(z["sampled_state_ids"], dtype=np.int64)
         cv1, cv2 = np.asarray(z["cv_A"], dtype=float), np.asarray(z["secondary_cv"], dtype=float)
+    row_src, src_note = union_row_sources(npz_path, sampled.size)
     rep = [i for i, v in enumerate(views) if abs(v.lam) <= 1e-9]
     pos = {views[i].state_id: j for j, i in enumerate(rep)}
     idx = np.asarray([pos.get(int(s), -1) for s in sampled], dtype=np.int64)
@@ -310,6 +349,8 @@ def union_coverage(npz_path: Path, column_views: Mapping[int, cr.StateView], set
         return [], {**status, "status": "unavailable", "reason": f"memory guard: {need_gb:.1f} GB > {max_gb} GB"}
     sub_views = [views[i] for i in rep]
     cv1, cv2, idx = cv1[keep], cv2[keep], idx[keep]
+    row_src = None if row_src is None else row_src[keep]
+    status["row_sources"] = src_note if row_src is not None else f"one source per state ({src_note})"
     u = cov.reduced_umbrella(cv1, cv2, sub_views, 1.0 / settings.rt)
     n_k = np.bincount(idx, minlength=len(rep)).astype(float)
     sampled_k = np.flatnonzero(n_k > 0)
@@ -323,8 +364,11 @@ def union_coverage(npz_path: Path, column_views: Mapping[int, cr.StateView], set
     logw = cov.log_weights(u[sampled_k], n_k[sampled_k], f)
     w = np.exp(logw - logw.max())
     w /= w.sum()
+    boot: Dict[str, Any] = {}
     cands = cov.coverage_holes(cv1, cv2, remap[idx], w, [sub_views[k] for k in sampled_k], column_views,
-                               settings, epoch=epoch)
+                               settings, epoch=epoch, source_idx=row_src, info=boot)
+    status["bootstrap"] = boot.get("bootstrap")
+    status["coverage_count"] = str(settings.coverage_count)
     return cands, status
 
 
@@ -520,4 +564,4 @@ def is_blocking(epoch_dir: Path) -> int:
 __all__ = ["annotate_report_with_refusals", "budget_for_epoch", "find_layout_reserve", "is_blocking",
            "load_history", "parquet_runs_provider", "phase_union_npz", "propose_cv2_resolution",
            "reset_no_reserve_warnings", "run_epoch_cv2_resolution", "save_history", "settings_from",
-           "union_coverage", "warn_no_reserve_once"]
+           "union_coverage", "union_row_sources", "warn_no_reserve_once"]
