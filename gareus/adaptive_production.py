@@ -536,6 +536,9 @@ class AdaptiveDecisionPolicy:
     refine_transition_count: str = "replica-path"
     refine_r3_mode: str = "flag"
     coverage_count: str = "same-column"
+    # R2 bootstrap: "fixed-f" (MBAR f held at the point estimate) or "resolve-f" (the lambda = 0
+    # MBAR re-solved per replicate with gareus-analyze's solver; t2_synthetic.md 9.10).
+    coverage_bootstrap: str = "fixed-f"
     # Respring (gareus/adaptive/cv2_respring*.py, --ap-cv2-respring), off by default: after a
     # numbered epoch, re-derive a CV2-restrained window's k2 from its own samples as a NEW
     # centre (old centre retired on every rung) when its realised mean compression
@@ -548,7 +551,8 @@ class AdaptiveDecisionPolicy:
 
     def __post_init__(self) -> None:
         for name, allowed in (("refine_transition_count", REFINE_TRANSITION_COUNTS),
-                              ("refine_r3_mode", REFINE_R3_MODES), ("coverage_count", COVERAGE_COUNTS)):
+                              ("refine_r3_mode", REFINE_R3_MODES), ("coverage_count", COVERAGE_COUNTS),
+                              ("coverage_bootstrap", COVERAGE_BOOTSTRAPS)):
             if getattr(self, name) not in allowed:
                 raise ValueError(f"{name} must be one of {allowed}, got {getattr(self, name)!r}")
         from .adaptive.cv2_respring import validate_knobs  # noqa: PLC0415
@@ -561,6 +565,7 @@ class AdaptiveDecisionPolicy:
 REFINE_TRANSITION_COUNTS = ("replica", "replica-path", "state-series")
 REFINE_R3_MODES = ("flag", "insert")
 COVERAGE_COUNTS = ("any", "same-column")
+COVERAGE_BOOTSTRAPS = ("fixed-f", "resolve-f")      # mirrors cv2_resolution.COVERAGE_BOOTSTRAPS
 LADDER_SETTINGS_FIELDS = ("ladder_adapt", "ladder_min_overlap", "ladder_overlap_quantile", "ladder_min_ess",
                           "ladder_max_rungs", "ladder_hysteresis", "ladder_max_moves")
 LADDER_SETTINGS_FILENAME = "ladder_adapt_settings.json"
@@ -581,7 +586,7 @@ DECISION_SETTINGS_FIELDS = (
     "layout_neighbour_rule",
     "cv2_resolution", "coverage_min_windows", "refine_min_transitions", "refine_pmf_sigma_kT",
     "refine_budget_fraction", "refine_protect_epochs", "refine_min_sigma",
-    "refine_transition_count", "refine_r3_mode", "coverage_count",
+    "refine_transition_count", "refine_r3_mode", "coverage_count", "coverage_bootstrap",
     "cv2_respring", "respring_min_neff", "respring_tolerance", "respring_max_fraction", "respring_k2_rtol",
 )
 DECISION_SETTINGS_FILENAME = "decision_settings.json"
@@ -8253,6 +8258,7 @@ def policy_from_args(args: Any) -> AdaptiveDecisionPolicy:
                                     or "replica-path"),
         refine_r3_mode=str(getattr(args, "adaptive_production_refine_r3_mode", "flag") or "flag"),
         coverage_count=str(getattr(args, "adaptive_production_coverage_count", "same-column") or "same-column"),
+        coverage_bootstrap=str(getattr(args, "adaptive_production_coverage_bootstrap", "fixed-f") or "fixed-f"),
         cv2_respring=_arg_bool(args, "adaptive_production_cv2_respring", False),
         respring_min_neff=_arg_float(args, "adaptive_production_respring_min_neff", 200.0),
         respring_tolerance=_arg_float(args, "adaptive_production_respring_tolerance", 0.05),

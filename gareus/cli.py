@@ -617,6 +617,12 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                         "centres whose CV1 restraint centre is the interval's column (CV1-unrestrained windows "
                         "never count); any: every centre, neighbouring columns included (near-inert on a 2-D "
                         "grid, whose adjacent columns reach every slab). Frozen with the decision settings.")
+    p.add_argument("--ap-coverage-bootstrap", choices=("fixed-f", "resolve-f"), default="fixed-f",
+                   help="R2: block bootstrap of a CV2 interval's free-energy sigma (--ap-refine-pmf-sigma-kt). "
+                        "resolve-f re-solves the lambda = 0 MBAR on every replicate (gareus-analyze's solver, "
+                        "warm-started; ~1 min per epoch at 143k rows x 59 states); fixed-f holds the MBAR f "
+                        "at the point estimate, which misses the neighbouring windows' f uncertainty and "
+                        "reads ~3x too small (T2 9.9-9.10). Default fixed-f. Frozen with the decision settings.")
     p.add_argument("--ap-refine-min-transitions", type=int, default=10,
                    help="R3: within-residence core-to-core CV2 transitions a bimodal window needs before "
                         "its modes get windows. Uncalibrated default.")
@@ -1726,6 +1732,7 @@ def _shim_adaptive_production(args: argparse.Namespace) -> None:
     args.adaptive_production_refine_transition_count = args.ap_refine_transition_count
     args.adaptive_production_refine_r3_mode = args.ap_refine_r3_mode
     args.adaptive_production_coverage_count = args.ap_coverage_count
+    args.adaptive_production_coverage_bootstrap = args.ap_coverage_bootstrap
     args.adaptive_production_refine_pmf_sigma_kt = args.ap_refine_pmf_sigma_kt
     args.adaptive_production_refine_budget_fraction = args.ap_refine_budget_fraction
     args.adaptive_production_refine_protect_epochs = args.ap_refine_protect_epochs

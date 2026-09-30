@@ -21,8 +21,12 @@ weighted 1-99 % CV2 range, cut into intervals one median sigma_w2 wide. An inter
     every centre, neighbouring columns included (T2 9.6: near-inert on a 2-D grid). Both counts
     are reported (``n_contributing_windows`` = the one used, ``n_contributing_windows_any`` /
     ``_same_column``), and 1 / sum p_c^2 over all centres; or
-  * the block-bootstrap sigma of its free energy F = -ln(W_interval / W_slab), f held fixed,
-    exceeds ``refine_pmf_sigma_kT``. Blocks (``autocorrelation_block_ids``): per state, the
+  * the block-bootstrap sigma of its free energy F = -ln(W_interval / W_slab) exceeds
+    ``refine_pmf_sigma_kT``. ``coverage_bootstrap`` "fixed-f" holds the MBAR f at the point
+    estimate and resamples the weights (per column); "resolve-f" re-solves the lambda = 0 MBAR
+    on every replicate (warm-started from the point f, one solve per replicate shared by all
+    columns, ``resolve_f_sigma``), which also propagates the uncertainty of the neighbouring
+    windows' relative f into F (T2 9.9: fixed-f reads ~3x too small). Blocks (``autocorrelation_block_ids``): per state, the
     statistical inefficiency g (``effective_samples.pooled_inefficiency``, Geyer's initial
     monotone sequence over that state's rows in each source, max over its restrained axes;
     g = 1 when it cannot be estimated, recorded) sets a block length of
@@ -30,6 +34,13 @@ weighted 1-99 % CV2 range, cut into intervals one median sigma_w2 wide. An inter
     give >= BOOT_MIN_BLOCKS blocks per state when the rows are too few (recorded). Rows are the
     union NPZ's, already thinned by the union builder, so g is in those rows. Replaces the
     fixed BOOT_BLOCKS blocks per state (``_block_ids``, kept for replays).
+MBAR: ``solve_rows`` / ``solve_mbar`` call gareus-analyze's solver
+(``gareus.mbar_analysis.solvers.solve_mbar``) with backend MBAR_BACKEND "numba-anderson"
+(fixed-point MBAR with Anderson mixing, 38 iterations / 0.8 s on chignolin_9's 143,513 x 59
+lambda = 0 union, vs 320 sweeps / 43 s for the NumPy loop this module used to carry), falling
+back to its NumPy "anderson" backend without numba. Deterministic: every per-sample and per-state
+reduction in the numba kernel is one thread's serial loop, so f does not depend on the thread
+count; no stochastic warm start (the gareus-analyze default "sambar" is not used). Gauge f_0 = 0.
 Adjacent hole intervals form one hole, split at every window centre of the column (a window's
 own neighbourhood is never a hole of its own); the new window sits at a piece's centre unless
 an existing window is within NEAR_CENTRE_SIGMA (1.5, the healthy spacing) of its own sigma_w2
@@ -39,12 +50,15 @@ within 1.5 sigma of that window unless weight extends well beyond it.
 from __future__ import annotations
 
 import math
+import time
+import warnings
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
 from gareus.adaptive import cv2_resolution as cr
 from gareus.adaptive.effective_samples import pooled_inefficiency
+from gareus.mbar_analysis import solvers as _mbar
 
 MIN_INTERVAL_WEIGHT = 0.02
 WEIGHT_RANGE = (0.01, 0.99)
@@ -56,6 +70,11 @@ BOOT_MIN_BLOCKS = cr.BOOT_MIN_BLOCKS
 G_MIN_RUN = 20                   # shortest per-source run used to estimate g (pooled_inefficiency)
 N_BOOT = 100
 _BOOT_SEED = 3303
+_RESOLVE_SEED = 3304             # resolve-f replicates draw from their own stream
+MBAR_BACKEND = "numba-anderson"  # gareus-analyze backend (deterministic, see the module docstring)
+MBAR_FALLBACK_BACKEND = "anderson"
+MBAR_TOL = 1e-12                 # max |f_new - f| of the un-mixed step (c9: 7e-12 from the 1e-13 answer, 45 iterations)
+MBAR_MAX_ITER = 20000
 
 
 def _logsumexp(a: np.ndarray, axis: int) -> np.ndarray:
@@ -75,23 +94,49 @@ def reduced_umbrella(cv1: np.ndarray, cv2: np.ndarray, views: Sequence[cr.StateV
     return float(beta) * u
 
 
-def solve_mbar(u_kn: np.ndarray, n_k: np.ndarray, *, tol: float = 1e-8, max_iter: int = 20000,
-               info: Optional[Dict[str, Any]] = None) -> np.ndarray:
-    """Self-consistent MBAR free energies (f_0 = 0) of the sampled states. ``info``, when
-    given, receives ``converged``, ``iterations`` and the last ``max_delta_f``."""
-    log_n = np.log(np.maximum(n_k, 1e-300))
-    f = np.zeros(u_kn.shape[0])
-    delta, it = float("inf"), 0
-    for it in range(1, int(max_iter) + 1):
-        log_den = _logsumexp(log_n[:, None] + f[:, None] - u_kn, axis=0)
-        f_new = -_logsumexp(-u_kn - log_den[None, :], axis=1)
-        f_new -= f_new[0]
-        delta = float(np.max(np.abs(f_new - f)))
-        f = f_new
-        if delta < tol:
-            break
+def solve_rows(u_nk: np.ndarray, window: np.ndarray, *, tol: float = MBAR_TOL, max_iter: int = MBAR_MAX_ITER,
+               f_init: Optional[np.ndarray] = None, info: Optional[Dict[str, Any]] = None
+               ) -> Tuple[np.ndarray, np.ndarray]:
+    """MBAR on (N, K) reduced energies ``u_nk`` with ``window`` = each row's state index, by
+    gareus-analyze's ``solve_mbar`` (MBAR_BACKEND, NumPy fallback). Returns (f, logw): f over
+    all K states with f_0 = 0 (NaN for a state without rows, gauge then set on the first
+    sampled one), logw the normalised per-row log weights. ``f_init`` warm-starts the solve.
+    ``info`` receives ``converged``, ``iterations``, ``max_delta_f`` and ``backend``."""
+    kw = dict(tol=float(tol), maxiter=int(max_iter), threads=0, f_init=f_init)
+    try:
+        res = _mbar.solve_mbar(u_nk, window, backend=MBAR_BACKEND, **kw)
+    except RuntimeError as exc:
+        if _mbar.NUMBA_AVAILABLE:
+            raise
+        res = _mbar.solve_mbar(u_nk, window, backend=MBAR_FALLBACK_BACKEND, **kw)
+        res["fallback_reason"] = str(exc)
+    f = np.asarray(res["f_k"], dtype=float).copy()
+    fin = np.flatnonzero(np.isfinite(f))
+    if fin.size:
+        f -= f[fin[0]]
     if info is not None:
-        info.update(converged=bool(delta < tol), iterations=int(it), max_delta_f=delta)
+        info.update(converged=bool(res["converged"]), iterations=int(res["iterations"]),
+                    max_delta_f=float(res["max_delta"]), backend=str(res["backend"]))
+    return f, np.asarray(res["logw"], dtype=float)
+
+
+def solve_mbar(u_kn: np.ndarray, n_k: np.ndarray, *, tol: float = MBAR_TOL, max_iter: int = MBAR_MAX_ITER,
+               info: Optional[Dict[str, Any]] = None, f_init: Optional[np.ndarray] = None) -> np.ndarray:
+    """Self-consistent MBAR free energies (f_0 = 0) of the sampled states, (K, N) layout: the
+    pre-v3 signature, now a thin wrapper over ``solve_rows`` (gareus-analyze's solver). MBAR's f
+    depends on the per-state counts only, not on which row came from which state, so the rows
+    are given the window ``repeat(arange(K), n_k)``. ``n_k`` must be positive integers summing
+    to N. ``info`` receives ``converged``, ``iterations``, ``max_delta_f`` and ``backend``."""
+    u_kn = np.asarray(u_kn, dtype=float)
+    n = np.asarray(n_k, dtype=float)
+    counts = np.rint(n).astype(np.int64)
+    if n.ndim != 1 or n.size != u_kn.shape[0] or np.any(np.abs(n - counts) > 1e-9) or np.any(counts <= 0) \
+            or int(counts.sum()) != u_kn.shape[1]:
+        raise ValueError("solve_mbar: n_k must be one positive integer count per row of u_kn, summing to its "
+                         f"columns (got {n.size} counts summing to {n.sum():g} for u_kn {u_kn.shape})")
+    window = np.repeat(np.arange(counts.size), counts)
+    f, _logw = solve_rows(np.ascontiguousarray(u_kn.T), window, tol=tol, max_iter=max_iter, f_init=f_init,
+                          info=info)
     return f
 
 
@@ -230,12 +275,76 @@ def _boot_sigma(w_int: np.ndarray, w_slab: np.ndarray, block: np.ndarray, rng: n
     return np.where(finite.mean(axis=0) >= 0.9, spread, np.inf)
 
 
+def column_bins(col: Dict[str, Any], cv1: np.ndarray, cv2: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """(slab mask, interval index, inside mask, n intervals) of one column over all rows, as
+    ``_interval_stats`` bins them."""
+    slab = np.abs(cv1 - col["c1"]) <= col["slab_half_width"]
+    edges = col["edges"]
+    bins = np.clip(np.searchsorted(edges, cv2, side="right") - 1, 0, edges.size - 2)
+    inside = slab & (cv2 >= edges[0]) & (cv2 <= edges[-1])
+    return slab, bins, inside, edges.size - 1
+
+
+def resolve_f_sigma(u_nk: np.ndarray, state_idx: np.ndarray, block: np.ndarray,
+                    cols_data: Sequence[Tuple[np.ndarray, np.ndarray, np.ndarray, int]], f_point: np.ndarray,
+                    rng: np.random.Generator, *, n_boot: int = N_BOOT, info: Optional[Dict[str, Any]] = None
+                    ) -> List[np.ndarray]:
+    """Per column, sigma of every interval's F = -ln(W_i / W_slab) over a block bootstrap that
+    RE-SOLVES the MBAR on each replicate. Blocks as ``_boot_sigma`` (``block`` = state * 10**7 +
+    block index; blocks drawn with replacement within each state, so every state keeps rows);
+    each replicate's MBAR (``solve_rows`` on the replicate's rows, warm-started from ``f_point``)
+    is shared by all columns (``cols_data`` from ``column_bins``). A replicate whose MBAR does not
+    converge counts as non-finite for every interval; as in the fixed-f bootstrap, sigma is inf
+    where > 10 % of the replicates are non-finite. ``info`` receives the replicate record."""
+    t0 = time.time()
+    uniq, inv = np.unique(np.asarray(block), return_inverse=True)
+    order = np.argsort(inv, kind="stable")
+    starts = np.searchsorted(inv[order], np.arange(uniq.size + 1))
+    rows_of = [order[starts[b]:starts[b + 1]] for b in range(uniq.size)]
+    sob = uniq // 10 ** 7
+    strata = [np.flatnonzero(sob == k) for k in np.unique(sob)]
+    reps: List[List[np.ndarray]] = [[] for _ in cols_data]
+    iters, n_bad = [], 0
+    for _ in range(int(n_boot)):
+        picked = np.concatenate([rng.choice(idx, size=idx.size) for idx in strata])
+        pick = np.concatenate([rows_of[b] for b in picked])
+        rinfo: Dict[str, Any] = {}
+        _f, lw = solve_rows(u_nk[pick], state_idx[pick], f_init=f_point, info=rinfo)
+        iters.append(rinfo["iterations"])
+        ok = bool(rinfo["converged"])
+        n_bad += int(not ok)
+        w = np.exp(lw - np.max(lw)) if ok else None
+        for c, (slab, bins, inside, n_int) in enumerate(cols_data):
+            if w is None:
+                reps[c].append(np.full(n_int, np.inf))
+                continue
+            tot = float(np.sum(w[slab[pick]]))
+            sel = inside[pick]
+            part = np.bincount(bins[pick][sel], weights=w[sel], minlength=n_int)
+            with np.errstate(divide="ignore"):
+                reps[c].append(-np.log(part / tot) if tot > 0 else np.full(n_int, np.inf))
+    out = []
+    for r in reps:
+        r = np.asarray(r).reshape(int(n_boot), -1)
+        finite = np.isfinite(r)
+        with np.errstate(invalid="ignore"), warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)       # all-empty intervals -> inf below
+            spread = np.nanstd(np.where(finite, r, np.nan), axis=0)
+        out.append(np.where(finite.mean(axis=0) >= 0.9, spread, np.inf))
+    if info is not None:
+        info.update(n_replicates=int(n_boot), n_not_converged=int(n_bad),
+                    iterations_q50_max=[float(np.median(iters)), int(max(iters))] if iters else None,
+                    wall_s=time.time() - t0)
+    return out
+
+
 def _interval_stats(col, cv1, cv2, state_idx, weights, centre_of_state, rng, *, block_ids=None,
-                    centre_column=None, info=None):
+                    centre_column=None, info=None, sigma=None):
     """(frac, n_eff, n_contrib [any column], sigma) per interval. ``block_ids``: bootstrap
     blocks (default ``autocorrelation_block_ids`` over this call's rows, one source);
     ``centre_column``: per centre, its CV1 column key or None (CV1-unrestrained), from which
-    ``info["n_contrib_same_column"]`` is counted (the centres of THIS column only)."""
+    ``info["n_contrib_same_column"]`` is counted (the centres of THIS column only). ``sigma``:
+    precomputed per-interval sigma (resolve-f); the fixed-f bootstrap (and ``rng``) is then unused."""
     slab = np.abs(cv1 - col["c1"]) <= col["slab_half_width"]
     edges = col["edges"]
     bins = np.clip(np.searchsorted(edges, cv2, side="right") - 1, 0, edges.size - 2)
@@ -261,9 +370,10 @@ def _interval_stats(col, cv1, cv2, state_idx, weights, centre_of_state, rng, *, 
         n_contrib[i] = float(np.sum(share >= CONTRIBUTOR_SHARE))
         if in_col is not None:
             n_same[i] = float(np.sum((share >= CONTRIBUTOR_SHARE) & in_col[:share.size]))
-    if block_ids is None:
-        block_ids, _binfo = autocorrelation_block_ids(state_idx, [cv1, cv2])
-    sigma = _boot_sigma(w_int, w_slab, block_ids, rng)
+    if sigma is None:
+        if block_ids is None:
+            block_ids, _binfo = autocorrelation_block_ids(state_idx, [cv1, cv2])
+        sigma = _boot_sigma(w_int, w_slab, block_ids, rng)
     if info is not None and in_col is not None:
         info["n_contrib_same_column"] = n_same
     return frac, n_eff, n_contrib, sigma
@@ -332,27 +442,45 @@ def centre_columns(sample_views: Sequence[cr.StateView], settings: cr.Resolution
 def coverage_holes(cv1: np.ndarray, cv2: np.ndarray, state_idx: np.ndarray, weights: np.ndarray,
                    sample_views: Sequence[cr.StateView], column_views: Mapping[int, cr.StateView],
                    settings: cr.ResolutionSettings, *, epoch: int = 0, source_idx: Optional[np.ndarray] = None,
-                   info: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+                   info: Optional[Dict[str, Any]] = None, u_nk: Optional[np.ndarray] = None,
+                   f_point: Optional[np.ndarray] = None) -> List[Dict[str, Any]]:
     """R2 candidates over every CV1 column of ``column_views`` (active representative-rung
     states with their P4 moments). ``state_idx`` indexes ``sample_views`` (the states of the
     MBAR that produced ``weights``, retired ones included); ``weights`` sum to 1;
     ``source_idx`` (optional) = each row's sample source, so bootstrap blocks never cross one.
-    ``info``, when given, receives the bootstrap block record (``bootstrap``)."""
+    ``info``, when given, receives the bootstrap block record (``bootstrap``). With
+    ``settings.coverage_bootstrap`` "resolve-f", ``u_nk`` (the (N, K) reduced energies of
+    ``sample_views`` on these rows) and ``f_point`` (the MBAR f that produced ``weights``) are
+    used for the re-solved bootstrap; each is recomputed when not given."""
     centre_of_state, centre_column = centre_columns(sample_views, settings)
     restrained = [(v.k1 is not None and v.k1 > 0, v.c2 is not None and v.k2 is not None and v.k2 > 0)
                   for v in sample_views]
     blocks, binfo = autocorrelation_block_ids(state_idx, [cv1, cv2], source_idx, restrained=restrained)
     binfo["n_sources"] = 1 if source_idx is None else int(np.unique(source_idx).size)
-    if info is not None:
-        info["bootstrap"] = {k: v for k, v in binfo.items() if k != "states"}
+    mode = str(getattr(settings, "coverage_bootstrap", "fixed-f"))
+    binfo["mode"] = mode
     same = str(settings.coverage_count) == "same-column"
     rng = np.random.default_rng([_BOOT_SEED, int(epoch)])
+    cols = [_extend_to_weight(col, cv1, cv2, weights) for col in columns(column_views, sorted(column_views), settings)]
+    sigmas: List[Optional[np.ndarray]] = [None] * len(cols)
+    if mode == "resolve-f" and cols:
+        if u_nk is None:
+            u_nk = np.ascontiguousarray(reduced_umbrella(cv1, cv2, sample_views, 1.0 / settings.rt).T)
+        if f_point is None:
+            f_point, _lw = solve_rows(u_nk, state_idx)
+        rinfo: Dict[str, Any] = {}
+        sigmas = resolve_f_sigma(u_nk, np.asarray(state_idx, dtype=np.int64), blocks,
+                                 [column_bins(c, cv1, cv2) for c in cols], f_point,
+                                 np.random.default_rng([_RESOLVE_SEED, int(epoch)]), info=rinfo)
+        binfo["resolve_f"] = rinfo
+    if info is not None:
+        info["bootstrap"] = {k: v for k, v in binfo.items() if k != "states"}
     out: List[Dict[str, Any]] = []
-    for col in columns(column_views, sorted(column_views), settings):
-        col = _extend_to_weight(col, cv1, cv2, weights)
+    for col, col_sigma in zip(cols, sigmas):
         extra: Dict[str, Any] = {}
         frac, n_eff, n_any, sigma = _interval_stats(col, cv1, cv2, state_idx, weights, centre_of_state, rng,
-                                                    block_ids=blocks, centre_column=centre_column, info=extra)
+                                                    block_ids=blocks, centre_column=centre_column, info=extra,
+                                                    sigma=col_sigma)
         n_same = extra["n_contrib_same_column"]
         n_contrib = n_same if same else n_any
         flags = (frac >= MIN_INTERVAL_WEIGHT) & ((n_contrib < float(settings.coverage_min_windows))
@@ -365,4 +493,5 @@ def coverage_holes(cv1: np.ndarray, cv2: np.ndarray, state_idx: np.ndarray, weig
     return out
 
 
-__all__ = ["autocorrelation_block_ids", "centre_columns", "columns", "coverage_holes", "log_weights", "reduced_umbrella", "solve_mbar"]
+__all__ = ["autocorrelation_block_ids", "centre_columns", "column_bins", "columns", "coverage_holes", "log_weights",
+           "reduced_umbrella", "resolve_f_sigma", "solve_mbar", "solve_rows"]

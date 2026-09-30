@@ -108,13 +108,16 @@ BURN_IN_NOTE = ("standard: the US pull is not written as samples, per-state burn
 DEFAULTS = {"coverage_min_windows": 2.0, "refine_min_transitions": 10, "refine_pmf_sigma_kT": 0.25,
             "refine_budget_fraction": 0.5, "refine_protect_epochs": 2, "refine_min_sigma": 0.1,
             "refine_transition_count": "replica-path", "refine_r3_mode": "flag",
-            "coverage_count": "same-column"}
+            "coverage_count": "same-column", "coverage_bootstrap": "fixed-f"}
 # R3 crossing counts (``count_transitions`` over different runs; see cv2_resolution_rules._transitions).
 TRANSITION_COUNTS = ("replica", "replica-path", "state-series")
 # R3 modes: "flag" records the would-be children and never emits an insert; "insert" acts.
 R3_MODES = ("flag", "insert")
 # R2 contributor count: "same-column" counts only centres of the interval's own CV1 column.
 COVERAGE_COUNTS = ("any", "same-column")
+# R2 bootstrap: "fixed-f" resamples the weights at the point MBAR f; "resolve-f" re-solves the
+# lambda = 0 MBAR per replicate (cv2_coverage.resolve_f_sigma).
+COVERAGE_BOOTSTRAPS = ("fixed-f", "resolve-f")
 BUDGET_REFUSALS = ("no_reserve", "resolution_budget")
 R3_FLAG_ONLY = "r3_flag_only"
 # The test that decided an R3 candidate (metrics["r3_gate"]), in the order they are applied.
@@ -140,6 +143,7 @@ class ResolutionSettings:
     refine_transition_count: str = DEFAULTS["refine_transition_count"]
     refine_r3_mode: str = DEFAULTS["refine_r3_mode"]
     coverage_count: str = DEFAULTS["coverage_count"]
+    coverage_bootstrap: str = DEFAULTS["coverage_bootstrap"]
     temperature_k: float = 300.0
     k1_min: float = 0.0
     k2_min: float = 0.0
@@ -148,7 +152,7 @@ class ResolutionSettings:
 
     def __post_init__(self) -> None:
         for name, allowed in (("refine_transition_count", TRANSITION_COUNTS), ("refine_r3_mode", R3_MODES),
-                              ("coverage_count", COVERAGE_COUNTS)):
+                              ("coverage_count", COVERAGE_COUNTS), ("coverage_bootstrap", COVERAGE_BOOTSTRAPS)):
             if getattr(self, name) not in allowed:
                 raise ValueError(f"{name} must be one of {allowed}, got {getattr(self, name)!r}")
 

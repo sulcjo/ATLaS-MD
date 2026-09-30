@@ -59,6 +59,7 @@ import json
 import math
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -351,22 +352,25 @@ def union_coverage(npz_path: Path, column_views: Mapping[int, cr.StateView], set
     cv1, cv2, idx = cv1[keep], cv2[keep], idx[keep]
     row_src = None if row_src is None else row_src[keep]
     status["row_sources"] = src_note if row_src is not None else f"one source per state ({src_note})"
-    u = cov.reduced_umbrella(cv1, cv2, sub_views, 1.0 / settings.rt)
     n_k = np.bincount(idx, minlength=len(rep)).astype(float)
     sampled_k = np.flatnonzero(n_k > 0)
     remap = -np.ones(len(rep), dtype=np.int64)
     remap[sampled_k] = np.arange(sampled_k.size)
+    sample_views = [sub_views[k] for k in sampled_k]
+    # (N, K) layout for gareus-analyze's solver; the resolve-f bootstrap reuses it
+    u_nk = np.ascontiguousarray(cov.reduced_umbrella(cv1, cv2, sample_views, 1.0 / settings.rt).T)
     mbar_info: Dict[str, Any] = {}
-    f = cov.solve_mbar(u[sampled_k], n_k[sampled_k], info=mbar_info)
+    t_mbar = time.time()
+    f, logw = cov.solve_rows(u_nk, remap[idx], info=mbar_info)
+    mbar_info["wall_s"] = time.time() - t_mbar
     status["mbar"] = mbar_info
     if not mbar_info.get("converged"):
         return [], {**status, "status": "unavailable", "reason": "lambda = 0 MBAR did not converge"}
-    logw = cov.log_weights(u[sampled_k], n_k[sampled_k], f)
     w = np.exp(logw - logw.max())
     w /= w.sum()
     boot: Dict[str, Any] = {}
-    cands = cov.coverage_holes(cv1, cv2, remap[idx], w, [sub_views[k] for k in sampled_k], column_views,
-                               settings, epoch=epoch, source_idx=row_src, info=boot)
+    cands = cov.coverage_holes(cv1, cv2, remap[idx], w, sample_views, column_views,
+                               settings, epoch=epoch, source_idx=row_src, info=boot, u_nk=u_nk, f_point=f)
     status["bootstrap"] = boot.get("bootstrap")
     status["coverage_count"] = str(settings.coverage_count)
     return cands, status
