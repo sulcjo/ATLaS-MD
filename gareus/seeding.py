@@ -260,6 +260,23 @@ def _primary_seed_score(
     return float("nan"), 0.0
 
 
+def classify_primary_start_delta(abs_delta: float, production_k: float, warn_delta: float, bad_delta: float):
+    """``"bad"`` / ``"warn"`` / ``None`` for a start's distance from its primary-CV centre.
+
+    Restraint-aware (spec P6): a window whose production primary force constant is <= 0 does
+    not restrain CV1, so its centre is a placeholder and the distance from it means nothing.
+    Such a window is never failed on it (chignolin_10 job 2761488: 11 of 15 'bad' windows
+    were k1 = 0 anchor/axis windows at 0.00 kcal/mol start bias).
+    """
+    if not (math.isfinite(float(production_k)) and float(production_k) > 0.0):
+        return None
+    if math.isfinite(abs_delta) and abs_delta > bad_delta:
+        return "bad"
+    if math.isfinite(abs_delta) and abs_delta > warn_delta:
+        return "warn"
+    return None
+
+
 def _score_seed_conformer(
     conf: dict,
     *,
@@ -2241,12 +2258,10 @@ def generate_us_starting_states_by_pulling(
             warn_delta = 0.75
             bad_delta = 1.5
             delta_units = "A"
-        if math.isfinite(abs_delta) and abs_delta > bad_delta:
+        _d_status = classify_primary_start_delta(abs_delta, prod_k_openmm, warn_delta, bad_delta)
+        if _d_status is not None:
             warnings.append(f"start is {abs_delta:.3g} {delta_units} from target center")
-            status = "bad"
-        elif math.isfinite(abs_delta) and abs_delta > warn_delta:
-            warnings.append(f"start is {abs_delta:.3g} {delta_units} from target center")
-            status = "warn"
+            status = _d_status
         _pb_status, _pb_msg = classify_starting_umbrella_bias(
             prod_bias_kcal,
             warn_kcal=float(getattr(args, "us_start_primary_warn_bias_kcal", 1.0) or 1.0),
