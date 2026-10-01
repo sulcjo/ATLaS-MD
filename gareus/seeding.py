@@ -260,6 +260,33 @@ def _primary_seed_score(
     return float("nan"), 0.0
 
 
+def _window_axis_restrained(ks, w: int) -> bool:
+    """True when window ``w`` restrains this axis (k > 0); a missing/non-finite k counts as restrained,
+    so runs that never record one keep the old scoring."""
+    try:
+        k = float(ks[int(w)])
+    except (TypeError, IndexError, ValueError):
+        return True
+    return (not math.isfinite(k)) or k > 0.0
+
+
+def classify_primary_start_delta(abs_delta: float, production_k: float, warn_delta: float, bad_delta: float):
+    """``"bad"`` / ``"warn"`` / ``None`` for a start's distance from its primary-CV centre.
+
+    Restraint-aware (spec P6): a window whose production primary force constant is <= 0 does
+    not restrain CV1, so its centre is a placeholder and the distance from it means nothing.
+    Such a window is never failed on it (chignolin_10 job 2761488: 11 of 15 'bad' windows
+    were k1 = 0 anchor/axis windows at 0.00 kcal/mol start bias).
+    """
+    if not (math.isfinite(float(production_k)) and float(production_k) > 0.0):
+        return None
+    if math.isfinite(abs_delta) and abs_delta > bad_delta:
+        return "bad"
+    if math.isfinite(abs_delta) and abs_delta > warn_delta:
+        return "warn"
+    return None
+
+
 def _score_seed_conformer(
     conf: dict,
     *,
@@ -272,6 +299,8 @@ def _score_seed_conformer(
     seed_secondary_weight: float,
     secondary_seed_scale: float,
     args,
+    primary_restrained: bool = True,
+    secondary_restrained: bool = True,
 ) -> tuple[float, dict]:
     """Score one GENPEPT conformer against a window's primary/secondary CV targets.
 
@@ -286,9 +315,15 @@ def _score_seed_conformer(
     if seed_selection_mode == "distance":
         primary_value = float(conf.get("cv_A", primary_value))
     primary_delta, primary_score = _primary_seed_score(primary_value, target_primary, primary_seed_scale)
+    # Restraint-aware (spec P6): an axis the window does not restrain has a placeholder centre;
+    # scoring seeds against it picks the wrong seed (chignolin_10 job 2762363: the CV2-free region
+    # representative got a CV1 = 0.20 seed for a 0.577 target and its pull never closed the gap).
+    if not primary_restrained:
+        primary_score = 0.0
     secondary_value = float(conf.get("secondary_cv_value", float("nan")))
     secondary_delta = float("nan")
     secondary_score = 0.0
+    secondary_available = bool(secondary_available and secondary_restrained)
     use_secondary = bool(
         seed_selection_mode == "active-cv"
         and secondary_available
@@ -324,6 +359,8 @@ def _score_seed_conformer(
         "secondary_scale": secondary_seed_scale,
         "secondary_weight": seed_secondary_weight,
         "secondary_score": secondary_score,
+        "primary_restrained": bool(primary_restrained),
+        "secondary_restrained": bool(secondary_restrained),
         "total_score": total,
         "conformer_pdb": str(conf.get("pdb_path", "")),
     }
@@ -888,6 +925,8 @@ def filter_explicit_2d_windows_by_seed_reachability(
                 primary_seed_scale=primary_scale, target_primary=float(c), target_secondary=target_secondary,
                 secondary_available=can_score_secondary, seed_secondary_weight=seed_secondary_weight,
                 secondary_seed_scale=secondary_scale, args=args,
+                primary_restrained=float(_k1[i]) > 0.0,
+                secondary_restrained=_k2 is None or float(_k2[i]) > 0.0,
             )
             if best_score is None or score < best_score:
                 best_score, best_components = score, components
@@ -1771,6 +1810,8 @@ def generate_us_starting_states_by_pulling(
                 seed_secondary_weight=seed_secondary_weight,
                 secondary_seed_scale=secondary_seed_scale,
                 args=args,
+                primary_restrained=_window_axis_restrained(ks_kj_nm2, w),
+                secondary_restrained=(not secondary_available) or _window_axis_restrained(secondary_cv_ks_kj, w),
             )
 
         if w in _x3_by_window:
@@ -2241,12 +2282,10 @@ def generate_us_starting_states_by_pulling(
             warn_delta = 0.75
             bad_delta = 1.5
             delta_units = "A"
-        if math.isfinite(abs_delta) and abs_delta > bad_delta:
+        _d_status = classify_primary_start_delta(abs_delta, prod_k_openmm, warn_delta, bad_delta)
+        if _d_status is not None:
             warnings.append(f"start is {abs_delta:.3g} {delta_units} from target center")
-            status = "bad"
-        elif math.isfinite(abs_delta) and abs_delta > warn_delta:
-            warnings.append(f"start is {abs_delta:.3g} {delta_units} from target center")
-            status = "warn"
+            status = _d_status
         _pb_status, _pb_msg = classify_starting_umbrella_bias(
             prod_bias_kcal,
             warn_kcal=float(getattr(args, "us_start_primary_warn_bias_kcal", 1.0) or 1.0),

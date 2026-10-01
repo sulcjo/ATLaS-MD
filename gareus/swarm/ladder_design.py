@@ -118,17 +118,19 @@ def fsf_floor_per_rung(lambdas, env: PepGamdEnvelope, *, warn_threshold: float =
     """
     lam = [float(x) for x in lambdas]
     has_total = bool(getattr(env, "has_total", True))
-    dih = [1.0 - l * float(env.k0max_dih) for l in lam]
+    f_dih, f_tot = getattr(env, "fsf_floor_dih", None), getattr(env, "fsf_floor_total", None)
+    clamp = lambda raw, f: raw if f is None else max(float(f), raw)
+    dih = [clamp(1.0 - l * float(env.k0max_dih), f_dih) for l in lam]
     top_dih = dih[-1] if dih else 1.0
     if has_total:
-        tot = [1.0 - l * float(env.k0max_total) for l in lam]
+        tot = [clamp(1.0 - l * float(env.k0max_total), f_tot) for l in lam]
         top_tot = tot[-1] if tot else 1.0
         warn = bool(top_tot < float(warn_threshold))
     else:
         tot = None
         top_tot = None
         warn = bool(top_dih < float(warn_threshold))
-    return {
+    out = {
         "Total": tot,
         "Dihedral": dih,
         "top_rung_floor_total": top_tot,
@@ -137,6 +139,12 @@ def fsf_floor_per_rung(lambdas, env: PepGamdEnvelope, *, warn_threshold: float =
         "note": "FSF floor = 1 - lambda*k0max at V = Vmin (unclamped lower-bound formula); "
                 "a floor near 0 on the top rung is the NaN mechanism seen in S3 attempts 6-7",
     }
+    if f_dih is not None or f_tot is not None:
+        # FSF clamp active (spec 2026-10-01-pep-gamd-fsf-clamp.md): floors reported as max(f, 1 - lambda*k0max).
+        out["fsf_clamp"] = {"Total": f_tot, "Dihedral": f_dih}
+        out["note"] = ("FSF floor = max(clamp floor, 1 - lambda*k0max) at V = Vmin; the clamp continues the "
+                       "boost linearly so the FSF never drops below the clamp floor")
+    return out
 
 
 def window_sigma_cv(k_kcal: float, temperature_k: float) -> float:

@@ -292,7 +292,17 @@ def _apply_sidecar_gamd_envelope(args, side: Dict[str, Any], sidecar_path: Path)
     if current and current != auto_dir and Path(current).resolve() != Path(shared_dir).resolve():
         return {"shared_gamd_setup_dir_kept_explicit": current}
     args.shared_gamd_setup_dir = shared_dir
-    return {"shared_gamd_setup_dir": shared_dir}
+    out = {"shared_gamd_setup_dir": shared_dir}
+    # The FSF clamp is frozen into the envelope: a run launched from the sidecar alone adopts its
+    # floors (explicit args are left alone; reconcile_fsf_floors refuses a disagreement later).
+    doc = read_json_file(globals_path) or {}
+    env_globals = doc.get("all_globals") or {}
+    for ch, dest in (("Total", "pep_gamd_fsf_floor_total"), ("Dihedral", "pep_gamd_fsf_floor_dihedral")):
+        key = f"fsf_floor_{ch}"
+        if key in env_globals and getattr(args, dest, None) is None:
+            setattr(args, dest, float(env_globals[key]))
+            out[dest] = float(env_globals[key])
+    return out
 
 
 def run_or_resume_epoch0(

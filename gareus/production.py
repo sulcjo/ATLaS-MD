@@ -1033,7 +1033,7 @@ def integrator_globals(integrator, unit=None, include_all: bool = False) -> dict
     else:
         interesting = (
             "boost", "sigma", "vmax", "vmin", "vavg", "energy",
-            "threshold", "k0", "step", "stage", "window", "potential",
+            "threshold", "k0", "step", "stage", "window", "potential", "fsf_floor",
         )
         out = {name: value for name, value in all_globals.items() if any(s in name.lower() for s in interesting)}
     # Add native stage/step where available; these names are stable in
@@ -4201,6 +4201,10 @@ def set_integrator_globals_from_dict(integrator, values: dict[str, float]) -> tu
         name_to_index = {str(integrator.getGlobalVariableName(i)): i for i in range(integrator.getNumGlobalVariables())}
     except Exception as exc:
         return copied, {"<all>": f"cannot inspect destination integrator globals: {exc}"}
+    # The FSF clamp is frozen with the envelope: never copy a clamped envelope into an
+    # unclamped integrator (the floor would be skipped silently) or the reverse.
+    from .pep_gamd import reconcile_fsf_floors
+    reconcile_fsf_floors(integrator, values)
     for name, raw_value in (values or {}).items():
         if name not in name_to_index:
             skipped[str(name)] = "not present in destination integrator"
@@ -7496,6 +7500,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         "gamd_boost_type": args.gamd_boost_type,
         "sigma0p_kcal_mol": args.sigma0p_kcal_mol,
         "sigma0d_kcal_mol": args.sigma0d_kcal_mol,
+        "pep_gamd_fsf_floor_total": getattr(args, "pep_gamd_fsf_floor_total", None),
+        "pep_gamd_fsf_floor_dihedral": getattr(args, "pep_gamd_fsf_floor_dihedral", None),
         "progress_jsonl": str(out_dir / str(getattr(args, "progress_jsonl", "progress.jsonl"))),
         "distance_csv": str(out_dir / str(getattr(args, "distance_csv", "distances.csv"))),
         "distance_jsonl": str(out_dir / str(getattr(args, "distance_jsonl", "distances.jsonl"))),
