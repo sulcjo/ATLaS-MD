@@ -108,14 +108,19 @@ def load_pair_context(pair_paths: Sequence, solute_pdb) -> PairContext:
     rt = PairModelRuntime.load(*[Path(p) for p in pair_paths], require_deployable=False, allow_legacy_v1=True)
     topology = app.PDBFile(str(solute_pdb)).topology
     atoms = list(topology.atoms())
-    cargs = rt.contact_args()
-    rule = str(rt.anchor_definition.get("pair_rule", "atom-pairs"))
-    cargs.contact_scheme = rule.split(":")[0] or "atom-pairs"
-    cargs.contact_pair_warning_threshold = 10 ** 9
-    pairs = build_nonlocal_contact_pairs(topology, cargs)
-    want = rt.anchor_definition.get("pair_list_sha256")
-    if want and contact_pair_list_digest(pairs) != want:
-        raise RuntimeError("contact pair list rebuilt from the solute topology does not match the pair model's")
+    from gareus.cv_selection.anchor_spec import is_contact
+    if is_contact(rt.anchor_kind):
+        cargs = rt.contact_args()
+        rule = str(rt.anchor_definition.get("pair_rule", "atom-pairs"))
+        cargs.contact_scheme = rule.split(":")[0] or "atom-pairs"
+        cargs.contact_pair_warning_threshold = 10 ** 9
+        pairs = build_nonlocal_contact_pairs(topology, cargs)
+        want = rt.anchor_definition.get("pair_list_sha256")
+        if want and contact_pair_list_digest(pairs) != want:
+            raise RuntimeError("contact pair list rebuilt from the solute topology does not match the pair model's")
+    else:                                 # distance anchor: the model's own atom pair
+        cargs = None
+        pairs = [(int(rt.anchor_definition["atom1"]), int(rt.anchor_definition["atom2"]), 1.0)]
     schema = json.loads(Path(pair_paths[2]).read_text())
     labels = []
     for f in schema["features"]:
@@ -293,7 +298,12 @@ def measure_structures(paths: Sequence, ctx: PairContext, mode: "X3.HiddenMode")
         if pos is None:
             continue
         feats = torsion_features(pos, ctx.quads)
-        c1 = contact_cv(pos, ctx.contact_pairs, ctx.contact_args)
+        if ctx.contact_args is None:      # distance anchor (A), as anchor_spec.value_from_positions
+            from gareus.cv_selection.anchor_spec import value_from_positions
+            c1 = np.atleast_1d(value_from_positions(ctx.runtime.anchor_kind, np.asarray(pos)[0] if np.ndim(pos) == 3
+                                                    else pos, ctx.contact_pairs, ctx.runtime))
+        else:
+            c1 = contact_cv(pos, ctx.contact_pairs, ctx.contact_args)
         c2 = float(evaluate_component(ctx.runtime.fit, ctx.runtime.j, feats, c1)[0])
         z = float(mode.scores(feats, c1)[0])
         out[str(p)] = {"cv1": float(c1[0]), "cv2": c2, "hidden_z": z, "side": int(mode.side([z])[0])}

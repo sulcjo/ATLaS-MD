@@ -511,8 +511,12 @@ def _add_residual_torsion_cv_force(openmm, system, phi_torsions, psi_torsions, c
     ``ss_k`` arrives in kJ/mol/CV^2 (production converts before set_window), so
     the energy expression carries no unit factor.
     """
+    from .cv_selection import anchor_spec as AS
     runtime.check_topology(phi_torsions, psi_torsions)
     runtime.check_anchor(args, contact_pairs)
+    kind = runtime.anchor_kind
+    if carry_primary_umbrella and not AS.is_contact(kind):
+        raise ValueError(f"only a contact anchor can carry the CV1 umbrella (SHARED_CONTACT_LAYOUT), not {kind!r}")
     fit, j = runtime.fit, int(runtime.j)
     v = np.asarray(fit.right_vectors[j - 1], dtype=np.float64)
     n_phi, n_psi = len(phi_torsions), len(psi_torsions)
@@ -530,21 +534,19 @@ def _add_residual_torsion_cv_force(openmm, system, phi_torsions, psi_torsions, c
         if len(torsions):
             cv_force.addCollectiveVariable(fname, _add_weighted_trig_torsion_force(openmm, torsions, weights, trig))
             names.append(fname)
-    r0_nm, beta_nm_inv = contact_switch_constants_nm(args)
-    contact_sum = openmm.CustomBondForce(
-        f"contact_weight*0.5*(1-tanh(0.5*{beta_nm_inv:.17g}*(r-{r0_nm:.17g})))")
-    contact_sum.addPerBondParameter("contact_weight")
-    for pair in contact_pairs:
-        contact_sum.addBond(int(pair[0]), int(pair[1]), [float(pair[2]) if len(pair) > 2 else 1.0])
-    cv_force.addCollectiveVariable("res_contacts", contact_sum)
-    norm = float(runtime.anchor_definition.get("norm", contact_normalization_denominator(list(contact_pairs), args)))
+    # The anchor sub-CV (anchor_spec): the contact switch sum for the contact kind (the same
+    # expression as forces.add_contact_umbrella_force), r (nm) for the end-to-end distance;
+    # c = sub_cv / norm in the anchor's own units either way.
+    anchor_name = "res_contacts" if AS.is_contact(kind) else "res_anchor"
+    cv_force.addCollectiveVariable(anchor_name, AS.build_anchor_subcv(openmm, kind, contact_pairs, args))
+    norm = AS.anchor_norm(kind, runtime.anchor_definition, contact_pairs, args)
     # The compiled coordinate writes the expression; the same object evaluates the fast-path
     # scalar and the positions evaluator (spec F02: one frozen definition for every stage).
     from .cv_selection.residual_runtime import compile_component
     compiled = compile_component(fit, j, norm=norm)
     K0, K1, K2 = compiled.k0, compiled.k1, compiled.k2
     lo, hi = compiled.clamp_lo, compiled.clamp_hi
-    z2 = compiled.openmm_expression(names, "res_contacts")
+    z2 = compiled.openmm_expression(names, anchor_name)
     cv_force.addGlobalParameter("ss_k", 0.0)
     cv_force.addGlobalParameter("ss0", 0.0)
     energy = f"0.5*ss_k*({z2}-ss0)^2"
@@ -571,13 +573,16 @@ def _add_residual_torsion_cv_force(openmm, system, phi_torsions, psi_torsions, c
         "n_psi_torsions": int(n_psi),
         "phi_torsions": [list(map(int, t)) for t in phi_torsions],
         "psi_torsions": [list(map(int, t)) for t in psi_torsions],
-        "contact_pairs": [[int(p[0]), int(p[1]), float(p[2]) if len(p) > 2 else 1.0] for p in contact_pairs],
+        "contact_pairs": ([[int(p[0]), int(p[1]), float(p[2]) if len(p) > 2 else 1.0] for p in contact_pairs]
+                          if AS.is_contact(kind) else []),
+        "anchor_kind": kind,
+        "anchor_pairs": [[int(p[0]), int(p[1]), float(p[2]) if len(p) > 2 else 1.0] for p in contact_pairs],
         "linear_subcv_names": list(names),
         # Ordered roles of every CustomCVForce sub-variable, in the order
         # getCollectiveVariableValues() returns them. The fast-path scalar is
         # reconstructed from these roles + residual_scalar, never from position
         # assumptions (spec F01; review finding I01).
-        "subcv_roles": [{"name": n, "role": "torsion_sum"} for n in names] + [{"name": "res_contacts", "role": "contact_sum"}],
+        "subcv_roles": [{"name": n, "role": "torsion_sum"} for n in names] + [{"name": anchor_name, "role": "contact_sum"}],
         "residual_scalar": compiled.as_record(),
         "cv_evaluator_version": RESIDUAL_EVALUATOR_VERSION,
         "force_group": int(force_group),
@@ -1847,9 +1852,10 @@ def add_secondary_structure_cv_force(openmm, system, topology, args, force_group
         # explicit policy, because their certificate described a different coordinate.
         policy = str(getattr(args, "legacy_model_policy", "refuse") or "refuse")
         runtime = PairModelRuntime.load(*paths, require_deployable=True, allow_legacy_v1=(policy == "allow-v1"))
+        from .cv_selection.anchor_spec import anchor_pairs
         info = _add_residual_torsion_cv_force(
             openmm, system, phi_torsions, psi_torsions,
-            list(primary_cv_def.get("contact_pairs", [])), runtime, args, force_group=force_group,
+            anchor_pairs(runtime.anchor_kind, primary_cv_def), runtime, args, force_group=force_group,
             carry_primary_umbrella=carry_primary_umbrella)
         info.update({"pair_model_path": str(paths[0]), "candidate_set_path": str(paths[1]),
                      "feature_schema_path": str(paths[2])})

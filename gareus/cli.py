@@ -1365,6 +1365,13 @@ def _validate_cv_selection_args(p: argparse.ArgumentParser, args: argparse.Names
             p.error("--cv2 auto selects CV2 inside the swarm stage; a manual production "
                     "run must pass --cv2 residual-torsion-pc with the three frozen "
                     "artifact paths")
+        # The residual CV2 is fitted against the run's CV1 (cv_selection.anchor_spec): the
+        # contact fraction, or the terminal CA--CA distance in A. Refuse anything else now.
+        from .cv_selection.anchor_spec import anchor_kind_for_args
+        try:
+            anchor_kind_for_args(args)
+        except ValueError as exc:
+            p.error(f"--cv2 auto: {exc}")
     elif mode == "residual-torsion-pc":
         # Frozen in every window mode, not only manual: the sidecar sets manual, but a
         # hand-written adaptive config must not be allowed to switch a frozen pair either.

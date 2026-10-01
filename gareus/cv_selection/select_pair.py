@@ -106,6 +106,9 @@ def balanced_weights(labels) -> np.ndarray:
 
 
 def _units(kind: str) -> str:
+    from .anchor_spec import ANCHOR_KINDS, units
+    if kind in ANCHOR_KINDS:            # the units the runtime force evaluates the anchor in
+        return units(kind)
     return "dimensionless" if kind == "nonlocal-contact-fraction" else "nanometer"
 
 
@@ -372,8 +375,11 @@ def select_cv_pair(data: SwarmDataset, config: SelectionConfig, *, physical_syst
                "deployable": False}
     if deployment:
         binding.update({k: deployment.get(k) for k in binding if k in deployment})
+        if deployment.get("anchor_binding_sha256"):     # non-contact anchors (anchor_spec)
+            binding["anchor_binding_sha256"] = deployment["anchor_binding_sha256"]
+        anchor_key = "anchor_binding_sha256" if "anchor_binding_sha256" in binding else "contact_pair_list_sha256"
         binding["deployable"] = bool(deployment.get("deployable", all(
-            binding[k] for k in ("topology_sha256", "physical_system_sha256", "contact_pair_list_sha256"))))
+            binding[k] for k in ("topology_sha256", "physical_system_sha256", anchor_key))))
     pair_model = PairModel.from_mapping({
         "schema": PAIR_MODEL_VERSION_V2,
         "candidate_set_sha256": candidate_set.sha256,

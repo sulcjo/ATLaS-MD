@@ -184,7 +184,8 @@ def probe_centre_seed_support(centres, seed_cv1) -> np.ndarray:
 def autotune_cv1_upper_bound(cv1, seed_cv1, *, n_windows: int, lo_q: float = 0.005,
                              hi_q: float = 0.995, temperature_k: float = 300.0,
                              k_max_kcal: float = 1200.0,
-                             max_seed_gap_sigma: float = 0.5) -> dict:
+                             max_seed_gap_sigma: float = 0.5,
+                             value_range: tuple = (0.0, 1.0)) -> dict:
     """Highest upper bound whose every centre has a seed within tolerance.
 
     tol = max_seed_gap_sigma * window_sigma_cv(k_max_kcal, temperature_k) (the tightest window
@@ -204,8 +205,11 @@ def autotune_cv1_upper_bound(cv1, seed_cv1, *, n_windows: int, lo_q: float = 0.0
     seeds = np.asarray(seed_cv1, dtype=float)
     seeds = seeds[np.isfinite(seeds)]
 
-    lo = max(0.0, float(np.quantile(v, lo_q)))
-    hi_initial = min(1.0, float(np.quantile(v, hi_q)))
+    # value_range: the anchor's physical range (anchor_spec.value_bounds; [0, 1] for the
+    # contact fraction, (0, None) for a distance in A).
+    vmin, vmax = value_range
+    lo = float(np.quantile(v, lo_q)) if vmin is None else max(float(vmin), float(np.quantile(v, lo_q)))
+    hi_initial = float(np.quantile(v, hi_q)) if vmax is None else min(float(vmax), float(np.quantile(v, hi_q)))
     if hi_initial <= lo:
         raise ValueError("degenerate CV1 coverage: quantile range collapsed to a point")
 
@@ -256,7 +260,8 @@ def autotune_cv1_upper_bound(cv1, seed_cv1, *, n_windows: int, lo_q: float = 0.0
 
 def cv1_centers_from_samples(cv1, n_windows: int = 16, lo_q: float = 0.005, hi_q: float = 0.995, *,
                               seed_cv1=None, temperature_k: float = 300.0, k_max_kcal: float = 1200.0,
-                              max_seed_gap_sigma: float = 0.5, probe_out: Optional[dict] = None) -> np.ndarray:
+                              max_seed_gap_sigma: float = 0.5, probe_out: Optional[dict] = None,
+                              value_range: tuple = (0.0, 1.0)) -> np.ndarray:
     """Centres spanning the swarm's OBSERVED CV1 coverage, never a fixed [0,1] grid.
 
     The static library-quantile veto that used to live here (library_cv1/library_q, raising
@@ -280,15 +285,17 @@ def cv1_centers_from_samples(cv1, n_windows: int = 16, lo_q: float = 0.005, hi_q
     if seed_cv1 is not None:
         result = autotune_cv1_upper_bound(
             v, seed_cv1, n_windows=n_windows, lo_q=lo_q, hi_q=hi_q, temperature_k=temperature_k,
-            k_max_kcal=k_max_kcal, max_seed_gap_sigma=max_seed_gap_sigma,
+            k_max_kcal=k_max_kcal, max_seed_gap_sigma=max_seed_gap_sigma, value_range=value_range,
         )
         if probe_out is not None:
             probe_out.update(result)
         return np.asarray(result["centres"], dtype=float)
 
     lo, hi = float(np.quantile(v, lo_q)), float(np.quantile(v, hi_q))
-    lo = max(0.0, lo)
-    hi = min(1.0, hi)
+    if value_range[0] is not None:
+        lo = max(float(value_range[0]), lo)
+    if value_range[1] is not None:
+        hi = min(float(value_range[1]), hi)
     if hi <= lo:
         raise ValueError("degenerate CV1 coverage: quantile range collapsed to a point")
     return np.linspace(lo, hi, int(n_windows))
@@ -363,7 +370,7 @@ def cv1_force_constants_from_curvature(centers, curvature_kcal, temperature_k: f
     return ks
 
 
-def write_ladder_windows_csv(path, centers, ks_kcal, lambdas) -> Path:
+def write_ladder_windows_csv(path, centers, ks_kcal, lambdas, primary_cv_mode: str = "contacts") -> Path:
     """Full cross product of CV1 centres x lambda rungs (never truncate the exchange graph)."""
     path = Path(path)
     lambdas = list(lambdas)
@@ -372,7 +379,7 @@ def write_ladder_windows_csv(path, centers, ks_kcal, lambdas) -> Path:
         n = 0
         for c, k in zip(centers, ks_kcal):
             for lam in lambdas:
-                yield [n, "contacts", f"{float(c):.6f}", f"{float(k):.4f}", f"{float(lam):.6f}"]
+                yield [n, primary_cv_mode, f"{float(c):.6f}", f"{float(k):.4f}", f"{float(lam):.6f}"]
                 n += 1
 
     # Staged and renamed: this file IS the production state space, and a
@@ -649,7 +656,7 @@ def cv2_force_constants_per_gap(centers, temperature_k: float, *, overlap_sigma:
     return out
 
 
-def write_ladder_windows_2d_csv(path, rows, lambdas) -> Path:
+def write_ladder_windows_2d_csv(path, rows, lambdas, primary_cv_mode: str = "contacts") -> Path:
     """(center1, k1, center2, k2) rows x lambda rungs; an unrestrained axis has k = 0.
 
     A ``None`` centre on an unrestrained axis is written empty. The production loader
@@ -662,7 +669,7 @@ def write_ladder_windows_2d_csv(path, rows, lambdas) -> Path:
         for r in rows:
             for lam in lambdas:
                 c2 = "" if r.get("center2") is None else f"{float(r['center2']):.6f}"
-                yield [n, "contacts", f"{float(r['center1']):.6f}", f"{float(r['k1']):.4f}",
+                yield [n, primary_cv_mode, f"{float(r['center1']):.6f}", f"{float(r['k1']):.4f}",
                        c2, f"{float(r['k2']):.4f}", f"{float(lam):.6f}"]
                 n += 1
 
