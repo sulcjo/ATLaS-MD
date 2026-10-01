@@ -42,7 +42,7 @@ from .checkpoints import production_checkpoint_available
 from .io import write_json, write_text_atomic, read_json_file, resolve_run_temperature_k, _json_ready, acquire_run_lock
 from .lifecycle import _graceful_shutdown
 from .store import SegmentRegistry
-from .extension_seeding import extension_parent_dirs
+from .extension_seeding import extension_parent_dirs, prior_phase_parent_dirs
 from .adaptive.paired_cv import PairedCVCollector, attach_paired_cv
 from .adaptive.pair_runtime import GATE_REPORT_NAME, gate_from_args
 from .adaptive.edge_metric import (GRAPH_EDGE_TYPES, attach_edge_metric, edge_is_weak_pairwise, edge_sort_overlap,
@@ -7396,6 +7396,8 @@ def run_scheduled_adaptive_epoch(
             "is_topup": name.startswith("topup"),
             "topup_index": int(name.split("_")[1]) if name.startswith("topup") and "_" in name[6:] else 0,
             "states_without_baseline_this_round": sorted(_baseline_skipped_state_ids.intersection(int(x) for x in state_ids)),
+            "continue_parent_dirs": continuation_parent_dirs(
+                epoch_dir.parent, epoch_dir, name, enabled=bool(getattr(args, "ap_continue_states", False))),
         })
         seed_report = None
         if current_seed_bank is not None and Path(current_seed_bank).exists():
@@ -8560,6 +8562,15 @@ def _check_extension_rounds_on_disk(adaptive_dir: Path, start_ext_round: int) ->
             )
 
 
+def continuation_parent_dirs(adaptive_dir, epoch_dir, segment_name: str, *, enabled: bool) -> list:
+    """--ap-continue-states: earlier phases' segments (oldest first) a phase continues its existing
+    states from. Empty when disabled, for top-ups (they seed from their own parent segment) and for
+    epoch 0 (nothing ran before it); the final phase continues from every numbered epoch."""
+    if not enabled or str(segment_name).startswith("topup"):
+        return []
+    return [str(p) for p in prior_phase_parent_dirs(adaptive_dir, Path(epoch_dir) / "x")]
+
+
 def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, forcefield, topology, equil_state, progress=None) -> Dict[str, Any]:
     """Run adaptive production by calling the existing GAREUS worker per epoch.
 
@@ -8873,6 +8884,8 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                 "segment_name": "epoch",
                 "is_topup": False,
                 "topup_index": 0,
+                "continue_parent_dirs": continuation_parent_dirs(
+                    epoch_dir.parent, epoch_dir, "epoch", enabled=bool(getattr(args, "ap_continue_states", False))),
                 "prev_epochs": [
                     {
                         "epoch": int(s["epoch"]),
@@ -9578,6 +9591,13 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             final_args.adaptive_feedback_pilot = False
             final_args.adaptive_feedback_final_production = False
             final_args.resume = bool(resume_requested and production_checkpoint_available(final_dir))
+            if bool(getattr(args, "ap_continue_states", False)):
+                # Non-scheduled final phase: continue existing states too (the scheduled path
+                # passes the same parents through run_segment's phase info).
+                setattr(final_args, "_adaptive_phase_info", {
+                    "segment_name": "final",
+                    "continue_parent_dirs": continuation_parent_dirs(adaptive_dir, final_dir, "final", enabled=True),
+                })
             if final_args.resume:
                 print(f"    Adaptive-production final frozen phase: checkpoint manifest found; resuming from {final_dir}")
             if _arg_bool(args, "adaptive_production_trajectories", True) is False:

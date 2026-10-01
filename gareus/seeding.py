@@ -1291,6 +1291,8 @@ def generate_us_starting_states_by_pulling(
     secondary_cv_centers=None,
     secondary_cv_ks_kj=None,
     secondary_cv_metadata: Optional[dict] = None,
+    allow_slow_mode_reseed: bool = True,
+    total_windows: Optional[int] = None,
 ):
     """Generate one starting structure per umbrella window by restrained CV pulling.
 
@@ -1778,7 +1780,11 @@ def generate_us_starting_states_by_pulling(
     # slow_mode_reseed/ table names the end state a reseeded window must start from. Empty
     # (no lookup at all) when the bank has none, so every other window and run is unchanged.
     _x3_by_window: dict = {}
-    if seed_dir is not None and conformer_library:
+    if not allow_slow_mode_reseed:
+        # --ap-continue-states pulls only new states, on a window subset whose indices do not
+        # match out_dir's epoch_window_map; X3 overrides re-seed EXISTING windows anyway.
+        pass
+    elif seed_dir is not None and conformer_library:
         try:
             from .adaptive.slow_mode_reseed import reseed_conformers_by_window
             _x3_by_window = reseed_conformers_by_window(
@@ -2419,7 +2425,9 @@ def generate_us_starting_states_by_pulling(
         )
         auto_drop = bool(getattr(args, "us_auto_drop_bad_windows", False))
         max_drop_fraction = float(getattr(args, "us_auto_drop_max_fraction", 1.0 / 3.0) or (1.0 / 3.0))
-        drop_fraction = n_bad / float(nwin)
+        # A subset pull (--ap-continue-states) measures the drop cap against the phase's full
+        # window count, so one bad new window never turns a would-be drop into a hard failure.
+        drop_fraction = n_bad / float(total_windows or nwin)
         _phase_info = getattr(args, "_adaptive_phase_info", {}) or {}
         # This fallback's whole premise is "a topup always re-seeds an already-
         # established window" - confirmed FALSE in general: pool exhaustion can

@@ -110,6 +110,41 @@ def extension_parent_dirs(adaptive_dir, ext_index: int) -> List[Path]:
     return parents
 
 
+_EPOCH_RE = re.compile(r"^epoch_(\d+)$")
+
+
+def _has_end_states(d: Path) -> bool:
+    return (d / PDB_DIR).is_dir() or (d / DIR_NAME).is_dir()
+
+
+def prior_phase_parent_dirs(adaptive_dir, phase_dir) -> List[Path]:
+    """Segments of every phase that ran before ``phase_dir``'s phase, oldest first.
+
+    ``phase_dir`` is a numbered epoch (flat ``epoch_NNN`` or one of its segments) or a
+    ``final`` segment. Epochs are ordered by number and precede ``final``; within an
+    epoch, :func:`_final_phase_parent_dirs` orders baseline then top-ups. Only segments
+    that left end states (``final_pdbs`` or a State export) are returned. Used by
+    ``--ap-continue-states`` so each existing state continues from its newest end state.
+    """
+    adaptive_dir = Path(adaptive_dir)
+    try:
+        group = Path(phase_dir).resolve().relative_to(adaptive_dir.resolve()).parts[0]
+    except (ValueError, IndexError):
+        return []
+    m = _EPOCH_RE.match(group)
+    if m is None and group != "final":
+        return []
+    current = int(m.group(1)) if m else None
+    epochs = sorted((int(_EPOCH_RE.match(d.name).group(1)), d) for d in adaptive_dir.iterdir()
+                    if d.is_dir() and _EPOCH_RE.match(d.name))
+    out: List[Path] = []
+    for k, d in epochs:
+        if current is not None and k >= current:
+            break
+        out.extend(seg for seg in _final_phase_parent_dirs(d) if _has_end_states(seg))
+    return out
+
+
 def _parent_restraints(parent: Path) -> Optional[Dict[str, List[Optional[float]]]]:
     """Per-window restraints the parent actually ran, in its own post-drop window order."""
     path = parent / "checkpoints" / "production_checkpoint_manifest.json"
@@ -136,6 +171,39 @@ def _parent_restraints(parent: Path) -> Optional[Dict[str, List[Optional[float]]
     }
 
 
+def _chain_end_pdb_by_window(parent: Path) -> Dict[int, Path]:
+    """window -> the PDB holding that window's chain END in this segment.
+
+    ``final_pdbs/`` accumulates one file per replica per job that ended in this
+    directory (``replica_r_window_w.pdb``, w = the window replica r held then), so a
+    window can have several files from different jobs. The chain end is the file of
+    the replica the segment's last checkpoint manifest assigns to that window; a
+    window that rule cannot place (no readable ``assignments``, or its file missing)
+    takes its newest file by mtime. Taking the last file in NAME order -- the earlier
+    behaviour -- picked a stale fork for 152-204 of 236 windows per chignolin_9 phase.
+    """
+    pdb_dir = parent / PDB_DIR
+    by_window: Dict[int, List[Path]] = {}
+    for path in pdb_dir.iterdir():
+        match = _PDB_RE.match(path.name)
+        if match is not None:
+            by_window.setdefault(int(match.group(2)), []).append(path)
+    out: Dict[int, Path] = {}
+    try:
+        m = json.loads((parent / "checkpoints" / "production_checkpoint_manifest.json").read_text())
+        assignments = [int(w) for w in m.get("assignments") or []]
+    except Exception:
+        assignments = []
+    for r, w in enumerate(assignments):
+        candidate = pdb_dir / f"replica_{r:03d}_window_{w:03d}.pdb"
+        if candidate.exists():
+            out[w] = candidate
+    for w, paths in by_window.items():
+        if w not in out:
+            out[w] = max(paths, key=lambda p: (p.stat().st_mtime_ns, p.name))
+    return out
+
+
 def pdb_seeds_of_parent(parent) -> Dict[int, PdbSeed]:
     """state_id -> PdbSeed for every ``final_pdbs`` file the parent's window map can place."""
     parent = Path(parent)
@@ -148,11 +216,7 @@ def pdb_seeds_of_parent(parent) -> Dict[int, PdbSeed]:
     state_of_window = state_id_of_window_from_epoch_map(parent)
     n = len(restraints["primary_center"])
     out: Dict[int, PdbSeed] = {}
-    for path in sorted(pdb_dir.iterdir()):
-        match = _PDB_RE.match(path.name)
-        if match is None:
-            continue
-        w = int(match.group(2))
+    for w, path in sorted(_chain_end_pdb_by_window(parent).items()):
         sid = state_of_window.get(w)
         if sid is None or w >= n:
             logger.warning("Extension seeding: %s has no window-map row / restraint for window %d; skipped", path, w)
