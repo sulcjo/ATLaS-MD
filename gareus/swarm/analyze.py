@@ -493,6 +493,7 @@ def _selection_config(args, k1_max_kcal: float, temperature_k: float) -> Selecti
         min_slowness_rho=float(getattr(args, "cv_selection_min_slowness", 0.72)),
         min_bimodality=float(getattr(args, "cv_selection_min_bimodality", 5.0 / 9.0)),
         half_split_min_corr=float(getattr(args, "cv_selection_half_split_min_corr", 0.8)),
+        gain_resamples=int(getattr(args, "cv_selection_gain_resamples", 8)),
     )
 
 

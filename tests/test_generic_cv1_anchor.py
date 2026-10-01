@@ -197,3 +197,38 @@ def test_a_distance_anchor_cannot_carry_the_cv1_umbrella():
     with pytest.raises(ValueError, match="carry the CV1 umbrella"):
         _add_residual_torsion_cv_force(openmm, system, phi, psi, [(0, 15, 1.0)], rt, _args(), force_group=29,
                                        carry_primary_umbrella=True)
+
+
+# ---- robust information-gain floor (--cv-selection-gain-resamples) -----------------------------
+
+def test_gain_floor_uses_fold_averaged_gain_and_rejects_only_demonstrably_uninformative():
+    from dataclasses import replace
+    from test_cv_selection_conditional_tica import ARGS, _slow_cfg, _trajectories
+    from gareus.cv_selection.select_pair import select_cv_pair
+
+    data = _trajectories()
+    cfg = replace(_slow_cfg(), min_gain_nats=0.02)
+    robust = select_cv_pair(data, cfg, **ARGS).report["components"]
+    single = select_cv_pair(data, replace(cfg, gain_resamples=0), **ARGS).report["components"]
+    for j, row in robust.items():
+        assert row["gain_resamples"] == 8 and 0.0 <= row["gain_pass_fraction"] <= 1.0
+        assert row["gain_nats"] == single[j]["gain_nats"]               # draw 0 = the historical assignment
+        robust_fail = any("fold assignments" in r for r in row["reasons"])
+        assert robust_fail == (row["gain_nats_mean"] + 2 * row["gain_nats_sd"] < 0.02)
+        single_fail = any(r.startswith("information gain") for r in single[j]["reasons"])
+        assert single_fail == (single[j]["gain_nats"] < 0.02)
+        assert "gain_nats_mean" not in single[j]                        # 0 = the rule before 2026-10-01
+
+
+def test_gain_resamples_is_validated_and_reaches_the_config(tmp_path):
+    from gareus.cli import parse_args
+    from gareus.cv_selection.select_pair import SelectionConfig
+    from gareus.swarm.analyze import _selection_config
+    with pytest.raises(ValueError):
+        SelectionConfig(gain_resamples=-1)
+    args = parse_args(["--seq", "GYDPETGTWG", "--out", str(tmp_path / "o")])
+    assert _selection_config(args, 1200.0, 300.0).gain_resamples == 8
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text("cv_selection:\n  gain_resamples: 0\n")
+    args = parse_args(["--config", str(cfg), "--seq", "GYDPETGTWG", "--out", str(tmp_path / "o")])
+    assert _selection_config(args, 1200.0, 300.0).gain_resamples == 0
