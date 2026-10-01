@@ -171,6 +171,39 @@ def _parent_restraints(parent: Path) -> Optional[Dict[str, List[Optional[float]]
     }
 
 
+def _chain_end_pdb_by_window(parent: Path) -> Dict[int, Path]:
+    """window -> the PDB holding that window's chain END in this segment.
+
+    ``final_pdbs/`` accumulates one file per replica per job that ended in this
+    directory (``replica_r_window_w.pdb``, w = the window replica r held then), so a
+    window can have several files from different jobs. The chain end is the file of
+    the replica the segment's last checkpoint manifest assigns to that window; a
+    window that rule cannot place (no readable ``assignments``, or its file missing)
+    takes its newest file by mtime. Taking the last file in NAME order -- the earlier
+    behaviour -- picked a stale fork for 152-204 of 236 windows per chignolin_9 phase.
+    """
+    pdb_dir = parent / PDB_DIR
+    by_window: Dict[int, List[Path]] = {}
+    for path in pdb_dir.iterdir():
+        match = _PDB_RE.match(path.name)
+        if match is not None:
+            by_window.setdefault(int(match.group(2)), []).append(path)
+    out: Dict[int, Path] = {}
+    try:
+        m = json.loads((parent / "checkpoints" / "production_checkpoint_manifest.json").read_text())
+        assignments = [int(w) for w in m.get("assignments") or []]
+    except Exception:
+        assignments = []
+    for r, w in enumerate(assignments):
+        candidate = pdb_dir / f"replica_{r:03d}_window_{w:03d}.pdb"
+        if candidate.exists():
+            out[w] = candidate
+    for w, paths in by_window.items():
+        if w not in out:
+            out[w] = max(paths, key=lambda p: (p.stat().st_mtime_ns, p.name))
+    return out
+
+
 def pdb_seeds_of_parent(parent) -> Dict[int, PdbSeed]:
     """state_id -> PdbSeed for every ``final_pdbs`` file the parent's window map can place."""
     parent = Path(parent)
@@ -183,11 +216,7 @@ def pdb_seeds_of_parent(parent) -> Dict[int, PdbSeed]:
     state_of_window = state_id_of_window_from_epoch_map(parent)
     n = len(restraints["primary_center"])
     out: Dict[int, PdbSeed] = {}
-    for path in sorted(pdb_dir.iterdir()):
-        match = _PDB_RE.match(path.name)
-        if match is None:
-            continue
-        w = int(match.group(2))
+    for w, path in sorted(_chain_end_pdb_by_window(parent).items()):
         sid = state_of_window.get(w)
         if sid is None or w >= n:
             logger.warning("Extension seeding: %s has no window-map row / restraint for window %d; skipped", path, w)

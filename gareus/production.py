@@ -6440,6 +6440,52 @@ def _seed_topup_windows_from_parent_states(
     return window_start_positions, window_start_velocities, window_start_boxes, seed_by_window
 
 
+def remap_subset_window_indices(pull_dir: Path, missing) -> None:
+    """Renumber a subset pull's per-window report rows (0..n-1 over ``missing``) to full window
+    indices, so report readers that index by window see the right windows. PDB file names keep
+    the subset numbering; ``us_starting_structures_subset.json`` records the mapping."""
+    import csv as _csv
+    full = [int(w) for w in missing]
+
+    def _fix_rows(obj):
+        if isinstance(obj, list):
+            for x in obj:
+                _fix_rows(x)
+        elif isinstance(obj, dict):
+            if "window" in obj and isinstance(obj["window"], (int, float, str)):
+                try:
+                    j = int(obj["window"])
+                    if 0 <= j < len(full):
+                        obj["window"] = full[j]
+                except (TypeError, ValueError):
+                    pass
+            for v in obj.values():
+                if isinstance(v, (list, dict)):
+                    _fix_rows(v)
+
+    for path in sorted(Path(pull_dir).glob("*.json")):
+        try:
+            doc = json.loads(path.read_text())
+        except Exception:
+            continue
+        _fix_rows(doc)
+        write_json(path, doc)
+    for path in sorted(Path(pull_dir).glob("*.csv")):
+        try:
+            with path.open(newline="") as fh:
+                rows = list(_csv.DictReader(fh))
+                fields = list(rows[0].keys()) if rows else []
+        except Exception:
+            continue
+        if "window" not in fields:
+            continue
+        _fix_rows(rows)
+        with path.open("w", newline="") as fh:
+            w = _csv.DictWriter(fh, fieldnames=fields)
+            w.writeheader()
+            w.writerows(rows)
+
+
 def merge_partial_pull(continued_pos, continued_vel, *, missing, pulled_pos, pulled_vel, pulled_dropped):
     """Place a subset pull's results (indexed 0..len(missing)-1) into the full window lists.
 
@@ -6464,16 +6510,21 @@ def _continue_windows_from_parent_ends(
     """--ap-continue-states: continue every window whose state has an earlier end state.
 
     Like :func:`_seed_extension_windows_from_parent_ends` but partial: returns
-    ``(positions, velocities, boxes, state_seed_by_window, pdb_seeded_windows, missing)``
+    ``(positions, velocities, boxes, {}, pdb_seeded_windows, missing, continued_state_windows)``
     where ``missing`` lists the windows with no parent end state (states new to this
-    phase); the caller pulls only those. Raises ``SeedMismatchError`` when a parent's
+    phase; the caller pulls only those) and ``continued_state_windows`` the windows
+    continued from an exported State (velocities kept, no same-phase CV assertion). Raises ``SeedMismatchError`` when a parent's
     restraint for a state disagrees with this phase's.
     """
     info = getattr(args, "_adaptive_phase_info", {}) or {}
     parent_dirs = [Path(p) for p in info.get("continue_parent_dirs") or []]
-    return _seed_windows_from_parent_ends(
+    (positions, velocities, boxes, state_seeds, pdb_windows, missing) = _seed_windows_from_parent_ends(
         parent_dirs, out_dir, nrep, n_atoms, centers_nm, ks_kj_nm2, secondary_cv_centers,
         secondary_cv_ks_kj, centers_a, k_list, secondary_cv_k_kcal_list, label="continue-states")
+    # A continued State crosses a phase boundary, where the CV definition may legitimately
+    # change (tICA refit / CV2 switch with unchanged centres): its recorded CVs are not this
+    # phase's, so it is NOT CV-asserted like a same-phase top-up seed. Its velocities are kept.
+    return positions, velocities, boxes, {}, pdb_windows, missing, set(state_seeds)
 
 
 def _seed_windows_from_parent_ends(
@@ -6977,6 +7028,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         window_start_boxes = [None] * nrep
         topup_seed_by_window: dict = {}
         pdb_seeded_windows: set = set()
+        continued_state_windows: set = set()
     else:
         # Keep pre-production US starting-structure pulling on the previous fixed-box
         # system so changing the default production ensemble does not silently alter
@@ -6989,6 +7041,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         _topup_phase_info = getattr(args, "_adaptive_phase_info", {}) or {}
         is_topup_segment = bool(_topup_phase_info.get("is_topup"))
         pdb_seeded_windows = set()
+        continued_state_windows = set()
         # A frozen-final extension runs the final phase's own window set: continue
         # each window from its newest parent end state instead of re-pulling.
         _extension_seeds = None
@@ -7022,7 +7075,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
 
         if _continue_seeds is not None:
             (_cont_pos, _cont_vel, window_start_boxes, topup_seed_by_window,
-             pdb_seeded_windows, _cont_missing) = _continue_seeds
+             pdb_seeded_windows, _cont_missing, continued_state_windows) = _continue_seeds
             if _cont_missing:
                 starting_structure_system = create_system(app, unit, forcefield, topology, args, include_barostat=False)
                 add_umbrella_cv_forces(openmm, starting_structure_system, topology, primary_cv_def, args,
@@ -7039,7 +7092,9 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     equil_state, primary_cv_def, cv_atom1, cv_atom2, setup_platform, setup_props, progress=progress,
                     secondary_cv_centers=_sub(secondary_cv_centers), secondary_cv_ks_kj=_sub(secondary_cv_ks_kj),
                     secondary_cv_metadata=secondary_cv_metadata, allow_slow_mode_reseed=False,
+                    total_windows=nrep,
                 )
+                remap_subset_window_indices(Path(out_dir) / "us_starting_structures", _cont_missing)
                 window_start_positions, window_start_velocities, dropped_window_indices = merge_partial_pull(
                     _cont_pos, _cont_vel, missing=_cont_missing,
                     pulled_pos=_p_pos, pulled_vel=_p_vel, pulled_dropped=_p_drop or [])
@@ -7109,6 +7164,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                                       for old in _keep]
                 topup_seed_by_window = {_new_of_old[w]: s for w, s in topup_seed_by_window.items() if w in _new_of_old}
                 pdb_seeded_windows = {_new_of_old[w] for w in pdb_seeded_windows if w in _new_of_old}
+                continued_state_windows = {_new_of_old[w] for w in continued_state_windows if w in _new_of_old}
             secondary_cv_metadata = _drop_result["secondary_cv_metadata"]
             window_metadata = _drop_result["window_metadata"]
             # drop_bad_us_windows_and_rebuild recomputed the explicit window table
@@ -7368,7 +7424,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 start_pos = window_start_positions[i] if i < len(window_start_positions) and window_start_positions[i] is not None else pos
                 start_vel = window_start_velocities[i] if i < len(window_start_velocities) and window_start_velocities[i] is not None else vel
                 sim_i.context.setPositions(start_pos)
-                _is_seeded_window = topup_seed_by_window.get(i) is not None
+                _is_seeded_window = topup_seed_by_window.get(i) is not None or i in continued_state_windows
                 if i in pdb_seeded_windows:
                     # Extension seed from a final PDB: coordinates rounded to 1e-3 A
                     # violate rigid-water/HMR constraints slightly, and there are no
@@ -7389,7 +7445,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                         _skipped_velocity_randomization = True
                     sim_i.context.setVelocities(start_vel)
                 set_window(sim_i.context, centers_nm, ks_kj_nm2, i, secondary_cv_centers, secondary_cv_ks_kj)
-                if _is_seeded_window:
+                if topup_seed_by_window.get(i) is not None:
                     # Top-up seeding (task 9): the loaded State must reproduce the CV
                     # values it was exported under. Runs here, right after set_window,
                     # on replica i's own _sim_pool thread -- every context-touching call

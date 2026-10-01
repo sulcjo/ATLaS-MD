@@ -42,3 +42,30 @@ are re-indexed with it. Top-ups, extensions and epoch 0 are unchanged.
 - Related suites pass: 2,324 tests.
 - Real-data dry run: c9 `epoch_002/baseline` and `final/baseline` resolve 236/236 windows from their
   parents' final PDBs (restraints verified, 0 to pull).
+
+## Adversarial review fixes
+
+- **HIGH (verified): stale chain-end PDBs.** `final_pdbs/` accumulates one file per replica per job, and the
+  PDB picker took the last file in name order. That was the wrong (stale) fork for 152–208 of 236 windows per
+  chignolin_9 phase, and it also affected frozen-final extensions: `final_extension_002` was seeded from forks
+  for 208/236 windows.
+  - `_chain_end_pdb_by_window` now takes `replica_r_window_{assignments[r]}` from the segment's last checkpoint
+    manifest, falling back to the newest file by mtime. It picks the true chain end for 236/236 windows in
+    every c9 phase.
+- **Exported States no longer get the CV check.** A continued State crosses a phase boundary, where the CV
+  definition may legitimately change (tICA refit, CV2 switch). It keeps its velocities but skips the
+  same-phase `assert_seed_matches`; the restraint check still applies.
+- **Auto-drop cap over the whole phase.** The cap is now measured against the phase's full window count
+  (`total_windows`), not the pulled subset.
+- **Non-scheduled final phase.** It honours the flag too.
+- **Subset report numbering.** The pulled subset's report rows are renumbered to full window indices
+  (`remap_subset_window_indices`).
+- **X3 warning.** Combining the flag with X3 prints a warning (X3's reseeds of existing windows are never
+  applied).
+- **Provenance.** The flag is recorded in the run manifest.
+
+Known limitations:
+- The explicit-2D seed-reachability pre-filter still runs over all windows before continuation is decided.
+  It could drop an existing state that has no GENPEPT seed nearby; it never fired on c9 and is a no-op with
+  a large `us_seed_preflight_max_score`.
+- Continued windows skip the start-quality gate (they start from their own restraint's end state).

@@ -1769,6 +1769,10 @@ def _shim_adaptive_production(args: argparse.Namespace) -> None:
     args.adaptive_production_max_coupling_fraction = args.ap_max_coupling_fraction
     args.adaptive_production_discovery_census = args.ap_discovery_census
     args.adaptive_production_slow_mode_reseed_fraction = args.ap_slow_mode_reseed_fraction
+    if bool(getattr(args, "ap_continue_states", False)) and float(args.ap_slow_mode_reseed_fraction or 0) > 0:
+        print("WARNING: --ap-continue-states continues existing states from their end states, so "
+              "--ap-slow-mode-reseed-fraction's reseeds of existing windows are computed but never applied.",
+              flush=True)
     args.adaptive_production_edge_metric = args.ap_edge_metric
     args.adaptive_production_cv2_resolution = args.ap_cv2_resolution
     args.adaptive_production_coverage_min_windows = args.ap_coverage_min_windows

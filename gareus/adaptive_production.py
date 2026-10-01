@@ -9591,6 +9591,13 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             final_args.adaptive_feedback_pilot = False
             final_args.adaptive_feedback_final_production = False
             final_args.resume = bool(resume_requested and production_checkpoint_available(final_dir))
+            if bool(getattr(args, "ap_continue_states", False)):
+                # Non-scheduled final phase: continue existing states too (the scheduled path
+                # passes the same parents through run_segment's phase info).
+                setattr(final_args, "_adaptive_phase_info", {
+                    "segment_name": "final",
+                    "continue_parent_dirs": continuation_parent_dirs(adaptive_dir, final_dir, "final", enabled=True),
+                })
             if final_args.resume:
                 print(f"    Adaptive-production final frozen phase: checkpoint manifest found; resuming from {final_dir}")
             if _arg_bool(args, "adaptive_production_trajectories", True) is False:
