@@ -499,6 +499,21 @@ def _selection_config(args, k1_max_kcal: float, temperature_k: float) -> Selecti
     )
 
 
+def _fit_contact_map_cv1(an: Path, dataset, ok_traces, frame_candidates, rd: Path, topology_pdb: Path,
+                         args, warnings: List[str]) -> Dict[str, Any]:
+    """Contact-map CV1 fit (spec 2026-10-01-contact-map-cv1.md section 3). Diagnostic: the CV1
+    design above is unchanged and nothing reads the model yet. Failures are recorded, never raised."""
+    from gareus.swarm.contact_map_cv1_fit import run_fit
+    if not topology_pdb.exists():
+        warnings.append("cv1 contact map: swarm/system/topology.pdb absent; not fitted")
+        return {"status": "error", "error": "topology_missing"}
+    try:
+        return run_fit(an, dataset, ok_traces, frame_candidates, rd, topology_pdb, args, warnings)
+    except Exception as exc:  # diagnostic only; analysis carries on
+        warnings.append(f"cv1 contact map: fit failed ({exc!r})")
+        return {"status": "error", "error": repr(exc)}
+
+
 def _pool_member_ids(ok_traces: Dict[int, Dict[str, np.ndarray]], discard: int) -> np.ndarray:
     """Member id per pooled ``cv1`` row, aligned with ``_pool(ok_traces, "cv1", discard)``: same
     member order, same discard, same finiteness filter (``_pool`` drops non-finite rows)."""
@@ -693,6 +708,9 @@ def analyze_swarm_stage(out_dir, args) -> dict:
         pair_layout: Optional[tuple] = None
         coupling_gate: Optional[Dict[str, Any]] = None
         pair_paths: Optional[dict] = None
+        # A contact-map CV1 fit is only ever this analysis's own: clear any earlier one first.
+        from gareus.swarm.contact_map_cv1_fit import clear_artifacts as _clear_cv1_artifacts
+        _clear_cv1_artifacts(an)
         if secondary_cv_mode(args) == "auto":
             from ..cv_selection import anchor_spec as AS
             contact_pairs = _swarm_contact_pairs(out_dir, args, warnings) if AS.is_contact(anchor_kind) else None
@@ -811,6 +829,12 @@ def analyze_swarm_stage(out_dir, args) -> dict:
             # Written after the layout block so the file carries the 2-D design too.
             write_json(an / "cv_selection_report.json", {**sel.report, **selection})
             report["cv_selection"] = selection
+            if bool(getattr(args, "swarm_cv1_contact_map_fit", False)):
+                report["cv1_contact_map"] = _fit_contact_map_cv1(an, dataset, ok_traces, frame_candidates,
+                                                                 rd, topology_pdb, args, warnings)
+        elif bool(getattr(args, "swarm_cv1_contact_map_fit", False)):
+            warnings.append("cv1 contact map: --swarm-cv1-contact-map-fit needs cv2 auto (the torsion "
+                            "dataset); not fitted")
 
         gate = evaluate_gates(
             rows, set(ok_member_ids), ok_traces, discard, ladder, list(done_summaries.values()),
