@@ -299,6 +299,7 @@ def test_tiny_real_swarm_member_moves_atoms_and_writes_trace_frames_and_done_slo
         contact_r0_a=4.5, contact_beta_a_inv=6.0, contact_normalize=True, contact_pair_warning_threshold=5000,
         swarm_seed_ns=0.002, swarm_equil_ps=0.4, swarm_output_interval_ps=0.2,
         swarm_seed_frame_interval_ps=0.4, swarm_graft_minimize_iters=200,
+        swarm_contact_map_min_separation=1,      # a dipeptide has one residue pair at separation 1
     )
     # 2 fs timestep: 0.4 ps equil = 200 discarded steps; 2 ps production at 0.2 ps/frame =
     # 100 steps/frame x 10 frames; seed-frame export every 0.4 ps = every 2nd frame.
@@ -394,6 +395,16 @@ def test_tiny_real_swarm_member_moves_atoms_and_writes_trace_frames_and_done_slo
     assert first_positions.shape == last_positions.shape, (
         "first seed-frame PDB and the peptide subset of last_frame.pdb have different atom counts"
     )
+    # The residue contact map is recorded row by row with the trace, and its last row is the
+    # final state: recompute it from last_frame.pdb (PDB precision 1e-3 A; soft-min is
+    # 1-Lipschitz in the atom distances, so 2e-3 A bounds the difference).
+    from gareus.swarm import contact_map as CM
+    cm_def = CM.read_index(member_dir / CM.INDEX_NAME)
+    assert cm_def["min_sequence_separation"] == 1 and len(cm_def["pairs"]) == 1
+    cm = np.load(member_dir / CM.FEATURES_NAME)
+    assert cm.shape == (len(trace_rows), 1) and np.all(np.isfinite(cm))
+    recomputed = float(CM.ContactMapEvaluator(cm_def)(last_positions_full)[0])
+    assert abs(float(cm[-1, 0]) - recomputed) <= 2e-3, (cm[-1, 0], recomputed)
     max_disp_nm = float(np.max(np.linalg.norm(last_positions - first_positions, axis=1)))
     print(f"test_tiny_real_swarm_member ... max_disp_nm={max_disp_nm:.4f}")
     assert max_disp_nm > 1e-3, (

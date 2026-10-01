@@ -316,6 +316,8 @@ def _method_settings(args: Any) -> dict[str, Any]:
         "swarm_max_seed_gap_sigma", "shared_gamd_setup_dir",
         "swarm_stability_sigma_rel_tol", "swarm_stability_extrema_sigma_tol",
         "swarm_min_done_fraction", "swarm_max_graft_fallback_fraction",
+        # Residue contact map recorded per member (contact-map CV1 spec step 1).
+        "swarm_contact_map_min_separation", "swarm_contact_map_lambda_a",
         # Frozen CV2 pair model, plan 2026-09-20-auto-cv-pair.
         "secondary_cv_model", "secondary_cv_candidate_set", "secondary_cv_feature_schema",
         "cv_selection_residual_degree", "cv_selection_max_nonlinear_r2",

@@ -998,6 +998,13 @@ def _add_swarm_args(p: argparse.ArgumentParser) -> None:
                    help="Discarded-by-construction equilibration per member, in ps.")
     p.add_argument("--swarm-output-interval-ps", type=float, default=2.0,
                    help="Per-member trace cadence, in ps (spec section 5).")
+    p.add_argument("--swarm-contact-map-min-separation", type=int, default=3,
+                   help="Residue contact map recorded per swarm trace row (contact_map_features.npy): "
+                        "residue pairs at least this far apart in sequence (default 3: calibrated "
+                        "2026-10-01, indistinguishable from 2 with fewer pairs).")
+    p.add_argument("--swarm-contact-map-lambda-a", type=float, default=0.2,
+                   help="Soft-min width (A) of the recorded residue contact map: d_ij = -lambda ln "
+                        "sum exp(-r_ab/lambda) over the two residues' heavy atoms.")
     p.add_argument("--swarm-seed-frame-interval-ps", type=float, default=20.0,
                    help="PDB frame cadence for seed export, in ps.")
     p.add_argument("--swarm-graft-minimize-iters", type=int, default=500,
@@ -2069,6 +2076,11 @@ def parse_args(argv: Optional[Iterable[str]] = None):
     _validate_gamd_args(args)
     _validate_fsf_clamp_args(p, args)
     _validate_cv_selection_args(p, args)
+    if int(getattr(args, "swarm_contact_map_min_separation", 3)) < 1:
+        p.error("--swarm-contact-map-min-separation must be >= 1")
+    _cm_lam = float(getattr(args, "swarm_contact_map_lambda_a", 0.2))
+    if not (math.isfinite(_cm_lam) and _cm_lam > 0.0):
+        p.error("--swarm-contact-map-lambda-a must be positive and finite")
     _validate_npt_args(args)
     _validate_replica_admission_args(args)
     if int(getattr(args, "checkpoint_keep_generations", 0) or 0) < 0:

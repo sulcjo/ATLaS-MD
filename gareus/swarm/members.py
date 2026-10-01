@@ -16,7 +16,7 @@ import json
 import re
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -81,6 +81,7 @@ def run_member_loop(
     timestep_ps: float = 0.004,
     feature_fn: Optional[Callable[[], Any]] = None,
     features_path: Optional[Path] = None,
+    extra_features: Optional[Sequence[Tuple[Callable[[], Any], Path]]] = None,
 ) -> dict:
     """Pure bookkeeping: equilibrate (discarded), then step/measure/write in chunks.
 
@@ -92,6 +93,8 @@ def run_member_loop(
     ``feature_fn()``, when given, returns one row of canonical torsion features measured on
     the SAME frame as the trace row; the rows are stacked and written atomically to
     ``features_path`` after the loop, so row ``i`` of the features is trace row ``i``.
+    ``extra_features`` = further ``(fn, path)`` streams recorded the same way (e.g. the residue
+    contact map, ``gareus.swarm.contact_map``); each is measured right after ``feature_fn``.
     """
     if n_prod_steps % steps_per_frame:
         raise ValueError(f"n_prod_steps={n_prod_steps} not divisible by steps_per_frame={steps_per_frame}")
@@ -103,6 +106,8 @@ def run_member_loop(
         step_fn(int(n_equil_steps))  # discarded by construction; never enters the trace
     n_frames = n_prod_steps // steps_per_frame
     feature_rows: list = []
+    extra = list(extra_features or [])
+    extra_rows: list = [[] for _ in extra]
     with trace_path.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=TRACE_COLUMNS)
         w.writeheader()
@@ -111,6 +116,8 @@ def run_member_loop(
             row = dict(measure_fn())
             if feature_fn is not None:
                 feature_rows.append(np.asarray(feature_fn(), dtype=np.float64))
+            for k, (fn, _path) in enumerate(extra):
+                extra_rows[k].append(np.asarray(fn(), dtype=np.float64))
             row["frame"] = i
             row["t_ps"] = (i + 1) * steps_per_frame * timestep_ps
             w.writerow({k: row.get(k, "") for k in TRACE_COLUMNS})
@@ -119,6 +126,8 @@ def run_member_loop(
                 write_frame_fn(i)
     if feature_fn is not None:
         _write_features_atomic(Path(features_path), feature_rows)
+    for (_fn, path), rows in zip(extra, extra_rows):
+        _write_features_atomic(Path(path), rows)
     return {"n_frames": n_frames, "n_equil_steps": int(n_equil_steps), "n_prod_steps": int(n_prod_steps)}
 
 
@@ -203,6 +212,7 @@ def _run_loop_recording_failure(
     t0: float,
     feature_fn: Optional[Callable[[], Any]] = None,
     features_path: Optional[Path] = None,
+    extra_features: Optional[Sequence[Tuple[Callable[[], Any], Path]]] = None,
 ) -> dict:
     """Run ``run_member_loop``; a mid-loop exception is a failed member, never re-raised.
 
@@ -216,7 +226,7 @@ def _run_loop_recording_failure(
             n_equil_steps=n_equil_steps, n_prod_steps=n_prod_steps, steps_per_frame=steps_per_frame,
             seed_frame_every=seed_frame_every, step_fn=step_fn, measure_fn=measure_fn,
             write_frame_fn=write_frame_fn, trace_path=trace_path, timestep_ps=timestep_ps,
-            feature_fn=feature_fn, features_path=features_path,
+            feature_fn=feature_fn, features_path=features_path, extra_features=extra_features,
         )
     except Exception as exc:
         frames_written = _count_trace_rows(trace_path)
@@ -329,6 +339,15 @@ def run_member(
         "phi_torsions": [list(map(int, t)) for t in phi_torsions],
         "psi_torsions": [list(map(int, t)) for t in psi_torsions],
     })
+    # Residue contact map per trace row (contact-map CV1 spec step 1): soft-min heavy-atom
+    # distances of residue pairs >= 3 apart; the definition travels with the features.
+    from gareus.swarm.contact_map import (FEATURES_NAME as CM_FEATURES, INDEX_NAME as CM_INDEX,
+                                          ContactMapEvaluator, contact_map_definition, write_index)
+    cm_definition = contact_map_definition(
+        topology, min_sequence_separation=int(getattr(args, "swarm_contact_map_min_separation", 3)),
+        lambda_angstrom=float(getattr(args, "swarm_contact_map_lambda_a", 0.2)))
+    write_index(member_dir / CM_INDEX, cm_definition)
+    cm_eval = ContactMapEvaluator(cm_definition)
     last_positions: dict = {}
 
     def step_fn(n):
@@ -343,6 +362,9 @@ def run_member(
     def feature_fn():
         return backbone_dihedral_features(last_positions["nm"], phi_torsions, psi_torsions)
 
+    def contact_map_fn():
+        return cm_eval(last_positions["nm"])
+
     def write_frame_fn(i):
         state = sim.context.getState(getPositions=True, enforcePeriodicBox=True)
         frame_path = member_dir / "frames" / f"frame_{i:05d}.pdb"
@@ -354,6 +376,7 @@ def run_member(
         write_frame_fn=write_frame_fn, trace_path=member_dir / "trace.csv", timestep_ps=timestep_ps,
         member_dir=member_dir, member_id=member_row.get("member_id"), crash_label="swarm", t0=t0,
         feature_fn=feature_fn, features_path=member_dir / "torsion_features.npy",
+        extra_features=[(contact_map_fn, member_dir / CM_FEATURES)],
     )
     if result["failed"]:
         done = result["done"]
