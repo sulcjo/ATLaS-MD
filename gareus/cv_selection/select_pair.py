@@ -49,6 +49,7 @@ from .pair_model import CERTIFICATE_VERSION_V2, PAIR_MODEL_VERSION_V2, PairModel
 from .protocol import NATIVE_BLIND_GENERATOR_PRESETS
 
 DESIGN_MEASURE = "balanced_frame_cells"
+PICK_RULES = ("breadth-tie-slowest", "slowest")
 
 
 @dataclass(frozen=True)
@@ -88,6 +89,14 @@ class SelectionConfig:
     # (demonstrably uninformative). 0 = the single historical assignment (rule before
     # 2026-10-01). The single draw moves by +-0.02-0.05 nats on chignolin's swarm.
     gain_resamples: int = 8
+    # Slowness ranking, among deployable candidates: "breadth-tie-slowest" (default since
+    # 2026-10-01) takes every candidate whose fold-averaged gain is within breadth_tie_sd
+    # combined sd of the broadest one, then the slowest of that tie-set; "slowest" ignores
+    # breadth (the rule before). Breadth separates the top candidates by less than its own
+    # noise on chignolin's swarm (0.07 nats vs sd 0.14 at 112 seed families) while the
+    # slowness order is stable, so breadth defines the set and slowness decides inside it.
+    pick_rule: str = "breadth-tie-slowest"
+    breadth_tie_sd: float = 1.0
     min_bimodality: float = 5.0 / 9.0        # Sarle's coefficient of a uniform distribution
     half_split_min_corr: float = 0.8
     n_cells_slowness: int = 8
@@ -95,6 +104,10 @@ class SelectionConfig:
     def __post_init__(self):
         if int(self.gain_resamples) < 0:
             raise ValueError("gain_resamples must be >= 0")
+        if self.pick_rule not in PICK_RULES:
+            raise ValueError(f"pick_rule must be one of {PICK_RULES}, got {self.pick_rule!r}")
+        if not float(self.breadth_tie_sd) >= 0.0:
+            raise ValueError("breadth_tie_sd must be >= 0")
 
 
 @dataclass(frozen=True)
@@ -217,13 +230,34 @@ def _score_components(fit: ResidualFit, X, a, z1, cells_fine, groups, cfg: Selec
     return scores
 
 
+def breadth_tie_set(deployable: Mapping[int, dict], cfg: SelectionConfig) -> set:
+    """Deployable candidates whose breadth is indistinguishable from the broadest one.
+
+    Breadth = the fold-averaged information gain (``gain_nats_mean`` +- ``gain_nats_sd``).
+    j joins when mean_j >= mean_best - breadth_tie_sd * sqrt(sd_best^2 + sd_j^2). Without
+    resampled gains (gain_resamples 0) or with pick_rule "slowest" every candidate is in the set.
+    """
+    if cfg.pick_rule != "breadth-tie-slowest" or not deployable or not all(
+            "gain_nats_mean" in s for s in deployable.values()):
+        return set(deployable)
+    mean = {j: float(s["gain_nats_mean"]) for j, s in deployable.items()}
+    sd = {j: float(s["gain_nats_sd"]) for j, s in deployable.items()}
+    broad = max(deployable, key=lambda j: (mean[j], -j))
+    k = float(cfg.breadth_tie_sd)
+    return {j for j in deployable if mean[j] >= mean[broad] - k * float(np.hypot(sd[broad], sd[j]))}
+
+
 def _pick(scores: Mapping[int, dict], cfg: SelectionConfig, ranking: str = "gain") -> tuple[Optional[int], str]:
     deployable = {j: s for j, s in scores.items() if s["deployable"]}
     if ranking == "slowness":
         if not deployable:
             return None, ("no component passed the R2, coupling, gain, slowness, bimodality and "
                           "seed-half reproducibility gates at fixed CV1")
-        best = max(deployable, key=lambda j: (deployable[j]["slowness_rho"], -j))
+        tie = breadth_tie_set(deployable, cfg)
+        best = max(tie, key=lambda j: (deployable[j]["slowness_rho"], -j))
+        if len(tie) < len(deployable):
+            return best, (f"slowest of the breadth tie-set {sorted(tie)} (fold-averaged gain within "
+                          f"{cfg.breadth_tie_sd:g} sd of the broadest) among deployable {sorted(deployable)}")
         return best, "slowest reproducible deployable component at fixed CV1 (lag autocorrelation)"
     if not deployable:
         return None, "no component passed the nonlinear-R2 and coupling gates"

@@ -494,6 +494,8 @@ def _selection_config(args, k1_max_kcal: float, temperature_k: float) -> Selecti
         min_bimodality=float(getattr(args, "cv_selection_min_bimodality", 5.0 / 9.0)),
         half_split_min_corr=float(getattr(args, "cv_selection_half_split_min_corr", 0.8)),
         gain_resamples=int(getattr(args, "cv_selection_gain_resamples", 8)),
+        pick_rule=str(getattr(args, "cv_selection_pick", "breadth-tie-slowest") or "breadth-tie-slowest"),
+        breadth_tie_sd=float(getattr(args, "cv_selection_breadth_tie_sd", 1.0)),
     )
 
 
