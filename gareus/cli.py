@@ -1005,6 +1005,14 @@ def _add_swarm_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--swarm-contact-map-lambda-a", type=float, default=0.2,
                    help="Soft-min width (A) of the recorded residue contact map: d_ij = -lambda ln "
                         "sum exp(-r_ab/lambda) over the two residues' heavy atoms.")
+    p.add_argument("--swarm-cv1-contact-map-fit", action="store_true",
+                   help="Swarm analyze (with cv2 auto): fit the contact-map tICA CV1 (spec "
+                        "2026-10-01-contact-map-cv1.md) and write analysis/cv1_model.json + "
+                        "cv1_selection_report.json. Diagnostic: the CV1 design is unchanged and no "
+                        "production mode reads the model yet.")
+    p.add_argument("--swarm-cv1-contact-map-r0-a", type=float, default=4.5,
+                   help="Rational switch r0 (A) turning the recorded soft-min residue distances into "
+                        "contacts, 1/(1 + (d/r0)^6) (calibrated 2026-10-01).")
     p.add_argument("--swarm-seed-frame-interval-ps", type=float, default=20.0,
                    help="PDB frame cadence for seed export, in ps.")
     p.add_argument("--swarm-graft-minimize-iters", type=int, default=500,
@@ -2081,6 +2089,9 @@ def parse_args(argv: Optional[Iterable[str]] = None):
     _cm_lam = float(getattr(args, "swarm_contact_map_lambda_a", 0.2))
     if not (math.isfinite(_cm_lam) and _cm_lam > 0.0):
         p.error("--swarm-contact-map-lambda-a must be positive and finite")
+    _cm_r0 = float(getattr(args, "swarm_cv1_contact_map_r0_a", 4.5))
+    if not (math.isfinite(_cm_r0) and _cm_r0 > 0.0):
+        p.error("--swarm-cv1-contact-map-r0-a must be positive and finite")
     _validate_npt_args(args)
     _validate_replica_admission_args(args)
     if int(getattr(args, "checkpoint_keep_generations", 0) or 0) < 0:
