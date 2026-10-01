@@ -40,6 +40,28 @@ DEFAULT_MIN_SEQUENCE_SEPARATION = 3
 DEFAULT_LAMBDA_ANGSTROM = 0.2
 FEATURES_NAME = "contact_map_features.npy"
 INDEX_NAME = "contact_map_index.json"
+#: Atom selections. "heavy": soft-min over the residues' heavy atoms (the 2026-10-01 calibration
+#: definition); "ca": the C-alpha distance (soft-min of one atom pair = the distance itself). The CA
+#: map is what production runs as CV1: additive over residue pairs, so it has a cheap force that is
+#: exact on GPU (the heavy soft-min has none in plain OpenMM, see gareus/contact_map_force.py).
+ATOMS_HEAVY = "heavy"
+ATOMS_CA = "ca"
+CA_QUANTITY = "ca_distance_angstrom"
+CA_FEATURES_NAME = "ca_map_features.npy"
+CA_INDEX_NAME = "ca_map_index.json"
+
+
+def file_names(atoms: str = ATOMS_HEAVY) -> tuple:
+    """(features, index) file names of a member's map for an atom selection."""
+    if atoms == ATOMS_CA:
+        return CA_FEATURES_NAME, CA_INDEX_NAME
+    if atoms == ATOMS_HEAVY:
+        return FEATURES_NAME, INDEX_NAME
+    raise ValueError(f"unknown contact-map atom selection {atoms!r}")
+
+
+def definition_atoms(definition: Mapping[str, Any]) -> str:
+    return str(definition.get("atom_selection", ATOMS_HEAVY))
 
 
 _H_NAME = re.compile(r"^\d*H")       # H, HA, 1HB, 2HD1 ... (PDB-style names) when no element
@@ -54,8 +76,10 @@ def _is_hydrogen(atom) -> bool:
 
 
 def contact_map_definition(topology, *, min_sequence_separation: int = DEFAULT_MIN_SEQUENCE_SEPARATION,
-                           lambda_angstrom: float = DEFAULT_LAMBDA_ANGSTROM) -> Dict[str, Any]:
-    """The residue pairs and heavy atoms of the contact map for ``topology`` (JSON-safe)."""
+                           lambda_angstrom: float = DEFAULT_LAMBDA_ANGSTROM, atoms: str = ATOMS_HEAVY) -> Dict[str, Any]:
+    """The residue pairs and their atoms (heavy atoms, or the C-alpha) for ``topology`` (JSON-safe).
+
+    The heavy-atom definition keeps its historical bytes (no ``atom_selection`` field)."""
     from ..cv import peptide_residues
 
     sep = int(min_sequence_separation)
@@ -65,13 +89,22 @@ def contact_map_definition(topology, *, min_sequence_separation: int = DEFAULT_M
     if not lam > 0.0:
         raise ValueError("lambda_angstrom must be > 0")
     residues = peptide_residues(topology)
-    heavy = [[int(a.index) for a in res.atoms() if not _is_hydrogen(a)] for res in residues]
+    file_names(atoms)
+    if atoms == ATOMS_CA:
+        # residues without exactly one CA (caps such as ACE/NME) are not part of the CA map; the
+        # sequence separation counts the remaining residues
+        residues = [r for r in residues if sum(1 for a in r.atoms() if str(a.name).strip() == "CA") == 1]
+        heavy = [[int(a.index) for a in res.atoms() if str(a.name).strip() == "CA"] for res in residues]
+    else:
+        heavy = [[int(a.index) for a in res.atoms() if not _is_hydrogen(a)] for res in residues]
     if any(not h for h in heavy):
         raise ValueError("a peptide residue has no heavy atom")
     pairs = [{"i": i, "j": j, "atoms_i": heavy[i], "atoms_j": heavy[j]}
              for i in range(len(residues)) for j in range(i + sep, len(residues))]
     body = {
-        "schema": SCHEMA, "quantity": QUANTITY, "min_sequence_separation": sep, "lambda_angstrom": lam,
+        "schema": SCHEMA, "quantity": CA_QUANTITY if atoms == ATOMS_CA else QUANTITY,
+        **({"atom_selection": ATOMS_CA} if atoms == ATOMS_CA else {}),
+        "min_sequence_separation": sep, "lambda_angstrom": lam,
         "residues": [{"index": k, "name": str(r.name), "id": str(r.id)} for k, r in enumerate(residues)],
         "pairs": pairs,
     }
@@ -136,16 +169,19 @@ def read_index(path) -> Dict[str, Any]:
     return data
 
 
-def load_member_contact_map(member_dir):
-    """(features, definition) of one member, held to each other: the index's digest and the
-    feature width = its pair count. None when the member predates the contact map (a round
-    resumed across the 2026-10-01 deploy can mix members with and without it)."""
+def load_member_contact_map(member_dir, atoms: str = ATOMS_HEAVY):
+    """(features, definition) of one member's map for ``atoms``, held to each other: the index's
+    digest and the feature width = its pair count. None when the member predates that map (a round
+    resumed across the 2026-10-01 deploys can mix members with and without it)."""
     from pathlib import Path
     member_dir = Path(member_dir)
-    feats, index = member_dir / FEATURES_NAME, member_dir / INDEX_NAME
+    f_name, i_name = file_names(atoms)
+    feats, index = member_dir / f_name, member_dir / i_name
     if not (feats.exists() and index.exists()):
         return None
     definition = read_index(index)
+    if definition_atoms(definition) != atoms:
+        raise ValueError(f"{index}: atom selection {definition_atoms(definition)!r}, expected {atoms!r}")
     X = np.load(feats)
     if X.ndim != 2 or X.shape[1] != len(definition["pairs"]):
         raise ValueError(f"{feats}: shape {X.shape} does not match {len(definition['pairs'])} pairs in {index}")
@@ -158,7 +194,8 @@ def pair_labels(definition: Mapping[str, Any]) -> List[str]:
             for p in definition["pairs"]]
 
 
-__all__ = ["DEFAULT_LAMBDA_ANGSTROM", "DEFAULT_MIN_SEQUENCE_SEPARATION", "FEATURES_NAME", "INDEX_NAME",
+__all__ = ["ATOMS_CA", "ATOMS_HEAVY", "CA_FEATURES_NAME", "CA_INDEX_NAME", "CA_QUANTITY", "definition_atoms",
+           "file_names", "DEFAULT_LAMBDA_ANGSTROM", "DEFAULT_MIN_SEQUENCE_SEPARATION", "FEATURES_NAME", "INDEX_NAME",
            "QUANTITY", "SCHEMA", "ContactMapEvaluator", "contact_map_definition", "load_member_contact_map",
            "pair_labels", "read_index",
            "soft_min_distance", "write_index"]

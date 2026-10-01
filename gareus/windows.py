@@ -1098,6 +1098,9 @@ def broadcast_contact_k_for_centers(args, centers_c) -> tuple[list[float], str]:
     return k_list, "manual-per-window"
 
 def choose_windows(args, out_dir: Path, openmm, app, unit, forcefield, topology, equil_state, cv_atom1: int, cv_atom2: int, progress: Optional[GuiProgressSink] = None) -> tuple[np.ndarray, list[float], dict]:
+    if primary_cv_mode(args) == "contact-map":
+        raise ValueError("--cv1 contact-map needs an explicit window table (windows_2d_csv); automatic window "
+                         "design works in contact-fraction or distance terms only")
     if primary_cv_is_contacts(args):
         mode = str(getattr(args, "window_mode", "manual") or "manual")
         if mode == "manual":
@@ -1276,7 +1279,16 @@ def load_explicit_2d_window_csv(args, path: Path) -> tuple[np.ndarray, list[floa
     all_secondary = True
     type_counts: dict[str, int] = {}
 
+    _run_mode = primary_cv_mode(args)
+    _mode_column = str(getattr(args, "explicit_2d_primary_cv_mode_column", "primary_cv_mode") or "primary_cv_mode")
     for offset, row in enumerate(rows, start=2):
+        # A table designed for one CV1 kind never runs under another when a contact-map CV1 is
+        # involved (its centres are standardised tICA units; contacts/distance read them as
+        # fractions or A). Other kind pairs keep the historical behaviour (column not checked).
+        _row_mode = str(row.get(_mode_column, "") or "").strip()
+        if _row_mode and "contact-map" in (_run_mode, primary_cv_mode(_row_mode)) and primary_cv_mode(_row_mode) != _run_mode:
+            raise ValueError(f"explicit 2D window CSV row {offset}: {_mode_column} {_row_mode!r} but this run's CV1 is "
+                             f"{_run_mode!r}; the window table belongs to another CV1")
         primary_center_columns = [
             "primary_cv_center", "primary_center", "primary_center_cv", "primary_cv_value",
             "contact_cv_center", "contact_center", "primary_contact_center",
@@ -1300,6 +1312,8 @@ def load_explicit_2d_window_csv(args, path: Path) -> tuple[np.ndarray, list[floa
                 default_primary_k = float(_manual_contact_k[0])
             else:
                 default_primary_k = float(getattr(args, "contact_adaptive_default_k_kcal", getattr(args, "contact_adaptive_min_k_kcal", 25.0)) or 25.0)
+        elif primary_cv_mode(args) == "contact-map":
+            default_primary_k = None       # no meaningful default in standardised units: required
         else:
             default_primary_k = float(getattr(args, "default_window_k_kcal_a2", 1.0) or 1.0)
         k = _csv_float_field(

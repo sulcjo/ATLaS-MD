@@ -79,6 +79,8 @@ NATIVE_BLIND_CV_KINDS = frozenset({
     "nonlocal-contact-fraction",
     "radius-of-gyration",
     "end-to-end-distance",
+    # reference-free: tICA of the swarm's own residue contact map (spec 2026-10-01-contact-map-cv1.md)
+    "contact-map-component",
     "torsion-pca-component",
     "quadratic-residual-torsion-pc",
 })

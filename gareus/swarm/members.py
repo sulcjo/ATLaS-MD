@@ -341,13 +341,18 @@ def run_member(
     })
     # Residue contact map per trace row (contact-map CV1 spec step 1): soft-min heavy-atom
     # distances of residue pairs >= 3 apart; the definition travels with the features.
-    from gareus.swarm.contact_map import (FEATURES_NAME as CM_FEATURES, INDEX_NAME as CM_INDEX,
-                                          ContactMapEvaluator, contact_map_definition, write_index)
-    cm_definition = contact_map_definition(
-        topology, min_sequence_separation=int(getattr(args, "swarm_contact_map_min_separation", 3)),
-        lambda_angstrom=float(getattr(args, "swarm_contact_map_lambda_a", 0.2)))
-    write_index(member_dir / CM_INDEX, cm_definition)
-    cm_eval = ContactMapEvaluator(cm_definition)
+    # Also the C-alpha distance map (same residue pairs): the CV1 production runs (contact-map
+    # spec, 2026-10-01 GPU decision).
+    from gareus.swarm.contact_map import (ATOMS_CA, ATOMS_HEAVY, ContactMapEvaluator, contact_map_definition,
+                                          file_names, write_index)
+    cm_streams = []
+    for atoms in (ATOMS_HEAVY, ATOMS_CA):
+        cm_definition = contact_map_definition(
+            topology, min_sequence_separation=int(getattr(args, "swarm_contact_map_min_separation", 3)),
+            lambda_angstrom=float(getattr(args, "swarm_contact_map_lambda_a", 0.2)), atoms=atoms)
+        f_name, i_name = file_names(atoms)
+        write_index(member_dir / i_name, cm_definition)
+        cm_streams.append((ContactMapEvaluator(cm_definition), member_dir / f_name))
     last_positions: dict = {}
 
     def step_fn(n):
@@ -362,8 +367,8 @@ def run_member(
     def feature_fn():
         return backbone_dihedral_features(last_positions["nm"], phi_torsions, psi_torsions)
 
-    def contact_map_fn():
-        return cm_eval(last_positions["nm"])
+    def map_fn(evaluator):
+        return lambda: evaluator(last_positions["nm"])
 
     def write_frame_fn(i):
         state = sim.context.getState(getPositions=True, enforcePeriodicBox=True)
@@ -376,7 +381,7 @@ def run_member(
         write_frame_fn=write_frame_fn, trace_path=member_dir / "trace.csv", timestep_ps=timestep_ps,
         member_dir=member_dir, member_id=member_row.get("member_id"), crash_label="swarm", t0=t0,
         feature_fn=feature_fn, features_path=member_dir / "torsion_features.npy",
-        extra_features=[(contact_map_fn, member_dir / CM_FEATURES)],
+        extra_features=[(map_fn(ev), path) for ev, path in cm_streams],
     )
     if result["failed"]:
         done = result["done"]

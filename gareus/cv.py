@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import math
 import warnings
-from typing import Optional, Iterable, Tuple, List, Dict, Any
+from pathlib import Path
+from typing import Optional, Iterable, Tuple, List, Dict, Any, Mapping
 
 import numpy as np
 
@@ -75,6 +76,10 @@ __all__ = [
 # Primary CV helpers
 # ---------------------------------------------------------------------------
 
+#: Fitted contact-map tICA CV1 (spec 2026-10-01-contact-map-cv1.md; model from swarm analyze).
+CONTACT_MAP_MODE = "contact-map"
+
+
 def primary_cv_mode(args_or_mode) -> str:
     """Return the canonical primary umbrella CV mode.
 
@@ -90,7 +95,7 @@ def primary_cv_mode(args_or_mode) -> str:
             mode = args_or_mode.get("primary_cv")
         else:
             maybe_mode = str(args_or_mode.get("mode", "distance") or "distance").strip().lower().replace("_", "-")
-            mode = maybe_mode if maybe_mode in {"distance", "nonlocal-contacts"} else "distance"
+            mode = maybe_mode if maybe_mode in {"distance", "nonlocal-contacts", CONTACT_MAP_MODE} else "distance"
     else:
         mode = getattr(args_or_mode, "primary_cv", "distance")
     mode = str(mode or "distance").strip().lower().replace("_", "-")
@@ -101,8 +106,24 @@ def primary_cv_mode(args_or_mode) -> str:
         "nonlocal-contact": "nonlocal-contacts",
         "nonlocal-contact-fraction": "nonlocal-contacts",
         "contact-fraction": "nonlocal-contacts",
+        "contactmap": CONTACT_MAP_MODE,
+        "contact-map-tica": CONTACT_MAP_MODE,
+        "contact-map-component": CONTACT_MAP_MODE,
     }
     return aliases.get(mode, mode)
+
+
+def primary_cv_is_contact_map(args_or_mode) -> bool:
+    """Return True for the fitted contact-map tICA CV1 (``--cv1 contact-map --cv1-model``)."""
+    return primary_cv_mode(args_or_mode) == CONTACT_MAP_MODE
+
+
+def primary_cv_is_dimensionless(args_or_mode) -> bool:
+    """True when the CV1 value is used as is (no A -> nm factor; k in kcal/mol/CV^2).
+
+    Only the units: the [0, 1] range, ``contact_normalize`` and the single weighted
+    CustomBondForce of the contact fraction stay ``primary_cv_is_contacts`` alone."""
+    return primary_cv_is_contacts(args_or_mode) or primary_cv_is_contact_map(args_or_mode)
 
 
 def primary_cv_is_contacts(args_or_mode) -> bool:
@@ -119,6 +140,8 @@ def primary_cv_label(args_or_mode) -> str:
     """Return a human‑readable label for the selected primary CV."""
     if isinstance(args_or_mode, dict) and args_or_mode.get("label"):
         return str(args_or_mode.get("label"))
+    if primary_cv_is_contact_map(args_or_mode):
+        return "contact-map tICA CV1"
     if primary_cv_is_contacts(args_or_mode):
         normalized = True
         if not isinstance(args_or_mode, str):
@@ -137,6 +160,8 @@ def primary_cv_units(args_or_mode) -> str:
     """
     if isinstance(args_or_mode, dict) and args_or_mode.get("units"):
         return str(args_or_mode.get("units"))
+    if primary_cv_is_contact_map(args_or_mode):
+        return "dimensionless"
     if primary_cv_is_contacts(args_or_mode):
         normalized = True
         if not isinstance(args_or_mode, str):
@@ -151,7 +176,7 @@ def primary_k_units(args_or_mode) -> str:
     """Return the user‑facing units for the primary umbrella force constant."""
     if isinstance(args_or_mode, dict) and args_or_mode.get("k_units"):
         return str(args_or_mode.get("k_units"))
-    if primary_cv_is_contacts(args_or_mode):
+    if primary_cv_is_dimensionless(args_or_mode):
         return "kcal/mol/CV^2"
     return "kcal/mol/A^2"
 
@@ -160,7 +185,7 @@ def primary_openmm_k_units(args_or_mode) -> str:
     """Return the OpenMM units for the primary umbrella force constant."""
     if isinstance(args_or_mode, dict) and args_or_mode.get("openmm_k_units"):
         return str(args_or_mode.get("openmm_k_units"))
-    if primary_cv_is_contacts(args_or_mode):
+    if primary_cv_is_dimensionless(args_or_mode):
         return "kJ/mol/CV^2"
     return "kJ/mol/nm^2"
 
@@ -171,7 +196,7 @@ def primary_center_to_openmm_value(center: float, args_or_mode) -> float:
     For distance CVs the user units are Å, so multiply by 0.1 to obtain nm.
     For nonlocal contacts the center is dimensionless and returned unchanged.
     """
-    if primary_cv_is_contacts(args_or_mode):
+    if primary_cv_is_dimensionless(args_or_mode):
         return float(center)
     return float(center) * 0.1
 
@@ -182,7 +207,7 @@ def primary_k_to_openmm_value(k_user: float, args_or_mode) -> float:
     For distance CVs the user units are kcal/mol/Å²; convert to kJ/mol/nm².
     For nonlocal contacts the user units are kcal/mol/CV²; convert to kJ/mol/CV².
     """
-    if primary_cv_is_contacts(args_or_mode):
+    if primary_cv_is_dimensionless(args_or_mode):
         return kcal_to_kj(k_user)
     return kcal_a2_to_kj_nm2(k_user)
 
@@ -212,7 +237,7 @@ def contact_us_pull_k_user(args, requested_legacy_k: float) -> float:
 
 def primary_delta_label(args_or_mode) -> str:
     """Return a short label for a primary‑CV deviation (``delta_CV`` or ``delta_A``)."""
-    return "delta_CV" if primary_cv_is_contacts(args_or_mode) else "delta_A"
+    return "delta_CV" if primary_cv_is_dimensionless(args_or_mode) else "delta_A"
 
 
 def primary_cv_axis_label(args_or_mode, include_legacy: bool = False) -> str:
@@ -1072,7 +1097,90 @@ def prepare_primary_cv_definition(
             "_np_beta_nm_inv": _beta_nm_inv,
             "_np_norm_denom": _norm_denom,
         }
+    if mode == CONTACT_MAP_MODE:
+        return contact_map_primary_cv_definition(topology, args, cv_atom1, cv_atom2, cv_label)
     raise ValueError(f"Unsupported --primary-cv {mode!r}")
+
+
+def swarm_member_cv_args(args):
+    """``args`` for the swarm stage's own CV1: the heavy contacts (its stratification coordinate).
+
+    A contact-map campaign's CV1 does not exist before epoch 0 fits it, so the swarm members,
+    seed descriptors and contact pair list always use contacts; every other CV1 passes through."""
+    if not primary_cv_is_contact_map(args):
+        return args
+    import copy
+    out = copy.copy(args)
+    out.primary_cv = "nonlocal-contacts"
+    out.cv1 = "contacts"
+    return out
+
+
+def load_cv1_model_for_args(args) -> Tuple[Dict[str, Any], str]:
+    """(model, absolute path) of ``--cv1-model``; refuses a missing file, a bad digest and a
+    sha different from the one a resumed run recorded (``args.cv1_model_sha256_expected``)."""
+    from .cv_selection.contact_map_cv1 import read_model
+    raw = str(getattr(args, "cv1_model", "") or "")
+    if not raw:
+        raise ValueError("--cv1 contact-map needs --cv1-model PATH (swarm/analysis/cv1_model.json)")
+    path = Path(raw).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"--cv1-model {path} does not exist")
+    model = read_model(path)
+    expected = str(getattr(args, "cv1_model_sha256_expected", "") or "")
+    if expected and expected != model["sha256"]:
+        raise RuntimeError(f"--cv1-model {path} has sha256 {model['sha256'][:12]}..., the run recorded "
+                           f"{expected[:12]}...; a resume must use the model it started with")
+    return model, str(path)
+
+
+def contact_map_primary_cv_definition(topology, args, cv_atom1=None, cv_atom2=None, cv_label=None) -> Dict[str, Any]:
+    """The contact-map CV1 definition: model path + sha, checked against ``topology``.
+
+    The model's residue pairs and heavy atoms must be exactly what this topology yields for the
+    model's own separation and lambda (same peptide, same atom order), else the run refuses."""
+    from .swarm.contact_map import contact_map_definition
+    model, path = load_cv1_model_for_args(args)
+    cmap = model["contact_map"]
+    from .swarm.contact_map import definition_atoms
+    from .contact_map_force import require_single_atom_pairs
+    mine = contact_map_definition(topology, min_sequence_separation=int(cmap["min_sequence_separation"]),
+                                  lambda_angstrom=float(cmap["lambda_angstrom"]), atoms=definition_atoms(cmap))
+    if mine["sha256"] != cmap["sha256"]:
+        raise RuntimeError(f"--cv1-model {path}: its contact map ({len(cmap['pairs'])} residue pairs, sha "
+                           f"{cmap['sha256'][:12]}...) does not match this topology's ({len(mine['pairs'])} pairs, "
+                           f"sha {mine['sha256'][:12]}...); the model belongs to another system or atom order")
+    require_single_atom_pairs(model)        # production runs the CA map only (GPU-exact force)
+    return {
+        "mode": CONTACT_MAP_MODE,
+        "label": "contact-map tICA CV1",
+        "units": "dimensionless",
+        "k_units": "kcal/mol/CV^2",
+        "openmm_k_units": "kJ/mol/CV^2",
+        "cv_atom1": int(cv_atom1) if cv_atom1 is not None else None,
+        "cv_atom2": int(cv_atom2) if cv_atom2 is not None else None,
+        "distance_cv_label_for_compatibility": str(cv_label or "terminal distance"),
+        "contact_pairs": [],
+        "n_contact_pairs": 0,
+        "cv1_model_path": path,
+        "cv1_model_sha256": str(model["sha256"]),
+        "contact_map_sha256": str(cmap["sha256"]),
+        "n_residue_pairs": int(len(cmap["pairs"])),
+        "switch": dict(model["switch"]),
+        "_cv1_model": model,
+    }
+
+
+def contact_map_model_of(primary_cv_def: Mapping[str, Any]) -> Dict[str, Any]:
+    """The frozen model behind a contact-map definition (re-read from its path when the
+    in-memory copy was stripped, e.g. a definition reloaded from JSON metadata)."""
+    model = primary_cv_def.get("_cv1_model")
+    if model is None:
+        from .cv_selection.contact_map_cv1 import read_model
+        model = read_model(primary_cv_def["cv1_model_path"])
+        if model["sha256"] != primary_cv_def.get("cv1_model_sha256"):
+            raise RuntimeError("cv1 model on disk differs from the one this run recorded")
+    return model
 
 
 def apply_primary_cv_metadata_to_args(args, metadata: Optional[Dict[str, Any]]) -> None:
@@ -1090,6 +1198,16 @@ def apply_primary_cv_metadata_to_args(args, metadata: Optional[Dict[str, Any]]) 
     if not isinstance(primary_meta, dict):
         return
     mode = primary_cv_mode(primary_meta)
+    if mode == CONTACT_MAP_MODE:
+        # resume rebuilds the same force: the recorded model path, held to the recorded sha
+        args.primary_cv = CONTACT_MAP_MODE
+        # a user-given --cv1-model (e.g. a campaign moved between hosts) is kept: the recorded sha,
+        # not the path, decides whether it is the same model
+        if primary_meta.get("cv1_model_path") and not getattr(args, "cv1_model", None):
+            args.cv1_model = str(primary_meta["cv1_model_path"])
+        if primary_meta.get("cv1_model_sha256"):
+            args.cv1_model_sha256_expected = str(primary_meta["cv1_model_sha256"])
+        return
     if mode != "nonlocal-contacts":
         return
     args.primary_cv = "nonlocal-contacts"
@@ -1117,6 +1235,10 @@ def primary_cv_value_from_positions_nm(
     return value is either a dimensionless fraction or a raw count.
     """
     mode = primary_cv_mode(primary_cv_def)
+    if mode == CONTACT_MAP_MODE:
+        from .contact_map_force import cv_from_positions_nm
+        return float(cv_from_positions_nm(contact_map_model_of(primary_cv_def), positions_nm,
+                                          atom_map=primary_cv_def.get("_atom_map")))
     if mode == "distance":
         return 10.0 * cv_distance_from_positions_nm(positions_nm, int(primary_cv_def["cv_atom1"]), int(primary_cv_def["cv_atom2"]))
     if mode == "nonlocal-contacts":

@@ -9,7 +9,7 @@ def test_auto_cv2_parses_with_documented_defaults_and_forces_the_tica_switch_off
     a = parse_args(["--seq", "GYDPETGTWG", "--cv1", "contacts", "--cv2", "auto",
                     "--window-mode", "adaptive-production", "--tica-switch-cv2"])
     assert a.secondary_cv == "auto" and a.primary_cv == "nonlocal-contacts"
-    assert a.cv_selection_residual_degree == 1 and a.cv_selection_max_coupling_fraction == 0.25
+    assert a.cv_selection_residual_degree == "both" and a.cv_selection_max_coupling_fraction == 0.25
     assert a.cv_selection_k2_reference_kcal == 1.0 and a.cv_selection_min_gain_nats == 0.02
     assert a.swarm_n_windows_cv2 == 4 and a.cv_selection_fallback == "cv1_only"
     assert a.tica_switch_cv2 is False

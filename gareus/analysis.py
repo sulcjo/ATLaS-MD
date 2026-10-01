@@ -100,7 +100,7 @@ def validate_analysis_metadata_readiness(out_dir: Path, target_overlap: float = 
         if w in seen_windows:
             errors.append(f"window table has duplicate window index {w}")
         seen_windows.add(w)
-        if str(row.get("primary_cv", "distance")) == "nonlocal-contacts":
+        if str(row.get("primary_cv", "distance")) in ("nonlocal-contacts", "contact-map"):
             for key in ("primary_center", "primary_k"):
                 val = _safe_float(row.get(key))
                 if not math.isfinite(val):

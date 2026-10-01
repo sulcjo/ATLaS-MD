@@ -38,7 +38,8 @@ from gareus.cv_selection.models import (
     evaluate_component,
     from_candidate_set,
 )
-from gareus.cv_selection.select_pair import SelectionConfig, SwarmDataset, select_cv_pair
+from gareus.cv_selection.select_pair import (SelectionConfig, SwarmDataset, select_cv_pair,
+                                             select_cv_pair_over_degrees)
 from gareus.cv_selection.coverage import build_region_inventory, region_centres
 from gareus.swarm.cv2_shape_layout import one_dimensional_reserve, select_pair_layout
 from gareus.io import write_json
@@ -142,7 +143,8 @@ def _pool(traces: Dict[int, Dict[str, np.ndarray]], key: str, discard: int) -> n
 
 
 def _write_sidecar(an: Path, seed_bank_dir: Path, windows_csv: Path, *,
-                   cvs: Optional[dict] = None, pair_paths: Optional[dict] = None) -> None:
+                   cvs: Optional[dict] = None, pair_paths: Optional[dict] = None,
+                   cv1_model: Optional[str] = None) -> None:
     """The ``starting_structures``/``windows``/``gamd`` fragment a ``windows_2d_csv``
     production run must consume, so the seed-selection path travels with the CSV
     (global constraint 5c; dests verified against ``gareus/cli.py``).
@@ -153,6 +155,10 @@ def _write_sidecar(an: Path, seed_bank_dir: Path, windows_csv: Path, *,
     payload: Dict[str, Any] = {}
     if cvs is not None:
         payload["cvs"] = dict(cvs)
+    if cv1_model:                        # the frozen contact-map CV1 the windows are designed in
+        from ..cv_selection.contact_map_cv1 import read_model
+        payload["cv1_model"] = str(Path(cv1_model).resolve())
+        payload["cv1_model_sha256"] = str(read_model(cv1_model)["sha256"])
     if pair_paths is not None:
         payload.update({
             "secondary_cv_model": str(Path(pair_paths["pair_model"]).resolve()),
@@ -214,6 +220,10 @@ def _library_cv1_for_round0(rd0: Path, plan_meta: dict, warnings: List[str],
     library's max rather than its q99, understating the cap's strictness) only when
     the descriptors file is missing, and records why in ``warnings`` when it does.
     """
+    from ..cv_selection.anchor_spec import KIND_CMAP
+    if anchor_kind == KIND_CMAP:
+        warnings.append("library-CV1 coverage cap: seed descriptors carry no contact-map CV1 value; not reported")
+        return np.zeros(0, dtype=float)
     path = rd0 / "seed_descriptors.csv"
     if path.exists():
         from ..cv_selection.anchor_spec import descriptor_value
@@ -318,7 +328,8 @@ def _swarm_contact_pairs(out_dir: Path, args, warnings: List[str]) -> Optional[l
     try:
         from openmm import app  # noqa: WPS433 -- runtime dependency of the swarm stage itself
         topology = app.PDBFile(str(topology_pdb)).topology
-        return list(prepare_primary_cv_definition(topology, args).get("contact_pairs", []))
+        from ..cv import swarm_member_cv_args
+        return list(prepare_primary_cv_definition(topology, swarm_member_cv_args(args)).get("contact_pairs", []))
     except Exception as exc:  # pragma: no cover - environment dependent
         warnings.append(f"cv selection: could not rebuild contact pairs from topology.pdb ({exc!r}); "
                         "the anchor's pair list is NOT bound into the pair model")
@@ -352,6 +363,9 @@ def _anchor_kind(args) -> str:
     from ..cv import primary_cv_mode
     from ..cv_selection.anchor_spec import KIND_CONTACT, anchor_kind_for_args
     explicit = getattr(args, "cv1", None)
+    if explicit not in (None, "") and primary_cv_mode(str(explicit)) == "contact-map":
+        from ..cv_selection.anchor_spec import KIND_CMAP
+        return KIND_CMAP                  # provisional: _prepare_contact_map_anchor may fall back
     if explicit in (None, "") or primary_cv_mode(str(explicit)) != "distance":
         return KIND_CONTACT
     return anchor_kind_for_args(args)
@@ -393,7 +407,9 @@ def _distance_anchor_definition(out_dir: Path, args, warnings: List[str]) -> Opt
 
 
 def _sidecar_cv1(kind: str) -> str:
-    from ..cv_selection.anchor_spec import is_contact
+    from ..cv_selection.anchor_spec import KIND_CMAP, is_contact
+    if kind == KIND_CMAP:
+        return "contact-map"
     return "contacts" if is_contact(kind) else "distance"
 
 
@@ -466,7 +482,7 @@ def _build_swarm_dataset(rows: List[dict], ok_traces: Dict[int, Dict[str, np.nda
     anchor = AnchorCandidate(anchor_kind, definition, cv1[finite])
     # The discovery partition excludes the anchor (select_pair step 2): for the end-to-end
     # anchor its own e2e column is dropped, or CV2 could add no information about it.
-    shape_cols = [rg[finite], e2e[finite]] if anchor_kind == "nonlocal-contact-fraction" else [rg[finite]]
+    shape_cols = [rg[finite]] if anchor_kind == "end-to-end-distance" else [rg[finite], e2e[finite]]
     dataset = SwarmDataset(features[finite], schema, anchor, np.column_stack(shape_cols),
                            groups[finite], member_ids=member_ids[finite], frame_index=frame_index[finite],
                            frame_dt_ps=float(getattr(args, "swarm_output_interval_ps", 2.0)))
@@ -476,9 +492,15 @@ def _build_swarm_dataset(rows: List[dict], ok_traces: Dict[int, Dict[str, np.nda
     return dataset, aux
 
 
+def _residual_degrees(args) -> tuple:
+    """--cv-selection-residual-degree: 1, 2, or both (default: best of linear and quadratic)."""
+    raw = str(getattr(args, "cv_selection_residual_degree", "both") or "both").strip().lower()
+    return (1, 2) if raw == "both" else (int(raw),)
+
+
 def _selection_config(args, k1_max_kcal: float, temperature_k: float) -> SelectionConfig:
     return SelectionConfig(
-        residual_degree=int(getattr(args, "cv_selection_residual_degree", 1)),
+        residual_degree=_residual_degrees(args)[0],
         max_nonlinear_r2=float(getattr(args, "cv_selection_max_nonlinear_r2", 0.20)),
         max_coupling_fraction=float(getattr(args, "cv_selection_max_coupling_fraction", 0.25)),
         k1_kcal_reference=float(k1_max_kcal),
@@ -497,6 +519,82 @@ def _selection_config(args, k1_max_kcal: float, temperature_k: float) -> Selecti
         pick_rule=str(getattr(args, "cv_selection_pick", "breadth-tie-slowest") or "breadth-tie-slowest"),
         breadth_tie_sd=float(getattr(args, "cv_selection_breadth_tie_sd", 1.0)),
     )
+
+
+def _prepare_contact_map_anchor(an: Path, rd: Path, out_dir: Path, rows, ok_traces, ok_features, frame_candidates,
+                                discard: int, args, warnings: List[str], round_index: int) -> Optional[Dict[str, Any]]:
+    """Fit the contact-map CV1 (round 0) and put its values in every trace (``cv1_contact_map``).
+
+    Returns {"model", "path", "summary"} or None, after which the campaign's CV1 falls back to
+    contacts (spec section 7): no mode passed the gates, the round predates the recorded map (the
+    ladder needs the CV1 on every trace row, not only the PDB frames), a later round, or a
+    failure. The reason is in ``warnings`` and the swarm report."""
+    from ..cv_selection import anchor_spec as AS
+    from ..cv_selection.contact_map_cv1 import MODEL_NAME, STATUS_SELECTED, evaluate_model, read_model
+    from . import contact_map as CMAP
+
+    def fallback(reason: str):
+        warnings.append(f"cv1 contact-map: {reason}; the campaign's CV1 falls back to contacts")
+        if round_index == 0:            # never leave a model next to a contacts sidecar
+            (an / MODEL_NAME).unlink(missing_ok=True)
+        return None
+
+    if round_index != 0:
+        return _frozen_contact_map_anchor(an, rd, ok_traces, warnings)
+    topology_pdb = swarm_root(out_dir) / "system" / "topology.pdb"
+    if not topology_pdb.exists():
+        return fallback("swarm/system/topology.pdb absent")
+    try:
+        contact_pairs = _swarm_contact_pairs(out_dir, args, warnings)
+        dataset, _aux = _build_swarm_dataset(rows, ok_traces, ok_features, discard, args, contact_pairs,
+                                             file_digest(topology_pdb), anchor_kind=AS.KIND_CONTACT)
+        summary = _fit_contact_map_cv1(an, dataset, ok_traces, frame_candidates, rd, topology_pdb, args, warnings)
+    except Exception as exc:  # the fallback is contacts, never a failed analysis
+        return fallback(f"fit failed ({exc!r})")
+    if summary.get("status") != STATUS_SELECTED:
+        return fallback(f"no deployable mode ({summary.get('selection_reason') or summary.get('error')})")
+    if summary.get("contact_map_source") != "trace":
+        return fallback("the round's members did not record the contact map natively (fit on PDB frames only)")
+    path = an / MODEL_NAME
+    model = read_model(path)
+    for m, tr in ok_traces.items():
+        got = CMAP.load_member_contact_map(rd / f"member_{int(m):04d}", CMAP.definition_atoms(model["contact_map"]))
+        if got is None or got[0].shape[0] != len(tr["cv1"]):
+            return fallback(f"member {m}: contact map missing or not aligned with its trace")
+        tr[AS.CMAP_TRACE_KEY] = evaluate_model(model, got[0])
+    return {"model": model, "path": str(path.resolve()), "summary": summary}
+
+
+def _frozen_contact_map_anchor(an: Path, rd: Path, ok_traces, warnings: List[str]) -> Optional[Dict[str, Any]]:
+    """Rounds >= 1 of a contact-map campaign: round 0's frozen model, never a refit.
+
+    Round 0's sidecar decides: ``cv1: contacts`` (it fell back) -> contacts here too (None); ``cv1:
+    contact-map`` -> its model (held to the sidecar's sha) evaluated on this round's recorded maps.
+    Anything else refuses, so seeds are never matched across CV1 units."""
+    from gareus.config import _load_config_file
+    from ..cv_selection import anchor_spec as AS
+    from ..cv_selection.contact_map_cv1 import MODEL_NAME, evaluate_model, read_model
+    from . import contact_map as CMAP
+    side_path = an / "ladder_run_args.yaml"
+    side = (_load_config_file(side_path) or {}) if side_path.exists() else {}
+    decided = str((side.get("cvs") or {}).get("cv1") or "")
+    if decided == "contacts":
+        warnings.append("cv1 contact-map: round 0 fell back to contacts; this round uses contacts too")
+        return None
+    if decided != "contact-map" or not (an / MODEL_NAME).exists():
+        raise RuntimeError(f"cv1 contact-map round >= 1 needs round 0's decision ({side_path}) and its "
+                           f"{MODEL_NAME}; re-run round 0's analysis first")
+    model = read_model(an / MODEL_NAME)
+    if side.get("cv1_model_sha256") and side["cv1_model_sha256"] != model["sha256"]:
+        raise RuntimeError(f"{an / MODEL_NAME} differs from the model round 0 handed to production")
+    atoms = CMAP.definition_atoms(model["contact_map"])
+    for m, tr in ok_traces.items():
+        got = CMAP.load_member_contact_map(rd / f"member_{int(m):04d}", atoms)
+        if got is None or got[0].shape[0] != len(tr["cv1"]):
+            raise RuntimeError(f"round member {m}: contact map missing or not aligned with its trace")
+        tr[AS.CMAP_TRACE_KEY] = evaluate_model(model, got[0])
+    return {"model": model, "path": str((an / MODEL_NAME).resolve()),
+            "summary": {"status": "frozen", "model_sha256": model["sha256"]}}
 
 
 def _fit_contact_map_cv1(an: Path, dataset, ok_traces, frame_candidates, rd: Path, topology_pdb: Path,
@@ -534,7 +632,9 @@ def analyze_swarm_stage(out_dir, args) -> dict:
     # The CV1 every downstream design step reads is the run's anchor (spec generic-cv1-anchor):
     # the heavy-contact cv1 column as recorded, or another recorded column in its own units.
     anchor_kind = _anchor_kind(args)
-    _substitute_anchor(anchor_kind, ok_traces, frame_candidates)
+    from ..cv_selection.anchor_spec import KIND_CMAP as _KIND_CMAP
+    if anchor_kind != _KIND_CMAP:         # the contact-map CV1 is fitted first (after the discard)
+        _substitute_anchor(anchor_kind, ok_traces, frame_candidates)
 
     graft_failed_members = sorted(m for m, d in done_summaries.items() if str(d.get("status", "ok")) == "graft_failed")
     md_failed_members = sorted(m for m, d in done_summaries.items() if str(d.get("status", "ok")) == "md_failed")
@@ -547,6 +647,23 @@ def analyze_swarm_stage(out_dir, args) -> dict:
     per_member_discard = {m: discard_frames_from_trace(tr["v_pep_kj"], block=block) for m, tr in ok_traces.items()}
     floor_frames = int(math.ceil(min_discard_ps / output_interval_ps)) if min_discard_ps > 0 else 0
     discard = pooled_discard(list(per_member_discard.values()), floor_frames=floor_frames)
+
+    warnings: List[str] = []
+    cmap_anchor: Optional[Dict[str, Any]] = None
+    from ..cv_selection.anchor_spec import KIND_CMAP as _KCM
+    cmap_requested = anchor_kind == _KCM              # the config asked for a contact-map CV1
+    if round_index == 0:
+        # A contact-map CV1 fit is only ever this analysis's own: clear any earlier one first.
+        from gareus.swarm.contact_map_cv1_fit import clear_artifacts as _clear_cv1_artifacts
+        _clear_cv1_artifacts(an)
+    from ..cv_selection.anchor_spec import KIND_CMAP, KIND_CONTACT
+    if anchor_kind == KIND_CMAP:
+        cmap_anchor = _prepare_contact_map_anchor(an, rd, out_dir, rows, ok_traces, ok_features, frame_candidates,
+                                                  discard, args, warnings, round_index)
+        if cmap_anchor is None:
+            anchor_kind = KIND_CONTACT
+        else:
+            _substitute_anchor(anchor_kind, ok_traces, frame_candidates)
 
     write_json(an / "envelope_discard.json", {
         "per_member_discard_frames": {str(m): v for m, v in per_member_discard.items()},
@@ -566,7 +683,6 @@ def analyze_swarm_stage(out_dir, args) -> dict:
 
     seeds_per_window = int(getattr(args, "swarm_seeds_per_window", 3))
     temperature_k = float(args.temperature_k)
-    warnings: List[str] = []
 
     report: Dict[str, Any] = {
         "round": round_index, "n_members": len(rows), "n_ok_members": len(ok_member_ids),
@@ -575,6 +691,10 @@ def analyze_swarm_stage(out_dir, args) -> dict:
         "budget_ns_done": budget_ns_done, "budget_ns_planned": budget_ns_planned,
         "discard_frames": discard, "warnings": warnings,
     }
+    if anchor_kind == KIND_CMAP or _anchor_kind(args) == KIND_CMAP:     # contact-map campaigns only
+        report["cv1_kind"] = _sidecar_cv1(anchor_kind)
+    if cmap_anchor is not None:
+        report["cv1_contact_map"] = cmap_anchor["summary"]
 
     if round_index == 0:
         envelopes = pool_member_envelopes(ok_traces, discard)
@@ -708,9 +828,6 @@ def analyze_swarm_stage(out_dir, args) -> dict:
         pair_layout: Optional[tuple] = None
         coupling_gate: Optional[Dict[str, Any]] = None
         pair_paths: Optional[dict] = None
-        # A contact-map CV1 fit is only ever this analysis's own: clear any earlier one first.
-        from gareus.swarm.contact_map_cv1_fit import clear_artifacts as _clear_cv1_artifacts
-        _clear_cv1_artifacts(an)
         if secondary_cv_mode(args) == "auto":
             from ..cv_selection import anchor_spec as AS
             contact_pairs = _swarm_contact_pairs(out_dir, args, warnings) if AS.is_contact(anchor_kind) else None
@@ -726,7 +843,11 @@ def analyze_swarm_stage(out_dir, args) -> dict:
             }
             anchor_key = "contact_pair_list_sha256"
             anchor_definition = None
-            if not AS.is_contact(anchor_kind):
+            if anchor_kind == AS.KIND_CMAP:
+                anchor_definition = AS.cmap_definition(cmap_anchor["model"], cmap_anchor["path"])
+                deployment["anchor_binding_sha256"] = AS.binding_digest(anchor_kind, anchor_definition)
+                anchor_key = "anchor_binding_sha256"
+            elif not AS.is_contact(anchor_kind):
                 anchor_definition = _distance_anchor_definition(out_dir, args, warnings)
                 deployment["anchor_binding_sha256"] = (AS.binding_digest(anchor_kind, anchor_definition)
                                                        if anchor_definition else None)
@@ -739,8 +860,10 @@ def analyze_swarm_stage(out_dir, args) -> dict:
             dataset, aux = _build_swarm_dataset(rows, ok_traces, ok_features, discard, args, contact_pairs,
                                                 topology_sha or digest(b"swarm-topology-unavailable"),
                                                 anchor_kind=anchor_kind, anchor_definition=anchor_definition)
-            sel = select_cv_pair(
+            _degrees = _residual_degrees(args)
+            sel = (select_cv_pair_over_degrees if len(_degrees) > 1 else select_cv_pair)(
                 dataset, _selection_config(args, k_max, temperature_k),
+                **({"degrees": _degrees} if len(_degrees) > 1 else {}),
                 physical_system_sha256=physical_sha or digest(b"swarm-system-unavailable"),
                 training_rows_sha256=aux["rows_sha256"],
                 library_versions=_library_versions(),
@@ -829,10 +952,10 @@ def analyze_swarm_stage(out_dir, args) -> dict:
             # Written after the layout block so the file carries the 2-D design too.
             write_json(an / "cv_selection_report.json", {**sel.report, **selection})
             report["cv_selection"] = selection
-            if bool(getattr(args, "swarm_cv1_contact_map_fit", False)):
+            if bool(getattr(args, "swarm_cv1_contact_map_fit", False)) and not cmap_requested:
                 report["cv1_contact_map"] = _fit_contact_map_cv1(an, dataset, ok_traces, frame_candidates,
                                                                  rd, topology_pdb, args, warnings)
-        elif bool(getattr(args, "swarm_cv1_contact_map_fit", False)):
+        elif bool(getattr(args, "swarm_cv1_contact_map_fit", False)) and not cmap_requested:
             warnings.append("cv1 contact map: --swarm-cv1-contact-map-fit needs cv2 auto (the torsion "
                             "dataset); not fitted")
 
@@ -879,13 +1002,15 @@ def analyze_swarm_stage(out_dir, args) -> dict:
                                                                      "mandatory_state_ids", "unresolved")}
                 _write_sidecar(an, seed_bank_dir, windows_csv,
                                cvs={"cv1": _sidecar_cv1(anchor_kind), "cv2": "residual-torsion-pc"},
-                               pair_paths=pair_paths)
+                               pair_paths=pair_paths, cv1_model=(cmap_anchor or {}).get("path"))
             else:
                 windows_csv = write_ladder_windows_csv(an / "windows_lambda_ladder.csv", centers, ks, ladder["lambdas"],
                                                        primary_cv_mode=_sidecar_cv1(anchor_kind))
                 report.update(one_dimensional_reserve(args, ladder_design["n_states"], warnings))
                 _write_sidecar(an, seed_bank_dir, windows_csv,
-                               cvs={"cv1": _sidecar_cv1(anchor_kind), "cv2": "none"} if selection is not None else None)
+                               cvs=({"cv1": _sidecar_cv1(anchor_kind), "cv2": "none"} if selection is not None
+                                    else {"cv1": _sidecar_cv1(anchor_kind)} if cmap_requested else None),
+                               cv1_model=(cmap_anchor or {}).get("path"))
         else:
             _withhold_ladder_artifacts(an)
             report["withheld_ladder_artifacts"] = True

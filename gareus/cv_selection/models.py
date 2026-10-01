@@ -27,7 +27,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional
 
 import numpy as np
 
@@ -366,6 +366,7 @@ class PairModelRuntime:
     feature_atoms: tuple            # one quadruplet per torsion: phi block then psi block
     legacy: bool = False            # v1 artifacts, read in explicit legacy mode
     deployable: bool = True
+    artifact_dir: Optional[str] = None   # directory of the pair model (contact-map anchor: its cv1_model.json)
 
     @classmethod
     def load(cls, pair_model_path, candidate_set_path, feature_schema_path, *,
@@ -411,7 +412,8 @@ class PairModelRuntime:
         atoms = tuple(tuple(int(i) for i in f.atom_indices) for f in schema.features if f.trig == "sin")
         return cls(from_candidate_set(candidates), int(pair.selected_component_index),
                    str(pair.anchor["kind"]), dict(pair.anchor["definition"]), pair.sha256, atoms,
-                   legacy=bool(pair.legacy or candidates.legacy), deployable=bool(pair.deployable))
+                   legacy=bool(pair.legacy or candidates.legacy), deployable=bool(pair.deployable),
+                   artifact_dir=str(Path(pair_model_path).resolve().parent))
 
     def contact_args(self) -> SimpleNamespace:
         """The contact parameters as an ``args``-shaped object, from the frozen definition."""
@@ -457,7 +459,7 @@ class PairModelRuntime:
             raise RuntimeError(f"anchor kind mismatch: pair model fitted against {self.anchor_kind!r}, "
                                f"the run's CV1 is {run_kind!r}")
         if not AS.is_contact(self.anchor_kind):
-            AS.check_run_matches(self.anchor_kind, self.anchor_definition, contact_pairs)
+            AS.check_run_matches(self.anchor_kind, self.anchor_definition, contact_pairs, args=args)
             return
         d = self.anchor_definition
         for key, attr in _ANCHOR_ARG_KEYS:

@@ -153,6 +153,8 @@ def _poincare_primary_cv_supported(meta: dict) -> bool:
     mode = str(meta.get('primary_cv', '') or '').lower()
     label = str(meta.get('primary_cv_label', '') or '').lower()
     units = str(meta.get('primary_cv_units', '') or '').lower()
+    if mode == 'contact-map':      # signed tICA coordinate: no fold/unfold direction is defined
+        return False
     return mode == 'nonlocal-contacts' or ('contact' in label and units in {'', 'dimensionless'})
 
 

@@ -76,6 +76,7 @@ from .cv import (
     prepare_primary_cv_definition,
     primary_center_to_openmm_value,
     primary_cv_is_contacts,
+    primary_cv_is_dimensionless,
     primary_cv_is_distance,
     primary_cv_label,
     primary_cv_mode,
@@ -492,6 +493,21 @@ def cv_force_layout(primary_cv_def, args, *, secondary_enabled: bool) -> str:
     return SPLIT_CV_LAYOUT
 
 
+def _global_param_index(force, name: str) -> int:
+    for i in range(force.getNumGlobalParameters()):
+        if force.getGlobalParameterName(i) == name:
+            return i
+    raise KeyError(name)
+
+
+def _has_global_param(force, name: str) -> bool:
+    try:
+        _global_param_index(force, name)
+        return True
+    except KeyError:
+        return False
+
+
 def _add_residual_torsion_cv_force(openmm, system, phi_torsions, psi_torsions, contact_pairs,
                                    runtime, args, *, force_group, carry_primary_umbrella=False):
     """Harmonic umbrella on a residual torsion component, chain rule included.
@@ -537,8 +553,9 @@ def _add_residual_torsion_cv_force(openmm, system, phi_torsions, psi_torsions, c
     # The anchor sub-CV (anchor_spec): the contact switch sum for the contact kind (the same
     # expression as forces.add_contact_umbrella_force), r (nm) for the end-to-end distance;
     # c = sub_cv / norm in the anchor's own units either way.
-    anchor_name = "res_contacts" if AS.is_contact(kind) else "res_anchor"
-    cv_force.addCollectiveVariable(anchor_name, AS.build_anchor_subcv(openmm, kind, contact_pairs, args))
+    # Contact-map: one weighted CA switch-sum sub-CV, c = sub - cmap_offset (a Lepton intermediate).
+    anchor_name, anchor_defs = AS.add_anchor_to_cv_force(openmm, cv_force, kind, contact_pairs, args,
+                                                        runtime.anchor_definition)
     norm = AS.anchor_norm(kind, runtime.anchor_definition, contact_pairs, args)
     # The compiled coordinate writes the expression; the same object evaluates the fast-path
     # scalar and the positions evaluator (spec F02: one frozen definition for every stage).
@@ -555,6 +572,8 @@ def _add_residual_torsion_cv_force(openmm, system, phi_torsions, psi_torsions, c
         cv_force.addGlobalParameter("contact_norm", contact_normalization_denominator(list(contact_pairs), args))
         cv_force.addGlobalParameter("k", 0.0)
         cv_force.addGlobalParameter("r0", 0.0)
+    if anchor_defs:                       # Lepton definitions of the anchor always come last
+        energy += "; " + anchor_defs
     cv_force.setEnergyFunction(energy)
     cv_force.setForceGroup(int(force_group))
     system.addForce(cv_force)
@@ -582,7 +601,11 @@ def _add_residual_torsion_cv_force(openmm, system, phi_torsions, psi_torsions, c
         # getCollectiveVariableValues() returns them. The fast-path scalar is
         # reconstructed from these roles + residual_scalar, never from position
         # assumptions (spec F01; review finding I01).
-        "subcv_roles": [{"name": n, "role": "torsion_sum"} for n in names] + [{"name": anchor_name, "role": "contact_sum"}],
+        "subcv_roles": [{"name": n, "role": "torsion_sum"} for n in names] + (
+            [{"name": anchor_name, "role": "contact_sum"}] if not anchor_defs else
+            # contact-map: one sub-CV = c + offset (contact_map_force.OFFSET_PARAM)
+            [{"name": cv_force.getCollectiveVariableName(len(names)), "role": "contact_sum",
+              "offset": float(cv_force.getGlobalParameterDefaultValue(_global_param_index(cv_force, "cmap_offset")))}]),
         "residual_scalar": compiled.as_record(),
         "cv_evaluator_version": RESIDUAL_EVALUATOR_VERSION,
         "force_group": int(force_group),
@@ -966,6 +989,12 @@ def observe_fast_path(ctx, primary_force, ss_force, args, secondary_cv_metadata)
     (spec F01 acceptance: the same coordinate is recorded and exchanged on).
     """
     meta = secondary_cv_metadata or {}
+    if primary_force is not None and _has_global_param(primary_force, "cmap_offset"):
+        # contact-map CV1: sub-CV 0 is c + offset (contact_map_force); never shared layout
+        cv = float(primary_force.getCollectiveVariableValues(ctx)[0]) - float(ctx.getParameter("cmap_offset"))
+        if ss_force is None or not meta.get("enabled"):
+            return cv, float("nan")
+        return cv, _ss_scalar_from_sub_cv_values(ss_force.getCollectiveVariableValues(ctx), meta)
     norm = float(ctx.getParameter("contact_norm")) if bool(getattr(args, "contact_normalize", True)) else 0.0
     if meta.get("enabled") and meta.get("cv_force_layout") == SHARED_CONTACT_LAYOUT:
         # One force, one read: CV1 is the contact_sum role, not sub-CV [0] (a torsion sum).
@@ -1645,8 +1674,10 @@ def explicit_window_analysis_rows(
     explicit_2d = bool(isinstance(meta, dict) and meta.get("explicit_2d_windows", False))
     rectangular = bool(isinstance(meta, dict) and meta.get("grid", False))
     primary_mode = str((wmeta or {}).get("primary_cv", "distance") or "distance")
-    contact_mode = primary_mode == "nonlocal-contacts"
-    primary_label = str((wmeta or {}).get("primary_cv_label", "nonlocal contact fraction" if contact_mode else "terminal distance"))
+    contact_mode = primary_mode in ("nonlocal-contacts", "contact-map")      # dimensionless CV1 (no A/nm columns)
+    primary_label = str((wmeta or {}).get("primary_cv_label", ("contact-map tICA CV1" if primary_mode == "contact-map"
+                                                               else "nonlocal contact fraction") if contact_mode
+                                          else "terminal distance"))
     primary_units = str((wmeta or {}).get("primary_cv_units", "dimensionless" if contact_mode else "A"))
     primary_k_units_val = str((wmeta or {}).get("primary_k_units", "kcal/mol/CV^2" if contact_mode else "kcal/mol/A^2"))
     rows: list[dict] = []
@@ -1998,6 +2029,10 @@ def add_secondary_structure_cv_force(openmm, system, topology, args, force_group
     }
 
 def add_primary_umbrella_force(openmm, system, primary_cv_def: dict, args, force_group: int = 31):
+    if primary_cv_mode(primary_cv_def) == "contact-map":
+        from .contact_map_force import add_contact_map_umbrella_force
+        from .cv import contact_map_model_of
+        return add_contact_map_umbrella_force(openmm, system, contact_map_model_of(primary_cv_def), force_group)
     if primary_cv_mode(primary_cv_def) == "nonlocal-contacts":
         return add_contact_umbrella_force(openmm, system, list(primary_cv_def.get("contact_pairs", [])), args, force_group)
     return add_umbrella_force(openmm, system, int(primary_cv_def["cv_atom1"]), int(primary_cv_def["cv_atom2"]), force_group)
@@ -2334,7 +2369,7 @@ def window_assignment_rows(centers_a: np.ndarray, k_list: list[float], temperatu
     ss_centers = np.asarray(secondary_centers, dtype=float) if secondary_centers is not None else None
     ss_k_arr = np.asarray(secondary_k_list, dtype=float) if secondary_k_list is not None else None
     rt_kcal_mol = 0.00198720425864083 * float(temperature_k)
-    contact_mode = primary_cv_is_contacts(args or "distance")
+    contact_mode = primary_cv_is_dimensionless(args or "distance")
     rows = []
     for i, (center, k) in enumerate(zip(centers, k_arr)):
         prev_spacing = float(center - centers[i - 1]) if i > 0 else ""
@@ -6718,6 +6753,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             args.primary_cv = primary_cv_mode(resume_primary)
             apply_primary_cv_metadata_to_args(args, resume_meta)
         except Exception:
+            if primary_cv_mode(getattr(args, "primary_cv", "distance")) == "contact-map":
+                raise                      # never rebuild a contact-map campaign as something else
             args.primary_cv = primary_cv_mode(getattr(args, "primary_cv", "distance"))
         primary_cv_def = prepare_primary_cv_definition(topology, args, cv_atom1=cv_atom1, cv_atom2=cv_atom2, cv_label=cv_label)
         cv_label = str(primary_cv_def.get("label", cv_label))

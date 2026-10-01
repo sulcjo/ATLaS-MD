@@ -269,7 +269,7 @@ def _platform_request(args: Any) -> dict[str, Any]:
     return {k: getattr(args, k, None) for k in keys if hasattr(args, k)}
 
 
-def pair_model_sha256(path) -> Optional[str]:
+def pair_model_sha256(path, flag: str = "--secondary-cv-model") -> Optional[str]:
     """Content digest recorded inside a cv_pair_model.json, or None when there is no model."""
     if not path:
         return None
@@ -277,7 +277,7 @@ def pair_model_sha256(path) -> Optional[str]:
     if not model_path.exists():
         # A configured model that is not on disk must not degrade a resume refusal
         # into a "no model" warning.
-        raise FileNotFoundError(f"--secondary-cv-model points at a missing file: {model_path}")
+        raise FileNotFoundError(f"{flag} points at a missing file: {model_path}")
     from .correctness._io import json_loads
     doc = json_loads(model_path.read_text(encoding="utf-8"))
     try:
@@ -292,7 +292,8 @@ def _method_settings(args: Any) -> dict[str, Any]:
         "temperature_k", "pressure_bar", "barostat_frequency", "production_ensemble",
         "production_barostat_frequency", "timestep_fs", "friction_per_ps", "nonbonded_cutoff_nm",
         "ewald_error_tolerance", "run_mode", "hmr", "hydrogen_mass_amu", "cv1", "cv2",
-        "primary_cv", "cv_mode", "contact_scheme", "contact_atom_selection",
+        "primary_cv", "cv_mode", "contact_scheme", "contact_atom_selection", "cv1_model",
+        "cv1_contact_map_k_min", "cv1_contact_map_k_max",
         "window_mode", "secondary_cv", "secondary_cv_centers",
         "gamd_boost_type", "sigma0p_kcal_mol", "sigma0d_kcal_mol",
         "pep_gamd_fsf_floor_total", "pep_gamd_fsf_floor_dihedral", "gamd_production_steps",
@@ -318,7 +319,7 @@ def _method_settings(args: Any) -> dict[str, Any]:
         "swarm_min_done_fraction", "swarm_max_graft_fallback_fraction",
         # Residue contact map recorded per member (contact-map CV1 spec step 1).
         "swarm_contact_map_min_separation", "swarm_contact_map_lambda_a",
-        "swarm_cv1_contact_map_fit", "swarm_cv1_contact_map_r0_a",
+        "swarm_cv1_contact_map_fit", "swarm_cv1_contact_map_r0_a", "swarm_cv1_contact_map_atoms",
         # Frozen CV2 pair model, plan 2026-09-20-auto-cv-pair.
         "secondary_cv_model", "secondary_cv_candidate_set", "secondary_cv_feature_schema",
         "cv_selection_residual_degree", "cv_selection_max_nonlinear_r2",
@@ -331,6 +332,7 @@ def _method_settings(args: Any) -> dict[str, Any]:
     ]
     settings = {k: getattr(args, k, None) for k in keys if hasattr(args, k)}
     settings["cv_pair_model_sha256"] = pair_model_sha256(getattr(args, "secondary_cv_model", None))
+    settings["cv1_model_sha256"] = pair_model_sha256(getattr(args, "cv1_model", None), flag="--cv1-model")
     # What the frozen CV2 is (spec 3.6): family, index and tICA lag, from the artifacts.
     from .cv_selection.labels import frozen_pair_label
     try:

@@ -120,6 +120,9 @@ CONFIG_KEY_ALIASES: Dict[str, str] = {
     "cv2_min_mode_members": "swarm_cv2_min_mode_members",
     "cv1_contact_map_fit": "swarm_cv1_contact_map_fit",
     "cv1_contact_map_r0_a": "swarm_cv1_contact_map_r0_a",
+    "cv1_contact_map_atoms": "swarm_cv1_contact_map_atoms",
+    "contact_map_k_min": "cv1_contact_map_k_min",
+    "contact_map_k_max": "cv1_contact_map_k_max",
 }
 
 
@@ -486,7 +489,7 @@ def _basic_chignolin_config() -> Dict[str, Any]:
         "cv_selection": {
             # Automatic CV2 selection: runs in the swarm stage
             # (--swarm-stage analyze) and freezes CV2 as residual-torsion-pc.
-            "residual_degree": 1,
+            "residual_degree": "both",
             "max_nonlinear_r2": 0.20,
             "max_coupling_fraction": 0.25,
             "k2_reference_kcal": 1.0,

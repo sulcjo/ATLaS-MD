@@ -31,7 +31,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from gareus.cv import prepare_primary_cv_definition
+from gareus.cv import prepare_primary_cv_definition, swarm_member_cv_args
 from gareus.imports import import_openmm
 from gareus.system_setup import (
     create_system,
@@ -191,7 +191,7 @@ def build_or_load_plan(args, out_dir, round_index: int, *, topology, contact_pai
     budget_ns = float(budget_ns_raw) if budget_ns_raw is not None else None
     base_seed = int(getattr(args, "seed", 0) or 0)
 
-    primary_cv_def = prepare_primary_cv_definition(topology, args)
+    primary_cv_def = prepare_primary_cv_definition(topology, swarm_member_cv_args(args))
     library = _load_seed_library_for_round(args, round_index, topology=topology, primary_cv_def=primary_cv_def)
 
     if round_index == 0:
@@ -318,7 +318,7 @@ def run_swarm_stage(args, out_dir, progress=None) -> dict:
     round_index = int(getattr(args, "swarm_round", 0) or 0)
     rd = round_dir(out_dir, round_index)
 
-    primary_cv_def = prepare_primary_cv_definition(topology, args)
+    primary_cv_def = prepare_primary_cv_definition(topology, swarm_member_cv_args(args))
     contact_pairs = primary_cv_def["contact_pairs"]
 
     rows, meta = build_or_load_plan(args, out_dir, round_index, topology=topology, contact_pairs=contact_pairs)

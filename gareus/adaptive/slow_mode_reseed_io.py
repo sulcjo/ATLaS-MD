@@ -118,6 +118,9 @@ def load_pair_context(pair_paths: Sequence, solute_pdb) -> PairContext:
         want = rt.anchor_definition.get("pair_list_sha256")
         if want and contact_pair_list_digest(pairs) != want:
             raise RuntimeError("contact pair list rebuilt from the solute topology does not match the pair model's")
+    elif rt.anchor_kind == "contact-map-component":
+        cargs = None                      # composite: anchor_spec.value_from_positions reads the model
+        pairs = []
     else:                                 # distance anchor: the model's own atom pair
         cargs = None
         pairs = [(int(rt.anchor_definition["atom1"]), int(rt.anchor_definition["atom2"]), 1.0)]
@@ -298,7 +301,7 @@ def measure_structures(paths: Sequence, ctx: PairContext, mode: "X3.HiddenMode")
         if pos is None:
             continue
         feats = torsion_features(pos, ctx.quads)
-        if ctx.contact_args is None:      # distance anchor (A), as anchor_spec.value_from_positions
+        if ctx.contact_args is None:      # distance (A) / contact-map anchor, as anchor_spec.value_from_positions
             from gareus.cv_selection.anchor_spec import value_from_positions
             c1 = np.atleast_1d(value_from_positions(ctx.runtime.anchor_kind, np.asarray(pos)[0] if np.ndim(pos) == 3
                                                     else pos, ctx.contact_pairs, ctx.runtime))

@@ -27,6 +27,7 @@ from .cv import (
     peptide_residues,
     primary_cv_format_value,
     primary_cv_is_contacts,
+    primary_cv_is_dimensionless,
     primary_cv_is_distance,
     primary_cv_label,
     primary_cv_mode,
@@ -561,6 +562,24 @@ def _relative_primary_cv_def_for_conformer(
         rel["_np_beta_nm_inv"] = float(primary_cv_def.get("_np_beta_nm_inv", 60.0))
         rel["_np_norm_denom"] = contact_normalization_denominator(pairs, type("_SeedArgsProxy", (), {"contact_normalize": primary_cv_def.get("contact_normalize", True)})())
         return rel
+    if mode == "contact-map":
+        # The frozen model is digest-checked, so its atoms are never renumbered: the seed's
+        # positions are read through an index map instead (every model atom must map).
+        from .cv import contact_map_model_of
+        model = contact_map_model_of(primary_cv_def)
+        atom_map = {}
+        for pair in model["contact_map"]["pairs"]:
+            for a in list(pair["atoms_i"]) + list(pair["atoms_j"]):
+                try:
+                    m = _map_topology_atom_index(int(a), topology, topology_to_seed)
+                except Exception:
+                    m = None
+                if m is None:
+                    return None
+                atom_map[int(a)] = int(m)
+        rel["_cv1_model"] = model
+        rel["_atom_map"] = atom_map
+        return rel
     return None
 
 
@@ -763,7 +782,7 @@ def load_genpept_conformer_library(
                 # centers).  Mark the primary CV unavailable so selection falls to the
                 # backbone-torsion secondary CV; the collapse is still flagged by
                 # detect_seed_scoring_degradations above.
-                if primary_cv_is_contacts(args) and primary_cv_mode(row_rel_primary) == "distance":
+                if primary_cv_is_dimensionless(args) and primary_cv_mode(row_rel_primary) == "distance":
                     primary_value = float("nan")
             else:
                 primary_value = float("nan")
@@ -1319,7 +1338,7 @@ def generate_us_starting_states_by_pulling(
 
     pull_steps = int(getattr(args, "us_pull_steps_per_window", 5000) or 0)
     pull_k_kcal_a2_requested = float(getattr(args, "us_pull_k_kcal_a2", 5.0) or 5.0)
-    if primary_cv_is_contacts(args):
+    if primary_cv_is_dimensionless(args):
         pull_k_kcal_a2 = contact_us_pull_k_user(args, pull_k_kcal_a2_requested)
         if pull_k_kcal_a2 < pull_k_kcal_a2_requested - 1.0e-12 and getattr(args, "contact_us_pull_k_kcal", None) is None:
             print(
@@ -1336,7 +1355,7 @@ def generate_us_starting_states_by_pulling(
     _explicit_ts = ts > 0.0
     if not _explicit_ts:
         ts = min(float(getattr(args, "timestep_fs", 2.0) or 2.0), 2.0)
-        if primary_cv_is_contacts(args):
+        if primary_cv_is_dimensionless(args):
             contact_ts = float(getattr(args, "contact_us_pull_timestep_fs", 1.0) or 1.0)
             if math.isfinite(contact_ts) and contact_ts > 0.0 and ts > contact_ts:
                 print(
@@ -1350,7 +1369,7 @@ def generate_us_starting_states_by_pulling(
         if contact_chunk > 0:
             safe_chunk = min(safe_chunk, contact_chunk)
     friction = float(getattr(args, "us_pull_friction_per_ps", 10.0) or 10.0)
-    if primary_cv_is_contacts(args):
+    if primary_cv_is_dimensionless(args):
         friction = max(friction, float(getattr(args, "contact_us_pull_min_friction_per_ps", 20.0) or 20.0))
 
     seed_dir = getattr(args, "seed_conformers_dir", None)
@@ -1398,7 +1417,7 @@ def generate_us_starting_states_by_pulling(
         print(f"    US pulling: {n_pull_workers} concurrent workers (devices: {', '.join(device_tokens[:n_pull_workers])}). k={pull_k_kcal_a2:.1f} kcal/mol, ts={ts:.1f} fs, {pull_steps:,} steps/win.")
         if pull_steps > 0 and nwin > 1:
             _centers_arr_tmp = np.asarray(centers_nm, dtype=float)
-            _cv_span = float(np.max(_centers_arr_tmp) - np.min(_centers_arr_tmp)) * (1.0 if primary_cv_is_contacts(args) else 10.0)
+            _cv_span = float(np.max(_centers_arr_tmp) - np.min(_centers_arr_tmp)) * (1.0 if primary_cv_is_dimensionless(args) else 10.0)
             print(
                 f"    NOTE: concurrent mode — each window pulls from equilibrated. "
                 f"Extreme windows traverse the full CV span ({_cv_span:.2f} {primary_cv_units(args)}). "
@@ -1422,7 +1441,7 @@ def generate_us_starting_states_by_pulling(
     _init_pos_nm = equil_state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
     initial_cv_user = primary_cv_value_from_positions_nm(_init_pos_nm, primary_cv_def, args)
     centers_nm_arr = np.asarray(centers_nm, dtype=float)
-    centers_user_arr = centers_nm_arr.copy() if primary_cv_is_contacts(args) else centers_nm_arr * 10.0
+    centers_user_arr = centers_nm_arr.copy() if primary_cv_is_dimensionless(args) else centers_nm_arr * 10.0
     nearest = int(np.argmin(np.abs(centers_user_arr - float(initial_cv_user))))
     positions_by_window = [None] * nwin
     velocities_by_window = [None] * nwin
@@ -1528,7 +1547,7 @@ def generate_us_starting_states_by_pulling(
         nsteps = int(nsteps)
         if nsteps <= 0:
             return
-        if not primary_cv_is_contacts(args):
+        if not primary_cv_is_dimensionless(args):
             sim.context.setParameter("r0", float(target_center))
             sim.context.setParameter("k", float(final_k_openmm))
             run_steps_safely(
@@ -1602,7 +1621,7 @@ def generate_us_starting_states_by_pulling(
         # Measured before any parameter/position changes below, so it reflects
         # the just-loaded seed, not anything this function is about to do to it.
         hold_scale = _seed_secondary_hold_scale(sim, w)
-        if primary_cv_is_contacts(args):
+        if primary_cv_is_dimensionless(args):
             # Start contact pulls from the current CV with k=0, then ramp in the
             # MD segment.  This avoids an instantaneous many-contact impulse before
             # the first integration step.
@@ -1695,7 +1714,7 @@ def generate_us_starting_states_by_pulling(
                 secondary_bias_kcal = 0.5 * float(secondary_k_kcal) * secondary_delta * secondary_delta
             except Exception:
                 pass
-        _unit_tag = "C" if primary_cv_is_contacts(args) else "A"
+        _unit_tag = "C" if primary_cv_is_dimensionless(args) else "A"
         _center_user = float(centers_user_arr[w])
         pdb_path = pull_dir / f"window_{w:03d}_center_{_center_user:.3f}{_unit_tag}_start.pdb"
         write_state_pdb(pdb_path, app, topology, pos)
@@ -1732,7 +1751,7 @@ def generate_us_starting_states_by_pulling(
         seed_selection_mode = "active-cv"
     seed_secondary_weight = max(0.0, float(getattr(args, "seed_secondary_weight", 1.0) or 0.0))
     seed_max_reuse = int(getattr(args, "seed_max_reuse_per_conformer", 0) or 0)
-    primary_seed_scale = _finite_spacing_scale(centers_user_arr, fallback=(0.2 if primary_cv_is_contacts(args) else 1.0))
+    primary_seed_scale = _finite_spacing_scale(centers_user_arr, fallback=(0.2 if primary_cv_is_contacts(args) else 1.0))   # contact-map: 1 sd
     secondary_seed_scale = _finite_spacing_scale(secondary_cv_centers if secondary_cv_centers is not None else [], fallback=0.25)
 
     # Seed preflight: if the BEST available GENPEPT seed across the whole library
@@ -1762,7 +1781,7 @@ def generate_us_starting_states_by_pulling(
         # it here from the already-resolved flags/defs, warn loudly, and
         # record it in the seed_selection_report — do not hard-raise.
         seed_scoring_degradations = detect_seed_scoring_degradations(
-            primary_is_contacts=primary_cv_is_contacts(args),
+            primary_is_contacts=primary_cv_is_dimensionless(args),
             rel_primary=resolved_cv_defs.get("rel_primary"),
             secondary_available=secondary_available,
             seed_secondary_weight=seed_secondary_weight,
@@ -1886,7 +1905,7 @@ def generate_us_starting_states_by_pulling(
         pos = state.getPositions()
         vel = state.getVelocities()
         pe_kj = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
-        _unit_tag = "C" if primary_cv_is_contacts(args) else "A"
+        _unit_tag = "C" if primary_cv_is_dimensionless(args) else "A"
         _center_user = float(centers_user_arr[w])
         pdb_path = pull_dir / f"window_{w:03d}_center_{_center_user:.3f}{_unit_tag}_CRASHFALLBACK_start.pdb"
         write_state_pdb(pdb_path, app, topology, pos)
@@ -2173,7 +2192,7 @@ def generate_us_starting_states_by_pulling(
                         pass
                 row_pull_steps = max(1, int(pull_steps * distance_fraction))
                 row_base_done = 0
-                previous_row_center = _current_primary_cv_from_context(sim) if primary_cv_is_contacts(args) else None
+                previous_row_center = _current_primary_cv_from_context(sim) if primary_cv_is_dimensionless(args) else None
                 for row_dist_nm in unique_dist_nm:
                     try:
                         _run_primary_pull_segment(
@@ -2181,7 +2200,7 @@ def generate_us_starting_states_by_pulling(
                             float(row_dist_nm), float(pull_k_kj_nm2), row_pull_steps,
                             "us_starting_pull_row_base",
                             row_base_done,
-                            f"US start 2D row base to {primary_cv_format_value(float(row_dist_nm if primary_cv_is_contacts(args) else row_dist_nm * 10.0), args)}",
+                            f"US start 2D row base to {primary_cv_format_value(float(row_dist_nm if primary_cv_is_dimensionless(args) else row_dist_nm * 10.0), args)}",
                             start_center=previous_row_center,
                         )
                         row_base_states[round(float(row_dist_nm), 8)] = sim.context.getState(
@@ -2279,7 +2298,10 @@ def generate_us_starting_states_by_pulling(
         if str(r.get("direction", "")).startswith("pull_crash_fallback"):
             warnings.append(f"pull crashed twice for this window; using unpulled equilibrated state ({r['direction']})")
             status = "bad"
-        if primary_cv_is_contacts(args):
+        if primary_cv_mode(args) == "contact-map":
+            # standardised units (swarm sd 1): a start half an sd off is suspect, one sd bad
+            warn_delta, bad_delta, delta_units = 0.5, 1.0, primary_cv_units(args)
+        elif primary_cv_is_contacts(args):
             contact_scale = contact_normalization_denominator(primary_cv_def.get("contact_pairs", []), args)
             warn_delta = 0.15 if bool(getattr(args, "contact_normalize", True)) else max(1.0, 0.15 * max(1.0, contact_scale))
             bad_delta = 0.30 if bool(getattr(args, "contact_normalize", True)) else max(2.0, 0.30 * max(1.0, contact_scale))

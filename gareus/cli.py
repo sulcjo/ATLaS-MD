@@ -142,8 +142,21 @@ def _add_cv_args(p: argparse.ArgumentParser) -> None:
     # NOTE: "auto" is deliberately NOT a valid --cv1 choice: the primary CV is the
     # fixed nonlocal-contact anchor the whole pipeline is built around (see
     # docs/atlas-md/developer/plans/2026-09-20-auto-cv-pair.md).
-    p.add_argument("--cv1", choices=["distance", "contacts", "nonlocal-contacts"], default=None,
-                   help="Primary CV: distance or contacts.")
+    p.add_argument("--cv1", choices=["distance", "contacts", "nonlocal-contacts", "contact-map"], default=None,
+                   help="Primary CV: distance, contacts, or contact-map (the fitted contact-map tICA CV1 of "
+                        "--cv1-model; in a swarm campaign the epoch-0 analysis fits it and hands it over).")
+    p.add_argument("--cv1-contact-map-k-min", type=float, default=0.0,
+                   help="Contact-map CV1 ladder k lower bound, kcal/mol per (standardised unit)^2 (0 = 0.5). "
+                        "Separate from --cv1-k-min, which a contact-map campaign keeps contact-scaled for its "
+                        "contacts fallback.")
+    p.add_argument("--cv1-contact-map-k-max", type=float, default=0.0,
+                   help="Contact-map CV1 ladder k upper bound (0 = 200: sigma_w 0.055 sd at 300 K).")
+    p.add_argument("--cv1-binding-override", action="store_true",
+                   help="Accept a contact-map campaign's re-analysed epoch-0 CV1 (a different cv1 model or a "
+                        "fallback to contacts) instead of refusing it; replaces cv1_binding.json.")
+    p.add_argument("--cv1-model", default=None,
+                   help="Frozen contact-map CV1 model (swarm/analysis/cv1_model.json, schema "
+                        "cv1_contact_map_v1) for --cv1 contact-map.")
     p.add_argument("--cv2", choices=["none", "alpha", "beta", "alpha-coil-beta", "acb",
                                       "rama-map", "rama", "custom", "tica", "tica-linear",
                                       "torsion-pca", "bootstrap-torsion", "bootstrap-linear",
@@ -254,9 +267,12 @@ def _add_cv_selection_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--secondary-cv-feature-schema", default=None,
                    help="Frozen feature-schema JSON written by the swarm stage "
                         "for cv2 residual-torsion-pc.")
-    p.add_argument("--cv-selection-residual-degree", type=int, choices=[1, 2], default=1,
-                   help="Degree of the CV1->CV2 regression removed by auto CV2 "
-                        "selection in the swarm stage (--swarm-stage analyze).")
+    p.add_argument("--cv-selection-residual-degree", choices=["1", "2", "both"], default="both",
+                   help="Degree of the CV1->CV2 regression removed by auto CV2 selection in the swarm stage "
+                        "(--swarm-stage analyze). both (default since 2026-10-01; was 1): select at degree 1 and "
+                        "2, pool the deployable candidates, same pick rule. Quadratic is not uniformly better: "
+                        "on chignolin it rescues the slow loop torsions against a contact-map CV1 (R2 gate "
+                        "0.54 -> 0.07) but removes the contacts CV1's CV2. 1 restores the linear rule.")
     p.add_argument("--cv-selection-max-nonlinear-r2", type=float, default=0.20,
                    help="Auto CV2 selection (swarm stage) rejects candidates whose "
                         "nonlinear CV1 coupling exceeds this R^2.")
@@ -1010,9 +1026,13 @@ def _add_swarm_args(p: argparse.ArgumentParser) -> None:
                         "2026-10-01-contact-map-cv1.md) and write analysis/cv1_model.json + "
                         "cv1_selection_report.json. Diagnostic: the CV1 design is unchanged and no "
                         "production mode reads the model yet.")
-    p.add_argument("--swarm-cv1-contact-map-r0-a", type=float, default=4.5,
-                   help="Rational switch r0 (A) turning the recorded soft-min residue distances into "
-                        "contacts, 1/(1 + (d/r0)^6) (calibrated 2026-10-01).")
+    p.add_argument("--swarm-cv1-contact-map-atoms", choices=["ca", "heavy"], default="ca",
+                   help="Contact map the CV1 is fitted on: ca = C-alpha distances (default; the only map "
+                        "production can run, GPU-exact and cheap), heavy = heavy-atom soft-min "
+                        "(diagnostic only).")
+    p.add_argument("--swarm-cv1-contact-map-r0-a", type=float, default=None,
+                   help="Rational switch r0 (A) turning the residue distances into contacts, "
+                        "1/(1 + (d/r0)^6). Unset: 8 A for the CA map, 4.5 A for heavy (calibrated 2026-10-01).")
     p.add_argument("--swarm-seed-frame-interval-ps", type=float, default=20.0,
                    help="PDB frame cadence for seed export, in ps.")
     p.add_argument("--swarm-graft-minimize-iters", type=int, default=500,
@@ -1231,10 +1251,15 @@ def _add_platform_args(p: argparse.ArgumentParser) -> None:
 def _resolve_cv_aliases(args: argparse.Namespace, argv_list: list) -> None:
     # cv1 → primary_cv
     if getattr(args, "cv1", None) not in (None, ""):
-        args.primary_cv = ("nonlocal-contacts"
-                           if str(args.cv1).strip().lower().replace("_", "-")
-                           in {"contacts", "nonlocal-contacts"}
-                           else "distance")
+        # YAML values arrive as parser defaults, which argparse never checks against choices:
+        # refuse an unknown CV1 here instead of silently running a distance CV1.
+        _cv1 = str(args.cv1).strip().lower().replace("_", "-")
+        _known = {"contacts": "nonlocal-contacts", "nonlocal-contacts": "nonlocal-contacts",
+                  "distance": "distance", "terminal-distance": "distance", "terminal": "distance",
+                  "contact-map": "contact-map", "contact-map-tica": "contact-map"}
+        if _cv1 not in _known:
+            raise SystemExit(f"ERROR: unknown cv1 {args.cv1!r}; choose from {sorted(set(_known))}")
+        args.primary_cv = _known[_cv1]
 
     # cv2 is canonical secondary CV attr; secondary_cv_mode() reads args.secondary_cv
     _cv2_val = getattr(args, "cv2", None)
@@ -1284,6 +1309,30 @@ def _normalize_run_mode(args: argparse.Namespace, argv_list: list) -> None:
     else:
         args.hmr = False
         args._run_mode_auto_timestep_fs = False
+
+
+#: Window modes that design CV1 windows themselves in contact-fraction or distance terms
+#: ([0, 1] ranges, boundary pulls, feedback rounds); a contact-map CV1 runs only from an explicit
+#: window table (the swarm's windows_lambda_ladder.csv), i.e. manual or adaptive-production.
+_CONTACT_MAP_REFUSED_WINDOW_MODES = ("adaptive", "adaptive-feedback", "double-adaptive", "delaunay-feedback")
+
+
+def _validate_contact_map_cv1_args(p: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    from .cv import primary_cv_is_contact_map
+    if not primary_cv_is_contact_map(args):
+        if getattr(args, "cv1_model", None):
+            p.error("--cv1-model is only used with --cv1 contact-map")
+        return
+    mode = str(getattr(args, "window_mode", "adaptive"))
+    if mode in _CONTACT_MAP_REFUSED_WINDOW_MODES:
+        p.error(f"--cv1 contact-map runs from an explicit window table (window_mode manual or "
+                f"adaptive-production), not window_mode {mode!r}")
+    model = getattr(args, "cv1_model", None)
+    if model and not Path(str(model)).expanduser().exists():
+        p.error(f"--cv1-model {model} does not exist")
+    if str(getattr(args, "swarm_cv1_contact_map_atoms", "ca") or "ca") != "ca":
+        p.error("--cv1 contact-map needs the C-alpha map (--swarm-cv1-contact-map-atoms ca): the heavy-atom "
+                "soft-min has no GPU-exact production force")
 
 
 def _validate_contact_args(args: argparse.Namespace) -> None:
@@ -2081,6 +2130,7 @@ def parse_args(argv: Optional[Iterable[str]] = None):
 
     args.contact_scheme = contact_scheme(args)
     _validate_contact_args(args)
+    _validate_contact_map_cv1_args(p, args)
     _validate_gamd_args(args)
     _validate_fsf_clamp_args(p, args)
     _validate_cv_selection_args(p, args)
@@ -2089,8 +2139,17 @@ def parse_args(argv: Optional[Iterable[str]] = None):
     _cm_lam = float(getattr(args, "swarm_contact_map_lambda_a", 0.2))
     if not (math.isfinite(_cm_lam) and _cm_lam > 0.0):
         p.error("--swarm-contact-map-lambda-a must be positive and finite")
-    _cm_r0 = float(getattr(args, "swarm_cv1_contact_map_r0_a", 4.5))
-    if not (math.isfinite(_cm_r0) and _cm_r0 > 0.0):
+    _out_ps = float(getattr(args, "swarm_output_interval_ps", 2.0) or 2.0)
+    _frame_ps = float(getattr(args, "swarm_seed_frame_interval_ps", 20.0) or 20.0)
+    _ratio = _frame_ps / _out_ps if _out_ps > 0 else float("nan")
+    _swarm_runs = (str(getattr(args, "swarm_stage", "off") or "off") != "off"
+                   or str(getattr(args, "window_mode", "")) == "adaptive-production")
+    if _swarm_runs and not (math.isfinite(_ratio) and _ratio >= 1.0 - 1e-9 and abs(_ratio - round(_ratio)) <= 1e-6):
+        p.error(f"--swarm-seed-frame-interval-ps {_frame_ps:g} must be a whole multiple of "
+                f"--swarm-output-interval-ps {_out_ps:g} (frames are written every N trace rows; "
+                f"{_ratio:g} would round to {max(1, round(_ratio)) * _out_ps:g} ps)")
+    _cm_r0 = getattr(args, "swarm_cv1_contact_map_r0_a", None)
+    if _cm_r0 is not None and not (math.isfinite(float(_cm_r0)) and float(_cm_r0) > 0.0):
         p.error("--swarm-cv1-contact-map-r0-a must be positive and finite")
     _validate_npt_args(args)
     _validate_replica_admission_args(args)
