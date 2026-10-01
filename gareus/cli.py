@@ -305,6 +305,14 @@ def _add_cv_selection_args(p: argparse.ArgumentParser) -> None:
                         "mean + 2 sd < --cv-selection-min-gain-nats (demonstrably uninformative). "
                         "0 = the single historical assignment (before 2026-10-01); the single draw "
                         "moves by +-0.02-0.05 nats on chignolin's swarm.")
+    p.add_argument("--cv-selection-pick", choices=["breadth-tie-slowest", "slowest"], default="breadth-tie-slowest",
+                   help="Slowness ranking, among candidates passing every gate. breadth-tie-slowest "
+                        "(default): the slowest of the candidates whose fold-averaged information gain "
+                        "is within --cv-selection-breadth-tie-sd combined sd of the broadest one. "
+                        "slowest: the slowest, ignoring breadth (the rule before 2026-10-01).")
+    p.add_argument("--cv-selection-breadth-tie-sd", type=float, default=1.0,
+                   help="Width of the breadth tie-set of --cv-selection-pick breadth-tie-slowest, in "
+                        "combined standard deviations of the fold-averaged gain.")
     p.add_argument("--cv-selection-half-split-min-corr", type=float, default=0.8,
                    help="Both seed-family halves, refitted from scratch, must pick a CV2 with "
                         "|r| >= this against the full-data winner, else cv1_only.")
