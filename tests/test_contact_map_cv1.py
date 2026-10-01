@@ -155,8 +155,9 @@ def _swarm_on_disk(tmp_path, n_members=3, n_rows=30, stride=5, record=(True, Tru
     with open(topo_pdb, "w") as fh:
         app.PDBFile.writeFile(top, rng.normal(scale=0.8, size=(30, 3)) * unit.nanometer, fh)
     top = app.PDBFile(str(topo_pdb)).topology
-    definition = CMAP.contact_map_definition(top)
-    ev = CMAP.ContactMapEvaluator(definition)
+    definitions = {a: CMAP.contact_map_definition(top, atoms=a) for a in (CMAP.ATOMS_HEAVY, CMAP.ATOMS_CA)}
+    definition = definitions[CMAP.ATOMS_CA]                            # the map the fit uses by default
+    evs = {a: CMAP.ContactMapEvaluator(d) for a, d in definitions.items()}
     rd = tmp_path / "round_000"
     frame_candidates, ok_traces, positions = [], {}, {}
     for m in range(n_members):
@@ -166,8 +167,10 @@ def _swarm_on_disk(tmp_path, n_members=3, n_rows=30, stride=5, record=(True, Tru
         ok_traces[m] = {"frame": np.arange(n_rows, dtype=float), "cv1": rng.random(n_rows),
                         "e2e_nm": rng.random(n_rows), "rg_nm": rng.random(n_rows)}
         if record[m]:
-            np.save(md / CMAP.FEATURES_NAME, np.vstack([ev(x) for x in xyz]))
-            CMAP.write_index(md / CMAP.INDEX_NAME, definition)
+            for a, d in definitions.items():                           # members record both maps
+                f_name, i_name = CMAP.file_names(a)
+                np.save(md / f_name, np.vstack([evs[a](x) for x in xyz]))
+                CMAP.write_index(md / i_name, d)
         for f in range(stride - 1, n_rows, stride):
             path = md / "frames" / f"frame_{f:05d}.pdb"
             with open(path, "w") as fh:
@@ -264,7 +267,7 @@ def test_recorded_map_with_a_wrong_row_count_falls_back_to_pdb_frames(tmp_path):
     args = SimpleNamespace(swarm_contact_map_min_separation=3, swarm_contact_map_lambda_a=0.2)
     for extra in (1, -1):
         ds, tr, fc, rd, topo, _ = _swarm_on_disk(tmp_path / f"x{extra}")
-        path = rd / "member_0001" / CMAP.FEATURES_NAME
+        path = rd / "member_0001" / CMAP.CA_FEATURES_NAME
         X = np.load(path)
         np.save(path, np.vstack([np.full((1, X.shape[1]), 9.9), X]) if extra > 0 else X[:-1])
         warn = []
@@ -300,7 +303,8 @@ def test_cli_and_yaml_keys(tmp_path):
     from gareus.cli import parse_args
     base = ["--seq", "GYDPETGTWG", "--out", str(tmp_path / "o")]
     a = parse_args(base)
-    assert a.swarm_cv1_contact_map_fit is False and a.swarm_cv1_contact_map_r0_a == 4.5
+    assert a.swarm_cv1_contact_map_fit is False and a.swarm_cv1_contact_map_r0_a is None
+    assert a.swarm_cv1_contact_map_atoms == "ca"
     assert parse_args(base + ["--swarm-cv1-contact-map-fit"]).swarm_cv1_contact_map_fit is True
     with pytest.raises(SystemExit):
         parse_args(base + ["--swarm-cv1-contact-map-r0-a", "0"])

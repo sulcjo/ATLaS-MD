@@ -227,6 +227,32 @@ SIDECAR_NAME = "ladder_run_args.yaml"
 _SIDECAR_PATH_KEYS = ("secondary_cv_model", "secondary_cv_candidate_set", "secondary_cv_feature_schema")
 
 
+CV1_BINDING_NAME = "cv1_binding.json"
+
+
+def _hold_cv1_binding(args, out_dir, cv1, side: Dict[str, Any]) -> None:
+    """Freeze a contact-map campaign's epoch-0 CV1 decision at the campaign root, on first use.
+
+    The sidecar lives in swarm/analysis, which a re-run of the analysis rewrites together with
+    cv1_model.json; without a record outside it a later job would silently run another model, or
+    contacts, against windows and samples designed in the first. ``--cv1-binding-override``
+    accepts a deliberate re-analysis."""
+    import json
+    if cv1 in (None, ""):
+        return
+    decided = {"cv1": str(cv1), "cv1_model_sha256": side.get("cv1_model_sha256") if str(cv1) == "contact-map" else None}
+    path = Path(out_dir) / CV1_BINDING_NAME
+    if path.exists() and not bool(getattr(args, "cv1_binding_override", False)):
+        held = json.loads(path.read_text())
+        if {k: held.get(k) for k in decided} != decided:
+            raise RuntimeError(f"epoch 0's CV1 decision {decided} differs from the campaign's frozen {held} "
+                               f"({path}); the analysis was re-run mid-campaign. Pass --cv1-binding-override "
+                               "to adopt the new decision knowingly")
+        return
+    from gareus.io import write_json
+    write_json(path, decided)
+
+
 def apply_epoch0_sidecar(args, out_dir) -> Dict[str, Any]:
     """Apply what epoch 0 decided about the CVs to the campaign arguments, in place.
 
@@ -245,6 +271,25 @@ def apply_epoch0_sidecar(args, out_dir) -> Dict[str, Any]:
     side = _load_config_file(path) or {}
     applied: Dict[str, Any] = {}
     cvs = side.get("cvs") or {}
+    cv1 = cvs.get("cv1")
+    if str(getattr(args, "primary_cv", "")) == "contact-map":
+        _hold_cv1_binding(args, out_dir, cv1, side)
+    if cv1 not in (None, "") and str(cv1) in ("contact-map", "contacts") and \
+            str(getattr(args, "primary_cv", "")) == "contact-map":
+        # a contact-map campaign: epoch 0 fitted the CV1 (or fell back to contacts, spec section 7)
+        args.cv1 = str(cv1)
+        args.primary_cv = "contact-map" if str(cv1) == "contact-map" else "nonlocal-contacts"
+        applied["primary_cv"] = args.primary_cv
+    if side.get("cv1_model") not in (None, "") and str(getattr(args, "primary_cv", "")) == "contact-map":
+        # a user-given --cv1-model (campaign moved between hosts) is kept; the sha decides
+        if not getattr(args, "cv1_model", None):
+            args.cv1_model = str(side["cv1_model"])
+        applied["cv1_model"] = args.cv1_model
+        if side.get("cv1_model_sha256"):
+            # every segment of the campaign must run the model the windows were designed in: a
+            # re-analysis that rewrote cv1_model.json is refused at the force build
+            args.cv1_model_sha256_expected = str(side["cv1_model_sha256"])
+            applied["cv1_model_sha256"] = args.cv1_model_sha256_expected
     cv2 = cvs.get("cv2")
     if cv2 not in (None, ""):
         args.secondary_cv = str(cv2)

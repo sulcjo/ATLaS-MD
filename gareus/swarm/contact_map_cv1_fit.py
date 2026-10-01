@@ -92,11 +92,21 @@ def _pdb_rows(frame_candidates, ok_traces, rows_of) -> List[Tuple[int, str]]:
     return sorted(out)
 
 
-def _native_maps(rd: Path, members, ok_traces, warnings: List[str]) -> Optional[Tuple[Dict[int, np.ndarray], dict]]:
+def map_atoms(args) -> str:
+    """The contact-map atom selection the CV1 is fitted on (``--swarm-cv1-contact-map-atoms``)."""
+    return str(getattr(args, "swarm_cv1_contact_map_atoms", CMAP.ATOMS_CA) or CMAP.ATOMS_CA)
+
+
+#: Rational-switch r0 (A) by atom selection: CA 8 A (2026-10-01 calibration, G0 CA info 0.283 nats),
+#: heavy soft-min 4.5 A (the first calibration).
+DEFAULT_R0_BY_ATOMS = {CMAP.ATOMS_CA: 8.0, CMAP.ATOMS_HEAVY: CM1.DEFAULT_SWITCH_R0_ANGSTROM}
+
+
+def _native_maps(rd: Path, members, ok_traces, warnings: List[str], atoms: str = CMAP.ATOMS_CA) -> Optional[Tuple[Dict[int, np.ndarray], dict]]:
     """Every member's recorded map with one shared definition and one row per trace row, else None."""
     maps, definition = {}, None
     for m in members:
-        got = CMAP.load_member_contact_map(rd / f"member_{int(m):04d}")
+        got = CMAP.load_member_contact_map(rd / f"member_{int(m):04d}", atoms)
         if got is None:
             return None
         X, d = got
@@ -147,7 +157,8 @@ def assemble(dataset, ok_traces, frame_candidates, rd: Path, topology_pdb: Path,
     rows_of = _row_lookup(dataset)
     pdb = _pdb_rows(frame_candidates, ok_traces, rows_of)
     topology = app.PDBFile(str(topology_pdb)).topology
-    native = _native_maps(Path(rd), np.unique(dataset.member_ids), ok_traces, warnings)
+    atoms = map_atoms(args)
+    native = _native_maps(Path(rd), np.unique(dataset.member_ids), ok_traces, warnings, atoms)
     if native is not None:
         maps, definition = native
         rows = np.arange(len(dataset.member_ids))
@@ -156,11 +167,11 @@ def assemble(dataset, ok_traces, frame_candidates, rd: Path, topology_pdb: Path,
     else:
         definition = CMAP.contact_map_definition(
             topology, min_sequence_separation=int(getattr(args, "swarm_contact_map_min_separation", 3)),
-            lambda_angstrom=float(getattr(args, "swarm_contact_map_lambda_a", 0.2)))
+            lambda_angstrom=float(getattr(args, "swarm_contact_map_lambda_a", 0.2)), atoms=atoms)
         rows = np.asarray([r for r, _ in pdb], dtype=np.int64)
         D = None
         source = SOURCE_PDB
-        warnings.append(f"cv1 contact map: members did not all record contact_map_features.npy; fitting on "
+        warnings.append(f"cv1 contact map: members did not all record {CMAP.file_names(atoms)[0]}; fitting on "
                         f"the {rows.size} rows with a PDB frame (contact_map_source: {SOURCE_PDB})")
     evaluator = CMAP.ContactMapEvaluator(definition)
     ca_rows, ca_xyz, pdb_maps = [], [], []
@@ -209,7 +220,7 @@ def _finish(dataset, ok_traces, rows, D, definition, source, ca_rows, ca_xyz, to
 
 def fit_config(args) -> CM1.CV1FitConfig:
     return CM1.CV1FitConfig(
-        switch_r0_angstrom=float(getattr(args, "swarm_cv1_contact_map_r0_a", CM1.DEFAULT_SWITCH_R0_ANGSTROM)),
+        switch_r0_angstrom=float(getattr(args, "swarm_cv1_contact_map_r0_a", None) or DEFAULT_R0_BY_ATOMS[map_atoms(args)]),
         tica_lag_ps=float(getattr(args, "cv_selection_tica_lag_ps", 50.0)),
         slowness_lag_ps=float(getattr(args, "cv_selection_slowness_lag_ps", 200.0)),
         min_slowness_rho=float(getattr(args, "cv_selection_min_slowness", 0.72)),

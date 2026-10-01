@@ -810,7 +810,7 @@ class DistanceLogger:
 
         win_meta = info.get("window_metadata", {}) or {}
         contact_meta = win_meta.get("contact_adaptive", {}) if isinstance(win_meta, dict) else {}
-        if primary_mode == "nonlocal-contacts" or primary_units in {"dimensionless", ""}:
+        if primary_mode != "contact-map" and (primary_mode == "nonlocal-contacts" or primary_units in {"dimensionless", ""}):
             # Contact maps should display the intended contact-fraction range,
             # not an Angstrom-style padded range.  effective_max is what
             # autocalibration selected; max is the user-requested ceiling.
@@ -864,6 +864,8 @@ class DistanceLogger:
         span = max(0.5, hi - lo)
         lo -= max(0.25, 0.08 * span)
         hi += max(0.25, 0.08 * span)
+        if primary_mode == "contact-map":      # signed standardised coordinate: no floor at 0
+            return float(lo), float(max(hi, lo + 0.5)), "contact-map-target"
         return float(max(0.0, lo)), float(max(hi, lo + 0.5)), "distance-target"
 
     def _primary_axis_tick_label(self, value: float, info: dict) -> str:
@@ -874,7 +876,7 @@ class DistanceLogger:
             v = float(value)
         except Exception:
             return str(value)[:5]
-        if primary_mode == "nonlocal-contacts" or primary_units in {"dimensionless", ""}:
+        if primary_mode in ("nonlocal-contacts", "contact-map") or primary_units in {"dimensionless", ""}:
             if abs(v) < 0.995:
                 return f"{v:.2f}"
             return f"{v:.2f}"

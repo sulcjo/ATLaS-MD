@@ -124,7 +124,8 @@ class CompiledResidualComponent:
             elif kind == ROLE_CONTACT_SUM:
                 if contact is not None:
                     raise ValueError("more than one contact_sum role")
-                contact = value
+                # the contact-map anchor's sub-CV is c + offset (offset recorded with the role)
+                contact = value - float(role.get("offset", 0.0))
             else:
                 raise ValueError(f"unknown sub-CV role {kind!r}")
         if contact is None:

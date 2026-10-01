@@ -8471,7 +8471,10 @@ def _apply_epoch0_cv_decision_on_resume(args, out_dir) -> Dict[str, Any]:
     envelope directory as every segment before it -- and only while CV2 is still
     ``'auto'``: an explicit CV2 is never overridden.
     """
-    if str(getattr(args, "secondary_cv", "") or "") != "auto":
+    # also for a contact-map CV1 campaign: its model path (or its fallback to contacts) comes from
+    # epoch 0 whatever CV2 is
+    if (str(getattr(args, "secondary_cv", "") or "") != "auto"
+            and str(getattr(args, "primary_cv", "") or "") != "contact-map"):
         return {}
     from gareus.swarm.epoch0 import SIDECAR_NAME, analysis_dir, apply_epoch0_sidecar
 

@@ -32,7 +32,7 @@ a statement about the 300 K equilibrium ensemble.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Optional
 
 import numpy as np
@@ -325,9 +325,70 @@ def _reproducibility(fit: ResidualFit, halves: list, X, a, scores: dict, cfg: Se
             row["deployable"] = False
 
 
+RESIDUAL_DEGREES_BOTH = (1, 2)
+
+
+def _pooled_pick(pooled: Mapping[tuple, dict], cfg: SelectionConfig, ranking: str) -> Optional[tuple]:
+    """(degree, component) winning among deployable candidates of several residual degrees.
+
+    Same rule as :func:`_pick` within one degree: slowness ranking takes the breadth tie-set
+    (fold-averaged gain within ``breadth_tie_sd`` combined sd of the broadest), then the slowest;
+    gain ranking the largest gain. Exact ties go to the lower degree, then the lower index."""
+    if not pooled:
+        return None
+    order = lambda key: (-key[0], -key[1])                            # prefer degree 1, then low j
+    if ranking != "slowness":
+        return max(pooled, key=lambda k: (pooled[k]["gain_nats"], order(k)))
+    rows = pooled
+    if cfg.pick_rule == "breadth-tie-slowest" and all("gain_nats_mean" in r for r in rows.values()):
+        broad = max(rows, key=lambda k: (rows[k]["gain_nats_mean"], order(k)))
+        m0, s0 = rows[broad]["gain_nats_mean"], rows[broad]["gain_nats_sd"]
+        rows = {k: r for k, r in rows.items()
+                if r["gain_nats_mean"] >= m0 - float(cfg.breadth_tie_sd) * float(np.hypot(s0, r["gain_nats_sd"]))}
+    return max(rows, key=lambda k: (rows[k]["slowness_rho"], order(k)))
+
+
+def select_cv_pair_over_degrees(data: SwarmDataset, config: SelectionConfig, *,
+                                degrees: tuple = RESIDUAL_DEGREES_BOTH, **kw) -> PairSelection:
+    """Best of several residual degrees (default since 2026-10-01: linear and quadratic).
+
+    Every degree is selected as usual; the deployable candidates of all degrees are pooled and the
+    same pick rule decides (:func:`_pooled_pick`). The winning degree's selection is returned (its
+    candidate set and pair model are what deploy), re-run with that component when its own pick
+    differed. With no deployable candidate anywhere the lowest degree's result (cv1_only) is
+    returned. A quadratic residual is not uniformly better: on chignolin it rescued the slow loop
+    torsions against a contact-map CV1 (R2 gate 0.54 -> 0.07) but removed the contacts CV1's
+    CV2 (its bimodality and seed-half reproducibility fell below the gates)."""
+    runs = {int(d): select_cv_pair(data, replace(config, residual_degree=int(d)), **kw) for d in degrees}
+    pooled = {(d, int(j)): row for d, sel in runs.items()
+              for j, row in (sel.report.get("components") or {}).items() if row.get("deployable")}
+    ranking = str(runs[min(runs)].report.get("ranking", config.ranking))
+    winner = _pooled_pick(pooled, config, ranking)
+    comparison = {str(d): {"status": sel.status,
+                           "selected_component_index": (int(sel.pair_model.selected_component_index)
+                                                        if sel.pair_model is not None else None),
+                           "deployable": sorted(j for (dd, j) in pooled if dd == d)}
+                  for d, sel in runs.items()}
+    if winner is None:
+        chosen, degree = runs[min(runs)], min(runs)
+    else:
+        degree, j = winner
+        chosen = runs[degree]
+        if chosen.pair_model is None or int(chosen.pair_model.selected_component_index) != j:
+            chosen = select_cv_pair(data, replace(config, residual_degree=degree), force_component=j, **kw)
+    chosen.report["residual_degree_mode"] = "best-of-" + "-".join(str(d) for d in sorted(runs))
+    chosen.report["residual_degree_selected"] = int(degree)
+    chosen.report["residual_degree_comparison"] = comparison
+    if winner is not None:
+        chosen.report["selection_reason"] = (f"residual degree {degree} component {winner[1]}: pooled over degrees "
+                                             f"{sorted(runs)} -- {chosen.report.get('selection_reason')}")
+    return chosen
+
+
 def select_cv_pair(data: SwarmDataset, config: SelectionConfig, *, physical_system_sha256: str,
                    training_rows_sha256: str, library_versions: Mapping[str, str],
-                   genpept_preset: str, deployment: Optional[Mapping[str, Any]] = None) -> PairSelection:
+                   genpept_preset: str, deployment: Optional[Mapping[str, Any]] = None,
+                   force_component: Optional[int] = None) -> PairSelection:
     # A fold-biased GENPEPT preset (e.g. "chignolin") is accepted and RECORDED, not refused:
     # the selection then rests on a library that knows the fold, and the pair model says so
     # (``genpept_preset``) so no downstream reader can mistake it for an ab initio run.
@@ -382,6 +443,11 @@ def select_cv_pair(data: SwarmDataset, config: SelectionConfig, *, physical_syst
     if ranking == "slowness":
         _reproducibility(fit, _half_fits(X, a, shape, groups, config, time), X, a, scores, config)
     winner, why = _pick(scores, config, ranking)
+    if force_component is not None and int(force_component) != winner:
+        # select_cv_pair_over_degrees: the pooled pick across residual degrees decided
+        if not scores.get(int(force_component), {}).get("deployable"):
+            raise ValueError(f"forced component {force_component} is not deployable at degree {config.residual_degree}")
+        winner, why = int(force_component), "pooled pick across residual degrees"
     report["components"] = {str(j): s for j, s in scores.items()}
     report["selection_reason"] = why
     lower = "slowness" if ranking == "slowness" else "information gain"
