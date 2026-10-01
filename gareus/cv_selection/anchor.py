@@ -4,7 +4,7 @@ import numpy as np
 from . import contracts as C
 from ..swarm.ladder_design import n_resolvable_windows
 
-DEPLOYABLE_ANCHOR_KINDS = frozenset({"nonlocal-contact-fraction"})
+DEPLOYABLE_ANCHOR_KINDS = frozenset({"nonlocal-contact-fraction", "end-to-end-distance"})  # anchor_spec.ANCHOR_KINDS
 
 
 @dataclass(frozen=True)

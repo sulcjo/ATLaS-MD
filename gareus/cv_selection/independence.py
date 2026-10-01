@@ -102,7 +102,7 @@ def frame_partition(features, *, n_cells: int, seed: int = DEFAULT_FOLD_SEED) ->
     return labels.astype(np.int64), centres
 
 
-def _heldout_cross_entropy(cells, coords, groups, n_bins, n_folds, alpha) -> float:
+def _heldout_cross_entropy(cells, coords, groups, n_bins, n_folds, alpha, fold_seed: int = DEFAULT_FOLD_SEED) -> float:
     """Mean held-out ``-log P(cell | bin(coords))`` with additive smoothing."""
     cells = np.asarray(cells, dtype=np.int64)
     coords = np.asarray(coords, dtype=np.float64)
@@ -113,7 +113,7 @@ def _heldout_cross_entropy(cells, coords, groups, n_bins, n_folds, alpha) -> flo
     n_cells = int(cells.max()) + 1
     total = 0.0
     count = 0
-    for hold in grouped_folds(groups, n_folds):
+    for hold in grouped_folds(groups, n_folds, seed=fold_seed):
         train = np.setdiff1d(np.arange(cells.size), hold)
         edges = [_equal_mass_edges(coords[train, k], bins_per_axis) for k in range(k_axes)]
 
@@ -137,9 +137,11 @@ def _heldout_cross_entropy(cells, coords, groups, n_bins, n_folds, alpha) -> flo
 
 
 def incremental_cell_information(cells, z1, z2, groups, *, n_bins: int = 10, n_folds: int = 4,
-                                 alpha: float = 1.0) -> dict:
-    """``I(cell; z2 | z1)`` estimated as ``L(z1) - L(z1, z2)`` in nats, plus the pieces."""
-    l1 = _heldout_cross_entropy(cells, z1, groups, n_bins, n_folds, alpha)
-    l2 = _heldout_cross_entropy(cells, z2, groups, n_bins, n_folds, alpha)
-    l12 = _heldout_cross_entropy(cells, np.column_stack([z1, z2]), groups, n_bins, n_folds, alpha)
+                                 alpha: float = 1.0, fold_seed: int = DEFAULT_FOLD_SEED) -> dict:
+    """``I(cell; z2 | z1)`` estimated as ``L(z1) - L(z1, z2)`` in nats, plus the pieces.
+
+    ``fold_seed`` picks the seed-family-to-fold assignment (the default is the historical one)."""
+    l1 = _heldout_cross_entropy(cells, z1, groups, n_bins, n_folds, alpha, fold_seed)
+    l2 = _heldout_cross_entropy(cells, z2, groups, n_bins, n_folds, alpha, fold_seed)
+    l12 = _heldout_cross_entropy(cells, np.column_stack([z1, z2]), groups, n_bins, n_folds, alpha, fold_seed)
     return {"l1": float(l1), "l2": float(l2), "l12": float(l12), "gain": float(l1 - l12)}

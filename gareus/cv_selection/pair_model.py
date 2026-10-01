@@ -43,6 +43,9 @@ CERTIFICATE_FIELDS_V2 = (CERTIFICATE_FIELDS - {"cov_q_weighted"}) | {
 MAX_CERTIFIED_COVARIANCE = 1e-8
 
 DEPLOYMENT_FIELDS = frozenset({"topology_sha256", "physical_system_sha256", "contact_pair_list_sha256", "deployable"})
+#: Optional (2026-10-01, spec generic-cv1-anchor): a non-contact anchor's binding
+#: (``anchor_spec.binding_digest``). Absent for contact anchors, whose bytes are unchanged.
+OPTIONAL_DEPLOYMENT_FIELDS = frozenset({"anchor_binding_sha256"})
 
 
 def _parse_deployment(raw: Any) -> dict[str, Any]:
@@ -51,12 +54,20 @@ def _parse_deployment(raw: Any) -> dict[str, Any]:
     label = "pair model.deployment"
     if not isinstance(raw, Mapping):
         _fail(ReasonCode.WRONG_TYPE, f"{label} must be a mapping")
-    _exact_fields(raw, set(DEPLOYMENT_FIELDS), label)
+    _exact_fields(raw, set(DEPLOYMENT_FIELDS) | (set(raw) & set(OPTIONAL_DEPLOYMENT_FIELDS)), label)
     if not isinstance(raw["deployable"], bool):
         _fail(ReasonCode.WRONG_TYPE, f"{label}.deployable must be a boolean")
     out: dict[str, Any] = {"deployable": raw["deployable"]}
+    anchor_bound = "anchor_binding_sha256" in raw
+    if anchor_bound:
+        out["anchor_binding_sha256"] = _hex64(raw["anchor_binding_sha256"], f"{label}.anchor_binding_sha256",
+                                              allow_none=True)
+        if raw["deployable"] and out["anchor_binding_sha256"] is None:
+            _fail(ReasonCode.MISSING_FIELD, f"{label}.anchor_binding_sha256 is required for a deployable pair")
     for key in ("topology_sha256", "physical_system_sha256", "contact_pair_list_sha256"):
         out[key] = _hex64(raw[key], f"{label}.{key}", allow_none=True)
+        if key == "contact_pair_list_sha256" and anchor_bound:
+            continue                       # a non-contact anchor binds anchor_binding_sha256 instead
         if raw["deployable"] and out[key] is None:
             _fail(ReasonCode.MISSING_FIELD,
                   f"{label}.{key} is required for a deployable pair; mark deployable=false for a "

@@ -512,11 +512,14 @@ def secondary_structure_score_from_positions_nm(positions_nm, ss_info: Optional[
 
     if mode == "residual-torsion-pc":
         runtime = _residual_runtime_from_ss_info(ss_info)
+        # anchor_pairs (2026-10-01) holds the anchor's atom pairs for every kind; older
+        # records only carry the contact anchor's contact_pairs.
+        pairs = ss_info.get("anchor_pairs", ss_info.get("contact_pairs", []))
         return residual_cv2_from_positions_nm(
             positions_nm, runtime,
             [tuple(map(int, quart)) for quart in ss_info.get("phi_torsions", [])],
             [tuple(map(int, quart)) for quart in ss_info.get("psi_torsions", [])],
-            [tuple(pair) for pair in ss_info.get("contact_pairs", [])],
+            [tuple(pair) for pair in pairs],
         )
 
     if mode in {"tica-linear", "torsion-pca"}:
@@ -599,8 +602,9 @@ def residual_cv2_from_positions_nm(positions_nm, runtime, phi_torsions, psi_tors
                                    contact_pairs) -> float:
     """The residual-torsion CV2 exactly as the OpenMM force defines it.
 
-    Contact parameters come from the runtime's own anchor definition, which
-    ``PairModelRuntime.check_anchor`` has proven equal to the run's ``args``;
+    ``contact_pairs`` are the anchor's atom pairs (``anchor_spec.anchor_pairs``: the contact
+    list, or the one end-to-end atom pair). Contact parameters come from the runtime's own
+    anchor definition, which ``PairModelRuntime.check_anchor`` has proven equal to the run's ``args``;
     this keeps the evaluator usable after a resume, when no ``args`` travels
     with the reloaded metadata. Degree-2 models clamp the anchor to the
     training range, mirroring the force expression.
@@ -610,7 +614,8 @@ def residual_cv2_from_positions_nm(positions_nm, runtime, phi_torsions, psi_tors
 
     positions = np.asarray(positions_nm, dtype=np.float64)
     feats = backbone_dihedral_features(positions, list(phi_torsions), list(psi_torsions))
-    anchor_value = nonlocal_contact_cv_from_positions_nm(positions, contact_pairs, runtime.contact_args())
+    from .cv_selection.anchor_spec import value_from_positions
+    anchor_value = value_from_positions(runtime.anchor_kind, positions, list(contact_pairs), runtime)
     value = evaluate_component(runtime.fit, runtime.j, feats[None, :], np.array([anchor_value]))
     return float(value[0])
 

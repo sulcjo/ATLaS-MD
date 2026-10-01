@@ -299,6 +299,12 @@ def _add_cv_selection_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--cv-selection-min-bimodality", type=float, default=5.0 / 9.0,
                    help="With --cv-selection-modality bc: minimum Sarle bimodality coefficient of "
                         "CV2 within some CV1 cell (5/9 = uniform distribution).")
+    p.add_argument("--cv-selection-gain-resamples", type=int, default=8,
+                   help="Slowness ranking: test the information-gain floor on the gain averaged over "
+                        "this many seed-family-to-fold assignments, rejecting a candidate only when "
+                        "mean + 2 sd < --cv-selection-min-gain-nats (demonstrably uninformative). "
+                        "0 = the single historical assignment (before 2026-10-01); the single draw "
+                        "moves by +-0.02-0.05 nats on chignolin's swarm.")
     p.add_argument("--cv-selection-half-split-min-corr", type=float, default=0.8,
                    help="Both seed-family halves, refitted from scratch, must pick a CV2 with "
                         "|r| >= this against the full-data winner, else cv1_only.")
@@ -1365,6 +1371,13 @@ def _validate_cv_selection_args(p: argparse.ArgumentParser, args: argparse.Names
             p.error("--cv2 auto selects CV2 inside the swarm stage; a manual production "
                     "run must pass --cv2 residual-torsion-pc with the three frozen "
                     "artifact paths")
+        # The residual CV2 is fitted against the run's CV1 (cv_selection.anchor_spec): the
+        # contact fraction, or the terminal CA--CA distance in A. Refuse anything else now.
+        from .cv_selection.anchor_spec import anchor_kind_for_args
+        try:
+            anchor_kind_for_args(args)
+        except ValueError as exc:
+            p.error(f"--cv2 auto: {exc}")
     elif mode == "residual-torsion-pc":
         # Frozen in every window mode, not only manual: the sidecar sets manual, but a
         # hand-written adaptive config must not be allowed to switch a frozen pair either.

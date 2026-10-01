@@ -197,9 +197,10 @@ def build_or_load_plan(args, out_dir, round_index: int, *, topology, contact_pai
     if round_index == 0:
         if not contact_pairs:
             raise SystemExit(
-                "--swarm-stage needs a nonlocal-contacts primary CV (contact_pairs is empty); "
-                "heavy-CV1 is the swarm's stratification coordinate and a distance-mode CV "
-                "cannot stratify it"
+                "--swarm-stage needs a nonlocal-contacts primary CV to RUN round-0 members "
+                "(contact_pairs is empty); heavy-CV1 is the swarm's stratification coordinate. "
+                "A distance-anchored campaign (--cv1 distance with cv2 auto) can reuse a finished "
+                "round 0: the analysis designs on the recorded e2e_nm (spec 2026-10-01-generic-cv1-anchor)"
             )
         ca_indices_in_seed = _ca_indices_in_seed(library, topology)
         dropped: list = []

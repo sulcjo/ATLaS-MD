@@ -401,6 +401,13 @@ class PairModelRuntime:
             raise RuntimeError(
                 "pair model is not deployable: it carries no real topology/system/contact-pair bindings "
                 f"(deployment={pair.deployment}); a discovery-only artifact cannot restrain production")
+        bound = pair.deployment.get("anchor_binding_sha256")
+        if bound is not None:
+            from .anchor_spec import binding_digest
+            want = binding_digest(str(pair.anchor["kind"]), dict(pair.anchor["definition"]))
+            if bound != want:
+                raise RuntimeError(f"pair model anchor binding {bound[:12]} does not match its own anchor "
+                                   f"definition ({want[:12] if want else None})")
         atoms = tuple(tuple(int(i) for i in f.atom_indices) for f in schema.features if f.trig == "sin")
         return cls(from_candidate_set(candidates), int(pair.selected_component_index),
                    str(pair.anchor["kind"]), dict(pair.anchor["definition"]), pair.sha256, atoms,
@@ -408,6 +415,9 @@ class PairModelRuntime:
 
     def contact_args(self) -> SimpleNamespace:
         """The contact parameters as an ``args``-shaped object, from the frozen definition."""
+        from .anchor_spec import is_contact
+        if not is_contact(self.anchor_kind):
+            raise RuntimeError(f"anchor {self.anchor_kind!r} has no contact parameters")
         d = self.anchor_definition
         return SimpleNamespace(
             contact_r0_a=float(d["r0_angstrom"]),
@@ -429,9 +439,26 @@ class PairModelRuntime:
                                    f"yields {actual}; same width, different coordinate")
 
     def check_anchor(self, args, contact_pairs) -> None:
-        """Every frozen anchor parameter must equal the run's, including the pair list itself."""
-        from ..cv import contact_normalization_denominator
+        """Every frozen anchor parameter must equal the run's, including the pair list itself.
 
+        ``contact_pairs`` are the run's anchor pairs (``anchor_spec.anchor_pairs``). The run's
+        CV1 must define the model's anchor kind: a contact model never deploys on a distance
+        run, nor the reverse."""
+        from ..cv import contact_normalization_denominator
+        from . import anchor_spec as AS
+
+        run_kind = self.anchor_kind
+        if getattr(args, "primary_cv", None) not in (None, ""):        # the run records its CV1
+            try:
+                run_kind = AS.anchor_kind_for_args(args)
+            except ValueError as exc:
+                raise RuntimeError(f"pair model anchor {self.anchor_kind!r}: the run's CV1 has no anchor ({exc})")
+        if run_kind != self.anchor_kind:
+            raise RuntimeError(f"anchor kind mismatch: pair model fitted against {self.anchor_kind!r}, "
+                               f"the run's CV1 is {run_kind!r}")
+        if not AS.is_contact(self.anchor_kind):
+            AS.check_run_matches(self.anchor_kind, self.anchor_definition, contact_pairs)
+            return
         d = self.anchor_definition
         for key, attr in _ANCHOR_ARG_KEYS:
             if key in d and not _same(d[key], getattr(args, attr, None)):

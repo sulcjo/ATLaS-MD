@@ -204,7 +204,8 @@ def _withhold_ladder_artifacts(an: Path) -> None:
     (an / "ladder_run_args.yaml").unlink(missing_ok=True)
 
 
-def _library_cv1_for_round0(rd0: Path, plan_meta: dict, warnings: List[str]) -> np.ndarray:
+def _library_cv1_for_round0(rd0: Path, plan_meta: dict, warnings: List[str],
+                            anchor_kind: str = "nonlocal-contact-fraction") -> np.ndarray:
     """The real per-seed heavy-CV1 sample for the "centre must lie inside library
     coverage" cap, read from round 0's ``seed_descriptors.csv`` (written by
     ``driver._write_seed_descriptors``). Falls back to ``plan_meta["edges"]["cv1"]``
@@ -215,8 +216,9 @@ def _library_cv1_for_round0(rd0: Path, plan_meta: dict, warnings: List[str]) -> 
     """
     path = rd0 / "seed_descriptors.csv"
     if path.exists():
+        from ..cv_selection.anchor_spec import descriptor_value
         with path.open(newline="") as f:
-            vals = [float(row["cv1"]) for row in csv.DictReader(f)]
+            vals = [descriptor_value(anchor_kind, row) for row in csv.DictReader(f)]
         if vals:
             return np.asarray(vals, dtype=float)
     warnings.append(
@@ -341,6 +343,60 @@ def _anchor_definition(args, contact_pairs: Optional[list]) -> Dict[str, Any]:
     return definition
 
 
+def _anchor_kind(args) -> str:
+    """The CV1 anchor this analysis designs windows on and fits CV2 against.
+
+    Only an explicitly configured distance CV1 (``cv1: distance``) switches the anchor: the CLI's
+    default ``primary_cv`` is "distance" even when no CV1 was given, and the swarm has always
+    designed on the heavy contacts then."""
+    from ..cv import primary_cv_mode
+    from ..cv_selection.anchor_spec import KIND_CONTACT, anchor_kind_for_args
+    explicit = getattr(args, "cv1", None)
+    if explicit in (None, "") or primary_cv_mode(str(explicit)) != "distance":
+        return KIND_CONTACT
+    return anchor_kind_for_args(args)
+
+
+def _substitute_anchor(kind: str, ok_traces: Dict[int, Dict[str, np.ndarray]], frame_candidates: List[dict]) -> None:
+    """Replace the recorded heavy-contact ``cv1`` by the anchor's values, in place (no-op for contacts).
+
+    Members always record the heavy contact CV1 (the swarm's stratification coordinate) and the
+    terminal CA--CA distance; a distance-anchored campaign designs everything on the latter."""
+    from ..cv_selection.anchor_spec import is_contact, trace_values
+    if is_contact(kind):
+        return
+    for tr in ok_traces.values():
+        tr["cv1_heavy_contacts"] = tr["cv1"]
+        tr["cv1"] = trace_values(kind, tr)
+    for fr in frame_candidates:
+        tr = ok_traces[int(fr["member_id"])]
+        rows = np.flatnonzero(np.round(tr["frame"]).astype(int) == int(fr["frame"]))
+        fr["cv1"] = float(tr["cv1"][int(rows[0])]) if rows.size else float("nan")
+
+
+def _distance_anchor_definition(out_dir: Path, args, warnings: List[str]) -> Optional[Dict[str, Any]]:
+    """The terminal CA--CA anchor by atom indices of the swarm topology (None = unbound)."""
+    from ..cv import choose_cv_atoms
+    from ..cv_selection.anchor_spec import e2e_definition
+    topology_pdb = swarm_root(out_dir) / "system" / "topology.pdb"
+    if not topology_pdb.exists():
+        warnings.append("cv selection: swarm/system/topology.pdb absent; the distance anchor's atoms are NOT "
+                        "bound into the pair model")
+        return None
+    try:
+        from openmm import app  # noqa: WPS433
+        a1, a2, _label = choose_cv_atoms(app.PDBFile(str(topology_pdb)).topology, args)
+        return e2e_definition(a1, a2)
+    except Exception as exc:  # pragma: no cover - environment dependent
+        warnings.append(f"cv selection: could not resolve the distance anchor's atoms ({exc!r})")
+        return None
+
+
+def _sidecar_cv1(kind: str) -> str:
+    from ..cv_selection.anchor_spec import is_contact
+    return "contacts" if is_contact(kind) else "distance"
+
+
 def _feature_schema_from_index(index: dict, topology_sha256: str) -> C.FeatureSchema:
     """Canonical feature order: phi block then psi block, sin then cos per torsion."""
     rows = []
@@ -356,7 +412,9 @@ def _feature_schema_from_index(index: dict, topology_sha256: str) -> C.FeatureSc
 
 def _build_swarm_dataset(rows: List[dict], ok_traces: Dict[int, Dict[str, np.ndarray]],
                          ok_features: Dict[int, Optional[tuple]], discard: int, args,
-                         contact_pairs: Optional[list], topology_sha256: str) -> Tuple[SwarmDataset, dict]:
+                         contact_pairs: Optional[list], topology_sha256: str, *,
+                         anchor_kind: str = "nonlocal-contact-fraction",
+                         anchor_definition: Optional[Dict[str, Any]] = None) -> Tuple[SwarmDataset, dict]:
     """Aligned per-frame rows past the discard: features, anchor, shape, energies, seed family.
 
     Alignment is by row index (Task 1 guarantees feature row i is trace row i); rows with
@@ -400,8 +458,16 @@ def _build_swarm_dataset(rows: List[dict], ok_traces: Dict[int, Dict[str, np.nda
     finite = (np.isfinite(features).all(axis=1) & np.isfinite(cv1) & np.isfinite(rg) & np.isfinite(e2e)
               & np.isfinite(v_pep) & np.isfinite(v_dih))
     schema = _feature_schema_from_index(index_ref, topology_sha256)
-    anchor = AnchorCandidate("nonlocal-contact-fraction", _anchor_definition(args, contact_pairs), cv1[finite])
-    dataset = SwarmDataset(features[finite], schema, anchor, np.column_stack([rg[finite], e2e[finite]]),
+    if anchor_kind == "nonlocal-contact-fraction":
+        definition = _anchor_definition(args, contact_pairs)
+    else:
+        definition = dict(anchor_definition or {"atom_rule": "terminal-ca", "units": "angstrom"})
+    # ``cv1`` already holds the anchor's values (``_substitute_anchor``).
+    anchor = AnchorCandidate(anchor_kind, definition, cv1[finite])
+    # The discovery partition excludes the anchor (select_pair step 2): for the end-to-end
+    # anchor its own e2e column is dropped, or CV2 could add no information about it.
+    shape_cols = [rg[finite], e2e[finite]] if anchor_kind == "nonlocal-contact-fraction" else [rg[finite]]
+    dataset = SwarmDataset(features[finite], schema, anchor, np.column_stack(shape_cols),
                            groups[finite], member_ids=member_ids[finite], frame_index=frame_index[finite],
                            frame_dt_ps=float(getattr(args, "swarm_output_interval_ps", 2.0)))
     aux = {"v_pep": v_pep[finite], "v_dih": v_dih[finite],
@@ -427,6 +493,7 @@ def _selection_config(args, k1_max_kcal: float, temperature_k: float) -> Selecti
         min_slowness_rho=float(getattr(args, "cv_selection_min_slowness", 0.72)),
         min_bimodality=float(getattr(args, "cv_selection_min_bimodality", 5.0 / 9.0)),
         half_split_min_corr=float(getattr(args, "cv_selection_half_split_min_corr", 0.8)),
+        gain_resamples=int(getattr(args, "cv_selection_gain_resamples", 8)),
     )
 
 
@@ -447,6 +514,10 @@ def analyze_swarm_stage(out_dir, args) -> dict:
 
     rows, plan_meta = _load_plan(rd)
     done_summaries, ok_traces, frame_candidates, missing_members, ok_features = _load_members(rd, rows)
+    # The CV1 every downstream design step reads is the run's anchor (spec generic-cv1-anchor):
+    # the heavy-contact cv1 column as recorded, or another recorded column in its own units.
+    anchor_kind = _anchor_kind(args)
+    _substitute_anchor(anchor_kind, ok_traces, frame_candidates)
 
     graft_failed_members = sorted(m for m, d in done_summaries.items() if str(d.get("status", "ok")) == "graft_failed")
     md_failed_members = sorted(m for m, d in done_summaries.items() if str(d.get("status", "ok")) == "md_failed")
@@ -510,11 +581,11 @@ def analyze_swarm_stage(out_dir, args) -> dict:
         # Reported diagnostic only (2026-09-08 fix) -- round-0 windows seed from the swarm's
         # OWN frames (seed_cv1=cv1_all below), never from the GENPEPT library, so this no
         # longer gates the round; its q99 still travels with the report for provenance.
-        library_cv1 = _library_cv1_for_round0(rd, plan_meta, warnings)
+        library_cv1 = _library_cv1_for_round0(rd, plan_meta, warnings, anchor_kind)
         library_q99 = float(np.quantile(library_cv1, 0.99)) if library_cv1.size else None
 
-        k_max = float(getattr(args, "contact_adaptive_max_k_kcal", 1200.0))
-        k_min = float(getattr(args, "contact_adaptive_min_k_kcal", 5.0))
+        from ..cv_selection.anchor_spec import k_bounds, value_bounds
+        k_min, k_max = k_bounds(anchor_kind, args)
         overlap_sigma = float(getattr(args, "swarm_overlap_sigma", 1.5))
         max_seed_gap_sigma = float(getattr(args, "swarm_max_seed_gap_sigma", 0.5))
         n_win = min(int(args.swarm_n_windows), n_resolvable_windows(coverage_range, temperature_k, k_max_kcal=k_max, overlap_sigma=overlap_sigma))
@@ -558,7 +629,8 @@ def analyze_swarm_stage(out_dir, args) -> dict:
             try:
                 legacy = autotune_cv1_upper_bound(cv1_all, seed_pool_cv1, n_windows=int(design_c["n_requested"]),
                                                   temperature_k=temperature_k, k_max_kcal=k_max,
-                                                  max_seed_gap_sigma=max_seed_gap_sigma)
+                                                  max_seed_gap_sigma=max_seed_gap_sigma,
+                                                  value_range=value_bounds(anchor_kind))
                 probe_out["legacy_autotune"] = {"hi": float(legacy["hi"]), "hi_initial": float(legacy["hi_initial"]),
                                                 "autotuned": bool(legacy["autotuned"])}
                 if bool(legacy["autotuned"]) and float(legacy["hi"]) < float(centers.max()) - 1e-12:
@@ -620,7 +692,8 @@ def analyze_swarm_stage(out_dir, args) -> dict:
         coupling_gate: Optional[Dict[str, Any]] = None
         pair_paths: Optional[dict] = None
         if secondary_cv_mode(args) == "auto":
-            contact_pairs = _swarm_contact_pairs(out_dir, args, warnings)
+            from ..cv_selection import anchor_spec as AS
+            contact_pairs = _swarm_contact_pairs(out_dir, args, warnings) if AS.is_contact(anchor_kind) else None
             system_xml = swarm_root(out_dir) / "system" / "base_system.xml"
             topology_pdb = swarm_root(out_dir) / "system" / "topology.pdb"
             # Real bindings or none: a placeholder digest never makes an artifact deployable
@@ -631,13 +704,21 @@ def analyze_swarm_stage(out_dir, args) -> dict:
                 "topology_sha256": topology_sha, "physical_system_sha256": physical_sha,
                 "contact_pair_list_sha256": contact_pair_list_digest(contact_pairs) if contact_pairs else None,
             }
+            anchor_key = "contact_pair_list_sha256"
+            anchor_definition = None
+            if not AS.is_contact(anchor_kind):
+                anchor_definition = _distance_anchor_definition(out_dir, args, warnings)
+                deployment["anchor_binding_sha256"] = (AS.binding_digest(anchor_kind, anchor_definition)
+                                                       if anchor_definition else None)
+                anchor_key = "anchor_binding_sha256"
             deployment["deployable"] = all(deployment[k] for k in ("topology_sha256", "physical_system_sha256",
-                                                                   "contact_pair_list_sha256"))
+                                                                   anchor_key))
             if not deployment["deployable"]:
                 warnings.append("cv selection: the pair model will NOT be deployable (missing swarm system, "
                                 "topology or contact pair list); production refuses a discovery-only artifact")
             dataset, aux = _build_swarm_dataset(rows, ok_traces, ok_features, discard, args, contact_pairs,
-                                                topology_sha or digest(b"swarm-topology-unavailable"))
+                                                topology_sha or digest(b"swarm-topology-unavailable"),
+                                                anchor_kind=anchor_kind, anchor_definition=anchor_definition)
             sel = select_cv_pair(
                 dataset, _selection_config(args, k_max, temperature_k),
                 physical_system_sha256=physical_sha or digest(b"swarm-system-unavailable"),
@@ -656,7 +737,7 @@ def analyze_swarm_stage(out_dir, args) -> dict:
                 "selection_reason": sel.report.get("selection_reason"),
                 "n_frames": int(dataset.features.shape[0]), "n_dropped_nonfinite": aux["n_dropped_nonfinite"],
                 "physical_system_bound": bool(system_xml.exists()),
-                "anchor_pair_list_bound": contact_pairs is not None,
+                "anchor_pair_list_bound": contact_pairs is not None or anchor_definition is not None,
                 "deployable": bool(deployment["deployable"]),
             }
             (an / "cv_feature_schema.json").write_bytes(dataset.feature_schema.to_json_bytes())
@@ -762,7 +843,8 @@ def analyze_swarm_stage(out_dir, args) -> dict:
         if gate["status"] == "pass":
             if pair_layout is not None:
                 layout, centers2, ks2, rows_2d, plan_record = pair_layout
-                windows_csv = write_ladder_windows_2d_csv(an / "windows_lambda_ladder.csv", rows_2d, ladder["lambdas"])
+                windows_csv = write_ladder_windows_2d_csv(an / "windows_lambda_ladder.csv", rows_2d, ladder["lambdas"],
+                                                          primary_cv_mode=_sidecar_cv1(anchor_kind))
                 # Companion artifact: state roles, region coverage, mandatory ids -- separately
                 # digested, never inside the physics rows (spec F05).
                 write_json(an / "layout_plan.json", plan_record)
@@ -770,12 +852,14 @@ def analyze_swarm_stage(out_dir, args) -> dict:
                 report["layout_plan"] = {k: plan_record[k] for k in ("status", "kind", "spatial_states", "n_states",
                                                                      "mandatory_state_ids", "unresolved")}
                 _write_sidecar(an, seed_bank_dir, windows_csv,
-                               cvs={"cv1": "contacts", "cv2": "residual-torsion-pc"}, pair_paths=pair_paths)
+                               cvs={"cv1": _sidecar_cv1(anchor_kind), "cv2": "residual-torsion-pc"},
+                               pair_paths=pair_paths)
             else:
-                windows_csv = write_ladder_windows_csv(an / "windows_lambda_ladder.csv", centers, ks, ladder["lambdas"])
+                windows_csv = write_ladder_windows_csv(an / "windows_lambda_ladder.csv", centers, ks, ladder["lambdas"],
+                                                       primary_cv_mode=_sidecar_cv1(anchor_kind))
                 report.update(one_dimensional_reserve(args, ladder_design["n_states"], warnings))
                 _write_sidecar(an, seed_bank_dir, windows_csv,
-                               cvs={"cv1": "contacts", "cv2": "none"} if selection is not None else None)
+                               cvs={"cv1": _sidecar_cv1(anchor_kind), "cv2": "none"} if selection is not None else None)
         else:
             _withhold_ladder_artifacts(an)
             report["withheld_ladder_artifacts"] = True

@@ -83,9 +83,18 @@ class SelectionConfig:
     slowness_lag_ps: float = 200.0           # lag of the ranking autocorrelation
     n_tica_components: int = C.MAX_TICA_COMPONENTS
     min_slowness_rho: float = 0.72           # ~exp(-1/3): implied timescale >= 3 lags
+    # Slowness ranking: the gain floor is tested on the gain averaged over this many
+    # seed-family-to-fold assignments, failing only when mean + 2 sd < min_gain_nats
+    # (demonstrably uninformative). 0 = the single historical assignment (rule before
+    # 2026-10-01). The single draw moves by +-0.02-0.05 nats on chignolin's swarm.
+    gain_resamples: int = 8
     min_bimodality: float = 5.0 / 9.0        # Sarle's coefficient of a uniform distribution
     half_split_min_corr: float = 0.8
     n_cells_slowness: int = 8
+
+    def __post_init__(self):
+        if int(self.gain_resamples) < 0:
+            raise ValueError("gain_resamples must be >= 0")
 
 
 @dataclass(frozen=True)
@@ -106,6 +115,9 @@ def balanced_weights(labels) -> np.ndarray:
 
 
 def _units(kind: str) -> str:
+    from .anchor_spec import ANCHOR_KINDS, units
+    if kind in ANCHOR_KINDS:            # the units the runtime force evaluates the anchor in
+        return units(kind)
     return "dimensionless" if kind == "nonlocal-contact-fraction" else "nanometer"
 
 
@@ -182,7 +194,19 @@ def _score_components(fit: ResidualFit, X, a, z1, cells_fine, groups, cfg: Selec
             row["slowness_rho"] = float(rho)
             row["slowness_lag_frames"] = int(time.slowness_lag)
             row["bimodality_max"] = float(bim)
-            if info["gain"] < cfg.min_gain_nats:
+            if cfg.gain_resamples > 0:
+                draws = [info["gain"]] + [
+                    incremental_cell_information(cells_fine, z1, z2, groups, n_folds=cfg.n_folds,
+                                                 fold_seed=DEFAULT_FOLD_SEED + k)["gain"]
+                    for k in range(1, int(cfg.gain_resamples))]
+                g_mean, g_sd = float(np.mean(draws)), float(np.std(draws))
+                row["gain_nats_mean"], row["gain_nats_sd"] = g_mean, g_sd
+                row["gain_resamples"] = len(draws)
+                row["gain_pass_fraction"] = float(np.mean(np.asarray(draws) >= cfg.min_gain_nats))
+                if g_mean + 2.0 * g_sd < cfg.min_gain_nats:
+                    reasons.append(f"information gain {g_mean:.4f} +- {g_sd:.4f} over {len(draws)} fold "
+                                   f"assignments: mean + 2 sd < {cfg.min_gain_nats:.3f}")
+            elif info["gain"] < cfg.min_gain_nats:
                 reasons.append(f"information gain {info['gain']:.4f} < {cfg.min_gain_nats:.3f}")
             if not np.isfinite(rho) or rho < cfg.min_slowness_rho:
                 reasons.append(f"slowness rho {rho:.3f} < {cfg.min_slowness_rho} at lag {time.slowness_lag} frames")
@@ -372,8 +396,11 @@ def select_cv_pair(data: SwarmDataset, config: SelectionConfig, *, physical_syst
                "deployable": False}
     if deployment:
         binding.update({k: deployment.get(k) for k in binding if k in deployment})
+        if deployment.get("anchor_binding_sha256"):     # non-contact anchors (anchor_spec)
+            binding["anchor_binding_sha256"] = deployment["anchor_binding_sha256"]
+        anchor_key = "anchor_binding_sha256" if "anchor_binding_sha256" in binding else "contact_pair_list_sha256"
         binding["deployable"] = bool(deployment.get("deployable", all(
-            binding[k] for k in ("topology_sha256", "physical_system_sha256", "contact_pair_list_sha256"))))
+            binding[k] for k in ("topology_sha256", "physical_system_sha256", anchor_key))))
     pair_model = PairModel.from_mapping({
         "schema": PAIR_MODEL_VERSION_V2,
         "candidate_set_sha256": candidate_set.sha256,
