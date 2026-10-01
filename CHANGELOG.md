@@ -6,6 +6,54 @@ The project follows semantic-style release numbering where practical. Research-m
 
 ## [Unreleased]
 
+## [0.8.5] — 2026-10-01
+
+This release targets slow convergence in chignolin_9. A frame-level convergence analysis showed:
+
+- The fold populations never converged over the 13.2 µs pool (native fraction 0.6 % → 2.5 %, still rising).
+- The D3/P4 turn dihedrals barely move along a trajectory (autocorrelation 0.93 at 10 ns).
+- Every epoch re-pulled all windows from seeds, so continuous trajectories lasted only ~14 ns.
+
+New sampling behaviour is behind flags that are off by default, except where listed under "Changed — results-changing".
+
+### Added
+
+- **Continue existing states between epochs** (`--ap-continue-states`, YAML `ap_continue_states`).
+  - Numbered epochs ≥ 1 and the final phase continue every state that has an earlier end state from the newest one (exported State with its velocities, else the chain-end final PDB with constraints re-applied and fresh velocities; restraints verified).
+  - Only states new to the phase (added by the adaptive actions: add, insert, split, respring, new or respaced rungs) are seeded and pulled, on a window subset merged back into the phase.
+  - A restraint mismatch falls back to the old full pull.
+  - Spec: `docs/superpowers/specs/2026-10-01-continue-existing-states.md`.
+- **Pep-GaMD FSF clamp** (`--pep-gamd-fsf-floor-total`, `--pep-gamd-fsf-floor-dihedral`, YAML `gamd:` keys).
+  - Below a per-channel floor f, the lower-bound boost continues linearly (C¹), so the force scaling factor stays at max(f, 1 − k·d): boosted forces never weaken below the floor or reverse.
+  - It also removes upstream gamd-openmm's discontinuous boost switch-off far below Vmin.
+  - The floors are frozen into the GaMD envelope (`fsf_floor_*` in `all_globals`). The integrator, all MBAR/analysis (`pep_gamd_boost_kj`), the NPT barostat evaluator and the swarm ladder report read the same values.
+  - Any integrator/envelope mismatch fails closed.
+  - Unset, the integrator program is byte-identical to before.
+  - Spec: `docs/superpowers/specs/2026-10-01-pep-gamd-fsf-clamp.md`.
+
+### Changed — results-changing
+
+- **Pairwise-MBAR edge metric is the campaign default** (`--ap-edge-metric pairwise-mbar`; the CLI/YAML default flipped from `marginal`).
+  - This changes weak-edge detection, bridge adds and the quality gate on every 2D or ladder campaign that does not set the flag.
+  - Library dataclass defaults are unchanged.
+- **Restraint-aware US seeding.** Seed scoring and the explicit-2D reachability filter ignore the placeholder centre of an axis the window does not restrain (k ≤ 0).
+  - A CV2-free window previously chose the seed matching CV2's placeholder: CV1 0.20 for a 0.577 target on chignolin_10.
+  - This changes which seed such windows start from.
+- **US start-quality gate.** It no longer fails a window for its distance from a k = 0 placeholder centre.
+
+### Fixed
+
+- **Chain-end PDBs.** `final_pdbs/` accumulates one file per replica per job, and the PDB seed picker took the last file in name order: a stale fork for 152–208 of 236 windows per chignolin_9 phase.
+  - This affected frozen-final extensions: chignolin_9's `final_extension_002` started 208/236 windows from forks rather than chain ends. Those were valid configurations, so there was no thermodynamic error.
+  - Each window now takes its chain end from the segment manifest's `assignments`.
+- **FSF clamp review findings.** An uninitialised envelope no longer yields NaN, sidecar runs adopt the envelope's floors, and the integrator-globals summary keeps the floors.
+- **CV2 verification findings F1–F3.**
+  - The respring variance inefficiency is now taken as max(g_cv2, g_q).
+  - The CV2-resolution report row never passes an incomplete evaluation.
+  - Ladder connectivity contracts tied-coordinate slots.
+- **3.1 edge-metric record re-graded** after the union overlap is applied.
+- **Ladder overlap** never chains a resprung centre with its retired rungs.
+
 ## [0.8.4] — 2026-09-30
 
 Everything new in this release that changes sampling or adaptive decisions is behind a flag that is off by default, except where listed under "Changed — results-changing". None of the adaptive-CV2 machinery has run in production MD yet; the validation below is synthetic (T2) and retrospective replays on chignolin_9 / chignolin_7 (T3).
