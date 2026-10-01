@@ -4120,6 +4120,7 @@ def drop_bad_us_windows_and_rebuild(
         "window_start_velocities": new_window_start_velocities,
         "secondary_cv_metadata": secondary_cv_metadata,
         "window_metadata": window_metadata,
+        "keep_indices": list(keep),
     }
 
 
@@ -6439,6 +6440,100 @@ def _seed_topup_windows_from_parent_states(
     return window_start_positions, window_start_velocities, window_start_boxes, seed_by_window
 
 
+def merge_partial_pull(continued_pos, continued_vel, *, missing, pulled_pos, pulled_vel, pulled_dropped):
+    """Place a subset pull's results (indexed 0..len(missing)-1) into the full window lists.
+
+    Returns ``(positions, velocities, dropped_full_indices)``; continued windows keep their
+    parent end states, ``pulled_dropped`` (subset indices) map back to full window indices.
+    """
+    missing = [int(w) for w in missing]
+    if len(pulled_pos) != len(missing) or len(pulled_vel) != len(missing):
+        raise ValueError(f"subset pull returned {len(pulled_pos)} positions / {len(pulled_vel)} velocities "
+                         f"for {len(missing)} pulled windows")
+    pos, vel = list(continued_pos), list(continued_vel)
+    for j, w in enumerate(missing):
+        pos[w], vel[w] = pulled_pos[j], pulled_vel[j]
+    return pos, vel, sorted(missing[int(j)] for j in pulled_dropped)
+
+
+def _continue_windows_from_parent_ends(
+    args, out_dir: Path, nrep: int, n_atoms: int,
+    centers_nm, ks_kj_nm2, secondary_cv_centers, secondary_cv_ks_kj,
+    centers_a, k_list, secondary_cv_k_kcal_list,
+):
+    """--ap-continue-states: continue every window whose state has an earlier end state.
+
+    Like :func:`_seed_extension_windows_from_parent_ends` but partial: returns
+    ``(positions, velocities, boxes, state_seed_by_window, pdb_seeded_windows, missing)``
+    where ``missing`` lists the windows with no parent end state (states new to this
+    phase); the caller pulls only those. Raises ``SeedMismatchError`` when a parent's
+    restraint for a state disagrees with this phase's.
+    """
+    info = getattr(args, "_adaptive_phase_info", {}) or {}
+    parent_dirs = [Path(p) for p in info.get("continue_parent_dirs") or []]
+    return _seed_windows_from_parent_ends(
+        parent_dirs, out_dir, nrep, n_atoms, centers_nm, ks_kj_nm2, secondary_cv_centers,
+        secondary_cv_ks_kj, centers_a, k_list, secondary_cv_k_kcal_list, label="continue-states")
+
+
+def _seed_windows_from_parent_ends(
+    parent_dirs, out_dir: Path, nrep: int, n_atoms: int,
+    centers_nm, ks_kj_nm2, secondary_cv_centers, secondary_cv_ks_kj,
+    centers_a, k_list, secondary_cv_k_kcal_list, *, label: str,
+):
+    from .extension_seeding import is_state_seed, load_extension_seeds, read_pdb_seed
+
+    if (Path(out_dir) / "epoch_window_map.csv").exists():
+        state_id_of_window = state_id_of_window_from_epoch_map(out_dir)
+    else:
+        state_id_of_window = {}
+    needed = [state_id_of_window.get(w, w) for w in range(nrep)]
+    seeds = load_extension_seeds(parent_dirs, needed) if state_id_of_window else {}
+    missing = [w for w, sid in enumerate(needed) if sid not in seeds]
+
+    def _at(seq, w):
+        return float(seq[w]) if seq is not None and w < len(seq) and seq[w] is not None else None
+
+    positions: list = [None] * nrep
+    velocities: list = [None] * nrep
+    boxes: list = [None] * nrep
+    state_seed_by_window: dict = {}
+    pdb_seeded_windows: set = set()
+    counts = {"export": 0, "pdb": 0}
+    for w, sid in enumerate(needed):
+        if sid not in seeds:
+            continue
+        seed = seeds[sid]
+        if is_state_seed(seed):
+            assert_seed_restraint_matches(
+                seed, w, _at(centers_nm, w), _at(ks_kj_nm2, w),
+                _at(secondary_cv_centers, w), _at(secondary_cv_ks_kj, w),
+            )
+            positions[w], velocities[w], boxes[w] = seed.positions, seed.velocities, seed.box
+            state_seed_by_window[w] = seed
+            counts["export"] += 1
+        else:
+            assert_seed_restraint_matches(
+                seed, w, _at(centers_a, w), _at(k_list, w),
+                _at(secondary_cv_centers, w), _at(secondary_cv_k_kcal_list, w),
+                rel_tol=1e-5, abs_tol=1e-6,
+            )
+            pos, box = read_pdb_seed(seed)
+            if len(pos) != int(n_atoms):
+                raise SeedMismatchError(
+                    f"{label} seed PDB {seed.path} has {len(pos)} atoms, system has {n_atoms}",
+                    window=w, state_id=sid,
+                )
+            positions[w], boxes[w] = pos, box
+            pdb_seeded_windows.add(w)
+            counts["pdb"] += 1
+    print(
+        f"    {label}: {nrep - len(missing)}/{nrep} window(s) continue from parent end states "
+        f"({counts['export']} State export(s), {counts['pdb']} final PDB(s)); {len(missing)} new to pull"
+    )
+    return positions, velocities, boxes, state_seed_by_window, pdb_seeded_windows, missing
+
+
 def _seed_extension_windows_from_parent_ends(
     args, out_dir: Path, nrep: int, n_atoms: int,
     centers_nm, ks_kj_nm2, secondary_cv_centers, secondary_cv_ks_kj,
@@ -6897,6 +6992,20 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         # A frozen-final extension runs the final phase's own window set: continue
         # each window from its newest parent end state instead of re-pulling.
         _extension_seeds = None
+        # --ap-continue-states: existing states continue from their newest earlier end
+        # state; only states new to this phase (no parent end state) are pulled.
+        _continue_seeds = None
+        if (_topup_phase_info.get("continue_parent_dirs") and not is_topup_segment
+                and not bool(_topup_phase_info.get("is_extension"))):
+            try:
+                _continue_seeds = _continue_windows_from_parent_ends(
+                    args, out_dir, nrep, topology.getNumAtoms(),
+                    centers_nm, ks_kj_nm2, secondary_cv_centers, secondary_cv_ks_kj,
+                    centers_a, k_list, secondary_cv_k_kcal_list,
+                )
+            except SeedMismatchError as exc:
+                print(f"WARNING: {out_dir}: parent end states rejected ({exc}); pulling every window instead")
+                _continue_seeds = None
         if bool(_topup_phase_info.get("is_extension")) and not is_topup_segment:
             try:
                 _extension_seeds = _seed_extension_windows_from_parent_ends(
@@ -6911,7 +7020,33 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 print(f"WARNING: extension {out_dir}: parent end states rejected ({exc}); pulling every window instead")
                 _extension_seeds = None
 
-        if _extension_seeds is not None:
+        if _continue_seeds is not None:
+            (_cont_pos, _cont_vel, window_start_boxes, topup_seed_by_window,
+             pdb_seeded_windows, _cont_missing) = _continue_seeds
+            if _cont_missing:
+                starting_structure_system = create_system(app, unit, forcefield, topology, args, include_barostat=False)
+                add_umbrella_cv_forces(openmm, starting_structure_system, topology, primary_cv_def, args,
+                                       secondary_enabled=bool((secondary_cv_metadata or {}).get("enabled")))
+                _sub = (lambda seq: None if seq is None else [seq[w] for w in _cont_missing])
+                write_json(Path(out_dir) / "us_starting_structures_subset.json", {
+                    "note": "--ap-continue-states: only these windows were pulled; files in "
+                            "us_starting_structures/ are numbered 0..n-1 over this list",
+                    "pulled_windows": [int(w) for w in _cont_missing],
+                })
+                _p_pos, _p_vel, _p_drop = generate_us_starting_states_by_pulling(
+                    args, out_dir, openmm, app, unit, topology, starting_structure_system,
+                    np.asarray(_sub(list(centers_nm)), dtype=float), np.asarray(_sub(list(ks_kj_nm2)), dtype=float),
+                    equil_state, primary_cv_def, cv_atom1, cv_atom2, setup_platform, setup_props, progress=progress,
+                    secondary_cv_centers=_sub(secondary_cv_centers), secondary_cv_ks_kj=_sub(secondary_cv_ks_kj),
+                    secondary_cv_metadata=secondary_cv_metadata, allow_slow_mode_reseed=False,
+                )
+                window_start_positions, window_start_velocities, dropped_window_indices = merge_partial_pull(
+                    _cont_pos, _cont_vel, missing=_cont_missing,
+                    pulled_pos=_p_pos, pulled_vel=_p_vel, pulled_dropped=_p_drop or [])
+            else:
+                window_start_positions, window_start_velocities = _cont_pos, _cont_vel
+                dropped_window_indices = []
+        elif _extension_seeds is not None:
             (window_start_positions, window_start_velocities, window_start_boxes,
              topup_seed_by_window, pdb_seeded_windows) = _extension_seeds
             dropped_window_indices = []
@@ -6966,6 +7101,14 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             secondary_cv_ks_kj = _drop_result["secondary_cv_ks_kj"]
             window_start_positions = _drop_result["window_start_positions"]
             window_start_velocities = _drop_result["window_start_velocities"]
+            # Per-window seed bookkeeping (continued states) follows the same keep set.
+            _keep = _drop_result.get("keep_indices")
+            if _keep is not None:
+                _new_of_old = {old: new for new, old in enumerate(_keep)}
+                window_start_boxes = [window_start_boxes[old] if window_start_boxes and old < len(window_start_boxes) else None
+                                      for old in _keep]
+                topup_seed_by_window = {_new_of_old[w]: s for w, s in topup_seed_by_window.items() if w in _new_of_old}
+                pdb_seeded_windows = {_new_of_old[w] for w in pdb_seeded_windows if w in _new_of_old}
             secondary_cv_metadata = _drop_result["secondary_cv_metadata"]
             window_metadata = _drop_result["window_metadata"]
             # drop_bad_us_windows_and_rebuild recomputed the explicit window table

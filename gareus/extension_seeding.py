@@ -110,6 +110,41 @@ def extension_parent_dirs(adaptive_dir, ext_index: int) -> List[Path]:
     return parents
 
 
+_EPOCH_RE = re.compile(r"^epoch_(\d+)$")
+
+
+def _has_end_states(d: Path) -> bool:
+    return (d / PDB_DIR).is_dir() or (d / DIR_NAME).is_dir()
+
+
+def prior_phase_parent_dirs(adaptive_dir, phase_dir) -> List[Path]:
+    """Segments of every phase that ran before ``phase_dir``'s phase, oldest first.
+
+    ``phase_dir`` is a numbered epoch (flat ``epoch_NNN`` or one of its segments) or a
+    ``final`` segment. Epochs are ordered by number and precede ``final``; within an
+    epoch, :func:`_final_phase_parent_dirs` orders baseline then top-ups. Only segments
+    that left end states (``final_pdbs`` or a State export) are returned. Used by
+    ``--ap-continue-states`` so each existing state continues from its newest end state.
+    """
+    adaptive_dir = Path(adaptive_dir)
+    try:
+        group = Path(phase_dir).resolve().relative_to(adaptive_dir.resolve()).parts[0]
+    except (ValueError, IndexError):
+        return []
+    m = _EPOCH_RE.match(group)
+    if m is None and group != "final":
+        return []
+    current = int(m.group(1)) if m else None
+    epochs = sorted((int(_EPOCH_RE.match(d.name).group(1)), d) for d in adaptive_dir.iterdir()
+                    if d.is_dir() and _EPOCH_RE.match(d.name))
+    out: List[Path] = []
+    for k, d in epochs:
+        if current is not None and k >= current:
+            break
+        out.extend(seg for seg in _final_phase_parent_dirs(d) if _has_end_states(seg))
+    return out
+
+
 def _parent_restraints(parent: Path) -> Optional[Dict[str, List[Optional[float]]]]:
     """Per-window restraints the parent actually ran, in its own post-drop window order."""
     path = parent / "checkpoints" / "production_checkpoint_manifest.json"

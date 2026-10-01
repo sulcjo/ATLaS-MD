@@ -277,7 +277,7 @@ def _add_cv_selection_args(p: argparse.ArgumentParser) -> None:
                    help="Auto CV2 ranking. slowness (default): residual PCs plus conditional "
                         "tICA modes of the CV1-residualised torsions; the slowest candidate at "
                         "fixed CV1 wins if it also clears the gain floor, --cv-selection-min-"
-                        "slowness and --cv-selection-min-bimodality, and both seed-family halves "
+                        "slowness and the --cv-selection-modality gate, and both seed-family halves "
                         "agree. gain: the legacy rule (residual PCs only, max information gain).")
     p.add_argument("--cv-selection-tica-lag-ps", type=float, default=50.0,
                    help="Lag of the conditional tICA fit (swarm frames within one member).")
@@ -288,9 +288,17 @@ def _add_cv_selection_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--cv-selection-min-slowness", type=float, default=0.72,
                    help="Minimum lag autocorrelation at fixed CV1 (0.72 ~ implied timescale "
                         ">= 3 lags).")
+    p.add_argument("--cv-selection-modality", choices=["mixture", "bc"], default="mixture",
+                   help="Multimodality gate of the slowness ranking. mixture (default): some CV1 cell "
+                        "must hold two member-supported Gaussian-mixture modes of CV2 with a density "
+                        "minimum >= 1 kT between them, each >= 10 %% of the cell (the CV2 shape layout's "
+                        "and R3's definition of a mode; any number of modes passes, a skewed single "
+                        "peak does not). bc: Sarle's bimodality coefficient >= "
+                        "--cv-selection-min-bimodality (the rule before 2026-10-01; it fails e.g. a "
+                        "25/50/25 trimodal and passes an exponential).")
     p.add_argument("--cv-selection-min-bimodality", type=float, default=5.0 / 9.0,
-                   help="Minimum Sarle bimodality coefficient of CV2 within some CV1 cell "
-                        "(5/9 = uniform distribution; above it reads as bimodal).")
+                   help="With --cv-selection-modality bc: minimum Sarle bimodality coefficient of "
+                        "CV2 within some CV1 cell (5/9 = uniform distribution).")
     p.add_argument("--cv-selection-half-split-min-corr", type=float, default=0.8,
                    help="Both seed-family halves, refitted from scratch, must pick a CV2 with "
                         "|r| >= this against the full-data winner, else cv1_only.")
@@ -461,6 +469,11 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                    help="Steps per epoch. 0 = auto (~1/20 of production-steps).")
     p.add_argument("--ap-final-steps", type=int, default=0,
                    help="Frozen final steps. 0 = reuse production-steps.")
+    p.add_argument("--ap-continue-states", dest="ap_continue_states", action="store_true", default=False,
+                   help="Numbered epochs >= 1 and the final phase continue every existing state from its newest "
+                        "earlier end state (exported State, else final PDB + fresh velocities) instead of re-grafting "
+                        "and re-pulling it from the seed bank; only states with no earlier end state (new ones added "
+                        "by the adaptive actions) are seeded and pulled. Off: every window is re-pulled each epoch.")
     p.add_argument("--ap-epoch0-step-fraction", type=float, default=0.5,
                    help="Fraction of epoch 0's fair MD-pool share it actually consumes (default "
                         "0.5, since epoch 0 only needs a short look to bootstrap tICA/GaMD "
