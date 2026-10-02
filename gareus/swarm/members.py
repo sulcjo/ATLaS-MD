@@ -14,6 +14,7 @@ from __future__ import annotations
 import csv
 import json
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple
@@ -41,6 +42,13 @@ from gareus.tica import backbone_dihedral_features
 
 TRACE_COLUMNS = ["frame", "t_ps", "cv1", "rg_nm", "e2e_nm", "v_pep_kj", "v_dih_kj", "potential_kj"]
 
+#: At most this many members graft at once. The graft's solvent-clash repair is a Python loop of
+#: small numpy calls, each releasing and re-taking the GIL; with ~174 member threads every re-take
+#: queued behind all the others (a lock convoy) and no member got past its graft in an hour (job
+#: 2788266, 2026-10-02, GPUs idle). A few at a time keeps each graft at its solo speed (seconds);
+#: grafted members step meanwhile, since OpenMM's step releases the GIL.
+GRAFT_CONCURRENCY = 4
+_GRAFT_GATE = threading.BoundedSemaphore(GRAFT_CONCURRENCY)
 _DEFAULT_GRAFT_MINIMIZE_ITERS = 500  # measured 2026-09-08: 100 left 18/99 real swarm members
 # NaN 0-3s into equilibration; the umbrella-seeding graft caller already uses 1000
 # (--us-pull-minimize-iterations) for the same graft_conformer_into_context call.
@@ -300,11 +308,12 @@ def run_member(
 
     cv_atom1, cv_atom2 = _terminal_ca_atoms(topology)
     minimize_iters = int(getattr(args, "swarm_graft_minimize_iters", _DEFAULT_GRAFT_MINIMIZE_ITERS))
-    graft_status = graft_conformer_into_context(
-        sim, topology, conformer, cv_atom1, cv_atom2,
-        float(args.temperature_k), unit,
-        minimize_iters=minimize_iters, seed=velocity_seed,
-    )
+    with _GRAFT_GATE:
+        graft_status = graft_conformer_into_context(
+            sim, topology, conformer, cv_atom1, cv_atom2,
+            float(args.temperature_k), unit,
+            minimize_iters=minimize_iters, seed=velocity_seed,
+        )
     if graft_status.get("fallback"):
         done = {
             "member_id": member_row.get("member_id"),
@@ -356,7 +365,11 @@ def run_member(
     last_positions: dict = {}
 
     def step_fn(n):
-        run_steps_safely(sim, n, "swarm", member_dir, app, topology, unit, progress=progress)
+        # Crash coordinates once per frame, not every 100 steps: each snapshot is a full position
+        # download with the GIL held (~7 ms at 19k atoms), which at 174 concurrent members alone
+        # saturated a core.
+        run_steps_safely(sim, n, "swarm", member_dir, app, topology, unit, progress=progress,
+                         chunk_size=max(100, int(steps_per_frame)))
 
     def measure_fn():
         state = sim.context.getState(getPositions=True, enforcePeriodicBox=True)
