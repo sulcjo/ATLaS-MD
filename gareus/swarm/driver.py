@@ -42,7 +42,8 @@ from gareus.system_setup import (
     setup_platform_and_properties,
     write_state_pdb,
 )
-from gareus.swarm.members import member_done, run_member
+from gareus.swarm.members import member_done, member_step_counts, run_member
+from gareus.swarm.round_progress import make_round_progress
 from gareus.swarm.seed_library import (
     _ca_indices_in_seed,
     _load_seed_library_for_round,
@@ -329,6 +330,16 @@ def run_swarm_stage(args, out_dir, progress=None) -> dict:
 
     n_workers, device_tokens = resolve_member_workers(args)
     missing_in_range: List[int] = []
+    # The round reports as one production epoch (epoch 0) so the monitor tracks it like any other.
+    _spf, n_prod_steps, _neq = member_step_counts(args)
+    round_progress = make_round_progress(
+        progress, n_members=len(member_range), n_prod_steps=n_prod_steps,
+        n_already_done=sum(1 for i in member_range
+                           if member_done(rd / f"member_{int(rows[i]['member_id']):04d}")),
+        timestep_fs=float(args.timestep_fs), round_index=round_index,
+    )
+    if round_progress is not None:
+        round_progress.emit()
     _missing_lock = threading.Lock()
 
     def _run_one(worker_args, row, member_dir, device):
@@ -341,12 +352,20 @@ def run_swarm_stage(args, out_dir, progress=None) -> dict:
             if key in props:
                 props[key] = str(device)
                 break
-        done = run_member(
-            worker_args, row, member_dir,
-            openmm=sysinfo["openmm"], app=sysinfo["app"], unit=sysinfo["unit"], topology=topology,
-            base_system_xml=sysinfo["base_system_xml"], equil_state=sysinfo["equil_state"], conformer=conformer,
-            platform=sysinfo["platform"], props=props, contact_pairs=contact_pairs, progress=progress,
-        )
+        if round_progress is not None:
+            round_progress.member_started(member_id)
+        done = {"status": "error"}
+        try:
+            done = run_member(
+                worker_args, row, member_dir,
+                openmm=sysinfo["openmm"], app=sysinfo["app"], unit=sysinfo["unit"], topology=topology,
+                base_system_xml=sysinfo["base_system_xml"], equil_state=sysinfo["equil_state"],
+                conformer=conformer, platform=sysinfo["platform"], props=props, contact_pairs=contact_pairs,
+                progress=progress, round_progress=round_progress,
+            )
+        finally:
+            if round_progress is not None:
+                round_progress.member_finished(member_id, ok=str(done.get("status", "ok")) == "ok")
         status = str(done.get("status", "ok"))
         if not member_done(member_dir):
             with _missing_lock:
@@ -355,8 +374,8 @@ def run_swarm_stage(args, out_dir, progress=None) -> dict:
             f"member {member_id:04d}/{len(rows):04d} cell {row['cell_id']} seed {row['seed_id']} "
             f"rep {row['replicate']} status {status} {float(done.get('ns_per_day', 0.0)):.0f} ns/day"
         )
-        if progress is not None:
-            progress.emit({
+        if round_progress is not None:
+            round_progress.emit_event({
                 "event": "swarm_member_done", "round": round_index, "member_id": member_id,
                 "n_members": len(rows), "cell_id": row["cell_id"], "seed_id": row["seed_id"],
                 "status": status, "ns_per_day": float(done.get("ns_per_day", 0.0)),
@@ -365,8 +384,12 @@ def run_swarm_stage(args, out_dir, progress=None) -> dict:
 
     if n_workers > 1:
         print(f"    swarm: {n_workers} concurrent members over devices {', '.join(device_tokens)}")
-    tally = execute_members(args, rows, member_range, rd, _run_one,
-                            n_workers=n_workers, device_tokens=device_tokens)
+    try:
+        tally = execute_members(args, rows, member_range, rd, _run_one,
+                                n_workers=n_workers, device_tokens=device_tokens)
+    finally:
+        if round_progress is not None:
+            round_progress.close()
     n_run = tally["n_run"]
     n_skipped_resume = tally["n_skipped_resume"]
     failed_in_range = tally["failed_in_range"]

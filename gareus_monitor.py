@@ -395,6 +395,9 @@ def diagnostics_for_state(s, now: Optional[float] = None) -> list[Diagnostic]:
     diags: list[Diagnostic] = []
     prog = _get_value(s, "_prog", {}) or {}
     phase = str(_get_value(s, "phase", "unknown"))
+    # The swarm round reports as production epoch 0 but owns no runtime pool (charged when the
+    # round completes) and no checkpoint manifests (members resume from their own directories).
+    swarm_epoch = bool(prog.get("swarm"))
     total = _get_value(s, "total_budget_ns")
     committed = _get_value(s, "committed_ns", 0.0) or 0.0
     live = _get_value(s, "agg_ns", 0.0) or 0.0
@@ -417,7 +420,7 @@ def diagnostics_for_state(s, now: Optional[float] = None) -> list[Diagnostic]:
 
     pool = _get_value(s, "_pool", {}) or {}
     if total is None:
-        if phase in ("gareus_production", "adaptive_feedback", "done", "converged"):
+        if phase in ("gareus_production", "adaptive_feedback", "done", "converged") and not swarm_epoch:
             diags.append(Diagnostic(
                 "warn", "missing_pool", "No adaptive runtime pool budget loaded",
                 _path_str(pool_path), "G% cannot be trusted without total_ns and used_ns."))
@@ -475,7 +478,7 @@ def diagnostics_for_state(s, now: Optional[float] = None) -> list[Diagnostic]:
             _path_str(progress_path), "Watch anharmonicity and effective sample quality."))
 
     ckpts = _get_value(s, "_ckpt_count")
-    if phase == "gareus_production" and prog and (ckpts is None or ckpts == 0):
+    if phase == "gareus_production" and prog and not swarm_epoch and (ckpts is None or ckpts == 0):
         diags.append(Diagnostic(
             "warn", "checkpoint_missing", "Production progress exists but no checkpoint manifests found",
             _path_str(diag_path), "Check checkpoint writer before relying on restart safety."))
@@ -2199,6 +2202,8 @@ class PeptideState:
                 if m:
                     completed.add(int(m.group(1)))
             return len(completed)
+        if self._epoch_count is None and self._prog.get("swarm"):
+            return 0  # the swarm round is epoch 0, running
         return self._epoch_count
 
     @property
@@ -3523,9 +3528,10 @@ def render_detail(s: PeptideState) -> str:
     if nspd: extras.append(f"{nspd:.0f} ns/day")
     if sps:  extras.append(f"{sps:.0f} steps/s")
     if nrep: extras.append(f"{nrep} replicas")
+    prog = s._prog or {}
     if extras:
         ep_val += c(A.DIM) + "   " + "   ".join(extras) + A.RESET
-    lines.append(labeled("Epoch", ep_val))
+    lines.append(labeled("Ep0 swarm" if prog.get("swarm") else "Epoch", ep_val))
     lines.append(labeled("Slurm", _slurm_detail(getattr(s, "_slurm_jobs", []))))
     lines += [blank(), sep]
 

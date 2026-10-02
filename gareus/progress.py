@@ -213,7 +213,9 @@ class GuiProgressSink:
         # In dashboard/interactive modes, let the distance logger own the frame for
         # production and GaMD calibration phases.  This avoids flickering the
         # progress bar underneath the dashboard.
-        if self.tui_mode in {"dashboard", "interactive"} and phase in {"gamd_calibration", "gareus_production"}:
+        # The swarm round (``extra["swarm"]``) reports as production but has no distance logger.
+        if (self.tui_mode in {"dashboard", "interactive"} and phase in {"gamd_calibration", "gareus_production"}
+                and not (extra or {}).get("swarm")):
             return
 
         # Console throttling.
