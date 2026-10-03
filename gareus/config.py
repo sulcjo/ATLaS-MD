@@ -117,6 +117,7 @@ CONFIG_KEY_ALIASES: Dict[str, str] = {
     # swarm: section-child short names -> swarm_* dests (spec P1 / 3.2)
     "adaptive_reserve_fraction": "swarm_adaptive_reserve_fraction",
     "cv2_layout": "swarm_cv2_layout",
+    "cv2_bridge_sets": "swarm_cv2_bridge_sets",
     "cv2_min_mode_members": "swarm_cv2_min_mode_members",
     "cv1_contact_map_fit": "swarm_cv1_contact_map_fit",
     "cv1_contact_map_r0_a": "swarm_cv1_contact_map_r0_a",

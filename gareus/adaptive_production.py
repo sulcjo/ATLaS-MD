@@ -544,6 +544,9 @@ class AdaptiveDecisionPolicy:
     # R2 bootstrap: "fixed-f" (MBAR f held at the point estimate) or "resolve-f" (the lambda = 0
     # MBAR re-solved per replicate with gareus-analyze's solver; t2_synthetic.md 9.10).
     coverage_bootstrap: str = "fixed-f"
+    # R1 bridges a CV2 gap with its layout column's whole bridge set (--ap-cv2-bridge-sets, off by
+    # default; spec 2026-10-03-cv2-bridge-sets-design): one atomic insert, never a lone midpoint.
+    cv2_bridge_sets: bool = False
     # Respring (gareus/adaptive/cv2_respring*.py, --ap-cv2-respring), off by default: after a
     # numbered epoch, re-derive a CV2-restrained window's k2 from its own samples as a NEW
     # centre (old centre retired on every rung) when its realised mean compression
@@ -593,6 +596,7 @@ DECISION_SETTINGS_FIELDS = (
     "refine_budget_fraction", "refine_protect_epochs", "refine_min_sigma",
     "refine_transition_count", "refine_r3_mode", "coverage_count", "coverage_bootstrap",
     "cv2_respring", "respring_min_neff", "respring_tolerance", "respring_max_fraction", "respring_k2_rtol",
+    "cv2_bridge_sets",
 )
 DECISION_SETTINGS_FILENAME = "decision_settings.json"
 
@@ -8090,11 +8094,17 @@ class AdaptiveProductionController:
             # plan["plan"] is _validate_insert's {"children", "added"} dict, wrapped by _validate_action.
             _, parent, _children, reason = action[:4]
             meta = dict(action[4]) if len(action) > 4 else None
-            for child in plan["plan"]["children"]:
+            by_child = list(((meta or {}).get("cv2_resolution") or {}).get("seed_source_by_child") or [])
+            for i, child in enumerate(plan["plan"]["children"]):
                 child_reason = "; ".join([f"insert child: {reason}", *child["notes"]])
+                child_meta = meta
+                if meta is not None and len(by_child) == len(plan["plan"]["children"]):
+                    # R1 bridge set: each child seeds from its nearer endpoint (else a's basin).
+                    res = {k: v for k, v in meta["cv2_resolution"].items() if k != "seed_source_by_child"}
+                    child_meta = {**meta, "cv2_resolution": {**res, "seed_source_state_id": int(by_child[i])}}
                 self._add_centre_on_every_rung(epoch, child["params"], parent=int(parent),
                                                source="adaptive_production_cv2_resolution",
-                                               reason=child_reason, metadata=meta)
+                                               reason=child_reason, metadata=child_meta)
         elif kind == "respring":
             # New centre first (on the rungs resolved at validation), then the members captured
             # at validation -- never recomputed: the new states share the old centre key.
@@ -8269,6 +8279,7 @@ def policy_from_args(args: Any) -> AdaptiveDecisionPolicy:
         coverage_count=str(getattr(args, "adaptive_production_coverage_count", "same-column") or "same-column"),
         coverage_bootstrap=str(getattr(args, "adaptive_production_coverage_bootstrap", "fixed-f") or "fixed-f"),
         cv2_respring=_arg_bool(args, "adaptive_production_cv2_respring", False),
+        cv2_bridge_sets=_arg_bool(args, "adaptive_production_cv2_bridge_sets", False),
         respring_min_neff=_arg_float(args, "adaptive_production_respring_min_neff", 200.0),
         respring_tolerance=_arg_float(args, "adaptive_production_respring_tolerance", 0.05),
         respring_max_fraction=_arg_float(args, "adaptive_production_respring_max_fraction", 0.25),

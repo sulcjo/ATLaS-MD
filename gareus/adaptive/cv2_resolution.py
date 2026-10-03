@@ -108,7 +108,7 @@ BURN_IN_NOTE = ("standard: the US pull is not written as samples, per-state burn
 DEFAULTS = {"coverage_min_windows": 2.0, "refine_min_transitions": 10, "refine_pmf_sigma_kT": 0.25,
             "refine_budget_fraction": 0.5, "refine_protect_epochs": 2, "refine_min_sigma": 0.1,
             "refine_transition_count": "replica-path", "refine_r3_mode": "flag",
-            "coverage_count": "same-column", "coverage_bootstrap": "fixed-f"}
+            "coverage_count": "same-column", "coverage_bootstrap": "fixed-f", "cv2_bridge_sets": False}
 # R3 crossing counts (``count_transitions`` over different runs; see cv2_resolution_rules._transitions).
 TRANSITION_COUNTS = ("replica", "replica-path", "state-series")
 # R3 modes: "flag" records the would-be children and never emits an insert; "insert" acts.
@@ -144,6 +144,8 @@ class ResolutionSettings:
     refine_r3_mode: str = DEFAULTS["refine_r3_mode"]
     coverage_count: str = DEFAULTS["coverage_count"]
     coverage_bootstrap: str = DEFAULTS["coverage_bootstrap"]
+    # R1 bridges a CV2 gap with the whole bridge set of its layout column (spec 2026-10-03-cv2-bridge-sets).
+    cv2_bridge_sets: bool = DEFAULTS["cv2_bridge_sets"]
     temperature_k: float = 300.0
     k1_min: float = 0.0
     k2_min: float = 0.0
@@ -509,7 +511,9 @@ def candidate_action(cand: Mapping[str, Any], epoch: int) -> Optional[Tuple]:
     meta = action_metadata(rule, cand.get("class"), epoch, parent)
     reason = f"cv2_resolution {rule}{'/' + cand['class'] if cand.get('class') else ''}: {cand['reason']}"
     kids = [child_params(c) for c in prop["children"]]
-    if rule == "R3":
+    if prop.get("seed_sources"):                # R1 bridge set: each child seeds from its nearer endpoint
+        meta[METADATA_KEY]["seed_source_by_child"] = [int(x) for x in prop["seed_sources"]]
+    if rule == "R3" or len(kids) > 1:          # R3 children, or an R1 bridge set: one atomic insert
         return ("insert", parent, kids, reason, meta)
     return ("add", parent, kids[0], reason, meta)
 
@@ -528,8 +532,16 @@ def allocate(cands: Sequence[Dict[str, Any]], allowance: Any, n_rungs: int, *,
     slots = None if ignore_budget or allowance is None else int(allowance.resolution_slots)
     spent, out = 0, []
     for c in pending:
-        cost = int(n_rungs) * (2 if c["rule"] == "R3" else 1)
+        n_kids = len((c.get("proposal") or {}).get("children") or []) or 1
+        cost = int(n_rungs) * (2 if c["rule"] == "R3" else n_kids)
         c = {**c, "cost_states": cost}
+        if (c.get("fallback_proposal") and mode != "no_reserve" and slots is not None and spent + cost > slots):
+            # An R1 bridge set never part-funded: when the whole set does not fit, today's midpoint does.
+            c = {**c, "proposal": c["fallback_proposal"], "cost_states": int(n_rungs),
+                 "metrics": {**(c.get("metrics") or {}), "bridge_mode": "midpoint_after_budget",
+                             "set_cost_states": cost}}
+            cost = int(n_rungs)
+        c.pop("fallback_proposal", None)
         if mode == "no_reserve":
             detail = getattr(allowance, "reason", "no_reserve")
             c.update(decision="refused", reason=f"no_reserve ({detail}): {c['reason']}", refusal="no_reserve")

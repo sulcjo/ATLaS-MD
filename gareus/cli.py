@@ -356,6 +356,11 @@ def _add_cv_selection_args(p: argparse.ArgumentParser) -> None:
                         "mode with >= --swarm-cv2-min-mode-members members, fills at 1.5 x the smallest "
                         "predicted sampled sigma, k2 = RT/sigma^2 - F'' in [--cv2-k-min, --cv2-k-max], adds "
                         "one CV1-free window per mode (X7) and ranks cells under the cap.")
+    p.add_argument("--swarm-cv2-bridge-sets", action=argparse.BooleanOptionalAction, default=False,
+                   help="--swarm-cv2-layout shape under a replica cap: grant the fills between two CV2 modes of a "
+                        "column as one whole bridge set (score = column weight share / n_fills; a set that does not "
+                        "fit is skipped, never part-granted), after a CV1-free barrier chain across the pooled "
+                        "profile and the connectivity states; then tails. Off by default (today's per-fill ranking).")
     p.add_argument("--swarm-cv2-min-mode-members", type=int, default=8,
                    help="Independent swarm members a CV2 mixture component needs before "
                         "--swarm-cv2-layout shape places a mandatory centre on it.")
@@ -700,6 +705,12 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--ap-refine-min-sigma", type=float, default=0.1,
                    help="Smallest target sampled CV2 sigma (CV2 units) of a new R1-R3 window. Uncalibrated "
                         "default.")
+    p.add_argument("--ap-cv2-bridge-sets", action=argparse.BooleanOptionalAction, default=False,
+                   help="R1 (--ap-cv2-resolution) bridges a weak/structural CV2 gap with the whole bridge set of "
+                        "its layout column (every fill the shape layout's placement puts between the two centres, "
+                        "one atomic insert costing n_rungs x n_fills) instead of a single midpoint window, which "
+                        "cannot connect a several-kT barrier. Falls back to the midpoint without a shape layout "
+                        "plan. Off by default; frozen decision rule.")
     p.add_argument("--ap-cv2-respring", action=argparse.BooleanOptionalAction, default=False,
                    help="Re-derive CV2 springs from production samples (off by default). After each numbered "
                         "epoch, a CV2-restrained window whose realised mean compression k2/(k2 + F''_prod), "
@@ -1875,6 +1886,7 @@ def _shim_adaptive_production(args: argparse.Namespace) -> None:
     args.adaptive_production_refine_protect_epochs = args.ap_refine_protect_epochs
     args.adaptive_production_refine_min_sigma = args.ap_refine_min_sigma
     args.adaptive_production_cv2_respring = args.ap_cv2_respring
+    args.adaptive_production_cv2_bridge_sets = args.ap_cv2_bridge_sets
     args.adaptive_production_respring_min_neff = args.ap_respring_min_neff
     args.adaptive_production_respring_tolerance = args.ap_respring_tolerance
     args.adaptive_production_respring_max_fraction = args.ap_respring_max_fraction
