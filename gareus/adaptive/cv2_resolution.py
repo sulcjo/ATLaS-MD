@@ -511,6 +511,8 @@ def candidate_action(cand: Mapping[str, Any], epoch: int) -> Optional[Tuple]:
     meta = action_metadata(rule, cand.get("class"), epoch, parent)
     reason = f"cv2_resolution {rule}{'/' + cand['class'] if cand.get('class') else ''}: {cand['reason']}"
     kids = [child_params(c) for c in prop["children"]]
+    if prop.get("seed_sources"):                # R1 bridge set: each child seeds from its nearer endpoint
+        meta[METADATA_KEY]["seed_source_by_child"] = [int(x) for x in prop["seed_sources"]]
     if rule == "R3" or len(kids) > 1:          # R3 children, or an R1 bridge set: one atomic insert
         return ("insert", parent, kids, reason, meta)
     return ("add", parent, kids[0], reason, meta)
@@ -533,6 +535,13 @@ def allocate(cands: Sequence[Dict[str, Any]], allowance: Any, n_rungs: int, *,
         n_kids = len((c.get("proposal") or {}).get("children") or []) or 1
         cost = int(n_rungs) * (2 if c["rule"] == "R3" else n_kids)
         c = {**c, "cost_states": cost}
+        if (c.get("fallback_proposal") and mode != "no_reserve" and slots is not None and spent + cost > slots):
+            # An R1 bridge set never part-funded: when the whole set does not fit, today's midpoint does.
+            c = {**c, "proposal": c["fallback_proposal"], "cost_states": int(n_rungs),
+                 "metrics": {**(c.get("metrics") or {}), "bridge_mode": "midpoint_after_budget",
+                             "set_cost_states": cost}}
+            cost = int(n_rungs)
+        c.pop("fallback_proposal", None)
         if mode == "no_reserve":
             detail = getattr(allowance, "reason", "no_reserve")
             c.update(decision="refused", reason=f"no_reserve ({detail}): {c['reason']}", refusal="no_reserve")

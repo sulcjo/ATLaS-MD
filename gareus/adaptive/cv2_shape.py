@@ -606,16 +606,10 @@ def bridge_fills(fit: CV2MixtureFit, z_lo: float, z_hi: float, *, sigma_w_target
             "f2": [float(x) for x in model.f2(z)], "sampled_sigma": [float(x) for x in model.sigma(z)]}
 
 
-def predicted_overlaps(fit: CV2MixtureFit, centres: Sequence[float], k2s: Sequence[float], temperature_k: float,
-                       n_grid: int = 4001) -> List[float]:
-    """Adjacent-window overlaps predicted on the fit's profile F(z) = -RT ln p_mix(z) (every
-    component): window k samples p_k ~ exp(-(F + k2 (z - c)^2 / 2) / RT); overlap(a, b) =
-    sum p_a p_b / (p_a + p_b) dz, the two-state MBAR overlap scale (0..0.5) for umbrella-only bias
-    differences. A design diagnostic on the swarm's design measure, not an equilibrium claim."""
+def _window_log_densities(fit: CV2MixtureFit, centres, k2s, temperature_k: float, n_grid: int):
+    """(grid z, dz, [log p_k normalised on the grid]) for windows on the fit's profile."""
     c = np.asarray(centres, dtype=float)
     k = np.asarray(k2s, dtype=float)
-    if c.size < 2:
-        return []
     rt = R_KCAL_MOL_K * float(temperature_k)
     comps = list(fit.components)
     sds = [math.sqrt(max(cm.variance, 0.0)) for cm in comps]
@@ -625,12 +619,26 @@ def predicted_overlaps(fit: CV2MixtureFit, centres: Sequence[float], k2s: Sequen
     z = np.linspace(lo, hi, int(n_grid))
     dz = z[1] - z[0]
     logp = mixture_logpdf(z, comps)
-    dens = []
+    out = []
     for ci, ki in zip(c, k):
         lq = logp - 0.5 * float(ki) * (z - float(ci)) ** 2 / rt
         lq = lq - lq.max()
-        q = np.exp(lq)
-        dens.append(q / (q.sum() * dz))
+        out.append(lq - math.log(float(np.exp(lq).sum()) * dz))
+    return z, dz, out
+
+
+def predicted_overlaps(fit: CV2MixtureFit, centres: Sequence[float], k2s: Sequence[float], temperature_k: float,
+                       n_grid: int = 4001) -> List[float]:
+    """Adjacent-window overlaps predicted on the fit's profile F(z) = -RT ln p_mix(z) (every
+    component): window k samples p_k ~ exp(-(F + k2 (z - c)^2 / 2) / RT); overlap(a, b) =
+    sum p_a p_b / (p_a + p_b) dz, the two-state MBAR overlap scale (0..0.5) for umbrella-only bias
+    differences. An UPPER bound on what sampling realises: it is an equilibrium quantity on the
+    swarm's design measure and cannot see a window trapped in one of two basins it straddles
+    (``internal_barriers_kT``), nor a swarm profile that differs from production."""
+    if len(centres) < 2:
+        return []
+    _z, dz, logs = _window_log_densities(fit, centres, k2s, temperature_k, n_grid)
+    dens = [np.exp(lq) for lq in logs]
     out = []
     for pa, pb in zip(dens[:-1], dens[1:]):
         s = pa + pb
@@ -639,6 +647,32 @@ def predicted_overlaps(fit: CV2MixtureFit, centres: Sequence[float], k2s: Sequen
     return out
 
 
-__all__ = ["CURVATURE_VARIANCE_FLOOR", "bridge_fills", "fit_from_record", "predicted_overlaps", "CV2MixtureFit", "CV2Placement", "DEFAULT_MIN_MEAN_COMPRESSION", "curvature_variance", "DEFAULT_MIN_MODE_MEMBERS", "DEFAULT_PRIOR_MEMBERS",
+def internal_barriers_kT(fit: CV2MixtureFit, centres: Sequence[float], k2s: Sequence[float], temperature_k: float,
+                         n_grid: int = 4001, min_peak_fraction: float = 0.01) -> List[float]:
+    """Per window, the barrier (kT) inside its own predicted density p_k on the design profile: the
+    lower of the two highest peaks minus the deepest point between them (0 for a unimodal window).
+    Peaks under ``min_peak_fraction`` of the top peak are ignored. A window with a barrier of a few kT
+    straddles two basins and samples one of them for long stretches -- overlap cannot show that."""
+    if not len(centres):
+        return []
+    _z, _dz, logs = _window_log_densities(fit, centres, k2s, temperature_k, n_grid)
+    floor = math.log(float(min_peak_fraction))
+    out = []
+    for lq in logs:
+        top = float(lq.max())
+        peaks = [i for i in range(1, lq.size - 1) if lq[i] >= lq[i - 1] and lq[i] > lq[i + 1] and lq[i] >= top + floor]
+        if len(peaks) < 2:
+            out.append(0.0)
+            continue
+        best = 0.0
+        for i, j in zip(peaks[:-1], peaks[1:]):
+            valley = float(lq[i:j + 1].min())
+            best = max(best, min(float(lq[i]), float(lq[j])) - valley)
+        out.append(best)
+    return out
+
+
+__all__ = ["CURVATURE_VARIANCE_FLOOR", "bridge_fills", "fit_from_record", "internal_barriers_kT",
+           "predicted_overlaps", "CV2MixtureFit", "CV2Placement", "DEFAULT_MIN_MEAN_COMPRESSION", "curvature_variance", "DEFAULT_MIN_MODE_MEMBERS", "DEFAULT_PRIOR_MEMBERS",
            "DEFAULT_SPACING_SIGMA", "MixtureComponent", "estimate_f2", "fit_cv2_mixture", "mixture_logpdf", "compression_floor_k2",
            "mode_depth", "mode_pair_resolvable", "place_cv2_centres", "predicted_sampled_sigma", "shape_rule_k2"]

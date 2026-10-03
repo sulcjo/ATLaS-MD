@@ -138,10 +138,56 @@ The swarm mixture is a design measure, not an equilibrium profile. The predicted
 
 ## 5. c10 use
 
-`chignolin_10.yaml` sets `swarm: cv2_bridge_sets: true` and `adaptive_production: ap_cv2_bridge_sets: true` on top of V3. The swarm is re-run from scratch (the run folder was removed), then the analysis designs the layout with bridge sets.
+**Both flags stay OFF for the chignolin_10 relaunch** (decision after the adversarial reviews, section 7):
+plain V3 (3 rungs to lambda 0.45, 13 CV1 columns). The code ships, off by default, for later use
+once production evidence shows a column whose CV2-free window does not connect its wells.
 
 ## 6. Risks
 
 - **The pooled profile mixes columns** whose well positions differ slightly (≈ ±0.2). The merged pooled anchors can sit between per-column wells, so the chain's ends may overlap their X7 windows less than designed. This is reported (`predicted_min_overlap` uses pooled anchors), not corrected.
 - **Bridge sets cost 4–7 states each.** Under a tight cap, few columns get one. That is deliberate (a partial bridge connects nothing), but per-column CV2 coverage on the barrier stays sparse. The barrier chain plus CV1 exchange within each well carries the connectivity.
 - **R1 sets can drain the reserve in one epoch.** At most one set per component pair per epoch, as today.
+
+## 7. Adversarial review (2026-10-03) and what changed
+
+Two independent reviews (code; statistical mechanics, with chignolin_10 epoch_000 production data).
+
+**The premise is weaker than section 1 states.** Every CV1 column already has a CV2-unrestrained window.
+In epoch_000 it overlaps both of its column's well windows (two-state BAR >= 0.12, both sides) in
+11 of 15 columns, and in the low-CV1 columns it crosses 13-24 times (state series, so exchange swaps
+are included). A zero well-to-well edge is therefore expected and is not a disconnected column. The
+exceptions are c1 +0.48 / +1.57 / +1.81. Also, production CV2 sd is about 0.72x the swarm prediction
+for stiff windows, and well weights are off by up to 0.5 in places, so the swarm profile is a weak
+design measure.
+
+**Changes made after review:**
+- Predicted overlap is documented as an UPPER bound: it is an equilibrium overlap and cannot see
+  trapping. `internal_barriers_kT` (the barrier inside each window's own predicted density) is now
+  recorded per fill, with a warning above 1 kT.
+- Scoring is by density, (weight_share / sigma_w1) / n_fills. A CV1-loose column (CV1 window wider
+  than 2x the median, e.g. at the CV1 k floor) is ineligible: such windows barely restrain CV1 and
+  duplicate the CV1-free chain. Before this change the ranking chose exactly those three columns.
+- Near-duplicate fills (within 0.5 sampled sigma of an anchor) are dropped from sets and never granted.
+- The chain is deduplicated against uniform rows and X7 windows. It is granted only if it raises the
+  CV1-free bottleneck (rows + X7 + chain, on the pooled profile) by >= 0.05. On V3 it does not
+  (0.278 -> 0.305), so it is not proposed.
+- Refusal reasons (`bridge_set_does_not_fit`, `cv1_loose_column`, `near_duplicate`,
+  `barrier_chain_does_not_fit`, chain `no_gain` / `all_duplicates` / `no_barrier`) are no longer
+  overwritten with "cap".
+- R1 sets:
+  - each child seeds from its nearer endpoint (`seed_source_by_child`, applied per child by the applier);
+  - near duplicates are dropped;
+  - compression bookkeeping is the same as for the midpoint;
+  - overlap is computed after the gate;
+  - a placement failure falls back to the midpoint.
+  - A set that does not fit the resolution budget falls back to today's midpoint
+    (`midpoint_after_budget`); on V3, resolution slots (<= 11) are below the smallest set (12 states).
+
+**V3 replay after the changes (flag on):**
+- the chain is not proposed (no_gain);
+- 4 whole bridges are granted: columns 9, 10, 8, plus one further set, 19 fills in total;
+- 3 warnings for fills straddling a 1.0-2.9 kT barrier inside their own window;
+- with the flag off, the recorded grants are reproduced exactly.
+
+Open, not built: rank sets by need, i.e. columns whose CV2-free window does not cross in
+production, which is evidence only epochs can give.

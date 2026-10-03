@@ -8094,11 +8094,17 @@ class AdaptiveProductionController:
             # plan["plan"] is _validate_insert's {"children", "added"} dict, wrapped by _validate_action.
             _, parent, _children, reason = action[:4]
             meta = dict(action[4]) if len(action) > 4 else None
-            for child in plan["plan"]["children"]:
+            by_child = list(((meta or {}).get("cv2_resolution") or {}).get("seed_source_by_child") or [])
+            for i, child in enumerate(plan["plan"]["children"]):
                 child_reason = "; ".join([f"insert child: {reason}", *child["notes"]])
+                child_meta = meta
+                if meta is not None and len(by_child) == len(plan["plan"]["children"]):
+                    # R1 bridge set: each child seeds from its nearer endpoint (else a's basin).
+                    res = {k: v for k, v in meta["cv2_resolution"].items() if k != "seed_source_by_child"}
+                    child_meta = {**meta, "cv2_resolution": {**res, "seed_source_state_id": int(by_child[i])}}
                 self._add_centre_on_every_rung(epoch, child["params"], parent=int(parent),
                                                source="adaptive_production_cv2_resolution",
-                                               reason=child_reason, metadata=meta)
+                                               reason=child_reason, metadata=child_meta)
         elif kind == "respring":
             # New centre first (on the rungs resolved at validation), then the members captured
             # at validation -- never recomputed: the new states share the old centre key.

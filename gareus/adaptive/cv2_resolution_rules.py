@@ -243,54 +243,83 @@ def _column_for(columns: Optional[Sequence[Mapping[str, Any]]], a: cr.StateView,
 
 
 def bridge_set_children(a: cr.StateView, b: cr.StateView, column: Optional[Mapping[str, Any]],
-                        settings: cr.ResolutionSettings) -> Dict[str, Any]:
+                        settings: cr.ResolutionSettings, gate: Any = None) -> Dict[str, Any]:
     """R1's children for the gap a-b: every fill the layout column's placement model puts strictly
-    between the two centres (same step rule and springs as the layout), or -- no column, or no
-    fill between them -- today's single sampled-midpoint bridge (``midpoint_fallback``)."""
-    from gareus.adaptive.cv2_shape import bridge_fills, predicted_overlaps  # noqa: PLC0415
-    fallback = {"bridge_mode": "midpoint_fallback", "children": [cr.bridge_child(a, b, settings)],
-                "predicted_overlaps": None, "predicted_min_overlap": None}
+    between the two centres (same step rule and springs as the layout; fills within 0.5 sampled
+    sigma of an endpoint dropped), each seeded from the NEARER endpoint and passed through the 3.4
+    gate; or -- no column, no fill, or a placement failure -- today's single sampled-midpoint bridge
+    (``midpoint_fallback``). ``fallback_children`` always carries that midpoint, for the budget."""
+    from gareus.adaptive.cv2_shape import (bridge_fills, compression_floor_k2,  # noqa: PLC0415
+                                           internal_barriers_kT, predicted_overlaps)
+    midpoint = [cr.bridge_child(a, b, settings)]
+    fallback = {"bridge_mode": "midpoint_fallback", "children": midpoint, "fallback_children": None,
+                "seed_sources": None, "predicted_overlaps": None, "predicted_min_overlap": None,
+                "internal_barrier_kT": None}
     if column is None or a.c2 is None or b.c2 is None:
         return fallback
     lo, hi = sorted((a, b), key=lambda v: float(v.c2))
-    fills = bridge_fills(column["fit"], float(lo.c2), float(hi.c2), sigma_w_target=column["sigma_w_target"],
-                         temperature_k=settings.temperature_k, k_min=column["k_min"], k_max=column["k_max"],
-                         spacing_sigma=column["spacing_sigma"], min_mean_compression=column["min_mean_compression"])
-    if not fills["centres"]:
+    try:
+        fills = bridge_fills(column["fit"], float(lo.c2), float(hi.c2), sigma_w_target=column["sigma_w_target"],
+                             temperature_k=settings.temperature_k, k_min=column["k_min"], k_max=column["k_max"],
+                             spacing_sigma=column["spacing_sigma"], min_mean_compression=column["min_mean_compression"])
+    except (ValueError, FloatingPointError):
+        return {**fallback, "bridge_mode": "midpoint_fallback_placement_failed"}
+    keep = [i for i, (z, sig) in enumerate(zip(fills["centres"], fills["sampled_sigma"]))
+            if abs(z - float(lo.c2)) >= 0.5 * sig and abs(z - float(hi.c2)) >= 0.5 * sig]
+    if not keep:
         return fallback
     k_cap = float(settings.k2_max) if settings.k2_max is not None and float(settings.k2_max) > 0 else None
+    c_min = float(column["min_mean_compression"])
     c1, k1 = 0.5 * (float(a.c1) + float(b.c1)), 0.5 * (float(a.k1) + float(b.k1))
-    children = []
-    for z, k2, f2, sig in zip(fills["centres"], fills["k2"], fills["f2"], fills["sampled_sigma"]):
-        k2 = min(float(k2), k_cap) if k_cap is not None else float(k2)
-        child = {"parent_state_id": int(a.state_id), "primary_center": c1, "primary_k": k1,
-                 "secondary_center": float(z), "centred_on": "bridge_set", "k2": k2, "f2_est": float(f2),
-                 "predicted_sampled_sigma": float(sig), "at_compression_floor": False, "refusal": None}
+    children, seeds = [], []
+    for i in keep:
+        z, k2, f2 = fills["centres"][i], float(fills["k2"][i]), float(fills["f2"][i])
+        k2 = min(k2, k_cap) if k_cap is not None else k2
+        floor_c = float(compression_floor_k2(f2, c_min))
+        width = settings.rt / float(column["sigma_w_target"]) ** 2 - max(0.0, f2)
+        near = lo if abs(z - float(lo.c2)) <= abs(z - float(hi.c2)) else hi
+        child = {"parent_state_id": int(a.state_id), "seed_source_state_id": int(near.state_id),
+                 "primary_center": c1, "primary_k": k1, "secondary_center": float(z), "centred_on": "bridge_set",
+                 "k2": k2, "f2_est": f2, "predicted_sampled_sigma": float(fills["sampled_sigma"][i]),
+                 "mean_compression": k2 / (k2 + max(0.0, f2)) if k2 + max(0.0, f2) > 0 else 1.0,
+                 "min_mean_compression": c_min, "compression_floor_k2": floor_c,
+                 "at_compression_floor": bool(floor_c > width and abs(k2 - floor_c) <= 1e-9 * max(1.0, floor_c)),
+                 "refusal": None}
         if k2 <= max(0.0, float(settings.k2_min)) * (1.0 + 1e-12):
             child["refusal"] = "k2_at_floor"
+        child = cr.gate_child(child, c1, k1, float(z), gate, f"cv2_resolution R1 bridge set {a.state_id}-{b.state_id}",
+                              settings)
         children.append(child)
-    ov = predicted_overlaps(column["fit"], [float(lo.c2), *fills["centres"], float(hi.c2)],
-                            [float(lo.k2), *[c["k2"] for c in children], float(hi.k2)], settings.temperature_k)
-    return {"bridge_mode": "set", "children": children, "predicted_overlaps": ov,
-            "predicted_min_overlap": float(min(ov)) if ov else None}
+        seeds.append(int(near.state_id))
+    cs = [float(lo.c2), *[c["secondary_center"] for c in children], float(hi.c2)]
+    ks = [float(lo.k2), *[c["k2"] for c in children], float(hi.k2)]
+    ov = predicted_overlaps(column["fit"], cs, ks, settings.temperature_k)
+    barriers = internal_barriers_kT(column["fit"], cs[1:-1], ks[1:-1], settings.temperature_k)
+    return {"bridge_mode": "set", "children": children, "fallback_children": midpoint, "seed_sources": seeds,
+            "predicted_overlaps": ov, "predicted_min_overlap": float(min(ov)) if ov else None,
+            "internal_barrier_kT": barriers}
 
 
 def _bridge_set_candidate(cls, a, b, metrics, reason, settings, gate, columns):
-    out = bridge_set_children(a, b, _column_for(columns, a, b), settings)
-    if out["bridge_mode"] == "midpoint_fallback":
-        metrics = {**metrics, "bridge_mode": "midpoint_fallback"}
+    out = bridge_set_children(a, b, _column_for(columns, a, b), settings, gate)
+    if out["bridge_mode"] != "set":
+        metrics = {**metrics, "bridge_mode": out["bridge_mode"]}
         return _bridge_candidate(cls, a, b, metrics, reason, settings, gate)
-    kids = [cr.gate_child(dict(c), c["primary_center"], c["primary_k"], c["secondary_center"], gate,
-                          f"cv2_resolution R1 bridge set {a.state_id}-{b.state_id}", settings) for c in out["children"]]
+    kids = out["children"]
     metrics = {**metrics, "bridge_mode": "set", "n_children": len(kids),
-               "predicted_overlaps": out["predicted_overlaps"], "predicted_min_overlap": out["predicted_min_overlap"]}
-    proposal = {"parent_state_id": int(a.state_id), "children": kids}
+               "predicted_overlaps": out["predicted_overlaps"], "predicted_min_overlap": out["predicted_min_overlap"],
+               "predicted_overlap_is_upper_bound": True, "internal_barrier_kT": out["internal_barrier_kT"]}
+    proposal = {"parent_state_id": int(a.state_id), "children": kids, "seed_sources": out["seed_sources"]}
     ids = [a.state_id, b.state_id]
     refused = [c["refusal"] for c in kids if c.get("refusal")]
     if refused:                                       # atomic: one refused child refuses the set
         return cr.new_candidate("R1", "edge", ids, "refused", f"{refused[0]}: {reason}", cls=cls,
                                 refusal=refused[0], metrics=metrics, proposal=proposal)
-    return cr.new_candidate("R1", "edge", ids, "proposed", reason, cls=cls, metrics=metrics, proposal=proposal)
+    fb = _bridge_candidate(cls, a, b, {}, reason, settings, gate)
+    cand = cr.new_candidate("R1", "edge", ids, "proposed", reason, cls=cls, metrics=metrics, proposal=proposal)
+    if fb["decision"] == "proposed":
+        cand["fallback_proposal"] = fb["proposal"]    # funded instead when the whole set does not fit
+    return cand
 
 
 def _bridge_candidate(cls, a, b, metrics, reason, settings, gate):

@@ -36,7 +36,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from gareus.adaptive.cv2_shape import (CV2MixtureFit, CV2Placement, MixtureComponent, estimate_f2, fit_cv2_mixture,
-                                       place_cv2_centres, predicted_overlaps, predicted_sampled_sigma, shape_rule_k2)
+                                       internal_barriers_kT, place_cv2_centres, predicted_overlaps,
+                                       predicted_sampled_sigma, shape_rule_k2)
 from gareus.adaptive.reserve_budget import layout_reserve_record
 from gareus.swarm.ladder_design import (LAYOUT_PLAN_VERSION, LAYOUT_STATUS_INSUFFICIENT, LAYOUT_STATUS_PROPOSED,
                                         R_KJ_PER_MOL_K, ROLE_AXIS, ROLE_JOINT, ROLE_REGION_REPRESENTATIVE,
@@ -46,6 +47,12 @@ from gareus.swarm.ladder_design import (LAYOUT_PLAN_VERSION, LAYOUT_STATUS_INSUF
 KERNEL_CUTOFF_SIGMA = 3.0      # CV1 kernel truncated beyond this many window widths
 MODE_DEDUP_SIGMA = 0.5         # an X7 mode window within this x its sampled sigma of another is a duplicate
 BRIDGE_MIN_PREDICTED_OVERLAP = 0.15   # bridge / chain below this predicted adjacent overlap: granted, but warned
+BRIDGE_MAX_INTERNAL_BARRIER_KT = 1.0  # a granted fill straddling a barrier above this inside its own window: warned
+CV1_LOOSE_FACTOR = 2.0                # a column whose CV1 window is this x wider than the median is CV1-loose
+CHAIN_MIN_GAIN = 0.05                 # the chain is granted only if it raises the CV1-free bottleneck by this
+PREDICTED_OVERLAP_NOTE = ("predicted overlaps are an UPPER bound: equilibrium overlap on the swarm design profile, "
+                          "blind to within-window trapping (internal_barrier_kT) and to swarm-vs-production "
+                          "differences (2026-10-03 review: production CV2 sd ~0.72x the swarm's)")
 SHAPE_LAYOUT_NOTE = ("the swarm is a design measure (short seeded runs), not an equilibrium conditional; "
                      "its mixture only locates structure and bounds resolution from above")
 
@@ -152,41 +159,66 @@ def mode_axis_windows(columns: Sequence[ShapeColumn], uniform_centres2, *, tempe
 
 # --- bridge sets (spec 2026-10-03-cv2-bridge-sets-design) --------------------------------
 
+def _near_duplicate(z: float, anchor: float, sigma: float) -> bool:
+    return abs(float(z) - float(anchor)) < MODE_DEDUP_SIGMA * float(sigma)
+
+
 def _placement_bridges(placement: CV2Placement, fit: CV2MixtureFit, temperature_k: float) -> List[dict]:
-    """The runs of fills strictly between consecutive ``mode`` anchors of one placement."""
+    """The runs of fills strictly between consecutive ``mode`` anchors of one placement. A fill
+    within ``MODE_DEDUP_SIGMA`` x its sampled sigma of either anchor (the step rule's last fill can
+    land on the next anchor) is a near duplicate: excluded from the set and never granted."""
     kinds = list(placement.kinds)
     anchors = [i for i, k in enumerate(kinds) if k == "mode"]
     out = []
     for i, j in zip(anchors[:-1], anchors[1:]):
-        fills = list(range(i + 1, j))
+        inner = list(range(i + 1, j))
+        dup = [q for q in inner if _near_duplicate(placement.centres[q], placement.centres[i], placement.sampled_sigma[q])
+               or _near_duplicate(placement.centres[q], placement.centres[j], placement.sampled_sigma[q])]
+        fills = [q for q in inner if q not in dup]
         if not fills:
             continue
-        ov = predicted_overlaps(fit, placement.centres[i:j + 1], placement.k2[i:j + 1], temperature_k)
-        out.append({"lower_position": i, "upper_position": j, "fill_positions": fills,
+        cs = [placement.centres[i], *[placement.centres[q] for q in fills], placement.centres[j]]
+        ks = [placement.k2[i], *[placement.k2[q] for q in fills], placement.k2[j]]
+        ov = predicted_overlaps(fit, cs, ks, temperature_k)
+        barriers = internal_barriers_kT(fit, cs[1:-1], ks[1:-1], temperature_k)
+        out.append({"lower_position": i, "upper_position": j, "fill_positions": fills, "near_duplicate_positions": dup,
                     "centres": [float(placement.centres[q]) for q in fills],
                     "k2": [float(placement.k2[q]) for q in fills], "n_fills": len(fills),
-                    "predicted_overlaps": ov, "predicted_min_overlap": float(min(ov)) if ov else None})
+                    "predicted_overlaps": ov, "predicted_min_overlap": float(min(ov)) if ov else None,
+                    "internal_barrier_kT": barriers, "max_internal_barrier_kT": float(max(barriers)) if barriers else 0.0})
     return out
 
 
 def column_bridge_sets(columns: Sequence[ShapeColumn], temperature_k: float) -> List[dict]:
-    """Every column's bridge sets, scored by connectivity per spatial state (weight_share / n_fills)."""
+    """Every column's bridge sets. Score = the column's design-measure density (weight_share /
+    sigma_w1: a wide CV1 kernel collects mass by width alone) per fill. A CV1-loose column (CV1
+    window wider than ``CV1_LOOSE_FACTOR`` x the median, e.g. at the CV1 k floor) is not eligible:
+    its windows barely restrain CV1 and duplicate the CV1-free chain (2026-10-03 review, C2)."""
+    widths = [float(c.sigma_w1) for c in columns]
+    median = float(np.median(widths)) if widths else 0.0
     sets = []
     for col in columns:
+        loose = median > 0 and float(col.sigma_w1) > CV1_LOOSE_FACTOR * median
+        density = float(col.weight_share) / float(col.sigma_w1) if col.sigma_w1 > 0 else 0.0
         for b in _placement_bridges(col.placement, col.fit, temperature_k):
             sets.append({"index": len(sets), "column": col.index, "centre1": col.centre1,
-                         "score": float(col.weight_share) / b["n_fills"], **b})
+                         "score": density / b["n_fills"], "eligible": not loose,
+                         "ineligible_reason": "cv1_loose_column" if loose else None, **b})
     return sets
 
 
 def pooled_fit(columns: Sequence[ShapeColumn]) -> CV2MixtureFit:
     """The columns' mixtures, each weighted by its column's ``weight_share``, as one fit (no new
-    EM; replayable from a layout plan): the CV1-free design profile of the barrier chain."""
-    shares = [float(c.weight_share) for c in columns]
-    total = sum(shares) or 1.0
+    EM; replayable from a layout plan): the CV1-free design profile of the barrier chain. It is the
+    swarm's stratified design marginal, not the equilibrium CV1 marginal."""
+    shares = [max(float(c.weight_share), 0.0) for c in columns]
+    total = sum(shares)
+    if total <= 0:
+        shares, total = [1.0] * len(columns), float(len(columns) or 1)
     comps = tuple(MixtureComponent(c.mean, c.variance, c.weight * sh / total, c.n_members, c.accepted, c.reason,
                                    c.reg_variance, c.variance_curvature)
-                  for col, sh in zip(columns, shares) for c in col.fit.components)
+                  for col, sh in zip(columns, shares) for c in col.fit.components if c.weight * sh > 0)
+
     def _avg(attr):
         vals = [(sh, float(getattr(col.fit, attr))) for col, sh in zip(columns, shares)
                 if math.isfinite(float(getattr(col.fit, attr)))]
@@ -198,18 +230,43 @@ def pooled_fit(columns: Sequence[ShapeColumn]) -> CV2MixtureFit:
                          max((c.fit.min_mode_members for c in columns), default=0), ("pooled over columns",))
 
 
+def _cv1_free_bottleneck(fit, windows: Sequence[Tuple[float, float]], temperature_k: float) -> Optional[float]:
+    """Min adjacent predicted overlap along the CV1-free windows sorted by centre (1-D: the widest path)."""
+    ws = sorted((float(z), float(k)) for z, k in windows)
+    if len(ws) < 2:
+        return None
+    ov = predicted_overlaps(fit, [w[0] for w in ws], [w[1] for w in ws], temperature_k)
+    return float(min(ov)) if ov else None
+
+
 def barrier_chain(columns: Sequence[ShapeColumn], envelope: Tuple[float, float], *, temperature_k: float,
-                  sigma_w_target: float, k_min: float, k_max: float, spacing_sigma: float) -> dict:
-    """The CV1-free chain across the pooled profile's barriers: every fill between consecutive
-    pooled anchors (k1 = 0, k2 from the pooled model). Empty when the pooled profile has one well."""
+                  sigma_w_target: float, k_min: float, k_max: float, spacing_sigma: float,
+                  existing: Sequence[Tuple[float, float]] = ()) -> dict:
+    """The CV1-free chain across the pooled profile's barriers: the fills between consecutive pooled
+    anchors, minus any within ``MODE_DEDUP_SIGMA`` sampled sigma of an existing CV1-free window
+    (``existing`` = uniform rows + X7 as (centre2, k2)). Proposed only if it raises the CV1-free
+    bottleneck (rows + X7 [+ chain], predicted on the pooled profile) by >= ``CHAIN_MIN_GAIN``."""
     fit = pooled_fit(columns)
     pl = place_cv2_centres(fit, envelope, sigma_w_target=sigma_w_target, temperature_k=temperature_k, k_min=k_min,
                            k_max=k_max, spacing_sigma=spacing_sigma)
     bridges = _placement_bridges(pl, fit, temperature_k)
-    mins = [b["predicted_min_overlap"] for b in bridges if b["predicted_min_overlap"] is not None]
-    return {"anchors": [float(pl.centres[i]) for i, k in enumerate(pl.kinds) if k == "mode"],
-            "centres": [z for b in bridges for z in b["centres"]], "k2": [k for b in bridges for k in b["k2"]],
-            "bridges": bridges, "predicted_min_overlap": float(min(mins)) if mins else None}
+    cands = [(z, k, sig) for b in bridges for z, k in zip(b["centres"], b["k2"])
+             for sig in [float(pl.sampled_sigma[list(pl.centres).index(z)])]]
+    kept = [(z, k) for z, k, sig in cands if not any(_near_duplicate(z, e, sig) for e, _k in existing)]
+    before = _cv1_free_bottleneck(fit, existing, temperature_k)
+    after = _cv1_free_bottleneck(fit, [*existing, *kept], temperature_k)
+    gain = (after - before) if after is not None and before is not None else after
+    useful = bool(kept) and (before is None or (gain is not None and gain >= CHAIN_MIN_GAIN))
+    barriers = internal_barriers_kT(fit, [z for z, _ in kept], [k for _, k in kept], temperature_k) if kept else []
+    rec = {"anchors": [float(pl.centres[i]) for i, k in enumerate(pl.kinds) if k == "mode"],
+           "candidates": [float(z) for z, _k, _s in cands], "deduplicated": len(cands) - len(kept),
+           "cv1_free_bottleneck_without": before, "cv1_free_bottleneck_with": after, "gain": gain,
+           "min_gain": CHAIN_MIN_GAIN, "internal_barrier_kT": barriers,
+           "centres": [float(z) for z, _ in kept] if useful else [], "k2": [float(k) for _, k in kept] if useful else [],
+           "predicted_min_overlap": after if useful else None}
+    if not useful:
+        rec["not_proposed"] = "no_barrier" if not cands else ("all_duplicates" if not kept else "no_gain")
+    return rec
 
 
 # --- requests and the budget -------------------------------------------------------------
@@ -303,6 +360,11 @@ def _grant_bridge_tiers(tier_mode, connect, fill, chain_reqs, sets, fill_cap, ce
     by_pos = {(q["column"], q["position"]): q for q in fill}
     for bs in sorted(sets, key=lambda b: (-b["score"], b["column"], b["lower_position"])):
         members = [by_pos[(bs["column"], p)] for p in bs["fill_positions"]]
+        if not bs.get("eligible", True):
+            bs.update({"granted": False, "reason": bs.get("ineligible_reason") or "ineligible"})
+            for q in members:
+                q.update({"granted": False, "rank": None, "tier": None, "reason": bs["reason"]})
+            continue
         if len(members) <= fill_cap - len(cells):
             for q in members:
                 rank = _grant(q, rank, "bridge_set", cells, roles)
@@ -345,8 +407,12 @@ def design_shape_layout(columns: Sequence[ShapeColumn], modes: Sequence[dict], u
     chain_reqs: list = []
     if bridges_on:
         member = {(bs["column"], p): bs["index"] for bs in bridge_sets for p in bs["fill_positions"]}
+        dups = {(bs["column"], p) for bs in bridge_sets for p in bs.get("near_duplicate_positions", ())}
         for q in fill:
             q["bridge_set"] = member.get((q["column"], q["position"]))
+            if (q["column"], q["position"]) in dups:
+                q.update({"bridge_set": "near_duplicate", "granted": False, "rank": None, "tier": None,
+                          "reason": "near_duplicate"})
         chain_reqs = [{"kind": "barrier_axis", "column": None, "position": m,
                        "cell": (None, index[("barrier_axis", m, None)]), "center1": None, "center2": float(z),
                        "k2": float(k), "score": None, "bridge_set": None}
@@ -378,7 +444,7 @@ def design_shape_layout(columns: Sequence[ShapeColumn], modes: Sequence[dict], u
     for q in requests:
         q.setdefault("granted", False)
         if not q["granted"]:
-            q.update({"rank": None, "tier": None, "reason": "cap"})
+            q.update({"rank": None, "tier": None, "reason": q.get("reason") or "cap"})
         q["cell"] = [q["cell"][0], q["cell"][1]]
     plan = {**base, "status": LAYOUT_STATUS_PROPOSED, "kind": kind, "spatial_states": len(cells), "cells": cells,
             "state_roles": roles, "mandatory_spatial_indices": list(range(mandatory)),
@@ -389,11 +455,16 @@ def design_shape_layout(columns: Sequence[ShapeColumn], modes: Sequence[dict], u
                           "n_dropped": sum(1 for q in requests if not q["granted"])}}
     if bridges_on:
         granted_chain = bool(chain_reqs) and all(q["granted"] for q in chain_reqs)
+        for bs in bridge_sets:
+            bs.setdefault("granted", False)
+            bs.setdefault("reason", "cap")
         plan["cv2_shape"].update({
-            "bridge_sets_enabled": True, "bridge_sets": list(bridge_sets),
+            "bridge_sets_enabled": True, "predicted_overlap_note": PREDICTED_OVERLAP_NOTE,
+            "bridge_sets": list(bridge_sets),
             "barrier_chain": {**chain, "granted": granted_chain,
                               "reason": ("granted" if granted_chain else
-                                         ("no_barrier" if not chain_reqs else chain_reqs[0].get("reason", "cap")))}})
+                                         (chain.get("not_proposed", "no_barrier") if not chain_reqs
+                                          else chain_reqs[0].get("reason") or "cap"))}})
     if float(reserve_fraction) > 0.0:
         plan["adaptive_reserve"] = layout_reserve_record(float(reserve_fraction), int(max_replicas), int(n_rungs),
                                                          fill_cap_spatial=fill_cap, spatial_states=len(cells))
@@ -425,7 +496,9 @@ def build_shape_pair_layout(*, cv1, z2, member_ids, deltav_kj, centers1, ks1, la
     if bridge_sets:
         extra = {"bridge_sets": column_bridge_sets(columns, temperature_k),
                  "chain": barrier_chain(columns, envelope, temperature_k=temperature_k, sigma_w_target=sigma_t,
-                                        k_min=k_min, k_max=k_max, spacing_sigma=overlap_sigma)}
+                                        k_min=k_min, k_max=k_max, spacing_sigma=overlap_sigma,
+                                        existing=[*zip((float(z) for z in u), (float(k) for k in uniform_ks2)),
+                                                  *((float(m["center2"]), float(m["k2"])) for m in modes)])}
     layout, centres2, ks2 = design_shape_layout(columns, modes, u, uniform_ks2, n_rungs=len(lambdas),
                                                 max_replicas=max_replicas, region_centre_indices=region_centre_indices,
                                                 reserve_fraction=reserve_fraction, **extra)
@@ -453,6 +526,10 @@ def _bridge_warnings(record: dict) -> List[str]:
         if bs.get("granted") and m is not None and m < BRIDGE_MIN_PREDICTED_OVERLAP:
             out.append(f"cv2 bridge set {bs['index']} (column {bs['column']}) predicted min overlap {m:.3f} < "
                        f"{BRIDGE_MIN_PREDICTED_OVERLAP}")
+        b = bs.get("max_internal_barrier_kT") or 0.0
+        if bs.get("granted") and b > BRIDGE_MAX_INTERNAL_BARRIER_KT:
+            out.append(f"cv2 bridge set {bs['index']} (column {bs['column']}): a fill straddles a {b:.1f} kT barrier "
+                       f"inside its own window (> {BRIDGE_MAX_INTERNAL_BARRIER_KT} kT): expect trapping")
     ch = record.get("barrier_chain") or {}
     m = ch.get("predicted_min_overlap")
     if ch.get("granted") and m is not None and m < BRIDGE_MIN_PREDICTED_OVERLAP:
