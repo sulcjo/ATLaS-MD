@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -569,6 +569,76 @@ def place_cv2_centres(fit: CV2MixtureFit, envelope: Tuple[float, float], *, sigm
                         tuple(dropped), c_floor, float(min_mean_compression))
 
 
-__all__ = ["CURVATURE_VARIANCE_FLOOR", "CV2MixtureFit", "CV2Placement", "DEFAULT_MIN_MEAN_COMPRESSION", "curvature_variance", "DEFAULT_MIN_MODE_MEMBERS", "DEFAULT_PRIOR_MEMBERS",
+# --- bridge sets (spec 2026-10-03-cv2-bridge-sets-design) --------------------------------
+
+def fit_from_record(record: Dict[str, Any]) -> CV2MixtureFit:
+    """``CV2MixtureFit`` rebuilt from its ``as_record()`` (a layout plan's ``fit``)."""
+    comps = tuple(MixtureComponent(float(c["mean"]), float(c["variance"]), float(c["weight"]), int(c["n_members"]),
+                                   bool(c["accepted"]), str(c.get("reason", "")), float(c.get("reg_variance", 0.0)),
+                                   None if c.get("variance_curvature") is None else float(c["variance_curvature"]))
+                  for c in record.get("components", []))
+    return CV2MixtureFit(comps, int(record.get("n_components", len(comps))),
+                         {int(k): float(v) for k, v in (record.get("bic") or {}).items()},
+                         float(record.get("regularisation", 0.0)),
+                         {float(k): float(v) for k, v in (record.get("cv_scores") or {}).items()},
+                         int(record.get("cv_folds", 0)), int(record.get("n_frames", 0)), int(record.get("n_members", 0)),
+                         float(record.get("weight_total", 0.0)), float(record.get("pooled_mean", float("nan"))),
+                         float(record.get("pooled_variance", float("nan"))), int(record.get("min_mode_members", 0)),
+                         tuple(record.get("reasons") or ()))
+
+
+def bridge_fills(fit: CV2MixtureFit, z_lo: float, z_hi: float, *, sigma_w_target: float, temperature_k: float,
+                 k_min: float, k_max: float, spacing_sigma: float = DEFAULT_SPACING_SIGMA,
+                 prior_members: float = DEFAULT_PRIOR_MEMBERS,
+                 min_mean_compression: float = DEFAULT_MIN_MEAN_COMPRESSION, n_grid: int = 33,
+                 max_centres: int = 500) -> Dict[str, List[float]]:
+    """The fills strictly between ``z_lo`` and ``z_hi`` by ``place_cv2_centres``' own step rule
+    and springs (the walk between two anchors): {centres, k2, f2, sampled_sigma}."""
+    lo, hi = sorted((float(z_lo), float(z_hi)))
+    model = _ShapeModel(fit, temperature_k, sigma_w_target, float(k_min), float(k_max), prior_members,
+                        min_mean_compression)
+    tol = 1e-9 * max(hi - lo, 1e-12)
+    walk = _walk(model, lo, hi, +1, float(spacing_sigma), 0.5, n_grid, tol, False, int(max_centres))
+    z = np.array([w[0] for w in walk], dtype=float)
+    if z.size == 0:
+        return {"centres": [], "k2": [], "f2": [], "sampled_sigma": []}
+    return {"centres": [float(x) for x in z], "k2": [float(x) for x in model.k2(z)],
+            "f2": [float(x) for x in model.f2(z)], "sampled_sigma": [float(x) for x in model.sigma(z)]}
+
+
+def predicted_overlaps(fit: CV2MixtureFit, centres: Sequence[float], k2s: Sequence[float], temperature_k: float,
+                       n_grid: int = 4001) -> List[float]:
+    """Adjacent-window overlaps predicted on the fit's profile F(z) = -RT ln p_mix(z) (every
+    component): window k samples p_k ~ exp(-(F + k2 (z - c)^2 / 2) / RT); overlap(a, b) =
+    sum p_a p_b / (p_a + p_b) dz, the two-state MBAR overlap scale (0..0.5) for umbrella-only bias
+    differences. A design diagnostic on the swarm's design measure, not an equilibrium claim."""
+    c = np.asarray(centres, dtype=float)
+    k = np.asarray(k2s, dtype=float)
+    if c.size < 2:
+        return []
+    rt = R_KCAL_MOL_K * float(temperature_k)
+    comps = list(fit.components)
+    sds = [math.sqrt(max(cm.variance, 0.0)) for cm in comps]
+    sig_k = math.sqrt(rt / max(float(np.min(k[k > 0])) if np.any(k > 0) else rt, 1e-12))
+    lo = min(float(c.min()), *[cm.mean - 8.0 * sd for cm, sd in zip(comps, sds)]) - 6.0 * sig_k
+    hi = max(float(c.max()), *[cm.mean + 8.0 * sd for cm, sd in zip(comps, sds)]) + 6.0 * sig_k
+    z = np.linspace(lo, hi, int(n_grid))
+    dz = z[1] - z[0]
+    logp = mixture_logpdf(z, comps)
+    dens = []
+    for ci, ki in zip(c, k):
+        lq = logp - 0.5 * float(ki) * (z - float(ci)) ** 2 / rt
+        lq = lq - lq.max()
+        q = np.exp(lq)
+        dens.append(q / (q.sum() * dz))
+    out = []
+    for pa, pb in zip(dens[:-1], dens[1:]):
+        s = pa + pb
+        m = s > 0
+        out.append(float(np.sum(pa[m] * pb[m] / s[m]) * dz))
+    return out
+
+
+__all__ = ["CURVATURE_VARIANCE_FLOOR", "bridge_fills", "fit_from_record", "predicted_overlaps", "CV2MixtureFit", "CV2Placement", "DEFAULT_MIN_MEAN_COMPRESSION", "curvature_variance", "DEFAULT_MIN_MODE_MEMBERS", "DEFAULT_PRIOR_MEMBERS",
            "DEFAULT_SPACING_SIGMA", "MixtureComponent", "estimate_f2", "fit_cv2_mixture", "mixture_logpdf", "compression_floor_k2",
            "mode_depth", "mode_pair_resolvable", "place_cv2_centres", "predicted_sampled_sigma", "shape_rule_k2"]

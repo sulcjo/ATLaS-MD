@@ -215,6 +215,84 @@ def _r1_edges(payload, views, rep, settings):
     return out, skipped
 
 
+BRIDGE_COLUMN_TOL = 1e-6
+
+
+def bridge_columns_from_plan(plan: Optional[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    """Per layout column, what ``bridge_set_children`` needs: the fit (rebuilt from the record)
+    and the layout's own placement settings. [] when the plan has no shape record."""
+    from gareus.adaptive.cv2_shape import fit_from_record  # noqa: PLC0415
+    rec = (plan or {}).get("cv2_shape") or {}
+    out = []
+    for col in rec.get("columns") or []:
+        try:
+            out.append({"centre1": float(col["centre1"]), "fit": fit_from_record(col["fit"]),
+                        "sigma_w_target": float(rec["sigma_w_target"]), "spacing_sigma": float(rec["spacing_sigma"]),
+                        "k_min": float(rec["cv2_k_min"]), "k_max": float(rec["cv2_k_max"]),
+                        "min_mean_compression": float((col.get("placement") or {}).get("min_mean_compression", 0.5))})
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def _column_for(columns: Optional[Sequence[Mapping[str, Any]]], a: cr.StateView, b: cr.StateView):
+    if not columns or abs(float(a.c1) - float(b.c1)) > BRIDGE_COLUMN_TOL:
+        return None
+    near = [c for c in columns if abs(float(c["centre1"]) - float(a.c1)) <= BRIDGE_COLUMN_TOL]
+    return near[0] if near else None
+
+
+def bridge_set_children(a: cr.StateView, b: cr.StateView, column: Optional[Mapping[str, Any]],
+                        settings: cr.ResolutionSettings) -> Dict[str, Any]:
+    """R1's children for the gap a-b: every fill the layout column's placement model puts strictly
+    between the two centres (same step rule and springs as the layout), or -- no column, or no
+    fill between them -- today's single sampled-midpoint bridge (``midpoint_fallback``)."""
+    from gareus.adaptive.cv2_shape import bridge_fills, predicted_overlaps  # noqa: PLC0415
+    fallback = {"bridge_mode": "midpoint_fallback", "children": [cr.bridge_child(a, b, settings)],
+                "predicted_overlaps": None, "predicted_min_overlap": None}
+    if column is None or a.c2 is None or b.c2 is None:
+        return fallback
+    lo, hi = sorted((a, b), key=lambda v: float(v.c2))
+    fills = bridge_fills(column["fit"], float(lo.c2), float(hi.c2), sigma_w_target=column["sigma_w_target"],
+                         temperature_k=settings.temperature_k, k_min=column["k_min"], k_max=column["k_max"],
+                         spacing_sigma=column["spacing_sigma"], min_mean_compression=column["min_mean_compression"])
+    if not fills["centres"]:
+        return fallback
+    k_cap = float(settings.k2_max) if settings.k2_max is not None and float(settings.k2_max) > 0 else None
+    c1, k1 = 0.5 * (float(a.c1) + float(b.c1)), 0.5 * (float(a.k1) + float(b.k1))
+    children = []
+    for z, k2, f2, sig in zip(fills["centres"], fills["k2"], fills["f2"], fills["sampled_sigma"]):
+        k2 = min(float(k2), k_cap) if k_cap is not None else float(k2)
+        child = {"parent_state_id": int(a.state_id), "primary_center": c1, "primary_k": k1,
+                 "secondary_center": float(z), "centred_on": "bridge_set", "k2": k2, "f2_est": float(f2),
+                 "predicted_sampled_sigma": float(sig), "at_compression_floor": False, "refusal": None}
+        if k2 <= max(0.0, float(settings.k2_min)) * (1.0 + 1e-12):
+            child["refusal"] = "k2_at_floor"
+        children.append(child)
+    ov = predicted_overlaps(column["fit"], [float(lo.c2), *fills["centres"], float(hi.c2)],
+                            [float(lo.k2), *[c["k2"] for c in children], float(hi.k2)], settings.temperature_k)
+    return {"bridge_mode": "set", "children": children, "predicted_overlaps": ov,
+            "predicted_min_overlap": float(min(ov)) if ov else None}
+
+
+def _bridge_set_candidate(cls, a, b, metrics, reason, settings, gate, columns):
+    out = bridge_set_children(a, b, _column_for(columns, a, b), settings)
+    if out["bridge_mode"] == "midpoint_fallback":
+        metrics = {**metrics, "bridge_mode": "midpoint_fallback"}
+        return _bridge_candidate(cls, a, b, metrics, reason, settings, gate)
+    kids = [cr.gate_child(dict(c), c["primary_center"], c["primary_k"], c["secondary_center"], gate,
+                          f"cv2_resolution R1 bridge set {a.state_id}-{b.state_id}", settings) for c in out["children"]]
+    metrics = {**metrics, "bridge_mode": "set", "n_children": len(kids),
+               "predicted_overlaps": out["predicted_overlaps"], "predicted_min_overlap": out["predicted_min_overlap"]}
+    proposal = {"parent_state_id": int(a.state_id), "children": kids}
+    ids = [a.state_id, b.state_id]
+    refused = [c["refusal"] for c in kids if c.get("refusal")]
+    if refused:                                       # atomic: one refused child refuses the set
+        return cr.new_candidate("R1", "edge", ids, "refused", f"{refused[0]}: {reason}", cls=cls,
+                                refusal=refused[0], metrics=metrics, proposal=proposal)
+    return cr.new_candidate("R1", "edge", ids, "proposed", reason, cls=cls, metrics=metrics, proposal=proposal)
+
+
 def _bridge_candidate(cls, a, b, metrics, reason, settings, gate):
     child = cr.bridge_child(a, b, settings)
     child = cr.gate_child(child, child["primary_center"], child["primary_k"], child["secondary_center"], gate,
@@ -227,23 +305,28 @@ def _bridge_candidate(cls, a, b, metrics, reason, settings, gate):
     return cr.new_candidate("R1", "edge", ids, "proposed", reason, cls=cls, metrics=metrics, proposal=proposal)
 
 
-def _r1_decide(cls, edge, a, b, metrics, history, epoch, settings, gate):
+def _r1_decide(cls, edge, a, b, metrics, history, epoch, settings, gate, columns=None):
     key = cr.edge_key(a.state_id, b.state_id)
     thr = settings.threshold
+    if settings.cv2_bridge_sets:
+        def bridge(*xs):
+            return _bridge_set_candidate(*xs, columns)
+    else:
+        bridge = _bridge_candidate
     if cls == "structural":
-        return _bridge_candidate(cls, a, b, metrics, f"component split at {thr:g}: more sampling cannot connect it",
+        return bridge(cls, a, b, metrics, f"component split at {thr:g}: more sampling cannot connect it",
                                  settings, gate)
     if cr.is_protected(a, epoch, settings) or cr.is_protected(b, epoch, settings):
         return cr.new_candidate("R1", "edge", [a.state_id, b.state_id], "skipped", "protected endpoint",
                                 cls=cls, metrics=metrics)
     if cls == "weak":
-        return _bridge_candidate(cls, a, b, metrics, f"confidently below {thr:g} inside one component",
+        return bridge(cls, a, b, metrics, f"confidently below {thr:g} inside one component",
                                  settings, gate)
     n = cr.consecutive_bad(history, key, epoch)
     metrics["consecutive_bad_epochs"] = n
     need = 1 + cr.UNMEASURED_WAIT_EPOCHS
     if n >= need:
-        return _bridge_candidate(cls, a, b, metrics, f"still unmeasured/weak after {n - 1} epoch(s) of sampling",
+        return bridge(cls, a, b, metrics, f"still unmeasured/weak after {n - 1} epoch(s) of sampling",
                                  settings, gate)
     return cr.new_candidate("R1", "edge", [a.state_id, b.state_id], "extend",
                             f"unmeasured {n}/{need} epochs: extend sampling first (the extend is a lifecycle "
@@ -251,7 +334,8 @@ def _r1_decide(cls, edge, a, b, metrics, history, epoch, settings, gate):
 
 
 def propose_r1(payload: Mapping[str, Any], views: Mapping[int, cr.StateView], rep_ids: Sequence[int],
-               settings: cr.ResolutionSettings, history: Mapping[str, Any], epoch: int, gate: Any = None
+               settings: cr.ResolutionSettings, history: Mapping[str, Any], epoch: int, gate: Any = None,
+               bridge_columns: Optional[Sequence[Mapping[str, Any]]] = None
                ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
     """R1 candidates, the updated edge history and a status record."""
     em = payload.get("edge_metric") or {}
@@ -273,7 +357,7 @@ def propose_r1(payload: Mapping[str, Any], views: Mapping[int, cr.StateView], re
             cands.append(cr.new_candidate("R1", "edge", [a.state_id, b.state_id], "no_action",
                                           "component_pair_already_bridged", cls=cls, metrics=metrics))
             continue
-        cand = _r1_decide(cls, edge, a, b, metrics, new_history, epoch, settings, gate)
+        cand = _r1_decide(cls, edge, a, b, metrics, new_history, epoch, settings, gate, bridge_columns)
         if cls == "structural" and cand["decision"] == "proposed":
             bridged_pairs.add(pair)
         cands.append(cand)
@@ -284,4 +368,4 @@ def propose_r1(payload: Mapping[str, Any], views: Mapping[int, cr.StateView], re
     return cands, new_history, status
 
 
-__all__ = ["propose_r1", "propose_r3"]
+__all__ = ["bridge_columns_from_plan", "bridge_set_children", "propose_r1", "propose_r3"]
