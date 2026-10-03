@@ -49,14 +49,22 @@ def _reweighted_sigma_and_ess(dv: np.ndarray, beta: float, lam: float) -> tuple[
 
 
 def design_lambda_ladder(deltav_kj, temperature_k: float, *, target_beta_sigma: float = 1.0,
-                          min_rungs: int = 3, max_rungs: int = 12, ess_floor: int = 50) -> dict:
-    """Grow lambda from 0 to 1 with adjacent-rung spacing set by target_beta_sigma * (beta*sigma_lambda)^-1.
+                          min_rungs: int = 3, max_rungs: int = 12, ess_floor: int = 50,
+                          lambda_max: float = 1.0) -> dict:
+    """Grow lambda from 0 to ``lambda_max`` with adjacent-rung spacing set by target_beta_sigma * (beta*sigma_lambda)^-1.
+
+    ``lambda_max`` (default 1, full boost) is the top rung. A cap below 1 spends the rungs where the
+    boost still grows and the lambda = 0 swarm can still reweight to: chignolin_10's forced lambda = 1
+    rung boosted less than lambda = 0.42 at ESS 29, while its states were what the replica cap lacked.
 
     sigma_lambda(DeltaV_max) is the reweighted standard deviation of DeltaV_max under the ensemble at
     rung lambda (reweighting swarm frames sampled at lambda=0). Rungs whose reweighted ESS falls below
     ess_floor are flagged via extrapolated_from_rung: everything from that rung on is extrapolated
     beyond what the lambda=0 swarm can support and must be confirmed by the S3 stage.
     """
+    lambda_max = float(lambda_max)
+    if not (math.isfinite(lambda_max) and 0.0 < lambda_max <= 1.0):
+        raise ValueError(f"lambda_max must be in (0, 1], got {lambda_max!r}")
     dv = np.asarray(deltav_kj, dtype=float)
     dv = dv[np.isfinite(dv)]
     if dv.size < 2:
@@ -64,14 +72,14 @@ def design_lambda_ladder(deltav_kj, temperature_k: float, *, target_beta_sigma: 
     beta = 1.0 / (R_KJ_MOL_K * float(temperature_k))
 
     lambdas: list[float] = [0.0]
-    while lambdas[-1] < 1.0 and len(lambdas) < int(max_rungs):
+    while lambdas[-1] < lambda_max and len(lambdas) < int(max_rungs):
         lam = lambdas[-1]
         sig, _ess = _reweighted_sigma_and_ess(dv, beta, lam)
         step = float(target_beta_sigma) / (beta * sig) if sig > 0 else 1.0
-        lambdas.append(min(1.0, lam + step))
-    if lambdas[-1] < 1.0:
-        # max_rungs reached before lambda=1: force the top rung so production always has one.
-        lambdas[-1] = 1.0
+        lambdas.append(min(lambda_max, lam + step))
+    if lambdas[-1] < lambda_max:
+        # max_rungs reached before lambda_max: force the top rung so production always has one.
+        lambdas[-1] = lambda_max
 
     while len(lambdas) < int(min_rungs):
         # Too few rungs for the floor: bisect the currently-widest gap.
@@ -98,6 +106,7 @@ def design_lambda_ladder(deltav_kj, temperature_k: float, *, target_beta_sigma: 
         "ess_per_rung": [float(x) for x in esss],
         "extrapolated_from_rung": extrapolated,
         "target_beta_sigma": float(target_beta_sigma),
+        "lambda_max": lambda_max,
         "beta_sigma_lambda0": float(beta * sigmas[0]),
         "n_samples": int(dv.size),
     }
