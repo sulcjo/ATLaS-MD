@@ -1354,27 +1354,46 @@ def _read_traj_interval_one_dir(prod_dir: Path) -> int:
     return 0
 
 
+def _segment_grid_origin(eff_resume_start: int, resume_start: int) -> int:
+    """Sample-clock step at which a segment's reporter step counter reads 0.
+
+    ``resume_start`` is the offset from the segment's file name (merged dirs add
+    ``phase * _MERGED_TRAJ_STEP_STRIDE``); ``eff_resume_start`` is the same point
+    on the sample clock (``_base_segment_resume_start``: plus the GaMD
+    calibration offset for non-merged runs). The counter itself restarts at the
+    phase's own ``prod_done``, i.e. ``resume_start mod STRIDE``.
+    """
+    return int(eff_resume_start) - int(resume_start) % _MERGED_TRAJ_STEP_STRIDE
+
+
 def _sample_to_segment_frame(
     sample_steps: np.ndarray,
     resume_start: int,
     n_frames: int,
     step_per_frame: int,
+    grid_origin: Optional[int] = None,
 ) -> tuple:
     """Map sample absolute steps to local frame indices within one trajectory segment.
 
-    Frame i in a segment with resume_start R and step_per_frame S has absolute step:
-        abs_step(i) = R + (i + 1) * S
+    OpenMM's trajectory reporters write a frame whenever the step counter is a
+    multiple of ``step_per_frame`` S, and a resumed run continues the counter
+    from ``prod_done``. Frame i of a segment starting at R therefore sits at the
+    (i + 1)-th grid point ``grid_origin + k * S`` strictly after R. For an R on
+    the grid that is R + (i + 1) * S; for a segment resumed off the grid (a
+    SIGTERM checkpoint at an arbitrary step) the first frame comes less than one
+    S after R. ``grid_origin`` None keeps the old assumption that R is on the grid.
 
     Returns (mask, local_frame_indices) where mask selects samples that fall in this segment.
     """
     spf = max(1, int(step_per_frame))
-    seg_first = resume_start + spf
-    seg_last = resume_start + n_frames * spf
+    start = int(resume_start)
+    origin = start if grid_origin is None else int(grid_origin)
+    seg_first = start + spf - (start - origin) % spf
+    seg_last = seg_first + (n_frames - 1) * spf
     mask = (sample_steps >= seg_first) & (sample_steps <= seg_last)
     if not np.any(mask):
         return mask, np.empty(0, dtype=np.int64)
-    local = (np.round((sample_steps[mask].astype(np.float64) - resume_start) / spf)
-             .astype(np.int64) - 1)
+    local = np.round((sample_steps[mask].astype(np.float64) - seg_first) / spf).astype(np.int64)
     local = np.clip(local, 0, n_frames - 1)
     return mask, local
 
@@ -1617,7 +1636,7 @@ def _compute_rg_from_trajectories(d: Data, args, progress: Optional[Progress], w
                 continue
             rep_frames+=int(n_frames)
             eff_resume_start=_base_segment_resume_start(resume_start, use_adjusted, steps_for_align, spf)
-            mask, local_frames=_sample_to_segment_frame(steps_for_align, eff_resume_start, n_frames, spf)
+            mask, local_frames=_sample_to_segment_frame(steps_for_align, eff_resume_start, n_frames, spf, grid_origin=_segment_grid_origin(eff_resume_start, resume_start))
             if not np.any(mask):
                 continue
             out[order[mask]]=rg[local_frames]
@@ -1882,7 +1901,7 @@ def _pca_replica_plan(d: Data, args, md, traj_dir: Path, warnings: list[str]) ->
             if n_seg_frames is None or n_seg_frames<=0:
                 continue
             eff_resume_start=_base_segment_resume_start(resume_start, use_adj, steps_for_align, spf)
-            mask, local_frames=_sample_to_segment_frame(steps_for_align, eff_resume_start, n_seg_frames, spf)
+            mask, local_frames=_sample_to_segment_frame(steps_for_align, eff_resume_start, n_seg_frames, spf, grid_origin=_segment_grid_origin(eff_resume_start, resume_start))
             if not np.any(mask):
                 continue
             seg_order=order[mask]
@@ -2291,7 +2310,7 @@ def _extra_replica_plan(d: Data, args, md, traj_dir: Path, warnings: list[str]) 
             if n_seg_frames is None or n_seg_frames<=0:
                 continue
             eff_resume_start=_base_segment_resume_start(resume_start, use_adj, steps_for_align, spf)
-            mask, local_frames=_sample_to_segment_frame(steps_for_align, eff_resume_start, n_seg_frames, spf)
+            mask, local_frames=_sample_to_segment_frame(steps_for_align, eff_resume_start, n_seg_frames, spf, grid_origin=_segment_grid_origin(eff_resume_start, resume_start))
             if not np.any(mask):
                 continue
             seg_order=order[mask]
@@ -3205,7 +3224,7 @@ def _compute_chignolin_distances(d, args, progress, warnings: list):
             except Exception as exc:
                 local_warns.append(f"--chignolin_fes: distance failed for replica {rep} ({seg_path}): {exc}")
                 continue
-            mask, local_frames = _sample_to_segment_frame(steps_for_align, resume_start, traj.n_frames, spf)
+            mask, local_frames = _sample_to_segment_frame(steps_for_align, resume_start, traj.n_frames, spf, grid_origin=_segment_grid_origin(resume_start, resume_start))
             if not np.any(mask):
                 continue
             dist1_out[order[mask]] = d1[local_frames]
