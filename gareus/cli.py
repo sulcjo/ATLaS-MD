@@ -28,7 +28,7 @@ from .config import (
 from .cv import contact_scheme, primary_cv_is_contacts, primary_cv_mode, secondary_cv_mode
 from .forces import self_test_nonlocal_contact_force
 from .io import write_json
-from .lifecycle import _graceful_shutdown
+from .lifecycle import GracefulStop, _graceful_shutdown
 from .production import run_gareus, sync_scratch_to_main
 from .progress import GuiProgressSink
 from .provenance import initialize_run_manifest, finalize_run_manifest
@@ -2676,7 +2676,7 @@ def main(argv: Optional[Iterable[str]] = None):
         progress.emit({"event": "run_complete", "out": str(out_dir)})
         _run_status = "completed"
     except BaseException as exc:
-        _run_status = "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed"
+        _run_status = "interrupted" if isinstance(exc, (KeyboardInterrupt, GracefulStop)) else "failed"
         _run_error = exc
         raise
     finally:
