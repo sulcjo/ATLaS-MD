@@ -1060,6 +1060,10 @@ def _add_swarm_args(p: argparse.ArgumentParser) -> None:
                    help="Rung acceptance control: target delta-lambda * beta * sigma_V.")
     p.add_argument("--swarm-min-rungs", type=int, default=3)
     p.add_argument("--swarm-max-rungs", type=int, default=12)
+    p.add_argument("--swarm-lambda-max", type=float, default=1.0,
+                   help="Top rung of the swarm-designed lambda ladder, in (0, 1]; 1 = full Pep-GaMD boost. "
+                        "Below 1 caps the ladder where the boost still grows and the lambda = 0 swarm can "
+                        "still reweight to (rungs between keep the --swarm-target-beta-sigma spacing).")
     p.add_argument("--swarm-ess-floor", type=int, default=50,
                    help="Reweighting ESS below which a ladder rung is 'extrapolated'.")
     p.add_argument("--swarm-stability-sigma-rel-tol", type=float, default=0.10,
@@ -2148,6 +2152,9 @@ def parse_args(argv: Optional[Iterable[str]] = None):
         p.error(f"--swarm-seed-frame-interval-ps {_frame_ps:g} must be a whole multiple of "
                 f"--swarm-output-interval-ps {_out_ps:g} (frames are written every N trace rows; "
                 f"{_ratio:g} would round to {max(1, round(_ratio)) * _out_ps:g} ps)")
+    _lam_max = float(getattr(args, "swarm_lambda_max", 1.0))
+    if not (math.isfinite(_lam_max) and 0.0 < _lam_max <= 1.0):
+        p.error(f"--swarm-lambda-max must be in (0, 1], got {_lam_max:g}")
     _cm_r0 = getattr(args, "swarm_cv1_contact_map_r0_a", None)
     if _cm_r0 is not None and not (math.isfinite(float(_cm_r0)) and float(_cm_r0) > 0.0):
         p.error("--swarm-cv1-contact-map-r0-a must be positive and finite")

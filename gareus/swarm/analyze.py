@@ -801,6 +801,7 @@ def analyze_swarm_stage(out_dir, args) -> dict:
             target_beta_sigma=float(getattr(args, "swarm_target_beta_sigma", 1.0)),
             min_rungs=int(getattr(args, "swarm_min_rungs", 3)), max_rungs=int(getattr(args, "swarm_max_rungs", 12)),
             ess_floor=int(getattr(args, "swarm_ess_floor", 50)),
+            lambda_max=float(getattr(args, "swarm_lambda_max", 1.0) or 1.0),
         )
         fsf = fsf_floor_per_rung(ladder["lambdas"], env, warn_threshold=float(getattr(args, "swarm_fsf_floor_warn", 0.5)))
         max_nearest_seed_gap = float(np.max(probe_out["nearest_seed_gap"])) if len(probe_out.get("nearest_seed_gap", [])) else None
