@@ -32,6 +32,7 @@ from typing import Iterable, Optional
 
 import numpy as np
 
+from .lifecycle import raise_if_stop_requested
 from .constants import AA3, WATER_RESNAMES, ION_RESNAMES
 from .imports import import_openmm, import_peptidebuilder
 from .units import kcal_a2_to_kj_nm2
@@ -1038,8 +1039,13 @@ def run_steps_safely(
     timestep_fs: Optional[float] = None,
     n_replicas: int = 1,
     message: str = "",
+    stop_check: bool = False,
 ):
-    """Run simulation steps in small chunks so crash PDBs contain the last finite coordinates."""
+    """Run simulation steps in small chunks so crash PDBs contain the last finite coordinates.
+
+    ``stop_check``: raise :class:`gareus.lifecycle.GracefulStop` before a chunk once a
+    SIGTERM was received (setup phases that hold no checkpointable state).
+    """
     nsteps = int(nsteps)
     if nsteps <= 0:
         return
@@ -1048,6 +1054,8 @@ def run_steps_safely(
     if progress is not None:
         progress.progress(label, progress_offset, progress_total or nsteps, message=message, timestep_fs=timestep_fs, n_replicas=n_replicas, force=True)
     while done < nsteps:
+        if stop_check:
+            raise_if_stop_requested(f"{label} at step {done}/{nsteps}")
         chunk = min(int(chunk_size), nsteps - done)
         try:
             state = sim.context.getState(getPositions=True, enforcePeriodicBox=True)

@@ -20,6 +20,7 @@ from typing import Optional
 
 import numpy as np
 
+from .lifecycle import GracefulStop, raise_if_stop_requested
 from .cv import (
     contact_normalization_denominator,
     contact_us_pull_k_user,
@@ -1290,6 +1291,23 @@ def us_pull_device_tokens(args, props) -> list[str]:
     return [x.strip() for x in dev.split(",") if x.strip()] or ["0"]
 
 
+def _completed_or_cancel_on_stop(futures):
+    """``as_completed`` that, on a stop request, cancels every queued window before re-raising.
+
+    In-flight windows stop at their next ``run_steps_safely`` chunk (``stop_check``), so the
+    executor's shutdown wait is one chunk long, not the remaining windows' pulls.
+    """
+    try:
+        for fut in concurrent.futures.as_completed(futures):
+            if fut.exception() is not None and isinstance(fut.exception(), GracefulStop):
+                raise fut.exception()
+            yield fut
+    except GracefulStop:
+        for pending in futures:
+            pending.cancel()
+        raise
+
+
 def generate_us_starting_states_by_pulling(
     args,
     out_dir: Path,
@@ -1556,7 +1574,7 @@ def generate_us_starting_states_by_pulling(
                 chunk_size=safe_chunk, progress=_pull_progress,
                 progress_total=max(1, nwin * max(1, pull_steps)),
                 progress_offset=progress_offset,
-                timestep_fs=ts, n_replicas=1,
+                timestep_fs=ts, n_replicas=1, stop_check=True,
                 message=message,
             )
             return
@@ -1599,7 +1617,7 @@ def generate_us_starting_states_by_pulling(
                 chunk_size=safe_chunk, progress=_pull_progress,
                 progress_total=max(1, nwin * max(1, pull_steps)),
                 progress_offset=progress_offset + done,
-                timestep_fs=ts, n_replicas=1,
+                timestep_fs=ts, n_replicas=1, stop_check=True,
                 message=message + f"; c-ramp {idx+1}/{stages} ({frac*100:.0f}%k)",
             )
             done += int(nstage)
@@ -1617,6 +1635,7 @@ def generate_us_starting_states_by_pulling(
         available GENPEPT seed is already far enough off that pulling is very
         unlikely to close the gap).
         """
+        raise_if_stop_requested(f"US pull before window {w+1}/{nwin}")
         effective_pull_steps = int(pull_steps if pull_steps_override is None else pull_steps_override)
         # Measured before any parameter/position changes below, so it reflects
         # the just-loaded seed, not anything this function is about to do to it.
@@ -1680,7 +1699,7 @@ def generate_us_starting_states_by_pulling(
                         chunk_size=safe_chunk, progress=_pull_progress,
                         progress_total=max(1, nwin * max(1, pull_steps)),
                         progress_offset=progress_base + done_local,
-                        timestep_fs=ts, n_replicas=1,
+                        timestep_fs=ts, n_replicas=1, stop_check=True,
                         message=f"Pull w{w+1}/{nwin}: cv2-ramp {idx+1}/{len(stage_steps)} ({scale*pull_k_scale:.1f}×) cv1→{centers_user_arr[w]:.3f} cv2→{float(secondary_cv_centers[w]):+.2f}",
                     )
                     done_local += int(nstage)
@@ -1986,6 +2005,7 @@ def generate_us_starting_states_by_pulling(
         )
         if n_pull_workers > 1:
             def _seed_task(w):
+                raise_if_stop_requested(f"US pull before window {w+1}/{nwin}")  # before the graft
                 s = _sim_pool.get()
                 device_idx = device_tokens[w % len(device_tokens)]
                 try:
@@ -2018,7 +2038,7 @@ def generate_us_starting_states_by_pulling(
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=n_pull_workers) as ex:
                 futures = {ex.submit(_seed_task, w): w for w in range(nwin)}
-                for fut in concurrent.futures.as_completed(futures):
+                for fut in _completed_or_cancel_on_stop(futures):
                     w, row, pos, vel, graft_status, seed_score_info = fut.result()
                     positions_by_window[w] = pos
                     velocities_by_window[w] = vel
@@ -2164,7 +2184,7 @@ def generate_us_starting_states_by_pulling(
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=n_pull_workers) as ex:
                 futures = {ex.submit(_pull_task, w): w for w in range(nwin)}
-                for fut in concurrent.futures.as_completed(futures):
+                for fut in _completed_or_cancel_on_stop(futures):
                     w, row, pos, vel = fut.result()
                     positions_by_window[w] = pos
                     velocities_by_window[w] = vel
