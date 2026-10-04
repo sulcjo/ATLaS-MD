@@ -454,11 +454,17 @@ def propose_cv2_resolution(registry: Any, diagnostics: Mapping[str, Any], action
                            union: Optional[Tuple[List[Dict[str, Any]], Dict[str, Any]]] = None,
                            union_reason: str = "no union diagnostics", reserve: Optional[dict] = None,
                            reserve_source: Optional[str] = None, gate: Any = None,
-                           ignore_budget: bool = False) -> Tuple[List[Tuple], Dict[str, Any], Dict[str, Any]]:
+                           ignore_budget: bool = False, bridge_columns: Optional[Sequence[Mapping[str, Any]]] = None,
+                           bridge_columns_source: Optional[str] = None
+                           ) -> Tuple[List[Tuple], Dict[str, Any], Dict[str, Any]]:
     """(new action list, report, new edge history). Pure apart from what ``runs_for`` reads."""
     views = cr.state_views(registry, diagnostics)
     rep = cr.representative_ids(views)
-    r1, new_history, r1_status = rules.propose_r1(diagnostics, views, rep, settings, history, epoch, gate)
+    r1, new_history, r1_status = rules.propose_r1(diagnostics, views, rep, settings, history, epoch, gate,
+                                                  bridge_columns=bridge_columns)
+    if settings.cv2_bridge_sets:
+        r1_status = {**r1_status, "bridge_sets": {"n_layout_columns": len(bridge_columns or []),
+                                                   "source": bridge_columns_source}}
     r3 = rules.propose_r3(views, rep, subsamples, runs_for, settings, epoch, gate)
     r2, r2_status = union if union is not None else ([], {"status": "unavailable", "reason": union_reason})
     allowance, main, rung_rec, n_rungs = budget_for_epoch(registry, policy, actions, reserve, settings)
@@ -515,10 +521,16 @@ def run_epoch_cv2_resolution(*, adaptive_dir: Path, epoch_dir: Path, epoch: int,
             union = union_coverage(npz, _column_views(registry, diagnostics), settings, epoch=epoch,
                                    max_gb=float(getattr(policy, "topup_diagnostics_max_gb", 8.0)))
         reserve, source = find_layout_reserve(out_dir, registry)
+        bridge_columns, bridge_source = None, None
+        if settings.cv2_bridge_sets:
+            from gareus.adaptive.cv2_respring_io import find_layout_plan  # noqa: PLC0415
+            plan, bridge_source = find_layout_plan(out_dir, registry)
+            bridge_columns = rules.bridge_columns_from_plan(plan)
         new_actions, report, history = propose_cv2_resolution(
             registry, diagnostics, actions, settings, policy, epoch=epoch, history=load_history(adaptive_dir),
             subsamples=_subsamples(diagnostics), runs_for=runs_for, union=union, union_reason=why,
-            reserve=reserve, reserve_source=source, gate=gate)
+            reserve=reserve, reserve_source=source, gate=gate, bridge_columns=bridge_columns,
+            bridge_columns_source=bridge_source)
         save_history(adaptive_dir, history)
         warn_no_reserve_once(adaptive_dir, report.get("budget") or {})
         report["stage"] = "numbered_epoch"
