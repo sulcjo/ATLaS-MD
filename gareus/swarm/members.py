@@ -321,7 +321,12 @@ def run_member(
 
     cv_atom1, cv_atom2 = _terminal_ca_atoms(topology)
     minimize_iters = int(getattr(args, "swarm_graft_minimize_iters", _DEFAULT_GRAFT_MINIMIZE_ITERS))
+    mid = int(member_row["member_id"]) if member_row.get("member_id") is not None else None
+    if round_progress is not None and mid is not None:
+        round_progress.member_phase(mid, "graft_wait")
     with _GRAFT_GATE:
+        if round_progress is not None and mid is not None:
+            round_progress.member_phase(mid, "grafting")
         graft_status = graft_conformer_into_context(
             sim, topology, conformer, cv_atom1, cv_atom2,
             float(args.temperature_k), unit,
@@ -373,8 +378,15 @@ def run_member(
     last_positions: dict = {}
 
     in_equilibration = [n_equil_steps > 0]
+    production_started = [False]
 
     def step_fn(n):
+        if round_progress is not None:
+            if in_equilibration[0]:
+                round_progress.member_phase(int(member_row["member_id"]), "equilibrating")
+            elif not production_started[0]:
+                production_started[0] = True
+                round_progress.member_phase(int(member_row["member_id"]), "production")
         # Crash coordinates once per frame, not every 100 steps: each snapshot is a full position
         # download with the GIL held (~7 ms at 19k atoms), which at 174 concurrent members alone
         # saturated a core.
@@ -392,7 +404,11 @@ def run_member(
         state = sim.context.getState(getPositions=True, enforcePeriodicBox=True)
         positions_nm = np.asarray(state.getPositions(asNumpy=True).value_in_unit(unit.nanometer))
         last_positions["nm"] = positions_nm  # one State fetch per frame, shared with feature_fn
-        return measure_frame(sim.context, system, unit, positions_nm, contact_pairs, ca_indices, args)
+        row = measure_frame(sim.context, system, unit, positions_nm, contact_pairs, ca_indices, args)
+        if round_progress is not None:
+            round_progress.add_frame(int(member_row["member_id"]), row.get("cv1"), row.get("rg_nm"),
+                                     row.get("e2e_nm"))
+        return row
 
     def feature_fn():
         return backbone_dihedral_features(last_positions["nm"], phi_torsions, psi_torsions)

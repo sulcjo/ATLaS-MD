@@ -347,13 +347,34 @@ def test_tiny_real_swarm_member_moves_atoms_and_writes_trace_frames_and_done_slo
     tmp = pathlib.Path(tempfile.mkdtemp())
     member_dir = tmp / "member_0000"
 
+    class _Recorder:            # swarm dashboard hooks (spec 2026-10-04-swarm-dashboard-design)
+        def __init__(self):
+            self.calls = []
+
+        def member_phase(self, mid, phase):
+            self.calls.append(("phase", mid, phase))
+
+        def add_prod_steps(self, mid, n):
+            self.calls.append(("steps", mid, n))
+
+        def add_frame(self, mid, cv1, rg, e2e):
+            self.calls.append(("frame", mid, (cv1, rg, e2e)))
+
+    rec = _Recorder()
     t0 = time.time()
     done = run_member(
         args, {"velocity_seed": 777, "member_id": 0}, member_dir,
         openmm=openmm, app=app, unit=unit, topology=fx["topology"], base_system_xml=base_system_xml,
         equil_state=equil_state, conformer=conformer, platform=platform, props=props,
-        contact_pairs=contact_pairs, progress=None,
+        contact_pairs=contact_pairs, progress=None, round_progress=rec,
     )
+    phases = [c[2] for c in rec.calls if c[0] == "phase"]
+    assert phases[:2] == ["graft_wait", "grafting"]
+    assert phases[-1] == "production" and phases.index("production") > phases.index("grafting")
+    first_steps = next(i for i, c in enumerate(rec.calls) if c[0] == "steps")
+    assert ("phase", 0, "production") in rec.calls[:first_steps]
+    frames = [c for c in rec.calls if c[0] == "frame"]
+    assert frames and all(np.isfinite(v) for c in frames for v in c[2])
     wall_s = time.time() - t0
     print(f"test_tiny_real_swarm_member ... wall_s={wall_s:.1f}")
     assert wall_s < 120.0
@@ -372,6 +393,7 @@ def test_tiny_real_swarm_member_moves_atoms_and_writes_trace_frames_and_done_slo
     trace_rows = list(csv.DictReader((member_dir / "trace.csv").open()))
     assert trace_rows, "trace.csv has no rows"
     assert list(trace_rows[0].keys()) == TRACE_COLUMNS
+    assert len(frames) == len(trace_rows)                 # one coverage frame per trace row
     for row in trace_rows:
         assert np.isfinite(float(row["v_pep_kj"]))
         assert np.isfinite(float(row["v_dih_kj"]))

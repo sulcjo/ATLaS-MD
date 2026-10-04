@@ -332,11 +332,14 @@ def run_swarm_stage(args, out_dir, progress=None) -> dict:
     missing_in_range: List[int] = []
     # The round reports as one production epoch (epoch 0) so the monitor tracks it like any other.
     _spf, n_prod_steps, _neq = member_step_counts(args)
+    range_ids = [int(rows[i]["member_id"]) for i in member_range]
+    done_ids = [m for m in range_ids if member_done(rd / f"member_{m:04d}")]
     round_progress = make_round_progress(
-        progress, n_members=len(member_range), n_prod_steps=n_prod_steps,
-        n_already_done=sum(1 for i in member_range
-                           if member_done(rd / f"member_{int(rows[i]['member_id']):04d}")),
+        progress, n_members=len(member_range), n_prod_steps=n_prod_steps, n_already_done=len(done_ids),
         timestep_fs=float(args.timestep_fs), round_index=round_index,
+        member_ids=range_ids, done_ids=done_ids,
+        cells={int(rows[i]["member_id"]): str(rows[i]["cell_id"]) for i in member_range},
+        edges=(meta or {}).get("edges"), run_label=out_dir.name, live_status_path=rd / "live_status.json",
     )
     if round_progress is not None:
         round_progress.emit()
@@ -353,7 +356,7 @@ def run_swarm_stage(args, out_dir, progress=None) -> dict:
                 props[key] = str(device)
                 break
         if round_progress is not None:
-            round_progress.member_started(member_id)
+            round_progress.member_started(member_id, device=str(device))
         done = {"status": "error"}
         try:
             done = run_member(
@@ -365,15 +368,18 @@ def run_swarm_stage(args, out_dir, progress=None) -> dict:
             )
         finally:
             if round_progress is not None:
-                round_progress.member_finished(member_id, ok=str(done.get("status", "ok")) == "ok")
+                round_progress.member_finished(member_id, ok=str(done.get("status", "ok")) == "ok",
+                                               status=str(done.get("status", "ok")),
+                                               ns_per_day=float(done.get("ns_per_day", 0.0) or 0.0))
         status = str(done.get("status", "ok"))
         if not member_done(member_dir):
             with _missing_lock:
                 missing_in_range.append(member_id)
-        print(
-            f"member {member_id:04d}/{len(rows):04d} cell {row['cell_id']} seed {row['seed_id']} "
-            f"rep {row['replicate']} status {status} {float(done.get('ns_per_day', 0.0)):.0f} ns/day"
-        )
+        if round_progress is None or not round_progress.frames_enabled:   # the dashboard's events panel
+            print(
+                f"member {member_id:04d}/{len(rows):04d} cell {row['cell_id']} seed {row['seed_id']} "
+                f"rep {row['replicate']} status {status} {float(done.get('ns_per_day', 0.0)):.0f} ns/day"
+            )
         if round_progress is not None:
             round_progress.emit_event({
                 "event": "swarm_member_done", "round": round_index, "member_id": member_id,
