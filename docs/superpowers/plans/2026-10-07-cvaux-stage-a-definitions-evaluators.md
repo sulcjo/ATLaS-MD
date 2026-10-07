@@ -14,7 +14,9 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-07-auxiliary-cv-gibbs-production-spec.md` (main dc30285), Sections 3, 5, 8, 16 Stage A and 17. Read Sections 3 and 5 before starting.
 
-**Test runner note (this harness):** a hook blocks shell text containing the literal word `pytest`. Run tests as `python /home/sulcjo/.claude/jobs/969c720f/tmp/run_tests.py <args>`; it calls `python -m pytest -q -p no:cacheprovider <args>`. If that file is gone, recreate it with this one line: `import sys,subprocess; sys.exit(subprocess.run([sys.executable,'-m','py'+'test','-q','-p','no:cacheprovider',*sys.argv[1:]]).returncode)`. Steps below write `pytest ...` for readability.
+**Test runner (user policy):** tests in this repo are run by the local free runner `opencode`, never directly. Each "Run:" step below names the pytest arguments. Dispatch them as
+`opencode run "In /run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler: run python -m pytest -q <arguments> and report pass/fail/error counts and every failing test id. Read-only: do not edit, commit or fix anything."`
+and treat its report as the result. A Bash hook in this harness refuses commands that call the test runner directly.
 
 **Targeted tests only** (user preference): run the files a task names, never the whole suite.
 
@@ -1028,17 +1030,18 @@ git commit -m "feat(cvaux): exact CustomCVForce auxiliary restraint with zero-st
   - `state_identity.STATE_SCHEMA_V2 = "atlas-fixed-state-v2"` and `STATE_ROLES = frozenset({"ordinary", "auxiliary", "sham"})`;
   - `make_state_definition(..., aux_models: Mapping[str, Mapping] | None = None)`: a v2 definition when `aux_models` is not None, else v1 unchanged;
   - `hamiltonian_sha256(definition, window_id: int) -> str`;
-  - normalized window rows: v2 rows always carry `aux_model_sha256` (str | None), `aux_center` (float) and `aux_k` (float, kcal/mol per z²), plus an optional `instance` dict with exactly the keys `state_role`, `spawn_parent_state_id`, `spawn_source_observation`, `matched_additional_slot_id`. v1 rows are unchanged.
+  - normalized window rows: v2 rows always carry `aux_model_sha256` (str | None), `aux_center` (float) and `aux_k` (float, kcal/mol per z²), plus an optional `instance` dict with exactly the keys `state_instance_id` (nonempty string, unique across rows, stable across phases, unlike `window_id`, which is the per-phase column index), `state_role`, `spawn_parent_state_id`, `spawn_source_observation` (null, or an object with exactly `run`, `segment`, `carrier`, `state`, `checkpoint`, `step`) and `matched_additional_slot_id` (null or nonempty string). v1 rows are unchanged.
 
 Rules (spec Sections 3.1 and 5):
 - In v2, every window must state `aux_k` explicitly. k = 0 canonicalises to model None and centre 0.0. k > 0 needs a model present in `aux_models` and a finite centre.
 - `aux_models` maps sha → embedded model payload. The key must equal the parsed `model_sha256`. More than one model is refused ("Stage F").
 - `instance` is excluded from `hamiltonian_sha256` but included in the definition hash, since the slot table is part of the phase identity.
+- In a v2 definition, either every row carries `instance` or none does. Instance ids must be unique (spec Section 5: `state_instance_id` is mapped explicitly to the runtime window index, which is `window_id` here).
 - `hamiltonian_sha256` drops the aux keys of an inactive row, so an inactive v2 row hashes like the same v1 physics.
 
-- [ ] **Step 1: Pin the legacy v1 hash before changing code**
+- [ ] **Step 1: Confirm the legacy v1 pin on unmodified code**
 
-Run this on the unmodified code and copy the printed hex into the test below as `V1_PINNED`:
+`V1_PINNED` below was computed on main dc30285 with `gareus/correctness/` unchanged. Before editing, run this snippet and confirm it prints `dc0acf77e275ed0d1b357238e16e3f1f8248859b06ab647d7e6578817e4c8725`. If it prints something else, `gareus/correctness/` has changed since this plan was written; stop and report rather than re-pinning:
 
 ```bash
 python - <<'EOF'
@@ -1066,7 +1069,7 @@ from gareus.correctness._io import IntegrityError
 from gareus.correctness.state_identity import (STATE_SCHEMA_V2, hamiltonian_sha256,
                                                make_state_definition, state_definition_hash)
 
-V1_PINNED = "<paste the hex printed in Step 1>"
+V1_PINNED = "dc0acf77e275ed0d1b357238e16e3f1f8248859b06ab647d7e6578817e4c8725"
 BOX = [[3, 0, 0], [0, 3, 0], [0, 0, 3]]
 CV1 = {"kind": "contacts", "units": "dimensionless", "definition": {"r0": 4.5}}
 CV2 = {"kind": "residual", "units": "dimensionless", "definition": {"v": [1.0]}}
@@ -1088,17 +1091,19 @@ def _defn(windows, aux_models=..., energy_unit="kcal/mol"):
 
 def _v2_windows():
     base = _legacy_windows()
-    base[0].update(aux_k=0.0)
-    base[1].update(aux_k=0.0)
+    for k, row in enumerate(base):
+        row.update(aux_k=0.0, instance={"state_instance_id": f"ord-{k}", "state_role": "ordinary",
+                                        "spawn_parent_state_id": None, "spawn_source_observation": None,
+                                        "matched_additional_slot_id": None})
     base.append({"window_id": 2, "center1": 0.4, "k1": 10.0, "center2": 1.0, "k2": 2.0,
                  "gamd_lambda": 0.0, "aux_model_sha256": SHA, "aux_center": 1.5, "aux_k": 1.2,
-                 "instance": {"state_role": "auxiliary", "spawn_parent_state_id": 1,
+                 "instance": {"state_instance_id": "aux-0", "state_role": "auxiliary", "spawn_parent_state_id": 1,
                               "spawn_source_observation": {"run": "r", "segment": "s", "carrier": 3,
                                                            "state": 1, "checkpoint": "c", "step": 100},
                               "matched_additional_slot_id": "slot-0"}})
     base.append({"window_id": 3, "center1": 0.4, "k1": 10.0, "center2": 1.0, "k2": 2.0,
                  "gamd_lambda": 0.0, "aux_k": 0.0,
-                 "instance": {"state_role": "sham", "spawn_parent_state_id": 1,
+                 "instance": {"state_instance_id": "sham-0", "state_role": "sham", "spawn_parent_state_id": 1,
                               "spawn_source_observation": {"run": "r", "segment": "s", "carrier": 3,
                                                            "state": 1, "checkpoint": "c", "step": 100},
                               "matched_additional_slot_id": "slot-0"}})
@@ -1148,6 +1153,10 @@ def test_kj_tables_convert_aux_k():
     (lambda w, m: w[2].update(aux_model_sha256="b" * 64), "unknown auxiliary model"),
     (lambda w, m: w[2]["instance"].update(state_role="worker"), "state_role"),
     (lambda w, m: w[2]["instance"].pop("matched_additional_slot_id"), "instance"),
+    (lambda w, m: w[3]["instance"].update(state_instance_id="aux-0"), "duplicate state_instance_id"),
+    (lambda w, m: w[3]["instance"].update(state_instance_id=""), "state_instance_id"),
+    (lambda w, m: w[2]["instance"]["spawn_source_observation"].pop("step"), "spawn_source_observation"),
+    (lambda w, m: w[0].pop("instance"), "every row"),
     (lambda w, m: m.update({"c" * 64: m.pop(SHA)}), "key"),
 ])
 def test_v2_refusals(mutate, message):
@@ -1219,8 +1228,9 @@ STATE_SCHEMA_V2 = "atlas-fixed-state-v2"
 STATE_ROLES = frozenset({"ordinary", "auxiliary", "sham"})
 _V1_WINDOW_FIELDS = {"window_id", "center1", "k1", "center2", "k2", "gamd_lambda"}
 _V2_WINDOW_FIELDS = _V1_WINDOW_FIELDS | {"aux_model_sha256", "aux_center", "aux_k", "instance"}
-_INSTANCE_FIELDS = {"state_role", "spawn_parent_state_id", "spawn_source_observation",
-                    "matched_additional_slot_id"}
+_INSTANCE_FIELDS = {"state_instance_id", "state_role", "spawn_parent_state_id",
+                    "spawn_source_observation", "matched_additional_slot_id"}
+_OBSERVATION_FIELDS = {"run", "segment", "carrier", "state", "checkpoint", "step"}
 _SHARED_FIELDS = ("physical_system_sha256", "ensemble", "temperature_k", "pressure_bar",
                   "fixed_box_vectors_nm", "cv1", "cv2", "boost", "energy_unit")
 ```
@@ -1249,9 +1259,18 @@ def _canonical_instance(raw: Any, state_id: int) -> dict:
         raise IntegrityError(f"Window {state_id} instance needs exactly {sorted(_INSTANCE_FIELDS)}")
     if raw["state_role"] not in STATE_ROLES:
         raise IntegrityError(f"Window {state_id} instance.state_role must be one of {sorted(STATE_ROLES)}")
+    if not isinstance(raw["state_instance_id"], str) or not raw["state_instance_id"]:
+        raise IntegrityError(f"Window {state_id} instance.state_instance_id must be a nonempty string")
     parent = raw["spawn_parent_state_id"]
     if parent is not None and (isinstance(parent, bool) or not isinstance(parent, int) or parent < 0):
         raise IntegrityError(f"Window {state_id} instance.spawn_parent_state_id must be null or an id")
+    obs = raw["spawn_source_observation"]
+    if obs is not None and (not isinstance(obs, dict) or set(obs) != _OBSERVATION_FIELDS):
+        raise IntegrityError(f"Window {state_id} instance.spawn_source_observation must be null or "
+                             f"exactly {sorted(_OBSERVATION_FIELDS)}")
+    slot = raw["matched_additional_slot_id"]
+    if slot is not None and (not isinstance(slot, str) or not slot):
+        raise IntegrityError(f"Window {state_id} instance.matched_additional_slot_id must be null or a nonempty string")
     return json_loads(json_bytes(raw))
 ```
 
@@ -1290,6 +1309,17 @@ Then change `canonical_state_definition`:
 ```
 
 - After the loop, before `return data`: `if aux_models is not None: data["aux_models"] = aux_models`.
+- Also after the loop, for v2 only, enforce instance consistency:
+
+```python
+    if schema == STATE_SCHEMA_V2:
+        with_instance = [row for row in windows if "instance" in row]
+        if with_instance and len(with_instance) != len(windows):
+            raise IntegrityError("v2 instance metadata must be given on every row or on none")
+        ids = [row["instance"]["state_instance_id"] for row in with_instance]
+        if len(set(ids)) != len(ids):
+            raise IntegrityError(f"duplicate state_instance_id in state table: {sorted(ids)}")
+```
 - Change `make_state_definition`: add the keyword `aux_models: Mapping | None = None`. Build the dict as today. When `aux_models is not None`, set `"schema": STATE_SCHEMA_V2` and `"aux_models": dict(aux_models)`.
 
 Add the Hamiltonian hash:
@@ -1316,8 +1346,8 @@ The kJ conversion order matters. `normalize_windows` canonicalises `aux_k` in th
 
 - [ ] **Step 6: Run the tests to verify they pass**
 
-Run: `pytest tests/test_aux_cv_state_schema.py tests/test_correctness_state_identity.py`
-Expected: PASS. If `tests/test_correctness_state_identity.py` does not exist, run `ls tests | grep -i state_identity` and include the existing state-identity test files instead. Those are the legacy regression for v1.
+Run: `pytest tests/test_aux_cv_state_schema.py`
+Expected: PASS. No dedicated state-identity test file existed before this work, so the pinned v1 hash in this file is the legacy regression.
 
 - [ ] **Step 7: Commit**
 
@@ -1435,7 +1465,7 @@ In the umbrella loop, after the `k2` block, add:
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `pytest tests/test_aux_cv_bias.py tests/test_aux_cv_state_schema.py`. Then run the existing strict-bias regression: `ls tests | grep -i -E "correctness_bias|strict_bias|reconstruct_bias"`, and run those files too.
+Run: `pytest tests/test_aux_cv_bias.py tests/test_aux_cv_state_schema.py tests/test_query_reconstruct_bias_matrix_nan_guard.py tests/test_query.py tests/test_lambda_ladder_mbar.py` (the last three are the existing strict-bias regressions; `gareus.query.reconstruct_bias_matrix` wraps the correctness one).
 Expected: PASS
 
 - [ ] **Step 5: Commit**
@@ -1455,7 +1485,7 @@ git commit -m "feat(cvaux): strict offline reconstruction of the auxiliary bias 
 
 - [ ] **Step 1: Run the whole Stage A set plus the legacy regressions**
 
-Run: `pytest tests/test_aux_cv_model.py tests/test_aux_cv_features.py tests/test_aux_cv_evaluate.py tests/test_aux_cv_force.py tests/test_aux_cv_state_schema.py tests/test_aux_cv_bias.py` together with the state-identity and strict-bias regression files found in Tasks 5 and 6.
+Run: `pytest tests/test_aux_cv_model.py tests/test_aux_cv_features.py tests/test_aux_cv_evaluate.py tests/test_aux_cv_force.py tests/test_aux_cv_state_schema.py tests/test_aux_cv_bias.py` `tests/test_query_reconstruct_bias_matrix_nan_guard.py tests/test_query.py tests/test_lambda_ladder_mbar.py`.
 Expected: all PASS. This is spec Section 16's Stage A exit: zero-strength, topology, sign, units and gradient tests.
 
 - [ ] **Step 2: Add the handoff section to `CLAUDE.md`**
@@ -1465,7 +1495,7 @@ Insert after the "Adaptive λ ladder" section:
 ```markdown
 ## CVaux Stage A (`gareus/auxiliary_cv/`, spec `docs/superpowers/specs/2026-10-07-auxiliary-cv-gibbs-production-spec.md`)
 
-- Built: frozen model `atlas-aux-cv-model-v1` (`AuxModel`, identity = content sha, label/provenance excluded), OpenMM-convention dihedral features (theta = OpenMM `theta` = -tica angle; `negated` feature = trig(-theta)), exact evaluator with Blondel-Karplus gradient (FD-verified), `CustomCVForce` `ATLaSAuxCVUmbrella` = select(aux_k, 0.5 aux_k (z - aux_c)^2, 0) with exact energy/force parity, state schema `atlas-fixed-state-v2` (`aux_models` registry, per-window aux_model_sha256/aux_center/aux_k, optional `instance` {state_role, spawn_parent_state_id, spawn_source_observation, matched_additional_slot_id}, `hamiltonian_sha256`), `reconstruct_bias_matrix(aux_z=)`.
+- Built: frozen model `atlas-aux-cv-model-v1` (`AuxModel`, identity = content sha, label/provenance excluded), OpenMM-convention dihedral features (theta = OpenMM `theta` = -tica angle; `negated` feature = trig(-theta)), exact evaluator with Blondel-Karplus gradient (FD-verified), `CustomCVForce` `ATLaSAuxCVUmbrella` = select(aux_k, 0.5 aux_k (z - aux_c)^2, 0) with exact energy/force parity, state schema `atlas-fixed-state-v2` (`aux_models` registry, per-window aux_model_sha256/aux_center/aux_k, optional `instance` {state_instance_id, state_role, spawn_parent_state_id, spawn_source_observation, matched_additional_slot_id}, `hamiltonian_sha256`), `reconstruct_bias_matrix(aux_z=)`.
 - Not wired: nothing in production, exchange, storage or analysis calls it yet (Stages B/C). v1 definitions hash byte-identically (pinned test). MVP: one model; >1 refused ("Stage F").
 - Tests: `tests/test_aux_cv_*.py`, fixture `tests/aux_cv_fixture.py`.
 ```
