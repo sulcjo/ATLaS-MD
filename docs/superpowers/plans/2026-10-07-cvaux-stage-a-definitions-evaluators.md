@@ -14,6 +14,8 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-07-auxiliary-cv-gibbs-production-spec.md` (main dc30285), Sections 3, 5, 8, 16 Stage A and 17. Read Sections 3 and 5 before starting.
 
+**Test-first note:** some tests are regression guards that pass before and after their task (they are marked in the code). The "Expected: FAIL" in each Step refers to the file as a whole (import or keyword errors), not to every test.
+
 **Test runner (user policy):** tests in this repo are run by the local free runner `opencode`, never directly. Each "Run:" step below names the pytest arguments. Dispatch them as
 `opencode run "In /run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler: run python -m pytest -q <arguments> and report pass/fail/error counts and every failing test id. Read-only: do not edit, commit or fix anything."`
 and treat its report as the result. A Bash hook in this harness refuses commands that call the test runner directly.
@@ -23,14 +25,17 @@ and treat its report as the result. A Bash hook in this harness refuses commands
 ## Global Constraints
 
 - Energies are kJ/mol inside OpenMM and in the exchange kernel. State tables use kcal/mol. Convert **exactly once** by 4.184 (`KJ_PER_KCAL` in `gareus/correctness/bias.py`).
-- An inactive restraint (k = 0) contributes **exactly zero**. Never evaluate `0 * (NaN - centre)**2`. Its canonical form is model null, centre 0.0, k 0.0.
+- An inactive restraint (k = 0) contributes **exactly zero energy** (never evaluate `0 * (NaN - centre)**2`; the force uses `select`) and exactly zero force at non-degenerate geometry. At a degenerate torsion (collinear atoms) OpenMM's torsion derivative is NaN, so even k = 0 yields NaN forces; stock OpenMM torsion forces behave identically. This is documented and tested (Task 4), and Stage B must never integrate such a state. The canonical inactive form is model null, centre 0.0, k 0.0.
 - A missing, negative or nonfinite force constant is an error, never "no pull". Positive strength requires a known model and a finite centre.
 - MVP supports **one** auxiliary model per state definition. More than one distinct model is refused with a message naming Stage F.
 - Never zero-fill a missing z. A z needed by an active column propagates NaN offline; any runtime use raises.
 - Legacy `atlas-fixed-state-v1` definitions must hash **byte-identically** to before this work.
 - Use float64 for every auxiliary value.
 - Do not assume a fixed force group. `build_aux_force` takes the group from its caller; Stage B allocates it.
-- Identity is content: model `label` and `provenance` never enter `model_sha256`. Hash coefficients and normalization, never a filename.
+- Identity is content: model `label` and `provenance` never enter `model_sha256`, the v2 `aux_models` registry, the definition hash or `hamiltonian_sha256`. Hash coefficients, offset, normalisation (`scale`) and imaging (`periodic_imaging`), never a filename. -0.0 is canonicalised to 0.0 (coefficients, offset, scale, `aux_center`) so the sign of zero never changes a hash.
+- z = (offset + Σ_j c_j f_j) / scale. `scale` is the frozen positive normalisation divisor (the c10 candidate records 3.181); Stage D ports the recovered artifact into this form and must document how its own normalisation maps onto `offset`/`coefficients`/`scale`. `periodic_imaging` is `"none"` (the only supported value): torsion atoms use raw Context coordinates and every sub-force calls `setUsesPeriodicBoundaryConditions(False)`.
+- Field-name deviation (spec Section 5 proposes `aux_k_kcal_mol`): the canonical field is `aux_k`, in kcal/mol per z², like `k1`/`k2`. This is recorded as an intentional deviation; Stages B/C use `aux_k`.
+- Roles (spec 1.1, 5, 11.1): `state_role` must agree with the energy. `auxiliary` ⇔ `aux_k > 0`; `ordinary` and `sham` require `aux_k == 0`. Every v2 row carries `instance` with a unique `state_instance_id`; `spawn_parent_state_id` is the parent's `state_instance_id` (string) or null, and must exist in the same table.
 - Angle convention (verified 2026-10-07 on OpenMM 8.5.1):
   - θ = OpenMM `CustomTorsionForce` `theta` = −(the tica/swarm angle, `gareus.tica._dihedral_rad`).
   - A feature with `dihedral_sign_convention: "negated"` (what swarm writes, `gareus/swarm/analyze.py:424`) is `trig(-θ)`; `"direct"` is `trig(θ)`.
@@ -38,11 +43,12 @@ and treat its report as the result. A Bash hook in this harness refuses commands
 
 ## Review Focus
 
-1. **Dihedral wrap at ±π.** A torsion crossing ±π must give continuous sin/cos features and a continuous z. The Task 2 test pins this.
-2. **Collinear (degenerate) torsion atoms.** z is undefined there. The per-structure evaluator and the gradient must raise `AuxGeometryError`; the vectorised offline evaluator returns NaN for that row so analysis can exclude it with a count. The Task 3 test pins both.
+1. **Dihedral wrap at ±π.** A torsion crossing ±π must give continuous sin/cos features, z and force energy. Tasks 2, 3 and 4 pin this from positions (`four_atoms_at(π ± ε)`), through z, to the OpenMM energy.
+2. **Collinear (degenerate) torsion atoms.** z is undefined there. The per-structure evaluator and the gradient must raise `AuxGeometryError`; the vectorised offline evaluator returns NaN for that row so analysis can exclude it with a count (Task 3). The OpenMM force at k = 0 returns E = 0 but NaN forces there (Task 4 documents and pins it). OpenMM also returns a finite energy at k > 0 where the evaluator raises; Stage B must detect degenerate geometry at runtime (spec 3.3).
 3. **One torsion in several features** (its sin and cos, or a phi listed twice). Weights must be applied per feature, not merged by torsion. The Task 4 force and evaluator parity test uses a model with both sin and cos of the same torsion.
 4. **kJ/mol state tables.** `aux_k` must be divided by 4.184 together with k1/k2 when `energy_unit == "kJ/mol"`. The Task 5 test pins this.
 5. **Mixed sign conventions in one model** (some features `negated`, some `direct`). The force must group sub-CVs by (trig, sign), not by trig alone. The Task 4 parity test covers a mixed model.
+6. **Cosmetic model edits.** Relabelling a model or editing its provenance must change no hash: not `model_sha256`, not the state-definition hash, not any `hamiltonian_sha256`. Task 5 pins this.
 
 ---
 
@@ -75,9 +81,11 @@ and treat its report as the result. A Bash hook in this harness refuses commands
 - Produces:
   - `AUX_MODEL_SCHEMA = "atlas-aux-cv-model-v1"`;
   - `class AuxModelError(IntegrityError)`;
-  - `@dataclass(frozen=True) class AuxModel` with fields `feature_schema: FeatureSchema`, `coefficients: tuple[float, ...]`, `offset: float`, `units: str`, `label: str`, `provenance_json: str`, `model_sha256: str`;
-  - methods `AuxModel.from_mapping(raw: Mapping) -> AuxModel`, `AuxModel.load(path) -> AuxModel`, `.to_mapping() -> dict`, `.write(path) -> None`;
-  - `tests/aux_cv_fixture.py`: `feature_rows(quads, conventions=None, blocks=None) -> list[dict]`, `model_payload(quads, coefficients, offset=0.0, conventions=None, topology_sha256="0"*64, label="test", provenance=None, blocks=None) -> dict`, `dipeptide() -> dict(topology, positions_nm, quads, labels)`.
+  - `SUPPORTED_PERIODIC_IMAGING = frozenset({"none"})`;
+  - `@dataclass(frozen=True) class AuxModel` with fields `feature_schema: FeatureSchema`, `coefficients: tuple[float, ...]`, `offset: float`, `scale: float` (positive divisor), `periodic_imaging: str` (`"none"`), `units: str`, `label: str`, `provenance_json: str`, `model_sha256: str`;
+  - methods `AuxModel.from_mapping(raw: Mapping) -> AuxModel`, `AuxModel.load(path) -> AuxModel`, `.identity_mapping() -> dict` (identity body + `model_sha256`, no label/provenance: what registries embed), `.to_mapping() -> dict` (identity + label + provenance), `.write(path) -> None`;
+  - model payload fields: required `schema`, `feature_schema`, `coefficients`, `offset`, `scale`, `periodic_imaging`, `units`; optional `label`, `provenance`, `model_sha256` (verified if present);
+  - `tests/aux_cv_fixture.py`: `feature_rows(quads, conventions=None, blocks=None) -> list[dict]`, `model_payload(quads, coefficients, offset=0.0, conventions=None, topology_sha256="0"*64, label="test", provenance=None, blocks=None, scale=1.0, periodic_imaging="none") -> dict`, `dipeptide() -> dict(topology, positions_nm, quads, labels)`, `blocks_of(d) -> list[str]`, `perturbed_geometries(d, n=4, sigma_nm=0.02, seed=0) -> list[ndarray]` (the minimised geometry first), `four_atoms_at(rotation_rad) -> ndarray (4, 3)` (rotation π puts the torsion on the ±π branch cut).
 
 - [ ] **Step 1: Write the shared fixture**
 
@@ -93,7 +101,7 @@ from gareus.cv_selection.contracts import FEATURE_SCHEMA_VERSION
 
 
 def feature_rows(quads, conventions=None, blocks=None):
-    """sin then cos per torsion, in the swarm's canonical order (gareus/swarm/analyze.py:415).
+    """sin then cos per torsion, in the swarm's canonical order (gareus/swarm/analyze.py:416-419).
 
     ``blocks`` gives each torsion's "phi"/"psi" (from backbone_torsion_quads labels) so
     topology checks see true names; without it the names alternate and only synthetic
@@ -111,13 +119,15 @@ def feature_rows(quads, conventions=None, blocks=None):
 
 
 def model_payload(quads, coefficients, offset=0.0, conventions=None, topology_sha256="0" * 64,
-                  label="test", provenance=None, blocks=None):
+                  label="test", provenance=None, blocks=None, scale=1.0, periodic_imaging="none"):
     return {
         "schema": AUX_MODEL_SCHEMA,
         "feature_schema": {"schema": FEATURE_SCHEMA_VERSION, "topology_sha256": topology_sha256,
                            "features": feature_rows(quads, conventions, blocks)},
         "coefficients": [float(c) for c in coefficients],
         "offset": float(offset),
+        "scale": float(scale),
+        "periodic_imaging": periodic_imaging,
         "units": "dimensionless",
         "label": label,
         "provenance": provenance if provenance is not None else {"source": "manual"},
@@ -135,6 +145,34 @@ def dipeptide():
     quads, labels = backbone_torsion_quads(fx["topology"], fx["peptide"])
     pos = np.asarray(fx["positions"].value_in_unit(unit.nanometer), dtype=np.float64)
     return {"topology": fx["topology"], "positions_nm": pos, "quads": quads, "labels": labels}
+
+
+def blocks_of(d):
+    return [lab.split("-")[0] for lab in d["labels"]]
+
+
+def perturbed_geometries(d, n=4, sigma_nm=0.02, seed=0):
+    """The minimised geometry plus n copies whose torsion atoms are randomly displaced."""
+    rng = np.random.default_rng(seed)
+    atoms = sorted({a for q in d["quads"] for a in q})
+    out = [d["positions_nm"].copy()]
+    for _ in range(n):
+        x = d["positions_nm"].copy()
+        x[atoms] += rng.normal(scale=sigma_nm, size=(len(atoms), 3))
+        out.append(x)
+    return out
+
+
+def four_atoms_at(rotation_rad):
+    """4 atoms (nm) whose dihedral is controlled by rotating atom 3 about the 1-2 axis.
+
+    rotation_rad = pi puts the torsion exactly at the +-pi branch cut of OpenMM's theta.
+    """
+    p1 = np.array([0.0, 0.0, 0.0])
+    p2 = np.array([0.0, 0.0, 0.15])
+    p0 = p1 + np.array([0.15, 0.0, -0.05])
+    p3 = p2 + np.array([0.15 * np.cos(rotation_rad), 0.15 * np.sin(rotation_rad), 0.05])
+    return np.array([p0, p1, p2, p3])
 ```
 
 - [ ] **Step 2: Write the failing tests**
@@ -153,7 +191,7 @@ QUADS = [(0, 1, 2, 3), (1, 2, 3, 4)]
 
 
 def test_round_trip_keeps_identity(tmp_path):
-    m = AuxModel.from_mapping(model_payload(QUADS, [0.5, -0.25, 0.0, 1.0], offset=0.3))
+    m = AuxModel.from_mapping(model_payload(QUADS, [0.5, -0.25, 0.0, 1.0], offset=0.3, scale=3.181))
     path = tmp_path / "aux.json"
     m.write(path)
     again = AuxModel.load(path)
@@ -166,14 +204,23 @@ def test_label_and_provenance_are_not_identity():
     a = AuxModel.from_mapping(model_payload(QUADS, [1, 0, 0, 0], label="a", provenance={"x": 1}))
     b = AuxModel.from_mapping(model_payload(QUADS, [1, 0, 0, 0], label="b", provenance={"y": 2}))
     assert a.model_sha256 == b.model_sha256
+    assert a.identity_mapping() == b.identity_mapping()
+    assert "label" not in a.identity_mapping() and "provenance" not in a.identity_mapping()
 
 
-def test_coefficients_offset_and_features_are_identity():
+def test_coefficients_offset_scale_and_features_are_identity():
     base = AuxModel.from_mapping(model_payload(QUADS, [1, 0, 0, 0])).model_sha256
     assert AuxModel.from_mapping(model_payload(QUADS, [1, 0, 0, 1e-9])).model_sha256 != base
     assert AuxModel.from_mapping(model_payload(QUADS, [1, 0, 0, 0], offset=1e-9)).model_sha256 != base
+    assert AuxModel.from_mapping(model_payload(QUADS, [1, 0, 0, 0], scale=2.0)).model_sha256 != base
     assert AuxModel.from_mapping(model_payload(QUADS, [1, 0, 0, 0],
                                                conventions=["direct", "negated"])).model_sha256 != base
+
+
+def test_negative_zero_does_not_change_identity():
+    a = AuxModel.from_mapping(model_payload(QUADS, [1.0, 0.0, 0.0, 0.0], offset=0.0))
+    b = AuxModel.from_mapping(model_payload(QUADS, [1.0, -0.0, -0.0, 0.0], offset=-0.0))
+    assert a.model_sha256 == b.model_sha256
 
 
 @pytest.mark.parametrize("mutate, message", [
@@ -181,6 +228,11 @@ def test_coefficients_offset_and_features_are_identity():
     (lambda p: p.update(coefficients=[0.0, 0.0, 0.0, 0.0]), "nonzero"),
     (lambda p: p.update(coefficients=[1.0, True, 0.0, 0.0]), "number"),
     (lambda p: p.update(offset=float("nan")), "offset|Nonfinite"),
+    (lambda p: p.update(scale=0.0), "scale"),
+    (lambda p: p.update(scale=-1.0), "scale"),
+    (lambda p: p.update(periodic_imaging="minimum_image"), "periodic_imaging"),
+    (lambda p: p.pop("scale"), "missing"),
+    (lambda p: p.pop("periodic_imaging"), "missing"),
     (lambda p: p.update(units="angstrom"), "units"),
     (lambda p: p.update(extra=1), "unknown"),
     (lambda p: p.pop("offset"), "missing"),
@@ -223,10 +275,12 @@ __all__ = ["AUX_MODEL_SCHEMA", "AuxModel", "AuxModelError"]
 # gareus/auxiliary_cv/model.py
 """Frozen auxiliary-CV model, schema ``atlas-aux-cv-model-v1``.
 
-z(x) = offset + sum_j coefficients[j] * f_j(x), with f_j = trig_j(s_j * theta_j), where theta_j is
-OpenMM's CustomTorsionForce ``theta`` for feature j's atoms and s_j = -1 for the "negated" sign
-convention (the tica / swarm convention) or +1 for "direct". Identity is content: ``label`` and
-``provenance`` never enter ``model_sha256``.
+z(x) = (offset + sum_j coefficients[j] * f_j(x)) / scale, with f_j = trig_j(s_j * theta_j), where
+theta_j is OpenMM's CustomTorsionForce ``theta`` for feature j's atoms and s_j = -1 for the "negated"
+sign convention (the tica / swarm convention) or +1 for "direct". ``scale`` is the frozen
+normalisation divisor (positive); ``periodic_imaging`` records how torsion atoms are imaged ("none":
+raw Context coordinates, no minimum-image; the only supported value). Identity is content:
+``label`` and ``provenance`` never enter ``model_sha256``; -0.0 is canonicalised to 0.0.
 """
 from __future__ import annotations
 
@@ -240,7 +294,8 @@ from ..cv_selection.contracts import FeatureSchema
 
 AUX_MODEL_SCHEMA = "atlas-aux-cv-model-v1"
 SUPPORTED_UNITS = frozenset({"dimensionless"})
-_REQUIRED = {"schema", "feature_schema", "coefficients", "offset", "units"}
+SUPPORTED_PERIODIC_IMAGING = frozenset({"none"})
+_REQUIRED = {"schema", "feature_schema", "coefficients", "offset", "scale", "periodic_imaging", "units"}
 _OPTIONAL = {"label", "provenance", "model_sha256"}
 
 
@@ -254,7 +309,7 @@ def _finite(value: Any, label: str) -> float:
     out = float(value)
     if not math.isfinite(out):
         raise AuxModelError(f"{label} must be finite, got {value!r}")
-    return out
+    return out + 0.0          # canonicalise -0.0 -> 0.0 (identity must not depend on the sign of zero)
 
 
 @dataclass(frozen=True)
@@ -262,6 +317,8 @@ class AuxModel:
     feature_schema: FeatureSchema
     coefficients: tuple[float, ...]
     offset: float
+    scale: float
+    periodic_imaging: str
     units: str
     label: str
     provenance_json: str
@@ -286,6 +343,12 @@ class AuxModel:
         if not any(c != 0.0 for c in coefficients):
             raise AuxModelError("aux model needs at least one nonzero coefficient (else z is constant)")
         offset = _finite(data["offset"], "offset")
+        scale = _finite(data["scale"], "scale")
+        if scale <= 0.0:
+            raise AuxModelError(f"aux model scale must be positive, got {scale!r}")
+        if data["periodic_imaging"] not in SUPPORTED_PERIODIC_IMAGING:
+            raise AuxModelError(f"aux model periodic_imaging {data['periodic_imaging']!r} not supported "
+                                f"({sorted(SUPPORTED_PERIODIC_IMAGING)})")
         if data["units"] not in SUPPORTED_UNITS:
             raise AuxModelError(f"aux model units {data['units']!r} not supported ({sorted(SUPPORTED_UNITS)})")
         label = data.get("label", "")
@@ -294,24 +357,33 @@ class AuxModel:
         provenance = data.get("provenance", {})
         if not isinstance(provenance, dict):
             raise AuxModelError("aux model provenance must be an object")
-        identity = {"schema": AUX_MODEL_SCHEMA, "feature_schema": schema.to_mapping(),
-                    "coefficients": list(coefficients), "offset": offset, "units": data["units"]}
-        sha = digest(json_bytes(identity))
+        sha = digest(json_bytes(cls._identity(schema, coefficients, offset, scale,
+                                              data["periodic_imaging"], data["units"])))
         claimed = data.get("model_sha256")
         if claimed is not None and claimed != sha:
             raise AuxModelError(f"aux model claims digest {claimed} but its contents hash to {sha}")
-        return cls(schema, coefficients, offset, data["units"], label,
+        return cls(schema, coefficients, offset, scale, data["periodic_imaging"], data["units"], label,
                    json_bytes(provenance).decode("utf-8"), sha)
+
+    @staticmethod
+    def _identity(schema, coefficients, offset, scale, periodic_imaging, units) -> dict[str, Any]:
+        return {"schema": AUX_MODEL_SCHEMA, "feature_schema": schema.to_mapping(),
+                "coefficients": list(coefficients), "offset": offset, "scale": scale,
+                "periodic_imaging": periodic_imaging, "units": units}
+
+    def identity_mapping(self) -> dict[str, Any]:
+        """Identity body + model_sha256 only (what state-definition registries embed)."""
+        body = self._identity(self.feature_schema, self.coefficients, self.offset, self.scale,
+                              self.periodic_imaging, self.units)
+        return {**body, "model_sha256": self.model_sha256}
 
     @classmethod
     def load(cls, path: Path | str) -> "AuxModel":
         return cls.from_mapping(json_loads(Path(path).read_bytes()))
 
     def to_mapping(self) -> dict[str, Any]:
-        return {"schema": AUX_MODEL_SCHEMA, "feature_schema": self.feature_schema.to_mapping(),
-                "coefficients": list(self.coefficients), "offset": self.offset, "units": self.units,
-                "label": self.label, "provenance": json_loads(self.provenance_json),
-                "model_sha256": self.model_sha256}
+        return {**self.identity_mapping(), "label": self.label,
+                "provenance": json_loads(self.provenance_json)}
 
     def write(self, path: Path | str) -> None:
         atomic_bytes(Path(path), json_bytes(self.to_mapping()))
@@ -320,7 +392,7 @@ class AuxModel:
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `pytest tests/test_aux_cv_model.py`
-Expected: PASS (all). If `test_invalid_payloads_are_refused[...missing...]` fails on its message match, the cause is `FeatureSchema` raising first. Adjust the test's `message` only if the raised error is still an `IntegrityError` naming the missing field.
+Expected: PASS (all; verified in scratch against OpenMM 8.5.1).
 
 - [ ] **Step 6: Commit**
 
@@ -338,9 +410,10 @@ git commit -m "feat(cvaux): frozen auxiliary-CV model with content identity"
 - Test: `tests/test_aux_cv_features.py`
 
 **Interfaces:**
-- Consumes: `AuxModel` (Task 1); `tests/aux_cv_fixture.dipeptide()`.
+- Consumes: `AuxModel` (Task 1); `tests/aux_cv_fixture.dipeptide()`, `blocks_of`, `four_atoms_at`.
 - Produces:
   - `class AuxGeometryError(IntegrityError)`;
+  - `DEGENERATE_CROSS2_NM4 = 1e-12` (threshold on |b1×b2|² and |b2×b3|², in nm⁴);
   - `openmm_dihedrals(xyz_nm, quads) -> np.ndarray` of shape (n_frames, n_torsions), equal to OpenMM `theta`, NaN where the torsion is degenerate;
   - `unique_torsions(model) -> tuple[tuple[tuple[int,int,int,int], ...], np.ndarray]` (the quads in first-appearance order, and the per-feature torsion index);
   - `feature_signs(model) -> np.ndarray` (s_j = -1 for negated, +1 for direct);
@@ -354,7 +427,7 @@ git commit -m "feat(cvaux): frozen auxiliary-CV model with content identity"
 import numpy as np
 import pytest
 
-from aux_cv_fixture import dipeptide, model_payload
+from aux_cv_fixture import blocks_of, dipeptide, four_atoms_at, model_payload
 from gareus.auxiliary_cv.features import (AuxGeometryError, check_feature_atoms, feature_signs,
                                           feature_values, openmm_dihedrals, unique_torsions)
 from gareus.auxiliary_cv.model import AuxModel
@@ -394,11 +467,16 @@ def test_degenerate_torsion_gives_nan():
     assert np.isnan(openmm_dihedrals(p, [(0, 1, 2, 3)])[0, 0])
 
 
-def test_features_continuous_across_pi():
-    # rotate p3 about the b2 axis through +pi: theta wraps from just below +pi to just above -pi
-    angles = np.array([np.pi - 1e-6, -np.pi + 1e-6])
+def test_positions_across_the_pi_branch_cut_give_continuous_features():
+    # Rotating atom 3 through the branch cut flips theta from ~+pi to ~-pi (or back);
+    # the sin/cos features computed from positions must not jump.
+    eps = 1e-6
+    xyz = np.stack([four_atoms_at(np.pi - eps), four_atoms_at(np.pi + eps)])
+    theta = openmm_dihedrals(xyz, [(0, 1, 2, 3)])[:, 0]
+    assert abs(abs(theta[0]) - np.pi) < 1e-5 and abs(abs(theta[1]) - np.pi) < 1e-5
+    assert np.sign(theta[0]) != np.sign(theta[1])          # the raw angle really wraps
     m = AuxModel.from_mapping(model_payload([(0, 1, 2, 3)], [1.0, 1.0]))
-    f = feature_values(angles[:, None], m)
+    f = feature_values(theta[:, None], m)
     assert np.abs(f[0] - f[1]).max() < 1e-5
 
 
@@ -418,18 +496,15 @@ def test_unique_torsions_shares_sin_and_cos():
     np.testing.assert_array_equal(idx, [0, 0, 1, 1])
 
 
-def _blocks(d):
-    return [lab.split("-")[0] for lab in d["labels"]]
-
-
 def test_topology_check_accepts_real_backbone_and_rejects_shifted_atoms():
     d = dipeptide()
     m = AuxModel.from_mapping(model_payload(d["quads"], [1.0] + [0.0] * (2 * len(d["quads"]) - 1),
-                                            blocks=_blocks(d)))
+                                            blocks=blocks_of(d)))
     check_feature_atoms(m, d["topology"])
+    check_feature_atoms(m, d["topology"], topology_sha256="0" * 64)   # the payload's own digest
     bad = [tuple(a + 1 for a in q) for q in d["quads"]]
     m_bad = AuxModel.from_mapping(model_payload(bad, [1.0] + [0.0] * (2 * len(bad) - 1),
-                                                blocks=_blocks(d)))
+                                                blocks=blocks_of(d)))
     with pytest.raises(IntegrityError, match="atom names"):
         check_feature_atoms(m_bad, d["topology"])
 
@@ -437,7 +512,7 @@ def test_topology_check_accepts_real_backbone_and_rejects_shifted_atoms():
 def test_topology_check_compares_topology_digest():
     d = dipeptide()
     m = AuxModel.from_mapping(model_payload(d["quads"], [1.0] + [0.0] * (2 * len(d["quads"]) - 1),
-                                            blocks=_blocks(d)))
+                                            blocks=blocks_of(d)))
     with pytest.raises(IntegrityError, match="topology"):
         check_feature_atoms(m, d["topology"], topology_sha256="a" * 64)
 ```
@@ -454,7 +529,8 @@ Expected: FAIL `ModuleNotFoundError: No module named 'gareus.auxiliary_cv.featur
 """Dihedral features of an auxiliary-CV model, in OpenMM's ``theta`` convention.
 
 theta = OpenMM CustomTorsionForce ``theta`` = -(gareus.tica._dihedral_rad). A "negated" feature is
-trig(-theta) (the tica / swarm convention), a "direct" feature trig(theta).
+trig(-theta) (the tica / swarm convention), a "direct" feature trig(theta). Coordinates are used
+as given (``periodic_imaging: "none"``): no minimum-image is applied to torsion atoms.
 """
 from __future__ import annotations
 
@@ -463,8 +539,8 @@ import numpy as np
 from ..correctness._io import IntegrityError
 from .model import AuxModel
 
-#: |n1| and |n2| below this (nm^2) make the torsion undefined (collinear atoms).
-DEGENERATE_NORM2_NM2 = 1e-12
+#: |b1 x b2|^2 or |b2 x b3|^2 below this (nm^4) makes the torsion undefined (collinear atoms).
+DEGENERATE_CROSS2_NM4 = 1e-12
 
 
 class AuxGeometryError(IntegrityError):
@@ -485,7 +561,7 @@ def openmm_dihedrals(xyz_nm, quads) -> np.ndarray:
         b2n = b2 / np.linalg.norm(b2, axis=-1, keepdims=True)
         m1 = np.cross(n1, b2n)
         theta = -np.arctan2(np.sum(m1 * n2, axis=-1), np.sum(n1 * n2, axis=-1))
-    theta[(nn1 < DEGENERATE_NORM2_NM2) | (nn2 < DEGENERATE_NORM2_NM2)] = np.nan
+    theta[(nn1 < DEGENERATE_CROSS2_NM4) | (nn2 < DEGENERATE_CROSS2_NM4)] = np.nan
     return theta
 
 
@@ -550,7 +626,7 @@ Expected: PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add gareus/auxiliary_cv/features.py tests/aux_cv_fixture.py tests/test_aux_cv_features.py
+git add gareus/auxiliary_cv/features.py tests/test_aux_cv_features.py
 git commit -m "feat(cvaux): OpenMM-convention dihedral features and topology check"
 ```
 
@@ -566,9 +642,9 @@ git commit -m "feat(cvaux): OpenMM-convention dihedral features and topology che
 **Interfaces:**
 - Consumes: Task 2 `openmm_dihedrals`, `unique_torsions`, `feature_signs`, `feature_values`, `AuxGeometryError`; `gareus.correctness.bias.KJ_PER_KCAL, finite_number`.
 - Produces:
-  - `z_from_dihedrals(theta, model) -> np.ndarray` of shape (n_frames,), with NaN where any used torsion is NaN;
+  - `z_from_dihedrals(theta, model) -> np.ndarray` of shape (n_frames,), z = (offset + features @ coefficients) / scale, NaN where any listed torsion is NaN (conservative: a degenerate torsion listed in the model makes z undefined even when its coefficients are zero; the force simply omits zero-coefficient features);
   - `z_from_positions(xyz_nm, model) -> np.ndarray` of shape (n_frames,);
-  - `z_and_gradient(xyz_nm, model) -> tuple[float, np.ndarray]` (the gradient has shape (n_atoms, 3), in z per nm; raises `AuxGeometryError` on a degenerate torsion);
+  - `z_and_gradient(xyz_nm, model) -> tuple[float, np.ndarray]` (the gradient has shape (n_atoms, 3), in z per nm, already divided by `scale`; raises `AuxGeometryError` on a degenerate torsion);
   - `aux_energy_kj(z, center, k_kcal) -> np.ndarray`;
   - `aux_forces_kj_nm(xyz_nm, model, center, k_kcal) -> np.ndarray` of shape (n_atoms, 3).
 
@@ -579,7 +655,7 @@ git commit -m "feat(cvaux): OpenMM-convention dihedral features and topology che
 import numpy as np
 import pytest
 
-from aux_cv_fixture import dipeptide, model_payload
+from aux_cv_fixture import blocks_of, dipeptide, four_atoms_at, model_payload, perturbed_geometries
 from gareus.auxiliary_cv.evaluate import (aux_energy_kj, aux_forces_kj_nm, z_and_gradient,
                                           z_from_dihedrals, z_from_positions)
 from gareus.auxiliary_cv.features import AuxGeometryError, openmm_dihedrals, unique_torsions
@@ -587,36 +663,49 @@ from gareus.auxiliary_cv.model import AuxModel
 from gareus.correctness._io import IntegrityError
 
 
-def _mixed_model(quads, blocks=None):
+def _mixed_model(quads, blocks=None, scale=3.181):
     rng = np.random.default_rng(7)
     coeffs = rng.normal(size=2 * len(quads))
     conv = ["negated" if k % 2 == 0 else "direct" for k in range(len(quads))]
-    return AuxModel.from_mapping(model_payload(quads, coeffs, offset=0.4, conventions=conv, blocks=blocks))
+    return AuxModel.from_mapping(model_payload(quads, coeffs, offset=0.4, conventions=conv, blocks=blocks,
+                                               scale=scale))
+
+
+def _geometries():
+    """Minimised dipeptide, 4 perturbed copies, and two 4-atom geometries straddling +-pi."""
+    d = dipeptide()
+    cases = [(f"dipeptide-{i}", x, d["quads"], blocks_of(d)) for i, x in enumerate(perturbed_geometries(d))]
+    for tag, rot in (("near+pi", np.pi - 1e-3), ("near-pi", np.pi + 1e-3)):
+        cases.append((tag, four_atoms_at(rot), [(0, 1, 2, 3)], None))
+    return cases
+
+
+GEOMETRIES = _geometries()
 
 
 def test_z_matches_hand_formula():
-    m = AuxModel.from_mapping(model_payload([(0, 1, 2, 3)], [2.0, -1.0], offset=0.5))
+    m = AuxModel.from_mapping(model_payload([(0, 1, 2, 3)], [2.0, -1.0], offset=0.5, scale=2.0))
     theta = np.array([[0.7]])
-    expected = 0.5 + 2.0 * np.sin(-0.7) - 1.0 * np.cos(-0.7)
+    expected = (0.5 + 2.0 * np.sin(-0.7) - 1.0 * np.cos(-0.7)) / 2.0
     assert z_from_dihedrals(theta, m)[0] == pytest.approx(expected, abs=1e-15)
 
 
-def test_positions_and_dihedral_paths_agree_on_real_peptide():
-    d = dipeptide()
-    m = _mixed_model(d["quads"], blocks=[lab.split("-")[0] for lab in d["labels"]])
-    quads, _ = unique_torsions(m)
-    a = z_from_positions(d["positions_nm"], m)[0]
-    b = z_from_dihedrals(openmm_dihedrals(d["positions_nm"], quads), m)[0]
-    c, _g = z_and_gradient(d["positions_nm"], m)
+@pytest.mark.parametrize("tag, x, quads, blocks", GEOMETRIES, ids=[g[0] for g in GEOMETRIES])
+def test_positions_and_dihedral_paths_agree(tag, x, quads, blocks):
+    m = _mixed_model(quads, blocks=blocks)
+    uq, _ = unique_torsions(m)
+    a = z_from_positions(x, m)[0]
+    b = z_from_dihedrals(openmm_dihedrals(x, uq), m)[0]
+    c, _g = z_and_gradient(x, m)
     assert a == pytest.approx(b, abs=1e-12) and a == pytest.approx(c, abs=1e-12)
 
 
-def test_gradient_matches_finite_differences():
-    d = dipeptide()
-    m = _mixed_model(d["quads"], blocks=[lab.split("-")[0] for lab in d["labels"]])
-    x = d["positions_nm"].copy()
+@pytest.mark.parametrize("tag, x, quads, blocks", GEOMETRIES, ids=[g[0] for g in GEOMETRIES])
+def test_gradient_matches_finite_differences(tag, x, quads, blocks):
+    m = _mixed_model(quads, blocks=blocks)
+    x = x.copy()
     _z, g = z_and_gradient(x, m)
-    atoms = sorted({a for q in d["quads"] for a in q})
+    atoms = sorted({a for q in quads for a in q})
     h = 1e-6
     for i in atoms:
         for k in range(3):
@@ -629,17 +718,23 @@ def test_gradient_matches_finite_differences():
     assert not np.any(g[untouched])
 
 
+def test_z_continuous_across_the_pi_branch_cut():
+    m = AuxModel.from_mapping(model_payload([(0, 1, 2, 3)], [1.3, -0.4], offset=0.1, scale=1.7))
+    z = z_from_positions(np.stack([four_atoms_at(np.pi - 1e-6), four_atoms_at(np.pi + 1e-6)]), m)
+    assert abs(z[0] - z[1]) < 1e-5
+
+
 def test_forces_are_minus_energy_gradient_in_kj_nm():
     d = dipeptide()
-    m = _mixed_model(d["quads"], blocks=[lab.split("-")[0] for lab in d["labels"]])
+    m = _mixed_model(d["quads"], blocks=blocks_of(d))
     x = d["positions_nm"].copy()
     z, g = z_and_gradient(x, m)
     f = aux_forces_kj_nm(x, m, center=z - 0.3, k_kcal=2.0)
     np.testing.assert_allclose(f, -2.0 * 4.184 * 0.3 * g, rtol=1e-12, atol=1e-12)
 
 
-def test_zero_strength_is_exact_zero_even_for_nan_z():
-    e = aux_energy_kj(np.array([np.nan, 1.0, -3.0]), center=0.0, k_kcal=0.0)
+def test_zero_strength_energy_is_exact_zero_even_for_nan_z():
+    e = aux_energy_kj(np.array([np.nan, 1.0, -3.0, 1e200]), center=0.0, k_kcal=0.0)
     assert e.dtype == np.float64 and np.all(e == 0.0)
 
 
@@ -678,8 +773,10 @@ Expected: FAIL `ModuleNotFoundError: No module named 'gareus.auxiliary_cv.evalua
 # gareus/auxiliary_cv/evaluate.py
 """Exact auxiliary-CV evaluator: z, analytic dz/dx and the harmonic restraint 0.5 k (z - c)^2.
 
-Units: positions nm, energies kJ/mol, forces kJ/mol/nm, k given in kcal/mol per z^2 (converted
-exactly once by KJ_PER_KCAL). This module is the numerical reference for the OpenMM force.
+z = (offset + sum_j c_j f_j) / scale. Units: positions nm, energies kJ/mol, forces kJ/mol/nm,
+k given in kcal/mol per z^2 (converted exactly once by KJ_PER_KCAL). This module is the numerical
+reference for the OpenMM force. Conservative by design: a degenerate torsion listed in the model
+(even with zero coefficients) makes z undefined here (NaN offline, AuxGeometryError per structure).
 """
 from __future__ import annotations
 
@@ -694,7 +791,7 @@ from .model import AuxModel
 
 def z_from_dihedrals(theta, model: AuxModel) -> np.ndarray:
     feats = feature_values(theta, model)
-    return model.offset + feats @ np.asarray(model.coefficients, dtype=np.float64)
+    return (model.offset + feats @ np.asarray(model.coefficients, dtype=np.float64)) / model.scale
 
 
 def z_from_positions(xyz_nm, model: AuxModel) -> np.ndarray:
@@ -734,12 +831,12 @@ def z_and_gradient(xyz_nm, model: AuxModel) -> tuple[float, np.ndarray]:
     # d trig(s*theta)/d theta: sin -> s cos(s theta); cos -> -s sin(s theta)
     dfeat = np.where(is_sin, signs * np.cos(arg), -signs * np.sin(arg))
     dz_dtheta = np.zeros(len(quads))
-    np.add.at(dz_dtheta, idx, coeffs * dfeat)
+    np.add.at(dz_dtheta, idx, coeffs * dfeat / model.scale)
     grad = np.zeros_like(x)
     for t, quad in enumerate(quads):
         if dz_dtheta[t] != 0.0:
             grad[list(quad)] += dz_dtheta[t] * _dtheta_dx(x[list(quad)])
-    z = float(model.offset + feature_values(theta[None, :], model)[0] @ coeffs)
+    z = float((model.offset + feature_values(theta[None, :], model)[0] @ coeffs) / model.scale)
     return z, grad
 
 
@@ -781,7 +878,7 @@ __all__ += ["aux_energy_kj", "aux_forces_kj_nm", "z_and_gradient", "z_from_dihed
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `pytest tests/test_aux_cv_evaluate.py tests/test_aux_cv_features.py`
-Expected: PASS
+Expected: PASS. The finite-difference and path-agreement tests run on 7 geometries: the minimised dipeptide, 4 randomly perturbed copies, and two 4-atom geometries 1e-3 rad either side of the ±π branch cut.
 
 - [ ] **Step 5: Commit**
 
@@ -804,7 +901,7 @@ git commit -m "feat(cvaux): exact auxiliary energy, analytic gradient and forces
 - Produces:
   - `AUX_FORCE_NAME = "ATLaSAuxCVUmbrella"`, `AUX_GLOBAL_K = "aux_k"`, `AUX_GLOBAL_C = "aux_c"`;
   - `@dataclass(frozen=True) class AuxForceInfo(name: str, force_group: int, model_sha256: str, global_k: str, global_c: str, sub_cv_names: tuple[str, ...])`;
-  - `build_aux_force(openmm, model, *, force_group: int) -> tuple[object, AuxForceInfo]` (the caller adds the force to the System);
+  - `build_aux_force(openmm, model, *, force_group: int) -> tuple[object, AuxForceInfo]` (the caller adds the force to the System). Energy function `select(aux_k, 0.5*aux_k*(auxz-aux_c)^2, 0); auxz = ((offset) + sub-CVs)/(scale)`; every sub-force has `usesPeriodicBoundaryConditions() == False`;
   - `set_aux_parameters(context, info, *, center, k_kcal) -> None`, which sets both globals and resets the centre to 0.0 when k = 0.
 
 Stage B will call `build_aux_force` from production setup and `set_aux_parameters` from the `set_window` path.
@@ -816,21 +913,21 @@ Stage B will call `build_aux_force` from production setup and `set_aux_parameter
 import numpy as np
 import pytest
 
-from aux_cv_fixture import dipeptide, model_payload
+from aux_cv_fixture import blocks_of, dipeptide, four_atoms_at, model_payload, perturbed_geometries
 from gareus.auxiliary_cv.evaluate import aux_energy_kj, aux_forces_kj_nm, z_from_positions
 from gareus.auxiliary_cv.force import (AUX_FORCE_NAME, build_aux_force, set_aux_parameters)
 from gareus.auxiliary_cv.model import AuxModel
 from gareus.correctness._io import IntegrityError
 
 
-def _context(model, n_atoms, force_group=7):
+def _context(model, n_atoms, force_group=7, platform="Reference"):
     import openmm as mm
     s = mm.System()
     for _ in range(n_atoms):
         s.addParticle(1.0)
     force, info = build_aux_force(mm, model, force_group=force_group)
     s.addForce(force)
-    ctx = mm.Context(s, mm.VerletIntegrator(0.001), mm.Platform.getPlatformByName("Reference"))
+    ctx = mm.Context(s, mm.VerletIntegrator(0.001), mm.Platform.getPlatformByName(platform))
     return ctx, info, force
 
 
@@ -841,29 +938,42 @@ def _energy_forces(ctx):
             np.asarray(st.getForces(asNumpy=True).value_in_unit(unit.kilojoule_per_mole / unit.nanometer)))
 
 
-def _model(d, conventions=None, coeffs=None, offset=0.4):
+def _model(d, conventions=None, coeffs=None, offset=0.4, scale=3.181):
     rng = np.random.default_rng(11)
     width = 2 * len(d["quads"])
     return AuxModel.from_mapping(model_payload(
         d["quads"], rng.normal(size=width) if coeffs is None else coeffs, offset=offset,
-        conventions=conventions, blocks=[lab.split("-")[0] for lab in d["labels"]]))
+        conventions=conventions, blocks=blocks_of(d), scale=scale))
 
 
 @pytest.mark.parametrize("conventions", [None, "mixed"])
-def test_energy_and_forces_match_reference(conventions):
+@pytest.mark.parametrize("geometry", range(5))
+def test_energy_and_forces_match_reference(conventions, geometry):
     d = dipeptide()
+    x = perturbed_geometries(d)[geometry]
     conv = None if conventions is None else ["negated" if k % 2 == 0 else "direct" for k in range(len(d["quads"]))]
     m = _model(d, conv)
-    ctx, info, _ = _context(m, len(d["positions_nm"]))
-    ctx.setPositions(d["positions_nm"])
-    z = z_from_positions(d["positions_nm"], m)[0]
+    ctx, info, _ = _context(m, len(x))
+    ctx.setPositions(x)
+    z = z_from_positions(x, m)[0]
     set_aux_parameters(ctx, info, center=z - 0.25, k_kcal=3.0)
     e, f = _energy_forces(ctx)
     assert e == pytest.approx(aux_energy_kj(np.array([z]), z - 0.25, 3.0)[0], rel=1e-10, abs=1e-10)
-    np.testing.assert_allclose(f, aux_forces_kj_nm(d["positions_nm"], m, z - 0.25, 3.0), rtol=1e-8, atol=1e-8)
+    np.testing.assert_allclose(f, aux_forces_kj_nm(x, m, z - 0.25, 3.0), rtol=1e-8, atol=1e-8)
 
 
-def test_zero_strength_contributes_exactly_nothing():
+def test_force_energy_continuous_across_the_pi_branch_cut():
+    m = AuxModel.from_mapping(model_payload([(0, 1, 2, 3)], [1.3, -0.4], offset=0.1, scale=1.7))
+    energies = []
+    for rot in (np.pi - 1e-6, np.pi + 1e-6):
+        ctx, info, _ = _context(m, 4)
+        ctx.setPositions(four_atoms_at(rot))
+        set_aux_parameters(ctx, info, center=-0.2, k_kcal=5.0)
+        energies.append(_energy_forces(ctx)[0])
+    assert abs(energies[0] - energies[1]) < 1e-4
+
+
+def test_zero_strength_contributes_exactly_nothing_at_regular_geometry():
     d = dipeptide()
     m = _model(d)
     ctx, info, _ = _context(m, len(d["positions_nm"]))
@@ -874,14 +984,38 @@ def test_zero_strength_contributes_exactly_nothing():
     assert ctx.getParameter(info.global_c) == 0.0
 
 
+def test_select_makes_zero_strength_exact_even_when_the_square_overflows():
+    # Without select, 0.5*0*(1e200 - 0)^2 = 0*inf = NaN. With select the energy is exactly 0.0.
+    m = AuxModel.from_mapping(model_payload([(0, 1, 2, 3)], [1.0, 0.0], offset=1e200))
+    ctx, info, force = _context(m, 4)
+    assert force.getEnergyFunction().startswith("select(aux_k,")
+    ctx.setPositions(four_atoms_at(1.0))
+    set_aux_parameters(ctx, info, center=0.0, k_kcal=0.0)
+    e, _f = _energy_forces(ctx)
+    assert e == 0.0
+
+
+def test_zero_strength_at_degenerate_geometry_has_zero_energy_but_nan_forces():
+    """Documented limit (Global Constraints): at collinear torsion atoms OpenMM's torsion
+    derivative is NaN, and 0 * NaN = NaN in the chain rule, so k = 0 gives E = 0 but NaN forces.
+    Stock OpenMM torsion forces behave the same way; Stage B must never integrate such a state."""
+    m = AuxModel.from_mapping(model_payload([(0, 1, 2, 3)], [1.0, 0.5], offset=0.1))
+    ctx, info, _ = _context(m, 4)
+    ctx.setPositions(np.array([[0, 0, 0], [1, 0, 0], [2, 0, 0], [3, 1, 0]], dtype=float) * 0.1)
+    set_aux_parameters(ctx, info, center=0.3, k_kcal=0.0)
+    e, f = _energy_forces(ctx)
+    assert e == 0.0
+    assert np.isnan(f[:4]).any()
+
+
 def test_full_square_keeps_cross_terms():
     d = dipeptide()
     width = 2 * len(d["quads"])
     ca = np.zeros(width); ca[0] = 1.3
     cb = np.zeros(width); cb[-1] = -0.8
-    m_ab = _model(d, coeffs=ca + cb, offset=0.2)
-    za = z_from_positions(d["positions_nm"], _model(d, coeffs=ca, offset=0.0))[0]
-    zb = z_from_positions(d["positions_nm"], _model(d, coeffs=cb, offset=0.0))[0]
+    m_ab = _model(d, coeffs=ca + cb, offset=0.2, scale=1.0)
+    za = z_from_positions(d["positions_nm"], _model(d, coeffs=ca, offset=0.0, scale=1.0))[0]
+    zb = z_from_positions(d["positions_nm"], _model(d, coeffs=cb, offset=0.0, scale=1.0))[0]
     ctx, info, _ = _context(m_ab, len(d["positions_nm"]))
     ctx.setPositions(d["positions_nm"])
     set_aux_parameters(ctx, info, center=0.0, k_kcal=1.0)
@@ -892,12 +1026,14 @@ def test_full_square_keeps_cross_terms():
     assert abs(full - separate) > 1e-3
 
 
-def test_force_metadata_and_group():
+def test_force_metadata_group_and_no_periodic_imaging():
     d = dipeptide()
     m = _model(d)
     _ctx, info, force = _context(m, len(d["positions_nm"]), force_group=12)
     assert force.getName() == AUX_FORCE_NAME and force.getForceGroup() == 12
     assert info.force_group == 12 and info.model_sha256 == m.model_sha256
+    for i in range(force.getNumCollectiveVariables()):
+        assert not force.getCollectiveVariable(i).usesPeriodicBoundaryConditions()
 
 
 @pytest.mark.parametrize("group", [-1, 32])
@@ -926,9 +1062,12 @@ Expected: FAIL `ModuleNotFoundError: No module named 'gareus.auxiliary_cv.force'
 # gareus/auxiliary_cv/force.py
 """OpenMM CustomCVForce for one auxiliary-CV restraint: select(aux_k, 0.5 aux_k (z - aux_c)^2, 0).
 
-z is the model's FULL scalar sum (squared as a whole, keeping cross terms). Sub-CVs are grouped
-by (trig, sign convention) so mixed-convention models stay exact. The ``select`` makes an
-inactive state (aux_k = 0) contribute exactly zero. Globals are kJ/mol per z^2 and z units.
+z = (offset + sum of sub-CVs) / scale is the model's FULL scalar (squared as a whole, keeping cross
+terms). Sub-CVs are grouped by (trig, sign convention) so mixed-convention models stay exact, and
+never use periodic boundary conditions (``periodic_imaging: "none"``). The ``select`` makes an
+inactive state (aux_k = 0) contribute exactly zero energy even when (z - aux_c)^2 overflows; its
+forces are exactly zero at non-degenerate geometry (a degenerate torsion gives NaN forces, as
+OpenMM's own torsion forces do). Globals are kJ/mol per z^2 and z units.
 """
 from __future__ import annotations
 
@@ -969,11 +1108,12 @@ def build_aux_force(openmm, model: AuxModel, *, force_group: int):
         name = f"aux_{trig}_{'neg' if sign < 0 else 'dir'}"
         tf = openmm.CustomTorsionForce(f"w*{trig}({'-' if sign < 0 else ''}theta)")
         tf.addPerTorsionParameter("w")
+        tf.setUsesPeriodicBoundaryConditions(False)
         for quad, weight in groups[(trig, sign)]:
             tf.addTorsion(*[int(a) for a in quad], [weight])
         cv.addCollectiveVariable(name, tf)
         names.append(name)
-    z_expr = f"({model.offset:.17g})" + "".join(f" + {n}" for n in names)
+    z_expr = f"(({model.offset:.17g})" + "".join(f" + {n}" for n in names) + f")/({model.scale:.17g})"
     cv.setEnergyFunction(
         f"select({AUX_GLOBAL_K}, 0.5*{AUX_GLOBAL_K}*(auxz-{AUX_GLOBAL_C})^2, 0); auxz = {z_expr}")
     cv.addGlobalParameter(AUX_GLOBAL_K, 0.0)
@@ -999,14 +1139,16 @@ def set_aux_parameters(context, info: AuxForceInfo, *, center, k_kcal) -> None:
 
 Add to `__init__.py`: `from .force import AUX_FORCE_NAME, AuxForceInfo, build_aux_force, set_aux_parameters` and extend `__all__`.
 
-Two things to know when debugging:
-- OpenMM's Lepton parser accepts `select(x, y, z)`, which returns y when x ≠ 0, else z. If the parser rejects the `auxz` intermediate, inline `z_expr` in both places instead.
+Things to know:
+- OpenMM's Lepton parser accepts `select(x, y, z)` (returns y when x ≠ 0, else z) and the `; auxz = ...` intermediate inside a `CustomCVForce` (verified on OpenMM 8.5.1, Reference and CPU).
+- `test_select_makes_zero_strength_exact_even_when_the_square_overflows` discriminates `select`: with offset 1e200 and k = 0, the plain expression `0.5*aux_k*(auxz-aux_c)^2` evaluates to 0·∞ = NaN (verified), while the `select` form gives exactly 0.0. Mutation-checked: removing `select` fails this test.
+- Parity was checked over 200 random models (mixed conventions, duplicate torsions, k 0.1–50) on Reference and CPU: worst relative energy error 1.3e-14, force 1.2e-13.
 - `CustomTorsionForce` `theta` is the OpenMM angle. That is why a `negated` feature uses `sin(-theta)` (see `gareus/production.py:454` `_add_weighted_trig_torsion_force`).
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `pytest tests/test_aux_cv_force.py tests/test_aux_cv_evaluate.py`
-Expected: PASS
+Expected: PASS (energy/force parity runs over the 5 dipeptide geometries × 2 convention sets).
 
 - [ ] **Step 5: Commit**
 
@@ -1025,19 +1167,22 @@ git commit -m "feat(cvaux): exact CustomCVForce auxiliary restraint with zero-st
 - Test: `tests/test_aux_cv_state_schema.py`
 
 **Interfaces:**
-- Consumes: `AuxModel.from_mapping` (Task 1).
+- Consumes: `AuxModel.from_mapping`, `AuxModel.identity_mapping` (Task 1).
 - Produces:
   - `state_identity.STATE_SCHEMA_V2 = "atlas-fixed-state-v2"` and `STATE_ROLES = frozenset({"ordinary", "auxiliary", "sham"})`;
   - `make_state_definition(..., aux_models: Mapping[str, Mapping] | None = None)`: a v2 definition when `aux_models` is not None, else v1 unchanged;
   - `hamiltonian_sha256(definition, window_id: int) -> str`;
-  - normalized window rows: v2 rows always carry `aux_model_sha256` (str | None), `aux_center` (float) and `aux_k` (float, kcal/mol per z²), plus an optional `instance` dict with exactly the keys `state_instance_id` (nonempty string, unique across rows, stable across phases, unlike `window_id`, which is the per-phase column index), `state_role`, `spawn_parent_state_id`, `spawn_source_observation` (null, or an object with exactly `run`, `segment`, `carrier`, `state`, `checkpoint`, `step`) and `matched_additional_slot_id` (null or nonempty string). v1 rows are unchanged.
+  - normalized window rows: v2 rows always carry `aux_model_sha256` (str | None), `aux_center` (float) and `aux_k` (float, kcal/mol per z²), plus a **required** `instance` dict with exactly the keys `state_instance_id` (nonempty string, unique across rows, stable across phases, unlike `window_id`, which is the per-phase column index), `state_role` (`ordinary`/`auxiliary`/`sham`), `spawn_parent_state_id` (null or the parent's `state_instance_id`, which must exist in the table), `spawn_source_observation` (null, or exactly `run`/`segment`/`checkpoint` nonempty strings and `carrier`/`state`/`step` integers ≥ 0, not booleans) and `matched_additional_slot_id` (null or nonempty string). v1 rows are unchanged.
+  - `aux_models[sha]` in a canonical v2 definition is `AuxModel.identity_mapping()` (no label/provenance).
 
 Rules (spec Sections 3.1 and 5):
 - In v2, every window must state `aux_k` explicitly. k = 0 canonicalises to model None and centre 0.0. k > 0 needs a model present in `aux_models` and a finite centre.
-- `aux_models` maps sha → embedded model payload. The key must equal the parsed `model_sha256`. More than one model is refused ("Stage F").
+- `aux_models` maps sha → embedded model payload. The key must equal the parsed `model_sha256`. The canonical registry keeps only the identity body + sha. More than one registered model is refused ("Stage F"); this is stricter than spec 1.2, which refuses more than one *active* model, and is acceptable for MVP.
+- `state_role` agrees with the energy: `auxiliary` ⇔ `aux_k > 0`; `ordinary`/`sham` ⇔ `aux_k == 0` (a sham carrying an active bias would silently invalidate the W/B design, spec 1.1 / 11.1).
 - `instance` is excluded from `hamiltonian_sha256` but included in the definition hash, since the slot table is part of the phase identity.
-- In a v2 definition, either every row carries `instance` or none does. Instance ids must be unique (spec Section 5: `state_instance_id` is mapped explicitly to the runtime window index, which is `window_id` here).
-- `hamiltonian_sha256` drops the aux keys of an inactive row, so an inactive v2 row hashes like the same v1 physics.
+- In a v2 definition every row carries `instance`. Instance ids must be unique (spec Section 5: `state_instance_id` is mapped explicitly to the runtime window index, which is `window_id` here).
+- `hamiltonian_sha256` drops the aux keys of an inactive row, so an inactive v2 row hashes like the same v1 physics. An active row is identified by its `aux_model_sha256` (content hash), so relabelling a model changes no Hamiltonian hash. A boolean `window_id` is refused.
+- `aux_center` canonicalises -0.0 to 0.0.
 
 - [ ] **Step 1: Confirm the legacy v1 pin on unmodified code**
 
@@ -1075,6 +1220,7 @@ CV1 = {"kind": "contacts", "units": "dimensionless", "definition": {"r0": 4.5}}
 CV2 = {"kind": "residual", "units": "dimensionless", "definition": {"v": [1.0]}}
 MODEL = AuxModel.from_mapping(model_payload([(0, 1, 2, 3)], [1.0, 0.5], offset=0.1))
 SHA = MODEL.model_sha256
+OBS = {"run": "r", "segment": "s", "carrier": 3, "state": 1, "checkpoint": "c", "step": 100}
 
 
 def _legacy_windows():
@@ -1097,20 +1243,26 @@ def _v2_windows():
                                         "matched_additional_slot_id": None})
     base.append({"window_id": 2, "center1": 0.4, "k1": 10.0, "center2": 1.0, "k2": 2.0,
                  "gamd_lambda": 0.0, "aux_model_sha256": SHA, "aux_center": 1.5, "aux_k": 1.2,
-                 "instance": {"state_instance_id": "aux-0", "state_role": "auxiliary", "spawn_parent_state_id": 1,
-                              "spawn_source_observation": {"run": "r", "segment": "s", "carrier": 3,
-                                                           "state": 1, "checkpoint": "c", "step": 100},
+                 "instance": {"state_instance_id": "aux-0", "state_role": "auxiliary",
+                              "spawn_parent_state_id": "ord-1", "spawn_source_observation": dict(OBS),
                               "matched_additional_slot_id": "slot-0"}})
     base.append({"window_id": 3, "center1": 0.4, "k1": 10.0, "center2": 1.0, "k2": 2.0,
                  "gamd_lambda": 0.0, "aux_k": 0.0,
-                 "instance": {"state_instance_id": "sham-0", "state_role": "sham", "spawn_parent_state_id": 1,
-                              "spawn_source_observation": {"run": "r", "segment": "s", "carrier": 3,
-                                                           "state": 1, "checkpoint": "c", "step": 100},
+                 "instance": {"state_instance_id": "sham-0", "state_role": "sham",
+                              "spawn_parent_state_id": "ord-1", "spawn_source_observation": dict(OBS),
                               "matched_additional_slot_id": "slot-0"}})
     return base
 
 
+def _relabelled():
+    payload = MODEL.to_mapping()
+    payload["label"] = "other"
+    payload["provenance"] = {"z": 1}
+    return payload
+
+
 def test_legacy_v1_hash_is_unchanged():
+    # Regression guard (passes before and after this task): v1 bytes must not change.
     assert state_definition_hash(_defn(_legacy_windows())) == V1_PINNED
 
 
@@ -1123,6 +1275,28 @@ def test_v2_round_trip_and_canonical_inactive():
     assert state_definition_hash(d) == state_definition_hash(_defn(_v2_windows(), aux_models={SHA: MODEL.to_mapping()}))
 
 
+def test_registry_embeds_identity_only():
+    d = _defn(_v2_windows(), aux_models={SHA: MODEL.to_mapping()})
+    assert d["aux_models"][SHA] == MODEL.identity_mapping()
+    assert "label" not in d["aux_models"][SHA] and "provenance" not in d["aux_models"][SHA]
+
+
+def test_relabelling_the_model_changes_no_hash():
+    d1 = _defn(_v2_windows(), aux_models={SHA: MODEL.to_mapping()})
+    d2 = _defn(_v2_windows(), aux_models={SHA: _relabelled()})
+    assert state_definition_hash(d1) == state_definition_hash(d2)
+    for wid in (0, 1, 2, 3):
+        assert hamiltonian_sha256(d1, wid) == hamiltonian_sha256(d2, wid)
+
+
+def test_negative_zero_center_hashes_like_zero():
+    w1, w2 = _v2_windows(), _v2_windows()
+    w1[2]["aux_center"] = 0.0
+    w2[2]["aux_center"] = -0.0
+    m = {SHA: MODEL.to_mapping()}
+    assert state_definition_hash(_defn(w1, aux_models=m)) == state_definition_hash(_defn(w2, aux_models=m))
+
+
 def test_sham_and_parent_share_hamiltonian_but_not_auxiliary():
     d = _defn(_v2_windows(), aux_models={SHA: MODEL.to_mapping()})
     assert hamiltonian_sha256(d, 3) == hamiltonian_sha256(d, 1)
@@ -1133,6 +1307,12 @@ def test_inactive_v2_row_hashes_like_v1_physics():
     v1 = _defn(_legacy_windows())
     v2 = _defn(_v2_windows(), aux_models={SHA: MODEL.to_mapping()})
     assert hamiltonian_sha256(v1, 1) == hamiltonian_sha256(v2, 1)
+
+
+def test_hamiltonian_hash_rejects_boolean_window_id():
+    d = _defn(_v2_windows(), aux_models={SHA: MODEL.to_mapping()})
+    with pytest.raises(IntegrityError, match="window_id"):
+        hamiltonian_sha256(d, True)
 
 
 def test_kj_tables_convert_aux_k():
@@ -1156,7 +1336,15 @@ def test_kj_tables_convert_aux_k():
     (lambda w, m: w[3]["instance"].update(state_instance_id="aux-0"), "duplicate state_instance_id"),
     (lambda w, m: w[3]["instance"].update(state_instance_id=""), "state_instance_id"),
     (lambda w, m: w[2]["instance"]["spawn_source_observation"].pop("step"), "spawn_source_observation"),
+    (lambda w, m: w[2]["instance"]["spawn_source_observation"].update(step="notastep"), "spawn_source_observation"),
+    (lambda w, m: w[2]["instance"]["spawn_source_observation"].update(carrier=True), "spawn_source_observation"),
+    (lambda w, m: w[2]["instance"].update(spawn_parent_state_id=1), "spawn_parent_state_id"),
+    (lambda w, m: w[2]["instance"].update(spawn_parent_state_id="ord-99"), "not a state_instance_id"),
     (lambda w, m: w[0].pop("instance"), "every row"),
+    # role <-> energy consistency (spec 1.1 / 11.1: a sham must never carry an active bias)
+    (lambda w, m: w[3].update(aux_model_sha256=SHA, aux_center=0.0, aux_k=1.0), "sham requires aux_k == 0"),
+    (lambda w, m: w[0].update(aux_model_sha256=SHA, aux_center=0.0, aux_k=1.0), "ordinary requires aux_k == 0"),
+    (lambda w, m: w[2].update(aux_k=0.0), "auxiliary requires aux_k > 0"),
     (lambda w, m: m.update({"c" * 64: m.pop(SHA)}), "key"),
 ])
 def test_v2_refusals(mutate, message):
@@ -1168,12 +1356,14 @@ def test_v2_refusals(mutate, message):
 
 
 def test_more_than_one_model_is_stage_f():
+    """Stricter than spec 1.2 (which refuses >1 ACTIVE model): MVP refuses >1 registered model."""
     other = AuxModel.from_mapping(model_payload([(0, 1, 2, 3)], [0.0, 1.0]))
     with pytest.raises(IntegrityError, match="Stage F"):
         _defn(_v2_windows(), aux_models={SHA: MODEL.to_mapping(), other.model_sha256: other.to_mapping()})
 
 
 def test_v1_rejects_aux_fields():
+    # Regression guard (passes before and after): v1 keeps refusing unknown physics fields.
     w = _legacy_windows()
     w[0]["aux_k"] = 0.0
     with pytest.raises(IntegrityError, match="unknown physics fields"):
@@ -1206,7 +1396,8 @@ def _aux_term(window: Mapping[str, Any], label: str) -> tuple[str | None, float,
         raise IntegrityError(f"{label}: active aux_k requires a full aux_model_sha256")
     if "aux_center" not in window:
         raise IntegrityError(f"{label}: active aux_k requires aux_center")
-    return sha, finite_number(window["aux_center"], f"{label}.aux_center"), force
+    # + 0.0 canonicalises -0.0 so identity hashes do not depend on the sign of zero
+    return sha, finite_number(window["aux_center"], f"{label}.aux_center") + 0.0, force
 ```
 
 In `normalize_windows`, after the `gamd_lambda` line and before `normalized.append(window)`, add:
@@ -1250,8 +1441,16 @@ def _canonical_aux_models(raw: Any) -> dict[str, dict]:
         model = AuxModel.from_mapping(payload)
         if key != model.model_sha256:
             raise IntegrityError(f"aux_models key {key} does not match the model's digest {model.model_sha256}")
-        out[key] = model.to_mapping()
+        out[key] = model.identity_mapping()     # identity body + sha only: no label/provenance
     return out
+
+
+def _nonempty_str(value: Any) -> bool:
+    return isinstance(value, str) and bool(value)
+
+
+def _nonnegative_int(value: Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, int) and value >= 0
 
 
 def _canonical_instance(raw: Any, state_id: int) -> dict:
@@ -1259,19 +1458,47 @@ def _canonical_instance(raw: Any, state_id: int) -> dict:
         raise IntegrityError(f"Window {state_id} instance needs exactly {sorted(_INSTANCE_FIELDS)}")
     if raw["state_role"] not in STATE_ROLES:
         raise IntegrityError(f"Window {state_id} instance.state_role must be one of {sorted(STATE_ROLES)}")
-    if not isinstance(raw["state_instance_id"], str) or not raw["state_instance_id"]:
+    if not _nonempty_str(raw["state_instance_id"]):
         raise IntegrityError(f"Window {state_id} instance.state_instance_id must be a nonempty string")
     parent = raw["spawn_parent_state_id"]
-    if parent is not None and (isinstance(parent, bool) or not isinstance(parent, int) or parent < 0):
-        raise IntegrityError(f"Window {state_id} instance.spawn_parent_state_id must be null or an id")
+    if parent is not None and not _nonempty_str(parent):
+        raise IntegrityError(f"Window {state_id} instance.spawn_parent_state_id must be null or the "
+                             "parent's state_instance_id (string)")
     obs = raw["spawn_source_observation"]
-    if obs is not None and (not isinstance(obs, dict) or set(obs) != _OBSERVATION_FIELDS):
-        raise IntegrityError(f"Window {state_id} instance.spawn_source_observation must be null or "
-                             f"exactly {sorted(_OBSERVATION_FIELDS)}")
+    if obs is not None:
+        if not isinstance(obs, dict) or set(obs) != _OBSERVATION_FIELDS:
+            raise IntegrityError(f"Window {state_id} instance.spawn_source_observation must be null or "
+                                 f"exactly {sorted(_OBSERVATION_FIELDS)}")
+        bad = [k for k in ("run", "segment", "checkpoint") if not _nonempty_str(obs[k])]
+        bad += [k for k in ("carrier", "state", "step") if not _nonnegative_int(obs[k])]
+        if bad:
+            raise IntegrityError(f"Window {state_id} instance.spawn_source_observation has invalid {bad} "
+                                 "(run/segment/checkpoint: nonempty string; carrier/state/step: integer >= 0)")
     slot = raw["matched_additional_slot_id"]
-    if slot is not None and (not isinstance(slot, str) or not slot):
+    if slot is not None and not _nonempty_str(slot):
         raise IntegrityError(f"Window {state_id} instance.matched_additional_slot_id must be null or a nonempty string")
     return json_loads(json_bytes(raw))
+
+
+def _check_instances(windows: list[dict]) -> None:
+    """v2 slot table: every row has instance metadata, ids are unique, roles match the energy."""
+    missing = [row["window_id"] for row in windows if "instance" not in row]
+    if missing:
+        raise IntegrityError(f"v2 state tables need instance metadata on every row; missing on windows {missing}")
+    ids = [row["instance"]["state_instance_id"] for row in windows]
+    if len(set(ids)) != len(ids):
+        raise IntegrityError(f"duplicate state_instance_id in state table: {sorted(ids)}")
+    known = set(ids)
+    for row in windows:
+        inst, k = row["instance"], row["aux_k"]
+        if inst["state_role"] == "auxiliary" and k <= 0:
+            raise IntegrityError(f"Window {row['window_id']}: state_role auxiliary requires aux_k > 0")
+        if inst["state_role"] in ("ordinary", "sham") and k != 0:
+            raise IntegrityError(f"Window {row['window_id']}: state_role {inst['state_role']} requires aux_k == 0")
+        parent = inst["spawn_parent_state_id"]
+        if parent is not None and parent not in known:
+            raise IntegrityError(f"Window {row['window_id']}: spawn_parent_state_id {parent!r} is not a "
+                                 "state_instance_id in this table")
 ```
 
 Then change `canonical_state_definition`:
@@ -1309,16 +1536,11 @@ Then change `canonical_state_definition`:
 ```
 
 - After the loop, before `return data`: `if aux_models is not None: data["aux_models"] = aux_models`.
-- Also after the loop, for v2 only, enforce instance consistency:
+- Also after the loop, for v2 only, enforce the slot-table rules (instance on every row, unique ids, role ⇔ energy, parent exists):
 
 ```python
     if schema == STATE_SCHEMA_V2:
-        with_instance = [row for row in windows if "instance" in row]
-        if with_instance and len(with_instance) != len(windows):
-            raise IntegrityError("v2 instance metadata must be given on every row or on none")
-        ids = [row["instance"]["state_instance_id"] for row in with_instance]
-        if len(set(ids)) != len(ids):
-            raise IntegrityError(f"duplicate state_instance_id in state table: {sorted(ids)}")
+        _check_instances(windows)
 ```
 - Change `make_state_definition`: add the keyword `aux_models: Mapping | None = None`. Build the dict as today. When `aux_models is not None`, set `"schema": STATE_SCHEMA_V2` and `"aux_models": dict(aux_models)`.
 
@@ -1327,19 +1549,134 @@ Add the Hamiltonian hash:
 ```python
 def hamiltonian_sha256(definition: Mapping[str, Any], window_id: int) -> str:
     """Identity of one state's potential and ensemble, excluding slot id and spawn provenance."""
+    if isinstance(window_id, bool) or not isinstance(window_id, int):
+        raise IntegrityError(f"window_id must be an integer, got {window_id!r}")
     state = canonical_state_definition(definition)
     rows = [row for row in state["windows"] if row["window_id"] == window_id]
     if len(rows) != 1:
         raise IntegrityError(f"No window {window_id} in this state definition")
     physics = {key: value for key, value in rows[0].items() if key not in ("window_id", "instance")}
-    model = None
-    if physics.get("aux_k", 0.0) > 0:
-        model = state["aux_models"][physics["aux_model_sha256"]]
-    else:
+    if physics.get("aux_k", 0.0) == 0:
+        # An inactive auxiliary term is no term: hash like the same v1 physics.
         for key in ("aux_model_sha256", "aux_center", "aux_k"):
             physics.pop(key, None)
+    # An active term is identified by aux_model_sha256 (the model's content hash) inside `physics`;
+    # labels/provenance never enter.
     shared = {key: state[key] for key in _SHARED_FIELDS}
-    return digest(json_bytes({"shared": shared, "window": physics, "aux_model": model}))
+    return digest(json_bytes({"shared": shared, "window": physics}))
+
+
+def state_definition_hash(definition: Mapping[str, Any]) -> str:
+    return digest(json_bytes(canonical_state_definition(definition)))
+
+
+def compare_state_definitions(reference: Any, candidate: Any, path: str = "state") -> list[dict]:
+    """Exact, field-level comparison; do not merge states using loose isclose."""
+    if isinstance(reference, dict) and isinstance(candidate, dict):
+        differences = []
+        for key in sorted(set(reference) | set(candidate)):
+            child = f"{path}.{key}"
+            if key not in reference or key not in candidate:
+                differences.append({"field": child, "reference": reference.get(key, "<missing>"),
+                                    "candidate": candidate.get(key, "<missing>")})
+            else:
+                differences.extend(compare_state_definitions(reference[key], candidate[key], child))
+        return differences
+    if isinstance(reference, list) and isinstance(candidate, list):
+        if len(reference) != len(candidate):
+            return [{"field": path + ".length", "reference": len(reference), "candidate": len(candidate)}]
+        return [difference for i, (left, right) in enumerate(zip(reference, candidate))
+                for difference in compare_state_definitions(left, right, f"{path}[{i}]")]
+    if reference != candidate:
+        return [{"field": path, "reference": reference, "candidate": candidate}]
+    return []
+
+
+def freeze_snapshot(segment_id: str, definition: Mapping[str, Any], *,
+                    equilibrium_analysis_eligible: bool,
+                    phase_kind: str) -> dict[str, Any]:
+    if not isinstance(segment_id, str) or not segment_id:
+        raise IntegrityError("A snapshot needs an explicit segment_id")
+    if not isinstance(equilibrium_analysis_eligible, bool):
+        raise IntegrityError("Analysis eligibility must be explicit, not truthy metadata")
+    if phase_kind not in {"production", "pilot", "exploration", "equilibration"}:
+        raise IntegrityError("Unknown explicit phase_kind")
+    if equilibrium_analysis_eligible and phase_kind != "production":
+        raise IntegrityError("Exploration/equilibration cannot be marked production eligible")
+    state = canonical_state_definition(definition)
+    return {
+        "segment_id": segment_id, "snapshot_schema": "atlas-window-snapshot-v2",
+        "windows": state["windows"],
+        "cv1_type": state["cv1"]["kind"] if state["cv1"] is not None else None,
+        "cv2_type": state["cv2"]["kind"] if state["cv2"] is not None else None,
+        "state_definition": state, "state_definition_sha256": state_definition_hash(state),
+        "sampling_policy": {"phase_kind": phase_kind,
+                            "equilibrium_analysis_eligible": equilibrium_analysis_eligible},
+    }
+
+
+def write_frozen_snapshot(path: Path | str, snapshot: Mapping[str, Any]) -> None:
+    """Refuse to rewrite an existing segment's definition; identical is a no-op.
+
+    Caller must hold the run lock. This is a single-writer metadata API.
+    """
+    validate_fixed_state_segments({str(snapshot["segment_id"]): snapshot}, require_eligible=False)
+    path = Path(path)
+    payload = json_bytes(snapshot)
+    if path.exists():
+        if path.read_bytes() != payload:
+            raise IntegrityError(f"Refusing to overwrite immutable state snapshot {path}")
+        return
+    atomic_bytes(path, payload)
+
+
+def validate_fixed_state_segments(
+    snapshots: Mapping[str, Mapping[str, Any]], *, require_eligible: bool = True,
+) -> CanonicalStateTable:
+    if not snapshots:
+        raise IntegrityError("No state snapshots were selected")
+    first = None
+    first_id = None
+    for segment_id, snapshot in snapshots.items():
+        if snapshot.get("segment_id") != segment_id:
+            raise IntegrityError(f"Snapshot segment_id mismatch for {segment_id}")
+        if snapshot.get("snapshot_schema") != "atlas-window-snapshot-v2":
+            raise IntegrityError(
+                f"Segment {segment_id} lacks a frozen state definition. Do not infer historical "
+                "CVs/envelopes from current files; export through a reviewed legacy migration."
+            )
+        policy = snapshot.get("sampling_policy")
+        if (not isinstance(policy, dict)
+                or policy.get("phase_kind") not in {"production", "pilot", "exploration", "equilibration"}
+                or not isinstance(policy.get("equilibrium_analysis_eligible"), bool)):
+            raise IntegrityError(f"Segment {segment_id} has invalid sampling-policy metadata")
+        if policy["equilibrium_analysis_eligible"] and policy["phase_kind"] != "production":
+            raise IntegrityError(f"Segment {segment_id} inconsistently marks exploration as production eligible")
+        if require_eligible and policy["equilibrium_analysis_eligible"] is not True:
+            raise IntegrityError(f"Segment {segment_id} is exploratory or has unknown sampling eligibility")
+        state = canonical_state_definition(snapshot["state_definition"])
+        if state_definition_hash(state) != snapshot.get("state_definition_sha256"):
+            raise IntegrityError(f"State-definition checksum mismatch for {segment_id}")
+        if normalize_windows(snapshot.get("windows", [])) != state["windows"]:
+            # Top-level windows may be ordered differently; compare by IDs below.
+            visible = sorted(normalize_windows(snapshot.get("windows", [])),
+                             key=lambda row: row.get("window_id", -1))
+            if visible != state["windows"]:
+                raise IntegrityError(f"Visible windows disagree with immutable definition in {segment_id}")
+        if first is None:
+            first, first_id = state, segment_id
+        else:
+            differences = compare_state_definitions(first, state)
+            if differences:
+                detail = differences[0]
+                raise IntegrityError(
+                    f"Segments {first_id!r} and {segment_id!r} are not fixed-state compatible: "
+                    f"{detail['field']}: {detail['reference']!r} != {detail['candidate']!r}. "
+                    "Use a validated union-state workflow instead of changing columns by segment."
+                )
+    return CanonicalStateTable(first, tuple(first["windows"]),
+                               tuple(row["window_id"] for row in first["windows"]),
+                               state_definition_hash(first))
 ```
 
 The kJ conversion order matters. `normalize_windows` canonicalises `aux_k` in the input unit, and `canonical_state_definition` then divides by 4.184 once, as it does for k1 and k2. Do not convert in `_aux_term`.
@@ -1347,7 +1684,7 @@ The kJ conversion order matters. `normalize_windows` canonicalises `aux_k` in th
 - [ ] **Step 6: Run the tests to verify they pass**
 
 Run: `pytest tests/test_aux_cv_state_schema.py`
-Expected: PASS. No dedicated state-identity test file existed before this work, so the pinned v1 hash in this file is the legacy regression.
+Expected: PASS (30 tests in scratch). No dedicated state-identity test file existed before this work, so the pinned v1 hash in this file is the legacy regression (re-verified after the edits: still `dc0acf77…`).
 
 - [ ] **Step 7: Commit**
 
@@ -1372,7 +1709,8 @@ Rules:
 - An active aux column (k > 0) without `aux_z[sha]` raises `MissingCoordinateError`.
 - NaN in z propagates to that column only.
 - An inactive row never reads z.
-- The term is added inside the umbrella loop, before the `lambda == 0` early return (spec Section 15 flags this exact trap).
+- The term is added inside the umbrella loop, before the `lambda == 0` early return (spec Section 15 flags this exact trap) and therefore before the ladder boost when λ > 0 (`test_aux_term_is_present_before_the_ladder_boost_when_lambda_is_positive`, via the `_ladder_apply` seam).
+- On current main, a row carrying aux keys is silently treated as unrestrained (`test_missing_model_column_raises` fails with "DID NOT RAISE"); this task closes that.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1381,6 +1719,7 @@ Rules:
 import numpy as np
 import pytest
 
+from gareus.correctness._io import IntegrityError
 from gareus.correctness.bias import MissingCoordinateError, reconstruct_bias_matrix
 
 SHA = "e" * 64
@@ -1417,6 +1756,7 @@ def test_nan_z_only_poisons_active_aux_column():
 
 
 def test_zero_strength_rows_equal_legacy_matrix_bitwise():
+    # Regression guard (passes before and after this task): inactive aux rows change nothing.
     legacy = [{k: v for k, v in r.items() if not k.startswith("aux_")} for r in _rows()]
     rows = _rows()
     rows[1]["aux_k"] = 0.0
@@ -1427,8 +1767,27 @@ def test_zero_strength_rows_equal_legacy_matrix_bitwise():
 
 
 def test_aux_z_shape_is_checked():
-    with pytest.raises(Exception, match="shape"):
+    with pytest.raises(IntegrityError, match="shape"):
         reconstruct_bias_matrix(np.array([0.1, 0.3]), None, _rows(), BETA, aux_z={SHA: np.array([1.0])})
+
+
+def test_aux_term_is_present_before_the_ladder_boost_when_lambda_is_positive():
+    rows = _rows()
+    for row in rows:
+        row["gamd_lambda"] = 0.5
+    seen = {}
+
+    def fake_ladder(matrix, pep, dih, lambdas, envelope, beta, meta):
+        seen["matrix"] = matrix.copy()          # what the boost helper receives
+        return matrix + 1.0                      # stand-in boost, same for every column
+
+    cv1 = np.array([0.1, 0.3])
+    z = np.array([0.5, 2.0])
+    u = reconstruct_bias_matrix(cv1, None, rows, BETA, v_pep=np.zeros(2), v_dih=np.zeros(2),
+                                envelope=object(), aux_z={SHA: z}, _ladder_apply=fake_ladder)
+    extra = BETA * 4.184 * 0.5 * 2.0 * (z - 1.0) ** 2
+    np.testing.assert_allclose(seen["matrix"][:, 1] - seen["matrix"][:, 0], extra, rtol=1e-12)
+    np.testing.assert_allclose(u[:, 1] - u[:, 0], extra, rtol=1e-12)
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -1495,7 +1854,7 @@ Insert after the "Adaptive λ ladder" section:
 ```markdown
 ## CVaux Stage A (`gareus/auxiliary_cv/`, spec `docs/superpowers/specs/2026-10-07-auxiliary-cv-gibbs-production-spec.md`)
 
-- Built: frozen model `atlas-aux-cv-model-v1` (`AuxModel`, identity = content sha, label/provenance excluded), OpenMM-convention dihedral features (theta = OpenMM `theta` = -tica angle; `negated` feature = trig(-theta)), exact evaluator with Blondel-Karplus gradient (FD-verified), `CustomCVForce` `ATLaSAuxCVUmbrella` = select(aux_k, 0.5 aux_k (z - aux_c)^2, 0) with exact energy/force parity, state schema `atlas-fixed-state-v2` (`aux_models` registry, per-window aux_model_sha256/aux_center/aux_k, optional `instance` {state_instance_id, state_role, spawn_parent_state_id, spawn_source_observation, matched_additional_slot_id}, `hamiltonian_sha256`), `reconstruct_bias_matrix(aux_z=)`.
+- Built: frozen model `atlas-aux-cv-model-v1` (`AuxModel`: z = (offset + Σ c f)/scale, `periodic_imaging` "none", identity = content sha incl. scale/imaging, label/provenance excluded, -0.0 canonicalised; registries embed `identity_mapping()`), OpenMM-convention dihedral features (theta = OpenMM `theta` = -tica angle; `negated` feature = trig(-theta)), exact evaluator with Blondel-Karplus gradient (FD-verified), `CustomCVForce` `ATLaSAuxCVUmbrella` = select(aux_k, 0.5 aux_k (z - aux_c)^2, 0) with exact energy/force parity, state schema `atlas-fixed-state-v2` (`aux_models` registry, per-window aux_model_sha256/aux_center/aux_k, required `instance` {state_instance_id, state_role, spawn_parent_state_id (parent's state_instance_id), spawn_source_observation, matched_additional_slot_id}, role ⇔ aux_k enforced, `hamiltonian_sha256` keyed on model sha), field `aux_k` kcal/mol/z² (deviation from spec's `aux_k_kcal_mol`); k = 0 is exact-zero energy, NaN forces at degenerate torsions (as stock OpenMM), `reconstruct_bias_matrix(aux_z=)`.
 - Not wired: nothing in production, exchange, storage or analysis calls it yet (Stages B/C). v1 definitions hash byte-identically (pinned test). MVP: one model; >1 refused ("Stage F").
 - Tests: `tests/test_aux_cv_*.py`, fixture `tests/aux_cv_fixture.py`.
 ```
@@ -1541,3 +1900,26 @@ git commit -m "docs(cvaux): Stage A handoff note"
   - Parquet/feature storage (Stage C);
   - c10 model recovery (Stage D).
 - **Interface names used later:** `AuxModel.model_sha256`, `build_aux_force(openmm, model, *, force_group)`, `set_aux_parameters(context, info, *, center, k_kcal)`, `z_from_dihedrals(theta, model)`, `openmm_dihedrals(xyz_nm, quads)`, `unique_torsions(model)`, `reconstruct_bias_matrix(..., aux_z=)`, `hamiltonian_sha256(definition, window_id)`.
+
+### Revision after adversarial verification (2026-10-08)
+
+The verifier implemented this plan in scratch (66/66 tests passing, parity 1e-13, v1 pin reproduced) and filed 14 findings; the revision applies all of them, together with cross-stage decisions D1–D4 and D14. The revised plan's code was re-run in scratch: 108 tests passing across the six files. The v1 pin is still `dc0acf77…`. The `select` mutation test fails without `select`.
+
+| Finding | Change |
+|---|---|
+| 1 (HIGH) Hamiltonian hash depended on label/provenance | Registry stores `identity_mapping()`; `hamiltonian_sha256` keys on `aux_model_sha256` only; relabel-invariance test for both hashes |
+| 2 Definition hash changed on relabel | Same fix; `test_relabelling_the_model_changes_no_hash` |
+| 3 Role not checked against energy | `_check_instances`: auxiliary ⇔ k > 0, ordinary/sham ⇔ k = 0; three refusal cases |
+| 4 v2 could omit `instance` | `instance` required on every v2 row |
+| 5 No normalisation/imaging record | `scale` (divisor) and `periodic_imaging` ("none") identity fields; force divides by scale, sub-forces non-periodic; tests |
+| 6 Weak provenance validation | Parent = `state_instance_id` string that must exist; typed observation fields; refusal cases |
+| 7 Vacuous wrap test | Geometry-based ±π tests through positions → θ → features (Task 2), z (Task 3), force energy (Task 4) |
+| 8 -0.0 hashed differently | Canonicalised in model fields and `aux_center`; tests |
+| 9 Zero-strength claim / `select` not discriminated | Claim narrowed to energy (and forces at regular geometry); degenerate-geometry NaN-force test; overflow test that fails without `select` |
+| 10 Regression guards / broad `Exception` | Guards marked in code; `IntegrityError` |
+| 11 One geometry only | FD and parity parametrised over perturbed and near-±π geometries |
+| 12 No λ > 0 + aux test | `_ladder_apply` seam test |
+| 13 Deviations | `aux_k` naming, stricter one-model rule, boolean `window_id` refusal, nm⁴ threshold name, conservative degenerate rule: all recorded |
+| 14 Cosmetic | Fixture citation `analyze.py:416-419`; Task 2 commit no longer re-adds the fixture |
+
+Interfaces changed for Stages B/C: `AuxModel.scale`, `AuxModel.periodic_imaging`, `AuxModel.identity_mapping()`; registries hold identity bodies; `spawn_parent_state_id` is a string; `instance` is mandatory in v2.
