@@ -1737,6 +1737,11 @@ git commit -m "feat(cvaux): checkpoint binding with save-time and pre-re-apply p
     - (c) the payload's `model_shas` contains the same sha.
   - When all three hold: non-residual CV2 gives `ELIGIBLE_VERIFIED` ("auxiliary features recorded"). Residual CV2 falls through to the residual rule, which accepts `EXCHANGE_ENERGY_VERSION_AUX` as the exchange version.
 - Non-auxiliary snapshots: unchanged.
+- **Replaces Stage B's marker.**
+  - Stage B classifies a v3_aux snapshot that carries the key `AUX_PERSISTED_SNAPSHOT_KEY` (`"aux_sample_schema"`) as `ELIGIBLE_UNKNOWN`.
+  - This task deletes that constant and its branch: persistence is decided only by the sample manifest's `payload_schema` (rules (a)–(c) above).
+  - Snapshots never carry an `aux_sample_schema` key.
+  - Update Stage B's kernel-identity test that referenced the constant in the same commit.
 - `segment_eligibility` reads `samples/<seg>/parquet_manifest.json`'s `payload_schema` (via `load_manifest(..., verify_hashes=False)`) and passes it.
 - `_load_segmented_parquet` already excludes everything not VERIFIED or NOT_APPLICABLE, so Stage B-era auxiliary data stays excluded and reported.
 
@@ -3765,7 +3770,7 @@ git commit -m "docs(cvaux): Stage C handoff note"
 | Equilibration and phase_kind policy (preparation ramp, excluded equilibration segment, burn-in sensitivity) | 6 | Stage D admission; Stage C defaults new aux runs to `pilot` / ineligible |
 | Structural-label boundary stream / exchange-grid frames when trajectories are off | 7, 12 | Stage D (Task 12 warns) |
 | `sampled_umbrella_bias_kj` description at `production.py:7873` still says umbrella-only although Stage B adds the aux term | 7 | Stage B handoff (noted to Stage B) |
-| Model binding to the run topology (`check_feature_atoms(topology_sha256=)`), with the swarm `file_digest` vs topology identity reconciled | 5, 9 | Stage B (D7 revision); Stage C binds its own `topology_identity_sha256` in checkpoints |
+| Model binding to the run topology (`check_feature_atoms(topology_sha256=)`), with the swarm `file_digest` vs topology identity reconciled | 5, 9 | Stage B (D7 revision); Stage C binds its own `topology_identity_sha256` in checkpoints. The two hashes serve different purposes and both are kept:<br>• Stage B `canonical_topology_sha256` is the model's atom-map identity (chains holding feature atoms, solvent excluded). It is stored in `AuxRuntime` and the kernel identity.<br>• Stage C `topology_identity_sha256` is the whole-topology identity used for checkpoint/resume.<br>Task 11's `aux_io_runtime` also carries Stage B's value, and `verify_aux_resume` checks the kernel identity digest, which covers it. |
 
 ---
 
