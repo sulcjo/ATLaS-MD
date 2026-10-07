@@ -6,6 +6,16 @@ The project follows semantic-style release numbering where practical. Research-m
 
 ## [Unreleased]
 
+### Changed — results-changing
+
+- **Every production replica now gets its own Langevin random stream.**
+  - Before, `make_production_integrator` seeded every REUS replica's integrator (cMD and GaMD/Pep-GaMD) with `args.seed`, and the GaMD multi-window recon did the same for every window. OpenMM gives two integrators with the same seed the same random-force sequence, so all replicas were driven by identical noise.
+  - Replicas that also shared start positions, velocities and restraint centre (no per-window start state, `--randomize-replica-velocities` off, duplicate centres) ran as near-copies. In every other case the stochastic forces were correlated across windows, so per-window estimates were not independent and bootstrap/block error bars may be too small.
+  - Replica *i* now uses `args.seed + 100000 + i` and recon window *i* uses `args.seed + 200000 + i` (`replica_integrator_seed_offset`, `recon_integrator_seed_offset`). `--seed 0` still means "OpenMM picks a unique seed per Context". Single-context callers keep `args.seed`.
+  - Only newly built Contexts get the new seeds. A replica restored with `Context.loadCheckpoint` keeps the RNG state stored in its checkpoint, so a resumed segment keeps the old shared stream until its next fresh build. Adaptive epochs, segments and extensions already rebuild Contexts with fresh `args.seed` values each time.
+  - Unaffected: swarm members (each worker gets `copy.copy(args)` with its own `velocity_seed`), the NPT barostat (already per-replica via `npt_seed_replica`), and the setup/seeding integrators (`make_langevin_integrator` with its own offsets).
+  - Test: `tests/test_replica_integrator_seed.py` (Reference-platform divergence oracle, plus an AST check that every integrator built inside a loop in `production.py` passes a `seed_offset`).
+
 ## [0.8.5] — 2026-10-01
 
 This release targets slow convergence in chignolin_9. A frame-level convergence analysis showed:
