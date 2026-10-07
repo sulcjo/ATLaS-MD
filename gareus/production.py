@@ -127,6 +127,8 @@ __all__ = [
     "add_primary_umbrella_force",
     "make_gamd_integrator",
     "make_production_integrator",
+    "recon_integrator_seed_offset",
+    "replica_integrator_seed_offset",
     "production_run_mode",
     "gamd_enabled",
     "window_assignment_rows",
@@ -2251,11 +2253,38 @@ def gamd_enabled(args) -> bool:
     return production_run_mode(args) in {"gamd", "hmr-gamd"}
 
 
-def make_cmd_integrator(openmm, args, unit, system=None):
+# Per-context Langevin seed offsets.  Every replica (and every GaMD recon window)
+# is its own Context, and OpenMM gives two integrators with the same seed the same
+# random-force sequence, so a shared args.seed makes the replicas' noise identical.
+# The bases sit clear of the npt_driver barostat offsets (61001-64001+r) and leave
+# room for 100k replicas each before the two ranges could meet.
+_REPLICA_INTEGRATOR_SEED_BASE = 100_000
+_RECON_INTEGRATOR_SEED_BASE = 200_000
+
+
+def replica_integrator_seed_offset(replica_index: int) -> int:
+    """Langevin seed offset for production replica `replica_index`."""
+    return _REPLICA_INTEGRATOR_SEED_BASE + int(replica_index)
+
+
+def recon_integrator_seed_offset(window_index: int) -> int:
+    """Langevin seed offset for GaMD multi-window recon window `window_index`."""
+    return _RECON_INTEGRATOR_SEED_BASE + int(window_index)
+
+
+def _integrator_seed(args, seed_offset: int = 0) -> int:
+    """`args.seed` + `seed_offset`, except that seed 0 stays 0: OpenMM reads 0 as
+    "pick a unique seed for each Context", which is already per-replica."""
+    base = int(args.seed)
+    return 0 if base == 0 else base + int(seed_offset)
+
+
+def make_cmd_integrator(openmm, args, unit, system=None, seed_offset: int = 0):
     """Create a plain conventional-MD LangevinMiddleIntegrator.
 
     A plain integrator applies every force group, so if `system` carries the Pep-GaMD
     auxiliary water-only force it must be excluded here or water-water is counted twice.
+    Callers that build one integrator per replica pass a distinct `seed_offset`.
     """
     integrator = openmm.LangevinMiddleIntegrator(
         float(args.temperature_k) * unit.kelvin,
@@ -2263,7 +2292,7 @@ def make_cmd_integrator(openmm, args, unit, system=None):
         float(args.timestep_fs) * unit.femtosecond,
     )
     try:
-        integrator.setRandomNumberSeed(int(args.seed))
+        integrator.setRandomNumberSeed(_integrator_seed(args, seed_offset))
     except Exception:
         pass
     if system is not None and _find_pep_gamd_aux_force(system)[1] is not None:
@@ -2277,14 +2306,14 @@ def make_cmd_integrator(openmm, args, unit, system=None):
     }
 
 
-def make_production_integrator(openmm, system, args, unit):
+def make_production_integrator(openmm, system, args, unit, seed_offset: int = 0):
     """Create the production integrator selected by --run-mode."""
     if gamd_enabled(args):
-        return make_gamd_integrator(system, args, unit)
-    return make_cmd_integrator(openmm, args, unit, system=system)
+        return make_gamd_integrator(system, args, unit, seed_offset=seed_offset)
+    return make_cmd_integrator(openmm, args, unit, system=system, seed_offset=seed_offset)
 
 
-def make_gamd_integrator(system, args, unit):
+def make_gamd_integrator(system, args, unit, seed_offset: int = 0):
     if is_pep_gamd(args):
         result = build_pep_gamd_integrator(system, args, unit)
     else:
@@ -2314,7 +2343,7 @@ def make_gamd_integrator(system, args, unit):
             sigma0d=sigma0d,
         )
     integrator = result[2]
-    integrator.setRandomNumberSeed(args.seed)
+    integrator.setRandomNumberSeed(_integrator_seed(args, seed_offset))
     try:
         integrator.setFriction(args.friction_per_ps / unit.picosecond)
     except Exception:
@@ -5841,9 +5870,11 @@ def run_multiwindow_gamd_recon(
         system_i = deserialize_system(openmm, base_system)
         targets, _peek_integrator = _gamd_boost_group_targets(system_i, args, unit)
         if integrator_kind == "gamd":
-            step_integrator, _ = make_gamd_integrator(system_i, args, unit)
+            step_integrator, _ = make_gamd_integrator(system_i, args, unit,
+                                                      seed_offset=recon_integrator_seed_offset(i))
         else:
-            step_integrator, _ = make_cmd_integrator(openmm, args, unit, system=system_i)
+            step_integrator, _ = make_cmd_integrator(openmm, args, unit, system=system_i,
+                                                     seed_offset=recon_integrator_seed_offset(i))
         props_i = replica_platform_properties(platform, props, args, i)
         sim_i = app.Simulation(topology, system_i, step_integrator, platform, props_i)
         if integrator_kind == "gamd" and seed_globals:
@@ -7387,7 +7418,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     _velocity_randomize_skip_count = 0
     for i in range(nrep):
         system_i = deserialize_system(openmm, base_system)
-        integrator_i, gamd_result = make_production_integrator(openmm, system_i, args, unit)
+        integrator_i, gamd_result = make_production_integrator(
+            openmm, system_i, args, unit, seed_offset=replica_integrator_seed_offset(i))
         copied_globals, skipped_globals = {}, {}
         loaded_shared_gamd_checkpoint = False
         props_i = replica_platform_properties(platform, props, args, i)
