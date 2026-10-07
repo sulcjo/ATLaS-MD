@@ -59,7 +59,16 @@ Stage B builds the runtime. This plan's Task 10 wires the following calls into `
 | Per exchange decision (accepted, rejected, stay, no-candidates) | Proposal outcome plus a within-step attempt counter | `parquet_exchange_writer.write_event(step=, attempt_seq=, selected_replica=, replica_i=, replica_j=, window_i=, window_j=, kind=, delta_e_kj=, accepted=, log_q_forward=, log_q_reverse=, p_accept=, energy_version=, assignments_after=)` |
 | At checkpoint save and after the resume assignment | `observed_params: list[tuple[float, float]]` per replica, from `read_aux_parameters(sim.context, aux_runtime.force_info)` | `save_production_checkpoint(..., aux_block=aux_checkpoint_block(...))`, `verify_aux_resume(manifest, ...)` |
 
-If Stage B evaluates exchange-matrix z some other way than `observe_carrier`, Stage B must prove that its z equals `observe_carrier(...).z` bitwise for the same positions. The stored z must be the z used in the exchange matrix (spec Section 7: "runtime force calculations remain authoritative; offline feature computation must use the same conventions").
+**Seam reconciliation with the committed Stage B plan (3ac214d).** These rules supersede the table above where they differ:
+- **Stored z.** Stage B evaluates exchange-matrix z with `observe_aux_z` (fast path: offset + the force's sub-CVs, read through the closure `_aux_z_for_replica(r, sim)`). That value is what `write_sample(aux_z=)` stores. The stored z is the z the exchange matrix used (spec Section 7: runtime forces are authoritative).
+- **Stored torsions.** `torsions` come from `observe_carrier(positions_nm, schema, models).torsions`, using the positions `_fetch_state` already holds at the sample step.
+- **No bitwise requirement.** Offline-recomputed z and stored z are never required to match bitwise. They must agree within the reduced-energy parity tolerance in Task 7 (spec Section 17: 1e-6 FP64 oracle, 1e-4 mixed precision).
+- **Runtime adapter.** Stage B's `AuxRuntime` carries `table`, `info` and `force_index`, not the fields listed above. Task 10's `runtime_io.aux_io_runtime(runtime, *, topology)` derives them:
+  - `state_definition` from the table's v2 definition;
+  - `models` from the table's model registry;
+  - `force_info` = `runtime.info`;
+  - `sample_schema` = `build_sample_schema(...)`.
+  No Stage B code changes.
 
 ## Review Focus
 
@@ -1336,7 +1345,10 @@ git commit -m "feat(cvaux): bind auxiliary state to checkpoints and verify Conte
 **Interfaces:**
 - Consumes: Task 2 `AuxSampleSchema`; Stage A `z_from_dihedrals`, `AuxModel`, `reconstruct_bias_matrix(aux_z=)`; `state_identity.freeze_snapshot`, `STATE_SCHEMA_V2`.
 - Produces:
-  - `aux_z_from_samples(samples, schema, models, *, parity_tol=1e-12) -> dict[str, np.ndarray]`. It recomputes z from the `tor_###` columns for every schema model. Where a stored `aux_z_##` exists and both values are finite, they must agree within `parity_tol` (absolute), else `IntegrityError`. A stored value that is finite where the recomputation is NaN, or the reverse, also raises. The output is float64, NaN where undefined.
+  - `parity_context(windows, beta, *, mixed_precision: bool = False) -> dict`, which returns the keyword arguments `beta`, `k_max_kcal`, `centers` and `parity_reduced_tol` for `aux_z_from_samples`, taken from the active aux rows (1e-4 when `mixed_precision`, else 1e-6).
+  - `aux_z_from_samples(samples, schema, models, *, beta, k_max_kcal: Mapping[str, float], centers: Mapping[str, Sequence[float]], parity_reduced_tol=1e-6) -> dict[str, np.ndarray]`. It recomputes z from the `tor_###` columns for every schema model.
+    - Where a stored `aux_z_##` exists and both values are finite, the reduced-energy disagreement it implies at that model's strongest active restraint must stay within tolerance: `beta * KJ_PER_KCAL * k_max_kcal[sha] * |z_stored - z_offline| * (|z_offline - c| + |z_stored - z_offline| / 2)`, bounded via the largest |z - c| over that model's active centres. Simplified conservatively, the check is `beta * KJ_PER_KCAL * k_max_kcal[sha] * |dz| * (max_dev + |dz|) <= parity_reduced_tol` with `max_dev = max over rows of |z_offline - c|` for the worst centre. Violations raise `IntegrityError`.
+    - Use 1e-6 for FP64/Reference data and 1e-4 for mixed-precision GPU data (spec Section 17). The exporter takes `parity_reduced_tol` from the segment manifest's recorded platform precision. A stored value that is finite where the recomputation is NaN, or the reverse, also raises. The output is float64, NaN where undefined.
   - `exclusion_report(excluded, *, origin_ids, replicas, steps, segment_ids, aux_z, time_block_steps, z_bins=10) -> dict`.
   - `build_export_arrays(..., aux_sample_schema: AuxSampleSchema | None = None, on_incomplete: str = "refuse", time_block_steps: int | None = None)`.
   - `WindowSnapshot.snapshot(..., state_definition=None, phase_kind="production", equilibrium_analysis_eligible=None)`. With `state_definition`, the payload becomes `{**freeze_snapshot(segment_id, state_definition, ...), "kernel_identity": ...}`, so `validate_fixed_state_segments` accepts it. The rows are the canonical v2 rows, so `load_windows` returns v2 rows. A rewrite with different bytes raises `IntegrityError`.
@@ -1411,7 +1423,7 @@ import pytest
 from aux_cv_fixture import model_payload
 from gareus.auxiliary_cv.evaluate import z_from_dihedrals
 from gareus.auxiliary_cv.model import AuxModel
-from gareus.auxiliary_cv.offline import aux_z_from_samples, exclusion_report
+from gareus.auxiliary_cv.offline import aux_z_from_samples, exclusion_report, parity_context
 from gareus.auxiliary_cv.sample_schema import AuxSampleSchema, _basis_sha
 from gareus.correctness._io import IntegrityError
 from gareus.correctness.export import build_export_arrays
@@ -1479,9 +1491,10 @@ def test_schema_required_and_must_cover_active_models():
 
 def test_stored_z_parity_is_checked():
     s = _samples()
-    s["aux_z_00"] = s["aux_z_00"] + 1e-6
+    s["aux_z_00"] = s["aux_z_00"] + 1e-3      # far beyond 1e-6 reduced energy at k = 1 kcal/mol
     with pytest.raises(IntegrityError, match="parity"):
-        aux_z_from_samples(s, SCHEMA, {MODEL.model_sha256: MODEL})
+        aux_z_from_samples(s, SCHEMA, {MODEL.model_sha256: MODEL},
+                           **parity_context(_defn()["windows"], BETA))
 
 
 def test_refuse_vs_exclude_and_report():
@@ -1536,11 +1549,12 @@ Expected: FAIL `ModuleNotFoundError: No module named 'gareus.auxiliary_cv.offlin
 from __future__ import annotations
 
 import json
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 
 from ..correctness._io import IntegrityError
+from ..correctness.bias import KJ_PER_KCAL
 from .evaluate import z_from_dihedrals
 from .model import AuxModel
 from .sample_schema import AuxSampleSchema
@@ -1557,8 +1571,23 @@ def _float_column(samples, name, n) -> np.ndarray:
     return arr
 
 
+def parity_context(windows, beta: float, *, mixed_precision: bool = False) -> dict[str, Any]:
+    """Keyword arguments for aux_z_from_samples from a state table's active aux rows."""
+    k_max: dict[str, float] = {}
+    centers: dict[str, list[float]] = {}
+    for w in windows:
+        if float(w.get("aux_k", 0.0)) > 0:
+            sha = w["aux_model_sha256"]
+            k_max[sha] = max(k_max.get(sha, 0.0), float(w["aux_k"]))
+            centers.setdefault(sha, []).append(float(w["aux_center"]))
+    return {"beta": float(beta), "k_max_kcal": k_max, "centers": centers,
+            "parity_reduced_tol": 1e-4 if mixed_precision else 1e-6}
+
+
 def aux_z_from_samples(samples: Mapping[str, Any], schema: AuxSampleSchema,
-                       models: Mapping[str, AuxModel], *, parity_tol: float = 1e-12) -> dict[str, np.ndarray]:
+                       models: Mapping[str, AuxModel], *, beta: float,
+                       k_max_kcal: Mapping[str, float], centers: Mapping[str, Sequence[float]],
+                       parity_reduced_tol: float = 1e-6) -> dict[str, np.ndarray]:
     n = len(np.asarray(samples["cv1"]))
     missing = [c for c in schema.torsion_columns if c not in samples]
     if missing:
@@ -1572,9 +1601,18 @@ def aux_z_from_samples(samples: Mapping[str, Any], schema: AuxSampleSchema,
         z = z_from_dihedrals(theta[:, schema.model_basis_index(models[sha])], models[sha]).astype(np.float64)
         if col in samples:
             stored = _float_column(samples, col, n)
+            if np.any(np.isfinite(stored) != np.isfinite(z)):
+                raise IntegrityError(f"stored {col} fails offline parity against model {sha} (finite mismatch)")
             both = np.isfinite(stored) & np.isfinite(z)
-            if np.any(np.isfinite(stored) != np.isfinite(z)) or np.any(np.abs(stored[both] - z[both]) > parity_tol):
-                raise IntegrityError(f"stored {col} fails offline parity against model {sha}")
+            k = float(k_max_kcal.get(sha, 0.0))
+            if k > 0 and np.any(both):
+                dz = np.abs(stored[both] - z[both])
+                cs = np.asarray(centers[sha], dtype=np.float64)
+                dev = np.max(np.abs(z[both][:, None] - cs[None, :]), axis=1)
+                du = float(beta) * KJ_PER_KCAL * k * dz * (dev + dz)
+                if np.any(du > parity_reduced_tol):
+                    raise IntegrityError(f"stored {col} fails offline parity against model {sha}: "
+                                         f"max reduced-energy disagreement {du.max():.3g} > {parity_reduced_tol:g}")
         out[sha] = z
     return out
 
@@ -1636,7 +1674,10 @@ Right after `envelope = ...`, add:
         if uncovered:
             raise IntegrityError(f"aux_sample_schema does not record active model(s) {uncovered}")
         models = {sha: AuxModel.from_mapping(table.definition["aux_models"][sha]) for sha in aux_sample_schema.model_shas}
-        aux_z = aux_z_from_samples(samples, aux_sample_schema, models)
+        from ..auxiliary_cv.offline import parity_context
+        aux_z = aux_z_from_samples(samples, aux_sample_schema, models,
+                                   **parity_context(table.windows, beta,
+                                                    mixed_precision=bool(table.definition.get("mixed_precision", False))))
     extra = {"aux_z": aux_z} if aux_z is not None else {}
 ```
 
@@ -1912,7 +1953,7 @@ In `gareus/mbar_analysis/loaders.py` `load_parquet`:
     aux_z = None
     if active_aux:
         from gareus.auxiliary_cv.model import AuxModel
-        from gareus.auxiliary_cv.offline import aux_z_from_samples, segment_aux_schemas
+        from gareus.auxiliary_cv.offline import aux_z_from_samples, parity_context, segment_aux_schemas
         from gareus.correctness._io import IntegrityError
         schemas = segment_aux_schemas(prod)
         seg_col = np.asarray(samples['segment_id']).astype(str)
@@ -1932,7 +1973,11 @@ In `gareus/mbar_analysis/loaders.py` `load_parquet`:
         schema = distinct.pop()
         state = payload.get('state_definition') or {}
         models = {sha: AuxModel.from_mapping(state['aux_models'][sha]) for sha in schema.model_shas}
-        aux_z = aux_z_from_samples(samples, schema, models)
+        # beta must already be known here: if load_parquet infers temperature/beta later, move that
+        # inference above this block (it reads only run metadata, not the filtered samples).
+        aux_z = aux_z_from_samples(samples, schema, models,
+                                   **parity_context(state['windows'], beta,
+                                                    mixed_precision=bool(payload.get('mixed_precision', False))))
         meta['aux_models'] = list(schema.model_shas)
         meta['aux_feature_segments'] = [s for s in present if s not in missing]
 ```
