@@ -6846,7 +6846,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 with (out_dir / "explicit_2d_window_table_loaded.csv").open("w", newline="") as handle:
                     norm_rows = window_metadata.get("normalized_rows", []) if isinstance(window_metadata, dict) else []
                     if norm_rows:
-                        writer = csv.DictWriter(handle, fieldnames=list(norm_rows[0].keys()), extrasaction="ignore")
+                        _fields = list(dict.fromkeys(k for row in norm_rows for k in row.keys()))
+                        writer = csv.DictWriter(handle, fieldnames=_fields, extrasaction="ignore")
                         writer.writeheader()
                         writer.writerows(norm_rows)
                 write_json(out_dir / "explicit_2d_window_table_loaded.json", _json_ready(window_metadata))
