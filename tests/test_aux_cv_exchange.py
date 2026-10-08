@@ -147,3 +147,21 @@ def test_auxiliary_carrier_sees_every_occupied_state_as_a_candidate():
                                                replica_of_window=replica_of_window)
     assert sorted(prop["windows"].tolist()) == list(range(n))
     assert np.all(prop["probabilities"] > 0.0)
+
+
+def test_production_gibbs_proposal_offers_every_state_with_an_auxiliary_row():
+    """Drive production gibbs_propose_one_replica: no mask, every state is a candidate with p > 0."""
+    from gareus.production import gibbs_propose_one_replica
+    n = 4
+    bias = _aux_bias(n, True)
+    seen = []
+
+    def choose(k, probs):
+        seen.append((int(k), np.asarray(probs, dtype=float).copy()))
+        return 0
+
+    gibbs_propose_one_replica(bias, BETA, np.arange(n), np.arange(n), 2, choose)
+    assert len(seen) == 1
+    k, probs = seen[0]
+    assert k == n
+    assert probs.shape == (n,) and np.all(probs > 0.0)

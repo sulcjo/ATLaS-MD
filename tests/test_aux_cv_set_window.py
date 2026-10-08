@@ -64,7 +64,7 @@ def test_missing_aux_globals_raise():
     s.addForce(f)
     ctx = mm.Context(s, mm.VerletIntegrator(0.001), mm.Platform.getPlatformByName("Reference"))
     _ctx, rt, _unit = _ctx_and_runtime()
-    with pytest.raises(Exception):
+    with pytest.raises(mm.OpenMMException, match="aux"):
         set_window(ctx, [0.0, 0.0], [0.0, 0.0], 1, aux_state=rt)
 
 
