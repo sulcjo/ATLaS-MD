@@ -493,6 +493,27 @@ def finalize_segment(
         registry.seal_segment(seg_id, absolute_end_step=end_step, status="interrupted")
 
 
+def reseal_parent_for_resume(registry: "SegmentRegistry", parent_segment_id: Optional[str],
+                             checkpoint_absolute_step: int) -> Optional[Dict[str, Any]]:
+    """On resume of an AUXILIARY run, cut a non-complete parent segment back to its checkpoint.
+
+    ``finalize_segment`` seals an exception exit at the crash step, and a killed job leaves the
+    parent ``running``. Either way, rows after the checkpoint come from a state that was rolled
+    back; the resumed segment re-runs those steps. Without this cut they would be pooled twice and
+    the event ledger would hold duplicate (step, attempt_seq). Legacy runs keep their own seal
+    (production resume branch, ruling B4).
+    """
+    seg = registry.get_segment(parent_segment_id) if parent_segment_id is not None else None
+    if seg is None or seg.get("status") not in ("running", "interrupted"):
+        return None
+    previous_end = seg.get("end_step")
+    cut = int(checkpoint_absolute_step) if previous_end is None else min(int(previous_end), int(checkpoint_absolute_step))
+    previous_status = seg.get("status")
+    registry.seal_segment(parent_segment_id, absolute_end_step=cut, status="interrupted")
+    return {"segment_id": parent_segment_id, "previous_status": previous_status,
+            "previous_end_step": previous_end, "end_step": cut}
+
+
 class WindowSnapshot:
     """Writes a per-segment window definition snapshot.
 

@@ -32,7 +32,7 @@ import numpy as np
 from .branding import product_label
 from .io import BufferedCsvDictWriter, write_json, read_json_file, _json_ready, acquire_run_lock
 from .logger import DistanceLogger, is_gamd_production_phase
-from .store import ParquetSampleWriter, ParquetExchangeWriter, SegmentRegistry, WindowSnapshot, parse_gamd_boost_components, finalize_segment
+from .store import ParquetSampleWriter, ParquetExchangeWriter, SegmentRegistry, WindowSnapshot, parse_gamd_boost_components, finalize_segment, reseal_parent_for_resume
 from .progress import GuiProgressSink, release_openmm_contexts
 from .lifecycle import _graceful_shutdown, _register_graceful_shutdown
 from .units import kcal_to_kj, kcal_a2_to_kj_nm2
@@ -8892,7 +8892,17 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 # Seal the previous crashed segment: rows beyond the checkpoint
                 # step have wrong window_id labels (exchange state was rolled back)
                 # and must be excluded from MBAR analysis.
-                if _parent_was_running and _parent_seg_id is not None:
+                if getattr(args, "_aux_runtime", None) is not None:
+                    # Auxiliary runs only (ruling B4): also cut a parent that an exception exit sealed
+                    # at its crash step, so no post-checkpoint row or ledger event is pooled twice.
+                    _reseal_record = reseal_parent_for_resume(
+                        _seg_registry, _parent_seg_id, int(manifest.get("absolute_step", 0)))
+                    if _reseal_record is not None and _reseal_record["previous_end_step"] not in (
+                            None, _reseal_record["end_step"]):
+                        print(f"    Resume: parent segment {_reseal_record['segment_id']} re-sealed at checkpoint "
+                              f"step {_reseal_record['end_step']} (was {_reseal_record['previous_status']} at "
+                              f"{_reseal_record['previous_end_step']}); later rows were rolled back.", flush=True)
+                elif _parent_was_running and _parent_seg_id is not None:
                     _seg_registry.seal_segment(
                         _parent_seg_id,
                         absolute_end_step=int(manifest.get("absolute_step", 0)),
