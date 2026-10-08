@@ -28,6 +28,12 @@ def physical_system_sha256(openmm, system) -> str:
     the state definition (fixed_box_vectors_nm for NVT; a sample variable for NPT).
     """
     copy = openmm.XmlSerializer.deserialize(openmm.XmlSerializer.serialize(system))
+    # Barostats are ensemble machinery, not the potential: the ensemble and pressure live in the state
+    # definition, and the hash must not depend on whether a barostat was added before or after it is
+    # taken (native MonteCarloBarostat in create_system vs the biased-MC owner; Task 13 carry-over 7).
+    for i in reversed(range(copy.getNumForces())):
+        if "Barostat" in copy.getForce(i).__class__.__name__:
+            copy.removeForce(i)
     copy.setDefaultPeriodicBoxVectors(openmm.Vec3(1, 0, 0), openmm.Vec3(0, 1, 0), openmm.Vec3(0, 0, 1))
     # The serializer stamps the OpenMM release (<System openmmVersion="...">); an OpenMM update alone must
     # not make an auxiliary run unresumable (kernel identity and parity checks cover physics changes).
@@ -41,14 +47,19 @@ def solvated_start_topology_identities(out_dir, model) -> tuple[str, str]:
     Both identities are read from ``<out_dir>/01_solvated_start.pdb`` -- the file setup writes and a resume
     rebuilds its topology from (``checkpoints.py``) -- so a fresh run and its resume hash the same topology.
     """
-    from openmm import app
     from .checkpoint import topology_identity_sha256
     from .runtime import canonical_topology_sha256
+    topology = solvated_start_topology(out_dir)
+    return canonical_topology_sha256(topology, model), topology_identity_sha256(topology)
+
+
+def solvated_start_topology(out_dir):
+    """The topology of ``<out_dir>/01_solvated_start.pdb`` (missing file -> IntegrityError)."""
+    from openmm import app
     path = Path(out_dir) / SOLVATED_START_PDB
     if not path.is_file():
         raise IntegrityError(f"auxiliary run needs {path} for its topology identity (missing)")
-    topology = app.PDBFile(str(path)).topology
-    return canonical_topology_sha256(topology, model), topology_identity_sha256(topology)
+    return app.PDBFile(str(path)).topology
 
 
 def _path_stem(key: str) -> str:

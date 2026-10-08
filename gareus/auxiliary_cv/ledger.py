@@ -77,3 +77,50 @@ def replay_assignments(events: Mapping[str, np.ndarray], start_assignments: Sequ
         if assignment_sha256(current) != str(sha[n]):
             raise IntegrityError(f"{label}: assignment checksum after the event does not match the ledger")
     return current
+
+
+def _first_duplicate(keys: np.ndarray):
+    """Index pair (first, second) of the first repeated row of an (n, 2) int key array, else None."""
+    if keys.shape[0] < 2:
+        return None
+    order = np.lexsort((keys[:, 1], keys[:, 0]))
+    sk = keys[order]
+    same = np.flatnonzero(np.all(sk[1:] == sk[:-1], axis=1))
+    if same.size == 0:
+        return None
+    a, b = order[same[0]], order[same[0] + 1]
+    return int(min(a, b)), int(max(a, b))
+
+
+def _segments_of(data, rows) -> list[str]:
+    seg = data.get("segment_id")
+    if seg is None:
+        return []
+    return sorted({str(np.asarray(seg, dtype=object)[r]) for r in rows})
+
+
+def refuse_duplicate_event_keys(events: Mapping[str, np.ndarray]) -> None:
+    """Refuse a pooled exchange ledger holding one (step, attempt_seq) twice (Task 13 carry-over 3).
+
+    Rows without an ``attempt_seq`` (legacy, non-event rows) carry no ordered key and are not compared.
+    A duplicate means two segments replay the same exchange decision (e.g. a pooled crashed parent and
+    its restarted child), so no permutation chain can be rebuilt from the ledger.
+    """
+    if not events or "attempt_seq" not in events or "step" not in events:
+        return
+    seq = events["attempt_seq"]
+    present = ~np.ma.getmaskarray(seq) if np.ma.isMaskedArray(seq) else np.ones(len(seq), dtype=bool)
+    seq_f = np.asarray(np.ma.getdata(seq), dtype=np.float64)
+    present &= np.isfinite(seq_f)
+    rows = np.flatnonzero(present)
+    if rows.size < 2:
+        return
+    step = np.asarray(np.ma.getdata(events["step"])).astype(np.int64)
+    keys = np.stack([step[rows], seq_f[rows].astype(np.int64)], axis=1)
+    dup = _first_duplicate(keys)
+    if dup is not None:
+        a, b = rows[dup[0]], rows[dup[1]]
+        raise IntegrityError(f"duplicate (step, attempt_seq) in the exchange ledger: step {int(step[a])}, "
+                             f"attempt_seq {int(keys[dup[0], 1])} in segment(s) {_segments_of(events, (a, b))}; "
+                             "two segments record the same exchange decision (a pooled crashed parent and its "
+                             "restarted child?) -- repair the segment registry before resuming or pooling")

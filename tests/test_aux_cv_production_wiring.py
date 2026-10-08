@@ -173,12 +173,21 @@ def test_aux_runtime_construction_in_run_gareus_is_gated_by_an_aux_condition():
         for child in ast.iter_child_nodes(node):
             parents[child] = node
     for name in ("add_aux_cv_force", "load_aux_state_table", "aux_snapshot_rows", "check_feature_atoms",
-                 "refuse_aux_population_change", "_check_instances", "canonical_topology_sha256"):
+                 "refuse_aux_population_change", "_check_instances", "canonical_topology_sha256",
+                 # Stage C
+                 "reseal_parent_for_resume", "verify_aux_ledger", "aux_checkpoint_block", "read_aux_parameters",
+                 "aux_table_from_checkpoint", "physical_system_sha256", "build_runtime_state_definition",
+                 "aux_io_runtime", "make_aux_record_observer", "write_event", "event_from_gibbs",
+                 "aux_event_fields", "check_runtime_parity", "check_exchange_boundary_alignment", "parity_context",
+                 "verify_aux_resume", "check_fixed_box", "context_box_nm",
+                 # Task 13 carry-overs
+                 "solvated_start_topology_identities", "check_checkpoint_rows_align", "anchor_ledger_events",
+                 "refuse_duplicate_event_keys", "data_boundary", "embed_cv_definition"):
         for call in _calls(tree, name):
             node, gated = call, False
             while node in parents:
                 node = parents[node]
-                if isinstance(node, ast.If) and "aux" in ast.unparse(node.test):
+                if isinstance(node, (ast.If, ast.IfExp)) and "aux" in ast.unparse(node.test):
                     gated = True
                     break
             assert gated, f"{name} at line {call.lineno} is not under an aux condition"

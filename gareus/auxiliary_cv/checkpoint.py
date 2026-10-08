@@ -128,6 +128,14 @@ def verify_aux_ledger(manifest: Mapping[str, Any], events: Mapping[str, Any]) ->
     if block is None:
         return
     anchor = block["ledger_anchor"]
+    if not events or "step" not in events or len(events["step"]) == 0:
+        # No exchange ran between the anchor and the checkpoint (e.g. SIGTERM before the first exchange,
+        # or a checkpoint interval shorter than the exchange interval): nothing may have moved.
+        start = [int(x) for x in anchor["start_assignments"]]
+        if start != [int(x) for x in manifest["assignments"]]:
+            raise IntegrityError(f"no exchange event in ledger segment {anchor['segment_id']}, yet the checkpoint "
+                                 f"assignment {list(manifest['assignments'])} differs from the anchor's {start}")
+        return
     got = replay_assignments(events, anchor["start_assignments"], after_step=int(anchor["start_step"]),
                              up_to_step=int(manifest["absolute_step"]))
     if [int(x) for x in got] != [int(x) for x in manifest["assignments"]]:
@@ -148,3 +156,27 @@ def aux_table_from_checkpoint(manifest: Mapping[str, Any], *, model):
     return AuxStateTable(model, tuple(float(r.get("aux_center", 0.0)) for r in windows),
                          tuple(float(r["aux_k"]) for r in windows),
                          tuple(dict(r["instance"]) for r in windows))       # v2: an instance on every row
+
+
+def check_checkpoint_rows_align(manifest: Mapping[str, Any], applied_window_key: Sequence[Sequence]) -> None:
+    """The checkpoint's frozen auxiliary table pairs row by row with the windows this resume applies.
+
+    ``applied_window_key`` is ``_aux_window_order_key`` of the resumed centres/k (CV1, and CV2 when
+    present): a row whose restraints differ would pair an auxiliary term with another window's
+    restraints (Task 13 carry-over 9). Inactive axes compare as (0, 0) (``normalize_windows``).
+    """
+    from .runtime_definition import _RESTRAINT_FIELDS, _applied_rows
+    block = manifest.get("aux")
+    if block is None:
+        raise IntegrityError("checkpoint has no auxiliary block to align the resumed windows with")
+    rows = sorted(canonical_state_definition(block["state_definition"])["windows"], key=lambda r: r["window_id"])
+    applied = _applied_rows(applied_window_key)
+    if len(rows) != len(applied):
+        raise IntegrityError(f"checkpoint auxiliary table has {len(rows)} rows, this resume applies "
+                             f"{len(applied)} windows")
+    for i, (have, want) in enumerate(zip(rows, applied)):
+        diff = [k for k in _RESTRAINT_FIELDS if float(have[k]) != float(want[k])]
+        if diff or int(have["window_id"]) != int(want["window_id"]):
+            raise IntegrityError(f"checkpoint auxiliary table row {i} (window_id {have['window_id']}) {diff} "
+                                 f"{[have[k] for k in diff]} != the resumed window's {[want[k] for k in diff]}; "
+                                 "the auxiliary term would pair with another window's restraints")

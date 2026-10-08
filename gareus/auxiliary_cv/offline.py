@@ -173,6 +173,27 @@ def classify_pool_segments(run_dir, segment_ids) -> dict[str, list[str]]:
     return out
 
 
+def refuse_duplicate_sample_keys(samples: Mapping[str, Any]) -> None:
+    """Refuse an auxiliary sample pool holding one observation key (step, replica) twice.
+
+    Task 13 carry-over 3: an interrupted auxiliary parent that never checkpointed stays pooled up to its
+    crash step while its restarted child re-runs the same steps; the two would count one carrier's
+    observation twice.
+    """
+    from .ledger import _first_duplicate, _segments_of
+    if not samples or "step" not in samples or "replica" not in samples:
+        return
+    step = np.asarray(np.ma.getdata(samples["step"])).astype(np.int64)
+    replica = np.asarray(np.ma.getdata(samples["replica"])).astype(np.int64)
+    dup = _first_duplicate(np.stack([step, replica], axis=1))
+    if dup is not None:
+        a, b = dup
+        raise IntegrityError(f"duplicate (step, replica) observation in the auxiliary sample pool: step {int(step[a])}, "
+                             f"replica {int(replica[a])} in segment(s) {_segments_of(samples, (a, b))}; a crashed "
+                             "parent without a checkpoint and its restarted child overlap -- repair the segment "
+                             "registry (seal the parent abandoned) before pooling")
+
+
 def pool_aux_segments(prod, samples, beta, meta, *, exclude_segments_without_aux_features: bool = False,
                       allow_ineligible_aux_segments: bool = False):
     """load_parquet's auxiliary branch: refuse or exclude segment classes, one eligible fixed state,
@@ -198,6 +219,7 @@ def pool_aux_segments(prod, samples, beta, meta, *, exclude_segments_without_aux
         seg_col = seg_col[keep]
         meta.setdefault("load_notes", []).append(
             f"excluded auxiliary segments without stored features (rows): {dropped}")
+    refuse_duplicate_sample_keys(samples)
     aux_segs = groups["aux"]
     if not aux_segs or seg_col.size == 0:
         raise IntegrityError(f"{prod}: no auxiliary segment with stored features remains to pool")
