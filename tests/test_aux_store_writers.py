@@ -92,3 +92,81 @@ def test_legacy_writer_refuses_aux_segment(tmp_path):
     w.flush()
     with pytest.raises(ParquetManifestError, match="payload schema"):
         ParquetSampleWriter(tmp_path)
+
+
+# ---------------------------------------------------------------- exchange event ledger
+from gareus.auxiliary_cv.ledger import EVENT_KINDS, EXCHANGE_EVENT_SCHEMA, assignment_sha256
+
+#: Pinned on main dc30285 (tmp/verify_C/pins.py).
+LEGACY_EXCHANGE_SCHEMA = ("step: uint64\nreplica_i: uint16\nreplica_j: uint16\nwindow_i: uint16\n"
+                          "window_j: uint16\ndelta_e: float\naccepted: bool")
+LEGACY_EXCHANGE_COLUMNS = [line.split(":")[0] for line in LEGACY_EXCHANGE_SCHEMA.split("\n")]
+
+
+def _event(step, seq, **kw):
+    base = dict(step=step, attempt_seq=seq, selected_replica=0, replica_i=0, replica_j=1, window_i=0,
+                window_j=1, kind="swap", delta_e_kj=-0.25, accepted=True, log_q_forward=np.log(0.4),
+                log_q_reverse=np.log(0.3), p_accept=0.9, energy_version="state_bias_matrix_v3_aux",
+                assignments_after=[1, 0, 2])
+    base.update(kw)
+    return base
+
+
+def test_legacy_exchange_schema_pinned(tmp_path):
+    import pyarrow.parquet as pq
+    from gareus.store import ParquetExchangeWriter
+    w = ParquetExchangeWriter(tmp_path)
+    w.write_exchange(step=5, replica_i=0, replica_j=1, window_i=0, window_j=1, delta_e=0.5, accepted=False)
+    w.close()
+    assert pq.read_table(tmp_path / "data.parquet").schema.to_string(show_schema_metadata=False) == LEGACY_EXCHANGE_SCHEMA
+    assert "payload_schema" not in load_manifest(tmp_path)
+    with pytest.raises(ValueError, match="event"):
+        w.write_event(**_event(6, 0))
+
+
+def test_event_rows_round_trip(tmp_path):
+    import pyarrow.parquet as pq
+    from gareus.store import ParquetExchangeWriter
+    w = ParquetExchangeWriter(tmp_path, event_schema=EXCHANGE_EVENT_SCHEMA)
+    w.write_event(**_event(100, 0))
+    w.write_event(**_event(100, 1, kind="skip", selected_replica=2, replica_i=2, replica_j=2, window_i=2,
+                           window_j=2, accepted=False, assignments_after=[1, 0, 2]))
+    w.close()
+    t = pq.read_table(tmp_path / "data.parquet")
+    assert t.column_names == LEGACY_EXCHANGE_COLUMNS + [
+        "attempt_seq", "selected_replica", "kind", "delta_e_kj", "log_q_forward", "log_q_reverse",
+        "p_accept", "energy_version", "assignment_sha256_after"]
+    assert t.column("attempt_seq").to_pylist() == [0, 1] and t.column("kind").to_pylist() == ["swap", "skip"]
+    assert t.column("assignment_sha256_after").to_pylist()[0] == assignment_sha256([1, 0, 2])
+    assert load_manifest(tmp_path)["payload_schema"] == {"schema": EXCHANGE_EVENT_SCHEMA}
+    with pytest.raises(ValueError, match="write_event"):
+        w.write_exchange(step=5, replica_i=0, replica_j=1, window_i=0, window_j=1, delta_e=0.5, accepted=False)
+    assert EVENT_KINDS == ("swap", "stay", "no_candidates", "skip")
+
+
+@pytest.mark.parametrize("bad", [dict(kind="teleport"), dict(attempt_seq=-1),
+                                 dict(kind="stay", accepted=True), dict(kind="skip", accepted=True),
+                                 dict(energy_version=""), dict(delta_e_kj="x"), dict(assignments_after=["a"]),
+                                 dict(replica_i=None)])
+def test_event_validation(tmp_path, bad):
+    from gareus.store import ParquetExchangeWriter
+    w = ParquetExchangeWriter(tmp_path, event_schema=EXCHANGE_EVENT_SCHEMA)
+    with pytest.raises((ValueError, TypeError)):
+        w.write_event(**_event(1, 0, **bad))
+    assert not any(w._buf.values())  # no ragged buffer after a refused row
+    w.write_event(**_event(2, 1))
+    w.close()
+
+
+def test_event_consolidation_sorts_by_step_then_seq_and_schema_mismatch_refused(tmp_path):
+    import pyarrow.parquet as pq
+    from gareus.store import ParquetExchangeWriter
+    w = ParquetExchangeWriter(tmp_path, flush_rows=1, event_schema=EXCHANGE_EVENT_SCHEMA)
+    for step, seq in ((200, 1), (100, 1), (100, 0), (200, 0)):
+        w.write_event(**_event(step, seq))
+    w.close()
+    t = pq.read_table(tmp_path / "data.parquet")
+    assert list(zip(t.column("step").to_pylist(), t.column("attempt_seq").to_pylist())) == [
+        (100, 0), (100, 1), (200, 0), (200, 1)]
+    with pytest.raises(ParquetManifestError, match="payload schema"):
+        ParquetExchangeWriter(tmp_path)

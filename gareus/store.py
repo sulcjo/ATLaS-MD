@@ -200,7 +200,7 @@ class ParquetSampleWriter:
 class ParquetExchangeWriter:
     """Buffers exchange events and flushes to Parquet chunks."""
 
-    def __init__(self, out_dir: Path, flush_rows: int = 1000) -> None:
+    def __init__(self, out_dir: Path, flush_rows: int = 1000, event_schema: Optional[str] = None) -> None:
         self._out_dir = Path(out_dir)
         self._out_dir.mkdir(parents=True, exist_ok=True)
         self._flush_rows = max(1, flush_rows)
@@ -209,6 +209,43 @@ class ParquetExchangeWriter:
         if self._manifest is None and list(self._out_dir.glob("*.parquet")):
             raise ParquetManifestError(f"cannot append to legacy Parquet segment without manifest: {self._out_dir}")
         self._chunk_idx = (self._manifest["next_chunk_index"] - 1) if self._manifest else 0
+        self._event_schema = event_schema
+        self._payload = {"schema": event_schema} if event_schema is not None else None
+        recorded = (self._manifest or {}).get("payload_schema")
+        if self._manifest and self._manifest["files"] and recorded != self._payload:
+            raise ParquetManifestError(
+                f"payload schema of {self._out_dir} is {recorded!r}; this writer would write {self._payload!r}")
+
+    def write_event(self, *, step, attempt_seq, selected_replica, replica_i, replica_j, window_i, window_j,
+                    kind, delta_e_kj, accepted, log_q_forward, log_q_reverse, p_accept, energy_version,
+                    assignments_after) -> None:
+        from .auxiliary_cv.ledger import EVENT_KINDS, assignment_sha256
+        if self._event_schema is None:
+            raise ValueError("write_event needs a writer constructed with event_schema")
+        if kind not in EVENT_KINDS:
+            raise ValueError(f"exchange event kind must be one of {EVENT_KINDS}, got {kind!r}")
+        if int(attempt_seq) < 0:
+            raise ValueError("attempt_seq must be >= 0")
+        if kind != "swap" and bool(accepted):
+            raise ValueError("only a swap event can be accepted")
+        if not isinstance(energy_version, str) or not energy_version:
+            raise ValueError("exchange event needs its energy/schema version")
+        # Convert every value before touching a buffer: a bad row must not leave ragged columns.
+        delta = float(delta_e_kj)
+        row = {
+            "step": int(step), "replica_i": int(replica_i), "replica_j": int(replica_j),
+            "window_i": int(window_i), "window_j": int(window_j), "delta_e": delta,
+            "accepted": bool(accepted), "attempt_seq": int(attempt_seq),
+            "selected_replica": int(selected_replica), "kind": kind, "delta_e_kj": delta,
+            "log_q_forward": float(log_q_forward), "log_q_reverse": float(log_q_reverse),
+            "p_accept": float(p_accept), "energy_version": energy_version,
+            "assignment_sha256_after": assignment_sha256(assignments_after),
+        }
+        b = self._buf
+        for name, value in row.items():
+            b[name].append(value)
+        if len(b["step"]) >= self._flush_rows:
+            self.flush()
 
     def write_exchange(
         self,
@@ -220,6 +257,8 @@ class ParquetExchangeWriter:
         delta_e: float,
         accepted: bool,
     ) -> None:
+        if self._event_schema is not None:
+            raise ValueError("event-mode writer requires write_event (ordered ledger), not write_exchange")
         b = self._buf
         b["step"].append(step)
         b["replica_i"].append(replica_i)
@@ -247,6 +286,20 @@ class ParquetExchangeWriter:
             "delta_e":   pa.array(b["delta_e"],   type=pa.float32()),
             "accepted":  pa.array(b["accepted"],  type=pa.bool_()),
         })
+        if self._event_schema is not None:
+            extra = {
+                "attempt_seq": pa.array(b["attempt_seq"], type=pa.uint32()),
+                "selected_replica": pa.array(b["selected_replica"], type=pa.int32()),
+                "kind": pa.array(b["kind"], type=pa.string()),
+                "delta_e_kj": pa.array(b["delta_e_kj"], type=pa.float64()),
+                "log_q_forward": pa.array(b["log_q_forward"], type=pa.float64()),
+                "log_q_reverse": pa.array(b["log_q_reverse"], type=pa.float64()),
+                "p_accept": pa.array(b["p_accept"], type=pa.float64()),
+                "energy_version": pa.array(b["energy_version"], type=pa.string()),
+                "assignment_sha256_after": pa.array(b["assignment_sha256_after"], type=pa.string()),
+            }
+            for name, column in extra.items():
+                tbl = tbl.append_column(name, column)
 
         self._chunk_idx += 1
         chunk_path = self._out_dir / f"chunk_{self._chunk_idx:06d}.parquet"
@@ -273,6 +326,7 @@ class ParquetExchangeWriter:
             kind="exchanges",
             record=record,
             next_chunk_index=self._chunk_idx + 1,
+            payload_schema=self._payload,
         )
 
         for lst in b.values():
@@ -292,7 +346,10 @@ class ParquetExchangeWriter:
         import pyarrow.dataset as ds
         import pyarrow.parquet as pq
         tbl = ds.dataset(chunks, format="parquet").to_table()
-        tbl = tbl.sort_by([("step", "ascending")])
+        keys = [("step", "ascending")]
+        if self._event_schema is not None:
+            keys.append(("attempt_seq", "ascending"))
+        tbl = tbl.sort_by(keys)
         has_compact = any(str(r["path"]).startswith("data") for r in source_records)
         name = f"data_{manifest['generation'] + 1:06d}.parquet" if has_compact else "data.parquet"
         output = self._out_dir / name
@@ -304,7 +361,8 @@ class ParquetExchangeWriter:
         _fsync_dir(self._out_dir)
         record = file_record(output, rows=tbl.num_rows, first_step=int(tbl["step"][0].as_py()), last_step=int(tbl["step"][-1].as_py()))
         self._manifest = replace_files_in_manifest(
-            self._out_dir, kind="exchanges", records=[record], next_chunk_index=self._chunk_idx + 1
+            self._out_dir, kind="exchanges", records=[record], next_chunk_index=self._chunk_idx + 1,
+            payload_schema=self._payload,
         )
         for source in chunks:
             source.unlink(missing_ok=True)
