@@ -5259,7 +5259,7 @@ def save_production_checkpoint(out_dir: Path, sims: list, assignments: list[int]
                                primary_cv_metadata=None, openmm_version: Optional[str] = None,
                                platform_name: Optional[str] = None,
                                drivers: Optional[list] = None, pool=None, npt_runtime: Optional[NptRunContext] = None,
-                               keep_generations: int = 0) -> None:
+                               keep_generations: int = 0, aux_block: Optional[dict] = None) -> None:
     """Write restart checkpoints for all production replicas.
 
     The OpenMM binary checkpoint is platform/version specific but it is the most
@@ -5366,6 +5366,8 @@ def save_production_checkpoint(out_dir: Path, sims: list, assignments: list[int]
         manifest["secondary_cv_centers"] = [float(x) for x in secondary_cv_centers]
     if secondary_cv_k_kcal_list is not None:
         manifest["secondary_cv_k_kcal_mol"] = [float(x) for x in secondary_cv_k_kcal_list]
+    if aux_block is not None:
+        manifest["aux"] = aux_block
     from .correctness.checkpoint_store import publish_generation
     publish_generation(out_dir, replica_payloads, manifest, keep_generations=int(keep_generations or 0))
 
@@ -5525,7 +5527,7 @@ def load_production_checkpoint(out_dir: Path, sims: list, centers_nm, ks_kj_nm2,
                                state_lambdas=None, k0max_by_channel: Optional[dict] = None,
                                drivers: Optional[list] = None, pool=None,
                                npt_runtime: Optional[NptRunContext] = None,
-                               args=None) -> Optional[dict]:
+                               args=None, aux_pre_apply=None) -> Optional[dict]:
     """Load a production checkpoint manifest and all replica checkpoints if available.
 
     state_lambdas/k0max_by_channel need not both be given: k0max_by_channel is None
@@ -5625,6 +5627,10 @@ def load_production_checkpoint(out_dir: Path, sims: list, centers_nm, ks_kj_nm2,
     assignments = [int(x) for x in manifest.get("assignments", list(range(len(sims))))]
     if len(assignments) != len(sims):
         raise RuntimeError("Checkpoint assignment count does not match replica count")
+    if aux_pre_apply is not None:
+        # Parameters as restored by loadCheckpoint, before any re-apply. The callable reads each
+        # replica's Context on that replica's own worker (pool.submit affinity) when a pool exists.
+        aux_pre_apply(manifest, assignments)       # parameters as restored by loadCheckpoint
 
     def _apply_assignment(r: int):
         sim = sims[r]
