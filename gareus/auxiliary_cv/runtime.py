@@ -12,7 +12,11 @@ import json
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
+import numpy as np
+
 from ..correctness._io import IntegrityError
+from .evaluate import z_from_positions
+from .features import active_feature_mask, openmm_dihedrals, unique_torsions
 from .force import AuxForceInfo, build_aux_force, set_aux_parameters
 from .state_table import AuxStateTable
 
@@ -138,3 +142,60 @@ if __name__ == "__main__":  # python -m gareus.auxiliary_cv.runtime topology-sha
     if len(sys.argv) != 4 or sys.argv[1] != "topology-sha":
         raise SystemExit("usage: python -m gareus.auxiliary_cv.runtime topology-sha PDB MODEL")
     print(canonical_topology_sha256_from_pdb(sys.argv[2], AuxModel.load(sys.argv[3])))
+
+
+def observe_aux_z(context, runtime: AuxRuntime, *, force=None, positions_nm=None) -> float:
+    """z of one carrier under the phase's auxiliary model, whatever state it occupies.
+
+    Never raises on a non-finite value: the observation is recorded as is, and
+    ``aux_bias_matrix_kcal`` refuses it when an active state needs it (sham arms may record NaN).
+    The fast path cannot see a degenerate torsion (OpenMM returns a finite theta there).
+    """
+    if (force is None) == (positions_nm is None):
+        raise ValueError("observe_aux_z needs exactly one of force= (fast path) or positions_nm= (slow path)")
+    model = runtime.table.model
+    if force is not None:
+        values = np.asarray(force.getCollectiveVariableValues(context), dtype=np.float64)
+        return float((model.offset + values.sum()) / model.scale)
+    return float(z_from_positions(positions_nm, model)[0])
+
+
+def check_aux_geometry(positions_nm, runtime: AuxRuntime, *, replica=None) -> None:
+    """Fail closed when a model torsion is degenerate (spec 3.3).
+
+    Same rule as Stage A ``openmm_dihedrals`` (NaN when |b1 x b2|^2 or |b2 x b3|^2 < DEGENERATE_CROSS2_NM4),
+    over the torsions that carry weight: those with at least one nonzero-coefficient feature
+    (Stage A ``active_feature_mask``). Stage A's evaluator and the force both ignore zero-weight
+    torsions, so z stays defined when only a zero-weight torsion is degenerate.
+    """
+    model = runtime.table.model
+    all_quads, idx = unique_torsions(model)
+    active_t = sorted(set(idx[active_feature_mask(model)].tolist()))
+    quads = [all_quads[t] for t in active_t]
+    theta = openmm_dihedrals(positions_nm, quads)[0]
+    if np.isnan(theta).any():
+        bad = [quads[t] for t in np.flatnonzero(np.isnan(theta))]
+        where = "" if replica is None else f" on replica {replica}"
+        raise AuxObservationError(f"degenerate auxiliary torsion(s) {bad}{where} while auxiliary states are "
+                                  "active; failing the segment (spec 3.3)")
+
+
+def make_aux_z_observer(runtime: AuxRuntime, *, use_fast_path: bool, fast_forces, unit):
+    """The single per-carrier z observer for both the sample and the exchange path.
+
+    With any active state: one positions read, a geometry check, then the fast-path z (the force's
+    own value) or the slow-path z. With no active state: positions only on the slow path; never raises.
+    """
+    any_active = any(float(k) > 0.0 for k in runtime.table.k_kcal)
+
+    def observe(r, sim) -> float:
+        pos = None
+        if any_active or not use_fast_path:
+            pos = sim.context.getState(getPositions=True).getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+        if any_active:
+            check_aux_geometry(pos, runtime, replica=r)
+        if use_fast_path:
+            return observe_aux_z(sim.context, runtime, force=fast_forces[r])
+        return observe_aux_z(sim.context, runtime, positions_nm=pos)
+
+    return observe
