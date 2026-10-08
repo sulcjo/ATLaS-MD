@@ -84,6 +84,21 @@ def test_topology_check_accepts_real_backbone_and_rejects_shifted_atoms():
         check_feature_atoms(m_bad, d["topology"])
 
 
+def test_topology_check_refuses_torsion_spanning_two_chains():
+    from openmm import app
+    top = app.Topology()
+    chain_a, chain_b = top.addChain(), top.addChain()
+    r0 = top.addResidue("ALA", chain_a)
+    r1 = top.addResidue("ALA", chain_b)       # consecutive residue index, different chain
+    el = app.element
+    top.addAtom("C", el.carbon, r0)
+    for name, e in (("N", el.nitrogen), ("CA", el.carbon), ("C", el.carbon)):
+        top.addAtom(name, e, r1)
+    m = AuxModel.from_mapping(model_payload([(0, 1, 2, 3)], [1.0, 0.0], blocks=["phi"]))
+    with pytest.raises(IntegrityError, match="chain"):
+        check_feature_atoms(m, top)
+
+
 def test_topology_check_compares_topology_digest():
     d = dipeptide()
     m = AuxModel.from_mapping(model_payload(d["quads"], [1.0] + [0.0] * (2 * len(d["quads"]) - 1),

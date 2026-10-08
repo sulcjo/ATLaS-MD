@@ -93,3 +93,6 @@ def check_feature_atoms(model: AuxModel, topology, *, topology_sha256: str | Non
         ok = (res[0] + 1 == res[1] == res[2] == res[3]) if block == "phi" else (res[0] == res[1] == res[2] == res[3] - 1)
         if not ok:
             raise IntegrityError(f"feature {feature.name}: atoms span residues {res}, not one {block}")
+        chains = [atoms[i].residue.chain.index for i in quad]
+        if len(set(chains)) != 1:
+            raise IntegrityError(f"feature {feature.name}: atoms span chains {chains}, not one {block}")
