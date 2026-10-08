@@ -8010,6 +8010,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         pymbar_metadata["samples_columns_for_mbar"]["auxiliary_cv_bias_note"] = (
             "auxiliary-CV runs: umbrella_bias_kcal_mol / umbrella_bias_kj_mol and every "
             "umbrella_bias_all_windows_* total include the auxiliary restraint A_s of each state; "
+            "umbrella_reduced_bias and umbrella_reduced_bias_all_windows_json also include it; "
+            "the sample `potential` column includes A_s (physical_energy_groups include the aux group); "
             "sampled_umbrella_bias_kj and the distance/secondary component vectors do not.")
     write_json(out_dir / "umbrella_pymbar_metadata.json", pymbar_metadata)
     print(f"PyMBAR umbrella constants written to {out_dir / 'umbrella_windows.csv'} and {out_dir / 'umbrella_pymbar_metadata.json'}")
