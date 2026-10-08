@@ -30,6 +30,14 @@ def _geometries():
 GEOMETRIES = _geometries()
 
 
+@pytest.mark.parametrize("shape", [(1, 4), (1, 1), (3,), ()], ids=["feature-width", "narrow", "1d", "0d"])
+def test_z_from_dihedrals_refuses_wrong_theta_shape(shape):
+    # 2 unique torsions -> theta must be (n_frames, 2); feature-width (4) and narrower must not slip through
+    m = AuxModel.from_mapping(model_payload([(0, 1, 2, 3), (1, 2, 3, 4)], [1.0, 0.5, -0.3, 0.2]))
+    with pytest.raises(IntegrityError, match="theta"):
+        z_from_dihedrals(np.zeros(shape), m)
+
+
 def test_z_matches_hand_formula():
     m = AuxModel.from_mapping(model_payload([(0, 1, 2, 3)], [2.0, -1.0], offset=0.5, scale=2.0))
     theta = np.array([[0.7]])

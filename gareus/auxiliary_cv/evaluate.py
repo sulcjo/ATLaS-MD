@@ -19,6 +19,16 @@ from .model import AuxModel
 
 
 def z_from_dihedrals(theta, model: AuxModel) -> np.ndarray:
+    """z per frame from OpenMM theta (radians), shape (n_frames, n_unique).
+
+    Columns are the model's unique torsions in the first-appearance order of
+    ``unique_torsions(model)``; any other shape is refused.
+    """
+    theta = np.asarray(theta, dtype=np.float64)
+    n_unique = len(unique_torsions(model)[0])
+    if theta.ndim != 2 or theta.shape[1] != n_unique:
+        raise IntegrityError(f"theta must have shape (n_frames, {n_unique}) (one column per unique "
+                             f"torsion), got {theta.shape}")
     active = active_feature_mask(model)
     feats = feature_values(theta, model)[:, active]
     coeffs = np.asarray(model.coefficients, dtype=np.float64)[active]
