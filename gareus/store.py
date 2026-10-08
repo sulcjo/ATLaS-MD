@@ -33,7 +33,7 @@ class ParquetSampleWriter:
     so partial flushes on crash leave no corrupt files.
     """
 
-    def __init__(self, out_dir: Path, flush_rows: int = 5000) -> None:
+    def __init__(self, out_dir: Path, flush_rows: int = 5000, aux_schema=None, aux_runtime=None) -> None:
         self._out_dir = Path(out_dir)
         self._out_dir.mkdir(parents=True, exist_ok=True)
         self._flush_rows = max(1, flush_rows)
@@ -42,6 +42,18 @@ class ParquetSampleWriter:
         if self._manifest is None and list(self._out_dir.glob("*.parquet")):
             raise ParquetManifestError(f"cannot append to legacy Parquet segment without manifest: {self._out_dir}")
         self._chunk_idx = (self._manifest["next_chunk_index"] - 1) if self._manifest else 0
+        self._aux_schema = aux_schema
+        self._aux_payload = None
+        if aux_schema is not None:
+            if aux_runtime is None:
+                raise ValueError("an aux sample writer needs aux_runtime={'platform', 'precision'}")
+            from .auxiliary_cv.sample_schema import payload_with_runtime
+            self._aux_payload = payload_with_runtime(aux_schema, aux_runtime)
+        recorded = (self._manifest or {}).get("payload_schema")
+        populated = bool(self._manifest and self._manifest["files"])
+        if populated and recorded != self._aux_payload:
+            raise ParquetManifestError(
+                f"payload schema of {self._out_dir} is {recorded!r}; this writer would write {self._aux_payload!r}")
 
     def write_sample(
         self,
@@ -57,7 +69,16 @@ class ParquetSampleWriter:
         v_pep: float = float("nan"),
         v_dih: float = float("nan"),
         gamd_lambda: float = 0.0,
+        aux_z=None,
+        torsions=None,
     ) -> None:
+        if self._aux_schema is None:
+            if aux_z is not None or torsions is not None:
+                raise ValueError("aux_z/torsions given to a writer without an aux sample schema")
+        else:
+            nz, nt = len(self._aux_schema.z_columns), len(self._aux_schema.torsion_columns)
+            if aux_z is None or torsions is None or len(aux_z) != nz or len(torsions) != nt:
+                raise ValueError(f"aux writer needs aux_z ({nz}) and torsions ({nt}) on every sample")
         b = self._buf
         b["step"].append(step)
         b["replica"].append(replica)
@@ -71,6 +92,12 @@ class ParquetSampleWriter:
         b["v_pep_kj_mol"].append(v_pep)
         b["v_dih_kj_mol"].append(v_dih)
         b["gamd_lambda"].append(gamd_lambda)
+        if self._aux_schema is not None:
+            b["observation_phase"].append("pre_exchange")
+            for name, value in zip(self._aux_schema.torsion_columns, torsions):
+                b[name].append(float(value))
+            for name, value in zip(self._aux_schema.z_columns, aux_z):
+                b[name].append(float(value))
         if len(b["step"]) >= self._flush_rows:
             self.flush()
 
@@ -95,6 +122,13 @@ class ParquetSampleWriter:
             "v_dih_kj_mol":        pa.array(b["v_dih_kj_mol"],        type=pa.float32()),
             "gamd_lambda":         pa.array(b["gamd_lambda"],         type=pa.float32()),
         })
+        if self._aux_schema is not None:
+            extra = {"observation_phase": pa.array(b["observation_phase"], type=pa.string())}
+            for name in self._aux_schema.torsion_columns + self._aux_schema.z_columns:
+                extra[name] = pa.array(b[name], type=pa.float64())
+            for name, column in extra.items():
+                tbl = tbl.append_column(name, column)
+            tbl = tbl.replace_schema_metadata({b"atlas_aux_samples": json.dumps(self._aux_payload, sort_keys=True).encode()})
 
         self._chunk_idx += 1
         chunk_path = self._out_dir / f"chunk_{self._chunk_idx:06d}.parquet"
@@ -121,6 +155,7 @@ class ParquetSampleWriter:
             kind="samples",
             record=record,
             next_chunk_index=self._chunk_idx + 1,
+            payload_schema=self._aux_payload,
         )
 
         for lst in b.values():
@@ -141,6 +176,8 @@ class ParquetSampleWriter:
         import pyarrow.parquet as pq
         tbl = ds.dataset(chunks, format="parquet").to_table()
         tbl = tbl.sort_by([("step", "ascending"), ("replica", "ascending")])
+        if self._aux_payload is not None:
+            tbl = tbl.replace_schema_metadata({b"atlas_aux_samples": json.dumps(self._aux_payload, sort_keys=True).encode()})
         has_compact = any(str(r["path"]).startswith("data") for r in source_records)
         name = f"data_{manifest['generation'] + 1:06d}.parquet" if has_compact else "data.parquet"
         output = self._out_dir / name
@@ -152,7 +189,8 @@ class ParquetSampleWriter:
         _fsync_dir(self._out_dir)
         record = file_record(output, rows=tbl.num_rows, first_step=int(tbl["step"][0].as_py()), last_step=int(tbl["step"][-1].as_py()))
         self._manifest = replace_files_in_manifest(
-            self._out_dir, kind="samples", records=[record], next_chunk_index=self._chunk_idx + 1
+            self._out_dir, kind="samples", records=[record], next_chunk_index=self._chunk_idx + 1,
+            payload_schema=self._aux_payload,
         )
         for source in chunks:
             source.unlink(missing_ok=True)
