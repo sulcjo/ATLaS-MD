@@ -36,6 +36,14 @@ and treat its report as the result. A Bash hook in this harness refuses commands
 - z = (offset + Σ_j c_j f_j) / scale. `scale` is the frozen positive normalisation divisor (the c10 candidate records 3.181); Stage D ports the recovered artifact into this form and must document how its own normalisation maps onto `offset`/`coefficients`/`scale`. `periodic_imaging` is `"none"` (the only supported value): torsion atoms use raw Context coordinates and every sub-force calls `setUsesPeriodicBoundaryConditions(False)`.
 - Field-name deviation (spec Section 5 proposes `aux_k_kcal_mol`): the canonical field is `aux_k`, in kcal/mol per z², like `k1`/`k2`. This is recorded as an intentional deviation; Stages B/C use `aux_k`.
 - Roles (spec 1.1, 5, 11.1): `state_role` must agree with the energy. `auxiliary` ⇔ `aux_k > 0`; `ordinary` and `sham` require `aux_k == 0`. Every v2 row carries `instance` with a unique `state_instance_id`; `spawn_parent_state_id` is the parent's `state_instance_id` (string) or null, and must exist in the same table.
+- Zero coefficients: only features with a nonzero coefficient enter z, in the evaluator (`active_feature_mask`) exactly as in the force (`build_aux_force` skips them). A degenerate torsion that carries no weight therefore leaves z defined (Tasks 3 and 4 pin evaluator/force agreement). `unique_torsions(model)` still lists every torsion of the feature schema, so the storage basis (Stage C) is unchanged.
+- Negative centres are valid: z is signed. `finite_number(value, label, *, minimum=None, positive=False)` (`gareus/correctness/bias.py:40`) defaults to `minimum=None`, and every call on a centre passes no minimum; only strengths pass `minimum=0`. Tests pin a negative centre (Tasks 3 and 5).
+- Recorded deviations from the spec (all deliberate, MVP):
+  - field name `aux_k` instead of `aux_k_kcal_mol` (above);
+  - more than one *registered* model is refused, stricter than spec 1.2's "more than one *active*" model;
+  - `spawn_parent_state_id` must name a `state_instance_id` in the same table, stricter than spec 5's "provenance only";
+  - `check_feature_atoms` accepts backbone phi/psi torsions only (C-N-CA-C / N-CA-C-N). Spec 3.2 makes the recovered c10 artifact authoritative over prose; if it contains omega or terminal torsions, Stage D must extend the check (and the feature-schema naming) before porting it. Flagged to Stage D in the Task 7 handoff;
+  - W/B slot pairing is checked only within one table (Task 5); pairing across the W and B arm tables is the Stage D preregistration validator's job.
 - Angle convention (verified 2026-10-07 on OpenMM 8.5.1):
   - θ = OpenMM `CustomTorsionForce` `theta` = −(the tica/swarm angle, `gareus.tica._dihedral_rad`).
   - A feature with `dihedral_sign_convention: "negated"` (what swarm writes, `gareus/swarm/analyze.py:424`) is `trig(-θ)`; `"direct"` is `trig(θ)`.
@@ -45,8 +53,8 @@ and treat its report as the result. A Bash hook in this harness refuses commands
 
 1. **Dihedral wrap at ±π.** A torsion crossing ±π must give continuous sin/cos features, z and force energy. Tasks 2, 3 and 4 pin this from positions (`four_atoms_at(π ± ε)`), through z, to the OpenMM energy.
 2. **Collinear (degenerate) torsion atoms.** z is undefined there. The per-structure evaluator and the gradient must raise `AuxGeometryError`; the vectorised offline evaluator returns NaN for that row so analysis can exclude it with a count (Task 3). The OpenMM force at k = 0 returns E = 0 but NaN forces there (Task 4 documents and pins it). OpenMM also returns a finite energy at k > 0 where the evaluator raises; Stage B must detect degenerate geometry at runtime (spec 3.3).
-3. **One torsion in several features** (its sin and cos, or a phi listed twice). Weights must be applied per feature, not merged by torsion. The Task 4 force and evaluator parity test uses a model with both sin and cos of the same torsion.
-4. **kJ/mol state tables.** `aux_k` must be divided by 4.184 together with k1/k2 when `energy_unit == "kJ/mol"`. The Task 5 test pins this.
+3. **One torsion in several features** (its sin and cos, or a phi listed twice). Weights must be applied per feature, not merged by torsion. Task 4 pins both: the parity test uses sin and cos of the same torsion, and `test_same_torsion_twice_in_one_group_matches_reference` lists one torsion twice in the same (trig, sign) group.
+4. **kJ/mol state tables.** `aux_k` must be divided by 4.184 together with k1/k2 when `energy_unit == "kJ/mol"`, exactly once, also when an already-canonical definition is re-canonicalised by a hash function. Task 5 pins the conversion and its idempotence.
 5. **Mixed sign conventions in one model** (some features `negated`, some `direct`). The force must group sub-CVs by (trig, sign), not by trig alone. The Task 4 parity test covers a mixed model.
 6. **Cosmetic model edits.** Relabelling a model or editing its provenance must change no hash: not `model_sha256`, not the state-definition hash, not any `hamiltonian_sha256`. Task 5 pins this.
 
@@ -578,6 +586,11 @@ def unique_torsions(model: AuxModel):
     return tuple(quads), idx
 
 
+def active_feature_mask(model: AuxModel) -> np.ndarray:
+    """Features with a nonzero coefficient: the only ones the force builds and z depends on."""
+    return np.asarray(model.coefficients, dtype=np.float64) != 0.0
+
+
 def feature_signs(model: AuxModel) -> np.ndarray:
     return np.array([-1.0 if f.dihedral_sign_convention == "negated" else 1.0
                      for f in model.feature_schema.features])
@@ -760,6 +773,26 @@ def test_degenerate_geometry_raises_in_gradient_and_is_nan_offline():
     assert np.isnan(z_from_positions(p, m)[0])
     with pytest.raises(AuxGeometryError):
         z_and_gradient(p, m)
+
+
+def test_degenerate_torsion_with_only_zero_coefficients_does_not_matter():
+    """z depends only on nonzero-coefficient features, exactly like the force (which skips them):
+    a degenerate torsion that carries no weight leaves z defined and finite."""
+    p = np.array([[0, 0, 0], [1, 0, 0], [2, 0, 0], [3, 1, 0], [4, 1, 1]], dtype=float) * 0.1
+    m = AuxModel.from_mapping(model_payload([(0, 1, 2, 3), (1, 2, 3, 4)], [0.0, 0.0, 1.0, 0.5], offset=0.2))
+    z = z_from_positions(p, m)[0]
+    zg, g = z_and_gradient(p, m)
+    assert np.isfinite(z) and zg == pytest.approx(z, abs=1e-12) and np.all(np.isfinite(g))
+    m_live = AuxModel.from_mapping(model_payload([(0, 1, 2, 3), (1, 2, 3, 4)], [0.0, 1e-3, 1.0, 0.5]))
+    with pytest.raises(AuxGeometryError):
+        z_and_gradient(p, m_live)
+
+
+def test_negative_centres_are_allowed():
+    """z is a signed projection: finite_number(center, ...) is called without a minimum
+    (its default is minimum=None), so negative centres are valid."""
+    e = aux_energy_kj(np.array([-1.5]), center=-0.5, k_kcal=2.0)
+    assert e[0] == pytest.approx(0.5 * 2.0 * 4.184 * 1.0, abs=1e-12)
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -775,8 +808,10 @@ Expected: FAIL `ModuleNotFoundError: No module named 'gareus.auxiliary_cv.evalua
 
 z = (offset + sum_j c_j f_j) / scale. Units: positions nm, energies kJ/mol, forces kJ/mol/nm,
 k given in kcal/mol per z^2 (converted exactly once by KJ_PER_KCAL). This module is the numerical
-reference for the OpenMM force. Conservative by design: a degenerate torsion listed in the model
-(even with zero coefficients) makes z undefined here (NaN offline, AuxGeometryError per structure).
+reference for the OpenMM force. Only features with a nonzero coefficient enter z, exactly as in
+the force (``build_aux_force`` skips zero-coefficient features), so a degenerate torsion whose
+features all have zero coefficients does not make z undefined; a degenerate torsion that carries
+weight does (NaN offline, AuxGeometryError per structure).
 """
 from __future__ import annotations
 
@@ -784,14 +819,16 @@ import numpy as np
 
 from ..correctness._io import IntegrityError
 from ..correctness.bias import KJ_PER_KCAL, finite_number
-from .features import (AuxGeometryError, feature_signs, feature_values, openmm_dihedrals,
-                       unique_torsions)
+from .features import (AuxGeometryError, active_feature_mask, feature_signs, feature_values,
+                       openmm_dihedrals, unique_torsions)
 from .model import AuxModel
 
 
 def z_from_dihedrals(theta, model: AuxModel) -> np.ndarray:
-    feats = feature_values(theta, model)
-    return (model.offset + feats @ np.asarray(model.coefficients, dtype=np.float64)) / model.scale
+    active = active_feature_mask(model)
+    feats = feature_values(theta, model)[:, active]
+    coeffs = np.asarray(model.coefficients, dtype=np.float64)[active]
+    return (model.offset + feats @ coeffs) / model.scale
 
 
 def z_from_positions(xyz_nm, model: AuxModel) -> np.ndarray:
@@ -820,23 +857,27 @@ def z_and_gradient(xyz_nm, model: AuxModel) -> tuple[float, np.ndarray]:
     if x.ndim != 2 or x.shape[1] != 3:
         raise IntegrityError("z_and_gradient takes one configuration of shape (n_atoms, 3)")
     quads, idx = unique_torsions(model)
+    active = active_feature_mask(model)
+    used = np.zeros(len(quads), dtype=bool)
+    used[idx[active]] = True                    # torsions that carry weight in z (and in the force)
     theta = openmm_dihedrals(x, quads)[0]
-    if np.isnan(theta).any():
-        bad = [quads[t] for t in np.flatnonzero(np.isnan(theta))]
+    degenerate = np.isnan(theta) & used
+    if degenerate.any():
+        bad = [quads[t] for t in np.flatnonzero(degenerate)]
         raise AuxGeometryError(f"auxiliary CV undefined: degenerate torsion(s) {bad}")
-    signs = feature_signs(model)
-    coeffs = np.asarray(model.coefficients, dtype=np.float64)
-    is_sin = np.array([f.trig == "sin" for f in model.feature_schema.features])
-    arg = theta[idx] * signs
+    signs = feature_signs(model)[active]
+    coeffs = np.asarray(model.coefficients, dtype=np.float64)[active]
+    is_sin = np.array([f.trig == "sin" for f in model.feature_schema.features])[active]
+    arg = theta[idx[active]] * signs
     # d trig(s*theta)/d theta: sin -> s cos(s theta); cos -> -s sin(s theta)
     dfeat = np.where(is_sin, signs * np.cos(arg), -signs * np.sin(arg))
     dz_dtheta = np.zeros(len(quads))
-    np.add.at(dz_dtheta, idx, coeffs * dfeat / model.scale)
+    np.add.at(dz_dtheta, idx[active], coeffs * dfeat / model.scale)
     grad = np.zeros_like(x)
     for t, quad in enumerate(quads):
         if dz_dtheta[t] != 0.0:
             grad[list(quad)] += dz_dtheta[t] * _dtheta_dx(x[list(quad)])
-    z = float((model.offset + feature_values(theta[None, :], model)[0] @ coeffs) / model.scale)
+    z = float(z_from_dihedrals(theta[None, :], model)[0])
     return z, grad
 
 
@@ -1049,6 +1090,39 @@ def test_set_parameters_rejects_invalid_strength():
     ctx, info, _ = _context(_model(d), len(d["positions_nm"]))
     with pytest.raises(IntegrityError):
         set_aux_parameters(ctx, info, center=0.0, k_kcal=-1.0)
+
+
+@pytest.mark.parametrize("geometry", range(3))
+def test_same_torsion_twice_in_one_group_matches_reference(geometry):
+    """Review Focus 3: a torsion listed twice in one (trig, sign) group gets each feature's weight."""
+    d = dipeptide()
+    x = perturbed_geometries(d)[geometry]
+    q0, q1 = d["quads"][0], d["quads"][1]
+    m = AuxModel.from_mapping(model_payload([q0, q0, q1], [0.7, -0.2, 1.1, 0.4, -0.5, 0.3], offset=0.1,
+                                            scale=1.3))
+    ctx, info, force = _context(m, len(x))
+    names = [force.getCollectiveVariableName(i) for i in range(force.getNumCollectiveVariables())]
+    sin_neg = force.getCollectiveVariable(names.index("aux_sin_neg"))
+    assert sin_neg.getNumTorsions() == 3          # q0 twice + q1, one weight per feature
+    ctx.setPositions(x)
+    z = z_from_positions(x, m)[0]
+    set_aux_parameters(ctx, info, center=z + 0.3, k_kcal=2.5)
+    e, f = _energy_forces(ctx)
+    assert e == pytest.approx(aux_energy_kj(np.array([z]), z + 0.3, 2.5)[0], rel=1e-10, abs=1e-10)
+    np.testing.assert_allclose(f, aux_forces_kj_nm(x, m, z + 0.3, 2.5), rtol=1e-8, atol=1e-8)
+
+
+def test_zero_coefficient_degenerate_torsion_agrees_with_evaluator():
+    p = np.array([[0, 0, 0], [1, 0, 0], [2, 0, 0], [3, 1, 0], [4, 1, 1]], dtype=float) * 0.1
+    m = AuxModel.from_mapping(model_payload([(0, 1, 2, 3), (1, 2, 3, 4)], [0.0, 0.0, 1.0, 0.5], offset=0.2))
+    ctx, info, _ = _context(m, 5)
+    ctx.setPositions(p)
+    z = z_from_positions(p, m)[0]
+    set_aux_parameters(ctx, info, center=z - 0.4, k_kcal=1.5)
+    e, f = _energy_forces(ctx)
+    assert np.all(np.isfinite(f))
+    assert e == pytest.approx(aux_energy_kj(np.array([z]), z - 0.4, 1.5)[0], rel=1e-10, abs=1e-10)
+    np.testing.assert_allclose(f, aux_forces_kj_nm(p, m, z - 0.4, 1.5), rtol=1e-8, atol=1e-8)
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -1140,7 +1214,7 @@ def set_aux_parameters(context, info: AuxForceInfo, *, center, k_kcal) -> None:
 Add to `__init__.py`: `from .force import AUX_FORCE_NAME, AuxForceInfo, build_aux_force, set_aux_parameters` and extend `__all__`.
 
 Things to know:
-- OpenMM's Lepton parser accepts `select(x, y, z)` (returns y when x ≠ 0, else z) and the `; auxz = ...` intermediate inside a `CustomCVForce` (verified on OpenMM 8.5.1, Reference and CPU).
+- OpenMM's Lepton parser accepts `select(x, y, z)` (returns y when x ≠ 0, else z) and the `; auxz = ...` intermediate inside a `CustomCVForce` (verified on OpenMM 8.5.1, Reference and CPU). In a Custom*Force energy string the **first** expression is the energy and later `;`-separated definitions are intermediates (OpenMM convention), so `select(...); auxz = ...` is the correct order. An earlier review suggested it might return `auxz`; the parity tests refute that.
 - `test_select_makes_zero_strength_exact_even_when_the_square_overflows` discriminates `select`: with offset 1e200 and k = 0, the plain expression `0.5*aux_k*(auxz-aux_c)^2` evaluates to 0·∞ = NaN (verified), while the `select` form gives exactly 0.0. Mutation-checked: removing `select` fails this test.
 - Parity was checked over 200 random models (mixed conventions, duplicate torsions, k 0.1–50) on Reference and CPU: worst relative energy error 1.3e-14, force 1.2e-13.
 - `CustomTorsionForce` `theta` is the OpenMM angle. That is why a `negated` feature uses `sin(-theta)` (see `gareus/production.py:454` `_add_weighted_trig_torsion_force`).
@@ -1183,6 +1257,9 @@ Rules (spec Sections 3.1 and 5):
 - In a v2 definition every row carries `instance`. Instance ids must be unique (spec Section 5: `state_instance_id` is mapped explicitly to the runtime window index, which is `window_id` here).
 - `hamiltonian_sha256` drops the aux keys of an inactive row, so an inactive v2 row hashes like the same v1 physics. An active row is identified by its `aux_model_sha256` (content hash), so relabelling a model changes no Hamiltonian hash. A boolean `window_id` is refused.
 - `aux_center` canonicalises -0.0 to 0.0.
+- **Every v2 row is routed through `_aux_term`.** `canonical_state_definition` already calls `windows = normalize_windows(data["windows"])` (current `gareus/correctness/state_identity.py:88`) before its window loop, and Step 4 makes `normalize_windows` call `_aux_term` whenever a row carries any aux key. A negative or nonfinite `aux_k` therefore raises in `finite_number`; an active row without a full `aux_model_sha256` or a finite `aux_center` raises; an inactive row canonicalises to `(None, 0.0, 0.0)`. The loop below then only needs the v2-specific checks (explicit `aux_k`, kJ conversion, registry membership, instance metadata).
+- **`energy_unit` convention, inherited from k1/k2.** For a `kJ/mol` table the loop divides k1, k2 and `aux_k` by 4.184 once, and the existing line `data["energy_unit"] = "kcal/mol"` (current `state_identity.py:106`) relabels the canonical table. The canonical table therefore always stores and states kcal/mol, and re-canonicalising it, as `state_definition_hash` and `hamiltonian_sha256` do, never divides again. `test_kj_canonicalisation_is_idempotent_through_the_hash_paths` pins this.
+- **W/B matched slots** (spec 5, 11.1). `matched_additional_slot_id` is null on every ordinary row. Within one table a slot id names at most one auxiliary and at most one sham. When both are present, the sham's `center1`/`k1`/`center2`/`k2`/`gamd_lambda` must equal its auxiliary partner's. A single arm's table holds only one side of each pair; cross-arm pairing is the Stage D preregistration validator's job.
 
 - [ ] **Step 1: Confirm the legacy v1 pin on unmodified code**
 
@@ -1211,8 +1288,11 @@ import pytest
 from aux_cv_fixture import model_payload
 from gareus.auxiliary_cv.model import AuxModel
 from gareus.correctness._io import IntegrityError
-from gareus.correctness.state_identity import (STATE_SCHEMA_V2, hamiltonian_sha256,
-                                               make_state_definition, state_definition_hash)
+from gareus.correctness._io import json_loads
+from gareus.correctness.state_identity import (STATE_SCHEMA_V2, canonical_state_definition,
+                                               freeze_snapshot, hamiltonian_sha256,
+                                               make_state_definition, state_definition_hash,
+                                               validate_fixed_state_segments, write_frozen_snapshot)
 
 V1_PINNED = "dc0acf77e275ed0d1b357238e16e3f1f8248859b06ab647d7e6578817e4c8725"
 BOX = [[3, 0, 0], [0, 3, 0], [0, 0, 3]]
@@ -1346,6 +1426,11 @@ def test_kj_tables_convert_aux_k():
     (lambda w, m: w[0].update(aux_model_sha256=SHA, aux_center=0.0, aux_k=1.0), "ordinary requires aux_k == 0"),
     (lambda w, m: w[2].update(aux_k=0.0), "auxiliary requires aux_k > 0"),
     (lambda w, m: m.update({"c" * 64: m.pop(SHA)}), "key"),
+    # W/B matched-slot rules (spec 5, 11.1)
+    (lambda w, m: w[0]["instance"].update(matched_additional_slot_id="slot-0"), "ordinary state cannot carry"),
+    (lambda w, m: (w[3].update(aux_model_sha256=SHA, aux_center=0.0, aux_k=1.0),
+                   w[3]["instance"].update(state_role="auxiliary")), "more than one auxiliary"),
+    (lambda w, m: w[3].update(k1=11.0), "baseline"),
 ])
 def test_v2_refusals(mutate, message):
     w = _v2_windows()
@@ -1368,6 +1453,59 @@ def test_v1_rejects_aux_fields():
     w[0]["aux_k"] = 0.0
     with pytest.raises(IntegrityError, match="unknown physics fields"):
         _defn(w)
+
+
+def test_v2_definition_round_trips_through_frozen_snapshots(tmp_path):
+    """Spec 5: snapshot hashes and restart comparisons cover the aux fields and instance metadata.
+
+    validate_fixed_state_segments re-normalises the visible windows with normalize_windows; this pins
+    that the instance block passes through it unchanged and the aux fields re-canonicalise identically.
+    """
+    d = _defn(_v2_windows(), aux_models={SHA: MODEL.to_mapping()})
+    snap = freeze_snapshot("seg_001", d, equilibrium_analysis_eligible=True, phase_kind="production")
+    table = validate_fixed_state_segments({"seg_001": snap})
+    assert table.definition == d and table.definition_sha256 == state_definition_hash(d)
+    rows = {r["window_id"]: r for r in table.windows}
+    assert rows[2]["instance"]["state_instance_id"] == "aux-0" and rows[2]["aux_model_sha256"] == SHA
+    path = tmp_path / "seg_001.json"
+    write_frozen_snapshot(path, snap)
+    again = validate_fixed_state_segments({"seg_001": json_loads(path.read_bytes())})
+    assert again.definition_sha256 == table.definition_sha256
+    other = freeze_snapshot("seg_002", _defn(_v2_windows(), aux_models={SHA: _relabelled()}),
+                            equilibrium_analysis_eligible=True, phase_kind="production")
+    validate_fixed_state_segments({"seg_001": snap, "seg_002": other})   # relabel: still fixed-state compatible
+    changed = _v2_windows()
+    changed[2]["aux_center"] = 1.6
+    moved = freeze_snapshot("seg_003", _defn(changed, aux_models={SHA: MODEL.to_mapping()}),
+                            equilibrium_analysis_eligible=True, phase_kind="production")
+    with pytest.raises(IntegrityError, match="aux_center"):
+        validate_fixed_state_segments({"seg_001": snap, "seg_003": moved})
+
+
+def test_kj_canonicalisation_is_idempotent_through_the_hash_paths():
+    """energy_unit convention (inherited from k1/k2): canonicalisation divides kJ tables by 4.184 once
+    and relabels the table "kcal/mol", so re-canonicalising (as every hash function does) never divides
+    again."""
+    w = _v2_windows()
+    for row in w:
+        row["k1"] *= 4.184
+        row["k2"] *= 4.184
+        row["aux_k"] *= 4.184
+    d = _defn(w, aux_models={SHA: MODEL.to_mapping()}, energy_unit="kJ/mol")
+    assert d["energy_unit"] == "kcal/mol"
+    assert canonical_state_definition(d) == d
+    assert state_definition_hash(d) == state_definition_hash(canonical_state_definition(d))
+    for wid in (0, 1, 2, 3):
+        assert hamiltonian_sha256(d, wid) == hamiltonian_sha256(canonical_state_definition(d), wid)
+    assert {r["window_id"]: r for r in canonical_state_definition(d)["windows"]}[2]["aux_k"] == \
+        pytest.approx(1.2, abs=1e-12)
+
+
+def test_negative_aux_centre_is_accepted():
+    w = _v2_windows()
+    w[2]["aux_center"] = -1.5
+    d = _defn(w, aux_models={SHA: MODEL.to_mapping()})
+    assert {r["window_id"]: r for r in d["windows"]}[2]["aux_center"] == -1.5
 ```
 
 - [ ] **Step 3: Run the tests to verify they fail**
@@ -1481,7 +1619,8 @@ def _canonical_instance(raw: Any, state_id: int) -> dict:
 
 
 def _check_instances(windows: list[dict]) -> None:
-    """v2 slot table: every row has instance metadata, ids are unique, roles match the energy."""
+    """v2 slot table: every row has instance metadata, ids are unique, roles match the energy,
+    parents exist, W/B slots pair consistently."""
     missing = [row["window_id"] for row in windows if "instance" not in row]
     if missing:
         raise IntegrityError(f"v2 state tables need instance metadata on every row; missing on windows {missing}")
@@ -1499,6 +1638,42 @@ def _check_instances(windows: list[dict]) -> None:
         if parent is not None and parent not in known:
             raise IntegrityError(f"Window {row['window_id']}: spawn_parent_state_id {parent!r} is not a "
                                  "state_instance_id in this table")
+    _check_slot_pairing(windows)
+
+
+_BASELINE_FIELDS = ("center1", "k1", "center2", "k2", "gamd_lambda")
+
+
+def _check_slot_pairing(windows: list[dict]) -> None:
+    """W/B matched-slot rules that one table can check (spec 5, 11.1).
+
+    Ordinary rows carry no slot. Within one table a slot id names at most one auxiliary and at
+    most one sham; when both are present (e.g. a combined analysis table) the sham's baseline
+    restraints and lambda must equal its auxiliary partner's. Pairing ACROSS arm tables (W has
+    the auxiliary, B the sham) is checked by the Stage D preregistration validator.
+    """
+    by_slot: dict[str, dict[str, dict]] = {}
+    for row in windows:
+        inst = row["instance"]
+        slot = inst["matched_additional_slot_id"]
+        if slot is None:
+            continue
+        role = inst["state_role"]
+        if role == "ordinary":
+            raise IntegrityError(f"Window {row['window_id']}: an ordinary state cannot carry "
+                                 f"matched_additional_slot_id {slot!r}")
+        roles = by_slot.setdefault(slot, {})
+        if role in roles:
+            raise IntegrityError(f"matched_additional_slot_id {slot!r} names more than one {role} state "
+                                 f"(windows {roles[role]['window_id']} and {row['window_id']})")
+        roles[role] = row
+    for slot, roles in by_slot.items():
+        if "auxiliary" in roles and "sham" in roles:
+            aux, sham = roles["auxiliary"], roles["sham"]
+            differ = [f for f in _BASELINE_FIELDS if aux[f] != sham[f]]
+            if differ:
+                raise IntegrityError(f"matched_additional_slot_id {slot!r}: sham window {sham['window_id']} "
+                                     f"baseline {differ} differs from auxiliary window {aux['window_id']}")
 ```
 
 Then change `canonical_state_definition`:
@@ -1684,7 +1859,7 @@ The kJ conversion order matters. `normalize_windows` canonicalises `aux_k` in th
 - [ ] **Step 6: Run the tests to verify they pass**
 
 Run: `pytest tests/test_aux_cv_state_schema.py`
-Expected: PASS (30 tests in scratch). No dedicated state-identity test file existed before this work, so the pinned v1 hash in this file is the legacy regression (re-verified after the edits: still `dc0acf77…`).
+Expected: PASS (36 tests in scratch). No dedicated state-identity test file existed before this work, so the pinned v1 hash in this file is the legacy regression (re-verified after the edits: still `dc0acf77…`).
 
 - [ ] **Step 7: Commit**
 
@@ -1812,13 +1987,33 @@ In `reconstruct_bias_matrix`, add the keyword `aux_z: Mapping[str, np.ndarray] |
                 aux_columns[sha] = numeric_vector(aux_z[sha], f"aux_z[{sha[:12]}]", n)
 ```
 
-In the umbrella loop, after the `k2` block, add:
+In the umbrella loop, after the `k2` block, add the aux block. The loop accumulates every umbrella term in **kcal/mol** (`k1`, `k2` and `aux_k` are kcal/mol per CV unit²). The existing line after the loop, `matrix *= beta * KJ_PER_KCAL`, then converts kcal → kJ and applies β (mol/kJ) exactly once for all three terms. The aux line therefore carries no β or 4.184 of its own. It sits inside the loop, before that scaling and before the `lambda == 0` early return. After the edit the loop reads, verbatim (the three `aux_k` lines are new; everything else is current `gareus/correctness/bias.py:147-162`):
 
 ```python
+    matrix = np.zeros((n, len(rows)), dtype=np.float64)
+    with np.errstate(over="raise", invalid="ignore"):
+        try:
+            for column, row in enumerate(rows):
+                if row["k1"] > 0:
+                    delta = primary - row["center1"]
+                    matrix[:, column] += 0.5 * row["k1"] * delta * delta
+                if row["k2"] > 0:
+                    delta = secondary - row["center2"]
+                    matrix[:, column] += 0.5 * row["k2"] * delta * delta
                 if row.get("aux_k", 0.0) > 0:
                     delta = aux_columns[row["aux_model_sha256"]] - row["aux_center"]
                     matrix[:, column] += 0.5 * row["aux_k"] * delta * delta
+            matrix *= beta * KJ_PER_KCAL
+        except FloatingPointError as exc:
+            raise IntegrityError("Overflow reconstructing umbrella bias; check CV units/parameters") from exc
+    lambdas = np.asarray([w["gamd_lambda"] for w in rows], dtype=np.float64)
+    bookkeeping = meta if meta is not None else {}
+    if not np.any(lambdas > 0):
+        bookkeeping.update(gamd_ladder=False, gamd_ladder_samples_without_raw_energies=0)
+        return matrix
 ```
+
+`test_aux_term_added_in_lambda_zero_path` pins the result numerically against `BETA * 4.184 * 0.5 * k * (z - c)**2`, where `BETA` is mol/kJ (1/(R T) with R = 0.0083144626 kJ/mol/K) and k is kcal/mol/z². A missing or doubled factor fails it.
 
 `numeric_vector(..., n)` raises `IntegrityError("... must have shape (n,) ...")`, which satisfies `test_aux_z_shape_is_checked`. Update the docstring: "aux_z maps model_sha256 to that model's z for every sample; required for every model with an active state."
 
@@ -1856,6 +2051,13 @@ Insert after the "Adaptive λ ladder" section:
 
 - Built: frozen model `atlas-aux-cv-model-v1` (`AuxModel`: z = (offset + Σ c f)/scale, `periodic_imaging` "none", identity = content sha incl. scale/imaging, label/provenance excluded, -0.0 canonicalised; registries embed `identity_mapping()`), OpenMM-convention dihedral features (theta = OpenMM `theta` = -tica angle; `negated` feature = trig(-theta)), exact evaluator with Blondel-Karplus gradient (FD-verified), `CustomCVForce` `ATLaSAuxCVUmbrella` = select(aux_k, 0.5 aux_k (z - aux_c)^2, 0) with exact energy/force parity, state schema `atlas-fixed-state-v2` (`aux_models` registry, per-window aux_model_sha256/aux_center/aux_k, required `instance` {state_instance_id, state_role, spawn_parent_state_id (parent's state_instance_id), spawn_source_observation, matched_additional_slot_id}, role ⇔ aux_k enforced, `hamiltonian_sha256` keyed on model sha), field `aux_k` kcal/mol/z² (deviation from spec's `aux_k_kcal_mol`); k = 0 is exact-zero energy, NaN forces at degenerate torsions (as stock OpenMM), `reconstruct_bias_matrix(aux_z=)`.
 - Not wired: nothing in production, exchange, storage or analysis calls it yet (Stages B/C). v1 definitions hash byte-identically (pinned test). MVP: one model; >1 refused ("Stage F").
+- Stage B owns:
+  - the exchange-energy/schema version `state_bias_matrix_v3_aux` (spec 5), with separate zero-feature regression tests proving v2 compatibility;
+  - **runtime detection of degenerate torsion geometry before integration** (spec 3.3). The force returns NaN forces at a degenerate torsion even at k = 0, and a finite energy at k > 0 where the evaluator raises.
+- Stage D owns:
+  - extending `check_feature_atoms` beyond phi/psi if the recovered c10 artifact contains omega or terminal torsions;
+  - cross-arm W/B slot pairing (one table checks only its own slots).
+- Recorded deviations: `aux_k` naming; one registered model; same-table parent rule.
 - Tests: `tests/test_aux_cv_*.py`, fixture `tests/aux_cv_fixture.py`.
 ```
 
@@ -1923,3 +2125,26 @@ The verifier implemented this plan in scratch (66/66 tests passing, parity 1e-13
 | 14 Cosmetic | Fixture citation `analyze.py:416-419`; Task 2 commit no longer re-adds the fixture |
 
 Interfaces changed for Stages B/C: `AuxModel.scale`, `AuxModel.periodic_imaging`, `AuxModel.identity_mapping()`; registries hold identity bodies; `spawn_parent_state_id` is a string; `instance` is mandatory in v2.
+
+### Board conditions applied (2026-10-08)
+
+The board (4 judges, unanimous ACCEPT-WITH-CHANGES on the revised plan, aggregate confidence 87; specialist pass B raised no flags) set eight conditions. Conditions from the earlier board run on the pre-revision plan were applied where still relevant. The revised code was re-run in scratch:
+- 120 tests pass across the six files (108 before);
+- the v1 pin is still `dc0acf77…`;
+- mutation checks: removing `_check_slot_pairing`, the evaluator's `active_feature_mask`, or the force's zero-coefficient skip makes the new tests fail (3, 2 and 1 failures).
+
+| Board condition | Change |
+|---|---|
+| 1. Task 6 β·4.184 not shown | Task 6 Step 3 now shows the loop verbatim: terms accumulate in kcal/mol, then the existing `matrix *= beta * KJ_PER_KCAL` scales once. The aux line rightly carries no factor of its own; the numeric pin is explained |
+| 2. `state_bias_matrix_v3_aux` ownership | Task 7 handoff: Stage B owns it, with zero-feature v2 regression tests |
+| 3. v2 snapshot round trip | `test_v2_definition_round_trips_through_frozen_snapshots`: `freeze_snapshot` → `validate_fixed_state_segments` (in memory and via `write_frozen_snapshot` + JSON reload). Pins that `normalize_windows` passes `instance` through (`dict(raw)` keeps it) and re-canonicalises aux fields identically. A relabelled-model segment stays compatible; a moved `aux_center` is refused |
+| 4. Unrecorded deviations | Global Constraints list: phi/psi-only topology check (flagged to Stage D), same-table parent rule, one-registered-model rule, `aux_k` naming, within-table-only slot pairing |
+| 5. `matched_additional_slot_id` pairing | Implemented `_check_slot_pairing`: ordinary rows carry none; at most one auxiliary and one sham per slot; a paired sham's baseline must equal its auxiliary's. Three refusal cases; cross-arm pairing deferred to Stage D |
+| 6. Committed duplicate-torsion test | `test_same_torsion_twice_in_one_group_matches_reference` (3 geometries; asserts 3 torsions in the `aux_sin_neg` group) |
+| 7. `energy_unit` label | The premise does not hold: the existing `data["energy_unit"] = "kcal/mol"` relabels the canonical table. Documented in Task 5's rules; idempotence through `state_definition_hash`/`hamiltonian_sha256` pinned by a test |
+| 8. Degenerate geometry handoff | Task 7 handoff: Stage B must detect degenerate torsions at runtime before integration |
+| Old board 1. v2 rows routed through `_aux_term` | Task 5 rules state the routing (`normalize_windows` before the loop) and its consequences |
+| Old board 4. Lepton statement order | Not a defect: first expression is the energy, later ones are intermediates; parity and the `select` mutation test confirm it. Noted in Task 4 |
+| Old board 5. `finite_number` minimum | Default is `minimum=None` (`bias.py:40`); centres pass none. Negative-centre tests added (Tasks 3, 5) |
+| Old board 6. kJ idempotence | Same as condition 7 |
+| Old board 7. Zero-coefficient torsions | The evaluator now uses only nonzero-coefficient features (`active_feature_mask`), like the force. A degenerate zero-weight torsion leaves z defined; evaluator and force agree (tests in Tasks 3 and 4). `unique_torsions` is unchanged, so the storage basis is unaffected |
