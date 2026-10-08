@@ -230,3 +230,15 @@ def test_origin_counts_follow_exclusion(tmp_path):
     nk = np.bincount(d.window, minlength=K)
     assert int(nk.sum()) == d.u_nk.shape[0] == d.cv.size
     assert np.isfinite(d.u_nk).all()
+
+
+def test_sample_window_ids_must_map_to_frozen_columns(tmp_path):
+    """load_parquet indexes u_nk columns by window_id: an origin outside the frozen table is refused."""
+    from gareus.auxiliary_cv.offline import pool_aux_segments
+    from gareus.query import load_samples
+    _run(tmp_path)
+    samples = load_samples(tmp_path, include_ineligible=True)
+    samples["window_id"] = np.asarray(samples["window_id"]).astype(np.int64)
+    samples["window_id"][0] = 5
+    with pytest.raises(IntegrityError, match="window_id"):
+        pool_aux_segments(tmp_path, samples, 0.4, {})

@@ -209,6 +209,17 @@ def pool_aux_segments(prod, samples, beta, meta, *, exclude_segments_without_aux
     if allow_ineligible_aux_segments:
         meta.setdefault("load_notes", []).append(
             "engineering analysis: ineligible auxiliary segments allowed, not an equilibrium estimate")
+    # load_parquet indexes u_nk columns by the raw window_id: the frozen columns must be 0..K-1 in order and
+    # every sample origin one of them, else rows would be scored against the wrong state (cf. chignolin_6).
+    columns = tuple(int(c) for c in table.column_window_ids)
+    if columns != tuple(range(len(columns))):
+        raise IntegrityError(f"frozen state table window_id columns {list(columns)[:8]} are not 0..K-1 in order; "
+                             "load_parquet cannot index them by window_id")
+    origins = np.asarray(np.ma.filled(np.ma.asarray(samples["window_id"]), -1)).astype(np.int64)
+    unknown = sorted(set(origins[(origins < 0) | (origins >= len(columns))].tolist()))
+    if unknown:
+        raise IntegrityError(f"sample window_id(s) {unknown[:8]} are not states of the frozen table "
+                             f"(window_id 0..{len(columns) - 1})")
     schemas, runtimes = segment_aux_schemas(prod), segment_aux_runtime(prod)
     distinct = {schemas.get(s) for s in aux_segs}
     if None in distinct or len(distinct) != 1:
