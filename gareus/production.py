@@ -5589,7 +5589,8 @@ def load_production_checkpoint(out_dir: Path, sims: list, centers_nm, ks_kj_nm2,
 
     def _apply_assignment(r: int):
         sim = sims[r]
-        set_window(sim.context, centers_nm, ks_kj_nm2, int(assignments[r]), secondary_centers, secondary_ks_kj)
+        set_window(sim.context, centers_nm, ks_kj_nm2, int(assignments[r]), secondary_centers, secondary_ks_kj,
+                   aux_state=None if args is None else getattr(args, "_aux_runtime", None))
         # The GaMD-integrator-globals restore above is best-effort (see the
         # comments above): when it is incomplete, k0_Total/k0_Dihedral are still
         # whatever _build_context_i set from this replica's BUILD-time index, not
@@ -5760,7 +5761,10 @@ def run_production_probe(args, out_dir: Path, sims: list, assignments: list[int]
         for r, sim in enumerate(sims):
             _run(r, sim.context.loadCheckpoint, saved[r])
         for r, sim in enumerate(sims):
-            _run(r, set_window, sim.context, centers_nm, ks_kj_nm2, int(assignments[r]))
+            # loadCheckpoint just restored the aux globals, but the complete target is re-applied
+            # like every other window application.
+            _run(r, set_window, sim.context, centers_nm, ks_kj_nm2, int(assignments[r]),
+                 aux_state=getattr(args, "_aux_runtime", None))
         # Roll the volume controllers back to their pre-probe state so the
         # probe consumed neither schedule nor random stream.
         if drivers is not None and npt_runtime is not None and npt_runtime.needs_controller:
@@ -5888,7 +5892,13 @@ def run_multiwindow_gamd_recon(
             sim_i.context.setVelocities(vel)
         else:
             sim_i.context.setVelocitiesToTemperature(args.temperature_k * unit.kelvin, args.seed + 4021 + i)
-        set_window(sim_i.context, centers_nm, ks_kj_nm2, i, secondary_cv_centers, secondary_cv_ks_kj)
+        # The envelope is calibrated with the auxiliary restraint OFF (D7).
+        set_window(sim_i.context, centers_nm, ks_kj_nm2, i, secondary_cv_centers, secondary_cv_ks_kj,
+                   aux_state=None)
+        _aux_runtime = getattr(args, "_aux_runtime", None)
+        if _aux_runtime is not None:
+            from .auxiliary_cv.runtime import deactivate_aux_parameters
+            deactivate_aux_parameters(sim_i.context, _aux_runtime)
         sims.append(sim_i)
         systems.append(system_i)
         integrators.append(step_integrator)
@@ -6125,7 +6135,13 @@ def apply_joint_envelope_gamd_calibration(
             _check_sim.context.setPeriodicBoxVectors(*_check_box)
         _check_sim.context.setPositions(equil_state.getPositions())
         _check_sim.context.setVelocitiesToTemperature(args.temperature_k * unit.kelvin, args.seed + 909)
-        set_window(_check_sim.context, centers_nm, ks_kj_nm2, 0, secondary_cv_centers, secondary_cv_ks_kj)
+        # Same policy as the recon: the envelope check runs with the auxiliary restraint OFF (D7).
+        set_window(_check_sim.context, centers_nm, ks_kj_nm2, 0, secondary_cv_centers, secondary_cv_ks_kj,
+                   aux_state=None)
+        _aux_runtime = getattr(args, "_aux_runtime", None)
+        if _aux_runtime is not None:
+            from .auxiliary_cv.runtime import deactivate_aux_parameters
+            deactivate_aux_parameters(_check_sim.context, _aux_runtime)
         _check_controller = None
         if npt_runtime is not None and npt_runtime.needs_controller:
             _check_controller = npt_runtime.initialize_controller(
@@ -7520,7 +7536,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                         # see the summary line after the replica-construction loop.
                         _skipped_velocity_randomization = True
                     sim_i.context.setVelocities(start_vel)
-                set_window(sim_i.context, centers_nm, ks_kj_nm2, i, secondary_cv_centers, secondary_cv_ks_kj)
+                set_window(sim_i.context, centers_nm, ks_kj_nm2, i, secondary_cv_centers, secondary_cv_ks_kj,
+                           aux_state=getattr(args, "_aux_runtime", None))
                 if topup_seed_by_window.get(i) is not None:
                     # Top-up seeding (task 9): the loaded State must reproduce the CV
                     # values it was exported under. Runs here, right after set_window,
@@ -8418,7 +8435,9 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 # accepted swap re-labels replicas so the cached CV/bias
                 # observables are stale until the next sample().
                 def _apply_swap_to_replica(replica_index: int):
-                    set_window(sims[replica_index].context, centers_nm, ks_kj_nm2, assignments[replica_index], secondary_cv_centers, secondary_cv_ks_kj)
+                    set_window(sims[replica_index].context, centers_nm, ks_kj_nm2, assignments[replica_index],
+                               secondary_cv_centers, secondary_cv_ks_kj,
+                               aux_state=getattr(args, "_aux_runtime", None))
                     set_replica_lambda_for_window(sims[replica_index].integrator, assignments[replica_index], state_lambdas, k0max_by_channel)
 
                 with _phase_timers.phase("exchange.swap_apply"):

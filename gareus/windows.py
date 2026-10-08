@@ -203,6 +203,8 @@ def set_window(
     window_index: int,
     secondary_centers: Optional[Iterable[float]] = None,
     secondary_ks_kj: Optional[Iterable[float]] = None,
+    *,
+    aux_state: Any = None,
 ) -> None:
     """Assign OpenMM global parameters for the given replica ``window_index``.
 
@@ -211,6 +213,8 @@ def set_window(
     dimensionless contact units and kJ/mol/CV² for contact CVs).  If
     ``secondary_centers`` and ``secondary_ks_kj`` are provided, those values
     are also assigned on the current context for the optional secondary CV.
+    When ``aux_state`` (an ``AuxRuntime``) is given, the window's complete
+    auxiliary-CV target is set too (k = 0 resets an ordinary window).
     """
     # centres_nm/ks_kj_nm2 are historical names.  In nonlocal‑contact mode they
     # hold dimensionless contact centres and kJ/mol/CV², respectively.
@@ -228,6 +232,14 @@ def set_window(
         except Exception:
             # The system may not contain the optional secondary CV force.
             pass
+    if aux_state is not None:
+        # Auxiliary-CV state (spec 3.3): set the COMPLETE target every time, including the reset
+        # to zero when the window is ordinary. No try/except: a Context built without the
+        # auxiliary capability while a runtime is configured is a fatal inconsistency.
+        from .auxiliary_cv.force import set_aux_parameters
+        w = int(window_index)
+        set_aux_parameters(context, aux_state.info, center=aux_state.table.centers[w],
+                           k_kcal=aux_state.table.k_kcal[w])
 
 
 
