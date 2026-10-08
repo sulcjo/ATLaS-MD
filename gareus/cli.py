@@ -2557,6 +2557,13 @@ def main(argv: Optional[Iterable[str]] = None):
                 print(f"WARNING [scratchdir hydrate]: {_main_dir} → {out_dir} failed: {exc}")
     else:
         out_dir.mkdir(parents=True, exist_ok=True)
+    if bool(getattr(args, "resume", False) or getattr(args, "extend", False) or getattr(args, "ap_resume", False)):
+        # Stage C (B1, c10 safety): the auxiliary-capability mismatch check runs BEFORE anything is written
+        # (reproducibility files, run_args, initialize_run_manifest), so a refused resume never stamps
+        # auxiliary keys into a legacy campaign's run_manifest.json. After scratch hydration on purpose.
+        from .production import refuse_resume_of_aux_campaign
+        for _resume_candidate in (out_dir, out_dir / "final_production"):
+            refuse_resume_of_aux_campaign(_resume_candidate, args)
     configure_color(args.color, tui_mode=getattr(args, "tui_mode", None))
     if bool(getattr(args, "self_test_primary_cv_force", False)):
         if primary_cv_is_contacts(args):

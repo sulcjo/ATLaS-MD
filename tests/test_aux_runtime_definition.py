@@ -84,6 +84,28 @@ def test_physical_system_sha_is_deterministic_and_bias_sensitive():
     assert physical_system_sha256(mm, s1) != physical_system_sha256(mm, s2)
 
 
+def test_physical_system_sha_ignores_the_openmm_version_stamp():
+    """Task 11 ruling: an OpenMM update must not make an auxiliary run unresumable."""
+    import re
+    import types
+    import openmm as mm
+    from pep_gamd_fixture import _fresh_system
+
+    class _OtherVersionSerializer:
+        @staticmethod
+        def serialize(obj):
+            return re.sub(r'openmmVersion="[^"]*"', 'openmmVersion="9.9.9"', mm.XmlSerializer.serialize(obj))
+
+        @staticmethod
+        def deserialize(xml):
+            return mm.XmlSerializer.deserialize(xml)
+
+    other = types.SimpleNamespace(XmlSerializer=_OtherVersionSerializer, Vec3=mm.Vec3)
+    s = _fresh_system()
+    assert _OtherVersionSerializer.serialize(s) != mm.XmlSerializer.serialize(s)
+    assert physical_system_sha256(other, s) == physical_system_sha256(mm, s)
+
+
 def test_cli_drops_unpersisted_flag_and_adds_phase_inputs(tmp_path, capsys):
     from gareus.cli import parse_args
     base = ["--seq", "GA", "--out", str(tmp_path / "o")]

@@ -118,7 +118,8 @@ from .phase_timers import PhaseTimers, aggregate_npt_timings
 from .provenance import (record_replica_admission, initialize_run_manifest, ensure_run_manifest_initialized, update_run_manifest,
                          finalize_run_manifest, pair_model_sha256)
 from .kernel_identity import (EXCHANGE_ENERGY_VERSION, FAST_SCALAR_MODES, LEGACY_TWO_TERM_MODES,
-                              RESIDUAL_EVALUATOR_VERSION, is_aux_kernel_record, kernel_identity_for_run)
+                              RESIDUAL_EVALUATOR_VERSION, exchange_energy_version_for_args,
+                              is_aux_kernel_record, kernel_identity_for_run)
 
 logger = logging.getLogger(__name__)
 
@@ -683,10 +684,11 @@ def verify_kernel_identity_on_resume(args, out_dir, secondary_cv_metadata: Optio
                   flush=True)
     recorded_ex = method.get("exchange_energy_version")
     recorded_ev = method.get("cv_evaluator_version")
-    if recorded_ex is not None and str(recorded_ex) != EXCHANGE_ENERGY_VERSION:
+    expected_ex = exchange_energy_version_for_args(args)
+    if recorded_ex is not None and str(recorded_ex) != expected_ex:
         raise RuntimeError(
-            f"resume refused: this campaign's samples were exchanged with {recorded_ex!r}; the current code "
-            f"implements {EXCHANGE_ENERGY_VERSION!r}. A changed kernel starts a new segment from these "
+            f"resume refused: this campaign's samples were exchanged with {recorded_ex!r}; this job "
+            f"implements {expected_ex!r}. A changed kernel starts a new segment from these "
             "coordinates with fresh equilibration; it never appends to the old one (spec F04).")
     if mode == "residual-torsion-pc":
         if recorded_ev is None and "exchange_energy_version" not in method:
@@ -699,22 +701,39 @@ def verify_kernel_identity_on_resume(args, out_dir, secondary_cv_metadata: Optio
                 f"{RESIDUAL_EVALUATOR_VERSION!r} (spec F04).")
 
 
-def refuse_resume_of_aux_campaign(out_dir) -> None:
-    """Stage B: an auxiliary-CV campaign cannot be resumed or extended (spec 2026-10-07, D6).
+def refuse_resume_of_aux_campaign(out_dir, args=None) -> None:
+    """Every --resume continues the auxiliary capability its campaign recorded (spec 2026-10-07, D6; Stage C B1).
 
-    Unconditional and snapshot-based on purpose. A Context checkpoint of an aux system loads
-    SILENTLY into a Context without the aux force (verified 2026-10-08), the run manifest's
-    method_settings are rebuilt from the CURRENT args every job, and verify_kernel_identity_on_resume
-    only runs when CV2 is enabled -- none of those can stop an aux slot resuming as an ordinary one.
-    A campaign whose snapshots record no auxiliary kernel (every legacy run) passes silently.
+    Snapshot-based on purpose: a Context checkpoint of an aux system loads SILENTLY into a Context without
+    the aux force (verified 2026-10-08), and the run manifest's method_settings are rebuilt from the
+    CURRENT args every job. Refused: an auxiliary campaign resumed without --aux-cv-model or with another
+    model, and a non-auxiliary campaign resumed with one. Nothing recorded (no kernel-identity snapshot):
+    no-op; the checkpoint binding (aux_table_from_checkpoint / verify_aux_resume) and pooling cover it.
+    Legacy campaigns resumed without a model pass silently. Also called by cli.main() before the run
+    manifest is (re)initialized, so a refused job never stamps auxiliary keys into a legacy manifest.
     """
-    recorded = _latest_segment_kernel_identity(out_dir) or {}
+    recorded = _latest_segment_kernel_identity(out_dir)
+    if recorded is None:
+        return
+    model_path = getattr(args, "aux_cv_model", None) if args is not None else None
     if is_aux_kernel_record(recorded):
+        recorded_sha = str(recorded.get("aux_model_sha256") or "")
+        if not model_path:
+            raise RuntimeError(
+                "resume/extend refused: this campaign ran auxiliary-CV states "
+                f"(model {recorded_sha[:12]}); resume it with the same --aux-cv-model, or start a new run "
+                "directory. Without it every auxiliary slot would continue as an ordinary state.")
+        from .auxiliary_cv.model import AuxModel
+        sha = AuxModel.load(model_path).model_sha256
+        if sha != recorded_sha:
+            raise RuntimeError(
+                f"resume/extend refused: --aux-cv-model {sha[:12]} is not this campaign's auxiliary model "
+                f"{recorded_sha[:12]}; a model change starts a new phase (spec Section 6).")
+        return
+    if model_path:
         raise RuntimeError(
-            "resume/extend refused: this campaign ran auxiliary-CV states "
-            f"(model {str(recorded.get('aux_model_sha256'))[:12]}). Resuming them is Stage C "
-            "(checkpoint binding of auxiliary states); without it every auxiliary slot would continue as "
-            "an ordinary state. Start a new run directory instead.")
+            "resume/extend refused: --aux-cv-model given, but this campaign's newest segment ran without "
+            "auxiliary-CV states; an auxiliary capability change starts a new run directory.")
 
 
 def _restore_secondary_cv_args_from_metadata(args, secondary_cv_metadata: dict, out_dir: Optional[Path] = None) -> None:
@@ -2381,11 +2400,18 @@ def make_gamd_integrator(system, args, unit, seed_offset: int = 0):
 
 def _aux_window_order_key(centers_a, k_list, secondary_centers, secondary_k_list, n) -> tuple:
     """(center1, k1[, center2, k2]) per window, in order: the identity an auxiliary state table is
-    bound to when loaded, re-checked when the runtime is resolved (auxiliary-CV runs only)."""
+    bound to when loaded, re-checked when the runtime is resolved (auxiliary-CV runs only).
+    NaN / None placeholders map to None, so two keys built from the same table compare equal."""
+    def _num(value):
+        if value is None:
+            return None
+        value = float(value)
+        return None if value != value else value
+
     has_secondary = secondary_centers is not None and secondary_k_list is not None
     return tuple(
-        (float(centers_a[w]), float(k_list[w]))
-        + ((float(secondary_centers[w]), float(secondary_k_list[w])) if has_secondary else ())
+        (_num(centers_a[w]), _num(k_list[w]))
+        + ((_num(secondary_centers[w]), _num(secondary_k_list[w])) if has_secondary else ())
         for w in range(int(n)))
 
 
@@ -6836,9 +6862,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     _aux_window_key = None
 
     if fast_resume:
-        # Unconditional (also --extend, which resumes): an auxiliary-CV campaign's checkpoints would
-        # load silently into Contexts without the aux force. No-op for every non-aux campaign.
-        refuse_resume_of_aux_campaign(out_dir)
+        # Every resume (also --extend): auxiliary capability mismatch refused (B1); legacy no-op.
+        refuse_resume_of_aux_campaign(out_dir, args)
         resume_def = load_resume_run_definition(out_dir, topology, args, manifest=resume_manifest)
         cv_atom1 = int(resume_def["cv_atom1"])
         cv_atom2 = int(resume_def["cv_atom2"])
@@ -6869,6 +6894,15 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             _restore_secondary_cv_args_from_metadata(args, secondary_cv_metadata, out_dir=out_dir)
             verify_kernel_identity_on_resume(args, out_dir, secondary_cv_metadata)
         window_metadata = dict(resume_def.get("window_metadata", {}))
+        if getattr(args, "aux_cv_model", None):
+            # Stage C (B2): the frozen auxiliary table comes from the checkpoint, never from today's CSV.
+            from .auxiliary_cv.checkpoint import aux_table_from_checkpoint
+            from .auxiliary_cv.model import AuxModel
+            from .auxiliary_cv.runtime import refuse_aux_population_change
+            _aux_table = aux_table_from_checkpoint(resume_manifest, model=AuxModel.load(args.aux_cv_model))
+            refuse_aux_population_change(_aux_table.n, len(centers_a), cause="checkpoint resume")
+            _aux_window_key = _aux_window_order_key(centers_a, k_list, secondary_cv_centers,
+                                                    secondary_cv_k_kcal_list, len(centers_a))
         shared_gamd_globals_all = dict(resume_def.get("shared_gamd_globals_all", {}) or {})
         shared_gamd_globals_interesting = dict(resume_def.get("shared_gamd_globals_interesting", {}) or {})
         calib_steps = int(resume_def.get("calib_steps", 0) or 0)
@@ -6876,6 +6910,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         shared_gamd_context_checkpoint = None
         print(f"[resume] Production checkpoint manifest found; skipping window generation, US pulling, and shared GaMD setup.")
     else:
+        if bool(getattr(args, "resume", False)):
+            refuse_resume_of_aux_campaign(out_dir, args)       # non-fast --resume (no checkpoint): B1/H3
         if equil_state is None:
             raise RuntimeError("No equilibrated state is available; cannot start ATLaS-MD production without a production checkpoint or saved 03_npt_equilibrated_state.xml.")
         cv_atom1, cv_atom2, distance_cv_label = choose_cv_atoms(topology, args)
@@ -6904,9 +6940,6 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 # is resolved, so no later reordering can pair a state with another window's aux term.
                 _aux_window_key = _aux_window_order_key(centers_a, k_list, secondary_cv_centers,
                                                         secondary_cv_k_kcal_list, len(centers_a))
-                print("WARNING: auxiliary-CV states active (--aux-cv-allow-unpersisted): z values are not "
-                      "written to the sample store yet, so this is an engineering run; its segments are "
-                      "classified 'aux_unpersisted' and excluded from every analysis (Stage C).", flush=True)
             # The filter just renumbered every window-indexed array around its
             # survivors, which invalidates the epoch_window_map.csv the adaptive
             # driver wrote into this phase directory before the sub-run started.

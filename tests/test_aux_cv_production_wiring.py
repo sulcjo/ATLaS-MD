@@ -108,14 +108,14 @@ def test_run_gareus_builds_aux_runtime_before_contexts_and_guards_population():
     assert checks and all(any(k.arg == "topology_sha256" for k in c.keywords) for c in checks)
     causes = {k.value.value for c in _calls(tree, "refuse_aux_population_change") for k in c.keywords
               if k.arg == "cause" and isinstance(k.value, ast.Constant)}
-    assert causes == {"seed-reachability filter", "--max-replicas", "US auto-drop"}
+    assert causes == {"seed-reachability filter", "--max-replicas", "US auto-drop", "checkpoint resume"}
     assert _calls(tree, "aux_snapshot_rows"), "Stage B snapshots must carry aux fields (D5)"
 
 
 def test_resume_refusal_runs_first_in_the_fast_resume_branch():
     import gareus.production as production
     src = inspect.getsource(production.run_gareus)
-    i_refuse = src.find("refuse_resume_of_aux_campaign(out_dir)")
+    i_refuse = src.find("refuse_resume_of_aux_campaign(out_dir")
     i_load = src.find("resume_def = load_resume_run_definition(")
     assert 0 <= i_refuse < i_load, "the aux resume refusal must precede loading the resume definition"
     assert src.find("if fast_resume:") < i_refuse

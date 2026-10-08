@@ -113,22 +113,23 @@ def test_segment_eligibility_excludes_unpersisted_aux_segments(tmp_path):
     assert segment_eligibility(run)["seg_001"]["eligibility"] == ELIGIBLE_AUX_UNPERSISTED
 
 
-def test_resume_of_an_aux_campaign_is_refused_unconditionally(tmp_path):
+def test_resume_of_an_aux_campaign_without_its_model_is_refused(tmp_path):
     from gareus.production import refuse_resume_of_aux_campaign
     run = _run_dir_with_snapshot(tmp_path, {"exchange_energy_version": EXCHANGE_ENERGY_VERSION_AUX,
                                             "aux_model_sha256": "d" * 64})
     with pytest.raises(RuntimeError, match="auxiliary"):
-        refuse_resume_of_aux_campaign(run)
+        refuse_resume_of_aux_campaign(run, types.SimpleNamespace(aux_cv_model=None))
 
 
 def test_resume_of_a_legacy_campaign_is_not_refused(tmp_path, capsys):
     from gareus.production import refuse_resume_of_aux_campaign
-    refuse_resume_of_aux_campaign(_run_dir_with_snapshot(tmp_path, {"exchange_energy_version": EXCHANGE_ENERGY_VERSION}))
-    refuse_resume_of_aux_campaign(tmp_path / "empty")          # no windows/ at all
+    refuse_resume_of_aux_campaign(_run_dir_with_snapshot(tmp_path, {"exchange_energy_version": EXCHANGE_ENERGY_VERSION}),
+                                  types.SimpleNamespace(aux_cv_model=None))
+    refuse_resume_of_aux_campaign(tmp_path / "empty", types.SimpleNamespace(aux_cv_model=None))  # no windows/
     old = tmp_path / "old"
     (old / "windows").mkdir(parents=True)
     (old / "windows" / "seg_001.json").write_text(json.dumps({"segment_id": "seg_001", "windows": []}))
-    refuse_resume_of_aux_campaign(old)                        # snapshot predating kernel identity
+    refuse_resume_of_aux_campaign(old, types.SimpleNamespace(aux_cv_model=None))  # snapshot predating kernel identity
     assert capsys.readouterr().out == ""
 
 

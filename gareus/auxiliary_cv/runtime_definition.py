@@ -4,6 +4,7 @@ Only imported on the auxiliary path (``--aux-cv-model``); every OpenMM / product
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -16,6 +17,7 @@ _PATH_SUFFIXES = ("_path", "_file", "_filename")
 _PATH_KEYS = {"path", "file", "filename"}
 _RESTRAINT_FIELDS = ("center1", "k1", "center2", "k2")
 SOLVATED_START_PDB = "01_solvated_start.pdb"
+_OPENMM_VERSION_ATTR = re.compile(r'\sopenmmVersion="[^"]*"')
 
 
 def physical_system_sha256(openmm, system) -> str:
@@ -27,7 +29,10 @@ def physical_system_sha256(openmm, system) -> str:
     """
     copy = openmm.XmlSerializer.deserialize(openmm.XmlSerializer.serialize(system))
     copy.setDefaultPeriodicBoxVectors(openmm.Vec3(1, 0, 0), openmm.Vec3(0, 1, 0), openmm.Vec3(0, 0, 1))
-    return digest(openmm.XmlSerializer.serialize(copy).encode("utf-8"))
+    # The serializer stamps the OpenMM release (<System openmmVersion="...">); an OpenMM update alone must
+    # not make an auxiliary run unresumable (kernel identity and parity checks cover physics changes).
+    xml = _OPENMM_VERSION_ATTR.sub("", openmm.XmlSerializer.serialize(copy), count=1)
+    return digest(xml.encode("utf-8"))
 
 
 def solvated_start_topology_identities(out_dir, model) -> tuple[str, str]:
