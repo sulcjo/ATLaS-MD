@@ -17,10 +17,10 @@ Run by the user. Nothing here was executed by the implementer. Measures stored-v
 Branch `feat/cvaux-t15` (or the merged feat/cvaux tip), from the local worktree:
 
 ```
-SCR=~/cvaux_parity_scratch          # on aurum2; must NOT be ~/2026_peptide_sampler or ~/gareus
+SCR=cvaux_parity_scratch            # on aurum2; must NOT be ~/2026_peptide_sampler or ~/gareus
 rsync -a --exclude .git --exclude RUNS --exclude '*.log' \
   /run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/.claude/worktrees/cvaux-t15/ \
-  sulcjo@aurum2:cvaux_parity_scratch/
+  sulcjo@aurum2:"$SCR"/
 ```
 
 (no `--delete`; `ssh sulcjo@aurum2`, not `ssh aurum`). Run everything below with `cd $SCR`.
@@ -35,18 +35,18 @@ Task 14 defines configuration A, the 24-window CSV and the model build. Use:
 
 `<<TASK14: exact configuration A command, CSV path and model path go here once Task 14 is built>>`
 
-Common flags on every aux run: `--production-phase-timers --aux-cv-model <MODEL>`. Below `$CMD_A` stands for
+Common flags on every run (put them in `$CMD_A` once): `--production-phase-timers`, plus `--aux-cv-model <MODEL>` on aux runs. Below `$CMD_A` stands for
 Task 14's configuration A command, `$OUT_*` for distinct output dirs.
 
 ## 3. Parity runs (three, same CSV and model)
 
 ```
 # CUDA mixed (default precision)
-$CMD_A --platform CUDA --out $OUT_CUDA_MIXED  --production-phase-timers
+$CMD_A --platform CUDA --out $OUT_CUDA_MIXED
 # OpenCL
-$CMD_A --platform OpenCL --out $OUT_OPENCL    --production-phase-timers
+$CMD_A --platform OpenCL --out $OUT_OPENCL
 # CUDA double
-$CMD_A --platform CUDA --precision double --out $OUT_CUDA_DOUBLE --production-phase-timers
+$CMD_A --platform CUDA --precision double --out $OUT_CUDA_DOUBLE
 ```
 
 `<<TASK14: confirm the precision flag spelling and --out flag in the exact command>>`
@@ -65,8 +65,8 @@ read-only and launches nothing.
 Repeat Task 14's exception path (configuration A):
 
 ```
-GAREUS_TEST_FAIL_AT_PROD_STEP=<N> $CMD_A --platform CUDA --out $OUT_RT --production-phase-timers   # dies at step N
-$CMD_A --platform CUDA --out $OUT_RT --resume --production-phase-timers
+GAREUS_TEST_FAIL_AT_PROD_STEP=<N> $CMD_A --platform CUDA --out $OUT_RT   # dies at step N
+$CMD_A --platform CUDA --out $OUT_RT --resume
 ```
 
 `<<TASK14: the N used in its exception path>>`. `verify_aux_resume` must pass: `loadCheckpoint` restores the
@@ -79,8 +79,10 @@ Same 24 windows, `--aux-cv-model` omitted, CSV minus the aux and instance column
 `--production-phase-timers`, same step count and GPU allocation:
 
 ```
-$CMD_A_NOAUX --platform CUDA --out $OUT_BASE --production-phase-timers
+$CMD_A_NOAUX --platform CUDA --out $OUT_BASE
 ```
+
+Note: top-level `ok` does not surface `bound_vacuous`. Check every segment's `bound_vacuous` flag; a vacuous segment (no active aux state, k_max 0) proves only finiteness, not parity.
 
 ## 6. Record (evidence file)
 

@@ -4,5 +4,7 @@
 set -euo pipefail
 [ "$#" -ge 1 ] || { echo "usage: $0 RUN_DIR [RUN_DIR ...]" >&2; exit 2; }
 for d in "$@"; do [ -d "$d" ] || { echo "not a directory: $d" >&2; exit 2; }; done
+args=()
+for d in "$@"; do args+=("$(realpath "$d")"); done
 cd "$(dirname "$0")/.."
-exec python -m gareus.auxiliary_cv.parity_report "$@"
+exec python -m gareus.auxiliary_cv.parity_report "${args[@]}"
