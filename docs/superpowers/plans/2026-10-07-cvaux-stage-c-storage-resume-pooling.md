@@ -1179,6 +1179,27 @@ def test_legacy_rows_mixed_into_event_ledger_raise(tmp_path):
         replay_assignments(load_exchanges(tmp_path), [1, 0, 2], after_step=0, up_to_step=100)
 
 
+def test_float_nan_event_columns_raise_before_any_int_cast(tmp_path):
+    from gareus.query import load_exchanges
+    reg_seg = "seg_001"
+    w = _writer(tmp_path, reg_seg)
+    _swap(w, 100, 0, 0, 1, 1, 0, [1, 0, 2])
+    _swap(w, 200, 0, 0, 1, 1, 0, [0, 1, 2])
+    w.close()
+    ev = dict(load_exchanges(tmp_path))
+    seq = np.asarray(np.ma.getdata(ev["attempt_seq"]), dtype=np.float64).copy()
+    seq[1] = np.nan
+    ev["attempt_seq"] = seq
+    with pytest.raises(IntegrityError, match="legacy exchange rows mixed.*NaN"):
+        replay_assignments(ev, [0, 1, 2], after_step=0, up_to_step=200)
+    sha = np.asarray(ev["assignment_sha256_after"], dtype=object).copy()
+    sha[0] = float("nan")
+    ev["attempt_seq"] = np.asarray(np.ma.getdata(load_exchanges(tmp_path)["attempt_seq"]))
+    ev["assignment_sha256_after"] = sha
+    with pytest.raises(IntegrityError, match="legacy exchange rows mixed.*None/NaN"):
+        replay_assignments(ev, [0, 1, 2], after_step=0, up_to_step=200)
+
+
 def test_legacy_exchanges_cannot_be_replayed(tmp_path):
     from gareus.query import load_exchanges
     from gareus.store import ParquetExchangeWriter
@@ -1227,9 +1248,13 @@ def _col(events, name, rows=None):
                                  f"{int(mask[rows].sum())} missing values in the replay range)")
         value = np.ma.getdata(value)
     arr = np.asarray(value)
-    if rows is not None and name in _EVENT_COLUMNS and arr.dtype == object:
-        if any(x is None for x in arr[rows]):
-            raise IntegrityError(f"legacy exchange rows mixed into an event ledger (column {name} has None)")
+    if rows is not None and name in _EVENT_COLUMNS:
+        # Board condition 2: a float column (pandas/NumPy upcast of a missing int) carries NaN, and
+        # NaN.astype(int64) is garbage. Detect it before any cast, deterministically.
+        if arr.dtype.kind == "f" and np.isnan(arr[rows]).any():
+            raise IntegrityError(f"legacy exchange rows mixed into an event ledger (column {name} has NaN)")
+        if arr.dtype == object and any(x is None or (isinstance(x, float) and x != x) for x in arr[rows]):
+            raise IntegrityError(f"legacy exchange rows mixed into an event ledger (column {name} has None/NaN)")
     return arr
 
 
@@ -1577,6 +1602,11 @@ def _force_record(info) -> dict[str, Any]:
     return record
 
 
+# Board condition 8: strict on purpose. Measured 2026-10-08 (OpenMM 8.5.1, Reference and CPU):
+# Context.createCheckpoint/loadCheckpoint restores CustomCVForce globals bit-exactly, both into the
+# same Context and into a fresh one (scratch verify_C/board_checks.py). CUDA/OpenCL round-trip
+# precision is measured in Task 14 Step 4; if a GPU platform is not bit-exact, record the measured
+# deviation there and stop (spec Section 17) -- do not loosen _REL here.
 def _check_params(state, assignments, observed, label) -> None:
     for r, (window, got) in enumerate(zip(assignments, observed)):
         expect = expected_aux_parameters(state, window)
@@ -2080,6 +2110,18 @@ def test_refuse_vs_exclude_and_report():
     assert rep["by_structural_group"].startswith("unavailable")
     man = json.loads(str(a["export_manifest_json"].item()))
     assert man["n_samples"] == 8 and man["n_kept"] == 6 and man["n_excluded"] == 2
+    # Board condition 9: every exported per-sample array is aligned with the kept rows.
+    n_kept = man["n_kept"]
+    for key, value in a.items():
+        arr = np.asarray(value)
+        if arr.ndim >= 1 and arr.shape[0] in (8, n_kept) and key not in ("N_k",):
+            assert arr.shape[0] == n_kept, f"exported array {key} has {arr.shape[0]} rows, expected {n_kept}"
+
+
+def test_registry_lookup_is_integrity_error_not_keyerror():
+    from gareus.auxiliary_cv.offline import registry_model
+    with pytest.raises(IntegrityError, match="missing from the frozen state definition"):
+        registry_model({"aux_models": {}}, "f" * 64, where="test")
 
 
 def test_exclusion_report_bins_finite_z():
@@ -2139,6 +2181,15 @@ def _float_column(samples, name, n) -> np.ndarray:
     if arr.shape != (n,):
         raise IntegrityError(f"sample column {name} has shape {arr.shape}, expected ({n},)")
     return arr
+
+
+def registry_model(definition: Mapping[str, Any], sha: str, *, where: str) -> AuxModel:
+    """The frozen registry's model for ``sha``; a diagnostic IntegrityError, never a KeyError (board 7)."""
+    registry = (definition or {}).get("aux_models") or {}
+    if sha not in registry:
+        raise IntegrityError(f"{where}: auxiliary model {sha} is recorded in the sample schema but missing "
+                             f"from the frozen state definition's aux_models registry {sorted(registry)}")
+    return AuxModel.from_mapping(registry[sha])
 
 
 def parity_context(windows, beta: float) -> dict[str, Any]:
@@ -2263,7 +2314,9 @@ Right after `envelope = ...`:
             raise IntegrityError(f"platform precision not recorded for segment(s) {unknown_prec}; "
                                  "parity tolerance cannot be chosen")
         row_tol = np.asarray([PARITY_TOLERANCE[precision[s]] for s in segments], dtype=np.float64)
-        models = {sha: AuxModel.from_mapping(table.definition["aux_models"][sha]) for sha in aux_sample_schema.model_shas}
+        from ..auxiliary_cv.offline import registry_model
+        models = {sha: registry_model(table.definition, sha, where="strict exporter")
+                  for sha in aux_sample_schema.model_shas}
         aux_z = aux_z_from_samples(samples, aux_sample_schema, models,
                                    parity_reduced_tol=row_tol, **parity_context(table.windows, beta))
     extra = {"aux_z": aux_z} if aux_z is not None else {}
@@ -2306,6 +2359,11 @@ Move the `for name in ("step", "replica"): if name in samples: arrays[name] = ..
 
 Remaining exporter edits:
 - In `source_arrays`, add the features when `aux_z is not None`: the `tor_###` columns, `aux_z:{sha}` and `aux_tolerance` (`row_tol`).
+- **Board condition 9 resolution: `source_arrays` is deliberately not masked.**
+  - In the exporter (`gareus/correctness/export.py:141-153`), `source_arrays` holds only input-provenance hashes. `manifest["source_arrays"] = {key: array_hash(value)}` hashes the complete pre-exclusion input, as `cv1`, `origins` and `segments` already do. No per-sample array from it is written to the NPZ.
+  - Masking it would make the signature describe a sample set that never existed on disk.
+  - The rows actually exported are the ones in the `keep` loop. `exclusion_report` together with `n_kept`/`n_excluded` ties the hashed input to the exported subset.
+  - The alignment test below pins that every exported per-sample array has length `n_kept`.
 - When `report is not None`, add `"exclusion_report": report`, `"n_kept": int(complete.sum())` and `"n_excluded": int((~complete).sum())` to `manifest`. Add `"on_incomplete": on_incomplete` to `signature_payload` only when it differs from `"refuse"`.
 - Thread `aux_sample_schema`, `aux_segment_precision`, `on_incomplete` and `time_block_steps` through `export_fixed_state_npz`.
 
@@ -2518,6 +2576,27 @@ def test_other_pooling_paths_refuse_aux(tmp_path):
     assert d.meta["aux_models"] == [MODEL.model_sha256]
 
 
+def test_load_data_default_path_works_for_aux_run_without_rounds(tmp_path):
+    from gareus.mbar_analysis.loaders import load_data
+    _run(tmp_path, historical=False)
+    d = load_data(tmp_path, None, source="auto")                 # default no_augment=False (board 4)
+    assert d.meta["aux_models"] == [MODEL.model_sha256]
+
+
+def test_load_data_refuses_aux_round_dir_and_skips_plain_round_dir(tmp_path):
+    from gareus.mbar_analysis.loaders import load_data
+    _run(tmp_path, historical=False)
+    rd = tmp_path / "adaptive_feedback_round_01"
+    (rd / "analysis_chunks").mkdir(parents=True)
+    (rd / "umbrella_windows.csv").write_text("window\n0\n")
+    (rd / "analysis_chunks" / "chunk_000.npz").write_bytes(b"")
+    d = load_data(tmp_path, None, source="auto")
+    assert any("augmentation skipped" in n for n in d.meta.get("load_notes", []))
+    _run(rd, historical=False)                                     # the round itself carries aux states
+    with pytest.raises(IntegrityError, match="adaptive round augmentation"):
+        load_data(tmp_path, None, source="auto")
+
+
 def test_union_builder_scans_pilot_dirs(tmp_path):
     from gareus.adaptive_production import build_union_state_mbar_inputs
     pilot = tmp_path / "pilot"; pilot.mkdir()
@@ -2654,8 +2733,10 @@ After `temp, beta = infer_temp_beta(prod, meta)`, which is already above, insert
         if bad_rt:
             raise IntegrityError(f'platform precision not recorded for segment(s) {bad_rt}')
         row_tol = np.asarray([PARITY_TOLERANCE[runtimes[s]['precision']] for s in seg_col], dtype=np.float64)
-        models = {sha: AuxModel.from_mapping(table.definition['aux_models'][sha]) for sha in schema.model_shas
-                  if sha in (table.definition.get('aux_models') or {})}
+        from gareus.auxiliary_cv.offline import registry_model
+        # Every schema model must be in the frozen registry: a silent filter would drop an active term.
+        models = {sha: registry_model(table.definition, sha, where=f'load_parquet ({prod})')
+                  for sha in schema.model_shas}
         if any(float(w.get('aux_k', 0.0)) > 0 for w in windows):
             aux_z = aux_z_from_samples(samples, schema, models, parity_reduced_tol=row_tol,
                                        **parity_context(windows, beta))
@@ -2686,6 +2767,24 @@ Placement: this block goes after `samples = load_samples(prod)` and `windows = l
 
 `clean()` then drops exactly those rows: same mask, `np.isfinite(d.cv) & finite_rows(d.u_nk)`.
 
+**N_k after exclusion (board condition 6), verified against current code:**
+- `clean()` (`gareus/mbar_analysis/data.py:249-267`) slices `d.window` with the same mask it applies to `d.u_nk`, along with `cv`, `cv2`, `replica`, `step` and `boost_kj`, the optional per-sample arrays and `_epoch_source`.
+- `Data` stores no separate `N_k`. Every solver recomputes it from the filtered origins at solve time: `np.bincount(window[(window >= 0) & (window < K)], minlength=K)` in `gareus/mbar_analysis/solvers.py:265, 369, 523, 676, 829, 1207`.
+- So origin counts cannot drift from the retained rows.
+- Pin this in `test_aux_loaders.py`:
+
+```python
+def test_origin_counts_follow_exclusion(tmp_path):
+    from gareus.mbar_analysis.data import clean
+    from gareus.mbar_analysis.loaders import load_parquet
+    _run(tmp_path, historical=False, nan_rows=(1, 3))   # two rows with NaN torsions (existing fixture option)
+    d = clean(load_parquet(tmp_path, aux_on_incomplete="exclude_and_report", aux_time_block_steps=300))
+    K = d.u_nk.shape[1]
+    nk = np.bincount(d.window, minlength=K)
+    assert int(nk.sum()) == d.u_nk.shape[0] == d.cv.size
+    assert np.isfinite(d.u_nk).all()
+```
+
 Guards:
 - `load_npz` and `load_csv`: first body line `from gareus.auxiliary_cv.offline import refuse_aux_snapshots; refuse_aux_snapshots(prod, where="load_npz (analysis arrays)")`, and `where="load_csv"` respectively.
 - `load_data`: in the plain branch, right after `requested=...`:
@@ -2707,7 +2806,20 @@ Guards:
     if not no_augment_effective:
 ```
 
-  For an aux run with round directories present and `no_augment=False`, call `refuse_aux_snapshots(run_dir, where="adaptive round augmentation")` before skipping. That way the refusal is visible rather than silent.
+  Augmentation for aux runs (board condition 4) looks only at real round directories. `refuse_aux_snapshots(run_dir, ...)` must **not** be called on the run directory: its `rglob("windows/*.json")` finds the aux run's own main snapshots, so every aux run would raise. Replace the `if not no_augment_effective:` body's aux handling with:
+
+```python
+    if run_has_aux(prod) and not no_augment:
+        _rd_root = prod.parent if prod.name == 'final_production' else prod
+        _rounds = _find_gareus_round_dirs(_rd_root)      # adaptive_feedback_round_* with analysis chunks only
+        for _rd in _rounds:
+            refuse_aux_snapshots(Path(_rd), where=f'adaptive round augmentation ({_rd.name})')
+        if _rounds:
+            notes.append(f'Auxiliary run: adaptive round augmentation skipped for {len(_rounds)} round dir(s); '
+                         'their rows carry no auxiliary features and cannot join an auxiliary pool.')
+```
+
+  `_find_gareus_round_dirs` (`loaders_adaptive.py:125`) is already imported in `loaders.py:29`. With no round directories, the default `no_augment=False` path proceeds unchanged.
 - `gareus/query.py` `export_analysis_arrays_npz`: first body line `from .auxiliary_cv.offline import refuse_aux_snapshots; refuse_aux_snapshots(Path(run_dir), where="legacy analysis_arrays.npz export")`.
 - `load_parquet_adaptive_union` (`loaders_union_parquet.py:303`): first body line `refuse_aux_snapshots(Path(adaptive_dir), where="adaptive union loader")`.
 - `build_union_state_mbar_inputs` (`adaptive_production.py:3715`), right after `adaptive_dir = Path(adaptive_dir)`:
@@ -3355,6 +3467,10 @@ def check_runtime_parity(runtime_z, positions_z, *, beta: float, k_max_kcal: flo
         from .cv import primary_cv_is_dimensionless
         _ens = str(getattr(args, "production_ensemble", "npt")).upper()
         _box = (None if _ens == "NPT" else
+                # Board condition 3: an OpenMM State always carries the box. Verified 2026-10-08 on 8.5.1
+                # Reference/CPU: bare getState() returned the 3 nm box (scratch verify_C/board_checks.py).
+                # No getState flag selects box vectors; this is the repo's own idiom
+                # (production.py:5859 equil_state.getPeriodicBoxVectors()). Task 13 re-checks it end to end.
                 np.asarray(sims[0].context.getState().getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.nanometer)).tolist())
         _cv1 = embed_cv_definition(primary_cv_mode(args), "dimensionless" if primary_cv_is_dimensionless(args) else "angstrom",
                                    _json_ready(primary_cv_def))
@@ -3558,6 +3674,17 @@ def test_compare_runs_identical(tmp_path):
         _ledger(run, "s", [(100, 0, "stay", 0), (100, 1, "stay", 1)])
     rep = compare_runs(a, b)
     assert rep["ok"] and rep["ledger_duplicates"] == 0
+
+def test_compare_runs_detects_duplicate_sample_rows(monkeypatch, tmp_path):
+    import gareus.auxiliary_cv.resume_check as rc
+    base = {"step": np.array([100, 200]), "replica": np.array([0, 0]), "window_id": np.array([0, 1])}
+    dup = {k: np.concatenate([v, v[-1:]]) for k, v in base.items()}
+    ev = {"step": np.array([100]), "attempt_seq": np.array([0]), "assignment_sha256_after": np.array(["a"])}
+    monkeypatch.setattr("gareus.query.load_exchanges", lambda p: ev)
+    monkeypatch.setattr("gareus.query.load_samples", lambda p: base if "ctl" in str(p) else dup)
+    out = rc.compare_runs(tmp_path / "ctl", tmp_path / "res")
+    assert out["sample_duplicate_keys"]["resumed"] == 1 and out["sample_rows"] == {"control": 2, "resumed": 3}
+    assert out["ok"] is False
 ```
 
 - [ ] **Step 2: Implement `resume_check.py`**
@@ -3581,10 +3708,13 @@ def ledger_completeness(events, *, selected_per_step: Optional[int]) -> dict[str
     return {"ok": not bad, "steps": int(steps.size), "bad_steps": bad}
 
 
-def _key_rows(samples) -> dict[tuple, int]:
-    keys = list(zip(np.asarray(samples["step"]).tolist(), np.asarray(samples["replica"]).tolist(),
+def _keys(samples) -> list[tuple]:
+    return list(zip(np.asarray(samples["step"]).tolist(), np.asarray(samples["replica"]).tolist(),
                     np.asarray(samples["window_id"]).tolist()))
-    return {k: i for i, k in enumerate(keys)}
+
+
+def _key_rows(samples) -> dict[tuple, int]:
+    return {k: i for i, k in enumerate(_keys(samples))}
 
 
 def compare_runs(control_dir, resumed_dir, *, z_atol: float = 1e-9) -> dict[str, Any]:
@@ -3599,8 +3729,16 @@ def compare_runs(control_dir, resumed_dir, *, z_atol: float = 1e-9) -> dict[str,
         sorted(zip(pr, np.asarray(er["assignment_sha256_after"]).tolist()))
     sc, sr = load_samples(Path(control_dir)), load_samples(Path(resumed_dir))
     if sc and sr:
+        keys_c, keys_r = _keys(sc), _keys(sr)
+        # Board condition 5: a dict/set comparison cannot see phantom duplicate rows (a reseal regression
+        # with a clean ledger). Compare row counts and duplicate keys explicitly.
+        out["sample_rows"] = {"control": len(keys_c), "resumed": len(keys_r)}
+        out["sample_duplicate_keys"] = {"control": len(keys_c) - len(set(keys_c)),
+                                        "resumed": len(keys_r) - len(set(keys_r))}
         kc, kr = _key_rows(sc), _key_rows(sr)
-        out["sample_keys_equal"] = set(kc) == set(kr)
+        out["sample_keys_equal"] = (set(kc) == set(kr) and len(keys_c) == len(keys_r)
+                                    and out["sample_duplicate_keys"]["resumed"] == 0
+                                    and out["sample_duplicate_keys"]["control"] == 0)
         common = sorted(set(kc) & set(kr))
         if "aux_z_00" in sc and common:
             zc = np.asarray(sc["aux_z_00"], dtype=float)[[kc[k] for k in common]]
@@ -3627,7 +3765,12 @@ Use the GA dipeptide system with `--run-mode cmd` (no GaMD, so no stock-boost re
 - **Check:** `python -c "from gareus.auxiliary_cv.resume_check import compare_runs, ledger_completeness; from gareus.query import load_exchanges; print(compare_runs('RUN_C','RUN_X')); print(ledger_completeness(load_exchanges('RUN_X'), selected_per_step=4))"`, and the same for `RUN_R`. `ok` must be True. On CPU, `max_abs_dz` should be 0. A bitwise difference after the resume step, with equal ledgers, means a nondeterministic CPU reduction: record it in the Task 15 note, never loosen `z_atol` silently.
 - **Load:** `load_parquet(RUN_X, allow_ineligible_aux_segments=True)` builds a finite `u_nk` (the run is `pilot`/ineligible by default).
 
-Record the four outputs in `docs/superpowers/plans/cvaux_stage_c_exit_evidence.md` (force-add) and commit with the hook:
+Record the four outputs in `docs/superpowers/plans/cvaux_stage_c_exit_evidence.md` (force-add). The evidence file must also carry a "Legacy behaviour change" paragraph (board caveat):
+- **What changes.** `reseal_parent_for_resume` now re-seals every non-complete parent segment at the checkpoint step on resume, for auxiliary and non-auxiliary runs alike.
+- **Consequence.** After an exception crash plus resume, legacy analyses drop the post-checkpoint rows they previously double-counted.
+- **Evidence.** Include the `RUN_X` row counts (sealed `end_step` before vs after resume).
+
+Commit with the hook:
 
 ```bash
 git add gareus/auxiliary_cv/resume_check.py tests/test_aux_resume_check.py gareus/production.py
@@ -3677,27 +3820,34 @@ import numpy as np
 
 
 def parity_report(run_dir) -> dict[str, Any]:
+    from ..correctness._io import IntegrityError
+    from ..correctness.export import R_KJ_MOL_K
     from ..correctness.state_identity import canonical_state_definition
     from ..query import load_samples, load_windows_metadata
-    from .model import AuxModel
-    from .offline import _float_column, parity_context, parity_violation, segment_aux_runtime, segment_aux_schemas
+    from .offline import (_float_column, parity_context, parity_violation, registry_model,
+                          segment_aux_runtime, segment_aux_schemas)
     from .evaluate import z_from_dihedrals
     from .sample_schema import PARITY_TOLERANCE
     run_dir = Path(run_dir)
     schemas, runtimes = segment_aux_schemas(run_dir), segment_aux_runtime(run_dir)
-    meta = load_windows_metadata(run_dir) or {}
-    state = canonical_state_definition(meta["state_definition"])
-    beta = 1.0 / (8.314462618e-3 * float(state["temperature_k"]))
-    ctx = parity_context(state["windows"], beta)
     out: dict[str, Any] = {"segments": {}}
     for seg, schema in schemas.items():
         if schema is None:
             continue
+        # Board condition 1. load_windows_metadata(run_dir, segment_id=None) (gareus/query.py:354) takes
+        # both arities, but the one-argument form returns only the LATEST segment's snapshot. Each segment
+        # is graded against its own frozen state definition.
+        meta = load_windows_metadata(run_dir, seg) or {}
+        if not meta.get("state_definition"):
+            raise IntegrityError(f"segment {seg} has auxiliary samples but no frozen state_definition snapshot")
+        state = canonical_state_definition(meta["state_definition"])
+        beta = 1.0 / (R_KJ_MOL_K * float(state["temperature_k"]))
+        ctx = parity_context(state["windows"], beta)
         s = load_samples(run_dir, segment_ids=[seg])
         n = len(np.asarray(s["cv1"]))
         theta = np.stack([_float_column(s, c, n) for c in schema.torsion_columns], axis=1)
         sha = schema.model_shas[0]
-        model = AuxModel.from_mapping(state["aux_models"][sha])
+        model = registry_model(state, sha, where=f"parity_report ({seg})")
         z_off = z_from_dihedrals(theta[:, schema.model_basis_index(model)], model)
         z_run = _float_column(s, schema.z_columns[0], n)
         both = np.isfinite(z_off) & np.isfinite(z_run)
