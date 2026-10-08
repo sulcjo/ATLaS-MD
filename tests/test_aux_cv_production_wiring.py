@@ -90,3 +90,95 @@ def test_sampled_umbrella_bias_stays_umbrella_only():
     src = inspect.getsource(__import__("gareus.production", fromlist=["run_gareus"]).run_gareus)
     line = [l for l in src.splitlines() if "sampled_umbrella_bias_kj = float(" in l]
     assert line and "aux" not in line[0], "sampled_umbrella_bias_kj must remain primary + secondary only"
+
+
+def test_run_gareus_builds_aux_runtime_before_contexts_and_guards_population():
+    import gareus.production as production
+    src = inspect.getsource(production.run_gareus)
+    tree = ast.parse(src)
+    add_calls = _calls(tree, "add_aux_cv_force")
+    assert len(add_calls) == 3, "base system + two starting-structure systems must all carry the aux force"
+    assert sum(any(k.arg == "force_group" for k in c.keywords) for c in add_calls) == 2
+    base_line = min(c.lineno for c in add_calls)
+    # Replica Contexts are built by the nested _build_context_i (dispatched through the pool, so
+    # it is not a direct call); the base-system aux force must precede its definition.
+    assert base_line < _func(tree, "_build_context_i").lineno
+    assert _calls(tree, "load_aux_state_table")
+    checks = _calls(tree, "check_feature_atoms")
+    assert checks and all(any(k.arg == "topology_sha256" for k in c.keywords) for c in checks)
+    causes = {k.value.value for c in _calls(tree, "refuse_aux_population_change") for k in c.keywords
+              if k.arg == "cause" and isinstance(k.value, ast.Constant)}
+    assert causes == {"seed-reachability filter", "--max-replicas", "US auto-drop"}
+    assert _calls(tree, "aux_snapshot_rows"), "Stage B snapshots must carry aux fields (D5)"
+
+
+def test_resume_refusal_runs_first_in_the_fast_resume_branch():
+    import gareus.production as production
+    src = inspect.getsource(production.run_gareus)
+    i_refuse = src.find("refuse_resume_of_aux_campaign(out_dir)")
+    i_load = src.find("resume_def = load_resume_run_definition(")
+    assert 0 <= i_refuse < i_load, "the aux resume refusal must precede loading the resume definition"
+    assert src.find("if fast_resume:") < i_refuse
+    # Unconditional: the first statement of the branch, not nested under a CV2/aux condition.
+    tree = _run_gareus_source()
+    branch = [n for n in ast.walk(tree) if isinstance(n, ast.If) and isinstance(n.test, ast.Name)
+              and n.test.id == "fast_resume" and n.body and isinstance(n.body[0], ast.Expr)
+              and _calls(n.body[0], "refuse_resume_of_aux_campaign")]
+    assert len(branch) == 1
+
+
+def test_snapshot_rows_with_instances_go_through_stage_a_instance_checks():
+    """C1: slot pairing and roles are enforced once, by Stage A's _check_instances."""
+    tree = _run_gareus_source()
+    checks = _calls(tree, "_check_instances")
+    assert len(checks) == 1
+    arg = checks[0].args[0]
+    assert isinstance(arg, ast.Call) and _calls(arg, "normalize_windows")
+    assert _calls(tree, "window_rows"), "instances must come from the aux table (snapshot rows drop them)"
+    assert checks[0].lineno > min(c.lineno for c in _calls(tree, "aux_snapshot_rows"))
+
+
+def test_us_auto_drop_guard_passes_the_real_drop_count():
+    """L6: n_now is the survivor count, not len - 1."""
+    tree = _run_gareus_source()
+    guard = [c for c in _calls(tree, "refuse_aux_population_change") for k in c.keywords
+             if k.arg == "cause" and isinstance(k.value, ast.Constant) and k.value.value == "US auto-drop"]
+    assert len(guard) == 1
+    n_now = ast.unparse(guard[0].args[1])
+    assert "dropped_window_indices" in n_now and "- 1" not in n_now
+
+
+def test_aux_runtime_resolution_checks_population_and_window_order():
+    """Task-6 alignment: the table matches the replica count and the window order it was loaded in."""
+    src = inspect.getsource(__import__("gareus.production", fromlist=["run_gareus"]).run_gareus)
+    i_res = src.find('_aux_rt = getattr(args, "_aux_runtime", None)')
+    assert i_res >= 0
+    block = src[i_res:i_res + 2500]
+    assert "_aux_rt.table.n != nrep" in block
+    assert "_aux_window_key" in block
+
+
+def test_assemble_refuses_aux_matrix_of_wrong_shape():
+    from gareus.correctness._io import IntegrityError
+    d = np.zeros((3, 3))
+    with pytest.raises(IntegrityError, match="shape"):
+        assemble_bias_matrices(d, d, d, aux_bias_kcal=np.zeros((3, 2)))
+
+
+def test_aux_runtime_construction_in_run_gareus_is_gated_by_an_aux_condition():
+    """Opt-in: every aux-runtime construction call in run_gareus sits under an aux condition."""
+    tree = _run_gareus_source()
+    parents = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+    for name in ("add_aux_cv_force", "load_aux_state_table", "aux_snapshot_rows", "check_feature_atoms",
+                 "refuse_aux_population_change", "_check_instances", "canonical_topology_sha256"):
+        for call in _calls(tree, name):
+            node, gated = call, False
+            while node in parents:
+                node = parents[node]
+                if isinstance(node, ast.If) and "aux" in ast.unparse(node.test):
+                    gated = True
+                    break
+            assert gated, f"{name} at line {call.lineno} is not under an aux condition"

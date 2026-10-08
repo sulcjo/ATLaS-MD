@@ -2245,8 +2245,12 @@ def assemble_bias_matrices(distance_bias_kcal, ss_bias_kcal, boost_bias_kj, aux_
     if aux_bias_kcal is None:
         bias_kcal = distance_bias_kcal + ss_bias_kcal + boost_bias_kcal
     else:
-        bias_kcal = (distance_bias_kcal + ss_bias_kcal + np.asarray(aux_bias_kcal, dtype=np.float64)
-                     + boost_bias_kcal)
+        aux_bias_kcal = np.asarray(aux_bias_kcal, dtype=np.float64)
+        if aux_bias_kcal.shape != distance_bias_kcal.shape:
+            from .correctness._io import IntegrityError
+            raise IntegrityError(f"auxiliary bias matrix shape {aux_bias_kcal.shape} != umbrella bias "
+                                 f"shape {distance_bias_kcal.shape} ([state, replica])")
+        bias_kcal = (distance_bias_kcal + ss_bias_kcal + aux_bias_kcal + boost_bias_kcal)
     bias_kj = 4.184 * bias_kcal
     return bias_kcal, bias_kj
 
@@ -2374,6 +2378,16 @@ def make_gamd_integrator(system, args, unit, seed_offset: int = 0):
     except Exception:
         pass
     return integrator, result
+
+def _aux_window_order_key(centers_a, k_list, secondary_centers, secondary_k_list, n) -> tuple:
+    """(center1, k1[, center2, k2]) per window, in order: the identity an auxiliary state table is
+    bound to when loaded, re-checked when the runtime is resolved (auxiliary-CV runs only)."""
+    has_secondary = secondary_centers is not None and secondary_k_list is not None
+    return tuple(
+        (float(centers_a[w]), float(k_list[w]))
+        + ((float(secondary_centers[w]), float(secondary_k_list[w])) if has_secondary else ())
+        for w in range(int(n)))
+
 
 def snapshot_window_rows(centers_a, k_list, secondary_centers, secondary_k_list,
                          gamd_lambdas=None, n=None) -> list[dict]:
@@ -6812,8 +6826,13 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         pass
     resume_manifest = read_json_file(checkpoint_manifest_path(out_dir), None) if bool(getattr(args, "resume", False)) else None
     fast_resume = isinstance(resume_manifest, dict) and bool(resume_manifest.get("replica_checkpoint_files"))
+    _aux_table = None
+    _aux_window_key = None
 
     if fast_resume:
+        # Unconditional (also --extend, which resumes): an auxiliary-CV campaign's checkpoints would
+        # load silently into Contexts without the aux force. No-op for every non-aux campaign.
+        refuse_resume_of_aux_campaign(out_dir)
         resume_def = load_resume_run_definition(out_dir, topology, args, manifest=resume_manifest)
         cv_atom1 = int(resume_def["cv_atom1"])
         cv_atom2 = int(resume_def["cv_atom2"])
@@ -6868,6 +6887,20 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 centers_a, k_list, secondary_cv_centers, secondary_cv_k_kcal_list,
                 secondary_cv_metadata, window_metadata,
             )
+            if getattr(args, "aux_cv_model", None):
+                from .auxiliary_cv.runtime import refuse_aux_population_change
+                refuse_aux_population_change(_n_windows_before_reachability_filter, len(centers_a),
+                                             cause="seed-reachability filter")
+                from .auxiliary_cv.state_table import load_aux_state_table
+                _aux_table = load_aux_state_table(args.aux_cv_model, (window_metadata or {}).get("aux_rows") or [])
+                refuse_aux_population_change(_aux_table.n, len(centers_a), cause="seed-reachability filter")
+                # Window order the table was loaded in (Task-6 alignment): re-checked where the runtime
+                # is resolved, so no later reordering can pair a state with another window's aux term.
+                _aux_window_key = _aux_window_order_key(centers_a, k_list, secondary_cv_centers,
+                                                        secondary_cv_k_kcal_list, len(centers_a))
+                print("WARNING: auxiliary-CV states active (--aux-cv-allow-unpersisted): z values are not "
+                      "written to the sample store yet, so this is an engineering run; its segments are "
+                      "classified 'aux_unpersisted' and excluded from every analysis (Stage C).", flush=True)
             # The filter just renumbered every window-indexed array around its
             # survivors, which invalidates the epoch_window_map.csv the adaptive
             # driver wrote into this phase directory before the sub-run started.
@@ -6964,6 +6997,9 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         print(f"WARNING [production] --max-replicas {_max_replicas}: the checkpoint holds "
               f"{len(centers_a)} windows; resuming with the checkpointed window set, not truncating")
     elif _max_replicas > 0 and len(centers_a) > _max_replicas:
+        if _aux_table is not None:
+            from .auxiliary_cv.runtime import refuse_aux_population_change
+            refuse_aux_population_change(len(centers_a), _max_replicas, cause="--max-replicas")
         print(f"[production] --max-replicas {_max_replicas}: truncating {len(centers_a)} windows to {_max_replicas}")
         centers_a = centers_a[:_max_replicas]
         k_list = k_list[:_max_replicas]
@@ -7087,6 +7123,19 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     secondary_cv_force_info = add_umbrella_cv_forces(
         openmm, base_system, topology, primary_cv_def, args,
         secondary_enabled=bool((secondary_cv_metadata or {}).get("enabled")))
+    args._aux_runtime = None
+    if getattr(args, "aux_cv_model", None):
+        if _aux_table is None:
+            raise RuntimeError("--aux-cv-model set but no auxiliary state table was loaded")
+        from .auxiliary_cv.features import check_feature_atoms
+        from .auxiliary_cv.runtime import add_aux_cv_force, canonical_topology_sha256
+        _aux_topology_sha = canonical_topology_sha256(topology, _aux_table.model)
+        check_feature_atoms(_aux_table.model, topology, topology_sha256=_aux_topology_sha)
+        args._aux_runtime = add_aux_cv_force(openmm, base_system, _aux_table, args,
+                                             topology_sha256=_aux_topology_sha)
+        print(f"    Auxiliary-CV restraint: model {args._aux_runtime.info.model_sha256[:12]}, force group "
+              f"{args._aux_runtime.info.force_group}, {sum(k > 0 for k in _aux_table.k_kcal)} active of "
+              f"{_aux_table.n} states; topology {_aux_topology_sha[:12]}")
     if secondary_cv_force_info.get("enabled"):
         secondary_cv_metadata.update(secondary_cv_force_info)
         print(
@@ -7196,6 +7245,10 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 starting_structure_system = create_system(app, unit, forcefield, topology, args, include_barostat=False)
                 add_umbrella_cv_forces(openmm, starting_structure_system, topology, primary_cv_def, args,
                                        secondary_enabled=bool((secondary_cv_metadata or {}).get("enabled")))
+                if args._aux_runtime is not None:
+                    from .auxiliary_cv.runtime import add_aux_cv_force
+                    add_aux_cv_force(openmm, starting_structure_system, _aux_table, args,
+                                     force_group=args._aux_runtime.info.force_group)
                 _sub = (lambda seq: None if seq is None else [seq[w] for w in _cont_missing])
                 write_json(Path(out_dir) / "us_starting_structures_subset.json", {
                     "note": "--ap-continue-states: only these windows were pulled; files in "
@@ -7245,6 +7298,10 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             starting_structure_system = create_system(app, unit, forcefield, topology, args, include_barostat=False)
             add_umbrella_cv_forces(openmm, starting_structure_system, topology, primary_cv_def, args,
                                    secondary_enabled=bool((secondary_cv_metadata or {}).get("enabled")))
+            if args._aux_runtime is not None:
+                from .auxiliary_cv.runtime import add_aux_cv_force
+                add_aux_cv_force(openmm, starting_structure_system, _aux_table, args,
+                                 force_group=args._aux_runtime.info.force_group)
 
             window_start_positions, window_start_velocities, dropped_window_indices = generate_us_starting_states_by_pulling(
                 args, out_dir, openmm, app, unit, topology, starting_structure_system, centers_nm, ks_kj_nm2,
@@ -7256,6 +7313,11 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             topup_seed_by_window = {}
 
         if dropped_window_indices:
+            if getattr(args, "_aux_runtime", None) is not None:
+                from .auxiliary_cv.runtime import refuse_aux_population_change
+                refuse_aux_population_change(len(centers_a),
+                                             len(centers_a) - len({int(i) for i in dropped_window_indices}),
+                                             cause="US auto-drop")
             _drop_result = drop_bad_us_windows_and_rebuild(
                 out_dir, dropped_window_indices,
                 centers_a, k_list, centers_nm, ks_kj_nm2,
@@ -7699,6 +7761,14 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     _aux_rt = getattr(args, "_aux_runtime", None)
     _fast_aux_forces = [None] * nrep
     if _aux_rt is not None:
+        # Task-6 alignment: one aux state per replica slot, in the window order the table was loaded in.
+        if _aux_rt.table.n != nrep or len(centers_a) != nrep:
+            raise RuntimeError(f"auxiliary state table has {_aux_rt.table.n} states for {nrep} replicas "
+                               f"({len(centers_a)} windows)")
+        if _aux_window_order_key(centers_a, k_list, secondary_cv_centers, secondary_cv_k_kcal_list,
+                                 nrep) != _aux_window_key:
+            raise RuntimeError("window order changed after the auxiliary state table was loaded; "
+                               "each auxiliary term would pair with another window's restraints")
         from .auxiliary_cv.force import AUX_FORCE_NAME as _AUX_CV_FORCE_NAME
         from .auxiliary_cv.runtime import aux_bias_matrix_kcal, make_aux_z_observer
         _fast_aux_forces = [sim.system.getForce(_aux_rt.force_index) for sim in sims]
@@ -7957,6 +8027,19 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         centers_a[:nrep], k_list[:nrep], secondary_cv_centers, secondary_cv_k_kcal_list,
         getattr(args, "state_gamd_lambdas", None), n=nrep,
     )
+    if getattr(args, "_aux_runtime", None) is not None:
+        from .auxiliary_cv.runtime import aux_snapshot_rows
+        # D5: every Stage-B-era snapshot names its auxiliary restraints, so a strict reader fails closed
+        # (MissingCoordinateError) instead of reconstructing the bias without A_s.
+        _win_snapshot_windows = aux_snapshot_rows(_win_snapshot_windows, args._aux_runtime.table)
+        _aux_table_rows = args._aux_runtime.table.window_rows()
+        if all("instance" in t for t in _aux_table_rows):
+            # C1: slot pairing and roles enforced once, by Stage A. aux_snapshot_rows does not carry
+            # the instance blocks, so they come from the table (checked here, not persisted).
+            from .correctness.bias import normalize_windows
+            from .correctness.state_identity import _check_instances
+            _check_instances(normalize_windows([dict(r, instance=t["instance"])
+                                                for r, t in zip(_win_snapshot_windows, _aux_table_rows)]))
     _cv2_type = (secondary_cv_metadata or {}).get("mode") if secondary_cv_centers is not None else None
     WindowSnapshot(out_dir).snapshot(_seg_id, _win_snapshot_windows, cv1_type=primary_cv_mode(args), cv2_type=_cv2_type,
                                      kernel_identity=kernel_identity_for_run(args, secondary_cv_metadata))
