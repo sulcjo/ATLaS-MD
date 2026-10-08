@@ -35,20 +35,31 @@ def _model(d, conventions=None, coeffs=None, offset=0.4, scale=3.181):
         conventions=conventions, blocks=blocks_of(d), scale=scale))
 
 
+def _require_platform(name):
+    import openmm as mm
+    names = [mm.Platform.getPlatform(i).getName() for i in range(mm.Platform.getNumPlatforms())]
+    if name not in names:
+        pytest.skip(f"OpenMM platform {name} unavailable")
+
+
+@pytest.mark.parametrize("platform", ["Reference", "CPU"])
 @pytest.mark.parametrize("conventions", [None, "mixed"])
 @pytest.mark.parametrize("geometry", range(5))
-def test_energy_and_forces_match_reference(conventions, geometry):
+def test_energy_and_forces_match_reference(conventions, geometry, platform):
+    _require_platform(platform)
     d = dipeptide()
     x = perturbed_geometries(d)[geometry]
     conv = None if conventions is None else ["negated" if k % 2 == 0 else "direct" for k in range(len(d["quads"]))]
     m = _model(d, conv)
-    ctx, info, _ = _context(m, len(x))
+    ctx, info, _ = _context(m, len(x), platform=platform)
     ctx.setPositions(x)
     z = z_from_positions(x, m)[0]
     set_aux_parameters(ctx, info, center=z - 0.25, k_kcal=3.0)
     e, f = _energy_forces(ctx)
-    assert e == pytest.approx(aux_energy_kj(np.array([z]), z - 0.25, 3.0)[0], rel=1e-10, abs=1e-10)
-    np.testing.assert_allclose(f, aux_forces_kj_nm(x, m, z - 0.25, 3.0), rtol=1e-8, atol=1e-8)
+    etol = 1e-10 if platform == "Reference" else 1e-5     # CPU platform computes in single precision trig
+    ftol = 1e-8 if platform == "Reference" else 1e-4
+    assert e == pytest.approx(aux_energy_kj(np.array([z]), z - 0.25, 3.0)[0], rel=etol, abs=etol)
+    np.testing.assert_allclose(f, aux_forces_kj_nm(x, m, z - 0.25, 3.0), rtol=ftol, atol=ftol)
 
 
 def test_force_energy_continuous_across_the_pi_branch_cut():
