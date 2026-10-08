@@ -155,6 +155,7 @@ def reconstruct_bias_matrix(
     yield NaN only in states requiring that coordinate. Row filtering belongs
     downstream and must keep origins/counts/aligned arrays consistent.
     _ladder_apply is a test seam, not an alternative production boost definition.
+    aux_z maps model_sha256 to that model's z for every sample; required for every model with an active state.
     """
     beta = finite_number(beta, "beta", positive=True)
     primary = numeric_vector(cv_A, "cv_A")
