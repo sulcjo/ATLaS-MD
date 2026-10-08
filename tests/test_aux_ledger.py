@@ -174,3 +174,14 @@ def test_production_resume_reseal_is_aux_gated_and_legacy_seal_is_unchanged():
     assert ast.unparse(interrupted[0]) == (
         "_seg_registry.seal_segment(_parent_seg_id, absolute_end_step=int(manifest.get('absolute_step', 0)), "
         "status='interrupted')")
+
+
+def test_replay_orders_same_step_swaps_by_attempt_seq_regardless_of_row_order(tmp_path):
+    """Two accepted swaps at step 100 only replay in attempt_seq order; reversed rows must still work."""
+    from gareus.query import load_exchanges
+    _crashed_parent(tmp_path)
+    ev = load_exchanges(tmp_path)
+    n = len(np.asarray(ev["step"]))
+    rev = {k: v[::-1] for k, v in ev.items() if hasattr(v, "__len__") and len(v) == n}
+    assert int(np.asarray(rev["step"])[0]) == 300
+    assert replay_assignments(rev, [0, 1, 2], after_step=0, up_to_step=200) == [1, 2, 0]
