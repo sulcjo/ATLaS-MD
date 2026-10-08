@@ -134,6 +134,9 @@ def _check_instances(windows: list[dict]) -> None:
         if inst["state_role"] in ("ordinary", "sham") and k != 0:
             raise IntegrityError(f"Window {row['window_id']}: state_role {inst['state_role']} requires aux_k == 0")
         parent = inst["spawn_parent_state_id"]
+        if parent is not None and parent == inst["state_instance_id"]:
+            raise IntegrityError(f"Window {row['window_id']}: state is its own parent "
+                                 f"(spawn_parent_state_id == state_instance_id {parent!r})")
         if parent is not None and parent not in known:
             raise IntegrityError(f"Window {row['window_id']}: spawn_parent_state_id {parent!r} is not a "
                                  "state_instance_id in this table")

@@ -135,6 +135,7 @@ def test_kj_tables_convert_aux_k():
     (lambda w, m: w[2]["instance"]["spawn_source_observation"].update(carrier=True), "spawn_source_observation"),
     (lambda w, m: w[2]["instance"].update(spawn_parent_state_id=1), "spawn_parent_state_id"),
     (lambda w, m: w[2]["instance"].update(spawn_parent_state_id="ord-99"), "not a state_instance_id"),
+    (lambda w, m: w[2]["instance"].update(spawn_parent_state_id="aux-0"), "own parent"),
     (lambda w, m: w[0].pop("instance"), "every row"),
     # role <-> energy consistency (spec 1.1 / 11.1: a sham must never carry an active bias)
     (lambda w, m: w[3].update(aux_model_sha256=SHA, aux_center=0.0, aux_k=1.0), "sham requires aux_k == 0"),
