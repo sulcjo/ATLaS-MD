@@ -315,6 +315,8 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
     low_memory: use one epoch worker at a time instead of retaining all worker
         results; callers should prefer the resolved union NPZ when available.
     """
+    from gareus.kernel_identity import refuse_aux_snapshots
+    refuse_aux_snapshots(Path(adaptive_dir), where="adaptive union loader")
     try:
         from gareus.query import load_samples  # noqa: F401 – used in _load_epoch_task
     except ImportError as exc:

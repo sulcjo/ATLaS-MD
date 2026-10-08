@@ -3752,6 +3752,11 @@ def build_union_state_mbar_inputs(
     arrays remain the registry snapshot.
     """
     adaptive_dir = Path(adaptive_dir)
+    # CVaux Stage C (C9): the union bias omits the auxiliary term; refuse aux phases here and in every pilot dir.
+    from .kernel_identity import refuse_aux_snapshots
+    refuse_aux_snapshots(adaptive_dir, where="adaptive union build")
+    for _pilot in (pilot_dirs or []):
+        refuse_aux_snapshots(Path(_pilot), where=f"adaptive union build (pilot dir {_pilot})")
     out_prefix = adaptive_dir / output_prefix
     states = [s for s in registry.all_states() if bool(s.usable_for_mbar)]
     if not states:

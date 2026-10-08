@@ -9,7 +9,7 @@ from ..correctness._io import IntegrityError
 from ..correctness.bias import KJ_PER_KCAL
 from .evaluate import z_from_dihedrals
 from .model import AuxModel
-from .sample_schema import AuxSampleSchema
+from .sample_schema import AUX_SAMPLES_SCHEMA, AuxSampleSchema
 
 AUDIT_THRESHOLD_FRACTION = 1e-3
 
@@ -113,3 +113,118 @@ def exclusion_report(excluded, *, origin_ids, replicas, steps, segment_ids, aux_
             "by_structural_group": "unavailable: no frozen structural labels before Stage D",
             "audit_threshold_fraction": AUDIT_THRESHOLD_FRACTION,
             "above_audit_threshold": bool(n and k / n > AUDIT_THRESHOLD_FRACTION)}
+
+
+def _segment_payloads(run_dir) -> dict[str, "dict | None"]:
+    """``payload_schema`` of every ``samples/<segment>/`` manifest (hashes not verified here)."""
+    from pathlib import Path
+    from ..parquet_manifest import load_manifest
+    out: dict[str, "dict | None"] = {}
+    root = Path(run_dir) / "samples"
+    if not root.exists():
+        return out
+    for seg_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+        manifest = load_manifest(seg_dir, expected_kind="samples")
+        payload = (manifest or {}).get("payload_schema")
+        # Only atlas-aux-samples-v1 payloads are auxiliary; anything else (or none) reads as None.
+        out[seg_dir.name] = payload if isinstance(payload, dict) and payload.get("schema") == AUX_SAMPLES_SCHEMA else None
+    return out
+
+
+def segment_aux_schemas(run_dir) -> dict[str, "AuxSampleSchema | None"]:
+    return {seg: (AuxSampleSchema.from_payload(p) if p else None) for seg, p in _segment_payloads(run_dir).items()}
+
+
+def segment_aux_runtime(run_dir) -> dict[str, "dict | None"]:
+    """The ``runtime`` block (platform, precision) of every segment's sample payload."""
+    from .sample_schema import runtime_from_payload
+    return {seg: (runtime_from_payload(p) if p else None) for seg, p in _segment_payloads(run_dir).items()}
+
+
+POOL_CLASSES = ("aux", "unpersisted", "ineligible_kernel", "no_snapshot", "legacy")
+_ALWAYS_REFUSED = (
+    ("legacy", "ran without auxiliary states: a campaign directory mixing v2 and v3_aux segments cannot be "
+               "pooled (ruling H3); split the run directory"),
+    ("no_snapshot", "have no window snapshot in an auxiliary run: their state table is unknown (ruling H2); "
+                    "repair the run"),
+    ("ineligible_kernel", "have an ineligible kernel (segment_eligibility); they cannot enter an equilibrium pool"),
+)
+
+
+def classify_pool_segments(run_dir, segment_ids) -> dict[str, list[str]]:
+    """Pool class of each segment of an auxiliary run (see POOL_CLASSES)."""
+    from ..kernel_identity import ELIGIBLE_AUX_UNPERSISTED, ELIGIBLE_VERIFIED, snapshot_has_aux
+    from ..query import load_windows_metadata, segment_eligibility
+    eligibility = segment_eligibility(run_dir)
+    out: dict[str, list[str]] = {key: [] for key in POOL_CLASSES}
+    for seg in sorted(str(s) for s in segment_ids):
+        snap = load_windows_metadata(run_dir, seg)
+        status = (eligibility.get(seg) or {}).get("eligibility")
+        if not snap:
+            out["no_snapshot"].append(seg)
+        elif not snapshot_has_aux(snap):
+            out["legacy"].append(seg)
+        elif status == ELIGIBLE_VERIFIED:
+            out["aux"].append(seg)
+        elif status == ELIGIBLE_AUX_UNPERSISTED:
+            out["unpersisted"].append(seg)
+        else:
+            out["ineligible_kernel"].append(seg)
+    return out
+
+
+def pool_aux_segments(prod, samples, beta, meta, *, exclude_segments_without_aux_features: bool = False,
+                      allow_ineligible_aux_segments: bool = False):
+    """load_parquet's auxiliary branch: refuse or exclude segment classes, one eligible fixed state,
+    one sample schema, offline z with per-segment parity. Returns (samples, windows, aux_z or None)."""
+    from ..correctness.state_identity import validate_fixed_state_segments
+    from ..query import load_windows_metadata
+    from .sample_schema import PARITY_TOLERANCE
+    seg_col = np.asarray(samples["segment_id"]).astype(str)
+    groups = classify_pool_segments(prod, set(seg_col.tolist()))
+    for key, why in _ALWAYS_REFUSED:
+        if groups[key]:
+            raise IntegrityError(f"segments {groups[key]} {why}")
+    if groups["unpersisted"]:
+        if not exclude_segments_without_aux_features:
+            raise IntegrityError(f"segments {groups['unpersisted']} ran auxiliary states without stored features "
+                                 "(Stage B era) and cannot be evaluated; pass exclude_segments_without_aux_features=True "
+                                 "to drop them with a note")
+        n = seg_col.size
+        keep = ~np.isin(seg_col, groups["unpersisted"])
+        dropped = {s: int(np.count_nonzero(seg_col == s)) for s in groups["unpersisted"]}
+        # v[keep] keeps masked arrays masked (no np.asarray): placeholders stay visible as NaN downstream.
+        samples = {k: (v[keep] if hasattr(v, "__len__") and len(v) == n else v) for k, v in samples.items()}
+        seg_col = seg_col[keep]
+        meta.setdefault("load_notes", []).append(
+            f"excluded auxiliary segments without stored features (rows): {dropped}")
+    aux_segs = groups["aux"]
+    if not aux_segs or seg_col.size == 0:
+        raise IntegrityError(f"{prod}: no auxiliary segment with stored features remains to pool")
+    snaps = {s: load_windows_metadata(prod, s) for s in aux_segs}
+    try:
+        table = validate_fixed_state_segments(snaps, require_eligible=not allow_ineligible_aux_segments)
+    except IntegrityError as exc:
+        raise IntegrityError(f"auxiliary segments are not one eligible fixed state: {exc}") from exc
+    if allow_ineligible_aux_segments:
+        meta.setdefault("load_notes", []).append(
+            "engineering analysis: ineligible auxiliary segments allowed, not an equilibrium estimate")
+    schemas, runtimes = segment_aux_schemas(prod), segment_aux_runtime(prod)
+    distinct = {schemas.get(s) for s in aux_segs}
+    if None in distinct or len(distinct) != 1:
+        raise IntegrityError(f"auxiliary sample schema differs between (or is missing from) segments {aux_segs}")
+    schema = distinct.pop()
+    bad_rt = [s for s in aux_segs if (runtimes.get(s) or {}).get("precision") not in PARITY_TOLERANCE]
+    if bad_rt:
+        raise IntegrityError(f"platform precision not recorded for segment(s) {bad_rt}; "
+                             "parity tolerance cannot be chosen")
+    row_tol = np.asarray([PARITY_TOLERANCE[runtimes[s]["precision"]] for s in seg_col], dtype=np.float64)
+    # Every schema model must be in the frozen registry: a silent filter would drop an active term.
+    models = {sha: registry_model(table.definition, sha, where=f"load_parquet ({prod})") for sha in schema.model_shas}
+    windows = [dict(w) for w in table.windows]
+    aux_z = None
+    if any(float(w.get("aux_k", 0.0)) > 0 for w in windows):
+        aux_z = aux_z_from_samples(samples, schema, models, parity_reduced_tol=row_tol, **parity_context(windows, beta))
+    meta["aux_models"] = list(schema.model_shas)
+    meta["aux_feature_segments"] = list(aux_segs)
+    return samples, windows, aux_z

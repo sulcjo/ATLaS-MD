@@ -65,6 +65,84 @@ def raw_sample_payload_schema(run_dir, segment_id) -> "dict | None":
     return payload if isinstance(payload, dict) else None
 
 
+class AuxPoolingRefused(RuntimeError):
+    """An auxiliary-CV run reached a pooling path that cannot reconstruct its bias (CVaux Stage C)."""
+
+
+#: Window-snapshot globs per depth: the run itself, then adaptive phases and their top-ups
+#: (adaptive_production/epoch_NNN/windows, adaptive_production/epoch_NNN/topup_*/windows). Never rglob:
+#: a union build runs every epoch over trees holding checkpoint generations and trajectories.
+_SNAPSHOT_GLOBS = ("windows/*.json", "*/windows/*.json", "*/*/windows/*.json")
+
+
+def _positive(value) -> bool:
+    try:
+        return float(value or 0.0) > 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def snapshot_has_aux(payload) -> bool:
+    """A windows/<segment>.json payload that carries auxiliary states (kernel identity, frozen v2
+    aux_models, or any row with auxiliary fields: Stage B D5a rows included)."""
+    if not isinstance(payload, dict):
+        return False
+    if is_aux_kernel_record(payload.get("kernel_identity")):
+        return True
+    state = payload.get("state_definition")
+    state = state if isinstance(state, dict) else {}
+    if state.get("aux_models"):
+        return True
+    rows = list(payload.get("windows") or []) + list(state.get("windows") or [])
+    return any(isinstance(r, dict) and ("aux_model_sha256" in r or _positive(r.get("aux_k"))) for r in rows)
+
+
+def aux_snapshot_hits(root, *, depth: int = 0) -> list:
+    """Snapshot paths with auxiliary states under fixed-depth globs (read-only; unreadable files skipped)."""
+    import json
+    from pathlib import Path
+    root = Path(root)
+    hits = []
+    for pattern in _SNAPSHOT_GLOBS[: int(depth) + 1]:
+        for path in sorted(root.glob(pattern)):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if snapshot_has_aux(payload):
+                hits.append(str(path))
+    return hits
+
+
+def run_has_aux(prod) -> bool:
+    """Auxiliary evidence for ONE run directory (read-only JSON; legacy output unchanged)."""
+    import json
+    from pathlib import Path
+    prod = Path(prod)
+    try:
+        manifest = json.loads((prod / "run_manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        manifest = {}
+    if isinstance(manifest, dict) and is_aux_kernel_record(manifest.get("method_settings")):
+        return True
+    if aux_snapshot_hits(prod, depth=0):
+        return True
+    samples = prod / "samples"
+    if samples.is_dir():
+        for seg_dir in sorted(p for p in samples.iterdir() if p.is_dir()):
+            if (raw_sample_payload_schema(prod, seg_dir.name) or {}).get("schema") == AUX_SAMPLES_PAYLOAD_SCHEMA:
+                return True
+    return False
+
+
+def refuse_aux_snapshots(root, *, where: str, depth: int = 2) -> None:
+    """Raise AuxPoolingRefused when any window snapshot under ``root`` (fixed depth) carries auxiliary states."""
+    hits = aux_snapshot_hits(root, depth=depth)
+    if hits:
+        raise AuxPoolingRefused(f"{where}: auxiliary states pool only through the strict fixed-state exporter or "
+                                f"load_parquet in the MVP (spec Sections 8/14); found {hits[:3]}")
+
+
 def exchange_energy_version_for_args(args) -> str:
     return EXCHANGE_ENERGY_VERSION_AUX if getattr(args, "aux_cv_model", None) else EXCHANGE_ENERGY_VERSION
 
