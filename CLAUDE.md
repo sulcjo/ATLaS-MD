@@ -1,6 +1,6 @@
 # Claude Handoff
 
-Updated 2026-09-30. Branch `feat/cv2-resolution` holds P1, 3.2 (shape layout), 3.3 (R1-R3), 3.7 (reporting), the review fixes and follow-ups (a)-(l), respring and the gareus-analyze MBAR wrapper (all behind flags, off by default, none run in MD). PR #118 merged it into main only up to `3b2c8eb`; the later commits (`0115bf3`..) need a second PR. Resolved-bug writeups live in `docs/CLAUDE_FIXED_BUG_ARCHIVE.md`. Validation reports: `docs/superpowers/specs/2026-09-29-adaptive-cv2-validation/` (`t2_synthetic.md` section 9, `t3_retrospective.md` section 10).
+Updated 2026-10-08. Branch `feat/cv2-resolution` holds P1, 3.2 (shape layout), 3.3 (R1-R3), 3.7 (reporting), the review fixes and follow-ups (a)-(l), respring and the gareus-analyze MBAR wrapper (all behind flags, off by default, none run in MD). PR #118 merged it into main only up to `3b2c8eb`; the later commits (`0115bf3`..) need a second PR. Resolved-bug writeups live in `docs/CLAUDE_FIXED_BUG_ARCHIVE.md`. Validation reports: `docs/superpowers/specs/2026-09-29-adaptive-cv2-validation/` (`t2_synthetic.md` section 9, `t3_retrospective.md` section 10).
 
 ## Adaptive λ ladder (`--ap-ladder-adapt respace`, off by default)
 
@@ -22,6 +22,8 @@ Updated 2026-09-30. Branch `feat/cv2-resolution` holds P1, 3.2 (shape layout), 3
 - Stage D owns:
   - extending `check_feature_atoms` beyond phi/psi if the recovered c10 artifact contains omega or terminal torsions;
   - cross-arm W/B slot pairing (one table checks only its own slots).
+- Stage C handoff: stored theta must be bound to the model's ordered quad list (unique_torsions first-appearance order), not only its width — permuted columns are undetectable by shape.
+- Topology check is single-chain-aware (same chain, consecutive residues); omega/terminal torsions unsupported (Stage D). `z_from_dihedrals` refuses theta not shaped (n_frames, n_unique); a state may not be its own spawn parent.
 - Recorded deviations: `aux_k` naming; one registered model; same-table parent rule.
 - Tests: `tests/test_aux_cv_*.py`, fixture `tests/aux_cv_fixture.py`.
 
