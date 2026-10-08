@@ -63,7 +63,9 @@ def array_hash(value: np.ndarray) -> str:
 def build_export_arrays(
     samples: Mapping[str, Any], snapshots: Mapping[str, Mapping[str, Any]], beta: float,
     *, sample_view: Mapping[str, Any], envelope_factory: Callable | None = None,
-    reconstruct: Callable = reconstruct_bias_matrix,
+    reconstruct: Callable = reconstruct_bias_matrix, aux_sample_schema=None,
+    aux_segment_precision: Mapping[str, str] | None = None,
+    on_incomplete: str = "refuse", time_block_steps: int | None = None,
 ) -> dict[str, np.ndarray]:
     """Build one coherent matrix; never change a column according to row origin.
 
@@ -71,6 +73,13 @@ def build_export_arrays(
     nonempty boundary ID. This records the caller's guarantee, not proof of a lock.
     All required observations must be finite for export. The kernel independently
     supports NaN propagation; this exporter refuses implicit sample deletion.
+
+    With active auxiliary states, z is evaluated offline from the stored torsion
+    basis for every row (``aux_sample_schema``) and checked against the stored
+    runtime z within the reduced-energy tolerance of each row's segment precision
+    (``aux_segment_precision``). ``on_incomplete="exclude_and_report"`` drops
+    whole rows with a non-finite cross-state energy, recomputes N_k and records
+    the audit; it never zero-fills.
     """
     view = json_loads(json_bytes(dict(sample_view)))
     if view.get("kind") not in {"immutable", "quiescent"} or not view.get("boundary_id"):
@@ -113,18 +122,50 @@ def build_export_arrays(
     if has_ladder and envelope_factory is None:
         raise IntegrityError("Ladder export requires a factory consuming the frozen boost definition")
     envelope = envelope_factory(table.definition["boost"]) if has_ladder else None
+    if on_incomplete not in ("refuse", "exclude_and_report"):
+        raise IntegrityError(f"on_incomplete must be 'refuse' or 'exclude_and_report', got {on_incomplete!r}")
+    active_aux = sorted({w["aux_model_sha256"] for w in table.windows if w.get("aux_k", 0.0) > 0})
+    aux_z = None
+    if active_aux:
+        from ..auxiliary_cv.offline import aux_z_from_samples, parity_context, registry_model
+        from ..auxiliary_cv.sample_schema import PARITY_TOLERANCE
+        if aux_sample_schema is None:
+            raise IntegrityError("active auxiliary states need the run's aux_sample_schema to evaluate z")
+        uncovered = [sha for sha in active_aux if sha not in aux_sample_schema.model_shas]
+        if uncovered:
+            raise IntegrityError(f"aux_sample_schema does not record active model(s) {uncovered}")
+        precision = dict(aux_segment_precision or {})
+        unknown_prec = [s for s in selected_ids if precision.get(s) not in PARITY_TOLERANCE]
+        if unknown_prec:
+            raise IntegrityError(f"platform precision not recorded for segment(s) {unknown_prec}; "
+                                 "parity tolerance cannot be chosen")
+        row_tol = np.asarray([PARITY_TOLERANCE[precision[s]] for s in segments], dtype=np.float64)
+        models = {sha: registry_model(table.definition, sha, where="strict exporter")
+                  for sha in aux_sample_schema.model_shas}
+        aux_z = aux_z_from_samples(samples, aux_sample_schema, models,
+                                   parity_reduced_tol=row_tol, **parity_context(table.windows, beta))
+    extra = {"aux_z": aux_z} if aux_z is not None else {}
     # ONE call with ONE state table for ALL rows; never per-segment states.
     matrix = np.asarray(reconstruct(cv1, cv2, list(table.windows), beta,
-                        v_pep=pep, v_dih=dih, envelope=envelope), dtype=np.float64)
+                        v_pep=pep, v_dih=dih, envelope=envelope, **extra), dtype=np.float64)
     if matrix.shape != (n, len(table.windows)):
         raise IntegrityError(f"Reconstructor returned an invalid matrix shape: {matrix.shape}")
     complete = np.all(np.isfinite(matrix), axis=1)
+    report = None
     if not complete.all():
         counts = np.bincount(origins[~complete], minlength=len(table.windows)).tolist()
-        raise IntegrityError(
-            f"Incomplete cross-state energies for {int((~complete).sum())} samples; "
-            f"counts by origin column={counts}. No rows were silently discarded."
-        )
+        if on_incomplete == "refuse":
+            raise IntegrityError(
+                f"Incomplete cross-state energies for {int((~complete).sum())} samples; "
+                f"counts by origin column={counts}. No rows were silently discarded."
+            )
+        if time_block_steps is None or "step" not in samples or "replica" not in samples:
+            raise IntegrityError("exclude_and_report needs step, replica and time_block_steps for the audit")
+        from ..auxiliary_cv.offline import exclusion_report
+        report = exclusion_report(~complete, origin_ids=origin_ids,
+                                  replicas=_integer_vector(samples["replica"], "replica", n),
+                                  steps=_integer_vector(samples["step"], "step", n), segment_ids=segments,
+                                  aux_z=aux_z or {}, time_block_steps=int(time_block_steps))
     arrays = {
         "cv_A": cv1, "window": origins, "original_window_id": origin_ids,
         "segment_id": segments, "column_window_ids": np.asarray(table.column_window_ids, dtype=np.int64),
@@ -145,6 +186,24 @@ def build_export_arrays(
     for name in ("step", "replica"):
         if name in arrays:
             source_arrays[name] = arrays[name]
+    if aux_z is not None:
+        from ..auxiliary_cv.offline import _float_column
+        for name in aux_sample_schema.torsion_columns + aux_sample_schema.z_columns:
+            if name in samples:
+                source_arrays[name] = _float_column(samples, name, n)
+        for sha, z in aux_z.items():
+            source_arrays[f"aux_z:{sha}"] = z
+        source_arrays["aux_tolerance"] = row_tol
+    # source_arrays hashes the complete pre-exclusion input on purpose; only the
+    # exported arrays below are restricted to the kept rows.
+    if report is not None:
+        keep = complete
+        for key in ("cv_A", "window", "original_window_id", "segment_id", "umbrella_reduced_bias_nk",
+                    "secondary_cv", "step", "replica"):
+            if key in arrays:
+                arrays[key] = arrays[key][keep]
+        arrays["N_k"] = np.bincount(arrays["window"], minlength=len(table.windows)).astype(np.int64)
+        arrays["exclusion_report_json"] = np.asarray(json_bytes(report).decode("utf-8"))
     signature_payload = {
         "export_schema": EXPORT_SCHEMA, "beta": beta,
         "state_definition_sha256": table.definition_sha256,
@@ -152,6 +211,8 @@ def build_export_arrays(
         "sample_view": view,
         "source_arrays": {key: array_hash(value) for key, value in sorted(source_arrays.items())},
     }
+    if on_incomplete != "refuse":
+        signature_payload["on_incomplete"] = on_incomplete
     manifest = {
         "schema": EXPORT_SCHEMA, "input_signature": digest(json_bytes(signature_payload)),
         "inputs": signature_payload, "state_definition": table.definition,
@@ -159,6 +220,10 @@ def build_export_arrays(
         "quantity": "reduced umbrella-plus-ladder bias; NOT full potential",
         "array_hashes": {key: array_hash(value) for key, value in sorted(arrays.items())},
     }
+    if report is not None:
+        manifest["exclusion_report"] = report
+        manifest["n_kept"] = int(complete.sum())
+        manifest["n_excluded"] = int((~complete).sum())
     arrays["export_manifest_json"] = np.asarray(json_bytes(manifest).decode("utf-8"))
     return arrays
 
@@ -187,9 +252,14 @@ def write_npz_atomic(out_path: Path | str, arrays: Mapping[str, np.ndarray]) -> 
 
 
 def export_fixed_state_npz(out_path, samples, snapshots, beta, *, sample_view,
-                           envelope_factory=None, reconstruct=reconstruct_bias_matrix) -> Path:
+                           envelope_factory=None, reconstruct=reconstruct_bias_matrix,
+                           aux_sample_schema=None, aux_segment_precision=None,
+                           on_incomplete="refuse", time_block_steps=None) -> Path:
     arrays = build_export_arrays(samples, snapshots, beta, sample_view=sample_view,
-                                 envelope_factory=envelope_factory, reconstruct=reconstruct)
+                                 envelope_factory=envelope_factory, reconstruct=reconstruct,
+                                 aux_sample_schema=aux_sample_schema,
+                                 aux_segment_precision=aux_segment_precision,
+                                 on_incomplete=on_incomplete, time_block_steps=time_block_steps)
     return write_npz_atomic(out_path, arrays)
 
 

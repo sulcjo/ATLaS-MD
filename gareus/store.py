@@ -532,7 +532,30 @@ class WindowSnapshot:
         cv1_type: str,
         cv2_type: Optional[str],
         kernel_identity: Optional[Dict[str, Any]] = None,
+        state_definition: Optional[Dict[str, Any]] = None,
+        phase_kind: str = "production",
+        equilibrium_analysis_eligible: Optional[bool] = None,
     ) -> None:
+        if state_definition is not None:
+            # Auxiliary-capable segment: an immutable frozen v2 snapshot whose CV kinds
+            # must match the definition (keeps the residual-CV2 kernel gate honest, C19).
+            from .correctness.state_identity import freeze_snapshot, write_frozen_snapshot
+            cv1_def = state_definition.get("cv1") or {}
+            cv2_def = state_definition.get("cv2")
+            if (cv1_def.get("kind") if cv1_def else None) != cv1_type:
+                raise ValueError(f"cv1_type {cv1_type!r} != state definition cv1 kind {cv1_def.get('kind')!r}")
+            if (cv2_def["kind"] if cv2_def else None) != cv2_type:
+                raise ValueError(f"cv2_type {cv2_type!r} != state definition cv2 kind "
+                                 f"{cv2_def['kind'] if cv2_def else None!r}")
+            if equilibrium_analysis_eligible is None:
+                raise ValueError("an auxiliary-capable snapshot must state its equilibrium eligibility explicitly")
+            frozen = freeze_snapshot(segment_id, state_definition,
+                                     equilibrium_analysis_eligible=bool(equilibrium_analysis_eligible),
+                                     phase_kind=phase_kind)
+            if kernel_identity is not None:
+                frozen["kernel_identity"] = dict(kernel_identity)
+            write_frozen_snapshot(self._win_dir / f"{segment_id}.json", frozen)
+            return
         payload = {
             "segment_id": segment_id,
             "cv1_type": cv1_type,

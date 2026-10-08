@@ -404,15 +404,17 @@ def reconstruct_bias_matrix(
     v_dih: Optional[np.ndarray] = None,
     envelope=None,
     meta: Optional[dict] = None,
+    aux_z=None,
 ) -> np.ndarray:
     """Strict reduced umbrella-plus-ladder bias; missing required coordinates raise.
 
     k1/k2 stay in kcal/mol per squared CV unit. beta stays in mol/kJ.
     The existing ladder helper remains the only boost implementation.
+    aux_z (model sha -> z per sample) is passed through for active auxiliary states.
     """
     from .correctness.bias import reconstruct_bias_matrix as _strict_bias
     return _strict_bias(cv_A, cv2, windows, beta,
-                        v_pep=v_pep, v_dih=v_dih, envelope=envelope, meta=meta)
+                        v_pep=v_pep, v_dih=v_dih, envelope=envelope, meta=meta, aux_z=aux_z)
 
 
 def export_analysis_arrays_npz(
