@@ -12,3 +12,7 @@ __all__ += ["aux_energy_kj", "aux_forces_kj_nm", "z_and_gradient", "z_from_dihed
 from .force import AUX_FORCE_NAME, AuxForceInfo, build_aux_force, set_aux_parameters
 
 __all__ += ["AUX_FORCE_NAME", "AuxForceInfo", "build_aux_force", "set_aux_parameters"]
+
+from .sample_schema import AUX_SAMPLES_SCHEMA, AuxObservation, AuxSampleSchema, build_sample_schema, observe_carrier
+
+__all__ += ["AUX_SAMPLES_SCHEMA", "AuxObservation", "AuxSampleSchema", "build_sample_schema", "observe_carrier"]
