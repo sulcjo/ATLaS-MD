@@ -72,6 +72,10 @@ and treat its report as the result. A Bash hook in this harness refuses commands
   - Stock gamd-openmm boost types are refused. `GamdIntegratorFactory.get_integrator` calls `set_all_forces_to_group(system, 0)` for every stock type (`gamd/integrator_factory.py:198`, verified 2026-10-07). That destroys the auxiliary force's dedicated group; for total and dual types it also boosts the restraint.
   - Pep-GaMD (`pep-gamd-*`) and `--run-mode cmd` are allowed.
 - **A z needed by an active state must be finite.** A non-finite z needed by an active state in the live exchange or sample matrix is fatal (`AuxObservationError`, raised by `aux_bias_matrix_kcal`). It is never zero-filled and never removes a candidate.
+- **Live degenerate geometry fails the segment (spec §3.3, board condition 1).** Whenever any state has `aux_k > 0`, every z observation, on both the sample path and the exchange path, also checks the model's torsions for degeneracy on that carrier's positions (`check_aux_geometry`, Task 5).
+  - The rule is the same as Stage A's `openmm_dihedrals` NaN rule: |b1×b2|² or |b2×b3|² below `DEGENERATE_CROSS2_NM4`.
+  - A degenerate torsion raises `AuxObservationError` and fails the segment with diagnostics.
+  - A sham-only or ordinary-only population (no active state) does not read positions for this and never raises.
   - `observe_aux_z` records the value whatever it is (a sham arm with every k = 0 may record NaN).
   - The fast path cannot detect a degenerate torsion: OpenMM returns a finite `theta` there. Detection of such frames is Stage C's offline parity: positions-derived NaN vs stored finite gives a finite-mismatch refusal.
 - **Gibbs eligibility is unrestricted.** No parent-only mask, neighbour mask or overlap filter. `--exchange-mode neighbor` (geometry graph) is refused with an aux model; `gibbs-walk`, `all-pair-sweep` and `random-pair` are allowed.
@@ -949,6 +953,11 @@ def canonical_topology_sha256_from_pdb(path, model) -> str:
     return canonical_topology_sha256(app.PDBFile(str(path)).topology, model)
 
 
+# Entry point. ASSUMPTION (board caveat 2): the digest includes each atom's residue and chain index, so it
+# must be computed on the PRODUCTION topology (same chain order, same solvent/ion chains before the
+# peptide). Solvent atoms never enter the body, but inserting or reordering chains ahead of the peptide's
+# chain shifts the chain/residue indices and gives a different digest. Stage D computes it from the
+# production topology.pdb of the run that will deploy the model.
 if __name__ == "__main__":  # python -m gareus.auxiliary_cv.runtime topology-sha PDB MODEL
     import sys
     from .model import AuxModel
@@ -1387,7 +1396,23 @@ git commit -m "feat(cvaux): set_window applies the complete aux target at all si
   - With `positions_nm`, z = `z_from_positions`.
   - Exactly one of the two must be given.
   - It **never raises on a non-finite z**: it records what it observed. Fatality is decided by `aux_bias_matrix_kcal`, only when an active state needs the value.
-  - The fast path returns a finite value even at a degenerate torsion (OpenMM's `theta` is finite there). The slow path returns NaN. Stage C's offline parity catches the fast-path case.
+  - The fast path returns a finite value even at a degenerate torsion (OpenMM's `theta` is finite there). The slow path returns NaN. Neither is relied on for fail-closed behaviour: that is `check_aux_geometry`'s job (below).
+- Produces: `check_aux_geometry(positions_nm, runtime, *, replica=None) -> None`. It raises `AuxObservationError` naming the degenerate quads and the replica.
+  - It covers every unique torsion of the model, including zero-coefficient ones: Stage A's conservative rule.
+  - Its threshold and semantics are exactly those of Stage A `openmm_dihedrals`, which it calls.
+- Produces: `make_aux_z_observer(runtime, *, use_fast_path: bool, fast_forces, unit) -> Callable[[int, sim], float]`. This is the single observer `run_gareus` installs as `_aux_z_for_replica` for both fetch closures (Task 6).
+  - With any active state, it reads the carrier's positions once and calls `check_aux_geometry`. It then returns the fast-path z (the force's own value, authoritative) or the slow-path z.
+  - With no active state, it reads positions only on the slow path, and never raises.
+- **Degeneracy option chosen, and its cost (board condition 1).** Fast-path z plus a positions-based degeneracy check, rather than switching z itself to `z_from_positions`.
+  - Both options need the same one `getState(getPositions=True)` per carrier per observation. OpenMM has no subset-positions read, so reading "only the torsion atoms" is not cheaper.
+  - Once the positions are on the host, the check is a vectorised cross product over the model's ≤ 36 torsions: negligible.
+  - Keeping the fast-path z keeps the stored/exchanged z equal to the value the integrated force actually used (Stage C D8). Switching z to positions would decouple the two.
+  - Added cost: one positions transfer per carrier per sample interval, plus one per exchange interval that is not a sample step. The cached-observable shortcut reuses the sample-step observation.
+  - Only aux-active populations pay it. Stage C reads the same positions for torsion storage (D8), so in Stage C the read is shared, not doubled. Stage C Task 14 benchmarks it.
+- **Spec §3.3 compliance note.** The OpenMM force evaluates a finite `theta` at a degenerate torsion, so between two observations the dynamics can integrate a meaningless A_s.
+  - The segment is failed at the next observation: the next sample or exchange interval, whichever comes first. This bounds the exposure to at most one observation interval of MD.
+  - The step that fails is never sampled or exchanged, so no observation from a degenerate configuration enters the sample store or the exchange kernel.
+  - Checking every MD step would need an in-integrator guard, which is out of scope. This bounded-exposure behaviour is the plan's reading of "fail the affected production segment with diagnostics".
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1450,12 +1475,73 @@ def test_degenerate_geometry_is_recorded_not_raised():
     q = rt.table.model.feature_schema.features[0].atom_indices
     bad[q[0]] = bad[q[1]]                       # collapse two torsion atoms -> undefined dihedral
     assert math.isnan(observe_aux_z(ctx, rt, positions_nm=bad))
+
+
+def _with_table(rt, k_kcal):
+    """Same runtime, one-state table with the given strength (0 = sham/ordinary, > 0 = active)."""
+    import dataclasses
+    return dataclasses.replace(rt, table=AuxStateTable(rt.table.model, (0.5,), (float(k_kcal),), (None,)))
+
+
+def _degenerate(ctx, rt, d):
+    bad = d["positions_nm"].copy()
+    q = rt.table.model.feature_schema.features[0].atom_indices
+    bad[q[0]] = bad[q[1]]
+    ctx.setPositions(bad)
+    return bad
+
+
+@pytest.mark.parametrize("fast", [True, False])
+def test_live_degenerate_geometry_with_an_active_state_raises_on_both_paths(fast):
+    """Board condition 1 / spec 3.3: the fast path alone sees a finite theta, so the observer checks geometry."""
+    from openmm import unit
+    from gareus.auxiliary_cv.runtime import AuxObservationError, make_aux_z_observer
+    ctx, rt, force, d = _setup()
+    _degenerate(ctx, rt, d)
+    active = _with_table(rt, 2.0)
+    observe = make_aux_z_observer(active, use_fast_path=fast, fast_forces=[force], unit=unit)
+    with pytest.raises(AuxObservationError, match="degenerate"):
+        observe(0, types.SimpleNamespace(context=ctx))
+
+
+@pytest.mark.parametrize("fast", [True, False])
+def test_sham_only_population_never_raises_on_degenerate_geometry(fast):
+    from openmm import unit
+    from gareus.auxiliary_cv.runtime import make_aux_z_observer
+    ctx, rt, force, d = _setup()
+    _degenerate(ctx, rt, d)
+    sham = _with_table(rt, 0.0)
+    z = make_aux_z_observer(sham, use_fast_path=fast, fast_forces=[force], unit=unit)(0, types.SimpleNamespace(context=ctx))
+    assert (math.isfinite(z) if fast else math.isnan(z))      # recorded, never raised
+
+
+@pytest.mark.parametrize("fast", [True, False])
+def test_regular_geometry_with_an_active_state_returns_the_path_z(fast):
+    from openmm import unit
+    from gareus.auxiliary_cv.runtime import make_aux_z_observer
+    ctx, rt, force, d = _setup()
+    active = _with_table(rt, 2.0)
+    z = make_aux_z_observer(active, use_fast_path=fast, fast_forces=[force], unit=unit)(0, types.SimpleNamespace(context=ctx))
+    assert z == pytest.approx(z_from_positions(d["positions_nm"], rt.table.model)[0], abs=1e-9)
+
+
+def test_set_aux_parameters_absolute_energy_is_kcal_times_4184():
+    """Board dissent (thinker): pin the kcal -> kJ conversion of set_aux_parameters in absolute terms."""
+    from openmm import unit
+    from gareus.auxiliary_cv.force import set_aux_parameters
+    ctx, rt, _force, d = _setup()
+    z = z_from_positions(d["positions_nm"], rt.table.model)[0]
+    k_kcal, c = 2.5, z - 0.4
+    set_aux_parameters(ctx, rt.info, center=c, k_kcal=k_kcal)
+    e = ctx.getState(getEnergy=True, groups={rt.info.force_group}).getPotentialEnergy() \
+           .value_in_unit(unit.kilojoule_per_mole)
+    assert e == pytest.approx(0.5 * k_kcal * 4.184 * (z - c) ** 2, rel=1e-9)
 ```
 
 - [ ] **Step 2: Run to verify failure**
 
 Run: `tests/test_aux_cv_observation.py`
-Expected: FAIL (`ImportError: observe_aux_z`).
+Expected: FAIL (`ImportError: observe_aux_z`). `test_set_aux_parameters_absolute_energy_is_kcal_times_4184` is a regression guard on Stage A's `set_aux_parameters`; it would pass on its own once the import succeeds.
 
 - [ ] **Step 3: Implement**
 
@@ -1465,6 +1551,7 @@ Add to the imports of `gareus/auxiliary_cv/runtime.py`:
 import numpy as np
 
 from .evaluate import z_from_positions
+from .features import openmm_dihedrals, unique_torsions
 ```
 
 Append:
@@ -1484,6 +1571,42 @@ def observe_aux_z(context, runtime: AuxRuntime, *, force=None, positions_nm=None
         values = np.asarray(force.getCollectiveVariableValues(context), dtype=np.float64)
         return float((model.offset + values.sum()) / model.scale)
     return float(z_from_positions(positions_nm, model)[0])
+
+
+def check_aux_geometry(positions_nm, runtime: AuxRuntime, *, replica=None) -> None:
+    """Fail closed when a model torsion is degenerate (spec 3.3).
+
+    Same rule as Stage A ``openmm_dihedrals`` (NaN when |b1 x b2|^2 or |b2 x b3|^2 < DEGENERATE_CROSS2_NM4),
+    over every unique torsion of the model, zero-coefficient ones included (Stage A's conservative rule).
+    """
+    quads, _idx = unique_torsions(runtime.table.model)
+    theta = openmm_dihedrals(positions_nm, quads)[0]
+    if np.isnan(theta).any():
+        bad = [quads[t] for t in np.flatnonzero(np.isnan(theta))]
+        where = "" if replica is None else f" on replica {replica}"
+        raise AuxObservationError(f"degenerate auxiliary torsion(s) {bad}{where} while auxiliary states are "
+                                  "active; failing the segment (spec 3.3)")
+
+
+def make_aux_z_observer(runtime: AuxRuntime, *, use_fast_path: bool, fast_forces, unit):
+    """The single per-carrier z observer for both the sample and the exchange path.
+
+    With any active state: one positions read, a geometry check, then the fast-path z (the force's
+    own value) or the slow-path z. With no active state: positions only on the slow path; never raises.
+    """
+    any_active = any(float(k) > 0.0 for k in runtime.table.k_kcal)
+
+    def observe(r, sim) -> float:
+        pos = None
+        if any_active or not use_fast_path:
+            pos = sim.context.getState(getPositions=True).getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+        if any_active:
+            check_aux_geometry(pos, runtime, replica=r)
+        if use_fast_path:
+            return observe_aux_z(sim.context, runtime, force=fast_forces[r])
+        return observe_aux_z(sim.context, runtime, positions_nm=pos)
+
+    return observe
 ```
 
 - [ ] **Step 4: Run to verify pass**
@@ -1495,7 +1618,7 @@ Expected: PASS
 
 ```bash
 git add gareus/auxiliary_cv/runtime.py tests/test_aux_cv_observation.py
-git commit -m "feat(cvaux): observe_aux_z fast/slow paths (records, never raises)"
+git commit -m "feat(cvaux): observe_aux_z fast/slow paths, live degeneracy check for active populations"
 ```
 
 ---
@@ -1685,19 +1808,17 @@ After the fast-path block (just after `_use_fast_cv_path = (...)` and its `print
     _fast_aux_forces = [None] * nrep
     if _aux_rt is not None:
         from .auxiliary_cv.force import AUX_FORCE_NAME as _AUX_CV_FORCE_NAME
-        from .auxiliary_cv.runtime import aux_bias_matrix_kcal, observe_aux_z
+        from .auxiliary_cv.runtime import aux_bias_matrix_kcal, make_aux_z_observer
         _fast_aux_forces = [sim.system.getForce(_aux_rt.force_index) for sim in sims]
         if any(f.getName() != _AUX_CV_FORCE_NAME for f in _fast_aux_forces):
             raise RuntimeError("replica systems do not carry the auxiliary-CV force at the base system's index")
-
-    def _aux_z_for_replica(r, sim) -> float:
-        """The single z observation both the sample writer and the exchange kernel use."""
-        if _aux_rt is None:
+        # The single z observation both the sample writer and the exchange kernel use; with any
+        # active state it also fails the segment on a degenerate torsion (spec 3.3, Task 5).
+        _aux_z_for_replica = make_aux_z_observer(_aux_rt, use_fast_path=_use_fast_cv_path,
+                                                 fast_forces=_fast_aux_forces, unit=unit)
+    else:
+        def _aux_z_for_replica(r, sim) -> float:
             return float("nan")
-        if _use_fast_cv_path:
-            return observe_aux_z(sim.context, _aux_rt, force=_fast_aux_forces[r])
-        pos = sim.context.getState(getPositions=True).getPositions(asNumpy=True).value_in_unit(unit.nanometer)
-        return observe_aux_z(sim.context, _aux_rt, positions_nm=pos)
 ```
 
 Sample path (`_fetch_state`, `:8090-8112`):
@@ -2279,7 +2400,9 @@ Resume branch: make the first statement inside `if fast_resume:` (`:6775`)
 
 Near the top of `run_gareus` (before `if fast_resume:`), add `_aux_table = None`.
 
-In the window-loading branch, right after the `filter_explicit_2d_windows_by_seed_reachability(...)` call (`:6825-6829`), add:
+In the window-loading branch, right after the `filter_explicit_2d_windows_by_seed_reachability(...)` call (`:6825-6829`), add the block below.
+
+`_n_windows_before_reachability_filter` already exists on main and needs no new definition. It is set at `production.py:6823` as `_n_windows_before_reachability_filter = int(len(centers_a))`, immediately before the filter call, in the same `if getattr(args, "windows_2d_csv", None):` branch (board caveat 3). Re-confirm that line before editing; if it has moved or been removed, define it the same way directly before the filter call.
 
 ```python
             if getattr(args, "aux_cv_model", None):
@@ -2378,7 +2501,7 @@ Expected: all PASS.
 - Stage-B data is unanalysable: snapshot rows carry aux_model_sha256/aux_center/aux_k (strict reconstruction raises MissingCoordinateError); `classify_segment_kernel` -> `aux_unpersisted` for every v3_aux snapshot without `aux_sample_schema`; `refuse_resume_of_aux_campaign` reads the newest snapshot unconditionally (checkpoints load silently into a non-aux Context).
 - Kernel `state_bias_matrix_v3_aux` + `aux_model_sha256` (+ `aux_topology_sha256` = `canonical_topology_sha256`, content of the feature atoms' chains) only with an aux model; legacy digest pinned. A production model must record that canonical digest as `feature_schema.topology_sha256` (`python -m gareus.auxiliary_cv.runtime topology-sha PDB MODEL`).
 - Proven: aux gradient applied once at full strength under an active Pep-GaMD boost (structure-matched paired arms; boosted copy = FSF_Total-scaled), Pep-GaMD NPT adapter sees aux as a bias group and tracks geometry (A_s is invariant under molecular-centroid scaling), production assembly = direct Context energies incl. all four swap terms with a sham row, exact Gibbs/pair detailed balance and sweep stationarity with aux + duplicate sham states, no candidate mask.
-- Stage D prerequisites (explicit deferrals, owners): finite-timestep validation of strong aux restraints (spec 3.4; Stage D); NPT controlled-distribution test (spec 17; Stage D); multi-Context cost benchmark incl. zero-strength overhead (spec 10; Stage D, Stage C measures the torsion read); diagnostics audit (spec 15: ladder_overlap, pmf_ladder_crosscheck with an ordinary-λ0 crosscheck, other_rung_same_centre, gareus_report; Stage D); pre-production equilibration and phase_kind (spec 6; Stage C records phase_kind, Stage D owns the protocol); aux pull ramp in admission (Stage D); c10 model port with the canonical topology digest (Stage D).
+- Stage D prerequisites (explicit deferrals, owners). Until done, each is reported as **unavailable, never as a pass** (spec §15), and none is part of Stage B's exit gate. Listed: finite-timestep validation of strong aux restraints (spec 3.4; Stage D); NPT controlled-distribution test (spec 17; Stage D); multi-Context cost benchmark incl. zero-strength overhead (spec 10; Stage D, Stage C measures the torsion read); diagnostics audit (spec 15: ladder_overlap, pmf_ladder_crosscheck with an ordinary-λ0 crosscheck, other_rung_same_centre, gareus_report; Stage D); pre-production equilibration and phase_kind (spec 6; Stage C records phase_kind, Stage D owns the protocol); aux pull ramp in admission (Stage D); c10 model port with the canonical topology digest (Stage D).
 - Stage C must: write `aux_sample_schema` into snapshots that store z/torsions and classify them; gate load_parquet/load_npz/load_csv/union loaders (incl. pilot dirs)/export on aux presence; lift the resume refusal and `--aux-cv-allow-unpersisted`; make `verify_kernel_identity_on_resume` args-aware; source `peptide_atoms` for `build_sample_schema` under `--run-mode cmd` (Stage B only sets it via `prepare_pep_gamd_args`).
 ```
 
@@ -2455,6 +2578,17 @@ git commit -m "feat(cvaux): run_gareus builds the auxiliary runtime; unanalysabl
 | Seams 12 | Stage D prerequisites list in the handoff (D13) |
 | Seams 14 | = B13 parser registration |
 | Seams 15 (B part) | the role rule matches Stage A D3 (auxiliary ⇔ k > 0; ordinary/sham k = 0); private Stage A helpers kept deliberately (noted in Depends on) |
+
+**Board conditions applied (rev_stage_B, ACCEPT-WITH-CHANGES, unanimous):**
+
+| Board item | Change |
+|---|---|
+| Condition 1: live degenerate-geometry fail-closed on sample and exchange paths | Task 5 `check_aux_geometry` + `make_aux_z_observer`, installed as `_aux_z_for_replica` (Task 6). Fast-path z is kept, plus a positions-based degeneracy check whenever any state is active. Tests on both paths, a sham-only no-raise test, and a §3.3 compliance note on bounded exposure |
+| Thinker partial dissent: absolute aux-energy unit test | Task 5 `test_set_aux_parameters_absolute_energy_is_kcal_times_4184` |
+| Caveat 2: topology digest chain-index assumption | Documented at the `topology-sha` entry point |
+| Caveat 3: `_n_windows_before_reachability_filter` | Already defined at `production.py:6823`; noted in Task 9 with a re-confirm instruction |
+| Caveat 4: deferred validations | Handoff list states they are reported unavailable, never pass, and are outside Stage B's exit gate |
+| Caveat 5: `LEGACY_DIGEST` re-confirm | Task 8 Step 1b kept unchanged |
 
 **Placeholder scan:** none. `LEGACY_DIGEST` is pinned (computed on dc30285, re-confirmed by the verifier), and Task 8 Step 1b only re-confirms it.
 
