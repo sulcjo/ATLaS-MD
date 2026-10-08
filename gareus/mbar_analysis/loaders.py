@@ -240,11 +240,33 @@ def _load_secondary_cv_from_csv(samples_csv: Path, expected_size: int) -> np.nda
     return arr if arr.size == expected_size else np.full(expected_size, np.nan)
 
 
+def _refuse_aux_run(prod: Path, meta: dict) -> None:
+    """Refuse an auxiliary-CV run (CVaux Stage B, controller ruling C3).
+
+    Its stored umbrella matrices / reconstructed biases omit the auxiliary restraint term, so no
+    MBAR built here is valid for it. Fires only on records naming the v3_aux exchange kernel or
+    an auxiliary model digest; legacy runs (no such record, or unreadable files) are untouched.
+    """
+    from gareus.kernel_identity import is_aux_kernel_record
+    manifest = rjson(prod/'run_manifest.json', {})
+    records = [meta, (meta or {}).get('kernel_identity') if isinstance(meta, dict) else None,
+               manifest.get('method_settings') if isinstance(manifest, dict) else None]
+    win_dir = prod/'windows'
+    if win_dir.is_dir():
+        for path in sorted(win_dir.glob('*.json')):
+            snap = rjson(path, {})
+            records.append(snap.get('kernel_identity') if isinstance(snap, dict) else None)
+    if any(is_aux_kernel_record(r) for r in records):
+        raise RuntimeError(f'{prod}: auxiliary-CV run (state_bias_matrix_v3_aux / aux model recorded); '
+                           'its bias cannot be reconstructed by this loader (Stage C reader required).')
+
+
 def load_npz(prod: Path) -> Data:
     arr, load_notes = _load_merged_arrays(prod)
     if not arr:
         raise FileNotFoundError(f'No samples in {prod}/analysis_arrays.npz or analysis_chunks/')
     meta=rjson(prod/'analysis_arrays_metadata.json',{}); meta.update(rjson(prod/'umbrella_pymbar_metadata.json',{}))
+    _refuse_aux_run(prod, meta)  # CVaux Stage B (ruling C3): aux runs never load here
     if load_notes:
         meta.setdefault('load_notes', []).extend(load_notes)
     cv=np.asarray(arr['cv_A'],float)
@@ -365,6 +387,7 @@ def _window_float_array(rows: list[dict], keys: tuple[str, ...], default: float)
 
 def load_csv(prod: Path, load_notes: Optional[list[str]] = None) -> Data:
     meta=rjson(prod/'umbrella_pymbar_metadata.json',{})
+    _refuse_aux_run(prod, meta)  # CVaux Stage B (ruling C3): aux runs never load here
     if load_notes:
         meta.setdefault('load_notes', []).extend(load_notes)
     centers,ks,rows=read_windows(prod/'umbrella_windows.csv')

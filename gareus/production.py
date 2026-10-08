@@ -118,7 +118,7 @@ from .phase_timers import PhaseTimers, aggregate_npt_timings
 from .provenance import (record_replica_admission, initialize_run_manifest, ensure_run_manifest_initialized, update_run_manifest,
                          finalize_run_manifest, pair_model_sha256)
 from .kernel_identity import (EXCHANGE_ENERGY_VERSION, FAST_SCALAR_MODES, LEGACY_TWO_TERM_MODES,
-                              RESIDUAL_EVALUATOR_VERSION, kernel_identity_for_run)
+                              RESIDUAL_EVALUATOR_VERSION, is_aux_kernel_record, kernel_identity_for_run)
 
 logger = logging.getLogger(__name__)
 
@@ -697,6 +697,24 @@ def verify_kernel_identity_on_resume(args, out_dir, secondary_cv_metadata: Optio
             raise RuntimeError(
                 f"resume refused: recorded cv_evaluator_version {recorded_ev!r} != current "
                 f"{RESIDUAL_EVALUATOR_VERSION!r} (spec F04).")
+
+
+def refuse_resume_of_aux_campaign(out_dir) -> None:
+    """Stage B: an auxiliary-CV campaign cannot be resumed or extended (spec 2026-10-07, D6).
+
+    Unconditional and snapshot-based on purpose. A Context checkpoint of an aux system loads
+    SILENTLY into a Context without the aux force (verified 2026-10-08), the run manifest's
+    method_settings are rebuilt from the CURRENT args every job, and verify_kernel_identity_on_resume
+    only runs when CV2 is enabled -- none of those can stop an aux slot resuming as an ordinary one.
+    A campaign whose snapshots record no auxiliary kernel (every legacy run) passes silently.
+    """
+    recorded = _latest_segment_kernel_identity(out_dir) or {}
+    if is_aux_kernel_record(recorded):
+        raise RuntimeError(
+            "resume/extend refused: this campaign ran auxiliary-CV states "
+            f"(model {str(recorded.get('aux_model_sha256'))[:12]}). Resuming them is Stage C "
+            "(checkpoint binding of auxiliary states); without it every auxiliary slot would continue as "
+            "an ordinary state. Start a new run directory instead.")
 
 
 def _restore_secondary_cv_args_from_metadata(args, secondary_cv_metadata: dict, out_dir: Optional[Path] = None) -> None:

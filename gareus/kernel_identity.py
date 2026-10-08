@@ -38,6 +38,34 @@ ELIGIBLE_AFFECTED = "affected"          # recorded kernel is a known-wrong one
 ELIGIBLE_UNKNOWN = "unknown"            # residual mode but no kernel record (pre-F01 segments)
 ELIGIBLE_NOT_APPLICABLE = "not_applicable"   # no residual CV: the F01 defect cannot have touched it
 
+#: Auxiliary-CV segment whose samples carry no z / torsion features (Stage B engineering runs):
+#: its bias cannot be reconstructed for any analysis, whatever its CV2 mode.
+ELIGIBLE_AUX_UNPERSISTED = "aux_unpersisted"
+
+#: The same shared assembly plus the exact auxiliary-CV restraint term evaluated for every
+#: carrier under every active state (spec 2026-10-07 auxiliary CV, Section 5). Used whenever an
+#: auxiliary model is configured, including sham arms whose strengths are all zero.
+EXCHANGE_ENERGY_VERSION_AUX = "state_bias_matrix_v3_aux"
+
+#: Window-snapshot key Stage C writes when a segment stores auxiliary z and torsion features.
+AUX_PERSISTED_SNAPSHOT_KEY = "aux_sample_schema"
+
+
+def exchange_energy_version_for_args(args) -> str:
+    return EXCHANGE_ENERGY_VERSION_AUX if getattr(args, "aux_cv_model", None) else EXCHANGE_ENERGY_VERSION
+
+
+def is_aux_kernel_record(record) -> bool:
+    """True when a kernel_identity / method_settings record describes an auxiliary-CV run.
+
+    One predicate for the eligibility classifier, the Stage B resume refusal and the MBAR loaders'
+    guard: the v3_aux exchange version, or any recorded auxiliary model digest.
+    """
+    if not isinstance(record, dict):
+        return False
+    return bool(record.get("exchange_energy_version") == EXCHANGE_ENERGY_VERSION_AUX
+                or record.get("aux_model_sha256") or record.get("aux_cv_model_sha256"))
+
 
 def kernel_identity_for_run(args, secondary_cv_metadata=None) -> dict:
     """The numerical kernel of a segment about to be written, as JSON-ready fields.
@@ -58,11 +86,20 @@ def kernel_identity_for_run(args, secondary_cv_metadata=None) -> dict:
         "secondary_cv_mode": mode if meta.get("enabled") else "none",
         "cv_evaluator_version": (str(meta.get("cv_evaluator_version")) if residual and meta.get("cv_evaluator_version")
                                  else (None if not residual else "affected_pre_f01")),
-        "exchange_energy_version": EXCHANGE_ENERGY_VERSION,
+        "exchange_energy_version": exchange_energy_version_for_args(args),
         "pair_model_sha256": meta.get("pair_model_sha256") if residual else None,
         "production_ensemble": str(getattr(args, "production_ensemble", "") or ""),
         "gamd_boost_type": str(getattr(args, "gamd_boost_type", "") or ""),
     }
+    if getattr(args, "aux_cv_model", None):
+        runtime = getattr(args, "_aux_runtime", None)
+        if runtime is not None:
+            identity["aux_model_sha256"] = str(runtime.info.model_sha256)
+            if getattr(runtime, "topology_sha256", None):
+                identity["aux_topology_sha256"] = str(runtime.topology_sha256)
+        else:
+            from .auxiliary_cv.model import AuxModel   # lazy: keep this module import-light
+            identity["aux_model_sha256"] = AuxModel.load(args.aux_cv_model).model_sha256
     body = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
     identity["digest"] = hashlib.sha256(body).hexdigest()
     return identity
@@ -78,6 +115,11 @@ def classify_segment_kernel(window_snapshot: dict) -> tuple:
     snap = dict(window_snapshot or {})
     cv2 = str(snap.get("cv2_type") or "none")
     identity = snap.get("kernel_identity") or {}
+    if is_aux_kernel_record(identity):
+        if not snap.get(AUX_PERSISTED_SNAPSHOT_KEY):
+            return ELIGIBLE_AUX_UNPERSISTED, ("auxiliary-CV segment without stored z/torsion features "
+                                              "(Stage B engineering run): its bias cannot be reconstructed")
+        return ELIGIBLE_UNKNOWN, "auxiliary-CV segment: classification needs the Stage C reader"
     if cv2 != RESIDUAL_MODE:
         return ELIGIBLE_NOT_APPLICABLE, "secondary CV is not residual-torsion-pc"
     if not identity:

@@ -342,8 +342,14 @@ def _method_settings(args: Any) -> dict[str, Any]:
         settings["cv2_component"] = {"error": f"{type(exc).__name__}: {exc}"}
     # Numerical-kernel identity of this segment (spec F01/F04): which CV evaluator and
     # which exchange-energy assembly produced its samples. A resume compares these.
-    from .kernel_identity import EXCHANGE_ENERGY_VERSION, RESIDUAL_EVALUATOR_VERSION
-    settings["exchange_energy_version"] = EXCHANGE_ENERGY_VERSION
+    from .kernel_identity import RESIDUAL_EVALUATOR_VERSION, exchange_energy_version_for_args
+    settings["exchange_energy_version"] = exchange_energy_version_for_args(args)
+    if getattr(args, "aux_cv_model", None):
+        from .auxiliary_cv.model import AuxModel
+        settings["aux_cv_model_sha256"] = AuxModel.load(args.aux_cv_model).model_sha256
+        # GaMD envelope recon/calibration ran with the auxiliary restraint off (k = 0), so arms that
+        # differ only in auxiliary strength calibrate identical envelopes (spec 3, 11.2).
+        settings["aux_envelope_calibration"] = "aux_inactive"
     settings["cv_evaluator_version"] = (RESIDUAL_EVALUATOR_VERSION
                                         if str(getattr(args, "secondary_cv", "") or "") in ("residual-torsion-pc", "residual-pc")
                                         else None)
