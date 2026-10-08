@@ -1398,7 +1398,7 @@ git commit -m "feat(cvaux): set_window applies the complete aux target at all si
   - It **never raises on a non-finite z**: it records what it observed. Fatality is decided by `aux_bias_matrix_kcal`, only when an active state needs the value.
   - The fast path returns a finite value even at a degenerate torsion (OpenMM's `theta` is finite there). The slow path returns NaN. Neither is relied on for fail-closed behaviour: that is `check_aux_geometry`'s job (below).
 - Produces: `check_aux_geometry(positions_nm, runtime, *, replica=None) -> None`. It raises `AuxObservationError` naming the degenerate quads and the replica.
-  - It covers every unique torsion of the model, including zero-coefficient ones: Stage A's conservative rule.
+  - It covers the torsions that carry weight (at least one nonzero-coefficient feature, Stage A `active_feature_mask`), matching Stage A's evaluator and the force: a degenerate zero-weight torsion leaves z defined.
   - Its threshold and semantics are exactly those of Stage A `openmm_dihedrals`, which it calls.
 - Produces: `make_aux_z_observer(runtime, *, use_fast_path: bool, fast_forces, unit) -> Callable[[int, sim], float]`. This is the single observer `run_gareus` installs as `_aux_z_for_replica` for both fetch closures (Task 6).
   - With any active state, it reads the carrier's positions once and calls `check_aux_geometry`. It then returns the fast-path z (the force's own value, authoritative) or the slow-path z.
@@ -1551,7 +1551,7 @@ Add to the imports of `gareus/auxiliary_cv/runtime.py`:
 import numpy as np
 
 from .evaluate import z_from_positions
-from .features import openmm_dihedrals, unique_torsions
+from .features import openmm_dihedrals, active_feature_mask, unique_torsions
 ```
 
 Append:
@@ -1577,9 +1577,14 @@ def check_aux_geometry(positions_nm, runtime: AuxRuntime, *, replica=None) -> No
     """Fail closed when a model torsion is degenerate (spec 3.3).
 
     Same rule as Stage A ``openmm_dihedrals`` (NaN when |b1 x b2|^2 or |b2 x b3|^2 < DEGENERATE_CROSS2_NM4),
-    over every unique torsion of the model, zero-coefficient ones included (Stage A's conservative rule).
+    over the torsions that carry weight: those with at least one nonzero-coefficient feature
+    (Stage A ``active_feature_mask``). Stage A's evaluator and the force both ignore zero-weight
+    torsions, so z stays defined when only a zero-weight torsion is degenerate.
     """
-    quads, _idx = unique_torsions(runtime.table.model)
+    model = runtime.table.model
+    all_quads, idx = unique_torsions(model)
+    active_t = sorted(set(idx[active_feature_mask(model)].tolist()))
+    quads = [all_quads[t] for t in active_t]
     theta = openmm_dihedrals(positions_nm, quads)[0]
     if np.isnan(theta).any():
         bad = [quads[t] for t in np.flatnonzero(np.isnan(theta))]
