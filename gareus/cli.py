@@ -1425,6 +1425,58 @@ def _validate_gamd_args(args: argparse.Namespace) -> None:
         )
 
 
+_AUX_PLAIN_WINDOW_MODES = ("adaptive", "manual")
+
+
+def _add_aux_cv_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--aux-cv-model", default=None, metavar="PATH",
+                   help="Frozen auxiliary-CV model (atlas-aux-cv-model-v1 JSON). Enables auxiliary-CV "
+                        "states: every row of --windows-2d-csv must state aux_k_kcal_mol (0 = ordinary or "
+                        "sham) and active rows aux_center. Plain runs only. Spec "
+                        "docs/superpowers/specs/2026-10-07-auxiliary-cv-gibbs-production-spec.md.")
+    p.add_argument("--aux-cv-allow-unpersisted", action="store_true", default=False,
+                   help="Acknowledge that this version does not yet write auxiliary z values to the "
+                        "sample store: the run is an engineering run whose samples are marked "
+                        "ineligible for analysis (Stage C removes this flag).")
+
+
+def _validate_aux_cv_args(p: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Refuse every configuration the Stage B auxiliary-state machinery cannot run exactly."""
+    if not getattr(args, "aux_cv_model", None):
+        if getattr(args, "aux_cv_allow_unpersisted", False):
+            p.error("--aux-cv-allow-unpersisted needs --aux-cv-model")
+        return
+    window_mode = str(getattr(args, "window_mode", "adaptive") or "adaptive")
+    if window_mode not in _AUX_PLAIN_WINDOW_MODES:
+        p.error(f"--aux-cv-model is plain-run only (--window-mode {' or '.join(_AUX_PLAIN_WINDOW_MODES)} with "
+                f"--windows-2d-csv); --window-mode {window_mode} rewrites or regenerates the window table "
+                "without auxiliary columns. Adaptive admission is a later stage")
+    if str(getattr(args, "swarm_stage", "off") or "off") != "off":
+        p.error("--aux-cv-model cannot run inside the swarm stage (--swarm-stage must be off)")
+    if not getattr(args, "windows_2d_csv", None):
+        p.error("--aux-cv-model needs --windows-2d-csv: auxiliary states are rows of an explicit state table")
+    run_mode = str(getattr(args, "run_mode", "gamd") or "gamd")
+    boost = str(getattr(args, "gamd_boost_type", "") or "")
+    if run_mode in ("gamd", "hmr-gamd") and not boost.startswith("pep-gamd"):
+        p.error(f"--aux-cv-model with --gamd-boost-type {boost!r}: every stock gamd-openmm integrator first "
+                "moves all forces to group 0 (gamd/integrator_factory.py set_all_forces_to_group), which "
+                "destroys the auxiliary restraint's own force group (and, for total/dual boost types, boosts "
+                "it); use a pep-gamd-* boost type or --run-mode cmd")
+    if str(getattr(args, "exchange_mode", "neighbor")) == "neighbor":
+        p.error("--aux-cv-model needs unrestricted exchange candidates (gibbs-walk, all-pair-sweep or "
+                "random-pair): --exchange-mode neighbor builds its graph from CV1/CV2 geometry and cannot "
+                "represent auxiliary states")
+    if getattr(args, "resume", False) or getattr(args, "extend", False):
+        p.error("--aux-cv-model cannot --resume/--extend yet: checkpoint binding of auxiliary states is Stage C")
+    if bool(getattr(args, "us_auto_drop_bad_windows", False)):
+        p.error("--aux-cv-model refuses --us-auto-drop-bad-windows: the state table is frozen and a population "
+                "change is a new phase (spec Section 6)")
+    if not getattr(args, "aux_cv_allow_unpersisted", False):
+        p.error("--aux-cv-model does not yet write auxiliary z to the sample store (Stage C); pass "
+                "--aux-cv-allow-unpersisted to acknowledge an engineering run whose samples are marked "
+                "ineligible for analysis")
+
+
 def _validate_fsf_clamp_args(p: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     """--pep-gamd-fsf-floor-*: [0, 1), Pep-GaMD only; one set clamps both (the other at 0.0)."""
     total = getattr(args, "pep_gamd_fsf_floor_total", None)
@@ -2085,6 +2137,7 @@ def build_gareus_parser() -> argparse.ArgumentParser:
     _add_cv_args(p)
     _add_cv_selection_args(p)
     _add_window_args(p)
+    _add_aux_cv_args(p)
     _add_us_args(p)
     _add_seeding_args(p)
     _add_genpept_prescan_args(p)
@@ -2119,6 +2172,7 @@ def parse_args(argv: Optional[Iterable[str]] = None):
     _add_cv_args(p)
     _add_cv_selection_args(p)
     _add_window_args(p)
+    _add_aux_cv_args(p)
     _add_us_args(p)
     _add_seeding_args(p)
     _add_genpept_prescan_args(p)
@@ -2143,6 +2197,7 @@ def parse_args(argv: Optional[Iterable[str]] = None):
 
     # Apply compat shims before validation (validators use legacy attr names)
     _apply_v2_compat_shims(args)
+    _validate_aux_cv_args(p, args)
 
     args.contact_scheme = contact_scheme(args)
     _validate_contact_args(args)
