@@ -163,16 +163,15 @@ def anchor_ledger_events(out_dir, manifest: Mapping[str, Any]) -> dict:
 
 
 def prepare_aux_resume(out_dir, registry, manifest: Mapping[str, Any], *, state_definition, force_info,
-                       topology_sha256: str, kernel_identity_digest: str) -> list[dict[str, Any]]:
+                       topology_sha256: str, kernel_identity_digest: str) -> dict[str, Any]:
     """Every auxiliary resume refusal that needs no Context, run BEFORE the resumed segment is registered.
 
-    Task 14 F4: a refusal here changes nothing on disk. Order: static checkpoint binding
+    Task 14 F4 (fix round 2): read-only -- it never changes the registry. Order: static checkpoint binding
     (``verify_aux_resume_static``), the ledger replay from the anchor segment, the duplicate-event check on
-    the registry view the re-seal will leave, and only then the re-seal itself
-    (``store.reseal_chain_for_resume``: orphans after the checkpoint's segment abandoned, the checkpoint's
-    segment cut to the checkpoint step). Returns the re-seal records.
+    the registry view the re-seal will leave. Returns the re-seal plan: ``run_gareus`` registers the resumed
+    segment under ``parent_segment_id`` (the checkpoint's segment, never an orphan) and applies
+    ``store.reseal_chain_for_resume`` only after the Context-dependent checks in the checkpoint load passed.
     """
-    from ..store import reseal_chain_for_resume
     from .checkpoint import verify_aux_ledger, verify_aux_resume_static
     from .ledger import refuse_duplicate_event_keys
     verify_aux_resume_static(manifest, aux_enabled=True, state_definition=state_definition, force_info=force_info,
@@ -180,7 +179,7 @@ def prepare_aux_resume(out_dir, registry, manifest: Mapping[str, Any], *, state_
     verify_aux_ledger(manifest, anchor_ledger_events(out_dir, manifest))
     ckpt_seg, ckpt_step = str(manifest["aux"]["segment_id"]), int(manifest.get("absolute_step", 0))
     refuse_duplicate_event_keys(_ledger_after_reseal(out_dir, registry, ckpt_seg, ckpt_step))
-    return reseal_chain_for_resume(registry, ckpt_seg, ckpt_step)
+    return {"checkpoint_segment_id": ckpt_seg, "checkpoint_step": ckpt_step, "parent_segment_id": ckpt_seg}
 
 
 def _ledger_after_reseal(out_dir, registry, ckpt_seg: str, ckpt_step: int) -> dict:

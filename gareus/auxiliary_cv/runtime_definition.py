@@ -60,6 +60,9 @@ def _canonical_list(parent, child, rule, where):
                                  "term indices, so this System has no order-insensitive canonical form")
         return []
     if kind == _ORDERED:
+        if any(len(e) for e in items):
+            raise IntegrityError(f"physical_system_sha256: {where}/{child.tag} item with child elements has no "
+                                 "canonical form")
         return [[e.tag, sorted(e.attrib.items())] for e in items]
     if any(e.tag != item or len(e) for e in items):
         raise IntegrityError(f"physical_system_sha256: unexpected element in {where}/{child.tag}")
@@ -74,7 +77,8 @@ def physical_system_sha256(openmm, system) -> str:
     and direction (same physics, different serialization). Bond, angle, torsion, constraint and exception
     terms are therefore direction-normalised and sorted; particles are never reordered (their index is
     their identity), forces keep their order. A force type without a canonical form here is refused, never
-    hashed raw. The default periodic box is excluded (box identity lives in the state definition:
+    hashed raw, and so is a System with virtual sites (children of <Particle>), extra System elements, or
+    index-referenced parameter offsets. The default periodic box is excluded (box identity lives in the state definition:
     fixed_box_vectors_nm for NVT, a sample variable for NPT), as are barostats (ensemble machinery; the
     ensemble and pressure live in the state definition; Task 13 carry-over 7) and the OpenMM release stamp
     (an OpenMM update alone must not make an auxiliary run unresumable; kernel identity and parity checks
@@ -89,9 +93,15 @@ def physical_system_sha256(openmm, system) -> str:
     extra = {c.tag for c in root} - _SYSTEM_CHILDREN
     if extra:
         raise IntegrityError(f"physical_system_sha256: System element(s) {sorted(extra)} have no canonical form")
+    particles = list(root.find("Particles"))
+    if any(len(e) for e in particles):
+        # A virtual site serialises as a child of its <Particle mass="0">: hashing the attributes alone would
+        # let Systems with different virtual sites hash equal (fix round 2).
+        raise IntegrityError("physical_system_sha256: a particle carries a virtual site (child element); "
+                             "virtual sites have no canonical form here")
     out: dict[str, Any] = {
         "system": sorted((k, v) for k, v in root.attrib.items() if k != "openmmVersion"),
-        "particles": [sorted(e.attrib.items()) for e in root.find("Particles")],
+        "particles": [sorted(e.attrib.items()) for e in particles],
         "constraints": sorted(_canonical_term(e, "pair") for e in root.find("Constraints")),
         "forces": [],
     }

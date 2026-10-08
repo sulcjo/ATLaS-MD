@@ -58,3 +58,12 @@ def test_compare_runs_detects_torsion_drift_with_wrapping(monkeypatch, tmp_path)
     _patched(monkeypatch, base, drift)
     out = rc.compare_runs(tmp_path / "ctl", tmp_path / "res")
     assert out["ok"] is False and abs(out["max_abs_dtorsion"] - 0.1) < 1e-12
+
+
+def test_compare_runs_records_none_and_is_not_ok_without_the_aux_and_torsion_columns(monkeypatch, tmp_path):
+    """Fix round 2 (minor 9): absent value columns are not a zero difference."""
+    import gareus.auxiliary_cv.resume_check as rc
+    base = {"step": np.array([100, 200]), "replica": np.array([0, 0]), "window_id": np.array([0, 1])}
+    _patched(monkeypatch, base, dict(base))
+    out = rc.compare_runs(tmp_path / "ctl", tmp_path / "res")
+    assert out["max_abs_dz"] is None and out["max_abs_dtorsion"] is None and out["ok"] is False

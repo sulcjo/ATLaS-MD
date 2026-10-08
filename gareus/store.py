@@ -526,16 +526,17 @@ def reseal_parent_for_resume(registry: "SegmentRegistry", parent_segment_id: Opt
 
 
 def reseal_chain_for_resume(registry: "SegmentRegistry", checkpoint_segment_id: str,
-                            checkpoint_absolute_step: int) -> List[Dict[str, Any]]:
+                            checkpoint_absolute_step: int, *, exclude: Optional[str] = None) -> List[Dict[str, Any]]:
     """On resume of an AUXILIARY run, walk back from the newest segment to the checkpoint's own segment.
 
     Every non-complete segment after the checkpoint's segment holds only rows past the checkpoint (an
     empty orphan left by a refused resume, or a child that died before its first checkpoint): it is sealed
     ``abandoned``. The checkpoint's segment is then cut back to the checkpoint step
     (:func:`reseal_parent_for_resume`). A ``complete`` segment after the checkpoint's segment cannot follow
-    from this checkpoint: refused. Returns one record per segment changed (Task 14 F4).
+    from this checkpoint: refused. ``exclude`` is the resuming segment itself (already registered), never
+    touched. Returns one record per segment changed (Task 14 F4).
     """
-    segs = registry.all_segments()
+    segs = [s for s in registry.all_segments() if s["segment_id"] != exclude]
     ids = [s["segment_id"] for s in segs]
     if checkpoint_segment_id not in ids:
         raise RuntimeError(f"resume refused: the checkpoint's segment {checkpoint_segment_id!r} is not in the "

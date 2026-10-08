@@ -211,8 +211,8 @@ def test_resume_ledger_check_is_scoped_and_every_refusal_precedes_the_reseal():
     static = src.index("verify_aux_resume_static(")
     ledger = src.index("verify_aux_ledger(")
     dup = src.index("refuse_duplicate_event_keys(")
-    reseal = src.index("reseal_chain_for_resume(")
-    assert static < ledger < dup < reseal
+    assert static < ledger < dup
+    assert "reseal_chain_for_resume(" not in src         # fix round 2: prepare never mutates the registry
     assert "anchor_ledger_events(out_dir, manifest)" in src
     assert "_ledger_after_reseal(" in src
 

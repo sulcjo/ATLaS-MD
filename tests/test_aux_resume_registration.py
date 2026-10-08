@@ -68,31 +68,39 @@ def _prepare(run, manifest, defn):
                               topology_sha256=TOPO, kernel_identity_digest=KID)
 
 
-def _child(run, steps):
-    from gareus.store import SegmentRegistry
+def _child_after_load(run, plan, steps):
+    """What run_gareus does once every refusal passed: register under the checkpoint's segment, load, re-seal."""
+    from gareus.store import SegmentRegistry, reseal_chain_for_resume
     reg = SegmentRegistry(run)
-    child = reg.open_segment("run", reg.get_latest_segment()["segment_id"], 1)
+    child = reg.open_segment("run", plan["parent_segment_id"], 1)
+    records = reseal_chain_for_resume(reg, plan["checkpoint_segment_id"], plan["checkpoint_step"], exclude=child)
     reg.set_segment_start_step(child, 200)
     _write(run, child, steps)
     reg.close_segment(child, max(steps))
+    return child, records
 
 
 @pytest.mark.parametrize("orphan", [False, True])
 def test_refuse_then_fix_then_resume_pools_every_step_once(tmp_path, orphan):
     from gareus.query import load_exchanges, load_samples
-    _seg, manifest = _crashed_campaign(tmp_path, orphan=orphan)
+    seg, manifest = _crashed_campaign(tmp_path, orphan=orphan)
     before = (tmp_path / "segments.json").read_bytes()
     # 1. a refused resume (here: the state definition drifted) changes nothing on disk
     with pytest.raises(IntegrityError, match="state_definition_sha256"):
         _prepare(tmp_path, manifest, _defn(aux_k=2.0))
     assert (tmp_path / "segments.json").read_bytes() == before
-    # 2. cause fixed: the resume re-seals (walking back over any orphan) and the child re-runs 300
-    records = _prepare(tmp_path, manifest, _defn())
+    # 2. cause fixed: the checks pass WITHOUT touching the registry (fix round 2, minor 4) ...
+    plan = _prepare(tmp_path, manifest, _defn())
+    assert (tmp_path / "segments.json").read_bytes() == before
+    assert plan == {"checkpoint_segment_id": seg, "checkpoint_step": 200, "parent_segment_id": seg}   # minor 5
+    # ... and the re-seal (walking back over any orphan) runs after the load; the child re-runs 300
+    child, records = _child_after_load(tmp_path, plan, [300, 400])
     segs = json.loads((tmp_path / "segments.json").read_text())
     assert segs[0]["end_step"] == 200 and segs[0]["status"] == "interrupted"
+    assert segs[-1]["segment_id"] == child and segs[-1]["parent_segment_id"] == seg
+    assert segs[-1]["status"] == "complete"
     if orphan:
         assert segs[1]["status"] == "abandoned" and len(records) == 2
-    _child(tmp_path, [300, 400])
     s = load_samples(tmp_path)
     keys = list(zip(np.asarray(s["step"]).tolist(), np.asarray(s["replica"]).tolist()))
     assert len(keys) == len(set(keys)) == 4 * 3
@@ -110,6 +118,25 @@ def test_reseal_chain_refuses_a_complete_segment_after_the_checkpoint(tmp_path):
         reseal_chain_for_resume(reg, a, 200)
     with pytest.raises(RuntimeError, match="not in the segment registry"):
         reseal_chain_for_resume(reg, "seg_099", 200)
+    c = reg.open_segment("run", a, 1)                       # the resuming segment itself is never touched
+    with pytest.raises(RuntimeError, match="complete"):
+        reseal_chain_for_resume(reg, a, 200, exclude=c)
+
+
+def test_loader_skips_an_abandoned_segment_that_still_holds_rows(tmp_path):
+    """Fix round 2 (minor 7): abandoning a segment with committed rows removes them from every pool."""
+    from gareus.query import load_exchanges, load_samples
+    from gareus.store import SegmentRegistry
+    reg = SegmentRegistry(tmp_path)
+    a = reg.open_segment("run", None, 1)
+    _write(tmp_path, a, [100, 200])
+    reg.close_segment(a, 200)
+    b = reg.open_segment("run", a, 1)
+    _write(tmp_path, b, [300, 400])
+    reg.seal_segment(b, absolute_end_step=-1, status="abandoned")
+    for loaded in (load_samples(tmp_path), load_exchanges(tmp_path)):
+        assert sorted(set(np.asarray(loaded["step"]).tolist())) == [100, 200]
+        assert set(np.asarray(loaded["segment_id"]).astype(str)) == {a}
 
 
 def test_aux_resume_without_checkpoint_refuses_when_a_committed_parent_exists(tmp_path):
@@ -157,6 +184,10 @@ def test_aux_resume_checks_run_before_the_segment_is_registered():
     opens = [i for i in range(len(src)) if src.startswith("_seg_registry.open_segment(", i)]
     assert len(opens) == 2                     # legacy (unconditional for non-aux) + aux (after the checks)
     assert opens[0] < prepare < opens[1]
+    # minor 5: the aux segment's parent is the checkpoint's segment; minor 4: the re-seal follows the load
+    assert "_seg_registry.open_segment(_run_id, _aux_parent_seg_id, _round_id)" in src
+    assert src.index("load_production_checkpoint(") < src.index("reseal_chain_for_resume(")
+    assert "exclude=_seg_id" in src
     assert "_seg_id = None if getattr(args, '_aux_runtime', None) is not None else " \
            "_seg_registry.open_segment(_run_id, _parent_seg_id, _round_id)" in src
     assert "refuse_aux_resume_without_checkpoint(out_dir)" in src

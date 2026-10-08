@@ -51,6 +51,9 @@ def compare_runs(control_dir, resumed_dir, *, z_atol: float = 1e-9, torsion_atol
                                     and out["sample_duplicate_keys"]["control"] == 0)
         common = sorted(set(kc) & set(kr))
         ic, ir = [kc[k] for k in common], [kr[k] for k in common]
+        # Fix round 2 (minor 9): an absent value column is recorded as None (not compared), never as 0.
+        out["max_abs_dz"] = None
+        out["max_abs_dtorsion"] = None
         if "aux_z_00" in sc and "aux_z_00" in sr and common:
             zc = np.asarray(sc["aux_z_00"], dtype=float)[ic]
             zr = np.asarray(sr["aux_z_00"], dtype=float)[ir]
@@ -62,6 +65,9 @@ def compare_runs(control_dir, resumed_dir, *, z_atol: float = 1e-9, torsion_atol
             out["max_abs_dtorsion"] = float(np.nanmax(np.stack(d)))
     else:
         out["sample_keys_equal"] = True
-    out["ok"] = (out["ledger_duplicates"] == 0 and out["ledger_equal"] and out["sample_keys_equal"]
-                 and out.get("max_abs_dz", 0.0) <= z_atol and out.get("max_abs_dtorsion", 0.0) <= torsion_atol)
+    values_ok = True
+    if sc and sr:
+        values_ok = (out["max_abs_dz"] is not None and out["max_abs_dz"] <= z_atol
+                     and out["max_abs_dtorsion"] is not None and out["max_abs_dtorsion"] <= torsion_atol)
+    out["ok"] = bool(out["ledger_duplicates"] == 0 and out["ledger_equal"] and out["sample_keys_equal"] and values_ok)
     return out

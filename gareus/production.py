@@ -8122,6 +8122,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     _aux_io = None
     _aux_record_for_replica = None
     _aux_reseal_records = None
+    _aux_reseal_plan = None
     _aux_resume_loading = False
     if getattr(args, "_aux_runtime", None) is not None:
         from .auxiliary_cv.runtime_definition import (aux_io_runtime, build_runtime_state_definition,
@@ -8166,15 +8167,18 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             args._aux_runtime, use_fast_path=_use_fast_cv_path, fast_forces=_fast_aux_forces, unit=unit,
             schema=_aux_io.sample_schema, models=_aux_io.models)
     if _aux_io is not None:
+        _aux_parent_seg_id = _parent_seg_id
         if fast_resume:
-            # Task 14 F4: the binding, ledger and duplicate refusals and the re-seal run before the resumed
-            # segment exists, so a refused resume leaves no orphan segment behind.
+            # Task 14 F4: the binding, ledger and duplicate refusals run (read-only) before the resumed segment
+            # exists, so a refused resume leaves no orphan segment behind. Its parent is the checkpoint's
+            # segment (fix round 2, minor 5); the re-seal waits for the checkpoint load (minor 4).
             from .auxiliary_cv.runtime_io import prepare_aux_resume
-            _aux_reseal_records = prepare_aux_resume(
+            _aux_reseal_plan = prepare_aux_resume(
                 out_dir, _seg_registry, resume_manifest, state_definition=_aux_io.state_definition,
                 force_info=_aux_io.force_info, topology_sha256=_aux_io.topology_sha256,
                 kernel_identity_digest=kernel_identity_for_run(args, secondary_cv_metadata)["digest"])
-        _seg_id = _seg_registry.open_segment(_run_id, _parent_seg_id, _round_id)
+            _aux_parent_seg_id = _aux_reseal_plan["parent_segment_id"]
+        _seg_id = _seg_registry.open_segment(_run_id, _aux_parent_seg_id, _round_id)
         # Carry-over 5: the frozen v2 snapshot carries the state definition.
         WindowSnapshot(out_dir).snapshot(_seg_id, _win_snapshot_windows, cv1_type=primary_cv_mode(args), cv2_type=_cv2_type,
                                          kernel_identity=kernel_identity_for_run(args, secondary_cv_metadata),
@@ -9156,9 +9160,17 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 # step have wrong window_id labels (exchange state was rolled back)
                 # and must be excluded from MBAR analysis.
                 if getattr(args, "_aux_runtime", None) is not None:
-                    # Auxiliary runs only (ruling B4, Task 14 F4): the re-seal (walking back over orphan
-                    # segments to the checkpoint's own), the anchor-scoped ledger replay and the duplicate-event
-                    # refusal already ran in prepare_aux_resume, before this segment was registered.
+                    # Auxiliary runs only (ruling B4, Task 14 F4): the anchor-scoped ledger replay and the
+                    # duplicate-event refusal ran in prepare_aux_resume, before this segment was registered; the
+                    # re-seal (walking back over orphan segments to the checkpoint's own) runs now, after every
+                    # Context-dependent check in the load passed (fix round 2, minor 4).
+                    from .store import reseal_chain_for_resume
+                    if _aux_reseal_plan is None:
+                        raise RuntimeError("auxiliary resume loaded a checkpoint without its pre-registration "
+                                           "checks (no replica checkpoint files in the manifest); refusing")
+                    _aux_reseal_records = reseal_chain_for_resume(
+                        _seg_registry, _aux_reseal_plan["checkpoint_segment_id"],
+                        _aux_reseal_plan["checkpoint_step"], exclude=_seg_id)
                     for _rec in (_aux_reseal_records or []):
                         if _rec["previous_end_step"] != _rec["end_step"] or _rec["status"] != _rec["previous_status"]:
                             print(f"    Resume: segment {_rec['segment_id']} re-sealed {_rec['status']} at step "

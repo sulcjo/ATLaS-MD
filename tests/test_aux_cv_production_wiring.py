@@ -184,7 +184,8 @@ def test_aux_runtime_construction_in_run_gareus_is_gated_by_an_aux_condition():
                  "solvated_start_topology_identities", "check_checkpoint_rows_align", "anchor_ledger_events",
                  "refuse_duplicate_event_keys", "data_boundary", "embed_cv_definition",
                  # Task 14 fix round 1 (F4)
-                 "prepare_aux_resume", "refuse_aux_resume_without_checkpoint", "discard_refused_segment"):
+                 "prepare_aux_resume", "refuse_aux_resume_without_checkpoint", "discard_refused_segment",
+                 "reseal_chain_for_resume"):
         for call in _calls(tree, name):
             node, gated = call, False
             while node in parents:

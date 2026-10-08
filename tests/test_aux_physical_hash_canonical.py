@@ -119,3 +119,18 @@ def test_index_referenced_exception_offsets_are_refused():
     nb.addExceptionParameterOffset("lam", 0, 0.1, 0.0, 0.0)
     with pytest.raises(IntegrityError, match="ExceptionOffsets"):
         physical_system_sha256(mm, s)
+
+
+def test_virtual_sites_are_refused_not_dropped():
+    """Fix round 2: a virtual site serialises as a child of <Particle mass="0">; hashing only the particle's
+    attributes would make Systems with different virtual sites hash equal."""
+    mm = _mm()
+    s = mm.System()
+    for m in (12.0, 12.0, 0.0):
+        s.addParticle(m)
+    s.setVirtualSite(2, mm.TwoParticleAverageSite(0, 1, 0.5, 0.5))
+    bonds = mm.HarmonicBondForce()
+    bonds.addBond(0, 1, 0.15, 1000.0)
+    s.addForce(bonds)
+    with pytest.raises(IntegrityError, match="virtual site"):
+        physical_system_sha256(mm, s)
