@@ -8,7 +8,7 @@ import pytest
 
 from aux_cv_fixture import model_payload
 from gareus.auxiliary_cv.model import AuxModel
-from gareus.kernel_identity import (AUX_PERSISTED_SNAPSHOT_KEY, ELIGIBLE_AUX_UNPERSISTED, ELIGIBLE_NOT_APPLICABLE,
+from gareus.kernel_identity import (ELIGIBLE_AUX_UNPERSISTED, ELIGIBLE_NOT_APPLICABLE,
                                     ELIGIBLE_UNKNOWN, ELIGIBLE_VERIFIED, EXCHANGE_ENERGY_VERSION,
                                     EXCHANGE_ENERGY_VERSION_AUX, RESIDUAL_EVALUATOR_VERSION,
                                     classify_segment_kernel, exchange_energy_version_for_args,
@@ -76,11 +76,12 @@ def test_aux_model_sha_alone_marks_a_segment_aux():
     assert classify_segment_kernel(snap)[0] == ELIGIBLE_AUX_UNPERSISTED
 
 
-def test_v3_aux_is_never_verified_in_stage_b():
-    snap = {"cv2_type": "residual-torsion-pc", AUX_PERSISTED_SNAPSHOT_KEY: {"schema": "x"},
+def test_v3_aux_without_payload_stays_unpersisted():
+    """Stage C: persistence comes from the samples manifest payload, never from a snapshot key."""
+    snap = {"cv2_type": "residual-torsion-pc", "aux_sample_schema": {"schema": "x"},
             "kernel_identity": {"cv_evaluator_version": RESIDUAL_EVALUATOR_VERSION,
                                 "exchange_energy_version": EXCHANGE_ENERGY_VERSION_AUX}}
-    assert classify_segment_kernel(snap)[0] == ELIGIBLE_UNKNOWN
+    assert classify_segment_kernel(snap)[0] == ELIGIBLE_AUX_UNPERSISTED
 
 
 def test_legacy_classification_unchanged():

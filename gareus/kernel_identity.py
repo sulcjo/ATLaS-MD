@@ -47,8 +47,22 @@ ELIGIBLE_AUX_UNPERSISTED = "aux_unpersisted"
 #: auxiliary model is configured, including sham arms whose strengths are all zero.
 EXCHANGE_ENERGY_VERSION_AUX = "state_bias_matrix_v3_aux"
 
-#: Window-snapshot key Stage C writes when a segment stores auxiliary z and torsion features.
-AUX_PERSISTED_SNAPSHOT_KEY = "aux_sample_schema"
+#: Payload schema a Stage C samples manifest records when every row stores the auxiliary z and the
+#: full torsion basis (gareus.auxiliary_cv.sample_schema.AUX_SAMPLES_SCHEMA; kept here import-light).
+AUX_SAMPLES_PAYLOAD_SCHEMA = "atlas-aux-samples-v1"
+
+
+def raw_sample_payload_schema(run_dir, segment_id) -> "dict | None":
+    """``payload_schema`` of ``samples/<segment>/`` as raw JSON; never validates files, never raises."""
+    import json
+    from pathlib import Path
+    from .parquet_manifest import manifest_path
+    try:
+        raw = json.loads(manifest_path(Path(run_dir) / "samples" / str(segment_id)).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    payload = raw.get("payload_schema") if isinstance(raw, dict) else None
+    return payload if isinstance(payload, dict) else None
 
 
 def exchange_energy_version_for_args(args) -> str:
@@ -105,28 +119,37 @@ def kernel_identity_for_run(args, secondary_cv_metadata=None) -> dict:
     return identity
 
 
-def classify_segment_kernel(window_snapshot: dict) -> tuple:
+def classify_segment_kernel(window_snapshot: dict, *, sample_payload_schema: "dict | None" = None) -> tuple:
     """(eligibility, reason) of one segment from its ``windows/<segment>.json`` payload.
 
     Non-residual segments are not affected by the residual fast-path defect and stay
     eligible under their own documented rules; a residual segment is verified only when its
-    recorded evaluator and exchange versions equal the current ones.
+    recorded evaluator and exchange versions equal the current ones. An auxiliary-CV segment is
+    verified only when its samples manifest records the atlas-aux-samples-v1 payload and its frozen
+    snapshot and that payload name the kernel's model (``sample_payload_schema``, Stage C).
     """
     snap = dict(window_snapshot or {})
     cv2 = str(snap.get("cv2_type") or "none")
     identity = snap.get("kernel_identity") or {}
     if is_aux_kernel_record(identity):
-        if not snap.get(AUX_PERSISTED_SNAPSHOT_KEY):
-            return ELIGIBLE_AUX_UNPERSISTED, ("auxiliary-CV segment without stored z/torsion features "
-                                              "(Stage B engineering run): its bias cannot be reconstructed")
-        return ELIGIBLE_UNKNOWN, "auxiliary-CV segment: classification needs the Stage C reader"
-    if cv2 != RESIDUAL_MODE:
+        sha = identity.get("aux_model_sha256")
+        payload = dict(sample_payload_schema or {})
+        state = snap.get("state_definition") or {}
+        if payload.get("schema") != AUX_SAMPLES_PAYLOAD_SCHEMA:
+            return ELIGIBLE_AUX_UNPERSISTED, ("auxiliary-CV segment whose samples carry no atlas-aux-samples-v1 "
+                                              "payload (Stage B engineering run): its bias cannot be reconstructed")
+        if not sha or sha not in (state.get("aux_models") or {}) or sha not in (payload.get("model_shas") or []):
+            return ELIGIBLE_AUX_UNPERSISTED, ("auxiliary model of the kernel identity is not bound by the frozen "
+                                              "snapshot and the sample schema")
+        if cv2 != RESIDUAL_MODE:
+            return ELIGIBLE_VERIFIED, "auxiliary features recorded (atlas-aux-samples-v1) with a frozen state table"
+    elif cv2 != RESIDUAL_MODE:
         return ELIGIBLE_NOT_APPLICABLE, "secondary CV is not residual-torsion-pc"
     if not identity:
         return ELIGIBLE_UNKNOWN, "residual segment without a kernel_identity record (written before F01)"
     ev = identity.get("cv_evaluator_version")
     ex = identity.get("exchange_energy_version")
-    if ev == RESIDUAL_EVALUATOR_VERSION and ex == EXCHANGE_ENERGY_VERSION:
+    if ev == RESIDUAL_EVALUATOR_VERSION and ex in (EXCHANGE_ENERGY_VERSION, EXCHANGE_ENERGY_VERSION_AUX):
         return ELIGIBLE_VERIFIED, "kernel matches the current evaluator and exchange assembly"
     if ev in (None, "affected_pre_f01"):
         return ELIGIBLE_AFFECTED, "recorded coordinates came from the two-term fall-through (review I01)"
