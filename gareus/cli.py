@@ -1434,18 +1434,21 @@ def _add_aux_cv_args(p: argparse.ArgumentParser) -> None:
                         "states: every row of --windows-2d-csv must state aux_k_kcal_mol (0 = ordinary or "
                         "sham) and active rows aux_center. Plain runs only. Spec "
                         "docs/superpowers/specs/2026-10-07-auxiliary-cv-gibbs-production-spec.md.")
-    p.add_argument("--aux-cv-allow-unpersisted", action="store_true", default=False,
-                   help="Acknowledge that this version does not yet write auxiliary z values to the "
-                        "sample store: the run is an engineering run whose samples are marked "
-                        "ineligible for analysis (Stage C removes this flag).")
+    p.add_argument("--aux-phase-kind", default="pilot",
+                   choices=["production", "pilot", "exploration", "equilibration"],
+                   help="Sampling-policy phase kind frozen into an auxiliary run's window snapshot (spec Section 6). "
+                        "Only 'production' segments can be marked equilibrium-eligible.")
+    p.add_argument("--aux-equilibrium-eligible", action="store_true", default=False,
+                   help="Mark this auxiliary run's segments eligible for equilibrium analysis (needs "
+                        "--aux-phase-kind production and an equilibrated, prespecified retained segment).")
 
 
 def _validate_aux_cv_args(p: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     """Refuse every configuration the Stage B auxiliary-state machinery cannot run exactly."""
     if not getattr(args, "aux_cv_model", None):
-        if getattr(args, "aux_cv_allow_unpersisted", False):
-            p.error("--aux-cv-allow-unpersisted needs --aux-cv-model")
         return
+    if getattr(args, "aux_equilibrium_eligible", False) and str(getattr(args, "aux_phase_kind", "pilot")) != "production":
+        p.error("--aux-equilibrium-eligible needs --aux-phase-kind production (freeze_snapshot rule)")
     window_mode = str(getattr(args, "window_mode", "adaptive") or "adaptive")
     if window_mode not in _AUX_PLAIN_WINDOW_MODES:
         p.error(f"--aux-cv-model is plain-run only (--window-mode {' or '.join(_AUX_PLAIN_WINDOW_MODES)} with "
@@ -1466,15 +1469,9 @@ def _validate_aux_cv_args(p: argparse.ArgumentParser, args: argparse.Namespace) 
         p.error("--aux-cv-model needs unrestricted exchange candidates (gibbs-walk, all-pair-sweep or "
                 "random-pair): --exchange-mode neighbor builds its graph from CV1/CV2 geometry and cannot "
                 "represent auxiliary states")
-    if getattr(args, "resume", False) or getattr(args, "extend", False):
-        p.error("--aux-cv-model cannot --resume/--extend yet: checkpoint binding of auxiliary states is Stage C")
     if bool(getattr(args, "us_auto_drop_bad_windows", False)):
         p.error("--aux-cv-model refuses --us-auto-drop-bad-windows: the state table is frozen and a population "
                 "change is a new phase (spec Section 6)")
-    if not getattr(args, "aux_cv_allow_unpersisted", False):
-        p.error("--aux-cv-model does not yet write auxiliary z to the sample store (Stage C); pass "
-                "--aux-cv-allow-unpersisted to acknowledge an engineering run whose samples are marked "
-                "ineligible for analysis")
 
 
 def _validate_fsf_clamp_args(p: argparse.ArgumentParser, args: argparse.Namespace) -> None:

@@ -87,6 +87,10 @@ def load_aux_state_table(model_path: Path | str, aux_rows: list[Mapping[str, Any
     with_instance = [p for p in parsed if p["instance"] is not None]
     if with_instance and len(with_instance) != len(parsed):
         raise IntegrityError("instance columns must be filled on every row or on none")
+    if not with_instance:
+        raise IntegrityError("auxiliary state tables need the instance columns (state_instance_id, state_role, "
+                             "spawn_parent_state_id, matched_additional_slot_id) on every row: a frozen v2 state "
+                             "definition requires instance metadata on every window (Stage C ruling M2)")
     ids = [p["instance"]["state_instance_id"] for p in with_instance]
     if len(set(ids)) != len(ids):
         raise IntegrityError(f"duplicate state_instance_id in the window table: {sorted(ids)}")
