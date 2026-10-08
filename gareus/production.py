@@ -2206,8 +2206,8 @@ def _production_barostat_description(args) -> str:
     return "OpenMM MonteCarloBarostat"
 
 
-def assemble_bias_matrices(distance_bias_kcal, ss_bias_kcal, boost_bias_kj):
-    """Combine the umbrella components and the Pep-GaMD boost into one (kcal, kj) pair.
+def assemble_bias_matrices(distance_bias_kcal, ss_bias_kcal, boost_bias_kj, aux_bias_kcal=None):
+    """Combine the umbrella components, optional auxiliary-CV bias and the Pep-GaMD boost.
 
     Both unit matrices carry the SAME quantity -- umbrella + boost -- so the
     invariant ``bias_kj == 4.184 * bias_kcal`` holds regardless of whether the
@@ -2216,12 +2216,19 @@ def assemble_bias_matrices(distance_bias_kcal, ss_bias_kcal, boost_bias_kj):
     Pulled out to module level so both assembly sites in ``run_gareus`` (the
     log/sample path and ``_current_exchange_arrays``) share one definition and
     so it is directly testable without a live OpenMM Context.
+
+    ``aux_bias_kcal`` (kcal/mol, [state, replica]) is the auxiliary-CV restraint of every state;
+    None keeps the exact pre-auxiliary arithmetic, so the off path stays byte-identical.
     """
     distance_bias_kcal = np.asarray(distance_bias_kcal, dtype=np.float64)
     ss_bias_kcal = np.asarray(ss_bias_kcal, dtype=np.float64)
     boost_bias_kj = np.asarray(boost_bias_kj, dtype=np.float64)
     boost_bias_kcal = boost_bias_kj / 4.184
-    bias_kcal = distance_bias_kcal + ss_bias_kcal + boost_bias_kcal
+    if aux_bias_kcal is None:
+        bias_kcal = distance_bias_kcal + ss_bias_kcal + boost_bias_kcal
+    else:
+        bias_kcal = (distance_bias_kcal + ss_bias_kcal + np.asarray(aux_bias_kcal, dtype=np.float64)
+                     + boost_bias_kcal)
     bias_kj = 4.184 * bias_kcal
     return bias_kcal, bias_kj
 
@@ -7670,6 +7677,22 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     if _fast_primary_force_idx >= 0 and _ss_enabled_global and _fast_ss_force_idx >= 0 and not _use_fast_cv_path:
         print(f"[production] secondary CV mode {secondary_cv_mode(secondary_cv_metadata)!r} has no verified "
               "fast-path scalar; observing it from positions instead")
+    # ── Auxiliary-CV states (spec 3.3/4.2): one z per carrier, whatever state it occupies ──
+    _aux_rt = getattr(args, "_aux_runtime", None)
+    _fast_aux_forces = [None] * nrep
+    if _aux_rt is not None:
+        from .auxiliary_cv.force import AUX_FORCE_NAME as _AUX_CV_FORCE_NAME
+        from .auxiliary_cv.runtime import aux_bias_matrix_kcal, make_aux_z_observer
+        _fast_aux_forces = [sim.system.getForce(_aux_rt.force_index) for sim in sims]
+        if any(f.getName() != _AUX_CV_FORCE_NAME for f in _fast_aux_forces):
+            raise RuntimeError("replica systems do not carry the auxiliary-CV force at the base system's index")
+        # The single z observation both the sample writer and the exchange kernel use; with any
+        # active state it also fails the segment on a degenerate torsion (spec 3.3, Task 5).
+        _aux_z_for_replica = make_aux_z_observer(_aux_rt, use_fast_path=_use_fast_cv_path,
+                                                 fast_forces=_fast_aux_forces, unit=unit)
+    else:
+        def _aux_z_for_replica(r, sim) -> float:
+            return float("nan")
     # ────────────────────────────────────────────────────────────────────────────
 
     # ── tICA dihedral observation buffers (optional, gated by tica_obs_interval) ─
@@ -7895,6 +7918,11 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             "gamd_lambda": "the λ-ladder boost strength of the state/window this sample was assigned to; 0.0 on every run where the λ-ladder is not active, and identically 0.0 on λ=0 rungs even when the ladder is active",
         },
     }
+    if getattr(args, "_aux_runtime", None) is not None:
+        pymbar_metadata["samples_columns_for_mbar"]["auxiliary_cv_bias_note"] = (
+            "auxiliary-CV runs: umbrella_bias_kcal_mol / umbrella_bias_kj_mol and every "
+            "umbrella_bias_all_windows_* total include the auxiliary restraint A_s of each state; "
+            "sampled_umbrella_bias_kj and the distance/secondary component vectors do not.")
     write_json(out_dir / "umbrella_pymbar_metadata.json", pymbar_metadata)
     print(f"PyMBAR umbrella constants written to {out_dir / 'umbrella_windows.csv'} and {out_dir / 'umbrella_pymbar_metadata.json'}")
 
@@ -8104,6 +8132,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             potentials_kj = np.empty(nrep, dtype=np.float64)
             v_pep_kj = np.empty(nrep, dtype=np.float64)
             v_dih_kj = np.empty(nrep, dtype=np.float64)
+            aux_z = np.full(nrep, np.nan, dtype=np.float64)
 
             def _fetch_state(r_sim):
                 r, sim = r_sim
@@ -8117,19 +8146,20 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     else:
                         pe = float("nan")
                     v_pep, v_dih = _fetch_v_pep_v_dih(ctx, pep_env, unit)
-                    return r, cv, ss, pe, v_pep, v_dih
+                    return r, cv, ss, pe, v_pep, v_dih, _aux_z_for_replica(r, sim)
                 cv, ss, pe = primary_secondary_and_potential_from_state(
                     sim.context, primary_cv_def, args, unit, secondary_cv_metadata,
                     read_potential_energy=read_sample_potential,
                 )
                 v_pep, v_dih = _fetch_v_pep_v_dih(sim.context, pep_env, unit)
-                return r, cv, ss, pe, v_pep, v_dih
+                return r, cv, ss, pe, v_pep, v_dih, _aux_z_for_replica(r, sim)
 
             with _phase_timers.phase("sample.fetch"):
                 _fetched_states = _sim_pool.map(_fetch_state, enumerate(sims))
-            for r, cv, ss, pe, v_pep, v_dih in _fetched_states:
+            for r, cv, ss, pe, v_pep, v_dih, z_aux in _fetched_states:
                 primary_values[r], ss_values[r], potentials_kj[r] = cv, ss, pe
                 v_pep_kj[r], v_dih_kj[r] = v_pep, v_dih
+                aux_z[r] = z_aux
             ss_centers_arr = ss_centers_arr_global
             ss_k_arr = ss_k_kcal_arr_global
             _has_ss_axis = secondary_cv_centers is not None and secondary_cv_k_kcal_list is not None
@@ -8139,8 +8169,10 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             )
             boost_bias_matrix_kj = (pep_gamd_boost_matrix_kj(v_pep_kj, v_dih_kj, state_lambdas, pep_env)
                                     if pep_env is not None else np.zeros((nrep, nrep)))
+            aux_bias_matrix_kcal_now = aux_bias_matrix_kcal(aux_z, _aux_rt.table) if _aux_rt is not None else None
             bias_matrix_kcal, bias_matrix_kj = assemble_bias_matrices(
-                distance_bias_matrix_kcal, ss_bias_matrix_kcal, boost_bias_matrix_kj
+                distance_bias_matrix_kcal, ss_bias_matrix_kcal, boost_bias_matrix_kj,
+                aux_bias_kcal=aux_bias_matrix_kcal_now,
             )
             reduced_bias_matrix = float(beta) * bias_matrix_kj
             observable_cache["step"] = int(step)
@@ -8149,6 +8181,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             observable_cache["bias_matrix_kj"] = bias_matrix_kj
             observable_cache["v_pep_kj"] = v_pep_kj
             observable_cache["v_dih_kj"] = v_dih_kj
+            observable_cache["aux_z"] = aux_z
             observable_cache["boost_bias_matrix_kj"] = boost_bias_matrix_kj
             if is_prod:
                 ensure_sample_writer()
@@ -8480,6 +8513,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             ss_values = np.full(nrep, np.nan, dtype=np.float64)
             v_pep_kj = np.empty(nrep, dtype=np.float64)
             v_dih_kj = np.empty(nrep, dtype=np.float64)
+            aux_z = np.full(nrep, np.nan, dtype=np.float64)
             _ss_enabled = bool((secondary_cv_metadata or {}).get("enabled"))
 
             def _fetch_exchange_state(r_sim):
@@ -8494,15 +8528,16 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     cv = primary_cv_value_from_positions_nm(pos, primary_cv_def, args)
                     ss = secondary_structure_score_from_positions_nm(pos, secondary_cv_metadata) if _ss_enabled else float("nan")
                     v_pep, v_dih = _fetch_v_pep_v_dih(sim.context, pep_env, unit)
-                return r, cv, ss, v_pep, v_dih
+                return r, cv, ss, v_pep, v_dih, _aux_z_for_replica(r, sim)
 
             with _phase_timers.phase("exchange.fetch"):
                 _fetched_exchange = _sim_pool.map(_fetch_exchange_state, enumerate(sims))
-            for r, cv, ss, v_pep, v_dih in _fetched_exchange:
+            for r, cv, ss, v_pep, v_dih, z_aux in _fetched_exchange:
                 primary_values[r] = cv
                 ss_values[r] = ss
                 v_pep_kj[r] = v_pep
                 v_dih_kj[r] = v_dih
+                aux_z[r] = z_aux
             _has_ss_axis = (secondary_cv_centers is not None and secondary_cv_ks_kj is not None
                             and ss_ks_kj_arr_global is not None)
             # Same kcal arrays as the sample path: the matrix the kernel exchanges on IS the
@@ -8514,7 +8549,9 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             )
             boost_bias_matrix_kj = (pep_gamd_boost_matrix_kj(v_pep_kj, v_dih_kj, state_lambdas, pep_env)
                                     if pep_env is not None else np.zeros((nrep, nrep)))
-            _, bias_matrix_kj = assemble_bias_matrices(distance_bias_kcal, ss_bias_kcal, boost_bias_matrix_kj)
+            aux_bias_kcal = aux_bias_matrix_kcal(aux_z, _aux_rt.table) if _aux_rt is not None else None
+            _, bias_matrix_kj = assemble_bias_matrices(distance_bias_kcal, ss_bias_kcal, boost_bias_matrix_kj,
+                                                       aux_bias_kcal=aux_bias_kcal)
             return primary_values, bias_matrix_kj
 
         def _candidate_delta_for_window_swap(wi: int, wj: int, bias_matrix_kj: np.ndarray) -> Optional[float]:

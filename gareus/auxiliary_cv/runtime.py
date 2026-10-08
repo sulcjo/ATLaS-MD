@@ -199,3 +199,24 @@ def make_aux_z_observer(runtime: AuxRuntime, *, use_fast_path: bool, fast_forces
         return observe_aux_z(sim.context, runtime, positions_nm=pos)
 
     return observe
+
+
+def aux_bias_matrix_kcal(z_values, table: AuxStateTable) -> "np.ndarray":
+    """[state, replica] auxiliary bias in kcal/mol; inactive states contribute exact zeros.
+
+    Every replica's z enters every active row, including replicas whose own state is ordinary
+    (spec 4.2). A non-finite z with any active state is fatal: the matrix never drops a state.
+    """
+    z = np.asarray(z_values, dtype=np.float64)
+    k = np.asarray(table.k_kcal, dtype=np.float64)
+    c = np.asarray(table.centers, dtype=np.float64)
+    out = np.zeros((k.size, z.size), dtype=np.float64)
+    active = k > 0.0
+    if not np.any(active):
+        return out
+    if not np.all(np.isfinite(z)):
+        bad = np.flatnonzero(~np.isfinite(z)).tolist()
+        raise AuxObservationError(f"non-finite auxiliary z for replica(s) {bad} with active auxiliary states")
+    d = z[np.newaxis, :] - c[active][:, np.newaxis]
+    out[active] = 0.5 * k[active][:, np.newaxis] * d * d
+    return out
