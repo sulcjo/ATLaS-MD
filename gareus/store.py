@@ -442,6 +442,17 @@ class SegmentRegistry:
                 break
         self._save()
 
+    def discard_latest_segment(self, segment_id: str) -> bool:
+        """Remove the LATEST segment's registry entry (auxiliary refused-resume rollback only).
+
+        Callers guarantee the segment holds no rows; anything but the newest entry is never removed.
+        """
+        if not self._segments or self._segments[-1]["segment_id"] != segment_id:
+            return False
+        self._segments.pop()
+        self._save()
+        return True
+
     def get_segment(self, segment_id: str) -> Optional[Dict[str, Any]]:
         for seg in self._segments:
             if seg["segment_id"] == segment_id:
@@ -512,6 +523,39 @@ def reseal_parent_for_resume(registry: "SegmentRegistry", parent_segment_id: Opt
     registry.seal_segment(parent_segment_id, absolute_end_step=cut, status="interrupted")
     return {"segment_id": parent_segment_id, "previous_status": previous_status,
             "previous_end_step": previous_end, "end_step": cut}
+
+
+def reseal_chain_for_resume(registry: "SegmentRegistry", checkpoint_segment_id: str,
+                            checkpoint_absolute_step: int) -> List[Dict[str, Any]]:
+    """On resume of an AUXILIARY run, walk back from the newest segment to the checkpoint's own segment.
+
+    Every non-complete segment after the checkpoint's segment holds only rows past the checkpoint (an
+    empty orphan left by a refused resume, or a child that died before its first checkpoint): it is sealed
+    ``abandoned``. The checkpoint's segment is then cut back to the checkpoint step
+    (:func:`reseal_parent_for_resume`). A ``complete`` segment after the checkpoint's segment cannot follow
+    from this checkpoint: refused. Returns one record per segment changed (Task 14 F4).
+    """
+    segs = registry.all_segments()
+    ids = [s["segment_id"] for s in segs]
+    if checkpoint_segment_id not in ids:
+        raise RuntimeError(f"resume refused: the checkpoint's segment {checkpoint_segment_id!r} is not in the "
+                           f"segment registry {ids}")
+    later = segs[ids.index(checkpoint_segment_id) + 1:]
+    for seg in later:                                  # validate the whole chain before changing anything
+        if seg.get("status") == "complete":
+            raise RuntimeError(f"resume refused: segment {seg['segment_id']} is complete but comes after the "
+                               f"checkpoint's segment {checkpoint_segment_id}; this checkpoint is not the newest")
+    records: List[Dict[str, Any]] = []
+    for seg in later:
+        if seg.get("status") == "abandoned":
+            continue
+        records.append({"segment_id": seg["segment_id"], "previous_status": seg.get("status"),
+                        "previous_end_step": seg.get("end_step"), "end_step": -1, "status": "abandoned"})
+        registry.seal_segment(seg["segment_id"], absolute_end_step=-1, status="abandoned")
+    rec = reseal_parent_for_resume(registry, checkpoint_segment_id, int(checkpoint_absolute_step))
+    if rec is not None:
+        records.insert(0, dict(rec, status="interrupted"))
+    return records
 
 
 class WindowSnapshot:

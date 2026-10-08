@@ -167,7 +167,8 @@ def test_checkpoint_saves_and_load_carry_the_aux_hooks():
     assert len(saves) == 2 and all(any(k.arg == "aux_block" for k in c.keywords) for c in saves)
     loads = _named_calls(tree, "load_production_checkpoint")
     assert len(loads) == 1 and any(k.arg == "aux_pre_apply" for k in loads[0].keywords)
-    assert len(_named_calls(tree, "verify_aux_ledger")) == 1
+    # Task 14 F4: the ledger replay moved into prepare_aux_resume (before segment registration)
+    assert len(_named_calls(tree, "prepare_aux_resume")) == 1
 
 
 # ── Carry-overs (task-13-carryovers.md) ────────────────────────────────────────────────────────────
@@ -202,14 +203,18 @@ def test_test_failure_hook_is_aux_gated():
     assert isinstance(guard, ast.If) and "_aux_test_fail_step is not None" in ast.unparse(guard.test)
 
 
-def test_resume_ledger_check_is_scoped_and_runs_after_the_reseal():
-    import gareus.production as production
-    src = ast.unparse(ast.parse(inspect.getsource(production.run_gareus)))
-    reseal = src.index("reseal_parent_for_resume(")
+def test_resume_ledger_check_is_scoped_and_every_refusal_precedes_the_reseal():
+    """Task 14 F4: refusals first (no side effects), then the re-seal; the replay stays anchor-scoped and the
+    duplicate check sees the registry view the re-seal will leave."""
+    from gareus.auxiliary_cv import runtime_io
+    src = ast.unparse(ast.parse(inspect.getsource(runtime_io.prepare_aux_resume)))
+    static = src.index("verify_aux_resume_static(")
     ledger = src.index("verify_aux_ledger(")
     dup = src.index("refuse_duplicate_event_keys(")
-    assert reseal < ledger and reseal < dup
+    reseal = src.index("reseal_chain_for_resume(")
+    assert static < ledger < dup < reseal
     assert "anchor_ledger_events(out_dir, manifest)" in src
+    assert "_ledger_after_reseal(" in src
 
 
 def test_data_boundary_is_safe_before_the_first_flush(tmp_path):

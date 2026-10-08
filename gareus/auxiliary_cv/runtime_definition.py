@@ -20,25 +20,94 @@ SOLVATED_START_PDB = "01_solvated_start.pdb"
 _OPENMM_VERSION_ATTR = re.compile(r'\sopenmmVersion="[^"]*"')
 
 
+# Canonical forms of the forces a base production System (ForceField.createSystem) carries. Per force:
+# child list tag -> ("terms", item tag, symmetry) | ("ordered", None, None) | ("empty", None, None).
+# Symmetry: "pair" = (i, j) ~ (j, i); "angle" = (i, j, k) ~ (k, j, i); "torsion" = (i, j, k, l) ~ (l, k, j, i)
+# (a dihedral angle is invariant under full reversal, propers and impropers alike).
+_TERMS, _ORDERED, _EMPTY = "terms", "ordered", "empty"
+_FORCE_CANONICAL = {
+    "HarmonicBondForce": {"Bonds": (_TERMS, "Bond", "pair")},
+    "HarmonicAngleForce": {"Angles": (_TERMS, "Angle", "angle")},
+    "PeriodicTorsionForce": {"Torsions": (_TERMS, "Torsion", "torsion")},
+    "NonbondedForce": {"GlobalParameters": (_ORDERED, None, None), "Particles": (_ORDERED, None, None),
+                       "Exceptions": (_TERMS, "Exception", "pair"),
+                       # offsets reference particle/exception INDICES: sorting exceptions would break them
+                       "ParticleOffsets": (_EMPTY, None, None), "ExceptionOffsets": (_EMPTY, None, None)},
+    "CMMotionRemover": {},
+}
+_SYSTEM_CHILDREN = {"PeriodicBoxVectors", "Particles", "Constraints", "Forces"}
+
+
+def _canonical_term(element, symmetry) -> list:
+    atom_keys = sorted((k for k in element.attrib if k[:1] == "p" and k[1:].isdigit()), key=lambda k: int(k[1:]))
+    atoms = [int(element.attrib[k]) for k in atom_keys]
+    if symmetry == "pair":
+        atoms = sorted(atoms)
+    elif symmetry == "angle" and atoms[0] > atoms[-1]:
+        atoms = atoms[::-1]
+    elif symmetry == "torsion" and atoms[::-1] < atoms:
+        atoms = atoms[::-1]
+    params = sorted((k, v) for k, v in element.attrib.items() if k not in atom_keys)
+    return [atoms, params]
+
+
+def _canonical_list(parent, child, rule, where):
+    kind, item, symmetry = rule
+    items = list(child)
+    if kind == _EMPTY:
+        if items:
+            raise IntegrityError(f"physical_system_sha256: {where} has {child.tag} ({len(items)}); they reference "
+                                 "term indices, so this System has no order-insensitive canonical form")
+        return []
+    if kind == _ORDERED:
+        return [[e.tag, sorted(e.attrib.items())] for e in items]
+    if any(e.tag != item or len(e) for e in items):
+        raise IntegrityError(f"physical_system_sha256: unexpected element in {where}/{child.tag}")
+    return sorted(_canonical_term(e, symmetry) for e in items)
+
+
 def physical_system_sha256(openmm, system) -> str:
     """Identity of the physical System (call BEFORE any umbrella/auxiliary bias force is added).
 
-    The default periodic box is replaced by the unit cell before hashing: a resume rebuilds the System from
-    01_solvated_start.pdb (rounded CRYST1), a fresh run from the in-memory topology. Box identity lives in
-    the state definition (fixed_box_vectors_nm for NVT; a sample variable for NPT).
+    Order-insensitive (Task 14 F1): a fresh run builds its System from the in-memory topology, a resume from
+    01_solvated_start.pdb, and the PDB round trip lists bonds, constraints and bonded terms in another order
+    and direction (same physics, different serialization). Bond, angle, torsion, constraint and exception
+    terms are therefore direction-normalised and sorted; particles are never reordered (their index is
+    their identity), forces keep their order. A force type without a canonical form here is refused, never
+    hashed raw. The default periodic box is excluded (box identity lives in the state definition:
+    fixed_box_vectors_nm for NVT, a sample variable for NPT), as are barostats (ensemble machinery; the
+    ensemble and pressure live in the state definition; Task 13 carry-over 7) and the OpenMM release stamp
+    (an OpenMM update alone must not make an auxiliary run unresumable; kernel identity and parity checks
+    cover physics changes).
     """
+    import xml.etree.ElementTree as ET
     copy = openmm.XmlSerializer.deserialize(openmm.XmlSerializer.serialize(system))
-    # Barostats are ensemble machinery, not the potential: the ensemble and pressure live in the state
-    # definition, and the hash must not depend on whether a barostat was added before or after it is
-    # taken (native MonteCarloBarostat in create_system vs the biased-MC owner; Task 13 carry-over 7).
     for i in reversed(range(copy.getNumForces())):
         if "Barostat" in copy.getForce(i).__class__.__name__:
             copy.removeForce(i)
-    copy.setDefaultPeriodicBoxVectors(openmm.Vec3(1, 0, 0), openmm.Vec3(0, 1, 0), openmm.Vec3(0, 0, 1))
-    # The serializer stamps the OpenMM release (<System openmmVersion="...">); an OpenMM update alone must
-    # not make an auxiliary run unresumable (kernel identity and parity checks cover physics changes).
-    xml = _OPENMM_VERSION_ATTR.sub("", openmm.XmlSerializer.serialize(copy), count=1)
-    return digest(xml.encode("utf-8"))
+    root = ET.fromstring(_OPENMM_VERSION_ATTR.sub("", openmm.XmlSerializer.serialize(copy), count=1))
+    extra = {c.tag for c in root} - _SYSTEM_CHILDREN
+    if extra:
+        raise IntegrityError(f"physical_system_sha256: System element(s) {sorted(extra)} have no canonical form")
+    out: dict[str, Any] = {
+        "system": sorted((k, v) for k, v in root.attrib.items() if k != "openmmVersion"),
+        "particles": [sorted(e.attrib.items()) for e in root.find("Particles")],
+        "constraints": sorted(_canonical_term(e, "pair") for e in root.find("Constraints")),
+        "forces": [],
+    }
+    for force in root.find("Forces"):
+        ftype = force.attrib.get("type")
+        rules = _FORCE_CANONICAL.get(ftype)
+        if rules is None:
+            raise IntegrityError(f"physical_system_sha256: force type {ftype!r} has no canonical form; refusing "
+                                 "to hash it raw (extend _FORCE_CANONICAL with its term symmetries)")
+        unknown = {c.tag for c in force} - set(rules)
+        if unknown:
+            raise IntegrityError(f"physical_system_sha256: {ftype} child element(s) {sorted(unknown)} have no "
+                                 "canonical form")
+        out["forces"].append({"attrs": sorted(force.attrib.items()),
+                              "lists": {c.tag: _canonical_list(force, c, rules[c.tag], ftype) for c in force}})
+    return digest(json_bytes(out))
 
 
 def solvated_start_topology_identities(out_dir, model) -> tuple[str, str]:

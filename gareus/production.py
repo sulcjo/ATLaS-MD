@@ -6935,6 +6935,10 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     else:
         if bool(getattr(args, "resume", False)):
             refuse_resume_of_aux_campaign(out_dir, args)       # non-fast --resume (no checkpoint): B1/H3
+            if getattr(args, "aux_cv_model", None):
+                # Task 13 minor 7: no checkpoint, but committed auxiliary rows -> refuse before anything runs.
+                from .auxiliary_cv.runtime_io import refuse_aux_resume_without_checkpoint
+                refuse_aux_resume_without_checkpoint(out_dir)
         if equil_state is None:
             raise RuntimeError("No equilibrated state is available; cannot start ATLaS-MD production without a production checkpoint or saved 03_npt_equilibrated_state.xml.")
         cv_atom1, cv_atom2, distance_cv_label = choose_cv_atoms(topology, args)
@@ -8095,7 +8099,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     _parent_seg_id = _parent_seg["segment_id"] if _parent_seg else None
     _parent_was_running = bool(_parent_seg and _parent_seg.get("status") == "running")
     _round_id = int(getattr(args, "adaptive_feedback_round", 1))
-    _seg_id = _seg_registry.open_segment(_run_id, _parent_seg_id, _round_id)
+    # Auxiliary runs register their segment only after every Context-free resume refusal (Task 14 F4).
+    _seg_id = None if getattr(args, "_aux_runtime", None) is not None else _seg_registry.open_segment(_run_id, _parent_seg_id, _round_id)
     _win_snapshot_windows = snapshot_window_rows(
         centers_a[:nrep], k_list[:nrep], secondary_cv_centers, secondary_cv_k_kcal_list,
         getattr(args, "state_gamd_lambdas", None), n=nrep,
@@ -8116,6 +8121,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     _cv2_type = (secondary_cv_metadata or {}).get("mode") if secondary_cv_centers is not None else None
     _aux_io = None
     _aux_record_for_replica = None
+    _aux_reseal_records = None
+    _aux_resume_loading = False
     if getattr(args, "_aux_runtime", None) is not None:
         from .auxiliary_cv.runtime_definition import (aux_io_runtime, build_runtime_state_definition,
                                                       embed_cv_definition, solvated_start_topology)
@@ -8159,6 +8166,15 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             args._aux_runtime, use_fast_path=_use_fast_cv_path, fast_forces=_fast_aux_forces, unit=unit,
             schema=_aux_io.sample_schema, models=_aux_io.models)
     if _aux_io is not None:
+        if fast_resume:
+            # Task 14 F4: the binding, ledger and duplicate refusals and the re-seal run before the resumed
+            # segment exists, so a refused resume leaves no orphan segment behind.
+            from .auxiliary_cv.runtime_io import prepare_aux_resume
+            _aux_reseal_records = prepare_aux_resume(
+                out_dir, _seg_registry, resume_manifest, state_definition=_aux_io.state_definition,
+                force_info=_aux_io.force_info, topology_sha256=_aux_io.topology_sha256,
+                kernel_identity_digest=kernel_identity_for_run(args, secondary_cv_metadata)["digest"])
+        _seg_id = _seg_registry.open_segment(_run_id, _parent_seg_id, _round_id)
         # Carry-over 5: the frozen v2 snapshot carries the state definition.
         WindowSnapshot(out_dir).snapshot(_seg_id, _win_snapshot_windows, cv1_type=primary_cv_mode(args), cv2_type=_cv2_type,
                                          kernel_identity=kernel_identity_for_run(args, secondary_cv_metadata),
@@ -9087,6 +9103,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                                    "--aux-cv-model; resume it with the same --aux-cv-model (spec D6)")
 
         if bool(getattr(args, "resume", False)):
+            # Task 14 F4: a refusal inside the load (Context parameters/boxes) discards the empty new segment.
+            _aux_resume_loading = _aux_io is not None
             manifest = load_production_checkpoint(
                 out_dir, sims, centers_nm, ks_kj_nm2, rng, secondary_cv_centers, secondary_cv_ks_kj,
                 openmm_version=str(getattr(getattr(openmm, "version", None), "version", None)),
@@ -9096,6 +9114,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 drivers=drivers, pool=_sim_pool, npt_runtime=npt_runtime, args=args,
                 aux_pre_apply=_aux_pre_apply,
             )
+            _aux_resume_loading = False
             if manifest is not None:
                 assignments[:] = [int(x) for x in manifest.get("assignments", assignments)]
                 dashboard_info["gamd_integrator_restore_ok"] = bool(manifest.get("resume_gamd_integrator_restore_report", {}).get("ok", False))
@@ -9137,24 +9156,14 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 # step have wrong window_id labels (exchange state was rolled back)
                 # and must be excluded from MBAR analysis.
                 if getattr(args, "_aux_runtime", None) is not None:
-                    # Auxiliary runs only (ruling B4): also cut a parent that an exception exit sealed
-                    # at its crash step, so no post-checkpoint row or ledger event is pooled twice.
-                    _reseal_record = reseal_parent_for_resume(
-                        _seg_registry, _parent_seg_id, int(manifest.get("absolute_step", 0)))
-                    if _reseal_record is not None and _reseal_record["previous_end_step"] not in (
-                            None, _reseal_record["end_step"]):
-                        print(f"    Resume: parent segment {_reseal_record['segment_id']} re-sealed at checkpoint "
-                              f"step {_reseal_record['end_step']} (was {_reseal_record['previous_status']} at "
-                              f"{_reseal_record['previous_end_step']}); later rows were rolled back.", flush=True)
-                    # After the re-seal (until then a running non-last parent is skipped by the loader):
-                    # carry-over 2: the ledger replays from the checkpoint's own anchor segment only;
-                    # carry-over 3: the registry-pooled ledger never records one decision twice.
-                    from .auxiliary_cv.checkpoint import verify_aux_ledger
-                    from .auxiliary_cv.ledger import refuse_duplicate_event_keys
-                    from .auxiliary_cv.runtime_io import anchor_ledger_events
-                    from .query import load_exchanges
-                    verify_aux_ledger(manifest, anchor_ledger_events(out_dir, manifest))
-                    refuse_duplicate_event_keys(load_exchanges(out_dir))
+                    # Auxiliary runs only (ruling B4, Task 14 F4): the re-seal (walking back over orphan
+                    # segments to the checkpoint's own), the anchor-scoped ledger replay and the duplicate-event
+                    # refusal already ran in prepare_aux_resume, before this segment was registered.
+                    for _rec in (_aux_reseal_records or []):
+                        if _rec["previous_end_step"] != _rec["end_step"] or _rec["status"] != _rec["previous_status"]:
+                            print(f"    Resume: segment {_rec['segment_id']} re-sealed {_rec['status']} at step "
+                                  f"{_rec['end_step']} (was {_rec['previous_status']} at {_rec['previous_end_step']}); "
+                                  "later rows were rolled back.", flush=True)
                 elif _parent_was_running and _parent_seg_id is not None:
                     _seg_registry.seal_segment(
                         _parent_seg_id,
@@ -9526,16 +9535,21 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         # Gate segment-complete marking on BOTH a clean loop exit AND
         # successful writer flush/close.  Any failure leaves the segment
         # as "interrupted" so the next resume knows the last valid checkpoint.
-        try:
-            finalize_segment(
-                _seg_registry,
-                _seg_id,
-                completed_cleanly=_prod_completed_cleanly,
-                writers_ok=_writers_ok,
-                end_step=int(calib_steps + prod_done),
-            )
-        except Exception as _finalize_exc:
-            print(f"WARNING: segment registry finalization failed: {_finalize_exc}", flush=True)
+        _aux_discarded = False
+        if _aux_resume_loading:
+            from .auxiliary_cv.runtime_io import discard_refused_segment
+            _aux_discarded = discard_refused_segment(out_dir, _seg_registry, _seg_id)
+        if not _aux_discarded:
+            try:
+                finalize_segment(
+                    _seg_registry,
+                    _seg_id,
+                    completed_cleanly=_prod_completed_cleanly,
+                    writers_ok=_writers_ok,
+                    end_step=int(calib_steps + prod_done),
+                )
+            except Exception as _finalize_exc:
+                print(f"WARNING: segment registry finalization failed: {_finalize_exc}", flush=True)
 
         distance_logger.close()
 

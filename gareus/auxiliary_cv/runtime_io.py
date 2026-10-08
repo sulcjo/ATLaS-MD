@@ -160,3 +160,102 @@ def anchor_ledger_events(out_dir, manifest: Mapping[str, Any]) -> dict:
     from ..query import load_exchanges
     segment_id = str(manifest["aux"]["ledger_anchor"]["segment_id"])
     return load_exchanges(Path(out_dir), segment_ids=[segment_id])
+
+
+def prepare_aux_resume(out_dir, registry, manifest: Mapping[str, Any], *, state_definition, force_info,
+                       topology_sha256: str, kernel_identity_digest: str) -> list[dict[str, Any]]:
+    """Every auxiliary resume refusal that needs no Context, run BEFORE the resumed segment is registered.
+
+    Task 14 F4: a refusal here changes nothing on disk. Order: static checkpoint binding
+    (``verify_aux_resume_static``), the ledger replay from the anchor segment, the duplicate-event check on
+    the registry view the re-seal will leave, and only then the re-seal itself
+    (``store.reseal_chain_for_resume``: orphans after the checkpoint's segment abandoned, the checkpoint's
+    segment cut to the checkpoint step). Returns the re-seal records.
+    """
+    from ..store import reseal_chain_for_resume
+    from .checkpoint import verify_aux_ledger, verify_aux_resume_static
+    from .ledger import refuse_duplicate_event_keys
+    verify_aux_resume_static(manifest, aux_enabled=True, state_definition=state_definition, force_info=force_info,
+                             topology_sha256=topology_sha256, kernel_identity_digest=kernel_identity_digest)
+    verify_aux_ledger(manifest, anchor_ledger_events(out_dir, manifest))
+    ckpt_seg, ckpt_step = str(manifest["aux"]["segment_id"]), int(manifest.get("absolute_step", 0))
+    refuse_duplicate_event_keys(_ledger_after_reseal(out_dir, registry, ckpt_seg, ckpt_step))
+    return reseal_chain_for_resume(registry, ckpt_seg, ckpt_step)
+
+
+def _ledger_after_reseal(out_dir, registry, ckpt_seg: str, ckpt_step: int) -> dict:
+    """(step, attempt_seq, segment_id) of every exchange event the registry will pool once the re-seal ran.
+
+    Read segment by segment (explicit ids bypass the loader's status filter), with the cut the re-seal will
+    apply: segments after the checkpoint's are dropped (abandoned), the checkpoint's own is cut to the
+    checkpoint step, earlier ones keep their committed boundary.
+    """
+    from ..query import load_exchanges
+    segs = registry.all_segments()
+    ids = [s["segment_id"] for s in segs]
+    if ckpt_seg not in ids:
+        raise IntegrityError(f"resume refused: the checkpoint's segment {ckpt_seg!r} is not in the segment registry {ids}")
+    cols: dict[str, list] = {"step": [], "attempt_seq": [], "segment_id": []}
+    for seg in segs[:ids.index(ckpt_seg) + 1]:
+        sid, status, end = seg["segment_id"], seg.get("status"), seg.get("end_step")
+        if sid == ckpt_seg:
+            cut = None if status == "complete" else (ckpt_step if end is None else min(int(end), ckpt_step))
+        elif status == "complete":
+            cut = None
+        elif status == "interrupted" and end is not None and int(end) >= 0:
+            cut = int(end)
+        else:
+            continue                                   # running non-last / abandoned: never pooled
+        ev = load_exchanges(Path(out_dir), segment_ids=[sid])
+        if not ev or "step" not in ev or "attempt_seq" not in ev or len(ev["step"]) == 0:
+            continue
+        step = np.asarray(np.ma.getdata(ev["step"])).astype(np.int64)
+        keep = np.ones(step.size, dtype=bool) if cut is None else step <= cut
+        cols["step"].append(step[keep])
+        cols["attempt_seq"].append(ev["attempt_seq"][keep])
+        cols["segment_id"].append(np.full(int(keep.sum()), sid, dtype=object))
+    if not cols["step"]:
+        return {}
+    return {"step": np.concatenate(cols["step"]), "attempt_seq": np.ma.concatenate(cols["attempt_seq"]),
+            "segment_id": np.concatenate(cols["segment_id"])}
+
+
+def refuse_aux_resume_without_checkpoint(out_dir) -> None:
+    """An auxiliary --resume that finds no production checkpoint while the registry holds committed data.
+
+    Task 13 minor 7. Restarting at step 0 would write a second copy of every (step, replica) key the
+    committed segment already holds; sealing that segment abandoned would silently drop committed data.
+    Refused at start instead (consistent with the re-seal, which never discards rows at or before a
+    checkpoint). Segments without rows (a job killed during setup, a refused resume) do not count.
+    """
+    from ..store import SegmentRegistry
+    for seg in SegmentRegistry(Path(out_dir)).all_segments():
+        if seg.get("status") == "abandoned":
+            continue
+        rows = data_boundary(out_dir, seg["segment_id"])
+        if rows["samples"]["n_rows"] or rows["exchanges"]["n_rows"]:
+            raise IntegrityError(
+                f"resume refused: no production checkpoint, but segment {seg['segment_id']} ({seg.get('status')}, "
+                f"end_step {seg.get('end_step')}) holds committed auxiliary data; restarting at step 0 would pool "
+                "its steps twice. Restore the checkpoint, or start a new run directory.")
+
+
+def discard_refused_segment(out_dir, registry, segment_id: str) -> bool:
+    """Roll back the segment a refused auxiliary resume registered (Task 14 F4): no side effects remain.
+
+    Only the newest segment, and only when it holds no committed row, is removed: its registry entry, its
+    (empty) sample and exchange directories and its window snapshot. Returns whether it was removed.
+    """
+    import shutil
+    latest = registry.get_latest_segment()
+    if latest is None or latest["segment_id"] != segment_id:
+        return False
+    rows = data_boundary(out_dir, segment_id)
+    if rows["samples"]["n_rows"] or rows["exchanges"]["n_rows"]:
+        return False
+    if not registry.discard_latest_segment(segment_id):
+        return False
+    for kind in ("samples", "exchanges"):
+        shutil.rmtree(Path(out_dir) / kind / str(segment_id), ignore_errors=True)
+    (Path(out_dir) / "windows" / f"{segment_id}.json").unlink(missing_ok=True)
+    return True

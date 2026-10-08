@@ -164,7 +164,8 @@ def test_production_resume_reseal_is_aux_gated_and_legacy_seal_is_unchanged():
                 out.append(ast.unparse(node.test))
         return out
 
-    reseal = calls("reseal_parent_for_resume")
+    # Task 14 F4: the aux re-seal runs inside prepare_aux_resume, before the resumed segment is registered.
+    reseal = calls("prepare_aux_resume")
     assert len(reseal) == 1 and any("aux" in t for t in if_tests(reseal[0]))
     interrupted = [c for c in calls("seal_segment") if any(
         k.arg == "status" and isinstance(k.value, ast.Constant) and k.value.value == "interrupted"

@@ -80,8 +80,11 @@ def test_physical_system_sha_is_deterministic_and_bias_sensitive():
     a, b, c = s3.getDefaultPeriodicBoxVectors()
     s3.setDefaultPeriodicBoxVectors(a * 1.0001, b * 1.0001, c * 1.0001)       # PDB-rounded box on resume
     assert physical_system_sha256(mm, s3) == physical_system_sha256(mm, s1)
+    # Task 14 F1: a force without a canonical form (any bias force) is refused, never hashed raw; physical
+    # sensitivity is pinned in test_aux_physical_hash_canonical.py.
     s2.addForce(mm.CustomExternalForce("0"))
-    assert physical_system_sha256(mm, s1) != physical_system_sha256(mm, s2)
+    with pytest.raises(IntegrityError, match="no canonical form"):
+        physical_system_sha256(mm, s2)
 
 
 def test_physical_system_sha_ignores_the_openmm_version_stamp():

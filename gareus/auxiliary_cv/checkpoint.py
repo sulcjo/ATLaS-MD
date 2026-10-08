@@ -87,10 +87,12 @@ def aux_checkpoint_block(*, state_definition, force_info, assignments: Sequence[
     }
 
 
-def verify_aux_resume(manifest: Mapping[str, Any], *, aux_enabled: bool, state_definition, force_info,
-                      assignments: Sequence[int], observed_params: Sequence[tuple[float, float]],
-                      topology_sha256: str, kernel_identity_digest: str) -> None:
-    """Call with the Context parameters as restored by loadCheckpoint, BEFORE any re-apply."""
+def verify_aux_resume_static(manifest: Mapping[str, Any], *, aux_enabled: bool, state_definition, force_info,
+                             topology_sha256: str, kernel_identity_digest: str) -> None:
+    """The checks that need no Context: capability, schema, state definition, force, topology, kernel.
+
+    Run before the resumed segment is registered (Task 14 F4), and again inside verify_aux_resume.
+    """
     block = manifest.get("aux")
     if bool(aux_enabled) != (block is not None):
         raise IntegrityError("auxiliary capability differs between checkpoint and this run; a model or "
@@ -112,6 +114,18 @@ def verify_aux_resume(manifest: Mapping[str, Any], *, aux_enabled: bool, state_d
         raise IntegrityError("topology identity changed between checkpoint and this run")
     if block["kernel_identity_digest"] != str(kernel_identity_digest):
         raise IntegrityError("kernel identity digest changed between checkpoint and this run")
+
+
+def verify_aux_resume(manifest: Mapping[str, Any], *, aux_enabled: bool, state_definition, force_info,
+                      assignments: Sequence[int], observed_params: Sequence[tuple[float, float]],
+                      topology_sha256: str, kernel_identity_digest: str) -> None:
+    """Call with the Context parameters as restored by loadCheckpoint, BEFORE any re-apply."""
+    verify_aux_resume_static(manifest, aux_enabled=aux_enabled, state_definition=state_definition,
+                             force_info=force_info, topology_sha256=topology_sha256,
+                             kernel_identity_digest=kernel_identity_digest)
+    block = manifest.get("aux")
+    if block is None:
+        return
     if int(block["n_replicas"]) != len(assignments) or len(observed_params) != len(assignments):
         raise IntegrityError(f"replica/carrier set incomplete: checkpoint {block['n_replicas']}, run {len(assignments)}")
     if block["assignment_sha256"] != assignment_sha256(assignments):
