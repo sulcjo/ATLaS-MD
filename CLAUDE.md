@@ -12,6 +12,19 @@ Updated 2026-09-30. Branch `feat/cv2-resolution` holds P1, 3.2 (shape layout), 3
 - States created by epoch's actions get seed: `_reassign_seeds_after_actions` re-runs `select_state_aware_seeds_for_targets` right after actions applied (bank's assignment written before them, so scheduled segment holding only new states used to get `filter_seed_bank_for_state_ids`'s `generic_fallback`, bank's first rows whatever their CVs). Scoring = CV distance only, so new rung gets its centre's seed.
 - Real-data replay (read-only): chignolin_9 final phases, 59 centres — predicted median rung overlaps 0.244/0.272/0.404 vs union pairwise 0.243/0.272/0.402; design [0, 0.175, 0.47, 1] (q10 0.281/0.281/0.286, from 0.209/0.248/0.396). chignolin_7: [0, 0.18, 0.46, 1] (0.29). Both: keep 4 rungs, move interior down. No MD run with it yet.
 
+## CVaux Stage A (`gareus/auxiliary_cv/`, spec `docs/superpowers/specs/2026-10-07-auxiliary-cv-gibbs-production-spec.md`)
+
+- Built: frozen model `atlas-aux-cv-model-v1` (`AuxModel`: z = (offset + Σ c f)/scale, `periodic_imaging` "none", identity = content sha incl. scale/imaging, label/provenance excluded, -0.0 canonicalised; registries embed `identity_mapping()`), OpenMM-convention dihedral features (theta = OpenMM `theta` = -tica angle; `negated` feature = trig(-theta)), exact evaluator with Blondel-Karplus gradient (FD-verified), `CustomCVForce` `ATLaSAuxCVUmbrella` = select(aux_k, 0.5 aux_k (z - aux_c)^2, 0) with exact energy/force parity, state schema `atlas-fixed-state-v2` (`aux_models` registry, per-window aux_model_sha256/aux_center/aux_k, required `instance` {state_instance_id, state_role, spawn_parent_state_id (parent's state_instance_id), spawn_source_observation, matched_additional_slot_id}, role ⇔ aux_k enforced, `hamiltonian_sha256` keyed on model sha), field `aux_k` kcal/mol/z² (deviation from spec's `aux_k_kcal_mol`); k = 0 is exact-zero energy, NaN forces at degenerate torsions (as stock OpenMM), `reconstruct_bias_matrix(aux_z=)`.
+- Not wired: nothing in production, exchange, storage or analysis calls it yet (Stages B/C). v1 definitions hash byte-identically (pinned test). MVP: one model; >1 refused ("Stage F").
+- Stage B owns:
+  - the exchange-energy/schema version `state_bias_matrix_v3_aux` (spec 5), with separate zero-feature regression tests proving v2 compatibility;
+  - **runtime detection of degenerate torsion geometry before integration** (spec 3.3). The force returns NaN forces at a degenerate torsion even at k = 0, and a finite energy at k > 0 where the evaluator raises.
+- Stage D owns:
+  - extending `check_feature_atoms` beyond phi/psi if the recovered c10 artifact contains omega or terminal torsions;
+  - cross-arm W/B slot pairing (one table checks only its own slots).
+- Recorded deviations: `aux_k` naming; one registered model; same-table parent rule.
+- Tests: `tests/test_aux_cv_*.py`, fixture `tests/aux_cv_fixture.py`.
+
 ## Adaptive-CV2 prerequisites (spec `docs/superpowers/specs/2026-09-29-adaptive-cv2-resolution-design.md`, Section 13)
 
 - **P6 restraint-aware identity.** `_centre_group_key`, `WindowStateRegistry.has_near_duplicate` (new `primary_k`/`secondary_k`), `ladder_overlap_by_axis` (new `secondary_k`, passed by `analyze_gareus_mbar.py`) and `ladder_adapt.centre_key` never use coordinate of unrestrained axis (k <= 0): CV2-only window at CV1 placeholder = different window from CV1-restrained one there. k None (not recorded) counts as restrained, old registries key exactly as before. `_centre_group_key` can now return None components; sort keys with `_sortable_centre_key`, never bare `sorted()`.
