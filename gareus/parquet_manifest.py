@@ -187,7 +187,7 @@ def validate_manifest(
     if row_sum != n_rows:
         raise ParquetManifestError(f"Parquet manifest row total {n_rows} does not equal file-row sum {row_sum}")
 
-    return {
+    out = {
         "schema": SCHEMA,
         "kind": kind,
         "generation": generation,
@@ -195,6 +195,13 @@ def validate_manifest(
         "next_chunk_index": next_chunk_index,
         "files": normalized,
     }
+    if "payload_schema" in manifest:
+        payload_schema = manifest["payload_schema"]
+        if (not isinstance(payload_schema, dict) or not isinstance(payload_schema.get("schema"), str)
+                or not payload_schema["schema"]):
+            raise ParquetManifestError("Parquet manifest payload_schema must be an object with a nonempty 'schema'")
+        out["payload_schema"] = payload_schema
+    return out
 
 
 def publish_manifest(segment_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
@@ -226,11 +233,25 @@ def committed_files(segment_dir: Path, *, expected_kind: str, verify_hashes: boo
     return [str(Path(segment_dir) / rec["path"]) for rec in manifest["files"]]
 
 
-def append_file_to_manifest(segment_dir: Path, *, kind: str, record: dict[str, Any], next_chunk_index: int) -> dict[str, Any]:
+def _merge_payload_schema(current: dict[str, Any], requested: Optional[dict[str, Any]]) -> dict[str, Any]:
+    new_manifest = dict(current)
+    if requested is None:
+        return new_manifest
+    recorded = current.get("payload_schema")
+    if recorded is None and current["files"]:
+        raise ParquetManifestError("payload schema changed: segment already holds rows without one")
+    if recorded is not None and recorded != requested:
+        raise ParquetManifestError(f"payload schema changed within a segment: {recorded!r} -> {requested!r}")
+    new_manifest["payload_schema"] = dict(requested)
+    return new_manifest
+
+
+def append_file_to_manifest(segment_dir: Path, *, kind: str, record: dict[str, Any], next_chunk_index: int,
+                            payload_schema: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     current = load_manifest(segment_dir, expected_kind=kind, verify_hashes=False)
     if current is None:
         current = empty_manifest(kind)
-    new_manifest = dict(current)
+    new_manifest = _merge_payload_schema(current, payload_schema)
     new_manifest["generation"] = int(current["generation"]) + 1
     new_manifest["files"] = [dict(x) for x in current["files"]] + [dict(record)]
     new_manifest["n_rows"] = int(current["n_rows"]) + int(record["rows"])
@@ -244,12 +265,13 @@ def replace_files_in_manifest(
     kind: str,
     records: Iterable[dict[str, Any]],
     next_chunk_index: int,
+    payload_schema: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     current = load_manifest(segment_dir, expected_kind=kind, verify_hashes=False)
     if current is None:
         raise ParquetManifestError("cannot replace files in a segment with no manifest")
     records = [dict(r) for r in records]
-    new_manifest = dict(current)
+    new_manifest = _merge_payload_schema(current, payload_schema)
     new_manifest["generation"] = int(current["generation"]) + 1
     new_manifest["files"] = records
     new_manifest["n_rows"] = sum(int(r["rows"]) for r in records)
