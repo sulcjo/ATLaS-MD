@@ -146,6 +146,7 @@ def reconstruct_bias_matrix(
     v_dih: np.ndarray | None = None,
     envelope=None,
     meta: dict | None = None,
+    aux_z: Mapping[str, np.ndarray] | None = None,
     _ladder_apply: Callable | None = None,
 ) -> np.ndarray:
     """Return the (N,K) reduced umbrella-plus-ladder bias, not full potential.
@@ -167,6 +168,16 @@ def reconstruct_bias_matrix(
         raise MissingCoordinateError(
             f"cv2 was not supplied, but states {active_secondary} have active secondary restraints"
         )
+    aux_columns = {}
+    for column, row in enumerate(rows):
+        if row.get("aux_k", 0.0) > 0:
+            sha = row["aux_model_sha256"]
+            if aux_z is None or sha not in aux_z:
+                raise MissingCoordinateError(
+                    f"aux z for model {sha} was not supplied, but state "
+                    f"{row.get('window_id', column)} has an active auxiliary restraint")
+            if sha not in aux_columns:
+                aux_columns[sha] = numeric_vector(aux_z[sha], f"aux_z[{sha[:12]}]", n)
     matrix = np.zeros((n, len(rows)), dtype=np.float64)
     with np.errstate(over="raise", invalid="ignore"):
         try:
@@ -177,6 +188,9 @@ def reconstruct_bias_matrix(
                 if row["k2"] > 0:
                     delta = secondary - row["center2"]
                     matrix[:, column] += 0.5 * row["k2"] * delta * delta
+                if row.get("aux_k", 0.0) > 0:
+                    delta = aux_columns[row["aux_model_sha256"]] - row["aux_center"]
+                    matrix[:, column] += 0.5 * row["aux_k"] * delta * delta
             matrix *= beta * KJ_PER_KCAL
         except FloatingPointError as exc:
             raise IntegrityError("Overflow reconstructing umbrella bias; check CV units/parameters") from exc
