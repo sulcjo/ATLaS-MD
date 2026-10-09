@@ -120,7 +120,8 @@ def state_rows(registry: Any, diagnostics: Mapping[str, Any]) -> Tuple[List[Dict
     rows = {int(r.get("state_id")): r for r in diagnostics.get("states", []) or []}
     policy = AdaptiveDecisionPolicy()
     groups: Dict[Tuple, List[int]] = {}
-    for s in registry.active_states():
+    from gareus.adaptive_production import ordinary_active_states  # noqa: PLC0415
+    for s in ordinary_active_states(registry):
         groups.setdefault(_centre_group_key(s, policy), []).append(int(s.state_id))
     out = []
     for sid in representative_ids(views):

@@ -226,6 +226,21 @@ def is_auxiliary_state(state) -> bool:
     return aux_params(state) is not None
 
 
+def ordinary_active_states(registry) -> List["WindowState"]:
+    """Active states that are not auxiliary workers (what every non-aux consumer iterates)."""
+    return [s for s in registry.active_states() if not is_auxiliary_state(s)]
+
+
+def _tag_auxiliary_rows(payload: Dict[str, Any], registry) -> None:
+    """Mark worker rows in a diagnostics payload; adds nothing when the registry has no worker."""
+    ids = {int(s.state_id) for s in registry.all_states() if is_auxiliary_state(s)}
+    if not ids:
+        return
+    for row in payload.get("states", []) or []:
+        if isinstance(row, dict) and int(row.get("state_id", -1)) in ids:
+            row["auxiliary"] = True
+
+
 def registry_has_aux(registry) -> bool:
     return any(is_auxiliary_state(s) for s in registry.all_states())
 
@@ -751,6 +766,8 @@ class WindowStateRegistry:
         """
         seen: List[float] = []
         for state in self.active_states():
+            if is_auxiliary_state(state):
+                continue
             lam = float(state.gamd_lambda or 0.0)
             if not any(abs(lam - v) <= 1.0e-9 for v in seen):
                 seen.append(lam)
@@ -1281,12 +1298,22 @@ def write_seed_bank_from_run_dirs(
     return payload
 
 
+def _seed_source_restriction(target) -> Optional[int]:
+    meta = getattr(target, "metadata", None) or {}
+    aux = meta.get(AUX_METADATA_KEY)
+    if isinstance(aux, dict) and aux.get("spawn_parent_state_id") is not None:
+        return int(aux["spawn_parent_state_id"])
+    res = meta.get("cv2_resolution")
+    if isinstance(res, dict) and res.get("seed_source_state_id") is not None:
+        return int(res["seed_source_state_id"])
+    return None
+
+
 def _seed_rows_for_target(rows: List[Dict[str, Any]], target: WindowState) -> List[Dict[str, Any]]:
     """The bank rows a target may start from: all of them, except for a state created by a
     spec 3.3 resolution action, which starts from its parent's frames (the nearest to its own
     centre) whenever the bank holds any."""
-    meta = (target.metadata or {}).get("cv2_resolution") or {}
-    parent = meta.get("seed_source_state_id")
+    parent = _seed_source_restriction(target)
     if parent is None:
         return rows
     own = [r for r in rows if str(r.get("source_state_id", "")).strip() not in ("", "None")
@@ -2561,7 +2588,7 @@ def build_geometry_edges(
     ladder inactive the grouping is skipped entirely and the result is
     byte-for-byte what it always was.
     """
-    active = registry.active_states()
+    active = ordinary_active_states(registry)
     if len(active) <= 1:
         return []
     policy = policy or AdaptiveDecisionPolicy()
@@ -2827,6 +2854,7 @@ def collect_epoch_diagnostics(
         "non_neighbor_redundancies": non_neighbor_redundancies,
         "policy": _json_ready(asdict(policy)),
     }
+    _tag_auxiliary_rows(payload, registry)
     attach_paired_cv(payload, paired, epoch_dir / "adaptive_epoch_diagnostics.json")
     if edge_metric:
         attach_edge_metric(payload, policy, epoch_dir)  # spec 3.1; no-op under the marginal metric
@@ -3111,7 +3139,7 @@ def _propose_tica_coverage_actions(
     umbrella_state_ids_arr = np.asarray(umbrella_state_ids) if umbrella_state_ids is not None else None
     replica_ids_arr = np.asarray(replica_ids) if replica_ids is not None else None
     steps_arr = np.asarray(steps) if steps is not None else None
-    active = [s for s in registry.active_states()
+    active = [s for s in ordinary_active_states(registry)
               if s.secondary_center is not None and (s.secondary_k or 0.0) > 0.0]
     finite = np.isfinite(primary) & np.isfinite(secondary)
     if not active or not np.any(finite):
@@ -4480,6 +4508,7 @@ def collect_final_combined_diagnostics(
         "edges": [e.to_dict() for e in edge_rows],
         "policy": _json_ready(asdict(policy)),
     }
+    _tag_auxiliary_rows(payload, registry)
     attach_paired_cv(payload, paired, adaptive_dir / "adaptive_final_combined_diagnostics.json")
     attach_edge_metric(payload, policy, adaptive_dir)  # spec 3.1; no-op under the marginal metric
     write_json(adaptive_dir / "adaptive_final_combined_diagnostics.json", payload)
@@ -5424,7 +5453,7 @@ def propose_actions_from_diagnostics(
             interloper = si if off_i else sj
             state_max_overlap[interloper] = max(state_max_overlap.get(interloper, 0.0), float(ov))
         retire_candidates: List[int] = []
-        for state in registry.active_states():
+        for state in ordinary_active_states(registry):
             sid = int(state.state_id)
             diag = state_rows.get(sid, {})
             if sid in graph_critical or sid in bad_touching:
@@ -5480,7 +5509,7 @@ def propose_actions_from_diagnostics(
 
     # 3. Explicitly record extensions for states that are obviously undersampled.
     action_keys = {(a[0], a[1]) for a in actions if len(a) > 1}
-    for state in registry.active_states():
+    for state in ordinary_active_states(registry):
         sid = int(state.state_id)
         if ("retire", sid) in action_keys:
             continue
@@ -6760,6 +6789,7 @@ def collect_segmented_epoch_diagnostics(epoch_dir: Path, registry: WindowStateRe
         "active_graph_connected": active_graph_connected(registry),
         "policy": _json_ready(asdict(policy)),
     }
+    _tag_auxiliary_rows(payload, registry)
     attach_paired_cv(payload, paired, epoch_dir / "adaptive_epoch_diagnostics.json")
     attach_edge_metric(payload, policy, epoch_dir)  # spec 3.1; no-op under the marginal metric
     write_json(epoch_dir / "adaptive_epoch_diagnostics.json", payload)
@@ -7809,7 +7839,7 @@ class AdaptiveProductionController:
         policy = AdaptiveDecisionPolicy()
         lam = float(lambda_new)
         groups: Dict[Tuple[int, Optional[int]], List[WindowState]] = {}
-        for state in self.registry.active_states():
+        for state in ordinary_active_states(self.registry):
             groups.setdefault(_centre_group_key(state, policy), []).append(state)
         created: List[WindowState] = []
         for _key, members in sorted(groups.items(), key=lambda kv: _sortable_centre_key(kv[0])):
@@ -7835,7 +7865,7 @@ class AdaptiveProductionController:
         their own Hamiltonian; nothing about any other state changes.
         """
         retired: List[int] = []
-        for state in list(self.registry.active_states()):
+        for state in list(ordinary_active_states(self.registry)):
             if abs(float(state.gamd_lambda or 0.0) - float(lam)) > 1.0e-9:
                 continue
             if bool((state.metadata or {}).get("mandatory")):
@@ -7855,7 +7885,7 @@ class AdaptiveProductionController:
     def _centre_members(self, state: WindowState) -> List[WindowState]:
         """Every ACTIVE state at ``state``'s umbrella centre (all rungs), via the centre key."""
         key = _centre_group_key(state, self.policy)
-        members = [s for s in self.registry.active_states() if _centre_group_key(s, self.policy) == key]
+        members = [s for s in ordinary_active_states(self.registry) if _centre_group_key(s, self.policy) == key]
         return sorted(members, key=lambda s: (float(s.gamd_lambda or 0.0), int(s.state_id)))
 
     def _refuse(self, index: int, kind: str, reason: str, detail: str, **extra: Any) -> None:
@@ -8029,8 +8059,8 @@ class AdaptiveProductionController:
         if not drop and not add:
             return None, ("no_change", "no rung to drop or add after filtering", {})
         policy = AdaptiveDecisionPolicy()
-        centres = {_centre_group_key(s, policy) for s in self.registry.active_states()}
-        n_drop = sum(1 for s in self.registry.active_states()
+        centres = {_centre_group_key(s, policy) for s in ordinary_active_states(self.registry)}
+        n_drop = sum(1 for s in ordinary_active_states(self.registry)
                      if any(abs(float(s.gamd_lambda or 0.0) - x) <= 1.0e-9 for x in drop)
                      and not bool((s.metadata or {}).get("mandatory")))
         refusal = self._budget_refusal("respace_ladder", len(centres) * len(add) - n_drop)
@@ -8076,7 +8106,7 @@ class AdaptiveProductionController:
             lam = float(action[1])
             policy = AdaptiveDecisionPolicy()
             groups: Dict[Tuple, List[WindowState]] = {}
-            for state in self.registry.active_states():
+            for state in ordinary_active_states(self.registry):
                 groups.setdefault(_centre_group_key(state, policy), []).append(state)
             return sum(1 for members in groups.values()
                        if not any(abs(float(s.gamd_lambda or 0.0) - lam) <= 1.0e-9 for s in members))

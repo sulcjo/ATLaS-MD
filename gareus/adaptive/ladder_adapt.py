@@ -362,6 +362,17 @@ def _read_phase(phase_dir) -> "pd.DataFrame":
     return df.drop(columns=["filename", "seg"])
 
 
+def registry_states_for_ladder(states: dict) -> dict:
+    """Registry state dicts without auxiliary workers (they are not rungs of any centre)."""
+    out = {}
+    for k, st in states.items():
+        aux = (st.get("metadata") or {}).get("aux")
+        if isinstance(aux, dict) and aux.get("role") == "auxiliary":
+            continue
+        out[k] = st
+    return out
+
+
 def load_centre_rung_samples(phases: Sequence[tuple], registry_states: Sequence[dict]
                              ) -> Dict[tuple, Dict[float, Tuple[np.ndarray, np.ndarray]]]:
     """``{centre_key: {lambda: (v_pep, v_dih)}}`` pooled over ``phases``.
@@ -372,7 +383,7 @@ def load_centre_rung_samples(phases: Sequence[tuple], registry_states: Sequence[
     """
     import csv
     from gareus.mbar_analysis.loaders_adaptive import _validate_and_repair_epoch_window_map
-    by_id = {int(s["state_id"]): s for s in registry_states}
+    by_id = registry_states_for_ladder({int(s["state_id"]): s for s in registry_states})
     acc: Dict[tuple, Dict[float, List[Tuple[np.ndarray, np.ndarray]]]] = {}
     for phase_dir, wmap_path in phases:
         with open(wmap_path) as fh:
