@@ -22,11 +22,14 @@ class DiscoveryResult:
 
 
 def run_discovery(ft, *, train, holdout, settings: AuxDiscoverySettings, full_topology, k3_max, epoch) -> DiscoveryResult:
+    """z3 candidates come only from discovery k that pass the reproducibility gates AND trigger (hidden structure
+    or lineage information): an untriggered k is structure CV1/CV2 already explain."""
     rep = {"n_frames": int(ft.n), "n_train": int(np.sum(train)), "n_holdout": int(np.sum(holdout))}
     lineage = ft.lineage
     disc_X = np.hstack([ft.tors, ft.hc]); disc_fam = ["tors"] * ft.tors.shape[1] + ["hc"] * ft.hc.shape[1]
     cv = np.c_[ft.cv1, ft.cv2]
-    disc = fit_partition(disc_X, disc_fam, cv, train, holdout, lineage, ft.step, settings, seed=settings.partition_seed)
+    disc = fit_partition(disc_X, disc_fam, cv, train, holdout, lineage, ft.step, settings, seed=settings.partition_seed,
+                         multi_k=True)
     rep["discovery"] = {"status": disc.status, "k": disc.choice.k, "table": disc.choice.table,
                         "hidden_fraction": disc.hidden_fraction, "co_occurrence": disc.co_occurrence,
                         "lineage_info": disc.lineage_info,

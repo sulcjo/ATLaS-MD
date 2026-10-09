@@ -253,7 +253,7 @@ class PartitionResult:
 
 
 def fit_partition(X, families, cv, train, holdout, lineage, step, s: AuxDiscoverySettings, *, seed: int = 0,
-                  feature_names: Optional[Sequence[str]] = None) -> PartitionResult:
+                  feature_names: Optional[Sequence[str]] = None, multi_k: bool = False) -> PartitionResult:
     lineage = np.asarray(lineage)
     X = np.asarray(X)
     cv = np.asarray(cv, np.float32)
@@ -270,7 +270,7 @@ def fit_partition(X, families, cv, train, holdout, lineage, step, s: AuxDiscover
         return PartitionResult("insufficient_evidence", choice, None, bins)
     nb = s.s_bins ** 2
     per_k = []
-    for ch in (choice.choices or [choice]):
+    for ch in ((choice.choices or [choice]) if multi_k else [choice]):
         hfk = hidden_fraction(ch.labels, bins, train, holdout, ch.k, nb)
         cok = co_occurrence(ch.labels, bins, holdout, ch.k, s)
         lik = lineage_info(ch.labels, bins, lineage, step, ch.k, nb, s.lineage_dirichlet_c)

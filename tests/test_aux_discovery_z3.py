@@ -164,13 +164,7 @@ def _shift_within_lineage(arr, lineage, step, rng):
     return out
 
 
-def _gate_inputs(ft):
-    tr = np.arange(ft.n) < 4500
-    return np.zeros(ft.n, int), tr, ~tr
-
-
 def test_null_gate_passes_planted_signal():
-    ft, lab = _with_lineage(_planted(n=3000)[0]), None
     ft, lab = _planted(n=3000); _with_lineage(ft)
     bins = np.zeros(ft.n, int); tr = np.arange(ft.n) < 2200; ho = ~tr
     s = AuxDiscoverySettings(n_null_z3=4)
@@ -240,3 +234,32 @@ def test_removed_settings_rejected():
     for key in ("info_gain_min", "stability_min", "basin_gain_min"):
         with pytest.raises(ValueError, match="unknown aux settings key"):
             AuxDiscoverySettings.from_mapping({**AuxDiscoverySettings().to_mapping(), key: 0.1})
+
+
+def test_null_gate_exits_early_on_failure():
+    ft, lab = _planted(n=3000); _with_lineage(ft)
+    ft.tors = _shift_within_lineage(ft.tors, ft.lineage, ft.step, np.random.default_rng(7))
+    bins = np.zeros(ft.n, int); tr = np.arange(ft.n) < 2200; ho = ~tr
+    s = AuxDiscoverySettings(n_null_z3=20); src = [(2, lab, [(0, 1)])]
+    best, _ = Z.search_z3_sources(ft, src, bins, tr, ho, s, nbins=1)
+    gate = Z.z3_null_gate(ft, src, best, bins, tr, ho, s, nbins=1)
+    assert not gate["passed"] and gate["n_null_run"] < 20 and len(gate["null_best"]) == gate["n_null_run"]
+
+
+def test_failing_null_gate_gives_broaden(monkeypatch):
+    from types import SimpleNamespace
+    from gareus.adaptive.aux_discovery import pipeline as P
+    ft, lab = _planted(n=600); _with_lineage(ft)
+    ft.hc = ft.hb = np.zeros((ft.n, 1)); ft.definition = SimpleNamespace(hc_labels=["a"], hb_labels=["b"]); ft.state_id = np.zeros(ft.n, int)
+    part = SimpleNamespace(status="ok", choice=SimpleNamespace(k=2, table=[]), hidden_fraction=1.0, co_occurrence=[],
+                           lineage_info=1.0, bins=np.zeros(ft.n, int), frozen=None,
+                           per_k=[{"k": 2, "labels": lab, "hidden_fraction": 1.0, "co_occurrence": [],
+                                   "lineage_info": 1.0, "triggered": True}])
+    monkeypatch.setattr(P, "fit_partition", lambda *a, **k: part)
+    monkeypatch.setattr(P, "_cooccurring_pairs", lambda *a, **k: [(0, 1)])
+    monkeypatch.setattr(P, "z3_null_gate", lambda *a, **k: {"passed": False, "null_margin": -1.0})
+    tr = np.arange(ft.n) < 400
+    res = P.run_discovery(ft, train=tr, holdout=~tr, settings=AuxDiscoverySettings(), full_topology=None,
+                          k3_max=3, epoch=1)
+    assert res.status == "broaden"
+    assert "passing_k" in res.report["discovery"] and "null_gate" in res.report["z3_search"]

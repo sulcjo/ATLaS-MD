@@ -92,7 +92,7 @@ def scramble_labels(labels, lineage, step, rng) -> np.ndarray:
     for lin in np.unique(lineage):
         idx = np.nonzero(lineage == lin)[0]
         idx = idx[np.argsort(step[idx], kind="stable")]
-        out[idx] = np.roll(labels[idx], int(rng.integers(0, idx.size)))
+        out[idx] = np.roll(labels[idx], int(rng.integers(1, idx.size)) if idx.size > 1 else 0)
     return out
 
 
@@ -173,6 +173,8 @@ def z3_null_gate(ft, sources, real_best, bins, train, holdout, s: AuxDiscoverySe
     rng = np.random.default_rng(int(s.partition_seed) + 7919)
     null_best = []
     for _ in range(n_null):
+        if null_best and max(null_best) >= real_best.info_gain:
+            break   # already failed: one null at least as good as the real best
         scr = [scramble_labels(lab, ft.lineage, ft.step, rng) for _, lab, _ in sources]
         b, _ = search_z3_sources(ft, sources, bins, train, holdout, s, nbins=nbins, light=True, label_override=scr)
         # a null search that finds no candidate (L1 shrinks every coefficient to zero) or a negative best has
@@ -181,7 +183,7 @@ def z3_null_gate(ft, sources, real_best, bins, train, holdout, s: AuxDiscoverySe
     nmax = max(null_best) if null_best else 0.0
     summ = {"min": min(null_best), "median": float(np.median(null_best)), "max": nmax} if null_best else None
     margin = float(real_best.info_gain - nmax)
-    return {**rep, "null_best": null_best, "null_floor": 0.0,
+    return {**rep, "n_null_run": len(null_best), "null_best": null_best, "null_floor": 0.0,
             "null_summary": summ, "null_margin": margin, "passed": bool(real_best.info_gain > nmax),
             "reason": None}
 
