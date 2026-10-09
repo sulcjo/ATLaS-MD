@@ -72,7 +72,7 @@ def _stub(monkeypatch, calls, crash_after_save):
     monkeypatch.setattr(ap, "_write_runtime_pool_reports", pool_reports)
 
 
-def test_crash_after_save_then_resume_applies_the_action_exactly_once(tmp_path, monkeypatch):
+def test_crash_after_save_then_resume_applies_the_action_exactly_once(tmp_path, monkeypatch, campaign_locks):
     args, out, adaptive = _campaign(tmp_path)
     calls = {"propose": 0, "diag_states": []}
     crash = {"armed": True}
@@ -87,9 +87,7 @@ def test_crash_after_save_then_resume_applies_the_action_exactly_once(tmp_path, 
         if (adaptive / "adaptive_production_driver_summary.json").exists() else {}
     assert int(summary.get("epochs_completed", 0) or 0) == 0          # the kill happened before this
 
-    # A killed job leaves its lock behind with a dead PID, which the next job treats as stale;
-    # in one test process the PID is still alive, so remove it as the stale-lock path would.
-    (adaptive / ".gareus_run.lock").unlink(missing_ok=True)
+    campaign_locks(out)                                                # conftest: stale-lock cleanup
     with pytest.raises(_ReachedFinal):
         ap.run_adaptive_production_auto_loop(args, out, None, None, None, None, None, None)
     assert calls["propose"] == 1                                       # never proposed again
@@ -110,3 +108,42 @@ def test_a_normal_run_records_the_ledger_without_changing_behaviour(tmp_path, mo
     assert calls["propose"] == 1 and len(WindowStateRegistry.load(adaptive).active_states()) == 4
     led = json.loads((adaptive / "epoch_000" / "actions_applied.json").read_text())
     assert led["actions"][0][0] == "add"
+
+
+def test_kill_right_after_registry_save_before_the_ledger_resumes_exactly_once(tmp_path, monkeypatch, campaign_locks):
+    """Task 17: the kill lands right after registry.save, before the post-save ledger write. The ledger is
+    written before the save too (with the digest the save will produce), so the resume still recovers."""
+    args, out, adaptive = _campaign(tmp_path)
+    calls = {"propose": 0, "diag_states": []}
+    _stub(monkeypatch, calls, {"armed": False})
+    real_save = WindowStateRegistry.save
+    armed = {"on": True}
+
+    def save_then_die(self, directory):
+        paths = real_save(self, directory)
+        if armed["on"] and calls["propose"] >= 1:
+            armed["on"] = False
+            raise _Crash()
+        return paths
+
+    monkeypatch.setattr(WindowStateRegistry, "save", save_then_die)
+    with pytest.raises(_Crash):
+        ap.run_adaptive_production_auto_loop(args, out, None, None, None, None, None, None)
+    assert len(WindowStateRegistry.load(adaptive).active_states()) == 4
+    campaign_locks(out)
+    with pytest.raises(_ReachedFinal):
+        ap.run_adaptive_production_auto_loop(args, out, None, None, None, None, None, None)
+    assert calls["propose"] == 1                                       # never proposed again
+    assert calls["diag_states"] == [3, 3]                             # re-entered on the pre-action registry
+    reg = WindowStateRegistry.load(adaptive)
+    assert len(reg.active_states()) == 4
+    assert sum(1 for s in reg.active_states() if abs(s.primary_center - 0.15) < 1e-9) == 1
+
+
+def test_pre_save_ledger_digest_equals_the_saved_registry_file(tmp_path):
+    reg = WindowStateRegistry()
+    for c in (0.1, 0.2, 0.3):
+        reg.add_state(c, 800.0, epoch=0, source="seed", metadata={"aux": {"aux_center": 0.1 * c, "role": "x"}})
+    predicted = ap._registry_json_digest(reg)
+    reg.save(tmp_path)
+    assert predicted == ap._file_sha256(tmp_path / "state_registry.json")
