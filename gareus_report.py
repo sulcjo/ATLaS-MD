@@ -227,6 +227,8 @@ def _check_aux_crosscheck(s: dict) -> Optional[dict]:
     if status == "pass":
         return {"name": name, "status": PASS,
                 "detail": f"max |dF| {mx:.2f} kcal/mol over supported bins" if mx is not None else "agrees"}
+    if status == "error":
+        return {"name": name, "status": CAUTION, "detail": str(cc.get("reason") or "error")}
     return {"name": name, "status": NA, "detail": str(cc.get("reason") or "skipped")}
 
 

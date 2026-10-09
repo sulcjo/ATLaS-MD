@@ -5289,11 +5289,11 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
                 warn.append(f"Aux ordinary-only cross-check FAILED: PMF from ordinary states only disagrees with the all-states PMF by "
                             f"{_acc.get('max_abs_diff_kcal',float('nan')):.3f} kcal/mol (tolerance {_acc['tolerance_kcal']:.3f}) -- "
                             f"the auxiliary states' bias terms or sampling are inconsistent with the ordinary ensemble.")
-            aux_workers_summary={'workers':worker_table(d,m['f_k'],aux_states=_aux_state_ids,ordinary_states=_ordinary),
+            aux_workers_summary={'workers':worker_table(d,m['f_k'],aux_states=_aux_state_ids,ordinary_states=_ordinary,state_lambdas=getattr(d,'state_lambdas',None)),
                                  'attribution':'none (no shams)','model_sha256':d.meta.get('aux_model_sha256')}
         except Exception as _exc:
             warn.append(f"Aux crosscheck/worker table unavailable: {type(_exc).__name__}: {_exc}")
-            aux_crosscheck_summary={'status':'skipped','reason':f'{type(_exc).__name__}: {_exc}','axes':{}}
+            aux_crosscheck_summary={'status':'error','reason':f'{type(_exc).__name__}: {_exc}','axes':{}}
 
     # Never pool epoch_000 into the main PMF/GaMD-boost report: it runs under
     # a different GaMD envelope (the shared-envelope recalibration fires from

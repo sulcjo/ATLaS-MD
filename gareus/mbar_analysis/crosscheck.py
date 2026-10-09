@@ -295,7 +295,7 @@ def aux_ordinary_crosscheck(d: Any, f_k_global: np.ndarray, bins_by_axis: dict, 
                 "tolerance_kcal": tol_kcal}
     u_all = np.asarray(select_matrix(d.u_nk), dtype=np.float64)
     logw_all = _target_logw(u_all, window, np.asarray(f_k_global, float))
-    u_ord = u_all[rows][:, ordinary]
+    u_ord = u_all[np.ix_(rows, ordinary)]
     remap = {int(s): i for i, s in enumerate(ordinary)}
     win_ord = np.fromiter((remap[int(w)] for w in window[rows]), dtype=np.int64, count=int(rows.sum()))
     f_ord, logw_ord = solve_rows(u_ord, win_ord)

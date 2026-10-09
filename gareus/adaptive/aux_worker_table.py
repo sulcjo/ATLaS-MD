@@ -77,7 +77,8 @@ def return_label_change_fraction(frames, eval_partition, worker_state: int,
     return {"fraction": (n_change / n_ep) if n_ep else None, "n_episodes": n_ep}
 
 
-def worker_table(d: Any, f_k, *, aux_states, ordinary_states, eval_partition=None, frames=None) -> List[dict]:
+def worker_table(d: Any, f_k, *, aux_states, ordinary_states, eval_partition=None, frames=None,
+                 state_lambdas=None) -> List[dict]:
     from gareus.mbar_analysis.ladder import pairwise_state_overlap
 
     window = np.asarray(d.window, dtype=np.int64)
@@ -95,6 +96,15 @@ def worker_table(d: Any, f_k, *, aux_states, ordinary_states, eval_partition=Non
     forecasts = meta.get("aux_forecast_O", {}) or {}
     aux_set = {int(a) for a in aux_states}
     ordinary = [int(o) for o in ordinary_states]
+    if state_lambdas is None:
+        state_lambdas = getattr(d, "state_lambdas", None)
+    if state_lambdas is not None:
+        lam = np.asarray(state_lambdas, float)
+        ordinary = [o for o in ordinary if o < lam.size and lam[o] == 0.0]
+    by_replica = []
+    for r in np.unique(replica):
+        idx = np.where(replica == r)[0]
+        by_replica.append(idx[np.argsort(step[idx], kind="stable")])
     rows: List[dict] = []
     for w in sorted(aux_set):
         mine = window == w
@@ -105,12 +115,10 @@ def worker_table(d: Any, f_k, *, aux_states, ordinary_states, eval_partition=Non
             ov = float(pairwise_state_overlap(u_nk, window, f_k, n_k, int(w), o))
             if best_o is None or ov > best_o:
                 best, best_o = o, ov
-        entries = exits = zero = 0
-        for r in np.unique(replica):
-            idx = np.where(replica == r)[0]
-            idx = idx[np.argsort(step[idx], kind="stable")]
-            ep = positive_residence_episodes(window[idx], np.ones(idx.size), aux_set)
-            entries += ep["entries"]; exits += ep["exits"]; zero += ep["zero_time_visits"]
+        entries = exits = 0
+        for idx in by_replica:
+            ep = positive_residence_episodes(window[idx], np.ones(idx.size), {w})
+            entries += ep["entries"]; exits += ep["exits"]
         zw = z[mine] if z is not None else np.array([])
         zw = zw[np.isfinite(zw)]
         row = {
@@ -123,7 +131,6 @@ def worker_table(d: Any, f_k, *, aux_states, ordinary_states, eval_partition=Non
             "occupancy_fraction": float(mine.sum() / max(1, window.size)),
             "entries": int(entries),
             "exits": int(exits),
-            "zero_time_visits": int(zero),
             "carrier_diversity": int(np.unique(replica[mine]).size),
             "z_mean": float(zw.mean()) if zw.size else None,
             "z_sd": float(zw.std()) if zw.size else None,

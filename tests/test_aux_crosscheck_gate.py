@@ -68,3 +68,9 @@ def test_report_rows_grade_fail_and_caution():
                                "aux_workers": {"workers": []}})
     assert _row(v2, "Aux ordinary-only crosscheck")["status"] == "na"
     assert _row(v2, "Aux workers")["status"] == "pass"
+
+
+def test_report_row_error_is_caution():
+    from gareus_report import build_health_verdict
+    v = build_health_verdict({"aux_crosscheck": {"status": "error", "reason": "boom"}})
+    assert _row(v, "Aux ordinary-only crosscheck")["status"] == "caution"
