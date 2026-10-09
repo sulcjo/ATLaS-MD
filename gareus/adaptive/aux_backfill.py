@@ -83,14 +83,50 @@ def frame_z(phase_dir: Path, model, adaptive_dir: Optional[Path] = None) -> pd.D
     return pd.concat(blocks).drop_duplicates(["replica", "step"], keep="last").reset_index(drop=True)
 
 
+def _final_pdb_z(phase_dir: Path, replica: int, window: int, model, top_path: Path) -> Optional[float]:
+    """z of ``final_pdbs/replica_RRR_window_WWW.pdb`` (production writes it at the phase's last step from the
+    replica's live Context; a replica's earlier stop at the same window is overwritten by it). None when the
+    file does not exist; raises when its leading atoms are not the solute's."""
+    import mdtraj as md
+    from gareus.auxiliary_cv.evaluate import z_from_positions
+    path = Path(phase_dir) / "final_pdbs" / f"replica_{int(replica):03d}_window_{int(window):03d}.pdb"
+    if not path.exists():
+        return None
+    solute = md.load_topology(str(top_path))
+    t = md.load(str(path))
+    n = solute.n_atoms
+    if t.n_atoms < n or any((a.name, a.residue.name, a.residue.resSeq) != (b.name, b.residue.name, b.residue.resSeq)
+                            for a, b in zip(list(t.topology.atoms)[:n], solute.atoms)):
+        raise ValueError(f"{path}: final_pdbs file's first {n} atoms are not the solute of {top_path}")
+    return float(np.ravel(z_from_positions(t.xyz[0, :n].astype(np.float64), model))[0])
+
+
 def write_phase_backfill(phase_dir: Path, model, *, adaptive_dir: Optional[Path] = None) -> dict:
+    """z for every sample of the phase from its XTC frames. The one exception is each replica's LAST sample when
+    it has no frame: the phase's step total (from the MD pool) is generally off the frame grid, so production
+    logs a final sample at that step with no XTC frame; its configuration is ``final_pdbs/replica_RRR_window_WWW
+    .pdb`` (W = the sample's own window). Any other missing frame, or a missing final PDB, refuses the phase."""
     import pyarrow as pa
     import pyarrow.parquet as pq
     phase_dir = Path(phase_dir)
-    samples = load_phase_samples(phase_dir)[["replica", "step"]]
+    loaded = load_phase_samples(phase_dir)
+    samples = loaded[["replica", "step"]]
     zdf = frame_z(phase_dir, model, adaptive_dir)
     merged = samples.merge(zdf, on=["replica", "step"], how="left")
-    missing = merged["aux_z"].isna()
+    missing = merged["aux_z"].isna().to_numpy()
+    n_pdb = 0
+    if missing.any():
+        last = (loaded["step"].to_numpy() == loaded.groupby("replica")["step"].transform("max").to_numpy())
+        top_path = census._find_topology(phase_dir, Path(adaptive_dir) if adaptive_dir else phase_dir.parent)
+        z = merged["aux_z"].to_numpy(dtype=np.float64).copy()
+        for i in np.flatnonzero(missing & last):
+            zi = _final_pdb_z(phase_dir, int(loaded["replica"].iat[i]), int(loaded["window_id"].iat[i]), model,
+                              top_path)
+            if zi is not None:
+                z[i] = zi
+                n_pdb += 1
+        merged["aux_z"] = z
+        missing = merged["aux_z"].isna().to_numpy()
     if missing.any():
         raise BackfillIncomplete(int(missing.sum()), merged.loc[missing, ["replica", "step"]].head(10).values.tolist())
     out = phase_dir / BACKFILL_FILENAME
@@ -100,6 +136,7 @@ def write_phase_backfill(phase_dir: Path, model, *, adaptive_dir: Optional[Path]
     pq.write_table(table, tmp)
     tmp.replace(out)
     return {"phase": str(phase_dir), "n_samples": int(len(samples)), "n_z": int(merged["aux_z"].notna().sum()),
+            "n_from_xtc": int(len(samples)) - n_pdb, "n_from_final_pdb": int(n_pdb),
             "model_sha256": model.model_sha256, "sha256": hashlib.sha256(out.read_bytes()).hexdigest()}
 
 

@@ -211,3 +211,67 @@ def test_backfill_and_recorded_check_on_a_gamd_phase(tmp_path):
     s = pd.read_parquet(f); s["aux_z_00"] = _z_ref(m); s.to_parquet(f)
     chk = check_backfill_against_recorded(ph, m)
     assert chk["ok"] and chk["n_compared"] == 3
+
+
+def _add_end_sample(ph, step, window=0, replica=0):
+    f = ph / "samples" / "seg_000" / "data.parquet"
+    s = pd.read_parquet(f)
+    extra = s[s.replica == replica].iloc[[0]].copy(); extra["step"] = step; extra["window_id"] = window
+    pd.concat([s, extra]).to_parquet(f)
+
+
+def _write_final_pdb(ph, replica, window, src=PDB):
+    (ph / "final_pdbs").mkdir(exist_ok=True)
+    shutil.copy(src, ph / "final_pdbs" / f"replica_{replica:03d}_window_{window:03d}.pdb")
+
+
+def test_off_grid_end_of_phase_sample_takes_its_final_pdb(tmp_path):
+    # c10 epoch_000: the pool's step total (357142) is off the 300-step frame grid, so the phase's last sample
+    # has no XTC frame; production's final_pdbs/replica_RRR_window_WWW.pdb holds exactly that configuration.
+    from gareus.auxiliary_cv.evaluate import z_from_positions
+    ph = make_phase(tmp_path, "epoch_000", {"replica_0.xtc": (0, 0, [300, 600])}, {0: 0.0}, lambda s: 0.0)
+    _add_end_sample(ph, 742)
+    _write_final_pdb(ph, 0, 0)
+    m = _model()
+    info = write_phase_backfill(ph, m)
+    df = read_phase_backfill(ph, m.model_sha256)
+    assert info["n_samples"] == info["n_z"] == 3 and info["n_from_xtc"] == 2 and info["n_from_final_pdb"] == 1
+    z_pdb = float(np.ravel(z_from_positions(md.load(str(PDB)).xyz[0].astype(np.float64), m))[0])
+    assert df.set_index("step").aux_z[742] == pytest.approx(z_pdb, abs=1e-9)
+
+
+def test_end_of_phase_sample_without_final_pdb_refused(tmp_path):
+    ph = make_phase(tmp_path, "epoch_000", {"replica_0.xtc": (0, 0, [300, 600])}, {0: 0.0}, lambda s: 0.0)
+    _add_end_sample(ph, 742)
+    with pytest.raises(BackfillIncomplete) as e:
+        write_phase_backfill(ph, _model())
+    assert e.value.examples == [[0, 742]]
+
+
+def test_final_pdb_of_another_window_refused(tmp_path):
+    ph = make_phase(tmp_path, "epoch_000", {"replica_0.xtc": (0, 0, [300, 600])}, {0: 0.0, 1: 0.0}, lambda s: 0.0)
+    _add_end_sample(ph, 742, window=0)
+    _write_final_pdb(ph, 0, 1)                 # the replica's earlier stop held window 1: not this sample
+    with pytest.raises(BackfillIncomplete):
+        write_phase_backfill(ph, _model())
+
+
+def test_missing_frame_before_the_end_is_never_patched_from_final_pdb(tmp_path):
+    ph = make_phase(tmp_path, "epoch_000", {"replica_0.xtc": (0, 0, [300, 900])}, {0: 0.0}, lambda s: 0.0)
+    _add_end_sample(ph, 600)                   # mid-phase gap: only the replica's LAST sample may use the PDB
+    _write_final_pdb(ph, 0, 0)
+    with pytest.raises(BackfillIncomplete) as e:
+        write_phase_backfill(ph, _model())
+    assert e.value.examples == [[0, 600]]
+
+
+def test_final_pdb_with_wrong_solute_refused(tmp_path):
+    ph = make_phase(tmp_path, "epoch_000", {"replica_0.xtc": (0, 0, [300, 600])}, {0: 0.0}, lambda s: 0.0)
+    _add_end_sample(ph, 742)
+    lines = PDB.read_text().splitlines()
+    i = next(k for k, l in enumerate(lines) if l.startswith(("ATOM", "HETATM")) and l[12:16].strip() == "CA")
+    lines[i] = lines[i][:12] + " CB " + lines[i][16:]
+    bad = tmp_path / "bad.pdb"; bad.write_text("\n".join(lines) + "\n")
+    _write_final_pdb(ph, 0, 0, src=bad)
+    with pytest.raises(ValueError, match="final_pdbs"):
+        write_phase_backfill(ph, _model())
