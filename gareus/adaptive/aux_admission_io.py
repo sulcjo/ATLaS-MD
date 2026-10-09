@@ -97,6 +97,8 @@ def _calib_steps_for_phase(args, adaptive_dir: Path) -> int:
 
 
 def _unfreeze(adaptive_dir: Path) -> None:
+    from gareus.adaptive.aux_backfill import remove_backfills
+    remove_backfills(adaptive_dir)
     for name in _FROZEN_NAMES:
         try:
             (Path(adaptive_dir) / name).unlink()
@@ -146,7 +148,7 @@ def run_epoch_aux_discovery(*, adaptive_dir, epoch_dir, epoch, registry, diagnos
                                  "burnin_phase_epoch": int(epoch) + 1,
                                  "forecast": {k: c[k] for k in ("O", "TV", "null", "net", "utility_q10")}}}))
         freeze_started = True
-        _freeze(adaptive_dir, epoch, res, new, settings, srec, val)
+        report["backfill"] = _freeze(adaptive_dir, epoch, res, new, settings, srec, val)
         report["admitted"] = [[a[1], a[2]] for a in new]
         return actions + new
     except Exception as exc:
@@ -162,17 +164,24 @@ def run_epoch_aux_discovery(*, adaptive_dir, epoch_dir, epoch, registry, diagnos
             print(f"WARNING: could not write {epoch_dir / REPORT_NAME}: {exc}")
 
 
-def _freeze(adaptive_dir: Path, epoch, res, new_actions, settings, srec, val) -> None:
+def _backfill(adaptive_dir: Path, epoch, model) -> List[dict]:
+    from gareus.adaptive.aux_backfill import backfill_all
+    return backfill_all(adaptive_dir, model, up_to_epoch=int(epoch))
+
+
+def _freeze(adaptive_dir: Path, epoch, res, new_actions, settings, srec, val) -> List[dict]:
     res.model.write(adaptive_dir / MODEL_FILENAME)
+    backfill = _backfill(adaptive_dir, epoch, res.model)     # BackfillIncomplete propagates: caller unfreezes
     part_sha = res.eval_partition.to_file(adaptive_dir / PARTITION_FILENAME)
     settings_sha = hashlib.sha256(json.dumps(srec.get("settings"), sort_keys=True).encode()).hexdigest()
     _write_json(adaptive_dir / ADMISSION_FILENAME, {
         "schema": ADMISSION_SCHEMA, "epoch": int(epoch), "model_sha256": res.model.model_sha256,
         "eval_partition_sha256": part_sha, "settings_sha256": settings_sha,
-        "validation": {"k3_max": val.k3_max, "reason": val.reason},
+        "validation": {"k3_max": val.k3_max, "reason": val.reason}, "backfill": backfill,
         "workers": [{"parent_state_id": a[1], "aux_center": a[2]["aux_center"],
                      "aux_k_kcal_mol": a[2]["aux_k_kcal_mol"], "placement_rank": a[4]["aux"]["placement_rank"],
                      "burnin_phase_epoch": a[4]["aux"]["burnin_phase_epoch"]} for a in new_actions]})
+    return backfill
 
 
 def annotate_report_with_refusals(adaptive_dir: Path, epoch_dir: Path, actions: Sequence[Tuple],
