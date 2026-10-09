@@ -55,6 +55,8 @@ def frame_z(phase_dir: Path, model, adaptive_dir: Optional[Path] = None) -> pd.D
     if top_path is None:
         raise FileNotFoundError(f"{phase_dir}: no solute_only.pdb")
     check_solute_indices(top_path, model)
+    import mdtraj as md
+    n_solute = md.load_topology(str(top_path)).n_atoms
     files = sorted(census._trajectory_files(phase_dir), key=lambda t: (t[0], t[1] or 0, str(t[2])))
     blocks = []
     for i, (replica, _start, path) in enumerate(files):
@@ -67,6 +69,8 @@ def frame_z(phase_dir: Path, model, adaptive_dir: Optional[Path] = None) -> pd.D
         keep = np.ones(steps.size, bool) if nxt is None else steps < int(nxt)
         if not keep.any():
             continue
+        if xyz.shape[1] != n_solute:
+            raise ValueError(f"{path}: {xyz.shape[1]} atoms per frame, solute PDB {top_path} has {n_solute}")
         z = np.ravel(z_from_positions(xyz[keep].astype(np.float64), model))
         blocks.append(pd.DataFrame({"replica": int(replica), "step": steps[keep], "aux_z": z}))
     if not blocks:
@@ -122,10 +126,12 @@ def backfill_all(adaptive_dir: Path, model, *, up_to_epoch: int) -> List[dict]:
     return out
 
 
-def check_backfill_against_recorded(phase_dir: Path, model, *, tol: float = 1e-5,
-                                    adaptive_dir: Optional[Path] = None) -> dict:
+def check_backfill_against_recorded(phase_dir: Path, model, *, tol: float = 0.05,
+                                    adaptive_dir: Optional[Path] = None, raise_on_fail: bool = False) -> dict:
     """Post-admission phase: recorded ``aux_z_00`` vs z_from_positions on its frames. Raises on a
-    deviation above ``tol`` or when no sample could be compared."""
+    deviation above ``tol`` only with ``raise_on_fail``; always returns
+    max_abs_dev, n_compared, tol, ok. (XTC 0.001 nm precision gives ~1e-2 z differences, hence tol 0.05.)
+    Raises when no sample could be compared."""
     import duckdb
     phase_dir = Path(phase_dir)
     rec = duckdb.connect().execute(
@@ -138,6 +144,7 @@ def check_backfill_against_recorded(phase_dir: Path, model, *, tol: float = 1e-5
     if joined.empty:
         raise ValueError(f"{phase_dir}: no sample with a recorded aux_z_00 and a frame to compare")
     dev = float((joined["aux_z_00"] - joined["aux_z"]).abs().max())
-    if dev > tol:
+    ok = dev <= tol
+    if not ok and raise_on_fail:
         raise ValueError(f"{phase_dir}: recorded aux_z_00 differs from z_from_positions by {dev:.3g} (> {tol})")
-    return {"phase": str(phase_dir), "n_compared": int(len(joined)), "max_abs_dev": dev}
+    return {"phase": str(phase_dir), "n_compared": int(len(joined)), "max_abs_dev": dev, "tol": float(tol), "ok": bool(ok)}

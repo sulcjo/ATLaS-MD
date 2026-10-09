@@ -105,10 +105,23 @@ def test_check_against_recorded(tmp_path):
     f = ph / "samples" / "seg_000" / "data.parquet"
     s = pd.read_parquet(f); s["aux_z_00"] = _z_ref(m); s.to_parquet(f)
     r = check_backfill_against_recorded(ph, m)
-    assert r["n_compared"] == 2 and r["max_abs_dev"] < 1e-5
-    s["aux_z_00"] = _z_ref(m) + 1e-3; s.to_parquet(f)
+    assert r["n_compared"] == 2 and r["max_abs_dev"] < 1e-5 and r["ok"] and r["tol"] == 0.05
+    s["aux_z_00"] = _z_ref(m) + 1e-2; s.to_parquet(f)          # XTC-scale deviation passes
+    assert check_backfill_against_recorded(ph, m)["ok"]
+    s["aux_z_00"] = _z_ref(m) + 0.1; s.to_parquet(f)
+    r = check_backfill_against_recorded(ph, m)
+    assert not r["ok"] and abs(r["max_abs_dev"] - 0.1) < 1e-4
     with pytest.raises(ValueError, match="differs"):
-        check_backfill_against_recorded(ph, m)
+        check_backfill_against_recorded(ph, m, raise_on_fail=True)
+
+
+def test_frame_atom_count_mismatch_refused(tmp_path):
+    ph = make_phase(tmp_path, "epoch_000", {"replica_0.xtc": (0, 0, [300])}, {0: 0.0}, lambda s: 0.0)
+    lines = (ph / "solute_only.pdb").read_text().splitlines()
+    i = max(k for k, l in enumerate(lines) if l.startswith(("ATOM", "HETATM")))
+    (ph / "solute_only.pdb").write_text("\n".join(lines[:i] + lines[i + 1:]) + "\n")
+    with pytest.raises(ValueError, match="atoms per frame"):
+        write_phase_backfill(ph, _model())
 
 
 # hook: a backfill failure must unfreeze (model, partition, admission, backfills written in this attempt)
