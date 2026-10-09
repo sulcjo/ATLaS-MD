@@ -212,6 +212,44 @@ class WindowState:
         return cls(**{k: v for k, v in data.items() if k in keep})
 
 
+AUX_METADATA_KEY = "aux"
+
+
+def aux_params(state) -> Optional[Dict[str, Any]]:
+    meta = getattr(state, "metadata", None) or {}
+    rec = meta.get(AUX_METADATA_KEY)
+    return rec if isinstance(rec, dict) and rec.get("role") == "auxiliary" else None
+
+
+def is_auxiliary_state(state) -> bool:
+    """The ONE predicate every consumer uses to tell an auxiliary worker from an ordinary state."""
+    return aux_params(state) is not None
+
+
+def registry_has_aux(registry) -> bool:
+    return any(is_auxiliary_state(s) for s in registry.all_states())
+
+
+def aux_csv_cells(state, active_ids) -> Dict[str, str]:
+    rec = aux_params(state)
+    sid = f"s{int(state.state_id)}"
+    if rec is None:
+        return {"aux_center": "", "aux_k_kcal_mol": "0.0", "aux_model_sha256": "",
+                "state_instance_id": sid, "state_role": "ordinary", "spawn_parent_state_id": "",
+                "matched_additional_slot_id": "", "spawn_source_observation_json": ""}
+    parent = rec.get("spawn_parent_state_id")
+    parent_cell = f"s{int(parent)}" if parent is not None and int(parent) in active_ids else ""
+    return {"aux_center": repr(float(rec["aux_center"])), "aux_k_kcal_mol": repr(float(rec["aux_k_kcal_mol"])),
+            "aux_model_sha256": str(rec["aux_model_sha256"]), "state_instance_id": sid,
+            "state_role": "auxiliary", "spawn_parent_state_id": parent_cell,
+            "matched_additional_slot_id": "", "spawn_source_observation_json": ""}
+
+
+def _aux_csv_fieldnames(fieldnames):
+    from gareus.windows import AUX_CSV_COLUMNS, INSTANCE_CSV_COLUMNS
+    return list(fieldnames) + list(AUX_CSV_COLUMNS) + list(INSTANCE_CSV_COLUMNS)
+
+
 @dataclass
 class LifecycleEvent:
     """Auditable registry event."""
@@ -749,6 +787,8 @@ class WindowStateRegistry:
         lam = float(gamd_lambda or 0.0)
         want = _restraint_pattern(primary_k, secondary_k, secondary)
         for state in self.all_states():
+            if is_auxiliary_state(state):
+                continue
             if abs(float(state.gamd_lambda or 0.0) - lam) > 1.0e-9:
                 continue
             have = _restraint_pattern(state.primary_k, state.secondary_k, state.secondary_center)
@@ -889,6 +929,11 @@ class WindowStateRegistry:
             if has_secondary and state.secondary_center is None:
                 raise RuntimeError("active registry mixes 1D and 2D states; cannot write one explicit 2D table")
             rows.append(row)
+        if registry_has_aux(self):
+            active_ids = {int(s.state_id) for s in active}
+            fieldnames = _aux_csv_fieldnames(fieldnames)
+            for row, state in zip(rows, active):
+                row.update(aux_csv_cells(state, active_ids))
         with path.open("w", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
             writer.writeheader()
@@ -2405,8 +2450,16 @@ _HAMILTONIAN_FIELDS = ("primary_center", "primary_k", "secondary_center", "secon
                        "gamd_lambda", "gamd_sigma0p", "gamd_sigma0d")
 
 
+def _aux_identity(state) -> Tuple[Any, ...]:
+    rec = aux_params(state)
+    if rec is None:
+        return (None, 0.0, None)
+    return (float(rec["aux_center"]), float(rec["aux_k_kcal_mol"]), str(rec["aux_model_sha256"]))
+
+
 def _hamiltonian_snapshot(registry: "WindowStateRegistry") -> Dict[int, Tuple[Any, ...]]:
-    return {int(s.state_id): tuple(getattr(s, f) for f in _HAMILTONIAN_FIELDS) for s in registry.all_states()}
+    return {int(s.state_id): tuple(getattr(s, f) for f in _HAMILTONIAN_FIELDS) + _aux_identity(s)
+            for s in registry.all_states()}
 
 
 def _same_parameter(a: Any, b: Any) -> bool:
@@ -2430,7 +2483,8 @@ def _assert_hamiltonians_unchanged(before: Dict[int, Tuple[Any, ...]], registry:
         raise RuntimeError(f"apply_actions removed state_id(s) {missing} from the registry; retired states "
                            "must stay (they carry samples into the union MBAR)")
     changed = [sid for sid, ham in before.items()
-               if not all(_same_parameter(a, getattr(now[sid], f)) for a, f in zip(ham, _HAMILTONIAN_FIELDS))]
+               if not all(_same_parameter(a, b) for a, b in
+                          zip(ham, tuple(getattr(now[sid], f) for f in _HAMILTONIAN_FIELDS) + _aux_identity(now[sid])))]
     if changed:
         raise RuntimeError(f"apply_actions changed the Hamiltonian of existing state_id(s) {changed}; "
                            "a centre/k/lambda change must create a new state_id")
@@ -5536,6 +5590,11 @@ def write_state_subset_window_csv(
         "created_epoch", "source", "reason", "usable_for_mbar", "burnin_steps",
         "gamd_lambda",
     ]
+    if registry_has_aux(registry):
+        active_ids = {int(s.state_id) for s in states}
+        fieldnames = _aux_csv_fieldnames(fieldnames)
+        for row, state in zip(rows, states):
+            row.update(aux_csv_cells(state, active_ids))
     with path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
