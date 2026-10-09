@@ -86,36 +86,48 @@ def _phase_frames(task):
     top_path = census._find_topology(phase_dir, adaptive_dir)
     if top_path is None:
         raise FileNotFoundError(f"{phase_dir}: no solute_only.pdb")
-    definition = definition or descriptor_definition(md.load_topology(str(top_path)))
+    own = descriptor_definition(md.load_topology(str(top_path)))
+    if definition is None:
+        definition = own
+    elif own.schema_sha256 != definition.schema_sha256:
+        raise ValueError(f"phase {label}: descriptor schema {own.schema_sha256[:12]} differs from the "
+                         f"campaign's {definition.schema_sha256[:12]} (topology {top_path})")
     wmap = state_id_of_window_from_epoch_map(phase_dir)
     if not wmap:
         raise RuntimeError(f"{phase_dir}: no epoch_window_map.csv")
     samples = load_phase_samples(phase_dir)
+    n_before = len(samples)
     samples["state_id"] = samples["window_id"].map(lambda w: wmap.get(int(w), -1)).astype(np.int64)
     samples["lam_reg"] = samples["state_id"].map(lambda s: registry_lambda.get(int(s), np.nan))
+    n_unmapped = int(n_before - ((samples["state_id"] >= 0) & samples["lam_reg"].notna()).sum())
     samples = samples[(samples["state_id"] >= 0) & (samples["lam_reg"].abs() < 1e-12)]
     samples = samples.drop(columns=["lam_reg"])
     files = sorted(census._trajectory_files(phase_dir), key=lambda t: (t[0], t[1] or 0, str(t[2])))
     blocks = []
+    anchors: Dict[int, int] = {}                     # one stride anchor per replica per phase
     for i, (replica, _start, path) in enumerate(files):
         if Path(path).stat().st_size == 0:
             continue
         nxt = next((s for r, s, _ in files[i + 1:] if r == replica), None)
-        xyz, steps = _read_xtc(path)
+        try:
+            xyz, steps = _read_xtc(path)
+        except Exception as exc:
+            raise RuntimeError(f"cannot read trajectory {path}: {type(exc).__name__}: {exc}") from exc
         if steps.size == 0:
             continue
         keep = np.ones(steps.size, bool) if nxt is None else steps < int(nxt)    # later resume file wins
         if not keep.any():
             continue
         kept = np.nonzero(keep)[0]
-        kept = kept[((steps[kept] - steps[kept][0]) % int(stride_steps)) == 0]
+        anchor = anchors.setdefault(int(replica), int(steps[kept][0]))   # earliest file's first kept step
+        kept = kept[((steps[kept] - anchor) % int(stride_steps)) == 0]
         frames = pd.DataFrame({"replica": int(replica), "step": steps[kept], "pos": kept})
         joined = frames.merge(samples, on=["replica", "step"], how="inner")      # XTC-only frames skipped
         if joined.empty:
             continue
         desc = evaluate_descriptors(xyz[joined["pos"].to_numpy()], definition)
         blocks.append((joined.drop(columns=["pos"]).reset_index(drop=True), desc))
-    return definition, blocks
+    return definition, blocks, n_unmapped
 
 
 def build_frame_table(adaptive_dir: Path, *, epochs: Iterable[int], registry_lambda: Dict[int, float],
@@ -128,20 +140,24 @@ def build_frame_table(adaptive_dir: Path, *, epochs: Iterable[int], registry_lam
     phases, _skipped = census.ordered_phases(root)
     todo = [(label, Path(pd_)) for label, pd_ in phases if phase_epoch(label) in wanted]
     definition = None
+    if todo:
+        top0 = census._find_topology(todo[0][1], root)
+        if top0 is None:
+            raise FileNotFoundError(f"{todo[0][1]}: no solute_only.pdb")
+        import mdtraj as md
+        definition = descriptor_definition(md.load_topology(str(top0)))
     if int(workers) > 1 and len(todo) > 1:
         # spawn, never fork: the driver process may hold CUDA contexts (as discovery_census.run_census)
         with ProcessPoolExecutor(max_workers=int(workers), mp_context=multiprocessing.get_context("spawn")) as pool:
-            results = list(pool.map(_phase_frames, [(l, p, root, None, registry_lambda, stride_steps)
+            results = list(pool.map(_phase_frames, [(l, p, root, definition, registry_lambda, stride_steps)
                                                    for l, p in todo]))
     else:
         results = []
         for l, p in todo:
-            res = _phase_frames((l, p, root, definition, registry_lambda, stride_steps))
-            definition = res[0]
-            results.append(res)
+            results.append(_phase_frames((l, p, root, definition, registry_lambda, stride_steps)))
     cols = {k: [] for k in _ARRAY_FIELDS}
     sources = []
-    for (label, phase_dir), (definition, blocks) in zip(todo, results):
+    for (label, phase_dir), (_def, blocks, n_unmapped) in zip(todo, results):
         n_phase = 0
         for sub, desc in blocks:
             n = len(sub)
@@ -156,7 +172,7 @@ def build_frame_table(adaptive_dir: Path, *, epochs: Iterable[int], registry_lam
             cols["cv2"].append(sub["cv2"].to_numpy(np.float32))
             for k in _DESC_FIELDS:
                 cols[k].append(desc[k])
-        sources.append({"phase": label, "dir": str(phase_dir), "n_frames": int(n_phase)})
+        sources.append({"phase": label, "dir": str(phase_dir), "n_frames": int(n_phase), "n_dropped_unmapped": n_unmapped})
     if definition is None or not cols["step"]:
         raise RuntimeError(f"no lambda = 0 frames in epochs {sorted(wanted)} under {root}")
     arrays = {k: np.concatenate(v) for k, v in cols.items()}

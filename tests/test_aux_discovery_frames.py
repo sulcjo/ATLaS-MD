@@ -38,7 +38,7 @@ def test_samples_dedup_keeps_last_segment(tmp_path: Path):
     assert len(df) == 1 and float(df.cv1.iloc[0]) == 2.0
 
 
-def test_budget_subsamples_uniformly_per_state(tmp_path: Path):
+def test_budget_caps_total_frames(tmp_path: Path):
     make_phase(tmp_path, "epoch_000", {"replica_0.xtc": (0, 0, list(range(300, 300 + 3000 * 40, 3000)))},
                {0: 0.0}, lambda s: 0.0)
     ft = build_frame_table(tmp_path, epochs=[0], registry_lambda={100: 0.0}, stride_steps=3000,
@@ -61,3 +61,23 @@ def test_workers_pool_matches_serial(tmp_path: Path):
     a = build_frame_table(tmp_path, **kw)
     b = build_frame_table(tmp_path, workers=2, **kw)
     assert a.n == b.n == 6 and np.array_equal(a.step, b.step) and np.allclose(a.tors, b.tors)
+
+
+def test_stride_anchored_per_replica_across_resume_files(tmp_path: Path):
+    make_phase(tmp_path, "epoch_000",
+               {"replica_0.xtc": (0, 0, [300, 3300]),
+                "replica_0_resume_from_4800.xtc": (0, 0, list(range(4800, 9301, 300)))},
+               {0: 0.0}, lambda s: 0.0)
+    ft = build_frame_table(tmp_path, epochs=[0], registry_lambda={100: 0.0}, stride_steps=3000,
+                           max_frames=10 ** 6, seed=0)
+    assert sorted(ft.step.tolist()) == [300, 3300, 6300, 9300]
+    assert ft.sources[0]["n_dropped_unmapped"] == 0
+
+
+def test_unmapped_state_counted(tmp_path: Path):
+    make_phase(tmp_path, "epoch_000", {"replica_0.xtc": (0, 0, [300, 3300]),
+                                       "replica_1.xtc": (1, 1, [300, 3300])},
+               {0: 0.0, 1: 0.0}, lambda s: 0.0)
+    ft = build_frame_table(tmp_path, epochs=[0], registry_lambda={100: 0.0}, stride_steps=3000,
+                           max_frames=100, seed=0)
+    assert ft.sources[0]["n_dropped_unmapped"] == 2 and set(ft.state_id) == {100}
