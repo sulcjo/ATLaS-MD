@@ -192,6 +192,12 @@ def build_health_verdict(s: dict, min_neighbor_overlap: float = 0.30) -> dict:
     cv2_row = _check_cv2_resolution(s, checks)
     if cv2_row is not None:
         checks.append(cv2_row)
+    aux_cc = _check_aux_crosscheck(s)
+    if aux_cc is not None:
+        checks.append(aux_cc)
+    aux_w = _check_aux_workers(s)
+    if aux_w is not None:
+        checks.append(aux_w)
     if s.get("aux_states"):
         # Spec Section 15: an auxiliary-state analysis is never PASS until the Stage D diagnostics audit.
         # A CAUTION row caps the banner (FAIL stays FAIL) and survives every overall_from_checks recompute.
@@ -204,6 +210,41 @@ def build_health_verdict(s: dict, min_neighbor_overlap: float = 0.30) -> dict:
         "checks": checks,
         "headline": _headline(s),
     }
+
+
+def _check_aux_crosscheck(s: dict) -> Optional[dict]:
+    """Ordinary-only vs all-states PMF agreement; None unless an aux analysis wrote ``aux_crosscheck``."""
+    name = "Aux ordinary-only crosscheck"
+    cc = s.get("aux_crosscheck")
+    if not isinstance(cc, dict):
+        return None
+    status = cc.get("status")
+    mx = _num(cc.get("max_abs_diff_kcal"))
+    if status == "fail":
+        return {"name": name, "status": FAIL,
+                "detail": f"ordinary-only PMF disagrees with the all-states PMF"
+                          + (f" by {mx:.2f} kcal/mol" if mx is not None else "") + " -- aux bias terms suspect"}
+    if status == "pass":
+        return {"name": name, "status": PASS,
+                "detail": f"max |dF| {mx:.2f} kcal/mol over supported bins" if mx is not None else "agrees"}
+    return {"name": name, "status": NA, "detail": str(cc.get("reason") or "skipped")}
+
+
+def _check_aux_workers(s: dict) -> Optional[dict]:
+    """Descriptive worker table; CAUTION when a worker's best-partner overlap is below the floor."""
+    name = "Aux workers"
+    aw = s.get("aux_workers")
+    if not isinstance(aw, dict):
+        return None
+    rows = aw.get("workers") or []
+    parts = []
+    for r in rows:
+        ov = _num(r.get("best_partner_overlap"))
+        parts.append(f"state {r.get('state_id')} -> {r.get('best_partner')} overlap "
+                     + (f"{ov:.2f}" if ov is not None else "n/a"))
+    detail = "; ".join(parts) + ("; " if parts else "") + "descriptive; no shams, no attribution"
+    bad = [r for r in rows if r.get("overlap_floor_ok") is False]
+    return {"name": name, "status": CAUTION if bad else PASS, "detail": detail}
 
 
 def _headline(s: dict) -> list[dict]:

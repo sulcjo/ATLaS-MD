@@ -5255,6 +5255,46 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
                 warn.append(f"λ-ladder cross-check FAILED: {_lcc.get('reason','contradictory ladder metadata')} -- "
                             f"the cross-check could not be made at all, so no PMF from this run is certified.")
 
+    # CVaux adaptive (Task 15): ordinary-only vs all-states PMF crosscheck + descriptive worker table.
+    # Only when the loader marked auxiliary states (d.meta['aux_states']); legacy runs never reach it.
+    aux_crosscheck_summary=None; aux_workers_summary=None
+    _aux_state_ids=[int(x) for x in (d.meta.get('aux_states') or [])]
+    if _aux_state_ids:
+        try:
+            from gareus.mbar_analysis.crosscheck import aux_ordinary_crosscheck
+            from gareus.adaptive.aux_worker_table import worker_table
+            _ordinary=[k for k in range(d.u_nk.shape[1]) if k not in set(_aux_state_ids)]
+            _bins_by_axis={'cv1':bins}
+            if np.any(np.isfinite(np.asarray(d.cv2,float))):
+                _bins_by_axis['cv2']=make_bins(np.asarray(d.cv2,float)[np.isfinite(np.asarray(d.cv2,float))],40,None,None)
+            _az=getattr(d,'aux_z',None)
+            if _az is None: _az=d.meta.get('aux_z')
+            if _az is not None:
+                _azf=np.asarray(_az,float); _azf=_azf[np.isfinite(_azf)]
+                if _azf.size: _bins_by_axis['z3']=make_bins(_azf,40,None,None)
+            _acc=aux_ordinary_crosscheck(d,m['f_k'],_bins_by_axis,kbt_kcal,ordinary_states=_ordinary)
+            aux_crosscheck_summary={k:v for k,v in _acc.items() if k!='axes'}
+            aux_crosscheck_summary['axes']={a:{k:v for k,v in r.items() if k not in ('edges','pmf_all','pmf_ordinary','counts_all','counts_ordinary')}
+                                            for a,r in _acc['axes'].items()}
+            _rows=[]
+            for _a,_r in _acc['axes'].items():
+                for _i,_e in enumerate(_r.get('pmf_all',[])):
+                    _rows.append((_a,_r['edges'][_i],_r['edges'][_i+1],_e,_r['pmf_ordinary'][_i],_r['counts_all'][_i],_r['counts_ordinary'][_i]))
+            if _rows:
+                import csv as _csv
+                with open(out/'pmf_aux_crosscheck.csv','w',newline='') as _fh:
+                    _w=_csv.writer(_fh); _w.writerow(['axis','edge_lo','edge_hi','pmf_all_kcal','pmf_ordinary_kcal','count_all','count_ordinary']); _w.writerows(_rows)
+                aux_crosscheck_summary['files']={'pmf_aux_crosscheck_csv':str(out/'pmf_aux_crosscheck.csv')}
+            if _acc['status']=='fail':
+                warn.append(f"Aux ordinary-only cross-check FAILED: PMF from ordinary states only disagrees with the all-states PMF by "
+                            f"{_acc.get('max_abs_diff_kcal',float('nan')):.3f} kcal/mol (tolerance {_acc['tolerance_kcal']:.3f}) -- "
+                            f"the auxiliary states' bias terms or sampling are inconsistent with the ordinary ensemble.")
+            aux_workers_summary={'workers':worker_table(d,m['f_k'],aux_states=_aux_state_ids,ordinary_states=_ordinary),
+                                 'attribution':'none (no shams)','model_sha256':d.meta.get('aux_model_sha256')}
+        except Exception as _exc:
+            warn.append(f"Aux crosscheck/worker table unavailable: {type(_exc).__name__}: {_exc}")
+            aux_crosscheck_summary={'status':'skipped','reason':f'{type(_exc).__name__}: {_exc}','axes':{}}
+
     # Never pool epoch_000 into the main PMF/GaMD-boost report: it runs under
     # a different GaMD envelope (the shared-envelope recalibration fires from
     # epoch 0's own sampling and at most once, gareus/adaptive_production.py's
@@ -5361,6 +5401,8 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
     else:
         s['epoch_000_report']={'available':False,'reason':'no epoch_000/rest split available (single-epoch run or non-adaptive-production source)'}
     s['ladder_crosscheck']=ladder_crosscheck_summary
+    if aux_crosscheck_summary is not None: s['aux_crosscheck']=aux_crosscheck_summary
+    if aux_workers_summary is not None: s['aux_workers']=aux_workers_summary
     if _aux_na is not None:
         # Written only for auxiliary-state analyses: gareus_report grades the unaudited rows NA from it.
         s['aux_states']={'reason':_aux_na,'models':[str(x) for x in d.meta.get('aux_models') or []]}

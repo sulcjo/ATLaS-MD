@@ -244,3 +244,107 @@ def ladder_crosscheck(d: Any, f_k_global: np.ndarray, bins, kbt_kcal: float,
         "pmf_full": pmf_full,
         "pmf_lambda0": pmf_lambda0,
     }
+
+
+# ---------------------------------------------------------------------------------------------
+# Auxiliary states: ordinary-only vs all-states PMF crosscheck (CVaux adaptive, Task 15)
+# ---------------------------------------------------------------------------------------------
+def _target_logw(u: np.ndarray, window: np.ndarray, f: np.ndarray) -> np.ndarray:
+    """Per-row log weight at the unbiased target (u = 0): -logsumexp_k(log N_k + f_k - u_nk)."""
+    from scipy.special import logsumexp
+    n_k = np.bincount(window, minlength=u.shape[1]).astype(float)
+    with np.errstate(divide="ignore"):
+        logn = np.log(n_k)
+    a = logn[None, :] + np.asarray(f, float)[None, :] - u
+    a = np.where(np.isfinite(a), a, -np.inf)
+    return -logsumexp(a, axis=1)
+
+
+def _axis_values(d: Any) -> dict:
+    axes = {}
+    cv = getattr(d, "cv", None)
+    if cv is not None:
+        axes["cv1"] = np.asarray(cv, float)
+    cv2 = getattr(d, "cv2", None)
+    if cv2 is not None and np.any(np.isfinite(np.asarray(cv2, float))):
+        axes["cv2"] = np.asarray(cv2, float)
+    z = getattr(d, "aux_z", None)
+    if z is None:
+        z = (getattr(d, "meta", None) or {}).get("aux_z")
+    if z is not None:
+        axes["z3"] = np.asarray(z, float)
+    return axes
+
+
+def aux_ordinary_crosscheck(d: Any, f_k_global: np.ndarray, bins_by_axis: dict, kbt_kcal: float, *,
+                            ordinary_states, tol_kcal: float = DEFAULT_TOL_KCAL) -> dict:
+    """PMF along each axis from all states (global ``f_k_global``) vs from ordinary states only
+    (``f`` re-solved on that subset with ``solve_rows``), both at the unbiased target. A
+    disagreement means the auxiliary states' bias terms are wrong (or aux sampling is
+    inconsistent), not noise. ``fail`` when any supported bin differs by more than
+    ``max(tol, BIN_NOISE_SAFETY_FACTOR x bin noise)``; axes with fewer than MIN_BINS_FOR_VERDICT
+    supported bins are skipped; all skipped -> overall skipped."""
+    from gareus.adaptive.mbar_solve import solve_rows
+    from .storage import select_matrix
+
+    ordinary = np.asarray(sorted(int(x) for x in ordinary_states), dtype=np.int64)
+    window = np.asarray(d.window, dtype=np.int64)
+    rows = np.isin(window, ordinary)
+    if ordinary.size == 0 or not rows.any():
+        return {"status": "skipped", "reason": "no ordinary-state samples", "axes": {},
+                "tolerance_kcal": tol_kcal}
+    u_all = np.asarray(select_matrix(d.u_nk), dtype=np.float64)
+    logw_all = _target_logw(u_all, window, np.asarray(f_k_global, float))
+    u_ord = u_all[rows][:, ordinary]
+    remap = {int(s): i for i, s in enumerate(ordinary)}
+    win_ord = np.fromiter((remap[int(w)] for w in window[rows]), dtype=np.int64, count=int(rows.sum()))
+    f_ord, logw_ord = solve_rows(u_ord, win_ord)
+    w_all = norm_logw(logw_all)
+    w_ord = norm_logw(logw_ord)
+    min_count = _min_bin_count(kbt_kcal, tol_kcal)
+    values = _axis_values(d)
+    out: dict = {}
+    worst = 0.0
+    any_verdict = False
+    any_fail = False
+    for name, edges in bins_by_axis.items():
+        x = values.get(name)
+        if x is None:
+            out[name] = {"status": "skipped", "reason": "axis unavailable"}
+            continue
+        edges = np.asarray(edges, float)
+        fin = np.isfinite(x)
+        pa = pmf_from_weights(x[fin], w_all[fin], edges, kbt_kcal)
+        xo = x[rows]
+        fo = np.isfinite(xo)
+        po = pmf_from_weights(xo[fo], w_ord[fo], edges, kbt_kcal)
+        Fa, Fo = np.asarray(pa["pmf"]), np.asarray(po["pmf"])
+        ca, co = np.asarray(pa["counts"]), np.asarray(po["counts"])
+        ok = np.isfinite(Fa) & np.isfinite(Fo)
+        gate = ok & (ca >= min_count) & (co >= min_count)
+        if int(gate.sum()) < MIN_BINS_FOR_VERDICT:
+            gate = ok & (ca >= MIN_BIN_COUNT_FLOOR) & (co >= MIN_BIN_COUNT_FLOOR)
+        if int(gate.sum()) < MIN_BINS_FOR_VERDICT:
+            out[name] = {"status": "skipped", "n_bins_compared": int(gate.sum()),
+                         "reason": f"fewer than {MIN_BINS_FOR_VERDICT} supported bins"}
+            continue
+        diff = (Fa - Fa[gate].min()) - (Fo - Fo[gate].min())
+        noise = kbt_kcal * np.sqrt(1.0 / np.maximum(ca, 1) + 1.0 / np.maximum(co, 1))
+        limit = np.maximum(tol_kcal, BIN_NOISE_SAFETY_FACTOR * noise)
+        bad = gate & (np.abs(diff) > limit)
+        mx = float(np.max(np.abs(diff[gate])))
+        any_verdict = True
+        any_fail = any_fail or bool(bad.any())
+        worst = max(worst, mx)
+        out[name] = {"status": "fail" if bad.any() else "pass", "max_abs_diff_kcal": mx,
+                     "n_bins_compared": int(gate.sum()), "n_bins_failing": int(bad.sum()),
+                     "edges": edges.tolist(), "pmf_all": Fa.tolist(), "pmf_ordinary": Fo.tolist(),
+                     "counts_all": ca.tolist(), "counts_ordinary": co.tolist()}
+    status = "skipped" if not any_verdict else ("fail" if any_fail else "pass")
+    res = {"status": status, "axes": out, "tolerance_kcal": tol_kcal, "tolerance_source": "fixed_default",
+           "n_ordinary_samples": int(rows.sum())}
+    if any_verdict:
+        res["max_abs_diff_kcal"] = worst
+    else:
+        res["reason"] = "no axis had enough supported bins"
+    return res
