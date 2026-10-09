@@ -465,3 +465,13 @@ def test_load_parquet_refuses_a_temperature_mismatch(tmp_path):
     (tmp_path / "gareus_metadata.json").write_text(json.dumps({"temperature_K": 310.0}))
     with pytest.raises(IntegrityError, match="temperature"):
         load_parquet(tmp_path)
+
+
+def test_explicit_null_aux_phase_kind_on_a_non_aux_job_is_the_default(tmp_path):
+    """Follow-up: YAML `aux_phase_kind: null` (None) without --aux-cv-model is not an explicit aux flag."""
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text("seq: GA\ncv1: contacts\nout: " + str(tmp_path / "o") + "\naux_phase_kind: null\n"
+                   "aux_equilibrium_eligible: null\n")
+    from gareus.cli import parse_args
+    a = parse_args(["--config", str(cfg)])
+    assert a.aux_cv_model is None and a.aux_phase_kind in (None, "pilot") and not a.aux_equilibrium_eligible

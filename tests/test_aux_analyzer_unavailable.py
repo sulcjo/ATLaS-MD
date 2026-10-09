@@ -105,3 +105,36 @@ def test_legacy_analysis_has_no_aux_marker(tmp_path):
     assert "aux_states" not in s
     assert all(R not in c["detail"] for c in s["health"]["checks"])
     assert all(R not in w for w in s["warnings"])
+
+
+# Follow-up: the overall banner is never PASS on aux data (capped at CAUTION; FAIL stays FAIL) --------
+
+CAP = "auxiliary states: diagnostics audit pending (Stage D)"
+
+
+def test_aux_summary_with_all_pass_rows_is_capped_at_caution():
+    s = _summary()
+    s["aux_states"] = {"reason": R, "models": ["a" * 64]}
+    v = gr.build_health_verdict(s, 0.30)
+    assert all(c["status"] in (gr.PASS, gr.NA, gr.CAUTION) for c in v["checks"])
+    assert v["overall"] == "CAUTION"
+    cap = [c for c in v["checks"] if c["detail"] == CAP]
+    assert len(cap) == 1 and cap[0]["status"] == gr.CAUTION
+    assert gr.overall_from_checks(v["checks"]) == "CAUTION"      # analyzer recomputes keep the cap
+
+
+def test_aux_summary_with_a_fail_row_stays_fail():
+    s = _summary()
+    s["aux_states"] = {"reason": R, "models": ["a" * 64]}
+    s["mbar"]["converged"] = False
+    assert gr.build_health_verdict(s, 0.30)["overall"] == "FAIL"
+
+
+def test_legacy_summary_verdict_and_bytes_unchanged():
+    s = _summary()
+    v = gr.build_health_verdict(copy.deepcopy(s), 0.30)
+    assert v["overall"] == "PASS" and all(c["detail"] != CAP for c in v["checks"])
+    # Same verdict bytes with and without an (absent/falsy) aux key, and no cap row.
+    s2 = copy.deepcopy(s)
+    s2["aux_states"] = None
+    assert json.dumps(gr.build_health_verdict(s2, 0.30), sort_keys=True) == json.dumps(v, sort_keys=True)

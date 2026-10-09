@@ -154,6 +154,9 @@ def _human_count(n: Optional[float]) -> str:
 # ===========================================================================
 # verdict
 # ===========================================================================
+AUX_OVERALL_CAP_REASON = "auxiliary states: diagnostics audit pending (Stage D)"
+
+
 def _aux_unavailable(s: dict, name: str) -> Optional[dict]:
     """CVaux Stage C final fix wave I2 (spec Section 15): an auxiliary-state analysis (``s['aux_states']``,
     written only by such an analysis) grades the not-yet-audited overlap/ladder rows NA, never PASS.
@@ -189,6 +192,10 @@ def build_health_verdict(s: dict, min_neighbor_overlap: float = 0.30) -> dict:
     cv2_row = _check_cv2_resolution(s, checks)
     if cv2_row is not None:
         checks.append(cv2_row)
+    if s.get("aux_states"):
+        # Spec Section 15: an auxiliary-state analysis is never PASS until the Stage D diagnostics audit.
+        # A CAUTION row caps the banner (FAIL stays FAIL) and survives every overall_from_checks recompute.
+        checks.append({"name": "Auxiliary states", "status": CAUTION, "detail": AUX_OVERALL_CAP_REASON})
 
     overall = overall_from_checks(checks)
 

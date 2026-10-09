@@ -1451,7 +1451,7 @@ def _validate_aux_cv_args(p: argparse.ArgumentParser, args: argparse.Namespace) 
         # every non-aux job's recorded args -- never error.
         if getattr(args, "aux_equilibrium_eligible", False):
             p.error("--aux-equilibrium-eligible needs --aux-cv-model (it marks auxiliary segments only)")
-        if str(getattr(args, "aux_phase_kind", "pilot")) != "pilot":
+        if getattr(args, "aux_phase_kind", None) not in (None, "pilot"):     # explicit null = default
             p.error(f"--aux-phase-kind {args.aux_phase_kind} needs --aux-cv-model (it is frozen into auxiliary "
                     "window snapshots only)")
         return
