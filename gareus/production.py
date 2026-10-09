@@ -32,7 +32,7 @@ import numpy as np
 from .branding import product_label
 from .io import BufferedCsvDictWriter, write_json, read_json_file, _json_ready, acquire_run_lock
 from .logger import DistanceLogger, is_gamd_production_phase
-from .store import ParquetSampleWriter, ParquetExchangeWriter, SegmentRegistry, WindowSnapshot, parse_gamd_boost_components, finalize_segment, reseal_parent_for_resume
+from .store import ParquetSampleWriter, ParquetExchangeWriter, SegmentRegistry, WindowSnapshot, parse_gamd_boost_components, finalize_segment
 from .progress import GuiProgressSink, release_openmm_contexts
 from .lifecycle import _graceful_shutdown, _register_graceful_shutdown
 from .units import kcal_to_kj, kcal_a2_to_kj_nm2
@@ -117,7 +117,7 @@ from .replica_admission import advance_replicas, effective_limits, make_dispatch
 from .phase_timers import PhaseTimers, aggregate_npt_timings
 from .provenance import (record_replica_admission, initialize_run_manifest, ensure_run_manifest_initialized, update_run_manifest,
                          finalize_run_manifest, pair_model_sha256)
-from .kernel_identity import (EXCHANGE_ENERGY_VERSION, FAST_SCALAR_MODES, LEGACY_TWO_TERM_MODES,
+from .kernel_identity import (FAST_SCALAR_MODES, LEGACY_TWO_TERM_MODES,
                               RESIDUAL_EVALUATOR_VERSION, exchange_energy_version_for_args,
                               is_aux_kernel_record, kernel_identity_for_run)
 
@@ -5152,6 +5152,8 @@ def write_final_run_report(out_dir: Path, args, centers_a, k_list, exchange_stat
     lines.append("## MBAR/US input validation")
     lines.append("")
     lines.append(f"Status: **{status_word(mbar)}**")
+    if getattr(args, "_aux_runtime", None) is not None and mbar.get("reason"):
+        lines.append(f"Reason: {mbar['reason']}")          # final fix wave M5: aux runs say why (SKIPPED)
     lines.append(f"Samples: **{int(mbar.get('n_samples', 0) or 0)}**")
     if mbar.get("sample_counts_by_window"):
         counts = ", ".join(str(x) for x in mbar.get("sample_counts_by_window", []))
@@ -5173,6 +5175,8 @@ def write_final_run_report(out_dir: Path, args, centers_a, k_list, exchange_stat
     lines.append("## GaMD boost/reweighting diagnostics")
     lines.append("")
     lines.append(f"Status: **{status_word(gamd)}**")
+    if getattr(args, "_aux_runtime", None) is not None and gamd.get("reason"):
+        lines.append(f"Reason: {gamd['reason']}")
     if gamd.get("n_finite", 0):
         lines.append(f"Finite boost samples: **{int(gamd.get('n_finite', 0))} / {int(gamd.get('n_total', 0))}**")
         lines.append(f"Boost mean ± sd: **{float(gamd.get('boost_mean_kcal_mol', float('nan'))):.3f} ± {float(gamd.get('boost_sd_kcal_mol', float('nan'))):.3f} kcal/mol**")
@@ -8157,9 +8161,14 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             applied_window_key=_aux_window_order_key(centers_a, k_list, secondary_cv_centers,
                                                      secondary_cv_k_kcal_list, nrep))
         # Carry-over 8: the storage adapter sees the solvated start PDB's topology, never the in-memory one.
+        from .auxiliary_cv.sample_schema import runtime_precision_info
+        # Final fix wave I4c: the Precision property is read on replica 0's own worker; a failed read is
+        # warned about once and recorded (precision_fallback) in the samples' runtime block.
         _aux_io = aux_io_runtime(args._aux_runtime, state_definition=_aux_definition,
                                  topology=solvated_start_topology(out_dir), args=args,
-                                 platform=platform, context=sims[0].context)
+                                 platform=platform, context=sims[0].context,
+                                 precision_info=_sim_pool.submit(0, runtime_precision_info, platform.getName(),
+                                                                 platform, sims[0].context).result())
         if _aux_io.topology_sha256 != _aux_whole_topology_sha:
             raise RuntimeError("auxiliary topology identity is not the solvated start PDB's "
                                f"({_aux_io.topology_sha256} vs {_aux_whole_topology_sha})")
@@ -8167,6 +8176,17 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             args._aux_runtime, use_fast_path=_use_fast_cv_path, fast_forces=_fast_aux_forces, unit=unit,
             schema=_aux_io.sample_schema, models=_aux_io.models)
     if _aux_io is not None:
+        # Final fix wave M2: every auxiliary refusal runs before the segment is registered -- the boundary
+        # alignment check too (same resolved intervals as the production loop's distance_interval).
+        from .auxiliary_cv.runtime_io import check_exchange_boundary_alignment
+        _aux_distance_interval = int(getattr(args, "distance_output_interval", 0) or 0)
+        if _aux_distance_interval <= 0:
+            _aux_distance_interval = max(1, min(int(args.report_interval), int(args.exchange_interval)))
+        _aux_distance_interval = max(1, _aux_distance_interval)
+        for _note in check_exchange_boundary_alignment(
+                exchange_interval=int(args.exchange_interval), distance_interval=_aux_distance_interval,
+                traj_interval=effective_traj_interval, calib_steps=int(calib_steps)):
+            print(f"WARNING: {_note}", flush=True)
         _aux_parent_seg_id = _parent_seg_id
         if fast_resume:
             # Task 14 F4: the binding, ledger and duplicate refusals run (read-only) before the resumed segment
@@ -8201,6 +8221,9 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         from .auxiliary_cv.runtime_io import ExchangeEventCounter
         _exchange_seq = ExchangeEventCounter()
         _aux_parity = parity_context(_aux_io.state_definition["windows"], beta)
+        # Final fix wave I4a: strict k_max lookup, resolved once (raises if an active state's model has none).
+        from .auxiliary_cv.offline import parity_bound
+        _aux_parity_k_max, _aux_parity_centers = parity_bound(_aux_parity, _aux_io.sample_schema.model_shas[0])
         _aux_event_kw = {"event_schema": EXCHANGE_EVENT_SCHEMA}
     parquet_exchange_writer = ParquetExchangeWriter(
         out_dir / "exchanges" / _seg_id,
@@ -8429,11 +8452,9 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             if _aux_io is not None:
                 from .auxiliary_cv.runtime_io import check_runtime_parity
                 from .auxiliary_cv.sample_schema import PARITY_TOLERANCE
-                _sha = _aux_io.sample_schema.model_shas[0]
                 # Carry-over 6: precision from the payload runtime block (the one the sample writer records).
                 check_runtime_parity(aux_z, aux_pos_z, beta=float(beta),
-                                     k_max_kcal=_aux_parity["k_max_kcal"].get(_sha, 0.0),
-                                     centers=_aux_parity["centers"].get(_sha, []),
+                                     k_max_kcal=_aux_parity_k_max, centers=_aux_parity_centers,
                                      tolerance=PARITY_TOLERANCE[_aux_io.runtime["precision"]])
             ss_centers_arr = ss_centers_arr_global
             ss_k_arr = ss_k_kcal_arr_global
@@ -9000,12 +9021,9 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         if distance_interval <= 0:
             distance_interval = max(1, min(int(args.report_interval), int(args.exchange_interval)))
         distance_interval = max(1, distance_interval)
-        if _aux_io is not None:
-            from .auxiliary_cv.runtime_io import check_exchange_boundary_alignment
-            for _note in check_exchange_boundary_alignment(
-                    exchange_interval=int(args.exchange_interval), distance_interval=distance_interval,
-                    traj_interval=effective_traj_interval, calib_steps=int(calib_steps)):
-                print(f"WARNING: {_note}", flush=True)
+        if _aux_io is not None and distance_interval != _aux_distance_interval:
+            raise RuntimeError(f"auxiliary run: resolved distance_interval {distance_interval} differs from the "
+                               f"one checked before segment registration ({_aux_distance_interval})")
 
         # Article-style GaREUS: the GaMD setup was already performed once above and
         # copied into every replica.  Do not run per-replica calibration/equilibration
@@ -9168,6 +9186,11 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     if _aux_reseal_plan is None:
                         raise RuntimeError("auxiliary resume loaded a checkpoint without its pre-registration "
                                            "checks (no replica checkpoint files in the manifest); refusing")
+                    if int(_aux_reseal_plan["checkpoint_step"]) != int(manifest.get("absolute_step", 0)):
+                        # Final fix wave M7: the re-seal cut must be the checkpoint that was actually loaded.
+                        raise RuntimeError(f"auxiliary resume: the re-seal plan's checkpoint step "
+                                           f"{_aux_reseal_plan['checkpoint_step']} is not the loaded checkpoint's "
+                                           f"absolute_step {manifest.get('absolute_step')}; refusing")
                     _aux_reseal_records = reseal_chain_for_resume(
                         _seg_registry, _aux_reseal_plan["checkpoint_segment_id"],
                         _aux_reseal_plan["checkpoint_step"], exclude=_seg_id)
@@ -9186,6 +9209,11 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 # Record the absolute start step of the resumed segment.
                 _seg_registry.set_segment_start_step(_seg_id, int(manifest.get("absolute_step", 0)))
             else:
+                if _aux_io is not None:
+                    # Final fix wave M1: an auxiliary fast resume whose checkpoint load found nothing refuses
+                    # like the non-fast path (committed rows would be pooled twice); the discard stays armed.
+                    from .auxiliary_cv.runtime_io import refuse_aux_resume_without_checkpoint
+                    refuse_aux_resume_without_checkpoint(out_dir)
                 _aux_resume_loading = False
                 print("    --resume requested, but no production checkpoint manifest was found; starting production from step 0")
                 # No checkpoint: any previously-running segment has no valid
