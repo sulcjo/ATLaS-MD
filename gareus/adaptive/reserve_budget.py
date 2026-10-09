@@ -77,6 +77,7 @@ class ReserveAllowance:
     n_rungs: Optional[int] = None
     add_rung_centres: Optional[int] = None
     resolution_centres: Optional[int] = None
+    aux_slots: int = 0
 
 
 def _centres(slots: Optional[int], n_rungs: Optional[int]) -> Optional[int]:
@@ -87,7 +88,7 @@ def _centres(slots: Optional[int], n_rungs: Optional[int]) -> Optional[int]:
 
 def reserve_allowances(max_replicas: int, n_active_states: int, reserve: Optional[Mapping[str, Any]], *,
                        n_rungs: Optional[int] = None, add_rung_taken: Optional[int] = None,
-                       resolution_share: float = RESOLUTION_SHARE) -> ReserveAllowance:
+                       resolution_share: float = RESOLUTION_SHARE, aux_slots: int = 0) -> ReserveAllowance:
     """Split the live free slots (``max_replicas - n_active_states``) for one epoch (spec P1/3.3).
 
     ``resolution_share`` is ``refine_budget_fraction`` (spec 3.3; default the spec's 0.5)."""
@@ -100,11 +101,13 @@ def reserve_allowances(max_replicas: int, n_active_states: int, reserve: Optiona
     recorded = (reserve or {}).get("max_replicas")
     reason = "cap_changed" if recorded is not None and int(recorded) != cap else "reserve"
     free = max(0, cap - int(n_active_states))
+    aux = max(0, min(int(aux_slots), free))
+    free -= aux
     add_rung = int(math.floor(ADD_RUNG_SHARE * free))
     taken = add_rung if add_rung_taken is None else min(max(0, int(add_rung_taken)), add_rung)
     resolution = int(math.floor(float(resolution_share) * (free - taken)))
     return ReserveAllowance(True, reason, free, add_rung, resolution, n_rungs,
-                            _centres(add_rung, n_rungs), _centres(resolution, n_rungs))
+                            _centres(add_rung, n_rungs), _centres(resolution, n_rungs), aux)
 
 
 __all__ = ["ADD_RUNG_SHARE", "RESOLUTION_SHARE", "ReserveAllowance", "layout_reserve_record",

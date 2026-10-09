@@ -8102,6 +8102,8 @@ class AdaptiveProductionController:
         if kind == "respring":
             parent = self.registry.get_state(int(action[1]))
             return per_centre - (len(self._centre_members(parent)) if parent is not None and parent.active else 0)
+        if kind == "admit_aux":
+            return 1
         if kind == "add_rung":
             lam = float(action[1])
             policy = AdaptiveDecisionPolicy()
@@ -8152,6 +8154,11 @@ class AdaptiveProductionController:
             plan, added = {}, self._states_added_by(action)
         elif kind == "respace_ladder":
             return self._validate_respace_ladder(action[1], action[2])
+        elif kind == "admit_aux":
+            aux_plan, refusal = self._validate_admit_aux(action)
+            if refusal is not None:
+                return None, refusal
+            plan, added = aux_plan, 1
         else:
             raise ValueError(f"unknown adaptive-production action {kind!r}")
         budget = self._budget_refusal(kind, added)
@@ -8159,6 +8166,58 @@ class AdaptiveProductionController:
             detail = budget.pop("detail")
             return None, ("max_replicas_budget", detail, budget)
         return {"plan": plan}, None
+
+    def _validate_admit_aux(self, action: Tuple) -> Tuple[Optional[Dict[str, Any]], Optional[Tuple]]:
+        """Validate one ``admit_aux`` action; mutates nothing.
+
+        Actions are validated one at a time against the live registry (each earlier accepted
+        action already executed), so worker count, duplicates and the model sha are read from
+        the registry itself; no pending bookkeeping exists to double count."""
+        _, parent_id, params = action[0], action[1], action[2]
+        parent = self.registry.get_state(int(parent_id))  # None for an unknown id
+        if parent is None:
+            return None, ("unknown_state", f"parent {parent_id} not in registry", {})
+        if not parent.active:
+            return None, ("inactive", f"parent {parent_id} is retired", {})
+        if is_auxiliary_state(parent):
+            return None, ("aux_parent_is_aux", f"parent {parent_id} is itself a worker", {})
+        if abs(float(parent.gamd_lambda or 0.0)) > 1.0e-12:
+            return None, ("aux_parent_not_lambda0", f"parent lambda {parent.gamd_lambda} is not 0", {})
+        sha = str(params["aux_model_sha256"])
+        workers = [s for s in self.registry.all_states() if is_auxiliary_state(s)]
+        shas = {str(aux_params(s)["aux_model_sha256"]) for s in workers}
+        if shas and shas != {sha}:
+            return None, ("aux_model_mismatch", f"campaign model {sorted(shas)} vs {sha}", {})
+        key = (int(parent_id), round(float(params["aux_center"]), 6), round(float(params["aux_k_kcal_mol"]), 6))
+        for s in workers:
+            if not s.active:
+                continue
+            a = aux_params(s)
+            if (int(a["spawn_parent_state_id"]), round(float(a["aux_center"]), 6),
+                    round(float(a["aux_k_kcal_mol"]), 6)) == key:
+                return None, ("aux_duplicate", f"worker {key} already present", {})
+        n_workers = sum(1 for s in workers if s.active)
+        slots = int(getattr(self.policy, "aux_reserve_slots", 0))
+        if n_workers + 1 > slots:
+            return None, ("aux_budget", f"{n_workers} workers + 1 > aux slice {slots}",
+                          {"n_workers": n_workers, "aux_reserve_slots": slots})
+        return {"parent": parent, "params": dict(params)}, None
+
+    def _execute_admit_aux(self, epoch: int, action: Tuple, plan: Dict[str, Any]) -> None:
+        parent, params = plan["parent"], plan["params"]
+        provenance = dict(action[4].get("aux") or {}) if len(action) > 4 and action[4] else {}
+        core = {"role": "auxiliary", "aux_center": float(params["aux_center"]),
+                "aux_k_kcal_mol": float(params["aux_k_kcal_mol"]),
+                "aux_model_sha256": str(params["aux_model_sha256"]),
+                "state_instance_id": None, "spawn_parent_state_id": int(parent.state_id),
+                "admitted_epoch": int(epoch)}
+        meta = {AUX_METADATA_KEY: {**provenance, **core}}  # core keys last: provenance never overrides
+        self.registry.add_state(parent.primary_center, parent.primary_k, parent.secondary_center,
+                                parent.secondary_k, gamd_sigma0p=parent.gamd_sigma0p,
+                                gamd_sigma0d=parent.gamd_sigma0d, gamd_lambda=0.0,
+                                parent_state_id=int(parent.state_id), epoch=int(epoch),
+                                source="adaptive_production_aux", reason=str(action[3]),
+                                burnin_steps=int(params.get("burnin_steps", 0)), metadata=meta)
 
     def _execute_action(self, epoch: int, action: Tuple, plan: Dict[str, Any]) -> None:
         """Apply one validated action from its plan."""
@@ -8183,6 +8242,8 @@ class AdaptiveProductionController:
             else:
                 self._add_centre_on_every_rung(epoch, child["params"], parent=parent, source="tica_coverage",
                                                reason=reason, metadata=dict(action[4]))
+        elif kind == "admit_aux":
+            self._execute_admit_aux(epoch, action, plan["plan"])
         elif kind == "add_rung":
             _, lambda_new, reason = action
             self._add_rung_at_every_centre(epoch, float(lambda_new), str(reason))
