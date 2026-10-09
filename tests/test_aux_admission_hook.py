@@ -1,0 +1,201 @@
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+
+from gareus.adaptive import aux_admission_io as H
+from gareus.adaptive.aux_discovery.validation import ValidationStatus
+from gareus.adaptive_production import AdaptiveDecisionPolicy, AdaptiveProductionController, WindowStateRegistry
+
+
+def _args(tmp):
+    return SimpleNamespace(out=str(tmp), traj_interval=300, distance_output_interval=300, exchange_interval=3000,
+                           timestep_fs=3.5, adaptive_production_aux_settings_override=False, temperature_k=300.0,
+                           gamd_production_steps=60000)
+
+
+def _registry():
+    r = WindowStateRegistry()
+    for c in (0.0, 0.5):
+        r.add_state(c, 10.0, 0.0, 2.0, gamd_lambda=0.0)
+    return r
+
+
+def _run(ad, tmp, registry=None, epoch=1, args=None):
+    return H.run_epoch_aux_discovery(
+        adaptive_dir=ad, epoch_dir=ad / f"epoch_{epoch:03d}", epoch=epoch, registry=registry or _registry(),
+        diagnostics={}, actions=[], policy=AdaptiveDecisionPolicy(aux_discovery=True, aux_reserve_slots=4),
+        args=args or _args(tmp), out_dir=tmp, phase_dirs=[])
+
+
+def _ok_validation(monkeypatch):
+    monkeypatch.setattr(H, "check_validation_record", lambda *a, **k: ValidationStatus(True, "ok", 5.0))
+
+
+def test_skips_epoch_zero_and_after_admission(tmp_path):
+    ad = tmp_path / "adaptive_production"; ad.mkdir()
+    pol = AdaptiveDecisionPolicy(aux_discovery=True)
+    out = H.run_epoch_aux_discovery(adaptive_dir=ad, epoch_dir=ad / "epoch_000", epoch=0, registry=_registry(),
+                                    diagnostics={}, actions=[("extend", 0, "x")], policy=pol, args=_args(tmp_path),
+                                    out_dir=tmp_path, phase_dirs=[])
+    assert out == [("extend", 0, "x")] and not (ad / "epoch_000" / "aux_discovery_report.json").exists()
+    (ad / "aux_admission.json").write_text("{}")
+    out = H.run_epoch_aux_discovery(adaptive_dir=ad, epoch_dir=ad / "epoch_001", epoch=1, registry=_registry(),
+                                    diagnostics={}, actions=[], policy=pol, args=_args(tmp_path),
+                                    out_dir=tmp_path, phase_dirs=[])
+    assert out == []
+
+
+def test_never_raises_and_reports_error(tmp_path, monkeypatch):
+    ad = tmp_path / "adaptive_production"; (ad / "epoch_001").mkdir(parents=True)
+    monkeypatch.setattr(H, "_build_frames", lambda **kw: (_ for _ in ()).throw(RuntimeError("boom")))
+    out = _run(ad, tmp_path)
+    rep = json.loads((ad / "epoch_001" / "aux_discovery_report.json").read_text())
+    assert out == [] and rep["status"] == "error" and "boom" in rep["error"]
+
+
+def test_validation_missing_blocks_admission(tmp_path, monkeypatch):
+    ad = tmp_path / "adaptive_production"; (ad / "epoch_001").mkdir(parents=True)
+    fake = H.DiscoveryResultStub.ok_with_workers([(0, 1.2, 2.0)])
+    monkeypatch.setattr(H, "_build_frames", lambda **kw: object())
+    monkeypatch.setattr(H, "_discover", lambda **kw: fake)
+    out = _run(ad, tmp_path)
+    rep = json.loads((ad / "epoch_001" / "aux_discovery_report.json").read_text())
+    assert out == [] and rep["status"] == "validation_missing" and not (ad / "aux_admission.json").exists()
+
+
+def test_alignment_check_refuses_doomed_admission(tmp_path, monkeypatch):
+    a = _args(tmp_path); a.traj_interval = 300; a.distance_output_interval = 300
+    assert H.phase_alignment_ok(a, calib_steps=1_010_000)[0] is False
+    assert H.phase_alignment_ok(a, calib_steps=0)[0] is True
+
+
+def test_alignment_uses_production_distance_interval_default(tmp_path):
+    a = _args(tmp_path); a.distance_output_interval = 0; a.report_interval = 2500
+    ok, why = H.phase_alignment_ok(a, calib_steps=0)       # resolved: min(2500, 3000) = 2500 does not divide 3000
+    assert ok is False and "distance_interval" in why
+
+
+def test_calib_steps_follow_the_global_shared_setup_file(tmp_path):
+    ad = tmp_path / "adaptive_production"
+    (ad / "global_shared_gamd_setup").mkdir(parents=True)
+    a = _args(tmp_path)
+    assert H._calib_steps_for_phase(a, ad) == 0                    # nothing recorded, no GaMD step args
+    a.gamd_cmd_prep_steps, a.gamd_cmd_steps, a.gamd_equil_prep_steps, a.gamd_equil_steps = 10, 20, 30, 40
+    assert H._calib_steps_for_phase(a, ad) == 100                  # a phase that calibrates itself
+    (ad / "global_shared_gamd_setup" / "shared_gamd_setup_globals.json").write_text(
+        json.dumps({"calibration_steps": 1_010_000}))
+    assert H._calib_steps_for_phase(a, ad) == 1_010_000            # the imported record wins (production.py:4488)
+    other = tmp_path / "elsewhere"; other.mkdir()
+    (other / "shared_gamd_setup_globals.json").write_text(json.dumps({"calibration_steps": 7}))
+    a.shared_gamd_setup_dir = str(other)
+    assert H._calib_steps_for_phase(a, ad) == 7
+
+
+def test_doomed_calibration_blocks_admission(tmp_path, monkeypatch):
+    ad = tmp_path / "adaptive_production"; (ad / "epoch_001").mkdir(parents=True)
+    (ad / "global_shared_gamd_setup").mkdir()
+    (ad / "global_shared_gamd_setup" / "shared_gamd_setup_globals.json").write_text(
+        json.dumps({"calibration_steps": 1_010_000}))
+    _ok_validation(monkeypatch)
+    monkeypatch.setattr(H, "_build_frames", lambda **kw: object())
+    monkeypatch.setattr(H, "_discover", lambda **kw: H.DiscoveryResultStub.ok_with_workers([(0, 1.2, 2.0)]))
+    out = _run(ad, tmp_path)
+    rep = json.loads((ad / "epoch_001" / "aux_discovery_report.json").read_text())
+    assert out == [] and rep["status"] == "alignment" and not (ad / "aux_admission.json").exists()
+
+
+def test_admission_freezes_files_and_emits_actions(tmp_path, monkeypatch):
+    ad = tmp_path / "adaptive_production"; (ad / "epoch_001").mkdir(parents=True)
+    _ok_validation(monkeypatch)
+    monkeypatch.setattr(H, "_build_frames", lambda **kw: object())
+    monkeypatch.setattr(H, "_discover", lambda **kw: H.DiscoveryResultStub.ok_with_workers([(1, 1.2, 2.0)]))
+    out = _run(ad, tmp_path)
+    assert len(out) == 1 and out[0][0] == "admit_aux" and out[0][1] == 1
+    assert out[0][2]["burnin_steps"] == 60000 and out[0][2]["aux_model_sha256"] == "e" * 64
+    adm = json.loads((ad / "aux_admission.json").read_text())
+    assert adm["schema"] == "atlas-aux-admission-v1" and adm["workers"][0]["parent_state_id"] == 1
+    assert (ad / "aux_model.json").exists() and (ad / "aux_eval_partition.pkl").exists()
+
+
+class _FailingPartition:
+    def to_file(self, path):
+        Path(path).write_bytes(b"half")
+        Path(str(path) + ".sha256").write_text("x")
+        raise OSError("disk full")
+
+
+def test_failure_after_freeze_started_removes_partial_files(tmp_path, monkeypatch):
+    ad = tmp_path / "adaptive_production"; (ad / "epoch_001").mkdir(parents=True)
+    _ok_validation(monkeypatch)
+    res = H.DiscoveryResultStub.ok_with_workers([(1, 1.2, 2.0)])
+    res.eval_partition = _FailingPartition()
+    monkeypatch.setattr(H, "_build_frames", lambda **kw: object())
+    monkeypatch.setattr(H, "_discover", lambda **kw: res)
+    out = _run(ad, tmp_path)
+    rep = json.loads((ad / "epoch_001" / "aux_discovery_report.json").read_text())
+    assert out == [] and rep["status"] == "error" and "disk full" in rep["error"]
+    leftovers = [p.name for p in ad.iterdir() if p.name.startswith(("aux_model", "aux_eval_partition", "aux_admission"))]
+    assert leftovers == []
+
+
+def test_inject_phase_args(tmp_path):
+    ad = tmp_path / "adaptive_production"; ad.mkdir()
+    pa = SimpleNamespace(aux_cv_model=None, aux_phase_kind="pilot", aux_equilibrium_eligible=False,
+                         windows_2d_csv=str(tmp_path / "w.csv"))
+    (tmp_path / "w.csv").write_text("state_id,state_role\n0,ordinary\n")
+    H.inject_aux_phase_args(pa, ad)
+    assert pa.aux_cv_model is None
+    (ad / "aux_admission.json").write_text(json.dumps({"schema": "atlas-aux-admission-v1"}))
+    (ad / "aux_model.json").write_text("{}")
+    (tmp_path / "w.csv").write_text("state_id,state_role\n0,ordinary\n1,auxiliary\n")
+    H.inject_aux_phase_args(pa, ad)
+    assert pa.aux_cv_model == str(ad / "aux_model.json") and pa.aux_phase_kind == "production"
+    assert pa.aux_equilibrium_eligible is True
+
+
+def _admitted_registry(epoch=1, burnin=60000):
+    r = _registry()
+    ctl = AdaptiveProductionController(r, policy=AdaptiveDecisionPolicy(aux_discovery=True, aux_reserve_slots=4))
+    ctl.apply_actions(epoch, [("admit_aux", 1, {"aux_center": 1.2, "aux_k_kcal_mol": 2.0, "aux_model_sha256": "e" * 64,
+                                                "burnin_steps": burnin}, "t", {"aux": {"placement_rank": 0}})])
+    assert not ctl.refused_actions
+    return r
+
+
+def test_set_worker_burnin_touches_only_this_epochs_provisional_workers(tmp_path):
+    ad = tmp_path / "adaptive_production"; ad.mkdir()
+    (ad / "aux_admission.json").write_text(json.dumps({"schema": "atlas-aux-admission-v1",
+                                                       "workers": [{"parent_state_id": 1}]}))
+    r = _admitted_registry()
+    ordinary = [s.burnin_steps for s in r.all_states() if s.metadata.get("aux") is None]
+    n = H.set_worker_burnin(r, 45000, epoch=1, provisional=60000, adaptive_dir=ad)
+    workers = [s for s in r.all_states() if s.metadata.get("aux")]
+    assert n == 1 and [s.burnin_steps for s in workers] == [45000]
+    assert [s.burnin_steps for s in r.all_states() if s.metadata.get("aux") is None] == ordinary
+    assert json.loads((ad / "aux_admission.json").read_text())["workers"][0]["burnin_steps"] == 45000
+    assert H.set_worker_burnin(r, 1, epoch=1, provisional=60000, adaptive_dir=ad) == 0   # no longer provisional
+    assert H.set_worker_burnin(r, 1, epoch=2, provisional=45000, adaptive_dir=ad) == 0   # other epoch
+
+
+def test_refused_admission_is_unfrozen_so_next_boundary_retries(tmp_path):
+    ad = tmp_path / "adaptive_production"; (ad / "epoch_001").mkdir(parents=True)
+    for name in ("aux_model.json", "aux_admission.json", "aux_eval_partition.pkl", "aux_eval_partition.pkl.sha256"):
+        (ad / name).write_text("x")
+    (ad / "epoch_001" / "aux_discovery_report.json").write_text(json.dumps({"status": "ok"}))
+    actions = [("admit_aux", 1, {}, "t")]
+    H.annotate_report_with_refusals(ad, ad / "epoch_001", actions, [{"action": "admit_aux", "reason": "aux_budget", "index": 0}])
+    rep = json.loads((ad / "epoch_001" / "aux_discovery_report.json").read_text())
+    assert rep["apply"]["refused"][0]["reason"] == "aux_budget" and rep["status"] == "refused_by_applier"
+    assert not (ad / "aux_admission.json").exists() and not (ad / "aux_model.json").exists()
+
+
+def test_driver_set_worker_burnin_wrapper(tmp_path):
+    from gareus.adaptive_production import _set_worker_burnin
+    ad = tmp_path / "adaptive_production"; ad.mkdir()
+    r = _admitted_registry()
+    assert _set_worker_burnin(r, 1, ad, next_phase_steps=0, provisional_steps=60000) == 0   # scheduled: unchanged
+    assert _set_worker_burnin(r, 1, ad, next_phase_steps=30000, provisional_steps=60000) == 1
+    assert [s.burnin_steps for s in r.all_states() if s.metadata.get("aux")] == [30000]

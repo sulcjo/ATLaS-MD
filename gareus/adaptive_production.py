@@ -7476,6 +7476,8 @@ def run_scheduled_adaptive_epoch(
         seg_args.gamd_production_steps = int(steps)
         seg_args.window_mode = "adaptive"
         seg_args.windows_2d_csv = str(windows_csv)
+        from .adaptive.aux_admission_io import inject_aux_phase_args  # noqa: PLC0415
+        inject_aux_phase_args(seg_args, epoch_dir.parent)
         seg_args.adaptive_feedback_enabled = False
         seg_args.adaptive_feedback_pilot = False
         seg_args.adaptive_feedback_final_production = False
@@ -9105,6 +9107,8 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                 print(f"    Adaptive-production epoch {epoch + 1}/{max_epochs}: checkpoint manifest found; resuming from {epoch_dir}")
             if current_windows_csv is not None:
                 epoch_args.windows_2d_csv = str(current_windows_csv)
+                from .adaptive.aux_admission_io import inject_aux_phase_args  # noqa: PLC0415
+                inject_aux_phase_args(epoch_args, adaptive_dir)
             if bool(policy.propagate_seed_bank) and current_seed_bank is not None and Path(current_seed_bank).exists():
                 epoch_args.seed_conformers_dir = Path(current_seed_bank)
             # Adaptive-production epochs are real sampling, so inherit
@@ -9269,6 +9273,16 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                     phase_dirs=([Path(s.get("dir")) for s in scheduled_summary.get("segments", []) if s.get("dir")]
                                 if scheduled_summary is not None else [epoch_dir]),
                     gate=_coupling_gate)
+            if bool(policy.aux_discovery):
+                # Adaptive auxiliary-CV discovery (off by default): after every other proposer; writes
+                # epoch_NNN/aux_discovery_report.json and, on success, the frozen aux_* files. Never raises.
+                from .adaptive.aux_admission_io import run_epoch_aux_discovery  # noqa: PLC0415
+                actions = run_epoch_aux_discovery(
+                    adaptive_dir=adaptive_dir, epoch_dir=epoch_dir, epoch=epoch, registry=registry,
+                    diagnostics=diagnostics, actions=actions, policy=policy, args=args, out_dir=out_dir,
+                    phase_dirs=([Path(s.get("dir")) for s in scheduled_summary.get("segments", []) if s.get("dir")]
+                                if scheduled_summary is not None else [epoch_dir]),
+                    gate=_coupling_gate)
         action_report = None
         if _arg_bool(args, "adaptive_production_write_action_reports", True):
             try:
@@ -9334,6 +9348,14 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                 # Spec 3.7: the epoch's CV2-resolution table beside the report(s). Never raises.
                 from .adaptive.cv2_resolution_summary import write_epoch_summary  # noqa: PLC0415
                 write_epoch_summary(epoch_dir, diagnostics)
+            if bool(policy.aux_discovery):
+                from .adaptive import aux_admission_io as _aux_io  # noqa: PLC0415
+                _aux_io.annotate_report_with_refusals(adaptive_dir, epoch_dir, actions, _refused_actions)
+                _set_worker_burnin(
+                    registry, epoch, adaptive_dir,
+                    next_phase_steps=(int(getattr(epoch_args, "gamd_production_steps", 0) or 0)
+                                      if scheduled_summary is None else 0),
+                    provisional_steps=int(getattr(args, "gamd_production_steps", 0) or 0))
         registry_paths = registry.save(adaptive_dir)
         if _post_action_registry is not None:
             # A recovered epoch's ``actions`` are the ledger's applied list; carry its refusals
@@ -9763,6 +9785,8 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             final_args.gamd_production_steps = int(actual_final_steps)
             final_args.window_mode = "adaptive"
             final_args.windows_2d_csv = str(final_windows_csv)
+            from .adaptive.aux_admission_io import inject_aux_phase_args  # noqa: PLC0415
+            inject_aux_phase_args(final_args, adaptive_dir)
             final_args.adaptive_feedback_enabled = False
             final_args.adaptive_feedback_pilot = False
             final_args.adaptive_feedback_final_production = False
@@ -9877,6 +9901,8 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
         ext_args.gamd_production_steps = int(actual_ext_steps)
         ext_args.window_mode = "adaptive"
         ext_args.windows_2d_csv = str(final_windows_csv)
+        from .adaptive.aux_admission_io import inject_aux_phase_args  # noqa: PLC0415
+        inject_aux_phase_args(ext_args, adaptive_dir)
         ext_args.adaptive_feedback_enabled = False
         ext_args.adaptive_feedback_pilot = False
         ext_args.adaptive_feedback_final_production = False
@@ -10194,6 +10220,19 @@ def _load_applied_actions(epoch_dir: Path, registry_path: Path) -> Optional[Dict
               "and epoch actions will be proposed again")
         return None
     return ledger
+
+
+def _set_worker_burnin(registry: WindowStateRegistry, epoch: int, adaptive_dir: Path, *,
+                       next_phase_steps: int, provisional_steps: int) -> int:
+    """Give this epoch's new auxiliary workers the next phase's production steps as burn-in (the admission hook
+    wrote the provisional ``gamd_production_steps``). Runs before ``registry.save`` so the saved registry, the
+    applied-actions digest and the next window table agree. ``next_phase_steps`` <= 0 (scheduled epochs, whose
+    per-state baseline length is only known at launch) keeps the provisional value."""
+    if int(next_phase_steps) <= 0:
+        return 0
+    from .adaptive.aux_admission_io import set_worker_burnin  # noqa: PLC0415
+    return set_worker_burnin(registry, int(next_phase_steps), epoch=int(epoch),
+                             provisional=int(provisional_steps), adaptive_dir=adaptive_dir)
 
 
 def _apply_registry_actions(registry: WindowStateRegistry, actions: Sequence[Tuple], epoch: int,
