@@ -970,6 +970,15 @@ OVERLAP_CV2_WARN_RETAINED_FRACTION = 0.95
 OVERLAP_SPACE_MARGINAL = 'cv1_marginal'
 OVERLAP_SPACE_JOINT = 'cv1_cv2_joint'
 
+# CVaux Stage C final fix wave I2 (spec Section 15): diagnostics not yet audited for auxiliary states report
+# this, never a pass. Keyed strictly on meta['aux_models'] (set only by load_parquet's auxiliary branch).
+AUX_DIAGNOSTICS_UNAVAILABLE = 'unavailable: aux states (Stage D audit)'
+
+
+def aux_diagnostics_unavailable(meta) -> Optional[str]:
+    """The unavailable reason for an auxiliary-state analysis, else None (every legacy analysis)."""
+    return AUX_DIAGNOSTICS_UNAVAILABLE if isinstance(meta, dict) and meta.get('aux_models') else None
+
 
 def _secondary_window_params(meta: dict, K: int) -> tuple:
     """``(secondary_center, secondary_k)``, length K, from the loader's own
@@ -1768,7 +1777,13 @@ def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.nd
                                          kbt_kcal, n_k=n_k_local)
     _cv_neigh_by_window = {int(r['window']): r for r in cv_neigh}
     _cv_bad_pairs = _weak_pairs(cv_neigh, _marg_thr)
-    if _cv_bad_pairs:
+    # Final fix wave I2: restraint-centre space cannot see an auxiliary axis (states differing only in A_s
+    # sit at one CV point), so on auxiliary data these overlap/connectivity grades are unavailable.
+    _aux_na = aux_diagnostics_unavailable(d.meta)
+    if _aux_na is not None:
+        warnings.append(f'{warning_prefix}CV-space nearest-neighbour overlap, joint (CV1, CV2) overlap and '
+                        f'overlap connectivity: {_aux_na}; their numbers are recorded but not graded.')
+    if _cv_bad_pairs and _aux_na is None:
         warnings.append(
             f'{warning_prefix}Weak CV-space nearest-neighbour overlap below '
             f'%.2f (CV1 marginal) for pairs: ' % _marg_thr
@@ -1787,7 +1802,7 @@ def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.nd
         cv_neigh_joint = cv_space_neighbor_overlap(O_joint, d.centers, d.k_kcal, _sec_centers,
                                                   _sec_ks, kbt_kcal, n_k=n_k_local)
         _joint_bad_pairs = _weak_pairs(cv_neigh_joint, _joint_thr)
-        if _joint_bad_pairs:
+        if _joint_bad_pairs and _aux_na is None:
             warnings.append(
                 f'{warning_prefix}Weak joint (CV1, CV2) nearest-neighbour overlap below '
                 f'%.3f for pairs: ' % _joint_thr
@@ -1842,10 +1857,11 @@ def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.nd
                        'components': [], 'component_samples': [],
                        'excluded_unsampled_states': []}
     connectivity = {'marginal': _conn_marginal, 'joint': _conn_joint}
-    warnings.extend(overlap_connectivity_warning_lines(
-        _conn_marginal, 'CV1-marginal', warning_prefix))
-    warnings.extend(overlap_connectivity_warning_lines(
-        _conn_joint, 'joint (CV1, CV2)', warning_prefix))
+    if _aux_na is None:
+        warnings.extend(overlap_connectivity_warning_lines(
+            _conn_marginal, 'CV1-marginal', warning_prefix))
+        warnings.extend(overlap_connectivity_warning_lines(
+            _conn_joint, 'joint (CV1, CV2)', warning_prefix))
     sel = pmfs[selected]
     finite = sel['pmf'][np.isfinite(sel['pmf'])]
     span = float(np.max(finite) - np.min(finite)) if finite.size else float('nan')

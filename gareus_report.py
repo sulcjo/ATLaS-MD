@@ -154,6 +154,17 @@ def _human_count(n: Optional[float]) -> str:
 # ===========================================================================
 # verdict
 # ===========================================================================
+def _aux_unavailable(s: dict, name: str) -> Optional[dict]:
+    """CVaux Stage C final fix wave I2 (spec Section 15): an auxiliary-state analysis (``s['aux_states']``,
+    written only by such an analysis) grades the not-yet-audited overlap/ladder rows NA, never PASS.
+    None for every other summary, so legacy rows are unchanged."""
+    aux = s.get("aux_states")
+    if not aux:
+        return None
+    reason = aux.get("reason") if isinstance(aux, dict) else None
+    return {"name": name, "status": NA, "detail": str(reason or "unavailable: aux states (Stage D audit)")}
+
+
 def build_health_verdict(s: dict, min_neighbor_overlap: float = 0.30) -> dict:
     """Derive a PASS/CAUTION/FAIL verdict from an analysis summary dict ``s``.
 
@@ -350,6 +361,9 @@ def _check_overlap(s: dict, thr: float) -> dict:
     certify that the window set is bridged. That is a property of the whole
     overlap graph, not of any pair -- see _check_overlap_connectivity below.
     """
+    _aux = _aux_unavailable(s, "Window overlap")
+    if _aux is not None:
+        return _aux
     joint = s.get("joint_overlap")
     joint = joint if isinstance(joint, dict) else {}
     jworst = _worst_of(joint.get("cv_space_neighbor_overlap")) if joint.get("available") else None
@@ -505,6 +519,9 @@ def _check_overlap_connectivity(s: dict) -> dict:
     pmf_summary.json), the whole check is ``na`` -- this module must keep working
     against summaries written before it existed.
     """
+    _aux = _aux_unavailable(s, "Overlap connectivity")
+    if _aux is not None:
+        return _aux
     conn = s.get("overlap_connectivity")
     if not isinstance(conn, dict) or not conn:
         return {"name": "Overlap connectivity", "status": NA,
@@ -811,6 +828,9 @@ def _check_ladder_crosscheck(s: dict) -> dict:
     ladder run at all) both grade NA -- neither is a detected fault.
     """
     name = "λ-ladder cross-check"
+    _aux = _aux_unavailable(s, name)
+    if _aux is not None:
+        return _aux
     lcc = s.get("ladder_crosscheck")
     if not isinstance(lcc, dict) or "status" not in lcc:
         return {"name": name, "status": NA, "detail": "not a λ-ladder run"}

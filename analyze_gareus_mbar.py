@@ -5221,7 +5221,12 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
     # (not d_main below): the epoch_000/rest split is a GaMD-envelope-
     # recalibration axis, orthogonal to which states carry lambda=0.
     ladder_crosscheck_summary={'status':'skipped','reason':'gamd_ladder not active for this run','n_lambda0_samples':0,'n_bins_compared':0}
-    if d.meta.get('gamd_ladder'):
+    from gareus.mbar_analysis.pmf import aux_diagnostics_unavailable
+    _aux_na=aux_diagnostics_unavailable(d.meta)   # final fix wave I2: None on every legacy analysis
+    if _aux_na is not None:
+        # Auxiliary states: the λ=0-only crosscheck is not audited for them yet (Stage D) -> NA, never a pass.
+        ladder_crosscheck_summary={'status':'skipped','reason':_aux_na,'n_lambda0_samples':0,'n_bins_compared':0}
+    elif d.meta.get('gamd_ladder'):
         _lcc=ladder_crosscheck(d,m['f_k'],bins,kbt_kcal)
         # Slim, JSON-safe view for pmf_summary.json -- the two full PMF
         # dicts (_lcc['pmf_full']/['pmf_lambda0']) carry numpy arrays and go
@@ -5356,6 +5361,9 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
     else:
         s['epoch_000_report']={'available':False,'reason':'no epoch_000/rest split available (single-epoch run or non-adaptive-production source)'}
     s['ladder_crosscheck']=ladder_crosscheck_summary
+    if _aux_na is not None:
+        # Written only for auxiliary-state analyses: gareus_report grades the unaudited rows NA from it.
+        s['aux_states']={'reason':_aux_na,'models':[str(x) for x in d.meta.get('aux_models') or []]}
     s['rg']=rg_info
     s['distance_rg_2d_fes']=fes2d_info
     s['pca_2d_fes']=pca2d_info
@@ -5403,7 +5411,11 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
     # block, via gareus_report.overall_from_checks (the same worst-status
     # rule build_health_verdict itself uses), inside the gamd_ladder gate so
     # a non-ladder run's health verdict is byte-for-byte unaffected.
-    if d.meta.get('gamd_ladder'):
+    if _aux_na is not None and d.meta.get('gamd_ladder'):
+        s['ladder_overlap']={'available':False,'reason':_aux_na}
+        s.setdefault('health',{}).setdefault('checks',[]).append(
+            {'name':'Ladder state overlap','status':'na','detail':_aux_na})
+    elif d.meta.get('gamd_ladder'):
         try:
             from gareus_report import overall_from_checks
             from gareus.mbar_analysis.ladder import pairwise_state_overlap
