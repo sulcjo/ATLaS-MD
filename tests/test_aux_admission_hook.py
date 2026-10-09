@@ -114,7 +114,7 @@ def test_admission_freezes_files_and_emits_actions(tmp_path, monkeypatch):
     monkeypatch.setattr(H, "_discover", lambda **kw: H.DiscoveryResultStub.ok_with_workers([(1, 1.2, 2.0)]))
     out = _run(ad, tmp_path)
     assert len(out) == 1 and out[0][0] == "admit_aux" and out[0][1] == 1
-    assert out[0][2]["burnin_steps"] == 60000 and out[0][2]["aux_model_sha256"] == "e" * 64
+    assert out[0][2]["burnin_steps"] == 0 and out[0][4]["aux"]["burnin_phase_epoch"] == 2 and out[0][2]["aux_model_sha256"] == "e" * 64
     adm = json.loads((ad / "aux_admission.json").read_text())
     assert adm["schema"] == "atlas-aux-admission-v1" and adm["workers"][0]["parent_state_id"] == 1
     assert (ad / "aux_model.json").exists() and (ad / "aux_eval_partition.pkl").exists()
@@ -156,30 +156,6 @@ def test_inject_phase_args(tmp_path):
     assert pa.aux_equilibrium_eligible is True
 
 
-def _admitted_registry(epoch=1, burnin=60000):
-    r = _registry()
-    ctl = AdaptiveProductionController(r, policy=AdaptiveDecisionPolicy(aux_discovery=True, aux_reserve_slots=4))
-    ctl.apply_actions(epoch, [("admit_aux", 1, {"aux_center": 1.2, "aux_k_kcal_mol": 2.0, "aux_model_sha256": "e" * 64,
-                                                "burnin_steps": burnin}, "t", {"aux": {"placement_rank": 0}})])
-    assert not ctl.refused_actions
-    return r
-
-
-def test_set_worker_burnin_touches_only_this_epochs_provisional_workers(tmp_path):
-    ad = tmp_path / "adaptive_production"; ad.mkdir()
-    (ad / "aux_admission.json").write_text(json.dumps({"schema": "atlas-aux-admission-v1",
-                                                       "workers": [{"parent_state_id": 1}]}))
-    r = _admitted_registry()
-    ordinary = [s.burnin_steps for s in r.all_states() if s.metadata.get("aux") is None]
-    n = H.set_worker_burnin(r, 45000, epoch=1, provisional=60000, adaptive_dir=ad)
-    workers = [s for s in r.all_states() if s.metadata.get("aux")]
-    assert n == 1 and [s.burnin_steps for s in workers] == [45000]
-    assert [s.burnin_steps for s in r.all_states() if s.metadata.get("aux") is None] == ordinary
-    assert json.loads((ad / "aux_admission.json").read_text())["workers"][0]["burnin_steps"] == 45000
-    assert H.set_worker_burnin(r, 1, epoch=1, provisional=60000, adaptive_dir=ad) == 0   # no longer provisional
-    assert H.set_worker_burnin(r, 1, epoch=2, provisional=45000, adaptive_dir=ad) == 0   # other epoch
-
-
 def test_refused_admission_is_unfrozen_so_next_boundary_retries(tmp_path):
     ad = tmp_path / "adaptive_production"; (ad / "epoch_001").mkdir(parents=True)
     for name in ("aux_model.json", "aux_admission.json", "aux_eval_partition.pkl", "aux_eval_partition.pkl.sha256"):
@@ -191,11 +167,3 @@ def test_refused_admission_is_unfrozen_so_next_boundary_retries(tmp_path):
     assert rep["apply"]["refused"][0]["reason"] == "aux_budget" and rep["status"] == "refused_by_applier"
     assert not (ad / "aux_admission.json").exists() and not (ad / "aux_model.json").exists()
 
-
-def test_driver_set_worker_burnin_wrapper(tmp_path):
-    from gareus.adaptive_production import _set_worker_burnin
-    ad = tmp_path / "adaptive_production"; ad.mkdir()
-    r = _admitted_registry()
-    assert _set_worker_burnin(r, 1, ad, next_phase_steps=0, provisional_steps=60000) == 0   # scheduled: unchanged
-    assert _set_worker_burnin(r, 1, ad, next_phase_steps=30000, provisional_steps=60000) == 1
-    assert [s.burnin_steps for s in r.all_states() if s.metadata.get("aux")] == [30000]

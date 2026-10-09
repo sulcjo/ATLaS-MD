@@ -96,12 +96,6 @@ def _calib_steps_for_phase(args, adaptive_dir: Path) -> int:
                    ("gamd_cmd_prep_steps", "gamd_cmd_steps", "gamd_equil_prep_steps", "gamd_equil_steps")))
 
 
-def _burnin_steps(args) -> int:
-    """Provisional burn-in: one full baseline segment. The driver overwrites it with the next phase's
-    production steps when it writes the next window table (``set_worker_burnin``)."""
-    return int(getattr(args, "gamd_production_steps", 0) or 0)
-
-
 def _unfreeze(adaptive_dir: Path) -> None:
     for name in _FROZEN_NAMES:
         try:
@@ -142,17 +136,17 @@ def run_epoch_aux_discovery(*, adaptive_dir, epoch_dir, epoch, registry, diagnos
         if not ok:
             report["status"] = "alignment"
             return actions
-        burnin = _burnin_steps(args)
         new = []
         for rank, c in enumerate(res.placement["chosen"]):
             new.append((ACTION, int(c["state_id"]),
                         {"aux_center": float(c["c3"]), "aux_k_kcal_mol": float(c["k3"]),
-                         "aux_model_sha256": res.model.model_sha256, "burnin_steps": burnin},
+                         "aux_model_sha256": res.model.model_sha256, "burnin_steps": 0},
                         f"aux_discovery epoch {int(epoch)}",
                         {"aux": {"discovery_epoch": int(epoch), "placement_rank": rank,
+                                 "burnin_phase_epoch": int(epoch) + 1,
                                  "forecast": {k: c[k] for k in ("O", "TV", "null", "net", "utility_q10")}}}))
         freeze_started = True
-        _freeze(adaptive_dir, epoch, res, new, settings, srec, val, burnin)
+        _freeze(adaptive_dir, epoch, res, new, settings, srec, val)
         report["admitted"] = [[a[1], a[2]] for a in new]
         return actions + new
     except Exception as exc:
@@ -168,7 +162,7 @@ def run_epoch_aux_discovery(*, adaptive_dir, epoch_dir, epoch, registry, diagnos
             print(f"WARNING: could not write {epoch_dir / REPORT_NAME}: {exc}")
 
 
-def _freeze(adaptive_dir: Path, epoch, res, new_actions, settings, srec, val, burnin: int) -> None:
+def _freeze(adaptive_dir: Path, epoch, res, new_actions, settings, srec, val) -> None:
     res.model.write(adaptive_dir / MODEL_FILENAME)
     part_sha = res.eval_partition.to_file(adaptive_dir / PARTITION_FILENAME)
     settings_sha = hashlib.sha256(json.dumps(srec.get("settings"), sort_keys=True).encode()).hexdigest()
@@ -178,32 +172,7 @@ def _freeze(adaptive_dir: Path, epoch, res, new_actions, settings, srec, val, bu
         "validation": {"k3_max": val.k3_max, "reason": val.reason},
         "workers": [{"parent_state_id": a[1], "aux_center": a[2]["aux_center"],
                      "aux_k_kcal_mol": a[2]["aux_k_kcal_mol"], "placement_rank": a[4]["aux"]["placement_rank"],
-                     "burnin_steps": int(burnin)} for a in new_actions]})
-
-
-def set_worker_burnin(registry, steps: int, *, epoch: int, provisional: int,
-                      adaptive_dir: Optional[Path] = None) -> int:
-    """Give this epoch's new workers the next phase's production steps as burn-in. Touches only workers admitted
-    in ``epoch`` whose burn-in is still the provisional value; mirrors it into ``aux_admission.json``."""
-    from gareus.adaptive_production import aux_params
-    steps = int(steps)
-    n = 0
-    for s in registry.all_states():
-        a = aux_params(s)
-        if a is None or int(a.get("admitted_epoch", -1)) != int(epoch) or int(s.burnin_steps) != int(provisional):
-            continue
-        s.burnin_steps = steps
-        n += 1
-    if n and adaptive_dir is not None:
-        path = Path(adaptive_dir) / ADMISSION_FILENAME
-        try:
-            rec = json.loads(path.read_text())
-            for w in rec.get("workers", []):
-                w["burnin_steps"] = steps
-            _write_json(path, rec)
-        except (OSError, ValueError) as exc:
-            print(f"WARNING: could not mirror worker burn-in into {path}: {exc}")
-    return n
+                     "burnin_phase_epoch": a[4]["aux"]["burnin_phase_epoch"]} for a in new_actions]})
 
 
 def annotate_report_with_refusals(adaptive_dir: Path, epoch_dir: Path, actions: Sequence[Tuple],
@@ -234,6 +203,7 @@ def annotate_report_with_refusals(adaptive_dir: Path, epoch_dir: Path, actions: 
 
 
 def inject_aux_phase_args(phase_args, adaptive_dir: Path) -> None:
+    # Deliberately ungated by the flag: a phase whose window CSV holds a worker must get the model, else the CSV loader refuses aux columns.
     adaptive_dir = Path(adaptive_dir)
     if not (adaptive_dir / ADMISSION_FILENAME).exists():
         return

@@ -9351,11 +9351,6 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             if bool(policy.aux_discovery):
                 from .adaptive import aux_admission_io as _aux_io  # noqa: PLC0415
                 _aux_io.annotate_report_with_refusals(adaptive_dir, epoch_dir, actions, _refused_actions)
-                _set_worker_burnin(
-                    registry, epoch, adaptive_dir,
-                    next_phase_steps=(int(getattr(epoch_args, "gamd_production_steps", 0) or 0)
-                                      if scheduled_summary is None else 0),
-                    provisional_steps=int(getattr(args, "gamd_production_steps", 0) or 0))
         registry_paths = registry.save(adaptive_dir)
         if _post_action_registry is not None:
             # A recovered epoch's ``actions`` are the ledger's applied list; carry its refusals
@@ -10220,19 +10215,6 @@ def _load_applied_actions(epoch_dir: Path, registry_path: Path) -> Optional[Dict
               "and epoch actions will be proposed again")
         return None
     return ledger
-
-
-def _set_worker_burnin(registry: WindowStateRegistry, epoch: int, adaptive_dir: Path, *,
-                       next_phase_steps: int, provisional_steps: int) -> int:
-    """Give this epoch's new auxiliary workers the next phase's production steps as burn-in (the admission hook
-    wrote the provisional ``gamd_production_steps``). Runs before ``registry.save`` so the saved registry, the
-    applied-actions digest and the next window table agree. ``next_phase_steps`` <= 0 (scheduled epochs, whose
-    per-state baseline length is only known at launch) keeps the provisional value."""
-    if int(next_phase_steps) <= 0:
-        return 0
-    from .adaptive.aux_admission_io import set_worker_burnin  # noqa: PLC0415
-    return set_worker_burnin(registry, int(next_phase_steps), epoch=int(epoch),
-                             provisional=int(provisional_steps), adaptive_dir=adaptive_dir)
 
 
 def _apply_registry_actions(registry: WindowStateRegistry, actions: Sequence[Tuple], epoch: int,
