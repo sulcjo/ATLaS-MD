@@ -88,7 +88,7 @@ def descriptor_definition(topology) -> DescriptorDefinition:
               "atom_residue_index": atom_residue_index}
     sha = hashlib.sha256(json.dumps(schema, sort_keys=True).encode()).hexdigest()
     return DescriptorDefinition(np.asarray(phi_idx), np.asarray(psi_idx), phi_labels, psi_labels,
-                                tuple(hc_groups), tuple(hc_labels), np.asarray(hb_pairs, dtype=np.int64),
+                                tuple(hc_groups), tuple(hc_labels), np.asarray(hb_pairs, dtype=np.int64).reshape(-1, 2),
                                 tuple(hb_labels), core_phi, core_psi,
                                 atom_names, atom_residue_names, atom_residue_index, sha)
 

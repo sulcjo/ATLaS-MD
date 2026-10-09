@@ -132,13 +132,26 @@ def solvated_start_topology_identities(out_dir, model) -> tuple[str, str]:
     return canonical_topology_sha256(topology, model), topology_identity_sha256(topology)
 
 
+#: An adaptive-production phase runs in ``<root>/adaptive_production/epoch_NNN/baseline`` (or a shallower
+#: ``epoch_NNN``/``final``) while setup writes the solvated start only at the campaign root.
+_SOLVATED_START_MAX_ANCESTORS = 3
+
+
+def solvated_start_path(out_dir) -> Path:
+    """``<d>/01_solvated_start.pdb`` for the nearest of ``out_dir`` and its first 3 ancestors that holds one
+    (a plain run: its own; an adaptive phase: the campaign root's). None found -> IntegrityError."""
+    base = Path(out_dir)
+    for d in [base, *base.parents][: _SOLVATED_START_MAX_ANCESTORS + 1]:
+        if (d / SOLVATED_START_PDB).is_file():
+            return d / SOLVATED_START_PDB
+    raise IntegrityError(f"auxiliary run needs {base / SOLVATED_START_PDB} (or one in its "
+                         f"{_SOLVATED_START_MAX_ANCESTORS} parent directories) for its topology identity (missing)")
+
+
 def solvated_start_topology(out_dir):
-    """The topology of ``<out_dir>/01_solvated_start.pdb`` (missing file -> IntegrityError)."""
+    """The topology of the run's ``01_solvated_start.pdb`` (``solvated_start_path``; missing -> IntegrityError)."""
     from openmm import app
-    path = Path(out_dir) / SOLVATED_START_PDB
-    if not path.is_file():
-        raise IntegrityError(f"auxiliary run needs {path} for its topology identity (missing)")
-    return app.PDBFile(str(path)).topology
+    return app.PDBFile(str(solvated_start_path(out_dir))).topology
 
 
 def _path_stem(key: str) -> str:

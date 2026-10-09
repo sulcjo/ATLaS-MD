@@ -9423,12 +9423,17 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             if bool(policy.aux_discovery):
                 from .adaptive import aux_admission_io as _aux_io  # noqa: PLC0415
                 _aux_io.annotate_report_with_refusals(adaptive_dir, epoch_dir, actions, _refused_actions)
-        registry_paths = registry.save(adaptive_dir)
         if _post_action_registry is not None:
             # A recovered epoch's ``actions`` are the ledger's applied list; carry its refusals
             # over as they are (their index points into the original proposal list).
             _refused_actions = [{k: v for k, v in r.items() if k != "index"}
                                 for r in (_ledger.get("refused") or [])]
+        # The ledger is written BEFORE the save as well, with the digest the save will produce: a job
+        # killed right after the save (before the post-save write) still finds a matching ledger.
+        # Killed before the save, the digest does not match the old registry and the ledger is stale.
+        _record_applied_actions(epoch_dir, epoch, actions, registry_path, refused=_refused_actions,
+                                registry_digest=_registry_json_digest(registry))
+        registry_paths = registry.save(adaptive_dir)
         _record_applied_actions(epoch_dir, epoch, actions, registry_path, refused=_refused_actions)
         _reassign_seeds_after_actions(current_seed_bank, registry)
         if float(policy.slow_mode_reseed_fraction or 0.0) > 0.0:
@@ -10249,8 +10254,16 @@ def _require_phase_within_replica_cap(args, n_states: int, phase_dir: Path, labe
         f"{phase_dir}")
 
 
+def _registry_json_digest(registry: "WindowStateRegistry") -> str:
+    """sha256 of the bytes ``registry.save_json`` writes (``write_json``: indent 2, sorted keys)."""
+    from .io import _NumpyEncoder
+    text = json.dumps(registry.to_dict(), indent=2, sort_keys=True, cls=_NumpyEncoder)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def _record_applied_actions(epoch_dir: Path, epoch: int, actions: Sequence[Tuple], registry_path: Path,
-                            refused: Optional[Sequence[Dict[str, Any]]] = None) -> Path:
+                            refused: Optional[Sequence[Dict[str, Any]]] = None,
+                            registry_digest: Optional[str] = None) -> Path:
     """Atomically record that ``actions`` were applied and saved as ``registry_path``.
 
     Written right after ``registry.save``: a resume that finds this file with a matching
@@ -10265,7 +10278,8 @@ def _record_applied_actions(epoch_dir: Path, epoch: int, actions: Sequence[Tuple
                "actions": _jsonable_action([a for i, a in enumerate(actions) if i not in skip]),
                "refused": [{**r, "proposal": _jsonable_action(list(actions)[int(r["index"])])}
                            if "index" in r else dict(r) for r in refused],
-               "registry_digest": _file_sha256(registry_path), "written_unix": time.time()}
+               "registry_digest": registry_digest if registry_digest is not None else _file_sha256(registry_path),
+               "written_unix": time.time()}
     tmp = path.with_name(path.name + f".tmp{os.getpid()}")
     tmp.write_text(json.dumps(payload, sort_keys=True))
     os.replace(tmp, path)

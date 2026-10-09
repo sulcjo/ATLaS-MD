@@ -87,6 +87,35 @@ def _read_xtc(path: Path):
     return np.asarray(xyz, dtype=np.float32), np.asarray(step, dtype=np.int64)
 
 
+def xtc_step_offset(phase_dir: Path) -> int:
+    """Sample step minus XTC step for one phase.
+
+    Production logs samples at ``calib_steps + prod_done`` (``absolute_step``) while each replica's trajectory
+    reporter writes its Context step count, which starts at 0 -- production-relative, also across resume files
+    (``replica_NNN_resume_from_<prod_done>``) -- so the offset is the phase's ``shared_gamd_calibration_steps``
+    (``gareus_metadata.json``; 0 for --run-mode cmd and for a frozen swarm envelope). A replica that loaded the
+    shared GaMD setup checkpoint (``--gamd-reuse-context-checkpoint``) continues the calibration's step count
+    instead: offset 0 (``replica_shared_gamd_copy_report.json``); a mix of both cannot be joined and raises."""
+    import json
+    phase_dir = Path(phase_dir)
+    meta = phase_dir / "gareus_metadata.json"
+    calib = 0
+    if meta.exists():
+        calib = int(json.loads(meta.read_text()).get("shared_gamd_calibration_steps", 0) or 0)
+    if calib <= 0:
+        return 0
+    rep = phase_dir / "replica_shared_gamd_copy_report.json"
+    if rep.exists():
+        flags = {bool(r.get("loaded_from_shared_gamd_setup_checkpoint"))
+                 for r in (json.loads(rep.read_text()).get("replicas") or []) if isinstance(r, dict)}
+        if flags == {True}:
+            return 0
+        if len(flags) > 1:
+            raise ValueError(f"{phase_dir}: mixed replicas (some loaded the shared GaMD setup checkpoint, some "
+                             "not): their trajectory steps cannot be joined to the sample steps")
+    return calib
+
+
 def _phase_frames(task):
     """One phase -> (definition, list of (frame DataFrame, descriptor dict)). Module level for spawn."""
     import mdtraj as md
@@ -112,6 +141,7 @@ def _phase_frames(task):
     samples = samples[(samples["state_id"] >= 0) & (samples["lam_reg"].abs() < 1e-12)]
     samples = samples.drop(columns=["lam_reg"])
     files = sorted(census._trajectory_files(phase_dir), key=lambda t: (t[0], t[1] or 0, str(t[2])))
+    offset = xtc_step_offset(phase_dir)
     blocks = []
     anchors: Dict[int, int] = {}                     # one stride anchor per replica per phase
     for i, (replica, _start, path) in enumerate(files):
@@ -128,6 +158,7 @@ def _phase_frames(task):
         if not keep.any():
             continue
         kept = np.nonzero(keep)[0]
+        steps = steps + offset                                           # XTC (production-relative) -> sample steps
         anchor = anchors.setdefault(int(replica), int(steps[kept][0]))   # earliest file's first kept step
         kept = kept[((steps[kept] - anchor) % int(stride_steps)) == 0]
         frames = pd.DataFrame({"replica": int(replica), "step": steps[kept], "pos": kept})

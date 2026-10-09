@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from aux_cv_fixture import model_payload
@@ -127,3 +129,28 @@ def test_resume_is_no_longer_refused_at_parse(tmp_path):
     import gareus.cli as cli
     src = inspect.getsource(cli._validate_aux_cv_args)
     assert "allow_unpersisted" not in src and "cannot --resume" not in src
+
+
+def test_solvated_start_found_at_the_adaptive_campaign_root(tmp_path):
+    # Task 17 (CPU e2e): an adaptive phase runs in <root>/adaptive_production/epoch_NNN/baseline, but setup
+    # writes 01_solvated_start.pdb only at the campaign root (the root a resume loads its topology from).
+    import shutil
+    import pytest as _pytest
+    from gareus.auxiliary_cv.runtime_definition import solvated_start_topology
+    from gareus.correctness._io import IntegrityError
+    src = Path(__file__).parent / "data" / "chignolin_solute.pdb"
+    root = tmp_path / "run"
+    phase = root / "adaptive_production" / "epoch_002" / "baseline"
+    phase.mkdir(parents=True)
+    shutil.copy(src, root / "01_solvated_start.pdb")
+    assert solvated_start_topology(phase).getNumAtoms() == solvated_start_topology(root).getNumAtoms()
+    # a phase's own copy wins over the root's
+    (phase / "01_solvated_start.pdb").write_text(
+        "ATOM      1  CA  GLY A   1       0.000   0.000   0.000  1.00  0.00           C\nEND\n")
+    assert solvated_start_topology(phase).getNumAtoms() == 1
+    # nothing within reach -> refused
+    deep = tmp_path / "other" / "a" / "b" / "c" / "d"
+    deep.mkdir(parents=True)
+    shutil.copy(src, tmp_path / "other" / "01_solvated_start.pdb")
+    with _pytest.raises(IntegrityError, match="01_solvated_start.pdb"):
+        solvated_start_topology(deep)

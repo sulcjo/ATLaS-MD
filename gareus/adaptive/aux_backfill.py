@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 
 from gareus.adaptive import discovery_census as census
-from gareus.adaptive.aux_discovery.frames import _read_xtc, load_phase_samples, phase_epoch
+from gareus.adaptive.aux_discovery.frames import _read_xtc, load_phase_samples, phase_epoch, xtc_step_offset
 
 BACKFILL_FILENAME = "aux_z_backfill.parquet"
 _SHA_KEY = b"aux_model_sha256"
@@ -48,7 +48,8 @@ def check_solute_indices(solute_pdb: Path, model) -> None:
 
 
 def frame_z(phase_dir: Path, model, adaptive_dir: Optional[Path] = None) -> pd.DataFrame:
-    """z for every XTC frame of the phase, (replica, step, aux_z); a later resume file wins."""
+    """z for every XTC frame of the phase, (replica, step, aux_z) with step on the samples' clock
+    (``xtc_step_offset``); a later resume file wins."""
     from gareus.auxiliary_cv.evaluate import z_from_positions
     phase_dir = Path(phase_dir)
     top_path = census._find_topology(phase_dir, Path(adaptive_dir) if adaptive_dir else phase_dir.parent)
@@ -58,6 +59,7 @@ def frame_z(phase_dir: Path, model, adaptive_dir: Optional[Path] = None) -> pd.D
     import mdtraj as md
     n_solute = md.load_topology(str(top_path)).n_atoms
     files = sorted(census._trajectory_files(phase_dir), key=lambda t: (t[0], t[1] or 0, str(t[2])))
+    offset = xtc_step_offset(phase_dir)          # samples are keyed by calib_steps + prod_done
     blocks = []
     for i, (replica, _start, path) in enumerate(files):
         if Path(path).stat().st_size == 0:
@@ -72,7 +74,7 @@ def frame_z(phase_dir: Path, model, adaptive_dir: Optional[Path] = None) -> pd.D
         if xyz.shape[1] != n_solute:
             raise ValueError(f"{path}: {xyz.shape[1]} atoms per frame, solute PDB {top_path} has {n_solute}")
         z = np.ravel(z_from_positions(xyz[keep].astype(np.float64), model))
-        blocks.append(pd.DataFrame({"replica": int(replica), "step": steps[keep], "aux_z": z}))
+        blocks.append(pd.DataFrame({"replica": int(replica), "step": steps[keep] + offset, "aux_z": z}))
     if not blocks:
         return pd.DataFrame({"replica": np.zeros(0, np.int64), "step": np.zeros(0, np.int64), "aux_z": np.zeros(0)})
     return pd.concat(blocks).drop_duplicates(["replica", "step"], keep="last").reset_index(drop=True)

@@ -81,3 +81,30 @@ def test_unmapped_state_counted(tmp_path: Path):
     ft = build_frame_table(tmp_path, epochs=[0], registry_lambda={100: 0.0}, stride_steps=3000,
                            max_frames=100, seed=0)
     assert ft.sources[0]["n_dropped_unmapped"] == 2 and set(ft.state_id) == {100}
+
+
+def test_gamd_phase_sample_steps_carry_the_calibration_offset(tmp_path: Path):
+    # Task 17 (CPU e2e under pep-gamd): production logs samples at calib_steps + prod_done but the trajectory
+    # reporter writes the Context step count (production-relative); the join found no frame at all.
+    make_phase(tmp_path, "epoch_000", {"replica_0.xtc": (0, 0, [300, 3300, 6300])}, {0: 0.0},
+               lambda s: s / 1e4, sample_step_offset=10200)
+    ft = build_frame_table(tmp_path, epochs=[0], registry_lambda={100: 0.0}, stride_steps=3000,
+                           max_frames=10 ** 6, seed=0)
+    assert sorted(ft.step.tolist()) == [10500, 13500, 16500]            # the samples' (absolute) steps
+    assert np.allclose(ft.cv1, ft.step / 1e4)
+
+
+def test_xtc_offset_is_zero_when_replicas_loaded_the_setup_checkpoint(tmp_path: Path):
+    import json
+    from gareus.adaptive.aux_discovery.frames import xtc_step_offset
+    ph = make_phase(tmp_path, "epoch_000", {"replica_0.xtc": (0, 0, [300])}, {0: 0.0}, lambda s: 0.0,
+                    sample_step_offset=10200)
+    assert xtc_step_offset(ph) == 10200
+    rep = {"replicas": [{"loaded_from_shared_gamd_setup_checkpoint": True}] * 2}
+    (ph / "replica_shared_gamd_copy_report.json").write_text(json.dumps(rep))
+    assert xtc_step_offset(ph) == 0                                     # Context step count continues calib
+    rep["replicas"][1] = {"loaded_from_shared_gamd_setup_checkpoint": False}
+    (ph / "replica_shared_gamd_copy_report.json").write_text(json.dumps(rep))
+    import pytest
+    with pytest.raises(ValueError, match="mixed"):
+        xtc_step_offset(ph)

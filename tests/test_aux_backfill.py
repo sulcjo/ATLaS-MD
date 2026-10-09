@@ -183,3 +183,17 @@ def test_hook_records_backfill_shas(tmp_path, monkeypatch):
     adm = json.loads((ad / "aux_admission.json").read_text())
     rep = json.loads((ad / "epoch_001" / "aux_discovery_report.json").read_text())
     assert len(adm["backfill"]) == 2 and rep["backfill"] == adm["backfill"] and all(len(b["sha256"]) == 64 for b in adm["backfill"])
+
+
+def test_backfill_and_recorded_check_on_a_gamd_phase(tmp_path):
+    # Task 17: a self-calibrated GaMD phase's samples are calib_steps ahead of its XTC steps.
+    ph = make_phase(tmp_path, "epoch_000", {"replica_0.xtc": (0, 0, [300, 3300, 6300])}, {0: 0.0}, lambda s: 0.0,
+                    sample_step_offset=10200)
+    m = _model()
+    info = write_phase_backfill(ph, m)
+    df = read_phase_backfill(ph, m.model_sha256)
+    assert info["n_samples"] == info["n_z"] == 3 and sorted(df.step.tolist()) == [10500, 13500, 16500]
+    f = ph / "samples" / "seg_000" / "data.parquet"
+    s = pd.read_parquet(f); s["aux_z_00"] = _z_ref(m); s.to_parquet(f)
+    chk = check_backfill_against_recorded(ph, m)
+    assert chk["ok"] and chk["n_compared"] == 3

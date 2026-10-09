@@ -66,3 +66,14 @@ def test_basin_codes_match_discovery_census():
 def test_schema_sha_is_stable():
     t = _traj()
     assert descriptor_definition(t.topology).schema_sha256 == descriptor_definition(t.topology).schema_sha256
+
+
+def test_dipeptide_without_contact_or_hbond_pairs_evaluates():
+    # Task 17 (CPU e2e on GA): a peptide too short for any hc/hb pair gave a 1-D empty hb_pairs and
+    # evaluate_descriptors raised IndexError inside the admission hook's frame table.
+    t = _traj().atom_slice(_traj().topology.select("resid 0 1"))
+    d = descriptor_definition(t.topology)
+    assert d.hb_pairs.shape == (0, 2) and len(d.hc_groups) == 0
+    out = evaluate_descriptors(t.xyz, d)
+    assert out["hb"].shape == (1, 0) and out["hc"].shape == (1, 0)
+    assert out["tors"].shape == (1, 2 * (len(d.phi_labels) + len(d.psi_labels)))

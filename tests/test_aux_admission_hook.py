@@ -167,3 +167,67 @@ def test_refused_admission_is_unfrozen_so_next_boundary_retries(tmp_path):
     assert rep["apply"]["refused"][0]["reason"] == "aux_budget" and rep["status"] == "refused_by_applier"
     assert not (ad / "aux_admission.json").exists() and not (ad / "aux_model.json").exists()
 
+
+
+def test_calib_steps_are_zero_without_gamd(tmp_path):
+    # Task 17 (CPU e2e, --run-mode cmd): production calibrates nothing (calib_steps = 0) but the hook summed the
+    # gamd_* step defaults (310000), so the alignment check could refuse a cmd campaign for no reason.
+    ad = tmp_path / "adaptive_production"; ad.mkdir()
+    a = _args(tmp_path)
+    a.gamd_cmd_prep_steps, a.gamd_cmd_steps, a.gamd_equil_prep_steps, a.gamd_equil_steps = 10, 20, 30, 40
+    for mode in ("cmd", "hmr-cmd"):
+        a.run_mode = mode
+        assert H._calib_steps_for_phase(a, ad) == 0
+    a.run_mode = "gamd"
+    assert H._calib_steps_for_phase(a, ad) == 100
+
+
+def test_inject_phase_args_for_a_worker_less_post_admission_segment(tmp_path):
+    # Task 17 (CPU e2e): once the registry holds a worker every subset CSV carries the aux columns, also a
+    # scheduled segment holding only ordinary states. It must get the model too (the loader refuses aux
+    # columns without one, and its samples need recorded z for pooling: backfill covers pre-admission only).
+    ad = tmp_path / "adaptive_production"; ad.mkdir()
+    pa = SimpleNamespace(aux_cv_model=None, aux_phase_kind="pilot", aux_equilibrium_eligible=False,
+                         windows_2d_csv=str(tmp_path / "w.csv"))
+    (tmp_path / "w.csv").write_text("state_id,aux_center,aux_k_kcal_mol,state_role\n0,,0.0,ordinary\n")
+    H.inject_aux_phase_args(pa, ad)                       # no admission: unchanged
+    assert pa.aux_cv_model is None and pa.aux_phase_kind == "pilot" and pa.aux_equilibrium_eligible is False
+    (ad / "aux_admission.json").write_text(json.dumps({"schema": "atlas-aux-admission-v1"}))
+    (ad / "aux_model.json").write_text("{}")
+    H.inject_aux_phase_args(pa, ad)
+    assert pa.aux_cv_model == str(ad / "aux_model.json") and pa.aux_phase_kind == "production"
+    assert pa.aux_equilibrium_eligible is True
+    pb = SimpleNamespace(aux_cv_model=None, aux_phase_kind="pilot", aux_equilibrium_eligible=False,
+                         windows_2d_csv=str(tmp_path / "plain.csv"))
+    (tmp_path / "plain.csv").write_text("state_id,state_role\n0,ordinary\n")
+    H.inject_aux_phase_args(pb, ad)                       # no aux columns, no worker: a plain phase
+    assert pb.aux_cv_model is None
+
+
+def test_admission_without_its_worker_is_re_emitted_never_rediscovered(tmp_path, monkeypatch):
+    # Task 17: a job killed after the freeze but before registry.save leaves aux_admission.json with no worker
+    # in the saved registry. The resumed boundary must re-emit the recorded worker (same parent, centre, k,
+    # model) instead of returning early forever (pooling would then refuse the campaign).
+    ad = tmp_path / "adaptive_production"; (ad / "epoch_001").mkdir(parents=True)
+    _ok_validation(monkeypatch)
+    monkeypatch.setattr(H, "_build_frames", lambda **kw: object())
+    monkeypatch.setattr(H, "_discover", lambda **kw: H.DiscoveryResultStub.ok_with_workers([(1, 1.2, 2.0)]))
+    first = _run(ad, tmp_path)
+    assert len(first) == 1
+
+    def _no_rediscovery(**kw):
+        raise AssertionError("re-discovered")
+
+    monkeypatch.setattr(H, "_build_frames", _no_rediscovery)
+    monkeypatch.setattr(H, "_discover", _no_rediscovery)
+    reg = _registry()                                         # the saved registry: worker never landed
+    again = _run(ad, tmp_path, registry=reg)
+    assert len(again) == 1 and again[0][0] == "admit_aux" and again[0][1] == 1
+    assert again[0][2] == first[0][2]                        # centre, k, model sha, burnin_steps
+    assert again[0][4]["aux"]["burnin_phase_epoch"] == 2
+    rep = json.loads((ad / "epoch_001" / "aux_discovery_report.json").read_text())
+    assert rep["status"] == "readmitted_from_record"
+    ctl = AdaptiveProductionController(reg, policy=AdaptiveDecisionPolicy(aux_discovery=True, aux_reserve_slots=4))
+    ctl.apply_actions(1, again)
+    assert not ctl.refused_actions
+    assert _run(ad, tmp_path, registry=reg) == []           # worker present: nothing to re-emit

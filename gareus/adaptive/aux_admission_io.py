@@ -83,7 +83,10 @@ def _calib_steps_for_phase(args, adaptive_dir: Path) -> int:
     ``<adaptive_dir>/global_shared_gamd_setup``) and takes ``calib_steps = payload["calibration_steps"]``
     (:4488). Without a recorded setup the phase calibrates itself with
     ``gamd_cmd_prep + gamd_cmd + gamd_equil_prep + gamd_equil`` steps (:6283); a run without GaMD uses 0."""
-    setup = str(getattr(args, "shared_gamd_setup_dir", "") or "").strip()
+    from gareus.production import gamd_enabled
+    if not gamd_enabled(args):        # --run-mode cmd/hmr-cmd: production sets calib_steps = 0 (production.py:7535)
+        return 0
+    setup =str(getattr(args, "shared_gamd_setup_dir", "") or "").strip()
     path = (Path(setup) if setup else Path(adaptive_dir) / "global_shared_gamd_setup") / "shared_gamd_setup_globals.json"
     if path.exists():
         try:
@@ -115,7 +118,7 @@ def run_epoch_aux_discovery(*, adaptive_dir, epoch_dir, epoch, registry, diagnos
     if not getattr(policy, "aux_discovery", False) or int(epoch) < 1:
         return actions
     if (adaptive_dir / ADMISSION_FILENAME).exists():
-        return actions
+        return actions + _readmit_missing_workers(adaptive_dir, epoch_dir, epoch, registry)
     report = {"schema": REPORT_SCHEMA, "epoch": int(epoch), "started_unix": time.time()}
     freeze_started = False
     try:
@@ -162,6 +165,56 @@ def run_epoch_aux_discovery(*, adaptive_dir, epoch_dir, epoch, registry, diagnos
             _write_json(epoch_dir / REPORT_NAME, report)
         except Exception as exc:             # the hook never raises
             print(f"WARNING: could not write {epoch_dir / REPORT_NAME}: {exc}")
+
+
+def _missing_admitted_workers(admission: dict, registry) -> List[dict]:
+    """The admission record's workers with no registry worker of the same (parent, centre, k)."""
+    from gareus.adaptive.aux_pooling import worker_table
+    have = worker_table((s.state_id, s.metadata) for s in registry.all_states())
+    out = []
+    for w in admission.get("workers") or []:
+        if not any(rec.get("spawn_parent_state_id") is not None
+                   and int(rec["spawn_parent_state_id"]) == int(w["parent_state_id"])
+                   and abs(float(rec["aux_center"]) - float(w["aux_center"])) < 1e-9
+                   and abs(float(rec["aux_k_kcal_mol"]) - float(w["aux_k_kcal_mol"])) < 1e-9
+                   for rec in have.values()):
+            out.append(w)
+    return out
+
+
+def _readmit_missing_workers(adaptive_dir: Path, epoch_dir: Path, epoch, registry) -> List[tuple]:
+    """A job killed after the freeze but before ``registry.save`` leaves aux_admission.json whose workers never
+    reached the saved registry. Re-emit them from the record (never re-discover): without this every later
+    boundary returns early and pooling refuses the campaign (``require_admitted_workers``). Never raises."""
+    report = {"schema": REPORT_SCHEMA, "epoch": int(epoch), "started_unix": time.time()}
+    try:
+        admission = json.loads((adaptive_dir / ADMISSION_FILENAME).read_text())
+        missing = _missing_admitted_workers(admission, registry)
+        if not missing:
+            return []
+        adm_epoch = int(admission["epoch"])
+        if int(epoch) > adm_epoch:     # phases since the admission ran without the model: z by backfill
+            from gareus.auxiliary_cv.model import AuxModel
+            report["backfill"] = _backfill(adaptive_dir, epoch, AuxModel.load(adaptive_dir / MODEL_FILENAME))
+        new = [(ACTION, int(w["parent_state_id"]),
+                {"aux_center": float(w["aux_center"]), "aux_k_kcal_mol": float(w["aux_k_kcal_mol"]),
+                 "aux_model_sha256": str(admission["model_sha256"]), "burnin_steps": 0},
+                f"aux_discovery epoch {adm_epoch} (re-admitted from {ADMISSION_FILENAME} at epoch {int(epoch)})",
+                {"aux": {"discovery_epoch": adm_epoch, "placement_rank": int(w.get("placement_rank", 0)),
+                         "burnin_phase_epoch": int(epoch) + 1, "readmitted_epoch": int(epoch)}})
+               for w in missing]
+        report.update(status="readmitted_from_record", admitted=[[a[1], a[2]] for a in new])
+        return new
+    except Exception as exc:
+        report.update(status="error", error=f"{type(exc).__name__}: {exc}", traceback=traceback.format_exc())
+        return []
+    finally:
+        if "status" in report:
+            report["finished_unix"] = time.time()
+            try:
+                _write_json(Path(epoch_dir) / REPORT_NAME, report)
+            except Exception as exc:
+                print(f"WARNING: could not write {Path(epoch_dir) / REPORT_NAME}: {exc}")
 
 
 def _backfill(adaptive_dir: Path, epoch, model) -> List[dict]:
@@ -220,8 +273,12 @@ def inject_aux_phase_args(phase_args, adaptive_dir: Path) -> None:
     if not csv_path or not Path(csv_path).exists():
         return
     with Path(csv_path).open() as fh:
-        roles = {row.get("state_role") for row in csv.DictReader(fh)}
-    if "auxiliary" not in roles:
+        reader = csv.DictReader(fh)
+        has_aux_columns = "aux_k_kcal_mol" in (reader.fieldnames or [])
+        roles = {row.get("state_role") for row in reader}
+    # A worker-less segment of a post-admission epoch still carries the aux columns (the registry holds a worker):
+    # it needs the model too, and records z for every sample (sham-only population, ruling M5) for pooling.
+    if "auxiliary" not in roles and not has_aux_columns:
         return
     phase_args.aux_cv_model = str(adaptive_dir / MODEL_FILENAME)
     phase_args.aux_phase_kind = "production"
