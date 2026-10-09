@@ -15,7 +15,7 @@ def test_phase_epoch_labels():
 def test_join_dedup_stride_and_lambda0(tmp_path: Path):
     make_phase(tmp_path, "epoch_000",
                {"replica_0.xtc": (0, 0, [300, 3300, 6300]),
-                "replica_0_resume_from_3300.xtc": (0, 0, [3300, 6300, 9300]),
+                "replica_0_resume_from_3300.xtc": (0, 0, [6300, 9300]),
                 "replica_1.xtc": (1, 1, [300, 3300, 6300])},
                {0: 0.0, 1: 0.2}, lambda s: s / 1e4)
     ft = build_frame_table(tmp_path, epochs=[0], registry_lambda={100: 0.0, 101: 0.2},
@@ -25,6 +25,27 @@ def test_join_dedup_stride_and_lambda0(tmp_path: Path):
     assert np.allclose(ft.cv1, ft.step / 1e4)
     assert ft.tors.shape == (4, 36)
     assert set(ft.lineage) == {"epoch_000:0"} and ft.n == 4
+
+
+def test_resume_step_frame_kept_c10_layout(tmp_path: Path):
+    # C2: the earlier file ends AT the resume step, the resume file's first frame is one interval later
+    make_phase(tmp_path, "epoch_000",
+               {"replica_000.xtc": (0, 0, [263700, 266700, 269700]),
+                "replica_000_resume_from_000269700.xtc": (0, 0, [272700, 275700])},
+               {0: 0.0}, lambda s: s / 1e6)
+    ft = build_frame_table(tmp_path, epochs=[0], registry_lambda={100: 0.0}, stride_steps=3000,
+                           max_frames=10 ** 6, seed=0)
+    assert sorted(ft.step.tolist()) == [263700, 266700, 269700, 272700, 275700]
+
+
+def test_resume_file_reemitting_the_resume_step_counted_once(tmp_path: Path):
+    make_phase(tmp_path, "epoch_000",
+               {"replica_0.xtc": (0, 0, [300, 3300, 6300]),
+                "replica_0_resume_from_3300.xtc": (0, 0, [3300, 6300, 9300])},
+               {0: 0.0}, lambda s: s / 1e4)
+    ft = build_frame_table(tmp_path, epochs=[0], registry_lambda={100: 0.0}, stride_steps=3000,
+                           max_frames=10 ** 6, seed=0)
+    assert sorted(ft.step.tolist()) == [300, 3300, 6300, 9300]
 
 
 def test_samples_dedup_keeps_last_segment(tmp_path: Path):

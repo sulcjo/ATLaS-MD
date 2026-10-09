@@ -74,10 +74,24 @@ def test_wrong_model_sha_refused(tmp_path):
 
 
 def test_resume_overlap_later_file_wins(tmp_path):
+    # crash case: the original file ran past the checkpoint (900) before the kill; the resume file (first frame
+    # at checkpoint + interval, as npt_driver.register_reporter schedules it) supersedes that frame
     ph = make_phase(tmp_path, "epoch_000", {"replica_0.xtc": (0, 0, [300, 600, 900]),
-                                            "replica_0_resume_from_600.xtc": (0, 0, [600, 900, 1200])},
+                                            "replica_0_resume_from_600.xtc": (0, 0, [900, 1200])},
                     {0: 0.0}, lambda s: 0.0)
     assert write_phase_backfill(ph, _model())["n_samples"] == 4      # 300,600,900,1200 once each
+
+
+def test_resume_step_frame_kept_c10_layout(tmp_path):
+    # c10 epoch_000 replica 0 (C2): replica_000.xtc ends AT the resume step 269700, the resume file starts at
+    # 270000 (= 269700 + interval) and a sample exists at 269700: its only frame is the earlier file's last one.
+    ph = make_phase(tmp_path, "epoch_000", {"replica_000.xtc": (0, 0, [269100, 269400, 269700]),
+                                            "replica_000_resume_from_000269700.xtc": (0, 0, [270000, 270300])},
+                    {0: 0.0}, lambda s: 0.0)
+    info = write_phase_backfill(ph, _model())
+    df = read_phase_backfill(ph, _model().model_sha256)
+    assert info["n_samples"] == info["n_z"] == 5
+    assert sorted(df.step.tolist()) == [269100, 269400, 269700, 270000, 270300]
 
 
 def test_solute_atom_mismatch_refused(tmp_path):

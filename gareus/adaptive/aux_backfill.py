@@ -68,7 +68,10 @@ def frame_z(phase_dir: Path, model, adaptive_dir: Optional[Path] = None) -> pd.D
         xyz, steps = _read_xtc(path)
         if steps.size == 0:
             continue
-        keep = np.ones(steps.size, bool) if nxt is None else steps < int(nxt)
+        # A resume file named ``_resume_from_R`` restarts at the checkpoint step R but its reporter writes the
+        # first frame at R + interval (npt_driver.register_reporter), so the earlier file's frame AT R is the
+        # only one there: keep it (<=). Should a resume file also re-emit R, drop_duplicates keeps the later one.
+        keep = np.ones(steps.size, bool) if nxt is None else steps <= int(nxt)
         if not keep.any():
             continue
         if xyz.shape[1] != n_solute:

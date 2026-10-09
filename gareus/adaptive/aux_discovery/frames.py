@@ -144,6 +144,7 @@ def _phase_frames(task):
     offset = xtc_step_offset(phase_dir)
     blocks = []
     anchors: Dict[int, int] = {}                     # one stride anchor per replica per phase
+    seen: Dict[int, set] = {}                        # XTC steps already taken per replica (resume overlap)
     for i, (replica, _start, path) in enumerate(files):
         if Path(path).stat().st_size == 0:
             continue
@@ -154,9 +155,16 @@ def _phase_frames(task):
             raise RuntimeError(f"cannot read trajectory {path}: {type(exc).__name__}: {exc}") from exc
         if steps.size == 0:
             continue
-        keep = np.ones(steps.size, bool) if nxt is None else steps < int(nxt)    # later resume file wins
+        # The earlier file's frame AT the resume step R is kept (<=): the resume file's reporter writes its first
+        # frame at R + interval (npt_driver.register_reporter). Frames past R are superseded by the resume file;
+        # a step the resume file re-emits that was already taken is counted once.
+        keep = np.ones(steps.size, bool) if nxt is None else steps <= int(nxt)
+        taken = seen.setdefault(int(replica), set())
+        if taken:
+            keep &= ~np.isin(steps, np.fromiter(taken, dtype=np.int64, count=len(taken)))
         if not keep.any():
             continue
+        taken.update(int(x) for x in steps[keep])
         kept = np.nonzero(keep)[0]
         steps = steps + offset                                           # XTC (production-relative) -> sample steps
         anchor = anchors.setdefault(int(replica), int(steps[kept][0]))   # earliest file's first kept step
