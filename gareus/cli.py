@@ -711,6 +711,14 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                         "one atomic insert costing n_rungs x n_fills) instead of a single midpoint window, which "
                         "cannot connect a several-kT barrier. Falls back to the midpoint without a shape layout "
                         "plan. Off by default; frozen decision rule.")
+    p.add_argument("--ap-aux-discovery", action=argparse.BooleanOptionalAction, default=False,
+                   help="Discover a torsion-linear auxiliary CV (z3) from this campaign's own frames at each "
+                        "numbered-epoch boundary from the end of epoch 1 and admit up to 4 lambda=0 worker states "
+                        "(spec 2026-10-09-cvaux-adaptive-discovery-design.md). Off by default.")
+    p.add_argument("--ap-aux-reserve-slots", type=int, default=4,
+                   help="Replica slots of the P1 reserve kept for auxiliary workers (R1/R3 never use them).")
+    p.add_argument("--ap-aux-settings-override", action="store_true", default=False,
+                   help="Replace the campaign's recorded aux_settings.json with this job's values.")
     p.add_argument("--ap-cv2-respring", action=argparse.BooleanOptionalAction, default=False,
                    help="Re-derive CV2 springs from production samples (off by default). After each numbered "
                         "epoch, a CV2-restrained window whose realised mean compression k2/(k2 + F''_prod), "
@@ -1460,8 +1468,8 @@ def _validate_aux_cv_args(p: argparse.ArgumentParser, args: argparse.Namespace) 
     window_mode = str(getattr(args, "window_mode", "adaptive") or "adaptive")
     if window_mode not in _AUX_PLAIN_WINDOW_MODES:
         p.error(f"--aux-cv-model is plain-run only (--window-mode {' or '.join(_AUX_PLAIN_WINDOW_MODES)} with "
-                f"--windows-2d-csv); --window-mode {window_mode} rewrites or regenerates the window table "
-                "without auxiliary columns. Adaptive admission is a later stage")
+                f"--windows-2d-csv); for adaptive-production use --ap-aux-discovery, which fits and injects "
+                f"the model per phase")
     if str(getattr(args, "swarm_stage", "off") or "off") != "off":
         p.error("--aux-cv-model cannot run inside the swarm stage (--swarm-stage must be off)")
     if not getattr(args, "windows_2d_csv", None):
@@ -1480,6 +1488,33 @@ def _validate_aux_cv_args(p: argparse.ArgumentParser, args: argparse.Namespace) 
     if bool(getattr(args, "us_auto_drop_bad_windows", False)):
         p.error("--aux-cv-model refuses --us-auto-drop-bad-windows: the state table is frozen and a population "
                 "change is a new phase (spec Section 6)")
+
+
+def _validate_aux_discovery_args(p: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if not getattr(args, "ap_aux_discovery", False):
+        return
+    if str(getattr(args, "window_mode", "")) != "adaptive-production":
+        p.error("--ap-aux-discovery needs --window-mode adaptive-production")
+    if getattr(args, "ap_topups", False):
+        p.error("--ap-aux-discovery cannot run with --ap-topups (out of scope, spec Section 11)")
+    if str(getattr(args, "exchange_mode", "") or "") == "neighbor":
+        p.error("--ap-aux-discovery needs an unrestricted exchange mode (gibbs-walk, all-pair-sweep, random-pair)")
+    if getattr(args, "us_auto_drop_bad_windows", False):
+        p.error("--ap-aux-discovery refuses --us-auto-drop-bad-windows (aux populations are frozen)")
+    run_mode = str(getattr(args, "run_mode", "gamd") or "gamd")
+    boost = str(getattr(args, "gamd_boost_type", "") or "")
+    if run_mode in ("gamd", "hmr-gamd") and not boost.startswith("pep-gamd"):
+        p.error("--ap-aux-discovery needs a pep-gamd-* boost type")
+    traj = int(getattr(args, "traj_interval", 0) or 0)
+    dist = int(getattr(args, "distance_output_interval", 0) or 0)
+    exch = int(getattr(args, "exchange_interval", 0) or 0)
+    if traj <= 0 or traj != dist:
+        p.error("--ap-aux-discovery needs traj_interval == distance_output_interval > 0 (z backfill needs "
+                "one trajectory frame per sample)")
+    if exch <= 0 or exch % traj:
+        p.error("--ap-aux-discovery needs exchange_interval to be a multiple of traj_interval")
+    if int(getattr(args, "ap_aux_reserve_slots", 4)) < 1:
+        p.error("--ap-aux-discovery needs --ap-aux-reserve-slots >= 1")
 
 
 def _validate_fsf_clamp_args(p: argparse.ArgumentParser, args: argparse.Namespace) -> None:
@@ -1943,6 +1978,9 @@ def _shim_adaptive_production(args: argparse.Namespace) -> None:
     args.adaptive_production_refine_protect_epochs = args.ap_refine_protect_epochs
     args.adaptive_production_refine_min_sigma = args.ap_refine_min_sigma
     args.adaptive_production_cv2_respring = args.ap_cv2_respring
+    args.adaptive_production_aux_discovery = bool(getattr(args, "ap_aux_discovery", False))
+    args.adaptive_production_aux_reserve_slots = int(getattr(args, "ap_aux_reserve_slots", 4))
+    args.adaptive_production_aux_settings_override = bool(getattr(args, "ap_aux_settings_override", False))
     args.adaptive_production_cv2_bridge_sets = args.ap_cv2_bridge_sets
     args.adaptive_production_respring_min_neff = args.ap_respring_min_neff
     args.adaptive_production_respring_tolerance = args.ap_respring_tolerance
@@ -2203,6 +2241,7 @@ def parse_args(argv: Optional[Iterable[str]] = None):
     # Apply compat shims before validation (validators use legacy attr names)
     _apply_v2_compat_shims(args)
     _validate_aux_cv_args(p, args)
+    _validate_aux_discovery_args(p, args)
 
     args.contact_scheme = contact_scheme(args)
     _validate_contact_args(args)

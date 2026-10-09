@@ -556,6 +556,8 @@ class AdaptiveDecisionPolicy:
     respring_tolerance: float = 0.05
     respring_max_fraction: float = 0.25
     respring_k2_rtol: float = 0.10
+    aux_discovery: bool = False
+    aux_reserve_slots: int = 4
 
     def __post_init__(self) -> None:
         for name, allowed in (("refine_transition_count", REFINE_TRANSITION_COUNTS),
@@ -566,6 +568,8 @@ class AdaptiveDecisionPolicy:
         from .adaptive.cv2_respring import validate_knobs  # noqa: PLC0415
         validate_knobs(self.respring_min_neff, self.respring_tolerance, self.respring_max_fraction,
                        self.respring_k2_rtol)
+        if int(self.aux_reserve_slots) < 0:
+            raise ValueError(f"aux_reserve_slots must be >= 0, got {self.aux_reserve_slots}")
 
 
 # Mirror gareus.adaptive.cv2_resolution.TRANSITION_COUNTS / R3_MODES / COVERAGE_COUNTS (not
@@ -596,6 +600,7 @@ DECISION_SETTINGS_FIELDS = (
     "refine_budget_fraction", "refine_protect_epochs", "refine_min_sigma",
     "refine_transition_count", "refine_r3_mode", "coverage_count", "coverage_bootstrap",
     "cv2_respring", "respring_min_neff", "respring_tolerance", "respring_max_fraction", "respring_k2_rtol",
+    "aux_discovery", "aux_reserve_slots",
     "cv2_bridge_sets",
 )
 DECISION_SETTINGS_FILENAME = "decision_settings.json"
@@ -8289,6 +8294,8 @@ def policy_from_args(args: Any) -> AdaptiveDecisionPolicy:
         respring_tolerance=_arg_float(args, "adaptive_production_respring_tolerance", 0.05),
         respring_max_fraction=_arg_float(args, "adaptive_production_respring_max_fraction", 0.25),
         respring_k2_rtol=_arg_float(args, "adaptive_production_respring_k2_rtol", 0.10),
+        aux_discovery=_arg_bool(args, "adaptive_production_aux_discovery", False),
+        aux_reserve_slots=_arg_int(args, "adaptive_production_aux_reserve_slots", 4),
     )
 
 
