@@ -1,9 +1,10 @@
 import csv
+import json
 from pathlib import Path
 
 from aux_cv_fixture import model_payload
 from gareus.adaptive_production import (
-    AUX_METADATA_KEY, DECISION_SETTINGS_FIELDS, AdaptiveDecisionPolicy, WindowStateRegistry,
+    AUX_METADATA_KEY, DECISION_SETTINGS_FILENAME, AdaptiveDecisionPolicy, WindowStateRegistry,
     _hamiltonian_snapshot, _resolve_decision_settings, aux_params, is_auxiliary_state,
     registry_has_aux, write_state_subset_window_csv)
 from gareus.auxiliary_cv.model import AuxModel
@@ -11,6 +12,49 @@ from gareus.auxiliary_cv.state_table import load_aux_state_table
 from gareus.windows import AUX_CSV_COLUMNS, INSTANCE_CSV_COLUMNS
 
 SHA = "a" * 64
+
+PRE_TASK1_DECISION_KEYS = frozenset({
+    "allocation_weight",
+    "convergence_max_weak_edges",
+    "convergence_min_samples_per_state",
+    "coverage_bootstrap",
+    "coverage_count",
+    "coverage_k_stiffen_cap",
+    "coverage_min_windows",
+    "cv2_bridge_sets",
+    "cv2_coupling_gate",
+    "cv2_resolution",
+    "cv2_respring",
+    "duplicate_primary_tol",
+    "duplicate_secondary_tol",
+    "edge_metric",
+    "layout_neighbour_rule",
+    "max_coupling_fraction",
+    "max_new_rungs_per_epoch",
+    "max_new_windows_per_epoch",
+    "max_target_deviation_sigma",
+    "min_edge_neff",
+    "min_exchange_acceptance",
+    "min_rung_overlap",
+    "min_samples_for_add",
+    "min_samples_for_retire",
+    "redundant_overlap",
+    "refine_budget_fraction",
+    "refine_min_sigma",
+    "refine_min_transitions",
+    "refine_pmf_sigma_kT",
+    "refine_protect_epochs",
+    "refine_r3_mode",
+    "refine_transition_count",
+    "respring_k2_rtol",
+    "respring_max_fraction",
+    "respring_min_neff",
+    "respring_tolerance",
+    "retire_converged",
+    "slow_mode_reseed_fraction",
+    "target_overlap",
+    "target_rung_overlap",
+})  # DECISION_SETTINGS_FIELDS at 9bb57c9
 
 
 def _registry():
@@ -133,9 +177,8 @@ def test_written_csv_parses_through_aux_state_table(tmp_path: Path):
 
 
 def test_flag_off_decision_settings_only_adds_two_keys(tmp_path: Path):
-    _pol, record = _resolve_decision_settings(tmp_path, AdaptiveDecisionPolicy())
-    new = {"aux_discovery", "aux_reserve_slots"}
-    assert set(record["settings"]) - (set(DECISION_SETTINGS_FIELDS) - new) == new
-    assert record["settings"]["aux_discovery"] is False
-    assert record["settings"]["aux_reserve_slots"] == 4
-    assert set(record["settings"]) == set(DECISION_SETTINGS_FIELDS)
+    _pol, _record = _resolve_decision_settings(tmp_path, AdaptiveDecisionPolicy())
+    written = json.loads((tmp_path / DECISION_SETTINGS_FILENAME).read_text())["settings"]
+    assert set(written) == PRE_TASK1_DECISION_KEYS | {"aux_discovery", "aux_reserve_slots"}
+    assert written["aux_discovery"] is False
+    assert written["aux_reserve_slots"] == 4
