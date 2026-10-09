@@ -34,7 +34,7 @@ def _planted(n=6000, seed=0, along_cv1=False):
 def test_recovers_planted_torsion():
     ft, lab = _planted()
     tr = np.arange(ft.n) < 4500; ho = ~tr; bins = np.zeros(ft.n, int)
-    best, allc = Z.search_z3(ft, lab, bins, tr, ho, AuxDiscoverySettings(), nbins=1)
+    best, allc = Z.search_z3(ft, lab, bins, tr, ho, AuxDiscoverySettings(), nbins=1, all_pairs=True)
     assert best is not None and best.passed and best.groups == (0, 1)
     top = np.flatnonzero(np.abs(best.w_std) > 1e-8)
     assert set(top) <= {6, 7}                                   # sin/cos of torsion 3
@@ -43,7 +43,7 @@ def test_recovers_planted_torsion():
 def test_rejects_cv1_correlated_direction():
     ft, lab = _planted(along_cv1=True)
     tr = np.arange(ft.n) < 4500; ho = ~tr; bins = np.zeros(ft.n, int)
-    best, allc = Z.search_z3(ft, lab, bins, tr, ho, AuxDiscoverySettings(), nbins=1)
+    best, allc = Z.search_z3(ft, lab, bins, tr, ho, AuxDiscoverySettings(), nbins=1, all_pairs=True)
     assert best is None and any("max_cv_corr" in c.fail for c in allc)
 
 
@@ -64,6 +64,12 @@ def test_emitted_model_matches_projection_and_loads():
     z_model = z_from_positions(t.xyz[0], model)
     z_ref = Z.z3_values(evaluate_descriptors(t.xyz, d)["tors"], cand)[0]
     assert abs(float(np.ravel(z_model)[0]) - float(z_ref)) < 1e-6
+    rng = np.random.default_rng(1)
+    xyz = np.repeat(t.xyz, 5, axis=0) + rng.normal(scale=0.05, size=(5, t.xyz.shape[1], 3))
+    # trig features are smooth through +-pi, so large perturbations (which cross it for some torsions) must agree
+    zs = np.array([float(np.ravel(z_from_positions(x, model))[0]) for x in xyz])
+    zr = Z.z3_values(evaluate_descriptors(xyz, d)["tors"], cand)
+    assert np.abs(zs - zr).max() < 1e-6
     from gareus.auxiliary_cv.model import AuxModel
     tmp = Path(__file__).parent / "_tmp_model.json"
     try:
@@ -81,12 +87,60 @@ def test_emit_refuses_disagreeing_production_topology():
         Z.emit_model(_cand(), d, top, label="t", provenance={})
 
 
-def test_ties_prefer_larger_c_and_ranking_rule():
-    src = inspect.getsource(Z.search_z3)
-    assert "max(scores)" in src or "max((" in src
+def test_exact_c_ties_go_to_larger_c(monkeypatch):
+    ft, lab = _planted()
+    tr = np.arange(ft.n) < 4500; ho = ~tr; bins = np.zeros(ft.n, int)
+    monkeypatch.setattr(Z, "_bern_ll", lambda m, X, y: 0.0)
+    s = AuxDiscoverySettings()
+    best, allc = Z.search_z3(ft, lab, bins, tr, ho, s, nbins=1, all_pairs=True)
+    assert allc and all(c.C == max(s.l1_c_grid) for c in allc)
+
+
+def _c(ig, nz, passed=True):
+    return Z.Z3Candidate((0, 1), 0.1, np.ones(36), np.zeros(36), np.ones(36), 1.0, ig, 0.9, 0.0, 0.0, 0.1,
+                         nz, passed, [])
+
+
+def test_pick_best_ranking():
+    assert Z.pick_best([_c(0.3, 5), _c(0.3, 2), _c(0.2, 1)]).n_nonzero == 2
+    assert Z.pick_best([_c(0.2, 1), _c(0.3, 9)]).n_nonzero == 9
+    assert Z.pick_best([_c(0.9, 1, passed=False)]) is None
+
+
+def test_l1_is_warning_free_and_sparse():
+    import warnings
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(300, 10)); y = (X[:, 3] > 0).astype(int)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        m = Z._l1(X, y, 0.1)
+    assert 0 < (np.abs(m.coef_[0]) > 1e-8).sum() < 10
+
+
+def test_nan_cv2_is_not_applicable_and_can_pass():
+    ft, lab = _planted()
+    ft.cv2 = np.full(ft.n, np.nan, np.float32)
+    tr = np.arange(ft.n) < 4500; ho = ~tr; bins = np.zeros(ft.n, int)
+    best, allc = Z.search_z3(ft, lab, bins, tr, ho, AuxDiscoverySettings(), nbins=1, all_pairs=True)
+    assert best is not None and best.corr_cv2 is None and "cv2_not_applicable" in best.notes
+
+
+def test_nonfinite_info_gain_fails(monkeypatch):
+    ft, lab = _planted()
+    tr = np.arange(ft.n) < 4500; ho = ~tr; bins = np.zeros(ft.n, int)
+    monkeypatch.setattr(Z, "info_gain", lambda *a, **k: float("nan"))
+    best, allc = Z.search_z3(ft, lab, bins, tr, ho, AuxDiscoverySettings(), nbins=1, all_pairs=True)
+    assert best is None and allc and "nonfinite_info_gain" in allc[0].fail
 
 
 def test_no_native_readout_imported():
+    import importlib, pkgutil, sys
+    import gareus.adaptive.aux_discovery as pkg
+    for mi in pkgutil.iter_modules(pkg.__path__):
+        importlib.import_module(f"{pkg.__name__}.{mi.name}")
+    bad = [m for m in sys.modules if m.startswith("gareus") and
+           any(k in m for k in ("native", "chignolin_fes", "readout"))]
+    assert not bad, bad
     src = inspect.getsource(Z)
     imports = [ln for ln in src.splitlines() if ln.strip().startswith(("import ", "from "))]
     for ln in imports:
