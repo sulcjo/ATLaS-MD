@@ -23,6 +23,7 @@ def build_aux_reference_context():
     system = _fresh_system()
     rt = add_aux_cv_force(mm, system, table, ARGS)
     integ = mm.LangevinMiddleIntegrator(300 * unit.kelvin, 5 / unit.picosecond, 0.001 * unit.picoseconds)
+    integ.setRandomNumberSeed(7)
     ctx = mm.Context(system, integ, mm.Platform.getPlatformByName("Reference"))
     ctx.setPositions(d["positions_nm"])
     sim = types.SimpleNamespace(context=ctx, step=integ.step)

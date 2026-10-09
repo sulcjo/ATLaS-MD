@@ -9,10 +9,10 @@ def test_ramp_moves_z_toward_center_and_clears_parameters():
     from gareus.seeding import ramp_aux_restraint
     sim, rt, z_of = build_aux_reference_context()
     z0 = z_of(sim)
-    target = z0 + 1.0
-    row = ramp_aux_restraint(sim, rt, center=target, k_kcal=20.0, stages=5, steps_per_stage=200)
+    target = z0 - 1.0  # z0 sits at the model's upper limit; only downward is reachable
+    row = ramp_aux_restraint(sim, rt, center=target, k_kcal=2000.0, stages=5, steps_per_stage=200)
     z1 = z_of(sim)
-    assert abs(z1 - target) < abs(z0 - target)
+    assert abs(z1 - target) < abs(z0 - target) - 0.3
     assert row["aux_ramp_stages"] == 5 and np.isfinite(row["aux_z_end"])
     assert sim.context.getParameter(rt.info.global_k) == 0.0
     assert sim.context.getParameter(rt.info.global_c) == 0.0
