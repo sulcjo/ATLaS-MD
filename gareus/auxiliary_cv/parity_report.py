@@ -30,6 +30,9 @@ def parity_report(run_dir) -> dict[str, Any]:
         beta = 1.0 / (R_KJ_MOL_K * float(state["temperature_k"]))
         ctx = parity_context(state["windows"], beta)
         s = load_samples(run_dir, segment_ids=[seg])
+        if not s or "cv1" not in s:
+            raise IntegrityError(f"segment {seg} has an auxiliary sample schema but no sample rows could be "
+                                 "read (missing or excluded segment)")
         n = len(np.asarray(s["cv1"]))
         theta = np.stack([_float_column(s, c, n) for c in schema.torsion_columns], axis=1)
         sha = schema.model_shas[0]

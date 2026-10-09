@@ -7,6 +7,7 @@ import numpy as np
 
 from ..correctness._io import IntegrityError
 from ..correctness.bias import KJ_PER_KCAL
+from .duplicates import merge_identical_hamiltonians  # noqa: F401  (re-export, final fix wave I4d)
 from .evaluate import z_from_dihedrals
 from .model import AuxModel
 from .sample_schema import AUX_SAMPLES_SCHEMA, AuxSampleSchema
@@ -42,6 +43,21 @@ def parity_context(windows, beta: float) -> dict[str, Any]:
             k_max[sha] = max(k_max.get(sha, 0.0), float(w["aux_k"]))
             centers.setdefault(sha, []).append(float(w["aux_center"]))
     return {"beta": float(beta), "k_max_kcal": k_max, "centers": centers}
+
+
+def parity_bound(parity: Mapping[str, Any], sha: str) -> tuple[float, list[float]]:
+    """(k_max, active centres) of model ``sha`` for the runtime parity bound -- strict (final fix wave I4a).
+
+    No active state anywhere (sham-only population): (0.0, []) explicitly. An active state exists but
+    ``sha`` has no k_max: refused, never silently read as 0 (parity must never switch itself off).
+    """
+    k_max = parity["k_max_kcal"]
+    if not k_max:
+        return 0.0, []
+    if sha not in k_max:
+        raise IntegrityError(f"parity bound: model {sha} has no k_max although the state table holds active "
+                             f"auxiliary states (models {sorted(k_max)})")
+    return float(k_max[sha]), [float(c) for c in parity["centers"][sha]]
 
 
 def parity_violation(stored, recomputed, *, beta: float, k_max_kcal: float, centers: Sequence[float]) -> np.ndarray:

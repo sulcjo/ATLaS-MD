@@ -29,6 +29,8 @@ def expected_aux_parameters(state_definition: Mapping[str, Any], window_id: int)
     k = float(found[0].get("aux_k", 0.0))
     if k == 0.0:
         return 0.0, 0.0
+    if found[0].get("aux_center") is None:
+        raise IntegrityError(f"window {window_id} is an active auxiliary state (aux_k {k}) without aux_center")
     return k * KJ_PER_KCAL, float(found[0]["aux_center"])
 
 
@@ -167,6 +169,9 @@ def aux_table_from_checkpoint(manifest: Mapping[str, Any], *, model):
     if model.model_sha256 not in registry:
         raise IntegrityError(f"--aux-cv-model {model.model_sha256} is not the checkpoint's model {sorted(registry)}")
     windows = sorted(state["windows"], key=lambda r: r["window_id"])
+    missing = [r["window_id"] for r in windows if float(r.get("aux_k", 0.0)) != 0.0 and r.get("aux_center") is None]
+    if missing:
+        raise IntegrityError(f"checkpoint auxiliary table: active window(s) {missing[:8]} without aux_center")
     return AuxStateTable(model, tuple(float(r.get("aux_center", 0.0)) for r in windows),
                          tuple(float(r["aux_k"]) for r in windows),
                          tuple(dict(r["instance"]) for r in windows))       # v2: an instance on every row

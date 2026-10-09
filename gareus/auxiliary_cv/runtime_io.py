@@ -87,9 +87,15 @@ def check_runtime_parity(runtime_z, positions_z, *, beta: float, k_max_kcal: flo
     positions_z = np.asarray(positions_z, dtype=np.float64)
     if np.any(np.isfinite(runtime_z) != np.isfinite(positions_z)):
         raise AuxObservationError("runtime/positions aux z parity: finite mismatch with an active auxiliary state")
-    du = parity_violation(runtime_z, positions_z, beta=beta, k_max_kcal=k_max_kcal, centers=centers)
-    if du.size and np.nanmax(du) > float(tolerance):
-        raise AuxObservationError(f"runtime/positions aux z parity: reduced disagreement {np.nanmax(du):.3g} > "
+    both = np.isfinite(runtime_z) & np.isfinite(positions_z)
+    if not np.any(both):
+        # Final fix wave I4b: with an active state, a sample with no finite comparison cannot vouch for parity.
+        raise AuxObservationError("runtime/positions aux z parity: no finite comparison (every carrier's z is "
+                                  "non-finite) with an active auxiliary state")
+    du = parity_violation(runtime_z[both], positions_z[both], beta=beta, k_max_kcal=k_max_kcal, centers=centers)
+    worst = float(np.max(du))
+    if not np.isfinite(worst) or worst > float(tolerance):
+        raise AuxObservationError(f"runtime/positions aux z parity: reduced disagreement {worst:.3g} > "
                                   f"{tolerance:g}")
 
 

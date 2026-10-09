@@ -29,7 +29,9 @@ def test_compare_runs_identical(tmp_path):
     for run in (a, b):
         _ledger(run, [(100, 0, "stay", 0), (100, 1, "stay", 1)])
     rep = compare_runs(a, b)
-    assert rep["ok"] and rep["ledger_duplicates"] == 0
+    # Final fix wave I3: identical ledgers but no samples on either side is not a pass (vacuous).
+    assert rep["ledger_duplicates"] == 0 and rep["ledger_equal"]
+    assert rep["ok"] is False and "samples" in rep["reason"]
 
 
 def _patched(monkeypatch, control, resumed):

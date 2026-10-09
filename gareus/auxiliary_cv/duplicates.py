@@ -24,6 +24,9 @@ def merge_identical_hamiltonians(u_nk, origins, hamiltonian_ids):
             if not np.array_equal(u[:, first], u[:, col], equal_nan=True):
                 raise IntegrityError(f"columns {first} and {col} share Hamiltonian {hid} but are not bitwise equal")
             groups[where[hid]].append(col)
+    bad = origins[(origins < 0) | (origins >= len(ids))]
+    if bad.size:
+        raise IntegrityError(f"sample origin(s) {sorted(set(bad.tolist()))[:8]} are not columns 0..{len(ids) - 1}")
     merged = u[:, [g[0] for g in groups]].copy()
     col_to_group = {c: gi for gi, g in enumerate(groups) for c in g}
     merged_origins = np.asarray([col_to_group[int(o)] for o in origins], dtype=np.int64)

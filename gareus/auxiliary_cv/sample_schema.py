@@ -114,31 +114,49 @@ def observe_carrier(xyz_nm, schema: AuxSampleSchema, models: Mapping[str, AuxMod
     return AuxObservation(theta, z)
 
 
-def runtime_precision(platform_name: str, platform=None, context=None) -> str:
+def runtime_precision_info(platform_name: str, platform=None, context=None) -> tuple[str, Optional[str]]:
+    """(precision, fallback reason or None). Reference/CPU are fixed; a GPU platform's ``Precision``
+    property is read from the Context. A failed or unrecognised read falls back to ``single`` (the
+    loosest parity tolerance) and says why, so it can be warned about and recorded (final fix wave I4c).
+    """
     name = str(platform_name)
     if name == "Reference":
-        return "double"
+        return "double", None
     if name == "CPU":
-        return "mixed"
-    if platform is not None and context is not None:
-        try:
-            value = str(platform.getPropertyValue(context, "Precision")).strip().lower()
-        except Exception:
-            value = ""
-        if value in PRECISIONS:
-            return value
-    return "single"
+        return "mixed", None
+    if platform is None or context is None:
+        return "single", f"no platform/context to read the {name} Precision property from"
+    try:
+        value = str(platform.getPropertyValue(context, "Precision")).strip().lower()
+    except Exception as exc:  # noqa: BLE001 -- any failed read is recorded, never silent
+        return "single", f"{name} Precision property read failed: {type(exc).__name__}: {exc}"
+    if value in PRECISIONS:
+        return value, None
+    return "single", f"{name} Precision property value {value!r} is not one of {PRECISIONS}"
 
 
-def runtime_info(platform_name: str, precision: str) -> dict[str, str]:
+def runtime_precision(platform_name: str, platform=None, context=None) -> str:
+    return runtime_precision_info(platform_name, platform, context)[0]
+
+
+def runtime_info(platform_name: str, precision: str, fallback_reason: Optional[str] = None) -> dict[str, Any]:
     if precision not in PRECISIONS:
         raise IntegrityError(f"runtime precision must be one of {PRECISIONS}, got {precision!r}")
-    return {"platform": str(platform_name), "precision": str(precision)}
+    info: dict[str, Any] = {"platform": str(platform_name), "precision": str(precision)}
+    if fallback_reason is not None:
+        # Only on a fallback: the normal block (and its payload bytes) is unchanged.
+        info["precision_fallback"] = True
+        info["precision_fallback_reason"] = str(fallback_reason)
+    return info
+
+
+def _fallback_reason(block: Mapping[str, Any]) -> Optional[str]:
+    return str(block.get("precision_fallback_reason", "")) if block.get("precision_fallback") else None
 
 
 def payload_with_runtime(schema: AuxSampleSchema, info: Mapping[str, str]) -> dict[str, Any]:
     payload = schema.to_payload()
-    payload["runtime"] = runtime_info(info["platform"], info["precision"])
+    payload["runtime"] = runtime_info(info["platform"], info["precision"], _fallback_reason(info))
     return payload
 
 
@@ -146,4 +164,4 @@ def runtime_from_payload(payload: Mapping[str, Any]) -> Optional[dict[str, str]]
     block = payload.get("runtime")
     if block is None:
         return None
-    return runtime_info(block.get("platform", ""), block.get("precision", ""))
+    return runtime_info(block.get("platform", ""), block.get("precision", ""), _fallback_reason(block))

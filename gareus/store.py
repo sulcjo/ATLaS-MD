@@ -79,6 +79,10 @@ class ParquetSampleWriter:
             nz, nt = len(self._aux_schema.z_columns), len(self._aux_schema.torsion_columns)
             if aux_z is None or torsions is None or len(aux_z) != nz or len(torsions) != nt:
                 raise ValueError(f"aux writer needs aux_z ({nz}) and torsions ({nt}) on every sample")
+            # Converted before any column is appended (as write_event does): a bad value never leaves a
+            # ragged buffer behind.
+            torsions = [float(v) for v in torsions]
+            aux_z = [float(v) for v in aux_z]
         b = self._buf
         b["step"].append(step)
         b["replica"].append(replica)
@@ -95,9 +99,9 @@ class ParquetSampleWriter:
         if self._aux_schema is not None:
             b["observation_phase"].append("pre_exchange")
             for name, value in zip(self._aux_schema.torsion_columns, torsions):
-                b[name].append(float(value))
+                b[name].append(value)
             for name, value in zip(self._aux_schema.z_columns, aux_z):
-                b[name].append(float(value))
+                b[name].append(value)
         if len(b["step"]) >= self._flush_rows:
             self.flush()
 

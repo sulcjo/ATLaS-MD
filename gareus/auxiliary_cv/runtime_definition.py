@@ -239,22 +239,31 @@ class AuxIORuntime:
     topology_sha256: str
 
 
-def aux_io_runtime(runtime, *, state_definition, topology, args, platform, context) -> AuxIORuntime:
+def aux_io_runtime(runtime, *, state_definition, topology, args, platform, context,
+                   precision_info=None) -> AuxIORuntime:
     """Storage-facing view of a resolved Stage B ``AuxRuntime``.
 
     ``topology`` must be the one read from ``01_solvated_start.pdb`` (see
     ``solvated_start_topology_identities``) so fresh runs and resumes carry the same identity.
+    ``precision_info`` = ``runtime_precision_info(...)`` as read on the Context's own worker (production);
+    None reads it here. A fallback prints one WARNING and is recorded in the runtime block.
     """
     from ..energy_decomposition import peptide_atom_groups_from_topology
     from ..kernel_identity import exchange_energy_version_for_args
     from .checkpoint import topology_identity_sha256
-    from .sample_schema import build_sample_schema, runtime_info, runtime_precision
+    from .sample_schema import build_sample_schema, runtime_info, runtime_precision_info
     atoms = getattr(args, "pep_gamd_peptide_atoms", None)
     if not atoms:
         atoms = peptide_atom_groups_from_topology(topology, "all-peptide")[1]
     model = runtime.table.model
     schema = build_sample_schema(topology, list(atoms), [model])
-    info = runtime_info(platform.getName(), runtime_precision(platform.getName(), platform, context))
+    if precision_info is None:
+        precision_info = runtime_precision_info(platform.getName(), platform, context)
+    precision, fallback_reason = precision_info
+    if fallback_reason is not None:
+        print(f"WARNING: auxiliary runtime precision fell back to {precision!r} ({fallback_reason}); parity uses "
+              "that tolerance and the samples' runtime block records precision_fallback", flush=True)
+    info = runtime_info(platform.getName(), precision, fallback_reason)
     return AuxIORuntime(state_definition, {model.model_sha256: model}, runtime.info, schema, info,
                         exchange_energy_version_for_args(args), str(args.aux_phase_kind),
                         bool(args.aux_equilibrium_eligible), topology_identity_sha256(topology))

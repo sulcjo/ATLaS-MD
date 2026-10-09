@@ -30,6 +30,8 @@ def compare_runs(control_dir, resumed_dir, *, z_atol: float = 1e-9, torsion_atol
     ec, er = load_exchanges(Path(control_dir)), load_exchanges(Path(resumed_dir))
 
     def _events(ev):
+        if not ev or "step" not in ev or len(ev["step"]) == 0:
+            return []                                   # empty ledger: no KeyError, graded below
         return list(zip(np.asarray(np.ma.getdata(ev["step"])).tolist(),
                         np.asarray(np.ma.getdata(ev["attempt_seq"])).tolist(),
                         np.asarray(ev["assignment_sha256_after"]).tolist()))
@@ -69,5 +71,16 @@ def compare_runs(control_dir, resumed_dir, *, z_atol: float = 1e-9, torsion_atol
     if sc and sr:
         values_ok = (out["max_abs_dz"] is not None and out["max_abs_dz"] <= z_atol
                      and out["max_abs_dtorsion"] is not None and out["max_abs_dtorsion"] <= torsion_atol)
-    out["ok"] = bool(out["ledger_duplicates"] == 0 and out["ledger_equal"] and out["sample_keys_equal"] and values_ok)
+    # Final fix wave I3: a comparison needs data on BOTH sides; an empty side (or two empty sides) is a
+    # vacuous comparison, never a pass, and says why.
+    reasons = []
+    for label, a, b in (("exchange ledger", pc, pr), ("samples", bool(sc), bool(sr))):
+        if not a and not b:
+            reasons.append(f"{label} empty on both sides (vacuous comparison)")
+        elif not a or not b:
+            reasons.append(f"{label} empty on the {'control' if not a else 'resumed'} side")
+    out["ok"] = bool(not reasons and out["ledger_duplicates"] == 0 and out["ledger_equal"]
+                     and out["sample_keys_equal"] and values_ok)
+    if reasons:
+        out["reason"] = "; ".join(reasons)
     return out

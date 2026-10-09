@@ -1446,6 +1446,14 @@ def _add_aux_cv_args(p: argparse.ArgumentParser) -> None:
 def _validate_aux_cv_args(p: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     """Refuse every configuration the Stage B auxiliary-state machinery cannot run exactly."""
     if not getattr(args, "aux_cv_model", None):
+        # Final fix wave I4e: the aux-only phase flags mean nothing without a model. Explicit use is detected
+        # by value (only an explicit flag or config key can make them non-default), so default-valued keys --
+        # every non-aux job's recorded args -- never error.
+        if getattr(args, "aux_equilibrium_eligible", False):
+            p.error("--aux-equilibrium-eligible needs --aux-cv-model (it marks auxiliary segments only)")
+        if str(getattr(args, "aux_phase_kind", "pilot")) != "pilot":
+            p.error(f"--aux-phase-kind {args.aux_phase_kind} needs --aux-cv-model (it is frozen into auxiliary "
+                    "window snapshots only)")
         return
     if getattr(args, "aux_equilibrium_eligible", False) and str(getattr(args, "aux_phase_kind", "pilot")) != "production":
         p.error("--aux-equilibrium-eligible needs --aux-phase-kind production (freeze_snapshot rule)")
