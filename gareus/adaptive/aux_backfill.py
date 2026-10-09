@@ -168,12 +168,39 @@ def backfill_all(adaptive_dir: Path, model, *, up_to_epoch: int) -> List[dict]:
     return out
 
 
+R_KCAL_MOL_K = 0.0019872041
+
+
+def worker_energy_error_kt(z_recorded, z_frame, workers, *, temperature_k: float = 300.0) -> List[dict]:
+    """Per worker (c3, k3 kcal/mol per z^2): the largest error the frame-derived z would make in the worker's
+    restraint energy, 0.5 k3 |(z1 - c3)^2 - (z2 - c3)^2| / RT, over the samples within 2 sigma_w of c3
+    (sigma_w = sqrt(RT / k3); either z). The pooled bias only matters where the worker samples, so that is
+    where the tolerance is judged (final fix wave I3: z units carry no physical scale)."""
+    RT = R_KCAL_MOL_K * float(temperature_k)
+    z1 = np.asarray(z_recorded, dtype=np.float64)
+    z2 = np.asarray(z_frame, dtype=np.float64)
+    out = []
+    for c3, k3 in workers:
+        c3, k3 = float(c3), float(k3)
+        sw = float(np.sqrt(RT / k3)) if k3 > 0 else float("inf")
+        near = (np.abs(z1 - c3) <= 2.0 * sw) | (np.abs(z2 - c3) <= 2.0 * sw)
+        de = 0.5 * k3 * np.abs((z1 - c3) ** 2 - (z2 - c3) ** 2) / RT
+        out.append({"aux_center": c3, "aux_k_kcal_mol": k3, "sigma_w": sw, "n_within_2sigma": int(near.sum()),
+                    "max_abs_dz_within": float(np.abs(z1 - z2)[near].max()) if near.any() else None,
+                    "max_energy_err_kt": float(de[near].max()) if near.any() else 0.0})
+    return out
+
+
 def check_backfill_against_recorded(phase_dir: Path, model, *, tol: float = 0.05,
-                                    adaptive_dir: Optional[Path] = None, raise_on_fail: bool = False) -> dict:
-    """Post-admission phase: recorded ``aux_z_00`` vs z_from_positions on its frames. Raises on a
-    deviation above ``tol`` only with ``raise_on_fail``; always returns
-    max_abs_dev, n_compared, tol, ok. (XTC 0.001 nm precision gives ~1e-2 z differences, hence tol 0.05.)
-    Raises when no sample could be compared."""
+                                    adaptive_dir: Optional[Path] = None, raise_on_fail: bool = False,
+                                    workers=None, temperature_k: float = 300.0, tol_kt: float = 1.0) -> dict:
+    """Post-admission phase: recorded ``aux_z_00`` vs z_from_positions on its XTC frames (the backfill's path).
+
+    Always returns max_abs_dev (z units), n_compared, tol, ok. With ``workers`` [(c3, k3), ...] the verdict is
+    physical: ``per_worker`` energy errors (``worker_energy_error_kt``), ``max_energy_err_kt`` and ok iff that
+    is <= ``tol_kt`` (default 1 kT); without workers ok iff max_abs_dev <= ``tol`` (z units; XTC 0.001 nm
+    precision gives ~1e-2). Raises on a failed verdict only with ``raise_on_fail``; raises when no sample could
+    be compared."""
     import duckdb
     phase_dir = Path(phase_dir)
     rec = duckdb.connect().execute(
@@ -186,7 +213,18 @@ def check_backfill_against_recorded(phase_dir: Path, model, *, tol: float = 0.05
     if joined.empty:
         raise ValueError(f"{phase_dir}: no sample with a recorded aux_z_00 and a frame to compare")
     dev = float((joined["aux_z_00"] - joined["aux_z"]).abs().max())
-    ok = dev <= tol
+    out = {"phase": str(phase_dir), "n_compared": int(len(joined)), "max_abs_dev": dev, "tol": float(tol)}
+    if workers:
+        per = worker_energy_error_kt(joined["aux_z_00"].to_numpy(np.float64), joined["aux_z"].to_numpy(np.float64),
+                                     workers, temperature_k=temperature_k)
+        err = max(p["max_energy_err_kt"] for p in per)
+        ok = bool(np.isfinite(err) and err <= float(tol_kt))
+        out.update(per_worker=per, max_energy_err_kt=float(err), tol_kt=float(tol_kt), temperature_k=float(temperature_k))
+        what = f"implies a worker energy error of {err:.3g} kT (> {tol_kt} kT)"
+    else:
+        ok = dev <= tol
+        what = f"differs from z_from_positions by {dev:.3g} (> {tol})"
+    out["ok"] = bool(ok)
     if not ok and raise_on_fail:
-        raise ValueError(f"{phase_dir}: recorded aux_z_00 differs from z_from_positions by {dev:.3g} (> {tol})")
-    return {"phase": str(phase_dir), "n_compared": int(len(joined)), "max_abs_dev": dev, "tol": float(tol), "ok": bool(ok)}
+        raise ValueError(f"{phase_dir}: recorded aux_z_00 {what}")
+    return out

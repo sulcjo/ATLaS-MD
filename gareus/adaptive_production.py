@@ -3871,7 +3871,9 @@ def build_union_state_mbar_inputs(
         from .adaptive import aux_pooling as _ap  # noqa: PLC0415
         from .kernel_identity import AuxPoolingRefused  # noqa: PLC0415
         _aux_workers = _ap.worker_table((int(s.state_id), s.metadata) for s in states)
-        _ap.require_admitted_workers(_aux_rec, _aux_workers, "adaptive union build")
+        _ap.require_admitted_workers(_aux_rec, _ap.worker_table((int(s.state_id), s.metadata)
+                                                                for s in registry.all_states()),
+                                     "adaptive union build", pooled=_aux_workers)
         for _sid, _rec in _aux_workers.items():
             if str(_rec.get("aux_model_sha256")) != str(_aux_rec.get("model_sha256")):
                 raise AuxPoolingRefused(f"worker state {_sid} names aux model {str(_rec.get('aux_model_sha256'))[:12]}, "
@@ -9365,7 +9367,7 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                     diagnostics=diagnostics, actions=actions, policy=policy, args=args, out_dir=out_dir,
                     phase_dirs=([Path(s.get("dir")) for s in scheduled_summary.get("segments", []) if s.get("dir")]
                                 if scheduled_summary is not None else [epoch_dir]),
-                    gate=_coupling_gate)
+                    gate=_coupling_gate, max_epochs=max_epochs)
         action_report = None
         if _arg_bool(args, "adaptive_production_write_action_reports", True):
             try:
@@ -9433,7 +9435,9 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                 write_epoch_summary(epoch_dir, diagnostics)
             if bool(policy.aux_discovery):
                 from .adaptive import aux_admission_io as _aux_io  # noqa: PLC0415
-                _aux_io.annotate_report_with_refusals(adaptive_dir, epoch_dir, actions, _refused_actions)
+                # Final fix wave C1: aux_admission.json lists exactly the registry's workers before the save.
+                _aux_io.annotate_report_with_refusals(adaptive_dir, epoch_dir, actions, _refused_actions,
+                                                      registry=registry)
         if _post_action_registry is not None:
             # A recovered epoch's ``actions`` are the ledger's applied list; carry its refusals
             # over as they are (their index points into the original proposal list).
@@ -10486,7 +10490,8 @@ def _action_to_dict(action: Tuple) -> Dict[str, Any]:
 
 def _adaptive_production_converged(actions: Sequence[Tuple], diagnostics: Dict[str, Any], policy: AdaptiveDecisionPolicy) -> bool:
     # Any proposed insertion or resolution blocks convergence (spec P2: split/refine too).
-    if any(str(a[0]) in ("add", "split", "refine", "insert") for a in actions):
+    # An aux admission (fix wave I2) blocks it too: the workers need at least one more numbered epoch.
+    if any(str(a[0]) in ("add", "split", "refine", "insert", "admit_aux") for a in actions):
         return False
     weak_edges = [edge for edge in diagnostics.get("edges", []) if _edge_is_measured_weak(edge, policy)]
     return len(weak_edges) == 0
@@ -10657,6 +10662,11 @@ def evaluate_adaptive_convergence_gate(
 
     if extend_like and not bool(policy.convergence_allow_extend_actions):
         continue_reasons.append(f"{len(extend_like)} extend action(s) proposed")
+
+    aux_admits = [a for a in action_rows if a.get("action") == "admit_aux"]
+    if aux_admits:
+        # Fix wave I2: newly admitted aux workers need the next numbered epoch (their burn-in phase).
+        continue_reasons.append(f"{len(aux_admits)} aux worker admission(s) proposed")
 
     if bool(getattr(policy, "cv2_resolution", False)):
         # Spec 3.3: R1-R3 work still pending (proposed, or refused for want of reserve/budget).

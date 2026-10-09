@@ -413,8 +413,8 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
                     raise AuxPoolingRefused(f'worker state {_sid} names aux model {str(_rec.get("aux_model_sha256"))[:12]}, '
                                             f'admission record {str(_aux_rec.get("model_sha256"))[:12]}')
                 _aux_cols[state_id_to_k[_sid]] = _rec
-        _ap.require_admitted_workers(_aux_rec, {int(state_ids[k]): r for k, r in _aux_cols.items()},
-                                    'adaptive union loader')
+        _ap.require_admitted_workers(_aux_rec, _aux_by_sid, 'adaptive union loader',
+                                     pooled={int(state_ids[k]): r for k, r in _aux_cols.items()})
 
     all_cv = []; all_cv2 = []; all_window = []; all_step = []
     all_replica = []; all_boost = []; all_boost_dih = []; all_potential = []; all_epoch_src = []

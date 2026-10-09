@@ -32,7 +32,10 @@ def _forecast(z, lab, lin_codes, c, k, shifts, RT, K):
 
 
 def place_workers(z, lab, state_id, lineage, step, is_train, is_heldout, s: AuxDiscoverySettings, *,
-                  k_labels: int, k3_max: Optional[float] = None) -> dict:
+                  k_labels: int, k3_max: Optional[float] = None, eligible_parents=None) -> dict:
+    """``eligible_parents`` (None = any): the states a worker may be spawned from (active, ordinary, lambda = 0
+    in the live registry after the epoch's other actions); a ranked candidate of another state is logged
+    ``parent_not_eligible`` and never chosen. At most ``s.max_workers`` are chosen (0 = none)."""
     RT = R_KCAL * float(s.temperature_k)
     rng = np.random.default_rng(int(s.placement_seed))
 
@@ -56,6 +59,9 @@ def place_workers(z, lab, state_id, lineage, step, is_train, is_heldout, s: AuxD
         lin = pd.factorize(tr.lineage)[0]
         longest = int(np.bincount(lin).max())
         sd = float(zt.std())
+        if not np.isfinite(sd) or sd <= 0.0:
+            skipped.append({"state_id": int(sid), "n_train_frames": len(tr), "reason": "zero_variance"})
+            continue
         med = float(np.median(zt))
         blocks = [np.flatnonzero(lin == b) for b in range(lin.max() + 1)]
         for q in s.quantiles:
@@ -98,9 +104,17 @@ def place_workers(z, lab, state_id, lineage, step, is_train, is_heldout, s: AuxD
                 cands.append(rec)
     ranked = sorted([c for c in cands if c["eligible"]], key=lambda c: -c["utility_q10"])
     chosen, used, log = [], set(), []
+    allowed = None if eligible_parents is None else {int(x) for x in eligible_parents}
     for r, c in enumerate(ranked):
+        if len(chosen) >= int(s.max_workers):
+            break
         key = (c["state_id"], c["side"])
         if key in used:
+            continue
+        if allowed is not None and int(c["state_id"]) not in allowed:
+            log.append({"rank": r, "state_id": c["state_id"], "side": c["side"], "c3": c["c3"], "k3": c["k3"],
+                        "utility_q10": c["utility_q10"], "heldout": c["heldout"], "confirmed": False,
+                        "reason": "parent_not_eligible"})
             continue
         h = c["heldout"]
         ok = bool(h and h["net"] > 0 and h["O"] >= s.heldout_o_min)
@@ -109,8 +123,6 @@ def place_workers(z, lab, state_id, lineage, step, is_train, is_heldout, s: AuxD
         if ok:
             chosen.append(c)
             used.add(key)
-        if len(chosen) == s.max_workers:
-            break
     gates = {"O_q05": s.gate_o_q05, "ess_frames": s.gate_ess_frames, "eff_lineages": s.gate_eff_lineages,
              "top3_share": s.gate_top3_share}
     return {"doc": DOC, "n_states": int(df.state_id.nunique()), "n_candidates": len(cands),

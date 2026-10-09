@@ -21,7 +21,8 @@ class DiscoveryResult:
     placement: Optional[dict] = None
 
 
-def run_discovery(ft, *, train, holdout, settings: AuxDiscoverySettings, full_topology, k3_max, epoch) -> DiscoveryResult:
+def run_discovery(ft, *, train, holdout, settings: AuxDiscoverySettings, full_topology, k3_max, epoch,
+                  eligible_parents=None) -> DiscoveryResult:
     """U13: ONE partition, fitted on CV-residualised contacts + H-bonds only (never torsions), so the torsion-only z3
     must predict structure defined independently of its inputs. z3 candidates come from every passing AND triggered k;
     placement and the frozen evaluation partition use the same fit (largest passing k)."""
@@ -61,7 +62,7 @@ def run_discovery(ft, *, train, holdout, settings: AuxDiscoverySettings, full_to
                                    "descriptor_schema_sha256": ft.definition.schema_sha256})
     z = z3_values(ft.tors, best)
     pl = place_workers(z, part.choice.labels, ft.state_id, lineage, ft.step, train, holdout, settings,
-                       k_labels=int(part.choice.k), k3_max=k3_max)
+                       k_labels=int(part.choice.k), k3_max=k3_max, eligible_parents=eligible_parents)
     rep["placement"] = {k: pl[k] for k in ("n_states", "n_candidates", "n_eligible", "skipped_states",
                                            "selection_log", "chosen")}
     rep["model_sha256"] = model.model_sha256

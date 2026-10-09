@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import dataclasses
 import hashlib
 import json
 import time
@@ -67,12 +68,63 @@ def _full_topology(out_dir: Path):
     return app.PDBFile(str(Path(out_dir) / "01_solvated_start.pdb")).topology
 
 
-def _discover(*, ft, epoch, settings, out_dir, k3_max):
+def _discover(*, ft, epoch, settings, out_dir, k3_max, eligible_parents=None):
     from gareus.adaptive.aux_discovery.pipeline import run_discovery
     train = ft.epoch < int(epoch)
     holdout = ft.epoch == int(epoch)
     return run_discovery(ft, train=train, holdout=holdout, settings=settings, full_topology=_full_topology(out_dir),
-                         k3_max=k3_max, epoch=epoch)
+                         k3_max=k3_max, epoch=epoch, eligible_parents=eligible_parents)
+
+
+def _ordinary_lambda0_active(registry) -> List[int]:
+    from gareus.adaptive_production import is_auxiliary_state
+    return sorted(int(s.state_id) for s in registry.active_states()
+                  if not is_auxiliary_state(s) and abs(float(s.gamd_lambda or 0.0)) <= 1.0e-12)
+
+
+def admission_limits(registry, actions: Sequence[Tuple], epoch, policy, args) -> dict:
+    """How many workers this boundary may admit and from which parents (final fix wave C1).
+
+    The epoch's other actions are applied to a COPY of the registry first (the order the applier will use:
+    admit_aux is appended last), so a parent retired by them (retire, respring, split, respace) is never
+    chosen and the replica budget sees their adds. Coupling gate None on the copy (the real gate records its
+    decisions). Slots = min(aux_reserve_slots - live workers, max_replicas_budget - active states) (budget 0 =
+    unlimited). Best effort: on any failure the live registry is used and the failure recorded; the applier
+    and ``reconcile_admission_with_registry`` stay authoritative."""
+    import contextlib
+    import copy
+    import io
+    from gareus.adaptive_production import _apply_registry_actions, _resolve_secondary_k_max, is_auxiliary_state
+    out = {"simulated": True}
+    sim = registry
+    try:
+        try:
+            k2max = _resolve_secondary_k_max(args)
+        except Exception:
+            k2max = None
+        sim = copy.deepcopy(registry)
+        with contextlib.redirect_stdout(io.StringIO()):
+            refused = _apply_registry_actions(sim, list(actions), int(epoch), policy=policy, secondary_k_max=k2max,
+                                              coupling_gate=None)
+        out["n_other_actions"] = len(actions)
+        out["n_other_refused"] = len(refused)
+    except Exception as exc:
+        sim = registry
+        out.update(simulated=False, simulation_error=f"{type(exc).__name__}: {exc}")
+    eligible = _ordinary_lambda0_active(sim)
+    if not out["simulated"]:                      # at least never pick a parent the epoch retires outright
+        retiring = {int(a[1]) for a in actions if str(a[0]) in ("retire", "respring", "split") and len(a) > 1}
+        eligible = [sid for sid in eligible if sid not in retiring]
+    n_workers = sum(1 for s in sim.active_states() if is_auxiliary_state(s))
+    slots = int(getattr(policy, "aux_reserve_slots", 0) or 0) - n_workers
+    budget = int(getattr(policy, "max_replicas_budget", 0) or 0)
+    n_active = len(sim.active_states())
+    free = (budget - n_active) if budget > 0 else None
+    n_slots = max(0, min(slots, free) if free is not None else slots)
+    out.update(eligible_parents=eligible, n_live_workers=int(n_workers), aux_reserve_slots=int(
+        getattr(policy, "aux_reserve_slots", 0) or 0), max_replicas_budget=budget, n_active_after_actions=n_active,
+        budget_free=free, n_slots=int(n_slots))
+    return out
 
 
 def _calib_steps_for_phase(args, adaptive_dir: Path) -> int:
@@ -111,17 +163,47 @@ def _unfreeze(adaptive_dir: Path) -> None:
             print(f"WARNING: could not remove partially frozen {name}: {exc}")
 
 
+def physical_system_check(args, out_dir) -> dict:
+    """Production computes ``physical_system_sha256`` of the bare System before adding the aux force and refuses
+    CMAP / virtual sites / non-canonical forces there (IntegrityError). Run the same check on the campaign's
+    system before admitting, so a doomed admission never freezes. Status ``ok``, ``refused`` (admission blocked)
+    or ``not_checked`` (the System could not be built here; production still checks)."""
+    try:
+        from openmm import app, unit
+        import openmm
+        from gareus.system_setup import create_system, make_forcefield_from_args
+        pdb = app.PDBFile(str(Path(out_dir) / "01_solvated_start.pdb"))
+        system = create_system(app, unit, make_forcefield_from_args(app, args), pdb.topology, args,
+                               include_barostat=False)
+    except Exception as exc:
+        return {"status": "not_checked", "detail": f"{type(exc).__name__}: {exc}"}
+    from gareus.auxiliary_cv.runtime_definition import physical_system_sha256
+    try:
+        return {"status": "ok", "physical_system_sha256": physical_system_sha256(openmm, system)}
+    except Exception as exc:                     # IntegrityError: CMAP, virtual sites, unknown force
+        return {"status": "refused", "detail": f"{type(exc).__name__}: {exc}"}
+
+
 def run_epoch_aux_discovery(*, adaptive_dir, epoch_dir, epoch, registry, diagnostics, actions, policy, args,
-                            out_dir, phase_dirs, gate=None) -> List[tuple]:
+                            out_dir, phase_dirs, gate=None, max_epochs: Optional[int] = None) -> List[tuple]:
     adaptive_dir = Path(adaptive_dir); epoch_dir = Path(epoch_dir)
     actions = list(actions)
     if not getattr(policy, "aux_discovery", False) or int(epoch) < 1:
         return actions
+    last_epoch = max_epochs is not None and int(epoch) >= int(max_epochs) - 1
     if (adaptive_dir / ADMISSION_FILENAME).exists():
+        _post_admission_spot_check(adaptive_dir, epoch_dir, epoch, phase_dirs)
+        if last_epoch:
+            return actions + _drop_missing_workers_at_last_epoch(adaptive_dir, epoch_dir, epoch, registry)
         return actions + _readmit_missing_workers(adaptive_dir, epoch_dir, epoch, registry)
     report = {"schema": REPORT_SCHEMA, "epoch": int(epoch), "started_unix": time.time()}
     freeze_started = False
     try:
+        if last_epoch:
+            # A worker admitted here would run only in the final phase, whose label carries no epoch: its burn-in
+            # phase (epoch + 1) would never match and the pull transient would pool unfiltered (fix wave I2).
+            report["status"] = "last_epoch"
+            return actions
         settings, srec = resolve_aux_settings(adaptive_dir, AuxDiscoverySettings(),
                                               override=bool(getattr(args, "adaptive_production_aux_settings_override", False)))
         report["settings"] = srec.get("settings")
@@ -130,8 +212,21 @@ def run_epoch_aux_discovery(*, adaptive_dir, epoch_dir, epoch, registry, diagnos
         calib = _calib_steps_for_phase(args, adaptive_dir)
         ok, why = phase_alignment_ok(args, calib_steps=calib)
         report["alignment"] = {"ok": ok, "detail": why, "calib_steps": int(calib)}
+        limits = admission_limits(registry, actions, epoch, policy, args)
+        report["limits"] = limits
+        if limits["n_slots"] <= 0:
+            report["status"] = "no_slots"
+            return actions
+        physical = physical_system_check(args, out_dir)
+        report["physical_system"] = physical
+        if physical["status"] == "refused":
+            report["status"] = "physical_system_unsupported"
+            return actions
+        # effective max = min(frozen settings.max_workers, free aux slots); the frozen settings record is untouched
+        run_settings = dataclasses.replace(settings, max_workers=min(int(settings.max_workers), int(limits["n_slots"])))
         ft = _build_frames(adaptive_dir=adaptive_dir, registry=registry, epoch=epoch, settings=settings, args=args)
-        res = _discover(ft=ft, epoch=epoch, settings=settings, out_dir=out_dir, k3_max=val.k3_max)
+        res = _discover(ft=ft, epoch=epoch, settings=run_settings, out_dir=out_dir, k3_max=val.k3_max,
+                        eligible_parents=limits["eligible_parents"])
         report.update(res.report); report["status"] = res.status
         if res.status != "ok":
             return actions
@@ -141,8 +236,16 @@ def run_epoch_aux_discovery(*, adaptive_dir, epoch_dir, epoch, registry, diagnos
         if not ok:
             report["status"] = "alignment"
             return actions
+        allowed = set(limits["eligible_parents"])
+        chosen = [c for c in res.placement["chosen"] if int(c["state_id"]) in allowed][: int(limits["n_slots"])]
+        dropped = [int(c["state_id"]) for c in res.placement["chosen"] if c not in chosen]
+        if dropped:
+            report["placement_filtered"] = dropped
+        if not chosen:
+            report["status"] = "no_eligible_worker"
+            return actions
         new = []
-        for rank, c in enumerate(res.placement["chosen"]):
+        for rank, c in enumerate(chosen):
             new.append((ACTION, int(c["state_id"]),
                         {"aux_center": float(c["c3"]), "aux_k_kcal_mol": float(c["k3"]),
                          "aux_model_sha256": res.model.model_sha256, "burnin_steps": 0},
@@ -243,31 +346,163 @@ def _freeze(adaptive_dir: Path, epoch, res, new_actions, settings, srec, val) ->
     return backfill
 
 
-def annotate_report_with_refusals(adaptive_dir: Path, epoch_dir: Path, actions: Sequence[Tuple],
-                                  refused: Sequence[Mapping]) -> None:
-    """Record the applier's refusals of ``admit_aux`` (``apply.refused``). When every admission of the epoch was
-    refused the frozen files are removed, so the next boundary discovers again instead of being blocked."""
+def _append_report_event(epoch_dir: Path, epoch, key: str, event: dict) -> None:
     path = Path(epoch_dir) / REPORT_NAME
+    try:
+        report = json.loads(path.read_text()) if path.exists() else {"schema": REPORT_SCHEMA, "epoch": int(epoch)}
+        report.setdefault(key, []).append(event)
+        _write_json(path, report)
+    except Exception as exc:
+        print(f"WARNING: could not record {key} in {path}: {exc}")
+
+
+def _registry_worker_records(registry) -> List[dict]:
+    from gareus.adaptive_production import aux_params, is_auxiliary_state
+    out = []
+    for s in sorted(registry.all_states(), key=lambda st: int(st.state_id)):
+        if not is_auxiliary_state(s):
+            continue
+        a = aux_params(s)
+        out.append({"parent_state_id": int(a["spawn_parent_state_id"]), "aux_center": float(a["aux_center"]),
+                    "aux_k_kcal_mol": float(a["aux_k_kcal_mol"]), "placement_rank": int(a.get("placement_rank", 0)),
+                    "burnin_phase_epoch": a.get("burnin_phase_epoch"), "state_id": int(s.state_id)})
+    return out
+
+
+def reconcile_admission_with_registry(adaptive_dir: Path, registry) -> dict:
+    """Make ``aux_admission.json``'s worker list exactly the registry's workers (final fix wave C1).
+
+    Called after the applier and BEFORE ``registry.save``: an admission the applier refused in part keeps only
+    the admitted workers (written atomically, the dropped ones under ``refused_workers``), one refused entirely
+    is un-frozen (model, partition, admission, backfills removed) so a later boundary discovers again. Raises
+    RuntimeError when the record cannot be made consistent: the job stops before the save, and the resumed
+    epoch re-admits from the unchanged record (an inconsistent record would make the campaign unpoolable)."""
+    adaptive_dir = Path(adaptive_dir)
+    path = adaptive_dir / ADMISSION_FILENAME
+    if not path.exists():
+        return {"status": "no_admission"}
+    try:
+        admission = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"{path}: unreadable admission record ({exc}); cannot reconcile it with the registry") from exc
+    have = _registry_worker_records(registry)
+    if not have:
+        _unfreeze(adaptive_dir)
+        if path.exists():
+            raise RuntimeError(f"{path}: every admitted worker was refused but the record could not be removed")
+        return {"status": "unfrozen", "dropped": list(admission.get("workers") or [])}
+    from gareus.adaptive.aux_pooling import _worker_key_matches
+    recorded = list(admission.get("workers") or [])
+    kept, pool = [], list(have)
+    for w in recorded:
+        hit = next((h for h in pool if _worker_key_matches({"spawn_parent_state_id": h["parent_state_id"],
+                                                            "aux_center": h["aux_center"],
+                                                            "aux_k_kcal_mol": h["aux_k_kcal_mol"]}, w)), None)
+        if hit is not None:
+            pool.remove(hit)
+            kept.append(w)
+    dropped = [w for w in recorded if w not in kept]
+    if not dropped and not pool:
+        return {"status": "unchanged"}
+    rewritten = dict(admission)
+    rewritten["workers"] = kept + [{k: v for k, v in h.items() if k != "state_id"} for h in pool]
+    if dropped:
+        rewritten["refused_workers"] = list(admission.get("refused_workers") or []) + dropped
+    try:
+        _write_json(path, rewritten)
+    except Exception as exc:
+        raise RuntimeError(f"{path}: could not rewrite the admission record to the admitted workers ({exc})") from exc
+    return {"status": "rewritten", "dropped": dropped, "added_from_registry": len(pool)}
+
+
+def annotate_report_with_refusals(adaptive_dir: Path, epoch_dir: Path, actions: Sequence[Tuple],
+                                  refused: Sequence[Mapping], registry=None) -> None:
+    """Record the applier's refusals of ``admit_aux`` (``apply.refused``) and, with ``registry`` (the driver
+    always passes it), reconcile ``aux_admission.json`` with the registry's actual workers
+    (``reconcile_admission_with_registry``; may raise RuntimeError, see there). Without a registry: when every
+    admission of the epoch was refused the frozen files are removed."""
+    n_admit = sum(1 for a in actions if str(a[0]) == ACTION)
+    if not n_admit:
+        return
+    path = Path(epoch_dir) / REPORT_NAME
+    mine = []
+    for r in refused:
+        i = r.get("index")
+        a = actions[int(i)] if i is not None and int(i) < len(actions) else None
+        if a is not None and str(a[0]) == ACTION:
+            mine.append({**dict(r), "proposal": [a[0], int(a[1])]})
+    rec = None
+    if registry is not None:
+        rec = reconcile_admission_with_registry(adaptive_dir, registry)
+    elif len(mine) == n_admit:
+        _unfreeze(adaptive_dir)
     if not path.exists():
         return
     try:
-        mine = []
-        n_admit = sum(1 for a in actions if str(a[0]) == ACTION)
-        for r in refused:
-            i = r.get("index")
-            a = actions[int(i)] if i is not None and int(i) < len(actions) else None
-            if a is not None and str(a[0]) == ACTION:
-                mine.append({**dict(r), "proposal": [a[0], int(a[1])]})
-        if not n_admit:
-            return
         report = json.loads(path.read_text())
-        report["apply"] = {"refused": mine}
+        report["apply"] = {"refused": mine, **({"reconcile": rec} if rec is not None else {})}
         if len(mine) == n_admit:
             report["status"] = "refused_by_applier"
-            _unfreeze(adaptive_dir)
         _write_json(path, report)
     except (OSError, ValueError) as exc:
         print(f"WARNING: could not annotate {path} with the applier's refusals ({exc})")
+
+
+def _drop_missing_workers_at_last_epoch(adaptive_dir: Path, epoch_dir: Path, epoch, registry) -> List[tuple]:
+    """At the last numbered epoch a re-admitted worker would run only in the final phase, whose burn-in can never
+    be filtered (I2): never re-admit there; reconcile the record with the registry instead. Never raises."""
+    try:
+        admission = json.loads((Path(adaptive_dir) / ADMISSION_FILENAME).read_text())
+        if not _missing_admitted_workers(admission, registry):
+            return []
+        rec = reconcile_admission_with_registry(adaptive_dir, registry)
+        _append_report_event(epoch_dir, epoch, "readmitted", {"epoch": int(epoch), "status": "last_epoch_not_readmitted",
+                                                             "reconcile": rec})
+    except Exception as exc:
+        print(f"WARNING: could not reconcile {ADMISSION_FILENAME} at the last epoch: {exc}")
+        _append_report_event(epoch_dir, epoch, "readmitted", {"epoch": int(epoch), "status": "error",
+                                                             "error": f"{type(exc).__name__}: {exc}"})
+    return []
+
+
+def _post_admission_spot_check(adaptive_dir: Path, epoch_dir: Path, epoch, phase_dirs) -> None:
+    """Once, on the first post-admission phase that recorded z: recorded aux_z_00 vs the frame-derived z the
+    backfill uses, judged per worker in kT (``check_backfill_against_recorded``). Recorded in
+    aux_admission.json[``spot_check``] and the epoch report; never raises, never blocks."""
+    adaptive_dir = Path(adaptive_dir)
+    path = adaptive_dir / ADMISSION_FILENAME
+    try:
+        admission = json.loads(path.read_text())
+        if admission.get("spot_check") is not None or int(epoch) <= int(admission.get("epoch", epoch)):
+            return
+        workers = [(float(w["aux_center"]), float(w["aux_k_kcal_mol"])) for w in admission.get("workers") or []]
+        if not workers:
+            return
+        from gareus.adaptive.aux_backfill import check_backfill_against_recorded
+        from gareus.auxiliary_cv.model import AuxModel
+        try:
+            temperature = float(json.loads((adaptive_dir / "aux_settings.json").read_text())["settings"]["temperature_k"])
+        except Exception:
+            temperature = float(AuxDiscoverySettings().temperature_k)
+        model = AuxModel.load(adaptive_dir / MODEL_FILENAME)
+        result, errors = None, []
+        for ph in phase_dirs or [epoch_dir]:
+            try:
+                result = check_backfill_against_recorded(Path(ph), model, adaptive_dir=adaptive_dir, workers=workers,
+                                                         temperature_k=temperature)
+                break
+            except Exception as exc:          # e.g. a phase that ran without the model: try the next one
+                errors.append(f"{ph}: {type(exc).__name__}: {exc}")
+        event = {"epoch": int(epoch), **(result or {"status": "not_checked", "errors": errors})}
+        _append_report_event(epoch_dir, epoch, "spot_check", event)
+        if result is not None:
+            admission["spot_check"] = event
+            _write_json(path, admission)
+            if not result["ok"]:
+                print(f"WARNING: aux z spot check: frame-derived z implies a worker energy error of "
+                      f"{result['max_energy_err_kt']:.3g} kT (> {result['tol_kt']} kT) on {result['phase']}")
+    except Exception as exc:
+        print(f"WARNING: aux z spot check failed: {type(exc).__name__}: {exc}")
 
 
 def inject_aux_phase_args(phase_args, adaptive_dir: Path) -> None:

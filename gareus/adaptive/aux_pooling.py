@@ -30,23 +30,42 @@ def worker_table(states: Iterable[Tuple[int, dict]]) -> Dict[int, dict]:
     return out
 
 
-def require_admitted_workers(admission: dict, workers: Dict[int, dict], where: str) -> None:
-    """Every worker of the admission record must map to a registry worker (parent + centre + k) in ``workers``.
+def _worker_key_matches(rec: dict, w: dict) -> bool:
+    return (rec.get("spawn_parent_state_id") is not None
+            and int(rec["spawn_parent_state_id"]) == int(w["parent_state_id"])
+            and abs(float(rec["aux_center"]) - float(w["aux_center"])) < 1e-9
+            and abs(float(rec["aux_k_kcal_mol"]) - float(w["aux_k_kcal_mol"])) < 1e-9)
 
-    ``workers`` = {state_id: aux params} of the registry states actually in the union. A missing or
-    stale registry would otherwise silently turn workers into ordinary states and drop the aux term."""
+
+def require_admitted_workers(admission: dict, registry_workers: Dict[int, dict], where: str, *,
+                             pooled: Optional[Dict[int, dict]] = None) -> None:
+    """The admission record's workers and the registry's workers must be the SAME set (parent + centre + k,
+    one-to-one, both directions); with ``pooled`` (the workers actually in the union), every one of them must be
+    pooled too (an admitted worker that is not usable refuses: fail closed).
+
+    A missing or stale registry would otherwise silently turn workers into ordinary states and drop the aux
+    term; a registry worker the record does not list (e.g. after a partial applier refusal) would pool under a
+    record that does not describe it."""
+    recorded = list(admission.get("workers") or [])
+    unmatched = dict(registry_workers)
     missing = []
-    for w in admission.get("workers") or []:
-        hit = any(rec.get("spawn_parent_state_id") is not None
-                  and int(rec["spawn_parent_state_id"]) == int(w["parent_state_id"])
-                  and abs(float(rec["aux_center"]) - float(w["aux_center"])) < 1e-9
-                  and abs(float(rec["aux_k_kcal_mol"]) - float(w["aux_k_kcal_mol"])) < 1e-9
-                  for rec in workers.values())
-        if not hit:
+    for w in recorded:
+        hit = next((sid for sid, rec in unmatched.items() if _worker_key_matches(rec, w)), None)
+        if hit is None:
             missing.append((w["parent_state_id"], w["aux_center"], w["aux_k_kcal_mol"]))
+        else:
+            unmatched.pop(hit)
     if missing:
         raise AuxPoolingRefused(f"{where}: admitted aux worker(s) (parent, centre, k) {missing} have no matching "
                                 "worker state in the registry (state_registry.json missing, stale or unusable)")
+    if unmatched:
+        raise AuxPoolingRefused(f"{where}: registry worker state(s) {sorted(unmatched)} are not in aux_admission.json "
+                                "(the admission record and the registry disagree)")
+    if pooled is not None:
+        absent = sorted(int(sid) for sid in registry_workers if int(sid) not in {int(k) for k in pooled})
+        if absent:
+            raise AuxPoolingRefused(f"{where}: admitted aux worker state(s) {absent} are not usable in the union "
+                                    "(an admitted worker must pool)")
 
 
 def phase_z(label: str, phase_dir: Path, replica, step, model_sha256: str, recorded=None) -> np.ndarray:
