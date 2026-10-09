@@ -1,17 +1,17 @@
 # CVaux Stage C exit evidence (Task 14, CPU)
 
-These are the clean runs of 2026-10-09 at commit `fceca0e`. Scratch dir: `S=/home/sulcjo/.claude/jobs/969c720f/tmp/cvaux_stage_c_e2e`. Nothing is under `RUNS/`.
+These are the clean runs of 2026-10-09 at commit `fceca0e`. The round-2 diagnostics (`DIAG_A`, `DIAG_B`) ran at `78243b2`, which added virtual-site refusal in the physical hash, the re-seal moved after the checkpoint load, and the checkpoint's segment as the resumed segment's parent. A–D were not rerun at `78243b2`; `DIAG_B` exercises its resume path end to end on Reference. Scratch dir: `S=/home/sulcjo/.claude/jobs/969c720f/tmp/cvaux_stage_c_e2e`. Nothing is under `RUNS/`.
 
-## SPEC DEVIATION: the gate passes structurally only, not bitwise and not within any tolerance
+## SPEC DEVIATION: with default (concurrent) replica stepping the gate passes structurally only
 
-The spec gate compares a restarted run with its uninterrupted control. It expects equal ledgers and `max_abs_dz = max_abs_dtorsion = 0` on CPU. That comparison passes in none of the configurations below.
+The spec gate compares a restarted run with its uninterrupted control. It expects equal ledgers and `max_abs_dz = max_abs_dtorsion = 0` on CPU.
 
-- **Across run directories (the brief's `compare_runs(control, resumed)`).**
-  - `ok = False` everywhere: ledgers unequal, `(step, replica, window)` key sets unequal.
-  - `max_abs_dz` is 1.75 (A), 1.94 (B), 1.77 (C) and 1.98 (D).
-  - `max_abs_dtorsion` is 2.14 (A), 2.65 (B), 2.49 (C) and 3.08 (D) rad.
-  - Cause: two fresh builds with `--seed 7` already differ before MD. `01_solvated_start.pdb` differs in hydrogen placement, so separately built dirs can never agree (F2).
-- **In the same directory (controller ruling 2).** The crashed parent's rows past the rollback step serve as the uninterrupted control for that interval. They are compared against the resumed child's rows at the same steps:
+**What was measured with the default concurrent stepping (configs A–D, CPU):**
+- **Across run directories** (the brief's `compare_runs(control, resumed)`): `ok = False` everywhere, with ledgers and `(step, replica, window)` key sets unequal.
+  - `max_abs_dz`: 1.75 (A), 1.94 (B), 1.77 (C), 1.98 (D).
+  - `max_abs_dtorsion`: 2.14 (A), 2.65 (B), 2.49 (C), 3.08 (D) rad.
+  - Two fresh builds with `--seed 7` already differ before MD (hydrogen placement in `01_solvated_start.pdb`). So this cross-directory comparison cannot be met by any resume (F2).
+- **In the same directory** (controller ruling 2): the crashed parent's rows past the rollback step against the resumed child's rows at the same steps.
 
   | Config | Interval (absolute) | Rows | cv1 max\|d\| (Å) | aux z max\|d\| | torsion max\|d\| (rad) | potential max\|d\| (kJ/mol) | Exchange decisions equal |
   |---|---|---|---|---|---|---|---|
@@ -20,14 +20,25 @@ The spec gate compares a restarted run with its uninterrupted control. It expect
   | C | 16000–17500 | 24/24 | 0.197 | 0.93 | 1.76 | 404 | no |
   | D | 2000–3500 | 24/24 | 0.154 | 1.56 | 1.80 | 324 | yes (12/12) |
 
-  - Divergence starts at the first sample after the resume (250 steps), so no tolerance short of "anything" passes.
-- **Why: F3, a legacy residual, not fixed.** A Context-level probe (`ckpt_determinism.py`, no gareus code) shows two things:
-  1. On OpenMM Reference, `loadCheckpoint` into a fresh Context reproduces continuation exactly (max |dx| = 0 nm), with or without a `MonteCarloBarostat`.
-  2. On CPU, OpenMM itself is not reproducible: 1.9e-3 nm without and 7.5e-4 nm with a barostat, after 250 steps.
+  The first compared sample (250 steps after the resume) already differs. No tolerance was evaluated; none was pre-registered.
 
-  A gareus aux crash/resume on Reference still diverged (cv1 0.069 Å at the first sample; 0.158 Å max over 2000–3500). It did so even with the fresh System built from the same PDB as the resume (the PDB-reload experiment, since reverted). So the residual divergence comes from how gareus rebuilds the resumed run, not from OpenMM's checkpoint.
-  - It could not be shown separately for a legacy run. The crash hook is aux-gated (ruling 19), and a graceful SIGTERM checkpoints at the stop step, which leaves no rolled-back rows to compare.
-  - Suspects to investigate (not done): the resumed Context build (PME grid derived from the creation-time box, the NPT/barostat controller state), and post-load re-applies.
+## F3, restated from the round-2 diagnostics (Reference, code 78243b2)
+
+**Measured result: the divergence is caused by concurrent replica stepping. It is a legacy property, not an auxiliary one and not a checkpoint-restore defect.**
+
+1. **(a) Non-aux control, concurrent stepping.** Run `DIAG_A`: config F with `W0.csv`, Reference, `--production-steps 4000`, `--flush-every-log`.
+   - SIGKILL at production step 3500. The legacy `_parent_was_running` seal then cut the parent to 2000 at the plain `--resume`.
+   - Child vs parent rows over 2250–3500: **not bitwise**. cv1 max |d| per sample is 0.163 / 0.047 / 0.142 / 0.084 / 0.036 / 0.087 Å; potential differs by 229–402 kJ/mol. The exchange decisions over the 8 overlapping events were equal.
+   - So the divergence exists without any auxiliary code.
+2. **(b) Aux config D, serialised stepping.** Run `DIAG_B`: config D, Reference, `--active-replicas-per-gpu 1`. Reference replicas share one admission queue, so at most one replica steps at a time, in 50-step turns. It used `--production-steps 4000`, crashed at 3500 and resumed.
+   - Child vs parent over 2250–3500: **bitwise equal in every column** (window_id, cv1, cv2, potential, boosts, v_pep, v_dih, gamd_lambda, tor_000, tor_001, aux_z_00).
+   - All 12 exchange events match: equal decisions and `assignment_sha256_after`, delta_e |d| = 0.
+   - The structural invariants also hold: 64 rows, 0 duplicate keys, ledger complete (8 steps x 4), one `state_definition_sha256`.
+3. **Earlier probe** (`ckpt_determinism.py`, OpenMM only): on Reference, `loadCheckpoint` into a fresh Context reproduces continuation exactly for a single Context. On CPU, OpenMM itself was not reproducible after 250 steps (7.5e-4 to 1.9e-3 nm), so a CPU bitwise gate is not attainable with OpenMM CPU.
+
+**Interpretation, with its limits.** Only the serialised-stepping change separates (b) from the diverging runs. Those runs are `DIAG_A` (non-aux, concurrent) and the round-1 Reference aux run `F1_X` (config A, concurrent, cv1 up to 0.158 Å). That fits the hypothesis that concurrently stepped Reference replicas draw from shared random-number state, whose interleaving differs between continuation and resume. The mechanism itself was not instrumented, and a concurrent Reference run of exactly config D was not made.
+
+**Consequence.** Resume parity is achievable bitwise on Reference with serialised replica stepping, for an auxiliary run. With the default concurrent stepping, only the structural gate below can pass.
 
 ## What passes: the structural gate
 
@@ -55,7 +66,7 @@ Parent `end_step`, from `segments.json`:
 
 The child starts at the checkpoint step every time.
 
-**F4.** A refused resume no longer leaves an orphan segment, and the re-seal walks back to the checkpoint's own segment. In `RUN_A_F4`, a resume with `--temperature-k 301` was refused with `state_definition_sha256 changed ... first differing fields: state.temperature_k: 300.0 -> 301.0`. Its `segments.json` sha was identical before and after (`08787da55c5eb7dd`), and `windows/` still held only `seg_001.json`. The following plain resume completed with 0 duplicate keys and a complete ledger.
+**F4.** Every Context-free refusal runs before the resumed segment is registered, and touches nothing (round 2: `prepare_aux_resume` is read-only). The Context-dependent refusals inside the checkpoint load run after registration, but before the re-seal. On such a refusal, the empty new segment is discarded: its registry entry, its empty data dirs and its snapshot are removed. That is a rollback of the job's own writes, not an absence of writes. The re-seal walks back over orphans to the checkpoint's own segment, and the resumed segment's parent is that segment (round 2). This is measured only for a Context-free refusal (below); the in-load discard path is covered by unit tests, not by a real run. In `RUN_A_F4`, a resume with `--temperature-k 301` was refused with `state_definition_sha256 changed ... first differing fields: state.temperature_k: 300.0 -> 301.0`. Its `segments.json` sha was identical before and after (`08787da55c5eb7dd`), and `windows/` still held only `seg_001.json`. The following plain resume completed with 0 duplicate keys and a complete ledger.
 
 ## Fresh vs resume identities (same in the parent and child snapshot of every config)
 
