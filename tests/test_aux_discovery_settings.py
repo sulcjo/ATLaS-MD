@@ -78,3 +78,22 @@ def test_explicit_aux_model_with_adaptive_production_points_to_flag(tmp_path, ca
         _parse(["--window-mode", "adaptive-production", "--aux-cv-model", str(tmp_path / "m.json"),
                 "--seq", "GYDPETGTWG", "--out", str(tmp_path)])
     assert "--ap-aux-discovery" in capsys.readouterr().err
+
+
+def test_c11_yaml_parses():
+    from pathlib import Path
+    cfg = Path("/run/media/sulcjo/sulcjo-data/IOCB/md/2026_peptide_sampler/RUNS/chignolin_11.yaml")
+    if not cfg.exists():
+        import pytest
+        pytest.skip("RUNS/ not present")
+    from gareus.cli import parse_args
+    try:
+        args = parse_args(["--config", str(cfg), "--out", "/tmp/c11_parse_only"])
+    except ValueError as exc:
+        # c10's yaml needs ATLaS-MD >= 31fee1d (swarm_max_members); this branch predates it.
+        if "swarm.swarm_max_members" in str(exc):
+            import pytest
+            pytest.skip("branch predates 31fee1d (swarm_max_members)")
+        raise
+    assert args.adaptive_production_aux_discovery is True
+    assert args.adaptive_production_aux_reserve_slots == 4

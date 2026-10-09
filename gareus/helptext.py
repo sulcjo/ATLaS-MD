@@ -2304,6 +2304,20 @@ seeds from the old one's frames. Report: epoch_NNN/cv2_respring_report.json
 --ap-cv2-resolution also on, the 3.7 table carries the
 counts and the row grades unresolved under-compressed windows CAUTION.
 
+Aux-CV discovery (--ap-aux-discovery, off by default; --ap-aux-reserve-slots 4).
+At the end of each numbered epoch N >= 1 the driver trains a z3 CVaux on epochs < N, scores
+it on holdout epoch N and, if it passes and adaptive_production/aux_validation.json is
+valid, admits up to --ap-aux-reserve-slots lambda = 0 aux workers from the P1 reserve
+(status in epoch_NNN/aux_discovery_report.json: insufficient_evidence, keep,
+no_evaluation_partition, broaden, no_worker, validation_missing, alignment, ok, error).
+Model, partition, settings and admission are frozen in adaptive_production/ (aux_*.json);
+--ap-aux-settings-override replaces the settings. Workers are invisible to respring, R1-R3,
+retirement and respace; the union MBAR pools them only after admission, using recorded z
+(post-admission) or XTC-backfilled z (before). Needs adaptive-production, no --ap-topups,
+unrestricted exchange, a pep-gamd boost, traj_interval == distance_output_interval dividing
+exchange_interval, and no --us-auto-drop-bad-windows. Replay:
+python -m gareus.adaptive.aux_discovery replay <run_dir> --epoch N --out DIR.
+
 Reporting (spec 3.7). One table per phase from files that already exist:
     python -m gareus.adaptive.cv2_resolution_summary RUNS/<run>/adaptive_production [--out DIR]
 writes cv2_resolution_summary.json (cv2_resolution_summary_v3) + _states.csv/_edges.csv
