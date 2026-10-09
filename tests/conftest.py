@@ -222,7 +222,7 @@ def _fixed_discovery(discover_calls):
     from gareus.adaptive.aux_discovery.pipeline import DiscoveryResult
     from gareus.adaptive.aux_discovery.z3_search import Z3Candidate, emit_model
 
-    def _discover(*, ft, epoch, settings, out_dir, k3_max):
+    def _discover(*, ft, epoch, settings, out_dir, k3_max, eligible_parents=None):
         discover_calls.append(int(epoch))
         tors = np.asarray(ft.tors, dtype=np.float64)
         w = np.linspace(1.0, -0.5, tors.shape[1])
@@ -237,6 +237,8 @@ def _fixed_discovery(discover_calls):
         model = emit_model(cand, ft.definition, H._full_topology(out_dir), label=f"e2e-epoch{int(epoch):03d}",
                            provenance={"source": "task17-e2e"})
         lam0 = np.asarray(ft.lam) == 0.0
+        if eligible_parents is not None:              # the hook's admission limits (fix wave C1)
+            lam0 &= np.isin(np.asarray(ft.state_id), np.asarray(list(eligible_parents), dtype=np.int64))
         parent = int(np.min(np.asarray(ft.state_id)[lam0]))
         c3 = float(np.mean(zr[np.asarray(ft.state_id) == parent]))
         chosen = [{"state_id": parent, "c3": c3, "k3": SMALL_CAMPAIGN_AUX_K3, "O": 0.3, "TV": 0.2,

@@ -43,7 +43,14 @@ def test_admission_through_epoch_loop_and_resume(tmp_path, small_adaptive_campai
         assert (run.phase_dir(label) / BACKFILL_FILENAME).exists(), label
     chk = check_backfill_against_recorded(run.phase_dir("epoch_002"), run.model(), adaptive_dir=ad)
     print(f"recorded-vs-frame aux z: {chk}")
-    assert chk["ok"] and chk["n_compared"] > 0
+    assert chk["n_compared"] > 0 and np.isfinite(chk["max_abs_dev"])
+    # the driver ran the kT-judged spot check once, on the first post-admission phase (never blocks)
+    spot = json.loads((ad / "aux_admission.json").read_text())["spot_check"]
+    print(f"driver spot check: {spot}")
+    assert spot["epoch"] == 2 and spot["n_compared"] > 0
+    assert np.isfinite(spot["max_abs_dev"]) and np.isfinite(spot["max_energy_err_kt"]) and len(spot["per_worker"]) == 1
+    rep2 = json.loads((ad / "epoch_002" / "aux_discovery_report.json").read_text())
+    assert rep2["spot_check"][-1]["max_energy_err_kt"] == spot["max_energy_err_kt"]
 
     # union pools every phase and includes the worker (manual build and the driver's own end-of-campaign union)
     from gareus.adaptive_production import build_union_state_mbar_inputs
