@@ -156,6 +156,46 @@ def data_boundary(out_dir, segment_id: str) -> dict[str, dict[str, int]]:
     return out
 
 
+def committed_rows_up_to(out_dir, kind: str, segment_id: str, step: int) -> int:
+    """Committed (manifest-listed) rows of one segment with ``step <= step`` -- the step column only.
+
+    Read straight from the manifest's files (no eligibility filter: pilot segments count too).
+    """
+    from ..parquet_manifest import committed_files
+    seg_dir = Path(out_dir) / kind / str(segment_id)
+    files = committed_files(seg_dir, expected_kind=kind) if seg_dir.is_dir() else None
+    if not files:
+        return 0
+    import pyarrow.parquet as pq
+    n = 0
+    for path in files:
+        steps = np.asarray(pq.read_table(path, columns=["step"]).column("step").to_numpy(zero_copy_only=False))
+        n += int(np.count_nonzero(steps.astype(np.int64) <= int(step)))
+    return n
+
+
+def check_data_boundary(out_dir, manifest: Mapping[str, Any]) -> None:
+    """The checkpoint segment's committed rows at or before the checkpoint step must reach the counts its
+    ``data_boundary`` recorded at save time (spec Section 9; final fix wave I1).
+
+    Fewer rows means the samples/exchanges on disk are older than the checkpoint (a restored or rolled-back
+    data directory, a lost flush): resuming would leave a hole the checkpoint claims is filled.
+    """
+    block = manifest["aux"]
+    boundary = block.get("data_boundary")
+    if not isinstance(boundary, Mapping):
+        raise IntegrityError("resume refused: the auxiliary checkpoint records no data_boundary")
+    seg, step = str(block["segment_id"]), int(manifest.get("absolute_step", 0))
+    for kind in ("samples", "exchanges"):
+        want = int(boundary[kind]["n_rows"])
+        have = committed_rows_up_to(out_dir, kind, seg, step)
+        if have < want:
+            raise IntegrityError(
+                f"resume refused: segment {seg} holds {have} committed {kind} rows at or before the checkpoint step "
+                f"{step}, but the checkpoint's data_boundary recorded {want}; the {kind} on disk are older than "
+                "the checkpoint")
+
+
 def anchor_ledger_events(out_dir, manifest: Mapping[str, Any]) -> dict:
     """The exchange events of the checkpoint's ledger-anchor segment only (carry-over 2).
 
@@ -174,7 +214,8 @@ def prepare_aux_resume(out_dir, registry, manifest: Mapping[str, Any], *, state_
 
     Task 14 F4 (fix round 2): read-only -- it never changes the registry. Order: static checkpoint binding
     (``verify_aux_resume_static``), the ledger replay from the anchor segment, the duplicate-event check on
-    the registry view the re-seal will leave. Returns the re-seal plan: ``run_gareus`` registers the resumed
+    the registry view the re-seal will leave. The checkpoint's data_boundary is enforced right after the
+    static binding (final fix wave I1). Returns the re-seal plan: ``run_gareus`` registers the resumed
     segment under ``parent_segment_id`` (the checkpoint's segment, never an orphan) and applies
     ``store.reseal_chain_for_resume`` only after the Context-dependent checks in the checkpoint load passed.
     """
@@ -182,6 +223,7 @@ def prepare_aux_resume(out_dir, registry, manifest: Mapping[str, Any], *, state_
     from .ledger import refuse_duplicate_event_keys
     verify_aux_resume_static(manifest, aux_enabled=True, state_definition=state_definition, force_info=force_info,
                              topology_sha256=topology_sha256, kernel_identity_digest=kernel_identity_digest)
+    check_data_boundary(out_dir, manifest)
     verify_aux_ledger(manifest, anchor_ledger_events(out_dir, manifest))
     ckpt_seg, ckpt_step = str(manifest["aux"]["segment_id"]), int(manifest.get("absolute_step", 0))
     refuse_duplicate_event_keys(_ledger_after_reseal(out_dir, registry, ckpt_seg, ckpt_step))

@@ -314,3 +314,59 @@ def test_final_report_prints_the_skip_reason_on_aux_runs_only(tmp_path, monkeypa
     assert "Status: **SKIPPED**" in aux and aux.count("Reason: because X") == 2
     legacy = _final_report(tmp_path / "l", monkeypatch, False)
     assert "Reason:" not in legacy
+
+
+# I1: the checkpoint's data_boundary is enforced before the resumed segment is registered ---------
+
+def _seg_with_samples(tmp_path, steps):
+    from gareus.store import ParquetSampleWriter, SegmentRegistry
+    reg = SegmentRegistry(tmp_path)
+    seg = reg.open_segment("run", None, 1)
+    w = ParquetSampleWriter(tmp_path / "samples" / seg)
+    for s in steps:
+        w.write_sample(step=s, replica=0, window_id=0, cv1=0.1, cv2=None, potential=0.0, boost_total=None,
+                       boost_dihedral=None, boost_nonbonded=None)
+    w.flush()
+    return reg, seg
+
+
+def _ckpt(seg, step, n_samples, n_exchanges=0):
+    return {"absolute_step": step, "assignments": [0],
+            "aux": {"segment_id": seg, "data_boundary": {"samples": {"generation": 1, "n_rows": n_samples},
+                                                         "exchanges": {"generation": 0, "n_rows": n_exchanges}},
+                    "ledger_anchor": {"segment_id": seg, "start_step": 0, "start_assignments": [0]}}}
+
+
+def test_data_boundary_counts_only_rows_up_to_the_checkpoint_step(tmp_path):
+    from gareus.auxiliary_cv.runtime_io import check_data_boundary
+    _reg, seg = _seg_with_samples(tmp_path, [10, 20, 30])
+    check_data_boundary(tmp_path, _ckpt(seg, 20, 2))
+    with pytest.raises(IntegrityError, match="data_boundary"):
+        check_data_boundary(tmp_path, _ckpt(seg, 20, 3))           # row at step 30 is after the checkpoint
+    with pytest.raises(IntegrityError, match="exchanges"):
+        check_data_boundary(tmp_path, _ckpt(seg, 20, 2, n_exchanges=1))
+
+
+def test_data_boundary_missing_is_refused(tmp_path):
+    from gareus.auxiliary_cv.runtime_io import check_data_boundary
+    _reg, seg = _seg_with_samples(tmp_path, [10])
+    m = _ckpt(seg, 10, 1)
+    del m["aux"]["data_boundary"]
+    with pytest.raises(IntegrityError, match="data_boundary"):
+        check_data_boundary(tmp_path, m)
+
+
+def test_samples_manifest_older_than_the_boundary_refuses_before_registration(tmp_path, monkeypatch):
+    import gareus.auxiliary_cv.checkpoint as ck
+    from gareus.auxiliary_cv.runtime_io import prepare_aux_resume
+    reg, seg = _seg_with_samples(tmp_path, [10, 20])
+    monkeypatch.setattr(ck, "verify_aux_resume_static", lambda *a, **k: None)
+    monkeypatch.setattr(ck, "verify_aux_ledger", lambda *a, **k: None)
+    before = [s["segment_id"] for s in reg.all_segments()]
+    with pytest.raises(IntegrityError, match="data_boundary"):
+        prepare_aux_resume(tmp_path, reg, _ckpt(seg, 20, 5), state_definition={}, force_info=None,
+                           topology_sha256="t", kernel_identity_digest="k")
+    assert [s["segment_id"] for s in reg.all_segments()] == before
+    plan = prepare_aux_resume(tmp_path, reg, _ckpt(seg, 20, 2), state_definition={}, force_info=None,
+                              topology_sha256="t", kernel_identity_digest="k")
+    assert plan["checkpoint_step"] == 20 and plan["parent_segment_id"] == seg
