@@ -1129,14 +1129,20 @@ def load_data(inp: Path, out: Optional[Path], source: str = 'auto', no_augment: 
     # Adaptive-production: prefer new Parquet epoch data, fall back to legacy NPZ.
     if prod.name == 'adaptive_production':
         # CVaux Stage C (rulings B3/H4): union NPZ, epoch CSV and union Parquet cannot carry the auxiliary term.
-        _refuse_aux_run(prod, {}, depth=2)
+        # A campaign whose driver admitted aux workers (aux_admission.json) pools ONLY through the union-Parquet
+        # loader, which evaluates the worker restraint from per-sample z (final fix wave C3).
+        from gareus.kernel_identity import AuxPoolingRefused, aux_admission_allows_pooling
+        _aux_admitted = aux_admission_allows_pooling(prod) is not None
+        if not _aux_admitted:
+            _refuse_aux_run(prod, {}, depth=2)
         union_npz = prod / 'adaptive_union_mbar.npz'
         _stale = _union_npz_older_than_samples(prod, union_npz) if (low_memory and epoch_ids is None
-                                                                    and union_npz.exists()) else None
+                                                                    and union_npz.exists()
+                                                                    and not _aux_admitted) else None
         if _stale:
             print(f'    WARNING [load] --low-memory: adaptive_union_mbar.npz is older than {_stale} '
                   '(a phase ran on after the snapshot); loading Parquet sequentially instead')
-        if low_memory and epoch_ids is None and union_npz.exists() and not _stale:
+        if low_memory and epoch_ids is None and union_npz.exists() and not _stale and not _aux_admitted:
             prov_notes = check_union_npz_window_map_provenance(prod)
             d = load_union_npz(prod, low_memory=True)
             if analysis_stride > 1 or analysis_stride_offset > 0:
@@ -1153,6 +1159,9 @@ def load_data(inp: Path, out: Optional[Path], source: str = 'auto', no_augment: 
         has_epoch_parquet = has_registry and any(prod.glob('*/samples/**/*.parquet'))
         if not has_epoch_parquet:
             has_epoch_parquet = bool(_find_adaptive_epoch_dirs(prod, epoch_ids=epoch_ids))
+        if _aux_admitted and not has_epoch_parquet:
+            raise AuxPoolingRefused(f'{prod}: admitted auxiliary workers (aux_admission.json) pool only through '
+                                    'the union-Parquet loader, and no epoch Parquet data was found')
         if has_epoch_parquet:
             d = load_parquet_adaptive_union(
                 prod, n_threads=n_threads, n_workers=n_workers, epoch_ids=epoch_ids,

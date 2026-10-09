@@ -971,7 +971,8 @@ OVERLAP_SPACE_MARGINAL = 'cv1_marginal'
 OVERLAP_SPACE_JOINT = 'cv1_cv2_joint'
 
 # CVaux Stage C final fix wave I2 (spec Section 15): diagnostics not yet audited for auxiliary states report
-# this, never a pass. Keyed strictly on meta['aux_models'] (set only by load_parquet's auxiliary branch).
+# this, never a pass. Keyed strictly on meta['aux_models'] (set by load_parquet's auxiliary branch and by the
+# adaptive union-Parquet loader when it pools admitted aux workers).
 AUX_DIAGNOSTICS_UNAVAILABLE = 'unavailable: aux states (Stage D audit)'
 
 

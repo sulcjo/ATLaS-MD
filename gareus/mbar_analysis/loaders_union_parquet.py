@@ -780,6 +780,9 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
     if _aux_cols:
         meta_out['aux_states'] = sorted(int(k) for k in _aux_cols)
         meta_out['aux_model_sha256'] = str(_aux_rec['model_sha256'])
+        # The Stage D audit flag (pmf.aux_diagnostics_unavailable): ladder crosscheck / ladder_overlap / overlap
+        # grades report unavailable and the banner is capped at CAUTION (final fix wave I1).
+        meta_out['aux_models'] = [str(_aux_rec['model_sha256'])]
         meta_out['aux_burnin_dropped'] = dict(_aux_burnin)
         meta_out['aux_parent_state'] = {int(k): state_id_to_k.get(int(rec['spawn_parent_state_id']))
                                         if rec.get('spawn_parent_state_id') is not None else None

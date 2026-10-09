@@ -1,6 +1,7 @@
 # tests/test_aux_analyzer_unavailable.py
 """Final fix wave I2 (spec Section 15): analyzer diagnostics not yet audited for auxiliary states report
-'unavailable', never PASS -- gated strictly on the aux_models flag load_parquet's aux branch sets.
+'unavailable', never PASS -- gated strictly on the aux_models flag load_parquet's aux branch and the adaptive
+union-Parquet loader (admitted workers) set.
 Legacy (no flag) rows and summaries are pinned unchanged."""
 import copy
 import json
