@@ -1029,7 +1029,20 @@ def _add_swarm_args(p: argparse.ArgumentParser) -> None:
                         "overrides --swarm-replicates-per-cell (the derivation is printed).")
     p.add_argument("--swarm-bins", type=str, default="4,3,3",
                    help="Comma-separated cell counts on heavy-CV1 x Rg x end-to-end distance "
-                        "(quantile edges from the seed library, never a fixed [0,1] grid).")
+                        "(quantile edges from the seed library, never a fixed [0,1] grid). Five entries "
+                        "(e.g. 4,3,3,3,3) add two contact-pattern PCA axes cpc1 x cpc2 (PCA of the seeds' CA "
+                        "residue-pair contact vectors; basis from the library's contact_pca_basis.json -- GENPEPT "
+                        "--contact-pca-strata -- else fitted on the library), frozen in swarm/round_000/.")
+    p.add_argument("--swarm-max-members", type=int, default=0,
+                   help="Cap on the round's members (0 = off: --swarm-replicates-per-cell members in every occupied "
+                        "cell). With a cap, members are dealt round-robin over cells (largest first): every cell its "
+                        "first distinct seed before any cell a second, up to the per-cell quota. Keeps the budget "
+                        "fixed when more axes multiply the cells.")
+    p.add_argument("--swarm-contact-pca-cutoff-a", type=float, default=8.0,
+                   help="CA-CA contact cutoff (A) when the contact-PCA basis is fitted on the seed library "
+                        "(a library basis from GENPEPT carries its own).")
+    p.add_argument("--swarm-contact-pca-min-sep", type=int, default=3,
+                   help="Minimum residue separation |i - j| of the contact-PCA residue pairs (fitted basis only).")
     p.add_argument("--swarm-equil-ps", type=float, default=100.0,
                    help="Discarded-by-construction equilibration per member, in ps.")
     p.add_argument("--swarm-output-interval-ps", type=float, default=2.0,
@@ -2248,6 +2261,15 @@ def parse_args(argv: Optional[Iterable[str]] = None):
         p.error(f"--swarm-seed-frame-interval-ps {_frame_ps:g} must be a whole multiple of "
                 f"--swarm-output-interval-ps {_out_ps:g} (frames are written every N trace rows; "
                 f"{_ratio:g} would round to {max(1, round(_ratio)) * _out_ps:g} ps)")
+    try:
+        _nb = [int(x) for x in str(getattr(args, "swarm_bins", "4,3,3") or "4,3,3").split(",")]
+    except ValueError:
+        _nb = []
+    if len(_nb) not in (3, 5) or any(x < 1 for x in _nb):
+        p.error(f"--swarm-bins needs 3 (cv1,rg,e2e) or 5 (+ contact-PCA cpc1,cpc2) positive ints, "
+                f"got {getattr(args, 'swarm_bins', None)!r}")
+    if int(getattr(args, "swarm_max_members", 0) or 0) < 0:
+        p.error("--swarm-max-members must be >= 0 (0 = no cap)")
     _lam_max = float(getattr(args, "swarm_lambda_max", 1.0))
     if not (math.isfinite(_lam_max) and 0.0 < _lam_max <= 1.0):
         p.error(f"--swarm-lambda-max must be in (0, 1], got {_lam_max:g}")

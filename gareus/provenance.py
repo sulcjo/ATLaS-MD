@@ -309,7 +309,8 @@ def _method_settings(args: Any) -> dict[str, Any]:
         # path (global-constraints.md's binding anchor -- these are ab initio, no native
         # reference of any kind is recorded here or anywhere else in this stage).
         "swarm_stage", "swarm_seed_ns", "swarm_replicates_per_cell", "swarm_budget_ns",
-        "swarm_bins", "swarm_equil_ps", "swarm_output_interval_ps", "swarm_seed_frame_interval_ps",
+        "swarm_bins", "swarm_max_members", "swarm_contact_pca_cutoff_a", "swarm_contact_pca_min_sep",
+        "swarm_equil_ps", "swarm_output_interval_ps", "swarm_seed_frame_interval_ps",
         "swarm_graft_minimize_iters", "swarm_member_workers", "swarm_member_range", "swarm_round", "swarm_seed_source",
         "swarm_production_seed_csv", "swarm_n_windows", "swarm_overlap_sigma", "swarm_target_beta_sigma",
         "swarm_min_rungs", "swarm_max_rungs", "swarm_lambda_max", "swarm_ess_floor", "swarm_seeds_per_window",

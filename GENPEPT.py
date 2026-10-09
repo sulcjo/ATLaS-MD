@@ -3037,6 +3037,71 @@ def iter_candidate_indices_by_diversity(X: np.ndarray, selected_idx: np.ndarray,
 
 
 
+def fit_contact_pca_on_pool(args, gen_store, out_dir: Path):
+    """Contact-PCA stratification axes (gareus/contact_pca.py): fit the basis on the whole
+    generation pool's CA contact vectors, save ``contact_pca_basis.json`` next to the outputs,
+    and attach the pool's (n, 2) axis values as ``gen_store.contact_pcs``."""
+    from gareus.contact_pca import BASIS_FILENAME, fit_basis
+    contacts = np.asarray(gen_store.contacts)
+    basis = fit_basis(contacts, cutoff_A=float(getattr(args, "contact_cutoff", 8.0)),
+                      min_sep=int(getattr(args, "contact_min_sep", 3)), n_residues=len(gen_store.seq),
+                      source=f"genpept generation pool ({contacts.shape[0]} conformers)")
+    basis.save(Path(out_dir) / BASIS_FILENAME)
+    gen_store.contact_pcs = basis.project(contacts) if contacts.size else np.zeros((0, 2))
+    ui_message(f"Contact-PCA basis: {contacts.shape[1]} residue pairs, explained variance "
+               f"{basis.explained_variance_ratio[0]:.2f}/{basis.explained_variance_ratio[1]:.2f} -> {BASIS_FILENAME}")
+    return basis
+
+
+def survivor_contact_pca(args, out_dir: Path, contacts_arr: np.ndarray, seq_len: int):
+    """(basis, (n, 2) axis values) for the viable pool: the generation-pool basis when it was
+    saved and matches these vectors, else one fitted on the viable pool itself (and saved)."""
+    from gareus.contact_pca import BASIS_FILENAME, fit_basis, load_basis
+    path = Path(out_dir) / BASIS_FILENAME
+    basis = None
+    if path.exists():
+        try:
+            basis = load_basis(path)
+            if basis.n_pairs != contacts_arr.shape[1]:
+                basis = None
+        except Exception:
+            basis = None
+    if basis is None:
+        basis = fit_basis(contacts_arr, cutoff_A=float(getattr(args, "contact_cutoff", 8.0)),
+                          min_sep=int(getattr(args, "contact_min_sep", 3)), n_residues=int(seq_len),
+                          source=f"genpept viable implicit pool ({contacts_arr.shape[0]} minima)")
+        basis.save(path)
+    return basis, basis.project(contacts_arr)
+
+
+def stratified_select(X: np.ndarray, n_select: int, method: str, badness: Optional[np.ndarray], cell_keys):
+    """Every occupied stratification cell represented first (its lowest-badness member, cells
+    by size, then key), the rest by ``select_by_minibatch_or_farthest`` over what is left;
+    labels = nearest selected centre, as the unstratified path."""
+    n = len(X)
+    n_select = max(1, min(int(n_select), n))
+    cells = {}
+    for i, key in enumerate(cell_keys):
+        cells.setdefault(tuple(key), []).append(i)
+    order = sorted(cells, key=lambda k: (-len(cells[k]), k))
+    first = []
+    for key in order[:n_select]:
+        members = cells[key]
+        first.append(min(members, key=lambda i: (float(badness[i]) if badness is not None else 0.0, i)))
+    need = n_select - len(first)
+    rest = []
+    if need > 0:
+        taken = set(first)
+        remaining = np.asarray([i for i in range(n) if i not in taken], dtype=int)
+        if remaining.size:
+            loc, _ = select_by_minibatch_or_farthest(X[remaining], need, method,
+                                                     None if badness is None else badness[remaining])
+            rest = [int(remaining[int(j)]) for j in loc]
+    selected = np.asarray(first + rest, dtype=int)
+    labels = nearest_center_labels_chunked(X, X[selected])
+    return selected, labels
+
+
 def preselection_quota_indices(args, gen_store: CompactGenerationStore) -> tuple[np.ndarray, dict]:
     """Cheap diversity-preserving quota filter before expensive clustering.
 
@@ -3068,6 +3133,12 @@ def preselection_quota_indices(args, gen_store: CompactGenerationStore) -> tuple
     else:
         bank_values = [str(getattr(r, "bank_name", "default") or "default") for r in gen_store.records]
 
+    pcs = getattr(gen_store, "contact_pcs", None)
+    pc_edges = None
+    if pcs is not None and bool(getattr(args, "contact_pca_strata", False)):
+        from gareus.contact_pca import quantile_edges as _cp_edges
+        n_pc_bins = max(1, int(getattr(args, "contact_pca_bins", 3) or 3))
+        pc_edges = [_cp_edges(pcs[:, k], n_pc_bins) for k in range(2)]
     for i in range(n):
         bank = bank_values[i] if use_bank and i < len(bank_values) else "all"
         key = (
@@ -3076,6 +3147,9 @@ def preselection_quota_indices(args, gen_store: CompactGenerationStore) -> tuple
             int(math.floor(int(gen_store.contact_count[i]) / contact_bin)),
             bank,
         )
+        if pc_edges is not None:
+            from gareus.contact_pca import bin_index as _cp_bin
+            key = key + (_cp_bin(pcs[i, 0], pc_edges[0]), _cp_bin(pcs[i, 1], pc_edges[1]))
         cbin = counts.get(key, 0)
         if cbin < quota:
             kept.append(i)
@@ -3094,6 +3168,7 @@ def preselection_quota_indices(args, gen_store: CompactGenerationStore) -> tuple
         "end_to_end_bin_A": float(e2e_bin),
         "contact_count_bin": int(contact_bin),
         "include_bank": bool(use_bank),
+        "contact_pca_bins": None if pc_edges is None else [len(e) - 1 for e in pc_edges],
     }
     return kept_idx, summary
 
@@ -3263,6 +3338,8 @@ def generate_candidates(args):
     gen_store.save(out_dir / "generation_compact_records.npz")
     contacts = gen_store.contacts
     descriptors = gen_store.descriptors
+    if bool(getattr(args, "contact_pca_strata", False)):
+        fit_contact_pca_on_pool(args, gen_store, out_dir)
     # The numerical selection path now uses compact arrays. The records list is
     # retained only for optional CSV output and selected-PDB reconstruction.
     contact_rows = desc_rows = None
@@ -6154,7 +6231,20 @@ def select_implicit_survivors(args, implicit_results: list[MinResult]):
 
     X_basin = build_feature_matrix(contacts_arr, desc_arr[:, :3])
     n_final = min(args.n_final_seeds, len(viable_rows))
-    selected_idx, basin_labels = select_by_minibatch_or_farthest(X_basin, n_final, args.cluster_method, badness)
+    if bool(getattr(args, "contact_pca_strata", False)):
+        from gareus.contact_pca import bin_index as _cp_bin, quantile_edges as _cp_edges
+        _basis, pcs = survivor_contact_pca(args, out_dir, contacts_arr, len(validate_sequence(args.seq)))
+        n_pc_bins = max(1, int(getattr(args, "contact_pca_bins", 3) or 3))
+        pc_edges = [_cp_edges(pcs[:, k], n_pc_bins) for k in range(2)]
+        cell_keys = [(_cp_bin(pcs[i, 0], pc_edges[0]), _cp_bin(pcs[i, 1], pc_edges[1])) for i in range(len(pcs))]
+        for i, row in enumerate(viable_rows):
+            row.update({"contact_pc1": float(pcs[i, 0]), "contact_pc2": float(pcs[i, 1]),
+                        "contact_pca_cell": f"{cell_keys[i][0]}_{cell_keys[i][1]}"})
+        selected_idx, basin_labels = stratified_select(X_basin, n_final, args.cluster_method, badness, cell_keys)
+        ui_message(f"Contact-PCA strata: {len(set(cell_keys))} occupied cells of "
+                   f"{(len(pc_edges[0]) - 1) * (len(pc_edges[1]) - 1)}, each represented in the survivors")
+    else:
+        selected_idx, basin_labels = select_by_minibatch_or_farthest(X_basin, n_final, args.cluster_method, badness)
 
     swaps_json = {}
     if bool(getattr(args, "mirror_balance", False)):
@@ -8193,6 +8283,15 @@ def parse_args(argv=None):
                    help="T7 capture radius: parent N-O pairs closer than this are restrained (A). Default 6.0.")
     p.add_argument("--t7-max-pairs", type=int, default=0,
                    help="T7 cap on restrained pairs per parent, nearest first (0 = no cap). Default 0.")
+    p.add_argument("--contact-pca-strata", action="store_true", default=False,
+                   help="Stratify on two contact-pattern PCA axes (PCA of the CA residue-pair contact vectors, "
+                        "--contact-cutoff/--contact-min-sep; basis fitted on the generation pool, saved as "
+                        "contact_pca_basis.json): the quota preselection key gains the two axes' quantile bins "
+                        "and the final survivors represent every occupied (pc1, pc2) cell before the usual "
+                        "farthest/minibatch fill. final_survivor_seeds.csv gains contact_pc1/contact_pc2/"
+                        "contact_pca_cell. Off by default.")
+    p.add_argument("--contact-pca-bins", type=int, default=3,
+                   help="Quantile bins per contact-PCA axis (with --contact-pca-strata).")
     p.add_argument("--preselection-bin-quota", type=int, default=0,
                    help="If >0, keep at most this many generated conformers per coarse Rg/E2E/contact-count/bin before clustering. Cheaply removes duplicate shapes.")
     p.add_argument("--preselection-rg-bin-A", type=float, default=1.0)
