@@ -713,7 +713,8 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                         "plan. Off by default; frozen decision rule.")
     p.add_argument("--ap-aux-discovery", action=argparse.BooleanOptionalAction, default=False,
                    help="Discover a torsion-linear auxiliary CV (z3) from this campaign's own frames at each "
-                        "numbered-epoch boundary from the end of epoch 1 and admit up to 4 lambda=0 worker states "
+                        "numbered-epoch boundary from the end of epoch 1 (never the last) and admit at most "
+                        "min(4, --ap-aux-reserve-slots minus live workers, free --max-replicas slots) lambda=0 worker states "
                         "(spec 2026-10-09-cvaux-adaptive-discovery-design.md). Off by default.")
     p.add_argument("--ap-aux-reserve-slots", type=int, default=4,
                    help="Replica slots of the P1 reserve kept for auxiliary workers (R1/R3 never use them).")
