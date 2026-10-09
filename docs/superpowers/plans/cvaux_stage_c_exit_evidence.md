@@ -1,6 +1,18 @@
 # CVaux Stage C exit evidence (Task 14, CPU)
 
-These are the clean runs of 2026-10-09 at commit `fceca0e`. The round-2 diagnostics (`DIAG_A`, `DIAG_B`) ran at `78243b2`, which added virtual-site refusal in the physical hash, the re-seal moved after the checkpoint load, and the checkpoint's segment as the resumed segment's parent. A–D were not rerun at `78243b2`; `DIAG_B` exercises its resume path end to end on Reference. Scratch dir: `S=/home/sulcjo/.claude/jobs/969c720f/tmp/cvaux_stage_c_e2e`. Nothing is under `RUNS/`.
+Scratch dir: `S=/home/sulcjo/.claude/jobs/969c720f/tmp/cvaux_stage_c_e2e`. Nothing is under `RUNS/`.
+
+## Which commit each result comes from
+- **Shipping commit `cbd26c7` (fix round 3).** Configs A (`RUN_A3_*`) and C (`RUN_C3_*`), plus the real refuse → fix → resume (`RUN_A3_F4`), were re-run here. Every structural check below holds for all three:
+  - parent `end_step`: A 3500 → 2000, C 17500 → 16000;
+  - the resumed `seg_002` has `parent_segment_id` `seg_001`;
+  - 96/96 rows, 0 duplicate keys, key set equal to the control's;
+  - ledger complete (12 x 4), 0 duplicate `(step, attempt_seq)`;
+  - one `state_definition_sha256`, finite `u_nk`;
+  - physical hash `c0ee726fb6750b40` parent = child.
+  - `RUN_A3_F4`: `--temperature-k 301` was refused ("state.temperature_k: 300.0 -> 301.0"). `segments.json` was unchanged (`3cdf3518bb818daf`), only `seg_001.json` existed, and the fixed resume passed.
+- **Predates the resume reorder (clean round, `fceca0e`).** Configs B and D, the graceful SIGTERM run `RUN_A_R`, and the first A/C/`RUN_A_F4` runs. Their structural results are below. They were not re-run at `cbd26c7`.
+- **Round-2 diagnostics (`78243b2`).** `DIAG_A` and `DIAG_B`.
 
 ## SPEC DEVIATION: with default (concurrent) replica stepping the gate passes structurally only
 
@@ -22,9 +34,9 @@ The spec gate compares a restarted run with its uninterrupted control. It expect
 
   The first compared sample (250 steps after the resume) already differs. No tolerance was evaluated; none was pre-registered.
 
-## F3, restated from the round-2 diagnostics (Reference, code 78243b2)
+## F3: diagnostics consistent with concurrent replica stepping as the cause (hypothesis; Reference, code 78243b2)
 
-**Measured result: the divergence is caused by concurrent replica stepping. It is a legacy property, not an auxiliary one and not a checkpoint-restore defect.**
+**Measured: a non-aux concurrent run diverges after resume, and one aux run with serialised stepping resumes bitwise. Both are consistent with the hypothesis that concurrent replica stepping causes the divergence; neither proves it.**
 
 1. **(a) Non-aux control, concurrent stepping.** Run `DIAG_A`: config F with `W0.csv`, Reference, `--production-steps 4000`, `--flush-every-log`.
    - SIGKILL at production step 3500. The legacy `_parent_was_running` seal then cut the parent to 2000 at the plain `--resume`.
@@ -36,13 +48,19 @@ The spec gate compares a restarted run with its uninterrupted control. It expect
    - The structural invariants also hold: 64 rows, 0 duplicate keys, ledger complete (8 steps x 4), one `state_definition_sha256`.
 3. **Earlier probe** (`ckpt_determinism.py`, OpenMM only): on Reference, `loadCheckpoint` into a fresh Context reproduces continuation exactly for a single Context. On CPU, OpenMM itself was not reproducible after 250 steps (7.5e-4 to 1.9e-3 nm), so a CPU bitwise gate is not attainable with OpenMM CPU.
 
-**Interpretation, with its limits.** Only the serialised-stepping change separates (b) from the diverging runs. Those runs are `DIAG_A` (non-aux, concurrent) and the round-1 Reference aux run `F1_X` (config A, concurrent, cv1 up to 0.158 Å). That fits the hypothesis that concurrently stepped Reference replicas draw from shared random-number state, whose interleaving differs between continuation and resume. The mechanism itself was not instrumented, and a concurrent Reference run of exactly config D was not made.
+**Interpretation, with its limits.** The two diagnostics differ in more than the stepping mode, so they do not isolate it. Confounds between `DIAG_A` (diverges) and `DIAG_B` (bitwise):
+- **Configuration:** F with the `W0` table (4 ordinary windows) vs D (aux slot table, NVT production).
+- **Auxiliary code:** non-aux vs aux (aux force, aux sample/event writers, `prepare_aux_resume` / re-seal path).
+- **Stepping machinery:** default `pool.map` stepping (all replicas at once) vs the admission dispatcher with one active replica and 50-step turns.
+- **Interruption:** SIGKILL with `--flush-every-log` vs the aux-only exception hook at 3500.
 
-**Consequence.** Resume parity is achievable bitwise on Reference with serialised replica stepping, for an auxiliary run. With the default concurrent stepping, only the structural gate below can pass.
+The round-1 Reference aux run `F1_X` (config A, concurrent stepping, with an experimental code change since reverted) also diverged. That fits the same hypothesis, but it is a different config and code. "Bitwise for an aux run" rests on a single run (`DIAG_B`). The suspected mechanism (shared random-number state across concurrently stepped Reference replicas) was not instrumented. A discriminating follow-up would be config D on Reference with and without `--active-replicas-per-gpu 1`, everything else identical.
+
+**Consequence.** One aux run with serialised stepping resumed bitwise on Reference. With the default concurrent stepping, only the structural gate below passed.
 
 ## What passes: the structural gate
 
-Every check below holds for A, B, C, D, `RUN_A_R` (SIGTERM) and `RUN_A_F4` (refuse → fix → resume), each against its config's control:
+Every check below holds for A, B, C, D, `RUN_A_R` (SIGTERM) and `RUN_A_F4` (refuse → fix → resume) at `fceca0e`, and for `RUN_A3_X`, `RUN_A3_F4` and `RUN_C3_X` at the shipping commit `cbd26c7`, each against its config's control:
 - 96/96 sample rows;
 - 0 duplicate `(step, replica)` keys;
 - `(step, replica)` key set equal to the control's;
