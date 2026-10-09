@@ -262,4 +262,4 @@ def test_failing_null_gate_gives_broaden(monkeypatch):
     res = P.run_discovery(ft, train=tr, holdout=~tr, settings=AuxDiscoverySettings(), full_topology=None,
                           k3_max=3, epoch=1)
     assert res.status == "broaden"
-    assert "passing_k" in res.report["discovery"] and "null_gate" in res.report["z3_search"]
+    assert "passing_k" in res.report["partition"] and "null_gate" in res.report["z3_search"]

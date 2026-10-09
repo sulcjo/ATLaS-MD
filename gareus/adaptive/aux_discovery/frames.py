@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import multiprocessing
 import re
+import os
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,6 +21,14 @@ _EPOCH_RE = re.compile(r"^epoch_(\d{3})(?:/|$)")
 _ARRAY_FIELDS = ("phase", "epoch", "replica", "step", "state_id", "lam", "cv1", "cv2",
                  "tors", "tors_theta_iupac", "hc", "hb", "basin")
 _DESC_FIELDS = ("tors", "tors_theta_iupac", "hc", "hb", "basin")
+
+
+_THREAD_VARS = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS")
+
+
+def _single_thread_worker():
+    for var in _THREAD_VARS:
+        os.environ[var] = "1"
 
 
 def phase_epoch(label: str) -> Optional[int]:
@@ -148,7 +157,10 @@ def build_frame_table(adaptive_dir: Path, *, epochs: Iterable[int], registry_lam
         definition = descriptor_definition(md.load_topology(str(top0)))
     if int(workers) > 1 and len(todo) > 1:
         # spawn, never fork: the driver process may hold CUDA contexts (as discovery_census.run_census)
-        with ProcessPoolExecutor(max_workers=int(workers), mp_context=multiprocessing.get_context("spawn")) as pool:
+        for var in _THREAD_VARS:  # spawned workers inherit this; avoids BLAS/OpenMP oversubscription
+            os.environ[var] = "1"
+        with ProcessPoolExecutor(max_workers=int(workers), mp_context=multiprocessing.get_context("spawn"),
+                                 initializer=_single_thread_worker) as pool:
             results = list(pool.map(_phase_frames, [(l, p, root, definition, registry_lambda, stride_steps)
                                                    for l, p in todo]))
     else:
