@@ -9,7 +9,7 @@ import numpy as np
 from .partitions import FrozenPartition, fit_partition
 from .placement import place_workers
 from .settings import AuxDiscoverySettings
-from .z3_search import emit_model, search_z3, z3_values
+from .z3_search import emit_model, search_z3_sources, z3_null_gate, z3_values, _cooccurring_pairs
 
 
 @dataclass
@@ -29,7 +29,10 @@ def run_discovery(ft, *, train, holdout, settings: AuxDiscoverySettings, full_to
     disc = fit_partition(disc_X, disc_fam, cv, train, holdout, lineage, ft.step, settings, seed=settings.partition_seed)
     rep["discovery"] = {"status": disc.status, "k": disc.choice.k, "table": disc.choice.table,
                         "hidden_fraction": disc.hidden_fraction, "co_occurrence": disc.co_occurrence,
-                        "lineage_info": disc.lineage_info}
+                        "lineage_info": disc.lineage_info,
+                        "passing_k": [{"k": r["k"], "hidden_fraction": r["hidden_fraction"],
+                                       "co_occurrence": r["co_occurrence"], "lineage_info": r["lineage_info"],
+                                       "triggered": r["triggered"]} for r in disc.per_k]}
     if disc.status != "ok":
         return DiscoveryResult(disc.status, rep)
     ev_X = np.hstack([ft.hc, ft.hb]); ev_fam = ["hc"] * ft.hc.shape[1] + ["hb"] * ft.hb.shape[1]
@@ -38,8 +41,16 @@ def run_discovery(ft, *, train, holdout, settings: AuxDiscoverySettings, full_to
     rep["evaluation"] = {"status": ev.status, "k": ev.choice.k, "table": ev.choice.table}
     if ev.choice.k is None:
         return DiscoveryResult("no_evaluation_partition", rep)
-    best, allc = search_z3(ft, disc.choice.labels, disc.bins, train, holdout, settings)
-    rep["z3_search"] = {"candidates": [c.summary() for c in allc], "chosen": best.summary() if best else None}
+    sources = [(r["k"], r["labels"], _cooccurring_pairs(r["labels"], disc.bins, holdout, settings))
+               for r in disc.per_k if r["triggered"]]
+    best, allc = search_z3_sources(ft, sources, disc.bins, train, holdout, settings)
+    rep["z3_search"] = {"candidates": [c.summary() for c in allc], "chosen": best.summary() if best else None,
+                        "sources_k": [k for k, _, _ in sources]}
+    if best is not None:
+        gate = z3_null_gate(ft, sources, best, disc.bins, train, holdout, settings)
+        rep["z3_search"]["null_gate"] = gate
+        if not gate["passed"]:
+            best = None
     if best is None:
         return DiscoveryResult("broaden", rep, eval_partition=ev.frozen)
     model = emit_model(best, ft.definition, full_topology, label=f"z3-epoch{epoch:03d}",

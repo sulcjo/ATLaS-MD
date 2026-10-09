@@ -29,12 +29,13 @@ class Z3Candidate:
     passed: bool
     fail: List[str] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
+    k: Optional[int] = None
 
     def summary(self) -> dict:
         return {"groups": list(self.groups), "C": self.C, "info_gain": round(self.info_gain, 4),
                 "stability": round(self.stability, 4), "corr_cv1": None if self.corr_cv1 is None else round(self.corr_cv1, 4),
                 "corr_cv2": None if self.corr_cv2 is None else round(self.corr_cv2, 4), "basin_gain": round(self.basin_gain, 4),
-                "n_nonzero": self.n_nonzero, "passed": self.passed, "fail": list(self.fail)}
+                "k": self.k, "n_nonzero": self.n_nonzero, "passed": self.passed, "fail": list(self.fail)}
 
 
 def z3_values(tors: np.ndarray, cand: Z3Candidate) -> np.ndarray:
@@ -84,8 +85,22 @@ def _cooccurring_pairs(labels, bins, holdout, s: AuxDiscoverySettings):
     return sorted(pairs)
 
 
+def scramble_labels(labels, lineage, step, rng) -> np.ndarray:
+    """Independent circular shift of each lineage's whole label sequence (frames ordered by step)."""
+    labels = np.asarray(labels); lineage = np.asarray(lineage); step = np.asarray(step)
+    out = labels.copy()
+    for lin in np.unique(lineage):
+        idx = np.nonzero(lineage == lin)[0]
+        idx = idx[np.argsort(step[idx], kind="stable")]
+        out[idx] = np.roll(labels[idx], int(rng.integers(0, idx.size)))
+    return out
+
+
 def search_z3(ft, labels, bins, train, holdout, s: AuxDiscoverySettings, *, nbins: Optional[int] = None,
-              all_pairs: bool = False):
+              all_pairs: bool = False, pairs=None, k: Optional[int] = None, light: bool = False):
+    """Candidates for one label vector. ``passed`` = finite + |corr(z, CV1/CV2)| guard only (U12); info gain,
+    stability and basin gain are computed and reported but gate nothing. ``light`` skips stability and basin
+    gain (null searches need only the info gain)."""
     nbins = int(nbins or s.s_bins ** 2)
     X = np.asarray(ft.tors, float)
     mu, sd = X[train].mean(0), X[train].std(0)
@@ -94,8 +109,9 @@ def search_z3(ft, labels, bins, train, holdout, s: AuxDiscoverySettings, *, nbin
     even = (np.asarray(ft.replica) % 2) == 0
     K = int(labels.max()) + 1
     out: List[Z3Candidate] = []
-    pairs = _cooccurring_pairs(labels, bins, holdout, s) if not all_pairs else \
-        [(a, b) for a in range(K) for b in range(a + 1, K)]
+    if pairs is None:
+        pairs = _cooccurring_pairs(labels, bins, holdout, s) if not all_pairs else \
+            [(a, b) for a in range(K) for b in range(a + 1, K)]
     for g1, g2 in pairs:
         m = train & np.isin(labels, (g1, g2)); y = (labels == g2).astype(int)
         if len(np.unique(y[m & even])) < 2 or len(np.unique(y[m & ~even])) < 2:
@@ -103,35 +119,71 @@ def search_z3(ft, labels, bins, train, holdout, s: AuxDiscoverySettings, *, nbin
         scores = [(_bern_ll(_l1(Xs[m & even], y[m & even], C), Xs[m & ~even], y[m & ~even]), C) for C in s.l1_c_grid]
         _, C = max(scores)
         w = _l1(Xs[m], y[m], C).coef_[0]
-        we = _l1(Xs[m & even], y[m & even], C).coef_[0]; wo = _l1(Xs[m & ~even], y[m & ~even], C).coef_[0]
         z_raw = Xs @ w
         if not np.any(w) or z_raw[train].std() == 0:
             continue
-        stab = abs(float(np.corrcoef(Xs[holdout] @ we, Xs[holdout] @ wo)[0, 1]))
+        if light:
+            stab = bg = float("nan")
+        else:
+            we = _l1(Xs[m & even], y[m & even], C).coef_[0]; wo = _l1(Xs[m & ~even], y[m & ~even], C).coef_[0]
+            stab = abs(float(np.corrcoef(Xs[holdout] @ we, Xs[holdout] @ wo)[0, 1]))
+            bg = float(sum(info_gain(z_raw, ft.basin[:, r].astype(int), bins, train, holdout, 5, nbins)
+                           for r in range(ft.basin.shape[1])))
         c1 = _cv_corr(z_raw, ft.cv1, holdout)
         c2 = _cv_corr(z_raw, ft.cv2, holdout)
         ig = info_gain(z_raw, labels, bins, train, holdout, K, nbins)
-        bg = float(sum(info_gain(z_raw, ft.basin[:, r].astype(int), bins, train, holdout, 5, nbins)
-                       for r in range(ft.basin.shape[1])))
         fail, notes = [], []
-        for name, v in (("info_gain", ig), ("stability", stab), ("basin_gain", bg)):
+        for name, v in (("info_gain", ig),) + ((() if light else (("stability", stab), ("basin_gain", bg)))):
             if not np.isfinite(v):
                 fail.append(f"nonfinite_{name}")
         if c1 is None:
             fail.append("nonfinite_corr_cv1")
         if c2 is None:
             notes.append("cv2_not_applicable")
-        if np.isfinite(ig) and ig < s.info_gain_min: fail.append("info_gain")
-        if np.isfinite(stab) and stab < s.stability_min: fail.append("stability")
         for name, c in (("cv1", c1), ("cv2", c2)):
             if c is not None and not np.isfinite(c):
                 fail.append(f"nonfinite_corr_{name}")
             elif c is not None and abs(c) > s.max_cv_corr and "max_cv_corr" not in fail:
                 fail.append("max_cv_corr")
-        if np.isfinite(bg) and bg < s.basin_gain_min: fail.append("basin_gain")
         out.append(Z3Candidate((g1, g2), float(C), w, mu, sd, float(z_raw[train].std()), ig, stab, c1, c2, bg,
-                               int((np.abs(w) > 1e-8).sum()), not fail, fail, notes))
+                               int((np.abs(w) > 1e-8).sum()), not fail, fail, notes, k))
     return pick_best(out), out
+
+
+def search_z3_sources(ft, sources, bins, train, holdout, s: AuxDiscoverySettings, *, nbins: Optional[int] = None,
+                      light: bool = False, label_override=None):
+    """``sources`` = [(k, labels, pairs)] over every passing+triggered discovery k. ``label_override`` (null
+    searches) maps source index -> scrambled labels with the pair list unchanged."""
+    allc: List[Z3Candidate] = []
+    for i, (k, labels, pairs) in enumerate(sources):
+        lab = labels if label_override is None else label_override[i]
+        allc.extend(search_z3(ft, lab, bins, train, holdout, s, nbins=nbins, pairs=pairs, k=k, light=light)[1])
+    return pick_best(allc), allc
+
+
+def z3_null_gate(ft, sources, real_best, bins, train, holdout, s: AuxDiscoverySettings, *,
+                 nbins: Optional[int] = None) -> dict:
+    """U12 gate: the best real candidate's held-out info gain must exceed the best-of-candidates gain of every one
+    of ``s.n_null_z3`` searches re-run on labels scrambled by an independent within-lineage circular shift."""
+    n_null = int(s.n_null_z3)
+    rep = {"n_null": n_null, "real_best": None if real_best is None else float(real_best.info_gain)}
+    if real_best is None:
+        return {**rep, "passed": False, "reason": "no_real_candidate", "null_best": [], "null_summary": None,
+                "null_margin": None}
+    rng = np.random.default_rng(int(s.partition_seed) + 7919)
+    null_best = []
+    for _ in range(n_null):
+        scr = [scramble_labels(lab, ft.lineage, ft.step, rng) for _, lab, _ in sources]
+        b, _ = search_z3_sources(ft, sources, bins, train, holdout, s, nbins=nbins, light=True, label_override=scr)
+        # a null search that finds no candidate (L1 shrinks every coefficient to zero) or a negative best has
+        # gain 0: "no discovery" is the floor the real candidate must clear
+        null_best.append(max(0.0, float(b.info_gain)) if b is not None and np.isfinite(b.info_gain) else 0.0)
+    nmax = max(null_best) if null_best else 0.0
+    summ = {"min": min(null_best), "median": float(np.median(null_best)), "max": nmax} if null_best else None
+    margin = float(real_best.info_gain - nmax)
+    return {**rep, "null_best": null_best, "null_floor": 0.0,
+            "null_summary": summ, "null_margin": margin, "passed": bool(real_best.info_gain > nmax),
+            "reason": None}
 
 
 def emit_model(cand: Z3Candidate, definition, full_topology, *, label: str, provenance: dict):

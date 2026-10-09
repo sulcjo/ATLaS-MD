@@ -40,10 +40,8 @@ class AuxDiscoverySettings:
     lineage_dirichlet_c: float = 5.0
     # z3 search
     l1_c_grid: Tuple[float, ...] = (0.003, 0.01, 0.03, 0.1, 0.3)
-    info_gain_min: float = 0.10
-    stability_min: float = 0.8
+    n_null_z3: int = 20
     max_cv_corr: float = 0.7
-    basin_gain_min: float = 0.05
     # placement (c10 placement.py)
     quantiles: Tuple[float, ...] = (0.05, 0.10, 0.90, 0.95)
     width_fractions: Tuple[float, ...] = (0.35, 0.5, 0.7)

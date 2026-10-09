@@ -88,6 +88,8 @@ class PartitionChoice:
     labels: Optional[np.ndarray] = None
     table: List[dict] = field(default_factory=list)
     reason: Optional[str] = None
+    # U12: every k passing the reproducibility gates (ascending k); ``k``/``gmm``/``labels`` stay the largest
+    choices: List["PartitionChoice"] = field(default_factory=list)
 
 
 def choose_partition(Pm, train, holdout, lineage, s: AuxDiscoverySettings, seed) -> PartitionChoice:
@@ -95,7 +97,7 @@ def choose_partition(Pm, train, holdout, lineage, s: AuxDiscoverySettings, seed)
         return PartitionChoice(None, None, None, [], reason="holdout_too_small")
     rng = np.random.default_rng(int(seed))
     tr_rows = np.nonzero(train)[0]
-    table, best = [], None
+    table, passing = [], []
     for k in range(int(s.k_min), int(s.k_max) + 1):
         g = GaussianMixture(k, covariance_type="full", n_init=3, random_state=0, reg_covar=1e-6).fit(Pm[train])
         lab_v = g.predict(Pm[holdout])
@@ -112,11 +114,12 @@ def choose_partition(Pm, train, holdout, lineage, s: AuxDiscoverySettings, seed)
                "n_groups_ok": n_ok}
         table.append(row)
         if ari_val >= s.ari_min and np.median(boots) >= s.ari_min and n_ok >= 2:
-            best = (k, g)
-    if best is None:
+            passing.append((k, g))
+    if not passing:
         return PartitionChoice(None, None, None, table)
-    k, g = best
-    return PartitionChoice(k, g, g.predict(Pm), table)
+    choices = [PartitionChoice(k, g, g.predict(Pm), table) for k, g in passing]
+    top = choices[-1]
+    return PartitionChoice(top.k, top.gmm, top.labels, table, choices=choices)
 
 
 def _cond_table(y, x, K, nx, alpha=1.0):
@@ -245,6 +248,8 @@ class PartitionResult:
     hidden_fraction: Optional[float] = None
     co_occurrence: List[dict] = field(default_factory=list)
     lineage_info: Optional[float] = None
+    # U12: one record per passing k {k, labels, hidden_fraction, co_occurrence, lineage_info, triggered}
+    per_k: List[dict] = field(default_factory=list)
 
 
 def fit_partition(X, families, cv, train, holdout, lineage, step, s: AuxDiscoverySettings, *, seed: int = 0,
@@ -263,11 +268,17 @@ def fit_partition(X, families, cv, train, holdout, lineage, step, s: AuxDiscover
     choice = choose_partition(Pm, train, holdout, lineage, s, seed)
     if choice.k is None:
         return PartitionResult("insufficient_evidence", choice, None, bins)
-    K, nb = choice.k, s.s_bins ** 2
-    hf = hidden_fraction(choice.labels, bins, train, holdout, K, nb)
-    co = co_occurrence(choice.labels, bins, holdout, K, s)
-    li = lineage_info(choice.labels, bins, lineage, step, K, nb, s.lineage_dirichlet_c)
+    nb = s.s_bins ** 2
+    per_k = []
+    for ch in (choice.choices or [choice]):
+        hfk = hidden_fraction(ch.labels, bins, train, holdout, ch.k, nb)
+        cok = co_occurrence(ch.labels, bins, holdout, ch.k, s)
+        lik = lineage_info(ch.labels, bins, lineage, step, ch.k, nb, s.lineage_dirichlet_c)
+        per_k.append({"k": ch.k, "labels": ch.labels, "hidden_fraction": hfk, "co_occurrence": cok,
+                      "lineage_info": lik,
+                      "triggered": bool((hfk >= s.hidden_min and bool(cok)) or lik >= s.lineage_info_min)})
+    hf, co, li = per_k[-1]["hidden_fraction"], per_k[-1]["co_occurrence"], per_k[-1]["lineage_info"]
     frozen = FrozenPartition(list(feature_names or [f"f{i}" for i in range(X.shape[1])]), keep, mean,
                              sd, list(families), s_mean, s_sd, knn, pca, nc, choice.gmm, sklearn.__version__)
-    triggered = (hf >= s.hidden_min and bool(co)) or li >= s.lineage_info_min
-    return PartitionResult("ok" if triggered else "keep", choice, frozen, bins, hf, co, li)
+    triggered = any(r["triggered"] for r in per_k)
+    return PartitionResult("ok" if triggered else "keep", choice, frozen, bins, hf, co, li, per_k)

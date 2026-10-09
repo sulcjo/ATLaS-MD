@@ -12,7 +12,7 @@ def test_defaults_match_c10_prereg_and_placement():
     assert (s.k_min, s.k_max, s.ari_min, s.n_boot_partition) == (2, 8, 0.5, 10)
     assert (s.knn_k, s.pca_var, s.pca_max, s.sd_drop, s.sd_floor) == (100, 0.8, 12, 1e-3, 0.05)
     assert s.l1_c_grid == (0.003, 0.01, 0.03, 0.1, 0.3)
-    assert (s.info_gain_min, s.stability_min, s.max_cv_corr, s.basin_gain_min) == (0.10, 0.8, 0.7, 0.05)
+    assert (s.n_null_z3, s.max_cv_corr) == (20, 0.7)
     assert s.quantiles == (0.05, 0.10, 0.90, 0.95) and s.width_fractions == (0.35, 0.5, 0.7)
     assert (s.gate_o_q05, s.gate_ess_frames, s.gate_eff_lineages, s.gate_top3_share) == (0.20, 50.0, 20.0, 0.5)
     assert (s.heldout_min_frames, s.heldout_o_min, s.max_workers) == (50, 0.15, 4)

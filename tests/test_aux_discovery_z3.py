@@ -146,3 +146,97 @@ def test_no_native_readout_imported():
     for ln in imports:
         for bad in ("rmsd", "native", "helix", "chignolin_fes"):
             assert bad not in ln.lower(), ln
+
+
+# ---- U12: null-calibrated gate, multi-k sources --------------------------------------------------------------
+def _with_lineage(ft, n_lin=20):
+    ft.lineage = np.array([f"p:{r % n_lin}" for r in range(ft.n)])
+    ft.step = np.arange(ft.n) // n_lin
+    return ft
+
+
+def _shift_within_lineage(arr, lineage, step, rng):
+    out = np.array(arr, copy=True)
+    for lin in np.unique(lineage):
+        idx = np.nonzero(lineage == lin)[0]
+        idx = idx[np.argsort(step[idx], kind="stable")]
+        out[idx] = np.roll(arr[idx], int(rng.integers(1, idx.size)), axis=0)
+    return out
+
+
+def _gate_inputs(ft):
+    tr = np.arange(ft.n) < 4500
+    return np.zeros(ft.n, int), tr, ~tr
+
+
+def test_null_gate_passes_planted_signal():
+    ft, lab = _with_lineage(_planted(n=3000)[0]), None
+    ft, lab = _planted(n=3000); _with_lineage(ft)
+    bins = np.zeros(ft.n, int); tr = np.arange(ft.n) < 2200; ho = ~tr
+    s = AuxDiscoverySettings(n_null_z3=4)
+    sources = [(2, lab, [(0, 1)])]
+    best, allc = Z.search_z3_sources(ft, sources, bins, tr, ho, s, nbins=1)
+    gate = Z.z3_null_gate(ft, sources, best, bins, tr, ho, s, nbins=1)
+    assert best is not None and gate["passed"] and gate["null_margin"] > 0
+    assert gate["n_null"] == 4 and len(gate["null_best"]) == 4
+    assert gate["real_best"] == pytest.approx(best.info_gain)
+    assert {"min", "median", "max"} <= set(gate["null_summary"])
+
+
+def test_null_gate_fails_noise_control():
+    ft, lab = _planted(n=3000); _with_lineage(ft)
+    rng = np.random.default_rng(7)   # a fixed draw; under no link the gate's false-pass rate is 1/(n_null+1)
+    ft.tors = _shift_within_lineage(ft.tors, ft.lineage, ft.step, rng)   # torsions no longer linked to labels
+    bins = np.zeros(ft.n, int); tr = np.arange(ft.n) < 2200; ho = ~tr
+    s = AuxDiscoverySettings(n_null_z3=8)
+    sources = [(2, lab, [(0, 1)])]
+    best, _ = Z.search_z3_sources(ft, sources, bins, tr, ho, s, nbins=1)
+    gate = Z.z3_null_gate(ft, sources, best, bins, tr, ho, s, nbins=1)
+    assert not gate["passed"] and gate["null_margin"] <= 0
+
+
+def test_removed_thresholds_do_not_gate_candidates():
+    ft, lab = _planted(); _with_lineage(ft)
+    tr = np.arange(ft.n) < 4500; ho = ~tr; bins = np.zeros(ft.n, int)
+    _, allc = Z.search_z3(ft, lab, bins, tr, ho, AuxDiscoverySettings(), nbins=1, all_pairs=True)
+    assert allc and all(not ({"info_gain", "stability", "basin_gain"} & set(c.fail)) for c in allc)
+    assert all(np.isfinite(c.info_gain) and np.isfinite(c.stability) and np.isfinite(c.basin_gain) for c in allc)
+
+
+def test_sources_collect_candidates_from_every_k():
+    ft, lab = _planted(n=3000); _with_lineage(ft)
+    bins = np.zeros(ft.n, int); tr = np.arange(ft.n) < 2200; ho = ~tr
+    lab3 = lab.copy(); lab3[::7] = 2
+    best, allc = Z.search_z3_sources(ft, [(2, lab, [(0, 1)]), (3, lab3, [(0, 1), (0, 2)])], bins, tr, ho,
+                                     AuxDiscoverySettings(), nbins=1)
+    assert {c.k for c in allc} == {2, 3}
+    assert {(c.k, c.groups) for c in allc} >= {(2, (0, 1)), (3, (0, 1)), (3, (0, 2))}
+
+
+def test_scramble_preserves_counts_and_is_seeded():
+    lin = np.repeat(["a", "b"], 50); step = np.tile(np.arange(50), 2)
+    lab = np.arange(100) % 3
+    a = Z.scramble_labels(lab, lin, step, np.random.default_rng(1))
+    b = Z.scramble_labels(lab, lin, step, np.random.default_rng(1))
+    assert (a == b).all() and (a != lab).any()
+    for l in ("a", "b"):
+        assert np.bincount(a[lin == l], minlength=3).tolist() == np.bincount(lab[lin == l], minlength=3).tolist()
+
+
+def test_choose_partition_returns_every_passing_k():
+    from gareus.adaptive.aux_discovery.partitions import choose_partition
+    rng = np.random.default_rng(0)
+    n = 1200
+    Pm = np.vstack([rng.normal(c, 0.4, (n // 3, 2)) for c in ((0, 0), (6, 0), (0, 6))])
+    lineage = np.array([f"p:{i % 12}" for i in range(n)])
+    tr = rng.random(n) < 0.6; ho = ~tr
+    ch = choose_partition(Pm, tr, ho, lineage, AuxDiscoverySettings(k_max=4, n_boot_partition=3), 0)
+    ks = [c.k for c in ch.choices]
+    assert 3 in ks and ks == sorted(ks) and ch.k == ks[-1]
+    assert all(c.labels is not None and c.gmm is not None for c in ch.choices)
+
+
+def test_removed_settings_rejected():
+    for key in ("info_gain_min", "stability_min", "basin_gain_min"):
+        with pytest.raises(ValueError, match="unknown aux settings key"):
+            AuxDiscoverySettings.from_mapping({**AuxDiscoverySettings().to_mapping(), key: 0.1})
