@@ -1,7 +1,7 @@
 """Offline auxiliary energies from stored features, parity, exclusion audits and pooling guards."""
 from __future__ import annotations
 
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 import numpy as np
 
@@ -210,8 +210,44 @@ def refuse_duplicate_sample_keys(samples: Mapping[str, Any]) -> None:
                              "registry (seal the parent abandoned) before pooling")
 
 
+_TEMPERATURE_RTOL = 1e-9
+_ENVELOPE_RTOL = 1e-12
+
+
+def check_frozen_matrix_inputs(definition: Mapping[str, Any], *, prod, windows: Sequence[Mapping[str, Any]],
+                               temperature_k: float) -> None:
+    """The frozen state definition's temperature and boost envelope are the ones the matrix is built with
+    (final fix wave M4): ``infer_temp_beta``'s temperature, and ``load_pep_gamd_envelope(prod)`` whenever a
+    state carries lambda > 0 (the only case load_parquet reads an envelope). Mismatch refuses.
+    """
+    import dataclasses
+    import math
+    frozen_t = float(definition["temperature_k"])
+    if not math.isclose(frozen_t, float(temperature_k), rel_tol=_TEMPERATURE_RTOL, abs_tol=0.0):
+        raise IntegrityError(f"analysis temperature {float(temperature_k)} K (infer_temp_beta) differs from the frozen "
+                             f"state definition's temperature_k {frozen_t} K")
+    if not any(float(w.get("gamd_lambda") or 0.0) > 0.0 for w in windows):
+        return
+    from ..mbar_analysis.ladder import load_pep_gamd_envelope
+    from ..pep_gamd import PepGamdEnvelope
+    boost = definition.get("boost")
+    if not isinstance(boost, Mapping) or not isinstance(boost.get("envelope"), Mapping):
+        raise IntegrityError("states with lambda > 0 but the frozen state definition embeds no boost envelope")
+    loaded = load_pep_gamd_envelope(prod)
+    if loaded is None:
+        raise IntegrityError(f"states with lambda > 0 but no shared_gamd_setup_globals.json envelope under {prod}")
+    frozen = PepGamdEnvelope.from_integrator_globals(dict(boost["envelope"]))
+    for f in dataclasses.fields(PepGamdEnvelope):
+        a, b = getattr(frozen, f.name), getattr(loaded, f.name)
+        same = (a == b) if (isinstance(a, bool) or a is None or b is None) else \
+            math.isclose(float(a), float(b), rel_tol=_ENVELOPE_RTOL, abs_tol=0.0)
+        if not same:
+            raise IntegrityError(f"boost envelope {f.name}: frozen state definition {a!r} vs the envelope the matrix "
+                                 f"is built with (load_pep_gamd_envelope({prod})) {b!r}")
+
+
 def pool_aux_segments(prod, samples, beta, meta, *, exclude_segments_without_aux_features: bool = False,
-                      allow_ineligible_aux_segments: bool = False):
+                      allow_ineligible_aux_segments: bool = False, temperature_k: Optional[float] = None):
     """load_parquet's auxiliary branch: refuse or exclude segment classes, one eligible fixed state,
     one sample schema, offline z with per-segment parity. Returns (samples, windows, aux_z or None)."""
     from ..correctness.state_identity import validate_fixed_state_segments
@@ -271,6 +307,8 @@ def pool_aux_segments(prod, samples, beta, meta, *, exclude_segments_without_aux
     # Every schema model must be in the frozen registry: a silent filter would drop an active term.
     models = {sha: registry_model(table.definition, sha, where=f"load_parquet ({prod})") for sha in schema.model_shas}
     windows = [dict(w) for w in table.windows]
+    if temperature_k is not None:
+        check_frozen_matrix_inputs(table.definition, prod=prod, windows=windows, temperature_k=temperature_k)
     aux_z = None
     if any(float(w.get("aux_k", 0.0)) > 0 for w in windows):
         aux_z = aux_z_from_samples(samples, schema, models, parity_reduced_tol=row_tol, **parity_context(windows, beta))

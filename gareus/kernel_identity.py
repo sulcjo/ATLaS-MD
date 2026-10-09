@@ -143,6 +143,15 @@ def refuse_aux_snapshots(root, *, where: str, depth: int = 2) -> None:
                                 f"load_parquet in the MVP (spec Sections 8/14); found {hits[:3]}")
 
 
+def refuse_aux_run(prod, *, where: str) -> None:
+    """Raise AuxPoolingRefused when ONE run directory is auxiliary by any evidence ``run_has_aux`` reads
+    (run manifest, depth-0 snapshot, samples payload schema): pure JSON, legacy runs unaffected."""
+    if run_has_aux(prod):
+        raise AuxPoolingRefused(f"{where}: {prod} is an auxiliary-CV run (run manifest, window snapshot or samples "
+                                "payload); auxiliary states pool only through the strict fixed-state exporter or "
+                                "load_parquet in the MVP (spec Sections 8/14)")
+
+
 def exchange_energy_version_for_args(args) -> str:
     return EXCHANGE_ENERGY_VERSION_AUX if getattr(args, "aux_cv_model", None) else EXCHANGE_ENERGY_VERSION
 

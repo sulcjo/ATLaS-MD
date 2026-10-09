@@ -433,8 +433,10 @@ def export_analysis_arrays_npz(
     beta     : 1/(kB*T) in mol/kJ
     out_path : destination path (default: run_dir/analysis_arrays.npz)
     """
-    from .kernel_identity import refuse_aux_snapshots
+    from .kernel_identity import refuse_aux_run, refuse_aux_snapshots
     refuse_aux_snapshots(Path(run_dir), where="legacy analysis_arrays.npz export", depth=0)
+    # Final fix wave M3: manifest + samples payload evidence too (pure JSON; a legacy run passes unchanged).
+    refuse_aux_run(Path(run_dir), where="legacy analysis_arrays.npz export")
     samples = load_samples(run_dir)
     if not samples or "cv1" not in samples:
         raise ValueError(f"No Parquet sample data found in {run_dir}/samples/")

@@ -379,6 +379,11 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
     if not epoch_dirs:
         selected = f' for requested epoch(s) {sorted(epoch_ids)}' if epoch_ids is not None else ''
         raise FileNotFoundError(f'No epoch Parquet data found in {adaptive_dir}{selected}')
+    # Final fix wave M3: every phase directory whose samples are read is checked with run_has_aux (run
+    # manifest, snapshots, samples payload; pure JSON) on top of the depth-2 snapshot scan above.
+    from gareus.kernel_identity import refuse_aux_run
+    for _ed, _ in epoch_dirs:
+        refuse_aux_run(Path(_ed), where="adaptive union loader")
 
     all_cv = []; all_cv2 = []; all_window = []; all_step = []
     all_replica = []; all_boost = []; all_boost_dih = []; all_potential = []; all_epoch_src = []

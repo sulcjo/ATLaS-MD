@@ -575,7 +575,7 @@ def load_parquet(prod: Path, *, exclude_segments_without_aux_features: bool = Fa
         samples, windows, aux_z = pool_aux_segments(
             prod, samples, beta, meta,
             exclude_segments_without_aux_features=exclude_segments_without_aux_features,
-            allow_ineligible_aux_segments=allow_ineligible_aux_segments)
+            allow_ineligible_aux_segments=allow_ineligible_aux_segments, temperature_k=temp)
 
     cv       = samples['cv1'].astype(np.float64)
     cv2_raw  = samples.get('cv2')

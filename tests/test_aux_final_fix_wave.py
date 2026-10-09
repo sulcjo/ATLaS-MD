@@ -370,3 +370,98 @@ def test_samples_manifest_older_than_the_boundary_refuses_before_registration(tm
     plan = prepare_aux_resume(tmp_path, reg, _ckpt(seg, 20, 2), state_definition={}, force_info=None,
                               topology_sha256="t", kernel_identity_digest="k")
     assert plan["checkpoint_step"] == 20 and plan["parent_segment_id"] == seg
+
+
+# M3: pure-JSON run_has_aux guards the legacy NPZ export and the union loader ----------------------
+
+def _samples_only_aux_run(tmp_path):
+    """Aux samples payload but no aux snapshot and no run manifest: refuse_aux_snapshots alone misses it."""
+    from test_aux_loaders import _write_segment
+    from gareus.store import SegmentRegistry
+    reg = SegmentRegistry(tmp_path)
+    seg = reg.open_segment("run", None, 1)
+    _write_segment(tmp_path, seg, True, np.random.default_rng(3))
+    reg.close_segment(seg, 600)
+    return seg
+
+
+def test_npz_export_refuses_a_run_identified_only_by_its_samples_payload(tmp_path):
+    from gareus.kernel_identity import AuxPoolingRefused, aux_snapshot_hits, run_has_aux
+    from gareus.query import export_analysis_arrays_npz
+    _samples_only_aux_run(tmp_path)
+    assert aux_snapshot_hits(tmp_path, depth=0) == [] and run_has_aux(tmp_path)
+    with pytest.raises(AuxPoolingRefused, match="auxiliary"):
+        export_analysis_arrays_npz(tmp_path, beta=0.4)
+    assert not (tmp_path / "analysis_arrays.npz").exists()
+
+
+def test_refuse_aux_run_is_silent_for_a_legacy_run(tmp_path):
+    from gareus.kernel_identity import refuse_aux_run
+    from gareus.store import ParquetSampleWriter, SegmentRegistry
+    reg = SegmentRegistry(tmp_path)
+    seg = reg.open_segment("run", None, 1)
+    w = ParquetSampleWriter(tmp_path / "samples" / seg)
+    w.write_sample(step=10, replica=0, window_id=0, cv1=0.1, cv2=None, potential=0.0, boost_total=None,
+                   boost_dihedral=None, boost_nonbonded=None)
+    w.close()
+    refuse_aux_run(tmp_path, where="t")
+
+
+def test_union_loader_checks_every_epoch_dir_before_loading():
+    import inspect
+    import gareus.mbar_analysis.loaders_union_parquet as up
+    src = inspect.getsource(up)
+    guard = src.index("refuse_aux_run(Path(_ed)")
+    assert src.index("epoch_dirs = _find_adaptive_epoch_dirs(") < guard < src.index("_load_epoch_task(_ed, _wp")
+
+
+# M4: the frozen state definition's temperature and boost envelope are the ones used for the matrix
+
+GLOBALS = {"Vmax_Total": 100.0, "Vmin_Total": 10.0, "threshold_energy_Total": 100.0, "k0_Total": 0.5,
+           "Vmax_Dihedral": 50.0, "Vmin_Dihedral": 5.0, "threshold_energy_Dihedral": 50.0, "k0_Dihedral": 0.4}
+
+
+def _frozen(boost, temperature_k=300.0):
+    return {"temperature_k": temperature_k, "boost": boost}
+
+
+def _env_file(prod, globals_):
+    import json
+    prod.mkdir(parents=True, exist_ok=True)
+    (prod / "shared_gamd_setup_globals.json").write_text(json.dumps({"all_globals": globals_}))
+
+
+def test_frozen_temperature_must_match_the_analysis_temperature(tmp_path):
+    from gareus.auxiliary_cv.offline import check_frozen_matrix_inputs
+    windows = [{"gamd_lambda": 0.0}]
+    check_frozen_matrix_inputs(_frozen(None), prod=tmp_path, windows=windows, temperature_k=300.0)
+    with pytest.raises(IntegrityError, match="temperature"):
+        check_frozen_matrix_inputs(_frozen(None), prod=tmp_path, windows=windows, temperature_k=310.0)
+
+
+def test_frozen_boost_envelope_must_match_the_loaded_envelope(tmp_path):
+    from gareus.auxiliary_cv.offline import check_frozen_matrix_inputs
+    windows = [{"gamd_lambda": 0.0}, {"gamd_lambda": 1.0}]
+    boost = {"kind": "pep-gamd-lower-dual", "envelope": dict(GLOBALS)}
+    with pytest.raises(IntegrityError, match="envelope"):           # no envelope file
+        check_frozen_matrix_inputs(_frozen(boost), prod=tmp_path, windows=windows, temperature_k=300.0)
+    _env_file(tmp_path, GLOBALS)
+    check_frozen_matrix_inputs(_frozen(boost), prod=tmp_path, windows=windows, temperature_k=300.0)
+    with pytest.raises(IntegrityError, match="boost"):
+        check_frozen_matrix_inputs(_frozen(None), prod=tmp_path, windows=windows, temperature_k=300.0)
+    _env_file(tmp_path, dict(GLOBALS, k0_Dihedral=0.41))
+    with pytest.raises(IntegrityError, match="envelope"):
+        check_frozen_matrix_inputs(_frozen(boost), prod=tmp_path, windows=windows, temperature_k=300.0)
+    # no active rung: the envelope is not used for the matrix and is not read
+    check_frozen_matrix_inputs(_frozen(boost), prod=tmp_path, windows=[{"gamd_lambda": 0.0}], temperature_k=300.0)
+
+
+def test_load_parquet_refuses_a_temperature_mismatch(tmp_path):
+    import json
+    from test_aux_loaders import _run
+    from gareus.mbar_analysis.loaders import load_parquet
+    _run(tmp_path)
+    load_parquet(tmp_path)
+    (tmp_path / "gareus_metadata.json").write_text(json.dumps({"temperature_K": 310.0}))
+    with pytest.raises(IntegrityError, match="temperature"):
+        load_parquet(tmp_path)
