@@ -188,6 +188,21 @@ def test_aux_resume_checks_run_before_the_segment_is_registered():
     assert "_seg_registry.open_segment(_run_id, _aux_parent_seg_id, _round_id)" in src
     assert src.index("load_production_checkpoint(") < src.index("reseal_chain_for_resume(")
     assert "exclude=_seg_id" in src
+
+
+def test_a_failing_reseal_or_missing_plan_still_discards_the_new_segment():
+    """Fix round 3: the discard stays armed from the checkpoint load through the re-seal, so a reseal error or
+    the missing-plan guard rolls back the empty new segment exactly like a refusal inside the load."""
+    src = ast.unparse(_run_gareus_tree())
+    load = src.index("manifest = load_production_checkpoint(")
+    arm = src.rindex("_aux_resume_loading = _aux_io is not None", 0, load)
+    guard = src.index("if _aux_reseal_plan is None:", load)
+    reseal = src.index("reseal_chain_for_resume(", load)
+    disarm = src.index("_aux_resume_loading = False", load)
+    assert arm < load < guard < reseal < disarm
+    # the guard raises (inside the armed window) and the finally discards when armed
+    assert "raise RuntimeError('auxiliary resume loaded a checkpoint without its pre-registration" in src
+    assert "if _aux_resume_loading:" in src and "discard_refused_segment(out_dir, _seg_registry, _seg_id)" in src
     assert "_seg_id = None if getattr(args, '_aux_runtime', None) is not None else " \
            "_seg_registry.open_segment(_run_id, _parent_seg_id, _round_id)" in src
     assert "refuse_aux_resume_without_checkpoint(out_dir)" in src

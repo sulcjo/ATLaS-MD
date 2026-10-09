@@ -9118,7 +9118,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 drivers=drivers, pool=_sim_pool, npt_runtime=npt_runtime, args=args,
                 aux_pre_apply=_aux_pre_apply,
             )
-            _aux_resume_loading = False
+            # Fix round 3: the discard stays armed through the auxiliary re-seal below (disarmed after it).
             if manifest is not None:
                 assignments[:] = [int(x) for x in manifest.get("assignments", assignments)]
                 dashboard_info["gamd_integrator_restore_ok"] = bool(manifest.get("resume_gamd_integrator_restore_report", {}).get("ok", False))
@@ -9176,6 +9176,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                             print(f"    Resume: segment {_rec['segment_id']} re-sealed {_rec['status']} at step "
                                   f"{_rec['end_step']} (was {_rec['previous_status']} at {_rec['previous_end_step']}); "
                                   "later rows were rolled back.", flush=True)
+                    _aux_resume_loading = False      # re-seal done: from here on the segment is finalized
                 elif _parent_was_running and _parent_seg_id is not None:
                     _seg_registry.seal_segment(
                         _parent_seg_id,
@@ -9185,6 +9186,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 # Record the absolute start step of the resumed segment.
                 _seg_registry.set_segment_start_step(_seg_id, int(manifest.get("absolute_step", 0)))
             else:
+                _aux_resume_loading = False
                 print("    --resume requested, but no production checkpoint manifest was found; starting production from step 0")
                 # No checkpoint: any previously-running segment has no valid
                 # end boundary — mark it abandoned so it is skipped in analysis.
