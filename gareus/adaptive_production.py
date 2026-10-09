@@ -758,7 +758,7 @@ class WindowStateRegistry:
         return int(self._next_state_id)
 
     def rung_lambdas(self) -> List[float]:
-        """Sorted distinct ``gamd_lambda`` over ACTIVE states.
+        """Sorted distinct ``gamd_lambda`` over ACTIVE ordinary states (auxiliary workers excluded).
 
         This is the λ-ladder as it currently stands.  ``[0.0]`` (or ``[]`` for
         an empty registry) means the ladder is inactive, and every rung-aware
@@ -2690,7 +2690,7 @@ def _non_neighbor_redundant_pairs(
     still distinct real states, so its edges look fine, while its true
     duplicate sits several rungs away and is never compared.
     """
-    active_ids = sorted(registry.active_state_ids())
+    active_ids = sorted(int(x.state_id) for x in ordinary_active_states(registry))
     if len(active_ids) < 2:
         return []
     existing_pairs = {tuple(sorted((int(a), int(b)))) for a, b, _et, _nd in geometry_edges}
@@ -5520,7 +5520,7 @@ def propose_actions_from_diagnostics(
 
 
 def _graph_articulation_states(registry: WindowStateRegistry) -> set[int]:
-    active_ids = registry.active_state_ids()
+    active_ids = [int(x.state_id) for x in ordinary_active_states(registry)]
     if len(active_ids) <= 2:
         return set(active_ids)
     edges = [(a, b) for a, b, _t, _d in build_geometry_edges(registry)]
@@ -5550,8 +5550,8 @@ def _graph_articulation_states(registry: WindowStateRegistry) -> set[int]:
 
 
 def active_graph_connected(registry: WindowStateRegistry) -> bool:
-    """Return True if the active-state geometry graph is connected."""
-    active_ids = registry.active_state_ids()
+    """Return True if the ordinary (non-worker) active-state geometry graph is connected."""
+    active_ids = [int(x.state_id) for x in ordinary_active_states(registry)]
     if len(active_ids) <= 1:
         return True
     adj = {sid: set() for sid in active_ids}

@@ -32,12 +32,70 @@ def test_geometry_edges_never_touch_worker():
     assert ids and w.state_id not in ids
 
 
+def _diag_for(r, w, worker_samples, other_samples):
+    rows = []
+    for s in r.active_states():
+        row = {"state_id": s.state_id, "warnings": [],
+               "sample_count": worker_samples if s.state_id == w.state_id else other_samples}
+        if s.state_id == w.state_id:
+            row["warnings"] = ["off_target_primary"]
+        rows.append(row)
+    alerts = [{"state_i": w.state_id, "state_j": 0, "overlap": 0.99}]
+    return {"states": rows, "edges": [], "non_neighbor_redundancies": alerts}
+
+
+def _targets(acts, kinds, sid):
+    return [a for a in acts if len(a) > 1 and a[0] in kinds and int(a[1]) == sid]
+
+
 def test_retirement_never_proposes_worker():
     r, w = _registry_with_worker()
-    diag = {"states": [{"state_id": s.state_id, "sample_count": 10 ** 6, "warnings": []}
-                       for s in r.active_states()], "edges": []}
-    acts = propose_actions_from_diagnostics(r, diag, policy=AdaptiveDecisionPolicy(retire_converged=True))
-    assert all(not (len(a) > 1 and a[0] in ("retire", "extend") and int(a[1]) == w.state_id) for a in acts)
+    diag = _diag_for(r, w, 10 ** 6, 10 ** 6)  # redundant, off-target, well sampled: retire candidate
+    pol = AdaptiveDecisionPolicy(retire_converged=True, min_active_states=1)
+    acts = propose_actions_from_diagnostics(r, diag, policy=pol)
+    assert not _targets(acts, ("retire", "extend"), w.state_id)
+
+
+def test_extension_never_proposes_worker():
+    r, w = _registry_with_worker()
+    diag = _diag_for(r, w, 1, 10 ** 6)  # worker undersampled: extend would fire for an ordinary state
+    pol = AdaptiveDecisionPolicy(retire_converged=True, min_active_states=1)
+    acts = propose_actions_from_diagnostics(r, diag, policy=pol)
+    assert not _targets(acts, ("retire", "extend"), w.state_id)
+
+
+def test_active_graph_connected_with_worker():
+    from gareus.adaptive_production import active_graph_connected, _graph_articulation_states
+    r, w = _registry_with_worker()
+    r0 = WindowStateRegistry()
+    for c1 in (0.0, 0.5, 1.0):
+        for lam in (0.0, 0.2):
+            r0.add_state(c1, 10.0, 0.5, 2.0, gamd_lambda=lam)
+    assert active_graph_connected(r0)
+    assert active_graph_connected(r)
+    assert _graph_articulation_states(r) == _graph_articulation_states(r0)
+    assert w.state_id not in _graph_articulation_states(r)
+
+
+def test_tag_auxiliary_rows_only_for_workers():
+    from gareus.adaptive_production import _tag_auxiliary_rows
+    r, w = _registry_with_worker()
+    payload = {"states": [{"state_id": s.state_id} for s in r.active_states()]}
+    _tag_auxiliary_rows(payload, r)
+    assert [x["state_id"] for x in payload["states"] if x.get("auxiliary")] == [w.state_id]
+    r0 = WindowStateRegistry()
+    r0.add_state(0.0, 10.0, 0.5, 2.0)
+    p0 = {"states": [{"state_id": 0}]}
+    _tag_auxiliary_rows(p0, r0)
+    assert p0 == {"states": [{"state_id": 0}]}
+
+
+def test_centre_members_exclude_worker():
+    from gareus.adaptive_production import AdaptiveProductionController
+    r, w = _registry_with_worker()
+    ctl = AdaptiveProductionController(r, policy=AdaptiveDecisionPolicy())
+    members = ctl._centre_members(r.get_state(0))
+    assert members and w.state_id not in {m.state_id for m in members}
 
 
 def test_cv2_resolution_views_skip_worker():
