@@ -108,3 +108,13 @@ def test_xtc_offset_is_zero_when_replicas_loaded_the_setup_checkpoint(tmp_path: 
     import pytest
     with pytest.raises(ValueError, match="mixed"):
         xtc_step_offset(ph)
+
+
+def test_wrong_step_clock_fails_loudly_not_as_an_empty_phase(tmp_path: Path):
+    import json
+    import pytest
+    ph = make_phase(tmp_path, "epoch_000", {"replica_0.xtc": (0, 0, [300, 3300])}, {0: 0.0}, lambda s: 0.0)
+    (ph / "gareus_metadata.json").write_text(json.dumps({"shared_gamd_calibration_steps": 10200}))
+    with pytest.raises(RuntimeError, match="offset 10200"):
+        build_frame_table(tmp_path, epochs=[0], registry_lambda={100: 0.0}, stride_steps=3000,
+                          max_frames=10 ** 6, seed=0)

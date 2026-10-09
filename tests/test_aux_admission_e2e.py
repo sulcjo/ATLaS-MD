@@ -83,7 +83,8 @@ def test_kill_after_freeze_before_save_readmits_from_the_record(tmp_path, small_
     reg = run.registry()
     assert len(_workers(reg.all_states())) == 1
     rep = json.loads((run.adaptive / "epoch_001" / "aux_discovery_report.json").read_text())
-    assert rep["status"] == "readmitted_from_record"
+    assert rep["status"] == "ok" and rep["fixed_discovery"] is True        # the discovery record survives
+    assert [e["status"] for e in rep["readmitted"]] == ["readmitted_from_record"]
     assert run.phase_has_column("epoch_002", "aux_z_00")
     from gareus.adaptive_production import build_union_state_mbar_inputs
     meta = build_union_state_mbar_inputs(run.adaptive, reg, output_prefix="e2e")

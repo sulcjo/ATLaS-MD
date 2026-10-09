@@ -226,7 +226,8 @@ def test_admission_without_its_worker_is_re_emitted_never_rediscovered(tmp_path,
     assert again[0][2] == first[0][2]                        # centre, k, model sha, burnin_steps
     assert again[0][4]["aux"]["burnin_phase_epoch"] == 2
     rep = json.loads((ad / "epoch_001" / "aux_discovery_report.json").read_text())
-    assert rep["status"] == "readmitted_from_record"
+    assert rep["status"] == "ok" and "settings" in rep and rep["admitted"]   # the discovery record survives
+    assert rep["readmitted"][-1]["status"] == "readmitted_from_record" and rep["readmitted"][-1]["epoch"] == 1
     ctl = AdaptiveProductionController(reg, policy=AdaptiveDecisionPolicy(aux_discovery=True, aux_reserve_slots=4))
     ctl.apply_actions(1, again)
     assert not ctl.refused_actions

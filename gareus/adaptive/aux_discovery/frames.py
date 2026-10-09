@@ -167,6 +167,11 @@ def _phase_frames(task):
             continue
         desc = evaluate_descriptors(xyz[joined["pos"].to_numpy()], definition)
         blocks.append((joined.drop(columns=["pos"]).reset_index(drop=True), desc))
+    if not blocks and anchors and len(samples):
+        # frames and lambda = 0 samples both exist but none join: the step clocks disagree (never a silent 0)
+        raise RuntimeError(f"{phase_dir}: no trajectory frame joins its {len(samples)} lambda = 0 samples at XTC "
+                           f"step offset {offset} (gareus_metadata.json shared_gamd_calibration_steps); the "
+                           "trajectory and sample step clocks disagree")
     return definition, blocks, n_unmapped
 
 

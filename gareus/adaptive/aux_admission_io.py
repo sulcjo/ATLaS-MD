@@ -185,8 +185,10 @@ def _missing_admitted_workers(admission: dict, registry) -> List[dict]:
 def _readmit_missing_workers(adaptive_dir: Path, epoch_dir: Path, epoch, registry) -> List[tuple]:
     """A job killed after the freeze but before ``registry.save`` leaves aux_admission.json whose workers never
     reached the saved registry. Re-emit them from the record (never re-discover): without this every later
-    boundary returns early and pooling refuses the campaign (``require_admitted_workers``). Never raises."""
-    report = {"schema": REPORT_SCHEMA, "epoch": int(epoch), "started_unix": time.time()}
+    boundary returns early and pooling refuses the campaign (``require_admitted_workers``). The epoch's
+    discovery report keeps every original field (the only record of the search and placement); the event is
+    appended under ``readmitted``. Never raises."""
+    event = {"epoch": int(epoch), "started_unix": time.time()}
     try:
         admission = json.loads((adaptive_dir / ADMISSION_FILENAME).read_text())
         missing = _missing_admitted_workers(admission, registry)
@@ -195,7 +197,7 @@ def _readmit_missing_workers(adaptive_dir: Path, epoch_dir: Path, epoch, registr
         adm_epoch = int(admission["epoch"])
         if int(epoch) > adm_epoch:     # phases since the admission ran without the model: z by backfill
             from gareus.auxiliary_cv.model import AuxModel
-            report["backfill"] = _backfill(adaptive_dir, epoch, AuxModel.load(adaptive_dir / MODEL_FILENAME))
+            event["backfill"] = _backfill(adaptive_dir, epoch, AuxModel.load(adaptive_dir / MODEL_FILENAME))
         new = [(ACTION, int(w["parent_state_id"]),
                 {"aux_center": float(w["aux_center"]), "aux_k_kcal_mol": float(w["aux_k_kcal_mol"]),
                  "aux_model_sha256": str(admission["model_sha256"]), "burnin_steps": 0},
@@ -203,18 +205,22 @@ def _readmit_missing_workers(adaptive_dir: Path, epoch_dir: Path, epoch, registr
                 {"aux": {"discovery_epoch": adm_epoch, "placement_rank": int(w.get("placement_rank", 0)),
                          "burnin_phase_epoch": int(epoch) + 1, "readmitted_epoch": int(epoch)}})
                for w in missing]
-        report.update(status="readmitted_from_record", admitted=[[a[1], a[2]] for a in new])
+        event.update(status="readmitted_from_record", admitted=[[a[1], a[2]] for a in new])
         return new
     except Exception as exc:
-        report.update(status="error", error=f"{type(exc).__name__}: {exc}", traceback=traceback.format_exc())
+        event.update(status="error", error=f"{type(exc).__name__}: {exc}", traceback=traceback.format_exc())
         return []
     finally:
-        if "status" in report:
-            report["finished_unix"] = time.time()
+        if "status" in event:
+            event["finished_unix"] = time.time()
+            path = Path(epoch_dir) / REPORT_NAME
             try:
-                _write_json(Path(epoch_dir) / REPORT_NAME, report)
+                report = json.loads(path.read_text()) if path.exists() else {"schema": REPORT_SCHEMA,
+                                                                             "epoch": int(epoch)}
+                report.setdefault("readmitted", []).append(event)
+                _write_json(path, report)
             except Exception as exc:
-                print(f"WARNING: could not write {Path(epoch_dir) / REPORT_NAME}: {exc}")
+                print(f"WARNING: could not record the re-admission in {path}: {exc}")
 
 
 def _backfill(adaptive_dir: Path, epoch, model) -> List[dict]:
