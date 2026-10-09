@@ -1870,6 +1870,9 @@ def _read_sample_dicts(run_dir: Path) -> List[Dict[str, Any]]:
                     "v_dih_kj_mol": _blank_if_nonfinite(_value_at(data, "v_dih_kj_mol", i, "")),
                     "gamd_lambda": _blank_if_nonfinite(_value_at(data, "gamd_lambda", i, "")),
                 }
+                if "aux_z_00" in data:
+                    # post-admission aux phase: the runtime z of the sample (exact; union pooling reads it)
+                    row["aux_z_00"] = _blank_if_nonfinite(_value_at(data, "aux_z_00", i, ""))
                 rows.append(row)
             return rows
     return _read_csv_dicts(run_dir / "samples.csv")
@@ -3840,8 +3843,11 @@ def build_union_state_mbar_inputs(
     """
     adaptive_dir = Path(adaptive_dir)
     # CVaux Stage C (C9): the union bias omits the auxiliary term; refuse aux phases here and in every pilot dir.
-    from .kernel_identity import refuse_aux_snapshots
-    refuse_aux_snapshots(adaptive_dir, where="adaptive union build")
+    from .kernel_identity import aux_admission_allows_pooling, refuse_aux_snapshots
+    # A campaign whose driver admitted aux workers pools them (per-sample z, aux term); otherwise refuse as before.
+    _aux_rec = aux_admission_allows_pooling(adaptive_dir)
+    if _aux_rec is None:
+        refuse_aux_snapshots(adaptive_dir, where="adaptive union build")
     for _pilot in (pilot_dirs or []):
         refuse_aux_snapshots(Path(_pilot), where=f"adaptive union build (pilot dir {_pilot})")
     out_prefix = adaptive_dir / output_prefix
@@ -3860,6 +3866,16 @@ def build_union_state_mbar_inputs(
 
     from .mbar_analysis.bias import _epoch_bias_param_vectors, _parse_epoch_window_map_native_params
 
+    _aux_workers: Dict[int, Dict[str, Any]] = {}
+    if _aux_rec is not None:
+        from .adaptive import aux_pooling as _ap  # noqa: PLC0415
+        from .kernel_identity import AuxPoolingRefused  # noqa: PLC0415
+        _aux_workers = _ap.worker_table((int(s.state_id), s.metadata) for s in states)
+        for _sid, _rec in _aux_workers.items():
+            if str(_rec.get("aux_model_sha256")) != str(_aux_rec.get("model_sha256")):
+                raise AuxPoolingRefused(f"worker state {_sid} names aux model {str(_rec.get('aux_model_sha256'))[:12]}, "
+                                        f"admission record {str(_aux_rec.get('model_sha256'))[:12]}")
+
     sample_rows: List[Dict[str, Any]] = []
     # Per source: (primary_center, primary_k, secondary_center, secondary_k) vectors
     # over the union states, native where that source's own map records them.
@@ -3875,6 +3891,7 @@ def build_union_state_mbar_inputs(
         source_index = len(source_params)
         source_params.append(_epoch_bias_param_vectors(
             native, state_ids.tolist(), primary_centers, primary_k, secondary_centers, secondary_k))
+        _source_first_row = len(sample_rows)
         for row in rows:
             w = _float_or_none(row.get("window"))
             cv = _float_or_none(row.get("cv_A", row.get("primary_cv_value")))
@@ -3901,7 +3918,22 @@ def build_union_state_mbar_inputs(
                 "v_dih_kj_mol": "" if v_dih is None else float(v_dih),
                 "usable_for_mbar": int(source_label.startswith("final") or include_epochs),
                 "_source_index": source_index,
+                **({"_replica": _float_or_none(row.get("replica")), "_z_recorded": _float_or_none(row.get("aux_z_00"))}
+                   if _aux_workers else {}),
             })
+        if _aux_workers and len(sample_rows) > _source_first_row:
+            _new = sample_rows[_source_first_row:]
+            _recorded = [r["_z_recorded"] for r in _new]
+            _has_recorded = any(v is not None for v in _recorded)
+            _bad = [r for r in _new if r["_replica"] is None or r["step"] == ""]
+            if _bad:
+                raise AuxPoolingRefused(f"{source_label}: {len(_bad)} rows without aux z (no replica/step to join on)")
+            _z = _ap.phase_z(
+                source_label, Path(sample_dir), [int(r["_replica"]) for r in _new], [int(r["step"]) for r in _new],
+                str(_aux_rec["model_sha256"]),
+                recorded=[np.nan if v is None else v for v in _recorded] if _has_recorded else None)
+            for _r, _zv in zip(_new, _z.tolist()):
+                _r["aux_z"] = float(_zv)
 
     if not sample_rows:
         raise RuntimeError(f"no usable sample rows found under {adaptive_dir}")
@@ -3911,6 +3943,21 @@ def build_union_state_mbar_inputs(
     # equilibrated_subsample, then rebuild sample_rows from kept indices.
     # All downstream numpy arrays are derived from sample_rows so alignment is
     # preserved automatically.
+    _burnin_dropped: Dict[int, int] = {}
+    if _aux_workers:
+        # Worker burn-in: the worker's samples of the phase(s) of its burnin_phase_epoch (never burnin_steps).
+        _label_epoch = {lab: _ap.phase_epoch(lab) for lab in {r["source"] for r in sample_rows}}
+        _kept_rows = []
+        for _r in sample_rows:
+            _rec = _aux_workers.get(int(_r["sampled_state_id"]))
+            if (_rec is not None and _rec.get("burnin_phase_epoch") is not None
+                    and _label_epoch[_r["source"]] == int(_rec["burnin_phase_epoch"])):
+                _burnin_dropped[int(_r["sampled_state_id"])] = _burnin_dropped.get(int(_r["sampled_state_id"]), 0) + 1
+                continue
+            _kept_rows.append(_r)
+        sample_rows = _kept_rows
+        if not sample_rows:
+            raise RuntimeError(f"no usable sample rows found under {adaptive_dir} (all were worker burn-in)")
     from .mbar_subsample import equilibrated_subsample as _es  # noqa: PLC0415
     _state_to_indices: Dict[int, List[int]] = {}
     for _gi, _row in enumerate(sample_rows):
@@ -3930,6 +3977,12 @@ def build_union_state_mbar_inputs(
         _subsample_counts[str(_sid)] = {"raw": _raw, "t0": _t0, "kept": _kept, "g": _g,
                                         "status": str(_res.status)}
     sample_rows = [sample_rows[i] for i in sorted(_kept_global)]
+    for _sid, _n in _burnin_dropped.items():
+        _subsample_counts.setdefault(str(_sid), {"raw": 0, "t0": 0, "kept": 0, "g": 1.0, "status": "all_burnin"})
+        _subsample_counts[str(_sid)]["burnin_dropped"] = int(_n)
+    for _sid in _aux_workers:
+        if str(_sid) in _subsample_counts:
+            _subsample_counts[str(_sid)].setdefault("burnin_dropped", 0)
     if size_guard is not None:
         size_guard(len(sample_rows), len(states))
 
@@ -3955,6 +4008,15 @@ def build_union_state_mbar_inputs(
         rows_src = np.flatnonzero(source_of_row == src)
         umbrella_bias_kcal[rows_src] = _union_umbrella_bias_kcal(
             cv_values[rows_src], secondary_values[rows_src], *source_params[int(src)])
+    aux_z_values = None
+    if _aux_workers:
+        # Worker restraint 0.5 k (z - c)^2 (kcal/mol) for every sample under every worker state; added before
+        # the kJ conversion and the ladder boost (workers are lambda = 0).
+        aux_z_values = np.asarray([float(r["aux_z"]) for r in sample_rows], dtype=np.float64)
+        for _j, _st in enumerate(states):
+            _rec = _aux_workers.get(int(_st.state_id))
+            if _rec is not None:
+                umbrella_bias_kcal[:, _j] += _ap.aux_term_kcal(aux_z_values, _rec["aux_center"], _rec["aux_k_kcal_mol"])
     umbrella_bias_kj = 4.184 * umbrella_bias_kcal
 
     # λ-ladder boost term: added by the one shared helper every MBAR
@@ -4019,6 +4081,11 @@ def build_union_state_mbar_inputs(
         state_lambdas=state_lambdas,
         v_pep_kj_mol=v_pep_values,
         v_dih_kj_mol=v_dih_values,
+        **({"aux_z": aux_z_values,
+            "aux_center": np.asarray([float(_aux_workers[int(s.state_id)]["aux_center"]) if int(s.state_id) in _aux_workers
+                                      else np.nan for s in states], dtype=np.float64),
+            "aux_k": np.asarray([float(_aux_workers[int(s.state_id)]["aux_k_kcal_mol"]) if int(s.state_id) in _aux_workers
+                                 else 0.0 for s in states], dtype=np.float64)} if _aux_workers else {}),
     )
     meta = {
         "schema_version": "adaptive_union_mbar_inputs_v1",
@@ -4036,6 +4103,9 @@ def build_union_state_mbar_inputs(
         "subsample_counts_per_state": _subsample_counts,
     }
     meta.update(_ladder_meta)
+    if _aux_workers:
+        meta["aux_model_sha256"] = str(_aux_rec["model_sha256"])
+        meta["aux_state_ids"] = sorted(_aux_workers)
     json_path = out_prefix.with_suffix(".json")
     write_json(json_path, _json_ready(meta))
     return meta

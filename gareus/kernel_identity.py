@@ -241,3 +241,25 @@ def classify_segment_kernel(window_snapshot: dict, *, sample_payload_schema: "di
     if ev in (None, "affected_pre_f01"):
         return ELIGIBLE_AFFECTED, "recorded coordinates came from the two-term fall-through (review I01)"
     return ELIGIBLE_UNKNOWN, f"kernel {ev!r}/{ex!r} is not the current {RESIDUAL_EVALUATOR_VERSION!r}/{EXCHANGE_ENERGY_VERSION!r}"
+
+
+def aux_admission_allows_pooling(adaptive_dir) -> "Optional[dict]":
+    """The admission record of a campaign whose driver admitted aux workers, else None.
+
+    Such a campaign pools its legacy and aux phases (spec 2026-10-09 Section 5): the union builders then
+    evaluate the worker restraint from per-sample z instead of refusing. None = no ``aux_admission.json``
+    (every existing refusal stays). A record whose model file does not match raises ``AuxPoolingRefused``.
+    """
+    import json
+    from pathlib import Path
+    ad = Path(adaptive_dir)
+    rec_path = ad / "aux_admission.json"
+    if not rec_path.exists():
+        return None
+    rec = json.loads(rec_path.read_text())
+    from gareus.auxiliary_cv.model import AuxModel
+    model = AuxModel.load(ad / "aux_model.json")
+    if model.model_sha256 != rec.get("model_sha256"):
+        raise AuxPoolingRefused(f"{ad}: aux_model.json sha {model.model_sha256[:12]} != admission record "
+                                f"{str(rec.get('model_sha256'))[:12]}")
+    return rec
