@@ -288,3 +288,20 @@ def test_cmap_system_blocks_admission_before_any_frame_is_read(tmp_path, monkeyp
     rep = _report(ad)
     assert out == [] and rep["status"] == "physical_system_unsupported" and not seen
     assert rep["physical_system"]["status"] == "refused" and "CMAP" in rep["physical_system"]["detail"]
+
+
+def test_cv2_resolution_budget_holds_back_the_aux_slice_only_with_the_flag():
+    # Task 4 minor: R1/R3 never spend the aux slice of the P1 reserve; flag off = byte-identical allowance
+    from gareus.adaptive import cv2_resolution as cr
+    from gareus.adaptive.cv2_resolution_io import budget_for_epoch
+    reserve = {"fraction": 0.2, "max_replicas": 13}
+    reg = _registry()
+    off, _, _, _ = budget_for_epoch(reg, AdaptiveDecisionPolicy(max_replicas_budget=13, aux_reserve_slots=4), [],
+                                    reserve, cr.ResolutionSettings())
+    on, _, _, _ = budget_for_epoch(reg, _policy(max_replicas_budget=13), [], reserve, cr.ResolutionSettings())
+    assert (off.free_slots, off.aux_slots) == (10, 0)
+    assert (on.free_slots, on.aux_slots) == (6, 4) and on.resolution_slots < off.resolution_slots
+    AdaptiveProductionController(reg, policy=_policy()).apply_actions(
+        1, [("admit_aux", 0, {"aux_center": 1.0, "aux_k_kcal_mol": 2.0, "aux_model_sha256": "e" * 64}, "t", {})])
+    held, _, _, _ = budget_for_epoch(reg, _policy(max_replicas_budget=13), [], reserve, cr.ResolutionSettings())
+    assert held.aux_slots == 3 and held.free_slots == 6                  # 9 free after the worker, 3 still held

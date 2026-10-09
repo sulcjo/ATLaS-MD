@@ -90,3 +90,23 @@ def test_loader_refuses_when_admitted_worker_not_in_registry(tmp_path):
     p.write_text(json.dumps(rec))
     with pytest.raises(AuxPoolingRefused, match="no matching worker state"):
         _load(camp)
+
+
+def test_recorded_z_of_a_phase_run_with_another_model_refused(tmp_path):
+    # fix wave minor: a post-admission phase's recorded aux_z_00 is pooled only when the phase's own runtime
+    # model (its window snapshots) is the admission's model
+    from gareus.adaptive.aux_pooling import phase_z
+    camp = build_campaign(tmp_path)
+    z = phase_z("final", camp.ad / "final", [0], [1], MODEL.model_sha256, recorded=[0.25])
+    assert z.tolist() == [0.25]
+    with pytest.raises(AuxPoolingRefused, match="runtime aux model"):
+        phase_z("final", camp.ad / "final", [0], [1], "1" * 64, recorded=[0.25])
+    with pytest.raises(AuxPoolingRefused, match="none recorded"):          # recorded z, no aux runtime record
+        phase_z("epoch_000", camp.ad / "epoch_000", [0], [1], MODEL.model_sha256, recorded=[0.25])
+
+
+def test_phase_runtime_model_shas_reads_the_snapshot(tmp_path):
+    from gareus.adaptive.aux_pooling import phase_runtime_model_shas
+    camp = build_campaign(tmp_path)
+    assert phase_runtime_model_shas(camp.ad / "final") == {MODEL.model_sha256}
+    assert phase_runtime_model_shas(camp.ad / "epoch_000") == set()

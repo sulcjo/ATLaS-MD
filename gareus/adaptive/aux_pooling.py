@@ -68,12 +68,41 @@ def require_admitted_workers(admission: dict, registry_workers: Dict[int, dict],
                                     "(an admitted worker must pool)")
 
 
+def phase_runtime_model_shas(phase_dir: Path) -> set:
+    """Aux model digests a phase ran with, from its own window snapshots (``windows/*.json``: kernel identity,
+    the frozen state definition's ``aux_models``, any row's ``aux_model_sha256``). Empty = no aux runtime."""
+    import json
+    shas = set()
+    for snap in sorted(Path(phase_dir).glob("windows/*.json")):
+        try:
+            payload = json.loads(snap.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        ki = payload.get("kernel_identity")
+        if isinstance(ki, dict) and ki.get("aux_model_sha256"):
+            shas.add(str(ki["aux_model_sha256"]))
+        state = payload.get("state_definition") if isinstance(payload.get("state_definition"), dict) else {}
+        shas.update(str(k) for k in (state.get("aux_models") or {}))
+        for row in list(payload.get("windows") or []) + list(state.get("windows") or []):
+            if isinstance(row, dict) and row.get("aux_model_sha256"):
+                shas.add(str(row["aux_model_sha256"]))
+    return shas
+
+
 def phase_z(label: str, phase_dir: Path, replica, step, model_sha256: str, recorded=None) -> np.ndarray:
-    """z (float64) for the given samples of one phase; raises AuxPoolingRefused when any row lacks it."""
+    """z (float64) for the given samples of one phase; raises AuxPoolingRefused when any row lacks it, or when
+    recorded z comes from a phase whose runtime aux model (its window snapshots) is not the admission's."""
     replica = np.asarray(replica, dtype=np.int64)
     step = np.asarray(step, dtype=np.int64)
     n = step.size
     if recorded is not None:
+        shas = phase_runtime_model_shas(phase_dir)
+        if shas != {str(model_sha256)}:
+            raise AuxPoolingRefused(f"{label}: recorded {Z_COLUMN} comes from runtime aux model(s) "
+                                    f"{sorted(x[:12] for x in shas) or 'none recorded'} in {phase_dir}/windows, "
+                                    f"not the admission's {str(model_sha256)[:12]}")
         z = np.asarray(np.ma.asarray(recorded, dtype=np.float64).filled(np.nan), dtype=np.float64)
         missing = int((~np.isfinite(z)).sum())
         if missing:
@@ -115,4 +144,4 @@ def aux_term_kcal(z: np.ndarray, center: float, k_kcal: float) -> np.ndarray:
     return 0.5 * float(k_kcal) * (np.asarray(z, dtype=np.float64) - float(center)) ** 2
 
 
-__all__ = ["phase_z", "burnin_keep", "worker_table", "aux_term_kcal", "phase_epoch", "Z_COLUMN", "KJ_PER_KCAL"]
+__all__ = ["phase_z", "phase_runtime_model_shas", "burnin_keep", "worker_table", "aux_term_kcal", "phase_epoch", "Z_COLUMN", "KJ_PER_KCAL"]

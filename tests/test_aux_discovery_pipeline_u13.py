@@ -60,7 +60,8 @@ def test_noise_control_is_broaden():
                           k3_max=3, epoch=1)
     assert res.status == "broaden"
     assert res.model is None and res.placement is None
-    assert not res.report["z3_search"].get("null_gate", {"passed": False})["passed"]
+    # no candidate survives the search on noise, so the null gate never runs (it is never reached, not passed)
+    assert res.report["z3_search"]["chosen"] is None and "null_gate" not in res.report["z3_search"]
 
 
 def test_planted_torsion_predicting_contact_groups_passes(monkeypatch):
