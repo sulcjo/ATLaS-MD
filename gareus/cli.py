@@ -1495,26 +1495,10 @@ def _validate_aux_discovery_args(p: argparse.ArgumentParser, args: argparse.Name
         return
     if str(getattr(args, "window_mode", "")) != "adaptive-production":
         p.error("--ap-aux-discovery needs --window-mode adaptive-production")
-    if getattr(args, "ap_topups", False):
-        p.error("--ap-aux-discovery cannot run with --ap-topups (out of scope, spec Section 11)")
-    if str(getattr(args, "exchange_mode", "") or "") == "neighbor":
-        p.error("--ap-aux-discovery needs an unrestricted exchange mode (gibbs-walk, all-pair-sweep, random-pair)")
-    if getattr(args, "us_auto_drop_bad_windows", False):
-        p.error("--ap-aux-discovery refuses --us-auto-drop-bad-windows (aux populations are frozen)")
-    run_mode = str(getattr(args, "run_mode", "gamd") or "gamd")
-    boost = str(getattr(args, "gamd_boost_type", "") or "")
-    if run_mode in ("gamd", "hmr-gamd") and not boost.startswith("pep-gamd"):
-        p.error("--ap-aux-discovery needs a pep-gamd-* boost type")
-    traj = int(getattr(args, "traj_interval", 0) or 0)
-    dist = int(getattr(args, "distance_output_interval", 0) or 0)
-    exch = int(getattr(args, "exchange_interval", 0) or 0)
-    if traj <= 0 or traj != dist:
-        p.error("--ap-aux-discovery needs traj_interval == distance_output_interval > 0 (z backfill needs "
-                "one trajectory frame per sample)")
-    if exch <= 0 or exch % traj:
-        p.error("--ap-aux-discovery needs exchange_interval to be a multiple of traj_interval")
-    if int(getattr(args, "ap_aux_reserve_slots", 4)) < 1:
-        p.error("--ap-aux-discovery needs --ap-aux-reserve-slots >= 1")
+    from gareus.adaptive.aux_discovery.settings import aux_discovery_incompatibilities
+    bad = aux_discovery_incompatibilities(args)
+    if bad:
+        p.error(bad[0])
 
 
 def _validate_fsf_clamp_args(p: argparse.ArgumentParser, args: argparse.Namespace) -> None:

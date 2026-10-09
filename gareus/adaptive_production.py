@@ -8849,6 +8849,17 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
     # connectivity, top-up partners), so every phase runs with the campaign's frozen value,
     # whatever this job's --layout-neighbour-rule says (phase args are copies of args).
     args.layout_neighbour_rule = str(policy.layout_neighbour_rule)
+    if bool(getattr(policy, "aux_discovery", False)):
+        # Final fix wave I4: the frozen policy can turn aux discovery on for a job whose own flags never passed
+        # the parse-time checks (a resume omitting --ap-aux-discovery); re-check them against the frozen policy.
+        from .adaptive.aux_discovery.settings import aux_discovery_incompatibilities  # noqa: PLC0415
+        _aux_bad = aux_discovery_incompatibilities(
+            args, topups=bool(getattr(policy, "topups_enabled", False))
+            or _arg_bool(args, "adaptive_production_topups", False))
+        if _aux_bad:
+            raise RuntimeError("this campaign's frozen decision settings enable aux-CV discovery "
+                               f"({adaptive_dir / 'decision_settings.json'}), but this job's options are "
+                               "incompatible with it: " + "; ".join(_aux_bad))
     max_epochs = max(1, _arg_int(args, "adaptive_production_epochs", 3))
     # Epoch 0 also bootstraps the tICA model and (when enabled) the shared GaMD
     # envelope recalibration -- both need only a short look at real sampling, not

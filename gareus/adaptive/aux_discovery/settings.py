@@ -13,7 +13,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Tuple
 
 AUX_SETTINGS_FILENAME = "aux_settings.json"
 AUX_SETTINGS_SCHEMA = "atlas-aux-discovery-settings-v1"
@@ -100,3 +100,37 @@ def resolve_aux_settings(adaptive_dir: Path, settings: AuxDiscoverySettings, *,
            "written_unix": time.time(), "override": bool(override)}
     _atomic_write_json(path, rec)
     return settings, rec
+
+
+def aux_discovery_incompatibilities(args, *, topups: bool = False) -> List[str]:
+    """Options aux discovery cannot run with (spec Section 11); [] = compatible. One source for the parse-time
+    refusal (``gareus.cli``) and the driver-start re-check against a campaign's frozen policy (fix wave I4).
+    ``topups``: the effective top-up switch (frozen policy or this job's flag)."""
+    bad = []
+    window_mode = str(getattr(args, "window_mode", "") or "")
+    if window_mode and window_mode != "adaptive-production":
+        bad.append("--ap-aux-discovery needs --window-mode adaptive-production")
+    if topups or getattr(args, "ap_topups", False):
+        bad.append("--ap-aux-discovery cannot run with --ap-topups (out of scope, spec Section 11)")
+    if str(getattr(args, "exchange_mode", "") or "") == "neighbor":
+        bad.append("--ap-aux-discovery needs an unrestricted exchange mode (gibbs-walk, all-pair-sweep, random-pair)")
+    if getattr(args, "us_auto_drop_bad_windows", False):
+        bad.append("--ap-aux-discovery refuses --us-auto-drop-bad-windows (aux populations are frozen)")
+    run_mode = str(getattr(args, "run_mode", "gamd") or "gamd")
+    boost = str(getattr(args, "gamd_boost_type", "") or "")
+    if run_mode in ("gamd", "hmr-gamd") and not boost.startswith("pep-gamd"):
+        bad.append("--ap-aux-discovery needs a pep-gamd-* boost type")
+    traj = int(getattr(args, "traj_interval", 0) or 0)
+    dist = int(getattr(args, "distance_output_interval", 0) or 0)
+    exch = int(getattr(args, "exchange_interval", 0) or 0)
+    if traj <= 0 or traj != dist:
+        bad.append("--ap-aux-discovery needs traj_interval == distance_output_interval > 0 (z backfill needs "
+                   "one trajectory frame per sample)")
+    elif exch <= 0 or exch % traj:
+        bad.append("--ap-aux-discovery needs exchange_interval to be a multiple of traj_interval")
+    slots = getattr(args, "ap_aux_reserve_slots", None)
+    if slots is None:
+        slots = getattr(args, "adaptive_production_aux_reserve_slots", 4)
+    if int(slots) < 1:
+        bad.append("--ap-aux-discovery needs --ap-aux-reserve-slots >= 1")
+    return bad
