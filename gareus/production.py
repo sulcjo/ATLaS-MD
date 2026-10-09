@@ -6536,6 +6536,18 @@ def reconcile_resume_secondary_cv_metadata(
     return meta
 
 
+def _aux_pull_ramp(args, aux_table, subset=None):
+    """aux_ramp argument for the US pull: None without an aux runtime; ``subset`` maps to pulled windows."""
+    runtime = getattr(args, "_aux_runtime", None)
+    if runtime is None or aux_table is None:
+        return None
+    from .seeding import AUX_PULL_RAMP_STAGES
+    idx = range(aux_table.n) if subset is None else [int(w) for w in subset]
+    return {"info": runtime.info, "runtime": runtime,
+            "centers": [None if aux_table.centers[w] is None else float(aux_table.centers[w]) for w in idx],
+            "k_kcal": [float(aux_table.k_kcal[w]) for w in idx], "stages": AUX_PULL_RAMP_STAGES}
+
+
 def _release_run_lock_best_effort(out_dir: Path) -> None:
     """Best-effort removal of this process's own ``.gareus_run.lock``.
 
@@ -7341,6 +7353,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     secondary_cv_centers=_sub(secondary_cv_centers), secondary_cv_ks_kj=_sub(secondary_cv_ks_kj),
                     secondary_cv_metadata=secondary_cv_metadata, allow_slow_mode_reseed=False,
                     total_windows=nrep,
+                    aux_ramp=_aux_pull_ramp(args, _aux_table, _cont_missing),
                 )
                 remap_subset_window_indices(Path(out_dir) / "us_starting_structures", _cont_missing)
                 window_start_positions, window_start_velocities, dropped_window_indices = merge_partial_pull(
@@ -7387,6 +7400,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 equil_state, primary_cv_def, cv_atom1, cv_atom2, setup_platform, setup_props, progress=progress,
                 secondary_cv_centers=secondary_cv_centers, secondary_cv_ks_kj=secondary_cv_ks_kj,
                 secondary_cv_metadata=secondary_cv_metadata,
+                aux_ramp=_aux_pull_ramp(args, _aux_table, None),
             )
             window_start_boxes = [None] * nrep
             topup_seed_by_window = {}
