@@ -6,9 +6,12 @@ import hashlib
 import pickle
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+import os
+import warnings
+from typing import List, Optional, Sequence
 
 import numpy as np
+import sklearn
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import adjusted_rand_score
@@ -18,29 +21,46 @@ from sklearn.neighbors import KNeighborsRegressor
 from .settings import AuxDiscoverySettings
 
 
+KNN_CHUNK = 4000
+
+
+def _apply_preprocess(X, keep, mean, sd, families):
+    """Shared by preprocess and FrozenPartition.predict so both transform identically."""
+    Z = (np.asarray(X, dtype=np.float64)[:, keep] - mean[keep]) / sd[keep]
+    fam = np.asarray(families)[keep]
+    for f in np.unique(fam):
+        Z[:, fam == f] /= np.sqrt((fam == f).sum())
+    return Z
+
+
 def preprocess(X, families, train, s: AuxDiscoverySettings):
     X = np.asarray(X, dtype=np.float64)
     mean = X[train].mean(0); sd_raw = X[train].std(0)
     keep = sd_raw >= s.sd_drop
     sd = np.maximum(sd_raw, s.sd_floor)  # exactly what Z used; FrozenPartition stores this
-    Z = (X[:, keep] - mean[keep]) / sd[keep]
-    fam = np.asarray(families)[keep]
-    for f in np.unique(fam):
-        Z[:, fam == f] /= np.sqrt((fam == f).sum())
-    return Z, keep, mean, sd
+    return _apply_preprocess(X, keep, mean, sd, families), keep, mean, sd
 
 
 def standardise_s(cv, train):
+    """Returns (S, mean, sd); float32 arithmetic."""
     cv = np.asarray(cv, dtype=np.float32)
-    return (cv - cv[train].mean(0)) / cv[train].std(0)
+    m = cv[train].mean(0); sd = cv[train].std(0)
+    return (cv - m) / sd, m, sd
+
+
+def _knn_predict(knn, S, chunk: int = KNN_CHUNK):
+    out = None
+    for a in range(0, len(S), chunk):
+        pr = knn.predict(S[a:a + chunk])
+        if out is None:
+            out = np.empty((len(S),) + pr.shape[1:], dtype=pr.dtype)
+        out[a:a + chunk] = pr
+    return out
 
 
 def knn_residual(S, Z, train, k):
     knn = KNeighborsRegressor(n_neighbors=int(k)).fit(S[train], Z[train])
-    M = np.empty_like(Z)
-    for a in range(0, len(Z), 4000):
-        M[a:a + 4000] = knn.predict(S[a:a + 4000])
-    return Z - M, knn
+    return Z - _knn_predict(knn, S), knn
 
 
 def pca_project(R, train, var, cap):
@@ -67,9 +87,12 @@ class PartitionChoice:
     gmm: object = None
     labels: Optional[np.ndarray] = None
     table: List[dict] = field(default_factory=list)
+    reason: Optional[str] = None
 
 
 def choose_partition(Pm, train, holdout, lineage, s: AuxDiscoverySettings, seed) -> PartitionChoice:
+    if holdout.sum() < max(int(s.k_max), 50):
+        return PartitionChoice(None, None, None, [], reason="holdout_too_small")
     rng = np.random.default_rng(int(seed))
     tr_rows = np.nonzero(train)[0]
     table, best = [], None
@@ -182,22 +205,22 @@ class FrozenPartition:
     pca: object
     n_components: int
     gmm: object
+    sklearn_version: str = ""
 
     def predict(self, X_raw, cv) -> np.ndarray:
-        X = np.asarray(X_raw, dtype=np.float64)
-        Z = (X[:, self.keep] - self.mean[self.keep]) / self.sd[self.keep]
-        fam = np.asarray(self.families)[self.keep]
-        for f in np.unique(fam):
-            Z[:, fam == f] /= np.sqrt((fam == f).sum())
+        Z = _apply_preprocess(X_raw, self.keep, self.mean, self.sd, self.families)
         S = (np.asarray(cv, np.float32) - self.s_mean) / self.s_sd
-        R = Z - self.knn.predict(S)
+        R = Z - _knn_predict(self.knn, S)
         return self.gmm.predict(self.pca.transform(R)[:, : self.n_components])
 
     def to_file(self, path: Path) -> str:
         data = pickle.dumps(self, protocol=4)
-        Path(path).write_bytes(data)
         sha = hashlib.sha256(data).hexdigest()
-        Path(str(path) + ".sha256").write_text(sha + "\n")
+        path = Path(path)
+        for target, payload in ((path, data), (Path(str(path) + ".sha256"), (sha + "\n").encode())):
+            tmp = target.with_name(target.name + f".tmp{os.getpid()}")
+            tmp.write_bytes(payload)
+            os.replace(tmp, target)
         return sha
 
     @staticmethod
@@ -206,7 +229,11 @@ class FrozenPartition:
         sha = Path(str(path) + ".sha256").read_text().strip()
         if hashlib.sha256(data).hexdigest() != sha:
             raise ValueError(f"{path}: sha256 mismatch")
-        return pickle.loads(data)
+        obj = pickle.loads(data)
+        if getattr(obj, "sklearn_version", "") != sklearn.__version__:
+            warnings.warn(f"{path}: fitted with scikit-learn {getattr(obj, 'sklearn_version', '?')}, "
+                          f"running {sklearn.__version__}")
+        return obj
 
 
 @dataclass
@@ -222,8 +249,14 @@ class PartitionResult:
 
 def fit_partition(X, families, cv, train, holdout, lineage, step, s: AuxDiscoverySettings, *, seed: int = 0,
                   feature_names: Optional[Sequence[str]] = None) -> PartitionResult:
+    lineage = np.asarray(lineage)
+    X = np.asarray(X)
+    cv = np.asarray(cv, np.float32)
+    if holdout.sum() < max(int(s.k_max), 50) or train.sum() < int(s.knn_k):
+        return PartitionResult("insufficient_evidence", PartitionChoice(None, reason="too_few_rows"), None,
+                               np.zeros(len(X), int))
     Z, keep, mean, sd = preprocess(X, families, train, s)
-    S = standardise_s(cv, train)
+    S, s_mean, s_sd = standardise_s(cv, train)
     R, knn = knn_residual(S, Z, train, s.knn_k)
     Pm, pca, nc = pca_project(R, train, s.pca_var, s.pca_max)
     bins = s_bins(S, train, s.s_bins)
@@ -234,9 +267,7 @@ def fit_partition(X, families, cv, train, holdout, lineage, step, s: AuxDiscover
     hf = hidden_fraction(choice.labels, bins, train, holdout, K, nb)
     co = co_occurrence(choice.labels, bins, holdout, K, s)
     li = lineage_info(choice.labels, bins, lineage, step, K, nb, s.lineage_dirichlet_c)
-    s_mean = np.asarray(cv, np.float32)[train].mean(0); s_sd = np.asarray(cv, np.float32)[train].std(0)
-    frozen = FrozenPartition(list(feature_names or [f"f{i}" for i in range(np.asarray(X).shape[1])]), keep, mean,
-                             sd, list(families), s_mean, s_sd,
-                             knn, pca, nc, choice.gmm)
+    frozen = FrozenPartition(list(feature_names or [f"f{i}" for i in range(X.shape[1])]), keep, mean,
+                             sd, list(families), s_mean, s_sd, knn, pca, nc, choice.gmm, sklearn.__version__)
     triggered = (hf >= s.hidden_min and bool(co)) or li >= s.lineage_info_min
     return PartitionResult("ok" if triggered else "keep", choice, frozen, bins, hf, co, li)
