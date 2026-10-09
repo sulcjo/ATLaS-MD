@@ -72,3 +72,21 @@ def test_loader_low_memory_matches(tmp_path):
     a = _load(camp)
     b = _load(camp, low_memory=True)
     np.testing.assert_allclose(np.asarray(b.u_nk), np.asarray(a.u_nk), rtol=1e-12, atol=1e-12)
+
+
+def test_loader_refuses_when_registry_json_missing(tmp_path):
+    camp = build_campaign(tmp_path)
+    (camp.ad / "state_registry.json").unlink()
+    with pytest.raises(AuxPoolingRefused, match="state_registry.json is missing"):
+        _load(camp)
+
+
+def test_loader_refuses_when_admitted_worker_not_in_registry(tmp_path):
+    import json
+    camp = build_campaign(tmp_path)
+    p = camp.ad / "aux_admission.json"
+    rec = json.loads(p.read_text())
+    rec["workers"][0]["aux_center"] = 9.9
+    p.write_text(json.dumps(rec))
+    with pytest.raises(AuxPoolingRefused, match="no matching worker state"):
+        _load(camp)

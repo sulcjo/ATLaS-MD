@@ -93,7 +93,12 @@ def test_admission_with_wrong_model_sha_refuses(tmp_path):
 def test_no_workers_outputs_unchanged(tmp_path):
     """No worker in the registry: an admission record adds no aux arrays/keys and no z requirement."""
     from gareus.adaptive_production import WindowStateRegistry
+    import json
     camp = build_campaign(tmp_path)
+    p = camp.ad / "aux_admission.json"
+    rec = json.loads(p.read_text())
+    rec["workers"] = []
+    p.write_text(json.dumps(rec))
     reg = WindowStateRegistry()
     reg.add_state(0.2, 10.0)
     reg.add_state(0.5, 10.0)
@@ -101,3 +106,13 @@ def test_no_workers_outputs_unchanged(tmp_path):
     d = np.load(meta["arrays_npz"])
     assert "aux_z" not in d.files and "aux_model_sha256" not in meta
     assert all("burnin_dropped" not in v for v in meta["subsample_counts_per_state"].values())
+
+
+def test_builder_refuses_when_admitted_worker_not_in_registry(tmp_path):
+    from gareus.adaptive_production import WindowStateRegistry
+    camp = build_campaign(tmp_path)
+    reg = WindowStateRegistry()
+    reg.add_state(0.2, 10.0)
+    reg.add_state(0.5, 10.0)
+    with pytest.raises(AuxPoolingRefused, match="no matching worker state"):
+        build_union_state_mbar_inputs(camp.ad, reg, output_prefix="x")

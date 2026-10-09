@@ -3871,6 +3871,7 @@ def build_union_state_mbar_inputs(
         from .adaptive import aux_pooling as _ap  # noqa: PLC0415
         from .kernel_identity import AuxPoolingRefused  # noqa: PLC0415
         _aux_workers = _ap.worker_table((int(s.state_id), s.metadata) for s in states)
+        _ap.require_admitted_workers(_aux_rec, _aux_workers, "adaptive union build")
         for _sid, _rec in _aux_workers.items():
             if str(_rec.get("aux_model_sha256")) != str(_aux_rec.get("model_sha256")):
                 raise AuxPoolingRefused(f"worker state {_sid} names aux model {str(_rec.get('aux_model_sha256'))[:12]}, "
@@ -3918,13 +3919,14 @@ def build_union_state_mbar_inputs(
                 "v_dih_kj_mol": "" if v_dih is None else float(v_dih),
                 "usable_for_mbar": int(source_label.startswith("final") or include_epochs),
                 "_source_index": source_index,
-                **({"_replica": _float_or_none(row.get("replica")), "_z_recorded": _float_or_none(row.get("aux_z_00"))}
+                **({"_replica": _float_or_none(row.get("replica")), "_z_recorded": _float_or_none(row.get("aux_z_00")),
+                    "_z_has_column": "aux_z_00" in row}
                    if _aux_workers else {}),
             })
         if _aux_workers and len(sample_rows) > _source_first_row:
             _new = sample_rows[_source_first_row:]
             _recorded = [r["_z_recorded"] for r in _new]
-            _has_recorded = any(v is not None for v in _recorded)
+            _has_recorded = any(r["_z_has_column"] for r in _new)
             _bad = [r for r in _new if r["_replica"] is None or r["step"] == ""]
             if _bad:
                 raise AuxPoolingRefused(f"{source_label}: {len(_bad)} rows without aux z (no replica/step to join on)")

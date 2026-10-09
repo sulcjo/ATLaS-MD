@@ -401,6 +401,9 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
     if _aux_rec is not None:
         from gareus.adaptive import aux_pooling as _ap
         from gareus.adaptive_production import WindowStateRegistry
+        from gareus.kernel_identity import AuxPoolingRefused
+        if (_aux_rec.get('workers') or []) and not (Path(adaptive_dir) / 'state_registry.json').exists():
+            raise AuxPoolingRefused(f'{adaptive_dir}: aux_admission.json lists workers but state_registry.json is missing')
         _aux_reg = WindowStateRegistry.load(adaptive_dir)
         _aux_by_sid = _ap.worker_table((int(st.state_id), st.metadata) for st in _aux_reg.all_states())
         for _sid, _rec in _aux_by_sid.items():
@@ -410,6 +413,8 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
                     raise AuxPoolingRefused(f'worker state {_sid} names aux model {str(_rec.get("aux_model_sha256"))[:12]}, '
                                             f'admission record {str(_aux_rec.get("model_sha256"))[:12]}')
                 _aux_cols[state_id_to_k[_sid]] = _rec
+        _ap.require_admitted_workers(_aux_rec, {int(state_ids[k]): r for k, r in _aux_cols.items()},
+                                    'adaptive union loader')
 
     all_cv = []; all_cv2 = []; all_window = []; all_step = []
     all_replica = []; all_boost = []; all_boost_dih = []; all_potential = []; all_epoch_src = []

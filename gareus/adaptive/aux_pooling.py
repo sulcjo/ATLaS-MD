@@ -30,6 +30,25 @@ def worker_table(states: Iterable[Tuple[int, dict]]) -> Dict[int, dict]:
     return out
 
 
+def require_admitted_workers(admission: dict, workers: Dict[int, dict], where: str) -> None:
+    """Every worker of the admission record must map to a registry worker (parent + centre + k) in ``workers``.
+
+    ``workers`` = {state_id: aux params} of the registry states actually in the union. A missing or
+    stale registry would otherwise silently turn workers into ordinary states and drop the aux term."""
+    missing = []
+    for w in admission.get("workers") or []:
+        hit = any(rec.get("spawn_parent_state_id") is not None
+                  and int(rec["spawn_parent_state_id"]) == int(w["parent_state_id"])
+                  and abs(float(rec["aux_center"]) - float(w["aux_center"])) < 1e-9
+                  and abs(float(rec["aux_k_kcal_mol"]) - float(w["aux_k_kcal_mol"])) < 1e-9
+                  for rec in workers.values())
+        if not hit:
+            missing.append((w["parent_state_id"], w["aux_center"], w["aux_k_kcal_mol"]))
+    if missing:
+        raise AuxPoolingRefused(f"{where}: admitted aux worker(s) (parent, centre, k) {missing} have no matching "
+                                "worker state in the registry (state_registry.json missing, stale or unusable)")
+
+
 def phase_z(label: str, phase_dir: Path, replica, step, model_sha256: str, recorded=None) -> np.ndarray:
     """z (float64) for the given samples of one phase; raises AuxPoolingRefused when any row lacks it."""
     replica = np.asarray(replica, dtype=np.int64)
