@@ -221,6 +221,17 @@ def set_window(
     # Convert iterables to lists so indices can be taken multiple times.
     centers_list = list(centers_nm)
     k_list = list(ks_kj_nm2)
+    aux_values = None
+    if aux_state is not None:
+        # Validate the aux target BEFORE the first setParameter so a bad value cannot leave
+        # the Context half-updated.
+        from .auxiliary_cv.force import aux_parameter_values
+        w = int(window_index)
+        try:
+            aux_values = aux_parameter_values(center=aux_state.table.centers[w],
+                                              k_kcal=aux_state.table.k_kcal[w])
+        except Exception as exc:
+            raise type(exc)(f"set_window: invalid aux parameters for window index {w}: {exc}") from exc
     context.setParameter("r0", float(centers_list[int(window_index)]))
     context.setParameter("k", float(k_list[int(window_index)]))
     if secondary_centers is not None and secondary_ks_kj is not None:
@@ -236,10 +247,8 @@ def set_window(
         # Auxiliary-CV state (spec 3.3): set the COMPLETE target every time, including the reset
         # to zero when the window is ordinary. No try/except: a Context built without the
         # auxiliary capability while a runtime is configured is a fatal inconsistency.
-        from .auxiliary_cv.force import set_aux_parameters
-        w = int(window_index)
-        set_aux_parameters(context, aux_state.info, center=aux_state.table.centers[w],
-                           k_kcal=aux_state.table.k_kcal[w])
+        context.setParameter(aux_state.info.global_k, aux_values[0])
+        context.setParameter(aux_state.info.global_c, aux_values[1])
 
 
 

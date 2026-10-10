@@ -63,13 +63,22 @@ def build_aux_force(openmm, model: AuxModel, *, force_group: int):
     return cv, info
 
 
-def set_aux_parameters(context, info: AuxForceInfo, *, center, k_kcal) -> None:
-    """Set the complete auxiliary target; an inactive state resets both globals to 0."""
+def aux_parameter_values(*, center, k_kcal) -> tuple[float, float]:
+    """Validated (k kJ/mol/z^2, centre) for the aux globals; (0, 0) when inactive.
+
+    Pure: raises IntegrityError before any Context is touched. The centre is not evaluated
+    when k == 0.
+    """
     k = finite_number(k_kcal, "aux_k", minimum=0)
     if k == 0.0:
-        context.setParameter(info.global_k, 0.0)
-        context.setParameter(info.global_c, 0.0)
-        return
+        return 0.0, 0.0
+    k_kj = finite_number(k * KJ_PER_KCAL, "aux_k (kJ/mol)", minimum=0)
     c = finite_number(center, "aux center")
-    context.setParameter(info.global_k, k * KJ_PER_KCAL)
+    return k_kj, c
+
+
+def set_aux_parameters(context, info: AuxForceInfo, *, center, k_kcal) -> None:
+    """Set the complete auxiliary target; an inactive state resets both globals to 0."""
+    k_kj, c = aux_parameter_values(center=center, k_kcal=k_kcal)
+    context.setParameter(info.global_k, k_kj)
     context.setParameter(info.global_c, c)
