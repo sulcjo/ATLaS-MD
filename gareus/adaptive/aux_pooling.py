@@ -70,18 +70,16 @@ def require_admitted_workers(admission: dict, registry_workers: Dict[int, dict],
                                     "(an admitted worker must pool)")
 
 
-def phase_runtime_model_shas(phase_dir: Path) -> set:
-    """Aux model digests a phase ran with, from its own window snapshots (``windows/*.json``: kernel identity,
-    the frozen state definition's ``aux_models``, any row's ``aux_model_sha256``). Empty = no aux runtime."""
+def _snapshot_model_shas(snap: Path) -> set:
+    """Aux model digests one window snapshot names (kernel identity, the frozen state definition's
+    ``aux_models``, any row's ``aux_model_sha256``)."""
     import json
     shas = set()
-    for snap in sorted(Path(phase_dir).glob("windows/*.json")):
-        try:
-            payload = json.loads(snap.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if not isinstance(payload, dict):
-            continue
+    try:
+        payload = json.loads(Path(snap).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return shas
+    if isinstance(payload, dict):
         ki = payload.get("kernel_identity")
         if isinstance(ki, dict) and ki.get("aux_model_sha256"):
             shas.add(str(ki["aux_model_sha256"]))
@@ -91,6 +89,41 @@ def phase_runtime_model_shas(phase_dir: Path) -> set:
             if isinstance(row, dict) and row.get("aux_model_sha256"):
                 shas.add(str(row["aux_model_sha256"]))
     return shas
+
+
+def phase_runtime_model_shas(phase_dir: Path) -> set:
+    """Aux model digests a phase ran with, from its own window snapshots (``windows/*.json``: kernel identity,
+    the frozen state definition's ``aux_models``, any row's ``aux_model_sha256``). Empty = no aux runtime."""
+    shas = set()
+    for snap in sorted(Path(phase_dir).glob("windows/*.json")):
+        shas |= _snapshot_model_shas(snap)
+    return shas
+
+
+def require_persisted_model_segments(phase_dir: Path, model_sha256: str, where: str) -> None:
+    """In an admitted campaign, a segment that ran with the admitted model but whose samples cannot be
+    reconstructed (kernel eligibility ``aux_unpersisted``: no atlas-aux-samples-v1 payload, or no window
+    snapshot in a phase run with the model) refuses pooling instead of being dropped. Segments not run with the
+    admitted model (pre-admission) are untouched: they pool through the backfill."""
+    from gareus.kernel_identity import ELIGIBLE_AUX_UNPERSISTED
+    from gareus.query import segment_eligibility
+    phase_dir = Path(phase_dir)
+    sha = str(model_sha256)
+    phase_ran_with_model = None
+    for seg_id, info in segment_eligibility(phase_dir).items():
+        if info.get("eligibility") != ELIGIBLE_AUX_UNPERSISTED:
+            continue
+        snap = phase_dir / "windows" / f"{seg_id}.json"
+        if snap.exists():
+            ran = sha in _snapshot_model_shas(snap)
+        else:
+            if phase_ran_with_model is None:
+                phase_ran_with_model = sha in phase_runtime_model_shas(phase_dir)
+            ran = phase_ran_with_model
+        if ran:
+            raise AuxPoolingRefused(f"{where}: segment {seg_id} ran with the admitted aux model {sha[:12]} but is "
+                                    f"{ELIGIBLE_AUX_UNPERSISTED} ({info.get('reason')}): its recorded z is missing, "
+                                    "pooling refused (never dropped, never backfilled)")
 
 
 def spot_check_due_phases(adaptive_dir, admission: dict) -> list:
@@ -125,8 +158,26 @@ def require_spot_check(adaptive_dir, admission: dict) -> None:
                                 f"({detail or 'ok is not true'}): the backfilled z is not validated, pooling refused")
     due = spot_check_due_phases(adaptive_dir, admission)
     if due:
+        cause = ("spot check never ran: --ap-aux-discovery is off for this campaign (decision_settings.json "
+                 "aux_discovery false; the check runs only inside the discovery hook)"
+                 if _aux_discovery_recorded_off(adaptive_dir) else "aux_admission.json has no spot_check record")
         raise AuxPoolingRefused(f"{adaptive_dir}: the post-admission aux z spot check is due (phase(s) {due[:3]} ran "
-                                "with the admitted model) but aux_admission.json has no spot_check record")
+                                f"with the admitted model) but {cause}")
+
+
+def spot_check_is_final(sc) -> bool:
+    """A recorded spot check that stands: a measured verdict (pass or over-tolerance). A record of a check that
+    could not run (``status`` error: exception, setup failure) is re-run at the next boundary."""
+    return isinstance(sc, dict) and sc.get("status") != "error"
+
+
+def _aux_discovery_recorded_off(adaptive_dir) -> bool:
+    import json
+    try:
+        rec = json.loads((Path(adaptive_dir) / "decision_settings.json").read_text())
+        return (rec.get("settings") or {}).get("aux_discovery") is False
+    except (OSError, ValueError, AttributeError):
+        return False
 
 
 def expected_backfill_sha256(admission: dict, adaptive_dir, phase_dir, where: str) -> str:
@@ -219,4 +270,5 @@ def aux_term_kcal(z: np.ndarray, center: float, k_kcal: float) -> np.ndarray:
 
 
 __all__ = ["phase_z", "phase_runtime_model_shas", "require_spot_check", "spot_check_due_phases",
+           "spot_check_is_final", "require_persisted_model_segments",
            "expected_backfill_sha256", "burnin_keep", "worker_table", "aux_term_kcal", "phase_epoch", "Z_COLUMN", "KJ_PER_KCAL"]

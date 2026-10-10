@@ -474,18 +474,20 @@ def _post_admission_spot_check(adaptive_dir: Path, epoch_dir: Path, epoch, phase
     frame-derived z the backfill uses, judged per worker in kT (``check_backfill_against_recorded``). Recorded
     in aux_admission.json[``spot_check``] and the epoch report; pooling requires ``ok`` true once a phase ran
     with the model (``aux_pooling.require_spot_check``). A check that cannot run there is recorded as a failure
-    (``ok`` false + the error), never left out; phases run without the model (a re-admission's boundary) are
-    not checked and nothing is recorded. Never raises."""
+    (``ok`` false, ``status`` error + the error), never left out, and is re-run at the next boundary (earlier
+    errors kept under ``previous_errors``); a measured verdict is final. Phases run without the model (a
+    re-admission's boundary) are not checked and nothing is recorded. Never raises."""
     adaptive_dir = Path(adaptive_dir)
     path = adaptive_dir / ADMISSION_FILENAME
     try:
         admission = json.loads(path.read_text())
-        if admission.get("spot_check") is not None or int(epoch) <= int(admission.get("epoch", epoch)):
+        from gareus.adaptive.aux_pooling import phase_runtime_model_shas, spot_check_is_final
+        previous = admission.get("spot_check")
+        if (previous is not None and spot_check_is_final(previous)) or int(epoch) <= int(admission.get("epoch", epoch)):
             return
         workers = [(float(w["aux_center"]), float(w["aux_k_kcal_mol"])) for w in admission.get("workers") or []]
         if not workers:
             return
-        from gareus.adaptive.aux_pooling import phase_runtime_model_shas
         sha = str(admission.get("model_sha256"))
         candidates = [Path(ph) for ph in (phase_dirs or [epoch_dir]) if sha in phase_runtime_model_shas(Path(ph))]
         if not candidates:
@@ -497,6 +499,9 @@ def _post_admission_spot_check(adaptive_dir: Path, epoch_dir: Path, epoch, phase
         event = {"epoch": int(epoch), **_run_spot_check(adaptive_dir, candidates, workers)}
     except Exception as exc:              # setup failed (model, settings): a failed check, not a missing one
         event = {"epoch": int(epoch), "ok": False, "status": "error", "error": f"{type(exc).__name__}: {exc}"}
+    if previous is not None:            # an errored check being re-run: keep what failed before
+        event["previous_errors"] = list(previous.get("previous_errors") or []) + [
+            {k: v for k, v in previous.items() if k != "previous_errors"}]
     _append_report_event(epoch_dir, epoch, "spot_check", event)
     try:
         _write_json(path, {**admission, "spot_check": event})

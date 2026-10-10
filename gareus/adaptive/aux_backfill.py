@@ -183,7 +183,9 @@ def write_phase_backfill(phase_dir: Path, model, *, adaptive_dir: Optional[Path]
 
 def _final_pdb_evidence(replica: int, step: int, end_step: Optional[int], xtc_max: Optional[int]) -> Optional[str]:
     """None when final_pdbs/ provably holds this sample's configuration, else why not: the sample must be the
-    phase's final production step (checkpoint manifest) and lie after every XTC frame of its replica."""
+    phase's final production step (checkpoint manifest) and lie after every XTC frame of its replica. A replica
+    with no XTC frame at all (``xtc_max`` None) is allowed on the manifest step alone: there is no frame to order
+    against, and the manifest step is the step final_pdbs/ was written at."""
     if end_step is None:
         return (f"replica {replica} step {step}: no checkpoint manifest ({CHECKPOINT_MANIFEST}) records the "
                 "phase's final production step, so final_pdbs/ cannot be tied to the sample")

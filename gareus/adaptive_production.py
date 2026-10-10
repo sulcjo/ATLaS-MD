@@ -3886,6 +3886,9 @@ def build_union_state_mbar_inputs(
     for source_label, sample_dir in _epoch_sample_sources(
         adaptive_dir, include_epochs=include_epochs, pilot_dirs=pilot_dirs, tica_cv_version=tica_cv_version
     ):
+        if _aux_rec is not None:
+            # Admitted campaign: a model-run segment the eligibility rule would drop (aux_unpersisted) refuses.
+            _ap.require_persisted_model_segments(Path(sample_dir), str(_aux_rec["model_sha256"]), source_label)
         rows = _read_sample_dicts(sample_dir)
         if not rows:
             continue

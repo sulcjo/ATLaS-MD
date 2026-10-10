@@ -349,3 +349,21 @@ def test_readmission_backfill_updates_the_admission_record(tmp_path):
     assert sorted(by_label) == ["epoch_000", "epoch_001", "epoch_002"]
     for label, sha in by_label.items():
         assert sha == hashlib.sha256((ad / label / BACKFILL_FILENAME).read_bytes()).hexdigest(), label
+
+
+def test_final_pdb_for_a_replica_without_xtc_frames_needs_only_the_manifest_step(tmp_path):
+    # replica 1 wrote no XTC frame (its only sample is the off-grid end of the phase): no frame bound to check,
+    # so the checkpoint manifest's final production step alone ties final_pdbs/ to the sample
+    ph = make_phase(tmp_path, "epoch_000", {"replica_0.xtc": (0, 0, [300, 600])}, {0: 0.0}, lambda s: 0.0)
+    f = ph / "samples" / "seg_000" / "data.parquet"
+    s = pd.read_parquet(f)
+    extra = s.iloc[[0]].copy(); extra["replica"] = 1; extra["step"] = 742
+    pd.concat([s, extra]).to_parquet(f)
+    _write_final_pdb(ph, 1, 0, final_step=742)
+    _add_end_sample(ph, 742)
+    _write_final_pdb(ph, 0, 0, final_step=742)
+    info = write_phase_backfill(ph, _model())
+    assert info["n_from_final_pdb"] == 2
+    _write_manifest(ph, 1042)                      # same layout, final step elsewhere: refused
+    with pytest.raises(BackfillIncomplete, match="final production step 1042"):
+        write_phase_backfill(ph, _model())

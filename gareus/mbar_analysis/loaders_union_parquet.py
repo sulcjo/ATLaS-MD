@@ -415,6 +415,12 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
                 _aux_cols[state_id_to_k[_sid]] = _rec
         _ap.require_admitted_workers(_aux_rec, _aux_by_sid, 'adaptive union loader',
                                      pooled={int(state_ids[k]): r for k, r in _aux_cols.items()})
+    if _aux_rec is not None:
+        # Admitted campaign: a model-run segment the eligibility rule would drop (aux_unpersisted) refuses.
+        from gareus.adaptive import aux_pooling as _ap
+        for _ed, _ in epoch_dirs:
+            _ap.require_persisted_model_segments(Path(_ed), str(_aux_rec['model_sha256']),
+                                                 _aux_phase_label(_ed, adaptive_dir))
 
     all_cv = []; all_cv2 = []; all_window = []; all_step = []
     all_replica = []; all_boost = []; all_boost_dih = []; all_potential = []; all_epoch_src = []

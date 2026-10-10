@@ -106,14 +106,19 @@ def test_post_admission_phase_without_recorded_z_refuses(tmp_path):
                 admission=adm, adaptive_dir=camp.ad)
 
 
-def test_post_admission_segment_without_aux_payload_is_never_backfilled(tmp_path):
-    # A model-run segment whose samples carry no atlas-aux-samples-v1 payload is excluded by the kernel
-    # eligibility rule (aux_unpersisted) before pooling; it never reaches the backfill (and phase_z, above,
-    # refuses it if it did).
-    import pandas as pd
+@BOTH
+def test_post_admission_segment_without_aux_payload_refuses(tmp_path, build):
+    # final ran with the admitted model (aux snapshot) but its samples carry no atlas-aux-samples-v1 payload:
+    # kernel eligibility calls it aux_unpersisted; in an admitted campaign that refuses, it is never dropped
     camp = build_campaign(tmp_path, final_records_z=False)
-    meta = _driver(camp)
-    assert "final" not in set(pd.read_csv(meta["samples_csv"])["source"])
+    with pytest.raises(AuxPoolingRefused, match=r"final.*seg_001.*aux_unpersisted"):
+        build(camp)
+
+
+@BOTH
+def test_pre_admission_aux_unpersisted_rule_untouched_for_phases_without_the_model(tmp_path, build):
+    # epoch_000 (no aux kernel) is not aux_unpersisted: the default fixture pools through its backfill
+    build(build_campaign(tmp_path))
 
 
 def test_pre_admission_phase_still_uses_backfill(tmp_path):
@@ -180,4 +185,39 @@ def test_spot_check_failure_verdict_recorded(tmp_path, monkeypatch):
                [camp.ad / "epoch_001"])
     assert sc["ok"] is False and sc["max_energy_err_kt"] == 100.0
     with pytest.raises(AuxPoolingRefused, match="100"):
+        aux_admission_allows_pooling(camp.ad)
+
+
+def test_spot_check_error_record_is_rerun_at_the_next_boundary(tmp_path, monkeypatch):
+    from gareus.adaptive import aux_admission_io as H
+    import gareus.adaptive.aux_backfill as B
+    camp = build_campaign(tmp_path, spot_check={"epoch": 1, "ok": False, "status": "error", "error": "RuntimeError: x"})
+    with pytest.raises(AuxPoolingRefused, match="spot check"):
+        aux_admission_allows_pooling(camp.ad)
+    monkeypatch.setattr(B, "check_backfill_against_recorded", lambda ph, *a, **k: {
+        "phase": str(ph), "ok": True, "max_energy_err_kt": 0.01, "tol_kt": 1.0, "n_compared": 3, "max_abs_dev": 0.01})
+    H._post_admission_spot_check(camp.ad, camp.ad / "final", 2, [camp.ad / "final"])
+    sc = json.loads((camp.ad / "aux_admission.json").read_text())["spot_check"]
+    assert sc["ok"] is True and sc["epoch"] == 2 and sc["previous_errors"][0]["error"] == "RuntimeError: x"
+    assert aux_admission_allows_pooling(camp.ad) is not None
+
+
+def test_measured_spot_check_failure_is_final(tmp_path, monkeypatch):
+    from gareus.adaptive import aux_admission_io as H
+    import gareus.adaptive.aux_backfill as B
+    measured = {"epoch": 1, "ok": False, "max_energy_err_kt": 100.0, "tol_kt": 1.0, "phase": "epoch_001",
+                "n_compared": 10, "max_abs_dev": 1.0}
+    camp = build_campaign(tmp_path, spot_check=measured)
+    called = []
+    monkeypatch.setattr(B, "check_backfill_against_recorded", lambda *a, **k: called.append(a) or {"ok": True})
+    H._post_admission_spot_check(camp.ad, camp.ad / "final", 2, [camp.ad / "final"])
+    assert called == [] and json.loads((camp.ad / "aux_admission.json").read_text())["spot_check"] == measured
+    with pytest.raises(AuxPoolingRefused, match="100"):
+        aux_admission_allows_pooling(camp.ad)
+
+
+def test_due_but_missing_names_aux_discovery_off(tmp_path):
+    camp = build_campaign(tmp_path, spot_check=None)
+    (camp.ad / "decision_settings.json").write_text(json.dumps({"settings": {"aux_discovery": False}}))
+    with pytest.raises(AuxPoolingRefused, match=r"spot check never ran: --ap-aux-discovery is off"):
         aux_admission_allows_pooling(camp.ad)
